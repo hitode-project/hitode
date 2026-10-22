@@ -7082,6 +7082,7 @@ ntdll.dll	NtWriteFile	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	FileHandle:W
 ntdll.dll	NtWriteVirtualMemory	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	ProcessHandle:Windows.Win32.Foundation.HANDLE:handle:1|BaseAddress:void*:ptr:1|Buffer:void*:ptr:1|NumberOfBytesToWrite:usize:u32:1|NumberOfBytesWritten:usize*:ptr:1
 ntdll.dll	RtlAcquirePebLock	stdcall	void	void	
 ntdll.dll	RtlAllocateHeap	stdcall	ptr	void*	HeapHandle:void*:ptr:1|Flags:u32:u32:1|Size:usize:u32:1
+ntdll.dll	RtlAnsiStringToUnicodeString	stdcall	i32	Windows.Win32.Foundation.NTSTATUS	DestinationString:Windows.Win32.Foundation.UNICODE_STRING*:ptr:1|SourceString:Windows.Win32.System.Kernel.STRING*:ptr:1|AllocateDestinationString:Windows.Win32.Foundation.BOOLEAN:u32:1
 ntdll.dll	RtlDosPathNameToNtPathName_U	stdcall	u32	Windows.Win32.Foundation.BOOLEAN	DosFileName:Windows.Win32.Foundation.PCWSTR:str16:1|NtFileName:Windows.Win32.Foundation.UNICODE_STRING*:ptr:1|FilePart:Windows.Win32.Foundation.PWSTR*:ptr:1|RelativeName:void*:ptr:1
 ntdll.dll	RtlEqualUnicodeString	stdcall	u32	Windows.Win32.Foundation.BOOLEAN	String1:Windows.Win32.Foundation.UNICODE_STRING*:ptr:1|String2:Windows.Win32.Foundation.UNICODE_STRING*:ptr:1|CaseInSensitive:Windows.Win32.Foundation.BOOLEAN:u32:1
 ntdll.dll	RtlFreeHeap	stdcall	u32	LOGICAL	HeapHandle:void*:ptr:1|Flags:u32:u32:1|BaseAddress:void*:ptr:1
@@ -7334,6 +7335,7 @@ ole32.dll	HWND_UserUnmarshal	stdcall	ptr	u8*	param0:u32*:ptr:1|param1:u8*:ptr:1|
 ole32.dll	HWND_UserUnmarshal64	stdcall	ptr	u8*	param0:u32*:ptr:1|param1:u8*:ptr:1|param2:Windows.Win32.Foundation.HWND*:ptr:1
 ole32.dll	IIDFromString	stdcall	i32	Windows.Win32.Foundation.HRESULT	lpsz:Windows.Win32.Foundation.PWSTR:str16:1|lpiid:System.Guid*:ptr:1
 ole32.dll	IsAccelerator	stdcall	i32	Windows.Win32.Foundation.BOOL	hAccel:Windows.Win32.UI.WindowsAndMessaging.HACCEL:handle:1|cAccelEntries:i32:i32:1|lpMsg:Windows.Win32.UI.WindowsAndMessaging.MSG*:ptr:1|lpwCmd:u16*:ptr:1
+ole32.dll	IsEqualGUID	stdcall	i32	Windows.Win32.Foundation.BOOL	rguid1:System.Guid*:ptr:1|rguid2:System.Guid*:ptr:1
 ole32.dll	MkParseDisplayName	stdcall	i32	Windows.Win32.Foundation.HRESULT	pbc:Windows.Win32.System.Com.IBindCtx:ptr:1|szUserName:Windows.Win32.Foundation.PWSTR:str16:1|pchEaten:u32*:ptr:1|ppmk:Windows.Win32.System.Com.IMoniker*:ptr:1
 ole32.dll	MonikerCommonPrefixWith	stdcall	i32	Windows.Win32.Foundation.HRESULT	pmkThis:Windows.Win32.System.Com.IMoniker:ptr:1|pmkOther:Windows.Win32.System.Com.IMoniker:ptr:1|ppmkCommon:Windows.Win32.System.Com.IMoniker*:ptr:1
 ole32.dll	MonikerRelativePathTo	stdcall	i32	Windows.Win32.Foundation.HRESULT	pmkSrc:Windows.Win32.System.Com.IMoniker:ptr:1|pmkDest:Windows.Win32.System.Com.IMoniker:ptr:1|ppmkRelPath:Windows.Win32.System.Com.IMoniker*:ptr:1|dwReserved:Windows.Win32.Foundation.BOOL:i32:1
@@ -7577,7 +7579,7 @@ oleaut32.dll	VARIANT_UserUnmarshal64	stdcall	ptr	u8*	param0:u32*:ptr:1|param1:u8
 oleaut32.dll	VarAbs	stdcall	i32	Windows.Win32.Foundation.HRESULT	pvarIn:Windows.Win32.System.Variant.VARIANT*:ptr:1|pvarResult:Windows.Win32.System.Variant.VARIANT*:ptr:1
 oleaut32.dll	VarAdd	stdcall	i32	Windows.Win32.Foundation.HRESULT	pvarLeft:Windows.Win32.System.Variant.VARIANT*:ptr:1|pvarRight:Windows.Win32.System.Variant.VARIANT*:ptr:1|pvarResult:Windows.Win32.System.Variant.VARIANT*:ptr:1
 oleaut32.dll	VarAnd	stdcall	i32	Windows.Win32.Foundation.HRESULT	pvarLeft:Windows.Win32.System.Variant.VARIANT*:ptr:1|pvarRight:Windows.Win32.System.Variant.VARIANT*:ptr:1|pvarResult:Windows.Win32.System.Variant.VARIANT*:ptr:1
-oleaut32.dll	VarBoolFromCy	stdcall	i32	Windows.Win32.Foundation.HRESULT	cyIn:Windows.Win32.System.Com.CY:unsupported:0|pboolOut:Windows.Win32.Foundation.VARIANT_BOOL*:ptr:1
+oleaut32.dll	VarBoolFromCy	stdcall	i32	Windows.Win32.Foundation.HRESULT	cyIn:Windows.Win32.System.Com.CY:aggregate:2|pboolOut:Windows.Win32.Foundation.VARIANT_BOOL*:ptr:1
 oleaut32.dll	VarBoolFromDate	stdcall	i32	Windows.Win32.Foundation.HRESULT	dateIn:f64:f64:2|pboolOut:Windows.Win32.Foundation.VARIANT_BOOL*:ptr:1
 oleaut32.dll	VarBoolFromDec	stdcall	i32	Windows.Win32.Foundation.HRESULT	pdecIn:Windows.Win32.Foundation.DECIMAL*:ptr:1|pboolOut:Windows.Win32.Foundation.VARIANT_BOOL*:ptr:1
 oleaut32.dll	VarBoolFromDisp	stdcall	i32	Windows.Win32.Foundation.HRESULT	pdispIn:Windows.Win32.System.Com.IDispatch:ptr:1|lcid:u32:u32:1|pboolOut:Windows.Win32.Foundation.VARIANT_BOOL*:ptr:1
@@ -7595,7 +7597,7 @@ oleaut32.dll	VarBoolFromUI8	stdcall	i32	Windows.Win32.Foundation.HRESULT	i64In:u
 oleaut32.dll	VarBstrCat	stdcall	i32	Windows.Win32.Foundation.HRESULT	bstrLeft:Windows.Win32.Foundation.BSTR:ptr:1|bstrRight:Windows.Win32.Foundation.BSTR:ptr:1|pbstrResult:Windows.Win32.Foundation.BSTR*:ptr:1
 oleaut32.dll	VarBstrCmp	stdcall	i32	Windows.Win32.Foundation.HRESULT	bstrLeft:Windows.Win32.Foundation.BSTR:ptr:1|bstrRight:Windows.Win32.Foundation.BSTR:ptr:1|lcid:u32:u32:1|dwFlags:u32:u32:1
 oleaut32.dll	VarBstrFromBool	stdcall	i32	Windows.Win32.Foundation.HRESULT	boolIn:Windows.Win32.Foundation.VARIANT_BOOL:i32:1|lcid:u32:u32:1|dwFlags:u32:u32:1|pbstrOut:Windows.Win32.Foundation.BSTR*:ptr:1
-oleaut32.dll	VarBstrFromCy	stdcall	i32	Windows.Win32.Foundation.HRESULT	cyIn:Windows.Win32.System.Com.CY:unsupported:0|lcid:u32:u32:1|dwFlags:u32:u32:1|pbstrOut:Windows.Win32.Foundation.BSTR*:ptr:1
+oleaut32.dll	VarBstrFromCy	stdcall	i32	Windows.Win32.Foundation.HRESULT	cyIn:Windows.Win32.System.Com.CY:aggregate:2|lcid:u32:u32:1|dwFlags:u32:u32:1|pbstrOut:Windows.Win32.Foundation.BSTR*:ptr:1
 oleaut32.dll	VarBstrFromDate	stdcall	i32	Windows.Win32.Foundation.HRESULT	dateIn:f64:f64:2|lcid:u32:u32:1|dwFlags:u32:u32:1|pbstrOut:Windows.Win32.Foundation.BSTR*:ptr:1
 oleaut32.dll	VarBstrFromDec	stdcall	i32	Windows.Win32.Foundation.HRESULT	pdecIn:Windows.Win32.Foundation.DECIMAL*:ptr:1|lcid:u32:u32:1|dwFlags:u32:u32:1|pbstrOut:Windows.Win32.Foundation.BSTR*:ptr:1
 oleaut32.dll	VarBstrFromDisp	stdcall	i32	Windows.Win32.Foundation.HRESULT	pdispIn:Windows.Win32.System.Com.IDispatch:ptr:1|lcid:u32:u32:1|dwFlags:u32:u32:1|pbstrOut:Windows.Win32.Foundation.BSTR*:ptr:1
@@ -7611,11 +7613,11 @@ oleaut32.dll	VarBstrFromUI4	stdcall	i32	Windows.Win32.Foundation.HRESULT	ulIn:u3
 oleaut32.dll	VarBstrFromUI8	stdcall	i32	Windows.Win32.Foundation.HRESULT	ui64In:u64:u64:2|lcid:u32:u32:1|dwFlags:u32:u32:1|pbstrOut:Windows.Win32.Foundation.BSTR*:ptr:1
 oleaut32.dll	VarCat	stdcall	i32	Windows.Win32.Foundation.HRESULT	pvarLeft:Windows.Win32.System.Variant.VARIANT*:ptr:1|pvarRight:Windows.Win32.System.Variant.VARIANT*:ptr:1|pvarResult:Windows.Win32.System.Variant.VARIANT*:ptr:1
 oleaut32.dll	VarCmp	stdcall	u32	Windows.Win32.System.Ole.VARCMP	pvarLeft:Windows.Win32.System.Variant.VARIANT*:ptr:1|pvarRight:Windows.Win32.System.Variant.VARIANT*:ptr:1|lcid:u32:u32:1|dwFlags:u32:u32:1
-oleaut32.dll	VarCyAbs	stdcall	i32	Windows.Win32.Foundation.HRESULT	cyIn:Windows.Win32.System.Com.CY:unsupported:0|pcyResult:Windows.Win32.System.Com.CY*:ptr:1
-oleaut32.dll	VarCyAdd	stdcall	i32	Windows.Win32.Foundation.HRESULT	cyLeft:Windows.Win32.System.Com.CY:unsupported:0|cyRight:Windows.Win32.System.Com.CY:unsupported:0|pcyResult:Windows.Win32.System.Com.CY*:ptr:1
-oleaut32.dll	VarCyCmp	stdcall	u32	Windows.Win32.System.Ole.VARCMP	cyLeft:Windows.Win32.System.Com.CY:unsupported:0|cyRight:Windows.Win32.System.Com.CY:unsupported:0
-oleaut32.dll	VarCyCmpR8	stdcall	u32	Windows.Win32.System.Ole.VARCMP	cyLeft:Windows.Win32.System.Com.CY:unsupported:0|dblRight:f64:f64:2
-oleaut32.dll	VarCyFix	stdcall	i32	Windows.Win32.Foundation.HRESULT	cyIn:Windows.Win32.System.Com.CY:unsupported:0|pcyResult:Windows.Win32.System.Com.CY*:ptr:1
+oleaut32.dll	VarCyAbs	stdcall	i32	Windows.Win32.Foundation.HRESULT	cyIn:Windows.Win32.System.Com.CY:aggregate:2|pcyResult:Windows.Win32.System.Com.CY*:ptr:1
+oleaut32.dll	VarCyAdd	stdcall	i32	Windows.Win32.Foundation.HRESULT	cyLeft:Windows.Win32.System.Com.CY:aggregate:2|cyRight:Windows.Win32.System.Com.CY:aggregate:2|pcyResult:Windows.Win32.System.Com.CY*:ptr:1
+oleaut32.dll	VarCyCmp	stdcall	u32	Windows.Win32.System.Ole.VARCMP	cyLeft:Windows.Win32.System.Com.CY:aggregate:2|cyRight:Windows.Win32.System.Com.CY:aggregate:2
+oleaut32.dll	VarCyCmpR8	stdcall	u32	Windows.Win32.System.Ole.VARCMP	cyLeft:Windows.Win32.System.Com.CY:aggregate:2|dblRight:f64:f64:2
+oleaut32.dll	VarCyFix	stdcall	i32	Windows.Win32.Foundation.HRESULT	cyIn:Windows.Win32.System.Com.CY:aggregate:2|pcyResult:Windows.Win32.System.Com.CY*:ptr:1
 oleaut32.dll	VarCyFromBool	stdcall	i32	Windows.Win32.Foundation.HRESULT	boolIn:Windows.Win32.Foundation.VARIANT_BOOL:i32:1|pcyOut:Windows.Win32.System.Com.CY*:ptr:1
 oleaut32.dll	VarCyFromDate	stdcall	i32	Windows.Win32.Foundation.HRESULT	dateIn:f64:f64:2|pcyOut:Windows.Win32.System.Com.CY*:ptr:1
 oleaut32.dll	VarCyFromDec	stdcall	i32	Windows.Win32.Foundation.HRESULT	pdecIn:Windows.Win32.Foundation.DECIMAL*:ptr:1|pcyOut:Windows.Win32.System.Com.CY*:ptr:1
@@ -7631,15 +7633,15 @@ oleaut32.dll	VarCyFromUI1	stdcall	i32	Windows.Win32.Foundation.HRESULT	bIn:u8:u3
 oleaut32.dll	VarCyFromUI2	stdcall	i32	Windows.Win32.Foundation.HRESULT	uiIn:u16:u32:1|pcyOut:Windows.Win32.System.Com.CY*:ptr:1
 oleaut32.dll	VarCyFromUI4	stdcall	i32	Windows.Win32.Foundation.HRESULT	ulIn:u32:u32:1|pcyOut:Windows.Win32.System.Com.CY*:ptr:1
 oleaut32.dll	VarCyFromUI8	stdcall	i32	Windows.Win32.Foundation.HRESULT	ui64In:u64:u64:2|pcyOut:Windows.Win32.System.Com.CY*:ptr:1
-oleaut32.dll	VarCyInt	stdcall	i32	Windows.Win32.Foundation.HRESULT	cyIn:Windows.Win32.System.Com.CY:unsupported:0|pcyResult:Windows.Win32.System.Com.CY*:ptr:1
-oleaut32.dll	VarCyMul	stdcall	i32	Windows.Win32.Foundation.HRESULT	cyLeft:Windows.Win32.System.Com.CY:unsupported:0|cyRight:Windows.Win32.System.Com.CY:unsupported:0|pcyResult:Windows.Win32.System.Com.CY*:ptr:1
-oleaut32.dll	VarCyMulI4	stdcall	i32	Windows.Win32.Foundation.HRESULT	cyLeft:Windows.Win32.System.Com.CY:unsupported:0|lRight:i32:i32:1|pcyResult:Windows.Win32.System.Com.CY*:ptr:1
-oleaut32.dll	VarCyMulI8	stdcall	i32	Windows.Win32.Foundation.HRESULT	cyLeft:Windows.Win32.System.Com.CY:unsupported:0|lRight:i64:i64:2|pcyResult:Windows.Win32.System.Com.CY*:ptr:1
-oleaut32.dll	VarCyNeg	stdcall	i32	Windows.Win32.Foundation.HRESULT	cyIn:Windows.Win32.System.Com.CY:unsupported:0|pcyResult:Windows.Win32.System.Com.CY*:ptr:1
-oleaut32.dll	VarCyRound	stdcall	i32	Windows.Win32.Foundation.HRESULT	cyIn:Windows.Win32.System.Com.CY:unsupported:0|cDecimals:i32:i32:1|pcyResult:Windows.Win32.System.Com.CY*:ptr:1
-oleaut32.dll	VarCySub	stdcall	i32	Windows.Win32.Foundation.HRESULT	cyLeft:Windows.Win32.System.Com.CY:unsupported:0|cyRight:Windows.Win32.System.Com.CY:unsupported:0|pcyResult:Windows.Win32.System.Com.CY*:ptr:1
+oleaut32.dll	VarCyInt	stdcall	i32	Windows.Win32.Foundation.HRESULT	cyIn:Windows.Win32.System.Com.CY:aggregate:2|pcyResult:Windows.Win32.System.Com.CY*:ptr:1
+oleaut32.dll	VarCyMul	stdcall	i32	Windows.Win32.Foundation.HRESULT	cyLeft:Windows.Win32.System.Com.CY:aggregate:2|cyRight:Windows.Win32.System.Com.CY:aggregate:2|pcyResult:Windows.Win32.System.Com.CY*:ptr:1
+oleaut32.dll	VarCyMulI4	stdcall	i32	Windows.Win32.Foundation.HRESULT	cyLeft:Windows.Win32.System.Com.CY:aggregate:2|lRight:i32:i32:1|pcyResult:Windows.Win32.System.Com.CY*:ptr:1
+oleaut32.dll	VarCyMulI8	stdcall	i32	Windows.Win32.Foundation.HRESULT	cyLeft:Windows.Win32.System.Com.CY:aggregate:2|lRight:i64:i64:2|pcyResult:Windows.Win32.System.Com.CY*:ptr:1
+oleaut32.dll	VarCyNeg	stdcall	i32	Windows.Win32.Foundation.HRESULT	cyIn:Windows.Win32.System.Com.CY:aggregate:2|pcyResult:Windows.Win32.System.Com.CY*:ptr:1
+oleaut32.dll	VarCyRound	stdcall	i32	Windows.Win32.Foundation.HRESULT	cyIn:Windows.Win32.System.Com.CY:aggregate:2|cDecimals:i32:i32:1|pcyResult:Windows.Win32.System.Com.CY*:ptr:1
+oleaut32.dll	VarCySub	stdcall	i32	Windows.Win32.Foundation.HRESULT	cyLeft:Windows.Win32.System.Com.CY:aggregate:2|cyRight:Windows.Win32.System.Com.CY:aggregate:2|pcyResult:Windows.Win32.System.Com.CY*:ptr:1
 oleaut32.dll	VarDateFromBool	stdcall	i32	Windows.Win32.Foundation.HRESULT	boolIn:Windows.Win32.Foundation.VARIANT_BOOL:i32:1|pdateOut:f64*:ptr:1
-oleaut32.dll	VarDateFromCy	stdcall	i32	Windows.Win32.Foundation.HRESULT	cyIn:Windows.Win32.System.Com.CY:unsupported:0|pdateOut:f64*:ptr:1
+oleaut32.dll	VarDateFromCy	stdcall	i32	Windows.Win32.Foundation.HRESULT	cyIn:Windows.Win32.System.Com.CY:aggregate:2|pdateOut:f64*:ptr:1
 oleaut32.dll	VarDateFromDec	stdcall	i32	Windows.Win32.Foundation.HRESULT	pdecIn:Windows.Win32.Foundation.DECIMAL*:ptr:1|pdateOut:f64*:ptr:1
 oleaut32.dll	VarDateFromDisp	stdcall	i32	Windows.Win32.Foundation.HRESULT	pdispIn:Windows.Win32.System.Com.IDispatch:ptr:1|lcid:u32:u32:1|pdateOut:f64*:ptr:1
 oleaut32.dll	VarDateFromI1	stdcall	i32	Windows.Win32.Foundation.HRESULT	cIn:Windows.Win32.Foundation.CHAR:i32:1|pdateOut:f64*:ptr:1
@@ -7662,7 +7664,7 @@ oleaut32.dll	VarDecCmpR8	stdcall	u32	Windows.Win32.System.Ole.VARCMP	pdecLeft:Wi
 oleaut32.dll	VarDecDiv	stdcall	i32	Windows.Win32.Foundation.HRESULT	pdecLeft:Windows.Win32.Foundation.DECIMAL*:ptr:1|pdecRight:Windows.Win32.Foundation.DECIMAL*:ptr:1|pdecResult:Windows.Win32.Foundation.DECIMAL*:ptr:1
 oleaut32.dll	VarDecFix	stdcall	i32	Windows.Win32.Foundation.HRESULT	pdecIn:Windows.Win32.Foundation.DECIMAL*:ptr:1|pdecResult:Windows.Win32.Foundation.DECIMAL*:ptr:1
 oleaut32.dll	VarDecFromBool	stdcall	i32	Windows.Win32.Foundation.HRESULT	boolIn:Windows.Win32.Foundation.VARIANT_BOOL:i32:1|pdecOut:Windows.Win32.Foundation.DECIMAL*:ptr:1
-oleaut32.dll	VarDecFromCy	stdcall	i32	Windows.Win32.Foundation.HRESULT	cyIn:Windows.Win32.System.Com.CY:unsupported:0|pdecOut:Windows.Win32.Foundation.DECIMAL*:ptr:1
+oleaut32.dll	VarDecFromCy	stdcall	i32	Windows.Win32.Foundation.HRESULT	cyIn:Windows.Win32.System.Com.CY:aggregate:2|pdecOut:Windows.Win32.Foundation.DECIMAL*:ptr:1
 oleaut32.dll	VarDecFromDate	stdcall	i32	Windows.Win32.Foundation.HRESULT	dateIn:f64:f64:2|pdecOut:Windows.Win32.Foundation.DECIMAL*:ptr:1
 oleaut32.dll	VarDecFromDisp	stdcall	i32	Windows.Win32.Foundation.HRESULT	pdispIn:Windows.Win32.System.Com.IDispatch:ptr:1|lcid:u32:u32:1|pdecOut:Windows.Win32.Foundation.DECIMAL*:ptr:1
 oleaut32.dll	VarDecFromI1	stdcall	i32	Windows.Win32.Foundation.HRESULT	cIn:Windows.Win32.Foundation.CHAR:i32:1|pdecOut:Windows.Win32.Foundation.DECIMAL*:ptr:1
@@ -7691,7 +7693,7 @@ oleaut32.dll	VarFormatFromTokens	stdcall	i32	Windows.Win32.Foundation.HRESULT	pv
 oleaut32.dll	VarFormatNumber	stdcall	i32	Windows.Win32.Foundation.HRESULT	pvarIn:Windows.Win32.System.Variant.VARIANT*:ptr:1|iNumDig:i32:i32:1|iIncLead:Windows.Win32.System.Ole.VARFORMAT_LEADING_DIGIT:i32:1|iUseParens:Windows.Win32.System.Ole.VARFORMAT_PARENTHESES:i32:1|iGroup:Windows.Win32.System.Ole.VARFORMAT_GROUP:i32:1|dwFlags:u32:u32:1|pbstrOut:Windows.Win32.Foundation.BSTR*:ptr:1
 oleaut32.dll	VarFormatPercent	stdcall	i32	Windows.Win32.Foundation.HRESULT	pvarIn:Windows.Win32.System.Variant.VARIANT*:ptr:1|iNumDig:i32:i32:1|iIncLead:Windows.Win32.System.Ole.VARFORMAT_LEADING_DIGIT:i32:1|iUseParens:Windows.Win32.System.Ole.VARFORMAT_PARENTHESES:i32:1|iGroup:Windows.Win32.System.Ole.VARFORMAT_GROUP:i32:1|dwFlags:u32:u32:1|pbstrOut:Windows.Win32.Foundation.BSTR*:ptr:1
 oleaut32.dll	VarI1FromBool	stdcall	i32	Windows.Win32.Foundation.HRESULT	boolIn:Windows.Win32.Foundation.VARIANT_BOOL:i32:1|pcOut:Windows.Win32.Foundation.PSTR:str8:1
-oleaut32.dll	VarI1FromCy	stdcall	i32	Windows.Win32.Foundation.HRESULT	cyIn:Windows.Win32.System.Com.CY:unsupported:0|pcOut:Windows.Win32.Foundation.PSTR:str8:1
+oleaut32.dll	VarI1FromCy	stdcall	i32	Windows.Win32.Foundation.HRESULT	cyIn:Windows.Win32.System.Com.CY:aggregate:2|pcOut:Windows.Win32.Foundation.PSTR:str8:1
 oleaut32.dll	VarI1FromDate	stdcall	i32	Windows.Win32.Foundation.HRESULT	dateIn:f64:f64:2|pcOut:Windows.Win32.Foundation.PSTR:str8:1
 oleaut32.dll	VarI1FromDec	stdcall	i32	Windows.Win32.Foundation.HRESULT	pdecIn:Windows.Win32.Foundation.DECIMAL*:ptr:1|pcOut:Windows.Win32.Foundation.PSTR:str8:1
 oleaut32.dll	VarI1FromDisp	stdcall	i32	Windows.Win32.Foundation.HRESULT	pdispIn:Windows.Win32.System.Com.IDispatch:ptr:1|lcid:u32:u32:1|pcOut:Windows.Win32.Foundation.PSTR:str8:1
@@ -7706,7 +7708,7 @@ oleaut32.dll	VarI1FromUI2	stdcall	i32	Windows.Win32.Foundation.HRESULT	uiIn:u16:
 oleaut32.dll	VarI1FromUI4	stdcall	i32	Windows.Win32.Foundation.HRESULT	ulIn:u32:u32:1|pcOut:Windows.Win32.Foundation.PSTR:str8:1
 oleaut32.dll	VarI1FromUI8	stdcall	i32	Windows.Win32.Foundation.HRESULT	i64In:u64:u64:2|pcOut:Windows.Win32.Foundation.PSTR:str8:1
 oleaut32.dll	VarI2FromBool	stdcall	i32	Windows.Win32.Foundation.HRESULT	boolIn:Windows.Win32.Foundation.VARIANT_BOOL:i32:1|psOut:i16*:ptr:1
-oleaut32.dll	VarI2FromCy	stdcall	i32	Windows.Win32.Foundation.HRESULT	cyIn:Windows.Win32.System.Com.CY:unsupported:0|psOut:i16*:ptr:1
+oleaut32.dll	VarI2FromCy	stdcall	i32	Windows.Win32.Foundation.HRESULT	cyIn:Windows.Win32.System.Com.CY:aggregate:2|psOut:i16*:ptr:1
 oleaut32.dll	VarI2FromDate	stdcall	i32	Windows.Win32.Foundation.HRESULT	dateIn:f64:f64:2|psOut:i16*:ptr:1
 oleaut32.dll	VarI2FromDec	stdcall	i32	Windows.Win32.Foundation.HRESULT	pdecIn:Windows.Win32.Foundation.DECIMAL*:ptr:1|psOut:i16*:ptr:1
 oleaut32.dll	VarI2FromDisp	stdcall	i32	Windows.Win32.Foundation.HRESULT	pdispIn:Windows.Win32.System.Com.IDispatch:ptr:1|lcid:u32:u32:1|psOut:i16*:ptr:1
@@ -7721,7 +7723,7 @@ oleaut32.dll	VarI2FromUI2	stdcall	i32	Windows.Win32.Foundation.HRESULT	uiIn:u16:
 oleaut32.dll	VarI2FromUI4	stdcall	i32	Windows.Win32.Foundation.HRESULT	ulIn:u32:u32:1|psOut:i16*:ptr:1
 oleaut32.dll	VarI2FromUI8	stdcall	i32	Windows.Win32.Foundation.HRESULT	ui64In:u64:u64:2|psOut:i16*:ptr:1
 oleaut32.dll	VarI4FromBool	stdcall	i32	Windows.Win32.Foundation.HRESULT	boolIn:Windows.Win32.Foundation.VARIANT_BOOL:i32:1|plOut:i32*:ptr:1
-oleaut32.dll	VarI4FromCy	stdcall	i32	Windows.Win32.Foundation.HRESULT	cyIn:Windows.Win32.System.Com.CY:unsupported:0|plOut:i32*:ptr:1
+oleaut32.dll	VarI4FromCy	stdcall	i32	Windows.Win32.Foundation.HRESULT	cyIn:Windows.Win32.System.Com.CY:aggregate:2|plOut:i32*:ptr:1
 oleaut32.dll	VarI4FromDate	stdcall	i32	Windows.Win32.Foundation.HRESULT	dateIn:f64:f64:2|plOut:i32*:ptr:1
 oleaut32.dll	VarI4FromDec	stdcall	i32	Windows.Win32.Foundation.HRESULT	pdecIn:Windows.Win32.Foundation.DECIMAL*:ptr:1|plOut:i32*:ptr:1
 oleaut32.dll	VarI4FromDisp	stdcall	i32	Windows.Win32.Foundation.HRESULT	pdispIn:Windows.Win32.System.Com.IDispatch:ptr:1|lcid:u32:u32:1|plOut:i32*:ptr:1
@@ -7736,7 +7738,7 @@ oleaut32.dll	VarI4FromUI2	stdcall	i32	Windows.Win32.Foundation.HRESULT	uiIn:u16:
 oleaut32.dll	VarI4FromUI4	stdcall	i32	Windows.Win32.Foundation.HRESULT	ulIn:u32:u32:1|plOut:i32*:ptr:1
 oleaut32.dll	VarI4FromUI8	stdcall	i32	Windows.Win32.Foundation.HRESULT	ui64In:u64:u64:2|plOut:i32*:ptr:1
 oleaut32.dll	VarI8FromBool	stdcall	i32	Windows.Win32.Foundation.HRESULT	boolIn:Windows.Win32.Foundation.VARIANT_BOOL:i32:1|pi64Out:i64*:ptr:1
-oleaut32.dll	VarI8FromCy	stdcall	i32	Windows.Win32.Foundation.HRESULT	cyIn:Windows.Win32.System.Com.CY:unsupported:0|pi64Out:i64*:ptr:1
+oleaut32.dll	VarI8FromCy	stdcall	i32	Windows.Win32.Foundation.HRESULT	cyIn:Windows.Win32.System.Com.CY:aggregate:2|pi64Out:i64*:ptr:1
 oleaut32.dll	VarI8FromDate	stdcall	i32	Windows.Win32.Foundation.HRESULT	dateIn:f64:f64:2|pi64Out:i64*:ptr:1
 oleaut32.dll	VarI8FromDec	stdcall	i32	Windows.Win32.Foundation.HRESULT	pdecIn:Windows.Win32.Foundation.DECIMAL*:ptr:1|pi64Out:i64*:ptr:1
 oleaut32.dll	VarI8FromDisp	stdcall	i32	Windows.Win32.Foundation.HRESULT	pdispIn:Windows.Win32.System.Com.IDispatch:ptr:1|lcid:u32:u32:1|pi64Out:i64*:ptr:1
@@ -7763,7 +7765,7 @@ oleaut32.dll	VarParseNumFromStr	stdcall	i32	Windows.Win32.Foundation.HRESULT	str
 oleaut32.dll	VarPow	stdcall	i32	Windows.Win32.Foundation.HRESULT	pvarLeft:Windows.Win32.System.Variant.VARIANT*:ptr:1|pvarRight:Windows.Win32.System.Variant.VARIANT*:ptr:1|pvarResult:Windows.Win32.System.Variant.VARIANT*:ptr:1
 oleaut32.dll	VarR4CmpR8	stdcall	u32	Windows.Win32.System.Ole.VARCMP	fltLeft:f32:f32:1|dblRight:f64:f64:2
 oleaut32.dll	VarR4FromBool	stdcall	i32	Windows.Win32.Foundation.HRESULT	boolIn:Windows.Win32.Foundation.VARIANT_BOOL:i32:1|pfltOut:f32*:ptr:1
-oleaut32.dll	VarR4FromCy	stdcall	i32	Windows.Win32.Foundation.HRESULT	cyIn:Windows.Win32.System.Com.CY:unsupported:0|pfltOut:f32*:ptr:1
+oleaut32.dll	VarR4FromCy	stdcall	i32	Windows.Win32.Foundation.HRESULT	cyIn:Windows.Win32.System.Com.CY:aggregate:2|pfltOut:f32*:ptr:1
 oleaut32.dll	VarR4FromDate	stdcall	i32	Windows.Win32.Foundation.HRESULT	dateIn:f64:f64:2|pfltOut:f32*:ptr:1
 oleaut32.dll	VarR4FromDec	stdcall	i32	Windows.Win32.Foundation.HRESULT	pdecIn:Windows.Win32.Foundation.DECIMAL*:ptr:1|pfltOut:f32*:ptr:1
 oleaut32.dll	VarR4FromDisp	stdcall	i32	Windows.Win32.Foundation.HRESULT	pdispIn:Windows.Win32.System.Com.IDispatch:ptr:1|lcid:u32:u32:1|pfltOut:f32*:ptr:1
@@ -7778,7 +7780,7 @@ oleaut32.dll	VarR4FromUI2	stdcall	i32	Windows.Win32.Foundation.HRESULT	uiIn:u16:
 oleaut32.dll	VarR4FromUI4	stdcall	i32	Windows.Win32.Foundation.HRESULT	ulIn:u32:u32:1|pfltOut:f32*:ptr:1
 oleaut32.dll	VarR4FromUI8	stdcall	i32	Windows.Win32.Foundation.HRESULT	ui64In:u64:u64:2|pfltOut:f32*:ptr:1
 oleaut32.dll	VarR8FromBool	stdcall	i32	Windows.Win32.Foundation.HRESULT	boolIn:Windows.Win32.Foundation.VARIANT_BOOL:i32:1|pdblOut:f64*:ptr:1
-oleaut32.dll	VarR8FromCy	stdcall	i32	Windows.Win32.Foundation.HRESULT	cyIn:Windows.Win32.System.Com.CY:unsupported:0|pdblOut:f64*:ptr:1
+oleaut32.dll	VarR8FromCy	stdcall	i32	Windows.Win32.Foundation.HRESULT	cyIn:Windows.Win32.System.Com.CY:aggregate:2|pdblOut:f64*:ptr:1
 oleaut32.dll	VarR8FromDate	stdcall	i32	Windows.Win32.Foundation.HRESULT	dateIn:f64:f64:2|pdblOut:f64*:ptr:1
 oleaut32.dll	VarR8FromDec	stdcall	i32	Windows.Win32.Foundation.HRESULT	pdecIn:Windows.Win32.Foundation.DECIMAL*:ptr:1|pdblOut:f64*:ptr:1
 oleaut32.dll	VarR8FromDisp	stdcall	i32	Windows.Win32.Foundation.HRESULT	pdispIn:Windows.Win32.System.Com.IDispatch:ptr:1|lcid:u32:u32:1|pdblOut:f64*:ptr:1
@@ -7798,7 +7800,7 @@ oleaut32.dll	VarRound	stdcall	i32	Windows.Win32.Foundation.HRESULT	pvarIn:Window
 oleaut32.dll	VarSub	stdcall	i32	Windows.Win32.Foundation.HRESULT	pvarLeft:Windows.Win32.System.Variant.VARIANT*:ptr:1|pvarRight:Windows.Win32.System.Variant.VARIANT*:ptr:1|pvarResult:Windows.Win32.System.Variant.VARIANT*:ptr:1
 oleaut32.dll	VarTokenizeFormatString	stdcall	i32	Windows.Win32.Foundation.HRESULT	pstrFormat:Windows.Win32.Foundation.PWSTR:str16:1|rgbTok:u8*:ptr:1|cbTok:i32:i32:1|iFirstDay:Windows.Win32.System.Ole.VARFORMAT_FIRST_DAY:i32:1|iFirstWeek:Windows.Win32.System.Ole.VARFORMAT_FIRST_WEEK:i32:1|lcid:u32:u32:1|pcbActual:i32*:ptr:1
 oleaut32.dll	VarUI1FromBool	stdcall	i32	Windows.Win32.Foundation.HRESULT	boolIn:Windows.Win32.Foundation.VARIANT_BOOL:i32:1|pbOut:u8*:ptr:1
-oleaut32.dll	VarUI1FromCy	stdcall	i32	Windows.Win32.Foundation.HRESULT	cyIn:Windows.Win32.System.Com.CY:unsupported:0|pbOut:u8*:ptr:1
+oleaut32.dll	VarUI1FromCy	stdcall	i32	Windows.Win32.Foundation.HRESULT	cyIn:Windows.Win32.System.Com.CY:aggregate:2|pbOut:u8*:ptr:1
 oleaut32.dll	VarUI1FromDate	stdcall	i32	Windows.Win32.Foundation.HRESULT	dateIn:f64:f64:2|pbOut:u8*:ptr:1
 oleaut32.dll	VarUI1FromDec	stdcall	i32	Windows.Win32.Foundation.HRESULT	pdecIn:Windows.Win32.Foundation.DECIMAL*:ptr:1|pbOut:u8*:ptr:1
 oleaut32.dll	VarUI1FromDisp	stdcall	i32	Windows.Win32.Foundation.HRESULT	pdispIn:Windows.Win32.System.Com.IDispatch:ptr:1|lcid:u32:u32:1|pbOut:u8*:ptr:1
@@ -7813,7 +7815,7 @@ oleaut32.dll	VarUI1FromUI2	stdcall	i32	Windows.Win32.Foundation.HRESULT	uiIn:u16
 oleaut32.dll	VarUI1FromUI4	stdcall	i32	Windows.Win32.Foundation.HRESULT	ulIn:u32:u32:1|pbOut:u8*:ptr:1
 oleaut32.dll	VarUI1FromUI8	stdcall	i32	Windows.Win32.Foundation.HRESULT	ui64In:u64:u64:2|pbOut:u8*:ptr:1
 oleaut32.dll	VarUI2FromBool	stdcall	i32	Windows.Win32.Foundation.HRESULT	boolIn:Windows.Win32.Foundation.VARIANT_BOOL:i32:1|puiOut:u16*:ptr:1
-oleaut32.dll	VarUI2FromCy	stdcall	i32	Windows.Win32.Foundation.HRESULT	cyIn:Windows.Win32.System.Com.CY:unsupported:0|puiOut:u16*:ptr:1
+oleaut32.dll	VarUI2FromCy	stdcall	i32	Windows.Win32.Foundation.HRESULT	cyIn:Windows.Win32.System.Com.CY:aggregate:2|puiOut:u16*:ptr:1
 oleaut32.dll	VarUI2FromDate	stdcall	i32	Windows.Win32.Foundation.HRESULT	dateIn:f64:f64:2|puiOut:u16*:ptr:1
 oleaut32.dll	VarUI2FromDec	stdcall	i32	Windows.Win32.Foundation.HRESULT	pdecIn:Windows.Win32.Foundation.DECIMAL*:ptr:1|puiOut:u16*:ptr:1
 oleaut32.dll	VarUI2FromDisp	stdcall	i32	Windows.Win32.Foundation.HRESULT	pdispIn:Windows.Win32.System.Com.IDispatch:ptr:1|lcid:u32:u32:1|puiOut:u16*:ptr:1
@@ -7828,7 +7830,7 @@ oleaut32.dll	VarUI2FromUI1	stdcall	i32	Windows.Win32.Foundation.HRESULT	bIn:u8:u
 oleaut32.dll	VarUI2FromUI4	stdcall	i32	Windows.Win32.Foundation.HRESULT	ulIn:u32:u32:1|puiOut:u16*:ptr:1
 oleaut32.dll	VarUI2FromUI8	stdcall	i32	Windows.Win32.Foundation.HRESULT	i64In:u64:u64:2|puiOut:u16*:ptr:1
 oleaut32.dll	VarUI4FromBool	stdcall	i32	Windows.Win32.Foundation.HRESULT	boolIn:Windows.Win32.Foundation.VARIANT_BOOL:i32:1|pulOut:u32*:ptr:1
-oleaut32.dll	VarUI4FromCy	stdcall	i32	Windows.Win32.Foundation.HRESULT	cyIn:Windows.Win32.System.Com.CY:unsupported:0|pulOut:u32*:ptr:1
+oleaut32.dll	VarUI4FromCy	stdcall	i32	Windows.Win32.Foundation.HRESULT	cyIn:Windows.Win32.System.Com.CY:aggregate:2|pulOut:u32*:ptr:1
 oleaut32.dll	VarUI4FromDate	stdcall	i32	Windows.Win32.Foundation.HRESULT	dateIn:f64:f64:2|pulOut:u32*:ptr:1
 oleaut32.dll	VarUI4FromDec	stdcall	i32	Windows.Win32.Foundation.HRESULT	pdecIn:Windows.Win32.Foundation.DECIMAL*:ptr:1|pulOut:u32*:ptr:1
 oleaut32.dll	VarUI4FromDisp	stdcall	i32	Windows.Win32.Foundation.HRESULT	pdispIn:Windows.Win32.System.Com.IDispatch:ptr:1|lcid:u32:u32:1|pulOut:u32*:ptr:1
@@ -7843,7 +7845,7 @@ oleaut32.dll	VarUI4FromUI1	stdcall	i32	Windows.Win32.Foundation.HRESULT	bIn:u8:u
 oleaut32.dll	VarUI4FromUI2	stdcall	i32	Windows.Win32.Foundation.HRESULT	uiIn:u16:u32:1|pulOut:u32*:ptr:1
 oleaut32.dll	VarUI4FromUI8	stdcall	i32	Windows.Win32.Foundation.HRESULT	ui64In:u64:u64:2|plOut:u32*:ptr:1
 oleaut32.dll	VarUI8FromBool	stdcall	i32	Windows.Win32.Foundation.HRESULT	boolIn:Windows.Win32.Foundation.VARIANT_BOOL:i32:1|pi64Out:u64*:ptr:1
-oleaut32.dll	VarUI8FromCy	stdcall	i32	Windows.Win32.Foundation.HRESULT	cyIn:Windows.Win32.System.Com.CY:unsupported:0|pi64Out:u64*:ptr:1
+oleaut32.dll	VarUI8FromCy	stdcall	i32	Windows.Win32.Foundation.HRESULT	cyIn:Windows.Win32.System.Com.CY:aggregate:2|pi64Out:u64*:ptr:1
 oleaut32.dll	VarUI8FromDate	stdcall	i32	Windows.Win32.Foundation.HRESULT	dateIn:f64:f64:2|pi64Out:u64*:ptr:1
 oleaut32.dll	VarUI8FromDec	stdcall	i32	Windows.Win32.Foundation.HRESULT	pdecIn:Windows.Win32.Foundation.DECIMAL*:ptr:1|pi64Out:u64*:ptr:1
 oleaut32.dll	VarUI8FromDisp	stdcall	i32	Windows.Win32.Foundation.HRESULT	pdispIn:Windows.Win32.System.Com.IDispatch:ptr:1|lcid:u32:u32:1|pi64Out:u64*:ptr:1

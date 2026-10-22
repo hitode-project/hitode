@@ -454,5 +454,15 @@
       "https://learn.microsoft.com/en-us/windows/win32/api/vfw/nf-vfw-mciwndregisterclass",
       "https://github.com/microsoft/win32metadata/blob/main/generation/WinSDK/RecompiledIdlHeaders/um/Vfw.h"
     ]
+  },
+  "equal_guid": {
+    "scope": "ole32.dll!IsEqualGUID only; the pinned WinMD omits the exported macro helper",
+    "source": "Microsoft Windows SDK 10.0.26100.1 x86 Ole32.Lib and the pinned Microsoft guiddef.h declarations",
+    "header_url": "https://raw.githubusercontent.com/microsoft/win32metadata/2f767671802301cf043c717d66bf004ed7863487/generation/WinSDK/RecompiledIdlHeaders/shared/guiddef.h",
+    "header_sha256": "7b0ff3b03ace4b2b26f2765ff7b68a925242ee13f678672491c4b347b0dcbff6",
+    "sdk_package": "Microsoft.Windows.SDK.CPP.x86 10.0.26100.1; c/um/x86/Ole32.Lib",
+    "sdk_library_sha256": "fe24373081cef2457627c82307ae7ac785e1f1907e8cb6a641d174b5f1161bca",
+    "target": "SDK import symbols _IsEqualGUID@8 and __imp__IsEqualGUID@8 establish x86 stdcall with two GUID pointers and a BOOL result",
+    "documentation": "https://learn.microsoft.com/en-us/windows/win32/api/guiddef/nf-guiddef-isequalguid"
   }
 }

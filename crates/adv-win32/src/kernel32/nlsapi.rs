@@ -5,14 +5,14 @@ use adv_cpu::backend::GuestExt;
 use adv_machine::{Env, Outcome};
 
 use super::K32;
-use crate::util::{
-    bytes_or_cstr, err, out_u32, put_cstr, put_wstr, set_last_error, units_or_wstr, write_units,
-    zero,
-};
+use crate::util::{bytes_or_cstr, err, out_u32, set_last_error, units_or_wstr, write_units, zero};
 use crate::{Win32, stdcall};
-use adv_os::nls::{ctype1, is_valid_codepage, lead_byte_ranges};
+use adv_os::nls::{is_valid_codepage, lead_byte_ranges};
 
+mod character_types;
 mod collation;
+mod enumeration;
+pub(in crate::kernel32) mod locales;
 mod preferred_ui;
 
 /// Japanese (0x411) or Chinese PRC (0x804), following the code page.
@@ -215,100 +215,6 @@ fn lc_map_string_a(env: &mut Env<'_>) -> Outcome {
     })
 }
 
-fn get_string_type_w(env: &mut Env<'_>) -> Outcome {
-    let (ty, src, len, out) = (env.arg(0), env.arg(1), env.arg(2) as i32, env.arg(3));
-    let units = units_or_wstr(env.cpu, src, len);
-    let types: Vec<u16> = match ty {
-        1 => units.iter().map(|&u| ctype1(u)).collect(),
-        _ => vec![0; units.len()],
-    };
-    write_units(env.cpu, out, &types);
-    Outcome::Return(1)
-}
-
-fn get_string_type_a(env: &mut Env<'_>) -> Outcome {
-    let (_lcid, ty, src, len, out) = (
-        env.arg(0),
-        env.arg(1),
-        env.arg(2),
-        env.arg(3) as i32,
-        env.arg(4),
-    );
-    let bytes = bytes_or_cstr(env.cpu, src, len);
-    let codec = env.ext.get::<Win32>().codec;
-    // One entry per byte; a DBCS character's type goes to both its bytes.
-    let mut types = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        let n = if codec.is_lead_byte(0, bytes[i]) && i + 1 < bytes.len() {
-            2
-        } else {
-            1
-        };
-        let u = codec
-            .to_utf16(0, &bytes[i..i + n])
-            .first()
-            .copied()
-            .unwrap_or(0);
-        let t = if ty == 1 { ctype1(u) } else { 0 };
-        types.extend(std::iter::repeat_n(t, n));
-        i += n;
-    }
-    write_units(env.cpu, out, &types);
-    Outcome::Return(1)
-}
-
-/// A few LOCALE_* values the CRT and games ask for.
-fn locale_info(lcid: u32, ty: u32) -> Option<String> {
-    let ja = lcid != 0x804;
-    Some(match ty & 0xffff {
-        0x1 => format!("{lcid:04x}"),                        // LOCALE_ILANGUAGE
-        0x3 | 0x59 => if ja { "JPN" } else { "CHS" }.into(), // LOCALE_SABBREVLANGNAME
-        0x5 => if ja { "81" } else { "86" }.into(),          // LOCALE_ICOUNTRY
-        0x7 | 0x5a => if ja { "JPN" } else { "CHN" }.into(), // LOCALE_SABBREVCTRYNAME
-        0xb => if ja { "932" } else { "936" }.into(), // LOCALE_IDEFAULTANSICODEPAGE (0x1004 masked)
-        0xe => ".".into(),                            // LOCALE_SDECIMAL
-        0xf => ",".into(),                            // LOCALE_STHOUSAND
-        0x1d => "/".into(),                           // LOCALE_SDATE
-        0x1e => ":".into(),                           // LOCALE_STIME
-        0x1004 => if ja { "932" } else { "936" }.into(),
-        _ => return None,
-    })
-}
-
-fn get_locale_info(env: &mut Env<'_>, wide: bool) -> Outcome {
-    let (lcid_arg, ty, buf, cap) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3));
-    let l = if lcid_arg == 0x400 || lcid_arg == 0x800 {
-        lcid(env)
-    } else {
-        lcid_arg
-    };
-    let Some(v) = locale_info(l, ty) else {
-        log::info!("GetLocaleInfo({l:#x}, {ty:#x}): unsupported");
-        set_last_error(env, err::INVALID_PARAMETER);
-        return Outcome::Return(0);
-    };
-    let n = if wide {
-        v.encode_utf16().count()
-    } else {
-        v.len()
-    } as u32
-        + 1;
-    if cap == 0 {
-        return Outcome::Return(n);
-    }
-    let ok = if wide {
-        put_wstr(env.cpu, buf, cap, &v.encode_utf16().collect::<Vec<_>>())
-    } else {
-        put_cstr(env.cpu, buf, cap, v.as_bytes())
-    };
-    if ok.is_none() {
-        set_last_error(env, err::INSUFFICIENT_BUFFER);
-        return Outcome::Return(0);
-    }
-    Outcome::Return(n)
-}
-
 pub(super) fn compare(env: &mut Env<'_>, locale: u32, flags: u32, a: &[u16], b: &[u16]) -> u32 {
     let locale = if matches!(locale, 0 | 0x400 | 0x800 | 0xc00 | 0x1000 | 0x1400) {
         lcid(env)
@@ -382,13 +288,14 @@ fn compare_string_ex(env: &mut Env<'_>) -> Outcome {
 
 pub(super) fn register(reg: &mut Registry) {
     preferred_ui::register(reg);
+    locales::register(reg);
+    character_types::register(reg);
+    enumeration::register(reg);
     stdcall(reg, K32, "CompareStringA", 6, compare_string_a);
     stdcall(reg, K32, "CompareStringW", 6, compare_string_w);
     // Same leading layout with a locale name; the version, reserved and
     // lParam arguments must be null and do not affect the comparison.
     stdcall(reg, K32, "CompareStringEx", 9, compare_string_ex);
-    // Enumerates nothing: callers probing for a locale name find none and use their default.
-    stdcall(reg, K32, "EnumSystemLocalesW", 2, |_| Outcome::Return(1));
     stdcall(reg, K32, "GetACP", 0, |e| {
         Outcome::Return(e.ext.get::<Win32>().codec.acp)
     });
@@ -424,10 +331,12 @@ pub(super) fn register(reg: &mut Registry) {
     // The locale name replaces the LCID; the mapping itself ignores both, and
     // the trailing version, reserved and sort-handle arguments are unused.
     stdcall(reg, K32, "LCMapStringEx", 9, lc_map_string_w);
-    stdcall(reg, K32, "GetStringTypeW", 4, get_string_type_w);
-    stdcall(reg, K32, "GetStringTypeA", 5, get_string_type_a);
-    stdcall(reg, K32, "GetLocaleInfoA", 4, |e| get_locale_info(e, false));
-    stdcall(reg, K32, "GetLocaleInfoW", 4, |e| get_locale_info(e, true));
+    stdcall(reg, K32, "GetLocaleInfoA", 4, |e| {
+        locales::query(e, false, false)
+    });
+    stdcall(reg, K32, "GetLocaleInfoW", 4, |e| {
+        locales::query(e, true, false)
+    });
     for n in [
         "GetUserDefaultLCID",
         "GetSystemDefaultLCID",

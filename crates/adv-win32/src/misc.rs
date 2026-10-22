@@ -8,6 +8,7 @@ use adv_machine::{Env, Outcome};
 
 mod common_dialogs;
 mod directories;
+mod dispatch_call;
 mod dwm;
 mod folder_browse;
 mod gdiplus;
@@ -16,6 +17,7 @@ mod image_list;
 pub(crate) mod imm;
 mod internet;
 mod ole_memory;
+pub(crate) use ole_memory::parse_guid;
 mod path_match;
 mod property_sheet;
 mod safe_array;
@@ -468,6 +470,7 @@ pub fn register(reg: &mut Registry) {
     safe_array::register(reg);
     task_allocator::register(reg);
     variant::register(reg);
+    dispatch_call::register(reg);
     // Offline, with no error: the guest never reaches the network.
     stdcall(reg, SENSAPI, "IsNetworkAlive", 1, |e| {
         let flags = e.arg(0);

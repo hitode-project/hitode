@@ -13,7 +13,7 @@ This spec covers Windows system libraries outside the core subsystems, as an off
 
 ### SYS-NET-2 Local network addresses
 
-**Rule**: Winsock byte-order and numeric address conversions MUST operate without network I/O or requiring WSAStartup. Invalid text MUST preserve output, and failed pointer or family validation MUST set the documented Winsock error. Legacy Winsock DLL aliases MUST reuse initialization state and local arithmetic.
+**Rule**: Winsock byte-order and numeric address conversions MUST operate without network I/O or requiring WSAStartup. Invalid text MUST preserve output, and failed pointer or family validation MUST set the documented Winsock error. Legacy Winsock aliases and socket closure MUST share initialization state, distinguishing uninitialized libraries from invalid sockets.
 **Verification**: Test
 
 ### SYS-NET-3 Offline provider routing
@@ -34,7 +34,7 @@ This spec covers Windows system libraries outside the core subsystems, as an off
 
 ### SYS-NET-6 Offline request handles
 
-**Rule**: Request operations MUST reject session and stale handles using their documented failure conventions. Internet reads and writes MUST clear their byte counts before handle validation. Session timeout and user-agent changes MUST remain observable through existing A/W option queries.
+**Rule**: Request operations MUST reject session and stale handles using their documented failure conventions. Read and write failures MUST preserve or clear byte counts according to their validated handle and operation. Session timeout and user-agent changes MUST remain observable through existing A/W option queries.
 **Verification**: Test
 **Basis**: Microsoft WinINet handle types, InternetReadFile, InternetWriteFile and InternetSetOption contracts.
 
@@ -184,5 +184,101 @@ This spec covers Windows system libraries outside the core subsystems, as an off
 **Rule**: Local printer enumeration MUST return zero installed or connected printers with checked count outputs. OpenPrinter MUST distinguish the real local server from absent printer devices and enforce ordinary-user access. Printer-device queries MUST fail without fabricating device modes or modifying their output buffers.
 **Verification**: Test
 **Basis**: Microsoft OpenPrinter, EnumPrinters and DocumentProperties contracts and the configured printer-free profile.
+
+### SYS-REG-1 Shared registry entry points
+
+**Rule**: Legacy, extended, and native registry entry points MUST share keys, names, access checks and deleted-handle state. Enumeration MUST use stored spellings and bounded output buffers. Shell value queries MUST reuse registry encoding and size negotiation.
+**Verification**: Test
+**Basis**: Microsoft RegEnumKey, RegDeleteKeyEx, NtOpenKey and SHGetValue contracts.
+
+### SYS-STR-1 Counted RTL conversion
+
+**Rule**: Counted ANSI-to-Unicode conversion MUST use the guest ACP and explicit byte length. Insufficient supplied storage MUST preserve the destination descriptor and payload. Allocated strings MUST use the process heap and remain releasable by RtlFreeUnicodeString.
+**Verification**: Test
+**Basis**: Microsoft RtlAnsiStringToUnicodeString and authored native capacity controls.
+
+### SYS-NLS-1 Portable locale data
+
+**Rule**: Locale identifiers, names, information and enumerators MUST share the guest profile's locale data. Enumeration MUST invoke guest callbacks and honor early termination across yields. Locale queries MUST negotiate encoded output sizes and preserve output on failure.
+**Verification**: Test
+**Basis**: Microsoft locale name, GetLocaleInfo and enumeration contracts; authored native callback-stop controls.
+
+### SYS-NLS-2 Character classification
+
+**Rule**: ANSI classification MUST classify the decoded Unicode characters using the specified locale's code page. Explicit lengths MUST preserve embedded nulls, and terminated inputs MUST include the null character's classification. Unsupported classification tables MUST fail explicitly without modifying output.
+**Verification**: Test
+**Basis**: Microsoft GetStringTypeA and GetStringTypeEx contracts.
+
+### SYS-SYNC-2 Extended object creation
+
+**Rule**: Extended event and semaphore creators MUST reuse legacy and native names, signal state, lifetime and wait scheduling. Invalid creation flags MUST fail before publishing a handle. Unsupported access restrictions MUST fail explicitly.
+**Verification**: Test
+**Basis**: Microsoft CreateEventEx and CreateSemaphoreEx contracts.
+
+### SYS-NLS-3 Localized date and time pictures
+
+**Rule**: Named and LCID date/time formatters MUST share Gregorian date validation, locale names and encoded output negotiation. Date formatting MUST derive the weekday from the supplied date. Failed formatting MUST preserve output bytes.
+**Verification**: Test
+**Basis**: Microsoft GetDateFormatEx and GetTimeFormatEx contracts; authored fixed-locale native picture controls.
+
+### SYS-CORE-2 UTC to local conversion
+
+**Rule**: UTC-to-local conversion MUST use the guest's configured offset or the caller's validated time-zone rules. Recurring transitions MUST apply the bias in effect before each transition. Conversion MUST preserve output on invalid dates and range overflow.
+**Verification**: Test
+**Basis**: Microsoft SystemTimeToTzSpecificLocalTime and TIME_ZONE_INFORMATION contracts.
+
+### SYS-SECURITY-1 Guest identity queries
+
+**Rule**: SID and account queries MUST use the existing guest identity and checked SID layouts. Security-descriptor owner queries MUST preserve relative and absolute owner pointers. Privilege-name lookup MUST return stable LUIDs without granting privileges.
+**Verification**: Test
+**Basis**: Microsoft IsValidSid, LookupAccountSid, LookupPrivilegeValue and GetSecurityDescriptorOwner contracts.
+
+### SYS-SECURITY-2 Ordinary token ownership
+
+**Rule**: Token aliases MUST share privilege state, while DuplicateTokenEx MUST create an independent token copy. AdjustTokenPrivileges MUST preserve absent privileges and report ERROR_NOT_ALL_ASSIGNED without granting authority. Impersonation MUST remain bound to its guest thread, and token process creation MUST enforce the ordinary caller's privilege restrictions.
+**Verification**: Test
+**Basis**: Microsoft AdjustTokenPrivileges, DuplicateTokenEx, ImpersonateLoggedOnUser and CreateProcessWithTokenW contracts.
+
+### SYS-AUTOMATION-1 Array storage and element ownership
+
+**Rule**: SAFEARRAY creation and indexing MUST use actual guest descriptors, bounds and process-heap storage. Variant array copies MUST retain independent elements through the shared BSTR allocator and real guest COM references. Array destruction MUST respect locks and release owned elements across yielding callbacks.
+**Verification**: Test
+**Basis**: Microsoft SAFEARRAY and VARIANT contracts; authored native dimension and stride controls.
+
+### SYS-AUTOMATION-2 Scalar conversion ownership and precision
+
+**Rule**: Automation scalar conversions MUST share guest locale data and BSTR ownership. Integer and currency conversions MUST round decimal ties to even without losing integer precision. Failed conversion MUST preserve output bytes and LastError.
+**Verification**: Test
+**Basis**: Microsoft VarBoolFromStr, VarBstrFromDate, VarCyFromStr and related scalar conversion contracts; authored native scalar controls.
+
+### SYS-AUTOMATION-3 Indirect values and extended coercion
+
+**Rule**: Indirect VARIANT copies MUST resolve borrowed pointers and establish independent ownership before retiring an aliased destination. Extended coercion MUST compute its result before releasing destination resources. Guest reference callbacks MUST preserve conversion continuations across scheduler waits.
+**Verification**: Test
+**Basis**: Microsoft VariantCopyInd and VariantChangeTypeEx contracts.
+
+### SYS-COM-1 Apartment and server lifetime
+
+**Rule**: COM and OLE initialization MUST maintain nesting and apartment mode per virtual thread. Conflicting modes MUST fail without changing initialization counts. Server references and class-publication suspension MUST belong to the guest process.
+**Verification**: Test
+**Basis**: Microsoft CoInitializeEx, OleInitialize, CoAddRefServerProcess and CoReleaseServerProcess contracts.
+
+### SYS-COM-2 Guest interface forwarding
+
+**Rule**: OLE drawing, running locks and proxy security MUST invoke the object's actual queried guest interface. Adapters MUST return the method's result and balance acquired references across guest waits. Interface lookup failure MUST NOT manufacture drawing or security effects.
+**Verification**: Test
+**Basis**: Microsoft OleDraw, OleLockRunning, CoSetProxyBlanket and IUnknown contracts.
+
+### SYS-COM-3 Installed class activation
+
+**Rule**: Class factories MUST activate installed constructors through shared COM identities and reference counts. Multi-interface activation MUST query one constructed object and publish individual HRESULTs. ProgID lookup MUST read the shared virtual registry without inventing classes.
+**Verification**: Test
+**Basis**: Microsoft CoGetClassObject, CoCreateInstanceEx, CLSIDFromProgID and IClassFactory contracts.
+
+### SYS-AUTOMATION-4 Actual dispatch calls
+
+**Rule**: DispCallFunc MUST invoke the supplied guest procedure or vtable entry with the declared x86 argument widths. Scalar results MUST come from actual EAX, EDX or x87 state after the call. Unsupported aggregate return conventions MUST fail explicitly before executing the procedure.
+**Verification**: Test
+**Basis**: Microsoft DispCallFunc contract and pinned WinMD x86 scalar layouts.
 
 Withdrawn: none

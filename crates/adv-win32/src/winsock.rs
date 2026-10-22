@@ -39,6 +39,16 @@ pub fn register(registry: &mut Registry) {
     for (name, function) in aliases {
         registry.add("wsock32.dll", &name, function.conv, function.handler);
     }
+    crate::stdcall(registry, "ws2_32.dll", "closesocket", 1, |env| {
+        // No socket creation front exists in this closure. Kernel, Internet and
+        // stale numeric handles cannot become sockets merely by their value.
+        let initialized = env
+            .ext
+            .try_get::<Library>()
+            .is_some_and(|library| library.references != 0);
+        set_last_error(env, if initialized { 10038 } else { NOT_INITIALIZED });
+        Outcome::Return(u32::MAX)
+    });
 }
 fn negotiated(requested: u16) -> Option<u16> {
     let major = requested as u8;

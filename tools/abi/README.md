@@ -62,6 +62,14 @@ Struct packing follows WinMD, and any padding is explicit so Pod records never e
 Large arrays use zeroed defaults; records exceeding 255 stack words are pointer-only and do not get a by-value `GuestArg` implementation.
 `D3DADAPTER_IDENTIFIER9` is 1100 bytes with packing 4; the authored D3D9 capability fixture checks these values and field offsets against the installed x86 SDK in addition to the generated assertions.
 
+Nested WinMD records retain their declaring type in the layout cache, so anonymous union names cannot collide.
+Automation currency values therefore occupy two x86 stack words.
+Generated Automation records preserve SDK alignment and opaque union storage with size and field-offset assertions.
+COM tables include the activation, moniker, type-information, font, picture and desktop-folder interfaces used by the system closure.
+
+The exported `ole32!IsEqualGUID` helper uses the SDK import library's `_IsEqualGUID@8` declaration; its inline header spelling is absent from WinMD.
+Its scoped supplement preserves two GUID pointers and a BOOL result.
+
 ## Selected legacy exports and DLL aliases
 
 DbgHelp is projected in full; ImageHlp retains only the `MakeSureDirectoryPathExists` alias.

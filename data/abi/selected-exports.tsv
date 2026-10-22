@@ -88,3 +88,5 @@ wsock32.dll	WSAIsBlocking	ws2_32.dll	WSAIsBlocking	0
 wsock32.dll	WSAStartup	ws2_32.dll	WSAStartup	2
 wsock32.dll	WSACleanup	ws2_32.dll	WSACleanup	0
 wsock32.dll	__WSAFDIsSet	ws2_32.dll	__WSAFDIsSet	2
+# The closure's counted ACP conversion is present in the pinned WinMD.
+ntdll.dll	RtlAnsiStringToUnicodeString	ntdll.dll	RtlAnsiStringToUnicodeString	3

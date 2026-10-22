@@ -1,9 +1,10 @@
-//! SAFEARRAY lock and data access over guest-owned descriptors, following
-//! Wine's oleaut32: the x86 descriptor keeps cLocks at +8 and pvData at +12.
+//! SAFEARRAY descriptors and elements share guest memory and process heap ownership.
 //! API contract: https://learn.microsoft.com/windows/win32/api/oleauto/nf-oleauto-safearrayaccessdata
 use adv_abi::{GuestPtr, Registry, guest::check_range, win32};
 use adv_cpu::backend::{GuestExt, Prot};
 use adv_machine::Env;
+mod owned;
+pub(super) use owned::{clone_then, destroy_then};
 
 #[cfg(test)]
 mod tests;
@@ -13,10 +14,11 @@ const E_UNEXPECTED: i32 = 0x8000_ffff_u32 as i32;
 const E_INVALIDARG: i32 = 0x8007_0057_u32 as i32;
 const LOCKS: u32 = 8;
 const DATA: u32 = 12;
-/// Wine refuses a lock count above this; native fails with E_UNEXPECTED too.
+/// Shared lock-counter limit for direct locks and data access.
 const MAX_LOCKS: u32 = 0xffff;
 
 pub(super) fn register(registry: &mut Registry) {
+    owned::register(registry);
     for api in [lock_ABI, unlock_ABI, access_ABI, unaccess_ABI] {
         registry.register(api);
     }

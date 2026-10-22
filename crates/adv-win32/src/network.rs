@@ -225,8 +225,11 @@ pub(crate) fn set_option(
         );
         return fail(env, 12009) as i32;
     }
-    if (option != 41 && length != 4) || (option == 41 && length & 1 != 0) {
+    if length == 0 {
         return fail(env, 87) as i32;
+    }
+    if (option != 41 && length != 4) || (option == 41 && length & 1 != 0) {
+        return fail(env, 12010) as i32;
     }
     if input == 0 || check_range(env.cpu, input, length, Prot::READ).is_err() {
         return fail(env, 87) as i32;

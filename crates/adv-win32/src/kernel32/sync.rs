@@ -648,6 +648,7 @@ pub(super) fn register(reg: &mut Registry) {
     });
     stdcall(reg, K32, "CreateEventA", 4, create_event);
     stdcall(reg, K32, "CreateEventW", 4, create_event);
+    stdcall(reg, K32, "CreateEventExW", 4, event::create_ex_front);
     reg.register(open_event_a_ABI);
     reg.register(open_event_w_ABI);
     stdcall(reg, K32, "SetEvent", 1, |e| event::state_front(e, true));
@@ -655,6 +656,7 @@ pub(super) fn register(reg: &mut Registry) {
     stdcall(reg, K32, "PulseEvent", 1, event::pulse_front);
     stdcall(reg, K32, "CreateSemaphoreA", 4, create_semaphore);
     stdcall(reg, K32, "CreateSemaphoreW", 4, create_semaphore);
+    stdcall(reg, K32, "CreateSemaphoreExW", 6, owned::create_ex_front);
     stdcall(reg, K32, "OpenSemaphoreA", 3, |env| {
         owned::open_front(env, owned::Kind::Semaphore)
     });

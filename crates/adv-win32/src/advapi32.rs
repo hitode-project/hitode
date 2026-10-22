@@ -6,7 +6,9 @@ pub(crate) use crypto::digest::Digest;
 mod groups;
 mod identity;
 mod scm;
+mod security;
 pub(crate) mod token;
+mod transactions;
 
 mod legacy;
 mod random;
@@ -376,17 +378,77 @@ fn set_value(env: &mut Env<'_>, wide: bool) -> Outcome {
     Outcome::Return(result.unwrap_or_else(|error| error))
 }
 fn query_value(env: &mut Env<'_>, wide: bool) -> Outcome {
-    let result = (|| -> Result<u32, u32> {
-        if env.arg(2) != 0 {
-            return Err(INVALID_PARAMETER);
+    if env.arg(2) != 0 {
+        return Outcome::Return(INVALID_PARAMETER);
+    }
+    query_value_at(
+        env,
+        wide,
+        env.arg(0),
+        env.arg(1),
+        [env.arg(3), env.arg(4), env.arg(5)],
+    )
+}
+#[adv_abi::win32(shlwapi,name="SHGetValueA",level=implement)]
+fn shell_get_value(
+    env: &mut Env<'_>,
+    key: adv_abi::Handle,
+    subkey: adv_abi::AnsiStr,
+    value: adv_abi::AnsiStr,
+    kind: adv_abi::GuestPtr<u32>,
+    data: adv_abi::GuestPtr<()>,
+    size: adv_abi::GuestPtr<u32>,
+) -> Outcome {
+    let request = (|| {
+        let subkey = name(env, subkey.0.addr(), false, true)?;
+        if subkey.is_empty() {
+            return Ok((key.0, false));
         }
-        let name = fold(&name(env, env.arg(1), wide, true)?);
-        let hkey = env.arg(0);
+        let parent = opened(env, key.0)?;
+        let (key, _) = child_key(&parent.key, &subkey)?;
+        let registry = state(env);
+        if !registry.keys.contains_key(&key) {
+            return Err(NOT_FOUND);
+        }
+        let handle =
+            env.ext
+                .get_mut::<VirtualRegistry>()
+                .allocate(&mut env.sys.objects, key, QUERY)?;
+        Ok((handle, true))
+    })();
+    let (handle, close) = match request {
+        Ok(result) => result,
+        Err(error) => return Outcome::Return(error),
+    };
+    let result = query_value_at(
+        env,
+        false,
+        handle,
+        value.0.addr(),
+        [kind.addr(), data.addr(), size.addr()],
+    );
+    if close {
+        let _ = env
+            .ext
+            .get::<VirtualRegistry>()
+            .close(&mut env.sys.objects, handle);
+    }
+    result
+}
+fn query_value_at(
+    env: &mut Env<'_>,
+    wide: bool,
+    hkey: u32,
+    value_name: u32,
+    outputs: [u32; 3],
+) -> Outcome {
+    let result = (|| -> Result<u32, u32> {
+        let name = fold(&name(env, value_name, wide, true)?);
         let opened = opened(env, hkey)?;
         if opened.access & QUERY == 0 {
             return Err(ACCESS_DENIED);
         }
-        let (type_out, data_out, size_out) = (env.arg(3), env.arg(4), env.arg(5));
+        let [type_out, data_out, size_out] = outputs;
         output(env, type_out, true)?;
         output(env, size_out, data_out == 0)?;
         let capacity = if data_out != 0 {
@@ -510,6 +572,8 @@ fn notify_change_key_value(_env: &mut Env<'_>) -> Outcome {
 }
 
 pub fn register(reg: &mut Registry) {
+    reg.register(shell_get_value_ABI);
+    transactions::register(reg);
     crypto::register(reg);
     legacy::register(reg);
     random::register(reg);
@@ -517,6 +581,7 @@ pub fn register(reg: &mut Registry) {
     identity::register(reg);
     scm::register(reg);
     token::register(reg);
+    security::register(reg);
     for (name, argc, handler) in [
         (
             "RegOpenKeyExA",

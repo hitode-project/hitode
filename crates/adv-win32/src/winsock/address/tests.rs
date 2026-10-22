@@ -109,6 +109,13 @@ fn conversions<B: Backend>(cpu: B) {
         0,
         10014,
     );
+    call("ws2_32.dll", "closesocket", &[0], u32::MAX, 10093);
+    call("wsock32.dll", "WSAStartup", &[0x202, DATA + 0xc00], 0, 0);
+    for socket in [0, u32::MAX, 0x11000004] {
+        call("ws2_32.dll", "closesocket", &[socket], u32::MAX, 10038);
+    }
+    call("ws2_32.dll", "WSACleanup", &[], 0, 0);
+    call("ws2_32.dll", "closesocket", &[0], u32::MAX, 10093);
     code.mov_mem_imm(DATA + 0x700, 0)
         .mov_eax_mem(DATA + 0x700)
         .ret();

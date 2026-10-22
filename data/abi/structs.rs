@@ -1,6 +1,6 @@
 // Generated from pinned Windows.Win32.winmd, x86 only.
 #![allow(non_snake_case)]
-#[repr(C)]
+#[repr(C, align(4))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct FILETIME {
     pub dwLowDateTime: u32,
@@ -15,7 +15,7 @@ impl crate::GuestArg for FILETIME {
     const WORDS: u8 = 2;
     fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
 }
-#[repr(C)]
+#[repr(C, align(2))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct SYSTEMTIME {
     pub wYear: u16,
@@ -42,7 +42,7 @@ impl crate::GuestArg for SYSTEMTIME {
     const WORDS: u8 = 4;
     fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
 }
-#[repr(C)]
+#[repr(C, align(4))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct POINT {
     pub x: i32,
@@ -57,7 +57,7 @@ impl crate::GuestArg for POINT {
     const WORDS: u8 = 2;
     fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
 }
-#[repr(C)]
+#[repr(C, align(4))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct RECT {
     pub left: i32,
@@ -76,7 +76,7 @@ impl crate::GuestArg for RECT {
     const WORDS: u8 = 4;
     fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
 }
-#[repr(C)]
+#[repr(C, align(1))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct BLENDFUNCTION {
     pub BlendOp: u8,
@@ -95,7 +95,7 @@ impl crate::GuestArg for BLENDFUNCTION {
     const WORDS: u8 = 1;
     fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
 }
-#[repr(C)]
+#[repr(C, align(4))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct TRIVERTEX {
     pub x: i32,
@@ -118,7 +118,7 @@ impl crate::GuestArg for TRIVERTEX {
     const WORDS: u8 = 4;
     fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
 }
-#[repr(C)]
+#[repr(C, align(4))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GRADIENT_RECT {
     pub UpperLeft: u32,
@@ -133,7 +133,7 @@ impl crate::GuestArg for GRADIENT_RECT {
     const WORDS: u8 = 2;
     fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
 }
-#[repr(C)]
+#[repr(C, align(4))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GRADIENT_TRIANGLE {
     pub Vertex1: u32,
@@ -150,7 +150,7 @@ impl crate::GuestArg for GRADIENT_TRIANGLE {
     const WORDS: u8 = 3;
     fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
 }
-#[repr(C)]
+#[repr(C, align(4))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct SECURITY_ATTRIBUTES {
     pub nLength: u32,
@@ -167,7 +167,7 @@ impl crate::GuestArg for SECURITY_ATTRIBUTES {
     const WORDS: u8 = 3;
     fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
 }
-#[repr(C)]
+#[repr(C, align(4))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct D3DPRESENT_PARAMETERS {
     pub BackBufferWidth: u32,
@@ -206,7 +206,7 @@ impl crate::GuestArg for D3DPRESENT_PARAMETERS {
     const WORDS: u8 = 14;
     fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
 }
-#[repr(C)]
+#[repr(C, align(4))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct D3DLOCKED_RECT {
     pub Pitch: i32,
@@ -221,7 +221,7 @@ impl crate::GuestArg for D3DLOCKED_RECT {
     const WORDS: u8 = 2;
     fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
 }
-#[repr(C)]
+#[repr(C, align(4))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct D3DSURFACE_DESC {
     pub Format: u32,
@@ -248,7 +248,7 @@ impl crate::GuestArg for D3DSURFACE_DESC {
     const WORDS: u8 = 8;
     fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
 }
-#[repr(C)]
+#[repr(C, align(4))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct D3DVIEWPORT9 {
     pub X: u32,
@@ -271,7 +271,7 @@ impl crate::GuestArg for D3DVIEWPORT9 {
     const WORDS: u8 = 6;
     fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
 }
-#[repr(C)]
+#[repr(C, align(4))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct D3DVERTEXBUFFER_DESC {
     pub Format: u32,
@@ -294,7 +294,7 @@ impl crate::GuestArg for D3DVERTEXBUFFER_DESC {
     const WORDS: u8 = 6;
     fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
 }
-#[repr(C)]
+#[repr(C, align(4))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct D3DINDEXBUFFER_DESC {
     pub Format: u32,
@@ -315,7 +315,7 @@ impl crate::GuestArg for D3DINDEXBUFFER_DESC {
     const WORDS: u8 = 5;
     fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
 }
-#[repr(C)]
+#[repr(C, align(4))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct D3DDISPLAYMODE {
     pub Width: u32,
@@ -334,7 +334,7 @@ impl crate::GuestArg for D3DDISPLAYMODE {
     const WORDS: u8 = 4;
     fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
 }
-#[repr(C)]
+#[repr(C, align(4))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct D3DDEVICE_CREATION_PARAMETERS {
     pub AdapterOrdinal: u32,
@@ -353,7 +353,7 @@ impl crate::GuestArg for D3DDEVICE_CREATION_PARAMETERS {
     const WORDS: u8 = 4;
     fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
 }
-#[repr(C)]
+#[repr(C, align(4))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct D3DVSHADERCAPS2_0 {
     pub Caps: u32,
@@ -372,7 +372,7 @@ impl crate::GuestArg for D3DVSHADERCAPS2_0 {
     const WORDS: u8 = 4;
     fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
 }
-#[repr(C)]
+#[repr(C, align(4))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct D3DPSHADERCAPS2_0 {
     pub Caps: u32,
@@ -393,7 +393,7 @@ impl crate::GuestArg for D3DPSHADERCAPS2_0 {
     const WORDS: u8 = 5;
     fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
 }
-#[repr(C)]
+#[repr(C, align(4))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct D3DCAPS9 {
     pub DeviceType: i32,
@@ -569,7 +569,7 @@ const _: () = assert!(core::mem::offset_of!(D3DADAPTER_IDENTIFIER9, SubSysId) ==
 const _: () = assert!(core::mem::offset_of!(D3DADAPTER_IDENTIFIER9, Revision) == 1076);
 const _: () = assert!(core::mem::offset_of!(D3DADAPTER_IDENTIFIER9, DeviceIdentifier) == 1080);
 const _: () = assert!(core::mem::offset_of!(D3DADAPTER_IDENTIFIER9, WHQLLevel) == 1096);
-#[repr(C)]
+#[repr(C, align(8))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DDDEVICEIDENTIFIER2 {
     pub szDriver: [i8; 512],
@@ -595,7 +595,7 @@ const _: () = assert!(core::mem::offset_of!(DDDEVICEIDENTIFIER2, dwSubSysId) == 
 const _: () = assert!(core::mem::offset_of!(DDDEVICEIDENTIFIER2, dwRevision) == 1044);
 const _: () = assert!(core::mem::offset_of!(DDDEVICEIDENTIFIER2, guidDeviceIdentifier) == 1048);
 const _: () = assert!(core::mem::offset_of!(DDDEVICEIDENTIFIER2, dwWHQLLevel) == 1064);
-#[repr(C)]
+#[repr(C, align(8))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct STATSTG {
     pub pwcsName: u32,
@@ -626,5 +626,285 @@ const _: () = assert!(core::mem::offset_of!(STATSTG, reserved) == 68);
 impl crate::GuestArg for STATSTG {
     const KIND: crate::AbiKind = crate::AbiKind::Aggregate;
     const WORDS: u8 = 18;
+    fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
+}
+#[repr(C, align(4))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct SAFEARRAYBOUND {
+    pub cElements: u32,
+    pub lLbound: i32,
+}
+const _: () = assert!(core::mem::size_of::<SAFEARRAYBOUND>() == 8);
+const _: () = assert!(core::mem::align_of::<SAFEARRAYBOUND>() == 4);
+const _: () = assert!(core::mem::offset_of!(SAFEARRAYBOUND, cElements) == 0);
+const _: () = assert!(core::mem::offset_of!(SAFEARRAYBOUND, lLbound) == 4);
+impl crate::GuestArg for SAFEARRAYBOUND {
+    const KIND: crate::AbiKind = crate::AbiKind::Aggregate;
+    const WORDS: u8 = 2;
+    fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
+}
+#[repr(C, align(4))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct SAFEARRAY {
+    pub cDims: u16,
+    pub fFeatures: u16,
+    pub cbElements: u32,
+    pub cLocks: u32,
+    pub pvData: u32,
+    pub rgsabound: [SAFEARRAYBOUND; 1],
+}
+const _: () = assert!(core::mem::size_of::<SAFEARRAY>() == 24);
+const _: () = assert!(core::mem::align_of::<SAFEARRAY>() == 4);
+const _: () = assert!(core::mem::offset_of!(SAFEARRAY, cDims) == 0);
+const _: () = assert!(core::mem::offset_of!(SAFEARRAY, fFeatures) == 2);
+const _: () = assert!(core::mem::offset_of!(SAFEARRAY, cbElements) == 4);
+const _: () = assert!(core::mem::offset_of!(SAFEARRAY, cLocks) == 8);
+const _: () = assert!(core::mem::offset_of!(SAFEARRAY, pvData) == 12);
+const _: () = assert!(core::mem::offset_of!(SAFEARRAY, rgsabound) == 16);
+impl crate::GuestArg for SAFEARRAY {
+    const KIND: crate::AbiKind = crate::AbiKind::Aggregate;
+    const WORDS: u8 = 6;
+    fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
+}
+#[repr(C, align(4))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct TYPEDESC {
+    pub Anonymous: [u8; 4],
+    pub vt: u16,
+    pub _padding0: [u8; 2],
+}
+const _: () = assert!(core::mem::size_of::<TYPEDESC>() == 8);
+const _: () = assert!(core::mem::align_of::<TYPEDESC>() == 4);
+const _: () = assert!(core::mem::offset_of!(TYPEDESC, Anonymous) == 0);
+const _: () = assert!(core::mem::offset_of!(TYPEDESC, vt) == 4);
+impl crate::GuestArg for TYPEDESC {
+    const KIND: crate::AbiKind = crate::AbiKind::Aggregate;
+    const WORDS: u8 = 2;
+    fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
+}
+#[repr(C, align(4))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ELEMDESC {
+    pub tdesc: TYPEDESC,
+    pub Anonymous: [u8; 8],
+}
+const _: () = assert!(core::mem::size_of::<ELEMDESC>() == 16);
+const _: () = assert!(core::mem::align_of::<ELEMDESC>() == 4);
+const _: () = assert!(core::mem::offset_of!(ELEMDESC, tdesc) == 0);
+const _: () = assert!(core::mem::offset_of!(ELEMDESC, Anonymous) == 8);
+impl crate::GuestArg for ELEMDESC {
+    const KIND: crate::AbiKind = crate::AbiKind::Aggregate;
+    const WORDS: u8 = 4;
+    fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
+}
+#[repr(C, align(4))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct FUNCDESC {
+    pub memid: i32,
+    pub lprgscode: u32,
+    pub lprgelemdescParam: u32,
+    pub funckind: i32,
+    pub invkind: i32,
+    pub callconv: i32,
+    pub cParams: i16,
+    pub cParamsOpt: i16,
+    pub oVft: i16,
+    pub cScodes: i16,
+    pub elemdescFunc: ELEMDESC,
+    pub wFuncFlags: u16,
+    pub _padding0: [u8; 2],
+}
+const _: () = assert!(core::mem::size_of::<FUNCDESC>() == 52);
+const _: () = assert!(core::mem::align_of::<FUNCDESC>() == 4);
+const _: () = assert!(core::mem::offset_of!(FUNCDESC, memid) == 0);
+const _: () = assert!(core::mem::offset_of!(FUNCDESC, lprgscode) == 4);
+const _: () = assert!(core::mem::offset_of!(FUNCDESC, lprgelemdescParam) == 8);
+const _: () = assert!(core::mem::offset_of!(FUNCDESC, funckind) == 12);
+const _: () = assert!(core::mem::offset_of!(FUNCDESC, invkind) == 16);
+const _: () = assert!(core::mem::offset_of!(FUNCDESC, callconv) == 20);
+const _: () = assert!(core::mem::offset_of!(FUNCDESC, cParams) == 24);
+const _: () = assert!(core::mem::offset_of!(FUNCDESC, cParamsOpt) == 26);
+const _: () = assert!(core::mem::offset_of!(FUNCDESC, oVft) == 28);
+const _: () = assert!(core::mem::offset_of!(FUNCDESC, cScodes) == 30);
+const _: () = assert!(core::mem::offset_of!(FUNCDESC, elemdescFunc) == 32);
+const _: () = assert!(core::mem::offset_of!(FUNCDESC, wFuncFlags) == 48);
+impl crate::GuestArg for FUNCDESC {
+    const KIND: crate::AbiKind = crate::AbiKind::Aggregate;
+    const WORDS: u8 = 13;
+    fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
+}
+#[repr(C, align(4))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct VARDESC {
+    pub memid: i32,
+    pub lpstrSchema: u32,
+    pub Anonymous: [u8; 4],
+    pub elemdescVar: ELEMDESC,
+    pub wVarFlags: u16,
+    pub _padding0: [u8; 2],
+    pub varkind: i32,
+}
+const _: () = assert!(core::mem::size_of::<VARDESC>() == 36);
+const _: () = assert!(core::mem::align_of::<VARDESC>() == 4);
+const _: () = assert!(core::mem::offset_of!(VARDESC, memid) == 0);
+const _: () = assert!(core::mem::offset_of!(VARDESC, lpstrSchema) == 4);
+const _: () = assert!(core::mem::offset_of!(VARDESC, Anonymous) == 8);
+const _: () = assert!(core::mem::offset_of!(VARDESC, elemdescVar) == 12);
+const _: () = assert!(core::mem::offset_of!(VARDESC, wVarFlags) == 28);
+const _: () = assert!(core::mem::offset_of!(VARDESC, varkind) == 32);
+impl crate::GuestArg for VARDESC {
+    const KIND: crate::AbiKind = crate::AbiKind::Aggregate;
+    const WORDS: u8 = 9;
+    fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
+}
+#[repr(C, align(4))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct TYPEATTR {
+    pub guid: [u32; 4],
+    pub lcid: u32,
+    pub dwReserved: u32,
+    pub memidConstructor: i32,
+    pub memidDestructor: i32,
+    pub lpstrSchema: u32,
+    pub cbSizeInstance: u32,
+    pub typekind: i32,
+    pub cFuncs: u16,
+    pub cVars: u16,
+    pub cImplTypes: u16,
+    pub cbSizeVft: u16,
+    pub cbAlignment: u16,
+    pub wTypeFlags: u16,
+    pub wMajorVerNum: u16,
+    pub wMinorVerNum: u16,
+    pub tdescAlias: TYPEDESC,
+    pub idldescType: [u8; 8],
+}
+const _: () = assert!(core::mem::size_of::<TYPEATTR>() == 76);
+const _: () = assert!(core::mem::align_of::<TYPEATTR>() == 4);
+const _: () = assert!(core::mem::offset_of!(TYPEATTR, guid) == 0);
+const _: () = assert!(core::mem::offset_of!(TYPEATTR, lcid) == 16);
+const _: () = assert!(core::mem::offset_of!(TYPEATTR, dwReserved) == 20);
+const _: () = assert!(core::mem::offset_of!(TYPEATTR, memidConstructor) == 24);
+const _: () = assert!(core::mem::offset_of!(TYPEATTR, memidDestructor) == 28);
+const _: () = assert!(core::mem::offset_of!(TYPEATTR, lpstrSchema) == 32);
+const _: () = assert!(core::mem::offset_of!(TYPEATTR, cbSizeInstance) == 36);
+const _: () = assert!(core::mem::offset_of!(TYPEATTR, typekind) == 40);
+const _: () = assert!(core::mem::offset_of!(TYPEATTR, cFuncs) == 44);
+const _: () = assert!(core::mem::offset_of!(TYPEATTR, cVars) == 46);
+const _: () = assert!(core::mem::offset_of!(TYPEATTR, cImplTypes) == 48);
+const _: () = assert!(core::mem::offset_of!(TYPEATTR, cbSizeVft) == 50);
+const _: () = assert!(core::mem::offset_of!(TYPEATTR, cbAlignment) == 52);
+const _: () = assert!(core::mem::offset_of!(TYPEATTR, wTypeFlags) == 54);
+const _: () = assert!(core::mem::offset_of!(TYPEATTR, wMajorVerNum) == 56);
+const _: () = assert!(core::mem::offset_of!(TYPEATTR, wMinorVerNum) == 58);
+const _: () = assert!(core::mem::offset_of!(TYPEATTR, tdescAlias) == 60);
+const _: () = assert!(core::mem::offset_of!(TYPEATTR, idldescType) == 68);
+impl crate::GuestArg for TYPEATTR {
+    const KIND: crate::AbiKind = crate::AbiKind::Aggregate;
+    const WORDS: u8 = 19;
+    fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
+}
+#[repr(C, align(4))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct TLIBATTR {
+    pub guid: [u32; 4],
+    pub lcid: u32,
+    pub syskind: i32,
+    pub wMajorVerNum: u16,
+    pub wMinorVerNum: u16,
+    pub wLibFlags: u16,
+    pub _padding0: [u8; 2],
+}
+const _: () = assert!(core::mem::size_of::<TLIBATTR>() == 32);
+const _: () = assert!(core::mem::align_of::<TLIBATTR>() == 4);
+const _: () = assert!(core::mem::offset_of!(TLIBATTR, guid) == 0);
+const _: () = assert!(core::mem::offset_of!(TLIBATTR, lcid) == 16);
+const _: () = assert!(core::mem::offset_of!(TLIBATTR, syskind) == 20);
+const _: () = assert!(core::mem::offset_of!(TLIBATTR, wMajorVerNum) == 24);
+const _: () = assert!(core::mem::offset_of!(TLIBATTR, wMinorVerNum) == 26);
+const _: () = assert!(core::mem::offset_of!(TLIBATTR, wLibFlags) == 28);
+impl crate::GuestArg for TLIBATTR {
+    const KIND: crate::AbiKind = crate::AbiKind::Aggregate;
+    const WORDS: u8 = 8;
+    fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
+}
+#[repr(C, align(8))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct FONTDESC {
+    pub cbSizeofstruct: u32,
+    pub lpstrName: u32,
+    pub cySize: [u8; 8],
+    pub sWeight: i16,
+    pub sCharset: i16,
+    pub fItalic: i32,
+    pub fUnderline: i32,
+    pub fStrikethrough: i32,
+}
+const _: () = assert!(core::mem::size_of::<FONTDESC>() == 32);
+const _: () = assert!(core::mem::align_of::<FONTDESC>() == 8);
+const _: () = assert!(core::mem::offset_of!(FONTDESC, cbSizeofstruct) == 0);
+const _: () = assert!(core::mem::offset_of!(FONTDESC, lpstrName) == 4);
+const _: () = assert!(core::mem::offset_of!(FONTDESC, cySize) == 8);
+const _: () = assert!(core::mem::offset_of!(FONTDESC, sWeight) == 16);
+const _: () = assert!(core::mem::offset_of!(FONTDESC, sCharset) == 18);
+const _: () = assert!(core::mem::offset_of!(FONTDESC, fItalic) == 20);
+const _: () = assert!(core::mem::offset_of!(FONTDESC, fUnderline) == 24);
+const _: () = assert!(core::mem::offset_of!(FONTDESC, fStrikethrough) == 28);
+impl crate::GuestArg for FONTDESC {
+    const KIND: crate::AbiKind = crate::AbiKind::Aggregate;
+    const WORDS: u8 = 8;
+    fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
+}
+#[repr(C, align(4))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct PICTDESC {
+    pub cbSizeofstruct: u32,
+    pub picType: u32,
+    pub Anonymous: [u8; 12],
+}
+const _: () = assert!(core::mem::size_of::<PICTDESC>() == 20);
+const _: () = assert!(core::mem::align_of::<PICTDESC>() == 4);
+const _: () = assert!(core::mem::offset_of!(PICTDESC, cbSizeofstruct) == 0);
+const _: () = assert!(core::mem::offset_of!(PICTDESC, picType) == 4);
+const _: () = assert!(core::mem::offset_of!(PICTDESC, Anonymous) == 8);
+impl crate::GuestArg for PICTDESC {
+    const KIND: crate::AbiKind = crate::AbiKind::Aggregate;
+    const WORDS: u8 = 5;
+    fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
+}
+#[repr(C, align(4))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct MULTI_QI {
+    pub pIID: u32,
+    pub pItf: u32,
+    pub hr: i32,
+}
+const _: () = assert!(core::mem::size_of::<MULTI_QI>() == 12);
+const _: () = assert!(core::mem::align_of::<MULTI_QI>() == 4);
+const _: () = assert!(core::mem::offset_of!(MULTI_QI, pIID) == 0);
+const _: () = assert!(core::mem::offset_of!(MULTI_QI, pItf) == 4);
+const _: () = assert!(core::mem::offset_of!(MULTI_QI, hr) == 8);
+impl crate::GuestArg for MULTI_QI {
+    const KIND: crate::AbiKind = crate::AbiKind::Aggregate;
+    const WORDS: u8 = 3;
+    fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
+}
+#[repr(C, align(4))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct COSERVERINFO {
+    pub dwReserved1: u32,
+    pub pwszName: u32,
+    pub pAuthInfo: u32,
+    pub dwReserved2: u32,
+}
+const _: () = assert!(core::mem::size_of::<COSERVERINFO>() == 16);
+const _: () = assert!(core::mem::align_of::<COSERVERINFO>() == 4);
+const _: () = assert!(core::mem::offset_of!(COSERVERINFO, dwReserved1) == 0);
+const _: () = assert!(core::mem::offset_of!(COSERVERINFO, pwszName) == 4);
+const _: () = assert!(core::mem::offset_of!(COSERVERINFO, pAuthInfo) == 8);
+const _: () = assert!(core::mem::offset_of!(COSERVERINFO, dwReserved2) == 12);
+impl crate::GuestArg for COSERVERINFO {
+    const KIND: crate::AbiKind = crate::AbiKind::Aggregate;
+    const WORDS: u8 = 4;
     fn decode(args: &mut crate::Arguments<'_>) -> Result<Self, adv_cpu::backend::MemFault> { args.pod() }
 }
