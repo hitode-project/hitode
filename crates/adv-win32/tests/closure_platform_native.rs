@@ -72,6 +72,7 @@ unsafe extern "system" {
     fn InternetSetOptionW(handle: Handle, option: u32, input: *const c_void, length: u32) -> i32;
     fn InternetQueryOptionA(handle: Handle, option: u32, output: *mut u8, length: *mut u32) -> i32;
     fn InternetReadFile(handle: Handle, output: *mut u8, length: u32, count: *mut u32) -> i32;
+    fn InternetWriteFile(handle: Handle, input: *const u8, length: u32, count: *mut u32) -> i32;
 }
 #[test]
 // spec: PERS-PRINT-1
@@ -110,7 +111,7 @@ fn native_transaction_handle_controls() {
     // Empty subkeys reopen the existing root; neither call creates or edits keys.
     let root = (0x80000001u32 as i32 as isize) as Handle;
     let name = [0u16];
-    for transaction in [0usize, usize::MAX] {
+    for transaction in [0usize, usize::MAX, 0x55555555] {
         let mut opened = 0x5555usize as Handle;
         let result = unsafe {
             RegOpenKeyTransactedW(
@@ -159,6 +160,7 @@ fn native_transaction_handle_controls() {
     }
 }
 #[test]
+// spec: PERS-STR-1
 fn native_counted_ansi_destination_capacity_controls() {
     let mut input = [0u8; 64];
     input[..4].copy_from_slice(b"ab\0c");
@@ -181,8 +183,33 @@ fn native_counted_ansi_destination_capacity_controls() {
             destination.maximum,
             &bytes[8..20]
         );
-        assert!(matches!(result, 0 | 0x80000005));
+        assert_eq!(result, if maximum >= 10 { 0 } else { 0x80000005 });
+        assert_eq!(destination.length, if maximum >= 10 { 8 } else { 0x5555 });
+        assert_eq!(destination.maximum, maximum);
+        let mut expected = [0xcd; 12];
+        if maximum >= 10 {
+            expected[..10].copy_from_slice(&[97, 0, 98, 0, 0, 0, 99, 0, 0, 0]);
+        }
+        assert_eq!(&bytes[8..20], &expected);
     }
+    let mut input = vec![b'a'; 32832];
+    let source = CountedString {
+        length: 32767,
+        maximum: 32767,
+        buffer: input.as_mut_ptr(),
+    };
+    let mut bytes = vec![0xcd; 65552];
+    let mut destination = CountedString {
+        length: 0x5555,
+        maximum: 0,
+        buffer: unsafe { bytes.as_mut_ptr().add(8) },
+    };
+    let result = unsafe { RtlAnsiStringToUnicodeString(&mut destination, &source, 0) } as u32;
+    eprintln!(
+        "rtl-ansi oversized result={result:x} length={}",
+        destination.length
+    );
+    assert_eq!(result, 0xc00000f0);
 }
 struct Internet(Handle);
 impl Drop for Internet {
@@ -217,11 +244,23 @@ fn native_session_option_and_wrong_request_type_controls() {
         0
     );
     assert_eq!(&bytes[..7], b"second\0");
-    let mut count = 0xcdcdcdcdu32;
-    assert_eq!(
-        unsafe { InternetReadFile(session.0, bytes.as_mut_ptr(), 0, &mut count) },
-        0
-    );
-    assert_eq!(count, 0);
-    assert_eq!(unsafe { GetLastError() }, 12018);
+    for (kind, handle) in [("session", session.0), ("null", std::ptr::null_mut())] {
+        for length in [0, 8] {
+            for write in [false, true] {
+                let mut count = 0xcdcdcdcdu32;
+                let result = unsafe {
+                    if write {
+                        InternetWriteFile(handle, bytes.as_ptr(), length, &mut count)
+                    } else {
+                        InternetReadFile(handle, bytes.as_mut_ptr(), length, &mut count)
+                    }
+                };
+                let error = unsafe { GetLastError() };
+                eprintln!(
+                    "internet-transfer kind={kind} write={write} length={length} result={result} error={error} count={count:x}"
+                );
+                assert_eq!(result, 0);
+            }
+        }
+    }
 }
