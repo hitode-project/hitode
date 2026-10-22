@@ -835,7 +835,7 @@ fn get_module_handle_ex(env: &mut Env<'_>, wide: bool) -> Outcome {
 
 /// Fixed guest path of a module. Published DLL names belong to their LDR block;
 /// resolving their original relative request against a later cwd is incorrect.
-pub(super) fn module_path(env: &Env<'_>, id: ModuleId) -> Result<String, MemFault> {
+pub(crate) fn module_path(env: &Env<'_>, id: ModuleId) -> Result<String, MemFault> {
     let w = env.ext.get::<Win32>();
     let m = adv_os::modules(env.ext).get(id);
     if m.ldr_entry == 0 {
@@ -947,6 +947,10 @@ fn write_module_file_name(
 
 pub(crate) fn k32_get_module_file_name_ex(env: &mut Env<'_>, wide: bool) -> Outcome {
     let (h_process, h_module, buf, cap) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3));
+    if let Err(error) = crate::kernel32::child_process::process_target(env, h_process, 0x0410) {
+        set_last_error(env, error.code);
+        return Outcome::Return(0);
+    }
     if crate::ntdll::current_process(env, h_process) {
         let Some(id) = module_of(env, h_module) else {
             set_last_error(env, err::MOD_NOT_FOUND);
@@ -1052,6 +1056,10 @@ fn write_modules(
 
 pub(crate) fn k32_enum_process_modules(env: &mut Env<'_>) -> Outcome {
     let (h_process, lph_module, cb, lpcb_needed) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3));
+    if let Err(error) = crate::kernel32::child_process::process_target(env, h_process, 0x0410) {
+        set_last_error(env, error.code);
+        return Outcome::Return(0);
+    }
     if crate::ntdll::current_process(env, h_process) {
         let handles = collect_executable_modules(adv_os::modules(env.ext));
         return write_modules(env, lph_module, cb, lpcb_needed, &handles);

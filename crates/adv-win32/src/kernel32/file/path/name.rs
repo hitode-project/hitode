@@ -357,6 +357,7 @@ mod tests {
         std::fs::write(root.join("game/Mix Dir/表データ.dat"), b"base").unwrap();
         std::fs::create_dir_all(root.join("data/overlay/mix dir")).unwrap();
         std::fs::write(root.join("data/overlay/mix dir/表データ.dat"), b"overlay").unwrap();
+        std::fs::write(root.join("game/Mix Dir/😀.dat"), b"unicode").unwrap();
         let path = "MIX DIR\\表データ.dat";
         let expected = "mix dir\\表データ.dat";
         for wide in [false, true] {
@@ -372,7 +373,7 @@ mod tests {
             );
             assert_eq!(read(&mut machine, 0x410100, wide), expected);
         }
-        std::fs::write(root.join("game/Mix Dir/😀.dat"), b"unicode").unwrap();
+
         let path = "MIX DIR\\😀.dat";
         let expected = "mix dir\\😀.dat";
         assert_eq!(
@@ -402,7 +403,13 @@ mod tests {
             (".git", ".GIT", ".GIT"),
             ("表表表表a.bin", "表表表表A.BIN", "表表表表a.bin"),
         ];
-        for (stored, _, _) in pairs {
+        let unicode_pairs = [
+            ("😀😀😀a.bin", "😀😀😀A.BIN", "😀😀😀a.bin"),
+            ("😀😀😀😀a.bin", "😀😀😀😀A.BIN", "😀😀😀😀A.BIN"),
+        ];
+        // All authored host files must exist before the VFS indexes this
+        // directory; host writes during a run deliberately remain invisible.
+        for (stored, _, _) in pairs.into_iter().chain(unicode_pairs) {
             std::fs::write(root.join("game").join(stored), b"authored").unwrap();
         }
         for wide in [false, true] {
@@ -412,15 +419,17 @@ mod tests {
                 } else {
                     machine.ext.get::<Win32>().codec.encode(expected).len()
                 } as u32;
-                assert_eq!(call(&mut machine, input, wide, true, 128, 0x410100), length);
+                let actual = call(&mut machine, input, wide, true, 128, 0x410100);
+                assert_eq!(
+                    actual,
+                    length,
+                    "input={input:?}, wide={wide}, error={}",
+                    crate::util::last_error(&env(&mut machine))
+                );
                 assert_eq!(read(&mut machine, 0x410100, wide), expected);
             }
         }
-        for (stored, input, expected) in [
-            ("😀😀😀a.bin", "😀😀😀A.BIN", "😀😀😀a.bin"),
-            ("😀😀😀😀a.bin", "😀😀😀😀A.BIN", "😀😀😀😀A.BIN"),
-        ] {
-            std::fs::write(root.join("game").join(stored), b"authored").unwrap();
+        for (_, input, expected) in unicode_pairs {
             assert_eq!(
                 call(&mut machine, input, true, true, 128, 0x410100),
                 expected.encode_utf16().count() as u32

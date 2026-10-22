@@ -1,6 +1,226 @@
 # Catalogued functions introduced after Windows 7; they stay unimplemented under the Windows 7 profile.
 # dll	name	minimum client	source (WinMD SupportedOSPlatform or Microsoft Learn requirements)
+advapi32.dll	CveEventWrite	Windows 10 (10.0.10240)	windows10.0.10240
+advapi32.dll	EnumDynamicTimeZoneInformation	Windows 8	windows8.0
+advapi32.dll	EventSetInformation	Windows 8	windows8.0
+advapi32.dll	GetDynamicTimeZoneInformationEffectiveYears	Windows 8	windows8.0
+advapi32.dll	LsaGetAppliedCAPIDs	Windows 8	windows8.0
+advapi32.dll	LsaLookupSids2	Windows 8	windows8.0
+advapi32.dll	LsaQueryCAPs	Windows 8	windows8.0
+advapi32.dll	OpenTraceFromBufferStream	Windows 11 2022 Update	https://learn.microsoft.com/en-us/windows/win32/api/evntrace/nf-evntrace-opentracefrombufferstream
+advapi32.dll	OpenTraceFromFile	Windows 11 2022 Update	https://learn.microsoft.com/en-us/windows/win32/api/evntrace/nf-evntrace-opentracefromfile
+advapi32.dll	OpenTraceFromRealTimeLogger	Windows 11 2022 Update	https://learn.microsoft.com/en-us/windows/win32/api/evntrace/nf-evntrace-opentracefromrealtimelogger
+advapi32.dll	OpenTraceFromRealTimeLoggerWithAllocationOptions	Windows 11 2022 Update	https://learn.microsoft.com/en-us/windows/win32/api/evntrace/nf-evntrace-opentracefromrealtimeloggerwithallocationoptions
+advapi32.dll	OperationEnd	Windows 8	windows8.0
+advapi32.dll	OperationStart	Windows 8	windows8.0
+advapi32.dll	PerfAddCounters	Windows 10 (10.0.14393)	windows10.0.14393
+advapi32.dll	PerfCloseQueryHandle	Windows 10 (10.0.14393)	windows10.0.14393
+advapi32.dll	PerfDeleteCounters	Windows 10 (10.0.14393)	windows10.0.14393
+advapi32.dll	PerfEnumerateCounterSet	Windows 10 (10.0.14393)	windows10.0.14393
+advapi32.dll	PerfEnumerateCounterSetInstances	Windows 10 (10.0.14393)	windows10.0.14393
+advapi32.dll	PerfOpenQueryHandle	Windows 10 (10.0.14393)	windows10.0.14393
+advapi32.dll	PerfQueryCounterData	Windows 10 (10.0.14393)	windows10.0.14393
+advapi32.dll	PerfQueryCounterInfo	Windows 10 (10.0.14393)	windows10.0.14393
+advapi32.dll	PerfQueryCounterSetRegistrationInfo	Windows 10 (10.0.14393)	windows10.0.14393
+advapi32.dll	ProcessTraceAddBufferToBufferStream	Windows 11 2022 Update	https://learn.microsoft.com/en-us/windows/win32/api/evntrace/nf-evntrace-processtraceaddbuffertobufferstream
+advapi32.dll	ProcessTraceBufferDecrementReference	Windows 11 2022 Update	https://learn.microsoft.com/en-us/windows/win32/api/evntrace/nf-evntrace-processtracebufferdecrementreference
+advapi32.dll	ProcessTraceBufferIncrementReference	Windows 11 2022 Update	https://learn.microsoft.com/en-us/windows/win32/api/evntrace/nf-evntrace-processtracebufferincrementreference
+advapi32.dll	QueryServiceDynamicInformation	Windows 8	windows8.0
+advapi32.dll	QueryTraceProcessingHandle	Windows 10 (10.0.16299)	windows10.0.16299
+advapi32.dll	TraceQueryInformation	Windows 8	windows8.0
+crypt32.dll	CertIsStrongHashToSign	Windows 8	windows8.0
+crypt32.dll	CertResyncCertificateChainEngine	Windows 10 (10.0.10240)	windows10.0.10240
+crypt32.dll	CryptCloseAsyncHandle	Windows 10 Build 20348	https://learn.microsoft.com/en-us/windows/win32/api/wincrypt/nf-wincrypt-cryptcloseasynchandle
+crypt32.dll	CryptCreateAsyncHandle	Windows 10 Build 20348	https://learn.microsoft.com/en-us/windows/win32/api/wincrypt/nf-wincrypt-cryptcreateasynchandle
+crypt32.dll	CryptGetAsyncParam	Windows 10 Build 20348	https://learn.microsoft.com/en-us/windows/win32/api/wincrypt/nf-wincrypt-cryptgetasyncparam
+crypt32.dll	CryptSetAsyncParam	Windows 10 Build 20348	https://learn.microsoft.com/en-us/windows/win32/api/wincrypt/nf-wincrypt-cryptsetasyncparam
+dbghelp.dll	SymAddSourceStreamA	Windows 10 Build 20348	https://learn.microsoft.com/en-us/windows/win32/api/dbghelp/nf-dbghelp-symaddsourcestreama
+dbghelp.dll	SymMatchStringA	Windows 10 Build 20348	https://learn.microsoft.com/en-us/windows/win32/api/dbghelp/nf-dbghelp-symmatchstringa
 imm32.dll	ImmDisableLegacyIME	Windows 8.0	windows8.0
+iphlpapi.dll	CaptureInterfaceHardwareCrossTimestamp	Windows 11 (Build 10.0.22000.194)	https://learn.microsoft.com/en-us/windows/win32/api/iphlpapi/nf-iphlpapi-captureinterfacehardwarecrosstimestamp
+iphlpapi.dll	FreeInterfaceDnsSettings	Windows 10 Build 19041	https://learn.microsoft.com/en-us/windows/win32/api/netioapi/nf-netioapi-freeinterfacednssettings
+iphlpapi.dll	GetDefaultCompartmentId	Windows 10 (10.0.10240)	windows10.0.10240
+iphlpapi.dll	GetIfEntry2Ex	Windows 10 (10.0.15063)	windows10.0.15063
+iphlpapi.dll	GetInterfaceActiveTimestampCapabilities	Windows 10 Build 20348	https://learn.microsoft.com/en-us/windows/win32/api/iphlpapi/nf-iphlpapi-getinterfaceactivetimestampcapabilities
+iphlpapi.dll	GetInterfaceDnsSettings	Windows 10 Build 19041	https://learn.microsoft.com/en-us/windows/win32/api/netioapi/nf-netioapi-getinterfacednssettings
+iphlpapi.dll	GetInterfaceSupportedTimestampCapabilities	Windows 10 Build 20348	https://learn.microsoft.com/en-us/windows/win32/api/iphlpapi/nf-iphlpapi-getinterfacesupportedtimestampcapabilities
+iphlpapi.dll	GetIpNetworkConnectionBandwidthEstimates	Windows 8	windows8.0
+iphlpapi.dll	GetNetworkConnectivityHint	Windows 10 (10.0.19041)	windows10.0.19041
+iphlpapi.dll	GetNetworkConnectivityHintForInterface	Windows 10 (10.0.19041)	windows10.0.19041
+iphlpapi.dll	GetTcpStatisticsEx2	Windows 10 (10.0.16299)	windows10.0.16299
+iphlpapi.dll	GetUdpStatisticsEx2	Windows 10 (10.0.16299)	windows10.0.16299
+iphlpapi.dll	NotifyNetworkConnectivityHintChange	Windows 10 (10.0.19041)	windows10.0.19041
+iphlpapi.dll	RegisterInterfaceTimestampConfigChange	Windows 10 Build 20348	https://learn.microsoft.com/en-us/windows/win32/api/iphlpapi/nf-iphlpapi-registerinterfacetimestampconfigchange
+iphlpapi.dll	SetInterfaceDnsSettings	Windows 10 Build 19041	https://learn.microsoft.com/en-us/windows/win32/api/netioapi/nf-netioapi-setinterfacednssettings
+iphlpapi.dll	UnregisterInterfaceTimestampConfigChange	Windows 10 Build 20348	https://learn.microsoft.com/en-us/windows/win32/api/iphlpapi/nf-iphlpapi-unregisterinterfacetimestampconfigchange
+kernel32.dll	AddResourceAttributeAce	Windows 8	windows8.0
+kernel32.dll	AddScopedPolicyIDAce	Windows 8	windows8.0
+kernel32.dll	AllocConsoleWithOptions	Windows 11 24H2 (build 26100) \[desktop apps only\]	https://learn.microsoft.com/en-us/windows/console/allocconsolewithoptions
+kernel32.dll	AppPolicyGetProcessTerminationMethod	After Windows 7 (exact minimum undocumented)	https://raw.githubusercontent.com/microsoft/win32metadata/2f767671802301cf043c717d66bf004ed7863487/generation/WinSDK/RecompiledIdlHeaders/um/appmodel.h; https://www.win7dll.info/kernel32_dll.html
+kernel32.dll	CeipIsOptedIn	Windows 8.1	windows8.1
+kernel32.dll	CheckTokenCapability	Windows 8	windows8.0
+kernel32.dll	CheckTokenMembershipEx	Windows 8	windows8.0
+kernel32.dll	ClosePackageInfo	Windows 8	windows8.0
+kernel32.dll	ClosePseudoConsole	Windows 10 October 2018 Update (version 1809) \[desktop apps only\]	https://learn.microsoft.com/en-us/windows/console/closepseudoconsole
+kernel32.dll	CopyFile2	Windows 8	windows8.0
+kernel32.dll	CreateDirectory2A	Windows 11 24H2 [desktop apps \| UWP apps]	https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createdirectory2a
+kernel32.dll	CreateDirectory2W	Windows 11 24H2 [desktop apps \| UWP apps]	https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createdirectory2w
+kernel32.dll	CreateEnclave	Windows 10 (10.0.10240)	windows10.0.10240
+kernel32.dll	CreateFile2	Windows 8	windows8.0
+kernel32.dll	CreateFile3	Windows 11 24H2 [desktop apps \| UWP apps]	https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfile3
+kernel32.dll	CreateFileMappingFromApp	Windows 8	windows8.0
+kernel32.dll	CreatePseudoConsole	Windows 10 October 2018 Update (version 1809) \[desktop apps only\]	https://learn.microsoft.com/en-us/windows/console/createpseudoconsole
+kernel32.dll	DeleteFile2A	Windows 11 24H2 [desktop apps \| UWP apps]	https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-deletefile2a
+kernel32.dll	DeleteFile2W	Windows 11 24H2 [desktop apps \| UWP apps]	https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-deletefile2w
+kernel32.dll	DeleteSynchronizationBarrier	Windows 8	windows8.0
+kernel32.dll	DiscardVirtualMemory	Windows 8.1	windows8.1
+kernel32.dll	EnableProcessOptionalXStateFeatures	Windows 11	https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-enableprocessoptionalxstatefeatures
+kernel32.dll	EnterSynchronizationBarrier	Windows 8	windows8.0
+kernel32.dll	EnumSystemGeoNames	Windows 10 (10.0.16299)	windows10.0.16299
+kernel32.dll	FindPackagesByPackageFamily	Windows 8.1	windows8.1
+kernel32.dll	FlsGetValue2	Windows 10 or later (SDK gate)	https://raw.githubusercontent.com/microsoft/win32metadata/2f767671802301cf043c717d66bf004ed7863487/generation/WinSDK/RecompiledIdlHeaders/um/fibersapi.h (_WIN32_WINNT >= _WIN32_WINNT_WIN10)
+kernel32.dll	FormatApplicationUserModelId	Windows 8.1	windows8.1
+kernel32.dll	FreeMemoryJobObject	Windows 10 (10.0.10240)	windows10.0.10240
+kernel32.dll	GetAppContainerNamedObjectPath	Windows 8	windows8.0
+kernel32.dll	GetCachedSigningLevel	Windows 8 [desktop apps \| UWP apps]	https://learn.microsoft.com/en-us/windows/win32/api/securitybaseapi/nf-securitybaseapi-getcachedsigninglevel
+kernel32.dll	GetCurrentPackageFamilyName	Windows 8	windows8.0
+kernel32.dll	GetCurrentPackageFullName	Windows 8	windows8.0
+kernel32.dll	GetCurrentPackageId	Windows 8	windows8.0
+kernel32.dll	GetCurrentPackageInfo	Windows 8	windows8.0
+kernel32.dll	GetCurrentPackagePath	Windows 8	windows8.0
+kernel32.dll	GetCurrentThreadStackLimits	Windows 8	windows8.0
+kernel32.dll	GetDiskSpaceInformationA	Windows 10 Build 17763 [desktop apps \| UWP apps]	https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getdiskspaceinformationa
+kernel32.dll	GetDiskSpaceInformationW	Windows 10 Build 17763 [desktop apps \| UWP apps]	https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getdiskspaceinformationw
+kernel32.dll	GetFirmwareEnvironmentVariableExA	Windows 8	windows8.0
+kernel32.dll	GetFirmwareEnvironmentVariableExW	Windows 8	windows8.0
+kernel32.dll	GetFirmwareType	Windows 8	windows8.0
+kernel32.dll	GetGeoInfoEx	Windows 10 (10.0.16299)	windows10.0.16299
+kernel32.dll	GetMachineTypeAttributes	Windows Build 22000	https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getmachinetypeattributes
+kernel32.dll	GetMemoryErrorHandlingCapabilities	Windows 8	windows8.0
+kernel32.dll	GetNumaNodeProcessorMask2	Windows 10 Build 20348	https://learn.microsoft.com/en-us/windows/win32/api/systemtopologyapi/nf-systemtopologyapi-getnumanodeprocessormask2
+kernel32.dll	GetOverlappedResultEx	Windows 8	windows8.0
+kernel32.dll	GetPackageApplicationIds	Windows 8.1	windows8.1
+kernel32.dll	GetPackageFamilyName	Windows 8	windows8.0
+kernel32.dll	GetPackageFullName	Windows 8	windows8.0
+kernel32.dll	GetPackageId	Windows 8	windows8.0
+kernel32.dll	GetPackageInfo	Windows 8	windows8.0
+kernel32.dll	GetPackagePath	Windows 8	windows8.0
+kernel32.dll	GetPackagePathByFullName	Windows 8.1	windows8.1
+kernel32.dll	GetPackagesByPackageFamily	Windows 8	windows8.0
+kernel32.dll	GetProcessDefaultCpuSetMasks	Windows 11	https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getprocessdefaultcpusetmasks
+kernel32.dll	GetProcessDefaultCpuSets	Windows 10	https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getprocessdefaultcpusets
+kernel32.dll	GetProcessInformation	Windows 8	windows8.0
+kernel32.dll	GetProcessMitigationPolicy	Windows 8	windows8.0
+kernel32.dll	GetStagedPackagePathByFullName	Windows 8.1	windows8.1
+kernel32.dll	GetSystemCpuSetInformation	Windows 10	https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getsystemcpusetinformation
+kernel32.dll	GetSystemTimePreciseAsFileTime	Windows 8	windows8.0
+kernel32.dll	GetTempPath2A	Windows 11 Build 22000	https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-gettemppath2a
+kernel32.dll	GetTempPath2W	Windows 11 Build 22000	https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-gettemppath2w
+kernel32.dll	GetThreadDescription	Windows 10 (10.0.14393)	windows10.0.14393
+kernel32.dll	GetThreadEnabledXStateFeatures	Windows 11	https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-getthreadenabledxstatefeatures
+kernel32.dll	GetThreadInformation	Windows 8	windows8.0
+kernel32.dll	GetThreadSelectedCpuSetMasks	Windows 11	https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getthreadselectedcpusetmasks
+kernel32.dll	GetThreadSelectedCpuSets	Windows 10	https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getthreadselectedcpusets
+kernel32.dll	GetUserDefaultGeoName	Windows 10 (10.0.16299)	windows10.0.16299
+kernel32.dll	HeapSummary	Windows 10 Build 20348	https://learn.microsoft.com/en-us/windows/win32/api/heapapi/nf-heapapi-heapsummary
+kernel32.dll	InitializeContext2	Windows 10 Build 20348	https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-initializecontext2
+kernel32.dll	InitializeEnclave	Windows 10 (10.0.10240)	windows10.0.10240
+kernel32.dll	InitializeSynchronizationBarrier	Windows 8	windows8.0
+kernel32.dll	InstallELAMCertificateInfo	Windows 8.1	windows8.1
+kernel32.dll	InterlockedPushListSListEx	Windows 8	windows8.0
+kernel32.dll	IsEnclaveTypeSupported	Windows 10 (10.0.10240)	windows10.0.10240
+kernel32.dll	IsNativeVhdBoot	Windows 8	windows8.0
+kernel32.dll	IsProcessCritical	Windows 8.1	windows8.1
+kernel32.dll	IsUserCetAvailableInEnvironment	Windows 10 Build 20348	https://learn.microsoft.com/en-us/windows/win32/api/sysinfoapi/nf-sysinfoapi-isusercetavailableinenvironment
+kernel32.dll	IsValidNLSVersion	Windows 8	windows8.0
+kernel32.dll	IsWow64GuestMachineSupported	Windows 10 (10.0.16299)	windows10.0.16299
+kernel32.dll	IsWow64Process2	Windows 10 (10.0.10586)	windows10.0.10586
+kernel32.dll	LoadEnclaveData	Windows 10 (10.0.10240)	windows10.0.10240
+kernel32.dll	LoadPackagedLibrary	Windows 8	windows8.0
+kernel32.dll	MapViewOfFileFromApp	Windows 8	windows8.0
+kernel32.dll	OfferVirtualMemory	Windows 8.1	windows8.1
+kernel32.dll	OpenPackageInfoByFullName	Windows 8	windows8.0
+kernel32.dll	PackageFamilyNameFromFullName	Windows 8	windows8.0
+kernel32.dll	PackageFamilyNameFromId	Windows 8	windows8.0
+kernel32.dll	PackageFullNameFromId	Windows 8	windows8.0
+kernel32.dll	PackageIdFromFullName	Windows 8	windows8.0
+kernel32.dll	PackageNameAndPublisherIdFromFamilyName	Windows 8	windows8.0
+kernel32.dll	ParseApplicationUserModelId	Windows 8.1	windows8.1
+kernel32.dll	PrefetchVirtualMemory	Windows 8	windows8.0
+kernel32.dll	PssCaptureSnapshot	Windows 8.1	windows8.1
+kernel32.dll	PssDuplicateSnapshot	Windows 8.1	windows8.1
+kernel32.dll	PssFreeSnapshot	Windows 8.1	windows8.1
+kernel32.dll	PssQuerySnapshot	Windows 8.1	windows8.1
+kernel32.dll	PssWalkMarkerCreate	Windows 8.1	windows8.1
+kernel32.dll	PssWalkMarkerFree	Windows 8.1	windows8.1
+kernel32.dll	PssWalkMarkerGetPosition	Windows 8.1	windows8.1
+kernel32.dll	PssWalkMarkerSeekToBeginning	Windows 8.1	windows8.1
+kernel32.dll	PssWalkMarkerSetPosition	Windows 8.1	windows8.1
+kernel32.dll	PssWalkSnapshot	Windows 8.1	windows8.1
+kernel32.dll	QueryIoRateControlInformationJobObject	Windows 10 (10.0.10240)	windows10.0.10240
+kernel32.dll	QueryProtectedPolicy	Windows 8.1	windows8.1
+kernel32.dll	QueueUserAPC2	Windows 11 (Build 22000)	https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-queueuserapc2
+kernel32.dll	ReadDirectoryChangesExW	Windows 10 (10.0.16299)	windows10.0.16299
+kernel32.dll	ReclaimVirtualMemory	Windows 8.1	windows8.1
+kernel32.dll	RegisterBadMemoryNotification	Windows 8	windows8.0
+kernel32.dll	ReleasePseudoConsole	Windows 11 24H2 (build 26100) \[desktop apps only\]	https://learn.microsoft.com/en-us/windows/console/releasepseudoconsole
+kernel32.dll	RemoveDirectory2A	Windows 11 24H2 [desktop apps \| UWP apps]	https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-removedirectory2a
+kernel32.dll	RemoveDirectory2W	Windows 11 24H2 [desktop apps \| UWP apps]	https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-removedirectory2w
+kernel32.dll	ResizePseudoConsole	Windows 10 October 2018 Update (version 1809) \[desktop apps only\]	https://learn.microsoft.com/en-us/windows/console/resizepseudoconsole
+kernel32.dll	SetCachedSigningLevel	Windows 8 [desktop apps \| UWP apps]	https://learn.microsoft.com/en-us/windows/win32/api/securitybaseapi/nf-securitybaseapi-setcachedsigninglevel
+kernel32.dll	SetFirmwareEnvironmentVariableExA	Windows 8	windows8.0
+kernel32.dll	SetFirmwareEnvironmentVariableExW	Windows 8	windows8.0
+kernel32.dll	SetIoRateControlInformationJobObject	Windows 10 (10.0.10240)	windows10.0.10240
+kernel32.dll	SetProcessDefaultCpuSetMasks	Windows 11	https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-setprocessdefaultcpusetmasks
+kernel32.dll	SetProcessDefaultCpuSets	Windows 10	https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-setprocessdefaultcpusets
+kernel32.dll	SetProcessDynamicEHContinuationTargets	Windows 10 Build 20348	https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-setprocessdynamicehcontinuationtargets
+kernel32.dll	SetProcessDynamicEnforcedCetCompatibleRanges	Windows 10, version 2004 (10.0; Build 19041.662)	https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-setprocessdynamicenforcedcetcompatibleranges
+kernel32.dll	SetProcessInformation	Windows 8	windows8.0
+kernel32.dll	SetProcessMitigationPolicy	Windows 8	windows8.0
+kernel32.dll	SetProtectedPolicy	Windows 8.1	windows8.1
+kernel32.dll	SetThreadDescription	Windows 10 (10.0.14393)	windows10.0.14393
+kernel32.dll	SetThreadInformation	Windows 8	windows8.0
+kernel32.dll	SetThreadSelectedCpuSetMasks	Windows 11	https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-setthreadselectedcpusetmasks
+kernel32.dll	SetThreadSelectedCpuSets	Windows 10	https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-setthreadselectedcpusets
+kernel32.dll	SetThreadpoolTimerEx	Windows 8	windows8.0
+kernel32.dll	SetThreadpoolWaitEx	Windows 8	windows8.0
+kernel32.dll	SetUserGeoName	Windows 10 (10.0.16299)	windows10.0.16299
+kernel32.dll	TlsGetValue2	Windows 11, version 24H2	https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-tlsgetvalue2
+kernel32.dll	UnmapViewOfFileEx	Windows 8	windows8.0
+kernel32.dll	UnregisterBadMemoryNotification	Windows 8	windows8.0
+kernel32.dll	WaitForDebugEventEx	Windows 10 (10.0.10240)	windows10.0.10240
+kernel32.dll	WerRegisterAdditionalProcess	Windows 10 (10.0.15063)	windows10.0.15063
+kernel32.dll	WerRegisterAppLocalDump	Windows 10 (10.0.16299)	windows10.0.16299
+kernel32.dll	WerRegisterCustomMetadata	Windows 10 (10.0.15063)	windows10.0.15063
+kernel32.dll	WerRegisterExcludedMemoryBlock	Windows 10 (10.0.15063)	windows10.0.15063
+kernel32.dll	WerUnregisterAdditionalProcess	Windows 10 (10.0.15063)	windows10.0.15063
+kernel32.dll	WerUnregisterAppLocalDump	Windows 10 (10.0.16299)	windows10.0.16299
+kernel32.dll	WerUnregisterCustomMetadata	Windows 10 (10.0.15063)	windows10.0.15063
+kernel32.dll	WerUnregisterExcludedMemoryBlock	Windows 10 (10.0.15063)	windows10.0.15063
+netapi32.dll	NetCreateProvisioningPackage	Windows 8	windows8.0
+netapi32.dll	NetFreeAadJoinInformation	Windows 10 (10.0.10240)	windows10.0.10240
+netapi32.dll	NetGetAadJoinInformation	Windows 10 (10.0.10240)	windows10.0.10240
+netapi32.dll	NetRequestProvisioningPackageInstall	Windows 8	windows8.0
+ole32.dll	CoAllowUnmarshalerCLSID	Windows 8	windows8.0
+ole32.dll	CoCreateInstanceFromApp	Windows 8	windows8.0
+ole32.dll	CoRegisterDeviceCatalog	Windows 10, version 2004 (10.0; Build 19041)	https://learn.microsoft.com/en-us/windows/win32/api/combaseapi/nf-combaseapi-coregisterdevicecatalog
+ole32.dll	CoRevokeDeviceCatalog	Windows 10, version 2004 (10.0; Build 19041)	https://learn.microsoft.com/en-us/windows/win32/api/combaseapi/nf-combaseapi-corevokedevicecatalog
+ole32.dll	OleConvertOLESTREAMToIStorage2	Windows 10 RTM (with Oct 2023 security update or later)	https://learn.microsoft.com/en-us/windows/win32/Stg/oleconvertolestreamtoistorage2
+ole32.dll	OleConvertOLESTREAMToIStorageEx2	Windows 10 RTM (with Oct 2023 security update or later)	https://learn.microsoft.com/en-us/windows/win32/Stg/oleconvertolestreamtoistorageex2
+ole32.dll	OleGetClipboardWithEnterpriseInfo	Windows 10 (10.0.10240)	windows10.0.10240
+ole32.dll	RoGetAgileReference	Windows 8.1	windows8.1
+oleacc.dll	AccNotifyTouchInteraction	Windows 8	windows8.0
+oleacc.dll	AccSetRunningUtilityState	Windows 8	windows8.0
+rpcrt4.dll	I_RpcExceptionFilter	Windows 10 Build 20348	https://learn.microsoft.com/en-us/windows/win32/api/rpcasync/nf-rpcasync-i_rpcexceptionfilter
+rpcrt4.dll	RpcImpersonateClientContainer	Windows 10 (10.0.10240)	windows10.0.10240
+rpcrt4.dll	RpcRevertContainerImpersonation	Windows 10 (10.0.10240)	windows10.0.10240
+rpcrt4.dll	RpcServerInterfaceGroupActivate	Windows 8	windows8.0
+rpcrt4.dll	RpcServerInterfaceGroupClose	Windows 8	windows8.0
+rpcrt4.dll	RpcServerInterfaceGroupCreateA	Windows 8	windows8.0
+rpcrt4.dll	RpcServerInterfaceGroupCreateW	Windows 8	windows8.0
+rpcrt4.dll	RpcServerInterfaceGroupDeactivate	Windows 8	windows8.0
+rpcrt4.dll	RpcServerInterfaceGroupInqBindings	Windows 8	windows8.0
+rpcrt4.dll	RpcServerRegisterIf3	Windows 8	windows8.0
 user32.dll	AdjustWindowRectExForDpi	Windows 10.0.14393	windows10.0.14393
 user32.dll	ApplyWindowAction	Windows 11	https://learn.microsoft.com/en-us/windows/win32/winmsg/winuser/nf-winuser-applywindowaction
 user32.dll	AreDpiAwarenessContextsEqual	Windows 10.0.14393	windows10.0.14393
@@ -86,3 +306,44 @@ user32.dll	SystemParametersInfoForDpi	Windows 10.0.14393	windows10.0.14393
 user32.dll	UnregisterPointerInputTarget	Windows 8.0	windows8.0
 user32.dll	UnregisterPointerInputTargetEx	Windows 10.0.10240	windows10.0.10240
 user32.dll	UnregisterSuspendResumeNotification	Windows 8.0	windows8.0
+userenv.dll	CreateAppContainerProfile	Windows 8	windows8.0
+userenv.dll	DeleteAppContainerProfile	Windows 8	windows8.0
+userenv.dll	DeriveAppContainerSidFromAppContainerName	Windows 8	windows8.0
+userenv.dll	DeriveRestrictedAppContainerSidFromAppContainerSidAndRestrictedName	Windows 10 (10.0.10240)	windows10.0.10240
+userenv.dll	GetAppContainerFolderPath	Windows 8	windows8.0
+userenv.dll	GetAppContainerRegistryLocation	Windows 8	windows8.0
+winhttp.dll	WinHttpAddRequestHeadersEx	Windows 10 Build 20348	https://learn.microsoft.com/en-us/windows/win32/api/winhttp/nf-winhttp-winhttpaddrequestheadersex
+winhttp.dll	WinHttpCreateProxyResolver	Windows 8	windows8.0
+winhttp.dll	WinHttpFreeProxyResult	Windows 8	windows8.0
+winhttp.dll	WinHttpFreeQueryConnectionGroupResult	Windows Build 22000	https://learn.microsoft.com/en-us/windows/win32/api/winhttp/nf-winhttp-winhttpfreequeryconnectiongroupresult
+winhttp.dll	WinHttpGetProxyForUrlEx	Windows 8	windows8.0
+winhttp.dll	WinHttpGetProxyResult	Windows 8	windows8.0
+winhttp.dll	WinHttpQueryConnectionGroup	Windows Build 22000	https://learn.microsoft.com/en-us/windows/win32/api/winhttp/nf-winhttp-winhttpqueryconnectiongroup
+winhttp.dll	WinHttpQueryHeadersEx	Windows 10 Build 20348	https://learn.microsoft.com/en-us/windows/win32/api/winhttp/nf-winhttp-winhttpqueryheadersex
+winhttp.dll	WinHttpReadDataEx	Windows 10 Build 20348	https://learn.microsoft.com/en-us/windows/win32/api/winhttp/nf-winhttp-winhttpreaddataex
+winhttp.dll	WinHttpResetAutoProxy	Windows 8	windows8.0
+winhttp.dll	WinHttpWebSocketClose	Windows 8	windows8.0
+winhttp.dll	WinHttpWebSocketCompleteUpgrade	Windows 8	windows8.0
+winhttp.dll	WinHttpWebSocketQueryCloseStatus	Windows 8	windows8.0
+winhttp.dll	WinHttpWebSocketReceive	Windows 8	windows8.0
+winhttp.dll	WinHttpWebSocketSend	Windows 8	windows8.0
+winhttp.dll	WinHttpWebSocketShutdown	Windows 8	windows8.0
+wininet.dll	InternetFreeCookies	Windows 8.1 [desktop apps only]	https://learn.microsoft.com/en-us/windows/win32/api/wininet/nf-wininet-internetfreecookies
+wininet.dll	InternetGetCookieEx2	Windows 8.1 [desktop apps only]	https://learn.microsoft.com/en-us/windows/win32/api/wininet/nf-wininet-internetgetcookieex2
+wininet.dll	InternetSetCookieEx2	Windows 8.1 [desktop apps only]	https://learn.microsoft.com/en-us/windows/win32/api/wininet/nf-wininet-internetsetcookieex2
+ws2_32.dll	GetAddrInfoExCancel	Windows 8.1	windows8.1
+ws2_32.dll	GetAddrInfoExOverlappedResult	Windows 8.1	windows8.1
+ws2_32.dll	GetHostNameW	Windows 8.1	windows8.1
+ws2_32.dll	ProcessSocketNotifications	Windows 10 Build 20348	https://learn.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-processsocketnotifications
+wtsapi32.dll	WTSEnableChildSessions	Windows 8	windows8.0
+wtsapi32.dll	WTSGetChildSessionId	Windows 8	windows8.0
+wtsapi32.dll	WTSIsChildSessionsEnabled	Windows 8	windows8.0
+wtsapi32.dll	WTSSetRenderHint	Windows 8	windows8.0
+xinput1_4.dll	#2	Windows 8	https://learn.microsoft.com/en-us/windows/win32/api/xinput/nf-xinput-xinputgetstate
+xinput1_4.dll	XInputEnable	Windows 8	https://learn.microsoft.com/en-us/windows/win32/api/xinput/nf-xinput-xinputenable
+xinput1_4.dll	XInputGetAudioDeviceIds	Windows 8	https://learn.microsoft.com/en-us/windows/win32/api/xinput/nf-xinput-xinputgetaudiodeviceids
+xinput1_4.dll	XInputGetBatteryInformation	Windows 8	https://learn.microsoft.com/en-us/windows/win32/api/xinput/nf-xinput-xinputgetbatteryinformation
+xinput1_4.dll	XInputGetCapabilities	Windows 8	https://learn.microsoft.com/en-us/windows/win32/api/xinput/nf-xinput-xinputgetcapabilities
+xinput1_4.dll	XInputGetKeystroke	Windows 8	https://learn.microsoft.com/en-us/windows/win32/api/xinput/nf-xinput-xinputgetkeystroke
+xinput1_4.dll	XInputGetState	Windows 8	https://learn.microsoft.com/en-us/windows/win32/api/xinput/nf-xinput-xinputgetstate
+xinput1_4.dll	XInputSetState	Windows 8	https://learn.microsoft.com/en-us/windows/win32/api/xinput/nf-xinput-xinputsetstate

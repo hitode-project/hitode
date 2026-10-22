@@ -12,6 +12,34 @@ use adv_pe::{ExportTarget, ImportName};
 
 const PAGE: u32 = 4096;
 
+/// Resolve a public system entry through its live image, including EAT and
+/// entry hooks. Standalone personalities without that image use its published
+/// thunk. Shared by CRT unwinding and the loader's own exception boundary.
+pub(crate) fn public_entry(env: &mut Env<'_>, module: &str, name: &str) -> Result<u32, String> {
+    let Some(id) = env.ext.get::<Modules>().by_name(module) else {
+        return env
+            .sys
+            .thunks
+            .resolve(env.cpu, module, name)
+            .map_err(|e| e.to_string());
+    };
+    let (win32, modules) = env.ext.get2_mut::<Win32, Modules>();
+    let mut loader = Loader::new(env.cpu, env.sys, modules, &win32.vfs);
+    match loader.guest_override(id, name).map_err(|e| e.to_string())? {
+        Some(target) => Ok(target),
+        None => loader
+            .resolve_dynamic(
+                id,
+                &ImportName::Name {
+                    hint: 0,
+                    name: name.to_owned(),
+                },
+            )
+            .map(|(target, _)| target)
+            .map_err(|e| e.to_string()),
+    }
+}
+
 fn system_module(modules: &Modules, name: &str) -> Result<Option<ModuleId>, LoadError> {
     if let Some((id, _)) = modules.iter().find(|(_, module)| {
         module.kind == ModuleKind::Host

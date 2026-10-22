@@ -58,6 +58,7 @@ impl Locale {
 #[derive(Clone, Default)]
 pub(super) struct LocaleState {
     categories: [Locale; 5],
+    multibyte_codepage: Option<u32>,
     // VC80's exported case functions enter a different EOF/error path after
     // any non-C locale has been installed, even if LC_CTYPE later returns C.
     // This latch limits the supported EOF profile; it does not emulate that
@@ -88,6 +89,26 @@ pub(super) fn formatting_codepage(env: &Env<'_>) -> u32 {
         .try_get::<CrtState>()
         .and_then(|state| state.locales.get(module))
         .map_or(0, |state| state.categories[1].codepage)
+}
+
+/// Multibyte string traversal has a separate code page, initially the guest ACP.
+pub(super) fn multibyte_codepage(env: &Env<'_>) -> u32 {
+    let module = crt_module(&env.sys.thunks.get(env.thunk).module);
+    env.ext
+        .try_get::<CrtState>()
+        .and_then(|state| state.locales.get(module))
+        .and_then(|state| state.multibyte_codepage)
+        .unwrap_or(env.ext.get::<crate::Win32>().codec.acp)
+}
+
+pub(super) fn set_multibyte_codepage(env: &mut Env<'_>, codepage: u32) {
+    let module = crt_module(&env.sys.thunks.get(env.thunk).module).to_owned();
+    env.ext
+        .get_or_default::<CrtState>()
+        .locales
+        .entry(module)
+        .or_default()
+        .multibyte_codepage = Some(codepage);
 }
 
 /// Buffer comparisons consume the same module-owned LC_CTYPE byte conversion.

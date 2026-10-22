@@ -192,7 +192,7 @@ fn errno_leaf(env: &mut Env<'_>) -> Option<u64> {
     Some((u64::from(adv_abi::leaf_edx(env)) << 32) | u64::from(address))
 }
 
-fn invalid_set(env: &mut Env<'_>, handler: GuestPtr<u8>) -> GuestPtr<u8> {
+pub(super) fn invalid_set(env: &mut Env<'_>, handler: GuestPtr<u8>) -> GuestPtr<u8> {
     if env.ext.try_get::<CrtState>().is_none() {
         env.ext.insert(CrtState::default());
     }

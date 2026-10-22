@@ -1,5 +1,5 @@
-//! Winsock initialization lifetime only. Socket/network APIs remain unresolved
-//! until a faithful persona exists; this module never creates a host socket.
+//! Winsock library lifetime and local address operations, without host sockets.
+mod address;
 use crate::util::{last_error, set_last_error};
 use adv_abi::Registry;
 use adv_cpu::backend::Prot;
@@ -15,6 +15,7 @@ struct Library {
 }
 
 pub fn register(registry: &mut Registry) {
+    address::register(registry);
     for (name, argc, handler) in [
         ("WSAStartup", 2, startup as adv_machine::Handler),
         ("#115", 2, startup),
@@ -26,6 +27,17 @@ pub fn register(registry: &mut Registry) {
         ("#112", 1, set_error),
     ] {
         crate::stdcall(registry, "ws2_32.dll", name, argc, handler);
+    }
+    // The legacy DLL consumes the same generated declarations and state owner.
+    let aliases: Vec<_> = registry
+        .registered()
+        .filter(|(module, name, _)| {
+            *module == "ws2_32.dll" && adv_abi::signature::lookup("wsock32.dll", name).is_some()
+        })
+        .map(|(_, name, function)| (name.to_owned(), function))
+        .collect();
+    for (name, function) in aliases {
+        registry.add("wsock32.dll", &name, function.conv, function.handler);
     }
 }
 fn negotiated(requested: u16) -> Option<u16> {

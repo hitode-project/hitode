@@ -13,6 +13,7 @@
 
 pub mod clipboard;
 pub mod com;
+pub mod entropy;
 pub mod gdi;
 pub mod global;
 pub mod heap;

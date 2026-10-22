@@ -1,6 +1,6 @@
 """Test CRT export-name projection on authored module-definition lines."""
 import unittest
-from crt_exports import exports
+from crt_exports import correct_kinds, exports
 
 
 class CrtExportTests(unittest.TestCase):
@@ -45,6 +45,18 @@ class CrtExportTests(unittest.TestCase):
             "tmpfile": "code", "_get_pgmptr": "code", "_time64": "code", "memcpy_s": "code",
             "_environ": "data",
         })
+
+    def test_replaced_math_import_data_markers_do_not_change_native_export_kinds(self):
+        names = exports("floor DATA\n_HUGE DATA\n_iob DATA\n")
+        evidence = {("msvcr90.dll", "floor"): "code"}
+        self.assertEqual(correct_kinds("msvcr90.dll", names, evidence), {
+            "floor": "code", "_HUGE": "data", "_iob": "data",
+        })
+        self.assertEqual(correct_kinds("msvcr80.dll", names, evidence), names)
+
+    def test_kind_evidence_cannot_invent_an_export(self):
+        with self.assertRaises(ValueError):
+            correct_kinds("msvcr90.dll", {}, {("msvcr90.dll", "floor"): "code"})
 
     def test_conflicting_kinds_are_rejected(self):
         with self.assertRaises(ValueError):

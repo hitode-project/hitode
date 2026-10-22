@@ -18,6 +18,16 @@ on:
       - 'crates/adv-device/tests/**'
       - '.github/workflows/windows-differential.yml'
   workflow_dispatch:
+    inputs:
+      crate:
+        description: Crate to check
+        type: choice
+        options: [all, adv-runtime, adv-win32, adv-device]
+        default: all
+      test:
+        description: Optional Windows test target name
+        type: string
+        default: ''
   schedule:
     - cron: '41 4 * * 1'
 
@@ -25,7 +35,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: windows-differential-${{ github.event.pull_request.number || github.ref }}
+  group: windows-differential-${{ github.event.pull_request.number || github.ref }}-${{ inputs.crate || 'all' }}-${{ inputs.test || 'all' }}
   cancel-in-progress: true
 
 jobs:
@@ -51,15 +61,25 @@ jobs:
           cache-on-failure: true
           cache-workspace-crates: true
       - name: Run the Windows-only differential tests
+        env:
+          DIFFERENTIAL_CRATE: ${{ inputs.crate || 'all' }}
+          DIFFERENTIAL_TEST: ${{ inputs.test }}
         run: |
           $features = @{ 'adv-runtime' = @('--features', 'gpu') }
           $failed = @()
           $tests = @()
+          $matched = $false
+          if ($env:DIFFERENTIAL_TEST -and $env:DIFFERENTIAL_TEST -notmatch '^[A-Za-z0-9_]+$') {
+            throw 'Test must be an exact Cargo test target name'
+          }
           foreach ($crate in 'adv-runtime', 'adv-win32', 'adv-device') {
+            if ($env:DIFFERENTIAL_CRATE -ne 'all' -and $env:DIFFERENTIAL_CRATE -ne $crate) { continue }
             $targets = Get-ChildItem "crates/$crate/tests/*.rs" |
               Where-Object { (Get-Content $_ -TotalCount 5) -match '^#!\[cfg\(windows\)\]' } |
+              Where-Object { -not $env:DIFFERENTIAL_TEST -or $_.BaseName -eq $env:DIFFERENTIAL_TEST } |
               ForEach-Object { '--test'; $_.BaseName }
             if (-not $targets) { continue }
+            $matched = $true
             $extra = if ($features.ContainsKey($crate)) { $features[$crate] } else { @() }
             cargo test --locked -p $crate @extra @targets --no-fail-fast -- --nocapture 2>&1 |
               Tee-Object "$env:RUNNER_TEMP/differential-$crate.txt"
@@ -70,10 +90,13 @@ jobs:
             if ($exit -ne 0 -and -not $names) { $failed += $crate }
             $tests += $names
           }
+          if (-not $matched) { throw 'No Windows-only test targets matched the selection' }
           $known = @(Get-Content tools/fixtures/hosted-known-failures.txt |
             Where-Object { $_ -match '^\s*[^#\s]' } | ForEach-Object { ($_ -split '\s+')[0] })
           $new = @($tests | Where-Object { $_ -notin $known })
-          $fixed = @($known | Where-Object { $_ -notin $tests })
+          $fixed = if ($env:DIFFERENTIAL_CRATE -eq 'all' -and -not $env:DIFFERENTIAL_TEST) {
+            @($known | Where-Object { $_ -notin $tests })
+          } else { @() }
           foreach ($name in $tests) { "::warning::differential test failed: $name" }
           foreach ($name in $fixed) { "::notice::known failure now passes; remove it from the list: $name" }
           if ($failed) { throw "build or harness failure in: $($failed -join ', ')" }

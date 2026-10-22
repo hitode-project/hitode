@@ -3,9 +3,7 @@
 pub(super) mod context;
 mod mapping;
 mod native;
-pub(super) mod phase;
 pub(super) mod system_service;
-pub(crate) use phase::uncaught_query_blocker;
 
 use adv_abi::{GuestPtr, Registry, win32};
 use adv_cpu::backend::{Backend, GuestExt, Prot, Reg};
@@ -233,7 +231,6 @@ struct Search {
     stack_bounds: Option<(u32, u32)>,
     searched: usize,
     // Survives vectored/frame callbacks, and expires on resume or nonlocal exit.
-    _phase: Rc<phase::Phase>,
     /// (scratch, establisher) of interrupted frame handlers, innermost first.
     outer: VecDeque<(u32, u32)>,
     /// Native NestedFrame: the highest establisher whose handler was running.
@@ -327,7 +324,6 @@ fn dispatch_origin(
         return Outcome::Fail(error.to_string());
     }
     let vectored = env.ext.get_or_default::<Vectored>().order.clone();
-    let active = phase::enter(env, phase::Phase::Dispatch, record.code);
     native::deliver(
         env,
         Search {
@@ -338,7 +334,6 @@ fn dispatch_origin(
             frame: None,
             stack_bounds: None,
             searched: 0,
-            _phase: active,
             outer: outer.into(),
             nested: None,
         },

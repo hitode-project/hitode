@@ -1,0 +1,182 @@
+# System libraries
+
+ID prefix: SYS
+
+This spec covers Windows system libraries outside the core subsystems, as an offline Windows 7 machine without printers or a console presents them. It includes networking, cryptography, process status, consoles, installers, profile files and printing. `adv-win32` implements them. [personality.md](personality.md) covers the shared Windows identity and [win32.md](win32.md) the core subsystems.
+
+## Offline networking
+
+### SYS-NET-1 Offline Internet sessions
+
+**Rule**: Synchronous WinINet and WinHTTP initialization MUST create library-owned sessions independently of transport availability. Session queries and closure MUST validate library ownership. Offline URL retrieval MUST fail without creating requests or reporting capability gaps.
+**Verification**: Test
+
+### SYS-NET-2 Local network addresses
+
+**Rule**: Winsock byte-order and numeric address conversions MUST operate without network I/O or requiring WSAStartup. Invalid text MUST preserve output, and failed pointer or family validation MUST set the documented Winsock error. Legacy Winsock DLL aliases MUST reuse initialization state and local arithmetic.
+**Verification**: Test
+
+### SYS-NET-3 Offline provider routing
+
+**Rule**: MPR connection and external-resource requests MUST fail ordinarily in the offline profile without publishing redirects. Connected and remembered-resource enumerators MUST be real Objects aliases over the profile's empty resource lists. Provider names and current-user queries MUST use local configuration independently of transport availability.
+**Verification**: Test
+
+### SYS-NET-4 Provider extended errors
+
+**Rule**: WNetSetLastError and WNetGetLastError MUST share extended error codes and UTF-16 strings per guest thread. A/W conversion MUST use the existing process codec. Extended-error queries MUST truncate strings with terminators without replacing another thread's information.
+**Verification**: Test
+**Basis**: Microsoft WNetSetLastError, WNetGetLastError and WNetGetUser documentation.
+
+### SYS-NET-5 Provider capability refusal
+
+**Rule**: Network-provider capability/version queries MUST report a capability gap when provider DLL dispatch is unavailable. They MUST NOT fabricate successful provider structures.
+**Verification**: Test
+
+### SYS-NET-6 Offline request handles
+
+**Rule**: Request operations MUST reject session and stale handles using their documented failure conventions. Internet reads and writes MUST clear their byte counts before handle validation. Session timeout and user-agent changes MUST remain observable through existing A/W option queries.
+**Verification**: Test
+**Basis**: Microsoft WinINet handle types, InternetReadFile, InternetWriteFile and InternetSetOption contracts.
+
+## Filesystem identity
+
+### SYS-FILE-1 Invariant filesystem names
+
+**Rule**: Filesystem name matching MUST use the shared invariant UTF-16 case mapping on every host. Non-ASCII names MUST use the same directory index and invalidation rules as ASCII names.
+**Verification**: Test
+
+## Cryptography
+
+### SYS-CRYPTO-1 Streaming digests
+
+**Rule**: CryptoAPI MD5, SHA-1, SHA-256, SHA-384 and SHA-512 MUST compute their standard digests across arbitrary input splits. Hash duplication MUST copy an independently writable stream. Successful hash-value retrieval MUST finalize that hash, while size queries and short buffers MUST preserve its stream.
+**Verification**: Test
+**Basis**: RFC 1321, FIPS 180-4, and Microsoft CryptGetHashParam documentation.
+
+### SYS-CRYPTO-2 CSP ownership
+
+**Rule**: CryptoAPI contexts and hashes MUST use typed aliases in the shared Objects owner. Context reference counts MUST control context lifetime. Invalid handles and failed input validation MUST preserve hash state and unrelated output bytes.
+**Verification**: Test
+
+### SYS-CRYPTO-3 Symmetric transforms
+
+**Rule**: CryptoAPI AES-128/192/256, DES, triple DES, RC2 and RC4 MUST perform their specified symmetric transforms. Key duplication MUST preserve an independent cipher state. Size queries and rejected calls MUST NOT advance cipher state.
+**Verification**: Test
+**Basis**: FIPS 197, FIPS 46-3, RFC 2268 and RFC 6229.
+
+### SYS-CRYPTO-4 HMAC and derived session keys
+
+**Rule**: CryptoAPI HMAC MUST compute RFC 2104 with the selected digest and supplied session key. CryptDeriveKey MUST finalize its base hash and use the documented CSP expansion for AES and triple DES. Plaintext key blobs MUST encode and recover the owned key material and export permissions.
+**Verification**: Test
+**Basis**: RFC 2104, RFC 4231 and Microsoft CryptDeriveKey documentation.
+
+### SYS-CRYPTO-5 Random output boundaries
+
+**Rule**: Random APIs MUST fill exactly the requested output range. Zero-length random requests MUST succeed without dereferencing a null buffer. Invalid output ranges MUST preserve guest bytes.
+**Verification**: Test
+
+### SYS-CRYPTO-6 Secure random source
+
+**Rule**: RtlGenRandom, CryptGenRandom and symmetric CryptGenKey MUST use the shared host OS entropy adapter. They MUST NOT substitute a deterministic generator when that source fails.
+**Verification**: Review — platform source selection and cryptographic entropy require review beyond statistical output tests.
+
+### SYS-CRYPTO-7 Binary text conversions
+
+**Rule**: CryptBinaryToString and CryptStringToBinary MUST transform the actual input bytes, including Base64 headers and hexadecimal encodings. Automatic detection MUST report the selected format and header skip count. A/W variants MUST share ASCII format semantics without applying an ANSI code page.
+**Verification**: Test
+**Basis**: Microsoft CryptBinaryToString and CryptStringToBinary documentation; RFC 4648.
+
+### SYS-CRYPTO-8 Conversion output boundaries
+
+**Rule**: Binary conversion size queries MUST report the complete required output size without writing output buffers. Formatted conversions MUST report ERROR_MORE_DATA and the required size for short buffers. Conversions MUST validate guest output permissions and preserve LastError on success.
+**Verification**: Test
+**Basis**: Microsoft CryptBinaryToString and CryptStringToBinary documentation.
+
+### SYS-CRYPTO-9 Raw binary copy lengths
+
+**Rule**: Raw CryptStringToBinary output MUST copy the caller's byte capacity from checked guest input, independently of its declared text length. Raw size queries MUST report the input character count, including for W calls. Raw binary-to-string copies MUST omit terminators and preserve the length on insufficient capacity.
+**Verification**: Test
+**Basis**: Authored native A/W binary conversion controls in `crypt32_encoding_native`.
+
+## Process status
+
+### SYS-PROCESS-1 Process and module queries
+
+**Rule**: PSAPI and K32 aliases MUST query the existing guest process, Loader and section owners. Module queries MUST enforce process query and VM-read rights, including local real handles. Reported paths MUST use owned LDR names or section paths and the same device mapping as QueryDosDevice.
+**Verification**: Test
+
+## Detached console
+
+### SYS-CONSOLE-1 Absent console handles
+
+**Rule**: Console input, output and buffer configuration MUST fail with ERROR_INVALID_HANDLE when no console is attached. Redirected standard streams MUST NOT constitute console buffers. Ordinary detached-console failures MUST NOT report capability gaps.
+**Verification**: Test
+
+### SYS-CONSOLE-2 Process control handlers
+
+**Rule**: SetConsoleCtrlHandler MUST maintain the process handler table and CTRL+C ignore attribute independently of console attachment. Removing an absent handler MUST fail. FreeConsole MUST succeed while detached and reset process control handlers.
+**Verification**: Test
+**Basis**: Microsoft FreeConsole and SetConsoleCtrlHandler documentation.
+
+### SYS-CONSOLE-3 Console creation capability
+
+**Rule**: AllocConsole MUST fail and report a capability gap when no host console transport is provided. It MUST NOT publish a console window or valid console handles.
+**Verification**: Test
+
+## Installer discovery
+
+### SYS-INSTALL-1 Empty installed state
+
+**Rule**: MSI discovery MUST report the profile's empty installed product and component sets without capability warnings. Queries MUST distinguish unknown products, unknown components and malformed identifiers. Unknown-item failures MUST preserve output buffers and direct-status APIs MUST preserve LastError.
+**Verification**: Test
+
+### SYS-INSTALL-2 Installer file hashes
+
+**Rule**: MsiGetFileHash MUST compute the real MD5 of guest file bytes through the existing VFS and coherent file readers. A/W paths MUST share that implementation. Invalid hash structures and failed reads MUST preserve hash output.
+**Verification**: Test
+**Basis**: Microsoft MsiGetFileHash documentation and RFC 1321.
+
+## Synchronization
+
+### SYS-SYNC-1 Signal and wait ownership
+
+**Rule**: SignalObjectAndWait MUST signal an existing event, release an owned mutex or increment a semaphore before waiting through the shared scheduler. Invalid wait handles MUST leave the signal object unchanged. Alertable waits MUST dispatch queued APCs and report WAIT_IO_COMPLETION.
+**Verification**: Test
+**Basis**: Microsoft SignalObjectAndWait documentation.
+
+## Profile files
+
+### SYS-PROFILEFILE-1 File-backed INI mutations
+
+**Rule**: Profile queries and writers MUST share the INI parser, VFS layout and coherent file owners. Section replacement MUST preserve unrelated sections. Writers MUST retain UTF-16LE files and encode other files through the guest ANSI code page.
+**Verification**: Test
+**Basis**: Microsoft GetPrivateProfileSection, WritePrivateProfileSection and WritePrivateProfileString documentation.
+
+### SYS-PROFILEFILE-2 Checksummed profile structures
+
+**Rule**: Profile structure writers MUST store the actual bytes with their checksum. Readers MUST validate size and checksum before writing guest output. Invalid data and inaccessible outputs MUST preserve output bytes.
+**Verification**: Test
+**Basis**: Microsoft GetPrivateProfileStruct and WritePrivateProfileStruct documentation.
+
+### SYS-PROFILEFILE-3 Native profile writes
+
+**Rule**: Modified native file entries MUST control profile opens, writes, truncation and closes. Failed writes MUST NOT truncate the file. Temporary native handles and guest scratch MUST be released after synchronous completion.
+**Verification**: Test
+
+## Local feature queries
+
+### SYS-CORE-1 Win7 local feature queries
+
+**Rule**: GetTickCount64 MUST retain the shared clock's full millisecond count. Legacy processor topology MUST derive from the same single-processor profile as its Ex counterpart. String probes MUST check guest readability, and the native x86 profile MUST report WOW64 directories unavailable without modifying output.
+**Verification**: Test
+**Basis**: Microsoft GetTickCount64, GetLogicalProcessorInformation, IsBadStringPtr and GetSystemWow64Directory contracts.
+
+## Printing
+
+### SYS-PRINT-1 Empty printer catalog
+
+**Rule**: Local printer enumeration MUST return zero installed or connected printers with checked count outputs. OpenPrinter MUST distinguish the real local server from absent printer devices and enforce ordinary-user access. Printer-device queries MUST fail without fabricating device modes or modifying their output buffers.
+**Verification**: Test
+**Basis**: Microsoft OpenPrinter, EnumPrinters and DocumentProperties contracts and the configured printer-free profile.
+
+Withdrawn: none

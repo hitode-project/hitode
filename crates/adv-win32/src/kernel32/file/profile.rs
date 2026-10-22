@@ -5,7 +5,14 @@ use adv_abi::{AnsiStr, GuestPtr, WideStr, guest::check_range, win32};
 use adv_cpu::backend::{MemFault, Prot};
 
 #[cfg(test)]
+mod complete_tests;
+mod query;
+#[cfg(test)]
 mod tests;
+mod write;
+pub(super) fn write_string(env: &mut Env<'_>, wide: bool) -> Outcome {
+    write::string(env, wide, true)
+}
 
 const MAX_FILE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_INPUT_UNITS: usize = 65536;
@@ -190,7 +197,8 @@ impl Ini {
         let end = units.iter().position(|&u| u == 0).unwrap_or(units.len());
         Self {
             lines: units[..end]
-                .split(|&u| matches!(u, 10 | 13))
+                .split(|&u| u == 10)
+                .flat_map(|line| line.strip_suffix(&[13]).unwrap_or(line).split(|&u| u == 13))
                 .map(<[u16]>::to_vec)
                 .collect(),
         }
@@ -752,6 +760,7 @@ fn sections_w(env: &mut Env<'_>, out: WideStr, capacity: u32, filename: WideStr)
 }
 
 pub(super) fn register(registry: &mut Registry) {
+    query::register(registry);
     registry.register(get_a_ABI);
     registry.register(get_w_ABI);
     registry.register(sections_a_ABI);
