@@ -503,3 +503,65 @@ fn native_nls_callback_stop_controls() {
         assert_eq!(result, 1);
     }
 }
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetLocaleInfoW(locale: u32, kind: u32, output: *mut u16, capacity: i32) -> i32;
+    fn GetDateFormatEx(
+        locale: *const u16,
+        flags: u32,
+        date: *const u16,
+        picture: *const u16,
+        output: *mut u16,
+        capacity: i32,
+        calendar: *const u16,
+    ) -> i32;
+}
+#[test]
+fn native_fixed_locale_table_controls() {
+    // Explicit built-in LCIDs and NOUSEROVERRIDE query public locale tables,
+    // never the runner's language preferences or customized user information.
+    for locale in [0x409, 0x411, 0x804, 0x7f] {
+        for kind in [
+            1, 3, 4, 5, 7, 8, 0xb, 0xd, 0x14, 0x19, 0x1a, 0x1f, 0x20, 0x21, 0x23, 0x1001, 0x1002,
+            0x1003, 0x1005, 0x1006, 0x100c,
+        ] {
+            let mut units = [0u16; 128];
+            let count = unsafe {
+                GetLocaleInfoW(
+                    locale,
+                    kind | 0x80000000,
+                    units.as_mut_ptr(),
+                    units.len() as i32,
+                )
+            };
+            assert!(count > 0);
+            eprintln!(
+                "fixed-locale locale={locale:x} kind={kind:x} value={}",
+                String::from_utf16_lossy(&units[..count as usize - 1])
+            );
+        }
+    }
+    let st = [2024u16, 2, 0, 29, 13, 4, 5, 0];
+    let picture = "dddd MMMM MMM d\0".encode_utf16().collect::<Vec<_>>();
+    for name in ["en-US", "ja-JP", "zh-CN", ""] {
+        let name = name.encode_utf16().chain([0]).collect::<Vec<_>>();
+        let mut output = [0u16; 128];
+        let count = unsafe {
+            GetDateFormatEx(
+                name.as_ptr(),
+                0x80000000,
+                st.as_ptr(),
+                picture.as_ptr(),
+                output.as_mut_ptr(),
+                128,
+                std::ptr::null(),
+            )
+        };
+        assert!(count > 0);
+        eprintln!(
+            "fixed-date value={}",
+            String::from_utf16_lossy(&output[..count as usize - 1])
+        );
+    }
+}
