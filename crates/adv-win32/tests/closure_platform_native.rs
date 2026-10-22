@@ -424,7 +424,13 @@ fn native_request_front_guard_controls() {
             "available",
             InternetQueryDataAvailable(session.0, &mut count, 0, 0),
         );
-        eprintln!("internet-available count={count:x}");
+        assert_eq!(count, 0);
+        count = 0xcdcdcdcd;
+        let result = InternetQueryDataAvailable(std::ptr::null_mut(), &mut count, 0, 0);
+        eprintln!(
+            "internet-available-invalid result={result} error={} count={count:x}",
+            GetLastError()
+        );
         let mut high = 0;
         let pointer = InternetSetFilePointer(session.0, 1, &mut high, 0, 0);
         eprintln!(
@@ -433,7 +439,9 @@ fn native_request_front_guard_controls() {
         );
         assert_eq!(pointer, u32::MAX);
         let result = InternetErrorDlg(std::ptr::null_mut(), session.0, 0, 8, std::ptr::null_mut());
-        eprintln!("internet-error-dialog no-error result={result}");
+        assert_eq!(result, 0);
+        let result = InternetErrorDlg(std::ptr::null_mut(), session.0, 0, 0, std::ptr::null_mut());
+        eprintln!("internet-error-dialog zero-flags result={result}");
         let value = 12345u32;
         for length in [0u32, 3, 4] {
             let result = InternetSetOptionW(session.0, 2, (&value as *const u32).cast(), length);
@@ -492,5 +500,6 @@ fn native_nls_callback_stop_controls() {
             CALLBACKS.load(std::sync::atomic::Ordering::SeqCst)
         );
         assert_eq!(CALLBACKS.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(result, 1);
     }
 }
