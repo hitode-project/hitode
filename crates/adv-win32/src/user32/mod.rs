@@ -12,6 +12,7 @@ pub mod display;
 mod encoding;
 mod enumeration;
 mod formatting;
+mod geometry;
 mod hit_test;
 pub(crate) mod hooks;
 pub mod host_input;
@@ -877,6 +878,7 @@ pub fn register(reg: &mut Registry) {
     s(reg, "UnionRect", 3, union_rect);
     s(reg, "AttachThreadInput", 3, |_| Outcome::Return(1));
     hit_test::register(reg);
+    geometry::register(reg);
     s(reg, "EnumWindows", 2, |_| Outcome::Return(1));
     s(reg, "EnumChildWindows", 3, |_| Outcome::Return(1));
     s(reg, "ChangeDisplaySettingsA", 2, |_| Outcome::Return(0));

@@ -62,6 +62,7 @@ pub const WS_TABSTOP: u32 = 0x0001_0000;
 pub const WS_EX_DLGMODALFRAME: u32 = 0x1;
 pub const WS_EX_NOPARENTNOTIFY: u32 = 0x4;
 pub const WS_EX_CLIENTEDGE: u32 = 0x200;
+pub const WS_EX_LAYOUTRTL: u32 = 0x0040_0000;
 
 pub const CW_USEDEFAULT: u32 = 0x8000_0000;
 
@@ -666,29 +667,41 @@ impl User {
         self.queues.entry(ctx).or_default()
     }
 
-    /// Screen position of `hwnd`'s client-area origin.
+    /// Physical screen position of the left edge of the client area.
     pub fn client_origin(&self, objects: &Objects, hwnd: u32) -> (i32, i32) {
         let Some(w) = self.windows.get(objects, &hwnd) else {
             return (0, 0);
         };
         let (l, t, _, _) = nc_insets(w.style, w.ex_style);
-        let (px, py) = if w.parent != 0 {
-            self.client_origin(objects, w.parent)
+        let (x, y) = self.window_origin(objects, hwnd).unwrap_or_default();
+        (x.wrapping_add(l), y.wrapping_add(t))
+    }
+
+    fn window_origin(&self, objects: &Objects, hwnd: u32) -> Option<(i32, i32)> {
+        let w = self.windows.get(objects, &hwnd)?;
+        if w.parent == 0 {
+            return Some((w.rect.left, w.rect.top));
+        }
+        let parent = self.windows.get(objects, &w.parent)?;
+        let (x, y) = self.client_origin(objects, w.parent);
+        let left = if parent.ex_style & WS_EX_LAYOUTRTL != 0 {
+            parent.client_size().0.wrapping_sub(w.rect.right)
         } else {
-            (0, 0)
+            w.rect.left
         };
-        (px + w.rect.left + l, py + w.rect.top + t)
+        Some((x.wrapping_add(left), y.wrapping_add(w.rect.top)))
     }
 
     /// Window rect in screen coordinates.
     pub fn screen_rect(&self, objects: &Objects, hwnd: u32) -> Option<Rect> {
         let w = self.windows.get(objects, &hwnd)?;
-        let (px, py) = if w.parent != 0 {
-            self.client_origin(objects, w.parent)
-        } else {
-            (0, 0)
-        };
-        Some(w.rect.offset(px, py))
+        let (x, y) = self.window_origin(objects, hwnd)?;
+        Some(Rect {
+            left: x,
+            top: y,
+            right: x.wrapping_add(w.rect.width()),
+            bottom: y.wrapping_add(w.rect.height()),
+        })
     }
 
     /// `hwnd` and all its descendants, parents before children.
@@ -1332,12 +1345,21 @@ fn create_window_inner(
         set_last_error(env, 8);
         return then(env, 0);
     };
+    let ex_style = if child
+        && u.windows
+            .get(&env.sys.objects, &parent)
+            .is_some_and(|w| w.ex_style & (WS_EX_LAYOUTRTL | 0x0010_0000) == WS_EX_LAYOUTRTL)
+    {
+        p.ex_style | WS_EX_LAYOUTRTL
+    } else {
+        p.ex_style
+    };
     let mut win = Window::new(
         hwnd,
         ci,
         class_proc,
         style & !WS_VISIBLE,
-        p.ex_style,
+        ex_style,
         if child { parent } else { 0 },
         Rect::new(x, y, w, h),
         ctx,

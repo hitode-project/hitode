@@ -133,9 +133,9 @@ This spec covers Win32 subsystems of the personality: images and loader state, s
 
 > Note: HOST-MENU-1 and HOST-MENU-3 in [host.md](host.md) cover the native menu side.
 
-### WIN32-USER-6 Window placement
+### WIN32-USER-6 Window placement and coordinates
 
-**Rule**: SetWindowPlacement MUST validate the complete structure and length before changing state, then use USER geometry, visibility, and activation callbacks. Normal windows MUST recover offscreen placement into the virtual work area; tool windows MUST preserve screen coordinates.
+**Rule**: SetWindowPlacement MUST validate complete structures and lengths before changing state through shared USER geometry, visibility and activation callbacks. Normal windows MUST recover offscreen placement into the virtual work area, while tool windows preserve screen coordinates. Coordinate mapping and child hit tests MUST follow `User::client_origin`, mirroring and immediate-child z-order.
 **Verification**: Test
 
 ### WIN32-USER-7 Placement state and limits

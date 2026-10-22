@@ -2644,6 +2644,7 @@ user32.dll!CheckDlgButton	user cache or win32k	not excluded	not excluded	not exc
 user32.dll!CheckMenuItem	user cache or win32k	not excluded	not excluded	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
 user32.dll!CheckMenuRadioItem	user cache or win32k	not excluded	not excluded	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
 user32.dll!CheckRadioButton	user cache or win32k	not excluded	not excluded	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
+user32.dll!ChildWindowFromPoint	user cache or win32k	not excluded	not excluded	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
 user32.dll!ClientToScreen	user cache or win32k	no	no	no	handler-owned state; same source	not required by fast path; ordinary not excluded	leaf	explicit nonblocking registration; decline before effects
 user32.dll!ClipCursor	user cache or win32k	not excluded	not excluded	not excluded	not excluded	live clock/input/window source	ordinary	ordinary required until all effects are proven safe
 user32.dll!CloseClipboard	user cache or win32k	not excluded	not excluded	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
@@ -2863,6 +2864,7 @@ user32.dll!LockWindowUpdate	user cache or win32k	not excluded	not excluded	not e
 user32.dll!MapDialogRect	user cache or win32k	not excluded	not excluded	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
 user32.dll!MapVirtualKeyA	user cache or win32k	not excluded	not excluded	yes/conditional	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
 user32.dll!MapVirtualKeyW	user cache or win32k	not excluded	not excluded	yes/conditional	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
+user32.dll!MapWindowPoints	user cache or win32k	not excluded	not excluded	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
 user32.dll!MessageBeep	user cache or win32k	not excluded	not excluded	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
 user32.dll!MessageBoxA	user cache or win32k	yes/conditional	not excluded	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
 user32.dll!MessageBoxExA	user cache or win32k	yes/conditional	not excluded	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
