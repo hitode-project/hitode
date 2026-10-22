@@ -65,11 +65,21 @@ pub(super) fn encode(input: &[u8], flags: u32) -> Result<Vec<u8>, u32> {
         }
         2 => out.extend_from_slice(input),
         4 | 5 | 10 | 11 => {
+            if format == 4 && ending.is_empty() {
+                for (index, &byte) in input.iter().enumerate() {
+                    if index != 0 {
+                        out.push(b' ');
+                    }
+                    out.push(HEX[(byte >> 4) as usize]);
+                    out.push(HEX[(byte & 15) as usize]);
+                }
+                return Ok(out);
+            }
             let ascii = matches!(format, 5 | 11);
             let address = matches!(format, 10 | 11);
             for (line, chunk) in input.chunks(16).enumerate() {
                 if address {
-                    out.extend_from_slice(format!("{:04x}  ", line * 16).as_bytes());
+                    out.extend_from_slice(format!("{:04x}\t", line * 16).as_bytes());
                 }
                 for (index, &byte) in chunk.iter().enumerate() {
                     if index != 0 {
@@ -130,6 +140,9 @@ fn base64(input: &[u16], strict: bool) -> Result<Vec<u8>, u32> {
             continue;
         }
         if unit == 61 {
+            if digits == 0 {
+                return Err(INVALID_DATA);
+            }
             padding += 1;
             if !strict {
                 break;
@@ -142,7 +155,11 @@ fn base64(input: &[u16], strict: bool) -> Result<Vec<u8>, u32> {
         if padding != 0 {
             return Err(INVALID_DATA);
         }
-        let digit = sextet(unit).ok_or(INVALID_DATA)?;
+        let digit = match sextet(unit) {
+            Some(digit) => digit,
+            None if !strict && digits != 0 => break,
+            None => return Err(INVALID_DATA),
+        };
         bits = (bits << 6) | digit;
         available += 6;
         digits += 1;
@@ -152,7 +169,9 @@ fn base64(input: &[u16], strict: bool) -> Result<Vec<u8>, u32> {
         }
     }
     if digits % 4 == 1 {
-        return Err(INVALID_DATA);
+        // Native zero-terminated controls accept a final single sextet and
+        // preserve bit 2 in the resulting byte, including in strict mode.
+        out.push((bits << (8 - available)) as u8 | 4);
     }
     Ok(out)
 }
@@ -229,6 +248,9 @@ fn hex(input: &[u16], format: u32) -> Result<Vec<u8>, u32> {
             if count != 0 && matches!(format, 5 | 11) && spaces >= 3 {
                 break;
             }
+            if count != 0 && spaces == 0 && !matches!(remaining[0], 10 | 13) {
+                return Err(INVALID_DATA);
+            }
             remaining = &remaining[spaces..];
             if remaining.is_empty() || matches!(remaining[0], 10 | 13) {
                 break;
@@ -246,6 +268,9 @@ fn hex(input: &[u16], format: u32) -> Result<Vec<u8>, u32> {
             return Err(INVALID_DATA);
         }
         if matches!(format, 5 | 11) {
+            if remaining.iter().all(|&unit| white(unit)) {
+                break;
+            }
             let padding = (16 - count) * 3 + usize::from(count <= 8) + 3;
             if remaining.len() < padding + count
                 || remaining[..padding]
@@ -257,7 +282,11 @@ fn hex(input: &[u16], format: u32) -> Result<Vec<u8>, u32> {
             remaining = &remaining[padding + count..];
         }
     }
-    Ok(out)
+    if out.is_empty() {
+        Err(INVALID_DATA)
+    } else {
+        Ok(out)
+    }
 }
 pub(super) fn decode(input: &[u16], binary: &[u8], flags: u32) -> Result<(Vec<u8>, u32, u32), u32> {
     if flags & !0x200000ff != 0 {

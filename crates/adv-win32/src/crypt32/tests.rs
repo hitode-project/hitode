@@ -35,6 +35,10 @@ fn encodings_match_rfc_vectors_and_preserve_header_detection() {
             for line_mode in [0, 0x80000000, 0x40000000] {
                 let output = encoding::encode(&bytes, kind | line_mode).unwrap();
                 let text = output.iter().copied().map(u16::from).collect::<Vec<_>>();
+                if length == 0 && matches!(kind, 5 | 10 | 11) {
+                    assert_eq!(encoding::decode(&text, &output, kind), Err(13));
+                    continue;
+                }
                 assert_eq!(
                     encoding::decode(&text, &output, kind).unwrap().0,
                     bytes,
@@ -63,10 +67,26 @@ fn encodings_match_rfc_vectors_and_preserve_header_detection() {
         encoding::encode(&[0, 0xab, 0xff], 12).unwrap(),
         b"00abff\r\n"
     );
-    for text in ["?", "A", "a?aa", "Zm9v====", "Zm9v=tail"] {
+    for text in ["?", "=", "===", "a?aa", "Zm9v====", "Zm9v=tail"] {
         let units = text.encode_utf16().collect::<Vec<_>>();
         assert_eq!(encoding::decode(&units, &[], 0x20000001), Err(13), "{text}");
     }
+    for (text, byte) in [("Z", 100), ("0", 212)] {
+        assert_eq!(
+            encoding::decode(&text.encode_utf16().collect::<Vec<_>>(), &[], 1)
+                .unwrap()
+                .0,
+            [byte]
+        );
+    }
+    assert_eq!(
+        encoding::encode(&[0, 1, 2], 10).unwrap(),
+        b"0000\t00 01 02\r\n"
+    );
+    assert_eq!(
+        encoding::encode(&(0..17).collect::<Vec<_>>(), 0x40000004).unwrap(),
+        b"00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f 10"
+    );
     let text = "Zm9v=ignored".encode_utf16().collect::<Vec<_>>();
     assert_eq!(encoding::decode(&text, &[], 1).unwrap().0, b"foo");
     for text in ["0", "0x00", "01?2", "aabbz"] {

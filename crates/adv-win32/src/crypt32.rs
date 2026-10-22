@@ -20,7 +20,8 @@ fn read(env: &Env<'_>, pointer: u32, length: u32) -> Result<Vec<u8>, u32> {
 fn binary_to_string(env: &mut Env<'_>, wide: bool) -> Outcome {
     let (input, length, flags, output, size) =
         (env.arg(0), env.arg(1), env.arg(2), env.arg(3), env.arg(4));
-    if input == 0 || check_range(env.cpu, size, 4, Prot::READ | Prot::WRITE).is_err() {
+    if input == 0 || length == 0 || check_range(env.cpu, size, 4, Prot::READ | Prot::WRITE).is_err()
+    {
         return fail(env, 87);
     }
     let input = match read(env, input, length) {
