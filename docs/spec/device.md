@@ -160,6 +160,12 @@ Comparing against the last publication keeps every slot's damage history complet
 **Verification**: Test
 **Basis**: [StringFormat](https://learn.microsoft.com/windows/win32/api/gdiplusstringformat/nl-gdiplusstringformat-stringformat).
 
+### DEV-IMAGE-12 Image list storage
+
+**Rule**: Image list duplication MUST copy independent pixels, masks, dimensions and background color. Image removal MUST compact later indexes, and icon size changes MUST remove every image. Count expansion MUST preserve existing images, and truncation MUST retire removed storage.
+**Verification**: Test
+**Basis**: [ImageList_Duplicate](https://learn.microsoft.com/windows/win32/api/commctrl/nf-commctrl-imagelist_duplicate), [ImageList_SetIconSize](https://learn.microsoft.com/windows/win32/api/commctrl/nf-commctrl-imagelist_seticonsize).
+
 ## Audio ownership
 
 ### DEV-AUDIO-1 Shared playback
