@@ -342,3 +342,9 @@ Withdrawn: PERS-SCOPE-2, PERS-SCOPE-7, PERS-SCOPE-9
 **Rule**: GetTickCount64 MUST retain the shared clock's full millisecond count. Legacy processor topology MUST derive from the same single-processor profile as its Ex counterpart. String probes MUST check guest readability, and the native x86 profile MUST report WOW64 directories unavailable without modifying output.
 **Verification**: Test
 **Basis**: Microsoft GetTickCount64, GetLogicalProcessorInformation, IsBadStringPtr and GetSystemWow64Directory contracts.
+
+### PERS-NET-6 Offline request handles
+
+**Rule**: Request operations MUST reject session and stale handles using their documented failure conventions. Internet reads and writes MUST clear their byte counts before handle validation. Session timeout and user-agent changes MUST remain observable through existing A/W option queries.
+**Verification**: Test
+**Basis**: Microsoft WinINet handle types, InternetReadFile, InternetWriteFile and InternetSetOption contracts.

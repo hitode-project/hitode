@@ -2,8 +2,10 @@
 use crate::network::{self, Library};
 use adv_abi::{AnsiStr, GuestPtr, Registry, WideStr, win32};
 use adv_machine::Env;
+mod requests;
 
 pub(super) fn register(reg: &mut Registry) {
+    requests::register(reg);
     for api in [
         open_a_ABI,
         open_w_ABI,

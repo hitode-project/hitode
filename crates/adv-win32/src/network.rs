@@ -17,6 +17,7 @@ struct Session {
     library: Library,
     agent: Vec<u16>,
     cache_only: bool,
+    timeouts: [u32; 3],
 }
 
 pub(crate) fn text(env: &Env<'_>, pointer: u32, wide: bool) -> Result<Vec<u16>, u32> {
@@ -104,6 +105,7 @@ pub(crate) fn open(
             library,
             agent,
             cache_only: flags & 0x01000000 != 0,
+            timeouts: [60_000, 30_000, 30_000],
         },
     ) {
         Some(handle) => handle,
@@ -155,6 +157,13 @@ pub(crate) fn query(
         return fail(env, 6) as i32;
     };
     let bytes = match option {
+        2 | 5 | 6 if library == Library::WinInet => session.timeouts[match option {
+            2 => 0,
+            5 => 1,
+            _ => 2,
+        }]
+        .to_le_bytes()
+        .to_vec(),
         9 => 1u32.to_le_bytes().to_vec(), // INTERNET_HANDLE_TYPE_INTERNET / WINHTTP_HANDLE_TYPE_SESSION
         41 => {
             let mut units = session.agent.clone();
@@ -194,6 +203,64 @@ pub(crate) fn query(
     }
     if env.cpu.write(buffer, &bytes).is_err() || size.write(env.cpu, bytes.len() as u32).is_err() {
         return fail(env, 998) as i32;
+    }
+    1
+}
+
+pub(crate) fn set_option(
+    env: &mut Env<'_>,
+    handle: u32,
+    option: u32,
+    input: u32,
+    length: u32,
+) -> i32 {
+    if !valid(env, Library::WinInet, handle) {
+        return fail(env, 6) as i32;
+    }
+    if !matches!(option, 2 | 5 | 6 | 41) {
+        adv_abi::warn_unavailable(
+            env,
+            "wininet.dll!InternetSetOptionW",
+            &format!("Internet session option {option} is unavailable"),
+        );
+        return fail(env, 12009) as i32;
+    }
+    if (option != 41 && length != 4) || (option == 41 && length & 1 != 0) {
+        return fail(env, 87) as i32;
+    }
+    if input == 0 || check_range(env.cpu, input, length, Prot::READ).is_err() {
+        return fail(env, 87) as i32;
+    }
+    let mut bytes = Vec::new();
+    if bytes.try_reserve_exact(length as usize).is_err() {
+        return fail(env, 8) as i32;
+    }
+    bytes.resize(length as usize, 0);
+    if env.cpu.read(input, &mut bytes).is_err() {
+        return fail(env, 998) as i32;
+    }
+    let namespace = env.ext.get::<Sessions>().0;
+    let identity = env
+        .sys
+        .objects
+        .lookup_alias::<Session>(namespace, handle)
+        .unwrap();
+    let session = env.sys.objects.owned_mut::<Session>(identity).unwrap();
+    if option == 41 {
+        session.agent = bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|bytes| u16::from_le_bytes(*bytes))
+            .take_while(|unit| *unit != 0)
+            .collect();
+    } else {
+        let index = match option {
+            2 => 0,
+            5 => 1,
+            _ => 2,
+        };
+        session.timeouts[index] = u32::from_le_bytes(bytes.try_into().unwrap());
     }
     1
 }
