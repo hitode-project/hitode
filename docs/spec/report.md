@@ -58,6 +58,11 @@ This spec covers the anonymous compatibility report, schema `hitode.report/1`, t
 **Rule**: A run that ends with a host-side error MUST still yield a summary, classified by REPORT-FAIL-1 from the error text and its elapsed time. Such a summary MUST NOT carry frame timing.
 **Verification**: Test
 
+### REPORT-GAP-1 API gaps
+
+**Rule**: A summary MUST list the unimplemented APIs the run called, and those a loaded module imports but did not call. Each list MUST hold at most 256 sorted, distinct `module!name` entries in printable ASCII. Other entries MUST be dropped, and a report carrying one MUST fail validation.
+**Verification**: Test
+
 ### REPORT-PERF-1 Frame time percentiles
 
 **Rule**: Performance data MUST be the 50th, 95th and 99th percentiles of frame time by nearest rank, rounded to 0.1 ms. Individual frame times MUST NOT be reported.

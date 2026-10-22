@@ -52,6 +52,14 @@ export interface ReportPerf {
   frame_ms_p99: number;
 }
 
+/** Unimplemented APIs the run met, as sorted "module!name" lists. */
+export interface ReportApiGaps {
+  /** Called by the game; the runtime returned their failure and kept playing. */
+  called: string[];
+  /** Imported by a loaded module but not called. */
+  imported: string[];
+}
+
 export interface Report {
   schema: typeof REPORT_SCHEMA;
   dedupe_key: string;
@@ -65,6 +73,7 @@ export interface Report {
   note?: string;
   failure?: ReportFailure;
   perf?: ReportPerf;
+  api_gaps?: ReportApiGaps;
 }
 
 /** What the user picked in the report form. */
@@ -80,6 +89,7 @@ export interface ReportInput {
   note: string | null;
   failure: ReportFailure | null;
   perf: ReportPerf | null;
+  apiGaps: ReportApiGaps | null;
 }
 
 export function situationOutcome(situation: Situation): Outcome {
@@ -103,5 +113,6 @@ export function buildReport(base: ReportBase, input: ReportInput): Report {
   if (input.note) report.note = input.note;
   if (input.failure) report.failure = input.failure;
   if (input.perf) report.perf = input.perf;
+  if (input.apiGaps) report.api_gaps = input.apiGaps;
   return report;
 }
