@@ -20,7 +20,6 @@ class	{cda42200-bd88-11d0-bd4e-00a0c911ce86}		1
 class	{d27cdb6e-ae6d-11cf-96b8-444553540000}		1
 import	kernel32.dll!WinExec		5
 import	shell32.dll!DragFinish		5
-import	kernel32.dll!EnumSystemLocalesA		4
 import	shell32.dll!DragQueryFileA		4
 import	gdi32.dll!DeleteEnhMetaFile		2
 import	gdi32.dll!GetEnhMetaFileHeader		2
@@ -30,73 +29,30 @@ import	gdi32.dll!SetEnhMetaFileBits		2
 import	gdi32.dll!SetWinMetaFileBits		2
 import	gdiplus.dll!GdipGetImagePixelFormat		2
 import	kernel32.dll!DeviceIoControl		2
-import	kernel32.dll!EnumCalendarInfoA		2
 import	kernel32.dll!GetFileAttributesExW		2
-import	ole32.dll!OleInitialize		2
-import	ole32.dll!OleUninitialize		2
-import	oleaut32.dll!GetErrorInfo		2
-import	user32.dll!InvalidateRgn		2
-import	user32.dll!MapWindowPoints		2
 import	user32.dll!WaitForInputIdle		2
 import	wininet.dll!InternetCrackUrlW		2
-import	advapi32.dll!AdjustTokenPrivileges		1
-import	advapi32.dll!DuplicateTokenEx		1
-import	advapi32.dll!GetSecurityDescriptorOwner		1
-import	advapi32.dll!ImpersonateLoggedOnUser		1
-import	advapi32.dll!IsValidSid		1
-import	advapi32.dll!LookupAccountSidA		1
-import	advapi32.dll!LookupPrivilegeValueA		1
-import	advapi32.dll!RegEnumKeyA		1
-import	advapi32.dll!RevertToSelf		1
-import	comctl32.dll!ImageList_Add		1
-import	comctl32.dll!ImageList_AddMasked		1
 import	comctl32.dll!ImageList_BeginDrag		1
 import	comctl32.dll!ImageList_DragEnter		1
 import	comctl32.dll!ImageList_DragLeave		1
 import	comctl32.dll!ImageList_DragMove		1
 import	comctl32.dll!ImageList_DragShowNolock		1
-import	comctl32.dll!ImageList_Draw		1
-import	comctl32.dll!ImageList_DrawEx		1
 import	comctl32.dll!ImageList_EndDrag		1
 import	comctl32.dll!ImageList_GetDragImage		1
-import	comctl32.dll!ImageList_GetIcon		1
-import	comctl32.dll!ImageList_Replace		1
 import	comctl32.dll!ImageList_SetDragCursorImage		1
 import	comctl32.dll!ImageList_Write		1
 import	comdlg32.dll!ChooseColorW		1
 import	comdlg32.dll!ChooseFontA		1
 import	d3dx9_43.dll!D3DXCreateLine		1
 import	d3dx9_43.dll!D3DXCreateSphere		1
-import	d3dx9_43.dll!D3DXCreateTextureFromFileInMemory		1
 import	d3dx9_43.dll!D3DXLoadMeshFromXInMemory		1
 import	gdi32.dll!CopyEnhMetaFileA		1
-import	gdi32.dll!EndDoc		1
-import	gdi32.dll!EndPage		1
 import	gdi32.dll!GetBitmapBits		1
-import	gdi32.dll!GetDCOrgEx		1
 import	gdi32.dll!GetEnhMetaFileBits		1
-import	gdi32.dll!GetSystemPaletteEntries		1
-import	gdi32.dll!GetTextExtentPointA		1
 import	gdi32.dll!GetWinMetaFileBits		1
 import	gdi32.dll!MaskBlt		1
 import	gdi32.dll!Polyline		1
 import	gdi32.dll!Rectangle		1
-import	gdi32.dll!SetAbortProc		1
-import	gdi32.dll!StartDocA		1
-import	gdi32.dll!StartPage		1
-import	gdiplus.dll!GdipAddPathBezier		1
-import	gdiplus.dll!GdipAddPathBeziers		1
-import	gdiplus.dll!GdipAddPathClosedCurve		1
-import	gdiplus.dll!GdipAddPathClosedCurve2		1
-import	gdiplus.dll!GdipAddPathCurve		1
-import	gdiplus.dll!GdipAddPathCurve2		1
-import	gdiplus.dll!GdipAddPathCurve3		1
-import	gdiplus.dll!GdipAddPathEllipse		1
-import	gdiplus.dll!GdipAddPathLine2		1
-import	gdiplus.dll!GdipAddPathPie		1
-import	gdiplus.dll!GdipAddPathPolygon		1
-import	gdiplus.dll!GdipAddPathRectangle		1
-import	gdiplus.dll!GdipAddPathRectangles		1
 import	gdiplus.dll!GdipBeginContainer2		1
 import	gdiplus.dll!GdipBitmapLockBits		1
 import	gdiplus.dll!GdipBitmapUnlockBits		1
@@ -143,7 +99,6 @@ import	gdiplus.dll!GdipRecordMetafileStream		1
 import	gdiplus.dll!GdipSaveImageToFile		1
 import	gdiplus.dll!GdipSetAdjustableArrowCapMiddleInset		1
 import	gdiplus.dll!GdipSetClipRegion		1
-import	gdiplus.dll!GdipSetCompositingMode		1
 import	gdiplus.dll!GdipSetLineBlend		1
 import	gdiplus.dll!GdipSetLineGammaCorrection		1
 import	gdiplus.dll!GdipSetLineLinearBlend		1
@@ -175,8 +130,6 @@ import	kernel32.dll!CreateTimerQueueTimer		1
 import	kernel32.dll!DeleteTimerQueueTimer		1
 import	kernel32.dll!FatalAppExitA		1
 import	kernel32.dll!GetDevicePowerState		1
-import	kernel32.dll!GetStringTypeExA		1
-import	kernel32.dll!GetStringTypeExW		1
 import	kernel32.dll!LockFileEx		1
 import	kernel32.dll!PostQueuedCompletionStatus		1
 import	kernel32.dll!SwitchToThread		1
@@ -188,12 +141,7 @@ import	msvcr80.dll!_CIcosh		1
 import	msvcr80.dll!_CIexp		1
 import	msvcr80.dll!_CIsinh		1
 import	msvcr80.dll!_CItanh		1
-import	msvcr80.dll!__CppXcptFilter		1
-import	msvcr80.dll!_amsg_exit		1
-import	msvcr80.dll!_crt_debugger_hook		1
-import	msvcr80.dll!_mktime64		1
 import	msvcr80.dll!clearerr		1
-import	msvcr80.dll!clock		1
 import	msvcr80.dll!ferror		1
 import	msvcr80.dll!fgets		1
 import	msvcr80.dll!fputs		1
@@ -201,8 +149,6 @@ import	msvcr80.dll!freopen		1
 import	msvcr80.dll!frexp		1
 import	msvcr80.dll!fscanf		1
 import	msvcr80.dll!localeconv		1
-import	msvcr80.dll!remove		1
-import	msvcr80.dll!rename		1
 import	msvcr80.dll!setvbuf		1
 import	msvcr80.dll!strcoll		1
 import	msvcr80.dll!strerror		1
@@ -224,8 +170,6 @@ import	msvcr90.dll!_CIasin		1
 import	msvcr90.dll!_CIatan		1
 import	msvcr90.dll!_CIatan2		1
 import	msvcr90.dll!_CIexp		1
-import	msvcr90.dll!_XcptFilter		1
-import	msvcr90.dll!__CppXcptFilter		1
 import	msvcr90.dll!___lc_collate_cp_func		1
 import	msvcr90.dll!___mb_cur_max_l_func		1
 import	msvcr90.dll!__crtCompareStringW		1
@@ -233,28 +177,16 @@ import	msvcr90.dll!__crtGetStringTypeW		1
 import	msvcr90.dll!__crtLCMapStringA		1
 import	msvcr90.dll!__crtLCMapStringW		1
 import	msvcr90.dll!__setusermatherr		1
-import	msvcr90.dll!_aligned_free		1
-import	msvcr90.dll!_aligned_malloc		1
-import	msvcr90.dll!_amsg_exit		1
 import	msvcr90.dll!_configthreadlocale		1
 import	msvcr90.dll!_create_locale		1
-import	msvcr90.dll!_crt_debugger_hook		1
-import	msvcr90.dll!_expand		1
 import	msvcr90.dll!_free_locale		1
 import	msvcr90.dll!_invoke_watson		1
 import	msvcr90.dll!_ismbclegal		1
-import	msvcr90.dll!_msize		1
-import	msvcr90.dll!_strtoi64		1
-import	msvcr90.dll!_ui64toa_s		1
-import	msvcr90.dll!_unlink		1
 import	msvcr90.dll!_vsnprintf		1
 import	msvcr90.dll!_write		1
-import	msvcr90.dll!abort		1
-import	msvcr90.dll!atoi		1
 import	msvcr90.dll!log		1
 import	msvcr90.dll!printf		1
 import	msvcr90.dll!setvbuf		1
-import	msvcr90.dll!strtol		1
 import	msvcr90.dll!towupper		1
 import	msvcr90.dll!ungetc		1
 import	msvcrt.dll!??0exception@@QAE@ABQBD@Z		1
@@ -262,50 +194,23 @@ import	msvcrt.dll!??0exception@@QAE@ABV0@@Z		1
 import	msvcrt.dll!??1exception@@UAE@XZ		1
 import	msvcrt.dll!??1type_info@@UAE@XZ		1
 import	msvcrt.dll!?what@exception@@UBEPBDXZ		1
-import	msvcrt.dll!_iob		1
-import	ntdll.dll!RtlAnsiStringToUnicodeString		1
-import	ole32.dll!CLSIDFromProgID		1
-import	ole32.dll!CoGetClassObject		1
-import	ole32.dll!CoSetProxyBlanket		1
 import	ole32.dll!CreateItemMoniker		1
 import	ole32.dll!GetRunningObjectTable		1
-import	ole32.dll!IsEqualGUID		1
-import	ole32.dll!OleDraw		1
-import	ole32.dll!OleLockRunning		1
-import	oleaut32.dll!#146		1
 import	oleaut32.dll!#161		1
 import	oleaut32.dll!#162		1
-import	oleaut32.dll!#277		1
 import	oleaut32.dll!#418		1
 import	oleaut32.dll!#420		1
-import	oleaut32.dll!SafeArrayCreate		1
-import	oleaut32.dll!SafeArrayGetLBound		1
-import	oleaut32.dll!SafeArrayGetUBound		1
-import	oleaut32.dll!SafeArrayPtrOfIndex		1
-import	oleaut32.dll!VariantChangeTypeEx		1
-import	oleaut32.dll!VariantCopyInd		1
 import	shell32.dll!CommandLineToArgvW		1
 import	shell32.dll!DragQueryFileW		1
 import	shell32.dll!SHChangeNotify		1
 import	shell32.dll!SHFileOperationA		1
 import	shell32.dll!SHGetDesktopFolder		1
-import	shlwapi.dll!SHGetValueA		1
 import	user32.dll!ActivateKeyboardLayout		1
-import	user32.dll!BeginDeferWindowPos		1
-import	user32.dll!BringWindowToTop		1
-import	user32.dll!CharPrevA		1
-import	user32.dll!CharToOemA		1
-import	user32.dll!ChildWindowFromPoint		1
-import	user32.dll!CreateIcon		1
 import	user32.dll!DefFrameProcA		1
 import	user32.dll!DefMDIChildProcA		1
-import	user32.dll!DeferWindowPos		1
 import	user32.dll!DrawEdge		1
 import	user32.dll!DrawFocusRect		1
 import	user32.dll!DrawFrameControl		1
-import	user32.dll!DrawIcon		1
-import	user32.dll!DrawIconEx		1
-import	user32.dll!EndDeferWindowPos		1
 import	user32.dll!ExitWindowsEx		1
 import	user32.dll!FindWindowExA		1
 import	user32.dll!FlashWindowEx		1
@@ -322,12 +227,10 @@ import	user32.dll!ScrollWindow		1
 import	user32.dll!ScrollWindowEx		1
 import	user32.dll!TranslateMDISysAccel		1
 import	user32.dll!UnregisterHotKey		1
-import	user32.dll!ValidateRgn		1
 import	user32.dll!WinHelpA		1
 import	user32.dll!mouse_event		1
 import	winmm.dll!PlaySoundA		1
 import	winmm.dll!mmioAdvance		1
-import	ws2_32.dll!#3		1
 import	xinput1_4.dll!#2		1
 load	combase.dll		3
 load	d3d9d.dll		2
@@ -362,27 +265,10 @@ load	usp10.dll		1
 lookup	user32.dll!GetLastActivePopup		10
 lookup	oleaut32.dll!LoadRegTypeLib		5
 lookup	oleaut32.dll!LoadTypeLib		5
-lookup	kernel32.dll!CreateEventExW		4
-lookup	kernel32.dll!CreateSemaphoreExW		4
 lookup	kernel32.dll!CreateSymbolicLinkW		4
 lookup	kernel32.dll!FreeLibraryWhenCallbackReturns		4
-lookup	kernel32.dll!GetLocaleInfoEx		4
-lookup	kernel32.dll!EnumSystemLocalesEx		3
-lookup	kernel32.dll!GetDateFormatEx		3
-lookup	kernel32.dll!GetTimeFormatEx		3
-lookup	kernel32.dll!GetUserDefaultLocaleName		3
-lookup	kernel32.dll!IsValidLocaleName		3
 lookup	kernel32.dll!SetDefaultDllDirectories		3
 lookup	kernel32.dll!SetThreadStackGuarantee		3
-lookup	ole32.dll!CoAddRefServerProcess		2
-lookup	ole32.dll!CoCreateInstanceEx		2
-lookup	ole32.dll!CoReleaseServerProcess		2
-lookup	ole32.dll!CoResumeClassObjects		2
-lookup	ole32.dll!CoSuspendClassObjects		2
-lookup	advapi32.dll!RegCreateKeyTransactedW		1
-lookup	advapi32.dll!RegDeleteKeyExW		1
-lookup	advapi32.dll!RegDeleteKeyTransactedW		1
-lookup	advapi32.dll!RegOpenKeyTransactedW		1
 lookup	advapi32.dll!RegisterTraceGuidsW		1
 lookup	comctl32.dll!FlatSB_EnableScrollBar		1
 lookup	comctl32.dll!FlatSB_GetScrollInfo		1
@@ -398,7 +284,6 @@ lookup	comctl32.dll!InitializeFlatSB		1
 lookup	comctl32.dll!UninitializeFlatSB		1
 lookup	d3d9.dll!Direct3DCreate9Ex		1
 lookup	ddraw.dll!DirectDrawEnumerateExA		1
-lookup	imm32.dll!ImmIsIME		1
 lookup	kernel32.dll!CloseThreadpoolWork		1
 lookup	kernel32.dll!CreateThreadpoolWork		1
 lookup	kernel32.dll!GetFileInformationByHandleEx		1
@@ -664,6 +549,7 @@ unreviewed	kernel32.dll!CreateFileW dwShareMode	0x1	4
 unreviewed	kernel32.dll!CreateProcessA dwCreationFlags	0x0	4
 unreviewed	kernel32.dll!CreateSemaphoreA lInitialCount	0x0	4
 unreviewed	kernel32.dll!CreateSemaphoreA lMaximumCount	0x7fffffff	4
+unreviewed	kernel32.dll!EnumSystemLocalesA dwFlags	0x1	4
 unreviewed	kernel32.dll!ExitProcess uExitCode	0xff	4
 unreviewed	kernel32.dll!ExitThread dwExitCode	0x0	4
 unreviewed	kernel32.dll!FormatMessageA dwLanguageId	0x0	4
@@ -684,6 +570,9 @@ unreviewed	kernel32.dll!Sleep dwMilliseconds	0xc8	4
 unreviewed	kernel32.dll!VirtualAlloc flAllocationType	0x3000	4
 unreviewed	kernel32.dll!VirtualProtect dwSize	0x4	4
 unreviewed	kernel32.dll!WideCharToMultiByte cbMultiByte	0x3f	4
+unreviewed	msvcrt.dll!calloc count	0x1	4
+unreviewed	msvcrt.dll!calloc count	0x20	4
+unreviewed	msvcrt.dll!calloc size	0x4	4
 unreviewed	ole32.dll!CoCreateInstance dwClsContext	0x3	4
 unreviewed	ole32.dll!CoTaskMemAlloc cb	0x6	4
 unreviewed	user32.dll!ChangeDisplaySettingsA dwFlags	0x2	4
@@ -810,6 +699,19 @@ unreviewed	msacm32.dll!acmStreamOpen dwInstance	0x0	3
 unreviewed	msacm32.dll!acmStreamPrepareHeader fdwPrepare	0x0	3
 unreviewed	msacm32.dll!acmStreamSize fdwSize	0x0	3
 unreviewed	msacm32.dll!acmStreamUnprepareHeader fdwUnprepare	0x0	3
+unreviewed	msvcrt.dll!calloc size	0x1	3
+unreviewed	msvcrt.dll!calloc size	0x10	3
+unreviewed	msvcrt.dll!calloc size	0x14	3
+unreviewed	msvcrt.dll!calloc size	0x20	3
+unreviewed	msvcrt.dll!calloc size	0x30	3
+unreviewed	msvcrt.dll!calloc size	0x34	3
+unreviewed	msvcrt.dll!calloc size	0x3c	3
+unreviewed	msvcrt.dll!calloc size	0x48	3
+unreviewed	msvcrt.dll!calloc size	0x520	3
+unreviewed	msvcrt.dll!malloc size	0x44	3
+unreviewed	msvcrt.dll!malloc size	0x60	3
+unreviewed	msvcrt.dll!malloc size	0x8	3
+unreviewed	msvcrt.dll!malloc size	0xe8	3
 unreviewed	msvcrt.dll!qsort width	0x4	3
 unreviewed	ole32.dll!CoCreateInstance dwClsContext	0x17	3
 unreviewed	ole32.dll!CoInitializeEx dwCoInit	0x2	3
@@ -1042,7 +944,25 @@ unreviewed	kernel32.dll!WaitForSingleObjectEx dwMilliseconds	0xffffffff	2
 unreviewed	kernel32.dll!WriteProcessMemory nSize	0x14	2
 unreviewed	msacm32.dll!acmStreamConvert fdwConvert	0x4	2
 unreviewed	msacm32.dll!acmStreamOpen fdwOpen	0x4	2
+unreviewed	msvcrt.dll!calloc count	0x2	2
+unreviewed	msvcrt.dll!calloc count	0xf	2
+unreviewed	msvcrt.dll!calloc size	0x210	2
+unreviewed	msvcrt.dll!calloc size	0x24	2
+unreviewed	msvcrt.dll!calloc size	0x2c	2
+unreviewed	msvcrt.dll!calloc size	0x38	2
+unreviewed	msvcrt.dll!calloc size	0x460	2
+unreviewed	msvcrt.dll!calloc size	0x714	2
+unreviewed	msvcrt.dll!calloc size	0x90	2
+unreviewed	msvcrt.dll!calloc size	0xb4	2
+unreviewed	msvcrt.dll!calloc size	0xb8	2
+unreviewed	msvcrt.dll!calloc size	0xc88	2
+unreviewed	msvcrt.dll!calloc size	0xe78	2
+unreviewed	msvcrt.dll!malloc size	0x20	2
+unreviewed	msvcrt.dll!malloc size	0x714	2
+unreviewed	msvcrt.dll!malloc size	0x80	2
+unreviewed	msvcrt.dll!malloc size	0xc	2
 unreviewed	msvfw32.dll!DrawDibDraw wFlags	0x0	2
+unreviewed	oleaut32.dll!GetErrorInfo dwReserved	0x0	2
 unreviewed	shell32.dll!SHGetFileInfoA cbFileInfo	0x160	2
 unreviewed	shell32.dll!SHGetFileInfoA dwFileAttributes	0x0	2
 unreviewed	shell32.dll!SHGetFolderPathW dwFlags	0x0	2
@@ -1142,6 +1062,7 @@ unreviewed	user32.dll!LoadImageW cy	0x10	2
 unreviewed	user32.dll!LoadImageW cy	0x20	2
 unreviewed	user32.dll!LoadImageW fuLoad	0x10	2
 unreviewed	user32.dll!LoadImageW type	0x1	2
+unreviewed	user32.dll!MapWindowPoints cPoints	0x2	2
 unreviewed	user32.dll!MessageBoxA uType	0x2010	2
 unreviewed	user32.dll!MessageBoxA uType	0x30	2
 unreviewed	user32.dll!MessageBoxA uType	0x34	2
@@ -1296,6 +1217,8 @@ unreviewed	winmm.dll!mixerOpen uMxId	0x0	2
 unreviewed	winmm.dll!mmioAscend fuAscend	0x0	2
 unreviewed	winmm.dll!mmioClose fuClose	0x0	2
 unreviewed	winmm.dll!timeSetEvent fuEvent	0x1	2
+unreviewed	advapi32.dll!AdjustTokenPrivileges BufferLength	0x10	1
+unreviewed	advapi32.dll!AdjustTokenPrivileges DisableAllPrivileges	0x0	1
 unreviewed	advapi32.dll!CryptAcquireContextW dwFlags	0x0	1
 unreviewed	advapi32.dll!CryptAcquireContextW dwProvType	0x1	1
 unreviewed	advapi32.dll!CryptCreateHash Algid	0x8004	1
@@ -1309,11 +1232,15 @@ unreviewed	advapi32.dll!CryptEncrypt dwFlags	0x0	1
 unreviewed	advapi32.dll!CryptEncrypt hHash	0x0	1
 unreviewed	advapi32.dll!CryptHashData dwFlags	0x0	1
 unreviewed	advapi32.dll!CryptReleaseContext dwFlags	0x0	1
+unreviewed	advapi32.dll!DuplicateTokenEx ImpersonationLevel	0x3	1
+unreviewed	advapi32.dll!DuplicateTokenEx TokenType	0x1	1
+unreviewed	advapi32.dll!DuplicateTokenEx dwDesiredAccess	0x2000000	1
 unreviewed	advapi32.dll!OpenProcessToken DesiredAccess	0x2000000	1
 unreviewed	advapi32.dll!RegCreateKeyExA samDesired	0x20006	1
 unreviewed	advapi32.dll!RegCreateKeyExW samDesired	0x20006	1
 unreviewed	advapi32.dll!RegCreateKeyExW samDesired	0x2001f	1
 unreviewed	advapi32.dll!RegCreateKeyExW samDesired	0xf003f	1
+unreviewed	advapi32.dll!RegEnumKeyA cchName	0x3ff	1
 unreviewed	advapi32.dll!RegOpenKeyExA samDesired	0x20119	1
 unreviewed	advapi32.dll!RegOpenKeyExA samDesired	0xf0019	1
 unreviewed	advapi32.dll!RegOpenKeyExW samDesired	0x20006	1
@@ -1332,12 +1259,14 @@ unreviewed	avifil32.dll!AVIStreamInfoA lSize	0x8c	1
 unreviewed	avifil32.dll!AVIStreamTimeToSample lTime	0x0	1
 unreviewed	comctl32.dll!CreateStatusWindowW style	0x54020103	1
 unreviewed	comctl32.dll!CreateStatusWindowW wID	0xc350	1
+unreviewed	comctl32.dll!ImageList_AddMasked crMask	0xff00ff	1
 unreviewed	comctl32.dll!ImageList_Create cInitial	0x0	1
 unreviewed	comctl32.dll!ImageList_Create cInitial	0x6	1
 unreviewed	comctl32.dll!ImageList_Create cx	0x10	1
 unreviewed	comctl32.dll!ImageList_Create cx	0xc	1
 unreviewed	comctl32.dll!ImageList_Create cy	0x10	1
 unreviewed	comctl32.dll!ImageList_Create cy	0xc	1
+unreviewed	comctl32.dll!ImageList_Draw i	0x0	1
 unreviewed	d3dx9_43.dll!D3DXCreateEffect Flags	0x0	1
 unreviewed	d3dx9_43.dll!D3DXCreateMatrixStack Flags	0x0	1
 unreviewed	d3dx9_43.dll!D3DXCreateTextureFromFileInMemoryEx ColorKey	0x0	1
@@ -1454,6 +1383,11 @@ unreviewed	gdi32.dll!GetStockObject i	0x1	1
 unreviewed	gdi32.dll!GetStockObject i	0x11	1
 unreviewed	gdi32.dll!GetStockObject i	0x2	1
 unreviewed	gdi32.dll!GetStockObject i	0x7	1
+unreviewed	gdi32.dll!GetSystemPaletteEntries cEntries	0x1	1
+unreviewed	gdi32.dll!GetSystemPaletteEntries cEntries	0x7	1
+unreviewed	gdi32.dll!GetSystemPaletteEntries cEntries	0x8	1
+unreviewed	gdi32.dll!GetSystemPaletteEntries iStart	0x0	1
+unreviewed	gdi32.dll!GetSystemPaletteEntries iStart	0x7	1
 unreviewed	gdi32.dll!IntersectClipRect left	0x0	1
 unreviewed	gdi32.dll!IntersectClipRect top	0x0	1
 unreviewed	gdi32.dll!LineTo x	0x0	1
@@ -1507,6 +1441,7 @@ unreviewed	gdiplus.dll!GdipMultiplyMatrix order	0x1	1
 unreviewed	gdiplus.dll!GdipMultiplyWorldTransform order	0x0	1
 unreviewed	gdiplus.dll!GdipRotateMatrix order	0x0	1
 unreviewed	gdiplus.dll!GdipRotateMatrix order	0x1	1
+unreviewed	gdiplus.dll!GdipSetCompositingMode compositingMode	0x0	1
 unreviewed	gdiplus.dll!GdipSetStringFormatMeasurableCharacterRanges rangeCount	0x1	1
 unreviewed	gdiplus.dll!GdipTransformMatrixPoints count	0x4	1
 unreviewed	imm32.dll!ImmGetCompositionStringA dwBufLen	0x3ff	1
@@ -1627,6 +1562,8 @@ unreviewed	kernel32.dll!GetShortPathNameW cchBuffer	0x410	1
 unreviewed	kernel32.dll!GetStdHandle nStdHandle	0xfffffff6	1
 unreviewed	kernel32.dll!GetStringTypeA cchSrc	0x100	1
 unreviewed	kernel32.dll!GetStringTypeA dwInfoType	0x1	1
+unreviewed	kernel32.dll!GetStringTypeExA cchSrc	0x80	1
+unreviewed	kernel32.dll!GetStringTypeExA dwInfoType	0x2	1
 unreviewed	kernel32.dll!GetSystemDirectoryA uSize	0x3ff	1
 unreviewed	kernel32.dll!GetSystemDirectoryA uSize	0x400	1
 unreviewed	kernel32.dll!GetTempFileNameW uUnique	0x0	1
@@ -1996,6 +1933,8 @@ unreviewed	mpr.dll!WNetOpenEnumA dwUsage	0x0	1
 unreviewed	msacm32.dll!acmStreamConvert fdwConvert	0x0	1
 unreviewed	msacm32.dll!acmStreamOpen fdwOpen	0x0	1
 unreviewed	msacm32.dll!acmStreamSize fdwSize	0x1	1
+unreviewed	msvcr80.dll!_amsg_exit code	0x1f	1
+unreviewed	msvcr80.dll!_crt_debugger_hook reserved	0x1	1
 unreviewed	msvcr80.dll!_setjmp3 count	0x0	1
 unreviewed	msvcr80.dll!exit status	0x1	1
 unreviewed	msvcr80.dll!longjmp value	0x1	1
@@ -2015,6 +1954,7 @@ unreviewed	msvcr80.dll!strchr value	0x75	1
 unreviewed	msvcr80.dll!strchr value	0x76	1
 unreviewed	msvcr80.dll!strrchr value	0x2e	1
 unreviewed	msvcr80.dll!strrchr value	0x5c	1
+unreviewed	msvcr80.dll!strtoul base	0x10	1
 unreviewed	msvcr90.dll!??2@YAPAXI@Z size	0x0	1
 unreviewed	msvcr90.dll!??2@YAPAXI@Z size	0x1	1
 unreviewed	msvcr90.dll!??2@YAPAXI@Z size	0x10	1
@@ -2067,16 +2007,50 @@ unreviewed	msvcr90.dll!??2@YAPAXI@Z size	0xb8	1
 unreviewed	msvcr90.dll!??2@YAPAXI@Z size	0xc	1
 unreviewed	msvcr90.dll!??2@YAPAXI@Z size	0xc0	1
 unreviewed	msvcr90.dll!??2@YAPAXI@Z size	0xe0	1
+unreviewed	msvcr90.dll!_amsg_exit code	0x1f	1
+unreviewed	msvcr90.dll!_amsg_exit code	0x8	1
 unreviewed	msvcr90.dll!_calloc_crt count	0x100	1
 unreviewed	msvcr90.dll!_calloc_crt size	0x2	1
 unreviewed	msvcr90.dll!_controlfp_s mask	0x30000	1
 unreviewed	msvcr90.dll!_controlfp_s newControl	0x10000	1
+unreviewed	msvcr90.dll!_crt_debugger_hook reserved	0x1	1
 unreviewed	msvcr90.dll!_endthreadex returnCode	0x0	1
+unreviewed	msvcr90.dll!_ui64toa_s capacity	0x1f	1
+unreviewed	msvcr90.dll!_ui64toa_s radix	0xa	1
 unreviewed	msvcr90.dll!_wsplitpath_s dirNumberOfElements	0x100	1
 unreviewed	msvcr90.dll!_wsplitpath_s driveNumberOfElements	0x3	1
 unreviewed	msvcr90.dll!_wsplitpath_s extNumberOfElements	0x100	1
 unreviewed	msvcr90.dll!_wsplitpath_s nameNumberOfElements	0x100	1
+unreviewed	msvcr90.dll!calloc count	0x1	1
+unreviewed	msvcr90.dll!calloc count	0x2	1
+unreviewed	msvcr90.dll!calloc count	0x20	1
+unreviewed	msvcr90.dll!calloc size	0x1	1
+unreviewed	msvcr90.dll!calloc size	0x10	1
+unreviewed	msvcr90.dll!calloc size	0x14	1
+unreviewed	msvcr90.dll!calloc size	0x20	1
+unreviewed	msvcr90.dll!calloc size	0x28	1
+unreviewed	msvcr90.dll!calloc size	0x2c	1
+unreviewed	msvcr90.dll!calloc size	0x38	1
+unreviewed	msvcr90.dll!calloc size	0x4	1
+unreviewed	msvcr90.dll!calloc size	0x460	1
+unreviewed	msvcr90.dll!calloc size	0x48	1
+unreviewed	msvcr90.dll!calloc size	0x520	1
+unreviewed	msvcr90.dll!calloc size	0x8	1
+unreviewed	msvcr90.dll!calloc size	0x88	1
+unreviewed	msvcr90.dll!calloc size	0xb18	1
+unreviewed	msvcr90.dll!calloc size	0xc88	1
+unreviewed	msvcr90.dll!calloc size	0xe50	1
 unreviewed	msvcr90.dll!exit status	0x1	1
+unreviewed	msvcr90.dll!malloc size	0x100	1
+unreviewed	msvcr90.dll!malloc size	0x20	1
+unreviewed	msvcr90.dll!malloc size	0x4	1
+unreviewed	msvcr90.dll!malloc size	0x40	1
+unreviewed	msvcr90.dll!malloc size	0x4000	1
+unreviewed	msvcr90.dll!malloc size	0x44	1
+unreviewed	msvcr90.dll!malloc size	0x60	1
+unreviewed	msvcr90.dll!malloc size	0x8	1
+unreviewed	msvcr90.dll!malloc size	0xc	1
+unreviewed	msvcr90.dll!malloc size	0xe8	1
 unreviewed	msvcr90.dll!memchr value	0x0	1
 unreviewed	msvcr90.dll!memchr value	0x4f	1
 unreviewed	msvcr90.dll!memchr value	0x65	1
@@ -2146,10 +2120,26 @@ unreviewed	msvcrt.dll!??2@YAPAXI@Z size	0xe8	1
 unreviewed	msvcrt.dll!??2@YAPAXI@Z size	0xf0	1
 unreviewed	msvcrt.dll!??2@YAPAXI@Z size	0xfe4	1
 unreviewed	msvcrt.dll!??2@YAPAXI@Z size	0xff8	1
+unreviewed	msvcrt.dll!_amsg_exit code	0x1f	1
 unreviewed	msvcrt.dll!_controlfp mask	0x30000	1
 unreviewed	msvcrt.dll!_controlfp newControl	0x10000	1
+unreviewed	msvcrt.dll!_itoa radix	0xa	1
 unreviewed	msvcrt.dll!_setjmp3 count	0x0	1
+unreviewed	msvcrt.dll!calloc size	0x470	1
+unreviewed	msvcrt.dll!calloc size	0x8	1
+unreviewed	msvcrt.dll!calloc size	0x994	1
+unreviewed	msvcrt.dll!calloc size	0xc	1
+unreviewed	msvcrt.dll!calloc size	0xcd0	1
+unreviewed	msvcrt.dll!calloc size	0xe28	1
 unreviewed	msvcrt.dll!longjmp value	0x1	1
+unreviewed	msvcrt.dll!malloc size	0x100	1
+unreviewed	msvcrt.dll!malloc size	0x1000	1
+unreviewed	msvcrt.dll!malloc size	0x18	1
+unreviewed	msvcrt.dll!malloc size	0x2c	1
+unreviewed	msvcrt.dll!malloc size	0x4000	1
+unreviewed	msvcrt.dll!malloc size	0x470	1
+unreviewed	msvcrt.dll!malloc size	0x994	1
+unreviewed	msvcrt.dll!malloc size	0xcd0	1
 unreviewed	msvcrt.dll!memchr value	0x4f	1
 unreviewed	msvcrt.dll!qsort number	0x4	1
 unreviewed	msvcrt.dll!qsort width	0xc	1
@@ -2173,18 +2163,31 @@ unreviewed	ntdll.dll!NtFreeVirtualMemory FreeType	0x8000	1
 unreviewed	ntdll.dll!NtReadVirtualMemory NumberOfBytesToRead	0x4	1
 unreviewed	ntdll.dll!NtTerminateProcess ExitStatus	0x0	1
 unreviewed	ntdll.dll!NtWriteVirtualMemory NumberOfBytesToWrite	0x10	1
+unreviewed	ntdll.dll!RtlAnsiStringToUnicodeString AllocateDestinationString	0x1	1
 unreviewed	ntdll.dll!RtlEqualUnicodeString CaseInSensitive	0x1	1
 unreviewed	ntdll.dll!RtlGetCurrentDirectory_U BufferLength	0x208	1
 unreviewed	ole32.dll!CoCreateInstance dwClsContext	0x7	1
+unreviewed	ole32.dll!CoGetClassObject dwClsContext	0x1	1
 unreviewed	ole32.dll!CoInitializeEx dwCoInit	0x0	1
+unreviewed	ole32.dll!CoSetProxyBlanket dwAuthnLevel	0x3	1
+unreviewed	ole32.dll!CoSetProxyBlanket dwAuthnSvc	0xa	1
+unreviewed	ole32.dll!CoSetProxyBlanket dwAuthzSvc	0x0	1
+unreviewed	ole32.dll!CoSetProxyBlanket dwCapabilities	0x0	1
+unreviewed	ole32.dll!CoSetProxyBlanket dwImpLevel	0x3	1
 unreviewed	ole32.dll!CoTaskMemAlloc cb	0x18	1
 unreviewed	ole32.dll!CoTaskMemAlloc cb	0x2	1
 unreviewed	ole32.dll!CoTaskMemAlloc cb	0x8	1
 unreviewed	ole32.dll!CreateStreamOnHGlobal fDeleteOnRelease	0x0	1
 unreviewed	ole32.dll!CreateStreamOnHGlobal fDeleteOnRelease	0x1	1
 unreviewed	ole32.dll!CreateStreamOnHGlobal fDeleteOnRelease	0xffffffff	1
+unreviewed	ole32.dll!OleDraw dwAspect	0x1	1
+unreviewed	ole32.dll!OleLockRunning fLastUnlockCloses	0x0	1
+unreviewed	ole32.dll!OleLockRunning fLock	0x1	1
 unreviewed	ole32.dll!StringFromGUID2 cchMax	0x40	1
 unreviewed	ole32.dll!StringFromGUID2 cchMax	0x64	1
+unreviewed	oleaut32.dll!SafeArrayCreate vt	0xc	1
+unreviewed	oleaut32.dll!VariantChangeTypeEx lcid	0x400	1
+unreviewed	oleaut32.dll!VariantChangeTypeEx wFlags	0x0	1
 unreviewed	psapi.dll!EnumProcessModules cb	0x7fd8	1
 unreviewed	psapi.dll!GetModuleBaseNameA nSize	0x100	1
 unreviewed	psapi.dll!GetModuleInformation cb	0xc	1
@@ -2210,6 +2213,7 @@ unreviewed	user32.dll!AdjustWindowRectEx dwStyle	0x12cf0000	1
 unreviewed	user32.dll!AdjustWindowRectEx dwStyle	0x2ce0000	1
 unreviewed	user32.dll!AdjustWindowRectEx dwStyle	0x90cb0000	1
 unreviewed	user32.dll!AppendMenuA uIDNewItem	0x1	1
+unreviewed	user32.dll!BeginDeferWindowPos nNumWindows	0x1	1
 unreviewed	user32.dll!CallWindowProcW Msg	0x82	1
 unreviewed	user32.dll!ChangeDisplaySettingsExA dwflags	0x4	1
 unreviewed	user32.dll!ChangeDisplaySettingsExW dwflags	0x4	1
@@ -2459,6 +2463,8 @@ unreviewed	user32.dll!DeleteMenu uPosition	0xf030	1
 unreviewed	user32.dll!DeleteMenu uPosition	0xf130	1
 unreviewed	user32.dll!DialogBoxIndirectParamW dwInitParam	0x0	1
 unreviewed	user32.dll!DialogBoxParamW dwInitParam	0x0	1
+unreviewed	user32.dll!DrawIcon X	0x0	1
+unreviewed	user32.dll!DrawIcon Y	0x0	1
 unreviewed	user32.dll!DrawTextA cchText	0xffffffff	1
 unreviewed	user32.dll!DrawTextA format	0x820	1
 unreviewed	user32.dll!EnableMenuItem uIDEnableItem	0x9c4b	1
@@ -2626,6 +2632,7 @@ unreviewed	user32.dll!InsertMenuItemA item	0xffffffff	1
 unreviewed	user32.dll!InsertMenuItemW fByPosition	0x0	1
 unreviewed	user32.dll!InsertMenuItemW fByPosition	0x1	1
 unreviewed	user32.dll!InvalidateRect bErase	0xffffffff	1
+unreviewed	user32.dll!InvalidateRgn bErase	0x0	1
 unreviewed	user32.dll!IsDlgButtonChecked nIDButton	0x3e9	1
 unreviewed	user32.dll!IsDlgButtonChecked nIDButton	0x3f1	1
 unreviewed	user32.dll!IsDlgButtonChecked nIDButton	0x3f2	1
