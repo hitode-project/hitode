@@ -511,7 +511,17 @@
     "jump_buffer": {
       "url": "https://raw.githubusercontent.com/Chuyu-Team/VC-LTL/master/VC/14.29.30037/include/setjmp.h",
       "sha256": "95195f814fdacf95114667d73f7d4d8b3fbf33ac711f2c152f682b612c0357d0",
-      "layout": "x86 _JUMP_BUFFER is sixteen DWORDs: Ebp/Ebx/Edi/Esi/Esp/Eip/Registration/TryLevel/Cookie/UnwindFunc/UnwindData[6]. __CxxLongjmpUnwind is a cdecl one-buffer local unwind callback. Compiler C++ UnwindData[0] supplies FuncInfo."
+      "layout": "x86 _JUMP_BUFFER is sixteen DWORDs: Ebp/Ebx/Edi/Esi/Esp/Eip/Registration/TryLevel/Cookie/UnwindFunc/UnwindData[6]. __CxxLongjmpUnwind is a stdcall one-buffer local unwind callback. Compiler C++ UnwindData[0] supplies FuncInfo."
+    },
+    "native_abi_check": {
+      "source": "Microsoft Visual C++ 2008 SP1 Redistributable Security Update, x86 MSVCR90 9.0.30729.6161; Microsoft VCLibs x86 UWPDesktop 14.0.33321.0 VCRuntime140. Only ABI/control-flow observations and hashes are retained; no binary or native code is imported.",
+      "vc90_url": "https://download.microsoft.com/download/5/D/8/5D8C65CB-C849-4025-8E95-C3966CAFD8AE/vcredist_x86.exe",
+      "vc90_redist_sha256": "8742bcbf24ef328a72d2a27b693cc7071e38d3bb4b9b44dec42aa3d2c8d61d92",
+      "msvcr90_sha256": "8e7fe1a1f3550c479ffd86a77bc9d10686d47f8727025bb891d8f4f0259354c8",
+      "vclibs_url": "https://download.microsoft.com/download/4/7/c/47c6134b-d61f-4024-83bd-b9c9ea951c25/Microsoft.VCLibs.x86.14.00.Desktop.appx",
+      "vcruntime140_sha256": "ca29b6c032a397ee320189b47c4ccd12a914a2730820e5c32c7efbf8c7f2d02c",
+      "observations": "Both x86 __CxxLongjmpUnwind entries use callee cleanup of one stack word and take FuncInfo at jump-buffer +40. Both __CxxQueryExceptionSize entries return sixteen bytes. _EH_prolog takes the frame handler in EAX and creates an x86 C++ registration; _NLG_Return2 is a return boundary preserving incoming registers.",
+      "processing_throw": "VC90 local C++ unwinding increments the processingThrow field before cleanup and decrements after cleanup, including __CxxLongjmpUnwind. _CxxThrowException constructs/raises a record without changing that field. Rethrow retains null object/ThrowInfo arguments in the raised record and frame handlers resolve the active caught object. These are ABI/control-flow observations of the pinned Microsoft binary, not native Windows execution results."
     }
   },
   "versioned_string_operations": {

@@ -52,6 +52,13 @@ fn machine(jit: bool, module: &str, handler: &str, magic: u32) -> Machine<JitCpu
     let mut r = Registry::default();
     adv_win32::register(&mut r);
     adv_win32::msvcrt::register(&mut r);
+    let original = r.get("kernel32.dll", "RtlUnwind").unwrap();
+    r.add(
+        "fixture.dll",
+        "original_unwind",
+        original.conv,
+        original.handler,
+    );
     assert!(r.signature_conflicts().is_empty());
     let mut m = Machine::new(
         JitCpu::new(PARK_ADDR, jit).unwrap(),
@@ -615,6 +622,111 @@ fn longjmp_runs_intervening_and_target_cpp_unwind_maps_before_resuming_setjmp() 
         assert!(matches!(result, RunResult::Exited(0)), "{result:?}");
         assert_eq!(logs(&m), vec![4, 3, 2, 1]);
         assert_eq!(m.cpu.read_u32(DATA + 64).unwrap(), 1);
+        clean(&m);
+    }
+}
+
+// spec: EXC-CPP-7, PERS-ABI-1
+#[test]
+fn cpp_local_unwind_callback_pops_its_argument_on_a_direct_guest_call() {
+    for jit in [false, true] {
+        for module in ["msvcr90.dll", "vcruntime140.dll"] {
+            let mut m = machine(jit, module, "__CxxFrameHandler3", 0x19930522);
+            let buffer = DATA + 0xc00;
+            let frame = DATA + 0xd00;
+            words(&mut m, frame, &[u32::MAX, STUB, 2]);
+            words(&mut m, buffer + 24, &[frame, 0, 0x56433230, 0, FUNC]);
+            let callback = m.resolve_import(module, "__CxxLongjmpUnwind").unwrap();
+            let mut a = Asm::new(CODE);
+            imm(&mut a, &[0x89, 0x25], DATA + 68);
+            a.push_imm(buffer).call(callback);
+            imm(&mut a, &[0x89, 0x25], DATA + 72);
+            a.bytes.extend_from_slice(&[0x31, 0xc0, 0xc3]);
+            let result = run(&mut m, a);
+            assert!(matches!(result, RunResult::Exited(0)), "{result:?}");
+            assert_eq!(
+                m.cpu.read_u32(DATA + 68).unwrap(),
+                m.cpu.read_u32(DATA + 72).unwrap()
+            );
+            assert_eq!(m.cpu.read_u32(frame + 8).unwrap(), 0);
+            assert_eq!(logs(&m), vec![2, 1]);
+            clean(&m);
+        }
+    }
+}
+
+// spec: EXC-CPP-6
+#[test]
+fn native_processing_count_tracks_local_unwinding_and_rethrow_keeps_a_null_throwinfo_marker() {
+    for jit in [false, true] {
+        let module = "msvcr90.dll";
+        let mut m = machine(jit, module, "__CxxFrameHandler3", 0x19930522);
+        let query = m.resolve_import(module, "__uncaught_exception").unwrap();
+        let add = m
+            .resolve_import("kernel32.dll", "AddVectoredExceptionHandler")
+            .unwrap();
+        let mut observer = Asm::new(INNER);
+        observer.call(query).mov_mem_eax(DATA + 80);
+        observer
+            .bytes
+            .extend_from_slice(&[0x8b, 0x44, 0x24, 4, 0x8b, 0, 0x8b, 0x40, 0x1c]);
+        observer.mov_mem_eax(DATA + 84);
+        observer.bytes.extend_from_slice(&[0x31, 0xc0, 0xc2, 4, 0]);
+        store(&mut m, INNER, observer);
+        words(&mut m, FUNC, &[0x19930522, 5, UNWIND, 2, TRIES, 0, 0, 0, 0]);
+        words(
+            &mut m,
+            TRIES,
+            &[1, 2, 3, 1, HANDLERS, 0, 3, 4, 1, HANDLERS + 16],
+        );
+        words(&mut m, HANDLERS + 16, &[0, TYPE, (-32i32) as u32, CATCH]);
+        let mut inner = Asm::new(CATCH + 128);
+        raise(&mut m, module, &mut inner, true);
+        inner.bytes.push(0xcc);
+        store(&mut m, CATCH + 128, inner);
+        m.cpu.write_u32(HANDLERS + 12, CATCH + 128).unwrap();
+        let mut a = Asm::new(CODE);
+        a.push_imm(INNER).push_imm(1).call(add);
+        prologue(&mut a, STUB, 2);
+        raise(&mut m, module, &mut a, false);
+        a.bytes.push(0xcc);
+        let result = run(&mut m, a);
+        assert!(matches!(result, RunResult::Exited(0)), "{result:?}");
+        assert_eq!(m.cpu.read_u32(DATA + 80).unwrap() & 255, 0);
+        assert_eq!(m.cpu.read_u32(DATA + 84).unwrap(), 0);
+        clean(&m);
+    }
+}
+
+// spec: EXC-CPP-6
+#[test]
+fn processing_count_is_zero_at_live_global_unwind_and_one_during_local_cleanup() {
+    for jit in [false, true] {
+        let module = "vcruntime140.dll";
+        let mut m = machine(jit, module, "__CxxFrameHandler3", 0x19930522);
+        let query = m
+            .resolve_import("ucrtbase.dll", "__uncaught_exceptions")
+            .unwrap();
+        let original = m.resolve_import("fixture.dll", "original_unwind").unwrap();
+        let target = m.resolve_import("kernel32.dll", "RtlUnwind").unwrap();
+        let wrapper = CLEAN + 320;
+        let mut hook = Asm::new(wrapper);
+        hook.call(query).mov_mem_eax(DATA + 88).jmp(original);
+        store(&mut m, wrapper, hook);
+        let mut patch = Asm::new(target);
+        patch.jmp(wrapper);
+        m.cpu.write(target, &patch.bytes).unwrap();
+        let mut cleanup = Asm::new(CLEAN + 128);
+        cleanup.call(query).mov_mem_eax(DATA + 92).ret();
+        store(&mut m, CLEAN + 128, cleanup);
+        let mut a = Asm::new(CODE);
+        prologue(&mut a, STUB, 2);
+        raise(&mut m, module, &mut a, false);
+        a.bytes.push(0xcc);
+        let result = run(&mut m, a);
+        assert!(matches!(result, RunResult::Exited(0)), "{result:?}");
+        assert_eq!(m.cpu.read_u32(DATA + 88).unwrap(), 0);
+        assert_eq!(m.cpu.read_u32(DATA + 92).unwrap(), 1);
         clean(&m);
     }
 }

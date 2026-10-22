@@ -54,4 +54,5 @@ Reject-Change 'throw-convention' "msvcr90.dll`t_CxxThrowException" 2 'cdecl' 'C+
 Reject-Change 'throw-width' "msvcr90.dll`t_CxxThrowException" 5 'object:void*:ptr:1' 'C++ throw stack contract'
 Reject-Change 'setjmp-convention' "msvcr90.dll`t_setjmp3" 2 'cdecl' 'setjmp stack contract'
 Reject-Change 'setjmp-prefix' "msvcr90.dll`t_setjmp3" 5 'buffer:jmp_buf:ptr:1' 'setjmp stack contract'
-Write-Output 'CRT inputs: reproducible generation and ten malformed process/math/throw/jump contracts verified.'
+Reject-Change 'cpp-jump-callback' "msvcr90.dll`t__CxxLongjmpUnwind" 2 'cdecl' 'C++ local unwind callback stack contract'
+Write-Output 'CRT inputs: reproducible generation and eleven malformed process/math/throw/jump contracts verified.'

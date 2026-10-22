@@ -184,8 +184,11 @@ qualified catchable types and PMD base adjustments, invoke guest copy constructo
 and unwind funclets, and retain exception objects across rethrows. Catch completion
 runs the object's destructor before a checked nonlocal continuation. Asynchronous
 frames invoke the installed thread translator with original Windows exception
-pointers. The runtime's processingThrow owner supplies uncaught queries, including
-UCRT queries of VC14 throws; raw Windows dispatch does not alter that count.
+pointers. Active C++ local-unwind scopes supply uncaught queries, including UCRT
+queries of VC14 cleanup; constructing or delivering a throw record does not alter
+that count. Rethrow records retain the compiler's null object/ThrowInfo marker.
+These internal contracts were checked against published Microsoft x86 runtimes;
+`crt-source.json` records the binaries' versions, hashes and observations.
 `crt_cpp_eh` exercises real Windows delivery, nested/outer catches, cleanup,
 translator throws, object lifetimes and termination in both execution modes.
 
@@ -202,7 +205,8 @@ including page-end input and read-only output, in interpreter and JIT.
 sixteen-DWORD x86 jump-buffer layout. The variadic `_setjmp3` declaration retains
 only its mandatory buffer/count prefix. Global unwinding calls live `RtlUnwind`
 before a compiler-provided local callback or the default SEH scope cleanup.
-`__CxxLongjmpUnwind` reads saved FuncInfo from UnwindData and the saved target state.
+`__CxxLongjmpUnwind` takes one jump-buffer pointer with stdcall cleanup and reads
+saved FuncInfo from UnwindData and the saved target state.
 Jump restoration uses the same checked stack-directed continuation protocol as
 catch entry, preserving saved nonvolatile registers and the zero-to-one result rule.
 Guest buffer writes are checked. C++ and SEH fixtures cover cross-frame cleanup

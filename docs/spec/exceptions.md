@@ -92,7 +92,7 @@ This spec covers structured exception dispatch in the Win32 personality: SEH sea
 
 ### EXC-CPP-6 Processing throw count
 
-**Rule**: Uncaught queries MUST reflect CRT throws awaiting catch entry in the current runtime/thread. Raw Windows dispatch and unwind MUST NOT invent C++ processing counts. Catch entry MUST decrement processing counts before the catch body executes.
+**Rule**: Uncaught queries MUST count active C++ local-unwind scopes in the current runtime/thread. Raw Windows delivery MUST NOT itself create C++ processing counts. Completed local cleanup MUST release its count before the catch body executes.
 **Verification**: Test
 
 ### EXC-CPP-7 Nonlocal jumps

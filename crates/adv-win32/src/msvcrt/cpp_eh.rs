@@ -27,6 +27,7 @@ struct Catch {
 #[derive(Default)]
 pub(super) struct Thread {
     pending: Vec<Rc<Object>>,
+    unwinding: Vec<Weak<()>>,
     catches: Vec<Weak<Catch>>,
     translating: Weak<()>,
     cleanup: Vec<Weak<Cleanup>>,
@@ -115,7 +116,7 @@ fn throw(env: &mut Env<'_>) -> Outcome {
     } else {
         Rc::new(Object { address, info })
     };
-    let information = [MAGIC, object.address, object.info];
+    let information = [MAGIC, address, info];
     thread(env).pending.push(object);
     crate::kernel32::raise_status(env, CODE, 1, &information, env.caller())
 }
@@ -295,13 +296,32 @@ fn frame_handler(env: &mut Env<'_>) -> Outcome {
     if !(MAGIC..=MAGIC + 2).contains(&magic) {
         return Outcome::Return(1);
     }
-    let object = thread(env)
-        .pending
-        .iter()
-        .rev()
-        .find(|o| o.address == address && o.info == info)
-        .cloned()
-        .unwrap_or_else(|| Rc::new(Object { address, info }));
+    if match word(env, record.wrapping_add(16)) {
+        Ok(count) => count != 3,
+        Err(fault) => return memory_failure(fault),
+    } {
+        return Outcome::Return(1);
+    }
+    let object = if info == 0 {
+        match thread(env)
+            .catches
+            .iter()
+            .rev()
+            .filter_map(Weak::upgrade)
+            .find_map(|catch| catch.object.borrow().clone())
+        {
+            Some(object) => object,
+            None => return Outcome::Return(1),
+        }
+    } else {
+        thread(env)
+            .pending
+            .iter()
+            .rev()
+            .find(|o| o.address == address && o.info == info)
+            .cloned()
+            .unwrap_or_else(|| Rc::new(Object { address, info }))
+    };
     let state = match word(env, frame.wrapping_add(8)) {
         Ok(s) => s as i32,
         Err(e) => return memory_failure(e),
@@ -352,7 +372,32 @@ fn frame_handler(env: &mut Env<'_>) -> Outcome {
     Outcome::Return(1)
 }
 
-fn unwind(env: &mut Env<'_>, function: Function, stop: i32, mut count: u32, then: Done) -> Outcome {
+fn unwind(env: &mut Env<'_>, function: Function, stop: i32, count: u32, then: Done) -> Outcome {
+    // MSVC's local unwind owns processingThrow, including longjmp and RTL
+    // cleanup. A weak marker also ends on nonlocal continuation retirement.
+    let guard = Rc::new(());
+    let state = thread(env);
+    state.unwinding.retain(|marker| marker.strong_count() != 0);
+    state.unwinding.push(Rc::downgrade(&guard));
+    unwind_step(
+        env,
+        function,
+        stop,
+        count,
+        Box::new(move |env| {
+            drop(guard);
+            then(env)
+        }),
+    )
+}
+
+fn unwind_step(
+    env: &mut Env<'_>,
+    function: Function,
+    stop: i32,
+    mut count: u32,
+    then: Done,
+) -> Outcome {
     loop {
         let current = match word(env, function.frame.wrapping_add(8)) {
             Ok(v) => v as i32,
@@ -378,7 +423,7 @@ fn unwind(env: &mut Env<'_>, function: Function, stop: i32, mut count: u32, then
             return Outcome::call(action, [], move |env, _| {
                 drop(guard);
                 env.cpu.set_reg(Reg::Ebp, ebp);
-                unwind(env, function, stop, count + 1, then)
+                unwind_step(env, function, stop, count + 1, then)
             })
             .unwindable();
         }
@@ -626,11 +671,22 @@ fn translate(env: &mut Env<'_>, function: Function, record: u32, context: u32) -
 }
 
 fn uncaught_count(env: &mut Env<'_>) -> Outcome {
-    Outcome::Return(thread(env).pending.len() as u32)
+    Outcome::Return(
+        thread(env)
+            .unwinding
+            .iter()
+            .filter(|marker| marker.strong_count() != 0)
+            .count() as u32,
+    )
 }
 
 pub(super) fn uncaught(env: &mut Env<'_>) -> Outcome {
-    Outcome::Return(u32::from(!thread(env).pending.is_empty()))
+    Outcome::Return(u32::from(
+        thread(env)
+            .unwinding
+            .iter()
+            .any(|marker| marker.strong_count() != 0),
+    ))
 }
 
 pub(crate) fn unhandled(env: &mut Env<'_>, code: u32) -> Option<Outcome> {
