@@ -1384,3 +1384,33 @@ ucrtbase.dll	_setjmp3	variadic	i32	int	buffer:jmp_buf:ptr:1|count:int:i32:1
 ucrtbase.dll	longjmp	cdecl	void	void	buffer:jmp_buf:ptr:1|value:int:i32:1
 vcruntime140.dll	_setjmp3	variadic	i32	int	buffer:jmp_buf:ptr:1|count:int:i32:1
 vcruntime140.dll	longjmp	cdecl	void	void	buffer:jmp_buf:ptr:1|value:int:i32:1
+
+# Internal x86 EH helpers: EAX supplies _EH_prolog handler; it installs a frame and resumes its caller. _NLG_Return2 preserves incoming registers.
+msvcrt40.dll	_EH_prolog	cdecl	void	void	
+msvcrt.dll	__CxxQueryExceptionSize	cdecl	u32	size_t	
+msvcrt.dll	_EH_prolog	cdecl	void	void	
+msvcr70.dll	__CxxQueryExceptionSize	cdecl	u32	size_t	
+msvcr70.dll	_EH_prolog	cdecl	void	void	
+msvcr71.dll	__CxxQueryExceptionSize	cdecl	u32	size_t	
+msvcr71.dll	_EH_prolog	cdecl	void	void	
+msvcr80.dll	__CxxQueryExceptionSize	cdecl	u32	size_t	
+msvcr80.dll	_EH_prolog	cdecl	void	void	
+msvcr80.dll	_NLG_Return2	cdecl	void	void	
+msvcr90.dll	__CxxQueryExceptionSize	cdecl	u32	size_t	
+msvcr90.dll	_EH_prolog	cdecl	void	void	
+msvcr90.dll	_NLG_Return2	cdecl	void	void	
+msvcr100.dll	__CxxQueryExceptionSize	cdecl	u32	size_t	
+msvcr100.dll	_EH_prolog	cdecl	void	void	
+msvcr100.dll	_NLG_Return2	cdecl	void	void	
+msvcr110.dll	__CxxQueryExceptionSize	cdecl	u32	size_t	
+msvcr110.dll	_EH_prolog	cdecl	void	void	
+msvcr110.dll	_NLG_Return2	cdecl	void	void	
+msvcr120.dll	__CxxQueryExceptionSize	cdecl	u32	size_t	
+msvcr120.dll	_EH_prolog	cdecl	void	void	
+msvcr120.dll	_NLG_Return2	cdecl	void	void	
+ucrtbase.dll	__CxxQueryExceptionSize	cdecl	u32	size_t	
+ucrtbase.dll	_EH_prolog	cdecl	void	void	
+ucrtbase.dll	_NLG_Return2	cdecl	void	void	
+vcruntime140.dll	__CxxQueryExceptionSize	cdecl	u32	size_t	
+vcruntime140.dll	_EH_prolog	cdecl	void	void	
+vcruntime140.dll	_NLG_Return2	cdecl	void	void	

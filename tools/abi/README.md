@@ -210,7 +210,12 @@ saved FuncInfo from UnwindData and the saved target state.
 Jump restoration uses the same checked stack-directed continuation protocol as
 catch entry, preserving saved nonvolatile registers and the zero-to-one result rule.
 Guest buffer writes are checked. C++ and SEH fixtures cover cross-frame cleanup
-before the saved continuation resumes in both execution modes.
+before the saved continuation resumes in both execution modes. The x86
+`_EH_prolog` entry installs the EAX-supplied handler and preserves the compiler
+frame layout without an ordinary stack argument. `__CxxQueryExceptionSize`
+returns its sixteen-byte registration buffer size; `_NLG_Return2` preserves
+incoming registers and flags at the debugger return boundary. These internal
+contracts use the pinned Microsoft x86 runtime observations described above.
 
 `python tools/abi/crt_exclusions.py` generates the exact CRT-task exclusions in
 `crt-exclusions.tsv`: the private API set, ConcRT namespace and legacy VC20/40

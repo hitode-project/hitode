@@ -99,3 +99,8 @@ This spec covers structured exception dispatch in the Win32 personality: SEH sea
 
 **Rule**: Longjmp MUST unwind intervening registrations through live RtlUnwind before local cleanup. Compiler C++ callbacks MUST interpret the saved FuncInfo and target state. Jump restoration MUST validate continuation ancestry and return one when the requested value is zero.
 **Verification**: Test
+
+### EXC-CPP-8 Compiler entry helpers
+
+**Rule**: The x86 EH prolog MUST install the EAX-supplied handler and initial state minus one, preserve caller EBP, and resume with checked machine ancestry. The exception-registration buffer query MUST return sixteen bytes. The NLG return boundary MUST preserve incoming registers, flags and the caller's stack.
+**Verification**: Test

@@ -56,6 +56,9 @@ pub(super) fn register(registry: &mut Registry) {
         &[
             ("_CxxThrowException", throw),
             ("__CxxLongjmpUnwind", longjmp_unwind),
+            ("__CxxQueryExceptionSize", exception_size),
+            ("_EH_prolog", prolog),
+            ("_NLG_Return2", return_boundary),
             ("__uncaught_exception", uncaught),
             ("__uncaught_exceptions", uncaught_count),
             ("__CxxFrameHandler", frame_handler),
@@ -77,6 +80,60 @@ fn word(env: &Env<'_>, address: u32) -> Result<u32, MemFault> {
 }
 fn put(env: &mut Env<'_>, address: u32, value: u32) -> Result<(), MemFault> {
     GuestPtr::new(address).write(env.cpu, value)
+}
+
+// Internal x86 entry contracts, checked against the Microsoft runtimes pinned
+// in crt-source.json. Neither prolog nor the debugger boundary takes arguments.
+fn exception_size(_: &mut Env<'_>) -> Outcome {
+    Outcome::Return(16)
+}
+
+fn return_boundary(env: &mut Env<'_>) -> Outcome {
+    Outcome::Return(env.cpu.reg(Reg::Eax))
+}
+
+fn prolog(env: &mut Env<'_>) -> Outcome {
+    let stack = env.cpu.reg(Reg::Esp);
+    let frame = stack.wrapping_sub(12);
+    let teb = env.ctx().teb;
+    let result = (|| {
+        let return_address = word(env, stack)?;
+        let previous = word(env, teb)?;
+        adv_abi::guest::check_range(env.cpu, teb, 4, adv_cpu::backend::Prot::WRITE)?;
+        adv_abi::guest::check_range(
+            env.cpu,
+            stack.wrapping_sub(16),
+            20,
+            adv_cpu::backend::Prot::WRITE,
+        )?;
+        Ok::<_, MemFault>((return_address, previous))
+    })();
+    let (return_address, previous) = match result {
+        Ok(values) => values,
+        Err(fault) => return memory_failure(fault),
+    };
+    let mut checkpoint = match env.checkpoint() {
+        Ok(checkpoint) => checkpoint,
+        Err(reason) => return Outcome::Fail(format!("C++ prolog checkpoint: {reason}")),
+    };
+    let words = [
+        return_address,
+        previous,
+        env.cpu.reg(Reg::Eax),
+        u32::MAX,
+        env.cpu.reg(Reg::Ebp),
+    ];
+    if let Err(fault) = GuestPtr::new(stack.wrapping_sub(16))
+        .write(env.cpu, words)
+        .and_then(|()| put(env, teb, frame))
+    {
+        return memory_failure(fault);
+    }
+    checkpoint.state.regs[0] = return_address;
+    checkpoint.state.regs[4] = frame;
+    checkpoint.state.regs[5] = stack;
+    checkpoint.state.eip = return_address;
+    Outcome::ResumeExecution(checkpoint)
 }
 
 fn longjmp_unwind(env: &mut Env<'_>) -> Outcome {

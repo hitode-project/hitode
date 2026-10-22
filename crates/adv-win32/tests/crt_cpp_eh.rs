@@ -730,3 +730,114 @@ fn processing_count_is_zero_at_live_global_unwind_and_one_during_local_cleanup()
         clean(&m);
     }
 }
+
+// spec: EXC-CPP-1, EXC-CPP-2, EXC-CPP-8
+#[test]
+fn compiler_prolog_installs_the_frame_used_by_real_cpp_dispatch() {
+    for jit in [false, true] {
+        for module in ["msvcrt40.dll", "msvcr90.dll", "vcruntime140.dll"] {
+            let mut m = machine(jit, module, "__CxxFrameHandler", 0x19930520);
+            let entry = m.resolve_import(module, "_EH_prolog").unwrap();
+            let mut a = Asm::new(CODE);
+            imm(&mut a, &[0x89, 0x25], DATA + 40);
+            imm(&mut a, &[0x89, 0x2d], DATA + 44);
+            a.bytes.extend_from_slice(&[0x64, 0xa1, 0, 0, 0, 0]);
+            a.mov_mem_eax(DATA + 48);
+            imm(&mut a, &[0xb8], STUB);
+            a.call(entry);
+            let return_address = a.here();
+            a.mov_mem_eax(DATA + 52);
+            imm(&mut a, &[0x89, 0x25], DATA + 56);
+            imm(&mut a, &[0x89, 0x2d], DATA + 60);
+            // The helper leaves the state at EBP-4. The compiler supplies its
+            // locals, saved ESP and active state after the helper returns.
+            a.bytes.extend_from_slice(&[0x8b, 0x45, 0xfc]);
+            a.mov_mem_eax(DATA + 64);
+            a.bytes.extend_from_slice(&[0x8b, 0x45, 0xf4]);
+            a.mov_mem_eax(DATA + 68);
+            a.bytes.extend_from_slice(&[0x8b, 0x45, 0xf8]);
+            a.mov_mem_eax(DATA + 72);
+            a.bytes.extend_from_slice(&[0x8b, 0x45, 0]);
+            a.mov_mem_eax(DATA + 76);
+            a.bytes
+                .extend_from_slice(&[0x83, 0xec, 0x74, 0x89, 0x65, 0xf0]);
+            a.bytes.extend_from_slice(&[0xc7, 0x45, 0xfc, 2, 0, 0, 0]);
+            raise(&mut m, module, &mut a, false);
+            a.bytes.push(0xcc);
+            let result = run(&mut m, a);
+            assert!(
+                matches!(result, RunResult::Exited(0)),
+                "{module} {result:?}"
+            );
+            let stack = m.cpu.read_u32(DATA + 40).unwrap();
+            assert_eq!(m.cpu.read_u32(DATA + 52).unwrap(), return_address);
+            assert_eq!(m.cpu.read_u32(DATA + 56).unwrap(), stack - 16);
+            assert_eq!(m.cpu.read_u32(DATA + 60).unwrap(), stack - 4);
+            assert_eq!(m.cpu.read_u32(DATA + 64).unwrap(), u32::MAX);
+            assert_eq!(
+                m.cpu.read_u32(DATA + 68).unwrap(),
+                m.cpu.read_u32(DATA + 48).unwrap()
+            );
+            assert_eq!(m.cpu.read_u32(DATA + 72).unwrap(), STUB);
+            assert_eq!(
+                m.cpu.read_u32(DATA + 76).unwrap(),
+                m.cpu.read_u32(DATA + 44).unwrap()
+            );
+            assert_eq!(logs(&m), vec![2, 1, 9]);
+            assert_eq!(m.cpu.read_u32(DATA + 20).unwrap(), 1);
+            clean(&m);
+        }
+    }
+}
+
+// spec: EXC-CPP-8
+#[test]
+fn exception_buffer_query_and_debugger_return_boundary_preserve_their_x86_contracts() {
+    for jit in [false, true] {
+        for module in [
+            "msvcr80.dll",
+            "msvcr90.dll",
+            "ucrtbase.dll",
+            "vcruntime140.dll",
+        ] {
+            let mut m = machine(jit, module, "__CxxFrameHandler", 0x19930520);
+            let query = m.resolve_import(module, "__CxxQueryExceptionSize").unwrap();
+            let boundary = m.resolve_import(module, "_NLG_Return2").unwrap();
+            let mut a = Asm::new(CODE);
+            a.call(query).mov_mem_eax(DATA + 40);
+            // Record flags after STC, and verify the no-argument boundary
+            // preserves all caller registers as well as the stack and flags.
+            a.bytes.extend_from_slice(&[0xf9, 0x9c, 0x58]);
+            a.mov_mem_eax(DATA + 44);
+            imm(&mut a, &[0xb8], 0x12345678);
+            imm(&mut a, &[0xb9], 0x23456789);
+            imm(&mut a, &[0xba], 0x3456789a);
+            imm(&mut a, &[0x89, 0x25], DATA + 48);
+            a.call(boundary).mov_mem_eax(DATA + 52);
+            imm(&mut a, &[0x89, 0x0d], DATA + 56);
+            imm(&mut a, &[0x89, 0x15], DATA + 60);
+            imm(&mut a, &[0x89, 0x25], DATA + 64);
+            a.bytes.extend_from_slice(&[0x9c, 0x58]);
+            a.mov_mem_eax(DATA + 68);
+            a.bytes.extend_from_slice(&[0x31, 0xc0, 0xc3]);
+            let result = run(&mut m, a);
+            assert!(
+                matches!(result, RunResult::Exited(0)),
+                "{module} {result:?}"
+            );
+            assert_eq!(m.cpu.read_u32(DATA + 40).unwrap(), 16);
+            assert_eq!(m.cpu.read_u32(DATA + 52).unwrap(), 0x12345678);
+            assert_eq!(m.cpu.read_u32(DATA + 56).unwrap(), 0x23456789);
+            assert_eq!(m.cpu.read_u32(DATA + 60).unwrap(), 0x3456789a);
+            assert_eq!(
+                m.cpu.read_u32(DATA + 48).unwrap(),
+                m.cpu.read_u32(DATA + 64).unwrap()
+            );
+            assert_eq!(
+                m.cpu.read_u32(DATA + 44).unwrap(),
+                m.cpu.read_u32(DATA + 68).unwrap()
+            );
+            clean(&m);
+        }
+    }
+}
