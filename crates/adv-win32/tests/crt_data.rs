@@ -363,3 +363,6 @@ fn every_legacy_runtime_exports_real_double_and_fdiv_data_cells() {
         numeric_cells(UnicornCpu::new(PARK_ADDR).unwrap(), module);
     }
 }
+
+#[path = "crt_data/iob.rs"]
+mod iob;

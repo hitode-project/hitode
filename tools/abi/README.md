@@ -381,3 +381,7 @@ CRT remove, unlink and rename fronts now call the live Windows mutation entries 
 UCRT narrow paths convert with the existing filename codec and retain per-argument RTL buffers until completion; legacy fronts retain their A/W calls.
 DOS error translation preserves the pinned first-match table, fallback ranges and UCRT Unicode-error difference.
 `crt_file_mutation` checks every projection, CP932/936 overlay effects, provider failures, buffer cleanup and allocation/validation ordering in interpreter/JIT.
+
+Data-only `aggregate` declarations may use `u8[N]` for a verified fixed byte extent from 1 through 65536; aggregate function returns remain unsupported.
+Legacy `_iob` arrays use this descriptor for twenty 32-byte FILE objects, with real input-buffer storage and no-console descriptors.
+The native VC80/VC90 layout and startup evidence are recorded in `crt-source.json`; UCRT remains a distinct opaque FILE ABI.

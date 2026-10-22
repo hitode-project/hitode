@@ -126,4 +126,9 @@ This spec covers the Microsoft C runtimes the guest links: every msvcrt and msvc
 **Rule**: UCRT narrow mutations MUST convert through the existing filename codec before calling the wide Windows entry, preserving NULL arguments and rejecting malformed sequences. Conversion buffers MUST use the existing guest heap, allocate in argument order and release in reverse order when the operation ends. Unicode translation failure MUST publish EILSEQ/DOS error 1113 before any file mutation.
 **Verification**: Test
 
+### CRT-LIB-25 Legacy FILE arrays
+
+**Rule**: Cataloged legacy `_iob` arrays MUST provide twenty 32-byte FILE objects, with initialized standard-stream flags and real stdin buffer storage. Without a console, their first three descriptors MUST contain minus two while the remaining entries stay closed. Legacy iob getters MUST return their runtime's actual array, preserving independent writable storage between DLL versions.
+**Verification**: Test
+
 Withdrawn: none

@@ -625,3 +625,41 @@ fn audio_registration_rejects_both_leaf_kinds() {
         "waveOutWrite"
     ));
 }
+
+// spec: PERS-ABI-1, PERS-EXPORT-6
+#[test]
+fn fixed_byte_arrays_retain_extent_and_cannot_be_called_or_resized_as_pointer_cells() {
+    use adv_machine::Resolver;
+    let declaration = signature::lookup("msvcr90.dll", "_iob").unwrap();
+    assert_eq!(declaration.data_size, Some(640));
+    assert_eq!(declaration.return_kind, adv_abi::AbiKind::Aggregate);
+    assert!(declaration.conv.is_none());
+    assert!(!declaration.callable());
+    assert!(declaration.parameters.is_empty());
+    let mut registry = Registry::default();
+    for size in [4, 128, 639, 641] {
+        assert!(
+            registry
+                .register_data("msvcr90.dll", "_iob", &vec![0; size])
+                .is_err()
+        );
+    }
+    let mut bytes = vec![0; 640];
+    bytes[639] = 0x5a;
+    registry
+        .register_data("msvcr90.dll", "_iob", &bytes)
+        .unwrap();
+    assert_eq!(registry.data_size("msvcr90.dll", "_iob"), Some(640));
+    assert_eq!(registry.data("msvcr90.dll", "_iob"), Some(bytes.as_slice()));
+    assert!(registry.dynamic_available("msvcr90.dll", "_iob"));
+    assert!(registry.get("msvcr90.dll", "_iob").is_none());
+    assert!(registry.set_data("msvcr90.dll", "_iob", &[0; 4]).is_err());
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            registry.add("msvcr90.dll", "_iob", Conv::Cdecl { argc: 0 }, |_| {
+                Outcome::Return(0)
+            });
+        }))
+        .is_err()
+    );
+}

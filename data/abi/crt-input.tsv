@@ -2581,3 +2581,31 @@ ucrtbase.dll	_o_rename	cdecl	i32	int	source:const char*:str8:1|target:const char
 ucrtbase.dll	_unlink	cdecl	i32	int	path:const char*:str8:1
 ucrtbase.dll	remove	cdecl	i32	int	path:const char*:str8:1
 ucrtbase.dll	rename	cdecl	i32	int	source:const char*:str8:1|target:const char*:str8:1
+# Native legacy x86 FILE[20], 32 bytes each; aggregate byte extent is data-only.
+msvcr100.dll	__iob_func	cdecl	ptr	FILE*	
+msvcr100.dll	__p__iob	cdecl	ptr	FILE*	
+msvcr100.dll	_iob	data	aggregate	u8[640]	
+msvcr110.dll	__iob_func	cdecl	ptr	FILE*	
+msvcr110.dll	__p__iob	cdecl	ptr	FILE*	
+msvcr110.dll	_iob	data	aggregate	u8[640]	
+msvcr120.dll	__iob_func	cdecl	ptr	FILE*	
+msvcr120.dll	__p__iob	cdecl	ptr	FILE*	
+msvcr120.dll	_iob	data	aggregate	u8[640]	
+msvcr70.dll	__iob_func	cdecl	ptr	FILE*	
+msvcr70.dll	__p__iob	cdecl	ptr	FILE*	
+msvcr70.dll	_iob	data	aggregate	u8[640]	
+msvcr71.dll	__iob_func	cdecl	ptr	FILE*	
+msvcr71.dll	__p__iob	cdecl	ptr	FILE*	
+msvcr71.dll	_iob	data	aggregate	u8[640]	
+msvcr80.dll	__iob_func	cdecl	ptr	FILE*	
+msvcr80.dll	__p__iob	cdecl	ptr	FILE*	
+msvcr80.dll	_iob	data	aggregate	u8[640]	
+msvcr90.dll	__iob_func	cdecl	ptr	FILE*	
+msvcr90.dll	__p__iob	cdecl	ptr	FILE*	
+msvcr90.dll	_iob	data	aggregate	u8[640]	
+msvcrt.dll	__p__iob	cdecl	ptr	FILE*	
+msvcrt.dll	_iob	data	aggregate	u8[640]	
+msvcrt20.dll	__p__iob	cdecl	ptr	FILE*	
+msvcrt20.dll	_iob	data	aggregate	u8[640]	
+msvcrt40.dll	__p__iob	cdecl	ptr	FILE*	
+msvcrt40.dll	_iob	data	aggregate	u8[640]	

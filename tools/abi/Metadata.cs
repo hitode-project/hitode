@@ -123,6 +123,15 @@ public static class AbiMetadata
     }
 
     static int Round(int n, int align) => (n + align - 1) / align * align;
+
+    static bool ByteArrayStorage(string type)
+    {
+        if (!type.StartsWith("u8[", StringComparison.Ordinal) || !type.EndsWith(']')) return false;
+        string count = type.Substring(3, type.Length - 4);
+        return count.Length != 0 && count.All(c => c >= '0' && c <= '9')
+            && int.TryParse(count, out int size) && size > 0 && size <= 65536;
+    }
+
     static string FullName(MetadataReader r, EntityHandle h)
     {
         if (h.IsNil) return "";
@@ -359,9 +368,11 @@ public static class AbiMetadata
                     && f[4] == (secure ? "errno_t" : unit + "*") && f[5] == parameters;
                 if (!crtIntegerOutput) throw new InvalidDataException("CRT integer formatting stack contract changed: " + row);
             }
+            bool crtDataArray = f.Length == 6 && f[2] == "data" && f[3] == "aggregate"
+                && ByteArrayStorage(f[4]) && f[5].Length == 0;
             bool crtDataDouble = f.Length == 6 && f[2] == "data" && f[3] == "f64"
                 && f[4] == "double" && f[5].Length == 0;
-            if (f.Length != 6 || (!new[] { "cdecl", "data" }.Contains(f[2]) && !crtVariadic && !crtSprintf && !crtProcessList && !crtThrow && !crtSetjmp && !crtJump) || (!new[] { "u32", "i32", "u64", "void", "ptr" }.Contains(f[3]) && !crtInteger && !crtDataDouble && !crtStrtod && !crtDifftime && !crtRound && !crtModf && !crtLdexp && !crtBinaryMath)
+            if (f.Length != 6 || (!new[] { "cdecl", "data" }.Contains(f[2]) && !crtVariadic && !crtSprintf && !crtProcessList && !crtThrow && !crtSetjmp && !crtJump) || (!new[] { "u32", "i32", "u64", "void", "ptr" }.Contains(f[3]) && !crtInteger && !crtDataDouble && !crtDataArray && !crtStrtod && !crtDifftime && !crtRound && !crtModf && !crtLdexp && !crtBinaryMath)
                 || (f[2] == "data" && (f[3] == "void" || f[5].Length != 0)))
                 throw new InvalidDataException("Invalid supplemental x86 signature: " + row);
             foreach (var parameter in f[5].Split('|', StringSplitOptions.RemoveEmptyEntries))

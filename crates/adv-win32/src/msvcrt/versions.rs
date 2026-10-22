@@ -15,7 +15,19 @@ pub(super) struct Profile {
     pub rename_copy_allowed: bool,
     pub unicode_file_paths: bool,
     pub zero_file_error_success: bool,
+    pub legacy_stdio: Option<StdioLayout>,
 }
+#[derive(Clone, Copy)]
+pub(super) struct StdioLayout {
+    pub entry_bytes: u32,
+    pub entries: u32,
+    pub stdin_buffer: u32,
+}
+const LEGACY_STDIO: StdioLayout = StdioLayout {
+    entry_bytes: 32,
+    entries: 20,
+    stdin_buffer: 4096,
+};
 
 pub(super) const PROFILES: &[Profile] = &[
     Profile {
@@ -27,6 +39,7 @@ pub(super) const PROFILES: &[Profile] = &[
         rename_copy_allowed: false,
         unicode_file_paths: false,
         zero_file_error_success: true,
+        legacy_stdio: Some(LEGACY_STDIO),
     },
     Profile {
         module: "msvcrt40.dll",
@@ -37,6 +50,7 @@ pub(super) const PROFILES: &[Profile] = &[
         rename_copy_allowed: false,
         unicode_file_paths: false,
         zero_file_error_success: true,
+        legacy_stdio: Some(LEGACY_STDIO),
     },
     Profile {
         module: "msvcrt.dll",
@@ -47,6 +61,7 @@ pub(super) const PROFILES: &[Profile] = &[
         rename_copy_allowed: false,
         unicode_file_paths: false,
         zero_file_error_success: true,
+        legacy_stdio: Some(LEGACY_STDIO),
     },
     Profile {
         module: "msvcr70.dll",
@@ -57,6 +72,7 @@ pub(super) const PROFILES: &[Profile] = &[
         rename_copy_allowed: false,
         unicode_file_paths: false,
         zero_file_error_success: true,
+        legacy_stdio: Some(LEGACY_STDIO),
     },
     Profile {
         module: "msvcr71.dll",
@@ -67,6 +83,7 @@ pub(super) const PROFILES: &[Profile] = &[
         rename_copy_allowed: false,
         unicode_file_paths: false,
         zero_file_error_success: true,
+        legacy_stdio: Some(LEGACY_STDIO),
     },
     Profile {
         module: "msvcr80.dll",
@@ -77,6 +94,7 @@ pub(super) const PROFILES: &[Profile] = &[
         rename_copy_allowed: false,
         unicode_file_paths: false,
         zero_file_error_success: true,
+        legacy_stdio: Some(LEGACY_STDIO),
     },
     Profile {
         module: "msvcr90.dll",
@@ -87,6 +105,7 @@ pub(super) const PROFILES: &[Profile] = &[
         rename_copy_allowed: false,
         unicode_file_paths: false,
         zero_file_error_success: true,
+        legacy_stdio: Some(LEGACY_STDIO),
     },
     Profile {
         module: "msvcr100.dll",
@@ -97,6 +116,7 @@ pub(super) const PROFILES: &[Profile] = &[
         rename_copy_allowed: false,
         unicode_file_paths: false,
         zero_file_error_success: true,
+        legacy_stdio: Some(LEGACY_STDIO),
     },
     Profile {
         module: "msvcr110.dll",
@@ -107,6 +127,7 @@ pub(super) const PROFILES: &[Profile] = &[
         rename_copy_allowed: false,
         unicode_file_paths: false,
         zero_file_error_success: true,
+        legacy_stdio: Some(LEGACY_STDIO),
     },
     Profile {
         module: "msvcr120.dll",
@@ -117,6 +138,7 @@ pub(super) const PROFILES: &[Profile] = &[
         rename_copy_allowed: false,
         unicode_file_paths: false,
         zero_file_error_success: true,
+        legacy_stdio: Some(LEGACY_STDIO),
     },
     Profile {
         module: "ucrtbase.dll",
@@ -127,6 +149,7 @@ pub(super) const PROFILES: &[Profile] = &[
         rename_copy_allowed: true,
         unicode_file_paths: true,
         zero_file_error_success: false,
+        legacy_stdio: None,
     },
     Profile {
         module: "vcruntime140.dll",
@@ -137,6 +160,7 @@ pub(super) const PROFILES: &[Profile] = &[
         rename_copy_allowed: false,
         unicode_file_paths: false,
         zero_file_error_success: true,
+        legacy_stdio: None,
     },
 ];
 

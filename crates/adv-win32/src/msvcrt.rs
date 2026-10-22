@@ -27,6 +27,7 @@ mod floating;
 mod heap;
 mod integer_format;
 mod intrinsic_math;
+mod legacy_stdio;
 mod locale;
 mod mbcs;
 mod memory_ops;
@@ -196,6 +197,7 @@ pub fn register(r: &mut Registry) {
     thread::register(r);
     heap::register(r);
     locale::register(r);
+    legacy_stdio::register(r);
     memory_ops::register(r);
     mbcs::register(r);
     modern_stdio::register(r);
@@ -258,7 +260,6 @@ pub fn register(r: &mut Registry) {
         ("_stricmp", 2),
         ("_strcmpi", 2),
         ("_strnicmp", 3),
-        ("__p__iob", 0),
         ("_purecall", 0),
     ] {
         r.add("msvcrt.dll", name, Conv::Cdecl { argc }, call);
@@ -274,7 +275,6 @@ pub fn register(r: &mut Registry) {
             ("__set_app_type", 1),
             ("__p__fmode", 0),
             ("__p__commode", 0),
-            ("__iob_func", 0),
             ("_invalid_parameter_noinfo", 0),
         ] {
             r.add(module, name, Conv::Cdecl { argc }, call);
@@ -349,6 +349,7 @@ pub(crate) fn detach_process(env: &mut Env<'_>) -> Result<(), String> {
     onexit::release_process_tables(env)?;
     startup::release_process_tables(env)?;
     locale::release_process_tables(env)?;
+    legacy_stdio::release(env)?;
     time64::release(env, None)?;
     release_errno(env, None)
 }
@@ -508,7 +509,7 @@ fn call(e: &mut Env<'_>) -> Outcome {
     let arg = |i| e.arg(i);
     let (a, b, c) = (arg(0), arg(1), arg(2));
     let value = match name.as_str() {
-        "__set_app_type" | "__p__fmode" | "__p__commode" | "__iob_func" | "__p__iob" => {
+        "__set_app_type" | "__p__fmode" | "__p__commode" => {
             if e.ext.try_get::<CrtState>().is_none() {
                 e.ext.insert(CrtState::default());
             }
@@ -516,8 +517,6 @@ fn call(e: &mut Env<'_>) -> Outcome {
                 e.sys.thunks.get(e.thunk).module.clone(),
                 if name == "__set_app_type" {
                     "app_type"
-                } else if name == "__iob_func" || name == "__p__iob" {
-                    "iob"
                 } else {
                     name.trim_start_matches("__p__")
                 }
@@ -527,12 +526,7 @@ fn call(e: &mut Env<'_>) -> Outcome {
             let pointer = if let Some(pointer) = existing {
                 pointer
             } else {
-                let size = if name == "__iob_func" || name == "__p__iob" {
-                    128
-                } else {
-                    4
-                };
-                let pointer = allocate(e, size, true);
+                let pointer = allocate(e, 4, true);
                 if pointer == 0 {
                     return Outcome::Fail("CRT global allocation failed".into());
                 }

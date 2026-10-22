@@ -33,9 +33,6 @@ pub(crate) fn initialize<B: Backend>(
                 .collect()
         })
         .unwrap_or_default();
-    if bindings.is_empty() {
-        return Ok(());
-    }
     let mut env = Env {
         context: machine.sys.current,
         cpu: &mut machine.cpu,
@@ -65,5 +62,5 @@ pub(crate) fn initialize<B: Backend>(
             }
         }
     }
-    Ok(())
+    legacy_stdio::initialize(&mut env)
 }
