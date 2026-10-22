@@ -109,7 +109,7 @@ const HELP: &str = "adv-run <EXE> [options]\n\
   --backend jit|interpreter   shared guest backend (default: jit)\n\
   --row-workers N         additional row helpers, 0 runs batches inline (default: up to 3)\n\
   --no-row-batching       disable proven row batches for comparison\n\
-  --api-mode strict|discovery   stop at stubs, or collect reviewed API failures (default: strict)\n\
+  --api-mode strict|discovery   stop at the first API gap, or keep playing past gaps (default: discovery)\n\
   --no-time-skip           disable timed-wait acceleration while Ctrl is held\n\
   --compile fast|speed    automatic JIT region policy (default: fast)\n\
   --no-tiering            keep automatic regions at the selected compile strategy\n\
@@ -193,7 +193,7 @@ impl Options {
             codec_kernels: adv_runtime::codec_kernels::Mode::Native,
             codec_kernels_explicit: false,
             codec_signatures: None,
-            api_mode: adv_runtime::RunMode::Strict,
+            api_mode: adv_runtime::RunMode::Discovery,
             time_skip: true,
         }
     }
@@ -592,6 +592,15 @@ fn api_report(runtime: &Runtime) -> String {
             .collect::<Vec<_>>()
             .join(", ")
     });
+    let imports = report_api_gaps(runtime)
+        .map(|gaps| {
+            gaps.imported
+                .iter()
+                .map(|name| json(name))
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
     let recent = diagnostics.map_or_else(String::new, |d| d.recent_stubs.iter().map(|call| {
         let args = call.arguments.iter().map(|arg| json(arg)).collect::<Vec<_>>().join(", ");
         format!("{{\"module\": {}, \"name\": {}, \"caller\": {}, \"context\": {}, \"arguments\": [{args}]}}",
@@ -663,7 +672,8 @@ fn api_report(runtime: &Runtime) -> String {
     format!(
         concat!(
             "{{\"mode\": {}, \"acceptance_eligible\": {}, \"stub_calls\": {}, \"structural_mismatches\": {}, ",
-            "\"called_gaps\": {{{}}}, \"recent_stubs\": [{}], \"signature_conflicts\": [{}], ",
+            "\"called_gaps\": {{{}}}, \"unimplemented_imports\": [{}], ",
+            "\"recent_stubs\": [{}], \"signature_conflicts\": [{}], ",
             "\"last_indirect_branch\": {}, \"coverage\": {{\"generated_exports\": {}, \"implement\": {}, \"state\": {}, \"safe_fail\": {}, \"legacy\": {}}}, ",
             "\"warnings\": [{}], \"unrecorded_warnings\": {}, ",
             "\"discovery_diagnostics_version\": 1, ",
@@ -677,6 +687,7 @@ fn api_report(runtime: &Runtime) -> String {
         diagnostics.map_or(0, |d| d.stub_calls),
         diagnostics.map_or(0, |d| d.structural_mismatches),
         gaps,
+        imports,
         recent,
         conflicts,
         branch,
@@ -1006,7 +1017,25 @@ pub fn error_summary(error: &str, elapsed: Duration) -> adv_report::RunSummary {
     adv_report::RunSummary {
         failure: report_failure(Some(error), None, None, elapsed),
         perf: None,
+        api_gaps: None,
     }
+}
+
+/// The unimplemented APIs the guest called, and those its loaded modules
+/// import, including modules loaded after startup.
+fn report_api_gaps(runtime: &Runtime) -> Option<adv_report::ApiGaps> {
+    let called = runtime
+        .api_diagnostics()
+        .map(|d| d.gaps.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let imported = runtime
+        .machine
+        .sys
+        .thunks
+        .iter()
+        .filter(|(_, thunk)| thunk.requested && !thunk.implemented)
+        .map(|(_, thunk)| format!("{}!{}", thunk.module, thunk.name));
+    adv_report::ApiGaps::new(called, imported)
 }
 
 /// How a run failed, for an anonymous report. `message` is the guest
@@ -2388,6 +2417,7 @@ fn run_execution(
             started.elapsed(),
         ),
         perf: adv_report::Perf::from_samples(performance.frame_samples()),
+        api_gaps: report_api_gaps(&runtime),
     };
     let stats = runtime.machine.cpu.counters();
     println!(

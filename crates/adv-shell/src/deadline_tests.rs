@@ -65,6 +65,8 @@ fn host_time_limit_keeps_live_guest_status_and_api_eligibility() {
             backend.into(),
             "--seconds".into(),
             "0.05".into(),
+            "--api-mode".into(),
+            "strict".into(),
             "--report".into(),
             report.to_str().unwrap().to_owned(),
         ];

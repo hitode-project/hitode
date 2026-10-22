@@ -3,7 +3,7 @@ import { call } from "./bridge";
 import { fakeReportBase, fakeSavedPath, fakeSubmit } from "./fake-report";
 import { codepageLabel } from "./format";
 import type { RunSummary } from "./host";
-import { buildReport, PERF_ISSUES, type PerfIssue, type Report, type ReportBase, type ReportFailure, type ReportPerf, type Situation } from "./report";
+import { buildReport, PERF_ISSUES, type PerfIssue, type Report, type ReportBase, type ReportApiGaps, type ReportFailure, type ReportPerf, type Situation } from "./report";
 import type { Game } from "./types";
 
 // The report form shared by the desktop and phone report screens: what the
@@ -12,7 +12,7 @@ import type { Game } from "./types";
 
 export type ReportView = "form" | "sending" | "sent" | "error" | "saved";
 /** Rows the user may leave out of the report. */
-export type Optional = "failure" | "perf" | "note";
+export type Optional = "failure" | "perf" | "gaps" | "note";
 
 export const SITUATIONS: [Situation, string][] = [
   ["fail", "无法启动"],
@@ -45,6 +45,8 @@ export interface ReportContext {
   failure: ReportFailure | null;
   perfLabel: string;
   perf: ReportPerf | null;
+  /** Null when the last run met no unimplemented API. */
+  apiGaps: ReportApiGaps | null;
 }
 
 const OS_NAMES: Record<string, string> = { windows: "Windows", macos: "macOS", linux: "Linux", android: "Android", ios: "iOS" };
@@ -64,6 +66,10 @@ function perfLabel(summary: RunSummary | null | undefined): string {
   const p = summary.perf;
   if (!p) return t("没有帧时间记录");
   return t("帧时间 p50 {0} ms · p95 {1} ms", p.frame_ms_p50.toFixed(1), p.frame_ms_p95.toFixed(1));
+}
+
+function gapsLabel(gaps: ReportApiGaps): string {
+  return t("已调用 {0} · 仅导入 {1}", String(gaps.called.length), String(gaps.imported.length));
 }
 
 /**
@@ -91,6 +97,7 @@ export async function loadReportContext(game: Game, summary: RunSummary | null |
     failure: summary?.failure ?? null,
     perfLabel: perfLabel(summary),
     perf: summary?.perf ?? null,
+    apiGaps: summary?.api_gaps ?? null,
   };
 }
 
@@ -111,7 +118,7 @@ export class ReportForm {
   situation = $state<Situation>("fail");
   issues = $state<Partial<Record<PerfIssue, boolean>>>({});
   note = $state("");
-  off = $state<Record<Optional, boolean>>({ failure: false, perf: false, note: false });
+  off = $state<Record<Optional, boolean>>({ failure: false, perf: false, gaps: false, note: false });
   rawOpen = $state(false);
   savedPath = $state("");
   /** Null while loading. */
@@ -162,6 +169,8 @@ export class ReportForm {
     if (this.hasFail)
       list.push({ id: "fail", label: t("失败信息"), value: ctx.failureLabel, locked: this.situation === "fail", optional: "failure" });
     if (this.isPerf) list.push({ id: "perf", label: t("性能"), value: ctx.perfLabel, locked: false, optional: "perf" });
+    // Gaps the game survived matter in every situation.
+    if (ctx.apiGaps) list.push({ id: "gaps", label: t("未实现接口"), value: gapsLabel(ctx.apiGaps), locked: false, optional: "gaps" });
     if (this.trimmed) list.push({ id: "note", label: t("备注"), value: this.trimmed, txt: true, locked: false, optional: "note" });
     return list.map((r) => ({ ...r, removed: !r.locked && r.optional !== undefined && this.off[r.optional] }));
   });
@@ -177,6 +186,7 @@ export class ReportForm {
       note: trimmed && !off.note ? trimmed : null,
       failure: keepFailure ? ctx.failure : null,
       perf: isPerf && !off.perf ? ctx.perf : null,
+      apiGaps: off.gaps ? null : ctx.apiGaps,
     });
   });
 
