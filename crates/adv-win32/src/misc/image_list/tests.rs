@@ -17,6 +17,7 @@ enum Arg {
     Memory(u32),
 }
 use Arg::{Memory as M, Value as I};
+mod bitmap;
 mod state;
 mod streams;
 

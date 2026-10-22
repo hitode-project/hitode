@@ -6,6 +6,7 @@ use adv_device::surface::{
 };
 use adv_os::gdi::{DeviceContexts, GdiObj, STOCK_BITMAP};
 
+pub(crate) mod bitmap;
 pub(crate) mod clip;
 mod color_table;
 mod dib;

@@ -6,6 +6,7 @@ use adv_cpu::backend::{GuestExt, Prot};
 use adv_machine::{Env, Namespace, Objects, Outcome};
 
 use crate::{Win32, util::set_last_error};
+mod bitmap;
 mod state;
 mod stream;
 
@@ -292,6 +293,7 @@ pub(super) fn register(registry: &mut Registry) {
     registry.register(replace_icon_ABI);
     registry.register(read_ABI);
     state::register(registry);
+    bitmap::register(registry);
 }
 
 #[cfg(test)]

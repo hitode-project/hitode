@@ -172,6 +172,12 @@ Comparing against the last publication keeps every slot's damage history complet
 **Verification**: Test
 **Basis**: [GraphicsPath](https://learn.microsoft.com/windows/win32/api/gdipluspath/nl-gdipluspath-graphicspath).
 
+### DEV-IMAGE-14 Image list bitmap inputs
+
+**Rule**: Bitmap strips MUST append independent RGBA and mask snapshots through shared GDI bitmap storage and palettes. Replacement MUST preserve list dimensions and all other images. Color-key insertion MUST derive transparency from the specified or upper-left palette color without consuming source handles.
+**Verification**: Test
+**Basis**: Microsoft ImageList_Add, ImageList_AddMasked and ImageList_Replace contracts.
+
 ## Audio ownership
 
 ### DEV-AUDIO-1 Shared playback

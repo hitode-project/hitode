@@ -62,7 +62,7 @@ fn set_size(env: &mut Env<'_>, handle: i32, width: i32, height: i32) -> i32 {
     list.height = height as u32;
     1
 }
-fn blank(width: u32, height: u32, mask: bool) -> Result<Image, ()> {
+pub(super) fn blank(width: u32, height: u32, mask: bool) -> Result<Image, ()> {
     let pixels = width as usize * height as usize;
     let mut rgba = Vec::new();
     rgba.try_reserve_exact(pixels * 4).map_err(|_| ())?;
