@@ -65,6 +65,7 @@ mod peb {
 }
 
 const GENERIC_READ: u32 = 0x8000_0000;
+const GENERIC_WRITE: u32 = 0x4000_0000;
 const SYNCHRONIZE: u32 = 0x10_0000;
 const FILE_SHARE_READ: u32 = 1;
 const FILE_SHARE_DELETE: u32 = 4;
@@ -229,10 +230,6 @@ pub fn start<B: Backend>(
     let parameters =
         memory::allocate_committed(&mut machine.cpu, &mut machine.sys.vm, &mut memory, size)
             .ok_or(Error::AddressSpace)?;
-    let pid = machine.sys.pid;
-    machine
-        .cpu
-        .write(parameters, &params::build(startup, parameters, pid))?;
     for (offset, value) in [
         (peb::PROCESS_PARAMETERS, parameters),
         (peb::NUMBER_OF_PROCESSORS, PROCESSORS),
@@ -289,16 +286,40 @@ pub fn start<B: Backend>(
     });
     machine.sys.exception_handler = Some(exception::deliver);
 
-    let (view, initial) = machine
-        .visit_context(Some(main), |env| {
-            let view = load_main_image(env, startup.image)?;
-            let state = env
-                .cpu
-                .capture_architecture()
-                .map_err(|error| Error::Context(error.to_string()))?;
-            Ok::<_, Error>((view, state))
-        })
-        .map_err(Error::Context)??;
+    let (view, initial) =
+        machine
+            .visit_context(Some(main), |env| {
+                let mut handles = [0; 3];
+                for (index, (fd, access)) in [
+                    (startup.stdin, GENERIC_READ),
+                    (startup.stdout, GENERIC_WRITE),
+                    (startup.stderr, GENERIC_WRITE),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    if let Some(fd) = fd {
+                        handles[index] = server::fd_to_handle(env, fd, access | SYNCHRONIZE)
+                            .map_err(|error| match error {
+                                status::Error::Status(code) => {
+                                    Error::Status("standard handle", code)
+                                }
+                                status::Error::Unsupported(reason) => Error::Context(reason),
+                            })?;
+                    }
+                }
+                env.cpu.write(
+                    parameters,
+                    &params::build(startup, parameters, env.sys.pid, handles),
+                )?;
+                let view = load_main_image(env, startup.image)?;
+                let state = env
+                    .cpu
+                    .capture_architecture()
+                    .map_err(|error| Error::Context(error.to_string()))?;
+                Ok::<_, Error>((view, state))
+            })
+            .map_err(Error::Context)??;
     for (offset, value) in [
         (peb::IMAGE_BASE_ADDRESS, view.base),
         (peb::IMAGE_SUBSYSTEM, view.info.subsystem),

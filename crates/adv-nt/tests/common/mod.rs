@@ -9,6 +9,9 @@
 //! probe.
 
 use std::cell::Cell;
+use std::fs::File;
+use std::io::Read;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::PathBuf;
 
 use adv_cpu::Cpu;
@@ -62,7 +65,7 @@ impl Progress for Runtime {
 
 /// Runs `name` from the probe directory to its end; none when the test
 /// is skipped.
-pub fn run_probe(name: &str) -> Option<RunResult> {
+pub fn run_probe(name: &str) -> Option<(RunResult, String)> {
     let _ = log::set_logger(&WineLog).map(|()| log::set_max_level(log::LevelFilter::Warn));
     let Some(dist) = std::env::var_os("ADV_WINE_DIST").map(PathBuf::from) else {
         eprintln!("skipped: ADV_WINE_DIST is not set");
@@ -111,6 +114,11 @@ pub fn run_probe(name: &str) -> Option<RunResult> {
 
     let cpu = Cpu::new(PARK_ADDR, false).unwrap();
     let mut machine = Machine::new(cpu, Platform, machine_clock).unwrap();
+    let mut fds = [0; 2];
+    // SAFETY: fds has room for both ends.
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    // SAFETY: both descriptors are new and owned by nobody else.
+    let (mut output, stdout) = unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) };
     let startup = Startup {
         image: &format!(r"C:\{name}"),
         command_line: name,
@@ -119,6 +127,9 @@ pub fn run_probe(name: &str) -> Option<RunResult> {
         // en-US
         locale: 0x409,
         debug: &std::env::var("WINEDEBUG").unwrap_or_default(),
+        stdin: None,
+        stdout: Some(stdout.as_raw_fd()),
+        stderr: None,
     };
     let started = process::start(
         &mut machine,
@@ -129,6 +140,7 @@ pub fn run_probe(name: &str) -> Option<RunResult> {
         Box::new(runtime),
     )
     .unwrap();
+    drop(stdout);
     assert_ne!(started.thread.pid, 0);
 
     // Time is virtual: when every context waits, it moves to the earliest
@@ -141,6 +153,19 @@ pub fn run_probe(name: &str) -> Option<RunResult> {
             other => break other,
         }
     };
+    drop(machine);
+    // The server keeps its descriptors after the guest exits.
+    // SAFETY: output owns the read end of the pipe.
+    assert_eq!(
+        unsafe { libc::fcntl(output.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) },
+        0
+    );
+    let mut text = String::new();
+    match output.read_to_string(&mut text) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+        Err(error) => panic!("reading probe output: {error}"),
+    }
     std::fs::remove_dir_all(&root).unwrap();
-    Some(result)
+    Some((result, text))
 }

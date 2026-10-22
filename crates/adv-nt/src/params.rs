@@ -4,6 +4,8 @@
 //! environment, in one private allocation that ntdll.dll later replaces and
 //! frees.
 
+use std::os::fd::RawFd;
+
 /// What a process starts with.
 pub struct Startup<'a> {
     /// The DOS path of the main image.
@@ -17,6 +19,9 @@ pub struct Startup<'a> {
     pub locale: u32,
     /// Wine debug channels, in WINEDEBUG syntax.
     pub debug: &'a str,
+    pub stdin: Option<RawFd>,
+    pub stdout: Option<RawFd>,
+    pub stderr: Option<RawFd>,
 }
 
 const SIZE: u32 = 0x2a4;
@@ -27,6 +32,9 @@ const SW_SHOWNORMAL: u32 = 1;
 const ALLOCATION_SIZE: usize = 0x00;
 const LENGTH: usize = 0x04;
 const FLAGS: usize = 0x08;
+const STD_INPUT: usize = 0x18;
+const STD_OUTPUT: usize = 0x1c;
+const STD_ERROR: usize = 0x20;
 const CURRENT_DIRECTORY: usize = 0x24;
 const IMAGE_PATH_NAME: usize = 0x38;
 const COMMAND_LINE: usize = 0x40;
@@ -82,7 +90,7 @@ fn put_string(block: &mut [u8], base: u32, field: usize, offset: u32, text: &[u1
 }
 
 /// The block for `startup`, to be placed at `base`.
-pub fn build(startup: &Startup<'_>, base: u32, process_id: u32) -> Vec<u8> {
+pub fn build(startup: &Startup<'_>, base: u32, process_id: u32, handles: [u32; 3]) -> Vec<u8> {
     let size = size(startup);
     let mut block = vec![0u8; size as usize];
     put(&mut block, ALLOCATION_SIZE, size);
@@ -90,6 +98,9 @@ pub fn build(startup: &Startup<'_>, base: u32, process_id: u32) -> Vec<u8> {
     put(&mut block, FLAGS, FLAG_NORMALIZED);
     put(&mut block, SHOW_WINDOW, SW_SHOWNORMAL);
     put(&mut block, PROCESS_GROUP_ID, process_id);
+    for (field, handle) in [STD_INPUT, STD_OUTPUT, STD_ERROR].into_iter().zip(handles) {
+        put(&mut block, field, handle);
+    }
 
     let directory = utf16(startup.directory);
     put_string(

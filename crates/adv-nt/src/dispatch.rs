@@ -62,6 +62,7 @@ const IMPLEMENTED: &[(&str, Syscall)] = &[
     ("NtUnmapViewOfSection", section::unmap_view),
     ("NtWaitForMultipleObjects", sync::wait_multiple),
     ("NtWaitForSingleObject", sync::wait_single),
+    ("NtWriteFile", file::write),
     (
         "NtWow64IsProcessorFeaturePresent",
         kuser::is_processor_feature_present,

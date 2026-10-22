@@ -29,6 +29,7 @@ REQUESTS = [
     "init_process_done",
     "terminate_process",
     "create_file",
+    "alloc_file_handle",
     "get_handle_fd",
     "close_handle",
     "create_mapping",

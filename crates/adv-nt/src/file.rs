@@ -28,6 +28,117 @@ pub struct Files {
     pub dosdevices: PathBuf,
 }
 
+const FILE_SYNCHRONOUS_IO: u32 = 0x30;
+const FD_TYPE_FILE: i32 = 1;
+const FILE_USE_FILE_POINTER_POSITION: i64 = -2;
+const FILE_WRITE_TO_END_OF_FILE: i64 = -1;
+
+/// NtWriteFile(handle, event, apc, apc_context, *io, *buffer, length,
+/// *offset, *key), synchronous writes only.
+pub fn write(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    let &[
+        handle,
+        event,
+        apc,
+        apc_context,
+        io,
+        buffer,
+        length,
+        offset,
+        key,
+    ] = args
+    else {
+        unreachable!()
+    };
+    status::finish((|| {
+        if event != 0 || apc != 0 || apc_context != 0 || key != 0 {
+            return Err(Error::Unsupported(
+                "NtWriteFile with an event, APC routine/context or key".into(),
+            ));
+        }
+        let fd = server::handle_fd(env, handle)?;
+        if fd.options & FILE_SYNCHRONOUS_IO == 0 {
+            return Err(Error::Unsupported(
+                "NtWriteFile on an asynchronous handle".into(),
+            ));
+        }
+        let mut position = None;
+        if fd.kind == FD_TYPE_FILE && offset != 0 {
+            let mut bytes = [0; 8];
+            env.cpu
+                .read(offset, &mut bytes)
+                .map_err(|_| status::ACCESS_VIOLATION)?;
+            let off = i64::from_le_bytes(bytes);
+            if off != FILE_USE_FILE_POINTER_POSITION {
+                position = Some(off);
+            }
+        }
+        let mut bytes = vec![0; length as usize];
+        env.cpu
+            .read(buffer, &mut bytes)
+            .map_err(|_| status::ACCESS_VIOLATION)?;
+        let result = (|| {
+            if position == Some(FILE_WRITE_TO_END_OF_FILE) {
+                // SAFETY: a zeroed stat is a valid buffer for fstat to fill.
+                let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+                // SAFETY: a descriptor the server gave the process and a valid buffer.
+                if unsafe { libc::fstat(fd.fd, &mut stat) } != 0 {
+                    return Err(write_error());
+                }
+                position = Some(stat.st_size);
+            }
+            loop {
+                // SAFETY: the descriptor is valid for this call, and bytes holds length bytes.
+                let count = unsafe {
+                    match position {
+                        Some(off) => libc::pwrite(fd.fd, bytes.as_ptr().cast(), bytes.len(), off),
+                        None => libc::write(fd.fd, bytes.as_ptr().cast(), bytes.len()),
+                    }
+                };
+                if count >= 0 {
+                    if let Some(off) = position {
+                        // SAFETY: the same regular file; Wine advances its synchronous position.
+                        unsafe { libc::lseek(fd.fd, off + count as i64, libc::SEEK_SET) };
+                    }
+                    return Ok(count as u32);
+                }
+                if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                    return Err(write_error());
+                }
+            }
+        })();
+        drop(fd);
+        write_u32(
+            env,
+            io,
+            result.as_ref().err().copied().unwrap_or(status::SUCCESS),
+        )?;
+        write_u32(env, io + 4, result.as_ref().copied().unwrap_or(0))?;
+        result.map(drop).map_err(Error::from)
+    })())
+}
+
+/// Wine's errno_to_status for write and pwrite failures.
+fn write_error() -> status::Status {
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::EAGAIN) => 0xc000_0043, // STATUS_SHARING_VIOLATION
+        Some(libc::EBADF) => status::INVALID_HANDLE,
+        Some(libc::EBUSY) => 0x8000_0011,  // STATUS_DEVICE_BUSY
+        Some(libc::ENOSPC) => 0xc000_007f, // STATUS_DISK_FULL
+        Some(libc::EPERM | libc::EROFS | libc::EACCES) => 0xc000_0022, // STATUS_ACCESS_DENIED
+        Some(libc::EISDIR) => 0xc000_0010, // STATUS_INVALID_DEVICE_REQUEST
+        Some(libc::EINVAL) => status::INVALID_PARAMETER,
+        Some(libc::EPIPE | libc::ECONNRESET) => 0xc000_00b0, // STATUS_PIPE_DISCONNECTED
+        Some(libc::EIO) => 0xc000_00a3,                      // STATUS_DEVICE_NOT_READY
+        Some(libc::ENXIO) => 0xc000_000e,                    // STATUS_NO_SUCH_DEVICE
+        Some(libc::ENOTTY | libc::EOPNOTSUPP) => 0xc000_00bb, // STATUS_NOT_SUPPORTED
+        Some(libc::EFAULT) => status::ACCESS_VIOLATION,
+        Some(libc::ESPIPE) => 0xc000_00af, // STATUS_ILLEGAL_FUNCTION
+        Some(libc::ETIME) => 0xc000_00b5,  // STATUS_IO_TIMEOUT
+        _ => 0xc000_0001,                  // STATUS_UNSUCCESSFUL
+    }
+}
+
 /// NtCreateFile(*handle, access, *attributes, *io, *allocation_size,
 /// file_attributes, sharing, disposition, options, ea_buffer, ea_length)
 pub fn create(env: &mut Env<'_>, args: &[u32]) -> Outcome {

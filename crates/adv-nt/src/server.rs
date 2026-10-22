@@ -17,8 +17,8 @@ use adv_machine::sched::{Handle, Object};
 use adv_machine::{CtxId, Env, Sys};
 
 use crate::protocol::{
-    CloseHandleRequest, FIXED_SIZE, GetHandleFdRequest, InitFirstThreadRequest, InitThreadRequest,
-    PROTOCOL_VERSION, Request,
+    AllocFileHandleRequest, CloseHandleRequest, FIXED_SIZE, GetHandleFdRequest,
+    InitFirstThreadRequest, InitThreadRequest, PROTOCOL_VERSION, Request,
 };
 
 /// i386, the machine of Hitode's prefixes.
@@ -362,6 +362,26 @@ pub fn end_thread(env: &mut Env<'_>) {
 
 fn broken(error: Error) -> crate::status::Error {
     crate::status::Error::Unsupported(format!("server: {error}"))
+}
+
+/// Makes an inheritable server handle for a host descriptor, as Wine's
+/// `wine_server_fd_to_handle` does.
+pub fn fd_to_handle(
+    env: &mut Env<'_>,
+    fd: RawFd,
+    access: u32,
+) -> Result<u32, crate::status::Error> {
+    let tid = current_tid(env)?;
+    send_fd(&link(env)?.socket, tid, fd).map_err(|error| broken(error.into()))?;
+    let mut request = AllocFileHandleRequest {
+        access,
+        attributes: 2, // OBJ_INHERIT
+        fd,
+        ..Default::default()
+    };
+    let (reply, _) = self::request(env, &mut request, &[], &mut [])?;
+    crate::status::check(reply.header.error)?;
+    Ok(reply.handle)
 }
 
 /// The host descriptor of `handle`, from the cache or the server.

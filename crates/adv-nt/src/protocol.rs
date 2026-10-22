@@ -171,6 +171,37 @@ impl Request for CreateFileRequest {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
+pub struct AllocFileHandleRequest {
+    pub header: RequestHeader,
+    pub access: u32,
+    pub attributes: u32,
+    pub fd: i32,
+}
+const _: () = assert!(size_of::<AllocFileHandleRequest>() == 24);
+const _: () = assert!(std::mem::offset_of!(AllocFileHandleRequest, access) == 12);
+const _: () = assert!(std::mem::offset_of!(AllocFileHandleRequest, attributes) == 16);
+const _: () = assert!(std::mem::offset_of!(AllocFileHandleRequest, fd) == 20);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AllocFileHandleReply {
+    pub header: ReplyHeader,
+    pub handle: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<AllocFileHandleReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(AllocFileHandleReply, handle) == 8);
+
+impl Request for AllocFileHandleRequest {
+    const NUMBER: i32 = 46;
+    type Reply = AllocFileHandleReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct GetHandleFdRequest {
     pub header: RequestHeader,
     pub handle: u32,
