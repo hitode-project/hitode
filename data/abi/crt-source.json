@@ -633,5 +633,23 @@
     ],
     "behavior": "Allocation failure and size/product overflow publish ENOMEM. Zero malloc/calloc requests retain a distinct one-byte block; realloc of a nonnull block to zero releases it. _expand uses HEAP_REALLOC_IN_PLACE_ONLY, preserves the original block on failure and retains one byte for a zero request. NULL _msize/_expand calls use the existing version-specific invalid-parameter policy.",
     "native_boundary": "The pinned VC90 default NT-heap _expand entry normalizes a zero size to one and calls HeapReAlloc with flag 0x10; no alternate heap owner is introduced."
+  },
+  "aligned_heap_fronts": {
+    "header": "Microsoft Windows SDK 10.0.26100.0 ucrt/corecrt_malloc.h",
+    "sha256": "44bd1bb518e730ba0be045f44a4735869e08f7d54ab85c298270770812fcff80",
+    "documentation": [
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/aligned-malloc",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/aligned-offset-malloc",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/aligned-free",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/aligned-msize",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/aligned-realloc",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/aligned-offset-realloc",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/aligned-recalloc",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/aligned-offset-recalloc"
+    ],
+    "storage": "A native x86 aligned view stores its backing process-heap pointer at (view & ~3)-4. The existing RTL owner retains allocation, sizing and release. No host address map or separate allocator is introduced.",
+    "boundaries": "Native Microsoft VC80/VC90 accept zero alignment and normalize it to four, unlike pinned UCRT which rejects it; version parameters preserve this difference. Other version profiles follow the documented nonzero power-of-two precondition. Native VC80/VC90/UCRT accept zero-sized aligned requests with offset zero. Aligned size checks NULL and computes backing size minus max(alignment,4), (-offset)&3 and three bytes; alignment/offset must match the allocation.",
+    "resizing": "Replacement allocations preserve the old block on failure and copy its available user bytes before release. Recalloc uses the native aligned-size zeroing boundary. Nonnull zero-sized resizing releases the old backing before alignment/offset validation; product overflow publishes ENOMEM before any resize.",
+    "evidence": "Microsoft SDK declarations and Learn establish public contracts. The pinned native Microsoft x86 runtime binaries listed in the provenance establish guest header geometry, zero input differences and validation order; no native execution or Wine implementation is claimed."
   }
 }

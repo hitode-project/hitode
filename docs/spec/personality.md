@@ -237,3 +237,13 @@ Withdrawn: PERS-SCOPE-2, PERS-SCOPE-7, PERS-SCOPE-9
 
 **Rule**: Public allocation failure and product overflow MUST publish ENOMEM. NULL size-query and expansion inputs MUST use the runtime's parameter-validation profile. Zero-sized allocation requests MUST retain distinct live blocks that can be freed.
 **Verification**: Test
+
+### PERS-CRT-9 Aligned allocation views
+
+**Rule**: Aligned CRT allocations MUST retain real backing blocks in the shared heap, with recoverable guest headers. The requested view plus offset MUST satisfy its alignment, and size queries MUST recover the requested extent. Resizing MUST preserve old contents on success and retain the original allocation on failure.
+**Verification**: Test
+
+### PERS-CRT-10 Aligned zeroing and validation
+
+**Rule**: Aligned recalloc MUST zero newly added bytes and reject overflowing products with ENOMEM. Invalid inputs MUST follow the version's parameter-validation profile and native zero-alignment policy. Zero-sized resizing of a nonnull view MUST release its backing block before alignment validation.
+**Verification**: Test

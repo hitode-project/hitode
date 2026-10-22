@@ -292,3 +292,6 @@ fn null_size_queries_and_expansion_use_the_runtime_invalid_parameter_profile() {
         }
     }
 }
+
+#[path = "crt_heap_exports/aligned.rs"]
+mod aligned;

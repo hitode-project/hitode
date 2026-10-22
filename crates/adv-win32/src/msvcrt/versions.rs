@@ -10,6 +10,7 @@ pub(super) struct Profile {
     pub module: &'static str,
     pub invalid_parameters: bool,
     pub multibyte_utf8: bool,
+    pub zero_alignment: bool,
 }
 
 pub(super) const PROFILES: &[Profile] = &[
@@ -17,61 +18,73 @@ pub(super) const PROFILES: &[Profile] = &[
         module: "msvcrt20.dll",
         invalid_parameters: false,
         multibyte_utf8: false,
+        zero_alignment: false,
     },
     Profile {
         module: "msvcrt40.dll",
         invalid_parameters: false,
         multibyte_utf8: false,
+        zero_alignment: false,
     },
     Profile {
         module: "msvcrt.dll",
         invalid_parameters: true,
         multibyte_utf8: false,
+        zero_alignment: false,
     },
     Profile {
         module: "msvcr70.dll",
         invalid_parameters: false,
         multibyte_utf8: false,
+        zero_alignment: false,
     },
     Profile {
         module: "msvcr71.dll",
         invalid_parameters: false,
         multibyte_utf8: false,
+        zero_alignment: false,
     },
     Profile {
         module: "msvcr80.dll",
         invalid_parameters: true,
         multibyte_utf8: false,
+        zero_alignment: true,
     },
     Profile {
         module: "msvcr90.dll",
         invalid_parameters: true,
         multibyte_utf8: false,
+        zero_alignment: true,
     },
     Profile {
         module: "msvcr100.dll",
         invalid_parameters: true,
         multibyte_utf8: false,
+        zero_alignment: false,
     },
     Profile {
         module: "msvcr110.dll",
         invalid_parameters: true,
         multibyte_utf8: false,
+        zero_alignment: false,
     },
     Profile {
         module: "msvcr120.dll",
         invalid_parameters: true,
         multibyte_utf8: false,
+        zero_alignment: false,
     },
     Profile {
         module: "ucrtbase.dll",
         invalid_parameters: true,
         multibyte_utf8: true,
+        zero_alignment: false,
     },
     Profile {
         module: "vcruntime140.dll",
         invalid_parameters: true,
         multibyte_utf8: false,
+        zero_alignment: false,
     },
 ];
 

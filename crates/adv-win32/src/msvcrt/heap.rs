@@ -4,6 +4,7 @@ use adv_abi::{GuestPtr, GuestReturn, win32};
 use adv_cpu::backend::MemFault;
 
 const HEAP_MAXREQ: u32 = 0xffffffe0;
+type Done = Box<dyn FnOnce(&mut Env<'_>, u32) -> Outcome>;
 
 pub(super) fn register(registry: &mut Registry) {
     registry.register(calloc_crt_ABI);
@@ -20,7 +21,7 @@ pub(super) fn register(registry: &mut Registry) {
     );
 }
 
-fn result(env: &mut Env<'_>, address: u32) -> Result<GuestPtr<()>, MemFault> {
+pub(super) fn result(env: &mut Env<'_>, address: u32) -> Result<GuestPtr<()>, MemFault> {
     if address == 0 {
         floating::errno_address(env).write(env.cpu, 12)?; // ENOMEM
     }
@@ -117,10 +118,14 @@ fn block_size(env: &mut Env<'_>) -> Outcome {
     if pointer == 0 {
         return errors::invalid(env, u32::MAX);
     }
+    size_then(env, pointer, Box::new(|_, size| Outcome::Return(size)))
+}
+
+pub(super) fn size_then(env: &mut Env<'_>, pointer: u32, then: Done) -> Outcome {
     let heap = env.ext.get::<Heaps>().process_heap;
     match crate::native::public_entry(env, "ntdll.dll", "RtlSizeHeap") {
-        Ok(entry) => Outcome::call(entry, [heap, 0, pointer], |_, value| {
-            Outcome::Return(value.value())
+        Ok(entry) => Outcome::call(entry, [heap, 0, pointer], move |env, value| {
+            then(env, value.value())
         }),
         Err(reason) => Outcome::Fail(format!("CRT live RtlSizeHeap resolution: {reason}")),
     }

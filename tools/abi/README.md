@@ -225,13 +225,9 @@ iostream families, including their data exports. `--check` detects stale entries
 This scope manifest neither registers behavior nor changes export discovery;
 `tools/survey/coverage.py` continues to report the unfiltered catalogs.
 
-The declarations cover guest floating controls, modern invalid-parameter
-callbacks and `_errno` for the supported msvcrt/msvcr80/msvcr90/ucrtbase profiles,
-plus UCRT exit arrays, initializer ranges, `wcstoull`, `wcscat_s` and the allocation family
-with their API-set aliases. The six legacy `__getmainargs`/`__wgetmainargs`
-declarations use the official Microsoft Learn prototypes because modern UCRT SDK
-headers omit them; they are not invented as UCRT or API-set exports. Their guest
-argv/environment arrays consume the existing Win32 command-line buffers and
+Declarations include floating controls, error cells, exit arrays and initializer
+ranges. Legacy `__getmainargs`/`__wgetmainargs` use Learn prototypes where SDK
+headers omit them. Their guest argv/environment arrays consume Win32 strings and
 process environment, with per-CRT guest-heap snapshots released on process detach.
 Glob expansion requests containing wildcards explicitly fail rather than report
 unexpanded arguments as success. Public `malloc/calloc/realloc/free/_msize/_expand`
@@ -242,6 +238,14 @@ realloc releases its block, while `_expand` retains one live byte and uses the
 RTL in-place flag. Failed resizing preserves the old block. NULL `_msize/_expand`
 inputs use the runtime's parameter-validation profile. Interpreter/JIT tests
 exercise the aliases, shared block contents, size queries and error contracts.
+Aligned malloc/free/size/realloc/recalloc fronts and their offset variants retain
+the native x86 guest header pointing into the same process heap. Resizing keeps
+the old backing until allocation and copying succeed; recalloc zeros the added
+extent. VC80/VC90's native zero-alignment acceptance is a version parameter;
+UCRT and the other profiles require the documented nonzero power of two. Native
+aligned size queries validate NULL and require the original alignment/offset.
+Tests cover alignment geometry, all cataloged versions, zeroing, zero-sized
+release, overflow and callback ordering on both interpreter and JIT.
 Legacy scalar `operator new/delete` use that same heap, including distinct live
 zero-byte allocations. The throwing `new` overload explicitly stops on allocation
 failure because guest `std::bad_alloc`/new-handler dispatch is not implemented;
