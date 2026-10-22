@@ -8,6 +8,7 @@ pub(super) fn register(registry: &mut Registry) {
         registry,
         &[
             ("_errno", address),
+            ("_dosmaperr", dosmaperr),
             ("__doserrno", address),
             ("_get_errno", get),
             ("_get_doserrno", get),
@@ -103,4 +104,48 @@ pub(super) fn validation(env: &mut Env<'_>, error: i32, result: Outcome) -> Outc
     }
     let name = env.sys.thunks.get(env.thunk).name.clone();
     invalid_parameter_then(env, &name, error, move |_| result)
+}
+
+/// Pinned Microsoft VC90's first-match DOS error table and fallback ranges.
+/// The duplicate ERROR_INVALID_HANDLE row resolves to the first EBADF entry.
+pub(super) fn dos_errno(code: u32) -> i32 {
+    match code {
+        2 | 3 | 15 | 18 | 53 | 67 | 161 | 206 => 2,
+        4 => 24,
+        5 | 16 | 19..=36 | 65 | 82 | 83 | 108 | 132 | 158 | 167 => 13,
+        6 | 114 | 130 => 9,
+        7..=9 | 1816 => 12,
+        10 => 7,
+        11 | 188..=202 => 8,
+        17 => 18,
+        80 | 183 => 17,
+        89 | 164 | 215 => 11,
+        109 => 32,
+        112 => 28,
+        128 | 129 => 10,
+        145 => 41,
+        _ => 22,
+    }
+}
+
+pub(super) fn map_dos(env: &mut Env<'_>, code: u32, result: u32) -> Outcome {
+    let pointer = floating::errno_address(env).addr();
+    if pointer == 0 {
+        return crate::kernel32::exit_process(env, 255);
+    }
+    let errno = if code == 1113
+        && versions::profile(&env.sys.thunks.get(env.thunk).module).unicode_file_paths
+    {
+        42 // UCRT adds NO_UNICODE_TRANSLATION -> EILSEQ to the legacy table.
+    } else {
+        dos_errno(code)
+    };
+    let pair = [(errno as u32).to_le_bytes(), code.to_le_bytes()].concat();
+    match env.cpu.write(pointer, &pair) {
+        Ok(()) => Outcome::Return(result),
+        Err(fault) => memory_failure(fault),
+    }
+}
+fn dosmaperr(env: &mut Env<'_>) -> Outcome {
+    map_dos(env, env.arg(0), 0)
 }

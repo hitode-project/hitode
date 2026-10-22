@@ -2496,3 +2496,88 @@ ucrtbase.dll	_wcsnset_s	cdecl	i32	errno_t	destination:wchar_t*:ptr:1|capacity:si
 ucrtbase.dll	_wcsrev	cdecl	ptr	wchar_t*	destination:wchar_t*:ptr:1
 ucrtbase.dll	_wcsset	cdecl	ptr	wchar_t*	destination:wchar_t*:ptr:1|value:wchar_t:u32:1
 ucrtbase.dll	_wcsset_s	cdecl	i32	errno_t	destination:wchar_t*:ptr:1|capacity:size_t:u32:1|value:wchar_t:u32:1
+# SDK stdio.h/io.h/corecrt_wio.h file mutation fronts; native _dosmaperr cdecl contract.
+api-ms-win-crt-filesystem-l1-1-0.dll	_wremove	cdecl	i32	int	path:const wchar_t*:str16:1
+api-ms-win-crt-filesystem-l1-1-0.dll	_wrename	cdecl	i32	int	source:const wchar_t*:str16:1|target:const wchar_t*:str16:1
+api-ms-win-crt-filesystem-l1-1-0.dll	_wunlink	cdecl	i32	int	path:const wchar_t*:str16:1
+msvcr100.dll	_dosmaperr	cdecl	void	void	code:unsigned long:u32:1
+msvcr100.dll	_unlink	cdecl	i32	int	path:const char*:str8:1
+msvcr100.dll	_wremove	cdecl	i32	int	path:const wchar_t*:str16:1
+msvcr100.dll	_wrename	cdecl	i32	int	source:const wchar_t*:str16:1|target:const wchar_t*:str16:1
+msvcr100.dll	_wunlink	cdecl	i32	int	path:const wchar_t*:str16:1
+msvcr100.dll	remove	cdecl	i32	int	path:const char*:str8:1
+msvcr100.dll	rename	cdecl	i32	int	source:const char*:str8:1|target:const char*:str8:1
+msvcr110.dll	_dosmaperr	cdecl	void	void	code:unsigned long:u32:1
+msvcr110.dll	_unlink	cdecl	i32	int	path:const char*:str8:1
+msvcr110.dll	_wremove	cdecl	i32	int	path:const wchar_t*:str16:1
+msvcr110.dll	_wrename	cdecl	i32	int	source:const wchar_t*:str16:1|target:const wchar_t*:str16:1
+msvcr110.dll	_wunlink	cdecl	i32	int	path:const wchar_t*:str16:1
+msvcr110.dll	remove	cdecl	i32	int	path:const char*:str8:1
+msvcr110.dll	rename	cdecl	i32	int	source:const char*:str8:1|target:const char*:str8:1
+msvcr120.dll	_dosmaperr	cdecl	void	void	code:unsigned long:u32:1
+msvcr120.dll	_unlink	cdecl	i32	int	path:const char*:str8:1
+msvcr120.dll	_wremove	cdecl	i32	int	path:const wchar_t*:str16:1
+msvcr120.dll	_wrename	cdecl	i32	int	source:const wchar_t*:str16:1|target:const wchar_t*:str16:1
+msvcr120.dll	_wunlink	cdecl	i32	int	path:const wchar_t*:str16:1
+msvcr120.dll	remove	cdecl	i32	int	path:const char*:str8:1
+msvcr120.dll	rename	cdecl	i32	int	source:const char*:str8:1|target:const char*:str8:1
+msvcr70.dll	_unlink	cdecl	i32	int	path:const char*:str8:1
+msvcr70.dll	_wremove	cdecl	i32	int	path:const wchar_t*:str16:1
+msvcr70.dll	_wrename	cdecl	i32	int	source:const wchar_t*:str16:1|target:const wchar_t*:str16:1
+msvcr70.dll	_wunlink	cdecl	i32	int	path:const wchar_t*:str16:1
+msvcr70.dll	remove	cdecl	i32	int	path:const char*:str8:1
+msvcr70.dll	rename	cdecl	i32	int	source:const char*:str8:1|target:const char*:str8:1
+msvcr71.dll	_unlink	cdecl	i32	int	path:const char*:str8:1
+msvcr71.dll	_wremove	cdecl	i32	int	path:const wchar_t*:str16:1
+msvcr71.dll	_wrename	cdecl	i32	int	source:const wchar_t*:str16:1|target:const wchar_t*:str16:1
+msvcr71.dll	_wunlink	cdecl	i32	int	path:const wchar_t*:str16:1
+msvcr71.dll	remove	cdecl	i32	int	path:const char*:str8:1
+msvcr71.dll	rename	cdecl	i32	int	source:const char*:str8:1|target:const char*:str8:1
+msvcr80.dll	_dosmaperr	cdecl	void	void	code:unsigned long:u32:1
+msvcr80.dll	_unlink	cdecl	i32	int	path:const char*:str8:1
+msvcr80.dll	_wremove	cdecl	i32	int	path:const wchar_t*:str16:1
+msvcr80.dll	_wrename	cdecl	i32	int	source:const wchar_t*:str16:1|target:const wchar_t*:str16:1
+msvcr80.dll	_wunlink	cdecl	i32	int	path:const wchar_t*:str16:1
+msvcr80.dll	remove	cdecl	i32	int	path:const char*:str8:1
+msvcr80.dll	rename	cdecl	i32	int	source:const char*:str8:1|target:const char*:str8:1
+msvcr90.dll	_dosmaperr	cdecl	void	void	code:unsigned long:u32:1
+msvcr90.dll	_unlink	cdecl	i32	int	path:const char*:str8:1
+msvcr90.dll	_wremove	cdecl	i32	int	path:const wchar_t*:str16:1
+msvcr90.dll	_wrename	cdecl	i32	int	source:const wchar_t*:str16:1|target:const wchar_t*:str16:1
+msvcr90.dll	_wunlink	cdecl	i32	int	path:const wchar_t*:str16:1
+msvcr90.dll	remove	cdecl	i32	int	path:const char*:str8:1
+msvcr90.dll	rename	cdecl	i32	int	source:const char*:str8:1|target:const char*:str8:1
+msvcrt.dll	_unlink	cdecl	i32	int	path:const char*:str8:1
+msvcrt.dll	_wremove	cdecl	i32	int	path:const wchar_t*:str16:1
+msvcrt.dll	_wrename	cdecl	i32	int	source:const wchar_t*:str16:1|target:const wchar_t*:str16:1
+msvcrt.dll	_wunlink	cdecl	i32	int	path:const wchar_t*:str16:1
+msvcrt.dll	remove	cdecl	i32	int	path:const char*:str8:1
+msvcrt.dll	rename	cdecl	i32	int	source:const char*:str8:1|target:const char*:str8:1
+msvcrt20.dll	_unlink	cdecl	i32	int	path:const char*:str8:1
+msvcrt20.dll	_wremove	cdecl	i32	int	path:const wchar_t*:str16:1
+msvcrt20.dll	_wrename	cdecl	i32	int	source:const wchar_t*:str16:1|target:const wchar_t*:str16:1
+msvcrt20.dll	_wunlink	cdecl	i32	int	path:const wchar_t*:str16:1
+msvcrt20.dll	remove	cdecl	i32	int	path:const char*:str8:1
+msvcrt20.dll	rename	cdecl	i32	int	source:const char*:str8:1|target:const char*:str8:1
+msvcrt40.dll	_unlink	cdecl	i32	int	path:const char*:str8:1
+msvcrt40.dll	_wremove	cdecl	i32	int	path:const wchar_t*:str16:1
+msvcrt40.dll	_wrename	cdecl	i32	int	source:const wchar_t*:str16:1|target:const wchar_t*:str16:1
+msvcrt40.dll	_wunlink	cdecl	i32	int	path:const wchar_t*:str16:1
+msvcrt40.dll	remove	cdecl	i32	int	path:const char*:str8:1
+msvcrt40.dll	rename	cdecl	i32	int	source:const char*:str8:1|target:const char*:str8:1
+ucrtbase.dll	_wremove	cdecl	i32	int	path:const wchar_t*:str16:1
+ucrtbase.dll	_wrename	cdecl	i32	int	source:const wchar_t*:str16:1|target:const wchar_t*:str16:1
+ucrtbase.dll	_wunlink	cdecl	i32	int	path:const wchar_t*:str16:1
+# UCRT narrow conversion and pinned _o_ mutation wrappers.
+api-ms-win-crt-filesystem-l1-1-0.dll	_unlink	cdecl	i32	int	path:const char*:str8:1
+api-ms-win-crt-filesystem-l1-1-0.dll	remove	cdecl	i32	int	path:const char*:str8:1
+api-ms-win-crt-filesystem-l1-1-0.dll	rename	cdecl	i32	int	source:const char*:str8:1|target:const char*:str8:1
+ucrtbase.dll	_o__unlink	cdecl	i32	int	path:const char*:str8:1
+ucrtbase.dll	_o__wremove	cdecl	i32	int	path:const wchar_t*:str16:1
+ucrtbase.dll	_o__wrename	cdecl	i32	int	source:const wchar_t*:str16:1|target:const wchar_t*:str16:1
+ucrtbase.dll	_o__wunlink	cdecl	i32	int	path:const wchar_t*:str16:1
+ucrtbase.dll	_o_remove	cdecl	i32	int	path:const char*:str8:1
+ucrtbase.dll	_o_rename	cdecl	i32	int	source:const char*:str8:1|target:const char*:str8:1
+ucrtbase.dll	_unlink	cdecl	i32	int	path:const char*:str8:1
+ucrtbase.dll	remove	cdecl	i32	int	path:const char*:str8:1
+ucrtbase.dll	rename	cdecl	i32	int	source:const char*:str8:1|target:const char*:str8:1

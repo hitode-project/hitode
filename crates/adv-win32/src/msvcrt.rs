@@ -19,6 +19,7 @@ mod directory;
 mod errors;
 mod exceptions;
 mod file;
+mod file_mutation;
 mod find;
 mod formatting;
 pub(crate) use data::initialize as initialize_data;
@@ -164,6 +165,7 @@ pub fn register(r: &mut Registry) {
     diagnostics::register(r);
     exceptions::register(r);
     find::register(r);
+    file_mutation::register(r);
     formatting::register(r);
     floating::register(r);
     errors::register(r);

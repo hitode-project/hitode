@@ -376,3 +376,8 @@ Full cleanup closes that CRT's streams after callbacks; fast cleanup preserves t
 In-place reversal and set exports share checked byte/UTF-16 kernels across cataloged CRT versions, including the verified UCRT `_o_` wrappers.
 Secure set fronts preserve the native incremental writes, original-suffix validation and EINVAL order; counts and capacities measure code units.
 `crt_strings` covers all projections, surrogate units, error callbacks, zero counts and page boundaries in interpreter/JIT.
+
+CRT remove, unlink and rename fronts now call the live Windows mutation entries through one versioned adapter.
+UCRT narrow paths convert with the existing filename codec and retain per-argument RTL buffers until completion; legacy fronts retain their A/W calls.
+DOS error translation preserves the pinned first-match table, fallback ranges and UCRT Unicode-error difference.
+`crt_file_mutation` checks every projection, CP932/936 overlay effects, provider failures, buffer cleanup and allocation/validation ordering in interpreter/JIT.

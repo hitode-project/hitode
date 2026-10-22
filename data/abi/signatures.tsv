@@ -659,6 +659,12 @@ api-ms-win-crt-convert-l1-1-0.dll	wcstol	cdecl	i32	long	text:const wchar_t*:str1
 api-ms-win-crt-convert-l1-1-0.dll	wcstoll	cdecl	i64	long long	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
 api-ms-win-crt-convert-l1-1-0.dll	wcstoul	cdecl	u32	unsigned long	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
 api-ms-win-crt-convert-l1-1-0.dll	wcstoull	cdecl	u64	unsigned long long	text:const wchar_t*:str16:1|end:wchar_t**:ptr:1|base:int:i32:1
+api-ms-win-crt-filesystem-l1-1-0.dll	_unlink	cdecl	i32	int	path:const char*:str8:1
+api-ms-win-crt-filesystem-l1-1-0.dll	_wremove	cdecl	i32	int	path:const wchar_t*:str16:1
+api-ms-win-crt-filesystem-l1-1-0.dll	_wrename	cdecl	i32	int	source:const wchar_t*:str16:1|target:const wchar_t*:str16:1
+api-ms-win-crt-filesystem-l1-1-0.dll	_wunlink	cdecl	i32	int	path:const wchar_t*:str16:1
+api-ms-win-crt-filesystem-l1-1-0.dll	remove	cdecl	i32	int	path:const char*:str8:1
+api-ms-win-crt-filesystem-l1-1-0.dll	rename	cdecl	i32	int	source:const char*:str8:1|target:const char*:str8:1
 api-ms-win-crt-heap-l1-1-0.dll	_aligned_free	cdecl	void	void	block:void*:ptr:1
 api-ms-win-crt-heap-l1-1-0.dll	_aligned_malloc	cdecl	ptr	void*	size:size_t:u32:1|alignment:size_t:u32:1
 api-ms-win-crt-heap-l1-1-0.dll	_aligned_msize	cdecl	u32	size_t	block:void*:ptr:1|alignment:size_t:u32:1|offset:size_t:u32:1
@@ -4677,6 +4683,7 @@ msvcr100.dll	_atoi64	cdecl	i64	__int64	text:const char*:str8:1
 msvcr100.dll	_c_exit	cdecl	void	void	
 msvcr100.dll	_cexit	cdecl	void	void	
 msvcr100.dll	_crt_debugger_hook	cdecl	void	void	reserved:int:i32:1
+msvcr100.dll	_dosmaperr	cdecl	void	void	code:unsigned long:u32:1
 msvcr100.dll	_errno	cdecl	ptr	int*	
 msvcr100.dll	_except_handler2	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 msvcr100.dll	_except_handler3	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
@@ -4764,6 +4771,7 @@ msvcr100.dll	_ultoa	cdecl	ptr	char*	value:unsigned long:u32:1|buffer:char*:ptr:1
 msvcr100.dll	_ultoa_s	cdecl	i32	errno_t	value:unsigned long:u32:1|buffer:char*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
 msvcr100.dll	_ultow	cdecl	ptr	wchar_t*	value:unsigned long:u32:1|buffer:wchar_t*:ptr:1|radix:int:i32:1
 msvcr100.dll	_ultow_s	cdecl	i32	errno_t	value:unsigned long:u32:1|buffer:wchar_t*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcr100.dll	_unlink	cdecl	i32	int	path:const char*:str8:1
 msvcr100.dll	_wcmdln	data	ptr	wchar_t*	
 msvcr100.dll	_wcsnset	cdecl	ptr	wchar_t*	destination:wchar_t*:ptr:1|value:wchar_t:u32:1|count:size_t:u32:1
 msvcr100.dll	_wcsnset_s	cdecl	i32	errno_t	destination:wchar_t*:ptr:1|capacity:size_t:u32:1|value:wchar_t:u32:1|count:size_t:u32:1
@@ -4781,6 +4789,8 @@ msvcr100.dll	_wexecve	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:c
 msvcr100.dll	_wexecvp	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1
 msvcr100.dll	_wexecvpe	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1|environment:const wchar_t* const*:ptr:1
 msvcr100.dll	_wpopen	cdecl	ptr	FILE*	command:const wchar_t*:str16:1|mode:const wchar_t*:str16:1
+msvcr100.dll	_wremove	cdecl	i32	int	path:const wchar_t*:str16:1
+msvcr100.dll	_wrename	cdecl	i32	int	source:const wchar_t*:str16:1|target:const wchar_t*:str16:1
 msvcr100.dll	_wspawnl	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
 msvcr100.dll	_wspawnle	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
 msvcr100.dll	_wspawnlp	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
@@ -4793,6 +4803,7 @@ msvcr100.dll	_wsystem	cdecl	i32	int	command:const wchar_t*:str16:1
 msvcr100.dll	_wtoi	cdecl	i32	int	text:const wchar_t*:str16:1
 msvcr100.dll	_wtoi64	cdecl	i64	__int64	text:const wchar_t*:str16:1
 msvcr100.dll	_wtol	cdecl	i32	long	text:const wchar_t*:str16:1
+msvcr100.dll	_wunlink	cdecl	i32	int	path:const wchar_t*:str16:1
 msvcr100.dll	abort	cdecl	void	void	
 msvcr100.dll	atexit	cdecl	i32	int	callback:_PVFV:ptr:1
 msvcr100.dll	atoi	cdecl	i32	int	text:const char*:str8:1
@@ -4804,6 +4815,8 @@ msvcr100.dll	longjmp	cdecl	void	void	buffer:jmp_buf:ptr:1|value:int:i32:1
 msvcr100.dll	malloc	cdecl	ptr	void*	size:size_t:u32:1
 msvcr100.dll	raise	cdecl	i32	int	number:int:i32:1
 msvcr100.dll	realloc	cdecl	ptr	void*	pointer:void*:ptr:1|size:size_t:u32:1
+msvcr100.dll	remove	cdecl	i32	int	path:const char*:str8:1
+msvcr100.dll	rename	cdecl	i32	int	source:const char*:str8:1|target:const char*:str8:1
 msvcr100.dll	signal	cdecl	ptr	_crt_signal_t	number:int:i32:1|action:_crt_signal_t:ptr:1
 msvcr100.dll	strcat	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1
 msvcr100.dll	strchr	cdecl	ptr	char*	text:const char*:str8:1|value:int:i32:1
@@ -4875,6 +4888,7 @@ msvcr110.dll	_atoi64	cdecl	i64	__int64	text:const char*:str8:1
 msvcr110.dll	_c_exit	cdecl	void	void	
 msvcr110.dll	_cexit	cdecl	void	void	
 msvcr110.dll	_crt_debugger_hook	cdecl	void	void	reserved:int:i32:1
+msvcr110.dll	_dosmaperr	cdecl	void	void	code:unsigned long:u32:1
 msvcr110.dll	_errno	cdecl	ptr	int*	
 msvcr110.dll	_except_handler2	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 msvcr110.dll	_except_handler3	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
@@ -4962,6 +4976,7 @@ msvcr110.dll	_ultoa	cdecl	ptr	char*	value:unsigned long:u32:1|buffer:char*:ptr:1
 msvcr110.dll	_ultoa_s	cdecl	i32	errno_t	value:unsigned long:u32:1|buffer:char*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
 msvcr110.dll	_ultow	cdecl	ptr	wchar_t*	value:unsigned long:u32:1|buffer:wchar_t*:ptr:1|radix:int:i32:1
 msvcr110.dll	_ultow_s	cdecl	i32	errno_t	value:unsigned long:u32:1|buffer:wchar_t*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcr110.dll	_unlink	cdecl	i32	int	path:const char*:str8:1
 msvcr110.dll	_wcmdln	data	ptr	wchar_t*	
 msvcr110.dll	_wcsnset	cdecl	ptr	wchar_t*	destination:wchar_t*:ptr:1|value:wchar_t:u32:1|count:size_t:u32:1
 msvcr110.dll	_wcsnset_s	cdecl	i32	errno_t	destination:wchar_t*:ptr:1|capacity:size_t:u32:1|value:wchar_t:u32:1|count:size_t:u32:1
@@ -4979,6 +4994,8 @@ msvcr110.dll	_wexecve	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:c
 msvcr110.dll	_wexecvp	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1
 msvcr110.dll	_wexecvpe	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1|environment:const wchar_t* const*:ptr:1
 msvcr110.dll	_wpopen	cdecl	ptr	FILE*	command:const wchar_t*:str16:1|mode:const wchar_t*:str16:1
+msvcr110.dll	_wremove	cdecl	i32	int	path:const wchar_t*:str16:1
+msvcr110.dll	_wrename	cdecl	i32	int	source:const wchar_t*:str16:1|target:const wchar_t*:str16:1
 msvcr110.dll	_wspawnl	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
 msvcr110.dll	_wspawnle	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
 msvcr110.dll	_wspawnlp	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
@@ -4991,6 +5008,7 @@ msvcr110.dll	_wsystem	cdecl	i32	int	command:const wchar_t*:str16:1
 msvcr110.dll	_wtoi	cdecl	i32	int	text:const wchar_t*:str16:1
 msvcr110.dll	_wtoi64	cdecl	i64	__int64	text:const wchar_t*:str16:1
 msvcr110.dll	_wtol	cdecl	i32	long	text:const wchar_t*:str16:1
+msvcr110.dll	_wunlink	cdecl	i32	int	path:const wchar_t*:str16:1
 msvcr110.dll	abort	cdecl	void	void	
 msvcr110.dll	atexit	cdecl	i32	int	callback:_PVFV:ptr:1
 msvcr110.dll	atoi	cdecl	i32	int	text:const char*:str8:1
@@ -5002,6 +5020,8 @@ msvcr110.dll	longjmp	cdecl	void	void	buffer:jmp_buf:ptr:1|value:int:i32:1
 msvcr110.dll	malloc	cdecl	ptr	void*	size:size_t:u32:1
 msvcr110.dll	raise	cdecl	i32	int	number:int:i32:1
 msvcr110.dll	realloc	cdecl	ptr	void*	pointer:void*:ptr:1|size:size_t:u32:1
+msvcr110.dll	remove	cdecl	i32	int	path:const char*:str8:1
+msvcr110.dll	rename	cdecl	i32	int	source:const char*:str8:1|target:const char*:str8:1
 msvcr110.dll	signal	cdecl	ptr	_crt_signal_t	number:int:i32:1|action:_crt_signal_t:ptr:1
 msvcr110.dll	strcat	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1
 msvcr110.dll	strchr	cdecl	ptr	char*	text:const char*:str8:1|value:int:i32:1
@@ -5073,6 +5093,7 @@ msvcr120.dll	_atoi64	cdecl	i64	__int64	text:const char*:str8:1
 msvcr120.dll	_c_exit	cdecl	void	void	
 msvcr120.dll	_cexit	cdecl	void	void	
 msvcr120.dll	_crt_debugger_hook	cdecl	void	void	reserved:int:i32:1
+msvcr120.dll	_dosmaperr	cdecl	void	void	code:unsigned long:u32:1
 msvcr120.dll	_errno	cdecl	ptr	int*	
 msvcr120.dll	_except_handler2	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 msvcr120.dll	_except_handler3	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
@@ -5160,6 +5181,7 @@ msvcr120.dll	_ultoa	cdecl	ptr	char*	value:unsigned long:u32:1|buffer:char*:ptr:1
 msvcr120.dll	_ultoa_s	cdecl	i32	errno_t	value:unsigned long:u32:1|buffer:char*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
 msvcr120.dll	_ultow	cdecl	ptr	wchar_t*	value:unsigned long:u32:1|buffer:wchar_t*:ptr:1|radix:int:i32:1
 msvcr120.dll	_ultow_s	cdecl	i32	errno_t	value:unsigned long:u32:1|buffer:wchar_t*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcr120.dll	_unlink	cdecl	i32	int	path:const char*:str8:1
 msvcr120.dll	_wcmdln	data	ptr	wchar_t*	
 msvcr120.dll	_wcsnset	cdecl	ptr	wchar_t*	destination:wchar_t*:ptr:1|value:wchar_t:u32:1|count:size_t:u32:1
 msvcr120.dll	_wcsnset_s	cdecl	i32	errno_t	destination:wchar_t*:ptr:1|capacity:size_t:u32:1|value:wchar_t:u32:1|count:size_t:u32:1
@@ -5177,6 +5199,8 @@ msvcr120.dll	_wexecve	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:c
 msvcr120.dll	_wexecvp	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1
 msvcr120.dll	_wexecvpe	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1|environment:const wchar_t* const*:ptr:1
 msvcr120.dll	_wpopen	cdecl	ptr	FILE*	command:const wchar_t*:str16:1|mode:const wchar_t*:str16:1
+msvcr120.dll	_wremove	cdecl	i32	int	path:const wchar_t*:str16:1
+msvcr120.dll	_wrename	cdecl	i32	int	source:const wchar_t*:str16:1|target:const wchar_t*:str16:1
 msvcr120.dll	_wspawnl	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
 msvcr120.dll	_wspawnle	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
 msvcr120.dll	_wspawnlp	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
@@ -5190,6 +5214,7 @@ msvcr120.dll	_wtoi	cdecl	i32	int	text:const wchar_t*:str16:1
 msvcr120.dll	_wtoi64	cdecl	i64	__int64	text:const wchar_t*:str16:1
 msvcr120.dll	_wtol	cdecl	i32	long	text:const wchar_t*:str16:1
 msvcr120.dll	_wtoll	cdecl	i64	long long	text:const wchar_t*:str16:1
+msvcr120.dll	_wunlink	cdecl	i32	int	path:const wchar_t*:str16:1
 msvcr120.dll	abort	cdecl	void	void	
 msvcr120.dll	atexit	cdecl	i32	int	callback:_PVFV:ptr:1
 msvcr120.dll	atoi	cdecl	i32	int	text:const char*:str8:1
@@ -5202,6 +5227,8 @@ msvcr120.dll	longjmp	cdecl	void	void	buffer:jmp_buf:ptr:1|value:int:i32:1
 msvcr120.dll	malloc	cdecl	ptr	void*	size:size_t:u32:1
 msvcr120.dll	raise	cdecl	i32	int	number:int:i32:1
 msvcr120.dll	realloc	cdecl	ptr	void*	pointer:void*:ptr:1|size:size_t:u32:1
+msvcr120.dll	remove	cdecl	i32	int	path:const char*:str8:1
+msvcr120.dll	rename	cdecl	i32	int	source:const char*:str8:1|target:const char*:str8:1
 msvcr120.dll	signal	cdecl	ptr	_crt_signal_t	number:int:i32:1|action:_crt_signal_t:ptr:1
 msvcr120.dll	strcat	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1
 msvcr120.dll	strchr	cdecl	ptr	char*	text:const char*:str8:1|value:int:i32:1
@@ -5329,6 +5356,7 @@ msvcr70.dll	_ui64toa	cdecl	ptr	char*	value:unsigned __int64:u64:2|buffer:char*:p
 msvcr70.dll	_ui64tow	cdecl	ptr	wchar_t*	value:unsigned __int64:u64:2|buffer:wchar_t*:ptr:1|radix:int:i32:1
 msvcr70.dll	_ultoa	cdecl	ptr	char*	value:unsigned long:u32:1|buffer:char*:ptr:1|radix:int:i32:1
 msvcr70.dll	_ultow	cdecl	ptr	wchar_t*	value:unsigned long:u32:1|buffer:wchar_t*:ptr:1|radix:int:i32:1
+msvcr70.dll	_unlink	cdecl	i32	int	path:const char*:str8:1
 msvcr70.dll	_wcmdln	data	ptr	wchar_t*	
 msvcr70.dll	_wcsnset	cdecl	ptr	wchar_t*	destination:wchar_t*:ptr:1|value:wchar_t:u32:1|count:size_t:u32:1
 msvcr70.dll	_wcsrev	cdecl	ptr	wchar_t*	destination:wchar_t*:ptr:1
@@ -5344,6 +5372,8 @@ msvcr70.dll	_wexecve	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:co
 msvcr70.dll	_wexecvp	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1
 msvcr70.dll	_wexecvpe	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1|environment:const wchar_t* const*:ptr:1
 msvcr70.dll	_wpopen	cdecl	ptr	FILE*	command:const wchar_t*:str16:1|mode:const wchar_t*:str16:1
+msvcr70.dll	_wremove	cdecl	i32	int	path:const wchar_t*:str16:1
+msvcr70.dll	_wrename	cdecl	i32	int	source:const wchar_t*:str16:1|target:const wchar_t*:str16:1
 msvcr70.dll	_wspawnl	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
 msvcr70.dll	_wspawnle	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
 msvcr70.dll	_wspawnlp	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
@@ -5356,6 +5386,7 @@ msvcr70.dll	_wsystem	cdecl	i32	int	command:const wchar_t*:str16:1
 msvcr70.dll	_wtoi	cdecl	i32	int	text:const wchar_t*:str16:1
 msvcr70.dll	_wtoi64	cdecl	i64	__int64	text:const wchar_t*:str16:1
 msvcr70.dll	_wtol	cdecl	i32	long	text:const wchar_t*:str16:1
+msvcr70.dll	_wunlink	cdecl	i32	int	path:const wchar_t*:str16:1
 msvcr70.dll	abort	cdecl	void	void	
 msvcr70.dll	atexit	cdecl	i32	int	callback:_PVFV:ptr:1
 msvcr70.dll	atoi	cdecl	i32	int	text:const char*:str8:1
@@ -5367,6 +5398,8 @@ msvcr70.dll	longjmp	cdecl	void	void	buffer:jmp_buf:ptr:1|value:int:i32:1
 msvcr70.dll	malloc	cdecl	ptr	void*	size:size_t:u32:1
 msvcr70.dll	raise	cdecl	i32	int	number:int:i32:1
 msvcr70.dll	realloc	cdecl	ptr	void*	pointer:void*:ptr:1|size:size_t:u32:1
+msvcr70.dll	remove	cdecl	i32	int	path:const char*:str8:1
+msvcr70.dll	rename	cdecl	i32	int	source:const char*:str8:1|target:const char*:str8:1
 msvcr70.dll	signal	cdecl	ptr	_crt_signal_t	number:int:i32:1|action:_crt_signal_t:ptr:1
 msvcr70.dll	strcat	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1
 msvcr70.dll	strchr	cdecl	ptr	char*	text:const char*:str8:1|value:int:i32:1
@@ -5490,6 +5523,7 @@ msvcr71.dll	_ui64toa	cdecl	ptr	char*	value:unsigned __int64:u64:2|buffer:char*:p
 msvcr71.dll	_ui64tow	cdecl	ptr	wchar_t*	value:unsigned __int64:u64:2|buffer:wchar_t*:ptr:1|radix:int:i32:1
 msvcr71.dll	_ultoa	cdecl	ptr	char*	value:unsigned long:u32:1|buffer:char*:ptr:1|radix:int:i32:1
 msvcr71.dll	_ultow	cdecl	ptr	wchar_t*	value:unsigned long:u32:1|buffer:wchar_t*:ptr:1|radix:int:i32:1
+msvcr71.dll	_unlink	cdecl	i32	int	path:const char*:str8:1
 msvcr71.dll	_wcmdln	data	ptr	wchar_t*	
 msvcr71.dll	_wcsnset	cdecl	ptr	wchar_t*	destination:wchar_t*:ptr:1|value:wchar_t:u32:1|count:size_t:u32:1
 msvcr71.dll	_wcsrev	cdecl	ptr	wchar_t*	destination:wchar_t*:ptr:1
@@ -5505,6 +5539,8 @@ msvcr71.dll	_wexecve	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:co
 msvcr71.dll	_wexecvp	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1
 msvcr71.dll	_wexecvpe	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1|environment:const wchar_t* const*:ptr:1
 msvcr71.dll	_wpopen	cdecl	ptr	FILE*	command:const wchar_t*:str16:1|mode:const wchar_t*:str16:1
+msvcr71.dll	_wremove	cdecl	i32	int	path:const wchar_t*:str16:1
+msvcr71.dll	_wrename	cdecl	i32	int	source:const wchar_t*:str16:1|target:const wchar_t*:str16:1
 msvcr71.dll	_wspawnl	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
 msvcr71.dll	_wspawnle	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
 msvcr71.dll	_wspawnlp	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
@@ -5517,6 +5553,7 @@ msvcr71.dll	_wsystem	cdecl	i32	int	command:const wchar_t*:str16:1
 msvcr71.dll	_wtoi	cdecl	i32	int	text:const wchar_t*:str16:1
 msvcr71.dll	_wtoi64	cdecl	i64	__int64	text:const wchar_t*:str16:1
 msvcr71.dll	_wtol	cdecl	i32	long	text:const wchar_t*:str16:1
+msvcr71.dll	_wunlink	cdecl	i32	int	path:const wchar_t*:str16:1
 msvcr71.dll	abort	cdecl	void	void	
 msvcr71.dll	atexit	cdecl	i32	int	callback:_PVFV:ptr:1
 msvcr71.dll	atoi	cdecl	i32	int	text:const char*:str8:1
@@ -5528,6 +5565,8 @@ msvcr71.dll	longjmp	cdecl	void	void	buffer:jmp_buf:ptr:1|value:int:i32:1
 msvcr71.dll	malloc	cdecl	ptr	void*	size:size_t:u32:1
 msvcr71.dll	raise	cdecl	i32	int	number:int:i32:1
 msvcr71.dll	realloc	cdecl	ptr	void*	pointer:void*:ptr:1|size:size_t:u32:1
+msvcr71.dll	remove	cdecl	i32	int	path:const char*:str8:1
+msvcr71.dll	rename	cdecl	i32	int	source:const char*:str8:1|target:const char*:str8:1
 msvcr71.dll	signal	cdecl	ptr	_crt_signal_t	number:int:i32:1|action:_crt_signal_t:ptr:1
 msvcr71.dll	strcat	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1
 msvcr71.dll	strchr	cdecl	ptr	char*	text:const char*:str8:1|value:int:i32:1
@@ -5617,6 +5656,7 @@ msvcr80.dll	_controlfp	cdecl	u32	u32	newControl:u32:u32:1|mask:u32:u32:1
 msvcr80.dll	_controlfp_s	cdecl	i32	i32	currentControl:u32*:ptr:1|newControl:u32:u32:1|mask:u32:u32:1
 msvcr80.dll	_crt_debugger_hook	cdecl	void	void	reserved:int:i32:1
 msvcr80.dll	_difftime64	cdecl	f64	double	end:__time64_t:u64:2|begin:__time64_t:u64:2
+msvcr80.dll	_dosmaperr	cdecl	void	void	code:unsigned long:u32:1
 msvcr80.dll	_endthreadex	cdecl	void	void	returnCode:unsigned int:u32:1
 msvcr80.dll	_errno	cdecl	ptr	i32*	
 msvcr80.dll	_except_handler2	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
@@ -5717,6 +5757,7 @@ msvcr80.dll	_ultoa	cdecl	ptr	char*	value:unsigned long:u32:1|buffer:char*:ptr:1|
 msvcr80.dll	_ultoa_s	cdecl	i32	errno_t	value:unsigned long:u32:1|buffer:char*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
 msvcr80.dll	_ultow	cdecl	ptr	wchar_t*	value:unsigned long:u32:1|buffer:wchar_t*:ptr:1|radix:int:i32:1
 msvcr80.dll	_ultow_s	cdecl	i32	errno_t	value:unsigned long:u32:1|buffer:wchar_t*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcr80.dll	_unlink	cdecl	i32	int	path:const char*:str8:1
 msvcr80.dll	_vscprintf	cdecl	i32	int	format:const char*:str8:1|arguments:va_list:ptr:1
 msvcr80.dll	_vscwprintf	cdecl	i32	int	format:const wchar_t*:str16:1|arguments:va_list:ptr:1
 msvcr80.dll	_vsnprintf_s	cdecl	i32	int	buffer:char*:str8:1|capacity:size_t:u32:1|count:size_t:u32:1|format:const char*:str8:1|arguments:va_list:ptr:1
@@ -5742,6 +5783,8 @@ msvcr80.dll	_wfindnext64i32	cdecl	i32	int	handle:intptr_t:i32:1|data:struct _wfi
 msvcr80.dll	_wfsopen	cdecl	ptr	FILE*	filename:const wchar_t*:str16:1|mode:const wchar_t*:str16:1|share:int:i32:1
 msvcr80.dll	_wmkdir	cdecl	i32	int	path:const wchar_t*:str16:1
 msvcr80.dll	_wpopen	cdecl	ptr	FILE*	command:const wchar_t*:str16:1|mode:const wchar_t*:str16:1
+msvcr80.dll	_wremove	cdecl	i32	int	path:const wchar_t*:str16:1
+msvcr80.dll	_wrename	cdecl	i32	int	source:const wchar_t*:str16:1|target:const wchar_t*:str16:1
 msvcr80.dll	_wspawnl	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
 msvcr80.dll	_wspawnle	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
 msvcr80.dll	_wspawnlp	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
@@ -5755,6 +5798,7 @@ msvcr80.dll	_wsystem	cdecl	i32	int	command:const wchar_t*:str16:1
 msvcr80.dll	_wtoi	cdecl	i32	int	text:const wchar_t*:str16:1
 msvcr80.dll	_wtoi64	cdecl	i64	__int64	text:const wchar_t*:str16:1
 msvcr80.dll	_wtol	cdecl	i32	long	text:const wchar_t*:str16:1
+msvcr80.dll	_wunlink	cdecl	i32	int	path:const wchar_t*:str16:1
 msvcr80.dll	abort	cdecl	void	void	
 msvcr80.dll	atexit	cdecl	i32	i32	function:callback:ptr:1
 msvcr80.dll	atoi	cdecl	i32	int	text:const char*:str8:1
@@ -5792,6 +5836,8 @@ msvcr80.dll	qsort	cdecl	void	void	base:void*:ptr:1|number:size_t:u32:1|width:siz
 msvcr80.dll	raise	cdecl	i32	int	number:int:i32:1
 msvcr80.dll	rand	cdecl	i32	int	
 msvcr80.dll	realloc	cdecl	ptr	void*	pointer:void*:ptr:1|size:size_t:u32:1
+msvcr80.dll	remove	cdecl	i32	int	path:const char*:str8:1
+msvcr80.dll	rename	cdecl	i32	int	source:const char*:str8:1|target:const char*:str8:1
 msvcr80.dll	setlocale	cdecl	ptr	char*	category:int:i32:1|locale:const char*:str8:1
 msvcr80.dll	signal	cdecl	ptr	_crt_signal_t	number:int:i32:1|action:_crt_signal_t:ptr:1
 msvcr80.dll	sprintf	variadic	i32	int	buffer:char*:str8:1|format:const char*:str8:1
@@ -5898,6 +5944,7 @@ msvcr90.dll	_controlfp	cdecl	u32	u32	newControl:u32:u32:1|mask:u32:u32:1
 msvcr90.dll	_controlfp_s	cdecl	i32	i32	currentControl:u32*:ptr:1|newControl:u32:u32:1|mask:u32:u32:1
 msvcr90.dll	_crt_debugger_hook	cdecl	void	void	reserved:int:i32:1
 msvcr90.dll	_difftime64	cdecl	f64	double	end:__time64_t:u64:2|begin:__time64_t:u64:2
+msvcr90.dll	_dosmaperr	cdecl	void	void	code:unsigned long:u32:1
 msvcr90.dll	_endthreadex	cdecl	void	void	returnCode:unsigned int:u32:1
 msvcr90.dll	_errno	cdecl	ptr	i32*	
 msvcr90.dll	_except_handler2	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
@@ -5998,6 +6045,7 @@ msvcr90.dll	_ultoa	cdecl	ptr	char*	value:unsigned long:u32:1|buffer:char*:ptr:1|
 msvcr90.dll	_ultoa_s	cdecl	i32	errno_t	value:unsigned long:u32:1|buffer:char*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
 msvcr90.dll	_ultow	cdecl	ptr	wchar_t*	value:unsigned long:u32:1|buffer:wchar_t*:ptr:1|radix:int:i32:1
 msvcr90.dll	_ultow_s	cdecl	i32	errno_t	value:unsigned long:u32:1|buffer:wchar_t*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcr90.dll	_unlink	cdecl	i32	int	path:const char*:str8:1
 msvcr90.dll	_vscprintf	cdecl	i32	int	format:const char*:str8:1|arguments:va_list:ptr:1
 msvcr90.dll	_vscwprintf	cdecl	i32	int	format:const wchar_t*:str16:1|arguments:va_list:ptr:1
 msvcr90.dll	_vsnprintf_s	cdecl	i32	int	buffer:char*:str8:1|capacity:size_t:u32:1|count:size_t:u32:1|format:const char*:str8:1|arguments:va_list:ptr:1
@@ -6023,6 +6071,8 @@ msvcr90.dll	_wfindnext64i32	cdecl	i32	int	handle:intptr_t:i32:1|data:struct _wfi
 msvcr90.dll	_wfsopen	cdecl	ptr	FILE*	filename:const wchar_t*:str16:1|mode:const wchar_t*:str16:1|share:int:i32:1
 msvcr90.dll	_wmkdir	cdecl	i32	int	path:const wchar_t*:str16:1
 msvcr90.dll	_wpopen	cdecl	ptr	FILE*	command:const wchar_t*:str16:1|mode:const wchar_t*:str16:1
+msvcr90.dll	_wremove	cdecl	i32	int	path:const wchar_t*:str16:1
+msvcr90.dll	_wrename	cdecl	i32	int	source:const wchar_t*:str16:1|target:const wchar_t*:str16:1
 msvcr90.dll	_wspawnl	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
 msvcr90.dll	_wspawnle	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
 msvcr90.dll	_wspawnlp	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
@@ -6036,6 +6086,7 @@ msvcr90.dll	_wsystem	cdecl	i32	int	command:const wchar_t*:str16:1
 msvcr90.dll	_wtoi	cdecl	i32	int	text:const wchar_t*:str16:1
 msvcr90.dll	_wtoi64	cdecl	i64	__int64	text:const wchar_t*:str16:1
 msvcr90.dll	_wtol	cdecl	i32	long	text:const wchar_t*:str16:1
+msvcr90.dll	_wunlink	cdecl	i32	int	path:const wchar_t*:str16:1
 msvcr90.dll	abort	cdecl	void	void	
 msvcr90.dll	atexit	cdecl	i32	i32	function:callback:ptr:1
 msvcr90.dll	atoi	cdecl	i32	int	text:const char*:str8:1
@@ -6074,6 +6125,8 @@ msvcr90.dll	qsort	cdecl	void	void	base:void*:ptr:1|number:size_t:u32:1|width:siz
 msvcr90.dll	raise	cdecl	i32	int	number:int:i32:1
 msvcr90.dll	rand	cdecl	i32	int	
 msvcr90.dll	realloc	cdecl	ptr	void*	pointer:void*:ptr:1|size:size_t:u32:1
+msvcr90.dll	remove	cdecl	i32	int	path:const char*:str8:1
+msvcr90.dll	rename	cdecl	i32	int	source:const char*:str8:1|target:const char*:str8:1
 msvcr90.dll	setlocale	cdecl	ptr	char*	category:int:i32:1|locale:const char*:str8:1
 msvcr90.dll	signal	cdecl	ptr	_crt_signal_t	number:int:i32:1|action:_crt_signal_t:ptr:1
 msvcr90.dll	sprintf	variadic	i32	int	buffer:char*:str8:1|format:const char*:str8:1
@@ -6257,6 +6310,7 @@ msvcrt.dll	_ultoa	cdecl	ptr	char*	value:unsigned long:u32:1|buffer:char*:ptr:1|r
 msvcrt.dll	_ultoa_s	cdecl	i32	errno_t	value:unsigned long:u32:1|buffer:char*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
 msvcrt.dll	_ultow	cdecl	ptr	wchar_t*	value:unsigned long:u32:1|buffer:wchar_t*:ptr:1|radix:int:i32:1
 msvcrt.dll	_ultow_s	cdecl	i32	errno_t	value:unsigned long:u32:1|buffer:wchar_t*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+msvcrt.dll	_unlink	cdecl	i32	int	path:const char*:str8:1
 msvcrt.dll	_waccess	cdecl	i32	int	path:const wchar_t*:str16:1|mode:int:i32:1
 msvcrt.dll	_wcmdln	data	ptr	wchar_t*	
 msvcrt.dll	_wcsnset	cdecl	ptr	wchar_t*	destination:wchar_t*:ptr:1|value:wchar_t:u32:1|count:size_t:u32:1
@@ -6279,6 +6333,8 @@ msvcrt.dll	_wfindnext64i32	cdecl	i32	int	handle:intptr_t:i32:1|data:struct _wfin
 msvcrt.dll	_wfsopen	cdecl	ptr	FILE*	filename:const wchar_t*:str16:1|mode:const wchar_t*:str16:1|share:int:i32:1
 msvcrt.dll	_wmkdir	cdecl	i32	int	path:const wchar_t*:str16:1
 msvcrt.dll	_wpopen	cdecl	ptr	FILE*	command:const wchar_t*:str16:1|mode:const wchar_t*:str16:1
+msvcrt.dll	_wremove	cdecl	i32	int	path:const wchar_t*:str16:1
+msvcrt.dll	_wrename	cdecl	i32	int	source:const wchar_t*:str16:1|target:const wchar_t*:str16:1
 msvcrt.dll	_wspawnl	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
 msvcrt.dll	_wspawnle	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
 msvcrt.dll	_wspawnlp	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
@@ -6292,6 +6348,7 @@ msvcrt.dll	_wsystem	cdecl	i32	int	command:const wchar_t*:str16:1
 msvcrt.dll	_wtoi	cdecl	i32	int	text:const wchar_t*:str16:1
 msvcrt.dll	_wtoi64	cdecl	i64	__int64	text:const wchar_t*:str16:1
 msvcrt.dll	_wtol	cdecl	i32	long	text:const wchar_t*:str16:1
+msvcrt.dll	_wunlink	cdecl	i32	int	path:const wchar_t*:str16:1
 msvcrt.dll	abort	cdecl	void	void	
 msvcrt.dll	atexit	cdecl	i32	i32	function:callback:ptr:1
 msvcrt.dll	atoi	cdecl	i32	int	text:const char*:str8:1
@@ -6329,6 +6386,8 @@ msvcrt.dll	qsort	cdecl	void	void	base:void*:ptr:1|number:size_t:u32:1|width:size
 msvcrt.dll	raise	cdecl	i32	int	number:int:i32:1
 msvcrt.dll	rand	cdecl	i32	int	
 msvcrt.dll	realloc	cdecl	ptr	void*	pointer:void*:ptr:1|size:size_t:u32:1
+msvcrt.dll	remove	cdecl	i32	int	path:const char*:str8:1
+msvcrt.dll	rename	cdecl	i32	int	source:const char*:str8:1|target:const char*:str8:1
 msvcrt.dll	setlocale	cdecl	ptr	char*	category:int:i32:1|locale:const char*:str8:1
 msvcrt.dll	signal	cdecl	ptr	_crt_signal_t	number:int:i32:1|action:_crt_signal_t:ptr:1
 msvcrt.dll	sprintf	variadic	i32	int	buffer:char*:str8:1|format:const char*:str8:1
@@ -6442,6 +6501,7 @@ msvcrt20.dll	_strrev	cdecl	ptr	char*	destination:char*:ptr:1
 msvcrt20.dll	_strset	cdecl	ptr	char*	destination:char*:ptr:1|value:int:i32:1
 msvcrt20.dll	_ultoa	cdecl	ptr	char*	value:unsigned long:u32:1|buffer:char*:ptr:1|radix:int:i32:1
 msvcrt20.dll	_ultow	cdecl	ptr	wchar_t*	value:unsigned long:u32:1|buffer:wchar_t*:ptr:1|radix:int:i32:1
+msvcrt20.dll	_unlink	cdecl	i32	int	path:const char*:str8:1
 msvcrt20.dll	_wcmdln	data	ptr	wchar_t*	
 msvcrt20.dll	_wcsnset	cdecl	ptr	wchar_t*	destination:wchar_t*:ptr:1|value:wchar_t:u32:1|count:size_t:u32:1
 msvcrt20.dll	_wcsrev	cdecl	ptr	wchar_t*	destination:wchar_t*:ptr:1
@@ -6455,6 +6515,8 @@ msvcrt20.dll	_wexecve	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:c
 msvcrt20.dll	_wexecvp	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1
 msvcrt20.dll	_wexecvpe	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1|environment:const wchar_t* const*:ptr:1
 msvcrt20.dll	_wpopen	cdecl	ptr	FILE*	command:const wchar_t*:str16:1|mode:const wchar_t*:str16:1
+msvcrt20.dll	_wremove	cdecl	i32	int	path:const wchar_t*:str16:1
+msvcrt20.dll	_wrename	cdecl	i32	int	source:const wchar_t*:str16:1|target:const wchar_t*:str16:1
 msvcrt20.dll	_wspawnl	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
 msvcrt20.dll	_wspawnle	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
 msvcrt20.dll	_wspawnlp	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
@@ -6466,6 +6528,7 @@ msvcrt20.dll	_wspawnvpe	cdecl	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:st
 msvcrt20.dll	_wsystem	cdecl	i32	int	command:const wchar_t*:str16:1
 msvcrt20.dll	_wtoi	cdecl	i32	int	text:const wchar_t*:str16:1
 msvcrt20.dll	_wtol	cdecl	i32	long	text:const wchar_t*:str16:1
+msvcrt20.dll	_wunlink	cdecl	i32	int	path:const wchar_t*:str16:1
 msvcrt20.dll	abort	cdecl	void	void	
 msvcrt20.dll	atexit	cdecl	i32	int	callback:_PVFV:ptr:1
 msvcrt20.dll	atoi	cdecl	i32	int	text:const char*:str8:1
@@ -6477,6 +6540,8 @@ msvcrt20.dll	longjmp	cdecl	void	void	buffer:jmp_buf:ptr:1|value:int:i32:1
 msvcrt20.dll	malloc	cdecl	ptr	void*	size:size_t:u32:1
 msvcrt20.dll	raise	cdecl	i32	int	number:int:i32:1
 msvcrt20.dll	realloc	cdecl	ptr	void*	pointer:void*:ptr:1|size:size_t:u32:1
+msvcrt20.dll	remove	cdecl	i32	int	path:const char*:str8:1
+msvcrt20.dll	rename	cdecl	i32	int	source:const char*:str8:1|target:const char*:str8:1
 msvcrt20.dll	signal	cdecl	ptr	_crt_signal_t	number:int:i32:1|action:_crt_signal_t:ptr:1
 msvcrt20.dll	strcat	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1
 msvcrt20.dll	strchr	cdecl	ptr	char*	text:const char*:str8:1|value:int:i32:1
@@ -6584,6 +6649,7 @@ msvcrt40.dll	_strrev	cdecl	ptr	char*	destination:char*:ptr:1
 msvcrt40.dll	_strset	cdecl	ptr	char*	destination:char*:ptr:1|value:int:i32:1
 msvcrt40.dll	_ultoa	cdecl	ptr	char*	value:unsigned long:u32:1|buffer:char*:ptr:1|radix:int:i32:1
 msvcrt40.dll	_ultow	cdecl	ptr	wchar_t*	value:unsigned long:u32:1|buffer:wchar_t*:ptr:1|radix:int:i32:1
+msvcrt40.dll	_unlink	cdecl	i32	int	path:const char*:str8:1
 msvcrt40.dll	_wcmdln	data	ptr	wchar_t*	
 msvcrt40.dll	_wcsnset	cdecl	ptr	wchar_t*	destination:wchar_t*:ptr:1|value:wchar_t:u32:1|count:size_t:u32:1
 msvcrt40.dll	_wcsrev	cdecl	ptr	wchar_t*	destination:wchar_t*:ptr:1
@@ -6597,6 +6663,8 @@ msvcrt40.dll	_wexecve	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:c
 msvcrt40.dll	_wexecvp	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1
 msvcrt40.dll	_wexecvpe	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1|environment:const wchar_t* const*:ptr:1
 msvcrt40.dll	_wpopen	cdecl	ptr	FILE*	command:const wchar_t*:str16:1|mode:const wchar_t*:str16:1
+msvcrt40.dll	_wremove	cdecl	i32	int	path:const wchar_t*:str16:1
+msvcrt40.dll	_wrename	cdecl	i32	int	source:const wchar_t*:str16:1|target:const wchar_t*:str16:1
 msvcrt40.dll	_wspawnl	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
 msvcrt40.dll	_wspawnle	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
 msvcrt40.dll	_wspawnlp	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
@@ -6608,6 +6676,7 @@ msvcrt40.dll	_wspawnvpe	cdecl	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:st
 msvcrt40.dll	_wsystem	cdecl	i32	int	command:const wchar_t*:str16:1
 msvcrt40.dll	_wtoi	cdecl	i32	int	text:const wchar_t*:str16:1
 msvcrt40.dll	_wtol	cdecl	i32	long	text:const wchar_t*:str16:1
+msvcrt40.dll	_wunlink	cdecl	i32	int	path:const wchar_t*:str16:1
 msvcrt40.dll	abort	cdecl	void	void	
 msvcrt40.dll	atexit	cdecl	i32	int	callback:_PVFV:ptr:1
 msvcrt40.dll	atoi	cdecl	i32	int	text:const char*:str8:1
@@ -6619,6 +6688,8 @@ msvcrt40.dll	longjmp	cdecl	void	void	buffer:jmp_buf:ptr:1|value:int:i32:1
 msvcrt40.dll	malloc	cdecl	ptr	void*	size:size_t:u32:1
 msvcrt40.dll	raise	cdecl	i32	int	number:int:i32:1
 msvcrt40.dll	realloc	cdecl	ptr	void*	pointer:void*:ptr:1|size:size_t:u32:1
+msvcrt40.dll	remove	cdecl	i32	int	path:const char*:str8:1
+msvcrt40.dll	rename	cdecl	i32	int	source:const char*:str8:1|target:const char*:str8:1
 msvcrt40.dll	signal	cdecl	ptr	_crt_signal_t	number:int:i32:1|action:_crt_signal_t:ptr:1
 msvcrt40.dll	strcat	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1
 msvcrt40.dll	strchr	cdecl	ptr	char*	text:const char*:str8:1|value:int:i32:1
@@ -9554,10 +9625,16 @@ ucrtbase.dll	_o__get_terminate	cdecl	ptr	callback
 ucrtbase.dll	_o__purecall	cdecl	i32	int	
 ucrtbase.dll	_o__strnset_s	cdecl	i32	errno_t	destination:char*:ptr:1|capacity:size_t:u32:1|value:int:i32:1|count:size_t:u32:1
 ucrtbase.dll	_o__strset_s	cdecl	i32	errno_t	destination:char*:ptr:1|capacity:size_t:u32:1|value:int:i32:1
+ucrtbase.dll	_o__unlink	cdecl	i32	int	path:const char*:str8:1
 ucrtbase.dll	_o__wcsnset	cdecl	ptr	wchar_t*	destination:wchar_t*:ptr:1|value:wchar_t:u32:1|count:size_t:u32:1
 ucrtbase.dll	_o__wcsnset_s	cdecl	i32	errno_t	destination:wchar_t*:ptr:1|capacity:size_t:u32:1|value:wchar_t:u32:1|count:size_t:u32:1
 ucrtbase.dll	_o__wcsset	cdecl	ptr	wchar_t*	destination:wchar_t*:ptr:1|value:wchar_t:u32:1
 ucrtbase.dll	_o__wcsset_s	cdecl	i32	errno_t	destination:wchar_t*:ptr:1|capacity:size_t:u32:1|value:wchar_t:u32:1
+ucrtbase.dll	_o__wremove	cdecl	i32	int	path:const wchar_t*:str16:1
+ucrtbase.dll	_o__wrename	cdecl	i32	int	source:const wchar_t*:str16:1|target:const wchar_t*:str16:1
+ucrtbase.dll	_o__wunlink	cdecl	i32	int	path:const wchar_t*:str16:1
+ucrtbase.dll	_o_remove	cdecl	i32	int	path:const char*:str8:1
+ucrtbase.dll	_o_rename	cdecl	i32	int	source:const char*:str8:1|target:const char*:str8:1
 ucrtbase.dll	_o_set_terminate	cdecl	ptr	callback	handler:callback:ptr:1
 ucrtbase.dll	_o_terminate	cdecl	void	void	
 ucrtbase.dll	_pclose	cdecl	i32	int	stream:FILE*:ptr:1
@@ -9597,6 +9674,7 @@ ucrtbase.dll	_ultoa	cdecl	ptr	char*	value:unsigned long:u32:1|buffer:char*:ptr:1
 ucrtbase.dll	_ultoa_s	cdecl	i32	errno_t	value:unsigned long:u32:1|buffer:char*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
 ucrtbase.dll	_ultow	cdecl	ptr	wchar_t*	value:unsigned long:u32:1|buffer:wchar_t*:ptr:1|radix:int:i32:1
 ucrtbase.dll	_ultow_s	cdecl	i32	errno_t	value:unsigned long:u32:1|buffer:wchar_t*:ptr:1|capacity:size_t:u32:1|radix:int:i32:1
+ucrtbase.dll	_unlink	cdecl	i32	int	path:const char*:str8:1
 ucrtbase.dll	_wcsnset	cdecl	ptr	wchar_t*	destination:wchar_t*:ptr:1|value:wchar_t:u32:1|count:size_t:u32:1
 ucrtbase.dll	_wcsnset_s	cdecl	i32	errno_t	destination:wchar_t*:ptr:1|capacity:size_t:u32:1|value:wchar_t:u32:1|count:size_t:u32:1
 ucrtbase.dll	_wcsrev	cdecl	ptr	wchar_t*	destination:wchar_t*:ptr:1
@@ -9614,6 +9692,8 @@ ucrtbase.dll	_wexecvp	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:c
 ucrtbase.dll	_wexecvpe	cdecl	i32	intptr_t	path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1|environment:const wchar_t* const*:ptr:1
 ucrtbase.dll	_wfopen_s	cdecl	i32	errno_t	output:FILE**:ptr:1|filename:const wchar_t*:str16:1|mode:const wchar_t*:str16:1
 ucrtbase.dll	_wpopen	cdecl	ptr	FILE*	command:const wchar_t*:str16:1|mode:const wchar_t*:str16:1
+ucrtbase.dll	_wremove	cdecl	i32	int	path:const wchar_t*:str16:1
+ucrtbase.dll	_wrename	cdecl	i32	int	source:const wchar_t*:str16:1|target:const wchar_t*:str16:1
 ucrtbase.dll	_wspawnl	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
 ucrtbase.dll	_wspawnle	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
 ucrtbase.dll	_wspawnlp	variadic	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arg0:const wchar_t*:str16:1
@@ -9627,6 +9707,7 @@ ucrtbase.dll	_wtoi	cdecl	i32	int	text:const wchar_t*:str16:1
 ucrtbase.dll	_wtoi64	cdecl	i64	__int64	text:const wchar_t*:str16:1
 ucrtbase.dll	_wtol	cdecl	i32	long	text:const wchar_t*:str16:1
 ucrtbase.dll	_wtoll	cdecl	i64	long long	text:const wchar_t*:str16:1
+ucrtbase.dll	_wunlink	cdecl	i32	int	path:const wchar_t*:str16:1
 ucrtbase.dll	abort	cdecl	void	void	
 ucrtbase.dll	atoi	cdecl	i32	int	text:const char*:str8:1
 ucrtbase.dll	atol	cdecl	i32	long	text:const char*:str8:1
@@ -9646,6 +9727,8 @@ ucrtbase.dll	memmove_s	cdecl	i32	errno_t	destination:void*:ptr:1|capacity:size_t
 ucrtbase.dll	quick_exit	cdecl	void	void	status:int:i32:1
 ucrtbase.dll	raise	cdecl	i32	int	number:int:i32:1
 ucrtbase.dll	realloc	cdecl	ptr	void*	block:void*:ptr:1|size:size_t:u32:1
+ucrtbase.dll	remove	cdecl	i32	int	path:const char*:str8:1
+ucrtbase.dll	rename	cdecl	i32	int	source:const char*:str8:1|target:const char*:str8:1
 ucrtbase.dll	set_terminate	cdecl	ptr	callback	handler:callback:ptr:1
 ucrtbase.dll	set_unexpected	cdecl	ptr	callback	handler:callback:ptr:1
 ucrtbase.dll	signal	cdecl	ptr	_crt_signal_t	number:int:i32:1|action:_crt_signal_t:ptr:1

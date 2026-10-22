@@ -55,17 +55,6 @@ fn fail(env: &mut Env<'_>, errno: GuestPtr<i32>, value: i32, dos: u32) -> Outcom
     crate::util::set_last_error(env, dos);
     Outcome::Return(u32::MAX)
 }
-fn dos_errno(code: u32) -> i32 {
-    match code {
-        2 | 3 | 15 | 18 | 123 | 206 => 2, // ENOENT
-        5 | 16 | 32 | 33 | 65 => 13,      // EACCES
-        8 | 14 => 12,                     // ENOMEM
-        80 | 183 => 17,                   // EEXIST
-        112 => 28,                        // ENOSPC
-        267 => 20,                        // ENOTDIR
-        _ => 22,                          // EINVAL
-    }
-}
 fn directory(env: &mut Env<'_>, pointer: u32, wide: bool, removing: bool) -> Outcome {
     let errno = match errno_pair(env) {
         Ok(errno) => errno,
@@ -118,7 +107,7 @@ fn directory(env: &mut Env<'_>, pointer: u32, wide: bool, removing: bool) -> Out
                 let code = if removing && matches!(dos, 145 | 267) {
                     if dos == 145 { 41 } else { 22 }
                 } else {
-                    dos_errno(dos)
+                    errors::dos_errno(dos)
                 };
                 fail(env, errno, code, dos)
             }

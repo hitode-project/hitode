@@ -12,6 +12,9 @@ pub(super) struct Profile {
     pub multibyte_utf8: bool,
     pub zero_alignment: bool,
     pub signal_validation: bool,
+    pub rename_copy_allowed: bool,
+    pub unicode_file_paths: bool,
+    pub zero_file_error_success: bool,
 }
 
 pub(super) const PROFILES: &[Profile] = &[
@@ -21,6 +24,9 @@ pub(super) const PROFILES: &[Profile] = &[
         multibyte_utf8: false,
         zero_alignment: false,
         signal_validation: true,
+        rename_copy_allowed: false,
+        unicode_file_paths: false,
+        zero_file_error_success: true,
     },
     Profile {
         module: "msvcrt40.dll",
@@ -28,6 +34,9 @@ pub(super) const PROFILES: &[Profile] = &[
         multibyte_utf8: false,
         zero_alignment: false,
         signal_validation: true,
+        rename_copy_allowed: false,
+        unicode_file_paths: false,
+        zero_file_error_success: true,
     },
     Profile {
         module: "msvcrt.dll",
@@ -35,6 +44,9 @@ pub(super) const PROFILES: &[Profile] = &[
         multibyte_utf8: false,
         zero_alignment: false,
         signal_validation: true,
+        rename_copy_allowed: false,
+        unicode_file_paths: false,
+        zero_file_error_success: true,
     },
     Profile {
         module: "msvcr70.dll",
@@ -42,6 +54,9 @@ pub(super) const PROFILES: &[Profile] = &[
         multibyte_utf8: false,
         zero_alignment: false,
         signal_validation: true,
+        rename_copy_allowed: false,
+        unicode_file_paths: false,
+        zero_file_error_success: true,
     },
     Profile {
         module: "msvcr71.dll",
@@ -49,6 +64,9 @@ pub(super) const PROFILES: &[Profile] = &[
         multibyte_utf8: false,
         zero_alignment: false,
         signal_validation: true,
+        rename_copy_allowed: false,
+        unicode_file_paths: false,
+        zero_file_error_success: true,
     },
     Profile {
         module: "msvcr80.dll",
@@ -56,6 +74,9 @@ pub(super) const PROFILES: &[Profile] = &[
         multibyte_utf8: false,
         zero_alignment: true,
         signal_validation: true,
+        rename_copy_allowed: false,
+        unicode_file_paths: false,
+        zero_file_error_success: true,
     },
     Profile {
         module: "msvcr90.dll",
@@ -63,6 +84,9 @@ pub(super) const PROFILES: &[Profile] = &[
         multibyte_utf8: false,
         zero_alignment: true,
         signal_validation: true,
+        rename_copy_allowed: false,
+        unicode_file_paths: false,
+        zero_file_error_success: true,
     },
     Profile {
         module: "msvcr100.dll",
@@ -70,6 +94,9 @@ pub(super) const PROFILES: &[Profile] = &[
         multibyte_utf8: false,
         zero_alignment: false,
         signal_validation: true,
+        rename_copy_allowed: false,
+        unicode_file_paths: false,
+        zero_file_error_success: true,
     },
     Profile {
         module: "msvcr110.dll",
@@ -77,6 +104,9 @@ pub(super) const PROFILES: &[Profile] = &[
         multibyte_utf8: false,
         zero_alignment: false,
         signal_validation: true,
+        rename_copy_allowed: false,
+        unicode_file_paths: false,
+        zero_file_error_success: true,
     },
     Profile {
         module: "msvcr120.dll",
@@ -84,6 +114,9 @@ pub(super) const PROFILES: &[Profile] = &[
         multibyte_utf8: false,
         zero_alignment: false,
         signal_validation: true,
+        rename_copy_allowed: false,
+        unicode_file_paths: false,
+        zero_file_error_success: true,
     },
     Profile {
         module: "ucrtbase.dll",
@@ -91,6 +124,9 @@ pub(super) const PROFILES: &[Profile] = &[
         multibyte_utf8: true,
         zero_alignment: false,
         signal_validation: false,
+        rename_copy_allowed: true,
+        unicode_file_paths: true,
+        zero_file_error_success: false,
     },
     Profile {
         module: "vcruntime140.dll",
@@ -98,6 +134,9 @@ pub(super) const PROFILES: &[Profile] = &[
         multibyte_utf8: false,
         zero_alignment: false,
         signal_validation: true,
+        rename_copy_allowed: false,
+        unicode_file_paths: false,
+        zero_file_error_success: true,
     },
 ];
 

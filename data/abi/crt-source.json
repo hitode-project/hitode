@@ -764,5 +764,20 @@
     ],
     "behavior": "Byte/UTF-16 operations use raw code units and return the original destination. Secure forms incrementally replace at most capacity-1 units, validate the original remaining terminator even after count exhaustion or a zero replacement, then clear only the first unit and report EINVAL if the original string was unterminated. A bounded secure NULL/zero/zero request succeeds; other NULL/zero-capacity inputs validate before touching memory.",
     "native_evidence": "Pinned Microsoft VC90 byte/wide set routines establish access order, partial modification, EINVAL and the zero-count exception. Pinned UCRT _o_ wrappers establish identical outer x86 cdecl contracts and select the configured single-application global state. No machine code is copied and no native Windows execution is claimed."
+  },
+  "file_mutations": {
+    "headers": {
+      "stdio.h": "06cbab3a501306fdd9176a00a83e5bb92ea4d7863cfd666355743527cf99edc6",
+      "io.h": "fedd480bc429a85abb122962c158cbc5b2f117c3c0ca628db2934ca68f2ee1c1",
+      "corecrt_wio.h": "e6a08ad4c75ef96fd5fafcff334048c4cc610f990f39c15e07c03af14d607197",
+      "corecrt_wstdio.h": "a10bbf4667b3aada380a6b80df853f9fbddc3cc691ca57389b3b6759f119e515"
+    },
+    "documentation": [
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/remove-wremove",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/rename-wrename",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/unlink-wunlink"
+    ],
+    "native_evidence": "Pinned Microsoft VC90 remove/_unlink and wide aliases call DeleteFileA/W; rename calls MoveFileA/W. UCRT wide rename uses MoveFileExW with COPY_ALLOWED. Legacy wrappers test GetLastError itself after false; UCRT preserves failure even when a replacement provider leaves error zero. Native _dosmaperr is cdecl void(unsigned long), writes DOS errno then errno and preserves LastError; its 45-entry first-match table precedes the access-denied and executable-format fallback ranges. No native Windows execution is claimed. UCRT narrow paths convert using the filename code page before the wide call, preserve NULL arguments, and reject malformed multibyte sequences with DOS error 1113/EILSEQ. Its sorted table removes the duplicate handle row and adds this Unicode translation mapping. Narrow rename allocates/converts the source before inspecting the destination, with reverse-order cleanup; this preserves allocation failure precedence over malformed later paths.",
+    "ownership": "All cataloged fronts use the live Windows file entries and existing VFS/native handle owner. UCRT narrow paths use checked conversion through the existing codec, with transient guest buffers allocated/freed through the existing RTL heap boundary. API sets and _o_ wrappers share UCRT state."
   }
 }

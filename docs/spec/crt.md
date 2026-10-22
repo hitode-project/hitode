@@ -111,4 +111,19 @@ This spec covers the Microsoft C runtimes the guest links: every msvcrt and msvc
 **Rule**: Secure set fronts MUST validate the original terminator within capacity even after count exhaustion or NUL replacement. Unterminated inputs MUST preserve native incremental edits, clear the first unit and report EINVAL through the runtime's validation policy. Only bounded NULL/zero-capacity/zero-count requests MUST bypass input validation.
 **Verification**: Test
 
+### CRT-LIB-22 File mutation adapters
+
+**Rule**: CRT removal and rename fronts MUST use the existing live Windows file owner and share narrow/wide behavior through their version profile. Failures MUST publish module/thread errno and DOS errno without replacing Windows LastError, while successful operations MUST preserve CRT error cells. UCRT rename MUST retain COPY_ALLOWED, and false/zero-error providers MUST follow the native version policy.
+**Verification**: Test
+
+### CRT-LIB-23 DOS error translation
+
+**Rule**: Cataloged `_dosmaperr` fronts MUST share the native first-match error mapping and fallback ranges, publish both thread error cells and preserve LastError. Duplicate native table entries MUST retain the first match, and unknown codes MUST map to EINVAL.
+**Verification**: Test
+
+### CRT-LIB-24 UCRT filename conversion
+
+**Rule**: UCRT narrow mutations MUST convert through the existing filename codec before calling the wide Windows entry, preserving NULL arguments and rejecting malformed sequences. Conversion buffers MUST use the existing guest heap, allocate in argument order and release in reverse order when the operation ends. Unicode translation failure MUST publish EILSEQ/DOS error 1113 before any file mutation.
+**Verification**: Test
+
 Withdrawn: none
