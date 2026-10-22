@@ -83,6 +83,8 @@ fn probes<B: Backend>(cpu: B, mode: RunMode) {
         "SetHandleCount",
         "GetSystemTimePreciseAsFileTime",
         "CreateFile2",
+        "FlsGetValue2",
+        "AppPolicyGetProcessTerminationMethod",
         "GetCurrentProcessId",
     ]
     .into_iter()
@@ -107,11 +109,11 @@ fn probes<B: Backend>(cpu: B, mode: RunMode) {
         machine.run_virtual(1_000_000),
         RunResult::Exited(0)
     ));
-    for index in 0..4 {
+    for index in 0..6 {
         assert_eq!(machine.cpu.read_u32(DATA + index * 8).unwrap(), 0);
         assert_eq!(machine.cpu.read_u32(DATA + index * 8 + 4).unwrap(), 127);
     }
-    assert_ne!(machine.cpu.read_u32(DATA + 32).unwrap(), 0);
+    assert_ne!(machine.cpu.read_u32(DATA + 48).unwrap(), 0);
 }
 
 #[test]

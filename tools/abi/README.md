@@ -135,6 +135,12 @@ Ordinal identities were verified from Microsoft's [June 2010 redistributable](ht
 The redistributable SHA-256 is `053f76dcbb28802e23341b6a787e3b0791c0fa5c8d4d011b1044172dbf89c73b`; the x86 DLL SHA-256 is `8d540d484ea41e374fd0107d55d253f87ded4ce780d515d8fd59bbe8c98970a7`.
 Only export metadata was read; binaries and instruction bytes remain outside the repository.
 
+For the closure's two undocumented version cases, the maintainer permits SDK gates and published Win7 export metadata as supplemental sources.
+FlsGetValue2 is gated by `_WIN32_WINNT_WIN10` in the SDK's `fibersapi.h`; its precise later introduction is not inferred from that lower bound.
+AppPolicyGetProcessTerminationMethod appears in the SDK's AppModel policy declarations and is absent from the published Win7 Kernel32 export catalog; its exact minimum remains undocumented.
+The cited Win7 catalog is build 6.1.7100.0, rather than an authored SP1 native test; this comparison does not claim SP1 differential verification.
+The post-Win7 rows pin the SDK header revision, and these names remain unregistered and unavailable to guest discovery.
+
 ## CRT export catalog
 
 WinMD lists no C runtime exports, so `crt-exports.tsv` names what each x86 CRT DLL exports:
