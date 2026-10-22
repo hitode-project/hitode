@@ -361,7 +361,13 @@ pub fn register(reg: &mut Registry) {
             continue;
         };
         let target = format!("Nt{suffix}");
-        if reg.is_implemented(NTDLL, export.name) || !reg.is_implemented(NTDLL, &target) {
+        // A Kernel32 forwarder can supply behavior through Registry lookup
+        // without a directly registered Nt frontend. It cannot be the target
+        // of a registration alias, whose ABI and implementation must be direct.
+        let direct = reg
+            .registered()
+            .any(|(module, name, _)| module == NTDLL && name == target);
+        if reg.is_implemented(NTDLL, export.name) || !direct {
             continue;
         }
         let target = adv_abi::system_exports::lookup(NTDLL, &target)

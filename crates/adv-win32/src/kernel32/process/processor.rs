@@ -177,6 +177,37 @@ fn logical_information_ex(
     Ok(1)
 }
 
+#[win32(kernel32, name = "GetLogicalProcessorInformation", level = implement)]
+fn logical_information(
+    env: &mut Env<'_>,
+    output: GuestPtr<u8>,
+    length: GuestPtr<u32>,
+) -> Result<i32, MemFault> {
+    let profile = *env.ext.get_or_default::<Processors>();
+    // The same single-core, single-node, single-package profile as the Ex API;
+    // it exposes no cache hierarchy. Each x86 legacy record occupies 24 bytes.
+    let mut bytes = [0u8; 72];
+    for (index, relation) in [0u32, 1, 3].into_iter().enumerate() {
+        let record = &mut bytes[index * 24..][..24];
+        record[..4].copy_from_slice(&profile.active_mask().to_le_bytes());
+        record[4..8].copy_from_slice(&relation.to_le_bytes());
+    }
+    let capacity = length.read(env.cpu)?;
+    length.write(env.cpu, bytes.len() as u32)?;
+    if output.is_null() || capacity < bytes.len() as u32 {
+        set_last_error(env, 122);
+        return Ok(0);
+    }
+    adv_abi::guest::check_range(
+        env.cpu,
+        output.addr(),
+        bytes.len() as u32,
+        adv_cpu::backend::Prot::WRITE,
+    )?;
+    env.cpu.write(output.addr(), &bytes)?;
+    Ok(1)
+}
+
 #[win32(kernel32, name = "GetThreadGroupAffinity", level = implement)]
 fn get_group_affinity(
     env: &mut Env<'_>,
@@ -229,6 +260,7 @@ pub(super) fn register(reg: &mut Registry) {
         current_processor_ex_ABI,
         highest_numa_node_ABI,
         logical_information_ex_ABI,
+        logical_information_ABI,
         get_group_affinity_ABI,
         set_group_affinity_ABI,
     ] {

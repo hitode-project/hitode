@@ -14,7 +14,7 @@ const CODE: u32 = 0x400000;
 const DATA: u32 = 0x410000;
 const OUT: u32 = 0x420000;
 
-fn fixture<B: Backend>(cpu: B, name: &str) -> (Machine<B>, PathBuf) {
+pub(super) fn fixture<B: Backend>(cpu: B, name: &str) -> (Machine<B>, PathBuf) {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/profile-string-tests")
         .join(format!(
@@ -65,7 +65,7 @@ fn env<B: Backend>(machine: &mut Machine<B>) -> Env<'_> {
         thunk: 0,
     }
 }
-fn wide<B: Backend>(machine: &mut Machine<B>, pointer: u32, text: &str) {
+pub(super) fn wide<B: Backend>(machine: &mut Machine<B>, pointer: u32, text: &str) {
     let bytes: Vec<_> = text
         .encode_utf16()
         .chain([0])
@@ -73,15 +73,15 @@ fn wide<B: Backend>(machine: &mut Machine<B>, pointer: u32, text: &str) {
         .collect();
     machine.cpu.write(pointer, &bytes).unwrap();
 }
-fn ansi<B: Backend>(machine: &mut Machine<B>, pointer: u32, bytes: &[u8]) {
+pub(super) fn ansi<B: Backend>(machine: &mut Machine<B>, pointer: u32, bytes: &[u8]) {
     machine.cpu.write(pointer, &[bytes, &[0]].concat()).unwrap();
 }
-fn bytes<B: Backend>(machine: &Machine<B>, pointer: u32, length: usize) -> Vec<u8> {
+pub(super) fn bytes<B: Backend>(machine: &Machine<B>, pointer: u32, length: usize) -> Vec<u8> {
     let mut bytes = vec![0; length];
     machine.cpu.read(pointer, &mut bytes).unwrap();
     bytes
 }
-fn utf16(text: &str) -> Vec<u8> {
+pub(super) fn utf16(text: &str) -> Vec<u8> {
     text.encode_utf16().flat_map(u16::to_le_bytes).collect()
 }
 fn invoke<B: Backend>(machine: &mut Machine<B>, values: [u32; 6], wide: bool) -> u32 {
@@ -107,7 +107,7 @@ fn invoke<B: Backend>(machine: &mut Machine<B>, values: [u32; 6], wide: bool) ->
         _ => panic!("profile queries return synchronously"),
     }
 }
-fn error<B: Backend>(machine: &mut Machine<B>) -> u32 {
+pub(super) fn error<B: Backend>(machine: &mut Machine<B>) -> u32 {
     crate::util::last_error(&env(machine))
 }
 fn call(code: &mut Asm, api: u32, values: &[u32], record: u32, get_error: u32) {
@@ -118,7 +118,7 @@ fn call(code: &mut Asm, api: u32, values: &[u32], record: u32, get_error: u32) {
     code.call(get_error).mov_mem_eax(record + 4);
 }
 
-fn profile_call<B: Backend>(machine: &mut Machine<B>, name: &str, args: &[u32]) -> u32 {
+pub(super) fn profile_call<B: Backend>(machine: &mut Machine<B>, name: &str, args: &[u32]) -> u32 {
     let before = machine.sys.objects.object_count();
     for (index, value) in args.iter().enumerate() {
         machine
@@ -652,7 +652,7 @@ fn native_defaults_quotes_duplicates_and_small_enumeration_capacities_match() {
 }
 
 #[test]
-fn checked_atomic_outputs_encoding_failures_and_unicode_writer_preserve_memory_and_file() {
+fn checked_outputs_encoding_failures_and_unicode_writes_preserve_source_files() {
     let (mut machine, root) = fixture(JitCpu::new(PARK_ADDR, false).unwrap(), "failures");
     machine.spawn("query", PARK_ADDR, &[], 65536).unwrap();
     machine.cpu.set_reg(Reg::Esp, DATA);
@@ -764,12 +764,16 @@ fn checked_atomic_outputs_encoding_failures_and_unicode_writer_preserve_memory_a
     }
     assert!(matches!(
         super::super::write_private_profile_string_a(&mut env(&mut machine)),
-        Outcome::Return(0)
+        Outcome::Return(1)
     ));
-    assert_eq!(error(&mut machine), 50);
+    assert_eq!(error(&mut machine), 0);
     assert_eq!(
         std::fs::read(root.join("game/unicode.ini")).unwrap(),
         wide_contents
     );
-    assert!(!root.join("data/overlay/unicode.ini").exists());
+    let written = std::fs::read(root.join("data/overlay/unicode.ini")).unwrap();
+    assert_eq!(
+        written,
+        [&[0xff, 0xfe], utf16("[S]\r\nk=replacement\r\n").as_slice()].concat()
+    );
 }

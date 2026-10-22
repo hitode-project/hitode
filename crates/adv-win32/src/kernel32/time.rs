@@ -487,6 +487,11 @@ fn get_tick_count(env: &mut Env<'_>) -> Outcome {
     poll_clock(env, |_, us| Outcome::Return((us / 1000) as u32))
 }
 
+#[win32(kernel32, name = "GetTickCount64", level = implement)]
+fn get_tick_count64(env: &mut Env<'_>) -> Outcome {
+    poll_clock(env, |_, us| Outcome::Return64(us / 1000))
+}
+
 #[win32(kernel32, name = "QueryPerformanceCounter", level = implement)]
 fn query_performance_counter(env: &mut Env<'_>, out: GuestPtr<i64>) -> Outcome {
     poll_clock(env, move |env, us| {
@@ -556,6 +561,7 @@ fn get_time_zone_information(env: &mut Env<'_>) -> Outcome {
 }
 
 pub(super) fn register(reg: &mut Registry) {
+    reg.register(get_tick_count64_ABI);
     reg.register(get_system_time_as_file_time_ABI);
     reg.register(file_time_to_dos_date_time_ABI);
     reg.register(dos_date_time_to_file_time_ABI);

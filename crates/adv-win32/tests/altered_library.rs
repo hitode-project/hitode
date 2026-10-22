@@ -8,12 +8,14 @@ use adv_machine::{Clock, Machine, RunResult, layout::PARK_ADDR};
 use adv_os::{FileSource, Loader, Modules, Process};
 use adv_pe::ImportName;
 use adv_win32::{Win32, Win32Config};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 const CODE: u32 = 0x400000;
 const DATA: u32 = 0x410000;
 const COUNT: u32 = DATA + 1024;
 const HOOK_COUNT: u32 = DATA + 512;
 const HOOK_ARG: u32 = DATA + 544;
+static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
 struct Empty;
 impl FileSource for Empty {
     fn read(&self, _: &str) -> Option<Vec<u8>> {
@@ -30,8 +32,9 @@ impl Test {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../target")
             .join(format!(
-                "target/altered-library-{}-{jit}-{rejects}",
-                std::process::id()
+                "target/altered-library-{}-{}-{jit}-{rejects}",
+                std::process::id(),
+                NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
             ));
         std::fs::create_dir_all(&root).unwrap();
         let body = if rejects {

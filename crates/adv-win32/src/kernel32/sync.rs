@@ -21,6 +21,8 @@ pub(crate) use local::detach_fls;
 #[cfg(test)]
 mod event_tests;
 #[cfg(test)]
+mod signal_tests;
+#[cfg(test)]
 mod wait_tests;
 
 const WAIT_OBJECT_0: u32 = 0;
@@ -669,6 +671,13 @@ pub(super) fn register(reg: &mut Registry) {
         let (h, ms) = (e.arg(0), e.arg(1));
         native::wait_front(e, h, ms, false)
     });
+    stdcall(
+        reg,
+        K32,
+        "SignalObjectAndWait",
+        4,
+        native::signal_wait_front,
+    );
     stdcall(reg, K32, "WaitForSingleObjectEx", 3, |e| {
         let (h, ms, alertable) = (e.arg(0), e.arg(1), e.arg(2));
         native::wait_front(e, h, ms, alertable != 0)
