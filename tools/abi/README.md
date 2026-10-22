@@ -135,6 +135,7 @@ WinMD lists no C runtime exports, so `crt-exports.tsv` names what each x86 CRT D
 msvcrt, msvcrt20/40, msvcr70 through msvcr120, ucrtbase, vcruntime140, msvcp60 and the UCRT API-set contracts.
 Names and the data flag come from the public-domain mingw-w64-crt module definitions, preprocessed for i386; `crt-exports-source.json` pins the commit and file hashes.
 The catalog states existence only, never a convention or implementation promise; `tools/survey/coverage.py` compares it and `signatures.tsv` against registered APIs.
+`closure.tsv` lists the functions sample game PEs import or look up by name; `tools/survey/closure.py` regenerates it from local game folders, and `coverage.py --closure` reports it.
 `post-win7.tsv` lists catalogued functions introduced after Windows 7, with their minimum client and source; they stay unimplemented, so discovery hides them as on Windows 7, and coverage counts them as excluded.
 
 Use the pinned WinMD's `SupportedOSPlatform` attribute, falling back to Microsoft Learn's minimum supported client when absent.
