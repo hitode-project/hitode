@@ -3579,7 +3579,12 @@ msvcr100.dll	?set_unexpected@@YAP6AXXZH@Z	cdecl	ptr	callback	handler:int:i32:1
 msvcr100.dll	?set_unexpected@@YAP6AXXZP6AXXZ@Z	cdecl	ptr	callback	handler:callback:ptr:1
 msvcr100.dll	?terminate@@YAXXZ	cdecl	void	void	
 msvcr100.dll	?unexpected@@YAXXZ	cdecl	void	void	
+msvcr100.dll	_CxxThrowException	stdcall	void	void	object:void*:ptr:1|info:_ThrowInfo*:ptr:1
+msvcr100.dll	__CxxFrameHandler	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
+msvcr100.dll	__CxxFrameHandler2	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
+msvcr100.dll	__CxxFrameHandler3	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 msvcr100.dll	__doserrno	cdecl	ptr	unsigned long*	
+msvcr100.dll	__uncaught_exception	cdecl	i32	int	
 msvcr100.dll	_errno	cdecl	ptr	int*	
 msvcr100.dll	_except_handler2	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 msvcr100.dll	_except_handler3	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
@@ -3643,7 +3648,12 @@ msvcr110.dll	?set_unexpected@@YAP6AXXZH@Z	cdecl	ptr	callback	handler:int:i32:1
 msvcr110.dll	?set_unexpected@@YAP6AXXZP6AXXZ@Z	cdecl	ptr	callback	handler:callback:ptr:1
 msvcr110.dll	?terminate@@YAXXZ	cdecl	void	void	
 msvcr110.dll	?unexpected@@YAXXZ	cdecl	void	void	
+msvcr110.dll	_CxxThrowException	stdcall	void	void	object:void*:ptr:1|info:_ThrowInfo*:ptr:1
+msvcr110.dll	__CxxFrameHandler	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
+msvcr110.dll	__CxxFrameHandler2	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
+msvcr110.dll	__CxxFrameHandler3	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 msvcr110.dll	__doserrno	cdecl	ptr	unsigned long*	
+msvcr110.dll	__uncaught_exception	cdecl	i32	int	
 msvcr110.dll	_errno	cdecl	ptr	int*	
 msvcr110.dll	_except_handler2	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 msvcr110.dll	_except_handler3	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
@@ -3707,7 +3717,12 @@ msvcr120.dll	?set_unexpected@@YAP6AXXZH@Z	cdecl	ptr	callback	handler:int:i32:1
 msvcr120.dll	?set_unexpected@@YAP6AXXZP6AXXZ@Z	cdecl	ptr	callback	handler:callback:ptr:1
 msvcr120.dll	?terminate@@YAXXZ	cdecl	void	void	
 msvcr120.dll	?unexpected@@YAXXZ	cdecl	void	void	
+msvcr120.dll	_CxxThrowException	stdcall	void	void	object:void*:ptr:1|info:_ThrowInfo*:ptr:1
+msvcr120.dll	__CxxFrameHandler	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
+msvcr120.dll	__CxxFrameHandler2	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
+msvcr120.dll	__CxxFrameHandler3	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 msvcr120.dll	__doserrno	cdecl	ptr	unsigned long*	
+msvcr120.dll	__uncaught_exception	cdecl	i32	int	
 msvcr120.dll	_errno	cdecl	ptr	int*	
 msvcr120.dll	_except_handler2	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 msvcr120.dll	_except_handler3	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
@@ -3768,7 +3783,10 @@ msvcr70.dll	?set_terminate@@YAP6AXXZP6AXXZ@Z	cdecl	ptr	callback	handler:callback
 msvcr70.dll	?set_unexpected@@YAP6AXXZP6AXXZ@Z	cdecl	ptr	callback	handler:callback:ptr:1
 msvcr70.dll	?terminate@@YAXXZ	cdecl	void	void	
 msvcr70.dll	?unexpected@@YAXXZ	cdecl	void	void	
+msvcr70.dll	_CxxThrowException	stdcall	void	void	object:void*:ptr:1|info:_ThrowInfo*:ptr:1
+msvcr70.dll	__CxxFrameHandler	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 msvcr70.dll	__doserrno	cdecl	ptr	unsigned long*	
+msvcr70.dll	__uncaught_exception	cdecl	i32	int	
 msvcr70.dll	_errno	cdecl	ptr	int*	
 msvcr70.dll	_except_handler2	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 msvcr70.dll	_except_handler3	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
@@ -3817,7 +3835,10 @@ msvcr71.dll	?set_terminate@@YAP6AXXZP6AXXZ@Z	cdecl	ptr	callback	handler:callback
 msvcr71.dll	?set_unexpected@@YAP6AXXZP6AXXZ@Z	cdecl	ptr	callback	handler:callback:ptr:1
 msvcr71.dll	?terminate@@YAXXZ	cdecl	void	void	
 msvcr71.dll	?unexpected@@YAXXZ	cdecl	void	void	
+msvcr71.dll	_CxxThrowException	stdcall	void	void	object:void*:ptr:1|info:_ThrowInfo*:ptr:1
+msvcr71.dll	__CxxFrameHandler	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 msvcr71.dll	__doserrno	cdecl	ptr	unsigned long*	
+msvcr71.dll	__uncaught_exception	cdecl	i32	int	
 msvcr71.dll	_errno	cdecl	ptr	int*	
 msvcr71.dll	_except_handler2	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 msvcr71.dll	_except_handler3	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
@@ -3881,9 +3902,14 @@ msvcr80.dll	_CIpow	cdecl	void	void
 msvcr80.dll	_CIsin	cdecl	void	void	
 msvcr80.dll	_CIsqrt	cdecl	void	void	
 msvcr80.dll	_CItan	cdecl	void	void	
+msvcr80.dll	_CxxThrowException	stdcall	void	void	object:void*:ptr:1|info:_ThrowInfo*:ptr:1
+msvcr80.dll	__CxxFrameHandler	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
+msvcr80.dll	__CxxFrameHandler2	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
+msvcr80.dll	__CxxFrameHandler3	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 msvcr80.dll	__control87_2	cdecl	i32	i32	newControl:u32:u32:1|mask:u32:u32:1|x86Control:u32*:ptr:1|sse2Control:u32*:ptr:1
 msvcr80.dll	__doserrno	cdecl	ptr	unsigned long*	
 msvcr80.dll	__getmainargs	cdecl	i32	i32	argc:int*:ptr:1|argv:char***:ptr:1|environment:char***:ptr:1|wildcard:int:i32:1|startup:_startupinfo*:ptr:1
+msvcr80.dll	__uncaught_exception	cdecl	i32	int	
 msvcr80.dll	__wgetmainargs	cdecl	i32	i32	argc:int*:ptr:1|argv:wchar_t***:ptr:1|environment:wchar_t***:ptr:1|wildcard:int:i32:1|startup:_startupinfo*:ptr:1
 msvcr80.dll	_acmdln	data	ptr	char*	
 msvcr80.dll	_beginthreadex	cdecl	u32	uintptr_t	security:void*:ptr:1|stackSize:unsigned int:u32:1|startAddress:_beginthreadex_proc_type:ptr:1|argument:void*:ptr:1|initFlag:unsigned int:u32:1|threadId:unsigned int*:ptr:1
@@ -4033,6 +4059,10 @@ msvcr90.dll	_CIpow	cdecl	void	void
 msvcr90.dll	_CIsin	cdecl	void	void	
 msvcr90.dll	_CIsqrt	cdecl	void	void	
 msvcr90.dll	_CItan	cdecl	void	void	
+msvcr90.dll	_CxxThrowException	stdcall	void	void	object:void*:ptr:1|info:_ThrowInfo*:ptr:1
+msvcr90.dll	__CxxFrameHandler	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
+msvcr90.dll	__CxxFrameHandler2	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
+msvcr90.dll	__CxxFrameHandler3	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 msvcr90.dll	___lc_codepage_func	cdecl	u32	unsigned int	
 msvcr90.dll	___lc_handle_func	cdecl	ptr	LCID*	
 msvcr90.dll	__control87_2	cdecl	i32	i32	newControl:u32:u32:1|mask:u32:u32:1|x86Control:u32*:ptr:1|sse2Control:u32*:ptr:1
@@ -4188,8 +4218,13 @@ msvcrt.dll	_CIpow	cdecl	void	void
 msvcrt.dll	_CIsin	cdecl	void	void	
 msvcrt.dll	_CIsqrt	cdecl	void	void	
 msvcrt.dll	_CItan	cdecl	void	void	
+msvcrt.dll	_CxxThrowException	stdcall	void	void	object:void*:ptr:1|info:_ThrowInfo*:ptr:1
+msvcrt.dll	__CxxFrameHandler	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
+msvcrt.dll	__CxxFrameHandler2	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
+msvcrt.dll	__CxxFrameHandler3	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 msvcrt.dll	__doserrno	cdecl	ptr	unsigned long*	
 msvcrt.dll	__getmainargs	cdecl	i32	i32	argc:int*:ptr:1|argv:char***:ptr:1|environment:char***:ptr:1|wildcard:int:i32:1|startup:_startupinfo*:ptr:1
+msvcrt.dll	__uncaught_exception	cdecl	i32	int	
 msvcrt.dll	__wgetmainargs	cdecl	i32	i32	argc:int*:ptr:1|argv:wchar_t***:ptr:1|environment:wchar_t***:ptr:1|wildcard:int:i32:1|startup:_startupinfo*:ptr:1
 msvcrt.dll	_access	cdecl	i32	int	path:const char*:str8:1|mode:int:i32:1
 msvcrt.dll	_acmdln	data	ptr	char*	
@@ -4309,6 +4344,8 @@ msvcrt20.dll	?set_terminate@@YAP6AXXZP6AXXZ@Z	cdecl	ptr	callback	handler:callbac
 msvcrt20.dll	?set_unexpected@@YAP6AXXZP6AXXZ@Z	cdecl	ptr	callback	handler:callback:ptr:1
 msvcrt20.dll	?terminate@@YAXXZ	cdecl	void	void	
 msvcrt20.dll	?unexpected@@YAXXZ	cdecl	void	void	
+msvcrt20.dll	_CxxThrowException	stdcall	void	void	object:void*:ptr:1|info:_ThrowInfo*:ptr:1
+msvcrt20.dll	__CxxFrameHandler	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 msvcrt20.dll	__doserrno	cdecl	ptr	unsigned long*	
 msvcrt20.dll	_errno	cdecl	ptr	int*	
 msvcrt20.dll	_except_handler2	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
@@ -4358,6 +4395,8 @@ msvcrt40.dll	?set_terminate@@YAP6AXXZP6AXXZ@Z	cdecl	ptr	callback	handler:callbac
 msvcrt40.dll	?set_unexpected@@YAP6AXXZP6AXXZ@Z	cdecl	ptr	callback	handler:callback:ptr:1
 msvcrt40.dll	?terminate@@YAXXZ	cdecl	void	void	
 msvcrt40.dll	?unexpected@@YAXXZ	cdecl	void	void	
+msvcrt40.dll	_CxxThrowException	stdcall	void	void	object:void*:ptr:1|info:_ThrowInfo*:ptr:1
+msvcrt40.dll	__CxxFrameHandler	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 msvcrt40.dll	__doserrno	cdecl	ptr	unsigned long*	
 msvcrt40.dll	_errno	cdecl	ptr	int*	
 msvcrt40.dll	_except_handler2	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
@@ -6199,9 +6238,15 @@ shlwapi.dll	wnsprintfA	variadic	i32	i32	pszDest:Windows.Win32.Foundation.PSTR:st
 shlwapi.dll	wnsprintfW	variadic	i32	i32	pszDest:Windows.Win32.Foundation.PWSTR:str16:1|cchDest:i32:i32:1|pszFmt:Windows.Win32.Foundation.PWSTR:str16:1
 shlwapi.dll	wvnsprintfA	stdcall	i32	i32	pszDest:Windows.Win32.Foundation.PSTR:str8:1|cchDest:i32:i32:1|pszFmt:Windows.Win32.Foundation.PSTR:str8:1|arglist:i8*:ptr:1
 shlwapi.dll	wvnsprintfW	stdcall	i32	i32	pszDest:Windows.Win32.Foundation.PWSTR:str16:1|cchDest:i32:i32:1|pszFmt:Windows.Win32.Foundation.PWSTR:str16:1|arglist:i8*:ptr:1
+ucrtbase.dll	_CxxThrowException	stdcall	void	void	object:void*:ptr:1|info:_ThrowInfo*:ptr:1
+ucrtbase.dll	__CxxFrameHandler	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
+ucrtbase.dll	__CxxFrameHandler2	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
+ucrtbase.dll	__CxxFrameHandler3	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 ucrtbase.dll	__control87_2	cdecl	i32	i32	newControl:u32:u32:1|mask:u32:u32:1|x86Control:u32*:ptr:1|sse2Control:u32*:ptr:1
 ucrtbase.dll	__doserrno	cdecl	ptr	unsigned long*	
 ucrtbase.dll	__std_terminate	cdecl	void	void	
+ucrtbase.dll	__uncaught_exception	cdecl	i32	int	
+ucrtbase.dll	__uncaught_exceptions	cdecl	u32	unsigned int	
 ucrtbase.dll	_cexit	cdecl	void	void	
 ucrtbase.dll	_control87	cdecl	u32	u32	newControl:u32:u32:1|mask:u32:u32:1
 ucrtbase.dll	_controlfp	cdecl	u32	u32	newControl:u32:u32:1|mask:u32:u32:1
@@ -7059,7 +7104,13 @@ user32.dll	wvsprintfA	stdcall	i32	i32	param0:Windows.Win32.Foundation.PSTR:str8:
 user32.dll	wvsprintfW	stdcall	i32	i32	param0:Windows.Win32.Foundation.PWSTR:str16:1|param1:Windows.Win32.Foundation.PWSTR:str16:1|arglist:i8*:ptr:1
 uxtheme.dll	IsAppThemed	stdcall	i32	Windows.Win32.Foundation.BOOL	
 uxtheme.dll	IsThemeActive	stdcall	i32	Windows.Win32.Foundation.BOOL	
+vcruntime140.dll	_CxxThrowException	stdcall	void	void	object:void*:ptr:1|info:_ThrowInfo*:ptr:1
+vcruntime140.dll	__CxxFrameHandler	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
+vcruntime140.dll	__CxxFrameHandler2	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
+vcruntime140.dll	__CxxFrameHandler3	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 vcruntime140.dll	__std_terminate	cdecl	void	void	
+vcruntime140.dll	__uncaught_exception	cdecl	i32	int	
+vcruntime140.dll	__uncaught_exceptions	cdecl	u32	unsigned int	
 vcruntime140.dll	_except_handler2	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 vcruntime140.dll	_except_handler3	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 vcruntime140.dll	_except_handler4_common	cdecl	i32	EXCEPTION_DISPOSITION	cookie:unsigned int*:ptr:1|check:fn*:ptr:1|record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1

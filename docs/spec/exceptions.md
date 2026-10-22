@@ -62,3 +62,35 @@ This spec covers structured exception dispatch in the Win32 personality: SEH sea
 
 **Rule**: EH4 MUST decode the scope table with the supplied cookie. Enabled GS/EH checks MUST call the supplied security callback with the decoded value in ECX before searching scopes. The callback's terminating failure MUST prevent filter execution.
 **Verification**: Test
+
+## C++ exception metadata
+
+### EXC-CPP-1 Catch search
+
+**Rule**: MSVC x86 frame handlers MUST search guest FuncInfo try blocks and match ThrowInfo catchable types. Value, reference, base-class and ellipsis catches MUST receive the matching guest object. Rethrow MUST retain the active exception and search enclosing scopes.
+**Verification**: Test
+
+### EXC-CPP-2 Cleanup ordering
+
+**Rule**: A selected C++ catch MUST call live global unwinding before local cleanup and catch execution. Cleanup MUST publish its outer state before calling guest destructors. Cross-frame throws MUST run inner-frame cleanup before the selected frame's catch.
+**Verification**: Test
+
+### EXC-CPP-3 Exception lifetime
+
+**Rule**: A completed catch MUST destroy its exception object exactly once after the final active owner releases it. Rethrow MUST preserve the object through enclosing catches. Catch continuation MUST retain checked machine ancestry.
+**Verification**: Test
+
+### EXC-CPP-4 Uncaught throws
+
+**Rule**: An uncaught CRT-generated C++ exception MUST enter its runtime's terminate handler. A C++ throw from a terminate handler MUST abort. Guest callbacks that explicitly exit MUST preserve their exit code.
+**Verification**: Test
+
+### EXC-CPP-5 SE translator
+
+**Rule**: Asynchronous C++ frame handlers MUST invoke their thread's SE translator for Windows exceptions with the original code and exception pointers. A translated C++ throw MUST enter ordinary C++ catch search. Returning translators MUST continue Windows handler search.
+**Verification**: Test
+
+### EXC-CPP-6 Processing throw count
+
+**Rule**: Uncaught queries MUST reflect CRT throws awaiting catch entry in the current runtime/thread. Raw Windows dispatch and unwind MUST NOT invent C++ processing counts. Catch entry MUST decrement processing counts before the catch body executes.
+**Verification**: Test

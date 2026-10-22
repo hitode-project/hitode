@@ -91,8 +91,31 @@ fn handler(env: &mut Env<'_>, slot: Slot, setting: bool) -> Outcome {
     Outcome::Return(old)
 }
 
+pub(super) fn translator(env: &mut Env<'_>) -> u32 {
+    thread(env, Slot::Translator).translator
+}
+
+pub(super) fn is_terminating(env: &mut Env<'_>) -> bool {
+    thread(env, Slot::Terminate).terminating.upgrade().is_some()
+}
+
 pub(super) fn terminate(env: &mut Env<'_>) -> Outcome {
-    let thread = thread(env, Slot::Terminate);
+    let owner = module(env, Slot::Terminate);
+    terminate_for(env, &owner)
+}
+
+pub(super) fn terminate_for(env: &mut Env<'_>, owner: &str) -> Outcome {
+    let owner = if owner == "vcruntime140.dll" {
+        "ucrtbase.dll"
+    } else {
+        owner
+    };
+    let thread = env
+        .ext
+        .get_or_default::<CrtState>()
+        .cpp_threads
+        .entry((owner.to_owned(), env.context))
+        .or_default();
     if thread.terminating.upgrade().is_some() {
         return abort(env);
     }

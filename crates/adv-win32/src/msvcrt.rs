@@ -10,6 +10,7 @@ mod byte_set;
 mod byte_sort;
 mod convert;
 mod cpp_alloc;
+pub(crate) mod cpp_eh;
 mod cpp_runtime;
 mod data;
 mod directory;
@@ -58,6 +59,7 @@ struct CrtState {
     invalid_handlers: HashMap<String, u32>,
     files: HashMap<u32, CrtFile>,
     locales: HashMap<String, locale::LocaleState>,
+    cpp_eh_threads: HashMap<(String, u32), cpp_eh::Thread>,
     cpp_threads: HashMap<(String, u32), cpp_runtime::Thread>,
     purecall_handlers: HashMap<String, u32>,
 }
@@ -169,6 +171,7 @@ pub fn register(r: &mut Registry) {
     convert::register(r);
     cpp_alloc::register(r);
     cpp_runtime::register(r);
+    cpp_eh::register(r);
     scan::register(r);
     wide_scan::register(r);
     secure_memory::register(r);
@@ -388,6 +391,7 @@ pub fn register(r: &mut Registry) {
 pub(crate) fn detach_thread(env: &mut Env<'_>) -> Result<(), String> {
     let context = env.context;
     if let Some(state) = env.ext.try_get_mut::<CrtState>() {
+        state.cpp_eh_threads.retain(|(_, id), _| *id != context);
         state.cpp_threads.retain(|(_, id), _| *id != context);
     }
     random::release(env, Some(env.context));
@@ -398,6 +402,7 @@ pub(crate) fn detach_thread(env: &mut Env<'_>) -> Result<(), String> {
 /// Host CRT modules are pinned. Process detach is their final errno boundary.
 pub(crate) fn detach_process(env: &mut Env<'_>) -> Result<(), String> {
     if let Some(state) = env.ext.try_get_mut::<CrtState>() {
+        state.cpp_eh_threads.clear();
         state.cpp_threads.clear();
         state.purecall_handlers.clear();
     }

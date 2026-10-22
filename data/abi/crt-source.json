@@ -493,5 +493,20 @@
       "https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-exception_registration_record",
       "https://learn.microsoft.com/en-us/windows/win32/api/winnt/nf-winnt-rtlunwind"
     ]
+  },
+  "x86_cpp_eh": {
+    "source": "Microsoft Learn _CxxThrowException and __CxxFrameHandler declarations; public MSVC x86 FuncInfo/ThrowInfo ABI. Internal frame handlers receive FuncInfo in EAX in addition to four stack pointers. Metadata is interpreted, never copied as native implementation code.",
+    "documentation": [
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/cxxthrowexception",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/cxxframehandler",
+      "https://www.openrce.org/articles/full_view/21",
+      "https://devblogs.microsoft.com/oldnewthing/20100730-00/?p=13273"
+    ],
+    "abi": "_CxxThrowException is void __stdcall(void*, _ThrowInfo*). __CxxFrameHandler/2/3 are four-pointer cdecl EXCEPTION_DISPOSITION with FuncInfo in EAX. x86 metadata uses absolute pointers. C++ code 0xe06d7363 carries magic, object, ThrowInfo.",
+    "corroboration": {
+      "source": "Microsoft VC 14.29.30037 ehdata.h, declaration/layout-only mirror. Registration frame, FuncInfo, TryBlockMapEntry and HandlerType fields were checked without importing any header or implementation.",
+      "url": "https://raw.githubusercontent.com/Chuyu-Team/VC-LTL/master/VC/14.29.30037/include/ehdata.h",
+      "sha256": "17f494086d8e9cbc855027a0f798036eb1270dda488e896776c26f2a5c7bc33a"
+    }
   }
 }

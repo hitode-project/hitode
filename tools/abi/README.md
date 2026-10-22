@@ -177,6 +177,18 @@ local cleanup and resume through a machine checkpoint that validates stack and
 continuation ancestry. No host exception substitutes for guest SEH dispatch.
 `crt_cpp_runtime` and `crt_seh` exercise these paths in both execution modes.
 
+C++ throw declarations preserve the documented two-pointer stdcall ABI, while
+frame handlers use four cdecl pointers and the internal x86 FuncInfo-in-EAX
+contract. Frame handlers interpret VC6/VC7/VC8+ absolute-pointer metadata, match
+qualified catchable types and PMD base adjustments, invoke guest copy constructors
+and unwind funclets, and retain exception objects across rethrows. Catch completion
+runs the object's destructor before a checked nonlocal continuation. Asynchronous
+frames invoke the installed thread translator with original Windows exception
+pointers. The runtime's processingThrow owner supplies uncaught queries, including
+UCRT queries of VC14 throws; raw Windows dispatch does not alter that count.
+`crt_cpp_eh` exercises real Windows delivery, nested/outer catches, cleanup,
+translator throws, object lifetimes and termination in both execution modes.
+
 `python tools/abi/crt_exclusions.py` generates the exact CRT-task exclusions in
 `crt-exclusions.tsv`: the private API set, ConcRT namespace and legacy VC20/40
 iostream families, including their data exports. `--check` detects stale entries.

@@ -137,7 +137,6 @@ pub(super) fn deliver(env: &mut Env<'_>, search: Search, source: Source) -> Outc
                 // The actual RTL call captures its own context and returns
                 // through the hook. Only then finish the Win32 front call.
                 return Outcome::call_on_stack(target, [scratch], scratch, move |_, _| {
-                    drop(search._phase);
                     Outcome::ResumeExecution(search.checkpoint.unwind_callbacks())
                 })
                 .unwindable();
@@ -323,6 +322,9 @@ fn terminal(env: &mut Env<'_>, record: &Record) -> Outcome {
 /// Reaching the valid end of the guest SEH chain reaches the RTL startup
 /// boundary. A malformed chain or an explicit second chance must not call it.
 pub(super) fn thread_unhandled(env: &mut Env<'_>, search: Search) -> Outcome {
+    if let Some(outcome) = crate::msvcrt::cpp_eh::unhandled(env, search.record.code) {
+        return outcome;
+    }
     let filter = env.ext.get_or_default::<RuntimeFilter>().0;
     if filter == 0 {
         return unhandled(env, search);

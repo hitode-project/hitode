@@ -237,6 +237,11 @@ public static class AbiMetadata
                 if (f[5] != prefix + "path:const " + character + "*:" + kind + ":1|arg0:const " + character + "*:" + kind + ":1")
                     throw new InvalidDataException("CRT process list stack contract changed: " + row);
             }
+            bool crtThrowName = f.Length == 6 && f[1] == "_CxxThrowException";
+            bool crtThrow = crtThrowName && f[2] == "stdcall" && f[3] == "void" && f[4] == "void"
+                && f[5] == "object:void*:ptr:1|info:_ThrowInfo*:ptr:1";
+            if (crtThrowName && !crtThrow)
+                throw new InvalidDataException("CRT C++ throw stack contract changed: " + row);
             bool crtVariadic = f.Length == 6 && new[] { "msvcr80.dll", "msvcr90.dll" }.Contains(f[0])
                 && new[] { "sprintf_s", "_snprintf_s", "swprintf_s", "_snwprintf_s", "_scprintf", "_scwprintf" }.Contains(f[1])
                 && f[2] == "variadic" && f[3] == "i32" && f[4] == "int";
@@ -304,7 +309,7 @@ public static class AbiMetadata
                     || f[4] != (begin ? "uintptr_t" : "void") || f[5] != parameters)
                     throw new InvalidDataException("CRT extended thread stack contract changed: " + row);
             }
-            if (f.Length != 6 || (!new[] { "cdecl", "data" }.Contains(f[2]) && !crtVariadic && !crtSprintf && !crtProcessList) || (!new[] { "u32", "i32", "u64", "void", "ptr" }.Contains(f[3]) && !crtStrtod && !crtDifftime && !crtRound && !crtModf && !crtLdexp && !crtBinaryMath)
+            if (f.Length != 6 || (!new[] { "cdecl", "data" }.Contains(f[2]) && !crtVariadic && !crtSprintf && !crtProcessList && !crtThrow) || (!new[] { "u32", "i32", "u64", "void", "ptr" }.Contains(f[3]) && !crtStrtod && !crtDifftime && !crtRound && !crtModf && !crtLdexp && !crtBinaryMath)
                 || (f[2] == "data" && (f[3] == "void" || f[5].Length != 0)))
                 throw new InvalidDataException("Invalid supplemental x86 signature: " + row);
             foreach (var parameter in f[5].Split('|', StringSplitOptions.RemoveEmptyEntries))

@@ -50,4 +50,6 @@ Reject-Change 'spawn-prefix' "ucrtbase.dll`t_spawnl" 5 'path:const char*:str8:1|
 Reject-Change 'wide-list' "ucrtbase.dll`t_wexecl" 5 'path:const char*:str8:1|arg0:const char*:str8:1' 'process list stack contract'
 Reject-Change 'pow-result' "msvcrt.dll`tpow" 3 'i32' 'binary math stack contract'
 Reject-Change 'hypot-width' "msvcrt.dll`t_hypot" 5 'x:double:f64:1|y:double:f64:2' 'binary math stack contract'
-Write-Output 'CRT inputs: reproducible generation and six malformed process/math contracts verified.'
+Reject-Change 'throw-convention' "msvcr90.dll`t_CxxThrowException" 2 'cdecl' 'C++ throw stack contract'
+Reject-Change 'throw-width' "msvcr90.dll`t_CxxThrowException" 5 'object:void*:ptr:1' 'C++ throw stack contract'
+Write-Output 'CRT inputs: reproducible generation and eight malformed process/math/throw contracts verified.'
