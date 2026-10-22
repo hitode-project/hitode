@@ -204,6 +204,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "adv-nt"
+version = "0.1.2"
+dependencies = [
+ "adv-wineserver",
+ "libc",
+]
+
+[[package]]
 name = "adv-os"
 version = "0.1.2"
 dependencies = [

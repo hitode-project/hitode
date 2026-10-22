@@ -35,6 +35,13 @@ int hitode_server_main( int debug )
     init_directories( load_intl_file() );
     init_threading();
     init_registry();
+    /* The server derives its machines from the host CPU. Hitode's guests are
+     * i386 on every host, so the server takes the state an i386 build has
+     * with a 32-bit prefix; init_registry() reads the machines only to mark
+     * WoW registry keys, which a single machine does not have. */
+    supported_machines[0] = IMAGE_FILE_MACHINE_I386;
+    supported_machines_count = 1;
+    native_machine = IMAGE_FILE_MACHINE_I386;
     main_loop();
     return 0;
 }

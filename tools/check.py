@@ -233,6 +233,7 @@ def check(everything: bool, ci: bool = False) -> bool:
     ok &= run("layering", [sys.executable, "tools/layering/check_layers.py"])
     ok &= run("vfs namespace", [sys.executable, "tools/vfs/check_namespace.py"])
     ok &= run("specs", [sys.executable, "tools/spec/check_spec.py"])
+    ok &= run("wine protocol", [sys.executable, "tools/wine/protocol.py", "--check"])
     ok &= run("docs", [sys.executable, "tools/docs/check_docs.py"])
     ok &= run("native fixture recordings", [sys.executable, "tools/fixtures/record_native.py", "--sources"])
     ok &= launcher(everything, ci)
