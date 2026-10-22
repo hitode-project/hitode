@@ -584,3 +584,9 @@ fn identity_and_sleep_fronts_share_windows_processes_and_virtual_scheduling() {
 
 #[path = "crt_process/diagnostics.rs"]
 mod diagnostics;
+
+#[path = "crt_process/signals.rs"]
+mod signals;
+
+#[path = "crt_process/signal_checks.rs"]
+mod signal_checks;

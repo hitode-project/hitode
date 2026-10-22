@@ -720,6 +720,8 @@ api-ms-win-crt-process-l1-1-0.dll	_wspawnve	cdecl	i32	intptr_t	mode:int:i32:1|pa
 api-ms-win-crt-process-l1-1-0.dll	_wspawnvp	cdecl	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1
 api-ms-win-crt-process-l1-1-0.dll	_wspawnvpe	cdecl	i32	intptr_t	mode:int:i32:1|path:const wchar_t*:str16:1|arguments:const wchar_t* const*:ptr:1|environment:const wchar_t* const*:ptr:1
 api-ms-win-crt-runtime-l1-1-0.dll	__doserrno	cdecl	ptr	unsigned long*	
+api-ms-win-crt-runtime-l1-1-0.dll	__fpecode	cdecl	ptr	int*	
+api-ms-win-crt-runtime-l1-1-0.dll	__pxcptinfoptrs	cdecl	ptr	void**	
 api-ms-win-crt-runtime-l1-1-0.dll	_cexit	cdecl	void	void	
 api-ms-win-crt-runtime-l1-1-0.dll	_crt_atexit	cdecl	i32	i32	function:callback:ptr:1
 api-ms-win-crt-runtime-l1-1-0.dll	_crt_debugger_hook	cdecl	void	void	reserved:int:i32:1
@@ -735,6 +737,8 @@ api-ms-win-crt-runtime-l1-1-0.dll	_initialize_onexit_table	cdecl	i32	i32	table:_
 api-ms-win-crt-runtime-l1-1-0.dll	_initterm	cdecl	void	void	begin:callback*:ptr:1|end:callback*:ptr:1
 api-ms-win-crt-runtime-l1-1-0.dll	_initterm_e	cdecl	i32	i32	begin:callback*:ptr:1|end:callback*:ptr:1
 api-ms-win-crt-runtime-l1-1-0.dll	_register_onexit_function	cdecl	i32	i32	table:_onexit_table_t*:ptr:1|function:callback:ptr:1
+api-ms-win-crt-runtime-l1-1-0.dll	_seh_filter_dll	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
+api-ms-win-crt-runtime-l1-1-0.dll	_seh_filter_exe	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
 api-ms-win-crt-runtime-l1-1-0.dll	_set_doserrno	cdecl	i32	errno_t	value:unsigned long:u32:1
 api-ms-win-crt-runtime-l1-1-0.dll	_set_errno	cdecl	i32	errno_t	value:int:i32:1
 api-ms-win-crt-runtime-l1-1-0.dll	_set_invalid_parameter_handler	cdecl	ptr	callback	handler:callback:ptr:1
@@ -742,7 +746,9 @@ api-ms-win-crt-runtime-l1-1-0.dll	_sleep	cdecl	void	void	milliseconds:unsigned l
 api-ms-win-crt-runtime-l1-1-0.dll	_wsystem	cdecl	i32	int	command:const wchar_t*:str16:1
 api-ms-win-crt-runtime-l1-1-0.dll	abort	cdecl	void	void	
 api-ms-win-crt-runtime-l1-1-0.dll	exit	cdecl	void	void	status:i32:i32:1
+api-ms-win-crt-runtime-l1-1-0.dll	raise	cdecl	i32	int	number:int:i32:1
 api-ms-win-crt-runtime-l1-1-0.dll	set_terminate	cdecl	ptr	callback	handler:callback:ptr:1
+api-ms-win-crt-runtime-l1-1-0.dll	signal	cdecl	ptr	_crt_signal_t	number:int:i32:1|action:_crt_signal_t:ptr:1
 api-ms-win-crt-runtime-l1-1-0.dll	system	cdecl	i32	int	command:const char*:str8:1
 api-ms-win-crt-runtime-l1-1-0.dll	terminate	cdecl	void	void	
 api-ms-win-crt-stdio-l1-1-0.dll	_pclose	cdecl	i32	int	stream:FILE*:ptr:1
@@ -4632,12 +4638,16 @@ msvcr100.dll	_CxxThrowException	stdcall	void	void	object:void*:ptr:1|info:_Throw
 msvcr100.dll	_EH_prolog	cdecl	void	void	
 msvcr100.dll	_HUGE	data	f64	double	
 msvcr100.dll	_NLG_Return2	cdecl	void	void	
+msvcr100.dll	_XcptFilter	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
+msvcr100.dll	__CppXcptFilter	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
 msvcr100.dll	__CxxFrameHandler	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 msvcr100.dll	__CxxFrameHandler2	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 msvcr100.dll	__CxxFrameHandler3	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 msvcr100.dll	__CxxLongjmpUnwind	stdcall	void	void	buffer:_JUMP_BUFFER*:ptr:1
 msvcr100.dll	__CxxQueryExceptionSize	cdecl	u32	size_t	
 msvcr100.dll	__doserrno	cdecl	ptr	unsigned long*	
+msvcr100.dll	__fpecode	cdecl	ptr	int*	
+msvcr100.dll	__pxcptinfoptrs	cdecl	ptr	void**	
 msvcr100.dll	__uncaught_exception	cdecl	i32	int	
 msvcr100.dll	_acmdln	data	ptr	char*	
 msvcr100.dll	_aligned_free	cdecl	void	void	block:void*:ptr:1
@@ -4760,7 +4770,9 @@ msvcr100.dll	calloc	cdecl	ptr	void*	count:size_t:u32:1|size:size_t:u32:1
 msvcr100.dll	free	cdecl	void	void	pointer:void*:ptr:1
 msvcr100.dll	longjmp	cdecl	void	void	buffer:jmp_buf:ptr:1|value:int:i32:1
 msvcr100.dll	malloc	cdecl	ptr	void*	size:size_t:u32:1
+msvcr100.dll	raise	cdecl	i32	int	number:int:i32:1
 msvcr100.dll	realloc	cdecl	ptr	void*	pointer:void*:ptr:1|size:size_t:u32:1
+msvcr100.dll	signal	cdecl	ptr	_crt_signal_t	number:int:i32:1|action:_crt_signal_t:ptr:1
 msvcr100.dll	strcat	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1
 msvcr100.dll	strchr	cdecl	ptr	char*	text:const char*:str8:1|value:int:i32:1
 msvcr100.dll	strcmp	cdecl	i32	int	left:const char*:str8:1|right:const char*:str8:1
@@ -4806,12 +4818,16 @@ msvcr110.dll	_CxxThrowException	stdcall	void	void	object:void*:ptr:1|info:_Throw
 msvcr110.dll	_EH_prolog	cdecl	void	void	
 msvcr110.dll	_HUGE	data	f64	double	
 msvcr110.dll	_NLG_Return2	cdecl	void	void	
+msvcr110.dll	_XcptFilter	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
+msvcr110.dll	__CppXcptFilter	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
 msvcr110.dll	__CxxFrameHandler	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 msvcr110.dll	__CxxFrameHandler2	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 msvcr110.dll	__CxxFrameHandler3	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 msvcr110.dll	__CxxLongjmpUnwind	stdcall	void	void	buffer:_JUMP_BUFFER*:ptr:1
 msvcr110.dll	__CxxQueryExceptionSize	cdecl	u32	size_t	
 msvcr110.dll	__doserrno	cdecl	ptr	unsigned long*	
+msvcr110.dll	__fpecode	cdecl	ptr	int*	
+msvcr110.dll	__pxcptinfoptrs	cdecl	ptr	void**	
 msvcr110.dll	__uncaught_exception	cdecl	i32	int	
 msvcr110.dll	_acmdln	data	ptr	char*	
 msvcr110.dll	_aligned_free	cdecl	void	void	block:void*:ptr:1
@@ -4934,7 +4950,9 @@ msvcr110.dll	calloc	cdecl	ptr	void*	count:size_t:u32:1|size:size_t:u32:1
 msvcr110.dll	free	cdecl	void	void	pointer:void*:ptr:1
 msvcr110.dll	longjmp	cdecl	void	void	buffer:jmp_buf:ptr:1|value:int:i32:1
 msvcr110.dll	malloc	cdecl	ptr	void*	size:size_t:u32:1
+msvcr110.dll	raise	cdecl	i32	int	number:int:i32:1
 msvcr110.dll	realloc	cdecl	ptr	void*	pointer:void*:ptr:1|size:size_t:u32:1
+msvcr110.dll	signal	cdecl	ptr	_crt_signal_t	number:int:i32:1|action:_crt_signal_t:ptr:1
 msvcr110.dll	strcat	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1
 msvcr110.dll	strchr	cdecl	ptr	char*	text:const char*:str8:1|value:int:i32:1
 msvcr110.dll	strcmp	cdecl	i32	int	left:const char*:str8:1|right:const char*:str8:1
@@ -4980,12 +4998,16 @@ msvcr120.dll	_CxxThrowException	stdcall	void	void	object:void*:ptr:1|info:_Throw
 msvcr120.dll	_EH_prolog	cdecl	void	void	
 msvcr120.dll	_HUGE	data	f64	double	
 msvcr120.dll	_NLG_Return2	cdecl	void	void	
+msvcr120.dll	_XcptFilter	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
+msvcr120.dll	__CppXcptFilter	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
 msvcr120.dll	__CxxFrameHandler	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 msvcr120.dll	__CxxFrameHandler2	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 msvcr120.dll	__CxxFrameHandler3	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 msvcr120.dll	__CxxLongjmpUnwind	stdcall	void	void	buffer:_JUMP_BUFFER*:ptr:1
 msvcr120.dll	__CxxQueryExceptionSize	cdecl	u32	size_t	
 msvcr120.dll	__doserrno	cdecl	ptr	unsigned long*	
+msvcr120.dll	__fpecode	cdecl	ptr	int*	
+msvcr120.dll	__pxcptinfoptrs	cdecl	ptr	void**	
 msvcr120.dll	__uncaught_exception	cdecl	i32	int	
 msvcr120.dll	_acmdln	data	ptr	char*	
 msvcr120.dll	_aligned_free	cdecl	void	void	block:void*:ptr:1
@@ -5110,7 +5132,9 @@ msvcr120.dll	calloc	cdecl	ptr	void*	count:size_t:u32:1|size:size_t:u32:1
 msvcr120.dll	free	cdecl	void	void	pointer:void*:ptr:1
 msvcr120.dll	longjmp	cdecl	void	void	buffer:jmp_buf:ptr:1|value:int:i32:1
 msvcr120.dll	malloc	cdecl	ptr	void*	size:size_t:u32:1
+msvcr120.dll	raise	cdecl	i32	int	number:int:i32:1
 msvcr120.dll	realloc	cdecl	ptr	void*	pointer:void*:ptr:1|size:size_t:u32:1
+msvcr120.dll	signal	cdecl	ptr	_crt_signal_t	number:int:i32:1|action:_crt_signal_t:ptr:1
 msvcr120.dll	strcat	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1
 msvcr120.dll	strchr	cdecl	ptr	char*	text:const char*:str8:1|value:int:i32:1
 msvcr120.dll	strcmp	cdecl	i32	int	left:const char*:str8:1|right:const char*:str8:1
@@ -5156,10 +5180,13 @@ msvcr70.dll	?unexpected@@YAXXZ	cdecl	void	void
 msvcr70.dll	_CxxThrowException	stdcall	void	void	object:void*:ptr:1|info:_ThrowInfo*:ptr:1
 msvcr70.dll	_EH_prolog	cdecl	void	void	
 msvcr70.dll	_HUGE	data	f64	double	
+msvcr70.dll	_XcptFilter	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
 msvcr70.dll	__CxxFrameHandler	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 msvcr70.dll	__CxxLongjmpUnwind	stdcall	void	void	buffer:_JUMP_BUFFER*:ptr:1
 msvcr70.dll	__CxxQueryExceptionSize	cdecl	u32	size_t	
 msvcr70.dll	__doserrno	cdecl	ptr	unsigned long*	
+msvcr70.dll	__fpecode	cdecl	ptr	int*	
+msvcr70.dll	__pxcptinfoptrs	cdecl	ptr	void**	
 msvcr70.dll	__uncaught_exception	cdecl	i32	int	
 msvcr70.dll	_acmdln	data	ptr	char*	
 msvcr70.dll	_adjust_fdiv	data	i32	int	
@@ -5257,7 +5284,9 @@ msvcr70.dll	calloc	cdecl	ptr	void*	count:size_t:u32:1|size:size_t:u32:1
 msvcr70.dll	free	cdecl	void	void	pointer:void*:ptr:1
 msvcr70.dll	longjmp	cdecl	void	void	buffer:jmp_buf:ptr:1|value:int:i32:1
 msvcr70.dll	malloc	cdecl	ptr	void*	size:size_t:u32:1
+msvcr70.dll	raise	cdecl	i32	int	number:int:i32:1
 msvcr70.dll	realloc	cdecl	ptr	void*	pointer:void*:ptr:1|size:size_t:u32:1
+msvcr70.dll	signal	cdecl	ptr	_crt_signal_t	number:int:i32:1|action:_crt_signal_t:ptr:1
 msvcr70.dll	strcat	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1
 msvcr70.dll	strchr	cdecl	ptr	char*	text:const char*:str8:1|value:int:i32:1
 msvcr70.dll	strcmp	cdecl	i32	int	left:const char*:str8:1|right:const char*:str8:1
@@ -5297,10 +5326,14 @@ msvcr71.dll	?unexpected@@YAXXZ	cdecl	void	void
 msvcr71.dll	_CxxThrowException	stdcall	void	void	object:void*:ptr:1|info:_ThrowInfo*:ptr:1
 msvcr71.dll	_EH_prolog	cdecl	void	void	
 msvcr71.dll	_HUGE	data	f64	double	
+msvcr71.dll	_XcptFilter	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
+msvcr71.dll	__CppXcptFilter	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
 msvcr71.dll	__CxxFrameHandler	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 msvcr71.dll	__CxxLongjmpUnwind	stdcall	void	void	buffer:_JUMP_BUFFER*:ptr:1
 msvcr71.dll	__CxxQueryExceptionSize	cdecl	u32	size_t	
 msvcr71.dll	__doserrno	cdecl	ptr	unsigned long*	
+msvcr71.dll	__fpecode	cdecl	ptr	int*	
+msvcr71.dll	__pxcptinfoptrs	cdecl	ptr	void**	
 msvcr71.dll	__uncaught_exception	cdecl	i32	int	
 msvcr71.dll	_acmdln	data	ptr	char*	
 msvcr71.dll	_adjust_fdiv	data	i32	int	
@@ -5399,7 +5432,9 @@ msvcr71.dll	calloc	cdecl	ptr	void*	count:size_t:u32:1|size:size_t:u32:1
 msvcr71.dll	free	cdecl	void	void	pointer:void*:ptr:1
 msvcr71.dll	longjmp	cdecl	void	void	buffer:jmp_buf:ptr:1|value:int:i32:1
 msvcr71.dll	malloc	cdecl	ptr	void*	size:size_t:u32:1
+msvcr71.dll	raise	cdecl	i32	int	number:int:i32:1
 msvcr71.dll	realloc	cdecl	ptr	void*	pointer:void*:ptr:1|size:size_t:u32:1
+msvcr71.dll	signal	cdecl	ptr	_crt_signal_t	number:int:i32:1|action:_crt_signal_t:ptr:1
 msvcr71.dll	strcat	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1
 msvcr71.dll	strchr	cdecl	ptr	char*	text:const char*:str8:1|value:int:i32:1
 msvcr71.dll	strcmp	cdecl	i32	int	left:const char*:str8:1|right:const char*:str8:1
@@ -5454,6 +5489,8 @@ msvcr80.dll	_CxxThrowException	stdcall	void	void	object:void*:ptr:1|info:_ThrowI
 msvcr80.dll	_EH_prolog	cdecl	void	void	
 msvcr80.dll	_HUGE	data	f64	double	
 msvcr80.dll	_NLG_Return2	cdecl	void	void	
+msvcr80.dll	_XcptFilter	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
+msvcr80.dll	__CppXcptFilter	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
 msvcr80.dll	__CxxFrameHandler	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 msvcr80.dll	__CxxFrameHandler2	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 msvcr80.dll	__CxxFrameHandler3	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
@@ -5461,7 +5498,9 @@ msvcr80.dll	__CxxLongjmpUnwind	stdcall	void	void	buffer:_JUMP_BUFFER*:ptr:1
 msvcr80.dll	__CxxQueryExceptionSize	cdecl	u32	size_t	
 msvcr80.dll	__control87_2	cdecl	i32	i32	newControl:u32:u32:1|mask:u32:u32:1|x86Control:u32*:ptr:1|sse2Control:u32*:ptr:1
 msvcr80.dll	__doserrno	cdecl	ptr	unsigned long*	
+msvcr80.dll	__fpecode	cdecl	ptr	int*	
 msvcr80.dll	__getmainargs	cdecl	i32	i32	argc:int*:ptr:1|argv:char***:ptr:1|environment:char***:ptr:1|wildcard:int:i32:1|startup:_startupinfo*:ptr:1
+msvcr80.dll	__pxcptinfoptrs	cdecl	ptr	void**	
 msvcr80.dll	__uncaught_exception	cdecl	i32	int	
 msvcr80.dll	__wgetmainargs	cdecl	i32	i32	argc:int*:ptr:1|argv:wchar_t***:ptr:1|environment:wchar_t***:ptr:1|wildcard:int:i32:1|startup:_startupinfo*:ptr:1
 msvcr80.dll	_acmdln	data	ptr	char*	
@@ -5643,9 +5682,11 @@ msvcr80.dll	modf	cdecl	f64	double	value:double:f64:2|integer:double*:ptr:1
 msvcr80.dll	pow	cdecl	f64	double	x:double:f64:2|y:double:f64:2
 msvcr80.dll	putc	cdecl	i32	int	character:int:i32:1|stream:FILE*:ptr:1
 msvcr80.dll	qsort	cdecl	void	void	base:void*:ptr:1|number:size_t:u32:1|width:size_t:u32:1|compare:fn*:ptr:1
+msvcr80.dll	raise	cdecl	i32	int	number:int:i32:1
 msvcr80.dll	rand	cdecl	i32	int	
 msvcr80.dll	realloc	cdecl	ptr	void*	pointer:void*:ptr:1|size:size_t:u32:1
 msvcr80.dll	setlocale	cdecl	ptr	char*	category:int:i32:1|locale:const char*:str8:1
+msvcr80.dll	signal	cdecl	ptr	_crt_signal_t	number:int:i32:1|action:_crt_signal_t:ptr:1
 msvcr80.dll	sprintf	variadic	i32	int	buffer:char*:str8:1|format:const char*:str8:1
 msvcr80.dll	sprintf_s	variadic	i32	int	buffer:char*:str8:1|capacity:size_t:u32:1|format:const char*:str8:1
 msvcr80.dll	srand	cdecl	void	void	seed:unsigned int:u32:1
@@ -5712,6 +5753,8 @@ msvcr90.dll	_CxxThrowException	stdcall	void	void	object:void*:ptr:1|info:_ThrowI
 msvcr90.dll	_EH_prolog	cdecl	void	void	
 msvcr90.dll	_HUGE	data	f64	double	
 msvcr90.dll	_NLG_Return2	cdecl	void	void	
+msvcr90.dll	_XcptFilter	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
+msvcr90.dll	__CppXcptFilter	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
 msvcr90.dll	__CxxFrameHandler	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 msvcr90.dll	__CxxFrameHandler2	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 msvcr90.dll	__CxxFrameHandler3	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
@@ -5721,8 +5764,10 @@ msvcr90.dll	___lc_codepage_func	cdecl	u32	unsigned int
 msvcr90.dll	___lc_handle_func	cdecl	ptr	LCID*	
 msvcr90.dll	__control87_2	cdecl	i32	i32	newControl:u32:u32:1|mask:u32:u32:1|x86Control:u32*:ptr:1|sse2Control:u32*:ptr:1
 msvcr90.dll	__doserrno	cdecl	ptr	unsigned long*	
+msvcr90.dll	__fpecode	cdecl	ptr	int*	
 msvcr90.dll	__getmainargs	cdecl	i32	i32	argc:int*:ptr:1|argv:char***:ptr:1|environment:char***:ptr:1|wildcard:int:i32:1|startup:_startupinfo*:ptr:1
 msvcr90.dll	__pctype_func	cdecl	ptr	const unsigned short*	
+msvcr90.dll	__pxcptinfoptrs	cdecl	ptr	void**	
 msvcr90.dll	__uncaught_exception	cdecl	u32	bool	
 msvcr90.dll	__wgetmainargs	cdecl	i32	i32	argc:int*:ptr:1|argv:wchar_t***:ptr:1|environment:wchar_t***:ptr:1|wildcard:int:i32:1|startup:_startupinfo*:ptr:1
 msvcr90.dll	_acmdln	data	ptr	char*	
@@ -5906,9 +5951,11 @@ msvcr90.dll	modf	cdecl	f64	double	value:double:f64:2|integer:double*:ptr:1
 msvcr90.dll	pow	cdecl	f64	double	x:double:f64:2|y:double:f64:2
 msvcr90.dll	putc	cdecl	i32	int	character:int:i32:1|stream:FILE*:ptr:1
 msvcr90.dll	qsort	cdecl	void	void	base:void*:ptr:1|number:size_t:u32:1|width:size_t:u32:1|compare:fn*:ptr:1
+msvcr90.dll	raise	cdecl	i32	int	number:int:i32:1
 msvcr90.dll	rand	cdecl	i32	int	
 msvcr90.dll	realloc	cdecl	ptr	void*	pointer:void*:ptr:1|size:size_t:u32:1
 msvcr90.dll	setlocale	cdecl	ptr	char*	category:int:i32:1|locale:const char*:str8:1
+msvcr90.dll	signal	cdecl	ptr	_crt_signal_t	number:int:i32:1|action:_crt_signal_t:ptr:1
 msvcr90.dll	sprintf	variadic	i32	int	buffer:char*:str8:1|format:const char*:str8:1
 msvcr90.dll	sprintf_s	variadic	i32	int	buffer:char*:str8:1|capacity:size_t:u32:1|format:const char*:str8:1
 msvcr90.dll	srand	cdecl	void	void	seed:unsigned int:u32:1
@@ -5971,13 +6018,17 @@ msvcrt.dll	_CItan	cdecl	void	void
 msvcrt.dll	_CxxThrowException	stdcall	void	void	object:void*:ptr:1|info:_ThrowInfo*:ptr:1
 msvcrt.dll	_EH_prolog	cdecl	void	void	
 msvcrt.dll	_HUGE	data	f64	double	
+msvcrt.dll	_XcptFilter	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
+msvcrt.dll	__CppXcptFilter	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
 msvcrt.dll	__CxxFrameHandler	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 msvcrt.dll	__CxxFrameHandler2	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 msvcrt.dll	__CxxFrameHandler3	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 msvcrt.dll	__CxxLongjmpUnwind	stdcall	void	void	buffer:_JUMP_BUFFER*:ptr:1
 msvcrt.dll	__CxxQueryExceptionSize	cdecl	u32	size_t	
 msvcrt.dll	__doserrno	cdecl	ptr	unsigned long*	
+msvcrt.dll	__fpecode	cdecl	ptr	int*	
 msvcrt.dll	__getmainargs	cdecl	i32	i32	argc:int*:ptr:1|argv:char***:ptr:1|environment:char***:ptr:1|wildcard:int:i32:1|startup:_startupinfo*:ptr:1
+msvcrt.dll	__pxcptinfoptrs	cdecl	ptr	void**	
 msvcrt.dll	__uncaught_exception	cdecl	i32	int	
 msvcrt.dll	__wgetmainargs	cdecl	i32	i32	argc:int*:ptr:1|argv:wchar_t***:ptr:1|environment:wchar_t***:ptr:1|wildcard:int:i32:1|startup:_startupinfo*:ptr:1
 msvcrt.dll	_access	cdecl	i32	int	path:const char*:str8:1|mode:int:i32:1
@@ -6142,9 +6193,11 @@ msvcrt.dll	modf	cdecl	f64	double	value:double:f64:2|integer:double*:ptr:1
 msvcrt.dll	pow	cdecl	f64	double	x:double:f64:2|y:double:f64:2
 msvcrt.dll	putc	cdecl	i32	int	character:int:i32:1|stream:FILE*:ptr:1
 msvcrt.dll	qsort	cdecl	void	void	base:void*:ptr:1|number:size_t:u32:1|width:size_t:u32:1|compare:fn*:ptr:1
+msvcrt.dll	raise	cdecl	i32	int	number:int:i32:1
 msvcrt.dll	rand	cdecl	i32	int	
 msvcrt.dll	realloc	cdecl	ptr	void*	pointer:void*:ptr:1|size:size_t:u32:1
 msvcrt.dll	setlocale	cdecl	ptr	char*	category:int:i32:1|locale:const char*:str8:1
+msvcrt.dll	signal	cdecl	ptr	_crt_signal_t	number:int:i32:1|action:_crt_signal_t:ptr:1
 msvcrt.dll	sprintf	variadic	i32	int	buffer:char*:str8:1|format:const char*:str8:1
 msvcrt.dll	srand	cdecl	void	void	seed:unsigned int:u32:1
 msvcrt.dll	strcat	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1
@@ -6189,9 +6242,12 @@ msvcrt20.dll	?terminate@@YAXXZ	cdecl	void	void
 msvcrt20.dll	?unexpected@@YAXXZ	cdecl	void	void	
 msvcrt20.dll	_CxxThrowException	stdcall	void	void	object:void*:ptr:1|info:_ThrowInfo*:ptr:1
 msvcrt20.dll	_HUGE	data	f64	double	
+msvcrt20.dll	_XcptFilter	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
 msvcrt20.dll	__CxxFrameHandler	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 msvcrt20.dll	__CxxLongjmpUnwind	stdcall	void	void	buffer:_JUMP_BUFFER*:ptr:1
 msvcrt20.dll	__doserrno	cdecl	ptr	unsigned long*	
+msvcrt20.dll	__fpecode	cdecl	ptr	int*	
+msvcrt20.dll	__pxcptinfoptrs	cdecl	ptr	void**	
 msvcrt20.dll	_acmdln	data	ptr	char*	
 msvcrt20.dll	_adjust_fdiv	data	i32	int	
 msvcrt20.dll	_amsg_exit	cdecl	void	void	code:int:i32:1
@@ -6273,7 +6329,9 @@ msvcrt20.dll	calloc	cdecl	ptr	void*	count:size_t:u32:1|size:size_t:u32:1
 msvcrt20.dll	free	cdecl	void	void	pointer:void*:ptr:1
 msvcrt20.dll	longjmp	cdecl	void	void	buffer:jmp_buf:ptr:1|value:int:i32:1
 msvcrt20.dll	malloc	cdecl	ptr	void*	size:size_t:u32:1
+msvcrt20.dll	raise	cdecl	i32	int	number:int:i32:1
 msvcrt20.dll	realloc	cdecl	ptr	void*	pointer:void*:ptr:1|size:size_t:u32:1
+msvcrt20.dll	signal	cdecl	ptr	_crt_signal_t	number:int:i32:1|action:_crt_signal_t:ptr:1
 msvcrt20.dll	strcat	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1
 msvcrt20.dll	strchr	cdecl	ptr	char*	text:const char*:str8:1|value:int:i32:1
 msvcrt20.dll	strcmp	cdecl	i32	int	left:const char*:str8:1|right:const char*:str8:1
@@ -6313,9 +6371,12 @@ msvcrt40.dll	?unexpected@@YAXXZ	cdecl	void	void
 msvcrt40.dll	_CxxThrowException	stdcall	void	void	object:void*:ptr:1|info:_ThrowInfo*:ptr:1
 msvcrt40.dll	_EH_prolog	cdecl	void	void	
 msvcrt40.dll	_HUGE	data	f64	double	
+msvcrt40.dll	_XcptFilter	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
 msvcrt40.dll	__CxxFrameHandler	cdecl	i32	EXCEPTION_DISPOSITION	record:EXCEPTION_RECORD*:ptr:1|frame:void*:ptr:1|context:CONTEXT*:ptr:1|dispatcher:void*:ptr:1
 msvcrt40.dll	__CxxLongjmpUnwind	stdcall	void	void	buffer:_JUMP_BUFFER*:ptr:1
 msvcrt40.dll	__doserrno	cdecl	ptr	unsigned long*	
+msvcrt40.dll	__fpecode	cdecl	ptr	int*	
+msvcrt40.dll	__pxcptinfoptrs	cdecl	ptr	void**	
 msvcrt40.dll	_acmdln	data	ptr	char*	
 msvcrt40.dll	_adjust_fdiv	data	i32	int	
 msvcrt40.dll	_amsg_exit	cdecl	void	void	code:int:i32:1
@@ -6397,7 +6458,9 @@ msvcrt40.dll	calloc	cdecl	ptr	void*	count:size_t:u32:1|size:size_t:u32:1
 msvcrt40.dll	free	cdecl	void	void	pointer:void*:ptr:1
 msvcrt40.dll	longjmp	cdecl	void	void	buffer:jmp_buf:ptr:1|value:int:i32:1
 msvcrt40.dll	malloc	cdecl	ptr	void*	size:size_t:u32:1
+msvcrt40.dll	raise	cdecl	i32	int	number:int:i32:1
 msvcrt40.dll	realloc	cdecl	ptr	void*	pointer:void*:ptr:1|size:size_t:u32:1
+msvcrt40.dll	signal	cdecl	ptr	_crt_signal_t	number:int:i32:1|action:_crt_signal_t:ptr:1
 msvcrt40.dll	strcat	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1
 msvcrt40.dll	strchr	cdecl	ptr	char*	text:const char*:str8:1|value:int:i32:1
 msvcrt40.dll	strcmp	cdecl	i32	int	left:const char*:str8:1|right:const char*:str8:1
@@ -9251,6 +9314,8 @@ ucrtbase.dll	__CxxLongjmpUnwind	stdcall	void	void	buffer:_JUMP_BUFFER*:ptr:1
 ucrtbase.dll	__CxxQueryExceptionSize	cdecl	u32	size_t	
 ucrtbase.dll	__control87_2	cdecl	i32	i32	newControl:u32:u32:1|mask:u32:u32:1|x86Control:u32*:ptr:1|sse2Control:u32*:ptr:1
 ucrtbase.dll	__doserrno	cdecl	ptr	unsigned long*	
+ucrtbase.dll	__fpecode	cdecl	ptr	int*	
+ucrtbase.dll	__pxcptinfoptrs	cdecl	ptr	void**	
 ucrtbase.dll	__std_terminate	cdecl	void	void	
 ucrtbase.dll	__uncaught_exception	cdecl	i32	int	
 ucrtbase.dll	__uncaught_exceptions	cdecl	u32	unsigned int	
@@ -9331,6 +9396,8 @@ ucrtbase.dll	_pclose	cdecl	i32	int	stream:FILE*:ptr:1
 ucrtbase.dll	_popen	cdecl	ptr	FILE*	command:const char*:str8:1|mode:const char*:str8:1
 ucrtbase.dll	_purecall	cdecl	i32	int	
 ucrtbase.dll	_register_onexit_function	cdecl	i32	i32	table:_onexit_table_t*:ptr:1|function:callback:ptr:1
+ucrtbase.dll	_seh_filter_dll	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
+ucrtbase.dll	_seh_filter_exe	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
 ucrtbase.dll	_set_doserrno	cdecl	i32	errno_t	value:unsigned long:u32:1
 ucrtbase.dll	_set_errno	cdecl	i32	errno_t	value:int:i32:1
 ucrtbase.dll	_set_invalid_parameter_handler	cdecl	ptr	callback	handler:callback:ptr:1
@@ -9398,9 +9465,11 @@ ucrtbase.dll	malloc	cdecl	ptr	void*	size:size_t:u32:1
 ucrtbase.dll	memchr	cdecl	ptr	void*	buffer:const void*:ptr:1|value:int:i32:1|count:size_t:u32:1
 ucrtbase.dll	memcpy_s	cdecl	i32	errno_t	destination:void*:ptr:1|capacity:size_t:u32:1|source:const void*:ptr:1|count:size_t:u32:1
 ucrtbase.dll	memmove_s	cdecl	i32	errno_t	destination:void*:ptr:1|capacity:size_t:u32:1|source:const void*:ptr:1|count:size_t:u32:1
+ucrtbase.dll	raise	cdecl	i32	int	number:int:i32:1
 ucrtbase.dll	realloc	cdecl	ptr	void*	block:void*:ptr:1|size:size_t:u32:1
 ucrtbase.dll	set_terminate	cdecl	ptr	callback	handler:callback:ptr:1
 ucrtbase.dll	set_unexpected	cdecl	ptr	callback	handler:callback:ptr:1
+ucrtbase.dll	signal	cdecl	ptr	_crt_signal_t	number:int:i32:1|action:_crt_signal_t:ptr:1
 ucrtbase.dll	strcat	cdecl	ptr	char*	destination:char*:str8:1|source:const char*:str8:1
 ucrtbase.dll	strchr	cdecl	ptr	char*	text:const char*:str8:1|value:int:i32:1
 ucrtbase.dll	strcmp	cdecl	i32	int	left:const char*:str8:1|right:const char*:str8:1

@@ -14,8 +14,7 @@ pub(super) fn register(registry: &mut Registry) {
 }
 
 pub(super) fn abort(env: &mut Env<'_>) -> Outcome {
-    // The default SIGABRT action ends without draining CRT atexit callbacks.
-    crate::kernel32::exit_process(env, 3)
+    signals::abort(env)
 }
 fn runtime_error(env: &mut Env<'_>) -> Outcome {
     // Native VC90 reports the runtime code, then takes its immediate exit path

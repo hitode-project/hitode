@@ -45,6 +45,7 @@ mod scan;
 mod secure_memory;
 mod seh;
 mod shared_file;
+mod signals;
 mod startup;
 mod stream_position;
 mod strings;
@@ -67,6 +68,7 @@ struct CrtState {
     cpp_eh_threads: HashMap<(String, u32), cpp_eh::Thread>,
     cpp_threads: HashMap<(String, u32), cpp_runtime::Thread>,
     purecall_handlers: HashMap<String, u32>,
+    signals: signals::State,
 }
 
 // The NT handle owns bytes; FILE retains read-ahead and its logical cursor.
@@ -185,6 +187,7 @@ pub fn register(r: &mut Registry) {
     secure_memory::register(r);
     seh::register(r);
     shared_file::register(r);
+    signals::register(r);
     stream_position::register(r);
     thread::register(r);
     heap::register(r);
@@ -224,7 +227,6 @@ pub fn register(r: &mut Registry) {
         ("_splitpath", 5),
         ("_makepath", 5),
         ("_beginthread", 3),
-        ("_XcptFilter", 2),
         ("__setusermatherr", 1),
         ("getenv", 1),
         ("??_U@YAPAXI@Z", 1),
@@ -328,6 +330,7 @@ pub(crate) fn detach_thread(env: &mut Env<'_>) -> Result<(), String> {
     if let Some(state) = env.ext.try_get_mut::<CrtState>() {
         state.cpp_eh_threads.retain(|(_, id), _| *id != context);
         state.cpp_threads.retain(|(_, id), _| *id != context);
+        state.signals.release(Some(context));
     }
     random::release(env, Some(env.context));
     time64::release(env, Some(env.context))?;
@@ -339,6 +342,7 @@ pub(crate) fn detach_process(env: &mut Env<'_>) -> Result<(), String> {
     if let Some(state) = env.ext.try_get_mut::<CrtState>() {
         state.cpp_eh_threads.clear();
         state.cpp_threads.clear();
+        state.signals.release(None);
         state.purecall_handlers.clear();
     }
     random::release(env, None);
@@ -1210,7 +1214,6 @@ fn call(e: &mut Env<'_>) -> Outcome {
                 Err(_) => u32::MAX,
             }
         }
-        "_XcptFilter" => 1,
         "__setusermatherr" => 0,
         "frexp" => {
             let x = match double(e) {
@@ -1506,6 +1509,9 @@ mod tests {
             let free = m.resolve_import("ucrtbase.dll", "free").unwrap();
             let errno = m.resolve_import("ucrtbase.dll", "_errno").unwrap();
             let mut a = CodeAssembler::new(32).unwrap();
+            // Allocate thread storage first: a later errno allocation may
+            // legitimately reuse the original user block after realloc moves it.
+            a.call(u64::from(errno)).unwrap();
             a.push(16).unwrap();
             a.call(u64::from(malloc)).unwrap();
             a.add(esp, 4).unwrap();

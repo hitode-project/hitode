@@ -81,4 +81,14 @@ This spec covers the Microsoft C runtimes the guest links: every msvcrt and msvc
 **Rule**: Default CRT abort MUST terminate through the Windows process owner with status three, without draining CRT exit callbacks. Runtime-error termination MUST use status 255 through that same owner. Debugger notifications MUST NOT fabricate a recipient or capability warning when no debugger is attached.
 **Verification**: Test
 
+### CRT-LIB-16 Signal ownership and delivery
+
+**Rule**: CRT process signals MUST share module slots, while fault signals MUST retain independent per-thread exception entries. Delivery MUST reset the relevant user handler before invoking guest code, and ignored signals MUST return normally. SIGABRT aliases MUST share state, while explicit raise preserves the original callback number.
+**Verification**: Test
+
+### CRT-LIB-17 Signal context and filtering
+
+**Rule**: Signal FP-code and exception-pointer cells MUST share the error-cell allocation and lifetime, expose callback context/reason and restore prior values on normal return. Filters MUST derive dispositions from native actions, retaining ten legacy fault entries and twelve UCRT entries including both SSE statuses. Nonlocal signal exits MUST abandon the CRT continuation without restoring prior cells or resuming termination.
+**Verification**: Test
+
 Withdrawn: none

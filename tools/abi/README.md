@@ -157,7 +157,7 @@ across all cataloged versions, without locale conversion or a fixed length cap.
 
 WinMD omits CRT exports.
 `data/abi/crt-input.tsv` supplies supported x86 scalar and pointer declarations for CRT functions and data storage.
-SDK declarations come from 10.0.26100.0 float.h, stdlib.h, errno.h, process.h, corecrt_startup.h, corecrt_wstdlib.h, corecrt_malloc.h and corecrt_wstring.h.
+SDK declarations come from 10.0.26100.0 float.h, stdlib.h, errno.h, process.h, corecrt_startup.h, corecrt_wstdlib.h, corecrt_malloc.h, corecrt_wstring.h and signal.h.
 Secure byte-copy declarations use the same SDK's `corecrt_memcpy_s.h`.
 Scalar C++ allocation declarations use MSVC Build Tools 14.44.35207 `vcruntime_new.h`.
 [crt-source.json](../../data/abi/crt-source.json) records their SHA-256 values and official documentation; no SDK header is copied.
@@ -179,6 +179,9 @@ VC14's standard terminate entry uses UCRT's slot.
 Returning terminate handlers take the shared public abort path; returning unexpected handlers enter terminate.
 Default abort/runtime-error exits use the Windows process owner with statuses 3/255,
 bypassing CRT exit callbacks. Debugger hooks have no recipient in this profile.
+Signal/raise and legacy exception filters share CRT module/thread signal slots;
+FP-code and exception-pointer cells extend the existing errno allocation. Native
+handler reset, context restoration and UCRT validation differences remain explicit.
 Their callbacks execute as guest code, preserving explicit exits.
 
 The x86 internal SEH helpers use explicit ABI rows: EH2/EH3 take four cdecl arguments, EH4 common takes six, and local/global helpers retain caller cleanup.

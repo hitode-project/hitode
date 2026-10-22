@@ -708,5 +708,30 @@
     ],
     "internal_abi": "Native Microsoft VC90 establishes void cdecl _amsg_exit(int) from its parameter load and immediate exit status 255. _crt_debugger_hook is void cdecl(int), established by its callers; the body clears an unexported debugger word without reading the input. No Windows native execution is claimed.",
     "environment": "No debugger or console is attached. The debugger hook has no recipient. Default abort exits with status 3; runtime errors exit with status 255. Both use the existing Windows process owner without draining CRT atexit callbacks; C++ termination shares the abort body."
+  },
+  "signals": {
+    "headers": [
+      {
+        "source": "Microsoft Windows SDK 10.0.26100.0 ucrt/signal.h",
+        "sha256": "3ba6c4e39e0996dcb9161b99e3baeb39ca7670beb93c8e63312fed1754e64997"
+      },
+      {
+        "source": "Microsoft Windows SDK 10.0.26100.0 ucrt/float.h",
+        "sha256": "0fbf87532c053b666940a65360f2488f5b6bb2e601632e32a0f1a8a078d8fdcd"
+      },
+      {
+        "source": "Microsoft Windows SDK 10.0.26100.0 ucrt/corecrt_startup.h",
+        "sha256": "2e2e27515bfe462435f5222022e5afdc84a50f093f87ade27db8afcaea202cb7"
+      }
+    ],
+    "documentation": [
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/signal",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/raise",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/fpecode",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/pxcptinfoptrs"
+    ],
+    "ownership": "Process signal slots live in the existing CRT module owner; SIGILL/SIGFPE/SIGSEGV retain per-thread native exception-table entries. errno, DOS errno, fpecode and exception pointers share one existing module/thread guest allocation and detach lifetime. No external console events are possible in the configured no-console profile.",
+    "native_evidence": "Pinned Microsoft VC90 establishes SIG_GET queries, SIGABRT 6/22 sharing (while raise retains the original callback argument), process/thread split, pre-call handler reset, explicit FP reason 0x8c, pointer/FPE save-and-restore, and exact fault status mapping. PTD allocation starts zeroed, and its initializer does not change fpecode. Native VC80/VC90/UCRT reserved POSIX numbers 1/3/13/16/17 fail without changing errno. VC80/VC90 invoke invalid-parameter handling for other signal errors; UCRT signal only assigns EINVAL, while its raise invokes validation. Version parameters retain that difference. No native Windows execution is claimed.",
+    "filters": "Legacy _XcptFilter searches ten pinned native fault entries, returns search for default/unknown, continue-execution for ignored/handled and execute-handler for the internal one-shot die action. __CppXcptFilter first rejects non-C++ statuses, then shares this table; the C++ code itself is absent and therefore returns search. No unconditional successful exception handling is fabricated. UCRT _seh_filter_exe uses twelve entries, adding SSE multiple faults/traps with reasons 0x8e/0x8d; _seh_filter_dll retains C++-only gating. The pinned Microsoft UCRT binary establishes both additions."
   }
 }

@@ -2244,3 +2244,74 @@ msvcrt40.dll	_amsg_exit	cdecl	void	void	code:int:i32:1
 msvcrt40.dll	abort	cdecl	void	void	
 ucrtbase.dll	_crt_debugger_hook	cdecl	void	void	reserved:int:i32:1
 ucrtbase.dll	abort	cdecl	void	void	
+
+# SDK signal.h/float.h and pinned native legacy x86 exception-filter ABI.
+api-ms-win-crt-runtime-l1-1-0.dll	__fpecode	cdecl	ptr	int*	
+api-ms-win-crt-runtime-l1-1-0.dll	__pxcptinfoptrs	cdecl	ptr	void**	
+api-ms-win-crt-runtime-l1-1-0.dll	raise	cdecl	i32	int	number:int:i32:1
+api-ms-win-crt-runtime-l1-1-0.dll	signal	cdecl	ptr	_crt_signal_t	number:int:i32:1|action:_crt_signal_t:ptr:1
+msvcr100.dll	_XcptFilter	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
+msvcr100.dll	__CppXcptFilter	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
+msvcr100.dll	__fpecode	cdecl	ptr	int*	
+msvcr100.dll	__pxcptinfoptrs	cdecl	ptr	void**	
+msvcr100.dll	raise	cdecl	i32	int	number:int:i32:1
+msvcr100.dll	signal	cdecl	ptr	_crt_signal_t	number:int:i32:1|action:_crt_signal_t:ptr:1
+msvcr110.dll	_XcptFilter	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
+msvcr110.dll	__CppXcptFilter	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
+msvcr110.dll	__fpecode	cdecl	ptr	int*	
+msvcr110.dll	__pxcptinfoptrs	cdecl	ptr	void**	
+msvcr110.dll	raise	cdecl	i32	int	number:int:i32:1
+msvcr110.dll	signal	cdecl	ptr	_crt_signal_t	number:int:i32:1|action:_crt_signal_t:ptr:1
+msvcr120.dll	_XcptFilter	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
+msvcr120.dll	__CppXcptFilter	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
+msvcr120.dll	__fpecode	cdecl	ptr	int*	
+msvcr120.dll	__pxcptinfoptrs	cdecl	ptr	void**	
+msvcr120.dll	raise	cdecl	i32	int	number:int:i32:1
+msvcr120.dll	signal	cdecl	ptr	_crt_signal_t	number:int:i32:1|action:_crt_signal_t:ptr:1
+msvcr70.dll	_XcptFilter	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
+msvcr70.dll	__fpecode	cdecl	ptr	int*	
+msvcr70.dll	__pxcptinfoptrs	cdecl	ptr	void**	
+msvcr70.dll	raise	cdecl	i32	int	number:int:i32:1
+msvcr70.dll	signal	cdecl	ptr	_crt_signal_t	number:int:i32:1|action:_crt_signal_t:ptr:1
+msvcr71.dll	_XcptFilter	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
+msvcr71.dll	__CppXcptFilter	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
+msvcr71.dll	__fpecode	cdecl	ptr	int*	
+msvcr71.dll	__pxcptinfoptrs	cdecl	ptr	void**	
+msvcr71.dll	raise	cdecl	i32	int	number:int:i32:1
+msvcr71.dll	signal	cdecl	ptr	_crt_signal_t	number:int:i32:1|action:_crt_signal_t:ptr:1
+msvcr80.dll	_XcptFilter	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
+msvcr80.dll	__CppXcptFilter	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
+msvcr80.dll	__fpecode	cdecl	ptr	int*	
+msvcr80.dll	__pxcptinfoptrs	cdecl	ptr	void**	
+msvcr80.dll	raise	cdecl	i32	int	number:int:i32:1
+msvcr80.dll	signal	cdecl	ptr	_crt_signal_t	number:int:i32:1|action:_crt_signal_t:ptr:1
+msvcr90.dll	_XcptFilter	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
+msvcr90.dll	__CppXcptFilter	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
+msvcr90.dll	__fpecode	cdecl	ptr	int*	
+msvcr90.dll	__pxcptinfoptrs	cdecl	ptr	void**	
+msvcr90.dll	raise	cdecl	i32	int	number:int:i32:1
+msvcr90.dll	signal	cdecl	ptr	_crt_signal_t	number:int:i32:1|action:_crt_signal_t:ptr:1
+msvcrt.dll	_XcptFilter	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
+msvcrt.dll	__CppXcptFilter	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
+msvcrt.dll	__fpecode	cdecl	ptr	int*	
+msvcrt.dll	__pxcptinfoptrs	cdecl	ptr	void**	
+msvcrt.dll	raise	cdecl	i32	int	number:int:i32:1
+msvcrt.dll	signal	cdecl	ptr	_crt_signal_t	number:int:i32:1|action:_crt_signal_t:ptr:1
+msvcrt20.dll	_XcptFilter	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
+msvcrt20.dll	__fpecode	cdecl	ptr	int*	
+msvcrt20.dll	__pxcptinfoptrs	cdecl	ptr	void**	
+msvcrt20.dll	raise	cdecl	i32	int	number:int:i32:1
+msvcrt20.dll	signal	cdecl	ptr	_crt_signal_t	number:int:i32:1|action:_crt_signal_t:ptr:1
+msvcrt40.dll	_XcptFilter	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
+msvcrt40.dll	__fpecode	cdecl	ptr	int*	
+msvcrt40.dll	__pxcptinfoptrs	cdecl	ptr	void**	
+msvcrt40.dll	raise	cdecl	i32	int	number:int:i32:1
+msvcrt40.dll	signal	cdecl	ptr	_crt_signal_t	number:int:i32:1|action:_crt_signal_t:ptr:1
+ucrtbase.dll	__fpecode	cdecl	ptr	int*	
+ucrtbase.dll	__pxcptinfoptrs	cdecl	ptr	void**	
+ucrtbase.dll	raise	cdecl	i32	int	number:int:i32:1
+ucrtbase.dll	signal	cdecl	ptr	_crt_signal_t	number:int:i32:1|action:_crt_signal_t:ptr:1
+ucrtbase.dll	_seh_filter_dll	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
+ucrtbase.dll	_seh_filter_exe	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
+api-ms-win-crt-runtime-l1-1-0.dll	_seh_filter_dll	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
+api-ms-win-crt-runtime-l1-1-0.dll	_seh_filter_exe	cdecl	i32	int	code:unsigned long:u32:1|pointers:struct _EXCEPTION_POINTERS*:ptr:1
