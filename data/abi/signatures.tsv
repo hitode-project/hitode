@@ -892,12 +892,16 @@ d3dx9_29.dll	D3DXVec3TransformCoord	stdcall	ptr	D3DXVECTOR3*	pOut:D3DXVECTOR3*:p
 d3dx9_29.dll	D3DXVec4Transform	stdcall	ptr	D3DXVECTOR4*	pOut:D3DXVECTOR4*:ptr:1|pV:const D3DXVECTOR4*:ptr:1|pM:const D3DXMATRIX*:ptr:1
 d3dx9_43.dll	D3DXCheckTextureRequirements	stdcall	i32	HRESULT	pDevice:LPDIRECT3DDEVICE9:ptr:1|pWidth:UINT*:ptr:1|pHeight:UINT*:ptr:1|pNumMipLevels:UINT*:ptr:1|Usage:DWORD:u32:1|pFormat:D3DFORMAT*:ptr:1|Pool:D3DPOOL:i32:1
 d3dx9_43.dll	D3DXCreateEffect	stdcall	i32	HRESULT	pDevice:IDirect3DDevice9*:ptr:1|pSrcData:void*:ptr:1|SrcDataLen:UINT:u32:1|pDefines:D3DXMACRO*:ptr:1|pInclude:ID3DXInclude*:ptr:1|Flags:DWORD:u32:1|pPool:ID3DXEffectPool*:ptr:1|ppEffect:ID3DXEffect**:ptr:1|ppCompilationErrors:ID3DXBuffer**:ptr:1
+d3dx9_43.dll	D3DXCreateLine	stdcall	i32	HRESULT	pDevice:LPDIRECT3DDEVICE9:ptr:1|ppLine:LPD3DXLINE*:ptr:1
 d3dx9_43.dll	D3DXCreateMatrixStack	stdcall	i32	HRESULT	Flags:DWORD:u32:1|ppStack:LPD3DXMATRIXSTACK*:ptr:1
+d3dx9_43.dll	D3DXCreateSphere	stdcall	i32	HRESULT	pDevice:LPDIRECT3DDEVICE9:ptr:1|Radius:FLOAT:f32:1|Slices:UINT:u32:1|Stacks:UINT:u32:1|ppMesh:LPD3DXMESH*:ptr:1|ppAdjacency:LPD3DXBUFFER*:ptr:1
 d3dx9_43.dll	D3DXCreateSprite	stdcall	i32	HRESULT	pDevice:LPDIRECT3DDEVICE9:ptr:1|ppSprite:LPD3DXSPRITE*:ptr:1
 d3dx9_43.dll	D3DXCreateTexture	stdcall	i32	HRESULT	pDevice:LPDIRECT3DDEVICE9:ptr:1|Width:UINT:u32:1|Height:UINT:u32:1|MipLevels:UINT:u32:1|Usage:DWORD:u32:1|Format:D3DFORMAT:i32:1|Pool:D3DPOOL:i32:1|ppTexture:LPDIRECT3DTEXTURE9*:ptr:1
+d3dx9_43.dll	D3DXCreateTextureFromFileInMemory	stdcall	i32	HRESULT	pDevice:LPDIRECT3DDEVICE9:ptr:1|pSrcData:LPCVOID:ptr:1|SrcDataSize:UINT:u32:1|ppTexture:LPDIRECT3DTEXTURE9*:ptr:1
 d3dx9_43.dll	D3DXCreateTextureFromFileInMemoryEx	stdcall	i32	HRESULT	pDevice:LPDIRECT3DDEVICE9:ptr:1|pSrcData:LPCVOID:ptr:1|SrcDataSize:UINT:u32:1|Width:UINT:u32:1|Height:UINT:u32:1|MipLevels:UINT:u32:1|Usage:DWORD:u32:1|Format:D3DFORMAT:i32:1|Pool:D3DPOOL:i32:1|Filter:DWORD:u32:1|MipFilter:DWORD:u32:1|ColorKey:D3DCOLOR:u32:1|pSrcInfo:D3DXIMAGE_INFO*:ptr:1|pPalette:PALETTEENTRY*:ptr:1|ppTexture:LPDIRECT3DTEXTURE9*:ptr:1
 d3dx9_43.dll	D3DXGetImageInfoFromFileInMemory	stdcall	i32	HRESULT	pSrcData:LPCVOID:ptr:1|SrcDataSize:UINT:u32:1|pSrcInfo:D3DXIMAGE_INFO*:ptr:1
 d3dx9_43.dll	D3DXGetShaderOutputSemantics	stdcall	i32	HRESULT	pFunction:DWORD*:ptr:1|pSemantics:D3DXSEMANTIC*:ptr:1|pCount:UINT*:ptr:1
+d3dx9_43.dll	D3DXLoadMeshFromXInMemory	stdcall	i32	HRESULT	Memory:LPCVOID:ptr:1|SizeOfMemory:DWORD:u32:1|Options:DWORD:u32:1|pD3DDevice:LPDIRECT3DDEVICE9:ptr:1|ppAdjacency:LPD3DXBUFFER*:ptr:1|ppMaterials:LPD3DXBUFFER*:ptr:1|ppEffectInstances:LPD3DXBUFFER*:ptr:1|pNumMaterials:DWORD*:ptr:1|ppMesh:LPD3DXMESH*:ptr:1
 d3dx9_43.dll	D3DXMatrixLookAtLH	stdcall	ptr	D3DXMATRIX*	pOut:D3DXMATRIX*:ptr:1|pEye:D3DXVECTOR3*:ptr:1|pAt:D3DXVECTOR3*:ptr:1|pUp:D3DXVECTOR3*:ptr:1
 d3dx9_43.dll	D3DXMatrixMultiply	stdcall	ptr	D3DXMATRIX*	pOut:D3DXMATRIX*:ptr:1|pM1:D3DXMATRIX*:ptr:1|pM2:D3DXMATRIX*:ptr:1
 d3dx9_43.dll	D3DXMatrixPerspectiveFovLH	stdcall	ptr	D3DXMATRIX*	pOut:D3DXMATRIX*:ptr:1|fovy:FLOAT:f32:1|Aspect:FLOAT:f32:1|zn:FLOAT:f32:1|zf:FLOAT:f32:1

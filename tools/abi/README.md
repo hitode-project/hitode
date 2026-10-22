@@ -124,6 +124,14 @@ which are also absent from the pinned WinMD. `sdk-com-source.json` records the
 installed `um/dxdiag.h` header hash. These declarations merge into the same
 `com.tsv`; the generator rejects duplicate, reordered or incomplete slots.
 
+The four scoped graphics helpers `D3DXCreateLine`, `D3DXCreateSphere`,
+`D3DXCreateTextureFromFileInMemory` and `D3DXLoadMeshFromXInMemory` supplement
+`sdk-input.tsv` from the official Microsoft.DXSDK.D3DX 9.29.952.8 package.
+`sdk-source.json` records the four header hashes and Microsoft Learn references.
+Their x86 WINAPI declarations return HRESULT and take two, six, four and nine
+stack words respectively; the sphere radius retains its FLOAT argument kind.
+The generator accepts only the exact declarations in this selection.
+
 ## CRT export catalog
 
 WinMD lists no C runtime exports, so `crt-exports.tsv` names what each x86 CRT DLL exports:
