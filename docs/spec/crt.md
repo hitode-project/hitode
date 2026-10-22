@@ -66,4 +66,9 @@ This spec covers the Microsoft C runtimes the guest links: every msvcrt and msvc
 **Rule**: Integer conversions MUST initialize nonnull end outputs before validating source and radix. Invalid parameters MUST use the runtime's validation profile, with full-width zero results when execution continues. Prefix scanning MUST stop at the first unrecognized unit and avoid reading a suffix after overflow when no end position was requested.
 **Verification**: Test
 
+### CRT-LIB-13 Integer radix output
+
+**Rule**: Integer radix output MUST use x86 input widths, lowercase digits, and a minus sign only for signed decimal inputs. Byte and UTF-16 fronts MUST share checked output, with capacities measured in code units. Secure fronts MUST clear the first unit before capacity/radix validation and report range failures through the runtime's parameter handler.
+**Verification**: Test
+
 Withdrawn: none

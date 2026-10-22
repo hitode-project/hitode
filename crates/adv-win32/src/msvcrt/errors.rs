@@ -88,7 +88,11 @@ pub(super) fn invalid(env: &mut Env<'_>, result: u32) -> Outcome {
 }
 
 pub(super) fn invalid_outcome(env: &mut Env<'_>, result: Outcome) -> Outcome {
-    if let Err(fault) = floating::errno_address(env).write(env.cpu, 22) {
+    validation(env, 22, result)
+}
+
+pub(super) fn validation(env: &mut Env<'_>, error: i32, result: Outcome) -> Outcome {
+    if let Err(fault) = floating::errno_address(env).write(env.cpu, error) {
         return memory_failure(fault);
     }
     if !versions::profile(&env.sys.thunks.get(env.thunk).module).invalid_parameters {
@@ -98,5 +102,5 @@ pub(super) fn invalid_outcome(env: &mut Env<'_>, result: Outcome) -> Outcome {
         return invalid_parameter_noinfo(env);
     }
     let name = env.sys.thunks.get(env.thunk).name.clone();
-    invalid_parameter_then(env, &name, 22, move |_| result)
+    invalid_parameter_then(env, &name, error, move |_| result)
 }

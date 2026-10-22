@@ -341,6 +341,24 @@ public static class AbiMetadata
                 crtInteger = f[2] == "cdecl" && f[3] == resultKind && f[4] == resultType && f[5] == parameters;
                 if (!crtInteger) throw new InvalidDataException("CRT integer conversion stack contract changed: " + row);
             }
+            string[] integerOutputNames = { "_itoa", "_ltoa", "_ultoa", "_i64toa", "_ui64toa", "_itow", "_ltow", "_ultow", "_i64tow", "_ui64tow" };
+            bool crtIntegerOutputName = f.Length == 6 && integerOutputNames.Any(name => f[1] == name || f[1] == name + "_s");
+            bool crtIntegerOutput = false;
+            if (crtIntegerOutputName)
+            {
+                bool bits64 = f[1].Contains("64"), wide = f[1].Contains('w'), secure = f[1].EndsWith("_s");
+                bool signed = !f[1].StartsWith("_u");
+                string type = bits64 ? "__int64" : (f[1].StartsWith("_itoa") || f[1].StartsWith("_itow") ? "int" : "long");
+                if (!signed) type = "unsigned " + type;
+                string kind = (signed ? "i" : "u") + (bits64 ? "64" : "32");
+                string unit = wide ? "wchar_t" : "char";
+                string parameters = "value:" + type + ":" + kind + ":" + (bits64 ? "2" : "1") + "|buffer:" + unit + "*:ptr:1";
+                if (secure) parameters += "|capacity:size_t:u32:1";
+                parameters += "|radix:int:i32:1";
+                crtIntegerOutput = f[2] == "cdecl" && f[3] == (secure ? "i32" : "ptr")
+                    && f[4] == (secure ? "errno_t" : unit + "*") && f[5] == parameters;
+                if (!crtIntegerOutput) throw new InvalidDataException("CRT integer formatting stack contract changed: " + row);
+            }
             bool crtDataDouble = f.Length == 6 && f[2] == "data" && f[3] == "f64"
                 && f[4] == "double" && f[5].Length == 0;
             if (f.Length != 6 || (!new[] { "cdecl", "data" }.Contains(f[2]) && !crtVariadic && !crtSprintf && !crtProcessList && !crtThrow && !crtSetjmp && !crtJump) || (!new[] { "u32", "i32", "u64", "void", "ptr" }.Contains(f[3]) && !crtInteger && !crtDataDouble && !crtStrtod && !crtDifftime && !crtRound && !crtModf && !crtLdexp && !crtBinaryMath)
@@ -353,7 +371,9 @@ public static class AbiMetadata
                     && p[1] == "__time64_t" && p[2] == "u64" && p[3] == "2";
                 bool crtRoundParameter = (crtRound || crtModf || crtLdexp || crtBinaryMath) && p.Length == 4
                     && p[1] == "double" && p[2] == "f64" && p[3] == "2";
-                if (p.Length != 4 || ((!new[] { "u32", "i32", "ptr", "str8", "str16" }.Contains(p[2]) || p[3] != "1") && !crtTime64Parameter && !crtRoundParameter))
+                bool crtIntegerOutputParameter = crtIntegerOutput && p.Length == 4 && p[0] == "value"
+                    && (p[2] == "u64" || p[2] == "i64") && p[3] == "2";
+                if (p.Length != 4 || ((!new[] { "u32", "i32", "ptr", "str8", "str16" }.Contains(p[2]) || p[3] != "1") && !crtTime64Parameter && !crtRoundParameter && !crtIntegerOutputParameter))
                     throw new InvalidDataException("Invalid supplemental x86 parameter: " + parameter);
             }
             var key = f[0] + "\t" + f[1];

@@ -214,7 +214,7 @@ This scope manifest neither registers behavior nor changes export discovery; `to
 
 Declarations include floating controls, error cells, exit arrays and initializer
 ranges. Integer conversions share checked narrow/UTF-16 scanning, x86-width
-saturation and module/thread errno, including EDX:EAX returns and native
+saturation, radix formatting and module/thread errno, including EDX:EAX returns and native
 end-pointer validation order. Legacy startup entries use Learn prototypes where SDK
 headers omit them. Their guest argv/environment arrays consume Win32 strings and
 process environment, with per-CRT guest-heap snapshots released on process detach.

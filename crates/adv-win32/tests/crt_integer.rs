@@ -391,3 +391,6 @@ fn invalid_parameter_callbacks_observe_initialized_end_and_full_width_zero_retur
         }
     }
 }
+
+#[path = "crt_integer/format.rs"]
+mod format;

@@ -23,6 +23,7 @@ mod formatting;
 pub(crate) use data::initialize as initialize_data;
 mod floating;
 mod heap;
+mod integer_format;
 mod intrinsic_math;
 mod locale;
 mod mbcs;
@@ -161,6 +162,7 @@ pub fn register(r: &mut Registry) {
     floating::register(r);
     errors::register(r);
     intrinsic_math::register(r);
+    integer_format::register(r);
     time64::register(r);
     random::register(r);
     scalar_float::register(r);
@@ -216,7 +218,6 @@ pub fn register(r: &mut Registry) {
         ("gmtime", 1),
         ("localtime", 1),
         ("abs", 1),
-        ("_itoa", 3),
         ("_strdup", 1),
         ("_splitpath", 5),
         ("_makepath", 5),
@@ -1064,34 +1065,6 @@ fn call(e: &mut Env<'_>) -> Outcome {
             ptr
         }
         "abs" => (a as i32).unsigned_abs(),
-        "_itoa" => {
-            if !(2..=36).contains(&c) {
-                return Outcome::Return(b);
-            }
-            // Only radix 10 is signed, as in msvcrt.
-            let (negative, mut magnitude) = if c == 10 && (a as i32) < 0 {
-                (true, (a as i32).unsigned_abs())
-            } else {
-                (false, a)
-            };
-            let mut text = Vec::new();
-            loop {
-                text.push(b"0123456789abcdefghijklmnopqrstuvwxyz"[(magnitude % c) as usize]);
-                magnitude /= c;
-                if magnitude == 0 {
-                    break;
-                }
-            }
-            if negative {
-                text.push(b'-');
-            }
-            text.reverse();
-            text.push(0);
-            if let Err(error) = e.cpu.write(b, &text) {
-                return Outcome::Fail(error.to_string());
-            }
-            b
-        }
         "_splitpath" => {
             let Ok(path) = e.cpu.read_cstr(a, 4096) else {
                 return Outcome::Fail("CRT path unmapped".into());

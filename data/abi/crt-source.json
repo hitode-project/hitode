@@ -675,5 +675,25 @@
     "scope": "Cataloged narrow and wide signed/unsigned 32/64-bit conversions without explicit locale handles; one checked prefix kernel uses the existing CRT locale and errno owners.",
     "behavior": "Saturate to x86-width bounds and publish ERANGE; unsigned negative conversion negates modulo width unless the magnitude overflowed. End pointers advance in bytes or UTF-16 units; no digits reset to the original pointer. NULL/radix failures initialize end before the version-specific parameter path, including full EDX:EAX zero on 64-bit returns.",
     "native_evidence": "Pinned Microsoft VC90 initializes end before source/radix checks, consumes a 0x prefix even without following digits, and stops overflow scanning early only when no end pointer was requested. Its wide parser accepts the documented Unicode decimal blocks reflected in the shared digit kernel; no machine code is copied or native Windows execution claimed."
+  },
+  "integer_formatting": {
+    "headers": [
+      {
+        "source": "Microsoft Windows SDK 10.0.26100.0 ucrt/stdlib.h",
+        "sha256": "1576fdb40eb225dff53489db2fd52e41c7bb24f1e621e4a95c2c7f4a7216949c"
+      },
+      {
+        "source": "Microsoft Windows SDK 10.0.26100.0 ucrt/corecrt_wstdlib.h",
+        "sha256": "98b62ac5fb4291961c19ecf5c1b2e641b437f9042054f1a56ebdfd0deb71eca1"
+      }
+    ],
+    "documentation": [
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/itoa-itow",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/itoa-s-itow-s",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/i64toa-s-ui64toa-s-i64tow-s-ui64tow-s"
+    ],
+    "scope": "Cataloged ordinary and secure int/long/unsigned-long/signed-64/unsigned-64 radix output, in byte and UTF-16 forms; one checked output kernel and existing invalid-parameter/errno owners.",
+    "signedness": "Signed inputs have a minus sign only for radix ten. Other legal radices render the unsigned x86-width bit pattern. Digits above nine are lowercase ASCII in both encodings.",
+    "native_evidence": "Pinned Microsoft VC90 secure helpers validate NULL/zero capacity first, clear the first unit, then check minimum capacity before radix. Insufficient capacity retains the reversed digit prefix written before overflow, clears the first unit, invokes the invalid-parameter path with ERANGE and returns ERANGE. Only valid plain radices have a documented contract; out-of-contract radices are rejected through the validation profile."
   }
 }
