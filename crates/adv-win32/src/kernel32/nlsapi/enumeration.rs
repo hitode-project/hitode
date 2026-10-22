@@ -1,12 +1,12 @@
 //! Guest callbacks over the same installed locales and Gregorian profile data.
-use super::locales::{self, LOCALES};
+use super::locales::{self, LOCALES, NEUTRAL_LOCALES};
 use adv_abi::Registry;
 use adv_cpu::backend::{Prot, Reg};
 use adv_machine::{Env, Outcome};
 use std::collections::VecDeque;
 
 struct Enumeration {
-    rows: VecDeque<String>,
+    rows: VecDeque<(String, u32)>,
     callback: u32,
     scratch: u32,
     wide: bool,
@@ -14,7 +14,7 @@ struct Enumeration {
     param: u32,
 }
 fn next(env: &mut Env<'_>, mut state: Enumeration) -> Outcome {
-    let Some(row) = state.rows.pop_front() else {
+    let Some((row, flags)) = state.rows.pop_front() else {
         return Outcome::Return(1);
     };
     let bytes = if state.wide {
@@ -32,7 +32,7 @@ fn next(env: &mut Env<'_>, mut state: Enumeration) -> Outcome {
     }
     let mut args = vec![state.scratch];
     if state.extended {
-        args.extend([0x11, state.param]);
+        args.extend([flags, state.param]);
     }
     Outcome::call_on_stack(state.callback, args, state.scratch, move |env, result| {
         if result.value() == 0 {
@@ -42,7 +42,7 @@ fn next(env: &mut Env<'_>, mut state: Enumeration) -> Outcome {
         }
     })
 }
-fn start(env: &mut Env<'_>, rows: Vec<String>, wide: bool, extended: bool) -> Outcome {
+fn start(env: &mut Env<'_>, rows: Vec<(String, u32)>, wide: bool, extended: bool) -> Outcome {
     let callback = env.arg(0);
     if callback == 0 {
         return locales::fail(env, 87);
@@ -77,29 +77,32 @@ fn system(env: &mut Env<'_>, wide: bool, extended: bool) -> Outcome {
         if env.arg(3) != 0 {
             return locales::fail(env, 87);
         }
-        if flags & !0x7f != 0 {
+        if flags & !0x3f != 0 {
             return locales::fail(env, 1004);
         }
-        // These are built-in specific locales; supplementary, alternate-sort
-        // and neutral-only selections have no rows in the portable data set.
-        if flags != 0 && flags & 0x11 == 0 {
+        let category = flags & 0xf;
+        if category != 0 && category & 1 == 0 {
             return start(env, Vec::new(), true, true);
         }
-    } else if !matches!(flags, 0..=2) {
+        let selection = flags & 0x30;
+        let rows = NEUTRAL_LOCALES
+            .iter()
+            .map(|l| (l, 0x11))
+            .chain(LOCALES.iter().filter(|l| l.id != 0x7f).map(|l| (l, 0x21)))
+            .filter(|(_, kind)| selection == 0 || selection & kind & 0x30 != 0)
+            .map(|(l, kind)| (l.name.to_owned(), kind))
+            .collect();
+        return start(env, rows, true, true);
+    }
+    if !matches!(flags, 0..=2) {
         return locales::fail(env, 1004);
     }
     let rows = LOCALES
         .iter()
         .filter(|l| l.id != 0x7f)
-        .map(|l| {
-            if extended {
-                l.name.to_owned()
-            } else {
-                format!("{:08X}", l.id)
-            }
-        })
+        .map(|l| (format!("{:08X}", l.id), 0))
         .collect();
-    start(env, rows, wide, extended)
+    start(env, rows, wide, false)
 }
 fn calendar(env: &mut Env<'_>) -> Outcome {
     let locale = match locales::by_id(env, env.arg(1)) {
@@ -149,7 +152,7 @@ fn calendar(env: &mut Env<'_>) -> Outcome {
             return locales::fail(env, 1004);
         }
     };
-    start(env, vec![text], false, false)
+    start(env, vec![(text, 0)], false, false)
 }
 pub(super) fn register(registry: &mut Registry) {
     crate::stdcall(registry, super::K32, "EnumSystemLocalesA", 2, |e| {

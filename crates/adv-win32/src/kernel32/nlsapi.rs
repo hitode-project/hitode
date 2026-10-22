@@ -12,7 +12,7 @@ use adv_os::nls::{is_valid_codepage, lead_byte_ranges};
 mod character_types;
 mod collation;
 mod enumeration;
-mod locales;
+pub(in crate::kernel32) mod locales;
 mod preferred_ui;
 
 /// Japanese (0x411) or Chinese PRC (0x804), following the code page.

@@ -550,7 +550,7 @@ fn native_fixed_locale_table_controls() {
         let count = unsafe {
             GetDateFormatEx(
                 name.as_ptr(),
-                0x80000000,
+                0,
                 st.as_ptr(),
                 picture.as_ptr(),
                 output.as_mut_ptr(),
@@ -562,6 +562,89 @@ fn native_fixed_locale_table_controls() {
         eprintln!(
             "fixed-date value={}",
             String::from_utf16_lossy(&output[..count as usize - 1])
+        );
+    }
+}
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn LocaleNameToLCID(name: *const u16, flags: u32) -> u32;
+    fn LCIDToLocaleName(locale: u32, output: *mut u16, capacity: i32, flags: u32) -> i32;
+}
+#[test]
+fn native_neutral_locale_name_controls() {
+    for text in ["en", "ja", "zh", "zh-Hans"] {
+        let name = text.encode_utf16().chain([0]).collect::<Vec<_>>();
+        for flags in [0, 0x08000000] {
+            let id = unsafe { LocaleNameToLCID(name.as_ptr(), flags) };
+            assert_ne!(id, 0);
+            let mut output = [0u16; 85];
+            let count = unsafe { LCIDToLocaleName(id, output.as_mut_ptr(), 85, flags) };
+            assert!(count > 0);
+            eprintln!(
+                "fixed-neutral name={text} flags={flags:x} id={id:x} result={}",
+                String::from_utf16_lossy(&output[..count as usize - 1])
+            );
+        }
+    }
+}
+#[link(name = "advapi32")]
+unsafe extern "system" {
+    fn LookupAccountSidA(
+        system: *const u8,
+        sid: *const u8,
+        name: *mut u8,
+        name_size: *mut u32,
+        domain: *mut u8,
+        domain_size: *mut u32,
+        usage: *mut u32,
+    ) -> i32;
+    fn GetSecurityDescriptorOwner(
+        descriptor: *const u8,
+        owner: *mut *const u8,
+        defaulted: *mut i32,
+    ) -> i32;
+}
+#[test]
+fn native_public_sid_and_descriptor_output_controls() {
+    let sid = [1u8, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0];
+    for capacity in [0, 32] {
+        let mut name = [0u8; 32];
+        let mut domain = [0u8; 32];
+        let mut names = capacity;
+        let mut domains = capacity;
+        let mut usage = 0xcdcdcdcd;
+        let result = unsafe {
+            LookupAccountSidA(
+                std::ptr::null(),
+                sid.as_ptr(),
+                name.as_mut_ptr(),
+                &mut names,
+                domain.as_mut_ptr(),
+                &mut domains,
+                &mut usage,
+            )
+        };
+        eprintln!(
+            "public-sid capacity={capacity} result={result} error={} names={names} domains={domains} usage={usage}",
+            unsafe { GetLastError() }
+        );
+        assert_eq!(result, i32::from(capacity != 0));
+    }
+    let mut descriptor = [0u8; 32];
+    descriptor[0] = 1;
+    descriptor[2..4].copy_from_slice(&0x8001u16.to_le_bytes());
+    descriptor[4..8].copy_from_slice(&20u32.to_le_bytes());
+    descriptor[20..32].copy_from_slice(&sid);
+    for revision in [1, 2] {
+        descriptor[0] = revision;
+        let mut owner = std::ptr::null();
+        let mut defaulted = 0x5555;
+        let result =
+            unsafe { GetSecurityDescriptorOwner(descriptor.as_ptr(), &mut owner, &mut defaulted) };
+        eprintln!(
+            "public-sd revision={revision} result={result} error={} owner-valid={} defaulted={defaulted}",
+            unsafe { GetLastError() },
+            owner == unsafe { descriptor.as_ptr().add(20) }
         );
     }
 }

@@ -203,4 +203,22 @@ This spec covers Windows system libraries outside the core subsystems, as an off
 **Verification**: Test
 **Basis**: Microsoft GetStringTypeA and GetStringTypeEx contracts.
 
+### SYS-SYNC-2 Extended object creation
+
+**Rule**: Extended event and semaphore creators MUST reuse legacy and native names, signal state, lifetime and wait scheduling. Invalid creation flags MUST fail before publishing a handle. Unsupported access restrictions MUST fail explicitly.
+**Verification**: Test
+**Basis**: Microsoft CreateEventEx and CreateSemaphoreEx contracts.
+
+### SYS-NLS-3 Localized date and time pictures
+
+**Rule**: Named and LCID date/time formatters MUST share Gregorian date validation, locale names and encoded output negotiation. Date formatting MUST derive the weekday from the supplied date. Failed formatting MUST preserve output bytes.
+**Verification**: Test
+**Basis**: Microsoft GetDateFormatEx and GetTimeFormatEx contracts.
+
+### SYS-CORE-2 UTC to local conversion
+
+**Rule**: UTC-to-local conversion MUST use the guest's configured offset or the caller's validated time-zone rules. Recurring transitions MUST apply the bias in effect before each transition. Conversion MUST preserve output on invalid dates and range overflow.
+**Verification**: Test
+**Basis**: Microsoft SystemTimeToTzSpecificLocalTime and TIME_ZONE_INFORMATION contracts.
+
 Withdrawn: none

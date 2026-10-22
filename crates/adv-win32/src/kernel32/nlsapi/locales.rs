@@ -5,12 +5,12 @@ use adv_cpu::backend::{GuestExt, Prot};
 use adv_machine::{Env, Outcome};
 
 #[derive(Clone, Copy)]
-pub(super) struct Locale {
+pub(in crate::kernel32) struct Locale {
     pub id: u32,
     pub name: &'static str,
     pub cp: u32,
 }
-pub(super) const LOCALES: [Locale; 4] = [
+pub(in crate::kernel32) const LOCALES: [Locale; 4] = [
     Locale {
         id: 0x409,
         name: "en-US",
@@ -32,19 +32,46 @@ pub(super) const LOCALES: [Locale; 4] = [
         cp: 1252,
     },
 ];
-pub(super) fn fail(env: &mut Env<'_>, error: u32) -> Outcome {
+pub(super) const NEUTRAL_LOCALES: [Locale; 4] = [
+    Locale {
+        id: 9,
+        name: "en",
+        cp: 1252,
+    },
+    Locale {
+        id: 0x11,
+        name: "ja",
+        cp: 932,
+    },
+    Locale {
+        id: 0x7804,
+        name: "zh",
+        cp: 936,
+    },
+    Locale {
+        id: 4,
+        name: "zh-Hans",
+        cp: 936,
+    },
+];
+pub(in crate::kernel32) fn fail(env: &mut Env<'_>, error: u32) -> Outcome {
     set_last_error(env, error);
     Outcome::Return(0)
 }
-pub(super) fn by_id(env: &Env<'_>, id: u32) -> Result<Locale, u32> {
+pub(in crate::kernel32) fn by_id(env: &Env<'_>, id: u32) -> Result<Locale, u32> {
     let id = if matches!(id, 0 | 0x400 | 0x800 | 0xc00 | 0x1400) {
         super::lcid(env)
     } else {
         id
     };
-    LOCALES.iter().find(|l| l.id == id).copied().ok_or(87)
+    LOCALES
+        .iter()
+        .chain(NEUTRAL_LOCALES.iter())
+        .find(|l| l.id == id)
+        .copied()
+        .ok_or(87)
 }
-pub(super) fn from_name(env: &Env<'_>, pointer: u32, flags: u32) -> Result<u32, u32> {
+pub(in crate::kernel32) fn from_name(env: &Env<'_>, pointer: u32, flags: u32) -> Result<u32, u32> {
     if flags & !0x08000000 != 0 {
         return Err(1004);
     }
@@ -64,14 +91,19 @@ pub(super) fn from_name(env: &Env<'_>, pointer: u32, flags: u32) -> Result<u32, 
     {
         return Ok(locale.id);
     }
-    for (neutral, specific, id) in [("en", 0x409, 9), ("ja", 0x411, 0x11), ("zh", 0x804, 4)] {
+    for (neutral, specific, id) in [
+        ("en", 0x409, 9),
+        ("ja", 0x411, 0x11),
+        ("zh", 0x804, 0x7804),
+        ("zh-Hans", 0x804, 4),
+    ] {
         if name.eq_ignore_ascii_case(neutral) {
             return Ok(if flags == 0 { specific } else { id });
         }
     }
     Err(87)
 }
-pub(super) fn put(
+pub(in crate::kernel32) fn put(
     env: &mut Env<'_>,
     text: &str,
     output: u32,
@@ -104,151 +136,67 @@ pub(super) fn put(
     let _ = env.cpu.write(output, &bytes);
     Outcome::Return(needed)
 }
-pub(super) fn info(locale: Locale, kind: u32) -> Option<String> {
-    let ja = locale.id == 0x411;
-    let zh = locale.id == 0x804;
-    Some(match kind {
-        1 => format!("{:04x}", locale.id),
-        2 | 0x6f => if ja {
-            "Japanese (Japan)"
-        } else if zh {
-            "Chinese (Simplified, PRC)"
-        } else {
-            "English (United States)"
-        }
-        .into(),
-        3 => if ja {
-            "JPN"
-        } else if zh {
-            "CHS"
-        } else {
-            "ENU"
-        }
-        .into(),
-        4 | 0x1002 => if ja {
-            "日本語"
-        } else if zh {
-            "中文(简体)"
-        } else {
-            "English"
-        }
-        .into(),
-        5 => if ja {
-            "81"
-        } else if zh {
-            "86"
-        } else {
-            "1"
-        }
-        .into(),
-        6 | 0x1003 => if ja {
-            "Japan"
-        } else if zh {
-            "China"
-        } else {
-            "United States"
-        }
-        .into(),
-        7 => if ja {
-            "JPN"
-        } else if zh {
-            "CHN"
-        } else {
-            "USA"
-        }
-        .into(),
-        8 => if ja {
-            "日本"
-        } else if zh {
-            "中国"
-        } else {
-            "United States"
-        }
-        .into(),
-        0xb | 0x1004 => locale.cp.to_string(),
-        0xc => ",".into(),
-        0xd => "0".into(),
-        0xe | 0x16 => ".".into(),
-        0xf | 0x17 => ",".into(),
-        0x10 | 0x18 => "3;0".into(),
-        0x11 => "2".into(),
-        0x12 => "1".into(),
-        0x13 => "0123456789".into(),
-        0x14 => if ja {
-            "¥"
-        } else if zh {
-            "￥"
-        } else {
-            "$"
-        }
-        .into(),
-        0x15 => if ja {
-            "JPY"
-        } else if zh {
-            "CNY"
-        } else {
-            "USD"
-        }
-        .into(),
-        0x19 | 0x1a => if ja { "0" } else { "2" }.into(),
-        0x1d => "/".into(),
-        0x1e => ":".into(),
-        0x1f => if ja {
-            "yyyy/MM/dd"
-        } else if zh {
-            "yyyy/M/d"
-        } else {
-            "M/d/yyyy"
-        }
-        .into(),
-        0x20 => if ja || zh {
-            "yyyy'年'M'月'd'日'"
-        } else {
-            "dddd, MMMM dd, yyyy"
-        }
-        .into(),
-        0x21 => if ja || zh { "2" } else { "0" }.into(),
-        0x23 => if ja || zh { "1" } else { "0" }.into(),
-        0x28 => if ja {
-            "午前"
-        } else if zh {
-            "上午"
-        } else {
-            "AM"
-        }
-        .into(),
-        0x29 => if ja {
-            "午後"
-        } else if zh {
-            "下午"
-        } else {
-            "PM"
-        }
-        .into(),
-        0x1005 => if ja || zh { "H:mm:ss" } else { "h:mm:ss tt" }.into(),
-        0x1009 => "1".into(),
-        0x100c => "1".into(),
-        0x59 => if ja {
-            "ja"
-        } else if zh {
-            "zh"
-        } else {
-            "en"
-        }
-        .into(),
-        0x5a => if ja {
-            "JP"
-        } else if zh {
-            "CN"
-        } else {
-            "US"
-        }
-        .into(),
-        0x5c => locale.name.into(),
+pub(in crate::kernel32) fn info(locale: Locale, kind: u32) -> Option<String> {
+    let index = match locale.id {
+        0x409 | 9 => 0,
+        0x411 | 0x11 => 1,
+        0x804 | 4 | 0x7804 => 2,
+        0x7f => 3,
         _ => return None,
-    })
+    };
+    let values = match kind {
+        1 => return Some(format!("{:04x}", locale.id)),
+        3 => ["ENU", "JPN", "CHS", "IVL"],
+        4 => ["English", "日本語", "中文(简体)", "Invariant Language"],
+        5 => ["1", "81", "86", "1"],
+        7 => ["USA", "JPN", "CHN", ""],
+        8 => ["United States", "日本", "中国", "Invariant Country"],
+        0xb => ["437", "932", "936", "437"],
+        0x1004 => return Some(locale.cp.to_string()),
+        0xc => [","; 4],
+        0xd => ["1", "0", "0", "0"],
+        0xe | 0x16 => ["."; 4],
+        0xf | 0x17 => [","; 4],
+        0x10 | 0x18 => ["3;0"; 4],
+        0x11 => ["2"; 4],
+        0x12 => ["1"; 4],
+        0x13 => ["0123456789"; 4],
+        0x14 => ["$", "¥", "¥", "¤"],
+        0x15 => ["USD", "JPY", "CNY", "XDR"],
+        0x19 | 0x1a => ["2", "0", "2", "2"],
+        0x1d => ["/"; 4],
+        0x1e => [":"; 4],
+        0x1f => ["M/d/yyyy", "yyyy/MM/dd", "yyyy/M/d", "MM/dd/yyyy"],
+        0x20 => [
+            "dddd, MMMM dd, yyyy",
+            "yyyy'年'M'月'd'日'",
+            "yyyy'年'M'月'd'日'",
+            "dddd, dd MMMM yyyy",
+        ],
+        0x21 => ["0", "2", "2", "0"],
+        0x23 => ["0", "1", "1", "1"],
+        0x28 => ["AM", "午前", "上午", "AM"],
+        0x29 => ["PM", "午後", "下午", "PM"],
+        0x1001 => [
+            "English",
+            "Japanese",
+            "Chinese (Simplified)",
+            "Invariant Language",
+        ],
+        0x1002 => ["United States", "Japan", "China", "Invariant Country"],
+        0x1005 => ["0"; 4],
+        0x100c => ["6", "6", "0", "6"],
+        0x1003 => ["h:mm:ss tt", "H:mm:ss", "H:mm:ss", "HH:mm:ss"],
+        0x1006 => ["MMMM yyyy", "yyyy'年'M'月'", "yyyy'年'M'月'", "yyyy MMMM"],
+        0x1009 => ["1"; 4],
+        0x59 => ["en", "ja", "zh", "iv"],
+        0x5a => ["US", "JP", "CN", "IV"],
+        0x5c => return Some(locale.name.into()),
+        _ => return None,
+    };
+    Some(values[index].into())
 }
-pub(super) fn query(env: &mut Env<'_>, wide: bool, named: bool) -> Outcome {
+pub(in crate::kernel32) fn query(env: &mut Env<'_>, wide: bool, named: bool) -> Outcome {
     let locale = if named {
         from_name(env, env.arg(0), 0).and_then(|id| by_id(env, id))
     } else {
@@ -289,7 +237,7 @@ pub(super) fn query(env: &mut Env<'_>, wide: bool, named: bool) -> Outcome {
     let _ = env.cpu.write_u32(env.arg(2), number);
     Outcome::Return(needed)
 }
-pub(super) fn register(reg: &mut Registry) {
+pub(in crate::kernel32) fn register(reg: &mut Registry) {
     for (name, count, handler) in [
         (
             "GetLocaleInfoEx",
@@ -306,7 +254,19 @@ pub(super) fn register(reg: &mut Registry) {
             if e.arg(3) & !0x08000000 != 0 {
                 return fail(e, 1004);
             }
-            match by_id(e, e.arg(0)) {
+            match by_id(
+                e,
+                if e.arg(3) == 0 {
+                    match e.arg(0) {
+                        9 => 0x409,
+                        0x11 => 0x411,
+                        4 | 0x7804 => 0x804,
+                        id => id,
+                    }
+                } else {
+                    e.arg(0)
+                },
+            ) {
                 Ok(locale) => put(e, locale.name, e.arg(1), e.arg(2), true),
                 Err(error) => fail(e, error),
             }

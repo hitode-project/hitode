@@ -146,8 +146,8 @@ fn run<B: Backend>(cpu: B, cp: u32) {
         assert_eq!(&bytes[6..], &[0xcd; 2]);
     }
     assert_eq!(m.cpu.read_u32(OUTPUT + 128).unwrap(), 0xcdcdcdcd);
-    assert_eq!(m.cpu.read_u32(COUNT).unwrap(), 8);
-    assert_eq!(m.cpu.read_u32(COUNT + 4).unwrap(), 0x11);
+    assert_eq!(m.cpu.read_u32(COUNT).unwrap(), 12);
+    assert_eq!(m.cpu.read_u32(COUNT + 4).unwrap(), 0x21);
     assert_eq!(m.cpu.read_u32(COUNT + 8).unwrap(), 0x12345678);
     assert_eq!(m.cpu.read_u32(OUTPUT + 64).unwrap(), 932);
     assert_eq!(m.cpu.read_u32(OUTPUT + 68).unwrap(), 932);
