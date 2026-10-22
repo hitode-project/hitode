@@ -90,6 +90,11 @@ fn run<B: Backend>(cpu: B) {
     for (i, iid) in [UNKNOWN, THREAD, BAD].into_iter().enumerate() {
         m.cpu.write_u32(RESULTS + i as u32 * 12, iid).unwrap();
     }
+    for (i, iid) in [UNKNOWN, BAD].into_iter().enumerate() {
+        m.cpu
+            .write_u32(RESULTS + 0x100 + i as u32 * 12, iid)
+            .unwrap();
+    }
     for (address, text) in [
         (PATH, "Closure.Automation.1\\CLSID"),
         (NAME, "closure.automation.1"),
@@ -128,6 +133,12 @@ fn run<B: Backend>(cpu: B) {
         "CoCreateInstanceEx",
         &[I(CLASS), I(0), I(1), I(0), I(3), I(RESULTS)],
         0x80012,
+    );
+    f.call(
+        "ole32.dll",
+        "CoCreateInstanceEx",
+        &[I(BAD), I(0), I(1), I(0), I(2), I(RESULTS + 0x100)],
+        0x80040154,
     );
     f.call(
         "ole32.dll",
@@ -212,6 +223,12 @@ fn run<B: Backend>(cpu: B) {
             f.m.cpu.read_u32(RESULTS + offset).unwrap(),
             value,
             "MULTI_QI {offset}"
+        );
+    }
+    for offset in [8, 20] {
+        assert_eq!(
+            f.m.cpu.read_u32(RESULTS + 0x100 + offset).unwrap(),
+            0x80040154
         );
     }
     let mut class = [0; 16];

@@ -269,4 +269,10 @@ This spec covers Windows system libraries outside the core subsystems, as an off
 **Verification**: Test
 **Basis**: Microsoft CoGetClassObject, CoCreateInstanceEx, CLSIDFromProgID and IClassFactory contracts.
 
+### SYS-AUTOMATION-4 Actual dispatch calls
+
+**Rule**: DispCallFunc MUST invoke the supplied guest procedure or vtable entry with the declared x86 argument widths. Scalar results MUST come from actual EAX, EDX or x87 state after the call. Unsupported aggregate return conventions MUST fail explicitly before executing the procedure.
+**Verification**: Test
+**Basis**: Microsoft DispCallFunc contract and pinned WinMD x86 scalar layouts.
+
 Withdrawn: none

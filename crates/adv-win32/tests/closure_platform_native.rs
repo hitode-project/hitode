@@ -1144,3 +1144,105 @@ fn native_authored_class_factory_and_multi_interface_controls() {
     .join()
     .unwrap();
 }
+#[link(name = "oleaut32")]
+unsafe extern "system" {
+    fn DispCallFunc(
+        instance: *mut c_void,
+        offset: usize,
+        convention: i32,
+        result_type: u16,
+        count: u32,
+        types: *const u16,
+        values: *const *const NativeVariant,
+        output: *mut NativeVariant,
+    ) -> i32;
+}
+extern "system" fn native_dispatch_integer(left: i32, right: i32) -> i32 {
+    left + right
+}
+extern "C" fn native_dispatch_cdecl(left: i32, right: i32) -> i32 {
+    left + right
+}
+extern "system" fn native_dispatch_double(left: f64, right: f64) -> f64 {
+    left + right
+}
+extern "system" fn native_dispatch_integer64(left: i64, right: i64) -> i64 {
+    left + right
+}
+static NATIVE_DISPATCH_VOID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+extern "system" fn native_dispatch_void() {
+    NATIVE_DISPATCH_VOID.store(42, std::sync::atomic::Ordering::Relaxed);
+}
+#[test]
+fn native_authored_dispatch_scalar_abi_controls() {
+    for (target, convention, kind, left, right) in [
+        (
+            native_dispatch_integer as *const () as usize,
+            4,
+            3,
+            (-7i64) as u64,
+            12,
+        ),
+        (
+            native_dispatch_cdecl as *const () as usize,
+            1,
+            3,
+            (-7i64) as u64,
+            12,
+        ),
+        (
+            native_dispatch_double as *const () as usize,
+            4,
+            5,
+            1.5f64.to_bits(),
+            2.25f64.to_bits(),
+        ),
+        (
+            native_dispatch_integer64 as *const () as usize,
+            4,
+            20,
+            0x100000002,
+            0x200000003,
+        ),
+    ] {
+        let a = native_scalar_variant(kind, left);
+        let b = native_scalar_variant(kind, right);
+        let values = [&a as *const NativeVariant, &b as *const NativeVariant];
+        let types = [kind, kind];
+        let mut result = NativeVariant([0; 32]);
+        let status = unsafe {
+            DispCallFunc(
+                std::ptr::null_mut(),
+                target,
+                convention,
+                kind,
+                2,
+                types.as_ptr(),
+                values.as_ptr(),
+                &mut result,
+            )
+        } as u32;
+        let result_type = u16::from_le_bytes(result.0[..2].try_into().unwrap());
+        let payload = u64::from_le_bytes(result.0[8..16].try_into().unwrap());
+        eprintln!(
+            "automation-dispatch kind={kind} convention={convention} status={status:x} result-type={result_type} payload={payload}"
+        );
+    }
+    let mut result = NativeVariant([0; 32]);
+    let status = unsafe {
+        DispCallFunc(
+            std::ptr::null_mut(),
+            native_dispatch_void as *const () as usize,
+            4,
+            0,
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
+            &mut result,
+        )
+    } as u32;
+    eprintln!(
+        "automation-dispatch void-status={status:x} called={}",
+        NATIVE_DISPATCH_VOID.load(std::sync::atomic::Ordering::Relaxed)
+    );
+}

@@ -31,7 +31,7 @@ fn forward(
     interface: [u8; 16],
     slot: u32,
     args: Vec<u32>,
-    missing_success: bool,
+    missing_result: Option<u32>,
 ) -> Outcome {
     let target = match method(env, object, 0) {
         Ok(target) => target,
@@ -55,8 +55,8 @@ fn forward(
             let result = result.value();
             if result & 0x80000000 != 0 {
                 free(env, scratch);
-                return Outcome::Return(if missing_success && result == 0x80004002 {
-                    0
+                return Outcome::Return(if result == 0x80004002 {
+                    missing_result.unwrap_or(result)
                 } else {
                     result
                 });
@@ -127,7 +127,7 @@ fn draw(
         iid(0x10d),
         3,
         vec![aspect, u32::MAX, 0, 0, 0, dc.0, bounds.addr(), 0, 0, 0],
-        false,
+        Some(0x8004006d),
     )
 }
 #[win32(ole32,name="OleLockRunning",level=implement)]
@@ -138,7 +138,7 @@ fn lock(env: &mut Env<'_>, object: GuestPtr<()>, lock: i32, last: i32) -> Outcom
         iid(0x126),
         6,
         vec![lock as u32, last as u32],
-        true,
+        Some(0),
     )
 }
 #[win32(ole32,name="CoSetProxyBlanket",level=implement)]
@@ -168,7 +168,7 @@ fn blanket(
             information.addr(),
             capabilities,
         ],
-        false,
+        None,
     )
 }
 

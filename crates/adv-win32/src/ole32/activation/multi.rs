@@ -28,6 +28,14 @@ fn requests(env: &mut Env<'_>, count: u32, results: u32) -> Result<Vec<(u32, u32
     }
     Ok(requests)
 }
+fn failed(env: &mut Env<'_>, requests: &[(u32, u32)], status: u32) -> Outcome {
+    for (row, _) in requests {
+        if env.cpu.write_u32(*row + 8, status).is_err() {
+            return Outcome::Return(POINTER);
+        }
+    }
+    Outcome::Return(status)
+}
 fn query_next(
     env: &mut Env<'_>,
     object: u32,
@@ -134,7 +142,7 @@ pub(super) fn create_ex(
         }
     }
     let Some(construct) = constructor(env, class, context) else {
-        return Outcome::Return(UNREGISTERED);
+        return failed(env, &requests, UNREGISTERED);
     };
     let Some(scratch) = allocate(env, 4) else {
         return Outcome::Return(MEMORY);
@@ -146,7 +154,7 @@ pub(super) fn create_ex(
         Box::new(move |env, result| {
             if result & 0x80000000 != 0 {
                 free(env, scratch);
-                return Outcome::Return(result);
+                return failed(env, &requests, result);
             }
             let object = env.cpu.read_u32(scratch).unwrap_or(0);
             if object == 0 {

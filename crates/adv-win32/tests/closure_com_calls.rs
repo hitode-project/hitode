@@ -149,7 +149,7 @@ fn run<B: Backend>(cpu: B) {
         .unwrap();
     let result = m.run_virtual(1_000_000);
     assert!(matches!(result, RunResult::Exited(0)), "{result:?}");
-    for (row, value) in [0x123, 0x80070005, 0, 0, 0x80004002, 0x80004002, 1, 0]
+    for (row, value) in [0x123, 0x80070005, 0, 0, 0x80004002, 0x8004006d, 1, 0]
         .into_iter()
         .enumerate()
     {

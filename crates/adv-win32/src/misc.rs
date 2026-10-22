@@ -8,6 +8,7 @@ use adv_machine::{Env, Outcome};
 
 mod common_dialogs;
 mod directories;
+mod dispatch_call;
 mod dwm;
 mod folder_browse;
 mod gdiplus;
@@ -443,6 +444,7 @@ pub fn register(reg: &mut Registry) {
     safe_array::register(reg);
     task_allocator::register(reg);
     variant::register(reg);
+    dispatch_call::register(reg);
     // Offline, with no error: the guest never reaches the network.
     stdcall(reg, SENSAPI, "IsNetworkAlive", 1, |e| {
         let flags = e.arg(0);
