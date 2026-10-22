@@ -372,3 +372,7 @@ Cataloged exit and initializer exports now select the shared runtime table acros
 Ordinary and quick-exit callbacks retain separate guest arrays under the existing module owner, heap and lock; API sets share UCRT state.
 Full cleanup closes that CRT's streams after callbacks; fast cleanup preserves them.
 `crt_exit` checks version projections, reentrant LIFO draining, quick-array isolation, initializer stopping and stream ownership on interpreter and JIT.
+
+In-place reversal and set exports share checked byte/UTF-16 kernels across cataloged CRT versions, including the verified UCRT `_o_` wrappers.
+Secure set fronts preserve the native incremental writes, original-suffix validation and EINVAL order; counts and capacities measure code units.
+`crt_strings` covers all projections, surrogate units, error callbacks, zero counts and page boundaries in interpreter/JIT.

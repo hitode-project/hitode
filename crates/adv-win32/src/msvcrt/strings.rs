@@ -16,27 +16,32 @@ pub(super) fn register(registry: &mut Registry) {
         .collect();
     versions::register(registry, &exports);
 }
-fn read(env: &Env<'_>, address: u32, width: u32) -> Result<u32, MemFault> {
+pub(super) fn read(env: &Env<'_>, address: u32, width: u32) -> Result<u32, MemFault> {
     if width == 1 {
         GuestPtr::<u8>::new(address).read(env.cpu).map(u32::from)
     } else {
         GuestPtr::<u16>::new(address).read(env.cpu).map(u32::from)
     }
 }
-fn write(env: &mut Env<'_>, address: u32, value: u32, width: u32) -> Result<(), MemFault> {
+pub(super) fn write(
+    env: &mut Env<'_>,
+    address: u32,
+    value: u32,
+    width: u32,
+) -> Result<(), MemFault> {
     if width == 1 {
         GuestPtr::new(address).write(env.cpu, value as u8)
     } else {
         GuestPtr::new(address).write(env.cpu, value as u16)
     }
 }
-fn advance(address: u32, width: u32) -> Result<u32, MemFault> {
+pub(super) fn advance(address: u32, width: u32) -> Result<u32, MemFault> {
     address.checked_add(width).ok_or(MemFault {
         addr: address,
         len: width.saturating_add(1),
     })
 }
-fn length(
+pub(super) fn length(
     env: &Env<'_>,
     mut address: u32,
     width: u32,

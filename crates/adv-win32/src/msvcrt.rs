@@ -48,6 +48,7 @@ mod shared_file;
 mod signals;
 mod startup;
 mod stream_position;
+mod string_edit;
 mod strings;
 mod thread;
 mod time64;
@@ -200,6 +201,7 @@ pub fn register(r: &mut Registry) {
     wide_string::register(r);
     process::register(r);
     strings::register(r);
+    string_edit::register(r);
     versions::register(
         r,
         &[("_setjmp", call), ("_setjmp3", call), ("longjmp", call)],

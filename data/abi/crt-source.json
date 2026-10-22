@@ -749,5 +749,20 @@
     "projection": "Catalog-filtered x86 cdecl declarations select existing shared callback/initializer implementations across all CRT versions. _Exit shares _exit. UCRT _crt_at_quick_exit/quick_exit retain a separate table in the existing module owner, using the same heap and lock as ordinary callbacks; API-set aliases share UCRT state.",
     "cleanup": "Full exit/_cexit closes only streams owned by the current CRT after draining callbacks; all currently modeled writes already reach the existing NT owner immediately. _c_exit returns without callbacks or stream flushing/closing. Quick exit drains only its own array and terminates without flushing streams. Process teardown releases both arrays without executing leftover callbacks.",
     "native_evidence": "Pinned Microsoft VC90 confirms ascending initializer traversal with NULL entries skipped and _initterm_e stopping at the first nonzero result. Documented termination behavior supplies the ordinary/quick distinctions; no native Windows execution is claimed."
+  },
+  "string_edits": {
+    "headers": {
+      "string.h": "796b2226809790078984b919542d818ce74190d2110b119f93c2a7c3882b5de5",
+      "corecrt_wstring.h": "63c623a827f102bf51019aa1f6b744add483cd66ed247802e93b5dbc6a7adf12"
+    },
+    "documentation": [
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/strrev-wcsrev-mbsrev-mbsrev-l",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/strset-wcsset-mbsset-mbsset-l",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/strnset-wcsnset-mbsnset-mbsnset-l",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/strset-s-strset-s-l-wcsset-s-wcsset-s-l-mbsset-s-mbsset-s-l",
+      "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/strnset-s-strnset-s-l-wcsnset-s-wcsnset-s-l-mbsnset-s-mbsnset-s-l"
+    ],
+    "behavior": "Byte/UTF-16 operations use raw code units and return the original destination. Secure forms incrementally replace at most capacity-1 units, validate the original remaining terminator even after count exhaustion or a zero replacement, then clear only the first unit and report EINVAL if the original string was unterminated. A bounded secure NULL/zero/zero request succeeds; other NULL/zero-capacity inputs validate before touching memory.",
+    "native_evidence": "Pinned Microsoft VC90 byte/wide set routines establish access order, partial modification, EINVAL and the zero-count exception. Pinned UCRT _o_ wrappers establish identical outer x86 cdecl contracts and select the configured single-application global state. No machine code is copied and no native Windows execution is claimed."
   }
 }

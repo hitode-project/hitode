@@ -101,4 +101,14 @@ This spec covers the Microsoft C runtimes the guest links: every msvcrt and msvc
 **Rule**: Cataloged CRT initializer fronts MUST share checked ascending table traversal, skip NULL entries and preserve guest callback execution. `_initterm_e` MUST stop at the first nonzero result and return it, while `_initterm` MUST visit every entry regardless of callback return values.
 **Verification**: Test
 
+### CRT-LIB-20 In-place string edits
+
+**Rule**: Cataloged ordinary byte and UTF-16 reversal and set fronts MUST share checked code-unit access, return the destination and preserve the original terminator. Bounded ordinary set operations MUST stop at their count without reading a following unit, including zero-count inputs.
+**Verification**: Test
+
+### CRT-LIB-21 Secure string set
+
+**Rule**: Secure set fronts MUST validate the original terminator within capacity even after count exhaustion or NUL replacement. Unterminated inputs MUST preserve native incremental edits, clear the first unit and report EINVAL through the runtime's validation policy. Only bounded NULL/zero-capacity/zero-count requests MUST bypass input validation.
+**Verification**: Test
+
 Withdrawn: none
