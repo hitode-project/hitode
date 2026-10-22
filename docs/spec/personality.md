@@ -295,3 +295,15 @@ Withdrawn: PERS-SCOPE-2, PERS-SCOPE-7, PERS-SCOPE-9
 
 **Rule**: Network-provider capability/version queries MUST report a capability gap when provider DLL dispatch is unavailable. They MUST NOT fabricate successful provider structures.
 **Verification**: Test
+
+### PERS-CRYPTO-7 Binary text conversions
+
+**Rule**: CryptBinaryToString and CryptStringToBinary MUST transform the actual input bytes, including Base64 headers and hexadecimal encodings. Automatic detection MUST report the selected format and header skip count. A/W variants MUST share ASCII format semantics without applying an ANSI code page.
+**Verification**: Test
+**Basis**: Microsoft CryptBinaryToString and CryptStringToBinary documentation; RFC 4648.
+
+### PERS-CRYPTO-8 Conversion output boundaries
+
+**Rule**: Binary conversion size queries MUST report the complete required output size without writing output buffers. Short buffers MUST report ERROR_MORE_DATA and the required size. Conversions MUST validate guest output permissions and preserve LastError on success.
+**Verification**: Test
+**Basis**: Microsoft CryptBinaryToString and CryptStringToBinary documentation.

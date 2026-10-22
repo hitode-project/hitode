@@ -12,6 +12,7 @@
 
 mod advapi32;
 pub mod codec_kernels;
+mod crypt32;
 pub mod gdi32;
 mod guest_code;
 pub(crate) mod heap_lock;
@@ -220,6 +221,7 @@ pub fn register(reg: &mut Registry) {
     version::register(reg);
     psapi::register(reg);
     msi::register(reg);
+    crypt32::register(reg);
     mpr::register(reg);
     vfw::register(reg);
     winsock::register(reg);
