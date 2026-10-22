@@ -394,6 +394,22 @@ pub(super) fn register(reg: &mut Registry) {
     reg.register(is_dbcs_lead_byte_ex_ABI);
     stdcall(reg, K32, "MultiByteToWideChar", 6, multi_byte_to_wide_char);
     stdcall(reg, K32, "WideCharToMultiByte", 8, wide_char_to_multi_byte);
+    // Flags other than MB_PRECOMPOSED, MB_ERR_INVALID_CHARS among them, are ignored.
+    reg.accept(
+        K32,
+        "MultiByteToWideChar",
+        "CodePage",
+        adv_os::nls::is_modeled,
+    );
+    reg.accept(K32, "MultiByteToWideChar", "dwFlags", |flags| {
+        flags & !1 == 0
+    });
+    reg.accept(
+        K32,
+        "WideCharToMultiByte",
+        "CodePage",
+        adv_os::nls::is_modeled,
+    );
     stdcall(reg, K32, "LCMapStringW", 6, lc_map_string_w);
     stdcall(reg, K32, "LCMapStringA", 6, lc_map_string_a);
     // The locale name replaces the LCID; the mapping itself ignores both, and

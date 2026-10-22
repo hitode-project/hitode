@@ -26,6 +26,24 @@ pub fn lead_byte_ranges(cp: u32) -> &'static [(u8, u8)] {
     }
 }
 
+/// The conversion table of a code page converted as Windows does.
+fn table(cp: u32) -> Option<&'static Encoding> {
+    match cp {
+        // WHATWG Shift_JIS is Windows-31J (NEC/IBM extensions included), as is GBK/cp936.
+        932 => Some(SHIFT_JIS),
+        936 => Some(GBK),
+        CP_UTF8 => Some(UTF_8),
+        1252 => Some(WINDOWS_1252),
+        _ => None,
+    }
+}
+
+/// Whether conversions in `cp` match Windows: the ANSI aliases and the code
+/// pages with a table. Any other code page converts as Windows-1252.
+pub fn is_modeled(cp: u32) -> bool {
+    matches!(cp, CP_ACP | CP_OEMCP | CP_THREAD_ACP) || table(cp).is_some()
+}
+
 pub fn is_valid_codepage(cp: u32) -> bool {
     matches!(cp, 932 | 936 | 1252 | 437 | CP_UTF8 | 20127)
 }
@@ -42,14 +60,9 @@ impl Codec {
         }
     }
 
+    /// Code pages without a table convert as Windows-1252.
     fn encoding(&self, cp: u32) -> &'static Encoding {
-        match self.resolve(cp) {
-            // WHATWG Shift_JIS is Windows-31J (NEC/IBM extensions included), as is GBK/cp936.
-            932 => SHIFT_JIS,
-            936 => GBK,
-            CP_UTF8 => UTF_8,
-            _ => WINDOWS_1252,
-        }
+        table(self.resolve(cp)).unwrap_or(WINDOWS_1252)
     }
 
     /// Bytes in code page `cp` to UTF-16, as MultiByteToWideChar without

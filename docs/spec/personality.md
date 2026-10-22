@@ -108,6 +108,16 @@ This spec covers the Windows identity the guest sees. It includes implementation
 **Rule**: Personality diagnostics MUST distinguish rejected probes, reviewed calls, stub calls, and structural mismatches. Rejected names MUST be bounded to 256 entries with explicit dropped counts.
 **Verification**: Review — the complete personality report and its 256-name boundary lack a dedicated end-to-end test.
 
+### PERS-EXPORT-9 Static survey
+
+**Rule**: A survey MUST list, before guest code runs, every static import, constant-named module load or lookup and constant COM class the runtime cannot satisfy. It MUST resolve game modules before host modules, as the loader does. It MUST count lookup call sites whose name or class is not a constant.
+**Verification**: Test
+
+### PERS-EXPORT-10 Mode contracts
+
+**Rule**: An implementation MAY declare, per scalar parameter, the values it handles as Windows 7 does. A survey MUST report each constant argument outside such a contract, marking calls that discard the result. It MUST list constant arguments to parameters without a contract.
+**Verification**: Test
+
 ## Observable API boundaries
 
 ### PERS-BRIDGE-1 Observed boundaries

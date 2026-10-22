@@ -14,6 +14,7 @@ mod graphics;
 pub use adv_win32::winmm::mmio;
 mod debug_views;
 mod report;
+pub mod survey;
 pub use adv_abi::{ApiDiagnostics, DynamicLookupFailure, MessageBoxCall, RunMode};
 /// The in-process JIT address map, for the debugger's sampler.
 #[cfg(target_arch = "aarch64")]

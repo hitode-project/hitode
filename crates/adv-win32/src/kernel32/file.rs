@@ -30,6 +30,10 @@ const OPEN_EXISTING: u32 = 3;
 const OPEN_ALWAYS: u32 = 4;
 const TRUNCATE_EXISTING: u32 = 5;
 const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x20;
+/// The CreateFile flags and attributes that need no modeling: attributes and
+/// caching hints. Overlapped I/O, delete on close, backup semantics and the
+/// remaining flags are ignored.
+const MODELED_FLAGS: u32 = 0xffff | 0x8000_0000 | 0x2000_0000 | 0x1000_0000 | 0x0800_0000;
 
 fn system_file(env: &mut Env<'_>, path: &str) -> Result<Option<std::sync::Arc<[u8]>>, ()> {
     let files = env
@@ -1530,6 +1534,11 @@ pub(super) fn register(reg: &mut Registry) {
         let p = path_w(e, e.arg(0));
         create_file(e, p)
     });
+    for name in ["CreateFileA", "CreateFileW"] {
+        reg.accept(K32, name, "dwFlagsAndAttributes", |flags| {
+            flags & !MODELED_FLAGS == 0
+        });
+    }
     stdcall(reg, K32, "ReadFile", 5, read_file);
     stdcall(reg, K32, "WriteFile", 5, write_file);
     stdcall(reg, K32, "SetFilePointer", 4, set_file_pointer);

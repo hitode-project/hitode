@@ -183,6 +183,7 @@ they exclude backend work and damage-history bookkeeping.
 | `--screenshot` | Diagnostic | No output |
 | `--trace` | Diagnostic | No output |
 | `--host-profile` | Diagnostic | No output |
+| `--survey` | Diagnostic | No output |
 | `--schedule-profile` | Diagnostic | No output |
 | `--auto-dialog-ms` | Fixture | No automatic dialog choice |
 | `--self-test-input` | Fixture | Off |
