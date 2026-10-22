@@ -53,7 +53,7 @@ pub(super) fn initialize(env: &mut Env<'_>, reserved: u32, flags: u32, ole: bool
     let Some(count) = a.com.checked_add(1) else {
         return 0x8007000e;
     };
-    let result = u32::from(a.com != 0);
+    let result = u32::from(if ole { a.ole != 0 } else { a.com != 0 });
     a.mode = mode;
     a.com = count;
     if ole {
@@ -122,16 +122,19 @@ fn suspend(env: &mut Env<'_>) -> u32 {
 }
 #[win32(oleaut32,name="GetErrorInfo",level=implement)]
 fn error_info(env: &mut Env<'_>, reserved: u32, output: GuestPtr<u32>) -> u32 {
-    if reserved != 0 {
-        return 0x80070057;
-    }
     if check_range(env.cpu, output.addr(), 4, Prot::WRITE).is_err() {
         return 0x80070057;
     }
     // No installed server supplies IErrorInfo. The calling thread has no error object.
     // Do not manufacture an error interface from an HRESULT or from another thread.
     match env.cpu.write_u32(output.addr(), 0) {
-        Ok(()) => 1,
+        Ok(()) => {
+            if reserved == 0 {
+                1
+            } else {
+                0x80070057
+            }
+        }
         Err(_) => 0x80070057,
     }
 }

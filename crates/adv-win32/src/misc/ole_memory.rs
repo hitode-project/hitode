@@ -194,8 +194,11 @@ fn format_guid(bytes: &[u8; 16]) -> String {
     )
 }
 
-fn parse_guid(s: &str) -> Option<[u8; 16]> {
+pub(crate) fn parse_guid(s: &str) -> Option<[u8; 16]> {
     let s = s.trim();
+    if !s.is_ascii() {
+        return None;
+    }
     let s = s.strip_prefix('{')?.strip_suffix('}')?;
     let mut parts = s.split('-');
     let p1 = u32::from_str_radix(parts.next()?, 16).ok()?;

@@ -40,7 +40,7 @@ fn run<B: Backend>(cpu: B) {
     for (name, args, value) in [
         ("CoInitializeEx", vec![0, 2], 0),
         ("CoInitializeEx", vec![0, 2], 1),
-        ("OleInitialize", vec![0], 1),
+        ("OleInitialize", vec![0], 0),
         ("OleInitialize", vec![0], 1),
         ("CoInitializeEx", vec![0, 0], 0x80010106),
         ("CoAddRefServerProcess", vec![], 1),
@@ -156,7 +156,7 @@ fn run<B: Backend>(cpu: B) {
         (0x108, 0x80010106),
         (0x120, 0),
         (0x124, 1),
-        (0x128, 0x55555555),
+        (0x128, 0),
         (0x12c, 0x80070057),
         (0x130, 0),
         (0x140, 0),

@@ -257,4 +257,16 @@ This spec covers Windows system libraries outside the core subsystems, as an off
 **Verification**: Test
 **Basis**: Microsoft CoInitializeEx, OleInitialize, CoAddRefServerProcess and CoReleaseServerProcess contracts.
 
+### SYS-COM-2 Guest interface forwarding
+
+**Rule**: OLE drawing, running locks and proxy security MUST invoke the object's actual queried guest interface. Adapters MUST return the method's result and balance acquired references across guest waits. Interface lookup failure MUST NOT manufacture drawing or security effects.
+**Verification**: Test
+**Basis**: Microsoft OleDraw, OleLockRunning, CoSetProxyBlanket and IUnknown contracts.
+
+### SYS-COM-3 Installed class activation
+
+**Rule**: Class factories MUST activate installed constructors through shared COM identities and reference counts. Multi-interface activation MUST query one constructed object and publish individual HRESULTs. ProgID lookup MUST read the shared virtual registry without inventing classes.
+**Verification**: Test
+**Basis**: Microsoft CoGetClassObject, CoCreateInstanceEx, CLSIDFromProgID and IClassFactory contracts.
+
 Withdrawn: none

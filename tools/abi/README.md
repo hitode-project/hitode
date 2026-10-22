@@ -67,6 +67,9 @@ Automation currency values therefore occupy two x86 stack words.
 Generated Automation records preserve SDK alignment and opaque union storage with size and field-offset assertions.
 COM tables include the activation, moniker, type-information, font, picture and desktop-folder interfaces used by the system closure.
 
+The exported `ole32!IsEqualGUID` helper uses the SDK import library's `_IsEqualGUID@8` declaration; its inline header spelling is absent from WinMD.
+Its scoped supplement preserves two GUID pointers and a BOOL result.
+
 ## Selected legacy exports and DLL aliases
 
 DbgHelp is projected in full; ImageHlp retains only the `MakeSureDirectoryPathExists` alias.

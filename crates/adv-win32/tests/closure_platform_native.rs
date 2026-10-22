@@ -972,3 +972,175 @@ fn native_authored_com_apartment_and_empty_error_controls() {
         eprintln!("com-server counts={a},{b},{c},{d} suspend={suspended:x} resume={resumed:x}");
     }
 }
+#[repr(C)]
+struct NativeUnknown {
+    table: *const NativeUnknownTable,
+    references: std::sync::atomic::AtomicU32,
+}
+#[repr(C)]
+struct NativeUnknownTable {
+    query: unsafe extern "system" fn(*mut NativeUnknown, *const u8, *mut *mut c_void) -> i32,
+    add: unsafe extern "system" fn(*mut NativeUnknown) -> u32,
+    release: unsafe extern "system" fn(*mut NativeUnknown) -> u32,
+}
+unsafe extern "system" fn native_no_interface(
+    _this: *mut NativeUnknown,
+    _iid: *const u8,
+    output: *mut *mut c_void,
+) -> i32 {
+    unsafe {
+        *output = std::ptr::null_mut();
+    }
+    0x80004002u32 as i32
+}
+unsafe extern "system" fn native_unknown_add(this: *mut NativeUnknown) -> u32 {
+    unsafe {
+        (*this)
+            .references
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1
+    }
+}
+unsafe extern "system" fn native_unknown_release(this: *mut NativeUnknown) -> u32 {
+    unsafe {
+        (*this)
+            .references
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed)
+            - 1
+    }
+}
+#[link(name = "ole32")]
+unsafe extern "system" {
+    fn OleLockRunning(object: *mut NativeUnknown, lock: i32, last: i32) -> i32;
+    fn OleDraw(object: *mut NativeUnknown, aspect: u32, dc: Handle, rect: *const i32) -> i32;
+    fn CoSetProxyBlanket(
+        object: *mut NativeUnknown,
+        authentication: u32,
+        authorization: u32,
+        name: *const u16,
+        level: u32,
+        impersonation: u32,
+        information: *mut c_void,
+        capabilities: u32,
+    ) -> i32;
+}
+#[test]
+fn native_authored_nonproxy_ole_interface_controls() {
+    let table = NativeUnknownTable {
+        query: native_no_interface,
+        add: native_unknown_add,
+        release: native_unknown_release,
+    };
+    let mut object = NativeUnknown {
+        table: &table,
+        references: std::sync::atomic::AtomicU32::new(1),
+    };
+    let bounds = [0, 0, 32, 32];
+    let lock = unsafe { OleLockRunning(&mut object, 1, 0) } as u32;
+    let draw = unsafe { OleDraw(&mut object, 1, std::ptr::null_mut(), bounds.as_ptr()) } as u32;
+    let blanket = unsafe {
+        CoSetProxyBlanket(
+            &mut object,
+            10,
+            0,
+            std::ptr::null(),
+            2,
+            3,
+            std::ptr::null_mut(),
+            0,
+        )
+    } as u32;
+    eprintln!(
+        "com-nonproxy lock={lock:x} draw={draw:x} blanket={blanket:x} references={}",
+        object.references.load(std::sync::atomic::Ordering::Relaxed)
+    );
+}
+#[repr(C)]
+struct NativeMultiQi {
+    iid: *const [u8; 16],
+    object: *mut c_void,
+    status: i32,
+}
+#[link(name = "ole32")]
+unsafe extern "system" {
+    fn CoGetClassObject(
+        class: *const [u8; 16],
+        context: u32,
+        reserved: *mut c_void,
+        iid: *const [u8; 16],
+        output: *mut *mut c_void,
+    ) -> i32;
+    fn CoCreateInstanceEx(
+        class: *const [u8; 16],
+        outer: *mut c_void,
+        context: u32,
+        server: *mut c_void,
+        count: u32,
+        results: *mut NativeMultiQi,
+    ) -> i32;
+}
+unsafe fn release_native_unknown(pointer: *mut c_void) {
+    let table = unsafe { *(pointer as *const *const usize) };
+    let method: unsafe extern "system" fn(*mut c_void) -> u32 =
+        unsafe { std::mem::transmute(*table.add(2)) };
+    unsafe { method(pointer) };
+}
+#[test]
+fn native_authored_class_factory_and_multi_interface_controls() {
+    std::thread::spawn(|| unsafe {
+        assert_eq!(CoInitializeEx(std::ptr::null_mut(), 2), 0);
+        let unknown = [0u8, 0, 0, 0, 0, 0, 0, 0, 0xc0, 0, 0, 0, 0, 0, 0, 0x46];
+        let factory_iid = [1u8, 0, 0, 0, 0, 0, 0, 0, 0xc0, 0, 0, 0, 0, 0, 0, 0x46];
+        let absent = [0x55; 16];
+        let font = [
+            3u8, 0x52, 0xe3, 0x0b, 0x91, 0x8f, 0xce, 0x11, 0x9d, 0xe3, 0, 0xaa, 0, 0x4b, 0xb8, 0x51,
+        ];
+        for (class, name) in [(&font, "font"), (&absent, "absent")] {
+            let mut factory = std::ptr::null_mut();
+            let status =
+                CoGetClassObject(class, 1, std::ptr::null_mut(), &factory_iid, &mut factory) as u32;
+            eprintln!(
+                "com-factory class={name} status={status:x} null={}",
+                factory.is_null()
+            );
+            if !factory.is_null() {
+                release_native_unknown(factory);
+            }
+            let mut results = [
+                NativeMultiQi {
+                    iid: &unknown,
+                    object: std::ptr::null_mut(),
+                    status: 0x55555555,
+                },
+                NativeMultiQi {
+                    iid: &absent,
+                    object: std::ptr::null_mut(),
+                    status: 0x55555555,
+                },
+            ];
+            let status = CoCreateInstanceEx(
+                class,
+                std::ptr::null_mut(),
+                1,
+                std::ptr::null_mut(),
+                2,
+                results.as_mut_ptr(),
+            ) as u32;
+            eprintln!(
+                "com-multi class={name} status={status:x} rows={:x},{:x} nulls={},{}",
+                results[0].status as u32,
+                results[1].status as u32,
+                results[0].object.is_null(),
+                results[1].object.is_null()
+            );
+            for row in results {
+                if !row.object.is_null() {
+                    release_native_unknown(row.object);
+                }
+            }
+        }
+        CoUninitialize();
+    })
+    .join()
+    .unwrap();
+}

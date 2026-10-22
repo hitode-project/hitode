@@ -72,3 +72,16 @@ Assert-Rejected 'wrong-words' $wrongWords 'stack contract changed'
 Assert-Rejected 'duplicate' ($selections + $selections[0]) 'Duplicate selected'
 Assert-Rejected 'conflict' ($selections + "user32.dll`tGetWindowPlacement`tshell32.dll`tSHGetFolderPathA`t5") 'Conflicting selected'
 Write-Output 'Selected exports: exact DLL scope and complete aliases verified; missing source, changed stack width, duplicate destination and conflicting alias rejected.'
+
+# The exported GUID helper has SDK-proven stdcall pointers, despite its inline header spelling.
+$sdkLines = [IO.File]::ReadAllLines((Join-Path $repoRoot 'data/abi/sdk-input.tsv'))
+Copy-Item (Join-Path $repoRoot 'data/abi/sdk-com-input.tsv') (Join-Path $cache 'sdk-com-input.tsv') -Force
+foreach ($replacement in @('rguid1:System.Guid*:u32:1', 'rguid1:System.Guid*:ptr:2')) {
+    $badSdk = @($sdkLines | ForEach-Object { $_.Replace('rguid1:System.Guid*:ptr:1', $replacement) })
+    $badPath = Join-Path $cache 'bad-guid-sdk.tsv'
+    [IO.File]::WriteAllLines($badPath, $badSdk)
+    $rejected = $false
+    try { [AbiMetadata]::Generate($Winmd, (Join-Path $cache 'bad-guid-sdk'), $modules, $crt, $valid, $badPath) }
+    catch { if (!$_.Exception.ToString().Contains('Invalid scoped SDK x86 signature')) { throw }; $rejected = $true }
+    if (!$rejected) { throw 'Malformed GUID helper SDK declaration accepted' }
+}

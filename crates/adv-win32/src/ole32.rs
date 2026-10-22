@@ -2,12 +2,16 @@
 use adv_abi::{GuestPtr, Registry, win32};
 use adv_machine::{Env, Outcome};
 
+mod activation;
+pub(crate) mod calls;
 mod runtime;
 pub mod tsf;
 
 pub fn register(registry: &mut Registry) {
     tsf::register(registry);
     runtime::register(registry);
+    calls::register(registry);
+    activation::register(registry);
     for api in [
         initialize_ABI,
         initialize_ex_ABI,

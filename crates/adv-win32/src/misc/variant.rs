@@ -287,44 +287,5 @@ pub(super) fn clear_value(env: &mut Env<'_>, value: u32) -> Outcome {
 }
 type ScalarThen = Box<dyn FnOnce(&mut Env<'_>, u32) -> Outcome>;
 pub(super) fn complete(env: &mut Env<'_>, outcome: Outcome, then: ScalarThen) -> Outcome {
-    match outcome {
-        Outcome::Return(value) => then(env, value),
-        Outcome::Call {
-            target,
-            args,
-            then: next,
-            stack,
-            unwindable,
-        } => Outcome::Call {
-            target,
-            args,
-            stack,
-            unwindable,
-            then: Box::new(move |env, value| {
-                let outcome = next(env, value);
-                complete(env, outcome, then)
-            }),
-        },
-        Outcome::Block {
-            wait,
-            then: next,
-            allow_time_skip,
-        } => Outcome::Block {
-            wait,
-            allow_time_skip,
-            then: Box::new(move |env, value| {
-                let outcome = next(env, value);
-                complete(env, outcome, then)
-            }),
-        },
-        Outcome::Defer { then: next } => Outcome::defer(move |env| {
-            let outcome = next(env);
-            complete(env, outcome, then)
-        }),
-        Outcome::HostRequest { then: next } => Outcome::host_request(move |env| {
-            let outcome = next(env);
-            complete(env, outcome, then)
-        }),
-        terminal => terminal,
-    }
+    crate::ole32::calls::complete(env, outcome, then)
 }

@@ -6401,6 +6401,7 @@ ole32.dll	HWND_UserUnmarshal	stdcall	ptr	u8*	param0:u32*:ptr:1|param1:u8*:ptr:1|
 ole32.dll	HWND_UserUnmarshal64	stdcall	ptr	u8*	param0:u32*:ptr:1|param1:u8*:ptr:1|param2:Windows.Win32.Foundation.HWND*:ptr:1
 ole32.dll	IIDFromString	stdcall	i32	Windows.Win32.Foundation.HRESULT	lpsz:Windows.Win32.Foundation.PWSTR:str16:1|lpiid:System.Guid*:ptr:1
 ole32.dll	IsAccelerator	stdcall	i32	Windows.Win32.Foundation.BOOL	hAccel:Windows.Win32.UI.WindowsAndMessaging.HACCEL:handle:1|cAccelEntries:i32:i32:1|lpMsg:Windows.Win32.UI.WindowsAndMessaging.MSG*:ptr:1|lpwCmd:u16*:ptr:1
+ole32.dll	IsEqualGUID	stdcall	i32	Windows.Win32.Foundation.BOOL	rguid1:System.Guid*:ptr:1|rguid2:System.Guid*:ptr:1
 ole32.dll	MkParseDisplayName	stdcall	i32	Windows.Win32.Foundation.HRESULT	pbc:Windows.Win32.System.Com.IBindCtx:ptr:1|szUserName:Windows.Win32.Foundation.PWSTR:str16:1|pchEaten:u32*:ptr:1|ppmk:Windows.Win32.System.Com.IMoniker*:ptr:1
 ole32.dll	MonikerCommonPrefixWith	stdcall	i32	Windows.Win32.Foundation.HRESULT	pmkThis:Windows.Win32.System.Com.IMoniker:ptr:1|pmkOther:Windows.Win32.System.Com.IMoniker:ptr:1|ppmkCommon:Windows.Win32.System.Com.IMoniker*:ptr:1
 ole32.dll	MonikerRelativePathTo	stdcall	i32	Windows.Win32.Foundation.HRESULT	pmkSrc:Windows.Win32.System.Com.IMoniker:ptr:1|pmkDest:Windows.Win32.System.Com.IMoniker:ptr:1|ppmkRelPath:Windows.Win32.System.Com.IMoniker*:ptr:1|dwReserved:Windows.Win32.Foundation.BOOL:i32:1

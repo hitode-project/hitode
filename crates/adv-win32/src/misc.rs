@@ -16,6 +16,7 @@ mod image_list;
 pub(crate) mod imm;
 mod internet;
 mod ole_memory;
+pub(crate) use ole_memory::parse_guid;
 mod path_match;
 mod property_sheet;
 mod safe_array;
