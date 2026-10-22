@@ -295,7 +295,6 @@ pub fn register(r: &mut Registry) {
             ("_encode_pointer", 1),
             ("_decode_pointer", 1),
             ("_encoded_null", 0),
-            ("time", 1),
             ("_time32", 1),
             ("_gmtime32", 1),
             ("_localtime32", 1),

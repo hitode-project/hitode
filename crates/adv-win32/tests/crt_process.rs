@@ -479,3 +479,49 @@ fn error_cells_remain_independent_while_another_guest_thread_runs() {
         no_gaps(&m);
     }
 }
+
+// spec: PERS-EXPORT-2
+#[test]
+fn nonexistent_legacy_time_and_string_contract_memchr_stay_hidden_from_guest_lookup() {
+    for jit in [false, true] {
+        let mut m = machine(jit);
+        let load = m.resolve_import("kernel32.dll", "LoadLibraryA").unwrap();
+        let lookup = m.resolve_import("kernel32.dll", "GetProcAddress").unwrap();
+        let error = m.resolve_import("kernel32.dll", "GetLastError").unwrap();
+        let mut code = Asm::new(CODE);
+        for (i, (module, name)) in [
+            ("msvcr80.dll", "time"),
+            ("msvcr90.dll", "time"),
+            ("api-ms-win-crt-string-l1-1-0.dll", "memchr"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let input = DATA + 4096 + i as u32 * 128;
+            m.cpu
+                .write(input, format!("{module}\0").as_bytes())
+                .unwrap();
+            m.cpu
+                .write(input + 64, format!("{name}\0").as_bytes())
+                .unwrap();
+            code.push_imm(input)
+                .call(load)
+                .mov_mem_eax(RESULTS + i as u32 * 12);
+            code.push_imm(input + 64)
+                .push_eax()
+                .call(lookup)
+                .mov_mem_eax(RESULTS + i as u32 * 12 + 4);
+            code.call(error).mov_mem_eax(RESULTS + i as u32 * 12 + 8);
+        }
+        code.bytes.extend_from_slice(&[0x31, 0xc0, 0xc3]);
+        m.cpu.write(CODE, &code.bytes).unwrap();
+        m.spawn("absent CRT exports", CODE, &[], 65536).unwrap();
+        let result = m.run_virtual(1_000_000);
+        assert!(matches!(result, RunResult::Exited(0)), "{result:?}");
+        for i in 0..3 {
+            assert_ne!(m.cpu.read_u32(RESULTS + i * 12).unwrap(), 0);
+            assert_eq!(m.cpu.read_u32(RESULTS + i * 12 + 4).unwrap(), 0);
+            assert_eq!(m.cpu.read_u32(RESULTS + i * 12 + 8).unwrap(), 127);
+        }
+    }
+}

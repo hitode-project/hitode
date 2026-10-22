@@ -544,5 +544,28 @@
       "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/strncpy-strncpy-l-wcsncpy-wcsncpy-l-mbsncpy-mbsncpy-l",
       "https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/strstr-wcsstr-mbsstr-mbsstr-l"
     ]
+  },
+  "absent_export_audit": {
+    "scope": "Remove handwritten registrations absent from real Microsoft x86 PE exports. ABI declarations do not imply a DLL export.",
+    "vc80": {
+      "url": "https://download.microsoft.com/download/8/B/4/8B42259F-5D70-43F4-AC2E-4B208FD8D66A/vcredist_x86.EXE",
+      "version": "8.0.50727.6195",
+      "msvcr80_sha256": "c3ac989c8489a23bb96400b1856f5325ffc67e844f04651ea5d61bc20a991c6d",
+      "absent": "time",
+      "present": "_time32, _time64"
+    },
+    "vc90": {
+      "version": "9.0.30729.6161",
+      "msvcr90_sha256": "8e7fe1a1f3550c479ffd86a77bc9d10686d47f8727025bb891d8f4f0259354c8",
+      "absent": "time",
+      "present": "_time32, _time64"
+    },
+    "ucrt_string_contract": {
+      "source": "Microsoft.Windows.SDK.CPP 10.0.26100.0, Redist/ucrt/DLLs/x86/api-ms-win-crt-string-l1-1-0.dll",
+      "sha256": "f7522818c7a5368cb006889f0948979b91b99baba3482a65bb20ef929ba6bd99",
+      "absent": "memchr",
+      "notes": "ucrtbase.dll and vcruntime140.dll retain their actual memchr exports."
+    },
+    "winmd_platform_audit": "The pinned WinMD has no P/Invoke methods whose DLL/name pair matches the refreshed CRT catalog. No SupportedOSPlatform exclusions can be derived for this catalog from WinMD; undocumented internal entries are not excluded by release year alone."
   }
 }

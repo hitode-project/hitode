@@ -346,3 +346,11 @@ ordinal handlers take precedence. A table entry adds no implementation or guesse
 signature: if neither a known signature nor implementation exists, calling it
 still stops. The self-authored `api_stubs.c` fixture covers the real SDK's static
 `d2d1.dll!#1` import, strict stopping, discovery chaining and correct failure returns.
+
+The CRT export audit removes three nonexistent handwritten fronts: VC80/VC90
+`time` and the public string API-set's `memchr`. Microsoft x86 PE export tables
+verify their absence; `crt-source.json` records versions, sources and hashes.
+The genuine `_time32`/`_time64` and UCRT/VCRuntime `memchr` entries remain separate
+exports. No matching CRT P/Invoke declarations exist in the pinned WinMD, so
+its SupportedOSPlatform attributes supply no CRT exclusions. Internal helpers
+are not classified as post-Windows-7 merely from a compiler release date.
