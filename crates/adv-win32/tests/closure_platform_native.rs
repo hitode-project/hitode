@@ -1246,3 +1246,19 @@ fn native_authored_dispatch_scalar_abi_controls() {
         NATIVE_DISPATCH_VOID.load(std::sync::atomic::Ordering::Relaxed)
     );
 }
+#[link(name = "shlwapi")]
+unsafe extern "system" {
+    fn SHAutoComplete(window: Handle, flags: u32) -> i32;
+}
+#[test]
+fn native_autocomplete_without_a_window_controls() {
+    std::thread::spawn(|| unsafe {
+        let before = SHAutoComplete(std::ptr::null_mut(), 0) as u32;
+        assert_eq!(CoInitializeEx(std::ptr::null_mut(), 2), 0);
+        let after = SHAutoComplete(std::ptr::null_mut(), 0) as u32;
+        eprintln!("shell-autocomplete null-before-init={before:x} null-after-init={after:x}");
+        CoUninitialize();
+    })
+    .join()
+    .unwrap();
+}
