@@ -20,6 +20,8 @@ mod capture;
 mod geometry;
 #[path = "window_creation/style.rs"]
 mod style;
+#[path = "window_creation/z_order.rs"]
+mod z_order;
 
 trait TestCpu: Backend {
     fn region(&mut self, _: u32, _: usize) {}

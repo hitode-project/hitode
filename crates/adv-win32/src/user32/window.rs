@@ -46,6 +46,7 @@ use super::{USER32, user, user_mut};
 use crate::util::{cstr, put_cstr, set_last_error};
 use crate::{Win32, stdcall};
 mod style;
+mod z_order;
 
 pub const WS_OVERLAPPED: u32 = 0;
 pub const WS_MAXIMIZE: u32 = 0x0100_0000;
@@ -474,6 +475,9 @@ pub struct User {
     pub windows: Windows,
     /// Top-level windows in z-order (top first).
     pub top: Vec<u32>,
+    /// Last foreground identity survives host deactivation, independently of z-order.
+    pub(super) foreground: u32,
+    pub(super) foreground_active: bool,
     next_hwnd: u32,
     pub desktop: u32,
     pub queues: HashMap<CtxId, Queue>,
@@ -527,6 +531,8 @@ impl User {
             next_atom: 0xc000,
             windows: Windows::new(objects)?,
             top: Vec::new(),
+            foreground: 0,
+            foreground_active: false,
             next_hwnd: HWND_BASE,
             desktop: 0,
             queues: HashMap::new(),
@@ -667,6 +673,15 @@ impl User {
         self.queues.entry(ctx).or_default()
     }
 
+    /// Current foreground HWND on the virtual desktop, or NULL while inactive.
+    pub fn foreground_window(&self) -> u32 {
+        if self.foreground_active {
+            self.foreground
+        } else {
+            0
+        }
+    }
+
     /// Physical screen position of the left edge of the client area.
     pub fn client_origin(&self, objects: &Objects, hwnd: u32) -> (i32, i32) {
         let Some(w) = self.windows.get(objects, &hwnd) else {
@@ -735,6 +750,10 @@ impl User {
     fn remove_window(&mut self, hwnd: u32, objects: &mut adv_machine::Objects) {
         if self.locked_window == Some(hwnd) {
             self.locked_window = None;
+        }
+        if self.foreground == hwnd {
+            self.foreground = 0;
+            self.foreground_active = false;
         }
         self.clipboard.remove_window(hwnd);
         self.menus.remove_window(hwnd, objects);
@@ -1387,7 +1406,7 @@ fn create_window_inner(
             .children
             .push(hwnd);
     } else {
-        u.top.insert(0, hwnd);
+        z_order::raise(u, &mut env.sys.objects, hwnd);
     }
     log::debug!("CreateWindowEx({class_name}) = {hwnd:#x} style {style:#x} at ({x},{y}) {w}x{h}");
 
@@ -1832,12 +1851,29 @@ pub fn activate_window(
     hwnd: u32,
     then: impl FnOnce(&mut Env<'_>) -> Outcome + 'static,
 ) -> Outcome {
+    activate_window_request(env, hwnd, true, then)
+}
+fn activate_window_request(
+    env: &mut Env<'_>,
+    hwnd: u32,
+    foreground: bool,
+    then: impl FnOnce(&mut Env<'_>) -> Outcome + 'static,
+) -> Outcome {
     let u = &mut env.ext.get_mut::<crate::Win32>().user;
     let Some(thread) = u.windows.get(&env.sys.objects, &hwnd).map(|w| w.thread) else {
         return then(env);
     };
-    u.top.retain(|&t| t != hwnd);
-    u.top.insert(0, hwnd);
+    z_order::raise(u, &mut env.sys.objects, hwnd);
+    let was_foreground = u.foreground_active;
+    let foreground_queue = u
+        .windows
+        .get(&env.sys.objects, &u.foreground)
+        .map(|w| w.thread);
+    let update_foreground = foreground || was_foreground && foreground_queue == Some(thread);
+    if update_foreground {
+        u.foreground = hwnd;
+        u.foreground_active = true;
+    }
     let q = u.queue(thread);
     let old = q.active;
     if old == hwnd {
@@ -1847,7 +1883,7 @@ pub fn activate_window(
     let mut msgs = Vec::new();
     if old != 0 {
         msgs.push([old, wm::ACTIVATE, 0, hwnd]);
-    } else {
+    } else if update_foreground && !was_foreground {
         msgs.push([hwnd, wm::ACTIVATEAPP, 1, 0]);
     }
     msgs.push([hwnd, wm::ACTIVATE, 1, old]); // WA_ACTIVE
@@ -1903,8 +1939,13 @@ pub fn set_window_pos(
 ) -> Outcome {
     let u = &mut env.ext.get_mut::<crate::Win32>().user;
     let Some(w) = u.windows.get(&env.sys.objects, &hwnd) else {
+        set_last_error(env, 1400);
         return then(env, false);
     };
+    if flags & SWP_NOZORDER == 0 && !z_order::valid(u, &env.sys.objects, hwnd, after) {
+        set_last_error(env, 1400);
+        return then(env, false);
+    }
     let old = w.rect;
     let (x, y) = if flags & SWP_NOMOVE != 0 {
         (old.left, old.top)
@@ -1924,18 +1965,34 @@ pub fn set_window_pos(
     }
     // WINDOWPOS: hwnd, hwndInsertAfter, x, y, cx, cy, flags.
     let wp = temp_alloc(env, 28);
+    if wp == 0 {
+        set_last_error(env, 8);
+        return then(env, false);
+    }
     for (i, v) in [hwnd, after, x as u32, y as u32, cx as u32, cy as u32, flags]
         .into_iter()
         .enumerate()
     {
-        let _ = env.cpu.write_u32(wp + 4 * i as u32, v);
+        if env.cpu.write_u32(wp + 4 * i as u32, v).is_err() {
+            temp_free(env, wp);
+            set_last_error(env, 8);
+            return then(env, false);
+        }
     }
-    send(env, hwnd, wm::WINDOWPOSCHANGING, 0, wp, move |env, _| {
+    let apply = move |env: &mut Env<'_>, _: u32| {
         // The window procedure may have adjusted the position.
         let r = |i: u32| env.cpu.read_u32(wp + 4 * i).unwrap_or(0) as i32;
         let (x, y, cx, cy) = (r(2), r(3), r(4), r(5));
         let flags = r(6) as u32;
         let u = &mut env.ext.get_mut::<crate::Win32>().user;
+        let after = env.cpu.read_u32(wp + 4).unwrap_or(after);
+        if !u.windows.contains_key(&env.sys.objects, &hwnd)
+            || flags & SWP_NOZORDER == 0 && !z_order::valid(u, &env.sys.objects, hwnd, after)
+        {
+            temp_free(env, wp);
+            set_last_error(env, 1400);
+            return then(env, false);
+        }
         if let Some(w) = u.windows.get_mut(&mut env.sys.objects, &hwnd) {
             w.rect = Rect::new(x, y, cx, cy);
             super::placement::position_changed(w);
@@ -1943,19 +2000,10 @@ pub fn set_window_pos(
                 w.invalidate_client(true);
             }
         }
-        if flags & SWP_NOZORDER == 0
-            && u.windows
-                .get(&env.sys.objects, &hwnd)
-                .is_some_and(|w| w.parent == 0)
-        {
-            u.top.retain(|&t| t != hwnd);
-            // HWND_TOP 0, HWND_BOTTOM 1, HWND_TOPMOST -1, HWND_NOTOPMOST -2, else after that window.
-            let at = match after {
-                0 | 0xffff_ffff | 0xffff_fffe => 0,
-                1 => u.top.len(),
-                a => u.top.iter().position(|&t| t == a).map_or(0, |i| i + 1),
-            };
-            u.top.insert(at, hwnd);
+        if flags & SWP_NOZORDER == 0 && !z_order::place(u, &mut env.sys.objects, hwnd, after) {
+            temp_free(env, wp);
+            set_last_error(env, 1400);
+            return then(env, false);
         }
         send(env, hwnd, wm::WINDOWPOSCHANGED, 0, wp, move |env, _| {
             temp_free(env, wp);
@@ -1975,7 +2023,12 @@ pub fn set_window_pos(
                 None => then(env, true),
             }
         })
-    })
+    };
+    if flags & 0x400 != 0 {
+        apply(env, 0)
+    } else {
+        send(env, hwnd, wm::WINDOWPOSCHANGING, 0, wp, apply)
+    }
 }
 
 /// Default handling of WM_WINDOWPOSCHANGED: WM_MOVE and WM_SIZE.
@@ -2078,11 +2131,41 @@ fn set_focus_api(env: &mut Env<'_>) -> Outcome {
     set_focus(env, hwnd, |_, old| Outcome::Return(old))
 }
 
+#[win32(user32, name = "BringWindowToTop", level = state)]
+fn bring_to_top(env: &mut Env<'_>, hwnd: AbiHandle) -> Outcome {
+    if !user(env)
+        .windows
+        .get(&env.sys.objects, &hwnd.0)
+        .is_some_and(|w| !w.destroying)
+    {
+        set_last_error(env, 1400);
+        return Outcome::Return(0);
+    }
+    let root = user(env).root(&env.sys.objects, hwnd.0);
+    if root == 0 {
+        set_last_error(env, 1400);
+        return Outcome::Return(0);
+    }
+    set_window_pos(
+        env,
+        hwnd.0,
+        0,
+        Rect::default(),
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        move |env, ok| {
+            if !ok {
+                return Outcome::Return(0);
+            }
+            activate_window(env, root, |_| Outcome::Return(1))
+        },
+    )
+}
+
 fn set_active_window(env: &mut Env<'_>) -> Outcome {
     let hwnd = env.arg(0);
     let ctx = env.context;
     let old = user_mut(env).queue(ctx).active;
-    activate_window(env, hwnd, move |_| Outcome::Return(old))
+    activate_window_request(env, hwnd, false, move |_| Outcome::Return(old))
 }
 
 #[win32(user32, name = "EnableWindow", level = state)]
@@ -2817,18 +2900,7 @@ fn get_active_window(env: &mut Env<'_>) -> Outcome {
 }
 
 fn get_foreground_window(env: &mut Env<'_>) -> Outcome {
-    let u = user(env);
-    Outcome::Return(
-        u.top
-            .iter()
-            .copied()
-            .find(|t| {
-                u.windows
-                    .get(&env.sys.objects, t)
-                    .is_some_and(Window::visible)
-            })
-            .unwrap_or(0),
-    )
+    Outcome::Return(user(env).foreground_window())
 }
 
 fn set_foreground_window(env: &mut Env<'_>) -> Outcome {
@@ -3156,6 +3228,7 @@ pub fn register(reg: &mut Registry) {
     s(reg, "UpdateWindow", 1, update_window);
     s(reg, "LockWindowUpdate", 1, lock_window_update);
     s(reg, "SetWindowPos", 7, set_window_pos_api);
+    reg.register(bring_to_top_ABI);
     s(reg, "MoveWindow", 6, move_window);
     s(reg, "SetFocus", 1, set_focus_api);
     s(reg, "GetFocus", 0, get_focus);

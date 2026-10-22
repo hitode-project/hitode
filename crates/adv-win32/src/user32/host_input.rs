@@ -172,11 +172,22 @@ fn activate_app(env: &mut Env<'_>, active: bool) -> bool {
     };
     let thread = user.windows.get(&env.sys.objects, &top).unwrap().thread;
     let hwnd = user
-        .queues
-        .get(&thread)
-        .map(|queue| queue.active)
-        .filter(|&hwnd| valid_window(user, &env.sys.objects, hwnd, thread))
+        .windows
+        .get(&env.sys.objects, &user.foreground)
+        .filter(|w| !w.destroying && w.visible())
+        .map(|w| w.hwnd)
+        .or_else(|| {
+            user.queues
+                .get(&thread)
+                .map(|queue| queue.active)
+                .filter(|&hwnd| valid_window(user, &env.sys.objects, hwnd, thread))
+        })
         .unwrap_or(top);
+    let state = &mut env.ext.get_mut::<Win32>().user;
+    if active {
+        state.foreground = hwnd;
+    }
+    state.foreground_active = active;
     let flag = u32::from(active);
     let messages = if active {
         [

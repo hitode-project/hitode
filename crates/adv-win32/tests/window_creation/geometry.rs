@@ -1,6 +1,6 @@
 //! Authored windows expose nested and mirrored mapping plus immediate-child lookup.
 use super::*;
-fn create<B: TestCpu>(
+pub(super) fn create<B: TestCpu>(
     f: &mut Fixture<B>,
     class: u32,
     parent: Arg,

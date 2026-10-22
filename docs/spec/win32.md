@@ -140,7 +140,7 @@ This spec covers Win32 subsystems of the personality: images and loader state, s
 
 ### WIN32-USER-7 Placement state and limits
 
-**Rule**: Placement MUST retain minimum position and restore-to-maximized state in the window owner. Asynchronous cross-thread placement and reversed or overflowing restore rectangles MUST fail explicitly.
+**Rule**: Placement MUST retain minimum position and restore-to-maximized state in the window owner. Asynchronous cross-thread placement and reversed or overflowing restore rectangles MUST fail explicitly. Z-order operations MUST preserve topmost bands and ownership constraints, retaining foreground identity when activation is suppressed.
 **Verification**: Test
 
 ### WIN32-USER-8 Physical double clicks

@@ -2622,6 +2622,7 @@ user32.dll!AppendMenuA	user cache or win32k	not excluded	not excluded	not exclud
 user32.dll!AppendMenuW	user cache or win32k	not excluded	not excluded	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
 user32.dll!AttachThreadInput	user cache or win32k	not excluded	not excluded	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
 user32.dll!BeginPaint	user cache or win32k	not excluded	not excluded	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
+user32.dll!BringWindowToTop	user cache or win32k	not excluded	not excluded	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
 user32.dll!CallNextHookEx	user cache or win32k	not excluded	not excluded	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
 user32.dll!CallWindowProcA	user cache or win32k	not excluded	yes/conditional	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
 user32.dll!CallWindowProcW	user cache or win32k	not excluded	yes/conditional	not excluded	not excluded	not required by fast path; ordinary not excluded	ordinary	ordinary required until all effects are proven safe
