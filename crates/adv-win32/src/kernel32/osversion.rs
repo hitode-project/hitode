@@ -76,11 +76,6 @@ fn get_product_info(env: &mut Env<'_>) -> Outcome {
         Err(_) => fail(env, 998),
     }
 }
-/// Desktop processes have no package identity; the buffer is left untouched.
-fn get_current_package_id(_: &mut Env<'_>) -> Outcome {
-    const APPMODEL_ERROR_NO_PACKAGE: u32 = 15700;
-    Outcome::Return(APPMODEL_ERROR_NO_PACKAGE)
-}
 /// Fill an OSVERSIONINFO[EX]{A,W} whose size field selects the layout.
 fn write_version(env: &mut Env<'_>, pointer: u32, wide: bool) -> Result<(), u32> {
     let base = if wide { 276 } else { 148 };
@@ -217,13 +212,6 @@ pub(super) fn register(registry: &mut Registry) {
     });
     stdcall(registry, "ntdll.dll", "RtlGetVersion", 1, rtl_get_version);
     stdcall(registry, super::K32, "GetProductInfo", 5, get_product_info);
-    stdcall(
-        registry,
-        super::K32,
-        "GetCurrentPackageId",
-        2,
-        get_current_package_id,
-    );
     stdcall(
         registry,
         super::K32,

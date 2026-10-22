@@ -14,12 +14,11 @@ const READ_ONLY: u32 = 0x420000;
 const UNMAPPED: u32 = 0x600000;
 const BUFFER: u32 = DATA + 0x800;
 const MARKER: u32 = 0x12345678;
-const DLLS: [&str; 5] = [
+const DLLS: [&str; 4] = [
     "xinput1_1.dll",
     "xinput1_2.dll",
     "xinput9_1_0.dll",
     "xinput1_3.dll",
-    "xinput1_4.dll",
 ];
 
 fn registry() -> Registry {
@@ -84,7 +83,7 @@ fn absent_controllers<B: Backend>(cpu: B) {
             let function = m.resolve_import(dll, "XInputEnable").unwrap();
             code.push_imm(0).call(function).push_imm(1).call(function);
         }
-        if matches!(dll, "xinput1_3.dll" | "xinput1_4.dll") {
+        if dll == "xinput1_3.dll" {
             extra.extend([
                 ("XInputGetBatteryInformation", vec![0, 0, BUFFER], 1167),
                 ("XInputGetBatteryInformation", vec![3, 2, READ_ONLY], 1167),
@@ -94,21 +93,6 @@ fn absent_controllers<B: Backend>(cpu: B) {
                 ("XInputGetKeystroke", vec![0, 0, UNMAPPED], 1167),
                 ("XInputGetKeystroke", vec![4, 0, BUFFER], 160),
                 ("XInputGetKeystroke", vec![0, 1, BUFFER], 160),
-            ]);
-        }
-        if dll == "xinput1_4.dll" {
-            extra.extend([
-                (
-                    "XInputGetAudioDeviceIds",
-                    vec![0, BUFFER, BUFFER + 4, BUFFER + 8, BUFFER + 12],
-                    1167,
-                ),
-                ("XInputGetAudioDeviceIds", vec![0, 0, 0, 0, 0], 1167),
-                (
-                    "XInputGetAudioDeviceIds",
-                    vec![4, BUFFER, BUFFER + 4, BUFFER + 8, BUFFER + 12],
-                    160,
-                ),
             ]);
         }
         for (name, args, result) in extra {
@@ -188,16 +172,22 @@ fn selected_legacy_versions_are_typed_and_do_not_advertise_attached_devices() {
             assert!(registry.dynamic_available(dll, name));
         }
     }
-    for (ordinal, name) in [
-        ("#2", "XInputGetState"),
-        ("#3", "XInputSetState"),
-        ("#4", "XInputGetCapabilities"),
+    // The xinput1_4 import library still supplies ABI/ordinal metadata, but the
+    // DLL shipped with Windows 8 and must not advertise a Win7 implementation.
+    for name in [
+        "XInputGetState",
+        "XInputSetState",
+        "XInputGetCapabilities",
+        "XInputEnable",
+        "XInputGetBatteryInformation",
+        "XInputGetKeystroke",
+        "XInputGetAudioDeviceIds",
+        "#2",
+        "#3",
+        "#4",
     ] {
-        assert_eq!(
-            registry.canonical_name("xinput1_4.dll", ordinal),
-            Some(name)
-        );
-        assert!(registry.dynamic_available("xinput1_4.dll", ordinal));
+        assert!(!registry.dynamic_available("xinput1_4.dll", name));
+        assert!(!registry.is_implemented("xinput1_4.dll", name));
     }
     assert!(registry.dynamic_available("xinput1_3.dll", "XInputGetKeystroke"));
     assert!(registry.signature_conflicts().is_empty());

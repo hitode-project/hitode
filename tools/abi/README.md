@@ -137,6 +137,16 @@ Names and the data flag come from the public-domain mingw-w64-crt module definit
 The catalog states existence only, never a convention or implementation promise; `tools/survey/coverage.py` compares it and `signatures.tsv` against registered APIs.
 `post-win7.tsv` lists catalogued functions introduced after Windows 7, with their minimum client and source; they stay unimplemented, so discovery hides them as on Windows 7, and coverage counts them as excluded.
 
+Use the pinned WinMD's `SupportedOSPlatform` attribute, falling back to Microsoft Learn's minimum supported client when absent.
+Keep exclusions sorted by DLL and export name; merge concurrent additions by their union and sort again.
+The signature catalog remains complete: excluding discovery does not erase ABI evidence or turn missing behavior into a registered failure.
+
+Multi-version desktop requirements need their earliest applicable client, rather than the first modern client in the list.
+The pinned metadata incorrectly marks 262 MSI names as `windows8.0` and 96 older Winsock names as `windows8.1`.
+Learn explicitly retains older clients for [MsiGetFileHash](https://learn.microsoft.com/en-us/windows/win32/api/msi/nf-msi-msigetfilehashw) and [WSAStartup](https://learn.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-wsastartup); these functions remain in scope.
+Likewise, AddDllDirectory, RemoveDllDirectory and SetDefaultDllDirectories remain in scope because their requirements include Windows 7 with KB2533623.
+XInput availability is DLL-specific: the [platform requirements](https://learn.microsoft.com/en-us/windows/win32/api/xinput/nf-xinput-xinputgetstate) exclude XInput 1.4 while retaining the legacy SDK and 9.1.0 versions.
+
 ```sh
 python tools/abi/crt_exports.py --mingw <mingw-w64-checkout> --check
 python -m unittest discover -s tools/abi -p test_crt_exports.py

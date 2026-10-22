@@ -1062,7 +1062,6 @@ pub(super) fn register(reg: &mut Registry) {
     stdcall(reg, K32, "GetStartupInfoW", 1, get_startup_info);
     stdcall(reg, K32, "GetStdHandle", 1, get_std_handle);
     stdcall(reg, K32, "SetStdHandle", 2, |_| Outcome::Return(1));
-    stdcall(reg, K32, "SetHandleCount", 1, |e| Outcome::Return(e.arg(0)));
     stdcall(reg, K32, "IsDebuggerPresent", 0, |_| Outcome::Return(0));
     stdcall(reg, K32, "CheckRemoteDebuggerPresent", 2, |e| {
         if let Err(error) = super::child_process::process_target(e, e.arg(0), 0x1000) {

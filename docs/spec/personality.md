@@ -67,7 +67,7 @@ This spec covers the Windows identity the guest sees. It includes implementation
 
 ### PERS-EXPORT-2 Discovery classification
 
-**Rule**: Dynamic discovery MUST expose only implemented or reviewed exports, except under `ADV_PERSONALITY_STRICT`. Forwarders MUST use their final target classification.
+**Rule**: Dynamic discovery MUST expose only implemented or reviewed exports, except under `ADV_PERSONALITY_STRICT`. Forwarders MUST use their final target classification. Exports introduced after Windows 7 MUST remain undiscoverable in both API modes.
 **Verification**: Test
 
 ### PERS-EXPORT-3 Review admission
