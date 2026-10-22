@@ -76,8 +76,13 @@ fn deliver<T: Copy>(
     Outcome::Return(out.len() as u32)
 }
 
+/// MultiByteToWideChar fails on an invalid sequence instead of substituting.
+const MB_ERR_INVALID_CHARS: u32 = 8;
+/// ERROR_NO_UNICODE_TRANSLATION.
+const NO_UNICODE_TRANSLATION: u32 = 1113;
+
 fn multi_byte_to_wide_char(env: &mut Env<'_>) -> Outcome {
-    let (cp, _flags, src, len, dst, cap) = (
+    let (cp, flags, src, len, dst, cap) = (
         env.arg(0),
         env.arg(1),
         env.arg(2),
@@ -89,7 +94,11 @@ fn multi_byte_to_wide_char(env: &mut Env<'_>) -> Outcome {
     if len < 0 {
         bytes.push(0);
     }
-    let units = env.ext.get::<Win32>().codec.to_utf16(cp, &bytes);
+    let (units, invalid) = env.ext.get::<Win32>().codec.to_utf16_checked(cp, &bytes);
+    if invalid && flags & MB_ERR_INVALID_CHARS != 0 {
+        set_last_error(env, NO_UNICODE_TRANSLATION);
+        return Outcome::Return(0);
+    }
     deliver(env, &units, dst, cap, |e, p, v| write_units(e.cpu, p, v))
 }
 
@@ -394,7 +403,7 @@ pub(super) fn register(reg: &mut Registry) {
     reg.register(is_dbcs_lead_byte_ex_ABI);
     stdcall(reg, K32, "MultiByteToWideChar", 6, multi_byte_to_wide_char);
     stdcall(reg, K32, "WideCharToMultiByte", 8, wide_char_to_multi_byte);
-    // Flags other than MB_PRECOMPOSED, MB_ERR_INVALID_CHARS among them, are ignored.
+    // MB_COMPOSITE and MB_USEGLYPHCHARS are ignored.
     reg.accept(
         K32,
         "MultiByteToWideChar",
@@ -402,7 +411,7 @@ pub(super) fn register(reg: &mut Registry) {
         adv_os::nls::is_modeled,
     );
     reg.accept(K32, "MultiByteToWideChar", "dwFlags", |flags| {
-        flags & !1 == 0
+        flags & !(1 | MB_ERR_INVALID_CHARS) == 0
     });
     reg.accept(
         K32,
@@ -432,4 +441,35 @@ pub(super) fn register(reg: &mut Registry) {
     }
     stdcall(reg, K32, "IsValidLocale", 2, |_| Outcome::Return(1));
     stdcall(reg, K32, "SetThreadLocale", 1, |_| Outcome::Return(1));
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::misc::test_support::{DATA, Fixture};
+    use adv_cpu::backend::Guest;
+
+    #[test]
+    fn invalid_sequences_fail_only_when_the_caller_asks() {
+        let mut f = Fixture::new("mb-err-invalid-chars");
+        // "A" and a lone Shift_JIS lead byte.
+        f.m.cpu.write(DATA, &[0x41, 0x82]).unwrap();
+        let convert = |f: &mut Fixture, flags| {
+            f.call(
+                "kernel32.dll",
+                "MultiByteToWideChar",
+                &[932, flags, DATA, 2, 0, 0],
+            )
+        };
+        assert_eq!(convert(&mut f, 1), 2);
+        assert_eq!(convert(&mut f, 1 | 8), 0);
+        assert_eq!(f.call("kernel32.dll", "GetLastError", &[]), 1113);
+        f.m.cpu.write(DATA, &[0x41, 0x82, 0xa0]).unwrap();
+        let valid = f.call(
+            "kernel32.dll",
+            "MultiByteToWideChar",
+            &[932, 8, DATA, 3, 0, 0],
+        );
+        assert_eq!(valid, 2);
+        f.cleanup();
+    }
 }

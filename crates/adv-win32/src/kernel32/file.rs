@@ -12,6 +12,7 @@ use crate::util::{INVALID_HANDLE_VALUE, cstr, err, out_u32, set_last_error, wstr
 use crate::{FileObj, STD_ERROR, STD_INPUT, STD_OUTPUT, Win32, stdcall};
 mod attributes;
 mod change_notification;
+pub(crate) mod delete_on_close;
 mod legacy;
 pub(crate) mod native;
 
@@ -30,10 +31,11 @@ const OPEN_EXISTING: u32 = 3;
 const OPEN_ALWAYS: u32 = 4;
 const TRUNCATE_EXISTING: u32 = 5;
 const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x20;
-/// The CreateFile flags and attributes that need no modeling: attributes and
-/// caching hints. Overlapped I/O, delete on close, backup semantics and the
-/// remaining flags are ignored.
-const MODELED_FLAGS: u32 = 0xffff | 0x8000_0000 | 0x2000_0000 | 0x1000_0000 | 0x0800_0000;
+/// The CreateFile flags and attributes modeled or needing no model:
+/// attributes, caching hints and delete on close. Overlapped I/O, backup
+/// semantics and the remaining flags are ignored.
+const MODELED_FLAGS: u32 =
+    0xffff | 0x8000_0000 | 0x2000_0000 | 0x1000_0000 | 0x0800_0000 | delete_on_close::FLAG;
 
 fn system_file(env: &mut Env<'_>, path: &str) -> Result<Option<std::sync::Arc<[u8]>>, ()> {
     let files = env
@@ -185,9 +187,18 @@ fn create_file(env: &mut Env<'_>, path: String) -> Outcome {
         }
         return Outcome::Return(handle);
     }
+    let deletes = env.arg(5) & delete_on_close::FLAG != 0;
+    let access = if deletes {
+        access | delete_on_close::DELETE
+    } else {
+        access
+    };
     let handle = open_with_share(env, &path, access, disposition, share);
     if handle != INVALID_HANDLE_VALUE {
         super::handle::set_inherit(env, handle, inherit);
+        if deletes {
+            delete_on_close::watch(env, handle);
+        }
     }
     Outcome::Return(handle)
 }

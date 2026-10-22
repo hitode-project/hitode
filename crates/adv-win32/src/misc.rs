@@ -302,13 +302,20 @@ fn folder(csidl: u32) -> Option<&'static str> {
     Some(match csidl & 0xff {
         0x00 | 0x10 => "Desktop",
         0x05 => "Documents",
+        0x0d => "Music",
+        0x0e => "Videos",
         0x1a => "AppData\\Roaming",
         0x1c => "AppData\\Local",
+        0x20 => "AppData\\Local\\Microsoft\\Windows\\Temporary Internet Files",
+        0x21 => "AppData\\Roaming\\Microsoft\\Windows\\Cookies",
+        0x22 => "AppData\\Local\\Microsoft\\Windows\\History",
         0x23 => "C:\\ProgramData",
         0x24 => "C:\\Windows",
         0x25 => "C:\\Windows\\system32",
         0x26 => "C:\\Program Files",
+        0x27 => "Pictures",
         0x28 => "",
+        0x2b => "C:\\Program Files\\Common Files",
         0x2e => "C:\\Users\\Public\\Documents",
         _ => return None,
     })
@@ -519,6 +526,36 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn user_and_shared_folders_resolve_to_their_windows_7_paths() {
+        use adv_cpu::backend::Guest;
+        let mut f = crate::misc::test_support::Fixture::new("special-folders");
+        let buf = crate::misc::test_support::DATA;
+        for (csidl, path) in [
+            (0x0d, r"\Music"),
+            (0x0e, r"\Videos"),
+            (
+                0x20,
+                r"\AppData\Local\Microsoft\Windows\Temporary Internet Files",
+            ),
+            (0x21, r"\AppData\Roaming\Microsoft\Windows\Cookies"),
+            (0x22, r"\AppData\Local\Microsoft\Windows\History"),
+            (0x27 | 0x8000, r"\Pictures"),
+            (0x2b, r"C:\Program Files\Common Files"),
+        ] {
+            assert_eq!(
+                f.call("shell32.dll", "SHGetFolderPathA", &[0, csidl, 0, 0, buf]),
+                0
+            );
+            let mut bytes = vec![0; 260];
+            f.m.cpu.read(buf, &mut bytes).unwrap();
+            let end = bytes.iter().position(|&b| b == 0).unwrap();
+            let text = String::from_utf8(bytes[..end].to_vec()).unwrap();
+            assert!(text.ends_with(path), "{csidl:#x}: {text}");
+        }
+        f.cleanup();
     }
 
     #[test]

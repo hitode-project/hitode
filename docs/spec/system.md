@@ -45,6 +45,12 @@ This spec covers Windows system libraries outside the core subsystems, as an off
 **Rule**: Filesystem name matching MUST use the shared invariant UTF-16 case mapping on every host. Non-ASCII names MUST use the same directory index and invalidation rules as ASCII names.
 **Verification**: Test
 
+### SYS-FILE-2 Delete on close
+
+**Rule**: A file opened with FILE_FLAG_DELETE_ON_CLOSE MUST be deleted once no handle has it open, or when the process exits. Its handle MUST carry DELETE access, so other opens MUST share delete access.
+**Verification**: Test
+**Basis**: Microsoft CreateFile documentation of FILE_FLAG_DELETE_ON_CLOSE.
+
 ## Cryptography
 
 ### SYS-CRYPTO-1 Streaming digests
