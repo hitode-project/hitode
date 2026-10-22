@@ -5,7 +5,9 @@ Input: the public-domain mingw-w64-crt .def files, preprocessed for i386 by `cc 
 Output: sorted data/abi/crt-exports.tsv and provenance JSON; stdout contains counts
 only. WinMD omits the C runtimes, so this catalog lists which names each CRT DLL
 exports and whether an export is data. It records no calling convention, ordinal
-or implementation promise; mingw import-library aliases (`==`) are not exports.
+or implementation promise. mingw hides some real exports it replaces: in
+`alias == export` only the right side is a DLL export, and `; name ; reason`
+comments keep the name unless the reason says the i386 DLL lacks it.
 """
 import argparse
 import hashlib
@@ -31,23 +33,41 @@ MODULES = {
 }
 API_SETS = "lib-common/api-ms-win-crt-*-l1-1-0.def*"
 DECORATION = re.compile(r"@\d+$")
+# `; name ; reason` or `; name replaced ...`: an export mingw replaces with its own.
+HIDDEN = re.compile(r";\s*([A-Za-z_?$][\w@?$]*)\s*(?:;\s*(.*)|\s+((?:replaced|disabled?)\b.*))$")
+# Reasons saying the plain i386 DLL lacks the name: removed exports, ARM64EC-hosted
+# CHPE builds and functions mingw supplies because i386 never exported them.
+ABSENT = re.compile(r"^removed|chpe|^i386 \S+ provided by emu", re.IGNORECASE)
+
+
+def undecorated(name):
+    return name if name.startswith("?") else DECORATION.sub("", name)
 
 
 def exports(text):
     """Export name to kind for preprocessed module-definition text."""
-    result = {}
+    result, hidden = {}, set()
     for line in text.splitlines():
+        line = line.strip()
+        comment = HIDDEN.fullmatch(line)
+        if comment:
+            if not ABSENT.search(comment.group(2) or comment.group(3) or ""):
+                hidden.add(undecorated(comment.group(1)))
+            continue
         line = line.split(";", 1)[0].strip()
-        if not line or line.startswith(("LIBRARY", "EXPORTS")) or "==" in line:
+        if not line or line.startswith(("LIBRARY", "EXPORTS")):
+            continue
+        if "==" in line:
+            hidden.add(undecorated(line.split("==", 1)[1].split()[0]))
             continue
         words = line.replace("=", " = ").split()
-        name = words[0]
-        if not name.startswith("?"):
-            name = DECORATION.sub("", name)
+        name = undecorated(words[0])
         kind = "data" if "DATA" in words[1:] else "code"
         if result.get(name, kind) != kind:
             raise ValueError(f"conflicting kinds for {name}")
         result[name] = kind
+    for name in hidden:
+        result.setdefault(name, "code")
     return result
 
 

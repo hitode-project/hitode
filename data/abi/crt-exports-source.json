@@ -11,7 +11,7 @@
       },
       "api-ms-win-crt-convert-l1-1-0.dll": {
         "definition": "lib-common/api-ms-win-crt-convert-l1-1-0.def.in",
-        "exports": 120,
+        "exports": 122,
         "sha256": "de76381eca0fc3204f7f99eee6fed18bbb426bc72615dfddb9820949cfc94d27"
       },
       "api-ms-win-crt-environment-l1-1-0.dll": {
@@ -66,7 +66,7 @@
       },
       "api-ms-win-crt-string-l1-1-0.dll": {
         "definition": "lib-common/api-ms-win-crt-string-l1-1-0.def",
-        "exports": 176,
+        "exports": 178,
         "sha256": "2b812b2a034c0a4f4929a6c407f2e4a6dd095701308a9d8aec4f2d93d6640868"
       },
       "api-ms-win-crt-time-l1-1-0.dll": {
@@ -86,57 +86,57 @@
       },
       "msvcr100.dll": {
         "definition": "lib32/msvcr100.def.in",
-        "exports": 1604,
+        "exports": 1621,
         "sha256": "03ccbd28fc5701a1fd8a5bcbf654b83a21be84fb2ab81a12585628adb9bb4f06"
       },
       "msvcr110.dll": {
         "definition": "lib32/msvcr110.def.in",
-        "exports": 1695,
+        "exports": 1710,
         "sha256": "ea906182b167088cc5168cd7d41d2ed6a2b0ae4f60a4775d27c80646ead9e415"
       },
       "msvcr120.dll": {
         "definition": "lib32/msvcr120.def.in",
-        "exports": 1890,
+        "exports": 1966,
         "sha256": "44b82e5e983423c0092d8cb1797671f79d5371c3ea8aabf2479500cf532f2910"
       },
       "msvcr70.dll": {
         "definition": "lib32/msvcr70.def.in",
-        "exports": 826,
+        "exports": 840,
         "sha256": "495f2c32139fa481106015a4b1cc69588367725122c652221070d96509f71ad7"
       },
       "msvcr71.dll": {
         "definition": "lib32/msvcr71.def.in",
-        "exports": 824,
+        "exports": 838,
         "sha256": "49e779c7c307dc4b68ce92ef9041a51c1d218c76871b0b7e439dcf076de4d17e"
       },
       "msvcr80.dll": {
         "definition": "lib32/msvcr80.def.in",
-        "exports": 1443,
+        "exports": 1466,
         "sha256": "e97bd39c1c877bd424e272a9f9346c3db35d00a09381a039f1b7fab41a23c137"
       },
       "msvcr90.dll": {
         "definition": "lib32/msvcr90.def.in",
-        "exports": 1430,
+        "exports": 1450,
         "sha256": "9cdb033edcabd7a7c17c6b52086ebfc29dce667f7415c0960cf18788ee72bb29"
       },
       "msvcrt.dll": {
         "definition": "lib-common/msvcrt.def.in",
-        "exports": 1298,
+        "exports": 1326,
         "sha256": "d9a2514ff787d4995f033feca5b90f02290ec382712bdbd3ae6d7fa8df6ecd78"
       },
       "msvcrt20.dll": {
         "definition": "lib32/msvcrt20.def.in",
-        "exports": 1108,
+        "exports": 1127,
         "sha256": "3e4a024ca7c83cd9e76fa0a4e0a42a546a3e228d3350335de60efe4090d5b06b"
       },
       "msvcrt40.dll": {
         "definition": "lib32/msvcrt40.def.in",
-        "exports": 1150,
+        "exports": 1166,
         "sha256": "87de1dcff3be6cce1a2d3872ae93c78bdb92289612910ce88ee493fbdcf42a1a"
       },
       "ucrtbase.dll": {
         "definition": "lib-common/ucrtbase.def.in",
-        "exports": 2538,
+        "exports": 2542,
         "sha256": "5925e0dbb389af33fb552b248d9bb5c7a516f564549544ca4b0024943fe96298"
       },
       "vcruntime140.dll": {
