@@ -3,7 +3,8 @@
 //!
 //! The tests need a Wine 11.0 i386 build and the probes built from
 //! `tests/probe`: `ADV_WINE_DIST` names the directory that holds
-//! `lib/wine/i386-windows` and `share/wine/nls`, and `ADV_WINE_PROBES` the
+//! `lib/wine/i386-windows` (and `i386-unix` for the Unix libraries) and
+//! `share/wine/nls`, and `ADV_WINE_PROBES` the
 //! directory that holds the probes. Without them the tests are skipped.
 //! The server keeps its state in globals, so each test binary runs one
 //! probe.
@@ -20,7 +21,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use adv_cpu::Cpu;
-use adv_machine::{Machine, RunResult, SliceResult, layout::PARK_ADDR};
+use adv_machine::{Machine, Resolver, RunResult, SliceResult, layout::PARK_ADDR};
 use adv_nt::server::{Progress, Time};
 use adv_nt::{dispatch::Platform, params::Startup, process};
 use adv_wineserver::{Clock, Config, Server, State};
@@ -74,7 +75,19 @@ impl Progress for Runtime {
 
 /// Runs `name` from the probe directory to its end, on real time when
 /// `real_time`; none when the test is skipped.
+#[allow(dead_code, reason = "each test binary uses one of the entries")]
 pub fn run_probe(name: &str, real_time: bool) -> Option<(RunResult, String)> {
+    run_probe_on(name, real_time, Platform, |_| {})
+}
+
+/// [`run_probe`] on a machine with `resolver`, which `prepare` sets up
+/// before the process starts.
+pub fn run_probe_on(
+    name: &str,
+    real_time: bool,
+    resolver: impl Resolver,
+    prepare: impl FnOnce(&mut Machine<Cpu>),
+) -> Option<(RunResult, String)> {
     let _ = log::set_logger(&WineLog).map(|()| log::set_max_level(log::LevelFilter::Warn));
     let Some(dist) = std::env::var_os("ADV_WINE_DIST").map(PathBuf::from) else {
         eprintln!("skipped: ADV_WINE_DIST is not set");
@@ -137,7 +150,8 @@ pub fn run_probe(name: &str, real_time: bool) -> Option<(RunResult, String)> {
     let runtime = Runtime { server, clock };
 
     let cpu = Cpu::new(PARK_ADDR, false).unwrap();
-    let mut machine = Machine::new(cpu, Platform, machine_clock).unwrap();
+    let mut machine = Machine::new(cpu, resolver, machine_clock).unwrap();
+    prepare(&mut machine);
     let mut fds = [0; 2];
     // SAFETY: fds has room for both ends.
     assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);

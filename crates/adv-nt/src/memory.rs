@@ -14,6 +14,7 @@ use adv_machine::vm::align_up;
 use adv_machine::{Env, Outcome, Vm};
 
 use crate::status::{self, Status};
+use crate::unixlib;
 
 pub const MEM_COMMIT: u32 = 0x1000;
 pub const MEM_RESERVE: u32 = 0x2000;
@@ -143,6 +144,53 @@ pub fn allocate_committed(
     Some(base)
 }
 
+/// Maps the image of a Unix library, whose page `i` gets `protections[i]`,
+/// high in the address space as a host loader would, and returns its base.
+pub fn map_library(
+    cpu: &mut dyn Guest,
+    vm: &mut Vm,
+    memory: &mut Memory,
+    image: &[u8],
+    protections: &[u32],
+) -> Option<u32> {
+    let size = protections.len() as u32 * PAGE;
+    let base = find_free(vm, size, true)?;
+    if !vm.reserve_at(base, size) {
+        return None;
+    }
+    let mapped = cpu.map(base, size, Prot::RW).is_ok()
+        && cpu.write(base, image).is_ok()
+        && protections.iter().enumerate().all(|(page, &protection)| {
+            memory
+                .prot(protection)
+                .is_ok_and(|prot| cpu.protect(base + page as u32 * PAGE, PAGE, prot).is_ok())
+        });
+    if !mapped {
+        let _ = vm.free(cpu, base);
+        return None;
+    }
+    memory.insert(
+        base,
+        Kind::Mapped,
+        PAGE_EXECUTE_WRITECOPY,
+        protections
+            .iter()
+            .map(|&protection| Some(protection))
+            .collect(),
+    );
+    Some(base)
+}
+
+/// Records new protections for the pages of the region at `base`, which
+/// the caller has applied.
+pub fn set_protections(memory: &mut Memory, base: u32, protections: &[u32]) {
+    if let Some(region) = memory.regions.get_mut(&base) {
+        for (page, &protection) in region.pages.iter_mut().zip(protections) {
+            *page = Some(protection);
+        }
+    }
+}
+
 /// Maps `bytes`, zero-filled to `size`, as a view of a data section with
 /// `protection`, and returns its base.
 pub fn map_view(
@@ -163,6 +211,39 @@ pub fn map_view(
         && cpu.write(base, bytes).is_ok()
         && cpu.protect(base, size, prot).is_ok();
     if !mapped {
+        let _ = vm.free(cpu, base);
+        return Err(status::NO_MEMORY);
+    }
+    memory.insert(
+        base,
+        Kind::Mapped,
+        protection,
+        vec![Some(protection); (size / PAGE) as usize],
+    );
+    Ok(base)
+}
+
+/// Maps `size` bytes of the file `fd` from `offset` as a view of a data
+/// section with `protection`, read-only or read-write, and returns its
+/// base. The view shares the file's pages with every other mapping of it,
+/// such as the server's.
+pub fn map_shared_view(
+    cpu: &mut dyn Guest,
+    vm: &mut Vm,
+    memory: &mut Memory,
+    fd: std::os::fd::BorrowedFd<'_>,
+    offset: u64,
+    size: u32,
+    protection: u32,
+) -> Result<u32, Status> {
+    // Data views never execute, whatever the image's DEP choice.
+    let prot = Prot(memory.prot(protection)?.0 & !Prot::EXEC.0);
+    let size = align_up(size, PAGE);
+    let base = find_free(vm, size, false).ok_or(status::NO_MEMORY)?;
+    if !vm.reserve_at(base, size) {
+        return Err(status::NO_MEMORY);
+    }
+    if cpu.map_shared_file(base, size, fd, offset, prot).is_err() {
         let _ = vm.free(cpu, base);
         return Err(status::NO_MEMORY);
     }
@@ -428,6 +509,17 @@ fn protect_in(env: &mut Env<'_>, args: &[u32]) -> Result<(), Status> {
 
 /// NtQueryVirtualMemory(process, address, class, *buffer, length, *returned)
 pub fn query(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    let &[process, address, class, buffer, length, _] = args else {
+        unreachable!()
+    };
+    if process == CURRENT_PROCESS
+        && matches!(
+            class,
+            unixlib::MEMORY_WINE_UNIX_FUNCS | unixlib::MEMORY_WINE_UNIX_WOW64_FUNCS
+        )
+    {
+        return unixlib::query(env, address, class, buffer, length);
+    }
     finish(query_in(env, args))
 }
 

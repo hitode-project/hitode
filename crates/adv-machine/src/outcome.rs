@@ -69,6 +69,11 @@ pub enum Outcome {
     },
     /// Resume a checked architectural checkpoint without an API return epilogue.
     ResumeExecution(crate::exception::Checkpoint),
+    /// End the innermost guest call on this context as if its callee had
+    /// returned this EAX, abandoning the current host call and the guest
+    /// frames between them (NtCallbackReturn). The current host call must be
+    /// nested inside that guest call.
+    ReturnFromCall(u32),
     /// Suspend the current context until `wait` is satisfied, then run `then`.
     Block {
         wait: Wait,

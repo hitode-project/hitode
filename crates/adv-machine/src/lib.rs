@@ -1272,6 +1272,38 @@ fn apply(
             Ok(())
         }
         Outcome::ResumeExecution(checkpoint) => checkpoint.restore(cpu, sys).map_err(Parked::Fail),
+        Outcome::ReturnFromCall(value) => {
+            let context = sys.current as usize;
+            if sys.contexts[context]
+                .frames
+                .last()
+                .is_none_or(|frame| origin.esp >= frame.return_floor)
+            {
+                return Err(Parked::Fail(
+                    "callback return outside a guest call made for a host call".into(),
+                ));
+            }
+            let Some(Frame {
+                then,
+                origin: outer,
+                ..
+            }) = sys.contexts[context].frames.pop()
+            else {
+                unreachable!()
+            };
+            cpu.set_reg(Reg::Esp, outer.esp);
+            let out = then(
+                &mut Env {
+                    context: sys.current,
+                    cpu: &mut *cpu,
+                    sys: &mut *sys,
+                    ext: &mut *ext,
+                    thunk: outer.thunk,
+                },
+                Resume::Returned(value),
+            );
+            apply(cpu, sys, ext, out, outer, defer_work)
+        }
         Outcome::Block {
             wait,
             then,

@@ -16,7 +16,10 @@ use adv_machine::{Env, Outcome, Wait};
 
 use crate::exception::{self, Dispatchers};
 use crate::object::{Attributes, read_u32, write_u32};
-use crate::protocol::{CreateEventRequest, EventOpRequest, QueueApcRequest, SelectRequest};
+use crate::protocol::{
+    CreateEventRequest, CreateMutexRequest, EventOpRequest, QueueApcRequest, ReleaseMutexRequest,
+    SelectRequest,
+};
 use crate::server::{self, Time};
 use crate::status::{self, Status};
 
@@ -76,6 +79,56 @@ pub fn create_event(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         write_u32(env, handle, reply.handle)?;
         status::check(reply.header.error)
     })())
+}
+
+/// NtCreateMutant(*handle, access, *attributes, owned)
+pub fn create_mutant(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    let &[handle, access, attributes, owned] = args else {
+        unreachable!()
+    };
+    status::finish((|| {
+        write_u32(env, handle, 0)?;
+        let objattr = match attributes {
+            0 => Vec::new(),
+            attributes => Attributes::read(env, attributes)?.wire(),
+        };
+        let mut request = CreateMutexRequest {
+            access,
+            owned: i32::from(owned as u8 != 0),
+            ..Default::default()
+        };
+        let (reply, _) = server::request(env, &mut request, &[&objattr], &mut [])?;
+        if reply.header.error != status::SUCCESS && reply.header.error != status::OBJECT_NAME_EXISTS
+        {
+            return Err(reply.header.error.into());
+        }
+        write_u32(env, handle, reply.handle)?;
+        status::check(reply.header.error)
+    })())
+}
+
+/// NtReleaseMutant(handle, *previous_count)
+pub fn release_mutant(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    let &[handle, previous] = args else {
+        unreachable!()
+    };
+    status::finish((|| {
+        let mut request = ReleaseMutexRequest {
+            handle,
+            ..Default::default()
+        };
+        let (reply, _) = server::request(env, &mut request, &[], &mut [])?;
+        status::check(reply.header.error)?;
+        if previous != 0 {
+            write_u32(env, previous, 1u32.wrapping_sub(reply.prev_count))?;
+        }
+        Ok(())
+    })())
+}
+
+/// NtYieldExecution(): another thread runs if one is ready.
+pub fn yield_execution(_: &mut Env<'_>, _: &[u32]) -> Outcome {
+    Outcome::block_then_return(Wait::Yield, status::SUCCESS)
 }
 
 /// NtSetEvent(handle, *previous_state)

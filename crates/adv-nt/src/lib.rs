@@ -5,10 +5,11 @@
 //! from the Hitode machine: NT system calls, process and thread startup, and
 //! the client side of the wineserver protocol (issue #58).
 //!
-//! So far it starts ntdll.dll up to its first system call, and holds the
-//! server client.
+//! The win32k system calls go to Wine's `win32u.so`, which runs as guest
+//! code that another crate loads (see [`unixlib`] and [`win32k`]).
 #![cfg(unix)]
 
+pub mod atom;
 pub mod context;
 pub mod debug;
 pub mod dispatch;
@@ -35,3 +36,5 @@ pub mod thread;
 pub mod timezone;
 pub mod token;
 pub mod unix;
+pub mod unixlib;
+pub mod win32k;

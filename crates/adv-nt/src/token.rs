@@ -3,7 +3,7 @@
 use adv_machine::{Env, Outcome};
 
 use crate::object::{write_bytes, write_u32};
-use crate::protocol::GetTokenSidRequest;
+use crate::protocol::{AllocateLocallyUniqueIdRequest, GetTokenSidRequest};
 use crate::server;
 use crate::status::{self, Error};
 
@@ -41,5 +41,18 @@ pub fn query(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         write_u32(env, info, at)?;
         write_u32(env, info + 4, 0)?;
         Ok(())
+    })())
+}
+
+/// NtAllocateLocallyUniqueId(*luid)
+pub fn allocate_locally_unique_id(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    if args[0] == 0 {
+        return Outcome::Return(status::ACCESS_VIOLATION);
+    }
+    status::finish((|| {
+        let mut request = AllocateLocallyUniqueIdRequest::default();
+        let (reply, _) = server::request(env, &mut request, &[], &mut [])?;
+        status::check(reply.header.error)?;
+        Ok(write_bytes(env, args[0], &reply.luid)?)
     })())
 }

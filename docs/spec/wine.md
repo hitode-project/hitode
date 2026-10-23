@@ -2,7 +2,7 @@
 
 ID prefix: WINE
 
-This spec covers the Wine userland stack. `adv-wineserver` runs Wine's server inside the host process. `adv-nt` takes the place of Wine's `ntdll.so` under Wine's own Windows DLLs. [README.md](README.md) explains the format.
+This spec covers the Wine userland stack. `adv-wineserver` runs Wine's server inside the host process. `adv-nt` takes the place of Wine's `ntdll.so` under Wine's own Windows DLLs. `adv-unix` runs Wine's other Unix libraries, such as `win32u.so`, as guest code. [README.md](README.md) explains the format.
 
 ## Sources
 
@@ -48,6 +48,35 @@ This spec covers the Wine userland stack. `adv-wineserver` runs Wine's server in
 ### WINE-SYS-2 Standard handles
 
 **Rule**: Each host descriptor the caller gives for standard input, output or error MUST become a server handle in the process parameters. A missing descriptor MUST leave that handle zero.
+**Verification**: Test
+
+### WINE-SYS-3 Section views
+
+**Rule**: A read-only or read-write view of a data section MUST share the file's pages with every other mapping, the server's included. A view MUST start at the requested offset, which MUST be a multiple of 64 KiB.
+**Verification**: Test
+
+### WINE-SYS-4 One process per machine
+
+**Rule**: `NtCreateUserProcess` MUST fail with `STATUS_NOT_SUPPORTED`. win32u then creates the process's own desktop window, as Wine does when explorer cannot start.
+**Verification**: Test
+
+## Unix libraries
+
+### WINE-UNIX-1 Guest ELF libraries
+
+**Rule**: A builtin module's Unix library MUST load as guest code when the module first asks for its function table. It MUST be relocated and initialized before the table is returned, and load at most once.
+**Verification**: Test
+
+### WINE-UNIX-2 Binding
+
+**Rule**: An undefined symbol MUST bind to another loaded library first, then to ntdll.dll's export of that name, then to a host function. Unix libraries call every function as cdecl, so a stdcall export MUST bind through a trampoline.
+**Verification**: Test
+
+An ntdll.dll export with no known convention stops the load. A weak symbol nothing provides binds to zero.
+
+### WINE-UNIX-3 win32k calls and callbacks
+
+**Rule**: System calls from 0x1000 MUST run the function win32u registered with its arguments. `KeUserModeCallback` MUST run `KiUserCallbackDispatcher` on the same stack, and `NtCallbackReturn` MUST end that call with its result.
 **Verification**: Test
 
 ## Threads

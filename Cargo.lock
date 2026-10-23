@@ -336,6 +336,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "adv-unix"
+version = "0.1.2"
+dependencies = [
+ "adv-cpu",
+ "adv-machine",
+ "adv-nt",
+ "adv-wineserver",
+ "libc",
+ "log",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "adv-win32"
 version = "0.1.2"
 dependencies = [

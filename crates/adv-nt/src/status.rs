@@ -5,6 +5,7 @@ pub type Status = u32;
 pub const SUCCESS: Status = 0;
 pub const OBJECT_NAME_EXISTS: Status = 0x4000_0000;
 pub const NOT_IMPLEMENTED: Status = 0xc000_0002;
+pub const NOT_SUPPORTED: Status = 0xc000_00bb;
 pub const INVALID_INFO_CLASS: Status = 0xc000_0003;
 pub const INFO_LENGTH_MISMATCH: Status = 0xc000_0004;
 pub const ACCESS_VIOLATION: Status = 0xc000_0005;
@@ -26,6 +27,7 @@ pub const OBJECT_NAME_NOT_FOUND: Status = 0xc000_0034;
 pub const OBJECT_PATH_NOT_FOUND: Status = 0xc000_003a;
 pub const INVALID_IMAGE_FORMAT: Status = 0xc000_007b;
 pub const BAD_DEVICE_TYPE: Status = 0xc000_00cb;
+pub const STACK_OVERFLOW: Status = 0xc000_00fd;
 
 /// Why a system call did not complete: a status for the guest, or a case
 /// the platform does not handle yet, which stops the machine.

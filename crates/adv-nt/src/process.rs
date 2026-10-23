@@ -21,7 +21,7 @@ use crate::params::{self, Startup};
 use crate::protocol::{InitProcessDoneRequest, TerminateProcessRequest};
 use crate::section::{self, View};
 use crate::server::{self, Connection, FirstThread, Link, Progress};
-use crate::{context, debug, dispatch, exception, image, kuser, nls, status, system};
+use crate::{context, debug, dispatch, exception, image, kuser, nls, status, system, win32k};
 
 /// TEB.WOW32Reserved: stubs that cannot reach the dispatcher pointer call
 /// through this field.
@@ -104,7 +104,9 @@ pub enum Error {
     Status(&'static str, u32),
 }
 
-/// The mapped ntdll.dll.
+/// The mapped ntdll.dll. The process keeps a copy, where the Unix side
+/// finds the exports it shares with ntdll.so.
+#[derive(Clone)]
 pub struct Ntdll {
     pub base: u32,
     exports: HashMap<String, u32>,
@@ -114,6 +116,11 @@ impl Ntdll {
     /// The address of a named export that is not forwarded.
     pub fn export(&self, name: &'static str) -> Result<u32, Error> {
         self.exports.get(name).copied().ok_or(Error::Export(name))
+    }
+
+    /// The address of the named export, if it is one and not forwarded.
+    pub fn get(&self, name: &str) -> Option<u32> {
+        self.exports.get(name).copied()
     }
 }
 
@@ -206,10 +213,11 @@ pub fn start<B: Backend>(
     machine
         .cpu
         .write_u32(ntdll.export(dispatch::UNIX_CALL)?, unix_call)?;
-    // Any nonzero handle: ntdll.dll only passes it back to the dispatcher.
-    machine
-        .cpu
-        .write(ntdll.export("__wine_unixlib_handle")?, &1u64.to_le_bytes())?;
+    // ntdll.dll only passes it back to the dispatcher.
+    machine.cpu.write(
+        ntdll.export("__wine_unixlib_handle")?,
+        &u64::from(dispatch::NTDLL_UNIXLIB).to_le_bytes(),
+    )?;
 
     let block = memory::allocate_committed(
         &mut machine.cpu,
@@ -279,6 +287,10 @@ pub fn start<B: Backend>(
         main,
         registered.tid,
         &mut machine.sys,
+    ));
+    machine.ext.insert(ntdll.clone());
+    machine.ext.insert(win32k::Dispatcher(
+        ntdll.export("KiUserCallbackDispatcher")?,
     ));
     machine.ext.insert(exception::Dispatchers {
         exception: ntdll.export("KiUserExceptionDispatcher")?,
@@ -504,6 +516,14 @@ fn init_teb(cpu: &mut dyn Guest, teb: u32, tid: u32, syscall: u32) -> Result<(),
         cpu.write_u32(teb + offset, value)?;
     }
     Ok(())
+}
+
+/// NtCreateUserProcess(*process, *thread, ...): a machine runs one process,
+/// so creating another fails as on a system that refuses it. win32u then
+/// gives the process a desktop window of its own instead of explorer's.
+pub fn create_user_process(_: &mut Env<'_>, _: &[u32]) -> adv_machine::Outcome {
+    log::warn!("NtCreateUserProcess: another process is not supported");
+    adv_machine::Outcome::Return(status::NOT_SUPPORTED)
 }
 
 /// NtTerminateProcess(process, exit_code): ntdll.dll first ends the other

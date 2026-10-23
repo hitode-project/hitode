@@ -12,6 +12,9 @@ use crate::timezone;
 const SYSTEM_BASIC_INFORMATION: u32 = 0;
 const SYSTEM_CURRENT_TIME_ZONE_INFORMATION: u32 = 44;
 const SYSTEM_DYNAMIC_TIME_ZONE_INFORMATION: u32 = 102;
+const SYSTEM_INTERRUPT_INFORMATION: u32 = 23;
+/// The size of SYSTEM_INTERRUPT_INFORMATION.
+const INTERRUPT_SIZE: usize = 24;
 const SYSTEM_WINE_VERSION_INFORMATION: u32 = 1000;
 /// The Wine release whose PE modules the platform serves.
 const WINE_VERSION: &str = "11.0";
@@ -33,6 +36,8 @@ pub fn query(env: &mut Env<'_>, args: &[u32]) -> Outcome {
             SYSTEM_DYNAMIC_TIME_ZONE_INFORMATION => {
                 (timezone::current(env)?.encode().to_vec(), false)
             }
+            // Wine fills it with random bytes, which RtlGenRandom uses.
+            SYSTEM_INTERRUPT_INFORMATION => (random(PROCESSORS as usize * INTERRUPT_SIZE)?, false),
             SYSTEM_WINE_VERSION_INFORMATION => (wine_version(), false),
             class => {
                 return Err(Error::Unsupported(format!(
@@ -50,6 +55,21 @@ pub fn query(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         write_bytes(env, info, &bytes)?;
         Ok(())
     })())
+}
+
+/// `length` bytes from the host's entropy source.
+fn random(length: usize) -> Result<Vec<u8>, Error> {
+    let mut bytes = vec![0u8; length];
+    for chunk in bytes.chunks_mut(256) {
+        // SAFETY: the chunk is writable and at most 256 bytes long.
+        if unsafe { libc::getentropy(chunk.as_mut_ptr().cast(), chunk.len()) } != 0 {
+            return Err(Error::Unsupported(format!(
+                "host entropy: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+    }
+    Ok(bytes)
 }
 
 /// SYSTEM_BASIC_INFORMATION, as Wine's `virtual_get_system_info`: the
@@ -127,6 +147,24 @@ fn host_system() -> (Vec<u8>, Vec<u8>) {
     };
     (text(&name.sysname), text(&name.release))
 }
+
+/// NtQueryPerformanceCounter(*counter, *frequency): 100 ns ticks of the
+/// monotonic clock, as the server's.
+pub fn query_performance_counter(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    let &[counter, frequency] = args else {
+        unreachable!()
+    };
+    let ticks = env.sys.clock.now_us() * 10;
+    status::finish((|| {
+        write_bytes(env, counter, &ticks.to_le_bytes())?;
+        if frequency != 0 {
+            write_bytes(env, frequency, &TICKS_PER_SECOND.to_le_bytes())?;
+        }
+        Ok::<_, Error>(())
+    })())
+}
+
+const TICKS_PER_SECOND: u64 = 10_000_000;
 
 /// NtQuerySystemTime(*time)
 pub fn query_time(env: &mut Env<'_>, args: &[u32]) -> Outcome {

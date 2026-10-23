@@ -12,28 +12,42 @@ use adv_machine::{Conv, Env, HostFn, Outcome, Resolver};
 
 use crate::syscalls::SYSCALLS;
 use crate::{
-    exception, file, information, kuser, memory, nls, object, process, registry, section, server,
-    sync, system, thread, token, unix,
+    atom, exception, file, information, kuser, memory, nls, object, process, registry, section,
+    server, sync, system, thread, token, unix, unixlib, win32k,
 };
 
 /// A system call, given its arguments.
 type Syscall = fn(&mut Env<'_>, &[u32]) -> Outcome;
 
 const IMPLEMENTED: &[(&str, Syscall)] = &[
+    ("NtAddAtom", atom::add),
+    (
+        "NtAllocateLocallyUniqueId",
+        token::allocate_locally_unique_id,
+    ),
     ("NtAllocateVirtualMemory", memory::allocate),
+    ("NtCallbackReturn", win32k::callback_return),
     ("NtClose", object::close),
     ("NtContinue", exception::resume),
     ("NtCreateEvent", sync::create_event),
     ("NtCreateFile", file::create),
     ("NtCreateKey", registry::create),
+    ("NtCreateMutant", sync::create_mutant),
     ("NtCreateSection", section::create),
     ("NtCreateThreadEx", thread::create),
+    ("NtCreateUserProcess", process::create_user_process),
     ("NtDelayExecution", sync::delay),
+    ("NtDeleteAtom", atom::delete),
+    ("NtDeleteKey", registry::delete),
+    ("NtDeleteValueKey", registry::delete_value),
+    ("NtEnumerateKey", registry::enumerate),
+    ("NtEnumerateValueKey", registry::enumerate_value),
     ("NtOpenDirectoryObject", object::open_directory),
     ("NtOpenFile", file::open),
     ("NtOpenKey", registry::open),
     ("NtOpenKeyEx", registry::open_ex),
     ("NtOpenSection", section::open),
+    ("NtFindAtom", atom::find),
     ("NtFreeVirtualMemory", memory::free),
     ("NtFsControlFile", file::control),
     ("NtGetNextThread", information::next_thread),
@@ -44,15 +58,22 @@ const IMPLEMENTED: &[(&str, Syscall)] = &[
     ("NtQueryAttributesFile", file::query_attributes),
     ("NtQueueApcThread", sync::queue_apc),
     ("NtQueryDefaultLocale", nls::default_locale),
+    ("NtQueryInformationAtom", atom::query),
     ("NtQueryInformationProcess", information::query_process),
     ("NtQueryInformationThread", information::query_thread),
     ("NtQueryInformationToken", token::query),
+    ("NtQueryKey", registry::query),
     ("NtQuerySection", section::query),
     ("NtQuerySystemInformation", system::query),
+    (
+        "NtQueryPerformanceCounter",
+        system::query_performance_counter,
+    ),
     ("NtQuerySystemTime", system::query_time),
     ("NtQueryValueKey", registry::query_value),
     ("NtQueryVirtualMemory", memory::query),
     ("NtRaiseException", exception::raise),
+    ("NtReleaseMutant", sync::release_mutant),
     ("NtResetEvent", sync::reset_event),
     ("NtResumeThread", thread::resume),
     ("NtSetEvent", sync::set_event),
@@ -64,6 +85,7 @@ const IMPLEMENTED: &[(&str, Syscall)] = &[
     ("NtWaitForMultipleObjects", sync::wait_multiple),
     ("NtWaitForSingleObject", sync::wait_single),
     ("NtWriteFile", file::write),
+    ("NtYieldExecution", sync::yield_execution),
     (
         "NtWow64IsProcessorFeaturePresent",
         kuser::is_processor_feature_present,
@@ -84,6 +106,9 @@ static TABLE: LazyLock<[Option<Syscall>; SYSCALLS.len()]> = LazyLock::new(|| {
     table
 });
 
+/// The first number of the win32k table, which `win32u.so` registers.
+const WIN32K_FIRST: usize = 0x1000;
+
 /// No system call takes more arguments.
 const MAX_ARGUMENTS: usize = 16;
 
@@ -92,6 +117,9 @@ const MAX_ARGUMENTS: usize = 16;
 pub const MODULE: &str = "ntdll.so";
 pub const SYSCALL: &str = "__wine_syscall_dispatcher";
 pub const UNIX_CALL: &str = "__wine_unix_call_dispatcher";
+/// ntdll.dll's own `__wine_unixlib_handle`, which serves its calls into
+/// ntdll.so; no Unix library's table sits at this address.
+pub const NTDLL_UNIXLIB: u32 = 1;
 
 /// The host functions of the NT platform.
 pub struct Platform;
@@ -129,6 +157,11 @@ impl Resolver for Platform {
 /// argument `i` is `env.arg(i + 1)`.
 fn syscall(env: &mut Env<'_>) -> Outcome {
     let number = env.cpu.reg(Reg::Eax) as usize;
+    if number >= WIN32K_FIRST {
+        kuser::refresh(env);
+        server::set_time(env);
+        return win32k::call(env, number as u32);
+    }
     let Some(&(name, bytes)) = SYSCALLS.get(number) else {
         return Outcome::Fail(format!("unknown system call {number:#x}"));
     };
@@ -146,6 +179,12 @@ fn syscall(env: &mut Env<'_>) -> Outcome {
 }
 
 fn unix_call(env: &mut Env<'_>) -> Outcome {
-    let (code, args) = (env.arg(2), env.arg(3));
-    unix::call(env, code, args)
+    let (handle, high, code, args) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3));
+    match (handle, high) {
+        (NTDLL_UNIXLIB, 0) => unix::call(env, code, args),
+        // Any other handle is a Unix library's table, which only i386
+        // addresses fill.
+        (funcs, 0) => unixlib::call(env, funcs, code, args),
+        _ => Outcome::Return(crate::status::INVALID_HANDLE),
+    }
 }

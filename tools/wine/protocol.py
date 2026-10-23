@@ -57,6 +57,20 @@ REQUESTS = [
     "resume_thread",
     "terminate_thread",
     "queue_apc",
+    "delete_key",
+    "delete_key_value",
+    "enum_key_value",
+    "create_mutex",
+    "release_mutex",
+    "add_atom",
+    "delete_atom",
+    "find_atom",
+    "get_atom_information",
+    "allocate_locally_unique_id",
+    "dup_handle",
+    "get_object_info",
+    "get_object_name",
+    "get_object_type",
 ]
 
 INTEGERS = {

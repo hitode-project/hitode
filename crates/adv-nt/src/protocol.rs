@@ -1090,3 +1090,395 @@ impl Request for QueueApcRequest {
         &mut self.header
     }
 }
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DeleteKeyRequest {
+    pub header: RequestHeader,
+    pub hkey: u32,
+}
+const _: () = assert!(size_of::<DeleteKeyRequest>() == 16);
+const _: () = assert!(std::mem::offset_of!(DeleteKeyRequest, hkey) == 12);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DeleteKeyReply {
+    pub header: ReplyHeader,
+}
+const _: () = assert!(size_of::<DeleteKeyReply>() == 8);
+
+impl Request for DeleteKeyRequest {
+    const NUMBER: i32 = 88;
+    type Reply = DeleteKeyReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DeleteKeyValueRequest {
+    pub header: RequestHeader,
+    pub hkey: u32,
+}
+const _: () = assert!(size_of::<DeleteKeyValueRequest>() == 16);
+const _: () = assert!(std::mem::offset_of!(DeleteKeyValueRequest, hkey) == 12);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DeleteKeyValueReply {
+    pub header: ReplyHeader,
+}
+const _: () = assert!(size_of::<DeleteKeyValueReply>() == 8);
+
+impl Request for DeleteKeyValueRequest {
+    const NUMBER: i32 = 94;
+    type Reply = DeleteKeyValueReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EnumKeyValueRequest {
+    pub header: RequestHeader,
+    pub hkey: u32,
+    pub index: i32,
+    pub info_class: i32,
+}
+const _: () = assert!(size_of::<EnumKeyValueRequest>() == 24);
+const _: () = assert!(std::mem::offset_of!(EnumKeyValueRequest, hkey) == 12);
+const _: () = assert!(std::mem::offset_of!(EnumKeyValueRequest, index) == 16);
+const _: () = assert!(std::mem::offset_of!(EnumKeyValueRequest, info_class) == 20);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EnumKeyValueReply {
+    pub header: ReplyHeader,
+    pub r#type: i32,
+    pub total: u32,
+    pub namelen: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<EnumKeyValueReply>() == 24);
+const _: () = assert!(std::mem::offset_of!(EnumKeyValueReply, r#type) == 8);
+const _: () = assert!(std::mem::offset_of!(EnumKeyValueReply, total) == 12);
+const _: () = assert!(std::mem::offset_of!(EnumKeyValueReply, namelen) == 16);
+
+impl Request for EnumKeyValueRequest {
+    const NUMBER: i32 = 93;
+    type Reply = EnumKeyValueReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CreateMutexRequest {
+    pub header: RequestHeader,
+    pub access: u32,
+    pub owned: i32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<CreateMutexRequest>() == 24);
+const _: () = assert!(std::mem::offset_of!(CreateMutexRequest, access) == 12);
+const _: () = assert!(std::mem::offset_of!(CreateMutexRequest, owned) == 16);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CreateMutexReply {
+    pub header: ReplyHeader,
+    pub handle: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<CreateMutexReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(CreateMutexReply, handle) == 8);
+
+impl Request for CreateMutexRequest {
+    const NUMBER: i32 = 36;
+    type Reply = CreateMutexReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ReleaseMutexRequest {
+    pub header: RequestHeader,
+    pub handle: u32,
+}
+const _: () = assert!(size_of::<ReleaseMutexRequest>() == 16);
+const _: () = assert!(std::mem::offset_of!(ReleaseMutexRequest, handle) == 12);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ReleaseMutexReply {
+    pub header: ReplyHeader,
+    pub prev_count: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<ReleaseMutexReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(ReleaseMutexReply, prev_count) == 8);
+
+impl Request for ReleaseMutexRequest {
+    const NUMBER: i32 = 37;
+    type Reply = ReleaseMutexReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AddAtomRequest {
+    pub header: RequestHeader,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<AddAtomRequest>() == 16);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AddAtomReply {
+    pub header: ReplyHeader,
+    pub atom: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<AddAtomReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(AddAtomReply, atom) == 8);
+
+impl Request for AddAtomRequest {
+    const NUMBER: i32 = 107;
+    type Reply = AddAtomReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DeleteAtomRequest {
+    pub header: RequestHeader,
+    pub atom: u32,
+}
+const _: () = assert!(size_of::<DeleteAtomRequest>() == 16);
+const _: () = assert!(std::mem::offset_of!(DeleteAtomRequest, atom) == 12);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DeleteAtomReply {
+    pub header: ReplyHeader,
+}
+const _: () = assert!(size_of::<DeleteAtomReply>() == 8);
+
+impl Request for DeleteAtomRequest {
+    const NUMBER: i32 = 108;
+    type Reply = DeleteAtomReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FindAtomRequest {
+    pub header: RequestHeader,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<FindAtomRequest>() == 16);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FindAtomReply {
+    pub header: ReplyHeader,
+    pub atom: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<FindAtomReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(FindAtomReply, atom) == 8);
+
+impl Request for FindAtomRequest {
+    const NUMBER: i32 = 109;
+    type Reply = FindAtomReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GetAtomInformationRequest {
+    pub header: RequestHeader,
+    pub atom: u32,
+}
+const _: () = assert!(size_of::<GetAtomInformationRequest>() == 16);
+const _: () = assert!(std::mem::offset_of!(GetAtomInformationRequest, atom) == 12);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GetAtomInformationReply {
+    pub header: ReplyHeader,
+    pub count: i32,
+    pub pinned: i32,
+    pub total: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<GetAtomInformationReply>() == 24);
+const _: () = assert!(std::mem::offset_of!(GetAtomInformationReply, count) == 8);
+const _: () = assert!(std::mem::offset_of!(GetAtomInformationReply, pinned) == 12);
+const _: () = assert!(std::mem::offset_of!(GetAtomInformationReply, total) == 16);
+
+impl Request for GetAtomInformationRequest {
+    const NUMBER: i32 = 110;
+    type Reply = GetAtomInformationReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AllocateLocallyUniqueIdRequest {
+    pub header: RequestHeader,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<AllocateLocallyUniqueIdRequest>() == 16);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AllocateLocallyUniqueIdReply {
+    pub header: ReplyHeader,
+    pub luid: [u8; 8],
+}
+const _: () = assert!(size_of::<AllocateLocallyUniqueIdReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(AllocateLocallyUniqueIdReply, luid) == 8);
+
+impl Request for AllocateLocallyUniqueIdRequest {
+    const NUMBER: i32 = 249;
+    type Reply = AllocateLocallyUniqueIdReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DupHandleRequest {
+    pub header: RequestHeader,
+    pub src_process: u32,
+    pub src_handle: u32,
+    pub dst_process: u32,
+    pub access: u32,
+    pub attributes: u32,
+    pub options: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<DupHandleRequest>() == 40);
+const _: () = assert!(std::mem::offset_of!(DupHandleRequest, src_process) == 12);
+const _: () = assert!(std::mem::offset_of!(DupHandleRequest, src_handle) == 16);
+const _: () = assert!(std::mem::offset_of!(DupHandleRequest, dst_process) == 20);
+const _: () = assert!(std::mem::offset_of!(DupHandleRequest, access) == 24);
+const _: () = assert!(std::mem::offset_of!(DupHandleRequest, attributes) == 28);
+const _: () = assert!(std::mem::offset_of!(DupHandleRequest, options) == 32);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DupHandleReply {
+    pub header: ReplyHeader,
+    pub handle: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<DupHandleReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(DupHandleReply, handle) == 8);
+
+impl Request for DupHandleRequest {
+    const NUMBER: i32 = 23;
+    type Reply = DupHandleReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GetObjectInfoRequest {
+    pub header: RequestHeader,
+    pub handle: u32,
+}
+const _: () = assert!(size_of::<GetObjectInfoRequest>() == 16);
+const _: () = assert!(std::mem::offset_of!(GetObjectInfoRequest, handle) == 12);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GetObjectInfoReply {
+    pub header: ReplyHeader,
+    pub access: u32,
+    pub ref_count: u32,
+    pub handle_count: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<GetObjectInfoReply>() == 24);
+const _: () = assert!(std::mem::offset_of!(GetObjectInfoReply, access) == 8);
+const _: () = assert!(std::mem::offset_of!(GetObjectInfoReply, ref_count) == 12);
+const _: () = assert!(std::mem::offset_of!(GetObjectInfoReply, handle_count) == 16);
+
+impl Request for GetObjectInfoRequest {
+    const NUMBER: i32 = 245;
+    type Reply = GetObjectInfoReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GetObjectNameRequest {
+    pub header: RequestHeader,
+    pub handle: u32,
+}
+const _: () = assert!(size_of::<GetObjectNameRequest>() == 16);
+const _: () = assert!(std::mem::offset_of!(GetObjectNameRequest, handle) == 12);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GetObjectNameReply {
+    pub header: ReplyHeader,
+    pub total: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<GetObjectNameReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(GetObjectNameReply, total) == 8);
+
+impl Request for GetObjectNameRequest {
+    const NUMBER: i32 = 246;
+    type Reply = GetObjectNameReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GetObjectTypeRequest {
+    pub header: RequestHeader,
+    pub handle: u32,
+}
+const _: () = assert!(size_of::<GetObjectTypeRequest>() == 16);
+const _: () = assert!(std::mem::offset_of!(GetObjectTypeRequest, handle) == 12);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GetObjectTypeReply {
+    pub header: ReplyHeader,
+}
+const _: () = assert!(size_of::<GetObjectTypeReply>() == 8);
+
+impl Request for GetObjectTypeRequest {
+    const NUMBER: i32 = 247;
+    type Reply = GetObjectTypeReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}

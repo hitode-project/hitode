@@ -16,6 +16,7 @@ use crate::protocol::{
 };
 use crate::server;
 use crate::status::{self, Error, Status};
+use crate::unixlib;
 
 const SEC_IMAGE: u32 = 0x100_0000;
 const SECTION_QUERY: u32 = 0x0001;
@@ -27,6 +28,9 @@ const FILE_WRITE_DATA: u32 = 0x0002;
 const IMAGE_NOT_AT_BASE: Status = 0x4000_0003;
 const IMAGE_MACHINE_TYPE_MISMATCH: Status = 0x4000_002e;
 const SECTION_NOT_IMAGE: Status = 0xc000_0049;
+const MAPPED_ALIGNMENT: Status = 0xc000_0220;
+/// Views of data sections start at multiples of this.
+const ALLOCATION_GRANULARITY: u32 = 0x1_0000;
 const MACHINE_I386: u16 = 0x014c;
 const MACHINE_AMD64: u16 = 0x8664;
 const MACHINE_ARM64: u16 = 0xaa64;
@@ -180,7 +184,7 @@ pub fn map_read_only(env: &mut Env<'_>, mapping: u32) -> Result<(u32, u32), Erro
     };
     let (reply, _) = server::request(env, &mut request, &[], &mut [])?;
     status::check(reply.header.error)?;
-    map_data(env, mapping, reply.size, 0, crate::memory::PAGE_READONLY)
+    map_data(env, mapping, reply.size, 0, 0, crate::memory::PAGE_READONLY)
 }
 
 const SECTION_BASIC_INFORMATION: u32 = 0;
@@ -296,9 +300,12 @@ pub fn map_view(env: &mut Env<'_>, args: &[u32]) -> Outcome {
                 "mapping a view at a given address".into(),
             ));
         }
-        if offset != 0 && (read_u32(env, offset)? != 0 || read_u32(env, offset + 4)? != 0) {
-            return Err(Error::Unsupported("mapping a view at an offset".into()));
-        }
+        let offset = match offset {
+            0 => 0,
+            offset => {
+                u64::from(read_u32(env, offset)?) | u64::from(read_u32(env, offset + 4)?) << 32
+            }
+        };
         let mut request = GetMappingInfoRequest {
             handle,
             access: view_access(protection)?,
@@ -308,10 +315,15 @@ pub fn map_view(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         status::check(reply.header.error)?;
         if reply.flags & SEC_IMAGE == 0 {
             let requested = read_u32(env, size_out)?;
-            let (base, size) = map_data(env, handle, reply.size, requested, protection)?;
+            let (base, size) = map_data(env, handle, reply.size, offset, requested, protection)?;
             write_u32(env, base_out, base)?;
             write_u32(env, size_out, size)?;
             return Ok(());
+        }
+        if offset != 0 {
+            return Err(Error::Unsupported(
+                "mapping an image view at an offset".into(),
+            ));
         }
         let view = map_image(env, handle)?;
         write_u32(env, base_out, view.base)?;
@@ -341,42 +353,77 @@ fn view_access(protection: u32) -> Result<u32, Error> {
     })
 }
 
-/// Maps a view of a data section with its file's contents. The view is a
-/// copy, so a writable view, whose writes other views and the file would
-/// see, is not supported.
+/// Maps a view of `requested` bytes, or the rest of the section, from
+/// `offset` in data section `mapping`. A read-only or read-write view
+/// shares the file's pages; a copy-on-write or executable view is a copy
+/// of the file's contents.
 fn map_data(
     env: &mut Env<'_>,
     mapping: u32,
     section_size: u64,
+    offset: u64,
     requested: u32,
     protection: u32,
 ) -> Result<(u32, u32), Error> {
     use crate::memory::*;
-    if matches!(protection & 0xff, PAGE_READWRITE | PAGE_EXECUTE_READWRITE) {
-        return Err(Error::Unsupported(
-            "mapping a writable view of a data section".into(),
-        ));
+    if !offset.is_multiple_of(u64::from(ALLOCATION_GRANULARITY)) {
+        return Err(MAPPED_ALIGNMENT.into());
     }
+    let available = section_size
+        .checked_sub(offset)
+        .filter(|&available| available > 0)
+        .ok_or(status::INVALID_VIEW_SIZE)?;
     let size = match requested {
-        0 => u32::try_from(section_size).map_err(|_| status::NO_MEMORY)?,
-        requested if u64::from(requested) > section_size => {
+        0 => u32::try_from(available).map_err(|_| status::NO_MEMORY)?,
+        requested if u64::from(requested) > available => {
             return Err(status::INVALID_VIEW_SIZE.into());
         }
         requested => requested,
     };
     let fd = server::handle_fd(env, mapping)?;
-    let mut bytes =
-        read_file(fd.fd).map_err(|error| Error::Unsupported(format!("section file: {error}")))?;
+    let base = match protection & 0xff {
+        PAGE_READONLY | PAGE_READWRITE => {
+            // SAFETY: the server's descriptor stays open while fd lives.
+            let file = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd.fd) };
+            let memory = env.ext.get_or_default::<Memory>();
+            memory::map_shared_view(
+                env.cpu,
+                &mut env.sys.vm,
+                memory,
+                file,
+                offset,
+                size,
+                protection,
+            )?
+        }
+        PAGE_EXECUTE_READWRITE => {
+            return Err(Error::Unsupported(
+                "mapping a writable executable view of a data section".into(),
+            ));
+        }
+        _ => {
+            let bytes = read_file(fd.fd)
+                .map_err(|error| Error::Unsupported(format!("section file: {error}")))?;
+            let start = (offset as usize).min(bytes.len());
+            let end = (start + size as usize).min(bytes.len());
+            let memory = env.ext.get_or_default::<Memory>();
+            memory::map_view(
+                env.cpu,
+                &mut env.sys.vm,
+                memory,
+                &bytes[start..end],
+                size,
+                protection,
+            )?
+        }
+    };
     drop(fd);
-    bytes.truncate(size as usize);
-    let memory = env.ext.get_or_default::<Memory>();
-    let base = memory::map_view(env.cpu, &mut env.sys.vm, memory, &bytes, size, protection)?;
     let mut request = MapViewRequest {
         mapping,
         access: view_access(protection)?,
         base: u64::from(base),
         size: u64::from(align_up(size, PAGE)),
-        start: 0,
+        start: offset,
         ..Default::default()
     };
     let (reply, _) = server::request(env, &mut request, &[], &mut [])?;
@@ -409,6 +456,7 @@ pub fn unmap_view(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         status::check(reply.header.error)?;
         let memory = env.ext.get_or_default::<Memory>();
         memory::remove_view(env.cpu, &mut env.sys.vm, memory, base);
+        unixlib::forget_image(env, base);
         Ok(())
     })())
 }
@@ -436,6 +484,7 @@ pub fn map_image(env: &mut Env<'_>, mapping: u32) -> Result<View, Error> {
     let fd = server::handle_fd(env, mapping)?;
     let file =
         read_file(fd.fd).map_err(|error| Error::Unsupported(format!("image file: {error}")))?;
+    let path = file_path(fd.fd);
     drop(fd);
     let mut pe = Pe::parse(&file).map_err(|_| status::INVALID_IMAGE_FORMAT)?;
     let preferred = if info.map_addr != 0 {
@@ -474,12 +523,33 @@ pub fn map_image(env: &mut Env<'_>, mapping: u32) -> Result<View, Error> {
     if reply.header.error != 0 && reply.header.error != IMAGE_NOT_AT_BASE {
         return Err(reply.header.error.into());
     }
+    unixlib::note_image(env, base, path);
     Ok(View {
         base,
         size: align_up(info.map_size, PAGE),
         relocated: base != preferred,
         info,
     })
+}
+
+/// The host path of an open file, for finding a builtin image's Unix
+/// library next to it.
+fn file_path(fd: std::os::fd::RawFd) -> Option<std::path::PathBuf> {
+    #[cfg(target_vendor = "apple")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let mut path = [0u8; libc::PATH_MAX as usize];
+        // SAFETY: F_GETPATH fills at most PATH_MAX bytes of the buffer.
+        if unsafe { libc::fcntl(fd, libc::F_GETPATH, path.as_mut_ptr()) } == -1 {
+            return None;
+        }
+        let length = path.iter().position(|&byte| byte == 0)?;
+        Some(std::ffi::OsStr::from_bytes(&path[..length]).into())
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        std::fs::read_link(format!("/proc/self/fd/{fd}")).ok()
+    }
 }
 
 fn read_file(fd: std::os::fd::RawFd) -> std::io::Result<Vec<u8>> {
