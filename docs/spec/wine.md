@@ -185,3 +185,8 @@ FreeType is such a library: win32u opens it by name and draws TrueType text thro
 
 **Rule**: When win32u starts explorer for its desktop, the process MUST NOT start. The calling thread MUST instead create the desktop and message windows as explorer does. It MUST then show the desktop over the virtual screen.
 **Verification**: Test
+
+### WINE-GFX-6 Direct3D 9 on Wine
+
+**Rule**: Our Direct3D 9 MUST load as a PE image in place of Wine's. Its surface DCs MUST be memory DCs that call GDI through its own IAT. A presented back buffer MUST reach the presenter.
+**Verification**: Test

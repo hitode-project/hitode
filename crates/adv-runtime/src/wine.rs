@@ -1,10 +1,10 @@
 //! Assembly of the graphics fronts on the Wine userland (issue #58): our
-//! DirectDraw as a PE image that Wine's loader maps, over the process surface
-//! store, with memory DCs that Wine's GDI draws into.
+//! DirectDraw and Direct3D 9 as PE images that Wine's loader maps, over the
+//! process surface store, with memory DCs that Wine's GDI draws into.
 //!
-//! A DirectDraw surface's DC comes from `D3DKMTCreateDCFromMemory` over the
-//! surface's own pixels, called through the image's IAT so that a guest hook
-//! sees it. Window geometry comes from the user driver in [`driver`].
+//! A surface's DC comes from `D3DKMTCreateDCFromMemory` over the surface's
+//! own pixels, called through the IAT of the front's image so that a guest
+//! hook sees it. Window geometry comes from the user driver in [`driver`].
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -25,14 +25,20 @@ mod surface;
 /// The display driver to name in the process's startup parameters.
 pub const GRAPHICS_DRIVER: &str = driver::MODULE;
 
-const DDRAW: &str = "ddraw.dll";
+/// The fronts' images, by the index their memory DCs are bound to.
+const IMAGES: [&str; 2] = ["ddraw.dll", "d3d9.dll"];
+const DDRAW: usize = 0;
+#[cfg(feature = "gpu")]
+const D3D9: usize = 1;
 const GDI32: &str = "gdi32.dll";
-const EXPORTS: [&str; 4] = [
+const DDRAW_EXPORTS: [&str; 4] = [
     "DirectDrawCreate",
     "DirectDrawCreateEx",
     "DirectDrawEnumerateA",
     "DirectDrawEnumerateW",
 ];
+#[cfg(feature = "gpu")]
+const D3D9_EXPORTS: [&str; 1] = ["Direct3DCreate9"];
 const GDI_IMPORTS: [&str; 4] = [
     "CreateCompatibleDC",
     "D3DKMTCreateDCFromMemory",
@@ -49,13 +55,15 @@ const SLOT: u32 = 64;
 
 pub fn register(registry: &mut Registry) {
     adv_dx::ddraw::register(registry);
+    #[cfg(feature = "gpu")]
+    adv_dx::d3d9::register(registry);
     driver::register(registry);
     surface::register(registry);
 }
 
-/// Install the surface store, DirectDraw and the user driver, and put their
-/// images in `prefix`, DirectDraw's in place of Wine's. Call before the
-/// process starts with [`GRAPHICS_DRIVER`].
+/// Install the surface store, the graphics fronts and the user driver, and
+/// put their images in `prefix`, in place of Wine's. Call before the process
+/// starts with [`GRAPHICS_DRIVER`].
 pub fn install<B: Backend>(
     machine: &mut Machine<B>,
     prefix: &Path,
@@ -69,16 +77,40 @@ pub fn install<B: Backend>(
     adv_dx::ddraw::install(
         machine,
         adv_dx::ddraw::Provider {
-            dc: memory_dc(),
+            dc: memory_dc::<DDRAW>(),
             memory: guest_memory,
             window: driver::geometry,
             completed: frame_completed,
         },
     )?;
-    let exports: Vec<_> = EXPORTS
-        .into_iter()
+    install_image(machine, prefix, DDRAW, &DDRAW_EXPORTS)?;
+    #[cfg(feature = "gpu")]
+    {
+        let heap = machine
+            .ext
+            .get_or_default::<adv_os::Heaps>()
+            .create(&mut machine.cpu, &mut machine.sys.vm)
+            .map_err(|e| e.to_string())?;
+        machine.ext.insert(Heap(heap));
+        adv_dx::d3d9::install(machine, d3d9_provider())?;
+        install_image(machine, prefix, D3D9, &D3D9_EXPORTS)?;
+    }
+    let driver = driver::image(machine)?;
+    adv_unix::builtin::install(prefix, &driver).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Build the image of front `image`, which imports GDI for its memory DCs.
+fn install_image<B: Backend>(
+    machine: &mut Machine<B>,
+    prefix: &Path,
+    image: usize,
+    names: &[&str],
+) -> Result<(), String> {
+    let exports: Vec<_> = names
+        .iter()
         .zip(1..)
-        .map(|(name, ordinal)| Export { name, ordinal })
+        .map(|(&name, ordinal)| Export { name, ordinal })
         .collect();
     let imports = [ImportModule {
         dll: GDI32.into(),
@@ -93,18 +125,55 @@ pub fn install<B: Backend>(
             })
             .collect(),
     }];
-    let image = ModuleImage::build(machine, DDRAW, &exports, &imports)?;
-    adv_unix::builtin::install(prefix, &image).map_err(|e| e.to_string())?;
-    let driver = driver::image(machine)?;
-    adv_unix::builtin::install(prefix, &driver).map_err(|e| e.to_string())?;
+    let built = ModuleImage::build(machine, IMAGES[image], &exports, &imports)?;
+    adv_unix::builtin::install(prefix, &built).map_err(|e| e.to_string())?;
     Ok(())
 }
 
-/// Memory DCs lent to DirectDraw surfaces.
+/// The heap of guest storage that Direct3D 9 allocates.
+#[cfg(feature = "gpu")]
+struct Heap(u32);
+
+/// The old stack's Direct3D 9 assembly, with what it takes from USER and the
+/// Win32 heap answered on the Wine userland.
+#[cfg(feature = "gpu")]
+fn d3d9_provider() -> adv_dx::d3d9::SurfaceProvider {
+    adv_dx::d3d9::SurfaceProvider {
+        allocator: adv_dx::interop::GuestAllocator {
+            allocate: |env, length| {
+                let heap = env.ext.get::<Heap>().0;
+                let heaps = env.ext.get_mut::<adv_os::Heaps>();
+                heaps.alloc(env.cpu, &mut env.sys.vm, heap, length, true)
+            },
+            free: |env, pointer| {
+                let heap = env.ext.get::<Heap>().0;
+                let heaps = env.ext.get_mut::<adv_os::Heaps>();
+                heaps.free(env.cpu, &mut env.sys.vm, heap, pointer);
+            },
+        },
+        dc: memory_dc::<D3D9>(),
+        // Windowed devices only; full-screen modes come with display modes.
+        mode_changed: |_, _, _| Outcome::Return(0),
+        device_released: |_, _| {},
+        display: |ext| {
+            let store = ext.get::<adv_device::surface::SurfaceStore>();
+            (store.width, store.height, 60)
+        },
+        window: |ext, objects, hwnd| {
+            driver::geometry(ext, objects, hwnd).map(|window| (window.width, window.height))
+        },
+        visible: |ext, _, hwnd| driver::visible(ext, hwnd),
+        fast_forward: |_| false,
+        unpaced: |_| {},
+        ..crate::graphics::d3d9_provider()
+    }
+}
+
+/// Memory DCs lent to the fronts' surfaces.
 #[derive(Default)]
 struct Dcs {
-    /// Where the loader mapped our DirectDraw image.
-    image: Option<u32>,
+    /// Where the loader mapped each front's image.
+    images: [Option<u32>; IMAGES.len()],
     /// The DC that memory DCs are made compatible with.
     device: u32,
     /// The bitmap of each lent DC.
@@ -113,18 +182,19 @@ struct Dcs {
     slots: Vec<u32>,
 }
 
-fn import(env: &mut Env<'_>, name: &str) -> Result<Import, String> {
-    let base = match env.ext.get_or_default::<Dcs>().image {
+fn import<const IMAGE: usize>(env: &mut Env<'_>, name: &str) -> Result<Import, String> {
+    let image = IMAGES[IMAGE];
+    let base = match env.ext.get_or_default::<Dcs>().images[IMAGE] {
         Some(base) => base,
         None => {
-            let base = adv_nt::process::module_base(env.cpu, env.sys.peb, DDRAW)
-                .ok_or("DirectDraw is not loaded")?;
-            env.ext.get_mut::<Dcs>().image = Some(base);
+            let base = adv_nt::process::module_base(env.cpu, env.sys.peb, image)
+                .ok_or_else(|| format!("{image} is not loaded"))?;
+            env.ext.get_mut::<Dcs>().images[IMAGE] = Some(base);
             base
         }
     };
-    Import::bind_in(env, DDRAW, base, GDI32, name)
-        .ok_or_else(|| format!("{DDRAW} does not import {name}"))
+    Import::bind_in(env, image, base, GDI32, name)
+        .ok_or_else(|| format!("{image} does not import {name}"))
 }
 
 /// A 64-byte block of guest memory for a call's in and out parameters.
@@ -152,14 +222,15 @@ pub(super) fn write_words(env: &mut Env<'_>, at: u32, words: &[u32]) -> Result<(
     env.cpu.write(at, &bytes).map_err(|e| e.to_string())
 }
 
-fn memory_dc() -> MemoryDc {
+/// Memory DCs whose GDI calls go through front `IMAGE`'s IAT.
+fn memory_dc<const IMAGE: usize>() -> MemoryDc {
     MemoryDc {
-        create,
-        flush: |env, _, _, then| match import(env, "GdiFlush") {
+        create: create::<IMAGE>,
+        flush: |env, _, _, then| match import::<IMAGE>(env, "GdiFlush") {
             Ok(flush) => flush.call(env, [], |env, _| then(env, Ok(()))),
             Err(error) => then(env, Err(error)),
         },
-        release,
+        release: release::<IMAGE>,
         // Without guest code the GDI objects stay until the process ends.
         discard: |env, dc| {
             env.ext.get_or_default::<Dcs>().bitmaps.remove(&dc);
@@ -167,7 +238,7 @@ fn memory_dc() -> MemoryDc {
     }
 }
 
-fn create(env: &mut Env<'_>, surface: DcSurface, then: DcCreated) -> Outcome {
+fn create<const IMAGE: usize>(env: &mut Env<'_>, surface: DcSurface, then: DcCreated) -> Outcome {
     // D3DDDIFORMAT values for the store's direct-color formats.
     let format = match surface.format {
         PixelFormat::Bgra32 => 22,
@@ -178,9 +249,9 @@ fn create(env: &mut Env<'_>, surface: DcSurface, then: DcCreated) -> Outcome {
     };
     let device = env.ext.get_or_default::<Dcs>().device;
     if device != 0 {
-        return create_from_memory(env, device, format, surface, then);
+        return create_from_memory::<IMAGE>(env, device, format, surface, then);
     }
-    let compatible = match import(env, "CreateCompatibleDC") {
+    let compatible = match import::<IMAGE>(env, "CreateCompatibleDC") {
         Ok(compatible) => compatible,
         Err(error) => return then(env, Err(error)),
     };
@@ -190,11 +261,11 @@ fn create(env: &mut Env<'_>, surface: DcSurface, then: DcCreated) -> Outcome {
             return then(env, Err("CreateCompatibleDC failed".into()));
         }
         env.ext.get_mut::<Dcs>().device = device;
-        create_from_memory(env, device, format, surface, then)
+        create_from_memory::<IMAGE>(env, device, format, surface, then)
     })
 }
 
-fn create_from_memory(
+fn create_from_memory<const IMAGE: usize>(
     env: &mut Env<'_>,
     device: u32,
     format: u32,
@@ -218,7 +289,8 @@ fn create_from_memory(
             0,
         ];
         debug_assert_eq!(words.len() as u32 * 4, CREATE_DESC);
-        write_words(env, desc, &words).and_then(|()| import(env, "D3DKMTCreateDCFromMemory"))
+        write_words(env, desc, &words)
+            .and_then(|()| import::<IMAGE>(env, "D3DKMTCreateDCFromMemory"))
     };
     let create = match prepared {
         Ok(create) => create,
@@ -247,7 +319,7 @@ fn create_from_memory(
     })
 }
 
-fn release(env: &mut Env<'_>, dc: u32, then: DcFinished) -> Outcome {
+fn release<const IMAGE: usize>(env: &mut Env<'_>, dc: u32, then: DcFinished) -> Outcome {
     let Some(bitmap) = env.ext.get_or_default::<Dcs>().bitmaps.remove(&dc) else {
         return then(env, Err(format!("{dc:#x} is not a lent memory DC")));
     };
@@ -256,7 +328,7 @@ fn release(env: &mut Env<'_>, dc: u32, then: DcFinished) -> Outcome {
         Err(error) => return then(env, Err(error)),
     };
     let destroy = match write_words(env, desc, &[dc, bitmap])
-        .and_then(|()| import(env, "D3DKMTDestroyDCFromMemory"))
+        .and_then(|()| import::<IMAGE>(env, "D3DKMTDestroyDCFromMemory"))
     {
         Ok(destroy) => destroy,
         Err(error) => {

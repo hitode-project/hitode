@@ -282,3 +282,9 @@ pub(super) fn geometry(
         origin: (left, top),
     })
 }
+
+/// Whether win32u last reported `hwnd` shown.
+#[cfg(feature = "gpu")]
+pub(super) fn visible(ext: &adv_machine::Ext, hwnd: u32) -> Option<bool> {
+    Some(ext.try_get::<Windows>()?.0.get(&hwnd)?.visible)
+}

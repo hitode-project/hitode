@@ -103,6 +103,10 @@ pub fn run_probe_with_prefix(
     run_probe_inspect(name, real_time, "null", resolver, prepare, |_| {})
 }
 
+/// The host services a run loop serves when every context waits, as the
+/// runtime's step does; true when guest work may continue.
+pub struct HostServices(pub fn(&mut Machine<Cpu>) -> bool);
+
 /// [`run_probe_with_prefix`] with Wine's display driver `graphics_driver`,
 /// and `inspect` looking at the machine after the process ends.
 pub fn run_probe_inspect(
@@ -227,6 +231,13 @@ pub fn run_probe_inspect(
             RunResult::Idle {
                 next_deadline: Some(deadline),
             } => machine.sys.clock.advance_to(deadline),
+            RunResult::Idle {
+                next_deadline: None,
+            } if machine
+                .ext
+                .try_get::<HostServices>()
+                .map(|services| services.0)
+                .is_some_and(|serve| serve(&mut machine)) => {}
             other => break other,
         }
     };
