@@ -24,6 +24,8 @@ fn window_procedures_nest_and_return() {
     // The numbers Wine prints for the probe on its null driver.
     assert_eq!(
         output.lines().collect::<Vec<_>>(),
-        ["created=1 sent=47 nested=7 deepest=2 drawn=1 waited=258 posted=21 quit=5 destroyed=1"]
+        [
+            "created=1 sent=47 nested=7 deepest=2 drawn=1 waited=258 posted=21 quit=5 destroyed=1 frames=1"
+        ]
     );
 }

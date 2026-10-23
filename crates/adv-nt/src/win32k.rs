@@ -16,6 +16,7 @@
 use std::collections::HashMap;
 
 use adv_cpu::backend::{GuestExt, Reg};
+use adv_machine::layout::teb;
 use adv_machine::{CtxId, Env, Outcome};
 
 use crate::object::write_u32;
@@ -41,10 +42,17 @@ struct Table {
 #[derive(Default)]
 struct Tables([Option<Table>; TABLES]);
 
-/// Each context's callbacks in progress, innermost last: where to store
-/// the results `NtCallbackReturn` gives.
+/// A callback in progress: where to store the results `NtCallbackReturn`
+/// gives, and the thread's exception list when it started.
+struct Callback {
+    ret_ptr: u32,
+    ret_length: u32,
+    exception_list: u32,
+}
+
+/// Each context's callbacks in progress, innermost last.
 #[derive(Default)]
-struct Callbacks(HashMap<CtxId, Vec<(u32, u32)>>);
+struct Callbacks(HashMap<CtxId, Vec<Callback>>);
 
 /// Where ntdll.dll takes user-mode callbacks.
 #[derive(Clone, Copy)]
@@ -123,6 +131,10 @@ pub fn user_mode_callback(
         return Outcome::Return(status::ACCESS_VIOLATION);
     }
     let context = env.context;
+    let teb = env.sys.contexts[context as usize].teb;
+    let Ok(exception_list) = env.cpu.read_u32(teb + teb::EXCEPTION_LIST) else {
+        return Outcome::Return(status::ACCESS_VIOLATION);
+    };
     let callbacks = env
         .ext
         .get_or_default::<Callbacks>()
@@ -130,7 +142,11 @@ pub fn user_mode_callback(
         .entry(context)
         .or_default();
     let depth = callbacks.len();
-    callbacks.push((ret_ptr, ret_length));
+    callbacks.push(Callback {
+        ret_ptr,
+        ret_length,
+        exception_list,
+    });
     Outcome::call_on_stack(
         dispatcher,
         [id, data, length, 0],
@@ -152,7 +168,7 @@ pub fn callback_return(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         unreachable!()
     };
     let context = env.context;
-    let Some((ret_ptr_out, ret_length_out)) = env
+    let Some(callback) = env
         .ext
         .get_or_default::<Callbacks>()
         .0
@@ -161,10 +177,19 @@ pub fn callback_return(env: &mut Env<'_>, args: &[u32]) -> Outcome {
     else {
         return Outcome::Return(NO_CALLBACK_ACTIVE);
     };
-    for (address, value) in [(ret_ptr_out, ret_ptr), (ret_length_out, ret_length)] {
+    for (address, value) in [
+        (callback.ret_ptr, ret_ptr),
+        (callback.ret_length, ret_length),
+    ] {
         if address != 0 && write_u32(env, address, value).is_err() {
             return Outcome::Return(status::ACCESS_VIOLATION);
         }
+    }
+    // As Wine's `user_mode_callback_return`: the frames the dispatcher
+    // registered end with the callback.
+    let teb = env.sys.contexts[context as usize].teb;
+    if write_u32(env, teb + teb::EXCEPTION_LIST, callback.exception_list).is_err() {
+        return Outcome::Return(status::ACCESS_VIOLATION);
     }
     Outcome::ReturnFromCall(result)
 }

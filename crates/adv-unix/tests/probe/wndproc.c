@@ -1,7 +1,8 @@
 /* The window procedure probe: user32 calls back into a window procedure
  * from CreateWindow, SendMessage and DispatchMessage. Inside the callback
  * the procedure draws into the window, sends itself a nested message and
- * waits; every call must return its value to the right caller.
+ * waits; every call must return its value to the right caller, and the
+ * thread's exception frames must be those it had before the calls.
  * Build: i686-w64-mingw32-gcc -O1 -o wndproc.exe wndproc.c -lgdi32 */
 #include <windows.h>
 #include <stdio.h>
@@ -59,6 +60,7 @@ int main(void)
     LRESULT sent;
     MSG message;
     int quit = -1;
+    void *frames = ((NT_TIB *)NtCurrentTeb())->ExceptionList;
 
     event = CreateEventW(NULL, TRUE, FALSE, NULL);
     class.lpfnWndProc = procedure;
@@ -75,8 +77,9 @@ int main(void)
     if (message.message == WM_QUIT) quit = message.wParam;
     DestroyWindow(window);
 
-    printf("created=%d sent=%ld nested=%d deepest=%d drawn=%d waited=%lu posted=%d quit=%d destroyed=%d\n",
-           created, (long)sent, nested, deepest, drawn, waited, posted, quit, destroyed);
+    printf("created=%d sent=%ld nested=%d deepest=%d drawn=%d waited=%lu posted=%d quit=%d destroyed=%d frames=%d\n",
+           created, (long)sent, nested, deepest, drawn, waited, posted, quit, destroyed,
+           ((NT_TIB *)NtCurrentTeb())->ExceptionList == frames);
     fflush(stdout);
     return !(created && sent == 47 && nested == 7 && deepest == 2 && drawn &&
              waited == WAIT_TIMEOUT && posted == 21 && quit == 5 && destroyed);

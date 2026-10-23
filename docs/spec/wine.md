@@ -103,7 +103,7 @@ An ntdll.dll export with no known convention stops the load. A weak symbol nothi
 
 ### WINE-UNIX-3 win32k calls and callbacks
 
-**Rule**: System calls from 0x1000 MUST run the function win32u registered with its arguments. `KeUserModeCallback` MUST run `KiUserCallbackDispatcher` on the same stack, and `NtCallbackReturn` MUST end that call with its result.
+**Rule**: System calls from 0x1000 MUST run the function win32u registered with its arguments. `KeUserModeCallback` MUST run `KiUserCallbackDispatcher` on the same stack, and `NtCallbackReturn` MUST end that call with its result. It MUST restore the exception list the callback found.
 **Verification**: Test
 
 ### WINE-UNIX-4 Shared libraries and files
