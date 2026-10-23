@@ -5,7 +5,7 @@ use adv_cpu::{X87Register, X87State};
 
 pub const SIZE: usize = 716;
 const CONTEXT_I386: u32 = 0x0001_0000;
-const FLAGS: u32 = 0x0001_002f; // control, integer, segments, x87, extended; no debug registers.
+const FLAGS: u32 = 0x0001_003f; // control, integer, segments, x87, debug, extended.
 fn put(bytes: &mut [u8], offset: usize, value: u32) {
     bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
@@ -116,16 +116,13 @@ pub fn decode(bytes: &[u8; SIZE], state: &mut ArchitecturalState) -> Result<(), 
     let flags = get(bytes, 0);
     // Any of control, integer, segments and extended registers restore their
     // part; FloatSave is read only through the extended registers, as Wine's
-    // NtContinue takes it. The machine has no debug registers, so they may
-    // only be restored to zero. XSTATE is not restored yet.
+    // NtContinue takes it. Debug registers live in the NT thread state.
+    // XSTATE is not restored yet.
     let parts = flags & !CONTEXT_I386;
     let supported =
         parts & !(1 | 2 | 4 | 8 | 0x10 | 0x20) == 0 && (parts & 8 == 0 || parts & 0x20 != 0);
     if flags & CONTEXT_I386 == 0 || !supported {
         return Err(format!("x86 CONTEXT flags unsupported: {flags:#x}"));
-    }
-    if flags & 0x10 != 0 && bytes[4..0x1c].iter().any(|&byte| byte != 0) {
-        return Err("x86 CONTEXT sets debug registers".into());
     }
     let mut candidate = state.clone();
     if flags & 1 != 0 {
@@ -171,6 +168,30 @@ pub fn decode(bytes: &[u8; SIZE], state: &mut ArchitecturalState) -> Result<(), 
     }
     *state = candidate;
     Ok(())
+}
+
+/// Wine retains the debug registers per thread independently of CPU execution.
+#[derive(Default)]
+pub struct DebugRegisters(std::collections::HashMap<adv_machine::CtxId, [u8; 24]>);
+
+pub fn save_debug(env: &mut adv_machine::Env<'_>, target: adv_machine::CtxId, bytes: &[u8]) {
+    if get(bytes, 0) & 0x10 != 0 {
+        env.ext
+            .get_or_default::<DebugRegisters>()
+            .0
+            .insert(target, bytes[4..28].try_into().unwrap());
+    }
+}
+
+pub fn load_debug(env: &mut adv_machine::Env<'_>, target: adv_machine::CtxId, bytes: &mut [u8]) {
+    let registers = env
+        .ext
+        .get_or_default::<DebugRegisters>()
+        .0
+        .get(&target)
+        .copied()
+        .unwrap_or([0; 24]);
+    bytes[4..28].copy_from_slice(&registers);
 }
 
 #[cfg(test)]
@@ -223,7 +244,7 @@ mod tests {
     }
     #[test]
     fn unsupported_context_fails_before_any_architecture_is_published() {
-        for (flags, dr7) in [(0, 0), (0x7, 0), (0x1000f, 0), (0x1003f, 1), (0x1006f, 0)] {
+        for (flags, dr7) in [(0, 0), (0x7, 0), (0x1000f, 0), (0x1006f, 0)] {
             let original = state();
             let mut bytes = encode(&original);
             let mut restored = original.clone();
@@ -235,11 +256,15 @@ mod tests {
         }
     }
 
+    // spec: WINE-THR-5
     #[test]
-    fn zero_debug_registers_restore_with_the_rest() {
+    fn debug_registers_do_not_change_cpu_execution_state() {
         let original = state();
         let mut bytes = encode(&original);
         put(&mut bytes, 0, 0x1003f);
+        for offset in (4..28).step_by(4) {
+            put(&mut bytes, offset, 0x12345678);
+        }
         let mut restored = original.clone();
         decode(&bytes, &mut restored).unwrap();
         assert_eq!(restored, original);

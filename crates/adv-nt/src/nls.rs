@@ -64,6 +64,7 @@ pub fn section(env: &mut Env<'_>, args: &[u32]) -> Outcome {
     };
     status::finish((|| {
         let mut attributes = Attributes {
+            security: Vec::new(),
             root: 0,
             attributes: 0,
             name: Some(section_name(kind, id)?.encode_utf16().collect()),
@@ -144,4 +145,31 @@ fn file_name(kind: u32, id: u32) -> Option<String> {
         (NLS_SECTION_NORMALIZE, 13) => "normidna".into(),
         _ => return None,
     })
+}
+
+/// NtQueryInstallUILanguage(*language)
+pub fn install_ui_language(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    let language = env.ext.get::<Locale>().0 as u16;
+    status::finish(
+        crate::object::write_bytes(env, args[0], &language.to_le_bytes()).map_err(Error::from),
+    )
+}
+
+struct UiLanguage(u16);
+
+/// NtQueryDefaultUILanguage(*language)
+pub fn default_ui_language(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    let language = env
+        .ext
+        .try_get::<UiLanguage>()
+        .map_or(env.ext.get::<Locale>().0 as u16, |language| language.0);
+    status::finish(
+        crate::object::write_bytes(env, args[0], &language.to_le_bytes()).map_err(Error::from),
+    )
+}
+
+/// NtSetDefaultUILanguage(language)
+pub fn set_ui_language(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    env.ext.insert(UiLanguage(args[0] as u16));
+    Outcome::Return(status::SUCCESS)
 }

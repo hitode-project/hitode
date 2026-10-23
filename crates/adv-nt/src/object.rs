@@ -56,6 +56,7 @@ pub struct Attributes {
     pub root: u32,
     pub attributes: u32,
     pub name: Option<Vec<u16>>,
+    pub security: Vec<u8>,
 }
 
 impl Attributes {
@@ -66,16 +67,21 @@ impl Attributes {
         if read_u32(env, address)? != LENGTH {
             return Err(status::INVALID_PARAMETER.into());
         }
-        if read_u32(env, address + SECURITY_DESCRIPTOR)? != 0 {
-            return Err(Error::Unsupported(
-                "object attributes with a security descriptor".into(),
-            ));
-        }
+        let security = security_descriptor(env, read_u32(env, address + SECURITY_DESCRIPTOR)?)?;
         let name = match read_u32(env, address + OBJECT_NAME)? {
             0 => None,
-            name => Some(read_unicode_string(env, name)?),
+            name => {
+                if read_u32(env, name + 4)? & 1 != 0 {
+                    return Err(0x8000_0002.into());
+                }
+                Some(read_unicode_string(env, name)?)
+            }
         };
+        if name.is_none() && read_u32(env, address + ROOT_DIRECTORY)? != 0 {
+            return Err(status::OBJECT_NAME_INVALID.into());
+        }
         Ok(Attributes {
+            security,
             root: read_u32(env, address + ROOT_DIRECTORY)?,
             attributes: read_u32(env, address + ATTRIBUTES)?,
             name,
@@ -92,9 +98,15 @@ impl Attributes {
     pub fn wire(&self) -> Vec<u8> {
         let name = self.name.as_deref().unwrap_or_default();
         let mut bytes = Vec::with_capacity(16 + 2 * name.len());
-        for value in [self.root, self.attributes, 0, 2 * name.len() as u32] {
+        for value in [
+            self.root,
+            self.attributes,
+            self.security.len() as u32,
+            2 * name.len() as u32,
+        ] {
             bytes.extend_from_slice(&value.to_le_bytes());
         }
+        bytes.extend_from_slice(&self.security);
         for unit in name {
             bytes.extend_from_slice(&unit.to_le_bytes());
         }
@@ -116,7 +128,7 @@ pub fn open_directory(env: &mut Env<'_>, args: &[u32]) -> adv_machine::Outcome {
     };
     status::finish((|| {
         write_u32(env, handle, 0)?;
-        let attributes = Attributes::read(env, attributes)?;
+        let attributes = crate::sync::open_attributes(env, attributes)?;
         let mut request = OpenDirectoryRequest {
             access,
             attributes: attributes.attributes,
@@ -131,49 +143,6 @@ pub fn open_directory(env: &mut Env<'_>, args: &[u32]) -> adv_machine::Outcome {
     })())
 }
 
-/// NtCreateDirectoryObject(*handle, access, *attributes)
-pub fn create_directory(env: &mut Env<'_>, args: &[u32]) -> adv_machine::Outcome {
-    let &[handle, access, attributes] = args else {
-        unreachable!()
-    };
-    status::finish((|| {
-        write_u32(env, handle, 0)?;
-        let objattr = Attributes::read(env, attributes)?.wire();
-        let mut request = crate::protocol::CreateDirectoryRequest {
-            access,
-            ..Default::default()
-        };
-        let (reply, _) = crate::server::request(env, &mut request, &[&objattr], &mut [])?;
-        write_u32(env, handle, reply.handle)?;
-        status::check(reply.header.error)
-    })())
-}
-
-/// NtCreateSymbolicLinkObject(*handle, access, *attributes, *target)
-pub fn create_symbolic_link(env: &mut Env<'_>, args: &[u32]) -> adv_machine::Outcome {
-    let &[handle, access, attributes, target] = args else {
-        unreachable!()
-    };
-    status::finish((|| {
-        write_u32(env, handle, 0)?;
-        if read_u32(env, target)? >> 16 == 0 {
-            return Err(status::INVALID_PARAMETER.into());
-        }
-        let target: Vec<u8> = read_unicode_string(env, target)?
-            .iter()
-            .flat_map(|unit| unit.to_le_bytes())
-            .collect();
-        let objattr = Attributes::read(env, attributes)?.wire();
-        let mut request = crate::protocol::CreateSymlinkRequest {
-            access,
-            ..Default::default()
-        };
-        let (reply, _) = crate::server::request(env, &mut request, &[&objattr, &target], &mut [])?;
-        write_u32(env, handle, reply.handle)?;
-        status::check(reply.header.error)
-    })())
-}
-
 /// NtQueryObject(handle, class, *info, length, *used_length)
 pub fn query(env: &mut Env<'_>, args: &[u32]) -> adv_machine::Outcome {
     use crate::protocol::{GetObjectInfoRequest, GetObjectNameRequest, GetObjectTypeRequest};
@@ -185,6 +154,26 @@ pub fn query(env: &mut Env<'_>, args: &[u32]) -> adv_machine::Outcome {
             write_u32(env, used_length, 0)?;
         }
         let used = match class {
+            4 => {
+                if length < 2 {
+                    return Err(0xc000_0206.into());
+                }
+                let mut request = crate::protocol::SetHandleInfoRequest {
+                    handle,
+                    ..Default::default()
+                };
+                let (reply, _) = crate::server::request(env, &mut request, &[], &mut [])?;
+                status::check(reply.header.error)?;
+                write_bytes(
+                    env,
+                    info,
+                    &[
+                        u8::from(reply.old_flags & 1 != 0),
+                        u8::from(reply.old_flags & 2 != 0),
+                    ],
+                )?;
+                2
+            }
             0 => {
                 if length < 56 {
                     return Err(status::INFO_LENGTH_MISMATCH.into());
@@ -293,6 +282,276 @@ pub fn query(env: &mut Env<'_>, args: &[u32]) -> adv_machine::Outcome {
         if used_length != 0 {
             write_u32(env, used_length, used)?;
         }
+        Ok(())
+    })())
+}
+
+/// NtDuplicateObject(source_process, source, destination_process, *destination,
+/// access, attributes, options)
+pub fn duplicate(env: &mut Env<'_>, args: &[u32]) -> adv_machine::Outcome {
+    let &[
+        src_process,
+        src_handle,
+        dst_process,
+        destination,
+        access,
+        attributes,
+        options,
+    ] = args
+    else {
+        unreachable!()
+    };
+    status::finish((|| {
+        if destination != 0 {
+            write_u32(env, destination, 0)?;
+        }
+        let mut request = crate::protocol::DupHandleRequest {
+            src_process,
+            src_handle,
+            dst_process,
+            access,
+            attributes,
+            options,
+            ..Default::default()
+        };
+        let (reply, _) = crate::server::request(env, &mut request, &[], &mut [])?;
+        if destination != 0 {
+            write_u32(env, destination, reply.handle)?;
+        }
+        status::check(reply.header.error)
+    })())
+}
+
+/// NtQueryDirectoryObject(handle, *buffer, size, single, restart, *context, *used)
+pub fn query_directory(env: &mut Env<'_>, args: &[u32]) -> adv_machine::Outcome {
+    let &[handle, buffer, size, single, restart, context, used] = args else {
+        unreachable!()
+    };
+    status::finish((|| {
+        let index = if restart as u8 != 0 {
+            0
+        } else {
+            read_u32(env, context)?
+        };
+        let mut entries = vec![0; size as usize];
+        let mut request = crate::protocol::GetDirectoryEntriesRequest {
+            handle,
+            index,
+            max_count: if single as u8 != 0 { 1 } else { u32::MAX },
+            ..Default::default()
+        };
+        let (reply, _) = crate::server::request(env, &mut request, &[], &mut entries)?;
+        let mut result = reply.header.error;
+        if result != 0 && result != 0x105 {
+            return Err(result.into());
+        }
+        let word = |at: usize| u32::from_le_bytes(entries[at..at + 4].try_into().unwrap()) as usize;
+        let mut count = 0;
+        let mut needed = 16;
+        let mut pos = 0;
+        for _ in 0..reply.count {
+            let name = word(pos);
+            let kind = word(pos + 4);
+            let entry_size = 16 + name + kind + 4;
+            if needed + entry_size > size as usize {
+                result = 0x105;
+                break;
+            }
+            count += 1;
+            needed += entry_size;
+            pos += 8 + (name + kind).next_multiple_of(4);
+        }
+        let mut head = 16 * (count + 1);
+        let mut bytes = vec![0; needed];
+        pos = 0;
+        for i in 0..count {
+            let name = word(pos);
+            let kind = word(pos + 4);
+            let mut source = pos + 8;
+            for (offset, length) in [(i * 16, name), (i * 16 + 8, kind)] {
+                bytes[offset..offset + 4].copy_from_slice(
+                    &((length as u32) | (((length + 2) as u32) << 16)).to_le_bytes(),
+                );
+                bytes[offset + 4..offset + 8]
+                    .copy_from_slice(&(buffer + head as u32).to_le_bytes());
+                bytes[head..head + length].copy_from_slice(&entries[source..source + length]);
+                head += length + 2;
+                source += length;
+            }
+            pos += 8 + (name + kind).next_multiple_of(4);
+        }
+        if size >= 16 {
+            write_bytes(env, buffer, &bytes)?;
+        }
+        if reply.count == 0 && result == 0 {
+            if used != 0 {
+                write_u32(env, used, 16)?;
+            }
+            return Err(0x8000_001a.into());
+        }
+        if single as u8 != 0 && count == 0 {
+            if used != 0 {
+                write_u32(env, used, 36 + reply.total_len)?;
+            }
+            return Err(0xc000_0023.into());
+        }
+        write_u32(env, context, index + count as u32)?;
+        if used != 0 {
+            write_u32(env, used, head as u32)?;
+        }
+        status::check(result)
+    })())
+}
+
+/// Serializes the descriptor's SID and ACL components as Wine's alloc_object_attributes.
+fn security_descriptor(env: &Env<'_>, address: u32) -> Result<Vec<u8>, Error> {
+    if address == 0 {
+        return Ok(Vec::new());
+    }
+    let header = read_u32(env, address)?;
+    if header & 0xff != 1 {
+        return Err(0xc000_0058.into());
+    }
+    let control = header >> 16;
+    let mut bytes = vec![0; 20];
+    bytes[..4].copy_from_slice(&(control & !0x8000).to_le_bytes());
+    for (index, offset) in [4, 8, 12, 16].into_iter().enumerate() {
+        let pointer = read_u32(env, address + offset)?;
+        if pointer == 0 || index == 2 && control & 0x10 == 0 || index == 3 && control & 4 == 0 {
+            continue;
+        }
+        let pointer = if control & 0x8000 != 0 {
+            address + pointer
+        } else {
+            pointer
+        };
+        let value = read_u32(env, pointer)?;
+        let length = if index < 2 {
+            8 + ((value >> 8) & 0xff) * 4
+        } else {
+            value >> 16
+        };
+        bytes[4 + index * 4..8 + index * 4].copy_from_slice(&length.to_le_bytes());
+        let start = bytes.len();
+        bytes.resize(start + length as usize, 0);
+        env.cpu
+            .read(pointer, &mut bytes[start..])
+            .map_err(|_| status::ACCESS_VIOLATION)?;
+    }
+    bytes.resize(bytes.len().next_multiple_of(2), 0);
+    Ok(bytes)
+}
+
+/// NtSetInformationObject(handle, class, info, length)
+pub fn set(env: &mut Env<'_>, args: &[u32]) -> adv_machine::Outcome {
+    status::finish((|| {
+        if args[1] != 4 {
+            return Err(status::NOT_IMPLEMENTED.into());
+        }
+        if args[3] < 2 {
+            return Err(0xc000_0206.into());
+        }
+        let mut bytes = [0; 2];
+        env.cpu
+            .read(args[2], &mut bytes)
+            .map_err(|_| status::ACCESS_VIOLATION)?;
+        let mut request = crate::protocol::SetHandleInfoRequest {
+            handle: args[0],
+            flags: i32::from(bytes[0] != 0) | (i32::from(bytes[1] != 0) << 1),
+            mask: 3,
+            ..Default::default()
+        };
+        let (reply, _) = crate::server::request(env, &mut request, &[], &mut [])?;
+        status::check(reply.header.error)
+    })())
+}
+
+/// NtCreateDirectoryObject(*handle, access, *attributes)
+pub fn create_directory(env: &mut Env<'_>, args: &[u32]) -> adv_machine::Outcome {
+    status::finish((|| {
+        write_u32(env, args[0], 0)?;
+        let attr = if args[2] == 0 {
+            Vec::new()
+        } else {
+            Attributes::read(env, args[2])?.wire()
+        };
+        let mut request = crate::protocol::CreateDirectoryRequest {
+            access: args[1],
+            ..Default::default()
+        };
+        let (reply, _) = crate::server::request(env, &mut request, &[&attr], &mut [])?;
+        write_u32(env, args[0], reply.handle)?;
+        status::check(reply.header.error)
+    })())
+}
+
+/// NtCreateSymbolicLinkObject(*handle, access, *attributes, *target)
+pub fn create_symlink(env: &mut Env<'_>, args: &[u32]) -> adv_machine::Outcome {
+    status::finish((|| {
+        write_u32(env, args[0], 0)?;
+        if read_u32(env, args[3])? >> 16 == 0 {
+            return Err(status::INVALID_PARAMETER.into());
+        }
+        if read_u32(env, args[3] + 4)? == 0 {
+            return Err(status::ACCESS_VIOLATION.into());
+        }
+        let attr = if args[2] == 0 {
+            Vec::new()
+        } else {
+            Attributes::read(env, args[2])?.wire()
+        };
+        let target: Vec<u8> = read_unicode_string(env, args[3])?
+            .iter()
+            .flat_map(|unit| unit.to_le_bytes())
+            .collect();
+        let mut request = crate::protocol::CreateSymlinkRequest {
+            access: args[1],
+            ..Default::default()
+        };
+        let (reply, _) = crate::server::request(env, &mut request, &[&attr, &target], &mut [])?;
+        write_u32(env, args[0], reply.handle)?;
+        status::check(reply.header.error)
+    })())
+}
+
+/// NtOpenSymbolicLinkObject(*handle, access, *attributes)
+pub fn open_symlink(env: &mut Env<'_>, args: &[u32]) -> adv_machine::Outcome {
+    status::finish((|| {
+        write_u32(env, args[0], 0)?;
+        let attr = crate::sync::open_attributes(env, args[2])?;
+        let mut request = crate::protocol::OpenSymlinkRequest {
+            access: args[1],
+            attributes: attr.attributes,
+            rootdir: attr.root,
+            ..Default::default()
+        };
+        let (reply, _) = crate::server::request(env, &mut request, &[&attr.name_bytes()], &mut [])?;
+        write_u32(env, args[0], reply.handle)?;
+        status::check(reply.header.error)
+    })())
+}
+
+/// NtQuerySymbolicLinkObject(handle, *target, *length)
+pub fn query_symlink(env: &mut Env<'_>, args: &[u32]) -> adv_machine::Outcome {
+    status::finish((|| {
+        if args[1] == 0 {
+            return Err(status::ACCESS_VIOLATION.into());
+        }
+        let maximum = read_u32(env, args[1])? >> 16;
+        let mut bytes = vec![0; maximum.saturating_sub(2) as usize];
+        let mut request = crate::protocol::QuerySymlinkRequest {
+            handle: args[0],
+            ..Default::default()
+        };
+        let (reply, size) = crate::server::request(env, &mut request, &[], &mut bytes)?;
+        if args[2] != 0 && matches!(reply.header.error, 0 | 0xc000_0023) {
+            write_u32(env, args[2], reply.total + 2)?;
+        }
+        status::check(reply.header.error)?;
+        let output = read_u32(env, args[1] + 4)?;
+        write_bytes(env, output, &bytes[..size])?;
+        write_bytes(env, output + size as u32, &[0; 2])?;
+        write_bytes(env, args[1], &(size as u16).to_le_bytes())?;
         Ok(())
     })())
 }

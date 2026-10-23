@@ -70,6 +70,7 @@ pub fn query(env: &mut Env<'_>, args: &[u32]) -> Outcome {
             FILE_DIRECTORY_INFORMATION => 64,
             FILE_FULL_DIRECTORY_INFORMATION => 68,
             FILE_BOTH_DIRECTORY_INFORMATION => 94,
+            63 => 114,
             10 | 12 | 37 | 38 | 50 | 60 => {
                 return Err(Error::Unsupported(format!(
                     "directory information class {class}"
@@ -147,6 +148,24 @@ pub fn query(env: &mut Env<'_>, args: &[u32]) -> Outcome {
             entry[48..56].copy_from_slice(&(metadata.blocks() * 512).to_le_bytes());
             entry[56..60].copy_from_slice(&basic[32..36]);
             entry[60..64].copy_from_slice(&(name.len() as u32).to_le_bytes());
+            if class == 63 {
+                entry[72..80].copy_from_slice(&metadata.ino().to_le_bytes());
+            }
+            if class == 3 || class == 63 {
+                let units: Vec<u16> = name
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|pair| u16::from_le_bytes(*pair))
+                    .collect();
+                let short = crate::path::short_name(&units);
+                let offset = if class == 3 { 68 } else { 88 };
+                entry[offset] = (short.len() * 2) as u8;
+                for (index, unit) in short.iter().enumerate() {
+                    entry[offset + 2 + index * 2..offset + 4 + index * 2]
+                        .copy_from_slice(&unit.to_le_bytes());
+                }
+            }
             bytes.extend_from_slice(&name[..shown]);
             if let Some(previous) = last {
                 bytes[previous as usize..previous as usize + 4]
@@ -183,13 +202,16 @@ fn align(size: u32) -> u32 {
 fn list(directory: &std::path::Path, mask: Option<&[u16]>) -> Result<Vec<OsString>, Status> {
     let wanted = |name: &OsString| {
         let name: Vec<u16> = name.to_string_lossy().encode_utf16().collect();
-        mask.is_none_or(|mask| matches(mask, &name))
+        mask.is_none_or(|mask| {
+            matches(mask, &name) || matches(mask, &crate::path::short_name(&name))
+        })
     };
     let entries = std::fs::read_dir(directory).map_err(|_| status::OBJECT_PATH_NOT_FOUND)?;
     let mut names: Vec<OsString> = entries
         .flatten()
         .filter(|entry| {
             entry
+                .path()
                 .metadata()
                 .is_ok_and(|metadata| metadata.is_file() || metadata.is_dir())
         })

@@ -182,6 +182,9 @@ pub fn wait_multiple(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         .map(|index| read_u32(env, handles + 4 * index))
         .collect();
     match handles {
+        Ok(handles) if handles.iter().any(|&handle| handle >= u32::MAX - 5) => {
+            Outcome::Return(status::INVALID_HANDLE)
+        }
         Ok(handles) => wait(env, &handles, wait_any as u8 != 0, alertable, timeout),
         Err(status) => Outcome::Return(status),
     }
@@ -206,11 +209,24 @@ pub fn delay(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         unreachable!()
     };
     if alertable as u8 != 0 {
-        return begin_select(
+        let timeout = match read_timeout(env, timeout) {
+            Ok(timeout) => timeout,
+            Err(code) => return Outcome::Return(code),
+        };
+        let select = new_select(
             env,
             Vec::new(),
             SELECT_INTERRUPTIBLE | SELECT_ALERTABLE,
             timeout,
+        );
+        return run_select(
+            env,
+            select,
+            Box::new(|env, ended| match ended {
+                Ended::Status(0x102) => Outcome::Return(status::SUCCESS),
+                Ended::Status(code) => Outcome::Return(code),
+                Ended::Apc { func, args } => run_apc(env, None, func, args, USER_APC),
+            }),
         );
     }
     let timeout = match read_timeout(env, timeout) {
@@ -294,7 +310,18 @@ fn new_select(env: &mut Env<'_>, op: Vec<u8>, flags: i32, timeout: Option<i64>) 
 /// Sends the `select`; if the server cannot end it at once, blocks until
 /// it does.
 fn run_select(env: &mut Env<'_>, select: Select, then: Then) -> Outcome {
+    run_select_result(env, select, then, 0, [0; APC_RESULT_SIZE])
+}
+
+fn run_select_result(
+    env: &mut Env<'_>,
+    select: Select,
+    then: Then,
+    previous: u32,
+    result: [u8; APC_RESULT_SIZE],
+) -> Outcome {
     let mut request = SelectRequest {
+        prev_apc: previous,
         flags: select.flags,
         cookie: select.cookie,
         timeout: select.timeout,
@@ -302,18 +329,21 @@ fn run_select(env: &mut Env<'_>, select: Select, then: Then) -> Outcome {
         ..Default::default()
     };
     let mut call = [0u8; APC_CALL_SIZE];
-    let reply = server::request(
-        env,
-        &mut request,
-        &[&[0; APC_RESULT_SIZE], &select.op],
-        &mut call,
-    );
+    let reply = server::request(env, &mut request, &[&result, &select.op], &mut call);
     let (reply, size) = match reply {
         Ok(reply) => reply,
         Err(error) => return status::finish(Err(error)),
     };
     if reply.header.error == KERNEL_APC {
-        return Outcome::Fail("system APCs".into());
+        let kind = u32::from_le_bytes(call[..4].try_into().unwrap());
+        if kind != 2 {
+            return Outcome::Fail(format!("system APC type {kind}"));
+        }
+        let result = match crate::file::complete_async(env, &call) {
+            Ok(result) => result,
+            Err(error) => return status::finish(Err(error)),
+        };
+        return run_select_result(env, select, then, reply.apc_handle, result);
     }
     if reply.signaled == 0 {
         return block(env, select, then);
@@ -452,7 +482,7 @@ fn run_apc(
     for (index, value) in [func, args[0], args[1], args[2], 1].into_iter().enumerate() {
         frame[4 * index..4 * index + 4].copy_from_slice(&value.to_le_bytes());
     }
-    exception::put_context(&mut frame, APC_CONTEXT, &interrupted);
+    exception::put_context(env, &mut frame, APC_CONTEXT, &interrupted);
     if let Err(error) = env.cpu.write(stack, &frame) {
         return Outcome::Fail(format!("APC frame: {error}"));
     }
@@ -467,14 +497,30 @@ pub fn queue_apc(env: &mut Env<'_>, args: &[u32]) -> Outcome {
     let &[thread, func, arg1, arg2, arg3] = args else {
         unreachable!()
     };
+    queue_apc_ex2(env, &[thread, 0, 0, func, arg1, arg2, arg3])
+}
+
+/// NtQueueApcThreadEx2(thread, reserve, flags, func, arg1, arg2, arg3)
+pub fn queue_apc_ex2(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    let &[thread, reserve, flags, func, arg1, arg2, arg3] = args else {
+        unreachable!()
+    };
     status::finish((|| {
         let mut request = QueueApcRequest {
             handle: thread,
+            reserve_handle: reserve,
             ..Default::default()
         };
         let mut call = [0u8; APC_CALL_SIZE];
         if func != 0 {
-            for (offset, value) in [(0, APC_USER), (8, func), (16, arg1), (24, arg2), (32, arg3)] {
+            for (offset, value) in [
+                (0, APC_USER),
+                (4, flags & 3),
+                (8, func),
+                (16, arg1),
+                (24, arg2),
+                (32, arg3),
+            ] {
                 call[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
             }
         }
@@ -589,7 +635,7 @@ pub fn create_semaphore(env: &mut Env<'_>, args: &[u32]) -> Outcome {
     })())
 }
 
-fn open_attributes(env: &Env<'_>, address: u32) -> Result<Attributes, status::Error> {
+pub(crate) fn open_attributes(env: &Env<'_>, address: u32) -> Result<Attributes, status::Error> {
     if address == 0 || read_u32(env, address)? != 24 {
         return Err(status::INVALID_PARAMETER.into());
     }
@@ -607,6 +653,7 @@ fn open_attributes(env: &Env<'_>, address: u32) -> Result<Attributes, status::Er
         Some(read_unicode_string(env, name)?)
     };
     Ok(Attributes {
+        security: Vec::new(),
         root,
         attributes: read_u32(env, address + 12)?,
         name,
@@ -882,5 +929,550 @@ pub fn wait_alert(env: &mut Env<'_>, args: &[u32]) -> Outcome {
             })
         }
         Err(error) => status::finish(Err(error)),
+    }
+}
+
+/// NtOpenEvent(*handle, access, *attributes)
+pub fn open_event(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    status::finish((|| {
+        write_u32(env, args[0], 0)?;
+        let attr = open_attributes(env, args[2])?;
+        let mut request = crate::protocol::OpenEventRequest {
+            access: args[1],
+            attributes: attr.attributes,
+            rootdir: attr.root,
+            ..Default::default()
+        };
+        let (reply, _) = server::request(env, &mut request, &[&attr.name_bytes()], &mut [])?;
+        write_u32(env, args[0], reply.handle)?;
+        status::check(reply.header.error)
+    })())
+}
+
+/// NtQueryEvent(handle, class, *info, length, *result_length)
+pub fn query_event(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    status::finish((|| {
+        if args[1] != 0 {
+            return Err(status::INVALID_INFO_CLASS.into());
+        }
+        if args[3] != 8 {
+            return Err(status::INFO_LENGTH_MISMATCH.into());
+        }
+        let mut request = crate::protocol::QueryEventRequest {
+            handle: args[0],
+            ..Default::default()
+        };
+        let (reply, _) = server::request(env, &mut request, &[], &mut [])?;
+        status::check(reply.header.error)?;
+        write_u32(env, args[2], u32::from(reply.manual_reset == 0))?;
+        write_u32(env, args[2] + 4, reply.state as u32)?;
+        if args[4] != 0 {
+            write_u32(env, args[4], 8)?;
+        }
+        Ok(())
+    })())
+}
+
+/// NtPulseEvent(handle, *previous_state)
+pub fn pulse_event(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    event_op(env, args, 0)
+}
+
+/// NtSignalAndWaitForSingleObject(signal, wait, alertable, *timeout)
+pub fn signal_and_wait(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    if args[0] == 0 {
+        return Outcome::Return(status::INVALID_HANDLE);
+    }
+    let op = [3u32, args[1], args[0]]
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect();
+    begin_select(
+        env,
+        op,
+        SELECT_INTERRUPTIBLE
+            | if args[2] as u8 != 0 {
+                SELECT_ALERTABLE
+            } else {
+                0
+            },
+        args[3],
+    )
+}
+
+/// NtCreateDebugObject(*handle, access, *attributes, flags)
+pub fn create_debug(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    status::finish((|| {
+        write_u32(env, args[0], 0)?;
+        if args[3] & !1 != 0 {
+            return Err(status::INVALID_PARAMETER.into());
+        }
+        let attributes = if args[2] == 0 {
+            Vec::new()
+        } else {
+            Attributes::read(env, args[2])?.wire()
+        };
+        let mut request = crate::protocol::CreateDebugObjRequest {
+            access: args[1],
+            flags: args[3],
+            ..Default::default()
+        };
+        let (reply, _) = server::request(env, &mut request, &[&attributes], &mut [])?;
+        write_u32(env, args[0], reply.handle)?;
+        status::check(reply.header.error)
+    })())
+}
+
+/// Wine exposes no auxiliary hardware counter.
+pub fn convert_counter(_: &mut Env<'_>, args: &[u32]) -> Outcome {
+    Outcome::Return(if args[1] == 0 {
+        status::ACCESS_VIOLATION
+    } else {
+        status::NOT_SUPPORTED
+    })
+}
+
+/// NtOpenMutant(*handle, access, *attributes)
+pub fn open_mutant(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    status::finish((|| {
+        write_u32(env, args[0], 0)?;
+        let attr = open_attributes(env, args[2])?;
+        let mut request = crate::protocol::OpenMutexRequest {
+            access: args[1],
+            attributes: attr.attributes,
+            rootdir: attr.root,
+            ..Default::default()
+        };
+        let (reply, _) = server::request(env, &mut request, &[&attr.name_bytes()], &mut [])?;
+        write_u32(env, args[0], reply.handle)?;
+        status::check(reply.header.error)
+    })())
+}
+
+/// NtSetEventBoostPriority(handle)
+pub fn boost_event(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    set_event(env, &[args[0], 0])
+}
+
+/// NtQueryMutant(handle, class, *info, length, *result_length)
+pub fn query_mutant(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    status::finish((|| {
+        if args[1] != 0 {
+            return Err(status::INVALID_INFO_CLASS.into());
+        }
+        if args[3] != 8 {
+            return Err(status::INFO_LENGTH_MISMATCH.into());
+        }
+        let mut request = crate::protocol::QueryMutexRequest {
+            handle: args[0],
+            ..Default::default()
+        };
+        let (reply, _) = server::request(env, &mut request, &[], &mut [])?;
+        status::check(reply.header.error)?;
+        write_u32(env, args[2], 1u32.wrapping_sub(reply.count))?;
+        write_bytes(
+            env,
+            args[2] + 4,
+            &[reply.owned as u8, reply.abandoned as u8],
+        )?;
+        if args[4] != 0 {
+            write_u32(env, args[4], 8)?;
+        }
+        Ok(())
+    })())
+}
+
+/// NtCreateKeyedEvent(*handle, access, *attributes, flags)
+pub fn create_keyed_event(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    status::finish((|| {
+        write_u32(env, args[0], 0)?;
+        let attr = if args[2] == 0 {
+            Vec::new()
+        } else {
+            Attributes::read(env, args[2])?.wire()
+        };
+        let mut request = crate::protocol::CreateKeyedEventRequest {
+            access: args[1],
+            ..Default::default()
+        };
+        let (reply, _) = server::request(env, &mut request, &[&attr], &mut [])?;
+        write_u32(env, args[0], reply.handle)?;
+        status::check(reply.header.error)
+    })())
+}
+
+/// NtOpenKeyedEvent(*handle, access, *attributes)
+pub fn open_keyed_event(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    status::finish((|| {
+        write_u32(env, args[0], 0)?;
+        let attr = open_attributes(env, args[2])?;
+        let mut request = crate::protocol::OpenKeyedEventRequest {
+            access: args[1],
+            attributes: attr.attributes,
+            rootdir: attr.root,
+            ..Default::default()
+        };
+        let (reply, _) = server::request(env, &mut request, &[&attr.name_bytes()], &mut [])?;
+        write_u32(env, args[0], reply.handle)?;
+        status::check(reply.header.error)
+    })())
+}
+
+/// NtCreateIoCompletion(*handle, access, *attributes, threads)
+pub fn create_completion(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    status::finish((|| {
+        write_u32(env, args[0], 0)?;
+        let attr = if args[2] == 0 {
+            Vec::new()
+        } else {
+            Attributes::read(env, args[2])?.wire()
+        };
+        let mut request = crate::protocol::CreateCompletionRequest {
+            access: args[1],
+            concurrent: args[3],
+            ..Default::default()
+        };
+        let (reply, _) = server::request(env, &mut request, &[&attr], &mut [])?;
+        write_u32(env, args[0], reply.handle)?;
+        status::check(reply.header.error)
+    })())
+}
+
+struct KeyedEvent(u32);
+
+/// NtWaitForKeyedEvent(handle, key, alertable, *timeout)
+pub fn wait_keyed_event(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    keyed_event(env, args, 4)
+}
+
+/// NtReleaseKeyedEvent(handle, key, alertable, *timeout)
+pub fn release_keyed_event(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    keyed_event(env, args, 5)
+}
+
+fn keyed_event(env: &mut Env<'_>, args: &[u32], op: u32) -> Outcome {
+    if args[1] & 1 != 0 {
+        return Outcome::Return(INVALID_PARAMETER_1);
+    }
+    let handle = if args[0] != 0 {
+        args[0]
+    } else if let Some(event) = env.ext.try_get::<KeyedEvent>() {
+        event.0
+    } else {
+        let mut request = crate::protocol::CreateKeyedEventRequest {
+            access: 0x1f0003,
+            ..Default::default()
+        };
+        let result = server::request(env, &mut request, &[], &mut []);
+        match result {
+            Ok((reply, _)) if reply.header.error == 0 => {
+                env.ext.insert(KeyedEvent(reply.handle));
+                reply.handle
+            }
+            Ok((reply, _)) => return Outcome::Return(reply.header.error),
+            Err(error) => return status::finish(Err(error)),
+        }
+    };
+    let mut data = Vec::new();
+    for value in [op, handle, args[1], 0] {
+        data.extend_from_slice(&value.to_le_bytes());
+    }
+    begin_select(
+        env,
+        data,
+        SELECT_INTERRUPTIBLE
+            | if args[2] as u8 != 0 {
+                SELECT_ALERTABLE
+            } else {
+                0
+            },
+        args[3],
+    )
+}
+
+/// NtOpenIoCompletion(*handle, access, *attributes)
+pub fn open_completion(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    status::finish((|| {
+        write_u32(env, args[0], 0)?;
+        let attr = open_attributes(env, args[2])?;
+        let mut request = crate::protocol::OpenCompletionRequest {
+            access: args[1],
+            attributes: attr.attributes,
+            rootdir: attr.root,
+            ..Default::default()
+        };
+        let (reply, _) = server::request(env, &mut request, &[&attr.name_bytes()], &mut [])?;
+        write_u32(env, args[0], reply.handle)?;
+        status::check(reply.header.error)
+    })())
+}
+
+/// NtAlertMultipleThreadByThreadId(*ids, count, unknown, unknown)
+pub fn alert_multiple(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    status::finish((|| {
+        let mut events = Vec::new();
+        for index in 0..args[1] {
+            events.push(alert_event(env, read_u32(env, args[0] + index * 4)?)?);
+        }
+        for event in events {
+            env.sys.set_event(event);
+        }
+        Ok(())
+    })())
+}
+
+/// NtCreateJobObject(*handle, access, *attributes)
+pub fn create_job(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    status::finish((|| {
+        write_u32(env, args[0], 0)?;
+        let attr = if args[2] == 0 {
+            Vec::new()
+        } else {
+            Attributes::read(env, args[2])?.wire()
+        };
+        let mut request = crate::protocol::CreateJobRequest {
+            access: args[1],
+            ..Default::default()
+        };
+        let (reply, _) = server::request(env, &mut request, &[&attr], &mut [])?;
+        write_u32(env, args[0], reply.handle)?;
+        status::check(reply.header.error)
+    })())
+}
+
+/// NtOpenJobObject(*handle, access, *attributes)
+pub fn open_job(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    status::finish((|| {
+        write_u32(env, args[0], 0)?;
+        let attr = open_attributes(env, args[2])?;
+        let mut request = crate::protocol::OpenJobRequest {
+            access: args[1],
+            attributes: attr.attributes,
+            rootdir: attr.root,
+            ..Default::default()
+        };
+        let (reply, _) = server::request(env, &mut request, &[&attr.name_bytes()], &mut [])?;
+        write_u32(env, args[0], reply.handle)?;
+        status::check(reply.header.error)
+    })())
+}
+
+/// NtSetIoCompletion(handle, key, value, status, information)
+pub fn set_completion(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    status::finish((|| {
+        let mut request = crate::protocol::AddCompletionRequest {
+            handle: args[0],
+            ckey: u64::from(args[1]),
+            cvalue: u64::from(args[2]),
+            status: args[3],
+            information: u64::from(args[4]),
+            ..Default::default()
+        };
+        let (reply, _) = server::request(env, &mut request, &[], &mut [])?;
+        status::check(reply.header.error)
+    })())
+}
+
+/// NtRemoveIoCompletion(handle, *key, *value, *io, *timeout)
+pub fn remove_completion(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    let args: [u32; 5] = args.try_into().unwrap();
+    let mut request = crate::protocol::RemoveCompletionRequest {
+        handle: args[0],
+        ..Default::default()
+    };
+    let reply = match server::request(env, &mut request, &[], &mut []) {
+        Ok((reply, _)) => reply,
+        Err(error) => return status::finish(Err(error)),
+    };
+    if reply.header.error == 0 {
+        return completion_result(
+            env,
+            args,
+            reply.ckey,
+            reply.cvalue,
+            reply.status,
+            reply.information,
+        );
+    }
+    if reply.header.error != 0x103 {
+        return Outcome::Return(reply.header.error);
+    }
+    let timeout = match read_timeout(env, args[4]) {
+        Ok(timeout) => timeout,
+        Err(error) => return Outcome::Return(error),
+    };
+    if timeout == Some(0) {
+        return Outcome::Return(0x102);
+    }
+    let op = [SELECT_WAIT, reply.wait_handle]
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect();
+    let select = new_select(env, op, SELECT_INTERRUPTIBLE, timeout);
+    run_select(
+        env,
+        select,
+        Box::new(move |env, ended| match ended {
+            Ended::Status(0) => {
+                let mut request = crate::protocol::GetThreadCompletionRequest::default();
+                match server::request(env, &mut request, &[], &mut []) {
+                    Ok((reply, _)) if reply.header.error == 0 => completion_result(
+                        env,
+                        args,
+                        reply.ckey,
+                        reply.cvalue,
+                        reply.status,
+                        reply.information,
+                    ),
+                    Ok((reply, _)) => Outcome::Return(reply.header.error),
+                    Err(error) => status::finish(Err(error)),
+                }
+            }
+            Ended::Status(status) => Outcome::Return(status),
+            Ended::Apc { .. } => unreachable!(),
+        }),
+    )
+}
+
+fn completion_result(
+    env: &mut Env<'_>,
+    args: [u32; 5],
+    key: u64,
+    value: u64,
+    code: u32,
+    information: u64,
+) -> Outcome {
+    status::finish((|| {
+        for (address, value) in [
+            (args[1], key as u32),
+            (args[2], value as u32),
+            (args[3], code),
+            (args[3] + 4, information as u32),
+        ] {
+            write_u32(env, address, value)?;
+        }
+        Ok(())
+    })())
+}
+
+/// NtRemoveIoCompletionEx(handle, *entries, count, *written, *timeout, alertable)
+pub fn remove_completion_ex(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    let args: [u32; 6] = args.try_into().unwrap();
+    if args[2] == 0 {
+        return Outcome::Return(status::INVALID_PARAMETER);
+    }
+    let mut count = 0;
+    let (code, handle) = loop {
+        let mut request = crate::protocol::RemoveCompletionRequest {
+            handle: args[0],
+            alertable: i32::from(args[5] as u8 != 0),
+            ..Default::default()
+        };
+        let reply = match server::request(env, &mut request, &[], &mut []) {
+            Ok((reply, _)) => reply,
+            Err(error) => return status::finish(Err(error)),
+        };
+        if reply.header.error != 0 {
+            break (reply.header.error, reply.wait_handle);
+        }
+        if let Err(error) = completion_entry(
+            env,
+            args[1] + count * 16,
+            reply.ckey,
+            reply.cvalue,
+            reply.status,
+            reply.information,
+        ) {
+            return status::finish(Err(error));
+        }
+        count += 1;
+        if count == args[2] {
+            break (0, 0);
+        }
+    };
+    if count != 0 || !matches!(code, 0x103 | USER_APC) {
+        return completion_ex_end(env, args[3], count, if count != 0 { 0 } else { code });
+    }
+    let timeout = match read_timeout(env, args[4]) {
+        Ok(timeout) => timeout,
+        Err(error) => return Outcome::Return(error),
+    };
+    if code != USER_APC && timeout == Some(0) {
+        return completion_ex_end(env, args[3], 0, 0x102);
+    }
+    let op = if code == USER_APC {
+        Vec::new()
+    } else {
+        [SELECT_WAIT, handle]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect()
+    };
+    let flags = SELECT_INTERRUPTIBLE
+        | if args[5] as u8 != 0 {
+            SELECT_ALERTABLE
+        } else {
+            0
+        };
+    let select = new_select(env, op, flags, timeout);
+    run_select(
+        env,
+        select,
+        Box::new(move |env, ended| match ended {
+            Ended::Status(0) => {
+                let mut request = crate::protocol::GetThreadCompletionRequest::default();
+                match server::request(env, &mut request, &[], &mut []) {
+                    Ok((reply, _)) if reply.header.error == 0 => {
+                        match completion_entry(
+                            env,
+                            args[1],
+                            reply.ckey,
+                            reply.cvalue,
+                            reply.status,
+                            reply.information,
+                        ) {
+                            Ok(()) => completion_ex_end(env, args[3], 1, 0),
+                            Err(error) => status::finish(Err(error)),
+                        }
+                    }
+                    Ok((reply, _)) => completion_ex_end(env, args[3], 0, reply.header.error),
+                    Err(error) => status::finish(Err(error)),
+                }
+            }
+            Ended::Status(code) => completion_ex_end(env, args[3], 0, code),
+            Ended::Apc {
+                func,
+                args: apc_args,
+            } => {
+                if let Err(error) = write_u32(env, args[3], 1) {
+                    return Outcome::Return(error);
+                }
+                run_apc(env, None, func, apc_args, USER_APC)
+            }
+        }),
+    )
+}
+
+fn completion_entry(
+    env: &mut Env<'_>,
+    output: u32,
+    key: u64,
+    value: u64,
+    code: u32,
+    information: u64,
+) -> Result<(), crate::status::Error> {
+    for (index, value) in [key as u32, value as u32, code, information as u32]
+        .into_iter()
+        .enumerate()
+    {
+        write_u32(env, output + index as u32 * 4, value)?;
+    }
+    Ok(())
+}
+
+fn completion_ex_end(env: &mut Env<'_>, written: u32, count: u32, code: u32) -> Outcome {
+    match write_u32(env, written, count.max(1)) {
+        Ok(()) => Outcome::Return(code),
+        Err(error) => Outcome::Return(error),
     }
 }

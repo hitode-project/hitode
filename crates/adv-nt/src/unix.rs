@@ -23,6 +23,7 @@ pub fn call(env: &mut Env<'_>, code: u32, args: u32) -> Outcome {
     match code {
         WINE_DBG_WRITE => debug_write(env, args),
         WINE_SERVER_CALL => server_call(env, args),
+        7 => crate::system::query_time(env, &[args]),
         _ => Outcome::Fail(format!("unix call {code} is not implemented")),
     }
 }

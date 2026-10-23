@@ -8,7 +8,7 @@ use adv_machine::{Env, Outcome};
 use adv_pe::Pe;
 
 use crate::image;
-use crate::memory::{self, CURRENT_PROCESS, Memory};
+use crate::memory::{self, Memory};
 use crate::object::{Attributes, read_u32, write_bytes, write_u32};
 use crate::protocol::{
     CreateMappingRequest, GetMappingInfoRequest, IsSameMappingRequest, MapImageViewRequest,
@@ -290,11 +290,7 @@ pub fn map_view(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         unreachable!()
     };
     status::finish((|| {
-        if process != CURRENT_PROCESS {
-            return Err(Error::Unsupported(
-                "mapping a view into another process".into(),
-            ));
-        }
+        crate::information::current_process(env, process)?;
         if read_u32(env, base_out)? != 0 {
             return Err(Error::Unsupported(
                 "mapping a view at a given address".into(),
@@ -441,11 +437,7 @@ pub fn unmap_view(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         unreachable!()
     };
     status::finish((|| {
-        if process != CURRENT_PROCESS {
-            return Err(Error::Unsupported(
-                "unmapping a view of another process".into(),
-            ));
-        }
+        crate::information::current_process(env, process)?;
         let memory = env.ext.get_or_default::<Memory>();
         let base = memory::view_base(memory, address).ok_or(status::NOT_MAPPED_VIEW)?;
         let mut request = UnmapViewRequest {

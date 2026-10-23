@@ -27,6 +27,7 @@ const PF_W: u32 = 2;
 const DT_NULL: u32 = 0;
 const DT_NEEDED: u32 = 1;
 const DT_PLTRELSZ: u32 = 2;
+const DT_HASH: u32 = 4;
 const DT_STRTAB: u32 = 5;
 const DT_SYMTAB: u32 = 6;
 const DT_INIT: u32 = 12;
@@ -213,10 +214,23 @@ pub fn parse(data: &[u8]) -> Result<Object, Error> {
     }
     let versym = tag(DT_VERSYM);
 
-    let count = match tag(DT_GNU_HASH) {
-        Some(hash) => gnu_hash_count(&image_file, hash as usize)?,
-        None => return Err(Error::Format),
+    // GNU hash omits undefined symbols; an object exporting nothing can
+    // have empty buckets even though its relocations reference imports.
+    let mut count = match (tag(DT_HASH), tag(DT_GNU_HASH)) {
+        (Some(hash), _) => image_file.u32(hash as usize + 4)? as usize,
+        (_, Some(hash)) => gnu_hash_count(&image_file, hash as usize)?,
+        _ => return Err(Error::Format),
     };
+    for (start, size) in [
+        (tag(DT_REL), tag(DT_RELSZ)),
+        (tag(DT_JMPREL), tag(DT_PLTRELSZ)),
+    ] {
+        if let (Some(start), Some(size)) = (start, size) {
+            for at in (start as usize..(start + size) as usize).step_by(8) {
+                count = count.max((image_file.u32(at + 4)? >> 8) as usize + 1);
+            }
+        }
+    }
     let mut symbols = Vec::with_capacity(count);
     for index in 0..count {
         let sym = symtab + index * 16;

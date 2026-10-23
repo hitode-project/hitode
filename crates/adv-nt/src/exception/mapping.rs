@@ -73,7 +73,27 @@ fn map_stop(
                 ACCESS_VIOLATION
             }
             FaultKind::InvalidInstruction => ILLEGAL_INSTRUCTION,
-            FaultKind::Other(reason) => return Err(format!("unclassified CPU fault: {reason}")),
+            FaultKind::Other(reason) => {
+                if matches!(
+                    instruction(cpu, pc).mnemonic(),
+                    Mnemonic::In
+                        | Mnemonic::Out
+                        | Mnemonic::Insb
+                        | Mnemonic::Insw
+                        | Mnemonic::Insd
+                        | Mnemonic::Outsb
+                        | Mnemonic::Outsw
+                        | Mnemonic::Outsd
+                        | Mnemonic::Hlt
+                        | Mnemonic::Lidt
+                        | Mnemonic::Lgdt
+                        | Mnemonic::Ltr
+                ) {
+                    PRIVILEGED_INSTRUCTION
+                } else {
+                    return Err(format!("unclassified CPU fault: {reason}"));
+                }
+            }
         },
         Exception::Trap { vector: 0, .. } => {
             // Windows distinguishes zero divisors from quotient overflow even
@@ -85,6 +105,40 @@ fn map_stop(
                 INTEGER_OVERFLOW
             }
         }
+        Exception::Trap { vector: 16, .. } => {
+            record.address = state.x87.ip;
+            let status = state.x87.status & !(state.x87.control & 0x3f);
+            if status & 1 != 0 {
+                if status & 0x40 != 0 {
+                    0xc000_0092
+                } else {
+                    0xc000_0090
+                }
+            } else if status & 2 != 0 {
+                0xc000_008d
+            } else if status & 4 != 0 {
+                0xc000_008e
+            } else if status & 8 != 0 {
+                0xc000_0091
+            } else if status & 0x10 != 0 {
+                0xc000_0093
+            } else if status & 0x20 != 0 {
+                0xc000_008f
+            } else {
+                0xc000_0090
+            }
+        }
+        Exception::Trap { vector: 19, .. } => {
+            record.count = 1;
+            0xc000_02b5
+        }
+        Exception::Trap { vector: 45, .. } => {
+            record.address = pc + 1;
+            record.count = 3;
+            record.information[..3].copy_from_slice(&[state.regs[0], state.regs[1], state.regs[2]]);
+            BREAKPOINT
+        }
+        Exception::Trap { vector: 1, .. } => 0x8000_0004,
         Exception::Trap { vector: 6, .. } => ILLEGAL_INSTRUCTION,
         Exception::Trap { vector: 13, .. }
             if matches!(
@@ -112,7 +166,13 @@ pub fn normalize_context(record: &Record, state: &mut ArchitecturalState) {
         // exactly one byte for both CC and CD03: CD03 therefore points at03.
         // The handler must explicitly advance/edit this saved EIP to continue;
         // returning unchanged repeats CC just as on the owned native oracle.
-        state.eip = record.address;
+        state.eip = if record.count == 3 {
+            record.address - 1
+        } else {
+            record.address
+        };
+    } else if record.code == 0x8000_0004 {
+        state.eflags &= !0x100;
     } else {
         // All other supported hardware stops are fault-class exceptions. x86
         // saves RF=1 for faults (#PF/#GP/#UD/#DE); the native x86 DLL-init
