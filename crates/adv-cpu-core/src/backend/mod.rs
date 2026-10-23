@@ -243,6 +243,25 @@ pub trait Guest {
     ) -> Result<std::rc::Rc<dyn CounterStorage>, MemFault> {
         Err(MemFault { addr, len })
     }
+    /// Map `len` bytes of host file `fd` from `offset` at `addr`, shared with
+    /// every other mapping of the file. Data only: `prot` is READ, with WRITE
+    /// for a writable descriptor.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    fn map_shared_file(
+        &mut self,
+        addr: u32,
+        len: u32,
+        _fd: std::os::fd::BorrowedFd<'_>,
+        _offset: u64,
+        _prot: Prot,
+    ) -> Result<(), MemFault> {
+        Err(MemFault { addr, len })
+    }
     /// Alias worker-confined file data pages. COPY views share reads until the
     /// first write to each page, then retain a private page. No executable views.
     fn map_file_pages(

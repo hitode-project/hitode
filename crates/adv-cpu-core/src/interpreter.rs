@@ -1480,7 +1480,8 @@ fn predecode(i: &Instruction) -> Option<Action> {
         (dst.writable() && same_width(dst, src)).then_some((dst, src))
     };
     Some(match i.mnemonic() {
-        M::Nop | M::Pause => Action::Nop,
+        // ENDBR32 marks indirect branch targets for CET, never enabled here.
+        M::Nop | M::Pause | M::Endbr32 => Action::Nop,
         M::Cpuid => Action::Cpuid,
         M::Rdtsc => Action::Rdtsc,
         M::Xlatb => Action::Mov(Operand::Register(Reg::decode(R::AL)?), op(0)?, false),

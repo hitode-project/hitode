@@ -60,7 +60,8 @@ pub const FAST_READ: u8 = READ << 5;
 pub const FAST_WRITE: u8 = WRITE << 5;
 
 enum SharedPage {
-    Audio {
+    /// Host shared memory: PCM buffers, counters or a shared file view.
+    Storage {
         storage: Arc<SharedAllocation>,
         offset: usize,
     },
@@ -73,7 +74,7 @@ enum SharedPage {
 impl SharedPage {
     fn read_into(&self, offset: usize, out: &mut [u8]) -> Result<(), String> {
         match self {
-            Self::Audio {
+            Self::Storage {
                 storage,
                 offset: base,
             } => {
@@ -86,10 +87,13 @@ impl SharedPage {
 
     fn write(&mut self, offset: usize, bytes: &[u8]) -> Result<(), String> {
         match self {
-            Self::Audio {
+            Self::Storage {
                 storage,
                 offset: base,
             } => {
+                if !storage.writable() {
+                    return Err("write to a read-only shared file view".into());
+                }
                 storage.store_bytes(*base + offset, bytes);
             }
             Self::File {
@@ -108,14 +112,14 @@ impl SharedPage {
 
     fn file_page(&self) -> bool {
         match self {
-            Self::Audio { .. } => false,
+            Self::Storage { .. } => false,
             Self::File { .. } => true,
         }
     }
 
     fn identity(&self) -> (u8, usize, usize) {
         match self {
-            Self::Audio { storage, offset } => (0, Arc::as_ptr(storage) as usize, *offset),
+            Self::Storage { storage, offset } => (0, Arc::as_ptr(storage) as usize, *offset),
             Self::File { page, .. } => (1, std::rc::Rc::as_ptr(page) as usize, 0),
         }
     }
@@ -1064,7 +1068,10 @@ impl Memory {
         }
         let page = range.start / PAGE_SIZE;
         self.perms[page] & (WRITE | EXEC) == WRITE
-            && matches!(self.shared_pages.get(&page), Some(SharedPage::Audio { .. }))
+            && matches!(
+                self.shared_pages.get(&page),
+                Some(SharedPage::Storage { .. })
+            )
     }
 
     /// Distinct guest views can overlap physically. REP must retain its element
@@ -1166,7 +1173,7 @@ impl Memory {
         for (index, page) in pages.clone().enumerate() {
             self.shared_pages.insert(
                 page,
-                SharedPage::Audio {
+                SharedPage::Storage {
                     storage: storage.clone(),
                     offset: index * PAGE_SIZE,
                 },
@@ -1178,6 +1185,46 @@ impl Memory {
             .fill(READ | WRITE | SHARED | if cfg!(windows) { AUDIO } else { 0 });
         self.touch(addr, len);
         Ok(storage)
+    }
+
+    /// Maps `storage`, a shared file view, at `addr` with `perms` (READ,
+    /// and WRITE when the view is writable). Every guest access goes through
+    /// the view, so it sees the file's other mappings at once.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    pub fn map_shared_file(
+        &mut self,
+        addr: u32,
+        len: usize,
+        storage: Arc<SharedAllocation>,
+        perms: u8,
+    ) -> Result<(), String> {
+        let pages = self.pages(addr, len)?;
+        if self.reservation.is_none()
+            || perms & !(READ | WRITE) != 0
+            || perms & READ == 0
+            || self.mapped[pages.clone()].iter().any(|&mapped| mapped)
+        {
+            return Err("invalid or overlapping shared file mapping".into());
+        }
+        for (index, page) in pages.clone().enumerate() {
+            self.shared_pages.insert(
+                page,
+                SharedPage::Storage {
+                    storage: storage.clone(),
+                    offset: index * PAGE_SIZE,
+                },
+            );
+        }
+        Arc::make_mut(&mut self.mapped)[pages.clone()].fill(true);
+        self.fast.invalidate(pages.clone());
+        Arc::make_mut(&mut self.perms)[pages].fill(perms | SHARED);
+        self.touch(addr, len);
+        Ok(())
     }
 
     /// Prepared private bytes may execute without externally mutable code.

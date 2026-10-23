@@ -7,6 +7,8 @@ use std::sync::atomic::{AtomicU8, Ordering};
 pub struct SharedAllocation {
     mapping: os::Mapping,
     len: usize,
+    /// Host stores are allowed; a read-only file view refuses them.
+    writable: bool,
 }
 
 impl crate::backend::CounterStorage for Arc<SharedAllocation> {
@@ -31,7 +33,38 @@ impl SharedAllocation {
         Ok(Arc::new(Self {
             mapping: os::Mapping::new(len)?,
             len,
+            writable: true,
         }))
+    }
+
+    /// `len` bytes of the file `fd` from `offset`, shared with every other
+    /// mapping of the file, such as another process's or the in-process
+    /// Wine server's.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    pub fn map_file(
+        fd: std::os::fd::BorrowedFd<'_>,
+        offset: u64,
+        len: usize,
+        writable: bool,
+    ) -> Result<Arc<Self>, String> {
+        if len == 0 {
+            return Err("shared file view length must be nonzero".into());
+        }
+        Ok(Arc::new(Self {
+            mapping: os::Mapping::file(fd, offset, len, writable)?,
+            len,
+            writable,
+        }))
+    }
+
+    /// Whether host stores may reach the storage.
+    pub fn writable(&self) -> bool {
+        self.writable
     }
 
     pub fn load_u8(&self, index: usize) -> u8 {
@@ -49,7 +82,7 @@ impl SharedAllocation {
 
     #[cfg(any(test, feature = "testing"))]
     pub fn store_u8(&self, index: usize, value: u8) {
-        assert!(index < self.len);
+        assert!(self.writable && index < self.len);
         // SAFETY: same stable storage and byte-width access as load_u8; this
         // alias is writable. No mixed-width or non-atomic stores are permitted.
         unsafe {
@@ -68,6 +101,7 @@ impl SharedAllocation {
     }
 
     pub fn store_bytes(&self, offset: usize, input: &[u8]) {
+        assert!(self.writable, "store to a read-only shared view");
         assert!(
             offset
                 .checked_add(input.len())
@@ -278,25 +312,82 @@ mod os {
     pub(super) struct View {
         ptr: NonNull<u8>,
         len: usize,
+        /// Where the logical bytes start in the host-page-aligned mapping.
+        skip: usize,
+    }
+
+    fn host_page() -> Result<usize, String> {
+        // SAFETY: sysconf only queries the running host.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        usize::try_from(page)
+            .ok()
+            .filter(|&page| page != 0)
+            .ok_or_else(|| format!("query host page size: {page}"))
     }
 
     /// Each view owns an independent mapping of the same backing object. The
     /// descriptor is closed after construction; the mappings retain the object.
     impl Mapping {
         pub fn new(len: usize) -> Result<Self, String> {
-            // SAFETY: sysconf only queries the running host, including 16 KiB
-            // Android/macOS hosts. Guest pages remain independently 4 KiB.
-            let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-            let page = usize::try_from(page)
-                .ok()
-                .filter(|&page| page != 0)
-                .ok_or_else(|| format!("query shared PCM host page size: {page}"))?;
-            let len = mapping_len(len, page)?;
+            // Hosts may have 16 KiB pages; guest pages remain 4 KiB.
+            let len = mapping_len(len, host_page()?)?;
             let backing = Backing::new(c"adv-pcm", len)?;
             let write = View::new(&backing, len, libc::PROT_READ | libc::PROT_WRITE)?;
             let read = View::new(&backing, len, libc::PROT_READ)?;
             // OwnedFd closes here. On errors it also closes, and View drops any
             // completed mapping if creating the second view failed.
+            Ok(Self { read, write })
+        }
+
+        /// Two views of `len` bytes of `fd` from `offset`; the write view
+        /// is read-only unless `writable`. The views start at the host page
+        /// that holds `offset`.
+        pub fn file(
+            fd: std::os::fd::BorrowedFd<'_>,
+            offset: u64,
+            len: usize,
+            writable: bool,
+        ) -> Result<Self, String> {
+            use std::os::fd::AsRawFd;
+            let page = host_page()?;
+            let skip = (offset % page as u64) as usize;
+            let span = mapping_len(
+                len.checked_add(skip).ok_or("shared file view overflow")?,
+                page,
+            )?;
+            let start = libc::off_t::try_from(offset - skip as u64)
+                .map_err(|_| "shared file view offset overflow")?;
+            let view = |protection| {
+                // SAFETY: a fresh shared mapping at an address the host picks,
+                // owned by the View until its Drop.
+                let ptr = unsafe {
+                    libc::mmap(
+                        std::ptr::null_mut(),
+                        span,
+                        protection,
+                        libc::MAP_SHARED,
+                        fd.as_raw_fd(),
+                        start,
+                    )
+                };
+                if ptr == libc::MAP_FAILED {
+                    return Err(format!(
+                        "map shared file view: {}",
+                        std::io::Error::last_os_error()
+                    ));
+                }
+                Ok(View {
+                    ptr: NonNull::new(ptr.cast()).ok_or("map shared file view: null")?,
+                    len: span,
+                    skip,
+                })
+            };
+            let write = view(if writable {
+                libc::PROT_READ | libc::PROT_WRITE
+            } else {
+                libc::PROT_READ
+            })?;
+            let read = view(libc::PROT_READ)?;
             Ok(Self { read, write })
         }
     }
@@ -320,11 +411,12 @@ mod os {
         fn new(backing: &Backing, len: usize, protection: i32) -> Result<Self, String> {
             // SAFETY: independent view, owned by this View until its Drop.
             let ptr = unsafe { backing.map(None, protection)? };
-            Ok(Self { ptr, len })
+            Ok(Self { ptr, len, skip: 0 })
         }
 
         pub(super) fn as_ptr(&self) -> *mut u8 {
-            self.ptr.as_ptr()
+            // SAFETY: skip lies inside the mapping.
+            unsafe { self.ptr.as_ptr().add(self.skip) }
         }
     }
 

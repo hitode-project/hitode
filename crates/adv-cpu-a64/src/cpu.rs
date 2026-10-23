@@ -248,6 +248,28 @@ impl Guest for View<'_> {
             .privatize_copy_pages(addr, len as usize)
             .map_err(|_| fault(addr, len as usize))
     }
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    fn map_shared_file(
+        &mut self,
+        addr: u32,
+        len: u32,
+        fd: std::os::fd::BorrowedFd<'_>,
+        offset: u64,
+        prot: Prot,
+    ) -> Result<(), MemFault> {
+        let writable = prot.contains(Prot::WRITE);
+        adv_cpu_core::shared_memory::SharedAllocation::map_file(fd, offset, len as usize, writable)
+            .and_then(|storage| {
+                self.memory
+                    .map_shared_file(addr, len as usize, storage, prot.0)
+            })
+            .map_err(|_| fault(addr, len as usize))
+    }
     fn map_file_pages(
         &mut self,
         addr: u32,
@@ -361,6 +383,22 @@ macro_rules! forward {
 impl Guest for Cpu {
     fn wants_code_images(&self) -> bool {
         cfg!(native) && self.native
+    }
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    fn map_shared_file(
+        &mut self,
+        addr: u32,
+        len: u32,
+        fd: std::os::fd::BorrowedFd<'_>,
+        offset: u64,
+        prot: Prot,
+    ) -> Result<(), MemFault> {
+        self.view(|guest| guest.map_shared_file(addr, len, fd, offset, prot))
     }
     forward! {
         fn register_code_image(&mut self, image: adv_cpu_core::AotImage) -> ();

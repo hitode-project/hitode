@@ -278,7 +278,9 @@ pub fn plan(instruction: &Instruction) -> Option<Op> {
     }
     Some(match mnemonic {
         M::Nop => Op::Nop,
-        // Hints that never fault.
+        // Hints that never fault; ENDBR32 marks indirect branch targets for
+        // CET, which the guest never enables.
+        M::Endbr32 => Op::Nop,
         M::Prefetcht0 | M::Prefetcht1 | M::Prefetcht2 | M::Prefetchnta => Op::Nop,
         M::Cld => Op::Direction(false),
         M::Std => Op::Direction(true),

@@ -209,6 +209,28 @@ impl Guest for View<'_> {
             .privatize_copy_pages(addr, len as usize)
             .map_err(|_| fault(addr, len as usize))
     }
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    fn map_shared_file(
+        &mut self,
+        addr: u32,
+        len: u32,
+        fd: std::os::fd::BorrowedFd<'_>,
+        offset: u64,
+        prot: Prot,
+    ) -> Result<(), MemFault> {
+        let writable = prot.contains(Prot::WRITE);
+        crate::shared_memory::SharedAllocation::map_file(fd, offset, len as usize, writable)
+            .and_then(|storage| {
+                self.memory
+                    .map_shared_file(addr, len as usize, storage, prot.0)
+            })
+            .map_err(|_| fault(addr, len as usize))
+    }
     fn map_file_pages(
         &mut self,
         addr: u32,
@@ -372,6 +394,22 @@ impl Guest for JitCpu {
     }
     fn privatize_copy_pages(&mut self, addr: u32, len: u32) -> Result<(), MemFault> {
         self.view(|g| g.privatize_copy_pages(addr, len))
+    }
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    fn map_shared_file(
+        &mut self,
+        addr: u32,
+        len: u32,
+        fd: std::os::fd::BorrowedFd<'_>,
+        offset: u64,
+        prot: Prot,
+    ) -> Result<(), MemFault> {
+        self.view(|g| g.map_shared_file(addr, len, fd, offset, prot))
     }
     fn map_file_pages(
         &mut self,
