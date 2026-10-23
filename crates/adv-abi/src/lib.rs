@@ -1,4 +1,5 @@
 //! x86 calling conventions, generated signatures, typed guest values and API diagnostics.
+//! COM interface identity and guest reference counters live in [`com`].
 //! API behavior belongs to adv-win32/adv-dx; this crate never owns their state.
 //!
 //! Pointer parameters cannot accidentally become raw integer arguments:
@@ -23,6 +24,7 @@ pub use adv_machine::{EnvLeafHandler, LeafEnv, LeafHandler};
 #[doc(hidden)]
 pub mod capability;
 pub mod code_signature;
+pub mod com;
 pub mod constants;
 pub mod guest;
 pub mod ordinals;

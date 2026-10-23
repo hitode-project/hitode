@@ -61,8 +61,10 @@ impl Fixture {
         };
         // Admission-only assembly fixture: no GDI operation is performed on
         // this handle. Real canvas writeback is covered by the DC module.
-        state.provider.acquire_dc = |_, _, _, _, _| Ok(0x1910);
-        state.provider.writeback_dc = |_, _, _, _| Ok(());
+        state.provider.dc.create = |env, _, then| then(env, Ok(0x1910));
+        state.provider.dc.flush = |env, _, _, then| then(env, Ok(()));
+        state.provider.dc.release = |env, _, then| then(env, Ok(()));
+        state.provider.dc.discard = |_, _| {};
         m.cpu.map(STACK, 4096, Prot::RW).unwrap();
         m.cpu.map(0x400000, 4096, Prot::RX).unwrap();
         m.spawn("texture updates", 0x400000, &[], 65536).unwrap();

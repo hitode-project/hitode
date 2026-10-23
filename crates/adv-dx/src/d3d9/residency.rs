@@ -59,7 +59,7 @@ fn evict(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
     let identities: Vec<_> = env
         .sys
         .objects
-        .hosts_in::<adv_os::com::ComObject<Payload>>(com(env).namespace())
+        .hosts_in::<adv_abi::com::ComObject<Payload>>(com(env).namespace())
         .map(|(id, _)| id)
         .collect();
     let mut textures = Vec::new();

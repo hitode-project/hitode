@@ -29,7 +29,7 @@ RULES: dict[str, set[str]] = {
     "adv-os": {"adv-abi", "adv-pe"},
     "adv-device": {"adv-sync"},
     "adv-win32": {"adv-os", "adv-device"},
-    "adv-dx": {"adv-os", "adv-device"},
+    "adv-dx": {"adv-abi", "adv-device"},
     # Wine's server, run in process for the Wine userland stack (issue #58).
     "adv-wineserver": set(),
     # The NT platform under Wine's userland; it talks to the server through
@@ -51,7 +51,9 @@ RULES: dict[str, set[str]] = {
 }
 ALIASES: dict[str, str] = {}
 TEST_ONLY = {"adv-unicorn", "adv-samples"}
-TRANSITIONAL: dict[tuple[str, str], str] = {}
+TRANSITIONAL: dict[tuple[str, str], str] = {
+    ("adv-dx", "adv-os"): "non-graphics fronts still use old-stack services",
+}
 
 
 def role(name: str) -> str:

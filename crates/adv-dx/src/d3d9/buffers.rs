@@ -836,7 +836,7 @@ pub(super) fn has_outstanding_default(env: &Env<'_>, device: Id) -> bool {
     let com = com(env);
     env.sys
         .objects
-        .hosts_in::<adv_os::com::ComObject<Payload>>(com.namespace())
+        .hosts_in::<adv_abi::com::ComObject<Payload>>(com.namespace())
         .any(|(id, _)| {
             matches!(com.get_identity(&env.sys.objects, id),
             Some(Payload::Buffer(buffer)) if buffer.device == device && buffer.pool == 0

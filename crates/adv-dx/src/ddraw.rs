@@ -1,15 +1,14 @@
 //! DirectDraw: `DirectDrawCreate(Ex)` and the IDirectDraw, IDirectDrawSurface and
 //! IDirectDrawClipper objects. Objects and vtables live in guest memory from the surface
 //! arena, so a guest can read or patch them; every vtable slot points at a registry thunk.
-//! Pixels belong to the shared surface store; a surface lends GDI a DC from the shared table.
+//! Pixels belong to the shared surface store; assembly lends a memory DC over them.
 use std::collections::BTreeMap;
 
+use adv_abi::com::{Com as CommonCom, ComIdentity, QueryError};
 use adv_device::surface::{
     self, BlitOptions, BlitRect, PixelFormat, Presenter, Rect, SurfaceMemory, Surfaces,
 };
 use adv_machine::Objects;
-use adv_os::com::{Com as CommonCom, ComIdentity, QueryError};
-use adv_os::gdi::DeviceContexts;
 
 pub mod front;
 pub use front::{Provider, WindowGeometry, install, register};
@@ -474,7 +473,7 @@ impl DirectDraw {
             return Ok(0x80040110);
         }
         if ![
-            adv_os::com::IUNKNOWN,
+            adv_abi::com::IUNKNOWN,
             IID_DDRAW,
             IID_DDRAW2,
             IID_DDRAW4,
@@ -611,7 +610,6 @@ impl DirectDraw {
         id: u32,
         a: &[u32],
         surfaces: &mut Surfaces<P>,
-        dcs: &mut DeviceContexts,
         objects: &mut adv_machine::Objects,
         m: &mut dyn SurfaceMemory,
     ) -> Result<u32, String> {
@@ -1047,37 +1045,6 @@ impl DirectDraw {
                 surfaces.get_mut(dst).unwrap().pixels = surfaces[src].pixels;
                 surfaces.get_mut(src).unwrap().pixels = front;
                 surfaces.present_from(self.context, dst, m, surfaces[dst].rect())?;
-                0
-            }
-            api::SURFACE_DC => {
-                let Some(sid) = self.surface_id(objects, a[0]) else {
-                    return Ok(INVALID);
-                };
-                if surfaces[sid].locked.is_some() {
-                    return Ok(BUSY);
-                }
-                m.writable(a[1], 4)?;
-                let dc = surfaces.new_id();
-                if !dcs.create(objects, dc, sid) {
-                    return Ok(0x8007000e);
-                }
-                if let Err(error) = m.put_u32(a[1], dc) {
-                    dcs.remove(objects, dc);
-                    return Err(error);
-                }
-                0
-            }
-            api::SURFACE_RELEASE_DC => {
-                let Some(sid) = self.surface_id(objects, a[0]) else {
-                    return Ok(INVALID);
-                };
-                if dcs.get(objects, a[1]) != Some(sid) {
-                    return Ok(INVALID);
-                }
-                dcs.remove(objects, a[1]);
-                if surfaces.primary_id() == Some(sid) {
-                    surfaces.present_from(self.context, sid, m, surfaces[sid].rect())?;
-                }
                 0
             }
             api::BLT_FAST => {
