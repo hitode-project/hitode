@@ -5,7 +5,7 @@
 //! It needs `ADV_WINE_DIST` and `ADV_WINETEST_DIR`, the directory that holds
 //! `<module>_<test>.exe`; without them it is skipped. The server runs once
 //! per process, so each case runs in a child process of this test binary.
-#![cfg(target_vendor = "apple")]
+#![cfg(any(target_vendor = "apple", target_os = "android"))]
 
 use std::path::PathBuf;
 use std::process::Command;

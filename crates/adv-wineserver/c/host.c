@@ -21,8 +21,11 @@
 #include <time.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include <sys/resource.h>
+#ifdef __APPLE__
 #include <mach/mach.h>
 #include <mach/mach_time.h>
+#endif
 
 #define TICKS_PER_SEC 10000000
 
@@ -34,17 +37,17 @@ extern void hitode_host_exit( int status ) __attribute__((noreturn));
 extern const char *hitode_host_getenv( const char *name );
 extern const char *hitode_host_executable( void );
 extern const char *hitode_host_server_root( void );
-extern int pthread_fchdir_np( int fd );
 
 static int current_dir = AT_FDCWD;
 
-/* Wine constructs its per-user base here; the caller owns that directory. */
+/* Wine constructs its per-user base here, under /tmp or, on Android, the
+ * configuration directory; the caller owns that directory. */
 int hitode_asprintf( char **str, const char *format, ... )
 {
     va_list args;
     int ret;
 
-    if (!strcmp( format, "/tmp/.wine-%u" ))
+    if (!strcmp( format, "/tmp/.wine-%u" ) || !strcmp( format, "%s/.wineserver" ))
     {
         *str = strdup( hitode_host_server_root() );
         return *str ? strlen( *str ) : -1;
@@ -152,17 +155,42 @@ int hitode_chmod( const char *path, mode_t mode )
     return fchmodat( current_dir, path, mode, 0 );
 }
 
+#ifndef __APPLE__
+/* The name of the directory behind `fd`. */
+static int dir_path( int fd, char *dir )
+{
+    char link[32];
+    ssize_t len;
+
+    snprintf( link, sizeof(link), "/proc/self/fd/%d", fd );
+    if ((len = readlink( link, dir, PATH_MAX - 1 )) == -1) return -1;
+    dir[len] = 0;
+    return 0;
+}
+#endif
+
 char *hitode_realpath( const char *path, char *resolved )
 {
     char dir[PATH_MAX], *absolute, *ret;
 
+#ifdef __linux__
+    /* The server finds its data files relative to its own executable. */
+    if (!strcmp( path, "/proc/self/exe" )) return realpath( hitode_host_executable(), resolved );
+#endif
     if (path[0] == '/' || current_dir == AT_FDCWD) return realpath( path, resolved );
+#ifdef __APPLE__
     if (fcntl( current_dir, F_GETPATH, dir ) == -1) return NULL;
+#else
+    if (dir_path( current_dir, dir ) == -1) return NULL;
+#endif
     if (asprintf( &absolute, "%s/%s", dir, path ) == -1) return NULL;
     ret = realpath( absolute, resolved );
     free( absolute );
     return ret;
 }
+
+#ifdef __APPLE__
+extern int pthread_fchdir_np( int fd );
 
 /* Darwin has no bindat/connectat. Resolve relative Unix socket names on a
  * helper thread so neither the process nor the caller's thread cwd changes. */
@@ -199,23 +227,49 @@ static int socket_call_at( struct socket_call *call )
     errno = call->error;
     return call->ret;
 }
+#else
+/* Linux has no bindat/connectat either. A relative Unix socket name is
+ * reached through the directory's descriptor under /proc. */
+static int socket_call_at( int (*func)( int, const struct sockaddr *, socklen_t ), int fd,
+                           const struct sockaddr *addr )
+{
+    struct sockaddr_un at = { .sun_family = AF_UNIX };
+    const char *name = ((const struct sockaddr_un *)addr)->sun_path;
+
+    if (snprintf( at.sun_path, sizeof(at.sun_path), "/proc/self/fd/%d/%s", current_dir, name )
+        >= (int)sizeof(at.sun_path))
+    {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    return func( fd, (const struct sockaddr *)&at, sizeof(at) );
+}
+#endif
 
 int hitode_bind( int fd, const struct sockaddr *addr, socklen_t len )
 {
-    struct socket_call call = { bind, current_dir, fd, addr, len, 0, 0 };
-
-    if (addr->sa_family != AF_UNIX || ((const struct sockaddr_un *)addr)->sun_path[0] == '/')
+    if (addr->sa_family != AF_UNIX || ((const struct sockaddr_un *)addr)->sun_path[0] == '/'
+        || current_dir == AT_FDCWD)
         return bind( fd, addr, len );
+#ifdef __APPLE__
+    struct socket_call call = { bind, current_dir, fd, addr, len, 0, 0 };
     return socket_call_at( &call );
+#else
+    return socket_call_at( bind, fd, addr );
+#endif
 }
 
 int hitode_connect( int fd, const struct sockaddr *addr, socklen_t len )
 {
-    struct socket_call call = { connect, current_dir, fd, addr, len, 0, 0 };
-
-    if (addr->sa_family != AF_UNIX || ((const struct sockaddr_un *)addr)->sun_path[0] == '/')
+    if (addr->sa_family != AF_UNIX || ((const struct sockaddr_un *)addr)->sun_path[0] == '/'
+        || current_dir == AT_FDCWD)
         return connect( fd, addr, len );
+#ifdef __APPLE__
+    struct socket_call call = { connect, current_dir, fd, addr, len, 0, 0 };
     return socket_call_at( &call );
+#else
+    return socket_call_at( connect, fd, addr );
+#endif
 }
 
 /* The server asks once for ready descriptors. With none ready it returns to
@@ -315,6 +369,20 @@ time_t hitode_time( time_t *t )
     return now;
 }
 
+/* Priorities and limits belong to the host process, which Hitode owns. */
+int hitode_setpriority( int which, id_t who, int prio )
+{
+    errno = EPERM;
+    return -1;
+}
+
+int hitode_setrlimit( int resource, const struct rlimit *limit )
+{
+    errno = EPERM;
+    return -1;
+}
+
+#ifdef __APPLE__
 /* Nanoseconds with a 1:1 timebase. */
 uint64_t hitode_mach_continuous_time( void )
 {
@@ -363,3 +431,4 @@ int hitode_NSGetExecutablePath( char *buf, uint32_t *size )
     memcpy( buf, path, len );
     return 0;
 }
+#endif

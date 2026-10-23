@@ -20,8 +20,11 @@
 #include <time.h>
 #include <sys/time.h>
 #include <sys/wait.h>
+#include <sys/resource.h>
+#ifdef __APPLE__
 #include <mach/mach_types.h>
 #include <mach/mach_time.h>
+#endif
 
 int hitode_asprintf( char **str, const char *format, ... );
 int hitode_chdir( const char *path );
@@ -54,6 +57,9 @@ int hitode_usleep( useconds_t usec );
 int hitode_gettimeofday( struct timeval *tv, void *tz );
 int hitode_clock_gettime( clockid_t clock, struct timespec *ts );
 time_t hitode_time( time_t *t );
+int hitode_setpriority( int which, id_t who, int prio );
+int hitode_setrlimit( int resource, const struct rlimit *limit );
+#ifdef __APPLE__
 uint64_t hitode_mach_continuous_time( void );
 kern_return_t hitode_mach_timebase_info( mach_timebase_info_t info );
 kern_return_t hitode_thread_policy_set( thread_act_t thread, thread_policy_flavor_t flavor,
@@ -63,6 +69,7 @@ kern_return_t hitode_mach_port_extract_right( ipc_space_t task, mach_port_name_t
                                               mach_msg_type_name_t *acquired );
 kern_return_t hitode_mach_port_deallocate( ipc_space_t task, mach_port_name_t name );
 int hitode_NSGetExecutablePath( char *buf, uint32_t *size );
+#endif
 
 #define asprintf(...) hitode_asprintf(__VA_ARGS__)
 #define chdir(...) hitode_chdir(__VA_ARGS__)
@@ -96,11 +103,15 @@ int hitode_NSGetExecutablePath( char *buf, uint32_t *size );
 #define gettimeofday(...) hitode_gettimeofday(__VA_ARGS__)
 #define clock_gettime(...) hitode_clock_gettime(__VA_ARGS__)
 #define time(...) hitode_time(__VA_ARGS__)
+#define setpriority(...) hitode_setpriority(__VA_ARGS__)
+#define setrlimit(...) hitode_setrlimit(__VA_ARGS__)
+#ifdef __APPLE__
 #define mach_continuous_time(...) hitode_mach_continuous_time(__VA_ARGS__)
 #define mach_timebase_info(...) hitode_mach_timebase_info(__VA_ARGS__)
 #define thread_policy_set(...) hitode_thread_policy_set(__VA_ARGS__)
 #define mach_port_extract_right(...) hitode_mach_port_extract_right(__VA_ARGS__)
 #define mach_port_deallocate(...) hitode_mach_port_deallocate(__VA_ARGS__)
 #define _NSGetExecutablePath(...) hitode_NSGetExecutablePath(__VA_ARGS__)
+#endif
 
 #endif

@@ -20,7 +20,7 @@ use adv_pe::{ImportModule, ImportName};
 use crate::graphics::{frame_completed, guest_memory, install_store};
 
 pub mod driver;
-#[cfg(target_vendor = "apple")]
+#[cfg(any(target_vendor = "apple", target_os = "android"))]
 pub mod session;
 mod surface;
 

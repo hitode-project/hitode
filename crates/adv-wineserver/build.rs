@@ -5,7 +5,8 @@ use std::path::Path;
 fn main() {
     println!("cargo:rerun-if-changed=c");
     println!("cargo:rerun-if-changed=../../vendor/wine");
-    if std::env::var("CARGO_CFG_TARGET_VENDOR").as_deref() != Ok("apple") {
+    let apple = std::env::var("CARGO_CFG_TARGET_VENDOR").as_deref() == Ok("apple");
+    if !apple && std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("android") {
         return;
     }
     let wine = Path::new("../../vendor/wine");

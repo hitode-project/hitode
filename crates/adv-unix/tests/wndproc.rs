@@ -1,6 +1,6 @@
 //! The window procedure probe: user32 calls window procedures back
 //! through win32u.so, nested, while they draw and wait.
-#![cfg(target_vendor = "apple")]
+#![cfg(any(target_vendor = "apple", target_os = "android"))]
 
 #[path = "../../adv-nt/tests/common/mod.rs"]
 mod common;

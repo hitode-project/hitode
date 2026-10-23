@@ -10,8 +10,8 @@
 //! process. It listens on Wine's usual master socket, which clients find
 //! through [`Server::socket_dir`].
 //!
-//! Only Apple targets build the server for now; elsewhere the crate is empty.
-#![cfg(target_vendor = "apple")]
+//! Apple and Android targets build the server; elsewhere the crate is empty.
+#![cfg(any(target_vendor = "apple", target_os = "android"))]
 
 use std::cell::Cell;
 use std::ffi::{CStr, CString, c_char, c_int};

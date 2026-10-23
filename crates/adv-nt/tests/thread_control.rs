@@ -1,6 +1,6 @@
 //! The thread-control probe: a busy-wait on the tick count, and threads
 //! that are suspended, resumed and terminated by another.
-#![cfg(target_vendor = "apple")]
+#![cfg(any(target_vendor = "apple", target_os = "android"))]
 
 mod common;
 

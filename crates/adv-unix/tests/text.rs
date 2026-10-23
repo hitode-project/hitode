@@ -3,7 +3,7 @@
 //!
 //! Besides the Wine build, the test needs an i386 `libfreetype.so.6` in
 //! its `lib/wine/i386-unix` and the fonts in `share/wine/fonts`.
-#![cfg(target_vendor = "apple")]
+#![cfg(any(target_vendor = "apple", target_os = "android"))]
 
 #[path = "../../adv-nt/tests/common/mod.rs"]
 mod common;

@@ -1,6 +1,6 @@
 //! Virtual time reaches a timer armed after its waiter blocked, and alerts
 //! persist and coalesce before the waiting thread resumes.
-#![cfg(target_vendor = "apple")]
+#![cfg(any(target_vendor = "apple", target_os = "android"))]
 
 mod common;
 

@@ -1,7 +1,7 @@
 //! Our DirectDraw on the Wine userland: Wine's GDI draws text into a surface
 //! through the surface's DC, and the surface blitted to the primary reaches
 //! the presenter, sized to the window that Wine reported through our driver.
-#![cfg(target_vendor = "apple")]
+#![cfg(any(target_vendor = "apple", target_os = "android"))]
 
 #[path = "../../adv-nt/tests/common/mod.rs"]
 mod common;

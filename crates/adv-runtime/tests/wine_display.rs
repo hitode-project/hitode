@@ -3,7 +3,7 @@
 //! the program waits for messages, with nothing reading it back.
 //!
 //! It needs `ADV_WINE_DIST` and `ADV_WINE_PROBES`, as the probe tests do.
-#![cfg(target_vendor = "apple")]
+#![cfg(any(target_vendor = "apple", target_os = "android"))]
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};

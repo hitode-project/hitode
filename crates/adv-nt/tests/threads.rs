@@ -1,6 +1,6 @@
 //! The gate-2 probe: two threads wake each other, a wait times out, and a
 //! queued APC ends an alertable sleep.
-#![cfg(target_vendor = "apple")]
+#![cfg(any(target_vendor = "apple", target_os = "android"))]
 
 mod common;
 

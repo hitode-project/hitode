@@ -1,5 +1,5 @@
 //! A new process registers its first thread with the in-process server.
-#![cfg(target_vendor = "apple")]
+#![cfg(any(target_vendor = "apple", target_os = "android"))]
 
 use std::cell::Cell;
 use std::path::PathBuf;

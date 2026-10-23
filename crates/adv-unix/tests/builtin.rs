@@ -1,5 +1,5 @@
 //! Wine loads a test-only host module in place of its own version.dll.
-#![cfg(target_vendor = "apple")]
+#![cfg(any(target_vendor = "apple", target_os = "android"))]
 
 #[path = "../../adv-nt/tests/common/mod.rs"]
 mod common;

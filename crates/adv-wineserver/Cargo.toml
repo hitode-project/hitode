@@ -7,11 +7,11 @@ rust-version.workspace = true
 license = "GPL-3.0-or-later AND LGPL-2.1-or-later"
 publish.workspace = true
 
-[target.'cfg(target_vendor = "apple")'.dependencies]
+[target.'cfg(any(target_vendor = "apple", target_os = "android"))'.dependencies]
 corosensei = "0.3"
 thiserror.workspace = true
 
-[target.'cfg(target_vendor = "apple")'.dev-dependencies]
+[target.'cfg(any(target_vendor = "apple", target_os = "android"))'.dev-dependencies]
 libc = "0.2"
 
 [build-dependencies]

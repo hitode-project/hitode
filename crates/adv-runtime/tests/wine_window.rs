@@ -1,6 +1,6 @@
 //! GDI paints a window on the Wine userland: our driver gives the window a
 //! surface over store pixels, and its flush reaches the presenter.
-#![cfg(target_vendor = "apple")]
+#![cfg(any(target_vendor = "apple", target_os = "android"))]
 
 #[path = "../../adv-nt/tests/common/mod.rs"]
 mod common;

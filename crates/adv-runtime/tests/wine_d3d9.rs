@@ -1,7 +1,7 @@
 //! Our Direct3D 9 on the Wine userland: Wine's GDI draws text into an
 //! offscreen plain surface through the surface's DC, and the surface copied to
 //! the back buffer and presented reaches the presenter.
-#![cfg(all(target_vendor = "apple", feature = "gpu"))]
+#![cfg(all(any(target_vendor = "apple", target_os = "android"), feature = "gpu"))]
 
 #[path = "../../adv-nt/tests/common/mod.rs"]
 mod common;

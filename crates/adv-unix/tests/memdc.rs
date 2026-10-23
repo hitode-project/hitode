@@ -1,6 +1,6 @@
 //! The memory-DC probe: gdi32 and win32u.so draw into caller-owned pixels
 //! through `D3DKMTCreateDCFromMemory`.
-#![cfg(target_vendor = "apple")]
+#![cfg(any(target_vendor = "apple", target_os = "android"))]
 
 #[path = "../../adv-nt/tests/common/mod.rs"]
 mod common;

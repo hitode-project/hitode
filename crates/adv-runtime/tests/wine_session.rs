@@ -2,7 +2,7 @@
 //! whose completions wake the run loop.
 //!
 //! It needs `ADV_WINE_DIST` and `ADV_WINE_PROBES`, as the probe tests do.
-#![cfg(all(target_vendor = "apple", feature = "gpu"))]
+#![cfg(all(any(target_vendor = "apple", target_os = "android"), feature = "gpu"))]
 
 use std::fs::File;
 use std::io::Read;

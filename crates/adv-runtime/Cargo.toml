@@ -28,7 +28,7 @@ iced-x86 = { version = "1.21", default-features = false, features = ["std", "dec
 adv-nt = { path = "../adv-nt" }
 adv-unix = { path = "../adv-unix" }
 
-[target.'cfg(target_vendor = "apple")'.dependencies]
+[target.'cfg(any(target_vendor = "apple", target_os = "android"))'.dependencies]
 adv-wineserver = { path = "../adv-wineserver" }
 log.workspace = true
 
@@ -40,7 +40,7 @@ adv-samples = { path = "../adv-samples" }
 iced-x86 = { version = "1.21", default-features = false, features = ["std", "code_asm"] }
 png = "0.17"
 
-[target.'cfg(target_vendor = "apple")'.dev-dependencies]
+[target.'cfg(any(target_vendor = "apple", target_os = "android"))'.dev-dependencies]
 libc = "0.2"
 pollster = "0.4"
 

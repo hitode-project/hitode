@@ -1,7 +1,7 @@
 //! Wine's ntdll.dll starts the gate-1 probe: the loader loads its imports
 //! and a library and runs its TLS callback; it sleeps, waits, and resumes
 //! from a fault, and its main thread has the stack its image asks for.
-#![cfg(target_vendor = "apple")]
+#![cfg(any(target_vendor = "apple", target_os = "android"))]
 
 mod common;
 
