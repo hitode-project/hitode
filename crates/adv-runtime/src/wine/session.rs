@@ -174,6 +174,9 @@ impl Session {
             .cpu
             .set_waker(wake.clone())
             .map_err(|e| e.to_string())?;
+        // A program may compute without waiting for as long as it likes, as on
+        // the built-in stack; the backend's default watchdog is for tests.
+        machine.set_execution_budget(None);
         adv_unix::install(&mut machine);
         super::install(&mut machine, &prefix, config.width, config.height)?;
         prepare(&mut machine)?;

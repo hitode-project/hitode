@@ -24,6 +24,7 @@ const CASES: &[&str] = &[
     "gdi32_pen",
     "kernel32_atom",
     "kernel32_codepage",
+    "kernel32_format_msg",
     "msvcrt_heap",
     "msvcrt_locale",
     "msvcrt_string",
