@@ -175,6 +175,7 @@ fn published_thunk_copy_uses_the_leaf_route_and_remains_patchable() {
         return_floor: DATA + 0x3e00,
         unwindable: false,
         then: Box::new(|_, _| Outcome::Return(0)),
+        callee_saved: [0; 4],
         origin: crate::sched::Origin {
             esp: DATA + 0x3ff0,
             ret_eip: PARK_ADDR,

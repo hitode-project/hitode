@@ -8,6 +8,8 @@
 pub use crate::objects::Objects;
 use std::any::Any;
 
+use adv_cpu::backend::Reg;
+
 use crate::outcome::{Continuation, DeferredContinuation, WakeReason};
 
 pub type CtxId = u32;
@@ -218,7 +220,13 @@ pub(crate) struct Frame {
     pub unwindable: bool,
     pub then: Continuation,
     pub origin: Origin,
+    /// EBX, EBP, ESI and EDI when the call began, which a callee that
+    /// returns preserves and [`crate::Outcome::ReturnFromCall`] restores.
+    pub callee_saved: [u32; 4],
 }
+
+/// The registers a guest callee preserves.
+pub(crate) const CALLEE_SAVED: [Reg; 4] = [Reg::Ebx, Reg::Ebp, Reg::Esi, Reg::Edi];
 
 pub(crate) enum ReadyResume {
     Woke {
@@ -272,7 +280,7 @@ pub struct Context {
     pub stack_hi: u32,
     /// Initial ESP/EIP, consumed when the register image is first materialized.
     pub(crate) start: Option<(u32, u32)>,
-    pub(crate) initial_registers: Vec<(adv_cpu::backend::Reg, u32)>,
+    pub(crate) initial_registers: Vec<(Reg, u32)>,
     /// Execution storage is reclaimable independently of the thread identity.
     pub(crate) storage: Option<ContextStorage>,
     /// One-shot process bootstrap, consumed only by an actual scheduler selection.

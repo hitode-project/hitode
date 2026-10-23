@@ -1258,6 +1258,7 @@ fn apply(
                     "guest call to {target:#x}: stack write failed: {e}"
                 )));
             }
+            let callee_saved = sched::CALLEE_SAVED.map(|reg| cpu.reg(reg));
             cpu.set_reg(Reg::Esp, sp);
             cpu.set_reg(Reg::Eip, target);
             sys.next_frame_id = id;
@@ -1268,6 +1269,7 @@ fn apply(
                 unwindable,
                 then,
                 origin,
+                callee_saved,
             });
             Ok(())
         }
@@ -1286,12 +1288,16 @@ fn apply(
             let Some(Frame {
                 then,
                 origin: outer,
+                callee_saved,
                 ..
             }) = sys.contexts[context].frames.pop()
             else {
                 unreachable!()
             };
             cpu.set_reg(Reg::Esp, outer.esp);
+            for (reg, value) in sched::CALLEE_SAVED.into_iter().zip(callee_saved) {
+                cpu.set_reg(reg, value);
+            }
             let out = then(
                 &mut Env {
                     context: sys.current,
