@@ -4,7 +4,7 @@
 //!
 //! A DirectDraw surface's DC comes from `D3DKMTCreateDCFromMemory` over the
 //! surface's own pixels, called through the image's IAT so that a guest hook
-//! sees it. Window geometry needs the user driver and is not provided yet.
+//! sees it. Window geometry comes from the user driver in [`driver`].
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -18,6 +18,11 @@ use adv_machine::{Env, Machine, Outcome};
 use adv_pe::{ImportModule, ImportName};
 
 use crate::graphics::{frame_completed, guest_memory, install_store};
+
+pub mod driver;
+
+/// The display driver to name in the process's startup parameters.
+pub const GRAPHICS_DRIVER: &str = driver::MODULE;
 
 const DDRAW: &str = "ddraw.dll";
 const GDI32: &str = "gdi32.dll";
@@ -43,10 +48,12 @@ const SLOT: u32 = 64;
 
 pub fn register(registry: &mut Registry) {
     adv_dx::ddraw::register(registry);
+    driver::register(registry);
 }
 
-/// Install the surface store and DirectDraw, and put the DirectDraw image in
-/// `prefix` in place of Wine's. Call before the process starts.
+/// Install the surface store, DirectDraw and the user driver, and put their
+/// images in `prefix`, DirectDraw's in place of Wine's. Call before the
+/// process starts with [`GRAPHICS_DRIVER`].
 pub fn install<B: Backend>(
     machine: &mut Machine<B>,
     prefix: &Path,
@@ -59,7 +66,7 @@ pub fn install<B: Backend>(
         adv_dx::ddraw::Provider {
             dc: memory_dc(),
             memory: guest_memory,
-            window: |_, _, _| None,
+            window: driver::geometry,
             completed: frame_completed,
         },
     )?;
@@ -83,6 +90,8 @@ pub fn install<B: Backend>(
     }];
     let image = ModuleImage::build(machine, DDRAW, &exports, &imports)?;
     adv_unix::builtin::install(prefix, &image).map_err(|e| e.to_string())?;
+    let driver = driver::image(machine)?;
+    adv_unix::builtin::install(prefix, &driver).map_err(|e| e.to_string())?;
     Ok(())
 }
 

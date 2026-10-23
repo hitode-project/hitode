@@ -100,14 +100,15 @@ pub fn run_probe_with_prefix(
     resolver: impl Resolver,
     prepare: impl FnOnce(&mut Machine<Cpu>, &std::path::Path),
 ) -> Option<(RunResult, String)> {
-    run_probe_inspect(name, real_time, resolver, prepare, |_| {})
+    run_probe_inspect(name, real_time, "null", resolver, prepare, |_| {})
 }
 
-/// [`run_probe_with_prefix`], with `inspect` looking at the machine after the
-/// process ends.
+/// [`run_probe_with_prefix`] with Wine's display driver `graphics_driver`,
+/// and `inspect` looking at the machine after the process ends.
 pub fn run_probe_inspect(
     name: &str,
     real_time: bool,
+    graphics_driver: &str,
     resolver: impl Resolver,
     prepare: impl FnOnce(&mut Machine<Cpu>, &std::path::Path),
     inspect: impl FnOnce(&mut Machine<Cpu>),
@@ -192,7 +193,7 @@ pub fn run_probe_inspect(
         stdin: None,
         stdout: Some(stdout.as_raw_fd()),
         stderr: None,
-        graphics_driver: "null",
+        graphics_driver,
     };
     let started = process::start(
         &mut machine,

@@ -77,6 +77,11 @@ Entries carry no 8.3 names, as on a volume that does not make them.
 **Rule**: For the current process, `NtFlushInstructionCache` MUST return success after prior guest writes become visible to instruction execution.
 **Verification**: Test
 
+### WINE-SYS-8 Same mapped files
+
+**Rule**: `NtAreMappedFilesTheSame` MUST succeed for two addresses in one view, and otherwise MUST ask the server whether two image views map one file. A private allocation MUST give `STATUS_CONFLICTING_ADDRESSES`.
+**Verification**: Test
+
 ## Unix libraries
 
 ### WINE-UNIX-1 Guest ELF libraries
@@ -159,4 +164,9 @@ FreeType is such a library: win32u opens it by name and draws TrueType text thro
 ### WINE-GFX-2 Presented GDI drawing
 
 **Rule**: What Wine's GDI draws into a DirectDraw surface MUST reach the presenter when the surface is blitted to the primary surface.
+**Verification**: Test
+
+### WINE-GFX-3 Window association
+
+**Rule**: Wine MUST load our user driver by the display device's `GraphicsDriver` name. Its DllMain MUST hand win32u a function table, leaving the rest to Wine's null driver. Window geometry that DirectDraw uses MUST come from the window rectangles win32u reports to the driver.
 **Verification**: Test

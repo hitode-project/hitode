@@ -256,6 +256,13 @@ pub fn map_shared_view(
     Ok(base)
 }
 
+/// The base and kind of the region that holds `address`.
+pub fn region(memory: &mut Memory, address: u32) -> Option<(u32, Kind)> {
+    memory
+        .region_of(address)
+        .map(|(base, region)| (base, region.kind))
+}
+
 /// The base of the section view that holds `address`.
 pub fn view_base(memory: &mut Memory, address: u32) -> Option<u32> {
     memory

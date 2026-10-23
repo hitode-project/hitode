@@ -13,6 +13,7 @@ pub const INVALID_HANDLE: Status = 0xc000_0008;
 pub const INVALID_PARAMETER: Status = 0xc000_000d;
 pub const NO_MEMORY: Status = 0xc000_0017;
 pub const CONFLICTING_ADDRESSES: Status = 0xc000_0018;
+pub const INVALID_ADDRESS: Status = 0xc000_0141;
 pub const NOT_MAPPED_VIEW: Status = 0xc000_0019;
 pub const UNABLE_TO_FREE_VM: Status = 0xc000_001a;
 pub const NOT_COMMITTED: Status = 0xc000_002d;

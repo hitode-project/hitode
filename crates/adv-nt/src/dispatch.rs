@@ -26,6 +26,7 @@ const IMPLEMENTED: &[(&str, Syscall)] = &[
         token::allocate_locally_unique_id,
     ),
     ("NtAllocateVirtualMemory", memory::allocate),
+    ("NtAreMappedFilesTheSame", section::are_same),
     ("NtCallbackReturn", win32k::callback_return),
     ("NtClose", object::close),
     ("NtContinue", exception::resume),

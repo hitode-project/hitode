@@ -399,6 +399,33 @@ impl Request for MapViewRequest {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
+pub struct IsSameMappingRequest {
+    pub header: RequestHeader,
+    pub _pad0: [u8; 4],
+    pub base1: u64,
+    pub base2: u64,
+}
+const _: () = assert!(size_of::<IsSameMappingRequest>() == 32);
+const _: () = assert!(std::mem::offset_of!(IsSameMappingRequest, base1) == 16);
+const _: () = assert!(std::mem::offset_of!(IsSameMappingRequest, base2) == 24);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IsSameMappingReply {
+    pub header: ReplyHeader,
+}
+const _: () = assert!(size_of::<IsSameMappingReply>() == 8);
+
+impl Request for IsSameMappingRequest {
+    const NUMBER: i32 = 74;
+    type Reply = IsSameMappingReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct UnmapViewRequest {
     pub header: RequestHeader,
     pub _pad0: [u8; 4],

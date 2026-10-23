@@ -11,8 +11,8 @@ use crate::image;
 use crate::memory::{self, CURRENT_PROCESS, Memory};
 use crate::object::{Attributes, read_u32, write_bytes, write_u32};
 use crate::protocol::{
-    CreateMappingRequest, GetMappingInfoRequest, MapImageViewRequest, MapViewRequest,
-    OpenMappingRequest, UnmapViewRequest,
+    CreateMappingRequest, GetMappingInfoRequest, IsSameMappingRequest, MapImageViewRequest,
+    MapViewRequest, OpenMappingRequest, UnmapViewRequest,
 };
 use crate::server;
 use crate::status::{self, Error, Status};
@@ -462,6 +462,36 @@ pub fn unmap_view(env: &mut Env<'_>, args: &[u32]) -> Outcome {
 }
 
 /// Maps the image of section `mapping`, as Wine's `virtual_map_image`.
+/// NtAreMappedFilesTheSame(address1, address2), as Wine's: success when both
+/// lie in one view or in image views of one file.
+pub fn are_same(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    let &[first, second] = args else {
+        unreachable!()
+    };
+    status::finish((|| {
+        let memory = env.ext.get_or_default::<Memory>();
+        let (Some(first), Some(second)) = (
+            memory::region(memory, first),
+            memory::region(memory, second),
+        ) else {
+            return Err(status::INVALID_ADDRESS.into());
+        };
+        if first.1 == memory::Kind::Private || second.1 == memory::Kind::Private {
+            return Err(status::CONFLICTING_ADDRESSES.into());
+        }
+        if first.0 == second.0 {
+            return Ok(());
+        }
+        let mut request = IsSameMappingRequest {
+            base1: u64::from(first.0),
+            base2: u64::from(second.0),
+            ..Default::default()
+        };
+        let (reply, _) = server::request(env, &mut request, &[], &mut [])?;
+        status::check(reply.header.error)
+    })())
+}
+
 pub fn map_image(env: &mut Env<'_>, mapping: u32) -> Result<View, Error> {
     let mut request = GetMappingInfoRequest {
         handle: mapping,

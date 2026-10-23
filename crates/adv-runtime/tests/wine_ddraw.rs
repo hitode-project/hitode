@@ -1,6 +1,6 @@
 //! Our DirectDraw on the Wine userland: Wine's GDI draws text into a surface
 //! through the surface's DC, and the surface blitted to the primary reaches
-//! the presenter.
+//! the presenter, sized to the window that Wine reported through our driver.
 #![cfg(target_vendor = "apple")]
 
 #[path = "../../adv-nt/tests/common/mod.rs"]
@@ -31,7 +31,7 @@ fn count(bgra: &[u8], stride: usize, width: usize, height: usize, color: [u8; 3]
         .count()
 }
 
-// spec: WINE-GFX-1, WINE-GFX-2
+// spec: WINE-GFX-1, WINE-GFX-2, WINE-GFX-3, WINE-SYS-8
 #[test]
 fn wine_gdi_draws_into_directdraw_surfaces_that_reach_the_presenter() {
     let mut registry = Registry::default();
@@ -40,6 +40,7 @@ fn wine_gdi_draws_into_directdraw_surfaces_that_reach_the_presenter() {
     let Some((result, output)) = common::run_probe_inspect(
         "ddraw.exe",
         false,
+        adv_runtime::wine::GRAPHICS_DRIVER,
         Platform(registry),
         |machine, prefix| {
             adv_unix::install(machine);
@@ -49,6 +50,7 @@ fn wine_gdi_draws_into_directdraw_surfaces_that_reach_the_presenter() {
             let frame = &machine.ext.get::<SurfaceStore>().presenter;
             let stride = frame.width as usize;
             presented = Some((
+                (frame.width, frame.height),
                 frame.frames,
                 count(&frame.bgra, stride, 64, 32, [0xff, 0xff, 0xff]),
                 count(&frame.bgra, stride, 64, 32, [0xff, 0, 0]),
@@ -69,7 +71,10 @@ fn wine_gdi_draws_into_directdraw_surfaces_that_reach_the_presenter() {
              background=2005 other=0 blitted=0"
         ]
     );
-    let (frames, inked, background) = presented.unwrap();
+    let (size, frames, inked, background) = presented.unwrap();
     assert!(frames >= 1, "no frame was presented");
+    // The driver reported the probe window's client area, and the
+    // cooperative level sized the presented frame to it.
+    assert_eq!(size, (64, 32));
     assert_eq!((inked, background), (43, 2005));
 }

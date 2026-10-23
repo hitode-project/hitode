@@ -36,6 +36,7 @@ REQUESTS = [
     "get_mapping_info",
     "map_image_view",
     "map_view",
+    "is_same_mapping",
     "unmap_view",
     "open_key",
     "create_key",

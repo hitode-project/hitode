@@ -36,6 +36,74 @@ struct Entries {
     images: HashMap<String, Arc<Vec<ImportModule>>>,
 }
 
+/// Entry code for host functions, one stub per thunk.
+#[derive(Default)]
+struct Stubs {
+    code_rva: u32,
+    code: Vec<u8>,
+    entries: Vec<u32>,
+    relocations: Vec<u32>,
+    rvas: HashMap<u32, u32>,
+}
+
+impl Stubs {
+    /// The RVA of the stub that enters the host function `module!name`.
+    fn entry<B: Backend>(
+        &mut self,
+        machine: &mut Machine<B>,
+        module: &str,
+        name: &str,
+    ) -> Result<u32, String> {
+        if machine
+            .sys
+            .thunks
+            .resolver()
+            .host_fn(module, name)
+            .is_none()
+        {
+            return Err(format!("host function not registered: {module}!{name}"));
+        }
+        machine
+            .sys
+            .thunks
+            .publish(&mut machine.cpu, module, name)
+            .map_err(|e| e.to_string())?;
+        let canonical = machine.sys.thunks.resolver().canonical_name(module, name);
+        let index = machine
+            .sys
+            .thunks
+            .published_index(module, canonical.as_deref().unwrap_or(name))
+            .unwrap();
+        if let Some(&rva) = self.rvas.get(&index) {
+            return Ok(rva);
+        }
+        let code = &mut self.code;
+        let thunk = machine.sys.thunks.get(index);
+        let rva = self.code_rva + u32::try_from(code.len()).map_err(|e| e.to_string())?;
+        // Relocatable hotpatch prologue, then the same transport as the
+        // machine's ordinary thunks. This entry enters the host body.
+        code.extend_from_slice(&[0x8b, 0xff, 0x55, 0x8b, 0xec, 0x5d]);
+        // EDX is volatile under every registered convention. A relocated
+        // guest image base survives copying this entry into a detour.
+        code.push(0xba); // mov edx, image_base
+        self.relocations.push(self.code_rva + code.len() as u32);
+        code.extend_from_slice(&IMAGE_BASE.to_le_bytes());
+        code.push(0x68);
+        code.extend_from_slice(&thunk.transport_token.unwrap().word().to_le_bytes());
+        code.extend_from_slice(&[0xcd, adv_cpu::backend::asm::TRAP_VECTOR]);
+        self.entries.push(index);
+        match thunk.f.conv {
+            Conv::Cdecl { .. } | Conv::CdeclVariadic { .. } => code.push(0xc3),
+            Conv::Stdcall { argc } => {
+                code.push(0xc2);
+                code.extend_from_slice(&(u16::from(argc) * 4).to_le_bytes());
+            }
+        }
+        self.rvas.insert(index, rva);
+        Ok(rva)
+    }
+}
+
 impl ModuleImage {
     /// Publish the named host functions and write their PE entries. The input
     /// import modules declare names/ordinals; their `iat_rva` fields are ignored.
@@ -45,78 +113,46 @@ impl ModuleImage {
         exports: &[Export<'_>],
         imports: &[ImportModule],
     ) -> Result<Self, String> {
+        Self::build_with_entry(machine, module, None, exports, imports)
+    }
+
+    /// [`Self::build`], with the host function `entry` (stdcall, three
+    /// arguments) as the image's DllMain.
+    pub fn build_with_entry<B: Backend>(
+        machine: &mut Machine<B>,
+        module: &str,
+        entry: Option<&str>,
+        exports: &[Export<'_>],
+        imports: &[ImportModule],
+    ) -> Result<Self, String> {
         let name = module.to_ascii_lowercase();
-        if !name.ends_with(".dll") || name.contains(['/', '\\', ':']) {
+        if !(name.ends_with(".dll") || name.ends_with(".drv")) || name.contains(['/', '\\', ':']) {
             return Err("a host module needs a DLL file name".into());
         }
         let mut writer = DllWriter::new(&name, IMAGE_BASE);
-        let code_rva = writer.next_rva();
-        let mut code = Vec::new();
+        let mut stubs = Stubs {
+            code_rva: writer.next_rva(),
+            ..Stubs::default()
+        };
         let mut pe_exports = Vec::new();
-        let mut entries = Vec::new();
-        let mut relocations = Vec::new();
-        let mut rvas = HashMap::new();
         for export in exports {
-            if machine
-                .sys
-                .thunks
-                .resolver()
-                .host_fn(&name, export.name)
-                .is_none()
-            {
-                return Err(format!(
-                    "host function not registered: {name}!{}",
-                    export.name
-                ));
-            }
-            machine
-                .sys
-                .thunks
-                .publish(&mut machine.cpu, &name, export.name)
-                .map_err(|e| e.to_string())?;
-            let canonical = machine
-                .sys
-                .thunks
-                .resolver()
-                .canonical_name(&name, export.name);
-            let index = machine
-                .sys
-                .thunks
-                .published_index(&name, canonical.as_deref().unwrap_or(export.name))
-                .unwrap();
-            let rva = if let Some(&rva) = rvas.get(&index) {
-                rva
-            } else {
-                let thunk = machine.sys.thunks.get(index);
-                let rva = code_rva + u32::try_from(code.len()).map_err(|e| e.to_string())?;
-                // Relocatable hotpatch prologue, then the same transport as the
-                // machine's ordinary thunks. This entry enters the host body.
-                code.extend_from_slice(&[0x8b, 0xff, 0x55, 0x8b, 0xec, 0x5d]);
-                // EDX is volatile under every registered convention. A relocated
-                // guest image base survives copying this entry into a detour.
-                code.push(0xba); // mov edx, image_base
-                relocations.push(code_rva + code.len() as u32);
-                code.extend_from_slice(&IMAGE_BASE.to_le_bytes());
-                code.push(0x68);
-                code.extend_from_slice(&thunk.transport_token.unwrap().word().to_le_bytes());
-                code.extend_from_slice(&[0xcd, adv_cpu::backend::asm::TRAP_VECTOR]);
-                entries.push(index);
-                match thunk.f.conv {
-                    Conv::Cdecl { .. } | Conv::CdeclVariadic { .. } => code.push(0xc3),
-                    Conv::Stdcall { argc } => {
-                        code.push(0xc2);
-                        code.extend_from_slice(&(u16::from(argc) * 4).to_le_bytes());
-                    }
-                }
-                rvas.insert(index, rva);
-                rva
-            };
+            let rva = stubs.entry(machine, &name, export.name)?;
             pe_exports.push(adv_pe::Export {
                 name: Some(export.name.into()),
                 ordinal: export.ordinal,
                 target: ExportTarget::Rva(rva),
             });
         }
+        if let Some(entry) = entry {
+            let rva = stubs.entry(machine, &name, entry)?;
+            writer.set_entry(rva);
+        }
+        let Stubs {
+            code,
+            entries,
+            relocations,
+            ..
+        } = stubs;
         let result = (|| -> Result<_, PeError> {
             let len = code.len() as u32;
             writer.section(
