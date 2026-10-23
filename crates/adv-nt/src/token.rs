@@ -56,3 +56,22 @@ pub fn allocate_locally_unique_id(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         Ok(write_bytes(env, args[0], &reply.luid)?)
     })())
 }
+
+/// NtOpenProcessToken(process, access, *handle)
+pub fn open_process(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    let &[process, access, handle] = args else {
+        unreachable!()
+    };
+    status::finish((|| {
+        write_u32(env, handle, 0)?;
+        let mut request = crate::protocol::OpenTokenRequest {
+            handle: process,
+            access,
+            ..Default::default()
+        };
+        let (reply, _) = server::request(env, &mut request, &[], &mut [])?;
+        status::check(reply.header.error)?;
+        write_u32(env, handle, reply.token)?;
+        Ok(())
+    })())
+}

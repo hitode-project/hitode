@@ -28,6 +28,7 @@ const CASES: &[&str] = &[
     "msvcrt_heap",
     "msvcrt_locale",
     "msvcrt_string",
+    "msvcrt_time",
     "ntdll_atom",
     "ntdll_env",
     "ntdll_error",

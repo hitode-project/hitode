@@ -47,7 +47,10 @@ const IMPLEMENTED: &[(&str, Syscall)] = &[
     ("NtOpenFile", file::open),
     ("NtOpenKey", registry::open),
     ("NtOpenKeyEx", registry::open_ex),
+    ("NtOpenProcess", information::open_process),
+    ("NtOpenProcessToken", token::open_process),
     ("NtOpenSection", section::open),
+    ("NtOpenThread", information::open_thread),
     ("NtFindAtom", atom::find),
     ("NtFreeVirtualMemory", memory::free),
     ("NtFlushInstructionCache", memory::flush_instruction_cache),
@@ -67,6 +70,7 @@ const IMPLEMENTED: &[(&str, Syscall)] = &[
     ("NtQueryInformationThread", information::query_thread),
     ("NtQueryInformationToken", token::query),
     ("NtQueryKey", registry::query),
+    ("NtQueryObject", object::query),
     ("NtQuerySection", section::query),
     ("NtQuerySystemInformation", system::query),
     (
