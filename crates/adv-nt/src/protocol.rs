@@ -1260,6 +1260,279 @@ impl Request for ReleaseMutexRequest {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
+pub struct CreateSemaphoreRequest {
+    pub header: RequestHeader,
+    pub access: u32,
+    pub initial: u32,
+    pub max: u32,
+}
+const _: () = assert!(size_of::<CreateSemaphoreRequest>() == 24);
+const _: () = assert!(std::mem::offset_of!(CreateSemaphoreRequest, access) == 12);
+const _: () = assert!(std::mem::offset_of!(CreateSemaphoreRequest, initial) == 16);
+const _: () = assert!(std::mem::offset_of!(CreateSemaphoreRequest, max) == 20);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CreateSemaphoreReply {
+    pub header: ReplyHeader,
+    pub handle: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<CreateSemaphoreReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(CreateSemaphoreReply, handle) == 8);
+
+impl Request for CreateSemaphoreRequest {
+    const NUMBER: i32 = 40;
+    type Reply = CreateSemaphoreReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OpenSemaphoreRequest {
+    pub header: RequestHeader,
+    pub access: u32,
+    pub attributes: u32,
+    pub rootdir: u32,
+}
+const _: () = assert!(size_of::<OpenSemaphoreRequest>() == 24);
+const _: () = assert!(std::mem::offset_of!(OpenSemaphoreRequest, access) == 12);
+const _: () = assert!(std::mem::offset_of!(OpenSemaphoreRequest, attributes) == 16);
+const _: () = assert!(std::mem::offset_of!(OpenSemaphoreRequest, rootdir) == 20);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OpenSemaphoreReply {
+    pub header: ReplyHeader,
+    pub handle: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<OpenSemaphoreReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(OpenSemaphoreReply, handle) == 8);
+
+impl Request for OpenSemaphoreRequest {
+    const NUMBER: i32 = 43;
+    type Reply = OpenSemaphoreReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct QuerySemaphoreRequest {
+    pub header: RequestHeader,
+    pub handle: u32,
+}
+const _: () = assert!(size_of::<QuerySemaphoreRequest>() == 16);
+const _: () = assert!(std::mem::offset_of!(QuerySemaphoreRequest, handle) == 12);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct QuerySemaphoreReply {
+    pub header: ReplyHeader,
+    pub current: u32,
+    pub max: u32,
+}
+const _: () = assert!(size_of::<QuerySemaphoreReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(QuerySemaphoreReply, current) == 8);
+const _: () = assert!(std::mem::offset_of!(QuerySemaphoreReply, max) == 12);
+
+impl Request for QuerySemaphoreRequest {
+    const NUMBER: i32 = 42;
+    type Reply = QuerySemaphoreReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ReleaseSemaphoreRequest {
+    pub header: RequestHeader,
+    pub handle: u32,
+    pub count: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<ReleaseSemaphoreRequest>() == 24);
+const _: () = assert!(std::mem::offset_of!(ReleaseSemaphoreRequest, handle) == 12);
+const _: () = assert!(std::mem::offset_of!(ReleaseSemaphoreRequest, count) == 16);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ReleaseSemaphoreReply {
+    pub header: ReplyHeader,
+    pub prev_count: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<ReleaseSemaphoreReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(ReleaseSemaphoreReply, prev_count) == 8);
+
+impl Request for ReleaseSemaphoreRequest {
+    const NUMBER: i32 = 41;
+    type Reply = ReleaseSemaphoreReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CreateTimerRequest {
+    pub header: RequestHeader,
+    pub access: u32,
+    pub manual: i32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<CreateTimerRequest>() == 24);
+const _: () = assert!(std::mem::offset_of!(CreateTimerRequest, access) == 12);
+const _: () = assert!(std::mem::offset_of!(CreateTimerRequest, manual) == 16);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CreateTimerReply {
+    pub header: ReplyHeader,
+    pub handle: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<CreateTimerReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(CreateTimerReply, handle) == 8);
+
+impl Request for CreateTimerRequest {
+    const NUMBER: i32 = 100;
+    type Reply = CreateTimerReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OpenTimerRequest {
+    pub header: RequestHeader,
+    pub access: u32,
+    pub attributes: u32,
+    pub rootdir: u32,
+}
+const _: () = assert!(size_of::<OpenTimerRequest>() == 24);
+const _: () = assert!(std::mem::offset_of!(OpenTimerRequest, access) == 12);
+const _: () = assert!(std::mem::offset_of!(OpenTimerRequest, attributes) == 16);
+const _: () = assert!(std::mem::offset_of!(OpenTimerRequest, rootdir) == 20);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OpenTimerReply {
+    pub header: ReplyHeader,
+    pub handle: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<OpenTimerReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(OpenTimerReply, handle) == 8);
+
+impl Request for OpenTimerRequest {
+    const NUMBER: i32 = 101;
+    type Reply = OpenTimerReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SetTimerRequest {
+    pub header: RequestHeader,
+    pub handle: u32,
+    pub expire: i64,
+    pub callback: u64,
+    pub arg: u64,
+    pub period: i32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<SetTimerRequest>() == 48);
+const _: () = assert!(std::mem::offset_of!(SetTimerRequest, handle) == 12);
+const _: () = assert!(std::mem::offset_of!(SetTimerRequest, expire) == 16);
+const _: () = assert!(std::mem::offset_of!(SetTimerRequest, callback) == 24);
+const _: () = assert!(std::mem::offset_of!(SetTimerRequest, arg) == 32);
+const _: () = assert!(std::mem::offset_of!(SetTimerRequest, period) == 40);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SetTimerReply {
+    pub header: ReplyHeader,
+    pub signaled: i32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<SetTimerReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(SetTimerReply, signaled) == 8);
+
+impl Request for SetTimerRequest {
+    const NUMBER: i32 = 102;
+    type Reply = SetTimerReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CancelTimerRequest {
+    pub header: RequestHeader,
+    pub handle: u32,
+}
+const _: () = assert!(size_of::<CancelTimerRequest>() == 16);
+const _: () = assert!(std::mem::offset_of!(CancelTimerRequest, handle) == 12);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CancelTimerReply {
+    pub header: ReplyHeader,
+    pub signaled: i32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<CancelTimerReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(CancelTimerReply, signaled) == 8);
+
+impl Request for CancelTimerRequest {
+    const NUMBER: i32 = 103;
+    type Reply = CancelTimerReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GetTimerInfoRequest {
+    pub header: RequestHeader,
+    pub handle: u32,
+}
+const _: () = assert!(size_of::<GetTimerInfoRequest>() == 16);
+const _: () = assert!(std::mem::offset_of!(GetTimerInfoRequest, handle) == 12);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GetTimerInfoReply {
+    pub header: ReplyHeader,
+    pub when: i64,
+    pub signaled: i32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<GetTimerInfoReply>() == 24);
+const _: () = assert!(std::mem::offset_of!(GetTimerInfoReply, when) == 8);
+const _: () = assert!(std::mem::offset_of!(GetTimerInfoReply, signaled) == 16);
+
+impl Request for GetTimerInfoRequest {
+    const NUMBER: i32 = 104;
+    type Reply = GetTimerInfoReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct AddAtomRequest {
     pub header: RequestHeader,
     pub _pad0: [u8; 4],

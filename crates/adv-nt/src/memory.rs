@@ -24,6 +24,16 @@ const MEM_FREE: u32 = 0x1_0000;
 const MEM_RESET: u32 = 0x8_0000;
 const MEM_TOP_DOWN: u32 = 0x10_0000;
 const MEM_WRITE_WATCH: u32 = 0x20_0000;
+const MEM_RESERVE_PLACEHOLDER: u32 = 0x4_0000;
+const MEM_REPLACE_PLACEHOLDER: u32 = 0x4000;
+const MEM_PRESERVE_PLACEHOLDER: u32 = 2;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Placeholder {
+    None,
+    Free,
+    Replaced,
+}
 
 pub const PAGE_NOACCESS: u32 = 0x01;
 pub const PAGE_READONLY: u32 = 0x02;
@@ -59,6 +69,7 @@ type Page = Option<u32>;
 struct Region {
     kind: Kind,
     protection: u32,
+    placeholder: Placeholder,
     pages: Vec<Page>,
 }
 
@@ -84,6 +95,7 @@ impl Memory {
             Region {
                 kind,
                 protection,
+                placeholder: Placeholder::None,
                 pages,
             },
         );
@@ -337,18 +349,43 @@ fn finish(result: Result<(), Status>) -> Outcome {
 
 /// NtAllocateVirtualMemory(process, *base, zero_bits, *size, type, protection)
 pub fn allocate(env: &mut Env<'_>, args: &[u32]) -> Outcome {
-    finish(allocate_in(env, args))
+    finish((|| {
+        let zero_bits = args[2];
+        if read(env, args[3])? == 0 {
+            return Err(status::INVALID_PARAMETER);
+        }
+        if zero_bits > 21 {
+            return Err(0xc000_00f1);
+        }
+        if args[4] & !(MEM_COMMIT | MEM_RESERVE | MEM_RESET | MEM_TOP_DOWN | MEM_WRITE_WATCH) != 0 {
+            return Err(status::INVALID_PARAMETER);
+        }
+        let high = if zero_bits == 0 || read(env, args[1])? != 0 {
+            0
+        } else {
+            u32::MAX >> zero_bits
+        };
+        allocate_in(env, args, 0, high, GRANULE)
+    })())
 }
 
-fn allocate_in(env: &mut Env<'_>, args: &[u32]) -> Result<(), Status> {
+fn allocate_in(
+    env: &mut Env<'_>,
+    args: &[u32],
+    low: u32,
+    high: u32,
+    alignment: u32,
+) -> Result<(), Status> {
     let &[process, base_out, _zero_bits, size_out, kind, protection] = args else {
         unreachable!()
     };
     if process != CURRENT_PROCESS {
         return Err(status::INVALID_HANDLE);
     }
-    let known = MEM_COMMIT | MEM_RESERVE | MEM_RESET | MEM_TOP_DOWN | MEM_WRITE_WATCH;
-    if kind & !known != 0 || kind & (MEM_COMMIT | MEM_RESERVE | MEM_RESET) == 0 {
+    if kind & (MEM_COMMIT | MEM_RESERVE | MEM_RESET) == 0
+        || kind & MEM_REPLACE_PLACEHOLDER != 0 && kind & MEM_RESERVE == 0
+        || kind & MEM_RESERVE_PLACEHOLDER != 0 && protection != PAGE_NOACCESS
+    {
         return Err(status::INVALID_PARAMETER);
     }
     let address = read(env, base_out)?;
@@ -363,11 +400,36 @@ fn allocate_in(env: &mut Env<'_>, args: &[u32]) -> Result<(), Status> {
     }
 
     let reserve = kind & MEM_RESERVE != 0 || address == 0;
-    let (start, length) = if reserve {
+    let (start, length) = if kind & MEM_REPLACE_PLACEHOLDER != 0 {
+        let (start, length) = pages(address, size)?;
+        let Some((base, region)) = memory(env).region_of(start) else {
+            return Err(status::INVALID_PARAMETER);
+        };
+        if start != base || length != region.end(base) - base {
+            return Err(status::CONFLICTING_ADDRESSES);
+        }
+        if region.placeholder != Placeholder::Free {
+            return Err(status::INVALID_PARAMETER);
+        }
+        region.placeholder = Placeholder::Replaced;
+        region.protection = protection;
+        (start, length)
+    } else if reserve {
         let (start, length) = if address == 0 {
             let length = align_up(size, PAGE);
-            let start = find_free(&env.sys.vm, length, kind & MEM_TOP_DOWN != 0)
-                .ok_or(status::NO_MEMORY)?;
+            let start = if low == 0 && high == 0 && alignment == GRANULE {
+                find_free(&env.sys.vm, length, kind & MEM_TOP_DOWN != 0)
+            } else {
+                find_free_range(
+                    &env.sys.vm,
+                    length,
+                    kind & MEM_TOP_DOWN != 0,
+                    low,
+                    high,
+                    alignment,
+                )
+            }
+            .ok_or(status::NO_MEMORY)?;
             (start, length)
         } else {
             let start = address & !(GRANULE - 1);
@@ -383,12 +445,17 @@ fn allocate_in(env: &mut Env<'_>, args: &[u32]) -> Result<(), Status> {
             protection,
             vec![None; (length / PAGE) as usize],
         );
+        if kind & MEM_RESERVE_PLACEHOLDER != 0 {
+            memory(env).regions.get_mut(&start).unwrap().placeholder = Placeholder::Free;
+        }
         (start, length)
     } else {
         let (start, length) = pages(address, size)?;
         match memory(env).region_of(start) {
             Some((base, region))
-                if region.kind == Kind::Private && start + length <= region.end(base) => {}
+                if region.kind == Kind::Private
+                    && region.placeholder != Placeholder::Free
+                    && start + length <= region.end(base) => {}
             _ => return Err(status::CONFLICTING_ADDRESSES),
         }
         (start, length)
@@ -436,15 +503,40 @@ fn free_in(env: &mut Env<'_>, args: &[u32]) -> Result<(), Status> {
         Some((base, region)) if region.kind == Kind::Private => (base, region.end(base)),
         _ => return Err(status::MEMORY_NOT_ALLOCATED),
     };
+    let first = address & !(PAGE - 1);
+    if size == 0 && first != base {
+        return Err(status::FREE_VM_NOT_AT_BASE);
+    }
     match kind {
+        kind if kind == MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER => {
+            let (start, length) = pages(address, size)?;
+            if size == 0 {
+                return Err(0xc000_00f1);
+            }
+            let (_, region) = memory(env).region_of(base).unwrap();
+            if region.placeholder == Placeholder::None
+                || region.placeholder == Placeholder::Free && length == end - base
+            {
+                return Err(status::CONFLICTING_ADDRESSES);
+            }
+            if start != base || length != end - base {
+                return Err(status::CONFLICTING_ADDRESSES);
+            }
+            region.placeholder = Placeholder::Free;
+            region.protection = PAGE_NOACCESS;
+            region.pages.fill(None);
+            for page in (base..end).step_by(PAGE as usize) {
+                let _ = env.cpu.unmap(page, PAGE);
+            }
+            write(env, base_out, start)?;
+            write(env, size_out, length)
+        }
         MEM_RELEASE => {
             if size != 0 {
                 let (start, length) = pages(address, size)?;
                 if start != base || start + length != end {
                     return Err(status::UNABLE_TO_FREE_VM);
                 }
-            } else if address != base {
-                return Err(status::FREE_VM_NOT_AT_BASE);
             }
             memory(env).regions.remove(&base);
             let _ = env.sys.vm.free(env.cpu, base);
@@ -469,7 +561,7 @@ fn free_in(env: &mut Env<'_>, args: &[u32]) -> Result<(), Status> {
                 let _ = env.cpu.unmap(page, PAGE);
             }
             write(env, base_out, start)?;
-            write(env, size_out, length)
+            write(env, size_out, if size == 0 { 0 } else { length })
         }
         _ => Err(status::INVALID_PARAMETER),
     }
@@ -634,4 +726,120 @@ pub fn flush_instruction_cache(_env: &mut Env<'_>, args: &[u32]) -> Outcome {
         );
     }
     Outcome::Return(status::SUCCESS)
+}
+
+/// NtAllocateVirtualMemoryEx(process, *base, *size, type, protection, *parameters, count)
+pub fn allocate_ex(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    let &[process, base, size, kind, protection, parameters, count] = args else {
+        unreachable!()
+    };
+    status::finish((|| {
+        let mut present = 0u32;
+        let (mut low, mut high, mut alignment) = (0, 0, GRANULE);
+        let mut attributes = 0;
+        let mut constrained = false;
+        if count != 0 && parameters == 0 {
+            return Err(status::INVALID_PARAMETER.into());
+        }
+        for index in 0..count {
+            let param = parameters + index * 16;
+            let typ = read(env, param)? & 0xff;
+            if typ >= 32 || present & (1 << typ) != 0 {
+                return Err(status::INVALID_PARAMETER.into());
+            }
+            present |= 1 << typ;
+            let value = read(env, param + 8)?;
+            match typ {
+                1 => {
+                    low = read(env, value)?;
+                    high = read(env, value + 4)?;
+                    let align = read(env, value + 8)?;
+                    constrained = low != 0 || high != 0 || align != 0;
+                    if align != 0 {
+                        if !align.is_power_of_two() || align < GRANULE {
+                            return Err(status::INVALID_PARAMETER.into());
+                        }
+                        alignment = align;
+                    }
+                    if low != 0 && (low >= USER_END || low & (GRANULE - 1) != 0) {
+                        return Err(status::INVALID_PARAMETER.into());
+                    }
+                    if high != 0
+                        && (high > USER_END
+                            || high <= low
+                            || high.wrapping_add(1) & (PAGE - 2) != 0)
+                    {
+                        return Err(status::INVALID_PARAMETER.into());
+                    }
+                }
+                5 => attributes = value,
+                2 | 3 | 4 | 6 => (),
+                _ => return Err(status::INVALID_PARAMETER.into()),
+            }
+        }
+        let known = MEM_COMMIT
+            | MEM_RESERVE
+            | MEM_TOP_DOWN
+            | MEM_WRITE_WATCH
+            | MEM_RESET
+            | MEM_RESERVE_PLACEHOLDER
+            | MEM_REPLACE_PLACEHOLDER;
+        if kind & !known != 0 {
+            return Err(status::INVALID_PARAMETER.into());
+        }
+        if read(env, base)? != 0 && constrained {
+            return Err(status::INVALID_PARAMETER.into());
+        }
+        if read(env, size)? == 0 {
+            return Err(status::INVALID_PARAMETER.into());
+        }
+        if attributes & 0x40 != 0 {
+            return Err(status::INVALID_PARAMETER.into());
+        }
+        allocate_in(
+            env,
+            &[process, base, 0, size, kind, protection],
+            low,
+            high,
+            alignment,
+        )
+        .map_err(Into::into)
+    })())
+}
+
+fn find_free_range(
+    vm: &Vm,
+    size: u32,
+    top_down: bool,
+    low: u32,
+    high: u32,
+    alignment: u32,
+) -> Option<u32> {
+    let end_limit = if high == 0 {
+        USER_END
+    } else {
+        (high + 1).min(USER_END)
+    };
+    let mut cursor = u64::from(low.max(GRANULE)).next_multiple_of(u64::from(alignment));
+    let mut found = None;
+    while cursor + u64::from(size) <= u64::from(end_limit) {
+        let address = cursor as u32;
+        if let Some((base, extent)) = vm.containing(address) {
+            cursor = (u64::from(base) + u64::from(extent)).next_multiple_of(u64::from(alignment));
+            continue;
+        }
+        let end = vm.next_region(address).unwrap_or(end_limit).min(end_limit);
+        if u64::from(end) - cursor >= u64::from(size) {
+            found = Some(if top_down {
+                (end - size) & !(alignment - 1)
+            } else {
+                address
+            });
+            if !top_down {
+                break;
+            }
+        }
+        cursor = u64::from(end).next_multiple_of(u64::from(alignment));
+    }
+    found
 }

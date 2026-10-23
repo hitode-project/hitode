@@ -15,10 +15,12 @@ use adv_cpu::backend::{ArchitecturalState, GuestExt, Reg};
 use adv_machine::{Env, Outcome, Wait};
 
 use crate::exception::{self, Dispatchers};
-use crate::object::{Attributes, read_u32, write_u32};
+use crate::object::{Attributes, read_u32, read_unicode_string, write_bytes, write_u32};
 use crate::protocol::{
-    CreateEventRequest, CreateMutexRequest, EventOpRequest, QueueApcRequest, ReleaseMutexRequest,
-    SelectRequest,
+    CancelTimerRequest, CreateEventRequest, CreateMutexRequest, CreateSemaphoreRequest,
+    CreateTimerRequest, DupHandleRequest, EventOpRequest, GetTimerInfoRequest,
+    OpenSemaphoreRequest, OpenTimerRequest, QuerySemaphoreRequest, QueueApcRequest,
+    ReleaseMutexRequest, ReleaseSemaphoreRequest, SelectRequest, SetTimerRequest,
 };
 use crate::server::{self, Time};
 use crate::status::{self, Status};
@@ -266,7 +268,7 @@ fn begin_select(env: &mut Env<'_>, op: Vec<u8>, flags: i32, timeout: u32) -> Out
         select,
         Box::new(|env, ended| match ended {
             Ended::Status(status) => Outcome::Return(status),
-            Ended::Apc { func, args } => run_apc(env, None, func, args),
+            Ended::Apc { func, args } => run_apc(env, None, func, args, USER_APC),
         }),
     )
 }
@@ -316,6 +318,10 @@ fn run_select(env: &mut Env<'_>, select: Select, then: Then) -> Outcome {
     if reply.signaled == 0 {
         return block(env, select, then);
     }
+    env.ext
+        .get_or_default::<Timers>()
+        .waits
+        .remove(&env.context);
     if reply.header.error != USER_APC {
         return then(env, Ended::Status(reply.header.error));
     }
@@ -336,9 +342,20 @@ fn block(env: &mut Env<'_>, select: Select, then: Then) -> Outcome {
         Ok(wake) => wake,
         Err(error) => return status::finish(Err(error)),
     };
+    env.ext
+        .get_or_default::<Timers>()
+        .waits
+        .insert(env.context, wake);
+    let deadline = match timer_deadline(env) {
+        Ok(timer) => match (select.deadline, timer) {
+            (Some(wait), Some(timer)) => Some(wait.min(timer)),
+            (wait, timer) => wait.or(timer),
+        },
+        Err(error) => return status::finish(Err(error)),
+    };
     let wait = Wait::Object {
         handle: wake,
-        deadline: select.deadline,
+        deadline,
     };
     Outcome::block(wait, move |env, _| wake_up(env, select, then))
 }
@@ -360,7 +377,13 @@ fn wake_up(env: &mut Env<'_>, mut select: Select, then: Then) -> Outcome {
         Ok(Some(wake_up)) if matches!(wake_up.signaled, USER_APC | KERNEL_APC) => {
             run_select(env, select, then)
         }
-        Ok(Some(wake_up)) => then(env, Ended::Status(wake_up.signaled)),
+        Ok(Some(wake_up)) => {
+            env.ext
+                .get_or_default::<Timers>()
+                .waits
+                .remove(&env.context);
+            then(env, Ended::Status(wake_up.signaled))
+        }
         Ok(None) => {
             let now = env.sys.clock.now_us();
             select.deadline = select.deadline.map(|deadline| deadline.max(now + RETRY_US));
@@ -383,7 +406,7 @@ pub fn continue_alertable(env: &mut Env<'_>, context: Box<ArchitecturalState>) -
         select,
         Box::new(move |env, ended| match ended {
             Ended::Status(_) => exception::resume_with(env, context),
-            Ended::Apc { func, args } => run_apc(env, Some(context), func, args),
+            Ended::Apc { func, args } => run_apc(env, Some(context), func, args, USER_APC),
         }),
     )
 }
@@ -397,6 +420,7 @@ fn run_apc(
     context: Option<Box<ArchitecturalState>>,
     func: u32,
     args: [u32; 3],
+    return_status: Status,
 ) -> Outcome {
     let Some(&Dispatchers {
         apc: dispatcher, ..
@@ -419,7 +443,7 @@ fn run_apc(
                 Err(error) => return Outcome::Fail(format!("APC: {error}")),
             };
             state.regs[4] = esp + 4;
-            state.regs[0] = USER_APC;
+            state.regs[0] = return_status;
             state
         }
     };
@@ -480,4 +504,383 @@ fn deadline_us(env: &mut Env<'_>, timeout: i64) -> u64 {
         (timeout as u64).saturating_sub(env.sys.clock.system_time())
     };
     now + ticks.div_ceil(10)
+}
+
+/// Timer handles whose next expiration may wake a server wait. The server
+/// remains the owner of timer state and APC queues.
+#[derive(Default)]
+struct Timers {
+    handles: std::collections::BTreeSet<u32>,
+    waits: std::collections::HashMap<adv_machine::CtxId, adv_machine::sched::Handle>,
+}
+
+fn timer_deadline(env: &mut Env<'_>) -> Result<Option<u64>, status::Error> {
+    let handles: Vec<_> = env
+        .ext
+        .get_or_default::<Timers>()
+        .handles
+        .iter()
+        .copied()
+        .collect();
+    let mut deadline = None;
+    for handle in handles {
+        let mut request = GetTimerInfoRequest {
+            handle,
+            ..Default::default()
+        };
+        let (mut reply, _) = server::request(env, &mut request, &[], &mut [])?;
+        if reply.header.error == 0xc000_0022 {
+            // Setting a timer needs MODIFY_STATE, not QUERY_STATE. Obtain a
+            // temporary query handle without keeping the timer alive.
+            let mut duplicate = DupHandleRequest {
+                src_process: u32::MAX,
+                src_handle: handle,
+                dst_process: u32::MAX,
+                access: 1,
+                ..Default::default()
+            };
+            let (duplicate, _) = server::request(env, &mut duplicate, &[], &mut [])?;
+            status::check(duplicate.header.error)?;
+            request.handle = duplicate.handle;
+            reply = server::request(env, &mut request, &[], &mut [])?.0;
+            server::close(env, duplicate.handle)?;
+        }
+        let now = env.sys.clock.now_us();
+        let when = if reply.when > 0 {
+            now + (reply.when as u64)
+                .saturating_sub(env.sys.clock.system_time())
+                .div_ceil(10)
+        } else {
+            reply.when.unsigned_abs().div_ceil(10)
+        };
+        if reply.header.error != status::SUCCESS || reply.when == TIMEOUT_INFINITE || when <= now {
+            env.ext.get_mut::<Timers>().handles.remove(&handle);
+        } else {
+            deadline = Some(deadline.map_or(when, |old: u64| old.min(when)));
+        }
+    }
+    Ok(deadline)
+}
+
+/// NtCreateSemaphore(*handle, access, *attributes, initial, maximum)
+pub fn create_semaphore(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    let &[handle, access, attributes, initial, max] = args else {
+        unreachable!()
+    };
+    status::finish((|| {
+        write_u32(env, handle, 0)?;
+        if (max as i32) <= 0 || (initial as i32) < 0 || initial > max {
+            return Err(status::INVALID_PARAMETER.into());
+        }
+        let attributes = if attributes == 0 {
+            Vec::new()
+        } else {
+            Attributes::read(env, attributes)?.wire()
+        };
+        let mut request = CreateSemaphoreRequest {
+            access,
+            initial,
+            max,
+            ..Default::default()
+        };
+        let (reply, _) = server::request(env, &mut request, &[&attributes], &mut [])?;
+        write_u32(env, handle, reply.handle)?;
+        status::check(reply.header.error)
+    })())
+}
+
+fn open_attributes(env: &Env<'_>, address: u32) -> Result<Attributes, status::Error> {
+    if address == 0 || read_u32(env, address)? != 24 {
+        return Err(status::INVALID_PARAMETER.into());
+    }
+    let root = read_u32(env, address + 4)?;
+    let name = read_u32(env, address + 8)?;
+    let name = if name == 0 {
+        if root != 0 {
+            return Err(status::OBJECT_NAME_INVALID.into());
+        }
+        None
+    } else {
+        if read_u32(env, name + 4)? & 1 != 0 {
+            return Err(0x8000_0002.into());
+        }
+        Some(read_unicode_string(env, name)?)
+    };
+    Ok(Attributes {
+        root,
+        attributes: read_u32(env, address + 12)?,
+        name,
+    })
+}
+
+/// NtOpenSemaphore(*handle, access, *attributes)
+pub fn open_semaphore(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    let &[handle, access, attributes] = args else {
+        unreachable!()
+    };
+    status::finish((|| {
+        write_u32(env, handle, 0)?;
+        let attr = open_attributes(env, attributes)?;
+        let mut request = OpenSemaphoreRequest {
+            access,
+            attributes: attr.attributes,
+            rootdir: attr.root,
+            ..Default::default()
+        };
+        let (reply, _) = server::request(env, &mut request, &[&attr.name_bytes()], &mut [])?;
+        write_u32(env, handle, reply.handle)?;
+        status::check(reply.header.error)
+    })())
+}
+
+/// NtReleaseSemaphore(handle, count, *previous)
+pub fn release_semaphore(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    let &[handle, count, previous] = args else {
+        unreachable!()
+    };
+    status::finish((|| {
+        let mut request = ReleaseSemaphoreRequest {
+            handle,
+            count,
+            ..Default::default()
+        };
+        let (reply, _) = server::request(env, &mut request, &[], &mut [])?;
+        status::check(reply.header.error)?;
+        if previous != 0 {
+            write_u32(env, previous, reply.prev_count)?;
+        }
+        Ok(())
+    })())
+}
+
+/// NtQuerySemaphore(handle, class, *info, length, *returned)
+pub fn query_semaphore(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    let &[handle, class, info, length, returned] = args else {
+        unreachable!()
+    };
+    status::finish((|| {
+        if class != 0 {
+            return Err(status::INVALID_INFO_CLASS.into());
+        }
+        if length != 8 {
+            return Err(status::INFO_LENGTH_MISMATCH.into());
+        }
+        let mut request = QuerySemaphoreRequest {
+            handle,
+            ..Default::default()
+        };
+        let (reply, _) = server::request(env, &mut request, &[], &mut [])?;
+        status::check(reply.header.error)?;
+        write_u32(env, info, reply.current)?;
+        write_u32(env, info + 4, reply.max)?;
+        if returned != 0 {
+            write_u32(env, returned, 8)?;
+        }
+        Ok(())
+    })())
+}
+
+/// NtCreateTimer(*handle, access, *attributes, type)
+pub fn create_timer(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    let &[handle, access, attributes, kind] = args else {
+        unreachable!()
+    };
+    status::finish((|| {
+        write_u32(env, handle, 0)?;
+        if kind > 1 {
+            return Err(status::INVALID_PARAMETER.into());
+        }
+        let attributes = if attributes == 0 {
+            Vec::new()
+        } else {
+            Attributes::read(env, attributes)?.wire()
+        };
+        let mut request = CreateTimerRequest {
+            access,
+            manual: i32::from(kind == 0),
+            ..Default::default()
+        };
+        let (reply, _) = server::request(env, &mut request, &[&attributes], &mut [])?;
+        write_u32(env, handle, reply.handle)?;
+        status::check(reply.header.error)
+    })())
+}
+
+/// NtOpenTimer(*handle, access, *attributes)
+pub fn open_timer(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    let &[handle, access, attributes] = args else {
+        unreachable!()
+    };
+    status::finish((|| {
+        write_u32(env, handle, 0)?;
+        let attr = open_attributes(env, attributes)?;
+        let mut request = OpenTimerRequest {
+            access,
+            attributes: attr.attributes,
+            rootdir: attr.root,
+            ..Default::default()
+        };
+        let (reply, _) = server::request(env, &mut request, &[&attr.name_bytes()], &mut [])?;
+        write_u32(env, handle, reply.handle)?;
+        status::check(reply.header.error)
+    })())
+}
+
+/// NtSetTimer(handle, *when, callback, arg, resume, period, *state)
+pub fn set_timer(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    let &[handle, when, callback, arg, resume, period, state] = args else {
+        unreachable!()
+    };
+    status::finish((|| {
+        let expire = i64::from(read_u32(env, when)?) | i64::from(read_u32(env, when + 4)?) << 32;
+        let mut request = SetTimerRequest {
+            handle,
+            expire,
+            callback: u64::from(callback),
+            arg: u64::from(arg),
+            period: period as i32,
+            ..Default::default()
+        };
+        let (reply, _) = server::request(env, &mut request, &[], &mut [])?;
+        if state != 0 {
+            write_bytes(env, state, &[reply.signaled as u8])?;
+        }
+        status::check(reply.header.error)?;
+        let timers = env.ext.get_or_default::<Timers>();
+        timers.handles.insert(handle);
+        for &wake in timers.waits.values() {
+            env.sys.set_event(wake);
+        }
+        if resume as u8 != 0 {
+            return Err(0x4000_0025.into());
+        }
+        Ok(())
+    })())
+}
+
+/// NtCancelTimer(handle, *state)
+pub fn cancel_timer(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    let &[handle, state] = args else {
+        unreachable!()
+    };
+    status::finish((|| {
+        let mut request = CancelTimerRequest {
+            handle,
+            ..Default::default()
+        };
+        let (reply, _) = server::request(env, &mut request, &[], &mut [])?;
+        if state != 0 {
+            write_bytes(env, state, &[reply.signaled as u8])?;
+        }
+        status::check(reply.header.error)
+    })())
+}
+
+/// NtQueryTimer(handle, class, *info, length, *returned)
+pub fn query_timer(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    let &[handle, class, info, length, returned] = args else {
+        unreachable!()
+    };
+    status::finish((|| {
+        if class != 0 {
+            return Err(status::INVALID_INFO_CLASS.into());
+        }
+        if length < 16 {
+            return Err(status::INFO_LENGTH_MISMATCH.into());
+        }
+        let mut request = GetTimerInfoRequest {
+            handle,
+            ..Default::default()
+        };
+        let (reply, _) = server::request(env, &mut request, &[], &mut [])?;
+        let now = if reply.when > 0 {
+            env.sys.clock.system_time()
+        } else {
+            Time::now(&mut env.sys.clock).monotonic
+        };
+        let remaining = reply.when.unsigned_abs().saturating_sub(now);
+        write_bytes(env, info, &remaining.to_le_bytes())?;
+        write_bytes(env, info + 8, &[reply.signaled as u8])?;
+        if returned != 0 {
+            write_u32(env, returned, 16)?;
+        }
+        status::check(reply.header.error)
+    })())
+}
+
+/// NtTestAlert(): deliver a pending user APC and return success.
+pub fn test_alert(env: &mut Env<'_>, _: &[u32]) -> Outcome {
+    let select = new_select(
+        env,
+        Vec::new(),
+        SELECT_INTERRUPTIBLE | SELECT_ALERTABLE,
+        Some(0),
+    );
+    run_select(
+        env,
+        select,
+        Box::new(|env, ended| match ended {
+            Ended::Status(_) => Outcome::Return(status::SUCCESS),
+            Ended::Apc { func, args } => run_apc(env, None, func, args, status::SUCCESS),
+        }),
+    )
+}
+
+#[derive(Default)]
+struct Alerts(std::collections::HashMap<u32, adv_machine::sched::Handle>);
+
+fn alert_event(env: &mut Env<'_>, tid: u32) -> Result<adv_machine::sched::Handle, Status> {
+    // Wine indexes its alert table by (tid >> 2) - 1, even for a thread
+    // that does not exist yet. Alerts persist until the next wait.
+    let index = (tid >> 2).wrapping_sub(1);
+    if index / 16384 > 4096 {
+        return Err(0xc000_000b);
+    }
+    if let Some(&event) = env.ext.get_or_default::<Alerts>().0.get(&index) {
+        return Ok(event);
+    }
+    let event = env.sys.objects.insert(adv_machine::sched::Object::Event {
+        manual_reset: true,
+        signaled: false,
+    });
+    env.ext.get_or_default::<Alerts>().0.insert(index, event);
+    Ok(event)
+}
+
+/// NtAlertThreadByThreadId(tid)
+pub fn alert_thread(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    match alert_event(env, args[0]) {
+        Ok(event) => {
+            env.sys.set_event(event);
+            Outcome::Return(status::SUCCESS)
+        }
+        Err(status) => Outcome::Return(status),
+    }
+}
+
+/// NtWaitForAlertByThreadId(address, *timeout)
+pub fn wait_alert(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    let result = (|| {
+        let tid = server::current_tid(env)?;
+        let event = alert_event(env, tid)?;
+        let timeout = read_timeout(env, args[1])?;
+        let deadline = timeout.map(|timeout| deadline_us(env, timeout));
+        Ok((event, deadline))
+    })();
+    match result {
+        Ok((handle, deadline)) => {
+            Outcome::block(Wait::Object { handle, deadline }, move |env, resume| {
+                if matches!(
+                    resume,
+                    adv_machine::Resume::Woke(adv_machine::WakeReason::Timeout)
+                ) {
+                    Outcome::Return(0x102)
+                } else {
+                    env.sys.reset_event(handle);
+                    Outcome::Return(0x101)
+                }
+            })
+        }
+        Err(error) => status::finish(Err(error)),
+    }
 }
