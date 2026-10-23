@@ -207,3 +207,10 @@ FreeType is such a library: win32u opens it by name and draws TrueType text thro
 
 **Rule**: While every guest context waits, a session MUST serve finished host work before it blocks. A host wake MUST end the block. The run loop MUST take the wake's interrupt before it drains host work.
 **Verification**: Test
+
+## Conformance
+
+### WINE-TEST-1 Wine's own tests
+
+**Rule**: Listed Wine conformance tests that pass on standard Wine MUST pass here with no failures. Each runs as its own program without arguments.
+**Verification**: Test
