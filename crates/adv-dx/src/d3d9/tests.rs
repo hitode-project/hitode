@@ -24,9 +24,8 @@ fn machine_with_limits(native: bool, references: u32) -> Machine<JitCpu> {
     m.ext.insert(heaps);
     let com = Com::new(&mut m.sys.objects).unwrap();
     let provider = SurfaceProvider {
-        acquire_dc: |_, _, _, _, _| Err("ownership-only fixture".into()),
-        writeback_dc: |_, _, _, _| Err("ownership-only fixture".into()),
-        release_dc: |_, _| {},
+        allocator: test_allocator(),
+        dc: test_dc(),
         insert: |_, _| unreachable!("ownership-only fixture"),
         target: |_, _| None,
         remove: |_, _, _| Ok(()),
@@ -236,7 +235,7 @@ fn query_of_bound_zero_reference_resource_retains_parent_once_and_failed_query_r
     let (device, device_id, resource, id) = setup(&mut env);
     let guid = GuestPtr::<Iid>::new(alloc(&mut env, 16).unwrap());
     let output = GuestPtr::<u32>::new(alloc(&mut env, 4).unwrap());
-    guid.write(env.cpu, adv_os::com::IUNKNOWN).unwrap();
+    guid.write(env.cpu, adv_abi::com::IUNKNOWN).unwrap();
     assert!(matches!(
         query(&mut env, GuestPtr::new(resource), guid, output),
         Outcome::Return(0)
@@ -281,7 +280,7 @@ fn parent_reference_limit_refuses_resource_resurrection_without_mutating_counts(
     );
     let guid = GuestPtr::<Iid>::new(alloc(&mut env, 16).unwrap());
     let output = GuestPtr::<u32>::new(alloc(&mut env, 4).unwrap());
-    guid.write(env.cpu, adv_os::com::IUNKNOWN).unwrap();
+    guid.write(env.cpu, adv_abi::com::IUNKNOWN).unwrap();
     assert!(matches!(
         query(&mut env, GuestPtr::new(resource), guid, output),
         Outcome::Return(OUT_OF_MEMORY)
@@ -389,7 +388,7 @@ fn get_direct3d_preserves_factory_identity_after_original_release_and_outlives_d
     assert_eq!(output.read(env.cpu).unwrap(), original);
     assert_eq!(com(&env).references(&env.sys.objects, factory), Some(2));
     let iid = GuestPtr::<Iid>::new(alloc(&mut env, 16).unwrap());
-    iid.write(env.cpu, adv_os::com::IUNKNOWN).unwrap();
+    iid.write(env.cpu, adv_abi::com::IUNKNOWN).unwrap();
     assert!(matches!(
         query(&mut env, GuestPtr::new(original), iid, output),
         Outcome::Return(0)
@@ -457,7 +456,7 @@ pub(in crate::d3d9) fn flush_recordings(env: &mut Env<'_>) {
     let ids: Vec<_> = env
         .sys
         .objects
-        .hosts_in::<adv_os::com::ComObject<Payload>>(com(env).namespace())
+        .hosts_in::<adv_abi::com::ComObject<Payload>>(com(env).namespace())
         .filter_map(|(id, _)| {
             matches!(
                 com(env).get_identity(&env.sys.objects, id),
@@ -517,4 +516,41 @@ fn shared_guest_counts_preserve_real_resource_parent_and_internal_lifetimes() {
     );
     assert_eq!(release(&mut env, device), 0);
     assert_eq!(env.sys.objects.alias_count(com(&env).namespace()), 1);
+}
+
+pub(super) fn test_allocator() -> crate::interop::GuestAllocator {
+    crate::interop::GuestAllocator {
+        allocate: |env, length| {
+            let heaps = env.ext.get_mut::<Heaps>();
+            heaps.alloc(env.cpu, &mut env.sys.vm, heaps.process_heap, length, true)
+        },
+        free: |env, pointer| {
+            let heaps = env.ext.get_mut::<Heaps>();
+            heaps.free(env.cpu, &mut env.sys.vm, heaps.process_heap, pointer);
+        },
+    }
+}
+pub(super) fn test_dc() -> crate::interop::MemoryDc {
+    use adv_win32::gdi32::raster::front::surface_dc;
+    crate::interop::MemoryDc {
+        create: |env, surface, then| {
+            let result = surface_dc::acquire(
+                env,
+                surface.width,
+                surface.height,
+                surface.pixels,
+                surface.pitch,
+            );
+            then(env, result)
+        },
+        flush: |env, dc, surface, then| {
+            let result = surface_dc::writeback(env, dc, surface.pixels, surface.pitch);
+            then(env, result)
+        },
+        release: |env, dc, then| {
+            surface_dc::release(env, dc);
+            then(env, Ok(()))
+        },
+        discard: surface_dc::release,
+    }
 }

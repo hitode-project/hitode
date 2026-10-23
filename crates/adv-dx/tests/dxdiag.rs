@@ -60,9 +60,22 @@ impl Fixture {
             adv_dx::d3d9::install(
                 &mut machine,
                 adv_dx::d3d9::SurfaceProvider {
-                    acquire_dc: |_, _, _, _, _| panic!("DxDiag never borrows DCs"),
-                    writeback_dc: |_, _, _, _| panic!("DxDiag never borrows DCs"),
-                    release_dc: |_, _| panic!("DxDiag never borrows DCs"),
+                    allocator: adv_dx::interop::GuestAllocator {
+                        allocate: |env, length| {
+                            let heaps = env.ext.get_mut::<adv_os::Heaps>();
+                            heaps.alloc(env.cpu, &mut env.sys.vm, heaps.process_heap, length, true)
+                        },
+                        free: |env, pointer| {
+                            let heaps = env.ext.get_mut::<adv_os::Heaps>();
+                            heaps.free(env.cpu, &mut env.sys.vm, heaps.process_heap, pointer);
+                        },
+                    },
+                    dc: adv_dx::interop::MemoryDc {
+                        create: |_, _, _| unreachable!(),
+                        flush: |_, _, _, _| unreachable!(),
+                        release: |_, _, _| unreachable!(),
+                        discard: |_, _| unreachable!(),
+                    },
                     insert: |_, _| panic!("DxDiag never creates surfaces"),
                     target: |_, _| None,
                     remove: |_, _, _| panic!("DxDiag never removes surfaces"),

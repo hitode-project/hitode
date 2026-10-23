@@ -3,8 +3,8 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
+use adv_abi::com::{Com, IUNKNOWN, QueryError};
 use adv_machine::{Namespace, ObjectLimits, Objects};
-use adv_os::com::{Com, IUNKNOWN, QueryError};
 
 const A: [u8; 16] = [1; 16];
 const B: [u8; 16] = [2; 16];

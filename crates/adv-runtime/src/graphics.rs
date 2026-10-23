@@ -177,16 +177,30 @@ pub fn install_graphics<B: Backend>(
             completed: frame_completed,
         },
     );
-    let gdi = machine.ext.get::<Win32>().gdi.clone();
     let mut entries = adv_dx::ddraw::install(
         machine,
-        gdi,
         adv_dx::ddraw::Provider {
+            dc: directdraw_dc(),
             memory: guest_memory,
             window: window_geometry,
             completed: frame_completed,
         },
     )?;
+    for class in [
+        [
+            0xe0, 0x0e, 0xb7, 0xd7, 0x40, 0x43, 0xcf, 0x11, 0xb0, 0x63, 0, 0x20, 0xaf, 0xc2, 0xcd,
+            0x35,
+        ],
+        [
+            0x96, 0x51, 0x30, 0x3c, 0xdb, 0x50, 0xd3, 0x11, 0x9c, 0xfe, 0, 0xc0, 0x4f, 0xd9, 0x30,
+            0xc5,
+        ],
+    ] {
+        machine
+            .ext
+            .get_or_default::<adv_os::com::ClassFactories>()
+            .register(class, adv_dx::ddraw::front::activate);
+    }
     for &(id, api) in adv_win32::gdi32::raster::front::BINDINGS {
         entries.insert(
             id,
@@ -229,9 +243,8 @@ fn frame_completed(env: &mut Env<'_>, serial: u64) -> Option<Outcome> {
 #[cfg(feature = "gpu")]
 pub(crate) fn d3d9_provider() -> adv_dx::d3d9::SurfaceProvider {
     adv_dx::d3d9::SurfaceProvider {
-        acquire_dc: adv_win32::gdi32::raster::front::surface_dc::acquire,
-        writeback_dc: adv_win32::gdi32::raster::front::surface_dc::writeback,
-        release_dc: adv_win32::gdi32::raster::front::surface_dc::release,
+        allocator: guest_allocator(),
+        dc: memory_dc(),
         mode_changed: |env, device, parameters| {
             if parameters.Windowed == 0 {
                 adv_win32::user32::display::fullscreen(
@@ -312,6 +325,78 @@ pub(crate) fn d3d9_provider() -> adv_dx::d3d9::SurfaceProvider {
     }
 }
 
+#[cfg(feature = "gpu")]
+fn guest_allocator() -> adv_dx::interop::GuestAllocator {
+    adv_dx::interop::GuestAllocator {
+        allocate: |env, length| {
+            let heaps = env.ext.get_mut::<adv_os::Heaps>();
+            heaps.alloc(env.cpu, &mut env.sys.vm, heaps.process_heap, length, true)
+        },
+        free: |env, pointer| {
+            let heaps = env.ext.get_mut::<adv_os::Heaps>();
+            heaps.free(env.cpu, &mut env.sys.vm, heaps.process_heap, pointer);
+        },
+    }
+}
+#[cfg(feature = "gpu")]
+fn memory_dc() -> adv_dx::interop::MemoryDc {
+    use adv_win32::gdi32::raster::front::surface_dc;
+    adv_dx::interop::MemoryDc {
+        create: |env, surface, then| {
+            let result = surface_dc::acquire(
+                env,
+                surface.width,
+                surface.height,
+                surface.pixels,
+                surface.pitch,
+            );
+            then(env, result)
+        },
+        flush: |env, dc, surface, then| {
+            let result = surface_dc::writeback(env, dc, surface.pixels, surface.pitch);
+            then(env, result)
+        },
+        release: |env, dc, then| {
+            surface_dc::release(env, dc);
+            then(env, Ok(()))
+        },
+        discard: surface_dc::release,
+    }
+}
+fn directdraw_dc() -> adv_dx::interop::MemoryDc {
+    use adv_os::gdi::DeviceContexts;
+    adv_dx::interop::MemoryDc {
+        create: |env, surface, then| {
+            let dc = env.ext.get_mut::<SurfaceStore>().new_id();
+            let mut dcs = DeviceContexts::new(env.ext.get::<Win32>().gdi.clone());
+            let result = if dcs.create(&mut env.sys.objects, dc, surface.surface.unwrap()) {
+                Ok(dc)
+            } else {
+                Err("GDI DC namespace exhausted".into())
+            };
+            then(env, result)
+        },
+        flush: |env, dc, surface, then| {
+            let dcs = DeviceContexts::new(env.ext.get::<Win32>().gdi.clone());
+            let result = if dcs.get(&env.sys.objects, dc) == surface.surface {
+                Ok(())
+            } else {
+                Err("DC does not select the DirectDraw surface".into())
+            };
+            then(env, result)
+        },
+        release: |env, dc, then| {
+            let mut dcs = DeviceContexts::new(env.ext.get::<Win32>().gdi.clone());
+            dcs.remove(&mut env.sys.objects, dc);
+            then(env, Ok(()))
+        },
+        discard: |env, dc| {
+            let mut dcs = DeviceContexts::new(env.ext.get::<Win32>().gdi.clone());
+            dcs.remove(&mut env.sys.objects, dc);
+        },
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn test_machine() -> Machine<adv_cpu::JitCpu> {
     let mut registry = Registry::default();
@@ -370,6 +455,17 @@ mod tests {
         invoke(machine, api.module, api.name, args)
     }
     fn invoke(machine: &mut Machine<JitCpu>, module: &str, name: &str, args: &[u32]) -> u32 {
+        let Outcome::Return(value) = invoke_outcome(machine, module, name, args) else {
+            panic!("graphics must return; {module}!{name}")
+        };
+        value
+    }
+    fn invoke_outcome(
+        machine: &mut Machine<JitCpu>,
+        module: &str,
+        name: &str,
+        args: &[u32],
+    ) -> Outcome {
         use adv_cpu::backend::Reg;
         if machine.sys.contexts.is_empty() {
             // Host-only ABI calls still need a TEB for LastError. Finish this
@@ -406,10 +502,93 @@ mod tests {
             thunk: index,
         });
         machine.sys.vm.free(&mut machine.cpu, stack).unwrap();
-        let Outcome::Return(value) = result else {
-            panic!("graphics must return; {module}!{name}")
+        result
+    }
+
+    #[test]
+    fn directdraw_dc_publication_failure_releases_the_dc_after_guest_calls() {
+        let mut m = test_machine();
+        let mut dc = directdraw_dc();
+        dc.create = |_, surface, then| {
+            Outcome::call(0x400000, [], move |env, _| {
+                (directdraw_dc().create)(env, surface, then)
+            })
         };
-        value
+        dc.release = |_, dc, then| {
+            Outcome::call(0x400004, [dc], move |env, _| {
+                (directdraw_dc().release)(env, dc, then)
+            })
+        };
+        adv_dx::ddraw::install(
+            &mut m,
+            adv_dx::ddraw::Provider {
+                dc,
+                memory: guest_memory,
+                window: window_geometry,
+                completed: frame_completed,
+            },
+        )
+        .unwrap();
+        let data = m.sys.vm.alloc(&mut m.cpu, 4096, Prot::RW).unwrap();
+        assert_eq!(graphics(&mut m, api::DD_CREATE_OLD, &[0, data, 0]), 0);
+        let device = m.cpu.read_u32(data).unwrap();
+        let mut description = [0u8; 108];
+        for (offset, value) in [(0, 108u32), (4, 7), (8, 2), (12, 4), (104, 0x40)] {
+            description[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        m.cpu.write(data + 64, &description).unwrap();
+        assert_eq!(
+            graphics(&mut m, api::CREATE_SURFACE, &[device, data + 64, data, 0]),
+            0
+        );
+        let surface = m.cpu.read_u32(data).unwrap();
+        let before = m.sys.objects.object_count();
+        let page = m.sys.vm.alloc(&mut m.cpu, 4096, Prot::RW).unwrap();
+        m.cpu.write_u32(page, 0xcccccccc).unwrap();
+        let Outcome::Call { then, .. } = invoke_outcome(
+            &mut m,
+            "ddraw.dll",
+            "IDirectDrawSurface7::GetDC",
+            &[surface, page],
+        ) else {
+            panic!("create must call guest code");
+        };
+        m.cpu.protect(page, 4096, Prot::READ).unwrap();
+        let mut env = Env {
+            context: m.sys.current,
+            cpu: &mut m.cpu,
+            sys: &mut m.sys,
+            ext: &mut m.ext,
+            thunk: 0,
+        };
+        let Outcome::Call { then, args, .. } = then(&mut env, adv_machine::Resume::Returned(0))
+        else {
+            panic!("cleanup must call guest code");
+        };
+        assert!(
+            env.ext
+                .get::<Win32>()
+                .gdi
+                .get(&env.sys.objects, args[0])
+                .is_some()
+        );
+        assert!(matches!(
+            then(&mut env, adv_machine::Resume::Returned(0)),
+            Outcome::Fail(_)
+        ));
+        assert_eq!(m.cpu.read_u32(page).unwrap(), 0xcccccccc);
+        assert_eq!(m.sys.objects.object_count(), before);
+        assert_eq!(m.sys.objects.all_hosts::<adv_os::gdi::GdiObj>().count(), 0);
+        // An inaccessible output fails before asking the assembly to create a DC.
+        assert!(matches!(
+            invoke_outcome(
+                &mut m,
+                "ddraw.dll",
+                "IDirectDrawSurface7::GetDC",
+                &[surface, page]
+            ),
+            Outcome::Fail(_)
+        ));
     }
 
     #[cfg(feature = "gpu")]
@@ -420,20 +599,29 @@ mod tests {
         let original: Vec<u8> = (0..32).collect();
         m.cpu.write(data, &original).unwrap();
         let provider = d3d9_provider();
-        let dc = (provider.acquire_dc)(
-            &mut Env {
-                context: m.sys.current,
-                cpu: &mut m.cpu,
-                sys: &mut m.sys,
-                ext: &mut m.ext,
-                thunk: 0,
-            },
-            4,
-            2,
-            data,
-            16,
-        )
-        .unwrap();
+        let surface = adv_dx::interop::DcSurface {
+            surface: None,
+            pixels: data,
+            width: 4,
+            height: 2,
+            pitch: 16,
+            format: adv_device::surface::PixelFormat::Bgra32,
+        };
+        let mut env = Env {
+            context: m.sys.current,
+            cpu: &mut m.cpu,
+            sys: &mut m.sys,
+            ext: &mut m.ext,
+            thunk: 0,
+        };
+        let Outcome::Return(dc) = (provider.dc.create)(
+            &mut env,
+            surface,
+            Box::new(|_, result| Outcome::Return(result.unwrap())),
+        ) else {
+            panic!("inline old-stack DC");
+        };
+
         assert!(matches!(
             m.ext.get::<Win32>().gdi.get(&m.sys.objects, dc),
             Some(adv_os::gdi::GdiObj::Dc { raster: true, .. })
@@ -443,34 +631,51 @@ mod tests {
             0x00554433
         );
         assert_eq!(graphics(&mut m, api::DELETE_DC, &[dc]), 0);
-        (provider.writeback_dc)(
-            &mut Env {
-                context: m.sys.current,
-                cpu: &mut m.cpu,
-                sys: &mut m.sys,
-                ext: &mut m.ext,
-                thunk: 0,
-            },
-            dc,
-            data + 64,
-            16,
-        )
-        .unwrap();
+        let mut env = Env {
+            context: m.sys.current,
+            cpu: &mut m.cpu,
+            sys: &mut m.sys,
+            ext: &mut m.ext,
+            thunk: 0,
+        };
+        assert!(matches!(
+            (provider.dc.flush)(
+                &mut env,
+                dc,
+                adv_dx::interop::DcSurface {
+                    pixels: data + 64,
+                    ..surface
+                },
+                Box::new(|_, result| {
+                    result.unwrap();
+                    Outcome::Return(0)
+                })
+            ),
+            Outcome::Return(0)
+        ));
         let mut actual = [0; 32];
         m.cpu.read(data + 64, &mut actual).unwrap();
         assert_eq!(&actual[..24], &original[..24]);
         assert_eq!(&actual[24..27], &[0x55, 0x44, 0x33]);
         assert_eq!(&actual[28..], &original[28..]);
-        (provider.release_dc)(
-            &mut Env {
-                context: m.sys.current,
-                cpu: &mut m.cpu,
-                sys: &mut m.sys,
-                ext: &mut m.ext,
-                thunk: 0,
-            },
-            dc,
-        );
+        let mut env = Env {
+            context: m.sys.current,
+            cpu: &mut m.cpu,
+            sys: &mut m.sys,
+            ext: &mut m.ext,
+            thunk: 0,
+        };
+        assert!(matches!(
+            (provider.dc.release)(
+                &mut env,
+                dc,
+                Box::new(|_, result| {
+                    result.unwrap();
+                    Outcome::Return(0)
+                })
+            ),
+            Outcome::Return(0)
+        ));
         assert_eq!(m.ext.get::<SurfaceStore>().live_surfaces(), 0);
         assert_eq!(m.ext.get::<SurfaceStore>().stats.presentations, 0);
         assert!(m.ext.get::<Win32>().gdi.get(&m.sys.objects, dc).is_none());

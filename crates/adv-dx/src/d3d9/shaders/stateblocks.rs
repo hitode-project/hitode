@@ -561,7 +561,7 @@ pub(in crate::d3d9) fn destroy(env: &mut Env<'_>, block: StateBlock) {
 }
 pub(in crate::d3d9) fn has_outstanding(env: &Env<'_>, device: Id) -> bool {
     let com = com(env);
-    env.sys.objects.hosts_in::<adv_os::com::ComObject<Payload>>(com.namespace()).any(|(id,_)|matches!(com.get_identity(&env.sys.objects,id),Some(Payload::StateBlock(b)) if b.device==device))
+    env.sys.objects.hosts_in::<adv_abi::com::ComObject<Payload>>(com.namespace()).any(|(id,_)|matches!(com.get_identity(&env.sys.objects,id),Some(Payload::StateBlock(b)) if b.device==device))
 }
 fn mask(env: &Env<'_>, device: Id, kind: i32) -> Option<Mask> {
     let Payload::Device(d) = com(env).get_identity(&env.sys.objects, device)? else {

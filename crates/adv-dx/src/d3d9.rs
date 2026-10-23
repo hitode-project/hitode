@@ -1,17 +1,16 @@
 //! D3D9 interface semantics over common COM identities and neutral GPU commands.
-//! The runtime supplies only surface/window assembly callbacks. Native frames
+//! Assembly supplies private guest allocation, memory DCs and window/display operations. Native frames
 //! use the same store and mailbox as GDI/DirectDraw, without a CPU round trip.
 // Typed SDK signatures determine the parameter count, including COM `this`.
 #![allow(clippy::too_many_arguments)]
+use adv_abi::com::{Com, ComIdentity, Destroyed, Iid, QueryError};
 use adv_abi::types::{D3DPRESENT_PARAMETERS, RECT};
 use adv_abi::{GuestPtr, Handle, Registry, win32};
 use adv_cpu::backend::{Backend, GuestExt, Prot};
 use adv_device::gpu::{Error, Gpu, Target};
 use adv_machine::{Env, Ext, Machine, Object, Objects, Outcome, Wait};
-use adv_os::{
-    Heaps,
-    com::{Com, ComIdentity, Destroyed, Iid, QueryError},
-};
+#[cfg(test)]
+use adv_os::Heaps;
 use resources::Resource;
 mod capabilities;
 mod creation;
@@ -56,11 +55,8 @@ const IID_DEVICE: Iid = [
 /// Thin assembly operations; no higher-layer payload is owned by this frontend.
 #[derive(Clone, Copy)]
 pub struct SurfaceProvider {
-    /// Explicit CPU/GDI access, assembled by the runtime without a frontend
-    /// dependency. The borrowed canvas is owned until `release_dc`.
-    pub acquire_dc: fn(&mut Env<'_>, u32, u32, u32, u32) -> Result<u32, String>,
-    pub writeback_dc: fn(&mut Env<'_>, u32, u32, u32) -> Result<(), String>,
-    pub release_dc: fn(&mut Env<'_>, u32),
+    pub allocator: crate::interop::GuestAllocator,
+    pub dc: crate::interop::MemoryDc,
     pub insert: fn(&mut Ext, Target) -> Result<u32, String>,
     pub target: fn(&Ext, u32) -> Option<Target>,
     pub remove: fn(&mut Ext, &mut dyn adv_cpu::backend::Guest, u32) -> Result<(), String>,
@@ -484,12 +480,12 @@ fn com(env: &Env<'_>) -> Com {
     env.ext.get::<State>().com
 }
 fn alloc(env: &mut Env<'_>, len: u32) -> Option<u32> {
-    let heaps = env.ext.get_mut::<Heaps>();
-    heaps.alloc(env.cpu, &mut env.sys.vm, heaps.process_heap, len, true)
+    let allocator = env.ext.get::<State>().provider.allocator;
+    (allocator.allocate)(env, len)
 }
 fn free(env: &mut Env<'_>, pointer: u32) {
-    let heaps = env.ext.get_mut::<Heaps>();
-    heaps.free(env.cpu, &mut env.sys.vm, heaps.process_heap, pointer);
+    let allocator = env.ext.get::<State>().provider.allocator;
+    (allocator.free)(env, pointer);
 }
 fn object(
     env: &mut Env<'_>,
@@ -1155,7 +1151,7 @@ fn reset(
         .identity::<Payload>(&env.sys.objects, this.addr())
         .unwrap();
     let com = com(env);
-    let outstanding_default = env.sys.objects.hosts_in::<adv_os::com::ComObject<Payload>>(com.namespace())
+    let outstanding_default = env.sys.objects.hosts_in::<adv_abi::com::ComObject<Payload>>(com.namespace())
         .any(|(id,_)| matches!(com.get_identity(&env.sys.objects,id), Some(Payload::Resource(r))
             if r.device == device_id && r.desc.Pool == 0 && com.references(&env.sys.objects,id).is_some_and(|n| n != 0)));
     if outstanding_default

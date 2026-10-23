@@ -3,11 +3,11 @@
 //! registration never decodes an opaque descriptor or uses a hand-written arity.
 #![allow(clippy::too_many_arguments)] // SDK COM signatures.
 use super::*;
+use crate::interop::{DcSurface, MemoryDc};
 use adv_abi::{Env, GuestPtr, Handle, Outcome, Registry, win32};
 use adv_cpu::backend::{Backend, Guest};
 use adv_device::surface::{MemoryView, SurfaceStore};
 use adv_machine::{Ext, Machine};
-use adv_os::gdi::Gdi;
 mod enumeration;
 mod modes;
 #[derive(Clone, Copy)]
@@ -18,13 +18,13 @@ pub struct WindowGeometry {
 }
 #[derive(Clone, Copy)]
 pub struct Provider {
+    pub dc: MemoryDc,
     pub memory: for<'a> fn(&'a mut (dyn Guest + 'a)) -> MemoryView<'a, dyn Guest + 'a>,
     pub window: fn(&Ext, &Objects, u32) -> Option<WindowGeometry>,
     pub completed: fn(&mut Env<'_>, u64) -> Option<Outcome>,
 }
 pub struct State {
     draw: DirectDraw,
-    dcs: DeviceContexts,
     provider: Provider,
 }
 impl State {
@@ -53,7 +53,6 @@ pub fn register(registry: &mut Registry) {
 }
 pub fn install<B: Backend>(
     machine: &mut Machine<B>,
-    gdi: Gdi,
     provider: Provider,
 ) -> Result<BTreeMap<u32, u32>, String> {
     let mut entries = BTreeMap::new();
@@ -106,27 +105,11 @@ pub fn install<B: Backend>(
     }
     machine.ext.insert(State {
         draw: DirectDraw::new(entries.clone()),
-        dcs: DeviceContexts::new(gdi),
         provider,
     });
-    let factories = machine.ext.get_or_default::<adv_os::com::ClassFactories>();
-    factories.register(
-        [
-            0xe0, 0x0e, 0xb7, 0xd7, 0x40, 0x43, 0xcf, 0x11, 0xb0, 0x63, 0, 0x20, 0xaf, 0xc2, 0xcd,
-            0x35,
-        ],
-        activate,
-    );
-    factories.register(
-        [
-            0x96, 0x51, 0x30, 0x3c, 0xdb, 0x50, 0xd3, 0x11, 0x9c, 0xfe, 0, 0xc0, 0x4f, 0xd9, 0x30,
-            0xc5,
-        ],
-        activate,
-    );
     Ok(entries)
 }
-fn activate(env: &mut Env<'_>, iid: [u8; 16], outer: u32, output: u32) -> Outcome {
+pub fn activate(env: &mut Env<'_>, iid: [u8; 16], outer: u32, output: u32) -> Outcome {
     let provider = env.ext.get::<State>().provider;
     let result = {
         let (state, store) = env.ext.get2_installed_mut::<State, SurfaceStore>();
@@ -197,14 +180,9 @@ fn call(env: &mut Env<'_>, id: u32, words: &[u32]) -> Outcome {
         }
         state.draw.context = env.context;
         let before = store.stats.presentations;
-        let result = state.draw.call(
-            id,
-            words,
-            store,
-            &mut state.dcs,
-            &mut env.sys.objects,
-            &mut memory,
-        );
+        let result = state
+            .draw
+            .call(id, words, store, &mut env.sys.objects, &mut memory);
         (
             result,
             store.stats.presentations,
@@ -491,11 +469,11 @@ fn get_attached(
 }
 #[win32(ddraw, name = "IDirectDrawSurface7::GetDC", level = implement)]
 fn surface_dc(env: &mut Env<'_>, this: GuestPtr<()>, arg1: GuestPtr<()>) -> Outcome {
-    call(env, api::SURFACE_DC, &[this.addr(), arg1.addr()])
+    get_dc(env, this.addr(), arg1.addr())
 }
 #[win32(ddraw, name = "IDirectDrawSurface7::ReleaseDC", level = implement)]
 fn surface_release_dc(env: &mut Env<'_>, this: GuestPtr<()>, arg1: Handle) -> Outcome {
-    call(env, api::SURFACE_RELEASE_DC, &[this.addr(), arg1.0])
+    release_dc(env, this.addr(), arg1.0)
 }
 #[win32(ddraw, name = "IDirectDrawSurface7::Restore", level = implement)]
 fn restore(env: &mut Env<'_>, this: GuestPtr<()>) -> Outcome {
@@ -582,4 +560,95 @@ fn get_device_identifier(
         Ok(()) => Outcome::Return(0),
         Err(_) => Outcome::Return(INVALID),
     }
+}
+
+fn dc_surface(env: &Env<'_>, sid: u32) -> DcSurface {
+    let surface = &env.ext.get::<SurfaceStore>()[sid];
+    DcSurface {
+        surface: Some(sid),
+        pixels: surface.pixels,
+        width: surface.width,
+        height: surface.height,
+        pitch: surface.pitch,
+        format: surface.format,
+    }
+}
+fn get_dc(env: &mut Env<'_>, object: u32, output: u32) -> Outcome {
+    let state = env.ext.get::<State>();
+    let Some(sid) = state.draw.surface_id(&env.sys.objects, object) else {
+        return Outcome::Return(INVALID);
+    };
+    if env.ext.get::<SurfaceStore>()[sid].locked.is_some() {
+        return Outcome::Return(BUSY);
+    }
+    let provider = state.provider;
+    if let Err(error) = (provider.memory)(env.cpu).writable(output, 4) {
+        return Outcome::Fail(format!("DirectDraw: {error}"));
+    }
+    let surface = dc_surface(env, sid);
+    (provider.dc.create)(
+        env,
+        surface,
+        Box::new(move |env, result| {
+            let dc = match result {
+                Ok(dc) => dc,
+                Err(_) => return Outcome::Return(0x8007000e),
+            };
+            let result = {
+                let mut memory = (provider.memory)(env.cpu);
+                memory
+                    .writable(output, 4)
+                    .and_then(|()| memory.put_u32(output, dc))
+            };
+            if let Err(error) = result {
+                return (provider.dc.release)(
+                    env,
+                    dc,
+                    Box::new(move |_, _| Outcome::Fail(format!("DirectDraw: {error}"))),
+                );
+            }
+            Outcome::Return(0)
+        }),
+    )
+}
+fn release_dc(env: &mut Env<'_>, object: u32, dc: u32) -> Outcome {
+    let state = env.ext.get::<State>();
+    let Some(sid) = state.draw.surface_id(&env.sys.objects, object) else {
+        return Outcome::Return(INVALID);
+    };
+    let provider = state.provider;
+    let surface = dc_surface(env, sid);
+    (provider.dc.flush)(
+        env,
+        dc,
+        surface,
+        Box::new(move |env, result| {
+            if result.is_err() {
+                return Outcome::Return(INVALID);
+            }
+            (provider.dc.release)(
+                env,
+                dc,
+                Box::new(move |env, result| {
+                    if result.is_err() {
+                        return Outcome::Return(INVALID);
+                    }
+                    let store = env.ext.get_mut::<SurfaceStore>();
+                    if store.primary_id() == Some(sid) {
+                        let memory = (provider.memory)(env.cpu);
+                        if let Err(error) =
+                            store.present_from(env.context, sid, &memory, store[sid].rect())
+                        {
+                            return Outcome::Fail(format!("DirectDraw: {error}"));
+                        }
+                        let serial = store.stats.presentations;
+                        if let Some(outcome) = (provider.completed)(env, serial) {
+                            return outcome;
+                        }
+                    }
+                    Outcome::Return(0)
+                }),
+            )
+        }),
+    )
 }

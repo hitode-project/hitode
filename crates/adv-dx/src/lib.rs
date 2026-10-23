@@ -1,6 +1,7 @@
 //! COM device fronts: the interface semantics and object state of DirectX devices (locks,
 //! reference counts, vtables in guest memory). Pixels, mixing and decoding belong to
-//! adv-device; shared process state to adv-os. This crate never depends on adv-win32.
+//! adv-device. DirectDraw and D3D9 receive allocator, DC and window services from
+//! assembly; other fronts use adv-os process state. This crate never depends on adv-win32.
 
 #[cfg(feature = "gpu")]
 pub mod d3d9;
@@ -13,4 +14,5 @@ pub mod dxdiag;
 pub mod shader;
 pub mod wmvcore;
 
+pub mod interop;
 mod refcounts;

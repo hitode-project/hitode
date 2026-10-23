@@ -31,8 +31,8 @@ The workspace is layered. Each layer may depend only on the layers below it, and
 | Host shell | `adv-shell`, `apps/adv-run`, `apps/adv-launcher`, `apps/adv-jit-helper` | Host windows, input, audio output, platform lifecycle, reports | Compatibility logic |
 | Assembly | `adv-runtime` | Loading and wiring the personality, machine and devices; scheduling a family of guest processes | API behavior |
 | Personality | `adv-win32`, `adv-dx` | Parameters, observable behavior and object state of Win32, the CRT and DirectX COM | Drawing, mixing, decoding |
-| System services | `adv-os` | Loader, synthetic PE images, PEB/TEB/LDR, virtual file system, registry, handles, COM | |
-| ABI | `adv-abi`, `adv-abi-macros` | Signatures, calling conventions, argument decoding, registration, stubs, API diagnostics | API behavior |
+| System services | `adv-os` | Loader, synthetic PE images, PEB/TEB/LDR, virtual file system, registry, handles, COM activation and Windows allocators | |
+| ABI | `adv-abi`, `adv-abi-macros` | Signatures, calling conventions, argument decoding, registration, stubs, API diagnostics, COM identities and vtables | API behavior |
 | NT platform | `adv-nt` | The NT services under Wine's PE modules in the Wine userland port: image mapping, process startup, the system call and Unix call dispatchers, and the server protocol client | Windows behavior above the NT interface |
 | Wine server | `adv-wineserver` | Wine's server built in process for the Wine userland port ([#58](https://github.com/hitode-project/hitode/issues/58), [docs/spec/wine.md](docs/spec/wine.md)): handles, namespace, registry and timers, resumed by its caller with time from its caller | Waiting, time, host processes and signals |
 | Unix libraries | `adv-unix` | Wine's Unix libraries, such as `win32u.so`, as guest ELF code: the loader, the host side of `ntdll.so` they import, and the C library parts they use | Windows behavior; host libraries they would load |
@@ -45,7 +45,9 @@ The workspace is layered. Each layer may depend only on the layers below it, and
 The dependency arrows, pointing at what is depended on:
 
 ```text
-adv-shell → adv-runtime → adv-win32 / adv-dx → adv-os → adv-abi → adv-machine → adv-cpu
+adv-shell → adv-runtime → adv-win32 → adv-os → adv-abi → adv-machine → adv-cpu
+adv-runtime → adv-dx → adv-abi / adv-device
+adv-dx → adv-os (transitional: fronts other than DirectDraw and D3D9)
 adv-cpu → adv-cpu-x64 (x86_64) / adv-cpu-a64 (AArch64) → adv-cpu-core
 adv-win32 / adv-dx / adv-shell → adv-device
 adv-cpu-core / adv-machine / adv-device / adv-shell → adv-sync
@@ -53,7 +55,16 @@ adv-shell → adv-report;  adv-os → adv-pe;  adv-abi → adv-abi-macros
 adv-run / adv-launcher → adv-shell
 ```
 
-`adv-win32` and `adv-dx` do not depend on each other; what they share moves down into `adv-os` or `adv-device`.
+`adv-win32` and `adv-dx` do not depend on each other. DirectDraw and D3D9 use
+`adv-abi` for COM identities, interface aliases and reference counts and
+`adv-device` for surfaces and GPU work. The assembly supplies D3D9's private guest
+allocator and both fronts' memory DC operations (`adv_dx::interop`), window geometry
+and display state. DC operations complete through `Outcome` continuations so an
+assembly can call guest Windows interfaces. The old stack adapts its heaps and
+shared GDI state in `adv-runtime::graphics`; its COM activation stays in `adv-os`.
+DirectDraw keeps its private surface arena. Other DirectX fronts retain a
+transitional dependency on `adv-os` for heaps, activation, Automation, files and
+input state.
 
 ## A frame, from start to screen
 

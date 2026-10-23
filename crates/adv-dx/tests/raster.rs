@@ -97,7 +97,6 @@ impl Fixture {
                 id,
                 args,
                 &mut self.surfaces,
-                &mut self.contexts,
                 &mut self.objects,
                 &mut self.memory,
             )
@@ -257,8 +256,15 @@ impl Fixture {
         }
     }
     fn dc(&mut self, object: u32) -> u32 {
-        assert_eq!(self.dd(dd::SURFACE_DC, &[object, 32]), 0);
-        self.memory.u32(32).unwrap()
+        assert_eq!(self.dd(dd::LOCK, &[object, 0, 64, 0x10, 0]), 0);
+        let pixels = self.memory.u32(64 + 36).unwrap();
+        assert_eq!(self.dd(dd::UNLOCK, &[object, 0]), 0);
+        let dc = self.surfaces.new_id();
+        let sid = (0..dc)
+            .find(|&sid| self.surfaces.get(sid).is_some_and(|s| s.pixels == pixels))
+            .unwrap();
+        assert!(self.contexts.create(&mut self.objects, dc, sid));
+        dc
     }
     fn query(&mut self, object: u32, iid: [u8; 16]) -> u32 {
         self.memory.write(16, &iid).unwrap();
@@ -636,65 +642,4 @@ fn gdi_stretch_modes_mirrors_and_clipping_use_the_shared_pixel_store() {
         0
     );
     assert_eq!(f.surfaces.presenter.bgra, before);
-}
-
-#[test]
-fn failed_directdraw_dc_output_never_publishes_a_gdi_alias() {
-    struct RejectOutput<'a> {
-        memory: &'a mut Memory,
-        reject_preflight: bool,
-    }
-    impl SurfaceMemory for RejectOutput<'_> {
-        fn read(&self, addr: u32, len: usize) -> Result<Cow<'_, [u8]>, String> {
-            self.memory.read(addr, len)
-        }
-        fn write(&mut self, addr: u32, bytes: &[u8]) -> Result<(), String> {
-            if addr == 32 {
-                Err("injected DC publication failure".into())
-            } else {
-                self.memory.write(addr, bytes)
-            }
-        }
-        fn writable(&self, addr: u32, len: usize) -> Result<(), String> {
-            if self.reject_preflight && addr == 32 {
-                Err("injected inaccessible output".into())
-            } else {
-                self.memory.writable(addr, len)
-            }
-        }
-        fn copy(&mut self, src: u32, dst: u32, len: usize) -> Result<(), String> {
-            self.memory.copy(src, dst, len)
-        }
-    }
-    let mut f = Fixture::new();
-    let (surface, _, _) = f.surface(4, 2, PixelFormat::Bgra32, false);
-    let before = f.objects.object_count();
-    for reject_preflight in [true, false] {
-        for _ in 0..8 {
-            f.memory.put_u32(32, 0xcccccccc).unwrap();
-            assert!(
-                f.ddraw
-                    .call(
-                        dd::SURFACE_DC,
-                        &[surface, 32],
-                        &mut f.surfaces,
-                        &mut f.contexts,
-                        &mut f.objects,
-                        &mut RejectOutput {
-                            memory: &mut f.memory,
-                            reject_preflight
-                        }
-                    )
-                    .is_err()
-            );
-            assert_eq!(f.memory.u32(32).unwrap(), 0xcccccccc);
-            assert_eq!(f.objects.object_count(), before);
-            assert_eq!(f.objects.all_hosts::<adv_os::gdi::GdiObj>().count(), 0);
-        }
-    }
-    let dc = f.dc(surface);
-    assert_eq!(f.objects.all_hosts::<adv_os::gdi::GdiObj>().count(), 1);
-    assert_eq!(f.dd(dd::SURFACE_RELEASE_DC, &[surface, dc]), 0);
-    assert_eq!(f.objects.object_count(), before);
-    assert_eq!(f.objects.all_hosts::<adv_os::gdi::GdiObj>().count(), 0);
 }
