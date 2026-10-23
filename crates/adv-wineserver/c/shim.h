@@ -3,13 +3,17 @@
  * Every server source is compiled with this header forced in front. It pulls
  * in the system headers first, so their declarations keep the real names,
  * then routes the calls that would block, leave, signal or read the clock
- * of the host process to platform.c. */
+ * of the host process to host.c. */
 
 #ifndef HITODE_SHIM_H
 #define HITODE_SHIM_H
 
 #include <stdarg.h>
 #include <stdlib.h>
+#include <stdio.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/socket.h>
 #include <unistd.h>
 #include <poll.h>
 #include <signal.h>
@@ -18,6 +22,24 @@
 #include <sys/wait.h>
 #include <mach/mach_types.h>
 #include <mach/mach_time.h>
+
+int hitode_asprintf( char **str, const char *format, ... );
+int hitode_chdir( const char *path );
+int hitode_fchdir( int fd );
+int hitode_open( const char *path, int flags, ... );
+FILE *hitode_fopen( const char *path, const char *mode );
+int hitode_stat( const char *path, struct stat *st );
+int hitode_lstat( const char *path, struct stat *st );
+int hitode_mkdir( const char *path, mode_t mode );
+int hitode_unlink( const char *path );
+int hitode_rmdir( const char *path );
+int hitode_rename( const char *from, const char *to );
+int hitode_link( const char *from, const char *to );
+ssize_t hitode_readlink( const char *path, char *buf, size_t size );
+int hitode_chmod( const char *path, mode_t mode );
+char *hitode_realpath( const char *path, char *resolved );
+int hitode_bind( int fd, const struct sockaddr *addr, socklen_t len );
+int hitode_connect( int fd, const struct sockaddr *addr, socklen_t len );
 
 int hitode_poll( struct pollfd *fds, nfds_t count, int timeout );
 char *hitode_getenv( const char *name );
@@ -41,6 +63,24 @@ kern_return_t hitode_mach_port_extract_right( ipc_space_t task, mach_port_name_t
                                               mach_msg_type_name_t *acquired );
 kern_return_t hitode_mach_port_deallocate( ipc_space_t task, mach_port_name_t name );
 int hitode_NSGetExecutablePath( char *buf, uint32_t *size );
+
+#define asprintf(...) hitode_asprintf(__VA_ARGS__)
+#define chdir(...) hitode_chdir(__VA_ARGS__)
+#define fchdir(...) hitode_fchdir(__VA_ARGS__)
+#define open(...) hitode_open(__VA_ARGS__)
+#define fopen(...) hitode_fopen(__VA_ARGS__)
+#define stat(...) hitode_stat(__VA_ARGS__)
+#define lstat(...) hitode_lstat(__VA_ARGS__)
+#define mkdir(...) hitode_mkdir(__VA_ARGS__)
+#define unlink(...) hitode_unlink(__VA_ARGS__)
+#define rmdir(...) hitode_rmdir(__VA_ARGS__)
+#define rename(...) hitode_rename(__VA_ARGS__)
+#define link(...) hitode_link(__VA_ARGS__)
+#define readlink(...) hitode_readlink(__VA_ARGS__)
+#define chmod(...) hitode_chmod(__VA_ARGS__)
+#define realpath(...) hitode_realpath(__VA_ARGS__)
+#define bind(...) hitode_bind(__VA_ARGS__)
+#define connect(...) hitode_connect(__VA_ARGS__)
 
 #define poll(...) hitode_poll(__VA_ARGS__)
 #define getenv(...) hitode_getenv(__VA_ARGS__)

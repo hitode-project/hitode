@@ -70,6 +70,7 @@ fn client_receives_request_pipe_and_server_exits_on_its_clock() {
     let clock = TestClock(Cell::new(0));
     let config = Config {
         prefix: prefix.clone(),
+        server_dir: root.join("server"),
         install,
         debug: 0,
     };
@@ -84,7 +85,17 @@ fn client_receives_request_pipe_and_server_exits_on_its_clock() {
         Err(adv_wineserver::Error::AlreadyStarted)
     ));
 
-    let client = UnixStream::connect(server.socket_path().unwrap()).unwrap();
+    let directory = std::fs::File::open(server.socket_dir().unwrap()).unwrap();
+    let client = std::thread::spawn(move || {
+        unsafe extern "C" {
+            fn pthread_fchdir_np(fd: libc::c_int) -> libc::c_int;
+        }
+        // SAFETY: directory is live; the thread exits after connect.
+        assert_eq!(unsafe { pthread_fchdir_np(directory.as_raw_fd()) }, 0);
+        UnixStream::connect("socket").unwrap()
+    })
+    .join()
+    .unwrap();
     assert!(matches!(server.step(&clock), State::Waiting(_)));
     let (version, _request_pipe) = receive_request_pipe(&client);
     assert_eq!(version, PROTOCOL_VERSION);
