@@ -48,6 +48,7 @@ pub enum Stop {
 pub struct Session {
     pub machine: Machine<Cpu>,
     wake: WakeEvent,
+    audio: adv_device::AudioControl,
 }
 
 /// Wine's Unix side, then the graphics fronts and the user driver.
@@ -178,6 +179,8 @@ impl Session {
         // the built-in stack; the backend's default watchdog is for tests.
         machine.set_execution_budget(None);
         adv_unix::install(&mut machine);
+        let audio = adv_device::AudioControl::new(true);
+        machine.ext.insert(audio.clone());
         super::install(&mut machine, &prefix, config.width, config.height)?;
         prepare(&mut machine)?;
         let startup = Startup {
@@ -202,7 +205,11 @@ impl Session {
             Box::new(Driver { server, clock }),
         )
         .map_err(|e| e.to_string())?;
-        Ok(Session { machine, wake })
+        Ok(Session {
+            machine,
+            wake,
+            audio,
+        })
     }
 
     /// Run the guest until it exits or `until` passes. While every context
@@ -246,6 +253,10 @@ impl Session {
                 return Stop::Failed(error.to_string());
             }
         }
+    }
+
+    pub fn audio_stream(&self) -> adv_device::AudioStream {
+        self.audio.stream()
     }
 
     /// The latest frame [`Session::capture`] took.
@@ -327,6 +338,7 @@ impl Session {
 
     /// Take finished host work; true when guest work may continue.
     fn serve(&mut self) -> Result<bool, String> {
+        self.audio.sync_clock(self.machine.sys.clock.now_us());
         #[cfg(feature = "gpu")]
         return adv_dx::d3d9::pump(&mut self.machine);
         #[cfg(not(feature = "gpu"))]

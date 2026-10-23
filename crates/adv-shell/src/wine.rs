@@ -118,6 +118,7 @@ pub(super) fn run_execution(
         frames: Some((worker.take_frames(), worker.ui_wake.clone())),
     };
     let mut session = start(options, dist, wake, host)?;
+    let mut audio = adv_device::Output::new(session.audio_stream());
     let mut performance = super::performance::Performance::default();
     let exit_code = loop {
         if worker.stopped() {
@@ -130,6 +131,7 @@ pub(super) fn run_execution(
         {
             break 0;
         }
+        audio.update();
         match session.run(Instant::now() + SLICE) {
             Stop::Paused => {}
             Stop::Exited(code) => break code as u8,

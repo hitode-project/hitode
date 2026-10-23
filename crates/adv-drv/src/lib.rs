@@ -12,6 +12,7 @@ use adv_device::surface::MemoryView;
 use adv_machine::Machine;
 use adv_machine::layout::PAGE;
 
+pub mod audio;
 pub mod user;
 
 /// What the drivers take from the assembly.
@@ -24,6 +25,7 @@ pub struct Provider {
 }
 
 pub fn register(registry: &mut Registry) {
+    audio::register(registry);
     user::register(registry);
 }
 
@@ -41,6 +43,7 @@ pub fn install<B: Backend>(
         .insert(adv_nt::process::Desktop(user::start_desktop));
     let image = user::image(machine)?;
     adv_unix::builtin::install(prefix, &image).map_err(|e| e.to_string())?;
+    audio::install(machine, prefix)?;
     Ok(())
 }
 
