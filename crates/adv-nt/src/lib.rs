@@ -12,6 +12,7 @@
 pub mod atom;
 pub mod context;
 pub mod debug;
+pub mod directory;
 pub mod dispatch;
 pub mod exception;
 pub mod file;

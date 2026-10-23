@@ -378,40 +378,70 @@ pub fn query_attributes(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         unreachable!()
     };
     status::finish((|| {
-        let attributes = Attributes::read(env, attributes)?;
-        let Some(name) = &attributes.name else {
-            return Err(status::INVALID_PARAMETER.into());
-        };
-        if attributes.root != 0 {
-            return Err(Error::Unsupported(
-                "querying a file relative to a directory".into(),
-            ));
-        }
-        let dosdevices = &env.ext.get::<Files>().dosdevices;
-        let host = match path::lookup(dosdevices, name)? {
-            Lookup::Found(host) => host,
-            Lookup::Missing(_) => return Err(status::OBJECT_NAME_NOT_FOUND.into()),
-            Lookup::Device => {
-                return Err(Error::Unsupported(format!(
-                    "querying device {}",
-                    String::from_utf16_lossy(name)
-                )));
-            }
-        };
-        let link = std::fs::symlink_metadata(&host).map_err(|_| status::OBJECT_NAME_NOT_FOUND)?;
-        let metadata = std::fs::metadata(&host).map_err(|_| status::OBJECT_NAME_NOT_FOUND)?;
-        if !metadata.is_file() && !metadata.is_dir() {
-            return Err(status::INVALID_INFO_CLASS.into());
-        }
+        let (host, link, metadata) = named_file(env, attributes)?;
         let bytes = basic_information(&host, &link, &metadata);
         write_bytes(env, info, &bytes)?;
         Ok(())
     })())
 }
 
+/// NtQueryFullAttributesFile(*attributes, *info):
+/// FILE_NETWORK_OPEN_INFORMATION, the times, sizes and attributes.
+pub fn query_full_attributes(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    let &[attributes, info] = args else {
+        unreachable!()
+    };
+    status::finish((|| {
+        use std::os::unix::fs::MetadataExt;
+        let (host, link, metadata) = named_file(env, attributes)?;
+        let basic = basic_information(&host, &link, &metadata);
+        let mut bytes = [0u8; 56];
+        bytes[..32].copy_from_slice(&basic[..32]);
+        bytes[32..40].copy_from_slice(&(metadata.blocks() * 512).to_le_bytes());
+        bytes[40..48].copy_from_slice(&metadata.size().to_le_bytes());
+        bytes[48..52].copy_from_slice(&basic[32..36]);
+        write_bytes(env, info, &bytes)?;
+        Ok(())
+    })())
+}
+
+/// The host file the OBJECT_ATTRIBUTES at `attributes` name, with its own
+/// and its target's metadata.
+fn named_file(
+    env: &mut Env<'_>,
+    attributes: u32,
+) -> Result<(PathBuf, std::fs::Metadata, std::fs::Metadata), Error> {
+    let attributes = Attributes::read(env, attributes)?;
+    let Some(name) = &attributes.name else {
+        return Err(status::INVALID_PARAMETER.into());
+    };
+    if attributes.root != 0 {
+        return Err(Error::Unsupported(
+            "querying a file relative to a directory".into(),
+        ));
+    }
+    let dosdevices = &env.ext.get::<Files>().dosdevices;
+    let host = match path::lookup(dosdevices, name)? {
+        Lookup::Found(host) => host,
+        Lookup::Missing(_) => return Err(status::OBJECT_NAME_NOT_FOUND.into()),
+        Lookup::Device => {
+            return Err(Error::Unsupported(format!(
+                "querying device {}",
+                String::from_utf16_lossy(name)
+            )));
+        }
+    };
+    let link = std::fs::symlink_metadata(&host).map_err(|_| status::OBJECT_NAME_NOT_FOUND)?;
+    let metadata = std::fs::metadata(&host).map_err(|_| status::OBJECT_NAME_NOT_FOUND)?;
+    if !metadata.is_file() && !metadata.is_dir() {
+        return Err(status::INVALID_INFO_CLASS.into());
+    }
+    Ok((host, link, metadata))
+}
+
 /// FILE_BASIC_INFORMATION: creation, access, write and change times, then
 /// the attributes.
-fn basic_information(
+pub(crate) fn basic_information(
     host: &std::path::Path,
     link: &std::fs::Metadata,
     metadata: &std::fs::Metadata,

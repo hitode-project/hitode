@@ -534,7 +534,7 @@ pub fn map_image(env: &mut Env<'_>, mapping: u32) -> Result<View, Error> {
 
 /// The host path of an open file, for finding a builtin image's Unix
 /// library next to it.
-fn file_path(fd: std::os::fd::RawFd) -> Option<std::path::PathBuf> {
+pub(crate) fn file_path(fd: std::os::fd::RawFd) -> Option<std::path::PathBuf> {
     #[cfg(target_vendor = "apple")]
     {
         use std::os::unix::ffi::OsStrExt;

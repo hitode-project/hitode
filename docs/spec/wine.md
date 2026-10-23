@@ -60,6 +60,13 @@ This spec covers the Wine userland stack. `adv-wineserver` runs Wine's server in
 **Rule**: `NtCreateUserProcess` MUST fail with `STATUS_NOT_SUPPORTED`. win32u then creates the process's own desktop window, as Wine does when explorer cannot start.
 **Verification**: Test
 
+### WINE-SYS-5 Host names and listings
+
+**Rule**: `\??\unix` MUST name the host's root as a drive names its link. A directory listing MUST give `.`, `..`, then the entries matching the mask in name order. Each query MUST continue where the last stopped, until a restart.
+**Verification**: Test
+
+Entries carry no 8.3 names, as on a volume that does not make them.
+
 ## Unix libraries
 
 ### WINE-UNIX-1 Guest ELF libraries
@@ -78,6 +85,13 @@ An ntdll.dll export with no known convention stops the load. A weak symbol nothi
 
 **Rule**: System calls from 0x1000 MUST run the function win32u registered with its arguments. `KeUserModeCallback` MUST run `KiUserCallbackDispatcher` on the same stack, and `NtCallbackReturn` MUST end that call with its result.
 **Verification**: Test
+
+### WINE-UNIX-4 Shared libraries and files
+
+**Rule**: `dlopen` of a bare name MUST look next to the Unix libraries already loaded. A Unix library MUST open host files only for reading, and map them as shared read-only views. `ntdll_get_data_dir` MUST name `share/wine` of that installation.
+**Verification**: Test
+
+FreeType is such a library: win32u opens it by name and draws TrueType text through it.
 
 ## Threads
 

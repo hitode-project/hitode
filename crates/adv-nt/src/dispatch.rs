@@ -12,8 +12,8 @@ use adv_machine::{Conv, Env, HostFn, Outcome, Resolver};
 
 use crate::syscalls::SYSCALLS;
 use crate::{
-    atom, exception, file, information, kuser, memory, nls, object, process, registry, section,
-    server, sync, system, thread, token, unix, unixlib, win32k,
+    atom, directory, exception, file, information, kuser, memory, nls, object, process, registry,
+    section, server, sync, system, thread, token, unix, unixlib, win32k,
 };
 
 /// A system call, given its arguments.
@@ -56,8 +56,10 @@ const IMPLEMENTED: &[(&str, Syscall)] = &[
     ("NtMapViewOfSection", section::map_view),
     ("NtProtectVirtualMemory", memory::protect),
     ("NtQueryAttributesFile", file::query_attributes),
+    ("NtQueryFullAttributesFile", file::query_full_attributes),
     ("NtQueueApcThread", sync::queue_apc),
     ("NtQueryDefaultLocale", nls::default_locale),
+    ("NtQueryDirectoryFile", directory::query),
     ("NtQueryInformationAtom", atom::query),
     ("NtQueryInformationProcess", information::query_process),
     ("NtQueryInformationThread", information::query_thread),

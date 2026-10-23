@@ -10,6 +10,7 @@
 #![cfg(unix)]
 
 pub mod elf;
+mod file;
 mod libc;
 pub mod loader;
 mod ntdll;
@@ -37,7 +38,9 @@ impl Resolver for Platform {
         }
         let (conv, handler) = match module {
             NTDLL => ntdll::function(name)?,
-            LIBC | LIBM => libc::function(name).or_else(|| pthread::function(name))?,
+            LIBC | LIBM => libc::function(name)
+                .or_else(|| file::function(name))
+                .or_else(|| pthread::function(name))?,
             _ => return None,
         };
         Some(HostFn {

@@ -4,8 +4,8 @@
 //! Functions whose behavior ntdll.dll's C runtime exports share, such as
 //! `memcpy` or `cos`, bind to those exports ([`shared_with_ntdll`]). The
 //! heap is the process heap. The rest are host functions with glibc's
-//! semantics; a library this process has no Unix side for, or a Unix file,
-//! is absent, as on a host that lacks it.
+//! semantics; a shared library outside Wine's Unix directory, or a file
+//! opened as a stream, is absent, as on a host that lacks it.
 
 use adv_cpu::backend::{GuestExt, Reg};
 use adv_machine::layout::teb;
@@ -13,18 +13,25 @@ use adv_machine::{Conv, Env, Outcome};
 use adv_nt::memory::{self, Memory};
 use adv_nt::process::Ntdll;
 
+use std::ffi::OsString;
+use std::os::unix::ffi::OsStringExt;
+use std::path::{Path, PathBuf};
+
 use crate::Function;
+use crate::loader::{self, Libraries};
 
 /// The longest format or string argument read.
 const MAX_STRING: usize = 1 << 16;
 const PEB_PROCESS_HEAP: u32 = 0x18;
 const HEAP_ZERO_MEMORY: u32 = 8;
+const RTLD_DEFAULT: u32 = 0;
 
 /// The ntdll.dll export that implements C library function `name`.
 pub fn shared_with_ntdll(name: &str) -> Option<&'static str> {
     const SHARED: &[&str] = &[
-        "memcmp", "memcpy", "memmove", "memset", "strcat", "strchr", "strcmp", "strcpy", "strlen",
-        "strncmp", "strrchr", "strstr", "qsort", "atan2", "cos", "sin", "floor", "pow", "log",
+        "memchr", "memcmp", "memcpy", "memmove", "memset", "strcat", "strchr", "strcmp", "strcpy",
+        "strlen", "strncmp", "strncpy", "strrchr", "strstr", "strtol", "qsort", "atan2", "cos",
+        "sin", "floor", "pow", "log",
     ];
     match name {
         // C23 scanf differs from C89's only in binary integers.
@@ -48,6 +55,8 @@ pub fn function(name: &str) -> Option<Function> {
         "__ctype_b_loc" => (cdecl(0), ctype_b_loc),
         "__ctype_toupper_loc" => (cdecl(0), ctype_toupper_loc),
         "_setjmp" => (cdecl(1), setjmp),
+        "longjmp" => (cdecl(2), longjmp),
+        "getenv" => (cdecl(1), getenv),
         "hypot" => (cdecl(4), hypot),
         "roundf" => (cdecl(1), roundf),
         "sincos" => (cdecl(4), sincos),
@@ -134,7 +143,7 @@ fn free(env: &mut Env<'_>) -> Outcome {
 }
 
 /// Copies `bytes` and a terminating zero into a new heap block.
-fn allocate_string(
+pub(crate) fn allocate_string(
     env: &mut Env<'_>,
     mut bytes: Vec<u8>,
     then: impl FnOnce(&mut Env<'_>, u32) -> Outcome + 'static,
@@ -500,6 +509,33 @@ fn setjmp(env: &mut Env<'_>) -> Outcome {
     }
 }
 
+/// longjmp(env, value): back to the `_setjmp` that filled the buffer,
+/// returning `value`, or 1 for 0.
+fn longjmp(env: &mut Env<'_>) -> Outcome {
+    let (buffer, value) = (env.arg(0), env.arg(1).max(1));
+    let mut words = [0u32; 6];
+    for (index, word) in words.iter_mut().enumerate() {
+        match env.cpu.read_u32(buffer + 4 * index as u32) {
+            Ok(value) => *word = value,
+            Err(_) => return Outcome::Fail(format!("longjmp: unreadable buffer at {buffer:#x}")),
+        }
+    }
+    let [ebx, esi, edi, ebp, esp, eip] = words;
+    let mut checkpoint = match env.checkpoint_for_stack_unwind(esp) {
+        Ok(checkpoint) => checkpoint,
+        Err(reason) => return Outcome::Fail(format!("longjmp: {reason}")),
+    };
+    let regs = &mut checkpoint.state.regs;
+    (regs[0], regs[3], regs[4], regs[5], regs[6], regs[7]) = (value, ebx, esp, ebp, esi, edi);
+    checkpoint.state.eip = eip;
+    Outcome::ResumeExecution(checkpoint.unwind_callbacks())
+}
+
+/// The process has no Unix environment.
+fn getenv(_: &mut Env<'_>) -> Outcome {
+    Outcome::Return(0)
+}
+
 // Mathematics.
 
 fn f64_arg(env: &Env<'_>, index: u32) -> f64 {
@@ -527,7 +563,7 @@ fn sincos(env: &mut Env<'_>) -> Outcome {
 
 // What the host lacks.
 
-/// The process sees no Unix files.
+/// The process opens no Unix streams.
 fn fopen(env: &mut Env<'_>) -> Outcome {
     if let Ok(path) = string(env, env.arg(0), MAX_STRING) {
         log::debug!("fopen {}: absent", String::from_utf8_lossy(&path));
@@ -535,17 +571,46 @@ fn fopen(env: &mut Env<'_>) -> Outcome {
     Outcome::Return(0)
 }
 
-/// No shared library outside the Unix libraries of Wine's modules is
-/// present.
+/// dlopen(name, flags): the shared libraries present are those next to
+/// the Unix libraries of Wine's modules. The handle is the base.
 fn dlopen(env: &mut Env<'_>) -> Outcome {
-    if let Ok(name) = string(env, env.arg(0), MAX_STRING) {
-        log::debug!("dlopen {}: absent", String::from_utf8_lossy(&name));
-    }
-    Outcome::Return(0)
+    let name = match string(env, env.arg(0), MAX_STRING) {
+        Ok(name) => PathBuf::from(OsString::from_vec(name)),
+        Err(error) => return Outcome::Fail(format!("dlopen: {error}")),
+    };
+    let libraries = env.ext.get_or_default::<Libraries>();
+    let directory = libraries.0.first().and_then(|first| first.path.parent());
+    let path = match directory {
+        Some(directory) if name.parent() == Some(Path::new("")) => directory.join(&name),
+        _ => name,
+    };
+    let shown = path.clone();
+    loader::open(
+        env,
+        &shown,
+        Box::new(move |_, base| {
+            if base.is_err() {
+                log::debug!("dlopen {}: absent", path.display());
+            }
+            Outcome::Return(base.unwrap_or(0))
+        }),
+    )
 }
 
-fn dlsym(_: &mut Env<'_>) -> Outcome {
-    Outcome::Return(0)
+/// dlsym(handle, name): a symbol of the library `handle` names, or of any
+/// for RTLD_DEFAULT.
+fn dlsym(env: &mut Env<'_>) -> Outcome {
+    let handle = env.arg(0);
+    let name = match string(env, env.arg(1), MAX_STRING) {
+        Ok(name) => String::from_utf8_lossy(&name).into_owned(),
+        Err(error) => return Outcome::Fail(format!("dlsym: {error}")),
+    };
+    let libraries = &env.ext.get_or_default::<Libraries>().0;
+    let address = libraries
+        .iter()
+        .filter(|library| handle == RTLD_DEFAULT || library.base == handle)
+        .find_map(|library| library.symbol(&name));
+    Outcome::Return(address.unwrap_or(0))
 }
 
 fn dlclose(_: &mut Env<'_>) -> Outcome {

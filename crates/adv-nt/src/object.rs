@@ -105,6 +105,7 @@ impl Attributes {
 
 /// NtClose(handle)
 pub fn close(env: &mut Env<'_>, args: &[u32]) -> adv_machine::Outcome {
+    crate::directory::forget(env, args[0]);
     status::finish(crate::server::close(env, args[0]))
 }
 
