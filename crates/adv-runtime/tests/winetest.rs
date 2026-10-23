@@ -19,6 +19,7 @@ const CASES: &[&str] = &[
     "gdi32_clipping",
     "gdi32_gdiobj",
     "gdi32_mapping",
+    "gdi32_metafile",
     "gdi32_palette",
     "gdi32_path",
     "gdi32_pen",
@@ -27,6 +28,8 @@ const CASES: &[&str] = &[
     "kernel32_format_msg",
     "msvcrt_heap",
     "msvcrt_locale",
+    "msvcrt_printf",
+    "msvcrt_scanf",
     "msvcrt_string",
     "msvcrt_time",
     "ntdll_atom",
@@ -36,6 +39,7 @@ const CASES: &[&str] = &[
     "ntdll_rtlstr",
     "ntdll_string",
     "user32_dce",
+    "user32_resource",
     "user32_text",
 ];
 const CASE: &str = "ADV_WINETEST_CASE";

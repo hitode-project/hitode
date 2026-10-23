@@ -171,6 +171,342 @@ impl Request for CreateFileRequest {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
+pub struct OpenFileObjectRequest {
+    pub header: RequestHeader,
+    pub access: u32,
+    pub attributes: u32,
+    pub rootdir: u32,
+    pub sharing: u32,
+    pub options: u32,
+}
+const _: () = assert!(size_of::<OpenFileObjectRequest>() == 32);
+const _: () = assert!(std::mem::offset_of!(OpenFileObjectRequest, access) == 12);
+const _: () = assert!(std::mem::offset_of!(OpenFileObjectRequest, attributes) == 16);
+const _: () = assert!(std::mem::offset_of!(OpenFileObjectRequest, rootdir) == 20);
+const _: () = assert!(std::mem::offset_of!(OpenFileObjectRequest, sharing) == 24);
+const _: () = assert!(std::mem::offset_of!(OpenFileObjectRequest, options) == 28);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OpenFileObjectReply {
+    pub header: ReplyHeader,
+    pub handle: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<OpenFileObjectReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(OpenFileObjectReply, handle) == 8);
+
+impl Request for OpenFileObjectRequest {
+    const NUMBER: i32 = 45;
+    type Reply = OpenFileObjectReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GetFileInfoRequest {
+    pub header: RequestHeader,
+    pub handle: u32,
+    pub info_class: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<GetFileInfoRequest>() == 24);
+const _: () = assert!(std::mem::offset_of!(GetFileInfoRequest, handle) == 12);
+const _: () = assert!(std::mem::offset_of!(GetFileInfoRequest, info_class) == 16);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GetFileInfoReply {
+    pub header: ReplyHeader,
+}
+const _: () = assert!(size_of::<GetFileInfoReply>() == 8);
+
+impl Request for GetFileInfoRequest {
+    const NUMBER: i32 = 51;
+    type Reply = GetFileInfoReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GetHandleUnixNameRequest {
+    pub header: RequestHeader,
+    pub handle: u32,
+}
+const _: () = assert!(size_of::<GetHandleUnixNameRequest>() == 16);
+const _: () = assert!(std::mem::offset_of!(GetHandleUnixNameRequest, handle) == 12);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GetHandleUnixNameReply {
+    pub header: ReplyHeader,
+    pub name_len: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<GetHandleUnixNameReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(GetHandleUnixNameReply, name_len) == 8);
+
+impl Request for GetHandleUnixNameRequest {
+    const NUMBER: i32 = 47;
+    type Reply = GetHandleUnixNameReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SetFdEofInfoRequest {
+    pub header: RequestHeader,
+    pub handle: u32,
+    pub eof: u64,
+}
+const _: () = assert!(size_of::<SetFdEofInfoRequest>() == 24);
+const _: () = assert!(std::mem::offset_of!(SetFdEofInfoRequest, handle) == 12);
+const _: () = assert!(std::mem::offset_of!(SetFdEofInfoRequest, eof) == 16);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SetFdEofInfoReply {
+    pub header: ReplyHeader,
+}
+const _: () = assert!(size_of::<SetFdEofInfoReply>() == 8);
+
+impl Request for SetFdEofInfoRequest {
+    const NUMBER: i32 = 274;
+    type Reply = SetFdEofInfoReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SetFdDispInfoRequest {
+    pub header: RequestHeader,
+    pub handle: u32,
+    pub flags: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<SetFdDispInfoRequest>() == 24);
+const _: () = assert!(std::mem::offset_of!(SetFdDispInfoRequest, handle) == 12);
+const _: () = assert!(std::mem::offset_of!(SetFdDispInfoRequest, flags) == 16);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SetFdDispInfoReply {
+    pub header: ReplyHeader,
+}
+const _: () = assert!(size_of::<SetFdDispInfoReply>() == 8);
+
+impl Request for SetFdDispInfoRequest {
+    const NUMBER: i32 = 272;
+    type Reply = SetFdDispInfoReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SetFdNameInfoRequest {
+    pub header: RequestHeader,
+    pub handle: u32,
+    pub rootdir: u32,
+    pub namelen: u32,
+    pub link: i32,
+    pub flags: u32,
+}
+const _: () = assert!(size_of::<SetFdNameInfoRequest>() == 32);
+const _: () = assert!(std::mem::offset_of!(SetFdNameInfoRequest, handle) == 12);
+const _: () = assert!(std::mem::offset_of!(SetFdNameInfoRequest, rootdir) == 16);
+const _: () = assert!(std::mem::offset_of!(SetFdNameInfoRequest, namelen) == 20);
+const _: () = assert!(std::mem::offset_of!(SetFdNameInfoRequest, link) == 24);
+const _: () = assert!(std::mem::offset_of!(SetFdNameInfoRequest, flags) == 28);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SetFdNameInfoReply {
+    pub header: ReplyHeader,
+}
+const _: () = assert!(size_of::<SetFdNameInfoReply>() == 8);
+
+impl Request for SetFdNameInfoRequest {
+    const NUMBER: i32 = 273;
+    type Reply = SetFdNameInfoReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CreateNamedPipeRequest {
+    pub header: RequestHeader,
+    pub access: u32,
+    pub options: u32,
+    pub sharing: u32,
+    pub disposition: u32,
+    pub maxinstances: u32,
+    pub outsize: u32,
+    pub insize: u32,
+    pub timeout: i64,
+    pub flags: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<CreateNamedPipeRequest>() == 56);
+const _: () = assert!(std::mem::offset_of!(CreateNamedPipeRequest, access) == 12);
+const _: () = assert!(std::mem::offset_of!(CreateNamedPipeRequest, options) == 16);
+const _: () = assert!(std::mem::offset_of!(CreateNamedPipeRequest, sharing) == 20);
+const _: () = assert!(std::mem::offset_of!(CreateNamedPipeRequest, disposition) == 24);
+const _: () = assert!(std::mem::offset_of!(CreateNamedPipeRequest, maxinstances) == 28);
+const _: () = assert!(std::mem::offset_of!(CreateNamedPipeRequest, outsize) == 32);
+const _: () = assert!(std::mem::offset_of!(CreateNamedPipeRequest, insize) == 36);
+const _: () = assert!(std::mem::offset_of!(CreateNamedPipeRequest, timeout) == 40);
+const _: () = assert!(std::mem::offset_of!(CreateNamedPipeRequest, flags) == 48);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CreateNamedPipeReply {
+    pub header: ReplyHeader,
+    pub handle: u32,
+    pub created: i32,
+}
+const _: () = assert!(size_of::<CreateNamedPipeReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(CreateNamedPipeReply, handle) == 8);
+const _: () = assert!(std::mem::offset_of!(CreateNamedPipeReply, created) == 12);
+
+impl Request for CreateNamedPipeRequest {
+    const NUMBER: i32 = 140;
+    type Reply = CreateNamedPipeReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ReadRequest {
+    pub header: RequestHeader,
+    pub _pad0: [u8; 4],
+    pub r#async: [u8; 40],
+    pub pos: u64,
+}
+impl Default for ReadRequest {
+    fn default() -> Self {
+        Self {
+            header: Default::default(),
+            _pad0: [0; 4],
+            r#async: [0; 40],
+            pos: 0,
+        }
+    }
+}
+const _: () = assert!(size_of::<ReadRequest>() == 64);
+const _: () = assert!(std::mem::offset_of!(ReadRequest, r#async) == 16);
+const _: () = assert!(std::mem::offset_of!(ReadRequest, pos) == 56);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ReadReply {
+    pub header: ReplyHeader,
+    pub wait: u32,
+    pub options: u32,
+}
+const _: () = assert!(size_of::<ReadReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(ReadReply, wait) == 8);
+const _: () = assert!(std::mem::offset_of!(ReadReply, options) == 12);
+
+impl Request for ReadRequest {
+    const NUMBER: i32 = 136;
+    type Reply = ReadReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct WriteRequest {
+    pub header: RequestHeader,
+    pub _pad0: [u8; 4],
+    pub r#async: [u8; 40],
+    pub pos: u64,
+}
+impl Default for WriteRequest {
+    fn default() -> Self {
+        Self {
+            header: Default::default(),
+            _pad0: [0; 4],
+            r#async: [0; 40],
+            pos: 0,
+        }
+    }
+}
+const _: () = assert!(size_of::<WriteRequest>() == 64);
+const _: () = assert!(std::mem::offset_of!(WriteRequest, r#async) == 16);
+const _: () = assert!(std::mem::offset_of!(WriteRequest, pos) == 56);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WriteReply {
+    pub header: ReplyHeader,
+    pub wait: u32,
+    pub options: u32,
+    pub size: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<WriteReply>() == 24);
+const _: () = assert!(std::mem::offset_of!(WriteReply, wait) == 8);
+const _: () = assert!(std::mem::offset_of!(WriteReply, options) == 12);
+const _: () = assert!(std::mem::offset_of!(WriteReply, size) == 16);
+
+impl Request for WriteRequest {
+    const NUMBER: i32 = 137;
+    type Reply = WriteReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AddFdCompletionRequest {
+    pub header: RequestHeader,
+    pub handle: u32,
+    pub cvalue: u64,
+    pub information: u64,
+    pub status: u32,
+    pub r#async: i32,
+}
+const _: () = assert!(size_of::<AddFdCompletionRequest>() == 40);
+const _: () = assert!(std::mem::offset_of!(AddFdCompletionRequest, handle) == 12);
+const _: () = assert!(std::mem::offset_of!(AddFdCompletionRequest, cvalue) == 16);
+const _: () = assert!(std::mem::offset_of!(AddFdCompletionRequest, information) == 24);
+const _: () = assert!(std::mem::offset_of!(AddFdCompletionRequest, status) == 32);
+const _: () = assert!(std::mem::offset_of!(AddFdCompletionRequest, r#async) == 36);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AddFdCompletionReply {
+    pub header: ReplyHeader,
+}
+const _: () = assert!(size_of::<AddFdCompletionReply>() == 8);
+
+impl Request for AddFdCompletionRequest {
+    const NUMBER: i32 = 270;
+    type Reply = AddFdCompletionReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct AllocFileHandleRequest {
     pub header: RequestHeader,
     pub access: u32,

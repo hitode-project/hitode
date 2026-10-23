@@ -1,6 +1,12 @@
 //! File system calls, after Wine's `unix/file.c`: the platform finds the
 //! host file and the server opens it and holds the handle.
 
+mod information;
+mod io;
+
+pub use information::{query, set};
+pub use io::{create_named_pipe, read};
+
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
@@ -8,7 +14,7 @@ use adv_machine::{Env, Outcome};
 
 use crate::object::{Attributes, write_bytes, write_u32};
 use crate::path::{self, Lookup};
-use crate::protocol::CreateFileRequest;
+use crate::protocol::{CreateFileRequest, OpenFileObjectRequest};
 use crate::server;
 use crate::status::{self, Error};
 
@@ -50,13 +56,17 @@ pub fn write(env: &mut Env<'_>, args: &[u32]) -> Outcome {
     else {
         unreachable!()
     };
+    let fd = match server::handle_fd(env, handle) {
+        Ok(fd) => fd,
+        Err(Error::Status(status::BAD_DEVICE_TYPE)) => return io::server_write(env, args),
+        Err(error) => return status::finish(Err(error)),
+    };
     status::finish((|| {
         if event != 0 || apc != 0 || apc_context != 0 || key != 0 {
             return Err(Error::Unsupported(
                 "NtWriteFile with an event, APC routine/context or key".into(),
             ));
         }
-        let fd = server::handle_fd(env, handle)?;
         if fd.options & FILE_SYNCHRONOUS_IO == 0 {
             return Err(Error::Unsupported(
                 "NtWriteFile on an asynchronous handle".into(),
@@ -118,7 +128,7 @@ pub fn write(env: &mut Env<'_>, args: &[u32]) -> Outcome {
     })())
 }
 
-/// Wine's errno_to_status for write and pwrite failures.
+/// Wine's errno_to_status for host file operations.
 fn write_error() -> status::Status {
     match std::io::Error::last_os_error().raw_os_error() {
         Some(libc::EAGAIN) => 0xc000_0043, // STATUS_SHARING_VIOLATION
@@ -126,7 +136,12 @@ fn write_error() -> status::Status {
         Some(libc::EBUSY) => 0x8000_0011,  // STATUS_DEVICE_BUSY
         Some(libc::ENOSPC) => 0xc000_007f, // STATUS_DISK_FULL
         Some(libc::EPERM | libc::EROFS | libc::EACCES) => 0xc000_0022, // STATUS_ACCESS_DENIED
-        Some(libc::EISDIR) => 0xc000_0010, // STATUS_INVALID_DEVICE_REQUEST
+        Some(libc::ENOTDIR) => status::OBJECT_PATH_NOT_FOUND,
+        Some(libc::ENOENT) => status::OBJECT_NAME_NOT_FOUND,
+        Some(libc::EMFILE | libc::ENFILE) => 0xc000_011f, // STATUS_TOO_MANY_OPENED_FILES
+        Some(libc::ENOTEMPTY) => 0xc000_0101,             // STATUS_DIRECTORY_NOT_EMPTY
+        Some(libc::ELOOP) => 0xc000_0280,                 // STATUS_REPARSE_POINT_NOT_RESOLVED
+        Some(libc::EISDIR) => 0xc000_0010,                // STATUS_INVALID_DEVICE_REQUEST
         Some(libc::EINVAL) => status::INVALID_PARAMETER,
         Some(libc::EPIPE | libc::ECONNRESET) => 0xc000_00b0, // STATUS_PIPE_DISCONNECTED
         Some(libc::EIO) => 0xc000_00a3,                      // STATUS_DEVICE_NOT_READY
@@ -273,10 +288,19 @@ impl Open {
             }
             Lookup::Missing(host) => (host, true),
             Lookup::Device => {
-                return Err(Error::Unsupported(format!(
-                    "opening device {}",
-                    String::from_utf16_lossy(name)
-                )));
+                let mut request = OpenFileObjectRequest {
+                    access: self.access,
+                    attributes: attributes.attributes,
+                    rootdir: attributes.root,
+                    sharing: self.sharing,
+                    options: self.options,
+                    ..Default::default()
+                };
+                let (reply, _) =
+                    server::request(env, &mut request, &[&attributes.name_bytes()], &mut [])?;
+                status::check(reply.header.error)?;
+                write_u32(env, self.handle, reply.handle)?;
+                return Ok(FILE_OPENED);
             }
         };
 
@@ -371,8 +395,7 @@ const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 const SECONDS_1601_TO_1970: i64 = 11_644_473_600;
 
 /// NtQueryAttributesFile(*attributes, *info): FILE_BASIC_INFORMATION of a
-/// named file, as Wine's `get_file_info`. DOS attributes Wine keeps in
-/// extended attributes are not read; no Hitode call writes them.
+/// named file, as Wine's `get_file_info`.
 pub fn query_attributes(env: &mut Env<'_>, args: &[u32]) -> Outcome {
     let &[attributes, info] = args else {
         unreachable!()
@@ -477,7 +500,9 @@ pub(crate) fn basic_information(
     if link.file_type().is_symlink() && metadata.is_dir() {
         attributes |= FILE_ATTRIBUTE_REPARSE_POINT;
     }
-    if host
+    if let Some(dos) = information::path_dos_attributes(host) {
+        attributes |= dos;
+    } else if host
         .file_name()
         .is_some_and(|name| name.as_bytes().starts_with(b".") && name != "." && name != "..")
     {
