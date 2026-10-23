@@ -2150,6 +2150,37 @@ impl Request for DeleteKeyValueRequest {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
+pub struct SetRegistryNotificationRequest {
+    pub header: RequestHeader,
+    pub hkey: u32,
+    pub event: u32,
+    pub subtree: i32,
+    pub filter: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<SetRegistryNotificationRequest>() == 32);
+const _: () = assert!(std::mem::offset_of!(SetRegistryNotificationRequest, hkey) == 12);
+const _: () = assert!(std::mem::offset_of!(SetRegistryNotificationRequest, event) == 16);
+const _: () = assert!(std::mem::offset_of!(SetRegistryNotificationRequest, subtree) == 20);
+const _: () = assert!(std::mem::offset_of!(SetRegistryNotificationRequest, filter) == 24);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SetRegistryNotificationReply {
+    pub header: ReplyHeader,
+}
+const _: () = assert!(size_of::<SetRegistryNotificationReply>() == 8);
+
+impl Request for SetRegistryNotificationRequest {
+    const NUMBER: i32 = 98;
+    type Reply = SetRegistryNotificationReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct EnumKeyValueRequest {
     pub header: RequestHeader,
     pub hkey: u32,

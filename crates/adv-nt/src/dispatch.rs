@@ -63,6 +63,11 @@ const IMPLEMENTED: &[(&str, Syscall)] = &[
     ("NtEnumerateKey", registry::enumerate),
     ("NtEnumerateValueKey", registry::enumerate_value),
     ("NtGetWriteWatch", memory::get_write_watch),
+    ("NtNotifyChangeKey", registry::notify_change),
+    (
+        "NtNotifyChangeMultipleKeys",
+        registry::notify_change_multiple,
+    ),
     ("NtOpenDirectoryObject", object::open_directory),
     ("NtOpenEvent", sync::open_event),
     ("NtOpenFile", file::open),

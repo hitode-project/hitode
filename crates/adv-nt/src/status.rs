@@ -3,6 +3,7 @@
 pub type Status = u32;
 
 pub const SUCCESS: Status = 0;
+pub const PENDING: Status = 0x0000_0103;
 pub const OBJECT_NAME_EXISTS: Status = 0x4000_0000;
 pub const NOT_IMPLEMENTED: Status = 0xc000_0002;
 pub const NOT_SUPPORTED: Status = 0xc000_00bb;

@@ -203,6 +203,28 @@ fn wait(env: &mut Env<'_>, handles: &[u32], any: bool, alertable: u32, timeout: 
     begin_select(env, op, flags, timeout)
 }
 
+/// Waits, not alertable and without a timeout, for `handle`, then passes
+/// the wait's status to `then`.
+pub fn wait_then(
+    env: &mut Env<'_>,
+    handle: u32,
+    then: impl FnOnce(&mut Env<'_>, Status) -> Outcome + 'static,
+) -> Outcome {
+    let mut op = Vec::with_capacity(8);
+    for word in [SELECT_WAIT, handle] {
+        op.extend_from_slice(&word.to_le_bytes());
+    }
+    let select = new_select(env, op, SELECT_INTERRUPTIBLE, None);
+    run_select(
+        env,
+        select,
+        Box::new(move |env, ended| match ended {
+            Ended::Status(status) => then(env, status),
+            Ended::Apc { .. } => unreachable!("a wait that is not alertable ran a user APC"),
+        }),
+    )
+}
+
 /// NtDelayExecution(alertable, *timeout)
 pub fn delay(env: &mut Env<'_>, args: &[u32]) -> Outcome {
     let &[alertable, timeout] = args else {

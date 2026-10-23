@@ -674,15 +674,16 @@ pub fn terminate(env: &mut Env<'_>, args: &[u32]) -> adv_machine::Outcome {
         return adv_machine::Outcome::Return(reply.header.error);
     }
     if process == 0 {
-        let others = env
-            .sys
-            .contexts
-            .iter()
-            .filter(|context| !context.is_done())
-            .count()
-            > 1;
-        if others {
-            return adv_machine::Outcome::Fail("ending a process's other threads".into());
+        // The server has killed every thread but the caller's; their
+        // contexts end where they stand, as `terminate_thread` ends one.
+        let others: Vec<_> = (0..env.sys.contexts.len() as u32)
+            .filter(|&context| {
+                context != env.context && !env.sys.contexts[context as usize].is_done()
+            })
+            .collect();
+        for context in others {
+            server::end_thread(env, context);
+            env.sys.terminate_context(context, exit_code);
         }
         return adv_machine::Outcome::Return(reply.header.error);
     }

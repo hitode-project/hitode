@@ -142,7 +142,7 @@ FreeType is such a library: win32u opens it by name and draws TrueType text thro
 
 ### WINE-THR-4 Termination
 
-**Rule**: Terminating another thread MUST end its context where it stands, with no detach work. Its waiters MUST see the thread signaled with the given exit code.
+**Rule**: Terminating another thread, or a process's other threads before it exits, MUST end their contexts where they stand, with no detach work. Waiters MUST see each thread signaled with the given exit code.
 **Verification**: Test
 
 ### WINE-THR-5 Debug register contexts

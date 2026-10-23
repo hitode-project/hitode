@@ -337,6 +337,107 @@ pub fn set_value(env: &mut Env<'_>, args: &[u32]) -> Outcome {
     })())
 }
 
+/// NtNotifyChangeKey(key, event, apc, apc_context, *io, filter, subtree,
+/// *buffer, length, asynchronous)
+pub fn notify_change(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    let &[
+        key,
+        event,
+        apc,
+        context,
+        io,
+        filter,
+        subtree,
+        buffer,
+        length,
+        asynchronous,
+    ] = args
+    else {
+        unreachable!()
+    };
+    notify_change_multiple(
+        env,
+        &[
+            key,
+            0,
+            0,
+            event,
+            apc,
+            context,
+            io,
+            filter,
+            subtree,
+            buffer,
+            length,
+            asynchronous,
+        ],
+    )
+}
+
+/// NtNotifyChangeMultipleKeys(key, count, *attributes, event, apc,
+/// apc_context, *io, filter, subtree, *buffer, length, asynchronous), as
+/// Wine implements it: the other keys, the APC and the buffer are ignored.
+pub fn notify_change_multiple(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    let &[
+        key,
+        _,
+        _,
+        event,
+        _,
+        _,
+        _,
+        filter,
+        subtree,
+        _,
+        _,
+        asynchronous,
+    ] = args
+    else {
+        unreachable!()
+    };
+    let asynchronous = asynchronous as u8 != 0;
+    let event = if asynchronous {
+        event
+    } else {
+        let mut request = crate::protocol::CreateEventRequest {
+            access: EVENT_ALL_ACCESS,
+            ..Default::default()
+        };
+        match server::request(env, &mut request, &[], &mut []) {
+            Ok((reply, _)) if reply.header.error == status::SUCCESS => reply.handle,
+            Ok((reply, _)) => return Outcome::Return(reply.header.error),
+            Err(error) => return status::finish(Err::<(), _>(error)),
+        }
+    };
+    let mut request = crate::protocol::SetRegistryNotificationRequest {
+        hkey: key,
+        event,
+        subtree: i32::from(subtree as u8 != 0),
+        filter,
+        ..Default::default()
+    };
+    let result = server::request(env, &mut request, &[], &mut []);
+    if asynchronous {
+        return status::finish(result.and_then(|(reply, _)| status::check(reply.header.error)));
+    }
+    let close = move |env: &mut Env<'_>, status: Status| match server::close(env, event) {
+        Ok(()) => Outcome::Return(status),
+        Err(error) => status::finish(Err::<(), _>(error)),
+    };
+    match result {
+        Ok((reply, _)) if reply.header.error == status::PENDING => {
+            crate::sync::wait_then(env, event, close)
+        }
+        Ok((reply, _)) => close(env, reply.header.error),
+        Err(error) => {
+            let _ = server::close(env, event);
+            status::finish(Err::<(), _>(error))
+        }
+    }
+}
+
+const EVENT_ALL_ACCESS: u32 = 0x1f_0003;
+
 /// NtDeleteKey(key)
 pub fn delete(env: &mut Env<'_>, args: &[u32]) -> Outcome {
     let mut request = DeleteKeyRequest {

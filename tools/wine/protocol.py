@@ -91,6 +91,7 @@ REQUESTS = [
     "queue_apc",
     "delete_key",
     "delete_key_value",
+    "set_registry_notification",
     "enum_key_value",
     "create_mutex",
     "release_mutex",
