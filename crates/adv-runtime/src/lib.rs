@@ -11,6 +11,9 @@ mod family;
 mod font;
 pub use family::ProcessStatus;
 mod graphics;
+/// Graphics assembly on the Wine userland.
+#[cfg(unix)]
+pub mod wine;
 pub use adv_win32::winmm::mmio;
 mod debug_views;
 mod report;

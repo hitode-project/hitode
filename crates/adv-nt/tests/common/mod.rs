@@ -93,11 +93,24 @@ pub fn run_probe_on(
 }
 
 /// Prepares machine bindings and files in the session's prefix before startup.
+#[allow(dead_code, reason = "each test binary uses one of the entries")]
 pub fn run_probe_with_prefix(
     name: &str,
     real_time: bool,
     resolver: impl Resolver,
     prepare: impl FnOnce(&mut Machine<Cpu>, &std::path::Path),
+) -> Option<(RunResult, String)> {
+    run_probe_inspect(name, real_time, resolver, prepare, |_| {})
+}
+
+/// [`run_probe_with_prefix`], with `inspect` looking at the machine after the
+/// process ends.
+pub fn run_probe_inspect(
+    name: &str,
+    real_time: bool,
+    resolver: impl Resolver,
+    prepare: impl FnOnce(&mut Machine<Cpu>, &std::path::Path),
+    inspect: impl FnOnce(&mut Machine<Cpu>),
 ) -> Option<(RunResult, String)> {
     let _ = log::set_logger(&WineLog).map(|()| log::set_max_level(log::LevelFilter::Warn));
     let Some(dist) = std::env::var_os("ADV_WINE_DIST").map(PathBuf::from) else {
@@ -216,6 +229,7 @@ pub fn run_probe_with_prefix(
             other => break other,
         }
     };
+    inspect(&mut machine);
     drop(machine);
     // The server keeps its descriptors after the guest exits.
     // SAFETY: output owns the read end of the pipe.

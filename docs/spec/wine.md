@@ -141,10 +141,22 @@ FreeType is such a library: win32u opens it by name and draws TrueType text thro
 
 ### WINE-DLL-2 Ordinary import calls
 
-**Rule**: Host DLL import calls MUST read the image's IAT slot at call time and enter its target through `Outcome::call` and a continuation. Guest changes to the slot or target entry MUST intercept the call.
+**Rule**: Host DLL import calls MUST read the image's IAT slot at call time and enter its target through `Outcome::call` and a continuation. Guest changes to the slot or target entry MUST intercept the call. Host code that a COM method or another path outside the image's entries enters MUST bind imports with the loader's image base.
 **Verification**: Test
 
 ### WINE-DLL-3 Prefix installation
 
 **Rule**: Host DLL installation MUST replace the prefix's system32 entry with a PE file carrying Wine's builtin signature. Installation MUST NOT modify the Wine distribution or follow an existing file symlink when writing.
+**Verification**: Test
+
+## Graphics
+
+### WINE-GFX-1 DirectDraw memory DCs
+
+**Rule**: On the Wine userland, a DirectDraw surface's DC MUST come from `D3DKMTCreateDCFromMemory` over the surface's own pixels, size, pitch and format. The call MUST go through the DirectDraw image's IAT. ReleaseDC MUST call `GdiFlush` and then `D3DKMTDestroyDCFromMemory` the same way.
+**Verification**: Test
+
+### WINE-GFX-2 Presented GDI drawing
+
+**Rule**: What Wine's GDI draws into a DirectDraw surface MUST reach the presenter when the surface is blitted to the primary surface.
 **Verification**: Test

@@ -50,6 +50,7 @@ const VER_PLATFORM_WIN32_NT: u32 = 2;
 /// `load_global_options` do.
 mod peb {
     pub const IMAGE_BASE_ADDRESS: u32 = 0x08;
+    pub const LDR: u32 = 0x0c;
     pub const PROCESS_PARAMETERS: u32 = 0x10;
     pub const NUMBER_OF_PROCESSORS: u32 = 0x64;
     pub const HEAP_SEGMENT_RESERVE: u32 = 0x78;
@@ -64,6 +65,38 @@ mod peb {
     pub const IMAGE_SUBSYSTEM: u32 = 0xb4;
     pub const IMAGE_SUBSYSTEM_MAJOR: u32 = 0xb8;
     pub const IMAGE_SUBSYSTEM_MINOR: u32 = 0xbc;
+}
+
+/// PEB_LDR_DATA and LDR_DATA_TABLE_ENTRY fields (i386) that ntdll's loader keeps.
+mod ldr {
+    pub const IN_LOAD_ORDER: u32 = 0x0c;
+    pub const DLL_BASE: u32 = 0x18;
+    pub const BASE_DLL_NAME: u32 = 0x2c;
+}
+
+/// The base of the loaded module `name` (case-insensitive), from the PEB's
+/// load-order list as Wine's loader keeps it.
+pub fn module_base(cpu: &dyn Guest, peb: u32, name: &str) -> Option<u32> {
+    let head = cpu.read_u32(peb + peb::LDR).ok()? + ldr::IN_LOAD_ORDER;
+    let mut entry = cpu.read_u32(head).ok()?;
+    // The list is bounded by the address space; a cycle that misses the
+    // head ends at the bound.
+    for _ in 0..65536 {
+        if entry == head {
+            break;
+        }
+        let length = usize::from(cpu.read_u16(entry + ldr::BASE_DLL_NAME).ok()?);
+        let buffer = cpu.read_u32(entry + ldr::BASE_DLL_NAME + 4).ok()?;
+        let mut bytes = vec![0; length];
+        cpu.read(buffer, &mut bytes).ok()?;
+        let (units, _) = bytes.as_chunks::<2>();
+        let units: Vec<u16> = units.iter().map(|&unit| u16::from_le_bytes(unit)).collect();
+        if String::from_utf16_lossy(&units).eq_ignore_ascii_case(name) {
+            return cpu.read_u32(entry + ldr::DLL_BASE).ok();
+        }
+        entry = cpu.read_u32(entry).ok()?;
+    }
+    None
 }
 
 const GENERIC_READ: u32 = 0x8000_0000;

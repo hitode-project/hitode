@@ -37,7 +37,8 @@ RULES: dict[str, set[str]] = {
     "adv-nt": {"adv-machine", "adv-pe"},
     # Wine's Unix libraries as guest ELF code, over the NT platform.
     "adv-unix": {"adv-nt", "adv-abi"},
-    "adv-runtime": {"adv-win32", "adv-dx"},
+    # The assembly wires both stacks; the Wine one over the NT platform.
+    "adv-runtime": {"adv-win32", "adv-dx", "adv-unix"},
     "adv-shell": {"adv-runtime", "adv-device", "adv-sync", "adv-report"},
     "adv-run": {"adv-shell"},
     "adv-jit-helper": set(),

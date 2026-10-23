@@ -3,6 +3,8 @@
 //! Wine-independent import calls capture an image's IAT slot at export entry,
 //! then read that slot whenever the host implementation calls it. Entries pass
 //! their relocated guest image base in volatile EDX for this initial capture.
+//! Host code entered another way, such as a COM method, binds with the base
+//! the loader reports for the image.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -27,8 +29,12 @@ pub struct ModuleImage {
     bytes: Vec<u8>,
 }
 
+/// The imports of each image, by its entries' thunks and by its name.
 #[derive(Default)]
-struct Entries(HashMap<u32, Arc<Vec<ImportModule>>>);
+struct Entries {
+    thunks: HashMap<u32, Arc<Vec<ImportModule>>>,
+    images: HashMap<String, Arc<Vec<ImportModule>>>,
+}
 
 impl ModuleImage {
     /// Publish the named host functions and write their PE entries. The input
@@ -125,13 +131,11 @@ impl ModuleImage {
             Ok((writer.finish()?, Arc::new(imports)))
         })()
         .map_err(|e| e.to_string())?;
+        let known = machine.ext.get_or_default::<Entries>();
         for index in entries {
-            machine
-                .ext
-                .get_or_default::<Entries>()
-                .0
-                .insert(index, result.1.clone());
+            known.thunks.insert(index, result.1.clone());
         }
+        known.images.insert(name.clone(), result.1.clone());
         Ok(Self {
             name,
             bytes: result.0,
@@ -156,7 +160,23 @@ impl Import {
     /// Capture before returning an Outcome or entering guest code. `name` is
     /// case-sensitive, or `#ordinal`; `module` is a DLL file name.
     pub fn bind(env: &Env<'_>, module: &str, name: &str) -> Option<Self> {
-        let imports = env.ext.try_get::<Entries>()?.0.get(&env.thunk)?;
+        let imports = env.ext.try_get::<Entries>()?.thunks.get(&env.thunk)?;
+        Self::find(imports, env.cpu.reg(Reg::Edx), module, name)
+    }
+
+    /// Bind in the built image `image` that the loader mapped at `base`.
+    pub fn bind_in(
+        env: &Env<'_>,
+        image: &str,
+        base: u32,
+        module: &str,
+        name: &str,
+    ) -> Option<Self> {
+        let imports = env.ext.try_get::<Entries>()?.images.get(image)?;
+        Self::find(imports, base, module, name)
+    }
+
+    fn find(imports: &[ImportModule], base: u32, module: &str, name: &str) -> Option<Self> {
         let import = imports
             .iter()
             .find(|m| m.dll.eq_ignore_ascii_case(module))?
@@ -166,7 +186,6 @@ impl Import {
                 adv_pe::ImportName::Name { name: imported, .. } => imported == name,
                 adv_pe::ImportName::Ordinal(ordinal) => name == format!("#{ordinal}"),
             })?;
-        let base = env.cpu.reg(Reg::Edx);
         Some(Self {
             slot: base.wrapping_add(import.iat_rva),
         })

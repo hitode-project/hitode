@@ -130,10 +130,6 @@ pub fn install_graphics<B: Backend>(
     width: u32,
     height: u32,
 ) -> Result<BTreeMap<u32, u32>, String> {
-    adv_device::surface::size(width, height)?;
-    if machine.ext.try_get::<SurfaceStore>().is_some() {
-        return Err("the process surface store is already installed".into());
-    }
     if machine.ext.try_get::<Win32>().is_none()
         || machine
             .ext
@@ -142,23 +138,7 @@ pub fn install_graphics<B: Backend>(
     {
         return Err("Win32 and its GDI frontend must be installed before graphics".into());
     }
-    let arena_len = 64 * 1024 * 1024;
-    let arena = machine
-        .sys
-        .vm
-        .alloc(&mut machine.cpu, arena_len, Prot::RW)
-        .map_err(|e| e.to_string())?;
-    let snapshot = Snapshot {
-        width,
-        height,
-        bgra: vec![0; width as usize * height as usize * 4],
-        frames: 0,
-        ..Default::default()
-    };
-    machine.ext.insert(SurfaceStore::new(
-        width, height, arena, arena_len, snapshot,
-    )?);
-    machine.ext.insert(RunControl::default());
+    install_store(machine, width, height)?;
     adv_dx::dshow::set_video_provider(
         &mut machine.ext,
         adv_dx::dshow::VideoProvider {
@@ -204,6 +184,35 @@ pub fn install_graphics<B: Backend>(
     }
     Ok(entries)
 }
+/// The process surface store and frame accounting, shared by both stacks.
+pub(crate) fn install_store<B: Backend>(
+    machine: &mut Machine<B>,
+    width: u32,
+    height: u32,
+) -> Result<(), String> {
+    adv_device::surface::size(width, height)?;
+    if machine.ext.try_get::<SurfaceStore>().is_some() {
+        return Err("the process surface store is already installed".into());
+    }
+    let arena_len = 64 * 1024 * 1024;
+    let arena = machine
+        .sys
+        .vm
+        .alloc(&mut machine.cpu, arena_len, Prot::RW)
+        .map_err(|e| e.to_string())?;
+    let snapshot = Snapshot {
+        width,
+        height,
+        bgra: vec![0; width as usize * height as usize * 4],
+        frames: 0,
+        ..Default::default()
+    };
+    machine.ext.insert(SurfaceStore::new(
+        width, height, arena, arena_len, snapshot,
+    )?);
+    machine.ext.insert(RunControl::default());
+    Ok(())
+}
 #[derive(Default)]
 /// Frame accounting of a run, updated by every presentation.
 pub(crate) struct RunControl {
@@ -214,7 +223,7 @@ pub(crate) struct RunControl {
     pub(crate) frame_intervals: Vec<Duration>,
 }
 
-fn frame_completed(env: &mut Env<'_>, serial: u64) -> Option<Outcome> {
+pub(crate) fn frame_completed(env: &mut Env<'_>, serial: u64) -> Option<Outcome> {
     env.sys.frame = serial as u32;
     env.sys.complete_frame();
     let control = env.ext.get_mut::<RunControl>();

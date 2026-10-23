@@ -24,6 +24,10 @@ adv-dx = { path = "../adv-dx" }
 adv-pe = { path = "../adv-pe" }
 iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder"] }
 
+[target.'cfg(unix)'.dependencies]
+adv-nt = { path = "../adv-nt" }
+adv-unix = { path = "../adv-unix" }
+
 [dev-dependencies]
 encoding_rs.workspace = true
 unicorn-engine.workspace = true
@@ -31,6 +35,11 @@ adv-unicorn = { path = "../adv-unicorn" }
 adv-samples = { path = "../adv-samples" }
 iced-x86 = { version = "1.21", default-features = false, features = ["std", "code_asm"] }
 png = "0.17"
+
+[target.'cfg(target_vendor = "apple")'.dev-dependencies]
+adv-wineserver = { path = "../adv-wineserver" }
+libc = "0.2"
+log.workspace = true
 
 [lints]
 workspace = true

@@ -47,6 +47,7 @@ The dependency arrows, pointing at what is depended on:
 ```text
 adv-shell → adv-runtime → adv-win32 → adv-os → adv-abi → adv-machine → adv-cpu
 adv-runtime → adv-dx → adv-abi / adv-device
+adv-runtime → adv-unix → adv-nt (the Wine userland)
 adv-dx → adv-os (transitional: fronts other than DirectDraw and D3D9)
 adv-cpu → adv-cpu-x64 (x86_64) / adv-cpu-a64 (AArch64) → adv-cpu-core
 adv-win32 / adv-dx / adv-shell → adv-device
@@ -66,7 +67,7 @@ DirectDraw keeps its private surface arena. Other DirectX fronts retain a
 transitional dependency on `adv-os` for heaps, activation, Automation, files and
 input state.
 
-For the Wine stack, `adv-abi::dll` writes host-module PE images through `adv-pe` and calls their imports through the machine. `adv-unix::builtin` installs those images in the prefix before process startup.
+For the Wine stack, `adv-abi::dll` writes host-module PE images through `adv-pe` and calls their imports through the machine. `adv-unix::builtin` installs those images in the prefix before process startup. `adv-runtime::wine` assembles the graphics fronts on that stack: our DirectDraw as such an image, with memory DCs from Wine's GDI.
 
 ## A frame, from start to screen
 
