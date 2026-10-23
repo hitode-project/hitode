@@ -4,6 +4,10 @@
  * system functions. The hitode_host_* functions come from the Rust facade:
  * the runtime owns waiting, time and the server's lifetime. */
 
+#ifndef __APPLE__
+#define _GNU_SOURCE /* unshare */
+#include <sched.h>
+#endif
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -174,8 +178,19 @@ char *hitode_realpath( const char *path, char *resolved )
     char dir[PATH_MAX], *absolute, *ret;
 
 #ifdef __linux__
-    /* The server finds its data files relative to its own executable. */
-    if (!strcmp( path, "/proc/self/exe" )) return realpath( hitode_host_executable(), resolved );
+    /* The server finds its data files relative to its own executable, so it
+     * is given a path inside the Wine installation, which need not exist. */
+    if (!strcmp( path, "/proc/self/exe" ))
+    {
+        const char *exe = hitode_host_executable();
+        if (!resolved) return strdup( exe );
+        if (strlen( exe ) >= PATH_MAX)
+        {
+            errno = ENAMETOOLONG;
+            return NULL;
+        }
+        return strcpy( resolved, exe );
+    }
 #endif
     if (path[0] == '/' || current_dir == AT_FDCWD) return realpath( path, resolved );
 #ifdef __APPLE__
@@ -191,9 +206,12 @@ char *hitode_realpath( const char *path, char *resolved )
 
 #ifdef __APPLE__
 extern int pthread_fchdir_np( int fd );
+#endif
 
-/* Darwin has no bindat/connectat. Resolve relative Unix socket names on a
- * helper thread so neither the process nor the caller's thread cwd changes. */
+/* There is no bindat/connectat. Resolve relative Unix socket names on a
+ * helper thread with its own working directory, so neither the process nor
+ * the caller's thread cwd changes, and the name fits sun_path however long
+ * the directory's path is. */
 struct socket_call
 {
     int (*func)( int, const struct sockaddr *, socklen_t );
@@ -207,7 +225,12 @@ static void *socket_call_thread( void *arg )
 {
     struct socket_call *call = arg;
 
+#ifdef __APPLE__
     call->ret = pthread_fchdir_np( call->dir );
+#else
+    call->ret = unshare( CLONE_FS );
+    if (!call->ret) call->ret = fchdir( call->dir );
+#endif
     if (!call->ret) call->ret = call->func( call->fd, call->addr, call->len );
     call->error = errno;
     return NULL;
@@ -227,36 +250,14 @@ static int socket_call_at( struct socket_call *call )
     errno = call->error;
     return call->ret;
 }
-#else
-/* Linux has no bindat/connectat either. A relative Unix socket name is
- * reached through the directory's descriptor under /proc. */
-static int socket_call_at( int (*func)( int, const struct sockaddr *, socklen_t ), int fd,
-                           const struct sockaddr *addr )
-{
-    struct sockaddr_un at = { .sun_family = AF_UNIX };
-    const char *name = ((const struct sockaddr_un *)addr)->sun_path;
-
-    if (snprintf( at.sun_path, sizeof(at.sun_path), "/proc/self/fd/%d/%s", current_dir, name )
-        >= (int)sizeof(at.sun_path))
-    {
-        errno = ENAMETOOLONG;
-        return -1;
-    }
-    return func( fd, (const struct sockaddr *)&at, sizeof(at) );
-}
-#endif
 
 int hitode_bind( int fd, const struct sockaddr *addr, socklen_t len )
 {
     if (addr->sa_family != AF_UNIX || ((const struct sockaddr_un *)addr)->sun_path[0] == '/'
         || current_dir == AT_FDCWD)
         return bind( fd, addr, len );
-#ifdef __APPLE__
     struct socket_call call = { bind, current_dir, fd, addr, len, 0, 0 };
     return socket_call_at( &call );
-#else
-    return socket_call_at( bind, fd, addr );
-#endif
 }
 
 int hitode_connect( int fd, const struct sockaddr *addr, socklen_t len )
@@ -264,12 +265,8 @@ int hitode_connect( int fd, const struct sockaddr *addr, socklen_t len )
     if (addr->sa_family != AF_UNIX || ((const struct sockaddr_un *)addr)->sun_path[0] == '/'
         || current_dir == AT_FDCWD)
         return connect( fd, addr, len );
-#ifdef __APPLE__
     struct socket_call call = { connect, current_dir, fd, addr, len, 0, 0 };
     return socket_call_at( &call );
-#else
-    return socket_call_at( connect, fd, addr );
-#endif
 }
 
 /* The server asks once for ready descriptors. With none ready it returns to

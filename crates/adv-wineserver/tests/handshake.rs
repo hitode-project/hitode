@@ -86,6 +86,7 @@ fn client_receives_request_pipe_and_server_exits_on_its_clock() {
         Err(adv_wineserver::Error::AlreadyStarted)
     ));
 
+    #[cfg(target_vendor = "apple")]
     let directory = std::fs::File::open(server.socket_dir().unwrap()).unwrap();
     #[cfg(target_vendor = "apple")]
     let client = std::thread::spawn(move || {
@@ -99,8 +100,7 @@ fn client_receives_request_pipe_and_server_exits_on_its_clock() {
     .join()
     .unwrap();
     #[cfg(not(target_vendor = "apple"))]
-    let client =
-        UnixStream::connect(format!("/proc/self/fd/{}/socket", directory.as_raw_fd())).unwrap();
+    let client = UnixStream::connect(server.socket_dir().unwrap().join("socket")).unwrap();
     assert!(matches!(server.step(&clock), State::Waiting(_)));
     let (version, _request_pipe) = receive_request_pipe(&client);
     assert_eq!(version, PROTOCOL_VERSION);

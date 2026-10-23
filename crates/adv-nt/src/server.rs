@@ -510,19 +510,30 @@ impl Connection {
         progress: &mut dyn Progress,
         time: Time,
     ) -> Result<(Connection, FirstThread), Error> {
-        #[cfg(not(target_vendor = "apple"))]
-        let socket = UnixStream::connect(socket_dir.join("socket"))?;
-        #[cfg(target_vendor = "apple")]
         let socket = {
             let directory = std::fs::File::open(socket_dir)?;
-            // Darwin has no connectat; a helper thread resolves the relative
-            // name without changing the process or the caller's thread cwd.
+            // There is no connectat; a helper thread with its own working
+            // directory resolves the relative name, which fits sun_path
+            // however long the directory's path is, without changing the
+            // process's or the caller's.
             std::thread::spawn(move || {
+                #[cfg(target_vendor = "apple")]
                 unsafe extern "C" {
                     fn pthread_fchdir_np(fd: libc::c_int) -> libc::c_int;
                 }
                 // SAFETY: directory is live; the thread exits after connect.
-                if unsafe { pthread_fchdir_np(directory.as_raw_fd()) } == -1 {
+                #[cfg(target_vendor = "apple")]
+                let changed = unsafe { pthread_fchdir_np(directory.as_raw_fd()) };
+                // SAFETY: as above; unsharing gives this thread alone the
+                // new working directory.
+                #[cfg(not(target_vendor = "apple"))]
+                let changed = unsafe {
+                    match libc::unshare(libc::CLONE_FS) {
+                        0 => libc::fchdir(directory.as_raw_fd()),
+                        error => error,
+                    }
+                };
+                if changed == -1 {
                     return Err(io::Error::last_os_error());
                 }
                 UnixStream::connect("socket")
