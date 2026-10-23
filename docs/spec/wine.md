@@ -170,3 +170,13 @@ FreeType is such a library: win32u opens it by name and draws TrueType text thro
 
 **Rule**: Wine MUST load our user driver by the display device's `GraphicsDriver` name. Its DllMain MUST hand win32u a function table, leaving the rest to Wine's null driver. Window geometry that DirectDraw uses MUST come from the window rectangles win32u reports to the driver.
 **Verification**: Test
+
+### WINE-GFX-4 Window surfaces
+
+**Rule**: The driver MUST give each window except the desktop a window surface over pixels it owns, wrapped by `NtGdiDdDDICreateDCFromMemory`. A flush of a visible window MUST present the window's part of those pixels without copying them.
+**Verification**: Test
+
+### WINE-GFX-5 In-process desktop
+
+**Rule**: When win32u starts explorer for its desktop, the process MUST NOT start. The calling thread MUST instead create the desktop and message windows as explorer does. It MUST then show the desktop over the virtual screen.
+**Verification**: Test

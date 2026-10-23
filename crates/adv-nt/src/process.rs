@@ -85,16 +85,33 @@ pub fn module_base(cpu: &dyn Guest, peb: u32, name: &str) -> Option<u32> {
         if entry == head {
             break;
         }
-        let length = usize::from(cpu.read_u16(entry + ldr::BASE_DLL_NAME).ok()?);
-        let buffer = cpu.read_u32(entry + ldr::BASE_DLL_NAME + 4).ok()?;
-        let mut bytes = vec![0; length];
-        cpu.read(buffer, &mut bytes).ok()?;
-        let (units, _) = bytes.as_chunks::<2>();
-        let units: Vec<u16> = units.iter().map(|&unit| u16::from_le_bytes(unit)).collect();
-        if String::from_utf16_lossy(&units).eq_ignore_ascii_case(name) {
+        if read_unicode_string(cpu, entry + ldr::BASE_DLL_NAME)?.eq_ignore_ascii_case(name) {
             return cpu.read_u32(entry + ldr::DLL_BASE).ok();
         }
         entry = cpu.read_u32(entry).ok()?;
+    }
+    None
+}
+
+/// The address of the named export of the image mapped at `base`, if it
+/// exports the name and does not forward it.
+pub fn module_export(cpu: &dyn Guest, base: u32, name: &str) -> Option<u32> {
+    let nt = base + cpu.read_u32(base + 0x3c).ok()?;
+    // The export directory and its size, in the PE32 optional header.
+    let (rva, size) = (cpu.read_u32(nt + 0x78).ok()?, cpu.read_u32(nt + 0x7c).ok()?);
+    let directory = base + rva;
+    let count = cpu.read_u32(directory + 0x18).ok()?;
+    let [functions, names, ordinals] =
+        [0x1c, 0x20, 0x24].map(|at| cpu.read_u32(directory + at).map_or(0, |rva| base + rva));
+    let mut text = vec![0; name.len() + 1];
+    for index in 0..count {
+        cpu.read(base + cpu.read_u32(names + 4 * index).ok()?, &mut text)
+            .ok()?;
+        if text[..name.len()] == *name.as_bytes() && text[name.len()] == 0 {
+            let ordinal = u32::from(cpu.read_u16(ordinals + 2 * index).ok()?);
+            let target = cpu.read_u32(functions + 4 * ordinal).ok()?;
+            return (!(rva..rva + size).contains(&target)).then_some(base + target);
+        }
     }
     None
 }
@@ -567,12 +584,46 @@ fn init_teb(cpu: &mut dyn Guest, teb: u32, tid: u32, syscall: u32) -> Result<(),
     Ok(())
 }
 
-/// NtCreateUserProcess(*process, *thread, ...): a machine runs one process,
-/// so creating another fails as on a system that refuses it. win32u then
-/// gives the process a desktop window of its own instead of explorer's.
-pub fn create_user_process(_: &mut Env<'_>, _: &[u32]) -> adv_machine::Outcome {
+/// What follows once the desktop exists.
+pub type Started = Box<dyn FnOnce(&mut Env<'_>) -> adv_machine::Outcome>;
+
+/// Starts explorer's desktop in this process: it creates and shows the
+/// desktop window on the calling thread, as explorer's desktop thread does.
+/// The crate with a user driver installs it.
+#[derive(Clone, Copy)]
+pub struct Desktop(pub fn(&mut Env<'_>, Started) -> adv_machine::Outcome);
+
+/// `ImagePathName` and `CommandLine` in `RTL_USER_PROCESS_PARAMETERS` (i386).
+const PARAMS_IMAGE: u32 = 0x38;
+const PARAMS_COMMAND_LINE: u32 = 0x40;
+
+/// NtCreateUserProcess(*process, *thread, ..., params, ...): a machine runs
+/// one process, so creating another fails as on a system that refuses it.
+/// When win32u starts explorer for its desktop, [`Desktop`] first makes the
+/// desktop here, which win32u's next request then finds.
+pub fn create_user_process(env: &mut Env<'_>, args: &[u32]) -> adv_machine::Outcome {
+    let refuse = |_: &mut Env<'_>| adv_machine::Outcome::Return(status::NOT_SUPPORTED);
+    let params = args[8];
+    let text = |at| read_unicode_string(env.cpu, params + at).unwrap_or_default();
+    let desktop = text(PARAMS_IMAGE)
+        .to_ascii_lowercase()
+        .ends_with("\\explorer.exe")
+        && text(PARAMS_COMMAND_LINE).ends_with(" /desktop");
+    if desktop && let Some(&Desktop(start)) = env.ext.try_get::<Desktop>() {
+        return start(env, Box::new(refuse));
+    }
     log::warn!("NtCreateUserProcess: another process is not supported");
-    adv_machine::Outcome::Return(status::NOT_SUPPORTED)
+    refuse(env)
+}
+
+fn read_unicode_string(cpu: &dyn Guest, at: u32) -> Option<String> {
+    let length = usize::from(cpu.read_u16(at).ok()?);
+    let buffer = cpu.read_u32(at + 4).ok()?;
+    let mut bytes = vec![0; length];
+    cpu.read(buffer, &mut bytes).ok()?;
+    let (units, _) = bytes.as_chunks::<2>();
+    let units: Vec<u16> = units.iter().map(|&unit| u16::from_le_bytes(unit)).collect();
+    Some(String::from_utf16_lossy(&units))
 }
 
 /// NtTerminateProcess(process, exit_code): ntdll.dll first ends the other

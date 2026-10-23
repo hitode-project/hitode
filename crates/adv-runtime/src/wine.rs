@@ -20,6 +20,7 @@ use adv_pe::{ImportModule, ImportName};
 use crate::graphics::{frame_completed, guest_memory, install_store};
 
 pub mod driver;
+mod surface;
 
 /// The display driver to name in the process's startup parameters.
 pub const GRAPHICS_DRIVER: &str = driver::MODULE;
@@ -49,6 +50,7 @@ const SLOT: u32 = 64;
 pub fn register(registry: &mut Registry) {
     adv_dx::ddraw::register(registry);
     driver::register(registry);
+    surface::register(registry);
 }
 
 /// Install the surface store, DirectDraw and the user driver, and put their
@@ -61,6 +63,9 @@ pub fn install<B: Backend>(
     height: u32,
 ) -> Result<(), String> {
     install_store(machine, width, height)?;
+    machine
+        .ext
+        .insert(adv_nt::process::Desktop(driver::start_desktop));
     adv_dx::ddraw::install(
         machine,
         adv_dx::ddraw::Provider {
@@ -122,7 +127,8 @@ fn import(env: &mut Env<'_>, name: &str) -> Result<Import, String> {
         .ok_or_else(|| format!("{DDRAW} does not import {name}"))
 }
 
-fn slot(env: &mut Env<'_>) -> Result<u32, String> {
+/// A 64-byte block of guest memory for a call's in and out parameters.
+pub(super) fn slot(env: &mut Env<'_>) -> Result<u32, String> {
     if let Some(slot) = env.ext.get_or_default::<Dcs>().slots.pop() {
         return Ok(slot);
     }
@@ -136,7 +142,12 @@ fn slot(env: &mut Env<'_>) -> Result<u32, String> {
     Ok(page)
 }
 
-fn write_words(env: &mut Env<'_>, at: u32, words: &[u32]) -> Result<(), String> {
+/// Give back a block from [`slot`].
+pub(super) fn free_slot(env: &mut Env<'_>, slot: u32) {
+    env.ext.get_or_default::<Dcs>().slots.push(slot);
+}
+
+pub(super) fn write_words(env: &mut Env<'_>, at: u32, words: &[u32]) -> Result<(), String> {
     let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
     env.cpu.write(at, &bytes).map_err(|e| e.to_string())
 }
