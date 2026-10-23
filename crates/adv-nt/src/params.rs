@@ -19,6 +19,7 @@ pub struct Startup<'a> {
     pub locale: u32,
     /// Wine debug channels, in WINEDEBUG syntax.
     pub debug: &'a str,
+    /// Host descriptors for the standard handles; none leaves a handle 0.
     pub stdin: Option<RawFd>,
     pub stdout: Option<RawFd>,
     pub stderr: Option<RawFd>,
