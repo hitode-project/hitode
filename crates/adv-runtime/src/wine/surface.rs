@@ -88,8 +88,10 @@ fn call(
 fn create(env: &mut Env<'_>) -> Outcome {
     let (hwnd, bounds, output) = (env.arg(0), env.arg(2), env.arg(3));
     if driver::is_desktop(env, hwnd) {
-        // Keep win32u's default surface.
-        return Outcome::Return(1);
+        // The desktop presents nothing, but its DC spans the virtual screen:
+        // win32u's offscreen surface covers it, where the 1×1 default would
+        // clip it.
+        return Outcome::Return(0);
     }
     let previous = check!(env.cpu.read_u32(output));
     if previous != 0 && env.cpu.read_u32(previous).ok() == Some(driver::surface_funcs(env)) {
