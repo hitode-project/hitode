@@ -57,8 +57,10 @@ This spec covers the Wine userland stack. `adv-wineserver` runs Wine's server in
 
 ### WINE-SYS-4 One process per machine
 
-**Rule**: `NtCreateUserProcess` MUST fail with `STATUS_NOT_SUPPORTED`. win32u then creates the process's own desktop window, as Wine does when explorer cannot start.
+**Rule**: `NtCreateUserProcess` MUST fail with `STATUS_NOT_SUPPORTED`. Calls on the current process MUST accept its server handles as well as its pseudo-handle.
 **Verification**: Test
+
+win32u creates the process's own desktop window, as Wine does when explorer cannot start.
 
 ### WINE-SYS-6 Display driver
 
@@ -67,10 +69,8 @@ This spec covers the Wine userland stack. `adv-wineserver` runs Wine's server in
 
 ### WINE-SYS-5 Host names and listings
 
-**Rule**: `\??\unix` MUST name the host's root as a drive names its link. A directory listing MUST give `.`, `..`, then the entries matching the mask in name order. Each query MUST continue where the last stopped, until a restart.
+**Rule**: `\??\unix` MUST name the host's root as a drive names its link. Directory queries MUST list matching entries in name order, preceded by `.` and `..`, and resume until restarted. Listings MUST expose Wine's hashed DOS aliases for names that need them.
 **Verification**: Test
-
-Entries carry no 8.3 names, as on a volume that does not make them.
 
 ### WINE-SYS-7 Instruction coherence
 
@@ -90,6 +90,11 @@ Entries carry no 8.3 names, as on a volume that does not make them.
 ### WINE-SYS-10 Main thread stack
 
 **Rule**: The main thread's stack MUST be as large as the stack reserve of the process's image, and no smaller than 1 MiB.
+**Verification**: Test
+
+### WINE-SYS-11 NT file names
+
+**Rule**: NT file names MUST reject dot components and duplicate separators inside paths. A relative file name MUST resolve through its directory handle.
 **Verification**: Test
 
 ## Unix libraries
@@ -132,12 +137,17 @@ FreeType is such a library: win32u opens it by name and draws TrueType text thro
 
 ### WINE-THR-3 Suspension
 
-**Rule**: Suspending another thread MUST stop its context before the system call returns, and resuming it to a zero count MUST let it run. A thread suspending itself is not supported.
+**Rule**: Suspending a thread MUST stop its context before the caller next runs. Resuming it to a zero count MUST let it run.
 **Verification**: Test
 
 ### WINE-THR-4 Termination
 
 **Rule**: Terminating another thread MUST end its context where it stands, with no detach work. Its waiters MUST see the thread signaled with the given exit code.
+**Verification**: Test
+
+### WINE-THR-5 Debug register contexts
+
+**Rule**: NT thread contexts MUST retain and return x86 debug registers. These registers MUST NOT trigger hardware breakpoints.
 **Verification**: Test
 
 ## Time

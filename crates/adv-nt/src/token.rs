@@ -17,7 +17,7 @@ pub fn query(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         unreachable!()
     };
     status::finish((|| {
-        if class != TOKEN_USER {
+        if class != TOKEN_USER && class != 4 {
             return Err(Error::Unsupported(format!(
                 "token information class {class}"
             )));
@@ -25,7 +25,12 @@ pub fn query(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         if result_length != 0 {
             write_u32(env, result_length, 0)?;
         }
-        let mut sid = vec![0u8; length.saturating_sub(TOKEN_USER_SIZE) as usize];
+        let header = if class == TOKEN_USER {
+            TOKEN_USER_SIZE
+        } else {
+            4
+        };
+        let mut sid = vec![0u8; length.saturating_sub(header) as usize];
         let mut request = GetTokenSidRequest {
             handle: token,
             which_sid: class,
@@ -33,13 +38,15 @@ pub fn query(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         };
         let (reply, size) = server::request(env, &mut request, &[], &mut sid)?;
         if result_length != 0 {
-            write_u32(env, result_length, reply.sid_len + TOKEN_USER_SIZE)?;
+            write_u32(env, result_length, reply.sid_len + header)?;
         }
         status::check(reply.header.error)?;
-        let at = info + TOKEN_USER_SIZE;
+        let at = info + header;
         write_bytes(env, at, &sid[..size])?;
         write_u32(env, info, at)?;
-        write_u32(env, info + 4, 0)?;
+        if class == TOKEN_USER {
+            write_u32(env, info + 4, 0)?;
+        }
         Ok(())
     })())
 }
@@ -72,6 +79,56 @@ pub fn open_process(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         let (reply, _) = server::request(env, &mut request, &[], &mut [])?;
         status::check(reply.header.error)?;
         write_u32(env, handle, reply.token)?;
+        Ok(())
+    })())
+}
+
+/// NtOpenThreadToken(thread, access, self, *handle)
+pub fn open_thread(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    status::finish((|| {
+        write_u32(env, args[3], 0)?;
+        let mut request = crate::protocol::OpenTokenRequest {
+            handle: args[0],
+            access: args[1],
+            flags: 1 | if args[2] as u8 != 0 { 2 } else { 0 },
+            ..Default::default()
+        };
+        let (reply, _) = server::request(env, &mut request, &[], &mut [])?;
+        status::check(reply.header.error)?;
+        write_u32(env, args[3], reply.token)?;
+        Ok(())
+    })())
+}
+
+/// NtDuplicateToken(token, access, *attributes, effective_only, type, *handle)
+pub fn duplicate(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    status::finish((|| {
+        write_u32(env, args[5], 0)?;
+        let attr = if args[2] == 0 {
+            Vec::new()
+        } else {
+            crate::object::Attributes::read(env, args[2])?.wire()
+        };
+        let qos = if args[2] == 0 {
+            0
+        } else {
+            crate::object::read_u32(env, args[2] + 20)?
+        };
+        let level = if qos == 0 {
+            0
+        } else {
+            crate::object::read_u32(env, qos + 4)? as i32
+        };
+        let mut request = crate::protocol::DuplicateTokenRequest {
+            handle: args[0],
+            access: args[1],
+            primary: i32::from(args[4] == 1),
+            impersonation_level: level,
+            ..Default::default()
+        };
+        let (reply, _) = server::request(env, &mut request, &[&attr], &mut [])?;
+        status::check(reply.header.error)?;
+        write_u32(env, args[5], reply.new_handle)?;
         Ok(())
     })())
 }

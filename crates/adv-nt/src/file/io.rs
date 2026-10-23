@@ -167,7 +167,7 @@ pub fn read(env: &mut Env<'_>, args: &[u32]) -> Outcome {
     }
 }
 
-fn add_completion(
+pub(super) fn add_completion(
     env: &mut Env<'_>,
     handle: u32,
     value: u32,
@@ -187,7 +187,7 @@ fn add_completion(
     Ok(())
 }
 
-fn event_op(env: &mut Env<'_>, handle: u32, op: i32) -> Result<(), Error> {
+pub(super) fn event_op(env: &mut Env<'_>, handle: u32, op: i32) -> Result<(), Error> {
     let mut request = EventOpRequest {
         handle,
         op,
@@ -221,6 +221,12 @@ fn server_read(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         request.r#async[32..40].copy_from_slice(&u64::from(context).to_le_bytes());
         let mut bytes = vec![0; length as usize];
         let (reply, size) = server::request(env, &mut request, &[], &mut bytes)?;
+        if reply.header.error == PENDING {
+            env.ext
+                .get_or_default::<AsyncReads>()
+                .0
+                .insert(io, (buffer, length));
+        }
         write_bytes(env, buffer, &bytes[..size])?;
         if reply.wait != 0 && reply.header.error != PENDING {
             write_u32(env, io, reply.header.error)?;
@@ -338,4 +344,37 @@ pub fn create_named_pipe(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         )?;
         Ok(())
     })())
+}
+
+#[derive(Default)]
+struct AsyncReads(std::collections::HashMap<u32, (u32, u32)>);
+
+/// The system APC completing server-side I/O, after Wine's irp_completion.
+pub fn complete_async(env: &mut Env<'_>, call: &[u8; 64]) -> Result<[u8; 40], Error> {
+    let word = |offset| u32::from_le_bytes(call[offset..offset + 4].try_into().unwrap());
+    let mut status = word(4);
+    let user = word(8);
+    let iosb = word(16);
+    let total = word(24);
+    let read = env.ext.get_or_default::<AsyncReads>().0.remove(&user);
+    if status == 0x101 {
+        let (buffer, length) = read.unwrap_or((0, 0));
+        let mut bytes = vec![0; length as usize];
+        let mut request = crate::protocol::GetAsyncResultRequest {
+            user_arg: u64::from(user),
+            ..Default::default()
+        };
+        let (reply, size) = server::request(env, &mut request, &[], &mut bytes)?;
+        status = reply.header.error;
+        write_bytes(env, buffer, &bytes[..size])?;
+    }
+    if iosb != 0 {
+        write_u32(env, iosb, status)?;
+        write_u32(env, iosb + 4, total)?;
+    }
+    let mut result = [0; 40];
+    result[..4].copy_from_slice(&2u32.to_le_bytes());
+    result[4..8].copy_from_slice(&status.to_le_bytes());
+    result[8..12].copy_from_slice(&total.to_le_bytes());
+    Ok(result)
 }

@@ -87,11 +87,6 @@ fn query_server(
     };
     let mut bytes = vec![0; length as usize];
     let (reply, size) = server::request(env, &mut request, &[], &mut bytes)?;
-    if reply.header.error == status::NOT_IMPLEMENTED {
-        return Err(Error::Unsupported(format!(
-            "file information class {class}"
-        )));
-    }
     write_bytes(env, buffer, &bytes[..size])?;
     Ok((reply.header.error, size as u32))
 }
@@ -372,6 +367,7 @@ fn set_in(
 ) -> Result<(), Error> {
     let size = match class {
         FILE_BASIC_INFORMATION => 40,
+        30 => 8,
         FILE_POSITION_INFORMATION | FILE_END_OF_FILE_INFORMATION => 8,
         FILE_DISPOSITION_INFORMATION => 1,
         FILE_DISPOSITION_INFORMATION_EX => 4,
@@ -386,6 +382,16 @@ fn set_in(
         return Err(INVALID_PARAMETER_3.into());
     }
     match class {
+        30 => {
+            let mut request = crate::protocol::SetCompletionInfoRequest {
+                handle,
+                chandle: read_u32(env, buffer)?,
+                ckey: u64::from(read_u32(env, buffer + 4)?),
+                ..Default::default()
+            };
+            let (reply, _) = server::request(env, &mut request, &[], &mut [])?;
+            status::check(reply.header.error)?;
+        }
         FILE_POSITION_INFORMATION => {
             let offset = read_i64(env, buffer)?;
             let fd = server::handle_fd(env, handle)?;

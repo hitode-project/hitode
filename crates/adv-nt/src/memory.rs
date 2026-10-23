@@ -71,6 +71,7 @@ struct Region {
     protection: u32,
     placeholder: Placeholder,
     pages: Vec<Page>,
+    write_watch: Option<Vec<bool>>,
 }
 
 impl Region {
@@ -96,6 +97,7 @@ impl Memory {
                 kind,
                 protection,
                 placeholder: Placeholder::None,
+                write_watch: None,
                 pages,
             },
         );
@@ -349,6 +351,14 @@ fn finish(result: Result<(), Status>) -> Outcome {
 
 /// NtAllocateVirtualMemory(process, *base, zero_bits, *size, type, protection)
 pub fn allocate(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    if args[0] != CURRENT_PROCESS {
+        if let Err(error) = crate::information::current_process(env, args[0]) {
+            return status::finish(Err(error));
+        }
+        let mut args = args.to_vec();
+        args[0] = CURRENT_PROCESS;
+        return allocate(env, &args);
+    }
     finish((|| {
         let zero_bits = args[2];
         if read(env, args[3])? == 0 {
@@ -461,6 +471,10 @@ fn allocate_in(
         (start, length)
     };
 
+    if kind & MEM_WRITE_WATCH != 0 {
+        let (_, region) = memory(env).region_of(start).expect("region");
+        region.write_watch = Some(vec![false; region.pages.len()]);
+    }
     if kind & MEM_COMMIT != 0 {
         let (base, region) = memory(env).region_of(start).expect("region");
         let first = ((start - base) / PAGE) as usize;
@@ -481,12 +495,21 @@ fn allocate_in(
             .protect(start, length, prot)
             .map_err(|_| status::NO_MEMORY)?;
     }
+    apply_write_watch(env, start, length)?;
     write(env, base_out, start)?;
     write(env, size_out, length)
 }
 
 /// NtFreeVirtualMemory(process, *base, *size, type)
 pub fn free(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    if args[0] != CURRENT_PROCESS {
+        if let Err(error) = crate::information::current_process(env, args[0]) {
+            return status::finish(Err(error));
+        }
+        let mut args = args.to_vec();
+        args[0] = CURRENT_PROCESS;
+        return free(env, &args);
+    }
     finish(free_in(env, args))
 }
 
@@ -569,6 +592,14 @@ fn free_in(env: &mut Env<'_>, args: &[u32]) -> Result<(), Status> {
 
 /// NtProtectVirtualMemory(process, *base, *size, protection, *old)
 pub fn protect(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    if args[0] != CURRENT_PROCESS {
+        if let Err(error) = crate::information::current_process(env, args[0]) {
+            return status::finish(Err(error));
+        }
+        let mut args = args.to_vec();
+        args[0] = CURRENT_PROCESS;
+        return protect(env, &args);
+    }
     finish(protect_in(env, args))
 }
 
@@ -601,6 +632,7 @@ fn protect_in(env: &mut Env<'_>, args: &[u32]) -> Result<(), Status> {
     env.cpu
         .protect(start, length, prot)
         .map_err(|_| status::NOT_COMMITTED)?;
+    apply_write_watch(env, start, length)?;
     write(env, old_out, old)?;
     write(env, base_out, start)?;
     write(env, size_out, length)
@@ -608,6 +640,14 @@ fn protect_in(env: &mut Env<'_>, args: &[u32]) -> Result<(), Status> {
 
 /// NtQueryVirtualMemory(process, address, class, *buffer, length, *returned)
 pub fn query(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    if args[0] != CURRENT_PROCESS {
+        if let Err(error) = crate::information::current_process(env, args[0]) {
+            return status::finish(Err(error));
+        }
+        let mut args = args.to_vec();
+        args[0] = CURRENT_PROCESS;
+        return query(env, &args);
+    }
     let &[process, address, class, buffer, length, _] = args else {
         unreachable!()
     };
@@ -719,17 +759,20 @@ pub fn guest_protection(memory: &Memory, protection: u32) -> Prot {
 
 /// NtFlushInstructionCache(process, address, size). Every guest store already
 /// commits through the CPU's code-mutation barrier before execution resumes.
-pub fn flush_instruction_cache(_env: &mut Env<'_>, args: &[u32]) -> Outcome {
-    if args[0] != CURRENT_PROCESS {
-        return Outcome::Fail(
-            "flushing another process's instruction cache is not supported".into(),
-        );
-    }
-    Outcome::Return(status::SUCCESS)
+pub fn flush_instruction_cache(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    status::finish(crate::information::current_process(env, args[0]))
 }
 
 /// NtAllocateVirtualMemoryEx(process, *base, *size, type, protection, *parameters, count)
 pub fn allocate_ex(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    if args[0] != CURRENT_PROCESS {
+        if let Err(error) = crate::information::current_process(env, args[0]) {
+            return status::finish(Err(error));
+        }
+        let mut args = args.to_vec();
+        args[0] = CURRENT_PROCESS;
+        return allocate_ex(env, &args);
+    }
     let &[process, base, size, kind, protection, parameters, count] = args else {
         unreachable!()
     };
@@ -842,4 +885,248 @@ fn find_free_range(
         cursor = u64::from(end).next_multiple_of(u64::from(alignment));
     }
     found
+}
+
+/// The process's reserved and committed guest memory, in bytes.
+pub fn usage(env: &mut Env<'_>) -> (u32, u32) {
+    let memory = memory(env);
+    let reserved = memory
+        .regions
+        .values()
+        .map(|region| region.pages.len() as u32 * PAGE)
+        .sum();
+    let committed = memory
+        .regions
+        .values()
+        .map(|region| region.pages.iter().filter(|page| page.is_some()).count() as u32 * PAGE)
+        .sum();
+    (reserved, committed)
+}
+
+/// Reapply Wine's write-watch protection after a commit, protection change or reset.
+fn apply_write_watch(env: &mut Env<'_>, start: u32, length: u32) -> Result<(), Status> {
+    for address in (start..start + length).step_by(PAGE as usize) {
+        let memory = memory(env);
+        let Some((base, region)) = memory.region_of(address) else {
+            continue;
+        };
+        let index = ((address - base) / PAGE) as usize;
+        let Some(watches) = &region.write_watch else {
+            continue;
+        };
+        if watches[index] {
+            continue;
+        }
+        let Some(protection) = region.pages[index] else {
+            continue;
+        };
+        let prot = memory.prot(protection)?;
+        env.cpu
+            .protect(address, PAGE, Prot(prot.0 & !Prot::WRITE.0))
+            .map_err(|_| status::NOT_COMMITTED)?;
+    }
+    Ok(())
+}
+
+/// Resolve a first write to a watched page, leaving read-only and guard faults intact.
+pub fn write_watch_fault(env: &mut Env<'_>, address: u32) -> bool {
+    let memory = memory(env);
+    let Some((base, region)) = memory.region_of(address) else {
+        return false;
+    };
+    let index = ((address - base) / PAGE) as usize;
+    let Some(protection) = region.pages[index] else {
+        return false;
+    };
+    let Some(watches) = &mut region.write_watch else {
+        return false;
+    };
+    if watches[index] {
+        return false;
+    }
+    let Ok(prot) = memory.prot(protection) else {
+        return false;
+    };
+    if !prot.contains(Prot::WRITE) {
+        return false;
+    }
+    let (_, region) = memory.region_of(address).unwrap();
+    region.write_watch.as_mut().unwrap()[index] = true;
+    env.cpu.protect(address & !(PAGE - 1), PAGE, prot).is_ok()
+}
+
+/// NtGetWriteWatch(process, flags, base, size, *addresses, *count, *granularity)
+pub fn get_write_watch(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    finish((|| {
+        let &[_, flags, address, size, addresses, count, granularity] = args else {
+            unreachable!()
+        };
+        if count == 0 || granularity == 0 {
+            return Err(status::ACCESS_VIOLATION);
+        }
+        let capacity = read(env, count)?;
+        if capacity == 0 || size == 0 || flags & !1 != 0 {
+            return Err(status::INVALID_PARAMETER);
+        }
+        if addresses == 0 {
+            return Err(status::ACCESS_VIOLATION);
+        }
+        let (start, length) = pages(address, size)?;
+        let Some((base, region)) = memory(env).region_of(start) else {
+            return Err(status::INVALID_PARAMETER);
+        };
+        if start + length > region.end(base) {
+            return Err(status::INVALID_PARAMETER);
+        }
+        let Some(watches) = &mut region.write_watch else {
+            return Err(status::INVALID_PARAMETER);
+        };
+        let first = ((start - base) / PAGE) as usize;
+        let mut found = Vec::new();
+        let mut scanned = 0;
+        for (index, watched) in watches
+            .iter_mut()
+            .enumerate()
+            .skip(first)
+            .take((length / PAGE) as usize)
+        {
+            scanned += 1;
+            if *watched {
+                found.push(base + index as u32 * PAGE);
+                if flags & 1 != 0 {
+                    *watched = false;
+                }
+                if found.len() == capacity as usize {
+                    break;
+                }
+            }
+        }
+        if flags & 1 != 0 {
+            apply_write_watch(env, start, scanned * PAGE)?;
+        }
+        for (index, address) in found.iter().enumerate() {
+            write(env, addresses + index as u32 * 4, *address)?;
+        }
+        write(env, count, found.len() as u32)?;
+        write(env, granularity, PAGE)
+    })())
+}
+
+/// NtResetWriteWatch(process, base, size)
+pub fn reset_write_watch(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    finish((|| {
+        if args[2] == 0 {
+            return Err(status::INVALID_PARAMETER);
+        }
+        let (start, length) = pages(args[1], args[2])?;
+        let Some((base, region)) = memory(env).region_of(start) else {
+            return Err(status::INVALID_PARAMETER);
+        };
+        if start + length > region.end(base) {
+            return Err(status::INVALID_PARAMETER);
+        }
+        let Some(watches) = &mut region.write_watch else {
+            return Err(status::INVALID_PARAMETER);
+        };
+        let first = ((start - base) / PAGE) as usize;
+        watches[first..first + (length / PAGE) as usize].fill(false);
+        apply_write_watch(env, start, length)
+    })())
+}
+
+/// NtReadVirtualMemory(process, source, destination, size, *read)
+pub fn read_virtual(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    let &[process, source, destination, size, returned] = args else {
+        unreachable!()
+    };
+    let result = (|| {
+        crate::information::current_process(env, process)?;
+        if !env.cpu.accessible(destination, size, Prot::WRITE) {
+            return Err(status::ACCESS_VIOLATION.into());
+        }
+        let mut bytes = vec![0; size as usize];
+        if !env.cpu.accessible(source, size, Prot::READ)
+            || env.cpu.read(source, &mut bytes).is_err()
+        {
+            return Err(0x8000_000du32.into());
+        }
+        crate::object::write_bytes(env, destination, &bytes)?;
+        Ok(())
+    })();
+    if returned != 0
+        && let Err(error) = write(env, returned, if result.is_ok() { size } else { 0 })
+    {
+        return Outcome::Return(error);
+    }
+    status::finish(result)
+}
+
+/// NtWriteVirtualMemory(process, destination, source, size, *written)
+pub fn write_virtual(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    let &[process, destination, source, size, returned] = args else {
+        unreachable!()
+    };
+    let result = (|| {
+        crate::information::current_process(env, process)?;
+        let mut bytes = vec![0; size as usize];
+        if !env.cpu.accessible(source, size, Prot::READ)
+            || env.cpu.read(source, &mut bytes).is_err()
+        {
+            return Err(0x8000_000du32.into());
+        }
+        if !env.cpu.accessible(destination, size, Prot::WRITE) {
+            return Err(status::ACCESS_VIOLATION.into());
+        }
+        crate::object::write_bytes(env, destination, &bytes)?;
+        Ok(())
+    })();
+    if returned != 0
+        && let Err(error) = write(env, returned, if result.is_ok() { size } else { 0 })
+    {
+        return Outcome::Return(error);
+    }
+    status::finish(result)
+}
+
+/// Wine's virtual_set_force_exec reapplies protections to existing views.
+pub fn set_execute(env: &mut Env<'_>, enabled: bool) -> Result<(), Status> {
+    let memory = memory(env);
+    memory.execute_readable = enabled;
+    let mut pages = Vec::new();
+    for (&base, region) in &memory.regions {
+        for (index, page) in region.pages.iter().enumerate() {
+            if let Some(protection) = page {
+                if protection & PAGE_GUARD != 0
+                    || matches!(
+                        *protection & 0xff,
+                        PAGE_NOACCESS
+                            | PAGE_EXECUTE
+                            | PAGE_EXECUTE_READ
+                            | PAGE_EXECUTE_READWRITE
+                            | PAGE_EXECUTE_WRITECOPY
+                    )
+                {
+                    continue;
+                }
+                let mut prot = memory.prot(*protection)?;
+                // Data-file views retain their non-executable mapping contract.
+                if region.kind == Kind::Mapped
+                    && matches!(
+                        *protection & 0xff,
+                        PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY
+                    )
+                {
+                    prot.0 &= !Prot::EXEC.0;
+                }
+                pages.push((base + index as u32 * PAGE, prot));
+            }
+        }
+    }
+    for (address, prot) in pages {
+        env.cpu
+            .protect(address, PAGE, prot)
+            .map_err(|_| status::NOT_COMMITTED)?;
+        apply_write_watch(env, address, PAGE)?;
+    }
+    Ok(())
 }

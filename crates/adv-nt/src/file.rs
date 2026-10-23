@@ -5,7 +5,7 @@ mod information;
 mod io;
 
 pub use information::{query, set};
-pub use io::{create_named_pipe, read};
+pub use io::{complete_async, create_named_pipe, read};
 
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
@@ -51,7 +51,7 @@ pub fn write(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         buffer,
         length,
         offset,
-        key,
+        _key,
     ] = args
     else {
         unreachable!()
@@ -61,17 +61,8 @@ pub fn write(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         Err(Error::Status(status::BAD_DEVICE_TYPE)) => return io::server_write(env, args),
         Err(error) => return status::finish(Err(error)),
     };
-    status::finish((|| {
-        if event != 0 || apc != 0 || apc_context != 0 || key != 0 {
-            return Err(Error::Unsupported(
-                "NtWriteFile with an event, APC routine/context or key".into(),
-            ));
-        }
-        if fd.options & FILE_SYNCHRONOUS_IO == 0 {
-            return Err(Error::Unsupported(
-                "NtWriteFile on an asynchronous handle".into(),
-            ));
-        }
+    let result = (|| {
+        let asynchronous = fd.options & FILE_SYNCHRONOUS_IO == 0;
         let mut position = None;
         if fd.kind == FD_TYPE_FILE && offset != 0 {
             let mut bytes = [0; 8];
@@ -82,6 +73,12 @@ pub fn write(env: &mut Env<'_>, args: &[u32]) -> Outcome {
             if off != FILE_USE_FILE_POINTER_POSITION {
                 position = Some(off);
             }
+        }
+        if asynchronous && fd.kind == FD_TYPE_FILE && position.is_none() {
+            if event != 0 {
+                io::event_op(env, event, 2)?;
+            }
+            return Err(status::INVALID_PARAMETER.into());
         }
         let mut bytes = vec![0; length as usize];
         env.cpu
@@ -106,7 +103,9 @@ pub fn write(env: &mut Env<'_>, args: &[u32]) -> Outcome {
                     }
                 };
                 if count >= 0 {
-                    if let Some(off) = position {
+                    if let Some(off) = position
+                        && !asynchronous
+                    {
                         // SAFETY: the same regular file; Wine advances its synchronous position.
                         unsafe { libc::lseek(fd.fd, off + count as i64, libc::SEEK_SET) };
                     }
@@ -124,8 +123,28 @@ pub fn write(env: &mut Env<'_>, args: &[u32]) -> Outcome {
             result.as_ref().err().copied().unwrap_or(status::SUCCESS),
         )?;
         write_u32(env, io + 4, result.as_ref().copied().unwrap_or(0))?;
-        result.map(drop).map_err(Error::from)
-    })())
+        let status = result.as_ref().err().copied().unwrap_or(status::SUCCESS);
+        let count = result?;
+        if event != 0 {
+            io::event_op(env, event, 1)?;
+        }
+        if apc != 0 {
+            let outcome = crate::sync::queue_apc(env, &[u32::MAX - 1, apc, apc_context, io, 0]);
+            if let Outcome::Return(code) = outcome {
+                status::check(code)?;
+            } else {
+                return Err(Error::Unsupported("queuing file write APC".into()));
+            }
+        }
+        if apc == 0 && apc_context != 0 && asynchronous {
+            io::add_completion(env, handle, apc_context, status, count, true)?;
+        }
+        Ok(if asynchronous { 0x103 } else { status })
+    })();
+    match result {
+        Ok(status) => Outcome::Return(status),
+        Err(error) => status::finish(Err(error)),
+    }
 }
 
 /// Wine's errno_to_status for host file operations.
@@ -213,6 +232,7 @@ pub fn open_path(
     options: u32,
 ) -> Result<u32, Error> {
     let attributes = Attributes {
+        security: Vec::new(),
         root: 0,
         attributes: OBJ_CASE_INSENSITIVE,
         name: Some(name),
@@ -269,19 +289,14 @@ impl Open {
     /// Opens the file and returns the Information value.
     fn open(&self, env: &mut Env<'_>) -> Result<u32, Error> {
         let attributes = Attributes::read(env, self.attributes)?;
-        let Some(name) = &attributes.name else {
+        if attributes.name.is_none() {
             return Err(status::INVALID_PARAMETER.into());
-        };
-        if attributes.root != 0 {
-            return Err(Error::Unsupported(
-                "opening a file relative to a directory".into(),
-            ));
         }
         if self.options & FILE_OPEN_BY_FILE_ID != 0 {
             return Err(Error::Unsupported("opening a file by its id".into()));
         }
-        let dosdevices = &env.ext.get::<Files>().dosdevices;
-        let (host, created) = match path::lookup(dosdevices, name)? {
+        let lookup = lookup_attributes(env, &attributes)?;
+        let (host, created) = match lookup {
             Lookup::Found(host) => (host, false),
             Lookup::Missing(_) if matches!(self.disposition, FILE_OPEN | FILE_OVERWRITE) => {
                 return Err(status::OBJECT_NAME_NOT_FOUND.into());
@@ -311,6 +326,20 @@ impl Open {
             options: self.options,
             attrs: self.file_attributes,
             ..Default::default()
+        };
+        let attributes = if attributes.root != 0 {
+            Attributes {
+                security: attributes.security,
+                root: 0,
+                attributes: attributes.attributes,
+                name: Some(
+                    path::nt_name(&env.ext.get::<Files>().dosdevices, &host)
+                        .encode_utf16()
+                        .collect(),
+                ),
+            }
+        } else {
+            attributes
         };
         let objattr = attributes.wire();
         let host = host.as_os_str().as_bytes();
@@ -438,13 +467,7 @@ fn named_file(
     let Some(name) = &attributes.name else {
         return Err(status::INVALID_PARAMETER.into());
     };
-    if attributes.root != 0 {
-        return Err(Error::Unsupported(
-            "querying a file relative to a directory".into(),
-        ));
-    }
-    let dosdevices = &env.ext.get::<Files>().dosdevices;
-    let host = match path::lookup(dosdevices, name)? {
+    let host = match lookup_attributes(env, &attributes)? {
         Lookup::Found(host) => host,
         Lookup::Missing(_) => return Err(status::OBJECT_NAME_NOT_FOUND.into()),
         Lookup::Device => {
@@ -556,4 +579,23 @@ pub fn control(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         write_u32(env, io + 4, OBJECT_ID_BUFFER_SIZE)?;
         Ok(())
     })())
+}
+
+fn lookup_attributes(env: &mut Env<'_>, attributes: &Attributes) -> Result<Lookup, Error> {
+    let name = attributes.name.as_deref().unwrap_or_default();
+    if attributes.root == 0 {
+        return Ok(path::lookup(&env.ext.get::<Files>().dosdevices, name)?);
+    }
+    if name.first() == Some(&(b'\\' as u16)) {
+        return Err(status::INVALID_PARAMETER.into());
+    }
+    path::validate_components(&String::from_utf16_lossy(name), false)?;
+    let root = information::unix_name(env, attributes.root)?;
+    let dosdevices = &env.ext.get::<Files>().dosdevices;
+    let mut full = path::nt_name(dosdevices, &root)
+        .encode_utf16()
+        .collect::<Vec<_>>();
+    full.push(b'\\' as u16);
+    full.extend_from_slice(name);
+    Ok(path::lookup(dosdevices, &full)?)
 }

@@ -51,9 +51,7 @@ pub fn create(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         unreachable!()
     };
     status::finish((|| {
-        if process != CURRENT_PROCESS {
-            return Err(Error::Unsupported("threads of another process".into()));
-        }
+        crate::information::current_process(env, process)?;
         if flags & !THREAD_CREATE_FLAGS_CREATE_SUSPENDED != 0 {
             return Err(Error::Unsupported(format!(
                 "thread creation flags {flags:#x}"
@@ -162,9 +160,6 @@ pub fn suspend(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         if reply.count == 0
             && let Some(context) = context_of(env, thread)?
         {
-            if context == env.context {
-                return Err(Error::Unsupported("a thread suspending itself".into()));
-            }
             env.sys.suspend_context(context);
         }
         if previous != 0 {
@@ -233,10 +228,7 @@ pub fn terminate(env: &mut Env<'_>, args: &[u32]) -> Outcome {
     Outcome::ExitThread(exit_code)
 }
 
-/// An unstarted suspended thread has its Windows context at the top of
-/// its stack, consumed by LdrInitializeThunk. Once materialized, its
-/// registers belong to the machine's saved execution context.
-fn initial_context(env: &mut Env<'_>, thread: u32, access: u32) -> Result<Option<u32>, Error> {
+fn context_target(env: &mut Env<'_>, thread: u32, access: u32) -> Result<CtxId, Error> {
     let target = if thread == CURRENT_THREAD {
         Some(env.context)
     } else {
@@ -252,12 +244,17 @@ fn initial_context(env: &mut Env<'_>, thread: u32, access: u32) -> Result<Option
         }
         target
     };
-    if target == Some(env.context) {
+    target.ok_or_else(|| Error::Unsupported("contexts of another process".into()))
+}
+
+/// An unstarted suspended thread has its Windows context at the top of
+/// its stack, consumed by LdrInitializeThunk. Once materialized, its
+/// registers belong to the machine's saved execution context.
+fn initial_context(env: &mut Env<'_>, thread: u32, access: u32) -> Result<Option<u32>, Error> {
+    let target = context_target(env, thread, access)?;
+    if target == env.context {
         return Ok(None);
     }
-    let Some(target) = target else {
-        return Err(Error::Unsupported("contexts of another process".into()));
-    };
     if env.sys.contexts[target as usize].suspend_count == 0
         || !env.sys.set_initial_registers(target, &[])
     {
@@ -277,8 +274,15 @@ pub fn get_context(env: &mut Env<'_>, args: &[u32]) -> Outcome {
     };
     status::finish((|| {
         let flags = read_u32(env, output)?;
-        if flags & 0x10 != 0 {
-            return Err(Error::Unsupported("x86 debug registers".into()));
+        if flags & !0x10010 == 0 {
+            let target = context_target(env, thread, 8)?;
+            let mut image = [0; 28];
+            crate::context::load_debug(env, target, &mut image);
+            if flags & 0x10 != 0 {
+                write_bytes(env, output + 4, &image[4..])?;
+            }
+            write_u32(env, output, flags | 0x10000)?;
+            return Ok(());
         }
         let mut image = if let Some(input) = initial_context(env, thread, 8)? {
             let mut image = [0; crate::context::SIZE];
@@ -295,6 +299,12 @@ pub fn get_context(env: &mut Env<'_>, args: &[u32]) -> Outcome {
             state.regs[4] += 4;
             crate::context::encode(&state)
         };
+        let target = if thread == CURRENT_THREAD {
+            env.context
+        } else {
+            context_of(env, thread)?.ok_or(status::INVALID_HANDLE)?
+        };
+        crate::context::load_debug(env, target, &mut image);
         if flags & 8 != 0 {
             let tag = u32::from_le_bytes(image[0x24..0x28].try_into().unwrap()) | 0xffff_0000;
             let status = u32::from_le_bytes(image[0x20..0x24].try_into().unwrap()) | 0xffff_0000;
@@ -307,6 +317,7 @@ pub fn get_context(env: &mut Env<'_>, args: &[u32]) -> Outcome {
             (2, 0x9c, 0xb4),
             (4, 0x8c, 0x9c),
             (8, 0x1c, 0x8c),
+            (0x10, 4, 0x1c),
             (0x20, 0xcc, crate::context::SIZE),
         ] {
             if flags & part != 0 {
@@ -328,6 +339,12 @@ pub fn set_context(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         env.cpu
             .read(input, &mut image)
             .map_err(|_| status::ACCESS_VIOLATION)?;
+        let flags = read_u32(env, input)?;
+        if flags & !0x10010 == 0 {
+            let target = context_target(env, thread, 0x10)?;
+            crate::context::save_debug(env, target, &image);
+            return Ok(None);
+        }
         let initial = initial_context(env, thread, 0x10)?;
         let mut checkpoint = env
             .checkpoint()
@@ -369,6 +386,12 @@ pub fn set_context(env: &mut Env<'_>, args: &[u32]) -> Outcome {
                 );
             }
         }
+        let target = if thread == CURRENT_THREAD {
+            env.context
+        } else {
+            context_of(env, thread)?.ok_or(status::INVALID_HANDLE)?
+        };
+        crate::context::save_debug(env, target, &image);
         if let Some(initial) = initial {
             write_bytes(env, initial, &crate::context::encode(state))?;
             Ok(None)

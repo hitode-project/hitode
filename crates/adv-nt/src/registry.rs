@@ -61,6 +61,7 @@ pub fn set_volatile_string(
     for (index, element) in path.iter().enumerate() {
         let last = index + 1 == path.len();
         let attributes = Attributes {
+            security: Vec::new(),
             root: hkey,
             attributes: OBJ_OPENIF | OBJ_CASE_INSENSITIVE,
             name: Some(element.encode_utf16().collect()),
