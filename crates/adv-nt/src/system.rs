@@ -1,5 +1,6 @@
 //! System information, after Wine's `unix/system.c`.
 
+use adv_cpu::PROCESSOR_IDENTITY;
 use adv_machine::layout::{GRANULE, PAGE};
 use adv_machine::{Env, Outcome};
 
@@ -10,6 +11,9 @@ use crate::status::{self, Error};
 use crate::timezone;
 
 const SYSTEM_BASIC_INFORMATION: u32 = 0;
+const SYSTEM_CPU_INFORMATION: u32 = 1;
+const SYSTEM_TIME_OF_DAY_INFORMATION: u32 = 3;
+const SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION: u32 = 8;
 const SYSTEM_CURRENT_TIME_ZONE_INFORMATION: u32 = 44;
 const SYSTEM_DYNAMIC_TIME_ZONE_INFORMATION: u32 = 102;
 const SYSTEM_INTERRUPT_INFORMATION: u32 = 23;
@@ -29,6 +33,65 @@ pub fn query(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         // The information, and whether the buffer must be its exact size.
         let (bytes, exact) = match class {
             SYSTEM_BASIC_INFORMATION => (basic_information().to_vec(), true),
+            SYSTEM_CPU_INFORMATION => (processor_information(env).to_vec(), false),
+            SYSTEM_TIME_OF_DAY_INFORMATION => {
+                let mut bytes = [0u8; 48];
+                let system = u64::from(crate::object::read_u32(env, crate::kuser::ADDRESS + 0x14)?)
+                    | (u64::from(crate::object::read_u32(env, crate::kuser::ADDRESS + 0x18)?)
+                        << 32);
+                let interrupt = u64::from(crate::object::read_u32(env, crate::kuser::ADDRESS + 8)?)
+                    | (u64::from(crate::object::read_u32(env, crate::kuser::ADDRESS + 12)?) << 32);
+                let bias = u64::from(crate::object::read_u32(env, crate::kuser::ADDRESS + 0x20)?)
+                    | (u64::from(crate::object::read_u32(env, crate::kuser::ADDRESS + 0x24)?)
+                        << 32);
+                let boot = match env.ext.try_get::<BootTime>() {
+                    Some(boot) => boot.0,
+                    None => {
+                        let boot = system - interrupt;
+                        env.ext.insert(BootTime(boot));
+                        boot
+                    }
+                };
+                bytes[..8].copy_from_slice(&boot.to_le_bytes());
+                bytes[8..16].copy_from_slice(&system.to_le_bytes());
+                bytes[16..24].copy_from_slice(&bias.to_le_bytes());
+                if result_size != 0 {
+                    write_u32(env, result_size, if size <= 48 { size } else { 0 })?;
+                }
+                if size > 48 {
+                    return Err(status::INFO_LENGTH_MISMATCH.into());
+                }
+                if info == 0 {
+                    return Err(status::ACCESS_VIOLATION.into());
+                }
+                write_bytes(env, info, &bytes[..size as usize])?;
+                return Ok(());
+            }
+            SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION => {
+                let count = (size / 48).min(PROCESSORS);
+                if count == 0 {
+                    if result_size != 0 {
+                        write_u32(env, result_size, 0)?;
+                    }
+                    return Err(status::INFO_LENGTH_MISMATCH.into());
+                }
+                let ticks = u64::from(crate::object::read_u32(env, crate::kuser::ADDRESS + 8)?)
+                    | (u64::from(crate::object::read_u32(env, crate::kuser::ADDRESS + 12)?) << 32);
+                // Wine's fallback CPU counters, advanced by the shared clock.
+                let mut bytes = vec![0; count as usize * 48];
+                for cpu in bytes.as_chunks_mut::<48>().0 {
+                    cpu[..8].copy_from_slice(&(3 * ticks).to_le_bytes());
+                    cpu[8..16].copy_from_slice(&ticks.to_le_bytes());
+                    cpu[16..24].copy_from_slice(&(2 * ticks).to_le_bytes());
+                }
+                (bytes, false)
+            }
+            u32::MAX => {
+                if result_size != 0 {
+                    write_u32(env, result_size, 0)?;
+                }
+                return Err(status::INVALID_INFO_CLASS.into());
+            }
             SYSTEM_CURRENT_TIME_ZONE_INFORMATION => {
                 let zone = timezone::current(env)?.encode();
                 (zone[..timezone::STATIC_SIZE].to_vec(), false)
@@ -56,6 +119,9 @@ pub fn query(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         Ok(())
     })())
 }
+
+/// The boot instant stays fixed while the shared clocks advance.
+struct BootTime(u64);
 
 /// `length` bytes from the host's entropy source.
 fn random(length: usize) -> Result<Vec<u8>, Error> {
@@ -170,4 +236,26 @@ const TICKS_PER_SECOND: u64 = 10_000_000;
 pub fn query_time(env: &mut Env<'_>, args: &[u32]) -> Outcome {
     let time = env.sys.clock.system_time();
     status::finish(write_bytes(env, args[0], &time.to_le_bytes()).map_err(Error::from))
+}
+
+/// SYSTEM_CPU_INFORMATION, using the same guest identity and feature bits as KUSER.
+fn processor_information(env: &Env<'_>) -> [u8; 12] {
+    let cpuid = env.cpu.cpuid_features();
+    let mut features: u32 = 0x0080_0275;
+    for (bit, mask) in [(4, 2), (23, 0x100), (26, 0x10000)] {
+        if cpuid & (1 << bit) != 0 {
+            features |= mask;
+        }
+    }
+    features |= 0x80; // PF_COMPARE_EXCHANGE_DOUBLE is always present.
+    if cpuid & (1 << 24) != 0 && cpuid & (1 << 25) != 0 {
+        features |= 0x42800;
+    }
+    let mut bytes = [0; 12];
+    bytes[2..4].copy_from_slice(&(PROCESSOR_IDENTITY.family() as u16).to_le_bytes());
+    let revision = ((PROCESSOR_IDENTITY.model() << 8) | PROCESSOR_IDENTITY.stepping()) as u16;
+    bytes[4..6].copy_from_slice(&revision.to_le_bytes());
+    bytes[6..8].copy_from_slice(&(PROCESSORS as u16).to_le_bytes());
+    bytes[8..12].copy_from_slice(&features.to_le_bytes());
+    bytes
 }

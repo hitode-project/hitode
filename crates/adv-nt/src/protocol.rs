@@ -706,6 +706,102 @@ impl Request for OpenMappingRequest {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
+pub struct OpenProcessRequest {
+    pub header: RequestHeader,
+    pub pid: u32,
+    pub access: u32,
+    pub attributes: u32,
+}
+const _: () = assert!(size_of::<OpenProcessRequest>() == 24);
+const _: () = assert!(std::mem::offset_of!(OpenProcessRequest, pid) == 12);
+const _: () = assert!(std::mem::offset_of!(OpenProcessRequest, access) == 16);
+const _: () = assert!(std::mem::offset_of!(OpenProcessRequest, attributes) == 20);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OpenProcessReply {
+    pub header: ReplyHeader,
+    pub handle: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<OpenProcessReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(OpenProcessReply, handle) == 8);
+
+impl Request for OpenProcessRequest {
+    const NUMBER: i32 = 27;
+    type Reply = OpenProcessReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OpenThreadRequest {
+    pub header: RequestHeader,
+    pub tid: u32,
+    pub access: u32,
+    pub attributes: u32,
+}
+const _: () = assert!(size_of::<OpenThreadRequest>() == 24);
+const _: () = assert!(std::mem::offset_of!(OpenThreadRequest, tid) == 12);
+const _: () = assert!(std::mem::offset_of!(OpenThreadRequest, access) == 16);
+const _: () = assert!(std::mem::offset_of!(OpenThreadRequest, attributes) == 20);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OpenThreadReply {
+    pub header: ReplyHeader,
+    pub handle: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<OpenThreadReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(OpenThreadReply, handle) == 8);
+
+impl Request for OpenThreadRequest {
+    const NUMBER: i32 = 28;
+    type Reply = OpenThreadReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OpenTokenRequest {
+    pub header: RequestHeader,
+    pub handle: u32,
+    pub access: u32,
+    pub attributes: u32,
+    pub flags: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<OpenTokenRequest>() == 32);
+const _: () = assert!(std::mem::offset_of!(OpenTokenRequest, handle) == 12);
+const _: () = assert!(std::mem::offset_of!(OpenTokenRequest, access) == 16);
+const _: () = assert!(std::mem::offset_of!(OpenTokenRequest, attributes) == 20);
+const _: () = assert!(std::mem::offset_of!(OpenTokenRequest, flags) == 24);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OpenTokenReply {
+    pub header: ReplyHeader,
+    pub token: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<OpenTokenReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(OpenTokenReply, token) == 8);
+
+impl Request for OpenTokenRequest {
+    const NUMBER: i32 = 220;
+    type Reply = OpenTokenReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct GetProcessInfoRequest {
     pub header: RequestHeader,
     pub handle: u32,
@@ -831,6 +927,38 @@ const _: () = assert!(std::mem::offset_of!(GetThreadInfoReply, desc_len) == 60);
 impl Request for GetThreadInfoRequest {
     const NUMBER: i32 = 14;
     type Reply = GetThreadInfoReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GetThreadTimesRequest {
+    pub header: RequestHeader,
+    pub handle: u32,
+}
+const _: () = assert!(size_of::<GetThreadTimesRequest>() == 16);
+const _: () = assert!(std::mem::offset_of!(GetThreadTimesRequest, handle) == 12);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GetThreadTimesReply {
+    pub header: ReplyHeader,
+    pub creation_time: i64,
+    pub exit_time: i64,
+    pub unix_pid: i32,
+    pub unix_tid: i32,
+}
+const _: () = assert!(size_of::<GetThreadTimesReply>() == 32);
+const _: () = assert!(std::mem::offset_of!(GetThreadTimesReply, creation_time) == 8);
+const _: () = assert!(std::mem::offset_of!(GetThreadTimesReply, exit_time) == 16);
+const _: () = assert!(std::mem::offset_of!(GetThreadTimesReply, unix_pid) == 24);
+const _: () = assert!(std::mem::offset_of!(GetThreadTimesReply, unix_tid) == 28);
+
+impl Request for GetThreadTimesRequest {
+    const NUMBER: i32 = 15;
+    type Reply = GetThreadTimesReply;
     fn header(&mut self) -> &mut RequestHeader {
         &mut self.header
     }
