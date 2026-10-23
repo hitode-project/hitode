@@ -26,6 +26,14 @@ pub fn write_u32(env: &mut Env<'_>, address: u32, value: u32) -> Result<(), Stat
         .map_err(|_| status::ACCESS_VIOLATION)
 }
 
+pub fn read_bytes(env: &Env<'_>, address: u32, length: u32) -> Result<Vec<u8>, Status> {
+    let mut bytes = vec![0; length as usize];
+    env.cpu
+        .read(address, &mut bytes)
+        .map_err(|_| status::ACCESS_VIOLATION)?;
+    Ok(bytes)
+}
+
 pub fn write_bytes(env: &mut Env<'_>, address: u32, bytes: &[u8]) -> Result<(), Status> {
     env.cpu
         .write(address, bytes)

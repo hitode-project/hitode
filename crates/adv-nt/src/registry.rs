@@ -6,7 +6,7 @@ use adv_machine::{Env, Outcome};
 use crate::object::{Attributes, read_unicode_string, write_bytes, write_u32};
 use crate::protocol::{
     CreateKeyRequest, DeleteKeyRequest, DeleteKeyValueRequest, EnumKeyRequest, EnumKeyValueRequest,
-    GetKeyValueRequest, OpenKeyRequest, SetKeyValueRequest,
+    FlushKeyRequest, GetKeyValueRequest, OpenKeyRequest, SetKeyValueRequest,
 };
 use crate::server;
 use crate::status::{self, Error, Status};
@@ -15,7 +15,6 @@ const OBJ_OPENIF: u32 = 0x80;
 const OBJ_CASE_INSENSITIVE: u32 = 0x40;
 const OBJECT_PATH_SYNTAX_BAD: Status = 0xc000_003b;
 const BUFFER_OVERFLOW: Status = 0x8000_0005;
-const BUFFER_TOO_SMALL: Status = 0xc000_0023;
 const NO_MORE_ENTRIES: Status = 0x8000_001a;
 const KEY_READ: u32 = 0x2_0019;
 const KEY_BASIC_INFORMATION: i32 = 0;
@@ -302,7 +301,7 @@ pub fn query_value(env: &mut Env<'_>, args: &[u32]) -> Outcome {
             };
         write_u32(env, result_length, needed)?;
         if length < minimum {
-            Err(BUFFER_TOO_SMALL.into())
+            Err(status::BUFFER_TOO_SMALL.into())
         } else if length < needed {
             Err(BUFFER_OVERFLOW.into())
         } else {
@@ -450,6 +449,18 @@ pub fn delete(env: &mut Env<'_>, args: &[u32]) -> Outcome {
     )
 }
 
+/// NtFlushKey(key)
+pub fn flush(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    let mut request = FlushKeyRequest {
+        hkey: args[0],
+        ..Default::default()
+    };
+    status::finish(
+        server::request(env, &mut request, &[], &mut [])
+            .and_then(|(reply, _)| status::check(reply.header.error)),
+    )
+}
+
 /// NtDeleteValueKey(key, *name)
 pub fn delete_value(env: &mut Env<'_>, args: &[u32]) -> Outcome {
     let &[key, name] = args else { unreachable!() };
@@ -578,7 +589,7 @@ fn key_information(
     let needed = fixed + reply.total;
     write_u32(env, result_length, needed)?;
     if length < fixed {
-        Err(BUFFER_TOO_SMALL.into())
+        Err(status::BUFFER_TOO_SMALL.into())
     } else if length < needed {
         Err(BUFFER_OVERFLOW.into())
     } else {

@@ -12,7 +12,6 @@ use crate::status::{self, Error, Status};
 
 const MAXINTATOM: u32 = 0xc000;
 const MAX_ATOM_LEN: usize = 255;
-const BUFFER_TOO_SMALL: Status = 0xc000_0023;
 const INVALID_INFO_CLASS: Status = 0xc000_0003;
 const ATOM_BASIC_INFORMATION: u32 = 0;
 /// The size of ATOM_BASIC_INFORMATION, whose name starts at `NAME`.
@@ -155,7 +154,7 @@ pub fn query(env: &mut Env<'_>, args: &[u32]) -> Outcome {
                 length = 2 * (name.len() as u32 - 1);
             }
             let result = if capacity == 0 {
-                BUFFER_TOO_SMALL
+                status::BUFFER_TOO_SMALL
             } else {
                 status::SUCCESS
             };
@@ -174,7 +173,7 @@ pub fn query(env: &mut Env<'_>, args: &[u32]) -> Outcome {
                     reply.pinned,
                     reply.total,
                     reply.total,
-                    BUFFER_TOO_SMALL,
+                    status::BUFFER_TOO_SMALL,
                 )
             } else {
                 name.truncate(size);

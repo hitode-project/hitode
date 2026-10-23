@@ -31,10 +31,16 @@ fn start(options: &Options, dist: &Path, wake: WakeEvent, host: Host) -> Result<
     };
     let prefix = std::path::absolute(prefix).map_err(|e| e.to_string())?;
     let debug = std::env::var("WINEDEBUG").unwrap_or_default();
+    let codepage = match options.codepage {
+        Some(codepage) => codepage,
+        None => crate::detect_codepage(&options.exe).map_err(|e| e.to_string())?,
+    };
     let config = Config {
         dist,
         prefix: &prefix,
         drive: options.wine_drive.as_deref(),
+        locale: adv_runtime::wine::session::locale(codepage),
+        fonts: adv_runtime::wine::session::HOST_FONTS,
         exe: &options.exe,
         width: options.width,
         height: options.height,

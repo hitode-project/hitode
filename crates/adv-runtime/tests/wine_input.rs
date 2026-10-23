@@ -39,6 +39,8 @@ fn run(probe: &str, gpu: bool) {
         dist: &dist,
         prefix: &root,
         drive: None,
+        locale: 0x409,
+        fonts: "",
         exe: &probes.join(probe),
         width: 640,
         height: 480,

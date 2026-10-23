@@ -30,6 +30,8 @@ fn a_waiting_program_publishes_its_frame_to_the_ui() {
         dist: &dist,
         prefix: &session_root,
         drive: None,
+        locale: 0x409,
+        fonts: "",
         exe: &game.join("show.exe"),
         width: 640,
         height: 480,

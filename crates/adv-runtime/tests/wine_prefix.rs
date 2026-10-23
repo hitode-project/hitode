@@ -37,6 +37,8 @@ fn a_session_sees_the_template_user_and_the_virtual_machine() {
         dist: &dist,
         prefix: &session_root,
         drive: None,
+        locale: 0x409,
+        fonts: "",
         exe: &game.join("identity.exe"),
         width: 640,
         height: 480,

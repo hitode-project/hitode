@@ -420,6 +420,17 @@ pub fn start<B: Backend>(
                     status::Error::Status(code) => Error::Status("graphics driver", code),
                     status::Error::Unsupported(reason) => Error::Context(reason),
                 })?;
+                if !startup.fonts.is_empty() {
+                    let fonts = crate::environment::user_key(env)
+                        .map(|user| format!(r"{user}\Software\Wine\Fonts"))
+                        .and_then(|key| {
+                            registry::set_volatile_string(env, &key, "Path", startup.fonts)
+                        });
+                    fonts.map_err(|error| match error {
+                        status::Error::Status(code) => Error::Status("font path", code),
+                        status::Error::Unsupported(reason) => Error::Context(reason),
+                    })?;
+                }
                 let view = load_main_image(env, startup.image)?;
                 let state = env
                     .cpu

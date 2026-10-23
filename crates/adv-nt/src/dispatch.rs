@@ -88,6 +88,7 @@ const IMPLEMENTED: &[(&str, Syscall)] = &[
     ("NtFindAtom", atom::find),
     ("NtFreeVirtualMemory", memory::free),
     ("NtFlushInstructionCache", memory::flush_instruction_cache),
+    ("NtFlushKey", registry::flush),
     ("NtFsControlFile", file::control),
     ("NtGetContextThread", thread::get_context),
     ("NtGetNextThread", information::next_thread),

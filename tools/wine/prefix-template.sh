@@ -24,11 +24,34 @@ trap 'rm -rf "$work"' EXIT
 mkdir -p "$work/home"
 
 wine() {
-    env -i PATH=/usr/bin:/bin USER=Player HOME="$work/home" WINEPREFIX="$work/prefix" \
+    env -i PATH=/usr/bin:/bin LC_CTYPE=C.UTF-8 USER=Player HOME="$work/home" WINEPREFIX="$work/prefix" \
         WINEDEBUG=-all WINEDLLOVERRIDES=mscoree,mshtml= "$install/bin/wine" "$@"
 }
 wine wineboot --init
 wine reg add 'HKCU\Software\Wine\Drivers' /v Audio /d advaudio /f >/dev/null
+# The fonts Windows ships stand for the host's CJK fonts (families as their
+# name tables give them, weight included): win32u takes the
+# first family of each list that the host has (macOS and iOS, then Android).
+replace() {
+    face=$1
+    shift
+    families=$(printf '%s\\0' "$@")
+    wine reg add 'HKCU\Software\Wine\Fonts\Replacements' /v "$face" /t REG_MULTI_SZ \
+        /d "${families%\\0}" /f >/dev/null
+}
+for face in 'MS Gothic' 'ＭＳ ゴシック' 'MS PGothic' 'ＭＳ Ｐゴシック' 'MS UI Gothic' \
+    'Meiryo' 'メイリオ' 'Meiryo UI' 'Yu Gothic' '游ゴシック'; do
+    replace "$face" 'Hiragino Sans W3' 'Hiragino Kaku Gothic ProN W3' 'Noto Sans CJK JP'
+done
+for face in 'MS Mincho' 'ＭＳ 明朝' 'MS PMincho' 'ＭＳ Ｐ明朝' 'Yu Mincho' '游明朝'; do
+    replace "$face" 'Hiragino Mincho ProN W3' 'Noto Serif CJK JP' 'Noto Sans CJK JP'
+done
+for face in 'SimHei' '黑体' 'Microsoft YaHei' '微软雅黑'; do
+    replace "$face" 'PingFang SC' 'Hiragino Sans GB W3' 'Noto Sans CJK SC'
+done
+for face in 'SimSun' '宋体' 'NSimSun' '新宋体'; do
+    replace "$face" 'Songti SC' 'Hiragino Sans GB W3' 'Noto Serif CJK SC' 'Noto Sans CJK SC'
+done
 env -i PATH=/usr/bin:/bin WINEPREFIX="$work/prefix" "$install/bin/wineserver" --wait
 
 rm -rf "$output"

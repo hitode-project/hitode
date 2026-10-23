@@ -4,9 +4,10 @@ use adv_cpu::backend::Prot;
 
 use super::information::read_i64;
 use super::*;
+use crate::object::read_bytes;
 use crate::protocol::{
     AddFdCompletionRequest, CreateNamedPipeRequest, EventOpRequest, GetFileInfoRequest,
-    QueueApcRequest, ReadRequest, WriteRequest,
+    IoctlRequest, QueueApcRequest, ReadRequest, WriteRequest,
 };
 
 const PENDING: u32 = 0x103;
@@ -344,6 +345,66 @@ pub fn create_named_pipe(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         )?;
         Ok(())
     })())
+}
+
+/// A control the server carries out, as Wine's `server_ioctl_file`:
+/// `args` are NtFsControlFile's or NtDeviceIoControlFile's.
+pub(super) fn server_ioctl(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    let result = (|| {
+        let &[
+            handle,
+            event,
+            apc,
+            context,
+            io,
+            code,
+            input,
+            input_size,
+            out,
+            out_size,
+        ] = args
+        else {
+            unreachable!()
+        };
+        let mut request = IoctlRequest {
+            code,
+            ..Default::default()
+        };
+        request.r#async[..4].copy_from_slice(&handle.to_le_bytes());
+        request.r#async[4..8].copy_from_slice(&event.to_le_bytes());
+        request.r#async[8..16].copy_from_slice(&u64::from(io).to_le_bytes());
+        request.r#async[16..24].copy_from_slice(&u64::from(io).to_le_bytes());
+        request.r#async[24..32].copy_from_slice(&u64::from(apc).to_le_bytes());
+        request.r#async[32..40].copy_from_slice(&u64::from(context).to_le_bytes());
+        let input = read_bytes(env, input, input_size)?;
+        // Only METHOD_BUFFERED leaves the output buffer out of the request.
+        let output = if code & 3 != 0 {
+            read_bytes(env, out, out_size)?
+        } else {
+            Vec::new()
+        };
+        let mut bytes = vec![0; out_size as usize];
+        let (reply, size) = server::request(env, &mut request, &[&input, &output], &mut bytes)?;
+        if reply.header.error == PENDING {
+            env.ext
+                .get_or_default::<AsyncReads>()
+                .0
+                .insert(io, (out, out_size));
+        }
+        write_bytes(env, out, &bytes[..size])?;
+        if reply.wait != 0 && reply.header.error != PENDING {
+            write_u32(env, io, reply.header.error)?;
+            write_u32(env, io + 4, size as u32)?;
+        }
+        Ok((reply.header.error, reply.wait, reply.options))
+    })();
+    match result {
+        Ok((status, 0, _)) => Outcome::Return(status),
+        Ok((_, wait, options)) => {
+            crate::sync::wait_single(env, &[wait, u32::from(options & 0x10 != 0), 0])
+        }
+        Err(error) => status::finish(Err(error)),
+    }
 }
 
 #[derive(Default)]

@@ -274,7 +274,7 @@ fn open(env: &mut Env<'_>, path: &str) -> Result<Option<u32>, Error> {
 }
 
 /// `\Registry\User\<sid>` of the thread's user, as `open_hkcu_key` names it.
-fn user_key(env: &mut Env<'_>) -> Result<String, Error> {
+pub(crate) fn user_key(env: &mut Env<'_>) -> Result<String, Error> {
     let mut request = GetTokenSidRequest {
         handle: EFFECTIVE_TOKEN,
         which_sid: TOKEN_USER,

@@ -198,6 +198,7 @@ pub fn run_probe_inspect(
         stdout: Some(stdout.as_raw_fd()),
         stderr: None,
         graphics_driver,
+        fonts: "",
     };
     let started = process::start(
         &mut machine,

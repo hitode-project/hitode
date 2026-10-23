@@ -27,6 +27,9 @@ pub struct Startup<'a> {
     /// The display driver win32u loads, which explorer would choose in
     /// Wine: `null` for windows that show nowhere.
     pub graphics_driver: &'a str,
+    /// Wine's font `Path`: the directories win32u loads fonts from besides
+    /// the Windows one, `;`-separated.
+    pub fonts: &'a str,
 }
 
 const SIZE: u32 = 0x2a4;

@@ -461,6 +461,45 @@ impl Request for ReadRequest {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
+pub struct IoctlRequest {
+    pub header: RequestHeader,
+    pub code: u32,
+    pub r#async: [u8; 40],
+}
+impl Default for IoctlRequest {
+    fn default() -> Self {
+        Self {
+            header: Default::default(),
+            code: 0,
+            r#async: [0; 40],
+        }
+    }
+}
+const _: () = assert!(size_of::<IoctlRequest>() == 56);
+const _: () = assert!(std::mem::offset_of!(IoctlRequest, code) == 12);
+const _: () = assert!(std::mem::offset_of!(IoctlRequest, r#async) == 16);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IoctlReply {
+    pub header: ReplyHeader,
+    pub wait: u32,
+    pub options: u32,
+}
+const _: () = assert!(size_of::<IoctlReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(IoctlReply, wait) == 8);
+const _: () = assert!(std::mem::offset_of!(IoctlReply, options) == 12);
+
+impl Request for IoctlRequest {
+    const NUMBER: i32 = 138;
+    type Reply = IoctlReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
 pub struct WriteRequest {
     pub header: RequestHeader,
     pub _pad0: [u8; 4],
@@ -1003,6 +1042,37 @@ const _: () = assert!(std::mem::offset_of!(GetTokenSidReply, sid_len) == 8);
 impl Request for GetTokenSidRequest {
     const NUMBER: i32 = 228;
     type Reply = GetTokenSidReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GetTokenGroupsRequest {
+    pub header: RequestHeader,
+    pub handle: u32,
+    pub attr_mask: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<GetTokenGroupsRequest>() == 24);
+const _: () = assert!(std::mem::offset_of!(GetTokenGroupsRequest, handle) == 12);
+const _: () = assert!(std::mem::offset_of!(GetTokenGroupsRequest, attr_mask) == 16);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GetTokenGroupsReply {
+    pub header: ReplyHeader,
+    pub attr_len: u32,
+    pub sid_len: u32,
+}
+const _: () = assert!(size_of::<GetTokenGroupsReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(GetTokenGroupsReply, attr_len) == 8);
+const _: () = assert!(std::mem::offset_of!(GetTokenGroupsReply, sid_len) == 12);
+
+impl Request for GetTokenGroupsRequest {
+    const NUMBER: i32 = 229;
+    type Reply = GetTokenGroupsReply;
     fn header(&mut self) -> &mut RequestHeader {
         &mut self.header
     }
@@ -2119,6 +2189,30 @@ const _: () = assert!(size_of::<DeleteKeyReply>() == 8);
 impl Request for DeleteKeyRequest {
     const NUMBER: i32 = 88;
     type Reply = DeleteKeyReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FlushKeyRequest {
+    pub header: RequestHeader,
+    pub hkey: u32,
+}
+const _: () = assert!(size_of::<FlushKeyRequest>() == 16);
+const _: () = assert!(std::mem::offset_of!(FlushKeyRequest, hkey) == 12);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FlushKeyReply {
+    pub header: ReplyHeader,
+}
+const _: () = assert!(size_of::<FlushKeyReply>() == 8);
+
+impl Request for FlushKeyRequest {
+    const NUMBER: i32 = 89;
+    type Reply = FlushKeyReply;
     fn header(&mut self) -> &mut RequestHeader {
         &mut self.header
     }

@@ -356,7 +356,13 @@ impl Open {
     }
 }
 
+const FILE_FS_VOLUME_INFORMATION: u32 = 1;
 const FILE_FS_DEVICE_INFORMATION: u32 = 4;
+const FILE_FS_ATTRIBUTE_INFORMATION: u32 = 5;
+const FILE_CASE_PRESERVED_NAMES: u32 = 0x02;
+const FILE_PERSISTENT_ACLS: u32 = 0x08;
+/// Every volume's serial number, fixed as the machine's identity is.
+const VOLUME_SERIAL: u32 = 0x4854_4f44;
 const FILE_DEVICE_DISK: u32 = 0x07;
 const FILE_DEVICE_NAMED_PIPE: u32 = 0x11;
 const FILE_DEVICE_NULL: u32 = 0x15;
@@ -378,22 +384,58 @@ fn query_volume_in(
     length: u32,
     class: u32,
 ) -> Result<(), Error> {
-    if class != FILE_FS_DEVICE_INFORMATION {
-        return Err(Error::Unsupported(format!(
-            "volume information class {class}"
-        )));
-    }
-    if length < 8 {
-        return Err(status::INFO_LENGTH_MISMATCH.into());
-    }
-    let fd = server::handle_fd(env, handle)?;
-    let device = device_type(fd.fd);
-    drop(fd);
-    write_u32(env, buffer, device)?;
-    // No removable or read-only media.
-    write_u32(env, buffer + 4, 0)?;
+    let bytes = match class {
+        // A session has no mount manager, so every drive is the volume one
+        // reports for a directory: NTFS, without a label.
+        FILE_FS_VOLUME_INFORMATION => {
+            if length < 24 {
+                return Err(status::INFO_LENGTH_MISMATCH.into());
+            }
+            server::handle_fd(env, handle)?;
+            let mut bytes = [0u8; 18];
+            bytes[8..12].copy_from_slice(&VOLUME_SERIAL.to_le_bytes());
+            bytes.to_vec()
+        }
+        FILE_FS_ATTRIBUTE_INFORMATION => {
+            if length < 16 {
+                return Err(status::INFO_LENGTH_MISMATCH.into());
+            }
+            server::handle_fd(env, handle)?;
+            let name: Vec<u8> = "NTFS".encode_utf16().flat_map(u16::to_le_bytes).collect();
+            let name = &name[..name.len().min(length as usize - 12)];
+            let mut bytes = Vec::with_capacity(12 + name.len());
+            for word in [
+                FILE_CASE_PRESERVED_NAMES | FILE_PERSISTENT_ACLS,
+                255,
+                name.len() as u32,
+            ] {
+                bytes.extend_from_slice(&word.to_le_bytes());
+            }
+            bytes.extend_from_slice(name);
+            bytes
+        }
+        FILE_FS_DEVICE_INFORMATION => {
+            if length < 8 {
+                return Err(status::INFO_LENGTH_MISMATCH.into());
+            }
+            let fd = server::handle_fd(env, handle)?;
+            let device = device_type(fd.fd);
+            drop(fd);
+            // No removable or read-only media.
+            [device, 0]
+                .iter()
+                .flat_map(|word| word.to_le_bytes())
+                .collect()
+        }
+        _ => {
+            return Err(Error::Unsupported(format!(
+                "volume information class {class}"
+            )));
+        }
+    };
+    write_bytes(env, buffer, &bytes)?;
     write_u32(env, io, status::SUCCESS)?;
-    write_u32(env, io + 4, 8)?;
+    write_u32(env, io + 4, bytes.len() as u32)?;
     Ok(())
 }
 
@@ -540,8 +582,11 @@ pub(crate) fn basic_information(
     bytes
 }
 
+const FSCTL_LOCK_VOLUME: u32 = 0x9_0018;
+const FSCTL_UNLOCK_VOLUME: u32 = 0x9_001c;
+const FSCTL_IS_VOLUME_MOUNTED: u32 = 0x9_0028;
 const FSCTL_GET_OBJECT_ID: u32 = 0x9_009c;
-const BUFFER_TOO_SMALL: status::Status = 0xc000_0023;
+const FSCTL_SET_SPARSE: u32 = 0x9_00c4;
 /// FILE_OBJECTID_BUFFER: the object id and three more ids.
 const OBJECT_ID_BUFFER_SIZE: u32 = 64;
 
@@ -551,34 +596,45 @@ pub fn control(env: &mut Env<'_>, args: &[u32]) -> Outcome {
     let &[handle, _, _, _, io, code, _, _, out, out_size] = args else {
         unreachable!()
     };
+    if io == 0 {
+        return Outcome::Return(status::INVALID_PARAMETER);
+    }
+    let (status, size) = match code {
+        FSCTL_GET_OBJECT_ID if out_size < OBJECT_ID_BUFFER_SIZE => {
+            return Outcome::Return(status::BUFFER_TOO_SMALL);
+        }
+        FSCTL_GET_OBJECT_ID => match object_id(env, handle, out) {
+            Ok(()) => (status::SUCCESS, OBJECT_ID_BUFFER_SIZE),
+            Err(error) => return status::finish(Err(error)),
+        },
+        // Wine succeeds without doing anything.
+        FSCTL_LOCK_VOLUME | FSCTL_UNLOCK_VOLUME | FSCTL_IS_VOLUME_MOUNTED | FSCTL_SET_SPARSE => {
+            (status::SUCCESS, 0)
+        }
+        _ => return io::server_ioctl(env, args),
+    };
     status::finish((|| {
-        if io == 0 {
-            return Err(status::INVALID_PARAMETER.into());
-        }
-        if code != FSCTL_GET_OBJECT_ID {
-            return Err(Error::Unsupported(format!("file system control {code:#x}")));
-        }
-        if out_size < OBJECT_ID_BUFFER_SIZE {
-            return Err(BUFFER_TOO_SMALL.into());
-        }
-        // The host device and inode identify the file, as in Wine.
-        let fd = server::handle_fd(env, handle)?;
-        // SAFETY: a zeroed stat is a valid buffer for fstat to fill.
-        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-        // SAFETY: a descriptor the server gave the process, and a valid buffer.
-        if unsafe { libc::fstat(fd.fd, &mut stat) } != 0 {
-            return Err(Error::Unsupported("fstat failed on a server file".into()));
-        }
-        drop(fd);
-        let mut bytes = [0u8; OBJECT_ID_BUFFER_SIZE as usize];
-        let device = stat.st_dev.to_le_bytes();
-        bytes[..device.len()].copy_from_slice(&device);
-        bytes[8..16].copy_from_slice(&stat.st_ino.to_le_bytes());
-        write_bytes(env, out, &bytes)?;
-        write_u32(env, io, status::SUCCESS)?;
-        write_u32(env, io + 4, OBJECT_ID_BUFFER_SIZE)?;
+        write_u32(env, io, status)?;
+        write_u32(env, io + 4, size)?;
         Ok(())
     })())
+}
+
+/// The host device and inode identify the file, as in Wine.
+fn object_id(env: &mut Env<'_>, handle: u32, out: u32) -> Result<(), Error> {
+    let fd = server::handle_fd(env, handle)?;
+    // SAFETY: a zeroed stat is a valid buffer for fstat to fill.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: a descriptor the server gave the process, and a valid buffer.
+    if unsafe { libc::fstat(fd.fd, &mut stat) } != 0 {
+        return Err(Error::Unsupported("fstat failed on a server file".into()));
+    }
+    drop(fd);
+    let mut bytes = [0u8; OBJECT_ID_BUFFER_SIZE as usize];
+    let device = stat.st_dev.to_le_bytes();
+    bytes[..device.len()].copy_from_slice(&device);
+    bytes[8..16].copy_from_slice(&stat.st_ino.to_le_bytes());
+    Ok(write_bytes(env, out, &bytes)?)
 }
 
 fn lookup_attributes(env: &mut Env<'_>, attributes: &Attributes) -> Result<Lookup, Error> {

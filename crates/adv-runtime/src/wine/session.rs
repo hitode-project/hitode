@@ -33,6 +33,11 @@ pub struct Config<'a> {
     /// Drive C:, where the player finds what games write outside their
     /// directory; the prefix's `drive_c` when none.
     pub drive: Option<&'a Path>,
+    /// The LCID of the system and user locales, which set the ANSI code page.
+    pub locale: u32,
+    /// Font directories besides Wine's own, as Wine's font `Path`
+    /// ([`HOST_FONTS`] for the host's).
+    pub fonts: &'a str,
     pub exe: &'a Path,
     pub width: u32,
     pub height: u32,
@@ -229,8 +234,23 @@ fn new_machine(
 
 /// What every process of the session starts with but its program.
 const ENVIRONMENT: &[(&str, &str)] = &[("SystemDrive", "C:"), ("SystemRoot", r"C:\windows")];
-/// en-US
-const LOCALE: u32 = 0x409;
+
+/// The locale whose ANSI code page is `codepage`: ja-JP for 932, zh-CN for
+/// 936, en-US otherwise.
+pub fn locale(codepage: u32) -> u32 {
+    match codepage {
+        932 => 0x411,
+        936 => 0x804,
+        _ => 0x409,
+    }
+}
+/// The host's font directories, which stand for the fonts Windows ships.
+#[cfg(target_os = "macos")]
+pub const HOST_FONTS: &str = r"\??\unix\System\Library\Fonts"; // privacy: allow the system font directory
+#[cfg(target_os = "ios")]
+pub const HOST_FONTS: &str = r"\??\unix\System\Library\Fonts\Core;\??\unix\System\Library\Fonts\CoreAddition;\??\unix\System\Library\Fonts\LanguageSupport"; // privacy: allow system font directories
+#[cfg(target_os = "android")]
+pub const HOST_FONTS: &str = r"\??\unix\system\fonts"; // privacy: allow the system font directory
 const WINEBOOT: &str = r"C:\windows\system32\wineboot.exe";
 
 /// Run `machine` until it exits or `until` passes. While every context
@@ -347,12 +367,13 @@ impl Session {
             command_line: &command_line,
             directory: r"C:\windows\system32\",
             environment: ENVIRONMENT,
-            locale: LOCALE,
+            locale: config.locale,
             debug: config.debug,
             stdin: None,
             stdout: None,
             stderr: None,
             graphics_driver: super::GRAPHICS_DRIVER,
+            fonts: config.fonts,
         };
         process::start(
             &mut boot,
@@ -376,12 +397,13 @@ impl Session {
             command_line: name,
             directory: r"D:\", // privacy: allow the guest's drive for the game
             environment: ENVIRONMENT,
-            locale: LOCALE,
+            locale: config.locale,
             debug: config.debug,
             stdin: None,
             stdout: config.stdout,
             stderr: None,
             graphics_driver: super::GRAPHICS_DRIVER,
+            fonts: config.fonts,
         };
         process::start(
             &mut machine,

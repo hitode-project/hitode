@@ -115,6 +115,8 @@ fn run_case() {
         dist: &dist,
         prefix: &session_root,
         drive: None,
+        locale: 0x409,
+        fonts: "",
         exe: &game.join(&name),
         width: 1024,
         height: 768,

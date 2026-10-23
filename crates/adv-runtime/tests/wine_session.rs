@@ -41,6 +41,8 @@ fn a_session_runs_a_program_from_its_directory_and_presents() {
         dist: &dist,
         prefix: &session_root,
         drive: None,
+        locale: 0x409,
+        fonts: "",
         exe: &game.join("d3d9.exe"),
         width: 640,
         height: 480,

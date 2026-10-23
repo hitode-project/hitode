@@ -274,6 +274,11 @@ FreeType is such a library: win32u opens it by name and draws TrueType text thro
 **Rule**: What a guest learns about its user and machine MUST NOT come from the host: the user MUST be `Player` and the computer `HITODE`. The firmware tables MUST name the virtual machine and the emulated processor, with no serial numbers or UUID. Name resolution through `getaddrinfo` MUST fail.
 **Verification**: Test
 
+### WINE-SES-5 Regional text
+
+**Rule**: A session's system and user locales MUST be those of the game's ANSI code page: ja-JP for 932, zh-CN for 936. Win32u MUST load the host's system fonts in place, and the prefix MUST replace the CJK faces Windows ships with host families.
+**Verification**: Review — which host fonts a game shows is seen on its own screens.
+
 ## Conformance
 
 ### WINE-TEST-1 Wine's own tests

@@ -501,7 +501,6 @@ const KERNEL_MODE: u32 = 1 << 16;
 const USER_MODE: u32 = 1 << 17;
 const NATIVE: u32 = 1 << 18;
 const PROCESS: u32 = 1 << 19;
-const BUFFER_TOO_SMALL: status::Status = 0xc000_0023;
 
 /// SYSTEM_SUPPORTED_PROCESSOR_ARCHITECTURES_INFORMATION, as Wine's
 /// `NtQuerySystemInformationEx` gives it.
@@ -540,7 +539,7 @@ fn supported_architectures(env: &mut Env<'_>, args: &[u32]) -> Outcome {
                     bytes[4 * index..4 * index + 4].copy_from_slice(&entry.to_le_bytes());
                 }
                 if (size as usize) < bytes.len() {
-                    (bytes, BUFFER_TOO_SMALL)
+                    (bytes, status::BUFFER_TOO_SMALL)
                 } else {
                     (bytes, status::SUCCESS)
                 }
@@ -670,7 +669,7 @@ fn firmware_table(env: &mut Env<'_>, info: u32, size: u32, result_size: u32) -> 
         write_u32(env, result_size, required)?;
     }
     if size < required {
-        return Err(BUFFER_TOO_SMALL.into());
+        return Err(status::BUFFER_TOO_SMALL.into());
     }
     write_bytes(env, info + FIRMWARE_HEADER, &table)?;
     Ok(())
@@ -1150,7 +1149,7 @@ pub fn power_information(env: &mut Env<'_>, args: &[u32]) -> Outcome {
                 return Err(status::INVALID_PARAMETER.into());
             }
             if size / POWER_SIZE < PROCESSORS {
-                return Err(BUFFER_TOO_SMALL.into());
+                return Err(status::BUFFER_TOO_SMALL.into());
             }
             // Every processor runs at the guest's time stamp frequency.
             let mhz = (adv_cpu::TSC_FREQ / 1_000_000) as u32;
@@ -1167,7 +1166,7 @@ pub fn power_information(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         // where the host has no battery provider.
         SYSTEM_BATTERY_STATE => {
             if size < BATTERY_SIZE {
-                return Err(BUFFER_TOO_SMALL.into());
+                return Err(status::BUFFER_TOO_SMALL.into());
             }
             let mut bytes = [0; BATTERY_SIZE as usize];
             bytes[0] = 1;
