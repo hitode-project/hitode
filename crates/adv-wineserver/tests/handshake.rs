@@ -52,6 +52,7 @@ fn receive_request_pipe(client: &UnixStream) -> (u32, OwnedFd) {
     (u32::from_ne_bytes(version), fd)
 }
 
+// spec: WINE-SRV-1
 #[test]
 fn client_receives_request_pipe_and_server_exits_on_its_clock() {
     let root = std::env::temp_dir().join(format!("adv-wineserver-{}", std::process::id()));
