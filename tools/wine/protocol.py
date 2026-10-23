@@ -29,6 +29,16 @@ REQUESTS = [
     "init_process_done",
     "terminate_process",
     "create_file",
+    "open_file_object",
+    "get_file_info",
+    "get_handle_unix_name",
+    "set_fd_eof_info",
+    "set_fd_disp_info",
+    "set_fd_name_info",
+    "create_named_pipe",
+    "read",
+    "write",
+    "add_fd_completion",
     "alloc_file_handle",
     "get_handle_fd",
     "close_handle",
@@ -113,7 +123,7 @@ def layout(handlers: str, struct: str, header_size: int) -> tuple[dict[str, int]
     return offsets, header_size
 
 
-KEYWORDS = {"type", "match", "ref", "move", "loop", "box", "fn", "mod", "use", "where", "impl"}
+KEYWORDS = {"async", "type", "match", "ref", "move", "loop", "box", "fn", "mod", "use", "where", "impl"}
 
 
 # Keywords that cannot be raw identifiers take a trailing underscore.
@@ -137,19 +147,30 @@ def rust_struct(protocol: str, handlers: str, types: dict[str, str], name: str, 
     members = [(field, ctype, offsets[field]) for field, ctype in fields(protocol, struct)]
     lines = ["#[repr(C)]", "#[derive(Clone, Copy, Debug, Default)]",
              f"pub struct {camel(name)}{kind.capitalize()} {{", f"    pub header: {header},"]
+    defaults = ["header: Default::default()"]
+    large_array = False
     position, pad = header_size, 0
     for index, (field, ctype, offset) in enumerate(members):
         if offset > position:
             lines.append(f"    pub _pad{pad}: [u8; {offset - position}],")
+            defaults.append(f"_pad{pad}: [0; {offset - position}]")
             pad += 1
         end = members[index + 1][2] if index + 1 < len(members) else size
         rust = types.get(ctype)
         width = int(rust[1:]) // 8 if rust else end - offset
         lines.append(f"    pub {ident(field)}: {rust or f'[u8; {width}]'},")
+        defaults.append(f"{ident(field)}: " + ("0" if rust else f"[0; {width}]"))
+        large_array |= not rust and width > 32
         position = offset + width
     if size > position:
         lines.append(f"    pub _pad{pad}: [u8; {size - position}],")
+        defaults.append(f"_pad{pad}: [0; {size - position}]")
     lines.append("}")
+    if large_array:
+        lines[1] = "#[derive(Clone, Copy, Debug)]"
+        lines += [f"impl Default for {camel(name)}{kind.capitalize()} {{",
+                  "    fn default() -> Self {",
+                  "        Self { " + ", ".join(defaults) + " }", "    }", "}"]
     lines.append(f"const _: () = assert!(size_of::<{camel(name)}{kind.capitalize()}>() == {size});")
     for field, _, offset in members:
         lines.append(
