@@ -87,6 +87,11 @@ Entries carry no 8.3 names, as on a volume that does not make them.
 **Rule**: A call from the host into Unix-side ELF code MUST start its arguments on a 16-byte boundary, as Wine's system call dispatcher does. Calls into Windows code MUST keep their exact stack.
 **Verification**: Test
 
+### WINE-SYS-10 Main thread stack
+
+**Rule**: The main thread's stack MUST be as large as the stack reserve of the process's image, and no smaller than 1 MiB.
+**Verification**: Test
+
 ## Unix libraries
 
 ### WINE-UNIX-1 Guest ELF libraries

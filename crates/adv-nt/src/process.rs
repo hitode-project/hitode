@@ -225,6 +225,25 @@ fn load_main_image(env: &mut Env<'_>, image: &str) -> Result<View, Error> {
     Ok(view)
 }
 
+/// The main thread's stack, as Wine's `virtual_alloc_thread_stack` sizes it:
+/// the image's reserve, and no less than the default. The thread exists
+/// before the image is mapped, so its file is read through the prefix.
+fn main_stack_size(prefix: &Path, image: &str) -> u32 {
+    let reserve = image
+        .split_once(':')
+        .and_then(|(drive, path)| {
+            let device = format!("dosdevices/{}:", drive.to_ascii_lowercase());
+            std::fs::read(
+                prefix
+                    .join(device)
+                    .join(path.trim_start_matches('\\').replace('\\', "/")),
+            )
+            .ok()
+        })
+        .and_then(|bytes| Pe::parse(&bytes).ok().map(|pe| pe.stack_reserve));
+    reserve.unwrap_or(0).max(DEFAULT_STACK)
+}
+
 const DISPLAY_DEVICE: &str = r"\Registry\Machine\System\CurrentControlSet\Control\Video\{00000000-0000-0000-0000-000000000000}\0000";
 
 pub fn start<B: Backend>(
@@ -317,7 +336,7 @@ pub fn start<B: Backend>(
         ldr_initialize_thunk,
         syscall,
         registered.tid,
-        DEFAULT_STACK,
+        main_stack_size(prefix, startup.image),
     )?;
     let teb = machine.sys.contexts[main as usize].teb;
     machine.ext.insert(memory);
