@@ -69,7 +69,9 @@ fn forward(env: &mut Env<'_>, request: u32) -> Result<u32, String> {
         let pointer = env.cpu.read_u32(vector).map_err(fault)?;
         let size = env.cpu.read_u32(vector + 4).map_err(fault)?;
         let mut bytes = vec![0; size as usize];
-        env.cpu.read(pointer, &mut bytes).map_err(fault)?;
+        if size != 0 {
+            env.cpu.read(pointer, &mut bytes).map_err(fault)?;
+        }
         data.push(bytes);
     }
     let reply_pointer = env.cpu.read_u32(request + REPLY_DATA).map_err(fault)?;
@@ -87,8 +89,12 @@ fn forward(env: &mut Env<'_>, request: u32) -> Result<u32, String> {
         .map_err(|error| format!("server call failed: {error}"))?;
     crate::server::deliver(env);
     env.cpu.write(request, &fixed).map_err(fault)?;
-    env.cpu
-        .write(reply_pointer, &reply[..size])
-        .map_err(fault)?;
+    // As ntdll.so: a request that takes no reply data leaves the pointer
+    // unset, so it is touched only when data came back.
+    if size != 0 {
+        env.cpu
+            .write(reply_pointer, &reply[..size])
+            .map_err(fault)?;
+    }
     Ok(u32::from_le_bytes(fixed[..4].try_into().unwrap()))
 }
