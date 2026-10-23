@@ -128,7 +128,7 @@ fn attach(env: &mut Env<'_>) -> Outcome {
         Err(error) => return Outcome::Fail(error),
     };
     let funcs = env.ext.get::<Funcs>().0;
-    Outcome::call(set, [funcs, VERSION], |_, _| Outcome::Return(1))
+    Outcome::call_aligned(env, set, [funcs, VERSION], |_, _| Outcome::Return(1))
 }
 
 /// The address of win32u.so's export `name`, which the driver calls as its
@@ -198,8 +198,9 @@ pub(super) fn start_desktop(env: &mut Env<'_>, then: Started) -> Outcome {
     let window = |class, size| [0, class, 0, DESKTOP_STYLE, 0, 0, size, size, 0, 0, 0, 0];
     Outcome::call(create, window(DESKTOP_CLASS_ATOM, 0), move |_, desktop| {
         let desktop = desktop.value();
-        Outcome::call(create, window(scratch, 100), move |_, _| {
-            Outcome::call(
+        Outcome::call(create, window(scratch, 100), move |env, _| {
+            Outcome::call_aligned(
+                env,
                 measure,
                 [scratch, 0, GET_VIRTUAL_SCREEN_RECT],
                 move |env, _| {

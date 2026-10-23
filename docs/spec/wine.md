@@ -82,6 +82,11 @@ Entries carry no 8.3 names, as on a volume that does not make them.
 **Rule**: `NtAreMappedFilesTheSame` MUST succeed for two addresses in one view, and otherwise MUST ask the server whether two image views map one file. A private allocation MUST give `STATUS_CONFLICTING_ADDRESSES`.
 **Verification**: Test
 
+### WINE-SYS-9 Unix stack alignment
+
+**Rule**: A call from the host into Unix-side ELF code MUST start its arguments on a 16-byte boundary, as Wine's system call dispatcher does. Calls into Windows code MUST keep their exact stack.
+**Verification**: Test
+
 ## Unix libraries
 
 ### WINE-UNIX-1 Guest ELF libraries

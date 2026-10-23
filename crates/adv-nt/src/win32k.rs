@@ -92,7 +92,7 @@ pub fn call(env: &mut Env<'_>, number: u32) -> Outcome {
         return Outcome::Return(status::ACCESS_VIOLATION);
     };
     let args: Vec<u32> = (1..=u32::from(bytes) / 4).map(|i| env.arg(i)).collect();
-    Outcome::call(function, args, |_, returned| {
+    Outcome::call_aligned(env, function, args, |_, returned| {
         Outcome::Return(returned.value())
     })
 }

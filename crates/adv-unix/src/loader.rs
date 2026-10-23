@@ -128,7 +128,7 @@ fn initialize(
 ) -> Outcome {
     match initializers.pop_front() {
         None => then(env),
-        Some(function) => Outcome::call(function, [], move |env, _| {
+        Some(function) => Outcome::call_aligned(env, function, [], move |env, _| {
             initialize(env, initializers, then)
         }),
     }

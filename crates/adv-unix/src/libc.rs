@@ -96,7 +96,7 @@ fn heap_call(
     };
     let mut call = vec![heap];
     call.extend_from_slice(args);
-    Outcome::call(function, call, move |env, returned| {
+    Outcome::call_aligned(env, function, call, move |env, returned| {
         then(env, returned.value())
     })
 }

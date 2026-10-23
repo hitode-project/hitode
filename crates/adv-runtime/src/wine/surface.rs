@@ -81,7 +81,7 @@ fn call(
     args: impl Into<Vec<u32>>,
     then: impl FnOnce(&mut Env<'_>, Resume) -> Outcome + 'static,
 ) -> Outcome {
-    Outcome::call(check!(win32u(env, name)), args, then)
+    Outcome::call_aligned(env, check!(win32u(env, name)), args, then)
 }
 
 /// CreateWindowSurface(hwnd, layered, surface_rect, surface).

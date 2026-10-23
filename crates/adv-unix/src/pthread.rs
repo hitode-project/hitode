@@ -242,7 +242,7 @@ fn run_once(env: &mut Env<'_>, control: u32, init: u32) -> Outcome {
             if env.cpu.write_u32(control, ONCE_RUNNING).is_err() {
                 return Outcome::Fail(format!("once control at {control:#x} is not writable"));
             }
-            Outcome::call(init, [], move |env, _| {
+            Outcome::call_aligned(env, init, [], move |env, _| {
                 match env.cpu.write_u32(control, ONCE_DONE) {
                     Ok(()) => Outcome::Return(0),
                     Err(error) => Outcome::Fail(error.to_string()),

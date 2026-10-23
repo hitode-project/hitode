@@ -100,7 +100,7 @@ pub fn call(env: &mut Env<'_>, funcs: u32, code: u32, args: u32) -> Outcome {
     let Ok(entry) = env.cpu.read_u32(funcs.wrapping_add(code.wrapping_mul(4))) else {
         return Outcome::Return(status::ACCESS_VIOLATION);
     };
-    Outcome::call(entry, [args], |_, returned| {
+    Outcome::call_aligned(env, entry, [args], |_, returned| {
         Outcome::Return(returned.value())
     })
 }

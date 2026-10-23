@@ -129,6 +129,21 @@ impl Outcome {
         }
     }
 
+    /// [`Self::call`] for a callee built for the i386 System V ABI, whose
+    /// arguments start on a 16-byte boundary; Windows code needs only 4.
+    pub fn call_aligned(
+        env: &Env<'_>,
+        target: u32,
+        args: impl Into<Vec<u32>>,
+        then: impl FnOnce(&mut Env<'_>, Resume) -> Outcome + 'static,
+    ) -> Self {
+        let args = args.into();
+        let esp = env.cpu.reg(adv_cpu::backend::Reg::Esp);
+        let bytes = 4 * args.len() as u32;
+        let stack = (esp.wrapping_sub(bytes) & !15).wrapping_add(bytes);
+        Self::call_on_stack(target, args, stack, then)
+    }
+
     /// Mark a guest call as one native code may abandon by nonlocal unwind;
     /// other outcomes are unchanged.
     pub fn unwindable(mut self) -> Self {
