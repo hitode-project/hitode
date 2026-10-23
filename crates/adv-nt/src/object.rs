@@ -131,6 +131,49 @@ pub fn open_directory(env: &mut Env<'_>, args: &[u32]) -> adv_machine::Outcome {
     })())
 }
 
+/// NtCreateDirectoryObject(*handle, access, *attributes)
+pub fn create_directory(env: &mut Env<'_>, args: &[u32]) -> adv_machine::Outcome {
+    let &[handle, access, attributes] = args else {
+        unreachable!()
+    };
+    status::finish((|| {
+        write_u32(env, handle, 0)?;
+        let objattr = Attributes::read(env, attributes)?.wire();
+        let mut request = crate::protocol::CreateDirectoryRequest {
+            access,
+            ..Default::default()
+        };
+        let (reply, _) = crate::server::request(env, &mut request, &[&objattr], &mut [])?;
+        write_u32(env, handle, reply.handle)?;
+        status::check(reply.header.error)
+    })())
+}
+
+/// NtCreateSymbolicLinkObject(*handle, access, *attributes, *target)
+pub fn create_symbolic_link(env: &mut Env<'_>, args: &[u32]) -> adv_machine::Outcome {
+    let &[handle, access, attributes, target] = args else {
+        unreachable!()
+    };
+    status::finish((|| {
+        write_u32(env, handle, 0)?;
+        if read_u32(env, target)? >> 16 == 0 {
+            return Err(status::INVALID_PARAMETER.into());
+        }
+        let target: Vec<u8> = read_unicode_string(env, target)?
+            .iter()
+            .flat_map(|unit| unit.to_le_bytes())
+            .collect();
+        let objattr = Attributes::read(env, attributes)?.wire();
+        let mut request = crate::protocol::CreateSymlinkRequest {
+            access,
+            ..Default::default()
+        };
+        let (reply, _) = crate::server::request(env, &mut request, &[&objattr, &target], &mut [])?;
+        write_u32(env, handle, reply.handle)?;
+        status::check(reply.header.error)
+    })())
+}
+
 /// NtQueryObject(handle, class, *info, length, *used_length)
 pub fn query(env: &mut Env<'_>, args: &[u32]) -> adv_machine::Outcome {
     use crate::protocol::{GetObjectInfoRequest, GetObjectNameRequest, GetObjectTypeRequest};

@@ -13,7 +13,8 @@ pub struct Startup<'a> {
     pub command_line: &'a str,
     /// The DOS path of the current directory, ending in a backslash.
     pub directory: &'a str,
-    /// `NAME=value` pairs.
+    /// `NAME=value` pairs, before the ones Wine adds
+    /// ([`crate::environment`]).
     pub environment: &'a [(&'a str, &'a str)],
     /// The LCID of the system and user locales.
     pub locale: u32,
@@ -52,27 +53,20 @@ fn utf16(text: &str) -> Vec<u16> {
     text.encode_utf16().collect()
 }
 
-/// The size of the block for `startup`.
-pub fn size(startup: &Startup<'_>) -> u32 {
-    let (strings, environment) = contents(startup);
-    SIZE + 2 * (MAX_PATH + strings.len() as u32 + environment.len() as u32)
+/// The size of the block for `startup` with the environment block
+/// `environment`.
+pub fn size(startup: &Startup<'_>, environment: &[u16]) -> u32 {
+    SIZE + 2 * (MAX_PATH + strings(startup).len() as u32 + environment.len() as u32)
 }
 
-/// The strings after the current directory buffer, each with its NUL, and
-/// the environment block.
-fn contents(startup: &Startup<'_>) -> (Vec<u16>, Vec<u16>) {
+/// The strings after the current directory buffer, each with its NUL.
+fn strings(startup: &Startup<'_>) -> Vec<u16> {
     let mut strings = Vec::new();
     for text in [startup.image, startup.command_line, startup.image] {
         strings.extend(utf16(text));
         strings.push(0);
     }
-    let mut environment = Vec::new();
-    for (name, value) in startup.environment {
-        environment.extend(utf16(&format!("{name}={value}")));
-        environment.push(0);
-    }
-    environment.push(0);
-    (strings, environment)
+    strings
 }
 
 fn put(block: &mut [u8], offset: usize, value: u32) {
@@ -94,8 +88,14 @@ fn put_string(block: &mut [u8], base: u32, field: usize, offset: u32, text: &[u1
 }
 
 /// The block for `startup`, to be placed at `base`.
-pub fn build(startup: &Startup<'_>, base: u32, process_id: u32, handles: [u32; 3]) -> Vec<u8> {
-    let size = size(startup);
+pub fn build(
+    startup: &Startup<'_>,
+    environment: &[u16],
+    base: u32,
+    process_id: u32,
+    handles: [u32; 3],
+) -> Vec<u8> {
+    let size = size(startup, environment);
     let mut block = vec![0u8; size as usize];
     put(&mut block, ALLOCATION_SIZE, size);
     put(&mut block, LENGTH, size);
@@ -126,9 +126,8 @@ pub fn build(startup: &Startup<'_>, base: u32, process_id: u32, handles: [u32; 3
         put_string(&mut block, base, field, cursor, &text, maximum);
         cursor += maximum;
     }
-    let (_, environment) = contents(startup);
     put(&mut block, ENVIRONMENT, base + cursor);
     put(&mut block, ENVIRONMENT_SIZE, 2 * environment.len() as u32);
-    put_text(&mut block, cursor as usize, &environment);
+    put_text(&mut block, cursor as usize, environment);
     block
 }

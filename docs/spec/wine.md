@@ -205,12 +205,24 @@ FreeType is such a library: win32u opens it by name and draws TrueType text thro
 
 ### WINE-SES-1 Kept prefix
 
-**Rule**: A session MUST keep its prefix between runs. Each start MUST relink system32 to the Wine installation and drive D: to the program's directory.
+**Rule**: A session MUST keep its prefix between runs. Each start MUST relink system32, and the template's module copies, to the Wine installation and drive D: to the program's directory.
 **Verification**: Test
 
 ### WINE-SES-2 Host wakes
 
 **Rule**: While every guest context waits, a session MUST serve finished host work before it blocks. A host wake MUST end the block. The run loop MUST take the wake's interrupt before it drains host work.
+**Verification**: Test
+
+### WINE-SES-3 Provisioned prefix
+
+**Rule**: A new prefix MUST start as a copy of the installation's template, `share/hitode/prefix`, and a session MUST NOT start without one. Each start MUST first run `wineboot.exe --restart` to its exit as its own process on the session's server. A process MUST start with its own variables, then those Wine's `add_registry_environment` adds.
+**Verification**: Test
+
+`tools/wine/prefix-template.sh` makes the template with standard Wine's `wineboot --init`. The restart creates the volatile keys and the known DLLs before the program starts. The template is a distribution artifact, made where standard Wine runs, and not part of the repository.
+
+### WINE-SES-4 Fixed identity
+
+**Rule**: What a guest learns about its user and machine MUST NOT come from the host: the user MUST be `Player` and the computer `HITODE`. The firmware tables MUST name the virtual machine and the emulated processor, with no serial numbers or UUID. Name resolution through `getaddrinfo` MUST fail.
 **Verification**: Test
 
 ## Conformance

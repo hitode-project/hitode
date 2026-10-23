@@ -57,6 +57,8 @@ pub fn function(name: &str) -> Option<Function> {
         "_setjmp" => (cdecl(1), setjmp),
         "longjmp" => (cdecl(2), longjmp),
         "getenv" => (cdecl(1), getenv),
+        "gethostname" => (cdecl(2), gethostname),
+        "getaddrinfo" => (cdecl(4), getaddrinfo),
         "hypot" => (cdecl(4), hypot),
         "roundf" => (cdecl(1), roundf),
         "sincos" => (cdecl(4), sincos),
@@ -534,6 +536,25 @@ fn longjmp(env: &mut Env<'_>) -> Outcome {
 /// The process has no Unix environment.
 fn getenv(_: &mut Env<'_>) -> Outcome {
     Outcome::Return(0)
+}
+
+/// The machine is always the prefix's computer, never the host.
+fn gethostname(env: &mut Env<'_>) -> Outcome {
+    let (buffer, size) = (env.arg(0), env.arg(1) as usize);
+    let mut name = adv_nt::environment::COMPUTER_NAME.as_bytes().to_vec();
+    name.push(0);
+    if name.len() > size || env.cpu.write(buffer, &name).is_err() {
+        return Outcome::Return(u32::MAX);
+    }
+    Outcome::Return(0)
+}
+
+/// glibc's `EAI_NONAME`.
+const EAI_NONAME: i32 = -2;
+
+/// A session resolves no names: the guest sees a machine without a network.
+fn getaddrinfo(_: &mut Env<'_>) -> Outcome {
+    Outcome::Return(EAI_NONAME as u32)
 }
 
 // Mathematics.

@@ -31,6 +31,36 @@ pub trait Request: Copy + Default {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
+pub struct StartupInfoData {
+    pub debug_flags: u32,
+    pub console_flags: u32,
+    pub console: u32,
+    pub hstdin: u32,
+    pub hstdout: u32,
+    pub hstderr: u32,
+    pub x: u32,
+    pub y: u32,
+    pub xsize: u32,
+    pub ysize: u32,
+    pub xchars: u32,
+    pub ychars: u32,
+    pub attribute: u32,
+    pub flags: u32,
+    pub show: u32,
+    pub process_group_id: u32,
+    pub curdir_len: u32,
+    pub dllpath_len: u32,
+    pub imagepath_len: u32,
+    pub cmdline_len: u32,
+    pub title_len: u32,
+    pub desktop_len: u32,
+    pub shellinfo_len: u32,
+    pub runtime_len: u32,
+}
+const _: () = assert!(size_of::<StartupInfoData>() == 96);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct InitFirstThreadRequest {
     pub header: RequestHeader,
     pub unix_pid: i32,
@@ -1004,6 +1034,60 @@ const _: () = assert!(std::mem::offset_of!(OpenDirectoryReply, handle) == 8);
 impl Request for OpenDirectoryRequest {
     const NUMBER: i32 = 240;
     type Reply = OpenDirectoryReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CreateDirectoryRequest {
+    pub header: RequestHeader,
+    pub access: u32,
+}
+const _: () = assert!(size_of::<CreateDirectoryRequest>() == 16);
+const _: () = assert!(std::mem::offset_of!(CreateDirectoryRequest, access) == 12);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CreateDirectoryReply {
+    pub header: ReplyHeader,
+    pub handle: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<CreateDirectoryReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(CreateDirectoryReply, handle) == 8);
+
+impl Request for CreateDirectoryRequest {
+    const NUMBER: i32 = 239;
+    type Reply = CreateDirectoryReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CreateSymlinkRequest {
+    pub header: RequestHeader,
+    pub access: u32,
+}
+const _: () = assert!(size_of::<CreateSymlinkRequest>() == 16);
+const _: () = assert!(std::mem::offset_of!(CreateSymlinkRequest, access) == 12);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CreateSymlinkReply {
+    pub header: ReplyHeader,
+    pub handle: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<CreateSymlinkReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(CreateSymlinkReply, handle) == 8);
+
+impl Request for CreateSymlinkRequest {
+    const NUMBER: i32 = 242;
+    type Reply = CreateSymlinkReply;
     fn header(&mut self) -> &mut RequestHeader {
         &mut self.header
     }
@@ -2242,6 +2326,113 @@ const _: () = assert!(size_of::<GetObjectTypeReply>() == 8);
 impl Request for GetObjectTypeRequest {
     const NUMBER: i32 = 247;
     type Reply = GetObjectTypeReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NewProcessRequest {
+    pub header: RequestHeader,
+    pub token: u32,
+    pub debug: u32,
+    pub parent_process: u32,
+    pub flags: u32,
+    pub socket_fd: i32,
+    pub access: u32,
+    pub machine: u16,
+    pub _pad0: [u8; 2],
+    pub info_size: u32,
+    pub handles_size: u32,
+    pub jobs_size: u32,
+    pub _pad1: [u8; 4],
+}
+const _: () = assert!(size_of::<NewProcessRequest>() == 56);
+const _: () = assert!(std::mem::offset_of!(NewProcessRequest, token) == 12);
+const _: () = assert!(std::mem::offset_of!(NewProcessRequest, debug) == 16);
+const _: () = assert!(std::mem::offset_of!(NewProcessRequest, parent_process) == 20);
+const _: () = assert!(std::mem::offset_of!(NewProcessRequest, flags) == 24);
+const _: () = assert!(std::mem::offset_of!(NewProcessRequest, socket_fd) == 28);
+const _: () = assert!(std::mem::offset_of!(NewProcessRequest, access) == 32);
+const _: () = assert!(std::mem::offset_of!(NewProcessRequest, machine) == 36);
+const _: () = assert!(std::mem::offset_of!(NewProcessRequest, info_size) == 40);
+const _: () = assert!(std::mem::offset_of!(NewProcessRequest, handles_size) == 44);
+const _: () = assert!(std::mem::offset_of!(NewProcessRequest, jobs_size) == 48);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NewProcessReply {
+    pub header: ReplyHeader,
+    pub info: u32,
+    pub pid: u32,
+    pub handle: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<NewProcessReply>() == 24);
+const _: () = assert!(std::mem::offset_of!(NewProcessReply, info) == 8);
+const _: () = assert!(std::mem::offset_of!(NewProcessReply, pid) == 12);
+const _: () = assert!(std::mem::offset_of!(NewProcessReply, handle) == 16);
+
+impl Request for NewProcessRequest {
+    const NUMBER: i32 = 0;
+    type Reply = NewProcessReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GetNewProcessInfoRequest {
+    pub header: RequestHeader,
+    pub info: u32,
+}
+const _: () = assert!(size_of::<GetNewProcessInfoRequest>() == 16);
+const _: () = assert!(std::mem::offset_of!(GetNewProcessInfoRequest, info) == 12);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GetNewProcessInfoReply {
+    pub header: ReplyHeader,
+    pub success: i32,
+    pub exit_code: i32,
+}
+const _: () = assert!(size_of::<GetNewProcessInfoReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(GetNewProcessInfoReply, success) == 8);
+const _: () = assert!(std::mem::offset_of!(GetNewProcessInfoReply, exit_code) == 12);
+
+impl Request for GetNewProcessInfoRequest {
+    const NUMBER: i32 = 1;
+    type Reply = GetNewProcessInfoReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GetStartupInfoRequest {
+    pub header: RequestHeader,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<GetStartupInfoRequest>() == 16);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GetStartupInfoReply {
+    pub header: ReplyHeader,
+    pub info_size: u32,
+    pub machine: u16,
+    pub _pad0: [u8; 2],
+}
+const _: () = assert!(size_of::<GetStartupInfoReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(GetStartupInfoReply, info_size) == 8);
+const _: () = assert!(std::mem::offset_of!(GetStartupInfoReply, machine) == 12);
+
+impl Request for GetStartupInfoRequest {
+    const NUMBER: i32 = 3;
+    type Reply = GetStartupInfoReply;
     fn header(&mut self) -> &mut RequestHeader {
         &mut self.header
     }

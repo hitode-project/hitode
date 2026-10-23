@@ -9,7 +9,8 @@ sizes come from the C_ASSERTs in server/request_handlers.h, which the server
 build checks, so every generated layout matches the server's by
 construction. A field whose type is not a plain integer becomes a byte array
 that spans it. Only the requests in REQUESTS are generated; add a name when
-adv-nt starts sending it.
+adv-nt starts sending it. STRUCTS are structures that requests carry as
+data.
 """
 from __future__ import annotations
 
@@ -55,6 +56,8 @@ REQUESTS = [
     "set_key_value",
     "get_token_sid",
     "open_directory",
+    "create_directory",
+    "create_symlink",
     "open_mapping",
     "open_process",
     "open_thread",
@@ -95,7 +98,14 @@ REQUESTS = [
     "get_object_info",
     "get_object_name",
     "get_object_type",
+    "new_process",
+    "get_new_process_info",
+    "get_startup_info",
 ]
+
+# Structures sent as request or reply data. Their fields are integers laid
+# out without padding, which the server's size check confirms.
+STRUCTS = ["startup_info_data"]
 
 INTEGERS = {
     "int": "i32", "unsigned int": "u32", "short": "i16", "unsigned short": "u16",
@@ -191,6 +201,28 @@ def rust_struct(protocol: str, handlers: str, types: dict[str, str], name: str, 
     return lines
 
 
+def plain_struct(protocol: str, handlers: str, types: dict[str, str], struct: str) -> list[str]:
+    size = re.search(rf"C_ASSERT\( sizeof\(struct {struct}\) == (\d+) \);", handlers)
+    if not size:
+        sys.exit(f"no size of struct {struct} in {HANDLERS.name}")
+    lines = ["#[repr(C)]", "#[derive(Clone, Copy, Debug, Default)]", f"pub struct {camel(struct)} {{"]
+    position = 0
+    for field, ctype in fields(protocol, struct):
+        rust = types.get(ctype)
+        if not rust:
+            sys.exit(f"struct {struct}: {field} is not an integer")
+        width = int(rust[1:]) // 8
+        if position % width:
+            sys.exit(f"struct {struct}: {field} is not aligned")
+        lines.append(f"    pub {ident(field)}: {rust},")
+        position += width
+    if position != int(size.group(1)):
+        sys.exit(f"struct {struct} has padding")
+    lines.append("}")
+    lines.append(f"const _: () = assert!(size_of::<{camel(struct)}>() == {position});")
+    return lines
+
+
 def generate() -> str:
     protocol = PROTOCOL.read_text()
     handlers = HANDLERS.read_text()
@@ -230,6 +262,9 @@ def generate() -> str:
         "    fn header(&mut self) -> &mut RequestHeader;",
         "}",
     ]
+    for struct in STRUCTS:
+        out.append("")
+        out += plain_struct(protocol, handlers, types, struct)
     for name in REQUESTS:
         out.append("")
         out += rust_struct(protocol, handlers, types, name, "request")

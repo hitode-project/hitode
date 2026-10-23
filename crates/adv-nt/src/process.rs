@@ -15,6 +15,7 @@ use adv_machine::layout::{DEFAULT_STACK, PAGE, teb};
 use adv_machine::{CtxId, Env, Machine, Sys};
 use adv_pe::{ExportTarget, Pe, PeError};
 
+use crate::environment::Environment;
 use crate::file::{self, Files};
 use crate::memory::{self, Kind, Memory, PAGE_GUARD_READWRITE, PAGE_READWRITE};
 use crate::params::{self, Startup};
@@ -307,12 +308,7 @@ pub fn start<B: Backend>(
         block + PAGE,
         &debug::table(startup.debug, app_name, PAGE as usize),
     )?;
-    let size = params::size(startup);
-    let parameters =
-        memory::allocate_committed(&mut machine.cpu, &mut machine.sys.vm, &mut memory, size)
-            .ok_or(Error::AddressSpace)?;
     for (offset, value) in [
-        (peb::PROCESS_PARAMETERS, parameters),
         (peb::NUMBER_OF_PROCESSORS, PROCESSORS),
         (peb::HEAP_SEGMENT_RESERVE, 0x10_0000),
         (peb::HEAP_SEGMENT_COMMIT, 0x1_0000),
@@ -394,9 +390,23 @@ pub fn start<B: Backend>(
                             })?;
                     }
                 }
+                // As Wine's `build_initial_params`, once the server is there.
+                let mut environment = Environment::new(startup.environment);
+                environment.add_dynamic();
+                environment.add_registry(env).map_err(|error| match error {
+                    status::Error::Status(code) => Error::Status("environment", code),
+                    status::Error::Unsupported(reason) => Error::Context(reason),
+                })?;
+                let environment = environment.block();
+                let size = params::size(startup, &environment);
+                let memory = env.ext.get_mut::<Memory>();
+                let parameters = memory::allocate_committed(env.cpu, &mut env.sys.vm, memory, size)
+                    .ok_or(Error::AddressSpace)?;
+                env.cpu
+                    .write_u32(env.sys.peb + peb::PROCESS_PARAMETERS, parameters)?;
                 env.cpu.write(
                     parameters,
-                    &params::build(startup, parameters, env.sys.pid, handles),
+                    &params::build(startup, &environment, parameters, env.sys.pid, handles),
                 )?;
                 // win32u looks the driver up under the desktop's display
                 // device, the null GUID while no explorer names another.

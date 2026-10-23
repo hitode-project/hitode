@@ -15,6 +15,7 @@ use adv_runtime::wine::session::{Config, Session, Stop};
 
 /// Cases that pass on standard Wine, as `<module>_<test>`.
 const CASES: &[&str] = &[
+    "gdi32_bitmap",
     "gdi32_brush",
     "gdi32_clipping",
     "gdi32_gdiobj",
@@ -25,6 +26,7 @@ const CASES: &[&str] = &[
     "gdi32_pen",
     "kernel32_atom",
     "kernel32_codepage",
+    "kernel32_environ",
     "kernel32_format_msg",
     "msvcrt_heap",
     "msvcrt_locale",

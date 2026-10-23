@@ -14,6 +14,7 @@ pub mod context;
 pub mod debug;
 pub mod directory;
 pub mod dispatch;
+pub mod environment;
 pub mod exception;
 pub mod file;
 pub mod image;
