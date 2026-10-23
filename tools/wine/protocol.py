@@ -95,6 +95,7 @@ REQUESTS = [
     "get_object_info",
     "get_object_name",
     "get_object_type",
+    "set_queue_fd",
 ]
 
 INTEGERS = {

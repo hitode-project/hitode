@@ -16,6 +16,7 @@ use adv_machine::layout::PAGE;
 use adv_nt::process::{Started, module_base, module_export};
 use adv_unix::loader::Libraries;
 
+pub mod input;
 mod surface;
 
 /// The driver's file name, the display device's `GraphicsDriver`.
@@ -23,9 +24,10 @@ pub const MODULE: &str = "wineadv.drv";
 /// `WINE_GDI_DRIVER_VERSION` of the vendored Wine.
 const VERSION: u32 = 108;
 /// Offsets in `struct user_driver_funcs` (i386), which is 604 bytes.
-const FUNCS: [(u32, &str); 5] = [
+const FUNCS: [(u32, &str); 6] = [
     (476, "CreateWindow"),
     (484, "DestroyWindow"),
+    (496, "ProcessEvents"),
     (512, "SetDesktopWindow"),
     (572, "CreateWindowSurface"),
     (580, "WindowPosChanged"),
@@ -51,6 +53,8 @@ pub struct Window {
     /// The part of the window its surface holds, in the same coordinates.
     pub extent: [i32; 4],
     pub visible: bool,
+    /// The guest context that owns the window.
+    context: adv_machine::CtxId,
 }
 
 /// The windows win32u reported, by handle.
@@ -62,10 +66,26 @@ struct Funcs(u32);
 
 pub(super) fn register(registry: &mut Registry) {
     surface::register(registry);
+    input::register(registry);
     registry.add(MODULE, "DllMain", Conv::Stdcall { argc: 3 }, attach);
-    registry.add(MODULE, "CreateWindow", Conv::Cdecl { argc: 1 }, |_| {
-        Outcome::Return(1)
-    });
+    registry.add(
+        MODULE,
+        "CreateWindow",
+        Conv::Cdecl { argc: 1 },
+        |env| match input::init(env) {
+            Ok(()) => {
+                let hwnd = env.arg(0);
+                env.ext
+                    .get_or_default::<Windows>()
+                    .0
+                    .entry(hwnd)
+                    .or_default()
+                    .context = env.context;
+                Outcome::Return(1)
+            }
+            Err(error) => Outcome::Fail(error),
+        },
+    );
     registry.add(MODULE, "DestroyWindow", Conv::Cdecl { argc: 1 }, |env| {
         let hwnd = env.arg(0);
         env.ext.get_or_default::<Windows>().0.remove(&hwnd);
@@ -115,6 +135,7 @@ pub(super) fn image<B: Backend>(machine: &mut Machine<B>) -> Result<ModuleImage,
             .map_err(|e| e.to_string())?;
     }
     machine.ext.insert(Funcs(funcs));
+    machine.ext.insert(input::Presentation::default());
     ModuleImage::build_with_entry(machine, MODULE, Some("DllMain"), &[], &[])
 }
 

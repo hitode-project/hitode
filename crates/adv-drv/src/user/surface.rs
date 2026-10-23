@@ -295,8 +295,12 @@ fn flush(env: &mut Env<'_>) -> Outcome {
             store.stats.presentations,
         )
     };
-    if changed && let Some(outcome) = (provider.completed)(env, presented) {
-        return outcome;
+    if changed {
+        super::input::prepare(env.ext, hwnd, (window.extent[0], window.extent[1]));
+        super::input::presented(env.ext);
+        if let Some(outcome) = (provider.completed)(env, presented) {
+            return outcome;
+        }
     }
     Outcome::Return(1)
 }

@@ -201,6 +201,23 @@ FreeType is such a library: win32u opens it by name and draws TrueType text thro
 **Rule**: When a thread that drew a software frame waits, the frame MUST be published. A frame deferred to a UI's mailbox MUST NOT wait for a readback.
 **Verification**: Test
 
+## Input
+
+### WINE-IN-1 Presented window coordinates
+
+**Rule**: Host mouse points MUST map to screen coordinates through the last presented window. Window surfaces MUST use `Window::extent`; DirectDraw and Direct3D 9 MUST use `Window::client`.
+**Verification**: Test
+
+### WINE-IN-2 Hardware input
+
+**Rule**: The user driver's `ProcessEvents` MUST deliver queued mouse and keyboard events through win32u as hardware input on the guest thread. Keyboard input MUST carry its virtual key, scan code, extended flag and release flag.
+**Verification**: Test
+
+### WINE-IN-3 Input wakes message waits
+
+**Rule**: Each input thread MUST register its event pipe as Wine's queue fd. Queuing host input MUST run the server and deliver wake-ups even when every guest context waits. Input waits MUST NOT use periodic polling.
+**Verification**: Test
+
 ## Sessions
 
 ### WINE-SES-1 Kept prefix

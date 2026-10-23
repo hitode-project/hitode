@@ -17,7 +17,7 @@ use adv_dx::interop::{DcCreated, DcFinished, DcSurface, MemoryDc};
 use adv_machine::{Env, Machine, Outcome};
 use adv_pe::{ImportModule, ImportName};
 
-use crate::graphics::{frame_completed, guest_memory, install_store};
+use crate::graphics::{guest_memory, install_store};
 
 #[cfg(any(target_vendor = "apple", target_os = "android"))]
 pub mod session;
@@ -92,7 +92,7 @@ pub fn install<B: Backend>(
     }
     let provider = adv_drv::Provider {
         memory: guest_memory,
-        completed: frame_completed,
+        completed: crate::graphics::frame_completed,
     };
     adv_drv::install(machine, prefix, provider)
 }
@@ -113,6 +113,11 @@ fn flush_on_wait(env: &mut Env<'_>) -> Option<Outcome> {
     }
 }
 
+fn frame_completed(env: &mut Env<'_>, serial: u64) -> Option<Outcome> {
+    adv_drv::user::input::presented(env.ext);
+    crate::graphics::frame_completed(env, serial)
+}
+
 /// The geometry DirectDraw sees for `hwnd`: its client area, as the user
 /// driver last heard of it.
 fn geometry(
@@ -122,6 +127,7 @@ fn geometry(
 ) -> Option<adv_dx::ddraw::WindowGeometry> {
     let [left, top, right, bottom] = adv_drv::user::window(ext, hwnd)?.client;
     let (width, height) = (right.checked_sub(left)?, bottom.checked_sub(top)?);
+    adv_drv::user::input::prepare(ext, hwnd, (left, top));
     (width > 0 && height > 0).then_some(adv_dx::ddraw::WindowGeometry {
         width: width as u32,
         height: height as u32,
@@ -191,7 +197,11 @@ fn d3d9_provider() -> adv_dx::d3d9::SurfaceProvider {
         window: |ext, objects, hwnd| {
             geometry(ext, objects, hwnd).map(|window| (window.width, window.height))
         },
-        visible: |ext, _, hwnd| adv_drv::user::window(ext, hwnd).map(|window| window.visible),
+        visible: |ext, objects, hwnd| {
+            let _ = geometry(ext, objects, hwnd);
+            adv_drv::user::window(ext, hwnd).map(|window| window.visible)
+        },
+        completed: frame_completed,
         fast_forward: |_| false,
         unpaced: |_| {},
         ..crate::graphics::d3d9_provider()

@@ -209,6 +209,14 @@ pub fn deliver(env: &mut Env<'_>) {
     }
 }
 
+/// Run the server for host activity, and deliver the resulting wake-ups.
+pub fn run(env: &mut Env<'_>) {
+    set_time(env);
+    let link = env.ext.get_mut::<Link>();
+    link.progress.run_server(link.time);
+    deliver(env);
+}
+
 /// What ended a wait the thread started with `select`.
 #[derive(Clone, Copy, Debug)]
 pub struct WakeUp {

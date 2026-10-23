@@ -2246,3 +2246,27 @@ impl Request for GetObjectTypeRequest {
         &mut self.header
     }
 }
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SetQueueFdRequest {
+    pub header: RequestHeader,
+    pub handle: u32,
+}
+const _: () = assert!(size_of::<SetQueueFdRequest>() == 16);
+const _: () = assert!(std::mem::offset_of!(SetQueueFdRequest, handle) == 12);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SetQueueFdReply {
+    pub header: ReplyHeader,
+}
+const _: () = assert!(size_of::<SetQueueFdReply>() == 8);
+
+impl Request for SetQueueFdRequest {
+    const NUMBER: i32 = 115;
+    type Reply = SetQueueFdReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
