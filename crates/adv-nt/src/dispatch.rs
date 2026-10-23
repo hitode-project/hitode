@@ -81,6 +81,7 @@ const IMPLEMENTED: &[(&str, Syscall)] = &[
     ("NtResetEvent", sync::reset_event),
     ("NtResumeThread", thread::resume),
     ("NtSetEvent", sync::set_event),
+    ("NtSetInformationProcess", information::set_process),
     ("NtSetValueKey", registry::set_value),
     ("NtTerminateProcess", process::terminate),
     ("NtSuspendThread", thread::suspend),

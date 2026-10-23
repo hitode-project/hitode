@@ -12,6 +12,7 @@ use crate::server;
 use crate::status::{self, Error};
 
 const PROCESS_DEBUG_PORT: u32 = 7;
+const PROCESS_DEFAULT_HARD_ERROR_MODE: u32 = 12;
 const PROCESS_WOW64_INFORMATION: u32 = 26;
 const PROCESS_IMAGE_INFORMATION: u32 = 37;
 
@@ -28,6 +29,10 @@ pub fn query_process(env: &mut Env<'_>, args: &[u32]) -> Outcome {
             // Nothing debugs a Hitode process, and an i386 process is
             // native, not WoW64.
             PROCESS_DEBUG_PORT | PROCESS_WOW64_INFORMATION => vec![0; 4],
+            PROCESS_DEFAULT_HARD_ERROR_MODE => {
+                let mode = env.ext.try_get::<ErrorMode>().map_or(0, |mode| mode.0);
+                mode.to_le_bytes().to_vec()
+            }
             PROCESS_IMAGE_INFORMATION => {
                 if size as usize != IMAGE_INFORMATION_SIZE {
                     return Err(status::INFO_LENGTH_MISMATCH.into());
@@ -55,6 +60,34 @@ pub fn query_process(env: &mut Env<'_>, args: &[u32]) -> Outcome {
             write_u32(env, result_size, bytes.len() as u32)?;
         }
         Ok(())
+    })())
+}
+
+/// The process's hard error mode, which Wine's ntdll.so keeps in a global.
+struct ErrorMode(u32);
+
+/// NtSetInformationProcess(process, class, *info, size)
+pub fn set_process(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    let &[process, class, info, size] = args else {
+        unreachable!()
+    };
+    status::finish((|| {
+        if process != CURRENT_PROCESS {
+            return Err(Error::Unsupported("changing another process".into()));
+        }
+        match class {
+            PROCESS_DEFAULT_HARD_ERROR_MODE => {
+                if size != 4 {
+                    return Err(status::INVALID_PARAMETER.into());
+                }
+                let mode = crate::object::read_u32(env, info)?;
+                env.ext.insert(ErrorMode(mode));
+                Ok(())
+            }
+            class => Err(Error::Unsupported(format!(
+                "setting process information class {class}"
+            ))),
+        }
     })())
 }
 
