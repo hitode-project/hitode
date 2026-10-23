@@ -39,7 +39,7 @@ The workspace is layered. Each layer may depend only on the layers below it, and
 | Machine | `adv-machine` | Guest contexts, scheduling, clocks, waits, callbacks, exception and trap dispatch | |
 | Execution | `adv-cpu`, `adv-cpu-core`, `adv-cpu-x64`, `adv-cpu-a64` | Running x86 code: CPU state, guest address space, code validity, translation | Anything about Win32 |
 | Devices | `adv-device` | Neutral surfaces and drawing, PCM mixing, fonts, audio and video decoding | Win32 handles and window semantics |
-| Shared | `adv-sync`, `adv-pe`, `adv-report` | Channels and wakeups; PE parsing; the anonymous compatibility report format | Policy |
+| Shared | `adv-sync`, `adv-pe`, `adv-report` | Channels and wakeups; PE parsing and generic image writing; the anonymous compatibility report format | Policy |
 | Test only | `adv-unicorn`, `adv-samples` | A reference CPU, locating local samples | Anything shipped |
 
 The dependency arrows, pointing at what is depended on:
@@ -51,7 +51,7 @@ adv-dx → adv-os (transitional: fronts other than DirectDraw and D3D9)
 adv-cpu → adv-cpu-x64 (x86_64) / adv-cpu-a64 (AArch64) → adv-cpu-core
 adv-win32 / adv-dx / adv-shell → adv-device
 adv-cpu-core / adv-machine / adv-device / adv-shell → adv-sync
-adv-shell → adv-report;  adv-os → adv-pe;  adv-abi → adv-abi-macros
+adv-shell → adv-report;  adv-os → adv-pe;  adv-abi → adv-abi-macros / adv-pe
 adv-run / adv-launcher → adv-shell
 ```
 
@@ -65,6 +65,8 @@ shared GDI state in `adv-runtime::graphics`; its COM activation stays in `adv-os
 DirectDraw keeps its private surface arena. Other DirectX fronts retain a
 transitional dependency on `adv-os` for heaps, activation, Automation, files and
 input state.
+
+For the Wine stack, `adv-abi::dll` writes host-module PE images through `adv-pe` and calls their imports through the machine. `adv-unix::builtin` installs those images in the prefix before process startup.
 
 ## A frame, from start to screen
 

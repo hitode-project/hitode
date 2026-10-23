@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 adv-machine.workspace = true
+adv-pe.workspace = true
 adv-cpu = { path = "../adv-cpu" }
 adv-abi-macros = { path = "../adv-abi-macros" }
 bytemuck = { version = "1", features = ["derive", "min_const_generics"] }

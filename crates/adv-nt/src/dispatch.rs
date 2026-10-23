@@ -49,6 +49,7 @@ const IMPLEMENTED: &[(&str, Syscall)] = &[
     ("NtOpenSection", section::open),
     ("NtFindAtom", atom::find),
     ("NtFreeVirtualMemory", memory::free),
+    ("NtFlushInstructionCache", memory::flush_instruction_cache),
     ("NtFsControlFile", file::control),
     ("NtGetNextThread", information::next_thread),
     ("NtGetNlsSectionPtr", nls::section),
