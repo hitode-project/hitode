@@ -377,6 +377,15 @@ impl Session {
         run(&mut self.machine, &self.wake, until, serve)
     }
 
+    /// Post host input in coordinates of the last presented frame and wake
+    /// the guest through Wine's queue fd, including when every thread waits.
+    pub fn input(&mut self, message: u32, wparam: u32, lparam: u32) -> Result<(), String> {
+        adv_drv::user::input::post(&mut self.machine.ext, message, wparam, lparam)?;
+        self.machine.visit_context(None, adv_nt::server::run)?;
+        self.wake.signal();
+        Ok(())
+    }
+
     /// The latest frame [`Session::capture`] took.
     pub fn frame(&self) -> &crate::Snapshot {
         &self.machine.ext.get::<SurfaceStore>().presenter

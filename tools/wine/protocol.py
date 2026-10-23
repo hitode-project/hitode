@@ -101,6 +101,7 @@ REQUESTS = [
     "new_process",
     "get_new_process_info",
     "get_startup_info",
+    "set_queue_fd",
 ]
 
 # Structures sent as request or reply data. Their fields are integers laid

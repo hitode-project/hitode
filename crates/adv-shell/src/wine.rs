@@ -119,16 +119,22 @@ pub(super) fn run_execution(
     };
     let mut session = start(options, dist, wake, host)?;
     let mut performance = super::performance::Performance::default();
-    let exit_code = loop {
+    let exit_code = 'execution: loop {
         if worker.stopped() {
             return Err("UI stopped while the guest was running".into());
         }
-        if worker
-            .pump(&mut performance)
-            .into_iter()
-            .any(|event| matches!(event, window::Event::Close | window::Event::ForceClose))
-        {
-            break 0;
+        for event in worker.pump(&mut performance) {
+            match event {
+                window::Event::Close | window::Event::ForceClose => break 'execution 0,
+                window::Event::Input {
+                    message,
+                    wparam,
+                    lparam,
+                } => {
+                    session.input(message, wparam, lparam)?;
+                }
+                _ => {}
+            }
         }
         match session.run(Instant::now() + SLICE) {
             Stop::Paused => {}
