@@ -52,6 +52,9 @@ fn a_session_runs_a_program_from_its_directory_and_presents() {
     let mut session = Session::start(&config, wake, move |machine| {
         let gpu =
             pollster::block_on(adv_device::gpu::Gpu::request(false)).map_err(|e| e.to_string())?;
+        gpu.context()
+            .set_execution_wake(gpu_wake.clone())
+            .map_err(|_| "the GPU already has a wake")?;
         Session::attach_gpu(machine, gpu, gpu_wake)
     })
     .unwrap();

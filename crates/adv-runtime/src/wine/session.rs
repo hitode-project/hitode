@@ -303,8 +303,8 @@ impl Session {
             .map(|_| ())
     }
 
-    /// Attach `gpu` as a headless shell does: our Direct3D 9 renders on it,
-    /// and its completions and readbacks signal `wake`. Call from the
+    /// Attach `gpu`, whose context already signals `wake`: our Direct3D 9
+    /// renders on it, and its readbacks signal `wake` too. Call from the
     /// `prepare` of [`Session::start`].
     #[cfg(feature = "gpu")]
     pub fn attach_gpu(
@@ -312,9 +312,6 @@ impl Session {
         gpu: adv_device::gpu::Gpu,
         wake: WakeEvent,
     ) -> Result<(), String> {
-        gpu.context()
-            .set_execution_wake(wake.clone())
-            .map_err(|_| "the GPU already has a wake")?;
         machine
             .ext
             .get_mut::<SurfaceStore>()

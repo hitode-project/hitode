@@ -191,6 +191,11 @@ FreeType is such a library: win32u opens it by name and draws TrueType text thro
 **Rule**: Our Direct3D 9 MUST load as a PE image in place of Wine's. Its surface DCs MUST be memory DCs that call GDI through its own IAT. A presented back buffer MUST reach the presenter.
 **Verification**: Test
 
+### WINE-GFX-7 Frames published on waits
+
+**Rule**: When a thread that drew a software frame waits, the frame MUST be published. A frame deferred to a UI's mailbox MUST NOT wait for a readback.
+**Verification**: Test
+
 ## Sessions
 
 ### WINE-SES-1 Kept prefix

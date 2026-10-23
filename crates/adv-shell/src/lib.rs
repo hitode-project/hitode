@@ -130,7 +130,7 @@ const HELP: &str = "adv-run <EXE> [options]\n\
   --hidden                create a hidden host window for frontend tests\n\
   --gpu-software          select a software GPU adapter for diagnostics\n\
   --headless-gpu         opt in to a GPU frontend without a window\n\
-  --wine DIST             run on the Wine userland installed in DIST (macOS, headless)\n\
+  --wine DIST             run on the Wine userland installed in DIST (macOS)\n\
   --d3d9-sm3             opt in to the SM3 capability milestone (default: off)\n\
   --d3d9-shader-cache PATH opt in to a bounded local WGSL disk cache\n\
   --width N --height N    initial guest canvas (default: 640 x 480)\n\
@@ -1240,7 +1240,7 @@ fn run(options: Options) -> Result<u8, String> {
         return Err("software GPU diagnostics require a GPU-enabled build".into());
     }
     #[cfg(target_os = "macos")]
-    if let Some(dist) = &options.wine {
+    if let Some(dist) = options.wine.as_ref().filter(|_| options.headless) {
         return wine::run(&options, dist);
     }
     #[cfg(target_os = "macos")]
@@ -1428,6 +1428,10 @@ fn run_execution(
     keys: std::sync::Arc<adv_sync::input::KeyState>,
     background: adv_sync::background::Sender,
 ) -> Result<Finished, String> {
+    #[cfg(target_os = "macos")]
+    if let (Some(dist), Some(worker)) = (options.wine.clone(), window.take()) {
+        return wine::run_execution(&options, &dist, worker, wake, background);
+    }
     window::initialize_dpi()?;
     let started = Instant::now();
     // Before any translation, so the sampler can attribute every unit.

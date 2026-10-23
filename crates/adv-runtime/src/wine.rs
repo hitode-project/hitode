@@ -73,6 +73,7 @@ pub fn install<B: Backend>(
     height: u32,
 ) -> Result<(), String> {
     install_store(machine, width, height)?;
+    machine.sys.context_wait = Some(flush_on_wait);
     machine
         .ext
         .insert(adv_nt::process::Desktop(driver::start_desktop));
@@ -100,6 +101,22 @@ pub fn install<B: Backend>(
     let driver = driver::image(machine)?;
     adv_unix::builtin::install(prefix, &driver).map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// A thread that waits has ended its frame: publish the software frame it
+/// drew, as the built-in stack's GDI does. With presentation deferred to a
+/// UI, nothing else publishes it while the guest idles.
+fn flush_on_wait(env: &mut Env<'_>) -> Option<Outcome> {
+    let memory = guest_memory(env.cpu);
+    let store = env.ext.try_get_mut::<adv_device::surface::SurfaceStore>()?;
+    match store.flush_context(env.context, &memory, adv_device::surface::FlushReason::Wait) {
+        Ok(true) => {
+            let serial = store.stats.presentations;
+            frame_completed(env, serial)
+        }
+        Ok(false) => None,
+        Err(error) => Some(Outcome::Fail(error)),
+    }
 }
 
 /// Build the image of front `image`, which imports GDI for its memory DCs.
