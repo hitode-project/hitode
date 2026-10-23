@@ -1,0 +1,19 @@
+[package]
+name = "adv-drv"
+description = "Wine's driver modules on the Wine userland, over the host devices"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+adv-abi = { path = "../adv-abi" }
+adv-cpu = { path = "../adv-cpu" }
+adv-device = { path = "../adv-device" }
+adv-machine.workspace = true
+adv-nt = { path = "../adv-nt" }
+adv-unix = { path = "../adv-unix" }
+
+[lints]
+workspace = true

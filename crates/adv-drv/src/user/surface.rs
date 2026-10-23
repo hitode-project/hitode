@@ -10,9 +10,8 @@ use adv_cpu::backend::{GuestExt, Prot};
 use adv_device::surface::{PixelFormat, Rect, SurfaceStore};
 use adv_machine::outcome::Resume;
 
-use super::driver::{self, MODULE, win32u};
-use super::{free_slot, slot, write_words};
-use crate::graphics::{frame_completed, guest_memory};
+use super::{MODULE, is_desktop, surface_funcs, win32u, window};
+use crate::{Provider, free_slot, slot, write_words};
 
 /// The host functions of `struct window_surface_funcs`, in its order.
 pub(super) const FUNCS: [&str; 3] = ["SurfaceSetClip", "SurfaceFlush", "SurfaceDestroy"];
@@ -87,14 +86,14 @@ fn call(
 /// CreateWindowSurface(hwnd, layered, surface_rect, surface).
 fn create(env: &mut Env<'_>) -> Outcome {
     let (hwnd, bounds, output) = (env.arg(0), env.arg(2), env.arg(3));
-    if driver::is_desktop(env, hwnd) {
+    if is_desktop(env, hwnd) {
         // The desktop presents nothing, but its DC spans the virtual screen:
         // win32u's offscreen surface covers it, where the 1×1 default would
         // clip it.
         return Outcome::Return(0);
     }
     let previous = check!(env.cpu.read_u32(output));
-    if previous != 0 && env.cpu.read_u32(previous).ok() == Some(driver::surface_funcs(env)) {
+    if previous != 0 && env.cpu.read_u32(previous).ok() == Some(surface_funcs(env)) {
         return Outcome::Return(1);
     }
     let [left, top, right, bottom] = check!(rect(env, bounds));
@@ -201,7 +200,7 @@ fn surface(
         0,
     ];
     check!(write_words(env, info, &header));
-    let funcs = driver::surface_funcs(env);
+    let funcs = surface_funcs(env);
     let args = [SURFACE_SIZE, funcs, hwnd, bounds, info, bitmap];
     call(env, "window_surface_create", args, move |env, created| {
         free_slot(env, info);
@@ -238,7 +237,7 @@ fn flush(env: &mut Env<'_>) -> Outcome {
         (surface.width, surface.height),
         surface.view,
     );
-    let Some(window) = driver::window(env, hwnd).filter(|window| window.visible) else {
+    let Some(window) = window(env.ext, hwnd).filter(|window| window.visible) else {
         return Outcome::Return(1);
     };
     let [left, top, right, bottom] = window.extent;
@@ -254,9 +253,10 @@ fn flush(env: &mut Env<'_>) -> Outcome {
         w: (right - left).max(0) as u32,
         h: (bottom - top).max(0) as u32,
     };
+    let provider = *env.ext.get::<Provider>();
     let (changed, presented) = {
         let store = env.ext.get_mut::<SurfaceStore>();
-        let mut memory = guest_memory(env.cpu);
+        let mut memory = (provider.memory)(env.cpu);
         let sid = match view {
             Some((sid, w, h)) if (w, h) == (width, height) => sid,
             _ => {
@@ -295,7 +295,7 @@ fn flush(env: &mut Env<'_>) -> Outcome {
             store.stats.presentations,
         )
     };
-    if changed && let Some(outcome) = frame_completed(env, presented) {
+    if changed && let Some(outcome) = (provider.completed)(env, presented) {
         return outcome;
     }
     Outcome::Return(1)

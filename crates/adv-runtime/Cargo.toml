@@ -25,6 +25,7 @@ adv-pe = { path = "../adv-pe" }
 iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder"] }
 
 [target.'cfg(unix)'.dependencies]
+adv-drv = { path = "../adv-drv" }
 adv-nt = { path = "../adv-nt" }
 adv-unix = { path = "../adv-unix" }
 

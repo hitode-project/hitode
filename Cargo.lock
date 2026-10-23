@@ -129,6 +129,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "adv-drv"
+version = "0.1.2"
+dependencies = [
+ "adv-abi",
+ "adv-cpu",
+ "adv-device",
+ "adv-machine",
+ "adv-nt",
+ "adv-unix",
+]
+
+[[package]]
 name = "adv-dx"
 version = "0.1.2"
 dependencies = [
@@ -272,6 +284,7 @@ dependencies = [
  "adv-abi",
  "adv-cpu",
  "adv-device",
+ "adv-drv",
  "adv-dx",
  "adv-machine",
  "adv-nt",

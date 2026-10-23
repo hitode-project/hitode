@@ -4,28 +4,26 @@
 //!
 //! A surface's DC comes from `D3DKMTCreateDCFromMemory` over the surface's
 //! own pixels, called through the IAT of the front's image so that a guest
-//! hook sees it. Window geometry comes from the user driver in [`driver`].
+//! hook sees it. Window geometry comes from the user driver in `adv_drv`.
 use std::collections::HashMap;
 use std::path::Path;
 
 use adv_abi::Registry;
 use adv_abi::dll::{Export, Import, ModuleImage};
-use adv_cpu::backend::{Backend, GuestExt, Prot};
+use adv_cpu::backend::{Backend, GuestExt};
 use adv_device::surface::PixelFormat;
+use adv_drv::{free_slot, slot, write_words};
 use adv_dx::interop::{DcCreated, DcFinished, DcSurface, MemoryDc};
-use adv_machine::layout::PAGE;
 use adv_machine::{Env, Machine, Outcome};
 use adv_pe::{ImportModule, ImportName};
 
 use crate::graphics::{frame_completed, guest_memory, install_store};
 
-pub mod driver;
 #[cfg(any(target_vendor = "apple", target_os = "android"))]
 pub mod session;
-mod surface;
 
 /// The display driver to name in the process's startup parameters.
-pub const GRAPHICS_DRIVER: &str = driver::MODULE;
+pub const GRAPHICS_DRIVER: &str = adv_drv::user::MODULE;
 
 /// The fronts' images, by the index their memory DCs are bound to.
 const IMAGES: [&str; 2] = ["ddraw.dll", "d3d9.dll"];
@@ -52,15 +50,12 @@ const GDI_IMPORTS: [&str; 4] = [
 const CREATE_DESC: u32 = 36;
 const CREATED_DC: u32 = 28;
 const CREATED_BITMAP: u32 = 32;
-/// Room for one descriptor; `D3DKMT_DESTROYDCFROMMEMORY` is hDc, hBitmap.
-const SLOT: u32 = 64;
 
 pub fn register(registry: &mut Registry) {
     adv_dx::ddraw::register(registry);
     #[cfg(feature = "gpu")]
     adv_dx::d3d9::register(registry);
-    driver::register(registry);
-    surface::register(registry);
+    adv_drv::register(registry);
 }
 
 /// Install the surface store, the graphics fronts and the user driver, and
@@ -74,15 +69,12 @@ pub fn install<B: Backend>(
 ) -> Result<(), String> {
     install_store(machine, width, height)?;
     machine.sys.context_wait = Some(flush_on_wait);
-    machine
-        .ext
-        .insert(adv_nt::process::Desktop(driver::start_desktop));
     adv_dx::ddraw::install(
         machine,
         adv_dx::ddraw::Provider {
             dc: memory_dc::<DDRAW>(),
             memory: guest_memory,
-            window: driver::geometry,
+            window: geometry,
             completed: frame_completed,
         },
     )?;
@@ -98,9 +90,11 @@ pub fn install<B: Backend>(
         adv_dx::d3d9::install(machine, d3d9_provider())?;
         install_image(machine, prefix, D3D9, &D3D9_EXPORTS)?;
     }
-    let driver = driver::image(machine)?;
-    adv_unix::builtin::install(prefix, &driver).map_err(|e| e.to_string())?;
-    Ok(())
+    let provider = adv_drv::Provider {
+        memory: guest_memory,
+        completed: frame_completed,
+    };
+    adv_drv::install(machine, prefix, provider)
 }
 
 /// A thread that waits has ended its frame: publish the software frame it
@@ -117,6 +111,22 @@ fn flush_on_wait(env: &mut Env<'_>) -> Option<Outcome> {
         Ok(false) => None,
         Err(error) => Some(Outcome::Fail(error)),
     }
+}
+
+/// The geometry DirectDraw sees for `hwnd`: its client area, as the user
+/// driver last heard of it.
+fn geometry(
+    ext: &adv_machine::Ext,
+    _: &adv_machine::Objects,
+    hwnd: u32,
+) -> Option<adv_dx::ddraw::WindowGeometry> {
+    let [left, top, right, bottom] = adv_drv::user::window(ext, hwnd)?.client;
+    let (width, height) = (right.checked_sub(left)?, bottom.checked_sub(top)?);
+    (width > 0 && height > 0).then_some(adv_dx::ddraw::WindowGeometry {
+        width: width as u32,
+        height: height as u32,
+        origin: (left, top),
+    })
 }
 
 /// Build the image of front `image`, which imports GDI for its memory DCs.
@@ -179,9 +189,9 @@ fn d3d9_provider() -> adv_dx::d3d9::SurfaceProvider {
             (store.width, store.height, 60)
         },
         window: |ext, objects, hwnd| {
-            driver::geometry(ext, objects, hwnd).map(|window| (window.width, window.height))
+            geometry(ext, objects, hwnd).map(|window| (window.width, window.height))
         },
-        visible: |ext, _, hwnd| driver::visible(ext, hwnd),
+        visible: |ext, _, hwnd| adv_drv::user::window(ext, hwnd).map(|window| window.visible),
         fast_forward: |_| false,
         unpaced: |_| {},
         ..crate::graphics::d3d9_provider()
@@ -197,8 +207,6 @@ struct Dcs {
     device: u32,
     /// The bitmap of each lent DC.
     bitmaps: HashMap<u32, u32>,
-    /// Free descriptor slots in guest memory.
-    slots: Vec<u32>,
 }
 
 fn import<const IMAGE: usize>(env: &mut Env<'_>, name: &str) -> Result<Import, String> {
@@ -214,31 +222,6 @@ fn import<const IMAGE: usize>(env: &mut Env<'_>, name: &str) -> Result<Import, S
     };
     Import::bind_in(env, image, base, GDI32, name)
         .ok_or_else(|| format!("{image} does not import {name}"))
-}
-
-/// A 64-byte block of guest memory for a call's in and out parameters.
-pub(super) fn slot(env: &mut Env<'_>) -> Result<u32, String> {
-    if let Some(slot) = env.ext.get_or_default::<Dcs>().slots.pop() {
-        return Ok(slot);
-    }
-    let page = env
-        .sys
-        .vm
-        .alloc(env.cpu, PAGE, Prot::RW)
-        .map_err(|e| e.to_string())?;
-    let slots = &mut env.ext.get_mut::<Dcs>().slots;
-    slots.extend((1..PAGE / SLOT).map(|index| page + index * SLOT));
-    Ok(page)
-}
-
-/// Give back a block from [`slot`].
-pub(super) fn free_slot(env: &mut Env<'_>, slot: u32) {
-    env.ext.get_or_default::<Dcs>().slots.push(slot);
-}
-
-pub(super) fn write_words(env: &mut Env<'_>, at: u32, words: &[u32]) -> Result<(), String> {
-    let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
-    env.cpu.write(at, &bytes).map_err(|e| e.to_string())
 }
 
 /// Memory DCs whose GDI calls go through front `IMAGE`'s IAT.
@@ -314,7 +297,7 @@ fn create_from_memory<const IMAGE: usize>(
     let create = match prepared {
         Ok(create) => create,
         Err(error) => {
-            env.ext.get_mut::<Dcs>().slots.push(desc);
+            free_slot(env, desc);
             return then(env, Err(error));
         }
     };
@@ -327,7 +310,7 @@ fn create_from_memory<const IMAGE: usize>(
                 .map_err(|e| e.to_string()),
             status => Err(format!("D3DKMTCreateDCFromMemory: {status:#x}")),
         };
-        env.ext.get_mut::<Dcs>().slots.push(desc);
+        free_slot(env, desc);
         match created {
             Ok((dc, bitmap)) => {
                 env.ext.get_mut::<Dcs>().bitmaps.insert(dc, bitmap);
@@ -351,12 +334,12 @@ fn release<const IMAGE: usize>(env: &mut Env<'_>, dc: u32, then: DcFinished) -> 
     {
         Ok(destroy) => destroy,
         Err(error) => {
-            env.ext.get_mut::<Dcs>().slots.push(desc);
+            free_slot(env, desc);
             return then(env, Err(error));
         }
     };
     destroy.call(env, [desc], move |env, status| {
-        env.ext.get_mut::<Dcs>().slots.push(desc);
+        free_slot(env, desc);
         match status.value() {
             0 => then(env, Ok(())),
             status => then(env, Err(format!("D3DKMTDestroyDCFromMemory: {status:#x}"))),

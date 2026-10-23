@@ -8,6 +8,7 @@ members = [
     "crates/adv-cpu-x64",
     "crates/adv-cpu-a64",
     "crates/adv-device",
+    "crates/adv-drv",
     "crates/adv-dx",
     "crates/adv-machine",
     "crates/adv-nt",

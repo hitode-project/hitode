@@ -35,6 +35,7 @@ The workspace is layered. Each layer may depend only on the layers below it, and
 | ABI | `adv-abi`, `adv-abi-macros` | Signatures, calling conventions, argument decoding, registration, stubs, API diagnostics, COM identities and vtables | API behavior |
 | NT platform | `adv-nt` | The NT services under Wine's PE modules in the Wine userland port: image mapping, process startup, the system call and Unix call dispatchers, and the server protocol client | Windows behavior above the NT interface |
 | Wine server | `adv-wineserver` | Wine's server built in process for the Wine userland port ([#58](https://github.com/hitode-project/hitode/issues/58), [docs/spec/wine.md](docs/spec/wine.md)): handles, namespace, registry and timers, resumed by its caller with time from its caller | Waiting, time, host processes and signals |
+| Wine drivers | `adv-drv` | Wine's driver modules on the Wine userland: the user driver, which places windows and gives them surfaces in the process surface store | The graphics fronts; host windows and output |
 | Unix libraries | `adv-unix` | Wine's Unix libraries, such as `win32u.so`, as guest ELF code: the loader, the host side of `ntdll.so` they import, and the C library parts they use | Windows behavior; host libraries they would load |
 | Machine | `adv-machine` | Guest contexts, scheduling, clocks, waits, callbacks, exception and trap dispatch | |
 | Execution | `adv-cpu`, `adv-cpu-core`, `adv-cpu-x64`, `adv-cpu-a64` | Running x86 code: CPU state, guest address space, code validity, translation | Anything about Win32 |
@@ -47,7 +48,8 @@ The dependency arrows, pointing at what is depended on:
 ```text
 adv-shell → adv-runtime → adv-win32 → adv-os → adv-abi → adv-machine → adv-cpu
 adv-runtime → adv-dx → adv-abi / adv-device
-adv-runtime → adv-unix → adv-nt (the Wine userland)
+adv-runtime → adv-drv → adv-unix → adv-nt (the Wine userland)
+adv-drv → adv-device
 adv-runtime → adv-wineserver (a Wine session connects the server to adv-nt)
 adv-dx → adv-os (transitional: fronts other than DirectDraw and D3D9)
 adv-cpu → adv-cpu-x64 (x86_64) / adv-cpu-a64 (AArch64) → adv-cpu-core
@@ -68,7 +70,7 @@ DirectDraw keeps its private surface arena. Other DirectX fronts retain a
 transitional dependency on `adv-os` for heaps, activation, Automation, files and
 input state.
 
-For the Wine stack, `adv-abi::dll` writes host-module PE images through `adv-pe` and calls their imports through the machine. `adv-unix::builtin` installs those images in the prefix before process startup. `adv-runtime::wine` assembles the graphics fronts on that stack: our DirectDraw as such an image, with memory DCs from Wine's GDI.
+For the Wine stack, `adv-abi::dll` writes host-module PE images through `adv-pe` and calls their imports through the machine. `adv-unix::builtin` installs those images in the prefix before process startup. `adv-runtime::wine` assembles the graphics fronts on that stack: our DirectDraw as such an image, with memory DCs from Wine's GDI. `adv-drv` holds the driver modules win32u loads, such as the user driver whose window reports give the fronts their geometry.
 
 ## A frame, from start to screen
 

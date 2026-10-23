@@ -16,6 +16,8 @@ use adv_machine::layout::PAGE;
 use adv_nt::process::{Started, module_base, module_export};
 use adv_unix::loader::Libraries;
 
+mod surface;
+
 /// The driver's file name, the display device's `GraphicsDriver`.
 pub const MODULE: &str = "wineadv.drv";
 /// `WINE_GDI_DRIVER_VERSION` of the vendored Wine.
@@ -53,12 +55,13 @@ pub struct Window {
 
 /// The windows win32u reported, by handle.
 #[derive(Default)]
-pub struct Windows(pub HashMap<u32, Window>);
+struct Windows(HashMap<u32, Window>);
 
 /// The guest copy of the driver's function table.
 struct Funcs(u32);
 
 pub(super) fn register(registry: &mut Registry) {
+    surface::register(registry);
     registry.add(MODULE, "DllMain", Conv::Stdcall { argc: 3 }, attach);
     registry.add(MODULE, "CreateWindow", Conv::Cdecl { argc: 1 }, |_| {
         Outcome::Return(1)
@@ -100,7 +103,7 @@ pub(super) fn image<B: Backend>(machine: &mut Machine<B>) -> Result<ModuleImage,
             .write_u32(funcs + offset, entry)
             .map_err(|e| e.to_string())?;
     }
-    for (index, name) in super::surface::FUNCS.into_iter().enumerate() {
+    for (index, name) in surface::FUNCS.into_iter().enumerate() {
         let entry = machine
             .sys
             .thunks
@@ -133,7 +136,7 @@ fn attach(env: &mut Env<'_>) -> Outcome {
 
 /// The address of win32u.so's export `name`, which the driver calls as its
 /// Unix side would.
-pub(super) fn win32u(env: &Env<'_>, name: &str) -> Result<u32, String> {
+fn win32u(env: &Env<'_>, name: &str) -> Result<u32, String> {
     env.ext
         .try_get::<Libraries>()
         .and_then(|libraries| {
@@ -147,13 +150,13 @@ pub(super) fn win32u(env: &Env<'_>, name: &str) -> Result<u32, String> {
 }
 
 /// The guest `struct window_surface_funcs` of the driver's surfaces.
-pub(super) fn surface_funcs(env: &Env<'_>) -> u32 {
+fn surface_funcs(env: &Env<'_>) -> u32 {
     env.ext.get::<Funcs>().0 + SURFACE_FUNCS
 }
 
 /// What win32u last reported about `hwnd`.
-pub(super) fn window(env: &Env<'_>, hwnd: u32) -> Option<Window> {
-    env.ext.try_get::<Windows>()?.0.get(&hwnd).copied()
+pub fn window(ext: &adv_machine::Ext, hwnd: u32) -> Option<Window> {
+    ext.try_get::<Windows>()?.0.get(&hwnd).copied()
 }
 
 /// The desktop window, which presents nothing itself.
@@ -166,7 +169,7 @@ fn set_desktop_window(env: &mut Env<'_>) -> Outcome {
     Outcome::Return(0)
 }
 
-pub(super) fn is_desktop(env: &Env<'_>, hwnd: u32) -> bool {
+fn is_desktop(env: &Env<'_>, hwnd: u32) -> bool {
     env.ext
         .try_get::<Desktop>()
         .is_some_and(|desktop| desktop.0 == hwnd)
@@ -184,7 +187,7 @@ pub(super) fn start_desktop(env: &mut Env<'_>, then: Started) -> Outcome {
     else {
         return Outcome::Fail(format!("{MODULE}: user32.dll and win32u.so are needed"));
     };
-    let scratch = match super::slot(env) {
+    let scratch = match crate::slot(env) {
         Ok(scratch) => scratch,
         Err(error) => return Outcome::Fail(error),
     };
@@ -205,7 +208,7 @@ pub(super) fn start_desktop(env: &mut Env<'_>, then: Started) -> Outcome {
                 [scratch, 0, GET_VIRTUAL_SCREEN_RECT],
                 move |env, _| {
                     let rect = read_rect(env, scratch);
-                    super::free_slot(env, scratch);
+                    crate::free_slot(env, scratch);
                     let [left, top, right, bottom] = match rect {
                         Ok(rect) => rect,
                         Err(error) => return Outcome::Fail(error),
@@ -266,25 +269,4 @@ fn position_changed(env: &mut Env<'_>) -> Outcome {
         window.visible = false;
     }
     Outcome::Return(0)
-}
-
-/// The geometry DirectDraw sees for `hwnd`.
-pub(super) fn geometry(
-    ext: &adv_machine::Ext,
-    _: &adv_machine::Objects,
-    hwnd: u32,
-) -> Option<adv_dx::ddraw::WindowGeometry> {
-    let [left, top, right, bottom] = ext.try_get::<Windows>()?.0.get(&hwnd)?.client;
-    let (width, height) = (right.checked_sub(left)?, bottom.checked_sub(top)?);
-    (width > 0 && height > 0).then_some(adv_dx::ddraw::WindowGeometry {
-        width: width as u32,
-        height: height as u32,
-        origin: (left, top),
-    })
-}
-
-/// Whether win32u last reported `hwnd` shown.
-#[cfg(feature = "gpu")]
-pub(super) fn visible(ext: &adv_machine::Ext, hwnd: u32) -> Option<bool> {
-    Some(ext.try_get::<Windows>()?.0.get(&hwnd)?.visible)
 }
