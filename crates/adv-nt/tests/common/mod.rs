@@ -168,6 +168,7 @@ pub fn run_probe_on(
         stdin: None,
         stdout: Some(stdout.as_raw_fd()),
         stderr: None,
+        graphics_driver: "null",
     };
     let started = process::start(
         &mut machine,

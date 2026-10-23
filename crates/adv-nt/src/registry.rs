@@ -35,6 +35,72 @@ const KEY_VALUE_FULL: u32 = 1;
 const KEY_VALUE_PARTIAL: u32 = 2;
 const KEY_VALUE_PARTIAL_ALIGN64: u32 = 3;
 
+const REG_OPTION_VOLATILE: u32 = 1;
+const REG_SZ: i32 = 1;
+const KEY_SET_VALUE: u32 = 2;
+const KEY_CREATE_SUB_KEY: u32 = 4;
+
+/// Sets string value `name` of the volatile key at registry path `key`,
+/// for the platform itself. Missing parents are created as lasting keys,
+/// one at a time, as the server creates only the last element of a name.
+pub fn set_volatile_string(
+    env: &mut Env<'_>,
+    key: &str,
+    name: &str,
+    value: &str,
+) -> Result<(), Error> {
+    let mut hkey = 0;
+    let elements: Vec<&str> = key
+        .split('\\')
+        .filter(|element| !element.is_empty())
+        .collect();
+    // `\Registry\Machine` always exists.
+    let (root, rest) = elements.split_at(2.min(elements.len()));
+    let mut path = vec![format!("\\{}", root.join("\\"))];
+    path.extend(rest.iter().map(|element| element.to_string()));
+    for (index, element) in path.iter().enumerate() {
+        let last = index + 1 == path.len();
+        let attributes = Attributes {
+            root: hkey,
+            attributes: OBJ_OPENIF | OBJ_CASE_INSENSITIVE,
+            name: Some(element.encode_utf16().collect()),
+        };
+        let mut request = CreateKeyRequest {
+            access: if last {
+                KEY_SET_VALUE
+            } else {
+                KEY_CREATE_SUB_KEY
+            },
+            options: if last { REG_OPTION_VOLATILE } else { 0 },
+            ..Default::default()
+        };
+        let created = server::request(env, &mut request, &[&attributes.wire(), &[]], &mut []);
+        if hkey != 0 {
+            server::close(env, hkey)?;
+        }
+        let (reply, _) = created?;
+        if !matches!(
+            reply.header.error,
+            status::SUCCESS | status::OBJECT_NAME_EXISTS
+        ) {
+            return Err(reply.header.error.into());
+        }
+        hkey = reply.hkey;
+    }
+    let name = bytes(&name.encode_utf16().collect::<Vec<_>>());
+    let value = bytes(&value.encode_utf16().chain([0]).collect::<Vec<_>>());
+    let mut request = SetKeyValueRequest {
+        hkey,
+        r#type: REG_SZ,
+        namelen: name.len() as u32,
+        ..Default::default()
+    };
+    let set = server::request(env, &mut request, &[&name, &value], &mut [])
+        .and_then(|(reply, _)| status::check(reply.header.error));
+    server::close(env, hkey)?;
+    set
+}
+
 /// NtOpenKey(*key, access, *attributes)
 pub fn open(env: &mut Env<'_>, args: &[u32]) -> Outcome {
     status::finish(open_key(env, args[0], args[1], args[2]))

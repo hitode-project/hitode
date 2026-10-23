@@ -23,6 +23,9 @@ pub struct Startup<'a> {
     pub stdin: Option<RawFd>,
     pub stdout: Option<RawFd>,
     pub stderr: Option<RawFd>,
+    /// The display driver win32u loads, which explorer would choose in
+    /// Wine: `null` for windows that show nowhere.
+    pub graphics_driver: &'a str,
 }
 
 const SIZE: u32 = 0x2a4;

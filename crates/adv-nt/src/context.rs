@@ -116,11 +116,16 @@ pub fn decode(bytes: &[u8; SIZE], state: &mut ArchitecturalState) -> Result<(), 
     let flags = get(bytes, 0);
     // Any of control, integer, segments and extended registers restore their
     // part; FloatSave is read only through the extended registers, as Wine's
-    // NtContinue takes it. Debug registers and XSTATE are not restored yet.
+    // NtContinue takes it. The machine has no debug registers, so they may
+    // only be restored to zero. XSTATE is not restored yet.
     let parts = flags & !CONTEXT_I386;
-    let supported = parts & !(1 | 2 | 4 | 8 | 0x20) == 0 && (parts & 8 == 0 || parts & 0x20 != 0);
+    let supported =
+        parts & !(1 | 2 | 4 | 8 | 0x10 | 0x20) == 0 && (parts & 8 == 0 || parts & 0x20 != 0);
     if flags & CONTEXT_I386 == 0 || !supported {
         return Err(format!("x86 CONTEXT flags unsupported: {flags:#x}"));
+    }
+    if flags & 0x10 != 0 && bytes[4..0x1c].iter().any(|&byte| byte != 0) {
+        return Err("x86 CONTEXT sets debug registers".into());
     }
     let mut candidate = state.clone();
     if flags & 1 != 0 {
@@ -218,14 +223,25 @@ mod tests {
     }
     #[test]
     fn unsupported_context_fails_before_any_architecture_is_published() {
-        for flags in [0, 0x7, 0x1000f, 0x1003f, 0x1006f] {
+        for (flags, dr7) in [(0, 0), (0x7, 0), (0x1000f, 0), (0x1003f, 1), (0x1006f, 0)] {
             let original = state();
             let mut bytes = encode(&original);
             let mut restored = original.clone();
             put(&mut bytes, 0, flags);
+            put(&mut bytes, 0x18, dr7);
             put(&mut bytes, 0xb8, 0xdeadbeef);
             assert!(decode(&bytes, &mut restored).is_err());
             assert_eq!(restored, original);
         }
+    }
+
+    #[test]
+    fn zero_debug_registers_restore_with_the_rest() {
+        let original = state();
+        let mut bytes = encode(&original);
+        put(&mut bytes, 0, 0x1003f);
+        let mut restored = original.clone();
+        decode(&bytes, &mut restored).unwrap();
+        assert_eq!(restored, original);
     }
 }

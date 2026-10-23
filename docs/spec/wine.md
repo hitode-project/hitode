@@ -60,6 +60,11 @@ This spec covers the Wine userland stack. `adv-wineserver` runs Wine's server in
 **Rule**: `NtCreateUserProcess` MUST fail with `STATUS_NOT_SUPPORTED`. win32u then creates the process's own desktop window, as Wine does when explorer cannot start.
 **Verification**: Test
 
+### WINE-SYS-6 Display driver
+
+**Rule**: Process start MUST set `GraphicsDriver` of the null-GUID display device to the driver the embedder names, as explorer would. With `null`, windows MUST be created and draw, showing nowhere.
+**Verification**: Test
+
 ### WINE-SYS-5 Host names and listings
 
 **Rule**: `\??\unix` MUST name the host's root as a drive names its link. A directory listing MUST give `.`, `..`, then the entries matching the mask in name order. Each query MUST continue where the last stopped, until a restart.

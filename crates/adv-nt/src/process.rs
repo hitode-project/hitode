@@ -21,7 +21,9 @@ use crate::params::{self, Startup};
 use crate::protocol::{InitProcessDoneRequest, TerminateProcessRequest};
 use crate::section::{self, View};
 use crate::server::{self, Connection, FirstThread, Link, Progress};
-use crate::{context, debug, dispatch, exception, image, kuser, nls, status, system, win32k};
+use crate::{
+    context, debug, dispatch, exception, image, kuser, nls, registry, status, system, win32k,
+};
 
 /// TEB.WOW32Reserved: stubs that cannot reach the dispatcher pointer call
 /// through this field.
@@ -172,6 +174,8 @@ fn load_main_image(env: &mut Env<'_>, image: &str) -> Result<View, Error> {
     }
     Ok(view)
 }
+
+const DISPLAY_DEVICE: &str = r"\Registry\Machine\System\CurrentControlSet\Control\Video\{00000000-0000-0000-0000-000000000000}\0000";
 
 pub fn start<B: Backend>(
     machine: &mut Machine<B>,
@@ -325,6 +329,18 @@ pub fn start<B: Backend>(
                     parameters,
                     &params::build(startup, parameters, env.sys.pid, handles),
                 )?;
+                // win32u looks the driver up under the desktop's display
+                // device, the null GUID while no explorer names another.
+                registry::set_volatile_string(
+                    env,
+                    DISPLAY_DEVICE,
+                    "GraphicsDriver",
+                    startup.graphics_driver,
+                )
+                .map_err(|error| match error {
+                    status::Error::Status(code) => Error::Status("graphics driver", code),
+                    status::Error::Unsupported(reason) => Error::Context(reason),
+                })?;
                 let view = load_main_image(env, startup.image)?;
                 let state = env
                     .cpu
