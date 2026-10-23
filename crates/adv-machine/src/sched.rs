@@ -615,6 +615,7 @@ mod active_tests {
             process_return: None,
             process_prepare: None,
             context_wait: None,
+            context_run: None,
             exception_handler: None,
             first_cpu_fault: None,
             latest_cpu_fault: None,

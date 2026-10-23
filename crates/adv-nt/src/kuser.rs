@@ -4,7 +4,9 @@
 //! In Wine the server shares the page, wineboot and ntdll.so fill its fixed
 //! fields, and the server refreshes its clocks every tick. Here the platform
 //! owns it: the processor features are the guest CPU's, and the clocks are
-//! refreshed from the machine clock as each system call enters.
+//! refreshed from the machine clock as each system call enters and before
+//! each context runs, so a guest that polls the page without a system call
+//! still sees time pass.
 
 use adv_cpu::backend::{Guest, MemFault, Prot};
 use adv_machine::Env;

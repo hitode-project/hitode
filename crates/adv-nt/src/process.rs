@@ -285,6 +285,7 @@ pub fn start<B: Backend>(
         apc: ntdll.export("KiUserApcDispatcher")?,
     });
     machine.sys.exception_handler = Some(exception::deliver);
+    machine.sys.context_run = Some(kuser::refresh);
 
     let (view, initial) =
         machine

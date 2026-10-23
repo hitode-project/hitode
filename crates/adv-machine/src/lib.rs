@@ -131,6 +131,9 @@ pub struct Sys {
     pub process_prepare: Option<ProcessPrepare>,
     /// Personality work before a context parks on an Outcome::Block.
     pub context_wait: Option<fn(&mut Env<'_>) -> Option<Outcome>>,
+    /// Personality work each time a context is about to run guest code, at
+    /// most once per scheduling quantum (for example, guest-visible clocks).
+    pub context_run: Option<fn(&mut Env<'_>)>,
     /// Personality-supplied interpretation of precise CPU stops.
     pub exception_handler: Option<exception::ExceptionHandler>,
     /// First backend fault, retained across guest SEH execution and later slices.
@@ -1903,6 +1906,7 @@ impl<B: Backend> Machine<B> {
             process_return: None,
             process_prepare: None,
             context_wait: None,
+            context_run: None,
             exception_handler: None,
             first_cpu_fault: None,
             latest_cpu_fault: None,
@@ -2683,6 +2687,15 @@ impl<B: Backend> Machine<B> {
                 self.cpu.set_execution_budget(hard_budget);
             }
 
+            if let Some(hook) = self.sys.context_run {
+                hook(&mut Env {
+                    context: id,
+                    cpu: &mut self.cpu,
+                    sys: &mut self.sys,
+                    ext: &mut self.ext,
+                    thunk: 0,
+                });
+            }
             let run_started = Instant::now();
             let hook_before = self.sys.stats.total.hook_ns;
             if self.sys.schedule_trace.enabled() {
