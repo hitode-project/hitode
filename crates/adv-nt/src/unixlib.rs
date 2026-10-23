@@ -5,9 +5,8 @@
 //! library of the same name in `i386-unix`. The DLL asks for its function
 //! table with `NtQueryVirtualMemory(MemoryWineUnixFuncs)` and then calls
 //! through `__wine_unix_call_dispatcher` with that table as the handle. The
-//! libraries are guest ELF code that another crate loads; this module only
-//! records which library belongs to which mapped image and calls through
-//! the tables.
+//! tables point to guest ELF code or registered host thunks. This module
+//! records the table belonging to each image and uses one guest call path.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -33,12 +32,33 @@ pub struct Loader(pub fn(&mut Env<'_>, &Path, Loaded) -> Outcome);
 
 /// The Unix library of each mapped image that has one, by image base.
 #[derive(Default)]
-struct Libraries(HashMap<u32, PathBuf>);
+struct Libraries(HashMap<u32, Library>);
+
+#[derive(Clone)]
+enum Library {
+    Guest(PathBuf),
+    Host(u32),
+}
+
+/// Guest tables of host thunks, used by builtin images without an ELF library.
+#[derive(Default)]
+pub struct HostTables(pub HashMap<String, u32>);
 
 /// Records the Unix library next to the image file `dll`, mapped at `base`.
 pub fn note_image(env: &mut Env<'_>, base: u32, dll: Option<PathBuf>) {
+    let library = dll.as_deref().and_then(|dll| {
+        library_of(dll).map(Library::Guest).or_else(|| {
+            let name = dll.file_name()?.to_str()?.to_ascii_lowercase();
+            env.ext
+                .try_get::<HostTables>()?
+                .0
+                .get(&name)
+                .copied()
+                .map(Library::Host)
+        })
+    });
     let libraries = env.ext.get_or_default::<Libraries>();
-    match dll.as_deref().and_then(library_of) {
+    match library {
         Some(library) => libraries.0.insert(base, library),
         None => libraries.0.remove(&base),
     };
@@ -78,20 +98,21 @@ pub fn query(env: &mut Env<'_>, module: u32, class: u32, buffer: u32, length: u3
         .0
         .get(&module)
         .cloned();
-    let (Some(library), Some(&Loader(load))) = (library, env.ext.try_get::<Loader>()) else {
-        return Outcome::Return(DLL_NOT_FOUND);
-    };
-    load(
-        env,
-        &library,
-        Box::new(move |env, funcs| match funcs {
-            Ok(funcs) => match env.cpu.write(buffer, &u64::from(funcs).to_le_bytes()) {
-                Ok(()) => Outcome::Return(status::SUCCESS),
-                Err(_) => Outcome::Return(status::ACCESS_VIOLATION),
-            },
-            Err(status) => Outcome::Return(status),
-        }),
-    )
+    let complete: Loaded = Box::new(move |env, funcs| match funcs {
+        Ok(funcs) => match env.cpu.write(buffer, &u64::from(funcs).to_le_bytes()) {
+            Ok(()) => Outcome::Return(status::SUCCESS),
+            Err(_) => Outcome::Return(status::ACCESS_VIOLATION),
+        },
+        Err(status) => Outcome::Return(status),
+    });
+    match library {
+        Some(Library::Host(table)) => complete(env, Ok(table)),
+        Some(Library::Guest(path)) => match env.ext.try_get::<Loader>() {
+            Some(&Loader(load)) => load(env, &path, complete),
+            None => complete(env, Err(DLL_NOT_FOUND)),
+        },
+        None => complete(env, Err(DLL_NOT_FOUND)),
+    }
 }
 
 /// Calls entry `code` of the table `funcs` with `args`, as Wine's

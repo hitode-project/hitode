@@ -218,6 +218,28 @@ FreeType is such a library: win32u opens it by name and draws TrueType text thro
 **Rule**: Each input thread MUST register its event pipe as Wine's queue fd. Queuing host input MUST run the server and deliver wake-ups even when every guest context waits. Input waits MUST NOT use periodic polling.
 **Verification**: Test
 
+## Audio
+
+### WINE-AUD-1 Builtin render driver
+
+**Rule**: `wineadvaudio.drv` MUST expose one render endpoint and no capture, MIDI or aux devices. Its Unix functions MUST use the ordinary Unix-call dispatcher.
+**Verification**: Test
+
+### WINE-AUD-2 Shared mixer
+
+**Rule**: Wine render streams MUST play guest ring buffers through `adv-device`'s mixer. Padding and position MUST follow its play cursor and playback clock.
+**Verification**: Test
+
+### WINE-AUD-3 Period waits
+
+**Rule**: A stream's timer loop MUST wait on the machine clock and signal its event each period. Releasing the stream MUST end its timer thread.
+**Verification**: Test
+
+### WINE-AUD-4 Session output
+
+**Rule**: A session MUST own its audio control and expose its mixed PCM stream. Windowed shells MUST open host audio output. Headless shells MUST NOT open host audio output.
+**Verification**: Test
+
 ## Sessions
 
 ### WINE-SES-1 Kept prefix

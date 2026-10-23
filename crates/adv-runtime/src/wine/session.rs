@@ -52,6 +52,7 @@ pub enum Stop {
 pub struct Session {
     pub machine: Machine<Cpu>,
     wake: WakeEvent,
+    audio: adv_device::AudioControl,
 }
 
 /// Wine's Unix side, then the graphics fronts and the user driver.
@@ -193,6 +194,7 @@ fn new_machine(
     prefix: &Path,
     clock: adv_machine::Clock,
     wake: &WakeEvent,
+    audio: &adv_device::AudioControl,
 ) -> Result<Machine<Cpu>, String> {
     let mut registry = Registry::default();
     super::register(&mut registry);
@@ -206,6 +208,7 @@ fn new_machine(
     // the built-in stack; the backend's default watchdog is for tests.
     machine.set_execution_budget(None);
     adv_unix::install(&mut machine);
+    machine.ext.insert(audio.clone());
     super::install(&mut machine, prefix, config.width, config.height)?;
     Ok(machine)
 }
@@ -266,6 +269,11 @@ fn run(
 
 /// Take finished host work; true when guest work may continue.
 fn serve(machine: &mut Machine<Cpu>) -> Result<bool, String> {
+    let now = machine.sys.clock.now_us();
+    machine
+        .ext
+        .get::<adv_device::AudioControl>()
+        .sync_clock(now);
     #[cfg(feature = "gpu")]
     return adv_dx::d3d9::pump(machine);
     #[cfg(not(feature = "gpu"))]
@@ -317,7 +325,8 @@ impl Session {
 
         // As Wine's `run_wineboot`, but restarting: the template stands for
         // what `--init` installs, and no services run.
-        let mut boot = new_machine(&config, &prefix, clock.clone(), &wake)?;
+        let audio = adv_device::AudioControl::new(true);
+        let mut boot = new_machine(&config, &prefix, clock.clone(), &wake, &audio)?;
         let command_line = format!("\"{WINEBOOT}\" --restart");
         let startup = Startup {
             image: WINEBOOT,
@@ -346,7 +355,7 @@ impl Session {
         }
         drop(boot);
 
-        let mut machine = new_machine(&config, &prefix, clock, &wake)?;
+        let mut machine = new_machine(&config, &prefix, clock, &wake, &audio)?;
         prepare(&mut machine)?;
         let startup = Startup {
             image: &format!(r"D:\{name}"), // privacy: allow the guest's drive for the game
@@ -369,7 +378,11 @@ impl Session {
             Box::new(shared),
         )
         .map_err(|e| e.to_string())?;
-        Ok(Session { machine, wake })
+        Ok(Session {
+            machine,
+            wake,
+            audio,
+        })
     }
 
     /// Run the guest until it exits or `until` passes; see [`run`].
@@ -384,6 +397,10 @@ impl Session {
         self.machine.visit_context(None, adv_nt::server::run)?;
         self.wake.signal();
         Ok(())
+    }
+
+    pub fn audio_stream(&self) -> adv_device::AudioStream {
+        self.audio.stream()
     }
 
     /// The latest frame [`Session::capture`] took.
