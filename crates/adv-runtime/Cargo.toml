@@ -28,6 +28,10 @@ iced-x86 = { version = "1.21", default-features = false, features = ["std", "dec
 adv-nt = { path = "../adv-nt" }
 adv-unix = { path = "../adv-unix" }
 
+[target.'cfg(target_vendor = "apple")'.dependencies]
+adv-wineserver = { path = "../adv-wineserver" }
+log.workspace = true
+
 [dev-dependencies]
 encoding_rs.workspace = true
 unicorn-engine.workspace = true
@@ -37,9 +41,8 @@ iced-x86 = { version = "1.21", default-features = false, features = ["std", "cod
 png = "0.17"
 
 [target.'cfg(target_vendor = "apple")'.dev-dependencies]
-adv-wineserver = { path = "../adv-wineserver" }
 libc = "0.2"
-log.workspace = true
+pollster = "0.4"
 
 [lints]
 workspace = true

@@ -288,6 +288,7 @@ dependencies = [
  "libc",
  "log",
  "png 0.17.16",
+ "pollster",
  "unicorn-engine",
 ]
 

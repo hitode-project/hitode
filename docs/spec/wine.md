@@ -190,3 +190,15 @@ FreeType is such a library: win32u opens it by name and draws TrueType text thro
 
 **Rule**: Our Direct3D 9 MUST load as a PE image in place of Wine's. Its surface DCs MUST be memory DCs that call GDI through its own IAT. A presented back buffer MUST reach the presenter.
 **Verification**: Test
+
+## Sessions
+
+### WINE-SES-1 Kept prefix
+
+**Rule**: A session MUST keep its prefix between runs. Each start MUST relink system32 to the Wine installation and drive D: to the program's directory.
+**Verification**: Test
+
+### WINE-SES-2 Host wakes
+
+**Rule**: While every guest context waits, a session MUST serve finished host work before it blocks. A host wake MUST end the block. The run loop MUST take the wake's interrupt before it drains host work.
+**Verification**: Test

@@ -48,6 +48,7 @@ The dependency arrows, pointing at what is depended on:
 adv-shell → adv-runtime → adv-win32 → adv-os → adv-abi → adv-machine → adv-cpu
 adv-runtime → adv-dx → adv-abi / adv-device
 adv-runtime → adv-unix → adv-nt (the Wine userland)
+adv-runtime → adv-wineserver (a Wine session connects the server to adv-nt)
 adv-dx → adv-os (transitional: fronts other than DirectDraw and D3D9)
 adv-cpu → adv-cpu-x64 (x86_64) / adv-cpu-a64 (AArch64) → adv-cpu-core
 adv-win32 / adv-dx / adv-shell → adv-device

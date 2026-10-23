@@ -20,6 +20,8 @@ use adv_pe::{ImportModule, ImportName};
 use crate::graphics::{frame_completed, guest_memory, install_store};
 
 pub mod driver;
+#[cfg(target_vendor = "apple")]
+pub mod session;
 mod surface;
 
 /// The display driver to name in the process's startup parameters.

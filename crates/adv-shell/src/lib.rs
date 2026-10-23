@@ -30,6 +30,8 @@ mod session;
 mod software_frame;
 mod survey;
 pub mod window;
+#[cfg(target_os = "macos")]
+mod wine;
 #[cfg(host_view)]
 pub use session::Session;
 
@@ -68,6 +70,8 @@ pub struct Options {
     pub cdroms: Vec<(char, PathBuf)>,
     pub install_dir: Option<PathBuf>,
     jit: bool,
+    /// The Wine installation to run on, in place of the built-in stack.
+    wine: Option<PathBuf>,
     compile_strategy: CompileStrategy,
     region_linking: bool,
     async_compilation: bool,
@@ -126,6 +130,7 @@ const HELP: &str = "adv-run <EXE> [options]\n\
   --hidden                create a hidden host window for frontend tests\n\
   --gpu-software          select a software GPU adapter for diagnostics\n\
   --headless-gpu         opt in to a GPU frontend without a window\n\
+  --wine DIST             run on the Wine userland installed in DIST (macOS, headless)\n\
   --d3d9-sm3             opt in to the SM3 capability milestone (default: off)\n\
   --d3d9-shader-cache PATH opt in to a bounded local WGSL disk cache\n\
   --width N --height N    initial guest canvas (default: 640 x 480)\n\
@@ -165,6 +170,7 @@ impl Options {
             cdroms: Vec::new(),
             install_dir: None,
             jit: true,
+            wine: None,
             compile_strategy: CompileStrategy::Fast,
             region_linking: true,
             async_compilation: true,
@@ -236,6 +242,8 @@ impl Options {
                     }
                     options.cdroms.push((letter, PathBuf::from(path)));
                 }
+                #[cfg(target_os = "macos")]
+                "--wine" => options.wine = Some(PathBuf::from(value()?)),
                 "--install-dir" => options.install_dir = Some(PathBuf::from(value()?)),
                 "--no-time-skip" => options.time_skip = false,
                 "--api-mode" => {
@@ -1230,6 +1238,10 @@ fn run(options: Options) -> Result<u8, String> {
     #[cfg(not(any(host_view, feature = "gpu")))]
     if options.gpu_software {
         return Err("software GPU diagnostics require a GPU-enabled build".into());
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(dist) = &options.wine {
+        return wine::run(&options, dist);
     }
     #[cfg(target_os = "macos")]
     if !options.headless {
