@@ -5,13 +5,12 @@
   import EditTitle from "./EditTitle.svelte";
   let editing = $state(false);
   import Icon from "./Icon.svelte";
-  import ManageSaves from "./ManageSaves.svelte";
-  import { canReveal, reveal } from "../lib/reveal";
+  import { canReveal, reveal, revealC } from "../lib/reveal";
   import { library } from "../lib/library.svelte";
   import { nav } from "../lib/nav.svelte";
   import type { Game } from "../lib/types";
 
-  // The phone "更多操作" sheet over the game detail page, and the 存档 page it opens.
+  // The phone "更多操作" sheet over the game detail page.
   interface Props {
     game: Game;
     onclose: () => void;
@@ -21,9 +20,9 @@
 
   let { game, onclose, onremoved }: Props = $props();
 
-  let view = $state<"menu" | "confirm" | "saves">("menu");
+  let view = $state<"menu" | "confirm">("menu");
 
-  // The back gesture closes the sheet, or leaves the saves page for the detail page.
+  // The back gesture closes the sheet.
   $effect(() =>
     nav.onBack(() => {
       onclose();
@@ -33,7 +32,7 @@
 
   let sheet = $state<HTMLElement>();
   $effect(() => {
-    if (view !== "saves") sheet?.focus();
+    sheet?.focus();
   });
 
   function onkeydown(e: KeyboardEvent) {
@@ -53,7 +52,6 @@
     onremoved();
   }
 
-  function openSaves() { view = "saves"; }
 </script>
 
 {#if metadata}<Vndb {game} {onclose} />{/if}
@@ -61,8 +59,7 @@
 {#if editing}<EditTitle {game} {onclose} />{/if}
 
 <div class="pm">
-  {#if view !== "saves"}
-    <button class="scrim" aria-label={t("关闭")} onclick={onclose}></button>
+  <button class="scrim" aria-label={t("关闭")} onclick={onclose}></button>
     <div class="sheet" role="dialog" aria-modal="true" aria-label={t("更多操作")} tabindex="-1" bind:this={sheet} {onkeydown}>
       <div class="grab" aria-hidden="true"></div>
       {#if view === "menu"}
@@ -93,9 +90,9 @@
             <span>{t("隐藏封面")}</span>
             <span class="r ck" class:on={game.nsfw}><Icon name="check" size={20} stroke={1.7} /></span>
           </button>
-          <button class="si" role="menuitem" aria-haspopup="dialog" onclick={openSaves}>
+          <button class="si" role="menuitem" onclick={() => { revealC(); onclose(); }}>
             <svg class="ic" width="20" height="20" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="2.8" width="12" height="3.4" rx="1"></rect><path d="M3 6.2v6.3A1.5 1.5 0 0 0 4.5 14h7a1.5 1.5 0 0 0 1.5-1.5V6.2M6.5 9h3"></path></svg>
-            <span>{t("存档…")}</span>
+            <span>{t("打开 C 盘")}</span>
           </button>
           <button class="si" role="menuitem" onclick={() => go(() => nav.go({ name: "report", gameId: game.id }))}>
             <svg class="ic" width="20" height="20" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3.5 14V2.5M3.5 3h8.2l-1.7 3 1.7 3H3.5"></path></svg>
@@ -117,9 +114,6 @@
         <button class="cancel" onclick={() => (view = "menu")}>{t("取消")}</button>
       {/if}
     </div>
-  {:else}
-    <ManageSaves {game} {onclose} />
-  {/if}
 </div>
 
 <style>

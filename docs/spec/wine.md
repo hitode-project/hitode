@@ -252,9 +252,9 @@ FreeType is such a library: win32u opens it by name and draws TrueType text thro
 
 ## Sessions
 
-### WINE-SES-1 Kept prefix
+### WINE-SES-1 Shared prefix
 
-**Rule**: A session MUST keep its prefix between runs. Each start MUST relink system32, and the template's module copies, to the Wine installation and drive D: to the program's directory.
+**Rule**: Every game MUST run on the player's one prefix, kept between runs, with drive C: inside it or where the embedder places it. Each start MUST relink system32 and the template's module copies to the Wine installation. Drive D: MUST be the program's directory, which the guest writes in place.
 **Verification**: Test
 
 ### WINE-SES-2 Host wakes

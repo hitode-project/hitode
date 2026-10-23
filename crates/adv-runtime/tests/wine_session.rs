@@ -27,7 +27,7 @@ fn a_session_runs_a_program_from_its_directory_and_presents() {
     std::fs::create_dir_all(&game).unwrap();
     std::fs::copy(probes.join("d3d9.exe"), game.join("d3d9.exe")).unwrap();
     // What an earlier run left: drive D: on another program's directory.
-    let devices = root.join("session/prefix/dosdevices");
+    let devices = root.join("session/dosdevices");
     std::fs::create_dir_all(&devices).unwrap();
     std::os::unix::fs::symlink(&probes, devices.join("d:")).unwrap();
 
@@ -39,7 +39,8 @@ fn a_session_runs_a_program_from_its_directory_and_presents() {
     let session_root = root.join("session");
     let config = Config {
         dist: &dist,
-        root: &session_root,
+        prefix: &session_root,
+        drive: None,
         exe: &game.join("d3d9.exe"),
         width: 640,
         height: 480,

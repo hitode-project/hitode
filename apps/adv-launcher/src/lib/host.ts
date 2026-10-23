@@ -92,6 +92,10 @@ export function pauseGame(paused: boolean): Promise<void> {
 export function stopGame(): Promise<void> {
   return call("stop_game", {}, undefined);
 }
+/** Opens drive C: of the Wine prefix, where games' other saved data is. */
+export function revealDrive(): Promise<void> {
+  return call("reveal_drive", {}, undefined);
+}
 export function revealPath(path: string): Promise<void> {
   return call("reveal_path", { path }, undefined);
 }

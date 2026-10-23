@@ -35,7 +35,8 @@ fn a_session_sees_the_template_user_and_the_virtual_machine() {
     let session_root = root.join("session");
     let config = Config {
         dist: &dist,
-        root: &session_root,
+        prefix: &session_root,
+        drive: None,
         exe: &game.join("identity.exe"),
         width: 640,
         height: 480,
@@ -48,7 +49,7 @@ fn a_session_sees_the_template_user_and_the_virtual_machine() {
     drop(stdout);
     let stop = session.run(Instant::now() + Duration::from_secs(60));
     drop(session);
-    let user_reg = std::fs::read_to_string(session_root.join("prefix/user.reg")).unwrap();
+    let user_reg = std::fs::read_to_string(session_root.join("user.reg")).unwrap();
 
     // SAFETY: output owns the read end of the pipe.
     assert_eq!(

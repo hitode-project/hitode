@@ -113,7 +113,8 @@ fn run_case() {
     let session_root = root.join("session");
     let config = Config {
         dist: &dist,
-        root: &session_root,
+        prefix: &session_root,
+        drive: None,
         exe: &game.join(&name),
         width: 1024,
         height: 768,

@@ -72,6 +72,11 @@ pub struct Options {
     jit: bool,
     /// The Wine installation to run on, in place of the built-in stack.
     wine: Option<PathBuf>,
+    /// The player's Wine prefix, which every game shares; next to the data
+    /// directory when none.
+    pub wine_prefix: Option<PathBuf>,
+    /// Where the prefix keeps drive C:, when not inside it.
+    pub wine_drive: Option<PathBuf>,
     compile_strategy: CompileStrategy,
     region_linking: bool,
     async_compilation: bool,
@@ -131,6 +136,7 @@ const HELP: &str = "adv-run <EXE> [options]\n\
   --gpu-software          select a software GPU adapter for diagnostics\n\
   --headless-gpu         opt in to a GPU frontend without a window\n\
   --wine DIST             run on the Wine userland installed in DIST (macOS)\n\
+  --wine-prefix PATH      the Wine prefix games share (default: beside the data dir)\n\
   --d3d9-sm3             opt in to the SM3 capability milestone (default: off)\n\
   --d3d9-shader-cache PATH opt in to a bounded local WGSL disk cache\n\
   --width N --height N    initial guest canvas (default: 640 x 480)\n\
@@ -171,6 +177,8 @@ impl Options {
             install_dir: None,
             jit: true,
             wine: None,
+            wine_prefix: None,
+            wine_drive: None,
             compile_strategy: CompileStrategy::Fast,
             region_linking: true,
             async_compilation: true,
@@ -244,6 +252,7 @@ impl Options {
                 }
                 #[cfg(target_os = "macos")]
                 "--wine" => options.wine = Some(PathBuf::from(value()?)),
+                "--wine-prefix" => options.wine_prefix = Some(PathBuf::from(value()?)),
                 "--install-dir" => options.install_dir = Some(PathBuf::from(value()?)),
                 "--no-time-skip" => options.time_skip = false,
                 "--api-mode" => {

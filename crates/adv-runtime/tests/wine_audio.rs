@@ -27,7 +27,8 @@ fn wine_audio_reaches_the_host_stream() {
     let (mut output, stdout) = unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) };
     let config = Config {
         dist: &dist,
-        root: &root,
+        prefix: &root,
+        drive: None,
         exe: &probes.join("audio.exe"),
         width: 640,
         height: 480,

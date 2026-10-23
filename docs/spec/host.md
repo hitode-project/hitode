@@ -215,11 +215,11 @@ Direct presentation requires Core Animation's `contentsOpaque` capability. Other
 **Applies to**: Launcher, macOS
 **Verification**: Review — the command runs on the AppKit main thread and requires a native session.
 
-### HOST-LIB-5 Saved data management
+### HOST-LIB-5 Drive C:
 
-**Rule**: Backups MUST include the game's independent data directory and registry, without modifying original game files. Restore and import MUST replace data only after copying the complete snapshot successfully, and MUST reject operations while a game runs. Automatic retention MUST preserve manual backups and obey the saved policy.
-**Applies to**: Launcher, macOS
-**Verification**: Test
+**Rule**: Games MUST write their own folders in place, and every game MUST share one Wine prefix in the app data directory. The launcher MUST open its drive C:, which holds what games write elsewhere, in the system file manager. iOS MUST keep drive C: in the app's Documents, and Android MUST serve it through a documents provider.
+**Applies to**: Launcher
+**Verification**: Review — the file managers run on a device.
 
 ### HOST-LIB-6 Playtime tracking
 

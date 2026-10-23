@@ -27,9 +27,12 @@ pub struct Config<'a> {
     /// The Wine installation: `lib/wine/i386-windows`, `i386-unix` and
     /// `share/wine/nls`.
     pub dist: &'a Path,
-    /// The session's own directory, which holds the prefix and the server's
-    /// runtime files.
-    pub root: &'a Path,
+    /// The player's prefix, which every game shares as one Windows user's
+    /// machine, and the server's runtime files.
+    pub prefix: &'a Path,
+    /// Drive C:, where the player finds what games write outside their
+    /// directory; the prefix's `drive_c` when none.
+    pub drive: Option<&'a Path>,
     pub exe: &'a Path,
     pub width: u32,
     pub height: u32,
@@ -132,9 +135,12 @@ fn link(source: &Path, target: &Path) -> Result<(), String> {
     std::os::unix::fs::symlink(source, target).map_err(|e| format!("{}: {e}", target.display()))
 }
 
-/// Create or refresh the prefix under `root`; returns it.
-fn prefix(config: &Config<'_>) -> Result<PathBuf, String> {
-    let prefix = config.root.join("prefix");
+/// Create or refresh the prefix; returns it and drive C:.
+fn prefix(config: &Config<'_>) -> Result<(PathBuf, PathBuf), String> {
+    let prefix = config.prefix.to_owned();
+    let drive = config
+        .drive
+        .map_or_else(|| prefix.join("drive_c"), Path::to_owned);
     let template = config.dist.join(TEMPLATE);
     if !template.join("system.reg").is_file() {
         return Err(format!(
@@ -148,9 +154,11 @@ fn prefix(config: &Config<'_>) -> Result<PathBuf, String> {
             std::fs::copy(template.join(file), prefix.join(file))
                 .map_err(|e| format!("{}: {e}", prefix.join(file).display()))?;
         }
-        copy_tree(&template.join("drive_c"), &prefix.join("drive_c"))?;
     }
-    let windows = prefix.join("drive_c/windows");
+    if !drive.join("windows").exists() {
+        copy_tree(&template.join("drive_c"), &drive)?;
+    }
+    let windows = drive.join("windows");
     for directory in [
         windows.join("system32"),
         windows.join("globalization/sorting"),
@@ -158,7 +166,10 @@ fn prefix(config: &Config<'_>) -> Result<PathBuf, String> {
     ] {
         std::fs::create_dir_all(&directory).map_err(|e| format!("{}: {e}", directory.display()))?;
     }
-    link(Path::new("../drive_c"), &prefix.join("dosdevices/c:"))?;
+    match config.drive {
+        Some(drive) => link(drive, &prefix.join("dosdevices/c:"))?,
+        None => link(Path::new("../drive_c"), &prefix.join("dosdevices/c:"))?,
+    }
     let game = config.exe.parent().ok_or("the program has no directory")?;
     link(game, &prefix.join("dosdevices/d:"))?;
     for directory in [MODULES, "share/wine/nls"] {
@@ -182,9 +193,12 @@ fn prefix(config: &Config<'_>) -> Result<PathBuf, String> {
         let (path, module) = line
             .split_once('\t')
             .ok_or_else(|| format!("links.tsv: {line}"))?;
-        link(&config.dist.join(MODULES).join(module), &prefix.join(path))?;
+        let path = path
+            .strip_prefix("drive_c/")
+            .ok_or_else(|| format!("links.tsv: {line}"))?;
+        link(&config.dist.join(MODULES).join(module), &drive.join(path))?;
     }
-    Ok(prefix)
+    Ok((prefix, drive))
 }
 
 /// A machine for one of the session's processes, with the graphics fronts
@@ -303,14 +317,14 @@ impl Session {
         let ntdll_path = config.dist.join("lib/wine/i386-windows/ntdll.dll");
         let ntdll =
             std::fs::read(&ntdll_path).map_err(|e| format!("{}: {e}", ntdll_path.display()))?;
-        let prefix = prefix(&config)?;
+        let (prefix, _) = prefix(&config)?;
 
         let mut clock = adv_machine::Clock::real();
         let time = GuestClock(Cell::new(Time::now(&mut clock)));
         let server = Server::start(
             &adv_wineserver::Config {
                 prefix: prefix.clone(),
-                server_dir: config.root.join("server"),
+                server_dir: config.prefix.join("server"),
                 install: config.dist.to_owned(),
                 debug: 0,
             },

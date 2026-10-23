@@ -6,7 +6,6 @@
   import EmptyLibrary from "../components/EmptyLibrary.svelte";
   import Icon from "../components/Icon.svelte";
   import ManageMenu from "../components/ManageMenu.svelte";
-  import ManageSaves from "../components/ManageSaves.svelte";
   import Vndb from "../components/Vndb.svelte";
   import EditTitle from "../components/EditTitle.svelte";
   import { bylineLabel, codepageLabel, lastPlayedLabel, playTimeLabel } from "../lib/format";
@@ -38,8 +37,8 @@
   let selectedId = $state<string | null>(library.takeFocus());
   /** The detail panel is a sheet over the grid on narrow windows. */
   let sheet = $state(false);
-  /** The "更多操作" menu or the saves dialog it opens. */
-  let popup = $state<"none" | "menu" | "saves" | "vndb" | "rename">("none");
+  /** The "更多操作" menu or a dialog it opens. */
+  let popup = $state<"none" | "menu" | "vndb" | "rename">("none");
   let moreButton = $state<HTMLButtonElement | null>(null);
 
   const items = $derived.by(() => {
@@ -107,7 +106,7 @@
   }
 
   function onkeydown(event: KeyboardEvent) {
-    // The menu and the saves dialog handle their own Escape.
+    // The menu and its dialogs handle their own Escape.
     if (event.key === "Escape" && popup === "none" && sheet) sheet = false;
   }
 </script>
@@ -245,7 +244,7 @@
                 <Icon name="more" />
               </button>
               {#if popup === "menu"}
-                <ManageMenu {game} onclose={closePopup} onsaves={() => (popup = "saves")}
+                <ManageMenu {game} onclose={closePopup}
                   onvndb={() => (popup = "vndb")} onrename={() => (popup = "rename")} onremove={() => remove(game)} />
               {/if}
             </div>
@@ -280,9 +279,7 @@
           {/if}
         </div>
       </aside>
-      {#if popup === "saves"}
-        <ManageSaves {game} onclose={closePopup} />
-      {:else if popup === "vndb"}
+      {#if popup === "vndb"}
         <Vndb {game} onclose={closePopup} />
       {:else if popup === "rename"}
         <EditTitle {game} onclose={closePopup} />

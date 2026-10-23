@@ -274,14 +274,11 @@ pub async fn start_game(
         .run_on_main_thread(move || {
             let started = HOST.with_borrow_mut(|host| {
                 let host = host.as_mut().unwrap();
-                if crate::saves::busy() {
-                    return Err("存档操作正在进行，请稍后启动".into());
-                }
                 if host.session.is_some() {
                     return Err("a game is already running".into());
                 }
-                let backup_data = data_dir.clone();
-                let options = playback.options(exe, data_dir, codepage)?;
+                let mut options = playback.options(exe, data_dir, codepage)?;
+                crate::drive::apply(host_window.app_handle(), &mut options)?;
                 let view = GameView::new(640, 480)?;
                 host.container.set_game(Some(&view));
                 let finished_window = host_window.clone();
@@ -298,7 +295,6 @@ pub async fn start_game(
                             host.exit.take().flatten()
                         });
                         let elapsed = started_at.elapsed();
-                        crate::saves::after_game(&finished_window, &backup_data);
                         crate::play::finished(&finished_window, id, result, elapsed);
                         if let Some(code) = exit {
                             finished_window.app_handle().exit(code);
@@ -539,8 +535,4 @@ pub fn game_fps() -> f64 {
             .and_then(|host| host.session.as_ref())
             .map_or(0.0, Session::fps)
     })
-}
-
-pub(crate) fn is_running() -> bool {
-    HOST.with_borrow(|host| host.as_ref().is_some_and(|host| host.session.is_some()))
 }

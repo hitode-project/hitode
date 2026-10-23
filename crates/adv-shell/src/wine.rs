@@ -21,11 +21,20 @@ struct Host {
 }
 
 fn start(options: &Options, dist: &Path, wake: WakeEvent, host: Host) -> Result<Session, String> {
-    let root = std::path::absolute(options.data_dir.join("wine")).map_err(|e| e.to_string())?;
+    let prefix = match &options.wine_prefix {
+        Some(prefix) => prefix.clone(),
+        None => options
+            .data_dir
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join("wine"),
+    };
+    let prefix = std::path::absolute(prefix).map_err(|e| e.to_string())?;
     let debug = std::env::var("WINEDEBUG").unwrap_or_default();
     let config = Config {
         dist,
-        root: &root,
+        prefix: &prefix,
+        drive: options.wine_drive.as_deref(),
         exe: &options.exe,
         width: options.width,
         height: options.height,

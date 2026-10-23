@@ -37,7 +37,8 @@ fn run(probe: &str, gpu: bool) {
     );
     let config = Config {
         dist: &dist,
-        root: &root,
+        prefix: &root,
+        drive: None,
         exe: &probes.join(probe),
         width: 640,
         height: 480,

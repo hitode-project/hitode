@@ -46,6 +46,26 @@ pub fn set_game_mode(app: &AppHandle, active: bool) -> tauri::Result<()> {
         })
 }
 
+/// Opens drive C: of the Wine prefix, which `DriveProvider` serves, in the
+/// system Files app.
+pub fn reveal_drive(app: &AppHandle) -> Result<(), String> {
+    app.get_webview_window("main")
+        .ok_or("no main window")?
+        .with_webview(move |webview| {
+            webview.jni_handle().exec(move |env, activity, _| {
+                match env
+                    .call_method(activity, "revealDrive", "()Z", &[])
+                    .and_then(|shown| shown.z())
+                {
+                    Ok(true) => {}
+                    Ok(false) => log::error!("revealDrive: no system Files app"),
+                    Err(error) => log::error!("revealDrive: {error}"),
+                }
+            });
+        })
+        .map_err(|e| e.to_string())
+}
+
 /// Opens `folder`, below the primary storage root, in the system Files app.
 pub fn reveal_folder(app: &AppHandle, folder: &std::path::Path) -> Result<(), String> {
     let relative = folder

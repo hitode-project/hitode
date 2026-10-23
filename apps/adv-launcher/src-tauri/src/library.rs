@@ -116,12 +116,6 @@ impl Library {
         let tmp = self.path.with_extension("json.tmp");
         fs::write(&tmp, serde_json::to_vec(&value)?).and_then(|()| fs::rename(tmp, &self.path))
     }
-    /// Save management (`saves.rs`) exists on the platforms that run games.
-    #[cfg(any(target_os = "macos", target_os = "android", target_os = "ios"))]
-    pub(crate) fn data_dir(&self, id: &str) -> io::Result<PathBuf> {
-        self.game(id)?;
-        Ok(self.path.parent().unwrap().join("games").join(id))
-    }
     pub(crate) fn game(&self, id: &str) -> io::Result<usize> {
         let index = self.games.iter().position(|g| g.id == id);
         index.ok_or_else(|| io::Error::other("game not found"))

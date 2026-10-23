@@ -28,7 +28,8 @@ fn a_waiting_program_publishes_its_frame_to_the_ui() {
     let session_root = root.join("session");
     let config = Config {
         dist: &dist,
-        root: &session_root,
+        prefix: &session_root,
+        drive: None,
         exe: &game.join("show.exe"),
         width: 640,
         height: 480,

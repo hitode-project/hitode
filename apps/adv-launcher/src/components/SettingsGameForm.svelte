@@ -3,18 +3,16 @@
   import { untrack } from "svelte";
   import Icon from "./Icon.svelte";
   import { device } from "../lib/device.svelte";
-  import ManageSaves from "./ManageSaves.svelte";
   import UpscalingSelect from "./UpscalingSelect.svelte";
   import SettingsSeg from "./SettingsSeg.svelte";
   import { revealFolder, type OverrideKey } from "../lib/fake-settings";
-  import { canReveal, reveal } from "../lib/reveal";
+  import { canReveal, reveal, revealC } from "../lib/reveal";
   import { nav } from "../lib/nav.svelte";
   import { GameForm } from "../lib/settings-form.svelte";
   import type { Game } from "../lib/types";
 
   let { game }: { game: Game } = $props();
 
-  let saves = $state(false);
 
   // The parent re-creates this form when the game changes.
   const form = new GameForm(untrack(() => game));
@@ -194,9 +192,9 @@
 
       <nav aria-label={t("更多")} style="display: flex; gap: 4px; margin: -8px 0 0 -10px">
         {#if device.gameView || device.simulated}
-          <button class="quiet" onclick={() => (saves = true)}>
+          <button class="quiet" onclick={revealC}>
             <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="2.8" width="12" height="3.4" rx="1"></rect><path d="M3 6.2v6.3A1.5 1.5 0 0 0 4.5 14h7a1.5 1.5 0 0 0 1.5-1.5V6.2M6.5 9h3"></path></svg>
-            <span>{t("存档…")}</span>
+            <span>{t("打开 C 盘")}</span>
           </button>
         {/if}
         {#if canReveal()}
@@ -223,9 +221,6 @@
   </div>
 </main>
 
-{#if saves}
-  <ManageSaves {game} onclose={() => (saves = false)} />
-{/if}
 
 <style>
   .sheet {

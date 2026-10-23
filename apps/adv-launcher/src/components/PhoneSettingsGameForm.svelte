@@ -1,7 +1,7 @@
 <script lang="ts">
+  import { revealC } from "../lib/reveal";
   import { t } from "../lib/i18n.svelte";
   import { untrack } from "svelte";
-  import ManageSaves from "./ManageSaves.svelte";
   import { device } from "../lib/device.svelte";
   import PhoneSettingsHeader from "./PhoneSettingsHeader.svelte";
   import UpscalingSelect from "./UpscalingSelect.svelte";
@@ -9,21 +9,11 @@
   import { revealFolder, type OverrideKey } from "../lib/fake-settings";
   import { prefs } from "../lib/prefs.svelte";
   import { library } from "../lib/library.svelte";
-  import { nav } from "../lib/nav.svelte";
   import { GameForm } from "../lib/settings-form.svelte";
   import type { Game } from "../lib/types";
 
   let { game }: { game: Game } = $props();
 
-  let saves = $state(false);
-  // The back gesture closes the saves dialog first.
-  $effect(() => {
-    if (!saves) return;
-    return nav.onBack(() => {
-      saves = false;
-      return true;
-    });
-  });
 
   // The parent re-creates this form when the game changes.
   const form = new GameForm(untrack(() => game));
@@ -197,9 +187,9 @@
 
     <nav aria-label={t("更多")} class="more">
       {#if device.gameView || device.simulated}
-        <button class="link" onclick={() => (saves = true)}>
+        <button class="link" onclick={revealC}>
           <svg class="ic" width="20" height="20" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="2.8" width="12" height="3.4" rx="1"></rect><path d="M3 6.2v6.3A1.5 1.5 0 0 0 4.5 14h7a1.5 1.5 0 0 0 1.5-1.5V6.2M6.5 9h3"></path></svg>
-          <span>{t("存档…")}</span>
+          <span>{t("打开 C 盘")}</span>
         </button>
       {/if}
       <button class="link" onclick={() => revealFolder(game.path)}>
@@ -216,9 +206,6 @@
   </main>
 </div>
 
-{#if saves}
-  <ManageSaves {game} onclose={() => (saves = false)} />
-{/if}
 
 <style>
   .screen {
