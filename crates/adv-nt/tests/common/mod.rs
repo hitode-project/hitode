@@ -7,15 +7,20 @@
 //! directory that holds the probes. Without them the tests are skipped.
 //! The server keeps its state in globals, so each test binary runs one
 //! probe.
+//!
+//! Time is virtual unless a probe needs threads that compute without
+//! waiting: then it is real, and the machine runs in slices so that its
+//! quantum interleaves them as a host scheduler would.
 
 use std::cell::Cell;
 use std::fs::File;
 use std::io::Read;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use adv_cpu::Cpu;
-use adv_machine::{Machine, RunResult, layout::PARK_ADDR};
+use adv_machine::{Machine, RunResult, SliceResult, layout::PARK_ADDR};
 use adv_nt::server::{Progress, Time};
 use adv_nt::{dispatch::Platform, params::Startup, process};
 use adv_wineserver::{Clock, Config, Server, State};
@@ -67,9 +72,9 @@ impl Progress for Runtime {
     }
 }
 
-/// Runs `name` from the probe directory to its end; none when the test
-/// is skipped.
-pub fn run_probe(name: &str) -> Option<(RunResult, String)> {
+/// Runs `name` from the probe directory to its end, on real time when
+/// `real_time`; none when the test is skipped.
+pub fn run_probe(name: &str, real_time: bool) -> Option<(RunResult, String)> {
     let _ = log::set_logger(&WineLog).map(|()| log::set_max_level(log::LevelFilter::Warn));
     let Some(dist) = std::env::var_os("ADV_WINE_DIST").map(PathBuf::from) else {
         eprintln!("skipped: ADV_WINE_DIST is not set");
@@ -113,7 +118,11 @@ pub fn run_probe(name: &str) -> Option<(RunResult, String)> {
         }
     }
     std::fs::copy(probes.join(name), prefix.join("drive_c").join(name)).unwrap();
-    let mut machine_clock = adv_machine::Clock::virtual_time();
+    let mut machine_clock = if real_time {
+        adv_machine::Clock::real()
+    } else {
+        adv_machine::Clock::virtual_time()
+    };
     let clock = GuestClock(Cell::new(Time::now(&mut machine_clock)));
     let config = Config {
         prefix: prefix.clone(),
@@ -158,10 +167,23 @@ pub fn run_probe(name: &str) -> Option<(RunResult, String)> {
     drop(stdout);
     assert_ne!(started.thread.pid, 0);
 
-    // Time is virtual: when every context waits, it moves to the earliest
-    // deadline.
+    // When every context waits, virtual time moves to the earliest deadline
+    // and real time sleeps until it.
     let result = loop {
-        match machine.run() {
+        let result = if real_time {
+            match machine.run_slice(Duration::from_millis(10)) {
+                SliceResult::Yielded => continue,
+                SliceResult::Complete(result) => result,
+            }
+        } else {
+            machine.run()
+        };
+        match result {
+            RunResult::Idle {
+                next_deadline: Some(deadline),
+            } if real_time => std::thread::sleep(Duration::from_micros(
+                deadline.saturating_sub(machine.sys.clock.now_us()),
+            )),
             RunResult::Idle {
                 next_deadline: Some(deadline),
             } => machine.sys.clock.advance_to(deadline),

@@ -978,6 +978,33 @@ impl Request for InitThreadRequest {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
+pub struct SuspendThreadRequest {
+    pub header: RequestHeader,
+    pub handle: u32,
+}
+const _: () = assert!(size_of::<SuspendThreadRequest>() == 16);
+const _: () = assert!(std::mem::offset_of!(SuspendThreadRequest, handle) == 12);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SuspendThreadReply {
+    pub header: ReplyHeader,
+    pub count: i32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<SuspendThreadReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(SuspendThreadReply, count) == 8);
+
+impl Request for SuspendThreadRequest {
+    const NUMBER: i32 = 17;
+    type Reply = SuspendThreadReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct ResumeThreadRequest {
     pub header: RequestHeader,
     pub handle: u32,

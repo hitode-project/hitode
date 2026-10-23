@@ -296,7 +296,7 @@ fn wake_up(env: &mut Env<'_>, mut select: Select, then: Then) -> Outcome {
         Err(error) => status::finish(Err(error)),
         // The thread was killed while it waited.
         Ok(Some(wake_up)) if wake_up.cookie == 0 => {
-            server::end_thread(env);
+            server::end_thread(env, env.context);
             Outcome::ExitThread(wake_up.signaled)
         }
         Ok(Some(wake_up)) if wake_up.cookie != select.cookie => Outcome::Fail(format!(

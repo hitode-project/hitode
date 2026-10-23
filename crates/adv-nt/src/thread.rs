@@ -4,14 +4,17 @@
 //! server. Wine registers a new thread from its own host thread when that
 //! first runs; here guest threads share the host thread, so the creating
 //! system call registers it, and a thread the server holds suspended waits
-//! in the machine until it is resumed.
+//! in the machine until it is resumed. Wine stops and kills other threads
+//! with signals; here the system call that asks suspends or ends the
+//! thread's context directly.
 
-use adv_machine::{Env, Outcome};
+use adv_machine::{CtxId, Env, Outcome};
 
 use crate::object::{Attributes, read_u32, write_bytes, write_u32};
 use crate::process;
 use crate::protocol::{
-    GetThreadInfoRequest, NewThreadRequest, ResumeThreadRequest, TerminateThreadRequest,
+    GetThreadInfoRequest, NewThreadRequest, ResumeThreadRequest, SuspendThreadRequest,
+    TerminateThreadRequest,
 };
 use crate::server;
 use crate::status::{self, Error};
@@ -117,6 +120,44 @@ fn update_attribute_list(env: &mut Env<'_>, list: u32, tid: u32, teb: u32) -> Re
     Ok(())
 }
 
+/// The context of the thread `handle` names, if it is one of ours.
+fn context_of(env: &mut Env<'_>, handle: u32) -> Result<Option<CtxId>, Error> {
+    let mut info = GetThreadInfoRequest {
+        handle,
+        ..Default::default()
+    };
+    let (info, _) = server::request(env, &mut info, &[], &mut [])?;
+    status::check(info.header.error)?;
+    Ok(server::context_of(env, info.tid))
+}
+
+/// NtSuspendThread(thread, *previous_count)
+pub fn suspend(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    let &[thread, previous] = args else {
+        unreachable!()
+    };
+    status::finish((|| {
+        let mut request = SuspendThreadRequest {
+            handle: thread,
+            ..Default::default()
+        };
+        let (reply, _) = server::request(env, &mut request, &[], &mut [])?;
+        status::check(reply.header.error)?;
+        if reply.count == 0
+            && let Some(context) = context_of(env, thread)?
+        {
+            if context == env.context {
+                return Err(Error::Unsupported("a thread suspending itself".into()));
+            }
+            env.sys.suspend_context(context);
+        }
+        if previous != 0 {
+            write_u32(env, previous, reply.count as u32)?;
+        }
+        Ok(())
+    })())
+}
+
 /// NtResumeThread(thread, *previous_count)
 pub fn resume(env: &mut Env<'_>, args: &[u32]) -> Outcome {
     let &[thread, previous] = args else {
@@ -129,16 +170,10 @@ pub fn resume(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         };
         let (reply, _) = server::request(env, &mut request, &[], &mut [])?;
         status::check(reply.header.error)?;
-        if reply.count == 1 {
-            let mut info = GetThreadInfoRequest {
-                handle: thread,
-                ..Default::default()
-            };
-            let (info, _) = server::request(env, &mut info, &[], &mut [])?;
-            status::check(info.header.error)?;
-            if let Some(context) = server::context_of(env, info.tid) {
-                env.sys.resume_context(context);
-            }
+        if reply.count == 1
+            && let Some(context) = context_of(env, thread)?
+        {
+            env.sys.resume_context(context);
         }
         if previous != 0 {
             write_u32(env, previous, reply.count as u32)?;
@@ -169,8 +204,15 @@ pub fn terminate(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         current = reply.self_ != 0;
     }
     if !current {
-        return Outcome::Fail("ending another thread".into());
+        // The server has killed the thread; its context ends where it stands.
+        return status::finish((|| {
+            if let Some(context) = context_of(env, thread)? {
+                server::end_thread(env, context);
+                env.sys.terminate_context(context, exit_code);
+            }
+            Ok(())
+        })());
     }
-    server::end_thread(env);
+    server::end_thread(env, env.context);
     Outcome::ExitThread(exit_code)
 }

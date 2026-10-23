@@ -53,6 +53,7 @@ REQUESTS = [
     "event_op",
     "new_thread",
     "init_thread",
+    "suspend_thread",
     "resume_thread",
     "terminate_thread",
     "queue_apc",

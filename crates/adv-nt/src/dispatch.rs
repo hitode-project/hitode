@@ -58,6 +58,7 @@ const IMPLEMENTED: &[(&str, Syscall)] = &[
     ("NtSetEvent", sync::set_event),
     ("NtSetValueKey", registry::set_value),
     ("NtTerminateProcess", process::terminate),
+    ("NtSuspendThread", thread::suspend),
     ("NtTerminateThread", thread::terminate),
     ("NtUnmapViewOfSection", section::unmap_view),
     ("NtWaitForMultipleObjects", sync::wait_multiple),

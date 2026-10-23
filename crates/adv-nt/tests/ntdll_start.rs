@@ -7,9 +7,10 @@ mod common;
 
 use adv_machine::RunResult;
 
+// spec: WINE-SRV-2, WINE-SRV-3, WINE-SYS-2
 #[test]
 fn the_probe_starts_waits_and_resumes() {
-    let Some((result, output)) = common::run_probe("gate1.exe") else {
+    let Some((result, output)) = common::run_probe("gate1.exe", false) else {
         return;
     };
     // It exits with 0 only when every step did what Windows does.

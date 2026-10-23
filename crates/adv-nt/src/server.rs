@@ -344,11 +344,10 @@ pub fn init_thread(
     Ok(answer.suspend != 0)
 }
 
-/// Forgets the current thread, which is ending: the server sees its pipes
-/// close and ends the thread, waking whoever waits for it.
-pub fn end_thread(env: &mut Env<'_>) {
+/// Forgets the thread of `context`, which is ending: the server sees its
+/// pipes close and ends the thread, waking whoever waits for it.
+pub fn end_thread(env: &mut Env<'_>, context: CtxId) {
     set_time(env);
-    let context = env.context;
     let Some(link) = env.ext.try_get_mut::<Link>() else {
         return;
     };
