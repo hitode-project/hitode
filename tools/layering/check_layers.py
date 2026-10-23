@@ -24,7 +24,7 @@ RULES: dict[str, set[str]] = {
     "adv-cpu-a64": {"adv-cpu-core"},
     "adv-cpu": {"adv-cpu-x64", "adv-cpu-a64"},
     "adv-machine": {"adv-cpu", "adv-sync"},
-    "adv-abi": {"adv-machine", "adv-abi-macros"},
+    "adv-abi": {"adv-machine", "adv-pe", "adv-abi-macros"},
     "adv-abi-macros": set(),
     "adv-os": {"adv-abi", "adv-pe"},
     "adv-device": {"adv-sync"},
@@ -36,7 +36,7 @@ RULES: dict[str, set[str]] = {
     # its protocol, so the server crate is a test dependency only.
     "adv-nt": {"adv-machine", "adv-pe"},
     # Wine's Unix libraries as guest ELF code, over the NT platform.
-    "adv-unix": {"adv-nt"},
+    "adv-unix": {"adv-nt", "adv-abi"},
     "adv-runtime": {"adv-win32", "adv-dx"},
     "adv-shell": {"adv-runtime", "adv-device", "adv-sync", "adv-report"},
     "adv-run": {"adv-shell"},

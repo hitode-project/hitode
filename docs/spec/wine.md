@@ -72,6 +72,11 @@ This spec covers the Wine userland stack. `adv-wineserver` runs Wine's server in
 
 Entries carry no 8.3 names, as on a volume that does not make them.
 
+### WINE-SYS-7 Instruction coherence
+
+**Rule**: For the current process, `NtFlushInstructionCache` MUST return success after prior guest writes become visible to instruction execution.
+**Verification**: Test
+
 ## Unix libraries
 
 ### WINE-UNIX-1 Guest ELF libraries
@@ -125,4 +130,21 @@ FreeType is such a library: win32u opens it by name and draws TrueType text thro
 ### WINE-TIME-1 Shared clock page
 
 **Rule**: The clocks in KUSER_SHARED_DATA MUST be refreshed as each system call enters and before each context runs. A guest that polls the page without a system call MUST see time pass.
+**Verification**: Test
+
+## Host DLL images
+
+### WINE-DLL-1 Loader-owned entries
+
+**Rule**: Host DLL exports MUST point inside an i386 PE32 image that Wine's loader maps. Entries MUST use their registered calling conventions and machine bindings without storing host addresses, at any load base.
+**Verification**: Test
+
+### WINE-DLL-2 Ordinary import calls
+
+**Rule**: Host DLL import calls MUST read the image's IAT slot at call time and enter its target through `Outcome::call` and a continuation. Guest changes to the slot or target entry MUST intercept the call.
+**Verification**: Test
+
+### WINE-DLL-3 Prefix installation
+
+**Rule**: Host DLL installation MUST replace the prefix's system32 entry with a PE file carrying Wine's builtin signature. Installation MUST NOT modify the Wine distribution or follow an existing file symlink when writing.
 **Verification**: Test

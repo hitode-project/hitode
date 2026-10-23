@@ -617,3 +617,14 @@ pub fn section_protection(characteristics: u32) -> u32 {
 pub fn guest_protection(memory: &Memory, protection: u32) -> Prot {
     memory.prot(protection).unwrap_or(Prot(0))
 }
+
+/// NtFlushInstructionCache(process, address, size). Every guest store already
+/// commits through the CPU's code-mutation barrier before execution resumes.
+pub fn flush_instruction_cache(_env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    if args[0] != CURRENT_PROCESS {
+        return Outcome::Fail(
+            "flushing another process's instruction cache is not supported".into(),
+        );
+    }
+    Outcome::Return(status::SUCCESS)
+}

@@ -1,4 +1,5 @@
 //! x86 calling conventions, generated signatures, typed guest values and API diagnostics.
+//! [`dll`] writes host-module PE images and calls their guest imports.
 //! API behavior belongs to adv-win32/adv-dx; this crate never owns their state.
 //!
 //! Pointer parameters cannot accidentally become raw integer arguments:
@@ -24,6 +25,7 @@ pub use adv_machine::{EnvLeafHandler, LeafEnv, LeafHandler};
 pub mod capability;
 pub mod code_signature;
 pub mod constants;
+pub mod dll;
 pub mod guest;
 pub mod ordinals;
 pub mod personality;

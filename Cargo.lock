@@ -15,6 +15,7 @@ dependencies = [
  "adv-abi-macros",
  "adv-cpu",
  "adv-machine",
+ "adv-pe",
  "adv-unicorn",
  "bytemuck",
  "iced-x86",
@@ -339,9 +340,11 @@ dependencies = [
 name = "adv-unix"
 version = "0.1.2"
 dependencies = [
+ "adv-abi",
  "adv-cpu",
  "adv-machine",
  "adv-nt",
+ "adv-pe",
  "adv-wineserver",
  "libc",
  "log",

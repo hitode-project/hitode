@@ -9,6 +9,7 @@
 //! host functions.
 #![cfg(unix)]
 
+pub mod builtin;
 pub mod elf;
 mod file;
 mod libc;

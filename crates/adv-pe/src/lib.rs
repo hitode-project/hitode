@@ -1,4 +1,4 @@
-//! PE32 image parsing: headers, sections, base relocations, imports, delay imports, TLS,
+//! PE32 image writing and parsing: headers, sections, base relocations, imports, delay imports, TLS,
 //! exports, and the resource tree.
 //!
 //! [`Pe::parse`] builds the image as the Windows loader would lay it out in memory
@@ -7,6 +7,7 @@
 //! binds the same buffer and copies it into guest memory in one write.
 
 mod resource;
+pub mod write;
 
 use thiserror::Error;
 

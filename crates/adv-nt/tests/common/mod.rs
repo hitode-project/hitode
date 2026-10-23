@@ -82,11 +82,22 @@ pub fn run_probe(name: &str, real_time: bool) -> Option<(RunResult, String)> {
 
 /// [`run_probe`] on a machine with `resolver`, which `prepare` sets up
 /// before the process starts.
+#[allow(dead_code, reason = "each test binary uses one of the entries")]
 pub fn run_probe_on(
     name: &str,
     real_time: bool,
     resolver: impl Resolver,
     prepare: impl FnOnce(&mut Machine<Cpu>),
+) -> Option<(RunResult, String)> {
+    run_probe_with_prefix(name, real_time, resolver, |machine, _| prepare(machine))
+}
+
+/// Prepares machine bindings and files in the session's prefix before startup.
+pub fn run_probe_with_prefix(
+    name: &str,
+    real_time: bool,
+    resolver: impl Resolver,
+    prepare: impl FnOnce(&mut Machine<Cpu>, &std::path::Path),
 ) -> Option<(RunResult, String)> {
     let _ = log::set_logger(&WineLog).map(|()| log::set_max_level(log::LevelFilter::Warn));
     let Some(dist) = std::env::var_os("ADV_WINE_DIST").map(PathBuf::from) else {
@@ -151,7 +162,7 @@ pub fn run_probe_on(
 
     let cpu = Cpu::new(PARK_ADDR, false).unwrap();
     let mut machine = Machine::new(cpu, resolver, machine_clock).unwrap();
-    prepare(&mut machine);
+    prepare(&mut machine, &prefix);
     let mut fds = [0; 2];
     // SAFETY: fds has room for both ends.
     assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
