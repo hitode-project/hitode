@@ -1,6 +1,7 @@
-//! Read-only views of a running [`Runtime`] for the interactive debugger.
+//! Read-only views of either runtime stack for the interactive debugger.
 //! They only read guest state, so they are safe at any guest boundary.
-use adv_cpu::backend::{Backend, GuestExt, Reg};
+use adv_cpu::Engine;
+use adv_cpu::backend::{Backend, Guest, GuestExt, Reg};
 
 use crate::boot::Runtime;
 
@@ -46,78 +47,6 @@ impl<B: Backend> Runtime<B> {
             .map(|(base, size, kind, name)| format!("{base:#010x} {size:#010x} {kind:<8} {name}"))
             .collect::<Vec<_>>()
             .join("\n")
-    }
-
-    /// Whether `address` follows a CALL in an image module, so a stack word
-    /// holding it is a return address rather than data.
-    fn after_call(&self, address: u32) -> bool {
-        let in_image = adv_os::modules(&self.machine.ext)
-            .iter()
-            .any(|(_, m)| m.kind == adv_os::module::ModuleKind::Image && m.contains(address));
-        if !in_image || address < 7 {
-            return false;
-        }
-        let mut bytes = [0u8; 7];
-        if self.machine.cpu.read(address - 7, &mut bytes).is_err() {
-            return false;
-        }
-        // CALL rel32; CALL r/m32 (FF /2) with no, 8-bit or 32-bit displacement,
-        // absolute or with a SIB byte.
-        let call = |modrm: u8| modrm & 0x38 == 0x10;
-        bytes[2] == 0xe8
-            || (bytes[5] == 0xff && call(bytes[6]) && bytes[6] >> 6 == 3)
-            || (bytes[5] == 0xff
-                && call(bytes[6])
-                && bytes[6] >> 6 == 0
-                && bytes[6] & 7 != 4
-                && bytes[6] & 7 != 5)
-            || (bytes[4] == 0xff && call(bytes[5]) && bytes[5] >> 6 == 1)
-            || (bytes[4] == 0xff && call(bytes[5]) && bytes[5] >> 6 == 0 && bytes[5] & 7 == 4)
-            || (bytes[3] == 0xff && call(bytes[4]) && bytes[4] >> 6 == 1 && bytes[4] & 7 == 4)
-            || (bytes[1] == 0xff && call(bytes[2]) && (bytes[2] >> 6 == 2 || bytes[2] & 0xc7 == 5))
-            || (bytes[0] == 0xff && call(bytes[1]) && bytes[1] >> 6 == 2 && bytes[1] & 7 == 4)
-    }
-
-    /// Likely return addresses on guest thread `context`'s stack, innermost
-    /// first: words after a CALL in an image module. A blocked thread is read
-    /// from its parked host call; the running thread from ESP.
-    pub fn stack_scan(&self, context: u32, frames: usize) -> Result<String, String> {
-        let sys = &self.machine.sys;
-        let ctx = sys
-            .contexts
-            .iter()
-            .find(|c| c.id == context)
-            .ok_or_else(|| format!("no guest context {context}"))?;
-        let esp = match ctx.blocked_stack() {
-            Some(esp) => esp,
-            None if sys.current == context && !ctx.is_done() => self.machine.cpu.reg(Reg::Esp),
-            None => return Err(format!("context {context} has no saved stack pointer")),
-        };
-        let top = if ctx.stack_hi > esp {
-            ctx.stack_hi
-        } else {
-            esp.saturating_add(STACK_SCAN_WORDS * 4)
-        };
-        let mut rows = vec![format!(
-            "context {context} esp {esp:#010x} stack [{:#010x}, {:#010x})",
-            ctx.stack_lo, ctx.stack_hi
-        )];
-        let mut address = esp;
-        while address < top && rows.len() <= frames && address - esp < STACK_SCAN_WORDS * 4 {
-            let Ok(word) = self.machine.cpu.read_u32(address) else {
-                rows.push(format!("  esp+{:#06x} <unmapped>", address - esp));
-                break;
-            };
-            if self.after_call(word) {
-                rows.push(format!(
-                    "  esp+{:#06x} {word:#010x} {}",
-                    address - esp,
-                    self.guest_place(word)
-                ));
-            }
-            address += 4;
-        }
-        Ok(rows.join("\n"))
     }
 
     /// Capability gaps the guest hit: unavailable and missing APIs, stub
@@ -176,9 +105,116 @@ impl<B: Backend> Runtime<B> {
         }
         rows.join("\n")
     }
+}
+
+/// Stack-specific observations used by the shared live debugger. Reads happen
+/// on the execution owner at guest boundaries.
+pub trait DebugTarget {
+    type Backend: Backend;
+    fn machine(&self) -> &adv_machine::Machine<Self::Backend>;
+    fn guest_place(&self, address: u32) -> String;
+    fn modules_report(&self) -> String;
+    fn image_ranges(&self) -> Result<Vec<(u32, u32)>, String>;
+    /// Whether historical samples can be assigned to this process.
+    fn profile_process_known(&self) -> bool {
+        true
+    }
+    fn profile_place(&self, address: u32) -> String {
+        self.guest_place(address)
+    }
+    fn calls_report(&self, count: usize) -> String {
+        self.machine().sys.recent_calls_tail(count).join("\n")
+    }
+    fn debug_counters(&self) -> [u64; 3]
+    where
+        Self::Backend: adv_cpu::Engine,
+    {
+        let cpu = self.machine().cpu.counters();
+        [
+            self.machine().sys.host_calls,
+            cpu.native_entries,
+            cpu.interpreter_entries,
+        ]
+    }
+    fn contexts_report(&self) -> String;
+    fn api_gaps_report(&self) -> String;
+    fn report(&self) -> String;
+
+    /// Whether `address` follows a CALL in an image module, so a stack word
+    /// holding it is a return address rather than data.
+    fn after_call(&self, address: u32, images: &[(u32, u32)]) -> bool {
+        let in_image = images
+            .iter()
+            .any(|&(base, size)| address.wrapping_sub(base) < size);
+        if !in_image || address < 7 {
+            return false;
+        }
+        let mut bytes = [0u8; 7];
+        if self.machine().cpu.read(address - 7, &mut bytes).is_err() {
+            return false;
+        }
+        // CALL rel32; CALL r/m32 (FF /2) with no, 8-bit or 32-bit displacement,
+        // absolute or with a SIB byte.
+        let call = |modrm: u8| modrm & 0x38 == 0x10;
+        bytes[2] == 0xe8
+            || (bytes[5] == 0xff && call(bytes[6]) && bytes[6] >> 6 == 3)
+            || (bytes[5] == 0xff
+                && call(bytes[6])
+                && bytes[6] >> 6 == 0
+                && bytes[6] & 7 != 4
+                && bytes[6] & 7 != 5)
+            || (bytes[4] == 0xff && call(bytes[5]) && bytes[5] >> 6 == 1)
+            || (bytes[4] == 0xff && call(bytes[5]) && bytes[5] >> 6 == 0 && bytes[5] & 7 == 4)
+            || (bytes[3] == 0xff && call(bytes[4]) && bytes[4] >> 6 == 1 && bytes[4] & 7 == 4)
+            || (bytes[1] == 0xff && call(bytes[2]) && (bytes[2] >> 6 == 2 || bytes[2] & 0xc7 == 5))
+            || (bytes[0] == 0xff && call(bytes[1]) && bytes[1] >> 6 == 2 && bytes[1] & 7 == 4)
+    }
+
+    /// Likely return addresses on guest thread `context`'s stack, innermost
+    /// first: words after a CALL in an image module. A blocked thread is read
+    /// from its parked host call; the running thread from ESP.
+    fn stack_scan(&self, context: u32, frames: usize) -> Result<String, String> {
+        let sys = &self.machine().sys;
+        let ctx = sys
+            .contexts
+            .iter()
+            .find(|c| c.id == context)
+            .ok_or_else(|| format!("no guest context {context}"))?;
+        let esp = match ctx.blocked_stack() {
+            Some(esp) => esp,
+            None if sys.current == context && !ctx.is_done() => self.machine().cpu.reg(Reg::Esp),
+            None => return Err(format!("context {context} has no saved stack pointer")),
+        };
+        let top = if ctx.stack_hi > esp {
+            ctx.stack_hi
+        } else {
+            esp.saturating_add(STACK_SCAN_WORDS * 4)
+        };
+        let mut rows = vec![format!(
+            "context {context} esp {esp:#010x} stack [{:#010x}, {:#010x})",
+            ctx.stack_lo, ctx.stack_hi
+        )];
+        let images = self.image_ranges()?;
+        let mut address = esp;
+        while address < top && rows.len() <= frames && address - esp < STACK_SCAN_WORDS * 4 {
+            let Ok(word) = self.machine().cpu.read_u32(address) else {
+                rows.push(format!("  esp+{:#06x} <unmapped>", address - esp));
+                break;
+            };
+            if self.after_call(word, &images) {
+                rows.push(format!(
+                    "  esp+{:#06x} {word:#010x} {}",
+                    address - esp,
+                    self.guest_place(word)
+                ));
+            }
+            address += 4;
+        }
+        Ok(rows.join("\n"))
+    }
 
     /// Hex dump of up to 4 KiB of guest memory.
-    pub fn memory_dump(&self, address: u32, len: u32) -> Result<String, String> {
+    fn memory_dump(&self, address: u32, len: u32) -> Result<String, String> {
         if len == 0 || len > 4096 || u64::from(address) + u64::from(len) > 1 << 32 {
             return Err("memory range must be 1..=4096 bytes inside guest address space".into());
         }
@@ -186,7 +222,7 @@ impl<B: Backend> Runtime<B> {
         for line in (0..len).step_by(16) {
             let at = address + line;
             let mut bytes = vec![0u8; (len - line).min(16) as usize];
-            match self.machine.cpu.read(at, &mut bytes) {
+            match self.machine().cpu.read(at, &mut bytes) {
                 Ok(()) => {
                     let hex: Vec<_> = bytes.iter().map(|b| format!("{b:02x}")).collect();
                     let text: String = bytes
@@ -208,12 +244,12 @@ impl<B: Backend> Runtime<B> {
     }
 
     /// Up to 64 guest instructions from `address`, by iced form.
-    pub fn disassemble(&self, address: u32, count: usize) -> Result<String, String> {
+    fn disassemble(&self, address: u32, count: usize) -> Result<String, String> {
         let mut bytes = vec![0u8; count.clamp(1, 64) * 15];
         let mut readable = bytes.len();
         while readable > 0
             && self
-                .machine
+                .machine()
                 .cpu
                 .read(address, &mut bytes[..readable])
                 .is_err()
@@ -248,5 +284,34 @@ impl<B: Backend> Runtime<B> {
             ));
         }
         Ok(rows.join("\n"))
+    }
+}
+
+impl<B: Backend> DebugTarget for Runtime<B> {
+    type Backend = B;
+    fn machine(&self) -> &adv_machine::Machine<B> {
+        &self.machine
+    }
+    fn guest_place(&self, address: u32) -> String {
+        self.guest_place(address)
+    }
+    fn modules_report(&self) -> String {
+        self.modules_report()
+    }
+    fn image_ranges(&self) -> Result<Vec<(u32, u32)>, String> {
+        Ok(adv_os::modules(&self.machine.ext)
+            .iter()
+            .filter(|(_, m)| m.kind == adv_os::module::ModuleKind::Image)
+            .map(|(_, m)| (m.base, m.size))
+            .collect())
+    }
+    fn contexts_report(&self) -> String {
+        self.contexts_report()
+    }
+    fn api_gaps_report(&self) -> String {
+        self.api_gaps_report()
+    }
+    fn report(&self) -> String {
+        self.report()
     }
 }

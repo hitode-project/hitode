@@ -99,6 +99,39 @@ pub fn module_base(cpu: &dyn Guest, peb: u32, name: &str) -> Option<u32> {
     None
 }
 
+/// A PE image in Wine's loader-owned load-order list.
+pub struct LoadedModule {
+    pub base: u32,
+    pub size: u32,
+    pub name: String,
+}
+
+/// Observe Wine's loaded PE images without running guest code.
+pub fn loaded_modules(cpu: &dyn Guest, peb: u32) -> Result<Vec<LoadedModule>, String> {
+    let read = |at| cpu.read_u32(at).map_err(|e| e.to_string());
+    let loader = read(peb + peb::LDR)?;
+    if loader == 0 {
+        return Ok(Vec::new());
+    }
+    let head = loader + ldr::IN_LOAD_ORDER;
+    let mut entry = read(head)?;
+    let mut modules = Vec::new();
+    // As module_base: diagnostic reads of guest-owned lists must be bounded.
+    for _ in 0..65536 {
+        if entry == head {
+            return Ok(modules);
+        }
+        modules.push(LoadedModule {
+            base: read(entry + ldr::DLL_BASE)?,
+            size: read(entry + 0x20)?, // LDR_DATA_TABLE_ENTRY.SizeOfImage
+            name: read_unicode_string(cpu, entry + ldr::BASE_DLL_NAME)
+                .ok_or("unreadable loader module name")?,
+        });
+        entry = read(entry)?;
+    }
+    Err("Wine loader list did not terminate".into())
+}
+
 /// The address of the named export of the image mapped at `base`, if it
 /// exports the name and does not forward it.
 pub fn module_export(cpu: &dyn Guest, base: u32, name: &str) -> Option<u32> {

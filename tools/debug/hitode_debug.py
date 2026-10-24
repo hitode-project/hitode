@@ -131,6 +131,10 @@ def frame_gaps(rows, gap_ms):
 
 
 def parse_modules(text):
+    # Wine module lists are scoped by guest PID. Samples carry no guest PID,
+    # so these tables cannot symbolize historical samples.
+    if text.startswith("pid "):
+        return []
     modules = []
     for line in text.splitlines():
         parts = line.split(None, 3)
@@ -329,9 +333,12 @@ def analyze(snapshot, gap_ms=100.0, top=6):
     """Report text explaining each frame gap of at least gap_ms in a snapshot."""
     rows = table(snapshot.text("timeline"))
     samples = table(snapshot.text("samples")) if "samples (last 30 s)" in snapshot.sections else []
-    modules = parse_modules(snapshot.text("modules"))
-    slow = parse_slow(snapshot.sections.get("slow paths (since previous snapshot)")
-                      or snapshot.sections.get("slow paths (whole session)", []))
+    module_text = snapshot.text("modules")
+    modules = parse_modules(module_text)
+    # Wine slow paths describe the presented process, whereas samples span the family.
+    slow = [] if module_text.startswith("pid ") else parse_slow(
+        snapshot.sections.get("slow paths (since previous snapshot)")
+        or snapshot.sections.get("slow paths (whole session)", []))
     names = host_names(snapshot, samples)
     out = []
     if len(rows) < 2:

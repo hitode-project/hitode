@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use adv_runtime::wine::session::{Config, Session, Stop};
-use adv_runtime::{DialogEvent, DialogSet, Engine};
+use adv_runtime::{DebugTarget, DialogEvent, DialogSet, Engine};
 use adv_sync::WakeEvent;
 use adv_sync::background::LocalSender;
 use adv_sync::input::KeyState;
@@ -99,10 +99,11 @@ pub(super) fn run(options: &Options, dist: &Path) -> Result<u8, String> {
             gpu,
             frames: None,
         };
+        let debugger = super::debug::start(options, false, wake.clone());
         let session = start(options, dist, wake.clone(), host)?;
         let keys = Arc::new(KeyState::default());
         let started = Instant::now();
-        let (code, mut session, _) = drive(options, session, None, &keys, &wake)?;
+        let (code, mut session, _) = drive(options, session, None, &keys, &wake, debugger)?;
         session.capture()?;
         let frame = session.frame();
         eprintln!(
@@ -134,8 +135,9 @@ pub(super) fn run_execution(
         gpu: worker.gpu.take(),
         frames: Some((worker.take_frames(), worker.ui_wake.clone())),
     };
+    let debugger = super::debug::start(options, true, wake.clone());
     let session = start(options, dist, wake.clone(), host)?;
-    let (exit_code, _, summary) = drive(options, session, Some(worker), &keys, &wake)?;
+    let (exit_code, _, summary) = drive(options, session, Some(worker), &keys, &wake, debugger)?;
     Ok(Finished { exit_code, summary })
 }
 
@@ -308,6 +310,61 @@ fn report(options: &Options, session: &Session, metrics: &Metrics, started: Inst
     format!("{{\n  {}\n}}\n", fields.join(",\n  "))
 }
 
+/// Adapter for the same debugger protocol and snapshots as the built-in stack.
+struct DebugSession<'a> {
+    session: &'a Session,
+    options: &'a Options,
+    metrics: &'a Metrics,
+    started: Instant,
+}
+
+impl DebugTarget for DebugSession<'_> {
+    type Backend = adv_runtime::Cpu;
+    fn machine(&self) -> &adv_machine::Machine<Self::Backend> {
+        &self.session.machine
+    }
+    fn guest_place(&self, address: u32) -> String {
+        self.session.guest_place(address)
+    }
+    fn modules_report(&self) -> String {
+        self.session.modules_report()
+    }
+    fn image_ranges(&self) -> Result<Vec<(u32, u32)>, String> {
+        Ok(self
+            .session
+            .debug_modules()?
+            .iter()
+            .map(|m| (m.base, m.size))
+            .collect())
+    }
+    fn profile_process_known(&self) -> bool {
+        false
+    }
+    fn profile_place(&self, address: u32) -> String {
+        format!("{address:#010x} (sample process unavailable)")
+    }
+    fn debug_counters(&self) -> [u64; 3] {
+        self.session.debug_counters()
+    }
+    fn calls_report(&self, count: usize) -> String {
+        format!(
+            "pid {:#x}: NT/Unix and host-module calls (Wine PE calls are not traced)\n{}",
+            self.session.machine.sys.pid,
+            self.session.machine.sys.recent_calls_tail(count).join("\n")
+        )
+    }
+    fn contexts_report(&self) -> String {
+        self.session.contexts_report()
+    }
+    fn api_gaps_report(&self) -> String {
+        "unavailable on the Wine stack: built-in API gap diagnostics; use Wine debug channels"
+            .into()
+    }
+    fn report(&self) -> String {
+        report(self.options, self.session, self.metrics, self.started)
+    }
+}
+
 /// Run the guest and answer the host until it exits, the time limit passes
 /// or a closed window's grace ends. Returns the exit code.
 fn drive(
@@ -316,6 +373,7 @@ fn drive(
     mut worker: Option<frontend::Worker>,
     keys: &Arc<KeyState>,
     wake: &WakeEvent,
+    mut debugger: Option<super::debug::Debugger>,
 ) -> Result<(u8, Session, adv_report::RunSummary), String> {
     let started = Instant::now();
     let mut audio = worker
@@ -348,7 +406,20 @@ fn drive(
                     message,
                     wparam,
                     lparam,
-                } => session.input(message, wparam, lparam)?,
+                } => {
+                    if let Some(debugger) = debugger.as_mut()
+                        && super::debug_hotkey(keys, message, wparam)
+                    {
+                        debugger.hotkey(&DebugSession {
+                            session: &session,
+                            options,
+                            metrics: &metrics,
+                            started,
+                        });
+                        continue;
+                    }
+                    session.input(message, wparam, lparam)?;
+                }
                 #[cfg(host_view)]
                 window::Event::Text(text, reply) => {
                     let _ = reply.send(session.text(&text));
@@ -471,6 +542,14 @@ fn drive(
             }
             break 0;
         }
+        if let Some(debugger) = debugger.as_mut() {
+            debugger.serve(&DebugSession {
+                session: &session,
+                options,
+                metrics: &metrics,
+                started,
+            });
+        }
         if paused || metrics.gate.frozen() {
             if let Some(audio) = audio.as_mut() {
                 audio.suspend();
@@ -508,6 +587,18 @@ fn drive(
             session.run(deadline)
         };
         let serial = session.presented_frames();
+        if let Some(debugger) = debugger.as_mut() {
+            debugger.after_step(
+                session.control_metrics().run_time - run_before,
+                serial,
+                &DebugSession {
+                    session: &session,
+                    options,
+                    metrics: &metrics,
+                    started,
+                },
+            );
+        }
         metrics
             .performance
             .step(session.control_metrics().run_time - run_before, serial);
@@ -788,22 +879,24 @@ mod tests {
     use std::io::{BufRead, BufReader, Write};
     use std::process::{Command, Stdio};
 
-    // spec: WINE-UI-1, WINE-UI-2, WINE-UI-3, WINE-UI-4, WINE-UI-5
+    // spec: WINE-UI-1, WINE-UI-2, WINE-UI-3, WINE-UI-4, WINE-UI-5, WINE-UI-6
     #[test]
     #[ignore = "subprocess entry for the headless control test"]
     fn headless_control_child() {
         let root = std::env::current_dir().unwrap();
         let dist = std::env::var_os("ADV_WINE_DIST").unwrap();
         let mut options = Options::new(root.join("popup_menu.exe"), root.join("data"));
+        options.wine = Some(dist.clone().into());
         options.wine_prefix = Some(root.join("prefix"));
         options.headless = true;
+        options.debug = true;
         options.control_stdin = true;
         options.codepage = Some(1252);
         options.seconds = Some(60.);
         assert_eq!(run(&options, Path::new(&dist)).unwrap(), 0);
     }
 
-    // spec: WINE-UI-1, WINE-UI-2, WINE-UI-3, WINE-UI-4, WINE-UI-5
+    // spec: WINE-UI-1, WINE-UI-2, WINE-UI-3, WINE-UI-4, WINE-UI-5, WINE-UI-6
     #[test]
     fn headless_wine_control() {
         let (Some(_dist), Some(probes)) = (
@@ -856,6 +949,29 @@ mod tests {
                 break address.to_owned();
             }
         };
+        let socket = std::fs::read_dir(super::super::debug::socket_dir())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(&format!("{}-", child.id()))
+            })
+            .expect("Wine debugger socket");
+        let mut debug = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+        debug
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut debug_reader = BufReader::new(debug.try_clone().unwrap());
+        let mut debug_command = |text: &str| {
+            writeln!(debug, "test {text}").unwrap();
+            let mut reply = String::new();
+            debug_reader.read_line(&mut reply).unwrap();
+            assert!(reply.contains("\"id\":\"test\""), "{reply}");
+            assert!(reply.contains("\"ok\":true"), "{text}: {reply}");
+            reply
+        };
         {
             let mut command = |text: &str| {
                 writeln!(input, "{text}").unwrap();
@@ -898,6 +1014,32 @@ mod tests {
                 "{latched}"
             );
             assert!(latched.contains("frozen=true"), "{latched}");
+            // Boundary requests must still be served while the frame gate freezes the guest.
+            assert!(debug_command("info").contains("stack=wine"));
+            assert!(debug_command("modules").contains("popup_menu.exe"));
+            assert!(debug_command("threads").contains("tid 0x"));
+            assert!(debug_command("stack 0 8").contains("context 0 esp"));
+            assert!(debug_command(&format!("mem 0x{address} 4")).contains("19 28 37 46"));
+            assert!(debug_command(&format!("dis 0x{address} 1")).contains("pid 0x"));
+            assert!(debug_command("calls 8").contains("NT/Unix"));
+            assert!(debug_command("gaps").contains("unavailable on the Wine stack"));
+            debug_command("slow reset");
+            debug_command("slow");
+            assert!(debug_command("report").contains("scene_gate"));
+            assert!(debug_command("timeline").contains("busy_us"));
+            debug_command("samples 1");
+            debug_command("mark wine-test");
+            let snapshot = debug_command("snap wine-test");
+            assert!(snapshot.contains("== modules"));
+            assert!(snapshot.contains("popup_menu.exe"));
+            let snapshots = root.join("data/debug");
+            assert!(std::fs::read_dir(&snapshots).unwrap().any(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with("-wine-test.txt")
+            }));
             let frozen_path = root.join("frozen.json");
             command(&format!("report {}", frozen_path.display()));
             let frozen = std::fs::read_to_string(&frozen_path).unwrap();
@@ -947,6 +1089,10 @@ mod tests {
             transcript.push('\n');
         }
         assert!(child.wait().unwrap().success(), "{transcript}");
+        assert!(
+            !socket.exists(),
+            "debugger socket remained after the session ended"
+        );
         assert!(
             transcript.contains("picked=42 initialized=2 commands=0 syscommands=0"),
             "{transcript}"

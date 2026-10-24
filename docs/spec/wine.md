@@ -261,6 +261,11 @@ FreeType is such a library: win32u opens it by name and draws TrueType text thro
 **Rule**: Wine control MUST support `reset-metrics` and `report`. Reset MUST restart frame observations, first-frame timing, and supported wait statistics. Reports MUST omit sections requiring unavailable stack data.
 **Verification**: Test
 
+### WINE-UI-6 Live debugger
+
+**Rule**: Wine sessions MUST serve the shared debugger when requested, including while paused or frame-frozen. Boundary reads MUST inspect the presented process without running guest code. Unsupported API diagnostics MUST be explicit.
+**Verification**: Test
+
 ## Audio
 
 ### WINE-AUD-1 Builtin render driver

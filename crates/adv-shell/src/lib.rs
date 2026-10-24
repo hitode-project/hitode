@@ -396,8 +396,13 @@ fn debug_hotkey(keys: &adv_sync::input::KeyState, message: u32, key: u32) -> boo
 /// What `info` reports about this session; fixed for its lifetime.
 fn debug_info(options: &Options, windowed: bool) -> String {
     format!(
-        "pid={}\nbuild={}\nplatform={}-{}\nmedia={}\ngpu={}\nwindow={}\nexe={}\ndata_dir={}\nstarted_unix_us={}",
+        "pid={}\nstack={}\nbuild={}\nplatform={}-{}\nmedia={}\ngpu={}\nwindow={}\nexe={}\ndata_dir={}\nstarted_unix_us={}",
         std::process::id(),
+        if options.wine.is_some() {
+            "wine"
+        } else {
+            "builtin"
+        },
         env!("ADV_SHELL_BUILD"),
         std::env::consts::OS,
         std::env::consts::ARCH,
@@ -1444,19 +1449,7 @@ fn run_execution(
     window::initialize_dpi()?;
     let started = Instant::now();
     // Before any translation, so the sampler can attribute every unit.
-    let mut debugger = debug::requested(options.debug)
-        .then(|| {
-            debug::Debugger::start(
-                debug_info(&options, window.is_some()),
-                &options.data_dir,
-                wake.clone(),
-            )
-        })
-        .and_then(|started| {
-            started
-                .map_err(|error| eprintln!("warning: debugger unavailable: {error}"))
-                .ok()
-        });
+    let mut debugger = debug::start(&options, window.is_some(), wake.clone());
     if let Some(install) = &options.install_dir {
         std::fs::create_dir_all(install)
             .map_err(|e| format!("install folder {}: {e}", install.display()))?;
@@ -1702,7 +1695,7 @@ fn run_execution(
                         if let Some(debugger) = debugger.as_mut()
                             && debug_hotkey(&keys, message, wparam)
                         {
-                            debugger.hotkey(&mut runtime);
+                            debugger.hotkey(&runtime);
                             continue;
                         }
                         inputs += u64::from(runtime.post_input(message, wparam, lparam));
@@ -2111,7 +2104,7 @@ fn run_execution(
             }
         }
         if let Some(debugger) = debugger.as_mut() {
-            debugger.serve(&mut runtime);
+            debugger.serve(&runtime);
         }
         let completion = observe_scene_gate(&mut runtime, &wake, &mut scene_gate)?;
         if let Some(completion) = completion {

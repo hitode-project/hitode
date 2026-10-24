@@ -7,6 +7,8 @@
 //! holds them, and drive D: is the game's directory. As Wine runs wineboot
 //! whenever its server starts, a session first runs it for the keys that
 //! last until the server stops.
+mod debug;
+
 use adv_drv::user::project;
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
@@ -78,6 +80,7 @@ pub struct Session {
     idle: BTreeMap<i32, Option<u64>>,
     foreground: i32,
     delivered: u64,
+    retired_debug: [u64; 3],
 }
 
 struct Settings {
@@ -600,6 +603,7 @@ impl Session {
             metrics: ControlMetrics::default(),
             foreground: shared.id.get(),
             delivered: 0,
+            retired_debug: [0; 3],
             shared,
             finished: None,
             idle: BTreeMap::new(),
@@ -690,6 +694,12 @@ impl Session {
                         .values()
                         .any(|m| project::view(&m.ext).windows.iter().any(|w| w.visible));
                     if shown && !visible {
+                        for machine in self.shared.driver.borrow().parked.values() {
+                            let counts = debug::counters(machine);
+                            for (total, count) in self.retired_debug.iter_mut().zip(counts) {
+                                *total += count;
+                            }
+                        }
                         self.shared.driver.borrow_mut().parked.clear();
                         self.finished = Some(code);
                         project::stopped(&mut self.machine.ext);
@@ -703,7 +713,12 @@ impl Session {
                         if self.foreground == id {
                             self.foreground = next;
                         }
-                        self.shared.driver.borrow_mut().parked.remove(&id);
+                        let retired = self.shared.driver.borrow_mut().parked.remove(&id).unwrap();
+                        for (total, count) in
+                            self.retired_debug.iter_mut().zip(debug::counters(&retired))
+                        {
+                            *total += count;
+                        }
                         self.idle.remove(&id);
                     } else {
                         self.finished = Some(code);

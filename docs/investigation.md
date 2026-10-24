@@ -126,6 +126,15 @@ python3 tools/debug/hitode_debug.py [--pid PID]        # prompt; or append one c
 - **Analysis:** `analyze` snapshots now and, for each frame gap, gives its sample shares, the hottest guest regions (nearby units of one module merged), host functions called from them, slow paths near them and a one-line verdict: waiting, generated code, overhead parts of generated code (stubs, x87 entry or publication), host calls from guest code, or translation. `watch` pulls and analyzes every new snapshot until the session ends and appends the reports to `target/investigations/debug/<pid>-analysis.txt`. Run it in the background while the user plays.
 - **Snapshots:** **Alt+Shift+F12 (Option+Shift+F12 on a Mac)** in the game window marks the moment and keeps a snapshot of the last 30 seconds in `<data-dir>/debug/`; `snap` takes one on request. A frame gap of 250 ms or more that the execution thread spent mostly in guest steps takes one by itself 2 s later (up to 32 per session); waiting gaps do not, since engines that present only on change leave them on every still screen. A snapshot holds the raw samples, slow paths since the previous snapshot and the runner's image and base, so `--snapshot FILE tl|prof|analyze` works after the session has ended. The client saves snapshots under `target/investigations/debug/`; they hold game text and stay local.
 
+Wine sessions use the same debugger in headless and windowed runs. `info` names
+which stack is running. `modules` and `threads` list the session's processes;
+`mem`, `dis`, `stack`, `calls` and `slow` inspect the presented process. `calls`
+records NT/Unix and host-module boundaries, not calls between Wine PE modules.
+`gaps` reports that the built-in stack's API diagnostics are unavailable.
+Timeline execution counters cover the process family, including exited children.
+Samples lack guest process identity, so Wine profile summaries keep raw guest
+addresses and omit process-specific instruction forms and code sizes.
+
 ## Reproducing and driving
 
 **Control commands.** `--control-stdin` takes one command per line:

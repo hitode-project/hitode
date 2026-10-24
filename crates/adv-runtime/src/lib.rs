@@ -16,6 +16,7 @@ mod graphics;
 pub mod wine;
 pub use adv_win32::winmm::mmio;
 mod debug_views;
+pub use debug_views::DebugTarget;
 mod report;
 pub mod survey;
 pub use adv_abi::{ApiDiagnostics, DynamicLookupFailure, MessageBoxCall, RunMode};
@@ -26,7 +27,7 @@ pub use adv_cpu::jit_map::{
     enable_memory as jit_map_enable, locate as jit_map_locate, lookup as jit_map_lookup,
     stub as jit_map_stub,
 };
-pub use adv_cpu::{CompileStrategy, Engine, EngineOptions, HostFeatures};
+pub use adv_cpu::{CompileStrategy, Cpu, Engine, EngineOptions, HostFeatures};
 #[cfg(target_os = "ios")]
 pub use adv_cpu::{code_pool_state, prepare_code_pool_after_attach, prepare_code_pool_if_debugged};
 

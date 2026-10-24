@@ -25,6 +25,16 @@ class ReplyShapeTests(unittest.TestCase):
         self.assertEqual(place(0x620096e4, modules), "krmovie.dll+0x96e4")
         self.assertEqual(place(0x10, modules), "0x00000010")
 
+    # spec: WINE-UI-6
+    def test_wine_samples_are_not_named_from_another_process_module_table(self):
+        modules = parse_modules("pid 0x20 (presented):\n"
+                                "0x00400000 0x00100000 Image    parent.exe\n"
+                                "pid 0x24:\n"
+                                "0x00400000 0x00100000 Image    child.exe\n"
+                                "modules unavailable: unreadable loader module name\n")
+        self.assertEqual(modules, [])
+        self.assertEqual(place(0x00401000, modules), "0x00401000")
+
     def test_samples_fall_into_slices_by_kind(self):
         samples = [{"unix_us": "1000", "kind": "Guest"}, {"unix_us": "1200", "kind": "Idle"},
                    {"unix_us": "251000", "kind": "Guest"}]

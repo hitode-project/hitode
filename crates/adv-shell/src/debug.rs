@@ -14,8 +14,7 @@
 //! waiting are not: engines that present only on change leave those on
 //! every still screen.
 use crate::window::WakeEvent;
-use adv_runtime::Engine;
-use adv_runtime::boot::Runtime;
+use adv_runtime::{Cpu, DebugTarget};
 use std::collections::{HashMap, VecDeque};
 #[cfg(unix)]
 use std::io::{BufRead, BufReader, Write};
@@ -27,6 +26,23 @@ use std::time::Duration;
 use std::time::Instant;
 
 mod profile;
+
+/// Start before guest translation so samples can name every generated unit.
+pub(crate) fn start(options: &crate::Options, windowed: bool, wake: WakeEvent) -> Option<Debugger> {
+    requested(options.debug)
+        .then(|| {
+            Debugger::start(
+                crate::debug_info(options, windowed),
+                &options.data_dir,
+                wake,
+            )
+        })
+        .and_then(|result| {
+            result
+                .map_err(|error| eprintln!("warning: debugger unavailable: {error}"))
+                .ok()
+        })
+}
 
 /// Guest instructions a snapshot describes by form and code size.
 const HOT_INSTRUCTIONS: usize = 60;
@@ -119,9 +135,9 @@ pub(crate) struct Debugger {
     snapshot_dir: PathBuf,
     busy_us: u64,
     last: FrameRow,
-    slow_baseline: HashMap<u32, [u64; 3]>,
+    slow_baseline: HashMap<(u32, u32), [u64; 3]>,
     /// Slow-path counts at the previous snapshot.
-    snapshot_baseline: HashMap<u32, [u64; 3]>,
+    snapshot_baseline: HashMap<(u32, u32), [u64; 3]>,
     /// The longest busy gap waiting for its snapshot, and when it ended.
     stall: Option<(u64, u64)>,
     stall_snapshots: usize,
@@ -169,7 +185,7 @@ impl Debugger {
     }
 
     /// Answers queued guest-state requests at this boundary.
-    pub(crate) fn serve(&mut self, runtime: &mut Runtime) {
+    pub(crate) fn serve(&mut self, runtime: &impl DebugTarget<Backend = Cpu>) {
         while let Ok(request) = self.receiver.try_recv() {
             let result = self.execute(&request.line, runtime);
             let _ = request.reply.send(result);
@@ -189,19 +205,24 @@ impl Debugger {
     }
 
     /// Accounts one guest step and records a timeline row per new frame.
-    pub(crate) fn after_step(&mut self, step: Duration, presented: u64, runtime: &Runtime) {
+    pub(crate) fn after_step(
+        &mut self,
+        step: Duration,
+        presented: u64,
+        runtime: &impl DebugTarget<Backend = Cpu>,
+    ) {
         self.busy_us += step.as_micros() as u64;
         if presented == self.last.frame {
             return;
         }
-        let counters = runtime.machine.cpu.counters();
+        let [host_calls, native_entries, interpreter_entries] = runtime.debug_counters();
         let row = FrameRow {
             unix_us: unix_us(),
             frame: presented,
             busy_us: std::mem::take(&mut self.busy_us),
-            host_calls: runtime.machine.sys.host_calls,
-            native_entries: counters.native_entries,
-            interpreter_entries: counters.interpreter_entries,
+            host_calls,
+            native_entries,
+            interpreter_entries,
         };
         let delta = FrameRow {
             host_calls: row.host_calls - self.last.host_calls.min(row.host_calls),
@@ -233,7 +254,7 @@ impl Debugger {
     }
 
     /// Alt+Shift+F12: mark the moment and keep a snapshot of it.
-    pub(crate) fn hotkey(&mut self, runtime: &mut Runtime) {
+    pub(crate) fn hotkey(&mut self, runtime: &impl DebugTarget<Backend = Cpu>) {
         mark(&self.shared, "hotkey".into());
         match self.snapshot("hotkey", runtime) {
             Ok(name) => eprintln!("debug: snapshot {name}"),
@@ -241,7 +262,11 @@ impl Debugger {
         }
     }
 
-    fn execute(&mut self, line: &str, runtime: &mut Runtime) -> Result<String, String> {
+    fn execute(
+        &mut self,
+        line: &str,
+        runtime: &impl DebugTarget<Backend = Cpu>,
+    ) -> Result<String, String> {
         let mut words = line.split_whitespace();
         let command = words.next().unwrap_or_default();
         let args: Vec<&str> = words.collect();
@@ -254,11 +279,7 @@ impl Debugger {
             }
             "calls" => {
                 let count = args.first().map_or(Ok(64), |n| number(n))?;
-                Ok(runtime
-                    .machine
-                    .sys
-                    .recent_calls_tail(count as usize)
-                    .join("\n"))
+                Ok(runtime.calls_report(count as usize))
             }
             "gaps" => Ok(runtime.api_gaps_report()),
             "modules" => Ok(runtime.modules_report()),
@@ -291,19 +312,26 @@ impl Debugger {
     }
 
     /// Slow-path runs by EIP since the last `slow reset`, busiest first.
-    fn slow(&mut self, runtime: &Runtime, reset: bool) -> String {
+    fn slow(&mut self, runtime: &impl DebugTarget<Backend = Cpu>, reset: bool) -> String {
         #[cfg(target_arch = "aarch64")]
         {
-            let executor = runtime.machine.cpu.executor();
+            let executor = runtime.machine().cpu.executor();
             let sites = executor.slow_path_sites();
+            let pid = runtime.machine().sys.pid;
             if reset {
-                self.slow_baseline = sites.into_iter().collect();
+                self.slow_baseline.retain(|&(owner, _), _| owner != pid);
+                self.slow_baseline
+                    .extend(sites.into_iter().map(|(eip, counts)| ((pid, eip), counts)));
                 return "slow-path counts reset".into();
             }
             let mut rows: Vec<_> = sites
                 .into_iter()
                 .map(|(eip, counts)| {
-                    let base = self.slow_baseline.get(&eip).copied().unwrap_or_default();
+                    let base = self
+                        .slow_baseline
+                        .get(&(pid, eip))
+                        .copied()
+                        .unwrap_or_default();
                     (eip, [0, 1, 2].map(|i| counts[i].saturating_sub(base[i])))
                 })
                 .filter(|(_, counts)| counts.iter().sum::<u64>() > 0)
@@ -329,7 +357,11 @@ impl Debugger {
     }
 
     /// Writes and keeps a snapshot; returns its name.
-    fn snapshot(&mut self, label: &str, runtime: &mut Runtime) -> Result<String, String> {
+    fn snapshot(
+        &mut self,
+        label: &str,
+        runtime: &impl DebugTarget<Backend = Cpu>,
+    ) -> Result<String, String> {
         let now = unix_us();
         let since = now.saturating_sub(SNAPSHOT_WINDOW_US);
         let label: String = label
@@ -361,10 +393,7 @@ impl Debugger {
             hot_text(&self.shared, since, runtime),
         );
         section("threads", threads(runtime));
-        section(
-            "calls",
-            runtime.machine.sys.recent_calls_tail(256).join("\n"),
-        );
+        section("calls", runtime.calls_report(256));
         section("gaps", runtime.api_gaps_report());
         let reset = std::mem::take(&mut self.slow_baseline);
         self.slow_baseline = std::mem::take(&mut self.snapshot_baseline);
@@ -372,8 +401,9 @@ impl Debugger {
             "slow paths (since previous snapshot)",
             self.slow(runtime, false),
         );
-        self.slow_baseline = HashMap::new();
+        let previous = std::mem::take(&mut self.slow_baseline);
         section("slow paths (whole session)", self.slow(runtime, false));
+        self.slow_baseline = previous;
         self.slow(runtime, true);
         self.snapshot_baseline = std::mem::replace(&mut self.slow_baseline, reset);
         section("modules", runtime.modules_report());
@@ -409,9 +439,15 @@ fn number(text: &str) -> Result<u32, String> {
     .map_err(|_| format!("invalid number {text:?}"))
 }
 
-fn threads(runtime: &Runtime) -> String {
+fn threads(runtime: &impl DebugTarget<Backend = Cpu>) -> String {
     let mut text = runtime.contexts_report();
-    for context in runtime.machine.sys.contexts.iter().filter(|c| !c.is_done()) {
+    for context in runtime
+        .machine()
+        .sys
+        .contexts
+        .iter()
+        .filter(|c| !c.is_done())
+    {
         if let Ok(stack) = runtime.stack_scan(context.id, 12) {
             text.push_str(&format!("\n{stack}"));
         }
@@ -710,7 +746,7 @@ fn samples_text(shared: &Shared, since: u64) -> String {
 /// The guest instructions most samples were in: their form, samples by
 /// part of their code, and host code bytes by part in the newest unit, so
 /// a client can group scattered instructions by mechanism.
-fn hot_text(shared: &Shared, since: u64, runtime: &Runtime) -> String {
+fn hot_text(shared: &Shared, since: u64, runtime: &impl DebugTarget<Backend = Cpu>) -> String {
     const PARTS: [&str; 8] = [
         "body",
         "cold",
@@ -742,12 +778,15 @@ fn hot_text(shared: &Shared, since: u64, runtime: &Runtime) -> String {
             .map(|part| format!("{part}_bytes"))
             .join("\t")
     )];
+    if !runtime.profile_process_known() {
+        return text.join("\n");
+    }
     for (eip, parts) in rows.into_iter().take(HOT_INSTRUCTIONS) {
         #[cfg(target_arch = "aarch64")]
         let (form, bytes) = {
             let sizes = adv_runtime::jit_map_code_of(eip);
             let form = runtime
-                .machine
+                .machine()
                 .cpu
                 .executor()
                 .instruction_form(eip)
@@ -772,7 +811,7 @@ fn hot_text(shared: &Shared, since: u64, runtime: &Runtime) -> String {
         text.push(format!(
             "{}\t{eip:#010x}\t{}\t{form}\t{}\t{}",
             parts.iter().sum::<usize>(),
-            runtime.guest_place(eip),
+            runtime.profile_place(eip),
             parts.map(|n| n.to_string()).join("\t"),
             bytes.join("\t"),
         ));
@@ -780,7 +819,11 @@ fn hot_text(shared: &Shared, since: u64, runtime: &Runtime) -> String {
     text.join("\n")
 }
 
-fn profile_summary(shared: &Shared, since: u64, runtime: &Runtime) -> String {
+fn profile_summary(
+    shared: &Shared,
+    since: u64,
+    runtime: &impl DebugTarget<Backend = Cpu>,
+) -> String {
     let samples: Vec<_> = shared.profiler.since(since).iter().map(classify).collect();
     if samples.is_empty() {
         return format!("no samples (sampler at {} Hz)", shared.profiler.hz());
@@ -818,14 +861,14 @@ fn profile_summary(shared: &Shared, since: u64, runtime: &Runtime) -> String {
         text.push(format!(
             "  {n:>6} {:5.1}% {eip:#010x} {}",
             share(n),
-            runtime.guest_place(eip)
+            runtime.profile_place(eip)
         ));
     }
     let mut insts: Vec<_> = insts.into_iter().collect();
     insts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     text.push("guest instructions and the part of their code:".into());
     for ((eip, part), n) in insts.into_iter().take(25) {
-        let place = eip.map_or_else(|| "-".into(), |eip| runtime.guest_place(eip));
+        let place = eip.map_or_else(|| "-".into(), |eip| runtime.profile_place(eip));
         text.push(format!(
             "  {n:>6} {:5.1}% {:>10} {part:<12} {place}",
             share(n),
