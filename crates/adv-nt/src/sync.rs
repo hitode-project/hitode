@@ -1742,3 +1742,199 @@ pub fn set_job(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         }
     })())
 }
+
+/// Wine 11.0's NtSetIntervalProfile stub.
+pub fn set_interval_profile(_env: &mut Env<'_>, _args: &[u32]) -> Outcome {
+    Outcome::Return(status::SUCCESS)
+}
+
+/// Wine 11.0's LPC port stub.
+pub fn port_stub(_env: &mut Env<'_>, _args: &[u32]) -> Outcome {
+    Outcome::Return(status::NOT_IMPLEMENTED)
+}
+
+/// Wine 11.0's NtCommitTransaction stub.
+pub fn commit_transaction(_env: &mut Env<'_>, _args: &[u32]) -> Outcome {
+    Outcome::Return(status::SUCCESS)
+}
+
+/// Wine 11.0's NtRollbackTransaction stub.
+pub fn rollback_transaction(_env: &mut Env<'_>, _args: &[u32]) -> Outcome {
+    Outcome::Return(status::ACCESS_VIOLATION)
+}
+
+/// NtCreateTransaction: Wine supplies its fixed dummy handle.
+pub fn create_transaction(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    status::finish(write_u32(env, args[0], 1).map_err(Into::into))
+}
+
+/// NtSetInformationDebugObject(debug, class, *info, length, *returned)
+pub fn set_debug_object(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    status::finish((|| {
+        if args[1] != 1 {
+            return Err(status::INVALID_PARAMETER.into());
+        }
+        if args[3] != 4 {
+            if args[4] != 0 {
+                write_u32(env, args[4], 4)?;
+            }
+            return Err(status::INFO_LENGTH_MISMATCH.into());
+        }
+        let flags = read_u32(env, args[2])?;
+        if flags & !1 != 0 {
+            return Err(status::INVALID_PARAMETER.into());
+        }
+        let mut request = crate::protocol::SetDebugObjInfoRequest {
+            debug: args[0],
+            flags,
+            ..Default::default()
+        };
+        let (reply, _) = server::request(env, &mut request, &[], &mut [])?;
+        status::check(reply.header.error)?;
+        if args[4] != 0 {
+            write_u32(env, args[4], 0)?;
+        }
+        Ok(())
+    })())
+}
+
+/// NtWaitForDebugEvent(debug, alertable, *timeout, *state)
+pub fn wait_debug_event(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    debug_event(env, args.try_into().unwrap(), true)
+}
+
+fn debug_event(env: &mut Env<'_>, args: [u32; 4], wait: bool) -> Outcome {
+    let mut request = crate::protocol::WaitDebugEventRequest {
+        debug: args[0],
+        ..Default::default()
+    };
+    // union debug_event_data from server_protocol.h.
+    let mut data = [0; 160];
+    let (reply, _) = match server::request(env, &mut request, &[], &mut data) {
+        Ok(reply) => reply,
+        Err(error) => return status::finish(Err(error)),
+    };
+    let result = (|| {
+        status::check(reply.header.error)?;
+        let word = |offset| u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+        let wide = |offset| u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+        let code = word(0);
+        let state = args[3];
+        write_u32(env, state, code)?;
+        write_u32(env, state + 4, reply.pid)?;
+        write_u32(env, state + 8, reply.tid)?;
+        let info = state + 12;
+        let mut partial = false;
+        match code {
+            0 | 1 => return Err(status::PENDING.into()),
+            2 => {
+                write_u32(env, info, word(4))?;
+                write_u32(env, info + 8, word(8))?;
+            }
+            3 => {
+                for (dest, src) in [
+                    (0, 8),
+                    (4, 12),
+                    (12, 4),
+                    (16, 16),
+                    (20, 24),
+                    (24, 28),
+                    (32, 32),
+                ] {
+                    write_u32(env, info + dest, word(src))?;
+                }
+            }
+            4 | 5 => write_u32(env, info, word(4))?,
+            6..=8 => {
+                for (dest, src) in [(0, 8), (4, 12), (8, 16), (12, 24), (16, 32), (80, 4)] {
+                    write_u32(env, info + dest, word(src))?;
+                }
+                for i in 0..word(32) {
+                    write_u32(env, info + 20 + i * 4, word(40 + i as usize * 8))?;
+                }
+            }
+            9 => {
+                for (dest, src) in [(0, 4), (4, 8), (8, 16), (12, 20), (16, 24)] {
+                    write_u32(env, info + dest, word(src))?;
+                }
+                partial = wide(8) > u64::from(u32::MAX);
+                if !partial {
+                    // Wine drops load notifications for non-i386 images.
+                    if let Ok(fd) = server::handle_fd(env, word(4)) {
+                        let mut dos = [0u8; 64];
+                        // SAFETY: pread fills bounded buffers; the borrowed descriptor stays open.
+                        unsafe {
+                            if libc::pread(fd.fd, dos.as_mut_ptr().cast(), dos.len(), 0)
+                                == dos.len() as isize
+                            {
+                                let offset = u32::from_le_bytes(dos[60..64].try_into().unwrap());
+                                let mut header = [0u8; 6];
+                                if libc::pread(
+                                    fd.fd,
+                                    header.as_mut_ptr().cast(),
+                                    header.len(),
+                                    i64::from(offset),
+                                ) == header.len() as isize
+                                {
+                                    partial = u16::from_le_bytes([header[4], header[5]]) != 0x14c;
+                                }
+                                libc::lseek(fd.fd, 0, libc::SEEK_SET);
+                            }
+                        }
+                    }
+                }
+            }
+            10 => {
+                write_u32(env, info, word(8))?;
+                partial = wide(8) > u64::from(u32::MAX);
+            }
+            _ => return Err(0xc000_00e5u32.into()),
+        }
+        if partial {
+            if code == 9 {
+                server::close(env, word(4))?;
+            }
+            let mut request = crate::protocol::ContinueDebugEventRequest {
+                debug: args[0],
+                pid: reply.pid,
+                tid: reply.tid,
+                status: 0x0001_0002,
+                ..Default::default()
+            };
+            let _ = server::request(env, &mut request, &[], &mut [])?;
+            return Err(0x8000_000du32.into());
+        }
+        Ok(())
+    })();
+    match result {
+        Err(status::Error::Status(0x8000_000d)) => debug_event(env, args, true),
+        Err(status::Error::Status(status::PENDING)) if !wait => Outcome::Return(0x102),
+        Err(status::Error::Status(status::PENDING)) => {
+            let timeout = match read_timeout(env, args[2]) {
+                Ok(timeout) => timeout,
+                Err(error) => return Outcome::Return(error),
+            };
+            let op = [SELECT_WAIT, args[0]]
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect();
+            let flags = SELECT_INTERRUPTIBLE
+                | if args[1] as u8 != 0 {
+                    SELECT_ALERTABLE
+                } else {
+                    0
+                };
+            let select = new_select(env, op, flags, timeout);
+            run_select(
+                env,
+                select,
+                Box::new(move |env, ended| match ended {
+                    Ended::Status(0) => debug_event(env, args, false),
+                    Ended::Status(code) => Outcome::Return(code),
+                    Ended::Apc { func, args } => run_apc(env, None, func, args, USER_APC),
+                }),
+            )
+        }
+        result => status::finish(result),
+    }
+}

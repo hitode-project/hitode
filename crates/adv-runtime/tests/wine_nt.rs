@@ -272,3 +272,52 @@ fn k_security() {
     let lines: Vec<_> = text.lines().collect();
     assert_eq!(lines, expected.map(|name| format!("{name} ok")), "{text}");
 }
+
+// spec: WINE-NT-401, WINE-NT-402, WINE-NT-403, WINE-NT-404
+#[test]
+fn m_system() {
+    let Some((stop, text)) = probe("m_system", "nt_m_system.exe", |_, _| {}) else {
+        return;
+    };
+    assert!(matches!(stop, Stop::Exited(0)), "{stop:?}: {text}");
+    assert_checks(
+        &text,
+        ": ok",
+        &[
+            "create-section-ex",
+            "map-view-ex-shared",
+            "map-view-ex-alignment",
+            "prefetch-memory",
+            "shared-virtual-lock",
+            "shared-virtual-unlock",
+            "unmap-view-ex",
+            "map-view-ex-placeholder",
+            "unmap-preserve-placeholder",
+            "flush-view",
+            "flush-file-data",
+            "virtual-lock",
+            "virtual-unlock",
+            "flush-write-buffers",
+            "execution-state-set",
+            "execution-state-previous",
+            "set-default-locale",
+            "system-locale-isolation",
+            "set-system-locale",
+            "user-locale-isolation",
+            "license-size",
+            "license-registry-data",
+            "wow64-allocate-validation",
+            "wow64-allocate",
+            "wow64-query-process",
+            "wow64-read-empty",
+            "wow64-write-empty",
+            "wow64-read-access",
+            "wow64-write-access",
+            "debug-attach-self",
+            "debug-kill-on-exit",
+            "debug-continue-invalid",
+            "debug-detach-unattached",
+            "debug-wait-timeout",
+        ],
+    );
+}

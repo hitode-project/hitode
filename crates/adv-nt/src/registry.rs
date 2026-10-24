@@ -3,7 +3,7 @@
 
 use adv_machine::{Env, Outcome};
 
-use crate::object::{Attributes, read_unicode_string, write_bytes, write_u32};
+use crate::object::{Attributes, read_u32, read_unicode_string, write_bytes, write_u32};
 use crate::protocol::{
     CreateKeyRequest, DeleteKeyRequest, DeleteKeyValueRequest, EnumKeyRequest, EnumKeyValueRequest,
     FlushKeyRequest, GetKeyValueRequest, OpenKeyRequest, SetKeyValueRequest,
@@ -734,5 +734,56 @@ pub fn save(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         };
         let (reply, _) = server::request(env, &mut request, &[], &mut [])?;
         status::check(reply.header.error)
+    })())
+}
+
+/// NtQueryLicenseValue reads the same Wine registry key as unix/registry.c.
+pub fn query_license(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    let &[name, kind, output, length, returned] = args else {
+        unreachable!()
+    };
+    status::finish((|| {
+        if name == 0
+            || read_u32(env, name + 4)? == 0
+            || read_u32(env, name)? & 0xffff == 0
+            || returned == 0
+        {
+            return Err(status::INVALID_PARAMETER.into());
+        }
+        let name = read_unicode_string(env, name)?;
+        let key = match open_for_reading(
+            env,
+            0,
+            r"\Registry\Machine\Software\Wine\LicenseInformation",
+        ) {
+            Ok(key) => key,
+            Err(Error::Status(_)) => return Err(status::OBJECT_NAME_NOT_FOUND.into()),
+            Err(error) => return Err(error),
+        };
+        let result = (|| {
+            if name.len() * 2 > MAX_VALUE_LENGTH {
+                return Err(status::OBJECT_NAME_NOT_FOUND.into());
+            }
+            let mut request = GetKeyValueRequest {
+                hkey: key,
+                ..Default::default()
+            };
+            let mut data = vec![0; length as usize];
+            let (reply, count) = server::request(env, &mut request, &[&bytes(&name)], &mut data)?;
+            status::check(reply.header.error)?;
+            if kind != 0 {
+                write_u32(env, kind, reply.r#type as u32)?;
+            }
+            write_u32(env, returned, reply.total)?;
+            if reply.total > length {
+                return Err(status::BUFFER_TOO_SMALL.into());
+            }
+            if count != 0 {
+                write_bytes(env, output, &data[..count])?;
+            }
+            Ok(())
+        })();
+        server::close(env, key)?;
+        result
     })())
 }

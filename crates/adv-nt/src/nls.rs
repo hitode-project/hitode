@@ -45,7 +45,10 @@ pub fn initialize(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         let view = section::map_read_only(env, mapping);
         server::close(env, mapping)?;
         write_u32(env, base, view?.0)?;
-        let locale = env.ext.get::<Locale>().0;
+        let locale = env
+            .ext
+            .try_get::<DefaultLocales>()
+            .map_or(env.ext.get::<Locale>().0, |locales| locales.0[0]);
         write_u32(env, lcid, locale)?;
         Ok(())
     })())
@@ -53,7 +56,12 @@ pub fn initialize(env: &mut Env<'_>, args: &[u32]) -> Outcome {
 
 /// NtQueryDefaultLocale(user, *lcid)
 pub fn default_locale(env: &mut Env<'_>, args: &[u32]) -> Outcome {
-    let locale = env.ext.get::<Locale>().0;
+    let locale = env
+        .ext
+        .try_get::<DefaultLocales>()
+        .map_or(env.ext.get::<Locale>().0, |locales| {
+            locales.0[usize::from(args[0] as u8 != 0)]
+        });
     status::finish(write_u32(env, args[1], locale).map_err(Error::from))
 }
 
@@ -171,5 +179,17 @@ pub fn default_ui_language(env: &mut Env<'_>, args: &[u32]) -> Outcome {
 /// NtSetDefaultUILanguage(language)
 pub fn set_ui_language(env: &mut Env<'_>, args: &[u32]) -> Outcome {
     env.ext.insert(UiLanguage(args[0] as u16));
+    Outcome::Return(status::SUCCESS)
+}
+
+struct DefaultLocales([u32; 2]);
+
+/// NtSetDefaultLocale(user, lcid): only the guest's locale changes.
+pub fn set_default_locale(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    if env.ext.try_get::<DefaultLocales>().is_none() {
+        let initial = env.ext.get::<Locale>().0;
+        env.ext.insert(DefaultLocales([initial; 2]));
+    }
+    env.ext.get_mut::<DefaultLocales>().0[usize::from(args[0] as u8 != 0)] = args[1];
     Outcome::Return(status::SUCCESS)
 }

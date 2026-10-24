@@ -344,3 +344,29 @@ FreeType is such a library: win32u opens it by name and draws TrueType text thro
 
 **Rule**: Security calls stubbed by Wine 11.0 MUST preserve its fixed statuses and output writes.
 **Verification**: Review — the call list is compared with Wine's Unix security and server implementations.
+## System, memory and debug calls
+
+### WINE-NT-401 Extended section views
+
+**Rule**: Extended section calls MUST follow Wine 11.0 parameter checks, shared mappings and placeholder replacement. Preserving an unmapped placeholder MUST retain its reservation.
+**Verification**: Test
+
+### WINE-NT-402 Memory services
+
+**Rule**: Memory flush, lock, prefetch and WoW64 services MUST follow Wine 11.0 statuses, lengths and server requests. Process write barriers MUST order prior guest writes.
+**Verification**: Test
+
+### WINE-NT-403 Guest system state
+
+**Rule**: Locale and execution-state updates MUST affect only guest state. License queries MUST read `\Registry\Machine\Software\Wine\LicenseInformation` with Wine's type and length reporting.
+**Verification**: Test
+
+### WINE-NT-404 Debug services
+
+**Rule**: Debug attachment, continuation, object information and event waits MUST use Wine's server requests. Debug waits MUST block through machine scheduling.
+**Verification**: Test
+
+### WINE-NT-405 System stubs
+
+**Rule**: M-system fixed stubs MUST retain Wine 11.0 statuses and output writes. Syscall-table stubs MUST raise Wine's noncontinuable stub exception. Unsupported LDT updates MUST return `STATUS_NOT_IMPLEMENTED`.
+**Verification**: Review — the implementations are compared with Wine's Unix sources and syscall stub table.

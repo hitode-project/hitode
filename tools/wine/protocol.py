@@ -167,6 +167,12 @@ REQUESTS = [
     "compare_objects",
     "set_object_permanence",
     "get_token_default_dacl",
+    "debug_process",
+    "continue_debug_event",
+    "set_debug_obj_info",
+    "wait_debug_event",
+    "read_process_memory",
+    "write_process_memory",
 ]
 
 # Structures sent as request or reply data. Their fields are integers laid

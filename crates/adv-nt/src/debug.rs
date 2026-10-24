@@ -5,6 +5,11 @@
 //! a NUL-terminated name in 16 bytes, then an entry with no name whose flags
 //! apply to every other channel.
 
+use adv_machine::{Env, Outcome};
+
+use crate::object::read_u32;
+use crate::{protocol, server, status};
+
 const FIXME: u8 = 1 << 0;
 const ERR: u8 = 1 << 1;
 const CLASSES: [&str; 4] = ["fixme", "err", "warn", "trace"];
@@ -74,6 +79,54 @@ pub fn table(spec: &str, app_name: &str, limit: usize) -> Vec<u8> {
         table.extend_from_slice(&entry);
     }
     table
+}
+
+/// Wine 11.0's NtTraceControl stub.
+pub fn trace_control(_env: &mut Env<'_>, _args: &[u32]) -> Outcome {
+    Outcome::Return(status::SUCCESS)
+}
+
+/// Wine 11.0's NtSetDebugFilterState stub.
+pub fn set_filter(_env: &mut Env<'_>, _args: &[u32]) -> Outcome {
+    Outcome::Return(status::SUCCESS)
+}
+
+/// NtDebugActiveProcess(process, debug)
+pub fn attach(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    debug_process(env, args, 1)
+}
+
+/// NtRemoveProcessDebug(process, debug)
+pub fn detach(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    debug_process(env, args, 0)
+}
+
+fn debug_process(env: &mut Env<'_>, args: &[u32], attach: i32) -> Outcome {
+    let mut request = protocol::DebugProcessRequest {
+        handle: args[0],
+        debug: args[1],
+        attach,
+        ..Default::default()
+    };
+    status::finish(
+        server::request(env, &mut request, &[], &mut [])
+            .and_then(|(reply, _)| status::check(reply.header.error)),
+    )
+}
+
+/// NtDebugContinue(debug, *client, status)
+pub fn continue_event(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    status::finish((|| {
+        let mut request = protocol::ContinueDebugEventRequest {
+            debug: args[0],
+            pid: read_u32(env, args[1])?,
+            tid: read_u32(env, args[1] + 4)?,
+            status: args[2],
+            ..Default::default()
+        };
+        let (reply, _) = server::request(env, &mut request, &[], &mut [])?;
+        status::check(reply.header.error)
+    })())
 }
 
 #[cfg(test)]
