@@ -282,6 +282,14 @@ pub fn create_mapping(
 /// NtMapViewOfSection(handle, process, *base, zero_bits, commit_size,
 /// *offset, *size, inherit, allocation_type, protection)
 pub fn map_view(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    if args[1] != u32::MAX
+        && matches!(
+            crate::information::current_process(env, args[1]),
+            Err(Error::Status(status::NOT_SUPPORTED))
+        )
+    {
+        return crate::apc::map(env, args, false);
+    }
     let &[
         handle,
         process,
@@ -459,6 +467,14 @@ fn map_data(
 
 /// NtUnmapViewOfSection(process, address)
 pub fn unmap_view(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    if args[0] != u32::MAX
+        && matches!(
+            crate::information::current_process(env, args[0]),
+            Err(Error::Status(status::NOT_SUPPORTED))
+        )
+    {
+        return crate::apc::unmap(env, args, false);
+    }
     let &[process, address] = args else {
         unreachable!()
     };
@@ -619,6 +635,14 @@ pub fn create_ex(env: &mut Env<'_>, args: &[u32]) -> Outcome {
 /// NtMapViewOfSectionEx(section, process, *base, *offset, *size, type,
 /// protection, *parameters, count)
 pub fn map_view_ex(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    if args[1] != u32::MAX
+        && matches!(
+            crate::information::current_process(env, args[1]),
+            Err(Error::Status(status::NOT_SUPPORTED))
+        )
+    {
+        return crate::apc::map(env, args, true);
+    }
     status::finish((|| {
         let offset = if args[3] == 0 {
             0
@@ -721,6 +745,14 @@ pub fn map_view_ex(env: &mut Env<'_>, args: &[u32]) -> Outcome {
 
 /// NtUnmapViewOfSectionEx(process, address, flags)
 pub fn unmap_view_ex(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    if args[0] != u32::MAX
+        && matches!(
+            crate::information::current_process(env, args[0]),
+            Err(Error::Status(status::NOT_SUPPORTED))
+        )
+    {
+        return crate::apc::unmap(env, args, true);
+    }
     if args[2] & !3 != 0 {
         return Outcome::Return(status::INVALID_PARAMETER);
     }

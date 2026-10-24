@@ -377,11 +377,7 @@ fn run_select_result(
         Err(error) => return status::finish(Err(error)),
     };
     if reply.header.error == KERNEL_APC {
-        let kind = u32::from_le_bytes(call[..4].try_into().unwrap());
-        if kind != 2 {
-            return Outcome::Fail(format!("system APC type {kind}"));
-        }
-        let result = match crate::file::complete_async(env, &call) {
+        let result = match crate::apc::invoke(env, &call, false) {
             Ok(result) => result,
             Err(error) => return status::finish(Err(error)),
         };

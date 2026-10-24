@@ -86,7 +86,7 @@ fn forward(env: &mut Env<'_>, request: u32) -> Result<u32, String> {
         .try_get_mut::<Link>()
         .ok_or("no server connection")?;
     let size = link
-        .call_raw(context, &mut fixed, &parts, &mut reply)
+        .call_raw(context, env.cpu, &mut fixed, &parts, &mut reply)
         .map_err(|error| format!("server call failed: {error}"))?;
     crate::server::deliver(env);
     env.cpu.write(request, &fixed).map_err(fault)?;

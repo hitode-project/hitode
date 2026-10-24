@@ -306,6 +306,8 @@ void hitode_exit( int status )
  * names anything to signal, wait for or fork from. */
 int hitode_kill( pid_t pid, int sig )
 {
+    extern int hitode_host_signal( int pid, int tid, int sig );
+    if (hitode_host_signal( pid, -1, sig )) return 0;
     errno = ESRCH;
     return -1;
 }

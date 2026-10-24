@@ -37,6 +37,27 @@ pub trait Clock {
     fn unix(&self) -> u64;
 }
 
+/// Services provided by the execution owner while the server runs.
+/// Signals are queued; memory transfers complete before returning to Wine.
+pub trait Tracing {
+    fn signal(&mut self, pid: i32, tid: i32, signal: i32) -> bool;
+    fn read_memory(&mut self, pid: i32, address: u64, data: &mut [u8]) -> u32;
+    fn write_memory(&mut self, pid: i32, address: u64, data: &[u8]) -> u32;
+}
+
+struct NoTracing;
+impl Tracing for NoTracing {
+    fn signal(&mut self, _: i32, _: i32, _: i32) -> bool {
+        false
+    }
+    fn read_memory(&mut self, _: i32, _: u64, _: &mut [u8]) -> u32 {
+        0xc000_0022
+    }
+    fn write_memory(&mut self, _: i32, _: u64, _: &[u8]) -> u32 {
+        0xc000_0022
+    }
+}
+
 pub struct Config {
     /// The Wine prefix; it must exist and belong to the current user.
     pub prefix: PathBuf,
@@ -87,6 +108,7 @@ static ENVIRONMENT: OnceLock<Environment> = OnceLock::new();
 thread_local! {
     /// The clock of the running step; set only while the server runs.
     static CLOCK: Cell<Option<*const dyn Clock>> = const { Cell::new(None) };
+    static TRACING: Cell<Option<*mut dyn Tracing>> = const { Cell::new(None) };
     /// The server coroutine's yielder; set only while the server runs.
     static YIELDER: Cell<*const Yielder<(), Suspend>> = const { Cell::new(std::ptr::null()) };
 }
@@ -132,6 +154,10 @@ impl Server {
     /// Resumes the server: it handles what its clients have sent and the
     /// timeouts that have passed, then returns when it would wait again.
     pub fn step(&mut self, clock: &dyn Clock) -> State {
+        self.step_with_tracing(clock, &mut NoTracing)
+    }
+
+    pub fn step_with_tracing(&mut self, clock: &dyn Clock, tracing: &mut dyn Tracing) -> State {
         if let State::Exited(_) = self.state {
             return self.state;
         }
@@ -140,6 +166,11 @@ impl Server {
         let clock: *const (dyn Clock + '_) = clock;
         CLOCK.set(Some(unsafe {
             std::mem::transmute::<*const (dyn Clock + '_), *const dyn Clock>(clock)
+        }));
+        let tracing: *mut (dyn Tracing + '_) = tracing;
+        // SAFETY: as with CLOCK, only the synchronous resume can access this pointer.
+        TRACING.set(Some(unsafe {
+            std::mem::transmute::<*mut (dyn Tracing + '_), *mut dyn Tracing>(tracing)
         }));
         self.state = match self.coroutine.resume(()) {
             CoroutineResult::Yield(Suspend::Wait(timeout)) => {
@@ -150,6 +181,7 @@ impl Server {
             }
         };
         CLOCK.set(None);
+        TRACING.set(None);
         self.state
     }
 
@@ -241,4 +273,39 @@ extern "C" fn hitode_host_server_root() -> *const c_char {
         .expect("server environment")
         .server_root
         .as_ptr()
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn hitode_host_signal(pid: c_int, tid: c_int, signal: c_int) -> c_int {
+    let Some(tracing) = TRACING.get() else {
+        return 0;
+    };
+    // SAFETY: the callback is inside the synchronous step owning this mutable borrow.
+    i32::from(unsafe { &mut *tracing }.signal(pid, tid, signal))
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn hitode_host_memory(
+    pid: c_int,
+    address: u64,
+    size: u32,
+    data: *mut u8,
+    write: c_int,
+) -> u32 {
+    let Some(tracing) = TRACING.get() else {
+        return 0xc000_0022;
+    };
+    // SAFETY: the tracing borrow is installed for exactly this step.
+    let tracing = unsafe { &mut *tracing };
+    if write != 0 {
+        // SAFETY: Wine supplies a readable source buffer of size bytes.
+        tracing.write_memory(pid, address, unsafe {
+            std::slice::from_raw_parts(data, size as usize)
+        })
+    } else {
+        // SAFETY: Wine supplies a writable destination buffer of size bytes.
+        tracing.read_memory(pid, address, unsafe {
+            std::slice::from_raw_parts_mut(data, size as usize)
+        })
+    }
 }

@@ -7,6 +7,10 @@
 //! `LdrInitializeThunk` with the CONTEXT that `NtContinue` later resumes at
 //! `RtlUserThreadStart`, as in Wine.
 
+mod creation;
+pub mod signals;
+pub use creation::{Child, Children};
+
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -281,6 +285,27 @@ pub fn start<B: Backend>(
     // Connecting needs the server to run; `progress` drives it.
     let time = server::Time::now(&mut machine.sys.clock);
     let (connection, registered) = Connection::connect(socket, &mut *progress, time)?;
+    start_connected(
+        machine,
+        ntdll,
+        apisets,
+        startup,
+        prefix,
+        progress,
+        (connection, registered),
+    )
+}
+
+pub fn start_connected<B: Backend>(
+    machine: &mut Machine<B>,
+    ntdll: &[u8],
+    apisets: &[u8],
+    startup: &Startup<'_>,
+    prefix: &Path,
+    progress: Box<dyn Progress>,
+    (connection, registered): (Connection, FirstThread),
+) -> Result<Process, Error> {
+    let time = server::Time::now(&mut machine.sys.clock);
     machine.sys.pid = registered.pid;
     let pe = Pe::parse(ntdll)?;
     let base = pe.image_base;
@@ -403,81 +428,102 @@ pub fn start<B: Backend>(
     machine.sys.exception_handler = Some(exception::deliver);
     machine.sys.context_run = Some(kuser::refresh);
 
-    let (view, initial) =
-        machine
-            .visit_context(Some(main), |env| {
-                let mut handles = [0; 3];
-                for (index, (fd, access)) in [
-                    (startup.stdin, GENERIC_READ),
-                    (startup.stdout, GENERIC_WRITE),
-                    (startup.stderr, GENERIC_WRITE),
-                ]
-                .into_iter()
-                .enumerate()
-                {
-                    if let Some(fd) = fd {
-                        handles[index] = server::fd_to_handle(env, fd, access | SYNCHRONIZE)
-                            .map_err(|error| match error {
+    let (view, initial) = machine
+        .visit_context(Some(main), |env| {
+            let mut handles = [0; 3];
+            for (index, (fd, access)) in [
+                (startup.stdin, GENERIC_READ),
+                (startup.stdout, GENERIC_WRITE),
+                (startup.stderr, GENERIC_WRITE),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                if let Some(fd) = fd {
+                    handles[index] =
+                        server::fd_to_handle(env, fd, access | SYNCHRONIZE).map_err(|error| {
+                            match error {
                                 status::Error::Status(code) => {
                                     Error::Status("standard handle", code)
                                 }
                                 status::Error::Unsupported(reason) => Error::Context(reason),
-                            })?;
-                    }
+                            }
+                        })?;
                 }
-                // As Wine's `build_initial_params`, once the server is there.
-                let mut environment = Environment::new(startup.environment);
-                environment.add_dynamic();
-                environment.add_registry(env).map_err(|error| match error {
-                    status::Error::Status(code) => Error::Status("environment", code),
-                    status::Error::Unsupported(reason) => Error::Context(reason),
-                })?;
-                let environment = environment.block();
-                let size = params::size(startup, &environment);
-                let memory = env.ext.get_mut::<Memory>();
-                let parameters = memory::allocate_committed(env.cpu, &mut env.sys.vm, memory, size)
-                    .ok_or(Error::AddressSpace)?;
-                env.cpu
-                    .write_u32(env.sys.peb + peb::PROCESS_PARAMETERS, parameters)?;
-                env.cpu.write(
-                    parameters,
-                    &params::build(startup, &environment, parameters, env.sys.pid, handles),
-                )?;
-                // win32u looks the driver up under the desktop's display
-                // device, the null GUID while no explorer names another.
-                registry::set_volatile_string(
-                    env,
-                    DISPLAY_DEVICE,
-                    "GraphicsDriver",
-                    startup.graphics_driver,
-                )
-                .map_err(|error| match error {
-                    status::Error::Status(code) => Error::Status("graphics driver", code),
-                    status::Error::Unsupported(reason) => Error::Context(reason),
-                })?;
-                if !startup.fonts.is_empty() {
-                    let fonts = crate::environment::user_key(env)
-                        .map(|user| format!(r"{user}\Software\Wine\Fonts"))
-                        .and_then(|key| {
-                            registry::set_volatile_string(env, &key, "Path", startup.fonts)
-                        });
-                    fonts.map_err(|error| match error {
-                        status::Error::Status(code) => Error::Status("font path", code),
-                        status::Error::Unsupported(reason) => Error::Context(reason),
-                    })?;
+            }
+            // As Wine's `build_initial_params`, once the server is there.
+            let mut environment = Environment::new(startup.environment);
+            environment.add_dynamic();
+            environment.add_registry(env).map_err(|error| match error {
+                status::Error::Status(code) => Error::Status("environment", code),
+                status::Error::Unsupported(reason) => Error::Context(reason),
+            })?;
+            let environment = environment.block();
+            let child = if registered.info_size != 0 {
+                let mut request = crate::protocol::GetStartupInfoRequest::default();
+                let mut bytes = vec![0; registered.info_size as usize];
+                let (reply, size) = server::request(env, &mut request, &[], &mut bytes)
+                    .map_err(|error| Error::Context(format!("startup info: {error:?}")))?;
+                if reply.header.error != 0 {
+                    return Err(Error::Status("startup info", reply.header.error));
                 }
-                crate::file::mount_drives(env).map_err(|error| match error {
-                    status::Error::Status(code) => Error::Status("drive letters", code),
+                bytes.truncate(size);
+                Some((bytes, reply.info_size))
+            } else {
+                None
+            };
+            let size = child.as_ref().map_or_else(
+                || params::size(startup, &environment),
+                |(bytes, _)| params::child_size(bytes),
+            );
+            let _host_size = params::size(startup, &environment);
+            let memory = env.ext.get_mut::<Memory>();
+            let parameters = memory::allocate_committed(env.cpu, &mut env.sys.vm, memory, size)
+                .ok_or(Error::AddressSpace)?;
+            env.cpu
+                .write_u32(env.sys.peb + peb::PROCESS_PARAMETERS, parameters)?;
+            env.cpu.write(
+                parameters,
+                &match &child {
+                    Some((bytes, info_size)) => params::child_block(bytes, *info_size, parameters)?,
+                    None => params::build(startup, &environment, parameters, env.sys.pid, handles),
+                },
+            )?;
+            // win32u looks the driver up under the desktop's display
+            // device, the null GUID while no explorer names another.
+            registry::set_volatile_string(
+                env,
+                DISPLAY_DEVICE,
+                "GraphicsDriver",
+                startup.graphics_driver,
+            )
+            .map_err(|error| match error {
+                status::Error::Status(code) => Error::Status("graphics driver", code),
+                status::Error::Unsupported(reason) => Error::Context(reason),
+            })?;
+            if !startup.fonts.is_empty() {
+                let fonts = crate::environment::user_key(env)
+                    .map(|user| format!(r"{user}\Software\Wine\Fonts"))
+                    .and_then(|key| {
+                        registry::set_volatile_string(env, &key, "Path", startup.fonts)
+                    });
+                fonts.map_err(|error| match error {
+                    status::Error::Status(code) => Error::Status("font path", code),
                     status::Error::Unsupported(reason) => Error::Context(reason),
                 })?;
-                let view = load_main_image(env, startup.image)?;
-                let state = env
-                    .cpu
-                    .capture_architecture()
-                    .map_err(|error| Error::Context(error.to_string()))?;
-                Ok::<_, Error>((view, state))
-            })
-            .map_err(Error::Context)??;
+            }
+            crate::file::mount_drives(env).map_err(|error| match error {
+                status::Error::Status(code) => Error::Status("drive letters", code),
+                status::Error::Unsupported(reason) => Error::Context(reason),
+            })?;
+            let view = load_main_image(env, startup.image)?;
+            let state = env
+                .cpu
+                .capture_architecture()
+                .map_err(|error| Error::Context(error.to_string()))?;
+            Ok::<_, Error>((view, state))
+        })
+        .map_err(Error::Context)??;
     for (offset, value) in [
         (peb::IMAGE_BASE_ADDRESS, view.base),
         (peb::IMAGE_SUBSYSTEM, view.info.subsystem),
@@ -515,12 +561,19 @@ pub fn start<B: Backend>(
         peb: u64::from(peb),
         ..Default::default()
     };
-    let (reply, _) = machine
-        .ext
-        .get_mut::<Link>()
-        .call(main, &mut done, &[], &mut [])?;
+    let (reply, _) =
+        machine
+            .ext
+            .get_mut::<Link>()
+            .call(main, &mut machine.cpu, &mut done, &[], &mut [])?;
     if reply.header.error != 0 {
         return Err(Error::Status("init_process_done", reply.header.error));
+    }
+    if reply.suspend != 0 {
+        machine
+            .visit_context(Some(main), signals::suspend)
+            .map_err(Error::Context)?
+            .map_err(|e| Error::Context(format!("suspend: {e:?}")))?;
     }
     Ok(Process {
         ntdll,
@@ -691,8 +744,7 @@ pub fn create_user_process(env: &mut Env<'_>, args: &[u32]) -> adv_machine::Outc
     if desktop && let Some(&Desktop(start)) = env.ext.try_get::<Desktop>() {
         return start(env, Box::new(refuse));
     }
-    log::warn!("NtCreateUserProcess: another process is not supported");
-    refuse(env)
+    creation::create(env, args)
 }
 
 fn read_unicode_string(cpu: &dyn Guest, at: u32) -> Option<String> {
@@ -743,27 +795,25 @@ pub fn terminate(env: &mut Env<'_>, args: &[u32]) -> adv_machine::Outcome {
 /// NtSuspendProcess(process)
 pub fn suspend(env: &mut Env<'_>, args: &[u32]) -> adv_machine::Outcome {
     status::finish((|| {
-        crate::information::current_process(env, args[0])?;
         let mut request = crate::protocol::SuspendProcessRequest {
             handle: args[0],
             ..Default::default()
         };
         let (reply, _) = server::request(env, &mut request, &[], &mut [])?;
         status::check(reply.header.error)?;
-        crate::thread::refresh_suspension(env)
+        Ok(())
     })())
 }
 
 /// NtResumeProcess(process)
 pub fn resume(env: &mut Env<'_>, args: &[u32]) -> adv_machine::Outcome {
     status::finish((|| {
-        crate::information::current_process(env, args[0])?;
         let mut request = crate::protocol::ResumeProcessRequest {
             handle: args[0],
             ..Default::default()
         };
         let (reply, _) = server::request(env, &mut request, &[], &mut [])?;
         status::check(reply.header.error)?;
-        crate::thread::refresh_suspension(env)
+        Ok(())
     })())
 }

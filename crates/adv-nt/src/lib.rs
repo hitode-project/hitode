@@ -9,6 +9,7 @@
 //! code that another crate loads (see [`unixlib`] and [`win32k`]).
 #![cfg(unix)]
 
+mod apc;
 pub mod atom;
 pub mod context;
 pub mod debug;

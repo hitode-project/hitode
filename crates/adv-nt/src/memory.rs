@@ -374,8 +374,12 @@ fn finish(result: Result<(), Status>) -> Outcome {
 /// NtAllocateVirtualMemory(process, *base, zero_bits, *size, type, protection)
 pub fn allocate(env: &mut Env<'_>, args: &[u32]) -> Outcome {
     if args[0] != CURRENT_PROCESS {
-        if let Err(error) = crate::information::current_process(env, args[0]) {
-            return status::finish(Err(error));
+        match crate::information::current_process(env, args[0]) {
+            Ok(()) => {}
+            Err(crate::status::Error::Status(status::NOT_SUPPORTED)) => {
+                return crate::apc::memory(env, args, 3);
+            }
+            Err(error) => return status::finish(Err(error)),
         }
         let mut args = args.to_vec();
         args[0] = CURRENT_PROCESS;
@@ -525,8 +529,12 @@ fn allocate_in(
 /// NtFreeVirtualMemory(process, *base, *size, type)
 pub fn free(env: &mut Env<'_>, args: &[u32]) -> Outcome {
     if args[0] != CURRENT_PROCESS {
-        if let Err(error) = crate::information::current_process(env, args[0]) {
-            return status::finish(Err(error));
+        match crate::information::current_process(env, args[0]) {
+            Ok(()) => {}
+            Err(crate::status::Error::Status(status::NOT_SUPPORTED)) => {
+                return crate::apc::memory(env, args, 5);
+            }
+            Err(error) => return status::finish(Err(error)),
         }
         let mut args = args.to_vec();
         args[0] = CURRENT_PROCESS;
@@ -615,8 +623,12 @@ fn free_in(env: &mut Env<'_>, args: &[u32]) -> Result<(), Status> {
 /// NtProtectVirtualMemory(process, *base, *size, protection, *old)
 pub fn protect(env: &mut Env<'_>, args: &[u32]) -> Outcome {
     if args[0] != CURRENT_PROCESS {
-        if let Err(error) = crate::information::current_process(env, args[0]) {
-            return status::finish(Err(error));
+        match crate::information::current_process(env, args[0]) {
+            Ok(()) => {}
+            Err(crate::status::Error::Status(status::NOT_SUPPORTED)) => {
+                return crate::apc::memory(env, args, 7);
+            }
+            Err(error) => return status::finish(Err(error)),
         }
         let mut args = args.to_vec();
         args[0] = CURRENT_PROCESS;
@@ -663,8 +675,12 @@ fn protect_in(env: &mut Env<'_>, args: &[u32]) -> Result<(), Status> {
 /// NtQueryVirtualMemory(process, address, class, *buffer, length, *returned)
 pub fn query(env: &mut Env<'_>, args: &[u32]) -> Outcome {
     if args[0] != CURRENT_PROCESS {
-        if let Err(error) = crate::information::current_process(env, args[0]) {
-            return status::finish(Err(error));
+        match crate::information::current_process(env, args[0]) {
+            Ok(()) => {}
+            Err(crate::status::Error::Status(status::NOT_SUPPORTED)) => {
+                return crate::apc::memory(env, args, 6);
+            }
+            Err(error) => return status::finish(Err(error)),
         }
         let mut args = args.to_vec();
         args[0] = CURRENT_PROCESS;
@@ -782,7 +798,12 @@ pub fn guest_protection(memory: &Memory, protection: u32) -> Prot {
 /// NtFlushInstructionCache(process, address, size). Every guest store already
 /// commits through the CPU's code-mutation barrier before execution resumes.
 pub fn flush_instruction_cache(env: &mut Env<'_>, args: &[u32]) -> Outcome {
-    status::finish(crate::information::current_process(env, args[0]))
+    match crate::information::current_process(env, args[0]) {
+        Err(crate::status::Error::Status(status::NOT_SUPPORTED)) => {
+            Outcome::Return(status::SUCCESS)
+        }
+        result => status::finish(result),
+    }
 }
 
 /// NtAllocateVirtualMemoryEx(process, *base, *size, type, protection, *parameters, count)
@@ -1062,7 +1083,21 @@ pub fn read_virtual(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         unreachable!()
     };
     let result = (|| {
-        crate::information::current_process(env, process)?;
+        if let Err(error) = crate::information::current_process(env, process) {
+            if !matches!(error, crate::status::Error::Status(status::NOT_SUPPORTED)) {
+                return Err(error);
+            }
+            let mut bytes = vec![0; size as usize];
+            let mut request = crate::protocol::ReadProcessMemoryRequest {
+                handle: process,
+                addr: u64::from(source),
+                ..Default::default()
+            };
+            let (reply, count) = crate::server::request(env, &mut request, &[], &mut bytes)?;
+            status::check(reply.header.error)?;
+            crate::object::write_bytes(env, destination, &bytes[..count])?;
+            return Ok(());
+        }
         if !env.cpu.accessible(destination, size, Prot::WRITE) {
             return Err(status::ACCESS_VIOLATION.into());
         }
@@ -1089,7 +1124,23 @@ pub fn write_virtual(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         unreachable!()
     };
     let result = (|| {
-        crate::information::current_process(env, process)?;
+        if let Err(error) = crate::information::current_process(env, process) {
+            if !matches!(error, crate::status::Error::Status(status::NOT_SUPPORTED)) {
+                return Err(error);
+            }
+            let mut bytes = vec![0; size as usize];
+            env.cpu
+                .read(source, &mut bytes)
+                .map_err(|_| status::ACCESS_VIOLATION)?;
+            let mut request = crate::protocol::WriteProcessMemoryRequest {
+                handle: process,
+                addr: u64::from(destination),
+                ..Default::default()
+            };
+            let (reply, _) = crate::server::request(env, &mut request, &[&bytes], &mut [])?;
+            status::check(reply.header.error)?;
+            return Ok(());
+        }
         let mut bytes = vec![0; size as usize];
         if !env.cpu.accessible(source, size, Prot::READ)
             || env.cpu.read(source, &mut bytes).is_err()
@@ -1166,6 +1217,14 @@ pub fn set_ldt_entries(_env: &mut Env<'_>, _args: &[u32]) -> Outcome {
 
 /// NtFlushVirtualMemory(process, *base, *size, unknown)
 pub fn flush_virtual(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    if args[0] != u32::MAX
+        && matches!(
+            crate::information::current_process(env, args[0]),
+            Err(crate::status::Error::Status(status::NOT_SUPPORTED))
+        )
+    {
+        return crate::apc::memory(env, args, 8);
+    }
     status::finish((|| {
         let address = read(env, args[1])? & !(PAGE - 1);
         let size = read(env, args[2])?;
@@ -1189,11 +1248,27 @@ pub fn flush_virtual(env: &mut Env<'_>, args: &[u32]) -> Outcome {
 
 /// NtLockVirtualMemory(process, *base, *size, unknown)
 pub fn lock_virtual(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    if args[0] != u32::MAX
+        && matches!(
+            crate::information::current_process(env, args[0]),
+            Err(crate::status::Error::Status(status::NOT_SUPPORTED))
+        )
+    {
+        return crate::apc::memory(env, args, 9);
+    }
     pin_virtual(env, args, true)
 }
 
 /// NtUnlockVirtualMemory(process, *base, *size, unknown)
 pub fn unlock_virtual(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    if args[0] != u32::MAX
+        && matches!(
+            crate::information::current_process(env, args[0]),
+            Err(crate::status::Error::Status(status::NOT_SUPPORTED))
+        )
+    {
+        return crate::apc::memory(env, args, 10);
+    }
     pin_virtual(env, args, false)
 }
 

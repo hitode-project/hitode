@@ -9,6 +9,7 @@
 //! last until the server stops.
 use adv_drv::user::project;
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -71,6 +72,25 @@ pub struct Session {
     wake: WakeEvent,
     audio: adv_device::AudioControl,
     metrics: ControlMetrics,
+    shared: Shared,
+    settings: Settings,
+    finished: Option<u32>,
+    idle: BTreeMap<i32, Option<u64>>,
+    foreground: i32,
+    delivered: u64,
+}
+
+struct Settings {
+    dist: PathBuf,
+    prefix: PathBuf,
+    locale: u32,
+    fonts: String,
+    debug: String,
+    width: u32,
+    height: u32,
+    jit: bool,
+    ntdll: Vec<u8>,
+    apisets: Vec<u8>,
 }
 
 /// Wine's Unix side, then the graphics fronts and the user driver.
@@ -102,19 +122,117 @@ impl Clock for GuestClock {
 struct Driver {
     server: Server,
     clock: GuestClock,
+    parked: BTreeMap<i32, Machine<Cpu>>,
+    signals: Vec<(i32, i32, i32)>,
+    generation: u64,
+    deadline: Option<Instant>,
 }
 
 /// The server, which the session's processes share.
 #[derive(Clone)]
-struct Shared(Rc<RefCell<Driver>>);
+struct Shared {
+    driver: Rc<RefCell<Driver>>,
+    id: Rc<Cell<i32>>,
+}
 
-impl Progress for Shared {
-    fn run_server(&mut self, time: Time) {
-        let driver = &mut *self.0.borrow_mut();
-        driver.clock.0.set(time);
-        if let State::Exited(status) = driver.server.step(&driver.clock) {
-            log::warn!("wineserver stopped with status {status}");
+struct Trace<'a, 'b> {
+    active: i32,
+    cpu: Option<&'a mut dyn Guest>,
+    parked: &'b mut BTreeMap<i32, Machine<Cpu>>,
+    signals: &'b mut Vec<(i32, i32, i32)>,
+}
+impl adv_wineserver::Tracing for Trace<'_, '_> {
+    fn signal(&mut self, pid: i32, tid: i32, sig: i32) -> bool {
+        self.signals.push((pid, tid, sig));
+        true
+    }
+    fn read_memory(&mut self, pid: i32, address: u64, bytes: &mut [u8]) -> u32 {
+        let cpu = if pid == self.active {
+            self.cpu.as_deref_mut()
+        } else {
+            self.parked
+                .get_mut(&pid)
+                .map(|m| &mut m.cpu as &mut dyn Guest)
+        };
+        let Some(cpu) = cpu else { return 0xc000_000b };
+        if address > u32::MAX as u64 || bytes.len() > 64 * 1024 * 1024 {
+            return 0xc000_000d;
         }
+        if cpu.read(address as u32, bytes).is_ok() {
+            0
+        } else {
+            0x8000_000d
+        }
+    }
+    fn write_memory(&mut self, pid: i32, address: u64, bytes: &[u8]) -> u32 {
+        let cpu = if pid == self.active {
+            self.cpu.as_deref_mut()
+        } else {
+            self.parked
+                .get_mut(&pid)
+                .map(|m| &mut m.cpu as &mut dyn Guest)
+        };
+        let Some(cpu) = cpu else { return 0xc000_000b };
+        if address > u32::MAX as u64 || bytes.len() > 64 * 1024 * 1024 {
+            return 0xc000_000d;
+        }
+        if !cpu.accessible(
+            address as u32,
+            bytes.len() as u32,
+            adv_cpu::backend::Prot::WRITE,
+        ) {
+            return 0x8000_000d;
+        }
+        if cpu.write(address as u32, bytes).is_ok() {
+            0
+        } else {
+            0x8000_000d
+        }
+    }
+}
+impl Shared {
+    fn step(&mut self, time: Time, cpu: Option<&mut dyn Guest>) {
+        let mut driver = self.driver.borrow_mut();
+        let Driver {
+            server,
+            clock,
+            parked,
+            signals,
+            generation,
+            deadline,
+        } = &mut *driver;
+        clock.0.set(time);
+        let state = server.step_with_tracing(
+            clock,
+            &mut Trace {
+                active: self.id.get(),
+                cpu,
+                parked,
+                signals,
+            },
+        );
+        *generation += 1;
+        *deadline = match state {
+            State::Waiting(Some(delay)) => Some(Instant::now() + delay),
+            _ => None,
+        };
+    }
+    fn process(&self) -> Self {
+        Self {
+            driver: self.driver.clone(),
+            id: Rc::new(Cell::new(0)),
+        }
+    }
+}
+impl Progress for Shared {
+    fn interrupt_pending(&self) -> bool {
+        !self.driver.borrow().signals.is_empty()
+    }
+    fn run_server(&mut self, time: Time) {
+        self.step(time, None);
+    }
+    fn run_server_for(&mut self, time: Time, cpu: &mut dyn Guest) {
+        self.step(time, Some(cpu));
     }
 }
 
@@ -394,10 +512,17 @@ impl Session {
         )
         .map_err(|e| e.to_string())?;
         let socket = server.socket_dir().ok_or("the server has no socket")?;
-        let shared = Shared(Rc::new(RefCell::new(Driver {
-            server,
-            clock: time,
-        })));
+        let shared = Shared {
+            driver: Rc::new(RefCell::new(Driver {
+                server,
+                clock: time,
+                parked: BTreeMap::new(),
+                signals: vec![],
+                generation: 0,
+                deadline: None,
+            })),
+            id: Rc::new(Cell::new(0)),
+        };
 
         // As Wine's `run_wineboot`, but restarting: the template stands for
         // what `--init` installs, and no services run.
@@ -455,55 +580,355 @@ impl Session {
             graphics_driver: super::GRAPHICS_DRIVER,
             fonts: config.fonts,
         };
-        process::start(
+        let started = process::start(
             &mut machine,
             &ntdll,
             &apisets,
             &startup,
             &prefix,
             &socket,
-            Box::new(shared),
+            Box::new(shared.clone()),
         )
         .map_err(|e| e.to_string())?;
+        shared.id.set(started.thread.unix_pid);
+        machine.ext.insert(process::Children::default());
+        machine.ext.insert(shared.clone());
         Ok(Session {
             machine,
             wake,
             audio,
             metrics: ControlMetrics::default(),
+            foreground: shared.id.get(),
+            delivered: 0,
+            shared,
+            finished: None,
+            idle: BTreeMap::new(),
+            settings: Settings {
+                dist: config.dist.to_owned(),
+                prefix: prefix.clone(),
+                locale: config.locale,
+                fonts: config.fonts.to_owned(),
+                debug: config.debug.to_owned(),
+                width: config.width,
+                height: config.height,
+                jit: config.jit,
+                ntdll,
+                apisets,
+            },
         })
     }
 
-    /// Run the guest until it exits or `until` passes; see [`run`].
+    /// Run the family on its single execution owner.
     pub fn run(&mut self, until: Instant) -> Stop {
-        let stop = run(
-            &mut self.machine,
-            &self.wake,
-            until,
-            serve,
-            None,
-            Some(&mut self.metrics),
-        );
-        if !matches!(stop, Stop::Paused) {
-            project::stopped(&mut self.machine.ext);
-        }
-        stop
+        self.run_family(until, false)
+    }
+    pub fn run_ui(&mut self, until: Instant) -> Stop {
+        self.run_family(until, true)
     }
 
-    /// Run up to one presentation, so control frame gates observe every frame.
-    pub fn run_ui(&mut self, until: Instant) -> Stop {
-        let frame = self.presented_frames();
-        let stop = run(
-            &mut self.machine,
-            &self.wake,
-            until,
-            serve,
-            Some(frame),
-            Some(&mut self.metrics),
-        );
-        if !matches!(stop, Stop::Paused) {
-            project::stopped(&mut self.machine.ext);
+    fn run_family(&mut self, until: Instant, stop_frame: bool) -> Stop {
+        let result = self.run_family_inner(until, stop_frame);
+        if self.shared.id.get() != self.foreground
+            && self
+                .shared
+                .driver
+                .borrow()
+                .parked
+                .contains_key(&self.foreground)
+            && let Err(error) = self.select(self.foreground)
+        {
+            return Stop::Failed(error);
         }
-        stop
+        result
+    }
+
+    fn run_family_inner(&mut self, until: Instant, stop_frame: bool) -> Stop {
+        if let Some(code) = self.finished {
+            return Stop::Exited(code);
+        }
+        let frame = self.presented_frames();
+        loop {
+            self.wake.take_interrupt();
+            if Instant::now() >= until {
+                return Stop::Paused;
+            }
+            if let Err(error) = self.spawn_children().and_then(|_| self.deliver()) {
+                return Stop::Failed(error);
+            }
+            let before = self.presented_frames();
+            let started = Instant::now();
+            let result =
+                if let Some(code) = self.machine.sys.process_identity.completion.exit_code() {
+                    SliceResult::Complete(RunResult::Exited(code))
+                } else {
+                    self.machine.run_slice(Duration::from_millis(10))
+                };
+            self.metrics.run_time += started.elapsed();
+            if let Err(error) = serve(&mut self.machine) {
+                return Stop::Failed(error);
+            }
+            let id = self.shared.id.get();
+            if self.presented_frames() != before
+                && project::view(&self.machine.ext).top != 0
+                && self.foreground != id
+                && let Err(error) = self.set_foreground(id)
+            {
+                return Stop::Failed(error);
+            }
+            match result {
+                SliceResult::Complete(RunResult::Exited(code)) => {
+                    self.machine.ext.get::<process::Children>().exited();
+                    if !self.audio.remove_owner(self.machine.sys.pid) {
+                        return Stop::Failed("audio command limit".into());
+                    }
+                    let shown = self.foreground == id && project::view(&self.machine.ext).top != 0;
+                    let visible = self
+                        .shared
+                        .driver
+                        .borrow()
+                        .parked
+                        .values()
+                        .any(|m| project::view(&m.ext).windows.iter().any(|w| w.visible));
+                    if shown && !visible {
+                        self.shared.driver.borrow_mut().parked.clear();
+                        self.finished = Some(code);
+                        project::stopped(&mut self.machine.ext);
+                        return Stop::Exited(code);
+                    }
+                    let next = self.shared.driver.borrow().parked.keys().next().copied();
+                    if let Some(next) = next {
+                        if let Err(error) = self.select(next) {
+                            return Stop::Failed(error);
+                        }
+                        if self.foreground == id {
+                            self.foreground = next;
+                        }
+                        self.shared.driver.borrow_mut().parked.remove(&id);
+                        self.idle.remove(&id);
+                    } else {
+                        self.finished = Some(code);
+                        project::stopped(&mut self.machine.ext);
+                        return Stop::Exited(code);
+                    }
+                }
+                SliceResult::Complete(RunResult::Failed(error)) => {
+                    return Stop::Failed(format!("{error:?}"));
+                }
+                SliceResult::Complete(RunResult::Idle { next_deadline }) => {
+                    self.idle.insert(id, next_deadline);
+                }
+                _ => {
+                    self.idle.remove(&id);
+                }
+            }
+            if stop_frame && self.presented_frames() != frame {
+                return Stop::Paused;
+            }
+            if let Err(error) = self.spawn_children() {
+                return Stop::Failed(error);
+            }
+            // Server pipes wake waiting clients; parked clients do no guest work.
+            let ids: Vec<_> = self.shared.driver.borrow().parked.keys().copied().collect();
+            for pid in &ids {
+                let mut machine = self.shared.driver.borrow_mut().parked.remove(pid).unwrap();
+                if machine
+                    .visit_context(None, adv_nt::server::deliver)
+                    .unwrap_or(false)
+                {
+                    self.idle.remove(pid);
+                }
+                self.shared.driver.borrow_mut().parked.insert(*pid, machine);
+            }
+            let now = self.machine.sys.clock.now_us();
+            let ready = ids.into_iter().find(|pid| {
+                !self.idle.contains_key(pid)
+                    || self.idle[pid].is_some_and(|deadline| deadline <= now)
+            });
+            if let Some(pid) = ready {
+                if let Err(error) = self.select(pid) {
+                    return Stop::Failed(error);
+                }
+                continue;
+            }
+            if !self.idle.contains_key(&self.shared.id.get()) {
+                continue;
+            }
+            // Let server timers fire even when every client is waiting.
+            let mut wait = until.saturating_duration_since(Instant::now());
+            for deadline in self.idle.values().flatten() {
+                wait = wait.min(Duration::from_micros(deadline.saturating_sub(now)));
+            }
+            if let Some(deadline) = self.shared.driver.borrow().deadline {
+                wait = wait.min(deadline.saturating_duration_since(Instant::now()));
+            }
+            self.machine
+                .sys
+                .clock
+                .begin_wait(Some(now + wait.as_micros() as u64));
+            let started = Instant::now();
+            if let Err(error) = self.wake.wait(Some(wait)) {
+                return Stop::Failed(error.to_string());
+            }
+            self.metrics.idle_waits += 1;
+            self.metrics.wait_time += started.elapsed();
+            let _ = self.machine.visit_context(None, adv_nt::server::run);
+            if let Err(error) = self.deliver() {
+                return Stop::Failed(error);
+            }
+            self.idle.clear();
+        }
+    }
+
+    fn deliver(&mut self) -> Result<(), String> {
+        let generation = self.shared.driver.borrow().generation;
+        if generation == self.delivered {
+            return Ok(());
+        }
+        self.delivered = generation;
+        let signals = std::mem::take(&mut self.shared.driver.borrow_mut().signals);
+        for (pid, tid, sig) in signals {
+            if pid == self.shared.id.get() {
+                process::signals::deliver(&mut self.machine, tid, sig)?;
+                self.idle.remove(&pid);
+            } else {
+                let target = self.shared.driver.borrow_mut().parked.remove(&pid);
+                if let Some(mut machine) = target {
+                    process::signals::deliver(&mut machine, tid, sig)?;
+                    self.shared.driver.borrow_mut().parked.insert(pid, machine);
+                    self.idle.remove(&pid);
+                }
+            }
+        }
+        if process::signals::wake(&mut self.machine)? {
+            self.idle.remove(&self.shared.id.get());
+        }
+        let ids: Vec<_> = self.shared.driver.borrow().parked.keys().copied().collect();
+        for pid in ids {
+            let mut machine = self.shared.driver.borrow_mut().parked.remove(&pid).unwrap();
+            if process::signals::wake(&mut machine)? {
+                self.idle.remove(&pid);
+            }
+            self.shared.driver.borrow_mut().parked.insert(pid, machine);
+        }
+        Ok(())
+    }
+
+    fn set_foreground(&mut self, id: i32) -> Result<(), String> {
+        if self.foreground == id {
+            return Ok(());
+        }
+        let current = self.shared.id.get();
+        self.select(self.foreground)?;
+        let mut target = self
+            .shared
+            .driver
+            .borrow_mut()
+            .parked
+            .remove(&id)
+            .ok_or("foreground process disappeared")?;
+        let memory = crate::graphics::guest_memory(&mut self.machine.cpu);
+        self.machine
+            .ext
+            .get_mut::<SurfaceStore>()
+            .transfer_frame_mailbox_to(target.ext.get_mut::<SurfaceStore>(), &memory)?;
+        self.shared.driver.borrow_mut().parked.insert(id, target);
+        self.foreground = id;
+        self.select(current)
+    }
+
+    fn select(&mut self, id: i32) -> Result<(), String> {
+        let mut next = self
+            .shared
+            .driver
+            .borrow_mut()
+            .parked
+            .remove(&id)
+            .ok_or("unknown process")?;
+        next.sys.clock = self.machine.sys.clock.clone();
+        std::mem::swap(&mut self.machine, &mut next);
+        self.shared
+            .driver
+            .borrow_mut()
+            .parked
+            .insert(self.shared.id.get(), next);
+        self.shared.id = self.machine.ext.get::<Shared>().id.clone();
+        Ok(())
+    }
+
+    fn spawn_children(&mut self) -> Result<(), String> {
+        let pending = std::mem::take(&mut self.machine.ext.get_mut::<process::Children>().pending);
+        for child in pending {
+            let shared = self.shared.process();
+            let c = &self.settings;
+            let config = Config {
+                dist: &c.dist,
+                prefix: &c.prefix,
+                drive: None,
+                locale: c.locale,
+                fonts: &c.fonts,
+                exe: Path::new(&child.image),
+                width: c.width,
+                height: c.height,
+                jit: c.jit,
+                debug: &c.debug,
+                stdout: None,
+            };
+            let mut machine = new_machine(
+                &config,
+                &c.prefix,
+                self.machine.sys.clock.clone(),
+                &self.wake,
+                &self.audio,
+            )?;
+            machine.inherit_policy(&self.machine);
+            machine
+                .cpu
+                .set_background_sender(self.machine.cpu.background_sender()?)
+                .map_err(|e| e.to_string())?;
+            #[cfg(feature = "gpu")]
+            adv_dx::d3d9::fork_host_state(&self.machine.ext, &mut machine.ext)?;
+            let mut progress = shared.clone();
+            let (connection, registered) = adv_nt::server::Connection::from_socket(
+                child.socket,
+                &mut progress,
+                Time::now(&mut machine.sys.clock),
+            )
+            .map_err(|e| e.to_string())?;
+            shared.id.set(registered.unix_pid);
+            let startup = Startup {
+                image: &child.image,
+                command_line: "",
+                directory: "",
+                environment: &[],
+                locale: c.locale,
+                debug: &c.debug,
+                stdin: None,
+                stdout: None,
+                stderr: None,
+                graphics_driver: super::GRAPHICS_DRIVER,
+                fonts: &c.fonts,
+            };
+            process::start_connected(
+                &mut machine,
+                &c.ntdll,
+                &c.apisets,
+                &startup,
+                &c.prefix,
+                Box::new(shared.clone()),
+                (connection, registered),
+            )
+            .map_err(|e| e.to_string())?;
+            machine
+                .ext
+                .insert(self.machine.ext.get::<process::Children>().fork());
+            machine.ext.insert(shared.clone());
+            self.shared
+                .driver
+                .borrow_mut()
+                .parked
+                .insert(shared.id.get(), machine);
+        }
+        Ok(())
     }
 
     pub fn control_metrics(&self) -> &ControlMetrics {

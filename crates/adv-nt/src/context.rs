@@ -194,6 +194,68 @@ pub fn load_debug(env: &mut adv_machine::Env<'_>, target: adv_machine::CtxId, by
     bytes[4..28].copy_from_slice(&registers);
 }
 
+/// Wine's i386 fields within context_data's architecture unions.
+pub(crate) fn to_server(image: &[u8; SIZE]) -> [u8; 1720] {
+    let mut wire = [0; 1720];
+    put(&mut wire, 0, 0x14c);
+    put(&mut wire, 4, get(image, 0) & 0x3f);
+    for (to, from, len) in [
+        (8, 0xb8, 4),
+        (12, 0xb4, 4),
+        (16, 0xc4, 4),
+        (20, 0xc0, 4),
+        (24, 0xbc, 4),
+        (28, 0xc8, 4),
+        (40, 0xb0, 4),
+        (44, 0xa4, 4),
+        (48, 0xac, 4),
+        (52, 0xa8, 4),
+        (56, 0xa0, 4),
+        (60, 0x9c, 4),
+        (288, 0x98, 4),
+        (292, 0x94, 4),
+        (296, 0x90, 4),
+        (300, 0x8c, 4),
+        (304, 0x1c, 112),
+        (824, 4, 24),
+        (944, 0xcc, 512),
+    ] {
+        wire[to..to + len].copy_from_slice(&image[from..from + len]);
+    }
+    wire
+}
+
+pub(crate) fn from_server(wire: &[u8], image: &mut [u8; SIZE]) {
+    let flags = get(wire, 4);
+    let flags_out = get(image, 0) | 0x10000 | flags & 0x3f;
+    put(image, 0, flags_out);
+    for (part, from, to, len) in [
+        (1, 8, 0xb8, 4),
+        (1, 12, 0xb4, 4),
+        (1, 16, 0xc4, 4),
+        (1, 20, 0xc0, 4),
+        (1, 24, 0xbc, 4),
+        (1, 28, 0xc8, 4),
+        (2, 40, 0xb0, 4),
+        (2, 44, 0xa4, 4),
+        (2, 48, 0xac, 4),
+        (2, 52, 0xa8, 4),
+        (2, 56, 0xa0, 4),
+        (2, 60, 0x9c, 4),
+        (4, 288, 0x98, 4),
+        (4, 292, 0x94, 4),
+        (4, 296, 0x90, 4),
+        (4, 300, 0x8c, 4),
+        (8, 304, 0x1c, 112),
+        (16, 824, 4, 24),
+        (32, 944, 0xcc, 512),
+    ] {
+        if flags & part != 0 {
+            image[to..to + len].copy_from_slice(&wire[from..from + len]);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

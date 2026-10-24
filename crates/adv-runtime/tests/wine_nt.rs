@@ -118,13 +118,7 @@ fn l_process() {
                     adv_nt::process::suspend(env, &[u32::MAX]),
                     adv_machine::Outcome::Return(0)
                 ));
-                assert!(
-                    env.sys
-                        .contexts
-                        .iter()
-                        .filter(|context| !context.is_done())
-                        .all(|context| context.suspend_count == 1)
-                );
+
                 assert!(matches!(
                     adv_nt::process::resume(env, &[u32::MAX]),
                     adv_machine::Outcome::Return(0)
@@ -330,6 +324,53 @@ fn m_system() {
             "debug-continue-invalid",
             "debug-detach-unattached",
             "debug-wait-timeout",
+        ],
+    );
+}
+
+// spec: WINE-SYS-4, PROC-ISO-1, PROC-HANDLE-1, PROC-CREATE-2
+#[test]
+fn children() {
+    let Some((stop, text)) = probe("children", "nt_children.exe", |_, _| {}) else {
+        return;
+    };
+    assert!(matches!(stop, Stop::Exited(0)), "{stop:?}: {text}");
+    assert_checks(
+        &text,
+        "=ok",
+        &[
+            "create_process",
+            "wait_child",
+            "child_exit",
+            "create_suspended",
+            "get_context",
+            "set_context",
+            "remote_allocate",
+            "remote_write",
+            "remote_read",
+            "remote_query",
+            "remote_protect",
+            "remote_thread",
+            "remote_thread_wait",
+            "remote_load_library",
+            "remote_free",
+            "resume_child",
+            "suspended_child_wait",
+            "suspended_child_exit",
+            "create_pipe",
+            "pipe_child",
+            "pipe_read",
+            "pipe_child_wait",
+            "pipe_child_exit",
+            "loop_pipe",
+            "loop_child",
+            "loop_ready",
+            "running_suspend",
+            "running_context",
+            "running_resume",
+            "terminate_child",
+            "terminated_wait",
+            "terminated_exit",
         ],
     );
 }

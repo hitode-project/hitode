@@ -34,6 +34,14 @@ const PS_ATTRIBUTE_GROUP_AFFINITY: u32 = 0x2_000b;
 /// NtCreateThreadEx(*handle, access, *attributes, process, start, param,
 /// flags, zero_bits, stack_commit, stack_reserve, *attribute_list)
 pub fn create(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    if args[3] != CURRENT_PROCESS
+        && matches!(
+            crate::information::current_process(env, args[3]),
+            Err(Error::Status(status::NOT_SUPPORTED))
+        )
+    {
+        return crate::apc::create_thread(env, args);
+    }
     let &[
         handle,
         access,
@@ -81,7 +89,7 @@ pub fn create(env: &mut Env<'_>, args: &[u32]) -> Outcome {
             .map_err(|error| Error::Unsupported(format!("thread stack: {error}")))?;
         let teb = env.sys.contexts[context as usize].teb;
         if server::init_thread(env, new, context, reply.tid, teb, start)? {
-            env.sys.suspend_context(context);
+            process::signals::queue(env, context);
         }
         if attribute_list != 0 {
             update_attribute_list(env, attribute_list, reply.tid, teb)?;
@@ -157,11 +165,6 @@ pub fn suspend(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         };
         let (reply, _) = server::request(env, &mut request, &[], &mut [])?;
         status::check(reply.header.error)?;
-        if reply.count == 0
-            && let Some(context) = context_of(env, thread)?
-        {
-            env.sys.suspend_context(context);
-        }
         if previous != 0 {
             write_u32(env, previous, reply.count as u32)?;
         }
@@ -181,11 +184,6 @@ pub fn resume(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         };
         let (reply, _) = server::request(env, &mut request, &[], &mut [])?;
         status::check(reply.header.error)?;
-        if reply.count == 1
-            && let Some(context) = context_of(env, thread)?
-        {
-            env.sys.resume_context(context);
-        }
         if previous != 0 {
             write_u32(env, previous, reply.count as u32)?;
         }
@@ -269,6 +267,9 @@ fn initial_context(env: &mut Env<'_>, thread: u32, access: u32) -> Result<Option
 
 /// NtGetContextThread(thread, *context)
 pub fn get_context(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    if args[0] != CURRENT_THREAD && env.ext.try_get::<process::Children>().is_some() {
+        return remote_get_context(env, args[0], args[1], 0);
+    }
     let &[thread, output] = args else {
         unreachable!()
     };
@@ -331,6 +332,23 @@ pub fn get_context(env: &mut Env<'_>, args: &[u32]) -> Outcome {
 
 /// NtSetContextThread(thread, *context)
 pub fn set_context(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    if args[0] != CURRENT_THREAD && env.ext.try_get::<process::Children>().is_some() {
+        let mut image = [0; crate::context::SIZE];
+        if env.cpu.read(args[1], &mut image).is_err() {
+            return Outcome::Return(status::ACCESS_VIOLATION);
+        }
+        let flags = u32::from_le_bytes(image[..4].try_into().unwrap()) | 0x10000;
+        image[..4].copy_from_slice(&flags.to_le_bytes());
+        let wire = crate::context::to_server(&image);
+        let mut request = crate::protocol::SetThreadContextRequest {
+            handle: args[0],
+            ..Default::default()
+        };
+        return status::finish(
+            server::request(env, &mut request, &[&wire], &mut [])
+                .and_then(|(reply, _)| status::check(reply.header.error)),
+        );
+    }
     let &[thread, input] = args else {
         unreachable!()
     };
@@ -417,38 +435,37 @@ pub fn processor_number(_: &mut Env<'_>, _: &[u32]) -> Outcome {
     Outcome::Return(0)
 }
 
-/// Reflects the server's thread suspend counts after a process operation.
-pub(crate) fn refresh_suspension(env: &mut Env<'_>) -> Result<(), Error> {
-    let contexts: Vec<_> = env
-        .sys
-        .contexts
-        .iter()
-        .enumerate()
-        .filter(|(_, context)| !context.is_done())
-        .map(|(id, context)| (id as CtxId, context.teb))
-        .collect();
-    for (context, teb) in contexts {
-        let mut open = crate::protocol::OpenThreadRequest {
-            tid: read_u32(env, teb + 0x24)?,
-            access: 0x800,
-            ..Default::default()
-        };
-        let (opened, _) = server::request(env, &mut open, &[], &mut [])?;
-        status::check(opened.header.error)?;
-        let mut query = GetThreadInfoRequest {
-            handle: opened.handle,
-            ..Default::default()
-        };
-        let result = server::request(env, &mut query, &[], &mut []);
-        server::close(env, opened.handle)?;
-        let (reply, _) = result?;
-        status::check(reply.header.error)?;
-        let suspended = env.sys.contexts[context as usize].suspend_count != 0;
-        if reply.suspend_count != 0 && !suspended {
-            env.sys.suspend_context(context);
-        } else if reply.suspend_count == 0 && suspended {
-            env.sys.resume_context(context);
+fn remote_get_context(env: &mut Env<'_>, thread: u32, output: u32, pending: u32) -> Outcome {
+    let flags = match read_u32(env, output) {
+        Ok(flags) => flags,
+        Err(e) => return Outcome::Return(e),
+    };
+    let mut request = crate::protocol::GetThreadContextRequest {
+        handle: thread,
+        context: pending,
+        flags: flags & 0x3f,
+        machine: 0x14c,
+        ..Default::default()
+    };
+    let mut wire = [0; 3440];
+    match server::request(env, &mut request, &[], &mut wire) {
+        Ok((reply, _)) if reply.header.error == status::PENDING => {
+            crate::sync::wait_then(env, reply.handle, move |env, code| {
+                if code != 0 {
+                    return Outcome::Return(code);
+                }
+                remote_get_context(env, thread, output, reply.handle)
+            })
         }
+        Ok((reply, _)) if reply.header.error == 0 => {
+            let mut image = [0; crate::context::SIZE];
+            if env.cpu.read(output, &mut image).is_err() {
+                return Outcome::Return(status::ACCESS_VIOLATION);
+            }
+            crate::context::from_server(&wire, &mut image);
+            status::finish(write_bytes(env, output, &image).map_err(Into::into))
+        }
+        Ok((reply, _)) => Outcome::Return(reply.header.error),
+        Err(e) => status::finish(Err(e)),
     }
-    Ok(())
 }

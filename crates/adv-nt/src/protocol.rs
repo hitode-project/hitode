@@ -4580,3 +4580,104 @@ impl Request for WriteProcessMemoryRequest {
         &mut self.header
     }
 }
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GetThreadContextRequest {
+    pub header: RequestHeader,
+    pub handle: u32,
+    pub context: u32,
+    pub flags: u32,
+    pub native_flags: u32,
+    pub machine: u16,
+    pub _pad0: [u8; 2],
+}
+const _: () = assert!(size_of::<GetThreadContextRequest>() == 32);
+const _: () = assert!(std::mem::offset_of!(GetThreadContextRequest, handle) == 12);
+const _: () = assert!(std::mem::offset_of!(GetThreadContextRequest, context) == 16);
+const _: () = assert!(std::mem::offset_of!(GetThreadContextRequest, flags) == 20);
+const _: () = assert!(std::mem::offset_of!(GetThreadContextRequest, native_flags) == 24);
+const _: () = assert!(std::mem::offset_of!(GetThreadContextRequest, machine) == 28);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GetThreadContextReply {
+    pub header: ReplyHeader,
+    pub self_: i32,
+    pub handle: u32,
+}
+const _: () = assert!(size_of::<GetThreadContextReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(GetThreadContextReply, self_) == 8);
+const _: () = assert!(std::mem::offset_of!(GetThreadContextReply, handle) == 12);
+
+impl Request for GetThreadContextRequest {
+    const NUMBER: i32 = 105;
+    type Reply = GetThreadContextReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SetThreadContextRequest {
+    pub header: RequestHeader,
+    pub handle: u32,
+    pub native_flags: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<SetThreadContextRequest>() == 24);
+const _: () = assert!(std::mem::offset_of!(SetThreadContextRequest, handle) == 12);
+const _: () = assert!(std::mem::offset_of!(SetThreadContextRequest, native_flags) == 16);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SetThreadContextReply {
+    pub header: ReplyHeader,
+    pub self_: i32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<SetThreadContextReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(SetThreadContextReply, self_) == 8);
+
+impl Request for SetThreadContextRequest {
+    const NUMBER: i32 = 106;
+    type Reply = SetThreadContextReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GetApcResultRequest {
+    pub header: RequestHeader,
+    pub handle: u32,
+}
+const _: () = assert!(size_of::<GetApcResultRequest>() == 16);
+const _: () = assert!(std::mem::offset_of!(GetApcResultRequest, handle) == 12);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct GetApcResultReply {
+    pub header: ReplyHeader,
+    pub result: [u8; 40],
+}
+impl Default for GetApcResultReply {
+    fn default() -> Self {
+        Self {
+            header: Default::default(),
+            result: [0; 40],
+        }
+    }
+}
+const _: () = assert!(size_of::<GetApcResultReply>() == 48);
+const _: () = assert!(std::mem::offset_of!(GetApcResultReply, result) == 8);
+
+impl Request for GetApcResultRequest {
+    const NUMBER: i32 = 20;
+    type Reply = GetApcResultReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}

@@ -13,6 +13,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
+use adv_cpu::backend::Guest;
 use adv_machine::sched::{Handle, Object};
 use adv_machine::{CtxId, Env, Sys};
 
@@ -32,6 +33,22 @@ const PATIENCE: u32 = 4;
 /// timeouts that have passed by `time`.
 pub trait Progress {
     fn run_server(&mut self, time: Time);
+    fn interrupt_pending(&self) -> bool {
+        false
+    }
+    fn run_server_for(&mut self, time: Time, _cpu: &mut dyn Guest) {
+        self.run_server(time);
+    }
+}
+
+struct Active<'a> {
+    progress: &'a mut dyn Progress,
+    cpu: &'a mut dyn Guest,
+}
+impl Progress for Active<'_> {
+    fn run_server(&mut self, time: Time) {
+        self.progress.run_server_for(time, self.cpu);
+    }
 }
 
 /// The guest's clocks, which the server reads as its own, in 100 ns ticks.
@@ -144,6 +161,7 @@ impl Link {
     pub fn call<R: Request>(
         &mut self,
         context: CtxId,
+        cpu: &mut dyn Guest,
         request: &mut R,
         data: &[&[u8]],
         reply_data: &mut [u8],
@@ -153,15 +171,23 @@ impl Link {
             .threads
             .get_mut(&context)
             .ok_or(Error::NoThread(context))?;
-        thread
-            .channel
-            .call(&mut *self.progress, time, request, data, reply_data)
+        thread.channel.call(
+            &mut Active {
+                progress: &mut *self.progress,
+                cpu,
+            },
+            time,
+            request,
+            data,
+            reply_data,
+        )
     }
 
     /// Passes on a request the guest prepared.
     pub fn call_raw(
         &mut self,
         context: CtxId,
+        cpu: &mut dyn Guest,
         fixed: &mut [u8; FIXED_SIZE],
         data: &[&[u8]],
         reply_data: &mut [u8],
@@ -171,9 +197,16 @@ impl Link {
             .threads
             .get_mut(&context)
             .ok_or(Error::NoThread(context))?;
-        thread
-            .channel
-            .call_raw(&mut *self.progress, time, fixed, data, reply_data)
+        thread.channel.call_raw(
+            &mut Active {
+                progress: &mut *self.progress,
+                cpu,
+            },
+            time,
+            fixed,
+            data,
+            reply_data,
+        )
     }
 }
 
@@ -193,10 +226,11 @@ pub fn set_time(env: &mut Env<'_>) {
 
 /// Wakes the blocked threads whose waits the server ended: their
 /// wake-ups are read now, so a thread that runs later finds its own.
-pub fn deliver(env: &mut Env<'_>) {
+pub fn deliver(env: &mut Env<'_>) -> bool {
     let Some(link) = env.ext.try_get_mut::<Link>() else {
-        return;
+        return false;
     };
+    let mut delivered = false;
     for thread in link.threads.values_mut() {
         if !thread.waiting || thread.pending.is_some() {
             continue;
@@ -205,15 +239,17 @@ pub fn deliver(env: &mut Env<'_>) {
         if let Ok(Some(wake_up)) = thread.channel.wake_up() {
             thread.pending = Some(wake_up);
             env.sys.set_event(thread.wake);
+            delivered = true;
         }
     }
+    delivered
 }
 
 /// Run the server for host activity, and deliver the resulting wake-ups.
 pub fn run(env: &mut Env<'_>) {
     set_time(env);
     let link = env.ext.get_mut::<Link>();
-    link.progress.run_server(link.time);
+    link.progress.run_server_for(link.time, env.cpu);
     deliver(env);
 }
 
@@ -260,6 +296,20 @@ pub fn wake_up(env: &mut Env<'_>) -> Result<Option<WakeUp>, crate::status::Error
     }
     deliver(env);
     Ok(wake_up)
+}
+
+/// Take an already delivered signal wait reply without advancing the server.
+pub fn poll_wake(env: &mut Env<'_>) -> Result<Option<WakeUp>, crate::status::Error> {
+    let context = env.context;
+    let thread = env.ext.get_mut::<Link>().thread(context).map_err(broken)?;
+    let wake = match thread.pending.take() {
+        Some(w) => Some(w),
+        None => thread.channel.wake_up().map_err(broken)?,
+    };
+    if wake.is_some() {
+        thread.waiting = false;
+    }
+    Ok(wake)
 }
 
 /// The machine context of the thread the server knows as `tid`.
@@ -321,7 +371,7 @@ pub fn init_thread(
     let (wait, wait_write) = pipe().map_err(fail)?;
     set_nonblocking(&reply).map_err(fail)?;
     set_nonblocking(&wait).map_err(fail)?;
-    let Env { ext, sys, .. } = env;
+    let Env { ext, sys, cpu, .. } = env;
     let link = ext
         .try_get_mut::<Link>()
         .ok_or_else(|| crate::status::Error::Unsupported("no server connection".into()))?;
@@ -338,7 +388,7 @@ pub fn init_thread(
         sys,
     );
     let mut init = InitThreadRequest {
-        unix_tid: tid as i32,
+        unix_tid: context as i32 + 1,
         reply_fd: reply_write.as_raw_fd(),
         wait_fd: wait_write.as_raw_fd(),
         teb: u64::from(teb),
@@ -346,7 +396,7 @@ pub fn init_thread(
         ..Default::default()
     };
     let (answer, _) = link
-        .call(context, &mut init, &[], &mut [])
+        .call(context, *cpu, &mut init, &[], &mut [])
         .map_err(broken)?;
     crate::status::check(answer.header.error)?;
     Ok(answer.suspend != 0)
@@ -362,13 +412,19 @@ pub fn end_thread(env: &mut Env<'_>, context: CtxId) {
     if let Some(thread) = link.threads.remove(&context) {
         env.sys.objects.close(thread.wake);
         drop(thread.channel);
-        link.progress.run_server(link.time);
+        link.progress.run_server_for(link.time, env.cpu);
     }
     deliver(env);
 }
 
 fn broken(error: Error) -> crate::status::Error {
     crate::status::Error::Unsupported(format!("server: {error}"))
+}
+
+/// Sends a descriptor for a subsequent server request.
+pub fn pass_fd(env: &mut Env<'_>, fd: RawFd) -> Result<(), crate::status::Error> {
+    let tid = current_tid(env)?;
+    send_fd(&link(env)?.socket, tid, fd).map_err(|error| broken(error.into()))
 }
 
 /// Makes an inheritable server handle for a host descriptor, as Wine's
@@ -394,7 +450,7 @@ pub fn fd_to_handle(
 /// The host descriptor of `handle`, from the cache or the server.
 pub fn handle_fd(env: &mut Env<'_>, handle: u32) -> Result<HandleFd, crate::status::Error> {
     let context = env.context;
-    let link = link(env)?;
+    let link = env.ext.get_mut::<Link>();
     if let Some(cached) = link.fds.get(&handle) {
         return Ok(HandleFd {
             fd: cached.fd.as_raw_fd(),
@@ -408,7 +464,7 @@ pub fn handle_fd(env: &mut Env<'_>, handle: u32) -> Result<HandleFd, crate::stat
         ..Default::default()
     };
     let (reply, _) = link
-        .call(context, &mut request, &[], &mut [])
+        .call(context, env.cpu, &mut request, &[], &mut [])
         .map_err(broken)?;
     crate::status::check(reply.header.error)?;
     let (tag, fd) = receive_fd(&link.socket, &mut *link.progress, link.time).map_err(broken)?;
@@ -460,8 +516,10 @@ pub fn request<R: Request>(
     reply_data: &mut [u8],
 ) -> Result<(R::Reply, usize), crate::status::Error> {
     let context = env.context;
-    let answer = link(env)?
-        .call(context, request, data, reply_data)
+    let answer = env
+        .ext
+        .get_mut::<Link>()
+        .call(context, env.cpu, request, data, reply_data)
         .map_err(broken)?;
     deliver(env);
     Ok(answer)
@@ -474,7 +532,11 @@ pub(crate) fn terminate_job(
     request: &mut crate::protocol::TerminateJobRequest,
 ) -> Result<bool, crate::status::Error> {
     let context = env.context;
-    match link(env)?.call(context, request, &[], &mut []) {
+    match env
+        .ext
+        .get_mut::<Link>()
+        .call(context, env.cpu, request, &[], &mut [])
+    {
         Ok((reply, _)) => {
             deliver(env);
             crate::status::check(reply.header.error)?;
@@ -505,6 +567,7 @@ pub enum Error {
 pub struct FirstThread {
     pub pid: u32,
     pub tid: u32,
+    pub unix_pid: i32,
     pub session_id: u32,
     /// The server's start time, in 100 ns ticks since 1601.
     pub server_start: i64,
@@ -516,6 +579,8 @@ pub struct FirstThread {
 
 /// One process's connection: its socket, and the pipes of its first
 /// thread.
+static NEXT_PROCESS: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
+
 pub struct Connection {
     socket: UnixStream,
     channel: Channel,
@@ -567,6 +632,14 @@ impl Connection {
             .join()
             .expect("socket connector")?
         };
+        Self::from_socket(socket, progress, time)
+    }
+
+    pub fn from_socket(
+        socket: UnixStream,
+        progress: &mut dyn Progress,
+        time: Time,
+    ) -> Result<(Self, FirstThread), Error> {
         socket.set_nonblocking(true)?;
         let (version, request) = receive_fd(&socket, progress, time)?;
         if version != PROTOCOL_VERSION {
@@ -586,8 +659,10 @@ impl Connection {
             wait,
         };
 
+        let unix_pid = NEXT_PROCESS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut init = InitFirstThreadRequest {
-            unix_pid: std::process::id() as i32,
+            unix_pid,
+            unix_tid: 1,
             reply_fd: reply_write.as_raw_fd(),
             wait_fd: wait_write.as_raw_fd(),
             ..Default::default()
@@ -611,6 +686,7 @@ impl Connection {
         let first = FirstThread {
             pid: answer.pid,
             tid: answer.tid,
+            unix_pid,
             session_id: answer.session_id,
             server_start: answer.server_start,
             info_size: answer.info_size,
@@ -889,5 +965,25 @@ fn receive_fd(
             Some(libc::EINTR) => {}
             _ => return Err(error.into()),
         }
+    }
+}
+
+/// Return the execution lease before a queued server signal can target another context.
+pub(crate) fn boundary(env: &mut Env<'_>, outcome: adv_machine::Outcome) -> adv_machine::Outcome {
+    if env
+        .ext
+        .try_get::<Link>()
+        .is_some_and(|link| link.progress.interrupt_pending())
+        && !matches!(
+            outcome,
+            adv_machine::Outcome::HostRequest { .. }
+                | adv_machine::Outcome::ExitProcess(_)
+                | adv_machine::Outcome::ExitThread(_)
+                | adv_machine::Outcome::Fail(_)
+        )
+    {
+        adv_machine::Outcome::host_request(move |_| outcome)
+    } else {
+        outcome
     }
 }

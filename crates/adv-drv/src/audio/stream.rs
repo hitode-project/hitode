@@ -35,8 +35,8 @@ fn advance(env: &mut Env<'_>, id: u32, stream: &mut Stream) -> Result<(), String
             stream.held -= frames;
             stream.cursor = cursor;
             if stream.held == 0 {
-                if !audio.stop_ring(u64::from(id))
-                    || !audio.set_position(u64::from(id), stream.write * align)
+                if !audio.stop_ring(source_id(env.sys.pid, id))
+                    || !audio.set_position(source_id(env.sys.pid, id), stream.write * align)
                 {
                     return Err("audio command limit".into());
                 }
@@ -52,11 +52,11 @@ fn advance(env: &mut Env<'_>, id: u32, stream: &mut Stream) -> Result<(), String
 fn play(env: &mut Env<'_>, id: u32, stream: &mut Stream) -> Result<(), String> {
     if stream.playing && !stream.running && stream.held != 0 {
         stream.generation += 1;
-        if !env
-            .ext
-            .get::<AudioControl>()
-            .play_ring(u64::from(id), true, stream.generation)
-        {
+        if !env.ext.get::<AudioControl>().play_ring(
+            source_id(env.sys.pid, id),
+            true,
+            stream.generation,
+        ) {
             return Err("audio command limit".into());
         }
         stream.running = true;
@@ -96,11 +96,14 @@ pub(super) fn call(
                 hr = 1;
             } else {
                 s.playing = false;
-                if !audio.stop_ring(u64::from(id)) {
+                if !audio.stop_ring(source_id(env.sys.pid, id)) {
                     return Err("audio command limit".into());
                 }
                 s.running = false;
-                if !audio.set_position(u64::from(id), s.cursor * s.format.mixer_align()) {
+                if !audio.set_position(
+                    source_id(env.sys.pid, id),
+                    s.cursor * s.format.mixer_align(),
+                ) {
                     return Err("audio command limit".into());
                 }
             }
@@ -121,7 +124,7 @@ pub(super) fn call(
                     s.frames * s.format.mixer_align(),
                     if s.format.mixer_bits() == 8 { 128 } else { 0 },
                 )?;
-                if !audio.set_position(u64::from(id), 0) {
+                if !audio.set_position(source_id(env.sys.pid, id), 0) {
                     return Err("audio command limit".into());
                 }
             }
@@ -220,7 +223,7 @@ pub(super) fn call(
                         .write(s.mix, &output[(first * align) as usize..])
                         .map_err(|e| e.to_string())?;
                 }
-                if !audio.written(u64::from(id), s.write * align, frames * align) {
+                if !audio.written(source_id(env.sys.pid, id), s.write * align, frames * align) {
                     return Err("audio command limit".into());
                 }
                 s.write = (s.write + frames) % s.frames;
@@ -278,7 +281,7 @@ pub(super) fn call(
                     * f32::from_bits(read(env, volumes + offset)?)
                     * f32::from_bits(read(env, session + offset)?);
             }
-            if !audio.set_stereo_gain(u64::from(id), gain) {
+            if !audio.set_stereo_gain(source_id(env.sys.pid, id), gain) {
                 return Err("audio command limit".into());
             }
             return Ok(());
@@ -362,7 +365,11 @@ pub(super) fn release(env: &mut Env<'_>, args: u32) -> Outcome {
                 .streams
                 .remove(&id)
                 .ok_or("unknown released stream")?;
-            if !env.ext.get::<AudioControl>().remove_pcm(u64::from(id)) {
+            if !env
+                .ext
+                .get::<AudioControl>()
+                .remove_pcm(source_id(env.sys.pid, id))
+            {
                 return Err("audio command limit".into());
             }
             for at in [stream.ring, stream.temporary] {

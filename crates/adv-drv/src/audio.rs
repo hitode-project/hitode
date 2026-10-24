@@ -334,7 +334,7 @@ fn execute(env: &mut Env<'_>, code: u32, args: u32) -> Result<(), String> {
             };
             let audio = env.ext.get::<AudioControl>();
             let voice = audio.add_ring(
-                u64::from(id),
+                source_id(env.sys.pid, id),
                 RingConfig {
                     view: region.read_alias,
                     bytes: frames * fmt.mixer_align(),
@@ -447,4 +447,8 @@ fn execute(env: &mut Env<'_>, code: u32, args: u32) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn source_id(pid: u32, id: u32) -> u64 {
+    (u64::from(pid) << 32) | u64::from(id)
 }

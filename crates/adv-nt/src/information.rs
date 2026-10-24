@@ -161,7 +161,17 @@ pub fn query_process(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         if matches!(class, 7 | 12 | 21 | 22 | 26 | 31 | 34) && size != 4 {
             return Err(status::INFO_LENGTH_MISMATCH.into());
         }
-        current_process(env, process)?;
+        if class == PROCESS_WOW64_INFORMATION && process != CURRENT_PROCESS {
+            // Every process of the family is 32-bit, as this one is.
+            let mut request = GetProcessInfoRequest {
+                handle: process,
+                ..Default::default()
+            };
+            let (reply, _) = server::request(env, &mut request, &[], &mut [])?;
+            status::check(reply.header.error)?;
+        } else {
+            current_process(env, process)?;
+        }
         if class == 3 {
             let length = if size == 44 { 44 } else { 48 };
             if result_size != 0 {

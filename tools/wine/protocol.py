@@ -173,6 +173,9 @@ REQUESTS = [
     "wait_debug_event",
     "read_process_memory",
     "write_process_memory",
+    "get_thread_context",
+    "set_thread_context",
+    "get_apc_result",
 ]
 
 # Structures sent as request or reply data. Their fields are integers laid

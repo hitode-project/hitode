@@ -134,3 +134,146 @@ pub fn build(
     put_text(&mut block, cursor as usize, environment);
     block
 }
+
+/// Wine's startup_info_data followed by its strings, and the environment block.
+pub(crate) fn serialize_startup(
+    env: &mut adv_machine::Env<'_>,
+    parameters: u32,
+    image: &str,
+) -> Result<(Vec<u8>, Vec<u8>), crate::status::Error> {
+    use crate::{object::read_u32, status};
+    let mut info = vec![0; std::mem::size_of::<crate::protocol::StartupInfoData>()];
+    for (to, from) in [
+        (0, 0x0c),
+        (4, 0x14),
+        (8, 0x10),
+        (12, 0x18),
+        (16, 0x1c),
+        (20, 0x20),
+        (24, 0x4c),
+        (28, 0x50),
+        (32, 0x54),
+        (36, 0x58),
+        (40, 0x5c),
+        (44, 0x60),
+        (48, 0x64),
+        (52, 0x68),
+        (56, 0x6c),
+        (60, 0x29c),
+    ] {
+        put(&mut info, to, read_u32(env, parameters + from)?);
+    }
+    let normalized = read_u32(env, parameters + 8)? & 1 != 0;
+    for (index, field) in [0x24, 0x30, 0x38, 0x40, 0x70, 0x78, 0x80, 0x88]
+        .into_iter()
+        .enumerate()
+    {
+        let bytes = if field == 0x38 {
+            image
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>()
+        } else {
+            let len = read_u32(env, parameters + field)? & 0xffff;
+            let mut pointer = read_u32(env, parameters + field + 4)?;
+            if !normalized {
+                pointer += parameters;
+            }
+            let mut bytes = vec![0; len as usize];
+            if len != 0 {
+                env.cpu
+                    .read(pointer, &mut bytes)
+                    .map_err(|_| status::ACCESS_VIOLATION)?;
+            }
+            bytes
+        };
+        put(&mut info, 64 + 4 * index, bytes.len() as u32);
+        info.extend(bytes);
+    }
+    if !info.len().is_multiple_of(2) {
+        info.push(0);
+    }
+    let pointer = read_u32(env, parameters + 0x48)?;
+    let mut environment = Vec::new();
+    if pointer != 0 {
+        let mut previous = false;
+        for at in (0..2 * 1024 * 1024).step_by(2) {
+            let mut unit = [0; 2];
+            env.cpu
+                .read(pointer + at, &mut unit)
+                .map_err(|_| status::ACCESS_VIOLATION)?;
+            environment.extend(unit);
+            if unit == [0; 2] && previous {
+                break;
+            }
+            previous = unit == [0; 2];
+        }
+    } else {
+        environment.extend([0; 4]);
+    }
+    Ok((info, environment))
+}
+
+pub(crate) fn child_size(bytes: &[u8]) -> u32 {
+    SIZE + 520 + bytes.len() as u32 + 32
+}
+
+/// Reconstruct normalized process parameters from get_startup_info, as init_startup_info does.
+pub(crate) fn child_block(
+    bytes: &[u8],
+    info_size: u32,
+    base: u32,
+) -> Result<Vec<u8>, crate::process::Error> {
+    let get = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+    let mut block = vec![0; child_size(bytes) as usize];
+    let len = block.len() as u32;
+    put(&mut block, 0, len);
+    put(&mut block, 4, len);
+    put(&mut block, 8, 1);
+    for (from, to) in [
+        (0, 0x0c),
+        (4, 0x14),
+        (8, 0x10),
+        (12, 0x18),
+        (16, 0x1c),
+        (20, 0x20),
+        (24, 0x4c),
+        (28, 0x50),
+        (32, 0x54),
+        (36, 0x58),
+        (40, 0x5c),
+        (44, 0x60),
+        (48, 0x64),
+        (52, 0x68),
+        (56, 0x6c),
+        (60, 0x29c),
+    ] {
+        put(&mut block, to, get(from));
+    }
+    let mut source = 96;
+    let mut target = SIZE as usize;
+    for (index, field) in [0x24, 0x30, 0x38, 0x40, 0x70, 0x78, 0x80, 0x88]
+        .into_iter()
+        .enumerate()
+    {
+        let len = get(64 + 4 * index) as usize;
+        if field == 0x30 && len == 0 {
+            continue;
+        }
+        let mut text = &bytes[source..source + len];
+        if field == 0x38 && text.starts_with(&[92, 0, 63, 0, 63, 0, 92, 0]) {
+            text = &text[8..];
+        }
+        let max = if index == 0 { 520 } else { text.len() + 2 };
+        put(&mut block, field, text.len() as u32 | ((max as u32) << 16));
+        put(&mut block, field + 4, base + target as u32);
+        block[target..target + text.len()].copy_from_slice(text);
+        target += max;
+        source += len;
+    }
+    let environment = &bytes[info_size as usize..];
+    put(&mut block, ENVIRONMENT, base + target as u32);
+    put(&mut block, ENVIRONMENT_SIZE, environment.len() as u32);
+    block[target..target + environment.len()].copy_from_slice(environment);
+    Ok(block)
+}

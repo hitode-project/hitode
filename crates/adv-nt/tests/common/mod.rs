@@ -13,11 +13,12 @@
 //! waiting: then it is real, and the machine runs in slices so that its
 //! quantum interleaves them as a host scheduler would.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::fs::File;
 use std::io::Read;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::time::Duration;
 
 use adv_cpu::Cpu;
@@ -56,20 +57,70 @@ impl log::Log for WineLog {
 struct Runtime {
     server: Server,
     clock: GuestClock,
+    signals: Rc<RefCell<Vec<(i32, i32)>>>,
 }
 
-impl Progress for Runtime {
-    fn run_server(&mut self, time: Time) {
+struct Trace<'a> {
+    signals: Rc<RefCell<Vec<(i32, i32)>>>,
+    cpu: Option<&'a mut dyn adv_cpu::backend::Guest>,
+}
+impl adv_wineserver::Tracing for Trace<'_> {
+    fn signal(&mut self, _: i32, tid: i32, sig: i32) -> bool {
+        self.signals.borrow_mut().push((tid, sig));
+        true
+    }
+    fn read_memory(&mut self, _: i32, at: u64, data: &mut [u8]) -> u32 {
+        if self
+            .cpu
+            .as_deref_mut()
+            .is_some_and(|cpu| cpu.read(at as u32, data).is_ok())
+        {
+            0
+        } else {
+            0xc0000022
+        }
+    }
+    fn write_memory(&mut self, _: i32, at: u64, data: &[u8]) -> u32 {
+        if self
+            .cpu
+            .as_deref_mut()
+            .is_some_and(|cpu| cpu.write(at as u32, data).is_ok())
+        {
+            0
+        } else {
+            0xc0000022
+        }
+    }
+}
+impl Runtime {
+    fn step(&mut self, time: Time, cpu: Option<&mut dyn adv_cpu::backend::Guest>) {
         self.clock.0.set(time);
         #[cfg(target_os = "macos")]
         let cwd = std::env::current_dir().unwrap();
-        let state = self.server.step(&self.clock);
+        let state = self.server.step_with_tracing(
+            &self.clock,
+            &mut Trace {
+                signals: self.signals.clone(),
+                cpu,
+            },
+        );
         #[cfg(target_os = "macos")]
         assert_eq!(std::env::current_dir().unwrap(), cwd);
         assert!(
             matches!(state, State::Waiting(_)),
             "server stopped: {state:?}"
         );
+    }
+}
+impl Progress for Runtime {
+    fn interrupt_pending(&self) -> bool {
+        !self.signals.borrow().is_empty()
+    }
+    fn run_server(&mut self, time: Time) {
+        self.step(time, None);
+    }
+    fn run_server_for(&mut self, time: Time, cpu: &mut dyn adv_cpu::backend::Guest) {
+        self.step(time, Some(cpu));
     }
 }
 
@@ -179,7 +230,12 @@ pub fn run_probe_inspect(
     #[cfg(target_os = "macos")]
     assert_eq!(std::env::current_dir().unwrap(), cwd);
     let socket = server.socket_dir().unwrap();
-    let runtime = Runtime { server, clock };
+    let signals = Rc::new(RefCell::new(Vec::new()));
+    let runtime = Runtime {
+        server,
+        clock,
+        signals: signals.clone(),
+    };
 
     let cpu = Cpu::new(PARK_ADDR, false).unwrap();
     let mut machine = Machine::new(cpu, resolver, machine_clock).unwrap();
@@ -219,6 +275,11 @@ pub fn run_probe_inspect(
     // When every context waits, virtual time moves to the earliest deadline
     // and real time sleeps until it.
     let result = loop {
+        let pending = std::mem::take(&mut *signals.borrow_mut());
+        for (tid, sig) in pending {
+            adv_nt::process::signals::deliver(&mut machine, tid, sig).unwrap();
+        }
+        adv_nt::process::signals::wake(&mut machine).unwrap();
         let result = if real_time {
             match machine.run_slice(Duration::from_millis(10)) {
                 SliceResult::Yielded => continue,
@@ -227,7 +288,18 @@ pub fn run_probe_inspect(
         } else {
             machine.run()
         };
+        adv_nt::process::signals::wake(&mut machine).unwrap();
+        if !signals.borrow().is_empty()
+            || machine
+                .sys
+                .contexts
+                .iter()
+                .any(|context| context.is_ready())
+        {
+            continue;
+        }
         match result {
+            RunResult::HostRequest => continue,
             RunResult::Idle {
                 next_deadline: Some(deadline),
             } if real_time => std::thread::sleep(Duration::from_micros(

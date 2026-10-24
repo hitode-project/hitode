@@ -81,22 +81,35 @@ void set_thread_context( struct thread *thread, const struct context_data *conte
     set_error( STATUS_UNSUCCESSFUL );
 }
 
+extern int hitode_host_signal( int pid, int tid, int sig );
+extern int hitode_host_memory( int pid, client_ptr_t ptr, data_size_t size, void *data, int write );
+
 int send_thread_signal( struct thread *thread, int sig )
 {
-    thread->unix_pid = -1;
-    thread->unix_tid = -1;
-    return 0;
+    return hitode_host_signal( thread->unix_pid, thread->unix_tid, sig );
 }
 
 int read_process_memory( struct process *process, client_ptr_t ptr, data_size_t size, char *dest )
 {
-    set_error( STATUS_ACCESS_DENIED );
-    return 0;
+    unsigned int status = hitode_host_memory( process->unix_pid, ptr, size, dest, 0 );
+    if (status) set_error( status );
+    return !status;
 }
 
 int write_process_memory( struct process *process, client_ptr_t ptr, data_size_t size, const char *src,
                           data_size_t *written )
 {
-    set_error( STATUS_ACCESS_DENIED );
-    return 0;
+    unsigned int status = hitode_host_memory( process->unix_pid, ptr, size, (void *)src, 1 );
+    if (written) *written = status ? 0 : size;
+    if (status) set_error( status );
+    return !status;
 }
+
+/* context.rs marshals the i386 members of Wine's architecture unions. */
+C_ASSERT( sizeof(struct context_data) == 1720 );
+C_ASSERT( offsetof(struct context_data, ctl) == 8 );
+C_ASSERT( offsetof(struct context_data, integer) == 40 );
+C_ASSERT( offsetof(struct context_data, seg) == 288 );
+C_ASSERT( offsetof(struct context_data, fp) == 304 );
+C_ASSERT( offsetof(struct context_data, debug) == 824 );
+C_ASSERT( offsetof(struct context_data, ext) == 944 );

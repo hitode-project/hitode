@@ -392,16 +392,18 @@ fn syscall(env: &mut Env<'_>) -> Outcome {
     for (index, arg) in args[..count].iter_mut().enumerate() {
         *arg = env.arg(index as u32 + 1);
     }
-    call(env, &args[..count])
+    let outcome = call(env, &args[..count]);
+    server::boundary(env, outcome)
 }
 
 fn unix_call(env: &mut Env<'_>) -> Outcome {
     let (handle, high, code, args) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3));
-    match (handle, high) {
+    let outcome = match (handle, high) {
         (NTDLL_UNIXLIB, 0) => unix::call(env, code, args),
         // Any other handle is a Unix library's table, which only i386
         // addresses fill.
         (funcs, 0) => unixlib::call(env, funcs, code, args),
         _ => Outcome::Return(crate::status::INVALID_HANDLE),
-    }
+    };
+    server::boundary(env, outcome)
 }
