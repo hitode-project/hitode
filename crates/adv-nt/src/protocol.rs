@@ -3852,3 +3852,262 @@ impl Request for AllocateReserveObjectRequest {
         &mut self.header
     }
 }
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CreateMailslotRequest {
+    pub header: RequestHeader,
+    pub access: u32,
+    pub options: u32,
+    pub _pad0: [u8; 4],
+    pub read_timeout: i64,
+    pub max_msgsize: u32,
+    pub _pad1: [u8; 4],
+}
+const _: () = assert!(size_of::<CreateMailslotRequest>() == 40);
+const _: () = assert!(std::mem::offset_of!(CreateMailslotRequest, access) == 12);
+const _: () = assert!(std::mem::offset_of!(CreateMailslotRequest, options) == 16);
+const _: () = assert!(std::mem::offset_of!(CreateMailslotRequest, read_timeout) == 24);
+const _: () = assert!(std::mem::offset_of!(CreateMailslotRequest, max_msgsize) == 32);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CreateMailslotReply {
+    pub header: ReplyHeader,
+    pub handle: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<CreateMailslotReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(CreateMailslotReply, handle) == 8);
+
+impl Request for CreateMailslotRequest {
+    const NUMBER: i32 = 237;
+    type Reply = CreateMailslotReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CancelAsyncRequest {
+    pub header: RequestHeader,
+    pub handle: u32,
+    pub iosb: u64,
+    pub only_thread: i32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<CancelAsyncRequest>() == 32);
+const _: () = assert!(std::mem::offset_of!(CancelAsyncRequest, handle) == 12);
+const _: () = assert!(std::mem::offset_of!(CancelAsyncRequest, iosb) == 16);
+const _: () = assert!(std::mem::offset_of!(CancelAsyncRequest, only_thread) == 24);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CancelAsyncReply {
+    pub header: ReplyHeader,
+    pub cancel_handle: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<CancelAsyncReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(CancelAsyncReply, cancel_handle) == 8);
+
+impl Request for CancelAsyncRequest {
+    const NUMBER: i32 = 133;
+    type Reply = CancelAsyncReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CancelSyncRequest {
+    pub header: RequestHeader,
+    pub handle: u32,
+    pub iosb: u64,
+}
+const _: () = assert!(size_of::<CancelSyncRequest>() == 24);
+const _: () = assert!(std::mem::offset_of!(CancelSyncRequest, handle) == 12);
+const _: () = assert!(std::mem::offset_of!(CancelSyncRequest, iosb) == 16);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CancelSyncReply {
+    pub header: ReplyHeader,
+}
+const _: () = assert!(size_of::<CancelSyncReply>() == 8);
+
+impl Request for CancelSyncRequest {
+    const NUMBER: i32 = 131;
+    type Reply = CancelSyncReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct FlushRequest {
+    pub header: RequestHeader,
+    pub _pad0: [u8; 4],
+    pub r#async: [u8; 40],
+}
+impl Default for FlushRequest {
+    fn default() -> Self {
+        Self {
+            header: Default::default(),
+            _pad0: [0; 4],
+            r#async: [0; 40],
+        }
+    }
+}
+const _: () = assert!(size_of::<FlushRequest>() == 56);
+const _: () = assert!(std::mem::offset_of!(FlushRequest, r#async) == 16);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FlushReply {
+    pub header: ReplyHeader,
+    pub event: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<FlushReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(FlushReply, event) == 8);
+
+impl Request for FlushRequest {
+    const NUMBER: i32 = 50;
+    type Reply = FlushReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LockFileRequest {
+    pub header: RequestHeader,
+    pub handle: u32,
+    pub offset: u64,
+    pub count: u64,
+    pub shared: i32,
+    pub wait: i32,
+}
+const _: () = assert!(size_of::<LockFileRequest>() == 40);
+const _: () = assert!(std::mem::offset_of!(LockFileRequest, handle) == 12);
+const _: () = assert!(std::mem::offset_of!(LockFileRequest, offset) == 16);
+const _: () = assert!(std::mem::offset_of!(LockFileRequest, count) == 24);
+const _: () = assert!(std::mem::offset_of!(LockFileRequest, shared) == 32);
+const _: () = assert!(std::mem::offset_of!(LockFileRequest, wait) == 36);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LockFileReply {
+    pub header: ReplyHeader,
+    pub handle: u32,
+    pub overlapped: i32,
+}
+const _: () = assert!(size_of::<LockFileReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(LockFileReply, handle) == 8);
+const _: () = assert!(std::mem::offset_of!(LockFileReply, overlapped) == 12);
+
+impl Request for LockFileRequest {
+    const NUMBER: i32 = 53;
+    type Reply = LockFileReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct UnlockFileRequest {
+    pub header: RequestHeader,
+    pub handle: u32,
+    pub offset: u64,
+    pub count: u64,
+}
+const _: () = assert!(size_of::<UnlockFileRequest>() == 32);
+const _: () = assert!(std::mem::offset_of!(UnlockFileRequest, handle) == 12);
+const _: () = assert!(std::mem::offset_of!(UnlockFileRequest, offset) == 16);
+const _: () = assert!(std::mem::offset_of!(UnlockFileRequest, count) == 24);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct UnlockFileReply {
+    pub header: ReplyHeader,
+}
+const _: () = assert!(size_of::<UnlockFileReply>() == 8);
+
+impl Request for UnlockFileRequest {
+    const NUMBER: i32 = 54;
+    type Reply = UnlockFileReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ReadDirectoryChangesRequest {
+    pub header: RequestHeader,
+    pub filter: u32,
+    pub subtree: i32,
+    pub want_data: i32,
+    pub r#async: [u8; 40],
+}
+impl Default for ReadDirectoryChangesRequest {
+    fn default() -> Self {
+        Self {
+            header: Default::default(),
+            filter: 0,
+            subtree: 0,
+            want_data: 0,
+            r#async: [0; 40],
+        }
+    }
+}
+const _: () = assert!(size_of::<ReadDirectoryChangesRequest>() == 64);
+const _: () = assert!(std::mem::offset_of!(ReadDirectoryChangesRequest, filter) == 12);
+const _: () = assert!(std::mem::offset_of!(ReadDirectoryChangesRequest, subtree) == 16);
+const _: () = assert!(std::mem::offset_of!(ReadDirectoryChangesRequest, want_data) == 20);
+const _: () = assert!(std::mem::offset_of!(ReadDirectoryChangesRequest, r#async) == 24);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ReadDirectoryChangesReply {
+    pub header: ReplyHeader,
+}
+const _: () = assert!(size_of::<ReadDirectoryChangesReply>() == 8);
+
+impl Request for ReadDirectoryChangesRequest {
+    const NUMBER: i32 = 61;
+    type Reply = ReadDirectoryChangesReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ReadChangeRequest {
+    pub header: RequestHeader,
+    pub handle: u32,
+}
+const _: () = assert!(size_of::<ReadChangeRequest>() == 16);
+const _: () = assert!(std::mem::offset_of!(ReadChangeRequest, handle) == 12);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ReadChangeReply {
+    pub header: ReplyHeader,
+}
+const _: () = assert!(size_of::<ReadChangeReply>() == 8);
+
+impl Request for ReadChangeRequest {
+    const NUMBER: i32 = 62;
+    type Reply = ReadChangeReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}

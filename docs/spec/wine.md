@@ -286,7 +286,7 @@ FreeType is such a library: win32u opens it by name and draws TrueType text thro
 **Rule**: Listed Wine conformance tests that pass on standard Wine MUST pass here with no failures. Each runs as its own program without arguments.
 **Verification**: Test
 
-## L-process NT calls
+## Registry, process and job calls
 
 ### WINE-NT-301 Registry hive operations
 
@@ -302,3 +302,24 @@ FreeType is such a library: win32u opens it by name and draws TrueType text thro
 
 **Rule**: Job membership, information, termination, and completion calls MUST use Wine's checks and server requests. Terminating the current process's job MUST end the machine process.
 **Verification**: Test
+## File calls
+
+### WINE-NT-101 File descriptor operations
+
+**Rule**: File flushing, deletion, mailslot creation, and scatter/gather I/O MUST follow Wine 11's checks, statuses, server requests, and side effects.
+**Verification**: Test
+
+### WINE-NT-102 File waits and cancellation
+
+**Rule**: File locks, directory notifications, and I/O cancellation MUST follow Wine 11. Their waits MUST use the machine's scheduler.
+**Verification**: Test
+
+### WINE-NT-103 Device controls
+
+**Rule**: Disk-family device controls MUST return Wine's results without host disk devices. Other device controls MUST reach the server.
+**Verification**: Test
+
+### WINE-NT-104 File stubs
+
+**Rule**: `NtQueryEaFile`, `NtSetEaFile`, and `NtSetVolumeInformationFile` MUST preserve Wine 11's stub checks, statuses, and side effects.
+**Verification**: Review — the package probe omits Wine's stubs.

@@ -1,134 +1,145 @@
 //! NT call packages through Wine's Win32 DLLs in headless sessions.
 #![cfg(any(target_vendor = "apple", target_os = "android"))]
 
-// spec: WINE-NT-301, WINE-NT-302, WINE-NT-303
-#[test]
-fn l_process() {
-    // Each package gets its own process: the server keeps global state.
-    let status = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "l_process_probe", "--ignored", "--nocapture"])
-        .status()
-        .unwrap();
-    assert!(status.success());
-}
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
-// spec: WINE-NT-301, WINE-NT-302, WINE-NT-303
-#[test]
-#[ignore = "run by l_process in an isolated process"]
-fn l_process_probe() {
-    use std::fs::File;
-    use std::io::Read;
-    use std::os::fd::{AsRawFd, FromRawFd};
-    use std::path::PathBuf;
-    use std::time::{Duration, Instant};
+use adv_runtime::wine::session::{Config, Session, Stop};
 
-    use adv_runtime::wine::session::{Config, Session, Stop};
-
+/// Runs the probe `exe` and returns how it stopped and what it printed, or
+/// `None` in the parent process and when no Wine dist is configured. Each
+/// package runs in its own process: the in-process Wine server is global.
+fn probe(test: &str, exe: &str, setup: impl FnOnce(&mut Session, &Path)) -> Option<(Stop, String)> {
+    if std::env::var_os("ADV_NT_PROBE_CHILD").is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"])
+            .env("ADV_NT_PROBE_CHILD", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return None;
+    }
     let (Some(dist), Some(probes)) = (
         std::env::var_os("ADV_WINE_DIST").map(PathBuf::from),
         std::env::var_os("ADV_WINE_PROBES").map(PathBuf::from),
     ) else {
         eprintln!("skipped: ADV_WINE_DIST or ADV_WINE_PROBES is not set");
-        return;
+        return None;
     };
-    let root = std::env::temp_dir().join(format!("adv-nt-l-process-{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!("adv-nt-{test}-{}", std::process::id()));
     let game = root.join("game");
     std::fs::create_dir_all(&game).unwrap();
-    let exe = game.join("nt_l_process.exe");
-    std::fs::copy(probes.join("nt_l_process.exe"), &exe).unwrap();
-    let mut fds = [0; 2];
-    // SAFETY: fds has room for both descriptors.
-    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-    // SAFETY: these new descriptors have no other owners.
-    let (mut output, stdout) = unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) };
-    let prefix = root.join("session");
+    std::fs::copy(probes.join(exe), game.join(exe)).unwrap();
+    let stdout = std::fs::File::create(root.join("stdout")).unwrap();
     let config = Config {
         dist: &dist,
-        prefix: &prefix,
+        prefix: &root.join("session"),
         drive: None,
         locale: 0x409,
         fonts: "",
-        exe: &exe,
+        exe: &game.join(exe),
         width: 640,
         height: 480,
         jit: true,
         debug: "",
-        stdout: Some(stdout.as_raw_fd()),
+        stdout: Some(std::os::fd::AsRawFd::as_raw_fd(&stdout)),
     };
     let wake = adv_sync::WakeEvent::new().unwrap();
     let mut session = Session::start(&config, wake, |_| Ok(())).unwrap();
-    // The hive operations require enabled backup and restore privileges.
-    session
-        .machine
-        .visit_context(None, |env| {
-            use adv_nt::{protocol, server, status};
-            let mut open = protocol::OpenTokenRequest {
-                handle: u32::MAX,
-                access: 0x20,
-                ..Default::default()
-            };
-            let (token, _) = server::request(env, &mut open, &[], &mut []).unwrap();
-            status::check(token.header.error).unwrap();
-            let privileges: Vec<u8> = [17u32, 0, 2, 18, 0, 2]
-                .iter()
-                .flat_map(|value| value.to_le_bytes())
-                .collect();
-            let mut adjust = protocol::AdjustTokenPrivilegesRequest {
-                handle: token.token,
-                ..Default::default()
-            };
-            let (reply, _) = server::request(env, &mut adjust, &[&privileges], &mut []).unwrap();
-            status::check(reply.header.error).unwrap();
-            server::close(env, token.token).unwrap();
-            let attributes = adv_nt::object::Attributes {
-                root: 0,
-                attributes: 0,
-                name: None,
-                security: Vec::new(),
-            };
-            let mut allocate = protocol::AllocateReserveObjectRequest {
-                r#type: 1,
-                ..Default::default()
-            };
-            let (reserve, _) =
-                server::request(env, &mut allocate, &[&attributes.wire()], &mut []).unwrap();
-            status::check(reserve.header.error).unwrap();
-            std::fs::write(game.join("nt_l_reserve.bin"), reserve.handle.to_le_bytes()).unwrap();
-            // The fixture can resume this sole process while its guest is suspended.
-            assert!(matches!(
-                adv_nt::process::suspend(env, &[u32::MAX]),
-                adv_machine::Outcome::Return(0)
-            ));
-            assert!(
-                env.sys
-                    .contexts
-                    .iter()
-                    .filter(|context| !context.is_done())
-                    .all(|context| context.suspend_count == 1)
-            );
-            assert!(matches!(
-                adv_nt::process::resume(env, &[u32::MAX]),
-                adv_machine::Outcome::Return(0)
-            ));
-            assert!(
-                env.sys
-                    .contexts
-                    .iter()
-                    .all(|context| context.suspend_count == 0)
-            );
-        })
-        .unwrap();
-    drop(stdout);
+    setup(&mut session, &game);
     let stop = session.run(Instant::now() + Duration::from_secs(60));
     drop(session);
-    // SAFETY: output owns the read descriptor.
-    assert_eq!(
-        unsafe { libc::fcntl(output.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) },
-        0
-    );
-    let mut text = String::new();
-    let _ = output.read_to_string(&mut text);
+    drop(stdout);
+    let text = std::fs::read_to_string(root.join("stdout")).unwrap();
     std::fs::remove_dir_all(&root).unwrap();
+    Some((stop, text))
+}
+
+/// Asserts that every `check` printed `<check><ok>` on a line of its own.
+fn assert_checks(text: &str, ok: &str, checks: &[&str]) {
+    for check in checks {
+        assert!(
+            text.lines().any(|line| line == format!("{check}{ok}")),
+            "{check}: {text}"
+        );
+    }
+}
+
+// spec: WINE-NT-301, WINE-NT-302, WINE-NT-303
+#[test]
+fn l_process() {
+    let Some((stop, text)) = probe("l_process", "nt_l_process.exe", |session, game| {
+        // The hive operations require enabled backup and restore privileges.
+        session
+            .machine
+            .visit_context(None, |env| {
+                use adv_nt::{protocol, server, status};
+                let mut open = protocol::OpenTokenRequest {
+                    handle: u32::MAX,
+                    access: 0x20,
+                    ..Default::default()
+                };
+                let (token, _) = server::request(env, &mut open, &[], &mut []).unwrap();
+                status::check(token.header.error).unwrap();
+                let privileges: Vec<u8> = [17u32, 0, 2, 18, 0, 2]
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect();
+                let mut adjust = protocol::AdjustTokenPrivilegesRequest {
+                    handle: token.token,
+                    ..Default::default()
+                };
+                let (reply, _) =
+                    server::request(env, &mut adjust, &[&privileges], &mut []).unwrap();
+                status::check(reply.header.error).unwrap();
+                server::close(env, token.token).unwrap();
+                let attributes = adv_nt::object::Attributes {
+                    root: 0,
+                    attributes: 0,
+                    name: None,
+                    security: Vec::new(),
+                };
+                let mut allocate = protocol::AllocateReserveObjectRequest {
+                    r#type: 1,
+                    ..Default::default()
+                };
+                let (reserve, _) =
+                    server::request(env, &mut allocate, &[&attributes.wire()], &mut []).unwrap();
+                status::check(reserve.header.error).unwrap();
+                std::fs::write(game.join("nt_l_reserve.bin"), reserve.handle.to_le_bytes())
+                    .unwrap();
+                // The fixture can resume this sole process while its guest is suspended.
+                assert!(matches!(
+                    adv_nt::process::suspend(env, &[u32::MAX]),
+                    adv_machine::Outcome::Return(0)
+                ));
+                assert!(
+                    env.sys
+                        .contexts
+                        .iter()
+                        .filter(|context| !context.is_done())
+                        .all(|context| context.suspend_count == 1)
+                );
+                assert!(matches!(
+                    adv_nt::process::resume(env, &[u32::MAX]),
+                    adv_machine::Outcome::Return(0)
+                ));
+                assert!(
+                    env.sys
+                        .contexts
+                        .iter()
+                        .all(|context| context.suspend_count == 0)
+                );
+            })
+            .unwrap();
+    }) else {
+        return;
+    };
     assert!(matches!(stop, Stop::Exited(37)), "{stop:?}: {text}");
     let checks = [
         "registry_create",
@@ -166,4 +177,42 @@ fn l_process_probe() {
     ];
     let expected: Vec<_> = checks.iter().map(|name| format!("{name}=1")).collect();
     assert_eq!(text.lines().collect::<Vec<_>>(), expected);
+}
+
+// spec: WINE-NT-101, WINE-NT-102, WINE-NT-103, WINE-THR-1
+#[test]
+fn j_file() {
+    let Some((stop, text)) = probe("j_file", "nt_j_file.exe", |_, _| {}) else {
+        return;
+    };
+    assert!(matches!(stop, Stop::Exited(0)), "{stop:?}: {text}");
+    assert_checks(
+        &text,
+        "=ok",
+        &[
+            "flush_file",
+            "flush_ex",
+            "flush_access",
+            "lock",
+            "lock_conflict",
+            "lock_wait",
+            "unlock",
+            "lock_woken",
+            "delete",
+            "mailslot",
+            "notify_filter",
+            "notify",
+            "cancel",
+            "cancel_ex",
+            "cancel_ex_result",
+            "cancel_sync",
+            "gather",
+            "scatter",
+            "device_invalid",
+            "device_disk",
+            "device_server",
+            "flush_pipe",
+            "pipe_read",
+        ],
+    );
 }

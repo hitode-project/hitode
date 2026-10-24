@@ -149,6 +149,14 @@ REQUESTS = [
     "query_completion",
     "adjust_token_privileges",
     "allocate_reserve_object",
+    "create_mailslot",
+    "cancel_async",
+    "cancel_sync",
+    "flush",
+    "lock_file",
+    "unlock_file",
+    "read_directory_changes",
+    "read_change",
 ]
 
 # Structures sent as request or reply data. Their fields are integers laid
