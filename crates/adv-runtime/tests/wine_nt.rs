@@ -328,7 +328,7 @@ fn m_system() {
     );
 }
 
-// spec: WINE-SYS-4, PROC-ISO-1, PROC-HANDLE-1, PROC-CREATE-2
+// spec: WINE-SYS-4, PROC-ISO-1, PROC-HANDLE-1, PROC-CREATE-2, PROC-MEM-1, SRV-SYNC-3
 #[test]
 fn children() {
     let Some((stop, text)) = probe("children", "nt_children.exe", |_, _| {}) else {

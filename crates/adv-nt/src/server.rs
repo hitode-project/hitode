@@ -242,6 +242,14 @@ impl Link {
         data: &[&[u8]],
         reply_data: &mut [u8],
     ) -> Result<(R::Reply, usize), Error> {
+        if R::NUMBER == crate::protocol::GetApcResultRequest::NUMBER {
+            // The server closes this handle when returning the APC result.
+            // Its number can then name a new, still-pending APC.
+            // SAFETY: NUMBER selects the generated repr(C) request layout.
+            let result =
+                unsafe { &*(request as *const R).cast::<crate::protocol::GetApcResultRequest>() };
+            self.inproc.remove(&result.handle);
+        }
         if R::NUMBER == crate::protocol::DupHandleRequest::NUMBER {
             // SAFETY: NUMBER selects the generated repr(C) request layout.
             let duplicate =
@@ -279,6 +287,9 @@ impl Link {
         reply_data: &mut [u8],
     ) -> Result<usize, Error> {
         let word = |offset| u32::from_ne_bytes(fixed[offset..offset + 4].try_into().unwrap());
+        if word(0) as i32 == crate::protocol::GetApcResultRequest::NUMBER {
+            self.inproc.remove(&word(12));
+        }
         if word(0) as i32 == crate::protocol::DupHandleRequest::NUMBER && word(32) & 1 != 0 {
             self.inproc.remove(&word(16));
         }
