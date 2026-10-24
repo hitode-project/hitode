@@ -324,7 +324,7 @@ pub fn query_performance_counter(env: &mut Env<'_>, args: &[u32]) -> Outcome {
     let &[counter, frequency] = args else {
         unreachable!()
     };
-    let ticks = env.sys.clock.now_us() * 10;
+    let ticks = performance_counter(env);
     status::finish((|| {
         write_bytes(env, counter, &ticks.to_le_bytes())?;
         if frequency != 0 {
@@ -334,7 +334,11 @@ pub fn query_performance_counter(env: &mut Env<'_>, args: &[u32]) -> Outcome {
     })())
 }
 
-const TICKS_PER_SECOND: u64 = 10_000_000;
+pub(crate) const TICKS_PER_SECOND: u64 = 10_000_000;
+
+pub(crate) fn performance_counter(env: &Env<'_>) -> u64 {
+    env.sys.clock.now_us() * 10
+}
 
 /// NtQuerySystemTime(*time)
 pub fn query_time(env: &mut Env<'_>, args: &[u32]) -> Outcome {

@@ -37,6 +37,11 @@ const BODIES: &[Body] = &[
         conv: Conv::Cdecl { argc: 3 },
         leaf: memmove,
     },
+    Body {
+        name: "ntdll.dll!NtQueryPerformanceCounter",
+        conv: Conv::Stdcall { argc: 2 },
+        leaf: query_performance_counter,
+    },
 ];
 
 /// The host functions of the bodies.
@@ -177,4 +182,28 @@ fn memmove(env: &mut Env<'_>) -> Option<u64> {
         env.cpu.copy_memory(src, dst, n as usize).ok()?;
     }
     Some(u64::from(dst) << 32 | u64::from(dst))
+}
+
+// spec: WINE-NAT-3
+fn query_performance_counter(env: &mut Env<'_>) -> Option<u64> {
+    let (counter, frequency) = (env.arg(0), env.arg(1));
+    if counter == 0
+        || !env.cpu.accessible(counter, 8, Prot::WRITE)
+        || (frequency != 0 && !env.cpu.accessible(frequency, 8, Prot::WRITE))
+    {
+        return None;
+    }
+    // The syscall boundary's system-time reads advance the virtual clock.
+    if env.sys.clock.is_virtual() {
+        crate::kuser::refresh(env);
+        crate::server::set_time(env);
+    }
+    let ticks = crate::system::performance_counter(env);
+    env.cpu.write(counter, &ticks.to_le_bytes()).ok()?;
+    if frequency != 0 {
+        env.cpu
+            .write(frequency, &crate::system::TICKS_PER_SECOND.to_le_bytes())
+            .ok()?;
+    }
+    Some(u64::from(crate::status::SUCCESS))
 }

@@ -187,6 +187,11 @@ FreeType is such a library: win32u opens it by name and draws TrueType text thro
 **Rule**: A native body that accepts a call MUST leave the guest state Wine's function would leave. Registers and flags the calling convention does not keep are exempt. Otherwise it MUST decline before any side effect, and the call MUST run Wine's function from its entry with the caller's frame.
 **Verification**: Test
 
+### WINE-NAT-3 Performance counter body
+
+**Rule**: The native body of `ntdll.dll!NtQueryPerformanceCounter` MUST use the system call's counter computation and machine clock. It MUST return success and write the counter and optional frequency as the system call does. A null counter or an unwritable output MUST make the body decline before any write.
+**Verification**: Test
+
 ## Graphics
 
 ### WINE-GFX-1 DirectDraw memory DCs
