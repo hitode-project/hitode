@@ -1439,7 +1439,7 @@ fn run_execution(
 ) -> Result<Finished, String> {
     #[cfg(target_os = "macos")]
     if let (Some(dist), Some(worker)) = (options.wine.clone(), window.take()) {
-        return wine::run_execution(&options, &dist, worker, wake, background);
+        return wine::run_execution(&options, &dist, worker, wake, keys, background);
     }
     window::initialize_dpi()?;
     let started = Instant::now();

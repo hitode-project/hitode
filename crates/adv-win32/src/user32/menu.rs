@@ -38,71 +38,7 @@ struct Item {
     submenu: u32,
 }
 
-/// Immutable presentation data. No guest payload or native platform handle is shared.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct MenuKey {
-    pub window: u32,
-    pub menu: u32,
-    pub revision: u64,
-    pub enabled: bool,
-}
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct MenuBar {
-    pub key: MenuKey,
-    pub items: Vec<MenuItem>,
-    pub popup: Option<PopupPresentation>,
-}
-/// Screen placement is projected to the guest client's coordinate space. UI
-/// reads the completion token only; no guest objects or native HWNDs are shared.
-#[derive(Clone, Debug)]
-pub struct PopupPresentation {
-    pub x: i32,
-    pub y: i32,
-    pub flags: u32,
-    pub exclude: Option<[i32; 4]>,
-    pub active: std::sync::Arc<std::sync::atomic::AtomicBool>,
-}
-impl PartialEq for PopupPresentation {
-    fn eq(&self, other: &Self) -> bool {
-        self.x == other.x
-            && self.y == other.y
-            && self.flags == other.flags
-            && self.exclude == other.exclude
-            && std::sync::Arc::ptr_eq(&self.active, &other.active)
-    }
-}
-impl Eq for PopupPresentation {}
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MenuItem {
-    pub text: Vec<u16>,
-    pub flags: u32,
-    pub supported: bool,
-    pub command: MenuCommand,
-    pub submenu: u32,
-    pub children: Vec<MenuItem>,
-}
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct MenuCommand {
-    pub window: u32,
-    pub root: u32,
-    pub menu: u32,
-    pub position: u32,
-    pub id: u32,
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MenuEvent {
-    Cancel {
-        window: u32,
-        root: u32,
-    },
-    Command(MenuCommand),
-    Initialize {
-        window: u32,
-        root: u32,
-        menu: u32,
-        position: Option<u16>,
-    },
-}
+pub use adv_device::ui::{MenuBar, MenuCommand, MenuEvent, MenuItem, MenuKey, PopupPresentation};
 
 /// Keep the visible menu owner's bar while a modal dialog disables its owner.
 pub fn presentation_key(user: &super::User, objects: &Objects) -> MenuKey {

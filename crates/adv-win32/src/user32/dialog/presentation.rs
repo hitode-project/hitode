@@ -6,92 +6,17 @@ use super::super::window::{Rect, TrackbarState, User, Window, make_long, wm};
 use super::super::{user, user_mut};
 use crate::Win32;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct DialogTarget {
-    pub dialog: u32,
-    pub hwnd: u32,
-    pub parent: u32,
-    pub id: u32,
-    pub created_us: u64,
-}
+pub use adv_device::ui::{
+    DialogControl, DialogEvent, DialogFont, DialogSet, DialogTarget, DialogWindow,
+};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DialogFont {
-    pub face: String,
-    pub height: i32,
-    pub weight: i32,
-    pub italic: bool,
-    pub charset: u8,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct DialogSet {
-    pub dialogs: Vec<DialogWindow>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DialogWindow {
-    pub target: DialogTarget,
-    pub owner: u32,
-    pub owner_enabled: bool,
-    pub class: String,
-    pub style: u32,
-    pub ex_style: u32,
-    pub text: String,
-    /// Screen coordinates; child rectangles use their parent's client coordinates.
-    pub rect: Rect,
-    pub client_size: (i32, i32),
-    pub visible: bool,
-    pub enabled: bool,
-    pub modal: bool,
-    pub focus: u32,
-    pub font: Option<DialogFont>,
-    /// Parents precede descendants; preserve guest z-order within each parent.
-    pub controls: Vec<DialogControl>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DialogControl {
-    pub target: DialogTarget,
-    pub class: String,
-    pub style: u32,
-    pub ex_style: u32,
-    pub text: String,
-    pub rect: Rect,
-    pub visible: bool,
-    pub enabled: bool,
-    pub check: u32,
-    pub items: Vec<String>,
-    pub selection: i32,
-    pub range: Option<(i32, i32)>,
-    pub value: i32,
-    pub font: Option<DialogFont>,
-    pub supported: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum DialogEvent {
-    Click(DialogTarget),
-    Select {
-        target: DialogTarget,
-        index: i32,
-    },
-    Track {
-        target: DialogTarget,
-        value: i32,
-        code: u16,
-    },
-    Text {
-        target: DialogTarget,
-        text: String,
-    },
-    Focus(DialogTarget),
-    Close(DialogTarget),
-    Key {
-        target: DialogTarget,
-        key: u32,
-        shift: bool,
-    },
+fn ui_rect(rect: Rect) -> adv_device::ui::Rect {
+    adv_device::ui::Rect {
+        left: rect.left,
+        top: rect.top,
+        right: rect.right,
+        bottom: rect.bottom,
+    }
 }
 
 fn identity(dialog: u32, window: &Window) -> DialogTarget {
@@ -208,7 +133,7 @@ pub fn presentation(win32: &Win32, objects: &Objects) -> Result<DialogSet, Strin
                     .status
                     .as_ref()
                     .map_or_else(|| child.text.clone(), |s| s.display(&child.text)),
-                rect: child.rect,
+                rect: ui_rect(child.rect),
                 visible: child.visible(),
                 enabled: child.enabled(),
                 check: child.control.button & 3,
@@ -231,7 +156,7 @@ pub fn presentation(win32: &Win32, objects: &Objects) -> Result<DialogSet, Strin
             style: window.style,
             ex_style: window.ex_style,
             text: window.text.clone(),
-            rect: window.rect,
+            rect: ui_rect(window.rect),
             client_size: window.client_size(),
             visible: true,
             enabled: window.enabled(),

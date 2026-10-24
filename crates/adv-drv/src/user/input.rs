@@ -2,7 +2,7 @@
 //! queue fd: readability sets QS_DRIVER, and ProcessEvents sends hardware
 //! input through win32u on that thread, as the Mac driver does.
 use std::cell::Cell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::io::{PipeReader, PipeWriter, Read, Write};
 use std::os::fd::AsRawFd;
 
@@ -48,12 +48,34 @@ struct Input {
     words: [u32; 7],
 }
 
+/// Driver work on a guest thread, which ends by running `done`.
+pub(super) type Job = Box<dyn FnOnce(&mut Env<'_>, Done) -> Outcome>;
+pub(super) type Done = Box<dyn FnOnce(&mut Env<'_>) -> Outcome>;
+
+enum Event {
+    Input(Input),
+    Job(Job),
+}
+
+impl Event {
+    fn wanted(&self, mask: u32) -> bool {
+        match self {
+            Event::Input(input) => input.mask & mask != 0,
+            Event::Job(_) => true,
+        }
+    }
+}
+
 struct Queue {
     read: PipeReader,
     write: PipeWriter,
-    events: VecDeque<Input>,
+    events: VecDeque<Event>,
     processing: bool,
 }
+
+/// Keys and mouse buttons the host holds down, by virtual key.
+#[derive(Default)]
+struct Held(BTreeSet<u32>);
 
 #[derive(Default)]
 struct Queues(HashMap<CtxId, Queue>);
@@ -97,12 +119,98 @@ pub(super) fn init(env: &mut Env<'_>) -> Result<(), String> {
     Ok(())
 }
 
+/// The window the last frame presented, if it still exists.
+pub fn presented_window(ext: &Ext) -> Option<u32> {
+    let (hwnd, _) = ext.get::<Presentation>().last.get()?;
+    window(ext, hwnd).map(|_| hwnd)
+}
+
+/// Run `job` on the guest thread that owns `hwnd`, when it next looks at
+/// its queue.
+pub(super) fn schedule(ext: &mut Ext, hwnd: u32, job: Job) -> bool {
+    let Some(window) = window(ext, hwnd) else {
+        return false;
+    };
+    push(ext, window.context, Event::Job(job)).is_ok()
+}
+
+fn push(ext: &mut Ext, context: CtxId, event: Event) -> Result<(), String> {
+    let Some(queue) = ext.get_mut::<Queues>().0.get_mut(&context) else {
+        return Err(format!("{MODULE}: context {context} has no queue"));
+    };
+    // One byte marks a nonempty queue. Neither end can block: writes only
+    // happen on empty queues, and reads only after their marker was written.
+    if queue.events.is_empty() {
+        queue.write.write_all(&[1]).map_err(|e| e.to_string())?;
+    }
+    queue.events.push_back(event);
+    Ok(())
+}
+
+/// Release every key and button the host holds, as when it loses focus.
+/// Returns how many releases were queued.
+pub fn release(ext: &mut Ext) -> usize {
+    let held = std::mem::take(&mut ext.get_or_default::<Held>().0);
+    held.into_iter()
+        .filter(|&key| {
+            let (message, wparam) = match key {
+                1 => (0x202, 0),
+                2 => (0x205, 0),
+                4 => (0x208, 0),
+                key => (0x101, key),
+            };
+            let lparam = if message == 0x101 { 0xc000_0001 } else { 0 };
+            post(ext, message, wparam, lparam).is_ok()
+        })
+        .count()
+}
+
+/// Type `text` into the presented window's thread, one UTF-16 unit per
+/// KEYEVENTF_UNICODE press. Returns how many characters were queued.
+pub fn text(ext: &mut Ext, text: &str) -> usize {
+    let Some(hwnd) = presented_window(ext) else {
+        return 0;
+    };
+    let context = window(ext, hwnd).unwrap().context;
+    let mut typed = 0;
+    for character in text.chars() {
+        let mut units = [0; 2];
+        for &unit in character.encode_utf16(&mut units).iter() {
+            for flags in [4, 6] {
+                let words = [1, u32::from(unit) << 16, flags, 0, 0, 0, 0];
+                let input = Input {
+                    hwnd,
+                    mask: QS_KEY,
+                    words,
+                };
+                if push(ext, context, Event::Input(input)).is_err() {
+                    return typed;
+                }
+            }
+        }
+        typed += 1;
+    }
+    typed
+}
+
 /// Queue a host Win32 mouse or key message. Mouse points are relative to
 /// the last presented frame, and become screen coordinates here.
 pub fn post(ext: &mut Ext, message: u32, wparam: u32, lparam: u32) -> Result<(), String> {
     let Some((hwnd, (left, top))) = ext.get::<Presentation>().last.get() else {
         return Ok(());
     };
+    let held = &mut ext.get_or_default::<Held>().0;
+    match message {
+        0x100 | 0x104 => drop(held.insert(wparam & 0xff)),
+        0x101 | 0x105 => drop(held.remove(&(wparam & 0xff))),
+        0x201 | 0x203 => drop(held.insert(1)),
+        0x202 => drop(held.remove(&1)),
+        0x204 | 0x206 => drop(held.insert(2)),
+        0x205 => drop(held.remove(&2)),
+        0x207 | 0x209 => drop(held.insert(4)),
+        0x208 => drop(held.remove(&4)),
+        _ => {}
+    }
     let Some(window) = window(ext, hwnd) else {
         return Ok(());
     };
@@ -138,14 +246,11 @@ pub fn post(ext: &mut Ext, message: u32, wparam: u32, lparam: u32) -> Result<(),
         }
         _ => return Ok(()),
     };
-    let queue = ext.get_mut::<Queues>().0.get_mut(&window.context).unwrap();
-    // One byte marks a nonempty queue. Neither end can block: writes only
-    // happen on empty queues, and reads only after their marker was written.
-    if queue.events.is_empty() {
-        queue.write.write_all(&[1]).map_err(|e| e.to_string())?;
-    }
-    queue.events.push_back(Input { hwnd, mask, words });
-    Ok(())
+    push(
+        ext,
+        window.context,
+        Event::Input(Input { hwnd, mask, words }),
+    )
 }
 
 fn process(env: &mut Env<'_>) -> Outcome {
@@ -163,16 +268,20 @@ fn process(env: &mut Env<'_>) -> Outcome {
 
 fn next(env: &mut Env<'_>, mask: u32) -> Outcome {
     let queue = env.ext.get_mut::<Queues>().0.get_mut(&env.context).unwrap();
-    let Some(index) = queue.events.iter().position(|input| input.mask & mask != 0) else {
+    let Some(index) = queue.events.iter().position(|event| event.wanted(mask)) else {
         queue.processing = false;
         return Outcome::Return(u32::from(mask == QS_ALLINPUT && queue.events.is_empty()));
     };
-    let input = queue.events.remove(index).unwrap();
+    let event = queue.events.remove(index).unwrap();
     if queue.events.is_empty()
         && let Err(error) = queue.read.read_exact(&mut [0])
     {
         return Outcome::Fail(error.to_string());
     }
+    let input = match event {
+        Event::Input(input) => input,
+        Event::Job(job) => return job(env, Box::new(move |env| next(env, mask))),
+    };
     let send = match win32u(env, "NtUserCallHwndParam") {
         Ok(send) => send,
         Err(error) => return Outcome::Fail(error),

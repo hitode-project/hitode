@@ -18,6 +18,7 @@ use adv_unix::loader::Libraries;
 
 mod display;
 pub mod input;
+pub mod project;
 mod surface;
 pub use display::DESKTOP;
 
@@ -93,6 +94,7 @@ pub(super) fn register(registry: &mut Registry) {
     registry.add(MODULE, "DestroyWindow", Conv::Cdecl { argc: 1 }, |env| {
         let hwnd = env.arg(0);
         env.ext.get_or_default::<Windows>().0.remove(&hwnd);
+        project::forget(env.ext, hwnd);
         Outcome::Return(0)
     });
     registry.add(
@@ -183,6 +185,18 @@ fn surface_funcs(env: &Env<'_>) -> u32 {
 /// What win32u last reported about `hwnd`.
 pub fn window(ext: &adv_machine::Ext, hwnd: u32) -> Option<Window> {
     ext.try_get::<Windows>()?.0.get(&hwnd).copied()
+}
+
+/// Every window win32u reported, with the guest thread that owns it.
+fn windows(ext: &adv_machine::Ext) -> Vec<(u32, adv_machine::CtxId)> {
+    let mut windows: Vec<_> = ext
+        .try_get::<Windows>()
+        .into_iter()
+        .flat_map(|windows| windows.0.iter())
+        .map(|(&hwnd, window)| (hwnd, window.context))
+        .collect();
+    windows.sort_unstable();
+    windows
 }
 
 /// The desktop window, which presents nothing itself.

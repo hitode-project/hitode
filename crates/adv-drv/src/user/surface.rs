@@ -30,8 +30,8 @@ struct Surface {
     pixels: u32,
     width: u32,
     height: u32,
-    /// The store surface over the window's part, with its size.
-    view: Option<(u32, u32, u32)>,
+    /// The store surface over the window's part, with its size and first pixel.
+    view: Option<(u32, u32, u32, u32)>,
 }
 
 /// The driver's window surfaces, by address.
@@ -242,16 +242,29 @@ fn flush(env: &mut Env<'_>) -> Outcome {
     let Some(window) = window(env.ext, hwnd).filter(|window| window.visible) else {
         return Outcome::Return(1);
     };
-    let [left, top, right, bottom] = window.extent;
-    let width = ((right - left).max(0) as u32).min(full.0);
-    let height = ((bottom - top).max(0) as u32).min(full.1);
+    // The host shows a projected dialog natively, and a window's caption,
+    // frame and menu bar as its own: frames carry the client area.
+    if super::project::projected(env.ext, hwnd) {
+        return Outcome::Return(1);
+    }
+    let [client_left, client_top, client_right, client_bottom] = window.client;
+    let x = (client_left - window.extent[0]).clamp(0, full.0 as i32) as u32;
+    let y = (client_top - window.extent[1]).clamp(0, full.1 as i32) as u32;
+    let width = ((client_right - client_left).max(0) as u32).min(full.0 - x);
+    let height = ((client_bottom - client_top).max(0) as u32).min(full.1 - y);
     if width == 0 || height == 0 {
         return Outcome::Return(1);
     }
+    let start = pixels + y * full.0 * 4 + x * 4;
     let [left, top, right, bottom] = check!(rect(env, dirty));
+    let (left, top) = ((left - x as i32).max(0), (top - y as i32).max(0));
+    let (right, bottom) = (
+        (right - x as i32).min(width as i32),
+        (bottom - y as i32).min(height as i32),
+    );
     let damage = Rect {
-        x: left.max(0) as u32,
-        y: top.max(0) as u32,
+        x: left as u32,
+        y: top as u32,
         w: (right - left).max(0) as u32,
         h: (bottom - top).max(0) as u32,
     };
@@ -260,13 +273,13 @@ fn flush(env: &mut Env<'_>) -> Outcome {
         let store = env.ext.get_mut::<SurfaceStore>();
         let mut memory = (provider.memory)(env.cpu);
         let sid = match view {
-            Some((sid, w, h)) if (w, h) == (width, height) => sid,
+            Some((sid, w, h, at)) if (w, h, at) == (width, height, start) => sid,
             _ => {
-                if let Some((old, _, _)) = view {
+                if let Some((old, _, _, _)) = view {
                     store.delete(old);
                 }
                 let part = adv_device::surface::Surface {
-                    pixels,
+                    pixels: start,
                     width,
                     height,
                     pitch: full.0 * 4,
@@ -282,7 +295,7 @@ fn flush(env: &mut Env<'_>) -> Outcome {
                     .0
                     .get_mut(&address)
                     .unwrap()
-                    .view = Some((sid, width, height));
+                    .view = Some((sid, width, height, start));
                 sid
             }
         };
@@ -298,7 +311,7 @@ fn flush(env: &mut Env<'_>) -> Outcome {
         )
     };
     if changed {
-        super::input::prepare(env.ext, hwnd, (window.extent[0], window.extent[1]));
+        super::input::prepare(env.ext, hwnd, (client_left, client_top));
         super::input::presented(env.ext);
         if let Some(outcome) = (provider.completed)(env, presented) {
             return outcome;
@@ -310,7 +323,7 @@ fn flush(env: &mut Env<'_>) -> Outcome {
 fn destroy(env: &mut Env<'_>) -> Outcome {
     let address = env.arg(0);
     if let Some(surface) = env.ext.get_or_default::<Surfaces>().0.remove(&address) {
-        if let Some((sid, _, _)) = surface.view {
+        if let Some((sid, _, _, _)) = surface.view {
             env.ext.get_mut::<SurfaceStore>().delete(sid);
         }
         let _ = env.sys.vm.free(env.cpu, surface.pixels);

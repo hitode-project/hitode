@@ -7,6 +7,7 @@
 //! holds them, and drive D: is the game's directory. As Wine runs wineboot
 //! whenever its server starts, a session first runs it for the keys that
 //! last until the server stops.
+use adv_drv::user::project;
 use std::cell::{Cell, RefCell};
 use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
@@ -432,11 +433,92 @@ impl Session {
 
     /// Post host input in coordinates of the last presented frame and wake
     /// the guest through Wine's queue fd, including when every thread waits.
+    /// A press, or the host window's restore, brings back a window the
+    /// guest minimized, as its taskbar button would.
     pub fn input(&mut self, message: u32, wparam: u32, lparam: u32) -> Result<(), String> {
-        adv_drv::user::input::post(&mut self.machine.ext, message, wparam, lparam)?;
+        let restoring = matches!((message, wparam), (5, 0) | (0x201 | 0x204, _));
+        if !(restoring && project::restore(&mut self.machine.ext)) {
+            adv_drv::user::input::post(&mut self.machine.ext, message, wparam, lparam)?;
+        }
+        self.poke()
+    }
+
+    /// Wake the guest for what the driver queued.
+    fn poke(&mut self) -> Result<(), String> {
         self.machine.visit_context(None, adv_nt::server::run)?;
         self.wake.signal();
         Ok(())
+    }
+
+    fn queued(&mut self, queued: bool) -> bool {
+        queued && self.poke().is_ok()
+    }
+
+    /// Committed IME text for the presented window; returns the characters
+    /// queued.
+    pub fn text(&mut self, text: &str) -> usize {
+        let typed = adv_drv::user::input::text(&mut self.machine.ext, text);
+        if self.poke().is_ok() { typed } else { 0 }
+    }
+
+    /// Release what the host holds down, as when its window loses focus.
+    pub fn release_input(&mut self) -> usize {
+        let released = adv_drv::user::input::release(&mut self.machine.ext);
+        if self.poke().is_ok() { released } else { 0 }
+    }
+
+    /// Ask the presented window to close.
+    pub fn close(&mut self) -> bool {
+        let queued = project::close(&mut self.machine.ext);
+        self.queued(queued)
+    }
+
+    /// The host application gained or lost activation.
+    pub fn activate(&mut self, active: bool) -> bool {
+        let queued = project::activate(&mut self.machine.ext, active);
+        self.queued(queued)
+    }
+
+    /// Read the guest's windows again for the native views below.
+    pub fn refresh_ui(&mut self) {
+        project::refresh(&mut self.machine.ext);
+        let _ = self.poke();
+    }
+
+    pub fn dialogs(&self) -> crate::DialogSet {
+        project::dialogs(&self.machine.ext)
+    }
+
+    pub fn dialog_event(&mut self, event: crate::DialogEvent) -> bool {
+        let queued = project::dialog_event(&mut self.machine.ext, event);
+        self.queued(queued)
+    }
+
+    pub fn menu_bar(&self) -> crate::MenuBar {
+        project::menu_bar(&self.machine.ext)
+    }
+
+    pub fn menu_event(&mut self, event: crate::MenuEvent) -> bool {
+        let queued = project::menu_event(&mut self.machine.ext, event);
+        self.queued(queued)
+    }
+
+    pub fn input_view(&self) -> crate::InputView {
+        project::view(&self.machine.ext)
+    }
+
+    pub fn window_at(&self, x: i32, y: i32) -> Option<crate::WindowView> {
+        project::window_at(&self.machine.ext, x, y)
+    }
+
+    /// Whether the guest minimized the presented window.
+    pub fn minimized(&self) -> bool {
+        project::minimized(&self.machine.ext)
+    }
+
+    /// Frames presented so far.
+    pub fn presented_frames(&self) -> u64 {
+        self.machine.ext.get::<SurfaceStore>().stats.presentations
     }
 
     pub fn audio_stream(&self) -> adv_device::AudioStream {

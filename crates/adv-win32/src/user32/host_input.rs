@@ -289,29 +289,7 @@ pub fn release(env: &mut Env<'_>) -> usize {
     posted
 }
 
-/// A guest window as the control channel reports it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct WindowView {
-    pub hwnd: u32,
-    pub parent: u32,
-    pub id: u32,
-    pub class: String,
-    pub text: String,
-    pub visible: bool,
-    pub enabled: bool,
-}
-
-/// What host input would address now: the displayed top-level window, its
-/// thread's focus, active and capture windows, and every top-level window in
-/// z-order. `top` is 0 when no guest window is displayed.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct InputView {
-    pub top: u32,
-    pub focus: u32,
-    pub active: u32,
-    pub capture: u32,
-    pub windows: Vec<WindowView>,
-}
+pub use adv_device::ui::{InputView, WindowView};
 
 fn window_view(user: &User, window: &super::window::Window) -> WindowView {
     WindowView {

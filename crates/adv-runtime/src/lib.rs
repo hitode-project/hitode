@@ -36,14 +36,12 @@ pub use adv_cpu::{code_pool_state, prepare_code_pool_after_attach, prepare_code_
 pub fn reserve_guest_window() -> Result<(), String> {
     adv_cpu::virtual_memory::GuestWindow::preserve()
 }
+pub use adv_device::ui::{
+    DialogControl, DialogEvent, DialogFont, DialogSet, DialogTarget, DialogWindow, InputView,
+    MenuBar, MenuCommand, MenuEvent, MenuItem, MenuKey, PopupPresentation, WindowView,
+};
 pub use adv_dx::dsound::{AudioSourceStatus, PcmDigest};
-pub use adv_win32::user32::dialog::{
-    DialogControl, DialogEvent, DialogFont, DialogSet, DialogTarget, DialogWindow,
-};
-pub use adv_win32::user32::host_input::{InputView, WindowView, mouse_mapping};
-pub use adv_win32::user32::menu::{
-    MenuBar, MenuCommand, MenuEvent, MenuItem, MenuKey, PopupPresentation,
-};
+pub use adv_win32::user32::host_input::mouse_mapping;
 pub use adv_win32::vorbisfile as vorbis;
 pub use graphics::{
     FrameConsumer, FrameProducer, FrameView, Graphics, GraphicsStats, IID_DDRAW7, IID_SURFACE7,
