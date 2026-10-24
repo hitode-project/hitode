@@ -518,16 +518,23 @@ fn serve(machine: &mut Machine<Cpu>) -> Result<bool, String> {
         .get::<adv_device::AudioControl>()
         .sync_clock(now);
     let notices = adv_dx::dsound::pump(machine)?;
+    let winmm = super::winmm::pump(machine)?;
+    let winmm_ready = machine
+        .sys
+        .contexts
+        .iter()
+        .any(|context| context.is_ready());
+    let notices = notices.into_iter().chain(winmm).min();
     machine.ext.insert(SoundDeadline(notices));
     let video = adv_dx::dshow::pump_video(machine)?;
     machine.ext.insert(VideoDeadline(video));
     let media = adv_drv::media::pump(machine)?;
     #[cfg(feature = "gpu")]
-    return adv_dx::d3d9::pump(machine).map(|gpu| gpu || media);
+    return adv_dx::d3d9::pump(machine).map(|gpu| gpu || media || winmm_ready);
     #[cfg(not(feature = "gpu"))]
     {
         let _ = machine;
-        Ok(media)
+        Ok(media || winmm_ready)
     }
 }
 

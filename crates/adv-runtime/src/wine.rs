@@ -24,6 +24,7 @@ mod class;
 pub mod session;
 mod sound;
 mod video;
+pub mod winmm;
 
 /// The display driver to name in the process's startup parameters.
 pub const GRAPHICS_DRIVER: &str = adv_drv::user::MODULE;
@@ -59,6 +60,7 @@ pub fn register(registry: &mut Registry) {
     class::register(registry);
     sound::register(registry);
     video::register(registry);
+    winmm::register(registry);
     #[cfg(feature = "gpu")]
     adv_dx::d3d9::register(registry);
     adv_drv::register(registry);
@@ -95,6 +97,7 @@ pub fn install<B: Backend>(
     machine.ext.insert(Heap(heap));
     sound::install(machine, prefix, allocator())?;
     video::install(machine, prefix)?;
+    winmm::install(machine, prefix)?;
     #[cfg(feature = "gpu")]
     {
         adv_dx::d3d9::install(machine, d3d9_provider())?;
