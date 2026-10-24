@@ -244,6 +244,7 @@ impl Progress for Shared {
 /// `tools/wine/prefix-template.sh`.
 const TEMPLATE: &str = "share/hitode/prefix";
 const MODULES: &str = "lib/wine/i386-windows";
+const NTDLL: &str = "lib/wine/i386-windows/ntdll.dll";
 /// How long wineboot may take.
 const BOOT: Duration = Duration::from_secs(120);
 
@@ -556,6 +557,7 @@ impl Session {
             Box::new(shared.clone()),
         )
         .map_err(|e| format!("wineboot: {e}"))?;
+        adv_nt::identity::note_ntdll(&mut boot.ext, &config.dist.join(NTDLL), &ntdll);
         match run(
             &mut boot,
             &wake,
@@ -594,6 +596,7 @@ impl Session {
             Box::new(shared.clone()),
         )
         .map_err(|e| e.to_string())?;
+        adv_nt::identity::note_ntdll(&mut machine.ext, &config.dist.join(NTDLL), &ntdll);
         shared.id.set(started.thread.unix_pid);
         machine.ext.insert(process::Children::default());
         machine.ext.insert(shared.clone());
@@ -939,6 +942,7 @@ impl Session {
                 (connection, registered),
             )
             .map_err(|e| e.to_string())?;
+            adv_nt::identity::note_ntdll(&mut machine.ext, &c.dist.join(NTDLL), &c.ntdll);
             machine
                 .ext
                 .insert(self.machine.ext.get::<process::Children>().fork());

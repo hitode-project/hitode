@@ -41,7 +41,9 @@ FFmpeg Unix modules are not needed. Build the host runner with `gpu,media`.
 On an i386-capable Linux builder with MinGW and i386 FreeType development files,
 run `tools/wine/build-media.sh SOURCE BUILD DIST STRIPPED_DIST`. It records the
 scalar SSE flags, disabled configure dependencies, the PE-only media target,
-installation and debug stripping. An existing build only installs the extra DLL;
+installation, debug stripping and the code identity tables
+(`tools/wine/identity.py DIST STRIPPED_DIST`, which also runs alone on an
+existing pair). An existing build only installs the extra DLL;
 compare checksums of the other installed binaries before and after. `DIST` holds
 `usr/local`; the stripped runtime contains its `lib` and `share` directories.
 

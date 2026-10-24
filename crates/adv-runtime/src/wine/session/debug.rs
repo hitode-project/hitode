@@ -39,6 +39,9 @@ impl Session {
     }
 
     pub fn guest_place(&self, address: u32) -> String {
+        if let Some(place) = adv_nt::identity::place(&self.machine.ext, address) {
+            return format!("pid {:#x} {place}", self.machine.sys.pid);
+        }
         let place = self
             .debug_modules()
             .ok()

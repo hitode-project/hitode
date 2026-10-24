@@ -491,6 +491,7 @@ pub fn unmap_view(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         let memory = env.ext.get_or_default::<Memory>();
         memory::remove_view(env.cpu, &mut env.sys.vm, memory, base);
         unixlib::forget_image(env, base);
+        crate::identity::forget_image(env.ext, base);
         Ok(())
     })())
 }
@@ -587,6 +588,8 @@ pub fn map_image(env: &mut Env<'_>, mapping: u32) -> Result<View, Error> {
     if reply.header.error != 0 && reply.header.error != IMAGE_NOT_AT_BASE {
         return Err(reply.header.error.into());
     }
+    let headers = &file[..(pe.size_of_headers as usize).min(file.len())];
+    crate::identity::note_image(env.ext, base, size, path.as_deref(), headers);
     unixlib::note_image(env, base, path);
     Ok(View {
         base,

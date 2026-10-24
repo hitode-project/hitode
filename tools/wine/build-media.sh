@@ -3,6 +3,7 @@
 # Usage: build-media.sh SOURCE BUILD DIST STRIPPED_DIST
 # Existing builds retain every installed binary except the added PE module.
 set -eu
+tools=$(cd "$(dirname "$0")" && pwd)
 source=$(cd "$1" && pwd)
 mkdir -p "$2" "$3" "$4"
 build=$(cd "$2" && pwd)
@@ -42,3 +43,4 @@ else
     cp "$dist/$module" "$stripped/${module#usr/local/}"
     i686-w64-mingw32-objcopy --strip-debug --file-alignment=512 "$stripped/${module#usr/local/}"
 fi
+python3 "$tools/identity.py" "$dist" "$stripped"

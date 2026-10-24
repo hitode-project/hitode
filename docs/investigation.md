@@ -131,6 +131,8 @@ which stack is running. `modules` and `threads` list the session's processes;
 `mem`, `dis`, `stack`, `calls` and `slow` inspect the presented process. `calls`
 records NT/Unix and host-module boundaries, not calls between Wine PE modules.
 `gaps` reports that the built-in stack's API diagnostics are unavailable.
+Addresses in the distribution's modules are named `module!function+offset`
+from the code identity tables when the mapped image's headers match them.
 Timeline execution counters cover the process family, including exited children.
 The report's `wine_boundaries` counts the family's system calls (NT and win32k
 tables), Unix calls by library and code, and server requests by name, each with

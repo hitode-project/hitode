@@ -19,6 +19,7 @@ pub mod dispatch;
 pub mod environment;
 pub mod exception;
 pub mod file;
+pub mod identity;
 pub mod image;
 pub mod information;
 pub mod kuser;
