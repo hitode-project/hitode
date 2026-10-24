@@ -1539,11 +1539,12 @@ mod tests {
         );
         println!(
             "mixed MMX loop: {} guest instructions, {} A64 instructions",
-            work.trace.len(),
+            work.unit.trace.len(),
             work.words().len()
         );
         assert!(
-            work.trace
+            work.unit
+                .trace
                 .insts
                 .iter()
                 .all(|i| !matches!(i.op, super::super::decode::Op::Helper(_)))

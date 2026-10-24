@@ -147,7 +147,7 @@ fn bytecode_vm_dispatch_instruction_gate() {
     // encoder's option 010 is UXTW; bit 13 selects the X-register form.
     let resolved = ldr_reg(X, X17, X17, host(0), true) | (1 << 13);
     let baseline = work.words()[2..=branch].to_vec();
-    work.images.push((CODE, 0x30000));
+    work.unit.images.push((CODE, 0x30000));
     mem.protect(DATA, 4096, 1).unwrap();
     translate(
         &mut work,
@@ -163,7 +163,7 @@ fn bytecode_vm_dispatch_instruction_gate() {
         &|_| None,
         0x037f,
     );
-    assert_eq!(work.tables.len(), 1);
+    assert_eq!(work.unit.tables.len(), 1);
     let hot = work.words().iter().position(|&w| w == br(X17)).unwrap();
     assert_eq!(work.words()[hot - 1], resolved);
     let after = 3;
@@ -327,6 +327,7 @@ impl Harness {
         );
         assert!(
             !work
+                .unit
                 .trace
                 .insts
                 .iter()
@@ -757,7 +758,7 @@ fn switch_table_recognition_checks_unsigned_bounds_pages_and_index_provenance() 
         let mut mem = memory(&code, &vec![0; 8192]);
         mem.protect(DATA, 8192, 1).unwrap();
         let mut work = Workspace::default();
-        work.images.push((CODE, 0x30000));
+        work.unit.images.push((CODE, 0x30000));
         let stubs = Stubs {
             leaf: HOST_CODE as usize,
             exit: HOST_CODE as usize,
@@ -787,7 +788,7 @@ fn switch_table_recognition_checks_unsigned_bounds_pages_and_index_provenance() 
                 &|_| None,
                 0x037f,
             );
-            let count = work.tables.first().map_or(0, |t| t.targets.len());
+            let count = work.unit.tables.first().map_or(0, |t| t.targets.len());
             assert_eq!(
                 count,
                 if writable_tail { 0 } else { expected },

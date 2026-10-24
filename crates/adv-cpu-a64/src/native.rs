@@ -1139,7 +1139,7 @@ impl Native {
     fn emit(&mut self, memory: &mut Memory, eip: u32) -> Option<Entry> {
         let at = self.cache.next();
         let mut work = std::mem::take(&mut self.work);
-        work.images.clone_from(&self.images.borrow());
+        work.unit.images.clone_from(&self.images.borrow());
         let (all, checked) = (self.checks != Checks::Adaptive, &self.checked);
         let control = if self.runtime.cpu.is_null() {
             self.control
@@ -1182,7 +1182,7 @@ impl Native {
             control,
         );
         if work.retired() == 0 {
-            self.diagnostics.empty_units[usize::from(work.trace.failure & 3)] += 1;
+            self.diagnostics.empty_units[usize::from(work.unit.trace.failure & 3)] += 1;
         }
         let entry = self.place(
             eip,
@@ -1193,16 +1193,17 @@ impl Native {
         );
         if let Some(entry) = entry {
             debug_assert_eq!(entry.unit, at);
-            if !work.tables.is_empty() {
+            if !work.unit.tables.is_empty() {
                 self.table_sources.insert(eip);
             }
-            for table in &work.tables {
+            for table in &work.unit.tables {
                 for (index, &target) in table.targets.iter().enumerate() {
                     let slot = (eip, at + table.offset + index * 8, at + table.stub);
                     self.rows.entry(target).or_default().push(slot);
                 }
             }
             let mut targets: Vec<_> = work
+                .unit
                 .tables
                 .iter()
                 .flat_map(|t| t.targets.iter().copied())
@@ -1232,7 +1233,7 @@ impl Native {
                 }
             }
         }
-        self.channels |= entry.is_some() && work.channels;
+        self.channels |= entry.is_some() && work.code.channels;
         // Code discovery can protect a host page shared with ordinary data.
         // Revalidate the non-faulting batch proof before linked code resumes.
         if self.channels {

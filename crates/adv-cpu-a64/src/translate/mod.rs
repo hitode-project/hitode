@@ -1,7 +1,9 @@
 //! Translation units (A64-TR-3).
 //!
-//! `trace` picks the guest instructions of a unit and analyses them; this
-//! module emits them in trace order, with side exits, edge trampolines and
+//! The front end builds a [`Unit`]: `trace` picks the guest instructions
+//! and analyses them, and `tables` finds the switch tables they index. A
+//! [`Backend`] lowers it (A64-TR-7). The JIT back end, [`Jit`], emits the
+//! instructions in trace order, with side exits, edge trampolines and
 //! refusals after the body, and `ops` emits each instruction.
 //!
 //! Flags follow A64-FLAG-1 to A64-FLAG-5. SF ZF OF live in NZCV. CF lives in NZCV's C in a
@@ -99,12 +101,67 @@ pub struct Site {
     pub resume: i32,
 }
 
-/// The last unit translated, in buffers the next translation reuses.
+/// A unit as the front end leaves it, for a back end to lower (A64-TR-7):
+/// its trace with the analysis back ends share, and the switch tables it
+/// may index directly.
 #[derive(Default)]
-pub struct Workspace {
+pub struct Unit {
+    /// The executable images, whose read-only tables may be indexed.
     pub(crate) images: Vec<(u32, u32)>,
     pub(crate) tables: Vec<tables::Table>,
     pub(crate) trace: Trace,
+}
+
+impl Unit {
+    /// Traces the unit at `eip`, ending before any of `stops`. Each byte
+    /// the unit depends on is registered with `watch_code`, so a store to
+    /// it reaches the owner. `leaf` and `redirect` are as for
+    /// [`Trace::build`].
+    pub fn build(
+        &mut self,
+        memory: &mut adv_cpu_core::memory::Memory,
+        eip: u32,
+        stops: &[u32],
+        leaf: &dyn Fn(u32, u32) -> bool,
+        redirect: &dyn Fn(u32) -> Option<(u32, Vec<u8>)>,
+    ) {
+        self.trace.build(memory, eip, stops, leaf, redirect);
+        tables::prepare(self, memory);
+        for &(start, len) in &self.trace.code {
+            memory.watch_code(start, len as usize);
+        }
+    }
+
+    /// Guest bytes the unit depends on, as sorted
+    /// (address, length) spans.
+    pub fn code(&self) -> &[(u32, u32)] {
+        &self.trace.code
+    }
+
+    /// What the unit's `interpret` calls run, from the base index its
+    /// back end was given.
+    pub fn helpers(&mut self) -> std::vec::Drain<'_, Helper> {
+        self.trace.helpers.drain(..)
+    }
+}
+
+/// A translator back end (A64-TR-7).
+pub trait Backend {
+    /// Lowers `unit`, traced from `eip`. A back end records where it put
+    /// the unit's tables in them.
+    fn lower(&mut self, unit: &mut Unit, eip: u32);
+}
+
+/// The last unit translated, in buffers the next translation reuses.
+#[derive(Default)]
+pub struct Workspace {
+    pub(crate) unit: Unit,
+    pub(crate) code: Code,
+}
+
+/// The JIT back end's output, in buffers the next unit reuses.
+#[derive(Default)]
+pub struct Code {
     asm: Asm,
     labels: Vec<Label>,
     sites: Vec<(usize, Site)>,
@@ -131,39 +188,39 @@ pub struct Link {
 
 impl Workspace {
     pub fn words(&self) -> &[u32] {
-        self.asm.words()
+        self.code.asm.words()
     }
 
     /// Byte offset of each site in `words`.
     pub fn sites(&self) -> &[(usize, Site)] {
-        &self.sites
+        &self.code.sites
     }
 
     /// Instructions the entry prepays: the unit runs only with that much
     /// countdown.
     pub fn retired(&self) -> u32 {
-        self.retired
+        self.code.retired
     }
 
     /// Guest bytes the unit depends on, as sorted
     /// (address, length) spans.
     pub fn code(&self) -> &[(u32, u32)] {
-        &self.trace.code
+        self.unit.code()
     }
 
     pub fn links(&self) -> &[Link] {
-        &self.links
+        &self.code.links
     }
 
     /// Where each stretch of the unit starts, for samplers.
     pub fn marks(&self) -> &[Mark] {
-        &self.marks
+        &self.code.marks
     }
 
     /// What the unit's `interpret` calls run, from the base index
     /// `translate` was given on.
     pub fn helpers(&mut self) -> std::vec::Drain<'_, Helper> {
-        self.trace.helpers.drain(..)
+        self.unit.helpers()
     }
 }
 
@@ -400,72 +457,93 @@ pub fn translate(
     redirect: &dyn Fn(u32) -> Option<(u32, Vec<u8>)>,
     control: u16,
 ) {
-    work.trace.build(memory, eip, stops, leaf, redirect);
-    tables::prepare(work, memory);
-    for &(start, len) in &work.trace.code {
-        memory.watch_code(start, len as usize);
-    }
-    let Workspace {
-        trace,
-        asm,
-        labels,
-        sites,
-        cold,
-        far,
-        links,
-        marks,
-        retired,
-        channels,
-        tables,
-        images: _,
-    } = work;
-    *channels = false;
-    asm.reset();
-    labels.clear();
-    labels.extend((0..trace.len()).map(|_| asm.label()));
-    sites.clear();
-    cold.clear();
-    far.clear();
-    links.clear();
-    marks.clear();
-    let mut t = Translator {
-        asm,
+    work.unit.build(memory, eip, stops, leaf, redirect);
+    Jit {
+        code: &mut work.code,
         features,
-        trace,
-        labels,
-        sites,
-        cold,
-        marks,
-        far,
-        links,
-        tables,
+        at,
         stubs,
         checked,
         helpers,
-        checking: false,
-        state: State::CANONICAL,
-        index: 0,
-        out: FlagSet::ALL,
-        keep: FlagSet::ALL,
-        vector: simd::Vector::default(),
-        pixel: None,
-        pixel_copies: Vec::new(),
-        channels,
-        x87: x87::Cache::default(),
-        x87_sites: Vec::new(),
         control,
-    };
-    if trace.len() == 0 {
-        // Nothing to translate: other units may still link here.
-        t.exit(Exit::Interpret, eip);
-        *retired = 0;
-    } else {
-        for index in 0..trace.len() {
-            t.instruction(index);
-        }
-        *retired = trace.prepaid(0);
     }
-    t.finish(at);
+    .lower(&mut work.unit, eip);
+}
+
+/// The JIT back end: A64 code for host address `at`, with the parameters
+/// of [`translate`].
+pub struct Jit<'a> {
+    pub code: &'a mut Code,
+    pub features: Features,
+    pub at: usize,
+    pub stubs: Stubs,
+    pub checked: &'a dyn Fn(u32) -> bool,
+    pub helpers: u32,
+    pub control: u16,
+}
+
+impl Backend for Jit<'_> {
+    fn lower(&mut self, unit: &mut Unit, eip: u32) {
+        let Code {
+            asm,
+            labels,
+            sites,
+            cold,
+            far,
+            links,
+            marks,
+            retired,
+            channels,
+        } = &mut *self.code;
+        let Unit { trace, tables, .. } = unit;
+        *channels = false;
+        asm.reset();
+        labels.clear();
+        labels.extend((0..trace.len()).map(|_| asm.label()));
+        sites.clear();
+        cold.clear();
+        far.clear();
+        links.clear();
+        marks.clear();
+        let mut t = Translator {
+            asm,
+            features: self.features,
+            trace,
+            labels,
+            sites,
+            cold,
+            marks,
+            far,
+            links,
+            tables,
+            stubs: self.stubs,
+            checked: self.checked,
+            helpers: self.helpers,
+            checking: false,
+            state: State::CANONICAL,
+            index: 0,
+            out: FlagSet::ALL,
+            keep: FlagSet::ALL,
+            vector: simd::Vector::default(),
+            pixel: None,
+            pixel_copies: Vec::new(),
+            channels,
+            x87: x87::Cache::default(),
+            x87_sites: Vec::new(),
+            control: self.control,
+        };
+        if trace.len() == 0 {
+            // Nothing to translate: other units may still link here.
+            t.exit(Exit::Interpret, eip);
+            *retired = 0;
+        } else {
+            for index in 0..trace.len() {
+                t.instruction(index);
+            }
+            *retired = trace.prepaid(0);
+        }
+        t.finish(self.at);
+    }
 }
 
 impl Translator<'_> {
