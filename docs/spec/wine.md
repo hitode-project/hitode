@@ -211,6 +211,11 @@ FreeType is such a library: win32u opens it by name and draws TrueType text thro
 **Rule**: When a thread that drew a software frame waits, the frame MUST be published. A frame deferred to a UI's mailbox MUST NOT wait for a readback.
 **Verification**: Test
 
+### WINE-GFX-8 Disabled N-patches
+
+**Rule**: Direct3D 9 MUST accept `SetNPatchMode(0)` without changing rendering state. Enabling N-patches MUST remain unavailable.
+**Verification**: Test
+
 ## Input
 
 ### WINE-IN-1 Presented window coordinates
@@ -278,6 +283,11 @@ FreeType is such a library: win32u opens it by name and draws TrueType text thro
 
 **Rule**: A session's system and user locales MUST be those of the game's ANSI code page: ja-JP for 932, zh-CN for 936. Win32u MUST load the host's system fonts in place, and the prefix MUST replace the CJK faces Windows ships with host families.
 **Verification**: Review — which host fonts a game shows is seen on its own screens.
+
+### WINE-SES-6 Installed system subdirectories
+
+**Rule**: The prefix template MUST retain Wine-installed subdirectories of `system32`, including their data and module links.
+**Verification**: Test
 
 ## Conformance
 
