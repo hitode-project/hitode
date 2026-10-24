@@ -10,7 +10,7 @@ use adv_cpu::backend::{Backend, GuestExt, Prot};
 use adv_device::{AudioControl, RingState, ring::RingConfig};
 use adv_machine::Machine;
 
-mod midi;
+pub mod midi;
 mod stream;
 #[cfg(test)]
 mod tests;
@@ -146,12 +146,6 @@ pub(super) fn register(registry: &mut Registry) {
         "modMessage",
         Conv::Stdcall { argc: 5 },
         midi::output,
-    );
-    registry.add(
-        MODULE,
-        "midi_render",
-        Conv::Stdcall { argc: 1 },
-        midi::timer,
     );
     registry.add(MODULE, "DriverProc", Conv::Stdcall { argc: 5 }, |env| {
         Outcome::Return(match env.arg(2) {

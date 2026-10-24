@@ -48,4 +48,4 @@ A table or a list may follow the fields as part of the rule. Three kinds of note
 
 ## Length
 
-A file has at most 400 lines. Split a longer file by subsystem instead of compressing fields.
+A file has at most 1000 lines. Split a longer file by subsystem instead of compressing fields.

@@ -1,5 +1,5 @@
-//! WinMM output messages over the device synthesizer. Wine retains stream
-//! scheduling, MCI sequencing, handle mapping and DriverCallback delivery.
+//! WinMM output messages over the device synthesizer. The session pumps
+//! rendering on host time; Wine retains handle mapping and callback delivery.
 use super::*;
 use adv_device::midi::{MidiEvent, SAMPLE_RATE};
 
@@ -19,7 +19,6 @@ struct Midi {
     volume: u32,
     running: u8,
     synth: Option<adv_device::midi::Synth>,
-    generation: u32,
     origin: u64,
     frames: u64,
 }
@@ -30,7 +29,6 @@ impl Default for Midi {
             volume: u32::MAX,
             running: 0,
             synth: None,
-            generation: 0,
             origin: 0,
             frames: 0,
         }
@@ -126,18 +124,8 @@ fn message(
             midi.synth = Some(adv_device::midi::Synth::new()?);
         }
         midi.synth.as_mut().unwrap().event(MidiEvent::Reset)?;
-        midi.generation += 1;
         midi.origin = env.sys.clock.now_us() + LEAD_US;
         midi.frames = 0;
-        let generation = midi.generation;
-        let entry = env
-            .sys
-            .thunks
-            .publish(env.cpu, MODULE, "midi_render")
-            .map_err(|e| e.to_string())?;
-        env.sys
-            .spawn(env.cpu, "MIDI render", entry, &[generation], 64 * 1024)
-            .map_err(|e| e.to_string())?;
         let midi = env.ext.get_mut::<Midi>();
         midi.open = Some(open);
         midi.running = 0;
@@ -315,16 +303,15 @@ pub(super) fn unix_output(env: &mut Env<'_>, args: u32) -> Result<(), String> {
 }
 
 // Fixed output lead separates guest event times from callback consumption. The
-// render context waits on the machine clock, including when the game is idle.
+// session pumps the renderer even when every guest context waits.
 const LEAD_US: u64 = 30_000;
-const PERIOD_US: u64 = 10_000;
-fn pump(env: &mut Env<'_>) -> Result<(), String> {
+fn render_until(env: &mut Env<'_>, until: u64) -> Result<(), String> {
     let audio = env.ext.get::<AudioControl>().clone();
     let now = env.sys.clock.now_us();
     audio.sync_clock(now);
     let source = source(env);
     let midi = env.ext.get_mut::<Midi>();
-    let end = (now + LEAD_US).saturating_sub(midi.origin) * u64::from(SAMPLE_RATE) / 1_000_000;
+    let end = until.saturating_sub(midi.origin) * u64::from(SAMPLE_RATE) / 1_000_000;
     while midi.frames < end {
         let frames = (end - midi.frames).min(441) as usize;
         let samples = midi.synth.as_mut().unwrap().render(frames);
@@ -351,19 +338,26 @@ fn pump(env: &mut Env<'_>) -> Result<(), String> {
     Ok(())
 }
 
-pub(super) fn timer(env: &mut Env<'_>) -> Outcome {
-    tick(env, env.arg(0))
+fn pump(env: &mut Env<'_>) -> Result<(), String> {
+    render_until(env, env.sys.clock.now_us() + LEAD_US)
 }
-fn tick(env: &mut Env<'_>, generation: u32) -> Outcome {
-    let midi = env.ext.get::<Midi>();
-    if midi.open.is_none() || midi.generation != generation {
-        return Outcome::Return(0);
+
+/// Render up to an event's device timestamp before changing synthesis state.
+pub fn native_event(env: &mut Env<'_>, at: u64, event: MidiEvent) -> Result<(), String> {
+    render_until(env, at + LEAD_US)?;
+    env.ext
+        .get_mut::<Midi>()
+        .synth
+        .as_mut()
+        .unwrap()
+        .event(event)
+}
+
+/// The session owns this deadline even when all guest contexts are waiting.
+pub fn native_pump(env: &mut Env<'_>) -> Result<Option<u64>, String> {
+    if env.ext.get_or_default::<Midi>().open.is_none() {
+        return Ok(None);
     }
-    if let Err(error) = pump(env) {
-        return Outcome::Fail(error);
-    }
-    Outcome::block(
-        adv_machine::Wait::Until(env.sys.clock.now_us() + PERIOD_US),
-        move |env, _| tick(env, generation),
-    )
+    pump(env)?;
+    Ok(Some(env.sys.clock.now_us() + 10_000))
 }

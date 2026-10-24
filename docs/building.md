@@ -66,7 +66,8 @@ bank. `vendor/fluidr3mono/FluidR3Mono_GM.sf3` is unchanged from MuseScore's
 SHA-256 `cfcd66d89e8386823400eca64934b14fbea7bf48ba1f00d21189af1262794ec2`.
 Its notices are in `vendor/fluidr3mono/LICENSE`. The bank is embedded and needs no
 runtime downloads or host MIDI setup. Synthesis runs on the execution owner;
-a machine-clock render context feeds the shared PCM mixer with 30 ms of lead.
+the session pump feeds the shared PCM mixer with 30 ms of lead. Native WinMM
+consumes wave headers and sequences MIDI streams independently of guest threads.
 The authored `tests/probe/midi.c` in `adv-runtime` checks WinMM, MIDI streams and
 MCI. Build it as its header describes into `ADV_WINE_PROBES`, then run
 `cargo test --release -p adv-runtime --test wine_midi` with `ADV_WINE_DIST` set.

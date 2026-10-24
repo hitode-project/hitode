@@ -397,3 +397,35 @@ Process startup MUST register the prefix's drive letters in the server namespace
 
 **Rule**: Listed Wine conformance tests that pass on standard Wine MUST pass here with no failures. Each runs as its own program without arguments.
 **Verification**: Test
+
+## Native winmm
+
+### WINE-AUD-8 Native wave output
+
+**Rule**: Native PCM and float wave output MUST consume queued headers on device time through the session mixer. Pausing, restarting, resetting and breaking loops MUST preserve Wine 11's header flags, ordering and positions.
+**Verification**: Test
+**Basis**: Wine 11 `dlls/winmm/waveform.c`.
+
+### WINE-AUD-9 Callback delivery
+
+**Rule**: Header completion MUST progress while all guest threads wait. Function completions MUST run on a guest worker. Window, thread and event callbacks MUST retain Wine's arguments and delivery order.
+**Verification**: Test
+**Basis**: Wine 11 `DriverCallback` and `WINMM_NotifyClient`.
+
+### WINE-AUD-10 Named sounds
+
+**Rule**: Memory, resource, file and alias sounds MUST play through native wave output. Synchronous calls MUST wait through the machine. Asynchronous looping and stopping MUST run on host time.
+**Verification**: Test
+**Basis**: Wine 11 `dlls/winmm/playsound.c`.
+
+### WINE-AUD-11 Remaining Wine exports
+
+**Rule**: The WinMM image MUST retain Wine 11's export names and ordinals. Unimplemented exports MUST call the original Wine module, loadable under a second name. Wine MCI wave playback MUST reach native wave output.
+**Verification**: Test
+**Basis**: Wine 11 `dlls/winmm/winmm.spec`.
+
+### WINE-AUD-12 Native MIDI streams
+
+**Rule**: MIDI streams MUST sequence short, long, tempo and callback events on host time through the Wine stack's synthesizer. Pause, restart, stop, properties and position MUST retain Wine 11's results. Session idle deadlines MUST include native audio work.
+**Verification**: Test
+**Basis**: Wine 11 `dlls/winmm/winmm.c`.

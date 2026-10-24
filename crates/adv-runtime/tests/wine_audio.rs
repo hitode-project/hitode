@@ -1,4 +1,4 @@
-//! Wine's own winmm and dsound feed a host-output reader in a headless session.
+//! Native WinMM and DirectSound feed a host-output reader in a headless session.
 #![cfg(any(target_vendor = "apple", target_os = "android"))]
 
 use std::fs::File;
@@ -53,6 +53,8 @@ fn wine_audio_reaches_the_host_stream() {
             break stop;
         }
     };
+    let native = session.machine.ext.get::<adv_runtime::wine::winmm::Stats>();
+    assert!(native.wave_headers >= 1 && native.wave_completed >= 1);
     drop(reader);
     drop(session);
     // SAFETY: output owns this valid descriptor.

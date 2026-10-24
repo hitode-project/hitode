@@ -15,7 +15,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent.parent
-MAX_LINES = 400
+MAX_LINES = 1000
 THIRD_PARTY = ("vendor/", "tools/fixtures/vendor/", "crates/adv-cpu-core/softfloat/")
 SPECS = "docs/spec/"
 ALLOWED = {

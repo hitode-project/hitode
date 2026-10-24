@@ -1,4 +1,4 @@
-//! Wine's WinMM, stream scheduler and MCI sequencer over the software synth.
+//! Native MIDI stream scheduling and Wine MCI over the software synthesizer.
 #![cfg(any(target_vendor = "apple", target_os = "android"))]
 use adv_runtime::wine::session::{Config, Session, Stop};
 use std::{
@@ -12,7 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-// spec: WINE-AUD-5, WINE-AUD-6
+// spec: WINE-AUD-5, WINE-AUD-6, WINE-AUD-12
 #[test]
 fn midi_messages_streams_and_mci_produce_pcm() {
     let (Some(dist), Some(probes)) = (
@@ -68,6 +68,10 @@ fn midi_messages_streams_and_mci_produce_pcm() {
     };
     consuming.store(false, Ordering::Release);
     let nonzero = consumer.join().unwrap();
+    let native = session.machine.ext.get::<adv_runtime::wine::winmm::Stats>();
+    assert_eq!(native.stream_events, 7);
+    assert_eq!(native.stream_time_us, 500_000);
+    assert_eq!(native.stream_headers, 1);
     drop(session);
     drop(stdout);
     let text = std::fs::read_to_string(root.join("stdout")).unwrap();

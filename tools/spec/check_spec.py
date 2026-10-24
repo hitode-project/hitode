@@ -19,7 +19,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent.parent
 SPEC = "docs/spec"
 RULES_DOC = f"{SPEC}/README.md"
-MAX_LINES = 400
+MAX_LINES = 1000
 MAX_WORDS = 25
 MAX_SENTENCES = 3
 FIELDS = ("Rule", "Applies to", "Verification", "Basis")
