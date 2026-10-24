@@ -630,7 +630,7 @@ Process startup MUST register the prefix's drive letters in the server namespace
 **Rule**: Native media images MUST preserve Wine's export names and ordinals. Unimplemented exports and quartz classes MUST delegate to Wine's retained original modules.
 **Verification**: Test
 
-## Native winmm
+## Native WinMM
 
 ### WINE-AUD-8 Native wave output
 
@@ -662,7 +662,7 @@ Process startup MUST register the prefix's drive letters in the server namespace
 **Verification**: Test
 **Basis**: Wine 11 `dlls/winmm/winmm.c`.
 
-## Native xaudio2
+## Native XAudio2
 
 ### WINE-XAUDIO-1 Native XAudio2 graph
 

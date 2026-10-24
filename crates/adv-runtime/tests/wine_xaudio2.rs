@@ -13,6 +13,22 @@ use std::{
 };
 
 fn play(version: u32) {
+    // Wine's server can start only once per host process.
+    let thread = std::thread::current();
+    let case = thread.name().unwrap();
+    if !std::env::args().any(|arg| arg == case) {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([case, "--exact", "--nocapture"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
     let (Some(dist), Some(probes)) = (
         std::env::var_os("ADV_WINE_DIST").map(PathBuf::from),
         std::env::var_os("ADV_WINE_PROBES").map(PathBuf::from),
