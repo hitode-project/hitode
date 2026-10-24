@@ -150,7 +150,7 @@ This spec covers the audio and video API front ends: ACM, DirectSound storage, D
 
 ### MEDIA-WMV-1 Compressed samples
 
-**Rule**: WMCreateSyncReader MUST deliver compressed stream samples with timestamps and clean-point flags. Requests for decompressed output MUST return `E_NOTIMPL`, and builds without media support MUST fail reader creation.
+**Rule**: WMCreateSyncReader MUST deliver compressed stream samples with timestamps and clean-point flags. Without Wine assembly, requests for decompressed output MUST return `E_NOTIMPL`. Builds without media support MUST fail reader creation.
 **Verification**: Test
 
 ### MEDIA-WMV-2 Input and allocation

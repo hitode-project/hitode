@@ -30,6 +30,9 @@ fn path(env: &Env<'_>, pointer: u32) -> Result<Vec<u16>, u32> {
 }
 
 fn open(env: &mut Env<'_>, filename: u32, then: Opened) -> Outcome {
+    if let Some(host) = env.ext.try_get::<Host>() {
+        return (host.open)(env, filename, then);
+    }
     if !Decoder::available() {
         adv_abi::warn_unavailable(
             env,
@@ -76,7 +79,7 @@ fn open(env: &mut Env<'_>, filename: u32, then: Opened) -> Outcome {
             let reader = match reader {
                 Ok(reader) => reader,
                 Err(error) => {
-                    env.sys.objects.close(handle);
+                    host::close(env, handle);
                     return then(env, Err(error));
                 }
             };
@@ -91,7 +94,7 @@ fn open(env: &mut Env<'_>, filename: u32, then: Opened) -> Outcome {
             match result {
                 Ok(decoder) => then(env, Ok((decoder, handle))),
                 Err(error) => {
-                    env.sys.objects.close(handle);
+                    host::close(env, handle);
                     then(env, Err(error))
                 }
             }
@@ -100,6 +103,7 @@ fn open(env: &mut Env<'_>, filename: u32, then: Opened) -> Outcome {
 }
 
 fn attach(env: &mut Env<'_>, filter: u32, decoder: Decoder, handle: u32, filename: Vec<u16>) {
+    env.ext.get_or_default::<Playback>().sources += 1;
     let info = decoder.info().clone();
     let source = Source {
         file_handle: Some(handle),
@@ -150,7 +154,7 @@ pub(super) fn add(env: &mut Env<'_>, graph: u32, filename: u32, name: u32, outpu
             let filter = match filter::new_filter(env, Role::FileSource, CLSID_ASYNC_READER) {
                 Ok(filter) => filter,
                 Err(error) => {
-                    env.sys.objects.close(handle);
+                    host::close(env, handle);
                     return Outcome::Return(error);
                 }
             };

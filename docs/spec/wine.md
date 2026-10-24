@@ -602,3 +602,30 @@ Process startup MUST register the prefix's drive letters in the server namespace
 
 **Rule**: Stack comparisons MUST run sequentially with the same executable, duration, headless GPU, audio, and automatic-dialog settings. The default gate MUST reject Wine CPU per frame exceeding 105% of the old stack's, or frame counts below 90%. Unsuccessful runs, missing summaries, and zero-frame measurements MUST NOT pass.
 **Verification**: Test
+
+## Native video
+
+### WINE-MEDIA-8 Native DirectShow graphs
+
+**Rule**: Wine's `quartz.dll` MUST activate implemented DirectShow classes through `adv_dx::dshow`. Native file graphs MUST decode through `adv_device` and mix audio through the session's native DirectSound service.
+**Verification**: Test
+
+### WINE-MEDIA-9 Native synchronous reader
+
+**Rule**: Wine's `WMCreateSyncReader` MUST use `adv_dx::wmvcore` for filename opening, compressed samples and decoded outputs. File reads and decoding MUST NOT block the execution owner.
+**Verification**: Test
+
+### WINE-MEDIA-10 Wine video geometry
+
+**Rule**: Native video layers MUST use the driver's Wine HWND geometry and inherited visibility. Presented pixels MUST occupy the owner's position within the presented canvas.
+**Verification**: Test
+
+### WINE-MEDIA-11 Host playback service
+
+**Rule**: Native renderer graphs MUST progress on host time without a guest streaming thread. The session MUST service video deadlines while guest threads wait. Completion MUST follow decoded EOF and queued audio playback.
+**Verification**: Test
+
+### WINE-MEDIA-12 Wine media fallback
+
+**Rule**: Native media images MUST preserve Wine's export names and ordinals. Unimplemented exports and quartz classes MUST delegate to Wine's retained original modules.
+**Verification**: Test

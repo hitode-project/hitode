@@ -404,10 +404,12 @@ fn convert_audio(
     let pts = decoded
         .pts()
         .or(decoded.timestamp())
-        .map_or(0, |t| (t.max(0) / 10) as u64);
-    let pts = clock
-        .as_mut()
-        .map_or(pts, |clock| clock.stamp(pts, pcm.samples(), rate));
+        .map(|t| (t.max(0) / 10) as u64);
+    let pts = match (clock.as_mut(), pts) {
+        (Some(clock), Some(pts)) => clock.stamp(pts, pcm.samples(), rate),
+        (Some(clock), None) => clock.missing(pcm.samples(), rate),
+        (None, pts) => pts.unwrap_or(0),
+    };
     let count = pcm.samples() * usize::from(channels);
     let samples = pcm.data(0)[..count * 4]
         .as_chunks::<4>()

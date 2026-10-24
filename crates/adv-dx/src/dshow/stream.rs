@@ -37,6 +37,11 @@ pub(crate) struct Session {
     pending_audio: VecDeque<AudioFrame>,
     /// The mixer stream was told the graph paused; queued PCM must not play on.
     audio_paused: bool,
+    host: bool,
+    deadline: Option<u64>,
+    audio_end: u64,
+    updates: VecDeque<Result<adv_device::media::Update, adv_device::media::Error>>,
+    decoded_end: bool,
 }
 
 enum End {
@@ -133,9 +138,22 @@ pub(crate) fn start(env: &mut Env<'_>, graph: u32, filter: u32) -> u32 {
             segment: 0,
             pending_audio: VecDeque::new(),
             audio_paused: false,
+            host: false,
+            deadline: Some(0),
+            audio_end: 0,
+            updates: VecDeque::new(),
+            decoded_end: false,
         },
     );
     apply_volume(env, graph);
+    if env.ext.try_get::<Host>().is_some() {
+        let native = !matches!(video, Some(VideoTarget::Guest(_)));
+        session(env, id).host = native;
+        if !native {
+            state(env).pending_threads.push(id);
+        }
+        return u32::from(video.is_some()) + u32::from(audio_renderer);
+    }
     let spawned = env
         .sys
         .thunks
@@ -157,9 +175,10 @@ pub(crate) fn start(env: &mut Env<'_>, graph: u32, filter: u32) -> u32 {
 }
 
 pub(crate) fn wake(env: &mut Env<'_>, id: u32) {
-    if let Some(session) = state(env).sessions.get(&id) {
-        let wake = session.wake;
+    if let Some(stream) = state(env).sessions.get(&id) {
+        let wake = stream.wake;
         env.sys.set_event(wake);
+        session(env, id).deadline = Some(0);
     }
 }
 
@@ -246,11 +265,31 @@ fn pump(env: &mut Env<'_>, id: u32) -> Outcome {
     }
     let position = graph::stream_position(env, graph);
     let media_us = (position.max(0) / 10) as u64;
-    let update = state(env)
-        .filters
-        .get_mut(&splitter)
-        .and_then(|f| f.source.as_mut()?.decoder.as_mut())
-        .map(|decoder| decoder.frame_at(media_us));
+    let native = env.ext.try_get::<Host>().is_some();
+    let update = if native && !session(env, id).host {
+        match session(env, id).updates.pop_front() {
+            Some(update) => Some(update),
+            None => return wait(env, id, Some(env.sys.clock.now_us() + POLL_US)),
+        }
+    } else {
+        let update = state(env)
+            .filters
+            .get_mut(&splitter)
+            .and_then(|f| f.source.as_mut()?.decoder.as_mut())
+            .map(|decoder| {
+                if native {
+                    decoder.poll_frame(media_us)
+                } else {
+                    decoder.frame_at(media_us).map(Some)
+                }
+            });
+        match update {
+            Some(Ok(None)) => return wait(env, id, Some(env.sys.clock.now_us() + 1000)),
+            Some(Ok(Some(update))) => Some(Ok(update)),
+            Some(Err(error)) => Some(Err(error)),
+            None => None,
+        }
+    };
     process_update(env, id, update, position, paused)
 }
 
@@ -303,6 +342,9 @@ fn process_update(
             );
         }
     };
+    let stats = env.ext.get_or_default::<Playback>();
+    stats.video_frames += u64::from(update.video.is_some());
+    stats.audio_frames += update.audio.len() as u64;
     let s = session(env, id);
     if s.audio.is_some() {
         s.pending_audio.extend(update.audio);
@@ -340,6 +382,9 @@ fn process_update(
             match video::publish(env, graph, frame) {
                 Ok(Some(outcome)) => outcome,
                 Ok(None) if ended => end_of_stream(env, id),
+                Ok(None) if session(env, id).host => {
+                    wait(env, id, Some(env.sys.clock.now_us() + 1000))
+                }
                 Ok(None) => pump(env, id),
                 Err(hr) => abort_stream(env, id, hr, "video presentation failed"),
             }
@@ -353,6 +398,7 @@ fn process_update(
 }
 
 fn wait(env: &mut Env<'_>, id: u32, deadline: Option<u64>) -> Outcome {
+    session(env, id).deadline = deadline;
     let handle = session(env, id).wake;
     Outcome::block(Wait::Object { handle, deadline }, move |env, _| {
         pump(env, id)
@@ -405,12 +451,17 @@ fn begin_segment(env: &mut Env<'_>, id: u32) -> Outcome {
     let stop = state(env).graphs[&graph]
         .stop
         .unwrap_or_else(|| graph::duration(env, graph));
+    let native = env.ext.try_get::<Host>().is_some();
     if let Some(decoder) = state(env)
         .filters
         .get_mut(&splitter)
         .and_then(|f| f.source.as_mut()?.decoder.as_mut())
         && flush
-        && let Err(error) = decoder.seek((position / 10) as u64)
+        && let Err(error) = if native {
+            decoder.request_seek((position / 10) as u64)
+        } else {
+            decoder.seek((position / 10) as u64)
+        }
     {
         return abort_stream(env, id, E_FAIL, &format!("seek to {position}: {error}"));
     }
@@ -421,6 +472,9 @@ fn begin_segment(env: &mut Env<'_>, id: u32) -> Outcome {
     s.prerolled = false;
     s.discontinuity = true;
     s.pending_audio.clear();
+    s.updates.clear();
+    s.decoded_end = false;
+    s.audio_end = 0;
     if flush {
         s.audio_paused = false;
     }
@@ -470,6 +524,16 @@ fn end_of_stream(env: &mut Env<'_>, id: u32) -> Outcome {
     {
         let deadline = env.sys.clock.now_us() + POLL_US;
         return wait(env, id, Some(deadline));
+    }
+    if session(env, id).host
+        && audio.is_some()
+        && ((env.ext.get::<State>().graphs[&graph]
+            .position(env.sys.clock.now_us())
+            .max(0)
+            / 10) as u64)
+            < session(env, id).audio_end
+    {
+        return wait(env, id, Some(env.sys.clock.now_us() + POLL_US));
     }
     let s = session(env, id);
     s.ending = false;
@@ -527,6 +591,9 @@ fn push_audio(env: &mut Env<'_>, id: u32) {
         let Some(sound) = env.ext.try_get_mut::<Sound>() else {
             return;
         };
+        let end = frame.pts_us
+            + block.samples.len() as u64 * 1_000_000
+                / (u64::from(block.sample_rate) * u64::from(block.channels));
         if let Err(block) = sound.audio.push_pcm(block) {
             // The mixer queue is full; retry on the next pass.
             session(env, id).pending_audio.push_front(AudioFrame {
@@ -537,6 +604,7 @@ fn push_audio(env: &mut Env<'_>, id: u32) {
             });
             return;
         }
+        session(env, id).audio_end = session(env, id).audio_end.max(end);
     }
 }
 
@@ -626,6 +694,108 @@ pub(crate) fn convert(frame: &VideoFrame, mt: &MediaType) -> Vec<u8> {
     out
 }
 
+/// Decode for guest filters at the host boundary; their thread delivers
+/// callbacks and samples through guest vtables.
+fn produce(env: &mut Env<'_>, id: u32) {
+    let s = session(env, id);
+    if s.stopping || s.decoded_end || s.generation != s.seen_generation {
+        return;
+    }
+    let (graph, splitter) = (s.graph, s.splitter);
+    let Some(graph_state) = state(env).graphs.get(&graph) else {
+        return;
+    };
+    if graph_state.state == graph::STOPPED {
+        return;
+    }
+    let paused = graph_state.state == graph::PAUSED;
+    if paused && (session(env, id).prerolled || !session(env, id).updates.is_empty()) {
+        return;
+    }
+    if !sync_audio_pause(env, id, paused) {
+        return;
+    }
+    let position = graph::stream_position(env, graph).max(0) as u64 / 10;
+    let update = state(env)
+        .filters
+        .get_mut(&splitter)
+        .and_then(|f| f.source.as_mut()?.decoder.as_mut())
+        .map(|decoder| decoder.poll_frame(position));
+    let result = match update {
+        Some(Ok(None)) | None => None,
+        Some(Ok(Some(update))) => Some(Ok(update)),
+        Some(Err(error)) => Some(Err(error)),
+    };
+    if let Some(mut result) = result {
+        let s = session(env, id);
+        match &mut result {
+            Ok(update) => {
+                s.decoded_end = update.ended;
+                if s.audio.is_some() {
+                    s.pending_audio.extend(std::mem::take(&mut update.audio));
+                }
+            }
+            Err(_) => s.decoded_end = true,
+        }
+        if match &result {
+            Ok(update) => update.video.is_some() || update.ended,
+            Err(_) => true,
+        } {
+            s.updates.push_back(result);
+        }
+        let wake = s.wake;
+        env.sys.set_event(wake);
+    }
+    if !paused {
+        push_audio(env, id);
+    }
+}
+
+/// Service native renderers without scheduling a guest streaming thread.
+pub(super) fn pump_host<B: adv_cpu::backend::Backend>(
+    machine: &mut adv_machine::Machine<B>,
+) -> Result<Option<u64>, String> {
+    if machine.ext.try_get::<Host>().is_none() {
+        return Ok(None);
+    }
+    machine.visit_context(None, |env| {
+        let now = env.sys.clock.now_us();
+        let guest: Vec<u32> = env
+            .ext
+            .try_get::<State>()
+            .into_iter()
+            .flat_map(|s| s.sessions.iter())
+            .filter_map(|(&id, s)| (!s.host).then_some(id))
+            .collect();
+        for id in &guest {
+            produce(env, *id);
+        }
+        let ids: Vec<u32> = env
+            .ext
+            .try_get::<State>()
+            .into_iter()
+            .flat_map(|s| s.sessions.iter())
+            .filter_map(|(&id, s)| (s.host && s.deadline.is_some_and(|d| d <= now)).then_some(id))
+            .collect();
+        for id in ids {
+            match pump(env, id) {
+                Outcome::Block { .. } | Outcome::Return(_) => {}
+                Outcome::Fail(error) => return Err(error),
+                _ => return Err("native video service requested guest execution".into()),
+            }
+        }
+        Ok(env
+            .ext
+            .try_get::<State>()
+            .into_iter()
+            .flat_map(|s| s.sessions.values())
+            .filter(|s| s.host)
+            .filter_map(|s| s.deadline)
+            .chain((!guest.is_empty()).then_some(now + 1000))
+            .min())
+    })?
+}
+
 #[cfg(test)]
 mod tests {
     use adv_cpu::JitCpu;
@@ -664,6 +834,11 @@ mod tests {
                 segment: 0,
                 pending_audio: VecDeque::new(),
                 audio_paused: false,
+                host: false,
+                deadline: Some(0),
+                audio_end: 0,
+                updates: VecDeque::new(),
+                decoded_end: false,
             },
         );
         (m, graph, events, wake)

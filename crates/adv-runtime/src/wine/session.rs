@@ -494,10 +494,16 @@ fn run(
 
 /// When DirectSound next has position notifications to deliver.
 struct SoundDeadline(Option<u64>);
+struct VideoDeadline(Option<u64>);
 
 /// The earlier of a guest deadline and the next notification.
 fn with_notices(machine: &Machine<Cpu>, deadline: Option<u64>) -> Option<u64> {
     let notices = machine.ext.try_get::<SoundDeadline>().and_then(|d| d.0);
+    let video = machine.ext.try_get::<VideoDeadline>().and_then(|d| d.0);
+    let deadline = match (deadline, video) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    };
     match (deadline, notices) {
         (Some(a), Some(b)) => Some(a.min(b)),
         (a, b) => a.or(b),
@@ -513,6 +519,8 @@ fn serve(machine: &mut Machine<Cpu>) -> Result<bool, String> {
         .sync_clock(now);
     let notices = adv_dx::dsound::pump(machine)?;
     machine.ext.insert(SoundDeadline(notices));
+    let video = adv_dx::dshow::pump_video(machine)?;
+    machine.ext.insert(VideoDeadline(video));
     let media = adv_drv::media::pump(machine)?;
     #[cfg(feature = "gpu")]
     return adv_dx::d3d9::pump(machine).map(|gpu| gpu || media);

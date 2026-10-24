@@ -105,7 +105,7 @@ fn pin_with(env: &mut Env<'_>, graph: u32, pointer: u32, existing_only: bool) ->
         return Outcome::Return(E_INVALIDARG);
     }
     if state(env).filters[&filter].role == Role::FileSource {
-        return file(env, graph, filter, pin, existing_only);
+        return file(env, graph, filter, pin, existing_only, None);
     }
     match state(env).pins[&pin].major {
         MEDIATYPE_VIDEO => video(
@@ -131,6 +131,7 @@ struct Build {
     file: Option<(u32, u32, Option<MediaType>)>,
     guest: Option<u32>,
     existing_only: bool,
+    target: Option<u32>,
 }
 
 impl Build {
@@ -149,6 +150,7 @@ impl Build {
             file: None,
             guest: None,
             existing_only,
+            target: None,
         })
     }
 
@@ -275,31 +277,6 @@ fn guest_pin(env: &mut Env<'_>, graph: u32, output: u32, existing_only: bool) ->
     })
 }
 
-/// Attach a continuation to the shared connection handler without replacing
-/// the guest IPin::Connect/host ReceiveConnection negotiation it implements.
-fn after(env: &mut Env<'_>, outcome: Outcome, finish: Then) -> Outcome {
-    match outcome {
-        Outcome::Return(hr) => finish(env, vec![hr]),
-        Outcome::Call {
-            target,
-            args,
-            then,
-            stack,
-            unwindable,
-        } => Outcome::Call {
-            target,
-            args,
-            then: Box::new(move |env, resume| {
-                let outcome = then(env, resume);
-                after(env, outcome, finish)
-            }),
-            stack,
-            unwindable,
-        },
-        _ => unreachable!("source connections only return or call guest COM methods"),
-    }
-}
-
 fn guest_source(env: &mut Env<'_>, graph: u32, output: u32, existing_only: bool) -> Outcome {
     let mut build = match Build::new(env, graph, existing_only) {
         Ok(build) => build,
@@ -325,7 +302,30 @@ fn guest_source(env: &mut Env<'_>, graph: u32, output: u32, existing_only: bool)
     )
 }
 
-fn file(env: &mut Env<'_>, graph: u32, source: u32, output: u32, existing_only: bool) -> Outcome {
+pub(super) fn connect_pins(env: &mut Env<'_>, graph: u32, output: u32, input: u32) -> Outcome {
+    let source = filter::host_pin(env, output).and_then(|pin| {
+        let state = env.ext.get::<State>();
+        let pin = &state.pins[&pin];
+        (state.filters[&pin.filter].role == Role::FileSource
+            && pin.dir == OUTPUT
+            && pin.peer == 0
+            && state.filters[&pin.filter].graph == graph)
+            .then_some(pin.filter)
+    });
+    match source {
+        Some(source) => file(env, graph, source, output, false, Some(input)),
+        None => filter::connect(env, output, input, 0),
+    }
+}
+
+fn file(
+    env: &mut Env<'_>,
+    graph: u32,
+    source: u32,
+    output: u32,
+    existing_only: bool,
+    target: Option<u32>,
+) -> Outcome {
     let Some(info) = state(env).filters[&source]
         .source
         .as_ref()
@@ -337,6 +337,7 @@ fn file(env: &mut Env<'_>, graph: u32, source: u32, output: u32, existing_only: 
         Ok(build) => build,
         Err(error) => return Outcome::Return(error),
     };
+    build.target = target;
     build.file = Some((source, output, state(env).pins[&output].mt.clone()));
     let input = endpoint(env, build.splitter, INPUT);
     if let Err(error) = connect(env, output, input) {
@@ -382,6 +383,7 @@ fn file(env: &mut Env<'_>, graph: u32, source: u32, output: u32, existing_only: 
 fn streams(env: &mut Env<'_>, mut build: Build) -> Outcome {
     let graph = build.graph;
     let existing_only = build.existing_only;
+    let target = build.target;
     let mut video_output = None;
     let mut audio_output = None;
     let state = env.ext.get::<State>();
@@ -394,6 +396,9 @@ fn streams(env: &mut Env<'_>, mut build: Build) -> Outcome {
         })
         .collect();
     for (pin, major) in outputs {
+        if target.is_some() && major != MEDIATYPE_VIDEO {
+            continue;
+        }
         let (role, clsid, name) = if major == MEDIATYPE_VIDEO {
             (Role::VideoDecoder, CLSID_MPEG_VIDEO_CODEC, "Video decoder")
         } else if major == MEDIATYPE_AUDIO {
@@ -444,6 +449,10 @@ fn streams(env: &mut Env<'_>, mut build: Build) -> Outcome {
         build.finish(env, hr)
     });
     match video_output {
+        Some(out) if target.is_some() => {
+            let outcome = filter::connect(env, out, target.unwrap(), 0);
+            after(env, outcome, finish)
+        }
         Some(out) => video(env, graph, out, existing_only, finish),
         None => finish(env, Vec::new()),
     }
