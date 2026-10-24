@@ -521,7 +521,7 @@ fn set_in(
 }
 
 fn lookup_rename(env: &mut Env<'_>, name: &[u16]) -> Result<PathBuf, Error> {
-    match path::lookup(&env.ext.get::<Files>().dosdevices, name)? {
+    match super::lookup_name(env, name)? {
         Lookup::Found(host) | Lookup::Missing(host) => Ok(host),
         Lookup::Device => Err(Error::Unsupported("renaming a device".into())),
     }

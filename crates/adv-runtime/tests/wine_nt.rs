@@ -217,7 +217,7 @@ fn j_file() {
     );
 }
 
-// spec: NT-SEC-1, NT-SEC-2, NT-SEC-3
+// spec: NT-SEC-1, NT-SEC-2, NT-SEC-3, WINE-SYS-11, WINE-SES-1
 #[test]
 fn k_security() {
     let Some((stop, text)) = probe("k_security", "nt_security.exe", |_, _| {}) else {
@@ -260,8 +260,20 @@ fn k_security() {
         "permanent_lifetime",
         "make_temporary",
         "temporary_lifetime",
+        "logical_drives",
+        "dos_device_directory",
         "dos_device_create",
+        "dos_device_list",
+        "dos_device_write",
+        "dos_device_attributes",
+        "dos_device_missing_path",
+        "dos_device_read",
+        "dos_device_volume",
+        "dos_device_rename",
+        "dos_device_delete",
         "dos_device_remove",
+        "dos_device_removed",
+        "dos_device_cleanup",
         "token_id",
         "create_token",
         "created_user",

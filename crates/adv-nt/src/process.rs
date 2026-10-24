@@ -466,6 +466,10 @@ pub fn start<B: Backend>(
                         status::Error::Unsupported(reason) => Error::Context(reason),
                     })?;
                 }
+                crate::file::mount_drives(env).map_err(|error| match error {
+                    status::Error::Status(code) => Error::Status("drive letters", code),
+                    status::Error::Unsupported(reason) => Error::Context(reason),
+                })?;
                 let view = load_main_image(env, startup.image)?;
                 let state = env
                     .cpu

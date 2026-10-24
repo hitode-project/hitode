@@ -240,8 +240,7 @@ pub fn open_path(
         attributes: OBJ_CASE_INSENSITIVE,
         name: Some(name),
     };
-    let dosdevices = &env.ext.get::<Files>().dosdevices;
-    let host = match path::lookup(dosdevices, attributes.name.as_deref().unwrap_or_default())? {
+    let host = match lookup_name(env, attributes.name.as_deref().unwrap_or_default())? {
         Lookup::Found(host) => host,
         Lookup::Missing(_) => return Err(status::OBJECT_NAME_NOT_FOUND.into()),
         Lookup::Device => return Err(Error::Unsupported("opening a device".into())),
@@ -640,10 +639,76 @@ fn object_id(env: &mut Env<'_>, handle: u32, out: u32) -> Result<(), Error> {
     Ok(write_bytes(env, out, &bytes)?)
 }
 
+/// Resolve DOS device links held by the server when no host drive resolves the name.
+pub(crate) fn lookup_name(env: &mut Env<'_>, name: &[u16]) -> Result<Lookup, Error> {
+    let mut name = name.to_vec();
+    // Wine's object namespace limits symbolic-link recursion to 32 levels.
+    for _ in 0..=32 {
+        let result = path::lookup(&env.ext.get::<Files>().dosdevices, &name);
+        match result {
+            Ok(Lookup::Device) | Err(status::OBJECT_PATH_NOT_FOUND) => {}
+            result => return Ok(result?),
+        }
+        let text = String::from_utf16(&name).map_err(|_| status::OBJECT_NAME_INVALID)?;
+        let Some(rest) = text.strip_prefix(r"\??\") else {
+            return Ok(result?);
+        };
+        let device_len = rest.find('\\').unwrap_or(rest.len()) + 4;
+        // A missing component on an existing host drive is a file lookup failure.
+        if result.is_err()
+            && env
+                .ext
+                .get::<Files>()
+                .dosdevices
+                .join(text[4..device_len].to_ascii_lowercase())
+                .is_dir()
+        {
+            return Ok(result?);
+        }
+        let device: Vec<u8> = text[..device_len]
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        let mut open = crate::protocol::OpenSymlinkRequest {
+            access: 1, // SYMBOLIC_LINK_QUERY
+            attributes: OBJ_CASE_INSENSITIVE,
+            ..Default::default()
+        };
+        let (link, _) = server::request(env, &mut open, &[&device], &mut [])?;
+        if link.header.error != status::SUCCESS {
+            return Ok(result?);
+        }
+        let mut query = crate::protocol::QuerySymlinkRequest {
+            handle: link.handle,
+            ..Default::default()
+        };
+        let mut target = vec![0; 65534]; // UNICODE_STRING's maximum byte length.
+        let queried = server::request(env, &mut query, &[], &mut target);
+        server::close(env, link.handle)?;
+        let (reply, size) = queried?;
+        status::check(reply.header.error)?;
+        name = target[..size]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|unit| u16::from_le_bytes(*unit))
+            .collect();
+        // A target may already end in the separator supplied by the caller.
+        let tail = &text[device_len..];
+        let tail = if name.last() == Some(&92) {
+            tail.strip_prefix('\\').unwrap_or(tail)
+        } else {
+            tail
+        };
+        name.extend(tail.encode_utf16());
+    }
+    Err(status::INVALID_PARAMETER.into())
+}
+
 fn lookup_attributes(env: &mut Env<'_>, attributes: &Attributes) -> Result<Lookup, Error> {
     let name = attributes.name.as_deref().unwrap_or_default();
     if attributes.root == 0 {
-        return Ok(path::lookup(&env.ext.get::<Files>().dosdevices, name)?);
+        return lookup_name(env, name);
     }
     if name.first() == Some(&(b'\\' as u16)) {
         return Err(status::INVALID_PARAMETER.into());
@@ -656,7 +721,7 @@ fn lookup_attributes(env: &mut Env<'_>, attributes: &Attributes) -> Result<Looku
         .collect::<Vec<_>>();
     full.push(b'\\' as u16);
     full.extend_from_slice(name);
-    Ok(path::lookup(dosdevices, &full)?)
+    lookup_name(env, &full)
 }
 
 /// Opens NtLoadKey's hive with Wine's read access and sharing mode.
@@ -746,4 +811,40 @@ pub fn set_ea(_: &mut Env<'_>, _: &[u32]) -> Outcome {
 /// Wine's NtSetVolumeInformationFile stub leaves the status block untouched.
 pub fn set_volume(_: &mut Env<'_>, _: &[u32]) -> Outcome {
     Outcome::Return(status::SUCCESS)
+}
+
+/// Names each drive under `dosdevices` in the server's `\??` directory, as
+/// mountmgr does: `GetLogicalDrives` lists drives from these links alone.
+pub(crate) fn mount_drives(env: &mut Env<'_>) -> Result<(), Error> {
+    let mut drives: Vec<u8> = std::fs::read_dir(&env.ext.get::<Files>().dosdevices)
+        .map_err(|_| status::OBJECT_PATH_NOT_FOUND)?
+        .filter_map(|entry| match entry.ok()?.file_name().as_bytes() {
+            &[letter, b':'] if letter.is_ascii_alphabetic() => Some(letter.to_ascii_uppercase()),
+            _ => None,
+        })
+        .collect();
+    drives.sort_unstable();
+    for (index, letter) in drives.into_iter().enumerate() {
+        let attributes = Attributes {
+            root: 0,
+            attributes: 0x10 | 0x40 | 0x80, // OBJ_PERMANENT | OBJ_CASE_INSENSITIVE | OBJ_OPENIF
+            name: Some(format!(r"\??\{}:", letter as char).encode_utf16().collect()),
+            security: Vec::new(),
+        };
+        let target: Vec<u8> = format!(r"\Device\HarddiskVolume{}", index + 1)
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        let mut request = crate::protocol::CreateSymlinkRequest {
+            access: 0xf0001, // SYMBOLIC_LINK_ALL_ACCESS
+            ..Default::default()
+        };
+        let (reply, _) =
+            server::request(env, &mut request, &[&attributes.wire(), &target], &mut [])?;
+        if reply.header.error != status::OBJECT_NAME_EXISTS {
+            status::check(reply.header.error)?;
+        }
+        server::close(env, reply.handle)?;
+    }
+    Ok(())
 }

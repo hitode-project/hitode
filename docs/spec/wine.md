@@ -95,6 +95,7 @@ win32u creates the process's own desktop window, as Wine does when explorer cann
 ### WINE-SYS-11 NT file names
 
 **Rule**: NT file names MUST reject dot components and duplicate separators inside paths. A relative file name MUST resolve through its directory handle.
+DOS device paths without a host drive MUST resolve through the server's symbolic links.
 **Verification**: Test
 
 ## Unix libraries
@@ -324,6 +325,7 @@ FreeType is such a library: win32u opens it by name and draws TrueType text thro
 ### WINE-SES-1 Shared prefix
 
 **Rule**: Every game MUST run on the player's one prefix, kept between runs, with drive C: inside it or where the embedder places it. Each start MUST relink system32 and the template's module copies to the Wine installation. Drive D: MUST be the program's directory, which the guest writes in place.
+Process startup MUST register the prefix's drive letters in the server namespace.
 **Verification**: Test
 
 ### WINE-SES-2 Host wakes

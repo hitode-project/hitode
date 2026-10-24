@@ -5,6 +5,8 @@
 #include <winternl.h>
 #include <stdio.h>
 
+#define DOS_DRIVE_ROOT "Z:\\" /* privacy: allow -- authored guest drive mapping */
+
 /* These NT services have no Win32 wrapper. */
 NTSYSAPI NTSTATUS NTAPI NtCreateToken(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES,
     TOKEN_TYPE, PLUID, PLARGE_INTEGER, PTOKEN_USER, PTOKEN_GROUPS,
@@ -39,6 +41,9 @@ int main(void)
     PRIVILEGE_SET required = {0}, used;
     GENERIC_MAPPING mapping = {1, 2, 4, 7};
     DWORD size, granted;
+    DWORD drives, written, serial;
+    HANDLE file;
+    char contents[4];
     BOOL present, allowed, defaulted;
     PACL read_acl;
     PSID world;
@@ -128,8 +133,29 @@ int main(void)
     check("make_temporary", !NtMakeTemporaryObject(event));
     CloseHandle(event);
     check("temporary_lifetime", !OpenEventA(EVENT_ALL_ACCESS, FALSE, "nt-security-object") && GetLastError() == ERROR_FILE_NOT_FOUND);
-    check("dos_device_create", DefineDosDeviceA(DDD_RAW_TARGET_PATH, "KSEC:", "\\??\\C:\\"));
-    check("dos_device_remove", DefineDosDeviceA(DDD_REMOVE_DEFINITION, "KSEC:", NULL));
+    drives = GetLogicalDrives();
+    check("logical_drives", (drives & 0xc) == 0xc && !(drives & (1u << 25)));
+    check("dos_device_directory", CreateDirectoryA("C:\\nt-drive-test", NULL));
+    check("dos_device_create", DefineDosDeviceA(DDD_RAW_TARGET_PATH, "Z:", "\\??\\C:\\nt-drive-test"));
+    check("dos_device_list", GetLogicalDrives() == (drives | (1u << 25)));
+    file = CreateFileA(DOS_DRIVE_ROOT "file.bin", GENERIC_WRITE, 0, NULL, CREATE_NEW, 0, NULL);
+    check("dos_device_write", file != INVALID_HANDLE_VALUE
+          && WriteFile(file, "test", 4, &written, NULL) && written == 4);
+    CloseHandle(file);
+    check("dos_device_attributes", GetFileAttributesA(DOS_DRIVE_ROOT "file.bin") != INVALID_FILE_ATTRIBUTES);
+    check("dos_device_missing_path", GetFileAttributesA(DOS_DRIVE_ROOT "missing\\file.bin") == INVALID_FILE_ATTRIBUTES
+          && GetLastError() == ERROR_PATH_NOT_FOUND);
+    file = CreateFileA("C:\\nt-drive-test\\file.bin", GENERIC_READ, 0, NULL, OPEN_EXISTING, 0, NULL);
+    check("dos_device_read", file != INVALID_HANDLE_VALUE
+          && ReadFile(file, contents, 4, &written, NULL) && written == 4 && !memcmp(contents, "test", 4));
+    CloseHandle(file);
+    check("dos_device_volume", GetVolumeInformationA(DOS_DRIVE_ROOT, NULL, 0, &serial, NULL, NULL, NULL, 0));
+    check("dos_device_rename", MoveFileA(DOS_DRIVE_ROOT "file.bin", DOS_DRIVE_ROOT "renamed.bin"));
+    check("dos_device_delete", DeleteFileA(DOS_DRIVE_ROOT "renamed.bin"));
+    check("dos_device_remove", DefineDosDeviceA(DDD_REMOVE_DEFINITION, "Z:", NULL));
+    check("dos_device_removed", GetLogicalDrives() == drives
+          && GetFileAttributesA(DOS_DRIVE_ROOT) == INVALID_FILE_ATTRIBUTES);
+    check("dos_device_cleanup", RemoveDirectoryA("C:\\nt-drive-test"));
 
     groups.GroupCount = 1;
     groups.Groups[0].Sid = world;
