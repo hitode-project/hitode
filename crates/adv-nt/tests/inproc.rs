@@ -33,7 +33,7 @@ fn measure(env: &mut adv_machine::Env<'_>) -> adv_machine::Outcome {
         .handler)(env)
 }
 
-// spec: SRV-SYNC-1, SRV-SYNC-2, SRV-SYNC-3, WINE-THR-1, WINE-THR-2
+// spec: SRV-SYNC-1, SRV-SYNC-2, SRV-SYNC-3, SRV-SYNC-4, WINE-THR-1, WINE-THR-2
 #[test]
 fn semaphore_event_ping_pong_avoids_server_operations() {
     let Some((result, output)) = common::run_probe_inspect(
@@ -65,5 +65,5 @@ fn semaphore_event_ping_pong_avoids_server_operations() {
         matches!(result, adv_machine::RunResult::Exited(0)),
         "{result:?}"
     );
-    assert_eq!(output.trim(), "rounds=10000 code=0");
+    assert_eq!(output.trim(), "rounds=10000 code=0 read=MZ");
 }

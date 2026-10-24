@@ -16,5 +16,8 @@ adv-sync = { path = "../adv-sync" }
 adv-nt = { path = "../adv-nt" }
 adv-unix = { path = "../adv-unix" }
 
+[target.'cfg(any(target_vendor = "apple", target_os = "android"))'.dev-dependencies]
+adv-wineserver = { path = "../adv-wineserver" }
+
 [lints]
 workspace = true

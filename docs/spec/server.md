@@ -40,3 +40,9 @@ Channel registrations MUST preserve event data, enablement and close behavior.
 
 **Rule**: Device objects MUST survive descriptor transfer and pending waits until their last reference closes. Closing a handle MUST invalidate its synchronization cache entry. Other descriptors and paths MUST retain libc behavior.
 **Verification**: Test
+
+### SRV-SYNC-4 Every event signaller
+
+**Rule**: Every host path that sets or resets an event, including file I/O completion, MUST use its in-process sync first. The server asserts on event operations for those objects.
+**Verification**: Test
+**Basis**: Wine 11 `server/event.c`

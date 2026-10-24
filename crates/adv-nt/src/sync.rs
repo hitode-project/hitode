@@ -154,29 +154,41 @@ fn event_op(env: &mut Env<'_>, args: &[u32], op: i32) -> Outcome {
         unreachable!()
     };
     status::finish((|| {
-        let command = match op {
-            SET_EVENT => ntsync::EVENT_SET,
-            RESET_EVENT => ntsync::EVENT_RESET,
-            _ => ntsync::EVENT_PULSE,
-        };
-        if let Some(value) = inproc_operation(env, handle, 2, 2, command, [0; 2])? {
-            if previous != 0 {
-                write_u32(env, previous, value[0])?;
-            }
-            return Ok(());
-        }
-        let mut request = EventOpRequest {
-            handle,
-            op,
-            ..Default::default()
-        };
-        let (reply, _) = server::request(env, &mut request, &[], &mut [])?;
-        status::check(reply.header.error)?;
+        let state = signal(env, handle, op)?;
         if previous != 0 {
-            write_u32(env, previous, reply.state as u32)?;
+            write_u32(env, previous, state)?;
         }
         Ok(())
     })())
+}
+
+/// Set, reset or pulse an event, in process when it has an in-process sync,
+/// and return its previous state. The server rejects event operations on those.
+pub(crate) fn signal(env: &mut Env<'_>, handle: u32, op: i32) -> Result<u32, status::Error> {
+    signal_as(env, handle, op, adv_machine::WakePriority::Normal)
+}
+fn signal_as(
+    env: &mut Env<'_>,
+    handle: u32,
+    op: i32,
+    priority: adv_machine::WakePriority,
+) -> Result<u32, status::Error> {
+    let command = match op {
+        SET_EVENT => ntsync::EVENT_SET,
+        RESET_EVENT => ntsync::EVENT_RESET,
+        _ => ntsync::EVENT_PULSE,
+    };
+    if let Some(value) = inproc_operation_as(env, handle, 2, 2, command, [0; 2], priority)? {
+        return Ok(value[0]);
+    }
+    let mut request = EventOpRequest {
+        handle,
+        op,
+        ..Default::default()
+    };
+    let (reply, _) = server::request(env, &mut request, &[], &mut [])?;
+    status::check(reply.header.error)?;
+    Ok(reply.state as u32)
 }
 
 /// NtWaitForSingleObject(handle, alertable, *timeout)
@@ -2046,7 +2058,19 @@ fn inproc_operation(
     kind: u32,
     access: u32,
     command: u32,
+    value: [u32; 2],
+) -> Result<Option<[u32; 2]>, status::Error> {
+    let priority = adv_machine::WakePriority::Normal;
+    inproc_operation_as(env, handle, kind, access, command, value, priority)
+}
+fn inproc_operation_as(
+    env: &mut Env<'_>,
+    handle: u32,
+    kind: u32,
+    access: u32,
+    command: u32,
     mut value: [u32; 2],
+    priority: adv_machine::WakePriority,
 ) -> Result<Option<[u32; 2]>, status::Error> {
     let sync = match inproc_get(env, handle, kind, access) {
         Err(status::Error::Status(status::NOT_IMPLEMENTED)) => return Ok(None),
@@ -2058,7 +2082,7 @@ fn inproc_operation(
         Err(libc::EOWNERDEAD) if command == ntsync::MUTEX_READ => value[0] = u32::MAX,
         Err(error) => return Err(inproc_status(error, command).into()),
     }
-    deliver_inproc(env);
+    deliver_inproc_as(env, priority);
     Ok(Some(value))
 }
 
@@ -2068,6 +2092,9 @@ struct InprocWaits(
     std::collections::HashMap<adv_machine::CtxId, (adv_machine::sched::Handle, InprocCompletion)>,
 );
 pub(crate) fn deliver_inproc(env: &mut Env<'_>) -> bool {
+    deliver_inproc_as(env, adv_machine::WakePriority::Normal)
+}
+fn deliver_inproc_as(env: &mut Env<'_>, priority: adv_machine::WakePriority) -> bool {
     let Some(waits) = env.ext.try_get_mut::<InprocWaits>() else {
         return false;
     };
@@ -2077,11 +2104,17 @@ pub(crate) fn deliver_inproc(env: &mut Env<'_>) -> bool {
             return false;
         };
         if result.get().is_some() {
-            delivered |= env.sys.set_event(*wake);
+            delivered |= env.sys.set_event_with_priority(*wake, priority);
         }
         true
     });
     delivered
+}
+
+/// Set an audio notification event; the waiters it satisfies run first, as
+/// the built-in stack's audio wakes do.
+pub fn set_audio_event(env: &mut Env<'_>, handle: u32) -> Result<(), status::Error> {
+    signal_as(env, handle, SET_EVENT, adv_machine::WakePriority::Audio).map(drop)
 }
 struct InprocWait {
     pending: ntsync::Pending,

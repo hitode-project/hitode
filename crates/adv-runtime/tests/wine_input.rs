@@ -77,13 +77,9 @@ fn run(probe: &str, gpu: bool) {
         }
         assert!(Instant::now() < until, "window did not present: {text}");
     }
-    let origin = text
-        .lines()
-        .find_map(|line| line.strip_prefix("ready="))
-        .unwrap();
-    let (x, y) = origin.split_once(',').unwrap();
-    let (x, y): (i32, i32) = (x.parse().unwrap(), y.parse().unwrap());
-    let point = ((y + 17) as u32) << 16 | (x + 13) as u32;
+    // Every presenter's frames carry the client area, so host points are
+    // client points.
+    let point = 17 << 16 | 13;
     // Every event starts with every guest context blocked indefinitely.
     let events = [
         (0x200, 0, point, "mouse=200 point=13,17 data=0"),

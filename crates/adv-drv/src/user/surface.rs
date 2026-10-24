@@ -114,6 +114,12 @@ fn create(env: &mut Env<'_>) -> Outcome {
     })
 }
 
+/// Bytes behind a surface: a flush presents the client area as a view of whole
+/// pitches from its first pixel, which runs up to one pitch past the last row.
+fn storage(pitch: u32, height: u32) -> u32 {
+    pitch * (height + 1)
+}
+
 /// Wrap new store pixels in a bitmap and make the window surface over it.
 fn wrap(
     env: &mut Env<'_>,
@@ -124,7 +130,7 @@ fn wrap(
     height: u32,
 ) -> Outcome {
     let pitch = width * 4;
-    let pixels = check!(env.sys.vm.alloc(env.cpu, pitch * height, Prot::RW));
+    let pixels = check!(env.sys.vm.alloc(env.cpu, storage(pitch, height), Prot::RW));
     let flags = DCX_CACHE | DCX_WINDOW;
     call(
         env,
@@ -329,4 +335,18 @@ fn destroy(env: &mut Env<'_>) -> Outcome {
         let _ = env.sys.vm.free(env.cpu, surface.pixels);
     }
     Outcome::Return(0)
+}
+
+#[cfg(test)]
+mod tests {
+    // spec: WINE-GFX-4
+    #[test]
+    fn a_client_view_of_whole_pitches_stays_in_storage() {
+        let (width, height) = (1936u32, 1057u32);
+        let pitch = width * 4;
+        // The client area starts after an 8-pixel frame and a 31-pixel caption.
+        let (x, y) = (8, 31);
+        let start = y * pitch + x * 4;
+        assert!(start + pitch * (height - y) <= super::storage(pitch, height));
+    }
 }

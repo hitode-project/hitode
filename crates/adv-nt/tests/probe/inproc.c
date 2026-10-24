@@ -33,6 +33,19 @@ int main(void)
     if (WaitForSingleObject(thread, INFINITE) != WAIT_OBJECT_0) return 4;
     if (!GetExitCodeThread(thread, &code) || code) return 5;
     CloseHandle(thread); CloseHandle(sem); CloseHandle(event);
-    printf("rounds=%u code=%lu\n", i, code);
+    {
+        /* File I/O signals its event as NtSetEvent would. */
+        WCHAR path[MAX_PATH];
+        char bytes[2];
+        OVERLAPPED overlapped = {0};
+        HANDLE file;
+        GetModuleFileNameW(NULL, path, MAX_PATH);
+        file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+        overlapped.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+        if (!ReadFile(file, bytes, 2, NULL, &overlapped)) return 7;
+        if (WaitForSingleObject(overlapped.hEvent, 0) != WAIT_OBJECT_0) return 8;
+        CloseHandle(overlapped.hEvent); CloseHandle(file);
+        printf("rounds=%u code=%lu read=%.2s\n", i, code, bytes);
+    }
     return 0;
 }

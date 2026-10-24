@@ -140,6 +140,7 @@ dependencies = [
  "adv-nt",
  "adv-sync",
  "adv-unix",
+ "adv-wineserver",
 ]
 
 [[package]]

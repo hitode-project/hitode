@@ -185,3 +185,12 @@ fn midi_unix_table_returns_winmm_notifications() {
     );
     assert_eq!(call(env, 0, 7, 0x00643c90, 0), (5, [0; 8]));
 }
+
+// spec: WINE-AUD-3
+#[test]
+fn directsound_queues_three_default_periods_of_sixty_ms() {
+    let [default, minimum] = PERIODS;
+    // dsound's primary.c queues min(buffer, 3 * default period) frames.
+    assert_eq!(3 * default, 600_000);
+    assert!(minimum <= default);
+}

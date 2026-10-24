@@ -1,5 +1,5 @@
 //! The display the driver reports: one adapter and monitor, at a fixed
-//! 1920x1080 desktop, with the bounded mode list the old stack's DirectDraw
+//! 2560x1440 desktop, with the bounded mode list the old stack's DirectDraw
 //! offers. Fronts change what is presented; the desktop never changes.
 use adv_abi::{Conv, Env, Outcome, Registry};
 use adv_cpu::backend::{GuestExt, Prot};
@@ -7,15 +7,20 @@ use adv_machine::layout::PAGE;
 
 use super::MODULE;
 
-/// The desktop's size, as the old stack's screen.
-pub const DESKTOP: (u32, u32) = (1920, 1080);
-const SIZES: [(u32, u32); 6] = [
+/// The desktop's size. A high-density host screen shows a 1920x1080 client at one
+/// device pixel per game pixel, so the desktop leaves room for it and its frame:
+/// win32u clamps windows to the screen as the old stack never did.
+pub const DESKTOP: (u32, u32) = (2560, 1440);
+/// The old stack's taskbar, which its work area leaves out at the bottom.
+const TASKBAR: u32 = 40;
+const SIZES: [(u32, u32); 7] = [
     (640, 480),
     (800, 600),
     (1024, 768),
     (1280, 720),
     (1600, 900),
     (1920, 1080),
+    (2560, 1440),
 ];
 const DEPTHS: [u32; 2] = [32, 16];
 
@@ -69,6 +74,12 @@ fn mode(width: u32, height: u32, depth: u32) -> [u8; DEVMODE as usize] {
     mode
 }
 
+/// `rc_monitor` and `rc_work` of `struct gdi_monitor`: the whole screen, and
+/// the screen above the taskbar, as the old stack's work area.
+fn monitor(width: u32, height: u32) -> [u32; 8] {
+    [0, 0, width, height, 0, 0, width, height - TASKBAR]
+}
+
 /// Write the display's page.
 pub(super) fn install(
     machine: &mut adv_machine::Machine<impl adv_cpu::backend::Backend>,
@@ -81,10 +92,7 @@ pub(super) fn install(
     let mut bytes = vec![0u8; PAGE as usize];
     bytes[NAME as usize..NAME as usize + 8].copy_from_slice(b"Default\0");
     let (width, height) = DESKTOP;
-    for (index, side) in [0, 0, width, height, 0, 0, width, height]
-        .into_iter()
-        .enumerate()
-    {
+    for (index, side) in monitor(width, height).into_iter().enumerate() {
         let at = MONITOR as usize + 4 * index;
         bytes[at..at + 4].copy_from_slice(&side.to_le_bytes());
     }
@@ -134,4 +142,26 @@ fn update_display_devices(env: &mut Env<'_>) -> Outcome {
             })
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    // spec: WINE-GFX-9
+    #[test]
+    fn the_work_area_leaves_out_the_taskbar() {
+        assert_eq!(
+            super::monitor(1920, 1080),
+            [0, 0, 1920, 1080, 0, 0, 1920, 1040]
+        );
+    }
+
+    // spec: WINE-GFX-9
+    #[test]
+    fn the_desktop_holds_a_framed_full_hd_window() {
+        // win32u's SM_CYMAXTRACK is the screen height plus 4 and two frames;
+        // a full-HD client adds a caption and two frames.
+        let (width, height) = super::DESKTOP;
+        assert!(width >= 1920 + 2 * 8 && height + 4 >= 1080 + 23 + 2 * 8);
+        assert!(super::SIZES.contains(&(width, height)));
+    }
 }

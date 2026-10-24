@@ -223,11 +223,16 @@ FreeType is such a library: win32u opens it by name and draws TrueType text thro
 **Rule**: Direct3D 9 MUST accept `SetNPatchMode(0)` without changing rendering state. Enabling N-patches MUST remain unavailable.
 **Verification**: Test
 
+### WINE-GFX-9 Display geometry
+
+**Rule**: The driver MUST report one 2560x1440 monitor, so win32u never clamps a framed 1920x1080 game window. The mode list MUST include it. Its work area MUST leave out a 40-pixel taskbar at the bottom.
+**Verification**: Test
+
 ## Input
 
 ### WINE-IN-1 Presented window coordinates
 
-**Rule**: Host mouse points MUST map to screen coordinates through the last presented window. Window surfaces MUST use `Window::extent`; DirectDraw and Direct3D 9 MUST use `Window::client`.
+**Rule**: Host mouse points MUST map to screen coordinates through the origin of the last presented window's content. Every presenter's frames carry only that content; the host shows caption, frame and menu bar natively.
 **Verification**: Test
 
 ### WINE-IN-2 Hardware input
@@ -272,6 +277,11 @@ FreeType is such a library: win32u opens it by name and draws TrueType text thro
 **Rule**: Wine sessions MUST serve the shared debugger when requested, including while paused or frame-frozen. Boundary reads MUST inspect the presented process without running guest code. Unsupported API diagnostics MUST be explicit.
 **Verification**: Test
 
+### WINE-UI-7 Native dialog presentation
+
+**Rule**: A shown top-level window MUST be read before its first flush. A dialog the host projects, such as a message box, MUST NOT present frames. Its icon MUST NOT show as an unavailable control.
+**Verification**: Test
+
 ## Audio
 
 ### WINE-AUD-1 Builtin render driver
@@ -286,7 +296,7 @@ FreeType is such a library: win32u opens it by name and draws TrueType text thro
 
 ### WINE-AUD-3 Period waits
 
-**Rule**: A stream's timer loop MUST wait on the machine clock and signal its event each period. Releasing the stream MUST end its timer thread.
+**Rule**: A stream's timer loop MUST wait on the machine clock and signal its event each period. Releasing the stream MUST end its timer thread. The default device period MUST be 20 ms, so clients that queue three periods hold 60 ms across host callback bursts.
 **Verification**: Test
 
 ### WINE-AUD-4 Session output
@@ -302,6 +312,11 @@ FreeType is such a library: win32u opens it by name and draws TrueType text thro
 ### WINE-AUD-6 MIDI synthesis
 
 **Rule**: MIDI notes and controllers MUST produce PCM through the shared mixer with a bundled General MIDI bank. Wine MUST retain stream timing, pause/resume and MCI sequencing. Closing MIDI output MUST remove its queued PCM.
+**Verification**: Test
+
+### WINE-AUD-7 Native DirectSound
+
+**Rule**: `dsound.dll` MUST be the built-in stack's DirectSound front, with Wine's export names and ordinals. It MUST mix on the host through the session's audio control, and capture MUST report no driver. Position notifications MUST be signalled on device time, bounding the session's idle wait.
 **Verification**: Test
 
 ## Media

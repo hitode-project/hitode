@@ -1243,19 +1243,16 @@ pub(super) fn forget(ext: &mut Ext, hwnd: u32) {
     }
 }
 
-/// Read a shown window before its first surface flush, including menu popups.
+/// Read a shown top-level window before its first surface flush, so a menu
+/// popup or dialog the host projects never presents a frame.
 pub(super) fn shown(env: &mut Env<'_>, hwnd: u32) -> Outcome {
-    let buffer = match env.sys.vm.alloc(env.cpu, 128, Prot::RW) {
-        Ok(buffer) => buffer,
-        Err(error) => return Outcome::Fail(format!("{MODULE}: {error}")),
-    };
+    const GWL_STYLE: u32 = -16i32 as u32;
+    const WS_CHILD: u32 = 0x4000_0000;
     calls(
         env,
-        vec![("GetClassNameW", vec![hwnd, buffer, 64])],
-        move |env, _| {
-            let popup = wide(env, buffer, 64) == "#32768";
-            let _ = env.sys.vm.free(env.cpu, buffer);
-            if popup {
+        vec![("GetWindowLongW", vec![hwnd, GWL_STYLE])],
+        move |env, results| {
+            if results[0] & WS_CHILD == 0 {
                 read(env, env.context, Box::new(|_| Outcome::Return(0)))
             } else {
                 Outcome::Return(0)

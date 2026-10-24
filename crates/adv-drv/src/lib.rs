@@ -4,6 +4,10 @@
 //! driver.
 #![cfg(unix)]
 
+// adv-nt's server channels link against the server's shim.
+#[cfg(all(test, any(target_vendor = "apple", target_os = "android")))]
+use adv_wineserver as _;
+
 use std::path::Path;
 
 use adv_abi::{Env, Outcome, Registry};

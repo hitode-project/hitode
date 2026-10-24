@@ -229,7 +229,7 @@ Direct presentation requires Core Animation's `contentsOpaque` capability. Other
 
 ### HOST-RUN-1 Presentation controls
 
-**Rule**: Host volume MUST scale device output without modifying source samples. Fit, integer and stretch modes MUST use the same physical-pixel rectangle for presentation and pointer mapping. Integer mode MUST fall back to proportional downscaling when the game exceeds the drawable.
+**Rule**: Host volume MUST scale device output without modifying source samples. Fit, integer and stretch modes MUST use the same physical-pixel rectangle for presentation and pointer mapping. Integer mode and the command-line window MUST show each game pixel as the most whole device pixels that fit, else shrink proportionally.
 **Applies to**: Launcher, macOS
 **Verification**: Test
 

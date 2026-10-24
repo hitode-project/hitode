@@ -211,3 +211,95 @@ fn popup_choice_and_cancel_child() {
         "{text}"
     );
 }
+
+// spec: WINE-UI-7
+#[test]
+fn a_message_box_is_projected_natively_from_its_first_frame() {
+    // The in-process server can start only once in each host process.
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--ignored", "--exact", "message_box_child", "--nocapture"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+// spec: WINE-UI-7
+#[test]
+#[ignore = "subprocess entry for the message box session test"]
+fn message_box_child() {
+    use adv_runtime::DialogEvent;
+
+    let (Some(dist), Some(probes)) = (
+        std::env::var_os("ADV_WINE_DIST").map(PathBuf::from),
+        std::env::var_os("ADV_WINE_PROBES").map(PathBuf::from),
+    ) else {
+        eprintln!("skipped: ADV_WINE_DIST or ADV_WINE_PROBES is not set");
+        return;
+    };
+    let root = std::env::temp_dir().join(format!("adv-wine-box-{}", std::process::id()));
+    let (mut output, stdout) = std::io::pipe().unwrap();
+    let config = Config {
+        dist: &dist,
+        prefix: &root,
+        drive: None,
+        locale: 0x409,
+        fonts: "",
+        exe: &probes.join("message_box.exe"),
+        width: 640,
+        height: 480,
+        jit: true,
+        debug: "",
+        stdout: Some(stdout.as_raw_fd()),
+    };
+    let mut session =
+        Session::start(&config, adv_sync::WakeEvent::new().unwrap(), |_| Ok(())).unwrap();
+    drop(stdout);
+    let until = Instant::now() + Duration::from_secs(60);
+    let mut answered = false;
+    let stop = loop {
+        assert!(Instant::now() < until, "the message box was not answered");
+        session.refresh_ui();
+        if let Some(dialog) = session.dialogs().dialogs.first().cloned() {
+            assert_ne!(
+                session.input_view().top,
+                dialog.target.hwnd,
+                "message box presented as a frame"
+            );
+            let unsupported: Vec<_> = dialog
+                .controls
+                .iter()
+                .filter(|control| !control.supported)
+                .map(|control| (&control.class, control.style))
+                .collect();
+            assert!(unsupported.is_empty(), "{unsupported:?}");
+            if !answered {
+                let ok = dialog
+                    .controls
+                    .iter()
+                    .find(|control| control.target.id == 1)
+                    .expect("an OK button");
+                answered = session.dialog_event(DialogEvent::Click(ok.target));
+            }
+        }
+        match session.run(Instant::now() + Duration::from_millis(20)) {
+            Stop::Paused => {}
+            stop => break stop,
+        }
+    };
+    drop(session);
+    // SAFETY: output owns the pipe's read descriptor.
+    assert_eq!(
+        unsafe { libc::fcntl(output.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) },
+        0
+    );
+    let mut text = String::new();
+    let _ = output.read_to_string(&mut text);
+    std::fs::remove_dir_all(root).unwrap();
+    assert!(matches!(stop, Stop::Exited(0)), "{stop:?}: {text}");
+    assert!(text.contains("answer=1"), "{text}");
+}

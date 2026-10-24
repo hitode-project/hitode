@@ -46,6 +46,11 @@ This spec covers the neutral device services behind the API front ends: frames, 
 **Rule**: With a mailbox, software presents MUST accumulate four-rectangle damage, publishing one serial/history entry per flush. Writer waits/message retrieval MUST flush, and any wait/present MUST flush after 50 ms. Readback, capture, layout/palette/video changes, flips and exit MUST flush first, with immediate headless presents and reason-specific counters.
 **Verification**: Test
 
+### DEV-FRAME-11 Deleted frame sources
+
+**Rule**: Deleting the source of a pending software frame MUST discard that frame.
+**Verification**: Test
+
 ### DEV-FRAME-9 Software frame cap
 
 **Rule**: With a host frame clock, a boundary frame covering a quarter of the surface may follow the last one within 1/60 s. It MAY then hold the writer's next empty PeekMessage until the vsync. Messages, timers and input MUST end the hold at once, and held keys or mouse buttons MUST prevent it.

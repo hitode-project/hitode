@@ -6,8 +6,8 @@ use super::information::read_i64;
 use super::*;
 use crate::object::read_bytes;
 use crate::protocol::{
-    AddFdCompletionRequest, CreateNamedPipeRequest, EventOpRequest, GetFileInfoRequest,
-    IoctlRequest, QueueApcRequest, ReadRequest, WriteRequest,
+    AddFdCompletionRequest, CreateNamedPipeRequest, GetFileInfoRequest, IoctlRequest,
+    QueueApcRequest, ReadRequest, WriteRequest,
 };
 
 const PENDING: u32 = 0x103;
@@ -188,14 +188,13 @@ pub(super) fn add_completion(
     Ok(())
 }
 
+/// Signal an I/O event as NtSetEvent and NtResetEvent would; like the
+/// server's own reply, an event that rejects the operation is no I/O failure.
 pub(super) fn event_op(env: &mut Env<'_>, handle: u32, op: i32) -> Result<(), Error> {
-    let mut request = EventOpRequest {
-        handle,
-        op,
-        ..Default::default()
-    };
-    server::request(env, &mut request, &[], &mut [])?;
-    Ok(())
+    match crate::sync::signal(env, handle, op) {
+        Ok(_) | Err(Error::Status(_)) => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 fn server_read(env: &mut Env<'_>, args: &[u32]) -> Outcome {

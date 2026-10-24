@@ -20,6 +20,10 @@ const UNSUPPORTED: u32 = 0x8889_0008;
 const NOT_STOPPED: u32 = 0x8889_0005;
 const OUT_OF_ORDER: u32 = 0x8889_0007;
 const EVENT_CALLBACK: u32 = 0x40000;
+/// Default and minimum device periods, in 100 ns units. DirectSound queues
+/// three default periods, which must outlast a host callback's burst plus the
+/// mixer thread's own wake-up interval and scheduling: 20 ms gives 60 ms.
+const PERIODS: [u64; 2] = [200_000, 50_000];
 const NAMES: [&str; 37] = [
     "process_attach",
     "process_detach",
@@ -413,7 +417,7 @@ fn execute(env: &mut Env<'_>, code: u32, args: u32) -> Result<(), String> {
             write(env, args + 12, 0)?;
         }
         17 => {
-            for (offset, period) in [(12, 100_000), (16, 50_000)] {
+            for (offset, period) in [12, 16].into_iter().zip(PERIODS) {
                 let out = read(env, args + offset)?;
                 if out != 0 {
                     wide(env, out, period)?;

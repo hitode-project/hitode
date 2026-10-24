@@ -1467,6 +1467,14 @@ impl<P: Presenter> Surfaces<P> {
         let Some(s) = self.surfaces.remove(&id) else {
             return false;
         };
+        // A pending frame cannot outlive the pixels it would publish.
+        if self
+            .software_pending
+            .as_ref()
+            .is_some_and(|p| p.source == id)
+        {
+            self.software_pending = None;
+        }
         #[cfg(feature = "gpu")]
         if self.native_surfaces.remove(&id).is_some() {
             return true;

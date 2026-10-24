@@ -658,8 +658,19 @@ impl Window {
             .styleMask()
             .contains(NSWindowStyleMask::FullScreen);
         if !full {
-            self.window
-                .setContentSize(NSSize::new(f64::from(width), f64::from(height)));
+            let available = self.window.screen().map_or((f64::MAX, f64::MAX), |screen| {
+                let size = self
+                    .window
+                    .contentRectForFrameRect(screen.visibleFrame())
+                    .size;
+                (size.width, size.height)
+            });
+            let (width, height) = fitted(
+                (f64::from(width), f64::from(height)),
+                available,
+                self.window.backingScaleFactor(),
+            );
+            self.window.setContentSize(NSSize::new(width, height));
         }
     }
 
@@ -733,9 +744,41 @@ impl Drop for Window {
     }
 }
 
+/// The content size, in points, that shows a `canvas` of game pixels: the
+/// most whole device pixels per game pixel that fit in `available` points,
+/// down to one, and below that the proportional size that fits.
+fn fitted(canvas: (f64, f64), available: (f64, f64), scale: f64) -> (f64, f64) {
+    let mut pixels = scale.floor().max(1.0);
+    while pixels >= 1.0 {
+        let size = (canvas.0 * pixels / scale, canvas.1 * pixels / scale);
+        if size.0 <= available.0 && size.1 <= available.1 {
+            return size;
+        }
+        pixels -= 1.0;
+    }
+    let shrink = (available.0 / canvas.0).min(available.1 / canvas.1);
+    (canvas.0 * shrink, canvas.1 * shrink)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // spec: HOST-RUN-1
+    #[test]
+    fn the_cli_window_fits_whole_device_pixels_on_the_screen() {
+        let screen = (1920.0, 1020.0);
+        assert_eq!(fitted((800.0, 600.0), screen, 2.0), (800.0, 600.0));
+        assert_eq!(fitted((1920.0, 1080.0), screen, 2.0), (960.0, 540.0));
+        assert_eq!(
+            fitted((1920.0, 1080.0), (2560.0, 1400.0), 1.0),
+            (1920.0, 1080.0)
+        );
+        assert_eq!(
+            fitted((3840.0, 2160.0), (960.0, 1000.0), 1.0),
+            (960.0, 540.0)
+        );
+    }
 
     // spec: HOST-RUN-1
     #[test]

@@ -101,6 +101,30 @@ fn video_layer() -> VideoLayer {
 }
 
 #[test]
+// spec: DEV-FRAME-11
+fn deleting_the_pending_source_discards_its_frame() {
+    let mut store = store();
+    let mut memory = Memory::new(false);
+    let (producer, mut consumer) = frame_mailbox();
+    store.set_frame_mailbox(producer, adv_sync::WakeEvent::new().unwrap());
+    let first = store
+        .create(5, 4, false, PixelFormat::Bgra32, &mut memory)
+        .unwrap();
+    store.present(first, &memory, store[first].rect()).unwrap();
+    assert!(store.delete(first));
+    assert!(!store.flush(&memory, FlushReason::Immediate).unwrap());
+    assert!(!consumer.update());
+    let second = store
+        .create(5, 4, false, PixelFormat::Bgra32, &mut memory)
+        .unwrap();
+    store
+        .present(second, &memory, store[second].rect())
+        .unwrap();
+    assert!(store.flush(&memory, FlushReason::Immediate).unwrap());
+    assert!(consumer.update());
+}
+
+#[test]
 // spec: MEDIA-VIDEO-4
 fn video_updates_clip_and_restore_an_immutable_base_without_game_present() {
     let mut store = store();
