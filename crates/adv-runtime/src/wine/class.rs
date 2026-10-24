@@ -27,7 +27,7 @@ const METHODS: [(&str, u8); 5] = [
 
 /// What a factory activates.
 #[derive(Clone, Copy)]
-enum Activation {
+pub(super) enum Activation {
     DirectDraw,
     Class([u8; 16]),
 }
@@ -131,7 +131,7 @@ pub(super) fn install<B: Backend>(machine: &mut Machine<B>) -> Result<(), String
 }
 
 /// DllGetClassObject(class, iid, *out) for the classes `activation` knows.
-fn get_class_object(
+pub(super) fn get_class_object(
     env: &mut Env<'_>,
     activation: impl FnOnce([u8; 16]) -> Option<Activation>,
 ) -> Outcome {

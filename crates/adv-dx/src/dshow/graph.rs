@@ -43,6 +43,7 @@ pub(crate) struct Graph {
     pub state: u32,
     events: VecDeque<(u32, u32, u32)>,
     event: Handle,
+    public_event: Option<u32>,
     notify: Option<(u32, u32, u32)>,
     /// AM_MEDIAEVENT_NONOTIFY: events are neither queued, signaled nor posted.
     no_notify: bool,
@@ -109,6 +110,14 @@ pub(crate) fn create(env: &mut Env<'_>, iid: Iid, outer: u32, output: u32) -> Ou
         manual_reset: true,
         signaled: false,
     });
+    let public_event = if let Some(host) = env.ext.try_get::<Host>() {
+        match (host.event)(env) {
+            Ok(event) => Some(event),
+            Err(error) => return Outcome::Fail(error),
+        }
+    } else {
+        None
+    };
     let canonical = faces[0];
     state(env).graphs.insert(
         canonical,
@@ -118,6 +127,7 @@ pub(crate) fn create(env: &mut Env<'_>, iid: Iid, outer: u32, output: u32) -> Ou
             state: STOPPED,
             events: VecDeque::new(),
             event,
+            public_event,
             notify: None,
             no_notify: false,
             default_complete: true,
@@ -199,6 +209,7 @@ fn teardown(env: &mut Env<'_>, graph: u32, then: Then) -> Outcome {
     }
     state(env).graphs.get_mut(&graph).unwrap().members.clear();
     let event = state(env).graphs[&graph].event;
+    let public_event = state(env).graphs[&graph].public_event;
     chain(
         env,
         calls,
@@ -213,6 +224,9 @@ fn teardown(env: &mut Env<'_>, graph: u32, then: Then) -> Outcome {
                 }
             }
             env.sys.objects.close(event);
+            if let Some(event) = public_event {
+                host::close(env, event);
+            }
             then(env, results)
         }),
     )
@@ -244,7 +258,9 @@ pub(crate) fn call(env: &mut Env<'_>, face: Face, method: &str, this: u32) -> Op
         (Face::FilterGraph, "ConnectDirect") => {
             Some(filter::connect(env, env.arg(1), env.arg(2), env.arg(3)))
         }
-        (Face::FilterGraph, "Connect") => Some(filter::connect(env, env.arg(1), env.arg(2), 0)),
+        (Face::FilterGraph, "Connect") => {
+            Some(render::connect_pins(env, graph, env.arg(1), env.arg(2)))
+        }
         (Face::FilterGraph, "Disconnect") => Some(filter::disconnect(env, env.arg(1))),
         (Face::FilterGraph, "Reconnect" | "ReconnectEx") => r(E_NOTIMPL),
         (Face::FilterGraph, "SetDefaultSyncSource") => r(S_OK),
@@ -535,7 +551,7 @@ pub(crate) fn pause(env: &mut Env<'_>, graph: u32, then: Then) -> Outcome {
             } else {
                 wake_sessions(env, graph);
             }
-            then(env, Vec::new())
+            flush_posts(env, then)
         }),
     )
 }
@@ -630,6 +646,7 @@ pub(crate) fn notify(env: &mut Env<'_>, graph: u32, code: u32, p1: u32, p2: u32)
             graph_state.completed += 1;
             if graph_state.completed >= graph_state.expected && !graph_state.complete_sent {
                 graph_state.complete_sent = true;
+                env.ext.get_or_default::<Playback>().completions += 1;
                 queue_event(env, graph, EC_COMPLETE, S_OK, 0);
             }
         }
@@ -647,8 +664,15 @@ fn queue_event(env: &mut Env<'_>, graph: u32, code: u32, p1: u32, p2: u32) {
         return;
     }
     graph_state.events.push_back((code, p1, p2));
-    let (event, notify) = (graph_state.event, graph_state.notify);
+    let (event, public_event, notify) = (
+        graph_state.event,
+        graph_state.public_event,
+        graph_state.notify,
+    );
     env.sys.set_event(event);
+    if let Some(event) = public_event {
+        (env.ext.get::<Host>().signal)(env, event, true);
+    }
     if let Some((window, message, instance)) = notify
         && window != 0
     {
@@ -658,6 +682,10 @@ fn queue_event(env: &mut Env<'_>, graph: u32, code: u32, p1: u32, p2: u32) {
 
 /// Post through the guest-visible user32 export; this front does not own windows.
 fn post_message(env: &mut Env<'_>, window: u32, message: u32, wparam: u32, lparam: u32) {
+    if let Some(host) = env.ext.try_get::<Host>() {
+        (host.post)(env, [window, message, wparam, lparam]);
+        return;
+    }
     let Ok(target) = env
         .sys
         .thunks
@@ -677,6 +705,12 @@ fn with_posts(env: &mut Env<'_>, value: u32) -> Outcome {
 }
 
 pub(crate) fn flush_posts(env: &mut Env<'_>, then: Then) -> Outcome {
+    if !state(env).pending_threads.is_empty() {
+        let id = state(env).pending_threads.remove(0);
+        let thread = env.ext.get::<Host>().thread;
+        let outcome = thread(env, id);
+        return after(env, outcome, Box::new(move |env, _| flush_posts(env, then)));
+    }
     if state(env).pending_posts.is_empty() {
         return then(env, Vec::new());
     }
@@ -688,7 +722,7 @@ fn event_method(env: &mut Env<'_>, graph: u32, method: &str) -> Option<Outcome> 
     let r = |value: u32| Some(Outcome::Return(value));
     match method {
         "GetEventHandle" => {
-            let event = g(env, graph).event;
+            let event = g(env, graph).public_event.unwrap_or(g(env, graph).event);
             let output = env.arg(1);
             if output == 0 {
                 return r(E_POINTER);
@@ -756,7 +790,11 @@ fn get_event(env: &mut Env<'_>, graph: u32, outputs: [u32; 3], timeout: u32) -> 
     if let Some((code, p1, p2)) = graph_state.events.pop_front() {
         if graph_state.events.is_empty() {
             let event = graph_state.event;
+            let public_event = graph_state.public_event;
             env.sys.reset_event(event);
+            if let Some(event) = public_event {
+                (env.ext.get::<Host>().signal)(env, event, false);
+            }
         }
         for (output, value) in outputs.into_iter().zip([code, p1, p2]) {
             let _ = env.cpu.write_u32(output, value);

@@ -57,6 +57,9 @@ pub struct Window {
     /// The part of the window its surface holds, in the same coordinates.
     pub extent: [i32; 4],
     pub visible: bool,
+    /// Client origin on screen for top-level windows.
+    pub origin: (i32, i32),
+    parent: u32,
     /// The guest context that owns the window.
     context: adv_machine::CtxId,
 }
@@ -308,8 +311,63 @@ fn position_changed(env: &mut Env<'_>) -> Outcome {
     if flags & SWP_HIDEWINDOW != 0 {
         window.visible = false;
     }
-    if flags & SWP_SHOWWINDOW != 0 {
-        return project::shown(env, hwnd);
+    let user32 = adv_nt::process::module_base(env.cpu, env.sys.peb, "user32.dll");
+    let target = |name| user32.and_then(|base| adv_nt::process::module_export(env.cpu, base, name));
+    let (Some(origin), Some(parent)) = (target("ClientToScreen"), target("GetAncestor")) else {
+        return Outcome::Fail("user driver: missing window geometry exports".into());
+    };
+    let scratch = match crate::slot(env) {
+        Ok(value) => value,
+        Err(error) => return Outcome::Fail(error),
+    };
+    if let Err(error) = crate::write_words(env, scratch, &[0, 0]) {
+        return Outcome::Fail(error);
     }
-    Outcome::Return(0)
+    Outcome::call(origin, [hwnd, scratch], move |env, _| {
+        let point = (
+            env.cpu.read_u32(scratch).unwrap_or(0) as i32,
+            env.cpu.read_u32(scratch + 4).unwrap_or(0) as i32,
+        );
+        crate::free_slot(env, scratch);
+        Outcome::call(parent, [hwnd, 1], move |env, result| {
+            let parent = result.value();
+            let parent = if is_desktop(env, parent) { 0 } else { parent };
+            let window = env.ext.get_mut::<Windows>().0.get_mut(&hwnd).unwrap();
+            window.origin = point;
+            window.parent = parent;
+            if flags & SWP_SHOWWINDOW != 0 {
+                project::shown(env, hwnd)
+            } else {
+                Outcome::Return(0)
+            }
+        })
+    })
+}
+
+/// Client origin and inherited visibility from the driver's window reports.
+pub fn client_geometry(ext: &adv_machine::Ext, hwnd: u32) -> Option<((i32, i32), bool)> {
+    let window = window(ext, hwnd)?;
+    if window.parent == 0 {
+        return Some((window.origin, window.visible));
+    }
+    let (origin, visible) = client_geometry(ext, window.parent)?;
+    Some((
+        (origin.0 + window.client[0], origin.1 + window.client[1]),
+        visible && window.visible,
+    ))
+}
+/// Post a host service notification through the window owner's Wine queue.
+pub fn post_message(ext: &mut adv_machine::Ext, args: [u32; 4]) {
+    input::schedule(
+        ext,
+        args[0],
+        Box::new(move |env, done| {
+            let target = adv_nt::process::module_base(env.cpu, env.sys.peb, "user32.dll")
+                .and_then(|base| adv_nt::process::module_export(env.cpu, base, "PostMessageW"));
+            match target {
+                Some(target) => Outcome::call(target, args, move |env, _| done(env)),
+                None => Outcome::Fail("user32: missing PostMessageW".into()),
+            }
+        }),
+    );
 }

@@ -132,6 +132,52 @@ impl Input {
             Ok(input)
         }
     }
+    /// Packet-tail duration for program streams whose sparse PTS underestimate
+    /// their length. Restore byte zero before decoding starts.
+    pub(super) fn packet_end_100ns(&mut self) -> Result<u64, Error> {
+        const TAIL: i64 = 256 * 1024;
+        // SAFETY: this open context owns its AVIO and supports byte seeks.
+        let origin = unsafe {
+            let context = self.context.as_mut_ptr();
+            let length = ff::ffi::avio_size((*context).pb);
+            ff::ffi::av_seek_frame(
+                context,
+                -1,
+                length.saturating_sub(TAIL).max(0),
+                ff::ffi::AVSEEK_FLAG_BYTE,
+            );
+            (*context).start_time
+        };
+        let mut end = 0;
+        let mut packet = ff::Packet::empty();
+        while packet.read(&mut self.context).is_ok() {
+            let Some(stream) = self.context.stream(packet.stream()) else {
+                continue;
+            };
+            let Some(stamp) = packet.pts().or(packet.dts()) else {
+                continue;
+            };
+            let tb = stream.time_base();
+            let time =
+                ((i128::from(stamp + packet.duration()) * i128::from(tb.numerator()) * 10_000_000)
+                    / i128::from(tb.denominator().max(1)))
+                .clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64;
+            end = end.max(time);
+        }
+        // SAFETY: restore this same open context before any decoder uses it.
+        let result = unsafe {
+            ff::ffi::av_seek_frame(self.context.as_mut_ptr(), -1, 0, ff::ffi::AVSEEK_FLAG_BYTE)
+        };
+        if result < 0 {
+            return Err(ff::Error::from(result).into());
+        }
+        let origin = if origin == ff::ffi::AV_NOPTS_VALUE {
+            0
+        } else {
+            origin * 10
+        };
+        Ok(end.saturating_sub(origin).max(0) as u64)
+    }
 }
 
 struct Audio {
@@ -289,7 +335,13 @@ fn open_audio(stream: &format::stream::Stream<'_>, asf: bool) -> Result<Audio, E
 impl Native {
     pub fn open(reader: Box<dyn ReadSeek>) -> Result<Self, Error> {
         ff::init()?;
-        let input = Input::open(reader)?;
+        let mut input = Input::open(reader)?;
+        let mut duration_us = input.context.duration().max(0) as u64;
+        // SAFETY: the context is open; this reads its estimation method.
+        let method = unsafe { (*input.context.as_ptr()).duration_estimation_method };
+        if method == ff::ffi::AVDurationEstimationMethod::AVFMT_DURATION_FROM_PTS {
+            duration_us = duration_us.max(input.packet_end_100ns()? / 10);
+        }
         let asf = input.context.format().name() == "asf";
         let video = input
             .context
@@ -316,7 +368,7 @@ impl Native {
         };
         let info = StreamInfo {
             container: input.context.format().name().into(),
-            duration_us: input.context.duration().max(0) as u64,
+            duration_us,
             video: video.as_ref().map(|v| {
                 let rate = input
                     .context

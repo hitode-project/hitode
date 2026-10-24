@@ -285,9 +285,10 @@ pub(crate) fn detach(env: &mut Env<'_>, graph: u32) {
 /// layouts do not republish or wake presentation.
 pub fn pump_video<B: adv_cpu::backend::Backend>(
     machine: &mut adv_machine::Machine<B>,
-) -> Result<(), String> {
+) -> Result<Option<u64>, String> {
+    let deadline = super::stream::pump_host(machine)?;
     let Some(state) = machine.ext.try_get::<State>() else {
-        return Ok(());
+        return Ok(deadline);
     };
     let graphs: Vec<u32> = state
         .graphs
@@ -295,7 +296,7 @@ pub fn pump_video<B: adv_cpu::backend::Backend>(
         .filter_map(|(&id, g)| (g.video.owner != 0 && g.video.visible).then_some(id))
         .collect();
     if graphs.is_empty() {
-        return Ok(());
+        return Ok(deadline);
     }
     let mut env = Env {
         context: machine.sys.current,
@@ -315,5 +316,5 @@ pub fn pump_video<B: adv_cpu::backend::Backend>(
                 .map_err(|hr| format!("DirectShow video window update failed ({hr:#x})"))?;
         }
     }
-    Ok(())
+    Ok(deadline)
 }
