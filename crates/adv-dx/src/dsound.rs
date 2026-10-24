@@ -81,6 +81,8 @@ const CLSID_DEVICE: [u8; 16] = [
 const CLSID_DEVICE8: [u8; 16] = [
     0x3f, 0xcc, 0x01, 0x39, 0xb5, 0x84, 0xa4, 0x4f, 0xba, 0x35, 0xaa, 0x81, 0x72, 0xb8, 0xa0, 0x9b,
 ];
+/// The classes `CoCreateInstance` activates through this front.
+pub const CLASSES: [[u8; 16]; 2] = [CLSID_DEVICE, CLSID_DEVICE8];
 const IID_BUFFER: [u8; 16] = [
     0x85, 0xfa, 0x9a, 0x27, 0x81, 0x49, 0xce, 0x11, 0xa5, 0x21, 0, 0x20, 0xaf, 0x0b, 0xe5, 0x60,
 ];
@@ -297,6 +299,25 @@ pub struct Sound {
     trace_pcm_dir: Option<std::path::PathBuf>,
     trace_pcm_chunks: bool,
     playback_clock: Arc<adv_device::clock::PlaybackClock>,
+    host: Host,
+}
+
+/// What a userland other than the built-in one answers for the front.
+#[derive(Clone, Copy, Default)]
+pub struct Host {
+    /// Guest storage for objects; the process heap when absent.
+    pub allocator: Option<crate::interop::GuestAllocator>,
+    /// Notification events; machine events when absent.
+    pub events: Option<Events>,
+}
+
+/// Notification events that are not machine objects.
+#[derive(Clone, Copy)]
+pub struct Events {
+    /// Whether `handle` may receive position notifications.
+    pub valid: fn(&mut Env<'_>, u32) -> bool,
+    /// Signal `handle` with audio wake priority.
+    pub signal: fn(&mut Env<'_>, u32) -> Result<(), String>,
 }
 impl Sound {
     /// A mixer stream id for another front's owned PCM (movie audio).
@@ -396,7 +417,7 @@ fn unavailable_create8(
 }
 pub fn install<B: Backend>(m: &mut Machine<B>) -> Result<(), String> {
     let audio = AudioControl::new(!m.sys.clock.is_virtual());
-    install_audio(m, audio, false)
+    install_audio(m, audio, false, Host::default())
 }
 
 /// Install process-local COM objects over the session's existing audio stream.
@@ -405,13 +426,24 @@ pub fn install_with_audio<B: Backend>(
     m: &mut Machine<B>,
     audio: AudioControl,
 ) -> Result<(), String> {
-    install_audio(m, audio, true)
+    install_audio(m, audio, true, Host::default())
+}
+
+/// Install the front over `audio` with `host`'s storage and events, for a
+/// userland whose process heap and events are not the built-in stack's.
+pub fn install_on_host<B: Backend>(
+    m: &mut Machine<B>,
+    audio: AudioControl,
+    host: Host,
+) -> Result<(), String> {
+    install_audio(m, audio, true, host)
 }
 
 fn install_audio<B: Backend>(
     m: &mut Machine<B>,
     audio: AudioControl,
     shared: bool,
+    host: Host,
 ) -> Result<(), String> {
     let trace = std::env::var_os("ADV_AUDIO_TRACE")
         .map(|path| {
@@ -493,6 +525,7 @@ fn install_audio<B: Backend>(
         trace_pcm_dir,
         trace_pcm_chunks: std::env::var_os("ADV_AUDIO_DUMP_CHUNKS").is_some(),
         playback_clock,
+        host,
     });
     let classes = m.ext.get_or_default::<adv_os::com::ClassFactories>();
     classes.register(CLSID_DEVICE, create_class);
@@ -552,12 +585,34 @@ fn create_com_device(
     Outcome::Return(0)
 }
 fn alloc(e: &mut Env<'_>, len: u32) -> Option<u32> {
+    if let Some(allocator) = e.ext.get::<Sound>().host.allocator {
+        return (allocator.allocate)(e, len);
+    }
     let heaps = e.ext.get_mut::<Heaps>();
     heaps.alloc(e.cpu, &mut e.sys.vm, heaps.process_heap, len, true)
 }
 fn free(e: &mut Env<'_>, ptr: u32) {
+    if let Some(allocator) = e.ext.get::<Sound>().host.allocator {
+        return (allocator.free)(e, ptr);
+    }
     let heaps = e.ext.get_mut::<Heaps>();
     heaps.free(e.cpu, &mut e.sys.vm, heaps.process_heap, ptr);
+}
+
+/// Signal position notifications on the calling thread.
+fn notify(e: &mut Env<'_>, handles: Vec<u32>) -> Result<(), String> {
+    match e.ext.get::<Sound>().host.events {
+        Some(events) => handles
+            .into_iter()
+            .try_for_each(|handle| (events.signal)(e, handle)),
+        None => {
+            for handle in handles {
+                e.sys
+                    .set_event_with_priority(handle, adv_machine::WakePriority::Audio);
+            }
+            Ok(())
+        }
+    }
 }
 fn release(e: &mut Env<'_>, ptr: u32) -> u32 {
     let s = e.ext.get_mut::<Sound>();
@@ -1247,12 +1302,14 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
         for i in 0..b {
             let offset = e.cpu.read_u32(c + i * 8).map_err(|e| e.to_string())?;
             let handle = e.cpu.read_u32(c + i * 8 + 4).map_err(|e| e.to_string())?;
-            if (offset != u32::MAX && offset >= len)
-                || !matches!(
+            let event = match e.ext.get::<Sound>().host.events {
+                Some(events) => (events.valid)(e, handle),
+                None => matches!(
                     e.sys.objects.get(handle),
                     Some(adv_machine::Object::Event { .. })
-                )
-            {
+                ),
+            };
+            if (offset != u32::MAX && offset >= len) || !event {
                 return Ok(INVALID);
             }
             entries.push((offset, handle));
@@ -1683,10 +1740,8 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
         }
         _ => return Err(format!("unimplemented audio method {full}")),
     };
-    for handle in s.ready_notices.drain(..) {
-        e.sys
-            .set_event_with_priority(handle, adv_machine::WakePriority::Audio);
-    }
+    let ready = std::mem::take(&mut s.ready_notices);
+    notify(e, ready)?;
     Ok(value)
 }
 fn call(e: &mut Env<'_>) -> Outcome {
@@ -1699,6 +1754,7 @@ fn call(e: &mut Env<'_>) -> Outcome {
 /// Service device notifications and retirements. The callback owns a PCM read alias.
 pub fn pump<B: Backend>(m: &mut Machine<B>) -> Result<Option<u64>, String> {
     let guest_now = m.sys.clock.now_us();
+    let mut fired = Vec::new();
     let s = m.ext.get_mut::<Sound>();
     s.audio.sync_clock(guest_now);
     for (&source, (_, queued)) in &mut s.pending_release {
@@ -1776,10 +1832,7 @@ pub fn pump<B: Backend>(m: &mut Machine<B>) -> Result<Option<u64>, String> {
             }
             buffer.notice_bytes = progress;
         }
-        for event in s.ready_notices.drain(..) {
-            m.sys
-                .set_event_with_priority(event, adv_machine::WakePriority::Audio);
-        }
+        fired.append(&mut s.ready_notices);
     }
     s.pending_notices
         .retain(|&(source, event, due, generation)| {
@@ -1792,8 +1845,7 @@ pub fn pump<B: Backend>(m: &mut Machine<B>) -> Result<Option<u64>, String> {
                 return false;
             }
             if due <= now {
-                m.sys
-                    .set_event_with_priority(event, adv_machine::WakePriority::Audio);
+                fired.push(event);
                 if let Some(trace) = s.trace.as_mut() {
                     let _ = writeln!(
                         trace,
@@ -1848,6 +1900,20 @@ pub fn pump<B: Backend>(m: &mut Machine<B>) -> Result<Option<u64>, String> {
                 let delay = (frames * 1_000_000).div_ceil(u64::from(buffer.frequency));
                 let deadline = guest_now + delay.max(1);
                 next = Some(next.map_or(deadline, |old| old.min(deadline)));
+            }
+        }
+    }
+    let events = s.host.events;
+    match events {
+        Some(events) => m.visit_context(None, |env| {
+            fired
+                .into_iter()
+                .try_for_each(|handle| (events.signal)(env, handle))
+        })??,
+        None => {
+            for event in fired {
+                m.sys
+                    .set_event_with_priority(event, adv_machine::WakePriority::Audio);
             }
         }
     }

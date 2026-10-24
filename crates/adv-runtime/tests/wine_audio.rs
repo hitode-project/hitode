@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use adv_runtime::wine::session::{Config, Session, Stop};
 
-// spec: WINE-AUD-1, WINE-AUD-2, WINE-AUD-3, WINE-AUD-4, WINE-THR-1
+// spec: WINE-AUD-1, WINE-AUD-2, WINE-AUD-3, WINE-AUD-4, WINE-AUD-7, WINE-THR-1
 #[test]
 fn wine_audio_reaches_the_host_stream() {
     let (Some(dist), Some(probes)) = (

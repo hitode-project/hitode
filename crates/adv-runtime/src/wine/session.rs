@@ -443,6 +443,7 @@ fn run(
             Ok(false) => {}
             Err(error) => return Stop::Failed(error),
         }
+        let deadline = with_notices(machine, deadline);
         if presented(machine) {
             return Stop::Paused;
         }
@@ -463,6 +464,18 @@ fn run(
     }
 }
 
+/// When DirectSound next has position notifications to deliver.
+struct SoundDeadline(Option<u64>);
+
+/// The earlier of a guest deadline and the next notification.
+fn with_notices(machine: &Machine<Cpu>, deadline: Option<u64>) -> Option<u64> {
+    let notices = machine.ext.try_get::<SoundDeadline>().and_then(|d| d.0);
+    match (deadline, notices) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
 /// Take finished host work; true when guest work may continue.
 fn serve(machine: &mut Machine<Cpu>) -> Result<bool, String> {
     let now = machine.sys.clock.now_us();
@@ -470,6 +483,8 @@ fn serve(machine: &mut Machine<Cpu>) -> Result<bool, String> {
         .ext
         .get::<adv_device::AudioControl>()
         .sync_clock(now);
+    let notices = adv_dx::dsound::pump(machine)?;
+    machine.ext.insert(SoundDeadline(notices));
     let media = adv_drv::media::pump(machine)?;
     #[cfg(feature = "gpu")]
     return adv_dx::d3d9::pump(machine).map(|gpu| gpu || media);
@@ -739,7 +754,8 @@ impl Session {
                     return Stop::Failed(format!("{error:?}"));
                 }
                 SliceResult::Complete(RunResult::Idle { next_deadline }) => {
-                    self.idle.insert(id, next_deadline);
+                    let deadline = with_notices(&self.machine, next_deadline);
+                    self.idle.insert(id, deadline);
                 }
                 _ => {
                     self.idle.remove(&id);

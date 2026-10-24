@@ -22,6 +22,7 @@ use crate::graphics::{guest_memory, install_store};
 mod class;
 #[cfg(any(target_vendor = "apple", target_os = "android"))]
 pub mod session;
+mod sound;
 
 /// The display driver to name in the process's startup parameters.
 pub const GRAPHICS_DRIVER: &str = adv_drv::user::MODULE;
@@ -55,6 +56,7 @@ const CREATED_BITMAP: u32 = 32;
 pub fn register(registry: &mut Registry) {
     adv_dx::ddraw::register(registry);
     class::register(registry);
+    sound::register(registry);
     #[cfg(feature = "gpu")]
     adv_dx::d3d9::register(registry);
     adv_drv::register(registry);
@@ -83,14 +85,15 @@ pub fn install<B: Backend>(
     class::install(machine)?;
     let ddraw: Vec<_> = DDRAW_EXPORTS.into_iter().chain(class::EXPORTS).collect();
     install_image(machine, prefix, DDRAW, &ddraw)?;
+    let heap = machine
+        .ext
+        .get_or_default::<adv_os::Heaps>()
+        .create(&mut machine.cpu, &mut machine.sys.vm)
+        .map_err(|e| e.to_string())?;
+    machine.ext.insert(Heap(heap));
+    sound::install(machine, prefix, allocator())?;
     #[cfg(feature = "gpu")]
     {
-        let heap = machine
-            .ext
-            .get_or_default::<adv_os::Heaps>()
-            .create(&mut machine.cpu, &mut machine.sys.vm)
-            .map_err(|e| e.to_string())?;
-        machine.ext.insert(Heap(heap));
         adv_dx::d3d9::install(machine, d3d9_provider())?;
         install_image(machine, prefix, D3D9, &D3D9_EXPORTS)?;
     }
@@ -170,27 +173,31 @@ fn install_image<B: Backend>(
     Ok(())
 }
 
-/// The heap of guest storage that Direct3D 9 allocates.
-#[cfg(feature = "gpu")]
+/// The heap of guest storage that the old stack's fronts allocate.
 struct Heap(u32);
+
+/// Allocation from [`Heap`], as the fronts' Win32 heap.
+fn allocator() -> adv_dx::interop::GuestAllocator {
+    adv_dx::interop::GuestAllocator {
+        allocate: |env, length| {
+            let heap = env.ext.get::<Heap>().0;
+            let heaps = env.ext.get_mut::<adv_os::Heaps>();
+            heaps.alloc(env.cpu, &mut env.sys.vm, heap, length, true)
+        },
+        free: |env, pointer| {
+            let heap = env.ext.get::<Heap>().0;
+            let heaps = env.ext.get_mut::<adv_os::Heaps>();
+            heaps.free(env.cpu, &mut env.sys.vm, heap, pointer);
+        },
+    }
+}
 
 /// The old stack's Direct3D 9 assembly, with what it takes from USER and the
 /// Win32 heap answered on the Wine userland.
 #[cfg(feature = "gpu")]
 fn d3d9_provider() -> adv_dx::d3d9::SurfaceProvider {
     adv_dx::d3d9::SurfaceProvider {
-        allocator: adv_dx::interop::GuestAllocator {
-            allocate: |env, length| {
-                let heap = env.ext.get::<Heap>().0;
-                let heaps = env.ext.get_mut::<adv_os::Heaps>();
-                heaps.alloc(env.cpu, &mut env.sys.vm, heap, length, true)
-            },
-            free: |env, pointer| {
-                let heap = env.ext.get::<Heap>().0;
-                let heaps = env.ext.get_mut::<adv_os::Heaps>();
-                heaps.free(env.cpu, &mut env.sys.vm, heap, pointer);
-            },
-        },
+        allocator: allocator(),
         dc: memory_dc::<D3D9>(),
         // Windowed devices only; full-screen modes come with display modes.
         mode_changed: |_, _, _| Outcome::Return(0),
