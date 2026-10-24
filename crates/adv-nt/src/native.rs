@@ -19,6 +19,8 @@ use iced_x86::{Decoder, DecoderOptions, FlowControl};
 
 use crate::identity::{self, Images};
 
+mod mixer;
+
 /// The module the bodies' thunks are registered under.
 pub const MODULE: &str = "hitode.native";
 
@@ -27,6 +29,7 @@ struct Body {
     name: &'static str,
     conv: Conv,
     leaf: EnvLeafHandler,
+    handler: adv_machine::Handler,
 }
 
 const BODIES: &[Body] = &[
@@ -36,11 +39,19 @@ const BODIES: &[Body] = &[
         name: "ntdll.dll!memcpy",
         conv: Conv::Cdecl { argc: 3 },
         leaf: memmove,
+        handler: resume_original,
+    },
+    Body {
+        name: "dsound.dll!DSOUND_MixToPrimary",
+        conv: Conv::Cdecl { argc: 6 },
+        leaf: mixer::mix,
+        handler: mixer::resume,
     },
     Body {
         name: "ntdll.dll!NtQueryPerformanceCounter",
         conv: Conv::Stdcall { argc: 2 },
         leaf: query_performance_counter,
+        handler: resume_original,
     },
 ];
 
@@ -51,7 +62,7 @@ pub(crate) fn host_fn(name: &str) -> Option<HostFn> {
         leaf: None,
         env_leaf: Some(body.leaf),
         conv: body.conv,
-        handler: resume_original,
+        handler: body.handler,
         data: 0,
         trace: false,
         guest: None,
@@ -151,7 +162,12 @@ fn bind_one(
     cpu.write(at, &trampoline).map_err(|e| e.to_string())?;
     trampolines.used = next - trampolines.page;
     trampolines.by_thunk.insert(index, at);
-    sys.redirects.insert(entry, (thunk, original.into()));
+    let target = if name == "dsound.dll!DSOUND_MixToPrimary" {
+        mixer::entry(cpu, sys, thunk)?
+    } else {
+        thunk
+    };
+    sys.redirects.insert(entry, (target, original.into()));
     Ok(())
 }
 
