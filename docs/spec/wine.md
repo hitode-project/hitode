@@ -270,7 +270,7 @@ FreeType is such a library: win32u opens it by name and draws TrueType text thro
 
 ### WINE-AUD-1 Builtin render driver
 
-**Rule**: `wineadvaudio.drv` MUST expose one render endpoint and no capture, MIDI or aux devices. Its Unix functions MUST use the ordinary Unix-call dispatcher.
+**Rule**: `wineadvaudio.drv` MUST expose one render endpoint, one software MIDI output, and no capture, MIDI input or aux devices. Its Unix functions MUST use the ordinary Unix-call dispatcher.
 **Verification**: Test
 
 ### WINE-AUD-2 Shared mixer
@@ -286,6 +286,16 @@ FreeType is such a library: win32u opens it by name and draws TrueType text thro
 ### WINE-AUD-4 Session output
 
 **Rule**: A session MUST own its audio control and expose its mixed PCM stream. Windowed shells MUST open host audio output. Headless shells MUST NOT open host audio output.
+**Verification**: Test
+
+### WINE-AUD-5 MIDI output messages
+
+**Rule**: MIDI output MUST support capability queries, open/close, prepared long messages, short messages, reset and stereo volume. Successful open, close and long-message submission MUST deliver the corresponding WinMM callbacks. Failed requests MUST NOT create an output handle or deliver a completion callback.
+**Verification**: Test
+
+### WINE-AUD-6 MIDI synthesis
+
+**Rule**: MIDI notes and controllers MUST produce PCM through the shared mixer with a bundled General MIDI bank. Wine MUST retain stream timing, pause/resume and MCI sequencing. Closing MIDI output MUST remove its queued PCM.
 **Verification**: Test
 
 ## Media

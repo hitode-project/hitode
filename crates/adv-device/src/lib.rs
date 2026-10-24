@@ -13,6 +13,7 @@ mod device;
 pub mod gpu;
 pub mod image;
 pub mod media;
+pub mod midi;
 pub mod mixer;
 mod owned;
 mod resample;

@@ -29,27 +29,31 @@ class PackageTests(unittest.TestCase):
                 package.package(Path('runner'), Path('unused'), '-', None)
 
     # spec: HOST-PKG-4
-    def test_parent_license_from_exact_crate_revision(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            crate = root / 'crate'
-            crate.mkdir()
-            (crate / 'Cargo.toml').touch()
-            (crate / '.cargo_vcs_info.json').write_text(json.dumps({'git': {'sha1': 'abc'}, 'path_in_vcs': 'crates/child'}))
-            cache = root / 'target/macos-license-cache'
-            cache.mkdir(parents=True)
-            with tarfile.open(cache / 'abc.tar.gz', 'w:gz') as archive:
-                folder = tarfile.TarInfo('repo-abc')
-                folder.type = tarfile.DIRTYPE
-                archive.addfile(folder)
-                text = b'Copyright upstream; test license'
-                member = tarfile.TarInfo('repo-abc/LICENSE')
-                member.size = len(text)
-                archive.addfile(member, io.BytesIO(text))
-            with patch.object(package, 'ROOT', root):
-                count = package.rust_licenses({'manifest_path': str(crate / 'Cargo.toml'), 'repository': 'https://github.com/example/repo', 'name': 'child', 'license': 'MIT'}, root / 'notices')
-            self.assertEqual(count, 1)
-            self.assertEqual((root / 'notices/LICENSE').read_bytes(), text)
+    def test_licenses_from_exact_crate_revision(self):
+        for name, crate_path, license_path in [
+                ('child', 'crates/child', 'LICENSE'),
+                ('oxisynth-chorus', 'oxisynth-chorus', 'oxisynth/LICENSE'),
+                ('oxisynth-reverb', 'oxisynth-reverb', 'oxisynth/LICENSE')]:
+            with self.subTest(crate=name), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                crate = root / 'crate'
+                crate.mkdir()
+                (crate / 'Cargo.toml').touch()
+                (crate / '.cargo_vcs_info.json').write_text(json.dumps({'git': {'sha1': 'abc'}, 'path_in_vcs': crate_path}))
+                cache = root / 'target/macos-license-cache'
+                cache.mkdir(parents=True)
+                with tarfile.open(cache / 'abc.tar.gz', 'w:gz') as archive:
+                    folder = tarfile.TarInfo('repo-abc')
+                    folder.type = tarfile.DIRTYPE
+                    archive.addfile(folder)
+                    text = b'Copyright upstream; test license'
+                    member = tarfile.TarInfo(f'repo-abc/{license_path}')
+                    member.size = len(text)
+                    archive.addfile(member, io.BytesIO(text))
+                with patch.object(package, 'ROOT', root):
+                    count = package.rust_licenses({'manifest_path': str(crate / 'Cargo.toml'), 'repository': 'https://github.com/example/repo', 'name': name, 'license': 'LGPL-2.1'}, root / 'notices')
+                self.assertEqual(count, 1)
+                self.assertEqual((root / 'notices/LICENSE').read_bytes(), text)
 
     # spec: HOST-PKG-3
     def test_only_jit_entitlement_and_no_adhoc_notarization(self):

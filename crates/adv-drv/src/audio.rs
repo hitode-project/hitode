@@ -10,6 +10,7 @@ use adv_cpu::backend::{Backend, GuestExt, Prot};
 use adv_device::{AudioControl, RingState, ring::RingConfig};
 use adv_machine::Machine;
 
+mod midi;
 mod stream;
 #[cfg(test)]
 mod tests;
@@ -119,7 +120,7 @@ pub(super) fn register(registry: &mut Registry) {
         0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
         25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36
     );
-    for (name, get_num) in [("modMessage", 1), ("midMessage", 53), ("auxMessage", 3)] {
+    for (name, get_num) in [("midMessage", 53), ("auxMessage", 3)] {
         registry.add_with_data(
             MODULE,
             name,
@@ -136,6 +137,18 @@ pub(super) fn register(registry: &mut Registry) {
             get_num,
         );
     }
+    registry.add(
+        MODULE,
+        "modMessage",
+        Conv::Stdcall { argc: 5 },
+        midi::output,
+    );
+    registry.add(
+        MODULE,
+        "midi_render",
+        Conv::Stdcall { argc: 1 },
+        midi::timer,
+    );
     registry.add(MODULE, "DriverProc", Conv::Stdcall { argc: 5 }, |env| {
         Outcome::Return(match env.arg(2) {
             1 | 3 | 4 | 6 | 7 | 8 => 1,
@@ -411,13 +424,10 @@ fn execute(env: &mut Env<'_>, code: u32, args: u32) -> Result<(), String> {
         27 => write(env, args + 4, 3)?,
         29 => write(env, args + 16, 0x8000_4001)?,
         31 => write(env, read(env, args)?, 1)?,
-        33 | 34 | 36 => {
+        33 => midi::unix_output(env, args)?,
+        34 | 36 => {
             let msg = read(env, args + 4)?;
-            let get_num = match code {
-                33 => 1,
-                34 => 53,
-                _ => 3,
-            };
+            let get_num = if code == 34 { 53 } else { 3 };
             write(
                 env,
                 read(env, args + 20)?,

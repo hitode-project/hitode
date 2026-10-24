@@ -65,7 +65,7 @@ fn wine_audio_reaches_the_host_stream() {
     std::fs::remove_dir_all(&root).unwrap();
     eprintln!("{text}");
     assert!(matches!(stop, Stop::Exited(0)), "{stop:?}: {text}");
-    assert!(text.contains("midi_out=0 midi_in=0 aux=0"), "{text}");
+    assert!(text.contains("midi_out=1 midi_in=0 aux=0"), "{text}");
     assert!(text.contains("render=1 capture=0"), "{text}");
     assert!(text.contains("wave_done=1 bytes=35280"), "{text}");
     assert!(text.contains("ds_advanced=1"), "{text}");

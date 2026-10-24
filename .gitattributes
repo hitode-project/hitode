@@ -15,3 +15,6 @@
 # Vendored Wine sources stay byte-identical to the upstream release.
 /vendor/wine/** -whitespace
 /vendor/wine/nls/*.nls binary
+
+# Bundled General MIDI SoundFont.
+/vendor/fluidr3mono/*.sf3 binary

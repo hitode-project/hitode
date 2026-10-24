@@ -58,6 +58,17 @@ Synthetic fixtures and their FFmpeg generation script live in
 Apple static FFmpeg builds enable VideoToolbox and its H.264, HEVC, MPEG-2 and
 MPEG-4 accelerators. Android uses software decoding.
 
+The MIDI output uses OxiSynth and the bundled MIT-licensed FluidR3Mono 2.312
+bank. `vendor/fluidr3mono/FluidR3Mono_GM.sf3` is unchanged from MuseScore's
+[v2.3.2 sound resources](https://github.com/musescore/MuseScore/tree/v2.3.2/share/sound),
+SHA-256 `cfcd66d89e8386823400eca64934b14fbea7bf48ba1f00d21189af1262794ec2`.
+Its notices are in `vendor/fluidr3mono/LICENSE`. The bank is embedded and needs no
+runtime downloads or host MIDI setup. Synthesis runs on the execution owner;
+a machine-clock render context feeds the shared PCM mixer with 30 ms of lead.
+The authored `tests/probe/midi.c` in `adv-runtime` checks WinMM, MIDI streams and
+MCI. Build it as its header describes into `ADV_WINE_PROBES`, then run
+`cargo test --release -p adv-runtime --test wine_midi` with `ADV_WINE_DIST` set.
+
 ## Tests
 
 ```sh

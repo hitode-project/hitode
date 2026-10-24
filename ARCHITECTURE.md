@@ -111,7 +111,7 @@ API signatures and metadata come from `data/abi/`; `tools/abi/` regenerates them
 ## Devices
 
 - **Graphics:** GDI, DirectDraw and Direct3D 9 share neutral surfaces and drawing services. Direct3D 9 shaders are translated within the limits in [docs/spec/graphics.md](docs/spec/graphics.md). Device services follow [docs/spec/device.md](docs/spec/device.md).
-- **Audio:** one mixer resamples with rubato and decodes with Symphonia. Shared PCM buffers are read through stable views, so a device never reads storage that the guest has freed.
+- **Audio:** one mixer resamples with rubato and decodes with Symphonia. Wine MIDI output synthesizes through OxiSynth with the bundled General MIDI bank. Shared PCM buffers are read through stable views, so a device never reads storage that the guest has freed.
 - **Video:** DirectShow, MCI and wmvcore decode through FFmpeg when built with the `media` feature. See [docs/spec/media.md](docs/spec/media.md).
 - **Fonts:** Windows GDI on Windows, and fontdb, skrifa and zeno elsewhere. Fonts that the guest supplies take priority.
 

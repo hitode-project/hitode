@@ -113,7 +113,8 @@ dependencies = [
  "objc2-foundation",
  "objc2-io-surface",
  "objc2-metal",
- "ogg",
+ "ogg 0.9.2",
+ "oxisynth",
  "png 0.17.16",
  "pollster",
  "rubato",
@@ -3440,6 +3441,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "lewton"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "777b48df9aaab155475a83a7df3070395ea1ac6902f5cd062b8f2b028075c030"
+dependencies = [
+ "byteorder",
+ "ogg 0.8.0",
+ "tinyvec",
+]
+
+[[package]]
 name = "libappindicator"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4142,6 +4154,15 @@ dependencies = [
 
 [[package]]
 name = "ogg"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6951b4e8bf21c8193da321bcce9c9dd2e13c858fe078bf9054a288b419ae5d6e"
+dependencies = [
+ "byteorder",
+]
+
+[[package]]
+name = "ogg"
 version = "0.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fdab8dcd8d4052eaacaf8fb07a3ccd9a6e26efadb42878a413c68fc4af1dee2b"
@@ -4202,6 +4223,35 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
 ]
+
+[[package]]
+name = "oxisynth"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "68d089fc07e074f57ac6698292ce3da05eac1d282b821eb4156d4c7d8e36c6ec"
+dependencies = [
+ "bitflags 2.13.2",
+ "lewton",
+ "log",
+ "oxisynth-chorus",
+ "oxisynth-reverb",
+ "soundfont",
+]
+
+[[package]]
+name = "oxisynth-chorus"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "755d6ea336fc37043b00a1b54198e24cb4537c509435c7aca2d837d36185703b"
+dependencies = [
+ "log",
+]
+
+[[package]]
+name = "oxisynth-reverb"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bdbb2d72d399b03dc7546c1087fabcdba68402f987bea903fe284c946fcca7aa"
 
 [[package]]
 name = "pango"
@@ -5555,6 +5605,12 @@ dependencies = [
  "web-sys",
  "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "soundfont"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2a7f4cb358863e55f8f1a3882f68601360cf6c42fc53ff2fe9aea41c33e24489"
 
 [[package]]
 name = "soup3"

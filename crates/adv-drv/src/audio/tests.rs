@@ -135,3 +135,53 @@ fn render_formats_wrap_and_follow_the_mixer_cursor() {
         assert!(output.iter().all(|&v| v == 0.0));
     }
 }
+
+// spec: WINE-AUD-1, WINE-AUD-5
+#[test]
+fn midi_unix_table_returns_winmm_notifications() {
+    let cpu = adv_cpu::Cpu::new(PARK_ADDR, false).unwrap();
+    let mut registry = Registry::default();
+    register(&mut registry);
+    let mut machine = Machine::new(cpu, registry, Clock::virtual_time()).unwrap();
+    machine.ext.insert(AudioControl::new(false));
+    let env = &mut Env {
+        context: 0,
+        cpu: &mut machine.cpu,
+        sys: &mut machine.sys,
+        ext: &mut machine.ext,
+        thunk: 0,
+    };
+    let args = allocate(env, 4096).unwrap();
+    let descriptor = args + 128;
+    let notify = args + 256;
+    let header = args + 512;
+    let call = |env: &mut Env<'_>, id, msg, p1, p2| {
+        crate::write_words(env, args, &[id, msg, 0, p1, p2, args + 64, notify]).unwrap();
+        execute(env, 33, args).unwrap();
+        let words: [u32; 8] = std::array::from_fn(|i| read(env, notify + i as u32 * 4).unwrap());
+        (read(env, args + 64).unwrap(), words)
+    };
+    assert_eq!(call(env, 0, 1, 0, 0), (1, [0; 8]));
+    assert_eq!(call(env, 1, 3, descriptor, 0), (2, [0; 8]));
+    crate::write_words(env, descriptor, &[0x24, 0x12, 0x34]).unwrap();
+    assert_eq!(
+        call(env, 0, 3, descriptor, 0x30000),
+        (0, [1, 0x3c7_0000, 0, 0, 0x12, 3, 0x24, 0x34])
+    );
+    crate::write_words(env, header, &[args + 1024, 6, 0, 0, 0, 0, 0]).unwrap();
+    env.cpu
+        .write(args + 1024, &[0xf0, 0x7e, 0x7f, 9, 1, 0xf7])
+        .unwrap();
+    assert_eq!(call(env, 0, 8, header, 64), (64, [0; 8]));
+    assert_eq!(call(env, 0, 5, header, 64), (0, [0; 8]));
+    assert_eq!(
+        call(env, 0, 8, header, 64),
+        (0, [1, 0x3c9_0000, header, 0, 0x12, 3, 0x24, 0x34])
+    );
+    assert_eq!(read(env, header + 16).unwrap(), 3);
+    assert_eq!(
+        call(env, 0, 4, 0, 0),
+        (0, [1, 0x3c8_0000, 0, 0, 0x12, 3, 0x24, 0x34])
+    );
+    assert_eq!(call(env, 0, 7, 0x00643c90, 0), (5, [0; 8]));
+}
