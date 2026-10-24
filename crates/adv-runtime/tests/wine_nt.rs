@@ -70,7 +70,7 @@ fn assert_checks(text: &str, ok: &str, checks: &[&str]) {
     }
 }
 
-// spec: WINE-NT-301, WINE-NT-302, WINE-NT-303
+// spec: NT-PROC-1, NT-PROC-2, NT-PROC-3
 #[test]
 fn l_process() {
     let Some((stop, text)) = probe("l_process", "nt_l_process.exe", |session, game| {
@@ -179,7 +179,7 @@ fn l_process() {
     assert_eq!(text.lines().collect::<Vec<_>>(), expected);
 }
 
-// spec: WINE-NT-101, WINE-NT-102, WINE-NT-103, WINE-THR-1
+// spec: NT-FILE-1, NT-FILE-2, NT-FILE-3, WINE-THR-1
 #[test]
 fn j_file() {
     let Some((stop, text)) = probe("j_file", "nt_j_file.exe", |_, _| {}) else {
@@ -217,7 +217,7 @@ fn j_file() {
     );
 }
 
-// spec: WINE-NT-201, WINE-NT-202, WINE-NT-203
+// spec: NT-SEC-1, NT-SEC-2, NT-SEC-3
 #[test]
 fn k_security() {
     let Some((stop, text)) = probe("k_security", "nt_security.exe", |_, _| {}) else {
@@ -273,7 +273,7 @@ fn k_security() {
     assert_eq!(lines, expected.map(|name| format!("{name} ok")), "{text}");
 }
 
-// spec: WINE-NT-401, WINE-NT-402, WINE-NT-403, WINE-NT-404
+// spec: NT-SYS-1, NT-SYS-2, NT-SYS-3, NT-SYS-4
 #[test]
 fn m_system() {
     let Some((stop, text)) = probe("m_system", "nt_m_system.exe", |_, _| {}) else {
