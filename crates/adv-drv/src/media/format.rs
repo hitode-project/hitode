@@ -27,15 +27,14 @@ pub(super) fn wg(codec: &CodecFormat, compressed: bool) -> [u8; 120] {
             extradata,
             ..
         } => {
-            let major = if !compressed {
-                5
-            } else {
-                match *fourcc {
-                    0x31564d57 | 0x32564d57 | 0x33564d57 | 0x31435657 | 0x41564d57 => 8,
-                    0x34363248 | 0x31637661 => 7,
-                    0x64697663 => 6,
-                    _ => 10,
-                }
+            // Like wg_parser, a compressed source exposes only the codecs
+            // Wine's own decoders take; it decodes every other one itself.
+            let major = match (compressed, *fourcc) {
+                (true, 0x31564d57 | 0x32564d57 | 0x33564d57 | 0x31435657 | 0x41564d57) => 8,
+                (true, 0x34363248 | 0x31637661) => 7,
+                (true, 0x64697663) => 6,
+                (true, 0x3167706d) => 10, // mpg1
+                _ => 5,
             };
             put(&mut out, 0, major);
             put(

@@ -36,6 +36,7 @@ impl State {
 pub fn register(registry: &mut Registry) {
     enumeration::register(registry);
     registry.register(get_device_identifier_ABI);
+    registry.register(get_fourcc_codes_ABI);
     for &(_, api) in BINDINGS {
         registry.register(api);
     }
@@ -566,6 +567,30 @@ fn get_device_identifier(
     // Identify our software adapter, without claiming host hardware or WHQL.
     value.guidDeviceIdentifier = [0x66445641, 0x4e87461b, 0x219a38aa, 0x015eda1e];
     match output.write(env.cpu, value) {
+        Ok(()) => Outcome::Return(0),
+        Err(_) => Outcome::Return(INVALID),
+    }
+}
+
+/// The adapter offers no FourCC overlay formats, so video renderers fall
+/// back to RGB surfaces.
+#[win32(ddraw, name = "IDirectDraw7::GetFourCCCodes", level = state)]
+fn get_fourcc_codes(
+    env: &mut Env<'_>,
+    this: GuestPtr<()>,
+    count: GuestPtr<u32>,
+    _codes: GuestPtr<u32>,
+) -> Outcome {
+    let state = env.ext.get::<State>();
+    let device = state
+        .draw
+        .com
+        .and_then(|com| com.get::<ComState>(&env.sys.objects, this.addr()))
+        .filter(|object| matches!(object.kind, Kind::Device));
+    if device.is_none() || count.addr() == 0 {
+        return Outcome::Return(INVALID);
+    }
+    match count.write(env.cpu, 0) {
         Ok(()) => Outcome::Return(0),
         Err(_) => Outcome::Return(INVALID),
     }

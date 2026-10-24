@@ -731,7 +731,12 @@ impl Container {
             _ => "video/mp4",
         }
         .into();
-        let duration = input.context.duration().max(0) as u64 * 10;
+        let mut duration = input.context.duration().max(0) as u64 * 10;
+        // SAFETY: the context is open; this reads a plain field.
+        let method = unsafe { (*input.context.as_ptr()).duration_estimation_method };
+        if method == ff::ffi::AVDurationEstimationMethod::AVFMT_DURATION_FROM_PTS {
+            duration = duration.max(Self::end_time(&reader).unwrap_or(0));
+        }
         let streams = (0..tracks.len()).map(|_| None).collect();
         Ok(Self {
             reader,
@@ -744,6 +749,41 @@ impl Container {
             indices,
             time: 0,
         })
+    }
+    /// The end of the last packet, from the start time, in 100 ns units.
+    /// FFmpeg estimates program streams from the final PTS alone, but MPEG
+    /// video often stamps only some packets; their DTS still mark the end.
+    fn end_time(reader: &Reader) -> Result<u64, Error> {
+        const TAIL: u64 = 256 * 1024;
+        let mut input = Input::open(Box::new(reader.clone()))?;
+        // SAFETY: the context is open; a byte seek only repositions its I/O.
+        let origin = unsafe {
+            let context = input.context.as_mut_ptr();
+            ff::ffi::av_seek_frame(
+                context,
+                -1,
+                reader.length.saturating_sub(TAIL) as i64,
+                ff::ffi::AVSEEK_FLAG_BYTE,
+            );
+            (*context).start_time
+        };
+        let mut end = 0;
+        let mut packet = ff::Packet::empty();
+        while packet.read(&mut input.context).is_ok() {
+            let Some(stream) = input.context.stream(packet.stream()) else {
+                continue;
+            };
+            let Some(stamp) = packet.pts().or(packet.dts()) else {
+                continue;
+            };
+            end = end.max(time(stamp + packet.duration(), stream.time_base()));
+        }
+        let origin = if origin == ff::ffi::AV_NOPTS_VALUE {
+            0
+        } else {
+            origin * 10
+        };
+        Ok(end.saturating_sub(origin).max(0) as u64)
     }
     fn next(&mut self, index: usize, compressed: bool) -> Result<Option<Sample>, Error> {
         let source_index = self.indices[index];
