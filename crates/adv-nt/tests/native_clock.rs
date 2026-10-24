@@ -1,5 +1,7 @@
 //! Native performance counter against Wine's real system call stub.
 
+#[cfg(any(target_vendor = "apple", target_os = "android"))]
+use adv_wineserver as _;
 use std::path::{Path, PathBuf};
 
 use adv_cpu::Cpu;
@@ -84,7 +86,7 @@ fn call(machine: &mut Machine<Cpu>, counter: u32, frequency: u32) -> [u32; 7] {
     .map(|address| machine.cpu.read_u32(address).unwrap())
 }
 
-// spec: WINE-NAT-3
+// spec: NAT-BODY-2
 #[test]
 fn performance_counter_matches_wine() {
     let Some(dist) = std::env::var_os("ADV_WINE_DIST").map(PathBuf::from) else {

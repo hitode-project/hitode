@@ -1,4 +1,4 @@
-//! Native bodies against Wine's own functions (WINE-NAT-2).
+//! Native bodies against Wine's own functions (NAT-BODY-1).
 //!
 //! Two machines map the distribution's ntdll.dll and bind its bodies; the
 //! reference then drops its redirects, so it runs Wine's code. The same
@@ -7,6 +7,8 @@
 //! the same bytes. `ADV_WINE_DIST` names the distribution; without it the
 //! test is skipped.
 
+#[cfg(any(target_vendor = "apple", target_os = "android"))]
+use adv_wineserver as _;
 use std::path::{Path, PathBuf};
 
 use adv_cpu::Cpu;
@@ -113,7 +115,7 @@ fn call(machine: &mut Machine<Cpu>, data: &[u8], args: [u32; 3]) -> Result<Vec<u
     Ok(words)
 }
 
-// spec: WINE-NAT-2
+// spec: NAT-BODY-1
 #[test]
 fn ntdll_memcpy_matches_wine() {
     let Some(dist) = std::env::var_os("ADV_WINE_DIST").map(PathBuf::from) else {

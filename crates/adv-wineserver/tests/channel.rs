@@ -95,7 +95,7 @@ extern "C" fn notified(owner: *mut c_void, token: usize) {
     unsafe { *owner.cast::<usize>() += token };
 }
 
-// spec: WINE-SRV-4, WINE-THR-1
+// spec: SRV-CHAN-1, WINE-THR-1
 #[test]
 fn registered_pipes_round_trip_wake_close_and_reuse() {
     // Link the facade supplying the shim's execution-owner services.

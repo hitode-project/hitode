@@ -206,7 +206,7 @@ pub fn fnv1a64(data: &[u8]) -> u64 {
 mod tests {
     use super::*;
 
-    // spec: WINE-NAT-1
+    // spec: NAT-ID-1
     #[test]
     fn tables_name_addresses_inside_functions() {
         let table =
@@ -219,7 +219,7 @@ mod tests {
         assert_eq!(table.named("second").map(|f| f.rva), Some(0x1040));
     }
 
-    // spec: WINE-NAT-1
+    // spec: NAT-ID-1
     #[test]
     fn functions_and_tables_match_only_their_build() {
         use adv_cpu::backend::{Guest, Prot};
@@ -259,7 +259,7 @@ mod tests {
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
-    // spec: WINE-NAT-1
+    // spec: NAT-ID-1
     #[test]
     fn distribution_paths_have_tables() {
         let (name, table) = table_of(Path::new("/w/lib/wine/i386-windows/NTDLL.dll")).unwrap();

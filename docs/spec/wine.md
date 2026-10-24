@@ -38,13 +38,6 @@ This spec covers the Wine userland stack. `adv-wineserver` runs Wine's server in
 **Rule**: A guest process MUST connect to the server when the server directory path is longer than `sun_path` holds.
 **Verification**: Test
 
-### WINE-SRV-4 Memory channels
-
-**Rule**: Request, reply and wait pipe bytes MUST travel through shared memory without channel read or write system calls.
-Registered descriptors MUST retain pipe read, close and readiness behavior across descriptor transfers and reuse.
-Wake delivery MUST visit only threads whose wait queues received bytes.
-**Verification**: Test
-
 ## System calls
 
 ### WINE-SYS-1 No invented success
@@ -186,23 +179,6 @@ FreeType is such a library: win32u opens it by name and draws TrueType text thro
 ### WINE-DLL-3 Prefix installation
 
 **Rule**: Host DLL installation MUST replace the prefix's system32 entry with a PE file carrying Wine's builtin signature. Installation MUST NOT modify the Wine distribution or follow an existing file symlink when writing.
-**Verification**: Test
-
-## Native bodies
-
-### WINE-NAT-1 Code identity
-
-**Rule**: A code identity table MUST describe a mapped image only when the hash of the image's headers equals the table's. A function MUST be bound to a native body only when its bytes, with base relocations masked, hash to the table's value.
-**Verification**: Test
-
-### WINE-NAT-2 Body semantics
-
-**Rule**: A native body that accepts a call MUST leave the guest state Wine's function would leave. Registers and flags the calling convention does not keep are exempt. Otherwise it MUST decline before any side effect, and the call MUST run Wine's function from its entry with the caller's frame.
-**Verification**: Test
-
-### WINE-NAT-3 Performance counter body
-
-**Rule**: The native body of `ntdll.dll!NtQueryPerformanceCounter` MUST use the system call's counter computation and machine clock. It MUST return success and write the counter and optional frequency as the system call does. A null counter or an unwritable output MUST make the body decline before any write.
 **Verification**: Test
 
 ## Graphics

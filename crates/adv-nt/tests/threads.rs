@@ -6,7 +6,7 @@ mod common;
 
 use adv_machine::RunResult;
 
-// spec: WINE-THR-1, WINE-THR-2, WINE-SRV-4
+// spec: WINE-THR-1, WINE-THR-2, SRV-CHAN-1
 #[test]
 fn threads_wait_wake_and_run_an_apc() {
     let Some((result, output)) = common::run_probe("gate2.exe", false) else {

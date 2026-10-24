@@ -184,7 +184,7 @@ fn memmove(env: &mut Env<'_>) -> Option<u64> {
     Some(u64::from(dst) << 32 | u64::from(dst))
 }
 
-// spec: WINE-NAT-3
+// spec: NAT-BODY-2
 fn query_performance_counter(env: &mut Env<'_>) -> Option<u64> {
     let (counter, frequency) = (env.arg(0), env.arg(1));
     if counter == 0
