@@ -66,10 +66,12 @@ done
 
 cd "$work/prefix"
 : >"$output/links.tsv"
-find drive_c -path drive_c/windows/system32 -prune -o -path drive_c/windows/syswow64 -prune \
+# Sessions link system32's top-level modules; wine.inf also installs subdirectories.
+find drive_c -path drive_c/windows/syswow64 -prune \
     -o -path drive_c/windows/globalization -prune -o -type d -print |
     while IFS= read -r directory; do mkdir -p "$output/$directory"; done
-find drive_c -path drive_c/windows/system32 -prune -o -path drive_c/windows/syswow64 -prune \
+find drive_c -path 'drive_c/windows/system32/*' ! -path 'drive_c/windows/system32/*/*' ! -type d -prune \
+    -o -path drive_c/windows/syswow64 -prune \
     -o -path drive_c/windows/globalization -prune -o -type f -print | sort |
     while IFS= read -r file; do
         name=$(basename "$file" | tr '[:upper:]' '[:lower:]')
