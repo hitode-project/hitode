@@ -419,6 +419,9 @@ fn set_in(
             } else {
                 read_u32(env, buffer)?
             };
+            if let Ok(host) = unix_name(env, handle) {
+                path::invalidate(&host);
+            }
             let mut request = SetFdDispInfoRequest {
                 handle,
                 flags,
@@ -499,6 +502,10 @@ fn set_in(
             } else {
                 lookup_rename(env, &units)?
             };
+            if let Ok(source) = unix_name(env, handle) {
+                path::invalidate(&source);
+            }
+            path::invalidate(&host);
             let mut request = SetFdNameInfoRequest {
                 handle,
                 rootdir,

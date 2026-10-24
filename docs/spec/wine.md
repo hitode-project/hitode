@@ -98,6 +98,12 @@ win32u creates the process's own desktop window, as Wine does when explorer cann
 DOS device paths without a host drive MUST resolve through the server's symbolic links.
 **Verification**: Test
 
+### WINE-SYS-12 Indexed path lookups
+
+**Rule**: Case-insensitive directory misses without possible hashed aliases MUST avoid listings. Indexed lookups MUST preserve case folding, alias rules, and entry precedence. Indexes MUST revalidate directory inode and nanosecond modification time, evict least recently used directories beyond 256, and invalidate directories for NT mutations.
+**Verification**: Test
+**Basis**: Wine 11.0 `find_file_in_dir` and `get_dir_case_sensitivity`.
+
 ## Unix libraries
 
 ### WINE-UNIX-1 Guest ELF libraries

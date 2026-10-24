@@ -253,6 +253,9 @@ pub fn open_path(
         ..Default::default()
     };
     let objattr = attributes.wire();
+    if options & 0x1000 != 0 {
+        path::invalidate(&host);
+    }
     let host = host.as_os_str().as_bytes();
     let (reply, _) = server::request(env, &mut request, &[&objattr, host], &mut [])?;
     status::check(reply.header.error)?;
@@ -344,6 +347,9 @@ impl Open {
             attributes
         };
         let objattr = attributes.wire();
+        if created || self.options & 0x1000 != 0 {
+            path::invalidate(&host);
+        }
         let host = host.as_os_str().as_bytes();
         let (reply, _) = server::request(env, &mut request, &[&objattr, host], &mut [])?;
         status::check(reply.header.error)?;
@@ -787,6 +793,7 @@ pub fn delete(env: &mut Env<'_>, args: &[u32]) -> Outcome {
             &mut [],
         )?;
         status::check(reply.header.error)?;
+        path::invalidate(&host);
         server::close(env, reply.handle)
     })())
 }

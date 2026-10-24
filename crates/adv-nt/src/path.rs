@@ -6,7 +6,11 @@
 //! as on Windows. NT names reject `.` and `..` components.
 //! `\??\unix` names the host's root the same way, as in Wine.
 
+mod index;
+
 use std::path::{Path, PathBuf};
+
+pub(crate) use index::invalidate;
 
 use crate::status::{self, Status};
 
@@ -138,19 +142,7 @@ fn find(directory: &Path, name: &str) -> Option<PathBuf> {
     if exact.symlink_metadata().is_ok() {
         return Some(exact);
     }
-    let wanted = name.to_lowercase();
-    std::fs::read_dir(directory)
-        .ok()?
-        .flatten()
-        .find(|entry| {
-            let text = entry.file_name();
-            let text = text.to_string_lossy();
-            text.to_lowercase() == wanted
-                || String::from_utf16_lossy(&short_name(&text.encode_utf16().collect::<Vec<_>>()))
-                    .to_lowercase()
-                    == wanted
-        })
-        .map(|entry| entry.path())
+    index::find(directory, name)
 }
 
 /// Wine's hash_short_file_name, used when a host name needs a DOS alias.
