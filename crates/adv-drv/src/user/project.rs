@@ -4,13 +4,18 @@
 //! thread as the controls' own messages, so Wine's controls keep their state.
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant};
 
 use adv_abi::{Env, Outcome};
 use adv_cpu::backend::{GuestExt, Prot};
 use adv_device::ui::{
     DialogControl, DialogEvent, DialogFont, DialogSet, DialogTarget, DialogWindow, InputView,
-    MenuBar, MenuCommand, MenuEvent, MenuItem, MenuKey, Rect, WindowView, supported,
+    MenuBar, MenuCommand, MenuEvent, MenuItem, MenuKey, PopupPresentation, Rect, WindowView,
+    supported,
 };
 use adv_machine::{CtxId, Ext};
 use adv_nt::process::{module_base, module_export};
@@ -33,6 +38,7 @@ const WM_HSCROLL: u32 = 0x114;
 const WM_VSCROLL: u32 = 0x115;
 const WM_INITMENU: u32 = 0x116;
 const WM_INITMENUPOPUP: u32 = 0x117;
+const MN_GETHMENU: u32 = 0x1e1;
 const SC_RESTORE: u32 = 0xf120;
 const BM_GETCHECK: u32 = 0xf0;
 const BM_CLICK: u32 = 0xf5;
@@ -139,9 +145,29 @@ struct Part {
 #[derive(Default)]
 struct Projection {
     parts: HashMap<CtxId, Part>,
+    popup: Option<(u32, Arc<AtomicBool>)>,
+    choice: Option<VecDeque<MenuCommand>>,
     /// Threads with a read under way, and when each last finished one.
     reading: BTreeSet<CtxId>,
     read: HashMap<CtxId, Instant>,
+}
+
+impl Drop for Projection {
+    fn drop(&mut self) {
+        if let Some((_, active)) = &self.popup {
+            active.store(false, Ordering::Release);
+        }
+    }
+}
+
+/// Retire native menu tracking when the process stops.
+pub fn stopped(ext: &mut Ext) {
+    if let Some(hwnd) = ext
+        .try_get::<Projection>()
+        .and_then(|state| state.popup.as_ref().map(|(hwnd, _)| *hwnd))
+    {
+        forget(ext, hwnd);
+    }
 }
 
 fn projection(ext: &mut Ext) -> &mut Projection {
@@ -266,12 +292,13 @@ pub fn dialogs(ext: &Ext) -> DialogSet {
     set
 }
 
-/// Whether the host shows `hwnd` as a native dialog rather than as frames.
+/// Whether the host shows `hwnd` as a native dialog or popup instead of frames.
 pub fn projected(ext: &Ext, hwnd: u32) -> bool {
-    dialogs(ext)
-        .dialogs
-        .iter()
-        .any(|dialog| dialog.target.hwnd == hwnd)
+    info(ext, hwnd).is_some_and(|info| info.is("#32768"))
+        || dialogs(ext)
+            .dialogs
+            .iter()
+            .any(|dialog| dialog.target.hwnd == hwnd)
 }
 
 fn target(dialog: u32, info: &Info) -> DialogTarget {
@@ -309,12 +336,39 @@ fn is_dialog<'a>(info: &Info, children: &impl Fn(u32) -> Vec<&'a Info>) -> bool 
             .any(|child| child.is("Button") && child.style & 0xf <= 1)
 }
 
-/// The menu bar of the presented window, or of the first visible window
-/// with one.
+/// The active popup, or the menu bar of the presented window or first visible
+/// window with one.
 pub fn menu_bar(ext: &Ext) -> MenuBar {
     let presented = input::presented_window(ext);
+    if let Some((hwnd, active)) = ext
+        .try_get::<Projection>()
+        .and_then(|state| state.popup.as_ref())
+        && let Some(popup) = info(ext, *hwnd)
+    {
+        let (x, y) = input::presented_origin(ext).unwrap_or((0, 0));
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        Arc::as_ptr(active).hash(&mut hasher);
+        return MenuBar {
+            key: MenuKey {
+                window: *hwnd,
+                menu: popup.id,
+                revision: hasher.finish(),
+                enabled: true,
+            },
+            items: popup.menu.clone(),
+            popup: Some(PopupPresentation {
+                x: popup.rect.left - x,
+                y: popup.rect.top - y,
+                flags: 0,
+                exclude: None,
+                active: active.clone(),
+            }),
+        };
+    }
     let owner = windows(ext)
-        .filter(|info| info.top_level() && info.visible() && !info.menu.is_empty())
+        .filter(|info| {
+            info.top_level() && info.visible() && !info.is("#32768") && !info.menu.is_empty()
+        })
         .min_by_key(|info| (Some(info.hwnd) != presented, info.hwnd));
     let Some(owner) = owner else {
         return MenuBar::default();
@@ -628,6 +682,45 @@ pub fn menu_event(ext: &mut Ext, event: MenuEvent) -> bool {
                 .or_else(|| find(&item.children, test))
         })
     }
+    if bar.popup.is_some() {
+        return match event {
+            // Native hosts follow a choice with cancellation for rejected choices.
+            // Accepted choices still need Wine's loop to consume their clicks.
+            MenuEvent::Cancel { .. } if projection(ext).choice.is_some() => true,
+            MenuEvent::Cancel { .. } => input::schedule(
+                ext,
+                window,
+                Box::new(|env, done| calls(env, vec![("EndMenu", vec![])], |env, _| done(env))),
+            ),
+            MenuEvent::Initialize { .. } => true,
+            MenuEvent::Command(command) => {
+                fn path(items: &[MenuItem], command: MenuCommand) -> Option<VecDeque<MenuCommand>> {
+                    for item in items {
+                        if item.flags & (3 | 0x800 | 0x4 | 0x100) != 0 {
+                            continue;
+                        }
+                        if item.command == command && item.submenu == 0 {
+                            return Some(VecDeque::from([command]));
+                        }
+                        if let Some(mut path) = path(&item.children, command) {
+                            path.push_front(item.command);
+                            return Some(path);
+                        }
+                    }
+                    None
+                }
+                let Some(path) = path(&bar.items, command) else {
+                    return false;
+                };
+                projection(ext).choice = Some(path);
+                input::schedule(
+                    ext,
+                    window,
+                    Box::new(move |env, done| click_next(env, root, done)),
+                )
+            }
+        };
+    }
     let message = match event {
         MenuEvent::Cancel { .. } => return false,
         MenuEvent::Command(command) => {
@@ -819,7 +912,28 @@ fn read(env: &mut Env<'_>, context: CtxId, done: Done) -> Outcome {
                 ..Info::default()
             });
         }
-        state(env, context, part, buffer, done)
+        let popups: Vec<usize> = part
+            .windows
+            .iter()
+            .enumerate()
+            .filter(|(_, info)| info.is("#32768") && info.visible())
+            .map(|(index, _)| index)
+            .collect();
+        let list = popups
+            .iter()
+            .map(|&index| {
+                (
+                    "SendMessageW",
+                    vec![part.windows[index].hwnd, MN_GETHMENU, 0, 0],
+                )
+            })
+            .collect();
+        calls(env, list, move |env, menus| {
+            for (index, menu) in popups.into_iter().zip(menus) {
+                part.windows[index].id = menu;
+            }
+            state(env, context, part, buffer, done)
+        })
     })
 }
 
@@ -1086,15 +1200,101 @@ fn finish(env: &mut Env<'_>, context: CtxId, part: Part, done: Done) -> Outcome 
     let projection = projection(env.ext);
     projection.reading.remove(&context);
     projection.read.insert(context, Instant::now());
+    let shown: Vec<_> = part
+        .windows
+        .iter()
+        .filter(|info| info.is("#32768") && info.visible() && info.id != 0)
+        .map(|info| (info.hwnd, info.id))
+        .collect();
+    if projection.popup.is_none()
+        && let Some(&(hwnd, _)) = shown.first()
+    {
+        projection.popup = Some((hwnd, Arc::new(AtomicBool::new(true))));
+    }
+    let next = projection
+        .choice
+        .as_ref()
+        .and_then(|path| path.front())
+        .map(|command| command.menu);
     projection.parts.insert(context, part);
+    if let Some(menu) = next
+        && shown.iter().any(|&(_, id)| id == menu)
+    {
+        return click_next(env, menu, done);
+    }
     done(env)
 }
 
 /// Forget a destroyed window.
 pub(super) fn forget(ext: &mut Ext, hwnd: u32) {
     if let Some(projection) = ext.try_get_mut::<Projection>() {
+        if projection
+            .popup
+            .as_ref()
+            .is_some_and(|(window, _)| *window == hwnd)
+        {
+            let (_, active) = projection.popup.take().unwrap();
+            active.store(false, Ordering::Release);
+            projection.choice = None;
+        }
         for part in projection.parts.values_mut() {
             part.windows.retain(|info| info.hwnd != hwnd);
         }
     }
+}
+
+/// Read a shown window before its first surface flush, including menu popups.
+pub(super) fn shown(env: &mut Env<'_>, hwnd: u32) -> Outcome {
+    let buffer = match env.sys.vm.alloc(env.cpu, 128, Prot::RW) {
+        Ok(buffer) => buffer,
+        Err(error) => return Outcome::Fail(format!("{MODULE}: {error}")),
+    };
+    calls(
+        env,
+        vec![("GetClassNameW", vec![hwnd, buffer, 64])],
+        move |env, _| {
+            let popup = wide(env, buffer, 64) == "#32768";
+            let _ = env.sys.vm.free(env.cpu, buffer);
+            if popup {
+                read(env, env.context, Box::new(|_| Outcome::Return(0)))
+            } else {
+                Outcome::Return(0)
+            }
+        },
+    )
+}
+
+/// Each submenu's show callback advances the click path only after Wine
+/// has laid it out. Hardware input goes through the owning thread's queue.
+fn click_next(env: &mut Env<'_>, menu: u32, done: Done) -> Outcome {
+    let state = projection(env.ext);
+    let Some(command) = state
+        .choice
+        .as_ref()
+        .and_then(|path| path.front())
+        .copied()
+        .filter(|command| command.menu == menu)
+    else {
+        return done(env);
+    };
+    state.choice.as_mut().unwrap().pop_front();
+    let buffer = match env.sys.vm.alloc(env.cpu, 16, Prot::RW) {
+        Ok(buffer) => buffer,
+        Err(error) => return Outcome::Fail(format!("{MODULE}: {error}")),
+    };
+    calls(
+        env,
+        vec![("GetMenuItemRect", vec![0, menu, command.position, buffer])],
+        move |env, results| {
+            let [left, top, right, bottom] = words::<4>(env, buffer);
+            let _ = env.sys.vm.free(env.cpu, buffer);
+            if results[0] == 0 {
+                return done(env);
+            }
+            match input::click(env, command.window, (left + right) / 2, (top + bottom) / 2) {
+                Ok(()) => done(env),
+                Err(error) => Outcome::Fail(error),
+            }
+        },
+    )
 }

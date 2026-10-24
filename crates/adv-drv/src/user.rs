@@ -308,5 +308,8 @@ fn position_changed(env: &mut Env<'_>) -> Outcome {
     if flags & SWP_HIDEWINDOW != 0 {
         window.visible = false;
     }
+    if flags & SWP_SHOWWINDOW != 0 {
+        return project::shown(env, hwnd);
+    }
     Outcome::Return(0)
 }

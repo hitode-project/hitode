@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use adv_runtime::wine::session::{Config, Session, Stop};
-use adv_runtime::{DialogEvent, DialogSet};
+use adv_runtime::{DialogEvent, DialogSet, Engine};
 use adv_sync::WakeEvent;
 use adv_sync::background::LocalSender;
 use adv_sync::input::KeyState;
@@ -102,7 +102,7 @@ pub(super) fn run(options: &Options, dist: &Path) -> Result<u8, String> {
         let session = start(options, dist, wake.clone(), host)?;
         let keys = Arc::new(KeyState::default());
         let started = Instant::now();
-        let (code, mut session) = drive(options, session, None, &keys, &wake)?;
+        let (code, mut session, _) = drive(options, session, None, &keys, &wake)?;
         session.capture()?;
         let frame = session.frame();
         eprintln!(
@@ -135,11 +135,8 @@ pub(super) fn run_execution(
         frames: Some((worker.take_frames(), worker.ui_wake.clone())),
     };
     let session = start(options, dist, wake.clone(), host)?;
-    let (exit_code, _) = drive(options, session, Some(worker), &keys, &wake)?;
-    Ok(Finished {
-        exit_code,
-        summary: adv_report::RunSummary::default(),
-    })
+    let (exit_code, _, summary) = drive(options, session, Some(worker), &keys, &wake)?;
+    Ok(Finished { exit_code, summary })
 }
 
 /// Headless answers to dialogs: each one's default button, pressed once its
@@ -188,6 +185,129 @@ impl AutoDialog {
     }
 }
 
+struct Metrics {
+    since: Instant,
+    first_frame_seconds: Option<f64>,
+    start_frame: u64,
+    performance: super::performance::Performance,
+    gate: control::SceneGate,
+}
+
+impl Metrics {
+    fn new() -> Self {
+        Self {
+            since: Instant::now(),
+            first_frame_seconds: None,
+            start_frame: 0,
+            performance: super::performance::Performance::default(),
+            gate: control::SceneGate::default(),
+        }
+    }
+}
+
+fn complete_gate(completion: control::GateCompletion, session: &mut Session, keys: &KeyState) {
+    let release = completion.release.map(|key| {
+        keys.set(key, false);
+        (
+            key,
+            session.input_view().top != 0 && session.input(0x101, key, 0xc000_0001).is_ok(),
+        )
+    });
+    control::acknowledge(match (completion.result, release) {
+        (Ok(message), Some((key, true))) => {
+            Ok(format!("{message} release={key} release_posted=true"))
+        }
+        (Ok(message), None) => Ok(format!("{message} release=none")),
+        (Ok(message), Some((key, false))) => Err(format!(
+            "{message} release={key} release_posted=false: no guest target window"
+        )),
+        (Err(message), release) => Err(format!(
+            "{message} release={} release_posted={}",
+            release.map_or_else(|| "none".into(), |(key, _)| key.to_string()),
+            release.is_some_and(|(_, posted)| posted)
+        )),
+    });
+}
+
+fn observe_gate(
+    session: &mut Session,
+    metrics: &mut Metrics,
+) -> Result<Option<control::GateCompletion>, String> {
+    let before = metrics.gate.check_duration();
+    if metrics
+        .gate
+        .needs_frame_pixels(session.presented_frames(), session.frame().frames)
+    {
+        let started = Instant::now();
+        session.capture()?;
+        metrics.gate.frame_capture(started.elapsed());
+    }
+    let completion = metrics.gate.observe(
+        session.presented_frames(),
+        session.frame().width,
+        &session.frame().bgra,
+        Instant::now(),
+    );
+    if let Some(budget) = &mut session.machine.sys.stats.frame_budget {
+        budget.scene_check(metrics.gate.check_duration().saturating_sub(before));
+    }
+    Ok(completion)
+}
+
+/// The shared diagnostic report fields that this stack can measure.
+fn report(options: &Options, session: &Session, metrics: &Metrics, started: Instant) -> String {
+    let frame = session.frame();
+    let sys = &session.machine.sys;
+    let mut fields = vec![
+        format!("\"exe\": {}", json(&options.exe.to_string_lossy())),
+        format!(
+            "\"backend\": {}",
+            json(if options.jit { "jit" } else { "interpreter" })
+        ),
+        "\"stop_reason\": \"running\"".into(),
+        "\"guest_exit_code\": null".into(),
+        format!(
+            "\"elapsed_seconds\": {:.6}",
+            started.elapsed().as_secs_f64()
+        ),
+        format!(
+            "\"first_frame_seconds\": {}",
+            metrics
+                .first_frame_seconds
+                .map_or_else(|| "null".into(), |seconds| format!("{seconds:.6}"))
+        ),
+        format!(
+            "\"frames\": {}",
+            session.presented_frames() - metrics.start_frame
+        ),
+        format!("\"width\": {}, \"height\": {}", frame.width, frame.height),
+        format!(
+            "\"frame_fnv1a64\": \"{:016x}\"",
+            super::checksum(&frame.bgra)
+        ),
+        format!("\"idle_waits\": {}", session.control_metrics().idle_waits),
+        format!(
+            "\"idle_wait_seconds\": {:.6}",
+            session.control_metrics().wait_time.as_secs_f64()
+        ),
+        format!("\"guest_contexts\": {}", sys.contexts.len()),
+        format!("\"host_calls\": {}", sys.host_calls),
+        format!("\"leaf_host_calls\": {}", sys.stats.leaf_calls),
+        format!("\"leaf_host_abandons\": {}", sys.stats.leaf_abandons),
+        format!("\"tls_images\": {}", sys.tls_images.len()),
+        session.machine.cpu.report_fields(),
+        format!("\"performance\": {}", metrics.performance.json()),
+        format!("\"scene_gate\": {}", metrics.gate.json()),
+    ];
+    if let Some(diagnostics) = &sys.stats.wait_diagnostics {
+        fields.push(format!("\"wait_diagnostics\": {}", diagnostics.json()));
+    }
+    if let Some(budget) = &sys.stats.frame_budget {
+        fields.push(format!("\"frame_budget\": {}", budget.json()));
+    }
+    format!("{{\n  {}\n}}\n", fields.join(",\n  "))
+}
+
 /// Run the guest and answer the host until it exits, the time limit passes
 /// or a closed window's grace ends. Returns the exit code.
 fn drive(
@@ -196,12 +316,12 @@ fn drive(
     mut worker: Option<frontend::Worker>,
     keys: &Arc<KeyState>,
     wake: &WakeEvent,
-) -> Result<(u8, Session), String> {
+) -> Result<(u8, Session, adv_report::RunSummary), String> {
     let started = Instant::now();
     let mut audio = worker
         .is_some()
         .then(|| adv_device::Output::new(session.audio_stream()));
-    let mut performance = super::performance::Performance::default();
+    let mut metrics = Metrics::new();
     let mut control = options
         .control_stdin
         .then(|| control::Control::start(wake.clone(), keys.clone()))
@@ -220,7 +340,7 @@ fn drive(
         }
         let events = worker
             .as_mut()
-            .map(|worker| worker.pump(&mut performance))
+            .map(|worker| worker.pump(&mut metrics.performance))
             .unwrap_or_default();
         for event in events {
             match event {
@@ -270,41 +390,134 @@ fn drive(
             session.refresh_ui();
         }
         if let Some(controller) = control.as_mut() {
-            for command in controller.drain() {
+            let commands = if metrics.gate.frozen() {
+                controller.drain_frozen(true)
+            } else {
+                controller.drain()
+            };
+            for command in commands {
+                if let control::Command::AwaitFrame(spec) = command {
+                    let hold = spec.hold;
+                    let result = if !options.headless {
+                        Err("await-frame requires headless execution".into())
+                    } else if hold.is_some() && session.input_view().top == 0 {
+                        Err("await-frame hold has no guest target window".into())
+                    } else {
+                        metrics
+                            .gate
+                            .arm(spec, session.presented_frames(), Instant::now())
+                    };
+                    match result {
+                        Err(error) => control::acknowledge(Err(error)),
+                        Ok(()) => {
+                            if let Some(key) = hold {
+                                keys.set(key, true);
+                                session.input(0x100, key, 1)?;
+                            }
+                        }
+                    }
+                    continue;
+                }
                 let close = matches!(command, control::Command::Close);
-                control::acknowledge(answer(&mut session, command));
+                let result = match command {
+                    control::Command::Resume => {
+                        metrics.gate.resume(Instant::now()).map(|_| "resume".into())
+                    }
+                    control::Command::Report(path) => {
+                        session.capture()?;
+                        let snapshot = report(options, &session, &metrics, started);
+                        super::write_report(&path, &snapshot, &session.machine.cpu)
+                            .map(|_| format!("report {}", path.display()))
+                    }
+                    control::Command::ResetMetrics => {
+                        session.reset_metrics();
+                        let serial = session.presented_frames();
+                        metrics.performance.reset(serial);
+                        metrics.start_frame = serial;
+                        metrics.since = Instant::now();
+                        metrics.first_frame_seconds = None;
+                        Ok(format!("reset-metrics start_frame={serial}"))
+                    }
+                    command => answer(&mut session, command),
+                };
+                control::acknowledge(result);
                 if close {
+                    metrics.gate.close(Instant::now());
                     close_at.get_or_insert_with(Instant::now);
                     if let Some(worker) = worker.as_mut() {
                         worker.hide();
                     }
                 }
             }
-            controller.after_guest_step(true);
+            controller.after_guest_step(!metrics.gate.frozen());
         }
         if let Some(delay) = auto_delay {
             auto.answer(delay, &mut session, Instant::now());
+        }
+        if let Some(completion) = observe_gate(&mut session, &mut metrics)? {
+            complete_gate(completion, &mut session, keys);
         }
         if options
             .seconds
             .is_some_and(|seconds| started.elapsed().as_secs_f64() >= seconds)
             || close_at.is_some_and(|at| at.elapsed() >= CLOSE_GRACE)
         {
+            if let Some(completion) = metrics.gate.abort(
+                "session time limit",
+                session.presented_frames(),
+                Instant::now(),
+            ) {
+                complete_gate(completion, &mut session, keys);
+            }
             break 0;
         }
-        if paused {
+        if paused || metrics.gate.frozen() {
             if let Some(audio) = audio.as_mut() {
                 audio.suspend();
             }
             if !control.as_ref().is_some_and(control::Control::has_pending) {
-                wake.wait(Some(SLICE)).map_err(|e| e.to_string())?;
+                let wait = if metrics.gate.frozen() {
+                    let limit = options.seconds.map(|seconds| {
+                        Duration::from_secs_f64(seconds).saturating_sub(started.elapsed())
+                    });
+                    let closing = close_at.map(|at| CLOSE_GRACE.saturating_sub(at.elapsed()));
+                    match (limit, closing) {
+                        (Some(a), Some(b)) => Some(a.min(b)),
+                        (a, b) => a.or(b),
+                    }
+                } else {
+                    Some(SLICE)
+                };
+                wake.wait(wait).map_err(|e| e.to_string())?;
             }
             continue;
         }
         if let Some(audio) = audio.as_mut() {
             audio.update();
         }
-        match session.run(Instant::now() + SLICE) {
+        let run_before = session.control_metrics().run_time;
+        let deadline = Instant::now()
+            + metrics
+                .gate
+                .remaining(Instant::now())
+                .unwrap_or(SLICE)
+                .min(SLICE);
+        let stop = if metrics.gate.pending() {
+            session.run_ui(deadline)
+        } else {
+            session.run(deadline)
+        };
+        let serial = session.presented_frames();
+        metrics
+            .performance
+            .step(session.control_metrics().run_time - run_before, serial);
+        if serial > metrics.start_frame && metrics.first_frame_seconds.is_none() {
+            metrics.first_frame_seconds = Some(metrics.since.elapsed().as_secs_f64());
+        }
+        if let Some(completion) = observe_gate(&mut session, &mut metrics)? {
+            complete_gate(completion, &mut session, keys);
+        }
+        match stop {
             Stop::Paused => {}
             Stop::Exited(code) => break code as u8,
             Stop::Failed(error) => return Err(error),
@@ -324,7 +537,18 @@ fn drive(
             minimized = now_minimized;
         }
     };
-    Ok((code, session))
+    if let Some(completion) = metrics.gate.abort(
+        "guest stopped before target",
+        session.presented_frames(),
+        Instant::now(),
+    ) {
+        complete_gate(completion, &mut session, keys);
+    }
+    let summary = adv_report::RunSummary {
+        perf: adv_report::Perf::from_samples(metrics.performance.frame_samples()),
+        ..adv_report::RunSummary::default()
+    };
+    Ok((code, session, summary))
 }
 
 fn position(x: i16, y: i16) -> u32 {
@@ -539,11 +763,16 @@ fn answer(session: &mut Session, command: control::Command) -> Result<String, St
             Ok("close".into())
         }
         Command::Error(error) => Err(error),
-        Command::Report(_)
-        | Command::Memory(..)
-        | Command::ResetMetrics
-        | Command::AwaitFrame(_)
-        | Command::Resume => Err(format!("{command:?} is not available on the Wine stack")),
+        Command::Memory(address, len) => session.inspect_memory(address, len).map(|bytes| {
+            let hex = bytes
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            format!("memory {address:#010x} {hex}")
+        }),
+        Command::Report(_) | Command::ResetMetrics | Command::AwaitFrame(_) | Command::Resume => {
+            unreachable!("run-loop command")
+        }
     }
 }
 
@@ -551,4 +780,181 @@ fn usable(set: &DialogSet) -> impl Iterator<Item = &adv_runtime::DialogWindow> {
     set.dialogs
         .iter()
         .filter(|dialog| dialog.visible && dialog.enabled)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::{Command, Stdio};
+
+    // spec: WINE-UI-1, WINE-UI-2, WINE-UI-3, WINE-UI-4, WINE-UI-5
+    #[test]
+    #[ignore = "subprocess entry for the headless control test"]
+    fn headless_control_child() {
+        let root = std::env::current_dir().unwrap();
+        let dist = std::env::var_os("ADV_WINE_DIST").unwrap();
+        let mut options = Options::new(root.join("popup_menu.exe"), root.join("data"));
+        options.wine_prefix = Some(root.join("prefix"));
+        options.headless = true;
+        options.control_stdin = true;
+        options.codepage = Some(1252);
+        options.seconds = Some(60.);
+        assert_eq!(run(&options, Path::new(&dist)).unwrap(), 0);
+    }
+
+    // spec: WINE-UI-1, WINE-UI-2, WINE-UI-3, WINE-UI-4, WINE-UI-5
+    #[test]
+    fn headless_wine_control() {
+        let (Some(_dist), Some(probes)) = (
+            std::env::var_os("ADV_WINE_DIST"),
+            std::env::var_os("ADV_WINE_PROBES"),
+        ) else {
+            eprintln!("skipped: ADV_WINE_DIST or ADV_WINE_PROBES is not set");
+            return;
+        };
+        let root = std::env::temp_dir().join(format!("adv-wine-control-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::copy(
+            Path::new(&probes).join("popup_menu.exe"),
+            root.join("popup_menu.exe"),
+        )
+        .unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "wine::tests::headless_control_child",
+                "--nocapture",
+            ])
+            .current_dir(&root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+        let mut input = child.stdin.take().unwrap();
+        let output = child.stdout.take().unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            for line in BufReader::new(output).lines() {
+                send.send(line.unwrap()).unwrap();
+            }
+        });
+        let mut transcript = String::new();
+        let mut next = || {
+            let line = receive
+                .recv_timeout(Duration::from_secs(90))
+                .expect("headless control output");
+            transcript.push_str(&line);
+            transcript.push('\n');
+            line
+        };
+        let address = loop {
+            let line = next();
+            if let Some(address) = line.strip_prefix("memory=") {
+                break address.to_owned();
+            }
+        };
+        {
+            let mut command = |text: &str| {
+                writeln!(input, "{text}").unwrap();
+                input.flush().unwrap();
+                loop {
+                    let line = next();
+                    if line.starts_with("control ") {
+                        break line;
+                    }
+                }
+            };
+            loop {
+                let menus = command("menus");
+                if menus.contains("42:0:/More/Nested choice") {
+                    assert!(menus.contains("enabled=true"), "{menus}");
+                    break;
+                }
+            }
+            assert_eq!(
+                command(&format!("memory 0x{address} 4")),
+                format!("control ok memory 0x{} 19283746", address.to_lowercase())
+            );
+            assert!(command("memory 0 4").starts_with("control error "));
+            let report_path = root.join("before.json");
+            assert!(
+                command(&format!("report {}", report_path.display()))
+                    .starts_with("control ok report ")
+            );
+            let report = std::fs::read_to_string(&report_path).unwrap();
+            let hash = report
+                .split_once("\"frame_fnv1a64\": \"")
+                .unwrap()
+                .1
+                .split('"')
+                .next()
+                .unwrap();
+            let latched = command(&format!("await-frame {hash} 2000 current"));
+            assert!(
+                latched.starts_with("control ok await-frame hash="),
+                "{latched}"
+            );
+            assert!(latched.contains("frozen=true"), "{latched}");
+            let frozen_path = root.join("frozen.json");
+            command(&format!("report {}", frozen_path.display()));
+            let frozen = std::fs::read_to_string(&frozen_path).unwrap();
+            assert!(frozen.contains("\"frozen\":true"));
+            assert_eq!(
+                report.split_once("\"frames\": ").unwrap().1.lines().next(),
+                frozen.split_once("\"frames\": ").unwrap().1.lines().next()
+            );
+            assert!(command("reset-metrics").starts_with("control ok reset-metrics start_frame="));
+            let reset_path = root.join("reset.json");
+            command(&format!("report {}", reset_path.display()));
+            let reset = std::fs::read_to_string(&reset_path).unwrap();
+            assert!(reset.contains("\"frames\": 0,"), "{reset}");
+            assert!(reset.contains("\"idle_waits\": 0,"), "{reset}");
+            assert!(
+                reset.contains("\"idle_wait_seconds\": 0.000000,"),
+                "{reset}"
+            );
+            assert!(reset.contains("\"first_frame_seconds\": null,"), "{reset}");
+            assert!(reset.contains("\"frame_observations\": 0"), "{reset}");
+            for unavailable in [
+                "api",
+                "codec",
+                "codec_kernels",
+                "time_skip",
+                "graphics_memory",
+            ] {
+                assert!(
+                    !reset.contains(&format!("\"{unavailable}\":")),
+                    "{unavailable}"
+                );
+            }
+            assert_eq!(command("resume"), "control ok resume");
+            assert_eq!(command("menu 42"), "control ok menu 42");
+        }
+        loop {
+            if next().starts_with("picked=42 ") {
+                break;
+            }
+        }
+        writeln!(input, "key 27").unwrap();
+        input.flush().unwrap();
+        drop(input);
+        reader.join().unwrap();
+        while let Ok(line) = receive.try_recv() {
+            transcript.push_str(&line);
+            transcript.push('\n');
+        }
+        assert!(child.wait().unwrap().success(), "{transcript}");
+        assert!(
+            transcript.contains("picked=42 initialized=2 commands=0 syscommands=0"),
+            "{transcript}"
+        );
+        assert!(
+            transcript.contains("cancelled=0 initialized=0 commands=0 syscommands=0"),
+            "{transcript}"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

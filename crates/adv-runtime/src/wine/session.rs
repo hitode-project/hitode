@@ -15,7 +15,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use adv_abi::Registry;
-use adv_cpu::Cpu;
+use adv_cpu::{Cpu, backend::Guest};
 use adv_device::surface::SurfaceStore;
 use adv_machine::{HostFn, Machine, RunResult, SliceResult, layout::PARK_ADDR};
 use adv_nt::server::{Progress, Time};
@@ -58,10 +58,19 @@ pub enum Stop {
     Failed(String),
 }
 
+/// Host observations of the session's execution and idle waits.
+#[derive(Default)]
+pub struct ControlMetrics {
+    pub idle_waits: u64,
+    pub wait_time: Duration,
+    pub run_time: Duration,
+}
+
 pub struct Session {
     pub machine: Machine<Cpu>,
     wake: WakeEvent,
     audio: adv_device::AudioControl,
+    metrics: ControlMetrics,
 }
 
 /// Wine's Unix side, then the graphics fronts and the user driver.
@@ -262,17 +271,31 @@ fn run(
     wake: &WakeEvent,
     until: Instant,
     serve: fn(&mut Machine<Cpu>) -> Result<bool, String>,
+    frame: Option<u64>,
+    mut metrics: Option<&mut ControlMetrics>,
 ) -> Stop {
+    // Whether a frame was presented since `frame`, when stopping at one.
+    let presented = |machine: &Machine<Cpu>| {
+        frame.is_some_and(|serial| machine.ext.get::<SurfaceStore>().stats.presentations != serial)
+    };
     loop {
         // Before draining host work, so a wake that comes during the
         // slice interrupts the next one.
         wake.take_interrupt();
         let now = Instant::now();
-        if now >= until {
+        if now >= until || presented(machine) {
             return Stop::Paused;
         }
-        let result = match machine.run_slice(Duration::from_millis(10)) {
+        let step = Instant::now();
+        let result = machine.run_slice(Duration::from_millis(10));
+        if let Some(metrics) = metrics.as_deref_mut() {
+            metrics.run_time += step.elapsed();
+        }
+        let result = match result {
             SliceResult::Yielded => {
+                if presented(machine) {
+                    return Stop::Paused;
+                }
                 if let Err(error) = serve(machine) {
                     return Stop::Failed(error);
                 }
@@ -284,19 +307,33 @@ fn run(
             RunResult::HostRequest => continue,
             RunResult::Exited(code) => return Stop::Exited(code),
             RunResult::Failed(error) => return Stop::Failed(format!("{error:?}")),
-            RunResult::Idle { next_deadline } => next_deadline,
+            RunResult::Idle { next_deadline } => {
+                if presented(machine) {
+                    return Stop::Paused;
+                }
+                next_deadline
+            }
         };
         match serve(machine) {
             Ok(true) => continue,
             Ok(false) => {}
             Err(error) => return Stop::Failed(error),
         }
+        if presented(machine) {
+            return Stop::Paused;
+        }
         let mut wait = until.saturating_duration_since(now);
         if let Some(deadline) = deadline {
             let us = deadline.saturating_sub(machine.sys.clock.now_us());
             wait = wait.min(Duration::from_micros(us));
         }
-        if let Err(error) = wake.wait(Some(wait)) {
+        let started = Instant::now();
+        let result = wake.wait(Some(wait));
+        if let Some(metrics) = metrics.as_deref_mut() {
+            metrics.idle_waits += 1;
+            metrics.wait_time += started.elapsed();
+        }
+        if let Err(error) = result {
             return Stop::Failed(error.to_string());
         }
     }
@@ -388,7 +425,14 @@ impl Session {
             Box::new(shared.clone()),
         )
         .map_err(|e| format!("wineboot: {e}"))?;
-        match run(&mut boot, &wake, Instant::now() + BOOT, |_| Ok(false)) {
+        match run(
+            &mut boot,
+            &wake,
+            Instant::now() + BOOT,
+            |_| Ok(false),
+            None,
+            None,
+        ) {
             Stop::Exited(0) => {}
             stop => return Err(format!("wineboot: {stop:?}")),
         }
@@ -423,12 +467,68 @@ impl Session {
             machine,
             wake,
             audio,
+            metrics: ControlMetrics::default(),
         })
     }
 
     /// Run the guest until it exits or `until` passes; see [`run`].
     pub fn run(&mut self, until: Instant) -> Stop {
-        run(&mut self.machine, &self.wake, until, serve)
+        let stop = run(
+            &mut self.machine,
+            &self.wake,
+            until,
+            serve,
+            None,
+            Some(&mut self.metrics),
+        );
+        if !matches!(stop, Stop::Paused) {
+            project::stopped(&mut self.machine.ext);
+        }
+        stop
+    }
+
+    /// Run up to one presentation, so control frame gates observe every frame.
+    pub fn run_ui(&mut self, until: Instant) -> Stop {
+        let frame = self.presented_frames();
+        let stop = run(
+            &mut self.machine,
+            &self.wake,
+            until,
+            serve,
+            Some(frame),
+            Some(&mut self.metrics),
+        );
+        if !matches!(stop, Stop::Paused) {
+            project::stopped(&mut self.machine.ext);
+        }
+        stop
+    }
+
+    pub fn control_metrics(&self) -> &ControlMetrics {
+        &self.metrics
+    }
+
+    /// Read the presented process's guest address space.
+    pub fn inspect_memory(&self, address: u32, len: u32) -> Result<Vec<u8>, String> {
+        let mut bytes = vec![0; len as usize];
+        self.machine
+            .cpu
+            .read(address, &mut bytes)
+            .map_err(|error| error.to_string())?;
+        Ok(bytes)
+    }
+
+    /// Reset the wait and frame statistics supported by this stack.
+    pub fn reset_metrics(&mut self) {
+        self.metrics = ControlMetrics::default();
+        if let Some(diagnostics) = &mut self.machine.sys.stats.wait_diagnostics {
+            diagnostics.reset();
+        }
+        let total = self.machine.sys.stats.total;
+        if let Some(budget) = &mut self.machine.sys.stats.frame_budget {
+            use crate::Engine;
+            budget.reset(total, self.machine.cpu.frame_counters());
+        }
     }
 
     /// Post host input in coordinates of the last presented frame and wake
