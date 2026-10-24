@@ -26,7 +26,9 @@
 //! and its next translation checks each access of the instruction against
 //! the page class table, a snapshot of `Memory::native_permissions` the
 //! runtime points at. Accesses the window cannot take call `access`, which
-//! performs them through `Memory` without leaving translated code. A stale
+//! performs them through `Memory` without leaving translated code. Raw permission
+//! snapshots are pinned only while generated accesses can run, released across
+//! host traps and refreshed before a continuing chain resumes. A stale
 //! table is harmless: the direct form is still a site, and `access`
 //! refuses anything the interpreter would not do.
 //!
@@ -439,11 +441,17 @@ unsafe extern "C" fn interpret(runtime: *mut Runtime, index: u32, countdown: u64
             // SAFETY: the executor's bridge outlives the run and nothing
             // else uses it while translated code runs.
             let bridge = unsafe { &mut *owner.bridge.cast::<Bridge<'_>>() };
+            // Generated accesses are paused. Let host mapping changes update
+            // the raw permissions in place instead of copying the whole table.
+            let classified = native.alias_snapshot.take().is_some();
             let status = call_trap(bridge, cpu, u32::from(vector));
             let same = memory.epoch == epoch && memory.dirty_pages.len() == dirty;
             // A slow host call must not leave the unit running past the
             // deadline; the owner reports it at the next instruction.
             let status = if status == 0 && same && cpu.eip == helper.next && !native.past() {
+                if classified {
+                    native.classify(memory);
+                }
                 0
             } else {
                 LEAVE
@@ -782,6 +790,7 @@ impl Native {
         }
         self.runtime.cpu = std::ptr::null_mut();
         self.runtime.owner = 0;
+        self.alias_snapshot = None;
         if let Some(error) = owner.error {
             return Err(error);
         }
@@ -1340,6 +1349,82 @@ mod tests {
         assert_eq!(base % (1 << 32), 0);
         assert!(base >= adv_cpu_core::virtual_memory::WINDOW_GUARD);
         assert_eq!(native.runtime.window, base as u64);
+    }
+
+    // spec: A64-MEM-8, A64-CTL-8
+    #[test]
+    fn raw_permissions_are_pinned_only_while_generated_accesses_can_run() {
+        use adv_cpu_core::memory::{EXEC, READ, WRITE};
+        use adv_cpu_core::trap::ExecutionTrap;
+
+        struct Mapping(bool);
+        impl ExecutionTrap for Mapping {
+            fn call(
+                &mut self,
+                _: &mut CpuState,
+                memory: &mut Memory,
+                vector: u32,
+            ) -> Result<bool, String> {
+                assert_eq!(vector, 0x2e);
+                assert_eq!(Arc::strong_count(&memory.perms), 1);
+                if self.0 {
+                    let before = Arc::as_ptr(&memory.perms);
+                    memory.protect(0x8000, 0x1000, READ)?;
+                    assert_eq!(Arc::as_ptr(&memory.perms), before);
+                }
+                Ok(false)
+            }
+        }
+
+        for change_mapping in [false, true] {
+            let (mut memory, mut native) = native();
+            memory.map(0x1000, 0x1000, READ | WRITE | EXEC).unwrap();
+            memory.map(0x8000, 0x1000, READ | WRITE).unwrap();
+            memory.write(0x8000, &42u32.to_le_bytes()).unwrap();
+            // mov eax, 7; int 0x2e; mov eax, [ecx]
+            let code = [0xb8, 7, 0, 0, 0, 0xcd, 0x2e, 0x8b, 0x01];
+            memory.write(0x1000, &code).unwrap();
+            let stop = 0x1000 + code.len() as u32;
+            native.first_visits = false;
+            native.checks = Checks::All;
+            let mut cpu = cpu(0x1000, 0, 0x8000);
+            let mut mapping = Mapping(change_mapping);
+            let mut bridge = Bridge {
+                timestamp: Default::default(),
+                memory: &mut memory,
+                error: None,
+                trap: None,
+                calls: 0,
+                handler: Some(&mut mapping),
+                parked: false,
+                deadline: None,
+                clock_due: true,
+                unclocked_bytes: 0,
+                bulk_calls: 0,
+                bulk_bytes: 0,
+                cliffs: Default::default(),
+                scratch: Default::default(),
+            };
+            let bridge_ptr = (&raw mut bridge).cast();
+            let run = native
+                .run(&mut cpu, &mut memory, stop, 100, bridge_ptr)
+                .unwrap()
+                .unwrap();
+            assert!(bridge.error.is_none(), "{:?}", bridge.error);
+            assert_eq!(bridge.calls, 1);
+            assert_eq!(Arc::strong_count(&memory.perms), 1);
+            if change_mapping {
+                assert_eq!((cpu.eip, cpu.regs[0]), (0x1007, 7));
+                assert_eq!(run.exit, Exit::Dispatch);
+                native
+                    .run(&mut cpu, &mut memory, stop, 100, bridge_ptr)
+                    .unwrap();
+            }
+            assert_eq!((cpu.eip, cpu.regs[0]), (stop, 42));
+            let before = Arc::as_ptr(&memory.perms);
+            memory.unmap(0x8000, 0x1000).unwrap();
+            assert_eq!(Arc::as_ptr(&memory.perms), before);
+        }
     }
 
     #[test]
