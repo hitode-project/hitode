@@ -32,6 +32,32 @@ FFMPEG_DIR=<ffmpeg> LIBCLANG_PATH=<libclang dir> \
 
 A dynamic media build needs the FFmpeg libraries next to the runner or on the library search path. Without `media`, video sources fail with `VFW_E_UNSUPPORTED_STREAM` and the report records the gap. `adv-run --help` lists the options.
 
+## Wine media distribution
+
+Wine 11.0's Windows media modules run unchanged. The host implements the Unix
+interfaces of winegstreamer and winedmo through FFmpeg; GStreamer and Wine's
+FFmpeg Unix modules are not needed. Build the host runner with `gpu,media`.
+
+On an i386-capable Linux builder with MinGW and i386 FreeType development files,
+run `tools/wine/build-media.sh SOURCE BUILD DIST STRIPPED_DIST`. It records the
+scalar SSE flags, disabled configure dependencies, the PE-only media target,
+installation and debug stripping. An existing build only installs the extra DLL;
+compare checksums of the other installed binaries before and after. `DIST` holds
+`usr/local`; the stripped runtime contains its `lib` and `share` directories.
+
+Run `tools/wine/prefix-template.sh DIST/usr/local OUTPUT` on that builder, then
+install `OUTPUT` at `share/hitode/prefix` in both distributions. The script runs
+Wine's registration entry point for the media COM classes and filter mapper.
+
+The media probes are `crates/adv-runtime/tests/probe/media_*.c`; their headers give
+the compiler commands. Put their executables in `ADV_WINE_PROBES` and set
+`ADV_WINE_DIST` to the installation root. Run
+`cargo test --release -p adv-runtime --features gpu,media --test wine_media`.
+Synthetic fixtures and their FFmpeg generation script live in
+`crates/adv-runtime/tests/fixtures/media`; each committed clip is below 64 KiB.
+Apple static FFmpeg builds enable VideoToolbox and its H.264, HEVC, MPEG-2 and
+MPEG-4 accelerators. Android uses software decoding.
+
 ## Tests
 
 ```sh

@@ -319,3 +319,5 @@ mod tests {
         ));
     }
 }
+
+pub mod wine;

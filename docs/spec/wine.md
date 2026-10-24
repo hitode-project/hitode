@@ -282,6 +282,43 @@ FreeType is such a library: win32u opens it by name and draws TrueType text thro
 **Rule**: A session MUST own its audio control and expose its mixed PCM stream. Windowed shells MUST open host audio output. Headless shells MUST NOT open host audio output.
 **Verification**: Test
 
+## Media
+
+### WINE-MEDIA-1 Host media seam
+
+**Rule**: Wine's unchanged PE media modules MUST use host tables implementing Wine 11's winegstreamer and winedmo Unix interfaces over `adv-device::media`. Muxer creation MUST fail when no encoder exists.
+**Verification**: Test
+
+### WINE-MEDIA-2 Decoder waits
+
+**Rule**: Media input and sample waits MUST block guest contexts through machine objects. Host decoder notifications MUST wake the session without execution-thread blocking or timer polling.
+**Verification**: Test
+
+### WINE-MEDIA-3 Demand-driven decoding
+
+**Rule**: Decoding MUST run on host workers with at most a few decoded frames queued per stream. Disabled, paused and unread streams MUST NOT drive decoding.
+**Verification**: Test
+
+### WINE-MEDIA-4 Hardware decoding
+
+**Rule**: Apple hosts MUST use VideoToolbox for supported streams and fall back to software per stream. Apple FFmpeg profiles MUST include the matching hardware accelerators. Android MAY decode in software.
+**Verification**: Review — hardware availability and fallback require platform runs.
+
+### WINE-MEDIA-5 Guest frame writes
+
+**Rule**: Each delivered frame MUST be written once into guest memory. Conversion and scaling MUST write directly into the requested guest buffer at its negotiated format and stride.
+**Verification**: Review — memory ownership and conversion destinations require source inspection.
+
+### WINE-MEDIA-6 Native pixel negotiation
+
+**Rule**: Parser negotiation MUST report native YUV before RGB wherever Wine lets the consumer choose. Guest code MUST NOT perform per-pixel conversion.
+**Verification**: Test
+
+### WINE-MEDIA-7 Reproducible media distribution
+
+**Rule**: The Wine recipe MUST build winegstreamer's PE module with the distribution's flags, install it, strip debug information, and register its classes. Adding the module MUST NOT change other distribution binaries.
+**Verification**: Review — distribution checksums and prefix regeneration are packaging checks.
+
 ## Sessions
 
 ### WINE-SES-1 Shared prefix

@@ -55,11 +55,15 @@ def configure(profile: dict, prefix: Path, mobile: str | None = None) -> list[st
     else:
         target = [f"--extra-cflags=-mmacosx-version-min={profile['minimum_macos']}",
                   f"--extra-ldflags=-mmacosx-version-min={profile['minimum_macos']}"]
+    media = ['--enable-demuxer=mov', '--enable-decoder=aac', '--enable-parser=aac']
+    if mobile != 'android':
+        media += ['--enable-videotoolbox',
+                  '--enable-hwaccel=h264_videotoolbox,hevc_videotoolbox,mpeg2_videotoolbox,mpeg4_videotoolbox']
     return [f'--prefix={prefix}', '--enable-static', '--disable-shared', '--enable-pic',
             '--disable-everything', '--disable-autodetect', '--disable-programs', '--disable-doc',
             '--disable-network', '--disable-debug', '--enable-small', '--disable-avdevice',
             '--disable-avfilter', '--disable-encoders', '--disable-muxers',
-            '--disable-gpl', '--disable-nonfree', '--disable-version3', *target,
+            '--disable-gpl', '--disable-nonfree', '--disable-version3', *target, *media,
             '--enable-demuxer=' + ','.join(profile['demuxers']),
             '--enable-decoder=' + ','.join(profile['decoders']),
             '--enable-parser=' + ','.join(profile['parsers'])]

@@ -238,6 +238,7 @@ fn new_machine(
     machine.set_execution_budget(None);
     adv_unix::install(&mut machine);
     machine.ext.insert(audio.clone());
+    adv_drv::media::set_wake(&mut machine.ext, wake.clone());
     super::install(&mut machine, prefix, config.width, config.height)?;
     Ok(machine)
 }
@@ -346,12 +347,13 @@ fn serve(machine: &mut Machine<Cpu>) -> Result<bool, String> {
         .ext
         .get::<adv_device::AudioControl>()
         .sync_clock(now);
+    let media = adv_drv::media::pump(machine)?;
     #[cfg(feature = "gpu")]
-    return adv_dx::d3d9::pump(machine);
+    return adv_dx::d3d9::pump(machine).map(|gpu| gpu || media);
     #[cfg(not(feature = "gpu"))]
     {
         let _ = machine;
-        Ok(false)
+        Ok(media)
     }
 }
 
