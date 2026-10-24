@@ -104,6 +104,7 @@ impl adv_machine::Resolver for Resolver {
     fn host_fn(&self, module: &str, name: &str) -> Option<HostFn> {
         adv_unix::Platform
             .host_fn(module, name)
+            .or_else(|| adv_drv::codec::host_fn(module, name))
             .or_else(|| self.0.get(module, name))
     }
     fn provides(&self, module: &str) -> bool {
@@ -380,6 +381,7 @@ fn new_machine(
     // the built-in stack; the backend's default watchdog is for tests.
     machine.set_execution_budget(None);
     adv_unix::install(&mut machine);
+    Session::install_codec_kernels(&mut machine, crate::codec_kernels::Mode::Native);
     machine.ext.insert(audio.clone());
     adv_drv::media::set_wake(&mut machine.ext, wake.clone());
     super::install(&mut machine, prefix, config.width, config.height)?;
@@ -520,6 +522,17 @@ fn serve(machine: &mut Machine<Cpu>) -> Result<bool, String> {
 }
 
 impl Session {
+    /// Select the shell's codec mode in `prepare`, before images are mapped.
+    pub fn install_codec_kernels(machine: &mut Machine<Cpu>, mode: crate::codec_kernels::Mode) {
+        use crate::codec_kernels::Mode;
+        let mode = match mode {
+            Mode::Guest => adv_drv::codec::Mode::Guest,
+            Mode::Verify => adv_drv::codec::Mode::Verify,
+            Mode::Native => adv_drv::codec::Mode::Native,
+        };
+        adv_drv::codec::install(&mut machine.ext, mode);
+    }
+
     /// Start `config.exe` on real time; `prepare` sets up the machine before
     /// the process starts, after the graphics fronts are installed.
     pub fn start(
@@ -955,6 +968,7 @@ impl Session {
                 &self.wake,
                 &self.audio,
             )?;
+            adv_drv::codec::install(&mut machine.ext, adv_drv::codec::mode(&self.machine.ext));
             machine.inherit_policy(&self.machine);
             machine
                 .cpu

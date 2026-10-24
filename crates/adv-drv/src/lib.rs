@@ -17,6 +17,7 @@ use adv_machine::Machine;
 use adv_machine::layout::PAGE;
 
 pub mod audio;
+pub mod codec;
 pub mod media;
 pub mod user;
 

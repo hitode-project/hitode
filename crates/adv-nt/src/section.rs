@@ -18,6 +18,13 @@ use crate::server;
 use crate::status::{self, Error, Status};
 use crate::unixlib;
 
+/// Assembly-supplied binding for mapped images and their retirement.
+#[derive(Clone, Copy)]
+pub struct ImageBinding {
+    pub mapped: fn(&mut Env<'_>, u32, &Pe),
+    pub unmapped: fn(&mut Env<'_>, u32),
+}
+
 const SEC_IMAGE: u32 = 0x100_0000;
 const SECTION_QUERY: u32 = 0x0001;
 const SECTION_MAP_WRITE: u32 = 0x0002;
@@ -490,6 +497,9 @@ pub fn unmap_view(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         status::check(reply.header.error)?;
         let memory = env.ext.get_or_default::<Memory>();
         memory::remove_view(env.cpu, &mut env.sys.vm, memory, base);
+        if let Some(binding) = env.ext.try_get::<ImageBinding>().copied() {
+            (binding.unmapped)(env, base);
+        }
         unixlib::forget_image(env, base);
         crate::identity::forget_image(env.ext, base);
         Ok(())
@@ -591,6 +601,9 @@ pub fn map_image(env: &mut Env<'_>, mapping: u32) -> Result<View, Error> {
     let headers = &file[..(pe.size_of_headers as usize).min(file.len())];
     crate::identity::note_image(env.ext, base, size, path.as_deref(), headers);
     crate::native::bind(env.cpu, env.sys, env.ext, base, &pe);
+    if let Some(binding) = env.ext.try_get::<ImageBinding>().copied() {
+        (binding.mapped)(env, base, &pe);
+    }
     unixlib::note_image(env, base, path);
     Ok(View {
         base,
