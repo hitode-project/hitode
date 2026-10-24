@@ -1993,6 +1993,18 @@ fn debug_event(env: &mut Env<'_>, args: [u32; 4], wait: bool) -> Outcome {
         Err(status::Error::Status(0x8000_000d)) => debug_event(env, args, true),
         Err(status::Error::Status(status::PENDING)) if !wait => Outcome::Return(0x102),
         Err(status::Error::Status(status::PENDING)) => {
+            let then: Then = Box::new(move |env, ended| match ended {
+                Ended::Status(0) => debug_event(env, args, false),
+                Ended::Status(code) => Outcome::Return(code),
+                Ended::Apc { func, args } => run_apc(env, None, func, args, USER_APC),
+            });
+            // As NtWaitForSingleObject: a debug object's sync is in-process
+            // when the device exists, and the server cannot queue on it.
+            let then = match prepare_inproc_wait(env, &[args[0]], true, args[1], args[2], None) {
+                Ok(wait) => return run_inproc_wait(env, wait, then),
+                Err(status::Error::Status(status::NOT_IMPLEMENTED)) => then,
+                Err(error) => return status::finish(Err(error)),
+            };
             let timeout = match read_timeout(env, args[2]) {
                 Ok(timeout) => timeout,
                 Err(error) => return Outcome::Return(error),
@@ -2008,15 +2020,7 @@ fn debug_event(env: &mut Env<'_>, args: [u32; 4], wait: bool) -> Outcome {
                     0
                 };
             let select = new_select(env, op, flags, timeout);
-            run_select(
-                env,
-                select,
-                Box::new(move |env, ended| match ended {
-                    Ended::Status(0) => debug_event(env, args, false),
-                    Ended::Status(code) => Outcome::Return(code),
-                    Ended::Apc { func, args } => run_apc(env, None, func, args, USER_APC),
-                }),
-            )
+            run_select(env, select, then)
         }
         result => status::finish(result),
     }
