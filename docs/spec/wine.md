@@ -38,6 +38,13 @@ This spec covers the Wine userland stack. `adv-wineserver` runs Wine's server in
 **Rule**: A guest process MUST connect to the server when the server directory path is longer than `sun_path` holds.
 **Verification**: Test
 
+### WINE-SRV-4 Memory channels
+
+**Rule**: Request, reply and wait pipe bytes MUST travel through shared memory without channel read or write system calls.
+Registered descriptors MUST retain pipe read, close and readiness behavior across descriptor transfers and reuse.
+Wake delivery MUST visit only threads whose wait queues received bytes.
+**Verification**: Test
+
 ## System calls
 
 ### WINE-SYS-1 No invented success

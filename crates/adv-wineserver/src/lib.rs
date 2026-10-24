@@ -8,7 +8,10 @@
 //!
 //! The server keeps its state in C globals, so one server runs per host
 //! process. It listens on Wine's usual master socket, which clients find
-//! through [`Server::socket_dir`].
+//! through [`Server::socket_dir`]. The shim keeps request, reply and wait
+//! bytes in shared memory, retaining the pipes as descriptor identities.
+//! Its close and SCM_RIGHTS wrappers keep each duplicate attached to its queue;
+//! clients use the same wrappers, serialized with the server by the execution owner.
 //!
 //! Apple and Android targets build the server; elsewhere the crate is empty.
 #![cfg(any(target_vendor = "apple", target_os = "android"))]

@@ -6,7 +6,8 @@
 //! as its clients, so the client never blocks on a descriptor: when it needs
 //! the server to act, it asks the runtime for [`Progress`] and tries again.
 
-use std::collections::HashMap;
+use std::cell::UnsafeCell;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::mem::{size_of, zeroed};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -24,6 +25,55 @@ use crate::protocol::{
     AllocFileHandleRequest, CloseHandleRequest, FIXED_SIZE, GetHandleFdRequest,
     InitFirstThreadRequest, InitThreadRequest, PROTOCOL_VERSION, Request,
 };
+
+// The shim owns the table shared by all processes on this execution owner.
+#[cfg(any(target_vendor = "apple", target_os = "android"))]
+mod pipes {
+    unsafe extern "C" {
+        #[link_name = "hitode_pipe"]
+        pub fn pipe(fds: *mut libc::c_int) -> libc::c_int;
+        #[link_name = "hitode_read"]
+        pub fn read(fd: libc::c_int, buf: *mut libc::c_void, size: usize) -> isize;
+        #[link_name = "hitode_write"]
+        pub fn write(fd: libc::c_int, buf: *const libc::c_void, size: usize) -> isize;
+        #[link_name = "hitode_sendmsg"]
+        pub fn sendmsg(fd: libc::c_int, msg: *const libc::msghdr, flags: libc::c_int) -> isize;
+        #[link_name = "hitode_recvmsg"]
+        pub fn recvmsg(fd: libc::c_int, msg: *mut libc::msghdr, flags: libc::c_int) -> isize;
+        pub fn hitode_channel_forget(fd: libc::c_int);
+        pub fn hitode_channel_watch(
+            fd: libc::c_int,
+            notify: extern "C" fn(*mut libc::c_void, usize),
+            owner: *mut libc::c_void,
+            token: usize,
+        );
+    }
+}
+#[cfg(not(any(target_vendor = "apple", target_os = "android")))]
+mod pipes {
+    pub use libc::{pipe, read, recvmsg, sendmsg, write};
+    pub unsafe fn hitode_channel_forget(_: libc::c_int) {}
+}
+
+struct PipeFd(OwnedFd);
+impl AsRawFd for PipeFd {
+    fn as_raw_fd(&self) -> RawFd {
+        self.0.as_raw_fd()
+    }
+}
+impl Drop for PipeFd {
+    fn drop(&mut self) {
+        // SAFETY: OwnedFd closes this descriptor immediately after unregistering it.
+        unsafe { pipes::hitode_channel_forget(self.as_raw_fd()) };
+    }
+}
+
+#[cfg(any(target_vendor = "apple", target_os = "android"))]
+extern "C" fn channel_ready(owner: *mut libc::c_void, context: usize) {
+    // SAFETY: the box stays live until all watched read ends close. Server steps
+    // and delivery run serially on the execution owner.
+    unsafe { &mut *(*owner.cast::<UnsafeCell<HashSet<CtxId>>>()).get() }.insert(context as CtxId);
+}
 
 /// i386, the machine of Hitode's prefixes.
 pub const MACHINE_I386: u16 = 0x014c;
@@ -83,6 +133,7 @@ pub struct Link {
     /// fd cache keeps them: until the handle is closed.
     fds: HashMap<u32, Cached>,
     threads: HashMap<CtxId, Thread>,
+    ready: Box<UnsafeCell<HashSet<CtxId>>>,
     /// Requests sent, by number; see [`crate::counters`].
     pub(crate) requests: HashMap<i32, Tally>,
 }
@@ -134,6 +185,7 @@ impl Link {
             time,
             fds: HashMap::new(),
             threads: HashMap::new(),
+            ready: Box::new(UnsafeCell::new(HashSet::new())),
             requests: HashMap::new(),
         };
         link.add_thread(main, tid, connection.channel, sys);
@@ -145,6 +197,16 @@ impl Link {
             manual_reset: false,
             signaled: false,
         });
+        #[cfg(any(target_vendor = "apple", target_os = "android"))]
+        // SAFETY: the read end unregisters before ready is dropped.
+        unsafe {
+            pipes::hitode_channel_watch(
+                channel.wait.as_raw_fd(),
+                channel_ready,
+                (&raw mut *self.ready).cast(),
+                context as usize,
+            );
+        }
         self.threads.insert(
             context,
             Thread {
@@ -242,7 +304,12 @@ pub fn deliver(env: &mut Env<'_>) -> bool {
         return false;
     };
     let mut delivered = false;
-    for thread in link.threads.values_mut() {
+    #[cfg(not(any(target_vendor = "apple", target_os = "android")))]
+    link.ready.get_mut().extend(link.threads.keys().copied());
+    for context in std::mem::take(link.ready.get_mut()) {
+        let Some(thread) = link.threads.get_mut(&context) else {
+            continue;
+        };
         if !thread.waiting || thread.pending.is_some() {
             continue;
         }
@@ -279,7 +346,15 @@ pub fn begin_wait(env: &mut Env<'_>) -> Result<Handle, crate::status::Error> {
     let context = env.context;
     let thread = link(env)?.thread(context).map_err(broken)?;
     thread.waiting = true;
-    Ok(thread.wake)
+    // A wake can arrive in the same step as select's reply, before begin_wait.
+    if thread.pending.is_none() {
+        thread.pending = thread.channel.wake_up().map_err(broken)?;
+    }
+    let wake = thread.wake;
+    if thread.pending.is_some() {
+        env.sys.set_event(wake);
+    }
+    Ok(wake)
 }
 
 /// Takes the wake-up the server sent the current thread, letting the
@@ -339,9 +414,9 @@ pub fn current_tid(env: &mut Env<'_>) -> Result<u32, crate::status::Error> {
 
 /// A thread's request pipe, made before the server knows the thread.
 pub struct NewThread {
-    request: OwnedFd,
+    request: PipeFd,
     /// The server's end, which `new_thread` names.
-    server_request: OwnedFd,
+    server_request: PipeFd,
 }
 
 impl NewThread {
@@ -599,10 +674,10 @@ pub struct Connection {
 
 /// A thread's pipes to the server.
 struct Channel {
-    request: OwnedFd,
-    reply: OwnedFd,
+    request: PipeFd,
+    reply: PipeFd,
     /// The server writes here to end a wait the thread started with `select`.
-    wait: OwnedFd,
+    wait: PipeFd,
 }
 
 impl Connection {
@@ -653,6 +728,7 @@ impl Connection {
     ) -> Result<(Self, FirstThread), Error> {
         socket.set_nonblocking(true)?;
         let (version, request) = receive_fd(&socket, progress, time)?;
+        let request = PipeFd(request);
         if version != PROTOCOL_VERSION {
             return Err(Error::Version(version));
         }
@@ -772,7 +848,7 @@ impl Channel {
         loop {
             // SAFETY: a valid descriptor and buffer.
             let read = unsafe {
-                libc::read(
+                pipes::read(
                     self.wait.as_raw_fd(),
                     reply.as_mut_ptr().cast(),
                     reply.len(),
@@ -811,7 +887,7 @@ impl Channel {
         while !bytes.is_empty() {
             // SAFETY: a valid descriptor and buffer.
             let written = unsafe {
-                libc::write(self.request.as_raw_fd(), bytes.as_ptr().cast(), bytes.len())
+                pipes::write(self.request.as_raw_fd(), bytes.as_ptr().cast(), bytes.len())
             };
             if written > 0 {
                 bytes = &bytes[written as usize..];
@@ -843,7 +919,7 @@ impl Channel {
         while !buffer.is_empty() {
             // SAFETY: a valid descriptor and buffer.
             let read = unsafe {
-                libc::read(
+                pipes::read(
                     self.reply.as_raw_fd(),
                     buffer.as_mut_ptr().cast(),
                     buffer.len(),
@@ -872,10 +948,10 @@ impl Channel {
     }
 }
 
-fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+fn pipe() -> io::Result<(PipeFd, PipeFd)> {
     let mut fds = [0; 2];
     // SAFETY: `fds` has room for both ends.
-    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+    if unsafe { pipes::pipe(fds.as_mut_ptr()) } != 0 {
         return Err(io::Error::last_os_error());
     }
     for fd in fds {
@@ -883,10 +959,15 @@ fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
         unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
     }
     // SAFETY: both descriptors are new and owned by nobody else.
-    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
+    Ok(unsafe {
+        (
+            PipeFd(OwnedFd::from_raw_fd(fds[0])),
+            PipeFd(OwnedFd::from_raw_fd(fds[1])),
+        )
+    })
 }
 
-fn set_nonblocking(fd: &OwnedFd) -> io::Result<()> {
+fn set_nonblocking(fd: &PipeFd) -> io::Result<()> {
     // SAFETY: a valid descriptor.
     let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
     // SAFETY: as above.
@@ -920,7 +1001,7 @@ fn send_fd(socket: &UnixStream, tid: u32, fd: RawFd) -> io::Result<()> {
         (*header).cmsg_type = libc::SCM_RIGHTS;
         (*header).cmsg_len = libc::CMSG_LEN(size_of::<RawFd>() as u32) as _;
         std::ptr::write_unaligned(libc::CMSG_DATA(header).cast::<RawFd>(), fd);
-        if libc::sendmsg(socket.as_raw_fd(), &message, 0) < 0 {
+        if pipes::sendmsg(socket.as_raw_fd(), &message, 0) < 0 {
             return Err(io::Error::last_os_error());
         }
     }
@@ -948,7 +1029,7 @@ fn receive_fd(
         message.msg_control = control.as_mut_ptr().cast();
         message.msg_controllen = control.len() as _;
         // SAFETY: as above.
-        let received = unsafe { libc::recvmsg(socket.as_raw_fd(), &mut message, 0) };
+        let received = unsafe { pipes::recvmsg(socket.as_raw_fd(), &mut message, 0) };
         if received == size_of::<u32>() as isize {
             // SAFETY: the kernel filled in the control buffer of `message`.
             let header = unsafe { libc::CMSG_FIRSTHDR(&message) };

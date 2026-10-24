@@ -14,6 +14,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <unistd.h>
 #include <poll.h>
 #include <signal.h>
@@ -43,6 +44,15 @@ int hitode_chmod( const char *path, mode_t mode );
 char *hitode_realpath( const char *path, char *resolved );
 int hitode_bind( int fd, const struct sockaddr *addr, socklen_t len );
 int hitode_connect( int fd, const struct sockaddr *addr, socklen_t len );
+
+int hitode_pipe( int fds[2] );
+int hitode_close( int fd );
+ssize_t hitode_read( int fd, void *buf, size_t size );
+ssize_t hitode_write( int fd, const void *buf, size_t size );
+ssize_t hitode_readv( int fd, const struct iovec *iov, int count );
+ssize_t hitode_writev( int fd, const struct iovec *iov, int count );
+ssize_t hitode_sendmsg( int fd, const struct msghdr *msg, int flags );
+ssize_t hitode_recvmsg( int fd, struct msghdr *msg, int flags );
 
 int hitode_poll( struct pollfd *fds, nfds_t count, int timeout );
 char *hitode_getenv( const char *name );
@@ -88,6 +98,15 @@ int hitode_NSGetExecutablePath( char *buf, uint32_t *size );
 #define realpath(...) hitode_realpath(__VA_ARGS__)
 #define bind(...) hitode_bind(__VA_ARGS__)
 #define connect(...) hitode_connect(__VA_ARGS__)
+
+#define pipe(...) hitode_pipe(__VA_ARGS__)
+#define close(...) hitode_close(__VA_ARGS__)
+#define read hitode_read
+#define write hitode_write
+#define readv(...) hitode_readv(__VA_ARGS__)
+#define writev(...) hitode_writev(__VA_ARGS__)
+#define sendmsg(...) hitode_sendmsg(__VA_ARGS__)
+#define recvmsg(...) hitode_recvmsg(__VA_ARGS__)
 
 #define poll(...) hitode_poll(__VA_ARGS__)
 #define getenv(...) hitode_getenv(__VA_ARGS__)

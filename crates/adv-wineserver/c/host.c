@@ -17,6 +17,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <sys/un.h>
 #include <poll.h>
 #include <pthread.h>
@@ -269,16 +270,316 @@ int hitode_connect( int fd, const struct sockaddr *addr, socklen_t len )
     return socket_call_at( &call );
 }
 
+/* Channel descriptors retain their kernel identity, including across SCM_RIGHTS.
+ * Only their bytes live here. The execution owner serializes server and clients. */
+struct channel
+{
+    unsigned char *data;
+    size_t size, capacity;
+    unsigned int readers, writers;
+    void (*notify)( void *, size_t );
+    void *owner;
+    size_t token;
+};
+struct endpoint { struct channel *channel; int writing; };
+static struct endpoint *endpoints;
+static size_t endpoint_count;
+static uint64_t queued_io, system_io;
+
+static struct endpoint *endpoint( int fd )
+{
+    return fd >= 0 && (size_t)fd < endpoint_count ? &endpoints[fd] : NULL;
+}
+
+static int attach( int fd, struct endpoint end )
+{
+    if ((size_t)fd >= endpoint_count)
+    {
+        size_t count = fd + 64;
+        struct endpoint *table = realloc( endpoints, count * sizeof(*table) );
+        if (!table) { errno = ENOMEM; return -1; }
+        memset( table + endpoint_count, 0, (count - endpoint_count) * sizeof(*table) );
+        endpoints = table;
+        endpoint_count = count;
+    }
+    endpoints[fd] = end;
+    if (end.writing) end.channel->writers++;
+    else end.channel->readers++;
+    return 0;
+}
+
+static void release( struct endpoint end )
+{
+    struct channel *channel = end.channel;
+    if (end.writing) channel->writers--;
+    else if (!--channel->readers) channel->notify = NULL;
+    if (!channel->readers && !channel->writers)
+    {
+        free( channel->data );
+        free( channel );
+    }
+}
+
+/* Rust's OwnedFd closes after removing its registration. */
+void hitode_channel_forget( int fd )
+{
+    struct endpoint *end = endpoint( fd );
+    if (end && end->channel)
+    {
+        release( *end );
+        end->channel = NULL;
+    }
+}
+
+int hitode_close( int fd )
+{
+    hitode_channel_forget( fd );
+    return close( fd );
+}
+
+int hitode_pipe( int fds[2] )
+{
+    struct channel *channel;
+    if (pipe( fds )) return -1;
+    if (!(channel = calloc( 1, sizeof(*channel) ))) goto error;
+    if (attach( fds[0], (struct endpoint){ channel, 0 } )) { free( channel ); goto error; }
+    if (attach( fds[1], (struct endpoint){ channel, 1 } ))
+    {
+        hitode_channel_forget( fds[0] );
+        goto error;
+    }
+    return 0;
+error:
+    close( fds[0] );
+    close( fds[1] );
+    errno = ENOMEM;
+    return -1;
+}
+
+void hitode_channel_watch( int fd, void (*notify)(void *, size_t), void *owner, size_t token )
+{
+    struct channel *channel = endpoint( fd )->channel;
+    channel->notify = notify;
+    channel->owner = owner;
+    channel->token = token;
+    if (channel->size) notify( owner, token );
+}
+
+void hitode_channel_counts( uint64_t *queued, uint64_t *system )
+{
+    *queued = queued_io;
+    *system = system_io;
+}
+
+ssize_t hitode_read( int fd, void *buf, size_t size )
+{
+    struct endpoint *end = endpoint( fd );
+    struct channel *channel;
+    if (!end || !(channel = end->channel)) { system_io++; return read( fd, buf, size ); }
+    queued_io++;
+    if (end->writing) { errno = EBADF; return -1; }
+    if (!size) return 0;
+    if (!channel->size)
+    {
+        if (!channel->writers) return 0;
+        errno = EAGAIN;
+        return -1;
+    }
+    if (size > channel->size) size = channel->size;
+    memcpy( buf, channel->data, size );
+    channel->size -= size;
+    memmove( channel->data, channel->data + size, channel->size );
+    return size;
+}
+
+ssize_t hitode_write( int fd, const void *buf, size_t size )
+{
+    struct endpoint *end = endpoint( fd );
+    struct channel *channel;
+    size_t old_size;
+    if (!end || !(channel = end->channel)) { system_io++; return write( fd, buf, size ); }
+    queued_io++;
+    if (!end->writing) { errno = EBADF; return -1; }
+    if (!channel->readers) { errno = EPIPE; return -1; }
+    if (!size) return 0;
+    old_size = channel->size;
+    if (size > channel->capacity - old_size)
+    {
+        size_t capacity = old_size + size;
+        unsigned char *data = realloc( channel->data, capacity );
+        if (!data) { errno = ENOMEM; return -1; }
+        channel->data = data;
+        channel->capacity = capacity;
+    }
+    memcpy( channel->data + old_size, buf, size );
+    channel->size += size;
+    if (!old_size && channel->notify) channel->notify( channel->owner, channel->token );
+    return size;
+}
+
+static ssize_t channel_vector( int fd, const struct iovec *iov, int count, int writing )
+{
+    ssize_t total = 0, ret;
+    int i;
+    for (i = 0; i < count; i++)
+    {
+        if (!iov[i].iov_len) continue;
+        ret = writing ? hitode_write( fd, iov[i].iov_base, iov[i].iov_len )
+                      : hitode_read( fd, iov[i].iov_base, iov[i].iov_len );
+        if (ret < 0) return total ? total : ret;
+        total += ret;
+        if ((size_t)ret < iov[i].iov_len) break;
+    }
+    return total;
+}
+
+ssize_t hitode_readv( int fd, const struct iovec *iov, int count )
+{
+    struct endpoint *end = endpoint( fd );
+    if (end && end->channel) return channel_vector( fd, iov, count, 0 );
+    system_io++;
+    return readv( fd, iov, count );
+}
+
+ssize_t hitode_writev( int fd, const struct iovec *iov, int count )
+{
+    struct endpoint *end = endpoint( fd );
+    if (end && end->channel) return channel_vector( fd, iov, count, 1 );
+    system_io++;
+    return writev( fd, iov, count );
+}
+
+/* Hold a reference while a registered endpoint is in a socket's rights queue.
+ * fstat identifies the received duplicate without changing the socket protocol. */
+struct transfer
+{
+    struct transfer *next;
+    struct endpoint end;
+    dev_t device;
+    ino_t inode;
+};
+static struct transfer *transfers;
+
+ssize_t hitode_sendmsg( int fd, const struct msghdr *msg, int flags )
+{
+    struct cmsghdr *cmsg;
+    struct transfer *pending = NULL, *item;
+    ssize_t ret;
+    for (cmsg = CMSG_FIRSTHDR( (struct msghdr *)msg ); cmsg;
+         cmsg = CMSG_NXTHDR( (struct msghdr *)msg, cmsg ))
+    {
+        size_t i, count;
+        int *fds;
+        if (cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS) continue;
+        fds = (int *)CMSG_DATA( cmsg );
+        count = (cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+        for (i = 0; i < count; i++)
+        {
+            struct endpoint *end = endpoint( fds[i] );
+            struct stat st;
+            if (!end || !end->channel) continue;
+            if (!(item = malloc( sizeof(*item) ))) { errno = ENOMEM; ret = -1; goto done; }
+            fstat( fds[i], &st );
+            *item = (struct transfer){ pending, *end, st.st_dev, st.st_ino };
+            pending = item;
+            if (end->writing) end->channel->writers++;
+            else end->channel->readers++;
+        }
+    }
+    ret = sendmsg( fd, msg, flags );
+done:
+    while ((item = pending))
+    {
+        pending = item->next;
+        if (ret >= 0) { item->next = transfers; transfers = item; }
+        else { release( item->end ); free( item ); }
+    }
+    return ret;
+}
+
+ssize_t hitode_recvmsg( int fd, struct msghdr *msg, int flags )
+{
+    ssize_t ret = recvmsg( fd, msg, flags );
+    struct cmsghdr *cmsg;
+    if (ret < 0) return ret;
+    for (cmsg = CMSG_FIRSTHDR( msg ); cmsg; cmsg = CMSG_NXTHDR( msg, cmsg ))
+    {
+        size_t i, count;
+        int *fds;
+        if (cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS) continue;
+        fds = (int *)CMSG_DATA( cmsg );
+        count = (cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+        for (i = 0; i < count; i++)
+        {
+            struct stat st;
+            struct transfer **ptr, *item;
+            int writing = (fcntl( fds[i], F_GETFL ) & O_ACCMODE) == O_WRONLY;
+            fstat( fds[i], &st );
+            for (ptr = &transfers; (item = *ptr); ptr = &item->next)
+                if (item->device == st.st_dev && item->inode == st.st_ino && item->end.writing == writing)
+                {
+                    if (attach( fds[i], item->end )) { close( fds[i] ); return -1; }
+                    *ptr = item->next;
+                    release( item->end );
+                    free( item );
+                    break;
+                }
+        }
+    }
+    return ret;
+}
+
+static int channel_poll( struct pollfd *fds, nfds_t count )
+{
+    struct pollfd other[count ? count : 1];
+    nfds_t i, rest = 0;
+    int ret, ready = 0;
+    for (i = 0; i < count; i++)
+    {
+        struct endpoint *end = endpoint( fds[i].fd );
+        struct channel *channel;
+        fds[i].revents = 0;
+        if (!end || !(channel = end->channel)) { other[rest++] = fds[i]; continue; }
+#ifdef __APPLE__
+        if (!fds[i].events) continue;
+        if (!(end->writing ? channel->readers : channel->writers))
+        {
+            fds[i].revents = POLLHUP | (fds[i].events & POLLIN);
+            continue;
+        }
+#endif
+        if (end->writing)
+        {
+            if (!channel->readers) fds[i].revents |= POLLERR | (fds[i].events & POLLOUT);
+            else fds[i].revents |= fds[i].events & POLLOUT;
+        }
+        else
+        {
+            if (channel->size) fds[i].revents |= fds[i].events & POLLIN;
+            if (!channel->writers) fds[i].revents |= POLLHUP;
+        }
+    }
+    if (rest && (ret = poll( other, rest, 0 )) < 0) return ret;
+    rest = 0;
+    for (i = 0; i < count; i++)
+    {
+        struct endpoint *end = endpoint( fds[i].fd );
+        if (!end || !end->channel) fds[i].revents = other[rest++].revents;
+        if (fds[i].revents) ready++;
+    }
+    return ready;
+}
+
 /* The server asks once for ready descriptors. With none ready it returns to
  * the runtime, which resumes it on new input or at the timeout; the server
  * then sees whatever is ready by then and computes its next wait itself. */
 int hitode_poll( struct pollfd *fds, nfds_t count, int timeout )
 {
-    int ret = poll( fds, count, 0 );
+    int ret = channel_poll( fds, count );
 
     if (ret || !timeout) return ret;
     hitode_host_wait( timeout );
-    return poll( fds, count, 0 );
+    return channel_poll( fds, count );
 }
 
 char *hitode_getenv( const char *name )
