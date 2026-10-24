@@ -94,6 +94,7 @@ pub fn install<B: Backend>(
         memory: guest_memory,
         completed: crate::graphics::frame_completed,
     };
+    adv_drv::media::install(machine)?;
     adv_drv::install(machine, prefix, provider)
 }
 

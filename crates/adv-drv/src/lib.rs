@@ -13,6 +13,7 @@ use adv_machine::Machine;
 use adv_machine::layout::PAGE;
 
 pub mod audio;
+pub mod media;
 pub mod user;
 
 /// What the drivers take from the assembly.
@@ -26,6 +27,7 @@ pub struct Provider {
 
 pub fn register(registry: &mut Registry) {
     audio::register(registry);
+    media::register(registry);
     user::register(registry);
 }
 

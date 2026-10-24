@@ -28,6 +28,8 @@ wine() {
         WINEDEBUG=-all WINEDLLOVERRIDES=mscoree,mshtml= "$install/bin/wine" "$@"
 }
 wine wineboot --init
+# Register the media filters and transforms, including Wine's filter mapper entries.
+wine regsvr32 /s winegstreamer.dll
 wine reg add 'HKCU\Software\Wine\Drivers' /v Audio /d advaudio /f >/dev/null
 # The fonts Windows ships stand for the host's CJK fonts (families as their
 # name tables give them, weight included): win32u takes the

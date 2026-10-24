@@ -40,22 +40,25 @@ enum Library {
     Host(u32),
 }
 
-/// Guest tables of host thunks, used by builtin images without an ELF library.
+/// Guest tables of host thunks, taking precedence over builtin ELF libraries.
 #[derive(Default)]
 pub struct HostTables(pub HashMap<String, u32>);
 
 /// Records the Unix library next to the image file `dll`, mapped at `base`.
 pub fn note_image(env: &mut Env<'_>, base: u32, dll: Option<PathBuf>) {
     let library = dll.as_deref().and_then(|dll| {
-        library_of(dll).map(Library::Guest).or_else(|| {
-            let name = dll.file_name()?.to_str()?.to_ascii_lowercase();
-            env.ext
-                .try_get::<HostTables>()?
-                .0
-                .get(&name)
-                .copied()
-                .map(Library::Host)
-        })
+        let host = dll
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| {
+                env.ext
+                    .try_get::<HostTables>()?
+                    .0
+                    .get(&name.to_ascii_lowercase())
+                    .copied()
+                    .map(Library::Host)
+            });
+        host.or_else(|| library_of(dll).map(Library::Guest))
     });
     let libraries = env.ext.get_or_default::<Libraries>();
     match library {

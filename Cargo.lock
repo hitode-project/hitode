@@ -137,6 +137,7 @@ dependencies = [
  "adv-device",
  "adv-machine",
  "adv-nt",
+ "adv-sync",
  "adv-unix",
 ]
 
