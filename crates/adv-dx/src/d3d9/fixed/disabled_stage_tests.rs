@@ -65,6 +65,40 @@ mod disabled_stage_tests {
         assert!(env.ext.get::<State>().pending.is_empty());
     }
 
+    // spec: GFX-STATE-1
+    #[test]
+    fn wrap_defaults_and_ambient_roundtrip() {
+        let mut m = crate::d3d9::tests::machine();
+        let mut env = Env {
+            context: m.sys.current,
+            cpu: &mut m.cpu,
+            sys: &mut m.sys,
+            ext: &mut m.ext,
+            thunk: 0,
+        };
+        let (pointer, _, _, _) = crate::d3d9::tests::setup(&mut env);
+        let this = GuestPtr::new(pointer);
+        let output = GuestPtr::<u32>::new(alloc(&mut env, 4).unwrap());
+        for state in 128..=135 {
+            assert_eq!(get_render(&mut env, this, state, output), 0);
+            assert_eq!(output.read(env.cpu).unwrap(), 0);
+            assert_eq!(set_render(&mut env, this, state, 0), 0);
+            for value in 1..=15 {
+                assert_eq!(set_render(&mut env, this, state, value), UNAVAILABLE);
+            }
+            assert_eq!(set_render(&mut env, this, state, 16), INVALID);
+            assert_eq!(get_render(&mut env, this, state, output), 0);
+            assert_eq!(output.read(env.cpu).unwrap(), 0);
+        }
+        assert_eq!(get_render(&mut env, this, 139, output), 0);
+        assert_eq!(output.read(env.cpu).unwrap(), 0);
+        for value in [0, 0x12345678, u32::MAX] {
+            assert_eq!(set_render(&mut env, this, 139, value), 0);
+            assert_eq!(get_render(&mut env, this, 139, output), 0);
+            assert_eq!(output.read(env.cpu).unwrap(), value);
+        }
+    }
+
     #[test]
     fn second_stage_combines_supported_operations_and_arguments() {
         let mut m = crate::d3d9::tests::machine();

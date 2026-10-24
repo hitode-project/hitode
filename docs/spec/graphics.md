@@ -378,8 +378,8 @@ Binding changes MUST NOT start speculative module preparation for transient shad
 
 ### GFX-STATE-1 Neutral fixed state
 
-**Rule**: DITHERENABLE zero and COLORVERTEX defaults, setters, and queries MUST agree. Enabling dithering MUST fail explicitly.
-**Verification**: Review — the native texture-blit script checks state roundtrips, but no annotated Rust test covers both states.
+**Rule**: Defaults, setters, and queries MUST agree for DITHERENABLE, COLORVERTEX, WRAP0–WRAP7, and AMBIENT. Enabling dithering or texture-coordinate wrapping MUST fail explicitly. AMBIENT MUST accept and preserve every DWORD value.
+**Verification**: Test
 
 Withdrawn: GFX-NUM-2, GFX-NUM-3, GFX-NUM-4, GFX-NUM-5
 

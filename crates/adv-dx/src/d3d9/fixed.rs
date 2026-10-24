@@ -277,9 +277,17 @@ impl Fixed {
                 (57, 0),
                 (58, u32::MAX),
                 (59, u32::MAX),
-                (128, 0), // WRAP0: texture coordinate wrapping is disabled.
+                (128, 0), // WRAP0–WRAP7: texture coordinate wrapping is disabled.
+                (129, 0),
+                (130, 0),
+                (131, 0),
+                (132, 0),
+                (133, 0),
+                (134, 0),
+                (135, 0),
                 (136, 1), // CLIPPING: GPU primitive clipping remains enabled.
                 (137, 1),
+                (139, 0), // AMBIENT: only relevant when lighting is enabled.
                 (141, 1), // COLORVERTEX: only relevant when lighting is enabled.
                 (145, 1), // Material sources: COLOR1, COLOR2, MATERIAL, MATERIAL.
                 (146, 2),
@@ -538,7 +546,7 @@ pub(super) fn set_render(env: &mut Env<'_>, this: GuestPtr<()>, state: i32, valu
             _ => false,
         },
         28 | 156 => value <= 1,
-        34 => true,
+        34 | 139 => true,
         35 | 140 => value <= 3,
         36..=38 => f32::from_bits(value).is_finite(),
         154 | 155 | 166 => f32::from_bits(value).is_finite() && f32::from_bits(value) > 0.0,
@@ -567,7 +575,7 @@ pub(super) fn set_render(env: &mut Env<'_>, this: GuestPtr<()>, state: i32, valu
         53..=55 | 186..=188 => stencil_op(value).is_some(),
         24 | 57..=59 => true,
         168 => value <= 15,
-        128 => match value {
+        128..=135 => match value {
             0 => true,
             1..=15 => return UNAVAILABLE,
             _ => false,
