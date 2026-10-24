@@ -52,6 +52,9 @@ impl Guest for Cpu<'_> {
     fn copy_memory(&mut self, src: u32, dst: u32, len: usize) -> Result<(), MemFault> {
         self.0.copy_memory(src, dst, len)
     }
+    fn fill_memory(&mut self, addr: u32, byte: u8, len: usize) -> Result<(), MemFault> {
+        self.0.fill_memory(addr, byte, len)
+    }
     fn next_mapped_page(&self, addr: u32, limit: u64) -> Result<Option<u32>, MemFault> {
         self.0.next_mapped_page(addr, limit)
     }

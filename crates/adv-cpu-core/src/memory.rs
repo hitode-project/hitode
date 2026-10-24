@@ -1543,9 +1543,27 @@ impl Memory {
     }
 
     pub fn fill(&mut self, address: u32, pattern: &[u8], len: usize) -> Result<(), String> {
-        self.committed(address, len)?;
+        let range = self.committed(address, len)?;
         if pattern.is_empty() {
             return Err("empty fill pattern".into());
+        }
+        if let [byte] = *pattern
+            && !self.overlays(&range)
+        {
+            if self.writes_code(&range) {
+                self.touch(address, len);
+            }
+            #[cfg(windows)]
+            let _host = Self::host_scope(
+                self.reservation.as_ref(),
+                &self.perms,
+                self.native_protection,
+                &range,
+                true,
+            )?;
+            // SAFETY: a committed ordinary range of exclusively borrowed memory.
+            unsafe { std::ptr::write_bytes(self.ptr.as_ptr().add(range.start), byte, len) };
+            return Ok(());
         }
         let mut scratch = [0; PAGE_SIZE];
         let mut at = 0;

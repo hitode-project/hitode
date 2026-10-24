@@ -316,6 +316,25 @@ pub trait Guest {
         self.read(src, &mut bytes)?;
         self.write(dst, &bytes)
     }
+    /// Set `len` bytes at `addr` to `byte`, as guest stores would: the
+    /// whole range must be writable, and nothing is written otherwise.
+    fn fill_memory(&mut self, addr: u32, byte: u8, len: usize) -> Result<(), MemFault> {
+        let fault = MemFault {
+            addr,
+            len: u32::try_from(len).unwrap_or(u32::MAX),
+        };
+        if !self.accessible(addr, fault.len, Prot::WRITE) || fault.len as usize != len {
+            return Err(fault);
+        }
+        let chunk = [byte; 4096];
+        let mut at = 0;
+        while at < len {
+            let count = (len - at).min(chunk.len());
+            self.write(addr.wrapping_add(at as u32), &chunk[..count])?;
+            at += count;
+        }
+        Ok(())
+    }
     /// Whether guest instructions may access the entire range with `prot`. Unlike host
     /// reads/writes, this includes page permissions. Unknown backends conservatively reject.
     fn accessible(&self, _addr: u32, _len: u32, _prot: Prot) -> bool {

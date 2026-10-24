@@ -627,6 +627,29 @@ fn api_overlap_copy_and_mixed_page_stores_keep_their_exact_bytes() {
 }
 
 #[test]
+fn api_fill_covers_shared_and_ordinary_pages_or_writes_nothing() {
+    let (mut cpu, shared) = fixture(&[0xc3], false);
+    cpu.map(DATA - 4096, 4096, Prot::RW).unwrap();
+    cpu.fill_memory(DATA - 5, 0x5a, 4096).unwrap();
+    let mut actual = vec![0; 4096];
+    cpu.read(DATA - 5, &mut actual).unwrap();
+    assert_eq!(actual, [0x5a; 4096]);
+    assert_eq!(shared.read_alias.load_u8(4090), 0x5a);
+    assert_eq!(shared.read_alias.load_u8(4091), 0);
+    cpu.fill_memory(DATA - 4096, 0x33, 100).unwrap();
+    let mut ordinary = [0; 101];
+    cpu.read(DATA - 4096, &mut ordinary).unwrap();
+    assert_eq!(ordinary[..100], [0x33; 100]);
+    assert_eq!(ordinary[100], 0);
+    cpu.protect(DATA - 4096, 4096, Prot::READ).unwrap();
+    assert!(cpu.fill_memory(DATA - 2, 0x11, 4).is_err());
+    assert_eq!(shared.read_alias.load_u8(0), 0x5a);
+    let mut before = [0; 2];
+    cpu.read(DATA - 2, &mut before).unwrap();
+    assert_eq!(before, [0x5a; 2]);
+}
+
+#[test]
 fn protected_cross_page_store_faults_without_partial_commit_then_restarts() {
     let code = bytes(|a| {
         a.mov(dword_ptr(DATA as i32 + 4094), 0x1234_5678).unwrap();

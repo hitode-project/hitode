@@ -319,6 +319,15 @@ impl Guest for View<'_> {
         }
         self.memory.copy(src, dst, len).map_err(|_| fault(dst, len))
     }
+    fn fill_memory(&mut self, addr: u32, byte: u8, len: usize) -> Result<(), MemFault> {
+        let len32 = u32::try_from(len).map_err(|_| fault(addr, len))?;
+        if !self.accessible(addr, len32, Prot::WRITE) {
+            return Err(fault(addr, len));
+        }
+        self.memory
+            .fill(addr, &[byte], len)
+            .map_err(|_| fault(addr, len))
+    }
     fn push_f64(&mut self, value: f64) {
         self.state.commit_mmx();
         self.state
@@ -424,6 +433,7 @@ impl Guest for Cpu {
         fn map_shared_counters(&mut self, addr: u32, len: u32)
             -> Result<Rc<dyn adv_cpu_core::backend::CounterStorage>, MemFault>;
         fn copy_memory(&mut self, src: u32, dst: u32, len: usize) -> Result<(), MemFault>;
+        fn fill_memory(&mut self, addr: u32, byte: u8, len: usize) -> Result<(), MemFault>;
         fn push_f64(&mut self, value: f64) -> ();
         fn pop_f64(&mut self) -> Option<f64>;
         fn write(&mut self, addr: u32, data: &[u8]) -> Result<(), MemFault>;
