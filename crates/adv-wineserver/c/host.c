@@ -18,6 +18,7 @@
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
+#include <sys/ioctl.h>
 #include <sys/un.h>
 #include <poll.h>
 #include <pthread.h>
@@ -45,6 +46,43 @@ extern void hitode_host_exit( int status ) __attribute__((noreturn));
 extern const char *hitode_host_getenv( const char *name );
 extern const char *hitode_host_executable( void );
 extern const char *hitode_host_server_root( void );
+
+/* Standalone server users have no NT platform; Wine sessions replace these. */
+__attribute__((weak)) int hitode_ntsync_open( void ) { errno = ENODEV; return -1; }
+__attribute__((weak)) int hitode_ntsync_known( int fd ) { return 0; }
+__attribute__((weak)) int hitode_ntsync_ioctl( int fd, unsigned long request, void *arg )
+{
+    return ioctl( fd, request, arg );
+}
+__attribute__((weak)) void hitode_ntsync_forget( int fd ) {}
+__attribute__((weak)) void hitode_ntsync_transfer( int fd, int operation ) {}
+
+int hitode_ioctl( int fd, unsigned long request, ... )
+{
+    va_list args;
+    void *arg;
+    va_start( args, request );
+    arg = va_arg( args, void * );
+    va_end( args );
+    if (hitode_ntsync_known( fd ))
+        return hitode_ntsync_ioctl( fd, request, arg );
+    return ioctl( fd, request, arg );
+}
+
+static void ntsync_rights( const struct msghdr *msg, int operation )
+{
+    struct cmsghdr *cmsg;
+    for (cmsg = CMSG_FIRSTHDR( (struct msghdr *)msg ); cmsg;
+         cmsg = CMSG_NXTHDR( (struct msghdr *)msg, cmsg ))
+    {
+        size_t i, count;
+        int *fds;
+        if (cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS) continue;
+        fds = (int *)CMSG_DATA( cmsg );
+        count = (cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+        for (i = 0; i < count; i++) hitode_ntsync_transfer( fds[i], operation );
+    }
+}
 
 static int current_dir = AT_FDCWD;
 
@@ -104,6 +142,7 @@ int hitode_open( const char *path, int flags, ... )
         mode = va_arg( args, int );
         va_end( args );
     }
+    if (!strcmp( path, "/dev/ntsync" )) return hitode_ntsync_open();
     return openat( current_dir, path, flags, mode );
 }
 
@@ -365,6 +404,7 @@ void hitode_channel_forget( int fd )
 int hitode_close( int fd )
 {
     hitode_channel_forget( fd );
+    hitode_ntsync_forget( fd );
     return close( fd );
 }
 
@@ -517,7 +557,9 @@ ssize_t hitode_sendmsg( int fd, const struct msghdr *msg, int flags )
             else end->channel->readers++;
         }
     }
+    ntsync_rights( msg, 0 );
     ret = sendmsg( fd, msg, flags );
+    if (ret < 0) ntsync_rights( msg, -1 );
 done:
     while ((item = pending))
     {
@@ -533,6 +575,7 @@ ssize_t hitode_recvmsg( int fd, struct msghdr *msg, int flags )
     ssize_t ret = recvmsg( fd, msg, flags );
     struct cmsghdr *cmsg;
     if (ret < 0) return ret;
+    ntsync_rights( msg, 1 );
     for (cmsg = CMSG_FIRSTHDR( msg ); cmsg; cmsg = CMSG_NXTHDR( msg, cmsg ))
     {
         size_t i, count;

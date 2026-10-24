@@ -26,6 +26,7 @@ pub mod kuser;
 pub mod memory;
 pub mod native;
 pub mod nls;
+pub mod ntsync;
 pub mod object;
 pub mod params;
 pub mod path;

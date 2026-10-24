@@ -21,3 +21,22 @@ Wake delivery MUST visit only threads whose wait queues received bytes.
 Event waits MUST merge queue readiness with kernel events using zero kernel timeouts and yield to the runtime when nothing is ready.
 Channel registrations MUST preserve event data, enablement and close behavior.
 **Verification**: Test
+
+## Synchronization
+
+### SRV-SYNC-1 In-process object operations
+
+**Rule**: Synchronization operations MUST preserve Wine 11's object state, access checks, return values, and fallback behavior.
+**Verification**: Test
+**Basis**: Wine 11 `dlls/ntdll/unix/sync.c`; Linux `Documentation/userspace-api/ntsync.rst`
+
+### SRV-SYNC-2 Atomic machine waits
+
+**Rule**: Pending device waits MUST park guest contexts in the machine. Wait-all MUST acquire every object atomically. Pulsing an event MUST satisfy eligible registered waiters before resetting it.
+**Verification**: Test
+**Basis**: WINE-THR-1, WINE-THR-2
+
+### SRV-SYNC-3 Descriptor ownership
+
+**Rule**: Device objects MUST survive descriptor transfer and pending waits until their last reference closes. Closing a handle MUST invalidate its synchronization cache entry. Other descriptors and paths MUST retain libc behavior.
+**Verification**: Test

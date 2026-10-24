@@ -1,18 +1,17 @@
 //! Synchronization, after Wine's `unix/sync.c` and `server_select`.
 //!
-//! Events live in the server. A wait is a `select` request; when the server
-//! cannot end it at once, it ends it later with a wake-up on the thread's
-//! wait pipe. Meanwhile the guest context blocks in the machine on its wake
-//! object, which the client sets when it finds the wake-up after any server
-//! run, or until the wait's deadline, which the server then sees pass. A
-//! plain sleep needs no server, as in Wine.
+//! Waitable objects use the emulated ntsync device when the server supplies
+//! it, with Wine's handle cache and access checks. Pending acquisitions park
+//! on machine events; server wake-ups and APCs retain the server path.
 //!
 //! A user APC queued to an alertable wait ends it; the thread then runs the
 //! APC in ntdll.dll's `KiUserApcDispatcher`, which resumes the interrupted
 //! context through `NtContinue`.
 
+use crate::ntsync;
 use adv_cpu::backend::{ArchitecturalState, GuestExt, Reg};
 use adv_machine::{Env, Outcome, Wait};
+use std::os::fd::AsRawFd;
 
 use crate::exception::{self, Dispatchers};
 use crate::object::{Attributes, read_u32, read_unicode_string, write_bytes, write_u32};
@@ -115,6 +114,13 @@ pub fn release_mutant(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         unreachable!()
     };
     status::finish((|| {
+        let tid = server::current_tid(env)?;
+        if let Some(value) = inproc_operation(env, handle, 3, 0, ntsync::MUTEX_UNLOCK, [tid, 0])? {
+            if previous != 0 {
+                write_u32(env, previous, 1u32.wrapping_sub(value[1]))?;
+            }
+            return Ok(());
+        }
         let mut request = ReleaseMutexRequest {
             handle,
             ..Default::default()
@@ -148,6 +154,17 @@ fn event_op(env: &mut Env<'_>, args: &[u32], op: i32) -> Outcome {
         unreachable!()
     };
     status::finish((|| {
+        let command = match op {
+            SET_EVENT => ntsync::EVENT_SET,
+            RESET_EVENT => ntsync::EVENT_RESET,
+            _ => ntsync::EVENT_PULSE,
+        };
+        if let Some(value) = inproc_operation(env, handle, 2, 2, command, [0; 2])? {
+            if previous != 0 {
+                write_u32(env, previous, value[0])?;
+            }
+            return Ok(());
+        }
         let mut request = EventOpRequest {
             handle,
             op,
@@ -191,6 +208,9 @@ pub fn wait_multiple(env: &mut Env<'_>, args: &[u32]) -> Outcome {
 }
 
 fn wait(env: &mut Env<'_>, handles: &[u32], any: bool, alertable: u32, timeout: u32) -> Outcome {
+    if let Some(outcome) = inproc_wait(env, handles, any, alertable, timeout, None) {
+        return outcome;
+    }
     let mut op = Vec::with_capacity(4 + 4 * handles.len());
     let code = if any { SELECT_WAIT } else { SELECT_WAIT_ALL };
     for word in std::iter::once(code).chain(handles.iter().copied()) {
@@ -222,6 +242,23 @@ pub fn wait_then_alertable(
     alertable: bool,
     then: WaitThen,
 ) -> Outcome {
+    match prepare_inproc_wait(env, &[handle], true, u32::from(alertable), 0, None) {
+        Ok(wait) => {
+            return run_inproc_wait(
+                env,
+                wait,
+                Box::new(move |env, ended| match ended {
+                    Ended::Status(code) => then(env, code),
+                    Ended::Apc { func, args } => match then(env, USER_APC) {
+                        Outcome::Return(_) => run_apc(env, None, func, args, USER_APC),
+                        outcome => outcome,
+                    },
+                }),
+            );
+        }
+        Err(status::Error::Status(status::NOT_IMPLEMENTED)) => {}
+        Err(error) => return status::finish(Err(error)),
+    }
     let mut op = Vec::with_capacity(8);
     for word in [SELECT_WAIT, handle] {
         op.extend_from_slice(&word.to_le_bytes());
@@ -724,6 +761,12 @@ pub fn release_semaphore(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         unreachable!()
     };
     status::finish((|| {
+        if let Some(value) = inproc_operation(env, handle, 4, 2, ntsync::SEM_RELEASE, [count, 0])? {
+            if previous != 0 {
+                write_u32(env, previous, value[0])?;
+            }
+            return Ok(());
+        }
         let mut request = ReleaseSemaphoreRequest {
             handle,
             count,
@@ -749,6 +792,14 @@ pub fn query_semaphore(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         }
         if length != 8 {
             return Err(status::INFO_LENGTH_MISMATCH.into());
+        }
+        if let Some(value) = inproc_operation(env, handle, 4, 1, ntsync::SEM_READ, [0; 2])? {
+            write_u32(env, info, value[0])?;
+            write_u32(env, info + 4, value[1])?;
+            if returned != 0 {
+                write_u32(env, returned, 8)?;
+            }
+            return Ok(());
         }
         let mut request = QuerySemaphoreRequest {
             handle,
@@ -996,6 +1047,14 @@ pub fn query_event(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         if args[3] != 8 {
             return Err(status::INFO_LENGTH_MISMATCH.into());
         }
+        if let Some(value) = inproc_operation(env, args[0], 2, 1, ntsync::EVENT_READ, [0; 2])? {
+            write_u32(env, args[2], u32::from(value[0] == 0))?;
+            write_u32(env, args[2] + 4, value[1])?;
+            if args[4] != 0 {
+                write_u32(env, args[4], 8)?;
+            }
+            return Ok(());
+        }
         let mut request = crate::protocol::QueryEventRequest {
             handle: args[0],
             ..Default::default()
@@ -1020,6 +1079,9 @@ pub fn pulse_event(env: &mut Env<'_>, args: &[u32]) -> Outcome {
 pub fn signal_and_wait(env: &mut Env<'_>, args: &[u32]) -> Outcome {
     if args[0] == 0 {
         return Outcome::Return(status::INVALID_HANDLE);
+    }
+    if let Some(outcome) = inproc_wait(env, &[args[1]], true, args[2], args[3], Some(args[0])) {
+        return outcome;
     }
     let op = [3u32, args[1], args[0]]
         .into_iter()
@@ -1100,6 +1162,19 @@ pub fn query_mutant(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         }
         if args[3] != 8 {
             return Err(status::INFO_LENGTH_MISMATCH.into());
+        }
+        if let Some(value) = inproc_operation(env, args[0], 3, 1, ntsync::MUTEX_READ, [0; 2])? {
+            write_u32(env, args[2], 1u32.wrapping_sub(value[1]))?;
+            let tid = server::current_tid(env)?;
+            write_bytes(
+                env,
+                args[2] + 4,
+                &[u8::from(value[0] == tid), u8::from(value[0] == u32::MAX)],
+            )?;
+            if args[4] != 0 {
+                write_u32(env, args[4], 8)?;
+            }
+            return Ok(());
         }
         let mut request = crate::protocol::QueryMutexRequest {
             handle: args[0],
@@ -1933,4 +2008,257 @@ fn debug_event(env: &mut Env<'_>, args: [u32; 4], wait: bool) -> Outcome {
         }
         result => status::finish(result),
     }
+}
+
+fn inproc_get(
+    env: &mut Env<'_>,
+    handle: u32,
+    kind: u32,
+    access: u32,
+) -> Result<server::InprocFd, status::Error> {
+    if server::inproc_device(env).is_none() {
+        return Err(status::NOT_IMPLEMENTED.into());
+    }
+    let sync = server::inproc_fd(env, Some(handle))?;
+    if kind != 0 && kind != sync.kind {
+        return Err(status::OBJECT_TYPE_MISMATCH.into());
+    }
+    if sync.access & access != access {
+        return Err(0xc000_0022.into());
+    }
+    Ok(sync)
+}
+fn inproc_status(errno: i32, command: u32) -> Status {
+    match errno {
+        libc::EOVERFLOW if command == ntsync::SEM_RELEASE => 0xc000_0047,
+        libc::EOVERFLOW => 0xc000_0191,
+        libc::EPERM => 0xc000_0046,
+        libc::EINVAL => status::INVALID_PARAMETER,
+        libc::ETIMEDOUT => 0x102,
+        libc::EBADF => status::INVALID_HANDLE,
+        libc::ENOMEM => status::NO_MEMORY,
+        _ => status::INVALID_PARAMETER,
+    }
+}
+fn inproc_operation(
+    env: &mut Env<'_>,
+    handle: u32,
+    kind: u32,
+    access: u32,
+    command: u32,
+    mut value: [u32; 2],
+) -> Result<Option<[u32; 2]>, status::Error> {
+    let sync = match inproc_get(env, handle, kind, access) {
+        Err(status::Error::Status(status::NOT_IMPLEMENTED)) => return Ok(None),
+        result => result?,
+    };
+    // SAFETY: value holds the two fields used by every object ioctl.
+    match unsafe { ntsync::ioctl(sync.fd.as_raw_fd(), command, value.as_mut_ptr()) } {
+        Ok(_) => {}
+        Err(libc::EOWNERDEAD) if command == ntsync::MUTEX_READ => value[0] = u32::MAX,
+        Err(error) => return Err(inproc_status(error, command).into()),
+    }
+    deliver_inproc(env);
+    Ok(Some(value))
+}
+
+type InprocCompletion = std::rc::Weak<ntsync::Completion>;
+#[derive(Default)]
+struct InprocWaits(
+    std::collections::HashMap<adv_machine::CtxId, (adv_machine::sched::Handle, InprocCompletion)>,
+);
+pub(crate) fn deliver_inproc(env: &mut Env<'_>) -> bool {
+    let Some(waits) = env.ext.try_get_mut::<InprocWaits>() else {
+        return false;
+    };
+    let mut delivered = false;
+    waits.0.retain(|_, (wake, result)| {
+        let Some(result) = result.upgrade() else {
+            return false;
+        };
+        if result.get().is_some() {
+            delivered |= env.sys.set_event(*wake);
+        }
+        true
+    });
+    delivered
+}
+struct InprocWait {
+    pending: ntsync::Pending,
+    _objects: Vec<server::InprocFd>,
+    _alert: Option<server::InprocFd>,
+    count: u32,
+    any: bool,
+    deadline: Option<u64>,
+    wake: adv_machine::sched::Handle,
+}
+fn inproc_wait(
+    env: &mut Env<'_>,
+    handles: &[u32],
+    any: bool,
+    alertable: u32,
+    timeout: u32,
+    signal: Option<u32>,
+) -> Option<Outcome> {
+    server::inproc_device(env)?;
+    match prepare_inproc_wait(env, handles, any, alertable, timeout, signal) {
+        Err(status::Error::Status(status::NOT_IMPLEMENTED)) => None,
+        Err(error) => Some(status::finish(Err(error))),
+        Ok(wait) => Some(run_inproc_wait(
+            env,
+            wait,
+            Box::new(|env, ended| match ended {
+                Ended::Status(code) => Outcome::Return(code),
+                Ended::Apc { func, args } => run_apc(env, None, func, args, USER_APC),
+            }),
+        )),
+    }
+}
+fn prepare_inproc_wait(
+    env: &mut Env<'_>,
+    handles: &[u32],
+    any: bool,
+    alertable: u32,
+    timeout: u32,
+    signal: Option<u32>,
+) -> Result<InprocWait, status::Error> {
+    let device = server::inproc_device(env).ok_or(status::NOT_IMPLEMENTED)?;
+    (|| {
+        let signal = signal
+            .map(|handle| inproc_get(env, handle, 0, 0))
+            .transpose()?;
+        if let Some(signal) = &signal {
+            let access = match signal.kind {
+                2 | 4 => 2,
+                3 => 0x10_0000,
+                _ => return Err(status::OBJECT_TYPE_MISMATCH.into()),
+            };
+            if signal.access & access == 0 {
+                return Err(0xc000_0022.into());
+            }
+        }
+        let objects = handles
+            .iter()
+            .map(|&handle| inproc_get(env, handle, 0, 0x10_0000))
+            .collect::<Result<Vec<_>, _>>()?;
+        if let Some(signal) = signal {
+            let tid = server::current_tid(env)?;
+            let (command, mut value) = match signal.kind {
+                2 => (ntsync::EVENT_SET, [0, 0]),
+                3 => (ntsync::MUTEX_UNLOCK, [tid, 0]),
+                4 => (ntsync::SEM_RELEASE, [1, 0]),
+                _ => unreachable!(),
+            };
+            // SAFETY: value supplies the command's UAPI fields.
+            unsafe { ntsync::ioctl(signal.fd.as_raw_fd(), command, value.as_mut_ptr()) }
+                .map_err(|e| status::Error::from(inproc_status(e, command)))?;
+            deliver_inproc(env);
+        }
+        let alert = if alertable as u8 != 0 {
+            Some(server::inproc_fd(env, None)?)
+        } else {
+            None
+        };
+        let timeout = read_timeout(env, timeout)?;
+        let deadline = timeout
+            .filter(|&t| t != TIMEOUT_INFINITE)
+            .map(|t| deadline_us(env, t));
+        let fds: Vec<_> = objects.iter().map(|o| o.fd.as_raw_fd()).collect();
+        let tid = server::current_tid(env)?;
+        let args = ntsync::WaitArgs {
+            timeout: deadline.map_or(u64::MAX, |d| d.saturating_mul(1000)),
+            objs: fds.as_ptr() as u64,
+            count: fds.len() as u32,
+            owner: tid,
+            alert: alert.as_ref().map_or(0, |o| o.fd.as_raw_fd() as u32),
+            ..Default::default()
+        };
+        let command = if !any && handles.len() != 1 {
+            ntsync::WAIT_ALL
+        } else {
+            ntsync::WAIT_ANY
+        };
+        // SAFETY: fds stays live until wait_ioctl has registered the objects.
+        let pending = unsafe { ntsync::wait_ioctl(device, command, &args) }
+            .map_err(|e| status::Error::from(inproc_status(e, command)))?;
+        let wake = env.sys.objects.insert(adv_machine::sched::Object::Event {
+            manual_reset: false,
+            signaled: false,
+        });
+        env.ext
+            .get_or_default::<InprocWaits>()
+            .0
+            .insert(env.context, (wake, pending.completion()));
+        Ok::<_, status::Error>(InprocWait {
+            pending,
+            _objects: objects,
+            _alert: alert,
+            count: handles.len() as u32,
+            any,
+            deadline,
+            wake,
+        })
+    })()
+}
+fn run_inproc_wait(env: &mut Env<'_>, wait: InprocWait, then: Then) -> Outcome {
+    let result = wait.pending.result().map(|result| {
+        result
+            .map(|(index, dead)| {
+                if index == wait.count {
+                    USER_APC
+                } else {
+                    (if dead { 0x80 } else { 0 }) + if wait.any { index } else { 0 }
+                }
+            })
+            .unwrap_or_else(|e| inproc_status(e, 0))
+    });
+    let result = result.or_else(|| {
+        wait.deadline
+            .filter(|&d| d <= env.sys.clock.now_us())
+            .map(|_| 0x102)
+    });
+    if let Some(result) = result {
+        env.ext
+            .get_or_default::<InprocWaits>()
+            .0
+            .remove(&env.context);
+        env.ext
+            .get_or_default::<Timers>()
+            .waits
+            .remove(&env.context);
+        env.sys.objects.close(wait.wake);
+        drop(wait);
+        if result == USER_APC {
+            let select = new_select(
+                env,
+                Vec::new(),
+                SELECT_INTERRUPTIBLE | SELECT_ALERTABLE,
+                Some(0),
+            );
+            return run_select(env, select, then);
+        }
+        return then(env, Ended::Status(result));
+    }
+    let timer = match timer_deadline(env) {
+        Ok(timer) => timer,
+        Err(error) => return status::finish(Err(error)),
+    };
+    let deadline = match (wait.deadline, timer) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    };
+    env.ext
+        .get_or_default::<Timers>()
+        .waits
+        .insert(env.context, wait.wake);
+    Outcome::block(
+        Wait::Object {
+            handle: wait.wake,
+            deadline,
+        },
+        move |env, _| {
+            server::run(env);
+            run_inproc_wait(env, wait, then)
+        },
+    )
 }

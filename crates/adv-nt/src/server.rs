@@ -13,6 +13,7 @@ use std::mem::{size_of, zeroed};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::rc::Rc;
 use std::time::Instant;
 
 use adv_cpu::backend::Guest;
@@ -133,6 +134,8 @@ pub struct Link {
     /// fd cache keeps them: until the handle is closed.
     fds: HashMap<u32, Cached>,
     threads: HashMap<CtxId, Thread>,
+    inproc_device: Option<crate::ntsync::Fd>,
+    inproc: HashMap<u32, InprocFd>,
     ready: Box<UnsafeCell<HashSet<CtxId>>>,
     /// Requests sent, by number; see [`crate::counters`].
     pub(crate) requests: HashMap<i32, Tally>,
@@ -150,6 +153,7 @@ struct Thread {
     /// The wake-up the server sent, read from the pipe on the thread's
     /// behalf.
     pending: Option<WakeUp>,
+    alert: Option<Rc<crate::ntsync::Fd>>,
 }
 
 struct Cached {
@@ -185,6 +189,8 @@ impl Link {
             time,
             fds: HashMap::new(),
             threads: HashMap::new(),
+            inproc_device: connection.inproc_device,
+            inproc: HashMap::new(),
             ready: Box::new(UnsafeCell::new(HashSet::new())),
             requests: HashMap::new(),
         };
@@ -215,6 +221,7 @@ impl Link {
                 wake,
                 waiting: false,
                 pending: None,
+                alert: None,
             },
         );
     }
@@ -234,6 +241,14 @@ impl Link {
         data: &[&[u8]],
         reply_data: &mut [u8],
     ) -> Result<(R::Reply, usize), Error> {
+        if R::NUMBER == crate::protocol::DupHandleRequest::NUMBER {
+            // SAFETY: NUMBER selects the generated repr(C) request layout.
+            let duplicate =
+                unsafe { &*(request as *const R).cast::<crate::protocol::DupHandleRequest>() };
+            if duplicate.options & 1 != 0 {
+                self.inproc.remove(&duplicate.src_handle);
+            }
+        }
         let (time, since) = (self.time, Instant::now());
         let thread = self
             .threads
@@ -262,6 +277,10 @@ impl Link {
         data: &[&[u8]],
         reply_data: &mut [u8],
     ) -> Result<usize, Error> {
+        let word = |offset| u32::from_ne_bytes(fixed[offset..offset + 4].try_into().unwrap());
+        if word(0) as i32 == crate::protocol::DupHandleRequest::NUMBER && word(32) & 1 != 0 {
+            self.inproc.remove(&word(16));
+        }
         let (time, since) = (self.time, Instant::now());
         let number = i32::from_ne_bytes(fixed[..4].try_into().unwrap());
         let thread = self
@@ -292,6 +311,7 @@ fn link<'a>(env: &'a mut Env<'_>) -> Result<&'a mut Link, crate::status::Error> 
 /// Shows the server the guest's clocks as they read now.
 pub fn set_time(env: &mut Env<'_>) {
     let time = Time::now(&mut env.sys.clock);
+    crate::ntsync::set_time(time);
     if let Some(link) = env.ext.try_get_mut::<Link>() {
         link.time = time;
     }
@@ -300,10 +320,10 @@ pub fn set_time(env: &mut Env<'_>) {
 /// Wakes the blocked threads whose waits the server ended: their
 /// wake-ups are read now, so a thread that runs later finds its own.
 pub fn deliver(env: &mut Env<'_>) -> bool {
+    let mut delivered = crate::sync::deliver_inproc(env);
     let Some(link) = env.ext.try_get_mut::<Link>() else {
-        return false;
+        return delivered;
     };
-    let mut delivered = false;
     #[cfg(not(any(target_vendor = "apple", target_os = "android")))]
     link.ready.get_mut().extend(link.threads.keys().copied());
     for context in std::mem::take(link.ready.get_mut()) {
@@ -585,6 +605,7 @@ pub fn handle_fd(env: &mut Env<'_>, handle: u32) -> Result<HandleFd, crate::stat
 /// Closes `handle` in the server and forgets its descriptor.
 pub fn close(env: &mut Env<'_>, handle: u32) -> Result<(), crate::status::Error> {
     link(env)?.fds.remove(&handle);
+    link(env)?.inproc.remove(&handle);
     let mut request = CloseHandleRequest {
         handle,
         ..Default::default()
@@ -670,6 +691,7 @@ static NEXT_PROCESS: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32
 pub struct Connection {
     socket: UnixStream,
     channel: Channel,
+    inproc_device: Option<crate::ntsync::Fd>,
 }
 
 /// A thread's pipes to the server.
@@ -779,7 +801,19 @@ impl Connection {
             info_size: answer.info_size,
             machines,
         };
-        Ok((Connection { socket, channel }, first))
+        let inproc_device = if answer.inproc_device != 0 {
+            Some(receive_fd(&socket, progress, time)?.1.into())
+        } else {
+            None
+        };
+        Ok((
+            Connection {
+                socket,
+                channel,
+                inproc_device,
+            },
+            first,
+        ))
     }
 }
 
@@ -1078,4 +1112,82 @@ pub(crate) fn boundary(env: &mut Env<'_>, outcome: adv_machine::Outcome) -> adv_
     } else {
         outcome
     }
+}
+
+/// A cached synchronization descriptor; waits retain it across NtClose.
+#[derive(Clone)]
+pub(crate) struct InprocFd {
+    pub fd: Rc<crate::ntsync::Fd>,
+    pub kind: u32,
+    pub access: u32,
+}
+
+pub(crate) fn inproc_device(env: &mut Env<'_>) -> Option<RawFd> {
+    env.ext
+        .try_get::<Link>()?
+        .inproc_device
+        .as_ref()
+        .map(AsRawFd::as_raw_fd)
+}
+
+/// Wine's get_inproc_sync_fd and per-thread get_inproc_alert_fd requests.
+pub(crate) fn inproc_fd(
+    env: &mut Env<'_>,
+    handle: Option<u32>,
+) -> Result<InprocFd, crate::status::Error> {
+    let context = env.context;
+    let link = link(env)?;
+    if let Some(handle) = handle {
+        if let Some(cached) = link.inproc.get(&handle) {
+            return Ok(cached.clone());
+        }
+    } else if let Some(alert) = &link.thread(context).map_err(broken)?.alert {
+        // Only synchronization waits use alerts, so they need no cache entry.
+        return Ok(InprocFd {
+            fd: alert.clone(),
+            kind: 1,
+            access: 0,
+        });
+    }
+    let name = if handle.is_some() {
+        "get_inproc_sync_fd"
+    } else {
+        "get_inproc_alert_fd"
+    };
+    let number = crate::protocol::REQUEST_NAMES
+        .iter()
+        .position(|&s| s == name)
+        .unwrap() as i32;
+    let mut fixed = [0u8; FIXED_SIZE];
+    fixed[..4].copy_from_slice(&number.to_ne_bytes());
+    fixed[12..16].copy_from_slice(&handle.unwrap_or(0).to_ne_bytes());
+    let link = env.ext.get_mut::<Link>();
+    link.call_raw(context, env.cpu, &mut fixed, &[], &mut [])
+        .map_err(broken)?;
+    let word = |offset| u32::from_ne_bytes(fixed[offset..offset + 4].try_into().unwrap());
+    crate::status::check(word(0))?;
+    let (_, fd) = receive_fd(&link.socket, &mut *link.progress, link.time).map_err(broken)?;
+    let fd = crate::ntsync::Fd::from(fd);
+    let cached = if let Some(handle) = handle {
+        let cached = InprocFd {
+            fd: Rc::new(fd),
+            kind: word(8),
+            access: word(12),
+        };
+        if handle < 0xffff_fffa {
+            link.inproc.insert(handle, cached.clone());
+        }
+        cached
+    } else {
+        let fd = Rc::new(fd);
+        let cached = InprocFd {
+            fd: fd.clone(),
+            kind: 1,
+            access: 0,
+        };
+        link.thread(context).map_err(broken)?.alert = Some(fd);
+        cached
+    };
+    deliver(env);
+    Ok(cached)
 }

@@ -15,6 +15,7 @@
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
+#include <sys/ioctl.h>
 #include <unistd.h>
 #include <poll.h>
 #include <signal.h>
@@ -36,6 +37,7 @@ int hitode_asprintf( char **str, const char *format, ... );
 int hitode_chdir( const char *path );
 int hitode_fchdir( int fd );
 int hitode_open( const char *path, int flags, ... );
+int hitode_ioctl( int fd, unsigned long request, ... );
 FILE *hitode_fopen( const char *path, const char *mode );
 int hitode_stat( const char *path, struct stat *st );
 int hitode_lstat( const char *path, struct stat *st );
@@ -97,6 +99,7 @@ int hitode_NSGetExecutablePath( char *buf, uint32_t *size );
 #define chdir(...) hitode_chdir(__VA_ARGS__)
 #define fchdir(...) hitode_fchdir(__VA_ARGS__)
 #define open(...) hitode_open(__VA_ARGS__)
+#define ioctl hitode_ioctl
 #define fopen(...) hitode_fopen(__VA_ARGS__)
 #define stat(...) hitode_stat(__VA_ARGS__)
 #define lstat(...) hitode_lstat(__VA_ARGS__)

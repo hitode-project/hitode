@@ -7,6 +7,8 @@ use std::os::unix::net::UnixStream;
 
 unsafe extern "C" {
     fn hitode_pipe(fds: *mut c_int) -> c_int;
+    fn hitode_open(path: *const libc::c_char, flags: c_int, ...) -> c_int;
+    fn hitode_ioctl(fd: c_int, request: libc::c_ulong, ...) -> c_int;
     fn hitode_close(fd: c_int) -> c_int;
     fn hitode_read(fd: c_int, buf: *mut c_void, size: usize) -> isize;
     fn hitode_write(fd: c_int, buf: *const c_void, size: usize) -> isize;
@@ -302,5 +304,26 @@ fn channel_events_preserve_filters_enablement_data_and_close() {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].filter, libc::EVFILT_WRITE);
         assert_ne!(events[0].flags & libc::EV_EOF, 0);
+    }
+}
+
+// spec: SRV-SYNC-3
+#[test]
+fn non_device_open_ioctl_and_close_reach_libc() {
+    let _ = adv_wineserver::PROTOCOL_VERSION;
+    // SAFETY: paths and buffers are live; every created descriptor closes here.
+    unsafe {
+        let fd = hitode_open(c"/dev/null".as_ptr(), libc::O_RDONLY);
+        assert!(fd >= 0);
+        assert_eq!(libc::read(fd, [0u8; 1].as_mut_ptr().cast(), 1), 0);
+        assert_eq!(hitode_close(fd), 0);
+        let mut fds = [0; 2];
+        assert_eq!(libc::pipe(fds.as_mut_ptr()), 0);
+        assert_eq!(libc::write(fds[1], [1u8].as_ptr().cast(), 1), 1);
+        let mut available = 0i32;
+        assert_eq!(hitode_ioctl(fds[0], libc::FIONREAD, &raw mut available), 0);
+        assert_eq!(available, 1);
+        assert_eq!(hitode_close(fds[0]), 0);
+        assert_eq!(hitode_close(fds[1]), 0);
     }
 }
