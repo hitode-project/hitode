@@ -1,12 +1,16 @@
 //! Registry system calls, after Wine's `unix/registry.c`: the server holds
 //! the registry; these calls pass the request on and lay out the reply.
+//! Complete small value reads are cached until any registry mutation or
+//! handle retirement on this execution owner, including another process's.
 
 use adv_machine::{Env, Outcome};
+use std::cell::Cell;
+use std::collections::HashMap;
 
 use crate::object::{Attributes, read_u32, read_unicode_string, write_bytes, write_u32};
 use crate::protocol::{
     CreateKeyRequest, DeleteKeyRequest, DeleteKeyValueRequest, EnumKeyRequest, EnumKeyValueRequest,
-    FlushKeyRequest, GetKeyValueRequest, OpenKeyRequest, SetKeyValueRequest,
+    FlushKeyRequest, GetKeyValueRequest, OpenKeyRequest, Request, SetKeyValueRequest,
 };
 use crate::server;
 use crate::status::{self, Error, Status};
@@ -33,6 +37,104 @@ const KEY_VALUE_BASIC: u32 = 0;
 const KEY_VALUE_FULL: u32 = 1;
 const KEY_VALUE_PARTIAL: u32 = 2;
 const KEY_VALUE_PARTIAL_ALIGN64: u32 = 3;
+
+thread_local! {
+    static REVISION: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Every typed and raw request passes here before the server can change keys
+/// or retire handles. Processes share the execution owner's revision.
+pub(crate) fn invalidate_request(number: i32) {
+    use crate::protocol::{
+        CloseHandleRequest, DupHandleRequest, LoadRegistryRequest, RenameKeyRequest,
+        UnloadRegistryRequest,
+    };
+    if matches!(
+        number,
+        CreateKeyRequest::NUMBER
+            | SetKeyValueRequest::NUMBER
+            | DeleteKeyValueRequest::NUMBER
+            | DeleteKeyRequest::NUMBER
+            | RenameKeyRequest::NUMBER
+            | LoadRegistryRequest::NUMBER
+            | UnloadRegistryRequest::NUMBER
+            | CloseHandleRequest::NUMBER
+            | DupHandleRequest::NUMBER
+    ) {
+        REVISION.set(REVISION.get().wrapping_add(1));
+    }
+}
+
+#[derive(Clone)]
+struct Value {
+    kind: u32,
+    total: u32,
+    data: Vec<u8>,
+}
+
+#[derive(Default)]
+struct Values {
+    revision: u64,
+    entries: usize,
+    keys: HashMap<u32, HashMap<Vec<u8>, Value>>,
+}
+
+impl Values {
+    fn current(&mut self) -> &mut Self {
+        if self.revision != REVISION.get() {
+            self.keys.clear();
+            self.entries = 0;
+            self.revision = REVISION.get();
+        }
+        self
+    }
+
+    fn get(&mut self, key: u32, name: &[u8], limit: usize) -> Option<Value> {
+        let value = self.current().keys.get(&key)?.get(name)?;
+        Some(Value {
+            kind: value.kind,
+            total: value.total,
+            data: value.data[..value.data.len().min(limit)].to_vec(),
+        })
+    }
+
+    fn insert(&mut self, key: u32, name: &[u8], value: &Value) {
+        if value.data.len() != value.total as usize || value.data.len() > 4096 {
+            return;
+        }
+        self.current();
+        if self.entries == 256 {
+            self.keys.clear();
+            self.entries = 0;
+        }
+        self.keys
+            .entry(key)
+            .or_default()
+            .insert(name.to_vec(), value.clone());
+        self.entries += 1;
+    }
+}
+
+fn read_value(env: &mut Env<'_>, key: u32, name: &[u8], limit: usize) -> Result<Value, Error> {
+    if let Some(value) = env.ext.get_or_default::<Values>().get(key, name, limit) {
+        return Ok(value);
+    }
+    let mut request = GetKeyValueRequest {
+        hkey: key,
+        ..Default::default()
+    };
+    let mut data = vec![0; limit];
+    let (reply, size) = server::request(env, &mut request, &[name], &mut data)?;
+    status::check(reply.header.error)?;
+    data.truncate(size);
+    let value = Value {
+        kind: reply.r#type as u32,
+        total: reply.total,
+        data,
+    };
+    env.ext.get_mut::<Values>().insert(key, name, &value);
+    Ok(value)
+}
 
 const REG_OPTION_VOLATILE: u32 = 1;
 const REG_SZ: i32 = 1;
@@ -265,31 +367,27 @@ pub fn query_value(env: &mut Env<'_>, args: &[u32]) -> Outcome {
             let count = name.len().min((length - minimum) as usize);
             write_bytes(env, info + at, &name[..count])?;
         }
-        let mut data = vec![0u8; length.saturating_sub(fixed) as usize];
-        if data_at.is_none() {
-            data.clear();
-        }
-        let mut request = GetKeyValueRequest {
-            hkey: key,
-            ..Default::default()
+        let limit = if data_at.is_some() {
+            length.saturating_sub(fixed) as usize
+        } else {
+            0
         };
-        let (reply, size) = server::request(env, &mut request, &[&name], &mut data)?;
-        status::check(reply.header.error)?;
+        let value = read_value(env, key, &name, limit)?;
         if let Some(at) = data_at {
-            write_bytes(env, info + at, &data[..size])?;
+            write_bytes(env, info + at, &value.data)?;
         }
-        let kind = reply.r#type as u32;
+        let kind = value.kind;
         let header: Vec<u32> = match class {
             KEY_VALUE_BASIC => vec![0, kind, name.len() as u32],
             KEY_VALUE_FULL => vec![
                 0,
                 kind,
                 20 + name.len() as u32,
-                reply.total,
+                value.total,
                 name.len() as u32,
             ],
-            KEY_VALUE_PARTIAL => vec![0, kind, reply.total],
-            _ => vec![kind, reply.total],
+            KEY_VALUE_PARTIAL => vec![0, kind, value.total],
+            _ => vec![kind, value.total],
         };
         let header: Vec<u8> = header
             .iter()
@@ -300,7 +398,7 @@ pub fn query_value(env: &mut Env<'_>, args: &[u32]) -> Outcome {
             + if class == KEY_VALUE_BASIC {
                 0
             } else {
-                reply.total
+                value.total
             };
         write_u32(env, result_length, needed)?;
         if length < minimum {
@@ -786,4 +884,55 @@ pub fn query_license(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         server::close(env, key)?;
         result
     })())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // spec: WINE-SYS-13
+    #[test]
+    fn cached_values_follow_family_mutations_and_handle_retirement() {
+        let mut first = Values::default();
+        let mut second = Values::default();
+        let value = Value {
+            kind: 4,
+            total: 4,
+            data: 42u32.to_le_bytes().to_vec(),
+        };
+        for cache in [&mut first, &mut second] {
+            cache.insert(12, b"value", &value);
+            let short = cache.get(12, b"value", 1).unwrap();
+            assert_eq!((short.kind, short.total, short.data), (4, 4, vec![42]));
+        }
+        invalidate_request(SetKeyValueRequest::NUMBER);
+        assert!(first.get(12, b"value", 4).is_none());
+        assert!(second.get(12, b"value", 4).is_none());
+        first.insert(12, b"value", &value);
+        invalidate_request(crate::protocol::CloseHandleRequest::NUMBER);
+        assert!(first.get(12, b"value", 4).is_none());
+    }
+
+    // spec: WINE-SYS-13
+    #[test]
+    fn only_complete_bounded_values_are_retained() {
+        let mut cache = Values::default();
+        let mut value = Value {
+            kind: 3,
+            total: 4,
+            data: vec![42],
+        };
+        cache.insert(12, b"partial", &value);
+        assert!(cache.get(12, b"partial", 4).is_none());
+        value.total = 4097;
+        value.data.resize(4097, 0);
+        cache.insert(12, b"large", &value);
+        assert!(cache.get(12, b"large", 4097).is_none());
+        value.total = 4;
+        value.data.truncate(4);
+        for key in 0..257 {
+            cache.insert(key, b"value", &value);
+            assert!(cache.keys.values().map(HashMap::len).sum::<usize>() <= 256);
+        }
+    }
 }

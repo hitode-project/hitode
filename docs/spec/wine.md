@@ -159,6 +159,11 @@ DOS device paths without a host drive MUST resolve through the server's symbolic
 **Verification**: Test
 **Basis**: Wine 11.0 `find_file_in_dir` and `get_dir_case_sensitivity`.
 
+### WINE-SYS-13 Registry value cache
+
+**Rule**: Cached registry reads MUST preserve information classes, buffer negotiation and value contents. Registry mutations and handle retirement through typed or raw requests MUST invalidate caches across the process family. Caches MUST retain at most 256 complete values per process, each at most 4096 bytes.
+**Verification**: Test
+
 ## NT files
 
 NT services follow Wine 11.0's argument checks, server requests and status codes.

@@ -10,6 +10,15 @@ use adv_runtime::wine::session::{Config, Session, Stop};
 /// `None` in the parent process and when no Wine dist is configured. Each
 /// package runs in its own process: the in-process Wine server is global.
 fn probe(test: &str, exe: &str, setup: impl FnOnce(&mut Session, &Path)) -> Option<(Stop, String)> {
+    probe_inspect(test, exe, setup, |_| {})
+}
+
+fn probe_inspect(
+    test: &str,
+    exe: &str,
+    setup: impl FnOnce(&mut Session, &Path),
+    inspect: impl FnOnce(&Session),
+) -> Option<(Stop, String)> {
     if std::env::var_os("ADV_NT_PROBE_CHILD").is_none() {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", test, "--nocapture"])
@@ -53,6 +62,7 @@ fn probe(test: &str, exe: &str, setup: impl FnOnce(&mut Session, &Path)) -> Opti
     let mut session = Session::start(&config, wake, |_| Ok(())).unwrap();
     setup(&mut session, &game);
     let stop = session.run(Instant::now() + Duration::from_secs(60));
+    inspect(&session);
     drop(session);
     drop(stdout);
     let text = std::fs::read_to_string(root.join("stdout")).unwrap();
@@ -371,6 +381,51 @@ fn children() {
             "terminate_child",
             "terminated_wait",
             "terminated_exit",
+        ],
+    );
+}
+
+// spec: WINE-SYS-13
+#[test]
+fn registry() {
+    use adv_nt::protocol::Request;
+    let before = std::cell::Cell::new(0);
+    let queries = |session: &Session| {
+        session
+            .boundaries()
+            .server
+            .get(&adv_nt::protocol::GetKeyValueRequest::NUMBER)
+            .map_or(0, |tally| tally.calls)
+    };
+    let Some((stop, text)) = probe_inspect(
+        "registry",
+        "nt_registry.exe",
+        |session, _| before.set(queries(session)),
+        |session| {
+            let requests = queries(session) - before.get();
+            eprintln!(
+                "registry fixture: {requests} server value queries, including child startup and mutation checks"
+            );
+            assert!(
+                requests < 1000,
+                "repeated reads still reach the server: {requests}"
+            );
+        },
+    ) else {
+        return;
+    };
+    assert!(matches!(stop, Stop::Exited(0)), "{stop:?}: {text}");
+    assert_checks(
+        &text,
+        "=ok",
+        &[
+            "repeat",
+            "size",
+            "short",
+            "update",
+            "child_update",
+            "delete",
+            "reopen",
         ],
     );
 }
