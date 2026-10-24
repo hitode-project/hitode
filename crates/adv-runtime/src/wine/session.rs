@@ -334,9 +334,11 @@ impl Session {
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or("the program name is not Unicode")?;
-        let ntdll_path = config.dist.join("lib/wine/i386-windows/ntdll.dll");
-        let ntdll =
-            std::fs::read(&ntdll_path).map_err(|e| format!("{}: {e}", ntdll_path.display()))?;
+        let module = |name: &str| {
+            let path = config.dist.join(MODULES).join(name);
+            std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))
+        };
+        let (ntdll, apisets) = (module("ntdll.dll")?, module("apisetschema.dll")?);
         let (prefix, _) = prefix(&config)?;
 
         let mut clock = adv_machine::Clock::real();
@@ -378,6 +380,7 @@ impl Session {
         process::start(
             &mut boot,
             &ntdll,
+            &apisets,
             &startup,
             &prefix,
             &socket,
@@ -408,6 +411,7 @@ impl Session {
         process::start(
             &mut machine,
             &ntdll,
+            &apisets,
             &startup,
             &prefix,
             &socket,

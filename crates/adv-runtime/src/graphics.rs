@@ -263,6 +263,7 @@ pub(crate) fn d3d9_provider() -> adv_dx::d3d9::SurfaceProvider {
             let (width, height) = ext.get::<Win32>().user.screen;
             (width.max(1) as u32, height.max(1) as u32, 60)
         },
+        monitor: adv_win32::user32::window::HMONITOR_PRIMARY,
         insert: |ext, target| ext.get_mut::<Graphics<Snapshot>>().insert_native(target),
         target: |ext, id| ext.get::<Graphics<Snapshot>>().native_target(id).cloned(),
         remove: |ext, _, id| {

@@ -76,6 +76,8 @@ pub struct SurfaceProvider {
     /// Host input policy: bypass refresh pacing while physical Ctrl is held.
     pub fast_forward: fn(&Ext) -> bool,
     pub display: fn(&Ext) -> (u32, u32, u32),
+    /// The display's HMONITOR, as the guest's user32 hands it out.
+    pub monitor: u32,
     /// Time since the host display's latest vsync and its period; None keeps
     /// refresh boundaries on the machine clock.
     pub vsync: fn(&Ext) -> Option<(std::time::Duration, std::time::Duration)>,

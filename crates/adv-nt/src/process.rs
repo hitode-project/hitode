@@ -53,6 +53,7 @@ mod peb {
     pub const IMAGE_BASE_ADDRESS: u32 = 0x08;
     pub const LDR: u32 = 0x0c;
     pub const PROCESS_PARAMETERS: u32 = 0x10;
+    pub const API_SET_MAP: u32 = 0x38;
     pub const NUMBER_OF_PROCESSORS: u32 = 0x64;
     pub const HEAP_SEGMENT_RESERVE: u32 = 0x78;
     pub const HEAP_SEGMENT_COMMIT: u32 = 0x7c;
@@ -187,9 +188,30 @@ pub struct Process {
 
 /// Connects to the server at `socket`, maps ntdll.dll and prepares the main
 /// thread, which runs once the machine does. `machine` must use
-/// [`dispatch::Platform`]; `prefix` is the Wine prefix whose drives the
+/// [`dispatch::Platform`]; `apisets` is Wine's apisetschema.dll; `prefix` is the Wine prefix whose drives the
 /// process sees; `progress` runs the server whenever the process waits for
 /// it.
+/// apisetschema.dll's `.apiset` section, when it holds a version 6 map.
+fn api_set_map(dll: &[u8]) -> Result<&[u8], Error> {
+    let invalid = || Error::Context("apisetschema.dll holds no API set map".into());
+    let pe =
+        Pe::parse(dll).map_err(|error| Error::Context(format!("apisetschema.dll: {error}")))?;
+    let section = pe
+        .sections
+        .iter()
+        .find(|section| section.name == ".apiset")
+        .ok_or_else(invalid)?;
+    let start = section.raw_offset as usize;
+    let map = dll
+        .get(start..start + section.virtual_size as usize)
+        .ok_or_else(invalid)?;
+    let field = |offset: usize| u32::from_le_bytes(map[offset..offset + 4].try_into().unwrap());
+    if map.len() < 8 || field(0) != 6 || field(4) as usize > map.len() {
+        return Err(invalid());
+    }
+    Ok(map)
+}
+
 /// Maps the main image as Wine's `load_main_exe` does: through a section of
 /// the file, so the server knows the process's image.
 fn load_main_image(env: &mut Env<'_>, image: &str) -> Result<View, Error> {
@@ -250,6 +272,7 @@ const DISPLAY_DEVICE: &str = r"\Registry\Machine\System\CurrentControlSet\Contro
 pub fn start<B: Backend>(
     machine: &mut Machine<B>,
     ntdll: &[u8],
+    apisets: &[u8],
     startup: &Startup<'_>,
     prefix: &Path,
     socket: &Path,
@@ -321,6 +344,18 @@ pub fn start<B: Backend>(
     ] {
         machine.cpu.write_u32(peb + offset, value)?;
     }
+    // As Wine's `load_apiset_dll`: the map that resolves `api-ms-win-*`
+    // names, which holds offsets from its own start.
+    let map = api_set_map(apisets)?;
+    let at = memory::allocate_committed(
+        &mut machine.cpu,
+        &mut machine.sys.vm,
+        &mut memory,
+        map.len() as u32,
+    )
+    .ok_or(Error::AddressSpace)?;
+    machine.cpu.write(at, map)?;
+    machine.cpu.write_u32(peb + peb::API_SET_MAP, at)?;
 
     // ntdll.dll keeps each thread's debug buffers after its TEB.
     machine.sys.teb_pages = TEB_PAGES;

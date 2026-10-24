@@ -39,6 +39,7 @@ fn machine_with_limits(native: bool, references: u32) -> Machine<JitCpu> {
         visible: |_, _, _| Some(false),
         fast_forward: |_| false,
         display: |_| (16, 12, 60),
+        monitor: 0x0001_0001,
         mode_changed: |_, _, _| Outcome::Return(0),
         device_released: |_, _| {},
         completed: |_, _| None,

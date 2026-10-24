@@ -129,6 +129,9 @@ pub fn run_probe_inspect(
     let ntdll_path = dist.join("lib/wine/i386-windows/ntdll.dll");
     let ntdll = std::fs::read(&ntdll_path)
         .unwrap_or_else(|error| panic!("{}: {error}", ntdll_path.display()));
+    let apisets_path = dist.join("lib/wine/i386-windows/apisetschema.dll");
+    let apisets = std::fs::read(&apisets_path)
+        .unwrap_or_else(|error| panic!("{}: {error}", apisets_path.display()));
 
     #[cfg(target_os = "macos")]
     let cwd = std::env::current_dir().unwrap();
@@ -203,6 +206,7 @@ pub fn run_probe_inspect(
     let started = process::start(
         &mut machine,
         &ntdll,
+        &apisets,
         &startup,
         &prefix,
         &socket,

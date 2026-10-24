@@ -190,10 +190,12 @@ fn d3d9_provider() -> adv_dx::d3d9::SurfaceProvider {
         // Windowed devices only; full-screen modes come with display modes.
         mode_changed: |_, _, _| Outcome::Return(0),
         device_released: |_, _| {},
-        display: |ext| {
-            let store = ext.get::<adv_device::surface::SurfaceStore>();
-            (store.width, store.height, 60)
+        display: |_| {
+            let (width, height) = adv_drv::user::DESKTOP;
+            (width, height, 60)
         },
+        // win32u numbers monitors from 1, and the driver reports one.
+        monitor: 1,
         window: |ext, objects, hwnd| {
             geometry(ext, objects, hwnd).map(|window| (window.width, window.height))
         },

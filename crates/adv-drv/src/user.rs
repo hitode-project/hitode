@@ -16,15 +16,18 @@ use adv_machine::layout::PAGE;
 use adv_nt::process::{Started, module_base, module_export};
 use adv_unix::loader::Libraries;
 
+mod display;
 pub mod input;
 mod surface;
+pub use display::DESKTOP;
 
 /// The driver's file name, the display device's `GraphicsDriver`.
 pub const MODULE: &str = "wineadv.drv";
 /// `WINE_GDI_DRIVER_VERSION` of the vendored Wine.
 const VERSION: u32 = 108;
 /// Offsets in `struct user_driver_funcs` (i386), which is 604 bytes.
-const FUNCS: [(u32, &str); 6] = [
+const FUNCS: [(u32, &str); 7] = [
+    (468, "UpdateDisplayDevices"),
     (476, "CreateWindow"),
     (484, "DestroyWindow"),
     (496, "ProcessEvents"),
@@ -67,6 +70,7 @@ struct Funcs(u32);
 pub(super) fn register(registry: &mut Registry) {
     surface::register(registry);
     input::register(registry);
+    display::register(registry);
     registry.add(MODULE, "DllMain", Conv::Stdcall { argc: 3 }, attach);
     registry.add(
         MODULE,
@@ -136,6 +140,7 @@ pub(super) fn image<B: Backend>(machine: &mut Machine<B>) -> Result<ModuleImage,
     }
     machine.ext.insert(Funcs(funcs));
     machine.ext.insert(input::Presentation::default());
+    display::install(machine)?;
     ModuleImage::build_with_entry(machine, MODULE, Some("DllMain"), &[], &[])
 }
 

@@ -86,16 +86,18 @@ fn call(
 /// CreateWindowSurface(hwnd, layered, surface_rect, surface).
 fn create(env: &mut Env<'_>) -> Outcome {
     let (hwnd, bounds, output) = (env.arg(0), env.arg(2), env.arg(3));
-    if is_desktop(env, hwnd) {
-        // The desktop presents nothing, but its DC spans the virtual screen:
-        // win32u's offscreen surface covers it, where the 1×1 default would
-        // clip it.
-        return Outcome::Return(0);
-    }
     let previous = check!(env.cpu.read_u32(output));
     if previous != 0 && env.cpu.read_u32(previous).ok() == Some(surface_funcs(env)) {
         return Outcome::Return(1);
     }
+    // The desktop presents nothing, but its DCs span the virtual screen:
+    // exactly, where win32u's own surface would round it up to whole tiles
+    // and the 1×1 default would clip it.
+    let bounds = if is_desktop(env, hwnd) {
+        super::display::screen(env)
+    } else {
+        bounds
+    };
     let [left, top, right, bottom] = check!(rect(env, bounds));
     let (width, height) = (right - left, bottom - top);
     if width <= 0 || height <= 0 {

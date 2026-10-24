@@ -89,6 +89,7 @@ impl Fixture {
                     visible: |_, _, _| None,
                     fast_forward: |_| false,
                     display: |_| (1920, 1080, 32),
+                    monitor: 0x0001_0001,
                     mode_changed: |_, _, _| panic!("DxDiag never changes display mode"),
                     device_released: |_, _| panic!("DxDiag never creates devices"),
                     completed: |_, _| None,
