@@ -133,6 +133,18 @@ REQUESTS = [
     "get_new_process_info",
     "get_startup_info",
     "set_queue_fd",
+    "create_token",
+    "adjust_token_privileges",
+    "filter_token",
+    "check_token_privileges",
+    "access_check",
+    "set_token_default_dacl",
+    "set_security_object",
+    "get_security_object",
+    "compare_objects",
+    "allocate_reserve_object",
+    "set_object_permanence",
+    "get_token_default_dacl",
 ]
 
 # Structures sent as request or reply data. Their fields are integers laid

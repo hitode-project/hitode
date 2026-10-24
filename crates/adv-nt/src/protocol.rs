@@ -3418,3 +3418,361 @@ impl Request for SetQueueFdRequest {
         &mut self.header
     }
 }
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CreateTokenRequest {
+    pub header: RequestHeader,
+    pub token_id: [u8; 8],
+    pub access: u32,
+    pub primary: i32,
+    pub impersonation_level: i32,
+    pub expire: i64,
+    pub group_count: i32,
+    pub primary_group: i32,
+    pub priv_count: i32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<CreateTokenRequest>() == 56);
+const _: () = assert!(std::mem::offset_of!(CreateTokenRequest, token_id) == 12);
+const _: () = assert!(std::mem::offset_of!(CreateTokenRequest, access) == 20);
+const _: () = assert!(std::mem::offset_of!(CreateTokenRequest, primary) == 24);
+const _: () = assert!(std::mem::offset_of!(CreateTokenRequest, impersonation_level) == 28);
+const _: () = assert!(std::mem::offset_of!(CreateTokenRequest, expire) == 32);
+const _: () = assert!(std::mem::offset_of!(CreateTokenRequest, group_count) == 40);
+const _: () = assert!(std::mem::offset_of!(CreateTokenRequest, primary_group) == 44);
+const _: () = assert!(std::mem::offset_of!(CreateTokenRequest, priv_count) == 48);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CreateTokenReply {
+    pub header: ReplyHeader,
+    pub token: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<CreateTokenReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(CreateTokenReply, token) == 8);
+
+impl Request for CreateTokenRequest {
+    const NUMBER: i32 = 219;
+    type Reply = CreateTokenReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AdjustTokenPrivilegesRequest {
+    pub header: RequestHeader,
+    pub handle: u32,
+    pub disable_all: i32,
+    pub get_modified_state: i32,
+}
+const _: () = assert!(size_of::<AdjustTokenPrivilegesRequest>() == 24);
+const _: () = assert!(std::mem::offset_of!(AdjustTokenPrivilegesRequest, handle) == 12);
+const _: () = assert!(std::mem::offset_of!(AdjustTokenPrivilegesRequest, disable_all) == 16);
+const _: () = assert!(std::mem::offset_of!(AdjustTokenPrivilegesRequest, get_modified_state) == 20);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AdjustTokenPrivilegesReply {
+    pub header: ReplyHeader,
+    pub len: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<AdjustTokenPrivilegesReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(AdjustTokenPrivilegesReply, len) == 8);
+
+impl Request for AdjustTokenPrivilegesRequest {
+    const NUMBER: i32 = 222;
+    type Reply = AdjustTokenPrivilegesReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FilterTokenRequest {
+    pub header: RequestHeader,
+    pub handle: u32,
+    pub flags: u32,
+    pub privileges_size: u32,
+}
+const _: () = assert!(size_of::<FilterTokenRequest>() == 24);
+const _: () = assert!(std::mem::offset_of!(FilterTokenRequest, handle) == 12);
+const _: () = assert!(std::mem::offset_of!(FilterTokenRequest, flags) == 16);
+const _: () = assert!(std::mem::offset_of!(FilterTokenRequest, privileges_size) == 20);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FilterTokenReply {
+    pub header: ReplyHeader,
+    pub new_handle: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<FilterTokenReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(FilterTokenReply, new_handle) == 8);
+
+impl Request for FilterTokenRequest {
+    const NUMBER: i32 = 226;
+    type Reply = FilterTokenReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CheckTokenPrivilegesRequest {
+    pub header: RequestHeader,
+    pub handle: u32,
+    pub all_required: i32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<CheckTokenPrivilegesRequest>() == 24);
+const _: () = assert!(std::mem::offset_of!(CheckTokenPrivilegesRequest, handle) == 12);
+const _: () = assert!(std::mem::offset_of!(CheckTokenPrivilegesRequest, all_required) == 16);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CheckTokenPrivilegesReply {
+    pub header: ReplyHeader,
+    pub has_privileges: i32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<CheckTokenPrivilegesReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(CheckTokenPrivilegesReply, has_privileges) == 8);
+
+impl Request for CheckTokenPrivilegesRequest {
+    const NUMBER: i32 = 224;
+    type Reply = CheckTokenPrivilegesReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AccessCheckRequest {
+    pub header: RequestHeader,
+    pub handle: u32,
+    pub desired_access: u32,
+    pub mapping: [u8; 20],
+}
+const _: () = assert!(size_of::<AccessCheckRequest>() == 40);
+const _: () = assert!(std::mem::offset_of!(AccessCheckRequest, handle) == 12);
+const _: () = assert!(std::mem::offset_of!(AccessCheckRequest, desired_access) == 16);
+const _: () = assert!(std::mem::offset_of!(AccessCheckRequest, mapping) == 20);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AccessCheckReply {
+    pub header: ReplyHeader,
+    pub access_granted: u32,
+    pub access_status: u32,
+    pub privileges_len: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<AccessCheckReply>() == 24);
+const _: () = assert!(std::mem::offset_of!(AccessCheckReply, access_granted) == 8);
+const _: () = assert!(std::mem::offset_of!(AccessCheckReply, access_status) == 12);
+const _: () = assert!(std::mem::offset_of!(AccessCheckReply, privileges_len) == 16);
+
+impl Request for AccessCheckRequest {
+    const NUMBER: i32 = 227;
+    type Reply = AccessCheckReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SetTokenDefaultDaclRequest {
+    pub header: RequestHeader,
+    pub handle: u32,
+}
+const _: () = assert!(size_of::<SetTokenDefaultDaclRequest>() == 16);
+const _: () = assert!(std::mem::offset_of!(SetTokenDefaultDaclRequest, handle) == 12);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SetTokenDefaultDaclReply {
+    pub header: ReplyHeader,
+}
+const _: () = assert!(size_of::<SetTokenDefaultDaclReply>() == 8);
+
+impl Request for SetTokenDefaultDaclRequest {
+    const NUMBER: i32 = 231;
+    type Reply = SetTokenDefaultDaclReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SetSecurityObjectRequest {
+    pub header: RequestHeader,
+    pub handle: u32,
+    pub security_info: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<SetSecurityObjectRequest>() == 24);
+const _: () = assert!(std::mem::offset_of!(SetSecurityObjectRequest, handle) == 12);
+const _: () = assert!(std::mem::offset_of!(SetSecurityObjectRequest, security_info) == 16);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SetSecurityObjectReply {
+    pub header: ReplyHeader,
+}
+const _: () = assert!(size_of::<SetSecurityObjectReply>() == 8);
+
+impl Request for SetSecurityObjectRequest {
+    const NUMBER: i32 = 232;
+    type Reply = SetSecurityObjectReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GetSecurityObjectRequest {
+    pub header: RequestHeader,
+    pub handle: u32,
+    pub security_info: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<GetSecurityObjectRequest>() == 24);
+const _: () = assert!(std::mem::offset_of!(GetSecurityObjectRequest, handle) == 12);
+const _: () = assert!(std::mem::offset_of!(GetSecurityObjectRequest, security_info) == 16);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GetSecurityObjectReply {
+    pub header: ReplyHeader,
+    pub sd_len: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<GetSecurityObjectReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(GetSecurityObjectReply, sd_len) == 8);
+
+impl Request for GetSecurityObjectRequest {
+    const NUMBER: i32 = 233;
+    type Reply = GetSecurityObjectReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CompareObjectsRequest {
+    pub header: RequestHeader,
+    pub first: u32,
+    pub second: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<CompareObjectsRequest>() == 24);
+const _: () = assert!(std::mem::offset_of!(CompareObjectsRequest, first) == 12);
+const _: () = assert!(std::mem::offset_of!(CompareObjectsRequest, second) == 16);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CompareObjectsReply {
+    pub header: ReplyHeader,
+}
+const _: () = assert!(size_of::<CompareObjectsReply>() == 8);
+
+impl Request for CompareObjectsRequest {
+    const NUMBER: i32 = 25;
+    type Reply = CompareObjectsReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AllocateReserveObjectRequest {
+    pub header: RequestHeader,
+    pub r#type: i32,
+}
+const _: () = assert!(size_of::<AllocateReserveObjectRequest>() == 16);
+const _: () = assert!(std::mem::offset_of!(AllocateReserveObjectRequest, r#type) == 12);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AllocateReserveObjectReply {
+    pub header: ReplyHeader,
+    pub handle: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<AllocateReserveObjectReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(AllocateReserveObjectReply, handle) == 8);
+
+impl Request for AllocateReserveObjectRequest {
+    const NUMBER: i32 = 24;
+    type Reply = AllocateReserveObjectReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SetObjectPermanenceRequest {
+    pub header: RequestHeader,
+    pub handle: u32,
+    pub permanent: i32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<SetObjectPermanenceRequest>() == 24);
+const _: () = assert!(std::mem::offset_of!(SetObjectPermanenceRequest, handle) == 12);
+const _: () = assert!(std::mem::offset_of!(SetObjectPermanenceRequest, permanent) == 16);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SetObjectPermanenceReply {
+    pub header: ReplyHeader,
+}
+const _: () = assert!(size_of::<SetObjectPermanenceReply>() == 8);
+
+impl Request for SetObjectPermanenceRequest {
+    const NUMBER: i32 = 26;
+    type Reply = SetObjectPermanenceReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GetTokenDefaultDaclRequest {
+    pub header: RequestHeader,
+    pub handle: u32,
+}
+const _: () = assert!(size_of::<GetTokenDefaultDaclRequest>() == 16);
+const _: () = assert!(std::mem::offset_of!(GetTokenDefaultDaclRequest, handle) == 12);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GetTokenDefaultDaclReply {
+    pub header: ReplyHeader,
+    pub acl_len: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<GetTokenDefaultDaclReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(GetTokenDefaultDaclReply, acl_len) == 8);
+
+impl Request for GetTokenDefaultDaclRequest {
+    const NUMBER: i32 = 230;
+    type Reply = GetTokenDefaultDaclReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
