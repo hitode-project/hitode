@@ -93,3 +93,117 @@ fn a_session_runs_a_program_from_its_directory_and_presents() {
     assert_eq!(size, (64, 32));
     assert_eq!(inked, 43);
 }
+
+// spec: WINE-UI-1, WINE-UI-2
+#[test]
+fn popup_choice_and_cancel_run_wines_modal_loop() {
+    // The in-process server can start only once in each host process.
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "popup_choice_and_cancel_child",
+            "--nocapture",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+// spec: WINE-UI-1, WINE-UI-2
+#[test]
+#[ignore = "subprocess entry for the popup session test"]
+fn popup_choice_and_cancel_child() {
+    use adv_runtime::MenuEvent;
+    use std::sync::atomic::Ordering;
+
+    let (Some(dist), Some(probes)) = (
+        std::env::var_os("ADV_WINE_DIST").map(PathBuf::from),
+        std::env::var_os("ADV_WINE_PROBES").map(PathBuf::from),
+    ) else {
+        eprintln!("skipped: ADV_WINE_DIST or ADV_WINE_PROBES is not set");
+        return;
+    };
+    let root = std::env::temp_dir().join(format!("adv-wine-popup-{}", std::process::id()));
+    let (mut output, stdout) = std::io::pipe().unwrap();
+    let config = Config {
+        dist: &dist,
+        prefix: &root,
+        drive: None,
+        locale: 0x409,
+        fonts: "",
+        exe: &probes.join("popup_menu.exe"),
+        width: 640,
+        height: 480,
+        jit: true,
+        debug: "",
+        stdout: Some(stdout.as_raw_fd()),
+    };
+    let mut session =
+        Session::start(&config, adv_sync::WakeEvent::new().unwrap(), |_| Ok(())).unwrap();
+    drop(stdout);
+    let until = Instant::now() + Duration::from_secs(60);
+    let mut first = None;
+    let mut second = None;
+    let stop = loop {
+        assert!(Instant::now() < until, "popup did not complete");
+        session.refresh_ui();
+        let bar = session.menu_bar();
+        if let Some(popup) = bar.popup {
+            assert_eq!((popup.x, popup.y), (12, 16));
+            assert_ne!(
+                session.input_view().top,
+                bar.key.window,
+                "popup presented as a frame"
+            );
+            if first.is_none() {
+                assert!(popup.active.load(Ordering::Acquire));
+                first = Some(popup.active);
+                let choice = bar.items[0].children[0].command;
+                assert_eq!(choice.id, 42);
+                assert!(session.menu_event(MenuEvent::Command(choice)));
+            } else if !std::sync::Arc::ptr_eq(first.as_ref().unwrap(), &popup.active)
+                && second.is_none()
+            {
+                assert!(!first.as_ref().unwrap().load(Ordering::Acquire));
+                second = Some(popup.active);
+                assert!(session.menu_event(MenuEvent::Cancel {
+                    window: bar.key.window,
+                    root: bar.key.menu
+                }));
+            }
+        }
+        match session.run(Instant::now() + Duration::from_millis(20)) {
+            Stop::Paused => {}
+            stop => break stop,
+        }
+    };
+    let completed = (first, second);
+    assert!(session.menu_bar().popup.is_none());
+    drop(session);
+    // SAFETY: output owns the pipe's read descriptor.
+    assert_eq!(
+        unsafe { libc::fcntl(output.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) },
+        0
+    );
+    let mut text = String::new();
+    let _ = output.read_to_string(&mut text);
+    std::fs::remove_dir_all(root).unwrap();
+    assert!(matches!(stop, Stop::Exited(0)), "{stop:?}: {text}");
+    assert!(!completed.0.unwrap().load(Ordering::Acquire));
+    assert!(!completed.1.unwrap().load(Ordering::Acquire));
+    assert!(text.contains("select=42 flags="), "{text}");
+    assert!(
+        text.contains("picked=42 initialized=2 commands=0 syscommands=0"),
+        "{text}"
+    );
+    assert!(
+        text.contains("cancelled=0 initialized=0 commands=0 syscommands=0"),
+        "{text}"
+    );
+}

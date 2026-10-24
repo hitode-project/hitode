@@ -228,6 +228,33 @@ FreeType is such a library: win32u opens it by name and draws TrueType text thro
 **Rule**: Each input thread MUST register its event pipe as Wine's queue fd. Queuing host input MUST run the server and deliver wake-ups even when every guest context waits. Input waits MUST NOT use periodic polling.
 **Verification**: Test
 
+## Native UI and control
+
+### WINE-UI-1 Native popup presentation
+
+**Rule**: Shown `#32768` windows MUST project their `MN_GETHMENU` items natively relative to the presented window's content, without presenting frames. Their completion tokens MUST become inactive when tracking ends.
+**Verification**: Test
+
+### WINE-UI-2 Popup input
+
+**Rule**: Host popup choices MUST click Wine's item rectangles, opening ancestor submenus in order. Cancellation MUST end Wine's menu loop. Wine MUST retain `TPM_RETURNCMD`, `TPM_NONOTIFY`, and menu notification behavior.
+**Verification**: Test
+
+### WINE-UI-3 Frame control
+
+**Rule**: Headless Wine control MUST support `await-frame` and `resume` through the shared frame gate. A matched or failed gate MUST freeze guest execution before acknowledgment.
+**Verification**: Test
+
+### WINE-UI-4 Memory inspection
+
+**Rule**: Wine control `memory` MUST read the presented process's guest memory and report read failures.
+**Verification**: Test
+
+### WINE-UI-5 Metrics and reports
+
+**Rule**: Wine control MUST support `reset-metrics` and `report`. Reset MUST restart frame observations, first-frame timing, and supported wait statistics. Reports MUST omit sections requiring unavailable stack data.
+**Verification**: Test
+
 ## Audio
 
 ### WINE-AUD-1 Builtin render driver

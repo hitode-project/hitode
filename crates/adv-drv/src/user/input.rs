@@ -125,6 +125,14 @@ pub fn presented_window(ext: &Ext) -> Option<u32> {
     window(ext, hwnd).map(|_| hwnd)
 }
 
+/// The screen origin used by the last presented client frame.
+pub(super) fn presented_origin(ext: &Ext) -> Option<(i32, i32)> {
+    ext.get::<Presentation>()
+        .last
+        .get()
+        .map(|(_, origin)| origin)
+}
+
 /// Run `job` on the guest thread that owns `hwnd`, when it next looks at
 /// its queue.
 pub(super) fn schedule(ext: &mut Ext, hwnd: u32, job: Job) -> bool {
@@ -191,6 +199,22 @@ pub fn text(ext: &mut Ext, text: &str) -> usize {
         typed += 1;
     }
     typed
+}
+
+/// Queue a screen-coordinate click on this thread for Wine's modal menu loop.
+pub(super) fn click(env: &mut Env<'_>, hwnd: u32, x: i32, y: i32) -> Result<(), String> {
+    for (mask, flag) in [(QS_MOUSEMOVE, 0), (QS_MOUSEBUTTON, 2), (QS_MOUSEBUTTON, 4)] {
+        push(
+            env.ext,
+            env.context,
+            Event::Input(Input {
+                hwnd,
+                mask,
+                words: [0, x as u32, y as u32, 0, flag | 0x8001, 0, 0],
+            }),
+        )?;
+    }
+    Ok(())
 }
 
 /// Queue a host Win32 mouse or key message. Mouse points are relative to
