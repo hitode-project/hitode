@@ -224,7 +224,7 @@ fn asprintf(env: &mut Env<'_>) -> Outcome {
 }
 
 /// `format` with the arguments at `args`, as glibc's printf formats the
-/// integer, character, string and pointer conversions.
+/// integer, fixed-point, character, string and pointer conversions.
 fn print(env: &mut Env<'_>, format: u32, mut args: u32) -> Result<Vec<u8>, String> {
     let format = string(env, format, MAX_STRING)?;
     let mut next = |env: &Env<'_>| {
@@ -314,6 +314,47 @@ fn print(env: &mut Env<'_>, format: u32, mut args: u32) -> Result<Vec<u8>, Strin
         };
         match conversion {
             b'%' => out.push(b'%'),
+            b'f' | b'F' if length.is_empty() || length == b"l" => {
+                let low = next(env)?;
+                let value = f64::from_bits(u64::from(low) | u64::from(next(env)?) << 32);
+                let format = format!(
+                    "%{}{}{}{}{}*.*{}\0",
+                    if left { "-" } else { "" },
+                    if plus { "+" } else { "" },
+                    if space { " " } else { "" },
+                    if alternate { "#" } else { "" },
+                    if zero { "0" } else { "" },
+                    conversion as char,
+                );
+                let width = i32::try_from(width).map_err(|_| "floating width exceeds INT_MAX")?;
+                let precision = i32::try_from(precision.unwrap_or(6))
+                    .map_err(|_| "floating precision exceeds INT_MAX")?;
+                // SAFETY: the generated C format takes two ints and one double.
+                let size = unsafe {
+                    ::libc::snprintf(
+                        std::ptr::null_mut(),
+                        0,
+                        format.as_ptr().cast(),
+                        width,
+                        precision,
+                        value,
+                    )
+                };
+                let size = usize::try_from(size).map_err(|_| "floating conversion failed")?;
+                let mut text = vec![0u8; size + 1];
+                // SAFETY: text holds the measured output and its terminating NUL.
+                unsafe {
+                    ::libc::snprintf(
+                        text.as_mut_ptr().cast(),
+                        text.len(),
+                        format.as_ptr().cast(),
+                        width,
+                        precision,
+                        value,
+                    );
+                }
+                out.extend_from_slice(&text[..size]);
+            }
             b'd' | b'i' | b'u' | b'x' | b'X' | b'o' => {
                 let raw = if wide {
                     let low = next(env)?;
@@ -652,4 +693,67 @@ fn assert_fail(env: &mut Env<'_>) -> Outcome {
         text(env, env.arg(3)),
         text(env, env.arg(0)),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use adv_cpu::{
+        Cpu,
+        backend::{Guest, Prot},
+    };
+    use adv_machine::{Clock, Machine, layout::PARK_ADDR};
+    #[cfg(any(target_vendor = "apple", target_os = "android"))]
+    use adv_wineserver as _;
+
+    // spec: WINE-UNIX-5
+    #[test]
+    fn fixed_point_arguments_and_bounded_output() {
+        let mut machine = Machine::new(
+            Cpu::new(PARK_ADDR, false).unwrap(),
+            crate::Platform,
+            Clock::virtual_time(),
+        )
+        .unwrap();
+        let (format, args, buffer) = (0x400000, 0x400100, 0x400200);
+        machine.cpu.map(format, 0x1000, Prot::RW).unwrap();
+        for (spec, value, expected) in [
+            ("%f", 1.25, "1.250000"),
+            ("%+.2f", 1.25, "+1.25"),
+            ("%08.2f", -1.25, "-0001.25"),
+            ("%-8.2lf", 1.25, "1.25    "),
+            ("%#.0f", 2.0, "2."),
+            ("% f", -0.0, "-0.000000"),
+            ("%08f", f64::INFINITY, "     inf"),
+            ("%F", f64::NAN, "NAN"),
+        ] {
+            machine
+                .cpu
+                .write(format, format!("{spec}:%u\0").as_bytes())
+                .unwrap();
+            machine.cpu.write(args, &value.to_le_bytes()).unwrap();
+            machine.cpu.write_u32(args + 8, 37).unwrap();
+            machine.visit_context(None, |env| {
+                let expected = format!("{expected}:37");
+                assert_eq!(print(env, format, args).unwrap(), expected.as_bytes());
+                assert!(matches!(print_to(env, buffer, 4, format, args), Outcome::Return(n) if n == expected.len() as u32));
+                let mut bytes = [0; 4];
+                env.cpu.read(buffer, &mut bytes).unwrap();
+                assert_eq!(&bytes[..3], &expected.as_bytes()[..3]);
+                assert_eq!(bytes[3], 0);
+            }).unwrap();
+        }
+        machine.cpu.write(format, b"%*.*f:%u\0").unwrap();
+        machine.cpu.write_u32(args, (-8i32) as u32).unwrap();
+        machine.cpu.write_u32(args + 4, 2).unwrap();
+        machine.cpu.write(args + 8, &1.25f64.to_le_bytes()).unwrap();
+        machine.cpu.write_u32(args + 16, 37).unwrap();
+        assert_eq!(
+            machine
+                .visit_context(None, |env| print(env, format, args))
+                .unwrap()
+                .unwrap(),
+            b"1.25    :37"
+        );
+    }
 }

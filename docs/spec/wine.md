@@ -275,6 +275,11 @@ An ntdll.dll export with no known convention stops the load. A weak symbol nothi
 
 FreeType is such a library: win32u opens it by name and draws TrueType text through it.
 
+### WINE-UNIX-5 Fixed-point formatting
+
+**Rule**: Unix library printf-family functions MUST consume `%f` and `%F` arguments as i386 doubles, preserving flags, width, precision and following arguments. Bounded output MUST retain the full formatted length and terminate any nonempty buffer.
+**Verification**: Test
+
 ## Threads
 
 ### WINE-THR-1 One scheduling authority
