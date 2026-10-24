@@ -1534,6 +1534,7 @@ mod tests {
                 fault: 0,
             },
             &|_, _| false,
+            &|_| None,
             0x037f,
         );
         println!(

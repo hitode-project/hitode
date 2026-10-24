@@ -397,9 +397,10 @@ pub fn translate(
     at: usize,
     stubs: Stubs,
     leaf: &dyn Fn(u32, u32) -> bool,
+    redirect: &dyn Fn(u32) -> Option<(u32, Vec<u8>)>,
     control: u16,
 ) {
-    work.trace.build(memory, eip, stops, leaf);
+    work.trace.build(memory, eip, stops, leaf, redirect);
     tables::prepare(work, memory);
     for &(start, len) in &work.trace.code {
         memory.watch_code(start, len as usize);

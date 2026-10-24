@@ -344,3 +344,65 @@ fn env_leaf_forwards_memory_queries_to_the_backend() {
     leaf.copy_memory(0x500000, 0x501000, 4).unwrap();
     assert_eq!(machine.cpu.read_u32(0x501000).unwrap(), 0x0403_0201);
 }
+
+/// A function returning its argument plus one, at `FUNCTION`.
+const FUNCTION: u32 = CODE + 0x1000;
+const PLUS_ONE: [u8; 8] = [0x8b, 0x44, 0x24, 0x04, 0x83, 0xc0, 0x01, 0xc3];
+
+struct Doubling;
+impl crate::Resolver for Doubling {
+    fn provides(&self, _: &str) -> bool {
+        true
+    }
+    fn host_fn(&self, _: &str, _: &str) -> Option<crate::HostFn> {
+        Some(crate::HostFn {
+            conv: Conv::Cdecl { argc: 1 },
+            env_leaf: Some(|env| Some(u64::from(env.arg(0) * 2))),
+            handler: |env| Outcome::Return(env.arg(0) * 2),
+            data: 0,
+            trace: false,
+            guest: None,
+            leaf: None,
+        })
+    }
+}
+
+// spec: A64-CTL-14
+#[test]
+fn redirected_functions_run_the_target_while_their_bytes_are_unchanged() {
+    let mut machine = Machine::new(
+        JitCpu::new(PARK_ADDR, true).unwrap(),
+        Doubling,
+        Clock::virtual_time(),
+    )
+    .unwrap();
+    machine.spawn("redirect test", CODE, &[], 65536).unwrap();
+    machine.cpu.map(CODE, 0x4000, Prot::RWX).unwrap();
+    machine.cpu.map(DATA, 0x4000, Prot::RW).unwrap();
+    let mut code = Asm::new(CODE);
+    code.push_imm(21).call(FUNCTION).add_esp(4).jmp(PARK_ADDR);
+    machine.cpu.write(CODE, &code.bytes).unwrap();
+    machine.cpu.write(FUNCTION, &PLUS_ONE).unwrap();
+    let thunk = machine.resolve_import("fixture.dll", "double").unwrap();
+    machine
+        .sys
+        .redirects
+        .insert(FUNCTION, (thunk, PLUS_ONE.into()));
+    let results = |machine: &mut Machine<JitCpu>| {
+        (0..3)
+            .map(|_| {
+                run(machine);
+                machine.cpu.reg(Reg::Eax)
+            })
+            .collect::<Vec<_>>()
+    };
+    // The first visit may run in the interpreter, which runs the function.
+    assert_eq!(results(&mut machine)[1..], [42, 42]);
+    let mut changed = PLUS_ONE;
+    changed[6] = 2;
+    machine.cpu.write(FUNCTION, &changed).unwrap();
+    assert_eq!(results(&mut machine), [23, 23, 23]);
+    machine.sys.trace = Trace::to_writer(Box::new(std::io::sink()));
+    machine.cpu.write(FUNCTION, &PLUS_ONE).unwrap();
+    assert_eq!(results(&mut machine), [22, 22, 22]);
+}

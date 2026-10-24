@@ -418,6 +418,14 @@ pub trait TrapHandler {
         None
     }
 
+    /// Where translated code continues instead of entering the function at
+    /// `pc`, while the bytes there are still the returned ones. The
+    /// interpreter runs the function itself, so the target must behave as
+    /// the function does.
+    fn redirect(&self, _pc: u32) -> Option<(u32, &[u8])> {
+        None
+    }
+
     /// The execution owner's guest clock, when one is installed. CPU reference
     /// counters use the same domain as guest OS time; this is not device time.
     /// A standalone backend may use its own reference clock when absent.

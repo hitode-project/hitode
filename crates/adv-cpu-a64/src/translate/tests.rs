@@ -87,6 +87,7 @@ fn full_x87_units_keep_short_branches_to_cold_code_in_reach() {
             host,
             stubs,
             &leaf,
+            &|_| None,
             0x037f,
         );
         assert!(
@@ -135,6 +136,7 @@ fn bytecode_vm_dispatch_instruction_gate() {
         HOST_CODE as usize,
         stubs,
         &|_, _| false,
+        &|_| None,
         0x037f,
     );
     let branch = work.words().iter().position(|&w| w == br(X17)).unwrap();
@@ -158,6 +160,7 @@ fn bytecode_vm_dispatch_instruction_gate() {
         HOST_CODE as usize,
         stubs,
         &|_, _| false,
+        &|_| None,
         0x037f,
     );
     assert_eq!(work.tables.len(), 1);
@@ -319,6 +322,7 @@ impl Harness {
                 fault: addr(self.forbidden),
             },
             &|_, _| false,
+            &|_| None,
             0x037f,
         );
         assert!(
@@ -780,6 +784,7 @@ fn switch_table_recognition_checks_unsigned_bounds_pages_and_index_provenance() 
                 HOST_CODE as usize,
                 stubs,
                 &|_, _| false,
+                &|_| None,
                 0x037f,
             );
             let count = work.tables.first().map_or(0, |t| t.targets.len());

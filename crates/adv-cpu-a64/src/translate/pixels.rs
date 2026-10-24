@@ -200,7 +200,7 @@ mod tests {
                     .unwrap();
                 stops.push(inst.ip32());
             }
-            trace.build(&memory, 0x10000, &stops, &|_, _| false);
+            trace.build(&memory, 0x10000, &stops, &|_, _| false, &|_| None);
             assert_eq!(
                 Plan::at(&trace, 0, &|_| variant == 5).is_some(),
                 variant == 0

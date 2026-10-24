@@ -139,13 +139,16 @@ fn slot(pc: u32, frame: u16) -> usize {
 
 impl Trace {
     /// Traces from `entry`, ending before any of `stops` except at the
-    /// entry.
+    /// entry. `redirect` gives, for a function entry whose calls go
+    /// elsewhere, the target and the bytes the function must still begin
+    /// with; the trace then jumps there instead of decoding the function.
     pub fn build(
         &mut self,
         memory: &Memory,
         entry: u32,
         stops: &[u32],
         leaf: &dyn Fn(u32, u32) -> bool,
+        redirect: &dyn Fn(u32) -> Option<(u32, Vec<u8>)>,
     ) {
         self.insts.clear();
         self.code.clear();
@@ -178,7 +181,18 @@ impl Trace {
                 self.insts[len - 1].next = Next::Edge(edge);
                 break;
             }
-            let Some((op, size)) = fetcher.fetch(pc) else {
+            let redirected = redirect(pc).filter(|(_, original)| {
+                let mut bytes = vec![0; original.len()];
+                memory.read_into(pc, &mut bytes).is_ok() && bytes == *original
+            });
+            let fetched = match redirected {
+                Some((target, original)) => {
+                    self.code.push((pc, original.len() as u32));
+                    Some((Op::Jmp(target), 0))
+                }
+                None => fetcher.fetch(pc),
+            };
+            let Some((op, size)) = fetched else {
                 self.failure = fetcher.failure;
                 if let Some(last) = self.insts.last_mut() {
                     last.next = Next::Edge(Edge::Interpret(pc));

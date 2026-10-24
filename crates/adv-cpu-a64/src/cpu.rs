@@ -490,6 +490,10 @@ impl ExecutionTrap for Raw<'_> {
         self.handler.leaf_call(pc, word)
     }
 
+    fn redirect(&self, pc: u32) -> Option<(u32, &[u8])> {
+        self.handler.redirect(pc)
+    }
+
     fn leaf(
         &mut self,
         state: &mut CpuState,

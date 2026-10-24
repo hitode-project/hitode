@@ -1168,6 +1168,17 @@ impl Native {
                     .as_ref()
                     .is_some_and(|handler| handler.leaf_call(pc, word))
             },
+            &|pc| {
+                if self.bridge.is_null() {
+                    return None;
+                }
+                // SAFETY: as for `leaf_call`.
+                let handler = unsafe { &*self.bridge.cast::<Bridge<'_>>() }
+                    .handler
+                    .as_ref()?;
+                let (target, original) = handler.redirect(pc)?;
+                Some((target, original.to_vec()))
+            },
             control,
         );
         if work.retired() == 0 {

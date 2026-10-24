@@ -38,7 +38,7 @@ pub mod wait_diagnostics;
 mod wake_queue;
 pub use wake_queue::WakePriority;
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use adv_cpu::backend::asm::Asm;
@@ -148,6 +148,10 @@ pub struct Sys {
     pub recent: RecentCalls,
     /// Host calls handled so far.
     pub host_calls: u64,
+    /// Guest functions whose translated calls go to a host thunk instead, by
+    /// entry, with the bytes the function begins with
+    /// ([`adv_cpu::backend::TrapHandler::redirect`]).
+    pub redirects: HashMap<u32, (u32, Box<[u8]>)>,
     /// Stop with an error after this many host calls (a debugging aid for guest loops that
     /// never block).
     pub call_limit: Option<u64>,
@@ -1738,6 +1742,14 @@ impl TrapHandler for Dispatch<'_> {
         Some(value)
     }
 
+    fn redirect(&self, pc: u32) -> Option<(u32, &[u8])> {
+        if self.sys.trace.enabled() || self.sys.call_limit.is_some() {
+            return None;
+        }
+        let (target, original) = self.sys.redirects.get(&pc)?;
+        Some((*target, original))
+    }
+
     fn guest_time_us(&mut self) -> Option<u64> {
         Some(self.sys.clock.guest_now_us())
     }
@@ -1953,6 +1965,7 @@ impl<B: Backend> Machine<B> {
             next_frame_id: 0,
             recent: RecentCalls::new(256),
             host_calls: 0,
+            redirects: HashMap::new(),
             call_limit: None,
             stats: Stats::new(),
             schedule_trace: schedule_trace::ScheduleTrace::default(),
