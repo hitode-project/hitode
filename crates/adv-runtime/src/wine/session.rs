@@ -511,6 +511,11 @@ fn serve(machine: &mut Machine<Cpu>) -> Result<bool, String> {
         .sync_clock(now);
     let notices = adv_dx::dsound::pump(machine)?;
     machine.ext.insert(SoundDeadline(notices));
+    let xaudio = adv_dx::xaudio2::pump(machine)?;
+    if let Some(deadline) = xaudio {
+        let notices = machine.ext.get_mut::<SoundDeadline>();
+        notices.0 = Some(notices.0.map_or(deadline, |at| at.min(deadline)));
+    }
     let media = adv_drv::media::pump(machine)?;
     #[cfg(feature = "gpu")]
     return adv_dx::d3d9::pump(machine).map(|gpu| gpu || media);
@@ -659,6 +664,7 @@ impl Session {
             Box::new(shared.clone()),
         )
         .map_err(|e| e.to_string())?;
+        super::xaudio2::activate(&mut machine, started.main)?;
         adv_nt::identity::note_ntdll(&mut machine, &config.dist.join(NTDLL), &ntdll);
         shared.id.set(started.thread.unix_pid);
         machine.ext.insert(process::Children::default());

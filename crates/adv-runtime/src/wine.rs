@@ -23,6 +23,7 @@ mod class;
 #[cfg(any(target_vendor = "apple", target_os = "android"))]
 pub mod session;
 mod sound;
+mod xaudio2;
 
 /// The display driver to name in the process's startup parameters.
 pub const GRAPHICS_DRIVER: &str = adv_drv::user::MODULE;
@@ -57,6 +58,7 @@ pub fn register(registry: &mut Registry) {
     adv_dx::ddraw::register(registry);
     class::register(registry);
     sound::register(registry);
+    xaudio2::register(registry);
     #[cfg(feature = "gpu")]
     adv_dx::d3d9::register(registry);
     adv_drv::register(registry);
@@ -92,6 +94,7 @@ pub fn install<B: Backend>(
         .map_err(|e| e.to_string())?;
     machine.ext.insert(Heap(heap));
     sound::install(machine, prefix, allocator())?;
+    xaudio2::install(machine, prefix)?;
     #[cfg(feature = "gpu")]
     {
         adv_dx::d3d9::install(machine, d3d9_provider())?;

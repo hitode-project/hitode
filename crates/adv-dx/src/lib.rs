@@ -13,6 +13,7 @@ pub mod dsound;
 pub mod dxdiag;
 pub mod shader;
 pub mod wmvcore;
+pub mod xaudio2;
 
 pub mod interop;
 mod refcounts;

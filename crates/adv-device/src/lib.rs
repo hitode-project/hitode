@@ -23,6 +23,7 @@ pub mod text;
 pub mod theora;
 pub mod ui;
 pub mod vorbis;
+pub mod xaudio2;
 pub use actor::{AudioControl, AudioEvent, RingState};
 #[cfg(feature = "device")]
 pub use device::{Metrics, Output};

@@ -397,3 +397,46 @@ Process startup MUST register the prefix's drive letters in the server namespace
 
 **Rule**: Listed Wine conformance tests that pass on standard Wine MUST pass here with no failures. Each runs as its own program without arguments.
 **Verification**: Test
+
+## Native xaudio2
+
+### WINE-XAUDIO-1 Native XAudio2 graph
+
+**Rule**: XAudio2 2.7, 2.8 and 2.9 voices MUST mix through the session's `AudioControl` on device time. Source sends through submix voices MUST apply voice volumes, channel volumes and output matrices. Send filters MUST process samples before accumulation into destination voices.
+**Verification**: Test
+**Basis**: Wine 11.0 `xaudio2_7` and FAudio.
+
+### WINE-XAUDIO-2 Versioned activation
+
+**Rule**: XAudio2 2.7 MUST activate through its normal and debug COM classes. XAudio2 2.8 and 2.9 MUST activate through `XAudio2Create`. Earlier XAudio2 modules MUST remain Wine's.
+**Verification**: Test
+
+### WINE-XAUDIO-3 Callback delivery
+
+**Rule**: Engine and voice callbacks MUST execute on one guest worker in Wine's order, with submitted buffer contexts. Late callbacks MUST NOT stall device consumption.
+**Verification**: Test
+
+### WINE-XAUDIO-4 Native volume meter
+
+**Rule**: A volume meter attached to a native voice MUST report that voice's played peak and RMS levels.
+**Verification**: Test
+
+### WINE-XAUDIO-5 Foreign effect compatibility
+
+**Rule**: An unsupported effect chain MUST select Wine's original engine before audio flows. Forwarded voices MUST preserve the engine's graph and submitted buffers.
+**Verification**: Test
+
+### WINE-XAUDIO-6 Source sequencing
+
+**Rule**: Native sources MUST honor play ranges, loops, frequency ratios, start, stop, flush, discontinuity and loop exit. Operation sets MUST apply together when committed.
+**Verification**: Test
+
+### WINE-XAUDIO-7 Native reverb
+
+**Rule**: Supported audio reverb MUST process on the host using Wine 11.0's FAudio DSP and parameters. Effects MUST precede voice gain. Unsupported reverb layouts MUST NOT enter the native DSP.
+**Verification**: Test
+
+### WINE-XAUDIO-8 Source formats
+
+**Rule**: Native sources MUST accept PCM, IEEE float, Microsoft ADPCM and xWMA buffers. Compressed decoding MUST use host code.
+**Verification**: Test

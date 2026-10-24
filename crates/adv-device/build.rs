@@ -1,5 +1,12 @@
-//! Build the vendored, decoder-only Theora implementation for the host target.
+//! Build the host Theora decoder and XAudio2 reverb DSP.
 fn main() {
+    cc::Build::new()
+        .file("src/xaudio2/reverb.c")
+        .define("NDEBUG", None)
+        .warnings(false)
+        .opt_level(3)
+        .compile("adv_xaudio_reverb");
+    println!("cargo:rerun-if-changed=src/xaudio2/reverb.c");
     let root = "../../vendor/libtheora";
     let mut build = cc::Build::new();
     build
