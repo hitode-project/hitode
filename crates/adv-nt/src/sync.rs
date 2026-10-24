@@ -210,17 +210,37 @@ pub fn wait_then(
     handle: u32,
     then: impl FnOnce(&mut Env<'_>, Status) -> Outcome + 'static,
 ) -> Outcome {
+    wait_then_alertable(env, handle, false, Box::new(then))
+}
+
+type WaitThen = Box<dyn FnOnce(&mut Env<'_>, Status) -> Outcome>;
+
+/// An internal object wait with Wine's requested alertability.
+pub fn wait_then_alertable(
+    env: &mut Env<'_>,
+    handle: u32,
+    alertable: bool,
+    then: WaitThen,
+) -> Outcome {
     let mut op = Vec::with_capacity(8);
     for word in [SELECT_WAIT, handle] {
         op.extend_from_slice(&word.to_le_bytes());
     }
-    let select = new_select(env, op, SELECT_INTERRUPTIBLE, None);
+    let select = new_select(
+        env,
+        op,
+        SELECT_INTERRUPTIBLE | if alertable { SELECT_ALERTABLE } else { 0 },
+        None,
+    );
     run_select(
         env,
         select,
         Box::new(move |env, ended| match ended {
             Ended::Status(status) => then(env, status),
-            Ended::Apc { .. } => unreachable!("a wait that is not alertable ran a user APC"),
+            Ended::Apc { func, args } => match then(env, USER_APC) {
+                Outcome::Return(_) => run_apc(env, None, func, args, USER_APC),
+                outcome => outcome,
+            },
         }),
     )
 }

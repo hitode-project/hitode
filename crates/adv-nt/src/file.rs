@@ -5,7 +5,10 @@ mod information;
 mod io;
 
 pub use information::{query, set};
-pub use io::{complete_async, create_named_pipe, read};
+pub use io::{
+    cancel, cancel_ex, cancel_sync, complete_async, create_mailslot, create_named_pipe,
+    device_control, flush, flush_ex, lock, notify_change, read, read_scatter, unlock, write_gather,
+};
 
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
@@ -654,4 +657,62 @@ fn lookup_attributes(env: &mut Env<'_>, attributes: &Attributes) -> Result<Looku
     full.push(b'\\' as u16);
     full.extend_from_slice(name);
     Ok(path::lookup(dosdevices, &full)?)
+}
+
+/// NtDeleteFile(*attributes): open with delete-on-close, then close.
+pub fn delete(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    status::finish((|| {
+        let attributes = Attributes::read(env, args[0])?;
+        let host = match lookup_attributes(env, &attributes)? {
+            Lookup::Found(host) => host,
+            Lookup::Missing(_) => return Err(status::OBJECT_NAME_NOT_FOUND.into()),
+            Lookup::Device => return Err(status::BAD_DEVICE_TYPE.into()),
+        };
+        let mut request = CreateFileRequest {
+            access: 0xc001_0000, // GENERIC_READ | GENERIC_WRITE | DELETE
+            sharing: 7,
+            create: FILE_OPEN as i32,
+            options: 0x1000, // FILE_DELETE_ON_CLOSE
+            ..Default::default()
+        };
+        let attributes = Attributes {
+            root: 0,
+            name: Some(
+                path::nt_name(&env.ext.get::<Files>().dosdevices, &host)
+                    .encode_utf16()
+                    .collect(),
+            ),
+            ..attributes
+        };
+        let (reply, _) = server::request(
+            env,
+            &mut request,
+            &[&attributes.wire(), host.as_os_str().as_bytes()],
+            &mut [],
+        )?;
+        status::check(reply.header.error)?;
+        server::close(env, reply.handle)
+    })())
+}
+
+/// Wine's EA query semi-stub validates the handle and clears the buffer.
+pub fn query_ea(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    let result = (|| {
+        server::handle_fd(env, args[0])?;
+        if args[2] != 0 && args[3] != 0 {
+            write_bytes(env, args[2], &vec![0; args[3] as usize])?;
+        }
+        Err(0xc000_0052u32.into()) // STATUS_NO_EAS_ON_FILE
+    })();
+    status::finish(result)
+}
+
+/// Wine's NtSetEaFile stub.
+pub fn set_ea(_: &mut Env<'_>, _: &[u32]) -> Outcome {
+    Outcome::Return(0xc000_0022) // STATUS_ACCESS_DENIED
+}
+
+/// Wine's NtSetVolumeInformationFile stub leaves the status block untouched.
+pub fn set_volume(_: &mut Env<'_>, _: &[u32]) -> Outcome {
+    Outcome::Return(status::SUCCESS)
 }

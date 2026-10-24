@@ -133,6 +133,14 @@ REQUESTS = [
     "get_new_process_info",
     "get_startup_info",
     "set_queue_fd",
+    "create_mailslot",
+    "cancel_async",
+    "cancel_sync",
+    "flush",
+    "lock_file",
+    "unlock_file",
+    "read_directory_changes",
+    "read_change",
 ]
 
 # Structures sent as request or reply data. Their fields are integers laid
