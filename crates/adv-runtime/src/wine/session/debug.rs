@@ -24,6 +24,16 @@ impl Session {
         totals
     }
 
+    /// Cumulative boundary counters of the family, including processes
+    /// that have exited.
+    pub fn boundaries(&self) -> adv_nt::counters::Boundaries {
+        let mut totals = self.retired_boundaries.clone();
+        self.debug_processes(|machine| {
+            totals.merge(&adv_nt::counters::Boundaries::of(&machine.ext));
+        });
+        totals
+    }
+
     pub fn debug_modules(&self) -> Result<Vec<adv_nt::process::LoadedModule>, String> {
         adv_nt::process::loaded_modules(&self.machine.cpu, self.machine.sys.peb)
     }

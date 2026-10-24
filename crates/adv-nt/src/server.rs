@@ -12,10 +12,13 @@ use std::mem::{size_of, zeroed};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::time::Instant;
 
 use adv_cpu::backend::Guest;
 use adv_machine::sched::{Handle, Object};
 use adv_machine::{CtxId, Env, Sys};
+
+use crate::counters::Tally;
 
 use crate::protocol::{
     AllocFileHandleRequest, CloseHandleRequest, FIXED_SIZE, GetHandleFdRequest,
@@ -80,6 +83,8 @@ pub struct Link {
     /// fd cache keeps them: until the handle is closed.
     fds: HashMap<u32, Cached>,
     threads: HashMap<CtxId, Thread>,
+    /// Requests sent, by number; see [`crate::counters`].
+    pub(crate) requests: HashMap<i32, Tally>,
 }
 
 /// A guest thread as the server knows it.
@@ -129,6 +134,7 @@ impl Link {
             time,
             fds: HashMap::new(),
             threads: HashMap::new(),
+            requests: HashMap::new(),
         };
         link.add_thread(main, tid, connection.channel, sys);
         link
@@ -166,12 +172,12 @@ impl Link {
         data: &[&[u8]],
         reply_data: &mut [u8],
     ) -> Result<(R::Reply, usize), Error> {
-        let time = self.time;
+        let (time, since) = (self.time, Instant::now());
         let thread = self
             .threads
             .get_mut(&context)
             .ok_or(Error::NoThread(context))?;
-        thread.channel.call(
+        let answer = thread.channel.call(
             &mut Active {
                 progress: &mut *self.progress,
                 cpu,
@@ -180,7 +186,9 @@ impl Link {
             request,
             data,
             reply_data,
-        )
+        );
+        self.requests.entry(R::NUMBER).or_default().add(since);
+        answer
     }
 
     /// Passes on a request the guest prepared.
@@ -192,12 +200,13 @@ impl Link {
         data: &[&[u8]],
         reply_data: &mut [u8],
     ) -> Result<usize, Error> {
-        let time = self.time;
+        let (time, since) = (self.time, Instant::now());
+        let number = i32::from_ne_bytes(fixed[..4].try_into().unwrap());
         let thread = self
             .threads
             .get_mut(&context)
             .ok_or(Error::NoThread(context))?;
-        thread.channel.call_raw(
+        let answer = thread.channel.call_raw(
             &mut Active {
                 progress: &mut *self.progress,
                 cpu,
@@ -206,7 +215,9 @@ impl Link {
             fixed,
             data,
             reply_data,
-        )
+        );
+        self.requests.entry(number).or_default().add(since);
+        answer
     }
 }
 

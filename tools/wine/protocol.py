@@ -336,6 +336,11 @@ def generate() -> str:
         "    type Reply: Copy + Default;",
         "    fn header(&mut self) -> &mut RequestHeader;",
         "}",
+        "",
+        "/// Every request's name, by number.",
+        f"pub const REQUEST_NAMES: [&str; {len(order)}] = [",
+        *(f'    "{name}",' for name in order),
+        "];",
     ]
     for struct in STRUCTS:
         out.append("")

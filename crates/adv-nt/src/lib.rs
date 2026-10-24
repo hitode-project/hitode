@@ -12,6 +12,7 @@
 mod apc;
 pub mod atom;
 pub mod context;
+pub mod counters;
 pub mod debug;
 pub mod directory;
 pub mod dispatch;

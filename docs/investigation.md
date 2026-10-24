@@ -132,6 +132,10 @@ which stack is running. `modules` and `threads` list the session's processes;
 records NT/Unix and host-module boundaries, not calls between Wine PE modules.
 `gaps` reports that the built-in stack's API diagnostics are unavailable.
 Timeline execution counters cover the process family, including exited children.
+The report's `wine_boundaries` counts the family's system calls (NT and win32k
+tables), Unix calls by library and code, and server requests by name, each with
+the host time of its synchronous part; a system call's time includes the
+requests it sends, and guest continuations and waits are not counted.
 Samples lack guest process identity, so Wine profile summaries keep raw guest
 addresses and omit process-specific instruction forms and code sizes.
 

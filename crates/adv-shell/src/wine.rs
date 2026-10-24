@@ -300,6 +300,7 @@ fn report(options: &Options, session: &Session, metrics: &Metrics, started: Inst
         session.machine.cpu.report_fields(),
         format!("\"performance\": {}", metrics.performance.json()),
         format!("\"scene_gate\": {}", metrics.gate.json()),
+        format!("\"wine_boundaries\": {}", session.boundaries().json(24)),
     ];
     if let Some(diagnostics) = &sys.stats.wait_diagnostics {
         fields.push(format!("\"wait_diagnostics\": {}", diagnostics.json()));

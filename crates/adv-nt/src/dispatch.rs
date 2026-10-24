@@ -6,14 +6,15 @@
 //! is a single host call with no Unix side in between.
 
 use std::sync::LazyLock;
+use std::time::Instant;
 
 use adv_cpu::backend::Reg;
 use adv_machine::{Conv, Env, HostFn, Outcome, Resolver};
 
 use crate::syscalls::SYSCALLS;
 use crate::{
-    atom, debug, directory, exception, file, information, kuser, memory, nls, object, process,
-    registry, section, server, sync, system, thread, token, unix, unixlib, win32k,
+    atom, counters, debug, directory, exception, file, information, kuser, memory, nls, object,
+    process, registry, section, server, sync, system, thread, token, unix, unixlib, win32k,
 };
 
 /// A system call, given its arguments.
@@ -373,7 +374,14 @@ impl Resolver for Platform {
 /// stub's return address at `[esp]` and its caller's frame above it, so
 /// argument `i` is `env.arg(i + 1)`.
 fn syscall(env: &mut Env<'_>) -> Outcome {
+    let since = Instant::now();
     let number = env.cpu.reg(Reg::Eax) as usize;
+    let outcome = dispatch_syscall(env, number);
+    counters::syscall(env, number as u32, since);
+    outcome
+}
+
+fn dispatch_syscall(env: &mut Env<'_>, number: usize) -> Outcome {
     if number >= WIN32K_FIRST {
         kuser::refresh(env);
         server::set_time(env);
@@ -397,6 +405,7 @@ fn syscall(env: &mut Env<'_>) -> Outcome {
 }
 
 fn unix_call(env: &mut Env<'_>) -> Outcome {
+    let since = Instant::now();
     let (handle, high, code, args) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3));
     let outcome = match (handle, high) {
         (NTDLL_UNIXLIB, 0) => unix::call(env, code, args),
@@ -405,5 +414,6 @@ fn unix_call(env: &mut Env<'_>) -> Outcome {
         (funcs, 0) => unixlib::call(env, funcs, code, args),
         _ => Outcome::Return(crate::status::INVALID_HANDLE),
     };
+    counters::unix(env, handle, code, since);
     server::boundary(env, outcome)
 }

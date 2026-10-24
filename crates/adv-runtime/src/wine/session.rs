@@ -81,6 +81,7 @@ pub struct Session {
     foreground: i32,
     delivered: u64,
     retired_debug: [u64; 3],
+    retired_boundaries: adv_nt::counters::Boundaries,
 }
 
 struct Settings {
@@ -604,6 +605,7 @@ impl Session {
             foreground: shared.id.get(),
             delivered: 0,
             retired_debug: [0; 3],
+            retired_boundaries: Default::default(),
             shared,
             finished: None,
             idle: BTreeMap::new(),
@@ -699,6 +701,8 @@ impl Session {
                             for (total, count) in self.retired_debug.iter_mut().zip(counts) {
                                 *total += count;
                             }
+                            self.retired_boundaries
+                                .merge(&adv_nt::counters::Boundaries::of(&machine.ext));
                         }
                         self.shared.driver.borrow_mut().parked.clear();
                         self.finished = Some(code);
@@ -719,6 +723,8 @@ impl Session {
                         {
                             *total += count;
                         }
+                        self.retired_boundaries
+                            .merge(&adv_nt::counters::Boundaries::of(&retired.ext));
                         self.idle.remove(&id);
                     } else {
                         self.finished = Some(code);

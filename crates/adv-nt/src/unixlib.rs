@@ -40,6 +40,10 @@ enum Library {
     Host(u32),
 }
 
+/// The file name of the Unix library each guest table belongs to.
+#[derive(Clone, Debug, Default)]
+pub struct Names(pub HashMap<u32, String>);
+
 /// Guest tables of host thunks, taking precedence over builtin ELF libraries.
 #[derive(Default)]
 pub struct HostTables(pub HashMap<String, u32>);
@@ -101,9 +105,18 @@ pub fn query(env: &mut Env<'_>, module: u32, class: u32, buffer: u32, length: u3
         .0
         .get(&module)
         .cloned();
+    let name = match &library {
+        Some(Library::Guest(path)) => path.file_name().map(|name| name.to_string_lossy().into()),
+        _ => None,
+    };
     let complete: Loaded = Box::new(move |env, funcs| match funcs {
         Ok(funcs) => match env.cpu.write(buffer, &u64::from(funcs).to_le_bytes()) {
-            Ok(()) => Outcome::Return(status::SUCCESS),
+            Ok(()) => {
+                if let Some(name) = name {
+                    env.ext.get_or_default::<Names>().0.insert(funcs, name);
+                }
+                Outcome::Return(status::SUCCESS)
+            }
             Err(_) => Outcome::Return(status::ACCESS_VIOLATION),
         },
         Err(status) => Outcome::Return(status),
