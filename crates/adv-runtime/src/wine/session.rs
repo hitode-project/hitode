@@ -8,6 +8,7 @@
 //! whenever its server starts, a session first runs it for the keys that
 //! last until the server stops.
 mod debug;
+mod fonts;
 
 use adv_drv::user::project;
 use std::cell::{Cell, RefCell};
@@ -39,8 +40,9 @@ pub struct Config<'a> {
     pub drive: Option<&'a Path>,
     /// The LCID of the system and user locales, which set the ANSI code page.
     pub locale: u32,
-    /// Font directories besides Wine's own, as Wine's font `Path`
-    /// ([`HOST_FONTS`] for the host's).
+    /// Host font directories as `;`-separated NT Unix paths. [`HOST_FONTS`]
+    /// selects the portable backend's full system discovery; empty isolates
+    /// the session to fonts installed in its prefix and Wine distribution.
     pub fonts: &'a str,
     pub exe: &'a Path,
     pub width: u32,
@@ -400,7 +402,7 @@ pub fn locale(codepage: u32) -> u32 {
         _ => 0x409,
     }
 }
-/// The host's font directories, which stand for the fonts Windows ships.
+/// Default host roots, selecting the portable backend's system discovery.
 #[cfg(target_os = "macos")]
 pub const HOST_FONTS: &str = r"\??\unix\System\Library\Fonts"; // privacy: allow the system font directory
 #[cfg(target_os = "ios")]
@@ -554,7 +556,12 @@ impl Session {
             std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))
         };
         let (ntdll, apisets) = (module("ntdll.dll")?, module("apisetschema.dll")?);
-        let (prefix, _) = prefix(&config)?;
+        let (prefix, drive) = prefix(&config)?;
+        let fonts = fonts::Fonts::prepare(&config, &drive)?;
+        let config = Config {
+            fonts: "",
+            ..config
+        };
 
         let mut clock = adv_machine::Clock::real();
         let time = GuestClock(Cell::new(Time::now(&mut clock)));
@@ -619,6 +626,7 @@ impl Session {
             Box::new(shared.clone()),
         )
         .map_err(|e| format!("wineboot: {e}"))?;
+        fonts.install(&mut boot)?;
         boot.ext.insert(shared.clone());
         adv_nt::identity::note_ntdll(&mut boot, &config.dist.join(NTDLL), &ntdll);
         match run(

@@ -1,12 +1,14 @@
 //! System discovery only needs name, OS/2 and post tables for fontdb metadata.
 //! Keep original file sources and collection indices for full glyph loading.
-use super::{Database, MAX_SYSTEM_FONT_BYTES, Source};
+use super::MAX_SYSTEM_FONT_BYTES;
+#[cfg(any(target_os = "macos", test))]
+use super::{Database, Source};
+#[cfg(any(target_os = "macos", test))]
+use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
 use std::{
-    collections::BTreeSet,
     fs::File,
     io::{self, Read, Seek, SeekFrom},
-    path::{Path, PathBuf},
-    sync::Arc,
+    path::Path,
 };
 
 fn read(file: &mut File, offset: u64, length: usize) -> io::Result<Vec<u8>> {
@@ -60,6 +62,28 @@ fn metadata(file: &mut File, offset: u64) -> io::Result<Vec<u8>> {
     }
     Ok(data)
 }
+pub(super) fn face_metadata(path: &Path, index: u32) -> io::Result<(Vec<u8>, bool)> {
+    let mut file = File::open(path)?;
+    let header = read(&mut file, 0, 12)?;
+    let offset = if &header[..4] == b"ttcf" {
+        if index >= u32_at(&header, 8) {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        u64::from(u32_at(&read(&mut file, 12 + u64::from(index) * 4, 4)?, 0))
+    } else {
+        0
+    };
+    let header = read(&mut file, offset, 12)?;
+    let count = u16::from_be_bytes([header[4], header[5]]) as usize;
+    let directory = read(&mut file, offset + 12, count * 16)?;
+    let truetype = directory
+        .as_chunks::<16>()
+        .0
+        .iter()
+        .any(|entry| &entry[..4] == b"glyf");
+    Ok((metadata(&mut file, offset)?, truetype))
+}
+#[cfg(any(target_os = "macos", test))]
 fn load_file(db: &mut Database, path: &Path) -> io::Result<()> {
     let mut file = File::open(path)?;
     let header = read(&mut file, 0, 12)?;
@@ -92,6 +116,7 @@ fn load_file(db: &mut Database, path: &Path) -> io::Result<()> {
     }
     Ok(())
 }
+#[cfg(any(target_os = "macos", test))]
 fn load_directory(db: &mut Database, directory: &Path, seen: &mut BTreeSet<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(directory) else {
         return;
@@ -121,6 +146,7 @@ fn load_directory(db: &mut Database, directory: &Path, seen: &mut BTreeSet<PathB
         }
     }
 }
+#[cfg(target_os = "macos")]
 pub(super) fn load_system_fonts(db: &mut Database) {
     // Match fontdb's macOS directories and discovery order.
     let mut seen = BTreeSet::new();
@@ -175,10 +201,18 @@ mod tests {
             let mut actual = Database::new();
             load_file(&mut actual, &path).unwrap();
             compare(&expected, &actual);
+            for info in actual.faces() {
+                let (data, truetype) = face_metadata(&path, info.index).unwrap();
+                assert!(truetype);
+                let mut metadata = Database::new();
+                metadata.load_font_data(data);
+                assert_eq!(metadata.faces().next().unwrap().families, info.families);
+            }
         }
     }
     // spec: DEV-FONT-1
     #[test]
+    #[cfg(target_os = "macos")]
     #[ignore = "compares metadata for all installed macOS fonts"]
     fn installed_metadata_matches_full_discovery() {
         let mut expected = Database::new();

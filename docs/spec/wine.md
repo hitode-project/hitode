@@ -583,8 +583,8 @@ Process startup MUST register the prefix's drive letters in the server namespace
 
 ### WINE-SES-5 Regional text
 
-**Rule**: A session's system and user locales MUST be those of the game's ANSI code page: ja-JP for 932, zh-CN for 936. Win32u MUST load the host's system fonts in place, and the prefix MUST replace the CJK faces Windows ships with host families.
-**Verification**: Review — which host fonts a game shows is seen on its own screens.
+**Rule**: A session's system and user locales MUST follow its ANSI code page: ja-JP for 932, zh-CN for 936. Wine MUST load fonts discovered by the portable backend, including nested directories. Missing standard families MUST use its regional matching order, require the declared character set, and prefer actual TrueType outlines without overriding installed families.
+**Verification**: Test
 
 ### WINE-SES-6 Installed system subdirectories
 

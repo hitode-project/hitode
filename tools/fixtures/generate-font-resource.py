@@ -57,3 +57,10 @@ if __name__ == "__main__":
     collection = TTCollection()
     collection.fonts = [font("ADV Collection One", 500), font("ADV Collection Two", 900)]
     collection.save(OUTPUT / "font-resource.ttc")
+    japanese = font("ADV Japanese Fixture", 500)
+    for table in japanese["cmap"].tables:
+        if table.isUnicode():
+            table.cmap[0x3042] = "A"
+    japanese["OS/2"].ulCodePageRange1 = (1 << 17) | 1
+    japanese["name"].setName("ADV 日本語フィクスチャ", 1, 3, 1, 0x411)
+    japanese.save(OUTPUT / "font-resource-japanese.ttf", reorderTables=False)

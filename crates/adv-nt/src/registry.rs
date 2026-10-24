@@ -150,6 +150,32 @@ pub fn set_volatile_string(
     name: &str,
     value: &str,
 ) -> Result<(), Error> {
+    let value = bytes(&value.encode_utf16().chain([0]).collect::<Vec<_>>());
+    set_volatile_value(env, key, name, REG_SZ, &value)
+}
+
+/// Sets a list of strings, terminated by an additional NUL, for the platform.
+pub fn set_volatile_multi_string(
+    env: &mut Env<'_>,
+    key: &str,
+    name: &str,
+    values: &[String],
+) -> Result<(), Error> {
+    let value: Vec<u16> = values
+        .iter()
+        .flat_map(|value| value.encode_utf16().chain([0]))
+        .chain([0])
+        .collect();
+    set_volatile_value(env, key, name, 7, &bytes(&value))
+}
+
+fn set_volatile_value(
+    env: &mut Env<'_>,
+    key: &str,
+    name: &str,
+    kind: i32,
+    value: &[u8],
+) -> Result<(), Error> {
     let mut hkey = 0;
     let elements: Vec<&str> = key
         .split('\\')
@@ -190,14 +216,13 @@ pub fn set_volatile_string(
         hkey = reply.hkey;
     }
     let name = bytes(&name.encode_utf16().collect::<Vec<_>>());
-    let value = bytes(&value.encode_utf16().chain([0]).collect::<Vec<_>>());
     let mut request = SetKeyValueRequest {
         hkey,
-        r#type: REG_SZ,
+        r#type: kind,
         namelen: name.len() as u32,
         ..Default::default()
     };
-    let set = server::request(env, &mut request, &[&name, &value], &mut [])
+    let set = server::request(env, &mut request, &[&name, value], &mut [])
         .and_then(|(reply, _)| status::check(reply.header.error));
     server::close(env, hkey)?;
     set

@@ -460,6 +460,13 @@ pub struct FontResolution {
     pub profile_sha256: Option<String>,
     pub backend: &'static str,
 }
+/// Installed files and replacements for missing standard families. Each target
+/// lists the physical family's legacy names, including localized spellings.
+#[cfg(not(windows))]
+pub struct FontReplacements {
+    pub files: Vec<std::path::PathBuf>,
+    pub families: Vec<(Vec<String>, Vec<String>)>,
+}
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CacheStats {
     pub fonts: usize,
@@ -542,6 +549,12 @@ pub fn prefetch_system_fonts() {
     portable::prefetch_system_fonts();
 }
 impl Text {
+    /// Export discovery and family matching to a guest font renderer. Prefer
+    /// real TrueType outlines for legacy families and require their code page.
+    #[cfg(not(windows))]
+    pub fn replacement_fonts(&self) -> Result<FontReplacements, TextError> {
+        self.backend.replacement_fonts()
+    }
     pub fn set_overrides(&mut self, overrides: Overrides) {
         self.invalidate_fonts();
         self.overrides = overrides;

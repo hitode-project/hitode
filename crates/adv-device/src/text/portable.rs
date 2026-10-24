@@ -15,10 +15,10 @@ use std::{
 };
 use zeno::{Command, Vector};
 
-#[cfg(target_os = "macos")]
 mod discovery;
 mod enumeration;
 mod profile;
+mod replacements;
 
 // System TTCs such as PingFang exceed the guest font-resource budget.
 const MAX_SYSTEM_FONT_BYTES: usize = 128 * 1024 * 1024;
@@ -476,7 +476,16 @@ impl WindowsFamily {
         }
     }
     fn names(&self) -> impl Iterator<Item = &'static str> {
-        std::iter::once(self.0).chain(self.1.map(|(_, local)| local))
+        let legacy = match self.0 {
+            "MS Gothic" => Some("MS ゴシック"),
+            "MS PGothic" => Some("MS Pゴシック"),
+            "MS Mincho" => Some("MS 明朝"),
+            "MS PMincho" => Some("MS P明朝"),
+            _ => None,
+        };
+        std::iter::once(self.0)
+            .chain(self.1.map(|(_, local)| local))
+            .chain(legacy)
     }
 }
 const WINDOWS_FAMILIES: &[WindowsFamily] = &[
@@ -494,14 +503,16 @@ const WINDOWS_FAMILIES: &[WindowsFamily] = &[
     WindowsFamily("MS PMincho", Some(("ja-JP", "ＭＳ Ｐ明朝"))),
     WindowsFamily("Meiryo", Some(("ja-JP", "メイリオ"))),
     WindowsFamily("Meiryo UI", None),
+    WindowsFamily("Yu Gothic", Some(("ja-JP", "游ゴシック"))),
+    WindowsFamily("Yu Mincho", Some(("ja-JP", "游明朝"))),
     WindowsFamily("SimSun", Some(("zh-Hans", "宋体"))),
     WindowsFamily("NSimSun", Some(("zh-Hans", "新宋体"))),
     WindowsFamily("SimHei", Some(("zh-Hans", "黑体"))),
     WindowsFamily("Microsoft YaHei", Some(("zh-Hans", "微软雅黑"))),
-    WindowsFamily("MingLiU", None),
-    WindowsFamily("PMingLiU", None),
-    WindowsFamily("Gulim", None),
-    WindowsFamily("Batang", None),
+    WindowsFamily("MingLiU", Some(("zh-Hant", "細明體"))),
+    WindowsFamily("PMingLiU", Some(("zh-Hant", "新細明體"))),
+    WindowsFamily("Gulim", Some(("ko-KR", "굴림"))),
+    WindowsFamily("Batang", Some(("ko-KR", "바탕"))),
 ];
 
 /// Whether a full enumeration lists a family. A leading period marks a
