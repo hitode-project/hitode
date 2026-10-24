@@ -45,11 +45,13 @@ pub fn function(name: &str) -> Option<Function> {
         "read" => (cdecl(3), read),
         "fstat" => (cdecl(2), fstat),
         "__fstat64_time64" => (cdecl(2), fstat64_time64),
+        "__stat64_time64" => (cdecl(2), stat64_time64),
         "fcntl" | "fcntl64" => (cdecl(3), fcntl),
         "mmap" => (cdecl(6), mmap),
         "mmap64" => (cdecl(7), mmap64),
         "munmap" => (cdecl(2), munmap),
         "__errno_location" => (cdecl(0), errno_location),
+        "strerror" => (cdecl(1), strerror),
         _ => return None,
     })
 }
@@ -87,6 +89,39 @@ fn errno_location(env: &mut Env<'_>) -> Outcome {
     match errno_slot(env) {
         Some(slot) => Outcome::Return(slot),
         None => Outcome::Fail("__errno_location: no memory".into()),
+    }
+}
+
+/// The buffer `strerror` returns, which each call overwrites.
+struct Message(u32);
+
+/// strerror(errno), in the host's words: the numbers below
+/// `LINUX_ERRNO_LIMIT` mean the same on every host.
+fn strerror(env: &mut Env<'_>) -> Outcome {
+    let errno = env.arg(0) as i32;
+    let text = if (0..LINUX_ERRNO_LIMIT).contains(&errno) {
+        std::io::Error::from_raw_os_error(errno).to_string()
+    } else {
+        format!("Unknown error {errno}")
+    };
+    let buffer = match env.ext.try_get::<Message>() {
+        Some(message) => message.0,
+        None => {
+            let memory = env.ext.get_or_default::<Memory>();
+            let Some(page) = memory::allocate_committed(env.cpu, &mut env.sys.vm, memory, PAGE)
+            else {
+                return Outcome::Fail("strerror: no memory".into());
+            };
+            env.ext.insert(Message(page));
+            page
+        }
+    };
+    let mut bytes = text.into_bytes();
+    bytes.truncate(PAGE as usize - 1);
+    bytes.push(0);
+    match env.cpu.write(buffer, &bytes) {
+        Ok(()) => Outcome::Return(buffer),
+        Err(error) => Outcome::Fail(format!("strerror: {error}")),
     }
 }
 
@@ -210,13 +245,37 @@ fn fstat(env: &mut Env<'_>) -> Outcome {
 }
 
 /// __fstat64_time64(fd, *stat): glibc's i386 `struct __stat64_t64`.
+fn fstat64_time64(env: &mut Env<'_>) -> Outcome {
+    let stat = host_stat(env);
+    store_stat64(env, stat)
+}
+
+/// __stat64_time64(path, *stat), as [`fstat64_time64`].
+fn stat64_time64(env: &mut Env<'_>) -> Outcome {
+    let path = env.arg(0);
+    let Ok(path) = env.cpu.read_cstr(path, ::libc::PATH_MAX as usize) else {
+        return Outcome::Fail(format!("stat: unreadable path at {path:#x}"));
+    };
+    let Ok(path) = std::ffi::CString::new(path) else {
+        return fail(env, EINVAL, u32::MAX);
+    };
+    // SAFETY: a zeroed stat is a valid buffer for stat to fill.
+    let mut stat: ::libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: a NUL-terminated path and a valid buffer.
+    let stat = match unsafe { ::libc::stat(path.as_ptr(), &mut stat) } {
+        0 => Ok(stat),
+        _ => Err(host_errno()),
+    };
+    store_stat64(env, stat)
+}
+
 #[allow(
     clippy::unnecessary_cast,
     reason = "the types of libc's stat fields differ between hosts"
 )]
-fn fstat64_time64(env: &mut Env<'_>) -> Outcome {
+fn store_stat64(env: &mut Env<'_>, stat: Result<::libc::stat, u32>) -> Outcome {
     let buffer = env.arg(1);
-    let stat = match host_stat(env) {
+    let stat = match stat {
         Ok(stat) => stat,
         Err(errno) => return fail(env, errno, u32::MAX),
     };

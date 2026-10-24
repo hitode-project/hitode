@@ -19,6 +19,7 @@ use adv_pe::{ImportModule, ImportName};
 
 use crate::graphics::{guest_memory, install_store};
 
+mod class;
 #[cfg(any(target_vendor = "apple", target_os = "android"))]
 pub mod session;
 
@@ -53,6 +54,7 @@ const CREATED_BITMAP: u32 = 32;
 
 pub fn register(registry: &mut Registry) {
     adv_dx::ddraw::register(registry);
+    class::register(registry);
     #[cfg(feature = "gpu")]
     adv_dx::d3d9::register(registry);
     adv_drv::register(registry);
@@ -78,7 +80,9 @@ pub fn install<B: Backend>(
             completed: frame_completed,
         },
     )?;
-    install_image(machine, prefix, DDRAW, &DDRAW_EXPORTS)?;
+    class::install(machine)?;
+    let ddraw: Vec<_> = DDRAW_EXPORTS.into_iter().chain(class::EXPORTS).collect();
+    install_image(machine, prefix, DDRAW, &ddraw)?;
     #[cfg(feature = "gpu")]
     {
         let heap = machine
