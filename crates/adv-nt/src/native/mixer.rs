@@ -115,6 +115,41 @@ pub(super) fn resume(env: &mut Env<'_>) -> Outcome {
     super::resume_original(env)
 }
 
+/// Helper and conversion functions found intact, with their bytes then: a
+/// function whose bytes still match needs no new identity check.
+#[derive(Default)]
+struct Verified(std::collections::HashMap<u32, Box<[u8]>>);
+
+/// The sorted addresses of the image's HIGHLOW base relocations.
+fn relocations(cpu: &dyn Guest, base: u32) -> Option<Vec<u32>> {
+    let nt = cpu.read_u32(base + 0x3c).ok()?.checked_add(base)?;
+    let reloc_at = cpu.read_u32(nt.checked_add(160)?).ok()?.checked_add(base)?;
+    let reloc_len = cpu.read_u32(nt.checked_add(164)?).ok()?;
+    if !cpu.accessible(reloc_at, reloc_len, Prot::READ) {
+        return None;
+    }
+    let mut reloc = vec![0; reloc_len as usize];
+    cpu.read(reloc_at, &mut reloc).ok()?;
+    let mut relocations = Vec::new();
+    let mut at = 0;
+    while at < reloc.len() {
+        let header = reloc.get(at..at + 8)?;
+        let block = word(header, 4) as usize;
+        if block < 8 || !block.is_multiple_of(2) || at + block > reloc.len() {
+            return None;
+        }
+        for offset in (at + 8..at + block).step_by(2) {
+            let entry = short(&reloc, offset);
+            if entry >> 12 == 3 {
+                relocations.push(base + word(&reloc, at) + u32::from(entry & 0xfff));
+            }
+        }
+        at += block;
+    }
+    relocations.sort_unstable();
+    Some(relocations)
+}
+
 // spec: NAT-BODY-3
 pub(super) fn mix(env: &mut Env<'_>) -> Option<u64> {
     let (device, output, frames, stopped) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3));
@@ -128,47 +163,29 @@ pub(super) fn mix(env: &mut Env<'_>) -> Option<u64> {
     let table = module.table()?;
     let pe_address = |name: &str| table.named(name).map(|f| module.base + f.rva);
     // Function pointers can be hooked independently of the mixer itself.
-    let nt = env
-        .cpu
-        .read_u32(module.base + 0x3c)
-        .ok()?
-        .checked_add(module.base)?;
-    let reloc_at = env
-        .cpu
-        .read_u32(nt.checked_add(160)?)
-        .ok()?
-        .checked_add(module.base)?;
-    let reloc_len = env.cpu.read_u32(nt.checked_add(164)?).ok()?;
-    if !env.cpu.accessible(reloc_at, reloc_len, Prot::READ) {
-        return None;
-    }
-    let mut reloc = vec![0; reloc_len as usize];
-    env.cpu.read(reloc_at, &mut reloc).ok()?;
-    let mut relocations = Vec::new();
-    let mut at = 0;
-    while at < reloc.len() {
-        let header = reloc.get(at..at + 8)?;
-        let block = word(header, 4) as usize;
-        if block < 8 || !block.is_multiple_of(2) || at + block > reloc.len() {
-            return None;
-        }
-        for offset in (at + 8..at + block).step_by(2) {
-            let entry = short(&reloc, offset);
-            if entry >> 12 == 3 {
-                relocations.push(module.base + word(&reloc, at) + u32::from(entry & 0xfff));
-            }
-        }
-        at += block;
-    }
-    let identify = |cpu: &dyn Guest, address: u32| -> Option<&str> {
+    let identify = |cpu: &dyn Guest, verified: &mut Verified, address: u32| -> Option<&str> {
         let f = table.at(address.checked_sub(module.base)?)?;
-        if module.base + f.rva != address
-            || !crate::identity::intact(cpu, address, f, |a| relocations.contains(&a))
-        {
+        if module.base + f.rva != address {
             return None;
+        }
+        let mut bytes = vec![0; f.size as usize];
+        cpu.read(address, &mut bytes).ok()?;
+        if verified
+            .0
+            .get(&address)
+            .is_none_or(|known| **known != *bytes)
+        {
+            let relocations = relocations(cpu, module.base)?;
+            if !crate::identity::intact(cpu, address, f, |a| relocations.binary_search(&a).is_ok())
+            {
+                return None;
+            }
+            verified.0.insert(address, bytes.into());
         }
         Some(&f.name)
     };
+    let (mxcsr, control) = (env.arg(4), env.arg(5));
+    let verified = env.ext.get_or_default::<Verified>();
     for name in [
         "secondarybuffer_is_audible",
         "mixieee32",
@@ -176,10 +193,10 @@ pub(super) fn mix(env: &mut Env<'_>) -> Option<u64> {
         "__divmoddi4",
         "DSOUND_CheckEvent.part.0",
     ] {
-        identify(env.cpu, pe_address(name)?)?;
+        identify(env.cpu, verified, pe_address(name)?)?;
     }
     // The adapter captures floating controls without expanding the leaf CPU view.
-    if env.arg(4) & !0x3f != 0x1f80 || env.arg(5) & 0xc3f != 0x3f {
+    if mxcsr & !0x3f != 0x1f80 || control & 0xc3f != 0x3f {
         return None;
     }
     let mut mem = Memory {
@@ -225,21 +242,22 @@ pub(super) fn mix(env: &mut Env<'_>) -> Option<u64> {
         let get = word(&buf, b::get);
         let mono = Some(get) == pe_address("get_mono");
         let getter = if mono { word(&buf, b::get_aux) } else { get };
-        let kind = match identify(mem.cpu, getter)? {
+        let kind = match identify(mem.cpu, verified, getter)? {
             "get8" => 1,
             "get16" => 2,
             "getieee32" => 4,
             _ => return None,
         };
         if mono {
-            identify(mem.cpu, get)?;
+            identify(mem.cpu, verified, get)?;
         }
         let put = word(&buf, b::put);
         let duplicate = Some(put) == pe_address("put_mono2stereo");
-        match identify(mem.cpu, put)? {
+        match identify(mem.cpu, verified, put)? {
             "putieee32" => (),
             "put_mono2stereo"
-                if channels == 2 && identify(mem.cpu, word(&buf, b::put_aux))? == "putieee32" => {}
+                if channels == 2
+                    && identify(mem.cpu, verified, word(&buf, b::put_aux))? == "putieee32" => {}
             _ => return None,
         }
         let fmt = mem.load(word(&buf, b::pwfx), 16, false)?;
