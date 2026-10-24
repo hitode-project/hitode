@@ -1,0 +1,180 @@
+//! Native bodies of distribution functions.
+//!
+//! A function of a distribution image whose bytes its code identity table
+//! confirms ([`crate::identity`]) can have a host body. Translated calls to
+//! the function branch to a thunk instead ([`adv_machine::Sys::redirects`]),
+//! which runs the body as a leaf call, without leaving translated code. The
+//! interpreter runs Wine's own code, and so does a call the body declines:
+//! it resumes at a trampoline holding the function's first instruction,
+//! which jumps to the second. A body therefore has the function's effect
+//! whenever it accepts a call, and declines anything else, such as memory
+//! the function would fault on.
+
+use std::collections::HashMap;
+
+use adv_cpu::backend::{Guest, Prot};
+use adv_machine::layout::PAGE;
+use adv_machine::{Conv, Env, EnvLeafHandler, Ext, HostFn, Outcome, Sys};
+use iced_x86::{Decoder, DecoderOptions, FlowControl};
+
+use crate::identity::{self, Images};
+
+/// The module the bodies' thunks are registered under.
+pub const MODULE: &str = "hitode.native";
+
+struct Body {
+    /// The image and function, which also names the thunk.
+    name: &'static str,
+    conv: Conv,
+    leaf: EnvLeafHandler,
+}
+
+const BODIES: &[Body] = &[
+    // Wine's i386 memcpy copies byte by byte and allows overlap, as
+    // memmove does, which jumps to it.
+    Body {
+        name: "ntdll.dll!memcpy",
+        conv: Conv::Cdecl { argc: 3 },
+        leaf: memmove,
+    },
+];
+
+/// The host functions of the bodies.
+pub(crate) fn host_fn(name: &str) -> Option<HostFn> {
+    let body = BODIES.iter().find(|body| body.name == name)?;
+    Some(HostFn {
+        leaf: None,
+        env_leaf: Some(body.leaf),
+        conv: body.conv,
+        handler: resume_original,
+        data: 0,
+        trace: false,
+        guest: None,
+    })
+}
+
+/// The trampolines of this process: their page, its used bytes, and each
+/// bound function's trampoline by thunk index.
+#[derive(Default)]
+struct Trampolines {
+    page: u32,
+    used: u32,
+    by_thunk: HashMap<u32, u32>,
+}
+
+/// Binds the bodies of the image `pe`, mapped at `base`.
+pub(crate) fn bind(cpu: &mut dyn Guest, sys: &mut Sys, ext: &mut Ext, base: u32, pe: &adv_pe::Pe) {
+    let Some(module) = ext
+        .try_get::<Images>()
+        .and_then(|images| images.0.get(&base))
+        .cloned()
+    else {
+        return;
+    };
+    if !BODIES
+        .iter()
+        .any(|body| body.name.starts_with(module.name.as_str()))
+    {
+        return;
+    }
+    let Some(table) = module.table() else {
+        return;
+    };
+    let mut relocations = pe.relocations().unwrap_or_default();
+    relocations.sort_unstable();
+    for body in BODIES {
+        let Some(name) = body
+            .name
+            .strip_prefix(module.name.as_str())
+            .and_then(|name| name.strip_prefix('!'))
+        else {
+            continue;
+        };
+        let Some(function) = table.named(name) else {
+            continue;
+        };
+        let entry = base + function.rva;
+        let relocated = |address: u32| {
+            relocations
+                .binary_search(&address.wrapping_sub(base))
+                .is_ok()
+        };
+        if !identity::intact(cpu, entry, function, relocated) {
+            log::debug!("{}: bytes differ from the distribution", body.name);
+            continue;
+        }
+        if let Err(error) = bind_one(cpu, sys, ext, body.name, entry, function.size) {
+            log::warn!("{}: no native body: {error}", body.name);
+        }
+    }
+}
+
+fn bind_one(
+    cpu: &mut dyn Guest,
+    sys: &mut Sys,
+    ext: &mut Ext,
+    name: &str,
+    entry: u32,
+    size: u32,
+) -> Result<(), String> {
+    let mut original = vec![0; size as usize];
+    cpu.read(entry, &mut original).map_err(|e| e.to_string())?;
+    let first = Decoder::with_ip(32, &original, u64::from(entry), DecoderOptions::NONE).decode();
+    if first.is_invalid() || first.flow_control() != FlowControl::Next {
+        return Err("the first instruction cannot move".into());
+    }
+    let length = first.len();
+    let mut trampoline = original[..length].to_vec();
+    trampoline.push(0xe9);
+    let resume = entry + length as u32;
+    let thunk = sys
+        .thunks
+        .publish(cpu, MODULE, name)
+        .map_err(|e| e.to_string())?;
+    let index = sys.thunks.published_index(MODULE, name).ok_or("no thunk")?;
+    let trampolines = ext.get_or_default::<Trampolines>();
+    if trampolines.page == 0 || trampolines.used + trampoline.len() as u32 + 4 > PAGE {
+        trampolines.page = sys
+            .vm
+            .alloc(cpu, PAGE, Prot::RWX)
+            .map_err(|e| e.to_string())?;
+        trampolines.used = 0;
+    }
+    let at = trampolines.page + trampolines.used;
+    let next = at + trampoline.len() as u32 + 4;
+    trampoline.extend_from_slice(&resume.wrapping_sub(next).to_le_bytes());
+    cpu.write(at, &trampoline).map_err(|e| e.to_string())?;
+    trampolines.used = next - trampolines.page;
+    trampolines.by_thunk.insert(index, at);
+    sys.redirects.insert(entry, (thunk, original.into()));
+    Ok(())
+}
+
+/// The ordinary handler of a body's thunk, entered when the body declined:
+/// the function runs from its trampoline with the caller's frame.
+fn resume_original(env: &mut Env<'_>) -> Outcome {
+    let Some(&trampoline) = env
+        .ext
+        .get_or_default::<Trampolines>()
+        .by_thunk
+        .get(&env.thunk)
+    else {
+        return Outcome::Fail("native body without a trampoline".into());
+    };
+    match env.checkpoint() {
+        Ok(mut checkpoint) => {
+            checkpoint.state.eip = trampoline;
+            Outcome::ResumeExecution(checkpoint)
+        }
+        Err(error) => Outcome::Fail(error.to_string()),
+    }
+}
+
+/// memmove(dst, src, n): EAX and EDX are `dst`, as Wine's code leaves them.
+fn memmove(env: &mut Env<'_>) -> Option<u64> {
+    let (dst, src, n) = (env.arg(0), env.arg(1), env.arg(2));
+    if n != 0 {
+        env.cpu.copy_memory(src, dst, n as usize).ok()?;
+    }
+    Some(u64::from(dst) << 32 | u64::from(dst))
+}

@@ -344,6 +344,9 @@ pub struct Platform;
 
 impl Resolver for Platform {
     fn host_fn(&self, module: &str, name: &str) -> Option<HostFn> {
+        if module == crate::native::MODULE {
+            return crate::native::host_fn(name);
+        }
         if module != MODULE {
             return None;
         }
@@ -366,7 +369,7 @@ impl Resolver for Platform {
     }
 
     fn provides(&self, module: &str) -> bool {
-        module == MODULE
+        module == MODULE || module == crate::native::MODULE
     }
 }
 

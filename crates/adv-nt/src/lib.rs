@@ -24,6 +24,7 @@ pub mod image;
 pub mod information;
 pub mod kuser;
 pub mod memory;
+pub mod native;
 pub mod nls;
 pub mod object;
 pub mod params;

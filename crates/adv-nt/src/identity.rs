@@ -141,11 +141,18 @@ pub(crate) fn note_image(ext: &mut Ext, base: u32, size: u32, dll: Option<&Path>
 }
 
 /// Records ntdll.dll, which a process maps from `image`, read from `dll`,
-/// at its preferred base when it starts.
-pub fn note_ntdll(ext: &mut Ext, dll: &Path, image: &[u8]) {
+/// at its preferred base when it starts, and binds its native bodies.
+pub fn note_ntdll<B: adv_cpu::backend::Backend>(
+    machine: &mut adv_machine::Machine<B>,
+    dll: &Path,
+    image: &[u8],
+) {
     if let Ok(pe) = adv_pe::Pe::parse(image) {
         let headers = &image[..(pe.size_of_headers as usize).min(image.len())];
-        note_image(ext, pe.image_base, pe.size_of_image, Some(dll), headers);
+        let base = pe.image_base;
+        note_image(&mut machine.ext, base, pe.size_of_image, Some(dll), headers);
+        let (cpu, sys, ext) = (&mut machine.cpu, &mut machine.sys, &mut machine.ext);
+        crate::native::bind(cpu, sys, ext, base, &pe);
     }
 }
 
@@ -199,6 +206,7 @@ pub fn fnv1a64(data: &[u8]) -> u64 {
 mod tests {
     use super::*;
 
+    // spec: WINE-NAT-1
     #[test]
     fn tables_name_addresses_inside_functions() {
         let table =
@@ -211,6 +219,47 @@ mod tests {
         assert_eq!(table.named("second").map(|f| f.rva), Some(0x1040));
     }
 
+    // spec: WINE-NAT-1
+    #[test]
+    fn functions_and_tables_match_only_their_build() {
+        use adv_cpu::backend::{Guest, Prot};
+        const AT: u32 = 0x40_1000;
+        // push imm32 with a relocated operand; ret.
+        let code = [0x68, 0x00, 0x20, 0x40, 0x00, 0xc3];
+        let mut masked = code;
+        masked[1..5].fill(0);
+        let function = Function {
+            rva: 0x1000,
+            size: code.len() as u32,
+            hash: fnv1a64(&masked) as u32,
+            name: "f".into(),
+        };
+        let mut cpu = adv_cpu::Cpu::new(0x1000, false).unwrap();
+        cpu.map(AT, 0x1000, Prot::RX).unwrap();
+        let relocated = |address| address == AT + 1;
+        cpu.write(AT, &[0x68, 0x00, 0x20, 0x80, 0x10, 0xc3])
+            .unwrap();
+        assert!(intact(&cpu, AT, &function, relocated));
+        cpu.write(AT + 5, &[0xcc]).unwrap();
+        assert!(!intact(&cpu, AT, &function, relocated));
+
+        let directory = std::env::temp_dir().join(format!("identity-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let table = directory.join("x.dll.tsv");
+        std::fs::write(&table, format!("{:016x}\n1000\t6\t0\tf\n", fnv1a64(b"MZ"))).unwrap();
+        let module = |headers: &[u8]| Module {
+            base: 0x40_0000,
+            size: 0x2000,
+            name: "x.dll".into(),
+            header: fnv1a64(headers),
+            table: table.clone(),
+        };
+        assert!(module(b"MZ").table().is_some());
+        assert!(module(b"MZ\0").table().is_none());
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    // spec: WINE-NAT-1
     #[test]
     fn distribution_paths_have_tables() {
         let (name, table) = table_of(Path::new("/w/lib/wine/i386-windows/NTDLL.dll")).unwrap();

@@ -175,6 +175,18 @@ FreeType is such a library: win32u opens it by name and draws TrueType text thro
 **Rule**: Host DLL installation MUST replace the prefix's system32 entry with a PE file carrying Wine's builtin signature. Installation MUST NOT modify the Wine distribution or follow an existing file symlink when writing.
 **Verification**: Test
 
+## Native bodies
+
+### WINE-NAT-1 Code identity
+
+**Rule**: A code identity table MUST describe a mapped image only when the hash of the image's headers equals the table's. A function MUST be bound to a native body only when its bytes, with base relocations masked, hash to the table's value.
+**Verification**: Test
+
+### WINE-NAT-2 Body semantics
+
+**Rule**: A native body that accepts a call MUST leave the guest state Wine's function would leave. Registers and flags the calling convention does not keep are exempt. Otherwise it MUST decline before any side effect, and the call MUST run Wine's function from its entry with the caller's frame.
+**Verification**: Test
+
 ## Graphics
 
 ### WINE-GFX-1 DirectDraw memory DCs

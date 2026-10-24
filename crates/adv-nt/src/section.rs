@@ -590,6 +590,7 @@ pub fn map_image(env: &mut Env<'_>, mapping: u32) -> Result<View, Error> {
     }
     let headers = &file[..(pe.size_of_headers as usize).min(file.len())];
     crate::identity::note_image(env.ext, base, size, path.as_deref(), headers);
+    crate::native::bind(env.cpu, env.sys, env.ext, base, &pe);
     unixlib::note_image(env, base, path);
     Ok(View {
         base,
