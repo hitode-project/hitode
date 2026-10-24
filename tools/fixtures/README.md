@@ -1,4 +1,6 @@
-# Repository-owned PE fixtures
+# Repository-owned fixtures
+
+## PE fixtures
 
 DLL export driver: [usage and JSON protocol](dll-driver.md).
 Build with `./tools/fixtures/build-dll-driver.ps1`; `tools/performance/dll_exports.py` compares scalar results, memory hashes, and loop costs for identical scripts.
@@ -121,3 +123,21 @@ Nonzero guest exit codes identify the failed check: 10–15 concern DLL loading,
 relocation and TLS; 16–17 concern thread/event synchronization; 18–21 concern
 window/GDI creation or drawing; 22 means the guest closed before both input types;
 23 means character translation produced a duplicate or incorrect character.
+
+## Optical media
+
+[`optical.iso`](../../crates/adv-os/tests/fixtures/optical.iso) is an authored 28-sector ISO9660/Joliet test image, with no game
+data. It is shared by the VFS and Win32 regression tests.
+
+- Volume label: `OPTICAL_TEST`; logical sector size: 2048 bytes.
+- Primary and Joliet descriptors: sectors 16 and 17; terminator: sector 18.
+- Primary root: sector 20; Joliet root: sector 21; `Sub`: sector 22.
+- Primary little/big endian root path tables: sectors 23 and 24.
+- `ReadMe.txt`: sector 25, `hello world` (11 bytes).
+- `Sub/日本.txt`: sector 26, `abcde` (5 bytes).
+- `Sub/split.bin`: sectors 26 and 27, `abcde world` (5 + 6 bytes).
+- Records use October 7, 2026, 12:34:56 UTC+8; identifiers use `;1` versions.
+
+The primary namespace exposes `README.TXT`; the Joliet namespace exposes mixed
+case and Unicode names. File extents deliberately share bytes to verify that
+the VFS identities belong to file records, rather than only to physical extents.

@@ -1,6 +1,10 @@
 # Wine userland
 
 ID prefix: WINE
+ID prefix: SRV
+ID prefix: NT
+ID prefix: NAT
+ID prefix: CODEC
 
 This spec covers the Wine userland stack. `adv-wineserver` runs Wine's server inside the host process. `adv-nt` takes the place of Wine's `ntdll.so` under Wine's own Windows DLLs. `adv-unix` runs Wine's other Unix libraries, such as `win32u.so`, as guest code. [README.md](README.md) explains the format.
 
@@ -37,6 +41,57 @@ This spec covers the Wine userland stack. `adv-wineserver` runs Wine's server in
 
 **Rule**: A guest process MUST connect to the server when the server directory path is longer than `sun_path` holds.
 **Verification**: Test
+
+## Server channels
+
+### SRV-CHAN-1 Memory channels
+
+**Rule**: Request, reply and wait pipe bytes MUST travel through shared memory without channel read or write system calls.
+Registered descriptors MUST retain pipe read, close and readiness behavior across descriptor transfers and reuse.
+Wake delivery MUST visit only threads whose wait queues received bytes.
+**Verification**: Test
+
+## Server event loop
+
+### SRV-EVENT-1 Incremental server events
+
+**Rule**: The server MUST use kqueue on Apple targets and epoll on Android, keeping channel registrations outside the kernel.
+Event waits MUST merge queue readiness with kernel events using zero kernel timeouts and yield to the runtime when nothing is ready.
+Channel registrations MUST preserve event data, enablement and close behavior.
+**Verification**: Test
+
+### SRV-EVENT-2 Resume only for server input
+
+**Rule**: Waiting servers MUST resume only for changed channel input, an expired deadline, kernel readiness, or an immediate continuation.
+Kernel readiness MUST wake the session and gate zero-timeout kernel queries without delaying ready descriptors.
+Descriptors that remain ready MUST remain observable on later steps.
+**Verification**: Test
+**Basis**: Wine 11 `server/fd.c`; WINE-THR-1
+
+## Server synchronization
+
+### SRV-SYNC-1 In-process object operations
+
+**Rule**: Synchronization operations MUST preserve Wine 11's object state, access checks, return values, and fallback behavior.
+**Verification**: Test
+**Basis**: Wine 11 `dlls/ntdll/unix/sync.c`; Linux `Documentation/userspace-api/ntsync.rst`
+
+### SRV-SYNC-2 Atomic machine waits
+
+**Rule**: Pending device waits MUST park guest contexts in the machine. Wait-all MUST acquire every object atomically. Pulsing an event MUST satisfy eligible registered waiters before resetting it.
+**Verification**: Test
+**Basis**: WINE-THR-1, WINE-THR-2
+
+### SRV-SYNC-3 Descriptor ownership
+
+**Rule**: Device objects MUST survive descriptor transfer and pending waits until their last reference closes. Closing a handle MUST invalidate its synchronization cache entry. Other descriptors and paths MUST retain libc behavior.
+**Verification**: Test
+
+### SRV-SYNC-4 Every event signaller
+
+**Rule**: Every host path that sets or resets an event, including file I/O completion, MUST use its in-process sync first. The server asserts on event operations for those objects.
+**Verification**: Test
+**Basis**: Wine 11 `server/event.c`
 
 ## System calls
 
@@ -104,6 +159,96 @@ DOS device paths without a host drive MUST resolve through the server's symbolic
 **Verification**: Test
 **Basis**: Wine 11.0 `find_file_in_dir` and `get_dir_case_sensitivity`.
 
+## NT files
+
+NT services follow Wine 11.0's argument checks, server requests and status codes.
+
+### NT-FILE-1 File descriptor operations
+
+**Rule**: File flushing, deletion, mailslot creation, and scatter/gather I/O MUST follow Wine 11's checks, statuses, server requests, and side effects.
+**Verification**: Test
+
+### NT-FILE-2 File waits and cancellation
+
+**Rule**: File locks, directory notifications, and I/O cancellation MUST follow Wine 11. Their waits MUST use the machine's scheduler.
+**Verification**: Test
+
+### NT-FILE-3 Device controls
+
+**Rule**: Disk-family device controls MUST return Wine's results without host disk devices. Other device controls MUST reach the server.
+**Verification**: Test
+
+### NT-FILE-4 File stubs
+
+**Rule**: `NtQueryEaFile`, `NtSetEaFile`, and `NtSetVolumeInformationFile` MUST preserve Wine 11's stub checks, statuses, and side effects.
+**Verification**: Review — the probe omits Wine's stubs.
+
+## NT security
+
+### NT-SEC-1 Tokens and privileges
+
+**Rule**: Token creation, opening, filtering, privilege adjustment, privilege checks, and default DACL updates MUST match Wine 11.0's server requests and results. Token users MUST remain guest identities independent of host names and users.
+**Verification**: Test
+
+### NT-SEC-2 Security descriptors and access
+
+**Rule**: Access checks and object security queries and updates MUST preserve Wine 11.0's descriptor conversion, length checks, statuses, and server effects.
+**Verification**: Test
+
+### NT-SEC-3 Object identity and lifetime
+
+**Rule**: Object comparison and reserve allocation MUST use Wine 11.0's server requests. Permanent and temporary objects MUST send `set_object_permanence` and retain the server's lifetime behavior.
+**Verification**: Test
+
+### NT-SEC-4 Security stubs
+
+**Rule**: Security calls stubbed by Wine 11.0 MUST preserve its fixed statuses and output writes.
+**Verification**: Review — the call list is compared with Wine's Unix security and server implementations.
+
+## NT registry, processes and jobs
+
+### NT-PROC-1 Registry hive operations
+
+**Rule**: Registry rename, transacted opens, and hive operations MUST follow Wine's argument checks and server requests. Hive files MUST use the guest's file handles.
+**Verification**: Test
+
+### NT-PROC-2 Process and thread operations
+
+**Rule**: Process enumeration, suspension, thread alerts, continuation, and APC calls MUST follow Wine's behavior within `WINE-SYS-4`. Suspension MUST update machine contexts.
+**Verification**: Test
+
+### NT-PROC-3 Jobs and completions
+
+**Rule**: Job membership, information, termination, and completion calls MUST use Wine's checks and server requests. Terminating the current process's job MUST end the machine process.
+**Verification**: Test
+
+## NT system, memory and debugging
+
+### NT-SYS-1 Extended section views
+
+**Rule**: Extended section calls MUST follow Wine 11.0 parameter checks, shared mappings and placeholder replacement. Preserving an unmapped placeholder MUST retain its reservation.
+**Verification**: Test
+
+### NT-SYS-2 Memory services
+
+**Rule**: Memory flush, lock, prefetch and WoW64 services MUST follow Wine 11.0 statuses, lengths and server requests. Process write barriers MUST order prior guest writes.
+**Verification**: Test
+
+### NT-SYS-3 Guest system state
+
+**Rule**: Locale and execution-state updates MUST affect only guest state. License queries MUST read `\Registry\Machine\Software\Wine\LicenseInformation` with Wine's type and length reporting.
+**Verification**: Test
+
+### NT-SYS-4 Debug services
+
+**Rule**: Debug attachment, continuation, object information and event waits MUST use Wine's server requests. Debug waits MUST block through machine scheduling.
+**Verification**: Test
+
+### NT-SYS-5 System stubs
+
+**Rule**: Fixed system stubs MUST retain Wine 11.0 statuses and output writes. Syscall-table stubs MUST raise Wine's noncontinuable stub exception. Unsupported LDT updates MUST return `STATUS_NOT_IMPLEMENTED`.
+**Verification**: Review — the implementations are compared with Wine's Unix sources and syscall stub table.
+
 ## Unix libraries
 
 ### WINE-UNIX-1 Guest ELF libraries
@@ -162,6 +307,31 @@ FreeType is such a library: win32u opens it by name and draws TrueType text thro
 ### WINE-TIME-1 Shared clock page
 
 **Rule**: The clocks in KUSER_SHARED_DATA MUST be refreshed as each system call enters and before each context runs. A guest that polls the page without a system call MUST see time pass.
+**Verification**: Test
+
+## Native bodies
+
+`adv-nt::identity` matches mapped distribution images and functions against code identity tables.
+`adv-nt::native` binds bodies to the confirmed functions.
+
+### NAT-ID-1 Code identity
+
+**Rule**: A code identity table MUST describe a mapped image only when the hash of the image's headers equals the table's. A function MUST be bound to a native body only when its bytes, with base relocations masked, hash to the table's value.
+**Verification**: Test
+
+### NAT-BODY-1 Body semantics
+
+**Rule**: A native body that accepts a call MUST leave the guest state Wine's function would leave. Registers and flags the calling convention does not keep are exempt. Otherwise it MUST decline before any side effect, and the call MUST run Wine's function from its entry with the caller's frame.
+**Verification**: Test
+
+### NAT-BODY-2 Performance counter body
+
+**Rule**: The native body of `ntdll.dll!NtQueryPerformanceCounter` MUST use the system call's counter computation and machine clock. It MUST return success and write the counter and optional frequency as the system call does. A null counter or an unwritable output MUST make the body decline before any write.
+**Verification**: Test
+
+### NAT-BODY-3 DirectSound mixer
+
+**Rule**: The DirectSound mixer body MUST preserve Wine's float samples, scratch data, buffer positions, frequency accumulators, states, shared lock words, and stopped result. It MUST decline before writes when locks would wait, notifications would fire, effects or 3D apply, conversions are unsupported, or required memory is inaccessible. Its field offsets MUST match the pinned module's DWARF.
 **Verification**: Test
 
 ## Host DLL images
@@ -355,6 +525,26 @@ FreeType is such a library: win32u opens it by name and draws TrueType text thro
 
 **Rule**: The Wine recipe MUST build winegstreamer's PE module with the distribution's flags, install it, strip debug information, and register its classes. Adding the module MUST NOT change other distribution binaries.
 **Verification**: Review — distribution checksums and prefix regeneration are packaging checks.
+
+## Static codec kernels
+
+Static Vorbis and Theora bindings run on the Wine stack.
+Device decoding follows [device.md](device.md).
+
+### CODEC-MAP-1 Image binding
+
+**Rule**: Non-distribution images MUST be scanned once per mapping, using executable ranges and the reviewed codec signatures. Distribution images and guest mode MUST NOT be scanned. Unmapping MUST retire bindings and their decoder state.
+**Verification**: Test
+
+### CODEC-CALL-1 Vorbis transforms
+
+**Rule**: Native Vorbis transforms MUST retain the built-in stack's admission, ABI, table, buffer, and floating-environment checks. Declined calls MUST preserve guest memory and resume the original function through its trampoline. Verify mode MUST publish guest results and preserve guest floating state.
+**Verification**: Test
+
+### CODEC-CALL-2 Theora packets
+
+**Rule**: Theora bindings MUST retain complete library-family admission and preserve pixels, state, guest allocation lifetime, return values, and callbacks. Calls without admitted decoder state MUST resume guest code before changing guest memory. Verify mode MUST compare native results while publishing guest results.
+**Verification**: Test
 
 ## Sessions
 

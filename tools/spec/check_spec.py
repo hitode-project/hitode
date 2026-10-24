@@ -3,7 +3,7 @@
 
   python3 tools/spec/check_spec.py    # prints one line per problem; exit 1 if any
 
-Each spec file declares an ID prefix and lists rules as `### ID Title`
+Each spec file declares its ID prefixes and lists rules as `### ID Title`
 headings followed by fields. Rules verified by a test need a `spec: ID`
 marker in a tracked source file; every mention of an ID with a known prefix
 anywhere in the repository must name a live rule.
@@ -100,14 +100,16 @@ def parse(path: str, text: str, spec: Spec) -> None:
 
     if len(lines) > MAX_LINES:
         err(len(lines), f"{len(lines)} lines; split the file (limit {MAX_LINES})")
-    prefix = next((m.group(1) for l in lines if (m := PREFIX_LINE.match(l))), None)
-    if prefix is None:
+    prefixes = [m.group(1) for l in lines if (m := PREFIX_LINE.match(l))]
+    if not prefixes:
         err(1, "missing the 'ID prefix:' line")
         return
-    if prefix in spec.prefixes:
-        err(1, f"prefix {prefix} is declared by another file")
-    spec.prefixes.add(prefix)
-    id_form = re.compile(rf"^{prefix}-[A-Z0-9]+-[1-9]\d*$")
+    for prefix in prefixes:
+        if prefix in spec.prefixes:
+            err(1, f"prefix {prefix} is already declared")
+        spec.prefixes.add(prefix)
+    prefix_form = "|".join(prefixes)
+    id_form = re.compile(rf"^(?:{prefix_form})-[A-Z0-9]+-[1-9]\d*$")
     rule: Rule | None = None
     fence = False
     for n, line in enumerate(lines, 1):
@@ -121,13 +123,13 @@ def parse(path: str, text: str, spec: Spec) -> None:
             ids = [i for i in re.split(r"[,\s]+", m.group(1)) if i and i != "none"]
             for i in ids:
                 if not id_form.match(i):
-                    err(n, f"withdrawn ID {i} does not match {prefix}-GROUP-N")
+                    err(n, f"withdrawn ID {i} does not match {prefix_form}-GROUP-N")
                 spec.withdrawn.add(i)
             continue
         if m := ENTRY.match(line):
             rule = Rule(m.group(1), path, n)
             if not id_form.match(rule.id):
-                err(n, f"rule ID {rule.id} does not match {prefix}-GROUP-N")
+                err(n, f"rule ID {rule.id} does not match {prefix_form}-GROUP-N")
             if rule.id in spec.rules:
                 other = spec.rules[rule.id]
                 err(n, f"rule ID {rule.id} already used at {other.path}:{other.line}")

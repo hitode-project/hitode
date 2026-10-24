@@ -25,7 +25,7 @@ A table or a list may follow the fields as part of the rule. Three kinds of note
 
 ## IDs
 
-- An ID is `PREFIX-GROUP-N`, for example `A64-MEM-5`. Each file declares its prefix on an `ID prefix:` line. Groups use uppercase letters and digits.
+- An ID is `PREFIX-GROUP-N`, for example `A64-MEM-5`. Each file declares every prefix it uses on a separate `ID prefix:` line. Each prefix belongs to one file. Groups use uppercase letters and digits.
 - IDs are never reused. To withdraw a rule, delete its text and move its ID to the `Withdrawn:` line at the end of the file.
 - Code and tests cite rules by ID, not by section. A test cites the rules it can refute with a `// spec: ID` line before the function; one line may list several IDs.
 
