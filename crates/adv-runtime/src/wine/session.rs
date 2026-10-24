@@ -130,6 +130,9 @@ struct Driver {
     signals: Vec<(i32, i32, i32)>,
     generation: u64,
     deadline: Option<Instant>,
+    input: u64,
+    #[cfg(test)]
+    resumes: usize,
 }
 
 /// The server, which the session's processes share.
@@ -197,6 +200,20 @@ impl adv_wineserver::Tracing for Trace<'_, '_> {
 impl Shared {
     fn step(&mut self, time: Time, cpu: Option<&mut dyn Guest>) {
         let mut driver = self.driver.borrow_mut();
+        // spec: SRV-EVENT-2
+        if matches!(driver.server.state(), State::Waiting(delay) if delay != Some(Duration::ZERO))
+            && driver.input == driver.server.input_generation()
+            && driver
+                .deadline
+                .is_none_or(|deadline| deadline > Instant::now())
+            && !driver.server.kernel_ready()
+        {
+            return;
+        }
+        #[cfg(test)]
+        {
+            driver.resumes += 1;
+        }
         let Driver {
             server,
             clock,
@@ -204,6 +221,8 @@ impl Shared {
             signals,
             generation,
             deadline,
+            input,
+            ..
         } = &mut *driver;
         clock.0.set(time);
         let state = server.step_with_tracing(
@@ -215,6 +234,7 @@ impl Shared {
                 signals,
             },
         );
+        *input = server.input_generation();
         *generation += 1;
         *deadline = match state {
             State::Waiting(Some(delay)) => Some(Instant::now() + delay),
@@ -452,6 +472,9 @@ fn run(
             let us = deadline.saturating_sub(machine.sys.clock.now_us());
             wait = wait.min(Duration::from_micros(us));
         }
+        if let Some(deadline) = machine.ext.get::<Shared>().driver.borrow().deadline {
+            wait = wait.min(deadline.saturating_duration_since(Instant::now()));
+        }
         let started = Instant::now();
         let result = wake.wait(Some(wait));
         if let Some(metrics) = metrics.as_deref_mut() {
@@ -461,6 +484,7 @@ fn run(
         if let Err(error) = result {
             return Stop::Failed(error.to_string());
         }
+        let _ = machine.visit_context(None, adv_nt::server::run);
     }
 }
 
@@ -521,7 +545,7 @@ impl Session {
 
         let mut clock = adv_machine::Clock::real();
         let time = GuestClock(Cell::new(Time::now(&mut clock)));
-        let server = Server::start(
+        let mut server = Server::start(
             &adv_wineserver::Config {
                 prefix: prefix.clone(),
                 server_dir: config.prefix.join("server"),
@@ -531,6 +555,13 @@ impl Session {
             &time,
         )
         .map_err(|e| e.to_string())?;
+        let server_wake = wake.clone();
+        server.set_waker(Box::new(move || server_wake.signal()));
+        let input = server.input_generation();
+        let deadline = match server.state() {
+            State::Waiting(Some(delay)) => Some(Instant::now() + delay),
+            _ => None,
+        };
         let socket = server.socket_dir().ok_or("the server has no socket")?;
         let shared = Shared {
             driver: Rc::new(RefCell::new(Driver {
@@ -539,7 +570,10 @@ impl Session {
                 parked: BTreeMap::new(),
                 signals: vec![],
                 generation: 0,
-                deadline: None,
+                deadline,
+                input,
+                #[cfg(test)]
+                resumes: 0,
             })),
             id: Rc::new(Cell::new(0)),
         };
@@ -572,6 +606,7 @@ impl Session {
             Box::new(shared.clone()),
         )
         .map_err(|e| format!("wineboot: {e}"))?;
+        boot.ext.insert(shared.clone());
         adv_nt::identity::note_ntdll(&mut boot, &config.dist.join(NTDLL), &ntdll);
         match run(
             &mut boot,
@@ -1170,3 +1205,7 @@ impl Session {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/wine/server_quiet.rs"]
+mod server_quiet;

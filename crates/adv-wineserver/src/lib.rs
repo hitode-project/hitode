@@ -17,11 +17,11 @@
 #![cfg(any(target_vendor = "apple", target_os = "android"))]
 
 use std::cell::Cell;
-use std::ffi::{CStr, CString, c_char, c_int};
+use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use corosensei::stack::DefaultStack;
@@ -86,6 +86,8 @@ pub enum Error {
     AlreadyStarted,
     #[error("path contains a NUL byte: {0}")]
     Path(PathBuf),
+    #[error("server event watcher: {0}")]
+    Events(std::io::Error),
 }
 
 enum Suspend {
@@ -96,6 +98,8 @@ enum Suspend {
 pub struct Server {
     coroutine: Coroutine<(), Suspend, c_int, DefaultStack>,
     state: State,
+    watch: *mut c_void,
+    wake: Box<Mutex<Box<dyn Fn() + Send>>>,
 }
 
 /// The strings the server reads through `getenv`, and its executable path.
@@ -119,6 +123,16 @@ thread_local! {
 unsafe extern "C" {
     fn hitode_server_main(debug: c_int) -> c_int;
     static server_dir: *const c_char;
+    fn hitode_server_running(running: c_int);
+    fn hitode_server_input() -> u64;
+    fn hitode_server_queue() -> c_int;
+    fn hitode_server_ready() -> c_int;
+    fn hitode_event_watch(
+        queue: c_int,
+        notify: extern "C" fn(*mut c_void),
+        owner: *mut c_void,
+    ) -> *mut c_void;
+    fn hitode_event_unwatch(watch: *mut c_void);
 }
 
 impl Server {
@@ -149,8 +163,22 @@ impl Server {
         let mut server = Server {
             coroutine,
             state: State::Waiting(Some(Duration::ZERO)),
+            watch: std::ptr::null_mut(),
+            wake: Box::new(Mutex::new(Box::new(|| {}))),
         };
         server.step(clock);
+        // SAFETY: the first wait established Wine's event set. The boxed wake
+        // stays pinned until Drop stops and joins the watcher.
+        server.watch = unsafe {
+            hitode_event_watch(
+                hitode_server_queue(),
+                event_wake,
+                (&raw mut *server.wake).cast(),
+            )
+        };
+        if server.watch.is_null() {
+            return Err(Error::Events(std::io::Error::last_os_error()));
+        }
         Ok(server)
     }
 
@@ -175,6 +203,8 @@ impl Server {
         TRACING.set(Some(unsafe {
             std::mem::transmute::<*mut (dyn Tracing + '_), *mut dyn Tracing>(tracing)
         }));
+        // SAFETY: the execution owner serializes channel access with this resume.
+        unsafe { hitode_server_running(1) };
         self.state = match self.coroutine.resume(()) {
             CoroutineResult::Yield(Suspend::Wait(timeout)) => {
                 State::Waiting(u64::try_from(timeout).ok().map(Duration::from_millis))
@@ -183,9 +213,30 @@ impl Server {
                 State::Exited(status)
             }
         };
+        unsafe { hitode_server_running(0) };
         CLOCK.set(None);
         TRACING.set(None);
         self.state
+    }
+
+    /// Changes to channels whose reader is the server, excluding its own writes.
+    pub fn input_generation(&self) -> u64 {
+        // SAFETY: channel state is accessed only by the execution owner.
+        unsafe { hitode_server_input() }
+    }
+
+    /// Ordinary descriptors have become ready since the last kernel query.
+    pub fn kernel_ready(&self) -> bool {
+        // SAFETY: the watcher and execution owner share only this atomic flag.
+        unsafe { hitode_server_ready() != 0 }
+    }
+
+    /// Wake the execution owner when Wine's kernel event set becomes readable.
+    pub fn set_waker(&mut self, wake: Box<dyn Fn() + Send>) {
+        *self.wake.lock().unwrap() = wake;
+        if self.kernel_ready() {
+            self.wake.lock().unwrap()();
+        }
     }
 
     pub fn state(&self) -> State {
@@ -207,12 +258,22 @@ impl Server {
 
 impl Drop for Server {
     fn drop(&mut self) {
+        if !self.watch.is_null() {
+            // SAFETY: stop joins the watcher before its callback storage is freed.
+            unsafe { hitode_event_unwatch(self.watch) };
+        }
         if !self.coroutine.done() {
             // SAFETY: the server's frames are C code with nothing to unwind;
             // its globals stay behind, which is why it never runs again.
             unsafe { self.coroutine.force_reset() };
         }
     }
+}
+
+extern "C" fn event_wake(owner: *mut c_void) {
+    // SAFETY: Server pins this mutex until the watcher has joined.
+    let wake = unsafe { &*owner.cast::<Mutex<Box<dyn Fn() + Send>>>() };
+    wake.lock().unwrap()();
 }
 
 fn suspend(reason: Suspend) {

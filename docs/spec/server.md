@@ -22,6 +22,14 @@ Event waits MUST merge queue readiness with kernel events using zero kernel time
 Channel registrations MUST preserve event data, enablement and close behavior.
 **Verification**: Test
 
+### SRV-EVENT-2 Resume only for server input
+
+**Rule**: Waiting servers MUST resume only for changed channel input, an expired deadline, kernel readiness, or an immediate continuation.
+Kernel readiness MUST wake the session and gate zero-timeout kernel queries without delaying ready descriptors.
+Descriptors that remain ready MUST remain observable on later steps.
+**Verification**: Test
+**Basis**: Wine 11 `server/fd.c`; WINE-THR-1
+
 ## Synchronization
 
 ### SRV-SYNC-1 In-process object operations

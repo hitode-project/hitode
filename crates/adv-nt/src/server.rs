@@ -41,6 +41,7 @@ mod pipes {
         pub fn sendmsg(fd: libc::c_int, msg: *const libc::msghdr, flags: libc::c_int) -> isize;
         #[link_name = "hitode_recvmsg"]
         pub fn recvmsg(fd: libc::c_int, msg: *mut libc::msghdr, flags: libc::c_int) -> isize;
+        pub fn hitode_server_connected();
         pub fn hitode_channel_forget(fd: libc::c_int);
         pub fn hitode_channel_watch(
             fd: libc::c_int,
@@ -749,6 +750,11 @@ impl Connection {
         time: Time,
     ) -> Result<(Self, FirstThread), Error> {
         socket.set_nonblocking(true)?;
+        // SAFETY: a connected client socket is new input for the server's event set.
+        #[cfg(any(target_vendor = "apple", target_os = "android"))]
+        unsafe {
+            pipes::hitode_server_connected()
+        };
         let (version, request) = receive_fd(&socket, progress, time)?;
         let request = PipeFd(request);
         if version != PROTOCOL_VERSION {

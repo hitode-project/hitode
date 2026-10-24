@@ -23,6 +23,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <string.h>
 #include <time.h>
 #include <sys/time.h>
@@ -322,12 +323,119 @@ struct channel
     void (*notify)( void *, size_t );
     void *owner;
     size_t token;
+    int server_read;
 };
 struct endpoint { struct channel *channel; int writing; };
 static struct endpoint *endpoints;
 static size_t endpoint_count;
 static uint64_t queued_io, system_io;
 static uint64_t kernel_waits, kernel_events, kernel_poll_fds;
+static uint64_t server_input;
+static int server_running, server_queue = -1, kernel_returned;
+static atomic_int kernel_ready = 1;
+
+void hitode_server_running( int running ) { server_running = running; }
+uint64_t hitode_server_input( void ) { return server_input; }
+int hitode_server_queue( void ) { return server_queue; }
+int hitode_server_ready( void ) { return atomic_load( &kernel_ready ); }
+void hitode_server_connected( void ) { atomic_store( &kernel_ready, 1 ); }
+
+/* Only the watcher accesses its wait set. The server's set remains owned by
+ * the execution owner; readiness crosses threads through one atomic flag. */
+struct event_watch
+{
+    int queue, stop[2];
+    pthread_t thread;
+    void (*notify)( void * );
+    void *owner;
+};
+
+static void *event_watch_thread( void *arg )
+{
+    struct event_watch *watch = arg;
+    for (;;)
+    {
+        int i, ret;
+#ifdef __APPLE__
+        struct kevent events[2];
+        ret = kevent( watch->queue, NULL, 0, events, 2, NULL );
+#else
+        struct epoll_event events[2];
+        ret = epoll_wait( watch->queue, events, 2, -1 );
+#endif
+        if (ret < 0 && errno == EINTR) continue;
+        if (ret < 0) abort();
+        for (i = 0; i < ret; i++)
+        {
+#ifdef __APPLE__
+            if (events[i].ident == (uintptr_t)watch->stop[0]) return NULL;
+#else
+            if (events[i].data.fd == watch->stop[0]) return NULL;
+#endif
+        }
+        atomic_store( &kernel_ready, 1 );
+        watch->notify( watch->owner );
+    }
+}
+
+void *hitode_event_watch( int queue, void (*notify)(void *), void *owner )
+{
+    struct event_watch *watch = calloc( 1, sizeof(*watch) );
+    int error;
+    if (!watch) return NULL;
+#ifdef __APPLE__
+    watch->queue = kqueue();
+#else
+    watch->queue = epoll_create1( EPOLL_CLOEXEC );
+#endif
+    if (watch->queue == -1) goto fail;
+    if (pipe( watch->stop )) goto fail_queue;
+    fcntl( watch->stop[0], F_SETFD, FD_CLOEXEC );
+    fcntl( watch->stop[1], F_SETFD, FD_CLOEXEC );
+#ifdef __APPLE__
+    struct kevent events[2];
+    EV_SET( &events[0], queue, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, NULL );
+    EV_SET( &events[1], watch->stop[0], EVFILT_READ, EV_ADD, 0, 0, NULL );
+    if (kevent( watch->queue, events, 2, NULL, 0, NULL ) == -1) goto fail_pipe;
+#else
+    struct epoll_event event = { .events = EPOLLIN | EPOLLET, .data.fd = queue };
+    if (epoll_ctl( watch->queue, EPOLL_CTL_ADD, queue, &event )) goto fail_pipe;
+    event = (struct epoll_event){ .events = EPOLLIN, .data.fd = watch->stop[0] };
+    if (epoll_ctl( watch->queue, EPOLL_CTL_ADD, watch->stop[0], &event )) goto fail_pipe;
+#endif
+    atomic_store( &kernel_ready, 1 );
+    watch->notify = notify;
+    watch->owner = owner;
+    if ((error = pthread_create( &watch->thread, NULL, event_watch_thread, watch )))
+    {
+        errno = error;
+        goto fail_pipe;
+    }
+    return watch;
+fail_pipe:
+    error = errno;
+    close( watch->stop[0] );
+    close( watch->stop[1] );
+    errno = error;
+fail_queue:
+    error = errno;
+    close( watch->queue );
+    errno = error;
+fail:
+    free( watch );
+    return NULL;
+}
+
+void hitode_event_unwatch( void *arg )
+{
+    struct event_watch *watch = arg;
+    write( watch->stop[1], "x", 1 );
+    pthread_join( watch->thread, NULL );
+    close( watch->stop[0] );
+    close( watch->stop[1] );
+    close( watch->queue );
+    free( watch );
+}
 
 struct channel_event
 {
@@ -396,6 +504,7 @@ void hitode_channel_forget( int fd )
     }
     if (end && end->channel)
     {
+        if (!server_running && end->channel->server_read) server_input++;
         release( *end );
         end->channel = NULL;
     }
@@ -484,6 +593,7 @@ ssize_t hitode_write( int fd, const void *buf, size_t size )
     }
     memcpy( channel->data + old_size, buf, size );
     channel->size += size;
+    if (!server_running && channel->server_read) server_input++;
     if (!old_size && channel->notify) channel->notify( channel->owner, channel->token );
     return size;
 }
@@ -559,6 +669,8 @@ ssize_t hitode_sendmsg( int fd, const struct msghdr *msg, int flags )
     }
     ntsync_rights( msg, 0 );
     ret = sendmsg( fd, msg, flags );
+    /* Client socket input is known before the watcher gets a turn. */
+    if (ret >= 0 && !server_running) atomic_store( &kernel_ready, 1 );
     if (ret < 0) ntsync_rights( msg, -1 );
 done:
     while ((item = pending))
@@ -688,8 +800,17 @@ static int channel_kevent( int queue, struct kevent *events, int capacity )
         count++;
     }
     if (count == capacity) { memcpy( events, queued, count * sizeof(*events) ); return count; }
-    kernel_waits++;
-    ret = kevent( queue, NULL, 0, events, capacity - count, &zero );
+    ret = 0;
+    if (atomic_exchange( &kernel_ready, 0 ))
+    {
+        kernel_waits++;
+        ret = kevent( queue, NULL, 0, events, capacity - count, &zero );
+        if (ret > 0)
+        {
+            atomic_store( &kernel_ready, 1 );
+            kernel_returned = 1;
+        }
+    }
     if (ret < 0) return ret;
     kernel_events += ret;
     /* Dispatch socket closure before channel closure, as Wine's poll array does. */
@@ -702,12 +823,14 @@ int hitode_kevent( int queue, const struct kevent *changes, int count,
 {
     struct kevent other[count ? count : 1];
     int i, rest = 0, ret, wait = -1;
+    if (server_running) server_queue = queue;
     for (i = 0; i < count; i++)
     {
         const struct kevent *ev = &changes[i];
         struct endpoint *end = endpoint( ev->ident );
         struct channel_event **ptr, *item;
         if (!end || !end->channel) { other[rest++] = *ev; continue; }
+        if (server_running && ev->filter == EVFILT_READ) end->channel->server_read = 1;
         ptr = find_event( queue, ev->ident, ev->filter );
         item = *ptr;
         if (ev->flags & EV_DELETE)
@@ -730,12 +853,22 @@ int hitode_kevent( int queue, const struct kevent *changes, int count,
         if (ev->flags & EV_DISABLE) item->event.flags |= EV_DISABLE;
         if (ev->flags & EV_ENABLE) item->event.flags &= ~EV_DISABLE;
     }
-    if (rest && kevent( queue, other, rest, NULL, 0, NULL ) < 0) return -1;
+    if (rest)
+    {
+        if (kevent( queue, other, rest, NULL, 0, NULL ) < 0) return -1;
+        atomic_store( &kernel_ready, 1 );
+    }
     if (!capacity) return 0;
     if (timeout)
     {
         int64_t ms = (int64_t)timeout->tv_sec * 1000 + (timeout->tv_nsec + 999999) / 1000000;
         wait = ms > INT_MAX ? INT_MAX : ms;
+    }
+    /* Level readiness belongs to the next step, even if it stays ready. */
+    if (server_running && kernel_returned)
+    {
+        kernel_returned = 0;
+        hitode_host_wait( 0 );
     }
     ret = channel_kevent( queue, events, capacity );
     if (ret || !wait) return ret;
@@ -747,7 +880,15 @@ int hitode_epoll_ctl( int queue, int op, int fd, struct epoll_event *event )
 {
     struct endpoint *end = endpoint( fd );
     struct channel_event **ptr, *item;
-    if (!end || !end->channel) return epoll_ctl( queue, op, fd, event );
+    if (server_running) server_queue = queue;
+    if (!end || !end->channel)
+    {
+        int ret = epoll_ctl( queue, op, fd, event );
+        if (!ret) atomic_store( &kernel_ready, 1 );
+        return ret;
+    }
+    if (server_running && op != EPOLL_CTL_DEL && (event->events & EPOLLIN))
+        end->channel->server_read = 1;
     ptr = find_event( queue, fd, 0 );
     item = *ptr;
     if (op == EPOLL_CTL_ADD)
@@ -792,8 +933,17 @@ static int channel_epoll( int queue, struct epoll_event *events, int capacity )
         queued[count++].events = ready;
     }
     if (count == capacity) { memcpy( events, queued, count * sizeof(*events) ); return count; }
-    kernel_waits++;
-    ret = epoll_wait( queue, events, capacity - count, 0 );
+    ret = 0;
+    if (atomic_exchange( &kernel_ready, 0 ))
+    {
+        kernel_waits++;
+        ret = epoll_wait( queue, events, capacity - count, 0 );
+        if (ret > 0)
+        {
+            atomic_store( &kernel_ready, 1 );
+            kernel_returned = 1;
+        }
+    }
     if (ret < 0) return ret;
     kernel_events += ret;
     memcpy( events + ret, queued, count * sizeof(*events) );
@@ -802,7 +952,14 @@ static int channel_epoll( int queue, struct epoll_event *events, int capacity )
 
 int hitode_epoll_wait( int queue, struct epoll_event *events, int capacity, int timeout )
 {
-    int ret = channel_epoll( queue, events, capacity );
+    int ret;
+    /* Level readiness belongs to the next step, even if it stays ready. */
+    if (server_running && kernel_returned)
+    {
+        kernel_returned = 0;
+        hitode_host_wait( 0 );
+    }
+    ret = channel_epoll( queue, events, capacity );
     if (ret || !timeout) return ret;
     hitode_host_wait( timeout );
     return channel_epoll( queue, events, capacity );

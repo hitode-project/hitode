@@ -165,7 +165,7 @@ pub fn handshake(many_files: bool) {
     assert_eq!(version, PROTOCOL_VERSION);
 
     let (reply, reply_write) = pipe();
-    let (_wait, wait_write) = pipe();
+    let (wait, wait_write) = pipe();
     send_fd(&client, reply_write.as_raw_fd());
     send_fd(&client, wait_write.as_raw_fd());
     let init = protocol::InitFirstThreadRequest {
@@ -247,6 +247,7 @@ pub fn handshake(many_files: bool) {
                 assert_ne!(answer.handle, 0);
             }
         }
+        server.step(&clock); // Finish the last descriptor transfer before measuring a quiet request.
         let (mut waits, mut events, mut polls) = (0, 0, 0);
         let (mut after_waits, mut after_events, mut after_polls) = (0, 0, 0);
         // SAFETY: the request header occupies fixed; all outputs and descriptors are live.
@@ -281,13 +282,16 @@ pub fn handshake(many_files: bool) {
             assert_ne!(answer.tid, 0);
             hitode_event_counts(&mut after_waits, &mut after_events, &mut after_polls);
         }
-        assert_eq!(after_waits - waits, 2, "kernel event waits per request");
+        assert_eq!(after_waits - waits, 0, "kernel event waits per request");
         assert_eq!(
             after_events - events,
             0,
             "ordinary descriptors returned by kernel"
         );
         assert_eq!(after_polls - polls, 0, "descriptors passed to kernel poll");
+    }
+    if many_files {
+        quiet_events(&mut server, &clock, &client, &request_pipe, &reply, &wait);
     }
     drop((request_pipe, reply, reply_write, wait_write));
     drop(client);
@@ -299,9 +303,155 @@ pub fn handshake(many_files: bool) {
             clock.0.get() < 10 * TICKS_PER_SECOND,
             "server still running"
         );
-        clock.0.set(clock.0.get() + timeout.as_nanos() as u64 / 100);
+        clock
+            .0
+            .set(clock.0.get() + timeout.max(Duration::from_millis(1)).as_nanos() as u64 / 100);
         state = server.step(&clock);
     }
     assert_eq!(state, State::Exited(0));
     std::fs::remove_dir_all(root).unwrap();
+}
+
+fn event_counts() -> (u64, u64) {
+    let (mut waits, mut events, mut polls) = (0, 0, 0);
+    // SAFETY: all three outputs are writable.
+    unsafe { hitode_event_counts(&mut waits, &mut events, &mut polls) };
+    (waits, events)
+}
+
+// spec: SRV-EVENT-2
+fn quiet_events(
+    server: &mut Server,
+    clock: &TestClock,
+    client: &UnixStream,
+    request: &ChannelFd,
+    reply: &ChannelFd,
+    wait: &ChannelFd,
+) {
+    let call = |server: &mut Server, number: i32, words: &[u32], data: &[u8]| {
+        let mut fixed = [0u8; 64];
+        fixed[..4].copy_from_slice(&number.to_ne_bytes());
+        fixed[4..8].copy_from_slice(&(data.len() as u32).to_ne_bytes());
+        for (i, word) in words.iter().enumerate() {
+            fixed[12 + i * 4..16 + i * 4].copy_from_slice(&word.to_ne_bytes());
+        }
+        // SAFETY: live channels and buffers; the fixed request holds its declared data size.
+        unsafe {
+            assert_eq!(
+                hitode_write(request.as_raw_fd(), fixed.as_ptr().cast(), 64),
+                64
+            );
+            if !data.is_empty() {
+                assert_eq!(
+                    hitode_write(request.as_raw_fd(), data.as_ptr().cast(), data.len()),
+                    data.len() as isize
+                );
+            }
+            server.step(clock);
+            assert_eq!(
+                hitode_read(reply.as_raw_fd(), fixed.as_mut_ptr().cast(), 64),
+                64
+            );
+        }
+        assert_eq!(
+            u32::from_ne_bytes(fixed[..4].try_into().unwrap()),
+            if number == protocol::SelectRequest::NUMBER {
+                0x103
+            } else {
+                0
+            },
+            "request {}",
+            protocol::REQUEST_NAMES[number as usize]
+        );
+        fixed
+    };
+    // A timeout wake uses only the memory wait channel, just like a signaled wait.
+    let before = event_counts();
+    let mut data = [0u8; 44]; // apc_result, then SELECT_NONE.
+    data[40..].copy_from_slice(&0u32.to_ne_bytes());
+    let timeout = -10_000i64; // One millisecond in monotonic ticks.
+    let words = [2, 0x1234, 0, timeout as u32, (timeout >> 32) as u32, 4, 0];
+    let answer = call(server, protocol::SelectRequest::NUMBER, &words, &data);
+    assert_eq!(u32::from_ne_bytes(answer[12..16].try_into().unwrap()), 0);
+    let generation = server.input_generation();
+    clock.0.set(clock.0.get() + 10_000);
+    server.step(clock);
+    let mut wake = [0u8; 16];
+    // SAFETY: the wait channel and destination buffer are live.
+    assert_eq!(
+        unsafe { hitode_read(wait.as_raw_fd(), wake.as_mut_ptr().cast(), 16) },
+        16
+    );
+    assert_eq!(u64::from_ne_bytes(wake[..8].try_into().unwrap()), 0x1234);
+    assert_eq!(u32::from_ne_bytes(wake[8..12].try_into().unwrap()), 0x102);
+    assert_eq!(
+        server.input_generation(),
+        generation,
+        "server output counted as input"
+    );
+    assert_eq!(
+        event_counts(),
+        before,
+        "quiet request and wake queried the kernel"
+    );
+
+    let number = |name: &str| {
+        protocol::REQUEST_NAMES
+            .iter()
+            .position(|&n| n == name)
+            .unwrap() as i32
+    };
+    let handle = |fixed: [u8; 64]| u32::from_ne_bytes(fixed[8..12].try_into().unwrap());
+    let name: Vec<u8> = "quiet".encode_utf16().flat_map(u16::to_ne_bytes).collect();
+    let station_name: Vec<u8> = "\\quiet"
+        .encode_utf16()
+        .flat_map(u16::to_ne_bytes)
+        .collect();
+    let station = handle(call(
+        server,
+        number("create_winstation"),
+        &[0, 0x000f_037f, 0, 0],
+        &station_name,
+    ));
+    call(server, number("set_process_winstation"), &[station], &[]);
+    let desktop = handle(call(
+        server,
+        number("create_desktop"),
+        &[0x4000_0000, 0x000f_01ff, 0],
+        &name,
+    ));
+    call(server, number("set_thread_desktop"), &[desktop], &[]);
+    let (reader, mut writer) = UnixStream::pair().unwrap();
+    send_fd(client, reader.as_raw_fd());
+    let answer = call(
+        server,
+        protocol::AllocFileHandleRequest::NUMBER,
+        &[0x0010_0001, 0, reader.as_raw_fd() as u32],
+        &[],
+    );
+    let handle = u32::from_ne_bytes(answer[8..12].try_into().unwrap());
+    call(server, protocol::SetQueueFdRequest::NUMBER, &[handle], &[]);
+    server.step(clock); // Drain registration readiness before waiting for new bytes.
+    assert!(!server.kernel_ready());
+    let (send, receive) = std::sync::mpsc::channel();
+    server.set_waker(Box::new(move || {
+        send.send(()).unwrap();
+    }));
+    let before = event_counts();
+    std::io::Write::write_all(&mut writer, b"ready").unwrap();
+    receive.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(server.kernel_ready(), "watcher did not retain readiness");
+    server.step(clock);
+    assert!(
+        event_counts().1 > before.1,
+        "server did not handle socket readiness"
+    );
+    let handled = event_counts().1;
+    server.step(clock);
+    assert_eq!(
+        event_counts().1,
+        handled,
+        "queue fd should be disabled after delivery"
+    );
+    server.set_waker(Box::new(|| {}));
 }

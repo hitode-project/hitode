@@ -4,7 +4,7 @@
 #[path = "common/handshake.rs"]
 mod common;
 
-// spec: SRV-EVENT-1, WINE-SRV-1
+// spec: SRV-EVENT-1, SRV-EVENT-2, WINE-SRV-1
 #[test]
 fn requests_with_many_ordinary_descriptors_use_incremental_events() {
     common::handshake(true);
