@@ -823,3 +823,48 @@ pub fn set_thread(env: &mut Env<'_>, args: &[u32]) -> Outcome {
 }
 
 struct ExecuteFlags(u32);
+
+/// NtWow64QueryInformationProcess64 returns Wine's 64-bit basic record.
+pub fn query_process64(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    let &[process, class, info, size, returned] = args else {
+        unreachable!()
+    };
+    if class != 0 {
+        return Outcome::Return(status::NOT_IMPLEMENTED);
+    }
+    status::finish((|| {
+        let mut len = 48;
+        let mut result = status::INFO_LENGTH_MISMATCH;
+        if size >= 48 {
+            if info == 0 {
+                result = status::ACCESS_VIOLATION;
+                len = 0;
+            } else {
+                let mut request = GetProcessInfoRequest {
+                    handle: process,
+                    ..Default::default()
+                };
+                let (reply, _) = server::request(env, &mut request, &[], &mut [])?;
+                result = reply.header.error;
+                if result == 0 {
+                    let mut data = [0; 48];
+                    data[..4].copy_from_slice(&reply.exit_code.to_le_bytes());
+                    data[8..16].copy_from_slice(&u64::from(reply.peb as u32).to_le_bytes());
+                    data[16..24]
+                        .copy_from_slice(&(reply.affinity & ((1 << PROCESSORS) - 1)).to_le_bytes());
+                    data[24..28].copy_from_slice(&u32::from(reply.base_priority).to_le_bytes());
+                    data[32..40].copy_from_slice(&u64::from(reply.pid).to_le_bytes());
+                    data[40..48].copy_from_slice(&u64::from(reply.ppid).to_le_bytes());
+                    write_bytes(env, info, &data)?;
+                }
+            }
+            if size > 48 {
+                result = status::INFO_LENGTH_MISMATCH;
+            }
+        }
+        if returned != 0 {
+            write_u32(env, returned, len)?;
+        }
+        status::check(result)
+    })())
+}

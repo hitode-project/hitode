@@ -1185,3 +1185,78 @@ pub fn power_information(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         ))),
     })())
 }
+
+/// Wine 11.0's NtApphelpCacheControl stub.
+pub fn apphelp_cache_control(env: &mut Env<'_>, _args: &[u32]) -> Outcome {
+    crate::exception::stub(env, "NtApphelpCacheControl")
+}
+
+/// NtDisplayString writes the Unicode string to Wine's error channel.
+pub fn display_string(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    if args[0] == 0 {
+        log::error!(target: "wine", "(null)");
+        return Outcome::Return(status::SUCCESS);
+    }
+    status::finish((|| {
+        let string = crate::object::read_unicode_string(env, args[0])?;
+        log::error!(target: "wine", "{}", String::from_utf16_lossy(&string));
+        Ok(())
+    })())
+}
+
+/// Wine 11.0's NtInitiatePowerAction stub.
+pub fn initiate_power_action(_env: &mut Env<'_>, _args: &[u32]) -> Outcome {
+    Outcome::Return(status::NOT_IMPLEMENTED)
+}
+
+/// Wine 11.0's NtLoadDriver stub.
+pub fn load_driver(_env: &mut Env<'_>, _args: &[u32]) -> Outcome {
+    Outcome::Return(status::NOT_IMPLEMENTED)
+}
+
+/// Wine 11.0's NtUnloadDriver stub.
+pub fn unload_driver(_env: &mut Env<'_>, _args: &[u32]) -> Outcome {
+    Outcome::Return(status::NOT_IMPLEMENTED)
+}
+
+/// Wine 11.0's NtQuerySystemEnvironmentValue stub.
+pub fn query_environment(_env: &mut Env<'_>, _args: &[u32]) -> Outcome {
+    Outcome::Return(status::NOT_IMPLEMENTED)
+}
+
+/// Wine 11.0's NtQuerySystemEnvironmentValueEx stub.
+pub fn query_environment_ex(_env: &mut Env<'_>, _args: &[u32]) -> Outcome {
+    Outcome::Return(status::NOT_IMPLEMENTED)
+}
+
+/// Wine 11.0's NtRaiseHardError stub.
+pub fn raise_hard_error(_env: &mut Env<'_>, _args: &[u32]) -> Outcome {
+    Outcome::Return(status::NOT_IMPLEMENTED)
+}
+
+/// Wine 11.0's NtShutdownSystem stub.
+pub fn shutdown(_env: &mut Env<'_>, _args: &[u32]) -> Outcome {
+    Outcome::Return(status::SUCCESS)
+}
+
+/// Wine 11.0's NtSystemDebugControl stub.
+pub fn debug_control(_env: &mut Env<'_>, _args: &[u32]) -> Outcome {
+    Outcome::Return(0xc000_0354)
+}
+
+struct ExecutionState(u32);
+
+/// NtSetThreadExecutionState retains Wine's process-wide, harmless state.
+pub fn set_execution_state(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    let current = env
+        .ext
+        .try_get::<ExecutionState>()
+        .map_or(7, |state| state.0);
+    status::finish((|| {
+        write_u32(env, args[1], current)?;
+        if current & 0x8000_0000 == 0 || args[0] & 0x8000_0000 != 0 {
+            env.ext.insert(ExecutionState(args[0]));
+        }
+        Ok(())
+    })())
+}

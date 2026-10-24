@@ -214,17 +214,16 @@ pub fn map_view(
     bytes: &[u8],
     size: u32,
     protection: u32,
+    base: u32,
 ) -> Result<u32, Status> {
     let prot = memory.prot(protection)?;
     let size = align_up(size, PAGE);
-    let base = find_free(vm, size, false).ok_or(status::NO_MEMORY)?;
-    if !vm.reserve_at(base, size) {
-        return Err(status::NO_MEMORY);
-    }
+    let placeholder = replaced_placeholder(memory, base);
     let mapped = cpu.map(base, size, Prot::RW).is_ok()
         && cpu.write(base, bytes).is_ok()
         && cpu.protect(base, size, prot).is_ok();
     if !mapped {
+        memory.regions.remove(&base);
         let _ = vm.free(cpu, base);
         return Err(status::NO_MEMORY);
     }
@@ -234,13 +233,13 @@ pub fn map_view(
         protection,
         vec![Some(protection); (size / PAGE) as usize],
     );
+    if placeholder {
+        memory.regions.get_mut(&base).unwrap().placeholder = Placeholder::Replaced;
+    }
     Ok(base)
 }
 
-/// Maps `size` bytes of the file `fd` from `offset` as a view of a data
-/// section with `protection`, read-only or read-write, and returns its
-/// base. The view shares the file's pages with every other mapping of it,
-/// such as the server's.
+/// Maps a shared data section at an automatically chosen address.
 pub fn map_shared_view(
     cpu: &mut dyn Guest,
     vm: &mut Vm,
@@ -250,14 +249,34 @@ pub fn map_shared_view(
     size: u32,
     protection: u32,
 ) -> Result<u32, Status> {
-    // Data views never execute, whatever the image's DEP choice.
-    let prot = Prot(memory.prot(protection)?.0 & !Prot::EXEC.0);
+    memory.prot(protection)?;
     let size = align_up(size, PAGE);
     let base = find_free(vm, size, false).ok_or(status::NO_MEMORY)?;
     if !vm.reserve_at(base, size) {
         return Err(status::NO_MEMORY);
     }
+    map_shared_view_at(cpu, vm, memory, fd, offset, protection, (base, size))
+}
+
+/// Maps `size` bytes of the file `fd` from `offset` as a view of a data
+/// section with `protection`, read-only or read-write, and returns its
+/// base. The view shares the file's pages with every other mapping of it,
+/// such as the server's.
+pub(crate) fn map_shared_view_at(
+    cpu: &mut dyn Guest,
+    vm: &mut Vm,
+    memory: &mut Memory,
+    fd: std::os::fd::BorrowedFd<'_>,
+    offset: u64,
+    protection: u32,
+    (base, size): (u32, u32),
+) -> Result<u32, Status> {
+    // Data views never execute, whatever the image's DEP choice.
+    let prot = Prot(memory.prot(protection)?.0 & !Prot::EXEC.0);
+    let size = align_up(size, PAGE);
+    let placeholder = replaced_placeholder(memory, base);
     if cpu.map_shared_file(base, size, fd, offset, prot).is_err() {
+        memory.regions.remove(&base);
         let _ = vm.free(cpu, base);
         return Err(status::NO_MEMORY);
     }
@@ -267,6 +286,9 @@ pub fn map_shared_view(
         protection,
         vec![Some(protection); (size / PAGE) as usize],
     );
+    if placeholder {
+        memory.regions.get_mut(&base).unwrap().placeholder = Placeholder::Replaced;
+    }
     Ok(base)
 }
 
@@ -1129,4 +1151,283 @@ pub fn set_execute(env: &mut Env<'_>, enabled: bool) -> Result<(), Status> {
         apply_write_watch(env, address, PAGE)?;
     }
     Ok(())
+}
+
+/// Wine 11.0's NtCreatePagingFile stub.
+pub fn create_paging_file(_env: &mut Env<'_>, _args: &[u32]) -> Outcome {
+    Outcome::Return(status::SUCCESS)
+}
+
+/// Wine returns STATUS_NOT_IMPLEMENTED without an LDT; the CPU interface
+/// has no operation for installing LDT descriptors.
+pub fn set_ldt_entries(_env: &mut Env<'_>, _args: &[u32]) -> Outcome {
+    Outcome::Return(status::NOT_IMPLEMENTED)
+}
+
+/// Wine 11.0's NtMapUserPhysicalPagesScatter stub.
+pub fn map_physical_scatter(env: &mut Env<'_>, _args: &[u32]) -> Outcome {
+    crate::exception::stub(env, "NtMapUserPhysicalPagesScatter")
+}
+
+/// NtFlushVirtualMemory(process, *base, *size, unknown)
+pub fn flush_virtual(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    status::finish((|| {
+        let address = read(env, args[1])? & !(PAGE - 1);
+        let size = read(env, args[2])?;
+        crate::information::current_process(env, args[0])?;
+        let (base, region) = memory(env)
+            .region_of(address)
+            .ok_or(status::INVALID_PARAMETER)?;
+        if u64::from(address) + u64::from(size) > u64::from(region.end(base)) {
+            return Err(status::INVALID_PARAMETER.into());
+        }
+        if size == 0 {
+            let size = region.end(base) - base;
+            write(env, args[2], size)?;
+        }
+        write(env, args[1], address)?;
+        // Views share the server file's pages, so there is nothing to
+        // write back: Wine's MS_ASYNC msync only schedules writeback.
+        Ok(())
+    })())
+}
+
+/// NtLockVirtualMemory(process, *base, *size, unknown)
+pub fn lock_virtual(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    pin_virtual(env, args, true)
+}
+
+/// NtUnlockVirtualMemory(process, *base, *size, unknown)
+pub fn unlock_virtual(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    pin_virtual(env, args, false)
+}
+
+fn pin_virtual(env: &mut Env<'_>, args: &[u32], lock: bool) -> Outcome {
+    status::finish((|| {
+        let address = read(env, args[1])?;
+        let size = read(env, args[2])?;
+        crate::information::current_process(env, args[0])?;
+        let length =
+            (u64::from(address & (PAGE - 1)) + u64::from(size)).next_multiple_of(u64::from(PAGE));
+        let start = address & !(PAGE - 1);
+        write(env, args[2], length as u32)?;
+        write(env, args[1], start)?;
+        if lock
+            && !(0..length).step_by(PAGE as usize).all(|offset| {
+                let page = start.wrapping_add(offset as u32);
+                [Prot::READ, Prot::WRITE, Prot::EXEC]
+                    .into_iter()
+                    .any(|prot| env.cpu.accessible(page, PAGE, prot))
+            })
+        {
+            return Err(0xc000_0022u32.into());
+        }
+        // Guest memory is never paged out from under the guest, so the pin
+        // itself has no host counterpart.
+        Ok(())
+    })())
+}
+
+/// NtSetInformationVirtualMemory: Wine prefetches ranges, with dirty-state
+/// tracking unsupported when write exceptions are disabled.
+pub fn set_information(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    status::finish((|| {
+        match args[1] {
+            0 => {
+                if args[4] == 0 {
+                    return Err(0xc000_00f3u32.into());
+                }
+                if args[5] != 4 {
+                    return Err(0xc000_00f4u32.into());
+                }
+                if args[2] == 0 {
+                    return Err(0xc000_00f1u32.into());
+                }
+                let _flags = read(env, args[4])?;
+                for index in 0..args[2] {
+                    if read(env, args[3] + index * 8 + 4)? == 0 {
+                        return Err(0xc000_00f2u32.into());
+                    }
+                }
+                // Prefetching is only a hint; guest pages are host memory.
+                Ok(())
+            }
+            3 => Err(status::NOT_SUPPORTED.into()),
+            _ => Err(0xc000_00f0u32.into()),
+        }
+    })())
+}
+
+/// Guest threads share one execution owner; a fence completes Wine's barrier.
+pub fn flush_write_buffers(_env: &mut Env<'_>, _args: &[u32]) -> Outcome {
+    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+    Outcome::Return(status::SUCCESS)
+}
+
+/// NtWow64AllocateVirtualMemory64(process, *base64, zero_bits64, *size64, type, protect)
+pub fn allocate64(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    status::finish((|| {
+        let size = u64::from(read(env, args[4])?) | u64::from(read(env, args[4] + 4)?) << 32;
+        let zero_bits = u64::from(args[2]) | u64::from(args[3]) << 32;
+        if size == 0 {
+            return Err(0xc000_00f2u32.into());
+        }
+        if zero_bits > 21 && zero_bits < 32 {
+            return Err(0xc000_00f1u32.into());
+        }
+        let base = u64::from(read(env, args[1])?) | u64::from(read(env, args[1] + 4)?) << 32;
+        crate::information::current_process(env, args[0])?;
+        let base = u32::try_from(base).map_err(|_| status::CONFLICTING_ADDRESSES)?;
+        let size = u32::try_from(size).map_err(|_| 0xc000_00a1u32)?;
+        let scratch = env.cpu.reg(adv_cpu::backend::Reg::Esp) - 8;
+        write(env, scratch, base)?;
+        write(env, scratch + 4, size)?;
+        match allocate(
+            env,
+            &[
+                CURRENT_PROCESS,
+                scratch,
+                zero_bits as u32,
+                scratch + 4,
+                args[5],
+                args[6],
+            ],
+        ) {
+            Outcome::Return(0) => {
+                let base = u64::from(read(env, scratch)?);
+                let size = u64::from(read(env, scratch + 4)?);
+                crate::object::write_bytes(env, args[1], &base.to_le_bytes())?;
+                crate::object::write_bytes(env, args[4], &size.to_le_bytes())?;
+                Ok(())
+            }
+            Outcome::Return(code) => Err(code.into()),
+            _ => unreachable!(),
+        }
+    })())
+}
+
+/// NtWow64ReadVirtualMemory64 always uses Wine's read_process_memory request.
+pub fn read_virtual64(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    let size = (u64::from(args[4]) | u64::from(args[5]) << 32).min(i32::MAX as u64) as u32;
+    let result = (|| {
+        if size != 0 && !env.cpu.accessible(args[3], size, Prot::WRITE) {
+            return Err(status::ACCESS_VIOLATION.into());
+        }
+        let mut data = vec![0; size as usize];
+        let mut request = crate::protocol::ReadProcessMemoryRequest {
+            handle: args[0],
+            addr: u64::from(args[1]) | u64::from(args[2]) << 32,
+            ..Default::default()
+        };
+        let (reply, count) = crate::server::request(env, &mut request, &[], &mut data)?;
+        status::check(reply.header.error)?;
+        if count != 0 {
+            crate::object::write_bytes(env, args[3], &data[..count])?;
+        }
+        Ok(())
+    })();
+    if args[6] != 0 {
+        let count = if result.is_ok() { u64::from(size) } else { 0 };
+        if let Err(error) = crate::object::write_bytes(env, args[6], &count.to_le_bytes()) {
+            return Outcome::Return(error);
+        }
+    }
+    status::finish(result)
+}
+
+/// NtWow64WriteVirtualMemory64 always uses Wine's write_process_memory request.
+pub fn write_virtual64(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    let size = (u64::from(args[4]) | u64::from(args[5]) << 32).min(i32::MAX as u64) as u32;
+    let result = (|| {
+        if size != 0 && !env.cpu.accessible(args[3], size, Prot::READ) {
+            return Err(0x8000_000du32.into());
+        }
+        let mut data = vec![0; size as usize];
+        if size != 0 {
+            env.cpu
+                .read(args[3], &mut data)
+                .map_err(|_| 0x8000_000du32)?;
+        }
+        let mut request = crate::protocol::WriteProcessMemoryRequest {
+            handle: args[0],
+            addr: u64::from(args[1]) | u64::from(args[2]) << 32,
+            ..Default::default()
+        };
+        let (reply, _) = crate::server::request(env, &mut request, &[&data], &mut [])?;
+        status::check(reply.header.error)
+    })();
+    if args[6] != 0 {
+        let count = if result.is_ok() { u64::from(size) } else { 0 };
+        if let Err(error) = crate::object::write_bytes(env, args[6], &count.to_le_bytes()) {
+            return Outcome::Return(error);
+        }
+    }
+    status::finish(result)
+}
+
+/// Reserves a section view, or replaces an exact free placeholder, as
+/// Wine's map_view does for NtMapViewOfSectionEx.
+pub(crate) fn reserve_section(
+    env: &mut Env<'_>,
+    address: u32,
+    size: u32,
+    kind: u32,
+    low: u32,
+    high: u32,
+) -> Result<u32, Status> {
+    if kind & MEM_REPLACE_PLACEHOLDER != 0 {
+        let (base, region) = memory(env)
+            .region_of(address)
+            .ok_or(status::INVALID_PARAMETER)?;
+        if address != base || size != region.end(base) - base {
+            return Err(status::CONFLICTING_ADDRESSES);
+        }
+        if region.placeholder != Placeholder::Free {
+            return Err(status::INVALID_PARAMETER);
+        }
+        region.placeholder = Placeholder::Replaced;
+        return Ok(base);
+    }
+    let base = if address == 0 {
+        if low == 0 && high == 0 {
+            find_free(&env.sys.vm, size, kind & MEM_TOP_DOWN != 0)
+        } else {
+            find_free_range(
+                &env.sys.vm,
+                size,
+                kind & MEM_TOP_DOWN != 0,
+                low,
+                high,
+                GRANULE,
+            )
+        }
+        .ok_or(status::NO_MEMORY)?
+    } else {
+        if u64::from(address) + u64::from(size) > u64::from(USER_END) {
+            return Err(0xc000_00a1);
+        }
+        address
+    };
+    if !env.sys.vm.reserve_at(base, size) {
+        return Err(status::CONFLICTING_ADDRESSES);
+    }
+    Ok(base)
+}
+
+/// Whether a mapped view replaced a placeholder.
+pub(crate) fn replaced_placeholder(memory: &mut Memory, base: u32) -> bool {
+    memory
+        .region_of(base)
+        .is_some_and(|(_, region)| region.placeholder == Placeholder::Replaced)
+}
+
+/// Unmaps a section while restoring the reservation it replaced.
+pub(crate) fn preserve_view(env: &mut Env<'_>, base: u32) {
+    let (_, region) = memory(env).region_of(base).expect("section view");
+    let size = region.end(base) - base;
+    region.kind = Kind::Private;
+    region.protection = PAGE_NOACCESS;
+    region.placeholder = Placeholder::Free;
+    region.pages.fill(None);
+    let _ = env.cpu.unmap(base, size);
 }

@@ -3418,3 +3418,172 @@ impl Request for SetQueueFdRequest {
         &mut self.header
     }
 }
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DebugProcessRequest {
+    pub header: RequestHeader,
+    pub handle: u32,
+    pub debug: u32,
+    pub attach: i32,
+}
+const _: () = assert!(size_of::<DebugProcessRequest>() == 24);
+const _: () = assert!(std::mem::offset_of!(DebugProcessRequest, handle) == 12);
+const _: () = assert!(std::mem::offset_of!(DebugProcessRequest, debug) == 16);
+const _: () = assert!(std::mem::offset_of!(DebugProcessRequest, attach) == 20);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DebugProcessReply {
+    pub header: ReplyHeader,
+}
+const _: () = assert!(size_of::<DebugProcessReply>() == 8);
+
+impl Request for DebugProcessRequest {
+    const NUMBER: i32 = 82;
+    type Reply = DebugProcessReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ContinueDebugEventRequest {
+    pub header: RequestHeader,
+    pub debug: u32,
+    pub pid: u32,
+    pub tid: u32,
+    pub status: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<ContinueDebugEventRequest>() == 32);
+const _: () = assert!(std::mem::offset_of!(ContinueDebugEventRequest, debug) == 12);
+const _: () = assert!(std::mem::offset_of!(ContinueDebugEventRequest, pid) == 16);
+const _: () = assert!(std::mem::offset_of!(ContinueDebugEventRequest, tid) == 20);
+const _: () = assert!(std::mem::offset_of!(ContinueDebugEventRequest, status) == 24);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ContinueDebugEventReply {
+    pub header: ReplyHeader,
+}
+const _: () = assert!(size_of::<ContinueDebugEventReply>() == 8);
+
+impl Request for ContinueDebugEventRequest {
+    const NUMBER: i32 = 81;
+    type Reply = ContinueDebugEventReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SetDebugObjInfoRequest {
+    pub header: RequestHeader,
+    pub debug: u32,
+    pub flags: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<SetDebugObjInfoRequest>() == 24);
+const _: () = assert!(std::mem::offset_of!(SetDebugObjInfoRequest, debug) == 12);
+const _: () = assert!(std::mem::offset_of!(SetDebugObjInfoRequest, flags) == 16);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SetDebugObjInfoReply {
+    pub header: ReplyHeader,
+}
+const _: () = assert!(size_of::<SetDebugObjInfoReply>() == 8);
+
+impl Request for SetDebugObjInfoRequest {
+    const NUMBER: i32 = 83;
+    type Reply = SetDebugObjInfoReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WaitDebugEventRequest {
+    pub header: RequestHeader,
+    pub debug: u32,
+}
+const _: () = assert!(size_of::<WaitDebugEventRequest>() == 16);
+const _: () = assert!(std::mem::offset_of!(WaitDebugEventRequest, debug) == 12);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WaitDebugEventReply {
+    pub header: ReplyHeader,
+    pub pid: u32,
+    pub tid: u32,
+}
+const _: () = assert!(size_of::<WaitDebugEventReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(WaitDebugEventReply, pid) == 8);
+const _: () = assert!(std::mem::offset_of!(WaitDebugEventReply, tid) == 12);
+
+impl Request for WaitDebugEventRequest {
+    const NUMBER: i32 = 78;
+    type Reply = WaitDebugEventReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ReadProcessMemoryRequest {
+    pub header: RequestHeader,
+    pub handle: u32,
+    pub addr: u64,
+}
+const _: () = assert!(size_of::<ReadProcessMemoryRequest>() == 24);
+const _: () = assert!(std::mem::offset_of!(ReadProcessMemoryRequest, handle) == 12);
+const _: () = assert!(std::mem::offset_of!(ReadProcessMemoryRequest, addr) == 16);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ReadProcessMemoryReply {
+    pub header: ReplyHeader,
+}
+const _: () = assert!(size_of::<ReadProcessMemoryReply>() == 8);
+
+impl Request for ReadProcessMemoryRequest {
+    const NUMBER: i32 = 84;
+    type Reply = ReadProcessMemoryReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WriteProcessMemoryRequest {
+    pub header: RequestHeader,
+    pub handle: u32,
+    pub addr: u64,
+}
+const _: () = assert!(size_of::<WriteProcessMemoryRequest>() == 24);
+const _: () = assert!(std::mem::offset_of!(WriteProcessMemoryRequest, handle) == 12);
+const _: () = assert!(std::mem::offset_of!(WriteProcessMemoryRequest, addr) == 16);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WriteProcessMemoryReply {
+    pub header: ReplyHeader,
+    pub written: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<WriteProcessMemoryReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(WriteProcessMemoryReply, written) == 8);
+
+impl Request for WriteProcessMemoryRequest {
+    const NUMBER: i32 = 85;
+    type Reply = WriteProcessMemoryReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}

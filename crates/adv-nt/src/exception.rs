@@ -205,3 +205,31 @@ pub fn raise(env: &mut Env<'_>, args: &[u32]) -> Outcome {
     context::save_debug(env, env.context, &image);
     enter_dispatcher(env, checkpoint, &raised)
 }
+
+/// Wine's loader.c stub_syscall raises EXCEPTION_WINE_STUB, rather than
+/// returning an NTSTATUS. The exception names live in guest memory.
+pub fn stub(env: &mut Env<'_>, name: &str) -> Outcome {
+    let mut checkpoint = match env.checkpoint() {
+        Ok(checkpoint) => checkpoint,
+        Err(error) => return Outcome::Fail(format!("stub context: {error}")),
+    };
+    let strings = checkpoint.state.regs[4] - 128;
+    let mut bytes = b"ntdll\0".to_vec();
+    bytes.extend_from_slice(name.as_bytes());
+    bytes.push(0);
+    if env.cpu.write(strings, &bytes).is_err() {
+        return Outcome::Return(crate::status::ACCESS_VIOLATION);
+    }
+    checkpoint.state.regs[4] = strings;
+    let mut information = [0; 15];
+    information[..2].copy_from_slice(&[strings, strings + 6]);
+    let record = Record {
+        code: 0x8000_0100,
+        flags: 1,
+        nested: 0,
+        address: checkpoint.state.eip,
+        count: 2,
+        information,
+    };
+    enter_dispatcher(env, checkpoint, &record)
+}
