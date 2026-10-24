@@ -406,3 +406,49 @@ pub fn set_context(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         Err(error) => status::finish(Err(error)),
     }
 }
+
+/// Wine's NtCreateThread, NtAlertThread and terminate-port registration stubs.
+pub fn not_implemented(_: &mut Env<'_>, _: &[u32]) -> Outcome {
+    Outcome::Return(status::NOT_IMPLEMENTED)
+}
+
+/// The guest exposes one logical processor.
+pub fn processor_number(_: &mut Env<'_>, _: &[u32]) -> Outcome {
+    Outcome::Return(0)
+}
+
+/// Reflects the server's thread suspend counts after a process operation.
+pub(crate) fn refresh_suspension(env: &mut Env<'_>) -> Result<(), Error> {
+    let contexts: Vec<_> = env
+        .sys
+        .contexts
+        .iter()
+        .enumerate()
+        .filter(|(_, context)| !context.is_done())
+        .map(|(id, context)| (id as CtxId, context.teb))
+        .collect();
+    for (context, teb) in contexts {
+        let mut open = crate::protocol::OpenThreadRequest {
+            tid: read_u32(env, teb + 0x24)?,
+            access: 0x800,
+            ..Default::default()
+        };
+        let (opened, _) = server::request(env, &mut open, &[], &mut [])?;
+        status::check(opened.header.error)?;
+        let mut query = GetThreadInfoRequest {
+            handle: opened.handle,
+            ..Default::default()
+        };
+        let result = server::request(env, &mut query, &[], &mut []);
+        server::close(env, opened.handle)?;
+        let (reply, _) = result?;
+        status::check(reply.header.error)?;
+        let suspended = env.sys.contexts[context as usize].suspend_count != 0;
+        if reply.suspend_count != 0 && !suspended {
+            env.sys.suspend_context(context);
+        } else if reply.suspend_count == 0 && suspended {
+            env.sys.resume_context(context);
+        }
+    }
+    Ok(())
+}

@@ -1498,3 +1498,227 @@ fn completion_ex_end(env: &mut Env<'_>, written: u32, count: u32, code: u32) -> 
         Err(error) => Outcome::Return(error),
     }
 }
+
+/// NtClearEvent(handle)
+pub fn clear_event(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    reset_event(env, &[args[0], 0])
+}
+
+/// NtQueueApcThreadEx(thread, reserve_and_flags, func, arg1, arg2, arg3)
+pub fn queue_apc_ex(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    queue_apc_ex2(
+        env,
+        &[
+            args[0],
+            args[1] & !3,
+            args[1] & 3,
+            args[2],
+            args[3],
+            args[4],
+            args[5],
+        ],
+    )
+}
+
+/// NtQueryIoCompletion(handle, class, *buffer, length, *returned)
+pub fn query_completion(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    status::finish((|| {
+        let &[handle, class, buffer, length, returned] = args else {
+            unreachable!()
+        };
+        if buffer == 0 || class != 0 {
+            return Err(status::INVALID_PARAMETER.into());
+        }
+        if returned != 0 {
+            write_u32(env, returned, 4)?;
+        }
+        if length != 4 {
+            return Err(status::INFO_LENGTH_MISMATCH.into());
+        }
+        let mut request = crate::protocol::QueryCompletionRequest {
+            handle,
+            ..Default::default()
+        };
+        let (reply, _) = server::request(env, &mut request, &[], &mut [])?;
+        status::check(reply.header.error)?;
+        write_u32(env, buffer, reply.depth)?;
+        Ok(())
+    })())
+}
+
+/// NtSetIoCompletionEx(handle, reserve, key, value, status, information)
+pub fn set_completion_ex(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    if args[1] == 0 {
+        return Outcome::Return(status::INVALID_HANDLE);
+    }
+    status::finish((|| {
+        let mut request = crate::protocol::AddCompletionRequest {
+            handle: args[0],
+            reserve_handle: args[1],
+            ckey: args[2].into(),
+            cvalue: args[3].into(),
+            status: args[4],
+            information: args[5].into(),
+            ..Default::default()
+        };
+        let (reply, _) = server::request(env, &mut request, &[], &mut [])?;
+        status::check(reply.header.error)
+    })())
+}
+
+/// NtAssignProcessToJobObject(job, process)
+pub fn assign_job(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    status::finish((|| {
+        crate::information::current_process(env, args[1])?;
+        let mut request = crate::protocol::AssignJobRequest {
+            job: args[0],
+            process: args[1],
+            ..Default::default()
+        };
+        let (reply, _) = server::request(env, &mut request, &[], &mut [])?;
+        status::check(reply.header.error)
+    })())
+}
+
+/// NtIsProcessInJob(process, job)
+pub fn process_in_job(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    status::finish((|| {
+        crate::information::current_process(env, args[0])?;
+        let mut request = crate::protocol::ProcessInJobRequest {
+            process: args[0],
+            job: args[1],
+            ..Default::default()
+        };
+        let (reply, _) = server::request(env, &mut request, &[], &mut [])?;
+        status::check(reply.header.error)
+    })())
+}
+
+/// NtTerminateJobObject(job, status)
+pub fn terminate_job(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    let mut request = crate::protocol::TerminateJobRequest {
+        handle: args[0],
+        status: args[1] as i32,
+        ..Default::default()
+    };
+    match server::terminate_job(env, &mut request) {
+        Ok(true) => Outcome::ExitProcess(args[1]),
+        Ok(false) => Outcome::Return(status::SUCCESS),
+        Err(error) => status::finish(Err(error)),
+    }
+}
+
+/// NtQueryInformationJobObject(job, class, *info, length, *returned)
+pub fn query_job(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    status::finish((|| {
+        let &[handle, class, info, length, returned] = args else {
+            unreachable!()
+        };
+        if class >= 53 {
+            return Err(status::INVALID_PARAMETER.into());
+        }
+        let size = match class {
+            1 => 48,
+            2 => 48,
+            3 => 12,
+            9 => 112,
+            _ => return Err(status::NOT_IMPLEMENTED.into()),
+        };
+        if length < size {
+            return Err(status::INFO_LENGTH_MISMATCH.into());
+        }
+        if class == 2 || class == 9 {
+            write_bytes(env, info, &vec![0; size as usize])?;
+            if returned != 0 {
+                write_u32(env, returned, size)?;
+            }
+            return Ok(());
+        }
+        let mut request = crate::protocol::GetJobInfoRequest {
+            handle,
+            ..Default::default()
+        };
+        let mut pids = vec![
+            0;
+            if class == 3 {
+                ((length - 8) / 4 * 4) as usize
+            } else {
+                0
+            }
+        ];
+        let (reply, count) = server::request(env, &mut request, &[], &mut pids)?;
+        if class == 1 {
+            if reply.header.error == 0 {
+                write_bytes(env, info, &[0; 48])?;
+                write_u32(env, info + 36, reply.total_processes as u32)?;
+                write_u32(env, info + 40, reply.active_processes as u32)?;
+            }
+            if returned != 0 {
+                write_u32(env, returned, 48)?;
+            }
+            return status::check(reply.header.error);
+        }
+        status::check(reply.header.error)?;
+        write_bytes(env, info + 8, &pids[..count])?;
+        let listed = ((length - 8) / 4).min(reply.active_processes as u32);
+        write_u32(env, info, reply.active_processes as u32)?;
+        write_u32(env, info + 4, listed)?;
+        if returned != 0 {
+            write_u32(env, returned, 8 + listed * 4)?;
+        }
+        if (length - 8) / 4 < reply.active_processes as u32 {
+            return Err(0x105.into());
+        }
+        Ok(())
+    })())
+}
+
+/// NtSetInformationJobObject(job, class, *info, length)
+pub fn set_job(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    status::finish((|| {
+        let &[handle, class, info, length] = args else {
+            unreachable!()
+        };
+        if class >= 53 {
+            return Err(status::INVALID_PARAMETER.into());
+        }
+        match class {
+            2 | 9 => {
+                let (size, valid) = if class == 2 {
+                    (48, 0xff)
+                } else {
+                    (112, 0x7fff)
+                };
+                if length != size {
+                    return Err(status::INVALID_PARAMETER.into());
+                }
+                let flags = read_u32(env, info + 16)?;
+                if flags & !valid != 0 {
+                    return Err(status::INVALID_PARAMETER.into());
+                }
+                let mut request = crate::protocol::SetJobLimitsRequest {
+                    handle,
+                    limit_flags: flags,
+                    ..Default::default()
+                };
+                let (reply, _) = server::request(env, &mut request, &[], &mut [])?;
+                status::check(reply.header.error)
+            }
+            7 => {
+                if length != 8 {
+                    return Err(status::INVALID_PARAMETER.into());
+                }
+                let mut request = crate::protocol::SetJobCompletionPortRequest {
+                    job: handle,
+                    key: read_u32(env, info)?.into(),
+                    port: read_u32(env, info + 4)?,
+                    ..Default::default()
+                };
+                let (reply, _) = server::request(env, &mut request, &[], &mut [])?;
+                status::check(reply.header.error)
+            }
+            4 => Ok(()),
+            _ => Err(status::NOT_IMPLEMENTED.into()),
+        }
+    })())
+}

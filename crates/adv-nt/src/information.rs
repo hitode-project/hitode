@@ -685,7 +685,23 @@ pub fn current_process(env: &mut Env<'_>, handle: u32) -> Result<(), Error> {
         handle,
         ..Default::default()
     };
-    let (reply, _) = server::request(env, &mut request, &[], &mut [])?;
+    let (mut reply, _) = server::request(env, &mut request, &[], &mut [])?;
+    if reply.header.error == 0xc000_0022 {
+        // Operation rights need not include query rights.
+        let mut duplicate = crate::protocol::DupHandleRequest {
+            src_process: CURRENT_PROCESS,
+            src_handle: handle,
+            dst_process: CURRENT_PROCESS,
+            access: 0x1000,
+            ..Default::default()
+        };
+        let (duplicate, _) = server::request(env, &mut duplicate, &[], &mut [])?;
+        status::check(duplicate.header.error)?;
+        request.handle = duplicate.handle;
+        let result = server::request(env, &mut request, &[], &mut []);
+        server::close(env, duplicate.handle)?;
+        reply = result?.0;
+    }
     status::check(reply.header.error)?;
     if reply.pid != env.sys.pid {
         return Err(status::NOT_SUPPORTED.into());
@@ -823,3 +839,27 @@ pub fn set_thread(env: &mut Env<'_>, args: &[u32]) -> Outcome {
 }
 
 struct ExecuteFlags(u32);
+
+/// NtGetNextProcess(process, access, attributes, flags, *handle)
+pub fn next_process(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    status::finish((|| {
+        let mut request = crate::protocol::GetNextProcessRequest {
+            last: args[0],
+            access: args[1],
+            attributes: args[2],
+            flags: args[3],
+            ..Default::default()
+        };
+        let (reply, _) = server::request(env, &mut request, &[], &mut [])?;
+        write_u32(
+            env,
+            args[4],
+            if reply.header.error == 0 {
+                reply.handle
+            } else {
+                0
+            },
+        )?;
+        status::check(reply.header.error)
+    })())
+}

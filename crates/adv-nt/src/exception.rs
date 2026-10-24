@@ -64,12 +64,17 @@ pub fn deliver(env: &mut Env<'_>, event: Exception, mut checkpoint: Checkpoint) 
         record.information[0] = 0;
     }
     mapping::normalize_context(&record, &mut checkpoint.state);
-    enter_dispatcher(env, checkpoint, &record)
+    enter_dispatcher(env, checkpoint, &record, &[])
 }
 
 /// Resumes the thread in the dispatcher with `record` and the CONTEXT of
 /// `checkpoint` on its stack.
-fn enter_dispatcher(env: &mut Env<'_>, mut checkpoint: Checkpoint, record: &Record) -> Outcome {
+fn enter_dispatcher(
+    env: &mut Env<'_>,
+    mut checkpoint: Checkpoint,
+    record: &Record,
+    tail: &[u8],
+) -> Outcome {
     let Some(&Dispatchers {
         exception: dispatcher,
         ..
@@ -78,8 +83,8 @@ fn enter_dispatcher(env: &mut Env<'_>, mut checkpoint: Checkpoint, record: &Reco
         return Outcome::Fail("no exception dispatcher".into());
     };
 
-    let stack = (checkpoint.state.regs[4] - LAYOUT_SIZE) & !63;
-    let mut frame = vec![0u8; LAYOUT_SIZE as usize];
+    let stack = (checkpoint.state.regs[4] - LAYOUT_SIZE - tail.len() as u32) & !63;
+    let mut frame = vec![0u8; LAYOUT_SIZE as usize + tail.len()];
     let mut put = |offset: u32, value: u32| {
         let offset = offset as usize;
         frame[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
@@ -95,6 +100,7 @@ fn enter_dispatcher(env: &mut Env<'_>, mut checkpoint: Checkpoint, record: &Reco
         put(RECORD + 0x14 + 4 * index as u32, *value);
     }
     put_context(env, &mut frame, CONTEXT as usize, &checkpoint.state);
+    frame[LAYOUT_SIZE as usize..].copy_from_slice(tail);
     if let Err(error) = env.cpu.write(stack, &frame) {
         return Outcome::Fail(format!("exception frame: {error}"));
     }
@@ -203,5 +209,47 @@ pub fn raise(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         return Outcome::Fail(format!("NtRaiseException: {error}"));
     }
     context::save_debug(env, env.context, &image);
-    enter_dispatcher(env, checkpoint, &raised)
+    enter_dispatcher(env, checkpoint, &raised, &[])
+}
+
+/// NtContinueEx(*context, argument_or_alertable)
+pub fn resume_ex(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    let alertable = if args[1] > 0xff {
+        match crate::object::read_u32(env, args[1] + 4) {
+            Ok(flags) => flags & 1,
+            Err(code) => return Outcome::Return(code),
+        }
+    } else {
+        u32::from(args[1] != 0)
+    };
+    resume(env, &[args[0], alertable])
+}
+
+/// Wine's generated syscall stubs raise EXCEPTION_WINE_STUB.
+pub fn syscall_stub(env: &mut Env<'_>, _: &[u32]) -> Outcome {
+    let number = env.cpu.reg(adv_cpu::backend::Reg::Eax) as usize;
+    let name = crate::syscalls::SYSCALLS[number].0;
+    let mut checkpoint = match env.checkpoint() {
+        Ok(checkpoint) => checkpoint,
+        Err(error) => return Outcome::Fail(format!("stub context: {error}")),
+    };
+    checkpoint.state.eip = match crate::object::read_u32(env, checkpoint.state.regs[4]) {
+        Ok(address) => address,
+        Err(code) => return Outcome::Return(code),
+    };
+    checkpoint.state.regs[4] += 4;
+    let tail = format!("ntdll\0{name}\0").into_bytes();
+    let stack = (checkpoint.state.regs[4] - LAYOUT_SIZE - tail.len() as u32) & !63;
+    let mut information = [0; 15];
+    information[0] = stack + LAYOUT_SIZE;
+    information[1] = stack + LAYOUT_SIZE + 6;
+    let record = Record {
+        code: 0x8000_0100,
+        flags: 1,
+        nested: 0,
+        address: checkpoint.state.eip,
+        count: 2,
+        information,
+    };
+    enter_dispatcher(env, checkpoint, &record, &tail)
 }

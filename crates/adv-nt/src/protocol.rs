@@ -3418,3 +3418,437 @@ impl Request for SetQueueFdRequest {
         &mut self.header
     }
 }
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RenameKeyRequest {
+    pub header: RequestHeader,
+    pub hkey: u32,
+}
+const _: () = assert!(size_of::<RenameKeyRequest>() == 16);
+const _: () = assert!(std::mem::offset_of!(RenameKeyRequest, hkey) == 12);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RenameKeyReply {
+    pub header: ReplyHeader,
+}
+const _: () = assert!(size_of::<RenameKeyReply>() == 8);
+
+impl Request for RenameKeyRequest {
+    const NUMBER: i32 = 99;
+    type Reply = RenameKeyReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LoadRegistryRequest {
+    pub header: RequestHeader,
+    pub file: u32,
+}
+const _: () = assert!(size_of::<LoadRegistryRequest>() == 16);
+const _: () = assert!(std::mem::offset_of!(LoadRegistryRequest, file) == 12);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LoadRegistryReply {
+    pub header: ReplyHeader,
+}
+const _: () = assert!(size_of::<LoadRegistryReply>() == 8);
+
+impl Request for LoadRegistryRequest {
+    const NUMBER: i32 = 95;
+    type Reply = LoadRegistryReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct UnloadRegistryRequest {
+    pub header: RequestHeader,
+    pub parent: u32,
+    pub attributes: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<UnloadRegistryRequest>() == 24);
+const _: () = assert!(std::mem::offset_of!(UnloadRegistryRequest, parent) == 12);
+const _: () = assert!(std::mem::offset_of!(UnloadRegistryRequest, attributes) == 16);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct UnloadRegistryReply {
+    pub header: ReplyHeader,
+}
+const _: () = assert!(size_of::<UnloadRegistryReply>() == 8);
+
+impl Request for UnloadRegistryRequest {
+    const NUMBER: i32 = 96;
+    type Reply = UnloadRegistryReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SaveRegistryRequest {
+    pub header: RequestHeader,
+    pub hkey: u32,
+    pub file: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<SaveRegistryRequest>() == 24);
+const _: () = assert!(std::mem::offset_of!(SaveRegistryRequest, hkey) == 12);
+const _: () = assert!(std::mem::offset_of!(SaveRegistryRequest, file) == 16);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SaveRegistryReply {
+    pub header: ReplyHeader,
+}
+const _: () = assert!(size_of::<SaveRegistryReply>() == 8);
+
+impl Request for SaveRegistryRequest {
+    const NUMBER: i32 = 97;
+    type Reply = SaveRegistryReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SuspendProcessRequest {
+    pub header: RequestHeader,
+    pub handle: u32,
+}
+const _: () = assert!(size_of::<SuspendProcessRequest>() == 16);
+const _: () = assert!(std::mem::offset_of!(SuspendProcessRequest, handle) == 12);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SuspendProcessReply {
+    pub header: ReplyHeader,
+}
+const _: () = assert!(size_of::<SuspendProcessReply>() == 8);
+
+impl Request for SuspendProcessRequest {
+    const NUMBER: i32 = 291;
+    type Reply = SuspendProcessReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ResumeProcessRequest {
+    pub header: RequestHeader,
+    pub handle: u32,
+}
+const _: () = assert!(size_of::<ResumeProcessRequest>() == 16);
+const _: () = assert!(std::mem::offset_of!(ResumeProcessRequest, handle) == 12);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ResumeProcessReply {
+    pub header: ReplyHeader,
+}
+const _: () = assert!(size_of::<ResumeProcessReply>() == 8);
+
+impl Request for ResumeProcessRequest {
+    const NUMBER: i32 = 292;
+    type Reply = ResumeProcessReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GetNextProcessRequest {
+    pub header: RequestHeader,
+    pub last: u32,
+    pub access: u32,
+    pub attributes: u32,
+    pub flags: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<GetNextProcessRequest>() == 32);
+const _: () = assert!(std::mem::offset_of!(GetNextProcessRequest, last) == 12);
+const _: () = assert!(std::mem::offset_of!(GetNextProcessRequest, access) == 16);
+const _: () = assert!(std::mem::offset_of!(GetNextProcessRequest, attributes) == 20);
+const _: () = assert!(std::mem::offset_of!(GetNextProcessRequest, flags) == 24);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GetNextProcessReply {
+    pub header: ReplyHeader,
+    pub handle: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<GetNextProcessReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(GetNextProcessReply, handle) == 8);
+
+impl Request for GetNextProcessRequest {
+    const NUMBER: i32 = 293;
+    type Reply = GetNextProcessReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TerminateJobRequest {
+    pub header: RequestHeader,
+    pub handle: u32,
+    pub status: i32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<TerminateJobRequest>() == 24);
+const _: () = assert!(std::mem::offset_of!(TerminateJobRequest, handle) == 12);
+const _: () = assert!(std::mem::offset_of!(TerminateJobRequest, status) == 16);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TerminateJobReply {
+    pub header: ReplyHeader,
+}
+const _: () = assert!(size_of::<TerminateJobReply>() == 8);
+
+impl Request for TerminateJobRequest {
+    const NUMBER: i32 = 290;
+    type Reply = TerminateJobReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GetJobInfoRequest {
+    pub header: RequestHeader,
+    pub handle: u32,
+}
+const _: () = assert!(size_of::<GetJobInfoRequest>() == 16);
+const _: () = assert!(std::mem::offset_of!(GetJobInfoRequest, handle) == 12);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GetJobInfoReply {
+    pub header: ReplyHeader,
+    pub total_processes: i32,
+    pub active_processes: i32,
+}
+const _: () = assert!(size_of::<GetJobInfoReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(GetJobInfoReply, total_processes) == 8);
+const _: () = assert!(std::mem::offset_of!(GetJobInfoReply, active_processes) == 12);
+
+impl Request for GetJobInfoRequest {
+    const NUMBER: i32 = 289;
+    type Reply = GetJobInfoReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SetJobLimitsRequest {
+    pub header: RequestHeader,
+    pub handle: u32,
+    pub limit_flags: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<SetJobLimitsRequest>() == 24);
+const _: () = assert!(std::mem::offset_of!(SetJobLimitsRequest, handle) == 12);
+const _: () = assert!(std::mem::offset_of!(SetJobLimitsRequest, limit_flags) == 16);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SetJobLimitsReply {
+    pub header: ReplyHeader,
+}
+const _: () = assert!(size_of::<SetJobLimitsReply>() == 8);
+
+impl Request for SetJobLimitsRequest {
+    const NUMBER: i32 = 287;
+    type Reply = SetJobLimitsReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SetJobCompletionPortRequest {
+    pub header: RequestHeader,
+    pub job: u32,
+    pub port: u32,
+    pub _pad0: [u8; 4],
+    pub key: u64,
+}
+const _: () = assert!(size_of::<SetJobCompletionPortRequest>() == 32);
+const _: () = assert!(std::mem::offset_of!(SetJobCompletionPortRequest, job) == 12);
+const _: () = assert!(std::mem::offset_of!(SetJobCompletionPortRequest, port) == 16);
+const _: () = assert!(std::mem::offset_of!(SetJobCompletionPortRequest, key) == 24);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SetJobCompletionPortReply {
+    pub header: ReplyHeader,
+}
+const _: () = assert!(size_of::<SetJobCompletionPortReply>() == 8);
+
+impl Request for SetJobCompletionPortRequest {
+    const NUMBER: i32 = 288;
+    type Reply = SetJobCompletionPortReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProcessInJobRequest {
+    pub header: RequestHeader,
+    pub job: u32,
+    pub process: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<ProcessInJobRequest>() == 24);
+const _: () = assert!(std::mem::offset_of!(ProcessInJobRequest, job) == 12);
+const _: () = assert!(std::mem::offset_of!(ProcessInJobRequest, process) == 16);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProcessInJobReply {
+    pub header: ReplyHeader,
+}
+const _: () = assert!(size_of::<ProcessInJobReply>() == 8);
+
+impl Request for ProcessInJobRequest {
+    const NUMBER: i32 = 286;
+    type Reply = ProcessInJobReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AssignJobRequest {
+    pub header: RequestHeader,
+    pub job: u32,
+    pub process: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<AssignJobRequest>() == 24);
+const _: () = assert!(std::mem::offset_of!(AssignJobRequest, job) == 12);
+const _: () = assert!(std::mem::offset_of!(AssignJobRequest, process) == 16);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AssignJobReply {
+    pub header: ReplyHeader,
+}
+const _: () = assert!(size_of::<AssignJobReply>() == 8);
+
+impl Request for AssignJobRequest {
+    const NUMBER: i32 = 285;
+    type Reply = AssignJobReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct QueryCompletionRequest {
+    pub header: RequestHeader,
+    pub handle: u32,
+}
+const _: () = assert!(size_of::<QueryCompletionRequest>() == 16);
+const _: () = assert!(std::mem::offset_of!(QueryCompletionRequest, handle) == 12);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct QueryCompletionReply {
+    pub header: ReplyHeader,
+    pub depth: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<QueryCompletionReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(QueryCompletionReply, depth) == 8);
+
+impl Request for QueryCompletionRequest {
+    const NUMBER: i32 = 268;
+    type Reply = QueryCompletionReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AdjustTokenPrivilegesRequest {
+    pub header: RequestHeader,
+    pub handle: u32,
+    pub disable_all: i32,
+    pub get_modified_state: i32,
+}
+const _: () = assert!(size_of::<AdjustTokenPrivilegesRequest>() == 24);
+const _: () = assert!(std::mem::offset_of!(AdjustTokenPrivilegesRequest, handle) == 12);
+const _: () = assert!(std::mem::offset_of!(AdjustTokenPrivilegesRequest, disable_all) == 16);
+const _: () = assert!(std::mem::offset_of!(AdjustTokenPrivilegesRequest, get_modified_state) == 20);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AdjustTokenPrivilegesReply {
+    pub header: ReplyHeader,
+    pub len: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<AdjustTokenPrivilegesReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(AdjustTokenPrivilegesReply, len) == 8);
+
+impl Request for AdjustTokenPrivilegesRequest {
+    const NUMBER: i32 = 222;
+    type Reply = AdjustTokenPrivilegesReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AllocateReserveObjectRequest {
+    pub header: RequestHeader,
+    pub r#type: i32,
+}
+const _: () = assert!(size_of::<AllocateReserveObjectRequest>() == 16);
+const _: () = assert!(std::mem::offset_of!(AllocateReserveObjectRequest, r#type) == 12);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AllocateReserveObjectReply {
+    pub header: ReplyHeader,
+    pub handle: u32,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<AllocateReserveObjectReply>() == 16);
+const _: () = assert!(std::mem::offset_of!(AllocateReserveObjectReply, handle) == 8);
+
+impl Request for AllocateReserveObjectRequest {
+    const NUMBER: i32 = 24;
+    type Reply = AllocateReserveObjectReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}

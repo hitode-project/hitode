@@ -655,3 +655,34 @@ fn lookup_attributes(env: &mut Env<'_>, attributes: &Attributes) -> Result<Looku
     full.extend_from_slice(name);
     Ok(path::lookup(dosdevices, &full)?)
 }
+
+/// Opens NtLoadKey's hive with Wine's read access and sharing mode.
+pub(crate) fn open_registry_file(env: &mut Env<'_>, address: u32) -> Result<u32, Error> {
+    let mut attributes = Attributes::read(env, address)?;
+    let host = match lookup_attributes(env, &attributes)? {
+        Lookup::Found(host) => host,
+        Lookup::Missing(_) => return Err(status::OBJECT_NAME_NOT_FOUND.into()),
+        Lookup::Device => return Err(status::BAD_DEVICE_TYPE.into()),
+    };
+    if attributes.root != 0 {
+        attributes.root = 0;
+        attributes.name = Some(
+            path::nt_name(&env.ext.get::<Files>().dosdevices, &host)
+                .encode_utf16()
+                .collect(),
+        );
+    }
+    let mut request = CreateFileRequest {
+        access: 0x8010_0000, // GENERIC_READ | SYNCHRONIZE
+        create: FILE_OPEN as i32,
+        ..Default::default()
+    };
+    let (reply, _) = server::request(
+        env,
+        &mut request,
+        &[&attributes.wire(), host.as_os_str().as_bytes()],
+        &mut [],
+    )?;
+    status::check(reply.header.error)?;
+    Ok(reply.handle)
+}

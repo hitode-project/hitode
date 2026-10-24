@@ -113,13 +113,16 @@ pub fn open_ex(env: &mut Env<'_>, args: &[u32]) -> Outcome {
 
 fn open_key(env: &mut Env<'_>, key: u32, access: u32, attributes: u32) -> Result<(), Error> {
     write_u32(env, key, 0)?;
-    let attributes = Attributes::read(env, attributes)?;
+    if crate::object::read_u32(env, attributes)? != 24 {
+        return Err(status::INVALID_PARAMETER.into());
+    }
+    let name = read_unicode_string(env, crate::object::read_u32(env, attributes + 8)?)?;
     let opened = open_named(
         env,
-        attributes.root,
+        crate::object::read_u32(env, attributes + 4)?,
         access,
-        attributes.attributes,
-        &attributes.name_bytes(),
+        crate::object::read_u32(env, attributes + 12)?,
+        &bytes(&name),
     )?;
     write_u32(env, key, opened)?;
     Ok(())
@@ -643,4 +646,93 @@ pub fn enumerate_value(env: &mut Env<'_>, args: &[u32]) -> Outcome {
 
 fn bytes(text: &[u16]) -> Vec<u8> {
     text.iter().flat_map(|unit| unit.to_le_bytes()).collect()
+}
+
+/// Wine's fixed registry stubs: no output or registry state changes.
+pub fn stub_success(_: &mut Env<'_>, _: &[u32]) -> Outcome {
+    Outcome::Return(status::SUCCESS)
+}
+
+/// NtCreateKeyTransacted is unimplemented in Wine.
+pub fn create_transacted(_: &mut Env<'_>, _: &[u32]) -> Outcome {
+    Outcome::Return(status::NOT_IMPLEMENTED)
+}
+
+/// NtRenameKey(key, *name)
+pub fn rename(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    status::finish((|| {
+        let name = args[1];
+        if name == 0 {
+            return Err(status::ACCESS_VIOLATION.into());
+        }
+        let length = crate::object::read_u32(env, name)? & 0xffff;
+        let buffer = crate::object::read_u32(env, name + 4)?;
+        if buffer == 0 || length == 0 {
+            return Err(status::INVALID_PARAMETER.into());
+        }
+        let name = crate::object::read_bytes(env, buffer, length)?;
+        let mut request = crate::protocol::RenameKeyRequest {
+            hkey: args[0],
+            ..Default::default()
+        };
+        let (reply, _) = server::request(env, &mut request, &[&name], &mut [])?;
+        status::check(reply.header.error)
+    })())
+}
+
+/// NtLoadKey, NtLoadKey2 and NtLoadKeyEx ignore their optional parameters,
+/// as Wine does. The server reads the hive through the opened guest file.
+pub fn load(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    status::finish((|| {
+        let file = crate::file::open_registry_file(env, args[1])?;
+        let mut attributes = Attributes::read(env, args[0])?;
+        attributes.attributes |= OBJ_OPENIF | OBJ_CASE_INSENSITIVE;
+        let result = (|| {
+            let mut request = crate::protocol::LoadRegistryRequest {
+                file,
+                ..Default::default()
+            };
+            let (reply, _) = server::request(env, &mut request, &[&attributes.wire()], &mut [])?;
+            match reply.header.error {
+                status::OBJECT_NAME_EXISTS => Ok(()),
+                code => status::check(code),
+            }
+        })();
+        server::close(env, file)?;
+        result
+    })())
+}
+
+/// NtUnloadKey(*attributes)
+pub fn unload(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    status::finish((|| {
+        let address = args[0];
+        if address == 0 || crate::object::read_u32(env, address + 8)? == 0 {
+            return Err(status::ACCESS_VIOLATION.into());
+        }
+        if crate::object::read_u32(env, address)? != 24 {
+            return Err(status::INVALID_PARAMETER.into());
+        }
+        let name = read_unicode_string(env, crate::object::read_u32(env, address + 8)?)?;
+        let mut request = crate::protocol::UnloadRegistryRequest {
+            parent: crate::object::read_u32(env, address + 4)?,
+            attributes: crate::object::read_u32(env, address + 12)?,
+            ..Default::default()
+        };
+        let (reply, _) = server::request(env, &mut request, &[&bytes(&name)], &mut [])?;
+        status::check(reply.header.error)
+    })())
+}
+
+/// NtSaveKey(key, file)
+pub fn save(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    status::finish((|| {
+        let mut request = crate::protocol::SaveRegistryRequest {
+            hkey: args[0],
+            file: args[1],
+            ..Default::default()
+        };
+        let (reply, _) = server::request(env, &mut request, &[], &mut [])?;
+        status::check(reply.header.error)
+    })())
 }

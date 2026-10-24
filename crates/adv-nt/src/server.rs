@@ -467,6 +467,24 @@ pub fn request<R: Request>(
     Ok(answer)
 }
 
+/// Terminating the caller's job kills its server thread before a reply is
+/// written. Wine receives SIGQUIT; this machine exits after that closure.
+pub(crate) fn terminate_job(
+    env: &mut Env<'_>,
+    request: &mut crate::protocol::TerminateJobRequest,
+) -> Result<bool, crate::status::Error> {
+    let context = env.context;
+    match link(env)?.call(context, request, &[], &mut []) {
+        Ok((reply, _)) => {
+            deliver(env);
+            crate::status::check(reply.header.error)?;
+            Ok(false)
+        }
+        Err(Error::Closed) => Ok(true),
+        Err(error) => Err(broken(error)),
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error(transparent)]

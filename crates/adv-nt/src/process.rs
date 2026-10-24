@@ -735,3 +735,31 @@ pub fn terminate(env: &mut Env<'_>, args: &[u32]) -> adv_machine::Outcome {
     }
     adv_machine::Outcome::ExitProcess(exit_code)
 }
+
+/// NtSuspendProcess(process)
+pub fn suspend(env: &mut Env<'_>, args: &[u32]) -> adv_machine::Outcome {
+    status::finish((|| {
+        crate::information::current_process(env, args[0])?;
+        let mut request = crate::protocol::SuspendProcessRequest {
+            handle: args[0],
+            ..Default::default()
+        };
+        let (reply, _) = server::request(env, &mut request, &[], &mut [])?;
+        status::check(reply.header.error)?;
+        crate::thread::refresh_suspension(env)
+    })())
+}
+
+/// NtResumeProcess(process)
+pub fn resume(env: &mut Env<'_>, args: &[u32]) -> adv_machine::Outcome {
+    status::finish((|| {
+        crate::information::current_process(env, args[0])?;
+        let mut request = crate::protocol::ResumeProcessRequest {
+            handle: args[0],
+            ..Default::default()
+        };
+        let (reply, _) = server::request(env, &mut request, &[], &mut [])?;
+        status::check(reply.header.error)?;
+        crate::thread::refresh_suspension(env)
+    })())
+}

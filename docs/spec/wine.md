@@ -285,3 +285,20 @@ FreeType is such a library: win32u opens it by name and draws TrueType text thro
 
 **Rule**: Listed Wine conformance tests that pass on standard Wine MUST pass here with no failures. Each runs as its own program without arguments.
 **Verification**: Test
+
+## L-process NT calls
+
+### WINE-NT-301 Registry hive operations
+
+**Rule**: Registry rename, transacted opens, and hive operations MUST follow Wine's argument checks and server requests. Hive files MUST use the guest's file handles.
+**Verification**: Test
+
+### WINE-NT-302 Process and thread operations
+
+**Rule**: Process enumeration, suspension, thread alerts, continuation, and APC calls MUST follow Wine's behavior within `WINE-SYS-4`. Suspension MUST update machine contexts.
+**Verification**: Test
+
+### WINE-NT-303 Jobs and completions
+
+**Rule**: Job membership, information, termination, and completion calls MUST use Wine's checks and server requests. Terminating the current process's job MUST end the machine process.
+**Verification**: Test

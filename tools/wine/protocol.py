@@ -133,6 +133,22 @@ REQUESTS = [
     "get_new_process_info",
     "get_startup_info",
     "set_queue_fd",
+    "rename_key",
+    "load_registry",
+    "unload_registry",
+    "save_registry",
+    "suspend_process",
+    "resume_process",
+    "get_next_process",
+    "terminate_job",
+    "get_job_info",
+    "set_job_limits",
+    "set_job_completion_port",
+    "process_in_job",
+    "assign_job",
+    "query_completion",
+    "adjust_token_privileges",
+    "allocate_reserve_object",
 ]
 
 # Structures sent as request or reply data. Their fields are integers laid
