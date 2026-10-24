@@ -1,8 +1,7 @@
 /* Configuration of the vendored wineserver for Apple and Android targets.
  *
  * Only the macros the server sources test are listed, true on macOS, iOS
- * and Android unless marked. HAVE_KQUEUE is left out on purpose: the server then waits
- * in poll(), which the shim hands to the runtime (shim.h). */
+ * and Android unless marked. The shim hands event-loop waits to the runtime. */
 
 #ifndef __WINE_CONFIG_H
 #define __WINE_CONFIG_H
@@ -27,6 +26,8 @@
 #define HAVE_UTIME_H 1
 
 #ifdef __APPLE__
+#define HAVE_KQUEUE 1
+#define HAVE_SYS_EVENT_H 1
 #define HAVE_STRUCT_SOCKADDR_UN_SUN_LEN 1
 #define HAVE_SYS_FILIO_H 1
 #define HAVE_SYS_SYSCTL_H 1
@@ -36,6 +37,8 @@
 #define HAVE_NETINET_TCP_FSM_H 1
 #endif
 #else
+#define HAVE_SYS_EPOLL_H 1
+#define HAVE_EPOLL_CREATE 1
 #define HAVE_LINUX_FILTER_H 1
 #define HAVE_LINUX_MAJOR_H 1
 #define HAVE_LINUX_TYPES_H 1

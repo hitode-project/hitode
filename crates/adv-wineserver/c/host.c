@@ -28,8 +28,11 @@
 #include <sys/types.h>
 #include <sys/resource.h>
 #ifdef __APPLE__
+#include <sys/event.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
+#else
+#include <sys/epoll.h>
 #endif
 
 #define TICKS_PER_SEC 10000000
@@ -285,6 +288,27 @@ struct endpoint { struct channel *channel; int writing; };
 static struct endpoint *endpoints;
 static size_t endpoint_count;
 static uint64_t queued_io, system_io;
+static uint64_t kernel_waits, kernel_events, kernel_poll_fds;
+
+struct channel_event
+{
+    struct channel_event *next;
+    int queue, fd, filter;
+#ifdef __APPLE__
+    struct kevent event;
+#else
+    struct epoll_event event;
+#endif
+};
+static struct channel_event *channel_events;
+
+static struct channel_event **find_event( int queue, int fd, int filter )
+{
+    struct channel_event **ptr = &channel_events;
+    while (*ptr && ((*ptr)->queue != queue || (*ptr)->fd != fd || (*ptr)->filter != filter))
+        ptr = &(*ptr)->next;
+    return ptr;
+}
 
 static struct endpoint *endpoint( int fd )
 {
@@ -324,6 +348,13 @@ static void release( struct endpoint end )
 void hitode_channel_forget( int fd )
 {
     struct endpoint *end = endpoint( fd );
+    struct channel_event **ptr = &channel_events, *item;
+    while ((item = *ptr))
+    {
+        if (item->fd != fd && item->queue != fd) { ptr = &item->next; continue; }
+        *ptr = item->next;
+        free( item );
+    }
     if (end && end->channel)
     {
         release( *end );
@@ -559,6 +590,7 @@ static int channel_poll( struct pollfd *fds, nfds_t count )
             if (!channel->writers) fds[i].revents |= POLLHUP;
         }
     }
+    kernel_poll_fds += rest;
     if (rest && (ret = poll( other, rest, 0 )) < 0) return ret;
     rest = 0;
     for (i = 0; i < count; i++)
@@ -581,6 +613,158 @@ int hitode_poll( struct pollfd *fds, nfds_t count, int timeout )
     hitode_host_wait( timeout );
     return channel_poll( fds, count );
 }
+
+/* Only channel registrations live here; ordinary descriptors stay in Wine's
+ * incremental kernel event set. Every kernel wait has a zero timeout. */
+void hitode_event_counts( uint64_t *waits, uint64_t *events, uint64_t *poll_fds )
+{
+    *waits = kernel_waits;
+    *events = kernel_events;
+    *poll_fds = kernel_poll_fds;
+}
+
+#ifdef __APPLE__
+static int channel_kevent( int queue, struct kevent *events, int capacity )
+{
+    const struct timespec zero = {0};
+    struct kevent queued[capacity];
+    struct channel_event *item;
+    int count = 0, ret;
+    for (item = channel_events; item && count < capacity; item = item->next)
+    {
+        struct endpoint *end;
+        struct channel *channel;
+        int eof;
+        if (item->queue != queue || (item->event.flags & EV_DISABLE)) continue;
+        end = endpoint( item->fd );
+        channel = end->channel;
+        eof = !(end->writing ? channel->readers : channel->writers);
+        if (!eof && !(item->filter == EVFILT_READ ? channel->size : end->writing)) continue;
+        EV_SET( &queued[count], item->fd, item->filter, eof ? EV_EOF : 0, 0,
+                item->filter == EVFILT_READ ? channel->size : 0, item->event.udata );
+        count++;
+    }
+    if (count == capacity) { memcpy( events, queued, count * sizeof(*events) ); return count; }
+    kernel_waits++;
+    ret = kevent( queue, NULL, 0, events, capacity - count, &zero );
+    if (ret < 0) return ret;
+    kernel_events += ret;
+    /* Dispatch socket closure before channel closure, as Wine's poll array does. */
+    memcpy( events + ret, queued, count * sizeof(*events) );
+    return count + ret;
+}
+
+int hitode_kevent( int queue, const struct kevent *changes, int count,
+                   struct kevent *events, int capacity, const struct timespec *timeout )
+{
+    struct kevent other[count ? count : 1];
+    int i, rest = 0, ret, wait = -1;
+    for (i = 0; i < count; i++)
+    {
+        const struct kevent *ev = &changes[i];
+        struct endpoint *end = endpoint( ev->ident );
+        struct channel_event **ptr, *item;
+        if (!end || !end->channel) { other[rest++] = *ev; continue; }
+        ptr = find_event( queue, ev->ident, ev->filter );
+        item = *ptr;
+        if (ev->flags & EV_DELETE)
+        {
+            if (!item) { errno = ENOENT; return -1; }
+            *ptr = item->next;
+            free( item );
+            continue;
+        }
+        if (!item)
+        {
+            if (!(ev->flags & EV_ADD)) { errno = ENOENT; return -1; }
+            if (!(item = calloc( 1, sizeof(*item) ))) { errno = ENOMEM; return -1; }
+            item->queue = queue;
+            item->fd = ev->ident;
+            item->filter = ev->filter;
+            *ptr = item;
+        }
+        if (ev->flags & EV_ADD) item->event = *ev;
+        if (ev->flags & EV_DISABLE) item->event.flags |= EV_DISABLE;
+        if (ev->flags & EV_ENABLE) item->event.flags &= ~EV_DISABLE;
+    }
+    if (rest && kevent( queue, other, rest, NULL, 0, NULL ) < 0) return -1;
+    if (!capacity) return 0;
+    if (timeout)
+    {
+        int64_t ms = (int64_t)timeout->tv_sec * 1000 + (timeout->tv_nsec + 999999) / 1000000;
+        wait = ms > INT_MAX ? INT_MAX : ms;
+    }
+    ret = channel_kevent( queue, events, capacity );
+    if (ret || !wait) return ret;
+    hitode_host_wait( wait );
+    return channel_kevent( queue, events, capacity );
+}
+#else
+int hitode_epoll_ctl( int queue, int op, int fd, struct epoll_event *event )
+{
+    struct endpoint *end = endpoint( fd );
+    struct channel_event **ptr, *item;
+    if (!end || !end->channel) return epoll_ctl( queue, op, fd, event );
+    ptr = find_event( queue, fd, 0 );
+    item = *ptr;
+    if (op == EPOLL_CTL_ADD)
+    {
+        if (item) { errno = EEXIST; return -1; }
+        if (!(item = calloc( 1, sizeof(*item) ))) { errno = ENOMEM; return -1; }
+        item->queue = queue;
+        item->fd = fd;
+        *ptr = item;
+    }
+    else if (!item) { errno = ENOENT; return -1; }
+    if (op == EPOLL_CTL_DEL) { *ptr = item->next; free( item ); }
+    else item->event = *event;
+    return 0;
+}
+
+static int channel_epoll( int queue, struct epoll_event *events, int capacity )
+{
+    struct epoll_event queued[capacity];
+    struct channel_event *item;
+    int count = 0, ret;
+    for (item = channel_events; item && count < capacity; item = item->next)
+    {
+        struct endpoint *end;
+        struct channel *channel;
+        unsigned int ready = 0;
+        if (item->queue != queue) continue;
+        end = endpoint( item->fd );
+        channel = end->channel;
+        if (end->writing)
+        {
+            ready = item->event.events & EPOLLOUT;
+            if (!channel->readers) ready |= EPOLLERR;
+        }
+        else
+        {
+            if (channel->size) ready = item->event.events & EPOLLIN;
+            if (!channel->writers) ready |= EPOLLHUP;
+        }
+        if (!ready) continue;
+        queued[count] = item->event;
+        queued[count++].events = ready;
+    }
+    if (count == capacity) { memcpy( events, queued, count * sizeof(*events) ); return count; }
+    kernel_waits++;
+    ret = epoll_wait( queue, events, capacity - count, 0 );
+    if (ret < 0) return ret;
+    kernel_events += ret;
+    memcpy( events + ret, queued, count * sizeof(*events) );
+    return count + ret;
+}
+
+int hitode_epoll_wait( int queue, struct epoll_event *events, int capacity, int timeout )
+{
+    int ret = channel_epoll( queue, events, capacity );
+    if (ret || !timeout) return ret;
+    hitode_host_wait( timeout );
+    return channel_epoll( queue, events, capacity );
+}
+#endif
 
 char *hitode_getenv( const char *name )
 {

@@ -95,7 +95,7 @@ extern "C" fn notified(owner: *mut c_void, token: usize) {
     unsafe { *owner.cast::<usize>() += token };
 }
 
-// spec: SRV-CHAN-1, WINE-THR-1
+// spec: SRV-CHAN-1, WINE-THR-1, SRV-EVENT-1
 #[test]
 fn registered_pipes_round_trip_wake_close_and_reuse() {
     // Link the facade supplying the shim's execution-owner services.
@@ -209,4 +209,98 @@ fn registered_pipes_round_trip_wake_close_and_reuse() {
         std::io::Error::last_os_error().raw_os_error(),
         Some(libc::EPIPE)
     );
+    #[cfg(target_vendor = "apple")]
+    channel_events_preserve_filters_enablement_data_and_close();
+}
+
+#[cfg(target_vendor = "apple")]
+fn channel_events_preserve_filters_enablement_data_and_close() {
+    unsafe extern "C" {
+        fn hitode_kevent(
+            queue: c_int,
+            changes: *const libc::kevent,
+            count: c_int,
+            events: *mut libc::kevent,
+            capacity: c_int,
+            timeout: *const libc::timespec,
+        ) -> c_int;
+    }
+    let _ = adv_wineserver::PROTOCOL_VERSION;
+    // SAFETY: descriptors are owned, buffers cover their counts, and zero timeouts never yield.
+    unsafe {
+        let queue = Fd(libc::kqueue());
+        assert!(queue.0 >= 0);
+        let change = |fd: i32, filter: i16, flags: u16, token: usize| {
+            let event = libc::kevent {
+                ident: fd as _,
+                filter,
+                flags,
+                fflags: 0,
+                data: 0,
+                udata: token as _,
+            };
+            assert_eq!(
+                hitode_kevent(
+                    queue.0,
+                    &event,
+                    1,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null()
+                ),
+                0
+            );
+        };
+        let ready = || {
+            let mut events: [libc::kevent; 4] = std::mem::zeroed();
+            let zero = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            let count = hitode_kevent(queue.0, std::ptr::null(), 0, events.as_mut_ptr(), 4, &zero);
+            assert!(count >= 0);
+            events[..count as usize].to_vec()
+        };
+        let (reader, writer) = pipe();
+        change(
+            reader.0,
+            libc::EVFILT_READ,
+            libc::EV_ADD | libc::EV_DISABLE,
+            11,
+        );
+        change(writer.0, libc::EVFILT_WRITE, libc::EV_ADD, 22);
+        let events = ready();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].filter, libc::EVFILT_WRITE);
+        assert_eq!(events[0].udata as usize, 22);
+        change(writer.0, libc::EVFILT_WRITE, libc::EV_DISABLE, 22);
+        assert_eq!(write(&writer, b"data"), 4);
+        assert!(ready().is_empty());
+        change(reader.0, libc::EVFILT_READ, libc::EV_ENABLE, 11);
+        let events = ready();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].filter, libc::EVFILT_READ);
+        assert_eq!(events[0].udata as usize, 11);
+        assert_eq!({ events[0].data }, 4);
+        drop(writer);
+        let events = ready();
+        assert_eq!(events.len(), 1);
+        assert_ne!(events[0].flags & libc::EV_EOF, 0);
+        assert_eq!({ events[0].data }, 4);
+        assert_eq!(read(&reader, &mut [0; 4]), 4);
+        assert_eq!({ ready()[0].data }, 0);
+        change(reader.0, libc::EVFILT_READ, libc::EV_DELETE, 11);
+        assert!(ready().is_empty());
+        change(reader.0, libc::EVFILT_READ, libc::EV_ADD, 33);
+        assert_eq!(ready()[0].udata as usize, 33);
+        drop(reader);
+        assert!(ready().is_empty());
+        let (reader, writer) = pipe();
+        change(writer.0, libc::EVFILT_WRITE, libc::EV_ADD, 44);
+        drop(reader);
+        let events = ready();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].filter, libc::EVFILT_WRITE);
+        assert_ne!(events[0].flags & libc::EV_EOF, 0);
+    }
 }

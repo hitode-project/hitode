@@ -12,3 +12,12 @@ This spec covers how guest processes reach the in-process Wine server: request, 
 Registered descriptors MUST retain pipe read, close and readiness behavior across descriptor transfers and reuse.
 Wake delivery MUST visit only threads whose wait queues received bytes.
 **Verification**: Test
+
+## Event loop
+
+### SRV-EVENT-1 Incremental server events
+
+**Rule**: The server MUST use kqueue on Apple targets and epoll on Android, keeping channel registrations outside the kernel.
+Event waits MUST merge queue readiness with kernel events using zero kernel timeouts and yield to the runtime when nothing is ready.
+Channel registrations MUST preserve event data, enablement and close behavior.
+**Verification**: Test

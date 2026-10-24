@@ -23,8 +23,13 @@
 #include <sys/wait.h>
 #include <sys/resource.h>
 #ifdef __APPLE__
+#include <sys/event.h>
+#undef LIST_INIT
+#undef LIST_ENTRY
 #include <mach/mach_types.h>
 #include <mach/mach_time.h>
+#else
+#include <sys/epoll.h>
 #endif
 
 int hitode_asprintf( char **str, const char *format, ... );
@@ -55,6 +60,13 @@ ssize_t hitode_sendmsg( int fd, const struct msghdr *msg, int flags );
 ssize_t hitode_recvmsg( int fd, struct msghdr *msg, int flags );
 
 int hitode_poll( struct pollfd *fds, nfds_t count, int timeout );
+#ifdef __APPLE__
+int hitode_kevent( int queue, const struct kevent *changes, int count,
+                   struct kevent *events, int capacity, const struct timespec *timeout );
+#else
+int hitode_epoll_ctl( int queue, int op, int fd, struct epoll_event *event );
+int hitode_epoll_wait( int queue, struct epoll_event *events, int capacity, int timeout );
+#endif
 char *hitode_getenv( const char *name );
 void hitode_exit( int status ) __attribute__((noreturn));
 int hitode_atexit( void (*func)(void) );
@@ -109,6 +121,12 @@ int hitode_NSGetExecutablePath( char *buf, uint32_t *size );
 #define recvmsg(...) hitode_recvmsg(__VA_ARGS__)
 
 #define poll(...) hitode_poll(__VA_ARGS__)
+#ifdef __APPLE__
+#define kevent(...) hitode_kevent(__VA_ARGS__)
+#else
+#define epoll_ctl(...) hitode_epoll_ctl(__VA_ARGS__)
+#define epoll_wait(...) hitode_epoll_wait(__VA_ARGS__)
+#endif
 #define getenv(...) hitode_getenv(__VA_ARGS__)
 #define exit(...) hitode_exit(__VA_ARGS__)
 #define _exit(...) hitode_exit(__VA_ARGS__)
