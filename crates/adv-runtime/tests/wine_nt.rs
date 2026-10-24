@@ -216,3 +216,59 @@ fn j_file() {
         ],
     );
 }
+
+// spec: WINE-NT-201, WINE-NT-202, WINE-NT-203
+#[test]
+fn k_security() {
+    let Some((stop, text)) = probe("k_security", "nt_security.exe", |_, _| {}) else {
+        return;
+    };
+    assert!(matches!(stop, Stop::Exited(0)), "{stop:?}: {text}");
+    let expected = [
+        "open_process",
+        "open_process_ex",
+        "fixed_user",
+        "duplicate_token",
+        "open_thread_empty",
+        "set_thread_token",
+        "open_thread",
+        "open_thread_ex",
+        "revert",
+        "lookup_privilege",
+        "adjust_privileges",
+        "privilege_disabled",
+        "restore_privileges",
+        "privilege_enabled",
+        "filter_token",
+        "filtered_privilege",
+        "default_dacl_init",
+        "set_token_dacl",
+        "token_dacl_roundtrip",
+        "set_token_short",
+        "world_sid",
+        "security_init",
+        "access_allowed",
+        "access_denied",
+        "access_short",
+        "create_event",
+        "set_security",
+        "query_security_short",
+        "query_security",
+        "duplicate_handle",
+        "compare_objects",
+        "make_permanent",
+        "permanent_lifetime",
+        "make_temporary",
+        "temporary_lifetime",
+        "dos_device_create",
+        "dos_device_remove",
+        "token_id",
+        "create_token",
+        "created_user",
+        "invalid_primary_group",
+        "reserve_object",
+        "reserve_invalid",
+    ];
+    let lines: Vec<_> = text.lines().collect();
+    assert_eq!(lines, expected.map(|name| format!("{name} ok")), "{text}");
+}

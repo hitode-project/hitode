@@ -563,3 +563,176 @@ pub fn query_symlink(env: &mut Env<'_>, args: &[u32]) -> adv_machine::Outcome {
         Ok(())
     })())
 }
+
+/// NtAccessCheck(descriptor, token, access, mapping, privileges, retlen, granted, status)
+pub fn access_check(env: &mut Env<'_>, args: &[u32]) -> adv_machine::Outcome {
+    status::finish((|| {
+        if args[4] == 0 || args[5] == 0 {
+            return Err(status::ACCESS_VIOLATION.into());
+        }
+        let length = read_u32(env, args[5])?;
+        let sd = security_descriptor(env, args[0])?;
+        let mut request = crate::protocol::AccessCheckRequest {
+            handle: args[1],
+            desired_access: args[2],
+            ..Default::default()
+        };
+        request.mapping[..16].copy_from_slice(&read_bytes(env, args[3], 16)?);
+        // The server returns at most one LUID_AND_ATTRIBUTES.
+        let mut privileges = vec![0; length.wrapping_sub(8).min(12) as usize];
+        let (reply, size) = crate::server::request(env, &mut request, &[&sd], &mut privileges)?;
+        write_bytes(env, args[4] + 8, &privileges[..size])?;
+        status::check(reply.header.error)?;
+        let needed = (8 + reply.privileges_len).max(20);
+        write_u32(env, args[5], needed)?;
+        if length < needed {
+            return Err(status::BUFFER_TOO_SMALL.into());
+        }
+        write_u32(env, args[4], reply.privileges_len / 12)?;
+        write_u32(env, args[7], reply.access_status)?;
+        Ok(write_u32(env, args[6], reply.access_granted)?)
+    })())
+}
+
+/// NtAccessCheckAndAuditAlarm: Wine's stub.
+pub fn access_check_audit(_: &mut Env<'_>, _: &[u32]) -> adv_machine::Outcome {
+    adv_machine::Outcome::Return(status::NOT_IMPLEMENTED)
+}
+
+/// NtAccessCheckByTypeAndAuditAlarm: Wine's stub.
+pub fn access_check_by_type_audit(_: &mut Env<'_>, _: &[u32]) -> adv_machine::Outcome {
+    adv_machine::Outcome::Return(status::NOT_IMPLEMENTED)
+}
+
+/// NtCloseObjectAuditAlarm: Wine's stub.
+pub fn close_audit(_: &mut Env<'_>, _: &[u32]) -> adv_machine::Outcome {
+    adv_machine::Outcome::Return(status::NOT_IMPLEMENTED)
+}
+
+/// NtQuerySecurityObject(handle, info, descriptor, length, retlen)
+pub fn query_security(env: &mut Env<'_>, args: &[u32]) -> adv_machine::Outcome {
+    status::finish((|| {
+        let mut buffer_size = 512;
+        loop {
+            let mut buffer = vec![0; buffer_size];
+            let mut request = crate::protocol::GetSecurityObjectRequest {
+                handle: args[0],
+                security_info: args[1],
+                ..Default::default()
+            };
+            let (reply, _) = crate::server::request(env, &mut request, &[], &mut buffer)?;
+            buffer_size = reply.sd_len as usize;
+            if reply.header.error == status::BUFFER_TOO_SMALL {
+                continue;
+            }
+            status::check(reply.header.error)?;
+            if buffer_size == 0 {
+                buffer[..20].fill(0);
+            }
+            let words: Vec<u32> = buffer[..20]
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|word| u32::from_le_bytes(*word))
+                .collect();
+            let needed = 20 + words[1..].iter().sum::<u32>();
+            write_u32(env, args[4], needed)?;
+            if args[3] < needed {
+                return Err(status::BUFFER_TOO_SMALL.into());
+            }
+            let mut output = vec![0; 20];
+            output[..4].copy_from_slice(&(1 | ((words[0] | 0x8000) << 16)).to_le_bytes());
+            let mut offset = 20u32;
+            for (i, &length) in words[1..].iter().enumerate() {
+                if length != 0 {
+                    output[4 + 4 * i..8 + 4 * i].copy_from_slice(&offset.to_le_bytes());
+                    offset += length;
+                }
+            }
+            output.extend_from_slice(&buffer[20..needed as usize]);
+            return Ok(write_bytes(env, args[2], &output)?);
+        }
+    })())
+}
+
+/// NtSetSecurityObject(handle, info, descriptor)
+pub fn set_security(env: &mut Env<'_>, args: &[u32]) -> adv_machine::Outcome {
+    status::finish((|| {
+        if args[2] == 0 {
+            return Err(status::ACCESS_VIOLATION.into());
+        }
+        let mut sd = security_descriptor(env, args[2])?;
+        if (args[1] & 1 != 0 && sd[4..8] == [0; 4]) || (args[1] & 2 != 0 && sd[8..12] == [0; 4]) {
+            return Err(0xc000_0079.into());
+        }
+        let mut control = u32::from_le_bytes(sd[..4].try_into().unwrap());
+        if args[1] & (8 | 0x10) != 0 {
+            control |= 0x10;
+        }
+        if args[1] & 4 != 0 {
+            control |= 4;
+        }
+        sd[..4].copy_from_slice(&control.to_le_bytes());
+        let mut request = crate::protocol::SetSecurityObjectRequest {
+            handle: args[0],
+            security_info: args[1],
+            ..Default::default()
+        };
+        let (reply, _) = crate::server::request(env, &mut request, &[&sd], &mut [])?;
+        status::check(reply.header.error)
+    })())
+}
+
+/// NtCompareObjects(first, second)
+pub fn compare(env: &mut Env<'_>, args: &[u32]) -> adv_machine::Outcome {
+    status::finish((|| {
+        let mut request = crate::protocol::CompareObjectsRequest {
+            first: args[0],
+            second: args[1],
+            ..Default::default()
+        };
+        let (reply, _) = crate::server::request(env, &mut request, &[], &mut [])?;
+        status::check(reply.header.error)
+    })())
+}
+
+/// NtAllocateReserveObject(handle, attributes, type)
+pub fn allocate_reserve(env: &mut Env<'_>, args: &[u32]) -> adv_machine::Outcome {
+    status::finish((|| {
+        write_u32(env, args[0], 0)?;
+        let attr = if args[1] == 0 {
+            Vec::new()
+        } else {
+            Attributes::read(env, args[1])?.wire()
+        };
+        let mut request = crate::protocol::AllocateReserveObjectRequest {
+            r#type: args[2] as i32,
+            ..Default::default()
+        };
+        let (reply, _) = crate::server::request(env, &mut request, &[&attr], &mut [])?;
+        status::check(reply.header.error)?;
+        Ok(write_u32(env, args[0], reply.handle)?)
+    })())
+}
+
+/// NtMakePermanentObject(handle)
+pub fn make_permanent(env: &mut Env<'_>, args: &[u32]) -> adv_machine::Outcome {
+    set_permanence(env, args[0], true)
+}
+
+/// NtMakeTemporaryObject(handle)
+pub fn make_temporary(env: &mut Env<'_>, args: &[u32]) -> adv_machine::Outcome {
+    set_permanence(env, args[0], false)
+}
+
+fn set_permanence(env: &mut Env<'_>, handle: u32, permanent: bool) -> adv_machine::Outcome {
+    status::finish((|| {
+        let mut request = crate::protocol::SetObjectPermanenceRequest {
+            handle,
+            permanent: i32::from(permanent),
+            ..Default::default()
+        };
+        let (reply, _) = crate::server::request(env, &mut request, &[], &mut [])?;
+        status::check(reply.header.error)
+    })())
+}

@@ -323,3 +323,24 @@ FreeType is such a library: win32u opens it by name and draws TrueType text thro
 
 **Rule**: `NtQueryEaFile`, `NtSetEaFile`, and `NtSetVolumeInformationFile` MUST preserve Wine 11's stub checks, statuses, and side effects.
 **Verification**: Review — the package probe omits Wine's stubs.
+## Token and object security calls
+
+### WINE-NT-201 Tokens and privileges
+
+**Rule**: Token creation, opening, filtering, privilege adjustment, privilege checks, and default DACL updates MUST match Wine 11.0's server requests and results. Token users MUST remain guest identities independent of host names and users.
+**Verification**: Test
+
+### WINE-NT-202 Security descriptors and access
+
+**Rule**: Access checks and object security queries and updates MUST preserve Wine 11.0's descriptor conversion, length checks, statuses, and server effects.
+**Verification**: Test
+
+### WINE-NT-203 Object identity and lifetime
+
+**Rule**: Object comparison and reserve allocation MUST use Wine 11.0's server requests. Permanent and temporary objects MUST send `set_object_permanence` and retain the server's lifetime behavior.
+**Verification**: Test
+
+### WINE-NT-204 Security stubs
+
+**Rule**: Security calls stubbed by Wine 11.0 MUST preserve its fixed statuses and output writes.
+**Verification**: Review — the call list is compared with Wine's Unix security and server implementations.
