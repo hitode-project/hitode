@@ -161,21 +161,25 @@ fn popup_choice_and_cancel_child() {
                 bar.key.window,
                 "popup presented as a frame"
             );
-            if first.is_none() {
-                assert!(popup.active.load(Ordering::Acquire));
-                first = Some(popup.active);
-                let choice = bar.items[0].children[0].command;
-                assert_eq!(choice.id, 42);
-                assert!(session.menu_event(MenuEvent::Command(choice)));
-            } else if !std::sync::Arc::ptr_eq(first.as_ref().unwrap(), &popup.active)
-                && second.is_none()
-            {
-                assert!(!first.as_ref().unwrap().load(Ordering::Acquire));
-                second = Some(popup.active);
-                assert!(session.menu_event(MenuEvent::Cancel {
-                    window: bar.key.window,
-                    root: bar.key.menu
-                }));
+            match &first {
+                None => {
+                    assert!(popup.active.load(Ordering::Acquire));
+                    first = Some(popup.active);
+                    let choice = bar.items[0].children[0].command;
+                    assert_eq!(choice.id, 42);
+                    assert!(session.menu_event(MenuEvent::Command(choice)));
+                }
+                Some(earlier)
+                    if !std::sync::Arc::ptr_eq(earlier, &popup.active) && second.is_none() =>
+                {
+                    assert!(!earlier.load(Ordering::Acquire));
+                    second = Some(popup.active);
+                    assert!(session.menu_event(MenuEvent::Cancel {
+                        window: bar.key.window,
+                        root: bar.key.menu
+                    }));
+                }
+                Some(_) => {}
             }
         }
         match session.run(Instant::now() + Duration::from_millis(20)) {
