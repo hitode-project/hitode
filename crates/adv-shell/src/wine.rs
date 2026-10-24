@@ -59,7 +59,9 @@ fn start(options: &Options, dist: &Path, wake: WakeEvent, host: Host) -> Result<
         stdout: Some(libc::STDOUT_FILENO),
     };
     let gpu_wake = wake.clone();
+    let codec_kernels = options.codec_kernels;
     Session::start(&config, wake, move |machine| {
+        Session::install_codec_kernels(machine, codec_kernels);
         machine.cpu.set_background_sender(host.background)?;
         if let Some(gpu) = host.gpu {
             Session::attach_gpu(machine, gpu, gpu_wake)?;
