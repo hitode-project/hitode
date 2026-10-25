@@ -57,6 +57,9 @@ Cached successors MUST match entry EIP and block-cache generation. They MUST pas
 **Rule**: `Memory::direct` MUST refuse writes intersecting observed bytes, including on non-executable pages. Checked stores intersecting observed bytes MUST advance the corresponding dependency versions. On non-executable pages, stores outside observed bytes MUST NOT invalidate dependencies.
 **Verification**: Test
 
+With software-checked memory, executable permission alone MUST NOT prevent `Memory::direct` writes to ordinary writable bytes outside observed dependencies.
+Native host protection MUST retain its executable-page write barrier.
+
 ## Native computation admission
 
 ### EXEC-NATIVE-1 Verified bindings

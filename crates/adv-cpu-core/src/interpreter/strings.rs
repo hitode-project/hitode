@@ -97,7 +97,7 @@ fn batch(state: &mut CpuState, memory: &mut Memory, op: StringOp, budget: u32) -
         Some(dst) => {
             let value = state.regs[0];
             // SAFETY: the entire ordinary writable page range was validated above;
-            // each unaligned element is inside it, and no shared/code page qualifies.
+            // each unaligned element is inside it, with no shared or observed bytes.
             unsafe {
                 match width {
                     1 => std::ptr::write_bytes(dst, value as u8, len),
@@ -328,7 +328,7 @@ mod tests {
 
     fn memory() -> Memory {
         let mut memory = Memory::new(0, 0x20000).unwrap();
-        memory.protect(0, 0x20000, READ | WRITE).unwrap();
+        memory.protect(0, 0x20000, READ | WRITE | EXEC).unwrap();
         let bytes: Vec<_> = (0..0x20000).map(|n| (n * 17 + n / 256) as u8).collect();
         memory.write(0, &bytes).unwrap();
         memory
@@ -501,6 +501,7 @@ mod tests {
         assert_eq!(bytes, [0x37; 16]);
     }
 
+    // spec: EXEC-CORE-7
     #[test]
     fn batches_reject_code_and_file_aliases_but_publish_pcm_atomically() {
         let op = StringOp {
@@ -516,7 +517,7 @@ mod tests {
         state.regs[6] = 0x2000;
         state.regs[7] = 0x4000;
         let mut m = memory();
-        m.protect(0x4000, PAGE_SIZE, READ | WRITE | EXEC).unwrap();
+        m.watch_code(0x4000, 16);
         assert_eq!(batch(&mut state, &mut m, op, 16), 0);
         let mut m = Memory::reserve(0, 0x10000).unwrap();
         let page = crate::backend::FilePage::new([0x71; PAGE_SIZE]);
@@ -533,6 +534,36 @@ mod tests {
         m.map_shared_audio(0x4000, PAGE_SIZE).unwrap();
         m.protect(0x4000, PAGE_SIZE, READ | WRITE).unwrap();
         assert_eq!(batch(&mut state, &mut m, op, 16), 16);
+    }
+
+    // spec: EXEC-CORE-7
+    #[test]
+    fn writable_executable_data_batches_until_observed_as_code() {
+        for kind in [StringKind::Movs, StringKind::Stos] {
+            for permissions in [READ | WRITE, READ | WRITE | EXEC] {
+                let op = StringOp {
+                    kind,
+                    width: 4,
+                    word: false,
+                    fs: false,
+                    repeat: true,
+                    unequal: false,
+                };
+                let mut m = memory();
+                m.protect(0x4000, PAGE_SIZE, permissions).unwrap();
+                let mut state = CpuState::default();
+                state.regs[1] = 128;
+                state.regs[6] = 0x2000;
+                state.regs[7] = 0x4000;
+                let initial = state.clone();
+                assert_eq!(batch(&mut state, &mut m, op, 128), 128);
+                m.watch_code(0x4000, 1);
+                state = initial;
+                assert_eq!(batch(&mut state, &mut m, op, 128), 0);
+                state.regs[7] = 0x4004;
+                assert_eq!(batch(&mut state, &mut m, op, 128), 128);
+            }
+        }
     }
     // spec: EXEC-CORE-5
     #[test]

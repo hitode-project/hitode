@@ -1028,9 +1028,9 @@ impl Memory {
 
     /// Host address of `len` bytes within one ordinary page that guest code
     /// may access directly: mapped, permitted, not shared, and for writes not
-    /// executable or observed dependency bytes, so no overlay, invalidation or
-    /// host protection scope is involved. Such pages are host-accessible under
-    /// native protection.
+    /// observed dependency bytes, so no overlay or invalidation is involved.
+    /// Native host protection also excludes executable pages through `writes_code`.
+    /// Use the pointer before any mapping, protection or code observation changes.
     #[inline]
     pub fn direct(&self, addr: u32, len: usize, write: bool) -> Option<*mut u8> {
         let offset = addr.wrapping_sub(self.base) as usize;
@@ -1041,9 +1041,7 @@ impl Memory {
         let page = offset / PAGE_SIZE;
         let perms = self.perms[page];
         let allowed = if write {
-            perms & WRITE != 0
-                && perms & (EXEC | SHARED) == 0
-                && !self.writes_code(&(offset..last + 1))
+            perms & WRITE != 0 && perms & SHARED == 0 && !self.writes_code(&(offset..last + 1))
         } else {
             perms & READ != 0 && perms & SHARED == 0
         };
@@ -1836,6 +1834,7 @@ mod linear_audio_tests {
         memory
             .protect(0x11000, PAGE_SIZE, READ | WRITE | EXEC)
             .unwrap();
+        assert!(memory.direct(0x11044, 4, true).is_none());
         memory.watch_code(0x11040, 4);
         let version = memory.versions[1];
         memory.write(0x11044, &[3; 4]).unwrap();
@@ -2054,6 +2053,28 @@ mod linear_audio_tests {
 mod file_page_tests {
     use super::*;
     use std::{cell::Cell, rc::Rc};
+
+    // spec: EXEC-CORE-7
+    #[test]
+    fn direct_data_stores_follow_byte_dependencies_on_writable_executable_pages() {
+        for permissions in [READ | WRITE, READ | WRITE | EXEC] {
+            let mut memory = Memory::reserve(0x10000, PAGE_SIZE).unwrap();
+            memory.map(0x10000, PAGE_SIZE, permissions).unwrap();
+            native_store(&memory, 0x10040, &[1; 8]);
+            assert_eq!(memory.read(0x10040, 8).unwrap(), [1; 8]);
+            let epoch = memory.epoch;
+            memory.watch_code(0x10040, 4);
+            assert!(memory.epoch > epoch);
+            assert!(memory.direct(0x10040, 4, true).is_none());
+            assert!(memory.direct(0x1003f, 2, true).is_none());
+            let version = memory.versions[0];
+            native_store(&memory, 0x10044, &[2; 4]);
+            assert_eq!(memory.versions[0], version);
+            memory.write(0x10040, &[3; 4]).unwrap();
+            assert!(memory.versions[0] > version);
+            assert_eq!(memory.read(0x10040, 8).unwrap(), [3, 3, 3, 3, 2, 2, 2, 2]);
+        }
+    }
 
     #[test]
     fn private_copy_pages_keep_execution_cache_and_retire_barriers_per_write() {
@@ -2521,8 +2542,14 @@ mod window_tests {
             memory.protect(0x3000, 0x1000, 3).unwrap();
             memory.protect(0x4000, 0x4000, 3).unwrap();
             memory.protect(0x8000, 0x4000, 1).unwrap();
-            memory.protect(0xc000, 0x4000, 3).unwrap();
+            memory.protect(0xc000, 0x4000, READ | WRITE | EXEC).unwrap();
             memory.watch_code(0xc000, 1);
+            assert!(memory.direct(0xc000, 1, true).is_none());
+            let alias = memory.direct(0xc004, 4, true).unwrap();
+            // SAFETY: the alias is writable outside the watched byte, even
+            // though the corresponding host window page is write-protected.
+            unsafe { std::ptr::copy_nonoverlapping(b"data".as_ptr(), alias, 4) };
+            assert_eq!(memory.read(0xc004, 4).unwrap(), b"data");
             let window = memory.window_base().unwrap();
             let reservation = memory.reservation.as_ref().unwrap();
             let start = reservation.ptr.as_ptr() as usize - window;
