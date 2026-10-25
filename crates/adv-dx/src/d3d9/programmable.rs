@@ -3,7 +3,7 @@
 use super::*;
 use crate::shader::{SamplerDimension, Shader, Translation};
 use adv_device::gpu::{
-    Attribute, AttributeFormat, ConstantBlock, Program, ProgramTexture, ProgrammableDraw,
+    Attribute, AttributeFormat, Program, ProgramTexture, ProgrammableDraw, VertexBytes,
     VertexStream,
 };
 mod source;
@@ -104,18 +104,6 @@ fn format(kind: u8) -> Result<AttributeFormat, u32> {
         16 => Float16x4,
         _ => return Err(INVALID),
     })
-}
-fn constants(c: &shaders::Constants, usage: adv_device::constants::ConstantUsage) -> ConstantBlock {
-    let mut block = ConstantBlock::default();
-    for n in usage.ranges().flat_map(|r| (r.start / 16)..(r.end / 16)) {
-        match n {
-            0..256 => block.floats[n] = c.floats[n],
-            256..272 => block.integers[n - 256] = c.integers[n - 256],
-            272..288 => block.booleans[n - 272][0] = c.booleans[n - 272],
-            _ => {}
-        }
-    }
-    block
 }
 #[derive(Clone)]
 struct Input {
@@ -378,7 +366,7 @@ fn prepare_checked(
             let mut raw = vec![0; bytes as usize];
             env.cpu.read(at, &mut raw).map_err(|_| INVALID)?;
             streams.push(VertexStream {
-                bytes: raw,
+                bytes: raw.into(),
                 stride,
                 attributes: selected
                     .iter()
@@ -397,7 +385,7 @@ fn prepare_checked(
                 target,
                 image,
                 state,
-                vertices: Vec::new(),
+                vertices: Arc::default(),
                 texcoords: None,
                 programmable: None,
                 recording_key: recording::draw_key(env, pointer),
@@ -416,13 +404,10 @@ fn prepare_checked(
         };
         vertex_count = draw.vertices.len() as u32;
         output_indices = None;
+        let count = draw.texcoords.as_ref().map(|(count, _)| *count);
         let mut stream = VertexStream {
-            bytes: if draw.texcoords.is_some() {
-                Vec::new()
-            } else {
-                bytemuck::cast_slice(&draw.vertices).to_vec()
-            },
-            stride: 40,
+            bytes: VertexBytes::fixed(draw.vertices.clone(), draw.texcoords.clone()),
+            stride: count.map_or(40, |n| 32 + n as u32 * 16),
             attributes: vec![
                 Attribute {
                     location: 0,
@@ -434,33 +419,11 @@ fn prepare_checked(
                     offset: 16,
                     format: AttributeFormat::Float4,
                 },
-                Attribute {
-                    location: 2,
-                    offset: 32,
-                    format: AttributeFormat::Float2,
-                },
             ],
         };
         let mut inputs = Vec::new();
-        if let Some((count, values)) = &draw.texcoords {
-            stream.stride = 32 + *count as u32 * 16;
-            stream.bytes.clear();
-            stream
-                .bytes
-                .reserve(draw.vertices.len() * stream.stride as usize);
-            stream.attributes.truncate(2);
-            for (vertex, coordinates) in draw.vertices.iter().zip(values.chunks_exact(*count)) {
-                stream
-                    .bytes
-                    .extend_from_slice(bytemuck::cast_slice(&vertex.position));
-                stream
-                    .bytes
-                    .extend_from_slice(bytemuck::cast_slice(&vertex.color));
-                stream
-                    .bytes
-                    .extend_from_slice(bytemuck::cast_slice(coordinates));
-            }
-            for n in 0..*count {
+        if let Some(count) = count {
+            for n in 0..count {
                 let location = 2 + n as u32;
                 let offset = 32 + n as u32 * 16;
                 stream.attributes.push(Attribute {
@@ -475,6 +438,12 @@ fn prepare_checked(
                     register: location,
                 });
             }
+        } else {
+            stream.attributes.push(Attribute {
+                location: 2,
+                offset: 32,
+                format: AttributeFormat::Float2,
+            });
         }
         (draw, vec![stream], inputs)
     };
@@ -510,15 +479,11 @@ fn prepare_checked(
                 .checked_add(size)
                 .filter(|v| *v <= 16 * 1024 * 1024)
                 .ok_or(INVALID)?;
-            let mut expanded = vec![0; size];
-            for v in 0..vertex_count as usize {
-                let at = v * stream.stride as usize;
-                for corner in 0..6 {
-                    let to = (v * 6 + corner) * stride;
-                    expanded[to..to + width].copy_from_slice(&stream.bytes[at..at + width]);
-                }
-            }
-            stream.bytes = expanded;
+            stream.bytes = std::mem::take(&mut stream.bytes).points(
+                vertex_count,
+                stream.stride as usize,
+                width,
+            );
             stream.stride = stride as u32;
         }
         vertex_count = vertex_count.checked_mul(6).ok_or(INVALID)?;
@@ -622,21 +587,17 @@ fn prepare_checked(
         }
     }
     let usage = [vt, pt].map(|t| t.map_or(Default::default(), |t| t.constants));
-    let mut pixel_constants = constants(&d.shaders.pixel_constants, usage[1]);
+    let mut extra = Vec::new();
     for (n, stage) in d.fixed.stage_slots.iter().enumerate() {
         if usage[1].registers[4] & (1 << (32 + n)) != 0 {
-            pixel_constants.bump_matrix[n] = [7, 8, 9, 10].map(|k| f32::from_bits(stage[&k]));
+            extra.push((288 + n, [7, 8, 9, 10].map(|k| stage[&k])));
         }
         if usage[1].registers[4] & (1 << (40 + n)) != 0 {
-            pixel_constants.bump_luminance[n] = [
-                f32::from_bits(stage[&22]),
-                f32::from_bits(stage[&23]),
-                0.,
-                0.,
-            ];
+            extra.push((296 + n, [stage[&22], stage[&23], 0, 0]));
         }
     }
-    let vertex_constants = constants(&d.shaders.vertex_constants, usage[0]);
+    let pixel_constants = d.shaders.pixel_constants.snapshot(usage[1], &extra);
+    let vertex_constants = d.shaders.vertex_constants.snapshot(usage[0], &[]);
     let key = ProgramKey {
         vertex: vs.as_ref().map(|s| s.id),
         pixel: ps.as_ref().map(|s| s.id),

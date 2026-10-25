@@ -14,7 +14,7 @@ impl ConstantUsage {
     pub fn set(&mut self, register: usize) {
         self.registers[register / 64] |= 1 << (register % 64);
     }
-    pub fn ranges(&self) -> impl Iterator<Item = std::ops::Range<usize>> + Clone {
+    pub fn ranges(&self) -> impl Iterator<Item = std::ops::Range<usize>> + Clone + use<> {
         self.registers
             .into_iter()
             .enumerate()

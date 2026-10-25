@@ -163,7 +163,7 @@ fn every_declaration_type_is_fetched_by_the_gpu_with_d3d_component_defaults() {
             program,
             streams: vec![
                 VertexStream {
-                    bytes: float(&[-1., 1., 0.5, 1., -1., -3., 0.5, 1., 3., 1., 0.5, 1.]),
+                    bytes: float(&[-1., 1., 0.5, 1., -1., -3., 0.5, 1., 3., 1., 0.5, 1.]).into(),
                     stride: 16,
                     attributes: vec![Attribute {
                         location: 0,
@@ -172,7 +172,7 @@ fn every_declaration_type_is_fetched_by_the_gpu_with_d3d_component_defaults() {
                     }],
                 },
                 VertexStream {
-                    bytes,
+                    bytes: bytes.into(),
                     stride: 0,
                     attributes: vec![Attribute {
                         location: 1,
@@ -183,8 +183,8 @@ fn every_declaration_type_is_fetched_by_the_gpu_with_d3d_component_defaults() {
             ],
             indices: None,
             vertex_count: 3,
-            vertex_constants: ConstantBlock::default(),
-            pixel_constants: ConstantBlock::default(),
+            vertex_constants: ConstantBlock::default().into(),
+            pixel_constants: ConstantBlock::default().into(),
             textures: vec![ProgramTexture {
                 image: None,
                 sampler: state.sampler,
@@ -287,7 +287,7 @@ fn fixed_pixel_stages_combine_a_second_texture_stage() {
     let draw = ProgrammableDraw {
         program,
         streams: vec![VertexStream {
-            bytes: bytemuck::cast_slice(&vertices).to_vec(),
+            bytes: bytemuck::cast_slice(&vertices).to_vec().into(),
             stride: 40,
             attributes: [
                 (0, 0, AttributeFormat::Float4),
@@ -303,8 +303,8 @@ fn fixed_pixel_stages_combine_a_second_texture_stage() {
         }],
         indices: None,
         vertex_count: 3,
-        vertex_constants: ConstantBlock::default(),
-        pixel_constants: ConstantBlock::default(),
+        vertex_constants: ConstantBlock::default().into(),
+        pixel_constants: ConstantBlock::default().into(),
         textures: images
             .map(|image| ProgramTexture {
                 image: Some(image),

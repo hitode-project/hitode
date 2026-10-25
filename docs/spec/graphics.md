@@ -85,7 +85,7 @@ Queued clear regions MUST retain their admission-time clip; subsequent drawing c
 **Rule**: D3D9 MUST validate recorded commands synchronously and flush before Present, readback, GPU waits, Reset, release, or recording limits. Busy continuations MUST resume the unexecuted suffix without replaying successful commands. Execution-time device failure MUST persist until Reset and be reported by Present or TestCooperativeLevel.
 **Verification**: Test
 
-Recorded programmable draws retain raw streams once, after consuming neutral inputs for bounds. Binding dependencies are cached until binding changes or resource destruction. Content writes resolve a slot once and index its current/base versions directly; retired slots can be reused.
+Recorded programmable draws capture guest streams and neutral geometry once, before the guest can mutate or release their sources. Immutable vertices and register snapshots are shared with bounds and sampling analysis. Backend byte packing and point expansion occur only when surviving commands execute. Binding dependencies are cached until binding changes or resource destruction. Content writes resolve a slot once and index its current/base versions directly; retired slots can be reused.
 
 Flush limits are 4096 commands or 64 MiB of upload and vertex data. Readback boundaries include GetRenderTargetData, GetFrontBufferData, GPU LockRect and GetDC; unsupported capture retains its ABI failure.
 
@@ -96,7 +96,7 @@ Flush limits are 4096 commands or 64 MiB of upload and vertex data. Readback bou
 
 Full clears replace previous dependencies; partial clears, draws and copies retain them. Upload admission assigns a fresh identity. A partial flush or a private presentation without the shared output prevents elision of that frame. DISCARD presentation may rotate independently reconstructible targets; destination-dependent frames preserve writable contents using an immutable GPU snapshot.
 Clear identities MUST include only the selected value and extent of each written color, depth or stencil component. Draws MUST read only the enabled depth/stencil tests.
-Fixed-state draw keys MAY be cached between mutations, but every mutable state access MUST invalidate the cached key.
+Fixed-state draw keys MAY be cached between mutations, but every mutable state access MUST invalidate the cached key. Fixed-state categories retain shared immutable maps and complete content keys. Identical map insertions preserve that category's key; arbitrary mutable access invalidates it.
 
 ### GFX-REC-3 Asynchronous pixel verification
 
@@ -145,14 +145,14 @@ transfers; state-block recording still captures unchanged setter membership.
 **Rule**: Translation MUST cache external register usage, excluding shader-local definitions. Fingerprints, copies and uploads MUST process only those ranges while preserving exact bits and uniform layout. Recording MUST retain complete xxh3-128 identities, and both backends MUST reserve aligned complete binding windows before writing.
 **Verification**: Test
 
-Usage includes implicit matrix rows, int/bool operands and legacy bump parameters. Relative float addressing covers all 256 float registers except local definitions. Constants, vertices, indices and pixels use 128-bit content keys. Insufficient storage wraps before the complete binding window exceeds the buffer. Packed wgpu uploads retain one queue write per buffer per batch. CPU damage interpretation agrees with complete constants.
+Usage includes implicit matrix rows, int/bool operands and legacy bump parameters. Relative float addressing covers all 256 float registers except local definitions. Constants, vertices, indices and pixels use 128-bit content keys. Insufficient storage wraps before the complete binding window exceeds the buffer. Packed wgpu uploads retain one queue write per buffer per batch. Immutable snapshots retain only used registers, reuse unchanged captures and serve CPU damage interpretation directly. Complete constant blocks are materialized only on demand; CPU interpretation agrees with complete constants.
 
 ### GFX-REC-8 Frontend work counters
 
 **Rule**: Diagnostic counter builds MUST report retained bytes and lookups per draw, entries per successful StateBlock Apply, and dead frame/pass eliminations. Ordinary builds MUST compile out work instrumentation.
 **Verification**: Test
 
-The diagnostic Cargo feature is `adv-dx/d3d9-counters`.
+The diagnostic Cargo feature is `adv-dx/d3d9-counters`. Retained payloads are counted per command, including shared snapshots; cumulative recorded bytes do not measure resident memory or memory traffic. Recording limits continue to use the logical upload size.
 
 ### GFX-REC-9 Dead target passes
 
@@ -222,8 +222,8 @@ The cap holds only the presenting context's next empty PeekMessage, so Present i
 
 Capture and Apply track versions per state category and inspect values only in
 changed categories. They copy only differing captured entries, preserving exact
-float bits, uncaptured state and COM ownership. An unchanged Capture reuses its
-snapshot storage; an unchanged Apply performs no state writes.
+float bits, uncaptured state and COM ownership. Capturing a complete state category shares its immutable map and content key. An unchanged Capture reuses its
+snapshot storage; an unchanged Apply performs no state writes. Applying only shader or buffer changes MUST preserve the fixed-state key cache.
 
 ## Vertex and raster input
 

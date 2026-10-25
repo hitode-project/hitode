@@ -2,7 +2,7 @@
 use super::*;
 use crate::shader::{
     Opcode, Register, RegisterKind, Shader, SourceModifier,
-    interpreter::{self, Constants, Outputs},
+    interpreter::{self, Outputs},
 };
 use adv_device::gpu::{Address, Filter, Sampler, Topology};
 
@@ -379,17 +379,10 @@ fn vertices(
     for n in 0..count {
         let mut output = if let Some(vertex) = vertex {
             let program = draw.programmable.as_ref()?;
-            let constants = Constants {
-                f: program.vertex_constants.floats,
-                i: program.vertex_constants.integers,
-                b: program.vertex_constants.booleans,
-                bump_matrix: program.vertex_constants.bump_matrix,
-                bump_luminance: program.vertex_constants.bump_luminance,
-            };
             interpreter::run(
                 vertex,
                 &vertex_input(program, n as u32)?,
-                &constants,
+                &program.vertex_constants,
                 &mut interpreter::NoTextures,
             )
             .ok()?

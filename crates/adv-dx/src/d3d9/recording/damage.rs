@@ -34,7 +34,7 @@ pub(super) fn bounds(env: &Env<'_>, device: &Device, operation: &Operation) -> R
     }
 }
 fn draw_bounds(env: &Env<'_>, device: &Device, d: &fixed::Draw) -> Option<Rect> {
-    use crate::shader::interpreter::{self, Constants, NoTextures};
+    use crate::shader::interpreter::{self, NoTextures};
     let mut positions = [[0.; 4]; 64];
     let count;
     let point = d.programmable.as_ref().filter(|p| p.parameters[2][3] != 0);
@@ -55,7 +55,7 @@ fn draw_bounds(env: &Env<'_>, device: &Device, d: &fixed::Draw) -> Option<Rect> 
             return None;
         }
         count = d.vertices.len();
-        for (out, v) in positions.iter_mut().zip(&d.vertices) {
+        for (out, v) in positions.iter_mut().zip(d.vertices.iter()) {
             *out = v.position;
         }
     } else {
@@ -66,17 +66,11 @@ fn draw_bounds(env: &Env<'_>, device: &Device, d: &fixed::Draw) -> Option<Rect> 
         count = p.vertex_count as usize;
         let shader = shaders::bound(env, device.shaders.vertex?)?;
         let translation = shader.translation.as_ref().ok()?;
-        let constants = Constants {
-            f: p.vertex_constants.floats,
-            i: p.vertex_constants.integers,
-            b: p.vertex_constants.booleans,
-            bump_matrix: p.vertex_constants.bump_matrix,
-            bump_luminance: p.vertex_constants.bump_luminance,
-        };
         for n in 0..p.vertex_count {
             let input = vertex_input(p, n)?;
             let output =
-                interpreter::run(&shader.parsed, &input, &constants, &mut NoTextures).ok()?;
+                interpreter::run(&shader.parsed, &input, &p.vertex_constants, &mut NoTextures)
+                    .ok()?;
             if point.is_some() && translation.writes_point_size {
                 margin = margin.max(1. + point_size(output.point_size)? * 0.5);
             }
@@ -136,15 +130,15 @@ fn vertex_input(
                 return None;
             }
             let mut v = [0., 0., 0., 1.];
-            let start = (n * stream.stride + a.offset) as usize;
-            for (component, bytes) in stream
-                .bytes
-                .get(start..start + a.format.size() as usize)?
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .enumerate()
-            {
+            let mut attribute = [0; 16];
+            let bytes = &mut attribute[..a.format.size() as usize];
+            stream.bytes.read_vertex(
+                n as usize,
+                stream.stride as usize,
+                a.offset as usize,
+                bytes,
+            )?;
+            for (component, bytes) in bytes.as_chunks::<4>().0.iter().enumerate() {
                 v[component] = f32::from_le_bytes(*bytes);
             }
             *input.v.get_mut(a.location as usize)? = v;

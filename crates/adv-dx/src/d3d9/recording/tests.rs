@@ -186,7 +186,8 @@ fn draw(f: &mut Fixture) -> fixed::Draw {
                 color: [0.25; 4],
                 uv: [0.; 2],
             },
-        ],
+        ]
+        .into(),
         texcoords: None,
         state: DrawState::new(16, 12),
         programmable: None,
@@ -353,6 +354,81 @@ fn busy_resumes_the_unexecuted_suffix_once_and_cancellation_releases_flush_owner
         assert_eq!(&f.pixels(&image)[..4], &[0x33, 0x22, 0x11, 0xff]);
         assert!(f.m.ext.get::<State>().pending.is_empty());
     }
+}
+
+// spec: GFX-REC-1, GFX-REC-2, GFX-REC-7
+#[test]
+fn repeated_programmable_frame_keeps_captures_without_backend_packing() {
+    let mut f = fixture();
+    let d = f.device;
+    let shader = f.packet([0xffff0200u32, 0x02000001, 0x800f0800, 0xa0e40000, 0xffff]);
+    let output = f.packet(0u32);
+    f.okay("IDirect3DDevice9::CreatePixelShader", &[d, shader, output]);
+    let shader = f.m.cpu.read_u32(output).unwrap();
+    f.okay("IDirect3DDevice9::SetPixelShader", &[d, shader]);
+    f.okay("IDirect3DDevice9::SetFVF", &[d, 0x44]);
+    f.okay("IDirect3DDevice9::SetRenderState", &[d, 22, 1]);
+    let color = f.packet([0.25f32, 0.5, 0.75, 1.]);
+    f.okay(
+        "IDirect3DDevice9::SetPixelShaderConstantF",
+        &[d, 0, color, 1],
+    );
+    for repeated in [false, true] {
+        let vertices = f.packet([
+            [
+                1f32.to_bits(),
+                1f32.to_bits(),
+                0,
+                1f32.to_bits(),
+                0xffffffff,
+            ],
+            [
+                15f32.to_bits(),
+                1f32.to_bits(),
+                0,
+                1f32.to_bits(),
+                0xffffffff,
+            ],
+            [
+                1f32.to_bits(),
+                11f32.to_bits(),
+                0,
+                1f32.to_bits(),
+                0xffffffff,
+            ],
+        ]);
+        clear(&mut f, 0xff000000);
+        f.okay("IDirect3DDevice9::BeginScene", &[d]);
+        f.okay(
+            "IDirect3DDevice9::DrawPrimitiveUP",
+            &[d, 4, 1, vertices, 20],
+        );
+        f.okay("IDirect3DDevice9::EndScene", &[d]);
+        let owner = id(&mut f);
+        let (bytes, constants) = {
+            let mut e = env(&mut f);
+            let recording = frame(&mut e, owner);
+            let Operation::Draw(draw) = recording.commands.last().unwrap() else {
+                panic!()
+            };
+            let p = draw.programmable.as_ref().unwrap();
+            (p.streams[0].bytes.clone(), p.pixel_constants.clone())
+        };
+        let retained = bytes.retained_bytes();
+        assert_eq!(constants.retained_bytes(), 16);
+        // Guest memory can change immediately after synchronous capture.
+        f.m.cpu.write(vertices, &[0; 60]).unwrap();
+        present(&mut f);
+        assert_eq!(constants.retained_bytes(), 16);
+        assert_eq!(
+            bytes.retained_bytes(),
+            retained + if repeated { 0 } else { bytes.len() }
+        );
+    }
+    assert_eq!(f.m.ext.get::<State>().frames.eliminated_frames, 1);
+    assert_eq!(f.m.ext.get::<Presents>().published, [1]);
+    let back = f.image(f.back);
+    assert_ne!(&f.pixels(&back)[(2 * 16 + 2) * 4..][..3], &[0, 0, 0]);
 }
 
 // spec: GFX-REC-2
@@ -828,7 +904,7 @@ fn programmable_draw(f: &mut Fixture) -> fixed::Draw {
             vec![false],
         ),
         streams: vec![VertexStream {
-            bytes: vec![0; 96],
+            bytes: vec![0; 96].into(),
             stride: 16,
             attributes: vec![Attribute {
                 location: 0,
@@ -838,8 +914,8 @@ fn programmable_draw(f: &mut Fixture) -> fixed::Draw {
         }],
         indices: Some(vec![0, 1, 2]),
         vertex_count: 6,
-        vertex_constants: ConstantBlock::default(),
-        pixel_constants: ConstantBlock::default(),
+        vertex_constants: ConstantBlock::default().into(),
+        pixel_constants: ConstantBlock::default().into(),
         textures: vec![ProgramTexture {
             image: None,
             sampler: state.sampler,
@@ -868,7 +944,7 @@ fn fingerprints_cover_program_constants_streams_indices_bindings_and_raw_vertice
     let fixed_key = fingerprint(&mut f, fixed);
     for n in 0..10 {
         let mut d = draw(&mut f);
-        let v = &mut d.vertices[0];
+        let v = &mut Arc::make_mut(&mut d.vertices)[0];
         if n < 4 {
             v.position[n] = f32::from_bits(v.position[n].to_bits() ^ 1);
         } else if n < 8 {
@@ -879,10 +955,10 @@ fn fingerprints_cover_program_constants_streams_indices_bindings_and_raw_vertice
         assert_ne!(fingerprint(&mut f, d), fixed_key);
     }
     let mut d = draw(&mut f);
-    d.texcoords = Some((1, vec![[0.; 4]; 3]));
+    d.texcoords = Some((1, vec![[0.; 4]; 3].into()));
     assert_ne!(fingerprint(&mut f, d), fixed_key);
     let mut d = programmable_draw(&mut f);
-    d.vertices[0].color[0] = 0.75;
+    Arc::make_mut(&mut d.vertices)[0].color[0] = 0.75;
     assert_eq!(
         fingerprint(&mut f, d),
         original,
@@ -890,14 +966,14 @@ fn fingerprints_cover_program_constants_streams_indices_bindings_and_raw_vertice
     );
     let extra = {
         let mut d = draw(&mut f);
-        d.texcoords = Some((1, vec![[0.; 4]; 3]));
+        d.texcoords = Some((1, vec![[0.; 4]; 3].into()));
         fingerprint(&mut f, d)
     };
     for n in 0..4 {
         let mut d = draw(&mut f);
         let mut v = vec![[0.; 4]; 3];
         v[0][n] = -0.0;
-        d.texcoords = Some((1, v));
+        d.texcoords = Some((1, v.into()));
         assert_ne!(fingerprint(&mut f, d), extra);
     }
     changed!(|d: &mut fixed::Draw| d.programmable.as_mut().unwrap().program.textures[0] = true);

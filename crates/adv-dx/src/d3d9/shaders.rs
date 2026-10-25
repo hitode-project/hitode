@@ -102,18 +102,100 @@ pub(super) struct Shader {
     pub translation: TranslationJob,
 }
 #[derive(Clone)]
-pub(super) struct Constants {
+pub(super) struct Registers {
     pub floats: [[f32; 4]; 256],
     pub integers: [[i32; 4]; 16],
     pub booleans: [i32; 16],
 }
-impl Default for Constants {
+impl Default for Registers {
     fn default() -> Self {
         Self {
             floats: [[0.; 4]; 256],
             integers: [[0; 4]; 16],
             booleans: [0; 16],
         }
+    }
+}
+#[derive(Default)]
+pub(super) struct Constants {
+    registers: Registers,
+    captured: std::sync::Mutex<Option<Captured>>,
+}
+#[derive(Clone)]
+struct Captured {
+    usage: adv_device::constants::ConstantUsage,
+    extra: Vec<(usize, [u32; 4])>,
+    snapshot: adv_device::gpu::ConstantSnapshot,
+    key: u128,
+}
+impl Clone for Constants {
+    fn clone(&self) -> Self {
+        Self {
+            registers: self.registers.clone(),
+            captured: std::sync::Mutex::new(self.captured.lock().unwrap().clone()),
+        }
+    }
+}
+impl std::ops::Deref for Constants {
+    type Target = Registers;
+    fn deref(&self) -> &Registers {
+        &self.registers
+    }
+}
+impl std::ops::DerefMut for Constants {
+    fn deref_mut(&mut self) -> &mut Registers {
+        *self.captured.get_mut().unwrap() = None;
+        &mut self.registers
+    }
+}
+impl Constants {
+    fn capture(
+        &self,
+        usage: adv_device::constants::ConstantUsage,
+        extra: &[(usize, [u32; 4])],
+    ) -> std::sync::MutexGuard<'_, Option<Captured>> {
+        let mut captured = self.captured.lock().unwrap();
+        if !captured
+            .as_ref()
+            .is_some_and(|c| c.usage == usage && c.extra == extra)
+        {
+            use std::hash::Hash;
+            let snapshot = adv_device::gpu::ConstantSnapshot::capture(usage, |n| match n {
+                0..256 => self.floats[n].map(f32::to_bits),
+                256..272 => self.integers[n - 256].map(|v| v as u32),
+                272..288 => [self.booleans[n - 272] as u32, 0, 0, 0],
+                _ => extra
+                    .iter()
+                    .find(|(index, _)| *index == n)
+                    .map_or([0; 4], |(_, v)| *v),
+            });
+            let mut h = xxhash_rust::xxh3::Xxh3::new();
+            for range in snapshot.ranges(usage) {
+                range.hash(&mut h);
+            }
+            let key = h.digest128();
+            *captured = Some(Captured {
+                usage,
+                extra: extra.to_vec(),
+                snapshot,
+                key,
+            });
+        }
+        captured
+    }
+    pub(super) fn snapshot(
+        &self,
+        usage: adv_device::constants::ConstantUsage,
+        extra: &[(usize, [u32; 4])],
+    ) -> adv_device::gpu::ConstantSnapshot {
+        self.capture(usage, extra)
+            .as_ref()
+            .unwrap()
+            .snapshot
+            .clone()
+    }
+    pub(super) fn key(&self, usage: adv_device::constants::ConstantUsage) -> u128 {
+        self.capture(usage, &[]).as_ref().unwrap().key
     }
 }
 #[derive(Clone, Default)]

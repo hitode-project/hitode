@@ -79,6 +79,45 @@ mod state_tests {
         assert_eq!(stage(env, pointer, 24), 0);
     }
 
+    // spec: GFX-REC-2, GFX-SHADER-4
+    #[test]
+    fn applying_only_constants_preserves_the_fixed_state_key() {
+        let mut machine = machine();
+        let mut env = env(&mut machine);
+        let (pointer, _, _, _) = super::super::super::tests::setup(&mut env);
+        assert_eq!(
+            super::super::shaders::stateblocks::create(
+                &mut env,
+                GuestPtr::new(pointer),
+                1,
+                GuestPtr::new(DATA)
+            ),
+            0
+        );
+        let block = env.cpu.read_u32(DATA).unwrap();
+        let key = device(&env, pointer).unwrap().fixed.key();
+        assert_eq!(
+            super::super::shaders::set_constants_direct(&mut env, pointer, 94, 0, &[0x3f; 16], 1),
+            0
+        );
+        assert_eq!(
+            super::super::shaders::stateblocks::apply(&mut env, GuestPtr::new(block)),
+            0
+        );
+        let d = device(&env, pointer).unwrap();
+        assert_eq!(d.fixed.key.get(), Some(key));
+        assert_eq!(d.shaders.vertex_constants.floats[0], [0.; 4]);
+        assert_eq!(call(&mut env, set_render_ABI, &[pointer, 22, 1]), 0);
+        device(&env, pointer).unwrap().fixed.key();
+        assert_eq!(
+            super::super::shaders::stateblocks::apply(&mut env, GuestPtr::new(block)),
+            0
+        );
+        let d = device(&env, pointer).unwrap();
+        assert_eq!(d.fixed.key.get(), None);
+        assert_eq!(d.fixed.key(), key);
+    }
+
     #[test]
     fn typed_neutral_defaults_bool_and_material_sources_roundtrip_without_side_effects() {
         let mut registry = Registry::default();
@@ -380,7 +419,7 @@ mod state_tests {
                     )
                     .unwrap();
                     assert_eq!(draw.state.last_pixel, last_pixel != 0);
-                    for vertex in draw.vertices {
+                    for vertex in draw.vertices.iter() {
                         assert_eq!(vertex.color, [128. / 255., 64. / 255., 32. / 255., 1.]);
                         assert_eq!(vertex.uv, [0.25, 0.75]);
                     }

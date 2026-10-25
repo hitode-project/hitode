@@ -105,31 +105,60 @@ pub(in crate::d3d9) fn fixed(f: &fixed::Fixed) -> u128 {
         clip_planes.map(|m| m.map(f32::to_bits)),
     ))
 }
-pub(super) fn content(env: &Env<'_>, id: Id, level: Option<u32>, aspect: u8) -> Content {
-    #[cfg(feature = "d3d9-counters")]
-    lookup(1);
-    match com(env).get_identity(&env.sys.objects, id) {
-        Some(Payload::Resource(r)) => {
-            let identity = r.container.unwrap_or(id);
-            #[cfg(feature = "d3d9-counters")]
-            lookup(1);
-            let pointer = match com(env).get_identity(&env.sys.objects, identity) {
-                Some(Payload::Resource(r)) => r.pointer,
-                _ => r.pointer,
-            };
-            Content(identity, level.unwrap_or(r.level), aspect, pointer)
+struct ResourceIdentity {
+    owner: Id,
+    pointer: u32,
+    level: u32,
+    levels: u32,
+}
+impl ResourceIdentity {
+    fn resolve(env: &Env<'_>, id: Id) -> Self {
+        #[cfg(feature = "d3d9-counters")]
+        lookup(1);
+        let com = com(env);
+        match com.get_identity(&env.sys.objects, id) {
+            Some(Payload::Resource(r)) => {
+                let owner = r.container.unwrap_or(id);
+                let pointer = if let Some(container) = r.container {
+                    #[cfg(feature = "d3d9-counters")]
+                    lookup(1);
+                    match com.get_identity(&env.sys.objects, container) {
+                        Some(Payload::Resource(parent)) => parent.pointer,
+                        _ => r.pointer,
+                    }
+                } else {
+                    r.pointer
+                };
+                Self {
+                    owner,
+                    pointer,
+                    level: r.level,
+                    levels: r.levels.len().max(1) as u32,
+                }
+            }
+            _ => Self {
+                owner: id,
+                pointer: 0,
+                level: 0,
+                levels: 1,
+            },
         }
-        _ => Content(id, level.unwrap_or(0), aspect, 0),
+    }
+    fn content(&self, level: Option<u32>, aspect: u8) -> Content {
+        Content(
+            self.owner,
+            level.unwrap_or(self.level),
+            aspect,
+            self.pointer,
+        )
     }
 }
+pub(super) fn content(env: &Env<'_>, id: Id, level: Option<u32>, aspect: u8) -> Content {
+    ResourceIdentity::resolve(env, id).content(level, aspect)
+}
 fn sample(env: &Env<'_>, id: Id, out: &mut Vec<Content>) {
-    #[cfg(feature = "d3d9-counters")]
-    lookup(1);
-    let count = match com(env).get_identity(&env.sys.objects, id) {
-        Some(Payload::Resource(r)) => r.levels.len().max(1),
-        _ => 1,
-    };
-    out.extend((0..count as u32).map(|n| content(env, id, Some(n), 0)));
+    let resource = ResourceIdentity::resolve(env, id);
+    out.extend((0..resource.levels).map(|n| resource.content(Some(n), 0)));
 }
 pub(super) struct Bindings {
     signature: (Option<Id>, Option<Id>, u64),
@@ -161,10 +190,11 @@ fn bind(env: &mut Env<'_>, owner: Id) -> Result<(), u32> {
     {
         sample(env, id, &mut samples);
     }
+    let depth = signature.1.map(|id| ResourceIdentity::resolve(env, id));
     let output = [
         signature.0.map(|id| content(env, id, None, 0)),
-        signature.1.map(|id| content(env, id, None, 1)),
-        signature.1.map(|id| content(env, id, None, 2)),
+        depth.as_ref().map(|r| r.content(None, 1)),
+        depth.as_ref().map(|r| r.content(None, 2)),
     ];
     #[cfg(feature = "d3d9-counters")]
     lookup(1);
@@ -414,7 +444,7 @@ pub(super) fn prepare(
     if let Operation::Draw(d) = &mut operation
         && d.programmable.is_some()
     {
-        d.vertices = Vec::new();
+        d.vertices = Arc::default();
         d.texcoords = None;
     }
     Ok(Prepared {

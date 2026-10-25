@@ -14,23 +14,11 @@ pub(super) use key::rect;
 pub(super) fn draw_key(env: &Env<'_>, pointer: u32) -> u128 {
     let d = device(env, pointer).unwrap();
     let constants = |id: Option<Id>, c: &shaders::Constants| {
-        use std::hash::Hash;
-        let mut h = xxhash_rust::xxh3::Xxh3::new();
-        if let Some(usage) = id
-            .and_then(|id| shaders::bound(env, id))
-            .and_then(|s| s.translation.as_ref().ok())
-            .map(|t| t.constants)
-        {
-            for n in usage.ranges().flat_map(|r| r.start / 16..r.end / 16) {
-                match n {
-                    0..256 => c.floats[n].map(f32::to_bits).hash(&mut h),
-                    256..272 => c.integers[n - 256].hash(&mut h),
-                    272..288 => c.booleans[n - 272].hash(&mut h),
-                    _ => {}
-                }
-            }
-        }
-        h.digest128()
+        c.key(
+            id.and_then(|id| shaders::bound(env, id))
+                .and_then(|s| s.translation.as_ref().ok())
+                .map_or(Default::default(), |t| t.constants),
+        )
     };
     hash((
         d.fixed.key(),
@@ -360,17 +348,13 @@ fn barrier_if_busy(
 fn accept(env: &mut Env<'_>, owner: Id, p: key::Prepared) -> Outcome {
     #[cfg(feature = "d3d9-counters")]
     let before = lookups();
-    if !matches!(
-        com(env).get_identity(&env.sys.objects, owner),
-        Some(Payload::Device(_))
-    ) {
+    #[cfg(feature = "d3d9-counters")]
+    lookup(1);
+    let Some(Payload::Device(d)) = com(env).get_identity(&env.sys.objects, owner) else {
         return Outcome::Return(INVALID);
-    }
-    let lost = matches!(com(env).get_identity(&env.sys.objects,owner),Some(Payload::Device(d)) if d.gpu_lost);
-    let limit = {
-        let f = frame(env, owner);
-        f.commands.len() + 1 >= 4096 || f.bytes + p.bytes >= 64 * 1024 * 1024
     };
+    let lost = d.gpu_lost;
+    let limit = d.frame.commands.len() + 1 >= 4096 || d.frame.bytes + p.bytes >= 64 * 1024 * 1024;
     // Ordinary admission unlocks immediately. A limit flush retains its lock
     // until execution, preserving the existing Busy API reservation.
     if (!limit || lost)
@@ -437,15 +421,21 @@ fn accept(env: &mut Env<'_>, owner: Id, p: key::Prepared) -> Outcome {
     f.key = hash((f.key, command));
     #[cfg(feature = "d3d9-counters")]
     let work = matches!(p.operation, Operation::Draw(_)).then_some((
-        (p.bytes
-            + passes::Plan::bytes(p.reads.len(), p.writes.len())
+        (passes::Plan::bytes(p.reads.len(), p.writes.len())
             + std::mem::size_of::<Operation>()
             + match &p.operation {
-                Operation::Draw(d) => d
-                    .programmable
-                    .as_ref()
-                    .map_or(0, |p| std::mem::size_of_val(p.as_ref())),
-                _ => 0,
+                Operation::Draw(d) => d.programmable.as_ref().map_or(p.bytes, |draw| {
+                    p.bytes - draw.streams.iter().map(|s| s.bytes.len()).sum::<usize>()
+                        + std::mem::size_of_val(draw.as_ref())
+                        + draw.vertex_constants.retained_bytes()
+                        + draw.pixel_constants.retained_bytes()
+                        + draw
+                            .streams
+                            .iter()
+                            .map(|s| s.bytes.retained_bytes())
+                            .sum::<usize>()
+                }),
+                _ => p.bytes,
             }) as u64,
         p.lookups + lookups() - before,
     ));

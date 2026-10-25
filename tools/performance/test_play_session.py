@@ -23,6 +23,7 @@ DIAGNOSTICS = (
 
 
 class FakeProcess:
+    pid = 123
     def __init__(self):
         self.stdout = io.StringIO("control ok key-up 17\n")
         self.stdin = io.StringIO()
@@ -37,6 +38,29 @@ class FakeProcess:
 
 
 class PlaySessionTests(unittest.TestCase):
+    def test_process_usage_keeps_cpu_seconds_separate_from_elapsed_time(self):
+        def read(pid, flavor, pointer):
+            self.assertEqual((pid, flavor), (123, 0))
+            pointer._obj.user_time = 108_000_000
+            pointer._obj.system_time = 6_000_000
+            pointer._obj.resident = 16384
+            pointer._obj.footprint = 12288
+            return 0
+
+        with patch("play_session.sys.platform", "darwin"), patch("play_session.ctypes.CDLL") as library:
+            library.return_value.proc_pid_rusage = read
+            def timebase(pointer):
+                pointer._obj[0], pointer._obj[1] = 125, 3
+                return 0
+            library.return_value.mach_timebase_info = timebase
+            usage = play_session.process_usage(123)
+            self.assertAlmostEqual(usage["user_seconds"], 4.5)
+            self.assertAlmostEqual(usage["system_seconds"], 0.25)
+            self.assertEqual(usage["resident_bytes"], 16384)
+            self.assertEqual(usage["footprint_bytes"], 12288)
+        with patch("play_session.sys.platform", "win32"):
+            self.assertIsNone(play_session.process_usage(123))
+
     def test_failure_preserves_the_frozen_scene_before_final_close(self):
         commands = []
         play_session.preserve_failure(commands.append, Path("fixture"))

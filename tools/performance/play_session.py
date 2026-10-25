@@ -29,6 +29,7 @@ imports a previous local archive into the new overlay. --cold clears both caches
 from __future__ import annotations
 
 import argparse
+import ctypes
 import hashlib
 import json
 import math
@@ -41,6 +42,38 @@ import subprocess
 import sys
 import threading
 import time
+
+
+class _MacUsage(ctypes.Structure):
+    # rusage_info_v0 from sys/resource.h; CPU times use Mach absolute ticks.
+    _fields_ = [("uuid", ctypes.c_uint8 * 16)] + [
+        (name, ctypes.c_uint64) for name in (
+            "user_time", "system_time", "idle_wakes", "interrupt_wakes", "pageins",
+            "wired", "resident", "footprint", "started", "exited",
+        )
+    ]
+
+
+def process_usage(pid):
+    """Cumulative macOS process CPU and memory; None when unavailable."""
+    if sys.platform != "darwin":
+        return None
+    function = ctypes.CDLL("/usr/lib/libproc.dylib").proc_pid_rusage
+    function.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+    function.restype = ctypes.c_int
+    usage = _MacUsage()
+    if function(pid, 0, ctypes.byref(usage)):
+        return None
+    timebase = (ctypes.c_uint32 * 2)()
+    basis = ctypes.CDLL("/usr/lib/libSystem.B.dylib").mach_timebase_info
+    basis.argtypes = [ctypes.c_void_p]
+    basis.restype = ctypes.c_int
+    if basis(ctypes.byref(timebase)):
+        return None
+    seconds_per_tick = timebase[0] / timebase[1] / 1e9
+    return {"user_seconds": usage.user_time * seconds_per_tick,
+            "system_seconds": usage.system_time * seconds_per_tick,
+            "resident_bytes": usage.resident, "footprint_bytes": usage.footprint}
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "android"))
@@ -293,6 +326,10 @@ def run(args: argparse.Namespace) -> None:
                     name = step["checkpoint"]
                     if scene and "await" in step:
                         gate_ack = send(await_command(step["await"]), step["await"]["timeout_ms"] / 1000 + 30)
+                    usage = process_usage(process.pid)
+                    if usage is not None:
+                        usage["wall_seconds"] = time.monotonic() - start
+                        (output / f"{name}.process.json").write_text(json.dumps(usage), encoding="utf-8")
                     report_path = output / f"{name}.json"
                     send(f"report {report_path}")
                     report = json.loads(report_path.read_text(encoding="utf-8"))

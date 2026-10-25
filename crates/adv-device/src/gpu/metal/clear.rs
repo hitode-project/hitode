@@ -21,7 +21,7 @@ impl Gpu {
         let draw = ProgrammableDraw {
             program: program.clone(),
             streams: vec![VertexStream {
-                bytes: bytemuck::cast_slice(vertices).to_vec(),
+                bytes: bytemuck::cast_slice(vertices).to_vec().into(),
                 stride: std::mem::size_of::<Vertex>() as u32,
                 attributes: vec![
                     Attribute {
@@ -38,8 +38,8 @@ impl Gpu {
             }],
             indices: None,
             vertex_count: vertices.len() as u32,
-            vertex_constants: ConstantBlock::default(),
-            pixel_constants: ConstantBlock::default(),
+            vertex_constants: ConstantBlock::default().into(),
+            pixel_constants: ConstantBlock::default().into(),
             textures: vec![],
             parameters: [[0; 4]; 40],
         };

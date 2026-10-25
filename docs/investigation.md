@@ -208,6 +208,7 @@ python tools/survey/module_profile.py <module> [--json <out>]
 - `--schedule-profile <run>/schedule.tsv` with `analyze_schedule.py` covers scheduling, locks and long frames. `--host-profile <csv>` gives API service time.
 - `ADV_LOOP_COVERAGE=1` with `--report` writes `*.loops.tsv` for `loop_coverage.py`. It ranks by instruction weight, not time.
 - `ADV_INTERP_PROFILE=<file>` profiles the interpreter.
+- On macOS, `play_session.py` writes cumulative process CPU time and memory to each checkpoint's `*.process.json`. Subtract CPU time and `wall_seconds` between checkpoints for whole-process core usage; 1.0 means one fully occupied core.
 - Checkpoint reports of `--frame-budget` and `--host-profile` carry cumulative `host_services_csv`. Subtract two checkpoints for the service time and count of a fixed segment; it includes handlers and continuations and excludes guest callbacks and waits.
 - In code cache reports, `load_ns` covers reading, checking and parsing the archive, and `restore_ns` covers relocation and publication after a hit. Neither is pure disk I/O.
 

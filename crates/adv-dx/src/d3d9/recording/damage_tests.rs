@@ -14,7 +14,8 @@ fn quad(f: &mut Fixture, x: f32, color: [f32; 4]) -> fixed::Draw {
         color,
         uv: [0.; 2],
     })
-    .to_vec();
+    .to_vec()
+    .into();
     d
 }
 fn bounds(f: &mut Fixture, d: fixed::Draw) -> Rect {
@@ -145,7 +146,7 @@ fn check_sparse_constants(verify: bool) {
                 &Operation::Draw(fixed::Draw {
                     target: d.target.clone(),
                     image: d.image.clone(),
-                    vertices: vec![],
+                    vertices: Arc::default(),
                     texcoords: None,
                     state: d.state,
                     programmable: Some(full.clone()),
@@ -276,10 +277,11 @@ fn bounds_cover_pretransformed_fixed_pipeline_and_conservative_fallbacks() {
         h: 12,
     };
     let mut d = quad(&mut f, 2., [1.; 4]);
-    d.vertices[0].position[3] = 0.;
+    Arc::make_mut(&mut d.vertices)[0].position[3] = 0.;
     assert_eq!(bounds(&mut f, d), full);
     let mut d = quad(&mut f, 2., [1.; 4]);
-    d.vertices.resize(65, d.vertices[0]);
+    let first = d.vertices[0];
+    Arc::make_mut(&mut d.vertices).resize(65, first);
     assert_eq!(bounds(&mut f, d), full);
     let mut d = quad(&mut f, 2., [1.; 4]);
     d.state.scissor = Some(Rect {
@@ -507,7 +509,8 @@ fn clipped_partial_attachment_clears_preserve_values_seen_by_a_larger_target() {
                 },
                 uv: [0.; 2],
             })
-            .to_vec();
+            .to_vec()
+            .into();
             if stencil {
                 let face = StencilFace {
                     compare: Compare::Equal,
@@ -750,7 +753,7 @@ fn shader_bounds_use_float_inputs_and_fall_back_for_nonfloat_or_unavailable_exec
     f.okay("IDirect3DDevice9::SetVertexShader", &[f.device, shader]);
     let make = |f: &mut Fixture| {
         let mut d = programmable_draw(f);
-        d.vertices.clear();
+        Arc::make_mut(&mut d.vertices).clear();
         let p = d.programmable.as_mut().unwrap();
         p.vertex_count = 3;
         p.streams[0].bytes = bytemuck::cast_slice(&[
@@ -758,7 +761,8 @@ fn shader_bounds_use_float_inputs_and_fall_back_for_nonfloat_or_unavailable_exec
             [0., 0.5, 0., 1.],
             [-0.5, 0., 0., 1.],
         ])
-        .to_vec();
+        .to_vec()
+        .into();
         d
     };
     let d = make(&mut f);
@@ -1142,7 +1146,8 @@ fn local_damage_crosses_scaled_copy_and_fixed_or_shader_composition_exactly() {
                         color: [1.; 4],
                         uv: [if flipped { 1. - x / 16. } else { x / 16. }, y / 12.],
                     })
-                    .to_vec();
+                    .to_vec()
+                    .into();
                     if shader {
                         f.okay("IDirect3DDevice9::SetPixelShader", &[f.device, ps]);
                         f.okay(

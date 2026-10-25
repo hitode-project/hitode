@@ -7,6 +7,8 @@ use adv_device::gpu::{
 };
 use adv_device::surface::Rect;
 mod input;
+mod state_map;
+use state_map::StateMap;
 
 pub(super) struct CachedFixed {
     state: Fixed,
@@ -44,11 +46,11 @@ impl std::ops::DerefMut for CachedFixed {
 #[derive(Clone)]
 pub(super) struct Fixed {
     pub(super) fvf: u32,
-    pub(super) render: BTreeMap<i32, u32>,
-    pub(super) stage: BTreeMap<i32, u32>,
-    pub(super) stage_slots: [BTreeMap<i32, u32>; 8],
-    pub(super) sampler: BTreeMap<i32, u32>,
-    pub(super) sampler_slots: [BTreeMap<i32, u32>; 20],
+    pub(super) render: StateMap,
+    pub(super) stage: StateMap,
+    pub(super) stage_slots: [StateMap; 8],
+    pub(super) sampler: StateMap,
+    pub(super) sampler_slots: [StateMap; 20],
     pub(super) viewport: D3DVIEWPORT9,
     pub(super) scissor: RECT,
     pub(super) transforms: [[f32; 16]; 3],
@@ -116,8 +118,8 @@ impl Layout {
 pub(super) struct Draw {
     pub target: Target,
     pub image: Option<Image>,
-    pub vertices: Vec<Vertex>,
-    pub texcoords: Option<(usize, Vec<[f32; 4]>)>,
+    pub vertices: Arc<Vec<Vertex>>,
+    pub texcoords: Option<(usize, Arc<Vec<[f32; 4]>>)>,
     pub state: DrawState,
     pub programmable: Option<Box<adv_device::gpu::ProgrammableDraw>>,
     pub recording_key: u128,
@@ -242,7 +244,7 @@ impl Fixed {
         ];
         Self {
             fvf: 0,
-            render: BTreeMap::from([
+            render: StateMap::from(BTreeMap::from([
                 (7, 0),
                 (8, 3), // FILLMODE: only solid rasterization is implemented.
                 (9, 2), // SHADEMODE: the shared shader interpolates vertex colors.
@@ -309,7 +311,7 @@ impl Fixed {
                 (207, 2),
                 (208, 1),
                 (209, 1),
-            ]),
+            ])),
             stage_slots: std::array::from_fn(|stage| {
                 let mut states =
                     BTreeMap::from([(7, 0), (8, 0), (9, 0), (10, 0), (22, 0), (23, 0)]);
@@ -318,9 +320,9 @@ impl Fixed {
                     // TEXCOORDINDEX defaults to the stage's own coordinate set.
                     states.insert(11, stage as u32);
                 }
-                states
+                states.into()
             }),
-            stage: BTreeMap::from([
+            stage: StateMap::from(BTreeMap::from([
                 (1, 4),
                 (2, 2),
                 (3, 1),
@@ -329,9 +331,9 @@ impl Fixed {
                 (6, 1),
                 (11, 0), // TEXCOORDINDEX: pass through the first FVF coordinate set.
                 (24, 0), // TEXTURETRANSFORMFLAGS: no texture coordinate transform.
-            ]),
-            sampler: sampler.clone(),
-            sampler_slots: std::array::from_fn(|_| sampler.clone()),
+            ])),
+            sampler: sampler.clone().into(),
+            sampler_slots: std::array::from_fn(|_| sampler.clone().into()),
             viewport: D3DVIEWPORT9 {
                 X: 0,
                 Y: 0,
@@ -1258,8 +1260,8 @@ fn prepare_input_checked(
     Ok(Draw {
         target,
         image,
-        vertices,
-        texcoords: texcoords.map(|values| (coordinate_count, values)),
+        vertices: vertices.into(),
+        texcoords: texcoords.map(|values| (coordinate_count, values.into())),
         state,
         programmable: None,
         recording_key: super::recording::hash((

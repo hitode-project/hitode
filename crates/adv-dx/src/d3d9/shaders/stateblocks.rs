@@ -106,28 +106,24 @@ impl Snapshot {
         Some(Self {
             fixed: fixed::Fixed {
                 fvf: d.fixed.fvf,
-                render: mask
-                    .render
-                    .iter()
-                    .map(|&i| (i, d.fixed.render[&i]))
-                    .collect(),
-                stage: mask.stage.iter().map(|&i| (i, d.fixed.stage[&i])).collect(),
+                render: d.fixed.render.capture(&mask.render),
+                stage: d.fixed.stage.capture(&mask.stage),
                 stage_slots: std::array::from_fn(|slot| {
-                    mask.stage_slots
+                    let keys = mask
+                        .stage_slots
                         .range((slot, i32::MIN)..=(slot, i32::MAX))
-                        .map(|&(_, i)| (i, d.fixed.stage_slots[slot][&i]))
-                        .collect()
+                        .map(|&(_, i)| i)
+                        .collect();
+                    d.fixed.stage_slots[slot].capture(&keys)
                 }),
-                sampler: mask
-                    .sampler
-                    .iter()
-                    .map(|&i| (i, d.fixed.sampler[&i]))
-                    .collect(),
+                sampler: d.fixed.sampler.capture(&mask.sampler),
                 sampler_slots: std::array::from_fn(|slot| {
-                    mask.sampler_slots
+                    let keys = mask
+                        .sampler_slots
                         .range((slot, i32::MIN)..=(slot, i32::MAX))
-                        .map(|&(_, i)| (i, d.fixed.sampler_slots[slot][&i]))
-                        .collect()
+                        .map(|&(_, i)| i)
+                        .collect();
+                    d.fixed.sampler_slots[slot].capture(&keys)
                 }),
                 viewport: d.fixed.viewport,
                 scissor: d.fixed.scissor,
@@ -816,7 +812,7 @@ pub(in crate::d3d9) fn capture(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
     };
     transfer(
         (
-            &mut old.fixed,
+            || &mut old.fixed,
             &mut old.shaders,
             &mut old.buffers,
             &mut old.texture,
@@ -874,7 +870,12 @@ pub(in crate::d3d9) fn apply(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
         return INVALID;
     };
     transfer(
-        (&mut d.fixed, &mut d.shaders, &mut d.buffers, &mut d.texture),
+        (
+            || &mut *d.fixed,
+            &mut d.shaders,
+            &mut d.buffers,
+            &mut d.texture,
+        ),
         (
             &snapshot.fixed,
             &snapshot.shaders,
@@ -905,9 +906,9 @@ pub(in crate::d3d9) fn apply(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
     release_changes(env, &changes);
     0
 }
-fn transfer(
+fn transfer<'a>(
     target: (
-        &mut fixed::Fixed,
+        impl FnOnce() -> &'a mut fixed::Fixed,
         &mut Bindings,
         &mut buffers::Bindings,
         &mut Option<Id>,
@@ -933,9 +934,6 @@ fn transfer(
         &source_shaders.pixel_constants,
         &mask.pixel_constants,
     );
-    if mask.fvf {
-        fixed.fvf = source_fixed.fvf;
-    }
     if mask.declaration {
         buffers.declaration = source_buffers.declaration;
     }
@@ -951,32 +949,48 @@ fn transfer(
     for &slot in &mask.textures {
         shaders.textures[slot] = source_shaders.textures[slot];
     }
-    for &i in &mask.render {
-        fixed.render.insert(i, source_fixed.render[&i]);
-    }
-    for &i in &mask.stage {
-        fixed.stage.insert(i, source_fixed.stage[&i]);
-    }
-    for &(slot, i) in &mask.stage_slots {
-        fixed.stage_slots[slot].insert(i, source_fixed.stage_slots[slot][&i]);
-    }
-    for &i in &mask.sampler {
-        fixed.sampler.insert(i, source_fixed.sampler[&i]);
-    }
-    for &(slot, i) in &mask.sampler_slots {
-        fixed.sampler_slots[slot].insert(i, source_fixed.sampler_slots[slot][&i]);
-    }
-    if mask.viewport {
-        fixed.viewport = source_fixed.viewport;
-    }
-    if mask.scissor {
-        fixed.scissor = source_fixed.scissor;
-    }
-    for &i in &mask.transforms {
-        fixed.transforms[i] = source_fixed.transforms[i];
-    }
-    for &i in &mask.clip_planes {
-        fixed.clip_planes[i] = source_fixed.clip_planes[i];
+    if mask.fvf
+        || mask.viewport
+        || mask.scissor
+        || !mask.render.is_empty()
+        || !mask.stage.is_empty()
+        || !mask.stage_slots.is_empty()
+        || !mask.sampler.is_empty()
+        || !mask.sampler_slots.is_empty()
+        || !mask.transforms.is_empty()
+        || !mask.clip_planes.is_empty()
+    {
+        let fixed = fixed();
+        if mask.fvf {
+            fixed.fvf = source_fixed.fvf;
+        }
+        for &i in &mask.render {
+            fixed.render.insert(i, source_fixed.render[&i]);
+        }
+        for &i in &mask.stage {
+            fixed.stage.insert(i, source_fixed.stage[&i]);
+        }
+        for &(slot, i) in &mask.stage_slots {
+            fixed.stage_slots[slot].insert(i, source_fixed.stage_slots[slot][&i]);
+        }
+        for &i in &mask.sampler {
+            fixed.sampler.insert(i, source_fixed.sampler[&i]);
+        }
+        for &(slot, i) in &mask.sampler_slots {
+            fixed.sampler_slots[slot].insert(i, source_fixed.sampler_slots[slot][&i]);
+        }
+        if mask.viewport {
+            fixed.viewport = source_fixed.viewport;
+        }
+        if mask.scissor {
+            fixed.scissor = source_fixed.scissor;
+        }
+        for &i in &mask.transforms {
+            fixed.transforms[i] = source_fixed.transforms[i];
+        }
+        for &i in &mask.clip_planes {
+            fixed.clip_planes[i] = source_fixed.clip_planes[i];
+        }
     }
 }
 #[derive(Clone, Copy)]
@@ -1159,7 +1173,8 @@ mod tests {
             panic!()
         };
         let fixed = &mut *d.fixed;
-        fixed.render.insert(7, 1 - fixed.render[&7]);
+        let z_enable = 1 - fixed.render[&7];
+        fixed.render.insert(7, z_enable);
         d.versions[0] += 1;
         assert_eq!(apply(&mut env, this), 0);
         assert_eq!(apply(&mut env, this), 0);
@@ -1210,7 +1225,8 @@ mod tests {
             panic!()
         };
         let fixed = &mut *d.fixed;
-        fixed.render.insert(7, 1 - fixed.render[&7]);
+        let z_enable = 1 - fixed.render[&7];
+        fixed.render.insert(7, z_enable);
         d.versions[0] += 1;
         let b = block(&env, this.addr()).unwrap();
         let d = device(&env, pointer).unwrap();
@@ -1271,7 +1287,12 @@ mod tests {
             panic!()
         };
         transfer(
-            (&mut d.fixed, &mut d.shaders, &mut d.buffers, &mut d.texture),
+            (
+                || &mut *d.fixed,
+                &mut d.shaders,
+                &mut d.buffers,
+                &mut d.texture,
+            ),
             (
                 &snapshot.fixed,
                 &snapshot.shaders,

@@ -4,12 +4,15 @@
 //! autoreleased temporaries on the calling thread.
 use crate::surface::Rect;
 mod clear;
+mod constant_snapshot;
+pub use constant_snapshot::ConstantSnapshot;
 pub mod compile;
 mod depth;
 mod line;
 mod programmable;
 mod renderer;
 mod submission;
+mod vertex_bytes;
 use depth::DeferredClear;
 pub use depth::{Depth, DepthFormat, Stencil, StencilFace, StencilOp};
 pub use programmable::{
@@ -22,6 +25,7 @@ pub use renderer::Submission;
 pub use renderer::validate_program;
 pub use renderer::{Gpu, Image, NativeContext, NativeFrame, Readback, Staged, Target};
 pub use submission::SubmissionPause;
+pub use vertex_bytes::VertexBytes;
 #[derive(Clone, Copy, Debug)]
 pub enum GpuBackend {
     Automatic,

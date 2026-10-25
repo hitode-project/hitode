@@ -38,6 +38,28 @@ impl Default for Constants {
         }
     }
 }
+/// Read-only constants shared by scalar analysis and the GPU command.
+pub trait ConstantSource {
+    fn register(&self, n: usize) -> [u32; 4];
+}
+impl ConstantSource for Constants {
+    fn register(&self, n: usize) -> [u32; 4] {
+        match n {
+            0..256 => self.f[n].map(f32::to_bits),
+            256..272 => self.i[n - 256].map(|v| v as u32),
+            272..288 => self.b[n - 272].map(|v| v as u32),
+            288..296 => self.bump_matrix[n - 288].map(f32::to_bits),
+            296..304 => self.bump_luminance[n - 296].map(f32::to_bits),
+            _ => [0; 4],
+        }
+    }
+}
+#[cfg(feature = "gpu")]
+impl ConstantSource for adv_device::gpu::ConstantSnapshot {
+    fn register(&self, n: usize) -> [u32; 4] {
+        self.register(n)
+    }
+}
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Outputs {
     pub position: Vec4,
@@ -62,8 +84,7 @@ impl Sampler for NoTextures {
         Err("texture oracle unavailable".into())
     }
 }
-#[derive(Clone)]
-struct State {
+struct State<'a, C> {
     r: [Vec4; 32],
     t: [Vec4; 8],
     a: Vec4,
@@ -74,11 +95,34 @@ struct State {
     o: [Vec4; 12],
     oc: [Vec4; 2],
     depth: f32,
-    constants: Constants,
+    constants: &'a C,
+    definitions: &'a [(Register, [u32; 4])],
     matrix: [f32; 3],
     matrix_n: usize,
 }
-impl State {
+impl<C> Copy for State<'_, C> {}
+impl<C> Clone for State<'_, C> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<C: ConstantSource> State<'_, C> {
+    fn constant(&self, kind: RegisterKind, n: usize) -> [u32; 4] {
+        let (offset, count) = match kind {
+            RegisterKind::Float => (0, 256),
+            RegisterKind::Int => (256, 16),
+            RegisterKind::Bool => (272, 16),
+            _ => unreachable!(),
+        };
+        if n >= count {
+            return [0; 4];
+        }
+        self.definitions
+            .iter()
+            .rev()
+            .find(|(r, _)| r.kind == kind && r.index as usize == n)
+            .map_or_else(|| self.constants.register(offset + n), |(_, value)| *value)
+    }
     fn index(&self, r: Register, rel: Option<Relative>, offset: u16) -> i32 {
         i32::from(r.index)
             .wrapping_add(i32::from(offset))
@@ -100,7 +144,7 @@ impl State {
         match r.kind {
             Temp => self.r.get(n).copied().unwrap_or_default(),
             Input => input.v.get(n).copied().unwrap_or_default(),
-            Float => self.constants.f.get(n).copied().unwrap_or_default(),
+            Float => self.constant(Float, n).map(f32::from_bits),
             Address => {
                 if n == 0 && rel.is_none() {
                     self.a
@@ -111,20 +155,8 @@ impl State {
             RasterOutput => self.ro.get(n).copied().unwrap_or_default(),
             ColorOutputLegacy => self.od.get(n).copied().unwrap_or_default(),
             Output => self.o.get(n).copied().unwrap_or_default(),
-            Int => self
-                .constants
-                .i
-                .get(n)
-                .copied()
-                .unwrap_or_default()
-                .map(|x| x as f32),
-            Bool => self
-                .constants
-                .b
-                .get(n)
-                .copied()
-                .unwrap_or_default()
-                .map(|x| x as f32),
+            Int => self.constant(Int, n).map(|v| v as i32 as f32),
+            Bool => self.constant(Bool, n).map(|v| v as i32 as f32),
             ColorOutput => self.oc.get(n).copied().unwrap_or_default(),
             DepthOutput => [self.depth; 4],
             Loop => [self.al as f32; 4],
@@ -237,12 +269,25 @@ impl State {
 /// Run one invocation. Keep the accepted semantic boundary identical to
 /// translation: callers run only shaders whose (cached) translation succeeded,
 /// since translating here would repeat it for every vertex.
-pub fn run(
+pub fn run<C: ConstantSource>(
     shader: &Shader,
     input: &Inputs,
-    constants: &Constants,
+    constants: &C,
     sampler: &mut dyn Sampler,
 ) -> Result<Outputs, Error> {
+    let definitions: Vec<_> = shader
+        .instructions
+        .iter()
+        .filter_map(|ins| {
+            let destination = ins.destination.as_ref()?;
+            let value = match ins.opcode {
+                Opcode::Def | Opcode::Defi => ins.immediate.as_slice().try_into().unwrap(),
+                Opcode::Defb => [u32::from(ins.immediate[0] != 0); 4],
+                _ => return None,
+            };
+            Some((destination.register, value))
+        })
+        .collect();
     let mut st = State {
         r: [[0.0; 4]; 32],
         t: input.t,
@@ -254,35 +299,17 @@ pub fn run(
         o: [[0.0; 4]; 12],
         oc: [[0.0; 4]; 2],
         depth: 0.0,
-        constants: constants.clone(),
+        constants,
+        definitions: &definitions,
         matrix: [0.0; 3],
         matrix_n: 0,
     };
-    for ins in &shader.instructions {
-        if let Some(d) = &ins.destination {
-            match ins.opcode {
-                Opcode::Def => {
-                    st.constants.f[d.register.index as usize] =
-                        std::array::from_fn(|i| f32::from_bits(ins.immediate[i]))
-                }
-                Opcode::Defi => {
-                    st.constants.i[d.register.index as usize] =
-                        std::array::from_fn(|i| ins.immediate[i] as i32)
-                }
-                Opcode::Defb => {
-                    st.constants.b[d.register.index as usize] =
-                        [i32::from(ins.immediate[0] != 0); 4]
-                }
-                _ => {}
-            }
-        }
-    }
     let mut pc = 0usize;
     let mut steps = 0;
     let mut calls = Vec::new();
     let mut loops: Vec<(i32, i32, i32)> = Vec::new();
     let mut discarded = false;
-    let mut snapshot = st.clone();
+    let mut snapshot = st;
     while pc < shader.instructions.len() {
         if steps >= MAX_EXECUTION_STEPS {
             return Err(Error::new(
@@ -302,7 +329,7 @@ pub fn run(
             continue;
         }
         if !ins.coissue {
-            snapshot = st.clone();
+            snapshot = st;
         }
         let reader = if ins.coissue { &snapshot } else { &st };
         let v: Vec<Vec4> = ins
@@ -641,7 +668,7 @@ pub fn run(
             Texbem | Texbeml | Bem => {
                 let d = ins.destination.as_ref().expect("bump");
                 let n = d.register.index as usize;
-                let m = st.constants.bump_matrix[n];
+                let m = st.constants.register(288 + n).map(f32::from_bits);
                 let (base, perturb) = if ins.opcode == Bem {
                     (a, b)
                 } else {
@@ -660,7 +687,7 @@ pub fn run(
                         .sample(n as u8, coord, 0)
                         .map_err(|e| Error::new(ins.offset, e))?;
                     if ins.opcode == Texbeml {
-                        let lum = st.constants.bump_luminance[n];
+                        let lum = st.constants.register(296 + n).map(f32::from_bits);
                         for x in &mut sampled {
                             *x *= perturb[2] * lum[0] + lum[1];
                         }
