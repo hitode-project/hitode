@@ -19,42 +19,94 @@ use iced_x86::{Decoder, DecoderOptions, FlowControl, OpKind};
 
 use crate::identity::{self, Images};
 
+mod crt;
 mod dib;
 mod mixer;
+mod nls;
 
 /// The module the bodies' thunks are registered under.
 pub const MODULE: &str = "hitode.native";
 
 struct Body {
     /// The image and function, which also names the thunk.
-    name: &'static str,
+    name: std::borrow::Cow<'static, str>,
     conv: Conv,
     leaf: EnvLeafHandler,
     handler: adv_machine::Handler,
 }
 
-const BODIES: &[Body] = &[
-    // Wine's i386 memcpy copies byte by byte and allows overlap, as
-    // memmove does, which jumps to it.
-    Body {
-        name: "ntdll.dll!memcpy",
-        conv: Conv::Cdecl { argc: 3 },
-        leaf: memmove,
-        handler: resume_original,
-    },
-    Body {
-        name: "dsound.dll!DSOUND_MixToPrimary",
-        conv: Conv::Cdecl { argc: 6 },
-        leaf: mixer::mix,
-        handler: mixer::resume,
-    },
-    Body {
-        name: "ntdll.dll!NtQueryPerformanceCounter",
-        conv: Conv::Stdcall { argc: 2 },
-        leaf: query_performance_counter,
-        handler: resume_original,
-    },
-];
+static BODIES: std::sync::LazyLock<Vec<Body>> = std::sync::LazyLock::new(|| {
+    let mut bodies = vec![
+        Body {
+            name: "ntdll.dll!memcpy".into(),
+            conv: Conv::Cdecl { argc: 3 },
+            leaf: memmove,
+            handler: resume_original,
+        },
+        Body {
+            name: "dsound.dll!DSOUND_MixToPrimary".into(),
+            conv: Conv::Cdecl { argc: 6 },
+            leaf: mixer::mix,
+            handler: mixer::resume,
+        },
+        Body {
+            name: "ntdll.dll!NtQueryPerformanceCounter".into(),
+            conv: Conv::Stdcall { argc: 2 },
+            leaf: query_performance_counter,
+            handler: resume_original,
+        },
+        Body {
+            name: "kernelbase.dll!MultiByteToWideChar".into(),
+            conv: Conv::Stdcall { argc: 6 },
+            leaf: nls::multi_byte_to_wide_char,
+            handler: resume_original,
+        },
+        Body {
+            name: "kernelbase.dll!WideCharToMultiByte".into(),
+            conv: Conv::Stdcall { argc: 8 },
+            leaf: nls::wide_char_to_multi_byte,
+            handler: resume_original,
+        },
+        Body {
+            name: "ntdll.dll!RtlMultiByteToUnicodeN".into(),
+            conv: Conv::Stdcall { argc: 5 },
+            leaf: nls::rtl_multi_byte_to_unicode_n,
+            handler: resume_original,
+        },
+        Body {
+            name: "ntdll.dll!RtlUnicodeToMultiByteN".into(),
+            conv: Conv::Stdcall { argc: 5 },
+            leaf: nls::rtl_unicode_to_multi_byte_n,
+            handler: resume_original,
+        },
+        Body {
+            name: "ntdll.dll!RtlMultiByteToUnicodeSize".into(),
+            conv: Conv::Stdcall { argc: 3 },
+            leaf: nls::rtl_multi_byte_to_unicode_size,
+            handler: resume_original,
+        },
+        Body {
+            name: "ntdll.dll!RtlUnicodeToMultiByteSize".into(),
+            conv: Conv::Stdcall { argc: 3 },
+            leaf: nls::rtl_unicode_to_multi_byte_size,
+            handler: resume_original,
+        },
+        Body {
+            name: "ntdll.dll!RtlOemToUnicodeN".into(),
+            conv: Conv::Stdcall { argc: 5 },
+            leaf: nls::rtl_oem_to_unicode_n,
+            handler: resume_original,
+        },
+        Body {
+            name: "ntdll.dll!RtlUnicodeToOemN".into(),
+            conv: Conv::Stdcall { argc: 5 },
+            leaf: nls::rtl_unicode_to_oem_n,
+            handler: resume_original,
+        },
+    ];
+    bodies.extend(crt::bodies());
+    bodies
+});
 
 /// The host functions of the bodies.
 pub(crate) fn host_fn(name: &str) -> Option<HostFn> {
@@ -134,7 +186,7 @@ pub(crate) fn bind_relocated(
             log::debug!("{}: bytes differ from the distribution", body.name);
             continue;
         }
-        if let Err(error) = bind_one(cpu, sys, ext, body.name, entry, function.size) {
+        if let Err(error) = bind_one(cpu, sys, ext, &body.name, entry, function.size) {
             log::warn!("{}: no native body: {error}", body.name);
         }
     }

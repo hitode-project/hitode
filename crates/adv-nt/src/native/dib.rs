@@ -21,7 +21,7 @@ macro_rules! bodies {
     ($( $leaf:ident, $argc:literal => [$($name:literal),*]; )*) => {
         pub(super) const BODIES: &[super::Body] = &[$($(
             super::Body {
-                name: concat!("win32u.so!", $name),
+                name: std::borrow::Cow::Borrowed(concat!("win32u.so!", $name)),
                 conv: Conv::Cdecl { argc: $argc },
                 leaf: $leaf,
                 handler: handler!($leaf),

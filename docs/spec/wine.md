@@ -360,6 +360,21 @@ FreeType is a host library under WINE-UNIX-6.
 **Rule**: DIB bodies MUST preserve Wine's pixels, padding, overlap traversal, bit fields, palette selection, blend arithmetic, and interpolation rounding. Unsupported formats or inaccessible memory MUST decline before writes. Field offsets and data addresses MUST match the pinned Unix module's DWARF.
 **Verification**: Test
 
+### NAT-BODY-5 Code page bodies
+
+**Rule**: PE code page bodies MUST use Wine's loaded conversion and normalization tables and preserve its output bytes, lengths, default-character indicators and errors. Their structure offsets and global addresses MUST match the pinned modules' DWARF. Cached-page lookups MUST decline while Wine's locale lock is held.
+**Verification**: Test
+
+### NAT-BODY-6 CRT bodies
+
+**Rule**: Locale-independent PE string and memory bodies MUST preserve Wine's bytes, return values, bounds and overlap behavior. An access that would fault MUST decline before any write.
+**Verification**: Test
+
+### NAT-BODY-7 PE body memory access
+
+**Rule**: PE string and conversion bodies MUST bound guest memory calls by pages and tables touched, rather than input units. Short calls fitting within one page of strings or eight KiB of conversion output MUST NOT allocate heap buffers.
+**Verification**: Test
+
 ## Host DLL images
 
 ### WINE-DLL-1 Loader-owned entries
