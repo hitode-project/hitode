@@ -355,6 +355,7 @@ Preparation MUST validate the compressed stream completely before publishing the
 ### HOST-SAVE-5 Copied installer state
 
 **Rule**: A game folder holding an empty Silky's Plus `<exe>_inst.xml` template MUST get the installer's per-user state on first run. The filled file MUST name the guest game root and executable, and the `save` template MUST be copied beside it unless portable saves serve it.
+Installer state MUST use the active stack's backing directory for the guest C drive.
 **Verification**: Test
 
 ## macOS packaging

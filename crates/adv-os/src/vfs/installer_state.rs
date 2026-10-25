@@ -26,7 +26,7 @@ pub(super) fn complete(cfg: &OsConfig) -> io::Result<()> {
         return Ok(());
     };
     let profile = ci_path(
-        &cfg.data_dir.join("c"),
+        &cfg.system_dir,
         &[
             "Users".into(),
             cfg.user_name.clone(),

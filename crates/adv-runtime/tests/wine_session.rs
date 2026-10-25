@@ -159,7 +159,7 @@ fn sequential_sessions_child() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
-// spec: WINE-SES-1, WINE-SES-2
+// spec: WINE-SES-1, WINE-SES-2, HOST-SAVE-5
 #[test]
 fn a_session_runs_a_program_from_its_directory_and_presents() {
     program_session(false);
@@ -200,6 +200,11 @@ fn program_session(child: bool) {
     let game = root.join("game");
     std::fs::create_dir_all(&game).unwrap();
     std::fs::copy(probes.join("d3d9.exe"), game.join("d3d9.exe")).unwrap();
+    std::fs::write(
+        game.join("d3d9_inst.xml"),
+        b"<InstallSetting><InstallPath></InstallPath><RunExe></RunExe></InstallSetting>",
+    )
+    .unwrap();
     if child {
         std::fs::write(game.join("spawn-child"), []).unwrap();
     }
@@ -264,6 +269,12 @@ fn program_session(child: bool) {
     );
     let mut text = String::new();
     let _ = output.read_to_string(&mut text);
+    let state = std::fs::read_to_string(
+        root.join("session/drive_c/Users/Player/AppData/Roaming/SilkysPlus/d3d9/d3d9_inst.xml"),
+    )
+    .unwrap();
+    assert!(state.contains("<InstallPath>D:</InstallPath>"), "{state}");
+    assert!(state.contains(r"<RunExe>D:\d3d9.exe</RunExe>"), "{state}"); // privacy: allow authored guest executable path
     std::fs::remove_dir_all(&root).unwrap();
     assert!(matches!(stop, Stop::Exited(0)), "{stop:?}: {text}");
     assert!(text.contains("presented=0"), "{text}");

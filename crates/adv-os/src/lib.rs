@@ -59,6 +59,8 @@ pub struct OsConfig {
     pub exe_name: String,
     /// Host directory for everything the guest writes (overlay, user profile, registry).
     pub data_dir: PathBuf,
+    /// Host directory behind guest C:, including per-user installer state.
+    pub system_dir: PathBuf,
     pub user_name: String,
     /// Host folder behind guest `C:\Program Files`, written in place: installers
     /// put their files straight into it rather than into the data overlay.
@@ -67,6 +69,7 @@ pub struct OsConfig {
 
 impl OsConfig {
     pub fn new(game_dir: impl Into<PathBuf>, exe_name: &str, data_dir: impl Into<PathBuf>) -> Self {
+        let data_dir = data_dir.into();
         Self {
             codepage: 932,
             game_dir: game_dir.into(),
@@ -74,7 +77,8 @@ impl OsConfig {
             resource_dir: None,
             guest_root: "C:\\Game".into(),
             exe_name: exe_name.into(),
-            data_dir: data_dir.into(),
+            system_dir: data_dir.join("c"),
+            data_dir,
             user_name: "Player".into(),
             install_dir: None,
         }

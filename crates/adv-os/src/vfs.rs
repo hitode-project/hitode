@@ -185,7 +185,7 @@ impl Vfs {
             overlay: cfg.data_dir.join("overlay"),
             whiteouts: whiteouts::Whiteouts::load(cfg.data_dir.join("whiteouts")),
             install: cfg.install_dir.clone(),
-            other: cfg.data_dir.join("c"),
+            other: cfg.system_dir.clone(),
             optical: BTreeMap::new(),
             memo: Mutex::default(),
         }

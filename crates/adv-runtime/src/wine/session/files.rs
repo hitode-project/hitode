@@ -92,6 +92,14 @@ pub(super) fn prepare(
         prefix,
     );
     cfg.guest_root = format!("{game_drive}:\\");
+    cfg.system_dir = config
+        .drive
+        .map_or_else(|| prefix.join("drive_c"), Path::to_owned);
+    cfg.codepage = match config.locale {
+        0x411 => 932,
+        0x804 => 936,
+        _ => 1252,
+    };
     let mut vfs = adv_os::Vfs::new(&cfg);
     for (letter, image) in &options.cdroms {
         vfs.mount_iso(*letter, image)
