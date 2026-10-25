@@ -275,15 +275,21 @@ An ntdll.dll export with no known convention stops the load. A weak symbol nothi
 
 ### WINE-UNIX-4 Shared libraries and files
 
-**Rule**: `dlopen` of a bare name MUST look next to the Unix libraries already loaded. A Unix library MUST open host files only for reading, and map them as shared read-only views. `ntdll_get_data_dir` MUST name `share/wine` of that installation.
+**Rule**: Except for host libraries, `dlopen` of a bare name MUST look next to the Unix libraries already loaded. A Unix library MUST open host files only for reading, and map them as shared read-only views. `ntdll_get_data_dir` MUST name `share/wine` of that installation.
 **Verification**: Test
 
-FreeType is such a library: win32u opens it by name and draws TrueType text through it.
+FreeType is a host library under WINE-UNIX-6.
 
 ### WINE-UNIX-5 Fixed-point formatting
 
 **Rule**: Unix library printf-family functions MUST consume `%f` and `%F` arguments as i386 doubles, preserving flags, width, precision and following arguments. Bounded output MUST retain the full formatted length and terminate any nonempty buffer.
 **Verification**: Test
+
+### WINE-UNIX-6 Host FreeType
+
+**Rule**: Wine's `libfreetype.so.6` requests MUST resolve to host FreeType 2.13.2 with the distribution's rendering defaults. Guest records and referenced buffers MUST use i386 layouts in guest heap memory and reflect completed host mutations. Glyph bytes, metrics and function results MUST match the distribution's i386 FreeType.
+**Verification**: Test
+**Basis**: Wine 11.0 `win32u/freetype.c` and FreeType 2.13.2 public headers.
 
 ## Threads
 
