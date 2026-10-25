@@ -153,8 +153,26 @@ pub fn lz77(
     {
         return Err(KernelError::UnsupportedSize);
     }
-    for i in destination..destination + length {
-        window[i] = window[i - distance];
+    if length == 0 {
+        return Ok(());
+    }
+    let (history, output) = window[..destination + length].split_at_mut(destination);
+    let prefix = &history[destination - distance..destination - distance + distance.min(length)];
+    lz77_segment(output, prefix)
+}
+
+/// Forward expansion on a remaining segment. The disjoint prefix contains
+/// min(distance, length) history bytes; overlapping reads use updated output.
+pub fn lz77_segment(output: &mut [u8], prefix: &[u8]) -> Result<(), KernelError> {
+    if prefix.is_empty() {
+        return Err(KernelError::UnsupportedSize);
+    }
+    for i in 0..output.len() {
+        output[i] = if i < prefix.len() {
+            prefix[i]
+        } else {
+            output[i - prefix.len()]
+        };
     }
     Ok(())
 }

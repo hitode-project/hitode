@@ -84,6 +84,10 @@ python3 -m unittest discover -s tools/<folder>
   and compiles unchanged row bodies with x86-32 clang under O1, O2 and Os. On
   AArch64, `cargo test -p adv-drv upstream_png -- --ignored` checks these public
   references through admission, native bridges and the guest interpreter.
+- `python3 tools/codec/lz77_reference.py` builds pinned zlib 1.1.4's `zmemcpy`
+  and an isolated `inflate_fast` copy loop. On AArch64, run
+  `cargo test -p adv-drv upstream_zlib -- --ignored`. This checks forward copies,
+  including overlapping matches; it does not establish whole-decoder coverage.
 - Tests that need a game read it from `$ADV_SAMPLES`. They are ignored or skip when it is unset, so the default run needs no game files.
 - Fixtures with a recording in `tools/fixtures/native/` run on every host: `cargo test -p adv-runtime --features gpu --test native_reference` compares each CPU backend with the native Windows output. Record or refresh one on Windows with `python tools/fixtures/record_native.py <name>`; `--check` there confirms the build is still deterministic.
 - Windows-only differential tests run a self-written fixture natively and under Hitode. Their build scripts are in `tools/fixtures/`. CI runs them in the advisory `windows-differential.yml` workflow after merges that touch fixtures or `adv-win32`, weekly, and for a branch on demand with `gh workflow run windows-differential.yml --ref <branch>`; without Windows, read the native results in its logs. Failures known on the hosted image are listed in `tools/fixtures/hosted-known-failures.txt`.

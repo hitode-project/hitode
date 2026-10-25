@@ -124,7 +124,8 @@ parameterized obligations for a publication bridge. Its forward-byte rule covers
 LZ77 and PNG Sub/Up/Average bodies, plus straight-line Paeth predictors with fixed
 dword frame slots. Indexed loops and register allocation are inferred. Unsupported
 recurrences remain guest work. Wine's `adv-drv::codec` supplies cold admission for
-the four PNG filters through `adv-machine::NativeAdmission`. The A64 front end offers complete
+the four PNG filters and long forward LZ77 copies through `adv-machine::NativeAdmission`.
+The A64 front end offers complete
 hot loop bodies; only verified bindings lower to engine-neutral native plans.
 The back end specializes mappings, calls `adv-device::codec_kernel` on directly
 accessible guest buffers and restores exact state through a checked scalar
@@ -133,8 +134,8 @@ code changes, new stops and unmapping. No per-call analysis or identity hashing
 is performed. A fixed scalar argument and separately checked read spans preserve
 prefix history for row segments. Fixed-frame guards preserve invariant inputs
 and the scalar tail's complete scratch effects. Paeth forms with internal
-branches retain guest execution. Device kernels also implement overlapping
-LZ77; that computation retains guest execution until its admitted wiring exists.
+branches retain guest execution. LZ77 preserves overlapping history; symbol
+decoding, window wrap and the surrounding stream state remain guest work.
 
 - **Graphics:** GDI, DirectDraw and Direct3D 9 share neutral surfaces and drawing services. Direct3D 9 shaders are translated within the limits in [docs/spec/graphics.md](docs/spec/graphics.md). Device services follow [docs/spec/device.md](docs/spec/device.md).
 - **Audio:** one mixer resamples with rubato and decodes with Symphonia. Wine MIDI output synthesizes through OxiSynth with the bundled General MIDI bank. Shared PCM buffers are read through stable views, so a device never reads storage that the guest has freed.

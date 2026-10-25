@@ -1,4 +1,4 @@
-//! PNG row admission on hot A64 translation preparation. All library and
+//! Byte recurrence admission on hot A64 translation preparation. All library and
 //! register differences stop here; the execution layer receives a byte plan.
 use adv_abi::native::{
     Budget, Computation, Dependency, DependencyKind, ImageSnapshot, analyze, verify,
@@ -24,7 +24,7 @@ pub(super) fn admit(_pc: u32, code: &[u8]) -> Vec<NativeRegion> {
             Computation::PngSub => sub,
             Computation::PngAverage => average,
             Computation::PngPaeth => paeth,
-            _ => continue,
+            Computation::Lz77 => copy,
         };
         if let Ok(binding) = verify::verify(&image, candidate, &mut budget) {
             // SAFETY: these kernels implement their checked contracts. The
@@ -33,6 +33,22 @@ pub(super) fn admit(_pc: u32, code: &[u8]) -> Vec<NativeRegion> {
         }
     }
     regions
+}
+
+unsafe extern "C" fn copy(source: *const u8, destination: *mut u8, length: u32, _scalar: u32) {
+    #[cfg(all(test, target_arch = "aarch64"))]
+    tests::BATCHES.with(|n| n.set(n.get() + 1));
+    let prefix_len = (destination as usize - source as usize).min(length as usize);
+    // SAFETY: the bridge proves a positive backward distance and readable
+    // history / writable output. Prefix borrows stop before the output;
+    // subsequent overlapping reads use the updated output itself.
+    let (output, prefix) = unsafe {
+        (
+            std::slice::from_raw_parts_mut(destination, length as usize),
+            std::slice::from_raw_parts(source, prefix_len),
+        )
+    };
+    let _ = adv_device::codec_kernel::lz77_segment(output, prefix);
 }
 
 unsafe extern "C" fn average(source: *const u8, destination: *mut u8, length: u32, bpp: u32) {
@@ -180,6 +196,38 @@ mod tests {
                         assert!(BATCHES.get() > 0);
                     }
                     if output == SOURCE + 1 && count >= 1024 {
+                        assert!(BATCHES.get() > 0);
+                    }
+                }
+            }
+        }
+    }
+
+    // spec: DEV-CODEC-1, EXEC-NATIVE-2, A64-TR-8
+    #[test]
+    fn long_forward_expansion_preserves_overlap_and_budget_boundaries() {
+        let code = [0x0f, 0xb6, 0x06, 0x88, 0x07, 0x46, 0x47, 0x49, 0x75, 0xf6];
+        for distance in [0, 1, 2, 7, 4096, 0x4000] {
+            for count in [1, 128, 129, 256, 258, 8192] {
+                for budget in [1, 6 * 129 - 1, 6 * 129, 100_000] {
+                    let output = OUTPUT + 0xf00;
+                    let (mut a, mut b) = (executor(count, output), executor(count, output));
+                    for e in [&mut a, &mut b] {
+                        e.write(CODE, &code).unwrap();
+                        e.state.regs[1] = count;
+                        e.state.regs[6] = output - distance;
+                        e.state.regs[7] = output;
+                    }
+                    BATCHES.set(0);
+                    let stop = CODE + code.len() as u32;
+                    compare(&mut a, &mut b, stop, budget);
+                    assert_eq!(a.state.fuel, b.state.fuel);
+                    compare(&mut a, &mut b, stop, 100_000);
+                    assert_eq!(a.state.fuel, b.state.fuel);
+                    if distance == 0 {
+                        assert_eq!(BATCHES.get(), 0);
+                    }
+                    if distance != 0 && count >= 256 && budget == 100_000 {
                         assert!(BATCHES.get() > 0);
                     }
                 }
@@ -451,6 +499,54 @@ mod tests {
                             })
                             .collect();
                         assert!(BATCHES.get() > 0, "{name} {optimization}: {reports:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    // spec: EXEC-NATIVE-2, A64-TR-8
+    #[test]
+    #[ignore = "run tools/codec/lz77_reference.py first"]
+    fn upstream_zlib_forward_copies_reuse_the_byte_rule() {
+        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/codec-reference/lz77");
+        for name in ["zmemcpy", "match_loop"] {
+            for optimization in ["O1", "O2", "Os"] {
+                let bytes =
+                    std::fs::read(directory.join(format!("{name}-{optimization}.bin"))).unwrap();
+                for count in [0, 1, 128, 129, 256, 258, 8192] {
+                    // A single DEFLATE match is at most 258 bytes. Larger
+                    // runs exercise only the independent utility copy.
+                    if name == "match_loop" && count > 258 {
+                        continue;
+                    }
+                    for distance in [1, 7, 4096, 0x4000] {
+                        let (mut a, mut b) = (executor(count, OUTPUT), executor(count, OUTPUT));
+                        let stop = CODE + 0x2000;
+                        for e in [&mut a, &mut b] {
+                            e.write(CODE, &bytes).unwrap();
+                            let sp = e.state.regs[4] - 32;
+                            e.state.regs[4] = sp;
+                            for (n, value) in [stop, OUTPUT, OUTPUT - distance, count]
+                                .into_iter()
+                                .enumerate()
+                            {
+                                e.write(sp + n as u32 * 4, &value.to_le_bytes()).unwrap();
+                            }
+                        }
+                        BATCHES.set(0);
+                        compare(&mut a, &mut b, stop, 1_000_000);
+                        assert_eq!(a.state.fuel, b.state.fuel);
+                        if count >= 256 {
+                            assert!(
+                                BATCHES.get() > 0,
+                                "{name} {optimization} {count} {distance}"
+                            );
+                        }
+                        if count <= 128 {
+                            assert_eq!(BATCHES.get(), 0);
+                        }
                     }
                 }
             }
