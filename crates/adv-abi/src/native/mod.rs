@@ -6,11 +6,13 @@
 //! constitute admission. These types contain no execution or device services.
 
 pub mod analyze;
+pub mod expression;
 pub mod verify;
 
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
+pub use expression::{Binary, Expression, MemoryVersion, Width};
 pub use verify::VerifiedBinding;
 
 /// Identity of a computation, independently of the implementation that runs it.
@@ -134,37 +136,91 @@ impl Register {
     }
 }
 
-/// Restricted state view for a one-byte forward loop. Offset addition uses
-/// x86 wrapping arithmetic; entry conditions constrain the resulting ranges.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ByteLoopMapping {
-    pub source: Register,
-    pub destination: Register,
-    pub remaining: Register,
-    pub source_offset: u32,
-    pub destination_offset: u32,
+pub struct MemorySpan {
+    pub address: Expression,
+    pub length: Expression,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Aliasing {
-    /// A positive backward distance; later reads can consume earlier stores.
-    ForwardHistory,
-    /// The previous PNG row cannot overlap the row being reconstructed.
-    Disjoint,
+pub enum Access {
+    Read,
+    ReadWrite,
 }
 
-/// Conditions the eventual execution bridge must establish before any effect.
-/// Zero remaining bytes decline: this region is a positive-count loop body,
-/// while its enclosing guest function owns the zero-iteration branch.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EntryConditions {
-    pub positive_count: bool,
-    pub nonwrapping_ranges: bool,
-    pub ordinary_readable_source: bool,
-    pub ordinary_readable_writable_destination: bool,
-    pub destination_disjoint_dependencies: bool,
-    pub no_instruction_observers: bool,
-    pub aliasing: Aliasing,
+pub struct StateView {
+    pub inputs: Vec<(Input, Expression)>,
+    pub output: MemorySpan,
+}
+
+impl StateView {
+    pub fn input(&self, input: Input) -> Option<&Expression> {
+        self.inputs
+            .iter()
+            .find_map(|(role, value)| (*role == input).then_some(value))
+    }
+}
+
+/// Parameterized obligations, not declarations that the current guest is safe.
+/// A publication bridge must establish every predicate before any side effect.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Predicate {
+    Positive(Expression),
+    NoWrap(MemorySpan),
+    Ordinary {
+        span: MemorySpan,
+        access: Access,
+    },
+    Disjoint(MemorySpan, MemorySpan),
+    BackwardDistance {
+        source: Expression,
+        destination: Expression,
+        distance: Expression,
+    },
+    WritesOutsideDependencies(MemorySpan),
+    NoInstructionObservers {
+        entry: u32,
+        end: u32,
+    },
+}
+
+/// A reference-rule hint. The checker reconstructs the recurrence and verifies
+/// the actual decreasing quantity; the hint conveys no execution permission.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProofHint {
+    ForwardBytes { remaining: Expression },
+}
+
+pub(crate) fn byte_view(
+    computation: Computation,
+    source: Expression,
+    destination: Expression,
+    remaining: Expression,
+) -> Option<StateView> {
+    let distance = Expression::binary(Binary::Subtract, destination.clone(), source.clone())?;
+    let inputs = match computation {
+        Computation::Lz77 => vec![(Input::History, source), (Input::Length, remaining.clone())],
+        Computation::PngSub => vec![
+            (Input::FilteredRow, destination.clone()),
+            (Input::ReconstructedPrefix, source),
+            (Input::BytesPerPixel, distance),
+            (Input::Length, remaining.clone()),
+        ],
+        Computation::PngUp => vec![
+            (Input::FilteredRow, destination.clone()),
+            (Input::PreviousRow, source),
+            (Input::Length, remaining.clone()),
+        ],
+        _ => return None,
+    };
+    Some(StateView {
+        inputs,
+        output: MemorySpan {
+            address: destination,
+            length: remaining,
+        },
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -231,7 +287,10 @@ pub struct CandidateBinding {
     pub contract: ReferenceContract,
     pub entry: u32,
     pub end: u32,
-    pub mapping: ByteLoopMapping,
+    pub view: StateView,
+    pub cutpoints: Vec<u32>,
+    pub exits: Vec<u32>,
+    pub proof: ProofHint,
 }
 
 /// Deterministic preparation budget. Exhaustion is distinct from a counterexample

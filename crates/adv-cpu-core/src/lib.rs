@@ -35,6 +35,7 @@ pub mod floating;
 pub mod frame_counters;
 pub mod host_features;
 pub mod instruction_trace;
+pub mod integer;
 pub mod interpreter;
 #[doc(hidden)]
 pub mod machine_memory;

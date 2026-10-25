@@ -1,95 +1,82 @@
-//! Small admission checker for single-byte, forward recurrence loops.
+//! Independent admission of positive-count, forward byte recurrences.
 //!
-//! The checker decodes the snapshot itself. A successful check establishes one
-//! complete iteration, its unique backedge, the decreasing counter and every
-//! register/flag/memory effect. Repeating that transition is an induction over
-//! a positive counter, not bounded execution or comparison on sample inputs.
+//! The checker re-decodes code through the shared integer semantics. Each step
+//! has typed values, ordered memory versions and complete continuation/final
+//! exits. Entry predicates remain obligations for the publication bridge.
 
-use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic, OpKind, Register as X86};
+use adv_cpu::integer::{self, Operand, Operation};
+use iced_x86::{
+    ConditionCode, Decoder, DecoderOptions, Instruction, Mnemonic, OpKind, Register as X86,
+};
 
+use super::expression::Kind;
 use super::*;
 
-pub const RULE_VERSION: u32 = 1;
+pub const RULE_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Address {
-    pub base: Register,
-    pub offset: u32,
+pub struct Store {
+    pub before: MemoryVersion,
+    pub after: MemoryVersion,
+    pub address: Expression,
+    pub value: Expression,
 }
 
-/// Exact expressions at the end of a single recurrence step. A low-byte write
-/// preserves its enclosing register's high bits explicitly.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Expression {
-    Initial(Register),
-    Add(Box<Expression>, u32),
-    /// Memory immediately before this iteration's store, including any history
-    /// written by preceding iterations. It is not a post-store reread.
-    ReadByte(Address),
-    SumByte(Box<Expression>, Box<Expression>),
-    LowByte(Box<Expression>),
-    ReplaceLowByte(Box<Expression>, Box<Expression>),
+pub struct ExitState {
+    pub registers: [Expression; 8],
+    pub flags: Expression,
+    pub memory: MemoryVersion,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Arithmetic {
-    Increment32,
-    Decrement32,
-    Add8,
+pub enum ExitKind {
+    Continue,
+    Complete,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FlagEffect {
-    pub arithmetic: Arithmetic,
-    pub left: Expression,
-    pub right: Option<Expression>,
+pub struct RegionExit {
+    pub kind: ExitKind,
+    pub target: u32,
+    pub condition: Expression,
+    pub state: ExitState,
 }
 
-/// The complete checked step. Effects remain ordered; INC and DEC preserve CF.
-/// No instruction outside this transition is silently treated as a no-op.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Transition {
-    pub registers: [Expression; 8],
-    pub flags: Vec<FlagEffect>,
-    pub destination: Address,
-    pub value: Expression,
+    pub store: Store,
+    pub exits: Vec<RegionExit>,
     pub instructions: u32,
 }
 
-/// A capability issued only after checking actual code against a reference
-/// recurrence. It has no public constructor and cannot be deserialized.
+/// Only the independent checker can construct this capability.
 ///
-/// ```compile_fail
+/// ~~~compile_fail
 /// use adv_abi::native::{CandidateBinding, VerifiedBinding};
-/// fn bypass(candidate: CandidateBinding) -> VerifiedBinding {
-///     candidate.into()
-/// }
-/// ```
+/// fn bypass(candidate: CandidateBinding) -> VerifiedBinding { candidate.into() }
+/// ~~~
 #[derive(Clone, Debug)]
 pub struct VerifiedBinding {
     candidate: CandidateBinding,
     dependencies: Vec<Dependency>,
     transition: Transition,
-    conditions: EntryConditions,
+    conditions: Vec<Predicate>,
 }
 
 impl VerifiedBinding {
     pub fn candidate(&self) -> &CandidateBinding {
         &self.candidate
     }
-
     pub fn dependencies(&self) -> &[Dependency] {
         &self.dependencies
     }
-
     pub fn transition(&self) -> &Transition {
         &self.transition
     }
-
-    pub fn conditions(&self) -> &EntryConditions {
+    pub fn conditions(&self) -> &[Predicate] {
         &self.conditions
     }
-
     pub const fn rule_version(&self) -> u32 {
         RULE_VERSION
     }
@@ -98,183 +85,134 @@ impl VerifiedBinding {
 fn counterexample(offset: u32, reason: &'static str) -> Rejection {
     Rejection::Counterexample { offset, reason }
 }
-
 fn unsupported(offset: u32, reason: &'static str) -> Rejection {
     Rejection::Unsupported { offset, reason }
 }
 
 pub(super) fn register(r: X86) -> Option<Register> {
-    match r {
-        X86::EAX | X86::AL => Register::new(0),
-        X86::ECX | X86::CL => Register::new(1),
-        X86::EDX | X86::DL => Register::new(2),
-        X86::EBX | X86::BL => Register::new(3),
-        X86::ESP => Register::new(4),
-        X86::EBP => Register::new(5),
-        X86::ESI => Register::new(6),
-        X86::EDI => Register::new(7),
-        _ => None,
-    }
+    let r = integer::Reg::decode(r)?;
+    (r.shift == 0 && matches!(r.width, 1 | 4)).then_some(Register(r.index))
 }
 
 pub(super) fn plain_memory(i: &Instruction) -> bool {
-    i.memory_index() == X86::None
-        && i.memory_base().size() == 4
-        && matches!(i.segment_prefix(), X86::None | X86::DS)
+    integer::Address::decode(i, false).is_some_and(|a| {
+        a.index.is_none()
+            && !a.word
+            && !a.fs
+            && a.base.is_some_and(|r| r.width == 4)
+            && matches!(i.segment_prefix(), X86::None | X86::DS)
+    })
 }
 
 fn add(value: Expression, amount: u32) -> Expression {
-    match (value, amount) {
-        (value, 0) => value,
-        (Expression::Add(value, old), amount) => add(*value, old.wrapping_add(amount)),
-        (value, amount) => Expression::Add(Box::new(value), amount),
-    }
+    Expression::binary(
+        Binary::Add,
+        value,
+        Expression::constant(Width::Dword, u64::from(amount)),
+    )
+    .expect("32-bit cursor")
 }
-
 fn low(value: Expression) -> Expression {
-    match value {
-        value @ (Expression::ReadByte(_) | Expression::SumByte(..)) => value,
-        Expression::ReplaceLowByte(_, value) => *value,
-        value => Expression::LowByte(Box::new(value)),
-    }
+    Expression::extract(value, 0, Width::Byte).expect("byte or full register")
 }
-
-fn address(i: &Instruction, values: &[Expression; 8]) -> Option<Address> {
+fn address(i: &Instruction, values: &[Expression; 8]) -> Option<Expression> {
     if !plain_memory(i) {
         return None;
     }
-    let r = register(i.memory_base())?;
-    let (base, offset) = match &values[r.index() as usize] {
-        Expression::Initial(base) => (*base, 0),
-        Expression::Add(base, offset) => {
-            let Expression::Initial(base) = **base else {
-                return None;
-            };
-            (base, *offset)
-        }
-        _ => return None,
-    };
-    Some(Address {
-        base,
-        offset: offset.wrapping_add(i.memory_displacement32()),
-    })
+    let a = integer::Address::decode(i, false)?;
+    Some(add(values[a.base?.index as usize].clone(), a.displacement))
 }
 
 struct Checker {
     values: [Expression; 8],
-    flags: Vec<FlagEffect>,
-    reads: Vec<Address>,
-    store: Option<(Address, Expression)>,
+    flags: Expression,
+    reads: Vec<Expression>,
+    store: Option<Store>,
 }
 
 impl Checker {
     fn new() -> Self {
         Self {
-            values: std::array::from_fn(|r| Expression::Initial(Register(r as u8))),
-            flags: Vec::new(),
+            values: std::array::from_fn(|r| Expression::register(Register(r as u8))),
+            flags: Expression::flags(),
             reads: Vec::new(),
             store: None,
         }
     }
-
     fn read(&mut self, i: &Instruction) -> Result<Expression, Rejection> {
         let at = i.ip32();
-        // A read after a store needs an alias-aware store chain. It is outside
-        // this rule, including when two different pointer registers may alias.
         if self.store.is_some() {
             return Err(unsupported(at, "memory read after a write"));
         }
         let a = address(i, &self.values).ok_or_else(|| unsupported(at, "memory address"))?;
         self.reads.push(a.clone());
-        Ok(Expression::ReadByte(a))
+        Ok(Expression::load(MemoryVersion(0), a, Width::Byte).expect("32-bit address"))
     }
-
     fn store(&mut self, i: &Instruction, value: Expression) -> Result<(), Rejection> {
         let at = i.ip32();
         let a = address(i, &self.values).ok_or_else(|| unsupported(at, "store address"))?;
-        if self.store.replace((a, low(value))).is_some() {
+        if self
+            .store
+            .replace(Store {
+                before: MemoryVersion(0),
+                after: MemoryVersion(1),
+                address: a,
+                value: low(value),
+            })
+            .is_some()
+        {
             return Err(unsupported(at, "more than one memory write per step"));
         }
         Ok(())
     }
-
+    fn flags(&mut self, kind: Mnemonic, left: Expression, right: Expression) {
+        self.flags = Expression::integer_flags(kind, self.flags.clone(), left, right)
+            .expect("decoded integer operands");
+    }
     fn instruction(&mut self, i: &Instruction) -> Result<(), Rejection> {
         let at = i.ip32();
         let bad = || unsupported(at, "instruction form");
         if i.has_lock_prefix() || i.has_rep_prefix() || i.has_repne_prefix() {
             return Err(bad());
         }
-        match i.mnemonic() {
-            Mnemonic::Nop if i.op_count() == 0 => {}
-            Mnemonic::Movzx
-                if i.op0_kind() == OpKind::Register
-                    && i.op0_register().size() == 4
-                    && i.op1_kind() == OpKind::Memory
-                    && i.memory_size().size() == 1 =>
-            {
-                let r = register(i.op0_register()).ok_or_else(bad)?;
-                let v = self.read(i)?;
-                self.values[r.index() as usize] = v;
+        match integer::decode(i).ok_or_else(bad)? {
+            Operation::Nop if i.op_count() == 0 => {}
+            Operation::Mov(Operand::Register(r), Operand::Memory(_, 1), false) if r.width == 4 => {
+                let value = self.read(i)?;
+                self.values[r.index as usize] =
+                    Expression::extend(value, Width::Dword, false).expect("byte extension");
             }
-            Mnemonic::Mov
-                if i.op0_kind() == OpKind::Register
-                    && i.op0_register().size() == 1
-                    && i.op1_kind() == OpKind::Memory
-                    && i.memory_size().size() == 1 =>
+            Operation::Mov(Operand::Register(r), Operand::Memory(_, 1), false)
+                if r.width == 1 && r.shift == 0 =>
             {
-                let r = register(i.op0_register()).ok_or_else(bad)?;
-                let v = self.read(i)?;
-                let old = self.values[r.index() as usize].clone();
-                self.values[r.index() as usize] =
-                    Expression::ReplaceLowByte(Box::new(old), Box::new(v));
+                let value = self.read(i)?;
+                self.values[r.index as usize] =
+                    Expression::insert(self.values[r.index as usize].clone(), value, 0)
+                        .expect("low-byte register write");
             }
-            Mnemonic::Mov
-                if i.op0_kind() == OpKind::Memory
-                    && i.op1_kind() == OpKind::Register
-                    && i.op1_register().size() == 1
-                    && i.memory_size().size() == 1 =>
+            Operation::Mov(Operand::Memory(_, 1), Operand::Register(r), false)
+                if r.width == 1 && r.shift == 0 =>
             {
-                let r = register(i.op1_register()).ok_or_else(bad)?;
-                self.store(i, self.values[r.index() as usize].clone())?;
+                self.store(i, self.values[r.index as usize].clone())?;
             }
-            Mnemonic::Add
-                if i.op0_kind() == OpKind::Memory
-                    && i.op1_kind() == OpKind::Register
-                    && i.op1_register().size() == 1
-                    && i.memory_size().size() == 1 =>
+            Operation::Binary(Mnemonic::Add, Operand::Memory(_, 1), Operand::Register(r))
+                if r.width == 1 && r.shift == 0 =>
             {
-                let r = register(i.op1_register()).ok_or_else(bad)?;
                 let left = self.read(i)?;
-                let right = low(self.values[r.index() as usize].clone());
-                self.flags.push(FlagEffect {
-                    arithmetic: Arithmetic::Add8,
-                    left: left.clone(),
-                    right: Some(right.clone()),
-                });
-                self.store(i, Expression::SumByte(Box::new(left), Box::new(right)))?;
+                let right = low(self.values[r.index as usize].clone());
+                self.flags(Mnemonic::Add, left.clone(), right.clone());
+                self.store(
+                    i,
+                    Expression::binary(Binary::Add, left, right).expect("byte sum"),
+                )?;
             }
-            Mnemonic::Inc | Mnemonic::Dec
-                if i.op0_kind() == OpKind::Register && i.op0_register().size() == 4 =>
+            Operation::Unary(kind @ (Mnemonic::Inc | Mnemonic::Dec), Operand::Register(r))
+                if r.width == 4 =>
             {
-                let r = register(i.op0_register()).ok_or_else(bad)?;
-                let value = self.values[r.index() as usize].clone();
-                self.flags.push(FlagEffect {
-                    arithmetic: if i.mnemonic() == Mnemonic::Inc {
-                        Arithmetic::Increment32
-                    } else {
-                        Arithmetic::Decrement32
-                    },
-                    left: value.clone(),
-                    right: None,
-                });
-                self.values[r.index() as usize] = add(
-                    value,
-                    if i.mnemonic() == Mnemonic::Inc {
-                        1
-                    } else {
-                        u32::MAX
-                    },
-                );
+                let value = self.values[r.index as usize].clone();
+                self.flags(kind, value.clone(), Expression::constant(Width::Dword, 1));
+                self.values[r.index as usize] =
+                    add(value, if kind == Mnemonic::Inc { 1 } else { u32::MAX });
             }
             _ => return Err(bad()),
         }
@@ -282,9 +220,8 @@ impl Checker {
     }
 }
 
-/// Re-decode a candidate and establish the forward-loop induction rule.
-/// Current rules cover one-byte LZ77 and PNG Sub/Up recurrences; other
-/// computations return Unsupported, rather than obtaining weaker admission.
+/// Check actual code and establish the forward-loop induction rule.
+/// Average/Paeth require additional proof rules and return Unsupported.
 pub fn verify(
     image: &ImageSnapshot,
     candidate: CandidateBinding,
@@ -294,19 +231,71 @@ pub fn verify(
     if image.identity != candidate.image {
         return Err(counterexample(at, "image identity"));
     }
-    if candidate.contract != ReferenceContract::get(candidate.contract.computation) {
+    let computation = candidate.contract.computation;
+    if candidate.contract != ReferenceContract::get(computation) {
         return Err(counterexample(at, "reference contract identity"));
     }
     if !matches!(
-        candidate.contract.computation,
+        computation,
         Computation::Lz77 | Computation::PngSub | Computation::PngUp
     ) {
         return Err(unsupported(at, "reference recurrence"));
     }
+    if candidate.cutpoints != [at] || candidate.exits != [candidate.end] {
+        return Err(counterexample(at, "cutpoints or exits"));
+    }
+    let view = &candidate.view;
+    let source_role = match computation {
+        Computation::Lz77 => Input::History,
+        Computation::PngSub => Input::ReconstructedPrefix,
+        _ => Input::PreviousRow,
+    };
+    let source = view
+        .input(source_role)
+        .ok_or_else(|| counterexample(at, "source mapping"))?
+        .clone();
+    let destination = view.output.address.clone();
+    let remaining = view
+        .input(Input::Length)
+        .ok_or_else(|| counterexample(at, "count mapping"))?
+        .clone();
+    let (source_reg, _) = source
+        .register_offset()
+        .ok_or_else(|| unsupported(at, "source expression"))?;
+    let (destination_reg, _) = destination
+        .register_offset()
+        .ok_or_else(|| unsupported(at, "destination expression"))?;
+    let (counter, offset) = remaining
+        .register_offset()
+        .ok_or_else(|| unsupported(at, "count expression"))?;
+    if offset != 0 {
+        return Err(unsupported(at, "count expression"));
+    }
+    if source_reg == destination_reg || source_reg == counter || destination_reg == counter {
+        return Err(counterexample(at, "loop roles overlap"));
+    }
+    if byte_view(
+        computation,
+        source.clone(),
+        destination.clone(),
+        remaining.clone(),
+    )
+    .as_ref()
+        != Some(view)
+    {
+        return Err(counterexample(at, "input mapping"));
+    }
+    if candidate.proof
+        != (ProofHint::ForwardBytes {
+            remaining: remaining.clone(),
+        })
+    {
+        return Err(counterexample(at, "loop proof hint"));
+    }
     let len = candidate
         .end
         .checked_sub(at)
-        .filter(|&len| len != 0)
+        .filter(|&n| n != 0)
         .ok_or_else(|| counterexample(at, "region extent"))?;
     let bytes = image
         .bytes(at, len)
@@ -323,18 +312,6 @@ pub fn verify(
     }) {
         return Err(counterexample(at, "region is not code"));
     }
-    let m = &candidate.mapping;
-    if m.source == m.destination || m.source == m.remaining || m.destination == m.remaining {
-        return Err(counterexample(at, "loop roles overlap"));
-    }
-    let source = Address {
-        base: m.source,
-        offset: m.source_offset,
-    };
-    let destination = Address {
-        base: m.destination,
-        offset: m.destination_offset,
-    };
     let mut decoder = Decoder::with_ip(32, bytes, u64::from(at), DecoderOptions::NONE);
     let mut checker = Checker::new();
     let mut count = 0;
@@ -364,32 +341,38 @@ pub fn verify(
     if !backedge {
         return Err(counterexample(at, "missing loop backedge"));
     }
-    let expected_flag = FlagEffect {
-        arithmetic: Arithmetic::Decrement32,
-        left: Expression::Initial(m.remaining),
-        right: None,
-    };
-    if checker.flags.last() != Some(&expected_flag) {
+    if !matches!(checker.flags.kind(), Kind::IntegerFlags(Mnemonic::Dec, _, left, _) if *left == remaining)
+    {
         return Err(counterexample(
             at,
             "loop test is not the decreasing counter",
         ));
     }
-    for (r, delta) in [(m.source, 1), (m.destination, 1), (m.remaining, u32::MAX)] {
-        if checker.values[r.index() as usize] != add(Expression::Initial(r), delta) {
+    for (r, delta) in [(source_reg, 1), (destination_reg, 1), (counter, u32::MAX)] {
+        if checker.values[r.index() as usize] != add(Expression::register(r), delta) {
             return Err(counterexample(at, "loop state recurrence"));
         }
     }
-    let copied = Expression::ReadByte(source.clone());
-    let expected = if candidate.contract.computation == Computation::Lz77 {
-        copied
+    let copied =
+        Expression::load(MemoryVersion(0), source.clone(), Width::Byte).expect("byte source");
+    let expected = if computation == Computation::Lz77 {
+        copied.clone()
     } else {
-        Expression::SumByte(
-            Box::new(Expression::ReadByte(destination.clone())),
-            Box::new(copied),
+        Expression::binary(
+            Binary::Add,
+            Expression::load(MemoryVersion(0), destination.clone(), Width::Byte)
+                .expect("byte destination"),
+            copied.clone(),
         )
+        .expect("byte sum")
     };
-    if checker.store != Some((destination.clone(), expected.clone())) {
+    let expected_store = Store {
+        before: MemoryVersion(0),
+        after: MemoryVersion(1),
+        address: destination.clone(),
+        value: expected,
+    };
+    if checker.store.as_ref() != Some(&expected_store) {
         return Err(counterexample(at, "byte recurrence"));
     }
     if checker
@@ -399,44 +382,69 @@ pub fn verify(
     {
         return Err(counterexample(at, "undeclared memory input"));
     }
-    // Every non-loop register is either invariant or receives one byte, with
-    // its high bits invariant. No hidden loop-carried temporary is admitted.
     for r in 0..8 {
         let r = Register(r);
-        if [m.source, m.destination, m.remaining].contains(&r) {
+        if [source_reg, destination_reg, counter].contains(&r) {
             continue;
         }
-        let initial = Expression::Initial(r);
-        let read = Expression::ReadByte(source.clone());
-        let low_write =
-            Expression::ReplaceLowByte(Box::new(initial.clone()), Box::new(read.clone()));
-        if checker.values[r.index() as usize] != initial
-            && checker.values[r.index() as usize] != read
-            && checker.values[r.index() as usize] != low_write
-        {
+        let initial = Expression::register(r);
+        let extended =
+            Expression::extend(copied.clone(), Width::Dword, false).expect("byte extension");
+        let partial = Expression::insert(initial.clone(), copied.clone(), 0).expect("low byte");
+        let actual = &checker.values[r.index() as usize];
+        if *actual != initial && *actual != extended && *actual != partial {
             return Err(unsupported(at, "unproven loop-carried register"));
         }
     }
-    let transition = Transition {
+    let state = ExitState {
         registers: checker.values,
         flags: checker.flags,
-        destination,
-        value: expected,
-        instructions: count,
+        memory: MemoryVersion(1),
     };
-    let conditions = EntryConditions {
-        positive_count: true,
-        nonwrapping_ranges: true,
-        ordinary_readable_source: true,
-        ordinary_readable_writable_destination: true,
-        destination_disjoint_dependencies: true,
-        no_instruction_observers: true,
-        aliasing: if candidate.contract.computation == Computation::PngUp {
-            Aliasing::Disjoint
-        } else {
-            Aliasing::ForwardHistory
+    let exits = [
+        (ExitKind::Continue, candidate.entry, ConditionCode::ne),
+        (ExitKind::Complete, candidate.end, ConditionCode::e),
+    ]
+    .map(|(kind, target, cc)| RegionExit {
+        kind,
+        target,
+        condition: Expression::condition(cc, state.flags.clone()).expect("flags condition"),
+        state: state.clone(),
+    })
+    .into();
+    let input = MemorySpan {
+        address: source.clone(),
+        length: remaining.clone(),
+    };
+    let output = candidate.view.output.clone();
+    let mut conditions = vec![
+        Predicate::Positive(remaining),
+        Predicate::NoWrap(input.clone()),
+        Predicate::NoWrap(output.clone()),
+        Predicate::Ordinary {
+            span: input.clone(),
+            access: Access::Read,
         },
-    };
+        Predicate::Ordinary {
+            span: output.clone(),
+            access: Access::ReadWrite,
+        },
+        Predicate::WritesOutsideDependencies(output.clone()),
+        Predicate::NoInstructionObservers {
+            entry: at,
+            end: candidate.end,
+        },
+    ];
+    if computation == Computation::PngUp {
+        conditions.push(Predicate::Disjoint(input, output));
+    } else {
+        conditions.push(Predicate::BackwardDistance {
+            distance: Expression::binary(Binary::Subtract, destination.clone(), source.clone())
+                .expect("32-bit distance"),
+            source,
+            destination,
+        });
+    }
     Ok(VerifiedBinding {
         candidate,
         dependencies: vec![Dependency {
@@ -444,7 +452,11 @@ pub fn verify(
             bytes: bytes.into(),
             kind: DependencyKind::Code,
         }],
-        transition,
+        transition: Transition {
+            store: expected_store,
+            exits,
+            instructions: count,
+        },
         conditions,
     })
 }

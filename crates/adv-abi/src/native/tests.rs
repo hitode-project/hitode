@@ -76,16 +76,25 @@ fn register_allocation_and_offsets_do_not_require_signatures() {
                             ));
                             let verified =
                                 verify::verify(&image, copy(&image), &mut budget()).unwrap();
-                            assert_eq!(verified.candidate().mapping.source.index(), source);
                             assert_eq!(
-                                verified.candidate().mapping.destination.index(),
-                                destination
+                                verified
+                                    .candidate()
+                                    .view
+                                    .input(Input::History)
+                                    .unwrap()
+                                    .register_offset(),
+                                Some((Register(source), offset as i32 as u32))
                             );
                             assert_eq!(
-                                verified.candidate().mapping.source_offset,
-                                offset as i32 as u32
+                                verified.candidate().view.output.address.register_offset(),
+                                Some((Register(destination), offset as i32 as u32))
                             );
-                            assert_eq!(verified.conditions().aliasing, Aliasing::ForwardHistory);
+                            assert!(
+                                verified
+                                    .conditions()
+                                    .iter()
+                                    .any(|p| matches!(p, Predicate::BackwardDistance { .. }))
+                            );
                             assert_eq!(
                                 verified.dependencies()[0].bytes,
                                 image.dependencies[0].bytes
@@ -109,14 +118,19 @@ fn png_sum_uses_the_same_code_proof_with_distinct_alias_conditions() {
         let computation = candidate.contract.computation;
         let verified = verify::verify(&image, candidate, &mut budget()).unwrap();
         assert_eq!(
-            verified.conditions().aliasing,
-            if computation == Computation::PngUp {
-                Aliasing::Disjoint
-            } else {
-                Aliasing::ForwardHistory
-            }
+            verified
+                .conditions()
+                .iter()
+                .any(|p| matches!(p, Predicate::Disjoint(..))),
+            computation == Computation::PngUp
         );
-        assert_eq!(verified.transition().flags.len(), 4);
+        assert_eq!(
+            verified
+                .conditions()
+                .iter()
+                .any(|p| matches!(p, Predicate::BackwardDistance { .. })),
+            computation == Computation::PngSub
+        );
     }
 }
 
@@ -200,6 +214,7 @@ fn hidden_effects_and_unaccounted_edges_cannot_be_admitted() {
     let mut candidate = original.clone();
     candidate.image = image.identity();
     candidate.end += 2;
+    candidate.exits = vec![candidate.end];
     assert!(matches!(
         verify::verify(&image, candidate, &mut budget()),
         Err(Rejection::Unsupported {
@@ -249,11 +264,167 @@ fn operand_size_branch_cannot_be_relocated_as_a_32_bit_loop() {
     bytes.extend(displacement.to_le_bytes());
     let image = snapshot(bytes);
     candidate.end += 3;
+    candidate.exits = vec![candidate.end];
     candidate.image = image.identity();
     assert!(matches!(
         verify::verify(&image, candidate, &mut budget()),
         Err(Rejection::Unsupported {
             reason: "nonrelocatable branch width",
+            ..
+        })
+    ));
+}
+
+// spec: EXEC-NATIVE-2, EXEC-NATIVE-3
+#[test]
+fn exit_models_match_guest_flags_partial_registers_and_updated_history() {
+    use adv_cpu::{
+        CpuState, EXEC, Memory, READ, WRITE,
+        interpreter::{Interpreter, Step},
+    };
+    for computation in [Computation::Lz77, Computation::PngSub, Computation::PngUp] {
+        for wide in [false, true] {
+            for count in [1, 3] {
+                for flags in [0x202, 0x203, 0x2d7] {
+                    let image = snapshot(byte_loop(
+                        6,
+                        7,
+                        1,
+                        0,
+                        0,
+                        computation != Computation::Lz77,
+                        wide,
+                    ));
+                    let candidate = analyze::discover(&image, &mut budget())
+                        .into_iter()
+                        .find(|c| c.contract.computation == computation)
+                        .unwrap();
+                    let binding = verify::verify(&image, candidate, &mut budget()).unwrap();
+                    let mut memory = Memory::new(0x1000, 0x4000).unwrap();
+                    memory.protect(0x1000, 0x4000, READ | WRITE).unwrap();
+                    memory.write(0x1000, &image.dependencies[0].bytes).unwrap();
+                    memory.protect(0x1000, 4096, READ | EXEC).unwrap();
+                    let source = if computation == Computation::PngUp {
+                        0x2000
+                    } else {
+                        0x20ff
+                    };
+                    memory.write(source, &[10, 20, 30]).unwrap();
+                    memory.write(0x2100, &[250, 241, 230]).unwrap();
+                    let mut state = CpuState {
+                        regs: [
+                            0x1234abff, count, 0x87654321, 0x11111111, 0x4000, 0x3000, source,
+                            0x2100,
+                        ],
+                        eip: 0x1000,
+                        eflags: flags,
+                        ..Default::default()
+                    };
+                    let mut interpreter = Interpreter::new();
+                    for iteration in 0..count {
+                        let read = |version, address, width| {
+                            assert_eq!(version, MemoryVersion(0));
+                            assert_eq!(width, Width::Byte);
+                            u64::from(memory.read(address, 1).unwrap()[0])
+                        };
+                        let eval = |e: &Expression| e.evaluate(&state.regs, state.eflags, &read);
+                        let exits: Vec<_> = binding
+                            .transition()
+                            .exits
+                            .iter()
+                            .filter(|exit| eval(&exit.condition) != 0)
+                            .collect();
+                        assert_eq!(exits.len(), 1);
+                        let exit = exits[0];
+                        assert_eq!(
+                            exit.kind,
+                            if iteration + 1 == count {
+                                verify::ExitKind::Complete
+                            } else {
+                                verify::ExitKind::Continue
+                            }
+                        );
+                        assert_eq!(exit.state.memory, MemoryVersion(1));
+                        let registers = exit.state.registers.each_ref().map(|e| eval(e) as u32);
+                        let expected_flags = eval(&exit.state.flags) as u32;
+                        let target = exit.target;
+                        let store = &binding.transition().store;
+                        assert_eq!(
+                            (store.before, store.after),
+                            (MemoryVersion(0), MemoryVersion(1))
+                        );
+                        let address = eval(&store.address) as u32;
+                        let value = eval(&store.value) as u8;
+                        for _ in 0..binding.transition().instructions {
+                            assert_eq!(interpreter.step(&mut state, &mut memory), Step::Executed);
+                        }
+                        assert_eq!(state.regs, registers);
+                        assert_eq!(state.eflags, expected_flags);
+                        assert_eq!(state.eip, target);
+                        assert_eq!(memory.read(address, 1).unwrap(), [value]);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// spec: EXEC-NATIVE-2, EXEC-NATIVE-3
+#[test]
+fn typed_values_keep_wide_sums_and_memory_versions_distinct() {
+    let byte = Expression::constant(Width::Byte, 255);
+    let one = Expression::constant(Width::Byte, 1);
+    assert_eq!(
+        Expression::binary(Binary::Add, byte.clone(), one.clone())
+            .unwrap()
+            .as_constant(),
+        Some(0)
+    );
+    let wide = Expression::extend(byte, Width::Word, false).unwrap();
+    let one = Expression::extend(one, Width::Word, false).unwrap();
+    assert_eq!(
+        Expression::binary(Binary::Add, wide, one)
+            .unwrap()
+            .as_constant(),
+        Some(256)
+    );
+    assert!(
+        Expression::binary(
+            Binary::Add,
+            Expression::constant(Width::Byte, 1),
+            Expression::constant(Width::Word, 1)
+        )
+        .is_none()
+    );
+    let address = Expression::register(Register(6));
+    let before = Expression::load(MemoryVersion(0), address.clone(), Width::Byte).unwrap();
+    let after = Expression::load(MemoryVersion(1), address, Width::Byte).unwrap();
+    assert_ne!(before, after);
+}
+
+// spec: EXEC-NATIVE-1, EXEC-NATIVE-2
+#[test]
+fn candidate_views_and_declared_exits_cannot_change_checked_relations() {
+    let image = snapshot(byte_loop(6, 7, 1, 0, 0, false, true));
+    let original = copy(&image);
+    let mut candidate = original.clone();
+    candidate
+        .view
+        .inputs
+        .push((Input::Length, Expression::constant(Width::Dword, 123)));
+    assert!(matches!(
+        verify::verify(&image, candidate, &mut budget()),
+        Err(Rejection::Counterexample {
+            reason: "input mapping",
+            ..
+        })
+    ));
+    let mut candidate = original;
+    candidate.exits.push(0x2000);
+    assert!(matches!(
+        verify::verify(&image, candidate, &mut budget()),
+        Err(Rejection::Counterexample {
+            reason: "cutpoints or exits",
             ..
         })
     ));

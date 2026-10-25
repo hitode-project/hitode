@@ -79,6 +79,11 @@ ordered reads of newly written history. A zero counter declines at this body;
 the enclosing guest function owns its zero-iteration path. State-view offsets
 are part of the checked address expressions, independent of register allocation.
 
+### EXEC-NATIVE-3 Typed state and shared integer semantics
+
+**Rule**: Integer admission MUST use CPU-core operand decoding and arithmetic flag semantics. Expressions MUST retain their bit widths and memory versions. Every proved exit MUST identify its PC, registers, flags and memory version.
+**Verification**: Test
+
 ## x64
 
 ### EXEC-X64-1 Frozen engine

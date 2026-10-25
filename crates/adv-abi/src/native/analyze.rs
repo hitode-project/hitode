@@ -74,18 +74,32 @@ pub fn discover(image: &ImageSnapshot, budget: &mut Budget) -> Vec<CandidateBind
                 &[Computation::Lz77]
             };
             for &computation in computations {
+                let source = Expression::binary(
+                    Binary::Add,
+                    Expression::register(source),
+                    Expression::constant(Width::Dword, u64::from(source_offset)),
+                )
+                .expect("32-bit address");
+                let destination = Expression::binary(
+                    Binary::Add,
+                    Expression::register(destination),
+                    Expression::constant(Width::Dword, u64::from(destination_offset)),
+                )
+                .expect("32-bit address");
+                let remaining = Expression::register(remaining);
+                let Some(view) = byte_view(computation, source, destination, remaining.clone())
+                else {
+                    continue;
+                };
                 candidates.push(CandidateBinding {
                     image: image.identity,
                     contract: ReferenceContract::get(computation),
                     entry: start,
                     end,
-                    mapping: ByteLoopMapping {
-                        source,
-                        destination,
-                        remaining,
-                        source_offset,
-                        destination_offset,
-                    },
+                    view,
+                    cutpoints: vec![start],
+                    exits: vec![end],
+                    proof: ProofHint::ForwardBytes { remaining },
                 });
             }
         }

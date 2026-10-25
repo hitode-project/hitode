@@ -117,9 +117,11 @@ API signatures and metadata come from `data/abi/`; `tools/abi/` regenerates them
 `adv-abi::native` separates `ReferenceContract`, `CandidateBinding` and
 `VerifiedBinding`. Preparation reads owned, immutable image snapshots with
 module-relative dependencies. The analyzer only proposes mappings; the
-independent verifier decodes their complete code and checks a supported
-recurrence before issuing a binding. Its forward-byte rule covers LZ77 and
-PNG Sub/Up bodies with explicit alias and entry conditions. Unsupported
+independent verifier decodes their complete code through `adv-cpu-core::integer`
+and checks a supported recurrence before issuing a binding. Typed expressions
+retain memory versions and complete state for each exit; entry conditions are
+parameterized obligations for a publication bridge. Its forward-byte rule covers
+LZ77 and PNG Sub/Up bodies. Unsupported
 recurrences remain guest work. These admission data types do not install
 execution entries or call device kernels.
 
