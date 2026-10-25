@@ -184,7 +184,11 @@ fn ffi_result(result: Result<i32, i32>) -> i32 {
                 {
                     *libc::__error() = error;
                 }
-                #[cfg(not(target_vendor = "apple"))]
+                #[cfg(target_os = "android")]
+                {
+                    *libc::__errno() = error;
+                }
+                #[cfg(not(any(target_vendor = "apple", target_os = "android")))]
                 {
                     *libc::__errno_location() = error;
                 }
