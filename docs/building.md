@@ -134,7 +134,7 @@ FFMPEG_DIR=<ffmpeg> LIBCLANG_PATH=<libclang dir> pnpm tauri dev
 
 Set `ADV_WINE_DIST` to the complete stripped Wine installation, including its
 prefix template and identity tables, when building a playable launcher. Cargo
-embeds compressed files with a content identity, without storing their host paths.
+embeds one solid XZ archive with a file-length manifest and content identity, without storing host paths.
 The player expands them once under its private application data before the first
 game, on a background thread. macOS, iOS and Android use the same files and code;
 source-only checks may omit the distribution, but game startup then reports the
@@ -142,7 +142,7 @@ missing build input instead of running the built-in stack.
 When generating a mobile Cargo wrapper below, set `ADV_WINE_DIST` at that step;
 the wrapper carries it through Xcode's restricted build environment.
 
-For a macOS release, run `python3 tools/macos/build.py --ffmpeg-only`, then put its printed wrapper folder first on `PATH` and run `pnpm tauri build --target aarch64-apple-darwin --bundles app,dmg`. The wrapper selects the static FFmpeg, remaps build paths and strips release debug records. The bundle is signed ad hoc with Hardened Runtime and only the `allow-jit` entitlement. The version comes from `package.json`, and must match the Cargo workspace version.
+For a macOS release, run `python3 tools/macos/build.py --ffmpeg-only`, then put its printed wrapper folder first on `PATH` and run `pnpm tauri build --target aarch64-apple-darwin --bundles app,dmg`. The wrapper selects the static FFmpeg, remaps build paths and strips release debug records. Preserve a separate dSYM when needed, and run `strip -x` on the bundled executable before its final signature to remove local symbols. The bundle is signed ad hoc with Hardened Runtime and only the `allow-jit` entitlement. The version comes from `package.json`, and must match the Cargo workspace version.
 
 ## macOS release package
 

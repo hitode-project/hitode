@@ -63,6 +63,10 @@ opt-level = 3
 [profile.release]
 debug = "line-tables-only"
 
+# Solid runtime compression also runs inside the launcher's build script.
+[profile.release.package.lzma-rust2]
+opt-level = 3
+
 [patch.crates-io]
 cpal = { path = "vendor/cpal" }
 symphonia-codec-adpcm = { path = "vendor/symphonia-codec-adpcm" }

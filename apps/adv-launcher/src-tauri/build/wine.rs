@@ -1,5 +1,5 @@
 //! Embed portable Wine files without host paths or platform resource APIs.
-use flate2::{Compression, write::GzEncoder};
+use lzma_rust2::{XzOptions, XzWriter};
 use sha2::{Digest, Sha256};
 use std::{
     fmt::Write,
@@ -37,10 +37,14 @@ pub fn bundle() {
         let mut paths = Vec::new();
         files(&root, &mut paths);
         paths.sort();
-        std::fs::create_dir_all(output.join("wine-files")).unwrap();
+        let mut options = XzOptions::with_preset(9);
+        options.lzma_options.nice_len = 273;
+        options.lzma_options.depth_limit = 512;
+        let archive = std::fs::File::create(output.join("wine.xz")).unwrap();
+        let mut compressed = XzWriter::new(archive, options).unwrap();
         let mut hash = Sha256::new();
-        generated.push_str("pub const FILES: &[(&str, Option<&[u8]>)] = &[\n");
-        for (index, path) in paths.iter().enumerate() {
+        generated.push_str("pub const FILES: &[(&str, Option<u64>)] = &[\n");
+        for path in &paths {
             let name = path
                 .strip_prefix(&root)
                 .unwrap()
@@ -57,18 +61,13 @@ pub fn bundle() {
             let bytes = std::fs::read(path).expect("read Wine file");
             hash.update((bytes.len() as u64).to_le_bytes());
             hash.update(&bytes);
-            let mut compressed = GzEncoder::new(Vec::new(), Compression::fast());
             compressed.write_all(&bytes).unwrap();
-            std::fs::write(
-                output.join(format!("wine-files/{index}.gz")),
-                compressed.finish().unwrap(),
-            )
-            .unwrap();
-            writeln!(generated, "({name:?}, Some(include_bytes!(concat!(env!(\"OUT_DIR\"), \"/wine-files/{index}.gz\")))),").unwrap();
+            writeln!(generated, "({name:?}, Some({})),", bytes.len()).unwrap();
         }
+        compressed.finish().unwrap();
         writeln!(
             generated,
-            "];\npub const ID: &str = \"{:x}\";",
+            "];\npub const ARCHIVE: &[u8] = include_bytes!(concat!(env!(\"OUT_DIR\"), \"/wine.xz\"));\npub const ID: &str = \"{:x}\";",
             hash.finalize()
         )
         .unwrap();
@@ -76,7 +75,7 @@ pub fn bundle() {
         // Source-only CI can check the launcher without a distribution. Player
         // startup reports the missing build input instead of selecting old Win32.
         generated.push_str(
-            "pub const FILES: &[(&str, Option<&[u8]>)] = &[];\npub const ID: &str = \"unavailable\";\n",
+            "pub const FILES: &[(&str, Option<u64>)] = &[];\npub const ARCHIVE: &[u8] = &[];\npub const ID: &str = \"unavailable\";\n",
         );
     }
     std::fs::write(output.join("wine.rs"), generated).unwrap();

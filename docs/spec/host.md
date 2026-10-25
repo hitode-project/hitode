@@ -147,6 +147,7 @@ Direct presentation requires Core Animation's `contentsOpaque` capability. Other
 ### HOST-SES-12 Player execution lifetime
 
 **Rule**: The player MUST run at most one Wine session on its persistent execution owner. Idle execution MUST block without polling. Bundled Wine files MUST be prepared off the UI thread before game startup, without selecting the built-in stack when unavailable.
+Preparation MUST validate the compressed stream completely before publishing the installation's ready marker.
 **Verification**: Test
 
 ### HOST-SES-2 Wakeups
