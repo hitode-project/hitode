@@ -1083,3 +1083,221 @@ fn cached_code_pages_resume_wine_with_owned_lock() {
         );
     }
 }
+
+struct CountingGuest<'a> {
+    cpu: &'a mut dyn Guest,
+    calls: std::cell::Cell<usize>,
+    pages: std::cell::RefCell<std::collections::BTreeSet<u32>>,
+    stores: usize,
+}
+impl CountingGuest<'_> {
+    fn touch(&self, at: u32, len: usize) {
+        self.calls.set(self.calls.get() + 1);
+        if len != 0 {
+            let page = adv_machine::layout::PAGE;
+            self.pages
+                .borrow_mut()
+                .extend(at / page..=(at + len as u32 - 1) / page);
+        }
+    }
+}
+impl Guest for CountingGuest<'_> {
+    fn reg(&self, r: adv_cpu::backend::Reg) -> u32 {
+        self.cpu.reg(r)
+    }
+    fn set_reg(&mut self, r: adv_cpu::backend::Reg, value: u32) {
+        self.cpu.set_reg(r, value);
+    }
+    fn read(&self, at: u32, data: &mut [u8]) -> Result<(), adv_cpu::backend::MemFault> {
+        self.touch(at, data.len());
+        self.cpu.read(at, data)
+    }
+    fn write(&mut self, at: u32, data: &[u8]) -> Result<(), adv_cpu::backend::MemFault> {
+        self.touch(at, data.len());
+        self.stores += 1;
+        self.cpu.write(at, data)
+    }
+    fn accessible(&self, at: u32, len: u32, prot: Prot) -> bool {
+        self.touch(at, len as usize);
+        self.cpu.accessible(at, len, prot)
+    }
+    fn shared_bytes(&self, at: u32, len: usize) -> Option<&[u8]> {
+        self.touch(at, len);
+        // Wine's NLS file mappings require a bulk read instead of a borrow.
+        if !(DATA..DATA + LEN).contains(&at) {
+            return None;
+        }
+        self.cpu.shared_bytes(at, len)
+    }
+    fn copy_memory(
+        &mut self,
+        src: u32,
+        dst: u32,
+        len: usize,
+    ) -> Result<(), adv_cpu::backend::MemFault> {
+        self.touch(src, len);
+        self.touch(dst, len);
+        self.stores += 1;
+        self.cpu.copy_memory(src, dst, len)
+    }
+    fn fill_memory(
+        &mut self,
+        dst: u32,
+        byte: u8,
+        len: usize,
+    ) -> Result<(), adv_cpu::backend::MemFault> {
+        self.touch(dst, len);
+        self.stores += 1;
+        self.cpu.fill_memory(dst, byte, len)
+    }
+    fn map(&mut self, at: u32, len: u32, prot: Prot) -> Result<(), adv_cpu::backend::MemFault> {
+        self.cpu.map(at, len, prot)
+    }
+    fn protect(&mut self, at: u32, len: u32, prot: Prot) -> Result<(), adv_cpu::backend::MemFault> {
+        self.cpu.protect(at, len, prot)
+    }
+    fn unmap(&mut self, at: u32, len: u32) -> Result<(), adv_cpu::backend::MemFault> {
+        self.cpu.unmap(at, len)
+    }
+}
+
+fn counted_body(m: &mut Machine<Cpu>, name: &str, context: u32, args: &[u32]) {
+    let thunk = m
+        .sys
+        .thunks
+        .published_index(adv_nt::native::MODULE, name)
+        .unwrap();
+    let body = m.sys.thunks.get(thunk).f.env_leaf.unwrap();
+    m.cpu.set_reg(adv_cpu::backend::Reg::Esp, SLOT);
+    for (i, arg) in args.iter().enumerate() {
+        m.cpu.write_u32(ARGS + i as u32 * 4, *arg).unwrap();
+    }
+    let mut cpu = CountingGuest {
+        cpu: &mut m.cpu,
+        calls: std::cell::Cell::new(0),
+        pages: std::cell::RefCell::new(std::collections::BTreeSet::new()),
+        stores: 0,
+    };
+    let mut env = adv_machine::Env {
+        context,
+        cpu: &mut cpu,
+        sys: &mut m.sys,
+        ext: &mut m.ext,
+        thunk,
+    };
+    assert!(body(&mut env).is_some(), "{name} declined");
+    let pages = cpu.pages.borrow().len();
+    assert!(
+        cpu.calls.get() <= 8 * pages + 16,
+        "{name}: {} calls for {pages} pages",
+        cpu.calls.get()
+    );
+    assert!(
+        cpu.stores <= if name.starts_with("kernelbase") { 3 } else { 1 },
+        "{name}: {} stores",
+        cpu.stores
+    );
+}
+
+// spec: NAT-BODY-4, NAT-BODY-5, NAT-BODY-6
+#[test]
+fn pe_bodies_access_memory_by_page() {
+    let Some(dist) = dist() else {
+        return;
+    };
+    for module in ["ntdll.dll", "msvcrt.dll", "ucrtbase.dll"] {
+        let (mut m, _) = machine(&dist, module, true);
+        let context = m.spawn("counted-body", CODE, &[], 0x10000).unwrap();
+        for name in [
+            "memset", "memmove", "memcmp", "memchr", "strlen", "strnlen", "wcslen", "wcsnlen",
+            "strcmp", "strncmp", "wcscmp", "wcsncmp", "strchr", "strrchr", "wcschr", "wcsrchr",
+            "strcpy", "wcscpy", "strcat", "wcscat", "strstr", "wcsstr",
+        ] {
+            // ntdll's memmove jumps to its existing memcpy body.
+            let export = if module == "ntdll.dll" && name == "memmove" {
+                "memcpy"
+            } else {
+                name
+            };
+            for offset in [0x100, 0xf01] {
+                let (a, b) = (DATA + offset, DATA + 0x4000);
+                let width = if name.starts_with("wcs") { 2 } else { 1 };
+                let mut data = vec![0; LEN as usize];
+                for at in [a, b] {
+                    for i in 0..1000 {
+                        put(&mut data, at + i * width, width, 0x41);
+                    }
+                }
+                m.cpu.write(DATA, &data).unwrap();
+                let args = if name == "memset" {
+                    vec![a, 0x41, 1000]
+                } else if name.ends_with("nlen") {
+                    vec![a, 1000]
+                } else if name.ends_with("chr") {
+                    vec![a, 0x7f, 1000]
+                } else {
+                    vec![a, b, 1000]
+                };
+                counted_body(&mut m, &format!("{module}!{export}"), context, &args);
+            }
+        }
+    }
+    let (mut m, _, _) = nls_machine(&dist, true);
+    let context = m.spawn("counted-conversion", CODE, &[], 0x10000).unwrap();
+    for code in [1252, 932] {
+        for flags in [0, 2, 8] {
+            for len in [1000, u32::MAX] {
+                m.cpu.write(DATA, &[0x41; 1000]).unwrap();
+                m.cpu.write(DATA + 1000, &[0]).unwrap();
+                counted_body(
+                    &mut m,
+                    "kernelbase.dll!MultiByteToWideChar",
+                    context,
+                    &[code, flags, DATA, len, DATA + 0x4000, 2000],
+                );
+            }
+        }
+        for flags in [0, 0x200, 0x400] {
+            for len in [1000, u32::MAX] {
+                for i in 0..1000 {
+                    m.cpu.write(DATA + i * 2, &0x41u16.to_le_bytes()).unwrap();
+                }
+                m.cpu.write(DATA + 2000, &[0, 0]).unwrap();
+                counted_body(
+                    &mut m,
+                    "kernelbase.dll!WideCharToMultiByte",
+                    context,
+                    &[
+                        code,
+                        flags,
+                        DATA,
+                        len,
+                        DATA + 0x4000,
+                        2000,
+                        0,
+                        DATA + 0x7000,
+                    ],
+                );
+            }
+        }
+    }
+    // Exercise bulk shared reads and outputs that exceed the stack buffers.
+    let large = 0x900000;
+    m.cpu.map(large, 0x50000, Prot::RW).unwrap();
+    m.cpu.fill_memory(large, 0x41, 0x50000).unwrap();
+    counted_body(
+        &mut m,
+        "kernelbase.dll!MultiByteToWideChar",
+        context,
+        &[1252, 0, large, 5000, DATA + 0x4000, 5000],
+    );
+    let mut output = [0; 10000];
+    m.cpu.read(DATA + 0x4000, &mut output).unwrap();
+    assert!(output.as_chunks::<2>().0.iter().all(|ch| *ch == [0x41, 0]));
+    counted_body(
+        &mut m,
+        "kernelbase.dll!MultiByteToWideChar",
+        context,
+        &[1252, 0, large, 0x50000, DATA + 0x4000, 1000],
+    );
+}

@@ -1,42 +1,57 @@
 //! Locale-independent Wine 11 PE string and memory functions.
 
-use adv_cpu::backend::{Guest, GuestExt, Prot};
-use adv_machine::Env;
+use adv_cpu::backend::{Guest, Prot};
+use adv_machine::{Conv, Env, EnvLeafHandler, layout::PAGE};
 
-fn unit(cpu: &dyn Guest, at: u32, width: u32) -> Option<u32> {
-    if !cpu.accessible(at, width, Prot::READ) {
+use super::{Body, resume_original};
+
+// Each slice stops at a guest page boundary, except an unaligned wide unit
+// straddling it, whose two page spans are checked separately.
+fn page(cpu: &dyn Guest, at: u32, width: u32, limit: u32) -> Option<&[u8]> {
+    let rest = PAGE - at % PAGE;
+    let len = (rest / width).max(1).min(limit) * width;
+    at.checked_add(len - 1)?;
+    if !cpu.accessible(at, len.min(rest), Prot::READ)
+        || (len > rest && !cpu.accessible(at + rest, len - rest, Prot::READ))
+    {
         return None;
     }
+    cpu.shared_bytes(at, len as usize)
+}
+
+fn value(bytes: &[u8], width: u32) -> u32 {
     if width == 1 {
-        Some(u32::from(cpu.read_u8(at).ok()?))
+        u32::from(bytes[0])
     } else {
-        Some(u32::from(cpu.read_u16(at).ok()?))
+        u32::from(u16::from_le_bytes([bytes[0], bytes[1]]))
     }
 }
 
-// Stop at the terminator, including when it touches the final mapped page.
-fn string(cpu: &dyn Guest, at: u32, width: u32, limit: u32) -> Option<Vec<u8>> {
-    let mut data = Vec::new();
-    let mut pos = at;
-    for _ in 0..limit {
-        let ch = unit(cpu, pos, width)?;
-        data.extend_from_slice(&ch.to_le_bytes()[..width as usize]);
-        if ch == 0 {
-            break;
-        }
-        pos = pos.checked_add(width)?;
-    }
-    Some(data)
+pub(super) fn string(cpu: &dyn Guest, at: u32, width: u32) -> Option<&[u8]> {
+    let len = scan_length(cpu, at, width, u32::MAX)?
+        .checked_add(1)?
+        .checked_mul(width)?;
+    cpu.shared_bytes(at, len as usize)
 }
 
-fn write(cpu: &mut dyn Guest, at: u32, data: &[u8]) -> Option<()> {
-    if !data.is_empty() {
-        if !cpu.accessible(at, data.len() as u32, Prot::WRITE) {
-            return None;
+fn scan_length(cpu: &dyn Guest, mut at: u32, width: u32, limit: u32) -> Option<u32> {
+    let mut count = 0;
+    while count < limit {
+        let bytes = page(cpu, at, width, limit - count)?;
+        let zero = if width == 1 {
+            bytes.iter().position(|&ch| ch == 0)
+        } else {
+            bytes.as_chunks::<2>().0.iter().position(|ch| *ch == [0, 0])
+        };
+        if let Some(i) = zero {
+            return count.checked_add(i as u32);
         }
-        cpu.write(at, data).ok()?;
+        count += bytes.len() as u32 / width;
+        if count < limit {
+            at = at.checked_add(bytes.len() as u32)?;
+        }
     }
-    Some(())
+    Some(limit)
 }
 
 // spec: NAT-BODY-5
@@ -59,19 +74,49 @@ pub(super) fn memset(env: &mut Env<'_>) -> Option<u64> {
     Some(u64::from(dst))
 }
 
-fn compare(env: &Env<'_>, width: u32, limit: u32, terminated: bool, sign: bool) -> Option<u64> {
+fn compare(env: &Env<'_>, width: u32, mut limit: u32, terminated: bool, sign: bool) -> Option<u64> {
     let (mut a, mut b) = (env.arg(0), env.arg(1));
-    for _ in 0..limit {
-        let (x, y) = (unit(env.cpu, a, width)?, unit(env.cpu, b, width)?);
-        if x != y {
-            let diff = x as i32 - y as i32;
-            return Some(u64::from((if sign { diff.signum() } else { diff }) as u32));
+    let (mut x, mut y) = (&[][..], &[][..]);
+    while limit != 0 {
+        if x.is_empty() {
+            x = page(env.cpu, a, width, limit)?;
         }
-        if terminated && x == 0 {
-            break;
+        if y.is_empty() {
+            y = page(env.cpu, b, width, limit)?;
         }
-        a = a.checked_add(width)?;
-        b = b.checked_add(width)?;
+        let len = y.len().min(x.len());
+        if !terminated {
+            let order = x[..len].cmp(&y[..len]);
+            if order != std::cmp::Ordering::Equal {
+                return Some(u64::from(order as i32 as u32));
+            }
+        } else {
+            let stop = if width == 1 {
+                x[..len]
+                    .iter()
+                    .zip(&y[..len])
+                    .position(|(&x, &y)| x != y || x == 0)
+            } else {
+                x[..len]
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .zip(y[..len].as_chunks::<2>().0)
+                    .position(|(x, y)| x != y || *x == [0, 0])
+            };
+            if let Some(i) = stop {
+                let at = i * width as usize;
+                let diff = value(&x[at..], width) as i32 - value(&y[at..], width) as i32;
+                return Some(u64::from((if sign { diff.signum() } else { diff }) as u32));
+            }
+        }
+        x = &x[len..];
+        y = &y[len..];
+        limit -= len as u32 / width;
+        if limit != 0 {
+            a = a.checked_add(len as u32)?;
+            b = b.checked_add(len as u32)?;
+        }
     }
     Some(0)
 }
@@ -105,14 +150,7 @@ pub(super) fn wcsncmp(env: &mut Env<'_>) -> Option<u64> {
 }
 
 fn length(env: &Env<'_>, width: u32, limit: u32) -> Option<u64> {
-    let mut at = env.arg(0);
-    for count in 0..limit {
-        if unit(env.cpu, at, width)? == 0 {
-            return Some(u64::from(count));
-        }
-        at = at.checked_add(width)?;
-    }
-    Some(u64::from(limit))
+    Some(u64::from(scan_length(env.cpu, env.arg(0), width, limit)?))
 }
 
 pub(super) fn strlen(env: &mut Env<'_>) -> Option<u64> {
@@ -128,22 +166,28 @@ pub(super) fn wcsnlen(env: &mut Env<'_>) -> Option<u64> {
     length(env, 2, env.arg(1))
 }
 
-fn find(env: &Env<'_>, width: u32, limit: u32, terminated: bool, last: bool) -> Option<u64> {
+fn find(env: &Env<'_>, width: u32, mut limit: u32, terminated: bool, last: bool) -> Option<u64> {
     let mut at = env.arg(0);
     let ch = env.arg(1) & if width == 1 { 0xff } else { 0xffff };
     let mut found = 0;
-    for _ in 0..limit {
-        let x = unit(env.cpu, at, width)?;
-        if x == ch {
-            found = at;
-            if !last {
-                break;
+    while limit != 0 {
+        let bytes = page(env.cpu, at, width, limit)?;
+        for (i, unit) in bytes.chunks_exact(width as usize).enumerate() {
+            let x = value(unit, width);
+            if x == ch {
+                found = at + i as u32 * width;
+                if !last {
+                    return Some(u64::from(found));
+                }
+            }
+            if terminated && x == 0 {
+                return Some(u64::from(found));
             }
         }
-        if terminated && x == 0 {
-            break;
+        limit -= bytes.len() as u32 / width;
+        if limit != 0 {
+            at = at.checked_add(bytes.len() as u32)?;
         }
-        at = at.checked_add(width)?;
     }
     Some(u64::from(found))
 }
@@ -166,9 +210,9 @@ pub(super) fn wcsrchr(env: &mut Env<'_>) -> Option<u64> {
 
 fn copy(env: &mut Env<'_>, width: u32, append: bool) -> Option<u64> {
     let (dst, src) = (env.arg(0), env.arg(1));
-    let data = string(env.cpu, src, width, u32::MAX)?;
+    let data = string(env.cpu, src, width)?;
     let offset = if append {
-        string(env.cpu, dst, width, u32::MAX)?.len() as u32 - width
+        string(env.cpu, dst, width)?.len() as u32 - width
     } else {
         0
     };
@@ -178,7 +222,11 @@ fn copy(env: &mut Env<'_>, width: u32, append: bool) -> Option<u64> {
     if at < src.checked_add(data.len() as u32)? && src < end {
         return None;
     }
-    write(env.cpu, at, &data)?;
+    let len = data.len();
+    if !env.cpu.accessible(at, len as u32, Prot::WRITE) {
+        return None;
+    }
+    env.cpu.copy_memory(src, at, len).ok()?;
     Some(u64::from(dst))
 }
 
@@ -196,15 +244,15 @@ pub(super) fn wcscat(env: &mut Env<'_>) -> Option<u64> {
 }
 
 fn substring(env: &Env<'_>, width: u32, check_haystack: bool) -> Option<u64> {
-    if check_haystack && unit(env.cpu, env.arg(0), width)? == 0 {
+    if check_haystack && value(page(env.cpu, env.arg(0), width, 1)?, width) == 0 {
         return Some(0);
     }
-    let needle = string(env.cpu, env.arg(1), width, u32::MAX)?;
+    let needle = string(env.cpu, env.arg(1), width)?;
     let needle = &needle[..needle.len() - width as usize];
     if needle.is_empty() {
         return Some(u64::from(env.arg(0)));
     }
-    let haystack = string(env.cpu, env.arg(0), width, u32::MAX)?;
+    let haystack = string(env.cpu, env.arg(0), width)?;
     let offset = haystack
         .windows(needle.len())
         .enumerate()
@@ -222,4 +270,105 @@ pub(super) fn wcsstr(env: &mut Env<'_>) -> Option<u64> {
 
 pub(super) fn strstr_nt(env: &mut Env<'_>) -> Option<u64> {
     substring(env, 1, true)
+}
+
+const ALL: &[&str] = &[
+    "ntdll.dll",
+    "msvcrt.dll",
+    "ucrtbase.dll",
+    "msvcr70.dll",
+    "msvcr71.dll",
+    "msvcr80.dll",
+    "msvcr90.dll",
+    "msvcr100.dll",
+    "msvcr110.dll",
+    "msvcr120.dll",
+    "msvcrtd.dll",
+];
+const WITH_STRNLEN: &[&str] = &[
+    "ntdll.dll",
+    "msvcrt.dll",
+    "ucrtbase.dll",
+    "msvcr80.dll",
+    "msvcr90.dll",
+    "msvcr100.dll",
+    "msvcr110.dll",
+    "msvcr120.dll",
+];
+const DIFF_COMPARISONS: &[&str] = &[
+    "ntdll.dll",
+    "msvcrt.dll",
+    "msvcr80.dll",
+    "msvcr90.dll",
+    "msvcr100.dll",
+    "msvcrtd.dll",
+];
+const NTDLL: &[&str] = &["ntdll.dll"];
+const CRT: &[&str] = &[
+    "msvcrt.dll",
+    "ucrtbase.dll",
+    "msvcr70.dll",
+    "msvcr71.dll",
+    "msvcr80.dll",
+    "msvcr90.dll",
+    "msvcr100.dll",
+    "msvcr110.dll",
+    "msvcr120.dll",
+    "msvcrtd.dll",
+];
+const SIGN_COMPARISONS: &[&str] = &[
+    "ucrtbase.dll",
+    "msvcr70.dll",
+    "msvcr71.dll",
+    "msvcr110.dll",
+    "msvcr120.dll",
+];
+
+pub(super) fn bodies() -> Vec<Body> {
+    type Variant = (EnvLeafHandler, &'static [&'static str]);
+    let table: &[(&str, u8, &[Variant])] = &[
+        ("memset", 3, &[(memset, ALL)]),
+        ("memmove", 3, &[(memmove, CRT)]),
+        ("memcmp", 3, &[(memcmp, ALL)]),
+        ("memchr", 3, &[(memchr, ALL)]),
+        ("strlen", 1, &[(strlen, ALL)]),
+        ("strnlen", 2, &[(strnlen, WITH_STRNLEN)]),
+        ("wcslen", 1, &[(wcslen, ALL)]),
+        ("wcsnlen", 2, &[(wcsnlen, WITH_STRNLEN)]),
+        ("strcmp", 2, &[(strcmp, ALL)]),
+        (
+            "strncmp",
+            3,
+            &[
+                (strncmp, DIFF_COMPARISONS),
+                (strncmp_sign, SIGN_COMPARISONS),
+            ],
+        ),
+        ("wcscmp", 2, &[(wcscmp, NTDLL), (wcscmp_sign, CRT)]),
+        ("wcsncmp", 3, &[(wcsncmp, ALL)]),
+        ("strchr", 2, &[(strchr, ALL)]),
+        ("strrchr", 2, &[(strrchr, ALL)]),
+        ("wcschr", 2, &[(wcschr, ALL)]),
+        ("wcsrchr", 2, &[(wcsrchr, ALL)]),
+        ("strcpy", 2, &[(strcpy, ALL)]),
+        ("wcscpy", 2, &[(wcscpy, ALL)]),
+        ("strcat", 2, &[(strcat, ALL)]),
+        ("wcscat", 2, &[(wcscat, ALL)]),
+        ("strstr", 2, &[(strstr_nt, NTDLL), (strstr, CRT)]),
+        ("wcsstr", 2, &[(wcsstr, ALL)]),
+    ];
+    let mut bodies = Vec::new();
+    for &(name, argc, variants) in table {
+        for &(leaf, modules) in variants {
+            for module in modules {
+                bodies.push(Body {
+                    name: format!("{module}!{name}"),
+                    conv: Conv::Cdecl { argc },
+                    leaf,
+                    handler: resume_original,
+                });
+            }
+        }
+    }
+    bodies
 }

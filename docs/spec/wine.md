@@ -354,6 +354,11 @@ FreeType is such a library: win32u opens it by name and draws TrueType text thro
 **Rule**: Locale-independent PE string and memory bodies MUST preserve Wine's bytes, return values, bounds and overlap behavior. An access that would fault MUST decline before any write.
 **Verification**: Test
 
+### NAT-BODY-6 PE body memory access
+
+**Rule**: PE string and conversion bodies MUST bound guest memory calls by pages and tables touched, rather than input units. Short calls fitting within one page of strings or eight KiB of conversion output MUST NOT allocate heap buffers.
+**Verification**: Test
+
 ## Host DLL images
 
 ### WINE-DLL-1 Loader-owned entries
