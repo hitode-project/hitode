@@ -100,7 +100,15 @@ pub fn call(env: &mut Env<'_>, number: u32) -> Outcome {
         return Outcome::Return(status::ACCESS_VIOLATION);
     };
     let args: Vec<u32> = (1..=u32::from(bytes) / 4).map(|i| env.arg(i)).collect();
-    Outcome::call_aligned(env, function, args, |_, returned| {
+    // Wine 11's win32syscalls.h: NtUserPeekMessage, including its yield.
+    let peek = number == 0x14ca;
+    if peek {
+        env.sys.begin_poll_peek();
+    }
+    Outcome::call_aligned(env, function, args, move |env, returned| {
+        if peek {
+            env.sys.end_poll_peek(returned.value() == 0);
+        }
         Outcome::Return(returned.value())
     })
 }
@@ -116,6 +124,11 @@ pub fn user_mode_callback(
     ret_ptr: u32,
     ret_length: u32,
 ) -> Outcome {
+    // Dispatch callbacks include Wine's thunk-lock save/restore around a yield.
+    // Window procedures, hooks and other application callbacks perform new work.
+    if id != 0 {
+        env.sys.poll_work();
+    }
     let Some(&Dispatcher(dispatcher)) = env.ext.try_get::<Dispatcher>() else {
         return Outcome::Fail("user-mode callbacks before ntdll.dll is mapped".into());
     };

@@ -221,5 +221,6 @@ fn query_performance_counter(env: &mut Env<'_>) -> Option<u64> {
             .write(frequency, &crate::system::TICKS_PER_SECOND.to_le_bytes())
             .ok()?;
     }
+    env.sys.poll_observation();
     Some(u64::from(crate::status::SUCCESS))
 }

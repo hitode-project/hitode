@@ -88,6 +88,11 @@ This spec covers `adv-machine`, which schedules guest threads, owns time and dis
 **Rule**: In real time, timed waits and waitable timers MUST expire on the first whole guest millisecond at or after their deadline. Display-paced waits MUST keep exact deadlines. Polling rounds MUST end on the next whole millisecond.
 **Verification**: Test
 
+### PROC-CLOCK-7 Quiet observation rounds
+
+**Rule**: As an alternative to PROC-CLOCK-5, repeated intervals containing only clock reads, empty message peeks and yields MAY wait before 64 repetitions. Every ready context MUST run during the round, with unchanged execution-delivery and object generations. New work or wake-source changes MUST invalidate this proof, preserving clock-tick deadlines and retained wakeups.
+**Verification**: Test
+
 ## Isolation
 
 ### PROC-ISO-1 Separate processes

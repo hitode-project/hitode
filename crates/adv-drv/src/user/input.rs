@@ -296,6 +296,7 @@ fn next(env: &mut Env<'_>, mask: u32) -> Outcome {
         queue.processing = false;
         return Outcome::Return(u32::from(mask == QS_ALLINPUT && queue.events.is_empty()));
     };
+    env.sys.poll_work();
     let event = queue.events.remove(index).unwrap();
     if queue.events.is_empty()
         && let Err(error) = queue.read.read_exact(&mut [0])

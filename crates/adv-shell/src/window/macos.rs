@@ -149,7 +149,6 @@ pub(crate) struct Hub {
     /// The view's display link (macOS 14 and later), paused between requests.
     link: RefCell<Option<Retained<objc2_quartz_core::CADisplayLink>>>,
     on_frame: RefCell<Option<Rc<dyn Fn()>>>,
-    in_frame: Cell<bool>,
     pub(crate) vsync: Arc<adv_sync::vsync::Vsync>,
 }
 impl Hub {

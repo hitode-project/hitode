@@ -28,7 +28,7 @@ fn capture(f: &mut Fixture) -> Result<bool, String> {
 }
 
 #[test]
-// spec: DEV-FRAME-1
+// spec: DEV-FRAME-1, DEV-FRAME-12
 fn deferred_capture_keeps_latest_complete_pixels_without_holding_guest_surfaces() {
     for mailbox in [false, true] {
         let mut f = fixture(true, 4, 2, false);
@@ -57,8 +57,8 @@ fn deferred_capture_keeps_latest_complete_pixels_without_holding_guest_surfaces(
         assert_eq!(invoke(&mut f, api::LOCK, &[primary, 0, LOCK_DESC, 0, 0]), 0);
         let front = u32_at(&f.machine, LOCK_DESC + 36);
         assert_eq!(invoke(&mut f, api::UNLOCK, &[primary, 0]), 0);
-        // Unlock of a primary is itself a completed presentation in this model.
-        assert_eq!(f.graphics().stats.presentations, 3);
+        // An unchanged primary unlock preserves the latest publication.
+        assert_eq!(f.graphics().stats.presentations, 2);
         // A later memory write is not a completed frame. Releasing the surface must
         // not make the frontend observe this partially modified/recycled storage.
         f.machine.cpu.write(front, &[0xff; 32]).unwrap();
@@ -66,7 +66,7 @@ fn deferred_capture_keeps_latest_complete_pixels_without_holding_guest_surfaces(
         assert_eq!(invoke(&mut f, api::RELEASE, &[primary]), 0);
         assert!(capture(&mut f).unwrap());
         assert_eq!(f.graphics().presenter.bgra, latest);
-        assert_eq!(f.graphics().presenter.frames, 3);
+        assert_eq!(f.graphics().presenter.frames, 2);
         assert!(!capture(&mut f).unwrap());
         assert_eq!(f.graphics().stats.host_captures, 1);
         if mailbox {
@@ -74,7 +74,7 @@ fn deferred_capture_keeps_latest_complete_pixels_without_holding_guest_surfaces(
             let mut displayed = adv_runtime::Snapshot::default();
             consumer.current().snapshot(&mut displayed).unwrap();
             assert_eq!(displayed.bgra, latest);
-            assert_eq!(displayed.frames, 3);
+            assert_eq!(displayed.frames, 2);
             assert!(!consumer.update());
         }
     }

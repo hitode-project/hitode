@@ -68,6 +68,8 @@ pub struct Ui {
     #[cfg(host_view)]
     next: Instant,
     #[cfg(host_view)]
+    cadence: crate::frame_pacer::Cadence,
+    #[cfg(host_view)]
     pub(crate) menu_changed: bool,
     #[cfg(host_view)]
     pub(crate) dialog_changed: bool,
@@ -131,6 +133,8 @@ pub fn channel(wake: WakeEvent, keys: Arc<KeyState>) -> Result<(Worker, Ui), Str
             presented: false,
             #[cfg(host_view)]
             next: Instant::now(),
+            #[cfg(host_view)]
+            cadence: Default::default(),
             #[cfg(host_view)]
             menu_changed: false,
             #[cfg(host_view)]
@@ -431,6 +435,16 @@ impl Ui {
         if let Some(native) = &mut self.native {
             let completed = native.poll()?;
             if let Some(completed) = completed {
+                if !matches!(
+                    completed.rendered.result,
+                    crate::native_gpu::DrawResult::Presented
+                ) {
+                    self.next = Instant::now();
+                }
+                if let Some(at) = completed.rendered.published_at {
+                    self.cadence.published(completed.rendered.serial, at);
+                    window.frame_rate(self.cadence.rate());
+                }
                 self.metric(Delivery::Native(completed.stats));
                 self.repaint |= window.native_canvas(completed.rendered.canvas)?;
                 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -463,8 +477,8 @@ impl Ui {
             }
             let native = self.native.as_mut().unwrap();
             let dimensions = window.native_client_size()?;
-            if window.refresh_ready()
-                && Instant::now() >= self.next
+            let now = Instant::now();
+            if crate::frame_pacer::submission_at(now, self.next) <= now
                 && (native.has_update() || self.repaint)
                 && native.schedule(dimensions, self.repaint)?
             {

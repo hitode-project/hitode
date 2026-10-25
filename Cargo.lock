@@ -213,6 +213,7 @@ version = "0.1.2"
 dependencies = [
  "adv-abi",
  "adv-cpu",
+ "adv-sync",
  "adv-unicorn",
  "log",
  "rustc-hash 2.1.3",

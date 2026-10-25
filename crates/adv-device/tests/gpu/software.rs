@@ -1,6 +1,7 @@
 use super::*;
 use adv_device::surface::{
-    FlushReason, PixelFormat, Snapshot, SurfaceMemory, Surfaces, frame_mailbox,
+    BlitRect, FlushReason, PixelFormat, Snapshot, SurfaceMemory, Surfaces, VideoFrame, VideoLayer,
+    frame_mailbox,
 };
 
 fn read_texture(context: &NativeContext, texture: &wgpu::Texture) -> Vec<u8> {
@@ -184,4 +185,91 @@ fn no_copy_software_formats_match_snapshots_and_preserve_publications() {
             assert_eq!(read_texture(context, &texture), expected.bgra);
         }
     }
+}
+
+// spec: HOST-DAMAGE-3, DEV-UPDATE-2
+#[test]
+fn bgra_texture_reads_snapshot_storage_after_the_guest_and_mailbox_reuse_their_frames() {
+    let gpu = pollster::block_on(Gpu::request_backend(false, GpuBackend::Metal)).unwrap();
+    let context = gpu.context();
+    for bottom_up in [false, true] {
+        let mut memory = Memory(vec![0; 65536]);
+        let mut surfaces = Surfaces::new(67, 9, 16, 65520, Snapshot::default()).unwrap();
+        let id = surfaces
+            .create(67, 9, bottom_up, PixelFormat::Bgra32, &mut memory)
+            .unwrap();
+        for y in 0..9 {
+            let bytes: Vec<_> = (0..67)
+                .flat_map(|x| [x as u8, y as u8, 23, (x + y) as u8])
+                .collect();
+            memory.write(surfaces[id].row(0, y), &bytes).unwrap();
+        }
+        let (tx, mut rx) = frame_mailbox();
+        surfaces.set_frame_mailbox(tx, adv_sync::WakeEvent::new().unwrap());
+        surfaces.present(id, &memory, surfaces[id].rect()).unwrap();
+        surfaces.flush(&memory, FlushReason::Immediate).unwrap();
+        assert!(rx.update());
+        let mut expected = Snapshot::default();
+        rx.current().snapshot(&mut expected).unwrap();
+        let texture = context
+            .submission()
+            .unwrap()
+            .software_texture(rx.current())
+            .unwrap()
+            .unwrap();
+        assert!(!texture.usage().contains(wgpu::TextureUsages::COPY_DST));
+        for value in 1..8 {
+            surfaces
+                .fill_raw(id, surfaces[id].rect(), value, &mut memory)
+                .unwrap();
+            surfaces.present(id, &memory, surfaces[id].rect()).unwrap();
+            surfaces.flush(&memory, FlushReason::Immediate).unwrap();
+            assert!(rx.update());
+        }
+        drop(rx);
+        drop(surfaces);
+        assert_eq!(read_texture(context, &texture), expected.bgra);
+    }
+    // A video-only publication retains a blank base after the layer is removed.
+    let mut surfaces = Surfaces::new(67, 9, 16, 65520, Snapshot::default()).unwrap();
+    let memory = Memory(vec![0; 65536]);
+    let (tx, mut rx) = frame_mailbox();
+    surfaces.set_frame_mailbox(tx, adv_sync::WakeEvent::new().unwrap());
+    let one = Rect {
+        x: 0,
+        y: 0,
+        w: 1,
+        h: 1,
+    };
+    let layer = VideoLayer {
+        frame: VideoFrame {
+            width: 1,
+            height: 1,
+            pitch: 4,
+            bgra: Arc::from([1, 2, 3, 255]),
+        },
+        source: one,
+        destination: BlitRect {
+            x: 0,
+            y: 0,
+            w: 1,
+            h: 1,
+        },
+        background: None,
+        clip: one,
+        canvas: (67, 9),
+        visible: true,
+        hide_cursor: false,
+    };
+    surfaces.set_video_layer(1, Some(layer), &memory).unwrap();
+    surfaces.set_video_layer(1, None, &memory).unwrap();
+    assert!(rx.update());
+    let texture = context
+        .submission()
+        .unwrap()
+        .software_texture(rx.current())
+        .unwrap()
+        .unwrap();
+    assert_eq!(read_texture(context, &texture), vec![0; 67 * 9 * 4]);
+    gpu.check().unwrap();
 }

@@ -124,6 +124,7 @@ impl Entry {
 /// One payload table for the process, with independent numeric alias namespaces.
 pub struct Objects {
     table: u64,
+    generation: std::cell::Cell<u64>,
     changed: ObjectChanges,
     changes: std::sync::mpsc::Receiver<(u64, crate::WakePriority)>,
     entries: HashMap<u64, Entry>,
@@ -174,6 +175,7 @@ impl Objects {
 
     pub(crate) fn mark_changed(&self, handle: Handle, priority: crate::WakePriority) {
         if let Some(id) = self.object_id(handle) {
+            self.generation.set(self.generation.get().wrapping_add(1));
             let _ = self.changed.send((id, priority));
         }
     }
@@ -181,6 +183,7 @@ impl Objects {
     pub(crate) fn changed_waiters(&self) -> Vec<(crate::CtxId, crate::WakePriority)> {
         let mut changes = BTreeMap::new();
         for (id, priority) in self.changes.try_iter() {
+            self.generation.set(self.generation.get().wrapping_add(1));
             let previous = changes.entry(id).or_insert(priority);
             *previous = (*previous).min(priority);
         }
@@ -203,6 +206,10 @@ impl Objects {
         }
     }
 
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation.get()
+    }
+
     pub fn reference_limit(&self) -> u32 {
         self.limits.references
     }
@@ -213,6 +220,7 @@ impl Objects {
         let (changed, changes) = std::sync::mpsc::channel();
         Self {
             table,
+            generation: std::cell::Cell::new(0),
             changed,
             changes,
             entries: HashMap::default(),

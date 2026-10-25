@@ -321,6 +321,7 @@ fn host_system() -> (Vec<u8>, Vec<u8>) {
 /// NtQueryPerformanceCounter(*counter, *frequency): 100 ns ticks of the
 /// monotonic clock, as the server's.
 pub fn query_performance_counter(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    env.sys.poll_observation();
     let &[counter, frequency] = args else {
         unreachable!()
     };
@@ -342,6 +343,7 @@ pub(crate) fn performance_counter(env: &Env<'_>) -> u64 {
 
 /// NtQuerySystemTime(*time)
 pub fn query_time(env: &mut Env<'_>, args: &[u32]) -> Outcome {
+    env.sys.poll_observation();
     let time = env.sys.clock.system_time();
     status::finish(write_bytes(env, args[0], &time.to_le_bytes()).map_err(Error::from))
 }

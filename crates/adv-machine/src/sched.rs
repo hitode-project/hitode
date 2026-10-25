@@ -295,6 +295,7 @@ pub struct Context {
     pub(crate) exact_deadline: bool,
     pub(crate) spin: crate::frame_spin::FrameSpin,
     pub(crate) progress: crate::poll_progress::PollProgress,
+    pub(crate) poll_peek_depth: u32,
     /// Kernel object signaled when this context ends.
     pub thread_handle: Handle,
 }
@@ -596,6 +597,9 @@ mod active_tests {
     fn wait_sys() -> Sys {
         Sys {
             clock: Clock::virtual_time(),
+            poll_wake: None,
+            poll_observed: false,
+            poll_activity: 0,
             invocation_arguments: None,
             trace: Trace::default(),
             thunks: ThunkTable::new(Box::new(Empty)),
@@ -692,6 +696,7 @@ mod active_tests {
             exact_deadline: false,
             spin: Default::default(),
             progress: Default::default(),
+            poll_peek_depth: 0,
             thread_handle,
             wait_objects: Vec::new(),
         });

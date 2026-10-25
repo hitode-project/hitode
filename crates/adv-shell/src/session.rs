@@ -485,21 +485,24 @@ impl Driver {
         };
         #[cfg(mobile)]
         {
-            let result = self
-                .main_loop
-                .borrow()
-                .as_ref()
-                .map(|main_loop| main_loop.arm(next));
+            let result = self.main_loop.borrow().as_ref().map(|main_loop| {
+                #[cfg(target_os = "ios")]
+                {
+                    main_loop.arm(
+                        next,
+                        self.view.requested_rate.get(),
+                        self.view.frame_clock.replace(false),
+                    )
+                }
+                #[cfg(target_os = "android")]
+                {
+                    main_loop.arm(next, self.view.frame_clock.replace(false))
+                }
+            });
             if let Some(Err(error)) = result {
                 self.finish(Err(error));
             }
         }
-        // A due presentation waits for the next vsync instead of the timer.
-        #[cfg(target_os = "macos")]
-        let next = match next {
-            Some(at) if at <= Instant::now() && self.view.request_frame() => None,
-            other => other,
-        };
         #[cfg(target_os = "macos")]
         if let Some(timer) = self.timer.borrow().as_ref()
             && timer.is_valid()

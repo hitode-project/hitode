@@ -1019,6 +1019,8 @@ pub(crate) struct Rendered {
     #[cfg(target_vendor = "apple")]
     pub(crate) placement: Option<Placement>,
     pub(crate) serial: u64,
+    #[cfg(host_view)]
+    pub(crate) published_at: Option<Instant>,
     pub(crate) canvas: (u32, u32),
     pub(crate) cursor_regions: Arc<[VideoCursorRegion]>,
     #[cfg(target_os = "macos")]
@@ -1197,6 +1199,8 @@ impl Session {
                         #[cfg(target_vendor = "apple")]
                         placement: None,
                         serial: self.serial,
+                        #[cfg(host_view)]
+                        published_at: self.frames.current().published_at(),
                         canvas: (self.width, self.height),
                         cursor_regions: self.cursor_regions.clone(),
                     });
@@ -1210,7 +1214,24 @@ impl Session {
                         .filter(|_| self.contiguous && self.native.is_none());
                     self.publication = None;
                     self.contiguous = false;
-                    if self.software.is_none() || old_extent != (self.width, self.height) {
+                    #[cfg(target_vendor = "apple")]
+                    let direct = if no_copy {
+                        submission
+                            .software_texture(self.frames.current())
+                            .map_err(|error| error.to_string())?
+                    } else {
+                        None
+                    };
+                    #[cfg(not(target_vendor = "apple"))]
+                    let direct: Option<wgpu::Texture> = None;
+                    let sampled = direct.is_some();
+                    let reset_upload = self.software.as_ref().is_none_or(|(texture, _)| {
+                        !texture.usage().contains(wgpu::TextureUsages::COPY_DST)
+                    }) || old_extent != (self.width, self.height);
+                    if let Some(texture) = direct {
+                        let view = texture.create_view(&Default::default());
+                        self.software = Some((texture, view));
+                    } else if reset_upload {
                         let texture = context.device.create_texture(&wgpu::TextureDescriptor {
                             label: Some("adv final software frame"),
                             size: wgpu::Extent3d {
@@ -1236,26 +1257,32 @@ impl Session {
                         self.software = Some((texture, view));
                     }
                     let texture = &self.software.as_ref().unwrap().0;
-                    if no_copy {
-                        #[cfg(target_vendor = "apple")]
-                        {
-                            submission
-                                .upload_software(texture, self.frames.current(), since)
-                                .map_err(|error| error.to_string())?;
-                            self.stats.gpu_transfer_bytes += self
-                                .snapshot
-                                .damage
-                                .iter()
-                                .map(|r| u64::from(r.w) * u64::from(r.h) * 4)
-                                .sum::<u64>();
+                    if !sampled {
+                        if no_copy {
+                            #[cfg(target_vendor = "apple")]
+                            {
+                                submission
+                                    .upload_software(
+                                        texture,
+                                        self.frames.current(),
+                                        if reset_upload { 0 } else { since },
+                                    )
+                                    .map_err(|error| error.to_string())?;
+                                self.stats.gpu_transfer_bytes += self
+                                    .snapshot
+                                    .damage
+                                    .iter()
+                                    .map(|r| u64::from(r.w) * u64::from(r.h) * 4)
+                                    .sum::<u64>();
+                            }
+                        } else {
+                            let bytes =
+                                crate::software_frame::upload(&submission, texture, &self.snapshot);
+                            self.stats.uploaded_bytes += bytes;
+                            self.stats.converted_bytes += bytes;
                         }
-                    } else {
-                        let bytes =
-                            crate::software_frame::upload(&submission, texture, &self.snapshot);
-                        self.stats.uploaded_bytes += bytes;
-                        self.stats.converted_bytes += bytes;
+                        self.stats.uploads += self.snapshot.damage.len() as u64;
                     }
-                    self.stats.uploads += self.snapshot.damage.len() as u64;
                     self.stats.software_started.get_or_insert_with(Instant::now);
                 }
                 self.native = None;
@@ -1276,6 +1303,8 @@ impl Session {
                 #[cfg(target_vendor = "apple")]
                 placement: None,
                 serial: self.serial,
+                #[cfg(host_view)]
+                published_at: self.frames.current().published_at(),
                 canvas,
                 cursor_regions: self.cursor_regions.clone(),
             });
@@ -1300,6 +1329,8 @@ impl Session {
                 result: DrawResult::Presented,
                 placement: Some(placement),
                 serial: self.serial,
+                #[cfg(host_view)]
+                published_at: self.frames.current().published_at(),
                 canvas,
                 cursor_regions: self.cursor_regions.clone(),
                 shared: Some((frame.clone(), completion)),
@@ -1340,6 +1371,8 @@ impl Session {
             placement: matches!(result, DrawResult::Presented).then_some(placement),
             result,
             serial: self.serial,
+            #[cfg(host_view)]
+            published_at: self.frames.current().published_at(),
             canvas,
             cursor_regions: self.cursor_regions.clone(),
         })
@@ -1563,6 +1596,7 @@ impl UiPresenter {
                     return Ok(Rendered {
                         result: DrawResult::Skipped,
                         serial: session.serial,
+                        published_at: session.frames.current().published_at(),
                         canvas: (session.width, session.height),
                         cursor_regions: session.cursor_regions.clone(),
                     });

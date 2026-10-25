@@ -409,6 +409,7 @@ fn new_machine(
     // A program may compute without waiting for as long as it likes, as on
     // the built-in stack; the backend's default watchdog is for tests.
     machine.set_execution_budget(None);
+    machine.sys.poll_wake = Some(wake.clone());
     adv_unix::install(&mut machine);
     Session::install_codec_kernels(&mut machine, crate::codec_kernels::Mode::Native);
     machine.ext.insert(audio.clone());

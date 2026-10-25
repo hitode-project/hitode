@@ -3,6 +3,8 @@
 //! guest instructions and yield site, observes nothing new, so its polling
 //! round may wait. A loop doing new work between yields, such as skipping text,
 //! must run on at once, even when only its instruction count tells it apart.
+//! Explicit observations also admit an earlier quiet round (PROC-CLOCK-7),
+//! provided the machine sees no intervening delivery or productive host call.
 
 /// Recent yield intervals a repeat may match; covers loops with several yields.
 const HISTORY: usize = 4;
@@ -21,10 +23,14 @@ pub struct PollProgress {
     next: usize,
     /// Consecutive intervals that matched an earlier one.
     repeats: u32,
+    /// This interval contains unclassified or productive work.
+    work: bool,
+    quiet: bool,
 }
 
 impl PollProgress {
-    pub(crate) fn call(&mut self, thunk: u32) {
+    pub(crate) fn call(&mut self, thunk: u32, observation: bool) {
+        self.work |= !observation;
         self.mix(u64::from(thunk) ^ 0x100);
     }
 
@@ -39,6 +45,7 @@ impl PollProgress {
         self.mix(retired);
         self.mix(u64::from(site));
         let interval = std::mem::take(&mut self.current);
+        self.quiet = !std::mem::take(&mut self.work) && self.history.contains(&interval);
         self.repeats = if self.history.contains(&interval) {
             self.repeats.saturating_add(1)
         } else {
@@ -53,6 +60,15 @@ impl PollProgress {
         self.repeats >= STREAK
     }
 
+    pub(crate) fn quiet(&self) -> bool {
+        self.quiet
+    }
+
+    pub(crate) fn new_work(&mut self) {
+        self.work = true;
+        self.quiet = false;
+    }
+
     fn mix(&mut self, value: u64) {
         self.current = (self.current.rotate_left(7) ^ value).wrapping_mul(0x9e37_79b9_7f4a_7c15);
     }
@@ -64,7 +80,7 @@ mod tests {
 
     fn interval(progress: &mut PollProgress, calls: &[u32], retired: u64) {
         for &call in calls {
-            progress.call(call);
+            progress.call(call, false);
         }
         progress.ran(retired);
         progress.yielded(0x40);

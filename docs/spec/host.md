@@ -185,11 +185,15 @@ Direct presentation requires Core Animation's `contentsOpaque` capability. Other
 **Applies to**: macOS, Android
 **Verification**: Test
 
-### HOST-SES-9 Display-link frame clock
+### HOST-SES-10 Submit before refresh
 
-**Rule**: On macOS 14 and later, the game view MUST present only inside display-link callbacks, each publishing the vsync grid to guest refresh pacing. The link MUST stay paused while no frame is pending. Older systems MUST keep the timer schedule.
-**Applies to**: macOS, iOS
-**Verification**: Review — the display link runs only inside the AppKit main loop, which no test drives.
+**Rule**: Published frames MUST schedule upload, scaling and presentation outside guest execution as soon as the presentation cap permits. Display links MUST publish refresh timing without gating submission or running without pending content. Hosts without display links MUST retain deadline timers.
+**Verification**: Test
+
+### HOST-SES-11 Requested display cadence
+
+**Rule**: Display rate requests MUST follow publication timestamps, accounting for mailbox drops and excluding repaints. Supported Apple display links and Android native surfaces MUST receive the estimated guest cadence, capped at 60 Hz. Android surfaces MAY replace AND-APP-10's initial 60 Hz request after measuring cadence.
+**Verification**: Test
 
 ### HOST-LIB-1 Storage and removal
 
@@ -384,16 +388,21 @@ Direct presentation requires Core Animation's `contentsOpaque` capability. Other
 **Rule**: Shipped files MUST NOT contain developer home, checkout or temporary build paths, including native helpers and archive members.
 **Verification**: Test
 
-Withdrawn: HOST-AND-1, HOST-AND-2, HOST-AND-3, HOST-AND-4, HOST-AND-5, HOST-AND-6, HOST-AND-7, HOST-AND-8, HOST-AND-9, HOST-AND-10, HOST-AND-11
+Withdrawn: HOST-AND-1, HOST-AND-2, HOST-AND-3, HOST-AND-4, HOST-AND-5, HOST-AND-6, HOST-AND-7, HOST-AND-8, HOST-AND-9, HOST-AND-10, HOST-AND-11, HOST-SES-9
 
 ### HOST-DAMAGE-1 Software texture uploads
 
 **Rule**: The software GPU presenter MUST transfer only damaged rectangles with matching origins and row pitches, without comparing complete frames. New or resized textures MUST receive complete images, while repaint MUST preserve existing textures. Metal uploads MUST retain immutable, page-owned publication storage through completion and decode it identically to CPU snapshots.
 **Verification**: Test
 
-Metal uses no-copy buffers for publications without video overlays: BGRA uses blits, and other formats use integer GPU decoding. Other presentations reuse the consumer's BGRA snapshot.
+Metal uses no-copy buffers for publications without video overlays: BGRA samples buffer-backed textures directly, and other formats use integer GPU decoding. Other presentations reuse the consumer's BGRA snapshot.
 
 ### HOST-DAMAGE-2 Software work counters
 
 **Rule**: Software frame counters MUST expose copied, CPU-converted, CPU-uploaded and GPU-transferred bytes, published frames and empty damage. Byte rates MUST use elapsed real time and exclude diagnostic reference work.
+**Verification**: Test
+
+### HOST-DAMAGE-3 Sample shared snapshots
+
+**Rule**: Metal BGRA software presentation without video overlays MUST sample an immutable buffer-backed texture directly from snapshot storage. The texture MUST retain that storage through GPU use while guest writes and mailbox reuse continue independently.
 **Verification**: Test

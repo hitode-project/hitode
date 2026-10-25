@@ -64,6 +64,9 @@ pub(super) fn register(registry: &mut Registry) {
             |env| {
                 let index = env.sys.thunks.get(env.thunk).f.data;
                 let (name, _, argc) = exports::EXPORTS[index as usize];
+                if name == "timeGetTime" {
+                    env.sys.poll_observation();
+                }
                 let mut args: Vec<_> = (0..u32::from(argc)).map(|i| env.arg(i)).collect();
                 if name.starts_with("waveOut") && !name.contains("ErrorText") {
                     return wave::call(env, name, args);

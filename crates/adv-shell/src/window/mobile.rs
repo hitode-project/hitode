@@ -82,7 +82,8 @@ pub struct GameView {
     control: Cell<bool>,
     physical_keys: RefCell<std::collections::BTreeSet<i32>>,
     keys: RefCell<Arc<adv_sync::input::KeyState>>,
-    pub(crate) ready: Cell<bool>,
+    pub(crate) requested_rate: Cell<u32>,
+    pub(crate) frame_clock: Cell<bool>,
     pub(crate) period: Cell<i64>,
 }
 impl GameView {
@@ -126,7 +127,8 @@ impl GameView {
             control: Cell::new(false),
             physical_keys: RefCell::new(Default::default()),
             keys: RefCell::new(Arc::default()),
-            ready: Cell::new(false),
+            requested_rate: Cell::new(60),
+            frame_clock: Cell::new(false),
             period: Cell::new(16_666_667),
         });
         #[cfg(target_os = "ios")]
@@ -192,18 +194,7 @@ impl GameView {
             }
         }
         self.client.set((width, height));
-        if let Some(window) = window {
-            // API 30 symbol; the minimum supported Android API is 29.
-            let symbol =
-                unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"ANativeWindow_setFrameRate".as_ptr()) };
-            if !symbol.is_null() {
-                let set: unsafe extern "C" fn(*mut ndk_sys::ANativeWindow, f32, i8) -> i32 =
-                    unsafe { std::mem::transmute(symbol) };
-                unsafe {
-                    set(window.as_ptr(), 60.0, 0);
-                }
-            }
-        }
+        self.apply_frame_rate();
         self.push(Event::Repaint);
         self.report_layout();
     }
@@ -610,8 +601,28 @@ impl GameView {
     /// A mobile view cannot be minimized; the next touch restores the guest.
     pub(crate) fn minimize(&self) {}
     pub(crate) fn set_video_cursor_regions(&self, _: Arc<[adv_runtime::VideoCursorRegion]>) {}
-    pub(crate) fn refresh_ready(&self) -> bool {
-        self.ready.get()
+    pub(crate) fn frame_rate(&self, rate: u32) {
+        self.frame_clock.set(true);
+        if self.requested_rate.replace(rate) == rate {
+            return;
+        }
+        #[cfg(target_os = "android")]
+        self.apply_frame_rate();
+    }
+    #[cfg(target_os = "android")]
+    fn apply_frame_rate(&self) {
+        if let Some(window) = self.window.get() {
+            // API 30 symbol; the minimum supported Android API is 29.
+            let symbol =
+                unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"ANativeWindow_setFrameRate".as_ptr()) };
+            if !symbol.is_null() {
+                let set: unsafe extern "C" fn(*mut ndk_sys::ANativeWindow, f32, i8) -> i32 =
+                    unsafe { std::mem::transmute(symbol) };
+                unsafe {
+                    set(window.as_ptr(), self.requested_rate.get() as f32, 0);
+                }
+            }
+        }
     }
     pub(crate) fn next_refresh(&self) -> Instant {
         let fps = (1_000_000_000.0 / self.period.get() as f64).round() as isize;

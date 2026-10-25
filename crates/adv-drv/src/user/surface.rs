@@ -275,6 +275,7 @@ fn flush(env: &mut Env<'_>) -> Outcome {
         h: (bottom - top).max(0) as u32,
     };
     let provider = *env.ext.get::<Provider>();
+    super::input::prepare(env.ext, hwnd, (client_left, client_top));
     let (changed, presented) = {
         let store = env.ext.get_mut::<SurfaceStore>();
         let mut memory = (provider.memory)(env.cpu);
@@ -316,9 +317,11 @@ fn flush(env: &mut Env<'_>) -> Outcome {
             store.stats.presentations,
         )
     };
-    if changed {
-        super::input::prepare(env.ext, hwnd, (client_left, client_top));
+    if changed || super::input::presented_window(env.ext) == Some(hwnd) {
         super::input::presented(env.ext);
+    }
+    if changed {
+        env.sys.poll_work();
         if let Some(outcome) = (provider.completed)(env, presented) {
             return outcome;
         }
