@@ -5,8 +5,8 @@
 //! the function branch to a thunk instead ([`adv_machine::Sys::redirects`]),
 //! which runs the body as a leaf call, without leaving translated code. The
 //! interpreter runs Wine's own code, and so does a call the body declines:
-//! it resumes at a trampoline holding the function's first instruction,
-//! which jumps to the second. A body therefore has the function's effect
+//! it resumes at a trampoline preserving the first instruction's effect
+//! before continuing at the second. A body therefore has the function's effect
 //! whenever it accepts a call, and declines anything else, such as memory
 //! the function would fault on.
 
@@ -15,10 +15,11 @@ use std::collections::HashMap;
 use adv_cpu::backend::{Guest, Prot};
 use adv_machine::layout::PAGE;
 use adv_machine::{Conv, Env, EnvLeafHandler, Ext, HostFn, Outcome, Sys};
-use iced_x86::{Decoder, DecoderOptions, FlowControl};
+use iced_x86::{Decoder, DecoderOptions, FlowControl, OpKind};
 
 use crate::identity::{self, Images};
 
+mod dib;
 mod mixer;
 
 /// The module the bodies' thunks are registered under.
@@ -57,7 +58,10 @@ const BODIES: &[Body] = &[
 
 /// The host functions of the bodies.
 pub(crate) fn host_fn(name: &str) -> Option<HostFn> {
-    let body = BODIES.iter().find(|body| body.name == name)?;
+    let body = BODIES
+        .iter()
+        .chain(dib::BODIES)
+        .find(|body| body.name == name)?;
     Some(HostFn {
         leaf: None,
         env_leaf: Some(body.leaf),
@@ -80,6 +84,18 @@ struct Trampolines {
 
 /// Binds the bodies of the image `pe`, mapped at `base`.
 pub(crate) fn bind(cpu: &mut dyn Guest, sys: &mut Sys, ext: &mut Ext, base: u32, pe: &adv_pe::Pe) {
+    let mut relocations = pe.relocations().unwrap_or_default();
+    relocations.sort_unstable();
+    bind_relocated(cpu, sys, ext, base, &relocations);
+}
+
+pub(crate) fn bind_relocated(
+    cpu: &mut dyn Guest,
+    sys: &mut Sys,
+    ext: &mut Ext,
+    base: u32,
+    relocations: &[u32],
+) {
     let Some(module) = ext
         .try_get::<Images>()
         .and_then(|images| images.0.get(&base))
@@ -89,6 +105,7 @@ pub(crate) fn bind(cpu: &mut dyn Guest, sys: &mut Sys, ext: &mut Ext, base: u32,
     };
     if !BODIES
         .iter()
+        .chain(dib::BODIES)
         .any(|body| body.name.starts_with(module.name.as_str()))
     {
         return;
@@ -96,9 +113,7 @@ pub(crate) fn bind(cpu: &mut dyn Guest, sys: &mut Sys, ext: &mut Ext, base: u32,
     let Some(table) = module.table() else {
         return;
     };
-    let mut relocations = pe.relocations().unwrap_or_default();
-    relocations.sort_unstable();
-    for body in BODIES {
+    for body in BODIES.iter().chain(dib::BODIES) {
         let Some(name) = body
             .name
             .strip_prefix(module.name.as_str())
@@ -136,13 +151,27 @@ fn bind_one(
     let mut original = vec![0; size as usize];
     cpu.read(entry, &mut original).map_err(|e| e.to_string())?;
     let first = Decoder::with_ip(32, &original, u64::from(entry), DecoderOptions::NONE).decode();
-    if first.is_invalid() || first.flow_control() != FlowControl::Next {
+    let call =
+        first.flow_control() == FlowControl::Call && first.op0_kind() == OpKind::NearBranch32;
+    if first.is_invalid() || (!call && first.flow_control() != FlowControl::Next) {
         return Err("the first instruction cannot move".into());
     }
     let length = first.len();
-    let mut trampoline = original[..length].to_vec();
+    // A PIC prologue's call observes its original return address. Pushing
+    // that address and jumping preserves both the helper and its return.
+    let mut trampoline = if call {
+        let mut code = vec![0x68];
+        code.extend_from_slice(&(entry + length as u32).to_le_bytes());
+        code
+    } else {
+        original[..length].to_vec()
+    };
     trampoline.push(0xe9);
-    let resume = entry + length as u32;
+    let resume = if call {
+        first.near_branch32()
+    } else {
+        entry + length as u32
+    };
     let thunk = sys
         .thunks
         .publish(cpu, MODULE, name)
@@ -164,6 +193,8 @@ fn bind_one(
     trampolines.by_thunk.insert(index, at);
     let target = if name == "dsound.dll!DSOUND_MixToPrimary" {
         mixer::entry(cpu, sys, thunk)?
+    } else if name.starts_with("win32u.so!halftone_") {
+        dib::entry(cpu, sys, thunk)?
     } else {
         thunk
     };

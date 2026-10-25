@@ -329,6 +329,11 @@ FreeType is such a library: win32u opens it by name and draws TrueType text thro
 **Rule**: A code identity table MUST describe a mapped image only when the hash of the image's headers equals the table's. A function MUST be bound to a native body only when its bytes, with base relocations masked, hash to the table's value.
 **Verification**: Test
 
+### NAT-ID-2 Unix code identity
+
+**Rule**: Unix i386 ELF identity tables MUST include local function symbols and mask dwords patched by dynamic relocations. Unix modules MUST bind bodies only after relocation, with matching ELF headers, program headers, and function bytes. A declined PIC entry call MUST preserve its original return address.
+**Verification**: Test
+
 ### NAT-BODY-1 Body semantics
 
 **Rule**: A native body that accepts a call MUST leave the guest state Wine's function would leave. Registers and flags the calling convention does not keep are exempt. Otherwise it MUST decline before any side effect, and the call MUST run Wine's function from its entry with the caller's frame.
@@ -342,6 +347,11 @@ FreeType is such a library: win32u opens it by name and draws TrueType text thro
 ### NAT-BODY-3 DirectSound mixer
 
 **Rule**: The DirectSound mixer body MUST preserve Wine's float samples, scratch data, buffer positions, frequency accumulators, states, shared lock words, and stopped result. It MUST decline before writes when locks would wait, notifications would fire, effects or 3D apply, conversions are unsupported, or required memory is inaccessible. Its field offsets MUST match the pinned module's DWARF.
+**Verification**: Test
+
+### NAT-BODY-4 DIB primitives
+
+**Rule**: DIB bodies MUST preserve Wine's pixels, padding, overlap traversal, bit fields, palette selection, blend arithmetic, and interpolation rounding. Unsupported formats or inaccessible memory MUST decline before writes. Field offsets and data addresses MUST match the pinned Unix module's DWARF.
 **Verification**: Test
 
 ## Host DLL images

@@ -96,6 +96,19 @@ pub fn open(env: &mut Env<'_>, path: &Path, then: Opened) -> Outcome {
     if let Err(error) = relocate(env, &object, base, &protections) {
         return Outcome::Fail(format!("{}: {error}", path.display()));
     }
+    let mut relocations: Vec<u32> = object
+        .relocations
+        .iter()
+        .filter(|r| {
+            matches!(
+                r.kind,
+                R_386_32 | R_386_PC32 | R_386_GLOB_DAT | R_386_JMP_SLOT | R_386_RELATIVE
+            )
+        })
+        .map(|r| r.offset)
+        .collect();
+    relocations.sort_unstable();
+    adv_nt::identity::note_unix(env, path, base, &object.image, &relocations);
     let exports = object
         .exports()
         .into_iter()
