@@ -17,10 +17,13 @@ use adv_pe::{ImportModule, ImportName};
 
 const QUARTZ: &str = "quartz.dll";
 const WMVCORE: &str = "wmvcore.dll";
+const QASF: &str = "qasf.dll";
 const ORIGINAL_QUARTZ: &str = "winequartz.dll";
 const ORIGINAL_WMVCORE: &str = "winewmvcore.dll";
+const ORIGINAL_QASF: &str = "wineqasf.dll";
 // Wine 11.0's spec files, including the explicitly assigned wmvcore ordinals.
-const QUARTZ_EXPORTS: &[(&str, u16, u8)] = &[
+type ExportSpec = (&'static str, u16, u8);
+const QUARTZ_EXPORTS: &[ExportSpec] = &[
     ("AMGetErrorTextA", 1, 3),
     ("AMGetErrorTextW", 2, 3),
     ("AmpFactorToDB", 3, 1),
@@ -31,7 +34,7 @@ const QUARTZ_EXPORTS: &[(&str, u16, u8)] = &[
     ("DllUnregisterServer", 8, 0),
     ("GetProxyDllInfo", 9, 0),
 ];
-const WMVCORE_EXPORTS: &[(&str, u16, u8)] = &[
+const WMVCORE_EXPORTS: &[ExportSpec] = &[
     ("WMCheckURLExtension", 1, 1),
     ("WMCheckURLScheme", 2, 1),
     ("WMCreateBackupRestorerPrivate", 3, 2),
@@ -54,10 +57,22 @@ const WMVCORE_EXPORTS: &[(&str, u16, u8)] = &[
     ("WMIsContentProtected", 20, 2),
 ];
 
+const QASF_EXPORTS: &[ExportSpec] = &[
+    ("DllCanUnloadNow", 1, 0),
+    ("DllGetClassObject", 2, 3),
+    ("DllRegisterServer", 3, 0),
+    ("DllUnregisterServer", 4, 0),
+];
+const MODULES: &[(&str, &str, &[ExportSpec])] = &[
+    (QUARTZ, ORIGINAL_QUARTZ, QUARTZ_EXPORTS),
+    (WMVCORE, ORIGINAL_WMVCORE, WMVCORE_EXPORTS),
+    (QASF, ORIGINAL_QASF, QASF_EXPORTS),
+];
+
 pub(super) fn register(registry: &mut Registry) {
     adv_dx::dshow::register(registry);
     adv_dx::wmvcore::register(registry);
-    for (module, exports) in [(QUARTZ, QUARTZ_EXPORTS), (WMVCORE, WMVCORE_EXPORTS)] {
+    for (module_index, &(module, _, exports)) in MODULES.iter().enumerate() {
         for (index, &(name, _, argc)) in exports.iter().enumerate() {
             if module == WMVCORE && name == "WMCreateSyncReader" {
                 continue;
@@ -67,7 +82,7 @@ pub(super) fn register(registry: &mut Registry) {
                 name,
                 Conv::Stdcall { argc },
                 forward,
-                (u64::from(module == WMVCORE) << 32) | index as u64,
+                ((module_index as u64) << 32) | index as u64,
             );
         }
     }
@@ -75,18 +90,14 @@ pub(super) fn register(registry: &mut Registry) {
 
 fn forward(env: &mut Env<'_>) -> Outcome {
     let data = env.sys.thunks.get(env.thunk).f.data;
-    let (module, original, exports) = if data >> 32 == 0 {
-        (QUARTZ, ORIGINAL_QUARTZ, QUARTZ_EXPORTS)
-    } else {
-        (WMVCORE, ORIGINAL_WMVCORE, WMVCORE_EXPORTS)
-    };
+    let (module, original, exports) = MODULES[(data >> 32) as usize];
     let (name, _, argc) = exports[data as u32 as usize];
-    if module == QUARTZ && name == "DllCanUnloadNow" {
+    if matches!(module, QUARTZ | QASF) && name == "DllCanUnloadNow" {
         return Outcome::Return(1);
     }
-    if module == QUARTZ && name == "DllGetClassObject" {
+    if matches!(module, QUARTZ | QASF) && name == "DllGetClassObject" {
         let mut class = [0; 16];
-        if env.cpu.read(env.arg(0), &mut class).is_ok() && adv_dx::dshow::has_class(&class) {
+        if env.cpu.read(env.arg(0), &mut class).is_ok() && adv_dx::dshow::has_graph_class(&class) {
             return super::class::get_class_object(env, |class| {
                 Some(super::class::Activation::Class(class))
             });
@@ -156,10 +167,7 @@ pub(super) fn install<B: Backend>(machine: &mut Machine<B>, prefix: &Path) -> Re
             completed: super::frame_completed,
         },
     );
-    for (module, original, exports) in [
-        (QUARTZ, ORIGINAL_QUARTZ, QUARTZ_EXPORTS),
-        (WMVCORE, ORIGINAL_WMVCORE, WMVCORE_EXPORTS),
-    ] {
+    for &(module, original, exports) in MODULES {
         let directory = prefix.join("drive_c/windows/system32");
         let retained = directory.join(original);
         if !retained.exists() {

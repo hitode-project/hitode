@@ -171,7 +171,7 @@ fn native_video_at_client_position() {
     probe("video", "media video ok");
 }
 
-// spec: WINE-MEDIA-12
+// spec: WINE-MEDIA-12, MEDIA-DMO-1
 #[test]
 fn original_quartz_class_and_exports() {
     probe("fallback", "media fallback ok");

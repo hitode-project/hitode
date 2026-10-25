@@ -371,16 +371,15 @@ pub fn install<B: adv_cpu::backend::Backend>(m: &mut adv_machine::Machine<B>) {
     classes.register(dmo::CLSID_DMO_WRAPPER, dmo::create);
 }
 
-/// Classes owned by the native DirectShow front.
-pub fn has_class(class: &Iid) -> bool {
+/// Classes exported by the native graph front. Wine retains its audio
+/// renderer factories so external push graphs receive their samples.
+pub fn has_graph_class(class: &Iid) -> bool {
     [
         CLSID_FILTERGRAPH,
         CLSID_FILTERGRAPH_NO_THREAD,
         CLSID_MPEG1_SPLITTER,
         CLSID_MPEG_VIDEO_CODEC,
         CLSID_MPEG_AUDIO_CODEC,
-        CLSID_DSOUND_RENDER,
-        CLSID_AUDIO_RENDER,
         dmo::CLSID_DMO_WRAPPER,
     ]
     .contains(class)

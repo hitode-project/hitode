@@ -661,7 +661,7 @@ Process startup MUST register the prefix's drive letters in the server namespace
 
 ### WINE-MEDIA-8 Native DirectShow graphs
 
-**Rule**: Wine's `quartz.dll` MUST activate implemented DirectShow classes through `adv_dx::dshow`. Native file graphs MUST decode through `adv_device` and mix audio through the session's native DirectSound service.
+**Rule**: Wine's `quartz.dll` MUST activate implemented DirectShow classes through `adv_dx::dshow`. The DMO wrapper MUST activate through `qasf.dll`. Native file graphs MUST decode through `adv_device` and mix audio through the session's native DirectSound service.
 **Verification**: Test
 
 ### WINE-MEDIA-9 Native synchronous reader
@@ -681,7 +681,7 @@ Process startup MUST register the prefix's drive letters in the server namespace
 
 ### WINE-MEDIA-12 Wine media fallback
 
-**Rule**: Native media images MUST preserve Wine's export names and ordinals. Unimplemented exports and quartz classes MUST delegate to Wine's retained original modules.
+**Rule**: Native media images MUST preserve Wine's export names and ordinals. Unimplemented exports and quartz classes MUST delegate to Wine's retained original modules. External audio-renderer activation MUST retain Wine's push-sample support.
 **Verification**: Test
 
 ## Native WinMM

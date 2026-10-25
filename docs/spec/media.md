@@ -129,6 +129,7 @@ This spec covers the audio and video API front ends: ACM, DirectSound storage, D
 ### MEDIA-DMO-1 Decoder admission
 
 **Rule**: DMO wrappers MUST accept only supported WMV/WMA decoder identities and publish input/output pins only after Init.
+Wine decoder capability probes MUST succeed for available codecs before stream sequence headers are supplied; decoder opening MUST wait for the first sample.
 **Verification**: Test
 
 ### MEDIA-DMO-2 Push ownership and preroll

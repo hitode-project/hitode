@@ -121,14 +121,21 @@ impl Worker {
         std::thread::Builder::new()
             .name("media-transform".into())
             .spawn(move || {
-                let mut decoder = match Decode::from_format(&codec) {
-                    Ok(decoder) => decoder,
+                let parameters = match Decode::parameters(&codec) {
+                    Ok(parameters) if codec::decoder::find(parameters.id()).is_some() => parameters,
+                    Ok(_) => {
+                        let _ = events.send(Event::Ready(Err(ff::Error::DecoderNotFound.into())));
+                        wake.signal();
+                        return;
+                    }
                     Err(error) => {
                         let _ = events.send(Event::Ready(Err(error)));
                         wake.signal();
                         return;
                     }
                 };
+                // Wine probes decoder support before negotiating sequence headers.
+                let mut decoder: Option<Decode> = None;
                 let nominal = match &codec {
                     CodecFormat::Video { frame_100ns, .. } => *frame_100ns as i64,
                     _ => 0,
@@ -146,20 +153,30 @@ impl Worker {
                 let _ = events.send(Event::Ready(Ok(info)));
                 wake.signal();
                 while let Ok(command) = inbox.recv() {
-                    let result = match command {
+                    let result = (|| match command {
                         Command::Decode(data, pts, duration) => {
+                            if decoder.is_none() {
+                                decoder = Some(Decode::open(
+                                    parameters.clone(),
+                                    ff::Rational(1, 10_000_000),
+                                )?);
+                            }
                             let mut packet = ff::Packet::copy(&data);
                             packet.set_pts(pts);
                             packet.set_duration(duration);
-                            decoder.push(Some(&packet))
+                            decoder.as_mut().unwrap().push(Some(&packet))
                         }
-                        Command::Drain => decoder.push(None),
+                        Command::Drain => decoder
+                            .as_mut()
+                            .map_or_else(|| Ok(Vec::new()), |decoder| decoder.push(None)),
                         Command::Flush => {
-                            decoder.flush();
+                            if let Some(decoder) = &mut decoder {
+                                decoder.flush();
+                            }
                             Ok(Vec::new())
                         }
                         _ => unreachable!(),
-                    };
+                    })();
                     match result {
                         Ok(frames) => {
                             for mut sample in frames {
@@ -424,7 +441,7 @@ impl Decode {
             _ => Err(ff::Error::StreamNotFound.into()),
         }
     }
-    fn from_format(format: &CodecFormat) -> Result<Self, Error> {
+    fn parameters(format: &CodecFormat) -> Result<codec::Parameters, Error> {
         let mut parameters = codec::Parameters::new();
         unsafe {
             let p = &mut *parameters.as_mut_ptr();
@@ -513,7 +530,7 @@ impl Decode {
                 p.extradata_size = extra.len() as i32;
             }
         }
-        Self::open(parameters, ff::Rational(1, 10_000_000))
+        Ok(parameters)
     }
     fn push(&mut self, packet: Option<&ff::Packet>) -> Result<Vec<Sample>, Error> {
         match self {
