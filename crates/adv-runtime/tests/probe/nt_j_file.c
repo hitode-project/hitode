@@ -6,6 +6,7 @@
 /* These two NT calls have no Win32 wrapper in Wine 11. */
 typedef NTSTATUS (WINAPI *flush_ex_fn)(HANDLE, ULONG, void *, ULONG, IO_STATUS_BLOCK *);
 typedef NTSTATUS (WINAPI *delete_fn)(OBJECT_ATTRIBUTES *);
+typedef NTSTATUS (WINAPI *directory_fn)(HANDLE, HANDLE, void *, void *, IO_STATUS_BLOCK *, void *, ULONG, ULONG, ULONG, UNICODE_STRING *, ULONG);
 NTSYSAPI void WINAPI RtlFreeUnicodeString(UNICODE_STRING *);
 static HANDLE file, ready, pipe_read, notify_directory;
 static OVERLAPPED notify_io;
@@ -41,6 +42,47 @@ static DWORD WINAPI cancel_worker(void *arg)
 {
     WaitForSingleObject(ready, INFINITE);
     return !CancelIoEx(notify_directory, &notify_io);
+}
+
+static void enumerate(void)
+{
+    const WCHAR *names[] = {L"j-enum/part00.dat", L"j-enum/part01.dat", L"j-enum/part02.dat"};
+    BYTE buffer[1024];
+    IO_STATUS_BLOCK io;
+    UNICODE_STRING mask;
+    HANDLE file, directory, search;
+    WIN32_FIND_DATAW found;
+    DWORD count = 0;
+    NTSTATUS status;
+    directory_fn query = (directory_fn)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryDirectoryFile");
+    CreateDirectoryW(L"j-enum", NULL);
+    for (int i = 0; i < 3; i++) {
+        file = CreateFileW(names[i], GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, 0, NULL);
+        CloseHandle(file);
+    }
+    search = FindFirstFileW(L"j-enum/part??.dat", &found);
+    if (search != INVALID_HANDLE_VALUE) {
+        do { count++; } while (count < 4 && FindNextFileW(search, &found));
+        FindClose(search);
+    }
+    check("directory_dos_mask", count == 3);
+    directory = CreateFileW(L"j-enum", FILE_LIST_DIRECTORY, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                            NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    RtlInitUnicodeString(&mask, L"part>>.dat");
+    status = query(directory, NULL, NULL, NULL, &io, buffer, sizeof(buffer), 1, 0xfeed0000, &mask, 0xbeef0001);
+    count = 0;
+    if (!status) {
+        BYTE *entry = buffer;
+        do { count++; if (!*(ULONG *)entry) break; entry += *(ULONG *)entry; } while (count < 4);
+    }
+    check("directory_boolean_batch", status == 0 && count == 3);
+    status = query(directory, NULL, NULL, NULL, &io, buffer, sizeof(buffer), 1, 0xfeed0000, NULL, 0xbeef0000);
+    check("directory_boolean_resume", status == (NTSTATUS)0x80000006);
+    status = query(directory, NULL, NULL, NULL, &io, buffer, sizeof(buffer), 1, 0xfeed0001, NULL, 0xbeef0001);
+    check("directory_boolean_single", status == 0 && *(ULONG *)buffer == 0 && io.Information < 100);
+    CloseHandle(directory);
+    for (int i = 0; i < 3; i++) DeleteFileW(names[i]);
+    RemoveDirectoryW(L"j-enum");
 }
 
 static void run(void)
@@ -161,6 +203,7 @@ static void run(void)
 
 void mainCRTStartup(void)
 {
+    enumerate();
     run();
     ExitProcess(failed);
 }

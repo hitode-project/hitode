@@ -2,8 +2,8 @@
 //!
 //! The first query on a handle lists the directory: `.` and `..`, then
 //! the entries that match the mask in name order. Each query goes on from
-//! where the last stopped, until a restart. Entries carry no 8.3 names, as
-//! on a volume that does not make them.
+//! where the last stopped, until a restart. Entries include Wine's hashed
+//! 8.3 aliases for names that need them.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -60,6 +60,9 @@ pub fn query(env: &mut Env<'_>, args: &[u32]) -> Outcome {
     else {
         unreachable!()
     };
+    // NT BOOLEAN arguments occupy a stack word, but only its low byte is defined.
+    let single = single as u8 != 0;
+    let restart = restart as u8 != 0;
     status::finish((|| {
         if event != 0 || apc != 0 {
             return Err(Error::Unsupported(
@@ -102,7 +105,7 @@ pub fn query(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         };
 
         let listings = &mut env.ext.get_or_default::<Listings>().0;
-        let fresh = !listings.contains_key(&handle) || (restart != 0 && mask.is_some());
+        let fresh = !listings.contains_key(&handle) || (restart && mask.is_some());
         if fresh {
             let directory = directory.ok_or(status::INVALID_PARAMETER)?;
             let names = list(&directory, mask.as_deref())?;
@@ -117,7 +120,7 @@ pub fn query(env: &mut Env<'_>, args: &[u32]) -> Outcome {
             listings.insert(handle, listing);
         }
         let listing = listings.get_mut(&handle).expect("listed above");
-        if restart != 0 {
+        if restart {
             listing.position = 0;
         }
 
@@ -192,7 +195,7 @@ pub fn query(env: &mut Env<'_>, args: &[u32]) -> Outcome {
                 result = BUFFER_OVERFLOW;
                 break;
             }
-            if single != 0 {
+            if single {
                 break;
             }
         }
@@ -238,25 +241,51 @@ fn list(directory: &std::path::Path, mask: Option<&[u16]>) -> Result<Vec<OsStrin
     Ok(dots.into_iter().filter(wanted).chain(names).collect())
 }
 
-/// Whether `name` matches `mask`, where `*` stands for any run of
-/// characters and `?` for one, without regard to case.
+/// Match an NT search expression, including Wine's DOS wildcard tokens.
 fn matches(mask: &[u16], name: &[u16]) -> bool {
     let upper = |c: u16| {
         char::from_u32(c.into())
             .map(|c| c.to_uppercase().next().unwrap_or(c) as u32)
             .unwrap_or(c.into())
     };
-    match mask.split_first() {
-        None => name.is_empty(),
-        Some((&STAR, rest)) => (0..=name.len()).any(|skip| matches(rest, &name[skip..])),
-        Some((&c, rest)) => name.split_first().is_some_and(|(&n, name)| {
-            (c == QUESTION || upper(c) == upper(n)) && matches(rest, name)
-        }),
+    let last_dot = name.iter().rposition(|&unit| unit == DOT);
+    let mut previous = vec![false; name.len() + 1];
+    let mut current = previous.clone();
+    previous[0] = true;
+    for &unit in mask {
+        for position in 0..=name.len() {
+            current[position] = match unit {
+                STAR => previous[position] || position > 0 && current[position - 1],
+                DOS_STAR => {
+                    previous[position]
+                        || position > 0 && Some(position - 1) != last_dot && current[position - 1]
+                }
+                DOS_QM => {
+                    previous[position] && (position == name.len() || name[position] == DOT)
+                        || position > 0 && name[position - 1] != DOT && previous[position - 1]
+                }
+                DOS_DOT => {
+                    position == name.len() && previous[position]
+                        || position > 0 && name[position - 1] == DOT && previous[position - 1]
+                }
+                _ => {
+                    position > 0
+                        && (unit == QUESTION || upper(unit) == upper(name[position - 1]))
+                        && previous[position - 1]
+                }
+            };
+        }
+        std::mem::swap(&mut previous, &mut current);
     }
+    previous[name.len()]
 }
 
 const STAR: u16 = b'*' as u16;
 const QUESTION: u16 = b'?' as u16;
+const DOT: u16 = b'.' as u16;
+const DOS_STAR: u16 = b'<' as u16;
+const DOS_QM: u16 = b'>' as u16;
+const DOS_DOT: u16 = b'"' as u16;
 
 #[cfg(test)]
 mod tests {
@@ -273,5 +302,27 @@ mod tests {
         assert!(matches(&utf16("*"), &utf16("")));
         assert!(!matches(&utf16("*.fon"), &utf16("tahoma.ttf")));
         assert!(!matches(&utf16("?"), &utf16("")));
+    }
+
+    // spec: WINE-SYS-5
+    #[test]
+    fn wine_dos_masks_enumerate_numbered_and_extensionless_files() {
+        for (mask, name, expected) in [
+            ("pack>>>>.arc", "pack0001.arc", true),
+            ("patch>>.dat", "patch.dat", true),
+            ("patch>>.dat", "patch12.dat", true),
+            ("patch>>.dat", "patch123.dat", false),
+            ("*\"*", "README", true),
+            ("*\"*", "README.txt", true),
+            ("<", "README", true),
+            ("<", "README.txt", false),
+            ("<.txt", "name.part.txt", true),
+        ] {
+            assert_eq!(
+                matches(&utf16(mask), &utf16(name)),
+                expected,
+                "{mask}, {name}"
+            );
+        }
     }
 }

@@ -125,6 +125,8 @@ win32u creates the process's own desktop window, as Wine does when explorer cann
 ### WINE-SYS-5 Host names and listings
 
 **Rule**: `\??\unix` MUST name the host's root as a drive names its link. Directory queries MUST list matching entries in name order, preceded by `.` and `..`, and resume until restarted. Listings MUST expose Wine's hashed DOS aliases for names that need them.
+Search expressions MUST recognize the NT DOS wildcard tokens `<`, `>` and `"` alongside `*` and `?`.
+Directory query `BOOLEAN` arguments MUST use only the low byte of their stack slot.
 **Verification**: Test
 
 ### WINE-SYS-7 Instruction coherence

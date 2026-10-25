@@ -10,7 +10,8 @@ run at their "at" time or as soon as the wait ends, whichever is later.
 Checkpoints save the actual framebuffer and frontend/device report, then optionally
 start a new measurement window. Times are host time since process launch, and every
 command waits for its real acknowledgement; no release may overtake its key-down.
-All guest writes and evidence go to --output. Game assets are never modified.
+Built-in stack guest writes and all evidence go to --output. Wine writes its
+game folder in place, so use a disposable copy of that folder with --wine.
 Use --audio --mute-audio --mode hidden (or window) to keep the real audio device
 path active while sending silence to hardware, without enabling capture or tracing.
 session.json records whether the hardware was requested to be muted.
@@ -21,6 +22,7 @@ and marks the session unsuitable for performance comparison.
 --pin-runner runs a copy of the binary from OUTPUT/bin; session.json records
 the SHA-256 of what actually ran.
 Native caching/static discovery are default; --no-code-cache diagnoses failures.
+--wine DIST selects the Wine stack with a separate prefix under OUTPUT.
 --warm-code-cache
 imports a previous local archive into the new overlay. --cold clears both caches.
 """
@@ -171,6 +173,11 @@ def run(args: argparse.Namespace) -> None:
                "--seconds", str(duration), "--auto-dialog-ms", str(getattr(args, "auto_dialog_ms", 50)),
                "--data-dir", str(output / "overlay"), "--report", str(output / "final.json"),
                "--screenshot", str(output / "final.png")]
+    if getattr(args, "wine", None):
+        command.extend(["--wine", str(args.wine.resolve(strict=True)),
+                        "--wine-prefix", str(output / "prefix")])
+    if getattr(args, "host_profile", False):
+        command.extend(["--host-profile", str(output / "host-services.csv")])
     for mount in getattr(args, "cdrom", []):
         command.extend(["--cdrom", mount])
     if getattr(args, "frame_budget", False):
@@ -355,6 +362,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--exe", required=True, type=Path)
     parser.add_argument("--schedule", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--wine", type=Path, help="Wine distribution; keep its prefix under OUTPUT")
+    parser.add_argument("--host-profile", action="store_true", help="record host service costs under OUTPUT")
     parser.add_argument("--cdrom", action="append", default=[], metavar="DRIVE=IMAGE",
                         help="mount an image in the guest; repeat for multiple drives")
     parser.add_argument("--auto-dialog-ms", type=int, default=50,

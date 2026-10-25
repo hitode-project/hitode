@@ -95,6 +95,16 @@ class PlaySessionTests(unittest.TestCase):
             self.assertFalse((args.output / "bin" / "notes.txt").exists())
             self.assertEqual(metadata["command"][0], str(pinned))
 
+    def test_wine_runs_use_a_prefix_inside_the_run(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            distribution = root / "wine-dist"
+            distribution.mkdir()
+            args = self.args(root, wine=distribution)
+            (command, _), _metadata = self.launch(args)
+            self.assertEqual(command[command.index("--wine") + 1], str(distribution))
+            self.assertEqual(command[command.index("--wine-prefix") + 1], str(args.output / "prefix"))
+
     def test_waits_are_validated_and_judged_from_acknowledgements(self):
         for bad in ({}, {"window": ""}, {"hit": [1]}, {"frames": 0}, {"window": "a", "frames": 1},
                     {"window": "a", "timeout": 0}):

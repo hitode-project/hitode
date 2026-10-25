@@ -183,7 +183,7 @@ fn l_process() {
     assert_eq!(text.lines().collect::<Vec<_>>(), expected);
 }
 
-// spec: NT-FILE-1, NT-FILE-2, NT-FILE-3, WINE-THR-1
+// spec: NT-FILE-1, NT-FILE-2, NT-FILE-3, WINE-THR-1, WINE-SYS-5
 #[test]
 fn j_file() {
     let Some((stop, text)) = probe("j_file", "nt_j_file.exe", |_, _| {}) else {
@@ -194,6 +194,10 @@ fn j_file() {
         &text,
         "=ok",
         &[
+            "directory_dos_mask",
+            "directory_boolean_batch",
+            "directory_boolean_resume",
+            "directory_boolean_single",
             "flush_file",
             "flush_ex",
             "flush_access",
