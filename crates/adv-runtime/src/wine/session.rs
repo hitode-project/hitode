@@ -1116,6 +1116,12 @@ impl Session {
                 .map_err(|e| e.to_string())?;
             #[cfg(feature = "gpu")]
             adv_dx::d3d9::fork_host_state(&self.machine.ext, &mut machine.ext)?;
+            // Until foreground handoff, a child queues frames for the session's
+            // consumer; Snapshot cannot present native GPU frames directly.
+            machine
+                .ext
+                .get_mut::<SurfaceStore>()
+                .set_deferred_presentation(true)?;
             let mut progress = shared.clone();
             let (connection, registered) = adv_nt::server::Connection::from_socket(
                 child.socket,

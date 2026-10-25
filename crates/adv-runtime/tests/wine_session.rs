@@ -162,6 +162,33 @@ fn sequential_sessions_child() {
 // spec: WINE-SES-1, WINE-SES-2
 #[test]
 fn a_session_runs_a_program_from_its_directory_and_presents() {
+    program_session(false);
+}
+
+// spec: WINE-GFX-6
+#[test]
+fn a_child_can_present_native_gpu_frames() {
+    assert!(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "native_child_session",
+                "--nocapture"
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+}
+
+#[test]
+#[ignore = "subprocess entry: Wine owns process-global server state"]
+fn native_child_session() {
+    program_session(true);
+}
+
+fn program_session(child: bool) {
     let (Some(dist), Some(probes)) = (
         std::env::var_os("ADV_WINE_DIST").map(PathBuf::from),
         std::env::var_os("ADV_WINE_PROBES").map(PathBuf::from),
@@ -173,6 +200,9 @@ fn a_session_runs_a_program_from_its_directory_and_presents() {
     let game = root.join("game");
     std::fs::create_dir_all(&game).unwrap();
     std::fs::copy(probes.join("d3d9.exe"), game.join("d3d9.exe")).unwrap();
+    if child {
+        std::fs::write(game.join("spawn-child"), []).unwrap();
+    }
     // What an earlier run left: drive D: on another program's directory.
     let devices = root.join("session/dosdevices");
     std::fs::create_dir_all(&devices).unwrap();
@@ -236,6 +266,10 @@ fn a_session_runs_a_program_from_its_directory_and_presents() {
     let _ = output.read_to_string(&mut text);
     std::fs::remove_dir_all(&root).unwrap();
     assert!(matches!(stop, Stop::Exited(0)), "{stop:?}: {text}");
+    assert!(text.contains("presented=0"), "{text}");
+    if child {
+        return;
+    }
     assert!(frames >= 1, "no frame was presented");
     assert_eq!(size, (64, 32));
     assert_eq!(inked, 43);

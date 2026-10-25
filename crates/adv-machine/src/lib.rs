@@ -2183,6 +2183,7 @@ impl<B: Backend> Machine<B> {
         self.frame_handoff = parent.frame_handoff;
         self.time_skip_source = parent.time_skip_source.clone();
         self.sys.stats.enabled = parent.sys.stats.enabled;
+        self.sys.stats.services_enabled = parent.sys.stats.services_enabled;
         self.sys.call_limit = parent.sys.call_limit;
         self.sys.trace = parent.sys.trace.clone();
     }

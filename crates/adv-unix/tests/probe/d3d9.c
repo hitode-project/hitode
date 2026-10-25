@@ -8,6 +8,7 @@
 #include <windows.h>
 #include <d3d9.h>
 #include <stdio.h>
+#include <string.h>
 
 #define WIDTH 64
 #define HEIGHT 32
@@ -41,6 +42,20 @@ static int draw(IDirect3DSurface9 *surface, HRESULT *released)
 
 int main(void)
 {
+    if (GetFileAttributesA("spawn-child") != INVALID_FILE_ATTRIBUTES && !strstr(GetCommandLineA(), " child")) {
+        char path[MAX_PATH], command[MAX_PATH + 16];
+        STARTUPINFOA startup = {sizeof(startup)};
+        PROCESS_INFORMATION child;
+        DWORD code;
+        GetModuleFileNameA(NULL, path, sizeof(path));
+        snprintf(command, sizeof(command), "\"%s\" child", path);
+        if (!CreateProcessA(path, command, NULL, NULL, TRUE, 0, NULL, NULL, &startup, &child)) return 5;
+        WaitForSingleObject(child.hProcess, INFINITE);
+        if (!GetExitCodeProcess(child.hProcess, &code)) return 6;
+        CloseHandle(child.hThread);
+        CloseHandle(child.hProcess);
+        return code;
+    }
     D3DPRESENT_PARAMETERS params = {0};
     IDirect3DSurface9 *surface, *back;
     IDirect3DDevice9 *device;

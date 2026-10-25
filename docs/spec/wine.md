@@ -424,6 +424,7 @@ FreeType is a host library under WINE-UNIX-6.
 ### WINE-GFX-6 Direct3D 9 on Wine
 
 **Rule**: Our Direct3D 9 MUST load as a PE image in place of Wine's. Its surface DCs MUST be memory DCs that call GDI through its own IAT. A presented back buffer MUST reach the presenter.
+Child processes MUST defer native GPU presentation to the session's consumer before drawing.
 **Verification**: Test
 
 ### WINE-GFX-7 Frames published on waits
