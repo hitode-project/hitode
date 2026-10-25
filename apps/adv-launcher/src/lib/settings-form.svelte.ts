@@ -75,7 +75,7 @@ class GeneralSettings {
 
 export const general = new GeneralSettings();
 
-type FontKey = "gothic" | "mincho";
+type FontKey = "gothic" | "mincho" | "chinese";
 
 /**
  * One game's settings form: run setup and per-game overrides of global values.
@@ -91,9 +91,10 @@ export class GameForm {
   error = $state("");
 
   static readonly LETTERS = ["D:", "E:", "F:", "G:"];
-  static readonly FONTS: { key: FontKey; name: string }[] = [
-    { key: "gothic", name: "ＭＳ ゴシック" },
-    { key: "mincho", name: "ＭＳ 明朝" },
+  static readonly FONTS: { key: FontKey; name: string; lang: string; preview: string }[] = [
+    { key: "gothic", name: "ＭＳ ゴシック", lang: "ja", preview: "「……また、夏が来るね」" },
+    { key: "mincho", name: "ＭＳ 明朝", lang: "ja", preview: "「……また、夏が来るね」" },
+    { key: "chinese", get name() { return t("中文字体"); }, lang: "zh-CN", preview: "「……夏天又要来了」" },
   ];
 
   /** Global values the per-game settings fall back to. */
@@ -237,9 +238,10 @@ export class GameForm {
   }
 
   /** CSS font stack previewing a font choice. */
-  static fontFamily(choice: string): string {
+  static fontFamily(choice: string, language = "ja"): string {
+    const fallback = language === "ja" ? "var(--font-ja)" : "var(--font-ui)";
     if (choice === "serif") return "var(--font-serif-ja)";
-    if (choice.startsWith("font:")) return `"${choice.slice(5)}", var(--font-ja)`;
-    return "var(--font-ja)";
+    if (choice.startsWith("font:")) return `"${choice.slice(5)}", ${fallback}`;
+    return fallback;
   }
 }

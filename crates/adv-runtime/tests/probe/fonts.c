@@ -2,6 +2,27 @@
  * Build: i686-w64-mingw32-gcc -O2 -Wall fonts.c -o fonts.exe -lgdi32 */
 #include <windows.h>
 #include <stdio.h>
+#include <string.h>
+
+static int check_override(HDC dc, int explicit)
+{
+    LOGFONTW request = {0}, saved, actual = {0};
+    SIZE size = {0};
+    HFONT font, old;
+    int ok;
+    request.lfHeight = -40;
+    lstrcpyW(request.lfFaceName, L"aDv jApAnEsE fIxTuRe");
+    saved = request;
+    font = CreateFontIndirectW(&request);
+    old = SelectObject(dc, font);
+    ok = !memcmp(&request, &saved, sizeof(request));
+    ok &= GetObjectW(font, sizeof(actual), &actual) == sizeof(actual);
+    ok &= !lstrcmpW(actual.lfFaceName, explicit ? L"ADV Resource Fixture" : saved.lfFaceName);
+    if (explicit) ok &= GetTextExtentPoint32W(dc, L"B", 1, &size) && size.cx == 20;
+    SelectObject(dc, old);
+    DeleteObject(font);
+    return ok;
+}
 
 struct enumeration { int count, truetype; };
 static int CALLBACK enumerate(const LOGFONTW *font, const TEXTMETRICW *metrics,
@@ -34,12 +55,22 @@ static int check_face(HDC dc, const WCHAR *name)
     return result.count > 0 && result.truetype && length != GDI_ERROR && length > 0;
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
     static const WCHAR text[] = {0x3042, 0};
     BITMAPINFO info = {{sizeof(BITMAPINFOHEADER), 64, -48, 1, 32, BI_RGB}};
     HDC dc = CreateCompatibleDC(NULL);
+    if (argc > 1) {
+        int ok = check_override(dc, !strcmp(argv[1], "explicit"));
+        FILE *result = fopen("font-child-result", "wb");
+        if (!result) return 6;
+        fputc(ok, result);
+        fclose(result);
+        DeleteDC(dc);
+        return ok ? 0 : 4;
+    }
     FILE *choices = fopen("choices.txt", "r");
+    int explicit = choices != NULL;
     if (choices) {
         BOOL smoothing = TRUE;
         SIZE chosen = {0};
@@ -63,6 +94,21 @@ int main(void)
         defaults &= SystemParametersInfoW(SPI_GETFONTSMOOTHING, 0, &smoothing, 0) && smoothing;
         printf("defaults=%d\n", defaults);
         if (!defaults) return 3;
+    }
+    {
+        STARTUPINFOA startup = { sizeof(startup) };
+        PROCESS_INFORMATION process;
+        char command[64];
+        int override = check_override(dc, explicit), child = 0;
+        DeleteFileA("font-child-result");
+        sprintf(command, "fonts.exe %s", explicit ? "explicit" : "default");
+        if (CreateProcessA(NULL, command, NULL, NULL, FALSE, 0, NULL, NULL, &startup, &process)) {
+            child = 1;
+            CloseHandle(process.hThread);
+            CloseHandle(process.hProcess);
+        }
+        printf("override=%d child=%d\n", override, child);
+        if (!override || !child) return 5;
     }
     DWORD *pixels;
     HBITMAP bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, (void **)&pixels, NULL, 0);

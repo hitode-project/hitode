@@ -5,8 +5,8 @@
 //! installation's prefix template, what `wineboot --init` makes of an empty
 //! prefix. Its system32 links to the Wine installation's modules, as a prefix
 //! holds them. The program directory uses D: or the next letter free of optical
-//! mounts. A Host keeps the prefix server between games; each session first
-//! runs wineboot to refresh the volatile keys before starting the program.
+//! mounts. A Host boots the prefix server once and keeps its volatile state
+//! between games. Game fonts are installed after wineboot has finished.
 mod debug;
 mod files;
 mod fonts;
@@ -336,8 +336,11 @@ fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Link `target` to `source`, replacing what a previous run left there.
+/// Link `target` to `source`, retaining an existing matching link.
 fn link(source: &Path, target: &Path) -> Result<(), String> {
+    if std::fs::read_link(target).is_ok_and(|existing| existing == source) {
+        return Ok(());
+    }
     if target.symlink_metadata().is_ok() {
         std::fs::remove_file(target).map_err(|e| format!("{}: {e}", target.display()))?;
     }
@@ -650,10 +653,9 @@ impl Session {
             std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))
         };
         let (ntdll, apisets) = (module("ntdll.dll")?, module("apisetschema.dll")?);
-        let (prefix, drive) = prefix(&config)?;
+        let (prefix, drive) = host.prefix(&config)?;
         let (mounts, game_drive) = files::prepare(&config, options, &prefix)?;
-        let mut fonts = fonts::Fonts::prepare(&config, &drive, options)?;
-        let config = Config {
+        let process_config = Config {
             fonts: "",
             ..config
         };
@@ -671,35 +673,36 @@ impl Session {
         // As Wine's `run_wineboot`, but restarting: the template stands for
         // what `--init` installs, and no services run.
         let audio = adv_device::AudioControl::new(true);
-        let mut boot = new_machine(&config, &prefix, clock.clone(), &wake, &audio)?;
-        boot.ext.insert(mounts.clone());
-        let command_line = format!("\"{WINEBOOT}\" --restart");
-        let startup = Startup {
-            image: WINEBOOT,
-            command_line: &command_line,
-            directory: r"C:\windows\system32\",
-            environment: ENVIRONMENT,
-            locale: config.locale,
-            debug: config.debug,
-            stdin: None,
-            stdout: None,
-            stderr: None,
-            graphics_driver: super::GRAPHICS_DRIVER,
-            fonts: config.fonts,
-        };
-        process::start(
-            &mut boot,
-            &ntdll,
-            &apisets,
-            &startup,
-            &prefix,
-            &socket,
-            Box::new(shared.clone()),
-        )
-        .map_err(|e| format!("wineboot: {e}"))?;
-        boot.ext.insert(shared.clone());
-        adv_nt::identity::note_ntdll(&mut boot, &config.dist.join(NTDLL), &ntdll);
-        let boot_result = fonts.install(&mut boot).and_then(|_| {
+        if !host.booted() {
+            fonts::clear_links(&drive)?;
+            let mut boot = new_machine(&process_config, &prefix, clock.clone(), &wake, &audio)?;
+            boot.ext.insert(mounts.clone());
+            let command_line = format!("\"{WINEBOOT}\" --restart");
+            let startup = Startup {
+                image: WINEBOOT,
+                command_line: &command_line,
+                directory: r"C:\windows\system32\",
+                environment: ENVIRONMENT,
+                locale: config.locale,
+                debug: config.debug,
+                stdin: None,
+                stdout: None,
+                stderr: None,
+                graphics_driver: super::GRAPHICS_DRIVER,
+                fonts: process_config.fonts,
+            };
+            process::start(
+                &mut boot,
+                &ntdll,
+                &apisets,
+                &startup,
+                &prefix,
+                &socket,
+                Box::new(shared.clone()),
+            )
+            .map_err(|e| format!("wineboot: {e}"))?;
+            boot.ext.insert(shared.clone());
+            adv_nt::identity::note_ntdll(&mut boot, &config.dist.join(NTDLL), &ntdll);
             match run(
                 &mut boot,
                 &wake,
@@ -708,14 +711,15 @@ impl Session {
                 None,
                 None,
             ) {
-                Stop::Exited(0) => Ok(()),
-                stop => Err(format!("wineboot: {stop:?}")),
+                Stop::Exited(0) => {}
+                stop => return Err(format!("wineboot: {stop:?}")),
             }
-        });
-        fonts.restore(&mut boot)?;
-        boot_result?;
-        drop(boot);
+            drop(boot);
+            host.finish_boot();
+        }
 
+        let mut fonts = host.fonts.prepare(&config, &drive, options)?;
+        let config = process_config;
         let mut machine = new_machine(&config, &prefix, clock, &wake, &audio)?;
         machine.ext.insert(mounts);
         prepare(&mut machine)?;
@@ -1097,6 +1101,7 @@ impl Session {
                 &self.wake,
                 &self.audio,
             )?;
+            self.fonts.configure(&mut machine);
             adv_drv::codec::install(&mut machine.ext, adv_drv::codec::mode(&self.machine.ext));
             machine.inherit_policy(&self.machine);
             machine.sys.frame_pacer = self.machine.sys.frame_pacer.clone();

@@ -722,7 +722,13 @@ fn normalized_weight(request: &FontRequest) -> i32 {
 }
 fn macos_cjk_families(region: &str) -> &'static [&'static str] {
     match region {
-        "SC" => &["PingFang SC", "Hiragino Sans GB", "Songti SC", "STHeiti"],
+        "SC" => &[
+            "PingFang SC",
+            "Hiragino Sans GB",
+            "Heiti SC",
+            "Songti SC",
+            "STHeiti",
+        ],
         "TC" => &["PingFang TC", "Songti TC"],
         "KR" => &["Apple SD Gothic Neo", "AppleMyungjo"],
         _ => &[],
@@ -2113,7 +2119,13 @@ mod tests {
             (
                 Encoding::SimplifiedChinese,
                 "SC",
-                &["PingFang SC", "Hiragino Sans GB", "Songti SC", "STHeiti"][..],
+                &[
+                    "PingFang SC",
+                    "Hiragino Sans GB",
+                    "Heiti SC",
+                    "Songti SC",
+                    "STHeiti",
+                ][..],
             ),
             (
                 Encoding::TraditionalChinese,

@@ -131,7 +131,7 @@
           {#each fonts as f (f.key)}
             {@const cur = form.value(f.key)}
             <div class="row" class:ov={form.overridden(f.key)}>
-              {@render head(f.key, f.name, "ja")}
+              {@render head(f.key, f.name, f.lang)}
               <svg class="arrow" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 8h10M9.5 4.5L13 8l-3.5 3.5"></path></svg>
               <span class="selw">
                 <select aria-label={t("{0} 的替换字体", f.name)} onchange={(e) => form.changeFont(f.key, e.currentTarget)}>
@@ -149,8 +149,8 @@
             <div class="pv {form.smoothClass}" role="group" aria-label={t("字体预览")}>
               {#each fonts as f (f.key)}
                 <div class="pvr">
-                  <span lang="ja" style="font-size: 12px; color: var(--fg3); white-space: nowrap">{f.name}</span>
-                  <span class="pvl" lang="ja" style:font-family={GameForm.fontFamily(form.value(f.key))}>「……また、夏が来るね」</span>
+                  <span lang={f.lang} style="font-size: 12px; color: var(--fg3); white-space: nowrap">{f.name}</span>
+                  <span class="pvl" lang={f.lang} style:font-family={GameForm.fontFamily(form.value(f.key), f.lang)}>{f.preview}</span>
                 </div>
               {/each}
             </div>

@@ -6,15 +6,45 @@ use super::*;
 #[derive(Default)]
 pub struct Host {
     binding: Option<Binding>,
+    pub(super) fonts: fonts::Catalog,
 }
 
 struct Binding {
     prefix: PathBuf,
     dist: PathBuf,
+    drive: PathBuf,
     driver: Rc<RefCell<Driver>>,
+    booted: bool,
 }
 
 impl Host {
+    pub(super) fn prefix(&mut self, config: &Config<'_>) -> Result<(PathBuf, PathBuf), String> {
+        let drive = config
+            .drive
+            .map_or_else(|| config.prefix.join("drive_c"), Path::to_owned);
+        if self
+            .binding
+            .as_ref()
+            .is_some_and(|binding| binding.drive == drive)
+        {
+            Ok((config.prefix.to_owned(), drive))
+        } else {
+            let prepared = prefix(config)?;
+            if let Some(binding) = &mut self.binding {
+                binding.drive = drive;
+            }
+            Ok(prepared)
+        }
+    }
+
+    pub(super) fn booted(&self) -> bool {
+        self.binding.as_ref().is_some_and(|binding| binding.booted)
+    }
+
+    pub(super) fn finish_boot(&mut self) {
+        self.binding.as_mut().unwrap().booted = true;
+    }
+
     pub fn start(
         &mut self,
         config: &Config<'_>,
@@ -61,6 +91,10 @@ impl Host {
             self.binding = Some(Binding {
                 prefix: config.prefix.to_owned(),
                 dist: config.dist.to_owned(),
+                drive: config
+                    .drive
+                    .map_or_else(|| config.prefix.join("drive_c"), Path::to_owned),
+                booted: false,
                 driver: Rc::new(RefCell::new(Driver {
                     server,
                     clock: time,

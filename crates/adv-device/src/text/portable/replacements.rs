@@ -141,6 +141,33 @@ mod tests {
 
     // spec: DEV-FONT-1, WINE-SES-5
     #[test]
+    fn simplified_chinese_replacements_prefer_heiti_to_songti() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/font-resource.ttf");
+        let mut db = Database::new();
+        db.load_font_file(path).unwrap();
+        let info = db.faces().next().unwrap();
+        let faces: Vec<_> = ["Songti SC", "Heiti SC"]
+            .into_iter()
+            .map(|name| Candidate {
+                info: info.clone(),
+                names: vec![name.into()],
+                codepages: codepage(Encoding::SimplifiedChinese),
+                truetype: true,
+            })
+            .collect();
+        let aliases = replacements(&faces);
+        for name in ["SimSun", "NSimSun", "SimHei", "Microsoft YaHei"] {
+            let (_, targets) = aliases
+                .iter()
+                .find(|(names, _)| names.iter().any(|alias| alias == name))
+                .unwrap();
+            assert_eq!(targets, &["Heiti SC"]);
+        }
+    }
+
+    // spec: DEV-FONT-1, WINE-SES-5
+    #[test]
     fn replacements_require_repertoire_and_prefer_actual_truetype() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/font-resource.ttf");

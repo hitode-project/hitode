@@ -2,7 +2,7 @@
 //! replacements, with real TrueType metadata and pixels from an authored font.
 #![cfg(any(target_vendor = "apple", target_os = "android"))]
 
-use adv_runtime::wine::session::{Config, Session, SessionOptions, Stop};
+use adv_runtime::wine::session::{Config, Host, SessionOptions, Stop};
 use std::{
     path::PathBuf,
     time::{Duration, Instant},
@@ -64,46 +64,75 @@ fn discovered_fonts_and_aliases_survive_prefix_reuse() {
         std::fs::remove_dir_all(root).unwrap();
         return;
     }
-    let output = root.join(format!("stdout-{}", std::process::id()));
-    let stdout = std::fs::File::create(&output).unwrap();
-    let config = Config {
-        dist: &dist,
-        prefix: &root.join("prefix"),
-        drive: None,
-        locale: 0x411,
-        fonts: &fonts,
-        exe: &game.join("fonts.exe"),
-        width: 640,
-        height: 480,
-        jit: true,
-        debug: "",
-        stdout: Some(std::os::fd::AsRawFd::as_raw_fd(&stdout)),
-    };
-    let explicit = game.join("choices.txt").exists();
-    let mut fonts = SessionOptions::default();
-    if explicit {
-        fonts.font_files.push(fixtures.join("font-resource.ttf"));
-        fonts
-            .fonts
-            .families
-            .insert("ADV Host Choice".into(), "ADV Resource Fixture".into());
-        fonts.fonts.antialiased = Some(false);
-    }
-    let mut session =
-        Session::start_with_options(&config, adv_sync::WakeEvent::new().unwrap(), &fonts, |_| {
-            Ok(())
-        })
-        .unwrap();
+    let initial = game.join("choices.txt").exists();
+    let mut host = Host::default();
+    for (pass, explicit) in [initial, !initial, initial].into_iter().enumerate() {
+        if explicit {
+            std::fs::write(game.join("choices.txt"), "explicit").unwrap();
+        } else if game.join("choices.txt").exists() {
+            std::fs::remove_file(game.join("choices.txt")).unwrap();
+        }
+        let output = root.join(format!("stdout-{}-{pass}", std::process::id()));
+        let stdout = std::fs::File::create(&output).unwrap();
+        let config = Config {
+            dist: &dist,
+            prefix: &root.join("prefix"),
+            drive: None,
+            locale: 0x411,
+            fonts: &fonts,
+            exe: &game.join("fonts.exe"),
+            width: 640,
+            height: 480,
+            jit: true,
+            debug: "",
+            stdout: Some(std::os::fd::AsRawFd::as_raw_fd(&stdout)),
+        };
+        let mut fonts = SessionOptions::default();
+        if explicit {
+            fonts.font_files.push(fixtures.join("font-resource.ttf"));
+            fonts
+                .fonts
+                .families
+                .insert("ADV Host Choice".into(), "ADV Resource Fixture".into());
+            fonts
+                .fonts
+                .families
+                .insert("ADV Japanese Fixture".into(), "ADV Resource Fixture".into());
+            fonts.fonts.antialiased = Some(false);
+        }
+        let mut session = host
+            .start(&config, adv_sync::WakeEvent::new().unwrap(), &fonts, |_| {
+                Ok(())
+            })
+            .unwrap();
 
-    let stop = session.run(Instant::now() + Duration::from_secs(30));
-    drop(session);
-    drop(stdout);
-    let text = std::fs::read_to_string(output).unwrap();
-    assert!(matches!(stop, Stop::Exited(0)), "{stop:?}: {text}");
-    let expected = if explicit {
-        vec!["choices=1", "aliases=1", "pixels=1", "private=1"]
-    } else {
-        vec!["defaults=1", "aliases=1", "pixels=1", "private=1"]
-    };
-    assert_eq!(text.lines().collect::<Vec<_>>(), expected);
+        let stop = session.run(Instant::now() + Duration::from_secs(30));
+        drop(session);
+        drop(stdout);
+        let text = std::fs::read_to_string(output).unwrap();
+        assert!(matches!(stop, Stop::Exited(0)), "{stop:?}: {text}");
+        assert_eq!(
+            std::fs::read(game.join("font-child-result")).unwrap(),
+            [1],
+            "child did not inherit font choices"
+        );
+        let expected = if explicit {
+            vec![
+                "choices=1",
+                "override=1 child=1",
+                "aliases=1",
+                "pixels=1",
+                "private=1",
+            ]
+        } else {
+            vec![
+                "defaults=1",
+                "override=1 child=1",
+                "aliases=1",
+                "pixels=1",
+                "private=1",
+            ]
+        };
+        assert_eq!(text.lines().collect::<Vec<_>>(), expected);
+    }
 }

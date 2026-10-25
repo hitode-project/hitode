@@ -188,9 +188,8 @@ pub(super) fn install<B: Backend>(machine: &mut Machine<B>, prefix: &Path) -> Re
         },
     ];
     let image = ModuleImage::build(machine, MODULE, &exports, &imports)?;
-    let path = adv_unix::builtin::install(prefix, &image).map_err(|e| e.to_string())?;
     // ModuleImage names host bindings. Wine's first three exports have no names.
-    let mut bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+    let mut bytes = image.bytes().to_vec();
     let pe = adv_pe::Pe::parse(&bytes).map_err(|e| e.to_string())?;
     let directory = pe.dirs[adv_pe::dir::EXPORT].rva as usize;
     let word = |at| u32::from_le_bytes(pe.image[at..at + 4].try_into().unwrap()) as usize;
@@ -224,7 +223,7 @@ pub(super) fn install<B: Backend>(machine: &mut Machine<B>, prefix: &Path) -> Re
     }
     let out = raw(directory) + 24;
     bytes[out..out + 4].copy_from_slice(&(retained as u32).to_le_bytes());
-    std::fs::write(path, bytes).map_err(|e| e.to_string())?;
+    adv_unix::builtin::install_bytes(prefix, MODULE, bytes).map_err(|e| e.to_string())?;
     Ok(())
 }
 fn pe_import(name: &str) -> adv_pe::Import {
