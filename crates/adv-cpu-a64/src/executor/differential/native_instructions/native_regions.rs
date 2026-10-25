@@ -1,6 +1,6 @@
 //! Engine-only checks of the admitted bridge ABI and its guarded scalar tail.
 use super::*;
-use adv_cpu_core::native_region::{Affine, Aliasing, NativeRegion};
+use adv_cpu_core::native_region::{Affine, Aliasing, NativeRegion, ReadSpan, Scalar};
 use adv_cpu_core::trap::ExecutionTrap;
 
 struct Admission(Vec<u8>);
@@ -24,7 +24,21 @@ impl ExecutionTrap for Admission {
                 [input(3), input(7), input(1)],
                 [0, -1, 0, 1, 0, 0, 0, 1],
                 6,
-                Aliasing::Disjoint,
+                [
+                    Some(ReadSpan {
+                        address: input(3),
+                        aliasing: Aliasing::Disjoint,
+                    }),
+                    None,
+                    None,
+                ],
+                Some(Scalar {
+                    value: Affine {
+                        registers: [0; 8],
+                        constant: 0xa55a,
+                    },
+                    upper_bounds: [None; 2],
+                }),
                 add_bytes,
             )
         }]
@@ -34,7 +48,8 @@ impl ExecutionTrap for Admission {
     }
 }
 
-unsafe extern "C" fn add_bytes(source: *const u8, destination: *mut u8, count: u32) {
+unsafe extern "C" fn add_bytes(source: *const u8, destination: *mut u8, count: u32, scalar: u32) {
+    assert_eq!(scalar, 0xa55a);
     // SAFETY: the bridge checked the complete disjoint ordinary batch spans.
     unsafe {
         for i in 0..count as usize {

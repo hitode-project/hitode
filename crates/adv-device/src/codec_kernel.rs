@@ -14,10 +14,11 @@ pub fn png_sub(row: &mut [u8], bpp: usize) -> Result<(), KernelError> {
     if bpp == 0 {
         return Err(KernelError::UnsupportedSize);
     }
-    for i in bpp..row.len() {
-        row[i] = row[i].wrapping_add(row[i - bpp]);
+    if bpp >= row.len() {
+        return Ok(());
     }
-    Ok(())
+    let (prefix, remaining) = row.split_at_mut(bpp);
+    png_sub_segment(remaining, prefix)
 }
 
 /// Sub on a remaining row segment. `prefix` is the preceding pixel, or its
@@ -54,8 +55,34 @@ pub fn png_average(row: &mut [u8], previous: &[u8], bpp: usize) -> Result<(), Ke
     if row.len() != previous.len() || bpp == 0 {
         return Err(KernelError::UnsupportedSize);
     }
+    let first = bpp.min(row.len());
+    let (prefix, remaining) = row.split_at_mut(first);
+    for (byte, &above) in prefix.iter_mut().zip(previous) {
+        *byte = byte.wrapping_add(above / 2);
+    }
+    if remaining.is_empty() {
+        return Ok(());
+    }
+    png_average_segment(remaining, &previous[first..], prefix)
+}
+
+/// Average on a remaining segment, retaining reconstructed bytes before the
+/// segment. For a segment shorter than one pixel, only that prefix portion
+/// is needed. Updated in-segment history is read from `row` itself.
+pub fn png_average_segment(
+    row: &mut [u8],
+    previous: &[u8],
+    prefix: &[u8],
+) -> Result<(), KernelError> {
+    if row.len() != previous.len() || prefix.is_empty() {
+        return Err(KernelError::UnsupportedSize);
+    }
     for i in 0..row.len() {
-        let left = if i < bpp { 0 } else { row[i - bpp] };
+        let left = if i < prefix.len() {
+            prefix[i]
+        } else {
+            row[i - prefix.len()]
+        };
         let predictor = (u16::from(left) + u16::from(previous[i])) / 2;
         row[i] = row[i].wrapping_add(predictor as u8);
     }

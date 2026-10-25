@@ -65,6 +65,54 @@ fn scalar_tail_cannot_read_an_unrestored_loop_carried_temporary() {
     ));
 }
 
+// spec: EXEC-NATIVE-2, EXEC-NATIVE-3
+#[test]
+fn average_admission_checks_the_wide_sum_and_prefix_mapping() {
+    let bytes = vec![
+        0x0f, 0xb6, 0x1c, 0x30, 0x0f, 0xb6, 0x14, 0x37, 0x01, 0xda, 0xd1, 0xea, 0x00, 0x14, 0x31,
+        0x46, 0x39, 0xf5, 0x75, 0xec,
+    ];
+    let image = snapshot(bytes.clone());
+    let candidate = analyze::discover(&image, &mut budget())
+        .into_iter()
+        .find(|c| c.contract.computation == Computation::PngAverage)
+        .unwrap();
+    let binding = verify::verify(&image, candidate.clone(), &mut budget()).unwrap();
+    assert!(
+        binding
+            .conditions()
+            .iter()
+            .any(|p| matches!(p, Predicate::BackwardDistance { .. }))
+    );
+    let mut incorrect = candidate;
+    incorrect
+        .view
+        .inputs
+        .iter_mut()
+        .find(|(role, _)| *role == Input::BytesPerPixel)
+        .unwrap()
+        .1 = Expression::constant(Width::Dword, 4);
+    assert!(matches!(
+        verify::verify(&image, incorrect, &mut budget()),
+        Err(Rejection::Counterexample {
+            reason: "input mapping",
+            ..
+        })
+    ));
+    let mut wrong = bytes;
+    wrong[9] = 0xd2; // ADD EDX, EDX loses the other predictor input.
+    let image = snapshot(wrong);
+    for candidate in analyze::discover(&image, &mut budget()) {
+        assert!(matches!(
+            verify::verify(&image, candidate, &mut budget()),
+            Err(Rejection::Counterexample {
+                reason: "byte recurrence",
+                ..
+            })
+        ));
+    }
+}
+
 // spec: EXEC-NATIVE-1, EXEC-NATIVE-2
 #[test]
 fn register_allocation_and_offsets_do_not_require_signatures() {

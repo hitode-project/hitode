@@ -33,19 +33,23 @@ pub fn discover(image: &ImageSnapshot, budget: &mut Budget) -> Vec<CandidateBind
                 continue;
             };
             let mut body = Decoder::with_ip(32, bytes, u64::from(start), DecoderOptions::NONE);
-            let (mut source, mut destination, mut remaining) = (None, None, None);
+            let (mut destination, mut remaining) = (None, None);
+            let mut sources = Vec::new();
             let values = std::array::from_fn(|r| Expression::register(Register(r as u8)));
             let mut increments = [false; 8];
             let mut adds = false;
+            let mut halves = false;
             while body.can_decode() && budget.instructions != 0 {
                 budget.instructions -= 1;
                 let step = body.decode();
                 if step.op1_kind() == OpKind::Memory
                     && matches!(step.mnemonic(), Mnemonic::Mov | Mnemonic::Movzx)
                     && verify::plain_memory(&step)
+                    && let Some(source) = verify::address(&step, &values)
                 {
-                    source = verify::address(&step, &values);
+                    sources.push(source);
                 }
+                halves |= step.mnemonic() == Mnemonic::Shr;
                 if step.op0_kind() == OpKind::Memory
                     && matches!(step.mnemonic(), Mnemonic::Mov | Mnemonic::Add)
                     && verify::plain_memory(&step)
@@ -84,28 +88,43 @@ pub fn discover(image: &ImageSnapshot, budget: &mut Budget) -> Vec<CandidateBind
                     }
                 }
             }
-            let (Some(source), Some(destination), Some(remaining)) =
-                (source, destination, remaining)
-            else {
+            let (Some(destination), Some(remaining)) = (destination, remaining) else {
                 continue;
             };
             if budget.instructions == 0 && body.can_decode() {
                 continue;
             }
-            let computations: &[Computation] = if adds {
-                &[Computation::PngSub, Computation::PngUp]
-            } else {
-                &[Computation::Lz77]
-            };
-            for &computation in computations {
-                let Some(view) = byte_view(
-                    computation,
-                    source.clone(),
-                    destination.clone(),
-                    remaining.clone(),
-                ) else {
-                    continue;
+            let mut proposals = Vec::new();
+            if adds && halves && sources.len() == 2 {
+                for (previous, left) in [(0, 1), (1, 0)] {
+                    if let Some(view) = row_view(
+                        Computation::PngAverage,
+                        sources[previous].clone(),
+                        sources[left].clone(),
+                        destination.clone(),
+                        remaining.clone(),
+                    ) {
+                        proposals.push((Computation::PngAverage, view));
+                    }
+                }
+            } else if let [source] = sources.as_slice() {
+                let computations: &[Computation] = if adds {
+                    &[Computation::PngSub, Computation::PngUp]
+                } else {
+                    &[Computation::Lz77]
                 };
+                for &computation in computations {
+                    if let Some(view) = byte_view(
+                        computation,
+                        source.clone(),
+                        destination.clone(),
+                        remaining.clone(),
+                    ) {
+                        proposals.push((computation, view));
+                    }
+                }
+            }
+            for (computation, view) in proposals {
                 candidates.push(CandidateBinding {
                     image: image.identity,
                     contract: ReferenceContract::get(computation),

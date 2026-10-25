@@ -355,6 +355,28 @@ impl Expression {
     pub(crate) fn kind(&self) -> &Kind {
         &self.kind
     }
+
+    pub(crate) fn same_value(&self, other: &Self) -> bool {
+        if self == other {
+            return true;
+        }
+        if self.width != other.width {
+            return false;
+        }
+        match (self.kind.as_ref(), other.kind.as_ref()) {
+            (Kind::Binary(op, a, b), Kind::Binary(other, c, d)) if op == other => {
+                (a.same_value(c) && b.same_value(d))
+                    || (matches!(
+                        op,
+                        Binary::Add | Binary::And | Binary::Or | Binary::Xor | Binary::Equal
+                    ) && a.same_value(d)
+                        && b.same_value(c))
+            }
+            (Kind::Extend(a, signed), Kind::Extend(b, other)) if signed == other => a.same_value(b),
+            (Kind::Extract(a, shift), Kind::Extract(b, other)) if shift == other => a.same_value(b),
+            _ => false,
+        }
+    }
 }
 
 fn sign(value: u64, width: Width) -> i64 {

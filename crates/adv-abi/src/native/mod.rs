@@ -223,6 +223,32 @@ pub(crate) fn byte_view(
     })
 }
 
+pub(crate) fn row_view(
+    computation: Computation,
+    previous: Expression,
+    left: Expression,
+    destination: Expression,
+    remaining: Expression,
+) -> Option<StateView> {
+    if !matches!(computation, Computation::PngAverage | Computation::PngPaeth) {
+        return None;
+    }
+    let distance = Expression::binary(Binary::Subtract, destination.clone(), left.clone())?;
+    Some(StateView {
+        inputs: vec![
+            (Input::FilteredRow, destination.clone()),
+            (Input::ReconstructedPrefix, left),
+            (Input::PreviousRow, previous),
+            (Input::BytesPerPixel, distance),
+            (Input::Length, remaining.clone()),
+        ],
+        output: MemorySpan {
+            address: destination,
+            length: remaining,
+        },
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DependencyKind {
     Code,

@@ -12,7 +12,7 @@ use iced_x86::{
 use super::expression::Kind;
 use super::*;
 
-pub const RULE_VERSION: u32 = 3;
+pub const RULE_VERSION: u32 = 4;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Store {
@@ -73,9 +73,25 @@ impl VerifiedBinding {
         &self,
         kernel: adv_cpu::native_region::Kernel,
     ) -> Option<adv_cpu::native_region::NativeRegion> {
-        use adv_cpu::native_region::{Affine, Aliasing, NativeRegion};
+        use adv_cpu::native_region::{Affine, Aliasing, NativeRegion, ReadSpan, Scalar};
+        let affine = |expression: &Expression| -> Option<Affine> {
+            let (terms, constant) = expression.affine()?;
+            let mut registers = [0; 8];
+            for (target, term) in registers.iter_mut().zip(terms) {
+                *target = match term {
+                    0 => 0,
+                    1 => 1,
+                    u32::MAX => -1,
+                    _ => return None,
+                };
+            }
+            Some(Affine {
+                registers,
+                constant,
+            })
+        };
         let source_role = match self.candidate.contract.computation {
-            Computation::PngUp => Input::PreviousRow,
+            Computation::PngUp | Computation::PngAverage => Input::PreviousRow,
             Computation::PngSub => Input::ReconstructedPrefix,
             Computation::Lz77 => Input::History,
             _ => return None,
@@ -90,16 +106,7 @@ impl VerifiedBinding {
             &view.output.address,
             view.input(Input::Length)?,
         ]) {
-            let (terms, constant) = expression.affine()?;
-            for (target, term) in target.registers.iter_mut().zip(terms) {
-                *target = match term {
-                    0 => 0,
-                    1 => 1,
-                    u32::MAX => -1,
-                    _ => return None,
-                };
-            }
-            target.constant = constant;
+            *target = affine(expression)?;
         }
         let mut advances = [0; 8];
         for (r, value) in self.transition.exits[0].state.registers.iter().enumerate() {
@@ -120,10 +127,33 @@ impl VerifiedBinding {
         if advances[4] != 0 || advances[5] != 0 {
             return None;
         }
-        let aliasing = if self.candidate.contract.computation == Computation::PngUp {
+        let aliasing = if matches!(
+            self.candidate.contract.computation,
+            Computation::PngUp | Computation::PngAverage
+        ) {
             Aliasing::Disjoint
         } else {
             Aliasing::Backward
+        };
+        let mut reads = [
+            Some(ReadSpan {
+                address: inputs[0],
+                aliasing,
+            }),
+            None,
+            None,
+        ];
+        let scalar = if self.candidate.contract.computation == Computation::PngAverage {
+            reads[1] = Some(ReadSpan {
+                address: affine(view.input(Input::ReconstructedPrefix)?)?,
+                aliasing: Aliasing::Backward,
+            });
+            Some(Scalar {
+                value: affine(view.input(Input::BytesPerPixel)?)?,
+                upper_bounds: [None; 2],
+            })
+        } else {
+            None
         };
         // SAFETY: admission checked the recurrence, complete effects, additive
         // cursor updates and scalar-tail restoration; the caller owns kernel identity.
@@ -132,7 +162,8 @@ impl VerifiedBinding {
                 inputs,
                 advances,
                 self.transition.instructions,
-                aliasing,
+                reads,
+                scalar,
                 kernel,
             )
         })
@@ -329,6 +360,29 @@ impl Checker {
                     self.values[b.index as usize].clone(),
                 );
             }
+            Operation::Binary(Mnemonic::Add, Operand::Register(a), Operand::Register(b))
+                if a.width == 4 && b.width == 4 =>
+            {
+                self.read_register(a);
+                self.read_register(b);
+                self.write_register(a);
+                let left = self.values[a.index as usize].clone();
+                let right = self.values[b.index as usize].clone();
+                self.flags(Mnemonic::Add, left.clone(), right.clone());
+                self.values[a.index as usize] =
+                    Expression::binary(Binary::Add, left, right).unwrap();
+            }
+            Operation::Shift(Mnemonic::Shr, Operand::Register(r), Operand::Immediate(1))
+                if r.width == 4 =>
+            {
+                self.read_register(r);
+                self.write_register(r);
+                let value = self.values[r.index as usize].clone();
+                let one = Expression::constant(Width::Dword, 1);
+                self.flags(Mnemonic::Shr, value.clone(), one.clone());
+                self.values[r.index as usize] =
+                    Expression::binary(Binary::ShiftRight, value, one).unwrap();
+            }
             _ => return Err(bad()),
         }
         Ok(())
@@ -336,7 +390,7 @@ impl Checker {
 }
 
 /// Check actual code and establish the forward-loop induction rule.
-/// Average/Paeth require additional proof rules and return Unsupported.
+/// Paeth requires additional proof rules and returns Unsupported.
 pub fn verify(
     image: &ImageSnapshot,
     candidate: CandidateBinding,
@@ -352,7 +406,7 @@ pub fn verify(
     }
     if !matches!(
         computation,
-        Computation::Lz77 | Computation::PngSub | Computation::PngUp
+        Computation::Lz77 | Computation::PngSub | Computation::PngUp | Computation::PngAverage
     ) {
         return Err(unsupported(at, "reference recurrence"));
     }
@@ -374,21 +428,38 @@ pub fn verify(
         .input(Input::Length)
         .ok_or_else(|| counterexample(at, "count mapping"))?
         .clone();
+    let left = if computation == Computation::PngAverage {
+        Some(
+            view.input(Input::ReconstructedPrefix)
+                .ok_or_else(|| counterexample(at, "left mapping"))?
+                .clone(),
+        )
+    } else {
+        None
+    };
     if [source.clone(), destination.clone(), remaining.clone()]
         .iter()
         .any(|e| e.affine().is_none())
     {
         return Err(unsupported(at, "non-affine loop address or count"));
     }
-    if byte_view(
-        computation,
-        source.clone(),
-        destination.clone(),
-        remaining.clone(),
-    )
-    .as_ref()
-        != Some(view)
-    {
+    let expected_view = if let Some(left) = &left {
+        row_view(
+            computation,
+            source.clone(),
+            left.clone(),
+            destination.clone(),
+            remaining.clone(),
+        )
+    } else {
+        byte_view(
+            computation,
+            source.clone(),
+            destination.clone(),
+            remaining.clone(),
+        )
+    };
+    if expected_view.as_ref() != Some(view) {
         return Err(counterexample(at, "input mapping"));
     }
     if candidate.proof
@@ -472,8 +543,31 @@ pub fn verify(
             return Err(counterexample(at, "loop state recurrence"));
         }
     }
+    if let Some(left) = &left
+        && left.after(&checker.values) != Some(add(left.clone(), 1))
+    {
+        return Err(counterexample(at, "left state recurrence"));
+    }
     let copied =
         Expression::load(MemoryVersion(0), source.clone(), Width::Byte).expect("byte source");
+    let predictor = if let Some(left) = &left {
+        let left = Expression::extend(
+            Expression::load(MemoryVersion(0), left.clone(), Width::Byte).unwrap(),
+            Width::Dword,
+            false,
+        )
+        .unwrap();
+        let above = Expression::extend(copied.clone(), Width::Dword, false).unwrap();
+        let sum = Expression::binary(Binary::Add, left, above).unwrap();
+        low(Expression::binary(
+            Binary::ShiftRight,
+            sum,
+            Expression::constant(Width::Dword, 1),
+        )
+        .unwrap())
+    } else {
+        copied.clone()
+    };
     let expected = if computation == Computation::Lz77 {
         copied.clone()
     } else {
@@ -481,7 +575,7 @@ pub fn verify(
             Binary::Add,
             Expression::load(MemoryVersion(0), destination.clone(), Width::Byte)
                 .expect("byte destination"),
-            copied.clone(),
+            predictor,
         )
         .expect("byte sum")
     };
@@ -491,32 +585,28 @@ pub fn verify(
         address: destination.clone(),
         value: expected,
     };
-    if checker.store.as_ref() != Some(&expected_store) {
+    if !checker.store.as_ref().is_some_and(|s| {
+        s.address == expected_store.address && s.value.same_value(&expected_store.value)
+    }) {
         return Err(counterexample(at, "byte recurrence"));
     }
     if checker
         .reads
         .iter()
-        .any(|a| *a != source && *a != destination)
+        .any(|a| *a != source && *a != destination && left.as_ref() != Some(a))
     {
         return Err(counterexample(at, "undeclared memory input"));
     }
     for r in 0..8 {
         let r = Register(r);
         let initial = Expression::register(r);
-        let extended =
-            Expression::extend(copied.clone(), Width::Dword, false).expect("byte extension");
-        let partial = Expression::insert(initial.clone(), copied.clone(), 0).expect("low byte");
         let actual = &checker.values[r.index() as usize];
         if let Some((terms, _)) = actual.affine()
             && terms == initial.affine().unwrap().0
         {
             continue;
         }
-        if *actual != initial && *actual != extended && *actual != partial {
-            return Err(unsupported(at, "unproven loop-carried register"));
-        }
-        let changed = if *actual == extended { u32::MAX } else { 0xff };
+        let changed = checker.defined[r.index() as usize];
         if *actual != initial && checker.initial_reads[r.index() as usize] & changed != 0 {
             return Err(unsupported(
                 at,
@@ -563,15 +653,33 @@ pub fn verify(
             end: candidate.end,
         },
     ];
-    if computation == Computation::PngUp {
-        conditions.push(Predicate::Disjoint(input, output));
+    if matches!(computation, Computation::PngUp | Computation::PngAverage) {
+        conditions.push(Predicate::Disjoint(input, output.clone()));
     } else {
         conditions.push(Predicate::BackwardDistance {
             distance: Expression::binary(Binary::Subtract, destination.clone(), source.clone())
                 .expect("32-bit distance"),
             source,
-            destination,
+            destination: destination.clone(),
         });
+    }
+    if let Some(left) = left {
+        let span = MemorySpan {
+            address: left.clone(),
+            length: output.length.clone(),
+        };
+        conditions.extend([
+            Predicate::NoWrap(span.clone()),
+            Predicate::Ordinary {
+                span,
+                access: Access::Read,
+            },
+            Predicate::BackwardDistance {
+                source: left.clone(),
+                destination: destination.clone(),
+                distance: Expression::binary(Binary::Subtract, destination, left).unwrap(),
+            },
+        ]);
     }
     Ok(VerifiedBinding {
         candidate,

@@ -22,6 +22,7 @@ pub(super) fn admit(_pc: u32, code: &[u8]) -> Vec<NativeRegion> {
         let kernel = match candidate.contract.computation {
             Computation::PngUp => up,
             Computation::PngSub => sub,
+            Computation::PngAverage => average,
             _ => continue,
         };
         if let Ok(binding) = verify::verify(&image, candidate, &mut budget) {
@@ -33,7 +34,23 @@ pub(super) fn admit(_pc: u32, code: &[u8]) -> Vec<NativeRegion> {
     regions
 }
 
-unsafe extern "C" fn sub(source: *const u8, destination: *mut u8, length: u32) {
+unsafe extern "C" fn average(source: *const u8, destination: *mut u8, length: u32, bpp: u32) {
+    #[cfg(all(test, target_arch = "aarch64"))]
+    tests::BATCHES.with(|n| n.set(n.get() + 1));
+    // SAFETY: admitted mappings fix bpp=destination-left. The backward read
+    // span proves positive distance/no underflow; all spans include the tail.
+    // Prefix borrows stop at the output, and previous/output are disjoint.
+    let (row, previous, prefix) = unsafe {
+        (
+            std::slice::from_raw_parts_mut(destination, length as usize),
+            std::slice::from_raw_parts(source, length as usize),
+            std::slice::from_raw_parts(destination.sub(bpp as usize), bpp.min(length) as usize),
+        )
+    };
+    let _ = adv_device::codec_kernel::png_average_segment(row, previous, prefix);
+}
+
+unsafe extern "C" fn sub(source: *const u8, destination: *mut u8, length: u32, _scalar: u32) {
     #[cfg(all(test, target_arch = "aarch64"))]
     tests::BATCHES.with(|n| n.set(n.get() + 1));
     let prefix_len = (destination as usize - source as usize).min(length as usize);
@@ -49,7 +66,7 @@ unsafe extern "C" fn sub(source: *const u8, destination: *mut u8, length: u32) {
     let _ = adv_device::codec_kernel::png_sub_segment(row, prefix);
 }
 
-unsafe extern "C" fn up(source: *const u8, destination: *mut u8, length: u32) {
+unsafe extern "C" fn up(source: *const u8, destination: *mut u8, length: u32, _scalar: u32) {
     #[cfg(all(test, target_arch = "aarch64"))]
     tests::BATCHES.with(|n| n.set(n.get() + 1));
     // SAFETY: the specialized bridge proves disjoint readable/writable spans
@@ -77,6 +94,10 @@ mod tests {
     // Authored indexed byte sum, matching the libpng scalar recurrence.
     const BODY: &[u8] = &[
         0x0f, 0xb6, 0x1c, 0x31, 0x00, 0x1c, 0x32, 0x46, 0x39, 0xf0, 0x75, 0xf4,
+    ];
+    const AVERAGE: &[u8] = &[
+        0x0f, 0xb6, 0x1c, 0x30, 0x0f, 0xb6, 0x14, 0x37, 0x01, 0xda, 0xd1, 0xea, 0x00, 0x14, 0x31,
+        0x46, 0x39, 0xf5, 0x75, 0xec,
     ];
 
     struct Admission;
@@ -136,6 +157,63 @@ mod tests {
                         assert!(BATCHES.get() > 0);
                     }
                     if output == SOURCE + 1 && count >= 1024 {
+                        assert!(BATCHES.get() > 0);
+                    }
+                }
+            }
+        }
+    }
+
+    // spec: A64-TR-8, EXEC-NATIVE-3
+    #[test]
+    fn average_segments_preserve_prefix_history_and_decline_invalid_extra_reads() {
+        for bpp in [1, 3, 8, 1024] {
+            for case in 0..4 {
+                for budget in [8 * 129 - 1, 8 * 129, 4096, 100_000] {
+                    let (mut a, mut b) = (executor(2048, OUTPUT), executor(2048, OUTPUT));
+                    for e in [&mut a, &mut b] {
+                        e.write(CODE, AVERAGE).unwrap();
+                        e.state.regs = [
+                            0x28000,
+                            OUTPUT,
+                            0xdeadbeef,
+                            0xfedcba98,
+                            0x2fff0,
+                            2048,
+                            0,
+                            OUTPUT - bpp,
+                        ];
+                        match case {
+                            1 => e.protect(OUTPUT - 0x1000, 0x1000, 0).unwrap(),
+                            2 => e.state.regs[0] = OUTPUT + 1,
+                            3 => e.protect(OUTPUT, 0x1000, 1).unwrap(),
+                            _ => {}
+                        }
+                    }
+                    BATCHES.set(0);
+                    // Compare the readable pages individually in the prefix-fault case.
+                    let stop = CODE + AVERAGE.len() as u32;
+                    assert_eq!(
+                        a.run_with_traps(stop, budget, &mut Admission, false)
+                            .unwrap(),
+                        b.run_with_traps(stop, budget, &mut Admission, true)
+                            .unwrap()
+                    );
+                    assert_eq!(
+                        a.state.capture_architecture(),
+                        b.state.capture_architecture()
+                    );
+                    assert_eq!(a.state.fuel, b.state.fuel);
+                    for page in [SOURCE, OUTPUT, OUTPUT + 0x1000, 0x28000] {
+                        assert_eq!(
+                            a.memory().read(page, 4096).unwrap(),
+                            b.memory().read(page, 4096).unwrap()
+                        );
+                    }
+                    if case != 0 {
+                        assert_eq!(BATCHES.get(), 0);
+                    }
+                    if case == 0 && budget >= 100_000 {
                         assert!(BATCHES.get() > 0);
                     }
                 }
@@ -206,11 +284,14 @@ mod tests {
     fn upstream_png_rows_compiler_configurations_execute_through_the_same_rule() {
         let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../target/codec-reference/png");
-        for name in ["up", "sub"] {
+        for name in ["up", "sub", "avg"] {
             for optimization in ["O1", "O2", "Os"] {
                 let bytes =
                     std::fs::read(directory.join(format!("{name}-{optimization}.bin"))).unwrap();
                 for (count, bpp) in [(0, 1), (1, 1), (3, 3), (129, 4), (4096, 3), (8192, 8)] {
+                    if name == "avg" && count < bpp {
+                        continue;
+                    }
                     let (mut a, mut b) = (executor(count, OUTPUT), executor(count, OUTPUT));
                     let stop = CODE + 0x2000;
                     for e in [&mut a, &mut b] {

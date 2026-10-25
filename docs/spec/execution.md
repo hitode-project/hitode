@@ -81,6 +81,9 @@ are part of the checked address expressions, independent of register allocation.
 The count may be an explicit down-counter or a bound minus an advancing index.
 Affine address/count relations are checked modulo 2^32; entry conditions rule
 out wrapping buffer spans.
+Average admission checks a widened predictor sum before shifting and byte
+truncation. Its left prefix follows the same ordered recurrence as Sub; the
+previous-row input remains disjoint from all output writes.
 
 ### EXEC-NATIVE-3 Typed state and shared integer semantics
 

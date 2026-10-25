@@ -10,6 +10,7 @@ use super::*;
 const MINIMUM: u32 = 128;
 const MAXIMUM: u32 = 1024;
 const SP: Reg = Reg::new(31);
+const ADDRESS: Reg = Reg::new(7);
 
 impl Unit {
     pub(super) fn prepare_regions(
@@ -57,6 +58,16 @@ impl Unit {
 }
 
 impl Translator<'_> {
+    fn region_address(&mut self, address: Affine, region: NativeRegion) -> Reg {
+        if address == region.inputs()[0] {
+            return X0;
+        }
+        if address == region.inputs()[1] {
+            return X1;
+        }
+        self.affine(address, ADDRESS);
+        ADDRESS
+    }
     fn affine(&mut self, value: Affine, out: Reg) {
         self.mov_imm(out, value.constant);
         for (r, coefficient) in value.registers.into_iter().enumerate() {
@@ -99,25 +110,33 @@ impl Translator<'_> {
         self.emit(cmp_imm(W, X2, MINIMUM + 1, false));
         self.asm.b_cond(Cond::Lo, scalar);
         // Full input/output spans may not wrap. Conservative at 4 GiB itself.
-        self.emit_all(&[
-            add(X, X3, X0, X2, Lsl, 0),
-            add(X, X4, X1, X2, Lsl, 0),
-            orr(X, X5, X3, X4, Lsl, 0),
-            lsr_imm(X, X5, X5, 32),
-        ]);
+        self.emit_all(&[add(X, X4, X1, X2, Lsl, 0), lsr_imm(X, X5, X4, 32)]);
         self.asm.cbz(X, true, X5, scalar);
-        match region.aliasing() {
-            Aliasing::Backward => {
-                self.emit(cmp(W, X0, X1, Lsl, 0));
-                self.asm.b_cond(Cond::Hs, scalar);
+        for read in region.reads().iter().flatten() {
+            let address = self.region_address(read.address, region);
+            self.emit_all(&[add(X, X3, address, X2, Lsl, 0), lsr_imm(X, X5, X3, 32)]);
+            self.asm.cbz(X, true, X5, scalar);
+            match read.aliasing {
+                Aliasing::Backward => {
+                    self.emit(cmp(W, address, X1, Lsl, 0));
+                    self.asm.b_cond(Cond::Hs, scalar);
+                }
+                Aliasing::Disjoint => {
+                    let safe = self.asm.label();
+                    self.emit(cmp(X, X3, X1, Lsl, 0));
+                    self.asm.b_cond(Cond::Ls, safe);
+                    self.emit(cmp(X, X4, address, Lsl, 0));
+                    self.asm.b_cond(Cond::Hi, scalar);
+                    self.asm.bind(safe);
+                }
             }
-            Aliasing::Disjoint => {
-                let safe = self.asm.label();
-                self.emit(cmp(X, X3, X1, Lsl, 0));
-                self.asm.b_cond(Cond::Ls, safe);
-                self.emit(cmp(X, X4, X0, Lsl, 0));
+        }
+        if let Some(parameter) = region.scalar() {
+            self.affine(parameter.value, X6);
+            for bound in parameter.upper_bounds.into_iter().flatten() {
+                let bound = self.region_address(bound, region);
+                self.emit(cmp(W, X6, bound, Lsl, 0));
                 self.asm.b_cond(Cond::Hi, scalar);
-                self.asm.bind(safe);
             }
         }
         // Leave one non-faulting scalar iteration to reconstruct all temps
@@ -125,7 +144,14 @@ impl Translator<'_> {
         self.emit(sub_imm(W, X2, X2, 1, false));
         self.mov_imm(X3, MAXIMUM);
         self.emit_all(&[cmp(W, X2, X3, Lsl, 0), csel(W, X2, X2, X3, Cond::Lo)]);
-        for address in [X0, X1] {
+        for expression in region
+            .reads()
+            .iter()
+            .flatten()
+            .map(|r| r.address)
+            .chain(std::iter::once(region.inputs()[1]))
+        {
+            let address = self.region_address(expression, region);
             self.emit(and_imm(W, X3, address, 4095));
             self.mov_imm(X4, 4095);
             self.emit_all(&[
@@ -137,7 +163,14 @@ impl Translator<'_> {
         self.emit(cmp_imm(W, X2, MINIMUM, false));
         self.asm.b_cond(Cond::Lo, scalar);
         self.emit(ldr(X, X5, RUNTIME, crate::runtime::CLASSES));
-        for (address, write) in [(X0, false), (X1, true)] {
+        for (expression, write) in region
+            .reads()
+            .iter()
+            .flatten()
+            .map(|r| (r.address, false))
+            .chain(std::iter::once((region.inputs()[1], true)))
+        {
+            let address = self.region_address(expression, region);
             self.emit_all(&[
                 lsr_imm(W, X3, address, 12),
                 ldr_narrow(Narrow::Byte, X4, X5, X3),
@@ -163,6 +196,9 @@ impl Translator<'_> {
             add(X, X0, WINDOW, X0, Lsl, 0),
             add(X, X1, WINDOW, X1, Lsl, 0),
         ]);
+        if let Some(parameter) = region.scalar() {
+            self.affine(parameter.value, X3);
+        }
         let target = region.kernel() as usize as u64;
         self.emit(movz(X, X16, target as u16, 0));
         for shift in [16, 32, 48] {
