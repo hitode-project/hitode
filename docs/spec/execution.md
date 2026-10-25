@@ -52,6 +52,28 @@ Exact retirement is enabled by `--profile` or `--frame-budget`. The synthetic `t
 
 Cached successors MUST match entry EIP and block-cache generation. They MUST pass the same memory and native-publication revision checks as a lookup. Clearing either decode cache MUST advance the cache generation before any entry is reused. Successor hits MUST preserve entry stops, budgets and observation boundaries.
 
+## Native computation admission
+
+### EXEC-NATIVE-1 Verified bindings
+
+**Rule**: `VerifiedBinding` MUST be constructed only by `adv_abi::native::verify`. Admission MUST bind complete code dependencies, the reference contract version and the verification rule version. Recognition and sample comparisons MUST NOT issue verified bindings.
+**Verification**: Test
+
+### EXEC-NATIVE-2 Forward byte recurrence proofs
+
+**Rule**: Admission MUST check each decoded instruction, the byte recurrence, all register and flag effects, and the decreasing counter's complete control flow. Unsupported instructions or recurrences MUST return Unsupported, and exhausted proof budgets MUST return Timeout. Counterexamples MUST remain distinct from both results.
+**Verification**: Test
+
+The single-byte rule checks a positive-count loop body with one conditional
+backedge and one fall-through exit. Entry conditions exclude instruction
+observers, including single stepping, and require nonwrapping,
+ordinary readable source and writable destination ranges. Destination writes
+exclude all code and constant dependencies. PNG Up requires
+disjoint rows; PNG Sub and LZ77 require a positive backward distance and retain
+ordered reads of newly written history. A zero counter declines at this body;
+the enclosing guest function owns its zero-iteration path. State-view offsets
+are part of the checked address expressions, independent of register allocation.
+
 ## x64
 
 ### EXEC-X64-1 Frozen engine

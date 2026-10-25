@@ -32,7 +32,7 @@ The workspace is layered. Each layer may depend only on the layers below it, and
 | Assembly | `adv-runtime` | Loading and wiring the personality, machine and devices; scheduling a family of guest processes | API behavior |
 | Personality | `adv-win32`, `adv-dx` | Parameters, observable behavior and object state of Win32, the CRT and DirectX COM | Drawing, mixing, decoding |
 | System services | `adv-os` | Loader, synthetic PE images, PEB/TEB/LDR, virtual file system, registry, handles, COM activation and Windows allocators | |
-| ABI | `adv-abi`, `adv-abi-macros` | Signatures, calling conventions, argument decoding, registration, stubs, API diagnostics, COM identities and vtables | API behavior |
+| ABI | `adv-abi`, `adv-abi-macros` | Signatures, calling conventions, argument decoding, registration, stubs, API diagnostics, COM identities and vtables; native computation contracts, adaptation proposals and admission proofs | API behavior and native computation |
 | NT platform | `adv-nt` | The NT services under Wine's PE modules in the Wine userland port: image mapping, process startup, the system call and Unix call dispatchers, the server protocol client, boundary counters, and the code identity of distribution modules with the native bodies it admits | Windows behavior above the NT interface |
 | Wine server | `adv-wineserver` | Wine's server built in process for the Wine userland port ([#58](https://github.com/hitode-project/hitode/issues/58), [docs/spec/wine.md](docs/spec/wine.md)): handles, namespace, registry and timers, resumed by its caller with time from its caller | Waiting, time, host processes and signals |
 | Wine drivers | `adv-drv` | Wine's driver modules on the Wine userland: the user driver, which places windows and gives them surfaces in the process surface store | The graphics fronts; host windows and output |
@@ -113,6 +113,15 @@ NT path redirects, so the prefix's original Program Files directory remains inta
 API signatures and metadata come from `data/abi/`; `tools/abi/` regenerates them, and `adv-abi` registers each front end from them.
 
 ## Devices
+
+`adv-abi::native` separates `ReferenceContract`, `CandidateBinding` and
+`VerifiedBinding`. Preparation reads owned, immutable image snapshots with
+module-relative dependencies. The analyzer only proposes mappings; the
+independent verifier decodes their complete code and checks a supported
+recurrence before issuing a binding. Its forward-byte rule covers LZ77 and
+PNG Sub/Up bodies with explicit alias and entry conditions. Unsupported
+recurrences remain guest work. These admission data types do not install
+execution entries or call device kernels.
 
 - **Graphics:** GDI, DirectDraw and Direct3D 9 share neutral surfaces and drawing services. Direct3D 9 shaders are translated within the limits in [docs/spec/graphics.md](docs/spec/graphics.md). Device services follow [docs/spec/device.md](docs/spec/device.md).
 - **Audio:** one mixer resamples with rubato and decodes with Symphonia. Wine MIDI output synthesizes through OxiSynth with the bundled General MIDI bank. Shared PCM buffers are read through stable views, so a device never reads storage that the guest has freed.

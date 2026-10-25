@@ -29,6 +29,7 @@ pub mod com;
 pub mod constants;
 pub mod dll;
 pub mod guest;
+pub mod native;
 pub mod ordinals;
 pub mod personality;
 pub mod signature;
