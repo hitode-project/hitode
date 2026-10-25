@@ -2,13 +2,13 @@
 //! replacements, with real TrueType metadata and pixels from an authored font.
 #![cfg(any(target_vendor = "apple", target_os = "android"))]
 
-use adv_runtime::wine::session::{Config, Session, Stop};
+use adv_runtime::wine::session::{Config, FontOptions, Session, Stop};
 use std::{
     path::PathBuf,
     time::{Duration, Instant},
 };
 
-// spec: WINE-SES-5, DEV-FONT-1
+// spec: WINE-SES-5, WINE-SES-8, DEV-FONT-1
 #[test]
 fn discovered_fonts_and_aliases_survive_prefix_reuse() {
     let (Some(dist), Some(probes)) = (
@@ -39,7 +39,12 @@ fn discovered_fonts_and_aliases_survive_prefix_reuse() {
         root.join("fonts").to_string_lossy().replace('/', "\\")
     );
     if child.is_none() {
-        for _ in 0..2 {
+        for pass in 0..2 {
+            if pass == 0 {
+                std::fs::write(game.join("choices.txt"), "explicit").unwrap();
+            } else {
+                std::fs::remove_file(game.join("choices.txt")).unwrap();
+            }
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
@@ -74,15 +79,31 @@ fn discovered_fonts_and_aliases_survive_prefix_reuse() {
         debug: "",
         stdout: Some(std::os::fd::AsRawFd::as_raw_fd(&stdout)),
     };
+    let explicit = game.join("choices.txt").exists();
+    let mut fonts = FontOptions::default();
+    if explicit {
+        fonts.files.push(fixtures.join("font-resource.ttf"));
+        fonts
+            .overrides
+            .families
+            .insert("ADV Host Choice".into(), "ADV Resource Fixture".into());
+        fonts.overrides.antialiased = Some(false);
+    }
     let mut session =
-        Session::start(&config, adv_sync::WakeEvent::new().unwrap(), |_| Ok(())).unwrap();
+        Session::start_with_fonts(&config, adv_sync::WakeEvent::new().unwrap(), &fonts, |_| {
+            Ok(())
+        })
+        .unwrap();
+
     let stop = session.run(Instant::now() + Duration::from_secs(30));
     drop(session);
     drop(stdout);
     let text = std::fs::read_to_string(output).unwrap();
     assert!(matches!(stop, Stop::Exited(0)), "{stop:?}: {text}");
-    assert_eq!(
-        text.lines().collect::<Vec<_>>(),
-        ["aliases=1", "pixels=1", "private=1"]
-    );
+    let expected = if explicit {
+        vec!["choices=1", "aliases=1", "pixels=1", "private=1"]
+    } else {
+        vec!["defaults=1", "aliases=1", "pixels=1", "private=1"]
+    };
+    assert_eq!(text.lines().collect::<Vec<_>>(), expected);
 }

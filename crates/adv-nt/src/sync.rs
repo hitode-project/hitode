@@ -470,11 +470,18 @@ fn block(env: &mut Env<'_>, select: Select, then: Then) -> Outcome {
         },
         Err(error) => return status::finish(Err(error)),
     };
+    let timed = select.op.is_empty() && select.deadline == deadline;
     let wait = Wait::Object {
         handle: wake,
         deadline,
     };
-    Outcome::block(wait, move |env, _| wake_up(env, select, then))
+    // spec: PROC-CLOCK-1
+    // Only a delay is eligible. An object or I/O producer needs real time.
+    if timed {
+        Outcome::block_timed(wait, move |env, _| wake_up(env, select, then))
+    } else {
+        Outcome::block(wait, move |env, _| wake_up(env, select, then))
+    }
 }
 
 /// Ends a blocked wait with the server's wake-up, or blocks again.

@@ -169,7 +169,8 @@ pub fn set_volatile_multi_string(
     set_volatile_value(env, key, name, 7, &bytes(&value))
 }
 
-fn set_volatile_value(
+/// Sets typed bytes of a platform-owned volatile value.
+pub fn set_volatile_value(
     env: &mut Env<'_>,
     key: &str,
     name: &str,
@@ -226,6 +227,49 @@ fn set_volatile_value(
         .and_then(|(reply, _)| status::check(reply.header.error));
     server::close(env, hkey)?;
     set
+}
+
+/// Read a platform-owned setting before a temporary host override.
+pub fn platform_value(
+    env: &mut Env<'_>,
+    key: &str,
+    name: &str,
+) -> Result<Option<(u32, Vec<u8>)>, Error> {
+    let hkey = match open_for_reading(env, 0, key) {
+        Ok(key) => key,
+        Err(Error::Status(status::OBJECT_NAME_NOT_FOUND | status::OBJECT_PATH_NOT_FOUND)) => {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let name = bytes(&name.encode_utf16().collect::<Vec<_>>());
+    let result = read_value(env, hkey, &name, MAX_VALUE_LENGTH);
+    server::close(env, hkey)?;
+    match result {
+        Ok(value) => Ok(Some((value.kind, value.data))),
+        Err(Error::Status(status::OBJECT_NAME_NOT_FOUND)) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Remove a temporary platform setting that had no original value.
+pub fn delete_platform_value(env: &mut Env<'_>, key: &str, name: &str) -> Result<(), Error> {
+    let hkey = open_named(
+        env,
+        0,
+        KEY_SET_VALUE,
+        0,
+        &bytes(&key.encode_utf16().collect::<Vec<_>>()),
+    )?;
+    let mut request = DeleteKeyValueRequest {
+        hkey,
+        ..Default::default()
+    };
+    let name = bytes(&name.encode_utf16().collect::<Vec<_>>());
+    let result = server::request(env, &mut request, &[&name], &mut [])
+        .and_then(|(reply, _)| status::check(reply.header.error));
+    server::close(env, request.hkey)?;
+    result
 }
 
 /// NtOpenKey(*key, access, *attributes)

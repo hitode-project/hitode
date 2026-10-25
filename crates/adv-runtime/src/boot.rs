@@ -687,21 +687,7 @@ impl<B: Backend> Runtime<B> {
         overrides: adv_device::text::Overrides,
         paths: &[std::path::PathBuf],
     ) -> Result<(), String> {
-        use std::io::Read;
-        let mut remaining = adv_device::text::MAX_FONT_RESOURCE_BYTES;
-        let mut files = Vec::new();
-        for path in paths {
-            let mut bytes = Vec::new();
-            std::fs::File::open(path)
-                .map_err(|e| e.to_string())?
-                .take(remaining as u64 + 1)
-                .read_to_end(&mut bytes)
-                .map_err(|e| e.to_string())?;
-            remaining = remaining
-                .checked_sub(bytes.len())
-                .ok_or("font resources exceed the byte limit")?;
-            files.push(bytes);
-        }
+        let files = crate::font::read_resources(paths)?;
         adv_win32::gdi32::font::configure(&mut self.machine, overrides, &files)
     }
     /// Post text committed by a host input method to the keyboard focus (see

@@ -39,6 +39,31 @@ int main(void)
     static const WCHAR text[] = {0x3042, 0};
     BITMAPINFO info = {{sizeof(BITMAPINFOHEADER), 64, -48, 1, 32, BI_RGB}};
     HDC dc = CreateCompatibleDC(NULL);
+    FILE *choices = fopen("choices.txt", "r");
+    if (choices) {
+        BOOL smoothing = TRUE;
+        SIZE chosen = {0};
+        HFONT choice = CreateFontW(-40, 0, 0, 0, 400, 0, 0, 0, ANSI_CHARSET,
+                                   0, 0, DEFAULT_QUALITY, 0, L"ADV Host Choice");
+        HFONT previous = SelectObject(dc, choice);
+        int selected = GetTextExtentPoint32W(dc, L"B", 1, &chosen) && chosen.cx == 20;
+        selected &= SystemParametersInfoW(SPI_GETFONTSMOOTHING, 0, &smoothing, 0) && !smoothing;
+        SelectObject(dc, previous); DeleteObject(choice); fclose(choices);
+        printf("choices=%d\n", selected);
+        if (!selected) return 2;
+    } else {
+        HKEY key;
+        DWORD type, length = 0;
+        BOOL smoothing = FALSE;
+        int defaults = RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"Software\\Microsoft\\Windows NT\\CurrentVersion\\FontSubstitutes", 0, KEY_READ, &key) == ERROR_SUCCESS;
+        if (defaults) {
+            defaults &= RegQueryValueExW(key, L"ADV Host Choice", NULL, &type, NULL, &length) == ERROR_FILE_NOT_FOUND;
+            RegCloseKey(key);
+        }
+        defaults &= SystemParametersInfoW(SPI_GETFONTSMOOTHING, 0, &smoothing, 0) && smoothing;
+        printf("defaults=%d\n", defaults);
+        if (!defaults) return 3;
+    }
     DWORD *pixels;
     HBITMAP bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, (void **)&pixels, NULL, 0);
     HFONT font, old;

@@ -194,6 +194,13 @@ they exclude backend work and damage-history bookkeeping.
 
 The default-off features above conflict with the default-on rule; each must become default or be removed.
 
+Wine sessions apply the shared engine and diagnostic settings, shader capabilities and cache location,
+font files, family substitutions and smoothing, frame and time limits, and audio output selection.
+`--report` writes the final stop reason and full guest exit code even on a guest failure;
+control snapshots retain `running` until execution stops. CPU, host and scheduling profiles use
+the same writers as the built-in stack. Ctrl acceleration uses the shared live key policy for
+eligible delays and stays disabled once a child process has been created.
+
 ## Cargo features
 
 No feature selects execution behavior: the engine follows the target architecture. Platform and device build capabilities such as `gpu` and `media` are described in [building.md](building.md).

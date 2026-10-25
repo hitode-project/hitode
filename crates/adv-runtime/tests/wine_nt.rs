@@ -429,3 +429,29 @@ fn registry() {
         ],
     );
 }
+
+// spec: PROC-CLOCK-1, PROC-CLOCK-2
+#[test]
+fn time_skip_respects_external_waits_and_process_families() {
+    let start = std::rc::Rc::new(std::cell::Cell::new(Instant::now()));
+    let setup_start = start.clone();
+    if let Some((stop, text)) = probe_inspect(
+        "time_skip_respects_external_waits_and_process_families",
+        "time_skip.exe",
+        move |session, _| {
+            setup_start.set(Instant::now());
+            session
+                .machine
+                .set_time_skip_source(Some(std::sync::Arc::new(|_| true)));
+        },
+        |session| {
+            assert!(session.machine.sys.scheduling.active_time_skips >= 2);
+            assert!(session.machine.sys.scheduling.active_time_skip_us >= 3_500_000);
+            assert!(start.get().elapsed() >= Duration::from_millis(650));
+            assert!(start.get().elapsed() < Duration::from_secs(4));
+        },
+    ) {
+        assert!(matches!(stop, Stop::Exited(0)), "{stop:?}: {text}");
+        assert_checks(&text, "ok", &["waits="]);
+    }
+}

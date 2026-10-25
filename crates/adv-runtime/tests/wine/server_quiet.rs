@@ -45,6 +45,7 @@ fn unchanged_input_does_not_resume_server() {
             signals: vec![],
             generation: 0,
             deadline: Some(Instant::now() + Duration::from_secs(60)),
+            guest_deadline: None,
             resumes: 0,
         })),
         id: Rc::new(Cell::new(0)),
@@ -58,6 +59,17 @@ fn unchanged_input_does_not_resume_server() {
     assert_eq!(shared.driver.borrow().resumes, before);
     shared.driver.borrow_mut().deadline = Some(Instant::now());
     shared.step(time, None);
+    assert_eq!(shared.driver.borrow().resumes, before + 1);
+    let before = shared.driver.borrow().resumes;
+    shared.driver.borrow_mut().deadline = Some(Instant::now() + Duration::from_secs(60));
+    shared.driver.borrow_mut().guest_deadline = Some(time.monotonic + 10);
+    shared.step(
+        Time {
+            monotonic: time.monotonic + 10,
+            ..time
+        },
+        None,
+    );
     assert_eq!(shared.driver.borrow().resumes, before + 1);
     let directory = std::fs::File::open(&socket).unwrap();
     let socket = std::thread::spawn(move || {

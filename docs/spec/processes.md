@@ -66,7 +66,7 @@ This spec covers `adv-machine`, which schedules guest threads, owns time and dis
 ### PROC-CLOCK-2 No time skip in a family
 
 **Rule**: Once a child process exists, the family MUST disable Ctrl time skip. A waiting process MUST NOT skip the runnable time of another process.
-**Verification**: Review — no test holds Ctrl while a child process runs.
+**Verification**: Test
 
 ### PROC-CLOCK-3 Clock polling
 

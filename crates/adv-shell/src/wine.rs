@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use adv_runtime::wine::session::{Config, Session, Stop};
+use adv_runtime::wine::session::{Config, FontOptions, Session, Stop};
 use adv_runtime::{DebugTarget, DialogEvent, DialogSet, Engine};
 use adv_sync::WakeEvent;
 use adv_sync::background::LocalSender;
@@ -30,7 +30,13 @@ struct Host {
     frames: Option<(adv_runtime::FrameProducer, WakeEvent)>,
 }
 
-fn start(options: &Options, dist: &Path, wake: WakeEvent, host: Host) -> Result<Session, String> {
+fn start(
+    options: &Options,
+    dist: &Path,
+    wake: WakeEvent,
+    keys: &Arc<KeyState>,
+    host: Host,
+) -> Result<Session, String> {
     let prefix = match &options.wine_prefix {
         Some(prefix) => prefix.clone(),
         None => options
@@ -60,9 +66,27 @@ fn start(options: &Options, dist: &Path, wake: WakeEvent, host: Host) -> Result<
     };
     let gpu_wake = wake.clone();
     let codec_kernels = options.codec_kernels;
-    Session::start(&config, wake, move |machine| {
+    let fonts = FontOptions {
+        overrides: adv_runtime::FontOverrides {
+            families: options.font_families.clone(),
+            antialiased: options.font_smoothing,
+        },
+        files: options.font_files.clone(),
+    };
+    Session::start_with_fonts(&config, wake.clone(), &fonts, move |machine| {
         Session::install_codec_kernels(machine, codec_kernels);
         machine.cpu.set_background_sender(host.background)?;
+        options.configure_machine(machine, &wake, keys)?;
+        Session::configure_graphics(
+            machine,
+            options.d3d9_sm3,
+            Some(
+                options
+                    .d3d9_shader_cache
+                    .clone()
+                    .unwrap_or_else(|| options.data_dir.join("artifacts/gpu")),
+            ),
+        );
         if let Some(gpu) = host.gpu {
             Session::attach_gpu(machine, gpu, gpu_wake)?;
         }
@@ -102,20 +126,16 @@ pub(super) fn run(options: &Options, dist: &Path) -> Result<u8, String> {
             frames: None,
         };
         let debugger = super::debug::start(options, false, wake.clone());
-        let session = start(options, dist, wake.clone(), host)?;
         let keys = Arc::new(KeyState::default());
         let started = Instant::now();
-        let (code, mut session, _) = drive(options, session, None, &keys, &wake, debugger)?;
-        session.capture()?;
+        let session = start(options, dist, wake.clone(), &keys, host)?;
+        let (code, session, _) = drive(options, session, None, &keys, &wake, debugger, started)?;
         let frame = session.frame();
         eprintln!(
             "wine: exit {code} after {:.2}s, {} frames presented",
             started.elapsed().as_secs_f64(),
             frame.frames
         );
-        if let Some(path) = &options.screenshot {
-            save_frame(path, frame)?;
-        }
         Ok(code)
     })();
     service.shutdown();
@@ -137,9 +157,18 @@ pub(super) fn run_execution(
         gpu: worker.gpu.take(),
         frames: Some((worker.take_frames(), worker.ui_wake.clone())),
     };
+    let started = Instant::now();
     let debugger = super::debug::start(options, true, wake.clone());
-    let session = start(options, dist, wake.clone(), host)?;
-    let (exit_code, _, summary) = drive(options, session, Some(worker), &keys, &wake, debugger)?;
+    let session = start(options, dist, wake.clone(), &keys, host)?;
+    let (exit_code, _, summary) = drive(
+        options,
+        session,
+        Some(worker),
+        &keys,
+        &wake,
+        debugger,
+        started,
+    )?;
     Ok(Finished { exit_code, summary })
 }
 
@@ -259,7 +288,21 @@ fn observe_gate(
 }
 
 /// The shared diagnostic report fields that this stack can measure.
-fn report(options: &Options, session: &Session, metrics: &Metrics, started: Instant) -> String {
+#[derive(Default)]
+struct Outcome {
+    reason: &'static str,
+    exit_code: Option<u32>,
+    failure: Option<String>,
+    screenshot_error: Option<String>,
+}
+
+fn report(
+    options: &Options,
+    session: &Session,
+    metrics: &Metrics,
+    started: Instant,
+    outcome: Option<&Outcome>,
+) -> String {
     let frame = session.frame();
     let sys = &session.machine.sys;
     let mut fields = vec![
@@ -268,8 +311,28 @@ fn report(options: &Options, session: &Session, metrics: &Metrics, started: Inst
             "\"backend\": {}",
             json(if options.jit { "jit" } else { "interpreter" })
         ),
-        "\"stop_reason\": \"running\"".into(),
-        "\"guest_exit_code\": null".into(),
+        format!(
+            "\"stop_reason\": {}",
+            json(outcome.map_or("running", |outcome| outcome.reason))
+        ),
+        format!(
+            "\"guest_exit_code\": {}",
+            outcome
+                .and_then(|outcome| outcome.exit_code)
+                .map_or_else(|| "null".into(), |code| code.to_string())
+        ),
+        format!(
+            "\"failure\": {}",
+            outcome
+                .and_then(|outcome| outcome.failure.as_deref())
+                .map_or_else(|| "null".into(), json)
+        ),
+        format!(
+            "\"screenshot_error\": {}",
+            outcome
+                .and_then(|outcome| outcome.screenshot_error.as_deref())
+                .map_or_else(|| "null".into(), json)
+        ),
         format!(
             "\"elapsed_seconds\": {:.6}",
             started.elapsed().as_secs_f64()
@@ -299,6 +362,18 @@ fn report(options: &Options, session: &Session, metrics: &Metrics, started: Inst
         format!("\"leaf_host_calls\": {}", sys.stats.leaf_calls),
         format!("\"leaf_host_abandons\": {}", sys.stats.leaf_abandons),
         format!("\"tls_images\": {}", sys.tls_images.len()),
+        format!(
+            "\"time_skip\": {{\"enabled\": {}, \"jumps\": {}, \"skipped_guest_us\": {}}}",
+            options.time_skip, sys.scheduling.active_time_skips, sys.scheduling.active_time_skip_us
+        ),
+        format!(
+            "\"tier0_instructions\": {}",
+            session
+                .machine
+                .cpu
+                .tier0_instructions()
+                .map_or_else(|| "null".into(), |count| count.to_string())
+        ),
         session.machine.cpu.report_fields(),
         format!("\"performance\": {}", metrics.performance.json()),
         format!("\"scene_gate\": {}", metrics.gate.json()),
@@ -364,7 +439,7 @@ impl DebugTarget for DebugSession<'_> {
             .into()
     }
     fn report(&self) -> String {
-        report(self.options, self.session, self.metrics, self.started)
+        report(self.options, self.session, self.metrics, self.started, None)
     }
 }
 
@@ -377,12 +452,12 @@ fn drive(
     keys: &Arc<KeyState>,
     wake: &WakeEvent,
     mut debugger: Option<super::debug::Debugger>,
+    started: Instant,
 ) -> Result<(u8, Session, adv_report::RunSummary), String> {
-    let started = Instant::now();
-    let mut audio = worker
-        .is_some()
+    let mut audio = (worker.is_some() && options.audio)
         .then(|| adv_device::Output::new(session.audio_stream()));
     let mut metrics = Metrics::new();
+    metrics.since = started;
     let mut control = options
         .control_stdin
         .then(|| control::Control::start(wake.clone(), keys.clone()))
@@ -395,242 +470,262 @@ fn drive(
     let mut close_at: Option<Instant> = None;
     let mut minimized = false;
     let mut paused = false;
-    let code = 'run: loop {
-        if worker.as_ref().is_some_and(frontend::Worker::stopped) {
-            return Err("UI stopped while the guest was running".into());
-        }
-        let events = worker
-            .as_mut()
-            .map(|worker| worker.pump(&mut metrics.performance))
-            .unwrap_or_default();
-        for event in events {
-            match event {
-                window::Event::Input {
-                    message,
-                    wparam,
-                    lparam,
-                } => {
-                    if let Some(debugger) = debugger.as_mut()
-                        && super::debug_hotkey(keys, message, wparam)
-                    {
-                        debugger.hotkey(&DebugSession {
-                            session: &session,
-                            options,
-                            metrics: &metrics,
-                            started,
-                        });
-                        continue;
-                    }
-                    session.input(message, wparam, lparam)?;
-                }
-                #[cfg(host_view)]
-                window::Event::Text(text, reply) => {
-                    let _ = reply.send(session.text(&text));
-                }
-                window::Event::Close => {
-                    paused = false;
-                    session.close();
-                    close_at.get_or_insert_with(Instant::now);
-                }
-                #[cfg(host_view)]
-                window::Event::ForceClose => break 'run 0,
-                #[cfg(host_view)]
-                window::Event::AudioSuspended(sleeping) => {
-                    if let Some(audio) = audio.as_mut().filter(|_| sleeping) {
-                        audio.suspend();
-                    }
-                }
-                #[cfg(host_view)]
-                window::Event::Paused(value) => paused = value,
-                #[cfg(host_view)]
-                window::Event::Volume(percent) => {
-                    if let Some(audio) = &audio {
-                        audio.set_volume(percent);
-                    }
-                }
-                window::Event::Repaint => {}
-                window::Event::FocusLost => {
-                    session.release_input();
-                }
-                window::Event::Menu(event) => {
-                    session.menu_event(event);
-                }
-                window::Event::Dialog(event) => {
-                    session.dialog_event(event);
-                }
+    let mut outcome = Outcome {
+        reason: "host_window_closed",
+        ..Default::default()
+    };
+    let result = (|| -> Result<(), String> {
+        'run: loop {
+            if worker.as_ref().is_some_and(frontend::Worker::stopped) {
+                return Err("UI stopped while the guest was running".into());
             }
-        }
-        if native {
-            session.refresh_ui();
-        }
-        if let Some(controller) = control.as_mut() {
-            let commands = if metrics.gate.frozen() {
-                controller.drain_frozen(true)
-            } else {
-                controller.drain()
-            };
-            for command in commands {
-                if let control::Command::AwaitFrame(spec) = command {
-                    let hold = spec.hold;
-                    let result = if !options.headless {
-                        Err("await-frame requires headless execution".into())
-                    } else if hold.is_some() && session.input_view().top == 0 {
-                        Err("await-frame hold has no guest target window".into())
-                    } else {
-                        metrics
-                            .gate
-                            .arm(spec, session.presented_frames(), Instant::now())
-                    };
-                    match result {
-                        Err(error) => control::acknowledge(Err(error)),
-                        Ok(()) => {
-                            if let Some(key) = hold {
-                                keys.set(key, true);
-                                session.input(0x100, key, 1)?;
-                            }
+            let events = worker
+                .as_mut()
+                .map(|worker| worker.pump(&mut metrics.performance))
+                .unwrap_or_default();
+            for event in events {
+                match event {
+                    window::Event::Input {
+                        message,
+                        wparam,
+                        lparam,
+                    } => {
+                        if let Some(debugger) = debugger.as_mut()
+                            && super::debug_hotkey(keys, message, wparam)
+                        {
+                            debugger.hotkey(&DebugSession {
+                                session: &session,
+                                options,
+                                metrics: &metrics,
+                                started,
+                            });
+                            continue;
+                        }
+                        session.input(message, wparam, lparam)?;
+                    }
+                    #[cfg(host_view)]
+                    window::Event::Text(text, reply) => {
+                        let _ = reply.send(session.text(&text));
+                    }
+                    window::Event::Close => {
+                        paused = false;
+                        session.close();
+                        close_at.get_or_insert_with(Instant::now);
+                    }
+                    #[cfg(host_view)]
+                    window::Event::ForceClose => break 'run,
+                    #[cfg(host_view)]
+                    window::Event::AudioSuspended(sleeping) => {
+                        if let Some(audio) = audio.as_mut().filter(|_| sleeping) {
+                            audio.suspend();
                         }
                     }
-                    continue;
-                }
-                let close = matches!(command, control::Command::Close);
-                let result = match command {
-                    control::Command::Resume => {
-                        metrics.gate.resume(Instant::now()).map(|_| "resume".into())
+                    #[cfg(host_view)]
+                    window::Event::Paused(value) => paused = value,
+                    #[cfg(host_view)]
+                    window::Event::Volume(percent) => {
+                        if let Some(audio) = &audio {
+                            audio.set_volume(percent);
+                        }
                     }
-                    control::Command::Report(path) => {
-                        session.capture()?;
-                        let snapshot = report(options, &session, &metrics, started);
-                        super::write_report(&path, &snapshot, &session.machine.cpu)
-                            .map(|_| format!("report {}", path.display()))
+                    window::Event::Repaint => {}
+                    window::Event::FocusLost => {
+                        session.release_input();
                     }
-                    control::Command::ResetMetrics => {
-                        session.reset_metrics();
-                        let serial = session.presented_frames();
-                        metrics.performance.reset(serial);
-                        metrics.start_frame = serial;
-                        metrics.since = Instant::now();
-                        metrics.first_frame_seconds = None;
-                        Ok(format!("reset-metrics start_frame={serial}"))
+                    window::Event::Menu(event) => {
+                        session.menu_event(event);
                     }
-                    command => answer(&mut session, command),
-                };
-                control::acknowledge(result);
-                if close {
-                    metrics.gate.close(Instant::now());
-                    close_at.get_or_insert_with(Instant::now);
-                    if let Some(worker) = worker.as_mut() {
-                        worker.hide();
+                    window::Event::Dialog(event) => {
+                        session.dialog_event(event);
                     }
                 }
             }
-            controller.after_guest_step(!metrics.gate.frozen());
-        }
-        if let Some(delay) = auto_delay {
-            auto.answer(delay, &mut session, Instant::now());
-        }
-        if let Some(completion) = observe_gate(&mut session, &mut metrics)? {
-            complete_gate(completion, &mut session, keys);
-        }
-        if options
-            .seconds
-            .is_some_and(|seconds| started.elapsed().as_secs_f64() >= seconds)
-            || close_at.is_some_and(|at| at.elapsed() >= CLOSE_GRACE)
-        {
-            if let Some(completion) = metrics.gate.abort(
-                "session time limit",
-                session.presented_frames(),
-                Instant::now(),
-            ) {
+            if native {
+                session.refresh_ui();
+            }
+            if let Some(controller) = control.as_mut() {
+                let commands = if metrics.gate.frozen() {
+                    controller.drain_frozen(true)
+                } else {
+                    controller.drain()
+                };
+                for command in commands {
+                    if let control::Command::AwaitFrame(spec) = command {
+                        let hold = spec.hold;
+                        let result = if !options.headless {
+                            Err("await-frame requires headless execution".into())
+                        } else if hold.is_some() && session.input_view().top == 0 {
+                            Err("await-frame hold has no guest target window".into())
+                        } else {
+                            metrics
+                                .gate
+                                .arm(spec, session.presented_frames(), Instant::now())
+                        };
+                        match result {
+                            Err(error) => control::acknowledge(Err(error)),
+                            Ok(()) => {
+                                if let Some(key) = hold {
+                                    keys.set(key, true);
+                                    session.input(0x100, key, 1)?;
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    let close = matches!(command, control::Command::Close);
+                    let result = match command {
+                        control::Command::Resume => {
+                            metrics.gate.resume(Instant::now()).map(|_| "resume".into())
+                        }
+                        control::Command::Report(path) => {
+                            session.capture()?;
+                            let snapshot = report(options, &session, &metrics, started, None);
+                            super::write_report(&path, &snapshot, &session.machine.cpu)
+                                .map(|_| format!("report {}", path.display()))
+                        }
+                        control::Command::ResetMetrics => {
+                            session.reset_metrics();
+                            let serial = session.presented_frames();
+                            metrics.performance.reset(serial);
+                            metrics.start_frame = serial;
+                            metrics.since = Instant::now();
+                            metrics.first_frame_seconds = None;
+                            Ok(format!("reset-metrics start_frame={serial}"))
+                        }
+                        command => answer(&mut session, command),
+                    };
+                    control::acknowledge(result);
+                    if close {
+                        metrics.gate.close(Instant::now());
+                        close_at.get_or_insert_with(Instant::now);
+                        if let Some(worker) = worker.as_mut() {
+                            worker.hide();
+                        }
+                    }
+                }
+                controller.after_guest_step(!metrics.gate.frozen());
+            }
+            if let Some(delay) = auto_delay {
+                auto.answer(delay, &mut session, Instant::now());
+            }
+            if let Some(completion) = observe_gate(&mut session, &mut metrics)? {
                 complete_gate(completion, &mut session, keys);
             }
-            break 0;
-        }
-        if let Some(debugger) = debugger.as_mut() {
-            debugger.serve(&DebugSession {
-                session: &session,
-                options,
-                metrics: &metrics,
-                started,
-            });
-        }
-        if paused || metrics.gate.frozen() {
-            if let Some(audio) = audio.as_mut() {
-                audio.suspend();
+            let reason = if options
+                .frames
+                .is_some_and(|frames| session.presented_frames() >= frames)
+            {
+                Some("frame_limit")
+            } else if options
+                .seconds
+                .is_some_and(|seconds| started.elapsed().as_secs_f64() >= seconds)
+            {
+                Some("time_limit")
+            } else if close_at.is_some_and(|at| at.elapsed() >= CLOSE_GRACE) {
+                Some("host_window_closed")
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                outcome.reason = reason;
+                break;
             }
-            if !control.as_ref().is_some_and(control::Control::has_pending) {
-                let wait = if metrics.gate.frozen() {
-                    let limit = options.seconds.map(|seconds| {
-                        Duration::from_secs_f64(seconds).saturating_sub(started.elapsed())
-                    });
-                    let closing = close_at.map(|at| CLOSE_GRACE.saturating_sub(at.elapsed()));
-                    match (limit, closing) {
-                        (Some(a), Some(b)) => Some(a.min(b)),
-                        (a, b) => a.or(b),
-                    }
-                } else {
-                    Some(SLICE)
-                };
-                wake.wait(wait).map_err(|e| e.to_string())?;
-            }
-            continue;
-        }
-        if let Some(audio) = audio.as_mut() {
-            audio.update();
-        }
-        let run_before = session.control_metrics().run_time;
-        let deadline = Instant::now()
-            + metrics
-                .gate
-                .remaining(Instant::now())
-                .unwrap_or(SLICE)
-                .min(SLICE);
-        let stop = if metrics.gate.pending() {
-            session.run_ui(deadline)
-        } else {
-            session.run(deadline)
-        };
-        let serial = session.presented_frames();
-        if let Some(debugger) = debugger.as_mut() {
-            debugger.after_step(
-                session.control_metrics().run_time - run_before,
-                serial,
-                &DebugSession {
+            if let Some(debugger) = debugger.as_mut() {
+                debugger.serve(&DebugSession {
                     session: &session,
                     options,
                     metrics: &metrics,
                     started,
-                },
-            );
-        }
-        metrics
-            .performance
-            .step(session.control_metrics().run_time - run_before, serial);
-        if serial > metrics.start_frame && metrics.first_frame_seconds.is_none() {
-            metrics.first_frame_seconds = Some(metrics.since.elapsed().as_secs_f64());
-        }
-        if let Some(completion) = observe_gate(&mut session, &mut metrics)? {
-            complete_gate(completion, &mut session, keys);
-        }
-        match stop {
-            Stop::Paused => {}
-            Stop::Exited(code) => break code as u8,
-            Stop::Failed(error) => return Err(error),
-        }
-        if let Some(worker) = worker.as_mut() {
-            let bar = session.menu_bar();
-            if worker.needs_menu(bar.key) {
-                worker.publish_menu(bar);
+                });
             }
-            worker.publish_dialogs(session.dialogs());
-            // A guest minimizing itself (a boss key) minimizes the host
-            // window; restoring that window restores the guest.
-            let now_minimized = session.minimized();
-            if now_minimized && !minimized {
-                worker.minimize();
+            if paused || metrics.gate.frozen() {
+                if let Some(audio) = audio.as_mut() {
+                    audio.suspend();
+                }
+                if !control.as_ref().is_some_and(control::Control::has_pending) {
+                    let wait = if metrics.gate.frozen() {
+                        let limit = options.seconds.map(|seconds| {
+                            Duration::from_secs_f64(seconds).saturating_sub(started.elapsed())
+                        });
+                        let closing = close_at.map(|at| CLOSE_GRACE.saturating_sub(at.elapsed()));
+                        match (limit, closing) {
+                            (Some(a), Some(b)) => Some(a.min(b)),
+                            (a, b) => a.or(b),
+                        }
+                    } else {
+                        Some(SLICE)
+                    };
+                    wake.wait(wait).map_err(|e| e.to_string())?;
+                }
+                continue;
             }
-            minimized = now_minimized;
+            if let Some(audio) = audio.as_mut() {
+                audio.update();
+            }
+            let run_before = session.control_metrics().run_time;
+            let deadline = Instant::now()
+                + metrics
+                    .gate
+                    .remaining(Instant::now())
+                    .unwrap_or(SLICE)
+                    .min(SLICE);
+            let stop = if metrics.gate.pending() || options.frames.is_some() {
+                session.run_ui(deadline)
+            } else {
+                session.run(deadline)
+            };
+            let serial = session.presented_frames();
+            if let Some(debugger) = debugger.as_mut() {
+                debugger.after_step(
+                    session.control_metrics().run_time - run_before,
+                    serial,
+                    &DebugSession {
+                        session: &session,
+                        options,
+                        metrics: &metrics,
+                        started,
+                    },
+                );
+            }
+            metrics
+                .performance
+                .step(session.control_metrics().run_time - run_before, serial);
+            if serial > metrics.start_frame && metrics.first_frame_seconds.is_none() {
+                metrics.first_frame_seconds = Some(metrics.since.elapsed().as_secs_f64());
+            }
+            if let Some(completion) = observe_gate(&mut session, &mut metrics)? {
+                complete_gate(completion, &mut session, keys);
+            }
+            match stop {
+                Stop::Paused => {}
+                Stop::Exited(code) => {
+                    outcome.reason = "guest_exit";
+                    outcome.exit_code = Some(code);
+                    break;
+                }
+                Stop::Failed(error) => return Err(error),
+            }
+            if let Some(worker) = worker.as_mut() {
+                let bar = session.menu_bar();
+                if worker.needs_menu(bar.key) {
+                    worker.publish_menu(bar);
+                }
+                worker.publish_dialogs(session.dialogs());
+                // A guest minimizing itself (a boss key) minimizes the host
+                // window; restoring that window restores the guest.
+                let now_minimized = session.minimized();
+                if now_minimized && !minimized {
+                    worker.minimize();
+                }
+                minimized = now_minimized;
+            }
         }
-    };
+        Ok(())
+    })();
+    if let Err(error) = result {
+        outcome.reason = "guest_failure";
+        outcome.failure = Some(error);
+    }
     if let Some(completion) = metrics.gate.abort(
         "guest stopped before target",
         session.presented_frames(),
@@ -638,10 +733,56 @@ fn drive(
     ) {
         complete_gate(completion, &mut session, keys);
     }
+    session.machine.sys.trace.flush();
+    session
+        .machine
+        .sys
+        .schedule_trace
+        .flush()
+        .map_err(|e| e.to_string())?;
+    if let Err(error) = session.machine.cpu.persist() {
+        eprintln!("warning: {error}");
+    }
+    if session.presented_frames() > 0 {
+        outcome.screenshot_error = session.capture().err();
+    }
+    if outcome.screenshot_error.is_none() {
+        outcome.screenshot_error = options
+            .screenshot
+            .as_ref()
+            .and_then(|path| save_frame(path, session.frame()).err());
+    }
+    if let Some(path) = &options.report {
+        let snapshot = report(options, &session, &metrics, started, Some(&outcome));
+        super::write_report(path, &snapshot, &session.machine.cpu)?;
+    }
+    options.write_profiles(&session.machine)?;
+    if let Some(error) = &outcome.failure {
+        eprintln!("wine: {error}");
+    }
+    let code = if outcome.failure.is_some() {
+        1
+    } else {
+        outcome.exit_code.unwrap_or(0) as u8
+    };
     let summary = adv_report::RunSummary {
+        failure: super::report_failure(
+            outcome.failure.as_deref(),
+            outcome.exit_code,
+            session
+                .machine
+                .sys
+                .latest_cpu_fault
+                .as_ref()
+                .map(super::cpu_fault),
+            started.elapsed(),
+        ),
         perf: adv_report::Perf::from_samples(metrics.performance.frame_samples()),
         ..adv_report::RunSummary::default()
     };
+    if let Some(error) = outcome.screenshot_error {
+        return Err(error);
+    }
     Ok((code, session, summary))
 }
 
@@ -880,9 +1021,117 @@ fn usable(set: &DialogSet) -> impl Iterator<Item = &adv_runtime::DialogWindow> {
 mod tests {
     use super::*;
     use std::io::{BufRead, BufReader, Write};
+    use std::path::PathBuf;
     use std::process::{Command, Stdio};
 
-    // spec: WINE-UI-1, WINE-UI-2, WINE-UI-3, WINE-UI-4, WINE-UI-5, WINE-UI-6
+    // spec: WINE-UI-5, WINE-SES-7
+    #[test]
+    #[ignore = "subprocess entry for execution limit reports"]
+    fn limits_child() {
+        let root = std::env::current_dir().unwrap();
+        let dist = PathBuf::from(std::env::var_os("ADV_WINE_DIST").unwrap());
+        let frames = root.join("frames").exists();
+        let mut options = Options::new(
+            root.join(if frames { "d3d9.exe" } else { "popup_menu.exe" }),
+            root.join("data"),
+        );
+        options.headless = true;
+        options.codepage = Some(1252);
+        options.wine_prefix = Some(root.join("prefix"));
+        options.frames = frames.then_some(1);
+        options.headless_gpu = frames;
+        options.seconds = Some(if frames { 20. } else { 0.1 });
+        options.report = Some(root.join("final.json"));
+        options.screenshot = frames.then(|| root.join("final.png"));
+        if root.join("failure").exists() {
+            let wake = WakeEvent::new().unwrap();
+            let mut background = adv_sync::background::Builder::new(wake.clone()).unwrap();
+            let sender = background
+                .sender_with_capacity_wake(8, 8, wake.clone())
+                .unwrap();
+            let mut service = background.start().unwrap();
+            let keys = Arc::new(KeyState::default());
+            let host = Host {
+                background: sender.into_local(),
+                gpu: None,
+                frames: None,
+            };
+            let mut session = start(&options, &dist, wake.clone(), &keys, host).unwrap();
+            session.machine.set_execution_budget(Some(Duration::ZERO));
+            let (code, _, summary) =
+                drive(&options, session, None, &keys, &wake, None, Instant::now()).unwrap();
+            assert_eq!(code, 1);
+            assert!(summary.failure.is_some());
+            service.shutdown();
+        } else {
+            assert_eq!(run(&options, &dist).unwrap(), 0);
+        }
+    }
+
+    // spec: WINE-UI-5, WINE-SES-7
+    #[test]
+    fn final_reports_cover_limits_and_failure() {
+        let (Some(_), Some(probes)) = (
+            std::env::var_os("ADV_WINE_DIST"),
+            std::env::var_os("ADV_WINE_PROBES"),
+        ) else {
+            return;
+        };
+        let root = std::env::temp_dir().join(format!("adv-wine-limits-{}", std::process::id()));
+        for mode in ["time", "frames", "failure"] {
+            let frames = mode == "frames";
+            let directory = root.join(mode);
+            std::fs::create_dir_all(&directory).unwrap();
+            if frames {
+                std::fs::write(directory.join("frames"), "1").unwrap();
+            } else if mode == "failure" {
+                std::fs::write(directory.join("failure"), "1").unwrap();
+            }
+            let exe = if frames { "d3d9.exe" } else { "popup_menu.exe" };
+            std::fs::copy(Path::new(&probes).join(exe), directory.join(exe)).unwrap();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "wine::tests::limits_child",
+                    "--nocapture",
+                ])
+                .current_dir(&directory)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let report = std::fs::read_to_string(directory.join("final.json")).unwrap();
+            let reason = match mode {
+                "frames" => "frame_limit",
+                "failure" => "guest_failure",
+                _ => "time_limit",
+            };
+            assert!(
+                report.contains(&format!("\"stop_reason\": \"{reason}\"")),
+                "{report}"
+            );
+            assert!(report.contains("\"guest_exit_code\": null"), "{report}");
+            if frames {
+                assert!(report.contains("\"frames\": 1,"), "{report}");
+            }
+            if frames {
+                assert!(
+                    std::fs::metadata(directory.join("final.png"))
+                        .unwrap()
+                        .len()
+                        > 0
+                );
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // spec: WINE-UI-1, WINE-UI-2, WINE-UI-3, WINE-UI-4, WINE-UI-5, WINE-UI-6, WINE-SES-7
     #[test]
     #[ignore = "subprocess entry for the headless control test"]
     fn headless_control_child() {
@@ -896,10 +1145,14 @@ mod tests {
         options.control_stdin = true;
         options.codepage = Some(1252);
         options.seconds = Some(60.);
+        options.report = Some(root.join("final.json"));
+        options.host_profile = Some(root.join("host.csv"));
+        options.schedule_profile = Some(root.join("schedule.tsv"));
+        options.profile = true;
         assert_eq!(run(&options, Path::new(&dist)).unwrap(), 0);
     }
 
-    // spec: WINE-UI-1, WINE-UI-2, WINE-UI-3, WINE-UI-4, WINE-UI-5, WINE-UI-6
+    // spec: WINE-UI-1, WINE-UI-2, WINE-UI-3, WINE-UI-4, WINE-UI-5, WINE-UI-6, WINE-SES-7
     #[test]
     fn headless_wine_control() {
         let (Some(_dist), Some(probes)) = (
@@ -1063,13 +1316,7 @@ mod tests {
             );
             assert!(reset.contains("\"first_frame_seconds\": null,"), "{reset}");
             assert!(reset.contains("\"frame_observations\": 0"), "{reset}");
-            for unavailable in [
-                "api",
-                "codec",
-                "codec_kernels",
-                "time_skip",
-                "graphics_memory",
-            ] {
+            for unavailable in ["api", "codec", "codec_kernels", "graphics_memory"] {
                 assert!(
                     !reset.contains(&format!("\"{unavailable}\":")),
                     "{unavailable}"
@@ -1104,6 +1351,22 @@ mod tests {
             transcript.contains("cancelled=0 initialized=0 commands=0 syscommands=0"),
             "{transcript}"
         );
+        let final_report = std::fs::read_to_string(root.join("final.json")).unwrap();
+        assert!(
+            final_report.contains("\"stop_reason\": \"guest_exit\""),
+            "{final_report}"
+        );
+        assert!(
+            final_report.contains("\"guest_exit_code\": 0"),
+            "{final_report}"
+        );
+        assert!(final_report.contains("\"failure\": null"), "{final_report}");
+        for path in ["final.cpu.tsv", "host.csv", "schedule.tsv"] {
+            assert!(
+                std::fs::metadata(root.join(path)).unwrap().len() > 0,
+                "{path}"
+            );
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -54,6 +54,13 @@ pub struct Config<'a> {
     pub stdout: Option<RawFd>,
 }
 
+/// User font choices, independent of the shell and Wine installation paths.
+#[derive(Default)]
+pub struct FontOptions {
+    pub overrides: crate::FontOverrides,
+    pub files: Vec<PathBuf>,
+}
+
 /// Where a run of the session stopped.
 #[derive(Debug)]
 pub enum Stop {
@@ -78,12 +85,21 @@ pub struct Session {
     metrics: ControlMetrics,
     shared: Shared,
     settings: Settings,
+    fonts: fonts::Fonts,
     finished: Option<u32>,
     idle: BTreeMap<i32, Option<u64>>,
     foreground: i32,
     delivered: u64,
     retired_debug: [u64; 3],
     retired_boundaries: adv_nt::counters::Boundaries,
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        if let Err(error) = self.fonts.restore(&mut self.machine) {
+            eprintln!("{error}");
+        }
+    }
 }
 
 struct Settings {
@@ -133,6 +149,7 @@ struct Driver {
     signals: Vec<(i32, i32, i32)>,
     generation: u64,
     deadline: Option<Instant>,
+    guest_deadline: Option<u64>,
     input: u64,
     #[cfg(test)]
     resumes: usize,
@@ -209,6 +226,9 @@ impl Shared {
             && driver
                 .deadline
                 .is_none_or(|deadline| deadline > Instant::now())
+            && driver
+                .guest_deadline
+                .is_none_or(|deadline| time.monotonic < deadline)
             && !driver.server.kernel_ready()
         {
             return;
@@ -224,6 +244,7 @@ impl Shared {
             signals,
             generation,
             deadline,
+            guest_deadline,
             input,
             ..
         } = &mut *driver;
@@ -239,6 +260,12 @@ impl Shared {
         );
         *input = server.input_generation();
         *generation += 1;
+        *guest_deadline = match state {
+            State::Waiting(Some(delay)) => {
+                Some(time.monotonic.saturating_add(delay.as_nanos() as u64 / 100))
+            }
+            _ => None,
+        };
         *deadline = match state {
             State::Waiting(Some(delay)) => Some(Instant::now() + delay),
             _ => None,
@@ -548,11 +575,34 @@ impl Session {
         adv_drv::codec::install(&mut machine.ext, mode);
     }
 
+    /// Configure the native graphics front before guest code runs.
+    #[cfg(feature = "gpu")]
+    pub fn configure_graphics(machine: &mut Machine<Cpu>, sm3: bool, cache: Option<PathBuf>) {
+        adv_dx::d3d9::set_shader_caps(
+            &mut machine.ext,
+            adv_dx::d3d9::ShaderCaps {
+                sm3,
+                ..Default::default()
+            },
+        );
+        adv_dx::d3d9::set_shader_cache(&mut machine.ext, cache);
+    }
+
     /// Start `config.exe` on real time; `prepare` sets up the machine before
     /// the process starts, after the graphics fronts are installed.
     pub fn start(
         config: &Config<'_>,
         wake: WakeEvent,
+        prepare: impl FnOnce(&mut Machine<Cpu>) -> Result<(), String>,
+    ) -> Result<Session, String> {
+        Self::start_with_fonts(config, wake, &FontOptions::default(), prepare)
+    }
+
+    /// Apply explicit fonts before Wine initializes its font renderer.
+    pub fn start_with_fonts(
+        config: &Config<'_>,
+        wake: WakeEvent,
+        fonts: &FontOptions,
         prepare: impl FnOnce(&mut Machine<Cpu>) -> Result<(), String>,
     ) -> Result<Session, String> {
         let exe = std::path::absolute(config.exe).map_err(|e| e.to_string())?;
@@ -570,7 +620,7 @@ impl Session {
         };
         let (ntdll, apisets) = (module("ntdll.dll")?, module("apisetschema.dll")?);
         let (prefix, drive) = prefix(&config)?;
-        let fonts = fonts::Fonts::prepare(&config, &drive)?;
+        let mut fonts = fonts::Fonts::prepare(&config, &drive, fonts)?;
         let config = Config {
             fonts: "",
             ..config
@@ -595,6 +645,15 @@ impl Session {
             State::Waiting(Some(delay)) => Some(Instant::now() + delay),
             _ => None,
         };
+        let guest_deadline = match server.state() {
+            State::Waiting(Some(delay)) => Some(
+                time.0
+                    .get()
+                    .monotonic
+                    .saturating_add(delay.as_nanos() as u64 / 100),
+            ),
+            _ => None,
+        };
         let socket = server.socket_dir().ok_or("the server has no socket")?;
         let shared = Shared {
             driver: Rc::new(RefCell::new(Driver {
@@ -604,6 +663,7 @@ impl Session {
                 signals: vec![],
                 generation: 0,
                 deadline,
+                guest_deadline,
                 input,
                 #[cfg(test)]
                 resumes: 0,
@@ -680,6 +740,7 @@ impl Session {
             Box::new(shared.clone()),
         )
         .map_err(|e| e.to_string())?;
+        fonts.apply(&mut machine)?;
         super::xaudio2::activate(&mut machine, started.main)?;
         adv_nt::identity::note_ntdll(&mut machine, &config.dist.join(NTDLL), &ntdll);
         shared.id.set(started.thread.unix_pid);
@@ -690,6 +751,7 @@ impl Session {
             wake,
             audio,
             metrics: ControlMetrics::default(),
+            fonts,
             foreground: shared.id.get(),
             delivered: 0,
             retired_debug: [0; 3],
@@ -876,11 +938,25 @@ impl Session {
                 .clock
                 .begin_wait(Some(now + wait.as_micros() as u64));
             let started = Instant::now();
-            if let Err(error) = self.wake.wait(Some(wait)) {
-                return Stop::Failed(error.to_string());
-            }
+            let signaled = match self.wake.wait(Some(wait)) {
+                Ok(signaled) => signaled,
+                Err(error) => return Stop::Failed(error.to_string()),
+            };
+            let waited = started.elapsed();
             self.metrics.idle_waits += 1;
-            self.metrics.wait_time += started.elapsed();
+            self.metrics.wait_time += waited;
+            let sys = &mut self.machine.sys;
+            if let Some(diagnostics) = &mut sys.stats.wait_diagnostics {
+                diagnostics.host_wait(
+                    Some(wait),
+                    waited,
+                    !signaled,
+                    sys.contexts.iter().any(|context| context.is_ready()),
+                );
+            }
+            if let Some(budget) = &mut sys.stats.frame_budget {
+                budget.wait(Some(wait), waited, !signaled);
+            }
             let _ = self.machine.visit_context(None, adv_nt::server::run);
             if let Err(error) = self.deliver() {
                 return Stop::Failed(error);
@@ -968,6 +1044,12 @@ impl Session {
     fn spawn_children(&mut self) -> Result<(), String> {
         let pending = std::mem::take(&mut self.machine.ext.get_mut::<process::Children>().pending);
         for child in pending {
+            // spec: PROC-CLOCK-2
+            // This family stays in real time even after its children exit.
+            self.machine.set_time_skip_source(None);
+            for machine in self.shared.driver.borrow_mut().parked.values_mut() {
+                machine.set_time_skip_source(None);
+            }
             let shared = self.shared.process();
             let c = &self.settings;
             let config = Config {

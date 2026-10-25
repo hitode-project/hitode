@@ -449,7 +449,7 @@ FreeType is such a library: win32u opens it by name and draws TrueType text thro
 
 ### WINE-UI-5 Metrics and reports
 
-**Rule**: Wine control MUST support `reset-metrics` and `report`. Reset MUST restart frame observations, first-frame timing, and supported wait statistics. Reports MUST omit sections requiring unavailable stack data.
+**Rule**: Wine control MUST support `reset-metrics` and `report`. Reset MUST restart frame observations, first-frame timing, and supported wait statistics. Reports MUST include actual stop reasons, full guest exit codes, and failures, omitting sections requiring unavailable stack data.
 **Verification**: Test
 
 ### WINE-UI-6 Live debugger
@@ -589,6 +589,16 @@ Process startup MUST register the prefix's drive letters in the server namespace
 ### WINE-SES-6 Installed system subdirectories
 
 **Rule**: The prefix template MUST retain Wine-installed subdirectories of `system32`, including their data and module links.
+**Verification**: Test
+
+### WINE-SES-7 Execution settings
+
+**Rule**: Both shells MUST apply the same engine policy and diagnostic settings. Wine MUST honor frame limits, shader capabilities, shader cache location, and physical audio enablement.
+**Verification**: Test
+
+### WINE-SES-8 Host font choices
+
+**Rule**: Explicit host font choices MAY override installed families. Font files, substitutions, and smoothing MUST apply before rendering. Substitutions and smoothing MUST NOT persist after the session.
 **Verification**: Test
 
 ## Conformance

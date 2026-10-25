@@ -115,6 +115,146 @@ pub struct Options {
     time_skip: bool,
 }
 
+impl Options {
+    /// Host execution policy, shared by both personalities before guest execution.
+    fn configure_machine(
+        &self,
+        machine: &mut adv_machine::Machine<adv_runtime::Cpu>,
+        wake: &adv_sync::WakeEvent,
+        keys: &std::sync::Arc<adv_sync::input::KeyState>,
+    ) -> Result<(), String> {
+        if self.time_skip {
+            let skip_keys = keys.clone();
+            let pending_input = wake.interrupt_flag();
+            machine.set_time_skip_source(Some(std::sync::Arc::new(move |startup| {
+                // Pending input/audio notifications must be drained before jumping.
+                // Until the first frame nothing is on screen to pace, so timed waits
+                // only delay first entry; afterwards skipping follows the Ctrl keys.
+                !pending_input.load(std::sync::atomic::Ordering::Acquire)
+                    && (startup
+                        || [0x11, 0xa2, 0xa3]
+                            .iter()
+                            .any(|key| skip_keys.get(*key) & 0x80 != 0))
+            })));
+        }
+        machine.cpu.configure(&EngineOptions {
+            compile_strategy: self.compile_strategy,
+            tiered_compilation: self.tiered_compilation,
+            region_linking: self.region_linking,
+            async_compilation: self.async_compilation,
+            row_batching: self.row_batching,
+            row_workers: self.row_workers,
+            compile_threads: None,
+            artifacts: Some(self.data_dir.clone()),
+            code_cache: !self.no_code_cache,
+            precompile: !self.no_code_cache,
+            frame_timing: self.frame_budget,
+            profiling: self.profile,
+        })?;
+        if self.frame_budget {
+            machine.sys.stats.wait_diagnostics =
+                Some(adv_machine::wait_diagnostics::WaitDiagnostics::default());
+            machine.sys.stats.frame_budget = Some(adv_machine::frame_budget::FrameBudget::new(
+                machine.sys.stats.total,
+                machine.cpu.frame_counters(),
+            ));
+        }
+        machine.sys.stats.services_enabled =
+            self.host_profile.is_some() || self.schedule_profile.is_some();
+        if let Some(path) = &self.schedule_profile {
+            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            machine.sys.schedule_trace = adv_machine::schedule_trace::ScheduleTrace::to_writer(
+                Box::new(std::io::BufWriter::new(
+                    std::fs::File::create(path).map_err(|e| e.to_string())?,
+                )),
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        if let Some(path) = &self.trace {
+            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            machine.sys.trace = adv_machine::Trace::to_writer(Box::new(std::io::BufWriter::new(
+                std::fs::File::create(path).map_err(|e| e.to_string())?,
+            )));
+            machine.sys.trace.all = true;
+            // Every call must reach the host to be traced.
+            machine
+                .sys
+                .thunks
+                .set_guest_code(&mut machine.cpu, false)
+                .map_err(|e| format!("{e:?}"))?;
+        }
+        Ok(())
+    }
+    fn write_profiles(
+        &self,
+        machine: &adv_machine::Machine<adv_runtime::Cpu>,
+    ) -> Result<(), String> {
+        if self.profile {
+            let mut entries: Vec<_> = machine.cpu.profile().into_iter().collect();
+            entries.sort_unstable_by_key(|(_, sample)| {
+                std::cmp::Reverse(sample.native_ns.saturating_add(sample.interpreter_ns))
+            });
+            if let Some(report) = &self.report {
+                use std::io::Write;
+                let path = report.with_extension("cpu.tsv");
+                if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                }
+                let mut output = std::io::BufWriter::new(
+                    std::fs::File::create(&path).map_err(|e| e.to_string())?,
+                );
+                writeln!(output, "pc\tnative_entries\tnative_ns\tinterpreter_entries\tinterpreter_instructions\tinterpreter_ns")
+                .map_err(|e| e.to_string())?;
+                for (pc, sample) in &entries {
+                    writeln!(
+                        output,
+                        "{pc:#010x}\t{}\t{}\t{}\t{}\t{}",
+                        sample.native_entries,
+                        sample.native_ns,
+                        sample.interpreter_entries,
+                        sample.interpreter_instructions,
+                        sample.interpreter_ns,
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+                output.flush().map_err(|e| e.to_string())?;
+                eprintln!(
+                    "CPU execution profile: {} (region linking is disabled while profiling)",
+                    path.display()
+                );
+            } else {
+                for (pc, sample) in entries.iter().take(20) {
+                    eprintln!(
+                        "CPU {pc:#010x}: native {} ns / {} entries; interpreter {} ns / {} instructions",
+                        sample.native_ns,
+                        sample.native_entries,
+                        sample.interpreter_ns,
+                        sample.interpreter_instructions
+                    );
+                }
+            }
+        }
+        if let Some(path) = &self.host_profile {
+            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            let mut file =
+                std::io::BufWriter::new(std::fs::File::create(path).map_err(|e| e.to_string())?);
+            machine
+                .sys
+                .stats
+                .write_host_csv(&machine.cpu, &machine.sys.thunks, &mut file)
+                .map_err(|e| e.to_string())?;
+            std::io::Write::flush(&mut file).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+}
+
 const HELP: &str = "adv-run <EXE> [options]\n\
   --exe PATH              guest executable (also accepted positionally)\n\
   --backend jit|interpreter   shared guest backend (default: jit)\n\
@@ -1443,8 +1583,10 @@ fn run_execution(
     background: adv_sync::background::Sender,
 ) -> Result<Finished, String> {
     #[cfg(target_os = "macos")]
-    if let (Some(dist), Some(worker)) = (options.wine.clone(), window.take()) {
-        return wine::run_execution(&options, &dist, worker, wake, keys, background);
+    if let Some(dist) = options.wine.as_deref()
+        && let Some(worker) = window.take()
+    {
+        return wine::run_execution(&options, dist, worker, wake, keys, background);
     }
     window::initialize_dpi()?;
     let started = Instant::now();
@@ -1514,48 +1656,11 @@ fn run_execution(
         .machine
         .cpu
         .set_background_sender(background.into_local())?;
-    if options.time_skip {
-        let skip_keys = keys.clone();
-        let pending_input = wake.interrupt_flag();
-        runtime
-            .machine
-            .set_time_skip_source(Some(std::sync::Arc::new(move |startup| {
-                // Pending input/audio notifications must be drained before jumping.
-                // Until the first frame nothing is on screen to pace, so timed waits
-                // only delay first entry; afterwards skipping follows the Ctrl keys.
-                !pending_input.load(std::sync::atomic::Ordering::Acquire)
-                    && (startup
-                        || [0x11, 0xa2, 0xa3]
-                            .iter()
-                            .any(|key| skip_keys.get(*key) & 0x80 != 0))
-            })));
-    }
     runtime
         .audio_stream()
         .set_waker(wake.clone())
         .map_err(|_| "audio wake event was already registered".to_owned())?;
-    runtime.machine.cpu.configure(&EngineOptions {
-        compile_strategy: options.compile_strategy,
-        tiered_compilation: options.tiered_compilation,
-        region_linking: options.region_linking,
-        async_compilation: options.async_compilation,
-        row_batching: options.row_batching,
-        row_workers: options.row_workers,
-        compile_threads: None,
-        artifacts: Some(options.data_dir.clone()),
-        code_cache: !options.no_code_cache,
-        precompile: !options.no_code_cache,
-        frame_timing: options.frame_budget,
-        profiling: options.profile,
-    })?;
-    if options.frame_budget {
-        runtime.machine.sys.stats.wait_diagnostics =
-            Some(adv_machine::wait_diagnostics::WaitDiagnostics::default());
-        runtime.machine.sys.stats.frame_budget = Some(adv_machine::frame_budget::FrameBudget::new(
-            runtime.machine.sys.stats.total,
-            runtime.machine.cpu.frame_counters(),
-        ));
-    }
+    options.configure_machine(&mut runtime.machine, &wake, &keys)?;
     runtime.set_frame_limit(options.frames);
     runtime.set_audio_enabled(options.audio);
     #[cfg(any(host_view, feature = "gpu"))]
@@ -1567,36 +1672,8 @@ fn run_execution(
             .clone()
             .unwrap_or_else(|| options.data_dir.join("artifacts/gpu")),
     ));
-    runtime.machine.sys.stats.services_enabled =
-        options.host_profile.is_some() || options.schedule_profile.is_some();
-    if let Some(path) = &options.schedule_profile {
-        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        }
-        runtime.machine.sys.schedule_trace =
-            adv_machine::schedule_trace::ScheduleTrace::to_writer(Box::new(
-                std::io::BufWriter::new(std::fs::File::create(path).map_err(|e| e.to_string())?),
-            ))
-            .map_err(|e| e.to_string())?;
-    }
     if let Some(delay) = options.auto_dialog_ms {
         runtime.set_auto_dialog_ms(Some(delay));
-    }
-    if let Some(path) = &options.trace {
-        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        }
-        runtime.machine.sys.trace = adv_machine::Trace::to_writer(Box::new(
-            std::io::BufWriter::new(std::fs::File::create(path).map_err(|e| e.to_string())?),
-        ));
-        runtime.machine.sys.trace.all = true;
-        // Every call must reach the host to be traced.
-        let machine = &mut runtime.machine;
-        machine
-            .sys
-            .thunks
-            .set_guest_code(&mut machine.cpu, false)
-            .map_err(|e| format!("{e:?}"))?;
     }
     runtime.set_host_keys(keys.clone());
     if let Some(worker) = window.as_mut() {
@@ -2336,50 +2413,6 @@ fn run_execution(
     #[cfg(any(host_view, feature = "gpu"))]
     runtime.cancel_pending_graphics();
     runtime.machine.sys.trace.flush();
-    if options.profile {
-        let mut entries: Vec<_> = runtime.machine.cpu.profile().into_iter().collect();
-        entries.sort_unstable_by_key(|(_, sample)| {
-            std::cmp::Reverse(sample.native_ns.saturating_add(sample.interpreter_ns))
-        });
-        if let Some(report) = &options.report {
-            use std::io::Write;
-            let path = report.with_extension("cpu.tsv");
-            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-            }
-            let mut output =
-                std::io::BufWriter::new(std::fs::File::create(&path).map_err(|e| e.to_string())?);
-            writeln!(output, "pc\tnative_entries\tnative_ns\tinterpreter_entries\tinterpreter_instructions\tinterpreter_ns")
-                .map_err(|e| e.to_string())?;
-            for (pc, sample) in &entries {
-                writeln!(
-                    output,
-                    "{pc:#010x}\t{}\t{}\t{}\t{}\t{}",
-                    sample.native_entries,
-                    sample.native_ns,
-                    sample.interpreter_entries,
-                    sample.interpreter_instructions,
-                    sample.interpreter_ns,
-                )
-                .map_err(|e| e.to_string())?;
-            }
-            output.flush().map_err(|e| e.to_string())?;
-            eprintln!(
-                "CPU execution profile: {} (region linking is disabled while profiling)",
-                path.display()
-            );
-        } else {
-            for (pc, sample) in entries.iter().take(20) {
-                eprintln!(
-                    "CPU {pc:#010x}: native {} ns / {} entries; interpreter {} ns / {} instructions",
-                    sample.native_ns,
-                    sample.native_entries,
-                    sample.interpreter_ns,
-                    sample.interpreter_instructions
-                );
-            }
-        }
-    }
     #[cfg(any(host_view, feature = "gpu"))]
     let native_frame = runtime.has_native_frame();
     #[cfg(not(any(host_view, feature = "gpu")))]
@@ -2425,20 +2458,7 @@ fn run_execution(
     if let Some(path) = &options.report {
         write_report(path, &report, &runtime.machine.cpu)?;
     }
-    if let Some(path) = &options.host_profile {
-        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        }
-        let mut file =
-            std::io::BufWriter::new(std::fs::File::create(path).map_err(|e| e.to_string())?);
-        runtime
-            .machine
-            .sys
-            .stats
-            .write_host_csv(&runtime.machine.cpu, &runtime.machine.sys.thunks, &mut file)
-            .map_err(|e| e.to_string())?;
-        std::io::Write::flush(&mut file).map_err(|e| e.to_string())?;
-    }
+    options.write_profiles(&runtime.machine)?;
     let summary = adv_report::RunSummary {
         failure: report_failure(
             guest_error.as_ref().map(|error| error.message.as_str()),
