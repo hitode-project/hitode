@@ -60,6 +60,8 @@ void init_process_tracing( struct process *process )
 
 void finish_process_tracing( struct process *process )
 {
+    /* The last guest thread is gone; there is no host process to reap. */
+    process->unix_pid = -1;
 }
 
 void init_thread_context( struct thread *thread )

@@ -1,6 +1,6 @@
 //! Wine file and section semantics over the shared ISO reader and install root.
 #![cfg(any(target_vendor = "apple", target_os = "android"))]
-use adv_runtime::wine::session::{Config, Session, SessionOptions, Stop};
+use adv_runtime::wine::session::{Config, Host, SessionOptions, Stop};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
@@ -43,7 +43,7 @@ fn with_modules(files: &[(&str, Vec<u8>)]) -> Vec<u8> {
     image
 }
 
-// spec: DEV-DISC-1, DEV-DISC-3, DEV-DISC-4, DEV-DISC-6, DEV-DISC-7, WINE-SES-1, WINE-SES-4, WINE-SES-9
+// spec: DEV-DISC-1, DEV-DISC-3, DEV-DISC-4, DEV-DISC-6, DEV-DISC-7, WINE-SES-1, WINE-SES-4, WINE-SES-9, WINE-SES-10
 #[test]
 fn mounted_volumes_and_install_paths_survive_processes_and_prefix_reuse() {
     let (Some(dist), Some(probes)) = (
@@ -147,13 +147,15 @@ fn mounted_volumes_and_install_paths_survive_processes_and_prefix_reuse() {
         ];
         options.install_dir = Some(root.join("install"));
     }
-    let mut session = Session::start_with_options(
-        &config,
-        adv_sync::WakeEvent::new().unwrap(),
-        &options,
-        |_| Ok(()),
-    )
-    .unwrap();
+    let mut host = Host::default();
+    let mut session = host
+        .start(
+            &config,
+            adv_sync::WakeEvent::new().unwrap(),
+            &options,
+            |_| Ok(()),
+        )
+        .unwrap();
     let stop = session.run(Instant::now() + Duration::from_secs(30));
     let text = std::fs::read_to_string(root.join("stdout")).unwrap();
     assert!(matches!(stop, Stop::Exited(0)), "{stop:?}: {text}");
@@ -198,5 +200,25 @@ fn mounted_volumes_and_install_paths_survive_processes_and_prefix_reuse() {
             )),
             "{text}"
         );
+        std::fs::write(root.join("game/reset.signal"), []).unwrap();
+        let output = std::fs::File::create(root.join("stdout-reset")).unwrap();
+        let config = Config {
+            stdout: Some(output.as_raw_fd()),
+            ..config
+        };
+        let mut session = host
+            .start(
+                &config,
+                adv_sync::WakeEvent::new().unwrap(),
+                &SessionOptions::default(),
+                |_| Ok(()),
+            )
+            .unwrap();
+        let stop = session.run(Instant::now() + Duration::from_secs(30));
+        drop(session);
+        drop(output);
+        let text = std::fs::read_to_string(root.join("stdout-reset")).unwrap();
+        assert!(matches!(stop, Stop::Exited(0)), "{stop:?}: {text}");
+        assert!(text.contains("reset_namespace=ok"), "{text}");
     }
 }

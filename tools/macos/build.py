@@ -124,8 +124,12 @@ def build(jobs: int, ffmpeg_only: bool, mobile: str | None = None) -> dict:
             # bindgen parses FFmpeg's headers against the NDK's libc headers.
             sysroot = (f"export BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android='--sysroot={ndk_toolchain()}/sysroot"
                        f" --target=aarch64-linux-android{profile['minimum_android']}'\n") if mobile == 'android' else ''
+            wine_dist = os.environ.get('ADV_WINE_DIST')
+            wine = (f"export ADV_WINE_DIST={shlex.quote(str(Path(wine_dist).resolve()))}\n"
+                    if wine_dist else '')
             wrapper.write_text('#!/bin/sh\n'
                                f"export FFMPEG_DIR='{prefix}'\n"
+                               f"{wine}"
                                "export LIBCLANG_PATH='/Library/Developer/CommandLineTools/usr/lib'\n"
                                "export CARGO_PROFILE_RELEASE_STRIP=debuginfo\n"
                                "case \" $* \" in *' --release '*)\n"

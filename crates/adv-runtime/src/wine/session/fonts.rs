@@ -24,6 +24,18 @@ impl Fonts {
         drive: &Path,
         options: &SessionOptions,
     ) -> Result<Self, String> {
+        let directory = drive.join("windows/fonts");
+        std::fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
+        for entry in std::fs::read_dir(&directory).map_err(|e| e.to_string())? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("hitode-host-")
+            {
+                std::fs::remove_file(entry.path()).map_err(|e| e.to_string())?;
+            }
+        }
         if config.fonts.is_empty()
             && options.font_files.is_empty()
             && options.fonts.families.is_empty()
@@ -55,18 +67,6 @@ impl Fonts {
         }
         let FontReplacements { files, families } =
             text.replacement_fonts().map_err(|e| e.to_string())?;
-        let directory = drive.join("windows/fonts");
-        std::fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
-        for entry in std::fs::read_dir(&directory).map_err(|e| e.to_string())? {
-            let entry = entry.map_err(|e| e.to_string())?;
-            if entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with("hitode-host-")
-            {
-                std::fs::remove_file(entry.path()).map_err(|e| e.to_string())?;
-            }
-        }
         let files: Vec<_> = files.iter().chain(&options.font_files).collect();
         for (index, file) in files.iter().enumerate() {
             let extension = file.extension().unwrap_or_default().to_string_lossy();
@@ -85,22 +85,28 @@ impl Fonts {
 
     /// Install before wineboot first enters user32 or win32u. Children see the
     /// same registry and installed files, including on a reused prefix.
-    pub fn install(&self, machine: &mut Machine<Cpu>) -> Result<(), String> {
+    pub fn install(&mut self, machine: &mut Machine<Cpu>) -> Result<(), String> {
         if !self.enabled {
             return Ok(());
         }
         machine
             .visit_context(None, |env| {
                 let user = adv_nt::environment::user_key(env)?;
-                adv_nt::registry::set_volatile_string(
-                    env,
-                    &format!(r"{user}\Software\Wine\Fonts"),
-                    "Path",
-                    "",
-                )?;
+                let key = format!(r"{user}\Software\Wine\Fonts");
+                self.saved.push(SavedSetting {
+                    value: adv_nt::registry::platform_value(env, &key, "Path")?,
+                    key: key.clone(),
+                    name: "Path".into(),
+                });
+                adv_nt::registry::set_volatile_string(env, &key, "Path", "")?;
                 let key = format!(r"{user}\Software\Wine\Fonts\Replacements");
                 for (aliases, targets) in &self.replacements {
                     for alias in aliases {
+                        self.saved.push(SavedSetting {
+                            value: adv_nt::registry::platform_value(env, &key, alias)?,
+                            key: key.clone(),
+                            name: alias.clone(),
+                        });
                         adv_nt::registry::set_volatile_multi_string(env, &key, alias, targets)?;
                     }
                 }

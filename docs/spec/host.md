@@ -140,9 +140,14 @@ Every layer is a 3×3 convolution, so a change reaches at most one input pixel p
 Direct presentation requires Core Animation's `contentsOpaque` capability. Other presentations use the drawable compositor. Display callbacks reclaim retired surfaces; a temporary timer also drains pending retirements when the frame clock is idle or occluded.
 ### HOST-SES-1 Embedding
 
-**Rule**: `Session::new(view, options, on_finished)` MUST use the same execution thread and background service startup as the CLI. A session MUST NOT take over the host `NSApplication` delegate or the host window.
+**Rule**: Embedded sessions MUST use the shared shell execution and background services. A session MUST NOT take over the host `NSApplication` delegate or the host window.
 **Applies to**: macOS
 **Verification**: Review — no test can start AppKit on the main thread.
+
+### HOST-SES-12 Player execution lifetime
+
+**Rule**: The player MUST run at most one Wine session on its persistent execution owner. Idle execution MUST block without polling. Bundled Wine files MUST be prepared off the UI thread before game startup, without selecting the built-in stack when unavailable.
+**Verification**: Test
 
 ### HOST-SES-2 Wakeups
 
@@ -161,7 +166,7 @@ Direct presentation requires Core Animation's `contentsOpaque` capability. Other
 
 ### HOST-SES-5 Finish callback
 
-**Rule**: The finish callback MUST run once, on the main thread, with `Finished { exit_code, summary }`. It MUST run only after the execution thread and background services join and guest files and the registry are finalized.
+**Rule**: The finish callback MUST run once, on the main thread, with `Finished { exit_code, summary }`. It MUST wait for session execution, background services, guest files, and registry finalization.
 **Applies to**: macOS
 **Verification**: Review — no test can run the AppKit main loop.
 
@@ -175,7 +180,7 @@ Direct presentation requires Core Animation's `contentsOpaque` capability. Other
 
 **Rule**: A paused session MUST NOT run guest code, MUST freeze guest time and MUST suspend audio output until it resumes. A close request MUST resume the session first so the guest can answer. System sleep MUST still suspend only audio output.
 **Applies to**: Launcher, macOS
-**Verification**: Review — the pause path runs only inside the embedded session loop, which no test drives.
+**Verification**: Test
 
 ## Desktop game library
 

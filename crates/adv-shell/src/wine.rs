@@ -1,5 +1,6 @@
-//! A program on the Wine userland (issue #58), selected per run with
-//! `--wine DIST`. Headless, it runs on this thread; with a window, it is the
+//! A program on the Wine userland (issue #58). The player keeps its execution
+//! owner between games; the CLI selects it with `--wine DIST`.
+//! Headless, it runs on this thread; with a window, it is the
 //! execution worker behind the same UI as the built-in stack. Either way the
 //! guest's windows reach the host natively: dialogs, the menu bar, IME text,
 //! focus, activation, minimizing and closing, and the control channel.
@@ -8,7 +9,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use adv_runtime::wine::session::{Config, Session, SessionOptions, Stop};
+use adv_runtime::wine::session::{Config, Host as WineHost, Session, SessionOptions, Stop};
 use adv_runtime::{DebugTarget, DialogEvent, DialogSet, Engine};
 use adv_sync::WakeEvent;
 use adv_sync::background::LocalSender;
@@ -28,9 +29,11 @@ struct Host {
     background: LocalSender,
     gpu: Option<adv_device::gpu::Gpu>,
     frames: Option<(adv_runtime::FrameProducer, WakeEvent)>,
+    pacer: Option<super::frame_pacer::HostPacer>,
 }
 
 fn start(
+    environment: &mut WineHost,
     options: &Options,
     dist: &Path,
     wake: WakeEvent,
@@ -75,10 +78,16 @@ fn start(
         cdroms: options.cdroms.clone(),
         install_dir: options.install_dir.clone(),
     };
-    Session::start_with_options(&config, wake.clone(), &fonts, move |machine| {
+    environment.start(&config, wake.clone(), &fonts, move |machine| {
         Session::install_codec_kernels(machine, codec_kernels);
         machine.cpu.set_background_sender(host.background)?;
         options.configure_machine(machine, &wake, keys)?;
+        if let Some(pacer) = host.pacer {
+            if let Some(vsync) = &pacer.vsync {
+                machine.ext.insert(vsync.clone());
+            }
+            machine.sys.frame_pacer = Some(Arc::new(pacer));
+        }
         Session::configure_graphics(
             machine,
             options.d3d9_sm3,
@@ -102,6 +111,7 @@ fn start(
     })
 }
 
+#[cfg(target_os = "macos")]
 pub(super) fn run(options: &Options, dist: &Path) -> Result<u8, String> {
     let wake = WakeEvent::new().map_err(|e| e.to_string())?;
     let mut background =
@@ -126,11 +136,19 @@ pub(super) fn run(options: &Options, dist: &Path) -> Result<u8, String> {
             background: sender.into_local(),
             gpu,
             frames: None,
+            pacer: None,
         };
         let debugger = super::debug::start(options, false, wake.clone());
         let keys = Arc::new(KeyState::default());
         let started = Instant::now();
-        let session = start(options, dist, wake.clone(), &keys, host)?;
+        let session = start(
+            &mut WineHost::default(),
+            options,
+            dist,
+            wake.clone(),
+            &keys,
+            host,
+        )?;
         let (code, session, _) = drive(options, session, None, &keys, &wake, debugger, started)?;
         let frame = session.frame();
         eprintln!(
@@ -147,6 +165,7 @@ pub(super) fn run(options: &Options, dist: &Path) -> Result<u8, String> {
 /// The execution worker of a windowed run: the guest presents through the
 /// UI's frame mailbox on the UI's GPU.
 pub(super) fn run_execution(
+    environment: &mut WineHost,
     options: &Options,
     dist: &Path,
     mut worker: frontend::Worker,
@@ -154,14 +173,23 @@ pub(super) fn run_execution(
     keys: Arc<KeyState>,
     background: adv_sync::background::Sender,
 ) -> Result<Finished, String> {
+    let pacer = super::frame_pacer::HostPacer {
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        vsync: worker.vsync.take(),
+        #[cfg(target_os = "android")]
+        vsync: None,
+        keys: keys.clone(),
+        origin: Instant::now(),
+    };
     let host = Host {
         background: background.into_local(),
         gpu: worker.gpu.take(),
         frames: Some((worker.take_frames(), worker.ui_wake.clone())),
+        pacer: Some(pacer),
     };
     let started = Instant::now();
     let debugger = super::debug::start(options, true, wake.clone());
-    let session = start(options, dist, wake.clone(), &keys, host)?;
+    let session = start(environment, options, dist, wake.clone(), &keys, host)?;
     let (exit_code, _, summary) = drive(
         options,
         session,
@@ -221,6 +249,7 @@ impl AutoDialog {
 }
 
 struct Metrics {
+    audio: super::audio::AudioOutput,
     since: Instant,
     first_frame_seconds: Option<f64>,
     start_frame: u64,
@@ -229,8 +258,9 @@ struct Metrics {
 }
 
 impl Metrics {
-    fn new() -> Self {
+    fn new(audio: super::audio::AudioOutput) -> Self {
         Self {
+            audio,
             since: Instant::now(),
             first_frame_seconds: None,
             start_frame: 0,
@@ -378,6 +408,7 @@ fn report(
         ),
         session.machine.cpu.report_fields(),
         format!("\"performance\": {}", metrics.performance.json()),
+        format!("\"audio\": {}", metrics.audio.json()),
         format!("\"scene_gate\": {}", metrics.gate.json()),
         format!("\"wine_boundaries\": {}", session.boundaries().json(24)),
     ];
@@ -456,9 +487,19 @@ fn drive(
     mut debugger: Option<super::debug::Debugger>,
     started: Instant,
 ) -> Result<(u8, Session, adv_report::RunSummary), String> {
-    let mut audio = (worker.is_some() && options.audio)
-        .then(|| adv_device::Output::new(session.audio_stream()));
-    let mut metrics = Metrics::new();
+    let mut metrics = Metrics::new(super::audio::AudioOutput::from_stream(
+        options.audio,
+        worker.is_none(),
+        session.audio_stream(),
+    ));
+    #[cfg(target_os = "android")]
+    {
+        metrics.performance.execution_scheduling = Some(super::configure_execution_thread());
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if worker.is_some() {
+        metrics.performance.execution_scheduling = Some(super::configure_execution_thread());
+    }
     metrics.since = started;
     let mut control = options
         .control_stdin
@@ -471,7 +512,7 @@ fn drive(
     let native = worker.is_some() || control.is_some() || auto_delay.is_some();
     let mut close_at: Option<Instant> = None;
     let mut minimized = false;
-    let mut paused = false;
+    let mut suspension = super::Suspension::default();
     let mut outcome = Outcome {
         reason: "host_window_closed",
         ..Default::default()
@@ -481,11 +522,10 @@ fn drive(
             if worker.as_ref().is_some_and(frontend::Worker::stopped) {
                 return Err("UI stopped while the guest was running".into());
             }
-            let events = worker
+            while let Some(event) = worker
                 .as_mut()
-                .map(|worker| worker.pump(&mut metrics.performance))
-                .unwrap_or_default();
-            for event in events {
+                .and_then(|worker| worker.next_input(&mut metrics.performance))
+            {
                 match event {
                     window::Event::Input {
                         message,
@@ -510,7 +550,9 @@ fn drive(
                         let _ = reply.send(session.text(&text));
                     }
                     window::Event::Close => {
-                        paused = false;
+                        suspension.apply(&mut metrics.audio, None, Some(false), |paused| {
+                            session.set_suspended(paused);
+                        });
                         session.close();
                         close_at.get_or_insert_with(Instant::now);
                     }
@@ -518,17 +560,19 @@ fn drive(
                     window::Event::ForceClose => break 'run,
                     #[cfg(host_view)]
                     window::Event::AudioSuspended(sleeping) => {
-                        if let Some(audio) = audio.as_mut().filter(|_| sleeping) {
-                            audio.suspend();
-                        }
+                        suspension.apply(&mut metrics.audio, Some(sleeping), None, |paused| {
+                            session.set_suspended(paused);
+                        });
                     }
                     #[cfg(host_view)]
-                    window::Event::Paused(value) => paused = value,
+                    window::Event::Paused(value) => {
+                        suspension.apply(&mut metrics.audio, None, Some(value), |paused| {
+                            session.set_suspended(paused);
+                        });
+                    }
                     #[cfg(host_view)]
                     window::Event::Volume(percent) => {
-                        if let Some(audio) = &audio {
-                            audio.set_volume(percent);
-                        }
+                        metrics.audio.set_volume(percent);
                     }
                     window::Event::Repaint => {}
                     window::Event::FocusLost => {
@@ -598,6 +642,9 @@ fn drive(
                     };
                     control::acknowledge(result);
                     if close {
+                        suspension.apply(&mut metrics.audio, None, Some(false), |paused| {
+                            session.set_suspended(paused);
+                        });
                         metrics.gate.close(Instant::now());
                         close_at.get_or_insert_with(Instant::now);
                         if let Some(worker) = worker.as_mut() {
@@ -640,9 +687,9 @@ fn drive(
                     started,
                 });
             }
-            if paused || metrics.gate.frozen() {
-                if let Some(audio) = audio.as_mut() {
-                    audio.suspend();
+            if suspension.paused || metrics.gate.frozen() {
+                if metrics.gate.frozen() {
+                    metrics.audio.set_suspended(true);
                 }
                 if !control.as_ref().is_some_and(control::Control::has_pending) {
                     let wait = if metrics.gate.frozen() {
@@ -655,15 +702,14 @@ fn drive(
                             (a, b) => a.or(b),
                         }
                     } else {
-                        Some(SLICE)
+                        None
                     };
                     wake.wait(wait).map_err(|e| e.to_string())?;
                 }
                 continue;
             }
-            if let Some(audio) = audio.as_mut() {
-                audio.update();
-            }
+            metrics.audio.set_suspended(suspension.sleeping);
+            metrics.audio.update();
             let run_before = session.control_metrics().run_time;
             let deadline = Instant::now()
                 + metrics
@@ -1019,7 +1065,7 @@ fn usable(set: &DialogSet) -> impl Iterator<Item = &adv_runtime::DialogWindow> {
         .filter(|dialog| dialog.visible && dialog.enabled)
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
     use std::io::{BufRead, BufReader, Write};
@@ -1057,8 +1103,17 @@ mod tests {
                 background: sender.into_local(),
                 gpu: None,
                 frames: None,
+                pacer: None,
             };
-            let mut session = start(&options, &dist, wake.clone(), &keys, host).unwrap();
+            let mut session = start(
+                &mut WineHost::default(),
+                &options,
+                &dist,
+                wake.clone(),
+                &keys,
+                host,
+            )
+            .unwrap();
             session.machine.set_execution_budget(Some(Duration::ZERO));
             let (code, _, summary) =
                 drive(&options, session, None, &keys, &wake, None, Instant::now()).unwrap();

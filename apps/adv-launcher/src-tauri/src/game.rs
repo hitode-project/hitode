@@ -268,6 +268,9 @@ pub async fn start_game(
         .unwrap()
         .launch(&id)
         .map_err(|e| e.to_string())?;
+    let options = playback
+        .prepare(window.app_handle(), exe, data_dir, codepage)
+        .await?;
     let (reply, result) = std::sync::mpsc::sync_channel(1);
     let host_window = window.clone();
     window
@@ -277,13 +280,11 @@ pub async fn start_game(
                 if host.session.is_some() {
                     return Err("a game is already running".into());
                 }
-                let mut options = playback.options(exe, data_dir, codepage)?;
-                crate::drive::apply(host_window.app_handle(), &mut options)?;
                 let view = GameView::new(640, 480)?;
                 host.container.set_game(Some(&view));
                 let finished_window = host_window.clone();
                 let started_at = Instant::now();
-                let session = Session::new(
+                let session = Session::new_with_execution(
                     view,
                     options,
                     Box::new(move |result| {
@@ -300,6 +301,7 @@ pub async fn start_game(
                             finished_window.app_handle().exit(code);
                         }
                     }),
+                    &host_window.state::<adv_shell::Execution>(),
                 );
                 match session {
                     Ok(session) => {

@@ -40,6 +40,10 @@ int main(void)
         return 0;
     }
     if (GetFileAttributesA("reset.signal") != INVALID_FILE_ATTRIBUTES) {
+        WCHAR device[MAX_PATH];
+        check("reset_namespace", !(GetLogicalDrives() & (1 << 6)) &&
+              QueryDosDeviceW(L"D:", device, MAX_PATH) &&
+              !lstrcmpW(device, L"\\Device\\HarddiskVolume2"));
         check("reset", GetDriveTypeW(DISC(L"")) == DRIVE_FIXED && GetDriveTypeW(DISC2(L"")) == DRIVE_NO_ROOT_DIR &&
               GetFileAttributesW(L"C:\\Program Files\\Volume Probe\\renamed.bin") == INVALID_FILE_ATTRIBUTES);
         return 0;

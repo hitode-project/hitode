@@ -3,7 +3,7 @@
 //! Sparse identity files give wineserver ordinary file handles, sharing and PE
 //! section metadata. They contain no medium data. Reads and mapped pages come
 //! from the retained source, including when a handle reaches another process.
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::os::fd::{FromRawFd, RawFd};
@@ -105,6 +105,7 @@ impl Identity {
 pub struct Mounts(Rc<Namespace>);
 #[derive(Default)]
 struct Namespace {
+    registered: Cell<bool>,
     install: Option<PathBuf>,
     root: Option<PathBuf>,
     volumes: BTreeMap<char, Mounted>,
@@ -120,11 +121,16 @@ impl Drop for Namespace {
 impl Mounts {
     pub fn new(install: Option<PathBuf>, root: Option<PathBuf>) -> Self {
         Self(Rc::new(Namespace {
+            registered: Cell::new(false),
             install,
             root,
             volumes: BTreeMap::new(),
             identities: RefCell::new(HashMap::new()),
         }))
+    }
+    /// Publish this namespace once, shared by wineboot, the game and its children.
+    pub(crate) fn begin_registration(&self) -> bool {
+        !self.0.registered.replace(true)
     }
     /// Called before the namespace is shared with any process.
     pub fn attach(

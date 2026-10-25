@@ -589,6 +589,11 @@ Device decoding follows [device.md](device.md).
 
 ## Sessions
 
+### WINE-SES-10 Sequential sessions
+
+**Rule**: Sequential sessions on one host MUST share their prefix server while owning separate guest machines and mount sources. Ending a session MUST release every guest process and save registry changes before another session starts. Failed startup and forced stops MUST leave the host reusable.
+**Verification**: Test
+
 ### WINE-SES-1 Shared prefix
 
 **Rule**: Every game MUST run on the player's one prefix, kept between runs, with drive C: inside it or where the embedder places it. Each start MUST relink system32 and the template's module copies to the Wine installation. The program directory MUST use D: or the first unmounted letter after it, with writes in place.
@@ -629,7 +634,7 @@ Process startup MUST register the prefix's drive letters in the server namespace
 
 ### WINE-SES-8 Host font choices
 
-**Rule**: Explicit host font choices MAY override installed families. Font files, substitutions, and smoothing MUST apply before rendering. Substitutions and smoothing MUST NOT persist after the session.
+**Rule**: Explicit host font choices MAY override installed families. Font files, substitutions, and smoothing MUST apply before rendering. Session font links, replacements, substitutions, and smoothing MUST NOT affect later sessions.
 **Verification**: Test
 
 ### WINE-SES-9 Mounted file ownership

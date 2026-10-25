@@ -41,7 +41,7 @@ struct Driver {
     ui: RefCell<Option<frontend::Ui>>,
     done: RefCell<spsc::Consumer<Result<Finished, String>>>,
     pending: RefCell<Option<Result<Finished, String>>>,
-    execution: RefCell<Option<std::thread::JoinHandle<()>>>,
+    execution: RefCell<Option<crate::execution::Task>>,
     service: RefCell<adv_sync::background::Service>,
     on_finished: RefCell<Option<OnFinished>>,
     #[cfg(target_os = "macos")]
@@ -74,12 +74,33 @@ impl Session {
         options: Options,
         on_finished: Box<dyn FnOnce(Result<Finished, String>)>,
     ) -> Result<Self, String> {
+        Self::new_inner(view, options, on_finished, None)
+    }
+
+    /// Starts one Wine game on the player's persistent execution owner.
+    pub fn new_with_execution(
+        view: View,
+        mut options: Options,
+        on_finished: Box<dyn FnOnce(Result<Finished, String>)>,
+        execution: &crate::Execution,
+    ) -> Result<Self, String> {
+        options.wine = Some(execution.distribution.clone());
+        Self::new_inner(view, options, on_finished, Some(execution))
+    }
+
+    fn new_inner(
+        view: View,
+        options: Options,
+        on_finished: OnFinished,
+        execution: Option<&crate::Execution>,
+    ) -> Result<Self, String> {
         #[cfg(target_os = "macos")]
         let projection = Rc::new(RefCell::new(Projection::embedded(view.clone())?));
         Self::start(
             view,
             options,
             on_finished,
+            execution,
             #[cfg(target_os = "macos")]
             projection,
         )
@@ -88,6 +109,7 @@ impl Session {
         view: View,
         options: Options,
         on_finished: Box<dyn FnOnce(Result<Finished, String>)>,
+        execution: Option<&crate::Execution>,
         #[cfg(target_os = "macos")] projection: Rc<RefCell<Projection>>,
     ) -> Result<Self, String> {
         let wake = WakeEvent::new().map_err(|e| e.to_string())?;
@@ -124,17 +146,40 @@ impl Session {
         let (mut tx, rx) = spsc::channel(1);
         #[cfg(mobile)]
         let view_keys = keys.clone();
-        let execution = std::thread::Builder::new()
-            .name("adv-execution".into())
-            .spawn(move || {
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    crate::run_execution(options, Some(worker), wake, keys, execution_sender)
+        let execute = move |environment: Option<(
+            &mut adv_runtime::wine::session::Host,
+            &std::path::Path,
+        )>| {
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match environment {
+                    Some((environment, dist)) => crate::wine::run_execution(
+                        environment,
+                        &options,
+                        dist,
+                        worker,
+                        wake,
+                        keys,
+                        execution_sender,
+                    ),
+                    None => {
+                        crate::run_execution(options, Some(worker), wake, keys, execution_sender)
+                    }
                 }))
                 .unwrap_or_else(|_| Err("execution worker panicked".into()));
-                let _ = tx.push(result);
-                completion_wake.signal();
-            })
-            .map_err(|e| e.to_string())?;
+            let _ = tx.push(result);
+            completion_wake.signal();
+        };
+        let execution = match execution {
+            Some(execution) => {
+                execution.submit(move |environment, dist| execute(Some((environment, dist))))?
+            }
+            None => crate::execution::Task::Thread(
+                std::thread::Builder::new()
+                    .name("adv-execution".into())
+                    .spawn(move || execute(None))
+                    .map_err(|e| e.to_string())?,
+            ),
+        };
         let driver = Rc::new(Driver {
             #[cfg(mobile)]
             main_loop: RefCell::new(None),
@@ -608,6 +653,7 @@ pub(crate) fn run_cli(options: Options) -> Result<u8, String> {
                 app.postEvent_atStart(&event, false);
             }
         }),
+        None,
         projection,
     )?;
     *session.driver.cli.borrow_mut() = Some(window);

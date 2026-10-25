@@ -179,8 +179,9 @@ pub async fn start_game(
         .unwrap()
         .launch(&id)
         .map_err(|e| e.to_string())?;
-    let mut options = playback.options(exe, data_dir, codepage)?;
-    crate::drive::apply(window.app_handle(), &mut options)?;
+    let options = playback
+        .prepare(window.app_handle(), exe, data_dir, codepage)
+        .await?;
     let host_window = window.clone();
     on_ui(&window, move || {
         HOST.with_borrow_mut(|host| {
@@ -205,7 +206,7 @@ pub async fn start_game(
             host.attach();
             let finished_window = host_window.clone();
             let started_at = Instant::now();
-            let session = Session::new(
+            let session = Session::new_with_execution(
                 view,
                 options,
                 Box::new(move |result| {
@@ -221,6 +222,7 @@ pub async fn start_game(
                     }
                     crate::play::finished(&finished_window, id, result, started_at.elapsed());
                 }),
+                &host_window.state::<adv_shell::Execution>(),
             );
             let session = match session {
                 Ok(session) => session,

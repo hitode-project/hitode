@@ -12,6 +12,153 @@ use std::time::{Duration, Instant};
 
 use adv_runtime::wine::session::{Config, Session, Stop};
 
+// spec: WINE-SES-10, WINE-SES-8
+#[test]
+fn sequential_sessions_reclaim_clients_and_keep_the_prefix() {
+    if std::env::var_os("ADV_WINE_DIST").is_none() || std::env::var_os("ADV_WINE_PROBES").is_none()
+    {
+        return;
+    }
+    assert!(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "sequential_sessions_child",
+                "--nocapture"
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+}
+
+#[test]
+#[ignore = "subprocess entry: Wine owns process-global server state"]
+fn sequential_sessions_child() {
+    use adv_runtime::wine::session::{Host, SessionOptions};
+    let dist = PathBuf::from(std::env::var_os("ADV_WINE_DIST").unwrap());
+    let probes = PathBuf::from(std::env::var_os("ADV_WINE_PROBES").unwrap());
+    let root = std::env::temp_dir().join(format!("adv-wine-lifecycle-{}", std::process::id()));
+    let first = root.join("first");
+    let second = root.join("second");
+    for directory in [&first, &second] {
+        std::fs::create_dir_all(directory).unwrap();
+        std::fs::copy(
+            probes.join("session_lifecycle.exe"),
+            directory.join("session_lifecycle.exe"),
+        )
+        .unwrap();
+    }
+    let prefix = root.join("prefix");
+    let config = Config {
+        dist: &dist,
+        prefix: &prefix,
+        drive: None,
+        locale: 0x409,
+        fonts: "",
+        exe: &first.join("session_lifecycle.exe"),
+        width: 640,
+        height: 480,
+        jit: true,
+        debug: "",
+        stdout: None,
+    };
+    let mut host = Host::default();
+    #[cfg(target_os = "macos")]
+    let mut descriptors = Vec::new();
+    for turn in 0..4 {
+        let directory = if turn < 2 { &first } else { &second };
+        let config = Config {
+            exe: &directory.join("session_lifecycle.exe"),
+            ..config
+        };
+        if turn == 1 {
+            std::fs::write(directory.join("hold"), []).unwrap();
+            std::fs::write(directory.join("spawn"), []).unwrap();
+            std::fs::remove_file(directory.join("ready")).unwrap();
+        }
+        let mut options = SessionOptions::default();
+        if turn < 2 {
+            options
+                .fonts
+                .families
+                .insert("HitodeLifetimeAlias".into(), "Arial".into());
+        }
+        let mut session = host
+            .start(
+                &config,
+                adv_sync::WakeEvent::new().unwrap(),
+                &options,
+                |_| Ok(()),
+            )
+            .unwrap();
+        assert!(
+            host.start(
+                &config,
+                adv_sync::WakeEvent::new().unwrap(),
+                &SessionOptions::default(),
+                |_| Ok(())
+            )
+            .is_err()
+        );
+        let until = Instant::now() + Duration::from_secs(30);
+        let stop = loop {
+            assert!(Instant::now() < until, "session {turn} timed out");
+            match session.run(Instant::now() + Duration::from_millis(20)) {
+                Stop::Paused if turn == 1 && directory.join("ready").exists() => {
+                    break Stop::Paused;
+                }
+                Stop::Paused => {}
+                stop => break stop,
+            }
+        };
+        if turn == 1 {
+            assert!(matches!(stop, Stop::Paused));
+            session.set_suspended(true);
+            let paused = session.machine.sys.clock.now_us();
+            std::thread::sleep(Duration::from_millis(5));
+            assert_eq!(session.machine.sys.clock.now_us(), paused);
+            session.set_suspended(false);
+        } else {
+            assert!(matches!(stop, Stop::Exited(0)), "session {turn}: {stop:?}");
+        }
+        drop(session);
+        #[cfg(target_os = "macos")]
+        descriptors.push(std::fs::read_dir("/dev/fd").unwrap().count());
+        let observed = [
+            (turn as u32 + 1).to_le_bytes(),
+            u32::from(turn < 2).to_le_bytes(),
+        ]
+        .concat();
+        assert_eq!(std::fs::read(directory.join("ready")).unwrap(), observed);
+        let registry = std::fs::read_to_string(prefix.join("user.reg")).unwrap();
+        assert!(
+            registry.contains(&format!("\"Runs\"=dword:{:08x}", turn + 1)),
+            "registry was not finalized"
+        );
+        if turn == 1 {
+            // A machine preparation failure must leave the server usable too.
+            assert!(
+                host.start(
+                    &config,
+                    adv_sync::WakeEvent::new().unwrap(),
+                    &SessionOptions::default(),
+                    |_| Err("authored startup failure".into())
+                )
+                .is_err()
+            );
+        }
+    }
+    #[cfg(target_os = "macos")]
+    assert!(
+        descriptors[3] <= descriptors[2],
+        "guest descriptors accumulated: {descriptors:?}"
+    );
+    drop(host);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 // spec: WINE-SES-1, WINE-SES-2
 #[test]
 fn a_session_runs_a_program_from_its_directory_and_presents() {

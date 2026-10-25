@@ -75,9 +75,9 @@ For the Wine stack, `adv-abi::dll` writes host-module PE images through `adv-pe`
 ## A frame, from start to screen
 
 1. **Launch.** A front end (the `adv-run` command line, the Tauri launcher or the Android app) creates an `adv-shell` session for the game executable, a data directory and options such as the code page.
-2. **Load.** `adv-runtime` asks the `adv-os` loader to map the executable and its DLLs into the guest address space. System DLLs are synthetic images with real export tables, so imports resolve as on Windows.
+2. **Load.** `adv-runtime::wine` starts the program through `adv-nt` and Wine's PE loader, using the bundled Windows modules and native device fronts. The CLI's built-in comparison stack uses the `adv-os` loader and synthetic system images.
 3. **Run.** `adv-machine` schedules guest threads on one execution owner, and `adv-cpu` runs their code. Code runs first in the interpreter; hot code is translated to host machine code.
-4. **Call the system.** A call into a system DLL reaches a trap. `adv-abi` decodes the arguments by the API's signature and calls its front end in `adv-win32` or `adv-dx`. If the API needs a guest callback or has to wait, the machine saves a continuation and resumes it later in the same thread's context.
+4. **Call the system.** Wine implements Windows behavior above the NT and Unix boundaries served by `adv-nt` and `adv-unix`. Native device fronts use `adv-abi`; the built-in stack also routes Win32 calls through it. Guest callbacks and waits save continuations that resume in the same thread's context.
 5. **Draw.** GDI, DirectDraw and Direct3D 9 front ends draw through the neutral surfaces of `adv-device`, with software and GPU backends behind one interface. Apple ARM programmable draws use native Metal with wgpu-owned textures; other GPU work uses wgpu ([GFX-METAL-1](docs/spec/graphics.md#gfx-metal-1-apple-programmable-draws)). A finished frame goes into a mailbox.
 6. **Present.** The shell takes the newest finished frame and presents it through wgpu (Metal on macOS). Dropping a host frame never skips a draw, lock or readback that the guest can observe.
 7. **Sound and input.** DirectSound and waveOut share one mixer and playback clock, and the host audio callback only reads mixed PCM. Host input events become USER messages in the guest's queues.
@@ -125,6 +125,14 @@ API signatures and metadata come from `data/abi/`; `tools/abi/` regenerates them
 - **`apps/adv-launcher`** is the player front end, built with Tauri and Svelte. It shows the game library, and draws its overlay as a transparent webview on top of the native game view. The overlay publishes the regions it wants input for, and the shell routes each pointer or key to the overlay or to the game.
 - **`apps/adv-jit-helper`** runs in the iOS player's embedded extension. It uses idevice to connect to the paired local device, mount its developer disk image and prepare the player's JIT pool as a separate debugger process (IOS-JIT-2). It has no runtime crate dependencies.
 - On Android, the same launcher runs in a Tauri Android app. Its webview sits above a SurfaceView that adv-shell presents into ([docs/spec/android.md](docs/spec/android.md)).
+
+The player uses Wine on macOS, iOS and Android. `adv-shell::Execution` owns one
+execution thread and `adv-runtime::wine::session::Host` keeps the prefix server
+between games. Each game has its own session, machines, devices and mount sources;
+teardown saves the registry and releases every client before the finish callback.
+The execution owner blocks between games. The launcher prepares the embedded Wine
+distribution off the UI thread; native views and input keep the same shell channels.
+The built-in stack remains available through the CLI for comparison.
 
 On macOS, guest menus appear in the native menu bar and guest dialogs become child windows of the game window. Quitting first asks the game to close and waits for it; a second quit forces the stop. Sleep releases the audio stream, and wake rebuilds it. After a run, the launcher can save an anonymous compatibility report whose format `adv-report` defines ([docs/spec/report.md](docs/spec/report.md)). The host contracts are in [docs/spec/host.md](docs/spec/host.md).
 

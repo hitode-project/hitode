@@ -5,11 +5,13 @@
 //! installation's prefix template, what `wineboot --init` makes of an empty
 //! prefix. Its system32 links to the Wine installation's modules, as a prefix
 //! holds them. The program directory uses D: or the next letter free of optical
-//! mounts. As Wine runs wineboot whenever its server starts, a session first
-//! runs it for the keys that last until the server stops.
+//! mounts. A Host keeps the prefix server between games; each session first
+//! runs wineboot to refresh the volatile keys before starting the program.
 mod debug;
 mod files;
 mod fonts;
+mod host;
+pub use host::Host;
 
 use adv_drv::user::project;
 use std::cell::{Cell, RefCell};
@@ -83,6 +85,8 @@ pub struct ControlMetrics {
 
 pub struct Session {
     pub machine: Machine<Cpu>,
+    // Retires clients after the active machine releases its connection.
+    _lease: host::Lease,
     wake: WakeEvent,
     audio: adv_device::AudioControl,
     metrics: ControlMetrics,
@@ -621,6 +625,17 @@ impl Session {
         options: &SessionOptions,
         prepare: impl FnOnce(&mut Machine<Cpu>) -> Result<(), String>,
     ) -> Result<Session, String> {
+        Host::default().start(config, wake, options, prepare)
+    }
+
+    fn start_on(
+        host: &mut Host,
+        config: &Config<'_>,
+        wake: WakeEvent,
+        options: &SessionOptions,
+        prepare: impl FnOnce(&mut Machine<Cpu>) -> Result<(), String>,
+    ) -> Result<Session, String> {
+        host.check(config)?;
         let exe = std::path::absolute(config.exe).map_err(|e| e.to_string())?;
         let config = Config {
             exe: &exe,
@@ -644,50 +659,14 @@ impl Session {
         };
 
         let mut clock = adv_machine::Clock::real();
-        let time = GuestClock(Cell::new(Time::now(&mut clock)));
-        let mut server = Server::start(
-            &adv_wineserver::Config {
-                prefix: prefix.clone(),
-                server_dir: config.prefix.join("server"),
-                install: config.dist.to_owned(),
-                debug: 0,
-            },
-            &time,
-        )
-        .map_err(|e| e.to_string())?;
-        let server_wake = wake.clone();
-        server.set_waker(Box::new(move || server_wake.signal()));
-        let input = server.input_generation();
-        let deadline = match server.state() {
-            State::Waiting(Some(delay)) => Some(Instant::now() + delay),
-            _ => None,
-        };
-        let guest_deadline = match server.state() {
-            State::Waiting(Some(delay)) => Some(
-                time.0
-                    .get()
-                    .monotonic
-                    .saturating_add(delay.as_nanos() as u64 / 100),
-            ),
-            _ => None,
-        };
-        let socket = server.socket_dir().ok_or("the server has no socket")?;
-        let shared = Shared {
-            driver: Rc::new(RefCell::new(Driver {
-                server,
-                clock: time,
-                parked: BTreeMap::new(),
-                signals: vec![],
-                generation: 0,
-                deadline,
-                guest_deadline,
-                mounts: mounts.clone(),
-                input,
-                #[cfg(test)]
-                resumes: 0,
-            })),
-            id: Rc::new(Cell::new(0)),
-        };
+        let shared = host.connect(&config, &mut clock, &wake, mounts.clone())?;
+        let lease = host::Lease(shared.clone());
+        let socket = shared
+            .driver
+            .borrow()
+            .server
+            .socket_dir()
+            .ok_or("the server has no socket")?;
 
         // As Wine's `run_wineboot`, but restarting: the template stands for
         // what `--init` installs, and no services run.
@@ -718,20 +697,23 @@ impl Session {
             Box::new(shared.clone()),
         )
         .map_err(|e| format!("wineboot: {e}"))?;
-        fonts.install(&mut boot)?;
         boot.ext.insert(shared.clone());
         adv_nt::identity::note_ntdll(&mut boot, &config.dist.join(NTDLL), &ntdll);
-        match run(
-            &mut boot,
-            &wake,
-            Instant::now() + BOOT,
-            |_| Ok(false),
-            None,
-            None,
-        ) {
-            Stop::Exited(0) => {}
-            stop => return Err(format!("wineboot: {stop:?}")),
-        }
+        let boot_result = fonts.install(&mut boot).and_then(|_| {
+            match run(
+                &mut boot,
+                &wake,
+                Instant::now() + BOOT,
+                |_| Ok(false),
+                None,
+                None,
+            ) {
+                Stop::Exited(0) => Ok(()),
+                stop => Err(format!("wineboot: {stop:?}")),
+            }
+        });
+        fonts.restore(&mut boot)?;
+        boot_result?;
         drop(boot);
 
         let mut machine = new_machine(&config, &prefix, clock, &wake, &audio)?;
@@ -760,14 +742,21 @@ impl Session {
             Box::new(shared.clone()),
         )
         .map_err(|e| e.to_string())?;
-        fonts.apply(&mut machine)?;
-        super::xaudio2::activate(&mut machine, started.main)?;
+        let configured = fonts
+            .install(&mut machine)
+            .and_then(|_| fonts.apply(&mut machine))
+            .and_then(|_| super::xaudio2::activate(&mut machine, started.main));
+        if let Err(error) = configured {
+            fonts.restore(&mut machine)?;
+            return Err(error);
+        }
         adv_nt::identity::note_ntdll(&mut machine, &config.dist.join(NTDLL), &ntdll);
         shared.id.set(started.thread.unix_pid);
         machine.ext.insert(process::Children::default());
         machine.ext.insert(shared.clone());
         Ok(Session {
             machine,
+            _lease: lease,
             wake,
             audio,
             metrics: ControlMetrics::default(),
@@ -800,6 +789,22 @@ impl Session {
     }
     pub fn run_ui(&mut self, until: Instant) -> Stop {
         self.run_family(until, true)
+    }
+
+    /// Stop the host audio callback before suspending the family's clocks and PCM.
+    pub fn set_suspended(&mut self, suspended: bool) -> bool {
+        let set = |machine: &mut Machine<Cpu>| {
+            if suspended {
+                machine.sys.clock.pause();
+            } else {
+                machine.sys.clock.resume();
+            }
+        };
+        set(&mut self.machine);
+        for machine in self.shared.driver.borrow_mut().parked.values_mut() {
+            set(machine);
+        }
+        self.audio.suspend(suspended)
     }
 
     fn run_family(&mut self, until: Instant, stop_frame: bool) -> Stop {
@@ -1094,6 +1099,14 @@ impl Session {
             )?;
             adv_drv::codec::install(&mut machine.ext, adv_drv::codec::mode(&self.machine.ext));
             machine.inherit_policy(&self.machine);
+            machine.sys.frame_pacer = self.machine.sys.frame_pacer.clone();
+            if let Some(vsync) = self
+                .machine
+                .ext
+                .try_get::<std::sync::Arc<adv_sync::vsync::Vsync>>()
+            {
+                machine.ext.insert(vsync.clone());
+            }
             machine
                 .ext
                 .insert(self.shared.driver.borrow().mounts.clone());

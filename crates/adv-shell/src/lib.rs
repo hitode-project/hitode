@@ -2,8 +2,12 @@
 mod audio;
 mod control;
 mod debug;
+#[cfg(host_view)]
+mod execution;
 mod frame_pacer;
 mod frontend;
+#[cfg(host_view)]
+pub use execution::Execution;
 #[cfg(any(host_view, windows))]
 mod logging;
 pub mod mobile;
@@ -30,7 +34,7 @@ mod session;
 mod software_frame;
 mod survey;
 pub mod window;
-#[cfg(target_os = "macos")]
+#[cfg(host_view)]
 mod wine;
 #[cfg(host_view)]
 pub use session::Session;
@@ -1551,6 +1555,24 @@ struct Suspension {
     sleeping: bool,
     paused: bool,
 }
+
+// spec: HOST-SES-7
+#[cfg(all(test, host_view))]
+#[test]
+fn frontend_sleep_and_pause_resume_only_their_own_state() {
+    let mut state = Suspension::default();
+    let mut audio =
+        audio::AudioOutput::from_stream(false, true, adv_device::AudioControl::new(true).stream());
+    let mut clocks = Vec::new();
+    state.apply(&mut audio, Some(true), None, |paused| clocks.push(paused));
+    state.apply(&mut audio, None, Some(true), |paused| clocks.push(paused));
+    state.apply(&mut audio, Some(false), None, |paused| clocks.push(paused));
+    assert!(state.paused);
+    assert_eq!(clocks, [true]);
+    state.apply(&mut audio, None, Some(false), |paused| clocks.push(paused));
+    assert_eq!(clocks, [true, false]);
+    assert!(!state.sleeping && !state.paused);
+}
 #[cfg(host_view)]
 impl Suspension {
     fn set(
@@ -1560,16 +1582,28 @@ impl Suspension {
         sleeping: Option<bool>,
         paused: Option<bool>,
     ) {
+        self.apply(audio, sleeping, paused, |paused| {
+            runtime.set_suspended(paused);
+        });
+    }
+
+    fn apply(
+        &mut self,
+        audio: &mut audio::AudioOutput,
+        sleeping: Option<bool>,
+        paused: Option<bool>,
+        suspend: impl FnOnce(bool),
+    ) {
         let was_paused = self.paused;
         self.sleeping = sleeping.unwrap_or(self.sleeping);
         self.paused = paused.unwrap_or(self.paused);
-        // Runtime::set_suspended requires the device callback stopped first
-        // and reopened only after resuming.
-        if self.paused && !was_paused {
-            audio.set_suspended(true);
-            runtime.set_suspended(true);
-        } else if !self.paused && was_paused {
-            runtime.set_suspended(false);
+        // Stop the device callback before pausing guest clocks and PCM;
+        // reopen it only after resuming them.
+        if self.paused != was_paused {
+            if self.paused {
+                audio.set_suspended(true);
+            }
+            suspend(self.paused);
         }
         audio.set_suspended(self.sleeping || self.paused);
     }
@@ -1586,7 +1620,15 @@ fn run_execution(
     if let Some(dist) = options.wine.as_deref()
         && let Some(worker) = window.take()
     {
-        return wine::run_execution(&options, dist, worker, wake, keys, background);
+        return wine::run_execution(
+            &mut adv_runtime::wine::session::Host::default(),
+            &options,
+            dist,
+            worker,
+            wake,
+            keys,
+            background,
+        );
     }
     window::initialize_dpi()?;
     let started = Instant::now();
@@ -1733,14 +1775,7 @@ fn run_execution(
     }
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     if window.is_some() {
-        // The guest produces the next interactive frame on this worker.
-        let error = unsafe {
-            libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0)
-        };
-        performance.execution_scheduling = Some(format!(
-            "{{\"requested_qos\": \"user_interactive\", \"applied\": {}, \"set_errno\": {error}}}",
-            error == 0
-        ));
+        performance.execution_scheduling = Some(configure_execution_thread());
     }
     let mut scene_gate = control::SceneGate::default();
     let mut inputs = 0u64;
@@ -2542,5 +2577,17 @@ fn configure_execution_thread() -> String {
         result == 0 && query_error == 0 && nice == -2,
         error,
         query_error
+    )
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn configure_execution_thread() -> String {
+    // The guest produces the next interactive frame on this worker.
+    let error = unsafe {
+        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0)
+    };
+    format!(
+        "{{\"requested_qos\": \"user_interactive\", \"applied\": {}, \"set_errno\": {error}}}",
+        error == 0
     )
 }

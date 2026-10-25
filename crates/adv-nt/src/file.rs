@@ -889,6 +889,37 @@ pub fn set_volume(_: &mut Env<'_>, _: &[u32]) -> Outcome {
 /// Names each drive under `dosdevices` in the server's `\??` directory, as
 /// mountmgr does: `GetLogicalDrives` lists drives from these links alone.
 pub(crate) fn mount_drives(env: &mut Env<'_>) -> Result<(), Error> {
+    if env
+        .ext
+        .try_get::<volume::Mounts>()
+        .is_some_and(volume::Mounts::begin_registration)
+    {
+        // Permanent DOS links belong to the prior mount namespace, not the server.
+        for letter in b'A'..=b'Z' {
+            let name: Vec<u8> = format!(r"\??\{}:", letter as char)
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect();
+            let mut open = crate::protocol::OpenSymlinkRequest {
+                access: 0x10000, // DELETE
+                attributes: OBJ_CASE_INSENSITIVE,
+                ..Default::default()
+            };
+            let (link, _) = server::request(env, &mut open, &[&name], &mut [])?;
+            if link.header.error == status::OBJECT_NAME_NOT_FOUND {
+                continue;
+            }
+            status::check(link.header.error)?;
+            let mut remove = crate::protocol::SetObjectPermanenceRequest {
+                handle: link.handle,
+                permanent: 0,
+                ..Default::default()
+            };
+            let removed = server::request(env, &mut remove, &[], &mut []);
+            server::close(env, link.handle)?;
+            status::check(removed?.0.header.error)?;
+        }
+    }
     let mut drives: Vec<u8> = std::fs::read_dir(&env.ext.get::<Files>().dosdevices)
         .map_err(|_| status::OBJECT_PATH_NOT_FOUND)?
         .filter_map(|entry| match entry.ok()?.file_name().as_bytes() {

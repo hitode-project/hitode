@@ -127,6 +127,7 @@ thread_local! {
     static TRACING: Cell<Option<*mut dyn Tracing>> = const { Cell::new(None) };
     /// The server coroutine's yielder; set only while the server runs.
     static YIELDER: Cell<*const Yielder<(), Suspend>> = const { Cell::new(std::ptr::null()) };
+    static FLUSH: Cell<bool> = const { Cell::new(false) };
 }
 
 unsafe extern "C" {
@@ -142,9 +143,32 @@ unsafe extern "C" {
         owner: *mut c_void,
     ) -> *mut c_void;
     fn hitode_event_unwatch(watch: *mut c_void);
+    static mut master_socket_timeout: i64;
+    fn flush_registry();
 }
 
 impl Server {
+    /// Keep this prefix available between guest sessions.
+    pub fn keep_alive(&mut self) {
+        // SAFETY: Wine's globals are accessed only by the execution owner.
+        unsafe { master_socket_timeout = i64::MAX };
+    }
+
+    /// Drain disconnected clients and save registry changes on Wine's stack.
+    pub fn flush(&mut self, clock: &dyn Clock) {
+        FLUSH.set(true);
+        loop {
+            let state = self.step(clock);
+            if matches!(state, State::Exited(_)) {
+                FLUSH.set(false);
+                break;
+            }
+            if !matches!(state, State::Waiting(Some(Duration::ZERO))) && !self.kernel_ready() {
+                break;
+            }
+        }
+    }
+
     /// Starts the server and runs it until it first waits.
     pub fn start(config: &Config, clock: &dyn Clock) -> Result<Server, Error> {
         let c_path = |path: &Path| {
@@ -298,6 +322,10 @@ fn suspend(reason: Suspend) {
 #[unsafe(no_mangle)]
 extern "C" fn hitode_host_wait(timeout: c_int) {
     suspend(Suspend::Wait(timeout));
+    if FLUSH.replace(false) {
+        // SAFETY: this runs on Wine's coroutine with its host services installed.
+        unsafe { flush_registry() };
+    }
 }
 
 #[unsafe(no_mangle)]

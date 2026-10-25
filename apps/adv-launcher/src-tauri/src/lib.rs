@@ -4,6 +4,8 @@
 #[cfg(target_os = "android")]
 pub mod android;
 #[cfg(any(target_os = "macos", target_os = "android", target_os = "ios"))]
+mod distribution;
+#[cfg(any(target_os = "macos", target_os = "android", target_os = "ios"))]
 mod drive;
 #[cfg(any(target_os = "macos", target_os = "android", target_os = "ios"))]
 #[cfg_attr(target_os = "android", path = "game_android.rs")]
@@ -86,6 +88,10 @@ pub fn run() {
         app.manage(std::sync::Mutex::new(library::Library::load(
             app.path().app_data_dir()?,
         )?));
+        #[cfg(any(target_os = "macos", target_os = "android", target_os = "ios"))]
+        app.manage(adv_shell::Execution::new(distribution::path(
+            &app.path().app_data_dir()?,
+        ))?);
         #[cfg(desktop)]
         {
             let menu = menu::build(app.handle())?;

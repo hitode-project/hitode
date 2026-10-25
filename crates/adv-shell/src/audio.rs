@@ -13,16 +13,7 @@ impl AudioOutput {
     pub fn new(enabled: bool, headless: bool, runtime: &Runtime) -> Self {
         #[cfg(any(host_view, windows))]
         {
-            let output = if enabled && !headless {
-                Some(adv_device::Output::new(runtime.audio_stream()))
-            } else {
-                None
-            };
-            Self {
-                output,
-                #[cfg(host_view)]
-                suspended: false,
-            }
+            Self::from_stream(enabled, headless, runtime.audio_stream())
         }
         #[cfg(not(any(host_view, windows)))]
         {
@@ -36,8 +27,20 @@ impl AudioOutput {
         }
     }
 
+    #[cfg(any(host_view, windows))]
+    pub fn from_stream(enabled: bool, headless: bool, stream: adv_device::AudioStream) -> Self {
+        Self {
+            output: (enabled && !headless).then(|| adv_device::Output::new(stream)),
+            #[cfg(host_view)]
+            suspended: false,
+        }
+    }
+
     #[cfg(host_view)]
     pub fn set_suspended(&mut self, suspended: bool) {
+        if self.suspended == suspended {
+            return;
+        }
         self.suspended = suspended;
         if let Some(output) = self.output.as_mut() {
             output.suspend();

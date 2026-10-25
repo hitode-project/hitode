@@ -1,4 +1,6 @@
 use std::process::Command;
+#[path = "build/wine.rs"]
+mod wine;
 
 fn git(args: &[&str]) -> Option<String> {
     let output = Command::new("git").args(args).output().ok()?;
@@ -7,6 +9,7 @@ fn git(args: &[&str]) -> Option<String> {
 }
 
 fn main() {
+    wine::bundle();
     // The report's app.build: the commit the launcher was built from. The
     // reflog changes with every commit and checkout of this worktree.
     if let Some(log) = git(&[
