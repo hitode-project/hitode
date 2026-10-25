@@ -689,6 +689,12 @@ fn conversions_match_wine() {
                     set(&mut data, RECTS, rect::right, 32);
                     dib(&mut data, SRC, src, SOURCE_BITS, seed);
                 }
+                if dst < 5 && seed % 8 == 7 {
+                    let bits = u32::from_le_bytes(
+                        data[0x100 + d::bits..0x104 + d::bits].try_into().unwrap(),
+                    );
+                    set(&mut data, SRC, d::bits, bits - SOURCE_BITS + DEST_BITS + 4);
+                }
                 if dst >= 5 && seed % 3 == 0 {
                     set(&mut data, DST, d::color_table, 0);
                 }

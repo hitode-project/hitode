@@ -1201,6 +1201,25 @@ fn convert_to(env: &mut Env<'_>) -> Option<u64> {
         if raw {
             let bytes = mem.get(src.at(l, y), used as usize)?.to_vec();
             mem.get_mut(da, used as usize)?.copy_from_slice(&bytes);
+        } else if dst.bpp > 8 && {
+            let source = u64::from(src.at(l, y));
+            let target = u64::from(da);
+            source + u64::from(width) * src.size() as u64 <= target
+                || target + u64::from(used) <= source
+        } {
+            // Resolve disjoint rows once; overlapping conversions retain Wine's
+            // per-pixel traversal below.
+            let source = mem.get(src.at(l, y), width as usize * src.size())?.to_vec();
+            let target = mem.get_mut(da, used as usize)?;
+            for (input, output) in source
+                .chunks_exact(src.size())
+                .zip(target.chunks_exact_mut(dst.size()))
+            {
+                let mut pixel = [0; 4];
+                pixel[..src.size()].copy_from_slice(input);
+                let value = dst.pack(src.rgb(u32::from_le_bytes(pixel)));
+                output.copy_from_slice(&value.to_le_bytes()[..dst.size()]);
+            }
         } else {
             for x in l..r {
                 let pixel = mem.pixel(src.at(x, y), src.size())?;
