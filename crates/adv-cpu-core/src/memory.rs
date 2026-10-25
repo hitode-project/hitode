@@ -260,9 +260,11 @@ impl Memory {
         if range.is_empty() {
             return false;
         }
-        if !self.selective_code_writes() {
-            return (range.start / PAGE_SIZE..=(range.end - 1) / PAGE_SIZE)
-                .any(|page| self.perms[page] & EXEC != 0);
+        if !self.selective_code_writes()
+            && (range.start / PAGE_SIZE..=(range.end - 1) / PAGE_SIZE)
+                .any(|page| self.perms[page] & EXEC != 0)
+        {
+            return true;
         }
         page_spans(range.clone()).any(|(page, bytes)| {
             self.watched[page]
@@ -1026,8 +1028,9 @@ impl Memory {
 
     /// Host address of `len` bytes within one ordinary page that guest code
     /// may access directly: mapped, permitted, not shared, and for writes not
-    /// executable, so no overlay, code invalidation or host protection scope
-    /// is involved. Such pages are host-accessible under native protection.
+    /// executable or observed dependency bytes, so no overlay, invalidation or
+    /// host protection scope is involved. Such pages are host-accessible under
+    /// native protection.
     #[inline]
     pub fn direct(&self, addr: u32, len: usize, write: bool) -> Option<*mut u8> {
         let offset = addr.wrapping_sub(self.base) as usize;
@@ -1038,7 +1041,9 @@ impl Memory {
         let page = offset / PAGE_SIZE;
         let perms = self.perms[page];
         let allowed = if write {
-            perms & WRITE != 0 && perms & (EXEC | SHARED) == 0
+            perms & WRITE != 0
+                && perms & (EXEC | SHARED) == 0
+                && !self.writes_code(&(offset..last + 1))
         } else {
             perms & READ != 0 && perms & SHARED == 0
         };
@@ -1812,6 +1817,31 @@ pub mod testing {
 mod linear_audio_tests {
     use super::testing::query;
     use super::*;
+
+    // spec: EXEC-CORE-7
+    #[test]
+    fn native_policy_observes_data_bytes_and_retains_the_executable_page_barrier() {
+        let mut memory = Memory::reserve(0x10000, 2 * PAGE_SIZE).unwrap();
+        memory.map(0x10000, 2 * PAGE_SIZE, READ | WRITE).unwrap();
+        memory.enable_native_protection().unwrap();
+        memory.watch_code(0x10040, 4);
+        assert!(memory.direct(0x10040, 4, true).is_none());
+        assert!(memory.direct(0x10044, 4, true).is_some());
+        let version = memory.versions[0];
+        memory.write(0x10040, &[1; 4]).unwrap();
+        assert!(memory.versions[0] > version);
+        let version = memory.versions[0];
+        memory.write(0x10044, &[2; 4]).unwrap();
+        assert_eq!(memory.versions[0], version);
+        memory
+            .protect(0x11000, PAGE_SIZE, READ | WRITE | EXEC)
+            .unwrap();
+        memory.watch_code(0x11040, 4);
+        let version = memory.versions[1];
+        memory.write(0x11044, &[3; 4]).unwrap();
+        assert!(memory.versions[1] > version);
+    }
+
     #[test]
     fn private_copy_privatization_restores_native_noaccess_permissions() {
         for enable_first in [false, true] {

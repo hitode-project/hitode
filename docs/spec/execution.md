@@ -52,6 +52,11 @@ Exact retirement is enabled by `--profile` or `--frame-budget`. The synthetic `t
 
 Cached successors MUST match entry EIP and block-cache generation. They MUST pass the same memory and native-publication revision checks as a lookup. Clearing either decode cache MUST advance the cache generation before any entry is reused. Successor hits MUST preserve entry stops, budgets and observation boundaries.
 
+### EXEC-CORE-7 Observed data write barriers
+
+**Rule**: `Memory::direct` MUST refuse writes intersecting observed bytes, including on non-executable pages. Checked stores intersecting observed bytes MUST advance the corresponding dependency versions. On non-executable pages, stores outside observed bytes MUST NOT invalidate dependencies.
+**Verification**: Test
+
 ## Native computation admission
 
 ### EXEC-NATIVE-1 Verified bindings
