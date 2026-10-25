@@ -1,5 +1,12 @@
 //! Build the host Theora decoder and XAudio2 reverb DSP.
 fn main() {
+    if std::env::var_os("CARGO_FEATURE_MEDIA").is_some()
+        && std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos")
+    {
+        for framework in ["VideoToolbox", "CoreMedia"] {
+            println!("cargo:rustc-link-lib=framework={framework}");
+        }
+    }
     cc::Build::new()
         .file("src/xaudio2/reverb.c")
         .define("NDEBUG", None)
