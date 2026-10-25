@@ -72,6 +72,7 @@ struct Region {
     placeholder: Placeholder,
     pages: Vec<Page>,
     write_watch: Option<Vec<bool>>,
+    maximum_protection: Option<u32>,
 }
 
 impl Region {
@@ -98,6 +99,7 @@ impl Memory {
                 protection,
                 placeholder: Placeholder::None,
                 write_watch: None,
+                maximum_protection: None,
                 pages,
             },
         );
@@ -285,6 +287,55 @@ pub(crate) fn map_shared_view_at(
         Kind::Mapped,
         protection,
         vec![Some(protection); (size / PAGE) as usize],
+    );
+    if placeholder {
+        memory.regions.get_mut(&base).unwrap().placeholder = Placeholder::Replaced;
+    }
+    Ok(base)
+}
+
+/// Map an immutable provider's pages without reading untouched ranges.
+pub(crate) fn map_source_view(
+    cpu: &mut dyn Guest,
+    vm: &mut Vm,
+    memory: &mut Memory,
+    source: &dyn crate::file::volume::ReadFile,
+    offset: u64,
+    protection: u32,
+    (base, size): (u32, u32),
+) -> Result<u32, Status> {
+    // The backend's shared file pages are data pages, never executable views.
+    if protection & 0xf0 != 0 {
+        memory.regions.remove(&base);
+        let _ = vm.free(cpu, base);
+        return Err(status::NOT_SUPPORTED);
+    }
+    let prot = Prot(memory.prot(protection)?.0 & !Prot::EXEC.0);
+    let size = align_up(size, PAGE);
+    let placeholder = replaced_placeholder(memory, base);
+    let pages: Vec<_> = (0..size / PAGE)
+        .map(|index| source.page(offset / u64::from(PAGE) + u64::from(index)))
+        .collect();
+    let copy = matches!(protection, PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY);
+    if cpu.map_file_pages(base, &pages, prot, copy).is_err() {
+        memory.regions.remove(&base);
+        let _ = vm.free(cpu, base);
+        return Err(status::NO_MEMORY);
+    }
+    memory.insert(
+        base,
+        Kind::Mapped,
+        protection,
+        vec![Some(protection); (size / PAGE) as usize],
+    );
+    memory.regions.get_mut(&base).unwrap().maximum_protection = Some(
+        PAGE_NOACCESS
+            | PAGE_READONLY
+            | if copy {
+                PAGE_READWRITE | PAGE_WRITECOPY
+            } else {
+                0
+            },
     );
     if placeholder {
         memory.regions.get_mut(&base).unwrap().placeholder = Placeholder::Replaced;
@@ -647,12 +698,18 @@ fn protect_in(env: &mut Env<'_>, args: &[u32]) -> Result<(), Status> {
     let address = read(env, base_out)?;
     let size = read(env, size_out)?;
     let (start, length) = pages(address, size)?;
-    let prot = memory(env).prot(protection)?;
+    let mut prot = memory(env).prot(protection)?;
     let Some((base, region)) = memory(env).region_of(start) else {
         return Err(status::NOT_MAPPED_VIEW);
     };
     if start + length > region.end(base) {
         return Err(status::NOT_MAPPED_VIEW);
+    }
+    if let Some(maximum) = region.maximum_protection {
+        if protection & 0xff & !maximum != 0 {
+            return Err(0xc000_004e);
+        }
+        prot.0 &= !Prot::EXEC.0;
     }
     let first = ((start - base) / PAGE) as usize;
     let range = first..first + (length / PAGE) as usize;
@@ -1500,4 +1557,77 @@ pub(crate) fn preserve_view(env: &mut Env<'_>, base: u32) {
     region.placeholder = Placeholder::Free;
     region.pages.fill(None);
     let _ = env.cpu.unmap(base, size);
+}
+
+#[cfg(test)]
+mod volume_tests {
+    use super::*;
+    use adv_cpu::{Cpu, backend::FilePage};
+    use std::{cell::Cell, rc::Rc};
+
+    struct Source(Vec<Rc<FilePage>>);
+    impl crate::file::volume::ReadFile for Source {
+        fn read_at(&self, _: u64, _: &mut [u8]) -> std::io::Result<usize> {
+            panic!("mapping must not read a whole file");
+        }
+        fn page(&self, index: u64) -> Rc<FilePage> {
+            self.0[index as usize].clone()
+        }
+    }
+
+    // spec: DEV-DISC-5, DEV-DISC-7
+    #[test]
+    fn immutable_volume_views_load_only_touched_pages_and_copy_writes() {
+        let loads = Rc::new(Cell::new(0));
+        let source = Source(
+            (0..32)
+                .map(|index| {
+                    let loads = loads.clone();
+                    FilePage::lazy(move || {
+                        loads.set(loads.get() + 1);
+                        Ok([index as u8 + 1; 4096])
+                    })
+                })
+                .collect(),
+        );
+        let mut cpu = Cpu::new(adv_machine::layout::PARK_ADDR, false).unwrap();
+        let mut vm = Vm::new();
+        let mut memory = Memory::default();
+        let size = 32 * PAGE;
+        let first = vm.reserve(size).unwrap();
+        let second = vm.reserve(size).unwrap();
+        map_source_view(
+            &mut cpu,
+            &mut vm,
+            &mut memory,
+            &source,
+            0,
+            PAGE_READONLY,
+            (first, size),
+        )
+        .unwrap();
+        map_source_view(
+            &mut cpu,
+            &mut vm,
+            &mut memory,
+            &source,
+            0,
+            PAGE_WRITECOPY,
+            (second, size),
+        )
+        .unwrap();
+        assert_eq!(loads.get(), 0);
+        let mut byte = [0];
+        cpu.read(first, &mut byte).unwrap();
+        assert_eq!(byte, [1]);
+        assert_eq!(loads.get(), 1);
+        cpu.write(second, &[99]).unwrap();
+        cpu.read(first, &mut byte).unwrap();
+        assert_eq!(byte, [1]);
+        cpu.read(second, &mut byte).unwrap();
+        assert_eq!(byte, [99]);
+        cpu.read(first + 31 * PAGE, &mut byte).unwrap();
+        assert_eq!(byte, [32]);
+        assert_eq!(loads.get(), 2);
+    }
 }

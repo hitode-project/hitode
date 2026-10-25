@@ -43,6 +43,15 @@ pub trait Clock {
 /// Services provided by the execution owner while the server runs.
 /// Signals are queued; memory transfers complete before returning to Wine.
 pub trait Tracing {
+    /// Optional immutable file backing, used for PE metadata on virtual volumes.
+    fn read_file(
+        &mut self,
+        _fd: i32,
+        _offset: u64,
+        _bytes: &mut [u8],
+    ) -> Option<std::io::Result<usize>> {
+        None
+    }
     fn signal(&mut self, pid: i32, tid: i32, signal: i32) -> bool;
     fn read_memory(&mut self, pid: i32, address: u64, data: &mut [u8]) -> u32;
     fn write_memory(&mut self, pid: i32, address: u64, data: &[u8]) -> u32;
@@ -337,6 +346,26 @@ extern "C" fn hitode_host_server_root() -> *const c_char {
         .expect("server environment")
         .server_root
         .as_ptr()
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn hitode_host_file(fd: c_int, offset: u64, bytes: *mut u8, size: usize) -> isize {
+    let Some(tracing) = TRACING.get() else {
+        return -2;
+    };
+    // SAFETY: the callback executes within the step owning the tracing borrow.
+    let tracing = unsafe { &mut *tracing };
+    let bytes = if size == 0 {
+        &mut []
+    } else {
+        // SAFETY: pread's caller supplies a writable buffer of size bytes.
+        unsafe { std::slice::from_raw_parts_mut(bytes, size) }
+    };
+    match tracing.read_file(fd, offset, bytes) {
+        None => -2,
+        Some(Ok(count)) => count as isize,
+        Some(Err(_)) => -1,
+    }
 }
 
 #[unsafe(no_mangle)]

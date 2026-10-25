@@ -55,6 +55,7 @@ int hitode_connect( int fd, const struct sockaddr *addr, socklen_t len );
 int hitode_pipe( int fds[2] );
 int hitode_close( int fd );
 ssize_t hitode_read( int fd, void *buf, size_t size );
+ssize_t hitode_pread( int fd, void *buf, size_t size, off_t offset );
 ssize_t hitode_write( int fd, const void *buf, size_t size );
 ssize_t hitode_readv( int fd, const struct iovec *iov, int count );
 ssize_t hitode_writev( int fd, const struct iovec *iov, int count );
@@ -117,6 +118,7 @@ int hitode_NSGetExecutablePath( char *buf, uint32_t *size );
 #define pipe(...) hitode_pipe(__VA_ARGS__)
 #define close(...) hitode_close(__VA_ARGS__)
 #define read hitode_read
+#define pread hitode_pread
 #define write hitode_write
 #define readv(...) hitode_readv(__VA_ARGS__)
 #define writev(...) hitode_writev(__VA_ARGS__)

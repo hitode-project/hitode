@@ -200,6 +200,10 @@ font files, family substitutions and smoothing, frame and time limits, and audio
 control snapshots retain `running` until execution stops. CPU, host and scheduling profiles use
 the same writers as the built-in stack. Ctrl acceleration uses the shared live key policy for
 eligible delays and stays disabled once a child process has been created.
+`--cdrom` uses the shared ISO9660/Joliet reader. The program directory takes the first
+unmounted letter from D: onward. `--install-dir` redirects `C:\Program Files` to the
+selected host directory without replacing the prefix's own directory. Children inherit
+both mappings; removing settings on the next run restores the prefix namespace.
 
 ## Cargo features
 

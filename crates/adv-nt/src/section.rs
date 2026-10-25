@@ -422,36 +422,53 @@ fn map_data(
     let rounded = u32::try_from(u64::from(size).next_multiple_of(u64::from(PAGE)))
         .map_err(|_| status::INVALID_PARAMETER)?;
     let base = memory::reserve_section(env, address, rounded, kind, low, high)?;
-    let base = match protection & 0xff {
-        PAGE_READONLY | PAGE_READWRITE => {
-            // SAFETY: the server's descriptor stays open while fd lives.
-            let file = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd.fd) };
-            let memory = env.ext.get_or_default::<Memory>();
-            memory::map_shared_view_at(
-                env.cpu,
-                &mut env.sys.vm,
-                memory,
-                file,
-                offset,
-                protection,
-                (base, size),
-            )?
-        }
-        _ => {
-            let bytes = read_file(fd.fd)
-                .map_err(|error| Error::Unsupported(format!("section file: {error}")))?;
-            let start = (offset as usize).min(bytes.len());
-            let end = (start + size as usize).min(bytes.len());
-            let memory = env.ext.get_or_default::<Memory>();
-            memory::map_view(
-                env.cpu,
-                &mut env.sys.vm,
-                memory,
-                &bytes[start..end],
-                size,
-                protection,
-                base,
-            )?
+    let source = crate::file::volume::mounts(env)
+        .reader(fd.fd)
+        .transpose()
+        .map_err(|_| status::NO_MEMORY)?;
+    let base = if let Some(source) = source {
+        let memory = env.ext.get_or_default::<Memory>();
+        memory::map_source_view(
+            env.cpu,
+            &mut env.sys.vm,
+            memory,
+            &*source,
+            offset,
+            protection,
+            (base, size),
+        )?
+    } else {
+        match protection & 0xff {
+            PAGE_READONLY | PAGE_READWRITE => {
+                // SAFETY: the server's descriptor stays open while fd lives.
+                let file = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd.fd) };
+                let memory = env.ext.get_or_default::<Memory>();
+                memory::map_shared_view_at(
+                    env.cpu,
+                    &mut env.sys.vm,
+                    memory,
+                    file,
+                    offset,
+                    protection,
+                    (base, size),
+                )?
+            }
+            _ => {
+                let bytes = crate::file::volume::read_all(&crate::file::volume::mounts(env), fd.fd)
+                    .map_err(|error| Error::Unsupported(format!("section file: {error}")))?;
+                let start = (offset as usize).min(bytes.len());
+                let end = (start + size as usize).min(bytes.len());
+                let memory = env.ext.get_or_default::<Memory>();
+                memory::map_view(
+                    env.cpu,
+                    &mut env.sys.vm,
+                    memory,
+                    &bytes[start..end],
+                    size,
+                    protection,
+                    base,
+                )?
+            }
         }
     };
     drop(fd);
@@ -557,8 +574,8 @@ pub fn map_image(env: &mut Env<'_>, mapping: u32) -> Result<View, Error> {
     let info = ImageInfo::parse(&data);
 
     let fd = server::handle_fd(env, mapping)?;
-    let file =
-        read_file(fd.fd).map_err(|error| Error::Unsupported(format!("image file: {error}")))?;
+    let file = crate::file::volume::read_all(&crate::file::volume::mounts(env), fd.fd)
+        .map_err(|error| Error::Unsupported(format!("image file: {error}")))?;
     let path = file_path(fd.fd);
     drop(fd);
     let mut pe = Pe::parse(&file).map_err(|_| status::INVALID_IMAGE_FORMAT)?;
@@ -631,17 +648,6 @@ pub(crate) fn file_path(fd: std::os::fd::RawFd) -> Option<std::path::PathBuf> {
     {
         std::fs::read_link(format!("/proc/self/fd/{fd}")).ok()
     }
-}
-
-fn read_file(fd: std::os::fd::RawFd) -> std::io::Result<Vec<u8>> {
-    use std::os::fd::FromRawFd;
-    // SAFETY: a descriptor the server gave the process, open for this call;
-    // ManuallyDrop leaves it open.
-    let file = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) });
-    let size = file.metadata()?.len();
-    let mut bytes = vec![0u8; size as usize];
-    std::os::unix::fs::FileExt::read_exact_at(&*file, &mut bytes, 0)?;
-    Ok(bytes)
 }
 
 /// NtCreateSectionEx ignores extended parameters in Wine 11.0.

@@ -28,6 +28,7 @@ const FILE_PIPE_LOCAL_INFORMATION: u32 = 24;
 const FILE_NETWORK_OPEN_INFORMATION: u32 = 34;
 const FILE_ATTRIBUTE_TAG_INFORMATION: u32 = 35;
 const FILE_ID_INFORMATION: u32 = 59;
+const FILE_STAT_INFORMATION: u32 = 68;
 const FILE_DISPOSITION_INFORMATION_EX: u32 = 64;
 
 static START_UMASK: std::sync::LazyLock<libc::mode_t> = std::sync::LazyLock::new(|| {
@@ -105,6 +106,7 @@ fn query_in(
         FILE_EA_INFORMATION | FILE_ALIGNMENT_INFORMATION => 4,
         FILE_NAME_INFORMATION => 8,
         FILE_ALL_INFORMATION => 104,
+        FILE_STAT_INFORMATION => 72,
         FILE_PIPE_INFORMATION => 8,
         FILE_PIPE_LOCAL_INFORMATION => 40,
         FILE_NETWORK_OPEN_INFORMATION => 56,
@@ -162,7 +164,12 @@ fn query_in(
         if class == FILE_BASIC_INFORMATION && !metadata.is_file() && !metadata.is_dir() {
             return Err(status::INVALID_INFO_CLASS.into());
         }
-        let mut basic = basic_information(std::path::Path::new(""), &metadata, &metadata);
+        let mounts = volume::mounts(env);
+        let optical = mounts.metadata(&metadata);
+        let mut basic = optical.as_ref().map_or_else(
+            || basic_information(std::path::Path::new(""), &metadata, &metadata),
+            |entry| entry.basic(),
+        );
         let mut attributes =
             u32::from_le_bytes(basic[32..36].try_into().unwrap()) | dos_attributes(fd.fd);
         let mut reparse_tag = 0;
@@ -186,7 +193,12 @@ fn query_in(
         basic[32..36].copy_from_slice(&attributes.to_le_bytes());
         let mut standard = [0; 24];
         if !metadata.is_dir() {
-            standard[..8].copy_from_slice(&(metadata.blocks() * 512).to_le_bytes());
+            standard[..8].copy_from_slice(
+                &optical
+                    .as_ref()
+                    .map_or(metadata.blocks() * 512, |entry| entry.allocated)
+                    .to_le_bytes(),
+            );
             standard[8..16].copy_from_slice(&metadata.size().to_le_bytes());
         }
         let links = if metadata.is_dir() {
@@ -221,9 +233,24 @@ fn query_in(
                 bytes[..4].copy_from_slice(&basic[32..36]);
                 bytes[4..8].copy_from_slice(&reparse_tag.to_le_bytes());
             }
+            FILE_STAT_INFORMATION => {
+                bytes[..8].copy_from_slice(&metadata.ino().to_le_bytes());
+                bytes[8..40].copy_from_slice(&basic[..32]);
+                bytes[40..56].copy_from_slice(&standard[..16]);
+                bytes[56..60].copy_from_slice(&basic[32..36]);
+                bytes[60..64].copy_from_slice(&reparse_tag.to_le_bytes());
+                bytes[64..68].copy_from_slice(&links.to_le_bytes());
+                bytes[68..72].copy_from_slice(&0x1f01ffu32.to_le_bytes());
+            }
             FILE_ID_INFORMATION => {
                 bytes.fill(0);
-                bytes[..8].copy_from_slice(&volume_serial(env)?.to_le_bytes());
+                bytes[..8].copy_from_slice(
+                    &mounts
+                        .info(fd.fd)
+                        .map(|info| u64::from(info.serial))
+                        .map_or_else(|| volume_serial(env), Ok)?
+                        .to_le_bytes(),
+                );
                 bytes[8..16].copy_from_slice(&metadata.ino().to_le_bytes());
             }
             _ => unreachable!(),
@@ -381,6 +408,12 @@ fn set_in(
     if length < size {
         return Err(INVALID_PARAMETER_3.into());
     }
+    if !matches!(class, FILE_POSITION_INFORMATION | 30) {
+        let fd = server::handle_fd(env, handle)?;
+        if volume::mounts(env).info(fd.fd).is_some() {
+            return Err(volume::WRITE_PROTECTED.into());
+        }
+    }
     match class {
         30 => {
             let mut request = crate::protocol::SetCompletionInfoRequest {
@@ -494,7 +527,7 @@ fn set_in(
                 .collect();
             let host = if rootdir != 0 {
                 let root = unix_name(env, rootdir)?;
-                let nt = path::nt_name(&env.ext.get::<Files>().dosdevices, &root);
+                let nt = super::nt_name(env, &root);
                 let full: Vec<_> = (nt + "\\" + &String::from_utf16_lossy(&units))
                     .encode_utf16()
                     .collect();
@@ -528,7 +561,13 @@ fn set_in(
 }
 
 fn lookup_rename(env: &mut Env<'_>, name: &[u16]) -> Result<PathBuf, Error> {
-    match super::lookup_name(env, name)? {
+    let lookup = super::lookup_name(env, name)?;
+    if let Lookup::Found(host) | Lookup::Missing(host) = &lookup
+        && volume::mounts(env).read_only(host)
+    {
+        return Err(volume::WRITE_PROTECTED.into());
+    }
+    match lookup {
         Lookup::Found(host) | Lookup::Missing(host) => Ok(host),
         Lookup::Device => Err(Error::Unsupported("renaming a device".into())),
     }

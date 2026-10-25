@@ -90,6 +90,12 @@ pub fn query(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         }
         let directory = crate::section::file_path(fd.fd);
         drop(fd);
+        let mounts = crate::file::volume::mounts(env);
+        if let Some(directory) = &directory {
+            mounts
+                .prepare_directory(directory)
+                .map_err(|_| status::OBJECT_PATH_NOT_FOUND)?;
+        }
         let mask = match mask {
             0 => None,
             mask => Some(read_unicode_string(env, mask)?).filter(|mask| !mask.is_empty()),
@@ -142,10 +148,19 @@ pub fn query(env: &mut Env<'_>, args: &[u32]) -> Outcome {
             let shown = name.len().min(room);
             bytes.resize((start + fixed) as usize, 0);
             let entry = &mut bytes[start as usize..];
-            let basic = basic_information(&path, &link, &metadata);
+            let optical = mounts.metadata(&metadata);
+            let basic = optical.as_ref().map_or_else(
+                || basic_information(&path, &link, &metadata),
+                |entry| entry.basic(),
+            );
             entry[8..40].copy_from_slice(&basic[..32]);
             entry[40..48].copy_from_slice(&metadata.size().to_le_bytes());
-            entry[48..56].copy_from_slice(&(metadata.blocks() * 512).to_le_bytes());
+            entry[48..56].copy_from_slice(
+                &optical
+                    .as_ref()
+                    .map_or(metadata.blocks() * 512, |entry| entry.allocated)
+                    .to_le_bytes(),
+            );
             entry[56..60].copy_from_slice(&basic[32..36]);
             entry[60..64].copy_from_slice(&(name.len() as u32).to_le_bytes());
             if class == 63 {

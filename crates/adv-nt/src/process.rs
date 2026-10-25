@@ -288,19 +288,21 @@ fn load_main_image(env: &mut Env<'_>, image: &str) -> Result<View, Error> {
 /// The main thread's stack, as Wine's `virtual_alloc_thread_stack` sizes it:
 /// the image's reserve, and no less than the default. The thread exists
 /// before the image is mapped, so its file is read through the prefix.
-fn main_stack_size(prefix: &Path, image: &str) -> u32 {
-    let reserve = image
-        .split_once(':')
-        .and_then(|(drive, path)| {
-            let device = format!("dosdevices/{}:", drive.to_ascii_lowercase());
-            std::fs::read(
-                prefix
-                    .join(device)
-                    .join(path.trim_start_matches('\\').replace('\\', "/")),
-            )
+fn main_stack_size(prefix: &Path, image: &str, mounts: Option<&file::volume::Mounts>) -> u32 {
+    use std::os::fd::AsRawFd;
+    let devices = prefix.join("dosdevices");
+    let name: Vec<u16> = format!(r"\??\{image}").encode_utf16().collect();
+    let mounts = mounts.cloned().unwrap_or_default();
+    let lookup = mounts
+        .lookup(&devices, &name)
+        .unwrap_or_else(|| crate::path::lookup(&devices, &name));
+    let reserve = match lookup {
+        Ok(crate::path::Lookup::Found(host)) => std::fs::File::open(host)
             .ok()
-        })
-        .and_then(|bytes| Pe::parse(&bytes).ok().map(|pe| pe.stack_reserve));
+            .and_then(|file| file::volume::read_all(&mounts, file.as_raw_fd()).ok())
+            .and_then(|bytes| Pe::parse(&bytes).ok().map(|pe| pe.stack_reserve)),
+        _ => None,
+    };
     reserve.unwrap_or(0).max(DEFAULT_STACK)
 }
 
@@ -425,7 +427,11 @@ pub fn start_connected<B: Backend>(
         ldr_initialize_thunk,
         syscall,
         registered.tid,
-        main_stack_size(prefix, startup.image),
+        main_stack_size(
+            prefix,
+            startup.image,
+            machine.ext.try_get::<file::volume::Mounts>(),
+        ),
     )?;
     let teb = machine.sys.contexts[main as usize].teb;
     machine.ext.insert(memory);

@@ -39,6 +39,7 @@ fn unchanged_input_does_not_resume_server() {
     let mut shared = Shared {
         driver: Rc::new(RefCell::new(Driver {
             input: server.input_generation(),
+            mounts: Default::default(),
             server,
             clock,
             parked: BTreeMap::new(),

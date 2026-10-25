@@ -560,7 +560,7 @@ Device decoding follows [device.md](device.md).
 
 ### WINE-SES-1 Shared prefix
 
-**Rule**: Every game MUST run on the player's one prefix, kept between runs, with drive C: inside it or where the embedder places it. Each start MUST relink system32 and the template's module copies to the Wine installation. Drive D: MUST be the program's directory, which the guest writes in place.
+**Rule**: Every game MUST run on the player's one prefix, kept between runs, with drive C: inside it or where the embedder places it. Each start MUST relink system32 and the template's module copies to the Wine installation. The program directory MUST use D: or the first unmounted letter after it, with writes in place.
 Process startup MUST register the prefix's drive letters in the server namespace.
 **Verification**: Test
 
@@ -599,6 +599,11 @@ Process startup MUST register the prefix's drive letters in the server namespace
 ### WINE-SES-8 Host font choices
 
 **Rule**: Explicit host font choices MAY override installed families. Font files, substitutions, and smoothing MUST apply before rendering. Substitutions and smoothing MUST NOT persist after the session.
+**Verification**: Test
+
+### WINE-SES-9 Mounted file ownership
+
+**Rule**: Wine sessions MUST apply ISO mounts and installation-directory mappings before process startup. Files, directories, sections, children, and volume queries MUST retain the same mounted backing. Reused prefixes MUST NOT retain removed host mappings.
 **Verification**: Test
 
 ## Conformance

@@ -22,17 +22,17 @@ impl Fonts {
     pub fn prepare(
         config: &Config<'_>,
         drive: &Path,
-        options: &FontOptions,
+        options: &SessionOptions,
     ) -> Result<Self, String> {
         if config.fonts.is_empty()
-            && options.files.is_empty()
-            && options.overrides.families.is_empty()
-            && options.overrides.antialiased.is_none()
+            && options.font_files.is_empty()
+            && options.fonts.families.is_empty()
+            && options.fonts.antialiased.is_none()
         {
             return Ok(Self {
                 enabled: false,
                 replacements: Vec::new(),
-                overrides: options.overrides.clone(),
+                overrides: options.fonts.clone(),
                 saved: Vec::new(),
             });
         }
@@ -50,7 +50,7 @@ impl Fonts {
         };
         #[cfg(target_os = "ios")]
         let mut text = Text::with_font_directories(&directories);
-        for bytes in crate::font::read_resources(&options.files)? {
+        for bytes in crate::font::read_resources(&options.font_files)? {
             text.add_resource(&bytes).map_err(|e| e.to_string())?;
         }
         let FontReplacements { files, families } =
@@ -67,7 +67,7 @@ impl Fonts {
                 std::fs::remove_file(entry.path()).map_err(|e| e.to_string())?;
             }
         }
-        let files: Vec<_> = files.iter().chain(&options.files).collect();
+        let files: Vec<_> = files.iter().chain(&options.font_files).collect();
         for (index, file) in files.iter().enumerate() {
             let extension = file.extension().unwrap_or_default().to_string_lossy();
             link(
@@ -78,7 +78,7 @@ impl Fonts {
         Ok(Self {
             enabled: true,
             replacements: families,
-            overrides: options.overrides.clone(),
+            overrides: options.fonts.clone(),
             saved: Vec::new(),
         })
     }

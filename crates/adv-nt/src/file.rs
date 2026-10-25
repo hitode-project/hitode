@@ -3,6 +3,7 @@
 
 mod information;
 mod io;
+pub mod volume;
 
 pub use information::{query, set};
 pub use io::{
@@ -64,6 +65,9 @@ pub fn write(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         Err(Error::Status(status::BAD_DEVICE_TYPE)) => return io::server_write(env, args),
         Err(error) => return status::finish(Err(error)),
     };
+    if volume::mounts(env).info(fd.fd).is_some() {
+        return Outcome::Return(volume::WRITE_PROTECTED);
+    }
     let result = (|| {
         let asynchronous = fd.options & FILE_SYNCHRONOUS_IO == 0;
         let mut position = None;
@@ -245,6 +249,9 @@ pub fn open_path(
         Lookup::Missing(_) => return Err(status::OBJECT_NAME_NOT_FOUND.into()),
         Lookup::Device => return Err(Error::Unsupported("opening a device".into())),
     };
+    if volume::mounts(env).read_only(&host) && access & 0x5001_0156 != 0 {
+        return Err(volume::WRITE_PROTECTED.into());
+    }
     let mut request = CreateFileRequest {
         access,
         sharing,
@@ -301,6 +308,14 @@ impl Open {
             return Err(Error::Unsupported("opening a file by its id".into()));
         }
         let lookup = lookup_attributes(env, &attributes)?;
+        if let Lookup::Found(host) | Lookup::Missing(host) = &lookup
+            && volume::mounts(env).read_only(host)
+            && (self.access & 0x5001_0156 != 0
+                || self.disposition != FILE_OPEN
+                || self.options & 0x1000 != 0)
+        {
+            return Err(volume::WRITE_PROTECTED.into());
+        }
         let (host, created) = match lookup {
             Lookup::Found(host) => (host, false),
             Lookup::Missing(_) if matches!(self.disposition, FILE_OPEN | FILE_OVERWRITE) => {
@@ -337,11 +352,7 @@ impl Open {
                 security: attributes.security,
                 root: 0,
                 attributes: attributes.attributes,
-                name: Some(
-                    path::nt_name(&env.ext.get::<Files>().dosdevices, &host)
-                        .encode_utf16()
-                        .collect(),
-                ),
+                name: Some(nt_name(env, &host).encode_utf16().collect()),
             }
         } else {
             attributes
@@ -371,7 +382,7 @@ const FILE_CASE_PRESERVED_NAMES: u32 = 0x02;
 const FILE_PERSISTENT_ACLS: u32 = 0x08;
 /// Every volume's serial number, fixed as the machine's identity is.
 const VOLUME_SERIAL: u32 = 0x4854_4f44;
-const FILE_DEVICE_DISK: u32 = 0x07;
+const FILE_DEVICE_DISK_FILE_SYSTEM: u32 = 0x08;
 const FILE_DEVICE_NAMED_PIPE: u32 = 0x11;
 const FILE_DEVICE_NULL: u32 = 0x15;
 const FILE_DEVICE_UNKNOWN: u32 = 0x22;
@@ -392,6 +403,17 @@ fn query_volume_in(
     length: u32,
     class: u32,
 ) -> Result<(), Error> {
+    let mounts = volume::mounts(env);
+    if mounts.roots().next().is_some() {
+        let fd = server::handle_fd(env, handle)?;
+        if let Some(info) = mounts.info(fd.fd) {
+            let (bytes, result) = volume::information(&info, class, length)?;
+            write_bytes(env, buffer, &bytes)?;
+            write_u32(env, io, result)?;
+            write_u32(env, io + 4, bytes.len() as u32)?;
+            return status::check(result);
+        }
+    }
     let bytes = match class {
         // A session has no mount manager, so every drive is the volume one
         // reports for a directory: NTFS, without a label.
@@ -420,6 +442,27 @@ fn query_volume_in(
                 bytes.extend_from_slice(&word.to_le_bytes());
             }
             bytes.extend_from_slice(name);
+            bytes
+        }
+        3 | 7 => {
+            let size = if class == 3 { 24 } else { 32 };
+            if length < size {
+                return Err(status::INFO_LENGTH_MISMATCH.into());
+            }
+            server::handle_fd(env, handle)?;
+            // The virtual disk profile is independent of host storage: 64 GiB
+            // available out of 256 GiB, with 4 KiB allocation units.
+            let total = (256u64 << 30) / 4096;
+            let available = (64u64 << 30) / 4096;
+            let mut bytes = vec![0; size as usize];
+            bytes[..8].copy_from_slice(&total.to_le_bytes());
+            bytes[8..16].copy_from_slice(&available.to_le_bytes());
+            if class == 7 {
+                bytes[16..24].copy_from_slice(&available.to_le_bytes());
+            }
+            let end = bytes.len();
+            bytes[end - 8..end - 4].copy_from_slice(&8u32.to_le_bytes());
+            bytes[end - 4..].copy_from_slice(&512u32.to_le_bytes());
             bytes
         }
         FILE_FS_DEVICE_INFORMATION => {
@@ -461,7 +504,7 @@ fn device_type(fd: std::os::fd::RawFd) -> u32 {
         libc::S_IFCHR if stat.st_rdev == libc::makedev(3, 2) => FILE_DEVICE_NULL,
         libc::S_IFCHR => FILE_DEVICE_UNKNOWN,
         libc::S_IFIFO | libc::S_IFSOCK => FILE_DEVICE_NAMED_PIPE,
-        _ => FILE_DEVICE_DISK,
+        _ => FILE_DEVICE_DISK_FILE_SYSTEM,
     }
 }
 
@@ -481,7 +524,10 @@ pub fn query_attributes(env: &mut Env<'_>, args: &[u32]) -> Outcome {
     };
     status::finish((|| {
         let (host, link, metadata) = named_file(env, attributes)?;
-        let bytes = basic_information(&host, &link, &metadata);
+        let bytes = volume::mounts(env).metadata(&metadata).map_or_else(
+            || basic_information(&host, &link, &metadata),
+            |entry| entry.basic(),
+        );
         write_bytes(env, info, &bytes)?;
         Ok(())
     })())
@@ -496,11 +542,19 @@ pub fn query_full_attributes(env: &mut Env<'_>, args: &[u32]) -> Outcome {
     status::finish((|| {
         use std::os::unix::fs::MetadataExt;
         let (host, link, metadata) = named_file(env, attributes)?;
-        let basic = basic_information(&host, &link, &metadata);
+        let basic = volume::mounts(env).metadata(&metadata).map_or_else(
+            || basic_information(&host, &link, &metadata),
+            |entry| entry.basic(),
+        );
         let mut bytes = [0u8; 56];
         bytes[..32].copy_from_slice(&basic[..32]);
-        bytes[32..40].copy_from_slice(&(metadata.blocks() * 512).to_le_bytes());
-        bytes[40..48].copy_from_slice(&metadata.size().to_le_bytes());
+        if let Some(entry) = volume::mounts(env).metadata(&metadata) {
+            bytes[32..40].copy_from_slice(&entry.size.to_le_bytes());
+            bytes[40..48].copy_from_slice(&entry.allocated.to_le_bytes());
+        } else {
+            bytes[32..40].copy_from_slice(&(metadata.blocks() * 512).to_le_bytes());
+            bytes[40..48].copy_from_slice(&metadata.size().to_le_bytes());
+        }
         bytes[48..52].copy_from_slice(&basic[32..36]);
         write_bytes(env, info, &bytes)?;
         Ok(())
@@ -607,6 +661,16 @@ pub fn control(env: &mut Env<'_>, args: &[u32]) -> Outcome {
     if io == 0 {
         return Outcome::Return(status::INVALID_PARAMETER);
     }
+    let mounts = volume::mounts(env);
+    if code == FSCTL_SET_SPARSE && mounts.roots().next().is_some() {
+        match server::handle_fd(env, handle) {
+            Ok(fd) if mounts.info(fd.fd).is_some() => {
+                return Outcome::Return(volume::WRITE_PROTECTED);
+            }
+            Err(error) => return status::finish(Err(error)),
+            _ => {}
+        }
+    }
     let (status, size) = match code {
         FSCTL_GET_OBJECT_ID if out_size < OBJECT_ID_BUFFER_SIZE => {
             return Outcome::Return(status::BUFFER_TOO_SMALL);
@@ -645,12 +709,22 @@ fn object_id(env: &mut Env<'_>, handle: u32, out: u32) -> Result<(), Error> {
     Ok(write_bytes(env, out, &bytes)?)
 }
 
+/// Reverse host redirects before naming paths through the drive links.
+pub(crate) fn nt_name(env: &Env<'_>, host: &std::path::Path) -> String {
+    volume::mounts(env)
+        .nt_name(host)
+        .unwrap_or_else(|| path::nt_name(&env.ext.get::<Files>().dosdevices, host))
+}
+
 /// Resolve DOS device links held by the server when no host drive resolves the name.
 pub(crate) fn lookup_name(env: &mut Env<'_>, name: &[u16]) -> Result<Lookup, Error> {
     let mut name = name.to_vec();
     // Wine's object namespace limits symbolic-link recursion to 32 levels.
     for _ in 0..=32 {
-        let result = path::lookup(&env.ext.get::<Files>().dosdevices, &name);
+        let devices = &env.ext.get::<Files>().dosdevices;
+        let result = volume::mounts(env)
+            .lookup(devices, &name)
+            .unwrap_or_else(|| path::lookup(devices, &name));
         match result {
             Ok(Lookup::Device) | Err(status::OBJECT_PATH_NOT_FOUND) => {}
             result => return Ok(result?),
@@ -721,10 +795,7 @@ fn lookup_attributes(env: &mut Env<'_>, attributes: &Attributes) -> Result<Looku
     }
     path::validate_components(&String::from_utf16_lossy(name), false)?;
     let root = information::unix_name(env, attributes.root)?;
-    let dosdevices = &env.ext.get::<Files>().dosdevices;
-    let mut full = path::nt_name(dosdevices, &root)
-        .encode_utf16()
-        .collect::<Vec<_>>();
+    let mut full = nt_name(env, &root).encode_utf16().collect::<Vec<_>>();
     full.push(b'\\' as u16);
     full.extend_from_slice(name);
     lookup_name(env, &full)
@@ -740,11 +811,7 @@ pub(crate) fn open_registry_file(env: &mut Env<'_>, address: u32) -> Result<u32,
     };
     if attributes.root != 0 {
         attributes.root = 0;
-        attributes.name = Some(
-            path::nt_name(&env.ext.get::<Files>().dosdevices, &host)
-                .encode_utf16()
-                .collect(),
-        );
+        attributes.name = Some(nt_name(env, &host).encode_utf16().collect());
     }
     let mut request = CreateFileRequest {
         access: 0x8010_0000, // GENERIC_READ | SYNCHRONIZE
@@ -770,6 +837,9 @@ pub fn delete(env: &mut Env<'_>, args: &[u32]) -> Outcome {
             Lookup::Missing(_) => return Err(status::OBJECT_NAME_NOT_FOUND.into()),
             Lookup::Device => return Err(status::BAD_DEVICE_TYPE.into()),
         };
+        if volume::mounts(env).read_only(&host) {
+            return Err(volume::WRITE_PROTECTED.into());
+        }
         let mut request = CreateFileRequest {
             access: 0xc001_0000, // GENERIC_READ | GENERIC_WRITE | DELETE
             sharing: 7,
@@ -779,11 +849,7 @@ pub fn delete(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         };
         let attributes = Attributes {
             root: 0,
-            name: Some(
-                path::nt_name(&env.ext.get::<Files>().dosdevices, &host)
-                    .encode_utf16()
-                    .collect(),
-            ),
+            name: Some(nt_name(env, &host).encode_utf16().collect()),
             ..attributes
         };
         let (reply, _) = server::request(
@@ -838,7 +904,9 @@ pub(crate) fn mount_drives(env: &mut Env<'_>) -> Result<(), Error> {
             name: Some(format!(r"\??\{}:", letter as char).encode_utf16().collect()),
             security: Vec::new(),
         };
-        let target: Vec<u8> = format!(r"\Device\HarddiskVolume{}", index + 1)
+        let target: Vec<u8> = volume::mounts(env)
+            .device_name(letter as char)
+            .unwrap_or_else(|| format!(r"\Device\HarddiskVolume{}", index + 1))
             .encode_utf16()
             .flat_map(u16::to_le_bytes)
             .collect();

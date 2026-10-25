@@ -80,14 +80,32 @@ pub fn read(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         let mut total = 0;
         let count = loop {
             // SAFETY: a live server descriptor and a writable buffer of length bytes.
-            let count = unsafe {
-                match position {
-                    Some(off) => libc::pread(fd.fd, bytes.as_mut_ptr().cast(), bytes.len(), off),
-                    None => libc::read(
-                        fd.fd,
-                        bytes[total..].as_mut_ptr().cast(),
-                        bytes.len() - total,
-                    ),
+            let count = if let Some(reader) = volume::mounts(env).reader(fd.fd) {
+                let reader = reader.map_err(|_| 0xc000_0185u32)?;
+                let at =
+                    position.unwrap_or_else(|| unsafe { libc::lseek(fd.fd, 0, libc::SEEK_CUR) });
+                let at_unsigned = u64::try_from(at).map_err(|_| status::INVALID_PARAMETER)?;
+                let count = reader
+                    .read_at(at_unsigned, &mut bytes[total..])
+                    .map_err(|_| 0xc000_0185u32)?;
+                if position.is_none() {
+                    unsafe {
+                        libc::lseek(fd.fd, at + count as i64, libc::SEEK_SET);
+                    }
+                }
+                count as isize
+            } else {
+                unsafe {
+                    match position {
+                        Some(off) => {
+                            libc::pread(fd.fd, bytes.as_mut_ptr().cast(), bytes.len(), off)
+                        }
+                        None => libc::read(
+                            fd.fd,
+                            bytes[total..].as_mut_ptr().cast(),
+                            bytes.len() - total,
+                        ),
+                    }
                 }
             };
             if count >= 0 {
@@ -628,6 +646,11 @@ fn async_data(handle: u32, event: u32, apc: u32, context: u32, io: u32) -> [u8; 
 pub fn device_control(env: &mut Env<'_>, args: &[u32]) -> Outcome {
     if args[0] == u32::MAX {
         return Outcome::Return(status::INVALID_HANDLE);
+    }
+    if let Ok(fd) = server::handle_fd(env, args[0])
+        && volume::mounts(env).info(fd.fd).is_some()
+    {
+        return Outcome::Return(status::NOT_SUPPORTED);
     }
     if matches!(args[5] >> 16, 2 | 4 | 7 | 0x2d | 0x33) {
         let result = (|| {

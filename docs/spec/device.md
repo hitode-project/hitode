@@ -287,7 +287,7 @@ Unmatched libraries MUST execute their guest implementations.
 ### DEV-DISC-5 Bounded image access
 
 **Rule**: Optical access MUST reuse the shared ISO parser without unpacking images or loading an entire image into memory. Section mappings MUST read pages on demand.
-**Verification**: Review — the synthetic-image tests check data and ownership but do not measure whole-image allocation or extraction behavior.
+**Verification**: Test
 
 ### DEV-DISC-6 Volume identity
 

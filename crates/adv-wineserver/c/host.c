@@ -551,6 +551,16 @@ void hitode_channel_counts( uint64_t *queued, uint64_t *system )
     *system = system_io;
 }
 
+/* Virtual volume files retain normal server handles; their data stays in the
+ * assembly's immutable backing instead of the sparse identity file. */
+extern ssize_t hitode_host_file( int fd, uint64_t offset, void *buf, size_t size );
+ssize_t hitode_pread( int fd, void *buf, size_t size, off_t offset )
+{
+    ssize_t result = hitode_host_file( fd, offset, buf, size );
+    if (result == -1) errno = EIO;
+    return result >= -1 ? result : pread( fd, buf, size, offset );
+}
+
 ssize_t hitode_read( int fd, void *buf, size_t size )
 {
     struct endpoint *end = endpoint( fd );

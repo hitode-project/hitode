@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use adv_runtime::wine::session::{Config, FontOptions, Session, Stop};
+use adv_runtime::wine::session::{Config, Session, SessionOptions, Stop};
 use adv_runtime::{DebugTarget, DialogEvent, DialogSet, Engine};
 use adv_sync::WakeEvent;
 use adv_sync::background::LocalSender;
@@ -66,14 +66,16 @@ fn start(
     };
     let gpu_wake = wake.clone();
     let codec_kernels = options.codec_kernels;
-    let fonts = FontOptions {
-        overrides: adv_runtime::FontOverrides {
+    let fonts = SessionOptions {
+        fonts: adv_runtime::FontOverrides {
             families: options.font_families.clone(),
             antialiased: options.font_smoothing,
         },
-        files: options.font_files.clone(),
+        font_files: options.font_files.clone(),
+        cdroms: options.cdroms.clone(),
+        install_dir: options.install_dir.clone(),
     };
-    Session::start_with_fonts(&config, wake.clone(), &fonts, move |machine| {
+    Session::start_with_options(&config, wake.clone(), &fonts, move |machine| {
         Session::install_codec_kernels(machine, codec_kernels);
         machine.cpu.set_background_sender(host.background)?;
         options.configure_machine(machine, &wake, keys)?;

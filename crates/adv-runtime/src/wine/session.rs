@@ -4,10 +4,11 @@
 //! The prefix keeps Wine's state between runs. A new one starts from the
 //! installation's prefix template, what `wineboot --init` makes of an empty
 //! prefix. Its system32 links to the Wine installation's modules, as a prefix
-//! holds them, and drive D: is the game's directory. As Wine runs wineboot
-//! whenever its server starts, a session first runs it for the keys that
-//! last until the server stops.
+//! holds them. The program directory uses D: or the next letter free of optical
+//! mounts. As Wine runs wineboot whenever its server starts, a session first
+//! runs it for the keys that last until the server stops.
 mod debug;
+mod files;
 mod fonts;
 
 use adv_drv::user::project;
@@ -54,11 +55,13 @@ pub struct Config<'a> {
     pub stdout: Option<RawFd>,
 }
 
-/// User font choices, independent of the shell and Wine installation paths.
+/// User settings applied before process startup, independent of the shell.
 #[derive(Default)]
-pub struct FontOptions {
-    pub overrides: crate::FontOverrides,
-    pub files: Vec<PathBuf>,
+pub struct SessionOptions {
+    pub fonts: crate::FontOverrides,
+    pub font_files: Vec<PathBuf>,
+    pub cdroms: Vec<(char, PathBuf)>,
+    pub install_dir: Option<PathBuf>,
 }
 
 /// Where a run of the session stopped.
@@ -151,6 +154,7 @@ struct Driver {
     deadline: Option<Instant>,
     guest_deadline: Option<u64>,
     input: u64,
+    mounts: adv_nt::file::volume::Mounts,
     #[cfg(test)]
     resumes: usize,
 }
@@ -167,8 +171,19 @@ struct Trace<'a, 'b> {
     cpu: Option<&'a mut dyn Guest>,
     parked: &'b mut BTreeMap<i32, Machine<Cpu>>,
     signals: &'b mut Vec<(i32, i32, i32)>,
+    mounts: &'b adv_nt::file::volume::Mounts,
 }
 impl adv_wineserver::Tracing for Trace<'_, '_> {
+    fn read_file(
+        &mut self,
+        fd: i32,
+        offset: u64,
+        bytes: &mut [u8],
+    ) -> Option<std::io::Result<usize>> {
+        self.mounts
+            .reader(fd)
+            .map(|reader| reader.and_then(|reader| reader.read_at(offset, bytes)))
+    }
     fn signal(&mut self, pid: i32, tid: i32, sig: i32) -> bool {
         self.signals.push((pid, tid, sig));
         true
@@ -245,6 +260,7 @@ impl Shared {
             generation,
             deadline,
             guest_deadline,
+            mounts,
             input,
             ..
         } = &mut *driver;
@@ -256,6 +272,7 @@ impl Shared {
                 cpu,
                 parked,
                 signals,
+                mounts,
             },
         );
         *input = server.input_generation();
@@ -358,8 +375,6 @@ fn prefix(config: &Config<'_>) -> Result<(PathBuf, PathBuf), String> {
         Some(drive) => link(drive, &prefix.join("dosdevices/c:"))?,
         None => link(Path::new("../drive_c"), &prefix.join("dosdevices/c:"))?,
     }
-    let game = config.exe.parent().ok_or("the program has no directory")?;
-    link(game, &prefix.join("dosdevices/d:"))?;
     for directory in [MODULES, "share/wine/nls"] {
         let entries = std::fs::read_dir(config.dist.join(directory))
             .map_err(|e| format!("{}: {e}", config.dist.join(directory).display()))?;
@@ -595,14 +610,14 @@ impl Session {
         wake: WakeEvent,
         prepare: impl FnOnce(&mut Machine<Cpu>) -> Result<(), String>,
     ) -> Result<Session, String> {
-        Self::start_with_fonts(config, wake, &FontOptions::default(), prepare)
+        Self::start_with_options(config, wake, &SessionOptions::default(), prepare)
     }
 
-    /// Apply explicit fonts before Wine initializes its font renderer.
-    pub fn start_with_fonts(
+    /// Apply host settings before Wine initializes its devices and file namespace.
+    pub fn start_with_options(
         config: &Config<'_>,
         wake: WakeEvent,
-        fonts: &FontOptions,
+        options: &SessionOptions,
         prepare: impl FnOnce(&mut Machine<Cpu>) -> Result<(), String>,
     ) -> Result<Session, String> {
         let exe = std::path::absolute(config.exe).map_err(|e| e.to_string())?;
@@ -620,7 +635,8 @@ impl Session {
         };
         let (ntdll, apisets) = (module("ntdll.dll")?, module("apisetschema.dll")?);
         let (prefix, drive) = prefix(&config)?;
-        let mut fonts = fonts::Fonts::prepare(&config, &drive, fonts)?;
+        let (mounts, game_drive) = files::prepare(&config, options, &prefix)?;
+        let mut fonts = fonts::Fonts::prepare(&config, &drive, options)?;
         let config = Config {
             fonts: "",
             ..config
@@ -664,6 +680,7 @@ impl Session {
                 generation: 0,
                 deadline,
                 guest_deadline,
+                mounts: mounts.clone(),
                 input,
                 #[cfg(test)]
                 resumes: 0,
@@ -675,6 +692,7 @@ impl Session {
         // what `--init` installs, and no services run.
         let audio = adv_device::AudioControl::new(true);
         let mut boot = new_machine(&config, &prefix, clock.clone(), &wake, &audio)?;
+        boot.ext.insert(mounts.clone());
         let command_line = format!("\"{WINEBOOT}\" --restart");
         let startup = Startup {
             image: WINEBOOT,
@@ -716,11 +734,12 @@ impl Session {
         drop(boot);
 
         let mut machine = new_machine(&config, &prefix, clock, &wake, &audio)?;
+        machine.ext.insert(mounts);
         prepare(&mut machine)?;
         let startup = Startup {
-            image: &format!(r"D:\{name}"), // privacy: allow the guest's drive for the game
+            image: &format!(r"{game_drive}:\{name}"),
             command_line: name,
-            directory: r"D:\", // privacy: allow the guest's drive for the game
+            directory: &format!(r"{game_drive}:\"),
             environment: ENVIRONMENT,
             locale: config.locale,
             debug: config.debug,
@@ -1074,6 +1093,9 @@ impl Session {
             )?;
             adv_drv::codec::install(&mut machine.ext, adv_drv::codec::mode(&self.machine.ext));
             machine.inherit_policy(&self.machine);
+            machine
+                .ext
+                .insert(self.shared.driver.borrow().mounts.clone());
             machine
                 .cpu
                 .set_background_sender(self.machine.cpu.background_sender()?)

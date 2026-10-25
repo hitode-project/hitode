@@ -105,6 +105,10 @@ The personality is Windows 7 SP1. Version APIs and the PEB come from one profile
 Each export is *implemented* (real behavior), *reviewed* (a deliberate, documented failure) or *hidden* (not discoverable). Player runs default to discovery mode, which records a call to a missing stub and returns a failure derived from its signature; strict mode, used for acceptance, stops there. Running with no stub calls does not prove compatibility, so structural warnings are counted separately. The rules are in [docs/spec/personality.md](docs/spec/personality.md), [docs/spec/win32.md](docs/spec/win32.md), [docs/spec/crt.md](docs/spec/crt.md) and [docs/spec/system.md](docs/spec/system.md).
 
 The virtual file system keeps the game's own files apart from its writes, and the registry persists per game. An installer writes into a folder that the launcher manages. Read-only ISO 9660 and Joliet images can be attached as CD drives.
+The Wine assembly adapts the same VFS through `adv-nt`'s read-only volume interface.
+Sparse identity files retain wineserver handle and section ownership; data and lazy
+mapping pages come directly from the shared ISO reader. Installation directories are
+NT path redirects, so the prefix's original Program Files directory remains intact.
 
 API signatures and metadata come from `data/abi/`; `tools/abi/` regenerates them, and `adv-abi` registers each front end from them.
 

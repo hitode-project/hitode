@@ -2,7 +2,7 @@
 //! replacements, with real TrueType metadata and pixels from an authored font.
 #![cfg(any(target_vendor = "apple", target_os = "android"))]
 
-use adv_runtime::wine::session::{Config, FontOptions, Session, Stop};
+use adv_runtime::wine::session::{Config, Session, SessionOptions, Stop};
 use std::{
     path::PathBuf,
     time::{Duration, Instant},
@@ -80,17 +80,17 @@ fn discovered_fonts_and_aliases_survive_prefix_reuse() {
         stdout: Some(std::os::fd::AsRawFd::as_raw_fd(&stdout)),
     };
     let explicit = game.join("choices.txt").exists();
-    let mut fonts = FontOptions::default();
+    let mut fonts = SessionOptions::default();
     if explicit {
-        fonts.files.push(fixtures.join("font-resource.ttf"));
+        fonts.font_files.push(fixtures.join("font-resource.ttf"));
         fonts
-            .overrides
+            .fonts
             .families
             .insert("ADV Host Choice".into(), "ADV Resource Fixture".into());
-        fonts.overrides.antialiased = Some(false);
+        fonts.fonts.antialiased = Some(false);
     }
     let mut session =
-        Session::start_with_fonts(&config, adv_sync::WakeEvent::new().unwrap(), &fonts, |_| {
+        Session::start_with_options(&config, adv_sync::WakeEvent::new().unwrap(), &fonts, |_| {
             Ok(())
         })
         .unwrap();
