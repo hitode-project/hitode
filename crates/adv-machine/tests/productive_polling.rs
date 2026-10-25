@@ -216,3 +216,27 @@ fn new_guest_work_between_observations_runs_before_the_first_idle() {
     assert!(matches!(machine.run(), RunResult::Idle { .. }));
     assert_eq!(machine.cpu.read_u32(DATA).unwrap(), STEPS as u32);
 }
+
+// spec: PROC-CLOCK-5, PROC-CLOCK-7
+#[test]
+fn ctrl_skip_retains_the_full_proof_for_bounded_iteration_work() {
+    let mut machine = quiet_machine();
+    machine.set_time_skip_source(Some(std::sync::Arc::new(|_| true)));
+    machine.cpu.map(DATA, 4096, Prot::RW).unwrap();
+    let mut code = Asm::new(CODE);
+    code.bytes.extend_from_slice(&[0xff, 0x05]); // inc dword [DATA]
+    code.bytes.extend_from_slice(&DATA.to_le_bytes());
+    for name in ["PeekMessage", "timeGetTime", "yield"] {
+        code.call(machine.resolve_import("test", name).unwrap());
+    }
+    code.cmp_mem_imm8(DATA, STEPS as i8).jnz(CODE);
+    let idle = CODE + code.bytes.len() as u32;
+    for name in ["PeekMessage", "timeGetTime", "yield"] {
+        code.call(machine.resolve_import("test", name).unwrap());
+    }
+    code.jmp(idle);
+    machine.cpu.write(CODE, &code.bytes).unwrap();
+    assert!(matches!(machine.run(), RunResult::Idle { .. }));
+    assert_eq!(machine.cpu.read_u32(DATA).unwrap(), STEPS as u32);
+    assert!(machine.ext.get::<Quiet>().polls >= 64);
+}

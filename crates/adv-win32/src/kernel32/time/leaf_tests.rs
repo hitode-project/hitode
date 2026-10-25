@@ -4,7 +4,11 @@ use adv_cpu::{
     JitCpu,
     backend::{Prot, Reg},
 };
-use adv_machine::{Clock, Machine, Resume, WakeReason, layout::PARK_ADDR};
+use adv_machine::{
+    Clock, Machine, Resume, Wait, WakeReason,
+    clock::{ClockPoll, POLL_STREAK},
+    layout::PARK_ADDR,
+};
 
 const DATA: u32 = 0x410000;
 

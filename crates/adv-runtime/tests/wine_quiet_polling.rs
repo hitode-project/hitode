@@ -56,6 +56,19 @@ fn wine_peek_and_time_loop_idles_and_notifications_wake_it() {
     let mut session = Session::start(&config, wake.clone(), |_| Ok(())).unwrap();
     drop(stdout);
     let mut text = String::new();
+    session
+        .machine
+        .set_time_skip_source(Some(std::sync::Arc::new(|_| true)));
+    until(&mut session, &mut output, &mut text, "clock_reads=");
+    session.machine.set_time_skip_source(None);
+    let reads: u32 = text
+        .lines()
+        .find_map(|line| line.strip_prefix("clock_reads="))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(reads < 4096, "clock-only loop spun {reads} times");
+    assert!(session.machine.sys.scheduling.active_time_skip_us >= 50_000);
     until(&mut session, &mut output, &mut text, "deadline=");
     let ready = text
         .lines()

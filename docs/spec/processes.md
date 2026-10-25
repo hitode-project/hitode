@@ -71,6 +71,7 @@ This spec covers `adv-machine`, which schedules guest threads, owns time and dis
 ### PROC-CLOCK-3 Clock polling
 
 **Rule**: A context that only rereads the clock MAY wait for the next millisecond on each read. The streak that proves it MUST exceed bounded per-item loops, such as a 256-key scan read twice.
+The built-in and Wine stacks MUST share clock-poll admission and preserve their clock API results.
 **Verification**: Test
 
 ### PROC-CLOCK-4 Frame spin
@@ -91,6 +92,7 @@ This spec covers `adv-machine`, which schedules guest threads, owns time and dis
 ### PROC-CLOCK-7 Quiet observation rounds
 
 **Rule**: As an alternative to PROC-CLOCK-5, repeated intervals containing only clock reads, empty message peeks and yields MAY wait before 64 repetitions. Every ready context MUST run during the round, with unchanged execution-delivery and object generations. New work or wake-source changes MUST invalidate this proof, preserving clock-tick deadlines and retained wakeups.
+While time skipping is requested, ready polling contexts MUST retain PROC-CLOCK-5's full repeated-interval proof.
 **Verification**: Test
 
 ## Isolation

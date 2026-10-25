@@ -2586,9 +2586,16 @@ impl<B: Backend> Machine<B> {
             }
             // Real time: polling contexts would spin the host. Hand control back so the host
             // can wait (at most 1 ms) like the OS would schedule them.
+            // Requested skipping retains the full proof: bounded iteration work
+            // can repeat quiet APIs while still advancing the game.
             if !self.sys.clock.is_virtual()
                 && self.sys.only_polling()
-                && (self.sys.polling_settled() || self.sys.quiet_polling())
+                && (self.sys.polling_settled()
+                    || (self.sys.quiet_polling()
+                        && !self
+                            .time_skip_source
+                            .as_ref()
+                            .is_some_and(|source| source(self.sys.completed_frames == 0))))
                 && self
                     .sys
                     .wakes

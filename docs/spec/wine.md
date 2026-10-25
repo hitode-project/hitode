@@ -707,6 +707,7 @@ Process startup MUST register the prefix's drive letters in the server namespace
 ### WINE-AUD-11 Remaining Wine exports
 
 **Rule**: The WinMM image MUST retain Wine 11's export names and ordinals. Unimplemented exports MUST call the original Wine module, loadable under a second name. Wine MCI wave playback MUST reach native wave output.
+`timeGetTime` MUST use the machine clock and its shared clock-poll admission.
 **Verification**: Test
 **Basis**: Wine 11 `dlls/winmm/winmm.spec`.
 

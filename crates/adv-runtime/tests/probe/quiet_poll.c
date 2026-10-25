@@ -63,7 +63,7 @@ int main(void)
 {
     WNDCLASSW cls = {0};
     OVERLAPPED overlapped = {0};
-    DWORD bytes, start;
+    DWORD bytes, start, clock_reads = 0;
     char data;
     cls.lpfnWndProc = procedure;
     cls.hInstance = GetModuleHandleW(NULL);
@@ -73,6 +73,10 @@ int main(void)
                              0, 0, 128, 64, NULL, NULL, cls.hInstance, NULL);
     if (!window) return 3;
     UpdateWindow(window);
+    start = timeGetTime();
+    while (timeGetTime() - start < 100) ++clock_reads;
+    printf("clock_reads=%lu\n", clock_reads);
+    fflush(stdout);
     for (unsigned i = 0; i < 3; ++i) events[i] = CreateEventW(NULL, FALSE, FALSE, NULL);
     read_event = overlapped.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
     HANDLE pipe = CreateNamedPipeW(L"\\\\.\\pipe\\quiet-poll", PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED,

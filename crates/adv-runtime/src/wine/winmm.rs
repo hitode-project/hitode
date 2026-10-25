@@ -66,6 +66,9 @@ pub(super) fn register(registry: &mut Registry) {
                 let (name, _, argc) = exports::EXPORTS[index as usize];
                 if name == "timeGetTime" {
                     env.sys.poll_observation();
+                    return adv_machine::clock::poll_clock(env, |_, us| {
+                        Outcome::Return((us / 1000) as u32)
+                    });
                 }
                 let mut args: Vec<_> = (0..u32::from(argc)).map(|i| env.arg(i)).collect();
                 if name.starts_with("waveOut") && !name.contains("ErrorText") {
