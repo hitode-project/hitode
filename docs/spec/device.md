@@ -210,6 +210,7 @@ Comparing against the last publication keeps every slot's damage history complet
 ### DEV-AUDIO-2 Control delivery
 
 **Rule**: Audio command queues MUST be bounded without losing stop or release requests. Notifications MUST return through machine-owned events.
+Device reconnection MUST retain refill notifications crossed while reanchoring a playing PCM ring.
 **Verification**: Test
 
 ### DEV-AUDIO-3 Vorbis callbacks
