@@ -112,7 +112,8 @@ Hitode would not exist without these projects.
 
 **Runtime**
 
-- [Wine](https://www.winehq.org/): its source and tests are our main reference for how Windows behaves, and its server runs inside Hitode.
+- [Wine](https://www.winehq.org/): Windows behavior comes from its modules, which run as guest code, and its server runs inside Hitode. Its source and tests have long been our main reference for how Windows behaves.
+- [FreeType](https://freetype.org/): rasterizes the games' text.
 - [iced-x86](https://github.com/icedland/iced): the x86 decoder under our CPU.
 - [Unicorn](https://www.unicorn-engine.org/) and [QEMU](https://www.qemu.org/): the reference CPUs our tests compare against.
 - [SingleStepTests/80386](https://github.com/SingleStepTests/80386): per-instruction test vectors.
@@ -124,9 +125,10 @@ Hitode would not exist without these projects.
 - [StikDebug](https://github.com/StikDebug/StikDebug) and [idevice](https://github.com/jkcoxson/idevice): JIT on iPhone and iPad without a computer.
 - [Moonlight](https://moonlight-stream.org/): the timing of our touch gestures follows its implementation.
 - [Magpie](https://github.com/Blinue/Magpie): our upscaling shaders are ported from it; the originals are [Anime4K](https://github.com/bloc97/Anime4K), [CuNNy](https://github.com/funnyplanter/CuNNy), [ArtCNN](https://github.com/Artoriuz/ArtCNN) and k7_modernAnime from [mpv_PlayKit](https://github.com/hooke007/mpv_PlayKit).
+- [OxiSynth](https://github.com/PolyMeilex/OxiSynth) and the FluidR3 Mono SoundFont: MIDI music synthesis.
 - [FFmpeg](https://ffmpeg.org/) and Xiph's [libtheora](https://www.theora.org/): playback of the games' own videos.
 
-We also use [wgpu](https://wgpu.rs/), [Symphonia](https://github.com/pdeljanov/Symphonia), [cpal](https://github.com/RustAudio/cpal), [encoding_rs](https://github.com/hsivonen/encoding_rs), [Tauri](https://tauri.app/) and [Svelte](https://svelte.dev/).
+We also use [wgpu](https://wgpu.rs/), [Symphonia](https://github.com/pdeljanov/Symphonia), [cpal](https://github.com/RustAudio/cpal), [encoding_rs](https://github.com/hsivonen/encoding_rs), [corosensei](https://github.com/Amanieu/corosensei), [Tauri](https://tauri.app/) and [Svelte](https://svelte.dev/).
 
 The name comes from the wooden starfish (*hitode*) that Fuko Ibuki carves one by one and gives to everyone in *CLANNAD*. We want to hand these old games, one by one, to more people too.
 
@@ -149,6 +151,10 @@ Third-party parts keep their own licenses:
 - `crates/adv-cpu-core/softfloat`: Berkeley SoftFloat 3e, BSD-3-Clause.
 - `vendor/cpal` (Apache-2.0) and `vendor/symphonia-codec-adpcm` (MPL-2.0): patched upstream code.
 - `vendor/libtheora`: the decoder of Xiph libtheora 1.2.0, BSD-3-Clause, with local changes; see its `NOTICE`.
-- `vendor/wine`: the server of Wine 11.0 and the headers it includes, LGPL-2.1-or-later, unmodified; see its `NOTICE`.
+- `vendor/wine`: the server of Wine 11.0 and the headers it includes, the `l_intl.nls` table the server loads at startup, and the `ntsyscalls.h` system call table, LGPL-2.1-or-later, unmodified; see its `NOTICE`.
+- `crates/adv-unix/freetype`: the FreeType ftgrays rasterizer, used under the FreeType License (FTL); see its `LICENSE.TXT`.
+- `vendor/fluidr3mono`: the FluidR3 Mono GM SoundFont, MIT; see its `LICENSE`.
 - `vendor/upscaling`: upscaling shader sources, under GPL-3.0 and each original's license (MIT for Anime4K); see its `NOTICE`.
 - `tools/fixtures/vendor/minhook`: a test fixture; see its `LICENSE.txt`.
+
+The Wine modules in release packages are an i386 build of Wine 11.0, LGPL-2.1-or-later; the build scripts are in `tools/wine/`.
