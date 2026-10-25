@@ -344,6 +344,16 @@ FreeType is such a library: win32u opens it by name and draws TrueType text thro
 **Rule**: The DirectSound mixer body MUST preserve Wine's float samples, scratch data, buffer positions, frequency accumulators, states, shared lock words, and stopped result. It MUST decline before writes when locks would wait, notifications would fire, effects or 3D apply, conversions are unsupported, or required memory is inaccessible. Its field offsets MUST match the pinned module's DWARF.
 **Verification**: Test
 
+### NAT-BODY-4 Code page bodies
+
+**Rule**: PE code page bodies MUST use Wine's loaded conversion and normalization tables and preserve its output bytes, lengths, default-character indicators and errors. Their structure offsets and global addresses MUST match the pinned modules' DWARF. Cached-page lookups MUST decline while Wine's locale lock is held.
+**Verification**: Test
+
+### NAT-BODY-5 CRT bodies
+
+**Rule**: Locale-independent PE string and memory bodies MUST preserve Wine's bytes, return values, bounds and overlap behavior. An access that would fault MUST decline before any write.
+**Verification**: Test
+
 ## Host DLL images
 
 ### WINE-DLL-1 Loader-owned entries
