@@ -14,6 +14,7 @@ adv-abi = { path = "../adv-abi" }
 adv-nt = { path = "../adv-nt" }
 log.workspace = true
 thiserror.workspace = true
+freetype-sys = { version = "=0.21.0", features = ["bundled"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -21,6 +22,9 @@ libc = "0.2"
 [target.'cfg(any(target_vendor = "apple", target_os = "android"))'.dev-dependencies]
 adv-pe.workspace = true
 adv-wineserver = { path = "../adv-wineserver" }
+
+[build-dependencies]
+cc = "1"
 
 [lints]
 workspace = true

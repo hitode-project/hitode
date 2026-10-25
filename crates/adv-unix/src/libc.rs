@@ -4,8 +4,8 @@
 //! Functions whose behavior ntdll.dll's C runtime exports share, such as
 //! `memcpy` or `cos`, bind to those exports ([`shared_with_ntdll`]). The
 //! heap is the process heap. The rest are host functions with glibc's
-//! semantics; a shared library outside Wine's Unix directory, or a file
-//! opened as a stream, is absent, as on a host that lacks it.
+//! semantics. FreeType is built into the host; other shared libraries load
+//! from Wine's Unix directory. Files opened as streams are absent.
 
 use adv_cpu::backend::{GuestExt, Reg};
 use adv_machine::layout::teb;
@@ -81,7 +81,7 @@ fn string(env: &Env<'_>, address: u32, max: usize) -> Result<Vec<u8>, String> {
 
 /// Calls ntdll.dll's heap function `name` on the process heap with
 /// `args` after the heap, and passes on its result.
-fn heap_call(
+pub(crate) fn heap_call(
     env: &mut Env<'_>,
     name: &str,
     args: &[u32],
@@ -634,12 +634,15 @@ fn fopen(env: &mut Env<'_>) -> Outcome {
 }
 
 /// dlopen(name, flags): the shared libraries present are those next to
-/// the Unix libraries of Wine's modules. The handle is the base.
+/// the Unix libraries of Wine's modules, or the built-in host FreeType.
 fn dlopen(env: &mut Env<'_>) -> Outcome {
     let name = match string(env, env.arg(0), MAX_STRING) {
         Ok(name) => PathBuf::from(OsString::from_vec(name)),
         Err(error) => return Outcome::Fail(format!("dlopen: {error}")),
     };
+    if name == Path::new(crate::freetype::SONAME) {
+        return Outcome::Return(crate::freetype::HANDLE);
+    }
     let libraries = env.ext.get_or_default::<Libraries>();
     let directory = libraries.0.first().and_then(|first| first.path.parent());
     let path = match directory {
@@ -667,6 +670,19 @@ fn dlsym(env: &mut Env<'_>) -> Outcome {
         Ok(name) => String::from_utf8_lossy(&name).into_owned(),
         Err(error) => return Outcome::Fail(format!("dlsym: {error}")),
     };
+    if handle == crate::freetype::HANDLE {
+        if crate::freetype::function(&name).is_none() {
+            return Outcome::Return(0);
+        }
+        return match env
+            .sys
+            .thunks
+            .resolve(env.cpu, crate::freetype::SONAME, &name)
+        {
+            Ok(address) => Outcome::Return(address),
+            _ => Outcome::Return(0),
+        };
+    }
     let libraries = &env.ext.get_or_default::<Libraries>().0;
     let address = libraries
         .iter()
