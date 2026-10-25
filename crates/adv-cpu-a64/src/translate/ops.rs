@@ -235,6 +235,9 @@ impl Translator<'_> {
                 let cond = self.condition(cc);
                 self.clobber(Operand::Guest(dst));
                 self.emit(csel(W, host(dst), value, host(dst), cond));
+                if biased(dst) {
+                    self.emit(add(X, host(dst), WINDOW, host(dst), Lsl, 0));
+                }
             }
             Op::Shift(kind, dst, count) => self.shift(kind, dst, count),
             Op::Imul(dst, source, imm) => self.imul(dst, source, imm),

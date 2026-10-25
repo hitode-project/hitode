@@ -430,10 +430,7 @@ pub fn plan(instruction: &Instruction) -> Option<Op> {
         | M::Cmovle
         | M::Cmovg => {
             let source = operand(instruction, 1)?;
-            match register(0)? {
-                ESP | EBP => return None,
-                target => Op::Cmov(instruction.condition_code(), target, source),
-            }
+            Op::Cmov(instruction.condition_code(), register(0)?, source)
         }
         _ => return None,
     })
@@ -734,10 +731,10 @@ fn quick_op(b: &mut Bytes, pc: u32) -> Option<Op> {
             let second = b.u8()?;
             let cc = CONDITIONS[usize::from(second & 15)];
             match second {
-                0x40..=0x4f => match b.modrm()? {
-                    (ESP | EBP, _) => return None,
-                    (reg, rm) => Op::Cmov(cc, reg, rm),
-                },
+                0x40..=0x4f => {
+                    let (reg, rm) = b.modrm()?;
+                    Op::Cmov(cc, reg, rm)
+                }
                 0x80..=0x8f => {
                     let rel = b.u32()?;
                     Op::Jcc(Cc::Flags(cc), near(b, rel))

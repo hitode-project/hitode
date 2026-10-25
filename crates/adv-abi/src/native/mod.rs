@@ -7,12 +7,15 @@
 
 pub mod analyze;
 pub mod expression;
+mod frame;
+mod paeth;
 pub mod verify;
 
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
 pub use expression::{Binary, Expression, MemoryVersion, Width};
+pub use frame::{FrameInvariant, FrameState};
 pub use verify::VerifiedBinding;
 
 /// Identity of a computation, independently of the implementation that runs it.
@@ -167,6 +170,8 @@ impl StateView {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Predicate {
     Positive(Expression),
+    Equal(Expression, Expression),
+    AtMost(Expression, Expression),
     NoWrap(MemorySpan),
     Ordinary {
         span: MemorySpan,

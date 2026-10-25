@@ -90,6 +90,27 @@ previous-row input remains disjoint from all output writes.
 **Rule**: Integer admission MUST use CPU-core operand decoding and arithmetic flag semantics. Expressions MUST retain their bit widths and memory versions. Every proved exit MUST identify its PC, registers, flags and memory version.
 **Verification**: Test
 
+### EXEC-NATIVE-4 Fixed private frame effects
+
+**Rule**: Fixed-frame admission MUST account for every dword read and write. A non-faulting scalar tail MUST restore all temporary slot values. Condition flags read by the body MUST have local definitions.
+**Verification**: Test
+
+- Invariant slots match entry registers that remain unchanged across the backedge.
+- Temporary slots have complete dword stores before reads of their current values; partial overlaps are unsupported.
+- The frame base remains unchanged, and its bounded span is ordinary and disjoint from all remaining input and output spans.
+- Writable frames exclude code dependencies and observed writes; a declined bridge has no guest effects.
+- Conditional moves retain their false destination and read memory sources even when false.
+- Preserved flags, including CF across INC/DEC, are not local definitions.
+
+### EXEC-NATIVE-5 Bounded Paeth integer identities
+
+**Rule**: Paeth admission MUST check signedness, widths, absolute-value identities and strict predictor comparisons. Normalization MUST stay within signed 32-bit arithmetic and a finite node budget.
+**Verification**: Test
+
+The straight-line rule uses three symbolic byte inputs. Exact normalized
+identities establish the predictor; sample agreement does not admit code.
+Unrecognized identities and internal branches remain unsupported.
+
 ## x64
 
 ### EXEC-X64-1 Frozen engine

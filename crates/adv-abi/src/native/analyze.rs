@@ -39,20 +39,25 @@ pub fn discover(image: &ImageSnapshot, budget: &mut Budget) -> Vec<CandidateBind
             let mut increments = [false; 8];
             let mut adds = false;
             let mut halves = false;
+            let mut selects = false;
             while body.can_decode() && budget.instructions != 0 {
                 budget.instructions -= 1;
                 let step = body.decode();
                 if step.op1_kind() == OpKind::Memory
                     && matches!(step.mnemonic(), Mnemonic::Mov | Mnemonic::Movzx)
                     && verify::plain_memory(&step)
+                    && step.memory_size().size() == 1
                     && let Some(source) = verify::address(&step, &values)
                 {
                     sources.push(source);
                 }
                 halves |= step.mnemonic() == Mnemonic::Shr;
+                selects |= step.condition_code() != iced_x86::ConditionCode::None
+                    && step.mnemonic() != Mnemonic::Jne;
                 if step.op0_kind() == OpKind::Memory
                     && matches!(step.mnemonic(), Mnemonic::Mov | Mnemonic::Add)
                     && verify::plain_memory(&step)
+                    && step.memory_size().size() == 1
                 {
                     destination = verify::address(&step, &values);
                     adds = step.mnemonic() == Mnemonic::Add;
@@ -95,7 +100,41 @@ pub fn discover(image: &ImageSnapshot, budget: &mut Budget) -> Vec<CandidateBind
                 continue;
             }
             let mut proposals = Vec::new();
-            if adds && halves && sources.len() == 2 {
+            if adds && selects && sources.len() == 3 {
+                for previous in 0..3 {
+                    for left in 0..3 {
+                        if previous == left {
+                            continue;
+                        }
+                        let distance = Expression::binary(
+                            Binary::Subtract,
+                            destination.clone(),
+                            sources[left].clone(),
+                        )
+                        .unwrap();
+                        let upper = Expression::binary(
+                            Binary::Subtract,
+                            sources[previous].clone(),
+                            distance,
+                        )
+                        .unwrap();
+                        if sources
+                            .iter()
+                            .enumerate()
+                            .any(|(n, source)| n != previous && n != left && *source == upper)
+                            && let Some(view) = row_view(
+                                Computation::PngPaeth,
+                                sources[previous].clone(),
+                                sources[left].clone(),
+                                destination.clone(),
+                                remaining.clone(),
+                            )
+                        {
+                            proposals.push((Computation::PngPaeth, view));
+                        }
+                    }
+                }
+            } else if adds && halves && sources.len() == 2 {
                 for (previous, left) in [(0, 1), (1, 0)] {
                     if let Some(view) = row_view(
                         Computation::PngAverage,

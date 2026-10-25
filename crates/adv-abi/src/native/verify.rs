@@ -12,7 +12,7 @@ use iced_x86::{
 use super::expression::Kind;
 use super::*;
 
-pub const RULE_VERSION: u32 = 4;
+pub const RULE_VERSION: u32 = 5;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Store {
@@ -62,6 +62,7 @@ pub struct VerifiedBinding {
     dependencies: Vec<Dependency>,
     transition: Transition,
     conditions: Vec<Predicate>,
+    frame: Option<FrameState>,
 }
 
 impl VerifiedBinding {
@@ -73,7 +74,10 @@ impl VerifiedBinding {
         &self,
         kernel: adv_cpu::native_region::Kernel,
     ) -> Option<adv_cpu::native_region::NativeRegion> {
-        use adv_cpu::native_region::{Affine, Aliasing, NativeRegion, ReadSpan, Scalar};
+        use adv_cpu::native_region::{
+            Affine, Aliasing, Frame as LowerFrame, FrameInvariant as LowerInvariant, NativeRegion,
+            ReadSpan, Scalar,
+        };
         let affine = |expression: &Expression| -> Option<Affine> {
             let (terms, constant) = expression.affine()?;
             let mut registers = [0; 8];
@@ -91,10 +95,11 @@ impl VerifiedBinding {
             })
         };
         let source_role = match self.candidate.contract.computation {
-            Computation::PngUp | Computation::PngAverage => Input::PreviousRow,
+            Computation::PngUp | Computation::PngAverage | Computation::PngPaeth => {
+                Input::PreviousRow
+            }
             Computation::PngSub => Input::ReconstructedPrefix,
             Computation::Lz77 => Input::History,
-            _ => return None,
         };
         let view = &self.candidate.view;
         let mut inputs = [Affine {
@@ -124,12 +129,12 @@ impl VerifiedBinding {
                 };
             }
         }
-        if advances[4] != 0 || advances[5] != 0 {
+        if advances[4] != 0 {
             return None;
         }
         let aliasing = if matches!(
             self.candidate.contract.computation,
-            Computation::PngUp | Computation::PngAverage
+            Computation::PngUp | Computation::PngAverage | Computation::PngPaeth
         ) {
             Aliasing::Disjoint
         } else {
@@ -143,14 +148,47 @@ impl VerifiedBinding {
             None,
             None,
         ];
-        let scalar = if self.candidate.contract.computation == Computation::PngAverage {
+        let scalar = if matches!(
+            self.candidate.contract.computation,
+            Computation::PngAverage | Computation::PngPaeth
+        ) {
             reads[1] = Some(ReadSpan {
                 address: affine(view.input(Input::ReconstructedPrefix)?)?,
                 aliasing: Aliasing::Backward,
             });
+            let parameter = view.input(Input::BytesPerPixel)?;
+            let mut bounds = [None; 2];
+            if self.candidate.contract.computation == Computation::PngPaeth {
+                reads[2] = Some(ReadSpan {
+                    address: affine(&Expression::binary(
+                        Binary::Subtract,
+                        view.input(Input::PreviousRow)?.clone(),
+                        parameter.clone(),
+                    )?)?,
+                    aliasing: Aliasing::Disjoint,
+                });
+                bounds[0] = Some(inputs[0]);
+            }
             Some(Scalar {
-                value: affine(view.input(Input::BytesPerPixel)?)?,
-                upper_bounds: [None; 2],
+                value: affine(parameter)?,
+                upper_bounds: bounds,
+            })
+        } else {
+            None
+        };
+        let frame = if let Some(frame) = &self.frame {
+            let mut invariants = [None; 8];
+            for (out, invariant) in invariants.iter_mut().zip(&frame.invariants) {
+                *out = Some(LowerInvariant {
+                    offset: invariant.offset,
+                    value: affine(&Expression::register(invariant.register))?,
+                });
+            }
+            Some(LowerFrame {
+                address: affine(&frame.span.address)?,
+                bytes: frame.span.length.as_constant()? as u32,
+                writes: !frame.stores.is_empty(),
+                invariants,
             })
         } else {
             None
@@ -164,6 +202,7 @@ impl VerifiedBinding {
                 self.transition.instructions,
                 reads,
                 scalar,
+                frame,
                 kernel,
             )
         })
@@ -180,6 +219,9 @@ impl VerifiedBinding {
     }
     pub fn conditions(&self) -> &[Predicate] {
         &self.conditions
+    }
+    pub fn frame(&self) -> Option<&FrameState> {
+        self.frame.as_ref()
     }
     pub const fn rule_version(&self) -> u32 {
         RULE_VERSION
@@ -239,6 +281,9 @@ struct Checker {
     store: Option<Store>,
     defined: [u32; 8],
     initial_reads: [u32; 8],
+    written: [u32; 8],
+    defined_flags: u32,
+    frame: super::frame::Slots,
 }
 
 impl Checker {
@@ -250,6 +295,9 @@ impl Checker {
             store: None,
             defined: [0; 8],
             initial_reads: [0; 8],
+            written: [0; 8],
+            defined_flags: 0,
+            frame: Default::default(),
         }
     }
     fn read_register(&mut self, r: integer::Reg) {
@@ -258,6 +306,7 @@ impl Checker {
     }
     fn write_register(&mut self, r: integer::Reg) {
         self.defined[r.index as usize] |= integer::mask(r.width) << r.shift;
+        self.written[r.index as usize] |= integer::mask(r.width) << r.shift;
     }
     fn address_registers(&mut self, i: &Instruction) {
         if let Some(a) = integer::Address::decode(i, false) {
@@ -283,8 +332,8 @@ impl Checker {
         if self
             .store
             .replace(Store {
-                before: MemoryVersion(0),
-                after: MemoryVersion(1),
+                before: self.frame.version(),
+                after: MemoryVersion(self.frame.version().0 + 1),
                 address: a,
                 value: low(value),
             })
@@ -293,6 +342,27 @@ impl Checker {
             return Err(unsupported(at, "more than one memory write per step"));
         }
         Ok(())
+    }
+    fn frame_read(
+        &mut self,
+        i: &Instruction,
+        target: Option<Register>,
+    ) -> Result<Expression, Rejection> {
+        let a = address(i, &self.values).ok_or_else(|| unsupported(i.ip32(), "frame address"))?;
+        let offset = super::frame::offset(&a)
+            .ok_or_else(|| unsupported(i.ip32(), "non-fixed dword load"))?;
+        self.address_registers(i);
+        self.frame.read(offset, target, i.ip32())
+    }
+    fn frame_write(&mut self, i: &Instruction, value: Expression) -> Result<(), Rejection> {
+        if self.store.is_some() {
+            return Err(unsupported(i.ip32(), "frame write after output write"));
+        }
+        let a = address(i, &self.values).ok_or_else(|| unsupported(i.ip32(), "frame address"))?;
+        let offset = super::frame::offset(&a)
+            .ok_or_else(|| unsupported(i.ip32(), "non-fixed dword store"))?;
+        self.address_registers(i);
+        self.frame.write(offset, value, i.ip32())
     }
     fn flags(&mut self, kind: Mnemonic, left: Expression, right: Expression) {
         self.flags = Expression::integer_flags(kind, self.flags.clone(), left, right)
@@ -303,6 +373,14 @@ impl Checker {
         let bad = || unsupported(at, "instruction form");
         if i.has_lock_prefix() || i.has_rep_prefix() || i.has_repne_prefix() {
             return Err(bad());
+        }
+        // Iced dependency bits, not architectural EFLAGS values. Preserved
+        // flags (notably INC/DEC's CF) do not become local definitions.
+        if i.rflags_read() & !self.defined_flags != 0 {
+            return Err(unsupported(
+                at,
+                "condition reads flags before a local definition",
+            ));
         }
         match integer::decode(i).ok_or_else(bad)? {
             Operation::Nop if i.op_count() == 0 => {}
@@ -326,6 +404,33 @@ impl Checker {
             {
                 self.read_register(r);
                 self.store(i, self.values[r.index as usize].clone())?;
+            }
+            Operation::Mov(Operand::Register(r), Operand::Memory(_, 4), false) if r.width == 4 => {
+                let value = self.frame_read(i, Some(Register(r.index)))?;
+                self.write_register(r);
+                self.values[r.index as usize] = value;
+            }
+            Operation::Mov(Operand::Memory(_, 4), Operand::Register(r), false) if r.width == 4 => {
+                self.read_register(r);
+                self.frame_write(i, self.values[r.index as usize].clone())?;
+            }
+            Operation::Mov(Operand::Register(a), Operand::Register(b), false)
+                if a.width == 4 && matches!(b.width, 1 | 4) =>
+            {
+                self.read_register(b);
+                let value = self.values[b.index as usize].clone();
+                let value = if b.width == 1 {
+                    Expression::extend(
+                        Expression::extract(value, b.shift, Width::Byte).unwrap(),
+                        Width::Dword,
+                        false,
+                    )
+                    .unwrap()
+                } else {
+                    value
+                };
+                self.write_register(a);
+                self.values[a.index as usize] = value;
             }
             Operation::Binary(Mnemonic::Add, Operand::Memory(_, 1), Operand::Register(r))
                 if r.width == 1 && r.shift == 0 =>
@@ -360,17 +465,55 @@ impl Checker {
                     self.values[b.index as usize].clone(),
                 );
             }
-            Operation::Binary(Mnemonic::Add, Operand::Register(a), Operand::Register(b))
-                if a.width == 4 && b.width == 4 =>
-            {
+            Operation::Binary(
+                kind @ (Mnemonic::Add | Mnemonic::Sub),
+                Operand::Register(a),
+                Operand::Register(b),
+            ) if a.width == 4 && b.width == 4 => {
                 self.read_register(a);
                 self.read_register(b);
                 self.write_register(a);
                 let left = self.values[a.index as usize].clone();
                 let right = self.values[b.index as usize].clone();
-                self.flags(Mnemonic::Add, left.clone(), right.clone());
-                self.values[a.index as usize] =
-                    Expression::binary(Binary::Add, left, right).unwrap();
+                self.flags(kind, left.clone(), right.clone());
+                self.values[a.index as usize] = Expression::binary(
+                    if kind == Mnemonic::Add {
+                        Binary::Add
+                    } else {
+                        Binary::Subtract
+                    },
+                    left,
+                    right,
+                )
+                .unwrap();
+            }
+            Operation::Unary(Mnemonic::Neg, Operand::Register(r)) if r.width == 4 => {
+                self.read_register(r);
+                self.write_register(r);
+                let value = self.values[r.index as usize].clone();
+                let zero = Expression::constant(Width::Dword, 0);
+                self.flags(Mnemonic::Neg, value.clone(), zero.clone());
+                self.values[r.index as usize] =
+                    Expression::binary(Binary::Subtract, zero, value).unwrap();
+            }
+            Operation::Cmov(Operand::Register(r), source, cc) if r.width == 4 => {
+                // The source is read even on the false branch, as in Tier 0.
+                let value = match source {
+                    Operand::Register(b) if b.width == 4 => {
+                        self.read_register(b);
+                        self.values[b.index as usize].clone()
+                    }
+                    Operand::Memory(_, 4) => self.frame_read(i, None)?,
+                    _ => return Err(bad()),
+                };
+                self.read_register(r);
+                self.written[r.index as usize] = u32::MAX;
+                self.values[r.index as usize] = Expression::select(
+                    Expression::condition(cc, self.flags.clone()).unwrap(),
+                    value,
+                    self.values[r.index as usize].clone(),
+                )
+                .unwrap();
             }
             Operation::Shift(Mnemonic::Shr, Operand::Register(r), Operand::Immediate(1))
                 if r.width == 4 =>
@@ -385,12 +528,13 @@ impl Checker {
             }
             _ => return Err(bad()),
         }
+        self.defined_flags &= !i.rflags_undefined();
+        self.defined_flags |= i.rflags_written() | i.rflags_cleared() | i.rflags_set();
         Ok(())
     }
 }
 
 /// Check actual code and establish the forward-loop induction rule.
-/// Paeth requires additional proof rules and returns Unsupported.
 pub fn verify(
     image: &ImageSnapshot,
     candidate: CandidateBinding,
@@ -403,12 +547,6 @@ pub fn verify(
     let computation = candidate.contract.computation;
     if candidate.contract != ReferenceContract::get(computation) {
         return Err(counterexample(at, "reference contract identity"));
-    }
-    if !matches!(
-        computation,
-        Computation::Lz77 | Computation::PngSub | Computation::PngUp | Computation::PngAverage
-    ) {
-        return Err(unsupported(at, "reference recurrence"));
     }
     if candidate.cutpoints != [at] || candidate.exits != [candidate.end] {
         return Err(counterexample(at, "cutpoints or exits"));
@@ -428,7 +566,7 @@ pub fn verify(
         .input(Input::Length)
         .ok_or_else(|| counterexample(at, "count mapping"))?
         .clone();
-    let left = if computation == Computation::PngAverage {
+    let left = if matches!(computation, Computation::PngAverage | Computation::PngPaeth) {
         Some(
             view.input(Input::ReconstructedPrefix)
                 .ok_or_else(|| counterexample(at, "left mapping"))?
@@ -550,38 +688,56 @@ pub fn verify(
     }
     let copied =
         Expression::load(MemoryVersion(0), source.clone(), Width::Byte).expect("byte source");
-    let predictor = if let Some(left) = &left {
-        let left = Expression::extend(
-            Expression::load(MemoryVersion(0), left.clone(), Width::Byte).unwrap(),
-            Width::Dword,
-            false,
+    let upper = if computation == Computation::PngPaeth {
+        Some(
+            Expression::binary(
+                Binary::Subtract,
+                source.clone(),
+                view.input(Input::BytesPerPixel).unwrap().clone(),
+            )
+            .unwrap(),
         )
-        .unwrap();
-        let above = Expression::extend(copied.clone(), Width::Dword, false).unwrap();
-        let sum = Expression::binary(Binary::Add, left, above).unwrap();
-        low(Expression::binary(
-            Binary::ShiftRight,
-            sum,
-            Expression::constant(Width::Dword, 1),
-        )
-        .unwrap())
     } else {
-        copied.clone()
+        None
     };
-    let expected = if computation == Computation::Lz77 {
+    let expected = if computation == Computation::PngPaeth {
+        let store = checker
+            .store
+            .as_ref()
+            .ok_or_else(|| counterexample(at, "missing output store"))?;
+        super::paeth::prove(&store.value, view, at)?;
+        store.value.clone()
+    } else if computation == Computation::Lz77 {
         copied.clone()
     } else {
+        let predictor = if let Some(left) = &left {
+            let left = Expression::extend(
+                Expression::load(MemoryVersion(0), left.clone(), Width::Byte).unwrap(),
+                Width::Dword,
+                false,
+            )
+            .unwrap();
+            let above = Expression::extend(copied.clone(), Width::Dword, false).unwrap();
+            let sum = Expression::binary(Binary::Add, left, above).unwrap();
+            low(Expression::binary(
+                Binary::ShiftRight,
+                sum,
+                Expression::constant(Width::Dword, 1),
+            )
+            .unwrap())
+        } else {
+            copied.clone()
+        };
         Expression::binary(
             Binary::Add,
-            Expression::load(MemoryVersion(0), destination.clone(), Width::Byte)
-                .expect("byte destination"),
+            Expression::load(MemoryVersion(0), destination.clone(), Width::Byte).unwrap(),
             predictor,
         )
-        .expect("byte sum")
+        .unwrap()
     };
     let expected_store = Store {
-        before: MemoryVersion(0),
-        after: MemoryVersion(1),
+        before: checker.frame.version(),
+        after: MemoryVersion(checker.frame.version().0 + 1),
         address: destination.clone(),
         value: expected,
     };
@@ -590,11 +746,9 @@ pub fn verify(
     }) {
         return Err(counterexample(at, "byte recurrence"));
     }
-    if checker
-        .reads
-        .iter()
-        .any(|a| *a != source && *a != destination && left.as_ref() != Some(a))
-    {
+    if checker.reads.iter().any(|a| {
+        *a != source && *a != destination && left.as_ref() != Some(a) && upper.as_ref() != Some(a)
+    }) {
         return Err(counterexample(at, "undeclared memory input"));
     }
     for r in 0..8 {
@@ -606,7 +760,7 @@ pub fn verify(
         {
             continue;
         }
-        let changed = checker.defined[r.index() as usize];
+        let changed = checker.written[r.index() as usize];
         if *actual != initial && checker.initial_reads[r.index() as usize] & changed != 0 {
             return Err(unsupported(
                 at,
@@ -614,10 +768,11 @@ pub fn verify(
             ));
         }
     }
+    let frame = checker.frame.finish(&checker.values, at)?;
     let state = ExitState {
         registers: checker.values,
         flags: checker.flags,
-        memory: MemoryVersion(1),
+        memory: expected_store.after,
     };
     let exits = [
         (ExitKind::Continue, candidate.entry, ConditionCode::ne),
@@ -653,7 +808,10 @@ pub fn verify(
             end: candidate.end,
         },
     ];
-    if matches!(computation, Computation::PngUp | Computation::PngAverage) {
+    if matches!(
+        computation,
+        Computation::PngUp | Computation::PngAverage | Computation::PngPaeth
+    ) {
         conditions.push(Predicate::Disjoint(input, output.clone()));
     } else {
         conditions.push(Predicate::BackwardDistance {
@@ -681,6 +839,57 @@ pub fn verify(
             },
         ]);
     }
+    if let Some(upper) = upper {
+        let span = MemorySpan {
+            address: upper,
+            length: output.length.clone(),
+        };
+        conditions.extend([
+            Predicate::AtMost(
+                view.input(Input::BytesPerPixel).unwrap().clone(),
+                view.input(Input::PreviousRow).unwrap().clone(),
+            ),
+            Predicate::NoWrap(span.clone()),
+            Predicate::Ordinary {
+                span: span.clone(),
+                access: Access::Read,
+            },
+            Predicate::Disjoint(span, output.clone()),
+        ]);
+    }
+    if let Some(frame) = &frame {
+        conditions.extend([
+            Predicate::NoWrap(frame.span.clone()),
+            Predicate::Ordinary {
+                span: frame.span.clone(),
+                access: if frame.stores.is_empty() {
+                    Access::Read
+                } else {
+                    Access::ReadWrite
+                },
+            },
+            Predicate::Disjoint(frame.span.clone(), output.clone()),
+        ]);
+        for invariant in &frame.invariants {
+            let slot = add(frame.span.address.clone(), invariant.offset);
+            conditions.push(Predicate::Equal(
+                Expression::load(MemoryVersion(0), slot, Width::Dword).unwrap(),
+                Expression::register(invariant.register),
+            ));
+        }
+        for input in &checker.reads {
+            conditions.push(Predicate::Disjoint(
+                frame.span.clone(),
+                MemorySpan {
+                    address: input.clone(),
+                    length: output.length.clone(),
+                },
+            ));
+        }
+        if !frame.stores.is_empty() {
+            conditions.push(Predicate::WritesOutsideDependencies(frame.span.clone()));
+        }
+    }
     Ok(VerifiedBinding {
         candidate,
         dependencies: vec![Dependency {
@@ -694,5 +903,6 @@ pub fn verify(
             instructions: count,
         },
         conditions,
+        frame,
     })
 }

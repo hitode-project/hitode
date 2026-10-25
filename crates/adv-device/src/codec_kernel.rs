@@ -94,11 +94,32 @@ pub fn png_paeth(row: &mut [u8], previous: &[u8], bpp: usize) -> Result<(), Kern
     if row.len() != previous.len() || bpp == 0 {
         return Err(KernelError::UnsupportedSize);
     }
+    let first = bpp.min(row.len());
+    let (prefix, remaining) = row.split_at_mut(first);
+    png_up(prefix, &previous[..first])?;
+    if remaining.is_empty() {
+        return Ok(());
+    }
+    png_paeth_segment(remaining, &previous[first..], prefix, &previous[..first])
+}
+
+/// Paeth on a remaining segment, with reconstructed current and previous
+/// prefixes. Prefix borrows are separate from the mutable output; updated
+/// history inside the batch is read from `row` itself.
+pub fn png_paeth_segment(
+    row: &mut [u8],
+    previous: &[u8],
+    prefix: &[u8],
+    previous_prefix: &[u8],
+) -> Result<(), KernelError> {
+    if row.len() != previous.len() || prefix.is_empty() || prefix.len() != previous_prefix.len() {
+        return Err(KernelError::UnsupportedSize);
+    }
     for i in 0..row.len() {
-        let (left, upper_left) = if i < bpp {
-            (0, 0)
+        let (left, upper_left) = if i < prefix.len() {
+            (prefix[i], previous_prefix[i])
         } else {
-            (row[i - bpp], previous[i - bpp])
+            (row[i - prefix.len()], previous[i - prefix.len()])
         };
         let above = previous[i];
         let p = i32::from(left) + i32::from(above) - i32::from(upper_left);

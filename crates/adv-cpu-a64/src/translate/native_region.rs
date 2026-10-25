@@ -11,6 +11,7 @@ const MINIMUM: u32 = 128;
 const MAXIMUM: u32 = 1024;
 const SP: Reg = Reg::new(31);
 const ADDRESS: Reg = Reg::new(7);
+const FRAME: Reg = Reg::new(8);
 
 impl Unit {
     pub(super) fn prepare_regions(
@@ -32,6 +33,7 @@ impl Unit {
             if body.iter().enumerate().any(|(n, i)| {
                 i.mode != Mode::Plain
                     || i.leaf.is_some()
+                    || matches!(i.op, super::decode::Op::Helper(_))
                     || checked(i.pc)
                     || (n != 0 && (self.trace.head(start + n) || self.trace.merge[start + n]))
                     || (n + 1 != body.len()
@@ -139,6 +141,59 @@ impl Translator<'_> {
                 self.asm.b_cond(Cond::Hi, scalar);
             }
         }
+        if let Some(frame) = region.frame() {
+            self.affine(frame.address, FRAME);
+            if frame.bytes == 4096 {
+                self.mov_imm(X16, frame.bytes);
+                self.emit(add(X, X3, FRAME, X16, Lsl, 0));
+            } else {
+                self.emit(add_imm(X, X3, FRAME, frame.bytes, false));
+            }
+            self.emit(lsr_imm(X, X5, X3, 32));
+            self.asm.cbz(X, true, X5, scalar);
+            // A bounded fixed frame and all data buffers remain disjoint for
+            // the batch. Skipped scratch stores cannot affect native inputs.
+            for expression in region
+                .reads()
+                .iter()
+                .flatten()
+                .map(|r| r.address)
+                .chain(std::iter::once(region.inputs()[1]))
+            {
+                let address = self.region_address(expression, region);
+                let safe = self.asm.label();
+                self.emit(cmp(X, X3, address, Lsl, 0));
+                self.asm.b_cond(Cond::Ls, safe);
+                self.emit_all(&[add(X, X4, address, X2, Lsl, 0), cmp(X, X4, FRAME, Lsl, 0)]);
+                self.asm.b_cond(Cond::Hi, scalar);
+                self.asm.bind(safe);
+            }
+            self.emit_all(&[
+                add_imm(X, X3, FRAME, frame.bytes - 1, false),
+                eor(X, X4, X3, FRAME, Lsl, 0),
+            ]);
+            self.asm.tbz(true, X4, 12, scalar);
+            self.emit_all(&[
+                ldr(X, X5, RUNTIME, crate::runtime::CLASSES),
+                lsr_imm(W, X3, FRAME, 12),
+                ldr_narrow(Narrow::Byte, X4, X5, X3),
+            ]);
+            self.asm.tbz(false, X4, READ.trailing_zeros(), scalar);
+            self.asm.tbz(true, X4, SHARED.trailing_zeros(), scalar);
+            if frame.writes {
+                self.asm.tbz(false, X4, WRITE.trailing_zeros(), scalar);
+                self.asm.tbz(true, X4, EXEC.trailing_zeros(), scalar);
+            }
+            for invariant in frame.invariants.into_iter().flatten() {
+                self.affine(invariant.value, X6);
+                self.emit_all(&[
+                    add_imm(W, X16, FRAME, invariant.offset, false),
+                    ldr_reg(W, X3, WINDOW, X16, false),
+                    cmp(W, X3, X6, Lsl, 0),
+                ]);
+                self.asm.b_cond(Cond::Ne, scalar);
+            }
+        }
         // Leave one non-faulting scalar iteration to reconstruct all temps
         // and flags. Bound each batch for scheduling and memory-class checks.
         self.emit(sub_imm(W, X2, X2, 1, false));
@@ -216,6 +271,9 @@ impl Translator<'_> {
                 1 => self.emit(add(W, host(r as u8), host(r as u8), X2, Lsl, 0)),
                 -1 => self.emit(sub(W, host(r as u8), host(r as u8), X2, Lsl, 0)),
                 _ => {}
+            }
+            if *advance != 0 && biased(r as u8) {
+                self.emit(add(X, host(r as u8), WINDOW, host(r as u8), Lsl, 0));
             }
         }
         #[cfg(test)]

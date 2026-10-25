@@ -23,6 +23,7 @@ pub(super) fn admit(_pc: u32, code: &[u8]) -> Vec<NativeRegion> {
             Computation::PngUp => up,
             Computation::PngSub => sub,
             Computation::PngAverage => average,
+            Computation::PngPaeth => paeth,
             _ => continue,
         };
         if let Ok(binding) = verify::verify(&image, candidate, &mut budget) {
@@ -48,6 +49,23 @@ unsafe extern "C" fn average(source: *const u8, destination: *mut u8, length: u3
         )
     };
     let _ = adv_device::codec_kernel::png_average_segment(row, previous, prefix);
+}
+
+unsafe extern "C" fn paeth(source: *const u8, destination: *mut u8, length: u32, bpp: u32) {
+    #[cfg(all(test, target_arch = "aarch64"))]
+    tests::BATCHES.with(|n| n.set(n.get() + 1));
+    // SAFETY: read spans cover both prefixes and the following scalar tail.
+    // Checked bounds prevent pointer subtraction from wrapping; backward
+    // distance and disjoint previous spans separate all mutable borrows.
+    let (row, previous, prefix, previous_prefix) = unsafe {
+        (
+            std::slice::from_raw_parts_mut(destination, length as usize),
+            std::slice::from_raw_parts(source, length as usize),
+            std::slice::from_raw_parts(destination.sub(bpp as usize), bpp.min(length) as usize),
+            std::slice::from_raw_parts(source.sub(bpp as usize), bpp.min(length) as usize),
+        )
+    };
+    let _ = adv_device::codec_kernel::png_paeth_segment(row, previous, prefix, previous_prefix);
 }
 
 unsafe extern "C" fn sub(source: *const u8, destination: *mut u8, length: u32, _scalar: u32) {
@@ -98,6 +116,11 @@ mod tests {
     const AVERAGE: &[u8] = &[
         0x0f, 0xb6, 0x1c, 0x30, 0x0f, 0xb6, 0x14, 0x37, 0x01, 0xda, 0xd1, 0xea, 0x00, 0x14, 0x31,
         0x46, 0x39, 0xf5, 0x75, 0xec,
+    ];
+    const FRAME_BODY: &[u8] = &[
+        0x89, 0x74, 0x24, 0x04, 0x0f, 0xb6, 0x1c, 0x31, 0x89, 0x5c, 0x24, 0x08, 0x8b, 0x3c, 0x24,
+        0x39, 0xff, 0x0f, 0x42, 0x5c, 0x24, 0x08, 0x00, 0x1c, 0x32, 0x8b, 0x44, 0x24, 0x0c, 0x46,
+        0x39, 0xf0, 0x75, 0xde,
     ];
 
     struct Admission;
@@ -221,6 +244,74 @@ mod tests {
         }
     }
 
+    // spec: EXEC-NATIVE-4, A64-TR-8
+    #[test]
+    fn fixed_frame_effects_guards_and_scalar_tail_match_guest_execution() {
+        for case in 0..6 {
+            let (mut a, mut b) = (executor(2048, OUTPUT), executor(2048, OUTPUT));
+            for e in [&mut a, &mut b] {
+                e.write(CODE, FRAME_BODY).unwrap();
+                let sp = e.state.regs[4];
+                e.write(sp, &e.state.regs[7].to_le_bytes()).unwrap();
+                e.write(sp + 12, &2048u32.to_le_bytes()).unwrap();
+            }
+            let stop = CODE + FRAME_BODY.len() as u32;
+            compare(&mut a, &mut b, stop, 100_000);
+            assert!(BATCHES.get() > 0);
+            for e in [&mut a, &mut b] {
+                e.state.eip = CODE;
+                e.state.regs[6] = 0;
+                if case == 2 {
+                    e.state.regs[4] = OUTPUT;
+                }
+                if case == 3 {
+                    e.state.regs[4] = SOURCE + 0x100;
+                }
+                let sp = e.state.regs[4];
+                e.write(sp, &e.state.regs[7].to_le_bytes()).unwrap();
+                e.write(sp + 12, &if case == 1 { 64u32 } else { 2048 }.to_le_bytes())
+                    .unwrap();
+                if case == 4 {
+                    e.protect(sp & !4095, 4096, 1).unwrap();
+                }
+                if case == 5 {
+                    e.memory_mut().watch_code(sp + 8, 4);
+                }
+            }
+            BATCHES.set(0);
+            compare(&mut a, &mut b, stop, 100_000);
+            assert_eq!(a.state.fuel, b.state.fuel);
+            if case == 0 {
+                assert!(BATCHES.get() > 0);
+            }
+            if matches!(case, 1 | 4 | 5) {
+                assert_eq!(BATCHES.get(), 0, "case {case}");
+            }
+        }
+    }
+
+    // spec: EXEC-NATIVE-4
+    #[test]
+    fn entry_carry_cannot_escape_into_the_final_scratch_slot() {
+        let code = [
+            0x0f, 0x42, 0xc3, 0x89, 0x44, 0x24, 0x04, 0x8b, 0x04, 0x24, 0x0f, 0xb6, 0x16, 0x00,
+            0x17, 0x46, 0x47, 0x49, 0x75, 0xec,
+        ];
+        let (mut a, mut b) = (executor(1024, OUTPUT), executor(1024, OUTPUT));
+        for e in [&mut a, &mut b] {
+            e.write(CODE, &code).unwrap();
+            e.write(SOURCE, &[255; 1024]).unwrap();
+            e.write(OUTPUT, &[1; 1024]).unwrap();
+            e.state.regs = [1, 1024, 0, 2, 0x2fff0, 0x2ffe0, SOURCE, OUTPUT];
+            e.state.eflags = 0x202;
+            e.write(0x2fff0, &1u32.to_le_bytes()).unwrap();
+        }
+        BATCHES.set(0);
+        compare(&mut a, &mut b, CODE + code.len() as u32, 100_000);
+        assert_eq!(a.memory().read(0x2fff4, 4).unwrap(), 2u32.to_le_bytes());
+        assert_eq!(BATCHES.get(), 0);
+    }
+
     // A64-TR-8: translation invalidation also revokes the specialized bridge.
     #[test]
     fn patches_unmaps_and_internal_stops_cannot_reuse_a_stale_bridge() {
@@ -284,12 +375,33 @@ mod tests {
     fn upstream_png_rows_compiler_configurations_execute_through_the_same_rule() {
         let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../target/codec-reference/png");
-        for name in ["up", "sub", "avg"] {
+        for name in [
+            "up",
+            "sub",
+            "avg",
+            "paeth_multibyte_pixel",
+            "paeth_1byte_pixel",
+        ] {
             for optimization in ["O1", "O2", "Os"] {
                 let bytes =
                     std::fs::read(directory.join(format!("{name}-{optimization}.bin"))).unwrap();
-                for (count, bpp) in [(0, 1), (1, 1), (3, 3), (129, 4), (4096, 3), (8192, 8)] {
-                    if name == "avg" && count < bpp {
+                for (count, bpp) in [
+                    (0, 1),
+                    (1, 1),
+                    (3, 3),
+                    (129, 1),
+                    (129, 4),
+                    (4096, 1),
+                    (4096, 3),
+                    (8192, 1),
+                    (8192, 8),
+                ] {
+                    if matches!(name, "avg" | "paeth_multibyte_pixel" | "paeth_1byte_pixel")
+                        && count < bpp
+                    {
+                        continue;
+                    }
+                    if name == "paeth_1byte_pixel" && bpp != 1 {
                         continue;
                     }
                     let (mut a, mut b) = (executor(count, OUTPUT), executor(count, OUTPUT));
@@ -310,7 +422,35 @@ mod tests {
                     BATCHES.set(0);
                     compare(&mut a, &mut b, stop, 1_000_000);
                     if count >= 4096 {
-                        assert!(BATCHES.get() > 0, "{name} {optimization}");
+                        if name == "paeth_1byte_pixel"
+                            || (name == "paeth_multibyte_pixel" && optimization == "Os")
+                        {
+                            assert_eq!(
+                                BATCHES.get(),
+                                0,
+                                "top-tested Paeth remains guest execution"
+                            );
+                            continue;
+                        }
+                        let image = ImageSnapshot::new(vec![Dependency {
+                            offset: 0,
+                            bytes: bytes.clone().into(),
+                            kind: DependencyKind::Code,
+                        }]);
+                        let mut budget = Budget {
+                            instructions: 10_000,
+                        };
+                        let reports: Vec<_> = analyze::discover(&image, &mut budget)
+                            .into_iter()
+                            .map(|c| {
+                                (
+                                    c.contract.computation,
+                                    verify::verify(&image, c, &mut budget)
+                                        .map(|b| b.frame().is_some()),
+                                )
+                            })
+                            .collect();
+                        assert!(BATCHES.get() > 0, "{name} {optimization}: {reports:?}");
                     }
                 }
             }

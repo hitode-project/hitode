@@ -1,6 +1,7 @@
 //! Exercise instruction commits, faults, retries and fuel through the native owner.
 use super::*;
 
+mod biased_cmov;
 mod channels;
 mod helper_gaps;
 mod jump_tables;

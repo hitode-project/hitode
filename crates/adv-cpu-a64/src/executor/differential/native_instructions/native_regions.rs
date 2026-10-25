@@ -39,6 +39,7 @@ impl ExecutionTrap for Admission {
                     },
                     upper_bounds: [None; 2],
                 }),
+                None,
                 add_bytes,
             )
         }]

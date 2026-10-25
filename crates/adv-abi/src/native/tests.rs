@@ -65,6 +65,32 @@ fn scalar_tail_cannot_read_an_unrestored_loop_carried_temporary() {
     ));
 }
 
+// spec: EXEC-NATIVE-4
+#[test]
+fn scratch_stores_cannot_depend_on_loop_carried_condition_flags() {
+    let body = vec![
+        0x0f, 0x42, 0xc3, 0x89, 0x44, 0x24, 0x04, 0x8b, 0x04, 0x24, 0x0f, 0xb6, 0x16, 0x00, 0x17,
+        0x46, 0x47, 0x49, 0x75, 0xec,
+    ];
+    for prefix in [None, Some(0x45), Some(0x4d)] {
+        let mut bytes: Vec<_> = prefix.into_iter().collect();
+        bytes.extend_from_slice(&body);
+        *bytes.last_mut().unwrap() = (-(bytes.len() as i8)) as u8;
+        let image = snapshot(bytes);
+        let candidates = analyze::discover(&image, &mut budget());
+        assert!(!candidates.is_empty());
+        for candidate in candidates {
+            assert!(matches!(
+                verify::verify(&image, candidate, &mut budget()),
+                Err(Rejection::Unsupported {
+                    reason: "condition reads flags before a local definition",
+                    ..
+                })
+            ));
+        }
+    }
+}
+
 // spec: EXEC-NATIVE-2, EXEC-NATIVE-3
 #[test]
 fn average_admission_checks_the_wide_sum_and_prefix_mapping() {
@@ -302,16 +328,19 @@ fn hidden_effects_and_unaccounted_edges_cannot_be_admitted() {
 #[test]
 fn budget_exhaustion_and_unsupported_rules_are_distinct() {
     let image = snapshot(byte_loop(6, 7, 1, 0, 0, false, true));
-    let mut candidate = copy(&image);
+    let candidate = copy(&image);
     assert!(matches!(
         verify::verify(&image, candidate.clone(), &mut Budget { instructions: 2 }),
         Err(Rejection::Timeout)
     ));
-    candidate.contract = ReferenceContract::get(Computation::PngPaeth);
+    let mut bytes = vec![0x0f, 0xaf, 0xc0]; // IMUL lies outside the checked integer subset.
+    bytes.extend(byte_loop(6, 7, 1, 0, 0, false, true));
+    *bytes.last_mut().unwrap() = (-(bytes.len() as i8)) as u8;
+    let unsupported = snapshot(bytes);
     assert!(matches!(
-        verify::verify(&image, candidate, &mut budget()),
+        verify::verify(&unsupported, copy(&unsupported), &mut budget()),
         Err(Rejection::Unsupported {
-            reason: "reference recurrence",
+            reason: "instruction form",
             ..
         })
     ));
