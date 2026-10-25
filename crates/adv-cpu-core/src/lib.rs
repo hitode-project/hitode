@@ -41,6 +41,7 @@ pub mod interpreter;
 pub mod machine_memory;
 #[doc(hidden)]
 pub mod memory;
+pub mod native_region;
 #[doc(hidden)]
 pub mod perf_map;
 #[doc(hidden)]

@@ -1535,6 +1535,7 @@ mod tests {
             },
             &|_, _| false,
             &|_| None,
+            &|_, _| Vec::new(),
             0x037f,
         );
         println!(

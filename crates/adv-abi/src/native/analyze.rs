@@ -34,6 +34,8 @@ pub fn discover(image: &ImageSnapshot, budget: &mut Budget) -> Vec<CandidateBind
             };
             let mut body = Decoder::with_ip(32, bytes, u64::from(start), DecoderOptions::NONE);
             let (mut source, mut destination, mut remaining) = (None, None, None);
+            let values = std::array::from_fn(|r| Expression::register(Register(r as u8)));
+            let mut increments = [false; 8];
             let mut adds = false;
             while body.can_decode() && budget.instructions != 0 {
                 budget.instructions -= 1;
@@ -42,26 +44,48 @@ pub fn discover(image: &ImageSnapshot, budget: &mut Budget) -> Vec<CandidateBind
                     && matches!(step.mnemonic(), Mnemonic::Mov | Mnemonic::Movzx)
                     && verify::plain_memory(&step)
                 {
-                    source = verify::register(step.memory_base())
-                        .map(|r| (r, step.memory_displacement32()));
+                    source = verify::address(&step, &values);
                 }
                 if step.op0_kind() == OpKind::Memory
                     && matches!(step.mnemonic(), Mnemonic::Mov | Mnemonic::Add)
                     && verify::plain_memory(&step)
                 {
-                    destination = verify::register(step.memory_base())
-                        .map(|r| (r, step.memory_displacement32()));
+                    destination = verify::address(&step, &values);
                     adds = step.mnemonic() == Mnemonic::Add;
                 }
                 if step.mnemonic() == Mnemonic::Dec && step.op0_kind() == OpKind::Register {
-                    remaining = verify::register(step.op0_register());
+                    remaining = verify::register(step.op0_register()).map(Expression::register);
+                }
+                if step.mnemonic() == Mnemonic::Inc
+                    && let Some(r) = verify::register(step.op0_register())
+                {
+                    increments[r.index() as usize] = true;
+                }
+                if step.mnemonic() == Mnemonic::Cmp
+                    && let (Some(a), Some(b)) = (
+                        verify::register(step.op0_register()),
+                        verify::register(step.op1_register()),
+                    )
+                {
+                    let pair = match (
+                        increments[a.index() as usize],
+                        increments[b.index() as usize],
+                    ) {
+                        (true, false) => Some((b, a)),
+                        (false, true) => Some((a, b)),
+                        _ => None,
+                    };
+                    if let Some((bound, index)) = pair {
+                        remaining = Expression::binary(
+                            Binary::Subtract,
+                            Expression::register(bound),
+                            Expression::register(index),
+                        );
+                    }
                 }
             }
-            let (
-                Some((source, source_offset)),
-                Some((destination, destination_offset)),
-                Some(remaining),
-            ) = (source, destination, remaining)
+            let (Some(source), Some(destination), Some(remaining)) =
+                (source, destination, remaining)
             else {
                 continue;
             };
@@ -74,21 +98,12 @@ pub fn discover(image: &ImageSnapshot, budget: &mut Budget) -> Vec<CandidateBind
                 &[Computation::Lz77]
             };
             for &computation in computations {
-                let source = Expression::binary(
-                    Binary::Add,
-                    Expression::register(source),
-                    Expression::constant(Width::Dword, u64::from(source_offset)),
-                )
-                .expect("32-bit address");
-                let destination = Expression::binary(
-                    Binary::Add,
-                    Expression::register(destination),
-                    Expression::constant(Width::Dword, u64::from(destination_offset)),
-                )
-                .expect("32-bit address");
-                let remaining = Expression::register(remaining);
-                let Some(view) = byte_view(computation, source, destination, remaining.clone())
-                else {
+                let Some(view) = byte_view(
+                    computation,
+                    source.clone(),
+                    destination.clone(),
+                    remaining.clone(),
+                ) else {
                     continue;
                 };
                 candidates.push(CandidateBinding {
@@ -99,7 +114,9 @@ pub fn discover(image: &ImageSnapshot, budget: &mut Budget) -> Vec<CandidateBind
                     view,
                     cutpoints: vec![start],
                     exits: vec![end],
-                    proof: ProofHint::ForwardBytes { remaining },
+                    proof: ProofHint::ForwardBytes {
+                        remaining: remaining.clone(),
+                    },
                 });
             }
         }

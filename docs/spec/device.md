@@ -222,6 +222,18 @@ Comparing against the last publication keeps every slot's damage history complet
 **Rule**: Static codec kernels MUST require matching signatures, calling conventions, and bounded inputs. Native acceleration MUST preserve library-level numerical tolerances and MUST NOT authorize arbitrary function replacement.
 **Verification**: Test
 
+### DEV-CODEC-1 Integer byte kernels
+
+**Rule**: Integer codec kernels MUST implement the byte semantics below without guest state, allocation, callbacks or I/O. Invalid sizes or distances MUST be rejected before writing.
+**Verification**: Test
+
+| Computation | Byte semantics |
+|---|---|
+| PNG Sub/Up/Average/Paeth | In-place modulo-256 output; zero left and upper-left before the first pixel |
+| PNG Average | Widen the sum before division |
+| PNG Paeth | Break ties in left, above, upper-left order |
+| LZ77 | Ordered reads include newly written history for overlapping matches |
+
 ### DEV-VIDEO-1 Native packet decoding
 
 **Rule**: Whole-packet Theora replacements MAY own opaque decoder state after complete library-family admission.

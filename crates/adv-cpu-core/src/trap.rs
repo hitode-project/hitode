@@ -5,6 +5,11 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 /// A caller-owned trap receiver. API decoding and all host continuation state
 /// belong to the machine and ABI layers, outside the execution layer.
 pub trait ExecutionTrap {
+    /// See [`crate::backend::TrapHandler::native_region`].
+    fn native_region(&self, _pc: u32, _code: &[u8]) -> Vec<crate::native_region::NativeRegion> {
+        Vec::new()
+    }
+
     fn leaf_call(&self, _pc: u32, _word: u32) -> bool {
         false
     }

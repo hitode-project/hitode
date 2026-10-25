@@ -66,7 +66,7 @@ Cached successors MUST match entry EIP and block-cache generation. They MUST pas
 
 ### EXEC-NATIVE-2 Forward byte recurrence proofs
 
-**Rule**: Admission MUST check each decoded instruction, the byte recurrence, all register and flag effects, and the decreasing counter's complete control flow. Unsupported instructions or recurrences MUST return Unsupported, and exhausted proof budgets MUST return Timeout. Counterexamples MUST remain distinct from both results.
+**Rule**: Admission MUST check each decoded instruction, the byte recurrence, all register and flag effects, and the decreasing byte count's complete control flow. Unsupported instructions or recurrences MUST return Unsupported, and exhausted proof budgets MUST return Timeout. Counterexamples MUST remain distinct from both results.
 **Verification**: Test
 
 The single-byte rule checks a positive-count loop body with one conditional
@@ -78,6 +78,9 @@ disjoint rows; PNG Sub and LZ77 require a positive backward distance and retain
 ordered reads of newly written history. A zero counter declines at this body;
 the enclosing guest function owns its zero-iteration path. State-view offsets
 are part of the checked address expressions, independent of register allocation.
+The count may be an explicit down-counter or a bound minus an advancing index.
+Affine address/count relations are checked modulo 2^32; entry conditions rule
+out wrapping buffer spans.
 
 ### EXEC-NATIVE-3 Typed state and shared integer semantics
 

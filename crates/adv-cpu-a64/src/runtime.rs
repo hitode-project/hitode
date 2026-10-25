@@ -100,6 +100,8 @@ pub struct Runtime {
     pub leaf: u64,
     #[cfg(test)]
     pub channel_batches: u64,
+    #[cfg(test)]
+    pub native_batches: u64,
 }
 
 impl Runtime {
@@ -109,6 +111,8 @@ impl Runtime {
             leaf: 0,
             #[cfg(test)]
             channel_batches: 0,
+            #[cfg(test)]
+            native_batches: 0,
             cpu,
             window,
             shadow: 0,
@@ -226,6 +230,8 @@ const ACCESS: u32 = field(offset_of!(Runtime, access));
 const INTERPRET: u32 = field(offset_of!(Runtime, interpret));
 #[cfg(test)]
 pub(crate) const CHANNEL_BATCHES: u32 = field(offset_of!(Runtime, channel_batches));
+#[cfg(test)]
+pub(crate) const NATIVE_BATCHES: u32 = field(offset_of!(Runtime, native_batches));
 pub(crate) const CLASSES: u32 = field(offset_of!(Runtime, classes));
 pub(crate) const ALIAS: u32 = field(offset_of!(Runtime, alias));
 pub(crate) const ALIAS_CLASSES: u32 = field(offset_of!(Runtime, alias_classes));

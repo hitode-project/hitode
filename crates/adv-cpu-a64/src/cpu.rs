@@ -486,6 +486,14 @@ struct Raw<'a> {
 }
 
 impl ExecutionTrap for Raw<'_> {
+    fn native_region(
+        &self,
+        pc: u32,
+        code: &[u8],
+    ) -> Vec<adv_cpu_core::native_region::NativeRegion> {
+        self.handler.native_region(pc, code)
+    }
+
     fn leaf_call(&self, pc: u32, word: u32) -> bool {
         self.handler.leaf_call(pc, word)
     }

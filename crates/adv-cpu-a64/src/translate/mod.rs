@@ -43,6 +43,7 @@ mod decode;
 pub mod first;
 mod flags;
 mod integer;
+mod native_region;
 mod ops;
 mod pixels;
 mod simd;
@@ -110,6 +111,7 @@ pub struct Unit {
     pub(crate) images: Vec<(u32, u32)>,
     pub(crate) tables: Vec<tables::Table>,
     pub(crate) trace: Trace,
+    regions: Vec<(usize, adv_cpu_core::native_region::NativeRegion)>,
 }
 
 impl Unit {
@@ -125,6 +127,7 @@ impl Unit {
         leaf: &dyn Fn(u32, u32) -> bool,
         redirect: &dyn Fn(u32) -> Option<(u32, Vec<u8>)>,
     ) {
+        self.regions.clear();
         self.trace.build(memory, eip, stops, leaf, redirect);
         tables::prepare(self, memory);
         for &(start, len) in &self.trace.code {
@@ -413,6 +416,7 @@ struct Translator<'a> {
     stubs: Stubs,
     /// Guest instructions whose accesses check their page first.
     checked: &'a dyn Fn(u32) -> bool,
+    regions: &'a [(usize, adv_cpu_core::native_region::NativeRegion)],
     /// The index of the first helper of the unit.
     helpers: u32,
     /// Whether the instruction being emitted is one.
@@ -455,9 +459,11 @@ pub fn translate(
     stubs: Stubs,
     leaf: &dyn Fn(u32, u32) -> bool,
     redirect: &dyn Fn(u32) -> Option<(u32, Vec<u8>)>,
+    admit: &dyn Fn(u32, &[u8]) -> Vec<adv_cpu_core::native_region::NativeRegion>,
     control: u16,
 ) {
     work.unit.build(memory, eip, stops, leaf, redirect);
+    work.unit.prepare_regions(memory, admit, checked);
     Jit {
         code: &mut work.code,
         features,
@@ -495,7 +501,12 @@ impl Backend for Jit<'_> {
             retired,
             channels,
         } = &mut *self.code;
-        let Unit { trace, tables, .. } = unit;
+        let Unit {
+            trace,
+            tables,
+            regions,
+            ..
+        } = unit;
         *channels = false;
         asm.reset();
         labels.clear();
@@ -518,6 +529,7 @@ impl Backend for Jit<'_> {
             tables,
             stubs: self.stubs,
             checked: self.checked,
+            regions,
             helpers: self.helpers,
             checking: false,
             state: State::CANONICAL,
@@ -646,6 +658,7 @@ impl Translator<'_> {
         }
         if !steady {
             self.asm.bind(self.labels[index]);
+            self.native_batch(index);
             self.pixel_start(index);
             self.channel_batch(index);
         }

@@ -121,9 +121,16 @@ independent verifier decodes their complete code through `adv-cpu-core::integer`
 and checks a supported recurrence before issuing a binding. Typed expressions
 retain memory versions and complete state for each exit; entry conditions are
 parameterized obligations for a publication bridge. Its forward-byte rule covers
-LZ77 and PNG Sub/Up bodies. Unsupported
-recurrences remain guest work. These admission data types do not install
-execution entries or call device kernels.
+LZ77 and PNG Sub/Up bodies, including indexed loops. Unsupported recurrences
+remain guest work. Wine's `adv-drv::codec` supplies cold admission for PNG
+Sub/Up through `adv-machine::NativeAdmission`. The A64 front end offers complete
+hot loop bodies; only verified bindings lower to engine-neutral native plans.
+The back end specializes mappings, calls `adv-device::codec_kernel` on directly
+accessible guest buffers and restores exact state through a checked scalar
+tail. The ordinary translation cache owns these bridges and revokes them on
+code changes, new stops and unmapping. No per-call analysis or identity hashing
+is performed. Device kernels also implement Average, Paeth and overlapping LZ77;
+those computations retain guest execution until their admitted wiring exists.
 
 - **Graphics:** GDI, DirectDraw and Direct3D 9 share neutral surfaces and drawing services. Direct3D 9 shaders are translated within the limits in [docs/spec/graphics.md](docs/spec/graphics.md). Device services follow [docs/spec/device.md](docs/spec/device.md).
 - **Audio:** one mixer resamples with rubato and decodes with Symphonia. Wine MIDI output synthesizes through OxiSynth with the bundled General MIDI bank. Shared PCM buffers are read through stable views, so a device never reads storage that the guest has freed.

@@ -408,6 +408,13 @@ pub trait GuestExt: Guest {
 impl<G: Guest + ?Sized> GuestExt for G {}
 
 pub trait TrapHandler {
+    /// Preparation only: admit the complete offered loop body. This is never
+    /// called by generated code; the returned capability obeys NativeRegion's
+    /// safety contract and is invalidated with the translation's code bytes.
+    fn native_region(&self, _pc: u32, _code: &[u8]) -> Vec<crate::native_region::NativeRegion> {
+        Vec::new()
+    }
+
     /// Authorize an exact PUSH token / INT pair for a light host call.
     fn leaf_call(&self, _pc: u32, _word: u32) -> bool {
         false

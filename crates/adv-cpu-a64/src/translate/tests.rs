@@ -88,6 +88,7 @@ fn full_x87_units_keep_short_branches_to_cold_code_in_reach() {
             stubs,
             &leaf,
             &|_| None,
+            &|_, _| Vec::new(),
             0x037f,
         );
         assert!(
@@ -137,6 +138,7 @@ fn bytecode_vm_dispatch_instruction_gate() {
         stubs,
         &|_, _| false,
         &|_| None,
+        &|_, _| Vec::new(),
         0x037f,
     );
     let branch = work.words().iter().position(|&w| w == br(X17)).unwrap();
@@ -161,6 +163,7 @@ fn bytecode_vm_dispatch_instruction_gate() {
         stubs,
         &|_, _| false,
         &|_| None,
+        &|_, _| Vec::new(),
         0x037f,
     );
     assert_eq!(work.unit.tables.len(), 1);
@@ -323,6 +326,7 @@ impl Harness {
             },
             &|_, _| false,
             &|_| None,
+            &|_, _| Vec::new(),
             0x037f,
         );
         assert!(
@@ -786,6 +790,7 @@ fn switch_table_recognition_checks_unsigned_bounds_pages_and_index_provenance() 
                 stubs,
                 &|_, _| false,
                 &|_| None,
+                &|_, _| Vec::new(),
                 0x037f,
             );
             let count = work.unit.tables.first().map_or(0, |t| t.targets.len());

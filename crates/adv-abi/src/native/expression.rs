@@ -100,6 +100,7 @@ impl Expression {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn register_offset(&self) -> Option<(Register, u32)> {
         match self.kind.as_ref() {
             Kind::Register(r) => Some((*r, 0)),
@@ -113,11 +114,107 @@ impl Expression {
         }
     }
 
+    /// A 32-bit affine address/count, modulo 2^32. This bounded form covers
+    /// pointer and indexed loops without solving general symbolic relations.
+    pub fn affine(&self) -> Option<([u32; 8], u32)> {
+        if self.width != Width::Dword {
+            return None;
+        }
+        match self.kind.as_ref() {
+            Kind::Constant(c) => Some(([0; 8], *c as u32)),
+            Kind::Register(r) => {
+                let mut coefficients = [0; 8];
+                coefficients[r.index() as usize] = 1;
+                Some((coefficients, 0))
+            }
+            Kind::Binary(op @ (Binary::Add | Binary::Subtract), a, b) => {
+                let (mut a, c) = a.affine()?;
+                let (b, d) = b.affine()?;
+                let sign: u32 = if *op == Binary::Add { 1 } else { u32::MAX };
+                for (a, b) in a.iter_mut().zip(b) {
+                    *a = a.wrapping_add(b.wrapping_mul(sign));
+                }
+                Some((a, c.wrapping_add(d.wrapping_mul(sign))))
+            }
+            Kind::Binary(Binary::Multiply, a, b) => {
+                let (mut coefficients, constant) = a.affine()?;
+                let factor = b.as_constant()? as u32;
+                for coefficient in &mut coefficients {
+                    *coefficient = coefficient.wrapping_mul(factor);
+                }
+                Some((coefficients, constant.wrapping_mul(factor)))
+            }
+            _ => None,
+        }
+    }
+
+    fn linear(coefficients: [u32; 8], constant: u32) -> Self {
+        let mut result = None;
+        for (r, coefficient) in coefficients.into_iter().enumerate() {
+            if coefficient == 0 {
+                continue;
+            }
+            let value = Self::register(Register(r as u8));
+            let value = match coefficient {
+                1 => value,
+                u32::MAX => {
+                    let zero = Self::constant(Width::Dword, 0);
+                    Self::new(Width::Dword, Kind::Binary(Binary::Subtract, zero, value))
+                }
+                _ => Self::new(
+                    Width::Dword,
+                    Kind::Binary(
+                        Binary::Multiply,
+                        value,
+                        Self::constant(Width::Dword, coefficient.into()),
+                    ),
+                ),
+            };
+            result = Some(match result {
+                None => value,
+                Some(old) => Self::new(Width::Dword, Kind::Binary(Binary::Add, old, value)),
+            });
+        }
+        match (result, constant) {
+            (None, c) => Self::constant(Width::Dword, c.into()),
+            (Some(value), 0) => value,
+            (Some(value), c) => Self::new(
+                Width::Dword,
+                Kind::Binary(Binary::Add, value, Self::constant(Width::Dword, c.into())),
+            ),
+        }
+    }
+
+    pub(crate) fn after(&self, registers: &[Expression; 8]) -> Option<Self> {
+        let (coefficients, mut constant) = self.affine()?;
+        let mut result = [0u32; 8];
+        for (coefficient, value) in coefficients.into_iter().zip(registers) {
+            if coefficient == 0 {
+                continue;
+            }
+            let (terms, c) = value.affine()?;
+            constant = constant.wrapping_add(coefficient.wrapping_mul(c));
+            for (result, term) in result.iter_mut().zip(terms) {
+                *result = result.wrapping_add(coefficient.wrapping_mul(term));
+            }
+        }
+        Some(Self::linear(result, constant))
+    }
+
     pub fn binary(op: Binary, left: Self, right: Self) -> Option<Self> {
         if left.width != right.width {
             return None;
         }
         let width = left.width;
+        if matches!(op, Binary::Add | Binary::Subtract)
+            && let (Some((mut a, c)), Some((b, d))) = (left.affine(), right.affine())
+        {
+            let sign: u32 = if op == Binary::Add { 1 } else { u32::MAX };
+            for (a, b) in a.iter_mut().zip(b) {
+                *a = a.wrapping_add(b.wrapping_mul(sign));
+            }
+            return Some(Self::linear(a, c.wrapping_add(d.wrapping_mul(sign))));
+        }
         let comparison = matches!(
             op,
             Binary::Equal | Binary::LessUnsigned | Binary::LessSigned

@@ -10,6 +10,7 @@ use adv_cpu::backend::{Guest, Prot, asm::Asm};
 use adv_machine::{Env, Ext, HostFn, Outcome, Sys, layout::PAGE};
 
 mod mdct;
+mod rows;
 mod theora;
 
 pub use mdct::{BUNDLED_SIGNATURES, Stats};
@@ -29,6 +30,9 @@ struct Images {
 
 /// Start binding before Wine maps the program and its libraries.
 pub fn install(ext: &mut Ext, mode: Mode) {
+    if mode == Mode::Native {
+        ext.insert(adv_machine::NativeAdmission(rows::admit));
+    }
     ext.insert(Images {
         mode,
         mapped: BTreeMap::new(),

@@ -48,6 +48,23 @@ fn copy(image: &ImageSnapshot) -> CandidateBinding {
         .unwrap()
 }
 
+// EXEC-NATIVE-3: a correct one-step recurrence alone cannot justify a scalar
+// tail if its flags read a temporary left by an earlier iteration.
+#[test]
+fn scalar_tail_cannot_read_an_unrestored_loop_carried_temporary() {
+    let mut bytes = vec![0x39, 0xd0]; // CMP EAX, EDX carries CF into the final DEC.
+    bytes.extend(byte_loop(6, 7, 1, 0, 0, false, true));
+    *bytes.last_mut().unwrap() = (-(bytes.len() as i8)) as u8;
+    let image = snapshot(bytes);
+    assert!(matches!(
+        verify::verify(&image, copy(&image), &mut budget()),
+        Err(Rejection::Unsupported {
+            reason: "scalar tail reads a loop-carried temporary before defining it",
+            ..
+        })
+    ));
+}
+
 // spec: EXEC-NATIVE-1, EXEC-NATIVE-2
 #[test]
 fn register_allocation_and_offsets_do_not_require_signatures() {

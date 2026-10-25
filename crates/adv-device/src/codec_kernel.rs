@@ -1,5 +1,5 @@
-//! Stateless codec math using the same Symphonia DSP implementation as decoding.
-//! Plans and scratch belong to one caller; no guest pointers, stream state or I/O.
+//! Stateless codec math. Buffers, plans and scratch belong to one caller;
+//! no guest pointers, stream state or I/O enter these kernels.
 use symphonia::core::dsp::mdct::Imdct;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -7,6 +7,108 @@ pub enum KernelError {
     UnsupportedSize,
     NonFiniteInput,
     NonFiniteOutput,
+}
+
+/// PNG Sub on a complete row (DEV-CODEC-1). The first pixel is unchanged.
+pub fn png_sub(row: &mut [u8], bpp: usize) -> Result<(), KernelError> {
+    if bpp == 0 {
+        return Err(KernelError::UnsupportedSize);
+    }
+    for i in bpp..row.len() {
+        row[i] = row[i].wrapping_add(row[i - bpp]);
+    }
+    Ok(())
+}
+
+/// Sub on a remaining row segment. `prefix` is the preceding pixel, or its
+/// initial portion when the segment is shorter than one pixel. It is disjoint
+/// from `row`; later predictor bytes come from the updated row itself.
+pub fn png_sub_segment(row: &mut [u8], prefix: &[u8]) -> Result<(), KernelError> {
+    if prefix.is_empty() {
+        return Err(KernelError::UnsupportedSize);
+    }
+    for i in 0..row.len() {
+        let left = if i < prefix.len() {
+            prefix[i]
+        } else {
+            row[i - prefix.len()]
+        };
+        row[i] = row[i].wrapping_add(left);
+    }
+    Ok(())
+}
+
+/// PNG Up on a complete row or corresponding row segments (DEV-CODEC-1).
+pub fn png_up(row: &mut [u8], previous: &[u8]) -> Result<(), KernelError> {
+    if row.len() != previous.len() {
+        return Err(KernelError::UnsupportedSize);
+    }
+    for (byte, &above) in row.iter_mut().zip(previous) {
+        *byte = byte.wrapping_add(above);
+    }
+    Ok(())
+}
+
+/// PNG Average. The sum is widened before division and byte truncation.
+pub fn png_average(row: &mut [u8], previous: &[u8], bpp: usize) -> Result<(), KernelError> {
+    if row.len() != previous.len() || bpp == 0 {
+        return Err(KernelError::UnsupportedSize);
+    }
+    for i in 0..row.len() {
+        let left = if i < bpp { 0 } else { row[i - bpp] };
+        let predictor = (u16::from(left) + u16::from(previous[i])) / 2;
+        row[i] = row[i].wrapping_add(predictor as u8);
+    }
+    Ok(())
+}
+
+/// PNG Paeth. Ties prefer left, then above, then upper left.
+pub fn png_paeth(row: &mut [u8], previous: &[u8], bpp: usize) -> Result<(), KernelError> {
+    if row.len() != previous.len() || bpp == 0 {
+        return Err(KernelError::UnsupportedSize);
+    }
+    for i in 0..row.len() {
+        let (left, upper_left) = if i < bpp {
+            (0, 0)
+        } else {
+            (row[i - bpp], previous[i - bpp])
+        };
+        let above = previous[i];
+        let p = i32::from(left) + i32::from(above) - i32::from(upper_left);
+        let a = (p - i32::from(left)).abs();
+        let b = (p - i32::from(above)).abs();
+        let c = (p - i32::from(upper_left)).abs();
+        let predictor = if a <= b && a <= c {
+            left
+        } else if b <= c {
+            above
+        } else {
+            upper_left
+        };
+        row[i] = row[i].wrapping_add(predictor);
+    }
+    Ok(())
+}
+
+/// Forward LZ77 expansion. Reads include history written by this call.
+pub fn lz77(
+    window: &mut [u8],
+    destination: usize,
+    distance: usize,
+    length: usize,
+) -> Result<(), KernelError> {
+    if distance == 0
+        || distance > destination
+        || destination
+            .checked_add(length)
+            .is_none_or(|end| end > window.len())
+    {
+        return Err(KernelError::UnsupportedSize);
+    }
+    for i in destination..destination + length {
+        window[i] = window[i - distance];
+    }
+    Ok(())
 }
 
 struct Plan {
@@ -50,6 +152,51 @@ impl ImdctCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // spec: DEV-CODEC-1
+    #[test]
+    fn integer_rows_and_overlapping_expansion() {
+        let mut row = [1, 2, 3, 4, 5, 6];
+        png_sub(&mut row, 2).unwrap();
+        assert_eq!(row, [1, 2, 4, 6, 9, 12]);
+        let mut row = [1, 2, 3, 4, 5, 6];
+        png_up(&mut row, &[250, 254, 0, 255, 5, 6]).unwrap();
+        assert_eq!(row, [251, 0, 3, 3, 10, 12]);
+        let mut row = [1, 2, 3, 4, 5, 6];
+        png_average(&mut row, &[250, 254, 200, 100, 250, 10], 2).unwrap();
+        assert_eq!(row, [126, 129, 166, 118, 213, 70]);
+        let mut row = [128, 0];
+        png_average(&mut row, &[254, 255], 1).unwrap();
+        assert_eq!(row, [255, 255]);
+        for (filtered, above, expected) in [
+            ([20, 0], [100, 90], [120, 120]),
+            ([246, 0], [100, 120], [90, 120]),
+            ([20, 0], [100, 80], [120, 100]),
+        ] {
+            let mut row = filtered;
+            png_paeth(&mut row, &above, 1).unwrap();
+            assert_eq!(row, expected);
+        }
+        let mut window = [b'a', b'b', 0, 0, 0, 0, 0, 0];
+        lz77(&mut window, 2, 2, 6).unwrap();
+        assert_eq!(&window, b"abababab");
+        lz77(&mut window, 1, 1, 7).unwrap();
+        assert_eq!(&window, b"aaaaaaaa");
+    }
+
+    #[test]
+    fn byte_kernel_rejection_has_no_effects() {
+        let mut row = [255, 128, 64];
+        let original = row;
+        assert!(png_sub(&mut row, 0).is_err());
+        assert!(png_up(&mut row, &[1]).is_err());
+        assert!(png_average(&mut row, &[1, 2, 3], 0).is_err());
+        assert!(png_paeth(&mut row, &[1], 1).is_err());
+        for (at, distance, len) in [(1, 0, 1), (1, 2, 1), (2, 1, 2), (1, 1, usize::MAX)] {
+            assert!(lz77(&mut row, at, distance, len).is_err());
+        }
+        assert_eq!(row, original);
+    }
 
     #[test]
     fn unscaled_impulse_has_correct_order_and_reuses_bounded_scratch() {

@@ -969,6 +969,11 @@ impl Native {
     }
 
     #[cfg(test)]
+    pub(crate) fn native_batches(&self) -> u64 {
+        self.runtime.native_batches
+    }
+
+    #[cfg(test)]
     pub(crate) fn unit_address(&self, eip: u32) -> Option<usize> {
         self.units.get(&eip).map(|entry| entry.unit)
     }
@@ -1178,6 +1183,16 @@ impl Native {
                     .as_ref()?;
                 let (target, original) = handler.redirect(pc)?;
                 Some((target, original.to_vec()))
+            },
+            &|pc, code| {
+                if self.bridge.is_null() {
+                    return Vec::new();
+                }
+                // SAFETY: admission runs synchronously on the execution owner.
+                unsafe { &*self.bridge.cast::<Bridge<'_>>() }
+                    .handler
+                    .as_ref()
+                    .map_or_else(Vec::new, |handler| handler.native_region(pc, code))
             },
             control,
         );

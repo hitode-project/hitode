@@ -220,6 +220,10 @@ pub struct Env<'a> {
     pub thunk: u32,
 }
 
+/// A cold-path admission service supplied by the personality's codec wiring.
+/// It receives immutable current code, never guest state or live memory views.
+pub struct NativeAdmission(pub fn(u32, &[u8]) -> Vec<adv_cpu::native_region::NativeRegion>);
+
 impl Env<'_> {
     /// `i`th stack argument of the current host call. Unreadable args read as 0 (and log).
     pub fn arg(&self, i: u32) -> u32 {
@@ -1719,6 +1723,15 @@ impl Dispatch<'_> {
 }
 
 impl TrapHandler for Dispatch<'_> {
+    fn native_region(&self, pc: u32, code: &[u8]) -> Vec<adv_cpu::native_region::NativeRegion> {
+        if self.sys.trace.enabled() || self.sys.call_limit.is_some() {
+            return Vec::new();
+        }
+        self.ext
+            .try_get::<NativeAdmission>()
+            .map_or_else(Vec::new, |admission| (admission.0)(pc, code))
+    }
+
     fn leaf_call(&self, pc: u32, word: u32) -> bool {
         if self.sys.trace.enabled()
             || self.sys.call_limit.is_some()
