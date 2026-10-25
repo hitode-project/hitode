@@ -58,22 +58,14 @@ Builds for each platform are on [GitHub Releases](https://github.com/hitode-proj
 
 Hitode has two parts: a **runtime** that runs Windows programs, and a **player** that hosts it on each platform.
 
-```mermaid
-flowchart TB
-  game["Original game<br/>exe · DLLs · translation patches"]
-  subgraph core["Runtime"]
-    direction LR
-    jit["x86 → ARM64 JIT"] ~~~ win["Windows behavior"] ~~~ dev["Graphics / audio / video devices"]
-  end
-  subgraph player["Player"]
-    direction LR
-    shell["Host shell<br/>Metal / Vulkan display · touch and keyboard · audio"] ~~~ launcher["Launcher<br/>library · settings · in-game overlay"]
-  end
-  os["macOS · iOS / iPadOS · Android"]
-  game --> core --> player --> os
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/architecture-dark.svg">
+  <img src="docs/images/architecture-light.svg" width="760" alt="Architecture: the original game runs in one Hitode process. Host-native code runs the experience (audio, video, graphics), the system (NT kernel, Wine server, drivers) and execution (x86 to ARM64 JIT, native bodies); Wine covers the long tail. Hitode runs on macOS, iOS and Android.">
+</picture>
 
 The approach follows console emulators: the game's own code runs unchanged, and Hitode provides the "hardware" it expects, namely a subset of Windows, graphics, audio and video devices, time and threads.
+
+Windows behavior comes from Wine, built together with the rest of Hitode; its modules run as guest code and cover the long tail. Everything the player feels is host code: audio mixing, MIDI, video decoding, DirectDraw and Direct3D 9, and the timing of all of them. The NT kernel, the Wine server and the drivers run in the same process, so the layers call each other directly. Where a Wine function's bytes are verified unchanged, a native body may run it as host code with the same result.
 
 The runtime also runs without the launcher. `adv-run` is its command-line entry point, for debugging and automated tests.
 
@@ -85,11 +77,11 @@ The runtime also runs without the launcher. `adv-run` is its command-line entry 
 |---|---|---|---|
 | Games | Specific engines | Most Windows programs | 32-bit visual novel engines |
 | Needs a port | Often | No | No |
-| Original patches | Depends on the port | Yes | Yes |
-| Setup | Easy | More involved | Pick a folder |
-| Size | Small | Larger | Small |
+| Original and translation patches | Depends on the port | Yes | Yes |
+| Setup | Easy | Versions and settings often tuned per game | Pick a folder |
+| Audio and video | Native in the port | Wine's general-purpose drivers | Native on the host |
 
-Hitode aims for a balance between the two: it loads the original program and patches as they are, but implements only what visual novels use, and spends its effort on the playing experience and engine compatibility.
+Hitode sits between the two: it loads the original program and patches as they are, takes the long tail of Windows behavior from Wine, and runs audio, video and graphics, the parts players feel directly, natively on the host. Every part is built and released together, so a compatibility problem is fixed once, in code, for every game and platform, without per-game settings.
 
 ## Building
 

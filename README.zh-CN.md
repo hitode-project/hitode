@@ -58,22 +58,14 @@ Hitode 不针对某个游戏或引擎做适配，而是实现 32 位 Windows 视
 
 Hitode 分为两部分：一个运行 Windows 程序的**运行时核心**，以及在各平台上承载它的**播放器**。
 
-```mermaid
-flowchart TB
-  game["原版游戏<br/>exe · DLL · 本地化补丁"]
-  subgraph core["运行核心"]
-    direction LR
-    jit["x86 → ARM64 JIT"] ~~~ win["Windows 行为"] ~~~ dev["图形 / 音频 / 视频设备"]
-  end
-  subgraph player["播放器"]
-    direction LR
-    shell["宿主壳<br/>Metal / Vulkan 画面 · 触控与键盘 · 音频"] ~~~ launcher["启动器<br/>游戏库 · 设置 · 游戏内覆盖层"]
-  end
-  os["macOS · iOS / iPadOS · Android"]
-  game --> core --> player --> os
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/architecture-dark.zh-CN.svg">
+  <img src="docs/images/architecture-light.zh-CN.svg" width="760" alt="架构图：原版游戏运行在一个 Hitode 进程里。体验（音频、视频、图形）、系统（NT 内核、Wine server、驱动）和执行（x86 到 ARM64 JIT、原生函数体）由宿主原生实现，Wine 负责长尾兼容。Hitode 运行在 macOS、iOS 和 Android 上。">
+</picture>
 
 思路借鉴主机模拟器：游戏自己的代码原样运行，Hitode 只提供它期待的“硬件”，也就是 Windows 的一个子集、图形音频视频设备、时间和线程。
+
+Windows 行为来自随 Hitode 一起构建的 Wine，它的模块作为 guest 代码运行，负责长尾兼容。玩家能感受到的部分全部是宿主代码：混音、MIDI、视频解码、DirectDraw 和 Direct3D 9，以及它们的计时。NT 内核、Wine server 和驱动都在同一个进程里，层与层直接调用。字节经过校验、确认未被改动的 Wine 函数，可以由原生函数体以宿主代码执行，结果完全相同。
 
 核心也可以脱离启动器单独运行，`adv-run` 是它的命令行入口，便于调试和自动化测试。
 
@@ -85,11 +77,11 @@ flowchart TB
 |---|---|---|---|
 | 支持的游戏 | 特定引擎 | 大多数 Windows 程序 | 32 位视觉小说引擎 |
 | 需要移植版 | 往往需要 | 不需要 | 不需要 |
-| 原版补丁 | 视移植情况 | 可以 | 可以 |
-| 上手配置 | 简单 | 较繁琐 | 选文件夹即可 |
-| 体积 | 小 | 较大 | 小 |
+| 原版与汉化补丁 | 视移植情况 | 可以 | 可以 |
+| 上手 | 简单 | 常要按游戏调整版本和设置 | 选文件夹即可 |
+| 音画 | 移植版原生实现 | Wine 的通用驱动 | 宿主原生实现 |
 
-Hitode 想在两者之间找一个平衡点：照常加载原版程序和补丁，但只实现视觉小说用得上的部分，把精力集中在游玩体验和引擎兼容上。
+Hitode 介于两者之间：照常加载原版程序和补丁，Windows 的长尾行为交给 Wine，玩家能直接感受到的音频、视频和图形由宿主原生实现。所有部分一起构建、一起发布，兼容问题在代码里修一次，所有游戏和平台一起受益，不必为每个游戏单独调设置。
 
 ## 构建
 
