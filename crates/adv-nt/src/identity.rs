@@ -3,7 +3,7 @@
 //! `tools/wine/identity.py` writes a table for every module of the Wine
 //! distribution to `share/hitode/identity/<module>.tsv`: a hash of the
 //! image's headers, then each function's RVA, size, a hash of its bytes
-//! with base relocations masked, and its name. A mapped image whose
+//! with relocations masked, and its name. A mapped image whose
 //! headers hash to the table's is that build, so its addresses name
 //! functions and its functions can be found by name. Tables load on first
 //! use and are shared by every process.
@@ -20,7 +20,7 @@ pub struct Function {
     pub rva: u32,
     pub size: u32,
     /// The low half of the FNV-1a 64 hash of the bytes, with every dword a
-    /// base relocation patches zeroed.
+    /// relocation patches zeroed.
     pub hash: u32,
     pub name: Box<str>,
 }
@@ -109,10 +109,13 @@ impl Images {
 }
 
 /// `<install>/share/hitode/identity/<name>.tsv` for
-/// `<install>/lib/wine/i386-windows/<name>`.
+/// `<install>/lib/wine/i386-windows/<name>` or its Unix counterpart.
 fn table_of(dll: &Path) -> Option<(String, PathBuf)> {
     let directory = dll.parent()?;
-    if directory.file_name()? != "i386-windows" {
+    if !matches!(
+        directory.file_name()?.to_str()?,
+        "i386-windows" | "i386-unix"
+    ) {
         return None;
     }
     let install = directory.parent()?.parent()?.parent()?;
@@ -154,6 +157,27 @@ pub fn note_ntdll<B: adv_cpu::backend::Backend>(
         let (cpu, sys, ext) = (&mut machine.cpu, &mut machine.sys, &mut machine.ext);
         crate::native::bind(cpu, sys, ext, base, &pe);
     }
+}
+
+/// Records and binds an i386 Unix image after relocation, using sorted RVAs.
+pub fn note_unix(
+    env: &mut adv_machine::Env<'_>,
+    path: &Path,
+    base: u32,
+    image: &[u8],
+    relocations: &[u32],
+) {
+    let phoff = u32::from_le_bytes(image[28..32].try_into().unwrap()) as usize;
+    let phsize = u16::from_le_bytes(image[42..44].try_into().unwrap()) as usize;
+    let phnum = u16::from_le_bytes(image[44..46].try_into().unwrap()) as usize;
+    note_image(
+        env.ext,
+        base,
+        image.len() as u32,
+        Some(path),
+        &image[..52.max(phoff + phsize * phnum)],
+    );
+    crate::native::bind_relocated(env.cpu, env.sys, env.ext, base, relocations);
 }
 
 pub(crate) fn forget_image(ext: &mut Ext, base: u32) {

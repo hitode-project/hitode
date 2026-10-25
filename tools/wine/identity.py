@@ -11,7 +11,9 @@ and every function from the COFF symbol table of the unstripped image
 except import thunks: its RVA, size, a hash of its bytes with base
 relocations masked, and its undecorated name. Each module's table is
 written to STRIPPED_DIST/share/hitode/identity/<module>.tsv, so the runtime
-reads only the tables of the modules it maps.
+reads only the tables of the modules it maps. Unix i386 ELF modules use
+their ELF and program headers, STT_FUNC symbols (including local symbols),
+and the dwords patched by dynamic relocations.
 """
 
 import re
@@ -20,6 +22,7 @@ import sys
 from pathlib import Path
 
 MODULES = "lib/wine/i386-windows"
+UNIX_MODULES = "lib/wine/i386-unix"
 OUTPUT = "share/hitode/identity"
 IMAGE_SCN_CNT_CODE = 0x20
 IMAGE_REL_BASED_HIGHLOW = 3
@@ -124,6 +127,60 @@ def module_rows(debug: Image, stripped: Image) -> list[str]:
     return rows
 
 
+class Elf:
+    def __init__(self, data: bytes):
+        self.data = data
+        if data[:6] != b"\x7fELF\x01\x01" or struct.unpack_from("<HH", data, 16) != (3, 3):
+            raise ValueError("not an i386 ELF shared object")
+        phoff, shoff = struct.unpack_from("<II", data, 28)
+        phsize, phnum, shsize, shnum = struct.unpack_from("<HHHH", data, 42)
+        self.headers = max(52, phoff + phsize * phnum)
+        self.sections = [
+            struct.unpack_from("<10I", data, shoff + i * shsize) for i in range(shnum)
+        ]
+        self.segments = [
+            struct.unpack_from("<8I", data, phoff + i * phsize) for i in range(phnum)
+        ]
+        self.relocated = set()
+        for _, kind, flags, _, offset, size, _, _, _, entsize in self.sections:
+            if kind == 9 and flags & 2:  # allocated SHT_REL, not debug relocations
+                for at in range(offset, offset + size, entsize):
+                    address, info = struct.unpack_from("<II", data, at)
+                    if info & 0xff in (1, 2, 6, 7, 8):
+                        self.relocated.add(address)
+
+    def offset(self, rva: int):
+        for kind, offset, va, _, size, _, _, _ in self.segments:
+            if kind == 1 and va <= rva < va + size:
+                return offset + rva - va
+        return None
+
+    masked = Image.masked
+
+    def functions(self):
+        found = {}
+        for _, kind, _, _, offset, size, link, _, _, entsize in self.sections:
+            if kind != 2:  # SHT_SYMTAB, including static functions
+                continue
+            strings = self.sections[link][4]
+            for at in range(offset, offset + size, entsize):
+                name, value, length, info, _, section = struct.unpack_from("<IIIBBH", self.data, at)
+                if info & 0xf != 2 or not length or not section:
+                    continue
+                start = strings + name
+                name = self.data[start : self.data.index(b"\0", start)].decode()
+                found.setdefault(value, (length, name))
+        return sorted(found.items())
+
+
+def elf_rows(debug: Elf, stripped: Elf) -> list[str]:
+    rows = [f"{fnv1a64(stripped.data[: stripped.headers]):016x}"]
+    for rva, (size, name) in debug.functions():
+        code = stripped.masked(rva, size)
+        rows.append(f"{rva:x}\t{size:x}\t{fnv1a64(code) & 0xffffffff:08x}\t{name}")
+    return rows
+
+
 def main(argv: list[str]) -> int:
     if len(argv) != 2:
         print(__doc__.strip().splitlines()[2], file=sys.stderr)
@@ -139,6 +196,12 @@ def main(argv: list[str]) -> int:
         except (ValueError, struct.error, FileNotFoundError):
             continue
         rows = module_rows(debug, image)
+        (output / f"{path.name.lower()}.tsv").write_text("\n".join(rows) + "\n")
+    unix_debug = debug_root.parent / "i386-unix"
+    for path in sorted((stripped / UNIX_MODULES).glob("*.so")):
+        image = Elf(path.read_bytes())
+        debug = Elf((unix_debug / path.name).read_bytes())
+        rows = elf_rows(debug, image)
         (output / f"{path.name.lower()}.tsv").write_text("\n".join(rows) + "\n")
     return 0
 
