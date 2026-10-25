@@ -67,7 +67,7 @@ The launcher holds selected directories' security scopes while it runs. Game fol
 
 ### IOS-APP-2 Native view
 
-**Rule**: The game view MUST present through a Metal layer above a black base and leave scaling to Core Animation under HOST-VIEW-9. It MUST report its pixel size from layout. A display link MUST present only while a frame is pending, publishing the vsync grid to guest refresh pacing under HOST-SES-9.
+**Rule**: The game view MUST present through a Metal layer above a black base and leave scaling to Core Animation under HOST-VIEW-9. It MUST report its pixel size from layout. A display link MUST publish the vsync grid for guest refresh pacing and remain paused without pending frames under HOST-SES-10.
 **Applies to**: iOS
 **Verification**: Review — UIKit layout and the display link run only inside an application.
 

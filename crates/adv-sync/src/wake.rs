@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 #[cfg(windows)]
@@ -260,17 +260,24 @@ mod os {
 pub struct WakeEvent {
     handle: Arc<os::Handle>,
     interrupt: Arc<AtomicBool>,
+    generation: Arc<AtomicU64>,
 }
 impl WakeEvent {
     pub fn new() -> std::io::Result<Self> {
         Ok(Self {
             handle: Arc::new(os::Handle::new()?),
             interrupt: Arc::new(AtomicBool::new(false)),
+            generation: Arc::new(AtomicU64::new(0)),
         })
     }
     pub fn signal(&self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
         self.interrupt.store(true, Ordering::Release);
         self.notify();
+    }
+    /// Execution deliveries since creation, including repeated signals before a drain.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
     }
     /// Retain an OS wake without requesting a CPU safepoint exit. Read-only
     /// diagnostics use this so they cannot overtake an input's guest time slice.

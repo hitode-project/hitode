@@ -80,6 +80,9 @@ pub fn add_table(
     true
 }
 
+/// NtUserPeekMessage in Wine 11's win32syscalls.h; its nested yield is part of the peek.
+const PEEK_MESSAGE: u32 = 0x14ca;
+
 /// System call `number` of a table other than the NT table, entered like
 /// [`crate::dispatch`]'s system calls: argument `i` is `env.arg(i + 1)`.
 pub fn call(env: &mut Env<'_>, number: u32) -> Outcome {
@@ -100,7 +103,14 @@ pub fn call(env: &mut Env<'_>, number: u32) -> Outcome {
         return Outcome::Return(status::ACCESS_VIOLATION);
     };
     let args: Vec<u32> = (1..=u32::from(bytes) / 4).map(|i| env.arg(i)).collect();
-    Outcome::call_aligned(env, function, args, |_, returned| {
+    let peek = number == PEEK_MESSAGE;
+    if peek {
+        env.sys.begin_poll_peek();
+    }
+    Outcome::call_aligned(env, function, args, move |env, returned| {
+        if peek {
+            env.sys.end_poll_peek(returned.value() == 0);
+        }
         Outcome::Return(returned.value())
     })
 }
@@ -116,6 +126,11 @@ pub fn user_mode_callback(
     ret_ptr: u32,
     ret_length: u32,
 ) -> Outcome {
+    // Dispatch callbacks include Wine's thunk-lock save/restore around a yield.
+    // Window procedures, hooks and other application callbacks perform new work.
+    if id != 0 {
+        env.sys.poll_work();
+    }
     let Some(&Dispatcher(dispatcher)) = env.ext.try_get::<Dispatcher>() else {
         return Outcome::Fail("user-mode callbacks before ntdll.dll is mapped".into());
     };

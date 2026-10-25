@@ -87,18 +87,17 @@ impl MainLoop {
         driver.wake.signal();
         Ok(main_loop)
     }
-    pub(super) fn arm(&self, next: Option<Instant>) -> Result<(), String> {
+    pub(super) fn arm(&self, next: Option<Instant>, frame: bool) -> Result<(), String> {
         let mut spec: libc::itimerspec = unsafe { std::mem::zeroed() };
-        if crate::frontend::request_vsync(next, self.pending.get()) {
+        if crate::frontend::request_vsync(frame.then(Instant::now), self.pending.get()) {
             self.pending.set(true);
             // One Weak token survives teardown until the uncancellable callback.
             let data = Box::into_raw(Box::new(self.driver.clone())).cast();
             unsafe {
                 AChoreographer_postFrameCallback64(self.choreographer, Some(frame_callback), data);
             }
-        } else if let Some(next) = next
-            && !self.pending.get()
-        {
+        }
+        if let Some(next) = next {
             let delay = next.saturating_duration_since(Instant::now());
             spec.it_value.tv_sec = delay.as_secs() as libc::time_t;
             spec.it_value.tv_nsec =
@@ -138,9 +137,7 @@ unsafe extern "C" fn frame_callback(_: i64, data: *mut c_void) {
         if let Some(main_loop) = driver.main_loop.borrow().as_ref() {
             main_loop.pending.set(false);
         }
-        driver.view.ready.set(true);
         driver.drive();
-        driver.view.ready.set(false);
     }
 }
 unsafe extern "C" fn rate_callback(period: i64, data: *mut c_void) {

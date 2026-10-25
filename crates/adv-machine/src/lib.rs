@@ -84,6 +84,11 @@ type ProcessPrepare = fn(&mut dyn Guest, &mut Sys, &mut Ext) -> Result<(), MemFa
 /// Host-side machine state shared by all handlers.
 pub struct Sys {
     pub clock: Clock,
+    /// Shared execution wake for input, server, media, I/O and APC deliveries.
+    pub poll_wake: Option<adv_sync::WakeEvent>,
+    poll_observed: bool,
+    /// Productive calls invalidate the round even when their context then blocks.
+    poll_activity: u64,
     /// Explicit arguments exist only while a host invocation or its continuation runs.
     invocation_arguments: Option<invocation::Arguments>,
     /// Real time: reusable scheduler slot where round-robin resumes after a host return.
@@ -398,6 +403,7 @@ impl Sys {
             exact_deadline: false,
             spin: Default::default(),
             progress: Default::default(),
+            poll_peek_depth: 0,
             thread_handle,
             wait_objects: Vec::new(),
         });
@@ -1027,6 +1033,46 @@ impl Sys {
         ready.peek().is_some() && ready.all(|c| c.yielded)
     }
 
+    /// Classify this host call as a clock read, empty message peek or yield.
+    pub fn poll_observation(&mut self) {
+        self.poll_observed = true;
+    }
+
+    /// Begin the implementation of a message peek, including its nested host calls.
+    pub fn begin_poll_peek(&mut self) {
+        self.poll_observation();
+        self.contexts[self.current as usize].poll_peek_depth += 1;
+    }
+
+    pub fn end_poll_peek(&mut self, empty: bool) {
+        self.contexts[self.current as usize].poll_peek_depth -= 1;
+        if !empty {
+            self.poll_work();
+        }
+    }
+
+    /// A guest callback or nonempty peek invalidates an enclosing observation.
+    pub fn poll_work(&mut self) {
+        self.poll_activity = self.poll_activity.wrapping_add(1);
+        self.contexts[self.current as usize].progress.new_work();
+    }
+
+    fn poll_generation(&self) -> (u64, u64, Option<u64>) {
+        (
+            self.poll_activity,
+            self.objects.generation(),
+            self.poll_wake.as_ref().map(|wake| wake.generation()),
+        )
+    }
+
+    fn quiet_polling(&self) -> bool {
+        self.poll_wake.is_some()
+            && self
+                .active_contexts()
+                .filter(|c| c.is_ready())
+                .all(|c| c.progress.quiet())
+    }
+
     /// Every ready context repeats earlier yield intervals (PROC-CLOCK-5).
     fn polling_settled(&self) -> bool {
         self.active_contexts()
@@ -1596,9 +1642,6 @@ impl Dispatch<'_> {
         self.sys
             .recent
             .push(self.sys.current, index, cpu.read_u32(esp).unwrap_or(0));
-        self.sys.contexts[self.sys.current as usize]
-            .progress
-            .call(index);
         self.sys.host_calls += 1;
         self.sys.stats.total.host_calls += 1;
         if self
@@ -1614,6 +1657,7 @@ impl Dispatch<'_> {
             )));
         }
         let t0 = self.sys.stats.start();
+        self.sys.poll_observed = false;
         let out = (f.handler)(&mut Env {
             context: self.sys.current,
             cpu: &mut *cpu,
@@ -1621,6 +1665,13 @@ impl Dispatch<'_> {
             ext: &mut *self.ext,
             thunk: index,
         });
+        let observed = std::mem::take(&mut self.sys.poll_observed);
+        let context = &mut self.sys.contexts[self.sys.current as usize];
+        let observation = observed || context.poll_peek_depth != 0;
+        context.progress.call(index, observation);
+        if !observation {
+            self.sys.poll_activity = self.sys.poll_activity.wrapping_add(1);
+        }
         let r = apply(cpu, self.sys, self.ext, out, origin, self.defer_work);
         self.sys.stats.host(t0, index, true, &self.sys.thunks);
         r
@@ -1704,6 +1755,7 @@ impl TrapHandler for Dispatch<'_> {
         let old_esp = cpu.reg(Reg::Esp);
         let old_edx = cpu.reg(Reg::Edx);
         cpu.set_reg(Reg::Esp, esp);
+        self.sys.poll_observed = false;
         let value = if let Some(handler) = binding.env_leaf {
             handler(&mut Env {
                 context: self.sys.current,
@@ -1733,9 +1785,13 @@ impl TrapHandler for Dispatch<'_> {
             index,
             cpu.read_u32(cpu.reg(Reg::Esp)).unwrap_or(0),
         );
-        self.sys.contexts[self.sys.current as usize]
-            .progress
-            .call(index);
+        let observed = std::mem::take(&mut self.sys.poll_observed);
+        let context = &mut self.sys.contexts[self.sys.current as usize];
+        let observation = observed || context.poll_peek_depth != 0;
+        context.progress.call(index, observation);
+        if !observation {
+            self.sys.poll_activity = self.sys.poll_activity.wrapping_add(1);
+        }
         self.sys.host_calls += 1;
         self.sys.stats.total.host_calls += 1;
         self.sys.stats.leaf(index, &self.sys.thunks);
@@ -1929,6 +1985,9 @@ impl<B: Backend> Machine<B> {
         }
         let sys = Sys {
             clock,
+            poll_wake: None,
+            poll_observed: false,
+            poll_activity: 0,
             invocation_arguments: None,
             trace: Trace::default(),
             thunks,
@@ -2476,6 +2535,7 @@ impl<B: Backend> Machine<B> {
         // Do not sleep the host after only one poller ran. Every currently ready
         // context must first get a turn in this scheduler invocation.
         self.sys.wakes.begin_slice();
+        let mut poll_generation = self.sys.poll_generation();
         loop {
             if let Some(budget) = hard_budget {
                 let remaining =
@@ -2500,11 +2560,21 @@ impl<B: Backend> Machine<B> {
             }
             self.sys.wake();
             self.sys.advance_if_only_polling();
+            let generation = self.sys.poll_generation();
+            if generation != poll_generation {
+                if (generation.1, generation.2) != (poll_generation.1, poll_generation.2) {
+                    self.sys.wakes.begin_slice();
+                }
+                poll_generation = generation;
+                for context in &mut self.sys.contexts {
+                    context.progress.new_work();
+                }
+            }
             // Real time: polling contexts would spin the host. Hand control back so the host
             // can wait (at most 1 ms) like the OS would schedule them.
             if !self.sys.clock.is_virtual()
                 && self.sys.only_polling()
-                && self.sys.polling_settled()
+                && (self.sys.polling_settled() || self.sys.quiet_polling())
                 && self
                     .sys
                     .wakes

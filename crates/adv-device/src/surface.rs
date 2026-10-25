@@ -159,6 +159,7 @@ pub struct PendingFrame {
     pub(crate) format: PixelFormat,
     pub(crate) palette: Option<Arc<[[u8; 4]; 256]>>,
     serial: u64,
+    published_at: Option<std::time::Instant>,
     pub(crate) pixels: Arc<Pixels>,
     damage: Damage,
     bottom_up: bool,
@@ -176,6 +177,7 @@ impl Default for PendingFrame {
             format: PixelFormat::Bgra32,
             palette: None,
             serial: 0,
+            published_at: None,
             pixels: Arc::new(Pixels::new()),
             damage: Damage::default(),
             bottom_up: false,
@@ -196,9 +198,10 @@ impl PendingFrame {
         damage: &Damage,
     ) -> Result<u64, String> {
         let full = surface.rect();
+        let pitch = publication_pitch(surface.pitch, surface.format);
         let reset = self.width != surface.width
             || self.height != surface.height
-            || self.pitch != surface.pitch
+            || self.pitch != pitch
             || self.format != surface.format
             || Arc::get_mut(&mut self.pixels).is_none();
         let regions = if reset {
@@ -212,7 +215,7 @@ impl PendingFrame {
         }
         self.width = surface.width;
         self.height = surface.height;
-        self.pitch = surface.pitch;
+        self.pitch = pitch;
         self.format = surface.format;
         self.palette.clone_from(&surface.palette);
         self.bottom_up = surface.bottom_up;
@@ -223,14 +226,14 @@ impl PendingFrame {
             self.pixels = Arc::new(Pixels::new());
         }
         let output = Arc::get_mut(&mut self.pixels).unwrap();
-        output.resize((surface.pitch * surface.height) as usize, 0);
+        output.resize((pitch * surface.height) as usize, 0);
         let mut copied = 0;
         for r in regions.iter().copied() {
             let start = surface.format.byte_offset(r.x) as usize;
             let n = surface.span(r.x, r.w) as usize;
             for y in r.y..r.y + r.h {
                 let src = memory.read(surface.row(0, y) + start as u32, n)?;
-                let dst = y as usize * surface.pitch as usize + start;
+                let dst = y as usize * pitch as usize + start;
                 output[dst..dst + n].copy_from_slice(src.as_ref());
                 copied += n as u64;
             }
@@ -239,13 +242,14 @@ impl PendingFrame {
             for y in 0..surface.height {
                 let n = surface.format.row_bytes(surface.width) as usize;
                 let src = memory.read(surface.row(0, y), n)?;
-                let at = y as usize * surface.pitch as usize;
+                let at = y as usize * pitch as usize;
                 if output[at..at + n] != *src {
                     return Err("incremental software slot differs from full storage".into());
                 }
             }
         }
         self.serial = serial;
+        self.published_at = Some(std::time::Instant::now());
         Ok(copied)
     }
     /// Convert only changes since this consumer's last snapshot. History gaps
@@ -345,6 +349,9 @@ impl PendingFrame {
     pub fn serial(&self) -> u64 {
         self.serial
     }
+    pub fn published_at(&self) -> Option<std::time::Instant> {
+        self.published_at
+    }
     pub fn video_layers(&self) -> &[(u64, VideoLayer)] {
         &self.video
     }
@@ -400,6 +407,7 @@ impl PendingFrame {
         self.format = PixelFormat::Bgra32;
         self.palette = None;
         self.serial = frame.serial;
+        self.published_at = Some(std::time::Instant::now());
         if !self.pixels.is_empty() {
             self.pixels = Arc::new(Pixels::new());
         }
@@ -571,6 +579,14 @@ fn verify_software() -> bool {
     static VERIFY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *VERIFY.get_or_init(|| std::env::var_os("ADV_VERIFY_SOFTWARE_FRAMES").is_some())
 }
+fn publication_pitch(pitch: u32, format: PixelFormat) -> u32 {
+    if cfg!(all(feature = "gpu", target_vendor = "apple")) && format == PixelFormat::Bgra32 {
+        // A buffer-backed Metal texture requires aligned rows in its snapshot.
+        return pitch.next_multiple_of(256);
+    }
+    pitch
+}
+
 /// Content-diff tiles (DEV-FRAME-10).
 const TILE_W: u32 = 64;
 const TILE_H: u32 = 16;
@@ -583,15 +599,12 @@ fn refine_damage(
     surface: &Surface,
     memory: &dyn SurfaceMemory,
     previous: &[u8],
+    previous_pitch: u32,
     declared: &Damage,
 ) -> Result<Damage, String> {
     let format = surface.format;
     let mut out = Damage::default();
     for r in declared.iter().copied() {
-        if r.w < TILE_W && r.h < TILE_H {
-            out.add(r);
-            continue;
-        }
         let total = u64::from(r.w) * u64::from(r.h);
         let mut changed = 0u64;
         let mut bands = Damage::default();
@@ -603,7 +616,7 @@ fn refine_damage(
                 let start = format.byte_offset(r.x) as usize;
                 let n = surface.span(r.x, r.w) as usize;
                 let src = memory.read(surface.row(0, row) + start as u32, n)?;
-                let at = row as usize * surface.pitch as usize + start;
+                let at = row as usize * previous_pitch as usize + start;
                 let old = &previous[at..at + n];
                 if *src == *old {
                     continue;
@@ -1538,14 +1551,15 @@ impl<P: Presenter> Surfaces<P> {
             let mut frame = PendingFrame {
                 width,
                 height,
-                pitch: width * 4,
+                pitch: publication_pitch(width * 4, PixelFormat::Bgra32),
                 ..Default::default()
             };
-            Arc::make_mut(&mut frame.pixels).resize(width as usize * height as usize * 4, 0);
+            Arc::make_mut(&mut frame.pixels).resize(frame.pitch as usize * height as usize, 0);
             self.retained_frame = Some(frame);
         }
         let frame = self.retained_frame.as_mut().unwrap();
         frame.serial = serial;
+        frame.published_at = Some(std::time::Instant::now());
         frame.history.clear(); // Video composition and removal always rebuild the base.
         frame.damage = Damage::from_rect(Rect {
             x: 0,
@@ -1985,9 +1999,10 @@ impl<P: Presenter> Surfaces<P> {
         let Some(pending) = self.software_pending.take() else {
             return Ok(false);
         };
+        let before = self.stats.published_frames;
         self.publish_software(pending.source, m, pending.damage)?;
         self.stats.software_flushes[reason as usize] += 1;
-        Ok(true)
+        Ok(self.stats.published_frames != before)
     }
     fn publish_software(
         &mut self,
@@ -2000,13 +2015,12 @@ impl<P: Presenter> Surfaces<P> {
         let reset = self.software_source != Some(id)
             || latest.is_none_or(|f| {
                 f.extent() != (s.width, s.height)
-                    || f.pitch != s.pitch
+                    || f.pitch != publication_pitch(s.pitch, s.format)
                     || f.format != s.format
                     || f.bottom_up != s.bottom_up
                     || f.palette != s.palette
-                    || !f.video.is_empty()
-            })
-            || !self.video_layers.is_empty();
+                    || !Arc::ptr_eq(&f.video, &self.video_layers)
+            });
         let damage = if reset {
             Damage::from_rect(s.rect())
         } else {
@@ -2015,22 +2029,26 @@ impl<P: Presenter> Surfaces<P> {
         if reset {
             self.damage_history.clear();
         }
-        self.stats.presentations += 1;
-        self.stats
-            .software_started
-            .get_or_insert_with(std::time::Instant::now);
-        self.software_source = Some(id);
         // The frame cap measures the guest's drawing, so it keeps the declared area.
         self.software_coverage = (
             damage.iter().map(|r| u64::from(r.w) * u64::from(r.h)).sum(),
             u64::from(s.width) * u64::from(s.height),
         );
         let damage = match latest {
-            Some(previous) if !reset && !s.format.packed() => {
-                refine_damage(s, m, &previous.pixels, &damage)?
+            Some(previous) if !reset => {
+                refine_damage(s, m, &previous.pixels, previous.pitch, &damage)?
             }
             _ => damage,
         };
+        if damage.is_empty() {
+            self.stats.empty_damage += 1;
+            return Ok(());
+        }
+        self.stats.presentations += 1;
+        self.stats
+            .software_started
+            .get_or_insert_with(std::time::Instant::now);
+        self.software_source = Some(id);
         self.stats.damaged_pixels += damage
             .iter()
             .map(|r| u64::from(r.w) * u64::from(r.h))

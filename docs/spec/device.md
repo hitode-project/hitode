@@ -46,6 +46,11 @@ This spec covers the neutral device services behind the API front ends: frames, 
 **Rule**: With a mailbox, software presents MUST accumulate four-rectangle damage, publishing one serial/history entry per flush. Writer waits/message retrieval MUST flush, and any wait/present MUST flush after 50 ms. Readback, capture, layout/palette/video changes, flips and exit MUST flush first, with immediate headless presents and reason-specific counters.
 **Verification**: Test
 
+### DEV-FRAME-12 Unchanged software redraws
+
+**Rule**: Software redraws matching the last publication MUST NOT publish, copy snapshot storage, or wake presentation. This comparison MUST include damage smaller than a content-diff tile.
+**Verification**: Test
+
 ### DEV-FRAME-11 Deleted frame sources
 
 **Rule**: Deleting the source of a pending software frame MUST discard that frame.

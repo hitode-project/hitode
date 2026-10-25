@@ -8,6 +8,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+adv-sync = { path = "../adv-sync" }
 adv-cpu = { path = "../adv-cpu" }
 thiserror.workspace = true
 log.workspace = true
