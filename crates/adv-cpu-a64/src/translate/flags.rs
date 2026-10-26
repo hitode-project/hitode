@@ -189,6 +189,9 @@ pub(crate) enum Overflow {
 }
 
 impl Overflow {
+    /// OF, reading operands through `value`; `None` for `Host`. Only AArch64
+    /// fault recovery reads it.
+    #[cfg_attr(not(target_arch = "aarch64"), expect(dead_code))]
     pub fn evaluate(self, value: impl Fn(Operand) -> u32) -> Option<bool> {
         Some(match self {
             Self::Host => return None,
