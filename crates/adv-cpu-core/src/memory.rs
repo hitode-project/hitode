@@ -980,6 +980,20 @@ impl Memory {
         Ok(())
     }
 
+    /// Whether an access to `range` must first stage file bytes or, for a
+    /// store, retire a private copy. Shared storage pages need neither.
+    fn stages(&self, range: &std::ops::Range<usize>, write: bool) -> bool {
+        let pages = range.start / PAGE_SIZE..=(range.end - 1) / PAGE_SIZE;
+        (write
+            && pages
+                .clone()
+                .any(|page| self.private_copy_pages.get(page) == Some(&Some(true))))
+            || self
+                .shared_pages
+                .range(pages)
+                .any(|(_, page)| page.file_page())
+    }
+
     /// Whether `page` holds its bytes in the linear storage: it is not
     /// shared, or it is an owned private copy, whose SHARED bit is only a
     /// store barrier (as `native_permissions` treats it).
@@ -1452,7 +1466,7 @@ impl Memory {
         range: &std::ops::Range<usize>,
         write: bool,
     ) -> Result<(), String> {
-        if range.is_empty() {
+        if range.is_empty() || !self.stages(range, write) {
             return Ok(());
         }
         let mut private = Vec::new();
