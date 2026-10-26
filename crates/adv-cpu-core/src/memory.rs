@@ -55,6 +55,10 @@ pub const SHARED: u8 = 8;
 /// A shared PCM page has a stable alias at base + guest offset. Access must
 /// still use only matching byte atomics, even for guest word/vector operations.
 pub const AUDIO: u8 = 16;
+/// A SHARED storage page the guest window shows (unix): translated code
+/// accesses it as ordinary memory, and the rest of `Memory` through its
+/// storage, which holds the same bytes.
+pub const LINEAR: u8 = 128;
 /// Derived grants in immutable native metadata, never guest protection flags.
 pub const FAST_READ: u8 = READ << 5;
 pub const FAST_WRITE: u8 = WRITE << 5;
@@ -702,13 +706,15 @@ impl Memory {
             use crate::virtual_memory::GuestPageProtection;
             self.attach()?;
             let reservation = self.reservation.as_ref().unwrap();
-            let committed =
-                |page: usize| self.mapped[page] && !self.shared_pages.contains_key(&page);
+            let committed = |page: usize| {
+                self.mapped[page]
+                    && (self.perms[page] & LINEAR != 0 || !self.shared_pages.contains_key(&page))
+            };
             // Owned private copies read linearly, as the native permission
             // snapshot says; stores still trap so the first one retires COPY.
             let protection = |page: usize| {
                 let perms = self.perms[page];
-                if perms & SHARED == 0 {
+                if perms & (SHARED | LINEAR) != SHARED {
                     GuestPageProtection::new(perms & 7, self.watched[page])
                 } else if self.private_copy_pages.get(page) == Some(&Some(true)) {
                     GuestPageProtection::new(perms & (READ | EXEC), self.watched[page])
@@ -790,6 +796,8 @@ impl Memory {
                 file.evict();
             }
         }
+        #[cfg(unix)]
+        self.unlinearize(pages.clone())?;
         // File overlays are not linear. PCM pages have their own section views
         // in the reservation, whose removal cannot invalidate a callback alias.
         let mut start = pages.start;
@@ -1198,8 +1206,10 @@ impl Memory {
         }
         Arc::make_mut(&mut self.mapped)[pages.clone()].fill(true);
         self.fast.invalidate(pages.clone());
-        Arc::make_mut(&mut self.perms)[pages]
+        Arc::make_mut(&mut self.perms)[pages.clone()]
             .fill(READ | WRITE | SHARED | if cfg!(windows) { AUDIO } else { 0 });
+        #[cfg(unix)]
+        self.linearize(pages);
         self.touch(addr, len);
         Ok(storage)
     }
@@ -1239,8 +1249,84 @@ impl Memory {
         }
         Arc::make_mut(&mut self.mapped)[pages.clone()].fill(true);
         self.fast.invalidate(pages.clone());
-        Arc::make_mut(&mut self.perms)[pages].fill(perms | SHARED);
+        Arc::make_mut(&mut self.perms)[pages.clone()].fill(perms | SHARED);
+        self.linearize(pages);
         self.touch(addr, len);
+        Ok(())
+    }
+
+    /// Shows the host pages of the window that storage pages `pages`, just
+    /// mapped with one protection, wholly cover. A view the window cannot
+    /// show (no window, or not host page aligned) keeps reaching its storage
+    /// through `Memory`.
+    #[cfg(unix)]
+    fn linearize(&mut self, pages: std::ops::Range<usize>) {
+        if self.window.is_none() || pages.is_empty() || self.attach().is_err() {
+            return;
+        }
+        let slack = self.window_slack();
+        let reservation = self.reservation.as_ref().unwrap();
+        let Some(host) = reservation
+            .direct_fault_view()
+            .map(|view| view.host_page_size())
+        else {
+            return;
+        };
+        let first = (slack + pages.start * PAGE_SIZE).next_multiple_of(host);
+        let end = (slack + pages.end * PAGE_SIZE) / host * host;
+        if first >= end {
+            return;
+        }
+        let linear = (first - slack) / PAGE_SIZE..(end - slack) / PAGE_SIZE;
+        let Some(SharedPage::Storage { storage, offset }) = self.shared_pages.get(&linear.start)
+        else {
+            return;
+        };
+        let perms = self.perms[linear.start];
+        let Some(source) = storage.host_pages(*offset, end - first, host) else {
+            return;
+        };
+        let protection =
+            crate::virtual_memory::GuestPageProtection::new(perms & (READ | WRITE), false)
+                .expect("guest permissions");
+        // SAFETY: the storage stays mapped while the pages hold it, and
+        // `unmap` and `protect` remove the overlay before they drop it.
+        if let Err(error) =
+            unsafe { reservation.overlay_direct(first, end - first, source, protection) }
+        {
+            log::warn!(
+                "cannot show shared storage at guest page {:#x}: {error}",
+                linear.start
+            );
+            return;
+        }
+        for page in &mut Arc::make_mut(&mut self.perms)[linear.clone()] {
+            *page |= LINEAR;
+        }
+        self.fast.invalidate(linear);
+    }
+
+    /// Ends the window's view of every linear storage overlay that meets
+    /// `pages`; translated code then reaches them through `Memory` again.
+    #[cfg(unix)]
+    fn unlinearize(&mut self, pages: std::ops::Range<usize>) -> Result<(), String> {
+        if !self.perms[pages.clone()].iter().any(|&p| p & LINEAR != 0) {
+            return Ok(());
+        }
+        self.attach()?;
+        let slack = self.window_slack();
+        let removed = self
+            .reservation
+            .as_ref()
+            .unwrap()
+            .remove_overlays(slack + pages.start * PAGE_SIZE, pages.len() * PAGE_SIZE)?;
+        for range in removed {
+            let pages = (range.start - slack) / PAGE_SIZE..(range.end - slack) / PAGE_SIZE;
+            for page in &mut Arc::make_mut(&mut self.perms)[pages.clone()] {
+                *page &= !LINEAR;
+            }
+            self.fast.invalidate(pages);
+        }
         Ok(())
     }
 
@@ -1737,11 +1823,51 @@ impl Memory {
                     perms | (*page & (SHARED | AUDIO)),
                 ));
             }
-            *page = perms | (*page & (SHARED | AUDIO));
+            *page = perms | (*page & (SHARED | AUDIO | LINEAR));
         }
+        #[cfg(unix)]
+        self.keep_overlays_exact(range.start / PAGE_SIZE..range.end / PAGE_SIZE)?;
         // Revoke validation even if synchronizing host protection fails.
         self.touch(addr, len);
         self.sync_window(range.start / PAGE_SIZE..range.end / PAGE_SIZE)?;
+        Ok(())
+    }
+
+    /// Ends the overlays of host pages among `pages` whose guest pages no
+    /// longer share one protection the storage takes, without EXEC: the
+    /// window would then fault on accesses the guest may make.
+    #[cfg(unix)]
+    fn keep_overlays_exact(&mut self, pages: std::ops::Range<usize>) -> Result<(), String> {
+        if !self.perms[pages.clone()].iter().any(|&p| p & LINEAR != 0) {
+            return Ok(());
+        }
+        let slack = self.window_slack();
+        let host = self
+            .reservation
+            .as_ref()
+            .unwrap()
+            .direct_fault_view()
+            .map_or(PAGE_SIZE, |view| view.host_page_size());
+        let span = host / PAGE_SIZE;
+        let mut first = (slack + pages.start * PAGE_SIZE) / host * host;
+        while first < slack + pages.end * PAGE_SIZE {
+            let chunk = (first - slack) / PAGE_SIZE..(first - slack) / PAGE_SIZE + span;
+            first += host;
+            let perms = &self.perms[chunk.clone()];
+            if perms[0] & LINEAR == 0 {
+                continue;
+            }
+            let writable = matches!(
+                self.shared_pages.get(&chunk.start),
+                Some(SharedPage::Storage { storage, .. }) if storage.writable()
+            );
+            let exact = perms.iter().all(|&p| p & 7 == perms[0] & 7)
+                && perms[0] & EXEC == 0
+                && (writable || perms[0] & WRITE == 0);
+            if !exact {
+                self.unlinearize(chunk)?;
+            }
+        }
         Ok(())
     }
 
@@ -2597,6 +2723,80 @@ mod window_tests {
                 [0; 6],
                 "{host}: fresh pages are zero"
             );
+        }
+    }
+
+    /// Translated code reaches the host pages of shared storage that the
+    /// window shows as ordinary memory holding the storage's bytes, until a
+    /// protection the window cannot keep exact or the unmap ends the view.
+    // spec: A64-MEM-11, A64-MEM-13
+    #[test]
+    fn the_guest_window_shows_whole_host_pages_of_shared_storage() {
+        use crate::virtual_memory::GuestAccess::{Read, Write};
+        let native = crate::virtual_memory::host_page_size().unwrap();
+        for host in [4096, 16384].into_iter().filter(|host| host % native == 0) {
+            let mut memory = Memory::window_at_host_size(0x10000, 0x40000, host).unwrap();
+            // A guest page past two host pages: on 16K hosts its host page
+            // holds unmapped pages too, so it stays with `Memory`.
+            let len = 2 * host + PAGE_SIZE;
+            let storage = memory.map_shared_audio(0x20000, len).unwrap();
+            let page = |addr: usize| (addr - 0x10000) / PAGE_SIZE;
+            let linear = |memory: &Memory, addr: usize| memory.perms[page(addr)] & LINEAR != 0;
+            let tail = 0x20000 + 2 * host;
+            assert!(
+                linear(&memory, 0x20000) && linear(&memory, tail - PAGE_SIZE),
+                "{host}"
+            );
+            assert_eq!(linear(&memory, tail), host == 4096, "{host}");
+            let snapshot = memory.native_permissions();
+            assert_eq!(
+                snapshot[page(0x20000)] & (SHARED | READ | WRITE),
+                READ | WRITE
+            );
+            assert_eq!(snapshot[page(tail)] & SHARED != 0, host != 4096, "{host}");
+
+            let window = memory.window_base().unwrap();
+            storage.store_bytes(8, b"device");
+            // SAFETY: the window shows the storage read-write there.
+            let shown = unsafe { std::slice::from_raw_parts((window + 0x20008) as *const u8, 6) };
+            assert_eq!(shown, b"device");
+            unsafe {
+                std::ptr::copy_nonoverlapping(b"guest".as_ptr(), (window + 0x20100) as *mut u8, 5)
+            };
+            let mut bytes = [0; 6];
+            memory.read_into(0x20100, &mut bytes[..5]).unwrap();
+            assert_eq!(&bytes[..5], b"guest");
+            memory.write(0x20200, b"host").unwrap();
+            let shown = unsafe { std::slice::from_raw_parts((window + 0x20200) as *const u8, 4) };
+            assert_eq!(shown, b"host");
+
+            // Read-only for one guest page: exact on 4K hosts, mixed on 16K.
+            memory.protect(0x20000, PAGE_SIZE, READ).unwrap();
+            assert_eq!(linear(&memory, 0x20000), host == 4096, "{host}");
+            assert_eq!(linear(&memory, 0x20000 + host), host == 4096, "{host}");
+            let reservation = memory.reservation.as_ref().unwrap();
+            let start = reservation.ptr.as_ptr() as usize - window;
+            let view = reservation.direct_fault_view().unwrap();
+            let allows = |addr: usize, access| view.window_allows(addr - start, PAGE_SIZE, access);
+            assert_eq!(allows(0x20000, Read), host == 4096, "{host}");
+            assert!(!allows(0x20000, Write), "{host}");
+            assert_eq!(allows(0x20000 + host, Write), host == 4096, "{host}");
+            drop(view);
+            memory.read_into(0x20008, &mut bytes).unwrap();
+            assert_eq!(&bytes, b"device");
+
+            memory.unmap(0x20000, len).unwrap();
+            assert!(!linear(&memory, 0x20000 + host), "{host}");
+            let reservation = memory.reservation.as_ref().unwrap();
+            let view = reservation.direct_fault_view().unwrap();
+            assert!(
+                !view.window_allows(0x20000 + host - start, PAGE_SIZE, Read),
+                "{host}"
+            );
+            drop(view);
+            assert_eq!(storage.load_u8(0x100), b'g');
+            memory.map(0x20000, len, READ).unwrap();
+            assert_eq!(memory.read(0x20100, 5).unwrap(), [0; 5], "{host}");
         }
     }
 

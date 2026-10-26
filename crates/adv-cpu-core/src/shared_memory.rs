@@ -67,6 +67,23 @@ impl SharedAllocation {
         self.writable
     }
 
+    /// The host pages of the storage's own writable (or, for a read-only
+    /// view, readable) mapping that hold `len` bytes from `offset`, when
+    /// they start a host page `page` bytes long: mapping them elsewhere
+    /// shares the bytes.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    pub(crate) fn host_pages(&self, offset: usize, len: usize, page: usize) -> Option<NonNull<u8>> {
+        if offset.checked_add(len)? > self.len.next_multiple_of(page) {
+            return None;
+        }
+        self.mapping.write.host_pages(offset, len, page)
+    }
+
     pub fn load_u8(&self, index: usize) -> u8 {
         if index >= self.len {
             return 0;
@@ -417,6 +434,20 @@ mod os {
         pub(super) fn as_ptr(&self) -> *mut u8 {
             // SAFETY: skip lies inside the mapping.
             unsafe { self.ptr.as_ptr().add(self.skip) }
+        }
+
+        /// Where `len` bytes from logical `offset` lie in this view, when
+        /// they start a host page `page` bytes long and stay inside it.
+        pub(super) fn host_pages(
+            &self,
+            offset: usize,
+            len: usize,
+            page: usize,
+        ) -> Option<NonNull<u8>> {
+            let at = self.skip.checked_add(offset)?;
+            (at.is_multiple_of(page) && at.checked_add(len)? <= self.len)
+                // SAFETY: checked to lie inside the mapping.
+                .then(|| unsafe { self.ptr.add(at) })
         }
     }
 

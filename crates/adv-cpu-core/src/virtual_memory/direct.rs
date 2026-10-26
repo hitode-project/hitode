@@ -277,6 +277,9 @@ pub(super) struct SharedAlias {
     /// Kept so a compact window shared by several memories can map both
     /// views again when this one takes its turn (IOS-MEM-2).
     backing: crate::dual_view::Backing,
+    /// Guest view ranges showing another owner's shared pages instead, as
+    /// offset to (source, length); see `Reservation::overlay_direct`.
+    overlays: std::cell::RefCell<std::collections::BTreeMap<usize, (NonNull<u8>, usize)>>,
     #[cfg(test)]
     fail_after: std::cell::Cell<Option<usize>>,
 }
@@ -337,6 +340,7 @@ impl SharedAlias {
                 len,
                 placed: alias_place.is_some(),
                 backing,
+                overlays: Default::default(),
                 #[cfg(test)]
                 fail_after: std::cell::Cell::new(None),
             },
@@ -364,6 +368,92 @@ impl SharedAlias {
             self.fail_after.set(Some(remaining - 1));
         }
         unsafe { libc::mprotect(pointer.cast(), change.span.len(), protection.flags()) == 0 }
+    }
+}
+
+/// `remap`, leaving the target inaccessible.
+///
+/// # Safety
+/// As for `remap`.
+#[cfg(unix)]
+unsafe fn place(source: NonNull<u8>, target: *mut u8, len: usize) -> bool {
+    // SAFETY: forwarded.
+    unsafe {
+        remap(source, target, len) && libc::mprotect(target.cast(), len, libc::PROT_NONE) == 0
+    }
+}
+
+/// Maps the `len` shared bytes at `source` at `target` as well, replacing
+/// what is there; protection follows the source until changed.
+///
+/// # Safety
+/// `target` must be an exclusively owned, unused range of `len` bytes.
+#[cfg(unix)]
+unsafe fn remap(source: NonNull<u8>, target: *mut u8, len: usize) -> bool {
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        unsafe extern "C" {
+            static mach_task_self_: libc::mach_port_t;
+            fn mach_vm_remap(
+                target_task: libc::mach_port_t,
+                target_address: *mut u64,
+                size: u64,
+                mask: u64,
+                flags: libc::c_int,
+                src_task: libc::mach_port_t,
+                src_address: u64,
+                copy: libc::boolean_t,
+                cur_protection: *mut libc::c_int,
+                max_protection: *mut libc::c_int,
+                inheritance: libc::c_uint,
+            ) -> libc::c_int;
+        }
+        const VM_FLAGS_OVERWRITE: libc::c_int = 0x4000;
+        const VM_INHERIT_NONE: libc::c_uint = 2;
+        let mut address = target as u64;
+        let (mut current, mut max) = (0, 0);
+        // SAFETY: forwarded; a shared (copy = false) remap of live pages.
+        let result = unsafe {
+            mach_vm_remap(
+                mach_task_self_,
+                &mut address,
+                len as u64,
+                0,
+                VM_FLAGS_OVERWRITE,
+                mach_task_self_,
+                source.as_ptr() as u64,
+                0,
+                &mut current,
+                &mut max,
+                VM_INHERIT_NONE,
+            )
+        };
+        result == 0 && address == target as u64
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        // A zero old size duplicates a shared mapping instead of moving it.
+        // SAFETY: forwarded.
+        let mapped = unsafe {
+            libc::mremap(
+                source.as_ptr().cast(),
+                0,
+                len,
+                libc::MREMAP_MAYMOVE | libc::MREMAP_FIXED,
+                target.cast::<libc::c_void>(),
+            )
+        };
+        mapped == target.cast()
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "android"
+    )))]
+    {
+        let _ = (source, target, len);
+        false
     }
 }
 
@@ -595,11 +685,31 @@ impl Reservation {
             alias
                 .backing
                 .map(Some(alias.pointer), libc::PROT_READ | libc::PROT_WRITE)?;
+            for (&offset, &(source, len)) in alias.overlays.borrow().iter() {
+                if !place(source, self.ptr.as_ptr().add(offset), len) {
+                    return Err(format!(
+                        "restore guest window overlay: {}",
+                        std::io::Error::last_os_error()
+                    ));
+                }
+            }
         }
-        let mut start = 0;
-        while start < host.len() {
+        Self::restore_protection(alias, self.ptr, &pages, 0..host.len())
+    }
+
+    /// Gives the guest view of host pages `range` the protection their
+    /// metadata records, from NONE.
+    fn restore_protection(
+        alias: &SharedAlias,
+        window: NonNull<u8>,
+        pages: &UnixPages,
+        range: Range<usize>,
+    ) -> Result<(), String> {
+        let host = &pages.direct.as_ref().unwrap().host;
+        let mut start = range.start;
+        while start < range.end {
             let end = start
-                + host[start..]
+                + host[start..range.end]
                     .iter()
                     .take_while(|&&p| p == host[start])
                     .count();
@@ -609,7 +719,7 @@ impl Reservation {
                     before: NativeProtection::None,
                     after: host[start],
                 };
-                if !alias.protect(self.ptr, &change, change.after) {
+                if !alias.protect(window, &change, change.after) {
                     return Err(format!(
                         "restore guest window protection: {}",
                         std::io::Error::last_os_error()
@@ -619,6 +729,114 @@ impl Reservation {
             start = end;
         }
         Ok(())
+    }
+
+    /// Commits whole host pages `offset..offset + len` with `protection`
+    /// and shows the shared pages at `source` there in the guest view
+    /// instead of the reservation's own, so translated code reaches memory
+    /// another owner shares, such as a file view. The checked alias keeps
+    /// the reservation's bytes: callers make every other access through the
+    /// source's owner.
+    ///
+    /// # Safety
+    /// `source` must map `len` shared bytes until `remove_overlays` takes
+    /// the range or the reservation drops.
+    pub unsafe fn overlay_direct(
+        &self,
+        offset: usize,
+        len: usize,
+        source: NonNull<u8>,
+        protection: GuestPageProtection,
+    ) -> Result<(), String> {
+        let alias = self
+            .direct_alias
+            .as_ref()
+            .ok_or("direct protection is not enabled")?;
+        let host = self.pages.borrow().host_page_size;
+        if len == 0 || !offset.is_multiple_of(host) || !len.is_multiple_of(host) {
+            return Err("overlays take whole host pages".into());
+        }
+        // The guest view shows the source instead: leave the reservation's
+        // bytes untouched rather than clearing pages nothing reads.
+        self.mutate(offset, len, Mutation::Commit(protection), false)?;
+        let pages = self
+            .pages
+            .try_borrow()
+            .map_err(|_| "direct mapping is pinned by an execution lease")?;
+        // SAFETY: the committed range is this reservation's and unused.
+        if !unsafe { place(source, self.ptr.as_ptr().add(offset), len) } {
+            // A failed remap may have unmapped the range; put the
+            // reservation's pages back or fail closed.
+            let error = std::io::Error::last_os_error();
+            // SAFETY: as above, from the reservation's own alias.
+            if !unsafe {
+                place(
+                    alias.pointer.add(offset),
+                    self.ptr.as_ptr().add(offset),
+                    len,
+                )
+            } || Self::restore_protection(
+                alias,
+                self.ptr,
+                &pages,
+                offset / host..(offset + len) / host,
+            )
+            .is_err()
+            {
+                std::process::abort();
+            }
+            drop(pages);
+            self.decommit_direct(offset, len)?;
+            return Err(format!("overlay guest window: {error}"));
+        }
+        Self::restore_protection(
+            alias,
+            self.ptr,
+            &pages,
+            offset / host..(offset + len) / host,
+        )?;
+        alias.overlays.borrow_mut().insert(offset, (source, len));
+        Ok(())
+    }
+
+    /// Shows the reservation's own pages again in every overlay that meets
+    /// `offset..offset + len`, decommitted, and returns their ranges.
+    pub fn remove_overlays(&self, offset: usize, len: usize) -> Result<Vec<Range<usize>>, String> {
+        let Some(alias) = self.direct_alias.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let removed: Vec<_> = alias
+            .overlays
+            .borrow()
+            .range(..offset + len)
+            .filter(|&(&start, &(_, size))| start + size > offset)
+            .map(|(&start, &(_, size))| start..start + size)
+            .collect();
+        for range in &removed {
+            // SAFETY: the overlay is this reservation's range, and the alias
+            // maps the reservation's pages at the same offset.
+            let host = self.pages.borrow().host_page_size;
+            if !unsafe {
+                place(
+                    alias.pointer.add(range.start),
+                    self.ptr.as_ptr().add(range.start),
+                    range.len(),
+                )
+            } || Self::restore_protection(
+                alias,
+                self.ptr,
+                &self.pages.borrow(),
+                range.start / host..range.end / host,
+            )
+            .is_err()
+            {
+                // The guest view would keep showing pages being released.
+                std::process::abort();
+            }
+            alias.overlays.borrow_mut().remove(&range.start);
+            self.decommit_direct(range.start, range.len())?;
+        }
+        Ok(removed)
     }
 
     /// The always-readable and writable view of committed guest bytes,
@@ -680,6 +898,17 @@ impl Reservation {
     }
 
     fn mutate_direct(&self, offset: usize, len: usize, mutation: Mutation) -> Result<(), String> {
+        self.mutate(offset, len, mutation, true)
+    }
+
+    /// `mutate_direct`; a commit clears the reservation's bytes if `clear`.
+    fn mutate(
+        &self,
+        offset: usize,
+        len: usize,
+        mutation: Mutation,
+        clear: bool,
+    ) -> Result<(), String> {
         let end = self.bounds(offset, len)?;
         let alias = self
             .direct_alias
@@ -707,7 +936,7 @@ impl Reservation {
                 return Err(format!("protect direct guest memory: {error}"));
             }
         }
-        if matches!(mutation, Mutation::Commit(_)) {
+        if clear && matches!(mutation, Mutation::Commit(_)) {
             // Recommit always clears through the stable alias, even when the
             // original guest window is NONE for a mixed or guest-protected page.
             unsafe { std::ptr::write_bytes(alias.pointer.as_ptr().add(offset), 0, len) };

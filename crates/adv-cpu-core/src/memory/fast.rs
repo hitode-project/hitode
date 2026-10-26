@@ -8,7 +8,7 @@
 //! through the existing epoch/trap exit and worker quiescence protocol.
 //! The serial software-checked owner exposes linear COPY reads while retaining
 //! EXEC as a first-store barrier. This never grants guest execute permission.
-use super::{EXEC, READ, SHARED, WRITE};
+use super::{EXEC, LINEAR, READ, SHARED, WRITE};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -115,6 +115,10 @@ impl FastPermissions {
                 && private_copies.get(page) == Some(&Some(true))
             {
                 permissions = (permissions & !SHARED) | EXEC;
+            }
+            // The window shows linear storage itself.
+            if permissions & LINEAR != 0 {
+                permissions &= !(SHARED | LINEAR);
             }
             if let Some((span, allows)) = window {
                 let host = match host {
