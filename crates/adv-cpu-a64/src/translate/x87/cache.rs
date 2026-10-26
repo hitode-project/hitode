@@ -874,7 +874,13 @@ impl Translator<'_> {
             ldrh(X8, X5, runtime::X87_CONTROL),
             ubfx(W, X15, X13, 11, 3),
         ]);
-        if self.trace.insts[self.index..=self.x87.end]
+        // A reload past the run's end (a helper after its last instruction)
+        // has no arithmetic left to guard.
+        if self
+            .trace
+            .insts
+            .get(self.index..=self.x87.end)
+            .unwrap_or_default()
             .iter()
             .any(|inst| {
                 matches!(
