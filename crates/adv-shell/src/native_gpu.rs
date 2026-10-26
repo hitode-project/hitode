@@ -1171,6 +1171,9 @@ impl Session {
                 }
                 changed = true;
             } else {
+                let update_video = video_changed
+                    || self.native.is_some()
+                    || (self.width, self.height) != self.frames.current().extent();
                 let submission = context.submission().map_err(|error| error.to_string())?;
                 self.cursor_regions = Arc::from(self.frames.current().video_cursor_regions()?);
                 if self.native.is_some() {
@@ -1184,13 +1187,13 @@ impl Session {
                     0
                 };
                 let metal = self.metal_upload;
-                let no_copy = metal && self.video.is_empty();
+                let no_copy = metal;
                 if no_copy {
                     (self.snapshot.width, self.snapshot.height) = frame.extent();
                     self.snapshot.frames = frame.serial();
                     self.snapshot.damage = frame.damage_since(since);
                 } else {
-                    frame.snapshot(&mut self.snapshot)?;
+                    frame.snapshot_base(&mut self.snapshot)?;
                 }
                 if self.snapshot.width == 0 || self.snapshot.height == 0 {
                     return Ok(Rendered {
@@ -1287,7 +1290,9 @@ impl Session {
                     self.stats.software_started.get_or_insert_with(Instant::now);
                 }
                 self.native = None;
-                self.overlays.clear();
+                if update_video {
+                    self.update_video(&context, &submission)?;
+                }
             }
         }
         let canvas = (self.width, self.height);
@@ -1360,7 +1365,7 @@ impl Session {
             canvas,
             // A frame consumed without reaching `draw_view` still needs upscaling.
             changed || !self.contiguous,
-            self.damage.filter(|_| !repaint),
+            self.damage.filter(|_| !repaint && self.overlays.is_empty()),
             &self.overlays,
             &submission,
         )?;
@@ -1694,8 +1699,28 @@ mod tests {
     }
     use super::*;
     use adv_device::gpu::Gpu;
-    use adv_device::surface::Rect;
+    use adv_device::surface::{Rect, SurfaceMemory};
+    use std::borrow::Cow;
     use std::time::Duration;
+
+    struct Memory(Vec<u8>);
+    impl SurfaceMemory for Memory {
+        fn read(&self, at: u32, len: usize) -> Result<Cow<'_, [u8]>, String> {
+            Ok(Cow::Borrowed(&self.0[at as usize..at as usize + len]))
+        }
+        fn write(&mut self, at: u32, data: &[u8]) -> Result<(), String> {
+            self.0[at as usize..at as usize + data.len()].copy_from_slice(data);
+            Ok(())
+        }
+        fn writable(&self, _: u32, _: usize) -> Result<(), String> {
+            Ok(())
+        }
+        fn copy(&mut self, src: u32, dst: u32, len: usize) -> Result<(), String> {
+            self.0
+                .copy_within(src as usize..src as usize + len, dst as usize);
+            Ok(())
+        }
+    }
 
     // spec: HOST-VIEW-1
     // spec: HOST-VIEW-9
@@ -1960,6 +1985,116 @@ mod tests {
         );
     }
 
+    // spec: HOST-VIEW-3
+    #[test]
+    fn software_video_overlays_match_cpu_composition_without_a_window() {
+        use adv_device::surface::{BlitRect, PixelFormat, Surfaces, frame_mailbox};
+        let mut gpu = pollster::block_on(Gpu::request(!cfg!(host_view))).unwrap();
+        let context = gpu.context().clone();
+        let mut memory = Memory(vec![0; 1024]);
+        let mut surfaces = Surfaces::new(6, 4, 16, 1008, Snapshot::default()).unwrap();
+        let id = surfaces
+            .create(6, 4, false, PixelFormat::Bgra32, &mut memory)
+            .unwrap();
+        memory
+            .write(surfaces[id].pixels, &[31, 63, 95, 255].repeat(24))
+            .unwrap();
+        let (producer, consumer) = frame_mailbox();
+        let wake = WakeEvent::new().unwrap();
+        surfaces.set_frame_mailbox(producer, wake.clone());
+        surfaces.present(id, &memory, surfaces[id].rect()).unwrap();
+        let layer = VideoLayer {
+            frame: VideoFrame {
+                width: 2,
+                height: 1,
+                pitch: 8,
+                bgra: Arc::from([255, 0, 0, 255, 0, 255, 0, 255]),
+            },
+            source: Rect {
+                x: 0,
+                y: 0,
+                w: 2,
+                h: 1,
+            },
+            destination: BlitRect {
+                x: 2,
+                y: 1,
+                w: 2,
+                h: 2,
+            },
+            background: Some((
+                BlitRect {
+                    x: 1,
+                    y: 0,
+                    w: 4,
+                    h: 4,
+                },
+                [9, 0, 0, 255],
+            )),
+            clip: Rect {
+                x: 1,
+                w: 4,
+                ..surfaces[id].rect()
+            },
+            canvas: (6, 4),
+            visible: true,
+            hide_cursor: false,
+        };
+        surfaces.set_video_layer(1, Some(layer), &memory).unwrap();
+        let format = wgpu::TextureFormat::Bgra8Unorm;
+        let presenter = WindowPresenter {
+            surface: None,
+            #[cfg(target_os = "android")]
+            android_window: None,
+            context: context.clone(),
+            configuration: wgpu::SurfaceConfiguration {
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                format,
+                width: 6,
+                height: 4,
+                present_mode: wgpu::PresentMode::Fifo,
+                desired_maximum_frame_latency: 2,
+                alpha_mode: wgpu::CompositeAlphaMode::Opaque,
+                color_space: wgpu::SurfaceColorSpace::Srgb,
+                view_formats: vec![],
+            },
+            compositor: Compositor::new(context.clone(), format),
+            upscaler: crate::Upscaler::Off,
+            scaling: crate::Scaling::Fit,
+            upscaling: None,
+            max_acquire_ns: Cell::new(0),
+            max_configure_ns: 0,
+            upscaled: (0, 0),
+            #[cfg(target_os = "macos")]
+            direct_layer: false,
+        };
+        let mut session = Session::new(presenter, consumer);
+        session.render(6, 4, false, &wake).unwrap();
+        assert_eq!(session.overlays.len(), 1);
+        assert!(session.native.is_none());
+        assert_eq!(session.snapshot.bgra.is_empty(), session.metal_upload);
+        let mut expected = Snapshot::default();
+        session.frames.current().snapshot(&mut expected).unwrap();
+        let output = gpu.image(6, 4).unwrap();
+        session
+            .presenter
+            .compositor
+            .compose_frame(
+                &session.software.as_ref().unwrap().1,
+                output.view(),
+                format,
+                [0., 0., 6., 4.],
+                (6, 4),
+                (6, 4),
+                &session.overlays,
+                &context.submission().unwrap(),
+            )
+            .unwrap();
+        let mut transfer = gpu.readback(&output, None).unwrap();
+        transfer.take_completion_job().unwrap()();
+        assert_eq!(transfer.poll().unwrap().unwrap(), expected.bgra);
+    }
+
     // spec: HOST-VIEW-7
     #[test]
     fn upscalers_process_odd_sized_rgb_frames_without_changing_the_source() {
@@ -2079,25 +2214,6 @@ mod tests {
     #[cfg(windows)]
     fn owned_window_regression(fallback: bool) {
         use adv_device::surface::{PixelFormat, SurfaceMemory, Surfaces, frame_mailbox};
-        use std::borrow::Cow;
-        struct Memory(Vec<u8>);
-        impl SurfaceMemory for Memory {
-            fn read(&self, at: u32, len: usize) -> Result<Cow<'_, [u8]>, String> {
-                Ok(Cow::Borrowed(&self.0[at as usize..at as usize + len]))
-            }
-            fn write(&mut self, at: u32, data: &[u8]) -> Result<(), String> {
-                self.0[at as usize..at as usize + data.len()].copy_from_slice(data);
-                Ok(())
-            }
-            fn writable(&self, _: u32, _: usize) -> Result<(), String> {
-                Ok(())
-            }
-            fn copy(&mut self, src: u32, dst: u32, len: usize) -> Result<(), String> {
-                self.0
-                    .copy_within(src as usize..src as usize + len, dst as usize);
-                Ok(())
-            }
-        }
         let mut gpu = pollster::block_on(Gpu::request(fallback)).unwrap();
         let mut window =
             crate::window::Window::new("GPU ownership regression", 32, 24, true).unwrap();

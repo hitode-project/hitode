@@ -73,7 +73,7 @@ This spec covers the host shells. It includes launcher overlay input, the game v
 
 ### HOST-VIEW-3 One composition path
 
-**Rule**: Software frames, GPU surfaces and video MUST share one background composition path. Composition MUST preserve encoded colors, write opaque alpha and keep the letterbox black.
+**Rule**: Software frames and GPU surfaces MUST draw video as GPU overlays through one background composition path, using CPU video composition only for captures. Composition MUST preserve encoded colors, write opaque alpha and keep the letterbox black.
 **Verification**: Test
 
 ### HOST-VIEW-4 Surface configuration off the UI thread

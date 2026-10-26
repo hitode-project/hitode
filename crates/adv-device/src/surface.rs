@@ -255,6 +255,13 @@ impl PendingFrame {
     /// Convert only changes since this consumer's last snapshot. History gaps
     /// force a full conversion; each consumer independently owns its baseline.
     pub fn snapshot(&self, out: &mut Snapshot) -> Result<(), String> {
+        self.snapshot_with_video(out, true)
+    }
+    /// Convert the base frame for presentation with separate GPU video overlays.
+    pub fn snapshot_base(&self, out: &mut Snapshot) -> Result<(), String> {
+        self.snapshot_with_video(out, false)
+    }
+    fn snapshot_with_video(&self, out: &mut Snapshot, video: bool) -> Result<(), String> {
         #[cfg(feature = "gpu")]
         if self.native.is_some() {
             return Err("native GPU snapshot requires an explicit asynchronous readback".into());
@@ -271,7 +278,7 @@ impl PendingFrame {
         let damage = if out.width != self.width
             || out.height != self.height
             || out.bgra.len() != self.width as usize * self.height as usize * 4
-            || !self.video.is_empty()
+            || (video && !self.video.is_empty())
         {
             Damage::from_rect(full)
         } else {
@@ -282,7 +289,9 @@ impl PendingFrame {
         out.bgra
             .resize(self.width as usize * self.height as usize * 4, 0);
         self.convert(out, &damage);
-        self.compose_video(out)?;
+        if video {
+            self.compose_video(out)?;
+        }
         out.frames = self.serial;
         out.damage = damage;
         if verify_software() {
@@ -293,7 +302,9 @@ impl PendingFrame {
                 ..Default::default()
             };
             self.convert(&mut reference, &[full]);
-            self.compose_video(&mut reference)?;
+            if video {
+                self.compose_video(&mut reference)?;
+            }
             if reference.bgra != out.bgra {
                 return Err("incremental software snapshot differs from full conversion".into());
             }
