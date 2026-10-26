@@ -18,6 +18,9 @@ thiserror.workspace = true
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[dev-dependencies]
+adv-device = { path = "../adv-device" }
+
 [target.'cfg(any(target_vendor = "apple", target_os = "android"))'.dev-dependencies]
 adv-wineserver = { path = "../adv-wineserver" }
 

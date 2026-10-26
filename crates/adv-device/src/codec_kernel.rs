@@ -1,5 +1,8 @@
 //! Stateless codec math. Buffers, plans and scratch belong to one caller;
 //! no guest pointers, stream state or I/O enter these kernels.
+mod deflate;
+pub use deflate::inflate_fast;
+
 use symphonia::core::dsp::mdct::Imdct;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -115,27 +118,58 @@ pub fn png_paeth_segment(
     if row.len() != previous.len() || prefix.is_empty() || prefix.len() != previous_prefix.len() {
         return Err(KernelError::UnsupportedSize);
     }
-    for i in 0..row.len() {
-        let (left, upper_left) = if i < prefix.len() {
-            (prefix[i], previous_prefix[i])
-        } else {
-            (row[i - prefix.len()], previous[i - prefix.len()])
-        };
-        let above = previous[i];
-        let p = i32::from(left) + i32::from(above) - i32::from(upper_left);
-        let a = (p - i32::from(left)).abs();
-        let b = (p - i32::from(above)).abs();
-        let c = (p - i32::from(upper_left)).abs();
-        let predictor = if a <= b && a <= c {
-            left
-        } else if b <= c {
-            above
-        } else {
-            upper_left
-        };
-        row[i] = row[i].wrapping_add(predictor);
+    match prefix.len() {
+        1 => paeth_pixels::<1>(row, previous, prefix, previous_prefix),
+        2 => paeth_pixels::<2>(row, previous, prefix, previous_prefix),
+        3 => paeth_pixels::<3>(row, previous, prefix, previous_prefix),
+        4 => paeth_pixels::<4>(row, previous, prefix, previous_prefix),
+        6 => paeth_pixels::<6>(row, previous, prefix, previous_prefix),
+        8 => paeth_pixels::<8>(row, previous, prefix, previous_prefix),
+        _ => {
+            for i in 0..row.len() {
+                let (left, corner) = if i < prefix.len() {
+                    (prefix[i], previous_prefix[i])
+                } else {
+                    (row[i - prefix.len()], previous[i - prefix.len()])
+                };
+                row[i] = row[i].wrapping_add(paeth_predictor(left, previous[i], corner));
+            }
+        }
     }
     Ok(())
+}
+
+#[inline]
+fn paeth_predictor(left: u8, above: u8, corner: u8) -> u8 {
+    let x = i16::from(above) - i16::from(corner);
+    let y = i16::from(left) - i16::from(corner);
+    let (a, b, c) = (x.abs(), y.abs(), (x + y).abs());
+    let (best, minimum) = if b < a { (above, b) } else { (left, a) };
+    if c < minimum { corner } else { best }
+}
+
+// PNG channel widths are constant within a row. Keeping each channel's history
+// in a fixed array removes per-byte history selection and exposes lane parallelism.
+fn paeth_pixels<const N: usize>(
+    row: &mut [u8],
+    previous: &[u8],
+    prefix: &[u8],
+    previous_prefix: &[u8],
+) {
+    let mut left: [u8; N] = prefix.try_into().unwrap();
+    let mut corner: [u8; N] = previous_prefix.try_into().unwrap();
+    let (pixels, tail) = row.as_chunks_mut::<N>();
+    let (above, above_tail) = previous.as_chunks::<N>();
+    for (pixel, above) in pixels.iter_mut().zip(above) {
+        for i in 0..N {
+            pixel[i] = pixel[i].wrapping_add(paeth_predictor(left[i], above[i], corner[i]));
+            left[i] = pixel[i];
+            corner[i] = above[i];
+        }
+    }
+    for i in 0..tail.len() {
+        tail[i] = tail[i].wrapping_add(paeth_predictor(left[i], above_tail[i], corner[i]));
+    }
 }
 
 /// Forward LZ77 expansion. Reads include history written by this call.

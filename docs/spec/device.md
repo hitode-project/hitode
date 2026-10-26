@@ -225,7 +225,7 @@ Device reconnection MUST retain refill notifications crossed while reanchoring a
 
 ### DEV-CODEC-1 Integer byte kernels
 
-**Rule**: Integer codec kernels MUST implement the byte semantics below without guest state, allocation, callbacks or I/O. Invalid sizes or distances MUST be rejected before writing.
+**Rule**: PNG row and LZ77 kernels MUST implement the byte semantics below without guest state, allocation, callbacks or I/O. Invalid sizes or distances MUST be rejected before writing.
 **Verification**: Test
 
 | Computation | Byte semantics |
@@ -234,6 +234,11 @@ Device reconnection MUST retain refill notifications crossed while reanchoring a
 | PNG Average | Widen the sum before division |
 | PNG Paeth | Break ties in left, above, upper-left order |
 | LZ77 | Ordered reads include newly written history for overlapping matches |
+
+### DEV-CODEC-2 DEFLATE batches
+
+**Rule**: DEFLATE batches MUST preserve Huffman decoding, extra bits, overlapping matches, chronological window history and speculative input rollback. Decoding MUST use caller-owned scratch without allocation, guest access or I/O. Rejection MAY leave partial scratch bytes but MUST NOT publish stream state.
+**Verification**: Test
 
 ### DEV-VIDEO-1 Native packet decoding
 

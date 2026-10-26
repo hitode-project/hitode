@@ -227,6 +227,7 @@ name = "adv-nt"
 version = "0.1.2"
 dependencies = [
  "adv-cpu",
+ "adv-device",
  "adv-machine",
  "adv-pe",
  "adv-wineserver",

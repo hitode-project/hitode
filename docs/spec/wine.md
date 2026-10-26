@@ -377,6 +377,26 @@ FreeType is a host library under WINE-UNIX-6.
 **Rule**: PE string and conversion bodies MUST bound guest memory calls by pages and tables touched, rather than input units. Short calls fitting within one page of strings or eight KiB of conversion output MUST NOT allocate heap buffers.
 **Verification**: Test
 
+### NAT-BODY-8 D3DX pixel conversion
+
+**Rule**: D3DX pixel bodies MUST preserve channel values, filter coordinates, color keys and padding with layouts matching the pinned module's DWARF. Unsupported formats or filters, overlapping buffers and inaccessible memory MUST decline before writes. Changed helper code or copy imports MUST retain guest execution.
+**Verification**: Test
+
+### NAT-BODY-9 PNG row bodies
+
+**Rule**: PNG row bodies MUST preserve Wine's Sub, Up, Average and Paeth bytes and row metadata through the shared device kernels. Missing kernels, overlapping rows and inaccessible memory MUST retain guest execution before writes. Row metadata offsets MUST match the pinned module's DWARF.
+**Verification**: Test
+
+### NAT-BODY-10 Embedded zlib checksums
+
+**Rule**: Adler-32 bodies MUST preserve the pinned zlib's seeded checksum, short-input arithmetic and null-buffer initialization. Inaccessible input MUST retain guest execution.
+**Verification**: Test
+
+### NAT-BODY-11 DEFLATE fast batches
+
+**Rule**: Native DEFLATE batches MUST preserve Wine's output, consumed input, bit reservoir, stream pointers and block-end state. Rejected batches MUST retain guest execution before guest writes. Stream and window layouts MUST match the pinned module's DWARF.
+**Verification**: Test
+
 ## Host DLL images
 
 ### WINE-DLL-1 Loader-owned entries

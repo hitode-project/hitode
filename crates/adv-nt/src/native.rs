@@ -23,6 +23,11 @@ mod crt;
 mod dib;
 mod mixer;
 mod nls;
+mod pixels;
+mod png;
+mod zlib;
+pub use png::{PngFilter, PngRows};
+pub use zlib::InflateFast;
 
 /// The module the bodies' thunks are registered under.
 pub const MODULE: &str = "hitode.native";
@@ -105,6 +110,16 @@ static BODIES: std::sync::LazyLock<Vec<Body>> = std::sync::LazyLock::new(|| {
         },
     ];
     bodies.extend(crt::bodies());
+    for version in 24..=43 {
+        bodies.push(Body {
+            name: format!("d3dx9_{version}.dll!d3dx_load_pixels_from_pixels").into(),
+            conv: Conv::Cdecl { argc: 6 },
+            leaf: pixels::load,
+            handler: resume_original,
+        });
+    }
+    bodies.extend(png::bodies());
+    bodies.extend(zlib::bodies());
     bodies
 });
 
@@ -139,6 +154,7 @@ pub(crate) fn bind(cpu: &mut dyn Guest, sys: &mut Sys, ext: &mut Ext, base: u32,
     let mut relocations = pe.relocations().unwrap_or_default();
     relocations.sort_unstable();
     bind_relocated(cpu, sys, ext, base, &relocations);
+    pixels::prepare(cpu, ext, base, pe, &relocations);
 }
 
 pub(crate) fn bind_relocated(
