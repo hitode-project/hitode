@@ -33,6 +33,9 @@ impl Drop for Fd {
         assert_eq!(unsafe { hitode_close(self.0) }, 0);
     }
 }
+/// Tests reuse freed descriptor numbers, so they must not run concurrently.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn pipe() -> (Fd, Fd) {
     let mut fds = [0; 2];
     // SAFETY: fds has space for both descriptors.
@@ -100,6 +103,7 @@ extern "C" fn notified(owner: *mut c_void, token: usize) {
 // spec: SRV-CHAN-1, WINE-THR-1, SRV-EVENT-1
 #[test]
 fn registered_pipes_round_trip_wake_close_and_reuse() {
+    let _serial = SERIAL.lock().unwrap_or_else(|poison| poison.into_inner());
     // Link the facade supplying the shim's execution-owner services.
     let _ = adv_wineserver::PROTOCOL_VERSION;
     let (request, client_request) = pipe();
@@ -310,6 +314,7 @@ fn channel_events_preserve_filters_enablement_data_and_close() {
 // spec: SRV-SYNC-3
 #[test]
 fn non_device_open_ioctl_and_close_reach_libc() {
+    let _serial = SERIAL.lock().unwrap_or_else(|poison| poison.into_inner());
     let _ = adv_wineserver::PROTOCOL_VERSION;
     // SAFETY: paths and buffers are live; every created descriptor closes here.
     unsafe {
