@@ -25,8 +25,10 @@ struct ProgramKey {
 pub(super) struct ProgramCache {
     entries: std::collections::HashMap<ProgramKey, Program>,
     bytes: usize,
+    order: std::collections::VecDeque<ProgramKey>,
     warming: std::collections::HashMap<ProgramKey, adv_device::gpu::compile::Compile<Program>>,
     warming_bytes: usize,
+    warming_order: std::collections::VecDeque<(ProgramKey, usize)>,
     pub counters: adv_device::gpu::compile::CompileCounters,
 }
 pub(super) fn register(registry: &mut Registry) {
@@ -409,7 +411,11 @@ fn prepare_checked(
         output_indices = None;
         let count = draw.texcoords.as_ref().map(|(count, _)| *count);
         let mut stream = VertexStream {
-            bytes: VertexBytes::fixed(draw.vertices.clone(), draw.texcoords.clone()),
+            bytes: VertexBytes::fixed(
+                draw.vertices.clone(),
+                draw.texcoords.clone(),
+                Some(draw.recording_key),
+            ),
             stride: count.map_or(40, |n| 32 + n as u32 * 16),
             attributes: vec![
                 Attribute {
@@ -612,10 +618,15 @@ fn prepare_checked(
     let program = if let Some(program) = cache.entries.get(&key) {
         program.clone()
     } else {
-        let prepared = cache
-            .warming
-            .remove(&key)
-            .and_then(|job| job.wait().as_ref().ok().cloned());
+        let prepared = cache.warming.remove(&key).and_then(|job| {
+            let at = cache
+                .warming_order
+                .iter()
+                .position(|(k, _)| k == &key)
+                .unwrap();
+            cache.warming_bytes -= cache.warming_order.remove(at).unwrap().1;
+            job.wait().as_ref().ok().cloned()
+        });
         let program = if let Some(program) = prepared {
             program
         } else {
@@ -634,10 +645,11 @@ fn prepare_checked(
         };
         const MAX_BYTES: usize = 8 * 1024 * 1024;
         if program.source().len() <= MAX_BYTES {
-            if cache.entries.len() == 256 || cache.bytes + program.source().len() > MAX_BYTES {
-                cache.entries.clear();
-                cache.bytes = 0;
+            while cache.entries.len() == 256 || cache.bytes + program.source().len() > MAX_BYTES {
+                let oldest = cache.order.pop_front().unwrap();
+                cache.bytes -= cache.entries.remove(&oldest).unwrap().source().len();
             }
+            cache.order.push_back(key.clone());
             cache.bytes += program.source().len();
             cache.entries.insert(key, program.clone());
         }

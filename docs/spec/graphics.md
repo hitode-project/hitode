@@ -53,6 +53,8 @@ This spec covers shared CPU compositing and the DirectDraw and Direct3D 9 API fr
 | Batches | Matching attachments reuse the encoder; adjacent identical constants reuse their ring range. |
 | Observations | GPU reports expose Metal draws, backend switches partitioned into partial clears, copies, uploads, fixed draws, readbacks and other transitions (including entry to Metal), ring bytes written and ring Busy returns. |
 
+Acquiring a submission lease MUST NOT flush queued drawing or change backends. Native frames MUST retain their producer's completion and let direct presentation subscribe to it without an extra queue submission. Actual reference-backend work MUST preserve queue order and invalidate stale native completion tokens.
+
 ## GPU render passes
 
 ### GFX-PASS-1 Deferred full clears
@@ -76,6 +78,7 @@ Metal and wgpu MUST share these rules and report passes, color loads, depth load
 **Rule**: Depth and stencil clears MUST wait on their depth image until a pass attaches it. Whole-image clears MUST become that pass's load actions; partial clears MUST execute as bounded draws before the first draw that tests or writes depth or stencil.
 A clear that cannot absorb a waiting one MUST execute the waiting one first. Deferring a clear MUST end a pass that already attaches the image. Depth images MUST NOT be observable except through attachment.
 Queued clear regions MUST retain their admission-time clip; subsequent drawing clips MUST NOT narrow them when they are materialized.
+Clipped clears MUST retain depth/stencil deferral independently of their color writes. Repeated equal clears inside a pending region MUST NOT materialize an otherwise unused attachment.
 **Verification**: Test
 
 ## D3D9 frame recording
@@ -97,7 +100,9 @@ Flush limits are 4096 commands or 64 MiB of upload and vertex data. Readback bou
 Full clears replace previous dependencies; partial clears, draws and copies retain them. Upload admission assigns a fresh identity. A partial flush or a private presentation without the shared output prevents elision of that frame. DISCARD presentation may rotate independently reconstructible targets; destination-dependent frames preserve writable contents using an immutable GPU snapshot.
 Clear identities MUST include only the selected value and extent of each written color, depth or stencil component. Draws MUST read only the enabled depth/stencil tests.
 Fixed-state draw keys MAY be cached between mutations, but every mutable state access MUST invalidate the cached key. Fixed-state categories retain shared immutable maps and complete content keys. Identical map insertions preserve that category's key; arbitrary mutable access invalidates it.
+Fixed-state category reads MUST use dense SDK selector tables, and state-block membership and delta calculation MUST use bounded slot bitmaps without per-member heap allocation.
 Fixed-input draws MAY capture each owned vertex stream once per draw when the span reads no more bytes than separate vertex reads. Complete input identities MUST retain index order and exact vertex bytes, including repeated indices; later draws MUST observe buffer writes.
+Owned input captures with identical complete inputs and decoding state MAY reuse immutable decoded geometry across adjacent frames. Each frame generation MUST retain at most 4096 entries and 64 MiB, and cached geometry MUST NOT retain GPU resources. Fixed programmable streams MAY reuse this complete capture identity instead of hashing expanded bytes again; arbitrary byte mutation and point expansion MUST discard that identity.
 
 ### GFX-REC-3 Asynchronous pixel verification
 
@@ -146,7 +151,7 @@ transfers; state-block recording still captures unchanged setter membership.
 **Rule**: Translation MUST cache external register usage, excluding shader-local definitions. Fingerprints, copies and uploads MUST process only those ranges while preserving exact bits and uniform layout. Recording MUST retain complete xxh3-128 identities, and both backends MUST reserve aligned complete binding windows before writing.
 **Verification**: Test
 
-Usage includes implicit matrix rows, int/bool operands and legacy bump parameters. Relative float addressing covers all 256 float registers except local definitions. Constants, vertices, indices and pixels use 128-bit content keys. Insufficient storage wraps before the complete binding window exceeds the buffer. Packed wgpu uploads retain one queue write per buffer per batch. Immutable snapshots retain only used registers, reuse unchanged captures and serve CPU damage interpretation directly. Complete constant blocks are materialized only on demand; CPU interpretation agrees with complete constants.
+Usage includes implicit matrix rows, int/bool operands and legacy bump parameters. Relative float addressing covers all 256 float registers except local definitions. Constants, vertices, indices and pixels use 128-bit content keys. Insufficient storage wraps before the complete binding window exceeds the buffer. Packed wgpu uploads retain one queue write per buffer per batch. Immutable snapshots retain only used registers, reuse unchanged captures across writes to unused registers and serve CPU damage interpretation directly. Complete constant blocks are materialized only on demand; CPU interpretation agrees with complete constants.
 
 ### GFX-REC-8 Frontend work counters
 
@@ -321,7 +326,7 @@ snapshot storage; an unchanged Apply performs no state writes. Redundant fixed-s
 
 ### GFX-CACHE-5 Repeated shader creation
 
-**Rule**: Identical bytecode MAY reuse successful translations while preserving independent shader objects and exact GetFunction bytes. Each process translation cache MUST retain at most 256 entries, with at most 8 MiB of bytecode, WGSL, and sampler payloads.
+**Rule**: Identical bytecode MAY reuse successful translations while preserving independent shader objects and exact GetFunction bytes. Each process translation cache MUST retain at most 256 entries, with at most 8 MiB of bytecode, WGSL, and sampler payloads. Translation and assembled-program caches MUST evict oldest entries individually instead of clearing unrelated entries.
 **Verification**: Test
 
 ### GFX-CACHE-6 Texture bindings
@@ -382,6 +387,8 @@ Binding changes MUST NOT start speculative module preparation for transient shad
 **Rule**: Standalone non-multisampled render targets created with Lockable MUST support CPU locks through ordered GPU readback and writable unlock uploads. Targets created without Lockable MUST reject CPU locks. Read-only unlocks MUST preserve GPU contents.
 **Verification**: Test
 **Basis**: Microsoft Direct3D 9 `IDirect3DDevice9::CreateRenderTarget` and `IDirect3DSurface9::LockRect`.
+
+CPU-only surfaces and managed texture-level locks preserve pending recorded commands; only GPU-backed locks require a readback barrier.
 
 ### GFX-STATE-1 Neutral fixed state
 

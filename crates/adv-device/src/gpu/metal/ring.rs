@@ -6,7 +6,7 @@ pub(super) struct Ring {
     pub(super) head: u64,
     tail: u64,
     waiting: Arc<AtomicBool>,
-    completions: VecDeque<(u64, Arc<AtomicBool>)>,
+    completions: VecDeque<(u64, Arc<super::display::Completion>)>,
 }
 impl Ring {
     pub(super) fn new(device: &ProtocolObject<dyn MTLDevice>) -> Result<Self, Error> {
@@ -27,7 +27,7 @@ impl Ring {
         // Arm before observing completions, so a Busy retry cannot lose its wake.
         self.waiting.store(true, Ordering::Release);
         while let Some((end, done)) = self.completions.front() {
-            if !done.load(Ordering::Acquire) {
+            if !done.ready() {
                 break;
             }
             self.tail = *end;
@@ -80,16 +80,16 @@ impl Ring {
         command: &ProtocolObject<dyn MTLCommandBuffer>,
         gate: Arc<submission::Gate>,
         failure: Arc<OnceLock<String>>,
+        completion: Arc<super::display::Completion>,
     ) {
-        let done = Arc::new(AtomicBool::new(false));
-        self.completions.push_back((self.head, done.clone()));
+        self.completions.push_back((self.head, completion.clone()));
         let waiting = self.waiting.clone();
         let block = block2::RcBlock::new(
             move |command: std::ptr::NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
                 if let Some(error) = unsafe { command.as_ref().error() } {
                     let _ = failure.set(format!("Metal command failed: {error}"));
                 }
-                done.store(true, Ordering::Release);
+                completion.complete();
                 if waiting.swap(false, Ordering::AcqRel) {
                     gate.notify_execution();
                 }

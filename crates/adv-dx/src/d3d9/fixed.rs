@@ -13,12 +13,14 @@ use state_map::StateMap;
 pub(super) struct CachedFixed {
     state: Fixed,
     key: std::cell::Cell<Option<u128>>,
+    inputs: std::cell::RefCell<input::GeometryCache>,
 }
 impl CachedFixed {
     pub(super) fn new(width: u32, height: u32) -> Self {
         Self {
             state: Fixed::new(width, height),
             key: std::cell::Cell::new(None),
+            inputs: Default::default(),
         }
     }
     pub(super) fn key(&self) -> u128 {
@@ -28,6 +30,9 @@ impl CachedFixed {
         let key = super::recording::fixed_key(&self.state);
         self.key.set(Some(key));
         key
+    }
+    pub(super) fn finish_inputs(&self) {
+        self.inputs.borrow_mut().finish();
     }
 }
 impl std::ops::Deref for CachedFixed {
@@ -1178,6 +1183,22 @@ fn prepare_input_checked(
         .and_then(|v| v.iter().max().copied())
         .unwrap_or(length - 1);
     let mut input = input::Reader::new(env, pointer, layout, source, first, last, length)?;
+    let base_key = super::recording::draw_key(env, pointer);
+    let captured = input.captured_key(indices, length);
+    let geometry_key = captured.map(|key| super::recording::hash((base_key, kind, count, key)));
+    if let Some(geometry) = geometry_key.and_then(|key| d.fixed.inputs.borrow_mut().get(key)) {
+        let (target, image, state) = prepare_state(env, pointer, kind)?;
+        return Ok(Draw {
+            target,
+            image,
+            state,
+            vertices: geometry.vertices,
+            texcoords: geometry.texcoords,
+            programmable: None,
+            recording_key: geometry_key.unwrap(),
+            program_key: 0,
+        });
+    }
     let mut input_key = xxhash_rust::xxh3::Xxh3::new();
     std::hash::Hash::hash(&indices, &mut input_key);
     let mut vertices = Vec::with_capacity(length as usize);
@@ -1204,7 +1225,9 @@ fn prepare_input_checked(
     for ordinal in 0..length {
         let index = indices.map_or(ordinal, |v| v[ordinal as usize]);
         input.read(env, index)?;
-        input.hash(&mut input_key);
+        if captured.is_none() {
+            input.hash(&mut input_key);
+        }
         let word = |stream: u16, at: u32| input.word(stream, at);
         let float = |stream, at| f32::from_le_bytes(word(stream, at));
         let at = layout.position;
@@ -1291,16 +1314,25 @@ fn prepare_input_checked(
         }
     }
     let (target, image, state) = prepare_state(env, pointer, kind)?;
+    let geometry = input::Geometry {
+        vertices: vertices.into(),
+        texcoords: texcoords.map(|values| (coordinate_count, values.into())),
+    };
+    if let Some(key) = geometry_key {
+        d.fixed.inputs.borrow_mut().insert(key, geometry.clone());
+    }
     Ok(Draw {
         target,
         image,
-        vertices: vertices.into(),
-        texcoords: texcoords.map(|values| (coordinate_count, values.into())),
+        vertices: geometry.vertices,
+        texcoords: geometry.texcoords,
         state,
         programmable: None,
         recording_key: super::recording::hash((
-            super::recording::draw_key(env, pointer),
-            input_key.digest128(),
+            base_key,
+            kind,
+            count,
+            captured.unwrap_or_else(|| input_key.digest128()),
         )),
         program_key: 0,
     })

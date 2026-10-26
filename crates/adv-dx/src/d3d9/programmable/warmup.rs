@@ -76,10 +76,12 @@ fn schedule(
             .flatten()
             .map(|(s, _)| s.bytecode().len() * 4 + crate::shader::MAX_TRANSLATION_BYTES)
             .sum::<usize>();
-    if cache.warming.len() == 16 || cache.warming_bytes + bytes > 32 * 1024 * 1024 {
-        cache.warming.clear();
-        cache.warming_bytes = 0;
+    while cache.warming.len() == 16 || cache.warming_bytes + bytes > 32 * 1024 * 1024 {
+        let (oldest, bytes) = cache.warming_order.pop_front().unwrap();
+        cache.warming.remove(&oldest);
+        cache.warming_bytes -= bytes;
     }
+    cache.warming_order.push_back((key.clone(), bytes));
     cache.warming_bytes += bytes;
     let job = Compile::spawn(bytes, cache.counters.clone(), move || {
         let translations = stages

@@ -48,11 +48,7 @@ fn shared_layer_preserves_rgb_independently_of_guest_alpha_and_output_color_spac
             .unwrap();
             let frame = gpu.completed_frame(target.image, 1).unwrap();
             let wake = adv_sync::WakeEvent::new().unwrap();
-            let fence = context
-                .submission()
-                .unwrap()
-                .display_completion(wake.clone())
-                .unwrap();
+            let fence = frame.display_completion(wake.clone()).unwrap();
             while !fence.ready().unwrap() {
                 assert!(wake.wait(Some(std::time::Duration::from_secs(10))).unwrap());
             }

@@ -790,6 +790,9 @@ fn finish(env: &mut Env<'_>, owner: Id, token: u64, presentation: u128, serial: 
     f.key = 0;
     f.partial = false;
     f.verdict = None;
+    if let Some(Payload::Device(d)) = com(env).get_identity(&env.sys.objects, owner) {
+        d.fixed.finish_inputs();
+    }
 }
 fn verify_pixels(
     env: &mut Env<'_>,

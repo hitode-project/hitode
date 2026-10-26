@@ -1319,7 +1319,7 @@ impl Session {
                 .as_ref()
                 .filter(|frame| frame.io_surface().is_some())
         {
-            let completion = submission
+            let completion = frame
                 .display_completion(_wake.clone())
                 .map_err(|e| e.to_string())?;
             self.contiguous = true;

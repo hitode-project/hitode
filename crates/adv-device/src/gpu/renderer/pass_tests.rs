@@ -287,6 +287,54 @@ fn depth_clears_wait_for_a_pass_that_attaches_depth() {
 
 // spec: GFX-PASS-3
 #[test]
+fn clipped_repeated_depth_clears_stay_deferred_until_depth_is_used() {
+    for native in backends() {
+        let mut gpu = gpu(native);
+        let target = gpu.target(4, 4, true).unwrap();
+        let green = draw();
+        let mut red = draw();
+        red.pixel_constants.floats[0] = [1., 0., 0., 1.];
+        gpu.clear(&target, Some([0., 0., 0., 1.]), Some(1.))
+            .unwrap();
+        let mut state = DrawState::new(4, 4);
+        state.depth = Some(Compare::Never);
+        gpu.draw_programmable(&target, &green, &state).unwrap();
+        read(&mut gpu, &target.image);
+        let before = gpu.stats();
+        state.depth = None;
+        for width in [2, 1, 2] {
+            gpu.set_clip(Some(Rect { w: width, ..FULL }));
+            gpu.clear_region(&target, FULL, Some([1., 0., 0., 1.]), Some(0.25), None)
+                .unwrap();
+            gpu.draw_programmable(&target, &green, &state).unwrap();
+            gpu.clear_region(&target, FULL, None, Some(0.25), None)
+                .unwrap();
+            read(&mut gpu, &target.image);
+        }
+        let after = gpu.stats();
+        assert_eq!(after.passes - before.passes, 3);
+        assert_eq!(after.color_loads - before.color_loads, 3);
+        assert_eq!(after.depth_loads - before.depth_loads, 0);
+        gpu.set_clip(None);
+        state.depth = Some(Compare::Less);
+        gpu.draw_programmable(&target, &red, &state).unwrap();
+        let pixels = read(&mut gpu, &target.image);
+        for (at, pixel) in pixels.as_chunks::<4>().0.iter().enumerate() {
+            assert_eq!(
+                *pixel,
+                if at % 4 < 2 {
+                    [0, 255, 0, 255]
+                } else {
+                    [0, 0, 255, 255]
+                },
+                "pixel {at}"
+            );
+        }
+    }
+}
+
+// spec: GFX-PASS-3
+#[test]
 fn a_partial_depth_clear_follows_the_deferred_whole_clear() {
     for native in backends() {
         let mut gpu = gpu(native);

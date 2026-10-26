@@ -3,6 +3,50 @@
 use super::*;
 use std::hash::{Hash, Hasher};
 
+#[derive(Clone)]
+pub(super) struct Geometry {
+    pub vertices: Arc<Vec<Vertex>>,
+    pub texcoords: Option<(usize, Arc<Vec<[f32; 4]>>)>,
+}
+#[derive(Default)]
+pub(super) struct GeometryCache {
+    current: std::collections::HashMap<u128, Geometry>,
+    previous: std::collections::HashMap<u128, Geometry>,
+    bytes: usize,
+}
+impl GeometryCache {
+    pub fn get(&mut self, key: u128) -> Option<Geometry> {
+        let geometry = self
+            .current
+            .get(&key)
+            .or_else(|| self.previous.get(&key))?
+            .clone();
+        self.insert(key, geometry.clone());
+        Some(geometry)
+    }
+    pub fn insert(&mut self, key: u128, geometry: Geometry) {
+        if self.current.contains_key(&key) {
+            return;
+        }
+        let bytes = std::mem::size_of_val(geometry.vertices.as_slice())
+            + geometry
+                .texcoords
+                .as_ref()
+                .map_or(0, |(_, values)| std::mem::size_of_val(values.as_slice()));
+        // Match the recording's command and payload budgets, for each of two
+        // frame generations, including draws that never reach Present.
+        if self.current.len() < 4096 && self.bytes + bytes <= 64 * 1024 * 1024 {
+            self.bytes += bytes;
+            self.current.insert(key, geometry);
+        }
+    }
+    pub fn finish(&mut self) {
+        std::mem::swap(&mut self.current, &mut self.previous);
+        self.current.clear();
+        self.bytes = 0;
+    }
+}
+
 pub(super) enum Input {
     Up { data: u32, stride: u32 },
     Bound { start: u32 },
@@ -21,6 +65,25 @@ pub(super) struct Reader {
     start: u32,
 }
 impl Reader {
+    pub(super) fn captured_key(&mut self, indices: Option<&[u32]>, length: u32) -> Option<u128> {
+        if self
+            .sources
+            .iter()
+            .zip(self.batches)
+            .any(|(source, batch)| source.is_some() && batch.is_none())
+        {
+            return None;
+        }
+        let mut key = xxhash_rust::xxh3::Xxh3::new();
+        indices.hash(&mut key);
+        for ordinal in 0..length {
+            self.current = indices
+                .map_or(ordinal, |v| v[ordinal as usize])
+                .checked_add(self.start)?;
+            self.hash(&mut key);
+        }
+        Some(key.digest128())
+    }
     pub(super) fn hash(&self, key: &mut impl Hasher) {
         let bytes: [&[u8]; 16] = std::array::from_fn(|n| self.bytes(n));
         bytes.hash(key);

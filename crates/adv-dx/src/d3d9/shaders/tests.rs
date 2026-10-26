@@ -715,8 +715,15 @@ fn translation_cache_evicts_without_changing_retained_programs() {
             retained.source
         );
     }
-    assert_eq!(cache.entries.len(), 1);
+    assert_eq!(cache.entries.len(), 256);
+    let (recent_tokens, _) = cache.order.back().unwrap();
+    let recent = cache.entries[recent_tokens].as_ref().unwrap().clone();
+    let recent_shader = crate::shader::Shader::parse(recent_tokens).unwrap();
     let replacement = cache.translate(&first, None).unwrap();
+    assert!(Arc::ptr_eq(
+        &recent,
+        &cache.translate(&recent_shader, None).unwrap()
+    ));
     assert!(!Arc::ptr_eq(&retained, &replacement));
     assert_eq!(retained.source, replacement.source);
 }
@@ -774,4 +781,45 @@ fn repeated_capture_preserves_signed_zero_nan_and_uncaptured_constants() {
         [0x8000_0000, 0x7fc0_0123, 0, 0]
     );
     assert_eq!(c.floats[8][0], 1.);
+}
+
+// spec: GFX-REC-7
+#[test]
+fn unused_constant_uploads_retain_the_used_register_capture() {
+    let mut m = machine();
+    let mut env = env(&mut m);
+    let (device, _, _, _) = super::super::tests::setup(&mut env);
+    let mut usage = adv_device::constants::ConstantUsage::default();
+    usage.set(0);
+    let constants = &super::device(&env, device)
+        .unwrap()
+        .shaders
+        .vertex_constants;
+    let before = constants.snapshot(usage, &[]);
+    let address = before.ranges(usage).next().unwrap().1.as_ptr();
+    let key = constants.key(usage);
+    let data = bytemuck::bytes_of(&[0x8000_0000u32, 0x7fc0_1234, 7, 9]);
+    assert_eq!(set_constants_direct(&mut env, device, 94, 255, data, 1), 0);
+    let constants = &super::device(&env, device)
+        .unwrap()
+        .shaders
+        .vertex_constants;
+    let unchanged = constants.snapshot(usage, &[]);
+    assert_eq!(unchanged.ranges(usage).next().unwrap().1.as_ptr(), address);
+    assert_eq!(constants.key(usage), key);
+    assert_eq!(
+        constants.floats[255].map(f32::to_bits),
+        [0x8000_0000, 0x7fc0_1234, 7, 9]
+    );
+    assert_eq!(set_constants_direct(&mut env, device, 94, 0, data, 1), 0);
+    let constants = &super::device(&env, device)
+        .unwrap()
+        .shaders
+        .vertex_constants;
+    assert_ne!(constants.key(usage), key);
+    assert_eq!(
+        constants.snapshot(usage, &[]).register(0),
+        [0x8000_0000, 0x7fc0_1234, 7, 9]
+    );
+    assert_eq!(before.register(0), [0; 4]);
 }

@@ -25,8 +25,9 @@ impl TranslationJob {
 }
 #[derive(Default)]
 pub(super) struct TranslationCache {
-    entries: BTreeMap<Vec<u32>, TranslationJob>,
+    entries: BTreeMap<Arc<[u32]>, TranslationJob>,
     bytes: usize,
+    order: std::collections::VecDeque<(Arc<[u32]>, usize)>,
     pub counters: CompileCounters,
     failures: Arc<std::sync::atomic::AtomicU64>,
 }
@@ -39,21 +40,11 @@ impl TranslationCache {
         if let Some(translation) = self.entries.get(shader.bytecode()) {
             return translation.clone();
         }
-        self.bytes = self
-            .entries
-            .iter()
-            .map(|(tokens, job)| {
-                tokens.len() * 4
-                    + job.0.ready().and_then(|r| r.as_ref().ok()).map_or(
-                        crate::shader::MAX_TRANSLATION_BYTES,
-                        |t| {
-                            t.source.len()
-                                + t.samplers.len()
-                                    * std::mem::size_of::<crate::shader::SamplerBinding>()
-                        },
-                    )
-            })
-            .sum();
+        self.bytes = 0;
+        for (tokens, bytes) in &mut self.order {
+            *bytes = translation_bytes(tokens, &self.entries[tokens]);
+            self.bytes += *bytes;
+        }
         let bytes = shader.bytecode().len() * 4 + crate::shader::MAX_TRANSLATION_BYTES;
         let parsed = shader.clone();
         let directory = directory.map(std::path::Path::to_owned);
@@ -72,11 +63,14 @@ impl TranslationCache {
         }));
         const MAX_BYTES: usize = 8 * 1024 * 1024;
         if bytes <= MAX_BYTES {
-            if self.entries.len() == 256 || self.bytes + bytes > MAX_BYTES {
-                self.entries.clear();
-                self.bytes = 0;
+            while self.entries.len() == 256 || self.bytes + bytes > MAX_BYTES {
+                let (oldest, bytes) = self.order.pop_front().unwrap();
+                self.entries.remove(&oldest);
+                self.bytes -= bytes;
             }
-            self.entries.insert(shader.bytecode().to_vec(), job.clone());
+            let key: Arc<[u32]> = shader.bytecode().into();
+            self.order.push_back((key.clone(), bytes));
+            self.entries.insert(key, job.clone());
             self.bytes += bytes;
         }
         job
@@ -93,6 +87,17 @@ impl TranslationCache {
     pub fn failures(&self) -> u64 {
         self.failures.load(std::sync::atomic::Ordering::Relaxed)
     }
+}
+
+fn translation_bytes(tokens: &[u32], job: &TranslationJob) -> usize {
+    tokens.len() * 4
+        + job.0.ready().and_then(|r| r.as_ref().ok()).map_or(
+            crate::shader::MAX_TRANSLATION_BYTES,
+            |t| {
+                t.source.len()
+                    + t.samplers.len() * std::mem::size_of::<crate::shader::SamplerBinding>()
+            },
+        )
 }
 
 pub(super) struct Shader {
@@ -149,6 +154,15 @@ impl std::ops::DerefMut for Constants {
     }
 }
 impl Constants {
+    fn invalidate_register(&mut self, register: usize) {
+        let captured = self.captured.get_mut().unwrap();
+        if captured
+            .as_ref()
+            .is_some_and(|c| c.usage.registers[register / 64] & (1 << (register % 64)) != 0)
+        {
+            *captured = None;
+        }
+    }
     fn capture(
         &self,
         usage: adv_device::constants::ConstantUsage,
@@ -652,11 +666,12 @@ fn constants_set(
     if adv_abi::guest::check_range(env.cpu, input.addr(), bytes, Prot::READ).is_err() {
         return INVALID;
     }
-    let mut data = vec![0u8; bytes as usize];
-    if bytes != 0 && env.cpu.read(input.addr(), &mut data).is_err() {
+    let mut storage = [0u8; 4096];
+    let data = &mut storage[..bytes as usize];
+    if bytes != 0 && env.cpu.read(input.addr(), data).is_err() {
         return INVALID;
     }
-    store_constants(env, id, range, &data, stage, kind)
+    store_constants(env, id, range, data, stage, kind)
 }
 /// Host-side constant upload for a D3DX Effect pass (GFX-EFFECT-3): the same
 /// validation and storage as the API without staging data in guest memory.
@@ -728,7 +743,8 @@ fn store_constants(
                     u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap())
                 });
                 if constants.floats[register].map(f32::to_bits) != value {
-                    constants.floats[register] = value.map(f32::from_bits);
+                    constants.invalidate_register(register);
+                    constants.registers.floats[register] = value.map(f32::from_bits);
                     changed = true;
                 }
             }
@@ -737,14 +753,16 @@ fn store_constants(
                     i32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap())
                 });
                 if constants.integers[register] != value {
-                    constants.integers[register] = value;
+                    constants.invalidate_register(register + 256);
+                    constants.registers.integers[register] = value;
                     changed = true;
                 }
             }
             ConstantKind::Boolean => {
                 let value = i32::from_le_bytes(bytes.try_into().unwrap());
                 if constants.booleans[register] != value {
-                    constants.booleans[register] = value;
+                    constants.invalidate_register(register + 272);
+                    constants.registers.booleans[register] = value;
                     changed = true;
                 }
             }

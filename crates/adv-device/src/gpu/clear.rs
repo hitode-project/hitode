@@ -64,7 +64,14 @@ impl Gpu {
             }
             return self.check();
         }
-        self.bounded_clear(target, rectangle, color, depth, stencil)
+        if depth.is_some() || stencil.is_some() {
+            self.defer_depth_clear(target, rectangle, depth, stencil)?;
+            if color.is_none() {
+                return self.check();
+            }
+            return self.bounded_clear(&target.color_only(), rectangle, color, None, None);
+        }
+        self.bounded_clear(target, rectangle, color, None, None)
     }
 
     /// Clear `rectangle` with a neutral draw, depth and stencil included.

@@ -16,6 +16,7 @@ enum Source {
     Fixed {
         vertices: Arc<Vec<Vertex>>,
         coordinates: Option<(usize, Arc<Vec<[f32; 4]>>)>,
+        key: Option<u128>,
         packed: OnceLock<Vec<u8>>,
     },
     Points {
@@ -31,12 +32,22 @@ impl VertexBytes {
     pub fn fixed(
         vertices: Arc<Vec<Vertex>>,
         coordinates: Option<(usize, Arc<Vec<[f32; 4]>>)>,
+        key: Option<u128>,
     ) -> Self {
         Self(Arc::new(Source::Fixed {
             vertices,
             coordinates,
+            key,
             packed: OnceLock::new(),
         }))
+    }
+    /// Complete immutable source identity supplied by the capturing frontend.
+    /// Mutating bytes or expanding point recipes discards this identity.
+    pub fn content_key(&self) -> Option<u128> {
+        match &*self.0 {
+            Source::Fixed { key, .. } => *key,
+            _ => None,
+        }
     }
     pub fn points(self, count: u32, stride: usize, width: usize) -> Self {
         Self(Arc::new(Source::Points {
@@ -67,6 +78,7 @@ impl VertexBytes {
                 vertices,
                 coordinates,
                 packed,
+                ..
             } => {
                 std::mem::size_of_val(vertices.as_slice())
                     + coordinates
@@ -268,14 +280,17 @@ mod tests {
             color: [1.; 4],
             uv: [0.25, 0.75],
         };
-        let mut bytes = VertexBytes::fixed(vec![v].into(), None);
+        let mut bytes = VertexBytes::fixed(vec![v].into(), None, Some(7));
+        assert_eq!(bytes.content_key(), Some(7));
         let before = bytes.clone();
         let expected = bytemuck::bytes_of(&v).to_vec();
         assert_eq!(hash(&bytes), hash(&expected));
         assert!(matches!(&*bytes.0, Source::Fixed { packed, .. } if packed.get().is_none()));
         bytes[0] = 9;
+        assert_eq!(bytes.content_key(), None);
         assert_eq!(&**before, &expected);
         let points = before.points(1, 40, 36);
+        assert_eq!(points.content_key(), None);
         let mut expanded = Vec::new();
         for _ in 0..6 {
             expanded.extend_from_slice(&expected[..36]);
@@ -293,7 +308,7 @@ mod tests {
             uv: [2.; 2],
         };
         let coordinates = vec![[3.; 4], [4.; 4]];
-        let bytes = VertexBytes::fixed(vec![v].into(), Some((2, coordinates.clone().into())));
+        let bytes = VertexBytes::fixed(vec![v].into(), Some((2, coordinates.clone().into())), None);
         let mut expected = bytemuck::bytes_of(&v)[..32].to_vec();
         expected.extend_from_slice(bytemuck::cast_slice(&coordinates));
         assert_eq!(hash(&bytes), hash(&expected));

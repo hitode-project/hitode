@@ -4,16 +4,17 @@
 //! borrows an immutable snapshot across device updates without copying maps.
 //! An unchanged captured subset retains its snapshot, including exact float bits.
 use super::*;
-use std::collections::BTreeSet;
+mod slots;
+use slots::Slots;
 
 const IID_BLOCK: Iid = [
     0x8e, 0x41, 0xe6, 0xb0, 0xce, 0xbb, 0x10, 0x4c, 0xab, 0x3b, 0xab, 0xa8, 0x00, 0xb5, 0xbb, 0xca,
 ];
 #[derive(Clone, Default)]
 struct ConstantMask {
-    floats: BTreeSet<usize>,
-    integers: BTreeSet<usize>,
-    booleans: BTreeSet<usize>,
+    floats: Slots<usize, 4>,
+    integers: Slots<usize, 1>,
+    booleans: Slots<usize, 1>,
 }
 impl ConstantMask {
     fn all(stage: Stage) -> Self {
@@ -25,11 +26,10 @@ impl ConstantMask {
     }
     fn mark(&mut self, kind: ConstantKind, range: std::ops::Range<usize>) {
         match kind {
-            ConstantKind::Float => &mut self.floats,
-            ConstantKind::Integer => &mut self.integers,
-            ConstantKind::Boolean => &mut self.booleans,
+            ConstantKind::Float => self.floats.extend(range),
+            ConstantKind::Integer => self.integers.extend(range),
+            ConstantKind::Boolean => self.booleans.extend(range),
         }
-        .extend(range);
     }
 }
 #[derive(Clone, Default)]
@@ -41,19 +41,19 @@ struct Mask {
     pixel_constants: ConstantMask,
     fvf: bool,
     declaration: bool,
-    streams: BTreeSet<usize>,
+    streams: Slots<usize, 1>,
     indices: bool,
     texture: bool,
-    textures: BTreeSet<usize>,
-    render: BTreeSet<i32>,
-    stage: BTreeSet<i32>,
-    stage_slots: BTreeSet<(usize, i32)>,
-    sampler: BTreeSet<i32>,
-    sampler_slots: BTreeSet<(usize, i32)>,
+    textures: Slots<usize, 1>,
+    render: Slots<i32, 4>,
+    stage: Slots<i32, 1>,
+    stage_slots: Slots<(usize, i32), 10>,
+    sampler: Slots<i32, 1>,
+    sampler_slots: Slots<(usize, i32), 10>,
     viewport: bool,
     scissor: bool,
-    transforms: BTreeSet<usize>,
-    clip_planes: BTreeSet<usize>,
+    transforms: Slots<usize, 1>,
+    clip_planes: Slots<usize, 1>,
 }
 #[cfg(feature = "d3d9-counters")]
 impl Mask {
@@ -106,24 +106,26 @@ impl Snapshot {
         Some(Self {
             fixed: fixed::Fixed {
                 fvf: d.fixed.fvf,
-                render: d.fixed.render.capture(&mask.render),
-                stage: d.fixed.stage.capture(&mask.stage),
+                render: d.fixed.render.capture(mask.render.iter()),
+                stage: d.fixed.stage.capture(mask.stage.iter()),
                 stage_slots: std::array::from_fn(|slot| {
-                    let keys = mask
+                    let keys: Slots<i32, 4> = mask
                         .stage_slots
-                        .range((slot, i32::MIN)..=(slot, i32::MAX))
-                        .map(|&(_, i)| i)
+                        .iter()
+                        .filter(|&(n, _)| n == slot)
+                        .map(|(_, i)| i)
                         .collect();
-                    d.fixed.stage_slots[slot].capture(&keys)
+                    d.fixed.stage_slots[slot].capture(keys.iter())
                 }),
-                sampler: d.fixed.sampler.capture(&mask.sampler),
+                sampler: d.fixed.sampler.capture(mask.sampler.iter()),
                 sampler_slots: std::array::from_fn(|slot| {
-                    let keys = mask
+                    let keys: Slots<i32, 4> = mask
                         .sampler_slots
-                        .range((slot, i32::MIN)..=(slot, i32::MAX))
-                        .map(|&(_, i)| i)
+                        .iter()
+                        .filter(|&(n, _)| n == slot)
+                        .map(|(_, i)| i)
                         .collect();
-                    d.fixed.sampler_slots[slot].capture(&keys)
+                    d.fixed.sampler_slots[slot].capture(keys.iter())
                 }),
                 viewport: d.fixed.viewport,
                 scissor: d.fixed.scissor,
@@ -148,12 +150,7 @@ impl Snapshot {
         macro_rules! indexed {
             ($class:expr, $name:ident, $a:expr, $b:expr) => {
                 if versions[$class] != d.versions[$class] {
-                    out.$name = m
-                        .$name
-                        .iter()
-                        .copied()
-                        .filter(|&i| $a(i) != $b(i))
-                        .collect();
+                    out.$name = m.$name.iter().filter(|&i| $a(i) != $b(i)).collect();
                     out.dirty |= u16::from(!out.$name.is_empty()) << $class;
                 }
             };
@@ -267,19 +264,16 @@ impl Snapshot {
                 out.floats = m
                     .floats
                     .iter()
-                    .copied()
                     .filter(|&i| a.floats[i].map(f32::to_bits) != b.floats[i].map(f32::to_bits))
                     .collect();
                 out.integers = m
                     .integers
                     .iter()
-                    .copied()
                     .filter(|&i| a.integers[i] != b.integers[i])
                     .collect();
                 out.booleans = m
                     .booleans
                     .iter()
-                    .copied()
                     .filter(|&i| a.booleans[i] != b.booleans[i])
                     .collect();
                 dirty |= u16::from(
@@ -315,12 +309,12 @@ impl Snapshot {
                 ids.push(id);
             }
         }
-        for &stream in &self.mask.streams {
+        for stream in &self.mask.streams {
             if let Some(id) = self.buffers.streams[stream].buffer {
                 ids.push(id);
             }
         }
-        for &slot in &self.mask.textures {
+        for slot in &self.mask.textures {
             if let Some(id) = self.shaders.textures[slot] {
                 ids.push(id);
             }
@@ -507,14 +501,14 @@ fn changes(
             pairs.push((old, new));
         }
     }
-    for &i in &mask.streams {
+    for i in &mask.streams {
         let old = buffers.streams[i].buffer;
         let new = new_buffers.streams[i].buffer;
         if old != new {
             pairs.push((old, new));
         }
     }
-    for &i in &mask.textures {
+    for i in &mask.textures {
         let old = shaders.textures[i];
         let new = new_shaders.textures[i];
         if old != new {
@@ -597,14 +591,14 @@ fn mask(env: &Env<'_>, device: Id, kind: i32) -> Option<Mask> {
         streams: if all {
             (0..16).collect()
         } else {
-            BTreeSet::new()
+            Slots::default()
         },
         indices: all,
         texture: all,
         textures: if all {
             (1..20).collect()
         } else {
-            BTreeSet::new()
+            Slots::default()
         },
         render: d
             .fixed
@@ -641,7 +635,7 @@ fn mask(env: &Env<'_>, device: Id, kind: i32) -> Option<Mask> {
         sampler: if pixel {
             d.fixed.sampler.keys().copied().collect()
         } else {
-            BTreeSet::new()
+            Slots::default()
         },
         sampler_slots: d
             .fixed
@@ -657,12 +651,12 @@ fn mask(env: &Env<'_>, device: Id, kind: i32) -> Option<Mask> {
         transforms: if all {
             (0..3).collect()
         } else {
-            BTreeSet::new()
+            Slots::default()
         },
         clip_planes: if vertex {
             (0..6).collect()
         } else {
-            BTreeSet::new()
+            Slots::default()
         },
     })
 }
@@ -846,14 +840,17 @@ pub(in crate::d3d9) fn capture(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
     0
 }
 fn copy_constants(target: &mut Constants, source: &Constants, mask: &ConstantMask) {
-    for &i in &mask.floats {
-        target.floats[i] = source.floats[i];
+    for i in &mask.floats {
+        target.invalidate_register(i);
+        target.registers.floats[i] = source.floats[i];
     }
-    for &i in &mask.integers {
-        target.integers[i] = source.integers[i];
+    for i in &mask.integers {
+        target.invalidate_register(i + 256);
+        target.registers.integers[i] = source.integers[i];
     }
-    for &i in &mask.booleans {
-        target.booleans[i] = source.booleans[i];
+    for i in &mask.booleans {
+        target.invalidate_register(i + 272);
+        target.registers.booleans[i] = source.booleans[i];
     }
 }
 #[win32(d3d9,name="IDirect3DStateBlock9::Apply",level=state)]
@@ -972,7 +969,7 @@ fn transfer<'a>(
     if mask.declaration {
         buffers.declaration = source_buffers.declaration;
     }
-    for &i in &mask.streams {
+    for i in &mask.streams {
         buffers.streams[i] = source_buffers.streams[i];
     }
     if mask.indices {
@@ -981,7 +978,7 @@ fn transfer<'a>(
     if mask.texture {
         *texture = source_texture;
     }
-    for &slot in &mask.textures {
+    for slot in &mask.textures {
         shaders.textures[slot] = source_shaders.textures[slot];
     }
     if mask.fvf
@@ -999,19 +996,19 @@ fn transfer<'a>(
         if mask.fvf {
             fixed.fvf = source_fixed.fvf;
         }
-        for &i in &mask.render {
+        for i in &mask.render {
             fixed.render.insert(i, source_fixed.render[&i]);
         }
-        for &i in &mask.stage {
+        for i in &mask.stage {
             fixed.stage.insert(i, source_fixed.stage[&i]);
         }
-        for &(slot, i) in &mask.stage_slots {
+        for (slot, i) in &mask.stage_slots {
             fixed.stage_slots[slot].insert(i, source_fixed.stage_slots[slot][&i]);
         }
-        for &i in &mask.sampler {
+        for i in &mask.sampler {
             fixed.sampler.insert(i, source_fixed.sampler[&i]);
         }
-        for &(slot, i) in &mask.sampler_slots {
+        for (slot, i) in &mask.sampler_slots {
             fixed.sampler_slots[slot].insert(i, source_fixed.sampler_slots[slot][&i]);
         }
         if mask.viewport {
@@ -1020,10 +1017,10 @@ fn transfer<'a>(
         if mask.scissor {
             fixed.scissor = source_fixed.scissor;
         }
-        for &i in &mask.transforms {
+        for i in &mask.transforms {
             fixed.transforms[i] = source_fixed.transforms[i];
         }
-        for &i in &mask.clip_planes {
+        for i in &mask.clip_planes {
             fixed.clip_planes[i] = source_fixed.clip_planes[i];
         }
     }

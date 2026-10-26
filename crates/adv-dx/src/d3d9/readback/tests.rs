@@ -348,3 +348,42 @@ fn failed_second_retain_and_event_exhaustion_roll_back_existing_com_owners() {
     assert_eq!(env.sys.objects.object_count(), 3);
     assert!(resources::resource(&env, pointer).unwrap().lock.is_none());
 }
+
+// spec: GFX-COPY-2, GFX-REC-2
+#[test]
+fn cpu_surface_and_texture_level_locks_keep_pending_draws_recorded() {
+    let mut f = super::super::stretch::tests::Fixture::new();
+    f.m.ext
+        .get_mut::<State>()
+        .tables
+        .insert("IDirect3DTexture9", 0);
+    let surface = f.surface(4, 3, 21, 2);
+    let output = f.packet(0u32);
+    f.okay(
+        "IDirect3DDevice9::CreateTexture",
+        &[f.device, 4, 3, 1, 0, 21, 1, output, 0],
+    );
+    let texture = f.m.cpu.read_u32(output).unwrap();
+    f.okay("IDirect3DTexture9::GetSurfaceLevel", &[texture, 0, output]);
+    let level = f.m.cpu.read_u32(output).unwrap();
+    f.okay(
+        "IDirect3DDevice9::Clear",
+        &[f.device, 0, 0, 1, 0xff123456, 1f32.to_bits(), 0],
+    );
+    let before = f.m.ext.get::<State>().frames.flushes;
+    for pointer in [surface, level] {
+        let locked = f.lock(pointer, 0, 0x10);
+        assert_ne!(locked.pBits, 0);
+        f.okay("IDirect3DSurface9::UnlockRect", &[pointer]);
+        assert_eq!(f.m.ext.get::<State>().frames.flushes, before);
+    }
+    let target = f.packet(0u32);
+    f.okay(
+        "IDirect3DDevice9::CreateRenderTarget",
+        &[f.device, 4, 3, 21, 0, 0, 1, target, 0],
+    );
+    let target = f.m.cpu.read_u32(target).unwrap();
+    f.lock(target, 0, 0x10);
+    assert_eq!(f.m.ext.get::<State>().frames.flushes[2], before[2] + 1);
+    f.okay("IDirect3DSurface9::UnlockRect", &[target]);
+}

@@ -77,6 +77,7 @@ pub(super) struct State {
     failure: Arc<OnceLock<String>>,
     ring: Ring,
     command: Option<Object<dyn MTLCommandBuffer>>,
+    completion: Option<Arc<display::Completion>>,
     initialization: Option<wgpu::CommandEncoder>,
     reference_queue: wgpu::Queue,
     encoder: Option<Object<dyn MTLRenderCommandEncoder>>,
@@ -118,6 +119,7 @@ impl State {
             gate: context.gate.clone(),
             failure: context.failure.clone(),
             command: None,
+            completion: None,
             initialization: None,
             reference_queue: context.queue.clone(),
             encoder: None,
@@ -155,8 +157,14 @@ impl State {
             self.owner.submissions.fetch_add(1, Ordering::Relaxed);
         }
         if let Some(command) = self.command.take() {
-            self.ring
-                .submitted(&command, self.gate.clone(), self.failure.clone());
+            let completion = Arc::new(display::Completion::default());
+            self.ring.submitted(
+                &command,
+                self.gate.clone(),
+                self.failure.clone(),
+                completion.clone(),
+            );
+            self.completion = Some(completion);
             command.commit();
             self.owner.submissions.fetch_add(1, Ordering::Relaxed);
             self.owner
@@ -168,6 +176,7 @@ impl State {
         self.draws = 0;
     }
     pub(super) fn select_wgpu(&mut self, reason: SwitchReason) {
+        self.completion = None;
         if self.last_metal {
             self.owner.backend_switches.fetch_add(1, Ordering::Relaxed);
             self.owner.backend_switches_by_reason[reason as usize].fetch_add(1, Ordering::Relaxed);

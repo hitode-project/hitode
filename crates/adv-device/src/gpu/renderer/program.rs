@@ -206,11 +206,17 @@ impl Pending {
     }
     pub(super) fn flush(&mut self, queue: &wgpu::Queue) {
         #[cfg(target_vendor = "apple")]
-        self.flush_metal(SwitchReason::Other);
+        if let Some(metal) = &mut self.metal {
+            metal.flush();
+        }
         self.resolve_clear();
         self.pass = None;
         self.attachments = None;
         if let Some(encoder) = self.encoder.take() {
+            #[cfg(target_vendor = "apple")]
+            if let Some(metal) = &mut self.metal {
+                metal.select_wgpu(SwitchReason::Other);
+            }
             let writes =
                 self.uniforms.flush(queue) + self.vertices.flush(queue) + self.indices.flush(queue);
             queue.submit(
@@ -767,7 +773,7 @@ impl Gpu {
             Topology::Lines | Topology::LineStrip => 2,
             _ => 3,
         };
-        validate(target, &vec![dummy; probe], state)?;
+        validate(target, &[dummy; 3][..probe], state)?;
         let clipped = self.clipped_state(*state, &target.image);
         let state = &clipped;
         if count == 0
@@ -793,7 +799,7 @@ impl Gpu {
         if last >= draw.vertex_count {
             return Err(invalid("shader index outside uploaded vertex span"));
         }
-        let mut locations = std::collections::HashSet::new();
+        let mut locations = 0u16;
         let mut total = 0u64;
         for stream in &draw.streams {
             if stream.stride > 2048
@@ -809,13 +815,14 @@ impl Gpu {
                     .ok_or_else(|| invalid("attribute offset overflow"))?;
                 if !a.offset.is_multiple_of(4)
                     || a.location >= 16
-                    || !locations.insert(a.location)
+                    || locations & (1 << a.location) != 0
                     || (stream.stride != 0 && end > stream.stride)
                     || u64::from(last) * u64::from(stream.stride) + u64::from(end)
                         > stream.bytes.len() as u64
                 {
                     return Err(invalid("vertex attribute outside uploaded span"));
                 }
+                locations |= 1 << a.location;
             }
             total += (stream.bytes.len() as u64).next_multiple_of(4);
         }

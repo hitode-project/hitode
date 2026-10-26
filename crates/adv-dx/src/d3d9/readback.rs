@@ -179,14 +179,6 @@ pub(super) fn lock_internal(
     }) {
         return outcome;
     }
-    if let Some(r) = resources::resource(env, this.addr()) {
-        let owner = r.device;
-        if recording::has_work(env, owner) {
-            return recording::barrier(env, owner, recording::Reason::Lock, move |env| {
-                lock_internal(env, this, output, rect, flags)
-            });
-        }
-    }
     if let Some((container, level)) = resources::container_level(env, this.addr()) {
         return Outcome::Return(resources::texture_lock(
             env,
@@ -251,6 +243,11 @@ pub(super) fn lock_internal(
         return Outcome::Return(INVALID);
     };
     let storage = r.storage;
+    if recording::has_work(env, owner) {
+        return recording::barrier(env, owner, recording::Reason::Lock, move |env| {
+            lock_internal(env, this, output, rect, flags)
+        });
+    }
     // This is explicit guest staging owned by the same Resource, allocated on
     // the first CPU lock and reused. Creation/Present never read GPU pixels.
     let storage = if storage == 0 {

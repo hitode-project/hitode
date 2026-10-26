@@ -324,6 +324,64 @@ struct V { @builtin(position) p:vec4<f32>, @location(0) uv:vec2<f32>, @location(
 
 // spec: GFX-METAL-1
 #[test]
+fn native_frames_reuse_producer_completion_without_flushing_on_a_lease() {
+    let mut gpu = gpu(true);
+    let target = gpu.presentation_target(4, 4, false).unwrap();
+    let draw = draw();
+    let state = DrawState::new(4, 4);
+    gpu.draw_programmable(&target, &draw, &state).unwrap();
+    read(&mut gpu, &target);
+    let context = gpu.context.clone();
+    let (device, queue) = {
+        let pending = context.pending.lock().unwrap();
+        let metal = pending.metal.as_ref().unwrap();
+        (metal.device.clone(), metal.queue.clone())
+    };
+    struct Release(Object<dyn MTLSharedEvent>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            self.0.setSignaledValue(1);
+        }
+    }
+    let release = Release(device.newSharedEvent().unwrap());
+    let blocker = objc2::rc::autoreleasepool(|_| queue.commandBuffer().unwrap());
+    blocker.encodeWaitForEvent_value(release.0.as_ref(), 1);
+    blocker.commit();
+    gpu.draw_programmable(&target, &draw, &state).unwrap();
+    let before = gpu.stats();
+    drop(context.submission().unwrap());
+    assert_eq!(gpu.stats().submissions, before.submissions);
+    assert_eq!(gpu.stats().backend_switches, before.backend_switches);
+    let frame = gpu.completed_frame(target.image.clone(), 1).unwrap();
+    let after = gpu.stats();
+    assert_eq!(after.submissions, before.submissions + 1);
+    assert_eq!(after.backend_switches, before.backend_switches);
+    assert!(frame.completion.is_some());
+    let wakes = [
+        adv_sync::WakeEvent::new().unwrap(),
+        adv_sync::WakeEvent::new().unwrap(),
+    ];
+    let completions = wakes
+        .each_ref()
+        .map(|wake| frame.display_completion(wake.clone()).unwrap());
+    assert!(
+        completions
+            .iter()
+            .all(|completion| !completion.ready().unwrap())
+    );
+    assert_eq!(gpu.stats().submissions, after.submissions);
+    release.0.setSignaledValue(1);
+    for (completion, wake) in completions.iter().zip(&wakes) {
+        while !completion.ready().unwrap() {
+            assert!(wake.wait(Some(std::time::Duration::from_secs(10))).unwrap());
+        }
+    }
+    assert_eq!(gpu.stats().backend_switches, after.backend_switches);
+    assert_eq!(read(&mut gpu, &target).len(), 64);
+}
+
+// spec: GFX-METAL-1
+#[test]
 fn ring_wraps_and_busy_leaves_draw_state_and_uploads_unchanged() {
     let mut gpu = gpu(true);
     let target = gpu.target(2, 2, false).unwrap();

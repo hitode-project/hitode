@@ -87,6 +87,11 @@ impl Depth {
                 stencil: new.stencil.or(old.stencil),
                 ..new
             });
+        } else if new.region.clipped(old.region) == new.region
+            && (new.depth.is_none() || new.depth.map(f32::to_bits) == old.depth.map(f32::to_bits))
+            && (new.stencil.is_none() || new.stencil == old.stencil)
+        {
+            *slot = Some(old);
         } else if new.region.clipped(old.region) == old.region
             && (old.depth.is_none() || new.depth.is_some())
             && (old.stencil.is_none() || new.stencil.is_some())

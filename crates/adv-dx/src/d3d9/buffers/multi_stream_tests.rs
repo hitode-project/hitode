@@ -218,6 +218,8 @@ fn cpu_multistream_fixed_input_preserves_offsets_indices_uv_pixels_and_rejection
         &[device, 0, texture],
     ));
     let prepared = fixed::prepare_bound(&mut env(&mut m), device, 5, 2, 1, None).unwrap();
+    let repeated = fixed::prepare_bound(&mut env(&mut m), device, 5, 2, 1, None).unwrap();
+    assert!(Arc::ptr_eq(&prepared.vertices, &repeated.vertices));
     assert!(prepared.vertices.iter().all(|v| v.uv == [0.75, 0.25]));
     assert_eq!(
         prepared.vertices[0].position,

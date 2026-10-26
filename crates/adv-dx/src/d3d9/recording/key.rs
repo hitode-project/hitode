@@ -420,7 +420,13 @@ pub(super) fn prepare(
                 } = p.as_ref();
                 program.textures.hash(&mut h);
                 for s in streams {
-                    (s.stride, &s.attributes, &s.bytes).hash(&mut h);
+                    (s.stride, &s.attributes).hash(&mut h);
+                    s.bytes.content_key().is_some().hash(&mut h);
+                    if let Some(key) = s.bytes.content_key() {
+                        key.hash(&mut h);
+                    } else {
+                        s.bytes.hash(&mut h);
+                    }
                     bytes += s.bytes.len();
                 }
                 (indices, vertex_count).hash(&mut h);
