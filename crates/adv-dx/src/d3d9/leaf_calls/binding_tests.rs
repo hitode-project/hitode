@@ -169,6 +169,15 @@ fn binding_leaves_preserve_noops_switches_and_decline_final_releases_before_effe
 }
 
 #[test]
+// spec: GFX-REC-6
+fn redundant_zero_fvf_leaf_keeps_the_unavailable_result() {
+    let mut f = Fixture::new();
+    let d = f.device;
+    assert_eq!(device(&env(&mut f.m, 0), d).unwrap().fixed.fvf, 0);
+    assert_ne!(leaf(&mut f, "IDirect3DDevice9::SetFVF", &[d, 0]), Some(0));
+}
+
+#[test]
 // spec: GFX-REC-6, GFX-SHADER-4
 fn state_block_leaves_admit_safe_transfers_and_decline_snapshot_destruction() {
     let mut f = Fixture::new();
@@ -204,6 +213,13 @@ fn state_block_leaves_admit_safe_transfers_and_decline_snapshot_destruction() {
         leaf(&mut f, "IDirect3DStateBlock9::Capture", &[block]),
         Some(0)
     );
+    // A block equal to the device transfers nothing.
+    let unchanged = versions(&mut f);
+    for name in ["Capture", "Apply"] {
+        let name = format!("IDirect3DStateBlock9::{name}");
+        assert_eq!(leaf(&mut f, &name, &[block]), Some(0));
+    }
+    assert_eq!(versions(&mut f), unchanged);
     assert_eq!(
         leaf(&mut f, "IDirect3DDevice9::SetVertexShader", &[d, b]),
         Some(0)

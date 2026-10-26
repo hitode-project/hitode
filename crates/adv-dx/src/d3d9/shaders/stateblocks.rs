@@ -86,6 +86,36 @@ impl Mask {
             + constants(&self.pixel_constants)) as u64
     }
 }
+impl Mask {
+    /// The state classes holding at least one member, one bit per class.
+    fn classes(&self) -> u16 {
+        let constants = |m: &ConstantMask| {
+            !(m.floats.is_empty() && m.integers.is_empty() && m.booleans.is_empty())
+        };
+        [
+            !self.render.is_empty(),
+            !(self.stage.is_empty() && self.stage_slots.is_empty()),
+            !(self.sampler.is_empty() && self.sampler_slots.is_empty()),
+            self.viewport,
+            self.scissor,
+            !self.transforms.is_empty(),
+            !self.clip_planes.is_empty(),
+            self.fvf || self.declaration,
+            self.vertex,
+            self.pixel,
+            !self.streams.is_empty(),
+            self.indices,
+            self.texture || !self.textures.is_empty(),
+            constants(&self.vertex_constants),
+            constants(&self.pixel_constants),
+        ]
+        .into_iter()
+        .enumerate()
+        .fold(0, |bits, (class, member)| {
+            bits | (u16::from(member) << class)
+        })
+    }
+}
 pub(in crate::d3d9) struct Snapshot {
     pub(in crate::d3d9) fixed: fixed::Fixed,
     pub(in crate::d3d9) shaders: Bindings,
@@ -100,10 +130,17 @@ pub(in crate::d3d9) struct StateBlock {
     fingerprints: [u128; 15],
 }
 impl StateBlock {
+    /// Whether every class holding a member still matches the device, so
+    /// Capture and Apply change nothing.
+    fn current(&self, d: &super::super::Device) -> bool {
+        let classes = self.snapshot.as_ref().unwrap().mask.classes();
+        (0..15).all(|c| classes & (1 << c) == 0 || self.fingerprints[c] == d.fingerprints[c])
+    }
     fn members(&self, d: &super::super::Device) -> Mask {
         let mut m = self.snapshot.as_ref().unwrap().mask.clone();
         let changed = |class| self.fingerprints[class] != d.fingerprints[class];
-        m.dirty = (0..15).fold(0, |bits, c| bits | (u16::from(changed(c)) << c));
+        // Classes without members never transfer, so they stay clean.
+        m.dirty = (0..15).fold(0, |bits, c| bits | (u16::from(changed(c)) << c)) & m.classes();
         if !changed(0) {
             m.render = Default::default();
         }
@@ -227,6 +264,23 @@ impl Snapshot {
         (&self.shaders, &self.buffers, self.texture)
     }
 }
+/// Completes a Capture or Apply that changes nothing, before any ABI work.
+pub(in crate::d3d9) fn leaf_noop(env: &mut Env<'_>, pointer: u32, _capture: bool) -> bool {
+    let Some(b) = block(env, pointer) else {
+        return false;
+    };
+    let Some(Payload::Device(d)) = com(env).get_identity(&env.sys.objects, b.device) else {
+        return false;
+    };
+    if d.recording.is_some() || !b.current(d) {
+        return false;
+    }
+    #[cfg(feature = "d3d9-counters")]
+    if !_capture {
+        count_apply(env, 0);
+    }
+    true
+}
 pub(in crate::d3d9) fn admits_leaf(env: &Env<'_>, pointer: u32, capture: bool) -> bool {
     let Some(b) = block(env, pointer) else {
         return true;
@@ -234,7 +288,7 @@ pub(in crate::d3d9) fn admits_leaf(env: &Env<'_>, pointer: u32, capture: bool) -
     let Some(Payload::Device(d)) = com(env).get_identity(&env.sys.objects, b.device) else {
         return true;
     };
-    if d.recording.is_some() || b.fingerprints == d.fingerprints {
+    if d.recording.is_some() || b.current(d) {
         return true;
     }
     let mask = b.members(d);
@@ -701,7 +755,7 @@ pub(in crate::d3d9) fn capture(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
     if d.recording.is_some() {
         return INVALID;
     }
-    if b.fingerprints == d.fingerprints {
+    if b.current(d) {
         return 0;
     }
     let mask = b.members(d);
@@ -773,14 +827,13 @@ pub(in crate::d3d9) fn apply(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
     };
     let id = b.device;
     let snapshot = b.snapshot.as_ref().unwrap();
-    let fingerprints = b.fingerprints;
     let Some(Payload::Device(d)) = com(env).get_identity(&env.sys.objects, id) else {
         return INVALID;
     };
     if d.recording.is_some() {
         return INVALID;
     }
-    if fingerprints == d.fingerprints {
+    if b.current(d) {
         #[cfg(feature = "d3d9-counters")]
         count_apply(env, 0);
         return 0;

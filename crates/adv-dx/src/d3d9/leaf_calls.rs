@@ -61,6 +61,11 @@ fn readable_arguments(env: &Env<'_>) -> Option<()> {
     adv_abi::guest::check_range(env.cpu, address, bytes, Prot::READ).ok()
 }
 pub(super) fn state_block(env: &mut Env<'_>) -> Option<u64> {
+    let this = env.cpu.arg(0).ok()?;
+    let capture = env.sys.thunks.get(env.thunk).name.ends_with("Capture");
+    if shaders::stateblocks::leaf_noop(env, this, capture) {
+        return Some(u64::from(env.cpu.reg(adv_cpu::backend::Reg::Edx)) << 32);
+    }
     readable_arguments(env)?;
     let name = env.sys.thunks.get(env.thunk).name.as_str();
     if !shaders::stateblocks::admits_leaf(env, env.cpu.arg(0).ok()?, name.ends_with("Capture")) {
@@ -121,6 +126,27 @@ pub(super) fn binding(env: &mut Env<'_>) -> Option<u64> {
         };
         Some(id)
     };
+    // A setter that rebinds what is already bound returns before any ABI work,
+    // exactly where its handler would.
+    if old == new
+        && let Some(d) = device(env, this)
+        && d.recording.is_none()
+    {
+        let arg = |n| env.cpu.arg(n).ok();
+        let redundant = match name {
+            // FVF 0 is never accepted; any other bound FVF was validated.
+            "IDirect3DDevice9::SetFVF" => d.fixed.fvf != 0 && arg(1) == Some(d.fixed.fvf),
+            "IDirect3DDevice9::SetVertexDeclaration" => d.fixed.fvf == 0,
+            "IDirect3DDevice9::SetStreamSource" => {
+                let stream = &d.buffers.streams[arg(1)? as usize];
+                new.is_none() || (arg(3) == Some(stream.offset) && arg(4) == Some(stream.stride))
+            }
+            _ => true,
+        };
+        if redundant {
+            return Some(u64::from(env.cpu.reg(adv_cpu::backend::Reg::Edx)) << 32);
+        }
+    }
     if old != new
         && old.is_some_and(|id| {
             com(env)
