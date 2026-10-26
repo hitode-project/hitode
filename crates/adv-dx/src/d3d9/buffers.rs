@@ -614,16 +614,19 @@ pub(super) fn clear_up_bindings(env: &mut Env<'_>, this: u32, indexed: bool) {
     let Some(Payload::Device(d)) = com(env).get_mut::<Payload>(&mut env.sys.objects, this) else {
         return;
     };
-    d.versions[10] += 1;
-    if indexed {
-        d.versions[11] += 1;
+    let old = std::mem::take(&mut d.buffers.streams[0]);
+    if old.buffer.is_some() || old.offset != 0 || old.stride != 0 {
+        d.versions[10] += 1;
     }
-    let stream = std::mem::take(&mut d.buffers.streams[0]).buffer;
+    let stream = old.buffer;
     let indices = if indexed {
         d.buffers.indices.take()
     } else {
         None
     };
+    if indices.is_some() {
+        d.versions[11] += 1;
+    }
     for id in [stream, indices].into_iter().flatten() {
         if let Some(Some(dead)) = com(env).release_internal(&mut env.sys.objects, id) {
             super::destroy(env, dead);

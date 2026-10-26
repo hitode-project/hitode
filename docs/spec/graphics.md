@@ -223,7 +223,7 @@ The cap holds only the presenting context's next empty PeekMessage, so Present i
 Capture and Apply track versions per state category and inspect values only in
 changed categories. They copy only differing captured entries, preserving exact
 float bits, uncaptured state and COM ownership. Capturing a complete state category shares its immutable map and content key. An unchanged Capture reuses its
-snapshot storage; an unchanged Apply performs no state writes. Applying only shader or buffer changes MUST preserve the fixed-state key cache.
+snapshot storage; an unchanged Apply performs no state writes. Redundant fixed-state and constant setters preserve category revisions while recording still captures their membership. Matching Capture/Apply bypass binding preparation and reference transfers; changes outside the captured subset refresh its observed revisions. Applying only shader or buffer changes MUST preserve the fixed-state key cache.
 
 ## Vertex and raster input
 

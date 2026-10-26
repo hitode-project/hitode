@@ -713,29 +713,45 @@ fn store_constants(
     let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, id) else {
         return INVALID;
     };
+    let live = d.recording.is_none();
     let constants = if let Some(recording) = d.recording.as_mut() {
         recording.mark_constants(stage, kind, range.clone());
         recording.shaders.constants_mut(stage)
     } else {
-        d.versions[13 + usize::from(stage == Stage::Pixel)] += 1;
         d.shaders.constants_mut(stage)
     };
+    let mut changed = false;
     for (register, bytes) in range.zip(data.chunks_exact(width as usize)) {
         match kind {
             ConstantKind::Float => {
-                constants.floats[register] = std::array::from_fn(|i| {
-                    f32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap())
-                })
+                let value = std::array::from_fn(|i| {
+                    u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap())
+                });
+                if constants.floats[register].map(f32::to_bits) != value {
+                    constants.floats[register] = value.map(f32::from_bits);
+                    changed = true;
+                }
             }
             ConstantKind::Integer => {
-                constants.integers[register] = std::array::from_fn(|i| {
+                let value = std::array::from_fn(|i| {
                     i32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap())
-                })
+                });
+                if constants.integers[register] != value {
+                    constants.integers[register] = value;
+                    changed = true;
+                }
             }
             ConstantKind::Boolean => {
-                constants.booleans[register] = i32::from_le_bytes(bytes.try_into().unwrap())
+                let value = i32::from_le_bytes(bytes.try_into().unwrap());
+                if constants.booleans[register] != value {
+                    constants.booleans[register] = value;
+                    changed = true;
+                }
             }
         }
+    }
+    if live && changed {
+        d.versions[13 + usize::from(stage == Stage::Pixel)] += 1;
     }
     0
 }

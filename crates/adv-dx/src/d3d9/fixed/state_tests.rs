@@ -79,6 +79,65 @@ mod state_tests {
         assert_eq!(stage(env, pointer, 24), 0);
     }
 
+    // spec: GFX-SHADER-4, GFX-REC-7
+    #[test]
+    fn identical_writes_keep_versions_and_recorded_membership_preserves_float_bits() {
+        use super::super::shaders::{self, stateblocks};
+        let mut machine = machine();
+        let mut env = env(&mut machine);
+        let (pointer, _, _, _) = super::super::super::tests::setup(&mut env);
+        let this = GuestPtr::new(pointer);
+        let initial = device(&env, pointer).unwrap().versions;
+        let sampler = device(&env, pointer).unwrap().fixed.sampler[&5];
+        for _ in 0..2 {
+            assert_eq!(call(&mut env, set_render_ABI, &[pointer, 22, 3]), 0);
+            assert_eq!(call(&mut env, set_stage_ABI, &[pointer, 1, 11, 1]), 0);
+            assert_eq!(
+                call(&mut env, set_sampler_ABI, &[pointer, 0, 5, sampler]),
+                0
+            );
+            assert_eq!(
+                shaders::set_constants_direct(&mut env, pointer, 94, 3, &[0; 16], 1),
+                0
+            );
+        }
+        assert_eq!(device(&env, pointer).unwrap().versions, initial);
+        assert_eq!(stateblocks::begin(&mut env, this), 0);
+        assert_eq!(call(&mut env, set_render_ABI, &[pointer, 22, 3]), 0);
+        assert_eq!(
+            shaders::set_constants_direct(&mut env, pointer, 94, 3, &[0; 16], 1),
+            0
+        );
+        assert_eq!(stateblocks::end(&mut env, this, GuestPtr::new(DATA)), 0);
+        let block = GuestPtr::new(env.cpu.read_u32(DATA).unwrap());
+        assert_eq!(device(&env, pointer).unwrap().versions, initial);
+        let bits = [0x8000_0000u32, 0x7fc0_1234, 0, 0];
+        assert_eq!(
+            shaders::set_constants_direct(&mut env, pointer, 94, 3, bytemuck::cast_slice(&bits), 1),
+            0
+        );
+        let changed = device(&env, pointer).unwrap().versions;
+        assert_eq!(changed[13], initial[13] + 1);
+        assert_eq!(
+            shaders::set_constants_direct(&mut env, pointer, 94, 3, bytemuck::cast_slice(&bits), 1),
+            0
+        );
+        assert_eq!(device(&env, pointer).unwrap().versions, changed);
+        assert_eq!(call(&mut env, set_render_ABI, &[pointer, 22, 1]), 0);
+        assert_eq!(call(&mut env, set_render_ABI, &[pointer, 14, 0]), 0);
+        assert_eq!(stateblocks::apply(&mut env, block), 0);
+        let d = device(&env, pointer).unwrap();
+        assert_eq!(d.fixed.render[&22], 3);
+        assert_eq!(d.fixed.render[&14], 0, "uncaptured state is retained");
+        assert_eq!(
+            d.shaders.vertex_constants.floats[3].map(f32::to_bits),
+            [0; 4]
+        );
+        let restored = d.versions;
+        assert_eq!(stateblocks::apply(&mut env, block), 0);
+        assert_eq!(device(&env, pointer).unwrap().versions, restored);
+    }
+
     // spec: GFX-REC-2, GFX-SHADER-4
     #[test]
     fn applying_only_constants_preserves_the_fixed_state_key() {

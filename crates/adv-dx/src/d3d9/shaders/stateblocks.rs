@@ -340,7 +340,7 @@ pub(in crate::d3d9) fn admits_leaf(env: &Env<'_>, pointer: u32, capture: bool) -
     let Some(Payload::Device(d)) = com(env).get_identity(&env.sys.objects, b.device) else {
         return true;
     };
-    if d.recording.is_some() {
+    if d.recording.is_some() || b.versions == d.versions {
         return true;
     }
     let s = b.snapshot.as_ref().unwrap();
@@ -384,12 +384,15 @@ pub(in crate::d3d9) enum FixedKey {
     Transform(usize),
     ClipPlane(usize),
 }
-pub(in crate::d3d9) fn mark_fixed(env: &mut Env<'_>, pointer: u32, key: FixedKey) {
+pub(in crate::d3d9) fn mark_fixed(env: &mut Env<'_>, pointer: u32, key: FixedKey, changed: bool) {
     let Some(Payload::Device(d)) = com(env).get_mut::<Payload>(&mut env.sys.objects, pointer)
     else {
         return;
     };
     let Some(r) = d.recording.as_mut() else {
+        if !changed {
+            return;
+        }
         let class = match key {
             FixedKey::Fvf => 7,
             FixedKey::Render(_) => 0,
@@ -788,8 +791,20 @@ pub(in crate::d3d9) fn capture(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
     if d.recording.is_some() {
         return INVALID;
     }
+    if b.versions == d.versions {
+        return 0;
+    }
     let mask = old.delta(d, b.versions);
     let versions = d.versions;
+    if mask.dirty == 0 {
+        let Some(Payload::StateBlock(b)) =
+            com(env).get_mut::<Payload>(&mut env.sys.objects, this.addr())
+        else {
+            unreachable!()
+        };
+        b.versions = versions;
+        return 0;
+    }
     let changes = changes(
         &old.shaders,
         &old.buffers,
@@ -847,7 +862,7 @@ pub(in crate::d3d9) fn apply(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
         return INVALID;
     };
     let id = b.device;
-    let snapshot = Arc::clone(b.snapshot.as_ref().unwrap());
+    let snapshot = b.snapshot.as_ref().unwrap();
     let versions = b.versions;
     let Some(Payload::Device(d)) = com(env).get_identity(&env.sys.objects, id) else {
         return INVALID;
@@ -855,7 +870,25 @@ pub(in crate::d3d9) fn apply(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
     if d.recording.is_some() {
         return INVALID;
     }
+    if versions == d.versions {
+        #[cfg(feature = "d3d9-counters")]
+        count_apply(env, 0);
+        return 0;
+    }
     let mask = snapshot.delta(d, versions);
+    let versions = d.versions;
+    if mask.dirty == 0 {
+        let Some(Payload::StateBlock(b)) =
+            com(env).get_mut::<Payload>(&mut env.sys.objects, this.addr())
+        else {
+            unreachable!()
+        };
+        b.versions = versions;
+        #[cfg(feature = "d3d9-counters")]
+        count_apply(env, 0);
+        return 0;
+    }
+    let snapshot = Arc::clone(snapshot);
     let changes = changes(
         &d.shaders,
         &d.buffers,
@@ -898,13 +931,15 @@ pub(in crate::d3d9) fn apply(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
     };
     b.versions = versions;
     #[cfg(feature = "d3d9-counters")]
-    {
-        let count = &mut env.ext.get_mut::<State>().frames;
-        count.stateblock_applies += 1;
-        count.stateblock_items += mask.items();
-    }
+    count_apply(env, mask.items());
     release_changes(env, &changes);
     0
+}
+#[cfg(feature = "d3d9-counters")]
+fn count_apply(env: &mut Env<'_>, items: u64) {
+    let count = &mut env.ext.get_mut::<State>().frames;
+    count.stateblock_applies += 1;
+    count.stateblock_items += items;
 }
 fn transfer<'a>(
     target: (
@@ -1182,6 +1217,49 @@ mod tests {
         assert_eq!(work.stateblock_applies, 2);
         assert_eq!(work.stateblock_items, 1);
         eprintln!("StateBlock work: full membership {full}; changed Apply 1; repeated Apply 0");
+    }
+
+    #[test]
+    // spec: GFX-SHADER-4
+    fn unchanged_subset_refreshes_versions_without_replacing_capture_storage() {
+        let mut m = crate::d3d9::tests::machine();
+        let mut env = Env {
+            context: m.sys.current,
+            cpu: &mut m.cpu,
+            sys: &mut m.sys,
+            ext: &mut m.ext,
+            thunk: 0,
+        };
+        let (pointer, _, _, _) = crate::d3d9::tests::setup(&mut env);
+        let this = GuestPtr::new(pointer);
+        let output = GuestPtr::new(alloc(&mut env, 4).unwrap());
+        assert_eq!(begin(&mut env, this), 0);
+        assert_eq!(fixed::set_render(&mut env, this, 22, 3), 0);
+        assert_eq!(end(&mut env, this, output), 0);
+        let this_block = GuestPtr::new(output.read(env.cpu).unwrap());
+        assert_eq!(capture(&mut env, this_block), 0);
+        let saved = Arc::as_ptr(
+            block(&env, this_block.addr())
+                .unwrap()
+                .snapshot
+                .as_ref()
+                .unwrap(),
+        );
+        assert_eq!(fixed::set_render(&mut env, this, 14, 0), 0);
+        assert_eq!(capture(&mut env, this_block), 0);
+        let b = block(&env, this_block.addr()).unwrap();
+        assert_eq!(Arc::as_ptr(b.snapshot.as_ref().unwrap()), saved);
+        assert_eq!(b.versions, device(&env, pointer).unwrap().versions);
+        assert_eq!(fixed::set_render(&mut env, this, 14, 1), 0);
+        assert_eq!(apply(&mut env, this_block), 0);
+        assert_eq!(
+            block(&env, this_block.addr()).unwrap().versions,
+            device(&env, pointer).unwrap().versions
+        );
+        assert_eq!(fixed::set_render(&mut env, this, 22, 1), 0);
+        assert_eq!(apply(&mut env, this_block), 0);
+        assert_eq!(device(&env, pointer).unwrap().fixed.render[&22], 3);
+        assert_eq!(device(&env, pointer).unwrap().fixed.render[&14], 1);
     }
 
     fn fingerprint(d: &super::super::super::Device) -> u128 {

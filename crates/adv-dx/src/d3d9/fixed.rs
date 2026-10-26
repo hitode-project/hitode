@@ -412,17 +412,20 @@ pub(super) fn set_fvf(env: &mut Env<'_>, this: GuestPtr<()>, fvf: u32) -> u32 {
     if !valid_fvf(fvf) {
         return UNAVAILABLE;
     }
-    if f.fvf == fvf
+    let previous = f.fvf;
+    if previous == fvf
         && device(env, this.addr())
             .is_some_and(|d| d.recording.is_none() && d.buffers.declaration.is_none())
     {
         return 0;
     }
+    let changed = previous != fvf;
     mutable(env, this.addr()).unwrap().fvf = fvf;
     super::shaders::stateblocks::mark_fixed(
         env,
         this.addr(),
         super::shaders::stateblocks::FixedKey::Fvf,
+        changed,
     );
     let device = com(env)
         .identity::<Payload>(&env.sys.objects, this.addr())
@@ -434,6 +437,7 @@ pub(super) fn set_fvf(env: &mut Env<'_>, this: GuestPtr<()>, fvf: u32) -> u32 {
                 env,
                 this.addr(),
                 super::shaders::stateblocks::FixedKey::Fvf,
+                true,
             );
         }
         return code;
@@ -588,11 +592,12 @@ pub(super) fn set_render(env: &mut Env<'_>, this: GuestPtr<()>, state: i32, valu
     if !valid {
         return INVALID;
     }
-    f.render.insert(state, value);
+    let changed = f.render.insert(state, value) != Some(value);
     super::shaders::stateblocks::mark_fixed(
         env,
         this.addr(),
         super::shaders::stateblocks::FixedKey::Render(state),
+        changed,
     );
     0
 }
@@ -622,11 +627,12 @@ pub(super) fn set_stage(
         return INVALID;
     }
     if matches!(kind, 7..=10 | 22 | 23) {
-        f.stage_slots[stage as usize].insert(kind, value);
+        let changed = f.stage_slots[stage as usize].insert(kind, value) != Some(value);
         super::shaders::stateblocks::mark_fixed(
             env,
             this.addr(),
             super::shaders::stateblocks::FixedKey::StageSlot(stage as usize, kind),
+            changed,
         );
         return 0;
     }
@@ -651,11 +657,12 @@ pub(super) fn set_stage(
         if !valid {
             return INVALID;
         }
-        f.stage_slots[stage as usize].insert(kind, value);
+        let changed = f.stage_slots[stage as usize].insert(kind, value) != Some(value);
         super::shaders::stateblocks::mark_fixed(
             env,
             this.addr(),
             super::shaders::stateblocks::FixedKey::StageSlot(stage as usize, kind),
+            changed,
         );
         return 0;
     }
@@ -683,11 +690,12 @@ pub(super) fn set_stage(
     if !valid {
         return INVALID;
     }
-    f.stage.insert(kind, value);
+    let changed = f.stage.insert(kind, value) != Some(value);
     super::shaders::stateblocks::mark_fixed(
         env,
         this.addr(),
         super::shaders::stateblocks::FixedKey::Stage(kind),
+        changed,
     );
     0
 }
@@ -761,11 +769,11 @@ pub(super) fn set_sampler(
     if !valid {
         return INVALID;
     }
-    if slot == 0 {
-        f.sampler.insert(kind, value);
+    let changed = if slot == 0 {
+        f.sampler.insert(kind, value)
     } else {
-        f.sampler_slots[slot].insert(kind, value);
-    }
+        f.sampler_slots[slot].insert(kind, value)
+    } != Some(value);
     super::shaders::stateblocks::mark_fixed(
         env,
         this.addr(),
@@ -774,6 +782,7 @@ pub(super) fn set_sampler(
         } else {
             super::shaders::stateblocks::FixedKey::SamplerSlot(slot, kind)
         },
+        changed,
     );
     0
 }
@@ -827,11 +836,29 @@ fn set_viewport(env: &mut Env<'_>, this: GuestPtr<()>, viewport: GuestPtr<D3DVIE
     {
         return INVALID;
     }
-    mutable(env, this.addr()).unwrap().viewport = v;
+    let f = mutable(env, this.addr()).unwrap();
+    let old = f.viewport;
+    let changed = (
+        old.X,
+        old.Y,
+        old.Width,
+        old.Height,
+        old.MinZ.to_bits(),
+        old.MaxZ.to_bits(),
+    ) != (
+        v.X,
+        v.Y,
+        v.Width,
+        v.Height,
+        v.MinZ.to_bits(),
+        v.MaxZ.to_bits(),
+    );
+    f.viewport = v;
     super::shaders::stateblocks::mark_fixed(
         env,
         this.addr(),
         super::shaders::stateblocks::FixedKey::Viewport,
+        changed,
     );
     0
 }
@@ -858,11 +885,15 @@ fn set_scissor(env: &mut Env<'_>, this: GuestPtr<()>, rect: GuestPtr<RECT>) -> u
     if rect.left < 0 || rect.top < 0 || rect.right <= rect.left || rect.bottom <= rect.top {
         return INVALID;
     }
+    let old = f.scissor;
+    let changed = (old.left, old.top, old.right, old.bottom)
+        != (rect.left, rect.top, rect.right, rect.bottom);
     f.scissor = rect;
     super::shaders::stateblocks::mark_fixed(
         env,
         this.addr(),
         super::shaders::stateblocks::FixedKey::Scissor,
+        changed,
     );
     0
 }
@@ -905,11 +936,13 @@ fn set_transform(
     let Some(f) = mutable(env, this.addr()) else {
         return INVALID;
     };
+    let changed = f.transforms[slot].map(f32::to_bits) != matrix.map(f32::to_bits);
     f.transforms[slot] = matrix;
     super::shaders::stateblocks::mark_fixed(
         env,
         this.addr(),
         super::shaders::stateblocks::FixedKey::Transform(slot),
+        changed,
     );
     0
 }

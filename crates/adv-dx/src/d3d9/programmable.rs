@@ -48,15 +48,18 @@ fn set_clip_plane(env: &mut Env<'_>, this: GuestPtr<()>, index: u32, plane: Gues
     else {
         return INVALID;
     };
-    if let Some(record) = &mut d.recording {
-        record.fixed.clip_planes[index as usize] = values;
+    let fixed = if let Some(record) = &mut d.recording {
+        &mut record.fixed
     } else {
-        d.fixed.clip_planes[index as usize] = values;
-    }
+        &mut *d.fixed
+    };
+    let changed = fixed.clip_planes[index as usize].map(f32::to_bits) != values.map(f32::to_bits);
+    fixed.clip_planes[index as usize] = values;
     shaders::stateblocks::mark_fixed(
         env,
         this.addr(),
         shaders::stateblocks::FixedKey::ClipPlane(index as usize),
+        changed,
     );
     0
 }
