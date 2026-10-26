@@ -854,7 +854,7 @@ fn content_keys_keep_all_xxh3_bits_and_ignore_unused_constant_banks() {
     let mut f = fixture();
     let make = |f: &mut Fixture| {
         let mut d = programmable_draw(f);
-        let p = d.programmable.as_mut().unwrap();
+        let p = Arc::make_mut(d.programmable.as_mut().unwrap());
         p.program.constants = [adv_device::constants::ConstantUsage::default(); 2];
         for usage in &mut p.program.constants {
             for n in [3, 258, 277, 288, 296] {
@@ -869,7 +869,7 @@ fn content_keys_keep_all_xxh3_bits_and_ignore_unused_constant_banks() {
         for bank in 0..5 {
             for used in [false, true] {
                 let mut d = make(&mut f);
-                let p = d.programmable.as_mut().unwrap();
+                let p = Arc::make_mut(d.programmable.as_mut().unwrap());
                 let c = if stage == 0 {
                     &mut p.vertex_constants
                 } else {
@@ -895,7 +895,7 @@ fn programmable_draw(f: &mut Fixture) -> fixed::Draw {
     let mut d = draw(f);
     let mut state = d.state;
     state.texture_op = TextureOp::Texture;
-    d.programmable = Some(Box::new(ProgrammableDraw {
+    d.programmable = Some(Arc::new(ProgrammableDraw {
         program: Program::new(
             Arc::from("authored immutable program identity"),
             vec![false],
@@ -973,30 +973,46 @@ fn fingerprints_cover_program_constants_streams_indices_bindings_and_raw_vertice
         d.texcoords = Some((1, v.into()));
         assert_ne!(fingerprint(&mut f, d), extra);
     }
-    changed!(|d: &mut fixed::Draw| d.programmable.as_mut().unwrap().program.textures[0] = true);
-    changed!(|d: &mut fixed::Draw| d.programmable.as_mut().unwrap().vertex_count = 5);
     changed!(
-        |d: &mut fixed::Draw| d.programmable.as_mut().unwrap().indices.as_mut().unwrap()[2] = 3
+        |d: &mut fixed::Draw| Arc::make_mut(d.programmable.as_mut().unwrap())
+            .program
+            .textures[0] = true
     );
-    changed!(|d: &mut fixed::Draw| d.programmable.as_mut().unwrap().streams[0].bytes[0] = 1);
-    changed!(|d: &mut fixed::Draw| d.programmable.as_mut().unwrap().streams[0].stride = 0);
     changed!(
-        |d: &mut fixed::Draw| d.programmable.as_mut().unwrap().streams[0].attributes[0].location =
+        |d: &mut fixed::Draw| Arc::make_mut(d.programmable.as_mut().unwrap()).vertex_count = 5
+    );
+    changed!(
+        |d: &mut fixed::Draw| Arc::make_mut(d.programmable.as_mut().unwrap())
+            .indices
+            .as_mut()
+            .unwrap()[2] = 3
+    );
+    changed!(
+        |d: &mut fixed::Draw| Arc::make_mut(d.programmable.as_mut().unwrap()).streams[0].bytes[0] =
             1
     );
+    changed!(
+        |d: &mut fixed::Draw| Arc::make_mut(d.programmable.as_mut().unwrap()).streams[0].stride = 0
+    );
+    changed!(
+        |d: &mut fixed::Draw| Arc::make_mut(d.programmable.as_mut().unwrap()).streams[0]
+            .attributes[0]
+            .location = 1
+    );
     changed!(|d: &mut fixed::Draw| {
-        let s = &mut d.programmable.as_mut().unwrap().streams[0];
+        let s = &mut Arc::make_mut(d.programmable.as_mut().unwrap()).streams[0];
         s.attributes[0].format = AttributeFormat::Float3;
         s.attributes[0].offset = 4;
     });
     changed!(
-        |d: &mut fixed::Draw| d.programmable.as_mut().unwrap().streams[0].attributes[0].format =
-            AttributeFormat::Float3
+        |d: &mut fixed::Draw| Arc::make_mut(d.programmable.as_mut().unwrap()).streams[0]
+            .attributes[0]
+            .format = AttributeFormat::Float3
     );
     for stage in 0..2 {
         for n in 0..256 * 4 {
             changed!(|d: &mut fixed::Draw| {
-                let p = d.programmable.as_mut().unwrap();
+                let p = Arc::make_mut(d.programmable.as_mut().unwrap());
                 let c = if stage == 0 {
                     &mut p.vertex_constants
                 } else {
@@ -1008,7 +1024,7 @@ fn fingerprints_cover_program_constants_streams_indices_bindings_and_raw_vertice
         for n in 0..16 * 4 {
             for boolean in [false, true] {
                 changed!(|d: &mut fixed::Draw| {
-                    let p = d.programmable.as_mut().unwrap();
+                    let p = Arc::make_mut(d.programmable.as_mut().unwrap());
                     let c = if stage == 0 {
                         &mut p.vertex_constants
                     } else {
@@ -1025,7 +1041,7 @@ fn fingerprints_cover_program_constants_streams_indices_bindings_and_raw_vertice
         for n in 0..8 * 4 {
             for luminance in [false, true] {
                 changed!(|d: &mut fixed::Draw| {
-                    let p = d.programmable.as_mut().unwrap();
+                    let p = Arc::make_mut(d.programmable.as_mut().unwrap());
                     let c = if stage == 0 {
                         &mut p.vertex_constants
                     } else {
@@ -1042,17 +1058,19 @@ fn fingerprints_cover_program_constants_streams_indices_bindings_and_raw_vertice
     }
     for n in 0..40 * 4 {
         changed!(
-            |d: &mut fixed::Draw| d.programmable.as_mut().unwrap().parameters[n / 4][n % 4] = 1
+            |d: &mut fixed::Draw| Arc::make_mut(d.programmable.as_mut().unwrap()).parameters
+                [n / 4][n % 4] = 1
         );
     }
     let texture = f.surface(16, 12, 21, 0);
     let image = f.image(texture);
     changed!(
-        |d: &mut fixed::Draw| d.programmable.as_mut().unwrap().textures[0].image = Some(image)
+        |d: &mut fixed::Draw| Arc::make_mut(d.programmable.as_mut().unwrap()).textures[0].image =
+            Some(image)
     );
     for n in 0..7 {
         changed!(|d: &mut fixed::Draw| {
-            let s = &mut d.programmable.as_mut().unwrap().textures[0].sampler;
+            let s = &mut Arc::make_mut(d.programmable.as_mut().unwrap()).textures[0].sampler;
             match n {
                 0 => s.min = Filter::Linear,
                 1 => s.mag = Filter::Linear,

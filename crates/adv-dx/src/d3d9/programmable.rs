@@ -630,7 +630,7 @@ fn prepare_checked(
         }
         program
     };
-    draw.programmable = Some(Box::new(ProgrammableDraw {
+    draw.programmable = Some(Arc::new(ProgrammableDraw {
         program,
         streams,
         indices: output_indices,

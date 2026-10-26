@@ -1,26 +1,49 @@
-//! Reuse synchronous indexed-draw preparation, never ordered content updates.
+//! The preceding frame owns shared prepared indexed draws and their immutable
+//! effects. Guest-writable inputs are compared with retained bytes before reuse.
 use super::*;
 use std::hash::Hash;
 
-type StateStamp = ([u64; 15], [u64; 2], u128);
-
 #[derive(Default)]
 pub(super) struct Cache {
-    generations: [HashMap<u128, Entry, std::hash::BuildHasherDefault<xxhash_rust::xxh3::Xxh3>>; 2],
-    bytes: usize,
-    entries: usize,
-    state: std::cell::Cell<Option<(StateStamp, u128)>>,
+    targets: HashMap<Id, Sequence>,
+    disabled: bool,
 }
-struct Entry {
-    variants: HashMap<u128, key::Prepared, std::hash::BuildHasherDefault<xxhash_rust::xxh3::Xxh3>>,
-    spans: Vec<(u32, u32, u128)>,
+#[derive(Default)]
+struct Sequence {
+    previous: Vec<Arc<Entry>>,
+    next: Vec<Arc<Entry>>,
+    index: HashMap<u128, Vec<usize>>,
+    next_index: HashMap<u128, Vec<usize>>,
+    cursor: usize,
+}
+pub(super) struct Entry {
+    signature: u128,
+    prepared: Arc<key::Prepared>,
+    spans: fixed::CapturedSpans,
+    pub saved: std::sync::OnceLock<Saved>,
+}
+pub(super) struct Saved {
+    pub command: u128,
+    pub damage: Arc<damage::Record>,
+    pub pass: Arc<passes::Effects>,
+    pub destinations: Vec<Option<u128>>,
 }
 impl Cache {
+    pub(super) fn invalidate(&mut self) {
+        self.targets.clear();
+        self.disabled = true;
+    }
     pub(super) fn finish(&mut self) {
-        self.generations.swap(0, 1);
-        self.generations[0].clear();
-        self.bytes = 0;
-        self.entries = 0;
+        if self.disabled {
+            *self = Self::default();
+            return;
+        }
+        self.targets.retain(|_, s| {
+            s.previous = std::mem::take(&mut s.next);
+            s.index = std::mem::take(&mut s.next_index);
+            s.cursor = 0;
+            !s.previous.is_empty()
+        });
     }
 }
 fn signature(
@@ -33,25 +56,21 @@ fn signature(
         .ok_or(INVALID)?;
     key::bind(env, owner)?;
     let d = device(env, pointer).ok_or(INVALID)?;
-    if !d.scene || d.needs_reset {
+    if !d.scene
+        || d.needs_reset
+        || d.frame.reuse.disabled
+        || d.frame.partial
+        || d.frame.active.is_some()
+    {
         return Err(INVALID);
     }
     let mut h = xxhash_rust::xxh3::Xxh3::new();
-    let stamp = (
-        d.versions,
-        [
-            d.shaders.vertex_constants.revision(),
-            d.shaders.pixel_constants.revision(),
-        ],
-        d.fixed.key(),
+    #[cfg(any(test, feature = "d3d9-counters"))]
+    debug_assert_eq!(
+        d.fingerprints,
+        std::array::from_fn(|class| d.class_key(class))
     );
-    let cached = d.frame.reuse.state.get().filter(|(old, _)| *old == stamp);
-    let state = cached.map(|(_, key)| key).unwrap_or_else(|| {
-        let key = draw_key(env, pointer);
-        d.frame.reuse.state.set(Some((stamp, key)));
-        key
-    });
-    (request, state).hash(&mut h);
+    (request, d.fingerprints).hash(&mut h);
     let target = targets::draw_target(env, pointer)?;
     // Presentation rotates back-buffer images; commands depend only on the
     // target's shape, and a reused command is rebased onto the current one.
@@ -106,7 +125,15 @@ fn signature(
     // Local sampling proofs depend on which producers precede this draw.
     let bindings = d.frame.binding_cache.as_ref().unwrap();
     for content in bindings.output.iter().skip(1).flatten() {
-        d.frame.damage.written(content).hash(&mut h);
+        (
+            d.frame.damage.written(content),
+            d.frame.contents.get(content),
+        )
+            .hash(&mut h);
+    }
+    for content in bindings.output.iter().flatten() {
+        let independent = d.frame.damage.independent(content);
+        independent.hash(&mut h);
     }
     for content in &bindings.samples {
         (
@@ -117,22 +144,18 @@ fn signature(
     }
     Ok((h.digest128(), target))
 }
-fn contents(env: &Env<'_>, spans: &[(u32, u32, u128)]) -> Option<u128> {
-    let mut h = xxhash_rust::xxh3::Xxh3::new();
-    spans.len().hash(&mut h);
-    for &(address, length, _) in spans {
-        adv_abi::guest::check_range(env.cpu, address, length, Prot::READ).ok()?;
-        let bytes = match env.cpu.shared_bytes(address, length as usize) {
-            Some(bytes) => std::borrow::Cow::Borrowed(bytes),
-            None => {
-                let mut bytes = vec![0; length as usize];
-                env.cpu.read(address, &mut bytes).ok()?;
-                std::borrow::Cow::Owned(bytes)
-            }
-        };
-        (address, length, xxhash_rust::xxh3::xxh3_128(&bytes)).hash(&mut h);
-    }
-    Some(h.digest128())
+fn unchanged(env: &Env<'_>, spans: &[(u32, Arc<[u8]>)]) -> bool {
+    spans.iter().all(|(address, old)| {
+        if adv_abi::guest::check_range(env.cpu, *address, old.len() as u32, Prot::READ).is_err() {
+            return false;
+        }
+        if let Some(bytes) = env.cpu.shared_bytes(*address, old.len()) {
+            bytes == old.as_ref()
+        } else {
+            let mut bytes = vec![0; old.len()];
+            env.cpu.read(*address, &mut bytes).is_ok() && bytes == old.as_ref()
+        }
+    })
 }
 pub(in crate::d3d9) fn indexed(
     env: &mut Env<'_>,
@@ -140,8 +163,6 @@ pub(in crate::d3d9) fn indexed(
     request: (i32, u32, &[u32]),
     build: impl FnOnce(&mut Env<'_>) -> Result<fixed::Draw, u32>,
 ) -> Outcome {
-    #[cfg(feature = "d3d9-counters")]
-    let before = lookups();
     let (signature, target) = match signature(env, pointer, request) {
         Ok(signed) => signed,
         Err(_) => {
@@ -157,26 +178,46 @@ pub(in crate::d3d9) fn indexed(
         }
     };
     let d = device(env, pointer).unwrap();
-    let template = d
-        .frame
-        .reuse
-        .generations
-        .iter()
-        .find_map(|g| g.get(&signature));
-    let content = template.and_then(|entry| contents(env, &entry.spans));
-    let cached = content.and_then(|content| {
-        d.frame
-            .reuse
-            .generations
-            .iter()
-            .find_map(|g| g.get(&signature)?.variants.get(&content))
-    });
-    let (prepared, spans, content) = if let Some(prepared) = cached {
-        let mut prepared = prepared.clone();
-        if let Operation::Draw(draw) = &mut prepared.operation {
-            draw.target = target;
+    let target_id = d.render_target.or(d.back_buffer).unwrap();
+    let sequence = d.frame.reuse.targets.get(&target_id);
+    let expected = sequence
+        .and_then(|s| s.previous.get(s.cursor))
+        .filter(|e| e.signature == signature && unchanged(env, &e.spans));
+    let cached = expected
+        .or_else(|| {
+            sequence.and_then(|s| {
+                s.index
+                    .get(&signature)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|&n| s.previous.get(n))
+                    .chain(
+                        s.next_index
+                            .get(&signature)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|&n| s.next.get(n)),
+                    )
+                    .find(|entry| unchanged(env, &entry.spans))
+            })
+        })
+        .cloned();
+    let entry = if let Some(entry) = cached {
+        #[cfg(any(test, feature = "d3d9-counters"))]
+        {
+            let owner = com(env)
+                .identity::<Payload>(&env.sys.objects, pointer)
+                .unwrap();
+            let reference = key::prepare(env, owner, entry.prepared.operation.clone()).unwrap();
+            debug_assert_eq!(reference.key, entry.prepared.key);
+            debug_assert_eq!(reference.bounds, entry.prepared.bounds);
+            debug_assert!(
+                reference.reads == entry.prepared.reads
+                    && reference.writes == entry.prepared.writes
+                    && reference.samples == entry.prepared.samples
+            );
         }
-        (prepared, template.unwrap().spans.clone(), content.unwrap())
+        entry
     } else {
         *d.fixed.captures.borrow_mut() = Some(Vec::new());
         let draw = build(env);
@@ -198,38 +239,38 @@ pub(in crate::d3d9) fn indexed(
             Ok(prepared) => prepared,
             Err(code) => return Outcome::Return(code),
         };
-        let content = hash(&spans);
-        (prepared, spans, content)
+        Arc::new(Entry {
+            signature,
+            prepared: Arc::new(prepared),
+            spans,
+            saved: Default::default(),
+        })
     };
     let owner = com(env)
         .identity::<Payload>(&env.sys.objects, pointer)
         .unwrap();
-    let cache = &mut frame(env, owner).reuse;
-    if !spans.is_empty()
-        && cache.generations[0]
-            .get(&signature)
-            .is_none_or(|e| !e.variants.contains_key(&content))
-        && cache.entries < 4096
-        && cache.bytes + prepared.bytes <= 64 * 1024 * 1024
+    let sequence = frame(env, owner)
+        .reuse
+        .targets
+        .entry(target_id)
+        .or_default();
+    if let Some(positions) = sequence.index.get(&signature)
+        && let Some(&n) = positions
+            .iter()
+            .find(|&&n| n >= sequence.cursor && Arc::ptr_eq(&sequence.previous[n], &entry))
     {
-        cache.bytes += prepared.bytes;
-        cache.entries += 1;
-        cache.generations[0]
-            .entry(signature)
-            .or_insert_with(|| Entry {
-                variants: Default::default(),
-                spans,
-            })
-            .variants
-            .insert(content, prepared.clone());
+        sequence.cursor = n + 1;
     }
-    #[cfg(feature = "d3d9-counters")]
-    let prepared = key::Prepared {
-        lookups: lookups() - before,
-        ..prepared
-    };
+    sequence
+        .next_index
+        .entry(signature)
+        .or_default()
+        .push(sequence.next.len());
+    sequence.next.push(entry.clone());
     if env.ext.get::<State>().gpu.is_none() {
         return Outcome::Return(UNAVAILABLE);
     }
-    barrier_if_busy(env, owner, move |env| accept(env, owner, prepared))
+    barrier_if_busy(env, owner, move |env| {
+        append(env, owner, &entry.prepared, Some(target), Some(&entry))
+    })
 }

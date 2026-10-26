@@ -148,6 +148,7 @@ pub(super) fn setup(env: &mut Env<'_>) -> (u32, Id, u32, Id) {
             shaders: shaders::Bindings::default(),
             recording: None,
             versions: [0; 15],
+            fingerprints: [0; 15],
             frame: recording::Recording::default(),
             gpu_lost: false,
             boundary: None,
@@ -156,6 +157,7 @@ pub(super) fn setup(env: &mut Env<'_>) -> (u32, Id, u32, Id) {
     .unwrap();
     if let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, device_id) {
         d.pointer = device;
+        d.refresh_all();
     }
     let (resource, id) = resources::make(
         env,

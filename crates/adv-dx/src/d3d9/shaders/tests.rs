@@ -379,6 +379,7 @@ fn native_vertex_and_pixel_block_membership_restores_only_each_stage() {
             for (&state, &value) in states.iter().zip(&before) {
                 d.fixed.render.insert(state, value);
             }
+            d.touch(0);
         }
         input.write(env.cpu, [1.; 4]).unwrap();
         assert_eq!(set_vertex_f(&mut env, this, 7, input.cast(), 1), 0);
@@ -390,6 +391,7 @@ fn native_vertex_and_pixel_block_membership_restores_only_each_stage() {
             for (&state, &value) in states.iter().zip(&after) {
                 d.fixed.render.insert(state, value);
             }
+            d.touch(0);
         }
         input.write(env.cpu, [3.; 4]).unwrap();
         assert_eq!(set_vertex_f(&mut env, this, 7, input.cast(), 1), 0);

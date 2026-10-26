@@ -85,7 +85,7 @@ Clipped clears MUST retain depth/stencil deferral independently of their color w
 
 ### GFX-REC-1 Ordered recording and flush boundaries
 
-**Rule**: D3D9 MUST validate recorded commands synchronously and flush before Present, readback, GPU waits, Reset, release, or recording limits. Busy continuations MUST resume the unexecuted suffix without replaying successful commands. Execution-time device failure MUST persist until Reset and be reported by Present or TestCooperativeLevel.
+**Rule**: D3D9 MUST validate new recorded commands synchronously and flush before Present, readback, GPU waits, Reset, release, or recording limits. Busy continuations MUST resume the unexecuted suffix without replaying successful commands. Execution-time device failure MUST persist until Reset and be reported by Present or TestCooperativeLevel.
 **Verification**: Test
 
 Recorded programmable draws capture guest streams and neutral geometry once, before the guest can mutate or release their sources. Immutable vertices and register snapshots are shared with bounds and sampling analysis. Backend byte packing and point expansion occur only when surviving commands execute. Binding dependencies are cached until binding changes or resource destruction. Content writes resolve a slot once and index its current/base versions directly; retired slots can be reused.
@@ -100,7 +100,7 @@ Flush limits are 4096 commands or 64 MiB of upload and vertex data. Readback bou
 Full clears replace previous dependencies; partial clears, draws and copies retain them. Upload admission assigns a fresh identity. A partial flush or a private presentation without the shared output prevents elision of that frame. DISCARD presentation may rotate independently reconstructible targets; destination-dependent frames preserve writable contents using an immutable GPU snapshot.
 Clear identities MUST include only the selected value and extent of each written color, depth or stencil component. Draws MUST read only the enabled depth/stencil tests.
 Fixed-state draw keys MAY be cached between mutations, but every mutable state access MUST invalidate the cached key. Fixed-state categories retain shared immutable maps and complete content keys. Identical map insertions preserve that category's key; arbitrary mutable access invalidates it.
-Fixed-state category reads MUST use dense SDK selector tables, and state-block membership and delta calculation MUST use bounded slot bitmaps without per-member heap allocation.
+Fixed-state category reads MUST use dense SDK selector tables, and state-block membership and copying MUST use bounded slot bitmaps without per-member heap allocation.
 Fixed-input draws MAY capture each owned vertex stream once per draw when the span reads no more bytes than separate vertex reads. Complete input identities MUST retain index order and exact vertex bytes, including repeated indices; later draws MUST observe buffer writes.
 Owned input captures with identical complete inputs and decoding state MAY reuse immutable decoded geometry across adjacent frames. Each frame generation MUST retain at most 4096 entries and 64 MiB, and cached geometry MUST NOT retain GPU resources. Fixed programmable streams MAY reuse this complete capture identity instead of hashing expanded bytes again; arbitrary byte mutation and point expansion MUST discard that identity.
 
@@ -111,7 +111,7 @@ Owned input captures with identical complete inputs and decoding state MAY reuse
 
 ### GFX-REC-4 Conservative damage and bounds
 
-**Rule**: Each target subresource MUST compare ordered command keys and bounds, including sampled content and retained destination dependencies. Changed, added, or removed entries MUST damage both old and new bounds. Damage MUST retain at most four rectangles and conservatively merge overflow without promoting bounded damage to the whole target based on coverage alone.
+**Rule**: Each target subresource MUST accumulate recording-time differences, including sampled content and retained destination dependencies. Changed, added, or removed entries MUST damage both old and new bounds. Damage MUST retain at most four rectangles and conservatively merge overflow without promoting bounded damage to the whole target based on coverage alone.
 **Verification**: Test
 
 Overflow merges into one bounding box. Bounds use decoded XYZRHW or CPU world/view/projection positions, or the scalar vertex shader interpreter for at most 64 float-input vertices. Perspective division and viewport mapping precede one-pixel raster margins, point-size expansion, and viewport/guest-scissor intersection. Nonpositive w, nonfinite values, excessive vertices, unsupported inputs or instructions use full-target bounds. Clear and copy use destination rectangles; CPU uploads use the whole target. Size/format changes and Reset invalidate history. Reading an intermediate target before a later write, or sharing an attachment across target allocations, conservatively forces full execution.
@@ -129,7 +129,7 @@ Immutable snapshot presentation MUST preserve known color damage, just as rotati
 
 ### GFX-REC-6 D3D9 leaf admission
 
-**Rule**: Only the methods below MAY enter EnvLeaf without blocking, guest callbacks or guest memory allocation and release. Draw and Clear admission MUST decline before side effects when recording might flush, wait or execute immediately. Declined calls MUST execute their ordinary adapter with identical state, commands and guest results.
+**Rule**: Only the methods below MAY enter EnvLeaf without blocking, guest callbacks or guest memory allocation and release. New Draw and Clear admission MUST decline before side effects when recording might flush, wait or execute immediately. Declined calls MUST execute their ordinary adapter with identical state, commands and guest results.
 **Verification**: Test
 **Basis**: A64-CTL-12
 
@@ -175,9 +175,9 @@ Damage clipping remains a conservative region optimization under GFX-REC-4/5.
 **Rule**: GetRenderTargetData into a plain system-memory surface MUST queue its copy in submission order and return before completion. LockRect, GetDC, surface export and another readback into that surface MUST wait for the copy first. Texture-level destinations and a busy readback lane MUST keep the blocking path.
 **Verification**: Test
 
-### GFX-REC-11 Reusing draw preparation and state-block deltas
+### GFX-REC-11 Differential frame recording
 
-**Rule**: Prepared draws MAY retain GPU leases for two frame generations, each bounded by 4096 entries and 64 MiB of logical draw data. Reuse MUST preserve commands, keys, damage, and pixels using complete 128-bit identities covering state, bindings, resource contents, constants, and producer changes. State-block admission and handlers MAY share revision deltas while preserving captured membership and exact values.
+**Rule**: State writes MUST maintain history-independent 128-bit identities, preserving state-block membership and exact values. Eligible unchanged draws MUST reuse shared previous-frame entries, checking guest-writable bytes and realigning after insertions or removals. Reuse MUST preserve commands, conservative damage, and pixels, and unavailable histories and flush boundaries MUST retain full preparation.
 **Verification**: Test
 
 ### GFX-PACE-1 Vsync-locked refresh boundaries

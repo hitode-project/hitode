@@ -69,7 +69,11 @@ impl StateMap {
         if old == Some(value) {
             return Some(value);
         }
+        let fingerprint = self.fingerprint()
+            ^ old.map_or(0, |v| crate::d3d9::recording::hash((key, v)))
+            ^ crate::d3d9::recording::hash((key, value));
         let contents = self.mutable();
+        contents.key = OnceLock::from(fingerprint);
         let index = key as usize;
         if index >= contents.values.len() {
             contents.values.resize(index + 1, 0);
@@ -116,20 +120,22 @@ impl Index<&i32> for StateMap {
         self.get(key).expect("captured fixed state")
     }
 }
+impl StateMap {
+    fn fingerprint(&self) -> u128 {
+        let key = *self.0.key.get_or_init(|| self.recompute());
+        #[cfg(any(test, feature = "d3d9-counters"))]
+        debug_assert_eq!(key, self.recompute());
+        key
+    }
+    fn recompute(&self) -> u128 {
+        self.iter().fold(0, |key, (slot, value)| {
+            key ^ crate::d3d9::recording::hash((slot, value))
+        })
+    }
+}
 impl Hash for StateMap {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.0
-            .key
-            .get_or_init(|| {
-                let mut h = xxhash_rust::xxh3::Xxh3::new();
-                self.len().hash(&mut h);
-                for (key, value) in self.iter() {
-                    key.hash(&mut h);
-                    value.hash(&mut h);
-                }
-                h.digest128()
-            })
-            .hash(state);
+        self.fingerprint().hash(state);
     }
 }
 

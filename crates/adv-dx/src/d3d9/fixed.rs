@@ -10,11 +10,13 @@ mod input;
 mod state_map;
 use state_map::StateMap;
 
+pub(super) type CapturedSpans = Vec<(u32, Arc<[u8]>)>;
+
 pub(super) struct CachedFixed {
     state: Fixed,
     key: std::cell::Cell<Option<u128>>,
     inputs: std::cell::RefCell<input::GeometryCache>,
-    pub(super) captures: std::cell::RefCell<Option<Vec<(u32, u32, u128)>>>,
+    pub(super) captures: std::cell::RefCell<Option<CapturedSpans>>,
 }
 impl CachedFixed {
     pub(super) fn new(width: u32, height: u32) -> Self {
@@ -49,7 +51,7 @@ impl CachedFixed {
         };
         let key = xxhash_rust::xxh3::xxh3_128(&bytes);
         if let Some(captures) = self.captures.borrow_mut().as_mut() {
-            captures.push((address, length, key));
+            captures.push((address, Arc::from(bytes.as_ref())));
         }
         let mut captures = self.inputs.borrow_mut();
         if let Some(bytes) = captures.stream(key) {
@@ -155,7 +157,7 @@ pub(super) struct Draw {
     pub vertices: Arc<Vec<Vertex>>,
     pub texcoords: Option<(usize, Arc<Vec<[f32; 4]>>)>,
     pub state: DrawState,
-    pub programmable: Option<Box<adv_device::gpu::ProgrammableDraw>>,
+    pub programmable: Option<Arc<adv_device::gpu::ProgrammableDraw>>,
     pub recording_key: u128,
     pub program_key: u128,
 }
@@ -483,6 +485,12 @@ pub(super) fn set_fvf(env: &mut Env<'_>, this: GuestPtr<()>, fvf: u32) -> u32 {
             return code;
         }
         mutable(env, this.addr()).unwrap().fvf = fvf;
+        super::shaders::stateblocks::mark_fixed(
+            env,
+            this.addr(),
+            super::shaders::stateblocks::FixedKey::Fvf,
+            true,
+        );
     }
     0
 }

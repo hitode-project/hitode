@@ -304,3 +304,111 @@ fn d3d9_reuse_rebases_onto_a_rotated_back_buffer_image() {
     assert_ne!(new.view(), old.view());
     assert_eq!(f.pixels(&new), expected);
 }
+
+#[test]
+// spec: GFX-REC-1, GFX-REC-2, GFX-REC-4, GFX-REC-11, GFX-SHADER-4
+fn d3d9_differential_frames_match_full_commands_damage_and_pixels_with_stateblocks() {
+    let mut results = Vec::new();
+    let (mut f, _) = reuse_fixture();
+    let d = f.device;
+    let output = f.packet(0u32);
+    f.okay("IDirect3DDevice9::BeginStateBlock", &[d]);
+    f.okay("IDirect3DDevice9::SetRenderState", &[d, 22, 3]);
+    f.okay("IDirect3DDevice9::SetSamplerState", &[d, 0, 5, 1]);
+    f.okay("IDirect3DDevice9::EndStateBlock", &[d, output]);
+    let block = f.m.cpu.read_u32(output).unwrap();
+    let mut templates = Vec::new();
+    for n in 0..4 {
+        let mut template = draw(&mut f);
+        let x = -0.9 + n as f32 * 0.45;
+        template.vertices = Arc::new(vec![
+            Vertex {
+                position: [x, -0.7, 0., 1.],
+                color: [1., 0., 0., 1.],
+                uv: [0.; 2],
+            },
+            Vertex {
+                position: [x + 0.15, -0.7, 0., 1.],
+                color: [1., 0., 0., 1.],
+                uv: [0.; 2],
+            },
+            Vertex {
+                position: [x, -0.3, 0., 1.],
+                color: [1., 0., 0., 1.],
+                uv: [0.; 2],
+            },
+        ]);
+        templates.push(template);
+    }
+    for full in [false, true] {
+        let owner = id(&mut f);
+        *frame(&mut env(&mut f), owner) = Recording::default();
+        let builds = std::cell::Cell::new(0);
+        let mut frames = Vec::new();
+        for sequence in [&[0, 1, 2][..], &[0, 3, 1, 2], &[0, 1, 2], &[0, 1, 2]] {
+            clear(&mut f, 0xff000000);
+            for &n in sequence {
+                f.okay("IDirect3DStateBlock9::Capture", &[block]);
+                let fingerprints = device(&env(&mut f), d).unwrap().fingerprints;
+                f.okay("IDirect3DDevice9::SetRenderState", &[d, 22, 1]);
+                f.okay("IDirect3DDevice9::SetSamplerState", &[d, 0, 5, 2]);
+                f.okay("IDirect3DStateBlock9::Apply", &[block]);
+                assert_eq!(device(&env(&mut f), d).unwrap().fingerprints, fingerprints);
+                f.okay("IDirect3DDevice9::SetSamplerState", &[d, 0, 5, 1]);
+                let owner = id(&mut f);
+                let outcome = if full {
+                    record(
+                        &mut env(&mut f),
+                        owner,
+                        Operation::Draw(templates[n as usize].clone()),
+                    )
+                } else {
+                    indexed(&mut env(&mut f), d, (4, 1, &[n]), |_| {
+                        builds.set(builds.get() + 1);
+                        Ok(templates[n as usize].clone())
+                    })
+                };
+                assert_eq!(f.finish(outcome), 0);
+            }
+            let owner = id(&mut f);
+            let key = frame(&mut env(&mut f), owner).key;
+            let published = f.m.ext.get::<Presents>().damage.len();
+            f.okay("IDirect3DDevice9::EndScene", &[d]);
+            present(&mut f);
+            let damage = f.m.ext.get::<Presents>().damage.get(published).copied();
+            let image = f.image(f.back);
+            frames.push((key, damage, f.pixels(&image)));
+            f.okay("IDirect3DDevice9::BeginScene", &[d]);
+        }
+        if !full {
+            assert_eq!(builds.get(), 4, "three initial entries and one insertion");
+        }
+        results.push(frames);
+    }
+    for (n, (cached, full)) in results[0].iter().zip(&results[1]).enumerate() {
+        assert_eq!(cached.0, full.0, "frame {n} commands");
+        assert_eq!(cached.1, full.1, "frame {n} damage");
+        assert_eq!(cached.2, full.2, "frame {n} pixels");
+    }
+}
+
+#[test]
+// spec: GFX-REC-1, GFX-REC-11
+fn d3d9_differential_early_readback_keeps_the_remaining_frame_on_the_full_path() {
+    let (mut f, _) = reuse_fixture();
+    let builds = std::cell::Cell::new(0);
+    clear(&mut f, 0xff000000);
+    reuse_draw(&mut f, &[0, 1, 2], &builds);
+    let outcome = flush(&mut f, Reason::Readback);
+    assert_eq!(f.finish(outcome), 0);
+    reuse_draw(&mut f, &[0, 1, 2], &builds);
+    reuse_draw(&mut f, &[0, 1, 2], &builds);
+    assert_eq!(builds.get(), 3);
+    f.okay("IDirect3DDevice9::EndScene", &[f.device]);
+    present(&mut f);
+    f.okay("IDirect3DDevice9::BeginScene", &[f.device]);
+    clear(&mut f, 0xff000000);
+    reuse_draw(&mut f, &[0, 1, 2], &builds);
+    reuse_draw(&mut f, &[0, 1, 2], &builds);
+    assert_eq!(builds.get(), 4, "the next frame can share entries again");
+}

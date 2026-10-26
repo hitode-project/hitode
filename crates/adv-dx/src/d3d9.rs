@@ -122,11 +122,56 @@ struct Device {
     shaders: shaders::Bindings,
     recording: Option<shaders::stateblocks::Snapshot>,
     versions: [u64; 15],
+    fingerprints: [u128; 15],
     frame: recording::Recording,
     gpu_lost: bool,
     /// The last refresh boundary, so vsync-locked boundaries keep their phase.
     boundary: Option<u64>,
 }
+impl Device {
+    fn class_key(&self, class: usize) -> u128 {
+        use recording::hash;
+        let f = &self.fixed;
+        match class {
+            0 => hash(&f.render),
+            1 => hash((&f.stage, &f.stage_slots)),
+            2 => hash((&f.sampler, &f.sampler_slots)),
+            3 => hash((
+                f.viewport.X,
+                f.viewport.Y,
+                f.viewport.Width,
+                f.viewport.Height,
+                f.viewport.MinZ.to_bits(),
+                f.viewport.MaxZ.to_bits(),
+            )),
+            4 => hash((
+                f.scissor.left,
+                f.scissor.top,
+                f.scissor.right,
+                f.scissor.bottom,
+            )),
+            5 => hash(f.transforms.map(|v| v.map(f32::to_bits))),
+            6 => hash(f.clip_planes.map(|v| v.map(f32::to_bits))),
+            7 => hash((f.fvf, self.buffers.declaration)),
+            8 => hash(self.shaders.vertex),
+            9 => hash(self.shaders.pixel),
+            10 => hash(self.buffers.streams.map(|s| (s.buffer, s.offset, s.stride))),
+            11 => hash(self.buffers.indices),
+            12 => hash((self.texture, self.shaders.textures)),
+            13 => self.shaders.vertex_constants.fingerprint(),
+            14 => self.shaders.pixel_constants.fingerprint(),
+            _ => unreachable!(),
+        }
+    }
+    fn touch(&mut self, class: usize) {
+        self.versions[class] += 1;
+        self.fingerprints[class] = self.class_key(class);
+    }
+    fn refresh_all(&mut self) {
+        self.fingerprints = std::array::from_fn(|class| self.class_key(class));
+    }
+}
+
 pub struct State {
     com: Com,
     tables: BTreeMap<&'static str, u32>,
@@ -1027,7 +1072,7 @@ fn create_device(
     let mut fixed =
         fixed::CachedFixed::new(normalized.BackBufferWidth, normalized.BackBufferHeight);
     fixed.auto_depth(normalized.EnableAutoDepthStencil != 0);
-    let device = Device {
+    let mut device = Device {
         children: BTreeMap::new(),
         pointer: 0,
         factory,
@@ -1048,10 +1093,12 @@ fn create_device(
         shaders: shaders::Bindings::default(),
         recording: None,
         versions: [0; 15],
+        fingerprints: [0; 15],
         frame: recording::Recording::default(),
         gpu_lost: false,
         boundary: None,
     };
+    device.refresh_all();
     let Some((pointer, id)) = object(
         env,
         "IDirect3DDevice9",

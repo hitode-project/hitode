@@ -126,16 +126,19 @@ fn check_sparse_constants(verify: bool) {
             assert_eq!(p.vertex_constants.floats[255], [0.; 4]);
             assert_eq!(p.pixel_constants.floats[255], [0.; 4]);
             let mut full = p.clone();
-            full.vertex_constants.floats = device.shaders.vertex_constants.floats;
-            full.vertex_constants.integers = device.shaders.vertex_constants.integers;
-            full.vertex_constants.booleans = device
+            Arc::make_mut(&mut full).vertex_constants.floats =
+                device.shaders.vertex_constants.floats;
+            Arc::make_mut(&mut full).vertex_constants.integers =
+                device.shaders.vertex_constants.integers;
+            Arc::make_mut(&mut full).vertex_constants.booleans = device
                 .shaders
                 .vertex_constants
                 .booleans
                 .map(|b| [b, 0, 0, 0]);
-            full.pixel_constants.floats = device.shaders.pixel_constants.floats;
-            full.pixel_constants.integers = device.shaders.pixel_constants.integers;
-            full.pixel_constants.booleans = device
+            Arc::make_mut(&mut full).pixel_constants.floats = device.shaders.pixel_constants.floats;
+            Arc::make_mut(&mut full).pixel_constants.integers =
+                device.shaders.pixel_constants.integers;
+            Arc::make_mut(&mut full).pixel_constants.booleans = device
                 .shaders
                 .pixel_constants
                 .booleans
@@ -157,7 +160,7 @@ fn check_sparse_constants(verify: bool) {
             assert_eq!(full_bounds, *frame_bounds.last().unwrap());
             (full, d.state)
         };
-        full.program.constants = [adv_device::constants::ConstantUsage::ALL; 2];
+        Arc::make_mut(&mut full).program.constants = [adv_device::constants::ConstantUsage::ALL; 2];
         let mut gpu = f.m.ext.get_mut::<State>().gpu.take().unwrap();
         let target = gpu
             .target(16, 12, false)
@@ -754,7 +757,7 @@ fn shader_bounds_use_float_inputs_and_fall_back_for_nonfloat_or_unavailable_exec
     let make = |f: &mut Fixture| {
         let mut d = programmable_draw(f);
         Arc::make_mut(&mut d.vertices).clear();
-        let p = d.programmable.as_mut().unwrap();
+        let p = Arc::make_mut(d.programmable.as_mut().unwrap());
         p.vertex_count = 3;
         p.streams[0].bytes = bytemuck::cast_slice(&[
             [-0.5f32, 0.5, 0., 1.],
@@ -782,13 +785,14 @@ fn shader_bounds_use_float_inputs_and_fall_back_for_nonfloat_or_unavailable_exec
         h: 12,
     };
     let mut d = make(&mut f);
-    d.programmable.as_mut().unwrap().streams[0].attributes[0].format = AttributeFormat::Bgra8Unorm;
+    Arc::make_mut(d.programmable.as_mut().unwrap()).streams[0].attributes[0].format =
+        AttributeFormat::Bgra8Unorm;
     assert_eq!(bounds(&mut f, d), full);
     let mut d = make(&mut f);
-    d.programmable.as_mut().unwrap().vertex_count = 65;
+    Arc::make_mut(d.programmable.as_mut().unwrap()).vertex_count = 65;
     assert_eq!(bounds(&mut f, d), full);
     let mut d = make(&mut f);
-    d.programmable.as_mut().unwrap().streams[0].bytes[12..16]
+    Arc::make_mut(d.programmable.as_mut().unwrap()).streams[0].bytes[12..16]
         .copy_from_slice(&(-1f32).to_le_bytes());
     assert_eq!(bounds(&mut f, d), full);
 }

@@ -123,7 +123,7 @@ impl Default for Registers {
 }
 #[derive(Default)]
 pub(super) struct Constants {
-    revision: u64,
+    fingerprint: std::cell::Cell<Option<u128>>,
     registers: Arc<Registers>,
     captured: std::cell::RefCell<Option<Captured>>,
 }
@@ -138,7 +138,7 @@ impl Clone for Constants {
     fn clone(&self) -> Self {
         Self {
             registers: self.registers.clone(),
-            revision: self.revision,
+            fingerprint: self.fingerprint.clone(),
             captured: std::cell::RefCell::new(self.captured.borrow().clone()),
         }
     }
@@ -151,14 +151,14 @@ impl std::ops::Deref for Constants {
 }
 impl std::ops::DerefMut for Constants {
     fn deref_mut(&mut self) -> &mut Registers {
-        self.revision += 1;
+        self.fingerprint.set(None);
         *self.captured.get_mut() = None;
         Arc::make_mut(&mut self.registers)
     }
 }
 impl Constants {
     fn invalidate_register(&mut self, register: usize) {
-        self.revision += 1;
+        self.fingerprint.set(None);
         let captured = self.captured.get_mut();
         if captured
             .as_ref()
@@ -212,8 +212,45 @@ impl Constants {
             .snapshot
             .clone()
     }
-    pub(super) fn revision(&self) -> u64 {
-        self.revision
+    fn register_bits(&self, n: usize) -> [u32; 4] {
+        match n {
+            0..256 => self.floats[n].map(f32::to_bits),
+            256..272 => self.integers[n - 256].map(|v| v as u32),
+            _ => [self.booleans[n - 272] as u32, 0, 0, 0],
+        }
+    }
+    fn recompute(&self) -> u128 {
+        (0..288).fold(0, |key, n| {
+            key ^ super::recording::hash((n, self.register_bits(n)))
+        })
+    }
+    pub(super) fn fingerprint(&self) -> u128 {
+        let key = self.fingerprint.get().unwrap_or_else(|| {
+            let key = self.recompute();
+            self.fingerprint.set(Some(key));
+            key
+        });
+        #[cfg(any(test, feature = "d3d9-counters"))]
+        debug_assert_eq!(key, self.recompute());
+        key
+    }
+    fn write_register(&mut self, n: usize, value: [u32; 4]) -> bool {
+        let old = self.register_bits(n);
+        if old == value {
+            return false;
+        }
+        let key = self.fingerprint()
+            ^ super::recording::hash((n, old))
+            ^ super::recording::hash((n, value));
+        self.invalidate_register(n);
+        let r = Arc::make_mut(&mut self.registers);
+        match n {
+            0..256 => r.floats[n] = value.map(f32::from_bits),
+            256..272 => r.integers[n - 256] = value.map(|v| v as i32),
+            _ => r.booleans[n - 272] = value[0] as i32,
+        }
+        self.fingerprint.set(Some(key));
+        true
     }
     pub(super) fn key(&self, usage: adv_device::constants::ConstantUsage) -> u128 {
         self.capture(usage, &[]).as_ref().unwrap().key
@@ -554,11 +591,11 @@ fn set_shader(env: &mut Env<'_>, this: GuestPtr<()>, pointer: GuestPtr<()>, stag
     let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, id) else {
         return INVALID;
     };
-    d.versions[8 + usize::from(stage == Stage::Pixel)] += 1;
     match stage {
         Stage::Vertex => d.shaders.vertex = new,
         Stage::Pixel => d.shaders.pixel = new,
     };
+    d.touch(8 + usize::from(stage == Stage::Pixel));
     if new != old {
         release_binding(env, old);
     }
@@ -621,10 +658,8 @@ pub(super) fn reset_bindings(env: &mut Env<'_>, id: Id) {
     let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, id) else {
         return;
     };
-    for v in &mut d.versions {
-        *v += 1;
-    }
     let old = std::mem::take(&mut d.shaders);
+    d.refresh_all();
     let recording = d.recording.take();
     release_bindings(env, old);
     if let Some(recording) = recording {
@@ -749,35 +784,22 @@ fn store_constants(
                 let value = std::array::from_fn(|i| {
                     u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap())
                 });
-                if constants.floats[register].map(f32::to_bits) != value {
-                    constants.invalidate_register(register);
-                    Arc::make_mut(&mut constants.registers).floats[register] =
-                        value.map(f32::from_bits);
-                    changed = true;
-                }
+                changed |= constants.write_register(register, value);
             }
             ConstantKind::Integer => {
                 let value = std::array::from_fn(|i| {
                     i32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap())
                 });
-                if constants.integers[register] != value {
-                    constants.invalidate_register(register + 256);
-                    Arc::make_mut(&mut constants.registers).integers[register] = value;
-                    changed = true;
-                }
+                changed |= constants.write_register(register + 256, value.map(|v| v as u32));
             }
             ConstantKind::Boolean => {
                 let value = i32::from_le_bytes(bytes.try_into().unwrap());
-                if constants.booleans[register] != value {
-                    constants.invalidate_register(register + 272);
-                    Arc::make_mut(&mut constants.registers).booleans[register] = value;
-                    changed = true;
-                }
+                changed |= constants.write_register(register + 272, [value as u32, 0, 0, 0]);
             }
         }
     }
     if live && changed {
-        d.versions[13 + usize::from(stage == Stage::Pixel)] += 1;
+        d.touch(13 + usize::from(stage == Stage::Pixel));
     }
     0
 }

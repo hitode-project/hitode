@@ -1011,12 +1011,12 @@ fn set_texture_binding(
     }
     if let Some(Payload::Device(d)) = com(env).get_mut::<Payload>(&mut env.sys.objects, this.addr())
     {
-        d.versions[12] += 1;
         if slot == 0 {
             d.texture = new;
         } else {
             d.shaders.textures[slot] = new;
         }
+        d.touch(12);
     }
     if let Some(id) = old
         && let Some(Some(dead)) = com(env).release_internal(&mut env.sys.objects, id)

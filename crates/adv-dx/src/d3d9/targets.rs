@@ -167,9 +167,9 @@ fn set(env: &mut Env<'_>, this: GuestPtr<()>, index: u32, surface: GuestPtr<()>)
     }
     if let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, device_id) {
         d.render_target = Some(new);
-        d.versions[3] += 1;
-        d.versions[4] += 1;
         d.fixed.target_changed(width, height);
+        d.touch(3);
+        d.touch(4);
     }
     if old != Some(new) {
         release_binding(env, old);

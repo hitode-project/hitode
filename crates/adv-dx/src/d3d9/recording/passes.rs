@@ -3,7 +3,7 @@
 use super::*;
 use std::collections::HashSet;
 
-struct Effects {
+pub(super) struct Effects {
     pass: u128,
     barrier: bool,
     clear: bool,
@@ -13,7 +13,7 @@ struct Effects {
 }
 #[derive(Default)]
 pub(super) struct Plan {
-    effects: Vec<Effects>,
+    effects: Vec<Arc<Effects>>,
     skipped: Vec<bool>,
     clear_masks: Vec<u8>,
     covered: HashSet<Content>,
@@ -25,15 +25,20 @@ impl Plan {
         reads: Vec<Content>,
         writes: Vec<(Content, bool)>,
         bounds: adv_device::surface::Rect,
-    ) {
-        self.effects.push(Effects {
-            pass: damage::image(operation).map_or(0, |i| hash(i.view())),
+    ) -> Arc<Effects> {
+        let effect = Arc::new(Effects {
+            pass: hash(writes.first().map(|(k, _)| (k.0, k.1))),
             barrier: matches!(operation, Operation::Upload { .. }),
             clear: matches!(operation, Operation::Clear { .. }),
             draw_bounds: matches!(operation, Operation::Draw(_)).then_some(bounds),
             reads,
             writes,
         });
+        self.effects.push(effect.clone());
+        effect
+    }
+    pub fn replay(&mut self, effect: Arc<Effects>) {
+        self.effects.push(effect);
     }
     #[cfg(feature = "d3d9-counters")]
     pub fn bytes(reads: usize, writes: usize) -> usize {
@@ -210,7 +215,7 @@ mod tests {
             ),
         ] {
             let mut plan = Plan {
-                effects,
+                effects: effects.into_iter().map(Arc::new).collect(),
                 ..Default::default()
             };
             plan.plan();
@@ -228,9 +233,9 @@ mod tests {
         };
         let mut plan = Plan {
             effects: vec![
-                clear(vec![(a, true), (depth, true)]),
-                effect(1, vec![], vec![(a, false)], false),
-                clear(vec![(depth, true)]),
+                Arc::new(clear(vec![(a, true), (depth, true)])),
+                Arc::new(effect(1, vec![], vec![(a, false)], false)),
+                Arc::new(clear(vec![(depth, true)])),
             ],
             ..Default::default()
         };
