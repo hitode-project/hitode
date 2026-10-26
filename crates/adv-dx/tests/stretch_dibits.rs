@@ -224,7 +224,9 @@ fn borrowed_pixels_are_not_owned_or_copied_to_a_scratch_surface() {
         &f.memory.bytes[BITS as usize..BITS as usize + bits.len()],
         bits
     );
-    assert_eq!(f.surfaces.presenter.frames, 3);
+    // Identical repeats publish nothing new.
+    assert_eq!(f.surfaces.presenter.frames, 1);
+    assert_eq!(f.surfaces.stats.empty_damage, 2);
 }
 
 #[test]
