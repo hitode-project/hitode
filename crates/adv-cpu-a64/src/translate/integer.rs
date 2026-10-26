@@ -44,7 +44,9 @@ pub enum Integer {
     Xadd(Src, u8),
     /// `xchg dst, src`.
     Xchg(Src, u8),
+    CompareExchange(Src, u8, u8),
     CompareExchange8(Mem, u8),
+    Cbw,
     Bswap(u8),
     /// `mul` or `imul` (true) of EAX into EDX:EAX.
     Multiply(Src, bool),
@@ -92,8 +94,9 @@ impl Integer {
             }
             Integer::Xadd(dst, _) => (F::NONE, F::ALL, mem(dst)),
             Integer::Xchg(dst, _) => (F::NONE, F::NONE, mem(dst)),
+            Integer::CompareExchange(dst, ..) => (F::NONE, F::ALL, mem(dst)),
             Integer::CompareExchange8(..) => (F::NONE, F::ZF, true),
-            Integer::Bswap(_) => (F::NONE, F::NONE, false),
+            Integer::Bswap(_) | Integer::Cbw => (F::NONE, F::NONE, false),
             Integer::Multiply(src, _) => (F::NONE, F::CF.or(F::OF), mem(src)),
             // The helper reads every flag.
             Integer::Divide(..) => (F::NONE, F::NONE, true),
@@ -123,7 +126,7 @@ pub fn plan(instruction: &Instruction, helper: u8) -> Option<Integer> {
     let mnemonic = instruction.mnemonic();
     // Locked exchanges are ordinary ones: guest threads take turns.
     if instruction.has_lock_prefix()
-        && !(matches!(mnemonic, M::Xadd | M::Xchg | M::Cmpxchg8b)
+        && !(matches!(mnemonic, M::Xadd | M::Xchg | M::Cmpxchg | M::Cmpxchg8b)
             && instruction.op_kind(0) == OpKind::Memory)
     {
         return None;
@@ -154,6 +157,7 @@ pub fn plan(instruction: &Instruction, helper: u8) -> Option<Integer> {
         }
     }
     Some(match mnemonic {
+        M::Cbw => Integer::Cbw,
         M::Shl | M::Sal | M::Shr | M::Sar | M::Rol | M::Ror
             if instruction.op_kind(1) == OpKind::Register
                 && instruction.op_register(1) == Register::CL =>
@@ -208,6 +212,7 @@ pub fn plan(instruction: &Instruction, helper: u8) -> Option<Integer> {
         }
         M::Xadd => Integer::Xadd(operand(0)?, register(1)?),
         M::Xchg => Integer::Xchg(operand(0)?, register(1)?),
+        M::Cmpxchg => Integer::CompareExchange(operand(0)?, register(1)?, helper),
         M::Bswap => Integer::Bswap(register(0)?),
         M::Mul | M::Imul if instruction.op_count() == 1 => {
             Integer::Multiply(operand(0)?, mnemonic == M::Imul)
@@ -245,7 +250,12 @@ impl Translator<'_> {
             Integer::Through(left, dst, count) => self.through(left, dst, count),
             Integer::Xadd(dst, src) => self.xadd(dst, src),
             Integer::Xchg(dst, src) => self.xchg(dst, src),
+            Integer::CompareExchange(dst, src, helper) => self.compare_exchange(dst, src, helper),
             Integer::CompareExchange8(mem, helper) => self.compare_exchange8(mem, helper),
+            Integer::Cbw => {
+                self.clobber(Operand::Guest(EAX));
+                self.emit_all(&[sbfx(W, X13, host(EAX), 0, 8), bfi(W, host(EAX), X13, 0, 16)]);
+            }
             Integer::Bswap(index) => {
                 self.clobber(Operand::Guest(index));
                 self.emit(rev(W, host(index), host(index)));
@@ -262,6 +272,72 @@ impl Translator<'_> {
                 self.state.derivable = None;
             }
         }
+    }
+
+    fn compare_exchange(&mut self, dst: Src, src: u8, helper: u8) {
+        self.flush_simd();
+        self.canonicalize();
+        let slow = self.asm.label();
+        let done = self.asm.label();
+        match dst {
+            Src::Reg(index) => self.emit(mov(W, X6, host(index))),
+            Src::Mem(mem) => {
+                let address = self.effective(mem);
+                self.emit_all(&[mov(W, X17, address), and_imm(W, X13, X17, 3)]);
+                self.asm.cbz(W, true, X13, slow);
+                let load = ldr_reg(W, X6, super::WINDOW, X17, false);
+                if self.checking {
+                    self.checked_memory(X17, 4, false, load, slow);
+                } else {
+                    self.site();
+                    self.emit(load);
+                }
+            }
+            Src::Imm(_) => unreachable!(),
+        }
+        self.emit_all(&[mov(W, X15, host(EAX)), eor(W, X13, X15, X6, Lsl, 0)]);
+        let unequal = self.asm.label();
+        let flags = self.asm.label();
+        self.asm.cbz(W, true, X13, unequal);
+        match dst {
+            Src::Reg(index) => self.emit(mov(W, host(index), host(src))),
+            Src::Mem(_) => {
+                let store = str_reg(W, host(src), super::WINDOW, X17, false);
+                if self.checking {
+                    self.checked_memory(X17, 4, true, store, slow);
+                } else {
+                    self.site();
+                    self.emit(store);
+                }
+            }
+            Src::Imm(_) => unreachable!(),
+        }
+        self.asm.b(flags);
+        self.asm.bind(unequal);
+        if matches!(dst, Src::Mem(_)) {
+            // A mismatch still writes: read-only destinations must fault before
+            // changing either EAX or the comparison flags.
+            let store = str_reg(W, X6, super::WINDOW, X17, false);
+            if self.checking {
+                self.checked_memory(X17, 4, true, store, slow);
+            } else {
+                self.site();
+                self.emit(store);
+            }
+        }
+        self.emit(mov(W, host(EAX), X6));
+        self.asm.bind(flags);
+        self.emit_all(&[
+            subs(W, X14, X15, X6, Lsl, 0),
+            mov(W, X10, X14),
+            eor(W, X11, X15, X6, Lsl, 0),
+            eor(W, X11, X11, X14, Lsl, 0),
+        ]);
+        self.asm.b(done);
+        self.asm.bind(slow);
+        self.helper(helper);
+        self.asm.bind(done);
+        self.state = State::CANONICAL;
     }
 
     fn compare_exchange8(&mut self, mem: Mem, helper: u8) {

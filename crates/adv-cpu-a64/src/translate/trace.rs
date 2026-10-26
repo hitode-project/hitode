@@ -200,7 +200,7 @@ impl Trace {
                 break;
             };
             let next_pc = pc.wrapping_add(size);
-            weight += if matches!(op, Op::X87(_)) {
+            weight += if matches!(op, Op::X87(_) | Op::Fild64(..)) {
                 X87_WEIGHT
             } else {
                 1

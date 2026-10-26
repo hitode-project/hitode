@@ -130,6 +130,8 @@ pub enum Op {
     Integer(super::integer::Integer),
     /// An x87 instruction `fast::classify` accepts.
     X87(super::x87::X87),
+    /// An exact signed 64-bit integer load into the extended x87 stack.
+    Fild64(Mem, u8, Option<u16>),
     /// Anything else the interpreter runs without transferring control:
     /// the `interpret` stub runs it, by its index in the trace's helpers.
     Helper(u8),
@@ -868,6 +870,12 @@ impl<'m> Fetcher<'m> {
             Op::Strings(strings)
         } else if let Some(integer) = super::integer::plan(&instruction, index) {
             Op::Integer(integer)
+        } else if instruction.code() == iced_x86::Code::Fild_m64int {
+            Op::Fild64(
+                memory(&instruction)?,
+                index,
+                helpers.last().and_then(|h| h.prepared.x87_opcode()),
+            )
         } else if let Some(x87) = super::x87::plan(
             &instruction,
             index,
@@ -922,7 +930,7 @@ impl Op {
             }
             Op::Strings(_) => (F::NONE, F::NONE, true),
             // The helper may run it.
-            Op::X87(_) => (F::NONE, F::NONE, true),
+            Op::X87(_) | Op::Fild64(..) => (F::NONE, F::NONE, true),
             Op::Integer(integer) => integer.effects(),
             Op::Mov(dst, src) => (F::NONE, F::NONE, mem(dst) || mem(src)),
             Op::Alu(_, dst, src) => (F::NONE, F::ALL, mem(dst) || mem(src)),

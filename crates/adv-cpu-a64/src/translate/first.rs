@@ -299,7 +299,8 @@ fn step(op: Op, next: u32, cpu: &mut CpuState, memory: &Memory) -> Option<bool> 
         | Op::Simd(_)
         | Op::Strings(_)
         | Op::Integer(_)
-        | Op::X87(_) => {
+        | Op::X87(_)
+        | Op::Fild64(..) => {
             return None;
         }
         Op::Mov(dst, src) => {

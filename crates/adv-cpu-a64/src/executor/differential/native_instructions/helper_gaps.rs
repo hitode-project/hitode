@@ -1,5 +1,125 @@
 use super::*;
 
+// spec: A64-ISA-5, A64-FLAG-4, A64-MEM-5, A64-MEM-7, A64-VER-1
+#[test]
+fn cmpxchg32_preserves_aliases_flags_and_faults_with_checked_memory() {
+    for form in 0..6 {
+        for value in [0u32, 0x7fffffff, 0x80000000, 0xffffffff] {
+            for equal in [false, true] {
+                let mut p = fixture(|a| {
+                    a.add(edi, ebx).unwrap();
+                    match form {
+                        0 => a.cmpxchg(edx, ecx),
+                        1 => a.cmpxchg(eax, ecx),
+                        2 => a.cmpxchg(edx, eax),
+                        3 => a.cmpxchg(edx, edx),
+                        4 => a.cmpxchg(dword_ptr(esi), ecx),
+                        _ => a.lock().cmpxchg(dword_ptr(esi), ecx),
+                    }
+                    .unwrap();
+                    a.adc(edi, 0).unwrap();
+                });
+                p.state.regs[0] = if equal { value } else { value ^ 0x80000000 };
+                p.state.regs[2] = value;
+                p.data[..4].copy_from_slice(&value.to_le_bytes());
+                for config in configs() {
+                    for budget in [1, 2, 100] {
+                        check(&p, config, budget, form < 4 || config.2 != Checks::Slow);
+                    }
+                    if form >= 4 {
+                        for offset in [0, 1, 4094] {
+                            let mut p = Program {
+                                code: p.code.clone(),
+                                stop: p.stop,
+                                data: p.data.clone(),
+                                state: p.state.clone(),
+                            };
+                            p.state.regs[6] = DATA + offset;
+                            p.data[offset as usize..offset as usize + 4]
+                                .copy_from_slice(&value.to_le_bytes());
+                            let mut native = executor(&p, config, false);
+                            let mut oracle = executor(&p, config, true);
+                            let page = (DATA + offset + 3) & !4095;
+                            native.protect(page, 4096, adv_cpu_core::READ).unwrap();
+                            oracle.protect(page, 4096, adv_cpu_core::READ).unwrap();
+                            assert_eq!(
+                                native.run(p.stop, 100).unwrap(),
+                                oracle.run(p.stop, 100).unwrap()
+                            );
+                            same(&native, &oracle);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// spec: A64F-FP-1, A64F-FP-2, A64F-FP-3, A64-MEM-7, A64-VER-1
+#[test]
+fn fild64_loads_all_integer_bits_and_preserves_fault_and_exception_order() {
+    for value in [
+        0i64,
+        1,
+        -1,
+        (1 << 53) - 1,
+        (1 << 53) + 1,
+        -(1 << 53) - 1,
+        i64::MIN,
+        i64::MAX,
+    ] {
+        let mut p = fixture(|a| {
+            a.add(eax, ecx).unwrap();
+            a.fild(qword_ptr(ebx)).unwrap();
+        });
+        p.data[..8].copy_from_slice(&value.to_le_bytes());
+        for control in [0x007f, 0x027f, 0x037f, 0x077f, 0x0b7f, 0x0f7f] {
+            p.state.x87.control = control;
+            for config in configs() {
+                for budget in [1, 2, 100] {
+                    check(&p, config, budget, config.2 != Checks::Slow);
+                }
+            }
+        }
+    }
+    for scenario in 0..4 {
+        let mut p = fixture(|a| {
+            a.nop().unwrap();
+            a.fild(qword_ptr(ebx)).unwrap();
+        });
+        match scenario {
+            0 => p.state.x87.tag = 0,
+            1 => {
+                p.state.x87.status = 0x8081;
+                p.state.x87.control &= !1;
+            }
+            2 => p.state.mmx_mode = 1,
+            _ => p.state.regs[3] = DATA + DATA_LEN as u32 - 4,
+        }
+        for config in configs() {
+            check(&p, config, 100, false);
+        }
+    }
+}
+
+// spec: A64-REG-3, A64-FLAG-4, A64-VER-1
+#[test]
+fn cbw_keeps_the_upper_accumulator_and_arithmetic_flags() {
+    for value in [0u32, 0x7f, 0x80, 0xff] {
+        let mut p = fixture(|a| {
+            a.add(edi, ebx).unwrap();
+            a.cbw().unwrap();
+            a.adc(edi, 0).unwrap();
+        });
+        p.state.regs[0] = 0xabcd1200 | value;
+        for config in configs() {
+            for budget in [1, 2, 3, 100] {
+                check(&p, config, budget, true);
+            }
+        }
+    }
+}
+
 // spec: A64-MEM-2, A64-MEM-4, A64-MEM-7, A64-MEM-8, A64F-FP-4, A64-VER-1
 #[test]
 fn checked_simd_moves_use_ordinary_aliases_and_follow_permission_changes() {
