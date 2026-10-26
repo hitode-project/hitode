@@ -170,6 +170,14 @@ impl Device {
     fn refresh_all(&mut self) {
         self.fingerprints = std::array::from_fn(|class| self.class_key(class));
     }
+    /// Refreshes only the classes in `dirty`, one bit per class.
+    fn refresh(&mut self, dirty: u32) {
+        for class in 0..self.fingerprints.len() {
+            if dirty & (1 << class) != 0 {
+                self.fingerprints[class] = self.class_key(class);
+            }
+        }
+    }
 }
 
 pub struct State {

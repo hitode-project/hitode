@@ -833,7 +833,7 @@ pub(in crate::d3d9) fn apply(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
             *v = v.checked_add(1).expect("state version exhausted");
         }
     }
-    d.refresh_all();
+    d.refresh(u32::from(mask.dirty));
     let fingerprints = d.fingerprints;
     let Some(Payload::StateBlock(b)) =
         com(env).get_mut::<Payload>(&mut env.sys.objects, this.addr())
