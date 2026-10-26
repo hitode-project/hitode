@@ -1249,8 +1249,8 @@ impl Session {
 
     /// Read the guest's windows again for the native views below.
     pub fn refresh_ui(&mut self) {
-        project::refresh(&mut self.machine.ext);
-        let _ = self.poke();
+        let queued = project::refresh(&mut self.machine.ext);
+        self.queued(queued);
     }
 
     pub fn dialogs(&self) -> crate::DialogSet {

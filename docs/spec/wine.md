@@ -626,6 +626,7 @@ Process startup MUST register the prefix's drive letters in the server namespace
 ### WINE-SES-2 Host wakes
 
 **Rule**: While every guest context waits, a session MUST serve finished host work before it blocks. A host wake MUST end the block. The run loop MUST take the wake's interrupt before it drains host work.
+UI projection refreshes MUST wake execution only when they queue new guest work.
 **Verification**: Test
 
 ### WINE-SES-3 Provisioned prefix

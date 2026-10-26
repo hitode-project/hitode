@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use adv_runtime::wine::session::{Config, Session, Stop};
 
-// spec: WINE-SES-10, WINE-SES-8, WINE-SES-3, WINE-SES-1, WINE-DLL-3
+// spec: WINE-SES-10, WINE-SES-8, WINE-SES-3, WINE-SES-1, WINE-DLL-3, WINE-SES-2
 #[test]
 fn sequential_sessions_reclaim_clients_and_keep_the_prefix() {
     if std::env::var_os("ADV_WINE_DIST").is_none() || std::env::var_os("ADV_WINE_PROBES").is_none()
@@ -86,13 +86,9 @@ fn sequential_sessions_child() {
                 .families
                 .insert("HitodeLifetimeAlias".into(), "Arial".into());
         }
+        let wake = adv_sync::WakeEvent::new().unwrap();
         let mut session = host
-            .start(
-                &config,
-                adv_sync::WakeEvent::new().unwrap(),
-                &options,
-                |_| Ok(()),
-            )
+            .start(&config, wake.clone(), &options, |_| Ok(()))
             .unwrap();
         session
             .machine
@@ -157,6 +153,14 @@ fn sequential_sessions_child() {
         if turn == 1 {
             assert!(matches!(stop, Stop::Paused));
             session.set_suspended(true);
+            session.refresh_ui();
+            let generation = wake.generation();
+            session.refresh_ui();
+            assert_eq!(
+                wake.generation(),
+                generation,
+                "idle UI refresh woke execution"
+            );
             let paused = session.machine.sys.clock.now_us();
             std::thread::sleep(Duration::from_millis(5));
             assert_eq!(session.machine.sys.clock.now_us(), paused);

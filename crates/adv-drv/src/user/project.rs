@@ -186,8 +186,10 @@ fn info(ext: &Ext, hwnd: u32) -> Option<&Info> {
 }
 
 /// Read every guest thread's windows again, at most every [`REFRESH`].
-pub fn refresh(ext: &mut Ext) {
+/// Returns whether new guest work was queued.
+pub fn refresh(ext: &mut Ext) -> bool {
     let now = Instant::now();
+    let mut queued = false;
     let mut owners: HashMap<CtxId, u32> = HashMap::new();
     for (hwnd, context) in super::windows(ext) {
         owners.entry(context).or_insert(hwnd);
@@ -208,8 +210,10 @@ pub fn refresh(ext: &mut Ext) {
             Box::new(move |env, done| read(env, context, done)),
         ) {
             projection(ext).reading.insert(context);
+            queued = true;
         }
     }
+    queued
 }
 
 /// The dialogs on screen, as the host shows them natively.
