@@ -117,12 +117,14 @@ impl Com {
         id: ComIdentity<T>,
     ) -> Option<&'a ComObject<T>> {
         let object = objects.owned(id)?;
-        (self.identity::<T>(objects, object.canonical) == Some(id)).then_some(object)
+        objects
+            .aliases(self.namespace, object.canonical, id)
+            .then_some(object)
     }
 
     pub fn get<'a, T: Any>(&self, objects: &'a Objects, pointer: u32) -> Option<&'a T> {
-        let id = self.identity::<T>(objects, pointer)?;
-        Some(&objects.owned(id)?.value)
+        let (_, object) = objects.resolve_alias::<ComObject<T>>(self.namespace, pointer)?;
+        Some(&object.value)
     }
 
     pub fn get_mut<'a, T: Any>(&self, objects: &'a mut Objects, pointer: u32) -> Option<&'a mut T> {
