@@ -16,8 +16,8 @@
 //! source region prepaid but will not complete; only an edge that owes
 //! more checks the countdown.
 //!
-//! Flags (A64-FLAG-3): a backward liveness pass over the trace, with every exit,
-//! fault site and countdown check observing all flags.
+//! Flags (A64-FLAG-3): backward liveness tracks recovery observations
+//! separately from guest reads. Merges agree on the flags recovery needs.
 
 use adv_cpu_core::memory::Memory;
 
@@ -104,6 +104,10 @@ pub struct Trace {
     pub live_in: Vec<FlagSet>,
     /// Flags read after each instruction, on any path.
     pub live_out: Vec<FlagSet>,
+    /// Flags an observer may see before a rewrite, including cold paths.
+    pub observe_in: Vec<FlagSet>,
+    /// Flags an observer may see after the instruction.
+    pub observe_out: Vec<FlagSet>,
     frames: Vec<Frame>,
     /// Instruction index + 1 by (EIP, frame), open addressing.
     slots: Vec<u8>,
@@ -385,8 +389,12 @@ impl Trace {
         self.live_in.resize(len, FlagSet::NONE);
         self.live_out.clear();
         self.live_out.resize(len, FlagSet::NONE);
-        // Without a backward edge, one backward pass sees every successor.
-        while self.liveness() && backward {}
+        self.observe_in.clear();
+        self.observe_in.resize(len, FlagSet::NONE);
+        self.observe_out.clear();
+        self.observe_out.resize(len, FlagSet::NONE);
+        while self.liveness(true) && backward {}
+        while self.liveness(false) && backward {}
     }
 
     pub fn len(&self) -> usize {
@@ -419,42 +427,60 @@ impl Trace {
         i64::from(self.owed(to)) - i64::from(self.unused(from))
     }
 
-    fn edge_live(&self, from: usize, edge: Edge) -> FlagSet {
+    fn edge_live(&self, from: usize, edge: Edge, observe: bool) -> FlagSet {
         match edge {
-            // A check that refuses leaves with every flag.
-            Edge::Internal(to) if self.net(from, to) > 0 => FlagSet::ALL,
-            Edge::Internal(to) => self.live_in[to],
+            Edge::Internal(to) if observe && self.net(from, to) > 0 => FlagSet::ALL,
+            Edge::Internal(to) => {
+                if observe {
+                    self.observe_in[to]
+                } else {
+                    self.live_in[to]
+                }
+            }
             Edge::Exit(_) | Edge::Interpret(_) => FlagSet::ALL,
         }
     }
 
-    /// One backward pass; whether anything changed.
-    fn liveness(&mut self) -> bool {
+    /// Recovery observations constrain merges; recipes serve other sites.
+    fn liveness(&mut self, observe: bool) -> bool {
         let mut changed = false;
         for index in (0..self.len()).rev() {
             let inst = &self.insts[index];
             let mut out = match inst.next {
-                Next::Fall => self.live_in[index + 1],
-                Next::Edge(edge) => self.edge_live(index, edge),
+                Next::Fall => {
+                    if observe {
+                        self.observe_in[index + 1]
+                    } else {
+                        self.live_in[index + 1]
+                    }
+                }
+                Next::Edge(edge) => self.edge_live(index, edge, observe),
                 Next::Dynamic => FlagSet::ALL,
             };
-            if let Some(taken) = inst.taken {
-                out = out.or(self.edge_live(index, taken));
+            if let Some(taken) = inst.taken
+                && (observe || matches!(taken, Edge::Internal(_)))
+            {
+                out = out.or(self.edge_live(index, taken, observe));
             }
-            // The callee, and a mismatching return, see every flag.
             if inst.mode != Mode::Plain {
                 out = FlagSet::ALL;
             }
             let effects = inst.effects;
-            let live = if effects.site {
-                FlagSet::ALL
+            let mut live = effects.reads.or(out.minus(effects.writes));
+            if observe && effects.site {
+                live = FlagSet::ALL;
+            } else if !observe && self.merge[index] {
+                live = live.or(self.observe_in[index]);
+            }
+            let (ins, outs) = if observe {
+                (&mut self.observe_in, &mut self.observe_out)
             } else {
-                effects.reads.or(out.minus(effects.writes))
+                (&mut self.live_in, &mut self.live_out)
             };
-            if live != self.live_in[index] || out != self.live_out[index] {
+            if live != ins[index] || out != outs[index] {
                 changed = true;
-                self.live_in[index] = live;
-                self.live_out[index] = out;
+                ins[index] = live;
+                outs[index] = out;
             }
         }
         changed

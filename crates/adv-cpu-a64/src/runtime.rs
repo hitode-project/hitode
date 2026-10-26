@@ -184,12 +184,12 @@ pub struct Stubs {
     pub interpret: usize,
 }
 
-/// Indirect table entries; a guest EIP indexes them by bits 2 to 17.
+/// Indirect table entries; the slot folds high EIP bits into the low bits.
 pub const TABLE_LEN: usize = 1 << 16;
 
 /// The indirect table slot of `eip`.
 pub const fn table_slot(eip: u32) -> usize {
-    (eip as usize >> 2) & (TABLE_LEN - 1)
+    ((eip ^ (eip >> 16)) as usize) & (TABLE_LEN - 1)
 }
 
 /// Shadow entries above the top that never match, for `ret_miss` to read.

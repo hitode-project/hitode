@@ -1293,6 +1293,13 @@ fn recover(cpu: &mut CpuState, site: Site, temps: [u64; 2]) {
         Operand::Temp(index) => temps[usize::from(index)] as u32,
         Operand::Imm(value) => value,
     };
+    if let Some(result) = site.nz {
+        let result = value(result);
+        cpu.eflags = cpu.eflags & !0xc0 | u32::from(result == 0) << 6 | (result >> 24 & 0x80);
+    }
+    if let Some(overflow) = site.overflow.evaluate(value) {
+        cpu.eflags = cpu.eflags & !0x800 | u32::from(overflow) << 11;
+    }
     match site.carry.evaluate(value) {
         Some(cf) => cpu.eflags = cpu.eflags & !1 | u32::from(cf),
         None if site.sense == Sense::Addition => cpu.eflags ^= 1,
@@ -1340,6 +1347,8 @@ mod tests {
             refund: 0,
             sense: Sense::Subtraction,
             carry: Carry::Host,
+            nz: None,
+            overflow: translate::Overflow::Host,
             recipe: Recipe::Canonical,
             checked: false,
             simd_dirty: 0,
@@ -1526,6 +1535,8 @@ mod tests {
                 refund: 3,
                 sense: Sense::Addition,
                 carry: Carry::Host,
+                nz: None,
+                overflow: translate::Overflow::Host,
                 recipe: Recipe::AddResult(Operand::Guest(0), Operand::Imm(1)),
                 checked: false,
                 simd_dirty: 0,
@@ -1535,5 +1546,20 @@ mod tests {
         );
         assert_eq!(cpu.eip, 0x1234);
         assert_eq!(cpu.eflags, 0x202 | 0x10);
+    }
+    // spec: A64-CTL-6
+    #[test]
+    fn j1_indirect_slots_fold_high_bits_keep_low_bits_and_clear_on_discard() {
+        let (_, mut native) = native();
+        let targets = [0x1000, 0x1001, 0x41000];
+        install(&mut native, targets[0], ldr_reg(W, X19, X27, X19, false));
+        for (index, target) in targets.into_iter().enumerate() {
+            for other in &targets[..index] {
+                assert_ne!(runtime::table_slot(target), runtime::table_slot(*other));
+            }
+            native.table[runtime::table_slot(target)] = [u64::from(target), 42];
+        }
+        native.discard_switch_target(targets[0]);
+        assert!(native.table.iter().all(|entry| *entry == EMPTY));
     }
 }

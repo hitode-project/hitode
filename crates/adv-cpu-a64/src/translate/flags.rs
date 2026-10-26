@@ -1,6 +1,6 @@
 //! The x86 flags as the translator tracks them (A64-FLAG-1 to A64-FLAG-5).
 //!
-//! SF ZF OF always live in NZCV. CF lives in NZCV's C in a tracked carry
+//! SF ZF OF live in NZCV or recoverable result recipes. CF lives in NZCV's C in a tracked carry
 //! sense, or lazily as a `Carry` over values still in registers, which lets
 //! an `inc` or `dec` clobber C for free. PF and AF stay a `Recipe` over such
 //! values until something would overwrite them.
@@ -175,6 +175,37 @@ impl Recipe {
 
     pub fn uses(self, operand: Operand) -> bool {
         self.operands().contains(&Some(operand))
+    }
+}
+
+/// OF when NZCV does not hold it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Overflow {
+    Host,
+    Clear,
+    Bit(Operand, u8),
+    Xor(Operand, u8, u8),
+    Step(Operand, bool),
+}
+
+impl Overflow {
+    pub fn evaluate(self, value: impl Fn(Operand) -> u32) -> Option<bool> {
+        Some(match self {
+            Self::Host => return None,
+            Self::Clear => false,
+            Self::Bit(a, n) => value(a) >> n & 1 != 0,
+            Self::Xor(a, n, m) => (value(a) >> n ^ value(a) >> m) & 1 != 0,
+            Self::Step(a, increment) => {
+                value(a) == if increment { 0x8000_0000 } else { 0x7fff_ffff }
+            }
+        })
+    }
+
+    pub fn uses(self, operand: Operand) -> bool {
+        match self {
+            Self::Host | Self::Clear => false,
+            Self::Bit(a, _) | Self::Xor(a, _, _) | Self::Step(a, _) => a == operand,
+        }
     }
 }
 

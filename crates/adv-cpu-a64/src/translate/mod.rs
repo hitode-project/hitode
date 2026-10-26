@@ -6,14 +6,15 @@
 //! instructions in trace order, with side exits, edge trampolines and
 //! refusals after the body, and `ops` emits each instruction.
 //!
-//! Flags follow A64-FLAG-1 to A64-FLAG-5. SF ZF OF live in NZCV. CF lives in NZCV's C in a
+//! Flags follow A64-FLAG-1 to A64-FLAG-5. SF ZF OF live in NZCV or recipes.
+//! CF lives in NZCV's C in a
 //! tracked carry sense, or lazily as a `Carry` over values still in
 //! registers; while C holds it, a `derivable` expression may still compute
 //! it, so an `inc` or `dec` that keeps CF can let C go. PF and AF stay a
 //! recipe over such values until something would overwrite them. Flags no
 //! path reads before writing them again are not computed. Every exit makes
 //! the flags canonical, an internal edge only those its target reads, and
-//! every fault site records sense, carry, recipe and the SIMD dirty mask for
+//! every fault site records sense, carry, flag recipes and the SIMD dirty mask for
 //! the owner. MMX values are published before control edges and observers
 //! (A64F-FP-4), except integer pixel-loop backedges (A64-TR-5). XMM writes
 //! remain immediate outside those loops.
@@ -57,6 +58,7 @@ mod x87;
 use iced_x86::ConditionCode;
 
 pub use decode::Helper;
+pub(crate) use flags::Overflow;
 pub use flags::{Carry, Operand, Recipe, Sense};
 pub use trace::MAX_INSTRUCTIONS;
 
@@ -91,6 +93,10 @@ pub struct Site {
     pub sense: Sense,
     pub carry: Carry,
     pub recipe: Recipe,
+    /// A pending result supplies SF and ZF; otherwise NZCV holds them.
+    pub(crate) nz: Option<Operand>,
+    /// OF as hardware V or a recipe over recoverable operands.
+    pub(crate) overflow: Overflow,
     /// Whether the access checks its page first, so a fault here is not
     /// a reason to check it.
     pub checked: bool,
@@ -289,6 +295,8 @@ struct State {
     /// CF as an expression over live values, while C also holds it.
     derivable: Option<Carry>,
     recipe: Recipe,
+    nz: Option<Operand>,
+    overflow: Overflow,
 }
 
 impl State {
@@ -298,6 +306,8 @@ impl State {
         carry: Carry::Host,
         derivable: None,
         recipe: Recipe::Canonical,
+        nz: None,
+        overflow: Overflow::Host,
     };
 }
 
@@ -306,6 +316,7 @@ impl State {
 #[derive(Clone, Copy)]
 enum Test {
     Cond(Cond),
+    Zero(Reg, bool),
     /// PF set (true) or clear, from w16's bit 0.
     Parity(bool),
     EcxZero,
@@ -317,6 +328,8 @@ enum Test {
 
 /// Code emitted after the unit body.
 enum Cold {
+    /// A short branch from x87 arithmetic to its distant generic path.
+    X87Guard { label: Label, generic: Label },
     Table {
         index: usize,
         table: Label,
@@ -620,9 +633,18 @@ impl Translator<'_> {
         self.checking = (self.checked)(inst.pc);
         if self.checking && inst.effects.site {
             self.vector.fp_default = false;
+            self.vector.fp_pe = false;
         }
-        self.out = trace.live_out[index];
-        self.keep = self.out.minus(inst.effects.writes);
+        self.out = trace.observe_out[index];
+        self.keep = trace.observe_out[index].minus(inst.effects.writes);
+        // Other flag writers use their existing exact hardware forms.
+        if !matches!(
+            inst.op,
+            decode::Op::Alu(..) | decode::Op::Step(..) | decode::Op::Shift(..)
+        ) && inst.effects.writes.any(FlagSet::NZV)
+        {
+            self.host_nzv(FlagSet::NZV.minus(inst.effects.writes));
+        }
         let steady = self.pixel.is_some_and(|p| p.steady);
         if self.x87.active && trace.merge[index] {
             self.x87_merge(index);
@@ -830,6 +852,10 @@ impl Translator<'_> {
                 ]);
                 Test::Parity(cc == Cc::Flags(ConditionCode::p))
             }
+            Cc::Flags(cc @ (ConditionCode::e | ConditionCode::ne)) if self.state.nz.is_some() => {
+                let value = self.narrow(self.state.nz.unwrap());
+                Test::Zero(value, cc == ConditionCode::ne)
+            }
             Cc::Flags(cc) => Test::Cond(self.condition(cc)),
             Cc::EcxZero => Test::EcxZero,
             Cc::CxZero => {
@@ -855,6 +881,7 @@ impl Translator<'_> {
     fn jump_if(&mut self, test: Test, label: Label) {
         match test {
             Test::Cond(cond) => self.asm.b_cond(cond, label),
+            Test::Zero(reg, nonzero) => self.asm.cbz(W, nonzero, reg, label),
             Test::Parity(set) => self.asm.tbz(!set, X16, 0, label),
             Test::EcxZero => self.asm.cbz(W, false, host(1), label),
             Test::CxZero => self.asm.cbz(W, false, X16, label),
@@ -878,6 +905,8 @@ impl Translator<'_> {
                 sense: self.state.sense,
                 carry: self.state.carry,
                 recipe: self.state.recipe,
+                nz: self.state.nz,
+                overflow: self.state.overflow,
                 checked: self.checking,
                 simd_dirty: self.vector.dirty,
                 resume: 0,
@@ -891,10 +920,13 @@ impl Translator<'_> {
         let state = self.state;
         flags.any(FlagSet::CF) && (state.carry != Carry::Host || state.sense != Sense::Subtraction)
             || flags.any(FlagSet::PF.or(FlagSet::AF)) && state.recipe != Recipe::Canonical
+            || flags.any(FlagSet::ZF.or(FlagSet::SF)) && state.nz.is_some()
+            || flags.any(FlagSet::OF) && state.overflow != Overflow::Host
     }
 
     /// Puts `flags` in canonical form; the others keep their form.
     fn convert(&mut self, flags: FlagSet) {
+        self.host_nzv(flags);
         if flags.any(FlagSet::CF) {
             self.host_carry();
             self.set_sense(Sense::Subtraction);
@@ -913,11 +945,19 @@ impl Translator<'_> {
         self.state.carry = Carry::Host;
         self.state.derivable = None;
         self.state.recipe = Recipe::Canonical;
+        self.state.nz = None;
+        self.state.overflow = Overflow::Host;
     }
 
     /// Called before an instruction writes `operand`: keeps what the flags
     /// still need from it. `forget` must follow the write.
     fn prepare(&mut self, operand: Operand) {
+        if self.state.nz == Some(operand) && self.keep.any(FlagSet::SF.or(FlagSet::ZF)) {
+            self.host_nzv(FlagSet::ZF.or(FlagSet::SF));
+        }
+        if self.state.overflow.uses(operand) && self.keep.any(FlagSet::OF) {
+            self.host_nzv(FlagSet::OF);
+        }
         if self.state.recipe.uses(operand) && self.keep.any(FlagSet::PF.or(FlagSet::AF)) {
             self.materialize();
         }
@@ -929,6 +969,12 @@ impl Translator<'_> {
     /// After `operand` changed: drops what still reads it, all dead.
     fn forget(&mut self, operand: Operand) {
         let state = &mut self.state;
+        if state.nz == Some(operand) {
+            state.nz = None;
+        }
+        if state.overflow.uses(operand) {
+            state.overflow = Overflow::Host;
+        }
         if state.recipe.uses(operand) {
             state.recipe = Recipe::Canonical;
         }
@@ -949,12 +995,54 @@ impl Translator<'_> {
     /// A recipe temporary neither the recipe nor a lazy carry reads.
     fn take_temp(&mut self) -> u8 {
         let free = |state: &State, t: u8| {
-            !state.recipe.uses(Operand::Temp(t)) && !state.carry.uses(Operand::Temp(t))
+            !state.recipe.uses(Operand::Temp(t))
+                && !state.carry.uses(Operand::Temp(t))
+                && state.nz != Some(Operand::Temp(t))
+                && !state.overflow.uses(Operand::Temp(t))
         };
         if !free(&self.state, 0) && !free(&self.state, 1) {
-            self.host_carry();
+            self.canonicalize();
         }
         if free(&self.state, 0) { 0 } else { 1 }
+    }
+
+    /// Restores pending N/Z/V without changing C or the other flag sources.
+    fn host_nzv(&mut self, flags: FlagSet) {
+        if flags.any(FlagSet::ZF.or(FlagSet::SF))
+            && let Some(result) = self.state.nz.take()
+        {
+            let result = self.narrow(result);
+            self.emit_all(&[
+                mrs_nzcv(X13),
+                ubfx(W, X14, result, 31, 1),
+                bfi(X, X13, X14, 31, 1),
+                clz(W, X14, result),
+                lsr_imm(W, X14, X14, 5),
+                bfi(X, X13, X14, 30, 1),
+                msr_nzcv(X13),
+            ]);
+        }
+        if !flags.any(FlagSet::OF) {
+            return;
+        }
+        let overflow = std::mem::replace(&mut self.state.overflow, Overflow::Host);
+        let (reg, bit) = match overflow {
+            Overflow::Host => return,
+            Overflow::Clear => (Reg::ZR, 0),
+            Overflow::Bit(a, n) => (self.narrow(a), u32::from(n)),
+            Overflow::Xor(a, n, m) => {
+                let a = self.narrow(a);
+                self.emit(eor(W, X17, a, a, Shift::Lsr, u32::from(n - m)));
+                (X17, u32::from(m))
+            }
+            Overflow::Step(a, increment) => {
+                let a = self.narrow(a);
+                let expected = self.imm(if increment { 0x8000_0000 } else { 0x7fff_ffff }, X14);
+                self.emit_all(&[eor(W, X17, a, expected, Lsl, 0), clz(W, X17, X17)]);
+                (X17, 5)
+            }
+        };
+        self.insert_flags(None, Some((reg, bit)));
     }
 
     /// Makes x10 and x11 canonical for the current recipe; uses w17.
@@ -1100,7 +1188,7 @@ impl Translator<'_> {
             sense: Sense::Addition,
             carry: Carry::Host,
             derivable: Some(carry),
-            recipe: self.state.recipe,
+            ..self.state
         };
     }
 
@@ -1144,6 +1232,7 @@ impl Translator<'_> {
     /// flipping to subtraction sense where no single condition reads it.
     fn condition(&mut self, cc: ConditionCode) -> Cond {
         use ConditionCode as C;
+        self.host_nzv(FlagSet::of(cc));
         if FlagSet::of(cc).any(FlagSet::CF) {
             self.host_carry();
         }
@@ -1248,6 +1337,10 @@ impl Translator<'_> {
 
     fn cold(&mut self, cold: Cold, at: usize) {
         match cold {
+            Cold::X87Guard { label, generic } => {
+                self.asm.bind(label);
+                self.asm.b(generic);
+            }
             Cold::Table { index, table, stub } => self.table_cold(index, table, stub, at),
             Cold::Leave {
                 label,

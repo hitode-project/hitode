@@ -9,7 +9,7 @@
 //!
 //! Arithmetic runs natively under the control word the guest had when the
 //! unit was translated, if it masks every exception, rounds to nearest and
-//! has precision 24, 53 or 64; each instruction checks the control word is
+//! has precision 24, 53 or 64; a run checks the control word is
 //! still that one. Precision 53 takes narrow operands and rounds once in
 //! binary64. Precision 24 also needs single-exact operands, then rounds
 //! that double's significand to 24 bits in integers, keeping the extended
@@ -130,6 +130,7 @@ impl Translator<'_> {
                 }
                 let done = self.x87_body(x, bail);
                 if x.fast == Fast::LoadControl {
+                    self.x87.guarded = false;
                     self.emit(mov(W, X8, X0));
                 }
                 return (done.0, done.1, None);
@@ -318,8 +319,10 @@ impl Translator<'_> {
         }
     }
 
-    /// Branches to `to` unless the control word is the one translated for.
-    fn pair_guard(&mut self, to: Label) {
+    /// Caches whether w8's control word matches in its unused bit 16.
+    /// Generic arithmetic reloads w8 and refreshes the bit before rejoining.
+    pub(super) fn pair_control(&mut self) {
+        self.x87.guarded = true;
         let control = u32::from(self.control);
         if control >> 12 != 0 {
             self.emit(sub_imm(W, X16, X8, control >> 12, true));
@@ -327,7 +330,20 @@ impl Translator<'_> {
         } else {
             self.emit(sub_imm(W, X16, X8, control, false));
         }
-        self.asm.cbz(W, true, X16, to);
+        self.emit_all(&[
+            clz(W, X16, X16),
+            lsr_imm(W, X16, X16, 5),
+            bfi(W, X8, X16, 16, 1),
+        ]);
+    }
+
+    fn pair_guard(&mut self, to: Label) {
+        if !self.x87.guarded {
+            self.pair_control();
+        }
+        let label = self.asm.label();
+        self.asm.tbz(false, X8, 16, label);
+        self.push_cold(super::super::Cold::X87Guard { label, generic: to });
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -757,6 +773,7 @@ impl Translator<'_> {
         self.wide_ops(g.op, g.reverse, bail);
         self.pair_from_extended(X0, X1, g.to, g.narrow, bail);
         self.emit(ldrh(X8, X5, runtime::X87_CONTROL));
+        self.pair_control();
         self.asm.b(g.join);
     }
 

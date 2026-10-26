@@ -624,6 +624,8 @@ impl Translator<'_> {
         self.insert_flags(Some(carry), overflow);
         self.emit(mov(W, source, X6));
         self.state = State {
+            nz: None,
+            overflow: super::Overflow::Host,
             sense: Sense::Addition,
             carry: Carry::Host,
             derivable: None,
@@ -671,6 +673,8 @@ impl Translator<'_> {
             Src::Imm(_) => unreachable!(),
         }
         self.state = State {
+            nz: None,
+            overflow: super::Overflow::Host,
             sense: Sense::Addition,
             carry: Carry::Host,
             derivable: None,
@@ -728,6 +732,7 @@ impl Translator<'_> {
         self.emit_all(&[mov(W, eax, X16), lsr_imm(X, edx, X16, 32)]);
         if flags {
             self.insert_flags(Some((X17, 6)), Some((X17, 6)));
+            self.state.overflow = super::Overflow::Host;
             self.state.sense = Sense::Addition;
             self.state.carry = Carry::Host;
             self.state.derivable = None;

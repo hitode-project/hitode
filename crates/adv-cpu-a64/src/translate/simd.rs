@@ -508,6 +508,8 @@ pub struct Vector {
     pub cpu: bool,
     /// MXCSR's control bits have passed the native SSE guard.
     pub fp_default: bool,
+    /// MXCSR PE is set on every path continuing inside this unit.
+    pub fp_pe: bool,
 }
 
 fn vmem(bytes: u8) -> VMem {
@@ -929,7 +931,8 @@ impl Translator<'_> {
         let bail = self.bail();
         let (slow, resume) = (self.asm.label(), self.asm.label());
         let inexact = simd.inexact();
-        if inexact || !self.vector.fp_default {
+        let first_pe = inexact && !self.vector.fp_pe;
+        if inexact && !self.vector.fp_pe || !self.vector.fp_default {
             self.emit(ldr(W, X13, X5, runtime::MXCSR));
         }
         // Masked exceptions, nearest, no DAZ or FTZ; flags may be set.
@@ -959,8 +962,9 @@ impl Translator<'_> {
             _ => [None, Some(s)],
         };
         let operands = Operands { s, inputs };
-        if inexact {
+        if inexact && !self.vector.fp_pe {
             self.asm.tbz(false, X13, 5, slow);
+            self.vector.fp_pe = true;
         }
         self.denormals(simd, operands, Some(slow));
         let tiny = self.floating_fast(simd, operands, slow);
@@ -980,6 +984,7 @@ impl Translator<'_> {
             self.clobber(Operand::Guest(index));
             self.emit(fmov_from_v(W, super::ops::result(index), V0));
             self.commit(index);
+            self.pe_ready(first_pe);
             return;
         }
         if matches!(simd.kind, Kind::FlagCompare(_)) {
@@ -1017,6 +1022,28 @@ impl Translator<'_> {
             _ => vmov(true, d, V0),
         });
         self.written(simd.dst);
+        self.pe_ready(first_pe);
+    }
+
+    /// An exact slow operation can leave PE clear; finish it, then leave
+    /// before entering code that assumes the sticky bit has been established.
+    fn pe_ready(&mut self, first: bool) {
+        if !first {
+            return;
+        }
+        let leave = self.asm.label();
+        self.emit(ldr(W, X13, X5, runtime::MXCSR));
+        self.asm.tbz(false, X13, 5, leave);
+        self.push_cold(Cold::Leave {
+            label: leave,
+            state: self.state,
+            simd_dirty: self.vector.dirty,
+            refund: self.trace.unused(self.index),
+            exit: crate::runtime::Exit::Dispatch,
+            eip: self.trace.insts[self.index].next_pc,
+            link: true,
+            x87: None,
+        });
     }
 
     /// The fast path of `floating` into v0 (and v2), with the checks around

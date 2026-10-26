@@ -144,7 +144,7 @@ fn bytecode_vm_dispatch_instruction_gate() {
     let branch = work.words().iter().position(|&w| w == br(X17)).unwrap();
     let target_load = work.sites().last().unwrap().0 / 4;
     let before = branch + 1 - target_load;
-    assert_eq!(before, 8, "guest target load through the hit-path br");
+    assert_eq!(before, 9, "guest target load through the hit-path br");
     // LDR (register), option 011: [x17, x19, lsl #3]. The existing
     // encoder's option 010 is UXTW; bit 13 selects the X-register form.
     let resolved = ldr_reg(X, X17, X17, host(0), true) | (1 << 13);
@@ -840,5 +840,155 @@ fn narrow_immediate_moves_keep_their_value_when_pf_and_af_materialize() {
                 assert_eq!(got, want, "part={part}, recipe={recipe}, flagm={flagm}");
             }
         }
+    }
+}
+
+fn j1_unit(code: &[u8]) -> Workspace {
+    let mut mem = memory(code, &[]);
+    let mut work = Workspace::default();
+    let at = HOST_CODE as usize;
+    translate(
+        &mut work,
+        &mut mem,
+        CODE,
+        &[CODE + code.len() as u32],
+        &|_| false,
+        0,
+        Features { flagm: false },
+        at,
+        Stubs {
+            leaf: at,
+            exit: at,
+            dispatch: at,
+            lookup: at,
+            lookup_slow: at,
+            ret_miss: at,
+            access: at,
+            interpret: at,
+            fault: at,
+        },
+        &|_, _| false,
+        &|_| None,
+        &|_, _| Vec::new(),
+        0x037f,
+    );
+    work
+}
+
+// spec: A64-FLAG-3, A64-FLAG-5, A64-CTL-7
+#[test]
+fn j1_hot_paths_omit_dead_logic_tests_and_loop_materialization() {
+    let code = bytes(|a| {
+        a.or(eax, ebx).unwrap();
+        a.mov(dword_ptr(edi), eax).unwrap();
+        a.add(ecx, 1).unwrap();
+    });
+    let work = j1_unit(&code);
+    assert!(
+        !work
+            .words()
+            .contains(&tst(W, host(0), host(0), Shift::Lsl, 0))
+    );
+    assert_eq!(work.sites()[0].1.nz, Some(Operand::Guest(0)));
+    let code = bytes(|a| {
+        a.or(eax, ebx).unwrap();
+        a.shl(eax, 3).unwrap();
+        a.mov(dword_ptr(edi), eax).unwrap();
+        a.add(ecx, 1).unwrap();
+    });
+    let work = j1_unit(&code);
+    assert!(!work.words().contains(&mov(W, X10, host(0))));
+    let code = bytes(|a| {
+        let mut top = a.create_label();
+        a.set_label(&mut top).unwrap();
+        a.dec(ecx).unwrap();
+        a.jnz(top).unwrap();
+    });
+    let work = j1_unit(&code);
+    let start = work.code.asm.position(work.code.labels[0]) / 4;
+    let end = work.code.asm.position(work.code.labels[1]) / 4;
+    assert_eq!(
+        &work.words()[start..end],
+        &[sub_imm(W, host(1), host(1), 1, false)]
+    );
+    assert!(
+        work.words()[end..]
+            .iter()
+            .any(|word| word & 0xff00_001f == cbz(W, true, host(1), 0))
+    );
+}
+
+// spec: A64F-FP-7
+#[test]
+fn j1_x87_run_admits_sahf_and_guards_once_until_control_changes() {
+    for change in [false, true] {
+        let code = bytes(|a| {
+            let mut done = a.create_label();
+            a.fld1().unwrap();
+            a.fld1().unwrap();
+            a.fadd_2(st0, st1).unwrap();
+            a.fadd_2(st0, st1).unwrap();
+            if change {
+                a.fldcw(word_ptr(ebx)).unwrap();
+            }
+            a.fadd_2(st0, st1).unwrap();
+            a.fcomp_2(st0, st1).unwrap();
+            a.fnstsw(ax).unwrap();
+            a.sahf().unwrap();
+            a.jb(done).unwrap();
+            a.fld1().unwrap();
+            a.set_label(&mut done).unwrap();
+            a.nop().unwrap();
+        });
+        let work = j1_unit(&code);
+        let hot_end = work
+            .code
+            .marks
+            .iter()
+            .find(|mark| mark.part == Part::Cold)
+            .unwrap()
+            .offset as usize
+            / 4;
+        let hot = &work.words()[..hot_end];
+        let guard = sub_imm(W, X16, temp(1), 0x037f, false);
+        assert_eq!(
+            hot.iter().filter(|&&word| word == guard).count(),
+            if change { 2 } else { 1 }
+        );
+        assert_eq!(
+            hot.iter()
+                .filter(|&&word| word == ldrh(X16, X5, runtime::X87_TAG))
+                .count(),
+            1
+        );
+    }
+}
+
+// spec: A64F-FP-5, A64-REG-5
+#[test]
+fn j1_sse_reuses_mxcsr_and_pe_checks_until_a_control_write() {
+    for control_write in [false, true] {
+        let code = bytes(|a| {
+            a.addss(xmm0, xmm1).unwrap();
+            if control_write {
+                a.ldmxcsr(dword_ptr(ebx)).unwrap();
+            }
+            a.mulss(xmm0, xmm1).unwrap();
+            a.subss(xmm0, xmm1).unwrap();
+        });
+        let work = j1_unit(&code);
+        let hot_end = work
+            .code
+            .marks
+            .iter()
+            .find(|mark| mark.part == Part::Cold)
+            .unwrap()
+            .offset as usize
+            / 4;
+        let loads = work.words()[..hot_end]
+            .iter()
+            .filter(|&&word| word == ldr(W, X13, X5, runtime::MXCSR))
+            .count();
+        assert_eq!(loads, if control_write { 4 } else { 2 });
     }
 }

@@ -1001,3 +1001,178 @@ fn sse_values_choose_between_the_fast_and_the_slow_path() {
         }
     }
 }
+
+// spec: A64-FLAG-2, A64-FLAG-3, A64-FLAG-4, A64-FLAG-5
+#[test]
+fn j1_fault_recipes_match_interpreter_before_dead_flag_rewrites() {
+    for form in 0..22 {
+        for value in [0, 0x7fff_ffff, 0x8000_0000, 0xffff_ffff] {
+            for overwrite in [false, true] {
+                let mut p = fixture(|a| {
+                    a.mov(edi, HOLE).unwrap();
+                    match form {
+                        0 => a.add(eax, edx),
+                        1 => a.sub(eax, edx),
+                        2 => a.or(eax, edx),
+                        3 => a.xor(eax, edx),
+                        4 => a.and(eax, edx),
+                        5 => a.shl(eax, 1),
+                        6 => a.shr(eax, 1),
+                        7 => a.sar(eax, 1),
+                        8 => a.shl(eax, 3),
+                        9 => a.shr(eax, 3),
+                        10 => a.sar(eax, 3),
+                        11 => a.inc(eax),
+                        12 => a.dec(eax),
+                        13 => a.add(al, dl),
+                        14 => a.sub(ax, dx),
+                        15 => a.or(al, dl),
+                        16 => a.xor(ax, dx),
+                        17 => a.and(ax, dx),
+                        18 => a.inc(al),
+                        19 => a.dec(ax),
+                        20 => a.shl(al, 1),
+                        _ => a.shr(ax, 3),
+                    }
+                    .unwrap();
+                    if overwrite {
+                        a.mov(eax, 0x1234).unwrap();
+                    }
+                    a.mov(dword_ptr(edi), eax).unwrap();
+                    a.add(ecx, 1).unwrap();
+                });
+                p.state.regs[0] = value;
+                for flagm in [false, true] {
+                    for checks in [Checks::Adaptive, Checks::All] {
+                        let config = (Features { flagm }, false, checks);
+                        let mut native = executor(&p, config, false);
+                        let mut oracle = executor(&p, config, true);
+                        assert_eq!(
+                            native.run(p.stop, 100).unwrap(),
+                            oracle.run(p.stop, 100).unwrap(),
+                            "form {form}"
+                        );
+                        same(&native, &oracle);
+                        assert!(native.stats.native_entries > 0);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// spec: A64-FLAG-1, A64-FLAG-2, A64-FLAG-3, A64-FLAG-5, A64-CTL-7
+#[test]
+fn j1_budget_refusals_and_conditional_exits_are_exact() {
+    for side_exit in [false, true] {
+        let p = fixture(|a| {
+            let mut top = a.create_label();
+            let mut done = a.create_label();
+            a.mov(ecx, 100).unwrap();
+            a.set_label(&mut top).unwrap();
+            a.dec(ecx).unwrap();
+            if side_exit {
+                a.jnz(done).unwrap();
+                a.add(eax, 1).unwrap();
+            } else {
+                a.jnz(top).unwrap();
+            }
+            a.set_label(&mut done).unwrap();
+        });
+        for flagm in [false, true] {
+            for budget in [3, 4, 5, 6, 13, 100, 250] {
+                let config = (Features { flagm }, false, Checks::Adaptive);
+                let mut native = executor(&p, config, false);
+                let mut oracle = executor(&p, config, true);
+                assert_eq!(
+                    native.run(p.stop, budget).unwrap(),
+                    oracle.run(p.stop, budget).unwrap()
+                );
+                same(&native, &oracle);
+            }
+        }
+    }
+}
+
+// spec: A64F-FP-3, A64F-FP-7, A64-FLAG-6
+#[test]
+fn j1_x87_sahf_and_control_changes_match_interpreter() {
+    for change in [false, true] {
+        let mut p = fixture(|a| {
+            let mut done = a.create_label();
+            a.fld1().unwrap();
+            a.fld1().unwrap();
+            a.fadd_2(st0, st1).unwrap();
+            a.fadd_2(st0, st1).unwrap();
+            if change {
+                a.fldcw(word_ptr(ebx)).unwrap();
+            }
+            a.fadd_2(st0, st1).unwrap();
+            a.fcomp_2(st0, st1).unwrap();
+            a.fnstsw(ax).unwrap();
+            a.sahf().unwrap();
+            a.jb(done).unwrap();
+            a.fld1().unwrap();
+            a.fadd_2(st0, st1).unwrap();
+            a.set_label(&mut done).unwrap();
+        });
+        p.data[..2].copy_from_slice(&0x037fu16.to_le_bytes());
+        for flagm in [false, true] {
+            let config = (Features { flagm }, false, Checks::Adaptive);
+            let mut native = executor(&p, config, false);
+            let mut oracle = executor(&p, config, true);
+            assert_eq!(
+                native.run(p.stop, 100).unwrap(),
+                oracle.run(p.stop, 100).unwrap()
+            );
+            same(&native, &oracle);
+            for (code, count) in native.interpreted_forms(2) {
+                assert!(count == 0 || !format!("{:?}", code.mnemonic()).starts_with('F'));
+            }
+        }
+    }
+}
+
+// spec: A64-FLAG-2, A64-FLAG-3, A64-FLAG-5
+#[test]
+fn j1_recipes_survive_partial_flag_writers_and_operand_reuse() {
+    for form in 0..10 {
+        for overflow in [false, true] {
+            let mut p = fixture(|a| {
+                a.mov(edi, HOLE).unwrap();
+                a.dec(eax).unwrap();
+                match form {
+                    0 => a.imul_2(ecx, edx),
+                    1 => a.mul(edx),
+                    2 => a.rol(edx, 1),
+                    3 => a.ror(edx, 3),
+                    4 => a.rcl(ecx, 1),
+                    5 => a.bsf(ecx, edx),
+                    6 => a.shl(edx, 3),
+                    7 => a.shr(edx, 1),
+                    8 => a.add(al, dl),
+                    _ => a.sahf(),
+                }
+                .unwrap();
+                // Reusing both recipe temporaries before a later fault must
+                // preserve all sources still needed by recovery.
+                a.mov(ax, dx).unwrap();
+                a.mov(eax, 7).unwrap();
+                a.mov(dword_ptr(edi), eax).unwrap();
+                a.add(ecx, 1).unwrap();
+            });
+            p.state.regs[0] = if overflow { 0x8000_0000 } else { 1 };
+            for flagm in [false, true] {
+                let config = (Features { flagm }, false, Checks::Adaptive);
+                let mut native = executor(&p, config, false);
+                let mut oracle = executor(&p, config, true);
+                assert_eq!(
+                    native.run(p.stop, 100).unwrap(),
+                    oracle.run(p.stop, 100).unwrap(),
+                    "form {form}"
+                );
+                same(&native, &oracle);
+            }
+        }
+    }
+}

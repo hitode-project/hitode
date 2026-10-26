@@ -383,6 +383,8 @@ pub(in super::super) struct Cold {
 #[derive(Default)]
 pub(in super::super) struct Cache {
     pub(in super::super) active: bool,
+    /// w8 bit 16 caches the specialization decision for its control word.
+    pub(super) guarded: bool,
     end: usize,
     pub(super) model: Model,
     /// The state before the instruction being emitted, its host registers
@@ -429,7 +431,8 @@ impl Translator<'_> {
         }
         let register = |src: Src| !matches!(src, Src::Mem(mem) if mem.fs);
         match inst.op {
-            Op::Nop
+            Op::Integer(super::super::integer::Integer::Sahf)
+            | Op::Nop
             | Op::Step(..)
             | Op::Neg(_)
             | Op::Not(_)
@@ -865,11 +868,26 @@ impl Translator<'_> {
     /// w13 from `CpuState`, w15 TOP at entry for a TOP `delta` past it,
     /// and w8.
     fn x87_reload(&mut self, delta: u8) {
+        self.x87.guarded = false;
         self.emit_all(&[
             ldrh(X13, X5, runtime::X87_STATUS),
             ldrh(X8, X5, runtime::X87_CONTROL),
             ubfx(W, X15, X13, 11, 3),
         ]);
+        if self.trace.insts[self.index..=self.x87.end]
+            .iter()
+            .any(|inst| {
+                matches!(
+                    inst.op,
+                    Op::X87(X87 {
+                        fast: Fast::Arith { .. },
+                        ..
+                    })
+                )
+            })
+        {
+            self.pair_control();
+        }
         if delta != 0 {
             self.emit_all(&[
                 sub_imm(W, X15, X15, u32::from(delta), false),
