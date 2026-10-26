@@ -615,6 +615,9 @@ pub fn map_image(env: &mut Env<'_>, mapping: u32) -> Result<View, Error> {
     if reply.header.error != 0 && reply.header.error != IMAGE_NOT_AT_BASE {
         return Err(reply.header.error.into());
     }
+    for (rva, size) in builtin_code(&file, &pe) {
+        env.sys.thunks.register_thunk_pages(base + rva, size);
+    }
     let headers = &file[..(pe.size_of_headers as usize).min(file.len())];
     crate::identity::note_image(env.ext, base, size, path.as_deref(), headers);
     crate::native::bind(env.cpu, env.sys, env.ext, base, &pe);
@@ -628,6 +631,17 @@ pub fn map_image(env: &mut Env<'_>, mapping: u32) -> Result<View, Error> {
         relocated: base != preferred,
         info,
     })
+}
+
+/// Code sections of a builtin image, as (RVA, size). They hold copied host
+/// entries (`push token; int`), which run as leaf calls only from registered
+/// code pages (A64-CTL-12).
+fn builtin_code<'a>(file: &[u8], pe: &'a Pe) -> impl Iterator<Item = (u32, u32)> + 'a {
+    let builtin = file.get(0x40..0x51) == Some(b"Wine builtin DLL\0");
+    pe.sections
+        .iter()
+        .filter(move |section| builtin && section.is_executable())
+        .map(|section| (section.virtual_address, section.mem_size()))
 }
 
 /// The host path of an open file, for finding a builtin image's Unix
@@ -798,4 +812,36 @@ pub fn unmap_view_ex(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         memory::preserve_view(env, base);
         Ok(())
     })())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use adv_pe::{scn, write::DllWriter};
+
+    #[test]
+    // spec: A64-CTL-12
+    fn builtin_images_register_only_their_code_sections() {
+        let mut writer = DllWriter::new("hostfront.dll", 0x1000_0000);
+        let code = writer
+            .section(
+                ".text",
+                vec![0xc3],
+                0x2000,
+                scn::CNT_CODE | scn::MEM_EXECUTE | scn::MEM_READ,
+            )
+            .unwrap();
+        writer
+            .section(".data", vec![0], 0x1000, scn::MEM_READ | scn::MEM_WRITE)
+            .unwrap();
+        let mut file = writer.finish().unwrap();
+        let pe = Pe::parse(&file).unwrap();
+        assert_eq!(builtin_code(&file, &pe).count(), 0);
+        file[0x40..0x51].copy_from_slice(b"Wine builtin DLL\0");
+        let pe = Pe::parse(&file).unwrap();
+        assert_eq!(
+            builtin_code(&file, &pe).collect::<Vec<_>>(),
+            [(code, 0x2000)]
+        );
+    }
 }
