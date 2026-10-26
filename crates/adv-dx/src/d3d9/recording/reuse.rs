@@ -22,6 +22,7 @@ pub(super) struct Entry {
     spans: fixed::CapturedSpans,
     pub saved: std::sync::OnceLock<Saved>,
 }
+#[derive(Clone)]
 pub(super) struct Saved {
     pub command: u128,
     pub damage: Arc<damage::Record>,
@@ -32,6 +33,16 @@ impl Cache {
     pub(super) fn invalidate(&mut self) {
         self.targets.clear();
         self.disabled = true;
+    }
+    /// Whether a retained entry still draws into `image`'s allocation.
+    #[cfg(test)]
+    pub(super) fn retains(&self, image: &adv_device::gpu::Image) -> bool {
+        self.targets.values().any(|s| {
+            s.previous.iter().chain(&s.next).any(|e| {
+                matches!(&e.prepared.operation,
+                    Operation::Draw(d) if d.target.image.shares_storage(image))
+            })
+        })
     }
     pub(super) fn finish(&mut self) {
         if self.disabled {
@@ -202,6 +213,7 @@ pub(in crate::d3d9) fn indexed(
             })
         })
         .cloned();
+    let origin = cached.clone();
     let entry = if let Some(entry) = cached {
         #[cfg(any(test, feature = "d3d9-counters"))]
         {
@@ -217,7 +229,27 @@ pub(in crate::d3d9) fn indexed(
                     && reference.samples == entry.prepared.samples
             );
         }
-        entry
+        // Retained entries must not pin a rotated back-buffer image: rebase
+        // the shared preparation onto the current target when it moved.
+        match &entry.prepared.operation {
+            Operation::Draw(draw) if !draw.target.image.shares_storage(&target.image) => {
+                let mut prepared = (*entry.prepared).clone();
+                if let Operation::Draw(draw) = &mut prepared.operation {
+                    draw.target = target.clone();
+                }
+                let saved = std::sync::OnceLock::new();
+                if let Some(old) = entry.saved.get() {
+                    let _ = saved.set(old.clone());
+                }
+                Arc::new(Entry {
+                    signature: entry.signature,
+                    prepared: Arc::new(prepared),
+                    spans: entry.spans.clone(),
+                    saved,
+                })
+            }
+            _ => entry,
+        }
     } else {
         *d.fixed.captures.borrow_mut() = Some(Vec::new());
         let draw = build(env);
@@ -255,9 +287,12 @@ pub(in crate::d3d9) fn indexed(
         .entry(target_id)
         .or_default();
     if let Some(positions) = sequence.index.get(&signature)
-        && let Some(&n) = positions
-            .iter()
-            .find(|&&n| n >= sequence.cursor && Arc::ptr_eq(&sequence.previous[n], &entry))
+        && let Some(&n) = positions.iter().find(|&&n| {
+            n >= sequence.cursor
+                && origin
+                    .as_ref()
+                    .is_some_and(|o| Arc::ptr_eq(&sequence.previous[n], o))
+        })
     {
         sequence.cursor = n + 1;
     }

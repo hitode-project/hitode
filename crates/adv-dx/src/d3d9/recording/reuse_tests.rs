@@ -303,6 +303,13 @@ fn d3d9_reuse_rebases_onto_a_rotated_back_buffer_image() {
     let new = f.image(f.back);
     assert_ne!(new.view(), old.view());
     assert_eq!(f.pixels(&new), expected);
+    // Retained entries must not pin the rotated-out image, or presentation
+    // can never reuse it.
+    let device_pointer = f.device;
+    let e = env(&mut f);
+    let d = device(&e, device_pointer).unwrap();
+    assert!(!d.frame.reuse.retains(&old));
+    assert!(d.frame.reuse.retains(&new));
 }
 
 #[test]
