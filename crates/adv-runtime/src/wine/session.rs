@@ -853,9 +853,10 @@ impl Session {
                 return Stop::Failed(error);
             }
             let id = self.shared.id.get();
+            // A single-process game is already foreground: skip the window view.
             if self.presented_frames() != before
-                && project::view(&self.machine.ext).top != 0
                 && self.foreground != id
+                && project::view(&self.machine.ext).top != 0
                 && let Err(error) = self.set_foreground(id)
             {
                 return Stop::Failed(error);

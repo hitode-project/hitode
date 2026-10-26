@@ -1741,6 +1741,33 @@ fn source_color_keys_skip_keyed_pixels_when_copying_and_scaling() {
         .unwrap();
     let first: Vec<u8> = logical_pixels(&s, wide, &m).iter().map(|p| p[2]).collect();
     assert_eq!(first, vec![0, 0, 0xff, 0xff, 0, 0, 0, 0]);
+    // Overlapping keyed copies read the source as it was before any write,
+    // and a later call reuses the scratch rows without stale pixels.
+    let strip = s.create(2, 4, false, PixelFormat::Rgb565, &mut m).unwrap();
+    for _ in 0..2 {
+        for (y, value) in [0x11u8, 0x22, 0x33, 0x44].into_iter().enumerate() {
+            m.write(s[strip].row(0, y as u32), &[0, 0, value, value])
+                .unwrap();
+        }
+        let source = Rect {
+            x: 0,
+            y: 0,
+            w: 2,
+            h: 3,
+        };
+        let shifted = BlitRect {
+            x: 0,
+            y: 1,
+            w: 2,
+            h: 3,
+        };
+        s.blit(strip, source, strip, shifted, options, &mut m)
+            .unwrap();
+        let rows: Vec<_> = (0..4)
+            .map(|y| m.read(s[strip].row(0, y), 4).unwrap().into_owned())
+            .collect();
+        assert_eq!(rows, [0x11, 0x11, 0x22, 0x33].map(|v: u8| vec![0, 0, v, v]));
+    }
 }
 
 #[test]

@@ -297,12 +297,11 @@ pub fn dialogs(ext: &Ext) -> DialogSet {
 }
 
 /// Whether the host shows `hwnd` as a native dialog or popup instead of frames.
+/// Window surfaces ask on every flush, so this classifies `hwnd` alone,
+/// exactly as [`dialogs`] would, without building the dialog set.
 pub fn projected(ext: &Ext, hwnd: u32) -> bool {
-    info(ext, hwnd).is_some_and(|info| info.is("#32768"))
-        || dialogs(ext)
-            .dialogs
-            .iter()
-            .any(|dialog| dialog.target.hwnd == hwnd)
+    let children = |parent| windows(ext).filter(|info| info.parent == parent).collect();
+    info(ext, hwnd).is_some_and(|info| info.is("#32768") || is_dialog(info, &children))
 }
 
 fn target(dialog: u32, info: &Info) -> DialogTarget {
@@ -1298,4 +1297,57 @@ fn click_next(env: &mut Env<'_>, menu: u32, done: Done) -> Outcome {
             }
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    // spec: WINE-UI-7
+    fn projected_windows_are_exactly_the_dialog_set_and_menus() {
+        let window = |hwnd, parent, class: &str, style| Info {
+            hwnd,
+            parent,
+            class: class.into(),
+            style: WS_VISIBLE | style,
+            ..Default::default()
+        };
+        let mut ext = Ext::default();
+        ext.get_or_default::<Projection>().parts.insert(
+            1,
+            Part {
+                windows: vec![
+                    window(1, 0, "GameCanvas", 0),
+                    window(2, 0, "#32770", 0),
+                    window(3, 2, "Button", 0),
+                    window(4, 0, "Prompt", 0),
+                    window(5, 4, "Static", 0),
+                    window(6, 4, "Button", 1),
+                    window(7, 0, "Mixed", 0),
+                    window(8, 7, "Custom", 0),
+                    window(9, 7, "Button", 0),
+                    window(10, 0, "#32768", 0),
+                    Info {
+                        style: 0,
+                        ..window(11, 0, "#32770", 0)
+                    },
+                ],
+                ..Default::default()
+            },
+        );
+        let set: Vec<u32> = dialogs(&ext)
+            .dialogs
+            .iter()
+            .map(|d| d.target.hwnd)
+            .collect();
+        assert_eq!(set, [2, 4]);
+        for hwnd in 1..=11 {
+            assert_eq!(
+                projected(&ext, hwnd),
+                set.contains(&hwnd) || hwnd == 10,
+                "window {hwnd}"
+            );
+        }
+    }
 }
