@@ -160,14 +160,14 @@ Usage includes implicit matrix rows, int/bool operands and legacy bump parameter
 
 The diagnostic Cargo feature is `adv-dx/d3d9-counters`. Retained payloads are counted per command, including shared snapshots; cumulative recorded bytes do not measure resident memory or memory traffic. Recording limits continue to use the logical upload size.
 
-### GFX-REC-9 Dead target passes
+### GFX-REC-9 Dead target writes
 
-**Rule**: Only complete target passes whose every output is fully overwritten before any read MAY be eliminated. Partial flushes, uploads, partial overwrites, and preserved attachment aspects MUST retain their dependencies. Verification mode MUST execute the complete reference command stream.
+**Rule**: Only operations whose every output is fully overwritten before any read MAY be eliminated, and a clear MUST drop exactly the components so overwritten. Partial flushes, uploads, partial overwrites, and preserved attachment aspects MUST retain their dependencies. Verification mode MUST execute the complete reference command stream.
 **Verification**: Test
 
 A pass is a contiguous group of writes to one target allocation. Backward
 liveness tracks logical resource levels and attachment aspects. Dead frames use
-GFX-REC-2; these and dead passes are the only whole-frame/pass omissions.
+GFX-REC-2; these and dead writes are the only whole-frame/operation omissions.
 Damage clipping remains a conservative region optimization under GFX-REC-4/5.
 
 ### GFX-REC-10 Detached render-target readback
@@ -177,7 +177,7 @@ Damage clipping remains a conservative region optimization under GFX-REC-4/5.
 
 ### GFX-PACE-1 Vsync-locked refresh boundaries
 
-**Rule**: When the host display rate is within 1% of a whole multiple of the guest refresh rate, Present boundaries MUST fall on host vsyncs. An on-time boundary MUST follow the previous one by exactly that multiple of vsyncs. A late Present MUST wait for the next vsync without repaying missed frames, and other rates MUST keep machine-clock boundaries.
+**Rule**: Present boundaries MUST fall on host vsyncs, and a late Present MUST wait for the next one without repaying missed frames. At display rates within 1% of a whole multiple of the guest rate, on-time boundaries MUST be exactly that many vsyncs apart. Other rates MUST snap the guest's rational cadence to the nearest vsync after now.
 **Verification**: Test
 
 ### GFX-PACE-2 Unpaced presents beyond the display rate
@@ -245,7 +245,7 @@ snapshot storage; an unchanged Apply performs no state writes. Redundant fixed-s
 
 ### GFX-INPUT-3 Pretransformed vertices
 
-**Rule**: XYZRHW and POSITIONT draws MUST bypass the bound vertex shader while preserving its binding identity and continuing pixel shading. POSITIONT declarations MUST use offset-ordered stream 0 inputs.
+**Rule**: XYZRHW and POSITIONT draws MUST bypass the bound vertex shader while preserving its binding identity and continuing pixel shading. POSITIONT declarations MUST use offset-ordered stream 0 inputs. Programmable pretransformed draws MUST capture stream bytes and indices and map positions in the vertex stage, interpolating only the varyings the pixel stage reads.
 **Verification**: Test
 
 ### GFX-INPUT-4 Fixed texture coordinates

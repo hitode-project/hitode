@@ -128,6 +128,7 @@ pub(super) fn setup(env: &mut Env<'_>) -> (u32, Id, u32, Id) {
         "IDirect3DDevice9",
         IID_DEVICE,
         Payload::Device(Box::new(Device {
+            children: BTreeMap::new(),
             pointer: 0,
             factory,
             surface: 0,

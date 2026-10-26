@@ -1143,7 +1143,6 @@ impl Session {
         _wake: &WakeEvent,
     ) -> Result<Rendered, String> {
         let context = self.presenter.context.clone();
-        let submission = context.submission().map_err(|error| error.to_string())?;
         let mut changed = false;
         if self.frames.update() {
             self.stats.consumed += 1;
@@ -1167,10 +1166,12 @@ impl Session {
                 self.contiguous = false;
                 self.native = Some(frame.clone());
                 if update_video {
+                    let submission = context.submission().map_err(|error| error.to_string())?;
                     self.update_video(&context, &submission)?;
                 }
                 changed = true;
             } else {
+                let submission = context.submission().map_err(|error| error.to_string())?;
                 self.cursor_regions = Arc::from(self.frames.current().video_cursor_regions()?);
                 if self.native.is_some() {
                     self.snapshot.frames = 0;
@@ -1351,6 +1352,7 @@ impl Session {
                 .ok_or("missing final software frame")?
                 .1
         };
+        let submission = context.submission().map_err(|error| error.to_string())?;
         let result = self.presenter.draw_view(
             view,
             size,

@@ -150,7 +150,7 @@ fn every_declaration_type_is_fetched_by_the_gpu_with_d3d_component_defaults() {
             None,
             &inputs,
             &[(false, 0)],
-            false,
+            (false, 0, false),
         )
         .unwrap();
         let program = Program::new(source.into(), vec![false]);
@@ -262,8 +262,16 @@ fn fixed_pixel_stages_combine_a_second_texture_stage() {
     };
     // Stage zero texel (0.5, 1, 1, 1), stage one (1, 0.5, 0.25, 0.5).
     let images = [texel([255, 255, 128, 255]), texel([64, 128, 255, 128])];
-    let source =
-        source::build(None, None, None, None, &[], &[(false, 0), (false, 1)], true).unwrap();
+    let source = source::build(
+        None,
+        None,
+        None,
+        None,
+        &[],
+        &[(false, 0), (false, 1)],
+        (true, 0, false),
+    )
+    .unwrap();
     let program = Program::new(source.into(), vec![false, false]);
     validate_program(&program).unwrap();
     let state = DrawState::new(8, 8);

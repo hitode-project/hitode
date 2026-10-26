@@ -373,7 +373,7 @@ fn repeated_programmable_frame_keeps_captures_without_backend_packing() {
         "IDirect3DDevice9::SetPixelShaderConstantF",
         &[d, 0, color, 1],
     );
-    for repeated in [false, true] {
+    for _repeated in [false, true] {
         let vertices = f.packet([
             [
                 1f32.to_bits(),
@@ -420,10 +420,7 @@ fn repeated_programmable_frame_keeps_captures_without_backend_packing() {
         f.m.cpu.write(vertices, &[0; 60]).unwrap();
         present(&mut f);
         assert_eq!(constants.retained_bytes(), 16);
-        assert_eq!(
-            bytes.retained_bytes(),
-            retained + if repeated { 0 } else { bytes.len() }
-        );
+        assert_eq!(bytes.retained_bytes(), retained);
     }
     assert_eq!(f.m.ext.get::<State>().frames.eliminated_frames, 1);
     assert_eq!(f.m.ext.get::<Presents>().published, [1]);
@@ -912,7 +909,7 @@ fn programmable_draw(f: &mut Fixture) -> fixed::Draw {
                 format: AttributeFormat::Float4,
             }],
         }],
-        indices: Some(vec![0, 1, 2]),
+        indices: Some(vec![0, 1, 2].into()),
         vertex_count: 6,
         vertex_constants: ConstantBlock::default().into(),
         pixel_constants: ConstantBlock::default().into(),

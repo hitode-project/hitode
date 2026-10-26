@@ -64,20 +64,28 @@ fn draw_bounds(env: &Env<'_>, device: &Device, d: &fixed::Draw) -> Option<Rect> 
             return None;
         }
         count = p.vertex_count as usize;
-        let shader = shaders::bound(env, device.shaders.vertex?)?;
-        let translation = shader.translation.as_ref().ok()?;
-        for n in 0..p.vertex_count {
-            let input = vertex_input(p, n)?;
-            let output =
-                interpreter::run(&shader.parsed, &input, &p.vertex_constants, &mut NoTextures)
-                    .ok()?;
-            if point.is_some() && translation.writes_point_size {
-                margin = margin.max(1. + point_size(output.point_size)? * 0.5);
+        if p.parameters[15][0] != 0 {
+            for n in 0..p.vertex_count {
+                let input = vertex_input(p, n)?;
+                positions[n as usize] =
+                    programmable::transformed::position(input.v[0], d.state.viewport)?;
             }
-            let mut position = output.position;
-            position[0] += position[3] / d.state.viewport.width;
-            position[1] -= position[3] / d.state.viewport.height;
-            positions[n as usize] = position;
+        } else {
+            let shader = shaders::bound(env, device.shaders.vertex?)?;
+            let translation = shader.translation.as_ref().ok()?;
+            for n in 0..p.vertex_count {
+                let input = vertex_input(p, n)?;
+                let output =
+                    interpreter::run(&shader.parsed, &input, &p.vertex_constants, &mut NoTextures)
+                        .ok()?;
+                if point.is_some() && translation.writes_point_size {
+                    margin = margin.max(1. + point_size(output.point_size)? * 0.5);
+                }
+                let mut position = output.position;
+                position[0] += position[3] / d.state.viewport.width;
+                position[1] -= position[3] / d.state.viewport.height;
+                positions[n as usize] = position;
+            }
         }
     }
     let v = d.state.viewport;
@@ -113,13 +121,25 @@ fn draw_bounds(env: &Env<'_>, device: &Device, d: &fixed::Draw) -> Option<Rect> 
     .clipped(full(&d.target.image));
     Some(d.state.scissor.map_or(r, |s| r.clipped(s)))
 }
-fn vertex_input(
+pub(in crate::d3d9) fn vertex_input(
     p: &adv_device::gpu::ProgrammableDraw,
     n: u32,
 ) -> Option<crate::shader::interpreter::Inputs> {
     let mut input = crate::shader::interpreter::Inputs::default();
     for stream in &p.streams {
         for a in &stream.attributes {
+            if a.format == AttributeFormat::Bgra8Unorm {
+                let mut bytes = [0; 4];
+                stream.bytes.read_vertex(
+                    n as usize,
+                    stream.stride as usize,
+                    a.offset as usize,
+                    &mut bytes,
+                )?;
+                input.v[a.location as usize] =
+                    [bytes[2], bytes[1], bytes[0], bytes[3]].map(|v| f32::from(v) / 255.);
+                continue;
+            }
             if !matches!(
                 a.format,
                 AttributeFormat::Float1

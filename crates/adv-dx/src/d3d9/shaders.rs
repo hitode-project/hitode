@@ -123,8 +123,8 @@ impl Default for Registers {
 }
 #[derive(Default)]
 pub(super) struct Constants {
-    registers: Registers,
-    captured: std::sync::Mutex<Option<Captured>>,
+    registers: Arc<Registers>,
+    captured: std::cell::RefCell<Option<Captured>>,
 }
 #[derive(Clone)]
 struct Captured {
@@ -137,7 +137,7 @@ impl Clone for Constants {
     fn clone(&self) -> Self {
         Self {
             registers: self.registers.clone(),
-            captured: std::sync::Mutex::new(self.captured.lock().unwrap().clone()),
+            captured: std::cell::RefCell::new(self.captured.borrow().clone()),
         }
     }
 }
@@ -149,13 +149,13 @@ impl std::ops::Deref for Constants {
 }
 impl std::ops::DerefMut for Constants {
     fn deref_mut(&mut self) -> &mut Registers {
-        *self.captured.get_mut().unwrap() = None;
-        &mut self.registers
+        *self.captured.get_mut() = None;
+        Arc::make_mut(&mut self.registers)
     }
 }
 impl Constants {
     fn invalidate_register(&mut self, register: usize) {
-        let captured = self.captured.get_mut().unwrap();
+        let captured = self.captured.get_mut();
         if captured
             .as_ref()
             .is_some_and(|c| c.usage.registers[register / 64] & (1 << (register % 64)) != 0)
@@ -167,8 +167,8 @@ impl Constants {
         &self,
         usage: adv_device::constants::ConstantUsage,
         extra: &[(usize, [u32; 4])],
-    ) -> std::sync::MutexGuard<'_, Option<Captured>> {
-        let mut captured = self.captured.lock().unwrap();
+    ) -> std::cell::RefMut<'_, Option<Captured>> {
+        let mut captured = self.captured.borrow_mut();
         if !captured
             .as_ref()
             .is_some_and(|c| c.usage == usage && c.extra == extra)
@@ -744,7 +744,8 @@ fn store_constants(
                 });
                 if constants.floats[register].map(f32::to_bits) != value {
                     constants.invalidate_register(register);
-                    constants.registers.floats[register] = value.map(f32::from_bits);
+                    Arc::make_mut(&mut constants.registers).floats[register] =
+                        value.map(f32::from_bits);
                     changed = true;
                 }
             }
@@ -754,7 +755,7 @@ fn store_constants(
                 });
                 if constants.integers[register] != value {
                     constants.invalidate_register(register + 256);
-                    constants.registers.integers[register] = value;
+                    Arc::make_mut(&mut constants.registers).integers[register] = value;
                     changed = true;
                 }
             }
@@ -762,7 +763,7 @@ fn store_constants(
                 let value = i32::from_le_bytes(bytes.try_into().unwrap());
                 if constants.booleans[register] != value {
                     constants.invalidate_register(register + 272);
-                    constants.registers.booleans[register] = value;
+                    Arc::make_mut(&mut constants.registers).booleans[register] = value;
                     changed = true;
                 }
             }

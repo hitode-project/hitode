@@ -6,6 +6,7 @@
 use super::*;
 mod slots;
 use slots::Slots;
+use std::rc::Rc;
 
 const IID_BLOCK: Iid = [
     0x8e, 0x41, 0xe6, 0xb0, 0xce, 0xbb, 0x10, 0x4c, 0xab, 0x3b, 0xab, 0xa8, 0x00, 0xb5, 0xbb, 0xca,
@@ -95,7 +96,7 @@ pub(in crate::d3d9) struct Snapshot {
 pub(in crate::d3d9) struct StateBlock {
     pointer: u32,
     pub(in crate::d3d9) device: Id,
-    snapshot: Option<Arc<Snapshot>>,
+    snapshot: Option<Rc<Snapshot>>,
     versions: [u64; 15],
 }
 impl Snapshot {
@@ -554,7 +555,15 @@ pub(in crate::d3d9) fn destroy(env: &mut Env<'_>, block: StateBlock) {
 }
 pub(in crate::d3d9) fn has_outstanding(env: &Env<'_>, device: Id) -> bool {
     let com = com(env);
-    env.sys.objects.hosts_in::<adv_abi::com::ComObject<Payload>>(com.namespace()).any(|(id,_)|matches!(com.get_identity(&env.sys.objects,id),Some(Payload::StateBlock(b)) if b.device==device))
+    let Some(Payload::Device(d)) = com.get_identity(&env.sys.objects, device) else {
+        return false;
+    };
+    d.children.values().any(|&id| {
+        matches!(
+            com.get_identity(&env.sys.objects, id),
+            Some(Payload::StateBlock(_))
+        )
+    })
 }
 fn mask(env: &Env<'_>, device: Id, kind: i32) -> Option<Mask> {
     let Payload::Device(d) = com(env).get_identity(&env.sys.objects, device)? else {
@@ -676,7 +685,7 @@ fn make(env: &mut Env<'_>, device: Id, snapshot: Snapshot, output: GuestPtr<u32>
         Payload::StateBlock(Box::new(StateBlock {
             pointer: 0,
             device,
-            snapshot: Some(Arc::new(snapshot)),
+            snapshot: Some(Rc::new(snapshot)),
             versions: [u64::MAX; 15],
         })),
     ) else {
@@ -815,7 +824,7 @@ pub(in crate::d3d9) fn capture(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
         unreachable!();
     };
     let mut snapshot = b.snapshot.take().unwrap();
-    let old = Arc::get_mut(&mut snapshot).expect("capture has exclusive snapshot ownership");
+    let old = Rc::get_mut(&mut snapshot).expect("capture has exclusive snapshot ownership");
     let Some(Payload::Device(d)) = com(env).get_identity(&env.sys.objects, id) else {
         unreachable!();
     };
@@ -842,15 +851,15 @@ pub(in crate::d3d9) fn capture(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
 fn copy_constants(target: &mut Constants, source: &Constants, mask: &ConstantMask) {
     for i in &mask.floats {
         target.invalidate_register(i);
-        target.registers.floats[i] = source.floats[i];
+        Arc::make_mut(&mut target.registers).floats[i] = source.floats[i];
     }
     for i in &mask.integers {
         target.invalidate_register(i + 256);
-        target.registers.integers[i] = source.integers[i];
+        Arc::make_mut(&mut target.registers).integers[i] = source.integers[i];
     }
     for i in &mask.booleans {
         target.invalidate_register(i + 272);
-        target.registers.booleans[i] = source.booleans[i];
+        Arc::make_mut(&mut target.registers).booleans[i] = source.booleans[i];
     }
 }
 #[win32(d3d9,name="IDirect3DStateBlock9::Apply",level=state)]
@@ -885,7 +894,7 @@ pub(in crate::d3d9) fn apply(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
         count_apply(env, 0);
         return 0;
     }
-    let snapshot = Arc::clone(snapshot);
+    let snapshot = Rc::clone(snapshot);
     let changes = changes(
         &d.shaders,
         &d.buffers,
@@ -1235,7 +1244,7 @@ mod tests {
         assert_eq!(end(&mut env, this, output), 0);
         let this_block = GuestPtr::new(output.read(env.cpu).unwrap());
         assert_eq!(capture(&mut env, this_block), 0);
-        let saved = Arc::as_ptr(
+        let saved = Rc::as_ptr(
             block(&env, this_block.addr())
                 .unwrap()
                 .snapshot
@@ -1245,7 +1254,7 @@ mod tests {
         assert_eq!(fixed::set_render(&mut env, this, 14, 0), 0);
         assert_eq!(capture(&mut env, this_block), 0);
         let b = block(&env, this_block.addr()).unwrap();
-        assert_eq!(Arc::as_ptr(b.snapshot.as_ref().unwrap()), saved);
+        assert_eq!(Rc::as_ptr(b.snapshot.as_ref().unwrap()), saved);
         assert_eq!(b.versions, device(&env, pointer).unwrap().versions);
         assert_eq!(fixed::set_render(&mut env, this, 14, 1), 0);
         assert_eq!(apply(&mut env, this_block), 0);
@@ -1295,7 +1304,7 @@ mod tests {
         assert_eq!(create(&mut env, GuestPtr::new(pointer), 1, output), 0);
         let this = GuestPtr::new(output.read(env.cpu).unwrap());
         assert_eq!(capture(&mut env, this), 0);
-        let saved = Arc::as_ptr(block(&env, this.addr()).unwrap().snapshot.as_ref().unwrap());
+        let saved = Rc::as_ptr(block(&env, this.addr()).unwrap().snapshot.as_ref().unwrap());
         let Some(Payload::Device(d)) = com(&env).get_identity_mut(&mut env.sys.objects, id) else {
             panic!()
         };
@@ -1310,7 +1319,7 @@ mod tests {
         assert_eq!(delta.dirty, 1);
         assert_eq!(capture(&mut env, this), 0);
         assert_eq!(
-            Arc::as_ptr(block(&env, this.addr()).unwrap().snapshot.as_ref().unwrap()),
+            Rc::as_ptr(block(&env, this.addr()).unwrap().snapshot.as_ref().unwrap()),
             saved
         );
         let expected = fingerprint(device(&env, pointer).unwrap());
@@ -1357,7 +1366,7 @@ mod tests {
         };
         d.shaders.vertex_constants.floats[3][0] = -0.;
         d.versions[13] += 1;
-        let snapshot = Arc::clone(block(&env, this.addr()).unwrap().snapshot.as_ref().unwrap());
+        let snapshot = Rc::clone(block(&env, this.addr()).unwrap().snapshot.as_ref().unwrap());
         let Some(Payload::Device(d)) = com(&env).get_identity_mut(&mut env.sys.objects, id) else {
             panic!()
         };

@@ -6,6 +6,7 @@ use std::collections::HashSet;
 struct Effects {
     pass: u128,
     barrier: bool,
+    clear: bool,
     draw_bounds: Option<adv_device::surface::Rect>,
     reads: Vec<Content>,
     writes: Vec<(Content, bool)>,
@@ -14,6 +15,7 @@ struct Effects {
 pub(super) struct Plan {
     effects: Vec<Effects>,
     skipped: Vec<bool>,
+    clear_masks: Vec<u8>,
     covered: HashSet<Content>,
 }
 impl Plan {
@@ -27,6 +29,7 @@ impl Plan {
         self.effects.push(Effects {
             pass: damage::image(operation).map_or(0, |i| hash(i.view())),
             barrier: matches!(operation, Operation::Upload { .. }),
+            clear: matches!(operation, Operation::Clear { .. }),
             draw_bounds: matches!(operation, Operation::Draw(_)).then_some(bounds),
             reads,
             writes,
@@ -42,6 +45,7 @@ impl Plan {
     pub fn truncate(&mut self, len: usize) {
         self.effects.truncate(len);
         self.skipped.clear();
+        self.clear_masks.clear();
     }
     pub fn skip(&self, n: usize) -> bool {
         self.skipped.get(n).copied().unwrap_or(false)
@@ -51,9 +55,14 @@ impl Plan {
             .draw_bounds
             .is_some_and(|r| r.clipped(clip).empty())
     }
+    pub fn clear_mask(&self, n: usize) -> u8 {
+        self.clear_masks.get(n).copied().unwrap_or(7)
+    }
     pub fn plan(&mut self) -> u64 {
         self.skipped.clear();
         self.skipped.resize(self.effects.len(), false);
+        self.clear_masks.clear();
+        self.clear_masks.resize(self.effects.len(), 7);
         let covered = &mut self.covered;
         covered.clear();
         let mut end = self.effects.len();
@@ -71,32 +80,38 @@ impl Plan {
                 }
             }
             let group = &self.effects[start..end];
-            let dead = !last.barrier
-                && group.iter().any(|e| !e.writes.is_empty())
-                && group
-                    .iter()
-                    .flat_map(|e| &e.writes)
-                    .all(|(k, _)| covered.contains(k));
-            if dead {
-                self.skipped[start..end].fill(true);
-                #[cfg(feature = "d3d9-counters")]
-                {
-                    count += 1;
+            let mut dead_group = true;
+            for (index, e) in group.iter().enumerate().rev() {
+                let dead = !e.barrier
+                    && !e.writes.is_empty()
+                    && e.writes.iter().all(|(k, _)| covered.contains(k));
+                if dead {
+                    self.skipped[start + index] = true;
+                    continue;
                 }
-            } else {
-                for e in group.iter().rev() {
-                    for &(k, overwrite) in &e.writes {
-                        if overwrite && !e.barrier {
-                            covered.insert(k);
-                        } else {
-                            covered.remove(&k);
-                        }
+                dead_group = false;
+                let mut mask = 7;
+                for &(k, overwrite) in &e.writes {
+                    if e.clear && covered.contains(&k) {
+                        mask &= !(1 << k.2);
+                        continue;
                     }
-                    for k in &e.reads {
-                        covered.remove(k);
+                    if overwrite && !e.barrier {
+                        covered.insert(k);
+                    } else {
+                        covered.remove(&k);
                     }
+                }
+                self.clear_masks[start + index] = mask;
+                for k in &e.reads {
+                    covered.remove(k);
                 }
             }
+            #[cfg(feature = "d3d9-counters")]
+            {
+                count += u64::from(dead_group);
+            }
+            let _ = dead_group;
             end = start;
         }
         #[cfg(feature = "d3d9-counters")]
@@ -134,6 +149,7 @@ mod tests {
             reads,
             writes,
             barrier,
+            clear: false,
             draw_bounds: None,
         };
         for (effects, skipped) in [
@@ -205,5 +221,23 @@ mod tests {
             plan.truncate(0);
             assert!(!plan.skip(0));
         }
+        // A clear keeps only the components no later write fully replaces.
+        let clear = |writes| Effects {
+            clear: true,
+            ..effect(1, vec![], writes, false)
+        };
+        let mut plan = Plan {
+            effects: vec![
+                clear(vec![(a, true), (depth, true)]),
+                effect(1, vec![], vec![(a, false)], false),
+                clear(vec![(depth, true)]),
+            ],
+            ..Default::default()
+        };
+        plan.plan();
+        assert_eq!(plan.skipped, [false, false, false]);
+        assert_eq!([0, 1, 2].map(|n| plan.clear_mask(n)), [7 & !(1 << 1), 7, 7]);
+        plan.truncate(0);
+        assert_eq!(plan.clear_mask(0), 7);
     }
 }

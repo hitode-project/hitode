@@ -100,6 +100,7 @@ enum Payload {
     StateBlock(Box<shaders::stateblocks::StateBlock>),
 }
 struct Device {
+    children: BTreeMap<u32, Id>,
     pointer: u32,
     factory: Id,
     surface: u32,
@@ -223,13 +224,14 @@ pub fn diagnostics(ext: &Ext, objects: &Objects) -> Diagnostics {
 #[derive(Clone)]
 enum Pixels {
     Host(Arc<Vec<u8>>),
+    Alpha8(Arc<Vec<u8>>),
     /// GPU staging memory and the content hash of the rows written to it.
     Staged(Arc<adv_device::gpu::Staged>, u64),
 }
 impl Pixels {
     fn len(&self) -> usize {
         match self {
-            Self::Host(pixels) => pixels.len(),
+            Self::Host(pixels) | Self::Alpha8(pixels) => pixels.len(),
             Self::Staged(staged, _) => staged.len(),
         }
     }
@@ -238,7 +240,7 @@ impl Pixels {
 impl std::hash::Hash for Pixels {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         match self {
-            Self::Host(pixels) => pixels.as_slice().hash(state),
+            Self::Host(pixels) | Self::Alpha8(pixels) => pixels.as_slice().hash(state),
             Self::Staged(_, digest) => digest.hash(state),
         }
     }
@@ -489,6 +491,17 @@ fn free(env: &mut Env<'_>, pointer: u32) {
     let allocator = env.ext.get::<State>().provider.allocator;
     (allocator.free)(env, pointer);
 }
+/// The device whose `children` index lists this object.
+fn child_owner(payload: &Payload) -> Option<Id> {
+    Some(match payload {
+        Payload::Resource(r) => r.device,
+        Payload::Buffer(r) => r.device,
+        Payload::Declaration(r) => r.device,
+        Payload::Shader(r) => r.device,
+        Payload::StateBlock(r) => r.device,
+        _ => return None,
+    })
+}
 fn object(
     env: &mut Env<'_>,
     interface: &'static str,
@@ -505,6 +518,13 @@ fn object(
         free(env, pointer);
         return None;
     };
+    if let Some(owner) = com(env)
+        .get_identity(&env.sys.objects, id)
+        .and_then(child_owner)
+        && let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, owner)
+    {
+        d.children.insert(pointer, id);
+    }
     let container = match com(env).get_identity(&env.sys.objects, id) {
         Some(Payload::Resource(r)) => r.container,
         _ => None,
@@ -517,6 +537,15 @@ fn object(
     Some((pointer, id))
 }
 fn destroy(env: &mut Env<'_>, destroyed: Destroyed<Payload>) {
+    // Interfaces, not the payload's pointer field, name every registration.
+    if let Some(owner) = child_owner(&destroyed.value)
+        && let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, owner)
+    {
+        for pointer in &destroyed.interfaces {
+            d.children.remove(pointer);
+        }
+    }
+
     if let Payload::Device(device) = destroyed.value {
         let provider = env.ext.get::<State>().provider;
         (provider.device_released)(env, device.pointer);
@@ -998,6 +1027,7 @@ fn create_device(
         fixed::CachedFixed::new(normalized.BackBufferWidth, normalized.BackBufferHeight);
     fixed.auto_depth(normalized.EnableAutoDepthStencil != 0);
     let device = Device {
+        children: BTreeMap::new(),
         pointer: 0,
         factory,
         surface,
@@ -1153,9 +1183,11 @@ fn reset(
         .identity::<Payload>(&env.sys.objects, this.addr())
         .unwrap();
     let com = com(env);
-    let outstanding_default = env.sys.objects.hosts_in::<adv_abi::com::ComObject<Payload>>(com.namespace())
-        .any(|(id,_)| matches!(com.get_identity(&env.sys.objects,id), Some(Payload::Resource(r))
-            if r.device == device_id && r.desc.Pool == 0 && com.references(&env.sys.objects,id).is_some_and(|n| n != 0)));
+    let outstanding_default = d.children.values().any(|&id| {
+        com.references(&env.sys.objects, id).is_some_and(|n| n != 0)
+            && matches!(com.get_identity(&env.sys.objects, id),
+                Some(Payload::Resource(r)) if r.desc.Pool == 0)
+    });
     if outstanding_default
         || buffers::has_outstanding_default(env, device_id)
         || shaders::stateblocks::has_outstanding(env, device_id)
@@ -1341,6 +1373,7 @@ fn execute_gpu(env: &mut Env<'_>, operation: &Operation) -> Result<Completion, E
             rectangle,
         } => match pixels {
             Pixels::Host(pixels) => gpu.upload(&target.image, *rectangle, *pitch, pixels),
+            Pixels::Alpha8(pixels) => gpu.upload_alpha(&target.image, *rectangle, *pitch, pixels),
             Pixels::Staged(staged, _) => gpu.upload_staged(&target.image, *rectangle, staged),
         }
         .map(|()| Completion::Command),

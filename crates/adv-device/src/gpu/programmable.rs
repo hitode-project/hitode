@@ -143,7 +143,7 @@ pub struct ProgramTexture {
 pub struct ProgrammableDraw {
     pub program: Program,
     pub streams: Vec<VertexStream>,
-    pub indices: Option<Vec<u32>>,
+    pub indices: Option<super::IndexBytes>,
     pub vertex_count: u32,
     pub vertex_constants: ConstantSnapshot,
     pub pixel_constants: ConstantSnapshot,

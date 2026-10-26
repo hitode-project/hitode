@@ -837,12 +837,12 @@ pub(super) fn reset_bindings(env: &mut Env<'_>, device: Id) {
 }
 pub(super) fn has_outstanding_default(env: &Env<'_>, device: Id) -> bool {
     let com = com(env);
-    env.sys
-        .objects
-        .hosts_in::<adv_abi::com::ComObject<Payload>>(com.namespace())
-        .any(|(id, _)| {
-            matches!(com.get_identity(&env.sys.objects, id),
-            Some(Payload::Buffer(buffer)) if buffer.device == device && buffer.pool == 0
+    let Some(Payload::Device(d)) = com.get_identity(&env.sys.objects, device) else {
+        return false;
+    };
+    d.children.values().any(|&id| {
+        matches!(com.get_identity(&env.sys.objects, id),
+            Some(Payload::Buffer(buffer)) if buffer.pool == 0
                 && com.references(&env.sys.objects, id).is_some_and(|n| n != 0))
-        })
+    })
 }

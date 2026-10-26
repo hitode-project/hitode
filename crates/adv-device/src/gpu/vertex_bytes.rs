@@ -12,7 +12,10 @@ use std::{
 pub struct VertexBytes(Arc<Source>);
 #[derive(Clone)]
 enum Source {
-    Raw(Vec<u8>),
+    Raw {
+        bytes: Vec<u8>,
+        key: Option<u128>,
+    },
     Fixed {
         vertices: Arc<Vec<Vertex>>,
         coordinates: Option<(usize, Arc<Vec<[f32; 4]>>)>,
@@ -29,6 +32,13 @@ enum Source {
     },
 }
 impl VertexBytes {
+    pub fn captured(bytes: Vec<u8>, key: u128) -> Self {
+        Self(Arc::new(Source::Raw {
+            bytes,
+            key: Some(key),
+        }))
+    }
+
     pub fn fixed(
         vertices: Arc<Vec<Vertex>>,
         coordinates: Option<(usize, Arc<Vec<[f32; 4]>>)>,
@@ -45,7 +55,7 @@ impl VertexBytes {
     /// Mutating bytes or expanding point recipes discards this identity.
     pub fn content_key(&self) -> Option<u128> {
         match &*self.0 {
-            Source::Fixed { key, .. } => *key,
+            Source::Fixed { key, .. } | Source::Raw { key, .. } => *key,
             _ => None,
         }
     }
@@ -61,7 +71,7 @@ impl VertexBytes {
     }
     pub fn len(&self) -> usize {
         match &*self.0 {
-            Source::Raw(v) => v.len(),
+            Source::Raw { bytes: v, .. } => v.len(),
             Source::Fixed {
                 vertices,
                 coordinates,
@@ -73,7 +83,7 @@ impl VertexBytes {
     /// Captured payload size, counted once per command even when shared.
     pub fn retained_bytes(&self) -> usize {
         match &*self.0 {
-            Source::Raw(v) => v.len(),
+            Source::Raw { bytes: v, .. } => v.len(),
             Source::Fixed {
                 vertices,
                 coordinates,
@@ -103,7 +113,7 @@ impl VertexBytes {
         output: &mut [u8],
     ) -> Option<()> {
         match &*self.0 {
-            Source::Raw(v) => {
+            Source::Raw { bytes: v, .. } => {
                 let at = n * stride + offset;
                 output.copy_from_slice(v.get(at..at + output.len())?);
             }
@@ -149,7 +159,7 @@ impl VertexBytes {
     }
     fn vertex(&self, n: usize, stride: usize, mut width: usize, write: &mut impl FnMut(&[u8])) {
         match &*self.0 {
-            Source::Raw(v) => write(&v[n * stride..n * stride + width]),
+            Source::Raw { bytes: v, .. } => write(&v[n * stride..n * stride + width]),
             Source::Fixed {
                 vertices,
                 coordinates,
@@ -181,7 +191,7 @@ impl VertexBytes {
     }
     fn visit(&self, write: &mut impl FnMut(&[u8])) {
         match &*self.0 {
-            Source::Raw(v) => write(v),
+            Source::Raw { bytes: v, .. } => write(v),
             Source::Fixed {
                 vertices,
                 coordinates,
@@ -226,14 +236,17 @@ impl Default for VertexBytes {
 }
 impl From<Vec<u8>> for VertexBytes {
     fn from(v: Vec<u8>) -> Self {
-        Self(Arc::new(Source::Raw(v)))
+        Self(Arc::new(Source::Raw {
+            bytes: v,
+            key: None,
+        }))
     }
 }
 impl Deref for VertexBytes {
     type Target = Vec<u8>;
     fn deref(&self) -> &Vec<u8> {
         match &*self.0 {
-            Source::Raw(v) => v,
+            Source::Raw { bytes: v, .. } => v,
             Source::Fixed { packed, .. } | Source::Points { packed, .. } => {
                 packed.get_or_init(|| {
                     let mut bytes = Vec::with_capacity(self.len());
@@ -246,12 +259,16 @@ impl Deref for VertexBytes {
 }
 impl DerefMut for VertexBytes {
     fn deref_mut(&mut self) -> &mut Vec<u8> {
-        if !matches!(&*self.0, Source::Raw(_)) {
-            self.0 = Arc::new(Source::Raw(self.as_slice().to_vec()));
+        if !matches!(&*self.0, Source::Raw { .. }) {
+            self.0 = Arc::new(Source::Raw {
+                bytes: self.as_slice().to_vec(),
+                key: None,
+            });
         }
-        let Source::Raw(v) = Arc::make_mut(&mut self.0) else {
+        let Source::Raw { bytes: v, key } = Arc::make_mut(&mut self.0) else {
             unreachable!()
         };
+        *key = None;
         v
     }
 }

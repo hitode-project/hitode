@@ -3,10 +3,12 @@
 use super::*;
 use crate::shader::{SamplerDimension, Shader, Translation};
 use adv_device::gpu::{
-    Attribute, AttributeFormat, Program, ProgramTexture, ProgrammableDraw, VertexBytes,
+    Attribute, AttributeFormat, IndexBytes, Program, ProgramTexture, ProgrammableDraw, VertexBytes,
     VertexStream,
 };
 mod source;
+mod streams;
+pub(in crate::d3d9) mod transformed;
 pub(super) mod warmup;
 pub(super) use warmup::warm;
 #[cfg(test)]
@@ -20,6 +22,7 @@ struct ProgramKey {
     inputs: Vec<(u32, AttributeFormat)>,
     /// Whether the fixed pixel stages combine a second texture stage.
     second: bool,
+    features: (u32, bool),
 }
 #[derive(Default)]
 pub(super) struct ProgramCache {
@@ -298,93 +301,62 @@ fn prepare_checked(
         return Err(INVALID);
     }
     let mut vertex_count;
-    let mut output_indices = indices.map(<[u32]>::to_vec);
+    let mut output_indices = indices.map(|v| v.iter().copied().collect::<IndexBytes>());
     let (mut draw, mut streams, input_spec) = if let Some(vs) = &vs {
         let inputs = inputs(env, pointer, &vs.parsed)?;
         let first = indices.and_then(|i| i.iter().min().copied()).unwrap_or(0);
-        let last = indices
-            .and_then(|i| i.iter().max().copied())
+        let last = output_indices
+            .as_ref()
+            .and_then(IndexBytes::maximum)
             .unwrap_or(length - 1);
         vertex_count = last
             .checked_sub(first)
             .and_then(|v| v.checked_add(1))
             .ok_or(INVALID)?;
         if let Some(i) = &mut output_indices {
-            for i in i {
-                *i -= first;
-            }
+            i.rebase(first);
         }
-        let mut streams = Vec::new();
-        let mut total = 0u32;
-        for n in 0..16 {
-            let selected: Vec<_> = inputs.iter().filter(|i| i.stream == n).collect();
-            if selected.is_empty() {
-                continue;
-            }
-            let minimum = selected
-                .iter()
-                .map(|i| i.offset + i.format.size())
-                .max()
-                .unwrap();
-            let (data, stride, available) = if let Some((data, stride)) = up {
-                if n != 0 {
-                    return Err(INVALID);
-                }
-                (data.addr(), stride, u32::MAX)
-            } else {
-                let stream = d.buffers.streams[n];
-                let Some(Payload::Buffer(buffer)) = stream
-                    .buffer
-                    .and_then(|id| com(env).get_identity(&env.sys.objects, id))
-                else {
-                    return Err(INVALID);
-                };
-                if buffer.locks != 0 || stream.offset > buffer.len {
-                    return Err(INVALID);
-                }
-                (
-                    buffer.storage.checked_add(stream.offset).ok_or(INVALID)?,
-                    stream.stride,
-                    buffer.len - stream.offset,
-                )
-            };
-            if stride > 2048 || !stride.is_multiple_of(4) || (stride != 0 && stride < minimum) {
-                return Err(INVALID);
-            }
-            let offset = start
-                .checked_add(first)
-                .and_then(|v| v.checked_mul(stride))
-                .ok_or(INVALID)?;
-            let bytes = (last - first)
-                .checked_mul(stride)
-                .and_then(|v| v.checked_add(minimum))
-                .ok_or(INVALID)?;
-            if offset.checked_add(bytes).is_none_or(|end| end > available) {
-                return Err(INVALID);
-            }
-            total = total
-                .checked_add(bytes)
-                .filter(|&v| v <= 16 * 1024 * 1024)
-                .ok_or(INVALID)?;
-            let at = data.checked_add(offset).ok_or(INVALID)?;
-            adv_abi::guest::check_range(env.cpu, at, bytes, Prot::READ).map_err(|_| INVALID)?;
-            let mut raw = vec![0; bytes as usize];
-            env.cpu.read(at, &mut raw).map_err(|_| INVALID)?;
-            streams.push(VertexStream {
-                bytes: raw.into(),
-                stride,
-                attributes: selected
-                    .iter()
-                    .map(|i| Attribute {
-                        location: i.register,
-                        offset: i.offset,
-                        format: i.format,
-                    })
-                    .collect(),
-            });
-        }
+        let streams = streams::capture(env, pointer, &inputs, up, start, first, last)?;
         let (target, image, state) =
             fixed::prepare_state(env, pointer, kind).map_err(|e| e.code)?;
+        (
+            fixed::Draw {
+                target,
+                image,
+                state,
+                vertices: Arc::default(),
+                texcoords: None,
+                programmable: None,
+                recording_key: recording::draw_key(env, pointer),
+                program_key: 0,
+            },
+            streams,
+            inputs,
+        )
+    } else if pretransformed(env, pointer)? {
+        let layout = fixed::layout(env, pointer).map_err(|e| e.code)?;
+        let inputs = transformed::inputs(layout);
+        let first = indices.and_then(|v| v.iter().min().copied()).unwrap_or(0);
+        let last = output_indices
+            .as_ref()
+            .and_then(IndexBytes::maximum)
+            .unwrap_or(length - 1);
+        vertex_count = last
+            .checked_sub(first)
+            .and_then(|n| n.checked_add(1))
+            .ok_or(INVALID)?;
+        if let Some(indices) = &mut output_indices {
+            indices.rebase(first);
+        }
+        let streams = streams::capture(env, pointer, &inputs, up, start, first, last)?;
+        let (target, image, state) =
+            fixed::prepare_state(env, pointer, kind).map_err(|e| e.code)?;
+        transformed::validate(
+            &streams,
+            state.viewport,
+            output_indices.as_ref().map(|v| v.as_slice()),
+            vertex_count,
+        )?;
         (
             fixed::Draw {
                 target,
@@ -456,15 +428,16 @@ fn prepare_checked(
         }
         (draw, vec![stream], inputs)
     };
-    if vs.is_some() && kind == 6 {
+    let transformed = vs.is_none() && input_spec.iter().any(|i| i.register == 0);
+    if (vs.is_some() || transformed) && kind == 6 {
         let original = output_indices
             .take()
-            .unwrap_or_else(|| (0..length).collect());
+            .unwrap_or_else(|| (0..length).collect::<IndexBytes>());
         let mut fan = Vec::with_capacity(count as usize * 3);
         for n in 1..original.len() - 1 {
             fan.extend_from_slice(&[original[0], original[n], original[n + 1]]);
         }
-        output_indices = Some(fan);
+        output_indices = Some(fan.into());
     }
     if kind == 1 {
         let mut budget = 0usize;
@@ -556,6 +529,7 @@ fn prepare_checked(
     );
     parameters[2][3] = u32::from(kind == 1);
     parameters[13] = second.unwrap_or_default();
+    parameters[15][0] = u32::from(transformed);
     parameters[3] = [
         d.fixed.render[&152],
         d.fixed.render[&28],
@@ -612,6 +586,7 @@ fn prepare_checked(
         pixel: ps.as_ref().map(|s| s.id),
         inputs: input_spec.iter().map(|i| (i.register, i.format)).collect(),
         second: second.is_some(),
+        features: (d.fixed.render[&152], d.fixed.render[&28] != 0),
     };
     draw.program_key = recording::hash(&key);
     let cache = &mut env.ext.get_mut::<State>().programs;
@@ -637,7 +612,7 @@ fn prepare_checked(
                 pt,
                 &input_spec,
                 &slots,
-                second.is_some(),
+                (second.is_some(), key.features.0, key.features.1),
             )?;
             let mut program = Program::new(source.into(), slots.iter().map(|s| s.0).collect());
             program.constants = usage;

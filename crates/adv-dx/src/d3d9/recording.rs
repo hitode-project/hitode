@@ -526,7 +526,25 @@ pub(super) fn flush(
             f.head += 1;
             continue;
         }
-        let operation = std::mem::replace(&mut f.commands[f.head], Operation::Consumed);
+        let mut operation = std::mem::replace(&mut f.commands[f.head], Operation::Consumed);
+        if let Operation::Clear {
+            color,
+            depth,
+            stencil,
+            ..
+        } = &mut operation
+        {
+            let mask = f.passes.clear_mask(f.head);
+            if mask & 1 == 0 {
+                *color = None;
+            }
+            if mask & 2 == 0 {
+                *depth = None;
+            }
+            if mask & 4 == 0 {
+                *stencil = None;
+            }
+        }
         let clip = if env.ext.get::<State>().verify_frames {
             None
         } else {

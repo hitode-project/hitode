@@ -534,7 +534,9 @@ fn bgra_snapshot_survives_busy_upload_and_later_dirty_rects() {
     );
     assert_eq!(f.dirty(source), [true]);
     assert_eq!(f.update(source, destination), 0);
-    assert_eq!(f.pixels(&image), [9, 8, 7, 6].repeat(32));
+    let mut expected = [1, 2, 3, 4].repeat(32);
+    expected[9 * 4..11 * 4].copy_from_slice(&[9, 8, 7, 6].repeat(2));
+    assert_eq!(f.pixels(&image), expected);
     assert_eq!(f.dirty(source), [false]);
 }
 
@@ -572,7 +574,11 @@ fn partial_dirty_marks_copy_matching_tail_mips_and_no_dirty_lock_stays_clean() {
         );
     }
     assert_eq!(f.update(source, destination), 0);
-    assert_eq!(f.pixels(&image), [11, 12, 13, 14].repeat(8));
+    let mut expected = [2, 2, 3, 4].repeat(8);
+    for row in 0..2 {
+        expected[row * 16..row * 16 + 8].copy_from_slice(&[11, 12, 13, 14].repeat(2));
+    }
+    assert_eq!(f.pixels(&image), expected);
     assert_eq!(f.dirty(source), [false; 5]);
     let output = f.packet(D3DLOCKED_RECT::default());
     assert_eq!(

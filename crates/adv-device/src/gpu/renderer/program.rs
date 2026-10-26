@@ -761,7 +761,7 @@ impl Gpu {
         let count = draw
             .indices
             .as_ref()
-            .map_or(draw.vertex_count as usize, Vec::len);
+            .map_or(draw.vertex_count as usize, |v| v.len());
         // Reuse all raster checks without decoding or evaluating guest vertices.
         let dummy = Vertex {
             position: [0., 0., 0., 1.],
@@ -794,7 +794,7 @@ impl Gpu {
         let last = draw
             .indices
             .as_ref()
-            .and_then(|v| v.iter().max().copied())
+            .and_then(|v| v.maximum())
             .unwrap_or(draw.vertex_count.saturating_sub(1));
         if last >= draw.vertex_count {
             return Err(invalid("shader index outside uploaded vertex span"));

@@ -419,3 +419,40 @@ fn staged_uploads_land_after_pending_clears_and_recycle_their_buffer() {
         drop(again);
     }
 }
+
+// spec: DEV-UPDATE-4, GFX-PASS-1
+#[test]
+fn compact_alpha_upload_keeps_padding_and_pixels_outside_the_rectangle() {
+    for native in backends() {
+        let mut gpu = gpu(native);
+        let image = gpu.image(4, 4).unwrap();
+        let target = Target {
+            image: image.clone(),
+            depth: None,
+        };
+        gpu.clear(&target, Some([1., 0., 0., 1.]), None).unwrap();
+        gpu.upload_alpha(
+            &image,
+            Rect {
+                x: 1,
+                y: 1,
+                w: 2,
+                h: 2,
+            },
+            3,
+            &[64, 128, 99, 255, 17],
+        )
+        .unwrap();
+        let pixels = read(&mut gpu, &image);
+        for (n, pixel) in pixels.as_chunks::<4>().0.iter().enumerate() {
+            let expected = match n {
+                5 => [0, 0, 0, 64],
+                6 => [0, 0, 0, 128],
+                9 => [0, 0, 0, 255],
+                10 => [0, 0, 0, 17],
+                _ => [0, 0, 255, 255],
+            };
+            assert_eq!(*pixel, expected);
+        }
+    }
+}

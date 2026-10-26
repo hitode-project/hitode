@@ -508,10 +508,15 @@ fn validate(operation: &Operation) -> Result<(), u32> {
             pixels,
             ..
         } => {
+            let width = if matches!(pixels, Pixels::Alpha8(_)) {
+                1
+            } else {
+                4
+            };
             bounds(&target.image, *rectangle, false)
-                && u64::from(*pitch) >= u64::from(rectangle.w) * 4
-                && pitch.is_multiple_of(4)
-                && u64::from(*pitch) * u64::from(rectangle.h - 1) + u64::from(rectangle.w) * 4
+                && u64::from(*pitch) >= u64::from(rectangle.w) * width
+                && (width == 1 || pitch.is_multiple_of(4))
+                && u64::from(*pitch) * u64::from(rectangle.h - 1) + u64::from(rectangle.w) * width
                     <= pixels.len() as u64
         }
         Operation::Copy {
@@ -552,7 +557,10 @@ fn validate(operation: &Operation) -> Result<(), u32> {
                 && s.scissor.is_none_or(|r| bounds(&d.target.image, r, false));
             raster
                 && if let Some(p) = &d.programmable {
-                    let n = p.indices.as_ref().map_or(p.vertex_count as usize, Vec::len);
+                    let n = p
+                        .indices
+                        .as_ref()
+                        .map_or(p.vertex_count as usize, |v| v.len());
                     let last = p
                         .indices
                         .as_ref()

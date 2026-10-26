@@ -31,6 +31,29 @@ impl CachedFixed {
         self.key.set(Some(key));
         key
     }
+    pub(super) fn capture_stream(
+        &self,
+        env: &Env<'_>,
+        address: u32,
+        length: u32,
+    ) -> Result<adv_device::gpu::VertexBytes, u32> {
+        let bytes = match env.cpu.shared_bytes(address, length as usize) {
+            Some(bytes) => std::borrow::Cow::Borrowed(bytes),
+            None => {
+                let mut bytes = vec![0; length as usize];
+                env.cpu.read(address, &mut bytes).map_err(|_| INVALID)?;
+                std::borrow::Cow::Owned(bytes)
+            }
+        };
+        let key = xxhash_rust::xxh3::xxh3_128(&bytes);
+        let mut captures = self.inputs.borrow_mut();
+        if let Some(bytes) = captures.stream(key) {
+            return Ok(bytes);
+        }
+        let bytes = adv_device::gpu::VertexBytes::captured(bytes.into_owned(), key);
+        captures.insert_stream(key, bytes.clone());
+        Ok(bytes)
+    }
     pub(super) fn finish_inputs(&self) {
         self.inputs.borrow_mut().finish();
     }
@@ -460,7 +483,7 @@ pub(super) fn set_fvf(env: &mut Env<'_>, this: GuestPtr<()>, fvf: u32) -> u32 {
 fn device_declaration(env: &Env<'_>, pointer: u32) -> Option<Id> {
     device(env, pointer)?.buffers.declaration
 }
-fn layout(env: &Env<'_>, pointer: u32) -> Result<Layout, Rejected> {
+pub(super) fn layout(env: &Env<'_>, pointer: u32) -> Result<Layout, Rejected> {
     let d = device(env, pointer).ok_or_else(|| rejected(INVALID, "invalid device interface"))?;
     match d.buffers.declaration {
         Some(id) => {

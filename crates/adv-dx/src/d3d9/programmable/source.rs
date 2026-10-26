@@ -40,9 +40,31 @@ pub(super) fn build(
     pt: Option<&Translation>,
     inputs: &[Input],
     slots: &[(bool, u8)],
-    second: bool,
+    features: (bool, u32, bool),
 ) -> Result<String, u32> {
-    let mut s = TYPES.to_owned();
+    let (second, clip, fog) = features;
+    let used = varyings(ps, second);
+    let mut s = TYPES.replace("struct Interpolated", "struct Varyings");
+    for n in 0..13 {
+        s = s.replace(&format!("@location({n}) "), "");
+    }
+    s = s.replace("@builtin(position) ", "");
+    s.push_str("struct Interpolated { @builtin(position) position:vec4<f32>,\n");
+    for (n, name) in fields().iter().enumerate() {
+        if used[n] {
+            writeln!(s, "@location({n}) {name}:vec4<f32>,").unwrap();
+        }
+    }
+    if clip & 15 != 0 {
+        s.push_str("@location(10) clip0:vec4<f32>,\n");
+    }
+    if clip & 48 != 0 {
+        s.push_str("@location(11) clip1:vec2<f32>,\n");
+    }
+    if fog {
+        s.push_str("@location(12) fog:f32,\n");
+    }
+    s.push_str("}\n");
     s.push_str(adv_device::gpu::BORDER_WGSL);
     for (ordinal, &(vertex, index)) in slots.iter().enumerate() {
         let p = if vertex { "vs" } else { "ps" };
@@ -70,7 +92,8 @@ pub(super) fn build(
         s.push_str(&t.source);
     }
     s.push_str("@vertex fn vertex_main(@builtin(vertex_index) ordinal:u32,");
-    if vs.is_some() {
+    let transformed = vs.is_none() && inputs.iter().any(|i| i.register == 0);
+    if vs.is_some() || transformed {
         for (n, i) in inputs.iter().enumerate() {
             if n > 0 {
                 s.push(',');
@@ -99,7 +122,7 @@ pub(super) fn build(
             }
         }
     }
-    s.push_str(")->Interpolated {\nvar out:Interpolated;\n");
+    s.push_str(")->Interpolated {\nvar out:Varyings;\n");
     if let Some(vs) = vs {
         s.push_str("var input:ShaderInputs;\n");
         for i in inputs {
@@ -144,6 +167,21 @@ pub(super) fn build(
                 .unwrap();
             }
         }
+    } else if transformed {
+        s.push_str("let viewport=bitcast<vec4<f32>>(draw_parameters.values[0]);let w=1.0/a0.w;out.position=vec4<f32>((((a0.x+0.5-viewport.z)/viewport.x)*2.0-1.0)*w,(1.0-((a0.y+0.5-viewport.w)/viewport.y)*2.0)*w,a0.z*w,w);let clip_position=out.position;out.fog=1.0;\n");
+        let color = inputs
+            .iter()
+            .find(|i| i.register == 1)
+            .map_or_else(|| "vec4<f32>(1.0)".into(), |i| i.format.unpack("a1"));
+        writeln!(s, "out.c0={color};").unwrap();
+        for n in 0..8 {
+            let register = 2 + n;
+            let value = inputs.iter().find(|i| i.register == register).map_or_else(
+                || "vec4<f32>(0.0,0.0,0.0,1.0)".into(),
+                |i| i.format.unpack(&format!("a{register}")),
+            );
+            writeln!(s, "out.t{n}={value};").unwrap();
+        }
     } else {
         s.push_str("out.position=a0;let clip_position=out.position;out.c0=a1;out.fog=1.0;\n");
         if inputs.is_empty() {
@@ -154,7 +192,7 @@ pub(super) fn build(
             }
         }
     }
-    for n in 0..6 {
+    for n in (0..6).filter(|n| clip & (1 << n) != 0) {
         let field = if n < 4 {
             format!("clip0.{}", ["x", "y", "z", "w"][n])
         } else {
@@ -174,7 +212,22 @@ pub(super) fn build(
         s.push_str("var size=bitcast<f32>(draw_parameters.values[11].w);\n");
     }
     s.push_str("size=clamp(size,bitcast<f32>(draw_parameters.values[12].x),bitcast<f32>(draw_parameters.values[12].y));out.position.x+=corner.x*size*out.position.w/bitcast<f32>(draw_parameters.values[0].x);out.position.y+=corner.y*size*out.position.w/bitcast<f32>(draw_parameters.values[0].y);if draw_parameters.values[12].z!=0u {out.t0=vec4<f32>((corner.x+1.0)*0.5,(1.0-corner.y)*0.5,0.0,1.0);} }\n");
-    s.push_str("return out;}\n");
+    s.push_str("return Interpolated(out.position");
+    for (n, field) in fields().iter().enumerate() {
+        if used[n] {
+            write!(s, ",out.{field}").unwrap();
+        }
+    }
+    if clip & 15 != 0 {
+        s.push_str(",out.clip0");
+    }
+    if clip & 48 != 0 {
+        s.push_str(",out.clip1");
+    }
+    if fog {
+        s.push_str(",out.fog");
+    }
+    s.push_str(");}\n");
     let depth = pt.is_some_and(|p| p.writes_depth);
     if depth {
         s.push_str(
@@ -192,7 +245,7 @@ pub(super) fn build(
     )
     .unwrap();
     s.push_str("let enabled=draw_parameters.values[3].x;\n");
-    for n in 0..6 {
+    for n in (0..6).filter(|n| clip & (1 << n) != 0) {
         let field = if n < 4 {
             format!("clip0.{}", ["x", "y", "z", "w"][n])
         } else {
@@ -206,8 +259,12 @@ pub(super) fn build(
         .unwrap();
     }
     if let Some(ps) = ps {
-        s.push_str("var registers:ShaderInputs;registers.position=input.position;registers.position.x-=0.5;registers.position.y-=0.5;registers.front_face=!front;registers.v[0]=input.c0;registers.v[1]=input.c1;\n");
-        for n in 0..8 {
+        s.push_str("var registers:ShaderInputs;registers.position=input.position;registers.position.x-=0.5;registers.position.y-=0.5;registers.front_face=!front;\n");
+        let (colors, coordinates) = used.split_at(2);
+        for n in (0..2).filter(|&n| colors[n]) {
+            writeln!(s, "registers.v[{n}]=input.c{n};").unwrap();
+        }
+        for n in (0..8).filter(|&n| coordinates[n]) {
             writeln!(s, "registers.t[{n}]=input.t{n};").unwrap();
         }
         if ps.version.major >= 3 {
@@ -231,7 +288,13 @@ pub(super) fn build(
                         _ => return Err(UNAVAILABLE),
                     }
                 };
-                writeln!(s, "registers.v[{}]={source};", i.register.index).unwrap();
+                if fields()
+                    .iter()
+                    .position(|name| source == format!("input.{name}"))
+                    .is_some_and(|n| used[n])
+                {
+                    writeln!(s, "registers.v[{}]={source};", i.register.index).unwrap();
+                }
             }
         }
         s.push_str("let result=ps_run(registers);var color=result.colors[0];\n");
@@ -243,7 +306,7 @@ pub(super) fn build(
         }
     }
     s.push_str("if !adv_alpha(color.a) {discard;}\n");
-    if ps.is_none_or(|p| p.version.major < 3) {
+    if fog && ps.is_none_or(|p| p.version.major < 3) {
         s.push_str("if draw_parameters.values[3].y!=0u {var factor=input.fog;let mode=draw_parameters.values[3].z;let values=bitcast<vec4<f32>>(draw_parameters.values[11]);let distance=input.position.z;if mode==1u {factor=exp(-values.z*distance);}else if mode==2u {factor=exp(-pow(values.z*distance,2.0));}else if mode==3u {factor=(values.y-distance)/(values.y-values.x);}color=vec4<f32>(mix(bitcast<vec4<f32>>(draw_parameters.values[10]).rgb,color.rgb,clamp(factor,0.0,1.0)),color.a);}\n");
     }
     if depth {
@@ -252,4 +315,65 @@ pub(super) fn build(
         s.push_str("return color;}\n");
     }
     Ok(s)
+}
+
+fn fields() -> [&'static str; 10] {
+    ["c0", "c1", "t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7"]
+}
+fn varyings(ps: Option<&Shader>, second: bool) -> [bool; 10] {
+    use crate::shader::RegisterKind;
+    let mut used = [false; 10];
+    let Some(ps) = ps else {
+        used[0] = true;
+        used[2] = true;
+        if second {
+            used[2..].fill(true);
+        }
+        return used;
+    };
+    for instruction in &ps.instructions {
+        for source in instruction
+            .sources
+            .iter()
+            .chain(instruction.predicate.iter())
+        {
+            if source.register.kind == RegisterKind::Input {
+                if source.relative.is_some() {
+                    used.fill(true);
+                } else if ps.version.major < 3 || source.register.index < 10 {
+                    let n = source.register.index as usize;
+                    if n < used.len() {
+                        used[n] = true;
+                    }
+                }
+            }
+            if source.register.kind == RegisterKind::Address && source.register.index < 8 {
+                used[2 + source.register.index as usize] = true;
+            }
+        }
+    }
+    // Legacy texture instructions include implicit coordinate dependencies.
+    if ps.version.major == 1 {
+        used[2..].fill(true);
+    }
+    if ps.version.major >= 3 {
+        for input in ps
+            .inputs
+            .iter()
+            .filter(|d| d.register.kind == RegisterKind::Input)
+        {
+            let read = used
+                .get(input.register.index as usize)
+                .copied()
+                .unwrap_or(false);
+            if read {
+                match (input.usage, input.index) {
+                    (10, n @ 0..=1) => used[n as usize] = true,
+                    (5, n @ 0..=7) => used[2 + n as usize] = true,
+                    _ => {}
+                }
+            }
+        }
+    }
+    used
 }

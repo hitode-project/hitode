@@ -96,7 +96,7 @@ Comparing against the last publication keeps every slot's damage history complet
 
 ### DEV-UPDATE-2 Snapshot semantics
 
-**Rule**: BGRA8 upload and shadow writeback MUST share an immutable snapshot. X8R8G8B8 MUST preserve original X bytes in the shadow while normalizing GPU alpha separately.
+**Rule**: BGRA8 and A8 upload and shadow writeback MUST share an immutable snapshot; A8 texels MUST expand to black BGRA on the GPU. X8R8G8B8 MUST preserve original X bytes in the shadow while normalizing GPU alpha separately.
 **Verification**: Test
 
 ### DEV-UPDATE-3 Completed buffer retention
@@ -104,9 +104,9 @@ Comparing against the last publication keeps every slot's damage history complet
 **Rule**: Completed raw and converted upload buffers MUST each retain at most 8 MiB. Larger updates MUST remain usable without retaining their buffers.
 **Verification**: Review — existing update tests exercise changing sizes and formats without asserting the completed-buffer retention limit.
 
-### DEV-UPDATE-4 Dirty level expansion
+### DEV-UPDATE-4 Dirty rectangle updates
 
-**Rule**: Dirty regions MAY conservatively expand to matching complete mip levels. This expansion MUST NOT introduce GPU waits or readback.
+**Rule**: Each matched mip level MUST upload and write back only its dirty rectangle, preserving texels outside it; clean levels MUST be skipped. Updates MUST NOT introduce GPU waits or readback.
 **Verification**: Test
 
 ## Image services

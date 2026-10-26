@@ -1,3 +1,4 @@
+mod alpha;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{
     Arc, Mutex, OnceLock,
@@ -517,6 +518,7 @@ pub struct Gpu {
     pipeline_order: VecDeque<PipelineKey>,
     pipeline_limit: usize,
     programmable: program::Cache,
+    alpha_upload: OnceLock<alpha::Upload>,
     attachment_scratch: Option<Image>,
     pub(super) clip: Option<Rect>,
     samplers: HashMap<Sampler, wgpu::Sampler>,
@@ -741,6 +743,7 @@ impl Gpu {
             pipeline_order: VecDeque::new(),
             pipeline_limit: MAX_PIPELINES,
             programmable: program::Cache::default(),
+            alpha_upload: OnceLock::new(),
             attachment_scratch: None,
             clip: None,
             samplers: HashMap::new(),
@@ -788,6 +791,7 @@ impl Gpu {
             pipeline_order: VecDeque::new(),
             pipeline_limit: self.pipeline_limit,
             programmable: program::Cache::default(),
+            alpha_upload: OnceLock::new(),
             attachment_scratch: None,
             clip: None,
             samplers: HashMap::new(),

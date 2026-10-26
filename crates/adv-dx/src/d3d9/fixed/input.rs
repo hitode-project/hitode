@@ -12,6 +12,7 @@ pub(super) struct Geometry {
 pub(super) struct GeometryCache {
     current: std::collections::HashMap<u128, Geometry>,
     previous: std::collections::HashMap<u128, Geometry>,
+    streams: [std::collections::HashMap<u128, adv_device::gpu::VertexBytes>; 2],
     bytes: usize,
 }
 impl GeometryCache {
@@ -35,14 +36,37 @@ impl GeometryCache {
                 .map_or(0, |(_, values)| std::mem::size_of_val(values.as_slice()));
         // Match the recording's command and payload budgets, for each of two
         // frame generations, including draws that never reach Present.
-        if self.current.len() < 4096 && self.bytes + bytes <= 64 * 1024 * 1024 {
+        if self.current.len() + self.streams[0].len() < 4096
+            && self.bytes + bytes <= 64 * 1024 * 1024
+        {
             self.bytes += bytes;
             self.current.insert(key, geometry);
+        }
+    }
+    pub fn stream(&mut self, key: u128) -> Option<adv_device::gpu::VertexBytes> {
+        let bytes = self.streams[0]
+            .get(&key)
+            .or_else(|| self.streams[1].get(&key))?
+            .clone();
+        self.insert_stream(key, bytes.clone());
+        Some(bytes)
+    }
+    pub fn insert_stream(&mut self, key: u128, stream: adv_device::gpu::VertexBytes) {
+        if self.streams[0].contains_key(&key) {
+            return;
+        }
+        if self.current.len() + self.streams[0].len() < 4096
+            && self.bytes + stream.len() <= 64 * 1024 * 1024
+        {
+            self.bytes += stream.len();
+            self.streams[0].insert(key, stream);
         }
     }
     pub fn finish(&mut self) {
         std::mem::swap(&mut self.current, &mut self.previous);
         self.current.clear();
+        self.streams.swap(0, 1);
+        self.streams[0].clear();
         self.bytes = 0;
     }
 }
@@ -56,15 +80,15 @@ struct Source {
     data: u32,
     stride: u32,
 }
-pub(super) struct Reader {
+pub(super) struct Reader<'a> {
     sources: [Option<Source>; 16],
-    raw: [Vec<u8>; 16],
+    raw: [std::borrow::Cow<'a, [u8]>; 16],
     batches: [Option<u32>; 16],
     sizes: [u32; 16],
     current: u32,
     start: u32,
 }
-impl Reader {
+impl<'a> Reader<'a> {
     pub(super) fn captured_key(&mut self, indices: Option<&[u32]>, length: u32) -> Option<u128> {
         if self
             .sources
@@ -95,7 +119,7 @@ impl Reader {
         &self.raw[stream][offset..offset + self.sizes[stream] as usize]
     }
     pub(super) fn new(
-        env: &Env<'_>,
+        env: &'a Env<'_>,
         device: u32,
         layout: Layout,
         input: Input,
@@ -171,10 +195,14 @@ impl Reader {
             let offset = first.checked_mul(stride).ok_or(INVALID)?;
             let span = data.checked_add(offset).ok_or(INVALID)?;
             check_span(env, span, end - offset)?;
-            // Owned buffers are ordinary storage. Batch dense indexed input
-            // only when it reads no more bytes than the per-vertex path.
-            if matches!(input, Input::Bound { .. })
-                && u64::from(end - offset) <= u64::from(vertices) * u64::from(minimum)
+            // Ordinary guest storage can be borrowed for synchronous decoding.
+            // Copied spans remain bounded by the separate vertex read volume.
+            if env
+                .cpu
+                .shared_bytes(span, (end - offset) as usize)
+                .is_some()
+                || (matches!(input, Input::Bound { .. })
+                    && u64::from(end - offset) <= u64::from(vertices) * u64::from(minimum))
             {
                 batches[number] = Some(first);
                 spans[number] = (span, end - offset);
@@ -182,12 +210,21 @@ impl Reader {
             sources[number] = Some(Source { data, stride });
         }
         let mut raw = std::array::from_fn(|stream| {
-            vec![0; batches[stream].map_or(sizes[stream], |_| spans[stream].1) as usize]
+            let (address, span) = spans[stream];
+            if batches[stream].is_some()
+                && let Some(bytes) = env.cpu.shared_bytes(address, span as usize)
+            {
+                return std::borrow::Cow::Borrowed(bytes);
+            }
+            std::borrow::Cow::Owned(vec![
+                0;
+                batches[stream].map_or(sizes[stream], |_| span) as usize
+            ])
         });
         for (stream, first) in batches.iter().enumerate() {
-            if first.is_some() {
+            if first.is_some() && matches!(raw[stream], std::borrow::Cow::Owned(_)) {
                 env.cpu
-                    .read(spans[stream].0, &mut raw[stream])
+                    .read(spans[stream].0, raw[stream].to_mut())
                     .map_err(|_| rejected(INVALID, "declared stream vertex read failed"))?;
             }
         }
@@ -213,7 +250,7 @@ impl Reader {
                     .and_then(|n| source.data.checked_add(n))
                     .ok_or(INVALID)?;
                 env.cpu
-                    .read(address, raw)
+                    .read(address, raw.to_mut())
                     .map_err(|_| rejected(INVALID, "declared stream vertex read failed"))?;
             }
         }
