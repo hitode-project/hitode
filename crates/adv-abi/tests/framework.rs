@@ -14,6 +14,52 @@ const CODE: u32 = 0x0040_0000;
 const DATA: u32 = 0x0041_0000;
 
 #[test]
+// spec: PERS-ABI-1
+fn borrowed_arguments_preserve_bits_aggregate_rounding_and_exact_faults() {
+    use adv_abi::Arguments;
+    use adv_cpu::backend::Reg;
+    let mut cpu = adv_cpu::JitCpu::new(PARK_ADDR, false).unwrap();
+    cpu.map(DATA, PAGE, Prot::RW).unwrap();
+    let end = DATA + PAGE;
+    let bytes: Vec<_> = [
+        0x80000000u32,
+        0x76543210,
+        0xfedcba98,
+        0x00ccbbaa,
+        0x7fc00001,
+    ]
+    .into_iter()
+    .flat_map(u32::to_le_bytes)
+    .collect();
+    for (address, words) in [(DATA + 3, 5), (end - 20, 5), (end - 20, 6)] {
+        cpu.set_reg(Reg::Esp, address - 4);
+        cpu.write(address, &bytes).unwrap();
+        for borrowed in [false, true] {
+            let mut args = if borrowed {
+                Arguments::with_words(&cpu, words)
+            } else {
+                Arguments::new(&cpu)
+            };
+            assert_eq!(args.next::<f32>().unwrap().to_bits(), 0x80000000);
+            assert_eq!(args.next::<u64>().unwrap(), 0xfedcba9876543210);
+            assert_eq!(args.pod::<[u8; 3]>().unwrap(), [0xaa, 0xbb, 0xcc]);
+            assert_eq!(args.next::<f32>().unwrap().to_bits(), 0x7fc00001);
+            if address + 20 == end {
+                let fault = args.next::<u32>().unwrap_err();
+                assert_eq!((fault.addr, fault.len), (end, 4));
+            }
+        }
+    }
+    cpu.set_reg(Reg::Esp, DATA - 4);
+    cpu.protect(DATA, PAGE, Prot::default()).unwrap();
+    let fault = Arguments::with_words(&cpu, 1).next::<u32>().unwrap_err();
+    assert_eq!((fault.addr, fault.len), (DATA, 4));
+    // An unmapped stack is valid for calls whose signature has no arguments.
+    cpu.set_reg(Reg::Esp, u32::MAX);
+    let _ = Arguments::with_words(&cpu, 0);
+}
+
+#[test]
 // spec: PERS-EXPORT-6
 fn data_declarations_have_width_and_cannot_be_function_bindings() {
     use adv_machine::Resolver;

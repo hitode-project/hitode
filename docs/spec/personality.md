@@ -204,6 +204,8 @@ This spec covers the Windows identity the guest sees. It includes implementation
 **Rule**: API signatures MUST come from `data/abi` and explicit checked aliases. API front ends MUST NOT create conflicting declarations or calling conventions.
 **Verification**: Test
 
+Typed adapters MAY borrow their complete readable argument span for decoding. They MUST preserve scalar and aggregate bits, stack-word rounding, page permissions and the original failing argument when a complete span cannot be borrowed. Zero-argument calls MUST NOT read argument memory.
+
 ### PERS-ABI-2 Layer ownership
 
 **Rule**: PE parsing MUST belong to `adv-pe`, loading policy to `adv-os`, and platform API behavior to its personality front end. Device implementations MUST NOT depend on personality crates.

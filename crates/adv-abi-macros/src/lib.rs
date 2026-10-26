@@ -268,7 +268,7 @@ fn expand(args: Args, function: ItemFn) -> syn::Result<proc_macro2::TokenStream>
                     "leaf behavior must return a synchronous integer value, not Outcome");
                 #[allow(non_snake_case)]
                 fn #leaf_adapter(__win32_env: &mut ::adv_abi::Env<'_>) -> Option<u64> {
-                    let mut __win32_arguments = ::adv_abi::Arguments::new(__win32_env.cpu);
+                    let mut __win32_arguments = ::adv_abi::Arguments::with_words(__win32_env.cpu, #stack_words);
                     #(#leaf_decode)*
                     let __win32_outcome = { #invoke };
                     match __win32_outcome {
@@ -294,7 +294,7 @@ fn expand(args: Args, function: ItemFn) -> syn::Result<proc_macro2::TokenStream>
         };
         #[allow(non_snake_case)]
         fn #adapter(__win32_env: &mut ::adv_abi::Env<'_>) -> ::adv_abi::Outcome {
-            let mut __win32_arguments = ::adv_abi::Arguments::new(__win32_env.cpu);
+            let mut __win32_arguments = ::adv_abi::Arguments::with_words(__win32_env.cpu, #stack_words);
             #(#decode)*
             #invoke
         }
