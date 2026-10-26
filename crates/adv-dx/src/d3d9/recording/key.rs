@@ -16,7 +16,7 @@ pub(in crate::d3d9) fn rect(r: adv_device::surface::Rect) -> (u32, u32, u32, u32
 fn image(i: &Image) -> (u32, u32, u32, u8) {
     (i.width(), i.height(), i.mip_levels(), i.alpha_mode() as u8)
 }
-fn target_key(t: &Target) -> impl Hash {
+pub(super) fn target_key(t: &Target) -> impl Hash {
     (
         image(&t.image),
         t.depth().map(|d| (d.width(), d.height(), d.format())),

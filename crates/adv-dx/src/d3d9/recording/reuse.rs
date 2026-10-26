@@ -23,7 +23,11 @@ impl Cache {
         self.entries = 0;
     }
 }
-fn signature(env: &mut Env<'_>, pointer: u32, request: (i32, u32, &[u32])) -> Result<u128, u32> {
+fn signature(
+    env: &mut Env<'_>,
+    pointer: u32,
+    request: (i32, u32, &[u32]),
+) -> Result<(u128, Target), u32> {
     let owner = com(env)
         .identity::<Payload>(&env.sys.objects, pointer)
         .ok_or(INVALID)?;
@@ -49,10 +53,12 @@ fn signature(env: &mut Env<'_>, pointer: u32, request: (i32, u32, &[u32])) -> Re
     });
     (request, state).hash(&mut h);
     let target = targets::draw_target(env, pointer)?;
+    // Presentation rotates back-buffer images; commands depend only on the
+    // target's shape, and a reused command is rebased onto the current one.
     (
         d.render_target.or(d.back_buffer),
         d.depth_stencil,
-        target.image.view(),
+        key::target_key(&target),
     )
         .hash(&mut h);
     d.buffers
@@ -109,7 +115,7 @@ fn signature(env: &mut Env<'_>, pointer: u32, request: (i32, u32, &[u32])) -> Re
         )
             .hash(&mut h);
     }
-    Ok(h.digest128())
+    Ok((h.digest128(), target))
 }
 fn contents(env: &Env<'_>, spans: &[(u32, u32, u128)]) -> Option<u128> {
     let mut h = xxhash_rust::xxh3::Xxh3::new();
@@ -136,8 +142,8 @@ pub(in crate::d3d9) fn indexed(
 ) -> Outcome {
     #[cfg(feature = "d3d9-counters")]
     let before = lookups();
-    let signature = match signature(env, pointer, request) {
-        Ok(key) => key,
+    let (signature, target) = match signature(env, pointer, request) {
+        Ok(signed) => signed,
         Err(_) => {
             return match build(env) {
                 Ok(draw) => {
@@ -166,11 +172,11 @@ pub(in crate::d3d9) fn indexed(
             .find_map(|g| g.get(&signature)?.variants.get(&content))
     });
     let (prepared, spans, content) = if let Some(prepared) = cached {
-        (
-            prepared.clone(),
-            template.unwrap().spans.clone(),
-            content.unwrap(),
-        )
+        let mut prepared = prepared.clone();
+        if let Operation::Draw(draw) = &mut prepared.operation {
+            draw.target = target;
+        }
+        (prepared, template.unwrap().spans.clone(), content.unwrap())
     } else {
         *d.fixed.captures.borrow_mut() = Some(Vec::new());
         let draw = build(env);

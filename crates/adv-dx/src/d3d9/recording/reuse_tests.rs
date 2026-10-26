@@ -266,3 +266,41 @@ fn d3d9_reuse_invalidates_all_draw_inputs() {
     reuse_draw(&mut f, &[1, 0, 2], &builds);
     assert_eq!(builds.get(), before + 4, "shader");
 }
+
+#[test]
+// spec: GFX-REC-11
+fn d3d9_reuse_rebases_onto_a_rotated_back_buffer_image() {
+    let (mut f, _) = reuse_fixture();
+    let builds = std::cell::Cell::new(0);
+    clear(&mut f, 0xff000000);
+    reuse_draw(&mut f, &[0, 1, 2], &builds);
+    f.okay("IDirect3DDevice9::EndScene", &[f.device]);
+    present(&mut f);
+    let old = f.image(f.back);
+    let expected = f.pixels(&old);
+    // Presentation hands the same back buffer another image of its shape.
+    let spare = f.render_target(old.width(), old.height(), 22);
+    let target = f.target(spare);
+    assert_eq!(
+        hash(key::target_key(&target)),
+        hash(key::target_key(&f.target(f.back)))
+    );
+    let back = f.back;
+    let e = env(&mut f);
+    let surface = resources::resource(&e, back).unwrap().surface.unwrap();
+    let replace = e.ext.get::<State>().provider.replace;
+    replace(e.ext, surface, target).unwrap();
+    f.okay("IDirect3DDevice9::BeginScene", &[f.device]);
+    clear(&mut f, 0xff000000);
+    reuse_draw(&mut f, &[0, 1, 2], &builds);
+    assert_eq!(
+        builds.get(),
+        1,
+        "the rotated image reuses the prepared draw"
+    );
+    f.okay("IDirect3DDevice9::EndScene", &[f.device]);
+    present(&mut f);
+    let new = f.image(f.back);
+    assert_ne!(new.view(), old.view());
+    assert_eq!(f.pixels(&new), expected);
+}
