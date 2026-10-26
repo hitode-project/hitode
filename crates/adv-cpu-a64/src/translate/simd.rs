@@ -21,6 +21,8 @@
 //! accesses that are not 16-byte aligned leave for the interpreter too,
 //! which raises the fault. The cpu pointer stays in x5 across a run of
 //! SIMD instructions.
+//! Checked moves share scalar window/alias permission checks; ordinary
+//! accesses stay native, while soft and crossing accesses re-execute in full.
 //!
 //! SSE arithmetic and conversions run in NEON while MXCSR is the default:
 //! masked exceptions, round to nearest, no DAZ or FTZ. There the A64
@@ -519,15 +521,23 @@ fn vmem(bytes: u8) -> VMem {
 
 impl Translator<'_> {
     pub(super) fn simd(&mut self, simd: Simd) {
-        if self.checking && simd.memory() {
-            self.helper(simd.helper);
-            return;
-        }
+        let slow = if self.checking && simd.memory() {
+            if simd.kind != Kind::Move {
+                self.helper(simd.helper);
+                return;
+            }
+            self.canonicalize();
+            self.flush_simd();
+            self.vector = Vector::default();
+            Some(self.asm.label())
+        } else {
+            None
+        };
         let mmx = simd.mmx();
         let ready = self.vector.ready;
         if mmx && !ready {
             self.cpu();
-            let bail = self.bail();
+            let bail = slow.unwrap_or_else(|| self.bail());
             self.emit(ldrh(X16, X5, runtime::X87_STATUS));
             self.asm.tbz(true, X16, 7, bail);
         }
@@ -535,7 +545,7 @@ impl Translator<'_> {
             let address = self.effective(simd.mem);
             if simd.aligned {
                 // NZCV holds guest flags.
-                let bail = self.bail();
+                let bail = slow.unwrap_or_else(|| self.bail());
                 self.emit(and_imm(W, X17, address, 15));
                 self.asm.cbz(W, true, X17, bail);
             }
@@ -543,7 +553,11 @@ impl Translator<'_> {
         } else {
             Reg::ZR
         };
-        self.simd_body(simd, address);
+        if slow.is_some() {
+            self.simd_move(simd, address, slow);
+        } else {
+            self.simd_body(simd, address);
+        }
         if mmx && simd.kind != Kind::Emms && !ready {
             self.cpu();
             self.emit_all(&[
@@ -553,6 +567,14 @@ impl Translator<'_> {
                 strh(Reg::ZR, X5, runtime::X87_TAG),
             ]);
             self.vector.ready = true;
+        }
+        if let Some(slow) = slow {
+            self.flush_simd();
+            let done = self.asm.label();
+            self.asm.b(done);
+            self.asm.bind(slow);
+            self.helper(simd.helper);
+            self.asm.bind(done);
         }
     }
 
@@ -566,7 +588,7 @@ impl Translator<'_> {
                 self.vector.ready = false;
                 return;
             }
-            Kind::Move => return self.simd_move(simd, address),
+            Kind::Move => return self.simd_move(simd, address, None),
             Kind::ExtractWord => {
                 let Loc::Gpr(index) = simd.dst else {
                     unreachable!()
@@ -818,13 +840,12 @@ impl Translator<'_> {
         self.written(simd.dst);
     }
 
-    fn simd_move(&mut self, simd: Simd, address: Reg) {
+    fn simd_move(&mut self, simd: Simd, address: Reg, slow: Option<Label>) {
         let size = vmem(simd.width);
         match (simd.dst, simd.src) {
             (Loc::Mem, src) => {
                 let s = self.register(src);
-                self.site();
-                self.emit(vstr_reg(size, s, WINDOW, address));
+                self.simd_access(size, s, address, true, slow);
             }
             (Loc::Gpr(index), src) => {
                 let s = self.register(src);
@@ -834,8 +855,7 @@ impl Translator<'_> {
             }
             (dst, Loc::Mem) => {
                 let d = self.destination(dst, false);
-                self.site();
-                self.emit(vldr_reg(size, d, WINDOW, address));
+                self.simd_access(size, d, address, false, slow);
                 self.written(dst);
             }
             (dst, Loc::Gpr(index)) => {
@@ -849,6 +869,27 @@ impl Translator<'_> {
                 self.emit(vmov(size == VMem::Q, d, s));
                 self.written(dst);
             }
+        }
+    }
+
+    fn simd_access(
+        &mut self,
+        size: VMem,
+        value: VReg,
+        address: Reg,
+        store: bool,
+        slow: Option<Label>,
+    ) {
+        let direct = if store {
+            vstr_reg(size, value, WINDOW, address)
+        } else {
+            vldr_reg(size, value, WINDOW, address)
+        };
+        if let Some(slow) = slow {
+            self.checked_memory(address, size.bytes(), store, direct, slow);
+        } else {
+            self.site();
+            self.emit(direct);
         }
     }
 

@@ -1,5 +1,46 @@
 use super::*;
 
+// spec: A64-MEM-2, A64-MEM-4, A64-MEM-7, A64-MEM-8, A64F-FP-4, A64-VER-1
+#[test]
+fn checked_simd_moves_use_ordinary_aliases_and_follow_permission_changes() {
+    let p = fixture(|a| {
+        a.add(eax, edx).unwrap();
+        a.movq(xmm0, qword_ptr(ebx)).unwrap();
+        a.movdqa(xmmword_ptr(ebx + 16), xmm0).unwrap();
+        a.movdqu(xmm1, xmmword_ptr(ebx + 32)).unwrap();
+        a.movss(dword_ptr(ebx + 48), xmm1).unwrap();
+        a.movq(mm0, qword_ptr(ebx + 64)).unwrap();
+        a.movq(qword_ptr(ebx + 72), mm0).unwrap();
+    });
+    for flagm in [false, true] {
+        for checks in [Checks::All, Checks::Slow] {
+            let config = (Features { flagm }, false, checks);
+            let mut native = executor(&p, config, false);
+            let mut oracle = executor(&p, config, true);
+            for cpu in [&mut native, &mut oracle] {
+                cpu.protect(DATA + 4096, DATA_LEN - 4096, 0).unwrap();
+            }
+            for permissions in [3, 1, 0, 3] {
+                for cpu in [&mut native, &mut oracle] {
+                    cpu.protect(DATA, 4096, permissions).unwrap();
+                    cpu.state = p.state.clone();
+                }
+                let before = native.native.as_ref().unwrap().diagnostics.helpers;
+                let interpreted = native.stats.interpreter_entries;
+                assert_eq!(
+                    native.run(p.stop, 100).unwrap(),
+                    oracle.run(p.stop, 100).unwrap()
+                );
+                same(&native, &oracle);
+                if permissions == 3 && checks != Checks::Slow {
+                    assert_eq!(native.native.as_ref().unwrap().diagnostics.helpers, before);
+                    assert_eq!(native.stats.interpreter_entries, interpreted);
+                }
+            }
+        }
+    }
+}
+
 fn configs() -> impl Iterator<Item = Config> {
     [false, true].into_iter().flat_map(|flagm| {
         [false, true].into_iter().flat_map(move |first| {

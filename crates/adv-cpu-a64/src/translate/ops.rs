@@ -1,5 +1,6 @@
 //! Each guest instruction's host code, with the flag work liveness allows.
 
+use crate::asm::Label;
 use crate::encode::Extend::{self, Uxtw};
 use crate::encode::Index::{Post, Pre};
 use crate::encode::Shift::{Asr, Lsl, Lsr};
@@ -522,8 +523,29 @@ impl Translator<'_> {
     fn checked(&mut self, address: Reg, rt: Reg, kind: u32, direct: u32) {
         self.flush_simd();
         let slow = self.asm.label();
+        let (site, resume) =
+            self.checked_memory(address, kind & 7, kind & ACCESS_STORE != 0, direct, slow);
+        self.push_cold(Cold::Access {
+            label: slow,
+            resume,
+            site,
+            address,
+            value: rt,
+            kind,
+        });
+    }
+
+    /// Emit one scalar or vector access after the same window/alias checks.
+    /// The caller owns the slow path and publishes its SIMD prefix first.
+    pub(super) fn checked_memory(
+        &mut self,
+        address: Reg,
+        width: u32,
+        store: bool,
+        direct: u32,
+        slow: Label,
+    ) -> (Label, Label) {
         let alias = self.asm.label();
-        let width = kind & 7;
         if width > 1 {
             // The last byte's address differs in bit 12 exactly when the
             // access crosses a page.
@@ -540,7 +562,7 @@ impl Translator<'_> {
         ]);
         // Permitted, not shared, and for a store not a code barrier.
         let bit = |permission: u8| permission.trailing_zeros();
-        let (needed, excluded) = if kind & ACCESS_STORE != 0 {
+        let (needed, excluded) = if store {
             (WRITE, &[EXEC, SHARED][..])
         } else {
             (READ, &[SHARED][..])
@@ -571,14 +593,7 @@ impl Translator<'_> {
         // Keep the access width and extension; only replace its base register.
         self.emit((direct & !(31 << 5)) | (X3.number() << 5));
         self.asm.bind(resume);
-        self.push_cold(Cold::Access {
-            label: slow,
-            resume,
-            site,
-            address,
-            value: rt,
-            kind,
-        });
+        (site, resume)
     }
 
     /// Loads a 32-bit source into a free recipe temporary.
