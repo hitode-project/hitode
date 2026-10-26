@@ -435,7 +435,9 @@ fn emit_access(asm: &mut Asm, fault: crate::asm::Label) {
 fn emit_probe(asm: &mut Asm, miss: crate::asm::Label) {
     asm.emit_all(&[
         ldr(X, r(17), RUNTIME, TABLE),
-        ubfx(X, r(6), r(16), 2, 16),
+        // `table_slot`: fold the high half into the low 16 bits.
+        eor(W, r(6), r(16), r(16), Lsr, 16),
+        ubfx(W, r(6), r(6), 0, 16),
         add(X, r(17), r(17), r(6), Lsl, 4),
         ldp(X, Offset, r(6), r(17), r(17), 0),
         sub(X, r(6), r(6), r(16), Lsl, 0),
