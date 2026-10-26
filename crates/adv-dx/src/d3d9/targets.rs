@@ -81,12 +81,7 @@ fn create(
     {
         return Outcome::Return(INVALID);
     }
-    if !matches!(format, 21 | 22)
-        || samples != 0
-        || quality != 0
-        || lockable != 0
-        || !shared.is_null()
-    {
+    if !matches!(format, 21 | 22) || samples != 0 || quality != 0 || !shared.is_null() {
         return Outcome::Return(UNAVAILABLE);
     }
     let target = match env.ext.get::<State>().gpu.as_ref() {
@@ -124,6 +119,7 @@ fn create(
             surface: Some(surface),
             storage: 0,
             owns_surface: true,
+            lockable: lockable != 0,
             lock: None,
             container: None,
             levels: Vec::new(),

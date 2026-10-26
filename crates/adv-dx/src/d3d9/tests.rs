@@ -173,6 +173,7 @@ pub(super) fn setup(env: &mut Env<'_>) -> (u32, Id, u32, Id) {
             surface: None,
             storage: 0,
             owns_surface: false,
+            lockable: false,
             lock: None,
             container: None,
             levels: Vec::new(),

@@ -138,6 +138,7 @@ pub(super) fn create_offscreen(
             surface,
             storage,
             owns_surface: surface.is_some(),
+            lockable: false,
             lock: None,
             container: None,
             levels: Vec::new(),
@@ -200,7 +201,7 @@ pub(super) fn lock_internal(
         return Outcome::Return(INVALID);
     };
     let back_buffer = lockable_back_buffer(env, this.addr(), r);
-    let gpu_lock = back_buffer || default_offscreen(r);
+    let gpu_lock = back_buffer || r.lockable || default_offscreen(r);
     // DONOTWAIT needs a genuinely nonblocking readiness protocol. Until that
     // exists it is rejected, never silently turned into a Machine wait.
     let allowed_flags = if back_buffer { 0x810 | 0x8000 } else { 0x10 };
@@ -381,7 +382,7 @@ pub(super) fn unlock_internal(env: &mut Env<'_>, this: GuestPtr<()>) -> Outcome 
         set_lock(env, id, None);
         return Outcome::Return(0);
     }
-    if !lockable_back_buffer(env, this.addr(), r) && !default_offscreen(r) {
+    if !lockable_back_buffer(env, this.addr(), r) && !r.lockable && !default_offscreen(r) {
         return Outcome::Return(INVALID);
     }
     let provider = env.ext.get::<State>().provider;

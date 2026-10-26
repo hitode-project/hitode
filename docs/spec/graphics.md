@@ -373,8 +373,14 @@ Binding changes MUST NOT start speculative module preparation for transient shad
 
 ### GFX-COPY-1 Texture destinations and RGBX
 
-**Rule**: `StretchRect` into render-target texture surfaces MUST retain container ownership until asynchronous completion. RGBX-to-ARGB copies MUST produce opaque alpha and preserve pixels outside the destination rectangle. Copies MUST NOT consume or modify guest drawing state.
-**Verification**: Review — the native texture-blit script checks pixels and identity, but no annotated test covers asynchronous container retention.
+**Rule**: Texture surfaces used by `StretchRect` MUST retain their container ownership until asynchronous completion. RGBX-to-ARGB copies MUST produce opaque alpha and preserve pixels outside the destination rectangle. Copies MUST NOT consume or modify guest drawing state.
+**Verification**: Test
+
+### GFX-COPY-2 Lockable render targets
+
+**Rule**: Standalone non-multisampled render targets created with Lockable MUST support CPU locks through ordered GPU readback and writable unlock uploads. Targets created without Lockable MUST reject CPU locks. Read-only unlocks MUST preserve GPU contents.
+**Verification**: Test
+**Basis**: Microsoft Direct3D 9 `IDirect3DDevice9::CreateRenderTarget` and `IDirect3DSurface9::LockRect`.
 
 ### GFX-STATE-1 Neutral fixed state
 
