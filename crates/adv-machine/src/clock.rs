@@ -296,6 +296,13 @@ pub fn record_leaf_clock(env: &mut Env<'_>, clock: Clock, now: u64) {
         .record(env.sys.current, env.sys.host_calls + 1, now);
 }
 
+/// Millisecond clock leaf shared by GetTickCount and timeGetTime.
+pub fn tick_leaf(env: &mut Env<'_>) -> Option<u64> {
+    let (clock, us) = leaf_clock(env)?;
+    record_leaf_clock(env, clock, us);
+    Some((u64::from(env.cpu.reg(adv_cpu::backend::Reg::Edx)) << 32) | u64::from((us / 1000) as u32))
+}
+
 /// Read the guest clock for a polling API. A context that does nothing but reread
 /// the clock is busy-waiting; once a streak proves it, each read waits for the
 /// next millisecond, as a preempted thread would observe, so the spin idles the

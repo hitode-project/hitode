@@ -3,7 +3,7 @@
 use adv_abi::{GuestPtr, Registry, types::FILETIME, win32};
 use adv_cpu::backend::{Guest, GuestExt};
 pub(crate) use adv_machine::clock::poll_clock;
-use adv_machine::clock::{leaf_clock, record_leaf_clock};
+use adv_machine::clock::{leaf_clock, record_leaf_clock, tick_leaf};
 use adv_machine::{Env, Outcome};
 
 use super::K32;
@@ -210,12 +210,6 @@ fn get_local_time(env: &mut Env<'_>) -> Outcome {
 fn local_systemtime(env: &mut Env<'_>) -> [u16; 8] {
     let ft = filetime_now(env) as i64 + local_offset_ft(env);
     filetime_to_systemtime(ft as u64)
-}
-
-pub(crate) fn tick_leaf(env: &mut Env<'_>) -> Option<u64> {
-    let (clock, us) = leaf_clock(env)?;
-    record_leaf_clock(env, clock, us);
-    Some((u64::from(adv_abi::leaf_edx(env)) << 32) | u64::from((us / 1000) as u32))
 }
 
 fn counter_leaf(env: &mut Env<'_>) -> Option<u64> {

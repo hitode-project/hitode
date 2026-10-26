@@ -57,6 +57,23 @@ struct Callbacks {
 
 pub(super) fn register(registry: &mut Registry) {
     for (index, &(name, _, argc)) in exports::EXPORTS.iter().enumerate() {
+        if name == "timeGetTime" {
+            registry.add_env_leaf(
+                MODULE,
+                name,
+                Conv::Stdcall { argc },
+                |env| {
+                    env.sys.poll_observation();
+                    adv_machine::clock::poll_clock(env, |_, us| Outcome::Return((us / 1000) as u32))
+                },
+                |env| {
+                    let value = adv_machine::clock::tick_leaf(env)?;
+                    env.sys.poll_observation();
+                    Some(value)
+                },
+            );
+            continue;
+        }
         registry.add_with_data(
             MODULE,
             name,
@@ -64,12 +81,6 @@ pub(super) fn register(registry: &mut Registry) {
             |env| {
                 let index = env.sys.thunks.get(env.thunk).f.data;
                 let (name, _, argc) = exports::EXPORTS[index as usize];
-                if name == "timeGetTime" {
-                    env.sys.poll_observation();
-                    return adv_machine::clock::poll_clock(env, |_, us| {
-                        Outcome::Return((us / 1000) as u32)
-                    });
-                }
                 let mut args: Vec<_> = (0..u32::from(argc)).map(|i| env.arg(i)).collect();
                 if name.starts_with("waveOut") && !name.contains("ErrorText") {
                     return wave::call(env, name, args);
@@ -435,4 +446,49 @@ fn check_callback(
         }),
         None => Outcome::Fail("WinMM cannot resolve IsWindow".into()),
     }
+}
+
+#[cfg(test)]
+// spec: PROC-CLOCK-3, A64-CTL-12
+#[test]
+fn time_get_time_leaf_matches_and_declines_for_wait() {
+    use adv_machine::clock::{ClockPoll, POLL_STREAK};
+    let mut registry = Registry::default();
+    register(&mut registry);
+    let mut m = Machine::new(
+        adv_cpu::JitCpu::new(adv_machine::layout::PARK_ADDR, false).unwrap(),
+        registry,
+        adv_machine::Clock::virtual_time(),
+    )
+    .unwrap();
+    let entry = m.resolve_import(MODULE, "timeGetTime").unwrap();
+    let index = (entry - adv_machine::layout::THUNK_BASE) / adv_machine::layout::THUNK_STRIDE;
+    let binding = m.sys.thunks.get(index).f;
+    m.visit_context(None, |env| {
+        env.thunk = index;
+        for read in 1..=POLL_STREAK {
+            let clock = env.sys.clock.clone();
+            let poll = env.ext.get_or_default::<ClockPoll>().clone();
+            let result = binding.env_leaf.unwrap()(env);
+            assert_eq!(result.is_none(), read == POLL_STREAK);
+            if result.is_none() {
+                assert_eq!(
+                    (env.sys.clock.now_us(), env.ext.get::<ClockPoll>()),
+                    (clock.now_us(), &poll)
+                );
+            }
+            env.sys.clock = clock;
+            env.ext.insert(poll);
+            env.sys.host_calls += 1;
+            match (binding.handler)(env) {
+                Outcome::Return(value) => assert_eq!(result.map(|v| v as u32), Some(value)),
+                Outcome::Block {
+                    wait: Wait::Until(_),
+                    ..
+                } => assert!(result.is_none()),
+                _ => panic!("unexpected clock outcome"),
+            }
+        }
+    })
+    .unwrap();
 }

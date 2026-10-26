@@ -252,3 +252,50 @@ fn run_once(env: &mut Env<'_>, control: u32, init: u32) -> Outcome {
         Err(error) => Outcome::Fail(format!("once control at {control:#x}: {error}")),
     }
 }
+
+#[cfg(test)]
+// spec: A64-CTL-12
+#[test]
+fn mutex_leaves_lock_recurse_unlock_and_decline() {
+    use adv_cpu::JitCpu;
+    use adv_cpu::backend::{Guest, Prot, Reg};
+    use adv_machine::{Clock, Machine, layout::PARK_ADDR};
+    let mut m = Machine::new(
+        JitCpu::new(PARK_ADDR, false).unwrap(),
+        crate::Platform,
+        Clock::virtual_time(),
+    )
+    .unwrap();
+    let (mutex, stack) = (0x410000, 0x410800);
+    m.cpu.map(mutex, 4096, Prot::RW).unwrap();
+    m.cpu
+        .write_u32(mutex + MUTEX_KIND, MUTEX_RECURSIVE)
+        .unwrap();
+    m.cpu.write_u32(stack + 4, mutex).unwrap();
+    m.cpu.set_reg(Reg::Esp, stack);
+    m.cpu.set_reg(Reg::Edx, 0x12345678);
+    for (name, context, result, held) in [
+        ("pthread_mutex_lock", 0, Some(0), Some((0, 1))),
+        ("pthread_mutex_lock", 0, Some(0), Some((0, 2))),
+        ("pthread_mutex_unlock", 0, Some(0), Some((0, 1))),
+        ("pthread_mutex_lock", 1, None, Some((0, 1))),
+        ("pthread_mutex_unlock", 0, Some(0), None),
+    ] {
+        let entry = m.resolve_import(crate::LIBC, name).unwrap();
+        let index = (entry - adv_machine::layout::THUNK_BASE) / adv_machine::layout::THUNK_STRIDE;
+        let binding = m.sys.thunks.get(index).f;
+        let mut env = Env {
+            context,
+            cpu: &mut m.cpu,
+            sys: &mut m.sys,
+            ext: &mut m.ext,
+            thunk: index,
+        };
+        assert_eq!(
+            binding.env_leaf.unwrap()(&mut env),
+            result.map(|v| (0x12345678u64 << 32) | v)
+        );
+        assert_eq!(locks(&mut env).mutexes.get(&mutex).copied(), held);
+        assert_eq!(env.cpu.reg(Reg::Esp), stack);
+    }
+}

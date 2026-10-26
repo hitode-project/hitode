@@ -49,7 +49,7 @@ pub fn register(registry: &mut Registry) {
         "timeGetTime",
         adv_abi::Conv::Stdcall { argc: 0 },
         get_time,
-        crate::kernel32::time::tick_leaf,
+        adv_machine::clock::tick_leaf,
     );
     for (name, argc, handler) in [
         ("timeGetDevCaps", 2, caps as adv_machine::Handler),

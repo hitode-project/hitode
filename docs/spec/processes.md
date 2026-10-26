@@ -70,8 +70,9 @@ This spec covers `adv-machine`, which schedules guest threads, owns time and dis
 
 ### PROC-CLOCK-3 Clock polling
 
-**Rule**: A context that only rereads the clock MAY wait for the next millisecond on each read. The streak that proves it MUST exceed bounded per-item loops, such as a 256-key scan read twice.
+**Rule**: Clock-only polling MAY wait for the next millisecond after a streak exceeding bounded per-item loops, including two 256-key scans.
 The built-in and Wine stacks MUST share clock-poll admission and preserve their clock API results.
+Clock leaves MUST preserve guest polling observations and decline required waits before clock or poll changes.
 **Verification**: Test
 
 ### PROC-CLOCK-4 Frame spin

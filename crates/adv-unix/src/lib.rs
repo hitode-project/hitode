@@ -20,7 +20,7 @@ mod ntdll;
 mod pthread;
 mod stdcall;
 
-use adv_cpu::backend::Backend;
+use adv_cpu::backend::{Backend, GuestExt};
 use adv_machine::{Conv, Env, HostFn, Machine, Outcome, Resolver};
 
 /// A host function of a Unix library's import.
@@ -49,7 +49,11 @@ impl Resolver for Platform {
         };
         Some(HostFn {
             leaf: None,
-            env_leaf: None,
+            env_leaf: match (module, name) {
+                (LIBC, "pthread_mutex_lock" | "pthread_mutex_unlock")
+                | (freetype::SONAME, "FT_Get_Char_Index") => Some(return_leaf),
+                _ => None,
+            },
             conv,
             handler,
             data: 0,
@@ -69,4 +73,18 @@ pub fn install<B: Backend>(machine: &mut Machine<B>) {
     machine
         .ext
         .insert(adv_nt::unixlib::Loader(loader::load_unixlib));
+}
+
+// Admitted handlers have no side effects on non-return outcomes.
+fn return_leaf(env: &mut Env<'_>) -> Option<u64> {
+    let binding = env.sys.thunks.get(env.thunk).f;
+    for i in 0..u32::from(binding.conv.argc()) {
+        env.cpu.arg(i).ok()?;
+    }
+    match (binding.handler)(env) {
+        Outcome::Return(value) => {
+            Some((u64::from(adv_abi::leaf_edx(env)) << 32) | u64::from(value))
+        }
+        _ => None,
+    }
 }
