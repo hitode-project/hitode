@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use adv_runtime::wine::session::{Config, Session, Stop};
 
-// spec: WINE-SES-10, WINE-SES-8
+// spec: WINE-SES-10, WINE-SES-8, WINE-SES-3, WINE-SES-1, WINE-DLL-3
 #[test]
 fn sequential_sessions_reclaim_clients_and_keep_the_prefix() {
     if std::env::var_os("ADV_WINE_DIST").is_none() || std::env::var_os("ADV_WINE_PROBES").is_none()
@@ -65,6 +65,7 @@ fn sequential_sessions_child() {
         stdout: None,
     };
     let mut host = Host::default();
+    let mut installed = None;
     #[cfg(target_os = "macos")]
     let mut descriptors = Vec::new();
     for turn in 0..4 {
@@ -93,6 +94,46 @@ fn sequential_sessions_child() {
                 |_| Ok(()),
             )
             .unwrap();
+        session
+            .machine
+            .visit_context(None, |env| {
+                let key = r"\Registry\Machine\Hardware\Description\System\BIOS";
+                let value =
+                    adv_nt::registry::platform_value(env, key, "SystemProductName").unwrap();
+                let expected = if turn == 0 {
+                    "Hitode Virtual Machine"
+                } else {
+                    "Hitode session marker"
+                };
+                let expected: Vec<_> = expected
+                    .encode_utf16()
+                    .chain([0])
+                    .flat_map(u16::to_le_bytes)
+                    .collect();
+                assert_eq!(
+                    value,
+                    Some((1, expected)),
+                    "server boot state was reinitialized"
+                );
+                adv_nt::registry::set_volatile_string(
+                    env,
+                    key,
+                    "SystemProductName",
+                    "Hitode session marker",
+                )
+                .unwrap();
+            })
+            .unwrap();
+        {
+            use std::os::unix::fs::MetadataExt;
+            let system = prefix.join("drive_c/windows/system32");
+            let files = ["ntdll.dll", "ddraw.dll", "winmm.dll"]
+                .map(|name| std::fs::symlink_metadata(system.join(name)).unwrap().ino());
+            if let Some(installed) = installed {
+                assert_eq!(files, installed, "unchanged prefix files were replaced");
+            }
+            installed = Some(files);
+        }
         assert!(
             host.start(
                 &config,

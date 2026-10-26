@@ -58,12 +58,13 @@ export interface GameValues {
   ff: FastForward;
   gothic: FontChoice;
   mincho: FontChoice;
+  chinese: FontChoice;
 }
 
 export type OverrideKey = keyof GameValues;
 
 /** Global defaults with no control on the settings screen. */
-export const GAME_DEFAULTS = { smooth: "game", gothic: "auto", mincho: "auto" } as const;
+export const GAME_DEFAULTS = { smooth: "game", gothic: "auto", mincho: "auto", chinese: "auto" } as const;
 
 export interface GameSetup {
   /** Code page the game's own strings are stored in. */

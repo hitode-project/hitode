@@ -56,6 +56,7 @@ export const messages: Record<string, [string, string]> = {
   "拉伸": ["Stretch", "引き伸ばす"],
   "超分辨率": ["Upscaling", "超解像"],
   "字体": ["Fonts", "フォント"],
+  "中文字体": ["Chinese fonts", "中国語フォント"],
   "{0} 的替换字体": ["Replacement font for {0}", "{0} の代替フォント"],
   "导入字体文件…": ["Import font file…", "フォントファイルをインポート…"],
   "字体预览": ["Font preview", "フォントプレビュー"],

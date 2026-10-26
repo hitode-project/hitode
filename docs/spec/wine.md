@@ -619,7 +619,7 @@ Device decoding follows [device.md](device.md).
 
 ### WINE-SES-1 Shared prefix
 
-**Rule**: Every game MUST run on the player's one prefix, kept between runs, with drive C: inside it or where the embedder places it. Each start MUST relink system32 and the template's module copies to the Wine installation. The program directory MUST use D: or the first unmounted letter after it, with writes in place.
+**Rule**: Every game MUST run on the player's one prefix, kept between runs, with drive C: inside it or where the embedder places it. A host MUST provision system32 and the template's module links before first using a drive C:. The program directory MUST use D: or the first unmounted letter after it, with writes in place.
 Process startup MUST register the prefix's drive letters in the server namespace.
 **Verification**: Test
 
@@ -630,10 +630,10 @@ Process startup MUST register the prefix's drive letters in the server namespace
 
 ### WINE-SES-3 Provisioned prefix
 
-**Rule**: A new prefix MUST start as a copy of the installation's template, `share/hitode/prefix`, and a session MUST NOT start without one. Each start MUST first run `wineboot.exe --restart` to its exit as its own process on the session's server. A process MUST start with its own variables, then those Wine's `add_registry_environment` adds.
+**Rule**: A host MUST provision a new prefix from the installation's template, `share/hitode/prefix`, before starting its server. A host MUST run `wineboot.exe --restart` successfully once on its server before discovering game fonts and starting games. A process MUST start with its own variables, then those Wine's `add_registry_environment` adds.
 **Verification**: Test
 
-`tools/wine/prefix-template.sh` makes the template with standard Wine's `wineboot --init`. The restart creates the volatile keys and the known DLLs before the program starts. The template is a distribution artifact, made where standard Wine runs, and not part of the repository.
+`tools/wine/prefix-template.sh` makes the template with standard Wine's `wineboot --init`. The restart creates the volatile keys and known DLLs for the server's lifetime. RunOnce and pending rename operations run at that boot boundary. The template is a distribution artifact, made where standard Wine runs, and not part of the repository.
 
 ### WINE-SES-4 Fixed identity
 
@@ -644,6 +644,10 @@ Process startup MUST register the prefix's drive letters in the server namespace
 
 **Rule**: A session's system and user locales MUST follow its ANSI code page: ja-JP for 932, zh-CN for 936. Wine MUST load fonts discovered by the portable backend, including nested directories. Missing standard families MUST use its regional matching order, require the declared character set, and prefer actual TrueType outlines without overriding installed families.
 **Verification**: Test
+
+macOS simplified Chinese matching prefers Heiti SC before Songti SC. Songti's
+Black and Bold faces also declare the Regular selection flag; Wine can choose
+Black for a normal-weight request to that family.
 
 ### WINE-SES-6 Installed system subdirectories
 
@@ -657,7 +661,7 @@ Process startup MUST register the prefix's drive letters in the server namespace
 
 ### WINE-SES-8 Host font choices
 
-**Rule**: Explicit host font choices MAY override installed families. Font files, substitutions, and smoothing MUST apply before rendering. Session font links, replacements, substitutions, and smoothing MUST NOT affect later sessions.
+**Rule**: Explicit host font choices MUST override matching font-creation requests without changing caller buffers, including when the requested family is installed. Font files, substitutions, and smoothing MUST apply before rendering and follow child processes. Session font links, replacements, substitutions, and smoothing MUST NOT affect later sessions.
 **Verification**: Test
 
 ### WINE-SES-9 Mounted file ownership

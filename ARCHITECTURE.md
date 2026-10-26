@@ -163,6 +163,9 @@ The player uses Wine on macOS, iOS and Android. `adv-shell::Execution` owns one
 execution thread and `adv-runtime::wine::session::Host` keeps the prefix server
 between games. Each game has its own session, machines, devices and mount sources;
 teardown saves the registry and releases every client before the finish callback.
+The host provisions and boots the prefix once per server, then installs game
+fonts without loading them in wineboot. System font discovery is reused between
+sessions; each session applies its own font links and registry overrides.
 The execution owner blocks between games. The launcher prepares the embedded Wine
 distribution off the UI thread; native views and input keep the same shell channels.
 The built-in stack remains available through the CLI for comparison.

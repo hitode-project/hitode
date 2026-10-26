@@ -58,6 +58,10 @@ struct Callbacks(HashMap<CtxId, Vec<Callback>>);
 #[derive(Clone, Copy)]
 pub struct Dispatcher(pub u32);
 
+/// An assembly's optional argument adaptation before entering a win32k body.
+/// Returning `None` leaves dispatch to the registered guest function.
+pub struct CallFilter(pub fn(&mut Env<'_>, u32, u32, &[u32]) -> Option<Outcome>);
+
 /// KeAddSystemServiceTable(functions, counters, limit, arguments, index)
 pub fn add_table(
     env: &mut Env<'_>,
@@ -103,6 +107,11 @@ pub fn call(env: &mut Env<'_>, number: u32) -> Outcome {
         return Outcome::Return(status::ACCESS_VIOLATION);
     };
     let args: Vec<u32> = (1..=u32::from(bytes) / 4).map(|i| env.arg(i)).collect();
+    if let Some(&CallFilter(filter)) = env.ext.try_get::<CallFilter>()
+        && let Some(outcome) = filter(env, number, function, &args)
+    {
+        return outcome;
+    }
     let peek = number == PEEK_MESSAGE;
     if peek {
         env.sys.begin_poll_peek();

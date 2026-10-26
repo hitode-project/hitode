@@ -9,17 +9,24 @@ use std::path::{Path, PathBuf};
 use adv_abi::dll::ModuleImage;
 
 pub fn install(prefix: &Path, image: &ModuleImage) -> io::Result<PathBuf> {
+    install_bytes(prefix, image.name(), image.bytes().to_vec())
+}
+
+/// Install a host image after its export metadata has been adjusted.
+pub fn install_bytes(prefix: &Path, name: &str, mut bytes: Vec<u8>) -> io::Result<PathBuf> {
     let directory = prefix.join("drive_c/windows/system32");
     std::fs::create_dir_all(&directory)?;
-    let path = directory.join(image.name());
+    let path = directory.join(name);
+    let signature = b"Wine builtin DLL\0";
+    bytes[0x40..0x40 + signature.len()].copy_from_slice(signature);
+    if !path.is_symlink() && std::fs::read(&path).is_ok_and(|existing| existing == bytes) {
+        return Ok(path);
+    }
     match std::fs::remove_file(&path) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
-    let mut bytes = image.bytes().to_vec();
-    let signature = b"Wine builtin DLL\0";
-    bytes[0x40..0x40 + signature.len()].copy_from_slice(signature);
     std::fs::write(&path, bytes)?;
     Ok(path)
 }
