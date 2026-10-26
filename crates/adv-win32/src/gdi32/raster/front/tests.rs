@@ -90,13 +90,14 @@ fn win32_message_readback_and_wait_boundaries_publish_only_the_writer_frame() {
         .set_frame_mailbox(tx, adv_sync::WakeEvent::new().unwrap());
     let dc = invoke(&mut m, data, get_dc_ABI, &[0]);
     let primary = m.ext.get::<SurfaceStore>().primary_id().unwrap();
-    let queue = |m: &mut Machine<JitCpu>| {
+    // Each frame changes the pixels; unchanged repeats publish nothing new.
+    let queue = |m: &mut Machine<JitCpu>, color: u32| {
         let store = m.ext.get_mut::<SurfaceStore>();
         store
             .fill_raw(
                 primary,
                 store[primary].rect(),
-                0x123456,
+                color,
                 &mut memory(&mut m.cpu),
             )
             .unwrap();
@@ -104,7 +105,7 @@ fn win32_message_readback_and_wait_boundaries_publish_only_the_writer_frame() {
             .present_from(0, primary, &memory(&mut m.cpu), store[primary].rect())
             .unwrap();
     };
-    for (name, args) in [
+    for (n, (name, args)) in [
         ("PeekMessageA", vec![data + 128, 0, 0, 0, 0]),
         ("PeekMessageW", vec![data + 128, 0, 0, 0, 0]),
         ("GetMessageA", vec![data + 128, 0, 0, 0]),
@@ -112,8 +113,11 @@ fn win32_message_readback_and_wait_boundaries_publish_only_the_writer_frame() {
         ("MsgWaitForMultipleObjects", vec![0, 0, 0, 0, 0]),
         ("GetPixel", vec![dc, 0, 0]),
         ("BitBlt", vec![dc, 0, 0, 1, 1, dc, 0, 0, 0xcc0020]),
-    ] {
-        queue(&mut m);
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        queue(&mut m, 0x123456 + n as u32);
         assert!(!rx.update());
         for (i, arg) in args.iter().enumerate() {
             m.cpu.write_u32(data + 4 + i as u32 * 4, *arg).unwrap();
@@ -137,6 +141,15 @@ fn win32_message_readback_and_wait_boundaries_publish_only_the_writer_frame() {
     }
 
     let before = m.ext.get::<SurfaceStore>().stats.presentations;
+    let store = m.ext.get_mut::<SurfaceStore>();
+    store
+        .fill_raw(
+            primary,
+            store[primary].rect(),
+            0x654321,
+            &mut memory(&mut m.cpu),
+        )
+        .unwrap();
     m.ext
         .get_mut::<SurfaceStore>()
         .present_from(
@@ -180,7 +193,7 @@ fn win32_message_readback_and_wait_boundaries_publish_only_the_writer_frame() {
         [1, 5, 0, 2]
     );
     assert_eq!(m.sys.completed_frames, 8);
-    queue(&mut m);
+    queue(&mut m, 0x112233);
     assert!(!rx.update());
     m.cpu.write_u32(data + 4, 0).unwrap();
     (registry.get("kernel32.dll", "ExitProcess").unwrap().handler)(&mut Env {
