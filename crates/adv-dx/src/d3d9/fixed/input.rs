@@ -1,6 +1,7 @@
 //! CPU streams for FVF-equivalent fixed vertex inputs. This reader has no
 //! programmable attributes, GPU layouts or resource ownership of its own.
 use super::*;
+use std::hash::{Hash, Hasher};
 
 pub(super) enum Input {
     Up { data: u32, stride: u32 },
@@ -14,11 +15,21 @@ struct Source {
 pub(super) struct Reader {
     sources: [Option<Source>; 16],
     raw: [Vec<u8>; 16],
+    batches: [Option<u32>; 16],
+    sizes: [u32; 16],
+    current: u32,
     start: u32,
 }
 impl Reader {
-    pub(super) fn key(&self) -> u128 {
-        super::super::recording::hash(&self.raw)
+    pub(super) fn hash(&self, key: &mut impl Hasher) {
+        let bytes: [&[u8]; 16] = std::array::from_fn(|n| self.bytes(n));
+        bytes.hash(key);
+    }
+    fn bytes(&self, stream: usize) -> &[u8] {
+        let offset = self.batches[stream].map_or(0, |first| {
+            ((self.current - first) * self.sources[stream].unwrap().stride) as usize
+        });
+        &self.raw[stream][offset..offset + self.sizes[stream] as usize]
     }
     pub(super) fn new(
         env: &Env<'_>,
@@ -27,6 +38,7 @@ impl Reader {
         input: Input,
         first: u32,
         last: u32,
+        vertices: u32,
     ) -> Result<Self, Rejected> {
         let mut sizes = [0u32; 16];
         for (stream, offset, bytes) in std::iter::once((
@@ -58,6 +70,8 @@ impl Reader {
         let first = first.checked_add(start).ok_or(INVALID)?;
         let last = last.checked_add(start).ok_or(INVALID)?;
         let mut sources = [None; 16];
+        let mut batches = [None; 16];
+        let mut spans = [(0, 0); 16];
         // Validate every used stream before reading or allocating vertex data.
         // An unused bound stream has no bearing on this declaration's draw.
         for (number, &minimum) in sizes.iter().enumerate().filter(|(_, size)| **size != 0) {
@@ -94,17 +108,42 @@ impl Reader {
             let offset = first.checked_mul(stride).ok_or(INVALID)?;
             let span = data.checked_add(offset).ok_or(INVALID)?;
             check_span(env, span, end - offset)?;
+            // Owned buffers are ordinary storage. Batch dense indexed input
+            // only when it reads no more bytes than the per-vertex path.
+            if matches!(input, Input::Bound { .. })
+                && u64::from(end - offset) <= u64::from(vertices) * u64::from(minimum)
+            {
+                batches[number] = Some(first);
+                spans[number] = (span, end - offset);
+            }
             sources[number] = Some(Source { data, stride });
+        }
+        let mut raw = std::array::from_fn(|stream| {
+            vec![0; batches[stream].map_or(sizes[stream], |_| spans[stream].1) as usize]
+        });
+        for (stream, first) in batches.iter().enumerate() {
+            if first.is_some() {
+                env.cpu
+                    .read(spans[stream].0, &mut raw[stream])
+                    .map_err(|_| rejected(INVALID, "declared stream vertex read failed"))?;
+            }
         }
         Ok(Self {
             sources,
-            raw: std::array::from_fn(|stream| vec![0; sizes[stream] as usize]),
+            raw,
+            batches,
+            sizes,
+            current: first,
             start,
         })
     }
     pub(super) fn read(&mut self, env: &Env<'_>, index: u32) -> Result<(), Rejected> {
         let index = index.checked_add(self.start).ok_or(INVALID)?;
-        for (source, raw) in self.sources.iter().zip(&mut self.raw) {
+        self.current = index;
+        for (number, (source, raw)) in self.sources.iter().zip(&mut self.raw).enumerate() {
+            if self.batches[number].is_some() {
+                continue;
+            }
             if let Some(source) = source {
                 let address = index
                     .checked_mul(source.stride)
@@ -118,7 +157,7 @@ impl Reader {
         Ok(())
     }
     pub(super) fn word(&self, stream: u16, offset: u32) -> [u8; 4] {
-        self.raw[stream as usize][offset as usize..offset as usize + 4]
+        self.bytes(stream as usize)[offset as usize..offset as usize + 4]
             .try_into()
             .unwrap()
     }

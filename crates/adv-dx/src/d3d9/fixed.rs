@@ -1177,8 +1177,9 @@ fn prepare_input_checked(
     let last = indices
         .and_then(|v| v.iter().max().copied())
         .unwrap_or(length - 1);
-    let mut input = input::Reader::new(env, pointer, layout, source, first, last)?;
-    let mut input_key = super::recording::hash(indices);
+    let mut input = input::Reader::new(env, pointer, layout, source, first, last, length)?;
+    let mut input_key = xxhash_rust::xxh3::Xxh3::new();
+    std::hash::Hash::hash(&indices, &mut input_key);
     let mut vertices = Vec::with_capacity(length as usize);
     let coordinate_count = layout.coordinate_count();
     let mut texcoords = if layout.extended_coordinates() {
@@ -1203,7 +1204,7 @@ fn prepare_input_checked(
     for ordinal in 0..length {
         let index = indices.map_or(ordinal, |v| v[ordinal as usize]);
         input.read(env, index)?;
-        input_key = super::recording::hash((input_key, input.key()));
+        input.hash(&mut input_key);
         let word = |stream: u16, at: u32| input.word(stream, at);
         let float = |stream, at| f32::from_le_bytes(word(stream, at));
         let at = layout.position;
@@ -1299,7 +1300,7 @@ fn prepare_input_checked(
         programmable: None,
         recording_key: super::recording::hash((
             super::recording::draw_key(env, pointer),
-            input_key,
+            input_key.digest128(),
         )),
         program_key: 0,
     })
