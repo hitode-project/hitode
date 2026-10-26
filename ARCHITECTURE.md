@@ -51,6 +51,7 @@ adv-runtime → adv-dx → adv-abi / adv-device
 adv-runtime → adv-drv → adv-unix → adv-nt (the Wine userland)
 adv-drv → adv-device
 adv-runtime → adv-wineserver (a Wine session connects the server to adv-nt)
+adv-nt → adv-wineserver (native queue key state)
 adv-dx → adv-os (transitional: fronts other than DirectDraw and D3D9)
 adv-cpu → adv-cpu-x64 (x86_64) / adv-cpu-a64 (AArch64) → adv-cpu-core
 adv-win32 / adv-dx / adv-shell → adv-device

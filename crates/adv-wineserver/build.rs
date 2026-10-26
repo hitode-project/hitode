@@ -16,6 +16,11 @@ fn main() {
         .filter(|path| path.extension().is_some_and(|extension| extension == "c"))
         .collect();
     sources.sort();
+    for source in &mut sources {
+        if source.file_name().is_some_and(|name| name == "queue.c") {
+            *source = "c/queue.c".into();
+        }
+    }
     cc::Build::new()
         .include("c")
         .include(wine.join("include"))

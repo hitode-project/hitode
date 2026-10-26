@@ -32,9 +32,8 @@ RULES: dict[str, set[str]] = {
     "adv-dx": {"adv-abi", "adv-device"},
     # Wine's server, run in process for the Wine userland stack (issue #58).
     "adv-wineserver": set(),
-    # The NT platform under Wine's userland; it talks to the server through
-    # its protocol, so the server crate is a test dependency only.
-    "adv-nt": {"adv-machine", "adv-pe"},
+    # The NT platform uses the server protocol and native queue access.
+    "adv-nt": {"adv-machine", "adv-pe", "adv-wineserver"},
     # Wine's Unix libraries as guest ELF code, over the NT platform.
     "adv-unix": {"adv-nt", "adv-abi"},
     # Wine's driver modules, over the Unix libraries and the host devices.

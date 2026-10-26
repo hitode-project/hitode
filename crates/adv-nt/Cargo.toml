@@ -21,7 +21,7 @@ libc = "0.2"
 [dev-dependencies]
 adv-device = { path = "../adv-device" }
 
-[target.'cfg(any(target_vendor = "apple", target_os = "android"))'.dev-dependencies]
+[target.'cfg(any(target_vendor = "apple", target_os = "android"))'.dependencies]
 adv-wineserver = { path = "../adv-wineserver" }
 
 [lints]

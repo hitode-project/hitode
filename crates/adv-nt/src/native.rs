@@ -21,6 +21,8 @@ use crate::identity::{self, Images};
 
 mod crt;
 mod dib;
+#[cfg(any(target_vendor = "apple", target_os = "android"))]
+mod input;
 mod mixer;
 mod nls;
 mod pixels;
@@ -58,6 +60,13 @@ static BODIES: std::sync::LazyLock<Vec<Body>> = std::sync::LazyLock::new(|| {
             name: "ntdll.dll!NtQueryPerformanceCounter".into(),
             conv: Conv::Stdcall { argc: 2 },
             leaf: query_performance_counter,
+            handler: resume_original,
+        },
+        #[cfg(any(target_vendor = "apple", target_os = "android"))]
+        Body {
+            name: "win32u.dll!NtUserGetKeyState".into(),
+            conv: Conv::Stdcall { argc: 1 },
+            leaf: input::key_state,
             handler: resume_original,
         },
         Body {

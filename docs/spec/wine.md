@@ -397,6 +397,11 @@ FreeType is a host library under WINE-UNIX-6.
 **Rule**: Native DEFLATE batches MUST preserve Wine's output, consumed input, bit reservoir, stream pointers and block-end state. Rejected batches MUST retain guest execution before guest writes. Stream and window layouts MUST match the pinned module's DWARF.
 **Verification**: Test
 
+### NAT-BODY-12 Queue key state
+
+**Rule**: The native `win32u.dll!NtUserGetKeyState` body MUST return Wine's synchronized queue key state, masked and sign-extended, to the guest. Missing server links, threads or queues MUST retain guest execution without creating a queue or leaving server errors or references.
+**Verification**: Test
+
 ## Host DLL images
 
 ### WINE-DLL-1 Loader-owned entries
