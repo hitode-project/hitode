@@ -123,6 +123,7 @@ impl Default for Registers {
 }
 #[derive(Default)]
 pub(super) struct Constants {
+    revision: u64,
     registers: Arc<Registers>,
     captured: std::cell::RefCell<Option<Captured>>,
 }
@@ -137,6 +138,7 @@ impl Clone for Constants {
     fn clone(&self) -> Self {
         Self {
             registers: self.registers.clone(),
+            revision: self.revision,
             captured: std::cell::RefCell::new(self.captured.borrow().clone()),
         }
     }
@@ -149,12 +151,14 @@ impl std::ops::Deref for Constants {
 }
 impl std::ops::DerefMut for Constants {
     fn deref_mut(&mut self) -> &mut Registers {
+        self.revision += 1;
         *self.captured.get_mut() = None;
         Arc::make_mut(&mut self.registers)
     }
 }
 impl Constants {
     fn invalidate_register(&mut self, register: usize) {
+        self.revision += 1;
         let captured = self.captured.get_mut();
         if captured
             .as_ref()
@@ -207,6 +211,9 @@ impl Constants {
             .unwrap()
             .snapshot
             .clone()
+    }
+    pub(super) fn revision(&self) -> u64 {
+        self.revision
     }
     pub(super) fn key(&self, usage: adv_device::constants::ConstantUsage) -> u128 {
         self.capture(usage, &[]).as_ref().unwrap().key

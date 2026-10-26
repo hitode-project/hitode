@@ -764,19 +764,18 @@ fn draw_indexed(
             vertices,
             base,
         )?;
-        if super::programmable::active(env, this.addr()) {
-            return super::programmable::prepare(
-                env,
-                this.addr(),
-                kind,
-                count,
-                None,
-                Some(&indices),
-                0,
-            );
-        }
-        fixed::prepare_bound(env, this.addr(), kind, count, 0, Some(&indices))
+        Ok(indices)
     })();
+    let indices = match result {
+        Ok(indices) => indices,
+        Err(error) => return Outcome::Return(error),
+    };
+    if super::programmable::active(env, this.addr()) {
+        return recording::indexed(env, this.addr(), (kind, count, &indices), |env| {
+            super::programmable::prepare(env, this.addr(), kind, count, None, Some(&indices), 0)
+        });
+    }
+    let result = fixed::prepare_bound(env, this.addr(), kind, count, 0, Some(&indices));
     match result {
         Ok(draw) => submit(env, this.addr(), draw, None),
         Err(error) => Outcome::Return(error),

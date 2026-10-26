@@ -14,6 +14,7 @@ pub(super) struct CachedFixed {
     state: Fixed,
     key: std::cell::Cell<Option<u128>>,
     inputs: std::cell::RefCell<input::GeometryCache>,
+    pub(super) captures: std::cell::RefCell<Option<Vec<(u32, u32, u128)>>>,
 }
 impl CachedFixed {
     pub(super) fn new(width: u32, height: u32) -> Self {
@@ -21,6 +22,7 @@ impl CachedFixed {
             state: Fixed::new(width, height),
             key: std::cell::Cell::new(None),
             inputs: Default::default(),
+            captures: Default::default(),
         }
     }
     pub(super) fn key(&self) -> u128 {
@@ -46,6 +48,9 @@ impl CachedFixed {
             }
         };
         let key = xxhash_rust::xxh3::xxh3_128(&bytes);
+        if let Some(captures) = self.captures.borrow_mut().as_mut() {
+            captures.push((address, length, key));
+        }
         let mut captures = self.inputs.borrow_mut();
         if let Some(bytes) = captures.stream(key) {
             return Ok(bytes);
@@ -143,6 +148,7 @@ impl Layout {
             || self.texcoords[0].is_some_and(|(_, _, dimensions)| dimensions != 2)
     }
 }
+#[derive(Clone)]
 pub(super) struct Draw {
     pub target: Target,
     pub image: Option<Image>,

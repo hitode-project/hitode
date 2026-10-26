@@ -8,9 +8,11 @@ use std::collections::HashMap;
 mod damage;
 mod key;
 mod passes;
+mod reuse;
 pub(super) use key::fixed as fixed_key;
 pub(super) use key::hash;
 pub(super) use key::rect;
+pub(super) use reuse::indexed;
 pub(super) fn draw_key(env: &Env<'_>, pointer: u32) -> u128 {
     let d = device(env, pointer).unwrap();
     let constants = |id: Option<Id>, c: &shaders::Constants| {
@@ -163,6 +165,7 @@ fn lookups() -> u64 {
 #[derive(Default)]
 pub(super) struct Recording {
     commands: Vec<Operation>,
+    reuse: reuse::Cache,
     passes: passes::Plan,
     damage: damage::Analysis,
     verify_region: Option<adv_device::surface::Rect>,
@@ -199,6 +202,7 @@ pub(super) fn forget(env: &mut Env<'_>, owner: Id, pointer: u32) {
         let f = &mut d.frame;
         let changed = f.contents.forget(pointer);
         f.binding_cache = None;
+        f.reuse = Default::default();
         f.damage.forget(pointer);
         if changed {
             f.partial = true;
@@ -806,6 +810,7 @@ fn finish(env: &mut Env<'_>, owner: Id, token: u64, presentation: u128, serial: 
     f.last_serial = serial;
     f.contents.reset();
     f.key = 0;
+    f.reuse.finish();
     f.partial = false;
     f.verdict = None;
     if let Some(Payload::Device(d)) = com(env).get_identity(&env.sys.objects, owner) {

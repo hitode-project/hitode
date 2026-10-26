@@ -248,6 +248,7 @@ impl std::hash::Hash for Pixels {
 
 // Keep ordinary hot commands inline. Only a parked command requires allocation.
 #[allow(clippy::large_enum_variant)]
+#[derive(Clone)]
 enum Operation {
     Clear {
         target: Target,

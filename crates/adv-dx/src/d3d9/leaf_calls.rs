@@ -3,9 +3,7 @@ use super::*;
 
 pub(super) fn draw(env: &mut Env<'_>) -> Option<u64> {
     let binding = env.sys.thunks.get(env.thunk).f;
-    for word in 0..u32::from(binding.conv.argc()) {
-        env.cpu.arg(word).ok()?;
-    }
+    readable_arguments(env)?;
     let this = env.cpu.arg(0).ok()?;
     let name = env.sys.thunks.get(env.thunk).name.as_str();
     let (count_word, up) = match name {
@@ -58,10 +56,9 @@ fn invoke(env: &mut Env<'_>) -> Option<u64> {
     }
 }
 fn readable_arguments(env: &Env<'_>) -> Option<()> {
-    for word in 0..u32::from(env.sys.thunks.get(env.thunk).f.conv.argc()) {
-        env.cpu.arg(word).ok()?;
-    }
-    Some(())
+    let address = env.cpu.reg(adv_cpu::backend::Reg::Esp).checked_add(4)?;
+    let bytes = u32::from(env.sys.thunks.get(env.thunk).f.conv.argc()) * 4;
+    adv_abi::guest::check_range(env.cpu, address, bytes, Prot::READ).ok()
 }
 pub(super) fn state_block(env: &mut Env<'_>) -> Option<u64> {
     readable_arguments(env)?;

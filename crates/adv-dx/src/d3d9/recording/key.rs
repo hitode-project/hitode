@@ -162,10 +162,10 @@ fn sample(env: &Env<'_>, id: Id, out: &mut Vec<Content>) {
 }
 pub(super) struct Bindings {
     signature: (Option<Id>, Option<Id>, u64),
-    output: [Option<Content>; 3],
-    samples: Vec<Content>,
+    pub(super) output: [Option<Content>; 3],
+    pub(super) samples: Vec<Content>,
 }
-fn bind(env: &mut Env<'_>, owner: Id) -> Result<(), u32> {
+pub(super) fn bind(env: &mut Env<'_>, owner: Id) -> Result<(), u32> {
     #[cfg(feature = "d3d9-counters")]
     lookup(1);
     let Some(Payload::Device(d)) = com(env).get_identity(&env.sys.objects, owner) else {
@@ -205,6 +205,7 @@ fn bind(env: &mut Env<'_>, owner: Id) -> Result<(), u32> {
     });
     Ok(())
 }
+#[derive(Clone)]
 pub(super) struct Prepared {
     #[cfg(feature = "d3d9-counters")]
     pub lookups: u64,

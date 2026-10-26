@@ -98,6 +98,22 @@ pub(in crate::d3d9) struct StateBlock {
     pub(in crate::d3d9) device: Id,
     snapshot: Option<Rc<Snapshot>>,
     versions: [u64; 15],
+    delta: std::cell::RefCell<Option<([u64; 15], Mask)>>,
+}
+impl StateBlock {
+    fn delta(&self, d: &super::super::Device) -> Mask {
+        let mut cached = self.delta.borrow_mut();
+        if cached
+            .as_ref()
+            .is_none_or(|(versions, _)| *versions != d.versions)
+        {
+            *cached = Some((
+                d.versions,
+                self.snapshot.as_ref().unwrap().delta(d, self.versions),
+            ));
+        }
+        cached.as_ref().unwrap().1.clone()
+    }
 }
 impl Snapshot {
     fn current(env: &Env<'_>, id: Id, mask: Mask) -> Option<Self> {
@@ -338,16 +354,19 @@ pub(in crate::d3d9) fn admits_leaf(env: &Env<'_>, pointer: u32, capture: bool) -
     if d.recording.is_some() || b.versions == d.versions {
         return true;
     }
+    let mask = b.delta(d);
+    if mask.dirty == 0 {
+        return true;
+    }
     let s = b.snapshot.as_ref().unwrap();
-    // Binding pairs compare values directly, so the captured mask yields the
-    // same pairs as the revision delta without building it.
+    // Share the revision delta with the handler before checking possible releases.
     let pairs = if capture {
         changes(
             &s.shaders,
             &s.buffers,
             s.texture,
             (&d.shaders, &d.buffers, d.texture),
-            &s.mask,
+            &mask,
         )
     } else {
         changes(
@@ -355,7 +374,7 @@ pub(in crate::d3d9) fn admits_leaf(env: &Env<'_>, pointer: u32, capture: bool) -
             &d.buffers,
             d.texture,
             (&s.shaders, &s.buffers, s.texture),
-            &s.mask,
+            &mask,
         )
     };
     // Public ownership guarantees that none of these releases frees guest storage.
@@ -687,6 +706,7 @@ fn make(env: &mut Env<'_>, device: Id, snapshot: Snapshot, output: GuestPtr<u32>
             device,
             snapshot: Some(Rc::new(snapshot)),
             versions: [u64::MAX; 15],
+            delta: Default::default(),
         })),
     ) else {
         for id in retained {
@@ -797,7 +817,7 @@ pub(in crate::d3d9) fn capture(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
     if b.versions == d.versions {
         return 0;
     }
-    let mask = old.delta(d, b.versions);
+    let mask = b.delta(d);
     let versions = d.versions;
     if mask.dirty == 0 {
         let Some(Payload::StateBlock(b)) =
@@ -844,6 +864,7 @@ pub(in crate::d3d9) fn capture(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
         unreachable!();
     };
     b.snapshot = Some(snapshot);
+    *b.delta.get_mut() = None;
     b.versions = versions;
     release_changes(env, &changes);
     0
@@ -881,7 +902,7 @@ pub(in crate::d3d9) fn apply(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
         count_apply(env, 0);
         return 0;
     }
-    let mask = snapshot.delta(d, versions);
+    let mask = b.delta(d);
     let versions = d.versions;
     if mask.dirty == 0 {
         let Some(Payload::StateBlock(b)) =
@@ -1266,6 +1287,47 @@ mod tests {
         assert_eq!(apply(&mut env, this_block), 0);
         assert_eq!(device(&env, pointer).unwrap().fixed.render[&22], 3);
         assert_eq!(device(&env, pointer).unwrap().fixed.render[&14], 1);
+    }
+
+    #[test]
+    // spec: GFX-REC-11, GFX-SHADER-4
+    fn d3d9_reuse_stateblock_delta_preserves_capture_apply_and_membership() {
+        let mut m = crate::d3d9::tests::machine();
+        let mut env = Env {
+            context: m.sys.current,
+            cpu: &mut m.cpu,
+            sys: &mut m.sys,
+            ext: &mut m.ext,
+            thunk: 0,
+        };
+        let (pointer, _, _, _) = crate::d3d9::tests::setup(&mut env);
+        let this = GuestPtr::new(pointer);
+        let output = GuestPtr::new(alloc(&mut env, 4).unwrap());
+        assert_eq!(begin(&mut env, this), 0);
+        assert_eq!(fixed::set_render(&mut env, this, 22, 3), 0);
+        assert_eq!(end(&mut env, this, output), 0);
+        let block_pointer = output.read(env.cpu).unwrap();
+        let block_this = GuestPtr::new(block_pointer);
+        assert_eq!(capture(&mut env, block_this), 0);
+        for _ in 0..3 {
+            assert_eq!(fixed::set_render(&mut env, this, 14, 0), 0);
+            assert!(admits_leaf(&env, block_pointer, false));
+            assert_eq!(apply(&mut env, block_this), 0);
+            assert_eq!(device(&env, pointer).unwrap().fixed.render[&14], 0);
+            assert_eq!(fixed::set_render(&mut env, this, 22, 1), 0);
+            assert!(admits_leaf(&env, block_pointer, false));
+            assert_eq!(apply(&mut env, block_this), 0);
+            assert_eq!(device(&env, pointer).unwrap().fixed.render[&22], 3);
+            assert!(admits_leaf(&env, block_pointer, true));
+            assert_eq!(capture(&mut env, block_this), 0);
+        }
+        assert_eq!(fixed::set_render(&mut env, this, 22, 2), 0);
+        assert!(admits_leaf(&env, block_pointer, true));
+        assert_eq!(capture(&mut env, block_this), 0);
+        assert_eq!(fixed::set_render(&mut env, this, 22, 1), 0);
+        assert!(admits_leaf(&env, block_pointer, false));
+        assert_eq!(apply(&mut env, block_this), 0);
+        assert_eq!(device(&env, pointer).unwrap().fixed.render[&22], 2);
     }
 
     fn fingerprint(d: &super::super::super::Device) -> u128 {

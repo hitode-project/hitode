@@ -175,6 +175,11 @@ Damage clipping remains a conservative region optimization under GFX-REC-4/5.
 **Rule**: GetRenderTargetData into a plain system-memory surface MUST queue its copy in submission order and return before completion. LockRect, GetDC, surface export and another readback into that surface MUST wait for the copy first. Texture-level destinations and a busy readback lane MUST keep the blocking path.
 **Verification**: Test
 
+### GFX-REC-11 Reusing draw preparation and state-block deltas
+
+**Rule**: Prepared draws MAY retain GPU leases for two frame generations, each bounded by 4096 entries and 64 MiB of logical draw data. Reuse MUST preserve commands, keys, damage, and pixels using complete 128-bit identities covering state, bindings, resource contents, constants, and producer changes. State-block admission and handlers MAY share revision deltas while preserving captured membership and exact values.
+**Verification**: Test
+
 ### GFX-PACE-1 Vsync-locked refresh boundaries
 
 **Rule**: Present boundaries MUST fall on host vsyncs, and a late Present MUST wait for the next one without repaying missed frames. At display rates within 1% of a whole multiple of the guest rate, on-time boundaries MUST be exactly that many vsyncs apart. Other rates MUST snap the guest's rational cadence to the nearest vsync after now.
