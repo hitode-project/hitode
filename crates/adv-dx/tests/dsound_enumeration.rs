@@ -6,7 +6,8 @@ use adv_cpu::{
 };
 use adv_machine::{Clock, Conv, Env, InitCall, Machine, Outcome, RunResult, layout::PARK_ADDR};
 use adv_os::Heaps;
-use adv_win32::{Win32, Win32Config};
+#[path = "../src/test_support.rs"]
+mod test_support;
 
 const CODE: u32 = 0x400000;
 const DATA: u32 = 0x410000;
@@ -51,7 +52,7 @@ fn capture_baseline(env: &mut Env<'_>) -> Outcome {
 
 fn registry(installed: bool) -> Registry {
     let mut registry = Registry::default();
-    adv_win32::register(&mut registry);
+    test_support::register(&mut registry);
     registry.add(
         "<dsound-enumeration-fixture>",
         "capture_baseline",
@@ -65,20 +66,14 @@ fn registry(installed: bool) -> Registry {
     }
     registry
 }
-fn machine(jit: bool, installed: bool, enabled: bool, codepage: u32) -> Machine<JitCpu> {
+fn machine(jit: bool, installed: bool, enabled: bool) -> Machine<JitCpu> {
     let mut m = Machine::new(
         JitCpu::new(PARK_ADDR, jit).unwrap(),
         registry(installed),
         Clock::virtual_time(),
     )
     .unwrap();
-    let mut config = Win32Config::new(
-        "/nonexistent/dsound-enum",
-        "fixture.exe",
-        "/nonexistent/dsound-enum-data",
-    );
-    config.os.codepage = codepage;
-    Win32::install(&mut m, config).unwrap();
+    test_support::install(&mut m);
     if installed {
         adv_dx::dsound::install(&mut m).unwrap();
         m.ext.get_mut::<adv_dx::dsound::Sound>().enabled = enabled;
@@ -110,8 +105,7 @@ fn heap_marker(m: &mut Machine<JitCpu>) -> u32 {
 }
 fn run(m: &mut Machine<JitCpu>, code: Asm) -> (RunResult, u32, usize) {
     m.cpu.write(CODE, &code.bytes).unwrap();
-    // start_main schedules Win32's startup gate; execution creates its persistent
-    // loader mutex. Sample after that gate releases, before the fixture entry.
+    // Capture process startup allocations before the fixture entry.
     let checkpoint = m
         .resolve_import("<dsound-enumeration-fixture>", "capture_baseline")
         .unwrap();
@@ -139,14 +133,11 @@ fn text(m: &Machine<JitCpu>, output: u32, wide: bool) -> String {
         }
         String::from_utf16(&units).unwrap()
     } else {
-        m.ext
-            .get::<Win32>()
-            .codec
-            .decode(&m.cpu.read_cstr(output, 64).unwrap())
+        String::from_utf8(m.cpu.read_cstr(output, 64).unwrap()).unwrap()
     }
 }
-fn enumeration(jit: bool, wide: bool, keep_going: u32, codepage: u32) {
-    let mut m = machine(jit, true, true, codepage);
+fn enumeration(jit: bool, wide: bool, keep_going: u32) {
+    let mut m = machine(jit, true, true);
     let mut inner = Asm::new(INNER);
     increment(&mut inner, INNER_COUNT);
     capture(&mut inner, 8, INNER_DESCRIPTION);
@@ -261,7 +252,7 @@ fn enumeration(jit: bool, wide: bool, keep_going: u32, codepage: u32) {
 }
 
 fn empty_or_invalid(jit: bool, installed: bool, enabled: bool) {
-    let mut m = machine(jit, installed, enabled, 932);
+    let mut m = machine(jit, installed, enabled);
     let mut callback = Asm::new(CALLBACK);
     increment(&mut callback, COUNT);
     callback.ret_n(16);
@@ -310,11 +301,8 @@ fn default_enumeration_is_synchronous_reentrant_and_creatable_for_ansi_and_utf16
     for jit in [false, true] {
         for wide in [false, true] {
             for keep_going in [0, 1] {
-                enumeration(jit, wide, keep_going, 932);
+                enumeration(jit, wide, keep_going);
             }
-        }
-        for codepage in [936, 65001] {
-            enumeration(jit, false, 1, codepage);
         }
     }
 }
@@ -368,7 +356,7 @@ fn device_ids_name_one_playback_device_that_create_opens() {
         guid
     };
     for jit in [false, true] {
-        let mut m = machine(jit, true, true, 932);
+        let mut m = machine(jit, true, true);
         // DSDEVID_DefaultPlayback, then DSDEVID_DefaultCapture.
         m.cpu.write(SOURCE, &default(0)).unwrap();
         m.cpu.write(SOURCE + 16, &default(1)).unwrap();

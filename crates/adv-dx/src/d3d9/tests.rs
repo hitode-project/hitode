@@ -19,9 +19,7 @@ fn machine_with_limits(native: bool, references: u32) -> Machine<JitCpu> {
         references,
         ..ObjectLimits::default()
     });
-    let mut heaps = Heaps::default();
-    heaps.process_heap = heaps.create(&mut m.cpu, &mut m.sys.vm).unwrap();
-    m.ext.insert(heaps);
+    crate::test_support::install(&mut m);
     let com = Com::new(&mut m.sys.objects).unwrap();
     let provider = SurfaceProvider {
         allocator: test_allocator(),
@@ -536,26 +534,5 @@ pub(super) fn test_allocator() -> crate::interop::GuestAllocator {
     }
 }
 pub(super) fn test_dc() -> crate::interop::MemoryDc {
-    use adv_win32::gdi32::raster::front::surface_dc;
-    crate::interop::MemoryDc {
-        create: |env, surface, then| {
-            let result = surface_dc::acquire(
-                env,
-                surface.width,
-                surface.height,
-                surface.pixels,
-                surface.pitch,
-            );
-            then(env, result)
-        },
-        flush: |env, dc, surface, then| {
-            let result = surface_dc::writeback(env, dc, surface.pixels, surface.pitch);
-            then(env, result)
-        },
-        release: |env, dc, then| {
-            surface_dc::release(env, dc);
-            then(env, Ok(()))
-        },
-        discard: surface_dc::release,
-    }
+    crate::test_support::dc::provider()
 }
