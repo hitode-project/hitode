@@ -59,7 +59,9 @@ android {
         buildConfig = true
     }
     packaging {
-        jniLibs.useLegacyPackaging = false
+        // Releases are downloaded directly: compressing the library halves the APK,
+        // and its Wine archive is unpacked to app data either way.
+        jniLibs.useLegacyPackaging = true
     }
 }
 

@@ -12,7 +12,7 @@ This spec covers the Android player: its package, its lifecycle and input, and t
 
 ### AND-APP-2 16 KiB alignment
 
-**Rule**: Every ELF LOAD segment in the APK MUST be aligned to at least 16 KiB. Shared libraries MUST be stored without compression and their ZIP data MUST start on a 16 KiB boundary.
+**Rule**: Every ELF LOAD segment in the APK MUST be aligned to at least 16 KiB. Shared libraries MAY be compressed, so the installer extracts them; a stored library's ZIP data MUST start on a 16 KiB boundary.
 **Applies to**: Android
 **Verification**: Test — `tools/android/check-apk.py` verifies ELF and ZIP alignment, with authored fixtures in `test_check_apk.py`.
 

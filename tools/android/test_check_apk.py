@@ -42,15 +42,16 @@ class ApkTests(unittest.TestCase):
                 archive.writestr("classes.dex", b"fixture")
                 add_library(archive, "lib/arm64-v8a/first.so", elf())
                 add_library(archive, "lib/arm64-v8a/second.so", elf(65536))
-            self.assertEqual(checker.check_apk(path), (2, 2))
+                add_library(archive, "lib/arm64-v8a/third.so", elf(), aligned=False, compressed=True)
+            self.assertEqual(checker.check_apk(path), (3, 3))
 
     # spec: AND-APP-2
-    def test_compression_and_zip_alignment_are_rejected(self):
-        for options in ({"aligned": False}, {"compressed": True}):
+    def test_stored_zip_alignment_and_compressed_elf_alignment_are_checked(self):
+        for library, options in ((elf(), {"aligned": False}), (elf(4096), {"compressed": True})):
             with self.subTest(options=options), tempfile.TemporaryDirectory() as directory:
                 path = Path(directory) / "fixture.apk"
                 with zipfile.ZipFile(path, "w") as archive:
-                    add_library(archive, "lib/arm64-v8a/game.so", elf(), **options)
+                    add_library(archive, "lib/arm64-v8a/game.so", library, **options)
                 with self.assertRaises(ValueError):
                     checker.check_apk(path)
 

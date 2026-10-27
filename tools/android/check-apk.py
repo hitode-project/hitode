@@ -3,7 +3,7 @@
 
 Usage: python tools/android/check-apk.py <apk>
 Input: an APK ZIP containing ELF shared libraries (32/64-bit, either byte order).
-Output: library/LOAD-segment counts; exit 1 for compressed or misaligned libraries,
+Output: library/LOAD-segment counts; exit 1 for misaligned libraries,
 invalid ELF/ZIP data, or an APK without shared libraries. No extraction is needed.
 """
 import argparse
@@ -40,23 +40,23 @@ def check_elf(data):
 
 
 def check_apk(path):
-    """Check stored ZIP offsets and ELF alignment; return (libraries, LOADs)."""
+    """Check ELF alignment, and ZIP offsets of stored libraries; return (libraries, LOADs)."""
     libraries = loads = 0
     with zipfile.ZipFile(path) as archive, open(path, "rb") as raw:
         for entry in archive.infolist():
             if not entry.filename.endswith(".so"):
                 continue
             libraries += 1
-            if entry.compress_type != zipfile.ZIP_STORED:
-                raise ValueError("shared library is compressed")
-            raw.seek(entry.header_offset)
-            header = raw.read(30)
-            if header[:4] != b"PK\x03\x04":
-                raise ValueError("invalid ZIP local header")
-            name_size, extra_size = struct.unpack_from("<HH", header, 26)
-            start = entry.header_offset + 30 + name_size + extra_size
-            if start % PAGE:
-                raise ValueError("shared library ZIP data is not 16 KiB aligned")
+            # The installer extracts compressed libraries; stored ones map in place.
+            if entry.compress_type == zipfile.ZIP_STORED:
+                raw.seek(entry.header_offset)
+                header = raw.read(30)
+                if header[:4] != b"PK\x03\x04":
+                    raise ValueError("invalid ZIP local header")
+                name_size, extra_size = struct.unpack_from("<HH", header, 26)
+                start = entry.header_offset + 30 + name_size + extra_size
+                if start % PAGE:
+                    raise ValueError("shared library ZIP data is not 16 KiB aligned")
             loads += check_elf(archive.read(entry))
     if not libraries:
         raise ValueError("APK has no shared libraries")
@@ -72,7 +72,7 @@ def main():
     except (OSError, ValueError, struct.error, zipfile.BadZipFile) as error:
         print(f"FAIL: {error}", file=sys.stderr)
         return 1
-    print(f"OK: {libraries} shared libraries, {loads} LOAD segments; stored and 16 KiB aligned")
+    print(f"OK: {libraries} shared libraries, {loads} LOAD segments; 16 KiB aligned")
     return 0
 
 
