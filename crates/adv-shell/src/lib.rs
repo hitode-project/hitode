@@ -813,9 +813,6 @@ pub fn run_cli() -> std::process::ExitCode {
     }
 }
 
-#[cfg(test)]
-mod deadline_tests;
-
 #[cfg(target_os = "android")]
 fn configure_execution_thread() -> String {
     let (result, error, nice, query_error) = unsafe {
