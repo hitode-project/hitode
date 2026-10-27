@@ -108,15 +108,6 @@ impl SharedAllocation {
         };
     }
 
-    #[cfg(windows)]
-    pub fn map_linear(
-        &self,
-        reservation: &crate::virtual_memory::Reservation,
-        offset: usize,
-    ) -> Result<(), String> {
-        reservation.map_section(offset, self.len, self.mapping.handle.as_ptr())
-    }
-
     pub fn store_bytes(&self, offset: usize, input: &[u8]) {
         assert!(self.writable, "store to a read-only shared view");
         assert!(
@@ -168,146 +159,6 @@ impl crate::backend::SharedReadView for SharedAllocation {
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use crate::dual_view::create_backing;
-
-#[cfg(windows)]
-mod os {
-    use super::*;
-    use std::ffi::c_void;
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn CreateFileMappingW(
-            file: *mut c_void,
-            attributes: *const c_void,
-            protection: u32,
-            size_high: u32,
-            size_low: u32,
-            name: *const u16,
-        ) -> *mut c_void;
-        fn MapViewOfFile(
-            mapping: *mut c_void,
-            access: u32,
-            offset_high: u32,
-            offset_low: u32,
-            bytes: usize,
-        ) -> *mut c_void;
-        fn UnmapViewOfFile(address: *const c_void) -> i32;
-        fn CloseHandle(handle: *mut c_void) -> i32;
-    }
-
-    pub(super) struct Mapping {
-        pub read: NonNull<u8>,
-        pub write: NonNull<u8>,
-        pub(super) handle: NonNull<c_void>,
-    }
-    impl Mapping {
-        pub fn new(len: usize) -> Result<Self, String> {
-            // SAFETY: page-file-backed mapping with no inherited handle/name.
-            let handle = NonNull::new(unsafe {
-                CreateFileMappingW(
-                    (-1isize) as *mut c_void,
-                    std::ptr::null(),
-                    4,
-                    ((len as u64) >> 32) as u32,
-                    len as u32,
-                    std::ptr::null(),
-                )
-            })
-            .ok_or_else(|| format!("create shared PCM: {}", std::io::Error::last_os_error()))?;
-            let write =
-                NonNull::new(unsafe { MapViewOfFile(handle.as_ptr(), 2, 0, 0, len).cast::<u8>() });
-            let read =
-                NonNull::new(unsafe { MapViewOfFile(handle.as_ptr(), 4, 0, 0, len).cast::<u8>() });
-            if let (Some(write), Some(read)) = (write, read) {
-                Ok(Self {
-                    read,
-                    write,
-                    handle,
-                })
-            } else {
-                let error = std::io::Error::last_os_error();
-                unsafe {
-                    if let Some(p) = write {
-                        UnmapViewOfFile(p.as_ptr().cast());
-                    }
-                    if let Some(p) = read {
-                        UnmapViewOfFile(p.as_ptr().cast());
-                    }
-                    CloseHandle(handle.as_ptr());
-                }
-                Err(format!("map shared PCM aliases: {error}"))
-            }
-        }
-    }
-    impl Drop for Mapping {
-        fn drop(&mut self) {
-            // SAFETY: Arc retains both views; destruction occurs only after the
-            // guest page owners and independently held read aliases are gone.
-            unsafe {
-                UnmapViewOfFile(self.read.as_ptr().cast());
-                UnmapViewOfFile(self.write.as_ptr().cast());
-                CloseHandle(self.handle.as_ptr());
-            }
-        }
-    }
-}
-
-#[cfg(all(test, windows))]
-mod tests {
-    use super::*;
-    #[repr(C)]
-    #[derive(Default)]
-    struct MemoryInfo {
-        base: usize,
-        allocation: usize,
-        allocation_protection: u32,
-        partition: u16,
-        region: usize,
-        state: u32,
-        protection: u32,
-        kind: u32,
-    }
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn VirtualQuery(
-            address: *const std::ffi::c_void,
-            info: *mut std::ffi::c_void,
-            len: usize,
-        ) -> usize;
-    }
-    #[test]
-    fn callback_alias_is_os_read_only_and_reads_the_same_physical_bytes() {
-        let storage = SharedAllocation::new(8192).unwrap();
-        let mut read = MemoryInfo::default();
-        let mut write = MemoryInfo::default();
-        // SAFETY: query-only OS operation on the two live views.
-        unsafe {
-            assert_ne!(
-                VirtualQuery(
-                    storage.mapping.read.as_ptr().cast(),
-                    (&mut read as *mut MemoryInfo).cast(),
-                    std::mem::size_of::<MemoryInfo>()
-                ),
-                0
-            );
-            assert_ne!(
-                VirtualQuery(
-                    storage.mapping.write.as_ptr().cast(),
-                    (&mut write as *mut MemoryInfo).cast(),
-                    std::mem::size_of::<MemoryInfo>()
-                ),
-                0
-            );
-        }
-        assert_eq!(read.protection, 2); // PAGE_READONLY
-        assert_eq!(write.protection, 4); // PAGE_READWRITE
-        assert_ne!(read.base, write.base);
-        storage.store_u8(0, 0x91);
-        storage.store_u8(8191, 0x37);
-        assert_eq!(storage.load_u8(0), 0x91);
-        assert_eq!(storage.load_u8(8191), 0x37);
-        assert_eq!(storage.load_u8(8192), 0);
-    }
-}
 
 #[cfg(any(
     target_os = "linux",
@@ -562,7 +413,6 @@ mod os {
 }
 
 #[cfg(not(any(
-    windows,
     target_os = "linux",
     target_os = "android",
     target_os = "macos",

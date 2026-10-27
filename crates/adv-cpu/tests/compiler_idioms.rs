@@ -85,7 +85,6 @@ fn leave32_restores_aligned_and_unaligned_frames_without_changing_lazy_flags() {
                 assert_eq!(jit.state.regs[5], 0xdead_beef);
             }
         }
-        support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
     }
 }
 
@@ -142,7 +141,7 @@ fn leave32_read_fault_commits_neither_stack_register_and_restarts_after_repair()
             );
             equal_registers_and_flags(&jit, &reference);
             assert_eq!(jit.state.fault_addr, address);
-            support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
+
             let mut uc = machine(&bytes, None);
             uc.state = reference.state.clone();
             for m in [&mut jit, &mut uc] {
@@ -162,7 +161,6 @@ fn leave32_read_fault_commits_neither_stack_register_and_restarts_after_repair()
             );
             assert_eq!(jit.state.regs[4], frame + 8);
             assert_eq!(jit.state.regs[5], 0x1234_5678);
-            support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
         }
     }
 }
@@ -206,7 +204,6 @@ fn cdq_preserves_raw_and_lazy_flags_and_sign_extends_only_eax() {
                     assert_eq!(jit.state.eflags, 0xed7);
                 }
             }
-            support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
         }
     }
 }
@@ -251,7 +248,6 @@ fn word_leave_and_cwd_match_oracle_operand_size_semantics() {
                 }
             }
             // Word LEAVE still interprets; CWD compiles.
-            support::x64_shape!(assert_eq!(jit.stats.interpreter_entries > 0, leave));
         }
     }
 }

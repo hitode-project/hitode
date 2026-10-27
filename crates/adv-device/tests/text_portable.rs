@@ -1,6 +1,6 @@
 //! Real portable font geometry/raster/ownership checks. The authored fixtures
 //! keep the test independent of fonts installed on a developer's host.
-#![cfg(not(windows))]
+
 use adv_device::{
     surface::{PixelFormat, Rect, Snapshot, SurfaceMemory, Surfaces},
     text::*,

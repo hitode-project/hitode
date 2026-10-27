@@ -108,7 +108,6 @@ fn carry_from_mixed_predecessors_survives_partial_writers_and_a_fault() {
                     }
                 }
             }
-            support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
         }
     }
 }
@@ -145,7 +144,6 @@ fn carry_controls_preserve_carried_overflow_after_rotate_and_multiply() {
                     }
                 }
             }
-            support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
         }
     }
 }
@@ -216,7 +214,6 @@ fn undefined_flags_after_shift_rotate_and_multiply_match_the_interpreter() {
                             }
                         }
                     }
-                    support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
                 }
             }
         }

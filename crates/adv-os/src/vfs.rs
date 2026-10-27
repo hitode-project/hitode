@@ -23,7 +23,7 @@ mod attributes;
 pub mod host;
 mod mutation;
 mod names;
-#[cfg(not(windows))]
+
 pub use mutation::sync_move;
 mod installer_state;
 mod optical;

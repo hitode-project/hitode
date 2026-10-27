@@ -96,10 +96,6 @@ fn integer_flags_match_unicorn_at_overflow_and_carry_boundaries() {
                 );
             }
         }
-        support::x64_shape!(assert_eq!(
-            jit.stats.interpreter_entries, 0,
-            "operation {operation}"
-        ));
     }
 }
 
@@ -127,8 +123,6 @@ fn direct_loop_and_memory_keep_execution_in_one_native_region() {
         reset(m, [0, 64, 0, 0, 0, 0, DATA, DATA + 1024], 2);
     }
     equal(&mut jit, &mut uc, 0x8d5);
-    support::x64_shape!(assert_eq!(jit.stats.native_entries, 1));
-    support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
 }
 
 #[test]
@@ -151,8 +145,6 @@ fn calls_returns_and_indirect_targets_stay_native() {
     reset(&mut uc, [0, 100, 0, 0, 0, 0, 0, 0], 2);
     equal(&mut jit, &mut uc, 0x8d5);
     assert_eq!(jit.state.regs[0], 300);
-    support::x64_shape!(assert_eq!(jit.stats.native_entries, 1));
-    support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
 }
 
 #[test]
@@ -178,9 +170,6 @@ fn interpreted_instruction_returns_without_replaying_native_writes() {
     assert_eq!(jit.memory().read(DATA, 4).unwrap(), 5u32.to_le_bytes());
     // The cold interpreter may include successors in each window. Count real
     // work while the memory and architectural comparisons catch any replay.
-    support::x64_shape!(assert!(jit.stats.interpreter_entries >= 5));
-    support::x64_shape!(assert!(jit.stats.interpreter_instructions >= 5));
-    support::x64_shape!(assert!(jit.stats.native_entries >= 5));
 }
 
 #[test]
@@ -219,23 +208,6 @@ fn faults_keep_arithmetic_flags_that_later_code_can_read() {
     assert_eq!(jit.state.eflags & 0x8d5, 0x10);
 }
 
-#[cfg_attr(target_arch = "aarch64", ignore = "Cranelift execution shape")]
-#[test]
-fn budget_yields_in_a_busy_loop_without_a_system_call() {
-    let code = assemble(|a| {
-        let mut top = a.create_label();
-        a.set_label(&mut top).unwrap();
-        a.inc(eax).unwrap();
-        a.jmp(top).unwrap();
-    });
-    let mut jit = machine(&code, true);
-    assert_eq!(jit.run(STOP, 1000).unwrap(), RunOutcome::Budget);
-    assert_eq!(jit.state.regs[0], 1000);
-    assert_eq!(jit.state.eip, CODE);
-    assert_eq!(jit.run(STOP, 3).unwrap(), RunOutcome::Budget);
-    assert_eq!(jit.state.regs[0], 1003);
-}
-
 #[test]
 fn host_patch_invalidates_native_and_unicorn_code() {
     let code = assemble(|a| {
@@ -248,7 +220,6 @@ fn host_patch_invalidates_native_and_unicorn_code() {
     reset(&mut jit, [0; 8], 2);
     assert_eq!(jit.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
     assert_eq!(jit.state.regs[0], 42);
-    support::x64_shape!(assert_eq!(jit.stats.invalidations, 1));
 }
 
 #[test]
@@ -265,7 +236,6 @@ fn guest_patch_exits_before_write_and_invalidates_the_active_region() {
     assert_eq!(jit.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
     assert_eq!(jit.state.regs[0], 42);
     assert_eq!(jit.memory().read(CODE + 7, 4).unwrap(), 42u32.to_le_bytes());
-    support::x64_shape!(assert!(jit.stats.invalidations >= 1));
 }
 
 #[test]
@@ -326,7 +296,6 @@ fn all_conditions_observe_lazy_flags_after_comparison() {
                 equal(&mut jit, &mut uc, 0x8d5);
             }
         }
-        support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
     }
 }
 
@@ -359,9 +328,6 @@ fn an_indirect_target_is_reloaded_after_a_pointer_patch() {
         assert_eq!(jit.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
         assert_eq!(jit.state.regs[0], expected);
     }
-    support::x64_shape!(assert_eq!(jit.stats.compilations, 1));
-    support::x64_shape!(assert_eq!(jit.stats.native_entries, 2));
-    support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
 }
 
 #[test]
@@ -386,7 +352,6 @@ fn interpreted_floating_state_survives_native_islands() {
     equal(&mut jit, &mut uc, 0x8d5);
     assert_eq!(jit.memory().read(DATA, 4).unwrap(), 10f32.to_le_bytes());
     // The loop's x87 instructions stay inside the native region.
-    support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
 }
 
 #[test]
@@ -418,7 +383,6 @@ fn interpreted_sse_state_survives_native_islands() {
     }
     equal(&mut jit, &mut uc, 0x8d5);
     assert_eq!(jit.memory().read(DATA + 32, 4).unwrap(), 9u32.to_le_bytes());
-    support::x64_shape!(assert!(jit.stats.native_entries >= 9));
 }
 
 #[test]
@@ -488,7 +452,6 @@ fn bytecode_loads_sign_extension_and_partial_registers_match() {
         }
         equal(&mut jit, &mut uc, 0x8d5);
     }
-    support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
 }
 
 #[test]
@@ -528,7 +491,6 @@ fn a_modified_return_address_misses_the_native_return_hint() {
     let mut uc = machine(&code, false);
     equal(&mut jit, &mut uc, 0x8d5);
     assert_eq!(jit.state.regs[0], 17);
-    support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
 }
 
 #[test]
@@ -586,10 +548,6 @@ fn integer_sse2_lanes_match_unicorn_including_saturation_and_packing() {
             }
             equal(&mut jit, &mut uc, 0x8d5);
         }
-        support::x64_shape!(assert_eq!(
-            jit.stats.interpreter_entries, 0,
-            "SSE2 operation {op}"
-        ));
     }
 }
 
@@ -612,7 +570,6 @@ fn sse2_shift_counts_at_and_above_lane_width_zero_the_result() {
             m.write(DATA, &[0xfd; 16]).unwrap();
         }
         equal(&mut jit, &mut uc, 0x8d5);
-        support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
     }
 }
 
@@ -633,130 +590,4 @@ fn vector_store_fault_checks_both_pages_before_writing() {
     );
     assert_eq!(jit.memory().read(DATA + 4088, 16).unwrap(), [0; 16]);
     assert_eq!(jit.state.xmm[0], [0xa5; 16]);
-}
-
-#[cfg_attr(target_arch = "aarch64", ignore = "Cranelift execution shape")]
-#[test]
-fn cliffs_count_native_fallbacks_by_instruction() {
-    let code = assemble(|a| {
-        let mut top = a.create_label();
-        a.set_label(&mut top).unwrap();
-        a.inc(eax).unwrap();
-        a.pause().unwrap();
-        a.dec(ecx).unwrap();
-        a.jnz(top).unwrap();
-        a.ret().unwrap();
-    });
-    let mut jit = machine(&code, true);
-    reset(&mut jit, [0, 9, 0, 0, 0, 0, 0, 0], 2);
-    assert_eq!(jit.run(STOP, 1_000_000).unwrap(), RunOutcome::ReachedStop);
-    let cliffs = &jit.stats.cliffs;
-    assert!(cliffs.fallbacks[&iced_x86::Mnemonic::Pause] >= 9);
-    let fallback = cliffs.interpreter[&adv_cpu::InterpreterReason::Fallback];
-    assert!(fallback.entries >= 9);
-    assert!(fallback.instructions >= fallback.entries);
-}
-
-#[cfg_attr(target_arch = "aarch64", ignore = "Cranelift execution shape")]
-#[test]
-fn cliffs_attribute_exact_x87_work_to_the_control_word() {
-    for (control, inexact, reason) in [
-        (0x027f_u16, false, None),
-        (0x037f, false, None),
-        (0x037f, true, Some(adv_cpu::X87Cliff::Control)),
-        (0x077f, false, Some(adv_cpu::X87Cliff::Control)),
-        (0x0b7f, false, Some(adv_cpu::X87Cliff::Control)),
-        (0x0f7f, false, Some(adv_cpu::X87Cliff::Control)),
-        (0x037e, false, Some(adv_cpu::X87Cliff::Control)),
-    ] {
-        let code = assemble(|a| {
-            a.fldcw(word_ptr(DATA)).unwrap();
-            a.fld(qword_ptr(DATA + 8)).unwrap();
-            a.fdiv(qword_ptr(DATA + 24)).unwrap();
-            a.fld(qword_ptr(DATA + 8)).unwrap();
-            a.fmul_2(st0, st1).unwrap();
-            a.fstp(qword_ptr(DATA + 16)).unwrap();
-            a.fstp(st0).unwrap();
-            a.ret().unwrap();
-        });
-        let mut jit = machine(&code, true);
-        jit.write(DATA, &control.to_le_bytes()).unwrap();
-        jit.write(DATA + 8, &3.0f64.to_le_bytes()).unwrap();
-        jit.write(
-            DATA + 24,
-            &(if inexact { 5.0f64 } else { 3.0f64 }).to_le_bytes(),
-        )
-        .unwrap();
-        assert_eq!(jit.run(STOP, 1_000_000).unwrap(), RunOutcome::ReachedStop);
-        assert_eq!(
-            jit.memory().read(DATA + 16, 8).unwrap(),
-            (if inexact { 1.8f64 } else { 3.0f64 }).to_le_bytes()
-        );
-        let cliffs = &jit.stats.cliffs;
-        let exact = cliffs
-            .x87_exact
-            .iter()
-            .filter(|((_, r), _)| Some(*r) == reason);
-        assert_eq!(
-            exact.count() > 0,
-            reason.is_some(),
-            "control={control:#x} {cliffs:?}"
-        );
-        assert!(
-            cliffs.x87_exact.keys().all(|(_, r)| Some(*r) == reason),
-            "{cliffs:?}"
-        );
-        let candidates = cliffs.x87_pc64_rows();
-        if control == 0x037f && inexact {
-            assert!(
-                candidates
-                    .iter()
-                    .any(|(label, n)| label == "Fdiv/Other" && *n > 0)
-            );
-            assert!(!candidates.iter().any(|(label, _)| label == "Fmul/Exact"));
-            assert_eq!(
-                candidates.iter().map(|(_, n)| n).sum::<u64>(),
-                cliffs.x87_control[&0x033f]
-            );
-        } else {
-            assert!(candidates.is_empty(), "{control:#x}: {candidates:?}");
-        }
-    }
-}
-
-#[test]
-#[cfg(not(target_arch = "aarch64"))] // x64 tier verification
-fn tier_verification_checks_new_regions_without_changing_results() {
-    let code = assemble(|a| {
-        let mut top = a.create_label();
-        let mut leaf = a.create_label();
-        a.set_label(&mut top).unwrap();
-        a.add(eax, ecx).unwrap();
-        a.mov(dword_ptr(edi), eax).unwrap();
-        a.add(edi, 4).unwrap();
-        a.call(leaf).unwrap();
-        a.dec(ecx).unwrap();
-        a.jnz(top).unwrap();
-        a.ret().unwrap();
-        a.set_label(&mut leaf).unwrap();
-        a.push(ebx).unwrap();
-        a.lea(ebx, dword_ptr(eax + eax * 2 + 1)).unwrap();
-        a.pop(edx).unwrap();
-        a.ret().unwrap();
-    });
-    let mut results = Vec::new();
-    for verify in [false, true] {
-        let mut jit = machine(&code, true);
-        jit.set_tier_verification(verify.then_some(true));
-        reset(&mut jit, [0, 50, 0, 7, 0, 0, 0, DATA], 2);
-        assert_eq!(jit.run(STOP, 1_000_000).unwrap(), RunOutcome::ReachedStop);
-        let checks = &jit.stats.verification;
-        assert_eq!(checks.mismatches, 0, "{checks:?}");
-        assert_eq!(checks.verified > 0, verify, "{checks:?}");
-        results.push((
-            jit.state.regs,
-            jit.memory().read(DATA, 256).unwrap().to_vec(),
-        ));
-    }
-    assert_eq!(results[0], results[1]);
 }

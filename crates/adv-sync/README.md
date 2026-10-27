@@ -26,18 +26,11 @@ It can wait for active compile/acquire/fence operations and must not serve as en
 Keep the window alive until these tasks and their results are reclaimed.
 Callers handle unaccepted required Tasks; the service does not replace device error protocols.
 
-CPU compilation only submits tasks: snapshot and completion SPSC queues allow eight outstanding tasks combined.
-Disabling async compilation cancels the submitter without joining the shared worker during compilation. The CPU knows nothing about GPU APIs.
-The shell registers execution/UI ports and injects LocalSender into JitCpu; interpreter mode can share the service.
-The standalone CPU's lazy service uses the previously installed execution WakeEvent and rejects replacement after injection.
-
 `Builder::with_work_policy(WorkPolicy::responsive(units))` explicitly configures startup; the default has no work limit.
 Submitters interpret these neutral units. They are neither milliseconds nor forced preemption for arbitrary FnOnce tasks.
-Registered ports read the same immutable configuration. The CPU splits Fast snapshots, limits Speed work, and rechecks estimates before every submission.
+Registered ports read the same immutable configuration.
 This policy does not bound GPU acquire/fence blocking time.
 
-```powershell
+```sh
 cargo test -p adv-sync --release
-cargo test -p adv-cpu --release --lib compiler::tests
-cargo test -p adv-cpu --release --lib compiler::tests::report_nonpreemptible_compile_latency -- --ignored --nocapture --test-threads=1
 ```

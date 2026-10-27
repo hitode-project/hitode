@@ -7,25 +7,13 @@ license.workspace = true
 publish.workspace = true
 description = "Execution layer facade: the platform's x86-32 engine over the engine-neutral core"
 
-# The engine is a platform fork, not a switch: AArch64 hosts run the a64
-# translator, every other host the Cranelift engine.
-[target.'cfg(target_arch = "aarch64")'.dependencies]
+[dependencies]
 adv-cpu-a64 = { path = "../adv-cpu-a64" }
 
-[target.'cfg(not(target_arch = "aarch64"))'.dependencies]
-adv-cpu-x64 = { path = "../adv-cpu-x64" }
-
-[features]
-jit-verifier = ["adv-cpu-x64/jit-verifier"]
-gir-capture = ["adv-cpu-x64/gir-capture"]
-gir-lift = ["adv-cpu-x64/gir-lift"]
-
 [dev-dependencies]
-adv-cpu = { path = ".", features = ["jit-verifier"] }
 adv-sync = { path = "../adv-sync" }
 adv-unicorn = { path = "../adv-unicorn" }
 iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "instr_info", "code_asm"] }
-libc = "0.2"
 serde_json = "1"
 unicorn-engine.workspace = true
 

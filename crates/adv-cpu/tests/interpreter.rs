@@ -1,7 +1,7 @@
 use adv_cpu::interpreter::{Interpreter, Step};
 use adv_cpu::{CpuState, EXEC, Memory, READ, WRITE};
-use adv_unicorn::Guarded;
 use iced_x86::code_asm::*;
+use unicorn_engine::Unicorn;
 use unicorn_engine::{
     RegisterX86 as R,
     unicorn_const::{Arch, Mode, Prot},
@@ -231,14 +231,14 @@ fn sidt_overflow_does_not_wrap_or_commit_cpu_state() {
 }
 
 struct Reference {
-    uc: Guarded<'static, ()>,
+    uc: Unicorn<'static, ()>,
     memory: Memory,
     interpreter: Interpreter,
 }
 
 impl Reference {
     fn new(bytes: &[u8]) -> Self {
-        let mut uc = Guarded::new(Arch::X86, Mode::MODE_32).unwrap();
+        let mut uc = Unicorn::new(Arch::X86, Mode::MODE_32).unwrap();
         uc.mem_map(0, 0x30000, Prot::ALL).unwrap();
         uc.mem_write(u64::from(CODE), bytes).unwrap();
         Self {

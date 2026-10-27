@@ -67,16 +67,7 @@ fn run(m: &mut Executor) {
         RunOutcome::ReachedStop
     );
 }
-#[cfg(windows)]
-fn pin() {
-    use std::ffi::c_void;
-    unsafe extern "system" {
-        fn GetCurrentProcess() -> *mut c_void;
-        fn SetProcessAffinityMask(p: *mut c_void, mask: usize) -> i32;
-    }
-    assert_ne!(unsafe { SetProcessAffinityMask(GetCurrentProcess(), 1) }, 0);
-}
-#[cfg(not(windows))]
+
 fn pin() {}
 fn main() {
     let samples: usize = std::env::args().nth(1).map_or(9, |s| s.parse().unwrap());

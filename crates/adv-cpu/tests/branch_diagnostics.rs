@@ -184,7 +184,6 @@ fn successful_linked_jump_is_retained_through_direct_transfers_and_context_resto
         assert_eq!(cpu.state.last_indirect_branch, record);
         if native {
             // CODE tail-links to TARGET within one Rust entry.
-            support::x64_shape!(assert_eq!(cpu.stats.native_entries, 1));
         }
     }
 }

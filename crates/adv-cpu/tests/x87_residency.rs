@@ -47,14 +47,14 @@ fn pcm_code_with_wait(wait: bool) -> Vec<u8> {
         a.ret().unwrap();
     })
 }
-fn machine(bytes: &[u8], native: bool, linked: bool) -> Executor {
+fn machine(bytes: &[u8], native: bool) -> Executor {
     let mut m = Executor::new(CODE, 0x40000).unwrap();
     m.protect(CODE, 0x40000, READ | WRITE).unwrap();
     m.write(CODE, bytes).unwrap();
     m.protect(CODE, 8192, READ | EXEC).unwrap();
     m.protect(STOP, 4096, READ | EXEC).unwrap();
     m.write(SCALE, &32768.0f32.to_le_bytes()).unwrap();
-    m.set_region_linking(linked);
+
     if native {
         m.add_region(Region::new(CODE, bytes.len())).unwrap();
     }
@@ -101,31 +101,24 @@ fn assert_pcm_registers(actual: &Executor, oracle: &Executor, exceptions: u32) {
 }
 
 #[test]
-fn shared_float_execution_matches_pcm_with_linking_and_oracle() {
+fn shared_float_execution_matches_pcm_and_oracle() {
     let bytes = pcm_code_with_wait(true);
-    let mut off = machine(&bytes, true, false);
-    let mut on = machine(&bytes, true, true);
-    let mut uc = machine(&bytes, false, false);
-    for m in [&mut off, &mut on, &mut uc] {
+    let mut on = machine(&bytes, true);
+    let mut uc = machine(&bytes, false);
+    for m in [&mut on, &mut uc] {
         m.write(SRC, &samples()).unwrap();
         start(m, SRC, OUT, STACK);
     }
-    assert_eq!(off.run(STOP, 100_000).unwrap(), RunOutcome::ReachedStop);
     assert_eq!(on.run(STOP, 100_000).unwrap(), RunOutcome::ReachedStop);
     assert_eq!(
         uc.run_unicorn(STOP, 100_000).unwrap(),
         RunOutcome::ReachedStop
     );
-    for m in [&off, &on, &uc] {
+    for m in [&on, &uc] {
         assert_eq!(m.memory().read(OUT, SAMPLES * 4).unwrap(), expected(false));
     }
-    assert_eq!(on.state.regs, off.state.regs);
     assert_pcm_registers(&on, &uc, 0x20);
-    assert_eq!(on.state.eflags, off.state.eflags);
     assert_eq!(on.state.eflags, uc.state.eflags);
-    // x87 runs inside the native region with and without linking.
-    support::x64_shape!(assert_eq!(on.stats.interpreter_instructions, 0));
-    support::x64_shape!(assert_eq!(off.stats.interpreter_instructions, 0));
 }
 
 #[test]
@@ -144,15 +137,13 @@ fn float_boundaries_keep_nan_infinity_denormal_results_and_reference_status() {
     let source: Vec<_> = (0..SAMPLES)
         .flat_map(|i| bits[i % bits.len()].to_le_bytes())
         .collect();
-    let mut on = machine(&bytes, true, true);
-    let mut off = machine(&bytes, true, false);
-    let mut uc = machine(&bytes, false, false);
-    for m in [&mut on, &mut off, &mut uc] {
+    let mut on = machine(&bytes, true);
+    let mut uc = machine(&bytes, false);
+    for m in [&mut on, &mut uc] {
         m.write(SRC, &source).unwrap();
         start(m, SRC, OUT, STACK);
     }
     assert_eq!(on.run(STOP, 100_000).unwrap(), RunOutcome::ReachedStop);
-    assert_eq!(off.run(STOP, 100_000).unwrap(), RunOutcome::ReachedStop);
     assert_eq!(
         uc.run_unicorn(STOP, 100_000).unwrap(),
         RunOutcome::ReachedStop
@@ -161,16 +152,10 @@ fn float_boundaries_keep_nan_infinity_denormal_results_and_reference_status() {
         on.memory().read(OUT, SAMPLES * 4).unwrap(),
         uc.memory().read(OUT, SAMPLES * 4).unwrap()
     );
-    assert_eq!(
-        off.memory().read(OUT, SAMPLES * 4).unwrap(),
-        uc.memory().read(OUT, SAMPLES * 4).unwrap()
-    );
     assert_pcm_registers(&on, &uc, 0x23);
-    assert_pcm_registers(&off, &uc, 0x23);
     assert_eq!(on.state.mmx, uc.state.mmx);
     // Invalid, denormal and precision flags were checked independently above.
     // Special operands use the same shared transaction without leaving the region.
-    support::x64_shape!(assert_eq!(on.stats.interpreter_instructions, 0));
 }
 
 #[test]
@@ -180,7 +165,7 @@ fn execution_slices_preserve_x87_rounding_modes_and_stack_for_two_contexts() {
         a.fldcw(word_ptr(CW as i32)).unwrap();
         a.ret().unwrap();
     });
-    let mut m = machine(&bytes, true, true);
+    let mut m = machine(&bytes, true);
     m.write(SETUP, &setup).unwrap();
     m.write(SRC, &samples()).unwrap();
     m.write(SRC + 0x4000, &samples()).unwrap();
@@ -233,15 +218,11 @@ fn execution_slices_preserve_x87_rounding_modes_and_stack_for_two_contexts() {
 #[test]
 fn x87_fault_keeps_restartable_stack_and_finishes_after_permission_repair() {
     let bytes = pcm_code();
-    let mut machines = [
-        machine(&bytes, true, false),
-        machine(&bytes, true, true),
-        machine(&bytes, false, false),
-    ];
+    let mut machines = [machine(&bytes, true), machine(&bytes, false)];
     for (index, m) in machines.iter_mut().enumerate() {
         m.write(SRC, &samples()).unwrap();
         start(m, SRC, OUT, STACK);
-        let run = if index == 2 {
+        let run = if index == 1 {
             m.run_unicorn(STOP, 100_000)
         } else {
             m.run(STOP, 100_000)
@@ -252,7 +233,7 @@ fn x87_fault_keeps_restartable_stack_and_finishes_after_permission_repair() {
     }
     let mut faults = Vec::new();
     for (index, m) in machines.iter_mut().enumerate() {
-        let outcome = if index == 2 {
+        let outcome = if index == 1 {
             m.run_unicorn(STOP, 100_000)
         } else {
             m.run(STOP, 100_000)
@@ -263,7 +244,7 @@ fn x87_fault_keeps_restartable_stack_and_finishes_after_permission_repair() {
         let saved = m.save_context().unwrap();
         m.restore_context(&saved).unwrap();
         m.protect(OUT + 4096, 4096, READ | WRITE).unwrap();
-        let outcome = if index == 2 {
+        let outcome = if index == 1 {
             m.run_unicorn(STOP, 100_000)
         } else {
             m.run(STOP, 100_000)
@@ -272,15 +253,13 @@ fn x87_fault_keeps_restartable_stack_and_finishes_after_permission_repair() {
         assert_eq!(m.memory().read(OUT, SAMPLES * 4).unwrap(), expected(false));
     }
     assert_eq!(faults[0], faults[1]);
-    assert_eq!(faults[1], faults[2]);
-    assert_eq!(machines[0].state.regs, machines[1].state.regs);
-    assert_pcm_registers(&machines[1], &machines[2], 0x20);
+    assert_pcm_registers(&machines[0], &machines[1], 0x20);
 }
 
 #[test]
 fn code_writes_invalidate_before_native_reentry() {
     let bytes = pcm_code();
-    let mut m = machine(&bytes, true, true);
+    let mut m = machine(&bytes, true);
     m.write(SRC, &samples()).unwrap();
     start(&mut m, SRC, OUT, STACK);
     assert_eq!(m.run(STOP, 100_000).unwrap(), RunOutcome::ReachedStop);
@@ -296,7 +275,6 @@ fn code_writes_invalidate_before_native_reentry() {
     // page beside its observed bytes, which stays native.
     start(&mut m, SRC, OUT, STACK);
     assert_eq!(m.run(STOP, 100_000).unwrap(), RunOutcome::ReachedStop);
-    let interpreted_before = m.stats.interpreter_instructions;
     start(&mut m, SRC, CODE + 0x300, STACK);
     m.state.regs[1] = 8;
     assert_eq!(m.run(STOP, 100_000).unwrap(), RunOutcome::ReachedStop);
@@ -304,11 +282,6 @@ fn code_writes_invalidate_before_native_reentry() {
         m.memory().read(CODE + 0x300, 32).unwrap(),
         &expected(false)[..32]
     );
-    support::x64_shape!(assert!(m.stats.invalidations > 0));
-    support::x64_shape!(assert_eq!(
-        m.stats.interpreter_instructions,
-        interpreted_before
-    ));
 }
 
 #[test]

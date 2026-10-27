@@ -10,25 +10,19 @@ These terms have one meaning across the docs, specs, code comments and reports. 
 | host | 宿主 | The machine and operating system that run Hitode, and the native code that runs on them. |
 | personality | 人格层 | The Windows identity the guest sees: exports, version facts and API behavior. The profile is Windows 7 SP1. |
 | HLE | HLE | A Win32 API service that the host implements, covering the personality and the API front ends. |
-| Tier 2 front end / API front end / shell | Tier 2 前端／API 前端／宿主壳 | Respectively: x86 to IR translation, the entry point of an API such as DSound, and the platform window with its input and output. Do not write "front end" alone for any of them. |
+| API front end / shell | API 前端／宿主壳 | Respectively: the entry point of an API such as DSound, and the platform window with its input and output. Do not write "front end" alone for any of them. |
 | overlay input region | 覆盖层输入区域 | A rectangle the launcher overlay claims for input. A press inside a region, or any press while the overlay is modal, goes to the webview. |
 
 ## Execution
 
 | Term | 中文 | Meaning |
 |---|---|---|
-| Tier 0 | Tier 0 | The predecoding interpreter. It runs cold code, code still waiting for compilation and instructions the engines do not support, and it is the reference for differential runs. |
-| predecode window | 预解码窗口 | A bounded run of instructions with a boundary index that Tier 0 caches to reuse local branches, calls and returns. It is not a GIR region. |
-| Tier 2 | Tier 2 | The Cranelift region JIT on x86_64 hosts. It compiles in the background. AArch64 hosts use a64 and have no Tier 2. |
+| Tier 0 | Tier 0 | The predecoding interpreter. It runs cold code and instructions the translator does not support, and it is the reference for differential runs. |
+| predecode window | 预解码窗口 | A bounded run of instructions with a boundary index that Tier 0 caches to reuse local branches, calls and returns. |
 | a64 | a64 | The translation engine for every AArch64 host. It keeps guest registers in fixed host registers, accesses memory directly through a guarded window and translates in one pass without an IR. |
-| GIR | GIR | The guest semantic IR. Production Tier 2 turns modeled integer instructions into SSA segments and keeps the rest as opaque operations. |
-| opaque operation | 不透明操作 | An instruction or kernel that GIR does not model and that reuses the existing emitter, such as x87, SSE and string loops. It is not interpreted. |
-| region / entry / link | 区域／入口／链接 | A region is the Tier 2 unit of compilation. An entry is where the dispatcher enters a region. A link is a direct transfer between regions that does not return to the Rust dispatch loop. |
-| execution contract | 执行契约 | The state, memory access, exit and recovery rules that Tier 0 and the platform engines share. `CpuState` is the authoritative state. |
-| pending fallback | 待编译回退 | Time the interpreter spends running a region whose compilation has not finished. It is not compile service time. |
-| warm profile | 预热档案 | `jit-warm.bin`, a list of regions worth compiling and their identities. Regions in it are compiled again after loading; it holds no machine code. |
-| code cache | 代码缓存 | Without qualification, persistent machine code that a later start loads after checking identity and validity. Compiled regions in one process form the in-memory code cache. |
-| image AOT | 映像提前编译 | Budgeted static discovery from image metadata and direct control flow that compiles private regions in idle compile slots. A region is published only when execution reaches it with matching inputs. |
+| region / entry / link | 区域／入口／链接 | A region is a bounded unit of guest code. An entry is where the dispatcher enters a region. A link is a direct transfer between regions that does not return to the Rust dispatch loop. |
+| execution contract | 执行契约 | The state, memory access, exit and recovery rules that Tier 0 and the AArch64 translator share. `CpuState` is the authoritative state. |
+| code cache | 代码缓存 | Translated code retained in one process. |
 | soft page | 软页 | A host page protected more strictly than the 4 KiB permission table says, for mixed permissions, translated code, shared audio memory or first file access. Accesses fault and are emulated, and hot access sites are translated again as checked accesses. |
 | biased ESP / EBP | 偏置 ESP／EBP | In a64, x23 and x24 hold the window base plus ESP and EBP. The window is 4 GiB aligned, so the low 32 bits are the guest value. |
 | carry sense | 进位感 | How a64 maps the ARM C flag to x86 CF: add sense means C equals CF, subtract sense means C is the inverse of CF. Block boundaries use subtract sense. |

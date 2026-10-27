@@ -211,7 +211,7 @@ fn loop_instruction_latches_match_unicorn_inside_and_across_page_permissions() {
     let mut m = machine(&copy, Some(CompileStrategy::Speed));
     m.state.regs = regs(1500, SRC, DST);
     assert_eq!(m.run(STOP, 1 << 30).unwrap(), RunOutcome::ReachedStop);
-    support::x64_shape!(assert_eq!(m.stats.interpreter_instructions, 0));
+
     assert_eq!(
         m.memory().read(DST, 12000).unwrap(),
         m.memory().read(SRC, 12000).unwrap()
@@ -244,113 +244,6 @@ fn packed_loop(wide: bool, fill: bool) -> Vec<u8> {
     })
 }
 
-#[cfg_attr(target_arch = "aarch64", ignore = "Cranelift execution shape")]
-#[test]
-fn packed_loop_transfers_preserve_aliases_faults_and_every_budget_prefix() {
-    for (wide, fill) in [(false, false), (true, false), (false, true), (true, true)] {
-        let bytes = packed_loop(wide, fill);
-        let width = if wide { 8 } else { 4 };
-        let seed = |m: &mut Executor| {
-            m.state.regs[0] = 0x1234_abcd;
-            m.state.x87.regs[0] = adv_cpu::X87Register::from_parts(0x1234_abcd_9876_fedc, 0x3fff);
-            m.state.x87.status = 3 << 11;
-            m.state.refresh_mmx();
-            m.state.eflags = 0xad7;
-        };
-        let floating = |m: &Executor| {
-            // Intel SDM Vol. 1, MMX/x87 transitions: Unicorn preserves the
-            // old exponent and rebuilds tags from payloads, so it cannot be
-            // the oracle for these fields. Check the architectural contract.
-            assert_eq!(m.state.x87.tag, if wide { 0 } else { 0xffff });
-            assert_eq!(m.state.x87.status, if wide { 0 } else { 3 << 11 });
-            assert_eq!(
-                m.state.x87.regs[0].sign_exponent(),
-                if wide && !fill { 0xffff } else { 0x3fff }
-            );
-            assert_eq!(m.state.x87.regs[0].significand(), m.state.mmx[0]);
-        };
-        for count in [1, 2, 3, 4, 5, 17, 257] {
-            for destination in [DST + 3, SRC, SRC + 7, SRC - 7, SRC + 15, SRC + 16] {
-                differential(
-                    "packed-loop",
-                    &bytes,
-                    regs(count, SRC, destination),
-                    seed,
-                    37,
-                );
-            }
-        }
-        for fault in [SRC, DST] {
-            differential(
-                "packed-loop-fault",
-                &bytes,
-                regs(1031, SRC, DST),
-                |m| {
-                    seed(m);
-                    m.protect(fault + 4096, 4096, if fault == SRC { 0 } else { READ })
-                        .unwrap();
-                },
-                1 << 30,
-            );
-        }
-        // Zero wraps ECX; the bounded mapping must fault normally, not admit
-        // an empty packed batch or skip all stores.
-        differential("packed-loop-zero", &bytes, regs(0, SRC, DST), seed, 1 << 30);
-        for strategy in [CompileStrategy::Fast, CompileStrategy::Speed] {
-            for fuel in 1..=19 {
-                let mut jit = machine(&bytes, Some(strategy));
-                let mut uc = machine(&bytes, None);
-                for m in [&mut jit, &mut uc] {
-                    m.state.regs = regs(200, SRC, DST);
-                    seed(m);
-                }
-                assert_eq!(jit.run(STOP, fuel).unwrap(), RunOutcome::Budget);
-                let done = 200 - jit.state.regs[1];
-                assert!(done > 0 && done < 200);
-                let instructions = if fill { 3 } else { 5 };
-                assert_eq!(
-                    uc.run_unicorn(STOP, (done * instructions) as usize)
-                        .unwrap(),
-                    RunOutcome::Budget
-                );
-                assert_eq!(jit.state.eip, uc.state.eip);
-                assert_eq!(jit.state.regs, uc.state.regs);
-                assert_eq!(jit.state.mmx, uc.state.mmx);
-                floating(&jit);
-                assert_eq!(jit.state.eflags & 0x8d5, uc.state.eflags & 0x8d5);
-                assert_eq!(
-                    jit.memory().read(DST, 201 * width).unwrap(),
-                    uc.memory().read(DST, 201 * width).unwrap()
-                );
-                // A fault before the next transfer exposes the previous
-                // packed batch's final state, including flags and MMX.
-                for m in [&mut jit, &mut uc] {
-                    m.protect(DST, 4096, READ).unwrap();
-                }
-                // Canonicalize Unicorn's flags after each ADD; its lazy AF
-                // otherwise disappears when a following store faults.
-                let mut expected = RunOutcome::Budget;
-                for _ in 0..8 {
-                    expected = uc.run_unicorn(STOP, 1).unwrap();
-                    if expected != RunOutcome::Budget {
-                        break;
-                    }
-                }
-                assert_ne!(expected, RunOutcome::Budget);
-                assert_eq!(jit.run(STOP, 100).unwrap(), expected);
-                assert_eq!(jit.state.regs, uc.state.regs);
-                assert_eq!(jit.state.mmx, uc.state.mmx);
-                floating(&jit);
-                assert_eq!(
-                    jit.state.eflags & 0x8d5,
-                    uc.state.eflags & 0x8d5,
-                    "wide={wide} fill={fill} {strategy:?} fuel={fuel}"
-                );
-            }
-        }
-    }
-}
-
 #[test]
 fn loop_batches_reconstruct_body_flags_before_budget_and_fault_exits() {
     let bytes = code(|a| {
@@ -375,110 +268,6 @@ fn loop_batches_reconstruct_body_flags_before_budget_and_fault_exits() {
             },
             1 << 30,
         );
-    }
-}
-
-#[cfg_attr(target_arch = "aarch64", ignore = "Cranelift execution shape")]
-#[test]
-fn packed_scalar_fills_preserve_width_sources_tails_and_faults() {
-    for width in [1, 2, 4] {
-        for source in 0..3 {
-            let bytes = code(|a| {
-                let mut top = a.create_label();
-                a.set_label(&mut top).unwrap();
-                a.add(edi, width).unwrap();
-                if source == 2 {
-                    // A changing full register must not be hoisted, even
-                    // when the store reads only its high byte or low word.
-                    a.add(eax, 0x101).unwrap();
-                }
-                match (width, source) {
-                    (1, 0) => a.mov(byte_ptr(edi - width), 0xb3),
-                    (2, 0) => a.mov(word_ptr(edi - width), 0xbeef),
-                    (4, 0) => a.mov(dword_ptr(edi - width), 0xdead_beefu32),
-                    (1, _) => a.mov(byte_ptr(edi - width), ah),
-                    (2, _) => a.mov(word_ptr(edi - width), ax),
-                    _ => a.mov(dword_ptr(edi - width), eax),
-                }
-                .unwrap();
-                a.loop_(top).unwrap();
-                a.ret().unwrap();
-            });
-            let seed = |m: &mut Executor| {
-                m.state.regs[0] = 0x2468_acdf;
-                m.state.eflags = 0xad7;
-            };
-            for count in [1, 15, 16, 17, 129] {
-                for slice in [7, 1 << 30] {
-                    differential(
-                        "scalar-fill",
-                        &bytes,
-                        regs(count, SRC, DST + 3),
-                        seed,
-                        slice,
-                    );
-                }
-            }
-            differential_with_oracle_slice(
-                "scalar-fill-fault",
-                &bytes,
-                regs(29, SRC, DST + 4096 - width as u32),
-                |m| {
-                    seed(m);
-                    m.protect(DST + 4096, 4096, READ).unwrap();
-                },
-                1 << 30,
-                1,
-            );
-            // For a straddling fault Unicorn reports the first inaccessible
-            // byte; the executor reports the operand start. Compare this
-            // transactional contract with our instruction interpreter.
-            let fault_machine = |strategy| {
-                let mut m = machine(&bytes, strategy);
-                m.state.regs = regs(29, SRC, DST + 4093);
-                seed(&mut m);
-                m.protect(DST + 4096, 4096, READ).unwrap();
-                m
-            };
-            let mut interpreted = fault_machine(None);
-            let expected = interpreted.run(STOP, 1000).unwrap();
-            for strategy in [CompileStrategy::Fast, CompileStrategy::Speed] {
-                let mut jit = fault_machine(Some(strategy));
-                assert_eq!(jit.run(STOP, 1000).unwrap(), expected);
-                assert_eq!(jit.state.regs, interpreted.state.regs);
-                assert_eq!(jit.state.eflags, interpreted.state.eflags);
-                assert_eq!(
-                    jit.memory().read(DST, 8192).unwrap(),
-                    interpreted.memory().read(DST, 8192).unwrap()
-                );
-            }
-            for strategy in [CompileStrategy::Fast, CompileStrategy::Speed] {
-                for fuel in [1, 7, 8, 15, 16, 17, 31, 32, 33] {
-                    let mut jit = machine(&bytes, Some(strategy));
-                    let mut uc = machine(&bytes, None);
-                    for m in [&mut jit, &mut uc] {
-                        m.state.regs = regs(200, SRC, DST + 3);
-                        seed(m);
-                    }
-                    assert_eq!(jit.run(STOP, fuel).unwrap(), RunOutcome::Budget);
-                    let done = 200 - jit.state.regs[1];
-                    let instructions = 3 + u32::from(source == 2);
-                    assert_eq!(
-                        uc.run_unicorn(STOP, (done * instructions) as usize)
-                            .unwrap(),
-                        RunOutcome::Budget
-                    );
-                    assert_eq!(jit.state.eip, uc.state.eip);
-                    assert_eq!(jit.state.regs, uc.state.regs);
-                    assert_eq!(jit.state.eflags & 0x8d5, uc.state.eflags & 0x8d5);
-                    assert_eq!(jit.state.x87, uc.state.x87);
-                    assert_eq!(
-                        jit.memory().read(DST, 804).unwrap(),
-                        uc.memory().read(DST, 804).unwrap()
-                    );
-                }
-            }
-        }
     }
 }
 
@@ -584,7 +373,7 @@ fn versioned_invariant_loop_interrupts_and_resumes_exactly() {
     assert_eq!(m.state.regs[1], 100_000_000 - completed);
     let sum = u32::from_le_bytes(m.memory().read(DST, 4).unwrap().try_into().unwrap());
     assert_eq!(sum, completed);
-    support::x64_shape!(assert_eq!(m.stats.interpreter_instructions, 0));
+
     flag.store(false, Ordering::Release);
     m.state.regs[1] = 10;
     assert_eq!(m.run(STOP, 1 << 20).unwrap(), RunOutcome::ReachedStop);
@@ -659,39 +448,6 @@ fn wrapping_indexed_writes_cannot_hide_aliases_with_forwarded_slots() {
             |m| m.write(DST + 8, &1u32.to_le_bytes()).unwrap(),
             1 << 30,
         );
-    }
-}
-
-#[cfg_attr(target_arch = "aarch64", ignore = "Cranelift execution shape")]
-#[test]
-fn rewriting_a_narrow_counter_keeps_memory_checks_on_every_iteration() {
-    let bytes = counted(true, |a| {
-        a.mov(cx, 4).unwrap();
-        a.mov(dword_ptr(edi), eax).unwrap();
-        a.add(edi, 4).unwrap();
-    });
-    for strategy in [CompileStrategy::Speed, CompileStrategy::Fast] {
-        let mut jit = machine(&bytes, Some(strategy));
-        let mut uc = machine(&bytes, None);
-        for m in [&mut jit, &mut uc] {
-            m.state.regs = regs(4, SRC, DST + 4096 - 20);
-            m.write(DST + 4096, &[0xa5; 32]).unwrap();
-            m.protect(DST + 4096, 4096, READ).unwrap();
-        }
-        // The first latch's CX=3 proves only three following stores. The
-        // body resets CX, so the sixth store must still check the next page.
-        // Keep fuel small even on a broken compiler: the unchecked loop must
-        // not run far enough to leave this fixture's allocated window.
-        let expected = uc.run_unicorn(STOP, 1000).unwrap();
-        assert!(matches!(
-            expected,
-            RunOutcome::WriteFault { address, .. } if address == DST + 4096
-        ));
-        assert_eq!(jit.run(STOP, 16).unwrap(), expected, "{strategy:?}");
-        assert_eq!(jit.state.eip, uc.state.eip);
-        assert_eq!(jit.state.regs, uc.state.regs);
-        assert_eq!(jit.state.eflags, uc.state.eflags);
-        assert_eq!(jit.memory().read(DST + 4096, 32).unwrap(), [0xa5; 32]);
     }
 }
 
@@ -1045,65 +801,6 @@ fn writes_aliasing_a_memory_bound_keep_the_comparison_current() {
     differential("bound-slot-alias", &bytes, r, |_| {}, 13);
 }
 
-#[cfg_attr(target_arch = "aarch64", ignore = "Cranelift execution shape")]
-#[test]
-fn memory_bound_permissions_changed_between_slices_preserve_the_fault_prefix() {
-    const BOUND: u32 = END - 0x104;
-    for reloaded in [false, true] {
-        let bytes = code(|a| {
-            let mut top = a.create_label();
-            a.set_label(&mut top).unwrap();
-            a.mov(eax, dword_ptr(esi + ebx * 4)).unwrap();
-            a.mov(dword_ptr(edi + ebx * 4), eax).unwrap();
-            a.inc(ebx).unwrap();
-            if reloaded {
-                a.mov(edx, dword_ptr(ebp)).unwrap();
-                a.cmp(ebx, edx).unwrap();
-            } else {
-                a.cmp(ebx, dword_ptr(ebp)).unwrap();
-            }
-            a.jb(top).unwrap();
-            a.ret().unwrap();
-        });
-        for strategy in [CompileStrategy::Speed, CompileStrategy::Fast] {
-            let mut jit = machine(&bytes, Some(strategy));
-            let mut uc = machine(&bytes, None);
-            for m in [&mut jit, &mut uc] {
-                m.state.regs = regs(0, SRC, DST);
-                m.state.regs[5] = BOUND;
-                m.write(BOUND, &3000u32.to_le_bytes()).unwrap();
-            }
-            assert_eq!(jit.run(STOP, 37).unwrap(), RunOutcome::Budget);
-            let completed = jit.state.regs[3];
-            assert!(completed > 0 && completed < 3000);
-            let cost = if reloaded { 6 } else { 5 };
-            assert_eq!(
-                uc.run_unicorn(STOP, cost * completed as usize).unwrap(),
-                RunOutcome::Budget
-            );
-            assert_eq!(jit.state.eip, uc.state.eip);
-            assert_eq!(jit.state.regs, uc.state.regs);
-            assert_eq!(jit.state.eflags & 0x8d5, uc.state.eflags & 0x8d5);
-            for m in [&mut jit, &mut uc] {
-                m.protect(END - 4096, 4096, 0).unwrap();
-            }
-            let mut expected = RunOutcome::Budget;
-            for _ in 0..100 {
-                expected = uc.run_unicorn(STOP, 1).unwrap();
-                if expected != RunOutcome::Budget {
-                    break;
-                }
-            }
-            assert!(matches!(expected, RunOutcome::ReadFault { address, .. } if address == BOUND));
-            assert_eq!(jit.run(STOP, 100).unwrap(), expected);
-            assert_eq!(jit.state.eip, uc.state.eip);
-            assert_eq!(jit.state.regs, uc.state.regs);
-            assert_eq!(jit.state.eflags & 0x8d5, uc.state.eflags & 0x8d5);
-            assert_eq!(jit.memory().read(DST, 4096), uc.memory().read(DST, 4096));
-        }
-    }
-}
-
 #[test]
 fn memory_bounds_crossing_page_permissions_match_unicorn() {
     const BOUND: u32 = END - 4098;
@@ -1195,57 +892,6 @@ fn absolute_memory_bounds_in_the_high_address_half_match_unicorn() {
             jit.memory().read(HIGH_DATA, 1),
             uc.memory().read(HIGH_DATA, 1)
         );
-    }
-}
-
-#[cfg(windows)]
-#[test]
-fn shared_memory_bounds_use_checked_reads_and_keep_exact_state() {
-    use adv_cpu::backend::{Guest, Prot};
-    const BOUND: u32 = END - 4096;
-    let bytes = code(|a| {
-        let mut top = a.create_label();
-        a.set_label(&mut top).unwrap();
-        a.mov(byte_ptr(edi), bl).unwrap();
-        a.inc(ebx).unwrap();
-        a.cmp(ebx, dword_ptr(ebp)).unwrap();
-        a.jb(top).unwrap();
-        a.ret().unwrap();
-    });
-    for strategy in [CompileStrategy::Speed, CompileStrategy::Fast] {
-        let mut cpu = adv_cpu::JitCpu::new(STOP, false).unwrap();
-        cpu.map(CODE, 4096, Prot::RX).unwrap();
-        cpu.map(STOP, 4096, Prot::RX).unwrap();
-        cpu.map(STACK & !4095, 4096, Prot::RW).unwrap();
-        cpu.map(DST, 4096, Prot::RW).unwrap();
-        let shared = cpu.map_shared_audio(BOUND, 4096).unwrap();
-        cpu.write(CODE, &bytes).unwrap();
-        cpu.write(STACK, &STOP.to_le_bytes()).unwrap();
-        cpu.write(BOUND, &3000u32.to_le_bytes()).unwrap();
-        let mut initial = regs(0, 0, DST);
-        initial[5] = BOUND;
-        let jit = cpu.executor_mut();
-        jit.state.regs = initial;
-        jit.state.eip = CODE;
-        jit.state.eflags = 0x202;
-        let mut region = Region::new(CODE, bytes.len());
-        region.compile_strategy = strategy;
-        jit.add_region(region).unwrap();
-        let mut uc = machine(&bytes, None);
-        uc.state.regs = initial;
-        uc.write(BOUND, &3000u32.to_le_bytes()).unwrap();
-        assert_eq!(jit.run(STOP, 100_000).unwrap(), RunOutcome::ReachedStop);
-        assert_eq!(
-            uc.run_unicorn(STOP, 100_000).unwrap(),
-            RunOutcome::ReachedStop
-        );
-        assert_eq!(jit.state.eip, uc.state.eip);
-        assert_eq!(jit.state.regs, uc.state.regs);
-        assert_eq!(jit.state.eflags & 0x8d5, uc.state.eflags & 0x8d5);
-        assert_eq!(jit.memory().read(DST, 1), uc.memory().read(DST, 1));
-        let mut bound = [0; 4];
-        shared.read_alias.copy_into(0, &mut bound);
-        assert_eq!(bound, 3000u32.to_le_bytes());
     }
 }
 
@@ -1698,82 +1344,6 @@ fn batched_loop_interrupts_and_resumes_exactly() {
     assert_eq!(m.state.regs[2], completed + 11);
 }
 
-#[cfg_attr(target_arch = "aarch64", ignore = "Cranelift execution shape")]
-#[test]
-fn compact_copies_cover_four_lane_aliases_tails_and_observable_budget_state() {
-    for packed in [false, true] {
-        let bytes = counted(true, |a| {
-            if packed {
-                a.movd(mm0, dword_ptr(esi)).unwrap();
-                a.movd(dword_ptr(edi), mm0).unwrap();
-            } else {
-                a.mov(eax, dword_ptr(esi)).unwrap();
-                a.mov(dword_ptr(edi), eax).unwrap();
-            }
-            a.add(esi, 4).unwrap();
-            a.add(edi, 4).unwrap();
-        });
-        for count in [3, 4, 5, 8, 9, 129] {
-            // +/-8 and +/-12 distinguish a four-lane alias proof from V=2.
-            for destination in [
-                DST,
-                SRC,
-                SRC + 8,
-                SRC + 12,
-                SRC - 8,
-                SRC - 12,
-                SRC + 15,
-                SRC - 15,
-                SRC + 16,
-                SRC - 16,
-            ] {
-                differential(
-                    "compact-copy",
-                    &bytes,
-                    regs(0x2345_0000 | count, SRC, destination),
-                    |_| {},
-                    37,
-                );
-            }
-        }
-        for strategy in [CompileStrategy::Fast, CompileStrategy::Speed] {
-            for fuel in [6, 7, 8, 9, 10, 11, 13, 17, 33, 34, 35] {
-                let mut jit = machine(&bytes, Some(strategy));
-                let mut uc = machine(&bytes, None);
-                for m in [&mut jit, &mut uc] {
-                    m.state.regs = regs(0x2345_0000 | 200, SRC, DST);
-                }
-                assert_eq!(jit.run(STOP, fuel).unwrap(), RunOutcome::Budget);
-                let done = (jit.state.regs[6] - SRC) / 4;
-                assert!(done > 0 && done < 200);
-                // One prologue instruction, six per complete iteration.
-                assert_eq!(
-                    uc.run_unicorn(STOP, 1 + 6 * done as usize).unwrap(),
-                    RunOutcome::Budget
-                );
-                assert_eq!(jit.state.eip, uc.state.eip);
-                assert_eq!(jit.state.regs, uc.state.regs, "packed={packed} fuel={fuel}");
-                assert_eq!(jit.state.mmx, uc.state.mmx);
-                assert_eq!(jit.state.eflags & 0x8d5, uc.state.eflags & 0x8d5);
-                assert_eq!(
-                    jit.memory().read(DST, 804).unwrap(),
-                    uc.memory().read(DST, 804).unwrap()
-                );
-                // Fault before the next MOV/MOVD overwrites its result: the
-                // last completed element and flags must remain observable.
-                for m in [&mut jit, &mut uc] {
-                    m.protect(SRC, 4096, 0).unwrap();
-                }
-                let expected = uc.run_unicorn(STOP, 100).unwrap();
-                assert_eq!(jit.run(STOP, 100).unwrap(), expected);
-                assert_eq!(jit.state.regs, uc.state.regs);
-                assert_eq!(jit.state.mmx, uc.state.mmx);
-                assert_eq!(jit.state.eflags & 0x8d5, uc.state.eflags & 0x8d5);
-            }
-        }
-    }
-}
-
 #[test]
 fn compact_copy_interrupt_publishes_progress_and_resumes() {
     transfer_interrupt(4, false, false);
@@ -1862,11 +1432,7 @@ fn transfer_interrupt(width: u32, fill: bool, looping: bool) {
     assert_eq!(m.state.regs[6], SRC + if fill { 0 } else { done * width });
     assert_eq!(m.state.regs[7], SRC + done * width);
     assert_eq!(m.state.mmx[0], 0);
-    support::x64_shape!(assert_eq!(
-        budget - m.state.fuel,
-        u64::from(done) + u64::from(!looping)
-    ));
-    support::x64_shape!(assert_eq!(m.stats.interpreter_instructions, 0));
+
     flag.store(false, Ordering::Release);
     m.state.regs[1] = 11;
     assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);

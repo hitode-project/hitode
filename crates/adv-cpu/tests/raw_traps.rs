@@ -81,9 +81,6 @@ fn raw_handler_changes_to_pc_and_code_stop_stale_native_execution() {
         );
         assert_eq!(cpu.state.regs[0], 99);
         assert_eq!(cpu.stats.trap_calls, 1);
-        if native {
-            support::x64_shape!(assert!(cpu.stats.invalidations > 0));
-        }
     }
 }
 

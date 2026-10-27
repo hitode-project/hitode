@@ -78,11 +78,6 @@ fn forward_copies_and_fills_match_unicorn_for_aligned_unaligned_and_cross_page_r
                     jit.memory().read(DST, 0x10000).unwrap(),
                     uc.memory().read(DST, 0x10000).unwrap()
                 );
-                support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
-                support::x64_shape!(assert_eq!(
-                    jit.stats.bulk_bytes,
-                    u64::from(count * width(operation))
-                ));
             }
         }
     }
@@ -101,8 +96,6 @@ fn zero_count_ignores_invalid_addresses_and_direction_flag() {
             assert_eq!(uc.run_unicorn(STOP, 100).unwrap(), RunOutcome::ReachedStop);
             assert_eq!(jit.state.regs, uc.state.regs);
             assert_eq!(jit.state.eflags, uc.state.eflags);
-            support::x64_shape!(assert_eq!(jit.stats.bulk_bytes, 0));
-            support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
         }
     }
 }
@@ -124,16 +117,6 @@ fn backwards_ranges_retain_rep_semantics() {
             uc.memory().read(DST, 4096).unwrap()
         );
         assert_eq!(jit.state.eflags, uc.state.eflags);
-        if cfg!(target_arch = "x86_64") {
-            support::x64_shape!(assert_eq!(
-                jit.stats.bulk_bytes,
-                27 * u64::from(width(operation))
-            ));
-            support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
-        } else {
-            support::x64_shape!(assert_eq!(jit.stats.bulk_bytes, 0));
-            support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
-        }
     }
 }
 
@@ -162,49 +145,9 @@ fn overlapping_copies_retain_element_order_and_flags() {
                     uc.memory().read(SRC, 4096).unwrap()
                 );
                 assert_eq!(jit.state.eflags, uc.state.eflags);
-                if cfg!(target_arch = "x86_64") {
-                    support::x64_shape!(assert_eq!(
-                        jit.stats.bulk_bytes,
-                        27 * u64::from(width(operation))
-                    ));
-                    support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
-                } else {
-                    // Checked elements can leave a non-overlapping tail that
-                    // the existing forward bulk helper completes on ARM64.
-                    support::x64_shape!(assert!(
-                        jit.stats.bulk_bytes <= 27 * u64::from(width(operation))
-                    ));
-                    support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
-                }
             }
         }
     }
-}
-
-#[test]
-#[cfg(target_arch = "x86_64")]
-fn descending_overlap_yields_and_resumes_without_snapshotting_the_source() {
-    let mut jit = machine(2, true, 0x50000);
-    let mut uc = machine(2, false, 0x50000);
-    for m in [&mut jit, &mut uc] {
-        init(m);
-        start(m, 10000, SRC + 50000, SRC + 49999, 0xcd7);
-    }
-    assert_eq!(jit.run(STOP, 1).unwrap(), RunOutcome::Budget);
-    assert_eq!(jit.state.eip, CODE);
-    assert_eq!(jit.state.regs[1], 10000 - 4096);
-    assert_eq!(jit.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
-    assert_eq!(
-        uc.run_unicorn(STOP, 20000).unwrap(),
-        RunOutcome::ReachedStop
-    );
-    assert_eq!(jit.state.regs, uc.state.regs);
-    assert_eq!(jit.state.eflags, uc.state.eflags);
-    assert_eq!(
-        jit.memory().read(SRC, 65536).unwrap(),
-        uc.memory().read(SRC, 65536).unwrap()
-    );
-    support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
 }
 
 #[test]
@@ -255,7 +198,7 @@ fn protected_later_pages_preserve_unicorn_partial_fault_progress() {
                     jit.memory().read(DST, 8192).unwrap(),
                     uc.memory().read(DST, 8192).unwrap()
                 );
-                support::x64_shape!(assert_eq!(jit.stats.bulk_bytes, 0));
+
                 assert_eq!(jit.state.regs[1], 32 - 16 / width(operation));
             }
         }
@@ -278,7 +221,7 @@ fn overflowing_bulk_ranges_use_checked_native_elements() {
             jit.memory().read(DST, 16).unwrap(),
             uc.memory().read(DST, 16).unwrap()
         );
-        support::x64_shape!(assert_eq!(jit.stats.bulk_bytes, 0));
+
         assert_eq!(jit.state.regs[1], 0x4000_0000);
     }
     for operation in [0, 2, 3, 5] {
@@ -302,7 +245,6 @@ fn overflowing_bulk_ranges_use_checked_native_elements() {
                 uc.run_unicorn(STOP, 100).unwrap()
             );
             assert_eq!(jit.state.regs, uc.state.regs);
-            support::x64_shape!(assert_eq!(jit.stats.bulk_bytes, 0));
         }
     }
 }
@@ -321,51 +263,11 @@ fn writes_to_executable_pages_fall_back_and_invalidate_warm_code() {
     start(&mut m, 1, SRC, TARGET + 1, 2);
     m.state.regs[0] = 73;
     assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
-    support::x64_shape!(assert_eq!(m.stats.bulk_bytes, 0));
+
     start(&mut m, 1, SRC, DST, 2);
     m.state.eip = TARGET;
     assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
     assert_eq!(m.state.regs[0], 73);
-    support::x64_shape!(assert_eq!(m.stats.invalidations, 1));
-}
-
-#[cfg_attr(target_arch = "aarch64", ignore = "Cranelift execution shape")]
-#[test]
-fn large_repeats_yield_at_chunk_boundaries_and_resume_independent_contexts() {
-    let mut m = machine(0, true, 0x900000);
-    let pattern: Vec<u8> = (0..3 * (1 << 20))
-        .map(|i| (i * 37 + i / 13) as u8)
-        .collect();
-    m.write(SRC, &pattern).unwrap();
-    start_with_stack(&mut m, 3 << 20, SRC, 0x400000, 0x8d7, 0x905800);
-    m.state.regs[0] = 11;
-    assert_eq!(m.run(STOP, 1).unwrap(), RunOutcome::Budget);
-    assert_eq!(m.state.regs[1], 2 << 20);
-    assert_eq!(m.state.eip, CODE);
-    let a = m.save_context().unwrap();
-    start_with_stack(&mut m, 2 << 20, SRC + 4096, 0x700000, 2, 0x905800);
-    m.state.regs[0] = 29;
-    assert_eq!(m.run(STOP, 1).unwrap(), RunOutcome::Budget);
-    assert_eq!(m.state.regs[1], 1 << 20);
-    let b = m.save_context().unwrap();
-    for (context, expected_eax, expected_flags) in [(&a, 11, 0x8d7), (&b, 29, 2)] {
-        m.restore_context(context).unwrap();
-        assert_eq!(m.run(STOP, 10).unwrap(), RunOutcome::ReachedStop);
-        assert_eq!(m.state.regs[1], 0);
-        assert_eq!(m.state.regs[0], expected_eax);
-        assert_eq!(m.state.eflags, expected_flags);
-    }
-    assert!(
-        m.memory().read(0x400000, 3 << 20).unwrap() == pattern.as_slice(),
-        "context A output"
-    );
-    assert!(
-        m.memory().read(0x700000, 2 << 20).unwrap() == &pattern[4096..4096 + (2 << 20)],
-        "context B output"
-    );
-    support::x64_shape!(assert_eq!(m.stats.bulk_calls, 5));
-    support::x64_shape!(assert_eq!(m.stats.bulk_bytes, 5 << 20));
-    support::x64_shape!(assert_eq!(m.stats.interpreter_entries, 0));
 }
 
 #[test]
@@ -416,8 +318,6 @@ fn bulk_deadline_stops_at_a_restartable_rep_then_finishes_after_rearming() {
         cpu.read(at, &mut bytes).unwrap();
         assert_eq!(bytes, [0x44; 16]);
     }
-    support::x64_shape!(assert_eq!(cpu.stats().bulk_bytes, u64::from(SIZE)));
-    support::x64_shape!(assert_eq!(cpu.stats().interpreter_entries, 0));
 }
 
 #[test]
@@ -460,8 +360,6 @@ fn a_host_call_that_expires_the_budget_does_not_start_following_bulk_writes() {
     let mut bytes = [0; 16];
     cpu.read(DST, &mut bytes).unwrap();
     assert_eq!(bytes, [0; 16]);
-    support::x64_shape!(assert_eq!(cpu.stats().bulk_bytes, 0));
-    support::x64_shape!(assert_eq!(cpu.stats().trap_calls, 1));
 }
 
 #[test]
@@ -478,7 +376,5 @@ fn native_address_size_and_fs_prefix_keep_zero_count_in_native_code() {
         assert_eq!(jit.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
         assert_eq!(uc.run_unicorn(STOP, 100).unwrap(), RunOutcome::ReachedStop);
         assert_eq!(jit.state.regs, uc.state.regs);
-        support::x64_shape!(assert_eq!(jit.stats.bulk_bytes, 0));
-        support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
     }
 }

@@ -176,10 +176,6 @@ fn byte_neg_exhausts_all_values_and_word_neg_covers_flag_boundaries_natively() {
                     }
                 }
             }
-            support::x64_shape!(assert_eq!(
-                jit.stats.interpreter_entries, 0,
-                "form {form}, strategy {strategy:?}"
-            ));
         }
     }
 }
@@ -265,12 +261,11 @@ fn narrow_neg_memory_faults_preserve_prefix_flags_and_atomic_writes_then_resume(
                         jit.memory().read(address, width).unwrap(),
                         &[0x01, 0x80][..width]
                     );
-                    let fallbacks = jit.stats.interpreter_entries;
+
                     for machine in [&mut jit, &mut interpreter, &mut unicorn] {
                         machine.protect(DATA, 8192, READ | WRITE).unwrap();
                     }
                     finished(&mut jit, &mut interpreter, &mut unicorn, &context);
-                    support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, fallbacks));
                 }
             }
         }

@@ -44,14 +44,7 @@ fn main() {
     let samples: usize = std::env::args().nth(1).map_or(9, |n| n.parse().unwrap());
     let filter = std::env::args().nth(2);
     assert!(samples > 0);
-    #[cfg(windows)]
-    {
-        unsafe extern "system" {
-            fn GetCurrentProcess() -> *mut std::ffi::c_void;
-            fn SetProcessAffinityMask(process: *mut std::ffi::c_void, mask: usize) -> i32;
-        }
-        assert_ne!(unsafe { SetProcessAffinityMask(GetCurrentProcess(), 1) }, 0);
-    }
+
     println!(
         "operation,storage,bytes,median_ms,interpreter_instructions,native_entries,native_code_bytes"
     );

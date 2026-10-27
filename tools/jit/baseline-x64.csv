@@ -1,8 +1,0 @@
-workload,jit_ms,unicorn_ms,speedup,compile_ms,native_bytes,native_entries_per_call,fallback_entries_per_call,checksum
-integer_loop,0.1674,0.4655,2.78,3.518,2968,1,0,57d20000
-dispatch_predictable,0.8805,2.9956,3.40,4.454,8104,1,0,4cb67844
-dispatch_random,3.5243,6.7217,1.91,5.978,8104,1,0,a9e2c3f6
-dispatch_bytes,3.3189,6.3894,1.93,4.806,8216,1,0,a9e2c3f6
-pointer_chase,0.9640,1.7120,1.78,2.140,4920,1,0,fffe0000
-call_return,0.4671,6.9827,14.95,3.028,6648,1,0,000c0000
-cold_then_hot,0.2308,0.4700,2.04,2.199,4096,1,1,57d20000

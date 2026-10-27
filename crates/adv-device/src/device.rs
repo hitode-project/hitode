@@ -333,20 +333,13 @@ impl Drop for Output {
 }
 
 fn same_device(a: &cpal::Device, b: &cpal::Device) -> bool {
-    #[cfg(target_os = "windows")]
-    {
-        // WASAPI compares endpoint IDs, including two devices with the same friendly name.
-        let (cpal::platform::DeviceInner::Wasapi(a), cpal::platform::DeviceInner::Wasapi(b)) =
-            (a.as_inner(), b.as_inner());
-        a == b
-    }
     #[cfg(target_os = "macos")]
     {
         let (cpal::platform::DeviceInner::CoreAudio(a), cpal::platform::DeviceInner::CoreAudio(b)) =
             (a.as_inner(), b.as_inner());
         a == b
     }
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    #[cfg(not(target_os = "macos"))]
     {
         a.name()
             .ok()

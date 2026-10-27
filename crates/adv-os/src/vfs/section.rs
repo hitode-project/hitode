@@ -46,46 +46,11 @@ pub(super) fn identity_queries() -> usize {
     IDENTITY_QUERIES.with(Cell::get)
 }
 
-#[cfg(windows)]
-fn host_file_identity(file: &File) -> std::io::Result<FileIdentity> {
-    use std::os::windows::io::AsRawHandle;
-    #[repr(C)]
-    #[derive(Default)]
-    struct Info {
-        attributes: u32,
-        created: [u32; 2],
-        accessed: [u32; 2],
-        written: [u32; 2],
-        volume: u32,
-        high_size: u32,
-        low_size: u32,
-        links: u32,
-        high_index: u32,
-        low_index: u32,
-    }
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn GetFileInformationByHandle(handle: *mut std::ffi::c_void, info: *mut Info) -> i32;
-    }
-    let mut info = Info::default();
-    // SAFETY: live owned file and correctly sized writable native metadata.
-    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok((
-        u64::from(info.volume),
-        (u64::from(info.high_index) << 32) | u64::from(info.low_index),
-    ))
-}
 #[cfg(unix)]
 fn host_file_identity(file: &File) -> std::io::Result<FileIdentity> {
     use std::os::unix::fs::MetadataExt;
     let metadata = file.metadata()?;
     Ok((metadata.dev(), metadata.ino()))
-}
-#[cfg(not(any(windows, unix)))]
-fn host_file_identity(_: &File) -> std::io::Result<FileIdentity> {
-    Err(std::io::ErrorKind::Unsupported.into())
 }
 
 impl FileSection {
@@ -151,7 +116,7 @@ impl FileSection {
             return Ok(bytes);
         }
         if let Some(file) = self.file.borrow().as_ref() {
-            // A cloned Windows FD shares its cursor. Restore it even after an
+            // A cloned FD shares its cursor. Restore it even after an
             // I/O error; all guest operations use this same execution worker.
             let mut file = file;
             let saved = file.stream_position()?;

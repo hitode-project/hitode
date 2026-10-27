@@ -111,10 +111,6 @@ fn unsigned_divide_matches_unicorn_and_rust_for_narrow_wide_and_eax_alias_source
                     }
                 }
             }
-            support::x64_shape!(assert_eq!(
-                jit.stats.interpreter_entries, 0,
-                "{strategy:?}, form {form}"
-            ));
         }
     }
 }
@@ -167,7 +163,6 @@ fn short_divide_fallbacks_mix_with_native_signed_division() {
         RunOutcome::ReachedStop
     );
     assert_eq!(jit.state.regs, reference.state.regs);
-    support::x64_shape!(assert!(jit.stats.interpreter_entries > 0));
 }
 
 #[test]
@@ -228,7 +223,6 @@ fn signed_divide_handles_signs_aliases_and_exact_exception_boundaries() {
                         assert_eq!(jit.state.eflags, before.eflags);
                         assert_eq!(jit.state.eip, CODE);
                     } else {
-                        let fallbacks = jit.stats.interpreter_entries;
                         assert_eq!(jit.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
                         assert_eq!(
                             reference.run_unicorn(STOP, 100).unwrap(),
@@ -244,7 +238,6 @@ fn signed_divide_handles_signs_aliases_and_exact_exception_boundaries() {
                             (i128::from(dividend) % i128::from(actual)) as i32
                         );
                         assert_eq!(jit.state.eflags, before.eflags);
-                        support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, fallbacks));
                     }
                 }
             }
@@ -342,9 +335,6 @@ fn divide_zero_and_quotient_overflow_fall_back_at_original_pc_for_guest_exceptio
                     assert_eq!(recover.calls, 1);
                     assert_eq!(cpu.reg(Reg::Eax), 91);
                     assert_eq!(cpu.reg(Reg::Edx), 73);
-                    if jit {
-                        support::x64_shape!(assert!(cpu.stats().interpreter_entries > 0));
-                    }
                 }
             }
         }

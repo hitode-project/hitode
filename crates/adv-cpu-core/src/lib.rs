@@ -4,8 +4,6 @@
 //! the hidden ones are engine-facing, not part of the host contract.
 #[doc(hidden)]
 pub mod architecture;
-#[doc(hidden)]
-pub mod atomic_memory;
 pub mod backend;
 #[doc(hidden)]
 pub mod cliffs;
@@ -17,15 +15,12 @@ pub mod dual_view;
 pub mod engine;
 pub mod execution_abi;
 #[doc(hidden)]
-#[allow(dead_code)]
 pub mod fault_recipe;
-#[cfg(all(
-    any(
-        target_os = "linux",
-        target_os = "android",
-        all(any(target_os = "macos", target_os = "ios"), target_arch = "aarch64")
-    ),
-    any(target_arch = "x86_64", target_arch = "aarch64")
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
 ))]
 pub mod fault_recovery;
 #[doc(hidden)]
@@ -37,8 +32,6 @@ pub mod host_features;
 pub mod instruction_trace;
 pub mod integer;
 pub mod interpreter;
-#[doc(hidden)]
-pub mod machine_memory;
 #[doc(hidden)]
 pub mod memory;
 pub mod native_region;

@@ -19,34 +19,6 @@ impl TrapHandler for Done {
     }
 }
 
-#[cfg(windows)]
-mod host {
-    use std::ffi::c_void;
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn GetCurrentProcess() -> *mut c_void;
-        fn SetProcessAffinityMask(process: *mut c_void, mask: usize) -> i32;
-        fn GetProcessTimes(
-            process: *mut c_void,
-            c: *mut u64,
-            e: *mut u64,
-            k: *mut u64,
-            u: *mut u64,
-        ) -> i32;
-    }
-    pub fn pin() {
-        assert_ne!(unsafe { SetProcessAffinityMask(GetCurrentProcess(), 1) }, 0);
-    }
-    pub fn cpu_seconds() -> f64 {
-        let (mut c, mut e, mut k, mut u) = (0, 0, 0, 0);
-        assert_ne!(
-            unsafe { GetProcessTimes(GetCurrentProcess(), &mut c, &mut e, &mut k, &mut u) },
-            0
-        );
-        (k + u) as f64 * 1e-7
-    }
-}
-#[cfg(not(windows))]
 mod host {
     pub fn pin() {}
     pub fn cpu_seconds() -> f64 {

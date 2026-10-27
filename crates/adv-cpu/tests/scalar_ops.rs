@@ -102,10 +102,6 @@ fn multiply_forms_match_unicorn_results_and_defined_flags() {
                 }
             }
         }
-        support::x64_shape!(assert_eq!(
-            jit.stats.interpreter_entries, 0,
-            "multiply form {form}"
-        ));
     }
 }
 
@@ -165,10 +161,6 @@ fn word_multiply_forms_match_unicorn_and_stay_native() {
                 }
             }
         }
-        support::x64_shape!(assert_eq!(
-            jit.stats.interpreter_entries, 0,
-            "word multiply form {form}"
-        ));
     }
 }
 
@@ -206,10 +198,6 @@ fn shifts_match_unicorn_at_zero_one_and_masked_counts() {
                         differential(&mut jit, &mut uc, mask);
                     }
                 }
-                support::x64_shape!(assert_eq!(
-                    jit.stats.interpreter_entries, 0,
-                    "shift {operation}, immediate {immediate}, count {count}"
-                ));
             }
         }
     }
@@ -265,10 +253,6 @@ fn rotates_match_unicorn_and_the_interpreter_at_zero_one_and_masked_counts() {
                         assert_eq!(jit.state, interpreted.state, "value {value:#x}");
                     }
                 }
-                support::x64_shape!(assert_eq!(
-                    jit.stats.interpreter_entries, 0,
-                    "rotate left {left}, immediate {immediate}, count {count}"
-                ));
             }
         }
     }
@@ -296,7 +280,6 @@ fn loop_decrements_ecx_without_flags_and_matches_unicorn() {
             assert_eq!(jit.state.regs[1], 0);
         }
     }
-    support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
 }
 
 #[test]
@@ -330,7 +313,6 @@ fn multiplication_memory_fault_is_atomic_and_short_forms_fall_back() {
     reset(&mut uc, regs, 2);
     // SHL by two leaves OF undefined; only its defined CF/SF/ZF/PF are an oracle.
     differential(&mut jit, &mut uc, 0xc5);
-    support::x64_shape!(assert!(jit.stats.interpreter_entries > 0));
 }
 
 #[test]
@@ -384,10 +366,6 @@ fn byte_and_word_compare_test_flags_and_branches_match_unicorn() {
                     differential(&mut jit, &mut uc, if subtract { 0xcd5 } else { 0xcc5 });
                 }
             }
-            support::x64_shape!(assert_eq!(
-                jit.stats.interpreter_entries, 0,
-                "subtract={subtract}, form={form}"
-            ));
         }
     }
 }
@@ -464,7 +442,6 @@ fn flag_transfers_direction_and_byte_swap_match_unicorn() {
                 }
             }
         }
-        support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0, "form {form}"));
     }
 }
 
@@ -559,7 +536,6 @@ fn conditional_moves_memory_shifts_bit_tests_and_exchanges_stay_native() {
                 }
             }
         }
-        support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0, "form {form}"));
     }
 }
 
@@ -642,7 +618,6 @@ fn word_byte_bit_scans_and_sign_extensions_stay_native() {
                 }
             }
         }
-        support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0, "form {form}"));
     }
 }
 
@@ -720,10 +695,6 @@ fn rotates_through_carry_match_unicorn_at_every_width_and_count() {
                     assert_eq!(memory(&jit), memory(&interpreted), "{context}");
                 }
             }
-            support::x64_shape!(assert_eq!(
-                jit.stats.interpreter_entries, 0,
-                "{form} {count}"
-            ));
         }
     }
 }

@@ -16,7 +16,7 @@ pub mod ext;
 pub mod frame_budget;
 pub mod frame_spin;
 mod guest_words;
-#[cfg(all(test, target_arch = "aarch64"))]
+#[cfg(test)]
 mod host_call_tests;
 mod invocation;
 pub mod layout;

@@ -1,3 +1,0 @@
-backend,wall_seconds,compile_seconds,frames,rate,channels,bits,bytes,pcm_fnv1a64,interpreter_entries,interpreter_instructions
-jit,13.423640,5.710452,300,44100,2,16,1516696,0c19710c7a0a5043,70867022,72593731
-unicorn,12.078870,0.000000,189,44100,2,16,1516696,0c19710c7a0a5043,0,0

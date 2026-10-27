@@ -100,6 +100,5 @@ fn word_pushes_and_pops_run_natively_and_match_unicorn() {
                 "{context}"
             );
         }
-        support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0, "op {index}"));
     }
 }

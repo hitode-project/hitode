@@ -2,8 +2,7 @@
 use crate::{CpuState, Memory, PAGE_SIZE, READ, WRITE, X87Cliff, interpreter::Step};
 use iced_x86::{Instruction, Mnemonic as M, Register as R};
 pub mod fast;
-#[cfg(all(test, target_arch = "x86_64"))]
-mod native_x87;
+
 pub mod packed;
 mod simd;
 pub mod softfloat;

@@ -1,5 +1,5 @@
 //! Stable virtual processor identity. Never expose host features to guest code:
-//! doing so would make instruction selection depend on x64 versus ARM hosts.
+//! doing so would make instruction selection depend on host capabilities.
 
 /// Identity of the emulated processor, shared by instruction and OS queries.
 #[derive(Clone, Copy, Debug)]

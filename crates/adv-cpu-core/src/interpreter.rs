@@ -1956,7 +1956,7 @@ impl Transaction {
                 // specified 16-bit byte swap. Our guest compatibility policy
                 // follows observed Intel execution: clear the low word,
                 // preserve the upper word and all flags. Do not delegate this
-                // undefined host instruction on x64 or invent REV16 on ARM.
+                // undefined REV16 behavior on ARM.
                 let value = if reg.width == 2 {
                     0
                 } else {

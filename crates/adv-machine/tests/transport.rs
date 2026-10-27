@@ -218,9 +218,6 @@ fn registered_transport_survives_copy_and_arithmetic_reconstruction_with_normal_
     let mut jit = JitCpu::new(PARK_ADDR, true).unwrap();
     jit.set_async_compilation(false);
     let machine = transport(jit, |machine| {
-        // a64 has no automatic-region policy to switch off.
-        #[cfg(not(target_arch = "aarch64"))]
-        machine.cpu.executor_mut().enable_auto_jit(false);
         let mut guest = Region::new(CODE, 4096);
         guest.entries.extend([
             CODE,
@@ -248,10 +245,4 @@ fn registered_transport_survives_copy_and_arithmetic_reconstruction_with_normal_
     });
     let stats = machine.cpu.stats();
     assert!(stats.native_entries > 0, "fixture must enter compiled code");
-    // a64 runs each entry's first visit outside translated code.
-    #[cfg(not(target_arch = "aarch64"))]
-    assert_eq!(
-        stats.interpreter_instructions, 0,
-        "all transport gates and return tails must execute in compiled code"
-    );
 }

@@ -4,9 +4,9 @@
 mod registers;
 
 use adv_cpu::{CpuState, Memory, RunOutcome};
-use adv_unicorn::Guarded;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{Deref, DerefMut};
+use unicorn_engine::Unicorn;
 use unicorn_engine::{
     RegisterX86 as R,
     unicorn_const::{Arch, HookType, MemType, Mode, Prot, uc_error},
@@ -44,7 +44,7 @@ struct HookData {
 /// An independent reference executor with its own memory and architectural state.
 pub struct Oracle {
     // Unicorn must drop before the stable allocation used by mem_map_ptr.
-    uc: Guarded<'static, HookData>,
+    uc: Unicorn<'static, HookData>,
     memory: Memory,
     pub state: CpuState,
     pages: BTreeMap<u32, u8>,
@@ -87,7 +87,7 @@ impl Oracle {
             Memory::new(base, len)?
         };
         let mut uc =
-            Guarded::new_with_data(Arch::X86, Mode::MODE_32, HookData::default()).map_err(error)?;
+            Unicorn::new_with_data(Arch::X86, Mode::MODE_32, HookData::default()).map_err(error)?;
         let mut pages = BTreeMap::new();
         if !sparse {
             let pointer = memory.read(base, len)?.as_ptr().cast_mut().cast();
@@ -275,23 +275,6 @@ impl Oracle {
     }
 }
 
-/// Asserts about the x64 engine's execution shape (native entries, compiled
-/// units, bulk counters). Skipped on AArch64 hosts, which run the a64 engine,
-/// so the semantic checks around them still run there. Whole tests about that
-/// shape (fuel per native block, regions, linking) are ignored there instead;
-/// a64 checks its own budget boundaries against the interpreter.
-#[allow(unused_macros)]
-macro_rules! x64_shape {
-    ($($body:tt)*) => {
-        // Still type-checked under a64, so its operands stay in use.
-        if !cfg!(target_arch = "aarch64") {
-            $($body)*
-        }
-    };
-}
-#[allow(unused_imports)]
-pub(crate) use x64_shape;
-
 /// The platform's engine.
 pub type Engine = adv_cpu::Executor;
 
@@ -387,14 +370,4 @@ impl Executor {
         self.after_oracle()?;
         result
     }
-}
-
-/// x64 tuning has no a64 counterpart; fixtures that set it keep compiling.
-#[cfg(target_arch = "aarch64")]
-impl Executor {
-    pub fn enable_auto_jit(&mut self, _enabled: bool) {}
-    pub fn set_region_linking(&mut self, _enabled: bool) {}
-    pub fn set_tier_verification(&mut self, _mode: Option<bool>) {}
-    pub fn set_profiling(&mut self, _enabled: bool) {}
-    pub fn set_auto_compile_strategy(&mut self, _strategy: adv_cpu::CompileStrategy) {}
 }

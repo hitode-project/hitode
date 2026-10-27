@@ -52,14 +52,12 @@ Header macros, placeholder names in script examples and names read only to clear
 | `ADV_AUDIO_DUMP_DIR` | Diagnostic | No output; needs `ADV_AUDIO_TRACE` |
 | `ADV_AUDIO_MUTE_DEVICE` | Diagnostic | Off; `1` mutes the physical output |
 | `ADV_AUDIO_TRACE` | Diagnostic | No output |
-| `ADV_BENCH_CPU` | Fixture | `0` (Windows synthetic memory benchmark) |
 | `ADV_BISECT_EXE` | Fixture | None; required for the explicit backend comparison, with the game chosen through `ADV_SAMPLES` |
 | `ADV_BISECT_BACKENDS` | Fixture | `interpreter,unicorn`; `jit` optional |
 | `ADV_BISECT_SECONDS` | Fixture | `10` (1 to 120), the outer deadline per backend |
 | `ADV_BISECT_CODEPAGE` | Fixture | The runtime default code page |
 | `ADV_BISECT_WORKER`, `ADV_BISECT_DATA`, `ADV_BISECT_BACKEND`, `ADV_BISECT_HASH_ITEM` | Fixture | Unset; child protocol set by the parent test |
 | `ADV_CODESIGN_IDENTITY` | Feature | Unset: `tools/macos/package.py` signs ad hoc |
-| `ADV_COMPILE_THREADS` | Diagnostic | Automatic 1 to 3, up to 4 on desktops with many cores; override 1 to 8 |
 | `ADV_CONTROLLED_FAULT_CASE` | Fixture | Unset; set by the parent test |
 | `ADV_CPU_DIRECT_PROBE` | Fixture | Unset; set by the parent test |
 | `ADV_DEBUG` | Diagnostic | Off; `1` serves the interactive debugger, as `adv-run --debug` |
@@ -76,18 +74,9 @@ Header macros, placeholder names in script examples and names read only to clear
 | `ADV_FONT_DIR` | Feature | System font folders only |
 | `ADV_FONT_PROFILE` | Fixture | No controlled font profile |
 | `ADV_GPU_BACKEND` | Migration comparison | Unset: native Metal programmable draws on Apple ARM; `wgpu` forces the reference path. Remove when R3-B completes. |
-| `ADV_GIR_CANDIDATES` | Fixture | None; required by the explicit corpus test |
 | `ADV_VERIFY_SOFTWARE_FRAMES` | Diagnostic | Off; any value compares incremental software storage and conversion against full-frame references |
-| `ADV_GIR_CAPTURE` | Diagnostic | No output; needs the `gir-capture` feature |
-| `ADV_GIR_CORPUS` | Fixture | None; required by the explicit corpus test |
-| `ADV_GIR_FAULT_CHILD` | Fixture | Unset; set by the parent test |
-| `ADV_GIR_LIFT` | Diagnostic | Off; needs the `gir-lift` feature |
-| `ADV_GIR_LIFT_CORPUS` | Fixture | No private corpus; self-written regions only |
-| `ADV_GIR_NATIVE` | Diagnostic | No output |
-| `ADV_GIR_OUTPUT` | Fixture | None; required by the explicit corpus test |
 | `ADV_HOST_FEATURES` | Diagnostic | Every detected feature; can only turn features off |
 | `ADV_HOST_FEATURES_REPORT` | Diagnostic | Off |
-| `ADV_INTERP_PROFILE` | Diagnostic | No output |
 | `ADV_INTERP_TRACE_DIR` | Diagnostic | No output |
 | `ADV_INTERP_TRACE_MAX` | Diagnostic | `4096`, at most 100000 |
 | `ADV_INTERP_TRACE_OPERANDS` | Diagnostic | Off |
@@ -96,35 +85,15 @@ Header macros, placeholder names in script examples and names read only to clear
 | `ADV_INTERP_TRACE_WATCH_DWORD` | Diagnostic | None; watches one DWORD at interpreter dispatch boundaries |
 | `ADV_INTERP_TRACE_STACK_WORDS` | Diagnostic | `4` (0 to 8) |
 | `ADV_IOS_JIT_AT_LAUNCH` | Fixture | Unset; `enable`, `ddiStatus` or `downloadDdi` runs that JIT helper task at launch |
-| `ADV_JIT_DUMP_DIR` | Diagnostic | No output |
-| `ADV_JIT_DUMP_REGIONS` | Diagnostic | All regions; needs `ADV_JIT_DUMP_DIR` |
-| `ADV_JIT_IR_COUNTS` | Diagnostic | Off |
 | `ADV_JIT_MAP_DIR` | Diagnostic | No output |
 | `ADV_JIT_VERIFY` | Diagnostic | Off; `1` or `strict` |
-| `ADV_JIT_X87_HELPER_ONLY` | Diagnostic | Off; guarded native x87 emission allowed |
-| `ADV_JIT_X87_SINGLE_ONLY` | Diagnostic | Off; resident x87 runs allowed |
-| `ADV_LOOP_COVERAGE` | Diagnostic | Off |
 | `ADV_MMIO_TRACE` | Diagnostic | No output |
-| `ADV_NATIVE_CACHE_CHILD` | Fixture | Unset; the parent test passes a local synthetic archive |
-| `ADV_NATIVE_CACHE_REJECT_BINARY` | Fixture | Unset; checks that another host binary is rejected |
 | `ADV_PERF_MAP_DIR` | Diagnostic | No output |
 | `ADV_PERSONALITY_STRICT` | Comparison | Off: only implemented and reviewed exports are discoverable. Removed when the dynamic export policy comparison ends |
 | `ADV_PRINTF_DIAG_PATH` | Diagnostic | No output |
 | `ADV_PRINTF_DIAG_WORDS` | Diagnostic | Empty filter; needs `ADV_PRINTF_DIAG_PATH` |
 | `ADV_PRIVACY_TERMS` | Diagnostic | The local `.privacy-terms`, if present |
 | `ADV_PRIVATE_ENV` | Fixture | Data in a self-written guest environment block only |
-| `ADV_REGION_BENCH_CATEGORY` | Fixture | All categories |
-| `ADV_REGION_BENCH_COMPILE` | Fixture | Off |
-| `ADV_REGION_BENCH_COMPILE_REPEATS` | Fixture | `9` |
-| `ADV_REGION_BENCH_EXPORT_CORPUS` | Fixture | No output |
-| `ADV_REGION_BENCH_LOOPS` | Fixture | `10000` |
-| `ADV_REGION_BENCH_PRIVATE_LIMIT` | Fixture | `3` |
-| `ADV_REGION_BENCH_REPEATS` | Fixture | `4` |
-| `ADV_REGION_BENCH_SAMPLES` | Fixture | `7` |
-| `ADV_REGION_BENCH_TIER0_ONLY` | Fixture | Off |
-| `ADV_SAFEPOINT_BENCH_LOOPS` | Fixture | `200000` |
-| `ADV_SAFEPOINT_BENCH_SAMPLES` | Fixture | `7` |
-| `ADV_SAFEPOINT_BENCH_TIER` | Fixture | `2` |
 | `ADV_SAMPLES` | Fixture | Unset: tests that need games skip |
 | `ADV_SECURE_COPY_ORACLE_CHILD` | Fixture | Unset; set by the parent test |
 | `ADV_SHELL_DPI_TEST_CHILD` | Fixture | Unset; set by the parent test |
@@ -154,15 +123,9 @@ they exclude backend work and damage-history bookkeeping.
 | Option | Kind | Default |
 |---|---|---|
 | `--exe` | Feature | Required; also accepted as a positional argument |
-| `--backend` | Diagnostic | `jit` (Tier 0 with the platform engine); `interpreter` optional |
-| `--row-workers` | Feature | Automatic, at most 3 helpers; `0` runs rows inline |
-| `--no-row-batching` | Diagnostic | Absent: proven batches enabled |
+| `--backend` | Diagnostic | `jit` (Tier 0 with the a64 translator); `interpreter` optional |
 | `--api-mode` | Diagnostic | `discovery`: unimplemented APIs return their derived failure and are reported; `strict` stops at the first, for acceptance |
 | `--no-time-skip` | Diagnostic | Absent: Ctrl time skip allowed when its conditions hold |
-| `--compile` | Diagnostic | `fast`; `speed` optional |
-| `--no-tiering` | Diagnostic | Absent: Fast to Speed promotion allowed |
-| `--no-region-linking` | Diagnostic | Absent: region linking enabled |
-| `--sync-compilation` | Diagnostic | Absent: background compilation |
 | `--codepage` | Feature | `auto`: 936 for marked or mostly GB2312 executables, otherwise 932; `932` and `936` override |
 | `--headless` | Fixture | Off: a host window is shown |
 | `--codec` | Diagnostic | `native`; `guest` for comparison |
@@ -179,7 +142,6 @@ they exclude backend work and damage-history bookkeeping.
 | `--frames` | Fixture | No frame limit |
 | `--seconds` | Fixture | No wall-clock limit |
 | `--data-dir` | Feature | `target/adv-data/<exe>` |
-| `--no-code-cache` | Diagnostic | Absent: persistent machine code and budgeted ahead-of-time compilation; for troubleshooting only |
 | `--cdrom` | Feature | None; repeat to mount read-only ISO images |
 | `--install-dir` | Feature | None: `C:\Program Files` lives in the data folder |
 | `--report` | Diagnostic | No output |
@@ -190,7 +152,7 @@ they exclude backend work and damage-history bookkeeping.
 | `--schedule-profile` | Diagnostic | No output |
 | `--auto-dialog-ms` | Fixture | No automatic dialog choice |
 | `--self-test-input` | Fixture | Off |
-| `--profile` | Diagnostic | Off; turning it on disables region linking |
+| `--profile` | Diagnostic | Off |
 | `--frame-budget` | Diagnostic | Off; headless with one guest worker only |
 | `--control-stdin` | Diagnostic | Off |
 | `--help`, `-h` | Diagnostic | Help not shown |
@@ -210,7 +172,7 @@ both mappings; removing settings on the next run restores the prefix namespace.
 
 ## Cargo features
 
-No feature selects execution behavior: the engine follows the target architecture. Platform and device build capabilities such as `gpu` and `media` are described in [building.md](building.md).
+The execution engine is AArch64. Platform and device build capabilities such as `gpu` and `media` are described in [building.md](building.md).
 
 Host service CSV diagnostics also count successful guest bodies and ordinary fallbacks per API, with the guest fraction. Guest probes are installed only while host profiling, frame timing or frame-budget diagnostics are active; disabled bodies and fallback jumps contain no counter instructions.
 
@@ -220,6 +182,6 @@ Host service CSV diagnostics also count successful guest bodies and ordinary fal
 
 ### AArch64 prepared code pool
 
-`ADV_A64_CODE_POOL_MIB` sets the fixed host-process code pool in MiB (default 512; 128 on iOS, where the JIT debugger prepares every page). It is read once before the first translated guest runs; each process leases 64 MiB. On iOS, a short pool first halves the lease down to 16 MiB; full exhaustion or an invalid/unavailable pool falls back to Tier 0 with a capability warning; other hosts map overflow caches separately. Hosts may call `adv_cpu_a64::prepare_code_pool()` before creating machines to prepare executable memory explicitly. This does not change the x86_64 engine.
+`ADV_A64_CODE_POOL_MIB` sets the fixed host-process code pool in MiB (default 512; 128 on iOS, where the JIT debugger prepares every page). It is read once before the first translated guest runs; each process leases 64 MiB. On iOS, a short pool first halves the lease down to 16 MiB; full exhaustion or an invalid/unavailable pool falls back to Tier 0 with a capability warning; other hosts map overflow caches separately. Hosts may call `adv_cpu_a64::prepare_code_pool()` before creating machines to prepare executable memory explicitly.
 
 Tier 0 baseline reports include `tier0_instructions` and `tier0_instructions_per_second` when `--profile` or `--frame-budget` enables exact retirement counting. Otherwise these fields are null. Rates use total host wall time, including waits, and do not treat REP elements as separately retired instructions. The standalone `adv-cpu-core` example `tier0_baseline` prints synthetic-case JSON lines; `--seconds N` sets each case duration and `--iterations N` sets loop work per run.
