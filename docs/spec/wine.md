@@ -42,6 +42,11 @@ This spec covers the Wine userland stack. `adv-wineserver` runs Wine's server in
 **Rule**: A guest process MUST connect to the server when the server directory path is longer than `sun_path` holds.
 **Verification**: Test
 
+### WINE-SRV-4 No executable host mappings
+
+**Rule**: The server MUST NOT map host memory executable. A mapping it requests with execute access MUST be granted readable without it.
+**Verification**: Test
+
 ## Server channels
 
 ### SRV-CHAN-1 Memory channels

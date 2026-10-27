@@ -16,6 +16,7 @@
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <unistd.h>
 #include <poll.h>
 #include <signal.h>
@@ -61,6 +62,7 @@ ssize_t hitode_readv( int fd, const struct iovec *iov, int count );
 ssize_t hitode_writev( int fd, const struct iovec *iov, int count );
 ssize_t hitode_sendmsg( int fd, const struct msghdr *msg, int flags );
 ssize_t hitode_recvmsg( int fd, struct msghdr *msg, int flags );
+void *hitode_mmap( void *addr, size_t size, int prot, int flags, int fd, off_t offset );
 
 int hitode_poll( struct pollfd *fds, nfds_t count, int timeout );
 #ifdef __APPLE__
@@ -124,6 +126,7 @@ int hitode_NSGetExecutablePath( char *buf, uint32_t *size );
 #define writev(...) hitode_writev(__VA_ARGS__)
 #define sendmsg(...) hitode_sendmsg(__VA_ARGS__)
 #define recvmsg(...) hitode_recvmsg(__VA_ARGS__)
+#define mmap(...) hitode_mmap(__VA_ARGS__)
 
 #define poll(...) hitode_poll(__VA_ARGS__)
 #ifdef __APPLE__

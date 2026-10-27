@@ -19,6 +19,7 @@
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/un.h>
 #include <poll.h>
 #include <pthread.h>
@@ -1085,6 +1086,15 @@ time_t hitode_time( time_t *t )
 
     if (t) *t = now;
     return now;
+}
+
+/* The server never runs code from its mappings; guest code reaches the CPU
+ * only through the translator. Its probe for an executable temporary
+ * directory maps a fresh file executable, which macOS validates for code
+ * signing in about 200 ms per probe, so it gets a readable mapping. */
+void *hitode_mmap( void *addr, size_t size, int prot, int flags, int fd, off_t offset )
+{
+    return mmap( addr, size, prot & ~PROT_EXEC, flags, fd, offset );
 }
 
 /* Priorities and limits belong to the host process, which Hitode owns. */
