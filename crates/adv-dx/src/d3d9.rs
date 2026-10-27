@@ -18,11 +18,9 @@ mod capabilities;
 mod creation;
 mod cursor;
 mod dc;
-pub(crate) mod direct;
 mod dirty;
 mod fixed;
 mod format;
-pub(crate) mod loading;
 mod memory;
 mod pacing;
 mod presentation;
@@ -30,7 +28,6 @@ mod programmable;
 mod readback;
 mod recording;
 mod residency;
-pub(crate) mod saving;
 mod stretch;
 mod targets;
 #[cfg(test)]
@@ -87,8 +84,6 @@ pub struct SurfaceProvider {
     pub mode_changed: fn(&mut Env<'_>, u32, D3DPRESENT_PARAMETERS) -> Outcome,
     pub device_released: fn(&mut Env<'_>, u32),
     pub completed: fn(&mut Env<'_>, u64) -> Option<Outcome>,
-    /// A completed Present that did not wait for a refresh boundary.
-    pub unpaced: fn(&mut Env<'_>),
 }
 
 type Id = ComIdentity<Payload>;
@@ -185,9 +180,6 @@ impl Device {
 pub struct State {
     com: Com,
     tables: BTreeMap<&'static str, u32>,
-    /// Published device and state block thunks by COM slot (GFX-EFFECT-3).
-    device_methods: Vec<u32>,
-    block_methods: Vec<u32>,
     gpu: Option<Gpu>,
     provider: SurfaceProvider,
     pending: Vec<Pending>,
@@ -405,7 +397,6 @@ pub fn install<B: Backend>(
     provider: SurfaceProvider,
 ) -> Result<(), String> {
     let mut tables = BTreeMap::new();
-    let (mut device_methods, mut block_methods) = (Vec::new(), Vec::new());
     for interface in [
         "IDirect3D9",
         "IDirect3DDevice9",
@@ -442,15 +433,6 @@ pub fn install<B: Backend>(
                 .cpu
                 .write_u32(table + u32::from(slot) * 4, thunk)
                 .map_err(|e| e.to_string())?;
-            let methods = match interface {
-                "IDirect3DDevice9" => &mut device_methods,
-                "IDirect3DStateBlock9" => &mut block_methods,
-                _ => continue,
-            };
-            if methods.len() <= usize::from(slot) {
-                methods.resize(usize::from(slot) + 1, 0);
-            }
-            methods[usize::from(slot)] = thunk;
         }
         tables.insert(interface, table);
     }
@@ -458,8 +440,6 @@ pub fn install<B: Backend>(
     machine.ext.insert(State {
         com,
         tables,
-        device_methods,
-        block_methods,
         gpu: None,
         provider,
         pending: Vec::new(),
@@ -1467,11 +1447,6 @@ fn completed(env: &mut Env<'_>, result: Completion) -> Outcome {
             return outcome;
         }
         let fast_forward = (provider.fast_forward)(env.ext);
-        // An unpaced Present (IMMEDIATE or occluded) is a whole frame for the
-        // software frame cap: frames above the display rate are never shown.
-        if deadline.is_none() && !fast_forward {
-            (provider.unpaced)(env);
-        }
         // S_PRESENT_OCCLUDED belongs to D3D9Ex. Base Present still succeeds;
         // visibility only suppresses the refresh deadline calculated below.
         return pacing::finish(env, deadline, 0, fast_forward);
@@ -1649,8 +1624,6 @@ pub fn pump<B: Backend>(machine: &mut Machine<B>) -> Result<bool, String> {
     let readback = readback::pump(&mut env);
     dc::reap_cancelled(&mut env);
     update_texture::reap_cancelled(&mut env);
-    loading::reap_cancelled(&mut env);
-    crate::d3dx9::reap_file_exports(&mut env, false);
     Ok(readback || progress)
 }
 /// Process stop cancels map ownership and closes internal wait handles. Accepted
@@ -1674,8 +1647,6 @@ pub fn cancel_pending<B: Backend>(machine: &mut Machine<B>) {
     readback::cancel_pending(&mut env);
     dc::cancel_all(&mut env);
     update_texture::cancel_all(&mut env);
-    loading::cancel_all(&mut env);
-    crate::d3dx9::reap_file_exports(&mut env, true);
 }
 #[win32(d3d9, name = "IDirect3DDevice9::Clear", level = implement)]
 fn clear(

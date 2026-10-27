@@ -541,7 +541,6 @@ pub struct Control {
     reader: Option<std::thread::Thread>,
     alive: Arc<AtomicBool>,
     awaiting_guest_boundary: bool,
-    input_receipt: u64,
     awaiting_until: Option<Instant>,
 }
 impl Control {
@@ -617,7 +616,6 @@ impl Control {
             reader: Some(reader.thread().clone()),
             alive,
             awaiting_guest_boundary: false,
-            input_receipt: 0,
             awaiting_until: None,
         })
     }
@@ -657,7 +655,6 @@ impl Control {
         };
         if command.as_ref().is_some_and(Command::interrupts_guest) {
             self.awaiting_guest_boundary = true;
-            self.input_receipt = 0;
             self.awaiting_until = Some(Instant::now() + Duration::from_secs(1));
         }
         command.into_iter().collect()
@@ -670,14 +667,6 @@ impl Control {
             self.awaiting_guest_boundary = false;
             self.awaiting_until = None;
         }
-    }
-    pub fn note_input_receipt(&mut self, receipt: u64) {
-        if self.awaiting_guest_boundary {
-            self.input_receipt = receipt;
-        }
-    }
-    pub fn awaited_input_receipt(&self) -> Option<u64> {
-        self.awaiting_guest_boundary.then_some(self.input_receipt)
     }
     pub fn has_pending(&self) -> bool {
         !self.receiver.is_empty()
@@ -734,7 +723,6 @@ mod tests {
             reader: None,
             alive: Arc::new(AtomicBool::new(true)),
             awaiting_guest_boundary: true,
-            input_receipt: 0,
             awaiting_until: Some(Instant::now() + Duration::from_secs(1)),
         };
         assert_eq!(control.drain(), [Command::KeyUp(17)]);
@@ -899,7 +887,6 @@ mod tests {
             reader: None,
             alive: Arc::new(AtomicBool::new(true)),
             awaiting_guest_boundary: false,
-            input_receipt: 0,
             awaiting_until: None,
         };
         sender.send(Command::Key(13)).unwrap();
@@ -913,7 +900,6 @@ mod tests {
         assert_eq!(control.drain_frozen(true), [Command::Resume]);
         assert!(control.drain().is_empty());
         control.after_guest_step(true);
-        assert_eq!(control.awaited_input_receipt(), None);
     }
     #[test]
     fn only_input_and_close_commands_request_guest_preemption() {
@@ -945,7 +931,6 @@ mod tests {
             reader: None,
             alive: Arc::new(AtomicBool::new(true)),
             awaiting_guest_boundary: false,
-            input_receipt: 0,
             awaiting_until: None,
         };
         sender.send(Command::KeyUp(17)).unwrap();
@@ -972,7 +957,6 @@ mod tests {
             reader: None,
             alive: Arc::new(AtomicBool::new(true)),
             awaiting_guest_boundary: false,
-            input_receipt: 0,
             awaiting_until: None,
         };
         sender.send(Command::KeyDown(17)).unwrap();
@@ -998,27 +982,16 @@ mod tests {
             reader: None,
             alive: Arc::new(AtomicBool::new(true)),
             awaiting_guest_boundary: false,
-            input_receipt: 0,
             awaiting_until: None,
         };
         sender.send(Command::KeyUp(17)).unwrap();
         sender.send(Command::Capture("frame.png".into())).unwrap();
         sender.send(Command::Report("report.json".into())).unwrap();
         assert_eq!(control.drain(), [Command::KeyUp(17)]);
-        control.note_input_receipt(4);
-        assert_eq!(control.awaited_input_receipt(), Some(4));
         control.awaiting_until = Some(Instant::now());
         assert!(
             matches!(control.drain().as_slice(), [Command::Error(error)] if error.contains("fence timed out"))
         );
-        assert_eq!(control.awaited_input_receipt(), None);
         assert_eq!(control.drain(), [Command::Report("report.json".into())]);
-        sender.send(Command::KeyUp(17)).unwrap();
-        assert_eq!(control.drain(), [Command::KeyUp(17)]);
-        assert_eq!(
-            control.awaited_input_receipt(),
-            Some(0),
-            "new or failed input never reuses an old receipt"
-        );
     }
 }

@@ -1,5 +1,4 @@
 //! Host observations, separate from the guest's presentation serial and clock.
-use crate::window::WaitOutcome;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
@@ -171,9 +170,6 @@ impl Performance {
             ..Self::default()
         };
     }
-    pub fn soft_yield(&mut self) {
-        self.soft_yields += 1;
-    }
     pub fn pump(&mut self, elapsed: Duration, completed: Instant) {
         if self
             .measurement_start
@@ -187,7 +183,7 @@ impl Performance {
     pub fn set_ui_metrics_dropped(&mut self, total: u64) {
         self.ui_metrics_dropped_total = total;
     }
-    #[cfg(any(host_view, all(windows, feature = "gpu")))]
+    #[cfg(host_view)]
     pub(crate) fn native(&mut self, stats: NativePresentation) {
         self.native = Some(stats);
     }
@@ -247,20 +243,6 @@ impl Performance {
     /// window; the anonymous report's frame percentiles.
     pub(crate) fn frame_samples(&self) -> impl Iterator<Item = f64> + '_ {
         self.warm_active_intervals.recent.iter().copied()
-    }
-    pub fn wait(&mut self, requested: Option<Duration>, elapsed: Duration, outcome: WaitOutcome) {
-        if let Some(requested) = requested {
-            self.wait_requested += requested;
-        }
-        match outcome {
-            WaitOutcome::Input => self.input_wakes += 1,
-            WaitOutcome::Deadline => {
-                self.deadline_wakes += 1;
-                if let Some(requested) = requested {
-                    self.wait_overshoot.add(elapsed.saturating_sub(requested));
-                }
-            }
-        }
     }
     pub fn json(&self) -> String {
         #[cfg(any(

@@ -41,7 +41,6 @@ fn machine_with_limits(native: bool, references: u32) -> Machine<JitCpu> {
         mode_changed: |_, _, _| Outcome::Return(0),
         device_released: |_, _| {},
         completed: |_, _| None,
-        unpaced: |_| {},
     };
     m.ext.insert(State {
         com,
@@ -56,8 +55,6 @@ fn machine_with_limits(native: bool, references: u32) -> Machine<JitCpu> {
             ("IDirect3DPixelShader9", 0),
             ("IDirect3DStateBlock9", 0),
         ]),
-        device_methods: Vec::new(),
-        block_methods: Vec::new(),
         gpu: None,
         provider,
         pending: Vec::new(),
@@ -295,14 +292,13 @@ fn parent_reference_limit_refuses_resource_resurrection_without_mutating_counts(
     assert_eq!(com(&env).references(&env.sys.objects, id), Some(0));
 }
 
-// spec: GFX-PACE-2
+// spec: GFX-PACE-1
 #[test]
 fn base_present_completion_returns_success_without_changing_wait_policy() {
     struct Policy {
         held: bool,
         fence: bool,
         serial: u64,
-        unpaced: u32,
     }
     let mut m = machine();
     m.spawn("present", adv_machine::layout::PARK_ADDR, &[], 0x10000)
@@ -311,11 +307,9 @@ fn base_present_completion_returns_success_without_changing_wait_policy() {
         held: false,
         fence: false,
         serial: 0,
-        unpaced: 0,
     });
     let provider = &mut m.ext.get_mut::<State>().provider;
     provider.fast_forward = |ext| ext.get::<Policy>().held;
-    provider.unpaced = |env| env.ext.get_mut::<Policy>().unpaced += 1;
     provider.completed = |env, serial| {
         let policy = env.ext.get_mut::<Policy>();
         policy.serial = serial;
@@ -337,8 +331,6 @@ fn base_present_completion_returns_success_without_changing_wait_policy() {
         Outcome::Return(0)
     ));
     assert_eq!(env.ext.get::<Policy>().serial, 7);
-    // Unpaced frames reach the frame cap; paced and fast-forwarded ones do not.
-    assert_eq!(env.ext.get::<Policy>().unpaced, 1);
     let at = env.sys.clock.now_us() + 1_000;
     assert!(matches!(
         completed(&mut env, Completion::Presented(8, Some(at))),
@@ -349,8 +341,6 @@ fn base_present_completion_returns_success_without_changing_wait_policy() {
         completed(&mut env, Completion::Presented(9, Some(at))),
         Outcome::Return(0)
     ));
-    completed(&mut env, Completion::Presented(9, None));
-    assert_eq!(env.ext.get::<Policy>().unpaced, 1);
     env.ext.get_mut::<Policy>().fence = true;
     assert!(matches!(
         completed(&mut env, Completion::Presented(10, Some(at))),

@@ -95,7 +95,6 @@ dependencies = [
  "objc2-metal",
  "ogg 0.9.2",
  "oxisynth",
- "png 0.17.16",
  "pollster",
  "rubato",
  "serde",
@@ -132,7 +131,6 @@ dependencies = [
  "adv-machine",
  "adv-os",
  "adv-sync",
- "adv-win32",
  "bytemuck",
  "iced-x86",
  "log",
@@ -277,7 +275,6 @@ dependencies = [
  "adv-sync",
  "adv-unicorn",
  "adv-unix",
- "adv-win32",
  "adv-wineserver",
  "encoding_rs",
  "iced-x86",
@@ -320,7 +317,6 @@ dependencies = [
  "png 0.17.16",
  "pollster",
  "wgpu",
- "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -353,24 +349,6 @@ dependencies = [
  "libc",
  "log",
  "thiserror 2.0.21",
-]
-
-[[package]]
-name = "adv-win32"
-version = "0.1.2"
-dependencies = [
- "adv-abi",
- "adv-cpu",
- "adv-device",
- "adv-machine",
- "adv-os",
- "adv-pe",
- "adv-sync",
- "adv-unicorn",
- "encoding_rs",
- "iced-x86",
- "log",
- "windows-sys 0.60.2",
 ]
 
 [[package]]

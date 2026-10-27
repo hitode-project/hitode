@@ -1318,7 +1318,7 @@ mod tests {
         assert_eq!((lock.Pitch, lock.pBits), (16, base + 128));
         assert!(
             matches!(
-                super::super::readback::transfer(
+                super::super::readback::transfer_detached(
                     &mut env,
                     GuestPtr::new(device_pointer),
                     GuestPtr::new(source),
@@ -1338,7 +1338,7 @@ mod tests {
         );
         assert_eq!(env.cpu.read_u32(base + 128).unwrap(), 0xff00ffff);
         assert!(matches!(
-            super::super::readback::transfer(
+            super::super::readback::transfer_detached(
                 &mut env,
                 GuestPtr::new(device_pointer),
                 GuestPtr::new(source),

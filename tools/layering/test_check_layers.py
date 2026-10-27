@@ -21,7 +21,7 @@ class LayeringTest(unittest.TestCase):
     def test_upward_and_sibling_edges_fail(self):
         self.assertTrue(check(("adv-cpu", "adv-machine", "normal")))
         self.assertTrue(check(("adv-device", "adv-cpu", "normal")))
-        self.assertTrue(check(("adv-win32", "adv-dx", "build")))
+        self.assertTrue(check(("adv-dx", "adv-nt", "build")))
 
     def test_test_only_crates_stay_in_dev_dependencies(self):
         self.assertEqual(check(("adv-cpu", "adv-unicorn", "dev")), [])

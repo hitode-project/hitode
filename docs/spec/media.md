@@ -2,19 +2,9 @@
 
 ID prefix: MEDIA
 
-This spec covers the audio and video API front ends: ACM, DirectSound storage, DirectShow graphs, Windows Media and MCI. `adv-dx` and `adv-win32` implement them, and FFmpeg decodes through `adv-device` when the `media` feature is built.
+This spec covers the native audio and video API front ends: DirectSound storage, DirectShow graphs and Windows Media. `adv-dx` implements them, and FFmpeg decodes through `adv-device` when the `media` feature is built.
 
 ## Audio APIs
-
-### MEDIA-AUDIO-1 ACM synchronous streams
-
-**Rule**: PCM and ADPCM streams MUST use real decoding, while application function drivers MUST execute guest DriverProc. A/W registration and details MUST share identity, and stream operations MUST retain common object and continuation ownership.
-**Verification**: Test
-
-### MEDIA-AUDIO-2 ACM boundaries
-
-**Rule**: System driver installation, window-type drivers, and asynchronous ACM streams MUST remain explicitly unavailable.
-**Verification**: Review — no single existing test covers rejection of all three ACM extension paths.
 
 ### MEDIA-AUDIO-3 Deferred DirectSound storage
 
@@ -36,17 +26,6 @@ This spec covers the audio and video API front ends: ACM, DirectSound storage, D
 | Alarm epoch | Increment for each low-lead event and each callback increasing either missing-PCM counter |
 | low_lead_events | Cumulative low-lead transitions |
 | min_lead_ratio_permille | Lifetime minimum floor(1000 × lead / period); zero before any valid observation |
-
-### MEDIA-AUDIO-5 Absent MIDI and mixer devices
-
-**Rule**: MIDI input/output and mixer enumeration MUST report zero devices without capability warnings. Failed opens MUST NOT create handles or callbacks. Calls requiring an opened MIDI handle, and `mixerClose`, MUST return `MMSYSERR_INVALHANDLE` without changing buffers or LastError.
-**Verification**: Test
-**Basis**: [mixerClose](https://learn.microsoft.com/windows/win32/api/mmeapi/nf-mmeapi-mixerclose).
-
-### MEDIA-AUDIO-6 MIDI error text
-
-**Rule**: MIDI input and output error descriptions MUST share bounded, terminated A/W writes, with zero capacity succeeding without memory access. Nonempty queries for unknown errors MUST return `MMSYSERR_BADERRNUM` without publishing text. Text queries MUST preserve LastError and MUST NOT require a device.
-**Verification**: Test
 
 ## Failure and completion
 
@@ -159,13 +138,6 @@ Wine decoder capability probes MUST succeed for available codecs before stream s
 **Rule**: Synchronous readers MUST limit complete guest IStream input to 512 MiB. When supplied, guest IWMReaderAllocatorEx MUST own the buffer receiving each delivered sample.
 **Verification**: Review — packet tests use prepared demuxed data and do not exercise full IStream admission or guest sample allocation.
 
-## AVIFile streams
-
-### MEDIA-AVI-1 Read-only file streams
-
-**Rule**: AVIFileOpenA MUST read through guest CreateFileA and the common demuxer, rejecting writing modes and custom handlers. Video samples MUST be indexed by frame time, audio samples addressed in block-aligned bytes. AVIStreamGetFrame MUST decode from the nearest key frame through the common packet decoder.
-**Verification**: Test
-
 ## Embedded video
 
 ### MEDIA-VIDEO-1 Window state
@@ -197,27 +169,3 @@ Wine decoder capability probes MUST succeed for available codecs before stream s
 
 **Rule**: Standalone host video windows, fullscreen activation, and input-message forwarding MUST fail explicitly without altering embedded geometry.
 **Verification**: Test
-
-## MCI digital video
-
-### MEDIA-MCI-1 Shared digital video
-
-**Rule**: MCI digital-video A/W commands MUST share devices, graph decoding, audio, windows, events, and seeking. Open, playback, stop, pause, resume, status, destination rectangles, side volumes, and close MUST use that lifecycle. Command strings MUST become the same command messages, with aliases kept by the string front end.
-**Verification**: Test
-
-### MEDIA-MCI-2 Completion notifications
-
-**Rule**: MCI playback completion MUST follow actual EOF. Stop or close MUST cancel pending completion, and a later Play MUST supersede it.
-**Verification**: Review — the existing MCI native comparison checks open, wait, status, and close but does not cover every notification replacement and cancellation sequence.
-
-### MEDIA-MCI-3 Unsupported commands
-
-**Rule**: Other MCI devices, string verbs outside digital video, and unsupported commands or flags MUST fail explicitly with MCI parser or device errors. MCI front ends MUST NOT invoke host MCI.
-**Verification**: Test
-
-### MEDIA-MCI-4 MCIWnd lifecycle
-
-**Rule**: MCIWndCreateA/W and MCIWndRegisterClass MUST share a USER class and MCI digital-video lifecycle, with x86 cdecl entry points. Failed opens MUST retain an empty window and queryable error, and destruction MUST close its device. Unsupported toolbar, recording, caption, notification, and window commands MUST fail explicitly.
-**Verification**: Test
-
-Withdrawn: none

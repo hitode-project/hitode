@@ -66,11 +66,6 @@ This spec covers the host shells. It includes launcher overlay input, the game v
 **Rule**: The native frame size MUST use physical pixels: content points multiplied by `backingScaleFactor` on macOS. Native GPU presentation MUST default to preserving aspect ratio and black bars, using sharp-bilinear sampling unless the host selects an upscaler. Pointer positions MUST map back through the same letterbox.
 **Verification**: Test
 
-### HOST-VIEW-2 Retained output
-
-**Rule**: Composing a frame MUST keep the previous output until commit. Retained pixels MUST survive reuse of the caller's buffer and invalid frames. A repaint without a new guest frame MUST show the retained pixels.
-**Verification**: Test
-
 ### HOST-VIEW-3 One composition path
 
 **Rule**: Software frames and GPU surfaces MUST draw video as GPU overlays through one background composition path, using CPU video composition only for captures. Composition MUST preserve encoded colors, write opaque alpha and keep the letterbox black.
@@ -346,11 +341,6 @@ Preparation MUST validate the compressed stream completely before publishing the
 **Rule**: On macOS, `FlushFileBuffers` and `NtFlushBuffersFile` MUST request `F_FULLFSYNC`. A same-volume rename with `MOVEFILE_WRITE_THROUGH` MUST sync the parent directory and then request `F_FULLFSYNC`. Other writes MUST NOT flush the drive cache.
 **Applies to**: macOS
 **Verification**: Review — no test can observe the drive cache flush.
-
-### HOST-SAVE-4 MoveFileEx durability
-
-**Rule**: With `MOVEFILE_WRITE_THROUGH`, a cross-volume move MUST flush the copy before deleting the source. A failed flush or a denied delete MUST keep the source.
-**Verification**: Test
 
 ### HOST-SAVE-5 Copied installer state
 

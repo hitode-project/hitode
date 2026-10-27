@@ -20,23 +20,14 @@ target/scratch/<agent>/          # one-off scripts and intermediate files
 
 ## Tools by symptom
 
-`cargo run -p adv-runtime --features gpu --example host_call_inventory -- --check docs/host-call-boundary.tsv` checks the generated registry boundary table, including aliases and COM methods. `--write` refreshes it, as does `python3 tools/check.py --fix`. `cargo test -p adv-runtime --features gpu --example host_call_inventory` tests coverage and conservative admission. Unproven ordinary effects and Windows kernel entry remain explicitly marked as not excluded; names alone never authorize acceleration.
-
-
 ### Startup and compatibility
 
 | Symptom | First | Then |
 |---|---|---|
-| A user report or a run report | `tools/survey/triage_report.py <report.json>`: gaps by DLL, where each is registered, and the next command | For an anonymous report it prints the discovery rerun with the report's code page; the run report's `missing_apis` then lists every gap at once. |
-| Where an API is implemented | `tools/survey/where.py <dll!api> ...` | Registration status from `host-call-boundary.tsv`, source lines, the table handler, cited specs and tests. |
-| Planning a new game's work | `tools/survey/gap.py <game folder>` (needs `pefile`) | Static imports no registered DLL provides. An estimate only: implement from real calls in `missing_apis`. |
 | Startup hangs, error box, early exit | `sample_matrix.py --only <id> --api-mode discovery --trace`, then the first failure in the report | `trace_hresult.py` summarizes failed HRESULTs. `--warm-from <cold run>` reuses the JIT profiles of a matching cold run. |
 | Smoke test after a personality change | `sample_matrix.py --quick` over `tools/performance/startup-smoke.json`, then `matrix_gate.py --require-frames --frame-tolerance 1` | One game per engine for 10 seconds. A run with zero frames or a new structural warning is a regression. |
-| First divergence in a new game, zero frames for no known reason | Native capture and `api_diff.py` in [tools/compat](../tools/compat/README.md), aligned on the main thread | Without child processes or output buffers the result is partial. |
 | Wrong behavior after some interaction | Reproduce up to that step with a `play_session.py` schedule | `--trace` keeps `api.trace`. The control command `memory ADDR LEN` reads guest memory. |
 | Wrong picture | A `checkpoint` or `capture` | `--gpu-software` compares adapters, and `trace_hresult.py` shows rendering failures. |
-| Win32 behavior differs from Windows | A self-written fixture in `tools/fixtures/` run natively, under the interpreter and under the JIT; record its native result once on Windows with `tools/fixtures/record_native.py`, and `native_reference` in `adv-runtime` then compares every host and backend with it. To learn the expected behavior first, read Wine's conformance test for the API (`dlls/<dll>/tests/*.c`): `ok()` states what Windows returns, and `broken()` marks results that differ between Windows versions, often the Windows 7 behavior the default profile follows | Each fixture's header comment states what it checks and how to build it. `personality_contract.py` runs the shared personality contracts. |
-| Backend hangs, or a run needs a CPU comparison | `backend_bisect` in `adv-runtime`, with `ADV_BISECT_EXE` set | Each backend runs with a fixed runner copy, its own data folder and an outer deadline. A timeout proves nothing about correctness. |
 
 Authored fixtures and generators for one area:
 
@@ -44,13 +35,7 @@ Authored fixtures and generators for one area:
 |---|---|---|
 | Android APK page compatibility | `tools/android/check-apk.py <apk>` | Standard-library ELF LOAD and stored ZIP data alignment checks for 16 KiB pages. Tests: `python -m unittest discover -s tools/android -p test_check_apk.py`. |
 | Upscaling shader regeneration | `tools/upscaling/generate.py <slangc>` | Pinned upstream shaders → WGSL, quantized layer fusion, cooperative matrix RGB convolutions and texture lifetimes; no game inputs. Tests: `python -m unittest discover -s tools/upscaling`. |
-| Recursive Shell directories | [`shell_directories.c`](../tools/fixtures/shell_directories.c), `build-shell-directories.ps1` | Authored local paths and scalar output; Unicode/ANSI recursion, existing paths and errors. Test: `cargo test -p adv-runtime --features gpu --test native_reference`. |
-| D3DX empty textures | [`d3dx9-texture-create.c`](../tools/fixtures/d3dx9-texture-create.c), `test-d3dx9-texture-create.ps1` | Authored dimensions, formats and usage; scalar correction, mip and lifetime comparisons. Test: `cargo test -p adv-runtime --test d3dx_texture --features gpu`. |
-| D3DX axis rotations and Vec2 | [`d3dx9-math2.c`](../tools/fixtures/d3dx9-math2.c), `build-d3d9.ps1 -Name d3dx9-math2` | Authored matrices, overlapping outputs and special values; native scalar comparison with 2e-6 tolerance. Test: `cargo test -p adv-runtime --test d3dx_math2`. |
-| Linguistic comparison | [`nls-compare.c`](../tools/fixtures/nls-compare.c), `build-nls-compare.ps1` | Authored strings and locale flags; A/W/Ex and lstrcmp scalar results. Test: `cargo test -p adv-runtime --features gpu --test native_reference`. |
-| Mouse tracking | [`mouse-track.c`](../tools/fixtures/mouse-track.c), `build-mouse-track.ps1` | Hidden owned windows without host cursor movement; query, cancellation and leave results. Test: `cargo test -p adv-runtime --features gpu --test native_reference`. |
 | D3D9 texture-target copies | [`d3d9-texture-blit.c`](../tools/fixtures/d3d9-texture-blit.c), `test-d3d9-texture-blit.ps1` | Authored RGBX/ARGB images; scalar and pixel comparisons for rectangles, container identity and render state. |
-| Multiline DrawText | [`drawtext-lines.c`](../tools/fixtures/drawtext-lines.c), `build-drawtext-lines.ps1` | Authored text and offscreen DIBs; RGB hashes, line heights, clipping and preserved rectangles. Test: `cargo test -p adv-runtime --features gpu --test native_reference`. |
 
 ### CPU and JIT
 
@@ -62,7 +47,6 @@ Authored fixtures and generators for one area:
 | Synthetic Tier 0 baseline | `cargo run -p adv-cpu-core --release --example tier0_baseline -- --seconds 2` | Authored integer/string/x87/MMX/indirect-call loops, retired-instruction checks and JSON throughput; no game samples. |
 | CPU suite and strict judgement | `acceptance.py [--strict] <logs>` in `tools/cpu` | On AArch64, `arm64-check.sh <ref>` runs the suite once and judges it both ways. |
 | Execution cliffs and tier verification counts | `tools/survey/cliffs.py <report.json> ...` | Groups plain and verify runs and uses only each run's final report. |
-| IR growth and compile service time | `ADV_JIT_IR_COUNTS=1`, then `tools/survey/compile_ir.py <stderr.log>` | Counts are anonymous. Byte categories are not a cost model for single IR operations. |
 | x64 region entry checks and cold compile cost | `host_region_bench` example in `adv-cpu` | `ADV_REGION_BENCH_COMPILE=1` adds Fast and Speed compile percentiles. |
 | AArch64 execution cost | `engine_bench` example in `adv-cpu` | Compares the interpreter and the platform engine through `Backend` only, in ns per guest instruction. |
 | Poll word and interrupt latency | `safepoint_bench` example in `adv-cpu` | `ADV_SAFEPOINT_BENCH_TIER` selects Tier 0 or 2. |
@@ -77,9 +61,8 @@ Authored fixtures and generators for one area:
 | Slow, stuttering or slow skipping in a game | The attribution workflow below | |
 | Two builds A/B | `compare_runtime.py` on a fixed frame prefix, gated on frame hashes | Compatibility regressions use `sample_matrix.py` and `matrix_gate.py`. |
 | Heap allocation cost | `heap_service` example in `adv-os` | `large` and `metadata` select other workloads. |
-| Short name comparison, Global and Vorbis HLE cost | `hot_hle` example in `adv-win32`, with its own `--data-dir` | Includes guest execution and cold compilation, so it is not pure dispatch cost. |
 | Slow D3D9 system memory texture upload | `benchmark_update_texture` in `adv-dx`, run with `--ignored` | Semantic tests sit beside it. |
-| Wait precision | `wait_precision` example in `adv-sync`, `hle_wait_precision` example in `adv-win32` | `--no-time-skip` checks the Ctrl policy. |
+| Wait precision | `wait_precision` example in `adv-sync` | `--no-time-skip` checks the Ctrl policy. |
 | AArch64 host CPU attribution | `ADV_PERF_MAP_DIR=<run>` with simpleperf, then `tools/performance/arm64_hotspots.py` | Off by default and anonymous. Without kernel access, kernel time is not measured. |
 | Android CPU suite and execution experiments | `tools/android/run-cpu-tests.ps1 -AllTests` or `-ExecutionExperiments` | Use `-WhatIf` or `-BuildOnly` without a device. |
 | Android scene summaries | `tools/android/summarize-baseline.py` | Checks that scene, binary and configuration match. |

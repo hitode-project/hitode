@@ -27,7 +27,6 @@ RULES: dict[str, set[str]] = {
     "adv-abi-macros": set(),
     "adv-os": {"adv-abi", "adv-pe"},
     "adv-device": {"adv-sync"},
-    "adv-win32": {"adv-os", "adv-device"},
     "adv-dx": {"adv-abi", "adv-device"},
     # Wine's server, run in process for the Wine userland stack (issue #58).
     "adv-wineserver": set(),
@@ -37,9 +36,9 @@ RULES: dict[str, set[str]] = {
     "adv-unix": {"adv-nt", "adv-abi"},
     # Wine's driver modules, over the Unix libraries and the host devices.
     "adv-drv": {"adv-unix", "adv-device"},
-    # The assembly wires both stacks; the Wine one over the NT platform, and
-    # its sessions connect the server to the NT platform.
-    "adv-runtime": {"adv-win32", "adv-dx", "adv-drv", "adv-wineserver"},
+    # The assembly wires the Wine userland over the NT platform, and its
+    # sessions connect the server to the NT platform.
+    "adv-runtime": {"adv-dx", "adv-drv", "adv-wineserver"},
     "adv-shell": {"adv-runtime", "adv-device", "adv-sync", "adv-report"},
     "adv-run": {"adv-shell"},
     "adv-jit-helper": set(),
@@ -55,6 +54,8 @@ ALIASES: dict[str, str] = {}
 TEST_ONLY = {"adv-unicorn", "adv-samples"}
 TRANSITIONAL: dict[tuple[str, str], str] = {
     ("adv-dx", "adv-os"): "non-graphics fronts still use old-stack services",
+    ("adv-runtime", "adv-os"): "the assembly installs those services for the fronts",
+    ("adv-shell", "adv-os"): "the side-key helper not yet moved to the Wine stack",
 }
 
 

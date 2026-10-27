@@ -801,7 +801,21 @@ fn unused_constant_uploads_retain_the_used_register_capture() {
     let address = before.ranges(usage).next().unwrap().1.as_ptr();
     let key = constants.key(usage);
     let data = bytemuck::bytes_of(&[0x8000_0000u32, 0x7fc0_1234, 7, 9]);
-    assert_eq!(set_constants_direct(&mut env, device, 94, 255, data, 1), 0);
+    let input = alloc(&mut env, 16).unwrap();
+    env.cpu.write(input, data).unwrap();
+    let upload = |env: &mut Env<'_>, start| {
+        let (stage, kind) = (Stage::Vertex, ConstantKind::Float);
+        constants_set(
+            env,
+            GuestPtr::new(device),
+            start,
+            GuestPtr::new(input),
+            1,
+            stage,
+            kind,
+        )
+    };
+    assert_eq!(upload(&mut env, 255), 0);
     let constants = &super::device(&env, device)
         .unwrap()
         .shaders
@@ -813,7 +827,7 @@ fn unused_constant_uploads_retain_the_used_register_capture() {
         constants.floats[255].map(f32::to_bits),
         [0x8000_0000, 0x7fc0_1234, 7, 9]
     );
-    assert_eq!(set_constants_direct(&mut env, device, 94, 0, data, 1), 0);
+    assert_eq!(upload(&mut env, 0), 0);
     let constants = &super::device(&env, device)
         .unwrap()
         .shaders

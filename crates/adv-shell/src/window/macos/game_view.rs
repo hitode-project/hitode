@@ -672,7 +672,6 @@ impl Input {
             buttons
         };
         let position = u32::from(gx as u16) | (u32::from(gy as u16) << 16);
-        let (message, wparam) = adv_runtime::mouse_mapping(message, wparam, false);
         self.hub.push(Event::Input {
             message,
             wparam,

@@ -48,6 +48,15 @@ mod state_tests {
             thunk: 0,
         }
     }
+    /// SetVertexShaderConstantF of one register from guest memory.
+    fn vertex_constant(env: &mut Env<'_>, pointer: u32, start: u32, data: &[u8]) -> u32 {
+        env.cpu.write(DATA + 0x1000, data).unwrap();
+        call(
+            env,
+            super::super::shaders::set_vertex_f_ABI,
+            &[pointer, start, DATA + 0x1000, 1],
+        )
+    }
     fn call(env: &mut Env<'_>, api: Api, args: &[u32]) -> u32 {
         env.cpu.write_u32(STACK, 0x12340000).unwrap();
         for (index, word) in args.iter().enumerate() {
@@ -82,7 +91,7 @@ mod state_tests {
     // spec: GFX-SHADER-4, GFX-REC-7
     #[test]
     fn identical_writes_keep_versions_and_recorded_membership_preserves_float_bits() {
-        use super::super::shaders::{self, stateblocks};
+        use super::super::shaders::stateblocks;
         let mut machine = machine();
         let mut env = env(&mut machine);
         let (pointer, _, _, _) = super::super::super::tests::setup(&mut env);
@@ -96,30 +105,24 @@ mod state_tests {
                 call(&mut env, set_sampler_ABI, &[pointer, 0, 5, sampler]),
                 0
             );
-            assert_eq!(
-                shaders::set_constants_direct(&mut env, pointer, 94, 3, &[0; 16], 1),
-                0
-            );
+            assert_eq!(vertex_constant(&mut env, pointer, 3, &[0; 16]), 0);
         }
         assert_eq!(device(&env, pointer).unwrap().versions, initial);
         assert_eq!(stateblocks::begin(&mut env, this), 0);
         assert_eq!(call(&mut env, set_render_ABI, &[pointer, 22, 3]), 0);
-        assert_eq!(
-            shaders::set_constants_direct(&mut env, pointer, 94, 3, &[0; 16], 1),
-            0
-        );
+        assert_eq!(vertex_constant(&mut env, pointer, 3, &[0; 16]), 0);
         assert_eq!(stateblocks::end(&mut env, this, GuestPtr::new(DATA)), 0);
         let block = GuestPtr::new(env.cpu.read_u32(DATA).unwrap());
         assert_eq!(device(&env, pointer).unwrap().versions, initial);
         let bits = [0x8000_0000u32, 0x7fc0_1234, 0, 0];
         assert_eq!(
-            shaders::set_constants_direct(&mut env, pointer, 94, 3, bytemuck::cast_slice(&bits), 1),
+            vertex_constant(&mut env, pointer, 3, bytemuck::cast_slice(&bits)),
             0
         );
         let changed = device(&env, pointer).unwrap().versions;
         assert_eq!(changed[13], initial[13] + 1);
         assert_eq!(
-            shaders::set_constants_direct(&mut env, pointer, 94, 3, bytemuck::cast_slice(&bits), 1),
+            vertex_constant(&mut env, pointer, 3, bytemuck::cast_slice(&bits)),
             0
         );
         assert_eq!(device(&env, pointer).unwrap().versions, changed);
@@ -155,10 +158,7 @@ mod state_tests {
         );
         let block = env.cpu.read_u32(DATA).unwrap();
         let key = device(&env, pointer).unwrap().fixed.key();
-        assert_eq!(
-            super::super::shaders::set_constants_direct(&mut env, pointer, 94, 0, &[0x3f; 16], 1),
-            0
-        );
+        assert_eq!(vertex_constant(&mut env, pointer, 0, &[0x3f; 16]), 0);
         assert_eq!(
             super::super::shaders::stateblocks::apply(&mut env, GuestPtr::new(block)),
             0

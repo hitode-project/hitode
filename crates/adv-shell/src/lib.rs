@@ -8,7 +8,7 @@ mod frame_pacer;
 mod frontend;
 #[cfg(host_view)]
 pub use execution::Execution;
-#[cfg(any(host_view, windows))]
+#[cfg(host_view)]
 mod logging;
 pub mod mobile;
 #[cfg(target_os = "ios")]
@@ -18,11 +18,11 @@ pub use adv_runtime::{
 };
 #[cfg(mobile)]
 pub use logging::init_system_log;
-#[cfg(any(host_view, all(windows, feature = "gpu")))]
+#[cfg(host_view)]
 mod native_gpu;
-#[cfg(any(host_view, all(windows, feature = "gpu")))]
+#[cfg(host_view)]
 mod upscaling;
-#[cfg(any(host_view, all(windows, feature = "gpu")))]
+#[cfg(host_view)]
 pub use upscaling::Upscaler;
 mod scaling;
 pub use scaling::Scaling;
@@ -30,9 +30,8 @@ pub mod overlay;
 mod performance;
 #[cfg(host_view)]
 mod session;
-#[cfg(any(host_view, all(windows, feature = "gpu"), all(test, feature = "gpu")))]
+#[cfg(any(host_view, all(test, feature = "gpu")))]
 mod software_frame;
-mod survey;
 pub mod window;
 #[cfg(host_view)]
 mod wine;
@@ -46,10 +45,9 @@ pub struct Finished {
     pub summary: adv_report::RunSummary,
 }
 
-use adv_machine::{RunResult, SliceResult};
-use adv_runtime::{CompileStrategy, Engine, EngineOptions, Snapshot, boot::Runtime};
+use adv_runtime::{CompileStrategy, Engine, EngineOptions, Snapshot};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// The ANSI code page `--codepage auto` would pick for this executable.
 pub fn detect_codepage(exe: &Path) -> std::io::Result<u32> {
@@ -59,8 +57,6 @@ pub fn detect_codepage(exe: &Path) -> std::io::Result<u32> {
         &bytes,
     ))
 }
-
-const SOFT_SLICE: Duration = Duration::from_millis(8);
 
 pub struct Options {
     pub font_families: std::collections::BTreeMap<String, String>,
@@ -74,7 +70,7 @@ pub struct Options {
     pub cdroms: Vec<(char, PathBuf)>,
     pub install_dir: Option<PathBuf>,
     jit: bool,
-    /// The Wine installation to run on, in place of the built-in stack.
+    /// The Wine installation to run on.
     wine: Option<PathBuf>,
     /// The player's Wine prefix, which every game shares; next to the data
     /// directory when none.
@@ -102,20 +98,14 @@ pub struct Options {
     trace: Option<PathBuf>,
     host_profile: Option<PathBuf>,
     schedule_profile: Option<PathBuf>,
-    survey: Option<PathBuf>,
     auto_dialog_ms: Option<u32>,
-    self_test_input: bool,
     profile: bool,
     control_stdin: bool,
     /// Serve `tools/debug/hitode_debug.py`; also `ADV_DEBUG=1`.
     pub debug: bool,
     frame_budget: bool,
     pub audio: bool,
-    codec: adv_runtime::vorbis::Policy,
-    codec_kernels: adv_runtime::codec_kernels::Mode,
-    codec_kernels_explicit: bool,
-    codec_signatures: Option<PathBuf>,
-    api_mode: adv_runtime::RunMode,
+    codec_kernels: adv_runtime::wine::codec::Mode,
     time_skip: bool,
 }
 
@@ -264,7 +254,6 @@ const HELP: &str = "adv-run <EXE> [options]\n\
   --backend jit|interpreter   shared guest backend (default: jit)\n\
   --row-workers N         additional row helpers, 0 runs batches inline (default: up to 3)\n\
   --no-row-batching       disable proven row batches for comparison\n\
-  --api-mode strict|discovery   stop at the first API gap, or keep playing past gaps (default: discovery)\n\
   --no-time-skip           disable timed-wait acceleration while Ctrl is held\n\
   --compile fast|speed    automatic JIT region policy (default: fast)\n\
   --no-tiering            keep automatic regions at the selected compile strategy\n\
@@ -272,14 +261,12 @@ const HELP: &str = "adv-run <EXE> [options]\n\
   --sync-compilation      compile automatic regions on the execution thread\n\
   --codepage auto|932|936 guest ANSI encoding: Japanese or GBK (default: auto)\n\
   --headless              run without a host window\n\
-  --codec guest|native    whole-module Vorbis provider (default: native)\n\
   --codec-kernels guest|verify|native  codec library acceleration (default: native; Vorbis permits FP rounding differences)\n\
-  --codec-signatures PATH reviewed library signatures (default: the bundled set)\n\
   --audio                 enable PCM audio (headless simulates without a device)\n\
   --hidden                create a hidden host window for frontend tests\n\
   --gpu-software          select a software GPU adapter for diagnostics\n\
   --headless-gpu         opt in to a GPU frontend without a window\n\
-  --wine DIST             run on the Wine userland installed in DIST (macOS)\n\
+  --wine DIST             the Wine userland installed in DIST (required)\n\
   --wine-prefix PATH      the Wine prefix games share (default: beside the data dir)\n\
   --d3d9-sm3             opt in to the SM3 capability milestone (default: off)\n\
   --d3d9-shader-cache PATH opt in to a bounded local WGSL disk cache\n\
@@ -295,9 +282,7 @@ const HELP: &str = "adv-run <EXE> [options]\n\
   --trace PATH            write every completed guest API call to a local trace\n\
   --host-profile PATH     opt-in API service time CSV (also supports N=2)\n\
   --schedule-profile PATH opt-in scheduling and lock boundary TSV\n\
-  --survey PATH           write the static API gaps of every module in the game folder\n\
   --auto-dialog-ms N      explicitly auto-select dialog defaults after N guest ms\n\
-  --self-test-input       post A key and left-click after the first idle\n\
   --profile               collect execution timings; with --report writes .cpu.tsv (disables region links)\n\
   --frame-budget          opt-in bounded per-frame accounting (headless, one worker)\n\
   --control-stdin         explicitly enable line-based diagnostic commands\n\
@@ -343,19 +328,13 @@ impl Options {
             trace: None,
             host_profile: None,
             schedule_profile: None,
-            survey: None,
             auto_dialog_ms: None,
-            self_test_input: false,
             profile: false,
             control_stdin: false,
             debug: false,
             frame_budget: false,
             audio: false,
-            codec: adv_runtime::vorbis::Policy::Native,
-            codec_kernels: adv_runtime::codec_kernels::Mode::Native,
-            codec_kernels_explicit: false,
-            codec_signatures: None,
-            api_mode: adv_runtime::RunMode::Discovery,
+            codec_kernels: adv_runtime::wine::codec::Mode::Native,
             time_skip: true,
         }
     }
@@ -394,18 +373,10 @@ impl Options {
                     }
                     options.cdroms.push((letter, PathBuf::from(path)));
                 }
-                #[cfg(target_os = "macos")]
                 "--wine" => options.wine = Some(PathBuf::from(value()?)),
                 "--wine-prefix" => options.wine_prefix = Some(PathBuf::from(value()?)),
                 "--install-dir" => options.install_dir = Some(PathBuf::from(value()?)),
                 "--no-time-skip" => options.time_skip = false,
-                "--api-mode" => {
-                    options.api_mode = match value()?.as_str() {
-                        "strict" => adv_runtime::RunMode::Strict,
-                        "discovery" => adv_runtime::RunMode::Discovery,
-                        _ => return Err("--api-mode must be strict or discovery".into()),
-                    };
-                }
                 "--backend" => {
                     options.jit = match value()?.as_str() {
                         "jit" => true,
@@ -446,30 +417,20 @@ impl Options {
                 "--headless-gpu" => options.headless_gpu = true,
                 "--d3d9-sm3" => options.d3d9_sm3 = true,
                 "--d3d9-shader-cache" => options.d3d9_shader_cache = Some(value()?.into()),
-                "--self-test-input" => options.self_test_input = true,
                 "--profile" => options.profile = true,
                 "--control-stdin" => options.control_stdin = true,
                 "--debug" => options.debug = true,
                 "--frame-budget" => options.frame_budget = true,
                 "--audio" => options.audio = true,
-                "--codec" => {
-                    options.codec = match value()?.as_str() {
-                        "guest" => adv_runtime::vorbis::Policy::Guest,
-                        "native" => adv_runtime::vorbis::Policy::Native,
-                        _ => return Err("--codec must be guest or native".into()),
-                    }
-                }
                 "--width" => options.width = value()?.parse().map_err(|_| "invalid width")?,
                 "--codec-kernels" => {
                     options.codec_kernels = match value()?.as_str() {
-                        "guest" => adv_runtime::codec_kernels::Mode::Guest,
-                        "verify" => adv_runtime::codec_kernels::Mode::Verify,
-                        "native" => adv_runtime::codec_kernels::Mode::Native,
+                        "guest" => adv_runtime::wine::codec::Mode::Guest,
+                        "verify" => adv_runtime::wine::codec::Mode::Verify,
+                        "native" => adv_runtime::wine::codec::Mode::Native,
                         _ => return Err("--codec-kernels must be guest, verify or native".into()),
                     };
-                    options.codec_kernels_explicit = true;
                 }
-                "--codec-signatures" => options.codec_signatures = Some(value()?.into()),
                 "--height" => options.height = value()?.parse().map_err(|_| "invalid height")?,
                 "--frames" => {
                     options.frames = Some(value()?.parse().map_err(|_| "invalid frame limit")?)
@@ -482,7 +443,6 @@ impl Options {
                 "--trace" => options.trace = Some(value()?.into()),
                 "--host-profile" => options.host_profile = Some(value()?.into()),
                 "--schedule-profile" => options.schedule_profile = Some(value()?.into()),
-                "--survey" => options.survey = Some(value()?.into()),
                 "--auto-dialog-ms" => {
                     options.auto_dialog_ms =
                         Some(value()?.parse().map_err(|_| "invalid dialog delay")?)
@@ -621,556 +581,6 @@ fn checksum(bytes: &[u8]) -> u64 {
     })
 }
 
-fn dynamic_lookup_json(failure: &adv_runtime::DynamicLookupFailure) -> String {
-    format!(
-        concat!(
-            "{{\"sequence\": {}, \"module\": {}, \"name\": {}, ",
-            "\"failure_module\": {}, \"failure_name\": {}, ",
-            "\"caller\": {}, \"context\": {}, \"kind\": {}, \"reason\": {}}}"
-        ),
-        failure.sequence,
-        json(&failure.module),
-        json(&failure.name),
-        failure
-            .failure_module
-            .as_deref()
-            .map_or_else(|| "null".into(), json),
-        failure
-            .failure_name
-            .as_deref()
-            .map_or_else(|| "null".into(), json),
-        failure.caller,
-        failure.context,
-        json(failure.kind.as_str()),
-        json(&failure.reason),
-    )
-}
-
-fn message_box_json(message: &adv_runtime::MessageBoxCall) -> String {
-    format!(
-        concat!(
-            "{{\"sequence\": {}, \"frame\": {}, \"api\": {}, \"caller\": {}, \"context\": {}, ",
-            "\"caption\": {}, \"text\": {}, \"style\": {}, \"result\": {}, ",
-            "\"preceding_lookup_failure\": {}}}"
-        ),
-        message.sequence,
-        message.frame,
-        json(&message.api),
-        message.caller,
-        message.context,
-        json(&message.caption),
-        json(&message.text),
-        message.style,
-        message.result,
-        message
-            .preceding_lookup_failure
-            .as_ref()
-            .map_or_else(|| "null".into(), dynamic_lookup_json),
-    )
-}
-
-fn cpu_fault_json(fault: Option<&adv_machine::exception::CpuFaultSnapshot>) -> String {
-    let Some(fault) = fault else {
-        return "null".into();
-    };
-    let access = fault.access();
-    let branch = fault.last_indirect_branch.map_or_else(
-        || "null".into(),
-        |branch| {
-            format!(
-                "{{\"source\": {}, \"target\": {}, \"kind\": {}}}",
-                branch.source,
-                branch.target,
-                json(&format!("{:?}", branch.kind))
-            )
-        },
-    );
-    let registers = fault
-        .registers
-        .iter()
-        .map(|(register, value)| format!("{}: {value}", json(&format!("{register:?}"))))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let stack = fault
-        .stack
-        .iter()
-        .map(u32::to_string)
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!(
-        concat!(
-            "{{\"context\": {}, \"pc\": {}, \"kind\": {}, \"access\": {}, \"address\": {}, \"reason\": {}, ",
-            "\"last_indirect_branch\": {}, \"registers\": {{{}}}, \"stack_address\": {}, \"stack\": [{}]}}"
-        ),
-        fault.context,
-        fault.fault.pc,
-        json(fault.kind_name()),
-        access.map_or_else(|| "null".into(), |(access, _)| json(access)),
-        access.map_or_else(|| "null".into(), |(_, address)| address.to_string()),
-        fault.reason().map_or_else(|| "null".into(), json),
-        branch,
-        registers,
-        fault.stack_address,
-        stack,
-    )
-}
-
-/// The report's personality gaps (PERS-EXPORT-8): rejected
-/// discovery probes and reviewed exports answered with their failure.
-fn personality_json(diagnostics: Option<&adv_runtime::ApiDiagnostics>) -> String {
-    let Some(d) = diagnostics else {
-        return "{\"rejected_probes\": [], \"dropped_rejected_probes\": 0, \"reviewed_calls\": {}}"
-            .into();
-    };
-    let probes = d
-        .rejected_probes
-        .iter()
-        .map(|(api, probe)| {
-            format!(
-                "{{\"api\": {}, \"class\": {}, \"count\": {}, \"first_caller\": {}}}",
-                json(api),
-                probe
-                    .class
-                    .map_or_else(|| "null".into(), |class| json(class.as_str())),
-                probe.count,
-                probe.first_caller
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    let reviewed = d
-        .reviewed_calls
-        .iter()
-        .map(|(api, count)| format!("{}: {count}", json(api)))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!(
-        "{{\"rejected_probes\": [{probes}], \"dropped_rejected_probes\": {}, \"reviewed_calls\": {{{reviewed}}}}}",
-        d.dropped_rejected_probes
-    )
-}
-
-fn api_report(runtime: &Runtime) -> String {
-    let mode = match runtime.api_mode() {
-        adv_runtime::RunMode::Strict => "strict",
-        adv_runtime::RunMode::Discovery => "discovery",
-    };
-    let diagnostics = runtime.api_diagnostics();
-    let gaps = diagnostics.map_or_else(String::new, |d| {
-        d.gaps
-            .iter()
-            .map(|(name, count)| format!("{}: {count}", json(name)))
-            .collect::<Vec<_>>()
-            .join(", ")
-    });
-    let imports = report_api_gaps(runtime)
-        .map(|gaps| {
-            gaps.imported
-                .iter()
-                .map(|name| json(name))
-                .collect::<Vec<_>>()
-                .join(", ")
-        })
-        .unwrap_or_default();
-    let recent = diagnostics.map_or_else(String::new, |d| d.recent_stubs.iter().map(|call| {
-        let args = call.arguments.iter().map(|arg| json(arg)).collect::<Vec<_>>().join(", ");
-        format!("{{\"module\": {}, \"name\": {}, \"caller\": {}, \"context\": {}, \"arguments\": [{args}]}}",
-            json(&call.module), json(&call.name), call.caller, call.context)
-    }).collect::<Vec<_>>().join(", "));
-    let conflicts = runtime
-        .api_signature_conflicts()
-        .iter()
-        .map(|conflict| {
-            format!(
-                "{{\"api\": {}, \"registered\": {}, \"metadata\": {}}}",
-                json(&format!("{}!{}", conflict.module, conflict.name)),
-                json(&format!("{:?}", conflict.registered)),
-                json(&format!("{:?}", conflict.metadata))
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    let branch = runtime.last_indirect_branch().map_or_else(
-        || "null".into(),
-        |branch| {
-            format!(
-                "{{\"source\": {}, \"target\": {}, \"kind\": {}}}",
-                branch.source,
-                branch.target,
-                json(&format!("{:?}", branch.kind))
-            )
-        },
-    );
-    let coverage = runtime.api_coverage();
-    let warnings = diagnostics.map_or_else(String::new, |d| {
-        d.warnings
-            .iter()
-            .map(|((api, reason), count)| {
-                format!(
-                    "{{\"api\": {}, \"reason\": {}, \"count\": {count}}}",
-                    json(api),
-                    json(reason)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(", ")
-    });
-    let lookups = diagnostics.map_or_else(String::new, |d| {
-        d.dynamic_lookup_failures
-            .iter()
-            .map(dynamic_lookup_json)
-            .collect::<Vec<_>>()
-            .join(", ")
-    });
-    let messages = diagnostics.map_or_else(String::new, |d| {
-        d.message_boxes
-            .iter()
-            .map(message_box_json)
-            .collect::<Vec<_>>()
-            .join(", ")
-    });
-    let processes = runtime.process_statuses().iter().map(|process| {
-        let (mismatches, reasons) = runtime.process_structural_diagnostics(process.pid);
-        let warnings = reasons.iter().map(|(api, reason, count)| format!("{{\"api\": {}, \"reason\": {}, \"count\": {count}}}", json(api), json(reason))).collect::<Vec<_>>().join(", ");
-        format!(
-        "{{\"pid\": {}, \"parent\": {}, \"image\": {}, \"exit_code\": {}, \"failure\": {}, \"first_cpu_fault\": {}, \"latest_cpu_fault\": {}, \"structural_mismatches\": {}, \"structural_warnings\": [{}]}}",
-        process.pid, process.parent.map_or_else(|| "null".into(), |v| v.to_string()), json(&process.image),
-        process.exit_code.map_or_else(|| "null".into(), |v| v.to_string()),
-        process.failure.as_deref().map_or_else(|| "null".into(), json),
-        cpu_fault_json(process.first_cpu_fault.as_ref()),
-        cpu_fault_json(process.latest_cpu_fault.as_ref()), mismatches, warnings
-    )}).collect::<Vec<_>>().join(", ");
-    format!(
-        concat!(
-            "{{\"mode\": {}, \"acceptance_eligible\": {}, \"stub_calls\": {}, \"structural_mismatches\": {}, ",
-            "\"called_gaps\": {{{}}}, \"unimplemented_imports\": [{}], ",
-            "\"recent_stubs\": [{}], \"signature_conflicts\": [{}], ",
-            "\"last_indirect_branch\": {}, \"coverage\": {{\"generated_exports\": {}, \"implement\": {}, \"state\": {}, \"safe_fail\": {}, \"legacy\": {}}}, ",
-            "\"warnings\": [{}], \"unrecorded_warnings\": {}, ",
-            "\"discovery_diagnostics_version\": 1, ",
-            "\"dynamic_lookup_failures\": [{}], \"dynamic_lookup_failure_count\": {}, ",
-            "\"dropped_dynamic_lookup_failures\": {}, \"message_boxes\": [{}], ",
-            "\"message_box_count\": {}, \"dropped_message_boxes\": {}, ",
-            "\"truncated_diagnostic_fields\": {}, \"processes\": [{}], \"personality\": {}}}"
-        ),
-        json(mode),
-        runtime.api_acceptance_eligible(),
-        diagnostics.map_or(0, |d| d.stub_calls),
-        diagnostics.map_or(0, |d| d.structural_mismatches),
-        gaps,
-        imports,
-        recent,
-        conflicts,
-        branch,
-        coverage.generated_exports,
-        coverage.implement,
-        coverage.state,
-        coverage.safe_fail,
-        coverage.legacy,
-        warnings,
-        diagnostics.map_or(0, |d| d.unrecorded_warnings),
-        lookups,
-        diagnostics.map_or(0, |d| d.dynamic_lookup_failure_count),
-        diagnostics.map_or(0, |d| d.dropped_dynamic_lookup_failures),
-        messages,
-        diagnostics.map_or(0, |d| d.message_box_count),
-        diagnostics.map_or(0, |d| d.dropped_message_boxes),
-        diagnostics.map_or(0, |d| d.truncated_diagnostic_fields),
-        processes,
-        personality_json(diagnostics),
-    )
-}
-
-struct ReportContext<'a> {
-    options: &'a Options,
-    runtime: &'a Runtime,
-    started: Instant,
-    first_frame_seconds: Option<f64>,
-    stop_reason: &'a str,
-    exit_code: Option<u32>,
-    idle_waits: u64,
-    wait_time: Duration,
-    inputs: u64,
-    failure: Option<&'a str>,
-    screenshot_error: Option<&'a str>,
-    performance: &'a performance::Performance,
-    audio: &'a audio::AudioOutput,
-    scene_gate: &'a control::SceneGate,
-}
-
-fn build_report(context: ReportContext<'_>) -> String {
-    let ReportContext {
-        options,
-        runtime,
-        started,
-        first_frame_seconds,
-        stop_reason,
-        exit_code,
-        idle_waits,
-        wait_time,
-        inputs,
-        failure,
-        screenshot_error,
-        performance,
-        audio,
-        scene_gate,
-    } = context;
-    let frame = runtime.frame();
-    let graphics = runtime.machine.ext.get::<adv_runtime::Graphics>();
-    let arena = graphics.arena_usage();
-    let g = &graphics.stats;
-    let graphics_memory = format!(
-        "{{\"capacity_bytes\": {}, \"free_bytes\": {}, \"largest_free_bytes\": {}, \"pixel_bytes\": {}, \"live_surfaces\": {}, \"software_publications\": {}, \"damaged_pixels\": {}, \"frame_pixels\": {}}}",
-        arena.capacity,
-        arena.free,
-        arena.largest_free,
-        arena.pixel_bytes,
-        arena.live_surfaces,
-        g.presentations,
-        g.damaged_pixels,
-        g.frame_pixels
-    );
-    #[cfg(any(host_view, feature = "gpu"))]
-    let gpu_diagnostics = {
-        let diagnostics = runtime.gpu_diagnostics();
-        let versions = |counts: [u64; 7]| {
-            ["1.1", "1.2", "1.3", "1.4", "2.0", "2.1", "3.0"]
-                .iter()
-                .zip(counts)
-                .map(|(version, count)| format!("\"{version}\":{count}"))
-                .collect::<Vec<_>>()
-                .join(",")
-        };
-        let shader_versions = format!(
-            "{{\"vertex\":{{{}}},\"pixel\":{{{}}},\"malformed\":{},\"untranslated\":{}}}",
-            versions(diagnostics.shaders.vertex),
-            versions(diagnostics.shaders.pixel),
-            diagnostics.shaders.malformed,
-            diagnostics.shaders.untranslated
-        );
-        let commands=diagnostics.gpu.map_or_else(||"null".into(),|g|format!("{{\"submissions\":{},\"draws\":{},\"vertices\":{},\"readbacks\":{},\"native_frames\":{},\"image_copy_bytes\":{},\"snapshot_allocations\":{},\"vertex_upload_allocations\":{},\"buffer_writes\":{},\"last_flush_buffer_writes\":{},\"bind_group_creations\":{},\"pipeline_cache_hits\":{},\"metal_draws\":{},\"backend_switches\":{},\"backend_switches_by_reason\":{{\"partial_clear\":{},\"copy\":{},\"upload\":{},\"fixed_draw\":{},\"readback\":{},\"other\":{}}},\"ring_bytes\":{},\"ring_busy\":{},\"passes\":{},\"color_loads\":{},\"depth_loads\":{},\"merged_clears\":{},\"compile_waits\":{},\"compile_wait_ns\":{},\"prebuild_hits\":{},\"prebuild_misses\":{},\"persisted_pipelines\":{},\"discarded_pipelines\":{}}}",g.submissions,g.draws,g.vertices,g.readbacks,g.native_frames,g.image_copy_bytes,g.native_frame_allocations,g.vertex_buffer_allocations,g.buffer_writes,g.last_flush_buffer_writes,g.bind_group_creations,g.pipeline_cache_hits,g.metal_draws,g.backend_switches,g.backend_switches_by_reason[0],g.backend_switches_by_reason[1],g.backend_switches_by_reason[2],g.backend_switches_by_reason[3],g.backend_switches_by_reason[4],g.backend_switches_by_reason[5],g.ring_bytes,g.ring_busy,g.passes,g.color_loads,g.depth_loads,g.merged_clears,g.compile_waits,g.compile_wait_ns,g.prebuild_hits,g.prebuild_misses,g.persisted_pipelines,g.discarded_pipelines));
-        let f = &diagnostics.frames;
-        let frames = format!(
-            "{{\"recorded_commands\":{},\"eliminated_frames\":{},\"full_executions\":{},\"clipped_executions\":{},\"clipped_area_sum\":{:.4}}}",
-            f.recorded_commands,
-            f.eliminated_frames,
-            f.full_executions,
-            f.clipped_executions,
-            f.clipped_area_sum
-        );
-        format!(
-            "{{\"live_interfaces\":{},\"pending_waits\":{},\"pending_readbacks\":{},\"commands\":{},\"frames\":{},\"shader_versions\":{}}}",
-            diagnostics.live_interfaces,
-            diagnostics.pending_waits,
-            diagnostics.pending_readbacks,
-            commands,
-            frames,
-            shader_versions
-        )
-    };
-    #[cfg(not(any(host_view, feature = "gpu")))]
-    let gpu_diagnostics = "null";
-    let mut codec = adv_runtime::vorbis::stats(&runtime.machine).map_or_else(
-        || "{\"provider\": \"guest\"}".into(),
-        |s| format!(concat!("{{\"provider\": \"native\", \"opens\": {}, \"failed_opens\": {}, ",
-            "\"clears\": {}, \"active_streams\": {}, \"decoded_packets\": {}, \"decoded_frames\": {}, ",
-            "\"guest_callbacks\": {}, \"read_callbacks\": {}, \"seek_callbacks\": {}, \"tell_callbacks\": {}, ",
-            "\"close_callbacks\": {}, \"callback_bytes\": {}, \"metadata_scans\": {}}}"),
-            s.opens, s.failed_opens, s.clears, s.active_streams, s.decoded_packets, s.decoded_frames,
-            s.guest_callbacks, s.read_callbacks, s.seek_callbacks, s.tell_callbacks, s.close_callbacks, s.callback_bytes, s.metadata_scans),
-    );
-    if let Some(selection) = runtime
-        .machine
-        .ext
-        .try_get::<adv_runtime::vorbis::Selection>()
-    {
-        codec.pop();
-        codec.push_str(&format!(
-            ", \"selection_reason\": {}}}",
-            selection
-                .reason
-                .as_deref()
-                .map_or_else(|| "null".into(), json)
-        ));
-    }
-    let codec_kernels = adv_runtime::codec_kernels::stats(&runtime.machine).map_or_else(
-        || "{\"mode\":\"guest\",\"installed\":0}".into(),
-        |s| {
-            let reasons = s.fallback_reasons.iter()
-                .map(|(reason, count)| format!("{}:{count}", json(reason)))
-                .collect::<Vec<_>>().join(",");
-            format!(concat!(
-                "{{\"mode\":{},\"installed\":{},\"calls\":{},\"native_calls\":{},\"verify_calls\":{},",
-                "\"fallback_calls\":{},\"revocations\":{},\"errors\":{},\"compared_floats\":{},",
-                "\"different_floats\":{},\"nonfinite_floats\":{},\"max_abs\":{},\"rms\":{},",
-                "\"relative_rms\":{},\"total_kernel_ns\":{},\"max_kernel_ns\":{},",
-                "\"last_rejection\":{},\"table_mismatch\":{},\"fallback_reasons\":{{{}}},",
-                "\"theora\":{{\"installed\":{},\"initialized\":{},\"frames\":{},\"native_frames\":{},",
-                "\"compared_bytes\":{},\"different_bytes\":{},\"state_mismatches\":{},\"decode_ns\":{},\"reason\":{}}}}}"
-            ), json(s.mode.as_str()), s.installed, s.calls, s.native_calls, s.verify_calls,
-                s.fallback_calls, s.revocations, s.errors, s.compared_floats, s.different_floats,
-                s.nonfinite_floats, s.max_abs, s.rms, s.relative_rms, s.total_kernel_ns, s.max_kernel_ns,
-                s.last_rejection.as_deref().map_or_else(|| "null".into(), json),
-                s.table_mismatch.as_deref().map_or_else(|| "null".into(), json), reasons,
-                s.theora.installed,s.theora.initialized,s.theora.frames,s.theora.native_frames,
-                s.theora.compared_bytes,s.theora.different_bytes,s.theora.state_mismatches,s.theora.decode_ns,
-                s.theora.reason.as_deref().map_or_else(||"null".into(),json))
-        },
-    );
-    let pcm = runtime.audio_pcm_metrics();
-    let sources = runtime.audio_source_status();
-    let pcm_metrics = format!(
-        concat!(
-            "{{\"queued_blocks\": {}, \"queued_source_frames\": {}, \"playback_starts\": {}, ",
-            "\"flushes\": {}, \"ends\": {}, \"removals\": {}, \"max_stream_queue_us\": {}, ",
-            "\"missing_stream_frames\": {}, \"missing_output_frames\": {}, ",
-            "\"low_lead_events\": {}, \"min_lead_ratio_permille\": {}, ",
-            "\"buffers\": {}, \"playing\": {}, \"looping\": {}, \"locked\": {}}}"
-        ),
-        pcm.queued_blocks,
-        pcm.queued_source_frames,
-        pcm.playback_starts,
-        pcm.flushes,
-        pcm.ends,
-        pcm.removals,
-        pcm.max_stream_queue_us,
-        pcm.missing_stream_frames,
-        pcm.missing_output_frames,
-        pcm.low_lead_events,
-        pcm.min_lead_ratio_permille,
-        sources.buffers,
-        sources.playing,
-        sources.looping,
-        sources.locked,
-    );
-    let missing = runtime.missing_apis();
-    let modules = adv_os::modules(&runtime.machine.ext).iter().map(|(_, module)| format!(
-        "{{\"name\": {}, \"kind\": {}, \"base\": \"{:#010x}\", \"size\": {}, \"exports\": {}}}",
-        json(&module.name), json(&format!("{:?}", module.kind)), module.base, module.size, module.exports_by_name.len()
-    )).collect::<Vec<_>>().join(", ");
-    let context_runs = runtime.machine.sys.scheduling.contexts.iter().enumerate()
-        .map(|(id, r)| format!("{{\"id\":{id},\"runs\":{},\"owner_wall_ns\":{},\"host_calls\":{},\"competing_wall_ns\":{}}}",
-            r.runs, r.owner_wall_ns, r.host_calls, r.competing_wall_ns))
-        .collect::<Vec<_>>().join(",");
-    // Snapshot the existing cumulative service counters, without the per-frame
-    // top-five truncation. Checkpoint differences delimit a fixed scene.
-    let host_services = if options.frame_budget || options.host_profile.is_some() {
-        let mut csv = Vec::new();
-        runtime
-            .machine
-            .sys
-            .stats
-            .write_host_csv(&runtime.machine.cpu, &runtime.machine.sys.thunks, &mut csv)
-            .unwrap();
-        json(std::str::from_utf8(&csv).unwrap())
-    } else {
-        "null".into()
-    };
-    format!(
-        concat!(
-            "{{\n  \"exe\": {},\n  \"backend\": {},\n  \"compile_strategy\": {},\n  \"region_linking\": {},\n  \"codepage\": {},\n  \"stop_reason\": {},\n",
-            "  \"guest_exit_code\": {},\n  \"elapsed_seconds\": {:.6},\n  \"first_frame_seconds\": {},\n  \"frames\": {},\n",
-            "  \"width\": {},\n  \"height\": {},\n  \"frame_fnv1a64\": \"{:016x}\",\n",
-            "  \"idle_waits\": {},\n  \"idle_wait_seconds\": {:.6},\n  \"polling_rounds\": {},\n  \"frame_spin_waits\": {},\n  \"input_messages\": {},\n",
-            "  \"context_runs\": [{}],\n  \"tiered_compilation\": {},\n",
-            "  \"host_calls\": {},\n  \"async_compilation\": {},\n  {},\n",
-            "  \"tier0_instructions\": {},\n  \"tier0_instructions_per_second\": {},\n",
-            "  \"guest_contexts\": {},\n  \"tls_images\": {},\n  \"loaded_modules\": [{}],\n",
-            "  \"api\": {},\n  \"first_cpu_fault\": {},\n  \"latest_cpu_fault\": {},\n  \"startup\": {{\"loaded\": true, \"guest_windows\": {}}},\n",
-            "  \"time_skip\": {{\"enabled\": {}, \"jumps\": {}, \"skipped_guest_us\": {}}},\n",
-            "  \"wait_diagnostics\": {},\n",
-            "  \"passive_stalls\": {{\"clamps\": {}, \"discarded_guest_us\": {}, \"max_step_us\": {}}},\n",
-            "  \"missing_apis\": [{}],\n  \"failure\": {},\n  \"screenshot_error\": {},\n  \"performance\": {},\n  \"audio\": {},\n  \"pcm\": {},\n  \"codec\": {},\n  \"codec_kernels\": {},\n  \"gpu\": {},\n  \"graphics_memory\": {},\n  \"scene_gate\": {},\n  \"runtime\": {},\n  \"frame_budget\": {},\n  \"host_services_csv\": {}\n}}\n"
-        ),
-        json(&options.exe.to_string_lossy()),
-        json(if options.jit { "jit" } else { "interpreter" }),
-        if options.jit {
-            json(match options.compile_strategy {
-                CompileStrategy::Fast => "fast",
-                CompileStrategy::Speed => "speed",
-            })
-        } else {
-            "null".into()
-        },
-        options.jit && options.region_linking && !options.profile,
-        runtime.codepage(),
-        json(stop_reason),
-        exit_code.map_or_else(|| "null".into(), |code| code.to_string()),
-        started.elapsed().as_secs_f64(),
-        first_frame_seconds.map_or_else(|| "null".into(), |seconds| format!("{seconds:.6}")),
-        runtime.presented_frames(),
-        frame.width,
-        frame.height,
-        checksum(&frame.bgra),
-        idle_waits,
-        wait_time.as_secs_f64(),
-        runtime.machine.sys.scheduling.polling_rounds,
-        runtime.machine.sys.scheduling.frame_spin_waits,
-        inputs,
-        context_runs,
-        options.jit && options.async_compilation && options.tiered_compilation,
-        runtime.machine.sys.host_calls,
-        options.jit && options.async_compilation,
-        runtime.machine.cpu.report_fields(),
-        runtime
-            .machine
-            .cpu
-            .tier0_instructions()
-            .map_or_else(|| "null".into(), |n| n.to_string()),
-        runtime.machine.cpu.tier0_instructions().map_or_else(
-            || "null".into(),
-            |n| format!(
-                "{:.3}",
-                n as f64 / started.elapsed().as_secs_f64().max(1e-9)
-            )
-        ),
-        runtime.machine.sys.contexts.len(),
-        runtime.machine.sys.tls_images.len(),
-        modules,
-        api_report(runtime),
-        cpu_fault_json(runtime.first_cpu_fault()),
-        cpu_fault_json(runtime.latest_cpu_fault()),
-        runtime.guest_window_count(),
-        options.time_skip,
-        runtime.machine.sys.scheduling.active_time_skips,
-        runtime.machine.sys.scheduling.active_time_skip_us,
-        runtime
-            .machine
-            .sys
-            .stats
-            .wait_diagnostics
-            .as_ref()
-            .map_or_else(|| "null".into(), |d| d.json()),
-        runtime.machine.sys.clock.passive_stalls().0,
-        runtime.machine.sys.clock.passive_stalls().1,
-        adv_machine::MAX_PASSIVE_STEP_US,
-        missing
-            .iter()
-            .map(|s| json(s))
-            .collect::<Vec<_>>()
-            .join(", "),
-        failure.map_or_else(|| "null".into(), json),
-        screenshot_error.map_or_else(|| "null".into(), json),
-        performance.json(),
-        audio.json(),
-        pcm_metrics,
-        codec,
-        codec_kernels,
-        gpu_diagnostics,
-        graphics_memory,
-        scene_gate.json(),
-        json(&runtime.report_with_profile(&runtime.machine.cpu.profile())),
-        runtime
-            .machine
-            .sys
-            .stats
-            .frame_budget
-            .as_ref()
-            .map_or_else(|| "null".into(), |b| b.json()),
-        host_services
-    )
-}
-
 /// The fault as a report shows it; backend text may name host state.
 fn cpu_fault(snapshot: &adv_machine::exception::CpuFaultSnapshot) -> String {
     let pc = snapshot.fault.pc;
@@ -1188,23 +598,6 @@ pub fn error_summary(error: &str, elapsed: Duration) -> adv_report::RunSummary {
         perf: None,
         api_gaps: None,
     }
-}
-
-/// The unimplemented APIs the guest called, and those its loaded modules
-/// import, including modules loaded after startup.
-fn report_api_gaps(runtime: &Runtime) -> Option<adv_report::ApiGaps> {
-    let called = runtime
-        .api_diagnostics()
-        .map(|d| d.gaps.keys().cloned().collect::<Vec<_>>())
-        .unwrap_or_default();
-    let imported = runtime
-        .machine
-        .sys
-        .thunks
-        .iter()
-        .filter(|(_, thunk)| thunk.requested && !thunk.implemented)
-        .map(|(_, thunk)| format!("{}!{}", thunk.module, thunk.name));
-    adv_report::ApiGaps::new(called, imported)
 }
 
 /// How a run failed, for an anonymous report. `message` is the guest
@@ -1251,243 +644,25 @@ fn write_report(path: &std::path::Path, report: &str, cpu: &impl Engine) -> Resu
     cpu.write_report_extras(path)
 }
 
-fn capture_diagnostic_frame(runtime: &mut Runtime, wake: &window::WakeEvent) -> Result<(), String> {
-    #[cfg(any(host_view, feature = "gpu"))]
-    if runtime.has_native_frame() {
-        return capture_native_after_stop(runtime, wake);
-    }
-    let _ = wake;
-    runtime.capture_latest_frame().map(|_| ())
-}
-
-fn observe_scene_gate(
-    runtime: &mut Runtime,
-    wake: &window::WakeEvent,
-    gate: &mut control::SceneGate,
-) -> Result<Option<control::GateCompletion>, String> {
-    let before = gate.check_duration();
-    if gate.needs_frame_pixels(runtime.presented_frames(), runtime.frame().frames) {
-        // Both software composition and native presentation can defer CPU
-        // pixels until a diagnostic capture. Materialize the current frame
-        // before hashing; ordinary execution never asks for this readback.
-        let started = Instant::now();
-        let result = capture_diagnostic_frame(runtime, wake);
-        gate.frame_capture(started.elapsed());
-        result?;
-    }
-    let completion = gate.observe(
-        runtime.presented_frames(),
-        runtime.frame().width,
-        &runtime.frame().bgra,
-        Instant::now(),
-    );
-    if let Some(budget) = &mut runtime.machine.sys.stats.frame_budget {
-        budget.scene_check(gate.check_duration().saturating_sub(before));
-    }
-    Ok(completion)
-}
-
-fn acknowledge_scene_gate(
-    completion: control::GateCompletion,
-    runtime: &mut Runtime,
-    keys: &adv_sync::input::KeyState,
-    inputs: &mut u64,
-    failure: &mut Option<String>,
-) {
-    let release = completion.release.map(|key| {
-        keys.set(key, false);
-        let posted = runtime.post_input(0x101, key, 0xc0000001);
-        *inputs += u64::from(posted);
-        (key, posted)
-    });
-    let result = match (completion.result, release) {
-        (Ok(message), Some((key, true))) => Ok(format!(
-            "{message} release={key} release_posted=true receipt={}",
-            runtime.latest_input_receipt()
-        )),
-        (Ok(message), None) => Ok(format!("{message} release=none")),
-        (Ok(message), Some((key, false))) => Err(format!(
-            "{message} release={key} release_posted=false: no guest target window"
-        )),
-        (Err(message), release) => Err(format!(
-            "{message} release={} release_posted={}",
-            release.map_or_else(|| "none".into(), |(key, _)| key.to_string()),
-            release.is_some_and(|(_, posted)| posted)
-        )),
-    };
-    if let Err(error) = &result {
-        *failure = Some(error.clone());
-    }
-    // The physical key was released at this frame boundary. Its queued guest
-    // message is explicitly reported; a frozen guest has not dispatched it yet.
-    control::acknowledge(result);
-}
-
-#[cfg(any(host_view, feature = "gpu"))]
-fn capture_native_after_stop(
-    runtime: &mut Runtime,
-    wake: &window::WakeEvent,
-) -> Result<(), String> {
-    use adv_sync::background::{Priority, Task};
-    use std::sync::mpsc::TrySendError;
-    // A report followed by a capture asks for the same frame again; its pixels
-    // are already materialized and the guest has not presented since.
-    if runtime.native_frame_serial() == Some(runtime.frame().frames) {
-        return Ok(());
-    }
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let (serial, mut ticket) = loop {
-        match runtime.begin_native_capture() {
-            Ok(Some(capture)) => break capture,
-            Ok(None) => return Ok(()),
-            Err(adv_device::gpu::Error::Busy) => {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    return Err("native capture resource wait timed out".into());
-                }
-                wake.wait(Some(remaining)).map_err(|e| e.to_string())?;
-            }
-            Err(error) => return Err(error.to_string()),
-        }
-    };
-    let sender = runtime.machine.cpu.background_sender()?;
-    let mut task = Task::new(ticket.take_completion_job().unwrap())
-        .finish_on_shutdown()
-        .without_wake();
-    loop {
-        match sender.borrow_mut().try_submit(Priority::Urgent, task) {
-            Ok(_) => break,
-            Err(TrySendError::Full(returned)) => task = returned,
-            Err(TrySendError::Disconnected(_)) => {
-                ticket.cancel();
-                return Err("native capture background service closed".into());
-            }
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            ticket.cancel();
-            return Err("native capture queue wait timed out".into());
-        }
-        wake.wait(Some(remaining)).map_err(|e| e.to_string())?;
-    }
-    loop {
-        if let Some(result) = ticket.poll() {
-            let pixels = result.map_err(|e| e.to_string())?;
-            if !runtime.finish_native_capture(serial, ticket.width, ticket.height, &pixels)? {
-                return Err("native capture was superseded".into());
-            }
-            return Ok(());
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            ticket.cancel();
-            return Err("native capture fence wait timed out".into());
-        }
-        wake.wait(Some(remaining)).map_err(|e| e.to_string())?;
-    }
-}
-
 fn run(options: Options) -> Result<u8, String> {
     if options.frame_budget && !options.headless {
         return Err("--frame-budget requires headless execution".into());
     }
-    #[cfg(not(any(host_view, feature = "gpu")))]
-    if options.gpu_software {
-        return Err("software GPU diagnostics require a GPU-enabled build".into());
-    }
+    let Some(dist) = options.wine.clone() else {
+        return Err(format!("--wine DIST is required\n{HELP}"));
+    };
     #[cfg(target_os = "macos")]
-    if let Some(dist) = options.wine.as_ref().filter(|_| options.headless) {
-        return wine::run(&options, dist);
-    }
-    #[cfg(target_os = "macos")]
-    if !options.headless {
-        return session::run_cli(options);
-    }
-    #[cfg(mobile)]
-    if !options.headless {
-        return Err("mobile games require a host GameView and Session".into());
-    }
-    window::initialize_dpi()?;
-    let wake = window::WakeEvent::new().map_err(|e| e.to_string())?;
-    let keys = std::sync::Arc::new(adv_sync::input::KeyState::default());
-    let mut background =
-        adv_sync::background::Builder::new(wake.clone()).map_err(|error| error.to_string())?;
-    let execution_sender = background
-        .sender_with_capacity_wake(8, 8, wake.clone())
-        .map_err(|error| error.to_string())?;
-    if options.headless {
-        let mut service = background.start().map_err(|error| error.to_string())?;
-        let result = run_execution(options, None, wake, keys, execution_sender);
-        service.shutdown();
-        return result.map(|finished| finished.exit_code);
-    }
-    #[cfg(not(host_view))]
     {
-        // The shared worker cannot preempt an active compiler task. Interactive
-        // compilation uses measured work slices so presentation can run between
-        // jobs; headless compilation above retains the unrestricted policy.
-        background = background.with_work_policy(adv_sync::background::WorkPolicy::responsive(256));
-        let mut window = window::Window::new(
-            &format!(
-                "ADV — {}",
-                options
-                    .exe
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-            ),
-            options.width,
-            options.height,
-            options.hidden,
-        )?;
-        let (worker, mut ui) = frontend::channel(wake.clone(), keys.clone())?;
-        #[cfg(any(target_os = "macos", all(windows, feature = "gpu")))]
-        let mut worker = worker;
-        #[cfg(any(target_os = "macos", all(windows, feature = "gpu")))]
-        {
-            // Startup is the only UI-side GPU initialization. Guest submission has
-            // not begun, so configuring the initially empty queue cannot race it.
-            let (gpu, presenter) = window.create_native(options.gpu_software)?;
-            let context = gpu.context().clone();
-            context
-                .set_execution_wake(wake.clone())
-                .map_err(|_| "GPU execution wake was already registered")?;
-            let ui_sender = background
-                .sender_with_capacity_wake(1, 1, ui.wake())
-                .map_err(|error| error.to_string())?;
-            ui.native(presenter, ui_sender);
-            worker.gpu = Some(gpu);
+        if options.headless {
+            return wine::run(&options, &dist);
         }
-        // All startup ports are registered before this one common worker starts.
-        // Interpretation uses it as well, even when compilation is disabled.
-        let mut service = background.start().map_err(|error| error.to_string())?;
-        let completion_wake = ui.wake();
-        let (mut tx, mut rx) = adv_sync::spsc::channel(1);
-        let execution = std::thread::Builder::new()
-            .name("adv-execution".into())
-            .spawn(move || {
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    run_execution(options, Some(worker), wake, keys, execution_sender)
-                }))
-                .unwrap_or_else(|_| Err("execution worker panicked".into()));
-                let _ = tx.push(result);
-                completion_wake.signal();
-            })
-            .map_err(|e| e.to_string())?;
-        let result = ui.run(&mut window, &mut rx);
-        drop(ui);
-        execution
-            .join()
-            .map_err(|_| "execution worker panicked".to_owned())?;
-        // Accepted presenter and fence jobs return/drop their owned resources while
-        // HWND is still alive. The window is destroyed only after this join.
-        service.shutdown();
-        #[cfg(target_os = "macos")]
-        window.finish_termination();
-        result?.map(|finished| finished.exit_code)
+        session::run_cli(options)
     }
-    #[cfg(host_view)]
-    unreachable!()
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = dist;
+        Err("this platform runs games in a host GameView and Session".into())
+    }
 }
 
 // spec: REPORT-FAIL-1
@@ -1573,18 +748,6 @@ fn frontend_sleep_and_pause_resume_only_their_own_state() {
 }
 #[cfg(host_view)]
 impl Suspension {
-    fn set(
-        &mut self,
-        runtime: &mut Runtime,
-        audio: &mut audio::AudioOutput,
-        sleeping: Option<bool>,
-        paused: Option<bool>,
-    ) {
-        self.apply(audio, sleeping, paused, |paused| {
-            runtime.set_suspended(paused);
-        });
-    }
-
     fn apply(
         &mut self,
         audio: &mut audio::AudioOutput,
@@ -1607,934 +770,32 @@ impl Suspension {
     }
 }
 
+#[cfg(host_view)]
 fn run_execution(
     options: Options,
-    mut window: Option<frontend::Worker>,
+    worker: frontend::Worker,
     wake: window::WakeEvent,
     keys: std::sync::Arc<adv_sync::input::KeyState>,
     background: adv_sync::background::Sender,
 ) -> Result<Finished, String> {
-    #[cfg(target_os = "macos")]
-    if let Some(dist) = options.wine.as_deref()
-        && let Some(worker) = window.take()
-    {
-        return wine::run_execution(
-            &mut adv_runtime::wine::session::Host::default(),
-            &options,
-            dist,
-            worker,
-            wake,
-            keys,
-            background,
-        );
-    }
-    window::initialize_dpi()?;
-    let started = Instant::now();
-    // Before any translation, so the sampler can attribute every unit.
-    let mut debugger = debug::start(&options, window.is_some(), wake.clone());
-    if let Some(install) = &options.install_dir {
-        std::fs::create_dir_all(install)
-            .map_err(|e| format!("install folder {}: {e}", install.display()))?;
-    }
-    let mut runtime = Runtime::with_codec(
-        &options.exe,
-        &options.data_dir,
-        options.install_dir.as_deref(),
-        options.jit,
-        options.width,
-        options.height,
-        options.codec,
-    )?;
-    if let Some(codepage) = options.codepage {
-        runtime.set_codepage(codepage)?;
-    }
-    runtime.configure_fonts(
-        adv_runtime::FontOverrides {
-            families: options.font_families.clone(),
-            antialiased: options.font_smoothing,
-        },
-        &options.font_files,
-    )?;
-    for (drive, image) in &options.cdroms {
-        runtime.mount_iso(*drive, image)?;
-    }
-    if let Some(path) = &options.survey {
-        let modules = survey::modules(&options.exe);
-        println!(
-            "{}",
-            survey::write(path, &modules, &runtime.survey(&modules))?
-        );
-    }
-    if options.codec_kernels != adv_runtime::codec_kernels::Mode::Guest {
-        use std::io::Read;
-        let mut signatures = String::new();
-        if let Some(path) = &options.codec_signatures {
-            std::fs::File::open(path)
-                .map_err(|e| format!("codec signatures {}: {e}", path.display()))?
-                .take(1_048_577)
-                .read_to_string(&mut signatures)
-                .map_err(|e| format!("codec signatures {}: {e}", path.display()))?;
-            if signatures.len() > 1_048_576 {
-                return Err("codec signatures exceed 1 MiB".into());
-            }
-        } else {
-            signatures.push_str(adv_runtime::codec_kernels::BUNDLED_SIGNATURES);
-        }
-        match runtime.install_codec_kernels(options.codec_kernels, &signatures) {
-            Ok(installed) => eprintln!("codec kernels: {installed:?}"),
-            // The default is an optimization: a binding is recorded only after
-            // its detour is complete, so the guest path stays usable.
-            Err(error) if !options.codec_kernels_explicit => {
-                eprintln!("warning: codec kernels disabled: {error}")
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    runtime.set_api_mode(options.api_mode);
-    runtime.machine.cpu.set_waker(wake.clone())?;
-    runtime
-        .machine
-        .cpu
-        .set_background_sender(background.into_local())?;
-    runtime
-        .audio_stream()
-        .set_waker(wake.clone())
-        .map_err(|_| "audio wake event was already registered".to_owned())?;
-    options.configure_machine(&mut runtime.machine, &wake, &keys)?;
-    runtime.set_frame_limit(options.frames);
-    runtime.set_audio_enabled(options.audio);
-    #[cfg(any(host_view, feature = "gpu"))]
-    runtime.set_d3d9_shader_caps(options.d3d9_sm3);
-    #[cfg(any(host_view, feature = "gpu"))]
-    runtime.set_d3d9_shader_cache(Some(
-        options
-            .d3d9_shader_cache
-            .clone()
-            .unwrap_or_else(|| options.data_dir.join("artifacts/gpu")),
-    ));
-    if let Some(delay) = options.auto_dialog_ms {
-        runtime.set_auto_dialog_ms(Some(delay));
-    }
-    runtime.set_host_keys(keys.clone());
-    if let Some(worker) = window.as_mut() {
-        let producer = worker.take_frames();
-        runtime.set_frame_mailbox(producer, worker.ui_wake.clone());
-        #[allow(unused_mut)]
-        let mut pacer = frame_pacer::HostPacer {
-            vsync: None,
-            keys: keys.clone(),
-            origin: Instant::now(),
-        };
-        #[cfg(any(target_os = "macos", target_os = "ios"))]
-        if let Some(vsync) = worker.vsync.take() {
-            pacer.vsync = Some(vsync.clone());
-            runtime.machine.ext.insert(vsync);
-        }
-        runtime.machine.sys.frame_pacer = Some(std::sync::Arc::new(pacer));
-    }
-    #[cfg(any(host_view, feature = "gpu"))]
-    if cfg!(windows) || (cfg!(host_view) && window.is_some()) || options.headless_gpu {
-        #[cfg(any(host_view, windows))]
-        let supplied_gpu = window.as_mut().and_then(|worker| worker.gpu.take());
-        #[cfg(not(any(host_view, windows)))]
-        let supplied_gpu = None;
-        let gpu = match supplied_gpu {
-            Some(gpu) => gpu,
-            None => {
-                let gpu = pollster::block_on(adv_device::gpu::Gpu::request(options.gpu_software))
-                    .map_err(|e| e.to_string())?;
-                gpu.context()
-                    .set_execution_wake(wake.clone())
-                    .map_err(|_| "GPU wake already installed")?;
-                runtime.set_deferred_presentation(true)?;
-                gpu
-            }
-        };
-        runtime.install_gpu(gpu)?;
-        let gpu_background = runtime.machine.cpu.background_sender()?;
-        runtime.set_gpu_background(gpu_background, wake.clone());
-    }
-    let mut audio = audio::AudioOutput::new(options.audio, options.headless, &runtime);
-    #[cfg(host_view)]
-    let mut suspension = Suspension::default();
-    let mut control = options
-        .control_stdin
-        .then(|| control::Control::start(wake.clone(), keys.clone()))
-        .transpose()?;
-    if control.is_some() {
-        runtime.enable_input_receipts();
-    }
-    let mut idle_waits = 0u64;
-    let mut wait_time = Duration::ZERO;
-    let mut performance = performance::Performance::default();
-    #[cfg(target_os = "android")]
-    {
-        performance.execution_scheduling = Some(configure_execution_thread());
-    }
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    if window.is_some() {
-        performance.execution_scheduling = Some(configure_execution_thread());
-    }
-    let mut scene_gate = control::SceneGate::default();
-    let mut inputs = 0u64;
-    let mut injected = false;
-    let mut first_frame_seconds = None;
-    let mut close_at = None;
-    let mut minimized = false;
-    let mut failure = None;
-    let mut guest_error = None;
-    let mut exit_code = None;
-    let stop_reason;
-    loop {
-        wake.take_interrupt();
-        if window.as_ref().is_some_and(frontend::Worker::stopped) {
-            return Err("UI stopped while the guest was running".into());
-        }
-        if let Some(w) = window.as_mut() {
-            #[cfg(mobile)]
-            let events = std::iter::from_fn(|| w.next_input(&mut performance));
-            #[cfg(not(mobile))]
-            let events = w.pump(&mut performance);
-            for event in events {
-                match event {
-                    window::Event::Input {
-                        message,
-                        wparam,
-                        lparam,
-                    } => {
-                        if let Some(debugger) = debugger.as_mut()
-                            && debug_hotkey(&keys, message, wparam)
-                        {
-                            debugger.hotkey(&runtime);
-                            continue;
-                        }
-                        inputs += u64::from(runtime.post_input(message, wparam, lparam));
-                    }
-                    #[cfg(host_view)]
-                    window::Event::Text(text, reply) => {
-                        let posted = runtime.post_text(&text);
-                        inputs += posted as u64;
-                        let _ = reply.send(posted);
-                    }
-                    window::Event::Close => {
-                        #[cfg(host_view)]
-                        suspension.set(&mut runtime, &mut audio, None, Some(false));
-                        runtime.post_input(0x10, 0, 0);
-                        #[cfg(not(host_view))]
-                        close_at.get_or_insert_with(Instant::now);
-                    }
-                    #[cfg(host_view)]
-                    window::Event::AudioSuspended(sleeping) => {
-                        suspension.set(&mut runtime, &mut audio, Some(sleeping), None)
-                    }
-                    #[cfg(host_view)]
-                    window::Event::Volume(percent) => audio.set_volume(percent),
-                    #[cfg(host_view)]
-                    window::Event::Paused(paused) => {
-                        suspension.set(&mut runtime, &mut audio, None, Some(paused))
-                    }
-                    #[cfg(host_view)]
-                    window::Event::ForceClose => unreachable!("force close is consumed by the UI"),
-                    window::Event::Repaint => {}
-                    window::Event::FocusLost => inputs += runtime.release_input() as u64,
-                    window::Event::Menu(event) => {
-                        inputs += u64::from(runtime.post_menu_event(event))
-                    }
-                    window::Event::Dialog(event) => {
-                        inputs += u64::from(runtime.post_dialog_event(event));
-                    }
-                }
-            }
-        }
-        if let Some(controller) = control.as_mut() {
-            let commands = if scene_gate.frozen() {
-                controller.drain_frozen(true)
-            } else {
-                controller.drain()
-            };
-            for command in commands {
-                let receipt_before = runtime.latest_input_receipt();
-                let result = match command {
-                    control::Command::Dialogs => runtime
-                        .dialogs()
-                        .map(|set| format!("dialogs {}", json(&format!("{set:?}")))),
-                    control::Command::Dialog(id) | control::Command::DialogTrack(id, _) => {
-                        let set = runtime.dialogs()?;
-                        let found: Vec<_> = set
-                            .dialogs
-                            .iter()
-                            .filter(|d| d.visible && d.enabled)
-                            .flat_map(|d| d.controls.iter())
-                            .filter(|c| c.target.id == id && c.visible && c.enabled)
-                            .map(|c| c.target)
-                            .collect();
-                        if found.len() == 1
-                            && runtime.post_dialog_event(match command {
-                                control::Command::DialogTrack(_, value) => {
-                                    adv_runtime::DialogEvent::Track {
-                                        target: found[0],
-                                        value,
-                                        code: 4,
-                                    }
-                                }
-                                _ => adv_runtime::DialogEvent::Click(found[0]),
-                            })
-                        {
-                            inputs += 1;
-                            Ok(format!("dialog {id}"))
-                        } else {
-                            Err(format!(
-                                "dialog control {id} is missing, ambiguous or disabled"
-                            ))
-                        }
-                    }
-                    control::Command::DialogClose => {
-                        let set = runtime.dialogs()?;
-                        let found: Vec<_> = set
-                            .dialogs
-                            .iter()
-                            .filter(|d| d.visible && d.enabled)
-                            .map(|d| d.target)
-                            .collect();
-                        if found.len() == 1
-                            && runtime.post_dialog_event(adv_runtime::DialogEvent::Close(found[0]))
-                        {
-                            inputs += 1;
-                            Ok("dialog-close".into())
-                        } else {
-                            Err("dialog-close requires one visible enabled dialog".into())
-                        }
-                    }
-                    control::Command::Menus => runtime.menu_bar().map(|bar| {
-                        fn visit(
-                            items: &[adv_runtime::MenuItem],
-                            path: &str,
-                            rows: &mut Vec<String>,
-                        ) {
-                            for item in items {
-                                let label =
-                                    format!("{path}/{}", String::from_utf16_lossy(&item.text));
-                                if item.children.is_empty() {
-                                    rows.push(format!(
-                                        "{}:{}:{}",
-                                        item.command.id, item.flags, label
-                                    ));
-                                } else {
-                                    visit(&item.children, &label, rows);
-                                }
-                            }
-                        }
-                        let mut rows = Vec::new();
-                        visit(&bar.items, "", &mut rows);
-                        format!(
-                            "menus enabled={} {}",
-                            bar.key.enabled,
-                            json(&rows.join(" | "))
-                        )
-                    }),
-                    control::Command::Menu(id) => {
-                        fn find(
-                            items: &[adv_runtime::MenuItem],
-                            id: u32,
-                            found: &mut Vec<adv_runtime::MenuCommand>,
-                        ) {
-                            for item in items {
-                                if item.children.is_empty() && item.command.id == id {
-                                    found.push(item.command);
-                                }
-                                find(&item.children, id, found);
-                            }
-                        }
-                        let mut found = Vec::new();
-                        let bar = runtime.menu_bar()?;
-                        find(&bar.items, id, &mut found);
-                        if found.len() == 1
-                            && runtime.post_menu_event(adv_runtime::MenuEvent::Command(found[0]))
-                        {
-                            inputs += 1;
-                            Ok(format!("menu {id}"))
-                        } else {
-                            Err(format!(
-                                "menu {id} is missing, ambiguous, detached or disabled"
-                            ))
-                        }
-                    }
-                    control::Command::Click(x, y) => {
-                        let position = u32::from(x as u16) | (u32::from(y as u16) << 16);
-                        let posted = [(0x200, 0), (0x201, 1), (0x202, 0)]
-                            .into_iter()
-                            .filter(|&(message, wparam)| {
-                                runtime.post_input(message, wparam, position)
-                            })
-                            .count();
-                        inputs += posted as u64;
-                        if posted == 3 {
-                            Ok(format!("click {x} {y}"))
-                        } else {
-                            Err("click has no guest target window".into())
-                        }
-                    }
-                    control::Command::MouseDown(x, y)
-                    | control::Command::MouseUp(x, y)
-                    | control::Command::RightMouseDown(x, y)
-                    | control::Command::RightMouseUp(x, y) => {
-                        let right = matches!(
-                            command,
-                            control::Command::RightMouseDown(..)
-                                | control::Command::RightMouseUp(..)
-                        );
-                        let pressed = matches!(
-                            command,
-                            control::Command::MouseDown(..) | control::Command::RightMouseDown(..)
-                        );
-                        let buttons = if pressed {
-                            if right { 2 } else { 1 }
-                        } else {
-                            0
-                        };
-                        let position = u32::from(x as u16) | (u32::from(y as u16) << 16);
-                        let moved = runtime.post_input(0x200, buttons, position);
-                        let posted = runtime.post_input(
-                            if right {
-                                if pressed { 0x204 } else { 0x205 }
-                            } else {
-                                if pressed { 0x201 } else { 0x202 }
-                            },
-                            buttons,
-                            position,
-                        );
-                        inputs += u64::from(moved) + u64::from(posted);
-                        if moved && posted {
-                            Ok(format!(
-                                "{}mouse-{} {x} {y}",
-                                if right { "right-" } else { "" },
-                                if pressed { "down" } else { "up" }
-                            ))
-                        } else {
-                            Err("mouse button has no guest target window".into())
-                        }
-                    }
-                    control::Command::Move(x, y) => {
-                        let position = u32::from(x as u16) | (u32::from(y as u16) << 16);
-                        if runtime.post_input(0x200, 0, position) {
-                            inputs += 1;
-                            Ok(format!("move {x} {y}"))
-                        } else {
-                            Err("mouse move has no guest target window".into())
-                        }
-                    }
-                    control::Command::Key(key) => {
-                        let down = runtime.post_input(0x100, key, 1);
-                        let up = runtime.post_input(0x101, key, 0xc0000001);
-                        inputs += u64::from(down) + u64::from(up);
-                        if down && up {
-                            Ok(format!("key {key}"))
-                        } else {
-                            Err("key has no guest target window".into())
-                        }
-                    }
-                    control::Command::KeyDown(key) | control::Command::KeyUp(key) => {
-                        let pressed = matches!(command, control::Command::KeyDown(_));
-                        let posted = runtime.post_input(
-                            if pressed { 0x100 } else { 0x101 },
-                            key,
-                            if pressed { 1 } else { 0xc0000001 },
-                        );
-                        inputs += u64::from(posted);
-                        if posted {
-                            Ok(format!("key-{} {key}", if pressed { "down" } else { "up" }))
-                        } else {
-                            Err("key has no guest target window".into())
-                        }
-                    }
-                    control::Command::Text(text) => {
-                        let posted = runtime.post_text(&text);
-                        inputs += posted as u64;
-                        let total = text.chars().count();
-                        if posted == total {
-                            Ok(format!("text {posted}"))
-                        } else {
-                            Err(format!("text posted {posted} of {total} characters"))
-                        }
-                    }
-                    control::Command::Activate(active) => {
-                        // The path a frontend uses when the host app gains or loses activation.
-                        if runtime.post_input(0x1c, u32::from(active), 0) {
-                            inputs += 1;
-                            Ok(format!("activate {}", u8::from(active)))
-                        } else {
-                            Err("activation has no guest target window".into())
-                        }
-                    }
-                    control::Command::Windows => {
-                        let view = runtime.input_view();
-                        Ok(format!(
-                            "windows {{\"frames\": {}, \"top\": {}, \"focus\": {}, \"active\": {}, \"capture\": {}, \"windows\": [{}]}}",
-                            runtime.presented_frames(),
-                            view.top,
-                            view.focus,
-                            view.active,
-                            view.capture,
-                            view.windows
-                                .iter()
-                                .map(window_json)
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        ))
-                    }
-                    control::Command::Hit(x, y) => Ok(format!(
-                        "hit {}",
-                        runtime
-                            .window_at(x.into(), y.into())
-                            .map_or_else(|| "null".into(), |window| window_json(&window))
-                    )),
-                    control::Command::Memory(address, len) => {
-                        runtime.inspect_memory(address, len).map(|bytes| {
-                            let hex = bytes
-                                .iter()
-                                .map(|b| format!("{b:02x}"))
-                                .collect::<Vec<_>>()
-                                .join("");
-                            format!("memory {address:#010x} {hex}")
-                        })
-                    }
-                    control::Command::Capture(path) => {
-                        capture_diagnostic_frame(&mut runtime, &wake)?;
-                        save_frame(&path, runtime.frame())
-                            .map(|_| format!("capture {}", path.display()))
-                    }
-                    control::Command::Report(path) => {
-                        runtime.machine.sys.schedule_trace.event(
-                            "observe",
-                            0,
-                            runtime.presented_frames(),
-                            0,
-                            0,
-                        );
-                        capture_diagnostic_frame(&mut runtime, &wake)?;
-                        runtime.machine.sys.trace.flush();
-                        let snapshot = build_report(ReportContext {
-                            options: &options,
-                            runtime: &runtime,
-                            started,
-                            first_frame_seconds,
-                            stop_reason: "running",
-                            exit_code: None,
-                            idle_waits,
-                            wait_time,
-                            inputs,
-                            failure: failure.as_deref(),
-                            screenshot_error: None,
-                            performance: &performance,
-                            audio: &audio,
-                            scene_gate: &scene_gate,
-                        });
-                        write_report(&path, &snapshot, &runtime.machine.cpu)
-                            .map(|_| format!("report {}", path.display()))
-                    }
-                    control::Command::ResetMetrics => {
-                        if let Some(diagnostics) = &mut runtime.machine.sys.stats.wait_diagnostics {
-                            diagnostics.reset();
-                        }
-                        let total = runtime.machine.sys.stats.total;
-                        if let Some(budget) = &mut runtime.machine.sys.stats.frame_budget {
-                            budget.reset(total, runtime.machine.cpu.frame_counters());
-                        }
-                        runtime.machine.sys.schedule_trace.event("mark", 0, 0, 0, 0);
-                        let serial = runtime.presented_frames();
-                        performance.reset(serial);
-                        Ok(format!("reset-metrics start_frame={serial}"))
-                    }
-                    control::Command::AwaitFrame(spec) => {
-                        if !options.headless {
-                            Err("await-frame requires headless execution".into())
-                        } else {
-                            let hold = spec.hold;
-                            if hold.is_some() && runtime.guest_window_count() == 0 {
-                                Err("await-frame hold has no guest target window".into())
-                            } else {
-                                match scene_gate.arm(
-                                    spec,
-                                    runtime.presented_frames(),
-                                    Instant::now(),
-                                ) {
-                                    Err(error) => Err(error),
-                                    Ok(()) => {
-                                        // Arm before publishing the physical held state. Guest
-                                        // execution resumes only after this command returns.
-                                        if let Some(key) = hold {
-                                            keys.set(key, true);
-                                            let posted = runtime.post_input(0x100, key, 1);
-                                            inputs += u64::from(posted);
-                                            if !posted
-                                                && let Some(completion) = scene_gate.abort(
-                                                    "hold has no guest target window",
-                                                    runtime.presented_frames(),
-                                                    Instant::now(),
-                                                )
-                                            {
-                                                acknowledge_scene_gate(
-                                                    completion,
-                                                    &mut runtime,
-                                                    &keys,
-                                                    &mut inputs,
-                                                    &mut failure,
-                                                );
-                                            }
-                                            controller
-                                                .note_input_receipt(runtime.latest_input_receipt());
-                                        }
-                                        continue; // Deferred ACK belongs to the actual latch/timeout.
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    control::Command::Resume => {
-                        scene_gate.resume(Instant::now()).map(|_| "resume".into())
-                    }
-                    control::Command::Close => {
-                        scene_gate.close(Instant::now());
-                        runtime.post_input(0x10, 0, 0);
-                        close_at.get_or_insert_with(Instant::now);
-                        if let Some(window) = window.as_mut() {
-                            window.hide();
-                        }
-                        Ok("close".into())
-                    }
-                    control::Command::Error(error) => Err(error),
-                };
-                let receipt = runtime.latest_input_receipt();
-                controller.note_input_receipt(if receipt != receipt_before {
-                    receipt
-                } else {
-                    0
-                });
-                control::acknowledge(result);
-            }
-        }
-        if let Some(debugger) = debugger.as_mut() {
-            debugger.serve(&runtime);
-        }
-        let completion = observe_scene_gate(&mut runtime, &wake, &mut scene_gate)?;
-        if let Some(completion) = completion {
-            acknowledge_scene_gate(completion, &mut runtime, &keys, &mut inputs, &mut failure);
-        }
-        if options
-            .seconds
-            .is_some_and(|limit| started.elapsed().as_secs_f64() >= limit)
-        {
-            if let Some(completion) = scene_gate.abort(
-                "session time limit",
-                runtime.presented_frames(),
-                Instant::now(),
-            ) {
-                acknowledge_scene_gate(completion, &mut runtime, &keys, &mut inputs, &mut failure);
-            }
-            stop_reason = "time_limit";
-            break;
-        }
-        if close_at.is_some_and(|at: Instant| at.elapsed() >= Duration::from_secs(2)) {
-            stop_reason = "host_window_closed";
-            break;
-        }
-        #[cfg(host_view)]
-        if suspension.paused {
-            // Input stays queued; only a resume, close or diagnostic command wakes this.
-            if !control.as_ref().is_some_and(control::Control::has_pending) {
-                wake.wait(None).map_err(|e| e.to_string())?;
-            }
-            continue;
-        }
-        if scene_gate.frozen() {
-            // Input is queued while frozen. Diagnostics share the same retained
-            // wake event and remain responsive without running another guest frame.
-            let pause_started = runtime
-                .machine
-                .sys
-                .stats
-                .frame_budget
-                .as_ref()
-                .map(|_| Instant::now());
-            if !control.as_ref().is_some_and(control::Control::has_pending) {
-                wake.wait(Some(Duration::from_millis(50)))
-                    .map_err(|e| e.to_string())?;
-            }
-            if let Some(at) = pause_started {
-                runtime
-                    .machine
-                    .sys
-                    .stats
-                    .frame_budget
-                    .as_mut()
-                    .unwrap()
-                    .control_pause(at.elapsed());
-            }
-            continue;
-        }
-        let time_remaining = options
-            .seconds
-            .map(|seconds| Duration::from_secs_f64(seconds).saturating_sub(started.elapsed()));
-        let close_remaining =
-            close_at.map(|at| Duration::from_secs(2).saturating_sub(at.elapsed()));
-        let slice = [time_remaining, close_remaining]
-            .into_iter()
-            .flatten()
-            .min()
-            .map_or(SOFT_SLICE, |remaining| remaining.min(SOFT_SLICE));
-        // A host deadline yields to the shell; it is not a guest failure or a
-        // process exit. Machine's soft slice already bounds CPU execution and
-        // collects leases without publishing a terminal process status.
-        let step_started = Instant::now();
-        let interrupts_before = runtime.machine.sys.scheduling.external_interrupts;
-        let frame_yields_before = runtime.machine.sys.scheduling.frame_host_yields;
-        let outcome = runtime.step_for(slice);
-        // Publish before an Idle wait: an engine may finish constructing its
-        // menu and then wait indefinitely for the very first UI command.
-        if let Some(worker) = window.as_mut()
-            && worker.needs_menu(runtime.menu_key())
-        {
-            worker.publish_menu(runtime.menu_bar()?);
-        }
-        if let Some(worker) = window.as_mut() {
-            worker.publish_dialogs(runtime.dialogs()?);
-            // A guest minimizing itself (a boss key) minimizes the host window
-            // where it has one; restoring that window restores the guest.
-            let now_minimized = runtime.window_minimized();
-            if now_minimized && !minimized {
-                worker.minimize();
-            }
-            minimized = now_minimized;
-        }
-        if let Some(controller) = control.as_mut() {
-            let ordinary = runtime.machine.sys.scheduling.external_interrupts == interrupts_before;
-            let full_or_idle = runtime.machine.sys.scheduling.frame_host_yields
-                == frame_yields_before
-                || matches!(&outcome, SliceResult::Complete(RunResult::Idle { .. }));
-            let input_completed = ordinary
-                && controller
-                    .awaited_input_receipt()
-                    .is_none_or(|receipt| runtime.input_receipt_completed(receipt, full_or_idle));
-            controller.after_guest_step(input_completed);
-        }
-        let step_elapsed = step_started.elapsed();
-        audio.update();
-        let presented = runtime.presented_frames();
-        performance.step(step_elapsed, presented);
-        if let Some(debugger) = debugger.as_mut() {
-            debugger.after_step(step_elapsed, presented, &runtime);
-        }
-        if matches!(
-            &outcome,
-            SliceResult::Complete(RunResult::Exited(_) | RunResult::Failed(_))
-        ) && let Some(completion) =
-            scene_gate.abort("guest stopped before target", presented, Instant::now())
-        {
-            acknowledge_scene_gate(completion, &mut runtime, &keys, &mut inputs, &mut failure);
-        }
-        let completion = observe_scene_gate(&mut runtime, &wake, &mut scene_gate)?;
-        if let Some(completion) = completion {
-            acknowledge_scene_gate(completion, &mut runtime, &keys, &mut inputs, &mut failure);
-        }
-        if first_frame_seconds.is_none() && presented > 0 {
-            first_frame_seconds = runtime
-                .first_frame_time()
-                .map(|at| at.saturating_duration_since(started).as_secs_f64());
-        }
-        if scene_gate.frozen() && matches!(&outcome, SliceResult::Complete(RunResult::Idle { .. }))
-        {
-            continue;
-        }
-        let outcome = match outcome {
-            SliceResult::Yielded => {
-                performance.soft_yield();
-                continue;
-            }
-            SliceResult::Complete(outcome) => outcome,
-        };
-        match outcome {
-            RunResult::HostRequest => unreachable!("runtime services process requests internally"),
-            RunResult::Exited(code) => {
-                if options.frames.is_some_and(|limit| presented >= limit) {
-                    stop_reason = "frame_limit";
-                    break;
-                }
-                exit_code = Some(code);
-                stop_reason = "guest_exit";
-                break;
-            }
-            RunResult::Failed(error) => {
-                failure = Some(format!("{error}\n{}", error.recent.join("\n")));
-                guest_error = Some(error);
-                stop_reason = "guest_failure";
-                break;
-            }
-            RunResult::Idle { next_deadline } => {
-                if options
-                    .frames
-                    .is_some_and(|limit| runtime.presented_frames() >= limit)
-                {
-                    stop_reason = "frame_limit";
-                    break;
-                }
-                if options.self_test_input && !injected {
-                    // Probe for a guest window after startup/worker waits. In windowed
-                    // tests the input takes the native callback and event-pump path.
-                    if runtime.post_input(0, 0, 0) {
-                        for (message, wparam, lparam) in [
-                            (0x100, 0x41, 1),
-                            (0x101, 0x41, 0xc0000001),
-                            (0x200, 0, (80 << 16) | 100),
-                            (0x201, 1, (80 << 16) | 100),
-                            (0x202, 0, (80 << 16) | 100),
-                        ] {
-                            if let Some(w) = window.as_mut() {
-                                w.post_input(message, wparam, lparam)?;
-                            } else {
-                                inputs += u64::from(runtime.post_input(message, wparam, lparam));
-                            }
-                        }
-                        injected = true;
-                        continue;
-                    }
-                }
-                let now = runtime.machine.sys.clock.now_us();
-                // Unbounded input waits still allow host limits and close requests to complete.
-                let mut delay = next_deadline
-                    .map(|deadline| Duration::from_micros(deadline.saturating_sub(now)));
-                if let Some(seconds) = options.seconds {
-                    let remaining =
-                        Duration::from_secs_f64(seconds).saturating_sub(started.elapsed());
-                    delay = Some(delay.map_or(remaining, |d| d.min(remaining)));
-                }
-                if let Some(at) = close_at {
-                    let remaining = Duration::from_secs(2).saturating_sub(at.elapsed());
-                    delay = Some(delay.map_or(remaining, |d| d.min(remaining)));
-                }
-                if let Some(remaining) = scene_gate.remaining(Instant::now()) {
-                    delay = Some(delay.map_or(remaining, |d| d.min(remaining)));
-                }
-                delay = audio.wait_duration(delay);
-                let wait_started = Instant::now();
-                // Every producer signals this same retained event. No UI/frame or
-                // stdin-specific blocking loop can hide another channel's wake.
-                let pending = control.as_ref().is_some_and(control::Control::has_pending);
-                let signaled = pending || wake.wait(delay).map_err(|e| e.to_string())?;
-                let wake = if signaled {
-                    window::WaitOutcome::Input
-                } else {
-                    window::WaitOutcome::Deadline
-                };
-                let waited = wait_started.elapsed();
-                if let Some(diagnostics) = &mut runtime.machine.sys.stats.wait_diagnostics {
-                    diagnostics.host_wait(
-                        delay,
-                        waited,
-                        !signaled,
-                        runtime.machine.sys.contexts.iter().any(|c| c.is_ready()),
-                    );
-                }
-                if let Some(budget) = &mut runtime.machine.sys.stats.frame_budget {
-                    budget.wait(delay, waited, !signaled);
-                }
-                performance.wait(delay, waited, wake);
-                wait_time += waited;
-                idle_waits += 1;
-            }
-        }
-    }
-    #[cfg(any(host_view, feature = "gpu"))]
-    runtime.cancel_pending_graphics();
-    runtime.machine.sys.trace.flush();
-    #[cfg(any(host_view, feature = "gpu"))]
-    let native_frame = runtime.has_native_frame();
-    #[cfg(not(any(host_view, feature = "gpu")))]
-    let native_frame = false;
-    if let Err(error) = runtime.machine.cpu.persist() {
-        eprintln!("warning: {error}");
-    }
-    if native_frame {
-        #[cfg(any(host_view, feature = "gpu"))]
-        if options.screenshot.is_some() || options.report.is_some() {
-            capture_native_after_stop(&mut runtime, &wake)?;
-        }
-    } else {
-        runtime.capture_latest_frame()?;
-    }
-    let frame = runtime.frame();
-    let screenshot_error = options
-        .screenshot
-        .as_ref()
-        .and_then(|path| save_frame(path, frame).err());
-    runtime
-        .machine
-        .sys
-        .schedule_trace
-        .flush()
-        .map_err(|e| e.to_string())?;
-    let report = build_report(ReportContext {
-        options: &options,
-        runtime: &runtime,
-        started,
-        first_frame_seconds,
-        stop_reason,
-        exit_code,
-        idle_waits,
-        wait_time,
-        inputs,
-        failure: failure.as_deref(),
-        screenshot_error: screenshot_error.as_deref(),
-        performance: &performance,
-        audio: &audio,
-        scene_gate: &scene_gate,
-    });
-    if let Some(path) = &options.report {
-        write_report(path, &report, &runtime.machine.cpu)?;
-    }
-    options.write_profiles(&runtime.machine)?;
-    let summary = adv_report::RunSummary {
-        failure: report_failure(
-            guest_error.as_ref().map(|error| error.message.as_str()),
-            exit_code,
-            runtime.latest_cpu_fault().map(cpu_fault),
-            started.elapsed(),
-        ),
-        perf: adv_report::Perf::from_samples(performance.frame_samples()),
-        api_gaps: report_api_gaps(&runtime),
-    };
-    let stats = runtime.machine.cpu.counters();
-    println!(
-        "{stop_reason}: exit={} frames={} elapsed={:.3}s host_calls={} native_entries={} interpreter_entries={} idle_waits={}",
-        exit_code.map_or_else(|| "none".into(), |code| code.to_string()),
-        runtime.presented_frames(),
-        started.elapsed().as_secs_f64(),
-        runtime.machine.sys.host_calls,
-        stats.native_entries,
-        stats.interpreter_entries,
-        idle_waits
-    );
-    #[cfg(any(host_view, feature = "gpu"))]
-    if let Some(gpu) = runtime.gpu_diagnostics().gpu {
-        println!(
-            "GPU Metal: draws={} backend_switches={} ring_bytes={} ring_busy={}",
-            gpu.metal_draws, gpu.backend_switches, gpu.ring_bytes, gpu.ring_busy
-        );
-    }
-    let exit_code = if let Some(error) = failure {
-        eprintln!("{error}");
-        1
-    } else if let Some(error) = screenshot_error {
-        eprintln!("screenshot: {error}");
-        1
-    } else {
-        u8::from(exit_code.is_some_and(|code| code != 0))
-    };
-    Ok(Finished { exit_code, summary })
+    let dist = options
+        .wine
+        .clone()
+        .ok_or("no Wine distribution to run on")?;
+    wine::run_execution(
+        &mut adv_runtime::wine::session::Host::default(),
+        &options,
+        &dist,
+        worker,
+        wake,
+        keys,
+        background,
+    )
 }
 
 /// Run the desktop/headless command-line shell with the process arguments.
 pub fn run_cli() -> std::process::ExitCode {
-    #[cfg(any(host_view, windows))]
+    #[cfg(host_view)]
     logging::init();
     if std::env::var("ADV_HOST_FEATURES_REPORT").is_ok_and(|value| value == "1") {
         eprintln!(

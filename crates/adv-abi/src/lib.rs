@@ -1,7 +1,7 @@
 //! x86 calling conventions, generated signatures, typed guest values and API diagnostics.
 //! COM interface identity and guest reference counters live in [`com`].
 //! [`dll`] writes host-module PE images and calls their guest imports.
-//! API behavior belongs to adv-win32/adv-dx; this crate never owns their state.
+//! API behavior belongs to adv-dx and the Wine fronts; this crate never owns their state.
 //!
 //! Pointer parameters cannot accidentally become raw integer arguments:
 //! ```compile_fail

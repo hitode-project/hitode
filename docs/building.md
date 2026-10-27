@@ -89,7 +89,6 @@ python3 -m unittest discover -s tools/<folder>
   `cargo test -p adv-drv upstream_zlib -- --ignored`. This checks forward copies,
   including overlapping matches; it does not establish whole-decoder coverage.
 - Tests that need a game read it from `$ADV_SAMPLES`. They are ignored or skip when it is unset, so the default run needs no game files.
-- Fixtures with a recording in `tools/fixtures/native/` run on every host: `cargo test -p adv-runtime --features gpu --test native_reference` compares each CPU backend with the native Windows output. Record or refresh one on Windows with `python tools/fixtures/record_native.py <name>`; `--check` there confirms the build is still deterministic.
 - On AArch64, `tools/cpu/arm64-check.sh <ref>` runs the CPU suite once and judges it both normally and in strict mode.
 - Media tests need the FFmpeg variables above: `cargo test -p adv-device --features media`.
 - Direct3D 9 builds only with the `gpu` feature, so `cargo test -p adv-dx` skips it without a word: test it with `cargo test -p adv-dx --features gpu`. Test files pulled in with `include!` are outside `cargo fmt`; format them with `rustfmt --edition 2024 <file>`.
@@ -132,7 +131,7 @@ embeds one solid XZ archive with a file-length manifest and content identity, wi
 The player expands them once under its private application data before the first
 game, on a background thread. macOS, iOS and Android use the same files and code;
 source-only checks may omit the distribution, but game startup then reports the
-missing build input instead of running the built-in stack.
+missing build input.
 When generating a mobile Cargo wrapper below, set `ADV_WINE_DIST` at that step;
 the wrapper carries it through Xcode's restricted build environment.
 

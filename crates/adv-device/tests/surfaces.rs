@@ -247,7 +247,7 @@ fn video_updates_clip_and_restore_an_immutable_base_without_game_present() {
 }
 
 #[test]
-// spec: MEDIA-VIDEO-4
+// spec: DEV-FRAME-1, MEDIA-VIDEO-4
 fn video_only_mailbox_coalesces_to_latest_and_capture_uses_same_composition() {
     let memory = Memory::new(false);
     let mut store = store();

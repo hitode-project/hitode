@@ -41,34 +41,23 @@ Header macros, placeholder names in script examples and names read only to clear
 
 | Name | Kind | Default |
 |---|---|---|
-| `ADV_ABI_AUDIT_PATH` | Fixture | Unset: run the parent test |
 | `ADV_ANDROID_SHELL_BUILD` | Fixture | Build-time label `unrecorded` |
-| `ADV_API_DIFF_BUILD` | Fixture | Unset: skip the local build check |
-| `ADV_API_DIFF_CHILD` | Fixture | Unset; the fixture passes it |
 | `ADV_ARTIFACT_ROOT` | Fixture | The repository `target` |
-| `ADV_AUDIO_CAPTURE` | Fixture | No output; used only by `audio_transition_probe` |
 | `ADV_AUDIO_CAPTURE_CALLBACK` | Diagnostic | No output |
 | `ADV_AUDIO_DUMP_CHUNKS` | Diagnostic | Off; on when set |
 | `ADV_AUDIO_DUMP_DIR` | Diagnostic | No output; needs `ADV_AUDIO_TRACE` |
 | `ADV_AUDIO_MUTE_DEVICE` | Diagnostic | Off; `1` mutes the physical output |
 | `ADV_AUDIO_TRACE` | Diagnostic | No output |
-| `ADV_BISECT_EXE` | Fixture | None; required for the explicit backend comparison, with the game chosen through `ADV_SAMPLES` |
-| `ADV_BISECT_BACKENDS` | Fixture | `interpreter,unicorn`; `jit` optional |
-| `ADV_BISECT_SECONDS` | Fixture | `10` (1 to 120), the outer deadline per backend |
-| `ADV_BISECT_CODEPAGE` | Fixture | The runtime default code page |
-| `ADV_BISECT_WORKER`, `ADV_BISECT_DATA`, `ADV_BISECT_BACKEND`, `ADV_BISECT_HASH_ITEM` | Fixture | Unset; child protocol set by the parent test |
 | `ADV_CODESIGN_IDENTITY` | Feature | Unset: `tools/macos/package.py` signs ad hoc |
 | `ADV_CONTROLLED_FAULT_CASE` | Fixture | Unset; set by the parent test |
 | `ADV_CPU_DIRECT_PROBE` | Fixture | Unset; set by the parent test |
 | `ADV_DEBUG` | Diagnostic | Off; `1` serves the interactive debugger, as `adv-run --debug` |
-| `ADV_DETOURS_SOURCE` | Fixture | Unset: no local Detours checkout |
 | `ADV_DEVICE_HELPER` | Fixture | Unset; device tools require it when needed |
 | `ADV_DEVICE_TASK` | Fixture | `bud` (frame budget tool) |
 | `ADV_DLL_DRIVER_RUNNER` | Fixture | Unset: skip the runner check |
 | `ADV_ENGINE_BENCH_ENGINES` | Fixture | Both the interpreter and the platform engine |
 | `ADV_ENGINE_BENCH_SCALE` | Fixture | `100` percent of the default iterations (1 to 1000) |
 | `ADV_ENGINE_BENCH_WORKLOADS` | Fixture | All workloads |
-| `ADV_ERROR_MODE_NATIVE_TEST_CHILD` | Fixture | Unset; set by the parent test |
 | `ADV_FIXTURE_ENV_83F2` | Fixture | Set and cleared by the fixture |
 | `ADV_FIXTURE_OTHER_83F2` | Fixture | Deliberately undefined variable read by the fixture |
 | `ADV_FONT_DIR` | Feature | System font folders only |
@@ -93,14 +82,8 @@ Header macros, placeholder names in script examples and names read only to clear
 | `ADV_PRINTF_DIAG_PATH` | Diagnostic | No output |
 | `ADV_PRINTF_DIAG_WORDS` | Diagnostic | Empty filter; needs `ADV_PRINTF_DIAG_PATH` |
 | `ADV_PRIVACY_TERMS` | Diagnostic | The local `.privacy-terms`, if present |
-| `ADV_PRIVATE_ENV` | Fixture | Data in a self-written guest environment block only |
 | `ADV_SAMPLES` | Fixture | Unset: tests that need games skip |
-| `ADV_SECURE_COPY_ORACLE_CHILD` | Fixture | Unset; set by the parent test |
-| `ADV_SHELL_DPI_TEST_CHILD` | Fixture | Unset; set by the parent test |
 | `ADV_SHELL_LOG_TEST_CHILD` | Fixture | Unset; set by the parent test |
-| `ADV_STARTUP_API_MODE` | Fixture | The runtime default mode |
-| `ADV_STARTUP_GPU` | Fixture | Off |
-| `ADV_TEST_AUTHORED_EFFECT_FXO` | Fixture | None; skips the comparison with locally compiled output |
 | `ADV_TEST_FFMPEG` | Fixture | `ffmpeg` |
 | `ADV_TEST_GPU_BACKEND` | Fixture | Automatic; `vulkan` or `gles` |
 | `ADV_TEST_ISO` | Fixture | None; a read-only image must be given |
@@ -123,14 +106,13 @@ they exclude backend work and damage-history bookkeeping.
 | Option | Kind | Default |
 |---|---|---|
 | `--exe` | Feature | Required; also accepted as a positional argument |
+| `--wine` | Feature | Required: the Wine userland installation the game runs on |
+| `--wine-prefix` | Host path override | One prefix shared by every game, beside the data folder |
 | `--backend` | Diagnostic | `jit` (Tier 0 with the a64 translator); `interpreter` optional |
-| `--api-mode` | Diagnostic | `discovery`: unimplemented APIs return their derived failure and are reported; `strict` stops at the first, for acceptance |
 | `--no-time-skip` | Diagnostic | Absent: Ctrl time skip allowed when its conditions hold |
 | `--codepage` | Feature | `auto`: 936 for marked or mostly GB2312 executables, otherwise 932; `932` and `936` override |
 | `--headless` | Fixture | Off: a host window is shown |
-| `--codec` | Diagnostic | `native`; `guest` for comparison |
 | `--codec-kernels` | Diagnostic | `native`; `guest` or `verify` compare Vorbis kernels and admitted Theora decoders |
-| `--codec-signatures` | Feature | Vorbis x87/SSE signatures; external records use `---`. Theora family fingerprints are bundled independently |
 | `--audio` | Feature | Off; headless runs simulate the device. To become default or be removed with the normal-play audio baseline |
 | `--hidden` | Fixture | Off |
 | `--gpu-software` | Diagnostic | Off: the adapter is chosen automatically |
@@ -148,10 +130,8 @@ they exclude backend work and damage-history bookkeeping.
 | `--screenshot` | Diagnostic | No output |
 | `--trace` | Diagnostic | No output |
 | `--host-profile` | Diagnostic | No output |
-| `--survey` | Diagnostic | No output |
 | `--schedule-profile` | Diagnostic | No output |
 | `--auto-dialog-ms` | Fixture | No automatic dialog choice |
-| `--self-test-input` | Fixture | Off |
 | `--profile` | Diagnostic | Off |
 | `--frame-budget` | Diagnostic | Off; headless with one guest worker only |
 | `--control-stdin` | Diagnostic | Off |
@@ -163,8 +143,7 @@ Wine sessions apply the shared engine and diagnostic settings, shader capabiliti
 font files, family substitutions and smoothing, frame and time limits, and audio output selection.
 `--report` includes whole-module Vorbis provider selection and callback/decoding counters.
 It writes the final stop reason and full guest exit code even on a guest failure;
-control snapshots retain `running` until execution stops. CPU, host and scheduling profiles use
-the same writers as the built-in stack. Ctrl acceleration uses the shared live key policy for
+control snapshots retain `running` until execution stops. Ctrl acceleration uses the shared live key policy for
 eligible delays and stays disabled once a child process has been created.
 `--cdrom` uses the shared ISO9660/Joliet reader. The program directory takes the first
 unmounted letter from D: onward. `--install-dir` redirects `C:\Program Files` to the

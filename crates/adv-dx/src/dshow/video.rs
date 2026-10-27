@@ -1,5 +1,5 @@
 //! The system video renderer owns COM state; the device owns pixels and composition.
-//! Runtime assembly resolves USER geometry without a dependency on adv-win32.
+//! Runtime assembly resolves USER geometry through the Wine stack's window owner.
 use super::{
     filter::{self, INPUT, Role},
     *,

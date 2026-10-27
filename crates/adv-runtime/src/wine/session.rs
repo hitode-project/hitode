@@ -433,7 +433,7 @@ fn new_machine(
     machine.set_execution_budget(None);
     machine.sys.poll_wake = Some(wake.clone());
     adv_unix::install(&mut machine);
-    Session::install_codec_kernels(&mut machine, crate::codec_kernels::Mode::Native);
+    Session::install_codec_kernels(&mut machine, adv_drv::codec::Mode::Native);
     machine.ext.insert(audio.clone());
     adv_drv::media::set_wake(&mut machine.ext, wake.clone());
     super::install(&mut machine, prefix, config.width, config.height)?;
@@ -588,13 +588,7 @@ fn serve(machine: &mut Machine<Cpu>) -> Result<bool, String> {
 
 impl Session {
     /// Select the shell's codec mode in `prepare`, before images are mapped.
-    pub fn install_codec_kernels(machine: &mut Machine<Cpu>, mode: crate::codec_kernels::Mode) {
-        use crate::codec_kernels::Mode;
-        let mode = match mode {
-            Mode::Guest => adv_drv::codec::Mode::Guest,
-            Mode::Verify => adv_drv::codec::Mode::Verify,
-            Mode::Native => adv_drv::codec::Mode::Native,
-        };
+    pub fn install_codec_kernels(machine: &mut Machine<Cpu>, mode: adv_drv::codec::Mode) {
         adv_drv::codec::install(&mut machine.ext, mode);
     }
 

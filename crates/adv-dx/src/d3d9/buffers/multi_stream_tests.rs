@@ -206,12 +206,29 @@ fn cpu_multistream_fixed_input_preserves_offsets_indices_uv_pixels_and_rejection
         vec![255, 255, 255, 255],
     ]
     .concat();
-    let Outcome::Return(texture) =
-        super::super::super::loading::create(&mut env(&mut m), device, 2, 2, 21, 1, image)
-    else {
-        panic!("small upload must complete");
-    };
-    assert!(texture != 0 && texture & 0x80000000 == 0);
+    let output = slot(&mut m);
+    okay(invoke(
+        &mut m,
+        "IDirect3DDevice9::CreateTexture",
+        &[device, 2, 2, 1, 0, 21, 1, output, 0],
+    ));
+    let texture = m.cpu.read_u32(output).unwrap();
+    let locked = alloc(&mut env(&mut m), 8).unwrap();
+    okay(invoke(
+        &mut m,
+        "IDirect3DTexture9::LockRect",
+        &[texture, 0, locked, 0, 0],
+    ));
+    let pitch = m.cpu.read_u32(locked).unwrap();
+    let bits = m.cpu.read_u32(locked + 4).unwrap();
+    for (row, pixels) in image.chunks(8).enumerate() {
+        m.cpu.write(bits + row as u32 * pitch, pixels).unwrap();
+    }
+    okay(invoke(
+        &mut m,
+        "IDirect3DTexture9::UnlockRect",
+        &[texture, 0],
+    ));
     okay(invoke(
         &mut m,
         "IDirect3DDevice9::SetTexture",

@@ -161,9 +161,7 @@ impl Session {
                         keys,
                         execution_sender,
                     ),
-                    None => {
-                        crate::run_execution(options, Some(worker), wake, keys, execution_sender)
-                    }
+                    None => crate::run_execution(options, worker, wake, keys, execution_sender),
                 }))
                 .unwrap_or_else(|_| Err("execution worker panicked".into()));
             let _ = tx.push(result);

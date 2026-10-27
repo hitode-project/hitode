@@ -11,7 +11,6 @@ pub mod constants;
 mod device;
 #[cfg(feature = "gpu")]
 pub mod gpu;
-pub mod image;
 pub mod media;
 pub mod midi;
 pub mod mixer;
@@ -56,5 +55,3 @@ pub struct DeviceClock {
     pub consumed_frames: u64,
     pub queued_frames: u32,
 }
-
-pub mod gdiplus;

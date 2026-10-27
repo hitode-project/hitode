@@ -17,13 +17,16 @@ use adv_dx::interop::{DcCreated, DcFinished, DcSurface, MemoryDc};
 use adv_machine::{Env, Machine, Outcome};
 use adv_pe::{ImportModule, ImportName};
 
-use crate::graphics::{guest_memory, install_store};
+use crate::graphics::{Snapshot, Surfaces, guest_memory, install_store};
 
 pub use adv_drv::codec::vorbisfile;
 
 mod class;
 #[cfg(any(target_vendor = "apple", target_os = "android"))]
 pub mod session;
+/// Codec library acceleration on the image-mapping path.
+#[cfg(any(target_vendor = "apple", target_os = "android"))]
+pub use adv_drv::codec;
 mod sound;
 mod video;
 pub mod winmm;
@@ -203,8 +206,8 @@ fn allocator() -> adv_dx::interop::GuestAllocator {
     }
 }
 
-/// The old stack's Direct3D 9 assembly, with what it takes from USER and the
-/// Win32 heap answered on the Wine userland.
+/// The Direct3D 9 front's assembly, with what it takes from USER and the heap
+/// answered on the Wine userland.
 #[cfg(feature = "gpu")]
 fn d3d9_provider() -> adv_dx::d3d9::SurfaceProvider {
     adv_dx::d3d9::SurfaceProvider {
@@ -228,8 +231,41 @@ fn d3d9_provider() -> adv_dx::d3d9::SurfaceProvider {
         },
         completed: frame_completed,
         fast_forward: |_| false,
-        unpaced: |_| {},
-        ..crate::graphics::d3d9_provider()
+        insert: |ext, target| ext.get_mut::<Surfaces<Snapshot>>().insert_native(target),
+        target: |ext, id| ext.get::<Surfaces<Snapshot>>().native_target(id).cloned(),
+        remove: |ext, _, id| {
+            if ext.get_mut::<Surfaces<Snapshot>>().delete(id) {
+                Ok(())
+            } else {
+                Err("D3D9 surface identity no longer exists".into())
+            }
+        },
+        replace: |ext, id, target| {
+            ext.get_mut::<Surfaces<Snapshot>>()
+                .replace_native(id, target)
+                .map(|_| ())
+        },
+        present: |ext, id, damage, gpu| {
+            ext.get_mut::<Surfaces<Snapshot>>()
+                .present_native_rotating(id, damage, gpu)
+        },
+        present_copy: |ext, id, damage, gpu| {
+            use adv_device::gpu::Error;
+            let graphics = ext.get_mut::<Surfaces<Snapshot>>();
+            let target = graphics
+                .native_target(id)
+                .ok_or_else(|| Error::Invalid("COPY front surface no longer exists".into()))?;
+            let frame = gpu.present(&target.image, 0)?;
+            graphics
+                .publish_native_frame(id, frame, damage)
+                .map_err(Error::Invalid)
+        },
+        repeat: |ext, id| ext.get_mut::<Surfaces<Snapshot>>().repeat_native_frame(id),
+        presentation_serial: |ext| ext.get::<Surfaces<Snapshot>>().output_serial(),
+        vsync: |ext| {
+            ext.try_get::<std::sync::Arc<adv_sync::vsync::Vsync>>()
+                .and_then(|vsync| vsync.phase(std::time::Instant::now()))
+        },
     }
 }
 

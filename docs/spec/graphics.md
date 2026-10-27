@@ -2,7 +2,7 @@
 
 ID prefix: GFX
 
-This spec covers shared CPU compositing and the DirectDraw and Direct3D 9 API front ends. It includes capabilities, shaders, vertex input, samplers, buffers, caches, numerical behavior and Effects. `adv-dx` and the GPU renderer in `adv-device` implement them.
+This spec covers shared CPU compositing and the DirectDraw and Direct3D 9 API front ends. It includes capabilities, shaders, vertex input, samplers, buffers, caches and numerical behavior. `adv-dx` and the GPU renderer in `adv-device` implement them.
 
 ## DirectDraw
 
@@ -25,18 +25,6 @@ This spec covers shared CPU compositing and the DirectDraw and Direct3D 9 API fr
 
 **Rule**: SetColorKey MUST store one inclusive raw range per surface and key kind. Blt and BltFast with source keys MUST skip source pixels in range, comparing only color bits of 32-bit pixels.
 **Verification**: Test
-
-### GFX-BLIT-1 Alpha and color-key transfers
-
-**Rule**: MSIMG32 alpha and color-key transfers and GDI32 aliases MUST share DC mapping, clipping, surfaces, and format conversion. Alpha transfers MUST use premultiplied source colors. Invalid blends, source bounds, and overlapping same-surface rectangles MUST fail before pixel writes.
-**Verification**: Test
-**Basis**: [AlphaBlend](https://learn.microsoft.com/windows/win32/api/wingdi/nf-wingdi-alphablend), [BLENDFUNCTION](https://learn.microsoft.com/windows/win32/api/wingdi/ns-wingdi-blendfunction), and [TransparentBlt](https://learn.microsoft.com/windows/win32/api/wingdi/nf-wingdi-transparentblt).
-
-### GFX-BLIT-2 Gradient meshes
-
-**Rule**: Gradient meshes MUST interpolate 16-bit vertex colors through shared surfaces and DC clipping, ignoring vertex alpha. Invalid mesh indices and unsupported low-color dithering MUST fail before painting. Rectangles and triangles MUST use exclusive rectangle bounds and top-left triangle edges.
-**Verification**: Test
-**Basis**: [GradientFill](https://learn.microsoft.com/windows/win32/api/wingdi/nf-wingdi-gradientfill).
 
 ## Native programmable execution
 
@@ -175,13 +163,6 @@ Damage clipping remains a conservative region optimization under GFX-REC-4/5.
 
 **Rule**: Present boundaries MUST fall on host vsyncs, and a late Present MUST wait for the next one without repaying missed frames. At display rates within 1% of a whole multiple of the guest rate, on-time boundaries MUST be exactly that many vsyncs apart. Other rates MUST snap the guest's rational cadence to the nearest vsync after now.
 **Verification**: Test
-
-### GFX-PACE-2 Unpaced presents beyond the display rate
-
-**Rule**: An IMMEDIATE or occluded Present MUST count as a whole frame for the DEV-FRAME-9 frame cap. Fast-forward MUST bypass that cap.
-**Verification**: Test
-
-The cap holds only the presenting context's next empty PeekMessage, so Present itself still returns at once.
 
 ## Capabilities
 
@@ -344,34 +325,7 @@ Binding changes MUST NOT start speculative module preparation for transient shad
 **Rule**: Shader arithmetic MUST use f32 and preserve D3D9 reference behavior for special values, including zero multiplication, reciprocal zero, and logarithm zero.
 **Verification**: Test
 
-## Effects
-
-### GFX-EFFECT-1 Binary Effect
-
-**Rule**: Precompiled FXO Effects MUST preserve parameter, technique, pass, constant-table, preshader, and pass-state semantics. Effect input parsing MUST remain bounded on truncated or malformed data.
-**Verification**: Test
-
-### GFX-EFFECT-2 Effect boundaries
-
-**Rule**: HLSL source compilation, unsupported FXLC expressions, state managers, parameter blocks, and pools MUST fail explicitly. Version declarations MUST NOT hide these limits behind successful no-ops.
-**Verification**: Review — binary and preshader tests do not enumerate every unsupported Effect interface and source-compilation entry.
-
-### GFX-EFFECT-3 Effect state saving and device calls
-
-**Rule**: A saving Begin MUST record its technique's pass states into one block on first use, capture it later, and apply it at End. OnLostDevice and Release MUST release these blocks. Device and block calls MUST run on the host only while the live vtable entry is the published thunk.
-**Verification**: Test — the hooked and unhooked call gate and host constant upload. Block recording follows Wine's d3dx9 Effect and is checked by game runs.
-
-## D3DX and surface copies
-
-### GFX-D3DX-1 Empty texture correction
-
-**Rule**: `_29` and `_43` texture requirement checks and creation MUST correct dimensions, mip counts, and compatible integer formats using actual D3D9 capabilities. Optional requirement outputs MUST remain unchanged on correction failure. Created textures MUST share D3D9 COM identity, mip storage, locks, and release behavior.
-**Verification**: Test
-
-### GFX-D3DX-2 Matrix and Vec2 operations
-
-**Rule**: `_29` and `_43` math entries MUST share axis rotations and Vec2 transforms, reading inputs before writing overlapping outputs. Normals MUST ignore translation; coordinate transforms MUST divide by homogeneous W and return NaN for zero W.
-**Verification**: Test
+## Surface copies
 
 ### GFX-COPY-1 Texture destinations and RGBX
 

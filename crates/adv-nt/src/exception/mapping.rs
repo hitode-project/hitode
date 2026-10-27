@@ -1,5 +1,4 @@
-//! NT codes for precise x86 CPU stops; the new stack's copy of the
-//! adv-win32 mapping, which goes with that stack.
+//! NT codes for precise x86 CPU stops.
 //! Faults retain the stopped PC;
 //! breakpoint addresses/CONTEXT follow native x86's one-byte PC adjustment;
 //! Continuing execution always requires the guest handler's disposition.

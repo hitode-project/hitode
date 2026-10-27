@@ -2,7 +2,7 @@
 
 ID prefix: PROC
 
-This spec covers `adv-machine`, which schedules guest threads, owns time and dispatches callbacks, and the guest process family that `adv-runtime` runs. The family supports ordinary x86 `CreateProcessA/W` launch chains, including the suspended creation, remote import rewriting and resume that Microsoft Detours performs. [README.md](README.md) explains the format.
+This spec covers `adv-machine`, which schedules guest threads, owns time and dispatches callbacks, and the guest processes of a Wine session that `adv-runtime` runs. [README.md](README.md) explains the format.
 
 ## Machine
 
@@ -115,19 +115,9 @@ While time skipping is requested, ready polling contexts MUST retain PROC-CLOCK-
 
 ## Creation
 
-### PROC-CREATE-1 Publication gate
-
-**Rule**: A child MUST be admitted to scheduling only after the parent call writes both handles and `PROCESS_INFORMATION`. If the creation is cancelled or fails, the child MUST be reclaimed without running its TLS callbacks, DllMain or entry point.
-**Verification**: Test
-
 ### PROC-CREATE-2 Startup parameters
 
 **Rule**: `CreateProcessA/W` MUST copy the command line, ANSI or Unicode environment block, working directory and code page. The PEB parameters, `GetCommandLine` and CRT startup MUST read the same content.
-**Verification**: Test
-
-### PROC-CREATE-3 Suspended creation and injection
-
-**Rule**: Creation MUST map the executable and establish the main thread before resume, without calling guest TLS or DllMain. After resume, the loader MUST read the current import directory from the child's memory, including remote allocations.
 **Verification**: Test
 
 ### PROC-CREATE-4 Suspend counts and thread context
@@ -140,11 +130,6 @@ While time skipping is requested, ready polling contexts MUST retain PROC-CLOCK-
 ### PROC-MEM-1 Remote memory
 
 **Rule**: `VirtualAllocEx`, `VirtualFreeEx`, `VirtualProtectEx`, `VirtualQueryEx`, `ReadProcessMemory` and `WriteProcessMemory` MUST act on the target process. Outputs MUST be validated in the caller's address space. Writes MUST trigger the existing code invalidation.
-**Verification**: Test
-
-### PROC-MEM-2 Failures stay contained
-
-**Rule**: A failed operation MUST NOT change another process, leave a half-created object or skip code invalidation.
 **Verification**: Test
 
 ### PROC-HANDLE-1 Process and thread handles
@@ -167,33 +152,6 @@ While time skipping is requested, ready polling contexts MUST retain PROC-CLOCK-
 **Rule**: Process and thread handles MAY be inherited and duplicated across processes. Creation MUST fail when an inheritable handle has a type that is not shared across processes, and MUST NOT drop it silently.
 **Verification**: Review — no test marks a file or event handle inheritable.
 
-## Scheduling and failure
-
-### PROC-SCHED-1 Single process and family scheduling
-
-**Rule**: Before a child exists, `step()` MUST call the unsliced `Machine::run()`, and `step_for()` MUST use the caller's whole slice. Afterwards, the family MUST share one settled clock and rotate processes in short slices.
-**Verification**: Test
-
-### PROC-SCHED-2 Stable final results
-
-**Rule**: Exit and failure results MUST stay the same on later steps.
-**Verification**: Test
-
-### PROC-SCHED-3 Loader exit
-
-**Rule**: The exit of a launcher process MUST NOT end the session while a child lives. Display, input and reporting MUST move to the remaining child.
-**Verification**: Test
-
-### PROC-SCHED-4 Child failures
-
-**Rule**: An exception in a child MUST end only that child, and the parent MUST be able to read its final state. The native exception status MUST be kept. Missing emulator capabilities MUST report `STATUS_NOT_SUPPORTED`, not an access violation.
-**Verification**: Test
-
-### PROC-SCHED-5 Family reports
-
-**Rule**: The report MUST list each process with its PID, parent PID, image and final state. Missing APIs and acceptance eligibility MUST cover the whole family, including children that have exited.
-**Verification**: Test
-
 ## Devices
 
 ### PROC-DEV-1 Foreground frames
@@ -207,11 +165,6 @@ While time skipping is requested, ready polling contexts MUST retain PROC-CLOCK-
 **Verification**: Review — no single test runs GPU and audio work in two processes.
 
 ## Limits and scope
-
-### PROC-LIMIT-1 Bounded family
-
-**Rule**: A family MUST allow at most 8 live processes, 128 processes in total and 64 pending requests. One remote transfer MUST NOT exceed 64 MiB, an environment block 2 MiB, and inherited aliases 1024. Exceeding a limit MUST fail without publishing a new machine.
-**Verification**: Test
 
 ### PROC-LIMIT-2 Real-time scheduler only
 

@@ -1,6 +1,6 @@
 //! The iOS main loop: the wake descriptor and a deadline timer on the main
 //! CFRunLoop, and a display link publishing the vsync grid for guest pacing
-//! (PROC-CLOCK-4, DEV-FRAME-9).
+//! (PROC-CLOCK-4).
 use super::Driver;
 use objc2::rc::Retained;
 use objc2::runtime::NSObject;

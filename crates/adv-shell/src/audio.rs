@@ -1,33 +1,13 @@
 //! Opt-in device output; headless sessions never open an audio device.
-use adv_runtime::boot::Runtime;
-use std::time::{Duration, Instant};
-
 pub struct AudioOutput {
     #[cfg(host_view)]
     suspended: bool,
-    #[cfg(any(host_view, windows))]
+    #[cfg(host_view)]
     output: Option<adv_device::Output>,
 }
 
 impl AudioOutput {
-    pub fn new(enabled: bool, headless: bool, runtime: &Runtime) -> Self {
-        #[cfg(any(host_view, windows))]
-        {
-            Self::from_stream(enabled, headless, runtime.audio_stream())
-        }
-        #[cfg(not(any(host_view, windows)))]
-        {
-            let _ = runtime;
-            if enabled && !headless {
-                eprintln!(
-                    "audio: native output is available on Windows and macOS; continuing with simulated PCM"
-                );
-            }
-            Self {}
-        }
-    }
-
-    #[cfg(any(host_view, windows))]
+    #[cfg(host_view)]
     pub fn from_stream(enabled: bool, headless: bool, stream: adv_device::AudioStream) -> Self {
         Self {
             output: (enabled && !headless).then(|| adv_device::Output::new(stream)),
@@ -57,7 +37,7 @@ impl AudioOutput {
         if self.suspended {
             return;
         }
-        #[cfg(any(host_view, windows))]
+        #[cfg(host_view)]
         if let Some(output) = self.output.as_mut() {
             output.update();
             if output.is_running() {
@@ -67,16 +47,8 @@ impl AudioOutput {
         }
     }
 
-    pub fn wait_duration(&self, delay: Option<Duration>) -> Option<Duration> {
-        #[cfg(any(host_view, windows))]
-        let wake = self.output.as_ref().and_then(adv_device::Output::next_wake);
-        #[cfg(not(any(host_view, windows)))]
-        let wake = None;
-        cap_delay(delay, wake, Instant::now())
-    }
-
     pub fn json(&self) -> String {
-        #[cfg(any(host_view, windows))]
+        #[cfg(host_view)]
         {
             use std::sync::atomic::Ordering::Relaxed;
             let Some(output) = &self.output else {
@@ -113,33 +85,5 @@ impl AudioOutput {
                 metrics.capture_dropped.load(Relaxed)
             )
         }
-        #[cfg(not(any(host_view, windows)))]
-        {
-            "{\"device_requested\": false, \"device_running\": false}".into()
-        }
-    }
-}
-
-fn cap_delay(delay: Option<Duration>, wake: Option<Instant>, now: Instant) -> Option<Duration> {
-    wake.map_or(delay, |at| {
-        let remaining = at.saturating_duration_since(now);
-        Some(delay.map_or(remaining, |delay| delay.min(remaining)))
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn device_maintenance_caps_unbounded_waits_without_delaying_guest_deadlines() {
-        let now = Instant::now();
-        let wake = Some(now + Duration::from_secs(1));
-        assert_eq!(cap_delay(None, wake, now), Some(Duration::from_secs(1)));
-        assert_eq!(
-            cap_delay(Some(Duration::from_millis(16)), wake, now),
-            Some(Duration::from_millis(16))
-        );
-        assert_eq!(cap_delay(None, Some(now), now), Some(Duration::ZERO));
-        assert_eq!(cap_delay(None, None, now), None);
     }
 }

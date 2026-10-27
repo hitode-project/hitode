@@ -31,8 +31,6 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 png = "0.17"
 
 [dev-dependencies]
-# Only the old-stack d3dx9, dinput and dxdiag tests use this personality.
-adv-win32 = { path = "../adv-win32" }
 iced-x86 = { version = "1.21", default-features = false, features = ["std", "code_asm"] }
 pollster = "0.4"
 

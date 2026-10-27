@@ -453,31 +453,22 @@ pub(super) fn upload_failed(env: &mut Env<'_>, operation: &Operation, cancelled:
     }
 }
 #[win32(d3d9,name="IDirect3DDevice9::GetRenderTargetData",level=implement)]
-fn transfer_detached(
+pub(super) fn transfer_detached(
     env: &mut Env<'_>,
     this: GuestPtr<()>,
     source: GuestPtr<()>,
     destination: GuestPtr<()>,
 ) -> Outcome {
-    read_target(env, this, source, destination, true)
-}
-pub(super) fn transfer(
-    env: &mut Env<'_>,
-    this: GuestPtr<()>,
-    source: GuestPtr<()>,
-    destination: GuestPtr<()>,
-) -> Outcome {
-    read_target(env, this, source, destination, false)
+    read_target(env, this, source, destination)
 }
 fn read_target(
     env: &mut Env<'_>,
     this: GuestPtr<()>,
     source: GuestPtr<()>,
     destination: GuestPtr<()>,
-    detach: bool,
 ) -> Outcome {
     if let Some(outcome) = settle(env, destination.addr(), move |env| {
-        read_target(env, this, source, destination, detach)
+        read_target(env, this, source, destination)
     }) {
         return outcome;
     }
@@ -485,7 +476,7 @@ fn read_target(
         && recording::has_work(env, owner)
     {
         return recording::barrier(env, owner, recording::Reason::Readback, move |env| {
-            read_target(env, this, source, destination, detach)
+            read_target(env, this, source, destination)
         });
     }
     let Some(owner) = com(env)
@@ -530,7 +521,7 @@ fn read_target(
         return Outcome::Return(INVALID);
     };
     let format = dst.desc.Format;
-    let detach = detach && dst.container.is_none();
+    let detach = dst.container.is_none();
     let Some(length) = format::length(format, dst.desc.Width, dst.desc.Height) else {
         return Outcome::Return(INVALID);
     };

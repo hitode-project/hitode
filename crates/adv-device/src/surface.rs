@@ -1300,7 +1300,6 @@ pub struct Surfaces<P: Presenter> {
     damage_history: DamageHistory,
     software_source: Option<u32>,
     /// Damaged and total pixels of the last software publication.
-    software_coverage: (u64, u64),
     software_pending: Option<SoftwareFrame>,
     #[cfg(feature = "gpu")]
     native_surfaces: BTreeMap<u32, NativeSurface>,
@@ -1365,7 +1364,6 @@ impl<P: Presenter> Surfaces<P> {
             surfaces: BTreeMap::new(),
             damage_history: DamageHistory::default(),
             software_source: None,
-            software_coverage: (0, 0),
             software_pending: None,
             #[cfg(feature = "gpu")]
             native_surfaces: BTreeMap::new(),
@@ -2004,10 +2002,6 @@ impl<P: Presenter> Surfaces<P> {
             Ok(false)
         }
     }
-    /// Damaged and total pixels of the last software publication.
-    pub fn software_coverage(&self) -> (u64, u64) {
-        self.software_coverage
-    }
     pub fn flush(&mut self, m: &dyn SurfaceMemory, reason: FlushReason) -> Result<bool, String> {
         let Some(pending) = self.software_pending.take() else {
             return Ok(false);
@@ -2042,11 +2036,7 @@ impl<P: Presenter> Surfaces<P> {
         if reset {
             self.damage_history.clear();
         }
-        // The frame cap measures the guest's drawing, so it keeps the declared area.
-        self.software_coverage = (
-            damage.iter().map(|r| u64::from(r.w) * u64::from(r.h)).sum(),
-            u64::from(s.width) * u64::from(s.height),
-        );
+        let frame_pixels = u64::from(s.width) * u64::from(s.height);
         let damage = match latest {
             Some(previous) if !reset => {
                 refine_damage(s, m, &previous.pixels, previous.pitch, &damage)?
@@ -2066,7 +2056,7 @@ impl<P: Presenter> Surfaces<P> {
             .iter()
             .map(|r| u64::from(r.w) * u64::from(r.h))
             .sum::<u64>();
-        self.stats.frame_pixels += self.software_coverage.1;
+        self.stats.frame_pixels += frame_pixels;
         self.damage_history.push((self.stats.presentations, damage));
         // Retire our latest reference before recycling the writer's private slot.
         self.retained_frame = None;

@@ -47,7 +47,6 @@ To find out whether your game runs, import it and try. If it will not start, fre
 | macOS (Apple silicon) | Supported | |
 | Android (ARMv8-A, 64-bit) | Supported | |
 | iOS / iPadOS | Supported | Not yet tested on iPad or on iOS 26 and later. Needs sideloading; enable JIT with LocalDevVPN or a similar tool, or performance may be too low to play. See [the iOS guide](docs/ios.zh-CN.md) (Chinese) |
-| Windows x64 | Debugging only | Not optimized for performance |
 
 ## Download
 

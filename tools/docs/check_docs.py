@@ -35,7 +35,6 @@ ALLOWED = {
     "docs/maintaining.md",
     "tools/abi/README.md",
     "tools/android/README.md",
-    "tools/compat/README.md",
     "tools/cpu/README.md",
     "tools/fixtures/README.md",
     "tools/fixtures/dll-driver.md",

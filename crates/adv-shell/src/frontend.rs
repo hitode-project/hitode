@@ -1,8 +1,6 @@
 //! UI presents the native game view. The execution worker owns the guest machine.
 //! Completed raw frames and input events cross bounded ownership channels.
 use crate::{performance, window};
-#[cfg(not(host_view))]
-use adv_runtime::Snapshot;
 use adv_runtime::{DialogSet, FrameConsumer, FrameProducer, MenuBar, MenuKey};
 use adv_sync::{WakeEvent, input::KeyState, spsc};
 use std::sync::{
@@ -14,13 +12,10 @@ use std::{cell::RefCell, rc::Rc};
 /// Owner of the native menu and dialog projection the sinks are given to.
 #[cfg(target_os = "macos")]
 type SinkTarget = window::Projection;
-#[cfg(not(host_view))]
-type SinkTarget = window::Window;
 
 enum Request {
     Hide,
     Minimize,
-    Input(u32, u32, u32),
 }
 enum Delivery {
     Input(window::Event),
@@ -28,7 +23,7 @@ enum Delivery {
     AndroidInput(crate::window::android_epoch::Stamp, window::Event),
     Present(u64, Duration, Instant),
     Pump(Duration, Instant),
-    #[cfg(any(host_view, all(windows, feature = "gpu")))]
+    #[cfg(host_view)]
     Native(performance::NativePresentation),
 }
 const INPUT_CAPACITY: usize = 4096;
@@ -39,7 +34,7 @@ pub struct Worker {
     input_epoch: Arc<window::android_epoch::Generation>,
     #[cfg(mobile)]
     keys: Arc<KeyState>,
-    #[cfg(any(host_view, all(windows, feature = "gpu")))]
+    #[cfg(host_view)]
     pub(crate) gpu: Option<adv_device::gpu::Gpu>,
     /// The host frame clock's vsync grid, handed to guest refresh pacing.
     #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -80,7 +75,7 @@ pub struct Ui {
     frames: Option<FrameConsumer>,
     menus: adv_sync::mailbox::Consumer<MenuBar>,
     dialogs: adv_sync::mailbox::Consumer<DialogSet>,
-    #[cfg(any(host_view, all(windows, feature = "gpu")))]
+    #[cfg(host_view)]
     native: Option<crate::native_gpu::UiPresenter>,
     keys: Arc<KeyState>,
     execution_wake: WakeEvent,
@@ -107,7 +102,7 @@ pub fn channel(wake: WakeEvent, keys: Arc<KeyState>) -> Result<(Worker, Ui), Str
             input_epoch: input_epoch.clone(),
             #[cfg(mobile)]
             keys: keys.clone(),
-            #[cfg(any(host_view, all(windows, feature = "gpu")))]
+            #[cfg(host_view)]
             gpu: None,
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             vsync: None,
@@ -146,7 +141,7 @@ pub fn channel(wake: WakeEvent, keys: Arc<KeyState>) -> Result<(Worker, Ui), Str
             frames: Some(frames_rx),
             menus: menus_rx,
             dialogs: dialogs_rx,
-            #[cfg(any(host_view, all(windows, feature = "gpu")))]
+            #[cfg(host_view)]
             native: None,
             keys,
             execution_wake: wake,
@@ -176,7 +171,7 @@ impl Worker {
     pub fn take_frames(&mut self) -> FrameProducer {
         self.frames.take().expect("frame producer installed once")
     }
-    #[cfg(any(not(mobile), test))]
+    #[cfg(test)]
     pub fn pump(&mut self, performance: &mut performance::Performance) -> Vec<window::Event> {
         std::iter::from_fn(|| self.next_input(performance)).collect()
     }
@@ -195,7 +190,7 @@ impl Worker {
                 }
                 Delivery::Present(serial, elapsed, at) => performance.present(serial, elapsed, at),
                 Delivery::Pump(elapsed, at) => performance.pump(elapsed, at),
-                #[cfg(any(host_view, all(windows, feature = "gpu")))]
+                #[cfg(host_view)]
                 Delivery::Native(stats) => performance.native(stats),
             }
         }
@@ -213,13 +208,6 @@ impl Worker {
     pub fn minimize(&mut self) {
         let _ = self.requests.push(Request::Minimize);
         self.ui_wake.signal();
-    }
-    pub fn post_input(&mut self, message: u32, wparam: u32, lparam: u32) -> Result<(), String> {
-        self.requests
-            .push(Request::Input(message, wparam, lparam))
-            .map_err(|_| "UI request queue is full")?;
-        self.ui_wake.signal();
-        Ok(())
     }
 }
 impl Ui {
@@ -266,7 +254,7 @@ impl Ui {
         self.repaint = true;
         self.wake.signal();
     }
-    #[cfg(any(host_view, all(windows, feature = "gpu")))]
+    #[cfg(host_view)]
     pub(crate) fn native(
         &mut self,
         presenter: crate::native_gpu::WindowPresenter,
@@ -415,7 +403,6 @@ impl Ui {
             match request {
                 Request::Hide => window.hide(),
                 Request::Minimize => window.minimize(),
-                Request::Input(m, w, l) => window.post_input(m, w, l)?,
             }
         }
         self.menu_changed |= self.menus.update();
@@ -539,120 +526,6 @@ impl Ui {
             execution_wake.signal();
             Ok(())
         }));
-    }
-    #[cfg(not(host_view))]
-    pub fn run<T>(
-        &mut self,
-        window: &mut window::Window,
-        done: &mut spsc::Consumer<T>,
-    ) -> Result<T, String> {
-        self.install_sinks(window);
-        let mut next = window.next_refresh();
-        #[cfg(not(host_view))]
-        let mut snapshot = Snapshot::default();
-        #[cfg(not(host_view))]
-        let mut candidate = Snapshot::default();
-        let mut repaint = false;
-        loop {
-            if let Some(result) = done.pop() {
-                return Ok(result);
-            }
-            while let Some(request) = self.requests.pop() {
-                match request {
-                    Request::Hide => window.hide(),
-                    Request::Minimize => window.minimize(),
-                    Request::Input(m, w, l) => window.post_input(m, w, l)?,
-                }
-            }
-            if self.menus.update() {
-                window.set_menu_bar(self.menus.current())?;
-            }
-            let had_dialogs = !self.dialogs.current().dialogs.is_empty();
-            if self.dialogs.update() {
-                if !had_dialogs && !self.dialogs.current().dialogs.is_empty() {
-                    // Physical focus moves to the native controls; their key
-                    // releases no longer pass through the canvas procedure.
-                    self.keys.release_all();
-                }
-                window.set_dialogs(self.dialogs.current())?;
-            }
-            let started = Instant::now();
-            let events = window.pump();
-            repaint |= self.pump_events(events, started)?;
-            #[cfg(any(host_view, all(windows, feature = "gpu")))]
-            if let Some(native) = &mut self.native {
-                let completed = native.poll()?;
-                if let Some(completed) = completed {
-                    self.metric(Delivery::Native(completed.stats));
-                    repaint |= window.native_canvas(completed.rendered.canvas)?;
-                    window.set_video_cursor_regions(completed.rendered.cursor_regions);
-                    if matches!(
-                        completed.rendered.result,
-                        crate::native_gpu::DrawResult::Presented
-                    ) {
-                        self.metric(Delivery::Present(
-                            completed.rendered.serial,
-                            completed.elapsed,
-                            completed.at,
-                        ));
-                    }
-                }
-                let native = self.native.as_mut().unwrap();
-                let dimensions = window.native_client_size()?;
-                if Instant::now() >= next
-                    && (native.has_update() || repaint)
-                    && native.schedule(dimensions, repaint)?
-                {
-                    repaint = false;
-                    next = window.next_refresh();
-                }
-                let delay = (!native.in_flight()
-                    && (native.has_update() || repaint)
-                    && dimensions.0 != 0
-                    && dimensions.1 != 0)
-                    .then(|| next.saturating_duration_since(Instant::now()));
-                window.wait_with_wake(delay, Some(&self.wake))?;
-                continue;
-            }
-            #[cfg(not(host_view))]
-            {
-                let frames = self.frames.as_mut().expect("software UI owns its consumer");
-                if Instant::now() >= next && (frames.has_update() || repaint) {
-                    let present_started = Instant::now();
-                    let updated = frames.update();
-                    let cursor_regions = updated
-                        .then(|| frames.current().video_cursor_regions())
-                        .transpose()?;
-                    let changed = if updated {
-                        frames.current().snapshot(&mut candidate)?;
-                        let changed = snapshot.width != candidate.width
-                            || snapshot.height != candidate.height
-                            || snapshot.bgra != candidate.bgra;
-                        std::mem::swap(&mut snapshot, &mut candidate);
-                        changed
-                    } else {
-                        false
-                    };
-                    if (changed || repaint) && !snapshot.bgra.is_empty() {
-                        window.present(&snapshot)?;
-                        // Metrics travel with input, but alone never wake an idle guest.
-                        self.metric(Delivery::Present(
-                            snapshot.frames,
-                            present_started.elapsed(),
-                            Instant::now(),
-                        ));
-                    }
-                    if let Some(regions) = cursor_regions {
-                        window.set_video_cursor_regions(Arc::from(regions));
-                    }
-                    repaint = false;
-                    next = window.next_refresh();
-                }
-                let delay = (self.frames.as_ref().unwrap().has_update() || repaint)
-                    .then(|| next.saturating_duration_since(Instant::now()));
-                window.wait_with_wake(delay, Some(&self.wake))?;
-            }
-        }
     }
     pub fn wake(&self) -> WakeEvent {
         self.wake.clone()
@@ -807,7 +680,7 @@ mod tests {
             Duration::from_millis(1),
             Instant::now(),
         ));
-        #[cfg(any(host_view, all(windows, feature = "gpu")))]
+        #[cfg(host_view)]
         ui.metric(Delivery::Native(performance::NativePresentation {
             consumed: 2,
             uploads: 1,
@@ -818,7 +691,7 @@ mod tests {
         assert!(!wake.interrupt_flag().load(Ordering::Acquire));
         let mut performance = performance::Performance::default();
         assert!(worker.pump(&mut performance).is_empty());
-        #[cfg(any(host_view, all(windows, feature = "gpu")))]
+        #[cfg(host_view)]
         {
             performance.reset(1);
             assert!(performance.json().contains("\"software_uploads\": 1"));

@@ -1,111 +1,10 @@
-//! Read-only views of either runtime stack for the interactive debugger.
+//! Read-only views of the runtime for the interactive debugger.
 //! They only read guest state, so they are safe at any guest boundary.
 use adv_cpu::Engine;
 use adv_cpu::backend::{Backend, Guest, GuestExt, Reg};
 
-use crate::boot::Runtime;
-
 /// Stack words a scan reads at most.
 const STACK_SCAN_WORDS: u32 = 16384;
-
-impl<B: Backend> Runtime<B> {
-    /// `module+offset` for a guest address, with the nearest export when
-    /// it is close enough to name the function.
-    pub fn guest_place(&self, address: u32) -> String {
-        let Some((_, module)) = adv_os::modules(&self.machine.ext)
-            .iter()
-            .find(|(_, module)| module.contains(address))
-        else {
-            return format!("{address:#010x}");
-        };
-        let offset = address - module.base;
-        let near = module
-            .exports_by_name
-            .iter()
-            .filter_map(|(name, target)| match target {
-                adv_pe::ExportTarget::Rva(rva) if *rva <= offset => Some((offset - rva, name)),
-                _ => None,
-            })
-            .min();
-        match near {
-            Some((distance, name)) if distance < 0x400 => {
-                format!("{}+{offset:#x} ({name}+{distance:#x})", module.name)
-            }
-            _ => format!("{}+{offset:#x}", module.name),
-        }
-    }
-
-    /// Loaded modules: base, size, kind and name.
-    pub fn modules_report(&self) -> String {
-        let mut modules: Vec<_> = adv_os::modules(&self.machine.ext)
-            .iter()
-            .map(|(_, m)| (m.base, m.size, format!("{:?}", m.kind), m.name.clone()))
-            .collect();
-        modules.sort();
-        modules
-            .iter()
-            .map(|(base, size, kind, name)| format!("{base:#010x} {size:#010x} {kind:<8} {name}"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
-    /// Capability gaps the guest hit: unavailable and missing APIs, stub
-    /// calls, message boxes and failed dynamic lookups.
-    pub fn api_gaps_report(&self) -> String {
-        let Some(api) = self.api_diagnostics() else {
-            return "no API diagnostics".into();
-        };
-        let mut rows = vec![format!(
-            "unavailable ({} distinct, {} unrecorded):",
-            api.warnings.len(),
-            api.unrecorded_warnings
-        )];
-        let mut warnings: Vec<_> = api.warnings.iter().collect();
-        warnings.sort_by(|a, b| b.1.cmp(a.1));
-        for ((name, reason), count) in warnings {
-            rows.push(format!("  {count:>8} {name}: {reason}"));
-        }
-        rows.push(format!("missing ({}):", api.gaps.len()));
-        for (name, count) in &api.gaps {
-            rows.push(format!("  {count:>8} {name}"));
-        }
-        rows.push(format!("stub calls: {}", api.stub_calls));
-        for call in api.recent_stubs.iter().rev().take(16) {
-            rows.push(format!(
-                "  [{}] {}!{} from {}",
-                call.context,
-                call.module,
-                call.name,
-                self.guest_place(call.caller)
-            ));
-        }
-        rows.push(format!("message boxes: {}", api.message_box_count));
-        for call in &api.message_boxes {
-            rows.push(format!(
-                "  [{}] {} from {}: {:?} {:?}",
-                call.context,
-                call.api,
-                self.guest_place(call.caller),
-                call.caption,
-                call.text
-            ));
-        }
-        rows.push(format!(
-            "failed dynamic lookups: {}",
-            api.dynamic_lookup_failure_count
-        ));
-        for failure in api.dynamic_lookup_failures.iter().rev().take(16) {
-            rows.push(format!(
-                "  [{}] {}!{} from {}",
-                failure.context,
-                failure.module,
-                failure.name,
-                self.guest_place(failure.caller)
-            ));
-        }
-        rows.join("\n")
-    }
-}
 
 /// Stack-specific observations used by the shared live debugger. Reads happen
 /// on the execution owner at guest boundaries.
@@ -284,34 +183,5 @@ pub trait DebugTarget {
             ));
         }
         Ok(rows.join("\n"))
-    }
-}
-
-impl<B: Backend> DebugTarget for Runtime<B> {
-    type Backend = B;
-    fn machine(&self) -> &adv_machine::Machine<B> {
-        &self.machine
-    }
-    fn guest_place(&self, address: u32) -> String {
-        self.guest_place(address)
-    }
-    fn modules_report(&self) -> String {
-        self.modules_report()
-    }
-    fn image_ranges(&self) -> Result<Vec<(u32, u32)>, String> {
-        Ok(adv_os::modules(&self.machine.ext)
-            .iter()
-            .filter(|(_, m)| m.kind == adv_os::module::ModuleKind::Image)
-            .map(|(_, m)| (m.base, m.size))
-            .collect())
-    }
-    fn contexts_report(&self) -> String {
-        self.contexts_report()
-    }
-    fn api_gaps_report(&self) -> String {
-        self.api_gaps_report()
-    }
-    fn report(&self) -> String {
-        self.report()
     }
 }

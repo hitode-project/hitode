@@ -47,8 +47,10 @@ fn empty_graph_preserves_identity_state_enumeration_and_event_contract() {
     std::fs::remove_dir_all(root).unwrap();
     assert_eq!(bytes.len(), 50 * 4);
     let words: Vec<_> = bytes
-        .chunks_exact(4)
-        .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|word| u32::from_le_bytes(*word))
         .collect();
     let mut expected = vec![0, 0, 0];
     for _ in 0..8 {
