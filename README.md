@@ -14,7 +14,10 @@
 
 How many steps does it take to put an elephant in a fridge? Open the door, put it in, close the door. Hitode wants playing a visual novel on a Mac or a mobile device to take three steps as well: pick the game folder, press Start, play.
 
-No port and no setup: the original exe, its DLLs and translation patches run as they are, with the x86 code executed directly on ARM.
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/requirements-dark.svg">
+  <img src="docs/images/requirements-light.svg" width="760" alt="System requirements from a game box, corrected by hand: Windows 98/Me/2000/XP becomes macOS, iOS and Android; Pentium III becomes ARM64; DirectX 9.0c becomes Metal and Vulkan; installing from the CD-ROM becomes picking a folder and pressing Start.">
+</picture>
 
 ## Features
 
@@ -30,7 +33,7 @@ No port and no setup: the original exe, its DLLs and translation patches run as 
 
 **Player**
 
-For now Hitode ships a simple player: a launcher that manages the library (with [VNDB](https://vndb.org/) metadata and play time), backs up saves and keeps per-game settings; upscaling filters such as Anime4K and CuNNy; and controls adapted to mobile devices and the Mac.
+For now Hitode ships a simple player: a launcher that manages the library (with [VNDB](https://vndb.org/) metadata and play time) and keeps per-game settings; upscaling filters such as Anime4K and CuNNy; and controls adapted to mobile devices and the Mac.
 
 <p>
 <a href="docs/images/launcher-desktop-light.webp"><picture>
@@ -70,7 +73,7 @@ Hitode has two parts: a **runtime** that runs Windows programs, and a **player**
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/architecture-dark.svg">
-  <img src="docs/images/architecture-light.svg" width="760" alt="Architecture: the original game runs in one Hitode process. Host-native code runs the experience (audio, video, graphics), the system (NT kernel, Wine server, drivers) and execution (x86 to ARM64 JIT, native bodies); Wine covers the long tail. Hitode runs on macOS, iOS and Android.">
+  <img src="docs/images/architecture-light.svg" width="760" alt="Architecture: the original game and Hitode share one process and run on several threads. Host-native code runs the experience (audio, video, graphics), the system (NT kernel, Wine server, drivers) and execution (x86 to ARM64 JIT, native bodies); Wine covers the long tail. Hitode runs on macOS, iOS and Android.">
 </picture>
 
 The approach follows console emulators: the game's own code runs unchanged, and Hitode provides the "hardware" it expects, namely a subset of Windows, graphics, audio and video devices, time and threads.
@@ -83,7 +86,7 @@ The runtime also runs without the launcher. `adv-run` is its command-line entry 
 
 ## How it compares
 
-| | Kirikiroid2, ONScripter and similar | Winlator, Wine and similar | Hitode |
+| | Kirikiroid2, ONScripter and similar | Winlator, CrossOver and similar | Hitode |
 |---|---|---|---|
 | Games | Specific engines | Most Windows programs | 32-bit visual novel engines |
 | Needs a port | Often | No | No |
@@ -111,7 +114,7 @@ Feedback and contributions are welcome:
 - **Game problems**: use the "game issue" template, naming the game and what happens; the report the launcher saves helps. Search for the game first, and reply there if it is already reported.
 - **Player (launcher UI, new features)**: the launcher is still simple, which makes it the easiest place to start. Issues and pull requests are welcome.
 - **Runtime: engine and game support**: changes go into the shared Windows behavior, never workarounds for a single game. Each behavior implemented helps every game that uses it, so supporting the next game keeps getting cheaper.
-- **Runtime: performance**: optimizations of the CPU, devices and presentation are welcome, with a focus on ARM64.
+- **Runtime: performance**: optimizations of the CPU, devices and presentation are welcome.
 - **Changes across layers or to a contract** (contracts are in [docs/spec/](docs/spec/README.md)): please open an issue to discuss first.
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) before you start. Do not commit files, screenshots or traces of commercial games.

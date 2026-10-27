@@ -14,7 +14,10 @@
 
 把大象装进冰箱要几步？打开冰箱，放进去，关上。Hitode 想让在 Mac 和移动设备上玩 galgame 也只要三步：选中游戏文件夹，点开始，玩。
 
-不需要移植版，也不需要配置：原版的 exe、DLL 和本地化补丁照常运行，x86 代码直接在 ARM 上执行。
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/requirements-dark.zh-CN.svg">
+  <img src="docs/images/requirements-light.zh-CN.svg" width="760" alt="游戏盒背面的运行环境表，被红笔改过：Windows 98/Me/2000/XP 改成 macOS、iOS 和 Android；Pentium III 改成 ARM64；DirectX 9.0c 改成 Metal 和 Vulkan；安装和插入光盘改成选文件夹，点开始。">
+</picture>
 
 ## 特性
 
@@ -30,7 +33,7 @@
 
 **播放器**
 
-目前我们提供一个简易的播放器：一个启动器管理游戏库（关联 [VNDB](https://vndb.org/) 信息、记录游玩时间）、备份存档和按游戏调整设置；画面可以用 Anime4K、CuNNy 等超分滤镜放大；适配移动设备和 Mac 的操作。
+目前我们提供一个简易的播放器：一个启动器管理游戏库（关联 [VNDB](https://vndb.org/) 信息、记录游玩时间）并可按游戏调整设置；画面可以用 Anime4K、CuNNy 等超分滤镜放大；适配移动设备和 Mac 的操作。
 
 <p>
 <a href="docs/images/launcher-desktop-light.zh-CN.webp"><picture>
@@ -70,7 +73,7 @@ Hitode 分为两部分：一个运行 Windows 程序的**运行时核心**，以
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/architecture-dark.zh-CN.svg">
-  <img src="docs/images/architecture-light.zh-CN.svg" width="760" alt="架构图：原版游戏运行在一个 Hitode 进程里。体验（音频、视频、图形）、系统（NT 内核、Wine server、驱动）和执行（x86 到 ARM64 JIT、原生函数体）由宿主原生实现，Wine 负责长尾兼容。Hitode 运行在 macOS、iOS 和 Android 上。">
+  <img src="docs/images/architecture-light.zh-CN.svg" width="760" alt="架构图：原版游戏和 Hitode 在同一个进程里，分多个线程运行。体验（音频、视频、图形）、系统（NT 内核、Wine server、驱动）和执行（x86 到 ARM64 JIT、原生函数体）由宿主原生实现，Wine 负责长尾兼容。Hitode 运行在 macOS、iOS 和 Android 上。">
 </picture>
 
 思路借鉴主机模拟器：游戏自己的代码原样运行，Hitode 只提供它期待的“硬件”，也就是 Windows 的一个子集、图形音频视频设备、时间和线程。
@@ -83,7 +86,7 @@ Windows 行为来自随 Hitode 一起构建的 Wine，它的模块作为 guest �
 
 ## 和其他方案的区别
 
-| | Kirikiroid2、ONScripter 等 | Winlator、Wine 等 | Hitode |
+| | Kirikiroid2、ONScripter 等 | Winlator、CrossOver 等 | Hitode |
 |---|---|---|---|
 | 支持的游戏 | 特定引擎 | 大多数 Windows 程序 | 32 位视觉小说引擎 |
 | 需要移植版 | 往往需要 | 不需要 | 不需要 |
@@ -111,7 +114,7 @@ cargo build --release -p adv-run
 - **游戏问题**：用 issue 里的“游戏问题”模板，写明哪款游戏、什么现象；能附上启动器保存的报告更好。提交前先搜一下游戏名，已有就在那里回复。
 - **播放器（启动器界面、新功能）**：启动器目前还很简易，这是门槛最低的入口，欢迎直接提 issue 或 PR。
 - **核心：引擎和游戏适配**：修改放进通用的 Windows 行为里，不针对单个游戏绕过。每实现一项行为，所有用到它的游戏都会受益，适配下一个游戏的成本会越来越低。
-- **核心：性能调优**：欢迎 CPU、设备和画面呈现方面的优化，重点是 ARM64。
+- **核心：性能调优**：欢迎 CPU、设备和画面呈现方面的优化。
 - **跨层或改变契约的改动**（契约见 [docs/spec/](docs/spec/README.md)）：请先开 issue 讨论。
 
 动手前请先读 [CONTRIBUTING.md](CONTRIBUTING.md)。请勿提交商业游戏的文件、截图或 trace。
