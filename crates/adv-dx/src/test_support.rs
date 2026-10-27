@@ -5,13 +5,12 @@ use adv_abi::{Conv, Env, Outcome, Registry};
 use adv_cpu::backend::{Backend, GuestExt};
 use adv_machine::{Machine, Wait, layout::teb};
 use adv_os::{
-    Heaps, Modules, OsConfig, Vfs,
+    Heaps, OsConfig, Vfs,
     com::{ClassFactories, Iid},
     vfs::FileObj,
 };
 
 pub fn install<B: Backend>(machine: &mut Machine<B>) {
-    machine.ext.get_or_default::<Modules>();
     let mut heaps = Heaps::default();
     heaps.process_heap = heaps.create(&mut machine.cpu, &mut machine.sys.vm).unwrap();
     machine.ext.insert(heaps);

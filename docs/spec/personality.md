@@ -86,11 +86,6 @@ This spec covers the Windows identity the guest sees. It includes implementation
 **Rule**: Personality diagnostics MUST distinguish rejected probes, reviewed calls, stub calls, and structural mismatches. Rejected names MUST be bounded to 256 entries with explicit dropped counts.
 **Verification**: Review — the complete personality report and its 256-name boundary lack a dedicated end-to-end test.
 
-### PERS-EXPORT-10 Mode contracts
-
-**Rule**: An implementation MAY declare, per scalar parameter, the values it handles as Windows 7 does. A survey MUST report each constant argument outside such a contract, marking calls that discard the result. It MUST list constant arguments to parameters without a contract.
-**Verification**: Test
-
 ## Windows identity and native services
 
 ### PERS-PROFILE-7 ANSI code page selection
@@ -109,5 +104,7 @@ Typed adapters MAY borrow their complete readable argument span for decoding. Th
 
 ### PERS-ABI-2 Layer ownership
 
-**Rule**: PE parsing MUST belong to `adv-pe`, loading policy to `adv-os`, and platform API behavior to its personality front end. Device implementations MUST NOT depend on personality crates.
+**Rule**: PE parsing MUST belong to `adv-pe`, loading policy to `adv-nt`, and platform API behavior to its personality front end. Device implementations MUST NOT depend on personality crates.
 **Verification**: Check — Cargo dependencies and `tools/layering/check_layers.py` enforce the layer direction.
+
+Withdrawn: PERS-EXPORT-10

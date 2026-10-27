@@ -635,23 +635,6 @@ fn normalize_unc(p: &str) -> String {
     result
 }
 
-impl crate::FileSource for Vfs {
-    fn absolute_path(&self, path: &str) -> String {
-        self.normalize(path)
-    }
-    fn read(&self, path: &str) -> Option<Vec<u8>> {
-        if self.is_optical_path(path) {
-            use std::io::Read;
-            let mut file = self.open_optical_file(path).ok()?;
-            let mut bytes = Vec::new();
-            file.read_to_end(&mut bytes).ok()?;
-            return Some(bytes);
-        }
-        let p = self.lookup(path)?;
-        p.is_file().then(|| std::fs::read(p).ok()).flatten()
-    }
-}
-
 /// Flush an explicitly requested durable file barrier, including drive caches.
 pub fn sync_file(file: &std::fs::File) -> std::io::Result<()> {
     #[cfg(target_os = "macos")]

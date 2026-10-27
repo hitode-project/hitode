@@ -700,34 +700,6 @@ fn audio_bindings_are_recognized_by_name() {
     ));
 }
 
-#[test]
-// spec: PERS-EXPORT-10
-fn mode_contracts_name_declared_scalar_parameters() {
-    let mut registry = Registry::default();
-    registry.accept("KERNEL32.dll", "SetFilePointer", "dwMoveMethod", |m| m <= 2);
-    let accepts = registry
-        .accepts("kernel32.dll", "SetFilePointer", "dwMoveMethod")
-        .unwrap();
-    assert!(accepts(2) && !accepts(3));
-    assert!(
-        registry
-            .accepts("kernel32.dll", "SetFilePointer", "lDistanceToMove")
-            .is_none()
-    );
-    for (name, param) in [
-        ("SetFilePointer", "lpDistanceToMoveHigh"),
-        ("SetFilePointer", "dwMode"),
-    ] {
-        let declared = std::panic::catch_unwind(|| {
-            Registry::default().accept("kernel32.dll", name, param, |_| true)
-        });
-        assert!(
-            declared.is_err(),
-            "{param} is not a declared scalar parameter"
-        );
-    }
-}
-
 // spec: PERS-ABI-1, PERS-EXPORT-6
 #[test]
 fn fixed_byte_arrays_retain_extent_and_cannot_be_called_or_resized_as_pointer_cells() {

@@ -326,11 +326,6 @@ Preparation MUST validate the compressed stream completely before publishing the
 
 ## Persistence
 
-### HOST-SAVE-1 Registry file
-
-**Rule**: The host MUST write the registry to a temporary file, sync it and atomically replace the old file. A failed write MUST report the error and keep the old content.
-**Verification**: Test
-
 ### HOST-SAVE-2 Guest file semantics
 
 **Rule**: Guest saves MUST keep Windows per-write file semantics. The host MUST NOT add transactions to guest files or truncate the guest exit path.
@@ -385,7 +380,7 @@ Installer state MUST use the active stack's backing directory for the guest C dr
 **Rule**: Shipped files MUST NOT contain developer home, checkout or temporary build paths, including native helpers and archive members.
 **Verification**: Test
 
-Withdrawn: HOST-AND-1, HOST-AND-2, HOST-AND-3, HOST-AND-4, HOST-AND-5, HOST-AND-6, HOST-AND-7, HOST-AND-8, HOST-AND-9, HOST-AND-10, HOST-AND-11, HOST-SES-9
+Withdrawn: HOST-AND-1, HOST-AND-2, HOST-AND-3, HOST-AND-4, HOST-AND-5, HOST-AND-6, HOST-AND-7, HOST-AND-8, HOST-AND-9, HOST-AND-10, HOST-AND-11, HOST-SES-9, HOST-SAVE-1
 
 ### HOST-DAMAGE-1 Software texture uploads
 

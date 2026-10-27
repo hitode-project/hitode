@@ -31,7 +31,7 @@ The workspace is layered. Each layer may depend only on the layers below it, and
 | Host shell | `adv-shell`, `apps/adv-run`, `apps/adv-launcher`, `apps/adv-jit-helper` | Host windows, input, audio output, platform lifecycle, reports | Compatibility logic |
 | Assembly | `adv-runtime` | Wine sessions: wiring the Wine userland, the native device fronts and devices | API behavior |
 | Device fronts | `adv-dx` | Parameters, observable behavior and object state of the DirectX COM fronts | Drawing, mixing, decoding |
-| System services | `adv-os` | Heaps, virtual file system, COM activation and NLS tables the native fronts still use; its loader, synthetic images and registry are not used by the player | |
+| System services | `adv-os` | Heaps, virtual file system, COM activation, NLS tables and host key mapping for native fronts | |
 | ABI | `adv-abi`, `adv-abi-macros` | Signatures, calling conventions, argument decoding, registration, stubs, API diagnostics, COM identities and vtables; native computation contracts, adaptation proposals and admission proofs | API behavior and native computation |
 | NT platform | `adv-nt` | The NT services under Wine's PE modules in the Wine userland port: image mapping, process startup, the system call and Unix call dispatchers, the server protocol client, boundary counters, and the code identity of distribution modules with the native bodies it admits | Windows behavior above the NT interface |
 | Wine server | `adv-wineserver` | Wine's server built in process for the Wine userland port ([#58](https://github.com/hitode-project/hitode/issues/58), [docs/spec/wine.md](docs/spec/wine.md)): handles, namespace, registry and timers, resumed by its caller with time from its caller | Waiting, time, host processes and signals |

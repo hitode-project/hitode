@@ -2,18 +2,13 @@
 
 ID prefix: WIN32
 
-This spec covers the Win32 state the shared crates still own: image rebasing, loader records, heaps, storage, message text and font metrics. `adv-pe`, `adv-os` and `adv-device` implement them.
+This spec covers the Win32 state the shared crates still own: image rebasing, heaps, storage, message text and font metrics. `adv-pe`, `adv-os` and `adv-device` implement them.
 
-## Images and loader state
+## Images
 
 ### WIN32-IMAGE-1 Atomic rebasing
 
 **Rule**: Rebasing MUST validate the header and entire relocation table before modifying the image. Success MUST publish the actual ImageBase while retaining the parsed preferred base. Without relocations, absolute addresses MUST remain unchanged.
-**Verification**: Test
-
-### WIN32-IMAGE-5 LDR publication
-
-**Rule**: Load and memory lists MUST place NTDLL after the executable and before ordinary DLLs; initialization order MUST place NTDLL first. Later publication MUST preserve record addresses, reference counts, and other modules' relative order.
 **Verification**: Test
 
 ## Shared objects
@@ -56,3 +51,5 @@ This spec covers the Win32 state the shared crates still own: image rebasing, lo
 
 **Rule**: ANSI widths and kerning MUST use the selected charset and device-provided default glyph. Wide outline metrics MUST preserve their own native short-buffer rules. Portable wide metrics MUST take first and last characters from the Unicode cmap, and break and default characters from OS/2 usFirstCharIndex.
 **Verification**: Test
+
+Withdrawn: WIN32-IMAGE-5
