@@ -218,29 +218,23 @@ impl Translator<'_> {
             // differs.
             self.emit(fmov_from_v(X, X2, v(n)));
             if !self.x87_narrow(n) {
-                let (exact, flagged) = (self.asm.label(), self.asm.label());
-                self.emit_all(&[vumov(3, X16, v(n), 1), lsl_imm(X, X17, X16, 1)]);
-                self.asm.cbz(X, false, X17, exact);
-                // Inexact needs rounding to nearest and PE masked.
-                self.emit(and_imm(W, X17, X8, 0xc00));
-                self.asm.cbz(W, true, X17, bail);
-                self.emit(and_imm(W, X17, X8, u64::from(PE)));
-                self.asm.cbz(W, false, X17, bail);
                 self.emit_all(&[
-                    orr_imm(W, X13, X13, u64::from(PE)),
+                    vumov(3, X16, v(n), 1),
+                    lsl_imm(X, X17, X16, 1),
+                    cmp_imm(X, X17, 0, false),
+                    cset(W, X3, Cond::Ne),
                     eor(X, X17, X16, X2, Lsl, 0),
-                    lsr_imm(X, X17, X17, 63),
-                    bfi(W, X13, X17, 9, 1),
+                    lsr_imm(X, X7, X17, 63),
                 ]);
-                self.asm.b(flagged);
-                self.asm.bind(exact);
-                self.clear_c1();
-                self.asm.bind(flagged);
+                self.store_rounding(width, false, bail);
+                self.store_flags(bail);
             } else {
                 self.clear_c1();
             }
         } else {
-            self.store_rounding(integer, bail);
+            if integer {
+                self.store_rounding(width, true, bail);
+            }
             // The sticky double: the top 53 bits of the value, the lowest
             // ORed with the rest. A low lane of the other sign takes one
             // unit off the high lane's magnitude.

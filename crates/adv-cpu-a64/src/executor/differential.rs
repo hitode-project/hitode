@@ -1958,6 +1958,99 @@ fn x87_loops_run_natively() {
     }
 }
 
+/// Directed stores of positive and negative extended products, including
+/// each width with and without a pop, stay native and preserve PE and C1.
+// spec: A64-FLAG-6, A64F-FP-1, A64F-FP-3, A64F-FP-7
+#[cfg(native)]
+#[test]
+fn x87_directed_store_loops_run_natively() {
+    for control in [0x173f, 0x1b3f, 0x1f3f] {
+        let mut a = CodeAssembler::new(32).unwrap();
+        let mut top = a.create_label();
+        for (at, value) in [(0x710, 1.0 + f64::EPSILON), (0x718, 1.0 - f64::EPSILON)] {
+            let bits = value.to_bits();
+            a.mov(dword_ptr(ebx + at), bits as u32).unwrap();
+            a.mov(dword_ptr(ebx + at + 4), (bits >> 32) as u32).unwrap();
+        }
+        a.mov(dword_ptr(ebx + 0x7f0), control).unwrap();
+        a.fninit().unwrap();
+        a.fldcw(word_ptr(ebx + 0x7f0)).unwrap();
+        a.mov(ecx, 50).unwrap();
+        a.lea(edi, ptr(ebx + 0x800)).unwrap();
+        a.set_label(&mut top).unwrap();
+        a.mov(dword_ptr(ebx + 0x700), ecx).unwrap();
+        for (negative, at, source) in [
+            (false, 0, 0x710),
+            (true, 0x30, 0x710),
+            (false, 0x60, 0x718),
+            (true, 0x90, 0x718),
+        ] {
+            a.fild(dword_ptr(ebx + 0x700)).unwrap();
+            a.fmul(qword_ptr(ebx + source)).unwrap();
+            if negative {
+                a.fchs().unwrap();
+            }
+            // Keep each result and status word, including exact stores.
+            a.fst(dword_ptr(edi + at)).unwrap();
+            a.fnstsw(ax).unwrap();
+            a.mov(word_ptr(edi + at + 4), ax).unwrap();
+            a.fst(qword_ptr(edi + at + 8)).unwrap();
+            a.fnstsw(ax).unwrap();
+            a.mov(word_ptr(edi + at + 16), ax).unwrap();
+            a.fld(st0).unwrap();
+            a.fstp(dword_ptr(edi + at + 20)).unwrap();
+            a.fnstsw(ax).unwrap();
+            a.mov(word_ptr(edi + at + 24), ax).unwrap();
+            a.fstp(qword_ptr(edi + at + 28)).unwrap();
+            a.fnstsw(ax).unwrap();
+            a.mov(word_ptr(edi + at + 36), ax).unwrap();
+        }
+        a.add(edi, 0xc0).unwrap();
+        a.dec(ecx).unwrap();
+        a.jnz(top).unwrap();
+        a.nop().unwrap();
+        let code = a.assemble(u64::from(CODE)).unwrap();
+        let mut state = CpuState {
+            eip: CODE,
+            ..CpuState::default()
+        };
+        state.regs[3] = DATA;
+        state.regs[4] = STACK_TOP;
+        state.x87.set_control(control as u16);
+        let program = Program {
+            stop: CODE + code.len() as u32 - 1,
+            code,
+            data: vec![0; DATA_LEN],
+            state,
+        };
+        let (outcome, state, memory) = reference(&program, u64::MAX >> 1);
+        assert_eq!(outcome, RunOutcome::ReachedStop);
+        let mut executor = Executor::new(BASE, LEN).unwrap();
+        executor.native.as_mut().unwrap().first_visits = false;
+        load(executor.memory_mut(), &program);
+        executor.state = program.state.clone();
+        assert_eq!(executor.run(program.stop, u64::MAX >> 1).unwrap(), outcome);
+        assert_eq!(executor.state.regs, state.regs, "control {control:#x}");
+        assert_eq!(executor.state.x87, state.x87, "control {control:#x}");
+        assert_eq!(executor.state.mmx, state.mmx, "control {control:#x}");
+        assert!(
+            snapshot(executor.memory()) == memory,
+            "control {control:#x}"
+        );
+        for which in [0, 2] {
+            for (code, count) in executor.interpreted_forms(which) {
+                let mnemonic = format!("{:?}", code.mnemonic());
+                assert!(
+                    count == 0
+                        || !mnemonic.starts_with('F')
+                        || code.mnemonic() == iced_x86::Mnemonic::Fninit,
+                    "{code:?} left translated code {count} times ({which}), control {control:#x}"
+                );
+            }
+        }
+    }
+}
+
 /// Data on a code page: each store faults until the instruction is checked,
 /// then takes `access` without leaving translated code.
 // spec: A64-MEM-6, A64-MEM-7, A64-CTL-10

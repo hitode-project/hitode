@@ -449,7 +449,9 @@ impl Translator<'_> {
     fn x87_store(&mut self, width: u8, integer: bool, pop: bool, slow: Label) {
         self.read(0, X0, X1, slow);
         self.ordinary(X0, X1, slow);
-        self.store_rounding(integer, slow);
+        if integer {
+            self.store_rounding(width, true, slow);
+        }
         if integer || width == 4 {
             self.double(X0, X1, V0, Take::Sticky(X3), slow);
             self.store_sticky(width, integer, slow);
@@ -480,11 +482,11 @@ impl Translator<'_> {
                 add(X, X17, X17, X7, Lsl, 0),
                 add(X, X17, X17, X16, Lsl, 52),
                 orr(X, X2, X2, X17, Lsl, 0),
-                ubfx(X, X17, X17, 52, 11),
-                cmp_imm(W, X17, 0x7ff, false),
             ]);
-            self.asm.b_cond(Cond::Eq, slow);
             self.asm.bind(zero);
+            self.store_rounding(width, false, slow);
+            self.emit_all(&[ubfx(X, X17, X2, 52, 11), cmp_imm(W, X17, 0x7ff, false)]);
+            self.asm.b_cond(Cond::Eq, slow);
         }
         self.store_flags(slow);
         self.emit(msr_nzcv(X4));
@@ -496,9 +498,10 @@ impl Translator<'_> {
         }
     }
 
-    /// Takes the interpreter unless the rounding control is to nearest, or
-    /// toward zero for integers, whose control it leaves in w7. Uses w17.
-    fn store_rounding(&mut self, integer: bool, slow: Label) {
+    /// For integers, checks the control and leaves it in w7. For floats,
+    /// adjusts nearest x2 and its magnitude increment w7 when w3 is inexact.
+    /// Uses x16 and x17.
+    fn store_rounding(&mut self, width: u8, integer: bool, slow: Label) {
         self.emit(ubfx(W, X17, X8, 10, 2));
         if integer {
             let nearest = self.asm.label();
@@ -508,7 +511,22 @@ impl Translator<'_> {
             self.asm.bind(nearest);
             self.emit(mov(W, X7, X17));
         } else {
-            self.asm.cbz(W, true, X17, slow);
+            let done = self.asm.label();
+            self.asm.cbz(W, false, X17, done);
+            self.asm.cbz(W, false, X3, done);
+            let size = if width == 8 { X } else { W };
+            // Truncate the magnitude, then add a unit for down on a
+            // negative value or up on a positive one.
+            self.emit_all(&[
+                lsr_imm(size, X16, X2, u32::from(width) * 8 - 1),
+                sub(size, X2, X2, X7, Lsl, 0),
+                sub_imm(W, X17, X17, 1, false),
+                eor(W, X17, X17, X16, Lsl, 0),
+                cmp_imm(W, X17, 1, false),
+                cset(W, X7, Cond::Eq),
+                add(size, X2, X2, X7, Lsl, 0),
+            ]);
+            self.asm.bind(done);
         }
     }
 
@@ -548,15 +566,12 @@ impl Translator<'_> {
             ]);
             self.asm.b_cond(Cond::Hi, slow);
             self.asm.bind(zero);
-            self.emit_all(&[
-                unary(Unary::Narrow, V1, V0),
-                fmov_from_v(W, X2, V1),
-                ubfx(W, X16, X2, 23, 8),
-                cmp_imm(W, X16, 0xff, false),
-            ]);
-            self.asm.b_cond(Cond::Eq, slow);
+            self.emit_all(&[unary(Unary::Narrow, V1, V0), fmov_from_v(W, X2, V1)]);
             self.emit(unary(Unary::Widen, V1, V1));
             self.grew(V1, V0);
+            self.store_rounding(width, false, slow);
+            self.emit_all(&[ubfx(W, X16, X2, 23, 8), cmp_imm(W, X16, 0xff, false)]);
+            self.asm.b_cond(Cond::Eq, slow);
         }
     }
 
