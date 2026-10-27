@@ -36,7 +36,6 @@ pub(super) fn register(registry: &mut Registry) {
             name,
             conv: Conv::Stdcall { argc },
             handler,
-            env_leaf: None,
             level: ImplementationLevel::Implement,
         });
     }

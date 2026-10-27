@@ -699,4 +699,4 @@ mod instruction_trace_tests {
     include!("../../adv-cpu-core/src/instruction_trace/executor_tests.rs");
 }
 #[cfg(all(test, native))]
-mod leaf_tests;
+mod host_call_tests;

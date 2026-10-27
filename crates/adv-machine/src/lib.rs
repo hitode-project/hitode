@@ -11,12 +11,13 @@
 //!   the urgency of the event that woke it, never an engine-specific thread role.
 
 pub mod clock;
-mod env_leaf;
 pub mod exception;
 pub mod ext;
 pub mod frame_budget;
 pub mod frame_spin;
 mod guest_words;
+#[cfg(all(test, target_arch = "aarch64"))]
+mod host_call_tests;
 mod invocation;
 pub mod layout;
 mod leaf;
@@ -47,7 +48,6 @@ use adv_cpu::backend::{
 };
 
 pub use clock::{Clock, MAX_PASSIVE_STEP_US};
-pub use env_leaf::EnvLeafHandler;
 pub use ext::Ext;
 pub use guest_words::{GuestWord, GuestWordPool};
 use layout::*;
@@ -1681,6 +1681,31 @@ impl Dispatch<'_> {
         r
     }
 
+    /// The trap action for the result of an INT, which began in frame
+    /// `frame_before`.
+    fn action(
+        &mut self,
+        cpu: &mut dyn Guest,
+        res: Result<(), Parked>,
+        frame_before: u32,
+    ) -> TrapAction {
+        match res {
+            Ok(()) if self.yield_on_frame && self.sys.completed_frames != frame_before => {
+                // Return/Call has already committed its stack and continuation state.
+                // Parking here does not fabricate a Sleep or re-execute the host call.
+                self.parked = Some(Parked::HostYield {
+                    resume_eip: cpu.reg(Reg::Eip),
+                });
+                TrapAction::Park
+            }
+            Ok(()) => TrapAction::Continue,
+            Err(p) => {
+                self.parked = Some(p);
+                TrapAction::Park
+            }
+        }
+    }
+
     fn guest_return(&mut self, cpu: &mut dyn Guest) -> Result<(), Parked> {
         let eax = cpu.reg(Reg::Eax);
         let returned_sp = cpu.reg(Reg::Esp);
@@ -1732,83 +1757,22 @@ impl TrapHandler for Dispatch<'_> {
             .map_or_else(Vec::new, |admission| (admission.0)(pc, code))
     }
 
-    fn leaf_call(&self, pc: u32, word: u32) -> bool {
-        if self.sys.trace.enabled()
-            || self.sys.call_limit.is_some()
-            || !self.sys.thunks.is_thunk_page(pc)
+    fn host_thunk(&self, pc: u32, word: u32) -> Option<u32> {
+        // Only pristine thunk pairs; hooks that move the INT stay raw traps.
+        if !self.sys.thunks.is_thunk_page(pc)
             || !self.sys.thunks.is_thunk_page(pc.wrapping_sub(5))
+            || pc == self.sys.guest_return_entry
         {
-            return false;
+            return None;
         }
-        self.sys.thunks.transport_index(word).is_some_and(|index| {
-            let f = self.sys.thunks.get(index).f;
-            f.leaf.is_some() || f.env_leaf.is_some()
-        })
+        self.sys.thunks.transport_index(word)
     }
 
-    fn on_leaf(&mut self, cpu: &mut dyn Guest, pc: u32, word: u32) -> Option<u64> {
-        if !self.leaf_call(pc, word) {
-            return None;
-        }
-        let esp = cpu.reg(Reg::Esp).wrapping_add(4);
-        if self
-            .sys
-            .current_context()
-            .frames
-            .last()
-            .is_some_and(|frame| esp >= frame.stack)
-        {
-            return None;
-        }
-        if cpu.read_u32(cpu.reg(Reg::Esp)).ok() != Some(word) {
-            return None;
-        }
-        let index = self.sys.thunks.transport_index(word)?;
-        let binding = self.sys.thunks.get(index).f;
-        let old_esp = cpu.reg(Reg::Esp);
-        let old_edx = cpu.reg(Reg::Edx);
-        cpu.set_reg(Reg::Esp, esp);
-        self.sys.poll_observed = false;
-        let value = if let Some(handler) = binding.env_leaf {
-            handler(&mut Env {
-                context: self.sys.current,
-                cpu: &mut env_leaf::Cpu(cpu),
-                sys: self.sys,
-                ext: self.ext,
-                thunk: index,
-            })
-        } else {
-            Some(binding.leaf?(&mut LeafEnv::new(&mut Env {
-                context: self.sys.current,
-                cpu,
-                sys: self.sys,
-                ext: self.ext,
-                thunk: index,
-            })))
-        };
-        let Some(value) = value else {
-            cpu.set_reg(Reg::Esp, old_esp);
-            cpu.set_reg(Reg::Edx, old_edx);
-            self.sys.stats.leaf_abandons += 1;
-            self.sys.stats.leaf_abandon(index, &self.sys.thunks);
-            return None;
-        };
-        self.sys.recent.push(
-            self.sys.current,
-            index,
-            cpu.read_u32(cpu.reg(Reg::Esp)).unwrap_or(0),
-        );
-        let observed = std::mem::take(&mut self.sys.poll_observed);
-        let context = &mut self.sys.contexts[self.sys.current as usize];
-        let observation = observed || context.poll_peek_depth != 0;
-        context.progress.call(index, observation);
-        if !observation {
-            self.sys.poll_activity = self.sys.poll_activity.wrapping_add(1);
-        }
-        self.sys.host_calls += 1;
-        self.sys.stats.total.host_calls += 1;
-        self.sys.stats.leaf(index, &self.sys.thunks);
-        Some(value)
+    fn on_host_call(&mut self, cpu: &mut dyn Guest, thunk: u32) -> TrapAction {
+        let frame_before = self.sys.completed_frames;
+        cpu.set_reg(Reg::Esp, cpu.reg(Reg::Esp).wrapping_add(4));
+        let res = self.host_call(cpu, thunk);
+        self.action(cpu, res, frame_before)
     }
 
     fn redirect(&self, pc: u32) -> Option<(u32, &[u8])> {
@@ -1868,21 +1832,7 @@ impl TrapHandler for Dispatch<'_> {
                 }
             }
         };
-        match res {
-            Ok(()) if self.yield_on_frame && self.sys.completed_frames != frame_before => {
-                // Return/Call has already committed its stack and continuation state.
-                // Parking here does not fabricate a Sleep or re-execute the host call.
-                self.parked = Some(Parked::HostYield {
-                    resume_eip: cpu.reg(Reg::Eip),
-                });
-                TrapAction::Park
-            }
-            Ok(()) => TrapAction::Continue,
-            Err(p) => {
-                self.parked = Some(p);
-                TrapAction::Park
-            }
-        }
+        self.action(cpu, res, frame_before)
     }
 }
 
@@ -1963,7 +1913,6 @@ impl<B: Backend> Machine<B> {
             "process_entry",
             HostFn {
                 leaf: None,
-                env_leaf: None,
                 conv: Conv::Cdecl { argc: 0 },
                 handler: process_entry,
                 data: 0,

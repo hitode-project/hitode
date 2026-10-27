@@ -11,24 +11,20 @@ fn env(m: &mut Machine<adv_cpu::JitCpu>, thunk: u32) -> Env<'_> {
         thunk,
     }
 }
-fn leaf(f: &mut Fixture, name: &str, args: &[u32]) -> Option<u32> {
-    let registry = f.m.sys.thunks.resolver_mut::<Registry>().unwrap();
-    super::super::register(registry);
-    let target = f.m.resolve_import("d3d9.dll", name).unwrap();
-    let index = (target - adv_machine::layout::THUNK_BASE) / adv_machine::layout::THUNK_STRIDE;
+/// Whether the check registered for `name` finds the call with `args`
+/// changes nothing.
+fn unchanged(f: &mut Fixture, name: &str, args: &[u32]) -> bool {
     f.m.cpu.set_reg(Reg::Esp, 0x550000);
     f.m.cpu.write_u32(0x550000, 0).unwrap();
     for (n, &arg) in args.iter().enumerate() {
         f.m.cpu.write_u32(0x550004 + n as u32 * 4, arg).unwrap();
     }
-    let handler =
-        f.m.sys
-            .thunks
-            .get(index)
-            .f
-            .env_leaf
-            .expect("registered EnvLeaf");
-    handler(&mut env(&mut f.m, index)).map(|v| v as u32)
+    let check = if name.starts_with("IDirect3DStateBlock9::") {
+        state_block
+    } else {
+        binding
+    };
+    check(&mut env(&mut f.m, 0), name)
 }
 fn create(f: &mut Fixture, name: &str, mut args: Vec<u32>) -> u32 {
     let output = f.packet(0u32);
@@ -45,7 +41,7 @@ fn versions(f: &mut Fixture) -> [u64; 15] {
 
 #[test]
 // spec: GFX-REC-6, GFX-SHADER-3, GFX-SHADER-4
-fn binding_leaves_preserve_noops_switches_and_decline_final_releases_before_effects() {
+fn rebinding_changes_nothing_and_switches_run_the_setter() {
     let mut f = Fixture::new();
     f.m.ext
         .get_mut::<State>()
@@ -119,21 +115,18 @@ fn binding_leaves_preserve_noops_switches_and_decline_final_releases_before_effe
             a.extend_from_slice(&suffix);
             a
         };
-        assert_eq!(leaf(&mut f, &name, &args(a)), Some(0), "{name}");
-        let unchanged = versions(&mut f);
-        assert_eq!(leaf(&mut f, &name, &args(a)), Some(0));
-        assert_eq!(versions(&mut f), unchanged);
-        assert_eq!(leaf(&mut f, &name, &args(b)), Some(0));
+        assert!(!unchanged(&mut f, &name, &args(a)), "{name}");
+        f.okay(&name, &args(a));
+        assert!(unchanged(&mut f, &name, &args(a)), "{name}");
+        let before = versions(&mut f);
+        f.okay(&name, &args(a));
+        assert_eq!(versions(&mut f), before);
+        assert!(!unchanged(&mut f, &name, &args(b)));
+        f.okay(&name, &args(b));
         assert_eq!(release(&mut env(&mut f.m, 0), b), 0);
-        let unchanged = versions(&mut f);
-        assert_eq!(leaf(&mut f, &name, &args(b)), Some(0));
-        assert_eq!(leaf(&mut f, &name, &args(a)), None);
-        assert_eq!(versions(&mut f), unchanged);
-        assert!(
-            com(&env(&mut f.m, 0))
-                .get::<Payload>(&f.m.sys.objects, b)
-                .is_some()
-        );
+        assert!(unchanged(&mut f, &name, &args(b)));
+        // The switch releases the last reference through the setter.
+        assert!(!unchanged(&mut f, &name, &args(a)));
         f.okay(&name, &args(a));
         assert!(
             com(&env(&mut f.m, 0))
@@ -141,45 +134,34 @@ fn binding_leaves_preserve_noops_switches_and_decline_final_releases_before_effe
                 .is_none()
         );
     }
-    assert_eq!(
-        leaf(&mut f, "IDirect3DDevice9::SetFVF", &[d, 0x44]),
-        Some(0)
-    );
-    let unchanged = versions(&mut f);
-    assert_eq!(
-        leaf(&mut f, "IDirect3DDevice9::SetFVF", &[d, 0x44]),
-        Some(0)
-    );
-    assert_eq!(versions(&mut f), unchanged);
+    f.okay("IDirect3DDevice9::SetFVF", &[d, 0x44]);
+    assert!(unchanged(&mut f, "IDirect3DDevice9::SetFVF", &[d, 0x44]));
+    let before = versions(&mut f);
+    f.okay("IDirect3DDevice9::SetFVF", &[d, 0x44]);
+    assert_eq!(versions(&mut f), before);
     // Recording the current value must still capture membership.
     f.okay("IDirect3DDevice9::BeginStateBlock", &[d]);
-    assert_eq!(
-        leaf(&mut f, "IDirect3DDevice9::SetFVF", &[d, 0x44]),
-        Some(0)
-    );
+    assert!(!unchanged(&mut f, "IDirect3DDevice9::SetFVF", &[d, 0x44]));
+    f.okay("IDirect3DDevice9::SetFVF", &[d, 0x44]);
     let output = f.packet(0u32);
     f.okay("IDirect3DDevice9::EndStateBlock", &[d, output]);
     let block = f.m.cpu.read_u32(output).unwrap();
     f.okay("IDirect3DDevice9::SetFVF", &[d, 0x104]);
-    assert_eq!(
-        leaf(&mut f, "IDirect3DStateBlock9::Apply", &[block]),
-        Some(0)
-    );
+    f.okay("IDirect3DStateBlock9::Apply", &[block]);
     assert_eq!(device(&env(&mut f.m, 0), d).unwrap().fixed.fvf, 0x44);
 }
 
 #[test]
-// spec: GFX-REC-6
-fn redundant_zero_fvf_leaf_keeps_the_unavailable_result() {
+fn redundant_zero_fvf_keeps_the_unavailable_result() {
     let mut f = Fixture::new();
     let d = f.device;
     assert_eq!(device(&env(&mut f.m, 0), d).unwrap().fixed.fvf, 0);
-    assert_ne!(leaf(&mut f, "IDirect3DDevice9::SetFVF", &[d, 0]), Some(0));
+    assert!(!unchanged(&mut f, "IDirect3DDevice9::SetFVF", &[d, 0]));
 }
 
 #[test]
-// spec: GFX-REC-6, GFX-SHADER-4
-fn state_block_leaves_admit_safe_transfers_and_decline_snapshot_destruction() {
+// spec: GFX-SHADER-4
+fn state_blocks_equal_to_the_device_transfer_nothing() {
     let mut f = Fixture::new();
     let d = f.device;
     let tokens = f.packet([
@@ -202,56 +184,28 @@ fn state_block_leaves_admit_safe_transfers_and_decline_snapshot_destruction() {
         "IDirect3DDevice9::CreateVertexShader",
         vec![d, tokens],
     );
-    assert_eq!(
-        leaf(&mut f, "IDirect3DDevice9::SetVertexShader", &[d, a]),
-        Some(0)
-    );
+    f.okay("IDirect3DDevice9::SetVertexShader", &[d, a]);
     let output = f.packet(0u32);
     f.okay("IDirect3DDevice9::CreateStateBlock", &[d, 1, output]);
     let block = f.m.cpu.read_u32(output).unwrap();
-    assert_eq!(
-        leaf(&mut f, "IDirect3DStateBlock9::Capture", &[block]),
-        Some(0)
-    );
-    // A block equal to the device transfers nothing.
-    let unchanged = versions(&mut f);
+    f.okay("IDirect3DStateBlock9::Capture", &[block]);
+    let before = versions(&mut f);
     for name in ["Capture", "Apply"] {
         let name = format!("IDirect3DStateBlock9::{name}");
-        assert_eq!(leaf(&mut f, &name, &[block]), Some(0));
+        assert!(unchanged(&mut f, &name, &[block]), "{name}");
+        f.okay(&name, &[block]);
     }
-    assert_eq!(versions(&mut f), unchanged);
-    assert_eq!(
-        leaf(&mut f, "IDirect3DDevice9::SetVertexShader", &[d, b]),
-        Some(0)
-    );
-    assert_eq!(
-        leaf(&mut f, "IDirect3DStateBlock9::Apply", &[block]),
-        Some(0)
-    );
-    assert_eq!(release(&mut env(&mut f.m, 0), a), 0);
+    assert_eq!(versions(&mut f), before);
     f.okay("IDirect3DDevice9::SetVertexShader", &[d, b]);
-    let unchanged = versions(&mut f);
-    assert_eq!(
-        leaf(&mut f, "IDirect3DStateBlock9::Capture", &[block]),
-        None
-    );
-    assert_eq!(versions(&mut f), unchanged);
-    assert!(
-        com(&env(&mut f.m, 0))
-            .get::<Payload>(&f.m.sys.objects, a)
-            .is_some()
-    );
-    f.okay("IDirect3DStateBlock9::Capture", &[block]);
-    assert!(
-        com(&env(&mut f.m, 0))
-            .get::<Payload>(&f.m.sys.objects, a)
-            .is_none()
-    );
+    assert!(!unchanged(&mut f, "IDirect3DStateBlock9::Apply", &[block]));
+    f.okay("IDirect3DStateBlock9::Apply", &[block]);
+    let bound = device(&env(&mut f.m, 0), d).unwrap().shaders.vertex;
+    let a = com(&env(&mut f.m, 0)).identity::<Payload>(&f.m.sys.objects, a);
+    assert_eq!(bound, a);
 }
 
 #[test]
-// spec: GFX-REC-6
-fn managed_texture_leaf_declines_before_dirty_upload_and_admits_resident_noop() {
+fn managed_texture_rebinding_uploads_dirty_levels_and_skips_resident_ones() {
     let mut f = Fixture::new();
     f.m.ext
         .get_mut::<State>()
@@ -263,17 +217,15 @@ fn managed_texture_leaf_declines_before_dirty_upload_and_admits_resident_noop() 
         "IDirect3DDevice9::CreateTexture",
         vec![d, 2, 2, 1, 0, 21, 1],
     );
-    let before = versions(&mut f);
-    let commands = f.m.ext.get::<State>().frames.recorded_commands;
-    assert_eq!(
-        leaf(&mut f, "IDirect3DDevice9::SetTexture", &[d, 0, texture]),
-        None
-    );
-    assert_eq!(versions(&mut f), before);
-    assert_eq!(f.m.ext.get::<State>().frames.recorded_commands, commands);
+    assert!(!unchanged(
+        &mut f,
+        "IDirect3DDevice9::SetTexture",
+        &[d, 0, texture]
+    ));
     f.okay("IDirect3DDevice9::SetTexture", &[d, 0, texture]);
-    assert_eq!(
-        leaf(&mut f, "IDirect3DDevice9::SetTexture", &[d, 0, texture]),
-        Some(0)
-    );
+    assert!(unchanged(
+        &mut f,
+        "IDirect3DDevice9::SetTexture",
+        &[d, 0, texture]
+    ));
 }

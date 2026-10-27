@@ -1,3 +1,5 @@
+//! Guest D3D9 sequences give the same results through direct host calls
+//! as while traced.
 use super::*;
 use crate::d3d9::stretch::tests::Fixture;
 use adv_cpu::backend::{Guest, Reg, asm::Asm};
@@ -6,7 +8,7 @@ use std::time::{Duration, Instant};
 
 const CODE: u32 = 0x400000;
 const STACK: u32 = 0x550000;
-type Snapshot = (u128, Vec<u128>, adv_cpu::ArchitecturalState, Vec<u8>, u64);
+type Snapshot = (u128, Vec<u128>, adv_cpu::ArchitecturalState, Vec<u8>);
 
 #[derive(Default)]
 struct Evidence {
@@ -27,9 +29,7 @@ fn capture(env: &mut Env<'_>) -> Outcome {
         env.cpu.read(address, &mut memory[start..]).unwrap();
     }
     let evidence = env.ext.get_mut::<Evidence>();
-    evidence
-        .snapshots
-        .push((state, keys, cpu, memory, env.sys.stats.leaf_calls));
+    evidence.snapshots.push((state, keys, cpu, memory));
     // The second pass reuses these exact resource identities and thunk bytes.
     env.sys.trace = Trace::to_writer(Box::new(std::io::sink()));
     env.sys.trace.all = true;
@@ -53,7 +53,7 @@ fn fixture(traced: bool) -> Fixture {
     };
     state.provider.presentation_serial = |_| None;
     let registry = f.m.sys.thunks.resolver_mut::<Registry>().unwrap();
-    super::super::register(registry);
+    super::register(registry);
     registry.add("fixture.dll", "capture", Conv::Stdcall { argc: 0 }, capture);
     registry.add("fixture.dll", "next", Conv::Stdcall { argc: 0 }, |env| {
         Outcome::Return(u32::from(env.ext.get::<Evidence>().snapshots.len() < 2))
@@ -91,12 +91,6 @@ fn call(f: &mut Fixture, code: &mut Asm, name: &str, args: &[u32]) {
         code.push_imm(arg);
     }
     let index = (target - adv_machine::layout::THUNK_BASE) / adv_machine::layout::THUNK_STRIDE;
-    if name.contains("::") && name != "IDirect3DDevice9::Present" {
-        assert!(
-            f.m.sys.thunks.get(index).f.env_leaf.is_some(),
-            "missing leaf: {name}"
-        );
-    }
     let slot = CODE + 0xc00 + index * 4;
     f.m.cpu.write_u32(slot, target).unwrap();
     code.bytes.extend_from_slice(&[0xff, 0x15]);
@@ -109,7 +103,7 @@ fn run(f: &mut Fixture, code: Asm) {
         match f.m.run() {
             RunResult::Exited(0) => break,
             RunResult::Idle { .. } => {
-                super::super::pump(&mut f.m).unwrap();
+                super::pump(&mut f.m).unwrap();
                 f.wake.wait(Some(Duration::from_millis(1))).unwrap();
             }
             result => panic!("D3D9 guest sequence: {result:?}"),
@@ -118,9 +112,9 @@ fn run(f: &mut Fixture, code: Asm) {
     }
 }
 
-// spec: A64-CTL-12, GFX-REC-6, GFX-REC-1, GFX-REC-2
+// spec: A64-CTL-12, GFX-REC-1, GFX-REC-2
 #[test]
-fn d3d9_leaf_and_trap_match_state_command_keys_registers_stack_memory_and_present() {
+fn d3d9_direct_and_traced_calls_match_state_command_keys_registers_stack_memory_and_present() {
     let mut f = fixture(false);
     let this = f.device;
     f.okay("IDirect3DDevice9::SetFVF", &[this, 0x44]);
@@ -189,9 +183,7 @@ fn d3d9_leaf_and_trap_match_state_command_keys_registers_stack_memory_and_presen
         .map(|(i, (a, b))| (i, *a, *b))
         .collect();
     assert!(changes.is_empty(), "memory differences: {changes:?}");
-    assert_eq!(evidence.snapshots[0].4, evidence.snapshots[1].4);
     assert_eq!(evidence.snapshots[0].1.len(), 32);
-    assert!(evidence.snapshots[0].4 > 0);
     let images: Vec<_> = evidence
         .frames
         .iter()
@@ -201,12 +193,12 @@ fn d3d9_leaf_and_trap_match_state_command_keys_registers_stack_memory_and_presen
     assert_eq!(f.pixels(&images[0]), f.pixels(&images[1]));
 }
 
-// spec: A64-CTL-12, GFX-REC-6, GFX-REC-1
+// spec: A64-CTL-12, GFX-REC-1
 #[test]
-fn last_recording_slot_declines_before_effects_and_ordinary_flush_matches() {
-    let mut leaf = fixture(false);
-    let mut trap = fixture(true);
-    for f in [&mut leaf, &mut trap] {
+fn last_recording_slot_flushes_alike_through_direct_and_traced_calls() {
+    let mut direct = fixture(false);
+    let mut traced = fixture(true);
+    for f in [&mut direct, &mut traced] {
         let this = f.device;
         f.okay("IDirect3DDevice9::SetFVF", &[this, 0x44]);
         f.okay("IDirect3DDevice9::BeginScene", &[this]);
@@ -240,17 +232,16 @@ fn last_recording_slot_declines_before_effects_and_ordinary_flush_matches() {
         call(f, &mut code, "exit", &[]);
         run(f, code);
     }
-    assert!(leaf.m.sys.stats.leaf_abandons > 0);
-    assert_eq!(leaf.m.ext.get::<State>().frames.recorded_commands, 4096);
+    assert_eq!(direct.m.ext.get::<State>().frames.recorded_commands, 4096);
     assert_eq!(
-        leaf.m.ext.get::<State>().frames.flushes[recording::Reason::Limit as usize],
+        direct.m.ext.get::<State>().frames.flushes[recording::Reason::Limit as usize],
         1
     );
     assert_eq!(
-        leaf.m.cpu.capture_architecture().unwrap(),
-        trap.m.cpu.capture_architecture().unwrap()
+        direct.m.cpu.capture_architecture().unwrap(),
+        traced.m.cpu.capture_architecture().unwrap()
     );
-    let a = leaf.image(leaf.back);
-    let b = trap.image(trap.back);
-    assert_eq!(leaf.pixels(&a), trap.pixels(&b));
+    let a = direct.image(direct.back);
+    let b = traced.image(traced.back);
+    assert_eq!(direct.pixels(&a), traced.pixels(&b));
 }

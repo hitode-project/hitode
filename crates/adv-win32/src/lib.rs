@@ -28,7 +28,6 @@ pub mod personality;
 pub mod printf;
 mod printing;
 mod psapi;
-mod query_leaves;
 pub mod user32;
 pub mod util;
 mod vcomp;
@@ -233,7 +232,6 @@ pub fn register(reg: &mut Registry) {
     vcomp::register(reg);
     ntdll::register(reg);
     guest_code::install(reg);
-    query_leaves::install(reg);
 }
 
 /// `reg.add` for stdcall functions.

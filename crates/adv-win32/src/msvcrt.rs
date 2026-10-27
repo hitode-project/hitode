@@ -325,7 +325,6 @@ pub fn register(r: &mut Registry) {
             r.add(module, name, Conv::Cdecl { argc }, call);
         }
     }
-    file::leaves::register(r);
     crate::guest_code::install_crt(r);
 }
 /// Release thread-owned cells only after the existing DLL/TLS detach callbacks.

@@ -44,12 +44,11 @@ pub fn register(registry: &mut Registry) {
     midi::register(registry);
     error_text::register(registry);
     sound::register(registry);
-    registry.add_env_leaf(
+    registry.add(
         "winmm.dll",
         "timeGetTime",
         adv_abi::Conv::Stdcall { argc: 0 },
         get_time,
-        adv_machine::clock::tick_leaf,
     );
     for (name, argc, handler) in [
         ("timeGetDevCaps", 2, caps as adv_machine::Handler),

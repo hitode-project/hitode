@@ -183,16 +183,6 @@ pub(super) fn errno_address(env: &mut Env<'_>) -> GuestPtr<i32> {
     };
     GuestPtr::new(address)
 }
-fn errno_leaf(env: &mut Env<'_>) -> Option<u64> {
-    let module = crt_module(&env.sys.thunks.get(env.thunk).module);
-    let address = *env
-        .ext
-        .try_get::<CrtState>()?
-        .errno
-        .get(&(module.to_owned(), env.context))?;
-    Some((u64::from(adv_abi::leaf_edx(env)) << 32) | u64::from(address))
-}
-
 pub(super) fn invalid_set(env: &mut Env<'_>, handler: GuestPtr<u8>) -> GuestPtr<u8> {
     if env.ext.try_get::<CrtState>().is_none() {
         env.ext.insert(CrtState::default());
@@ -367,9 +357,6 @@ pub(super) fn register(reg: &mut Registry) {
         vc90_control87_2_ABI,
     ] {
         reg.register(api);
-        if api.name == "_errno" {
-            reg.set_env_leaf(api.module, api.name, errno_leaf);
-        }
     }
 }
 

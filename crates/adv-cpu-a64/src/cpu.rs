@@ -494,31 +494,31 @@ impl ExecutionTrap for Raw<'_> {
         self.handler.native_region(pc, code)
     }
 
-    fn leaf_call(&self, pc: u32, word: u32) -> bool {
-        self.handler.leaf_call(pc, word)
+    fn host_thunk(&self, pc: u32, word: u32) -> Option<u32> {
+        self.handler.host_thunk(pc, word)
     }
 
     fn redirect(&self, pc: u32) -> Option<(u32, &[u8])> {
         self.handler.redirect(pc)
     }
 
-    fn leaf(
+    fn host_call(
         &mut self,
         state: &mut CpuState,
         memory: &mut Memory,
-        pc: u32,
-        word: u32,
-    ) -> Option<u64> {
+        thunk: u32,
+    ) -> Result<bool, String> {
+        state.commit_mmx();
         let images = self.images;
-        self.handler.on_leaf(
+        let action = self.handler.on_host_call(
             &mut View {
                 state,
                 memory,
                 images,
             },
-            pc,
-            word,
-        )
+            thunk,
+        );
+        Ok(action == TrapAction::Park)
     }
 
     fn guest_time_us(&mut self) -> Option<u64> {

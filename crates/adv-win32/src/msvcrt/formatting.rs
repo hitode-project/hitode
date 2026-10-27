@@ -136,7 +136,6 @@ pub(super) fn register(registry: &mut Registry) {
                 } else {
                     Conv::CdeclVariadic { fixed: front.fixed }
                 },
-                env_leaf: None,
                 handler: buffer,
                 level: ImplementationLevel::Implement,
             });
@@ -149,7 +148,6 @@ pub(super) fn register(registry: &mut Registry) {
                 module,
                 name,
                 conv,
-                env_leaf: None,
                 handler: stream,
                 level: ImplementationLevel::Implement,
             });

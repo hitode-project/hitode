@@ -259,13 +259,8 @@ impl Snapshot {
         ids
     }
 }
-impl Snapshot {
-    pub(in crate::d3d9) fn binding_state(&self) -> (&Bindings, &buffers::Bindings, Option<Id>) {
-        (&self.shaders, &self.buffers, self.texture)
-    }
-}
-/// Completes a Capture or Apply that changes nothing, before any ABI work.
-pub(in crate::d3d9) fn leaf_noop(env: &mut Env<'_>, pointer: u32, _capture: bool) -> bool {
+/// Whether a Capture or Apply of the block at `pointer` transfers nothing.
+pub(in crate::d3d9) fn unchanged(env: &mut Env<'_>, pointer: u32, _capture: bool) -> bool {
     let Some(b) = block(env, pointer) else {
         return false;
     };
@@ -280,48 +275,6 @@ pub(in crate::d3d9) fn leaf_noop(env: &mut Env<'_>, pointer: u32, _capture: bool
         count_apply(env, 0);
     }
     true
-}
-pub(in crate::d3d9) fn admits_leaf(env: &Env<'_>, pointer: u32, capture: bool) -> bool {
-    let Some(b) = block(env, pointer) else {
-        return true;
-    };
-    let Some(Payload::Device(d)) = com(env).get_identity(&env.sys.objects, b.device) else {
-        return true;
-    };
-    if d.recording.is_some() || b.current(d) {
-        return true;
-    }
-    let mask = b.members(d);
-    if mask.dirty == 0 {
-        return true;
-    }
-    let s = b.snapshot.as_ref().unwrap();
-    // Only captured binding members can release storage.
-    let pairs = if capture {
-        changes(
-            &s.shaders,
-            &s.buffers,
-            s.texture,
-            (&d.shaders, &d.buffers, d.texture),
-            &mask,
-        )
-    } else {
-        changes(
-            &d.shaders,
-            &d.buffers,
-            d.texture,
-            (&s.shaders, &s.buffers, s.texture),
-            &mask,
-        )
-    };
-    // Public ownership guarantees that none of these releases frees guest storage.
-    pairs.iter().all(|(old, _)| {
-        old.is_none_or(|id| {
-            com(env)
-                .references(&env.sys.objects, id)
-                .is_some_and(|n| n > 0)
-        })
-    })
 }
 pub(in crate::d3d9) enum FixedKey {
     Fvf,
@@ -390,14 +343,11 @@ pub(in crate::d3d9) fn register(registry: &mut Registry) {
         block_add_ref_ABI,
         block_release_ABI,
         block_device_ABI,
-        adv_abi::Api {
-            env_leaf: Some(super::super::leaf_calls::state_block),
-            ..capture_ABI
-        },
-        adv_abi::Api {
-            env_leaf: Some(super::super::leaf_calls::state_block),
-            ..apply_ABI
-        },
+        super::super::unchanged::unless_unchanged!(
+            capture_ABI,
+            super::super::unchanged::state_block
+        ),
+        super::super::unchanged::unless_unchanged!(apply_ABI, super::super::unchanged::state_block),
         create_ABI,
         begin_ABI,
         end_ABI,
@@ -1248,21 +1198,16 @@ mod tests {
         assert_eq!(capture(&mut env, block_this), 0);
         for _ in 0..3 {
             assert_eq!(fixed::set_render(&mut env, this, 14, 0), 0);
-            assert!(admits_leaf(&env, block_pointer, false));
             assert_eq!(apply(&mut env, block_this), 0);
             assert_eq!(device(&env, pointer).unwrap().fixed.render[&14], 0);
             assert_eq!(fixed::set_render(&mut env, this, 22, 1), 0);
-            assert!(admits_leaf(&env, block_pointer, false));
             assert_eq!(apply(&mut env, block_this), 0);
             assert_eq!(device(&env, pointer).unwrap().fixed.render[&22], 3);
-            assert!(admits_leaf(&env, block_pointer, true));
             assert_eq!(capture(&mut env, block_this), 0);
         }
         assert_eq!(fixed::set_render(&mut env, this, 22, 2), 0);
-        assert!(admits_leaf(&env, block_pointer, true));
         assert_eq!(capture(&mut env, block_this), 0);
         assert_eq!(fixed::set_render(&mut env, this, 22, 1), 0);
-        assert!(admits_leaf(&env, block_pointer, false));
         assert_eq!(apply(&mut env, block_this), 0);
         assert_eq!(device(&env, pointer).unwrap().fixed.render[&22], 2);
     }

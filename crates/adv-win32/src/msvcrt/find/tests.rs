@@ -47,6 +47,8 @@ impl Fixture {
                 std::process::id(),
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));
+        // A reused process ID would otherwise inherit an earlier run's files.
+        let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("game")).unwrap();
         std::fs::create_dir_all(root.join("data/overlay")).unwrap();
         std::fs::write(root.join("game/alpha.dat"), b"old").unwrap();

@@ -4,7 +4,7 @@
 //! A register is loaded from `CpuState` when the unit first reads it.
 //! XMM writes immediately update `CpuState`, except inside integer pixel loops.
 //! MMX writes mark d8-d15 dirty;
-//! control edges outside those loops, helpers, leaf calls, checked accesses
+//! control edges outside those loops, helpers, host calls, checked accesses
 //! and x87/EMMS entries
 //! spill them to MMX and the aliased x87 significand and exponent (0xffff).
 //! Pixel-loop exits also publish dirty XMM registers. Direct faults record
@@ -1591,7 +1591,7 @@ mod tests {
             Features { flagm: false },
             0,
             Stubs {
-                leaf: 0,
+                call: 0,
                 exit: 0,
                 dispatch: 0,
                 lookup: 0,
@@ -1601,7 +1601,7 @@ mod tests {
                 interpret: 0,
                 fault: 0,
             },
-            &|_, _| false,
+            &|_, _| None,
             &|_| None,
             &|_, _| Vec::new(),
             0x037f,

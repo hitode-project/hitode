@@ -1,7 +1,7 @@
 //! Locale-independent Wine 11 PE string and memory functions.
 
 use adv_cpu::backend::{Guest, Prot};
-use adv_machine::{Conv, Env, EnvLeafHandler, layout::PAGE};
+use adv_machine::{Conv, Env, layout::PAGE};
 
 use super::{Body, resume_original};
 
@@ -325,7 +325,7 @@ const SIGN_COMPARISONS: &[&str] = &[
 ];
 
 pub(super) fn bodies() -> Vec<Body> {
-    type Variant = (EnvLeafHandler, &'static [&'static str]);
+    type Variant = (super::BodyFn, &'static [&'static str]);
     let table: &[(&str, u8, &[Variant])] = &[
         ("memset", 3, &[(memset, ALL)]),
         ("memmove", 3, &[(memmove, CRT)]),
@@ -359,12 +359,12 @@ pub(super) fn bodies() -> Vec<Body> {
     ];
     let mut bodies = Vec::new();
     for &(name, argc, variants) in table {
-        for &(leaf, modules) in variants {
+        for &(body, modules) in variants {
             for module in modules {
                 bodies.push(Body {
                     name: format!("{module}!{name}").into(),
                     conv: Conv::Cdecl { argc },
-                    leaf,
+                    body,
                     handler: resume_original,
                 });
             }

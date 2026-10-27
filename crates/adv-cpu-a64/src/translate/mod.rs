@@ -123,18 +123,18 @@ pub struct Unit {
 impl Unit {
     /// Traces the unit at `eip`, ending before any of `stops`. Each byte
     /// the unit depends on is registered with `watch_code`, so a store to
-    /// it reaches the owner. `leaf` and `redirect` are as for
+    /// it reaches the owner. `host` and `redirect` are as for
     /// [`Trace::build`].
     pub fn build(
         &mut self,
         memory: &mut adv_cpu_core::memory::Memory,
         eip: u32,
         stops: &[u32],
-        leaf: &dyn Fn(u32, u32) -> bool,
+        host: &dyn Fn(u32, u32) -> Option<u32>,
         redirect: &dyn Fn(u32) -> Option<(u32, Vec<u8>)>,
     ) {
         self.regions.clear();
-        self.trace.build(memory, eip, stops, leaf, redirect);
+        self.trace.build(memory, eip, stops, host, redirect);
         tables::prepare(self, memory);
         for &(start, len) in &self.trace.code {
             memory.watch_code(start, len as usize);
@@ -236,7 +236,6 @@ impl Workspace {
 /// Host addresses of the `runtime` stubs units branch to.
 #[derive(Clone, Copy, Debug)]
 pub struct Stubs {
-    pub leaf: usize,
     pub exit: usize,
     pub dispatch: usize,
     /// Continues at the guest EIP in w16 through the indirect table.
@@ -249,6 +248,8 @@ pub struct Stubs {
     pub access: usize,
     /// An instruction the interpreter runs.
     pub interpret: usize,
+    /// A recognized host call.
+    pub call: usize,
     /// Where a faulting site leaves.
     pub fault: usize,
 }
@@ -470,12 +471,12 @@ pub fn translate(
     features: Features,
     at: usize,
     stubs: Stubs,
-    leaf: &dyn Fn(u32, u32) -> bool,
+    host: &dyn Fn(u32, u32) -> Option<u32>,
     redirect: &dyn Fn(u32) -> Option<(u32, Vec<u8>)>,
     admit: &dyn Fn(u32, &[u8]) -> Vec<adv_cpu_core::native_region::NativeRegion>,
     control: u16,
 ) {
-    work.unit.build(memory, eip, stops, leaf, redirect);
+    work.unit.build(memory, eip, stops, host, redirect);
     work.unit.prepare_regions(memory, admit, checked);
     Jit {
         code: &mut work.code,

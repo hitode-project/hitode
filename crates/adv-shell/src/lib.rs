@@ -1073,7 +1073,7 @@ fn build_report(context: ReportContext<'_>) -> String {
             "  \"width\": {},\n  \"height\": {},\n  \"frame_fnv1a64\": \"{:016x}\",\n",
             "  \"idle_waits\": {},\n  \"idle_wait_seconds\": {:.6},\n  \"polling_rounds\": {},\n  \"frame_spin_waits\": {},\n  \"input_messages\": {},\n",
             "  \"context_runs\": [{}],\n  \"tiered_compilation\": {},\n",
-            "  \"host_calls\": {},\n  \"leaf_host_calls\": {},\n  \"leaf_host_abandons\": {},\n  \"async_compilation\": {},\n  {},\n",
+            "  \"host_calls\": {},\n  \"async_compilation\": {},\n  {},\n",
             "  \"tier0_instructions\": {},\n  \"tier0_instructions_per_second\": {},\n",
             "  \"guest_contexts\": {},\n  \"tls_images\": {},\n  \"loaded_modules\": [{}],\n",
             "  \"api\": {},\n  \"first_cpu_fault\": {},\n  \"latest_cpu_fault\": {},\n  \"startup\": {{\"loaded\": true, \"guest_windows\": {}}},\n",
@@ -1110,8 +1110,6 @@ fn build_report(context: ReportContext<'_>) -> String {
         context_runs,
         options.jit && options.async_compilation && options.tiered_compilation,
         runtime.machine.sys.host_calls,
-        runtime.machine.sys.stats.leaf_calls,
-        runtime.machine.sys.stats.leaf_abandons,
         options.jit && options.async_compilation,
         runtime.machine.cpu.report_fields(),
         runtime

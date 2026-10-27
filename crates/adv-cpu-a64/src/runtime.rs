@@ -96,8 +96,10 @@ pub struct Runtime {
     /// The indirect branch that last missed the table: source EIP in the
     /// low half, `IndirectBranchKind` above; 0 when the owner has taken it.
     pub branch: u64,
-    /// Light host dispatch: bit 0 exits after INT, bit 1 requests ordinary INT.
-    pub leaf: u64,
+    /// `call(runtime, site, countdown) -> status`, called by `call` for
+    /// the host call through thunk `site >> 32` whose INT is at the low
+    /// half: statuses and charges as for `interpret`.
+    pub call: u64,
     #[cfg(test)]
     pub channel_batches: u64,
     #[cfg(test)]
@@ -108,7 +110,7 @@ impl Runtime {
     pub fn new(cpu: *mut CpuState, window: u64) -> Self {
         assert_eq!(window % (1 << 32), 0, "the window is 4 GiB aligned");
         Self {
-            leaf: 0,
+            call: 0,
             #[cfg(test)]
             channel_batches: 0,
             #[cfg(test)]
@@ -165,7 +167,6 @@ impl Exit {
 
 /// Byte offsets of the stubs in their code.
 pub struct Stubs {
-    pub leaf: usize,
     pub code: Vec<u32>,
     pub enter: usize,
     pub exit: usize,
@@ -182,6 +183,8 @@ pub struct Stubs {
     pub access: usize,
     /// Where translated code has the owner interpret an instruction.
     pub interpret: usize,
+    /// Where translated code makes a recognized host call.
+    pub call: usize,
 }
 
 /// Indirect table entries; the slot folds high EIP bits into the low bits.
@@ -228,6 +231,7 @@ const SHADOW_TOP: u32 = field(offset_of!(Runtime, shadow_top));
 const RESUME: u32 = field(offset_of!(Runtime, resume));
 const ACCESS: u32 = field(offset_of!(Runtime, access));
 const INTERPRET: u32 = field(offset_of!(Runtime, interpret));
+const CALL: u32 = field(offset_of!(Runtime, call));
 #[cfg(test)]
 pub(crate) const CHANNEL_BATCHES: u32 = field(offset_of!(Runtime, channel_batches));
 #[cfg(test)]
@@ -304,11 +308,11 @@ pub fn stubs() -> Stubs {
     let access = asm.offset();
     emit_access(&mut asm, fault_label);
     let interpret = asm.offset();
-    emit_interpret(&mut asm);
-    let leaf = asm.offset();
-    emit_leaf(&mut asm);
+    emit_interpret(&mut asm, INTERPRET);
+    let call = asm.offset();
+    emit_interpret(&mut asm, CALL);
     Stubs {
-        leaf,
+        call,
         code: asm.finish(),
         enter,
         exit,
@@ -323,57 +327,23 @@ pub fn stubs() -> Stubs {
     }
 }
 
-/// Only ESP and EDX cross into the leaf environment; flags stay in registers.
-fn emit_leaf(asm: &mut Asm) {
-    asm.emit_all(&[
-        stp(X, Pre, r(7), r(8), SP, -64),
-        stp(X, Offset, r(9), r(10), SP, 16),
-        stp(X, Offset, r(11), r(12), SP, 32),
-        mrs_nzcv(r(17)),
-        stp(X, Offset, r(17), Reg::LR, SP, 48),
-        ldr(X, r(0), RUNTIME, CPU),
-        str(W, r(23), r(0), REGS as u32 + 16),
-        str(W, r(21), r(0), REGS as u32 + 8),
-        mov(X, r(0), RUNTIME),
-        ldr(X, r(16), RUNTIME, offset_of!(Runtime, leaf) as u32),
-        blr(r(16)),
-    ]);
-    let refused = asm.label();
-    asm.tbz(true, r(0), 1, refused);
-    asm.emit_all(&[
-        ldr(X, r(16), RUNTIME, CPU),
-        ldr(W, r(19), r(16), REGS as u32),
-        ldr(W, r(21), r(16), REGS as u32 + 8),
-        ldr(W, r(17), r(16), REGS as u32 + 16),
-        add_ext(X, r(23), WINDOW, r(17), Uxtw, 0),
-    ]);
-    asm.bind(refused);
-    asm.emit_all(&[
-        ldp(X, Offset, r(17), Reg::LR, SP, 48),
-        msr_nzcv(r(17)),
-        ldp(X, Offset, r(11), r(12), SP, 32),
-        ldp(X, Offset, r(9), r(10), SP, 16),
-        ldp(X, Post, r(7), r(8), SP, 64),
-        ret(Reg::LR),
-    ]);
-}
-
-/// `interpret`, called with w1 the helper's index and canonical flags.
-/// Keeps x7-x9 and x27-x29; the guest registers and flags are what the
-/// helper left in `CpuState`, x0-x6 and x13-x17 are free.
-fn emit_interpret(asm: &mut Asm) {
+/// `interpret` or `call`, by the runtime function at `slot`, called with
+/// x1 its argument and canonical flags. Keeps x7-x9 and x27-x29; the guest
+/// registers and flags are what the owner left in `CpuState`, x0-x6 and
+/// x13-x17 are free.
+fn emit_interpret(asm: &mut Asm, slot: u32) {
     asm.emit_all(&[
         stp(X, Pre, r(7), r(8), SP, -32),
         stp(X, Offset, r(9), Reg::LR, SP, 16),
-        mov(W, r(6), r(1)),
+        mov(X, r(6), r(1)),
         ldr(X, r(0), RUNTIME, CPU),
     ]);
     emit_store_guest(asm);
     asm.emit_all(&[
         mov(X, r(0), RUNTIME),
-        mov(W, r(1), r(6)),
+        mov(X, r(1), r(6)),
         mov(X, r(2), r(9)),
-        ldr(X, r(16), RUNTIME, INTERPRET),
+        ldr(X, r(16), RUNTIME, slot),
         blr(r(16)),
         mov(X, r(6), r(0)),
         ldr(X, r(0), RUNTIME, CPU),

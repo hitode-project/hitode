@@ -46,8 +46,8 @@ impl Translator<'_> {
     pub(super) fn op(&mut self, inst: Inst) {
         match inst.op {
             Op::Nop | Op::Jmp(_) => {}
-            Op::Helper(index) => match inst.leaf {
-                Some(word) => self.leaf(inst, word),
+            Op::Helper(index) => match inst.call {
+                Some(thunk) => self.host_call(inst, thunk),
                 None => self.helper(index),
             },
             Op::Simd(simd) => self.simd(simd),
@@ -476,12 +476,27 @@ impl Translator<'_> {
     /// unit, with canonical flags; leaves when it asks to. Conditional callers
     /// must also flush before the fork, so their fast path publishes the prefix.
     pub(super) fn helper(&mut self, index: u8) {
+        let index = self.helpers + u32::from(index);
+        self.mov_imm(X1, index);
+        self.owner_call(self.stubs.interpret);
+    }
+
+    /// Makes the host call through `thunk` whose INT is `inst`, with the
+    /// guest synchronized as for a helper (A64-CTL-12).
+    fn host_call(&mut self, inst: Inst, thunk: u32) {
+        self.mov_imm(X1, inst.pc);
+        let thunk = u16::try_from(thunk).expect("thunk index");
+        self.emit(movk(X, X1, thunk, 32));
+        self.owner_call(self.stubs.call);
+    }
+
+    /// Calls `stub` with the argument in x1 and the guest in `CpuState`.
+    fn owner_call(&mut self, stub: usize) {
         self.canonicalize();
-        // The interpreter may change any SIMD register.
+        // The owner may change any SIMD register.
         self.flush_simd();
         self.vector = super::simd::Vector::default();
-        self.mov_imm(X1, self.helpers + u32::from(index));
-        self.far_call(self.stubs.interpret);
+        self.far_call(stub);
         self.state = State::CANONICAL;
         let leave = self.asm.label();
         self.asm.cbz(W, true, X0, leave);
@@ -489,34 +504,6 @@ impl Translator<'_> {
             label: leave,
             refund: self.trace.unused(self.index),
         });
-    }
-
-    fn leaf(&mut self, inst: Inst, word: u32) {
-        self.canonicalize();
-        self.flush_simd();
-        self.vector = super::simd::Vector::default();
-        self.mov_imm(X1, inst.pc);
-        self.mov_imm(super::X2, word);
-        self.far_call(self.stubs.leaf);
-        self.state = State::CANONICAL;
-        // Bit 1 refuses before INT; bit 0 leaves after the completed call.
-        for (bit, exit, eip, extra) in [
-            (1, super::Exit::Interpret, inst.pc, 1),
-            (0, super::Exit::Dispatch, inst.next_pc, 0),
-        ] {
-            let label = self.asm.label();
-            self.asm.tbz(true, X0, bit, label);
-            self.push_cold(Cold::Leave {
-                label,
-                state: State::CANONICAL,
-                simd_dirty: self.vector.dirty,
-                refund: self.trace.unused(self.index) + extra,
-                exit,
-                eip,
-                link: false,
-                x87: None,
-            });
-        }
     }
 
     /// A checked access (A64-MEM-7) of `kind` at the guest address in `address`,

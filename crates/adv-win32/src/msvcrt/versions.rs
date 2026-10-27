@@ -254,7 +254,6 @@ pub(super) fn register(registry: &mut Registry, exports: &[(&str, Handler)]) {
                 name: declaration.name,
                 conv: declaration.conv.expect("CRT code declaration"),
                 handler: *handler,
-                env_leaf: None,
                 level: ImplementationLevel::Implement,
             });
         }

@@ -83,7 +83,6 @@ pub(super) fn host_fn(module: &str, name: &str) -> Option<HostFn> {
         handler,
         data: index.parse().ok()?,
         leaf: None,
-        env_leaf: None,
         trace: false,
         guest: None,
     })

@@ -71,7 +71,8 @@ pub enum Mode {
 
 #[derive(Clone, Copy, Debug)]
 pub struct Inst {
-    pub leaf: Option<u32>,
+    /// The thunk of a recognized host call (A64-CTL-12).
+    pub call: Option<u32>,
     pub pc: u32,
     pub next_pc: u32,
     pub op: Op,
@@ -151,7 +152,7 @@ impl Trace {
         memory: &Memory,
         entry: u32,
         stops: &[u32],
-        leaf: &dyn Fn(u32, u32) -> bool,
+        host: &dyn Fn(u32, u32) -> Option<u32>,
         redirect: &dyn Fn(u32) -> Option<(u32, Vec<u8>)>,
     ) {
         self.insts.clear();
@@ -215,15 +216,16 @@ impl Trace {
                 _ => self.code.push((pc, size)),
             }
             let mut inst = Inst {
-                leaf: if matches!(op, Op::Helper(_)) && size == 2 {
+                call: if matches!(op, Op::Helper(_)) && size == 2 {
                     let mut bytes = [0; 7];
                     memory
                         .read_into(pc.wrapping_sub(5), &mut bytes)
                         .ok()
                         .and_then(|_| {
                             let word = u32::from_le_bytes(bytes[1..5].try_into().unwrap());
-                            (bytes[0] == 0x68 && bytes[5..] == [0xcd, 0x2e] && leaf(pc, word))
-                                .then_some(word)
+                            (bytes[0] == 0x68 && bytes[5..] == [0xcd, 0x2e])
+                                .then(|| host(pc, word))
+                                .flatten()
                         })
                 } else {
                     None
@@ -237,7 +239,7 @@ impl Trace {
                 taken: None,
                 frame,
             };
-            if inst.leaf.is_some() {
+            if inst.call.is_some() {
                 self.code.push((pc.wrapping_sub(5), 7));
             }
             // A continuation must be new to the trace and leave room after it.

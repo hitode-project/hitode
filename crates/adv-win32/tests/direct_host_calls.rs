@@ -1,4 +1,4 @@
-//! Authored API sequence compares the a64 leaf route with a full API trace.
+//! An authored API sequence gives the same results with and without a full API trace.
 #![cfg(target_arch = "aarch64")]
 use adv_abi::Registry;
 use adv_cpu::{
@@ -29,7 +29,7 @@ fn api_from(
     code.call(address).mov_mem_eax(DATA + output);
 }
 
-fn run(traced: bool) -> (Vec<u8>, u64, u64) {
+fn run(traced: bool) -> (Vec<u8>, u64) {
     let mut registry = Registry::default();
     adv_win32::register(&mut registry);
     let mut machine = Machine::new(
@@ -166,19 +166,16 @@ fn run(traced: bool) -> (Vec<u8>, u64, u64) {
     assert_eq!(machine.cpu.read_u32(DATA + 64).unwrap(), 1);
     assert_eq!(machine.cpu.read_u32(DATA + 72).unwrap(), 1);
     assert_eq!(machine.cpu.read_u32(DATA + 80).unwrap(), 0);
-    assert_eq!(machine.sys.stats.leaf_abandons, if traced { 0 } else { 15 });
     let mut output = vec![0; 1024];
     machine.cpu.read(DATA, &mut output).unwrap();
-    (output, machine.sys.stats.leaf_calls, machine.sys.host_calls)
+    (output, machine.sys.host_calls)
 }
 
-// spec: A64-CTL-12, WIN32-API-15
+// spec: A64-CTL-12
 #[test]
-fn registered_leaf_apis_match_their_traced_handlers() {
-    let (leaf, leaves, calls) = run(false);
-    let (traced, trace_leaves, trace_calls) = run(true);
-    assert_eq!(leaf, traced);
-    assert!(leaves > 0);
-    assert_eq!(trace_leaves, 0);
+fn direct_api_calls_match_their_traced_handlers() {
+    let (direct, calls) = run(false);
+    let (traced, trace_calls) = run(true);
+    assert_eq!(direct, traced);
     assert_eq!(calls, trace_calls);
 }

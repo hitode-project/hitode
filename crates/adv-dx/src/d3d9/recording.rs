@@ -190,13 +190,6 @@ pub(super) struct Recording {
     readback: Option<adv_device::gpu::Readback>,
     job: Option<adv_sync::background::Task>,
 }
-pub(super) fn admits_leaf(env: &Env<'_>, pointer: u32, bytes: usize) -> bool {
-    device(env, pointer).is_some_and(|d| {
-        d.frame.active.is_none()
-            && d.frame.commands.len() + 1 < 4096
-            && d.frame.bytes + bytes < 64 * 1024 * 1024
-    })
-}
 pub(super) fn forget(env: &mut Env<'_>, owner: Id, pointer: u32) {
     if let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, owner) {
         let f = &mut d.frame;

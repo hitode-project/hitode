@@ -125,10 +125,7 @@ pub(super) fn register(registry: &mut Registry) {
         texture_desc_ABI,
         texture_lock_ABI,
         texture_unlock_ABI,
-        adv_abi::Api {
-            env_leaf: Some(super::leaf_calls::binding),
-            ..set_texture_ABI
-        },
+        super::unchanged::unless_unchanged!(set_texture_ABI, super::unchanged::binding),
         get_texture_ABI,
         texture_levels_ABI,
         texture_set_lod_ABI,
@@ -1026,7 +1023,7 @@ fn set_texture_binding(
     0
 }
 
-#[win32(d3d9,name="IDirect3DDevice9::GetTexture",level=implement,leaf)]
+#[win32(d3d9,name="IDirect3DDevice9::GetTexture",level=implement)]
 fn get_texture(env: &mut Env<'_>, this: GuestPtr<()>, stage: u32, output: GuestPtr<u32>) -> u32 {
     if output.write(env.cpu, 0).is_err() {
         return INVALID;

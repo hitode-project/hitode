@@ -64,7 +64,7 @@ fn full_x87_units_keep_short_branches_to_cold_code_in_reach() {
         let mut work = Workspace::default();
         let host = HOST_CODE as usize;
         let stubs = Stubs {
-            leaf: host,
+            call: host,
             exit: host,
             dispatch: host,
             lookup: host,
@@ -75,7 +75,7 @@ fn full_x87_units_keep_short_branches_to_cold_code_in_reach() {
             fault: host,
         };
         let features = Features { flagm: false };
-        let leaf = |_, _| false;
+        let no_calls = |_, _| None;
         translate(
             &mut work,
             &mut mem,
@@ -86,7 +86,7 @@ fn full_x87_units_keep_short_branches_to_cold_code_in_reach() {
             features,
             host,
             stubs,
-            &leaf,
+            &no_calls,
             &|_| None,
             &|_, _| Vec::new(),
             0x037f,
@@ -116,7 +116,7 @@ fn bytecode_vm_dispatch_instruction_gate() {
     let mut mem = memory(&code, &[]);
     let mut work = Workspace::default();
     let stubs = Stubs {
-        leaf: HOST_CODE as usize,
+        call: HOST_CODE as usize,
         exit: HOST_CODE as usize,
         dispatch: HOST_CODE as usize,
         lookup: HOST_CODE as usize,
@@ -136,7 +136,7 @@ fn bytecode_vm_dispatch_instruction_gate() {
         Features { flagm: false },
         HOST_CODE as usize,
         stubs,
-        &|_, _| false,
+        &|_, _| None,
         &|_| None,
         &|_, _| Vec::new(),
         0x037f,
@@ -161,7 +161,7 @@ fn bytecode_vm_dispatch_instruction_gate() {
         Features { flagm: false },
         HOST_CODE as usize,
         stubs,
-        &|_, _| false,
+        &|_, _| None,
         &|_| None,
         &|_, _| Vec::new(),
         0x037f,
@@ -314,7 +314,7 @@ impl Harness {
             Features { flagm },
             addr(at),
             Stubs {
-                leaf: addr(self.forbidden),
+                call: addr(self.forbidden),
                 exit: addr(self.stubs.exit),
                 dispatch: addr(self.dispatch),
                 lookup: addr(self.forbidden),
@@ -324,7 +324,7 @@ impl Harness {
                 interpret: addr(self.forbidden),
                 fault: addr(self.forbidden),
             },
-            &|_, _| false,
+            &|_, _| None,
             &|_| None,
             &|_, _| Vec::new(),
             0x037f,
@@ -764,7 +764,7 @@ fn switch_table_recognition_checks_unsigned_bounds_pages_and_index_provenance() 
         let mut work = Workspace::default();
         work.unit.images.push((CODE, 0x30000));
         let stubs = Stubs {
-            leaf: HOST_CODE as usize,
+            call: HOST_CODE as usize,
             exit: HOST_CODE as usize,
             dispatch: HOST_CODE as usize,
             lookup: HOST_CODE as usize,
@@ -788,7 +788,7 @@ fn switch_table_recognition_checks_unsigned_bounds_pages_and_index_provenance() 
                 Features { flagm: false },
                 HOST_CODE as usize,
                 stubs,
-                &|_, _| false,
+                &|_, _| None,
                 &|_| None,
                 &|_, _| Vec::new(),
                 0x037f,
@@ -857,7 +857,7 @@ fn j1_unit(code: &[u8]) -> Workspace {
         Features { flagm: false },
         at,
         Stubs {
-            leaf: at,
+            call: at,
             exit: at,
             dispatch: at,
             lookup: at,
@@ -867,7 +867,7 @@ fn j1_unit(code: &[u8]) -> Workspace {
             interpret: at,
             fault: at,
         },
-        &|_, _| false,
+        &|_, _| None,
         &|_| None,
         &|_, _| Vec::new(),
         0x037f,

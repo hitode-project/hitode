@@ -44,7 +44,7 @@ use std::sync::Arc;
 
 use adv_cpu_core::interpreter::{Execution, Step, accessible};
 use adv_cpu_core::memory::{Memory, READ, WRITE};
-use adv_cpu_core::trap::{Bridge, call_trap};
+use adv_cpu_core::trap::{Bridge, call_host, call_trap};
 use adv_cpu_core::{CpuState, IndirectBranch, IndirectBranchKind};
 
 use crate::cache::CodeCache;
@@ -441,21 +441,16 @@ unsafe extern "C" fn interpret(runtime: *mut Runtime, index: u32, countdown: u64
             // SAFETY: the executor's bridge outlives the run and nothing
             // else uses it while translated code runs.
             let bridge = unsafe { &mut *owner.bridge.cast::<Bridge<'_>>() };
-            // Generated accesses are paused. Let host mapping changes update
-            // the raw permissions in place instead of copying the whole table.
-            let classified = native.alias_snapshot.take().is_some();
-            let status = call_trap(bridge, cpu, u32::from(vector));
-            let same = memory.epoch == epoch && memory.dirty_pages.len() == dirty;
-            // A slow host call must not leave the unit running past the
-            // deadline; the owner reports it at the next instruction.
-            let status = if status == 0 && same && cpu.eip == helper.next && !native.past() {
-                if classified {
-                    native.classify(memory);
-                }
-                0
-            } else {
-                LEAVE
-            };
+            let resumes = host(
+                native,
+                memory,
+                bridge,
+                cpu,
+                (epoch, dirty),
+                helper.next,
+                |b, c| call_trap(b, c, u32::from(vector)),
+            );
+            let status = if resumes { 0 } else { LEAVE };
             (status, i64::from(units) - 1)
         }
         Ok(execution) => {
@@ -473,44 +468,68 @@ unsafe extern "C" fn interpret(runtime: *mut Runtime, index: u32, countdown: u64
     (charge as u64) << 32 | u64::from(status)
 }
 
-unsafe extern "C" fn leaf(runtime: *mut Runtime, pc: u32, word: u32) -> u32 {
-    // SAFETY: run owns these objects exclusively until generated code returns.
+/// Called by the `call` stub for the host call through thunk `site >> 32`
+/// whose INT is at `site as u32`: as `interpret` has the INT make it, but
+/// without decoding the INT or rereading its token (A64-CTL-12).
+unsafe extern "C" fn call(runtime: *mut Runtime, site: u64, _countdown: u64) -> u64 {
+    const LEAVE: u32 = Exit::Dispatch as u32 + 1;
+    // SAFETY: as in `interpret`.
     let owner = unsafe { &mut *((*runtime).owner as *mut Owner) };
-    let (native, memory, cpu) =
-        unsafe { (&mut *owner.native, &mut *owner.memory, &mut *(*runtime).cpu) };
+    let (native, memory) = unsafe { (&mut *owner.native, &mut *owner.memory) };
+    let cpu = unsafe { &mut *(*runtime).cpu };
+    let pc = site as u32;
     if owner.bridge.is_null() {
-        return 2;
+        // Without a host the interpreter takes the INT, which is refunded.
+        cpu.eip = pc;
+        return (-1i64 as u64) << 32 | u64::from(Exit::Interpret as u32 + 1);
     }
+    // SAFETY: as in `interpret`.
     let bridge = unsafe { &mut *owner.bridge.cast::<Bridge<'_>>() };
-    let (epoch, dirty) = (memory.epoch, memory.dirty_pages.len());
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        bridge
-            .handler
-            .as_mut()
-            .and_then(|handler| handler.leaf(cpu, memory, pc, word))
-    }));
-    match result {
-        Ok(Some(value)) => {
-            cpu.regs[0] = value as u32;
-            cpu.regs[2] = (value >> 32) as u32;
-            cpu.eip = pc.wrapping_add(2);
-            u32::from(
-                native.past()
-                    || native
-                        .interrupt
-                        .as_ref()
-                        .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
-                    || memory.epoch != epoch
-                    || memory.dirty_pages.len() != dirty
-                    || native.stops.contains(&cpu.eip),
-            )
-        }
-        Ok(None) => 2,
-        Err(_) => {
-            owner.error = Some("leaf host handler panicked".into());
-            1
-        }
+    // The INT has committed its next PC.
+    let next = pc.wrapping_add(2);
+    cpu.eip = next;
+    let before = (memory.epoch, memory.dirty_pages.len());
+    let thunk = (site >> 32) as u32;
+    if host(native, memory, bridge, cpu, before, next, |b, c| {
+        call_host(b, c, thunk)
+    }) {
+        0
+    } else {
+        native.diagnostics.helper_exits += 1;
+        u64::from(LEAVE)
     }
+}
+
+/// Makes a host call from translated code with `call`, the guest in `cpu`.
+/// True continues at `next`: the call returned there and changed no code
+/// or mapping, and no deadline, interrupt or stop is due. Otherwise the
+/// unit leaves for wherever the call went.
+fn host(
+    native: &mut Native,
+    memory: &mut Memory,
+    bridge: &mut Bridge<'_>,
+    cpu: &mut CpuState,
+    (epoch, dirty): (u64, usize),
+    next: u32,
+    call: impl FnOnce(&mut Bridge<'_>, &mut CpuState) -> u32,
+) -> bool {
+    // Generated accesses are paused. Let host mapping changes update the
+    // raw permissions in place instead of copying the whole table.
+    let classified = native.alias_snapshot.take().is_some();
+    let resumes = call(bridge, cpu) == 0
+        && memory.epoch == epoch
+        && memory.dirty_pages.len() == dirty
+        && cpu.eip == next
+        && !native.past()
+        && !native
+            .interrupt
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
+        && !native.stops.contains(&next);
+    if resumes && classified {
+        native.classify(memory);
+    }
+    resumes
 }
 
 /// The virtual counter, which reads in a few nanoseconds where
@@ -627,7 +646,7 @@ impl Native {
                 (stubs.shadow_reset, "shadow_reset"),
                 (stubs.access, "access"),
                 (stubs.interpret, "interpret"),
-                (stubs.leaf, "leaf"),
+                (stubs.call, "call"),
             ],
         );
         // SAFETY: `enter` follows the C calling convention with the
@@ -660,7 +679,6 @@ impl Native {
             cache,
             enter,
             stubs: Stubs {
-                leaf: base + stubs.leaf,
                 exit: base + stubs.exit,
                 dispatch: base + stubs.dispatch,
                 lookup: base + stubs.lookup,
@@ -668,6 +686,7 @@ impl Native {
                 ret_miss: base + stubs.ret_miss,
                 access: base + stubs.access,
                 interpret: base + stubs.interpret,
+                call: base + stubs.call,
                 fault: base + stubs.fault,
             },
             units: FxHashMap::default(),
@@ -782,7 +801,7 @@ impl Native {
             (*runtime).helper = dispatch as *const () as u64;
             (*runtime).access = access as *const () as u64;
             (*runtime).interpret = interpret as *const () as u64;
-            (*runtime).leaf = leaf as *const () as u64;
+            (*runtime).call = call as *const () as u64;
             (*runtime).owner = &raw mut owner as u64;
             let previous = ACTIVE.replace(faults);
             enter(runtime, entry.unit);
@@ -1165,19 +1184,19 @@ impl Native {
             self.stubs,
             &|pc, word| {
                 if self.bridge.is_null() {
-                    return false;
+                    return None;
                 }
                 // SAFETY: translation occurs only during the bridge's run.
                 unsafe { &*self.bridge.cast::<Bridge<'_>>() }
                     .handler
                     .as_ref()
-                    .is_some_and(|handler| handler.leaf_call(pc, word))
+                    .and_then(|handler| handler.host_thunk(pc, word))
             },
             &|pc| {
                 if self.bridge.is_null() {
                     return None;
                 }
-                // SAFETY: as for `leaf_call`.
+                // SAFETY: as for `host_thunk`.
                 let handler = unsafe { &*self.bridge.cast::<Bridge<'_>>() }
                     .handler
                     .as_ref()?;

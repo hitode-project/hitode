@@ -139,11 +139,11 @@ fn performance_counter_matches_wine() {
         (DATA + 0x1000, DATA + 8),
         (DATA, DATA + 0x1000),
     ] {
-        let abandons = native.sys.stats.leaf_abandons;
+        let abandons = adv_nt::native::declines(&native.ext);
         let got = call(&mut native, counter, frequency);
         assert_eq!(got, call(&mut reference, counter, frequency));
         assert_eq!(got[0], adv_nt::status::ACCESS_VIOLATION);
         assert_eq!(got[1], got[2]);
-        assert_eq!(native.sys.stats.leaf_abandons, abandons + 1);
+        assert_eq!(adv_nt::native::declines(&native.ext), abandons + 1);
     }
 }

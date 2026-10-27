@@ -4,7 +4,7 @@
 //! [`Backend::run`]. Guest code runs until it executes a trap instruction (`int 0x2e` in a
 //! thunk) or faults. On a trap the backend calls [`TrapHandler::on_trap`] from inside the
 //! emulation loop. The handler either finishes the call on the spot ([`TrapAction::Continue`]:
-//! the fast path for leaf API calls) or asks the backend to park the guest
+//! the usual path for API calls) or asks the backend to park the guest
 //! ([`TrapAction::Park`]). Parking unwinds out of `run`, so only the top-level scheduler
 //! ever re-enters guest code. There is no host→guest recursion.
 
@@ -415,14 +415,16 @@ pub trait TrapHandler {
         Vec::new()
     }
 
-    /// Authorize an exact PUSH token / INT pair for a light host call.
-    fn leaf_call(&self, _pc: u32, _word: u32) -> bool {
-        false
+    /// The thunk whose host call the exact PUSH token / INT pair at `pc`
+    /// makes, so translated code may call it directly.
+    fn host_thunk(&self, _pc: u32, _word: u32) -> Option<u32> {
+        None
     }
 
-    /// Only ESP and EDX are synchronized. None requests ordinary INT dispatch.
-    fn on_leaf(&mut self, _cpu: &mut dyn Guest, _pc: u32, _word: u32) -> Option<u64> {
-        None
+    /// `on_trap` for the INT 0x2e of a pair `host_thunk` recognized as
+    /// `thunk`, its token still pushed.
+    fn on_host_call(&mut self, cpu: &mut dyn Guest, _thunk: u32) -> TrapAction {
+        self.on_trap(cpu, 0x2e)
     }
 
     /// Where translated code continues instead of entering the function at

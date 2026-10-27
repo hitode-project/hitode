@@ -391,10 +391,7 @@ impl Fixed {
 }
 pub(super) fn register(registry: &mut Registry) {
     for api in [
-        adv_abi::Api {
-            env_leaf: Some(super::leaf_calls::binding),
-            ..set_fvf_ABI
-        },
+        super::unchanged::unless_unchanged!(set_fvf_ABI, super::unchanged::binding),
         get_fvf_ABI,
         set_render_ABI,
         get_render_ABI,
@@ -408,10 +405,7 @@ pub(super) fn register(registry: &mut Registry) {
         get_scissor_ABI,
         set_transform_ABI,
         get_transform_ABI,
-        adv_abi::Api {
-            env_leaf: Some(super::leaf_calls::draw),
-            ..draw_up_ABI
-        },
+        draw_up_ABI,
     ] {
         registry.register(api);
     }
@@ -507,7 +501,7 @@ pub(super) fn layout(env: &Env<'_>, pointer: u32) -> Result<Layout, Rejected> {
             .ok_or_else(|| rejected(INVALID, "no supported FVF is set")),
     }
 }
-#[win32(d3d9,name="IDirect3DDevice9::GetFVF",level=implement,leaf)]
+#[win32(d3d9,name="IDirect3DDevice9::GetFVF",level=implement)]
 pub(super) fn get_fvf(env: &mut Env<'_>, this: GuestPtr<()>, output: GuestPtr<u32>) -> u32 {
     let Some(f) = current(env, this.addr()) else {
         return INVALID;
@@ -571,7 +565,7 @@ fn stencil_op(value: u32) -> Option<StencilOp> {
         _ => return None,
     })
 }
-#[win32(d3d9,name="IDirect3DDevice9::SetRenderState",level=state,leaf)]
+#[win32(d3d9,name="IDirect3DDevice9::SetRenderState",level=state)]
 pub(super) fn set_render(env: &mut Env<'_>, this: GuestPtr<()>, state: i32, value: u32) -> u32 {
     let Some(f) = mutable(env, this.addr()) else {
         return INVALID;
@@ -643,7 +637,7 @@ pub(super) fn set_render(env: &mut Env<'_>, this: GuestPtr<()>, state: i32, valu
     );
     0
 }
-#[win32(d3d9,name="IDirect3DDevice9::GetRenderState",level=implement,leaf)]
+#[win32(d3d9,name="IDirect3DDevice9::GetRenderState",level=implement)]
 fn get_render(env: &mut Env<'_>, this: GuestPtr<()>, state: i32, output: GuestPtr<u32>) -> u32 {
     let Some(&value) = current(env, this.addr()).and_then(|f| f.render.get(&state)) else {
         return INVALID;
@@ -654,7 +648,7 @@ fn get_render(env: &mut Env<'_>, this: GuestPtr<()>, state: i32, output: GuestPt
         INVALID
     }
 }
-#[win32(d3d9,name="IDirect3DDevice9::SetTextureStageState",level=state,leaf)]
+#[win32(d3d9,name="IDirect3DDevice9::SetTextureStageState",level=state)]
 pub(super) fn set_stage(
     env: &mut Env<'_>,
     this: GuestPtr<()>,
@@ -741,7 +735,7 @@ pub(super) fn set_stage(
     );
     0
 }
-#[win32(d3d9,name="IDirect3DDevice9::GetTextureStageState",level=implement,leaf)]
+#[win32(d3d9,name="IDirect3DDevice9::GetTextureStageState",level=implement)]
 fn get_stage(
     env: &mut Env<'_>,
     this: GuestPtr<()>,
@@ -782,7 +776,7 @@ fn address(value: u32) -> Option<Address> {
 fn rgba(argb: u32) -> u32 {
     (argb & 0xff00_ff00) | ((argb >> 16) & 0xff) | ((argb & 0xff) << 16)
 }
-#[win32(d3d9,name="IDirect3DDevice9::SetSamplerState",level=state,leaf)]
+#[win32(d3d9,name="IDirect3DDevice9::SetSamplerState",level=state)]
 pub(super) fn set_sampler(
     env: &mut Env<'_>,
     this: GuestPtr<()>,
@@ -828,7 +822,7 @@ pub(super) fn set_sampler(
     );
     0
 }
-#[win32(d3d9,name="IDirect3DDevice9::GetSamplerState",level=implement,leaf)]
+#[win32(d3d9,name="IDirect3DDevice9::GetSamplerState",level=implement)]
 fn get_sampler(
     env: &mut Env<'_>,
     this: GuestPtr<()>,
@@ -854,7 +848,7 @@ fn get_sampler(
         INVALID
     }
 }
-#[win32(d3d9,name="IDirect3DDevice9::SetViewport",level=state,leaf)]
+#[win32(d3d9,name="IDirect3DDevice9::SetViewport",level=state)]
 fn set_viewport(env: &mut Env<'_>, this: GuestPtr<()>, viewport: GuestPtr<D3DVIEWPORT9>) -> u32 {
     let Ok(v) = viewport.read(env.cpu) else {
         return INVALID;
@@ -904,7 +898,7 @@ fn set_viewport(env: &mut Env<'_>, this: GuestPtr<()>, viewport: GuestPtr<D3DVIE
     );
     0
 }
-#[win32(d3d9,name="IDirect3DDevice9::GetViewport",level=implement,leaf)]
+#[win32(d3d9,name="IDirect3DDevice9::GetViewport",level=implement)]
 fn get_viewport(env: &mut Env<'_>, this: GuestPtr<()>, output: GuestPtr<D3DVIEWPORT9>) -> u32 {
     let Some(f) = current(env, this.addr()) else {
         return INVALID;
@@ -916,7 +910,7 @@ fn get_viewport(env: &mut Env<'_>, this: GuestPtr<()>, output: GuestPtr<D3DVIEWP
         INVALID
     }
 }
-#[win32(d3d9,name="IDirect3DDevice9::SetScissorRect",level=state,leaf)]
+#[win32(d3d9,name="IDirect3DDevice9::SetScissorRect",level=state)]
 fn set_scissor(env: &mut Env<'_>, this: GuestPtr<()>, rect: GuestPtr<RECT>) -> u32 {
     let Ok(rect) = rect.read(env.cpu) else {
         return INVALID;
@@ -939,7 +933,7 @@ fn set_scissor(env: &mut Env<'_>, this: GuestPtr<()>, rect: GuestPtr<RECT>) -> u
     );
     0
 }
-#[win32(d3d9,name="IDirect3DDevice9::GetScissorRect",level=implement,leaf)]
+#[win32(d3d9,name="IDirect3DDevice9::GetScissorRect",level=implement)]
 fn get_scissor(env: &mut Env<'_>, this: GuestPtr<()>, output: GuestPtr<RECT>) -> u32 {
     let Some(f) = current(env, this.addr()) else {
         return INVALID;
@@ -959,7 +953,7 @@ fn transform_slot(kind: i32) -> Option<usize> {
         _ => return None,
     })
 }
-#[win32(d3d9,name="IDirect3DDevice9::SetTransform",level=state,leaf)]
+#[win32(d3d9,name="IDirect3DDevice9::SetTransform",level=state)]
 fn set_transform(
     env: &mut Env<'_>,
     this: GuestPtr<()>,
@@ -988,7 +982,7 @@ fn set_transform(
     );
     0
 }
-#[win32(d3d9,name="IDirect3DDevice9::GetTransform",level=implement,leaf)]
+#[win32(d3d9,name="IDirect3DDevice9::GetTransform",level=implement)]
 fn get_transform(
     env: &mut Env<'_>,
     this: GuestPtr<()>,

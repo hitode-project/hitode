@@ -600,7 +600,8 @@ fn family(family: &str) {
         );
     }
     assert_eq!(
-        native.sys.stats.leaf_abandons, 0,
+        adv_nt::native::declines(&native.ext),
+        0,
         "body declined covered inputs"
     );
 }
@@ -749,7 +750,7 @@ fn conversions_match_wine() {
             }
         }
     }
-    assert_eq!(native.sys.stats.leaf_abandons, 0);
+    assert_eq!(adv_nt::native::declines(&native.ext), 0);
 }
 
 // spec: NAT-ID-2, NAT-BODY-4
@@ -1073,7 +1074,7 @@ fn dib_declines_before_writes() {
             }
             _ => unreachable!(),
         }
-        let before = native.sys.stats.leaf_abandons;
+        let before = adv_nt::native::declines(&native.ext);
         let (actual, bytes) = execute(&mut native, entry, &args, &data, false, None);
         let (expected, reference_bytes) = execute(&mut reference, entry, &args, &data, false, None);
         if case == 2 {
@@ -1084,7 +1085,11 @@ fn dib_declines_before_writes() {
             assert!(matches!(expected, RunResult::Exited(0)), "{expected:?}");
         }
         assert_eq!(bytes, reference_bytes, "decline {case} changed memory");
-        assert_eq!(native.sys.stats.leaf_abandons - before, 1, "decline {case}");
+        assert_eq!(
+            adv_nt::native::declines(&native.ext) - before,
+            1,
+            "decline {case}"
+        );
     }
 }
 
@@ -1117,7 +1122,7 @@ fn halftone_declines_nondefault_rounding() {
             call(&mut reference, entry, &args, &data, false)
         );
     }
-    let before = native.sys.stats.leaf_abandons;
+    let before = adv_nt::native::declines(&native.ext);
     for _ in 0..3 {
         let (actual, bytes) = execute(&mut native, entry, &args, &data, false, Some(0x3f80));
         let (expected, reference_bytes) =
@@ -1126,5 +1131,5 @@ fn halftone_declines_nondefault_rounding() {
         assert!(matches!(expected, RunResult::Exited(0)), "{expected:?}");
         assert_eq!(bytes, reference_bytes);
     }
-    assert!(native.sys.stats.leaf_abandons > before);
+    assert!(adv_nt::native::declines(&native.ext) > before);
 }

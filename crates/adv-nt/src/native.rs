@@ -3,7 +3,7 @@
 //! A function of a distribution image whose bytes its code identity table
 //! confirms ([`crate::identity`]) can have a host body. Translated calls to
 //! the function branch to a thunk instead ([`adv_machine::Sys::redirects`]),
-//! which runs the body as a leaf call, without leaving translated code. The
+//! whose host call runs the body without leaving translated code. The
 //! interpreter runs Wine's own code, and so does a call the body declines:
 //! it resumes at a trampoline preserving the first instruction's effect
 //! before continuing at the second. A body therefore has the function's effect
@@ -14,7 +14,7 @@ use std::collections::HashMap;
 
 use adv_cpu::backend::{Guest, Prot};
 use adv_machine::layout::PAGE;
-use adv_machine::{Conv, Env, EnvLeafHandler, Ext, HostFn, Outcome, Sys};
+use adv_machine::{Conv, Env, Ext, HostFn, Outcome, Sys};
 use iced_x86::{Decoder, DecoderOptions, FlowControl, OpKind};
 
 use crate::identity::{self, Images};
@@ -34,12 +34,26 @@ pub use zlib::InflateFast;
 /// The module the bodies' thunks are registered under.
 pub const MODULE: &str = "hitode.native";
 
+/// A host body: the function's return value, or None to decline before
+/// any observable effect.
+type BodyFn = fn(&mut Env<'_>) -> Option<u64>;
+
 struct Body {
     /// The image and function, which also names the thunk.
     name: std::borrow::Cow<'static, str>,
     conv: Conv,
-    leaf: EnvLeafHandler,
+    body: BodyFn,
+    /// Runs the function itself after the body declined.
     handler: adv_machine::Handler,
+}
+
+/// Calls whose body declined, so that Wine's own code ran.
+#[derive(Default)]
+struct Declines(u64);
+
+/// The calls whose body declined so far.
+pub fn declines(ext: &Ext) -> u64 {
+    ext.try_get::<Declines>().map_or(0, |declines| declines.0)
 }
 
 static BODIES: std::sync::LazyLock<Vec<Body>> = std::sync::LazyLock::new(|| {
@@ -47,74 +61,74 @@ static BODIES: std::sync::LazyLock<Vec<Body>> = std::sync::LazyLock::new(|| {
         Body {
             name: "ntdll.dll!memcpy".into(),
             conv: Conv::Cdecl { argc: 3 },
-            leaf: memmove,
+            body: memmove,
             handler: resume_original,
         },
         Body {
             name: "dsound.dll!DSOUND_MixToPrimary".into(),
             conv: Conv::Cdecl { argc: 6 },
-            leaf: mixer::mix,
+            body: mixer::mix,
             handler: mixer::resume,
         },
         Body {
             name: "ntdll.dll!NtQueryPerformanceCounter".into(),
             conv: Conv::Stdcall { argc: 2 },
-            leaf: query_performance_counter,
+            body: query_performance_counter,
             handler: resume_original,
         },
         #[cfg(any(target_vendor = "apple", target_os = "android"))]
         Body {
             name: "win32u.dll!NtUserGetKeyState".into(),
             conv: Conv::Stdcall { argc: 1 },
-            leaf: input::key_state,
+            body: input::key_state,
             handler: resume_original,
         },
         Body {
             name: "kernelbase.dll!MultiByteToWideChar".into(),
             conv: Conv::Stdcall { argc: 6 },
-            leaf: nls::multi_byte_to_wide_char,
+            body: nls::multi_byte_to_wide_char,
             handler: resume_original,
         },
         Body {
             name: "kernelbase.dll!WideCharToMultiByte".into(),
             conv: Conv::Stdcall { argc: 8 },
-            leaf: nls::wide_char_to_multi_byte,
+            body: nls::wide_char_to_multi_byte,
             handler: resume_original,
         },
         Body {
             name: "ntdll.dll!RtlMultiByteToUnicodeN".into(),
             conv: Conv::Stdcall { argc: 5 },
-            leaf: nls::rtl_multi_byte_to_unicode_n,
+            body: nls::rtl_multi_byte_to_unicode_n,
             handler: resume_original,
         },
         Body {
             name: "ntdll.dll!RtlUnicodeToMultiByteN".into(),
             conv: Conv::Stdcall { argc: 5 },
-            leaf: nls::rtl_unicode_to_multi_byte_n,
+            body: nls::rtl_unicode_to_multi_byte_n,
             handler: resume_original,
         },
         Body {
             name: "ntdll.dll!RtlMultiByteToUnicodeSize".into(),
             conv: Conv::Stdcall { argc: 3 },
-            leaf: nls::rtl_multi_byte_to_unicode_size,
+            body: nls::rtl_multi_byte_to_unicode_size,
             handler: resume_original,
         },
         Body {
             name: "ntdll.dll!RtlUnicodeToMultiByteSize".into(),
             conv: Conv::Stdcall { argc: 3 },
-            leaf: nls::rtl_unicode_to_multi_byte_size,
+            body: nls::rtl_unicode_to_multi_byte_size,
             handler: resume_original,
         },
         Body {
             name: "ntdll.dll!RtlOemToUnicodeN".into(),
             conv: Conv::Stdcall { argc: 5 },
-            leaf: nls::rtl_oem_to_unicode_n,
+            body: nls::rtl_oem_to_unicode_n,
             handler: resume_original,
         },
         Body {
             name: "ntdll.dll!RtlUnicodeToOemN".into(),
             conv: Conv::Stdcall { argc: 5 },
-            leaf: nls::rtl_unicode_to_oem_n,
+            body: nls::rtl_unicode_to_oem_n,
             handler: resume_original,
         },
     ];
@@ -123,7 +137,7 @@ static BODIES: std::sync::LazyLock<Vec<Body>> = std::sync::LazyLock::new(|| {
         bodies.push(Body {
             name: format!("d3dx9_{version}.dll!d3dx_load_pixels_from_pixels").into(),
             conv: Conv::Cdecl { argc: 6 },
-            leaf: pixels::load,
+            body: pixels::load,
             handler: resume_original,
         });
     }
@@ -134,19 +148,35 @@ static BODIES: std::sync::LazyLock<Vec<Body>> = std::sync::LazyLock::new(|| {
 
 /// The host functions of the bodies.
 pub(crate) fn host_fn(name: &str) -> Option<HostFn> {
-    let body = BODIES
-        .iter()
-        .chain(dib::BODIES)
-        .find(|body| body.name == name)?;
+    let (index, body) = bodies().enumerate().find(|(_, body)| body.name == name)?;
     Some(HostFn {
         leaf: None,
-        env_leaf: Some(body.leaf),
         conv: body.conv,
-        handler: body.handler,
-        data: 0,
+        handler: run,
+        data: index as u64,
         trace: false,
         guest: None,
     })
+}
+
+fn bodies() -> impl Iterator<Item = &'static Body> {
+    BODIES.iter().chain(dib::BODIES)
+}
+
+/// The handler of a body's thunk: the body, or the function itself when
+/// the body declines.
+fn run(env: &mut Env<'_>) -> Outcome {
+    let index = env.sys.thunks.get(env.thunk).f.data as usize;
+    let body = BODIES
+        .get(index)
+        .unwrap_or_else(|| &dib::BODIES[index - BODIES.len()]);
+    match (body.body)(env) {
+        Some(value) => Outcome::Return64(value),
+        None => {
+            env.ext.get_or_default::<Declines>().0 += 1;
+            (body.handler)(env)
+        }
+    }
 }
 
 /// The trampolines of this process: their page, its used bytes, and each

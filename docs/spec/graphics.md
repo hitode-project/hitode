@@ -127,24 +127,15 @@ Intermediate color damage MUST propagate through proven axis-aligned copies and 
 Unknown allocations redraw fully; nonrotating targets have age one. Clear and copy respect the clip. Early flushes conservatively invalidate damage history. DISCARD rotation requires an initial full overwrite so replay reconstructs stale slots exactly. Accumulating frames restore the last logical backbuffer when necessary and keep the snapshot path. Early reads restore that baseline too. Diagnostic verification executes full frames while still computing damage and reading the actual presented allocation. No presentation cadence or audio behavior changes.
 Immutable snapshot presentation MUST preserve known color damage, just as rotating presentation does. Draws whose conservative bounds do not intersect the required execution region MUST be omitted before backend submission.
 
-### GFX-REC-6 D3D9 leaf admission
+### GFX-REC-6 D3D9 unchanged calls
 
-**Rule**: Only the methods below MAY enter EnvLeaf without blocking, guest callbacks or guest memory allocation and release. New Draw and Clear admission MUST decline before side effects when recording might flush, wait or execute immediately. Declined calls MUST execute their ordinary adapter with identical state, commands and guest results.
+**Rule**: Binding setters and state-block Capture and Apply that change nothing MUST return D3D_OK before validation, reference transfers or command recording. Calls MUST take their full handler while recording, for invalid objects, and when SetTexture would restore managed residency or flush dirty levels.
 **Verification**: Test
-**Basis**: A64-CTL-12
 
-| Methods | Admission |
+| Methods | Unchanged when |
 |---|---|
-| Set/GetRenderState, Set/GetTextureStageState, Set/GetSamplerState, Set/GetTransform, Set/GetViewport, Set/GetScissorRect | Synchronous state and guest memory access. |
-| GetFVF, GetTexture, GetStreamSource, GetIndices, GetVertexDeclaration, GetVertexShader, GetPixelShader | Query state and retain existing COM identities. |
-| Set/GetVertexShaderConstantF/I/B, Set/GetPixelShaderConstantF/I/B, BeginScene, EndScene | Synchronous constants and scene state. |
-| SetTexture, SetStreamSource, SetIndices, SetVertexShader, SetPixelShader, SetVertexDeclaration, SetFVF, StateBlock Capture/Apply | Any replaced binding retains public ownership; unchanged bindings may have zero public references. SetTexture additionally requires no residency restoration or dirty-level flush. |
-| DrawPrimitive, DrawIndexedPrimitive, DrawPrimitiveUP, DrawIndexedPrimitiveUP, Clear | No active flush; incoming command and conservative byte bound remain strictly below 4096 commands and 64 MiB. UP additionally requires empty bindings it would clear. |
-
-Binding and state-block admission checks all releases before mutation. Calls that
-could free guest storage or restore texture residency decline to the ordinary
-path. Rebinding an unchanged live object avoids redundant validation and reference
-transfers; state-block recording still captures unchanged setter membership.
+| SetTexture, SetStreamSource, SetIndices, SetVertexShader, SetPixelShader, SetVertexDeclaration, SetFVF | The incoming object identity, and any offset, stride or FVF, equal the bound state. |
+| StateBlock Capture, Apply | Every captured value equals the device state. |
 
 ### GFX-REC-7 Shader constant ranges and content hashing
 

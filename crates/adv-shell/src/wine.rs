@@ -391,8 +391,6 @@ fn report(
         ),
         format!("\"guest_contexts\": {}", sys.contexts.len()),
         format!("\"host_calls\": {}", sys.host_calls),
-        format!("\"leaf_host_calls\": {}", sys.stats.leaf_calls),
-        format!("\"leaf_host_abandons\": {}", sys.stats.leaf_abandons),
         format!("\"tls_images\": {}", sys.tls_images.len()),
         format!(
             "\"time_skip\": {{\"enabled\": {}, \"jumps\": {}, \"skipped_guest_us\": {}}}",

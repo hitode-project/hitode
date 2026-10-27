@@ -169,7 +169,11 @@ fn ntdll_memcpy_matches_wine() {
         call(&mut reference, &data, args),
     );
     assert!(faulted.is_err(), "{faulted:?}");
-    assert_eq!(native.sys.stats.leaf_abandons, 1, "the body declined");
+    assert_eq!(
+        adv_nt::native::declines(&native.ext),
+        1,
+        "the body declined"
+    );
     assert_eq!(faulted, expected);
     let mut copied = [0; 100];
     native.cpu.read(DATA, &mut copied).unwrap();

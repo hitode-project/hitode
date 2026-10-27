@@ -149,7 +149,6 @@ pub(super) fn host_fn(module: &str, name: &str) -> Option<HostFn> {
     };
     Some(HostFn {
         conv: Conv::Cdecl { argc },
-        env_leaf: Some(native),
         handler: call,
         data: index.parse().ok()?,
         trace: false,

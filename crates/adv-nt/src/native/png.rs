@@ -1,6 +1,6 @@
 //! Pinned libpng row ABIs. Device math is supplied by the codec assembly.
 use adv_cpu::backend::Prot;
-use adv_machine::{Conv, Env, EnvLeafHandler};
+use adv_machine::{Conv, Env};
 
 #[derive(Clone, Copy)]
 pub enum PngFilter {
@@ -14,7 +14,7 @@ pub enum PngFilter {
 pub struct PngRows(pub fn(PngFilter, &mut [u8], &[u8], usize) -> bool);
 
 pub(super) fn bodies() -> Vec<super::Body> {
-    let entries: &[(&str, EnvLeafHandler)] = &[
+    let entries: &[(&str, super::BodyFn)] = &[
         ("png_read_filter_row_sub", sub),
         ("png_read_filter_row_up", up),
         ("png_read_filter_row_avg", average),
@@ -23,10 +23,10 @@ pub(super) fn bodies() -> Vec<super::Body> {
     ];
     entries
         .iter()
-        .map(|(name, leaf)| super::Body {
+        .map(|(name, body)| super::Body {
             name: format!("windowscodecs.dll!{name}").into(),
             conv: Conv::Cdecl { argc: 3 },
-            leaf: *leaf,
+            body: *body,
             handler: super::resume_original,
         })
         .collect()

@@ -95,9 +95,6 @@ cpu_runs,host_calls,sched,polls,frontend_wakes,blocks,block_bytes";
 
 #[derive(Default)]
 pub struct Stats {
-    pub leaf_calls: u64,
-    pub leaf_abandons: u64,
-    leaf_counts: Vec<(u64, u64)>,
     pub frame_budget: Option<crate::frame_budget::FrameBudget>,
     pub wait_diagnostics: Option<crate::wait_diagnostics::WaitDiagnostics>,
     /// Take wall-clock timings and keep per-frame rows.
@@ -114,42 +111,6 @@ pub struct Stats {
 }
 
 impl Stats {
-    pub(crate) fn leaf(&mut self, thunk: u32, thunks: &ThunkTable) {
-        self.leaf_calls += 1;
-        if !(self.enabled || self.services_enabled || self.frame_budget.is_some()) {
-            return;
-        }
-        self.note_leaf(thunk, false);
-        if let Some(budget) = &mut self.frame_budget {
-            budget.leaf(thunk, thunks, false);
-        }
-        let i = thunk as usize;
-        if self.per_thunk.len() <= i {
-            self.per_thunk.resize(i + 1, (0, 0, 0));
-        }
-        self.per_thunk[i].1 += 1;
-    }
-
-    fn note_leaf(&mut self, thunk: u32, abandon: bool) {
-        self.leaf_counts
-            .resize(self.leaf_counts.len().max(thunk as usize + 1), (0, 0));
-        let counts = &mut self.leaf_counts[thunk as usize];
-        if abandon {
-            counts.1 += 1;
-        } else {
-            counts.0 += 1;
-        }
-    }
-    pub(crate) fn leaf_abandon(&mut self, thunk: u32, thunks: &ThunkTable) {
-        if !(self.enabled || self.services_enabled || self.frame_budget.is_some()) {
-            return;
-        }
-        self.note_leaf(thunk, true);
-        if let Some(budget) = &mut self.frame_budget {
-            budget.leaf(thunk, thunks, true);
-        }
-    }
-
     pub fn new() -> Self {
         Self {
             total: FrameRow {
@@ -342,29 +303,22 @@ impl Stats {
     ) -> io::Result<()> {
         writeln!(
             writer,
-            "module,function,calls,total_ns,max_ns,leaf_calls,leaf_abandons,guest_calls,ordinary_calls,guest_fraction,leaf_fraction"
+            "module,function,calls,total_ns,max_ns,guest_calls,ordinary_calls,guest_fraction"
         )?;
         for (i, thunk) in thunks.iter() {
             let (ns, calls, max) = self.per_thunk.get(i as usize).copied().unwrap_or_default();
-            let (leaves, abandons) = self
-                .leaf_counts
-                .get(i as usize)
-                .copied()
-                .unwrap_or_default();
             let [entries, own, linked] = thunks.guest_counts(cpu, i);
             let guest = entries.saturating_sub(own + linked);
-            let ordinary = calls.saturating_sub(leaves) + linked;
-            let total = (guest + ordinary + leaves).max(1) as f64;
-            if guest + ordinary + leaves + abandons == 0 {
+            let ordinary = calls + linked;
+            if guest + ordinary == 0 {
                 continue;
             }
             writeln!(
                 writer,
-                "\"{}\",\"{}\",{calls},{ns},{max},{leaves},{abandons},{guest},{ordinary},{:.6},{:.6}",
+                "\"{}\",\"{}\",{calls},{ns},{max},{guest},{ordinary},{:.6}",
                 thunk.module.replace('"', "\"\""),
                 thunk.name.replace('"', "\"\""),
-                guest as f64 / total,
-                leaves as f64 / total
+                guest as f64 / (guest + ordinary) as f64
             )?;
         }
         Ok(())

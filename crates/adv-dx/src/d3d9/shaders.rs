@@ -300,15 +300,9 @@ pub(super) fn register(registry: &mut Registry) {
         pixel_function_ABI,
         create_vertex_ABI,
         create_pixel_ABI,
-        adv_abi::Api {
-            env_leaf: Some(super::leaf_calls::binding),
-            ..set_vertex_ABI
-        },
+        super::unchanged::unless_unchanged!(set_vertex_ABI, super::unchanged::binding),
         get_vertex_ABI,
-        adv_abi::Api {
-            env_leaf: Some(super::leaf_calls::binding),
-            ..set_pixel_ABI
-        },
+        super::unchanged::unless_unchanged!(set_pixel_ABI, super::unchanged::binding),
         get_pixel_ABI,
         set_vertex_f_ABI,
         get_vertex_f_ABI,
@@ -628,7 +622,7 @@ fn get_shader(env: &mut Env<'_>, this: GuestPtr<()>, output: GuestPtr<u32>, stag
 pub(super) fn set_vertex(env: &mut Env<'_>, this: GuestPtr<()>, pointer: GuestPtr<()>) -> u32 {
     set_shader(env, this, pointer, Stage::Vertex)
 }
-#[win32(d3d9,name="IDirect3DDevice9::GetVertexShader",level=implement,leaf)]
+#[win32(d3d9,name="IDirect3DDevice9::GetVertexShader",level=implement)]
 pub(super) fn get_vertex(env: &mut Env<'_>, this: GuestPtr<()>, output: GuestPtr<u32>) -> u32 {
     get_shader(env, this, output, Stage::Vertex)
 }
@@ -636,7 +630,7 @@ pub(super) fn get_vertex(env: &mut Env<'_>, this: GuestPtr<()>, output: GuestPtr
 pub(super) fn set_pixel(env: &mut Env<'_>, this: GuestPtr<()>, pointer: GuestPtr<()>) -> u32 {
     set_shader(env, this, pointer, Stage::Pixel)
 }
-#[win32(d3d9,name="IDirect3DDevice9::GetPixelShader",level=implement,leaf)]
+#[win32(d3d9,name="IDirect3DDevice9::GetPixelShader",level=implement)]
 pub(super) fn get_pixel(env: &mut Env<'_>, this: GuestPtr<()>, output: GuestPtr<u32>) -> u32 {
     get_shader(env, this, output, Stage::Pixel)
 }
@@ -846,7 +840,7 @@ fn constants_get(
 }
 macro_rules! constant_api {
     ($set:ident,$get:ident,$set_name:tt,$get_name:tt,$stage:ident,$kind:ident,$ty:ty) => {
-        #[win32(d3d9,name=$set_name,level=state,leaf)]
+        #[win32(d3d9,name=$set_name,level=state)]
         pub(super) fn $set(
             env: &mut Env<'_>,
             this: GuestPtr<()>,
@@ -864,7 +858,7 @@ macro_rules! constant_api {
                 ConstantKind::$kind,
             )
         }
-        #[win32(d3d9,name=$get_name,level=implement,leaf)]
+        #[win32(d3d9,name=$get_name,level=implement)]
         pub(super) fn $get(
             env: &mut Env<'_>,
             this: GuestPtr<()>,

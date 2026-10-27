@@ -26,7 +26,6 @@ impl Resolver for Platform {
             handler,
             data: 0,
             leaf: None,
-            env_leaf: None,
             trace: false,
             guest: None,
         })

@@ -348,7 +348,7 @@ fn codepage<'a>(mem: &mut Memory<'a>, base: u32, mut code: u32) -> Option<CodePa
             return CodePage::load(mem, at);
         }
     }
-    // Wine loads uncached pages through NT services, outside a leaf body.
+    // Wine loads uncached pages through NT services, outside a body.
     None
 }
 

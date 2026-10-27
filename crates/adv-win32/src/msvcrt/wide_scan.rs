@@ -12,7 +12,6 @@ pub(super) fn register(registry: &mut Registry) {
             module,
             name: "swscanf_s",
             conv: Conv::CdeclVariadic { fixed: 2 },
-            env_leaf: None,
             handler: scan,
             level: ImplementationLevel::Implement,
         });

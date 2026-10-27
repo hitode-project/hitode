@@ -13,18 +13,18 @@ macro_rules! handler {
     (halftone) => {
         resume_halftone
     };
-    ($leaf:ident) => {
+    ($body:ident) => {
         super::resume_original
     };
 }
 macro_rules! bodies {
-    ($( $leaf:ident, $argc:literal => [$($name:literal),*]; )*) => {
+    ($( $body:ident, $argc:literal => [$($name:literal),*]; )*) => {
         pub(super) const BODIES: &[super::Body] = &[$($(
             super::Body {
                 name: std::borrow::Cow::Borrowed(concat!("win32u.so!", $name)),
                 conv: Conv::Cdecl { argc: $argc },
-                leaf: $leaf,
-                handler: handler!($leaf),
+                body: $body,
+                handler: handler!($body),
             },
         )*)*];
     };
@@ -1373,7 +1373,7 @@ fn halftone(env: &mut Env<'_>) -> Option<u64> {
     mem.commit()
 }
 
-// Capture the guest's SSE controls without expanding the leaf CPU state.
+// Capture the guest's SSE controls through the adapter.
 pub(super) fn entry(cpu: &mut dyn Guest, sys: &mut Sys, thunk: u32) -> Result<u32, String> {
     let at = sys
         .vm

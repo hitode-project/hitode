@@ -193,7 +193,7 @@ fn compare(
     accepted: bool,
     label: &str,
 ) {
-    let before = native.sys.stats.leaf_abandons;
+    let before = adv_nt::native::declines(&native.ext);
     let mut actual = call(native, data, &[DATA, start]);
     let mut expected = call(reference, data, &[DATA, start]);
     actual.0.as_mut().unwrap()[0] = 0; // void ABI
@@ -205,7 +205,7 @@ fn compare(
         actual.1.iter().zip(&expected.1).position(|(a, b)| a != b)
     );
     assert_eq!(
-        native.sys.stats.leaf_abandons == before,
+        adv_nt::native::declines(&native.ext) == before,
         accepted,
         "{label}: native acceptance"
     );

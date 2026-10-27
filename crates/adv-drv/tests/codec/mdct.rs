@@ -21,7 +21,6 @@ impl Resolver for Platform {
                 trace: false,
                 guest: None,
                 leaf: None,
-                env_leaf: None,
             });
         }
         super::super::host_fn(module, name)

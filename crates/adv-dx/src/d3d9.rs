@@ -12,6 +12,8 @@ use adv_machine::{Env, Ext, Machine, Object, Objects, Outcome, Wait};
 #[cfg(test)]
 use adv_os::Heaps;
 use resources::Resource;
+#[cfg(all(test, target_arch = "aarch64"))]
+mod call_tests;
 mod capabilities;
 mod creation;
 mod cursor;
@@ -20,7 +22,6 @@ pub(crate) mod direct;
 mod dirty;
 mod fixed;
 mod format;
-mod leaf_calls;
 pub(crate) mod loading;
 mod memory;
 mod pacing;
@@ -34,6 +35,7 @@ mod stretch;
 mod targets;
 #[cfg(test)]
 mod tests;
+mod unchanged;
 mod update_texture;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -370,10 +372,7 @@ pub fn register(registry: &mut Registry) {
         get_direct3d_ABI,
         begin_scene_ABI,
         end_scene_ABI,
-        adv_abi::Api {
-            env_leaf: Some(leaf_calls::draw),
-            ..clear_ABI
-        },
+        clear_ABI,
         present_ABI,
         reset_ABI,
     ] {
@@ -1350,7 +1349,7 @@ fn reset(
     }
     (provider.mode_changed)(env, this.addr(), normalized)
 }
-#[win32(d3d9, name = "IDirect3DDevice9::BeginScene", level = state, leaf)]
+#[win32(d3d9, name = "IDirect3DDevice9::BeginScene", level = state)]
 fn begin_scene(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
     let Some(Payload::Device(d)) = com(env).get_mut::<Payload>(&mut env.sys.objects, this.addr())
     else {
@@ -1362,7 +1361,7 @@ fn begin_scene(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
     d.scene = true;
     0
 }
-#[win32(d3d9, name = "IDirect3DDevice9::EndScene", level = state, leaf)]
+#[win32(d3d9, name = "IDirect3DDevice9::EndScene", level = state)]
 fn end_scene(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
     let Some(Payload::Device(d)) = com(env).get_mut::<Payload>(&mut env.sys.objects, this.addr())
     else {

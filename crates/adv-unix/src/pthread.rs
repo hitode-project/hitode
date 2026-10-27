@@ -256,7 +256,7 @@ fn run_once(env: &mut Env<'_>, control: u32, init: u32) -> Outcome {
 #[cfg(test)]
 // spec: A64-CTL-12
 #[test]
-fn mutex_leaves_lock_recurse_unlock_and_decline() {
+fn mutexes_lock_recurse_unlock_and_block_contenders() {
     use adv_cpu::JitCpu;
     use adv_cpu::backend::{Guest, Prot, Reg};
     use adv_machine::{Clock, Machine, layout::PARK_ADDR};
@@ -291,10 +291,11 @@ fn mutex_leaves_lock_recurse_unlock_and_decline() {
             ext: &mut m.ext,
             thunk: index,
         };
-        assert_eq!(
-            binding.env_leaf.unwrap()(&mut env),
-            result.map(|v| (0x12345678u64 << 32) | v)
-        );
+        let returned = match (binding.handler)(&mut env) {
+            Outcome::Return(value) => Some(value),
+            _ => None,
+        };
+        assert_eq!(returned, result);
         assert_eq!(locks(&mut env).mutexes.get(&mutex).copied(), held);
         assert_eq!(env.cpu.reg(Reg::Esp), stack);
     }

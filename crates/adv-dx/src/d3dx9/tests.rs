@@ -874,7 +874,6 @@ fn unavailable_surface_encoding_clears_output_without_reading_surface() {
         module: "d3dx9_43.dll",
         name: "D3DXSaveSurfaceToFileInMemory",
         conv: api.conv,
-        env_leaf: None,
         handler: api.handler,
         level: ImplementationLevel::SafeFail,
     };
@@ -889,112 +888,5 @@ fn unavailable_surface_encoding_clears_output_without_reading_surface() {
             fixture.0.cpu.read_u32(OUTPUT).unwrap(),
             if output == OUTPUT { 0 } else { 0x13579bdf }
         );
-    }
-}
-
-// spec: WIN32-API-15, A64-CTL-12
-#[test]
-fn math_leaves_match_all_exports_and_decline_invalid_ranges_without_writes() {
-    for module in ["d3dx9_43.dll", "d3dx9_29.dll"] {
-        for api in [
-            multiply_ABI,
-            transpose_ABI,
-            scaling_ABI,
-            translation_ABI,
-            rotation_yaw_pitch_roll_ABI,
-            rotation_y_ABI,
-            rotation_x_ABI,
-            rotation_z_ABI,
-            perspective_fov_lh_ABI,
-            transform4_ABI,
-            transform3_ABI,
-            transform_coord_ABI,
-            transform2_ABI,
-            transform2_coord_ABI,
-            transform2_normal_ABI,
-            catmull_rom_ABI,
-            look_at_ABI,
-            project_ABI,
-        ] {
-            let mut args = match api.name {
-                "D3DXMatrixMultiply" => vec![OUTPUT, LEFT, RIGHT],
-                "D3DXMatrixTranspose" => vec![OUTPUT, LEFT],
-                "D3DXMatrixLookAtLH" => vec![OUTPUT, VECTOR, VECTOR, VECTOR],
-                "D3DXVec3CatmullRom" => {
-                    vec![OUTPUT, VECTOR, VECTOR, VECTOR, VECTOR, 0.4f32.to_bits()]
-                }
-                "D3DXVec3Project" => vec![OUTPUT, VECTOR, VIEWPORT, PROJECTION, VIEW, LEFT],
-                name if name.starts_with("D3DXVec") => vec![OUTPUT, VECTOR, LEFT],
-                _ => {
-                    let Conv::Stdcall { argc } = api.conv else {
-                        unreachable!()
-                    };
-                    let mut args = vec![0.4f32.to_bits(); usize::from(argc)];
-                    args[0] = OUTPUT;
-                    args
-                }
-            };
-            let mut cases = Vec::new();
-            for output in [OUTPUT, LEFT, READ_ONLY, UNMAPPED, DATA + 4092] {
-                args[0] = output;
-                cases.push(args.clone());
-            }
-            args[0] = OUTPUT;
-            for i in 1..args.len() {
-                if [LEFT, RIGHT, VECTOR, VIEWPORT, PROJECTION, VIEW].contains(&args[i]) {
-                    let mut invalid = args.clone();
-                    invalid[i] = UNMAPPED;
-                    cases.push(invalid);
-                }
-            }
-            for args in cases {
-                let output = args[0];
-                let mut fast = Fixture::new();
-                let mut ordinary = Fixture::new();
-                for fixture in [&mut fast, &mut ordinary] {
-                    fixture.projection_inputs();
-                    fixture.put(OUTPUT, [0xababababu32; 16]);
-                }
-                let expected = ordinary.call(api, &args);
-                let entry = fast.0.resolve_import(module, api.name).unwrap();
-                let thunk =
-                    (entry - adv_machine::layout::THUNK_BASE) / adv_machine::layout::THUNK_STRIDE;
-                fast.0.cpu.set_reg(Reg::Esp, STACK);
-                for (i, arg) in args.iter().enumerate() {
-                    fast.0
-                        .cpu
-                        .write_u32(STACK + 4 + i as u32 * 4, *arg)
-                        .unwrap();
-                }
-                let before = fast.bytes(DATA, 4096);
-                let binding = fast.0.sys.thunks.get(thunk).f;
-                let mut env = Env {
-                    context: fast.0.sys.current,
-                    cpu: &mut fast.0.cpu,
-                    sys: &mut fast.0.sys,
-                    ext: &mut fast.0.ext,
-                    thunk,
-                };
-                let value = binding.env_leaf.unwrap()(&mut env);
-                if [READ_ONLY, UNMAPPED, DATA + 4092].contains(&output) || args.contains(&UNMAPPED)
-                {
-                    assert_eq!(value, None, "{}", api.name);
-                    assert_eq!(fast.bytes(DATA, 4096), before);
-                    assert_eq!(fast.call(api, &args), expected);
-                } else {
-                    assert_eq!(value.unwrap() as u32, expected, "{}", api.name);
-                }
-                assert_eq!(
-                    fast.bytes(DATA, 4096),
-                    ordinary.bytes(DATA, 4096),
-                    "{}",
-                    api.name
-                );
-                assert_eq!(
-                    fast.0.cpu.read_u32(teb_addr(0) + teb::LAST_ERROR).unwrap(),
-                    ERROR
-                );
-            }
-        }
     }
 }

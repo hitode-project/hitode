@@ -7,8 +7,6 @@ use adv_abi::{
 };
 use adv_cpu::backend::Prot;
 
-pub(super) mod leaves;
-
 pub(super) type OpenDone = operations::Done<u32>;
 
 pub(super) fn error(env: &mut Env<'_>, status: u32, result: u32) -> Outcome {

@@ -32,7 +32,7 @@ impl Unit {
             let body = &self.trace.insts[start..=end];
             if body.iter().enumerate().any(|(n, i)| {
                 i.mode != Mode::Plain
-                    || i.leaf.is_some()
+                    || i.call.is_some()
                     || matches!(i.op, super::decode::Op::Helper(_))
                     || checked(i.pc)
                     || (n != 0 && (self.trace.head(start + n) || self.trace.merge[start + n]))

@@ -39,13 +39,9 @@ pub fn register(registry: &mut Registry) {
         look_at_ABI,
         project_ABI,
     ] {
-        registry.register(adv_abi::Api {
-            env_leaf: Some(math_leaf),
-            ..api
-        });
+        registry.register(api);
         registry.register(adv_abi::Api {
             module: "d3dx9_29.dll",
-            env_leaf: Some(math_leaf),
             ..api
         });
     }
@@ -56,47 +52,6 @@ pub fn register(registry: &mut Registry) {
     texture_create::register(registry);
     save_file::register(registry);
     sprite::register(registry);
-}
-
-fn math_leaf(env: &mut Env<'_>) -> Option<u64> {
-    use adv_abi::guest::check_range;
-    use adv_cpu::backend::Prot;
-    let thunk = env.sys.thunks.get(env.thunk);
-    let name = thunk.name.as_str();
-    let binding = thunk.f;
-    let mut arguments = adv_abi::Arguments::new(env.cpu);
-    let mut args = [0u32; 7];
-    let adv_abi::Conv::Stdcall { argc } = binding.conv else {
-        unreachable!()
-    };
-    for arg in &mut args[..usize::from(argc)] {
-        *arg = arguments.next().ok()?;
-    }
-    let (output, inputs): (u32, &[(usize, u32)]) = match name {
-        "D3DXMatrixMultiply" => (64, &[(1, 64), (2, 64)]),
-        "D3DXMatrixTranspose" => (64, &[(1, 64)]),
-        "D3DXMatrixLookAtLH" => (64, &[(1, 12), (2, 12), (3, 12)]),
-        "D3DXVec2Transform" => (16, &[(1, 8), (2, 64)]),
-        "D3DXVec2TransformCoord" | "D3DXVec2TransformNormal" => (8, &[(1, 8), (2, 64)]),
-        "D3DXVec3Transform" => (16, &[(1, 12), (2, 64)]),
-        "D3DXVec3TransformCoord" => (12, &[(1, 12), (2, 64)]),
-        "D3DXVec4Transform" => (16, &[(1, 16), (2, 64)]),
-        "D3DXVec3CatmullRom" => (12, &[(1, 12), (2, 12), (3, 12), (4, 12)]),
-        "D3DXVec3Project" => (12, &[(1, 12), (2, 24), (3, 64), (4, 64), (5, 64)]),
-        _ => (64, &[]),
-    };
-    check_range(env.cpu, args[0], output, Prot::WRITE).ok()?;
-    let mut input = [0; 64];
-    for &(index, length) in inputs {
-        check_range(env.cpu, args[index], length, Prot::READ).ok()?;
-        env.cpu
-            .read(args[index], &mut input[..length as usize])
-            .ok()?;
-    }
-    let adv_machine::Outcome::Return(result) = (binding.handler)(env) else {
-        return None;
-    };
-    (result != 0).then(|| (u64::from(adv_abi::leaf_edx(env)) << 32) | u64::from(result))
 }
 
 fn product(left: Matrix, right: Matrix) -> Matrix {
@@ -117,7 +72,7 @@ fn transform_value(vector: Vector4, matrix: Matrix) -> Vector4 {
     })
 }
 
-#[win32(d3dx9_43, name = "D3DXMatrixScaling", level = implement, leaf)]
+#[win32(d3dx9_43, name = "D3DXMatrixScaling", level = implement)]
 fn scaling(
     env: &mut Env<'_>,
     output: GuestPtr<Matrix>,
@@ -141,7 +96,7 @@ fn scaling_value(sx: f32, sy: f32, sz: f32) -> Matrix {
     ]
 }
 
-#[win32(d3dx9_43, name = "D3DXMatrixTranslation", level = implement, leaf)]
+#[win32(d3dx9_43, name = "D3DXMatrixTranslation", level = implement)]
 fn translation(
     env: &mut Env<'_>,
     output: GuestPtr<Matrix>,
@@ -162,7 +117,7 @@ fn translation_value(x: f32, y: f32, z: f32) -> Matrix {
     [1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., x, y, z, 1.]
 }
 
-#[win32(d3dx9_43, name = "D3DXMatrixRotationYawPitchRoll", level = implement, leaf)]
+#[win32(d3dx9_43, name = "D3DXMatrixRotationYawPitchRoll", level = implement)]
 fn rotation_yaw_pitch_roll(
     env: &mut Env<'_>,
     output: GuestPtr<Matrix>,
@@ -205,7 +160,7 @@ fn rotation_yaw_pitch_roll_value(yaw: f32, pitch: f32, roll: f32) -> Matrix {
     ]
 }
 
-#[win32(d3dx9_43, name = "D3DXMatrixRotationY", level = implement, leaf)]
+#[win32(d3dx9_43, name = "D3DXMatrixRotationY", level = implement)]
 fn rotation_y(env: &mut Env<'_>, output: GuestPtr<Matrix>, angle: f32) -> GuestPtr<Matrix> {
     let (sin, cos) = angle.sin_cos();
     let value = [
@@ -218,7 +173,7 @@ fn rotation_y(env: &mut Env<'_>, output: GuestPtr<Matrix>, angle: f32) -> GuestP
     }
 }
 
-#[win32(d3dx9_43, name = "D3DXMatrixRotationX", level = implement, leaf)]
+#[win32(d3dx9_43, name = "D3DXMatrixRotationX", level = implement)]
 fn rotation_x(env: &mut Env<'_>, output: GuestPtr<Matrix>, angle: f32) -> GuestPtr<Matrix> {
     let (s, c) = angle.sin_cos();
     let value = [1., 0., 0., 0., 0., c, s, 0., 0., -s, c, 0., 0., 0., 0., 1.];
@@ -229,7 +184,7 @@ fn rotation_x(env: &mut Env<'_>, output: GuestPtr<Matrix>, angle: f32) -> GuestP
     }
 }
 
-#[win32(d3dx9_43, name = "D3DXMatrixRotationZ", level = implement, leaf)]
+#[win32(d3dx9_43, name = "D3DXMatrixRotationZ", level = implement)]
 fn rotation_z(env: &mut Env<'_>, output: GuestPtr<Matrix>, angle: f32) -> GuestPtr<Matrix> {
     let (s, c) = angle.sin_cos();
     let value = [c, s, 0., 0., -s, c, 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.];
@@ -252,7 +207,7 @@ fn transform2_value(vector: Vector2, matrix: Matrix, translate: bool) -> Vector4
     })
 }
 
-#[win32(d3dx9_43, name = "D3DXVec2Transform", level = implement, leaf)]
+#[win32(d3dx9_43, name = "D3DXVec2Transform", level = implement)]
 fn transform2(
     env: &mut Env<'_>,
     output: GuestPtr<Vector4>,
@@ -272,7 +227,7 @@ fn transform2(
     }
 }
 
-#[win32(d3dx9_43, name = "D3DXVec2TransformCoord", level = implement, leaf)]
+#[win32(d3dx9_43, name = "D3DXVec2TransformCoord", level = implement)]
 fn transform2_coord(
     env: &mut Env<'_>,
     output: GuestPtr<Vector2>,
@@ -295,7 +250,7 @@ fn transform2_coord(
     }
 }
 
-#[win32(d3dx9_43, name = "D3DXVec2TransformNormal", level = implement, leaf)]
+#[win32(d3dx9_43, name = "D3DXVec2TransformNormal", level = implement)]
 fn transform2_normal(
     env: &mut Env<'_>,
     output: GuestPtr<Vector2>,
@@ -313,7 +268,7 @@ fn transform2_normal(
     }
 }
 
-#[win32(d3dx9_43, name = "D3DXMatrixPerspectiveFovLH", level = implement, leaf)]
+#[win32(d3dx9_43, name = "D3DXMatrixPerspectiveFovLH", level = implement)]
 fn perspective_fov_lh(
     env: &mut Env<'_>,
     output: GuestPtr<Matrix>,
@@ -352,7 +307,7 @@ fn perspective_fov_lh(
     }
 }
 
-#[win32(d3dx9_43, name = "D3DXVec4Transform", level = implement, leaf)]
+#[win32(d3dx9_43, name = "D3DXVec4Transform", level = implement)]
 fn transform4(
     env: &mut Env<'_>,
     output: GuestPtr<Vector4>,
@@ -372,7 +327,7 @@ fn transform4(
     }
 }
 
-#[win32(d3dx9_43, name = "D3DXVec3Transform", level = implement, leaf)]
+#[win32(d3dx9_43, name = "D3DXVec3Transform", level = implement)]
 fn transform3(
     env: &mut Env<'_>,
     output: GuestPtr<Vector4>,
@@ -392,7 +347,7 @@ fn transform3(
     }
 }
 
-#[win32(d3dx9_43, name = "D3DXVec3TransformCoord", level = implement, leaf)]
+#[win32(d3dx9_43, name = "D3DXVec3TransformCoord", level = implement)]
 fn transform_coord(
     env: &mut Env<'_>,
     output: GuestPtr<Vector>,
@@ -417,7 +372,7 @@ fn transform_coord(
     }
 }
 
-#[win32(d3dx9_43, name = "D3DXVec3CatmullRom", level = implement, leaf)]
+#[win32(d3dx9_43, name = "D3DXVec3CatmullRom", level = implement)]
 fn catmull_rom(
     env: &mut Env<'_>,
     output: GuestPtr<Vector>,
@@ -451,7 +406,7 @@ fn catmull_rom(
     }
 }
 
-#[win32(d3dx9_43, name = "D3DXMatrixMultiply", level = implement, leaf)]
+#[win32(d3dx9_43, name = "D3DXMatrixMultiply", level = implement)]
 fn multiply(
     env: &mut Env<'_>,
     output: GuestPtr<Matrix>,
@@ -469,7 +424,7 @@ fn multiply(
     }
 }
 
-#[win32(d3dx9_43, name = "D3DXMatrixTranspose", level = implement, leaf)]
+#[win32(d3dx9_43, name = "D3DXMatrixTranspose", level = implement)]
 fn transpose(
     env: &mut Env<'_>,
     output: GuestPtr<Matrix>,
@@ -505,7 +460,7 @@ fn normalized(vector: Vector) -> Vector {
     }
 }
 
-#[win32(d3dx9_43, name = "D3DXMatrixLookAtLH", level = implement, leaf)]
+#[win32(d3dx9_43, name = "D3DXMatrixLookAtLH", level = implement)]
 fn look_at(
     env: &mut Env<'_>,
     output: GuestPtr<Matrix>,
@@ -544,7 +499,7 @@ fn look_at(
     }
 }
 
-#[win32(d3dx9_43, name = "D3DXVec3Project", level = implement, leaf)]
+#[win32(d3dx9_43, name = "D3DXVec3Project", level = implement)]
 fn project(
     env: &mut Env<'_>,
     output: GuestPtr<Vector>,

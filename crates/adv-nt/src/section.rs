@@ -634,7 +634,7 @@ pub fn map_image(env: &mut Env<'_>, mapping: u32) -> Result<View, Error> {
 }
 
 /// Code sections of a builtin image, as (RVA, size). They hold copied host
-/// entries (`push token; int`), which run as leaf calls only from registered
+/// entries (`push token; int`), which translated code calls directly only from registered
 /// code pages (A64-CTL-12).
 fn builtin_code<'a>(file: &[u8], pe: &'a Pe) -> impl Iterator<Item = (u32, u32)> + 'a {
     let builtin = file.get(0x40..0x51) == Some(b"Wine builtin DLL\0");

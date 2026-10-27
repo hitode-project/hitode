@@ -333,7 +333,7 @@ fn mixer_matches_wine() {
             );
         }
     }
-    assert_eq!(native.sys.stats.leaf_abandons, 0);
+    assert_eq!(adv_nt::native::declines(&native.ext), 0);
     assert!(native.sys.host_calls > 60);
     assert_eq!(reference.sys.host_calls, 0);
     // Each rejected buffer is last: a decline must leave earlier buffers untouched.
@@ -397,7 +397,7 @@ fn mixer_matches_wine() {
             }
             _ => unreachable!(),
         }
-        let before = native.sys.stats.leaf_abandons;
+        let before = adv_nt::native::declines(&native.ext);
         let actual = call(&mut native, &data);
         let expected = call(&mut reference, &data);
         assert_eq!(actual.0, expected.0, "decline {case}");
@@ -408,7 +408,7 @@ fn mixer_matches_wine() {
         );
         assert!(actual.1 == expected.1, "decline {case} changed memory");
         assert_eq!(
-            native.sys.stats.leaf_abandons - before,
+            adv_nt::native::declines(&native.ext) - before,
             u64::from(case != 8),
             "decline {case}"
         );

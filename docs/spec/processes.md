@@ -240,5 +240,5 @@ Withdrawn: none
 
 ### PROC-MACH-9 Host boundary accounting
 
-**Rule**: Reports MUST expose non-leaf totals and completed guest and leaf fractions per API. Diagnostics MUST distinguish entries, same-binding fallbacks and linked fallbacks while preserving registers, flags and guest patches. Disabled guest bodies and fallback transfers MUST execute no diagnostic counter instructions.
+**Rule**: Reports MUST expose totals and completed guest fractions per API. Diagnostics MUST distinguish entries, same-binding fallbacks and linked fallbacks while preserving registers, flags and guest patches. Disabled guest bodies and fallback transfers MUST execute no diagnostic counter instructions.
 **Verification**: Test

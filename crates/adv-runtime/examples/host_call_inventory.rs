@@ -10,8 +10,6 @@ fn row(module: &str, name: &str, f: HostFn) -> String {
     let api = format!("{module}!{name}");
     let route = if f.guest.is_some() {
         "guest"
-    } else if f.leaf.is_some() || f.env_leaf.is_some() {
-        "leaf"
     } else {
         "ordinary"
     };
@@ -104,7 +102,7 @@ fn row(module: &str, name: &str, f: HostFn) -> String {
             "DLL entry/exception continuation",
             "ordinary continuation",
             "CPU context",
-            "guest lifecycle/exception body; not a host leaf",
+            "guest lifecycle/exception body; not a host call",
         )
     } else if f.guest.is_some() {
         (
@@ -117,18 +115,6 @@ fn row(module: &str, name: &str, f: HostFn) -> String {
                 "guest memory/context"
             },
             "authored guest body; ordinary implementation retained",
-        )
-    } else if route == "leaf" {
-        (
-            if ["GetTickCount", "timeGetTime", "QueryPerformanceCounter"].contains(&name) {
-                "poll fallback only"
-            } else {
-                "no"
-            },
-            "no",
-            "no",
-            "handler-owned state; same source",
-            "explicit nonblocking registration; decline before effects",
         )
     } else {
         // Conservative admission is intentional: source/name similarity cannot
@@ -218,7 +204,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // spec: WIN32-API-15, PROC-MACH-8
+    // spec: PROC-MACH-8
     #[test]
     fn committed_inventory_matches_every_assembled_registration() {
         let expected = include_str!("../../../docs/host-call-boundary.tsv")
@@ -228,24 +214,5 @@ mod tests {
             .join("\n")
             + "\n";
         assert_eq!(inventory(), expected);
-    }
-    // spec: A64-CTL-12
-    #[test]
-    fn eligibility_never_infers_a_leaf_from_a_name() {
-        let mut registry = adv_abi::Registry::default();
-        registry.add(
-            "kernel32.dll",
-            "GetTickCount",
-            adv_abi::Conv::Stdcall { argc: 0 },
-            |_| adv_abi::Outcome::Return(0),
-        );
-        assert!(
-            row(
-                "kernel32.dll",
-                "GetTickCount",
-                registry.get("kernel32.dll", "GetTickCount").unwrap()
-            )
-            .contains("\tordinary\t")
-        );
     }
 }

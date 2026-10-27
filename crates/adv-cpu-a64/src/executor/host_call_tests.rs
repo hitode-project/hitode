@@ -1,4 +1,4 @@
-//! Authored thunk programs compare light calls with the ordinary INT path.
+//! Authored thunk programs compare direct host calls with the ordinary INT path.
 use super::*;
 use crate::native::Checks;
 use crate::translate::Features;
@@ -17,9 +17,11 @@ fn read_word(memory: &Memory, address: u32) -> Result<u32, String> {
     ))
 }
 
+const THUNK_INDEX: u32 = 7;
+
 struct Calls {
     enabled: bool,
-    leaves: u32,
+    direct: u32,
     traps: u32,
     delay: bool,
     interrupt: Option<Arc<AtomicBool>>,
@@ -28,34 +30,32 @@ impl Calls {
     fn new(enabled: bool) -> Self {
         Self {
             enabled,
-            leaves: 0,
+            direct: 0,
             traps: 0,
             delay: false,
             interrupt: None,
         }
     }
-    fn result(&self, state: &mut CpuState, memory: &mut Memory, word: u32) -> u64 {
+    fn result(&self, state: &mut CpuState, memory: &mut Memory) {
+        let word = read_word(memory, state.regs[4]).unwrap();
         state.regs[4] = state.regs[4].wrapping_add(4);
         let arg = read_word(memory, state.regs[4] + 4).unwrap();
         memory.write(arg, &word.to_le_bytes()).unwrap();
-        u64::from(state.regs[2]) << 32 | u64::from(word)
+        state.regs[0] = word;
     }
 }
 impl ExecutionTrap for Calls {
-    fn leaf_call(&self, pc: u32, word: u32) -> bool {
-        self.enabled && pc == THUNK + 5 && [WORD, WORD + 1].contains(&word)
+    fn host_thunk(&self, pc: u32, word: u32) -> Option<u32> {
+        (self.enabled && pc == THUNK + 5 && [WORD, WORD + 1].contains(&word)).then_some(THUNK_INDEX)
     }
-    fn leaf(
+    fn host_call(
         &mut self,
         state: &mut CpuState,
         memory: &mut Memory,
-        pc: u32,
-        word: u32,
-    ) -> Option<u64> {
-        if !self.leaf_call(pc, word) || read_word(memory, state.regs[4]).ok() != Some(word) {
-            return None;
-        }
-        self.leaves += 1;
+        thunk: u32,
+    ) -> Result<bool, String> {
+        assert_eq!((thunk, state.eip), (THUNK_INDEX, THUNK + 7));
+        self.direct += 1;
         if self.delay {
             let end = Instant::now() + std::time::Duration::from_millis(20);
             while Instant::now() < end {
@@ -65,7 +65,8 @@ impl ExecutionTrap for Calls {
         if let Some(flag) = &self.interrupt {
             flag.store(true, Ordering::Release);
         }
-        Some(self.result(state, memory, word))
+        self.result(state, memory);
+        Ok(false)
     }
     fn call(
         &mut self,
@@ -75,10 +76,7 @@ impl ExecutionTrap for Calls {
     ) -> Result<bool, String> {
         assert_eq!(vector, 0x2e);
         self.traps += 1;
-        let word = read_word(memory, state.regs[4]).unwrap();
-        let value = self.result(state, memory, word);
-        state.regs[0] = value as u32;
-        state.regs[2] = (value >> 32) as u32;
+        self.result(state, memory);
         Ok(false)
     }
 }
@@ -131,7 +129,7 @@ fn bytes(executor: &Executor) -> Vec<u8> {
 
 // spec: A64-CTL-7, A64-CTL-12, A64-REG-4, A64-VER-1
 #[test]
-fn leaf_and_trap_match_at_instruction_budget_cuts() {
+fn direct_and_trapped_calls_match_at_instruction_budget_cuts() {
     for flagm in [false, true] {
         for first in [false, true] {
             for checks in [Checks::Adaptive, Checks::All, Checks::Slow] {
@@ -140,7 +138,7 @@ fn leaf_and_trap_match_at_instruction_budget_cuts() {
                 let initial = light.state.clone();
                 let data = light.memory.read(DATA, 0x4000).unwrap().to_vec();
                 let stack = light.memory.read(STACK, 0x4000).unwrap().to_vec();
-                let mut leaves = Calls::new(true);
+                let mut direct = Calls::new(true);
                 let mut traps = Calls::new(false);
                 for budget in [1, 2, 3, 4, 5, 6, 7, 30] {
                     for executor in [&mut light, &mut ordinary] {
@@ -155,7 +153,7 @@ fn leaf_and_trap_match_at_instruction_budget_cuts() {
                         executor.write(STACK, &stack).unwrap();
                     }
                     let a = light
-                        .run_with_traps(stop, budget, &mut leaves, false)
+                        .run_with_traps(stop, budget, &mut direct, false)
                         .unwrap();
                     let b = ordinary
                         .run_with_traps(stop, budget, &mut traps, false)
@@ -167,7 +165,7 @@ fn leaf_and_trap_match_at_instruction_budget_cuts() {
                     );
                     assert_eq!(bytes(&light), bytes(&ordinary));
                 }
-                assert!(leaves.leaves > 0);
+                assert!(direct.direct > 0);
             }
         }
     }
@@ -182,7 +180,7 @@ fn patches_to_thunk_bytes_and_import_pointer_take_effect() {
     executor
         .run_with_traps(stop, 30, &mut calls, false)
         .unwrap();
-    assert_eq!(calls.leaves, 1);
+    assert_eq!(calls.direct, 1);
     executor
         .write(THUNK + 1, &(WORD + 1).to_le_bytes())
         .unwrap();
@@ -204,12 +202,12 @@ fn patches_to_thunk_bytes_and_import_pointer_take_effect() {
         .run_with_traps(stop, 30, &mut calls, false)
         .unwrap();
     assert_eq!(executor.state.regs[0], 42);
-    assert_eq!(calls.leaves, 2);
+    assert_eq!(calls.direct, 2);
 }
 
 // spec: A64-CTL-8, A64-CTL-12
 #[test]
-fn deadline_and_interrupt_leave_before_the_instruction_after_leaf() {
+fn deadline_and_interrupt_leave_before_the_instruction_after_a_call() {
     for delayed in [false, true] {
         let (mut executor, stop) = fixture((false, false, Checks::Adaptive));
         let initial = executor.state.clone();
@@ -240,44 +238,25 @@ fn deadline_and_interrupt_leave_before_the_instruction_after_leaf() {
         );
         assert_eq!(executor.state.eip, THUNK + 7);
         assert_eq!(read_word(&executor.memory, DATA + 40).unwrap(), 0);
-        assert_eq!(calls.leaves, 2);
+        assert_eq!(calls.direct, 2);
     }
-}
-
-// spec: A64-CTL-12
-#[test]
-fn cached_leaf_can_return_to_ordinary_dispatch() {
-    let (mut executor, stop) = fixture((false, false, Checks::Adaptive));
-    let initial = executor.state.clone();
-    let mut calls = Calls::new(true);
-    executor
-        .run_with_traps(stop, 30, &mut calls, false)
-        .unwrap();
-    calls.enabled = false;
-    executor.state = initial;
-    executor
-        .run_with_traps(stop, 30, &mut calls, false)
-        .unwrap();
-    assert_eq!((calls.leaves, calls.traps), (1, 1));
-    assert_eq!(executor.state.regs[0], WORD);
 }
 
 // spec: A64F-FP-4, A64-CTL-12, A64-VER-1
 #[test]
-fn leaf_observes_dirty_mmx_and_x87_aliases_in_an_inlined_call() {
+fn host_call_observes_dirty_mmx_and_x87_aliases_in_an_inlined_call() {
     use iced_x86::code_asm::*;
     struct Observer(Calls);
     impl ExecutionTrap for Observer {
-        fn leaf_call(&self, pc: u32, word: u32) -> bool {
-            self.0.leaf_call(pc, word)
+        fn host_thunk(&self, pc: u32, word: u32) -> Option<u32> {
+            self.0.host_thunk(pc, word)
         }
-        fn leaf(
+        fn host_call(
             &mut self,
             state: &mut CpuState,
             memory: &mut Memory,
-            pc: u32,
-            word: u32,
-        ) -> Option<u64> {
+            thunk: u32,
+        ) -> Result<bool, String> {
             assert_eq!(state.mmx[3], 0x11111111);
             assert_eq!(
                 state.x87.regs[3],
@@ -287,7 +266,7 @@ fn leaf_observes_dirty_mmx_and_x87_aliases_in_an_inlined_call() {
             let mut context = state.clone();
             let context = context.capture_architecture();
             assert_eq!(context.x87.regs[3], state.x87.regs[3]);
-            self.0.leaf(state, memory, pc, word)
+            self.0.host_call(state, memory, thunk)
         }
         fn call(
             &mut self,
@@ -332,7 +311,7 @@ fn leaf_observes_dirty_mmx_and_x87_aliases_in_an_inlined_call() {
                 );
                 assert_eq!(bytes(&native), bytes(&oracle));
                 if !first {
-                    assert_eq!(observer.0.leaves, 1);
+                    assert_eq!(observer.0.direct, 1);
                 }
             }
         }

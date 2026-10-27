@@ -359,7 +359,6 @@ impl Resolver for Platform {
         };
         Some(HostFn {
             leaf: None,
-            env_leaf: None,
             conv,
             handler,
             data: 0,

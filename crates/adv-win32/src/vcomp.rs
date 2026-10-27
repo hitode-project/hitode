@@ -70,7 +70,6 @@ pub(crate) fn register(reg: &mut Registry) {
             name,
             conv,
             handler,
-            env_leaf: None,
             level: ImplementationLevel::Implement,
         });
     }

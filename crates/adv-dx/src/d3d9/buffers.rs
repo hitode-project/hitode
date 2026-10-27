@@ -60,28 +60,13 @@ pub(super) fn register(registry: &mut Registry) {
         index_lock_ABI,
         vertex_unlock_ABI,
         index_unlock_ABI,
-        adv_abi::Api {
-            env_leaf: Some(super::leaf_calls::binding),
-            ..set_stream_ABI
-        },
+        super::unchanged::unless_unchanged!(set_stream_ABI, super::unchanged::binding),
         get_stream_ABI,
-        adv_abi::Api {
-            env_leaf: Some(super::leaf_calls::binding),
-            ..set_indices_ABI
-        },
+        super::unchanged::unless_unchanged!(set_indices_ABI, super::unchanged::binding),
         get_indices_ABI,
-        adv_abi::Api {
-            env_leaf: Some(super::leaf_calls::draw),
-            ..draw_ABI
-        },
-        adv_abi::Api {
-            env_leaf: Some(super::leaf_calls::draw),
-            ..draw_indexed_ABI
-        },
-        adv_abi::Api {
-            env_leaf: Some(super::leaf_calls::draw),
-            ..draw_indexed_up_ABI
-        },
+        draw_ABI,
+        draw_indexed_ABI,
+        draw_indexed_up_ABI,
     ] {
         registry.register(api);
     }
@@ -497,7 +482,7 @@ fn set_stream(
     }
     0
 }
-#[win32(d3d9,name="IDirect3DDevice9::GetStreamSource",level=implement,leaf)]
+#[win32(d3d9,name="IDirect3DDevice9::GetStreamSource",level=implement)]
 fn get_stream(
     env: &mut Env<'_>,
     this: GuestPtr<()>,
@@ -584,7 +569,7 @@ fn set_indices(env: &mut Env<'_>, this: GuestPtr<()>, pointer: GuestPtr<()>) -> 
     }
     0
 }
-#[win32(d3d9,name="IDirect3DDevice9::GetIndices",level=implement,leaf)]
+#[win32(d3d9,name="IDirect3DDevice9::GetIndices",level=implement)]
 fn get_indices(env: &mut Env<'_>, this: GuestPtr<()>, output: GuestPtr<u32>) -> u32 {
     let Some(d) = device(env, this.addr()) else {
         return INVALID;

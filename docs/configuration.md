@@ -212,7 +212,7 @@ both mappings; removing settings on the next run restores the prefix namespace.
 
 No feature selects execution behavior: the engine follows the target architecture. Platform and device build capabilities such as `gpu` and `media` are described in [building.md](building.md).
 
-Host service CSV diagnostics also count successful guest bodies, ordinary fallbacks and leaf calls per API, with guest/leaf fractions. Guest probes are installed only while host profiling, frame timing or frame-budget diagnostics are active; disabled bodies and fallback jumps contain no counter instructions. The final report always derives non-leaf host calls from existing total and leaf counts.
+Host service CSV diagnostics also count successful guest bodies and ordinary fallbacks per API, with the guest fraction. Guest probes are installed only while host profiling, frame timing or frame-budget diagnostics are active; disabled bodies and fallback jumps contain no counter instructions.
 
 ### AArch64 compact window
 

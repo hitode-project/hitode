@@ -25,7 +25,6 @@ struct Fixture {
     entry: u32,
     original: Vec<u8>,
     reads: Vec<u32>,
-    leaves: usize,
 }
 impl Fixture {
     fn new(root: &Path) -> Self {
@@ -72,7 +71,6 @@ impl Fixture {
             entry,
             original,
             reads: vec![],
-            leaves: 0,
         }
     }
     fn hook(&mut self, enabled: bool) {
@@ -106,19 +104,8 @@ impl Fixture {
         }
         (index, self.machine.sys.thunks.get(index).f)
     }
-    fn leaf(&mut self, module: &str, name: &str, args: &[u32]) -> Option<u64> {
+    fn call(&mut self, module: &str, name: &str, args: &[u32]) -> u32 {
         let (index, binding) = self.binding(module, name, args);
-        binding.env_leaf.unwrap()(&mut self.env(index))
-    }
-    fn call(&mut self, module: &str, name: &str, args: &[u32], leaf: bool) -> u32 {
-        let (index, binding) = self.binding(module, name, args);
-        if leaf
-            && let Some(handler) = binding.env_leaf
-            && let Some(value) = handler(&mut self.env(index))
-        {
-            self.leaves += 1;
-            return value as u32;
-        }
         let mut outcome = (binding.handler)(&mut self.env(index));
         loop {
             match outcome {
@@ -170,7 +157,7 @@ fn contents() -> Vec<u8> {
     (0..12317).map(|i| (i * 37) as u8).collect()
 }
 
-// spec: WIN32-API-19, A64-CTL-12
+// spec: WIN32-API-19
 #[test]
 fn buffered_and_live_unbuffered_sequences_match() {
     let root = root();
@@ -182,9 +169,9 @@ fn buffered_and_live_unbuffered_sequences_match() {
             if hooked {
                 f.hook(true);
             }
-            let stream = f.call(module, "fopen", &[DATA, DATA + 32], false);
+            let stream = f.call(module, "fopen", &[DATA, DATA + 32]);
             assert_ne!(stream, 0);
-            let errno = f.call(module, "_errno", &[], false);
+            let errno = f.call(module, "_errno", &[]);
             f.machine
                 .cpu
                 .write(errno, &[79i32.to_le_bytes(), 91u32.to_le_bytes()].concat())
@@ -207,14 +194,14 @@ fn buffered_and_live_unbuffered_sequences_match() {
                 ("fgetc", vec![stream]),
                 ("fseek", vec![stream, 2, 1]),
             ] {
-                let value = f.call(module, name, &args, true);
-                let tell = f.call(module, "ftell", &[stream], true);
-                assert_eq!(f.call(module, "fgetpos", &[stream, DATA + 80], true), 0);
+                let value = f.call(module, name, &args);
+                let tell = f.call(module, "ftell", &[stream]);
+                assert_eq!(f.call(module, "fgetpos", &[stream, DATA + 80]), 0);
                 assert_eq!(
                     u64::from_le_bytes(f.bytes(DATA + 80, 8).try_into().unwrap()),
                     u64::from(tell)
                 );
-                let eof = f.call(module, "feof", &[stream], true);
+                let eof = f.call(module, "feof", &[stream]);
                 rows.push((
                     value,
                     tell,
@@ -224,10 +211,10 @@ fn buffered_and_live_unbuffered_sequences_match() {
                     crate::util::last_error(&f.env(0)),
                 ));
             }
-            assert_eq!(f.call(module, "fseek", &[stream, 0, 0], false), 0);
+            assert_eq!(f.call(module, "fseek", &[stream, 0, 0]), 0);
             let mut chars = vec![];
             loop {
-                let ch = f.call(module, "fgetc", &[stream], true);
+                let ch = f.call(module, "fgetc", &[stream]);
                 chars.push(ch);
                 if ch == u32::MAX {
                     break;
@@ -237,22 +224,20 @@ fn buffered_and_live_unbuffered_sequences_match() {
                 &chars[..chars.len() - 1],
                 contents().iter().map(|&b| u32::from(b)).collect::<Vec<_>>()
             );
-            assert_eq!(f.call(module, "feof", &[stream], true), 1);
+            assert_eq!(f.call(module, "feof", &[stream]), 1);
             rows.push((
                 0,
-                f.call(module, "ftell", &[stream], true),
+                f.call(module, "ftell", &[stream]),
                 1,
                 vec![],
                 f.bytes(errno, 8),
                 crate::util::last_error(&f.env(0)),
             ));
-            assert_eq!(f.call(module, "fclose", &[stream], false), 0);
+            assert_eq!(f.call(module, "fclose", &[stream]), 0);
             assert!(f.machine.ext.get::<CrtState>().files.is_empty());
             if hooked {
                 assert!(f.reads.contains(&6000));
                 assert!(f.reads.iter().filter(|&&n| n == 1).count() >= chars.len());
-            } else {
-                assert!(f.leaves > 15);
             }
             observations.push((rows, chars));
         }
@@ -273,9 +258,9 @@ fn update_writes_and_flush_synchronize_the_original_handle() {
             if hooked {
                 f.hook(true);
             }
-            let stream = f.call(module, "fopen", &[DATA, DATA + 48], false);
+            let stream = f.call(module, "fopen", &[DATA, DATA + 48]);
             let mut rows = vec![];
-            rows.push(f.call(module, "fgetc", &[stream], true));
+            rows.push(f.call(module, "fgetc", &[stream]));
             let handle = f.machine.ext.get::<CrtState>().files[&stream].handle;
             let os = f
                 .machine
@@ -287,23 +272,23 @@ fn update_writes_and_flush_synchronize_the_original_handle() {
                 .stream_position()
                 .unwrap();
             assert_eq!(os, if hooked { 1 } else { 4096 });
-            rows.push(f.call(module, "fflush", &[stream], false));
-            let tell = f.call(module, "ftell", &[stream], true);
+            rows.push(f.call(module, "fflush", &[stream]));
+            let tell = f.call(module, "ftell", &[stream]);
             assert_eq!(
-                f.call("kernel32.dll", "SetFilePointer", &[handle, 0, 0, 1], false),
+                f.call("kernel32.dll", "SetFilePointer", &[handle, 0, 0, 1]),
                 tell
             );
-            rows.push(f.call(module, "fgetc", &[stream], true));
-            rows.push(f.call(module, "fseek", &[stream, 4, 0], false));
+            rows.push(f.call(module, "fgetc", &[stream]));
+            rows.push(f.call(module, "fseek", &[stream, 4, 0]));
             f.machine.cpu.write(OUT, b"XY").unwrap();
-            rows.push(f.call(module, "fwrite", &[OUT, 1, 2, stream], false));
-            rows.push(f.call(module, "fseek", &[stream, 0, 0], false));
-            rows.push(f.call(module, "fread", &[OUT, 1, 8, stream], true));
-            rows.push(f.call(module, "ftell", &[stream], true));
+            rows.push(f.call(module, "fwrite", &[OUT, 1, 2, stream]));
+            rows.push(f.call(module, "fseek", &[stream, 0, 0]));
+            rows.push(f.call(module, "fread", &[OUT, 1, 8, stream]));
+            rows.push(f.call(module, "ftell", &[stream]));
             // A write directly after read-ahead also resumes at the logical cursor.
             f.machine.cpu.write(OUT + 16, b"Z").unwrap();
-            rows.push(f.call(module, "fwrite", &[OUT + 16, 1, 1, stream], false));
-            rows.push(f.call(module, "fclose", &[stream], false));
+            rows.push(f.call(module, "fwrite", &[OUT + 16, 1, 1, stream]));
+            rows.push(f.call(module, "fclose", &[stream]));
             observations.push((
                 rows,
                 f.bytes(OUT, 8),
@@ -313,89 +298,6 @@ fn update_writes_and_flush_synchronize_the_original_handle() {
         assert_eq!(observations[0], observations[1]);
         assert_eq!(&observations[0].1[4..6], b"XY");
         assert_eq!(observations[0].2[8], b'Z');
-    }
-    std::fs::remove_dir_all(root).unwrap();
-}
-
-// spec: WIN32-API-19, A64-CTL-12
-#[test]
-fn leaves_decline_before_output_or_cursor_changes_and_notice_late_hooks() {
-    let root = root();
-    std::fs::write(root.join("stream.bin"), contents()).unwrap();
-    for module in [
-        "msvcrt.dll",
-        "msvcr80.dll",
-        "msvcr90.dll",
-        "ucrtbase.dll",
-        "api-ms-win-crt-stdio-l1-1-0.dll",
-    ] {
-        let mut f = Fixture::new(&root);
-        let modern = module.contains("ucrt") || module.starts_with("api-");
-        let stream = if modern {
-            f.machine
-                .cpu
-                .write(
-                    DATA + 96,
-                    &"stream.bin\0"
-                        .encode_utf16()
-                        .flat_map(u16::to_le_bytes)
-                        .collect::<Vec<_>>(),
-                )
-                .unwrap();
-            f.machine
-                .cpu
-                .write(
-                    DATA + 128,
-                    &"rb\0"
-                        .encode_utf16()
-                        .flat_map(u16::to_le_bytes)
-                        .collect::<Vec<_>>(),
-                )
-                .unwrap();
-            assert_eq!(
-                f.call(
-                    module,
-                    "_wfopen_s",
-                    &[DATA + 64, DATA + 96, DATA + 128],
-                    false
-                ),
-                0
-            );
-            f.machine.cpu.read_u32(DATA + 64).unwrap()
-        } else {
-            f.call(module, "fopen", &[DATA, DATA + 32], false)
-        };
-        assert_eq!(f.leaf(module, "fread", &[OUT, 1, 1, stream]), None);
-        assert_eq!(f.call(module, "fread", &[OUT, 1, 1, stream], false), 1);
-        let before = f.bytes(OUT, 16384);
-        for (output, length) in [(OUT, 4096), (DATA + 20476, 8), (u32::MAX - 2, 8)] {
-            assert_eq!(f.leaf(module, "fread", &[output, 1, length, stream]), None);
-            assert_eq!(f.machine.ext.get::<CrtState>().files[&stream].position, 1);
-            assert_eq!(f.bytes(OUT, 16384), before);
-        }
-        assert_eq!(f.leaf(module, "ftell", &[stream]), Some(1));
-        if !modern {
-            assert_eq!(f.leaf(module, "fgetpos", &[stream, DATA + 20476]), None);
-            assert_eq!(
-                f.leaf(module, "getc", &[stream]),
-                Some(u64::from(contents()[1]))
-            );
-        }
-        let position = f.call(module, "ftell", &[stream], true);
-        f.hook(true);
-        assert_eq!(f.leaf(module, "fread", &[OUT, 1, 1, stream]), None);
-        assert_eq!(f.leaf(module, "ftell", &[stream]), None);
-        assert_eq!(
-            f.machine.ext.get::<CrtState>().files[&stream].position,
-            u64::from(position)
-        );
-        assert_eq!(f.call(module, "fread", &[OUT, 1, 1, stream], false), 1);
-        assert_eq!(
-            f.bytes(OUT, 1),
-            contents()[position as usize..position as usize + 1]
-        );
-        assert_eq!(f.reads, [1]);
-        assert_eq!(f.call(module, "fclose", &[stream], false), 0);
     }
     std::fs::remove_dir_all(root).unwrap();
 }

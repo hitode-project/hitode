@@ -738,7 +738,7 @@ fn set_cursor_pos(env: &mut Env<'_>) -> Outcome {
     Outcome::Return(1)
 }
 
-#[win32(user32, name = "GetAsyncKeyState", level = implement, leaf)]
+#[win32(user32, name = "GetAsyncKeyState", level = implement)]
 fn get_async_key_state(env: &mut Env<'_>, vk: i32) -> u32 {
     let vk = vk as usize & 0xff;
     let frame = env.sys.frame;
@@ -767,7 +767,7 @@ fn queued_key_state(env: &Env<'_>, vk: usize) -> u8 {
         .map_or(0, |queue| queue.keyboard.0[vk])
 }
 
-#[win32(user32, name = "GetKeyState", level = implement, leaf)]
+#[win32(user32, name = "GetKeyState", level = implement)]
 fn get_key_state(env: &mut Env<'_>, vk: i32) -> u32 {
     let vk = vk as usize & 0xff;
     let k = queued_key_state(env, vk);
@@ -786,17 +786,6 @@ fn get_keyboard_state(env: &mut Env<'_>) -> Outcome {
         .get(&env.context)
         .map_or([0; 256], |queue| queue.keyboard.0);
     Outcome::Return(u32::from(env.cpu.write(p, &keys).is_ok()))
-}
-
-fn keyboard_leaf(env: &mut Env<'_>) -> Option<u64> {
-    let p = env.cpu.arg(0).ok()?;
-    adv_abi::guest::check_range(env.cpu, p, 256, adv_cpu::backend::Prot::WRITE).ok()?;
-    let keys = user(env)
-        .queues
-        .get(&env.context)
-        .map_or([0; 256], |queue| queue.keyboard.0);
-    env.cpu.write(p, &keys).ok()?;
-    Some((u64::from(adv_abi::leaf_edx(env)) << 32) | 1)
 }
 
 // ---- monitors and DCs ----
@@ -905,12 +894,11 @@ pub fn register(reg: &mut Registry) {
     s(reg, "ShowScrollBar", 3, |_| Outcome::Return(1));
     reg.register(get_async_key_state_ABI);
     reg.register(get_key_state_ABI);
-    reg.add_env_leaf(
+    reg.add(
         USER32,
         "GetKeyboardState",
         Conv::Stdcall { argc: 1 },
         get_keyboard_state,
-        keyboard_leaf,
     );
     s(reg, "MonitorFromPoint", 3, monitor_from);
     s(reg, "MonitorFromWindow", 2, monitor_from);

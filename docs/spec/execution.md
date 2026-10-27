@@ -26,7 +26,7 @@ This spec covers the contract that Tier 0 and both platform engines share, and t
 
 ### EXEC-CORE-4 Audio call marks
 
-**Rule**: Thunks MUST classify audio bindings at registration, and dispatch MUST record their latest call using the guest wait-deadline clock. Thread queries MUST report whether that timestamp is strictly after the supplied time, without affecting scheduling. Audio bindings MUST reject both Leaf and EnvLeaf registration.
+**Rule**: Thunks MUST classify audio bindings at registration, and dispatch MUST record their latest call using the guest wait-deadline clock. Thread queries MUST report whether that timestamp is strictly after the supplied time, without affecting scheduling.
 **Verification**: Test
 
 | Binding | Audio classification |

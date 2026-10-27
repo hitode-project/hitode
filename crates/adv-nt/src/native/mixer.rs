@@ -84,7 +84,7 @@ fn window(
     Some(data)
 }
 
-/// Marshal GCC regparm(3) into stack arguments without expanding leaf CPU state.
+/// Marshal GCC regparm(3) into stack arguments.
 pub(super) fn entry(cpu: &mut dyn Guest, sys: &mut Sys, thunk: u32) -> Result<u32, String> {
     let at = sys
         .vm
@@ -195,7 +195,7 @@ pub(super) fn mix(env: &mut Env<'_>) -> Option<u64> {
     ] {
         identify(env.cpu, verified, pe_address(name)?)?;
     }
-    // The adapter captures floating controls without expanding the leaf CPU view.
+    // The adapter captures the floating controls.
     if mxcsr & !0x3f != 0x1f80 || control & 0xc3f != 0x3f {
         return None;
     }

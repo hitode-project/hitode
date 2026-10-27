@@ -11,26 +11,16 @@ struct Args {
     module: Ident,
     name: Option<String>,
     level: Ident,
-    leaf: bool,
 }
 impl Parse for Args {
     fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
         let module = input.parse()?;
         let mut name = None;
         let mut level = None;
-        let mut leaf = false;
         while !input.is_empty() {
             input.parse::<Token![,]>()?;
             if input.is_empty() {
                 break;
-            }
-            if input.peek(Ident) && input.fork().parse::<Ident>()? == "leaf" {
-                input.parse::<Ident>()?;
-                if leaf {
-                    return Err(input.error("duplicate leaf"));
-                }
-                leaf = true;
-                continue;
             }
             let option: MetaNameValue = input.parse()?;
             if option.path.is_ident("name") {
@@ -68,7 +58,6 @@ impl Parse for Args {
         Ok(Self {
             module,
             name,
-            leaf,
             level: level.ok_or_else(|| {
                 syn::Error::new(Span::call_site(), "implementation level is required")
             })?,
@@ -177,7 +166,6 @@ fn expand(args: Args, function: ItemFn) -> syn::Result<proc_macro2::TokenStream>
     }
     let mut checks = Vec::new();
     let mut decode = Vec::new();
-    let mut leaf_decode = Vec::new();
     let mut names = Vec::new();
     let mut stack_words: u16 = 0;
     let mut selectors = Vec::new();
@@ -223,7 +211,6 @@ fn expand(args: Args, function: ItemFn) -> syn::Result<proc_macro2::TokenStream>
             assert!(<#ty as ::adv_abi::GuestArg>::WORDS == #words, #message);
         });
         decode.push(quote! { let #parameter_name: #ty = match __win32_arguments.next() { Ok(value) => value, Err(fault) => return ::adv_abi::guest::memory_failure(fault) }; });
-        leaf_decode.push(quote! { let #parameter_name: #ty = __win32_arguments.next().ok()?; });
         names.push(parameter_name);
     }
     let stack_words = u8::try_from(stack_words)
@@ -259,34 +246,9 @@ fn expand(args: Args, function: ItemFn) -> syn::Result<proc_macro2::TokenStream>
     } else {
         invoke
     };
-    let leaf_adapter = format_ident!("{ident}__env_leaf_adapter");
-    let (leaf_function, leaf_binding) = if args.leaf {
-        (
-            quote! {
-                const _: () = assert!(!matches!(<#return_type as ::adv_abi::GuestReturn>::KIND,
-                    ::adv_abi::AbiKind::Outcome | ::adv_abi::AbiKind::F32 | ::adv_abi::AbiKind::F64),
-                    "leaf behavior must return a synchronous integer value, not Outcome");
-                #[allow(non_snake_case)]
-                fn #leaf_adapter(__win32_env: &mut ::adv_abi::Env<'_>) -> Option<u64> {
-                    let mut __win32_arguments = ::adv_abi::Arguments::with_words(__win32_env.cpu, #stack_words);
-                    #(#leaf_decode)*
-                    let __win32_outcome = { #invoke };
-                    match __win32_outcome {
-                        ::adv_abi::Outcome::Return(value) => Some((u64::from(::adv_abi::leaf_edx(__win32_env)) << 32) | u64::from(value)),
-                        ::adv_abi::Outcome::Return64(value) => Some(value),
-                        _ => unreachable!("synchronous leaf return"),
-                    }
-                }
-            },
-            quote!(Some(#leaf_adapter as ::adv_abi::EnvLeafHandler)),
-        )
-    } else {
-        (quote!(), quote!(None))
-    };
     Ok(quote! {
         #[allow(clippy::too_many_arguments, reason = "the parameters match the guest ABI")]
         #function
-        #leaf_function
         const _: () = {
             #(#checks)*
             assert!(matches!(<#return_type as ::adv_abi::GuestReturn>::KIND, ::adv_abi::AbiKind::Outcome)
@@ -300,7 +262,7 @@ fn expand(args: Args, function: ItemFn) -> syn::Result<proc_macro2::TokenStream>
         }
         #[allow(non_upper_case_globals)]
         #visibility const #descriptor: ::adv_abi::Api = ::adv_abi::Api {
-            module: #module, name: #name, conv: #conv, handler: #adapter, env_leaf: #leaf_binding,
+            module: #module, name: #name, conv: #conv, handler: #adapter,
             level: ::adv_abi::ImplementationLevel::#level,
         };
     })

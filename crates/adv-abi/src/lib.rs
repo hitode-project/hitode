@@ -20,7 +20,7 @@ use std::sync::OnceLock;
 
 pub use adv_abi_macros::win32;
 pub use adv_machine::{Conv, Env, GuestCode, Handler, HostFn, Outcome};
-pub use adv_machine::{EnvLeafHandler, LeafEnv, LeafHandler};
+pub use adv_machine::{LeafEnv, LeafHandler};
 
 #[doc(hidden)]
 pub mod capability;
@@ -65,7 +65,6 @@ pub struct Api {
     pub name: &'static str,
     pub conv: Conv,
     pub handler: Handler,
-    pub env_leaf: Option<EnvLeafHandler>,
     pub level: ImplementationLevel,
 }
 
@@ -125,46 +124,14 @@ impl Registry {
                     .map(|host| (module.as_str(), name.as_str(), host))
             }))
     }
-    /// Register one implementation for both light calls and ordinary traps.
+    /// Register an implementation that needs only a `LeafEnv`.
     pub fn add_leaf(&mut self, module: &str, name: &str, conv: Conv, handler: LeafHandler) {
-        assert!(
-            !adv_machine::thunk::is_audio_binding(module, name),
-            "audio bindings cannot be leaf calls"
-        );
         self.add(module, name, conv, adv_machine::thunk::leaf_trap);
         self.fns
             .get_mut(&(module.to_ascii_lowercase(), name.to_owned()))
             .expect("just inserted")
             .host
             .leaf = Some(handler);
-    }
-
-    /// Full service leaf; None must precede all observable side effects.
-    ///
-    /// Outcome behaviors cannot opt into the synchronous macro adapter.
-    /// ```compile_fail
-    /// use adv_abi::{win32, Env, Outcome};
-    /// #[win32(kernel32, name = "Sleep", level = implement, leaf)]
-    /// fn sleep(_: &mut Env<'_>, _: u32) -> Outcome { Outcome::Return(0) }
-    /// ```
-    pub fn add_env_leaf(
-        &mut self,
-        module: &str,
-        name: &str,
-        conv: Conv,
-        ordinary: Handler,
-        leaf: EnvLeafHandler,
-    ) {
-        assert!(
-            !adv_machine::thunk::is_audio_binding(module, name),
-            "audio bindings cannot be leaf calls"
-        );
-        self.add(module, name, conv, ordinary);
-        self.fns
-            .get_mut(&(module.to_ascii_lowercase(), name.to_owned()))
-            .expect("just inserted")
-            .host
-            .env_leaf = Some(leaf);
     }
 
     /// Opt in only after validating a complete native provider's ABI.
@@ -198,7 +165,6 @@ impl Registry {
             Entry {
                 host: HostFn {
                     leaf: None,
-                    env_leaf: None,
                     conv,
                     handler,
                     trace: false,
@@ -256,16 +222,7 @@ impl Registry {
 
     /// Preserve immutable binding data when composing typed API decorators.
     pub fn register_with_data(&mut self, api: Api, data: u64) {
-        if let Some(leaf) = api.env_leaf {
-            self.add_env_leaf(api.module, api.name, api.conv, api.handler, leaf);
-            self.fns
-                .get_mut(&(api.module.to_ascii_lowercase(), api.name.to_owned()))
-                .unwrap()
-                .host
-                .data = data;
-        } else {
-            self.add_with_data(api.module, api.name, api.conv, api.handler, data);
-        }
+        self.add_with_data(api.module, api.name, api.conv, api.handler, data);
         self.fns
             .get_mut(&(api.module.to_ascii_lowercase(), api.name.to_owned()))
             .expect("just inserted")
@@ -400,16 +357,6 @@ impl Registry {
             .guest = Some(guest);
     }
 
-    /// Attach an audited adapter without replacing ABI metadata or guest code.
-    pub fn set_env_leaf(&mut self, module: &str, name: &str, leaf: EnvLeafHandler) {
-        assert!(!adv_machine::thunk::is_audio_binding(module, name));
-        self.fns
-            .get_mut(&(module.to_ascii_lowercase(), name.to_owned()))
-            .expect("leaf requires an existing implementation")
-            .host
-            .env_leaf = Some(leaf);
-    }
-
     pub fn set_trace(&mut self, module: &str, name: &str, on: bool) {
         if let Some(f) = self
             .fns
@@ -449,7 +396,6 @@ impl Registry {
             )
             .then_some(HostFn {
                 leaf: None,
-                env_leaf: None,
                 // The unknown ABI never returns, so no cleanup is guessed.
                 conv: Conv::Cdecl { argc: 0 },
                 handler: stub::fixed_dispatch,
@@ -464,7 +410,6 @@ impl Registry {
             .expect("signature in table");
         Some(HostFn {
             leaf: None,
-            env_leaf: None,
             conv: signature.conv.unwrap_or(Conv::Cdecl { argc: 0 }),
             handler: stub::dispatch,
             trace: true,
@@ -693,7 +638,6 @@ mod signature_conflict_cache_tests {
             module: "kernel32.dll",
             name: "SetFilePointerEx",
             conv,
-            env_leaf: None,
             handler: |_| Outcome::Return(0),
             level: ImplementationLevel::Implement,
         }
@@ -794,7 +738,6 @@ mod named_alias_tests {
                 module: "kernel32.dll",
                 name: "lstrcpyA",
                 conv: Conv::Stdcall { argc: 2 },
-                env_leaf: None,
                 handler: |_| Outcome::Return(0),
                 level: ImplementationLevel::Implement,
             },
@@ -950,11 +893,6 @@ impl adv_machine::Resolver for Registry {
     fn implemented(&self, module: &str, name: &str) -> bool {
         self.is_implemented(module, name)
     }
-}
-
-#[doc(hidden)]
-pub fn leaf_edx(env: &Env<'_>) -> u32 {
-    env.cpu.reg(adv_cpu::backend::Reg::Edx)
 }
 
 pub mod library_signature;

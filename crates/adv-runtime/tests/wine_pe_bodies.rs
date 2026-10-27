@@ -48,13 +48,15 @@ fn probe(jit: bool) -> Option<String> {
         .unwrap();
     let csv = String::from_utf8(csv).unwrap();
     if jit {
+        // Even if every decline was this export's, bodies ran over 100 times.
+        let declines = adv_nt::native::declines(&session.machine.ext);
         for name in ["MultiByteToWideChar", "WideCharToMultiByte"] {
             let row = csv
                 .lines()
                 .find(|l| l.contains(&format!("\"kernelbase.dll!{name}\"")))
-                .unwrap_or_else(|| panic!("no body calls for {name}: {csv}"));
-            let leaves: u64 = row.split(',').nth(5).unwrap().parse().unwrap();
-            assert!(leaves > 100, "{row}");
+                .unwrap_or_else(|| panic!("no calls for {name}: {csv}"));
+            let calls: u64 = row.split(',').nth(2).unwrap().parse().unwrap();
+            assert!(calls > 100 + declines, "{row}, {declines} declines");
         }
     }
     drop(session);

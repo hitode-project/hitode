@@ -48,12 +48,12 @@ fn get_cp_info(env: &mut Env<'_>) -> Outcome {
     Outcome::Return(1)
 }
 
-#[win32(kernel32, name = "IsDBCSLeadByte", level = implement, leaf)]
+#[win32(kernel32, name = "IsDBCSLeadByte", level = implement)]
 fn is_dbcs_lead_byte(env: &mut Env<'_>, b: u32) -> i32 {
     i32::from(env.ext.get::<Win32>().codec.is_lead_byte(0, b as u8))
 }
 
-#[win32(kernel32, name = "IsDBCSLeadByteEx", level = implement, leaf)]
+#[win32(kernel32, name = "IsDBCSLeadByteEx", level = implement)]
 fn is_dbcs_lead_byte_ex(env: &mut Env<'_>, cp: u32, b: u32) -> i32 {
     i32::from(env.ext.get::<Win32>().codec.is_lead_byte(cp, b as u8))
 }

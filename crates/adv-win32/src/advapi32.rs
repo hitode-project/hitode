@@ -501,48 +501,6 @@ fn query_value_at(
     })();
     Outcome::Return(result.unwrap_or_else(|error| error))
 }
-fn query_leaf(env: &mut Env<'_>, wide: bool) -> Option<u64> {
-    // state() loads the registry from disk only on its first use.
-    env.ext.try_get::<VirtualRegistry>()?;
-    let mut arguments = adv_abi::Arguments::new(env.cpu);
-    let mut args = [0u32; 6];
-    for arg in &mut args {
-        *arg = arguments.next().ok()?;
-    }
-    if args[2] != 0 {
-        return None;
-    }
-    let requested = fold(&name(env, args[1], wide, true).ok()?);
-    let registry = env.ext.get::<VirtualRegistry>();
-    let opened = registry.key(&env.sys.objects, args[0]).ok()?;
-    if opened.access & QUERY == 0 {
-        return None;
-    }
-    let value = registry.keys.get(&opened.key)?.get(&requested)?;
-    let length = if !wide && string_type(value.kind) {
-        let (pairs, tail) = value.bytes.as_chunks::<2>();
-        if !tail.is_empty() {
-            return None;
-        }
-        let units: Vec<_> = pairs.iter().map(|&p| u16::from_le_bytes(p)).collect();
-        env.ext.get::<Win32>().codec.from_utf16(0, &units).0.len()
-    } else {
-        value.bytes.len()
-    } as u32;
-    output(env, args[3], true).ok()?;
-    output(env, args[5], args[4] == 0).ok()?;
-    if args[4] != 0 {
-        let capacity = env.cpu.read_u32(args[5]).ok()?;
-        if capacity >= length {
-            adv_abi::guest::check_range(env.cpu, args[4], length, Prot::WRITE).ok()?;
-        }
-    }
-    let Outcome::Return(value) = query_value(env, wide) else {
-        unreachable!()
-    };
-    Some((u64::from(adv_abi::leaf_edx(env)) << 32) | u64::from(value))
-}
-
 fn close_key(env: &mut Env<'_>) -> Outcome {
     let key = env.arg(0);
     state(env);
@@ -604,10 +562,5 @@ pub fn register(reg: &mut Registry) {
         ("RegNotifyChangeKeyValue", 5, notify_change_key_value),
     ] {
         stdcall(reg, "advapi32.dll", name, argc, handler);
-        match name {
-            "RegQueryValueExA" => reg.set_env_leaf("advapi32.dll", name, |e| query_leaf(e, false)),
-            "RegQueryValueExW" => reg.set_env_leaf("advapi32.dll", name, |e| query_leaf(e, true)),
-            _ => (),
-        }
     }
 }

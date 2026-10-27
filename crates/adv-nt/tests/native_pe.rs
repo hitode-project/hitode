@@ -185,13 +185,14 @@ fn same(
     args: &[u32],
     label: &str,
 ) {
-    let abandons = native.sys.stats.leaf_abandons;
+    let abandons = adv_nt::native::declines(&native.ext);
     let actual = call(native, data, args);
     let expected = call(reference, data, args);
     assert!(expected.0.is_ok(), "{label}: Wine failed: {:?}", expected.0);
     assert_eq!(actual.0, expected.0, "{label}: {args:x?}");
     assert_eq!(
-        native.sys.stats.leaf_abandons, abandons,
+        adv_nt::native::declines(&native.ext),
+        abandons,
         "{label}: valid call declined"
     );
     assert!(
@@ -307,7 +308,7 @@ fn png_row_family_matches_wine() {
                 put(&mut data, DATA + 4, 4, len);
                 put(&mut data, DATA + 11, 1, depth);
                 let args = [DATA, DATA + 0x4000, DATA + 0x1000];
-                let before = native.sys.stats.leaf_abandons;
+                let before = adv_nt::native::declines(&native.ext);
                 let mut actual = call(&mut native, &data, &args);
                 let mut expected = call(&mut reference, &data, &args);
                 // These functions return void; EAX is not part of their ABI.
@@ -315,7 +316,8 @@ fn png_row_family_matches_wine() {
                 expected.0.as_mut().unwrap()[0] = 0;
                 assert_eq!(actual, expected, "{name} depth={depth} len={len}");
                 assert_eq!(
-                    native.sys.stats.leaf_abandons, before,
+                    adv_nt::native::declines(&native.ext),
+                    before,
                     "row was not accelerated"
                 );
             }
@@ -523,12 +525,12 @@ fn d3dx_integer_pixels_match_wine_and_preserve_hooks() {
     let args = [DP, DF, SP, SF, 3, 0];
     let mut input = data.clone();
     put(&mut input, DP, 4, DATA + 0x1002);
-    let before = native.sys.stats.leaf_abandons;
+    let before = adv_nt::native::declines(&native.ext);
     let actual = call(&mut native, &input, &args);
     let expected = call(&mut reference, &input, &args);
     assert_eq!(actual, expected, "overlapping pixels retain Wine");
     assert!(actual.0.is_ok());
-    assert!(native.sys.stats.leaf_abandons > before);
+    assert!(adv_nt::native::declines(&native.ext) > before);
     let helper = pe.image_base + table.named("make_argb_color").unwrap().rva;
     let mut original = [0; 6];
     native.cpu.read(helper, &mut original).unwrap();
@@ -537,12 +539,12 @@ fn d3dx_integer_pixels_match_wine_and_preserve_hooks() {
             .write(helper, &[0xb8, 0x78, 0x56, 0x34, 0x12, 0xc3])
             .unwrap();
     }
-    let before = native.sys.stats.leaf_abandons;
+    let before = adv_nt::native::declines(&native.ext);
     let actual = call(&mut native, &data, &args);
     let expected = call(&mut reference, &data, &args);
     assert_eq!(actual, expected, "patched pixel helper");
     assert!(actual.0.is_ok());
-    assert!(native.sys.stats.leaf_abandons > before);
+    assert!(adv_nt::native::declines(&native.ext) > before);
 
     let slot = pe
         .imports()
@@ -564,12 +566,12 @@ fn d3dx_integer_pixels_match_wine_and_preserve_hooks() {
             .unwrap();
         m.cpu.write_u32(slot, CODE + 0x800).unwrap();
     }
-    let before = native.sys.stats.leaf_abandons;
+    let before = adv_nt::native::declines(&native.ext);
     let actual = call(&mut native, &data, &args);
     let expected = call(&mut reference, &data, &args);
     assert_eq!(actual, expected, "patched copy import");
     assert!(actual.0.is_ok());
-    assert!(native.sys.stats.leaf_abandons > before);
+    assert!(adv_nt::native::declines(&native.ext) > before);
 }
 
 // spec: NAT-BODY-1, NAT-BODY-6
@@ -650,7 +652,7 @@ fn crt_exports_match_wine() {
             };
             prepare(&mut native, entry, argc, false);
             prepare(&mut reference, entry, argc, false);
-            let before = native.sys.stats.leaf_calls;
+            let before = native.sys.host_calls;
             for case in 0..48 {
                 let mut data = vec![0; LEN as usize];
                 data.iter_mut()
@@ -756,12 +758,12 @@ fn crt_exports_match_wine() {
                 );
             }
             assert!(
-                native.sys.stats.leaf_calls > before,
+                native.sys.host_calls > before,
                 "{module}!{name} never reached a body"
             );
             eprintln!(
                 "{module}!{name}: {} native calls",
-                native.sys.stats.leaf_calls - before
+                native.sys.host_calls - before
             );
         }
     }
@@ -858,7 +860,7 @@ fn code_pages_match_wine() {
                     .copy_memory(TABLES + page_index as u32 * 0x2c, NT + 0x723e0 + 0x2c, 0x2c)
                     .unwrap();
             }
-            let before = native.sys.stats.leaf_calls;
+            let before = native.sys.host_calls;
             let flag_count = if !kernel {
                 1
             } else if wide {
@@ -975,7 +977,7 @@ fn code_pages_match_wine() {
                 }
             }
             assert!(
-                native.sys.stats.leaf_calls > before,
+                native.sys.host_calls > before,
                 "{name} cp{page} never accepted a call"
             );
         }
@@ -1240,7 +1242,7 @@ fn crt_faults_resume_wine_before_writes() {
                     native.cpu.protect(dst, 0x1000, Prot::READ).unwrap();
                     reference.cpu.protect(dst, 0x1000, Prot::READ).unwrap();
                 }
-                let before = native.sys.stats.leaf_abandons;
+                let before = adv_nt::native::declines(&native.ext);
                 let actual = call(&mut native, &data, &args[..argc]);
                 let expected = call(&mut reference, &data, &args[..argc]);
                 assert!(
@@ -1254,7 +1256,7 @@ fn crt_faults_resume_wine_before_writes() {
                     "{module}!{name} fault {fault}: partial writes differ"
                 );
                 assert!(
-                    native.sys.stats.leaf_abandons > before,
+                    adv_nt::native::declines(&native.ext) > before,
                     "{module}!{name} fault {fault}: did not decline"
                 );
             }
@@ -1315,7 +1317,7 @@ fn code_page_faults_resume_wine_before_writes() {
             for _ in 0..4 {
                 same(&mut native, &mut reference, &data, &args, name);
             }
-            let before = native.sys.stats.leaf_abandons;
+            let before = adv_nt::native::declines(&native.ext);
             let mut args = args;
             if fault == 0 {
                 args[if kernel {
@@ -1354,7 +1356,7 @@ fn code_page_faults_resume_wine_before_writes() {
                 "{name} fault {fault}: partial writes differ"
             );
             assert!(
-                native.sys.stats.leaf_abandons > before,
+                adv_nt::native::declines(&native.ext) > before,
                 "{name} fault {fault}: did not decline"
             );
         }
@@ -1439,7 +1441,7 @@ fn cached_code_pages_resume_wine_with_owned_lock() {
             code.extend_from_slice(&original);
             m.cpu.write(CODE, &code).unwrap();
         }
-        let before = native.sys.stats.leaf_abandons;
+        let before = adv_nt::native::declines(&native.ext);
         for _ in 0..4 {
             let actual = call(&mut native, &data, &args[..argc]);
             let expected = call(&mut reference, &data, &args[..argc]);
@@ -1452,7 +1454,7 @@ fn cached_code_pages_resume_wine_with_owned_lock() {
             }
         }
         assert!(
-            native.sys.stats.leaf_abandons > before,
+            adv_nt::native::declines(&native.ext) > before,
             "{name}: locked lookup did not decline"
         );
     }
@@ -1541,7 +1543,7 @@ fn counted_body(m: &mut Machine<Cpu>, name: &str, context: u32, args: &[u32]) {
         .thunks
         .published_index(adv_nt::native::MODULE, name)
         .unwrap();
-    let body = m.sys.thunks.get(thunk).f.env_leaf.unwrap();
+    let body = m.sys.thunks.get(thunk).f.handler;
     m.cpu.set_reg(adv_cpu::backend::Reg::Esp, SLOT);
     for (i, arg) in args.iter().enumerate() {
         m.cpu.write_u32(ARGS + i as u32 * 4, *arg).unwrap();
@@ -1559,7 +1561,10 @@ fn counted_body(m: &mut Machine<Cpu>, name: &str, context: u32, args: &[u32]) {
         ext: &mut m.ext,
         thunk,
     };
-    assert!(body(&mut env).is_some(), "{name} declined");
+    assert!(
+        matches!(body(&mut env), adv_machine::Outcome::Return64(_)),
+        "{name} declined"
+    );
     let pages = cpu.pages.borrow().len();
     assert!(
         cpu.calls.get() <= 8 * pages + 16,

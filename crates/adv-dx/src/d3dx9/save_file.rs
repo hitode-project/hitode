@@ -18,7 +18,6 @@ pub(super) fn register(registry: &mut Registry) {
         module: "d3dx9_43.dll",
         name: "D3DXSaveSurfaceToFileW",
         conv: Conv::Stdcall { argc: 5 },
-        env_leaf: None,
         handler: save,
         level: ImplementationLevel::Implement,
     });

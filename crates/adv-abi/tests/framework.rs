@@ -147,7 +147,6 @@ fn dynamic_availability_exposes_fixed_names_only_with_capability() {
         module: "kernel32.dll",
         name: "FlsAlloc",
         conv: Conv::Stdcall { argc: 1 },
-        env_leaf: None,
         handler: |_| Outcome::Return(u32::MAX),
         level: ImplementationLevel::SafeFail,
     });
@@ -172,7 +171,6 @@ fn a_frontend_under_a_forwarding_name_implements_its_fixed_target() {
         module: "kernel32.dll",
         name: "SetThreadpoolTimer",
         conv: Conv::Stdcall { argc: 4 },
-        env_leaf: None,
         handler: |_| Outcome::Return(0),
         level: ImplementationLevel::Implement,
     });
@@ -674,7 +672,7 @@ fn selected_d3dx_graphics_helpers_keep_sdk_scalar_and_pointer_abi_kinds() {
 
 // spec: EXEC-CORE-4
 #[test]
-fn audio_registration_rejects_both_leaf_kinds() {
+fn audio_bindings_are_recognized_by_name() {
     for (module, name) in [
         ("DSOUND.DLL", "IDirectSoundBuffer8::Play"),
         ("quartz.dll", "IMediaControl::Run"),
@@ -688,23 +686,10 @@ fn audio_registration_rejects_both_leaf_kinds() {
         ("winmm.dll", "PlaySoundW"),
         ("winmm.dll", "sndPlaySoundA"),
     ] {
-        for env_leaf in [false, true] {
-            let result = std::panic::catch_unwind(|| {
-                let mut registry = Registry::default();
-                if env_leaf {
-                    registry.add_env_leaf(
-                        module,
-                        name,
-                        Conv::Stdcall { argc: 0 },
-                        |_| Outcome::Return(0),
-                        |_| Some(0),
-                    );
-                } else {
-                    registry.add_leaf(module, name, Conv::Stdcall { argc: 0 }, |_| 0);
-                }
-            });
-            assert!(result.is_err(), "{module}!{name}: env_leaf={env_leaf}");
-        }
+        assert!(
+            adv_machine::thunk::is_audio_binding(module, name),
+            "{module}!{name}"
+        );
     }
     for name in ["timeGetTime", "timeBeginPeriod", "timeSetEvent"] {
         assert!(!adv_machine::thunk::is_audio_binding("winmm.dll", name));

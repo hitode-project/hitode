@@ -3,7 +3,6 @@
 use adv_abi::{GuestPtr, Registry, types::FILETIME, win32};
 use adv_cpu::backend::{Guest, GuestExt};
 pub(crate) use adv_machine::clock::poll_clock;
-use adv_machine::clock::{leaf_clock, record_leaf_clock, tick_leaf};
 use adv_machine::{Env, Outcome};
 
 use super::K32;
@@ -212,26 +211,6 @@ fn local_systemtime(env: &mut Env<'_>) -> [u16; 8] {
     filetime_to_systemtime(ft as u64)
 }
 
-fn counter_leaf(env: &mut Env<'_>) -> Option<u64> {
-    let out = GuestPtr::<i64>::new(env.cpu.arg(0).ok()?);
-    adv_abi::guest::check_range(env.cpu, out.addr(), 8, adv_cpu::backend::Prot::WRITE).ok()?;
-    let (clock, us) = leaf_clock(env)?;
-    out.write(
-        env.cpu,
-        (us * (adv_machine::clock::QPC_FREQ / 1_000_000)) as i64,
-    )
-    .ok()?;
-    record_leaf_clock(env, clock, us);
-    Some((u64::from(adv_abi::leaf_edx(env)) << 32) | 1)
-}
-
-fn frequency_leaf(env: &mut Env<'_>) -> Option<u64> {
-    let out = GuestPtr::<i64>::new(env.cpu.arg(0).ok()?);
-    adv_abi::guest::check_range(env.cpu, out.addr(), 8, adv_cpu::backend::Prot::WRITE).ok()?;
-    query_performance_frequency(env, out).ok()?;
-    Some((u64::from(adv_abi::leaf_edx(env)) << 32) | 1)
-}
-
 #[win32(kernel32, name = "GetTickCount", level = implement)]
 fn get_tick_count(env: &mut Env<'_>) -> Outcome {
     poll_clock(env, |_, us| Outcome::Return((us / 1000) as u32))
@@ -319,18 +298,9 @@ pub(super) fn register(reg: &mut Registry) {
     reg.register(dos_date_time_to_file_time_ABI);
     stdcall(reg, K32, "GetSystemTime", 1, get_system_time);
     stdcall(reg, K32, "GetLocalTime", 1, get_local_time);
-    reg.register(adv_abi::Api {
-        env_leaf: Some(tick_leaf),
-        ..get_tick_count_ABI
-    });
-    reg.register(adv_abi::Api {
-        env_leaf: Some(counter_leaf),
-        ..query_performance_counter_ABI
-    });
-    reg.register(adv_abi::Api {
-        env_leaf: Some(frequency_leaf),
-        ..query_performance_frequency_ABI
-    });
+    reg.register(get_tick_count_ABI);
+    reg.register(query_performance_counter_ABI);
+    reg.register(query_performance_frequency_ABI);
     reg.register(sleep_ABI);
     stdcall(
         reg,
@@ -509,6 +479,3 @@ mod tests {
         );
     }
 }
-
-#[cfg(test)]
-mod leaf_tests;

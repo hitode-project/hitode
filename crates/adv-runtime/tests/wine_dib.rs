@@ -3,7 +3,7 @@
 #[path = "../../adv-nt/tests/common/mod.rs"]
 mod common;
 
-use adv_machine::{Env, HostFn, Resolver};
+use adv_machine::{Env, HostFn, Outcome, Resolver};
 
 #[derive(Default)]
 struct Calls(std::collections::HashMap<String, u32>);
@@ -12,7 +12,7 @@ impl Resolver for Platform {
     fn host_fn(&self, module: &str, name: &str) -> Option<HostFn> {
         let mut f = adv_unix::Platform.host_fn(module, name)?;
         if module == "hitode.native" && name.starts_with("win32u.so!") {
-            f.env_leaf = Some(counted);
+            f.handler = counted;
         }
         Some(f)
     }
@@ -20,14 +20,18 @@ impl Resolver for Platform {
         adv_unix::Platform.provides(module)
     }
 }
-fn counted(env: &mut Env<'_>) -> Option<u64> {
+fn counted(env: &mut Env<'_>) -> Outcome {
     let name = env.sys.thunks.get(env.thunk).name.clone();
     let body = adv_unix::Platform
-        .host_fn("hitode.native", &name)?
-        .env_leaf?;
-    let value = body(env)?;
-    *env.ext.get_or_default::<Calls>().0.entry(name).or_default() += 1;
-    Some(value)
+        .host_fn("hitode.native", &name)
+        .unwrap()
+        .handler;
+    let declines = adv_nt::native::declines(env.ext);
+    let outcome = body(env);
+    if adv_nt::native::declines(env.ext) == declines {
+        *env.ext.get_or_default::<Calls>().0.entry(name).or_default() += 1;
+    }
+    outcome
 }
 
 // spec: NAT-ID-2, NAT-BODY-4
