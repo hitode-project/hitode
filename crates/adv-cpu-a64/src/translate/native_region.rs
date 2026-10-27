@@ -103,7 +103,7 @@ impl Translator<'_> {
     fn native_choice(&mut self, region: NativeRegion, done: Label) {
         // As with channel batches, page-class snapshots must be refreshed
         // after code discovery changes host-page protection.
-        *self.channels = true;
+        *self.uses_permissions = true;
         let scalar = self.asm.label();
         self.emit(mrs_nzcv(X15));
         for (input, target) in region.inputs().iter().zip([X0, X1, X2]) {

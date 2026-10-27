@@ -73,7 +73,7 @@ impl Plan {
                 | Op::Jcc(..)
                 | Op::Setcc(..)
                 | Op::Cmov(..)
-                | Op::Shift(..)
+                | Op::Shift(_, Src::Reg(_), Some(_))
                 | Op::Imul(..)
                 | Op::Carry(..)
                 | Op::Narrow(..)

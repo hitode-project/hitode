@@ -180,7 +180,7 @@ pub struct Code {
     links: Vec<Link>,
     marks: Vec<Mark>,
     retired: u32,
-    pub(crate) channels: bool,
+    pub(crate) uses_permissions: bool,
 }
 
 /// A link point of a unit: a branch to the owner's helper that may become
@@ -445,7 +445,7 @@ struct Translator<'a> {
     vector: simd::Vector,
     pixel: Option<pixels::Active>,
     pixel_copies: Vec<pixels::Copy>,
-    channels: &'a mut bool,
+    uses_permissions: &'a mut bool,
     /// The x87 run whose stack lives in host registers, if any.
     x87: x87::Cache,
     /// Sites inside such runs and the stubs that publish before faulting.
@@ -513,7 +513,7 @@ impl Backend for Jit<'_> {
             links,
             marks,
             retired,
-            channels,
+            uses_permissions,
         } = &mut *self.code;
         let Unit {
             trace,
@@ -521,7 +521,7 @@ impl Backend for Jit<'_> {
             regions,
             ..
         } = unit;
-        *channels = false;
+        *uses_permissions = false;
         asm.reset();
         labels.clear();
         labels.extend((0..trace.len()).map(|_| asm.label()));
@@ -553,7 +553,7 @@ impl Backend for Jit<'_> {
             vector: simd::Vector::default(),
             pixel: None,
             pixel_copies: Vec::new(),
-            channels,
+            uses_permissions,
             x87: x87::Cache::default(),
             x87_sites: Vec::new(),
             control: self.control,

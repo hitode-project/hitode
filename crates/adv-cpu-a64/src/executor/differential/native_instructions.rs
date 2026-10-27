@@ -141,6 +141,169 @@ fn bit_scans_biased_cl_shifts_and_comparisons_run_without_helpers_and_resume_at_
     }
 }
 
+// spec: A64-FLAG-2, A64-FLAG-3, A64-CTL-7, A64-TR-2, A64-TR-4, A64-VER-1
+#[test]
+fn cl_shifts_and_rotates_match_flags_memory_and_budget_cuts_without_helpers() {
+    for kind in 0..5 {
+        for count in [0u32, 1, 2, 31, 32, 33, 63, 64, 255, 0xffff_ff01] {
+            for destination in 0..4 {
+                for dead in [false, true] {
+                    let mut p = fixture(|a| {
+                        a.add(edx, eax).unwrap();
+                        macro_rules! shift {
+                            ($dst:expr) => {
+                                match kind {
+                                    0 => a.shl($dst, cl),
+                                    1 => a.shr($dst, cl),
+                                    2 => a.sar($dst, cl),
+                                    3 => a.rol($dst, cl),
+                                    _ => a.ror($dst, cl),
+                                }
+                                .unwrap()
+                            };
+                        }
+                        match destination {
+                            0 => shift!(eax),
+                            1 => shift!(ecx),
+                            2 => shift!(dword_ptr(ebp + 0x1c)),
+                            _ => shift!(dword_ptr(ebx + ecx * 4 + 0x1c)),
+                        }
+                        if dead {
+                            a.sub(edx, 19).unwrap();
+                        }
+                    });
+                    p.state.regs[1] = count;
+                    p.state.regs[3] = DATA.wrapping_sub(count.wrapping_mul(4));
+                    let value =
+                        [0, 1, 0x8000_0000, 0x8123_ffff, u32::MAX][(count as usize + kind) % 5];
+                    p.state.regs[0] = value;
+                    p.data[0x1c..0x20].copy_from_slice(&value.to_le_bytes());
+                    for config in pixel_loops::configs() {
+                        for budget in [1, 2, 3, 10] {
+                            let mut native = executor(&p, config, false);
+                            let mut oracle = executor(&p, config, true);
+                            assert_eq!(
+                                native.run(p.stop, budget).unwrap(),
+                                oracle.run(p.stop, budget).unwrap(),
+                                "kind={kind} count={count} destination={destination} dead={dead} config={config:?} budget={budget}"
+                            );
+                            same(&native, &oracle);
+                            assert_eq!(
+                                native.run(p.stop, 10).unwrap(),
+                                oracle.run(p.stop, 10).unwrap()
+                            );
+                            same(&native, &oracle);
+                            assert_eq!(native.native.as_ref().unwrap().diagnostics.helpers, 0);
+                            assert!(
+                                native
+                                    .native
+                                    .as_ref()
+                                    .unwrap()
+                                    .helper_histogram()
+                                    .is_empty()
+                            );
+                            if !config.1 && budget == 10 {
+                                assert!(native.stats.native_entries > 0);
+                                assert_eq!(native.stats.interpreter_entries, 0);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// spec: A64-FLAG-2, A64-FLAG-4, A64-MEM-5, A64-MEM-7, A64-MEM-8, A64-MEM-10, A64-CTL-7
+#[test]
+fn cl_shift_memory_faults_preserve_the_prefix_and_retry_with_the_same_count() {
+    for kind in 0..5 {
+        for count in [0, 1, 31, 32, 33, 255] {
+            for address in [HOLE, DATA, DATA + 0xfff, DATA + DATA_LEN as u32 - 1] {
+                let mut p = fixture(|a| {
+                    a.add(eax, edx).unwrap();
+                    let dst = dword_ptr(address as i32);
+                    match kind {
+                        0 => a.shl(dst, cl),
+                        1 => a.shr(dst, cl),
+                        2 => a.sar(dst, cl),
+                        3 => a.rol(dst, cl),
+                        _ => a.ror(dst, cl),
+                    }
+                    .unwrap();
+                    a.mov(edi, edx).unwrap();
+                });
+                p.state.regs[1] = count;
+                p.data.fill(0x81);
+                for config in pixel_loops::configs() {
+                    let mut native = executor(&p, config, false);
+                    let mut oracle = executor(&p, config, true);
+                    for cpu in [&mut native, &mut oracle] {
+                        if address == DATA {
+                            cpu.protect(DATA, 0x1000, 1).unwrap();
+                        } else if address == DATA + 0xfff {
+                            cpu.protect(DATA + 0x1000, 0x1000, 1).unwrap();
+                        }
+                    }
+                    let outcome = native.run(p.stop, 10).unwrap();
+                    assert!(matches!(
+                        outcome,
+                        RunOutcome::ReadFault { .. } | RunOutcome::WriteFault { .. }
+                    ));
+                    assert_eq!(
+                        outcome,
+                        oracle.run(p.stop, 10).unwrap(),
+                        "kind={kind} count={count} address={address:x} config={config:?}"
+                    );
+                    same(&native, &oracle);
+                    for cpu in [&mut native, &mut oracle] {
+                        cpu.protect(address & !0xfff, 0x2000, 3).unwrap();
+                    }
+                    assert_eq!(
+                        native.run(p.stop, 10).unwrap(),
+                        oracle.run(p.stop, 10).unwrap()
+                    );
+                    same(&native, &oracle);
+                    assert_eq!(
+                        native.memory().read(address, 4).unwrap(),
+                        oracle.memory().read(address, 4).unwrap()
+                    );
+                }
+            }
+        }
+    }
+}
+
+// spec: A64-FLAG-2, A64-MEM-5, A64-CTL-10
+#[test]
+fn cl_shift_zero_count_does_not_write_watched_memory() {
+    for count in [0, 32, 64, 0xffff_ff00] {
+        let mut p = fixture(|a| {
+            a.shr(dword_ptr(ebp + 0x1c), cl).unwrap();
+        });
+        p.state.regs[1] = count;
+        p.data.fill(0x81);
+        for config in pixel_loops::configs() {
+            let mut native = executor(&p, config, false);
+            let mut oracle = executor(&p, config, true);
+            for cpu in [&mut native, &mut oracle] {
+                cpu.memory_mut().watch_code(DATA + 0x1c, 4);
+            }
+            assert_eq!(
+                native.run(p.stop, 10).unwrap(),
+                oracle.run(p.stop, 10).unwrap()
+            );
+            same(&native, &oracle);
+            assert_eq!(native.native.as_ref().unwrap().unchecked_faults, 0);
+            assert_eq!(native.native.as_ref().unwrap().diagnostics.helpers, 0);
+            assert_eq!(native.native.as_ref().unwrap().diagnostics.refused, 0);
+            if !config.1 {
+                assert_eq!(native.stats.interpreter_entries, 0);
+            }
+        }
+    }
+}
+
 // spec: A64-FLAG-4
 #[test]
 fn bit_scan_and_scalar_compare_cross_page_faults_commit_only_the_prefix_and_retry_after_mapping() {

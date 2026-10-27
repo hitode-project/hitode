@@ -3,7 +3,7 @@
 use crate::asm::Label;
 use crate::encode::Extend::{self, Uxtw};
 use crate::encode::Index::{Post, Pre};
-use crate::encode::Shift::{Lsl, Lsr};
+use crate::encode::Shift::{Asr, Lsl, Lsr};
 use crate::encode::Size::{W, X};
 use crate::encode::*;
 
@@ -11,8 +11,8 @@ use super::decode::{Alu, ESP, Mem, Narrow8or16, Op, Part, ShiftKind, Src};
 use super::flags::{Carry, FlagSet, Operand, Recipe, Sense};
 use super::trace::{Inst, Mode};
 use super::{
-    Cold, RUNTIME, SHADOW, State, Translator, WINDOW, X0, X1, X3, X4, X5, X6, X13, X16, X17,
-    biased, host, temp,
+    Cold, RUNTIME, SHADOW, State, Translator, WINDOW, X0, X1, X3, X4, X5, X6, X10, X13, X14, X15,
+    X16, X17, biased, host, temp,
 };
 use crate::runtime::{self, ACCESS_SIGNED, ACCESS_STORE};
 use adv_cpu_core::IndirectBranchKind;
@@ -243,7 +243,9 @@ impl Translator<'_> {
                     self.emit(add(X, host(dst), WINDOW, host(dst), Lsl, 0));
                 }
             }
-            Op::Shift(kind, dst, count) => self.shift(kind, dst, count),
+            Op::Shift(kind, Src::Reg(dst), Some(count)) => self.shift(kind, dst, count),
+            Op::Shift(kind, dst, None) => self.shift_cl(kind, dst),
+            Op::Shift(_, _, Some(_)) => unreachable!(),
             Op::Imul(dst, source, imm) => self.imul(dst, source, imm),
             Op::Carry(subtract, dst, source) => self.carry(subtract, dst, source),
         }
@@ -1229,6 +1231,170 @@ impl Translator<'_> {
                 _ => super::Overflow::Clear,
             };
         }
+    }
+
+    /// CL masks the count to five bits; zero keeps the destination and flags.
+    fn shift_cl(&mut self, kind: ShiftKind, dst: Src) {
+        use ShiftKind::*;
+        let ecx = host(1);
+        let written = Op::Shift(kind, dst, None).effects().writes;
+        if let Src::Reg(dst) = dst
+            && !self.out.any(written)
+        {
+            let source = host(dst);
+            // A variable shift takes the count modulo 32, as x86 masks it.
+            self.clobber(Operand::Guest(dst));
+            let result = result(dst);
+            let word = match kind {
+                Shl => shiftv(W, Lsl, result, source, ecx),
+                Shr => shiftv(W, Lsr, result, source, ecx),
+                Sar => shiftv(W, Asr, result, source, ecx),
+                Rol => {
+                    self.emit(sub(W, X17, Reg::ZR, ecx, Lsl, 0));
+                    rorv(W, result, source, X17)
+                }
+                Ror => rorv(W, result, source, ecx),
+            };
+            self.emit(word);
+            self.commit(dst);
+            return;
+        }
+        self.canonicalize();
+        let done = self.asm.label();
+        let zero = matches!(dst, Src::Mem(_)).then(|| self.asm.label());
+        // x7 holds the memory source and x5 its address across checked accesses.
+        let source = match dst {
+            Src::Reg(dst) => host(dst),
+            Src::Mem(mem) => {
+                *self.uses_permissions = true;
+                let address = self.effective(mem);
+                self.emit(mov(W, X5, address));
+                self.load(Addr::Window(X5), temp(0));
+                temp(0)
+            }
+            Src::Imm(_) => unreachable!(),
+        };
+        self.emit(and_imm(W, X16, ecx, 31));
+        self.asm.cbz(W, false, X16, zero.unwrap_or(done));
+        // The result in w6; CF and OF as bits of registers when live.
+        let flags = self.out.any(written);
+        let (carry, overflow) = if !flags {
+            let word = match kind {
+                Shl => shiftv(W, Lsl, X6, source, X16),
+                Shr => shiftv(W, Lsr, X6, source, X16),
+                Sar => shiftv(W, Asr, X6, source, X16),
+                Rol => {
+                    self.emit(sub(W, X17, Reg::ZR, X16, Lsl, 0));
+                    rorv(W, X6, source, X17)
+                }
+                Ror => rorv(W, X6, source, X16),
+            };
+            self.emit(word);
+            ((Reg::ZR, 0), (Reg::ZR, 0))
+        } else {
+            match kind {
+                Shl => {
+                    self.emit_all(&[
+                        shiftv(W, Lsl, X6, source, X16),
+                        sub(W, X17, Reg::ZR, X16, Lsl, 0),
+                        shiftv(W, Lsr, X17, source, X17),
+                        eor(W, X15, X17, X6, Lsr, 31),
+                    ]);
+                    ((X17, 0), (X15, 0))
+                }
+                Shr | Sar => {
+                    let shift = if kind == Shr { Lsr } else { Asr };
+                    self.emit_all(&[
+                        shiftv(W, shift, X6, source, X16),
+                        sub_imm(W, X17, X16, 1, false),
+                        shiftv(W, Lsr, X17, source, X17),
+                    ]);
+                    let overflow = if kind == Shr {
+                        (source, 31)
+                    } else {
+                        (Reg::ZR, 0)
+                    };
+                    ((X17, 0), overflow)
+                }
+                Rol => {
+                    self.emit_all(&[
+                        sub(W, X17, Reg::ZR, X16, Lsl, 0),
+                        rorv(W, X6, source, X17),
+                        eor(W, X15, X6, X6, Lsr, 31),
+                    ]);
+                    ((X6, 0), (X15, 0))
+                }
+                Ror => {
+                    self.emit_all(&[rorv(W, X6, source, X16), eor(W, X15, X6, X6, Lsl, 1)]);
+                    ((X6, 31), (X15, 31))
+                }
+            }
+        };
+        // Store before changing any guest flag (A64-FLAG-4).
+        if matches!(dst, Src::Mem(_)) {
+            self.store(Addr::Window(X5), X6);
+        }
+        if flags {
+            // OF changes only for a count of 1; C holds CF in subtraction sense.
+            let old = temp(1);
+            self.emit_all(&[
+                mrs_nzcv(old),
+                ubfx(W, X14, overflow.0, overflow.1, 1),
+                ubfx(W, X13, old, 28, 1),
+                cmp_imm(W, X16, 1, false),
+                csel(W, X14, X14, X13, Cond::Eq),
+                bfi(X, old, X14, 28, 1),
+                ubfx(W, X14, carry.0, carry.1, 1),
+                eor_imm(W, X14, X14, 1),
+                bfi(X, old, X14, 29, 1),
+            ]);
+            if !matches!(kind, Rol | Ror) {
+                self.emit_all(&[
+                    lsr_imm(W, X14, X6, 31),
+                    bfi(X, old, X14, 31, 1),
+                    cmp_imm(W, X6, 0, false),
+                    cset(W, X14, Cond::Eq),
+                    bfi(X, old, X14, 30, 1),
+                    mov(W, X10, X6),
+                ]);
+            }
+            self.emit(msr_nzcv(old));
+        }
+        if let Src::Reg(dst) = dst {
+            self.emit(mov(W, result(dst), X6));
+            self.commit(dst);
+        }
+        if let Some(zero) = zero {
+            self.asm.b(done);
+            self.asm.bind(zero);
+            let slow = self.asm.label();
+            // Zero counts still require WRITE, but must not perform a store.
+            // The preceding load established that both page indices are valid.
+            self.emit_all(&[
+                ldr(X, X3, RUNTIME, runtime::ALIAS_CLASSES),
+                lsr_imm(W, X4, X5, 12),
+                ldr_narrow(Narrow::Byte, X4, X3, X4),
+            ]);
+            self.asm.tbz(false, X4, WRITE.trailing_zeros(), slow);
+            self.emit_all(&[
+                add_imm(W, X4, X5, 3, false),
+                lsr_imm(W, X4, X4, 12),
+                ldr_narrow(Narrow::Byte, X4, X3, X4),
+            ]);
+            self.asm.tbz(false, X4, WRITE.trailing_zeros(), slow);
+            self.push_cold(Cold::Leave {
+                label: slow,
+                state: State::CANONICAL,
+                simd_dirty: self.vector.dirty,
+                refund: self.trace.owed(self.index),
+                exit: super::Exit::Interpret,
+                eip: self.trace.insts[self.index].pc,
+                link: false,
+                x87: self.x87_leaving(),
+            });
+        }
+        self.asm.bind(done);
+        self.state = State::CANONICAL;
     }
 
     /// `imul dst, source[, imm]`: CF and OF report a product that does not

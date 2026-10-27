@@ -135,17 +135,28 @@ fn integer(a: &mut CodeAssembler, rng: &mut Rng, w: AsmRegister32, r: AsmRegiste
     let other = rng.pick(&WRITABLE);
     match rng.below(10) {
         0 => {
+            let memory = (rng.below(2) == 0).then(|| mem(a, rng));
             if rng.below(2) == 0 {
-                a.mov(ecx, rng.pick(&[0u32, 1, 2, 31, 32, 33])).unwrap();
+                a.mov(ecx, rng.pick(&[0u32, 1, 2, 31, 32, 33, 63, 64, 255]))
+                    .unwrap();
             }
-            match rng.below(5) {
-                0 => a.shl(w, cl),
-                1 => a.shr(w, cl),
-                2 => a.sar(w, cl),
-                3 => a.rol(w, cl),
-                _ => a.ror(w, cl),
+            macro_rules! shift {
+                ($dst:expr) => {
+                    match rng.below(5) {
+                        0 => a.shl($dst, cl),
+                        1 => a.shr($dst, cl),
+                        2 => a.sar($dst, cl),
+                        3 => a.rol($dst, cl),
+                        _ => a.ror($dst, cl),
+                    }
+                    .unwrap()
+                };
             }
-            .unwrap()
+            if let Some(memory) = memory {
+                shift!(dword_ptr(memory));
+            } else {
+                shift!(w);
+            }
         }
         1 => {
             let count = rng.pick(&[1u32, 1, 2, 7, 31, 32, 33]);

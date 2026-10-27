@@ -347,6 +347,9 @@ impl Harness {
         put(offset_of!(runtime::Runtime, cpu), CPU);
         put(offset_of!(runtime::Runtime, window), WINDOW_BASE);
         put(offset_of!(runtime::Runtime, countdown), 100);
+        let permissions = CONTEXT + 0x3000;
+        put(offset_of!(runtime::Runtime, alias_classes), permissions);
+        self.emu.write(permissions, &vec![3; 0x100]);
         self.emu.write(CONTEXT, &context);
         let mut state = vec![0; size_of::<CpuState>()];
         for (n, value) in initial.regs.iter().enumerate() {
@@ -511,22 +514,31 @@ fn bit_scans_preserve_undefined_flags_zero_destinations_and_word_halves() {
 
 // spec: A64-FLAG-2
 #[test]
-fn shifts_by_cl_cover_every_register_and_count_with_live_and_dead_flags() {
+fn shifts_by_cl_cover_registers_memory_and_every_count_with_live_and_dead_flags() {
     let mut h = Harness::new();
-    for dst in 0..8 {
+    for dst in 0..9 {
         for kind in 0..5 {
             for dead in [false, true] {
                 let code = bytes(|a| {
                     a.add(edx, eax).unwrap();
-                    let r = [eax, ecx, edx, ebx, esp, ebp, esi, edi][dst];
-                    match kind {
-                        0 => a.shl(r, cl),
-                        1 => a.shr(r, cl),
-                        2 => a.sar(r, cl),
-                        3 => a.rol(r, cl),
-                        _ => a.ror(r, cl),
+                    macro_rules! shift {
+                        ($dst:expr) => {
+                            match kind {
+                                0 => a.shl($dst, cl),
+                                1 => a.shr($dst, cl),
+                                2 => a.sar($dst, cl),
+                                3 => a.rol($dst, cl),
+                                _ => a.ror($dst, cl),
+                            }
+                            .unwrap()
+                        };
                     }
-                    .unwrap();
+                    if dst == 8 {
+                        shift!(dword_ptr(ebp + 0x1c));
+                        a.mov(edi, dword_ptr(ebp + 0x1c)).unwrap();
+                    } else {
+                        shift!([eax, ecx, edx, ebx, esp, ebp, esi, edi][dst]);
+                    }
                     // SUB writes every flag, making the shift's flags dead.
                     if dead {
                         a.sub(edx, 19).unwrap();
@@ -534,12 +546,15 @@ fn shifts_by_cl_cover_every_register_and_count_with_live_and_dead_flags() {
                 });
                 for count in 0..=255 {
                     let mut state = initial();
-                    state.regs[dst] = 0x8123ffff;
+                    if dst < 8 {
+                        state.regs[dst] = 0x8123ffff;
+                    }
                     state.regs[1] = (state.regs[1] & !255) | count;
-                    let want = reference(&code, &[], &state);
-                    let (got, exit, left) = h.run(&code, &[], &state, false);
+                    let data = [0xff; 0x20];
+                    let want = reference(&code, &data, &state);
+                    let (got, exit, left) = h.run(&code, &data, &state, false);
                     assert_eq!(exit, Exit::Dispatch);
-                    assert_eq!(left, if dead { 97 } else { 98 });
+                    assert_eq!(left, 98 - u64::from(dead) - u64::from(dst == 8));
                     assert_eq!(
                         got, want,
                         "dst={dst}, kind={kind}, dead={dead}, count={count}"

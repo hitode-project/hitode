@@ -136,7 +136,7 @@ impl Translator<'_> {
         let Some(plan) = Plan::at(self.trace, index, self.checked) else {
             return;
         };
-        *self.channels = true;
+        *self.uses_permissions = true;
         let scalar = self.asm.label();
         let channels = plan.sources.len() as u32;
         let cost = BATCH * plan.instructions;

@@ -439,7 +439,7 @@ impl Translator<'_> {
             | Op::Cdq
             | Op::Jmp(_)
             | Op::Setcc(..)
-            | Op::Shift(..)
+            | Op::Shift(_, Src::Reg(_), Some(_))
             | Op::Direction(_) => true,
             Op::Narrow(_, _, a, b) => [a, b]
                 .iter()
