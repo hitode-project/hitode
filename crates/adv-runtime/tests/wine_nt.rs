@@ -459,3 +459,24 @@ fn time_skip_respects_external_waits_and_process_families() {
         assert_checks(&text, "ok", &["waits="]);
     }
 }
+
+// spec: WINE-THR-3, WINE-THR-4, WINE-TIME-1
+#[test]
+fn thread_control_with_startup_time_skip() {
+    let Some((stop, text)) = probe(
+        "thread_control_with_startup_time_skip",
+        "control.exe",
+        |session, _| {
+            session
+                .machine
+                .set_time_skip_source(Some(std::sync::Arc::new(|startup| startup)));
+        },
+    ) else {
+        return;
+    };
+    assert!(matches!(stop, Stop::Exited(0)), "{stop:?}: {text}");
+    assert_eq!(
+        text.lines().collect::<Vec<_>>(),
+        ["ticked=1 suspended=0 frozen=1 resumed=1 ran=1 joined=0 code=3 waited=0 waiter=4"]
+    );
+}

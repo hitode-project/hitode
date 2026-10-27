@@ -330,7 +330,7 @@ FreeType is a host library under WINE-UNIX-6.
 
 ### WINE-THR-4 Termination
 
-**Rule**: Terminating another thread, or a process's other threads before it exits, MUST end their contexts where they stand, with no detach work. Waiters MUST see each thread signaled with the given exit code.
+**Rule**: Terminating another thread, or a process's other threads before it exits, MUST end their contexts where they stand, with no detach work. Waiters MUST see each thread signaled with the given exit code. Termination MUST remove pending suspension and saved signal state before host polling.
 **Verification**: Test
 
 ### WINE-THR-5 Debug register contexts

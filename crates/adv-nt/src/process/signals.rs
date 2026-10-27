@@ -22,6 +22,14 @@ pub(crate) fn queue(env: &mut Env<'_>, id: CtxId) {
     env.sys.suspend_context(id);
 }
 
+pub(crate) fn forget(env: &mut Env<'_>, id: CtxId) {
+    env.ext.get_or_default::<Signals>().0.remove(&id);
+    env.ext
+        .get_or_default::<Pending>()
+        .0
+        .retain(|&context| context != id);
+}
+
 pub fn suspend(env: &mut Env<'_>) -> Result<(), Error> {
     if env
         .ext
@@ -123,11 +131,6 @@ pub fn deliver(machine: &mut Machine<adv_cpu::Cpu>, tid: i32, sig: i32) -> Resul
         machine
             .visit_context(Some(id), |env| {
                 if sig == libc::SIGQUIT || sig == libc::SIGKILL {
-                    env.ext.get_or_default::<Signals>().0.remove(&id);
-                    env.ext
-                        .get_or_default::<Pending>()
-                        .0
-                        .retain(|&context| context != id);
                     server::end_thread(env, id);
                     env.sys.terminate_context_stopped(id, 0);
                     Ok(())
@@ -159,7 +162,6 @@ pub fn wake(machine: &mut Machine<adv_cpu::Cpu>) -> Result<bool, String> {
         changed |= machine
             .visit_context(Some(id), |env| match server::poll_wake(env) {
                 Ok(Some(wake)) if wake.cookie == 0 => {
-                    env.ext.get_mut::<Signals>().0.remove(&id);
                     server::end_thread(env, id);
                     env.sys.terminate_context_stopped(id, wake.signaled);
                     Ok(true)
