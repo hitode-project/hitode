@@ -1,3 +1,4 @@
+import { locale } from "./i18n.svelte";
 import type { Game } from "./types";
 
 // Fake library for the browser preview (`pnpm dev`); in the app the library
@@ -7,9 +8,6 @@ const DAY = 86_400_000;
 const now = Date.now();
 
 interface Seed {
-  title: string;
-  brand: string;
-  year: number;
   cover: string;
   engine: string;
   /** Days since last played; null if never started. */
@@ -19,23 +17,29 @@ interface Seed {
   favorite?: boolean;
   nsfw?: boolean;
   offline?: Game["offline"];
-  path?: string;
+  root?: string;
 }
 
+// Neutral sample entries: numbered titles, no brands, plain covers.
 const seeds: Seed[] = [
-  { title: "夏影のアルバム", brand: "月下工房", year: 2004, cover: "cv1", engine: "KiriKiri 2", last: 1, hours: 12.5, sessions: 9, favorite: true },
-  { title: "星屑レター", brand: "Lapis Soft", year: 2007, cover: "cv2", engine: "NScripter", last: 3, hours: 31, sessions: 22, favorite: true },
-  { title: "硝子の街と七つの鐘", brand: "鈴音堂", year: 2009, cover: "cv4", engine: "SoftPAL", last: 7, hours: 8, sessions: 6 },
-  { title: "千年桜の約束", brand: "ひだまり舎", year: 2008, cover: "cv9", engine: "KiriKiri 2", last: 14, hours: 46, sessions: 31, favorite: true },
-  { title: "ほうかごエトランゼ", brand: "Lapis Soft", year: 2011, cover: "cv5", engine: "CatSystem2", last: 30, hours: 3, sessions: 2 },
-  { title: "雨音ステップ", brand: "白波ソフト", year: 2010, cover: "cv10", engine: "Yu-RIS", last: null, hours: 0, nsfw: true },
-  { title: "蒼の残響", brand: "鈴音堂", year: 2005, cover: "cv7", engine: "SoftPAL", last: null, hours: 0 },
-  { title: "灯台守のいない島", brand: "白波ソフト", year: 2003, cover: "cv8", engine: "NScripter", last: null, hours: 0, offline: "disk", path: "/Volumes/外置硬盘/Games/灯台守のいない島" },
-  { title: "雪解けのプレリュード", brand: "月下工房", year: 2006, cover: "cv6", engine: "KiriKiri 2", last: null, hours: 0 },
-  { title: "白露の庭", brand: "ひだまり舎", year: 2002, cover: "cv3", engine: "KiriKiri 2", last: null, hours: 0, offline: "missing", path: "~/ADV/白露の庭" },
-  { title: "夜明けのリフレイン", brand: "月下工房", year: 2012, cover: "cv11", engine: "KiriKiri Z", last: null, hours: 0 },
-  { title: "紅葉坂ダイアリー", brand: "鈴音堂", year: 2001, cover: "cv12", engine: "SoftPAL", last: null, hours: 0 },
+  { cover: "cv1", engine: "KiriKiri 2", last: 1, hours: 12.5, sessions: 9, favorite: true },
+  { cover: "cv2", engine: "NScripter", last: 3, hours: 31, sessions: 22, favorite: true },
+  { cover: "cv3", engine: "SoftPAL", last: 7, hours: 8, sessions: 6 },
+  { cover: "cv4", engine: "KiriKiri 2", last: 14, hours: 46, sessions: 31, favorite: true },
+  { cover: "cv5", engine: "CatSystem2", last: 30, hours: 3, sessions: 2 },
+  { cover: "cv6", engine: "Yu-RIS", last: null, hours: 0, nsfw: true },
+  { cover: "cv7", engine: "SoftPAL", last: null, hours: 0 },
+  { cover: "cv8", engine: "NScripter", last: null, hours: 0, offline: "disk", root: "/Volumes/外置硬盘/Games" },
+  { cover: "cv9", engine: "KiriKiri 2", last: null, hours: 0 },
+  { cover: "cv10", engine: "KiriKiri 2", last: null, hours: 0, offline: "missing", root: "~/ADV" },
+  { cover: "cv11", engine: "KiriKiri Z", last: null, hours: 0 },
+  { cover: "cv12", engine: "SoftPAL", last: null, hours: 0 },
 ];
+
+function sampleTitle(n: number): string {
+  const language = locale();
+  return language === "zh" ? `示例游戏 ${n}` : language === "ja" ? `サンプルゲーム ${n}` : `Sample Game ${n}`;
+}
 
 /** Deterministic pseudo-random daily minutes ending on the last-played day. */
 function daily(index: number, last: number | null): number[] {
@@ -60,15 +64,16 @@ function fakeGame(s: Seed, i: number): Game {
   const days = daily(i, s.last);
   // The total covers at least the last 30 days.
   const recent = days.reduce((sum, minutes) => sum + minutes, 0);
+  const title = sampleTitle(i + 1);
   return {
     id: `g${i + 1}`,
-    title: s.title,
-    brand: s.brand,
-    year: s.year,
+    title,
+    brand: "",
+    year: 0,
     cover: s.cover,
     engine: s.engine,
     codepage: 932,
-    path: s.path ?? `~/Games/${s.title}`,
+    path: `${s.root ?? "~/Games"}/${title}`,
     exe: "Game.exe",
     lastPlayed: s.last === null ? null : now - s.last * DAY,
     playMinutes: Math.max(Math.round(s.hours * 60), recent),

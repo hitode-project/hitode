@@ -32,6 +32,17 @@
 
 目前我们提供一个简易的播放器：一个启动器管理游戏库（关联 [VNDB](https://vndb.org/) 信息、记录游玩时间）、备份存档和按游戏调整设置；画面可以用 Anime4K、CuNNy 等超分滤镜放大；适配移动设备和 Mac 的操作。
 
+<p>
+<a href="docs/images/launcher-desktop-light.zh-CN.webp"><picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/launcher-desktop-dark.zh-CN.webp">
+  <img src="docs/images/launcher-desktop-light.zh-CN.webp" width="400" height="250" alt="Mac 上的启动器：示例条目的游戏库和详情面板">
+</picture></a>
+<a href="docs/images/launcher-phone-light.zh-CN.webp"><picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/launcher-phone-dark.zh-CN.webp">
+  <img src="docs/images/launcher-phone-light.zh-CN.webp" width="116" height="250" alt="手机上的启动器：示例条目的游戏库">
+</picture></a>
+</p>
+
 ## 能玩哪些游戏
 
 Hitode 不针对某个游戏或引擎做适配，而是实现 32 位 Windows 视觉小说常用的系统功能：GDI、DirectDraw、Direct3D 9、DirectSound、DirectInput，以及 DirectShow、Windows Media 和 VfW 视频。只要游戏建立在这些功能之上，不论是商业引擎、引擎的哪个版本，还是品牌自研的引擎，都有机会直接运行。

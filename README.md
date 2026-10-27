@@ -32,6 +32,17 @@ No port and no setup: the original exe, its DLLs and translation patches run as 
 
 For now Hitode ships a simple player: a launcher that manages the library (with [VNDB](https://vndb.org/) metadata and play time), backs up saves and keeps per-game settings; upscaling filters such as Anime4K and CuNNy; and controls adapted to mobile devices and the Mac.
 
+<p>
+<a href="docs/images/launcher-desktop-light.webp"><picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/launcher-desktop-dark.webp">
+  <img src="docs/images/launcher-desktop-light.webp" width="400" height="250" alt="The launcher on the Mac: library grid with sample entries and a detail panel">
+</picture></a>
+<a href="docs/images/launcher-phone-light.webp"><picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/launcher-phone-dark.webp">
+  <img src="docs/images/launcher-phone-light.webp" width="116" height="250" alt="The launcher on a phone: library grid with sample entries">
+</picture></a>
+</p>
+
 ## Which games run
 
 Hitode does not target particular games or engines. It implements the system features 32-bit Windows visual novels commonly use: GDI, DirectDraw, Direct3D 9, DirectSound, DirectInput, and video through DirectShow, Windows Media and VfW. A game built on these has a chance to run as it is, whether it uses a commercial engine, any version of one, or a brand's in-house engine.
