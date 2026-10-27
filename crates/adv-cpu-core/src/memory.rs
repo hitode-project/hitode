@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 mod fast;
 mod locks;
+mod page_map;
 
 pub use fast::FastPermissions;
 
@@ -151,7 +152,7 @@ pub struct Memory {
     pub dirty_pages: BTreeMap<u32, u64>,
     pub dirty_ranges: Option<Vec<(u32, usize)>>,
     reservation: Option<crate::virtual_memory::Reservation>,
-    shared_pages: BTreeMap<usize, SharedPage>,
+    shared_pages: page_map::PageMap<SharedPage>,
     /// Owned snapshots have no external alias. SHARED is only their first-store
     /// barrier, retired by the same transactional store preparation as COPY.
     private_copy_pages: Vec<Option<bool>>,
@@ -319,7 +320,7 @@ impl Memory {
             dirty_pages: BTreeMap::new(),
             dirty_ranges: Some(Vec::new()),
             reservation: None,
-            shared_pages: BTreeMap::new(),
+            shared_pages: Default::default(),
             private_copy_pages: vec![None; len / PAGE_SIZE],
             private_copy_epoch: 0,
             resident: BTreeMap::new(),
@@ -358,7 +359,7 @@ impl Memory {
             dirty_pages: BTreeMap::new(),
             dirty_ranges: Some(Vec::new()),
             reservation: Some(reservation),
-            shared_pages: BTreeMap::new(),
+            shared_pages: Default::default(),
             private_copy_pages: vec![None; len / PAGE_SIZE],
             private_copy_epoch: 0,
             resident: BTreeMap::new(),
@@ -594,10 +595,13 @@ impl Memory {
         if self.reservation.is_none() {
             return Err("unmapping requires reserved address space".into());
         }
-        for page in pages.clone() {
-            if let Some(file) = self.resident.remove(&page) {
-                file.evict();
-            }
+        let resident: Vec<_> = self
+            .resident
+            .range(pages.clone())
+            .map(|(&page, _)| page)
+            .collect();
+        for page in resident {
+            self.resident.remove(&page).unwrap().evict();
         }
         #[cfg(unix)]
         self.unlinearize(pages.clone())?;
@@ -655,7 +659,9 @@ impl Memory {
         }
         let start = (addr - self.base) as usize / PAGE_SIZE;
         let last = ((addr - self.base) as usize + len - 1) / PAGE_SIZE;
-        for page in start..=last {
+        // Only watched pages hold translated code, so only their changes
+        // invalidate units; mapping a large file view stays per-page cheap.
+        for page in (start..=last).filter(|&page| self.watched[page]) {
             self.dirty_pages
                 .entry(self.base + page as u32 * PAGE_SIZE as u32)
                 .or_insert(self.versions[page]);
@@ -933,7 +939,7 @@ impl Memory {
         let shared = self
             .shared_pages
             .range(pages.clone())
-            .map(|(&page, storage)| (page, storage.identity()));
+            .map(|(page, storage)| (page, storage.identity()));
         let resident = self
             .resident
             .range(pages)
@@ -1288,7 +1294,7 @@ impl Memory {
             return Ok(());
         }
         let mut private = Vec::new();
-        for (&index, storage) in self
+        for (index, storage) in self
             .shared_pages
             .range(range.start / PAGE_SIZE..=(range.end - 1) / PAGE_SIZE)
         {
@@ -2284,6 +2290,12 @@ mod window_tests {
             assert!(
                 memory.dirty_pages.is_empty(),
                 "unwatched data stays ordinary"
+            );
+            memory.protect(0x18000, 8192, READ | WRITE).unwrap();
+            memory.unmap(0x18000, 8192).unwrap();
+            assert!(
+                memory.dirty_pages.is_empty(),
+                "remapping unwatched pages invalidates nothing"
             );
         }
     }
