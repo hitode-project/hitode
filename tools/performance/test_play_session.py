@@ -70,22 +70,6 @@ class PlaySessionTests(unittest.TestCase):
         self.assertTrue(commands[2].endswith("blocked.png"))
         self.assertNotIn("close", commands)
 
-    def test_native_cache_import_and_switches_use_only_the_new_overlay(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory).resolve()
-            native = root / "jit-code.bin"
-            native.write_bytes(b"authored native cache")
-            args = self.args(root, compile_threads=4, warm_code_cache=native)
-            (command, kwargs), _ = self.launch(args)
-            self.assertNotIn("--no-code-cache", command)
-            self.assertEqual(kwargs["env"]["ADV_COMPILE_THREADS"], "4")
-            self.assertEqual((args.output / "overlay/jit-code.bin").read_bytes(), native.read_bytes())
-
-    def test_native_cache_diagnostic_bypass_reaches_the_runner(self):
-        with tempfile.TemporaryDirectory() as directory:
-            args = self.args(Path(directory).resolve(), no_code_cache=True)
-            (command, _), _ = self.launch(args)
-            self.assertIn("--no-code-cache", command)
 
     def test_optical_mounts_and_pending_dialogs_reach_runner_unchanged(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -155,7 +139,7 @@ class PlaySessionTests(unittest.TestCase):
 
     def test_code_page_defaults_to_detection(self):
         args = play_session.build_parser().parse_args(
-            ["--binary", "b", "--exe", "e", "--schedule", "s", "--output", "o"])
+            ["--wine", "w", "--binary", "b", "--exe", "e", "--schedule", "s", "--output", "o"])
         self.assertEqual(args.codepage, "auto")
         self.assertFalse(args.pin_runner)
 
@@ -166,10 +150,10 @@ class PlaySessionTests(unittest.TestCase):
         binary.write_bytes(b"Mocked runner, never executed")
         game.write_bytes(b"Authored mock guest, never executed")
         schedule.write_text(json.dumps([{"at": 0, "command": "key-up 17"}]), encoding="utf-8")
-        values = dict(binary=binary, exe=game, schedule=schedule, output=root / "output",
+        values = dict(wine=root, binary=binary, exe=game, schedule=schedule, output=root / "output",
                       seed_data=None, audio=True, mute_audio=False, capture_audio=False,
                       mode="hidden", tail_seconds=0, codepage=932, codec="native",
-                      sync_compilation=False, no_tiering=False, trace=False)
+                      trace=False)
         values.update(changes)
         return argparse.Namespace(**values)
 
@@ -263,10 +247,10 @@ class ReplayDiagnosticsTest(unittest.TestCase):
                 schedule = root / "schedule.json"
                 schedule.write_text('[{"at":0,"command":"key 13"}]', encoding="utf-8")
                 output = root / "session"
-                args = argparse.Namespace(binary=binary, exe=game, schedule=schedule,
+                args = argparse.Namespace(wine=root, binary=binary, exe=game, schedule=schedule,
                     output=output, seed_data=None, mode="hidden", codepage=932,
                     audio=False, capture_audio=False, trace=trace, tail_seconds=0,
-                    codec="native", sync_compilation=False, no_tiering=False)
+                    codec="native")
 
                 class Runner:
                     returncode = None

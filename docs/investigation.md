@@ -24,8 +24,8 @@ target/scratch/<agent>/          # one-off scripts and intermediate files
 
 | Symptom | First | Then |
 |---|---|---|
-| Startup hangs, error box, early exit | `sample_matrix.py --only <id> --api-mode discovery --trace`, then the first failure in the report | `trace_hresult.py` summarizes failed HRESULTs. `--warm-from <cold run>` reuses the JIT profiles of a matching cold run. |
-| Smoke test after a personality change | `sample_matrix.py --quick` over `tools/performance/startup-smoke.json`, then `matrix_gate.py --require-frames --frame-tolerance 1` | One game per engine for 10 seconds. A run with zero frames or a new structural warning is a regression. |
+| Startup hangs, error box, early exit | `sample_matrix.py --wine <dist> --only <id> --trace`, then the first failure in the report | `trace_hresult.py` summarizes failed HRESULTs. |
+| Smoke test after a personality change | `sample_matrix.py --wine <dist> --quick` over `tools/performance/startup-smoke.json`, then `matrix_gate.py --require-frames --frame-tolerance 1` | One game per engine for 10 seconds. A run with zero frames or a new structural warning is a regression. |
 | Wrong behavior after some interaction | Reproduce up to that step with a `play_session.py` schedule | `--trace` keeps `api.trace`. The control command `memory ADDR LEN` reads guest memory. |
 | Wrong picture | A `checkpoint` or `capture` | `--gpu-software` compares adapters, and `trace_hresult.py` shows rendering failures. |
 
@@ -35,7 +35,6 @@ Authored fixtures and generators for one area:
 |---|---|---|
 | Android APK page compatibility | `tools/android/check-apk.py <apk>` | Standard-library ELF LOAD and stored ZIP data alignment checks for 16 KiB pages. Tests: `python -m unittest discover -s tools/android -p test_check_apk.py`. |
 | Upscaling shader regeneration | `tools/upscaling/generate.py <slangc>` | Pinned upstream shaders → WGSL, quantized layer fusion, cooperative matrix RGB convolutions and texture lifetimes; no game inputs. Tests: `python -m unittest discover -s tools/upscaling`. |
-| D3D9 texture-target copies | [`d3d9-texture-blit.c`](../tools/fixtures/d3d9-texture-blit.c), `test-d3d9-texture-blit.ps1` | Authored RGBX/ARGB images; scalar and pixel comparisons for rectangles, container identity and render state. |
 
 ### CPU and JIT
 
@@ -47,17 +46,15 @@ Authored fixtures and generators for one area:
 | Synthetic Tier 0 baseline | `cargo run -p adv-cpu-core --release --example tier0_baseline -- --seconds 2` | Authored integer/string/x87/MMX/indirect-call loops, retired-instruction checks and JSON throughput; no game samples. |
 | CPU suite and strict judgement | `acceptance.py [--strict] <logs>` in `tools/cpu` | On AArch64, `arm64-check.sh <ref>` runs the suite once and judges it both ways. |
 | Execution cliffs and tier verification counts | `tools/survey/cliffs.py <report.json> ...` | Groups plain and verify runs and uses only each run's final report. |
-| x64 region entry checks and cold compile cost | `host_region_bench` example in `adv-cpu` | `ADV_REGION_BENCH_COMPILE=1` adds Fast and Speed compile percentiles. |
 | AArch64 execution cost | `engine_bench` example in `adv-cpu` | Compares the interpreter and the platform engine through `Backend` only, in ns per guest instruction. |
 | Poll word and interrupt latency | `safepoint_bench` example in `adv-cpu` | `ADV_SAFEPOINT_BENCH_TIER` selects Tier 0 or 2. |
 | Which observed code static discovery covers | `tools/performance/static_coverage.py` | Labeled wall-clock sample coverage, not a complete PC set. |
-| Native instruction rate for frame budget estimates | `native_instruction_rate` example in `adv-cpu` | Feed its JSON to `frame_budget.py --native-rate`. |
 
 ### Performance
 
 | Symptom | First | Then |
 |---|---|---|
-| Uneven animation intervals, slow Ctrl skip, long first start | `frame_budget.py run --platform android\|windows --binary <runner> --output <run>` | Summarizes presentation runs, load boundaries and Ctrl commits per second. `--no-code-cache` is for troubleshooting only. `--frame-budget` reads the clock twice per host call, so leave it off when timing startup. |
+| Uneven animation intervals, slow Ctrl skip, long first start | `play_session.py --wine <dist> --binary <runner> --exe <exe> --schedule <schedule> --output <run> --frame-budget` | Summarizes presentation runs, load boundaries and Ctrl commits per second. `--frame-budget` reads the clock twice per host call, so leave it off when timing startup. |
 | Slow, stuttering or slow skipping in a game | The attribution workflow below | |
 | Two builds A/B | `compare_runtime.py` on a fixed frame prefix, gated on frame hashes | Compatibility regressions use `sample_matrix.py` and `matrix_gate.py`. |
 | Heap allocation cost | `heap_service` example in `adv-os` | `large` and `metadata` select other workloads. |
@@ -74,7 +71,6 @@ Authored fixtures and generators for one area:
 | Sound | `ADV_AUDIO_TRACE=<file>`, with `ADV_AUDIO_DUMP_DIR=<dir>` | `play_session.py --capture-audio` and `analyze_audio_capture.py` |
 | Text and fonts | `ADV_TEXT_DIAGNOSTICS=1` | `ADV_FONT_PROFILE` |
 | mmio and RIFF reads | `ADV_MMIO_TRACE=<file>` | |
-| Cost of one DLL, function-level differential | `tools/performance/dll_exports.py` with an x86 C fixture and a JSON script | [The driver protocol](../tools/fixtures/dll-driver.md) |
 | Fixed core exports, ordinals and API set forwarders | `tools/abi/system_exports.py` | Reads PE export and namespace metadata only. |
 | SDK ordinal import identity | `tools/abi/import_ordinals.py --check` | |
 
@@ -84,7 +80,7 @@ Authored fixtures and generators for one area:
 - A process or thread exit that does not return adds a `# terminal` comment with the original binding, exit code, entry stack and resume point.
 - `# cpu_fault` records a real CPU fault before personality exception handling. It does not mean the fault went unhandled. Interrupts use `# raw_interrupt`. Addresses stay out of shared reports.
 
-**Bounded interpreter observation.** With `--backend interpreter` on either CPU engine, set `ADV_INTERP_TRACE_DIR` to an existing folder under `target` and `ADV_INTERP_TRACE_RANGES` to comma-separated half-open `<start>..<end>` PC ranges.
+**Bounded interpreter observation.** With `--backend interpreter` on the AArch64 engine, set `ADV_INTERP_TRACE_DIR` to an existing folder under `target` and `ADV_INTERP_TRACE_RANGES` to comma-separated half-open `<start>..<end>` PC ranges.
 
 - `ADV_INTERP_TRACE_MAX` defaults to 4096 (1 to 100000), and `ADV_INTERP_TRACE_STACK_WORDS` to 4 (0 to 8). `ADV_INTERP_TRACE_START` delays observation until a PC.
 - Each executor writes `interpreter-*.jsonl` with the opcode name, integer registers and flags before and after, stack words, the step and the stop reason. It holds no code bytes.
@@ -92,7 +88,7 @@ Authored fixtures and generators for one area:
 - `ADV_INTERP_TRACE_OPERANDS=1` adds explicit register, immediate and memory operand values of up to 8 bytes.
 - Observation never changes guest memory or exception behavior. Output stays local.
 
-**Tier verification.** `ADV_JIT_VERIFY=1` interprets the first native entries before running them natively and counts the comparisons in the report's `tier_verification`; `strict` stops at the first mismatch. The x64 engine checks one unlinked block after each publication. The a64 engine checks the first runs from each entry PC by their retired instruction count. Mismatch reports carry guest addresses and stay local.
+**Tier verification.** `ADV_JIT_VERIFY=1` interprets the first native entries before running them natively and counts the comparisons in the report's `tier_verification`; `strict` stops at the first mismatch. The a64 engine checks the first runs from each entry PC by their retired instruction count. Mismatch reports carry guest addresses and stay local.
 
 ## Live sessions: the debugger
 
@@ -148,7 +144,7 @@ Headless runs check mechanisms and gains quickly. Fix the binary, configuration,
 
 ## Performance work
 
-- **Targets.** ARM macOS, iOS and modern Android share the a64 engine and get the same optimizations. The x86_64 engine is frozen and only gets correctness fixes; do not change the a64 contract in [docs/spec/a64.md](spec/a64.md) without a maintainer.
+- **Targets.** ARM macOS, iOS and modern Android share the a64 engine and get the same optimizations. Do not change the a64 contract in [docs/spec/a64.md](spec/a64.md) without a maintainer.
 - **Priorities.** First, transitions and animations run at the game's own pace without stutter or runs of dropped frames. Second, Ctrl skipping advances the story fast; dropped frames there do not matter. Third, the first start may be slower, but not much.
 - **Baselines.** Normal play has no audio dropouts, a click shows on screen within 100 ms at p95, and waiting for input costs almost no CPU. Frames that are slow natively do not count, load pauses are judged on their own, and steady state comes before one-time costs.
 - **Spend where it shows.** Never trade away what a player perceives: stutter, dropped frames, slow loads, audio glitches. Shrink what a player cannot see, such as hashing, copies, host calls, wakeups, memory bandwidth and diagnostics, and move what must stay to moments nobody notices. When unsure, keep the experience and prove the saving with counts.
@@ -193,6 +189,5 @@ python tools/survey/module_profile.py <module> [--json <out>]
 - `ADV_INTERP_PROFILE=<file>` profiles the interpreter.
 - On macOS, `play_session.py` writes cumulative process CPU time and memory to each checkpoint's `*.process.json`. Subtract CPU time and `wall_seconds` between checkpoints for whole-process core usage; 1.0 means one fully occupied core.
 - Checkpoint reports of `--frame-budget` and `--host-profile` carry cumulative `host_services_csv`. Subtract two checkpoints for the service time and count of a fixed segment; it includes handlers and continuations and excludes guest callbacks and waits.
-- In code cache reports, `load_ns` covers reading, checking and parsing the archive, and `restore_ns` covers relocation and publication after a hit. Neither is pure disk I/O.
 
 A finding goes into the commit or pull request that acts on it, with the baseline configuration, the sample count and window, and the hypotheses ruled out.

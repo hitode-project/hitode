@@ -706,10 +706,6 @@ Black for a normal-weight request to that family.
 **Rule**: Listed Wine conformance tests that pass on standard Wine MUST pass here with no failures. Each runs as its own program without arguments.
 **Verification**: Test
 
-### WINE-TEST-2 Stack switch comparison
-
-**Rule**: Stack comparisons MUST run sequentially with the same executable, duration, headless GPU, audio, and automatic-dialog settings. The default gate MUST reject Wine CPU per frame exceeding 105% of the old stack's, or frame counts below 90%. Unsuccessful runs, missing summaries, and zero-frame measurements MUST NOT pass.
-**Verification**: Test
 
 ## Native video
 
@@ -813,3 +809,5 @@ Black for a normal-weight request to that family.
 
 **Rule**: Native sources MUST accept PCM, IEEE float, Microsoft ADPCM and xWMA buffers. Compressed decoding MUST use host code.
 **Verification**: Test
+
+Withdrawn: WINE-TEST-2

@@ -155,7 +155,7 @@ python3 tools/macos/package.py
 The runner inside the bundle takes the usual arguments:
 
 ```sh
-target/macos/ADV.app/Contents/MacOS/adv-run --audio \
+target/macos/ADV.app/Contents/MacOS/adv-run --wine <distribution> --audio \
   --data-dir target/investigations/<topic>/data "$ADV_SAMPLES/<game>/<game>.exe"
 ```
 

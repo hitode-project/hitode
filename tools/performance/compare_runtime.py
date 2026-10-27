@@ -98,6 +98,7 @@ def file_hash(path: Path) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--wine', required=True, type=Path)
     parser.add_argument('--baseline', required=True, type=Path)
     parser.add_argument('--candidate', required=True, type=Path)
     parser.add_argument('--exe', required=True, help='EXE path relative to ADV_SAMPLES')
@@ -156,7 +157,8 @@ def main() -> None:
                     else:
                         overlay.mkdir()
                     command = [str(binaries[label]), str(exe), '--' + args.mode, '--backend',
-                               args.backend, '--compile', 'fast', '--frames', str(args.frames),
+                               args.backend, '--wine', str(args.wine.resolve(strict=True)),
+                               '--wine-prefix', str(Path(temporary) / 'prefix'), '--frames', str(args.frames),
                                '--codepage', args.codepage, '--data-dir', str(overlay),
                                '--report', str(report_path)]
                     if args.audio:
