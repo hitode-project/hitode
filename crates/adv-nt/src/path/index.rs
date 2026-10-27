@@ -275,6 +275,9 @@ mod tests {
 
     #[cfg(any(target_vendor = "apple", target_os = "android"))]
     fn rename_through_nt(root: &Path, name: &str) {
+        let Some(install) = std::env::var_os("ADV_WINE_DIST") else {
+            return;
+        };
         use crate::{file, server};
         use adv_cpu::{
             Cpu,
@@ -300,7 +303,7 @@ mod tests {
             &adv_wineserver::Config {
                 prefix: root.to_owned(),
                 server_dir: root.join("server"),
-                install: std::env::var_os("ADV_WINE_DIST").unwrap().into(),
+                install: install.into(),
                 debug: 0,
             },
             &Time,
