@@ -2,13 +2,13 @@
 
 ID prefix: DEV
 
-This spec covers the neutral device services behind the API front ends: frames, depth attachments, texture updates, images, audio, fonts and optical media. `adv-device` and `adv-os` implement them.
+This spec covers the neutral device services behind the API front ends: frames, depth attachments, texture updates, icon raster output, audio, fonts and optical media. `adv-device` and `adv-os` implement them.
 
 ## Frames
 
 ### DEV-FRAME-1 Shared presentation
 
-**Rule**: GDI, DirectDraw, and D3D9 MUST use neutral surfaces and drawing services under the same device interface. The mailbox MUST publish complete frames and let the host select the latest completed frame.
+**Rule**: DirectDraw and D3D9 MUST use neutral surfaces and drawing services under the same device interface. The mailbox MUST publish complete frames and let the host select the latest completed frame.
 **Verification**: Test
 
 ### DEV-FRAME-2 Observable work
@@ -46,12 +46,15 @@ This spec covers the neutral device services behind the API front ends: frames, 
 **Rule**: With a mailbox, software presents MUST accumulate four-rectangle damage, publishing one serial/history entry per flush. Writer waits/message retrieval MUST flush, and any wait/present MUST flush after 50 ms. Readback, capture, layout/palette/video changes, flips and exit MUST flush first, with immediate headless presents and reason-specific counters.
 **Verification**: Test
 
-### DEV-FRAME-9 Software frame cap
+### DEV-FRAME-12 Unchanged software redraws
 
-**Rule**: With a host frame clock, a boundary frame covering a quarter of the surface may follow the last one within 1/60 s. It MAY then hold the writer's next empty PeekMessage until the vsync. Messages, timers and input MUST end the hold at once, and held keys or mouse buttons MUST prevent it.
+**Rule**: Software redraws matching the last publication MUST NOT publish, copy snapshot storage, or wake presentation. This comparison MUST include damage smaller than a content-diff tile.
 **Verification**: Test
 
-Flush reasons are writer wait, message retrieval, age expiry and immediate visibility. Pending age starts at the first write; unrelated waits do not end younger frames. Message boundaries apply even when no message is retrieved.
+### DEV-FRAME-11 Deleted frame sources
+
+**Rule**: Deleting the source of a pending software frame MUST discard that frame.
+**Verification**: Test
 
 ### DEV-FRAME-10 Content-diff publication damage
 
@@ -86,7 +89,7 @@ Comparing against the last publication keeps every slot's damage history complet
 
 ### DEV-UPDATE-2 Snapshot semantics
 
-**Rule**: BGRA8 upload and shadow writeback MUST share an immutable snapshot. X8R8G8B8 MUST preserve original X bytes in the shadow while normalizing GPU alpha separately.
+**Rule**: BGRA8 and A8 upload and shadow writeback MUST share an immutable snapshot; A8 texels MUST expand to black BGRA on the GPU. X8R8G8B8 MUST preserve original X bytes in the shadow while normalizing GPU alpha separately.
 **Verification**: Test
 
 ### DEV-UPDATE-3 Completed buffer retention
@@ -94,101 +97,18 @@ Comparing against the last publication keeps every slot's damage history complet
 **Rule**: Completed raw and converted upload buffers MUST each retain at most 8 MiB. Larger updates MUST remain usable without retaining their buffers.
 **Verification**: Review — existing update tests exercise changing sizes and formats without asserting the completed-buffer retention limit.
 
-### DEV-UPDATE-4 Dirty level expansion
+### DEV-UPDATE-4 Dirty rectangle updates
 
-**Rule**: Dirty regions MAY conservatively expand to matching complete mip levels. This expansion MUST NOT introduce GPU waits or readback.
+**Rule**: Each matched mip level MUST upload and write back only its dirty rectangle, preserving texels outside it; clean levels MUST be skipped. Updates MUST NOT introduce GPU waits or readback.
 **Verification**: Test
 
 ## Image services
-
-### DEV-IMAGE-1 Image decoding
-
-**Rule**: Device image services MUST decode PNG, BMP, and DDS including authored DXT mipmaps, and scale BGRA8 pixels. D3DX front ends MUST retain HRESULT, source-format, and filter-policy semantics. Default memory texture loading MUST publish a real complete mip chain through the shared D3D9 resource owner.
-**Verification**: Test
-
-### DEV-IMAGE-2 GDI+ lifetime
-
-**Rule**: GDI+ Graphics MUST retain their images, cloned pixels MUST be independent, and borrowed scan0 changes and drawing MUST synchronize with guest storage. GDI bitmap writeback MUST preserve guest object ownership.
-**Verification**: Test
-
-### DEV-IMAGE-3 GDI+ platform boundary
-
-**Rule**: GDI+ native pointers and private DCs MUST NOT enter guest memory. Missing device operations MUST return an explicit not-implemented result identifying the calling flat API.
-**Verification**: Review — native pointer isolation and complete capability diagnostics require adapter review.
-
-### DEV-IMAGE-4 GDI+ storage bounds
-
-**Rule**: GDI+ images MUST be limited to 64 MiB each, with at most 256 MiB of independent front-end backing.
-**Verification**: Review — no existing test reaches either GDI+ storage admission boundary.
-
-### DEV-IMAGE-5 CPU bitmap rendering
-
-**Rule**: CPU GDI+ devices MUST provide owned bitmap storage, clear, image drawing with retained compositing modes, filled paths and filled primitives through the shared device interface.
-**Verification**: Test
-**Basis**: [GDI+ Graphics](https://learn.microsoft.com/windows/win32/gdiplus/-gdiplus-class-graphics).
-
-### DEV-IMAGE-6 GDI+ value queries
-
-**Rule**: Image queries MUST report actual dimensions, bounds, pixels and bitmap type. Path and string-format clones MUST retain independent state and reject invalid receiver kinds.
-**Verification**: Test
-
-### DEV-IMAGE-7 GDI+ path pixel centers
-
-**Rule**: Aliased paths MUST test pixel centers using their fill rule. Antialiased path coverage MUST honor integer and half-integer pixel-center modes.
-**Verification**: Test
-**Basis**: [PixelOffsetMode](https://learn.microsoft.com/windows/win32/api/gdiplusenums/ne-gdiplusenums-pixeloffsetmode).
-
-### DEV-IMAGE-8 GDI+ affine matrices
-
-**Rule**: Matrices MUST retain IEEE nonfinite coefficients and compose row-vector affine transforms in the requested prepend or append order. Failed inversion and overflowing point transformations MUST preserve input state.
-**Verification**: Test
-**Basis**: [MatrixOrder](https://learn.microsoft.com/windows/win32/api/gdiplusenums/ne-gdiplusenums-matrixorder).
-
-### DEV-IMAGE-9 GDI+ solid brush state
-
-**Rule**: Solid brush color changes MUST affect subsequent drawing. Cloned brushes MUST retain independent colors, and color access MUST reject non-solid receivers.
-**Verification**: Test
-
-### DEV-IMAGE-10 GDI+ world transforms
-
-**Rule**: Graphics world matrices MUST transform path and image drawing. Setting and querying world matrices MUST copy their values without sharing subsequent mutations. Singular world transforms MUST fail without changing graphics state.
-**Verification**: Test
-
-### DEV-IMAGE-11 GDI+ string layout settings
-
-**Rule**: String formats MUST preserve independent digit substitution, alignment, trimming, hotkey, tab and measurable-range settings when cloned. Generic formats MUST report native default and typographic settings. Setting more than 32 character ranges MUST return ValueOverflow without changing the previous ranges.
-**Verification**: Test
-**Basis**: [StringFormat](https://learn.microsoft.com/windows/win32/api/gdiplusstringformat/nl-gdiplusstringformat-stringformat).
-
-### DEV-IMAGE-12 Image list storage
-
-**Rule**: Image list duplication MUST copy independent pixels, alpha modes, masks, dimensions and background color. Image removal MUST compact later indexes, and icon size changes MUST remove every image. Count expansion MUST preserve existing images, and truncation MUST retire removed storage.
-**Verification**: Test
-**Basis**: [ImageList_Duplicate](https://learn.microsoft.com/windows/win32/api/commctrl/nf-commctrl-imagelist_duplicate), [ImageList_SetIconSize](https://learn.microsoft.com/windows/win32/api/commctrl/nf-commctrl-imagelist_seticonsize).
-
-### DEV-IMAGE-13 GDI+ path geometry
-
-**Rule**: Path arrays MUST preserve cubic control points, figure boundaries, closure flags and markers through cloning and affine transformations. Cardinal curves MUST preserve tension, neighboring-point tangents and closed joins in cubic control points that affect shared raster output. Zero-area rectangles MUST add no points, while zero-area ellipses MUST retain thirteen cubic points.
-**Verification**: Test
-**Basis**: [GraphicsPath](https://learn.microsoft.com/windows/win32/api/gdipluspath/nl-gdipluspath-graphicspath).
-
-### DEV-IMAGE-14 Image list bitmap inputs
-
-**Rule**: Bitmap strips MUST append independent RGBA and mask snapshots through shared GDI bitmap storage and palettes. Replacement MUST preserve list dimensions and all other images. Color-key insertion MUST derive transparency from the specified or upper-left palette color without consuming source handles.
-**Verification**: Test
-**Basis**: Microsoft ImageList_Add, ImageList_AddMasked and ImageList_Replace contracts.
 
 ### DEV-IMAGE-15 Icon and image list raster output
 
 **Rule**: Icon and image list drawing MUST apply packed AND/XOR masks or premultiplied source-over through shared surfaces, mappings and clipping. Icon extraction MUST preserve independent pixels and monochrome double-height mask layout. Invalid destination storage MUST preserve pixels and damage versions.
 **Verification**: Test
 **Basis**: [DrawIconEx](https://learn.microsoft.com/windows/win32/api/winuser/nf-winuser-drawiconex), [ICONINFO](https://learn.microsoft.com/windows/win32/api/winuser/ns-winuser-iconinfo), Microsoft ImageList_Draw and ImageList_GetIcon contracts.
-
-### DEV-IMAGE-16 GDI+ compositing and graphics properties
-
-**Rule**: Graphics compositing MUST select source-over blending or source-copy replacement without changing pixels outside primitive coverage. Smoothing getters MUST report normalized aliases, while text hint getters MUST report the retained device setting. Compositing MUST quantize premultiplied color and alpha channels before conversion to straight-alpha image pixels.
-**Verification**: Test
-**Basis**: Microsoft CompositingMode and SmoothingMode contracts and native-backed System.Drawing GraphicsTests pixel expectations.
 
 ## Audio ownership
 
@@ -200,6 +120,7 @@ Comparing against the last publication keeps every slot's damage history complet
 ### DEV-AUDIO-2 Control delivery
 
 **Rule**: Audio command queues MUST be bounded without losing stop or release requests. Notifications MUST return through machine-owned events.
+Device reconnection MUST retain refill notifications crossed while reanchoring a playing PCM ring.
 **Verification**: Test
 
 ### DEV-AUDIO-3 Vorbis callbacks
@@ -210,6 +131,23 @@ Comparing against the last publication keeps every slot's damage history complet
 ### DEV-AUDIO-4 Codec admission
 
 **Rule**: Static codec kernels MUST require matching signatures, calling conventions, and bounded inputs. Native acceleration MUST preserve library-level numerical tolerances and MUST NOT authorize arbitrary function replacement.
+**Verification**: Test
+
+### DEV-CODEC-1 Integer byte kernels
+
+**Rule**: PNG row and LZ77 kernels MUST implement the byte semantics below without guest state, allocation, callbacks or I/O. Invalid sizes or distances MUST be rejected before writing.
+**Verification**: Test
+
+| Computation | Byte semantics |
+|---|---|
+| PNG Sub/Up/Average/Paeth | In-place modulo-256 output; zero left and upper-left before the first pixel |
+| PNG Average | Widen the sum before division |
+| PNG Paeth | Break ties in left, above, upper-left order |
+| LZ77 | Ordered reads include newly written history for overlapping matches |
+
+### DEV-CODEC-2 DEFLATE batches
+
+**Rule**: DEFLATE batches MUST preserve Huffman decoding, extra bits, overlapping matches, chronological window history and speculative input rollback. Decoding MUST use caller-owned scratch without allocation, guest access or I/O. Rejection MAY leave partial scratch bytes but MUST NOT publish stream state.
 **Verification**: Test
 
 ### DEV-VIDEO-1 Native packet decoding
@@ -282,7 +220,7 @@ Unmatched libraries MUST execute their guest implementations.
 ### DEV-DISC-5 Bounded image access
 
 **Rule**: Optical access MUST reuse the shared ISO parser without unpacking images or loading an entire image into memory. Section mappings MUST read pages on demand.
-**Verification**: Review — the synthetic-image tests check data and ownership but do not measure whole-image allocation or extraction behavior.
+**Verification**: Test
 
 ### DEV-DISC-6 Volume identity
 

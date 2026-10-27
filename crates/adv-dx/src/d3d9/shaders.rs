@@ -25,8 +25,9 @@ impl TranslationJob {
 }
 #[derive(Default)]
 pub(super) struct TranslationCache {
-    entries: BTreeMap<Vec<u32>, TranslationJob>,
+    entries: BTreeMap<Arc<[u32]>, TranslationJob>,
     bytes: usize,
+    order: std::collections::VecDeque<(Arc<[u32]>, usize)>,
     pub counters: CompileCounters,
     failures: Arc<std::sync::atomic::AtomicU64>,
 }
@@ -39,21 +40,11 @@ impl TranslationCache {
         if let Some(translation) = self.entries.get(shader.bytecode()) {
             return translation.clone();
         }
-        self.bytes = self
-            .entries
-            .iter()
-            .map(|(tokens, job)| {
-                tokens.len() * 4
-                    + job.0.ready().and_then(|r| r.as_ref().ok()).map_or(
-                        crate::shader::MAX_TRANSLATION_BYTES,
-                        |t| {
-                            t.source.len()
-                                + t.samplers.len()
-                                    * std::mem::size_of::<crate::shader::SamplerBinding>()
-                        },
-                    )
-            })
-            .sum();
+        self.bytes = 0;
+        for (tokens, bytes) in &mut self.order {
+            *bytes = translation_bytes(tokens, &self.entries[tokens]);
+            self.bytes += *bytes;
+        }
         let bytes = shader.bytecode().len() * 4 + crate::shader::MAX_TRANSLATION_BYTES;
         let parsed = shader.clone();
         let directory = directory.map(std::path::Path::to_owned);
@@ -72,11 +63,14 @@ impl TranslationCache {
         }));
         const MAX_BYTES: usize = 8 * 1024 * 1024;
         if bytes <= MAX_BYTES {
-            if self.entries.len() == 256 || self.bytes + bytes > MAX_BYTES {
-                self.entries.clear();
-                self.bytes = 0;
+            while self.entries.len() == 256 || self.bytes + bytes > MAX_BYTES {
+                let (oldest, bytes) = self.order.pop_front().unwrap();
+                self.entries.remove(&oldest);
+                self.bytes -= bytes;
             }
-            self.entries.insert(shader.bytecode().to_vec(), job.clone());
+            let key: Arc<[u32]> = shader.bytecode().into();
+            self.order.push_back((key.clone(), bytes));
+            self.entries.insert(key, job.clone());
             self.bytes += bytes;
         }
         job
@@ -95,6 +89,17 @@ impl TranslationCache {
     }
 }
 
+fn translation_bytes(tokens: &[u32], job: &TranslationJob) -> usize {
+    tokens.len() * 4
+        + job.0.ready().and_then(|r| r.as_ref().ok()).map_or(
+            crate::shader::MAX_TRANSLATION_BYTES,
+            |t| {
+                t.source.len()
+                    + t.samplers.len() * std::mem::size_of::<crate::shader::SamplerBinding>()
+            },
+        )
+}
+
 pub(super) struct Shader {
     pub pointer: u32,
     pub device: Id,
@@ -102,18 +107,153 @@ pub(super) struct Shader {
     pub translation: TranslationJob,
 }
 #[derive(Clone)]
-pub(super) struct Constants {
+pub(super) struct Registers {
     pub floats: [[f32; 4]; 256],
     pub integers: [[i32; 4]; 16],
     pub booleans: [i32; 16],
 }
-impl Default for Constants {
+impl Default for Registers {
     fn default() -> Self {
         Self {
             floats: [[0.; 4]; 256],
             integers: [[0; 4]; 16],
             booleans: [0; 16],
         }
+    }
+}
+#[derive(Default)]
+pub(super) struct Constants {
+    fingerprint: std::cell::Cell<Option<u128>>,
+    registers: Arc<Registers>,
+    captured: std::cell::RefCell<Option<Captured>>,
+}
+#[derive(Clone)]
+struct Captured {
+    usage: adv_device::constants::ConstantUsage,
+    extra: Vec<(usize, [u32; 4])>,
+    snapshot: adv_device::gpu::ConstantSnapshot,
+    key: u128,
+}
+impl Clone for Constants {
+    fn clone(&self) -> Self {
+        Self {
+            registers: self.registers.clone(),
+            fingerprint: self.fingerprint.clone(),
+            captured: std::cell::RefCell::new(self.captured.borrow().clone()),
+        }
+    }
+}
+impl std::ops::Deref for Constants {
+    type Target = Registers;
+    fn deref(&self) -> &Registers {
+        &self.registers
+    }
+}
+impl std::ops::DerefMut for Constants {
+    fn deref_mut(&mut self) -> &mut Registers {
+        self.fingerprint.set(None);
+        *self.captured.get_mut() = None;
+        Arc::make_mut(&mut self.registers)
+    }
+}
+impl Constants {
+    fn invalidate_register(&mut self, register: usize) {
+        self.fingerprint.set(None);
+        let captured = self.captured.get_mut();
+        if captured
+            .as_ref()
+            .is_some_and(|c| c.usage.registers[register / 64] & (1 << (register % 64)) != 0)
+        {
+            *captured = None;
+        }
+    }
+    fn capture(
+        &self,
+        usage: adv_device::constants::ConstantUsage,
+        extra: &[(usize, [u32; 4])],
+    ) -> std::cell::RefMut<'_, Option<Captured>> {
+        let mut captured = self.captured.borrow_mut();
+        if !captured
+            .as_ref()
+            .is_some_and(|c| c.usage == usage && c.extra == extra)
+        {
+            use std::hash::Hash;
+            let snapshot = adv_device::gpu::ConstantSnapshot::capture(usage, |n| match n {
+                0..256 => self.floats[n].map(f32::to_bits),
+                256..272 => self.integers[n - 256].map(|v| v as u32),
+                272..288 => [self.booleans[n - 272] as u32, 0, 0, 0],
+                _ => extra
+                    .iter()
+                    .find(|(index, _)| *index == n)
+                    .map_or([0; 4], |(_, v)| *v),
+            });
+            let mut h = xxhash_rust::xxh3::Xxh3::new();
+            for range in snapshot.ranges(usage) {
+                range.hash(&mut h);
+            }
+            let key = h.digest128();
+            *captured = Some(Captured {
+                usage,
+                extra: extra.to_vec(),
+                snapshot,
+                key,
+            });
+        }
+        captured
+    }
+    pub(super) fn snapshot(
+        &self,
+        usage: adv_device::constants::ConstantUsage,
+        extra: &[(usize, [u32; 4])],
+    ) -> adv_device::gpu::ConstantSnapshot {
+        self.capture(usage, extra)
+            .as_ref()
+            .unwrap()
+            .snapshot
+            .clone()
+    }
+    fn register_bits(&self, n: usize) -> [u32; 4] {
+        match n {
+            0..256 => self.floats[n].map(f32::to_bits),
+            256..272 => self.integers[n - 256].map(|v| v as u32),
+            _ => [self.booleans[n - 272] as u32, 0, 0, 0],
+        }
+    }
+    fn recompute(&self) -> u128 {
+        (0..288).fold(0, |key, n| {
+            key ^ super::recording::hash((n, self.register_bits(n)))
+        })
+    }
+    pub(super) fn fingerprint(&self) -> u128 {
+        let key = self.fingerprint.get().unwrap_or_else(|| {
+            let key = self.recompute();
+            self.fingerprint.set(Some(key));
+            key
+        });
+        #[cfg(any(test, feature = "d3d9-counters"))]
+        debug_assert_eq!(key, self.recompute());
+        key
+    }
+    fn write_register(&mut self, n: usize, value: [u32; 4]) -> bool {
+        let old = self.register_bits(n);
+        if old == value {
+            return false;
+        }
+        let key = self.fingerprint()
+            ^ super::recording::hash((n, old))
+            ^ super::recording::hash((n, value));
+        self.invalidate_register(n);
+        let r = Arc::make_mut(&mut self.registers);
+        match n {
+            0..256 => r.floats[n] = value.map(f32::from_bits),
+            256..272 => r.integers[n - 256] = value.map(|v| v as i32),
+            _ => r.booleans[n - 272] = value[0] as i32,
+        }
+        self.fingerprint.set(Some(key));
+        true
+    }
+    pub(super) fn key(&self, usage: adv_device::constants::ConstantUsage) -> u128 {
+        self.capture(usage, &[]).as_ref().unwrap().key
     }
 }
 #[derive(Clone, Default)]
@@ -160,15 +300,9 @@ pub(super) fn register(registry: &mut Registry) {
         pixel_function_ABI,
         create_vertex_ABI,
         create_pixel_ABI,
-        adv_abi::Api {
-            env_leaf: Some(super::leaf_calls::binding),
-            ..set_vertex_ABI
-        },
+        super::unchanged::unless_unchanged!(set_vertex_ABI, super::unchanged::binding),
         get_vertex_ABI,
-        adv_abi::Api {
-            env_leaf: Some(super::leaf_calls::binding),
-            ..set_pixel_ABI
-        },
+        super::unchanged::unless_unchanged!(set_pixel_ABI, super::unchanged::binding),
         get_pixel_ABI,
         set_vertex_f_ABI,
         get_vertex_f_ABI,
@@ -451,11 +585,11 @@ fn set_shader(env: &mut Env<'_>, this: GuestPtr<()>, pointer: GuestPtr<()>, stag
     let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, id) else {
         return INVALID;
     };
-    d.versions[8 + usize::from(stage == Stage::Pixel)] += 1;
     match stage {
         Stage::Vertex => d.shaders.vertex = new,
         Stage::Pixel => d.shaders.pixel = new,
     };
+    d.touch(8 + usize::from(stage == Stage::Pixel));
     if new != old {
         release_binding(env, old);
     }
@@ -488,7 +622,7 @@ fn get_shader(env: &mut Env<'_>, this: GuestPtr<()>, output: GuestPtr<u32>, stag
 pub(super) fn set_vertex(env: &mut Env<'_>, this: GuestPtr<()>, pointer: GuestPtr<()>) -> u32 {
     set_shader(env, this, pointer, Stage::Vertex)
 }
-#[win32(d3d9,name="IDirect3DDevice9::GetVertexShader",level=implement,leaf)]
+#[win32(d3d9,name="IDirect3DDevice9::GetVertexShader",level=implement)]
 pub(super) fn get_vertex(env: &mut Env<'_>, this: GuestPtr<()>, output: GuestPtr<u32>) -> u32 {
     get_shader(env, this, output, Stage::Vertex)
 }
@@ -496,7 +630,7 @@ pub(super) fn get_vertex(env: &mut Env<'_>, this: GuestPtr<()>, output: GuestPtr
 pub(super) fn set_pixel(env: &mut Env<'_>, this: GuestPtr<()>, pointer: GuestPtr<()>) -> u32 {
     set_shader(env, this, pointer, Stage::Pixel)
 }
-#[win32(d3d9,name="IDirect3DDevice9::GetPixelShader",level=implement,leaf)]
+#[win32(d3d9,name="IDirect3DDevice9::GetPixelShader",level=implement)]
 pub(super) fn get_pixel(env: &mut Env<'_>, this: GuestPtr<()>, output: GuestPtr<u32>) -> u32 {
     get_shader(env, this, output, Stage::Pixel)
 }
@@ -518,10 +652,8 @@ pub(super) fn reset_bindings(env: &mut Env<'_>, id: Id) {
     let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, id) else {
         return;
     };
-    for v in &mut d.versions {
-        *v += 1;
-    }
     let old = std::mem::take(&mut d.shaders);
+    d.refresh_all();
     let recording = d.recording.take();
     release_bindings(env, old);
     if let Some(recording) = recording {
@@ -570,51 +702,12 @@ fn constants_set(
     if adv_abi::guest::check_range(env.cpu, input.addr(), bytes, Prot::READ).is_err() {
         return INVALID;
     }
-    let mut data = vec![0u8; bytes as usize];
-    if bytes != 0 && env.cpu.read(input.addr(), &mut data).is_err() {
+    let mut storage = [0u8; 4096];
+    let data = &mut storage[..bytes as usize];
+    if bytes != 0 && env.cpu.read(input.addr(), data).is_err() {
         return INVALID;
     }
-    store_constants(env, id, range, &data, stage, kind)
-}
-/// Host-side constant upload for a D3DX Effect pass (GFX-EFFECT-3): the same
-/// validation and storage as the API without staging data in guest memory.
-pub(super) fn set_constants_direct(
-    env: &mut Env<'_>,
-    this: u32,
-    slot: u32,
-    start: u32,
-    data: &[u8],
-    count: u32,
-) -> u32 {
-    let (stage, kind) = match slot {
-        94 => (Stage::Vertex, ConstantKind::Float),
-        96 => (Stage::Vertex, ConstantKind::Integer),
-        98 => (Stage::Vertex, ConstantKind::Boolean),
-        109 => (Stage::Pixel, ConstantKind::Float),
-        111 => (Stage::Pixel, ConstantKind::Integer),
-        _ => (Stage::Pixel, ConstantKind::Boolean),
-    };
-    let Some(id) = device_id(env, this) else {
-        return INVALID;
-    };
-    let Some(range) = constant_range(start, count, constant_limit(stage, kind)) else {
-        return INVALID;
-    };
-    let width = match kind {
-        ConstantKind::Boolean => 4,
-        _ => 16,
-    };
-    if data.len() < (count * width) as usize {
-        return INVALID;
-    }
-    store_constants(
-        env,
-        id,
-        range,
-        &data[..(count * width) as usize],
-        stage,
-        kind,
-    )
+    store_constants(env, id, range, data, stage, kind)
 }
 fn store_constants(
     env: &mut Env<'_>,
@@ -631,29 +724,36 @@ fn store_constants(
     let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, id) else {
         return INVALID;
     };
+    let live = d.recording.is_none();
     let constants = if let Some(recording) = d.recording.as_mut() {
         recording.mark_constants(stage, kind, range.clone());
         recording.shaders.constants_mut(stage)
     } else {
-        d.versions[13 + usize::from(stage == Stage::Pixel)] += 1;
         d.shaders.constants_mut(stage)
     };
+    let mut changed = false;
     for (register, bytes) in range.zip(data.chunks_exact(width as usize)) {
         match kind {
             ConstantKind::Float => {
-                constants.floats[register] = std::array::from_fn(|i| {
-                    f32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap())
-                })
+                let value = std::array::from_fn(|i| {
+                    u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap())
+                });
+                changed |= constants.write_register(register, value);
             }
             ConstantKind::Integer => {
-                constants.integers[register] = std::array::from_fn(|i| {
+                let value = std::array::from_fn(|i| {
                     i32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap())
-                })
+                });
+                changed |= constants.write_register(register + 256, value.map(|v| v as u32));
             }
             ConstantKind::Boolean => {
-                constants.booleans[register] = i32::from_le_bytes(bytes.try_into().unwrap())
+                let value = i32::from_le_bytes(bytes.try_into().unwrap());
+                changed |= constants.write_register(register + 272, [value as u32, 0, 0, 0]);
             }
         }
+    }
+    if live && changed {
+        d.touch(13 + usize::from(stage == Stage::Pixel));
     }
     0
 }
@@ -700,7 +800,7 @@ fn constants_get(
 }
 macro_rules! constant_api {
     ($set:ident,$get:ident,$set_name:tt,$get_name:tt,$stage:ident,$kind:ident,$ty:ty) => {
-        #[win32(d3d9,name=$set_name,level=state,leaf)]
+        #[win32(d3d9,name=$set_name,level=state)]
         pub(super) fn $set(
             env: &mut Env<'_>,
             this: GuestPtr<()>,
@@ -718,7 +818,7 @@ macro_rules! constant_api {
                 ConstantKind::$kind,
             )
         }
-        #[win32(d3d9,name=$get_name,level=implement,leaf)]
+        #[win32(d3d9,name=$get_name,level=implement)]
         pub(super) fn $get(
             env: &mut Env<'_>,
             this: GuestPtr<()>,

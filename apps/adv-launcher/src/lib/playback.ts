@@ -7,6 +7,7 @@ export function playback(gameId: string) {
   for (const [key, aliases] of [
     ["gothic", ["ＭＳ ゴシック", "ＭＳ Ｐゴシック", "MS Gothic", "MS PGothic"]],
     ["mincho", ["ＭＳ 明朝", "ＭＳ Ｐ明朝", "MS Mincho", "MS PMincho"]],
+    ["chinese", ["SimSun", "NSimSun", "SimHei", "Microsoft YaHei", "Microsoft YaHei UI", "宋体", "新宋体", "黑体", "微软雅黑", "MingLiU", "PMingLiU", "Microsoft JhengHei", "Microsoft JhengHei UI", "細明體", "新細明體", "微軟正黑體"]],
   ] as const) {
     const choice = values[key];
     if (choice.startsWith("font:")) for (const name of aliases) fontFamilies[name] = choice.slice(5);

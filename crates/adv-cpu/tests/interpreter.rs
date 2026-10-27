@@ -1,7 +1,7 @@
 use adv_cpu::interpreter::{Interpreter, Step};
 use adv_cpu::{CpuState, EXEC, Memory, READ, WRITE};
-use adv_unicorn::Guarded;
 use iced_x86::code_asm::*;
+use unicorn_engine::Unicorn;
 use unicorn_engine::{
     RegisterX86 as R,
     unicorn_const::{Arch, Mode, Prot},
@@ -231,14 +231,14 @@ fn sidt_overflow_does_not_wrap_or_commit_cpu_state() {
 }
 
 struct Reference {
-    uc: Guarded<'static, ()>,
+    uc: Unicorn<'static, ()>,
     memory: Memory,
     interpreter: Interpreter,
 }
 
 impl Reference {
     fn new(bytes: &[u8]) -> Self {
-        let mut uc = Guarded::new(Arch::X86, Mode::MODE_32).unwrap();
+        let mut uc = Unicorn::new(Arch::X86, Mode::MODE_32).unwrap();
         uc.mem_map(0, 0x30000, Prot::ALL).unwrap();
         uc.mem_write(u64::from(CODE), bytes).unwrap();
         Self {
@@ -1091,6 +1091,28 @@ fn bit_scans_strings_and_double_shifts_match_reference() {
                     }
             };
             reference.check(&initial, flags);
+        }
+    }
+}
+
+#[test]
+fn trailing_and_leading_zero_counts_run_as_bit_scans() {
+    // TZCNT and LZCNT eax, ecx: the processor reports neither BMI1 nor
+    // LZCNT, so they are BSF and BSR.
+    for (bytes, scan) in [
+        ([0xf3, 0x0f, 0xbc, 0xc1], vec![0x0f, 0xbc, 0xc1]),
+        ([0xf3, 0x0f, 0xbd, 0xc1], vec![0x0f, 0xbd, 0xc1]),
+    ] {
+        for value in [0u32, 1, 0x80, 0x8000_0000] {
+            let mut counted = state();
+            counted.regs[0] = 0x55;
+            counted.regs[1] = value;
+            let mut scanned = counted.clone();
+            Interpreter::new().step(&mut counted, &mut memory(&bytes));
+            Interpreter::new().step(&mut scanned, &mut memory(&scan));
+            assert_eq!(counted.regs, scanned.regs, "{bytes:02x?} of {value:#x}");
+            assert_eq!(counted.eflags & 0x40, scanned.eflags & 0x40);
+            assert_eq!(counted.eip, scanned.eip + 1);
         }
     }
 }

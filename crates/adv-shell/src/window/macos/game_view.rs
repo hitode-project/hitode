@@ -236,19 +236,19 @@ impl GameView {
             window.miniaturize(None);
         }
     }
-    /// With a display link, presentation happens only inside its callback.
-    pub(crate) fn refresh_ready(&self) -> bool {
-        let hub = self.hub();
-        hub.link.borrow().is_none() || hub.in_frame.get()
-    }
-    /// A display link caps the rate itself (`request_frame`); the timer
-    /// fallback spaces presentations by the refresh interval.
+    /// Submit before the compositor's next refresh, respecting the 60 Hz cap.
     pub(crate) fn next_refresh(&self) -> std::time::Instant {
-        let now = std::time::Instant::now();
-        if self.hub().link.borrow().is_some() {
-            return now;
+        std::time::Instant::now() + refresh_interval(self.display_fps())
+    }
+    pub(crate) fn frame_rate(&self, rate: u32) {
+        if let Some(link) = self.hub().link.borrow().as_ref() {
+            link.setPreferredFrameRateRange(CAFrameRateRange {
+                minimum: rate as f32,
+                maximum: rate as f32,
+                preferred: rate as f32,
+            });
         }
-        now + refresh_interval(self.display_fps())
+        self.request_frame();
     }
     fn display_fps(&self) -> isize {
         self.window()
@@ -319,9 +319,7 @@ impl GameView {
         }
         let on_frame = hub.on_frame.borrow().clone();
         if let Some(on_frame) = on_frame {
-            hub.in_frame.set(true);
             on_frame();
-            hub.in_frame.set(false);
         }
     }
     pub(crate) fn vsync(&self) -> Arc<adv_sync::vsync::Vsync> {
@@ -674,7 +672,6 @@ impl Input {
             buttons
         };
         let position = u32::from(gx as u16) | (u32::from(gy as u16) << 16);
-        let (message, wparam) = adv_runtime::mouse_mapping(message, wparam, false);
         self.hub.push(Event::Input {
             message,
             wparam,

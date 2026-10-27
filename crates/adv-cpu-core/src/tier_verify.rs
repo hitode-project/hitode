@@ -1,13 +1,10 @@
-//! Opt-in tier verification for both engines: the first native entries are
+//! Opt-in tier verification for the AArch64 engine: the first native entries are
 //! checked against the interpreter.
 //!
 //! With `ADV_JIT_VERIFY=1` (or `strict`), the executor first interprets from
 //! the entry one instruction at a time, keeping the architectural state before
 //! each instruction and the bytes each one writes. It restores those bytes and
-//! the entry state, then runs the native code once. The x64 engine runs one
-//! block without region links after each publication and compares its exit
-//! with the interpreted state at the same PC; one block has no back edge, so
-//! that PC names a single interpreted state. The a64 engine checks each entry
+//! the entry state, then runs the native code once. The engine checks each entry
 //! PC's first runs and reports how many instructions they retired, which names
 //! the interpreted state directly. Native writes outside the interpreted
 //! footprint go unseen. Strict mode turns a mismatch into a run error, so a
@@ -24,7 +21,7 @@ use crate::{ArchitecturalState, CpuState, Memory};
 
 /// Interpreted instructions per trace; a native exit beyond it is inconclusive.
 pub const MAX_STEPS: usize = 4096;
-/// Native entries verified per x64 publication or a64 entry PC.
+/// Native entries verified per entry PC.
 pub const ENTRIES: u8 = 4;
 /// Mismatch descriptions kept for the run report.
 pub const REPORTS: usize = 16;

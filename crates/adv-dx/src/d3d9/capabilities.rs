@@ -120,13 +120,12 @@ fn mode(
     }
     put(env, output, mode_value(env))
 }
-const HMONITOR_PRIMARY: u32 = 0x0001_0001;
 #[win32(d3d9, name = "IDirect3D9::GetAdapterMonitor", level = implement)]
 fn adapter_monitor(env: &mut Env<'_>, this: GuestPtr<()>, adapter: u32) -> adv_abi::Handle {
     if !factory(env, this.addr(), adapter) {
         return adv_abi::Handle(0);
     }
-    adv_abi::Handle(HMONITOR_PRIMARY)
+    adv_abi::Handle(env.ext.get::<State>().provider.monitor)
 }
 #[win32(d3d9,name="IDirect3DDevice9::GetDisplayMode",level=implement)]
 fn device_display(
@@ -331,7 +330,7 @@ pub(super) fn caps(env: &Env<'_>) -> Result<D3DCAPS9, u32> {
         MaxStreams: 16,
         MaxVertexIndex: 0x000f_ffff,
         MaxStreamStride: 2048,
-        DevCaps2: 1, // STREAMOFFSET: SetStreamSource offsets are used by drawing.
+        DevCaps2: 1 | 0x10, // STREAMOFFSET and CAN_STRETCHRECT_FROM_TEXTURES.
         NumSimultaneousRTs: 1,
         VertexShaderVersion: if shader { 0xfffe_0000 | model << 8 } else { 0 },
         PixelShaderVersion: if shader { 0xffff_0000 | model << 8 } else { 0 },
@@ -538,7 +537,7 @@ mod tests {
         );
         assert_eq!(value.TextureCaps & (0x800 | 0x2000), 0);
         assert_eq!((value.MaxStreams, value.MaxVertexIndex), (16, 0x000f_ffff));
-        assert_eq!(value.DevCaps2, 1, "only stream offsets are implemented");
+        assert_eq!(value.DevCaps2, 1 | 0x10, "stream offsets and texture blits");
         assert!(
             u64::from(value.MaxTextureWidth) * u64::from(value.MaxTextureHeight) * 4
                 <= 64 * 1024 * 1024
@@ -595,7 +594,7 @@ mod tests {
         );
         assert_eq!(
             adapter_monitor(&mut env, this, 0),
-            adv_abi::Handle(HMONITOR_PRIMARY)
+            adv_abi::Handle(0x0001_0001)
         );
         assert_eq!(adapter_monitor(&mut env, this, 1), adv_abi::Handle(0));
         assert_eq!(

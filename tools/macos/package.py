@@ -94,7 +94,11 @@ def rust_licenses(package: dict, destination: Path) -> int:
     with tarfile.open(archive) as tar:
         prefix = tar.getnames()[0].split('/')[0]
         directory = Path(prefix) / vcs.get('path_in_vcs', '')
-        for parent in [directory, *directory.parents]:
+        directories = [directory, *directory.parents]
+        # These published workspace crates share the synth crate's LGPL text.
+        if package['name'] in ('oxisynth-chorus', 'oxisynth-reverb'):
+            directories.insert(1, Path(prefix) / 'oxisynth')
+        for parent in directories:
             if parent == Path('.'):
                 break
             matches = [m for m in tar.getmembers() if m.isfile() and
@@ -150,8 +154,13 @@ def notices(resources: Path, build: dict) -> tuple[int, int]:
         rust_count += 1
     # Local patched dependencies and statically linked SoftFloat need notices too.
     for name, path in [('cpal', 'vendor/cpal'), ('symphonia-codec-adpcm', 'vendor/symphonia-codec-adpcm'),
-                       ('softfloat', 'crates/adv-cpu-core/softfloat'), ('libtheora', 'vendor/libtheora')]:
+                       ('softfloat', 'crates/adv-cpu-core/softfloat'), ('libtheora', 'vendor/libtheora'),
+                       ('fluidr3mono', 'vendor/fluidr3mono')]:
         count += copy_licenses(ROOT / path, licenses / name)
+    sources.append({'name': 'FluidR3Mono_GM', 'versionInfo': '2.312',
+                    'downloadLocation': 'https://raw.githubusercontent.com/musescore/MuseScore/v2.3.2/share/sound/FluidR3Mono_GM.sf3',
+                    'sha256': 'cfcd66d89e8386823400eca64934b14fbea7bf48ba1f00d21189af1262794ec2',
+                    'license': 'MIT'})
     source = resources / 'Source'
     source.mkdir(exist_ok=True)
     (source / 'dependencies.json').write_text(json.dumps(sources, indent=2) + '\n')

@@ -4,7 +4,7 @@
 //! [`Backend::run`]. Guest code runs until it executes a trap instruction (`int 0x2e` in a
 //! thunk) or faults. On a trap the backend calls [`TrapHandler::on_trap`] from inside the
 //! emulation loop. The handler either finishes the call on the spot ([`TrapAction::Continue`]:
-//! the fast path for leaf API calls) or asks the backend to park the guest
+//! the usual path for API calls) or asks the backend to park the guest
 //! ([`TrapAction::Park`]). Parking unwinds out of `run`, so only the top-level scheduler
 //! ever re-enters guest code. There is no host→guest recursion.
 
@@ -243,6 +243,25 @@ pub trait Guest {
     ) -> Result<std::rc::Rc<dyn CounterStorage>, MemFault> {
         Err(MemFault { addr, len })
     }
+    /// Map `len` bytes of host file `fd` from `offset` at `addr`, shared with
+    /// every other mapping of the file. Data only: `prot` is READ, with WRITE
+    /// for a writable descriptor.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    fn map_shared_file(
+        &mut self,
+        addr: u32,
+        len: u32,
+        _fd: std::os::fd::BorrowedFd<'_>,
+        _offset: u64,
+        _prot: Prot,
+    ) -> Result<(), MemFault> {
+        Err(MemFault { addr, len })
+    }
     /// Alias worker-confined file data pages. COPY views share reads until the
     /// first write to each page, then retain a private page. No executable views.
     fn map_file_pages(
@@ -296,6 +315,25 @@ pub trait Guest {
         let mut bytes = vec![0; len];
         self.read(src, &mut bytes)?;
         self.write(dst, &bytes)
+    }
+    /// Set `len` bytes at `addr` to `byte`, as guest stores would: the
+    /// whole range must be writable, and nothing is written otherwise.
+    fn fill_memory(&mut self, addr: u32, byte: u8, len: usize) -> Result<(), MemFault> {
+        let fault = MemFault {
+            addr,
+            len: u32::try_from(len).unwrap_or(u32::MAX),
+        };
+        if !self.accessible(addr, fault.len, Prot::WRITE) || fault.len as usize != len {
+            return Err(fault);
+        }
+        let chunk = [byte; 4096];
+        let mut at = 0;
+        while at < len {
+            let count = (len - at).min(chunk.len());
+            self.write(addr.wrapping_add(at as u32), &chunk[..count])?;
+            at += count;
+        }
+        Ok(())
     }
     /// Whether guest instructions may access the entire range with `prot`. Unlike host
     /// reads/writes, this includes page permissions. Unknown backends conservatively reject.
@@ -370,13 +408,30 @@ pub trait GuestExt: Guest {
 impl<G: Guest + ?Sized> GuestExt for G {}
 
 pub trait TrapHandler {
-    /// Authorize an exact PUSH token / INT pair for a light host call.
-    fn leaf_call(&self, _pc: u32, _word: u32) -> bool {
-        false
+    /// Preparation only: admit the complete offered loop body. This is never
+    /// called by generated code; the returned capability obeys NativeRegion's
+    /// safety contract and is invalidated with the translation's code bytes.
+    fn native_region(&self, _pc: u32, _code: &[u8]) -> Vec<crate::native_region::NativeRegion> {
+        Vec::new()
     }
 
-    /// Only ESP and EDX are synchronized. None requests ordinary INT dispatch.
-    fn on_leaf(&mut self, _cpu: &mut dyn Guest, _pc: u32, _word: u32) -> Option<u64> {
+    /// The thunk whose host call the exact PUSH token / INT pair at `pc`
+    /// makes, so translated code may call it directly.
+    fn host_thunk(&self, _pc: u32, _word: u32) -> Option<u32> {
+        None
+    }
+
+    /// `on_trap` for the INT 0x2e of a pair `host_thunk` recognized as
+    /// `thunk`, its token still pushed.
+    fn on_host_call(&mut self, cpu: &mut dyn Guest, _thunk: u32) -> TrapAction {
+        self.on_trap(cpu, 0x2e)
+    }
+
+    /// Where translated code continues instead of entering the function at
+    /// `pc`, while the bytes there are still the returned ones. The
+    /// interpreter runs the function itself, so the target must behave as
+    /// the function does.
+    fn redirect(&self, _pc: u32) -> Option<(u32, &[u8])> {
         None
     }
 

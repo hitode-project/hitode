@@ -18,11 +18,19 @@ adv-sync = { path = "../adv-sync" }
 adv-cpu = { path = "../adv-cpu" }
 adv-machine = { path = "../adv-machine" }
 adv-os = { path = "../adv-os" }
-adv-win32 = { path = "../adv-win32" }
 adv-device = { path = "../adv-device" }
 adv-dx = { path = "../adv-dx" }
 adv-pe = { path = "../adv-pe" }
 iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder"] }
+
+[target.'cfg(unix)'.dependencies]
+adv-drv = { path = "../adv-drv" }
+adv-nt = { path = "../adv-nt" }
+adv-unix = { path = "../adv-unix" }
+
+[target.'cfg(any(target_vendor = "apple", target_os = "android"))'.dependencies]
+adv-wineserver = { path = "../adv-wineserver" }
+log.workspace = true
 
 [dev-dependencies]
 encoding_rs.workspace = true
@@ -31,6 +39,10 @@ adv-unicorn = { path = "../adv-unicorn" }
 adv-samples = { path = "../adv-samples" }
 iced-x86 = { version = "1.21", default-features = false, features = ["std", "code_asm"] }
 png = "0.17"
+
+[target.'cfg(any(target_vendor = "apple", target_os = "android"))'.dev-dependencies]
+libc = "0.2"
+pollster = "0.4"
 
 [lints]
 workspace = true

@@ -26,7 +26,9 @@
 //! and its next translation checks each access of the instruction against
 //! the page class table, a snapshot of `Memory::native_permissions` the
 //! runtime points at. Accesses the window cannot take call `access`, which
-//! performs them through `Memory` without leaving translated code. A stale
+//! performs them through `Memory` without leaving translated code. Raw permission
+//! snapshots are pinned only while generated accesses can run, released across
+//! host traps and refreshed before a continuing chain resumes. A stale
 //! table is harmless: the direct form is still a site, and `access`
 //! refuses anything the interpreter would not do.
 //!
@@ -42,7 +44,7 @@ use std::sync::Arc;
 
 use adv_cpu_core::interpreter::{Execution, Step, accessible};
 use adv_cpu_core::memory::{Memory, READ, WRITE};
-use adv_cpu_core::trap::{Bridge, call_trap};
+use adv_cpu_core::trap::{Bridge, call_host, call_trap};
 use adv_cpu_core::{CpuState, IndirectBranch, IndirectBranchKind};
 
 use crate::cache::CodeCache;
@@ -439,15 +441,16 @@ unsafe extern "C" fn interpret(runtime: *mut Runtime, index: u32, countdown: u64
             // SAFETY: the executor's bridge outlives the run and nothing
             // else uses it while translated code runs.
             let bridge = unsafe { &mut *owner.bridge.cast::<Bridge<'_>>() };
-            let status = call_trap(bridge, cpu, u32::from(vector));
-            let same = memory.epoch == epoch && memory.dirty_pages.len() == dirty;
-            // A slow host call must not leave the unit running past the
-            // deadline; the owner reports it at the next instruction.
-            let status = if status == 0 && same && cpu.eip == helper.next && !native.past() {
-                0
-            } else {
-                LEAVE
-            };
+            let resumes = host(
+                native,
+                memory,
+                bridge,
+                cpu,
+                (epoch, dirty),
+                helper.next,
+                |b, c| call_trap(b, c, u32::from(vector)),
+            );
+            let status = if resumes { 0 } else { LEAVE };
             (status, i64::from(units) - 1)
         }
         Ok(execution) => {
@@ -465,44 +468,68 @@ unsafe extern "C" fn interpret(runtime: *mut Runtime, index: u32, countdown: u64
     (charge as u64) << 32 | u64::from(status)
 }
 
-unsafe extern "C" fn leaf(runtime: *mut Runtime, pc: u32, word: u32) -> u32 {
-    // SAFETY: run owns these objects exclusively until generated code returns.
+/// Called by the `call` stub for the host call through thunk `site >> 32`
+/// whose INT is at `site as u32`: as `interpret` has the INT make it, but
+/// without decoding the INT or rereading its token (A64-CTL-12).
+unsafe extern "C" fn call(runtime: *mut Runtime, site: u64, _countdown: u64) -> u64 {
+    const LEAVE: u32 = Exit::Dispatch as u32 + 1;
+    // SAFETY: as in `interpret`.
     let owner = unsafe { &mut *((*runtime).owner as *mut Owner) };
-    let (native, memory, cpu) =
-        unsafe { (&mut *owner.native, &mut *owner.memory, &mut *(*runtime).cpu) };
+    let (native, memory) = unsafe { (&mut *owner.native, &mut *owner.memory) };
+    let cpu = unsafe { &mut *(*runtime).cpu };
+    let pc = site as u32;
     if owner.bridge.is_null() {
-        return 2;
+        // Without a host the interpreter takes the INT, which is refunded.
+        cpu.eip = pc;
+        return (-1i64 as u64) << 32 | u64::from(Exit::Interpret as u32 + 1);
     }
+    // SAFETY: as in `interpret`.
     let bridge = unsafe { &mut *owner.bridge.cast::<Bridge<'_>>() };
-    let (epoch, dirty) = (memory.epoch, memory.dirty_pages.len());
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        bridge
-            .handler
-            .as_mut()
-            .and_then(|handler| handler.leaf(cpu, memory, pc, word))
-    }));
-    match result {
-        Ok(Some(value)) => {
-            cpu.regs[0] = value as u32;
-            cpu.regs[2] = (value >> 32) as u32;
-            cpu.eip = pc.wrapping_add(2);
-            u32::from(
-                native.past()
-                    || native
-                        .interrupt
-                        .as_ref()
-                        .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
-                    || memory.epoch != epoch
-                    || memory.dirty_pages.len() != dirty
-                    || native.stops.contains(&cpu.eip),
-            )
-        }
-        Ok(None) => 2,
-        Err(_) => {
-            owner.error = Some("leaf host handler panicked".into());
-            1
-        }
+    // The INT has committed its next PC.
+    let next = pc.wrapping_add(2);
+    cpu.eip = next;
+    let before = (memory.epoch, memory.dirty_pages.len());
+    let thunk = (site >> 32) as u32;
+    if host(native, memory, bridge, cpu, before, next, |b, c| {
+        call_host(b, c, thunk)
+    }) {
+        0
+    } else {
+        native.diagnostics.helper_exits += 1;
+        u64::from(LEAVE)
     }
+}
+
+/// Makes a host call from translated code with `call`, the guest in `cpu`.
+/// True continues at `next`: the call returned there and changed no code
+/// or mapping, and no deadline, interrupt or stop is due. Otherwise the
+/// unit leaves for wherever the call went.
+fn host(
+    native: &mut Native,
+    memory: &mut Memory,
+    bridge: &mut Bridge<'_>,
+    cpu: &mut CpuState,
+    (epoch, dirty): (u64, usize),
+    next: u32,
+    call: impl FnOnce(&mut Bridge<'_>, &mut CpuState) -> u32,
+) -> bool {
+    // Generated accesses are paused. Let host mapping changes update the
+    // raw permissions in place instead of copying the whole table.
+    let classified = native.alias_snapshot.take().is_some();
+    let resumes = call(bridge, cpu) == 0
+        && memory.epoch == epoch
+        && memory.dirty_pages.len() == dirty
+        && cpu.eip == next
+        && !native.past()
+        && !native
+            .interrupt
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
+        && !native.stops.contains(&next);
+    if resumes && classified {
+        native.classify(memory);
+    }
+    resumes
 }
 
 /// The virtual counter, which reads in a few nanoseconds where
@@ -557,7 +584,7 @@ pub(crate) struct Native {
     strikes: FxHashMap<u32, u32>,
     /// Guest instructions whose accesses check their page first.
     checked: FxHashSet<u32>,
-    channels: bool,
+    uses_permissions: bool,
     /// Faults at unchecked sites so far.
     pub(crate) unchecked_faults: u64,
     /// The run's wall deadline as a virtual counter value.
@@ -619,7 +646,7 @@ impl Native {
                 (stubs.shadow_reset, "shadow_reset"),
                 (stubs.access, "access"),
                 (stubs.interpret, "interpret"),
-                (stubs.leaf, "leaf"),
+                (stubs.call, "call"),
             ],
         );
         // SAFETY: `enter` follows the C calling convention with the
@@ -652,7 +679,6 @@ impl Native {
             cache,
             enter,
             stubs: Stubs {
-                leaf: base + stubs.leaf,
                 exit: base + stubs.exit,
                 dispatch: base + stubs.dispatch,
                 lookup: base + stubs.lookup,
@@ -660,6 +686,7 @@ impl Native {
                 ret_miss: base + stubs.ret_miss,
                 access: base + stubs.access,
                 interpret: base + stubs.interpret,
+                call: base + stubs.call,
                 fault: base + stubs.fault,
             },
             units: FxHashMap::default(),
@@ -672,7 +699,7 @@ impl Native {
             checks: Checks::Adaptive,
             strikes: FxHashMap::default(),
             checked: FxHashSet::default(),
-            channels: false,
+            uses_permissions: false,
             unchecked_faults: 0,
             deadline: None,
             diagnostics: Diagnostics::default(),
@@ -750,7 +777,7 @@ impl Native {
         }
         debug_assert_eq!(cpu.lazy_flags[3], 0, "lazy flags settle before entry");
         let budget = fuel.min(SLICE);
-        if self.channels || self.checks != Checks::Adaptive || !self.checked.is_empty() {
+        if self.uses_permissions || self.checks != Checks::Adaptive || !self.checked.is_empty() {
             self.classify(memory);
         }
         self.cache.sync();
@@ -774,7 +801,7 @@ impl Native {
             (*runtime).helper = dispatch as *const () as u64;
             (*runtime).access = access as *const () as u64;
             (*runtime).interpret = interpret as *const () as u64;
-            (*runtime).leaf = leaf as *const () as u64;
+            (*runtime).call = call as *const () as u64;
             (*runtime).owner = &raw mut owner as u64;
             let previous = ACTIVE.replace(faults);
             enter(runtime, entry.unit);
@@ -782,6 +809,7 @@ impl Native {
         }
         self.runtime.cpu = std::ptr::null_mut();
         self.runtime.owner = 0;
+        self.alias_snapshot = None;
         if let Some(error) = owner.error {
             return Err(error);
         }
@@ -960,6 +988,11 @@ impl Native {
     }
 
     #[cfg(test)]
+    pub(crate) fn native_batches(&self) -> u64 {
+        self.runtime.native_batches
+    }
+
+    #[cfg(test)]
     pub(crate) fn unit_address(&self, eip: u32) -> Option<usize> {
         self.units.get(&eip).map(|entry| entry.unit)
     }
@@ -1053,7 +1086,7 @@ impl Native {
         self.units.clear();
         self.rows.clear();
         self.table_sources.clear();
-        self.channels = false;
+        self.uses_permissions = false;
         self.pages.clear();
         self.links.clear();
         self.linked.clear();
@@ -1130,7 +1163,7 @@ impl Native {
     fn emit(&mut self, memory: &mut Memory, eip: u32) -> Option<Entry> {
         let at = self.cache.next();
         let mut work = std::mem::take(&mut self.work);
-        work.images.clone_from(&self.images.borrow());
+        work.unit.images.clone_from(&self.images.borrow());
         let (all, checked) = (self.checks != Checks::Adaptive, &self.checked);
         let control = if self.runtime.cpu.is_null() {
             self.control
@@ -1151,18 +1184,39 @@ impl Native {
             self.stubs,
             &|pc, word| {
                 if self.bridge.is_null() {
-                    return false;
+                    return None;
                 }
                 // SAFETY: translation occurs only during the bridge's run.
                 unsafe { &*self.bridge.cast::<Bridge<'_>>() }
                     .handler
                     .as_ref()
-                    .is_some_and(|handler| handler.leaf_call(pc, word))
+                    .and_then(|handler| handler.host_thunk(pc, word))
+            },
+            &|pc| {
+                if self.bridge.is_null() {
+                    return None;
+                }
+                // SAFETY: as for `host_thunk`.
+                let handler = unsafe { &*self.bridge.cast::<Bridge<'_>>() }
+                    .handler
+                    .as_ref()?;
+                let (target, original) = handler.redirect(pc)?;
+                Some((target, original.to_vec()))
+            },
+            &|pc, code| {
+                if self.bridge.is_null() {
+                    return Vec::new();
+                }
+                // SAFETY: admission runs synchronously on the execution owner.
+                unsafe { &*self.bridge.cast::<Bridge<'_>>() }
+                    .handler
+                    .as_ref()
+                    .map_or_else(Vec::new, |handler| handler.native_region(pc, code))
             },
             control,
         );
         if work.retired() == 0 {
-            self.diagnostics.empty_units[usize::from(work.trace.failure & 3)] += 1;
+            self.diagnostics.empty_units[usize::from(work.unit.trace.failure & 3)] += 1;
         }
         let entry = self.place(
             eip,
@@ -1173,16 +1227,17 @@ impl Native {
         );
         if let Some(entry) = entry {
             debug_assert_eq!(entry.unit, at);
-            if !work.tables.is_empty() {
+            if !work.unit.tables.is_empty() {
                 self.table_sources.insert(eip);
             }
-            for table in &work.tables {
+            for table in &work.unit.tables {
                 for (index, &target) in table.targets.iter().enumerate() {
                     let slot = (eip, at + table.offset + index * 8, at + table.stub);
                     self.rows.entry(target).or_default().push(slot);
                 }
             }
             let mut targets: Vec<_> = work
+                .unit
                 .tables
                 .iter()
                 .flat_map(|t| t.targets.iter().copied())
@@ -1212,10 +1267,10 @@ impl Native {
                 }
             }
         }
-        self.channels |= entry.is_some() && work.channels;
+        self.uses_permissions |= entry.is_some() && work.code.uses_permissions;
         // Code discovery can protect a host page shared with ordinary data.
-        // Revalidate the non-faulting batch proof before linked code resumes.
-        if self.channels {
+        // Refresh permission snapshots before linked code resumes.
+        if self.uses_permissions {
             self.classify(memory);
         }
         self.work = work;
@@ -1257,6 +1312,13 @@ fn recover(cpu: &mut CpuState, site: Site, temps: [u64; 2]) {
         Operand::Temp(index) => temps[usize::from(index)] as u32,
         Operand::Imm(value) => value,
     };
+    if let Some(result) = site.nz {
+        let result = value(result);
+        cpu.eflags = cpu.eflags & !0xc0 | u32::from(result == 0) << 6 | (result >> 24 & 0x80);
+    }
+    if let Some(overflow) = site.overflow.evaluate(value) {
+        cpu.eflags = cpu.eflags & !0x800 | u32::from(overflow) << 11;
+    }
     match site.carry.evaluate(value) {
         Some(cf) => cpu.eflags = cpu.eflags & !1 | u32::from(cf),
         None if site.sense == Sense::Addition => cpu.eflags ^= 1,
@@ -1304,6 +1366,8 @@ mod tests {
             refund: 0,
             sense: Sense::Subtraction,
             carry: Carry::Host,
+            nz: None,
+            overflow: translate::Overflow::Host,
             recipe: Recipe::Canonical,
             checked: false,
             simd_dirty: 0,
@@ -1340,6 +1404,82 @@ mod tests {
         assert_eq!(base % (1 << 32), 0);
         assert!(base >= adv_cpu_core::virtual_memory::WINDOW_GUARD);
         assert_eq!(native.runtime.window, base as u64);
+    }
+
+    // spec: A64-MEM-8, A64-CTL-8
+    #[test]
+    fn raw_permissions_are_pinned_only_while_generated_accesses_can_run() {
+        use adv_cpu_core::memory::{EXEC, READ, WRITE};
+        use adv_cpu_core::trap::ExecutionTrap;
+
+        struct Mapping(bool);
+        impl ExecutionTrap for Mapping {
+            fn call(
+                &mut self,
+                _: &mut CpuState,
+                memory: &mut Memory,
+                vector: u32,
+            ) -> Result<bool, String> {
+                assert_eq!(vector, 0x2e);
+                assert_eq!(Arc::strong_count(&memory.perms), 1);
+                if self.0 {
+                    let before = Arc::as_ptr(&memory.perms);
+                    memory.protect(0x8000, 0x1000, READ)?;
+                    assert_eq!(Arc::as_ptr(&memory.perms), before);
+                }
+                Ok(false)
+            }
+        }
+
+        for change_mapping in [false, true] {
+            let (mut memory, mut native) = native();
+            memory.map(0x1000, 0x1000, READ | WRITE | EXEC).unwrap();
+            memory.map(0x8000, 0x1000, READ | WRITE).unwrap();
+            memory.write(0x8000, &42u32.to_le_bytes()).unwrap();
+            // mov eax, 7; int 0x2e; mov eax, [ecx]
+            let code = [0xb8, 7, 0, 0, 0, 0xcd, 0x2e, 0x8b, 0x01];
+            memory.write(0x1000, &code).unwrap();
+            let stop = 0x1000 + code.len() as u32;
+            native.first_visits = false;
+            native.checks = Checks::All;
+            let mut cpu = cpu(0x1000, 0, 0x8000);
+            let mut mapping = Mapping(change_mapping);
+            let mut bridge = Bridge {
+                timestamp: Default::default(),
+                memory: &mut memory,
+                error: None,
+                trap: None,
+                calls: 0,
+                handler: Some(&mut mapping),
+                parked: false,
+                deadline: None,
+                clock_due: true,
+                unclocked_bytes: 0,
+                bulk_calls: 0,
+                bulk_bytes: 0,
+                cliffs: Default::default(),
+                scratch: Default::default(),
+            };
+            let bridge_ptr = (&raw mut bridge).cast();
+            let run = native
+                .run(&mut cpu, &mut memory, stop, 100, bridge_ptr)
+                .unwrap()
+                .unwrap();
+            assert!(bridge.error.is_none(), "{:?}", bridge.error);
+            assert_eq!(bridge.calls, 1);
+            assert_eq!(Arc::strong_count(&memory.perms), 1);
+            if change_mapping {
+                assert_eq!((cpu.eip, cpu.regs[0]), (0x1007, 7));
+                assert_eq!(run.exit, Exit::Dispatch);
+                native
+                    .run(&mut cpu, &mut memory, stop, 100, bridge_ptr)
+                    .unwrap();
+            }
+            assert_eq!((cpu.eip, cpu.regs[0]), (stop, 42));
+            let before = Arc::as_ptr(&memory.perms);
+            memory.unmap(0x8000, 0x1000).unwrap();
+            assert_eq!(Arc::as_ptr(&memory.perms), before);
+        }
     }
 
     #[test]
@@ -1414,6 +1554,8 @@ mod tests {
                 refund: 3,
                 sense: Sense::Addition,
                 carry: Carry::Host,
+                nz: None,
+                overflow: translate::Overflow::Host,
                 recipe: Recipe::AddResult(Operand::Guest(0), Operand::Imm(1)),
                 checked: false,
                 simd_dirty: 0,
@@ -1423,5 +1565,20 @@ mod tests {
         );
         assert_eq!(cpu.eip, 0x1234);
         assert_eq!(cpu.eflags, 0x202 | 0x10);
+    }
+    // spec: A64-CTL-6
+    #[test]
+    fn j1_indirect_slots_fold_high_bits_keep_low_bits_and_clear_on_discard() {
+        let (_, mut native) = native();
+        let targets = [0x1000, 0x1001, 0x41000];
+        install(&mut native, targets[0], ldr_reg(W, X19, X27, X19, false));
+        for (index, target) in targets.into_iter().enumerate() {
+            for other in &targets[..index] {
+                assert_ne!(runtime::table_slot(target), runtime::table_slot(*other));
+            }
+            native.table[runtime::table_slot(target)] = [u64::from(target), 42];
+        }
+        native.discard_switch_target(targets[0]);
+        assert!(native.table.iter().all(|entry| *entry == EMPTY));
     }
 }

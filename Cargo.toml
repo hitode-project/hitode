@@ -5,11 +5,12 @@ members = [
     "crates/adv-abi-macros",
     "crates/adv-cpu",
     "crates/adv-cpu-core",
-    "crates/adv-cpu-x64",
     "crates/adv-cpu-a64",
     "crates/adv-device",
+    "crates/adv-drv",
     "crates/adv-dx",
     "crates/adv-machine",
+    "crates/adv-nt",
     "crates/adv-os",
     "crates/adv-pe",
     "crates/adv-report",
@@ -18,7 +19,8 @@ members = [
     "crates/adv-shell",
     "crates/adv-sync",
     "crates/adv-unicorn",
-    "crates/adv-win32",
+    "crates/adv-unix",
+    "crates/adv-wineserver",
     "apps/adv-run",
     "apps/adv-jit-helper",
     "apps/adv-launcher/src-tauri",
@@ -58,6 +60,10 @@ opt-level = 3
 
 [profile.release]
 debug = "line-tables-only"
+
+# Solid runtime compression also runs inside the launcher's build script.
+[profile.release.package.lzma-rust2]
+opt-level = 3
 
 [patch.crates-io]
 cpal = { path = "vendor/cpal" }

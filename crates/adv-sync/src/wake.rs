@@ -1,160 +1,7 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-#[cfg(windows)]
-mod os {
-    use super::*;
-    use std::ffi::c_void;
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn CreateEventW(
-            attributes: *const c_void,
-            manual: i32,
-            initial: i32,
-            name: *const u16,
-        ) -> *mut c_void;
-        fn SetEvent(event: *mut c_void) -> i32;
-        fn WaitForSingleObject(event: *mut c_void, milliseconds: u32) -> u32;
-        fn WaitForMultipleObjects(
-            count: u32,
-            handles: *const *mut c_void,
-            all: i32,
-            milliseconds: u32,
-        ) -> u32;
-        fn CreateWaitableTimerExW(
-            attributes: *const c_void,
-            name: *const u16,
-            flags: u32,
-            access: u32,
-        ) -> *mut c_void;
-        fn SetWaitableTimerEx(
-            timer: *mut c_void,
-            due: *const i64,
-            period: i32,
-            callback: *const c_void,
-            argument: *const c_void,
-            context: *const c_void,
-            tolerance: u32,
-        ) -> i32;
-        fn CancelWaitableTimer(timer: *mut c_void) -> i32;
-        fn CloseHandle(handle: *mut c_void) -> i32;
-    }
-    // One timer per waiting thread, not per cloned event. Concurrent waiters
-    // cannot rearm each other's deadlines. Non-alertable waits never call user
-    // code while the timer is armed. No global timer-resolution request is made.
-    struct DeadlineTimer(*mut c_void);
-    impl DeadlineTimer {
-        fn new() -> Option<Self> {
-            const HIGH_RESOLUTION: u32 = 2;
-            const SYNCHRONIZE_AND_MODIFY: u32 = 0x0010_0002;
-            let timer = unsafe {
-                CreateWaitableTimerExW(
-                    std::ptr::null(),
-                    std::ptr::null(),
-                    HIGH_RESOLUTION,
-                    SYNCHRONIZE_AND_MODIFY,
-                )
-            };
-            if timer.is_null() {
-                None
-            } else {
-                Some(Self(timer))
-            }
-        }
-        fn wait(&self, event: *mut c_void, timeout: Duration) -> std::io::Result<bool> {
-            let ticks = timeout.as_nanos().div_ceil(100).clamp(1, i64::MAX as u128);
-            let due = -(ticks as i64);
-            // Negative 100 ns units specify a relative one-shot deadline. Windows
-            // copies due synchronously; no callback or pointer is retained.
-            if unsafe {
-                SetWaitableTimerEx(
-                    self.0,
-                    &due,
-                    0,
-                    std::ptr::null(),
-                    std::ptr::null(),
-                    std::ptr::null(),
-                    0,
-                )
-            } == 0
-            {
-                return Err(std::io::Error::last_os_error());
-            }
-            let handles = [event, self.0];
-            // An already-pending channel event wins even when both are signaled.
-            let result = match unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, u32::MAX) } {
-                0 => Ok(true),
-                1 => Ok(false),
-                _ => Err(std::io::Error::last_os_error()),
-            };
-            // Cancel an unexpired deadline after an early channel wake. The next
-            // SetWaitableTimerEx also resets any already-signaled timer state.
-            unsafe {
-                CancelWaitableTimer(self.0);
-            }
-            result
-        }
-    }
-    impl Drop for DeadlineTimer {
-        fn drop(&mut self) {
-            unsafe {
-                CloseHandle(self.0);
-            }
-        }
-    }
-    thread_local! { static DEADLINE_TIMER: Option<DeadlineTimer> = DeadlineTimer::new(); }
-    pub struct Handle(*mut c_void);
-    // Windows events allow concurrent SetEvent and waiting. Arc pins the handle.
-    unsafe impl Send for Handle {}
-    unsafe impl Sync for Handle {}
-    impl Handle {
-        pub fn new() -> std::io::Result<Self> {
-            let event = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
-            if event.is_null() {
-                Err(std::io::Error::last_os_error())
-            } else {
-                Ok(Self(event))
-            }
-        }
-        pub fn signal(&self) {
-            unsafe {
-                SetEvent(self.0);
-            }
-        }
-        pub fn wait(&self, timeout: Option<Duration>) -> std::io::Result<bool> {
-            if let Some(duration) = timeout.filter(|duration| !duration.is_zero())
-                && let Ok(Some(result)) = DEADLINE_TIMER
-                    .try_with(|timer| timer.as_ref().map(|timer| timer.wait(self.0, duration)))
-            {
-                return result;
-            }
-            // Unbounded waits and zero-duration polls need no timer. Older
-            // Windows versions without high-resolution timers retain the event
-            // timeout fallback and the same signal-before-wait behavior.
-            let ms = timeout.map_or(u32::MAX, |d| {
-                d.as_nanos()
-                    .div_ceil(1_000_000)
-                    .min(u128::from(u32::MAX - 1)) as u32
-            });
-            match unsafe { WaitForSingleObject(self.0, ms) } {
-                0 => Ok(true),
-                258 => Ok(false),
-                _ => Err(std::io::Error::last_os_error()),
-            }
-        }
-        pub fn raw(&self) -> *mut c_void {
-            self.0
-        }
-    }
-    impl Drop for Handle {
-        fn drop(&mut self) {
-            unsafe {
-                CloseHandle(self.0);
-            }
-        }
-    }
-}
 #[cfg(unix)]
 mod os {
     use super::*;
@@ -260,17 +107,24 @@ mod os {
 pub struct WakeEvent {
     handle: Arc<os::Handle>,
     interrupt: Arc<AtomicBool>,
+    generation: Arc<AtomicU64>,
 }
 impl WakeEvent {
     pub fn new() -> std::io::Result<Self> {
         Ok(Self {
             handle: Arc::new(os::Handle::new()?),
             interrupt: Arc::new(AtomicBool::new(false)),
+            generation: Arc::new(AtomicU64::new(0)),
         })
     }
     pub fn signal(&self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
         self.interrupt.store(true, Ordering::Release);
         self.notify();
+    }
+    /// Execution deliveries since creation, including repeated signals before a drain.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
     }
     /// Retain an OS wake without requesting a CPU safepoint exit. Read-only
     /// diagnostics use this so they cannot overtake an input's guest time slice.
@@ -278,8 +132,8 @@ impl WakeEvent {
     pub fn notify(&self) {
         self.handle.signal();
     }
-    /// Submillisecond deadlines on Windows (high-resolution timer) and
-    /// Linux/Android (ppoll); other Unix hosts round up to poll's milliseconds.
+    /// Submillisecond deadlines on Linux/Android (ppoll); other Unix hosts
+    /// round up to poll's milliseconds.
     /// No spinning, timer-resolution changes or guest-clock advancement.
     pub fn wait(&self, timeout: Option<Duration>) -> std::io::Result<bool> {
         self.handle.wait(timeout)
@@ -293,10 +147,7 @@ impl WakeEvent {
     pub fn take_interrupt(&self) -> bool {
         self.interrupt.swap(false, Ordering::AcqRel)
     }
-    #[cfg(windows)]
-    pub fn as_raw_handle(&self) -> *mut std::ffi::c_void {
-        self.handle.raw()
-    }
+
     /// The pipe's read end, readable while a wake is pending, for a host
     /// event loop to watch. `wait` drains it.
     #[cfg(unix)]

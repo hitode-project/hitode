@@ -160,7 +160,6 @@ fn carry_controls_preserve_other_flags_and_feed_branches_and_setcc() {
                         "{strategy:?}, producer={producer}, carry={carry}, {left:#x}, {right:#x}"
                     );
                 }
-                support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
             }
         }
     }
@@ -201,7 +200,6 @@ fn carry_controls_chain_through_inc_dec_adc_sbb_and_a_loop_merge() {
                 }
             }
         }
-        support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
     }
 }
 
@@ -271,10 +269,6 @@ fn carry_forms_match(subtract: bool) {
                     }
                 }
             }
-            support::x64_shape!(assert_eq!(
-                jit.stats.interpreter_entries, 0,
-                "carry form {form}, subtract={subtract}"
-            ));
         }
     }
 }
@@ -308,7 +302,6 @@ fn sbb_chain_uses_lazy_carry_preserved_by_inc_dec_then_feeds_setcc() {
                 );
             }
         }
-        support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
     }
 }
 
@@ -339,7 +332,6 @@ fn adc_chain_preserves_lazy_carry_across_inc_dec_and_faulting_stores() {
                 );
             }
         }
-        support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
     }
     let bytes = assemble(|a| {
         a.adc(dword_ptr(edi), ecx).unwrap();
@@ -415,7 +407,6 @@ fn all_setcc_conditions_preserve_flags_and_high_register_bits_for_raw_and_lazy_f
                     "{strategy:?}, producer {producer}, {left:#x}, {right:#x}, {flags:#x}"
                 );
             }
-            support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
         }
     }
 }
@@ -481,7 +472,6 @@ fn setcc_can_write_a_page_without_read_permission_and_short_sbb_stays_native() {
     assert_eq!(jit.state.eflags, 0xed7);
     jit.protect(DATA, 4096, READ | WRITE).unwrap();
     assert_eq!(jit.memory().read(DATA, 1).unwrap(), [1]);
-    support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
 
     let bytes = assemble(|a| {
         a.sbb(al, cl).unwrap();
@@ -500,5 +490,4 @@ fn setcc_can_write_a_page_without_read_permission_and_short_sbb_stays_native() {
         jit.memory().read(DATA, 4).unwrap(),
         reference.memory().read(DATA, 4).unwrap()
     );
-    support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
 }

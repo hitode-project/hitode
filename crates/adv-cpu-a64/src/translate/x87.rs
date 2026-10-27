@@ -106,6 +106,75 @@ enum Take {
 /// x6 the guest address, x8 the control word, w13 the status word, w14 the
 /// tag word, w15 TOP; x7, x16 and x17 are scratch.
 impl Translator<'_> {
+    pub(super) fn fild64(&mut self, mem: Mem, helper: u8, opcode: Option<u16>) {
+        self.flush_simd();
+        self.canonicalize();
+        let address = self.effective(mem);
+        self.emit(mov(W, X6, address));
+        self.cpu();
+        let slow = self.asm.label();
+        let memory_slow = self.asm.label();
+        let done = self.asm.label();
+        self.emit_all(&[
+            mrs_nzcv(X4),
+            ldrh(X13, X5, runtime::X87_STATUS),
+            ldr(W, X16, X5, runtime::MMX_MODE),
+        ]);
+        self.asm.tbz(true, X13, 7, slow);
+        self.asm.cbz(W, true, X16, slow);
+        self.emit_all(&[ubfx(W, X15, X13, 11, 3), ldrh(X14, X5, runtime::X87_TAG)]);
+        let load = ldr_reg(X, X0, WINDOW, X6, false);
+        if self.checking {
+            self.emit(mov(X, X7, X4));
+            self.checked_memory(X6, 8, false, load, memory_slow);
+            self.emit(mov(X, X4, X7));
+        } else {
+            self.site();
+            self.emit(load);
+        }
+        // Normalize the unsigned magnitude straight into raw80. No host-double
+        // conversion or rounding loses the low bits of large signed integers.
+        self.emit_all(&[
+            asr_imm(X, X1, X0, 63),
+            eor(X, X16, X0, X1, Lsl, 0),
+            sub(X, X0, X16, X1, Lsl, 0),
+            and_imm(W, X1, X1, 0x8000),
+        ]);
+        let zero = self.asm.label();
+        self.asm.cbz(X, false, X0, zero);
+        self.emit_all(&[
+            clz(X, X16, X0),
+            shiftv(X, Shift::Lsl, X0, X0, X16),
+            movz(W, X17, 0x403e, 0),
+            sub(W, X17, X17, X16, Lsl, 0),
+            orr(W, X1, X1, X17, Lsl, 0),
+        ]);
+        self.asm.bind(zero);
+        self.st_push(X0, X1, slow);
+        self.clear_c1();
+        self.emit_all(&[
+            bfi(W, X13, X15, 11, 3),
+            strh(X13, X5, runtime::X87_STATUS),
+            strh(X14, X5, runtime::X87_TAG),
+        ]);
+        self.mov_imm(X16, self.trace.insts[self.index].pc);
+        self.emit(str(W, X16, X5, runtime::X87_IP));
+        if let Some(opcode) = opcode {
+            self.emit_all(&[movz(W, X16, opcode, 0), strh(X16, X5, runtime::X87_OPCODE)]);
+        }
+        self.emit_all(&[str(W, X6, X5, runtime::X87_DP), msr_nzcv(X4)]);
+        self.asm.b(done);
+        self.asm.bind(memory_slow);
+        if self.checking {
+            self.emit(mov(X, X4, X7));
+        }
+        self.asm.bind(slow);
+        self.emit(msr_nzcv(X4));
+        self.helper(helper);
+        self.asm.bind(done);
+        self.vector = super::simd::Vector::default();
+    }
+
     pub(super) fn x87(&mut self, x: X87) {
         if self.x87_cached(x) {
             return;
@@ -380,7 +449,9 @@ impl Translator<'_> {
     fn x87_store(&mut self, width: u8, integer: bool, pop: bool, slow: Label) {
         self.read(0, X0, X1, slow);
         self.ordinary(X0, X1, slow);
-        self.store_rounding(integer, slow);
+        if integer {
+            self.store_rounding(width, true, slow);
+        }
         if integer || width == 4 {
             self.double(X0, X1, V0, Take::Sticky(X3), slow);
             self.store_sticky(width, integer, slow);
@@ -411,11 +482,11 @@ impl Translator<'_> {
                 add(X, X17, X17, X7, Lsl, 0),
                 add(X, X17, X17, X16, Lsl, 52),
                 orr(X, X2, X2, X17, Lsl, 0),
-                ubfx(X, X17, X17, 52, 11),
-                cmp_imm(W, X17, 0x7ff, false),
             ]);
-            self.asm.b_cond(Cond::Eq, slow);
             self.asm.bind(zero);
+            self.store_rounding(width, false, slow);
+            self.emit_all(&[ubfx(X, X17, X2, 52, 11), cmp_imm(W, X17, 0x7ff, false)]);
+            self.asm.b_cond(Cond::Eq, slow);
         }
         self.store_flags(slow);
         self.emit(msr_nzcv(X4));
@@ -427,9 +498,10 @@ impl Translator<'_> {
         }
     }
 
-    /// Takes the interpreter unless the rounding control is to nearest, or
-    /// toward zero for integers, whose control it leaves in w7. Uses w17.
-    fn store_rounding(&mut self, integer: bool, slow: Label) {
+    /// For integers, checks the control and leaves it in w7. For floats,
+    /// adjusts nearest x2 and its magnitude increment w7 when w3 is inexact.
+    /// Uses x16 and x17.
+    fn store_rounding(&mut self, width: u8, integer: bool, slow: Label) {
         self.emit(ubfx(W, X17, X8, 10, 2));
         if integer {
             let nearest = self.asm.label();
@@ -439,7 +511,22 @@ impl Translator<'_> {
             self.asm.bind(nearest);
             self.emit(mov(W, X7, X17));
         } else {
-            self.asm.cbz(W, true, X17, slow);
+            let done = self.asm.label();
+            self.asm.cbz(W, false, X17, done);
+            self.asm.cbz(W, false, X3, done);
+            let size = if width == 8 { X } else { W };
+            // Truncate the magnitude, then add a unit for down on a
+            // negative value or up on a positive one.
+            self.emit_all(&[
+                lsr_imm(size, X16, X2, u32::from(width) * 8 - 1),
+                sub(size, X2, X2, X7, Lsl, 0),
+                sub_imm(W, X17, X17, 1, false),
+                eor(W, X17, X17, X16, Lsl, 0),
+                cmp_imm(W, X17, 1, false),
+                cset(W, X7, Cond::Eq),
+                add(size, X2, X2, X7, Lsl, 0),
+            ]);
+            self.asm.bind(done);
         }
     }
 
@@ -479,15 +566,12 @@ impl Translator<'_> {
             ]);
             self.asm.b_cond(Cond::Hi, slow);
             self.asm.bind(zero);
-            self.emit_all(&[
-                unary(Unary::Narrow, V1, V0),
-                fmov_from_v(W, X2, V1),
-                ubfx(W, X16, X2, 23, 8),
-                cmp_imm(W, X16, 0xff, false),
-            ]);
-            self.asm.b_cond(Cond::Eq, slow);
+            self.emit_all(&[unary(Unary::Narrow, V1, V0), fmov_from_v(W, X2, V1)]);
             self.emit(unary(Unary::Widen, V1, V1));
             self.grew(V1, V0);
+            self.store_rounding(width, false, slow);
+            self.emit_all(&[ubfx(W, X16, X2, 23, 8), cmp_imm(W, X16, 0xff, false)]);
+            self.asm.b_cond(Cond::Eq, slow);
         }
     }
 

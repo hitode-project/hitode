@@ -2,8 +2,14 @@
 //! every wait deadline read this clock, so a run can be made deterministic (virtual time)
 //! or recorded and replayed later.
 
+use crate::{CtxId, Env, Outcome, Wait};
 use std::cell::Cell;
 use std::time::Instant;
+
+/// NT system time of 1970-01-01.
+pub const UNIX_EPOCH_SYSTEM_TIME: u64 = 116_444_736_000_000_000;
+/// Wall-clock start for virtual-time runs: 2020-01-01T00:00:00Z (deterministic).
+const VIRTUAL_START_UNIX: u64 = 1_577_836_800;
 
 /// Maximum unplanned wall-time advance. Expected idle waits are credited in
 /// full; time discarded after a stall is never repaid as catch-up work.
@@ -162,6 +168,22 @@ impl Clock {
         self.now_us()
     }
 
+    /// The guest's UTC time as an NT system time (100 ns units since 1601).
+    /// Virtual runs start at a fixed date; real runs read the host's wall
+    /// clock.
+    pub fn system_time(&mut self) -> u64 {
+        let unix_us = if self.is_virtual() {
+            VIRTUAL_START_UNIX * 1_000_000 + self.guest_now_us() - self.epoch_us
+        } else {
+            let _ = self.guest_now_us();
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_micros() as u64)
+                .unwrap_or(0)
+        };
+        UNIX_EPOCH_SYSTEM_TIME + unix_us * 10
+    }
+
     /// Virtual mode: move time forward to `us` (never backwards). Real mode: no-op.
     pub fn advance_to(&mut self, us: u64) {
         if let ClockMode::Virtual(t) = &mut self.mode {
@@ -212,6 +234,67 @@ impl Clock {
             *paused_for_us += at.elapsed().as_micros() as u64;
         }
     }
+}
+
+/// Back-to-back reads which prove a context is only polling the clock. Bounded
+/// per-item loops read the clock back to back too: Siglus stamps each of 256
+/// keys, twice a frame, and a 64-read streak stretched its frames to 200 ms.
+pub const POLL_STREAK: u32 = 2048;
+/// Longest gap between two reads of one poll: a loop doing real work between
+/// reads is not a busy-wait, however often it asks for the time.
+const POLL_GAP_US: u64 = 50;
+
+/// The last clock read and how many reads on that context came back to back,
+/// with no other host call and almost no guest time between them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ClockPoll {
+    context: Option<CtxId>,
+    call: u64,
+    read_us: u64,
+    streak: u32,
+}
+
+impl ClockPoll {
+    fn next_streak(&self, context: CtxId, call: u64, now: u64) -> u32 {
+        if self.context == Some(context)
+            && self.call + 1 == call
+            && now.saturating_sub(self.read_us) <= POLL_GAP_US
+        {
+            self.streak.saturating_add(1)
+        } else {
+            1
+        }
+    }
+
+    fn record(&mut self, context: CtxId, call: u64, now: u64) {
+        self.streak = self.next_streak(context, call, now);
+        (self.context, self.call, self.read_us) = (Some(context), call, now);
+    }
+}
+
+/// Read the guest clock for a polling API. A context that does nothing but reread
+/// the clock is busy-waiting; once a streak proves it, each read waits for the
+/// next millisecond, as a preempted thread would observe, so the spin idles the
+/// context and time skipping can reach the time it waits for.
+pub fn poll_clock(
+    env: &mut Env<'_>,
+    finish: impl FnOnce(&mut Env<'_>, u64) -> Outcome + 'static,
+) -> Outcome {
+    let now = env.sys.clock.guest_now_us();
+    let (context, call) = (env.sys.current, env.sys.host_calls);
+    let poll = env.ext.get_or_default::<ClockPoll>();
+    poll.record(context, call, now);
+    if poll.streak < POLL_STREAK {
+        return finish(env, now);
+    }
+    let next_ms = (now / 1000 + 1) * 1000;
+    Outcome::block_timed(Wait::Until(next_ms), move |env, _| {
+        let now = env.sys.clock.guest_now_us();
+        let call = env.sys.host_calls;
+        let poll = env.ext.get_or_default::<ClockPoll>();
+        (poll.call, poll.read_us) = (call, now);
+        finish(env, now)
+    })
 }
 
 #[cfg(test)]

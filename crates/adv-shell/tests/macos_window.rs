@@ -134,7 +134,7 @@ mod mac {
         window.pump()
     }
 
-    // spec: HOST-VIEW-6 HOST-OVL-9
+    // spec: HOST-VIEW-1 HOST-VIEW-6 HOST-OVL-9 HOST-RUN-1
     pub fn run() {
         let mtm = MainThreadMarker::new().expect("main thread");
         let mut window = Window::new("adv macos window test", 320, 240, true).unwrap();
@@ -150,9 +150,19 @@ mod mac {
             ((320.0 * scale) as u32, (240.0 * scale) as u32)
         );
         window.native_canvas((1600, 900)).unwrap();
+        let size = native.contentView().unwrap().bounds().size;
+        let available = native
+            .contentRectForFrameRect(native.screen().unwrap().visibleFrame())
+            .size;
+        assert!(size.width <= available.width && size.height <= available.height);
+        assert!((size.width / size.height - 1600.0 / 900.0).abs() < 0.001);
+        let scale = native.backingScaleFactor();
         assert_eq!(
             window.native_client_size().unwrap(),
-            ((1600.0 * scale) as u32, (900.0 * scale) as u32)
+            (
+                (size.width * scale).round() as u32,
+                (size.height * scale).round() as u32
+            )
         );
         window.native_canvas((320, 240)).unwrap();
         drop(presenter);

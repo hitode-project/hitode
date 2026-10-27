@@ -25,6 +25,62 @@ impl Software {
     }
 }
 impl Submission<'_> {
+    /// Sample BGRA publications directly from their immutable snapshot allocation.
+    /// The texture retains its parent buffer, whose deallocator owns the pixels.
+    pub fn software_texture(&self, frame: &PendingFrame) -> Result<Option<wgpu::Texture>, Error> {
+        if frame.format != PixelFormat::Bgra32 {
+            return Ok(None);
+        }
+        let device = unsafe { self.context.device.as_hal::<wgpu::hal::api::Metal>() }.unwrap();
+        let device = device.raw_device();
+        let buffer = software_buffer(device, frame)?;
+        let (width, height) = frame.extent();
+        let descriptor = MTLTextureDescriptor::new();
+        descriptor.setTextureType(MTLTextureType::Type2D);
+        descriptor.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
+        unsafe {
+            descriptor.setWidth(width as usize);
+            descriptor.setHeight(height as usize);
+        }
+        descriptor.setStorageMode(MTLStorageMode::Shared);
+        descriptor.setUsage(MTLTextureUsage::ShaderRead);
+        let raw = buffer
+            .newTextureWithDescriptor_offset_bytesPerRow(&descriptor, 0, frame.pitch as usize)
+            .ok_or_else(|| Error::Device("Metal software texture import failed".into()))?;
+        let texture = unsafe {
+            let raw = wgpu::hal::metal::Device::texture_from_raw(
+                raw,
+                FORMAT,
+                MTLTextureType::Type2D,
+                1,
+                1,
+                wgpu::hal::CopyExtent {
+                    width,
+                    height,
+                    depth: 1,
+                },
+                None,
+            );
+            self.context
+                .device
+                .create_texture_from_hal::<wgpu::hal::api::Metal>(
+                    raw,
+                    &wgpu::TextureDescriptor {
+                        label: Some("adv shared software snapshot"),
+                        size: extent(width, height),
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: FORMAT,
+                        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC,
+                        view_formats: &[],
+                    },
+                    wgpu::TextureUses::RESOURCE,
+                )
+        };
+        Ok(Some(texture))
+    }
+
     /// Import a page-owned immutable publication. The command retains its bytes
     /// until completion; subsequent producer writes acquire another slot.
     /// The destination is a same-sized BGRA8 texture with COPY_DST, STORAGE,
@@ -68,21 +124,7 @@ impl Submission<'_> {
         }
         let device = unsafe { self.context.device.as_hal::<wgpu::hal::api::Metal>() }.unwrap();
         let device = device.raw_device();
-        let pixels = frame.pixels.clone();
-        let pointer = NonNull::new(pixels.as_ptr().cast_mut().cast()).unwrap();
-        let size = pixels.allocation_size();
-        let release = block2::RcBlock::new(move |_: NonNull<std::ffi::c_void>, _: usize| {
-            let _ = &pixels;
-        });
-        let buffer = unsafe {
-            device.newBufferWithBytesNoCopy_length_options_deallocator(
-                pointer,
-                size,
-                MTLResourceOptions::StorageModeShared,
-                Some(&release),
-            )
-        }
-        .ok_or_else(|| Error::Device("Metal software frame import failed".into()))?;
+        let buffer = software_buffer(device, frame)?;
         let queue = unsafe { self.context.queue.as_hal::<wgpu::hal::api::Metal>() }.unwrap();
         let command = queue
             .as_raw()
@@ -158,4 +200,26 @@ impl Submission<'_> {
         command.commit();
         Ok(damage)
     }
+}
+
+fn software_buffer(
+    device: &ProtocolObject<dyn MTLDevice>,
+    frame: &PendingFrame,
+) -> Result<Object<dyn MTLBuffer>, Error> {
+    let pixels = frame.pixels.clone();
+    let pointer = NonNull::new(pixels.as_ptr().cast_mut().cast()).unwrap();
+    let size = pixels.allocation_size();
+    let release = block2::RcBlock::new(move |_: NonNull<std::ffi::c_void>, _: usize| {
+        let _ = &pixels;
+    });
+    let buffer = unsafe {
+        device.newBufferWithBytesNoCopy_length_options_deallocator(
+            pointer,
+            size,
+            MTLResourceOptions::StorageModeShared,
+            Some(&release),
+        )
+    }
+    .ok_or_else(|| Error::Device("Metal software frame import failed".into()))?;
+    Ok(buffer)
 }

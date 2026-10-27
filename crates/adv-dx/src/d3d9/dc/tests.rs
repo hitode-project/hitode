@@ -1,14 +1,12 @@
-//! Authored GDI/D3D interoperation, including real asynchronous GPU readback.
+//! Memory-DC leases, including real asynchronous GPU readback.
 use super::*;
 use adv_cpu::{
     JitCpu,
     backend::{Guest, Reg},
 };
-use adv_device::surface::{MemoryOperations, MemoryView, Snapshot, SurfaceStore};
+use adv_device::surface::{Snapshot, SurfaceStore};
 use adv_machine::{Resume, WakeReason};
-use adv_win32::{Win32, Win32Config};
 use std::{
-    borrow::Cow,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -23,30 +21,6 @@ fn env(m: &mut Machine<JitCpu>) -> Env<'_> {
         thunk: 0,
     }
 }
-fn memory<'a>(cpu: &'a mut (dyn Guest + 'a)) -> MemoryView<'a, dyn Guest + 'a> {
-    MemoryView::new(
-        cpu,
-        MemoryOperations {
-            read: |cpu, address, length| {
-                let mut bytes = vec![0; length];
-                cpu.read(address, &mut bytes).map_err(|e| e.to_string())?;
-                Ok(Cow::Owned(bytes))
-            },
-            write: |cpu, address, bytes| cpu.write(address, bytes).map_err(|e| e.to_string()),
-            writable: |cpu, address, length| {
-                if cpu.accessible(address, length as u32, Prot::WRITE) {
-                    Ok(())
-                } else {
-                    Err("not writable".into())
-                }
-            },
-            copy: |cpu, source, destination, length| {
-                cpu.copy_memory(source, destination, length)
-                    .map_err(|e| e.to_string())
-            },
-        },
-    )
-}
 struct Fixture {
     m: Machine<JitCpu>,
     registry: Registry,
@@ -58,11 +32,6 @@ impl Fixture {
     fn new(gpu: bool) -> Self {
         let mut m = super::super::tests::machine();
         m.sys.objects = Objects::default();
-        Win32::install(
-            &mut m,
-            Win32Config::new(".", "surface-dc.exe", "target/surface-dc"),
-        )
-        .unwrap();
         let arena = m.sys.vm.alloc(&mut m.cpu, 1024 * 1024, Prot::RW).unwrap();
         m.ext.insert(
             SurfaceStore::new(
@@ -80,20 +49,11 @@ impl Fixture {
             )
             .unwrap(),
         );
-        adv_win32::gdi32::raster::set_provider(
-            &mut m.ext,
-            adv_win32::gdi32::raster::DrawingProvider {
-                memory,
-                completed: |_, _| None,
-            },
-        );
         let com = Com::new(&mut m.sys.objects).unwrap();
         let state = m.ext.get_mut::<State>();
         state.com = com;
         state.tables.insert("IDirect3DTexture9", 0);
-        state.provider.acquire_dc = adv_win32::gdi32::raster::front::surface_dc::acquire;
-        state.provider.writeback_dc = adv_win32::gdi32::raster::front::surface_dc::writeback;
-        state.provider.release_dc = adv_win32::gdi32::raster::front::surface_dc::release;
+        state.provider.dc = super::super::tests::test_dc();
         state.provider.insert = |ext, target| ext.get_mut::<SurfaceStore>().insert_native(target);
         state.provider.target = |ext, id| ext.get::<SurfaceStore>().native_target(id).cloned();
         state.provider.remove = |ext, _, id| {
@@ -128,7 +88,6 @@ impl Fixture {
         destroy(&mut env(&mut m), dead);
         let mut registry = Registry::default();
         super::super::register(&mut registry);
-        adv_win32::register(&mut registry);
         Self {
             m,
             registry,
@@ -181,9 +140,21 @@ impl Fixture {
         let result = self.call("d3d9.dll", name, args);
         self.finish(result)
     }
-    fn gdi(&mut self, name: &str, args: &[u32]) -> u32 {
-        let result = self.call("gdi32.dll", name, args);
-        self.finish(result)
+    fn pixel(&mut self, dc: u32, x: usize, y: usize, color: Option<u32>) -> u32 {
+        let bytes = self
+            .m
+            .ext
+            .get_mut::<crate::test_support::dc::State>()
+            .pixels
+            .get_mut(&dc)
+            .unwrap();
+        let at = (y * 4 + x) * 4;
+        if let Some(color) = color {
+            let [r, g, b, _] = color.to_le_bytes();
+            bytes[at..at + 4].copy_from_slice(&[b, g, r, 0]);
+        }
+        let [b, g, r, _] = bytes[at..at + 4].try_into().unwrap();
+        u32::from_le_bytes([r, g, b, 0])
     }
     fn surface(&mut self, pool: u32, format: u32) -> u32 {
         let output = self.packet(0u32);
@@ -242,20 +213,6 @@ fn gdi_dc_owns_mip_and_device_until_matching_release_and_blocks_public_unlock() 
     assert_eq!(f.m.cpu.read_u32(output).unwrap(), 0x12345678);
     assert_eq!(f.d3d("IDirect3DTexture9::UnlockRect", &[texture, 1]), 0);
     let dc = f.acquire(top);
-    let bitmap = match f
-        .m
-        .ext
-        .get::<Win32>()
-        .gdi
-        .get(&f.m.sys.objects, dc)
-        .unwrap()
-    {
-        adv_os::gdi::GdiObj::Dc { selected, .. } => selected[3],
-        _ => panic!(),
-    };
-    assert_eq!(f.gdi("DeleteDC", &[dc]), 0);
-    assert_eq!(f.gdi("DeleteObject", &[bitmap]), 0);
-    assert_eq!(f.gdi("SelectObject", &[dc, adv_os::gdi::STOCK_BITMAP]), 0);
     assert_eq!(
         f.d3d("IDirect3DSurface9::ReleaseDC", &[top, dc + 1]),
         INVALID
@@ -273,8 +230,8 @@ fn gdi_dc_owns_mip_and_device_until_matching_release_and_blocks_public_unlock() 
         INVALID
     );
     assert_eq!(f.d3d("IDirect3DSurface9::UnlockRect", &[top]), INVALID);
-    assert_eq!(f.gdi("SetPixel", &[dc, 1, 2, 0x00332211]), 0x00332211);
-    assert_eq!(f.gdi("GetPixel", &[dc, 1, 2]), 0x00332211);
+    assert_eq!(f.pixel(dc, 1, 2, Some(0x00332211)), 0x00332211);
+    assert_eq!(f.pixel(dc, 1, 2, None), 0x00332211);
     let storage = {
         let e = env(&mut f.m);
         resources::storage(&e, resources::resource(&e, top).unwrap()).unwrap()
@@ -309,7 +266,7 @@ fn gdi_dc_owns_mip_and_device_until_matching_release_and_blocks_public_unlock() 
             .get_identity(&f.m.sys.objects, lease.owner)
             .is_some()
     );
-    assert_eq!(f.gdi("SetPixel", &[dc, 0, 0, 0x00010203]), 0x00010203);
+    assert_eq!(f.pixel(dc, 0, 0, Some(0x00010203)), 0x00010203);
     assert_eq!(f.d3d("IDirect3DSurface9::ReleaseDC", &[sibling, dc]), 0);
     assert!(f.m.ext.get::<State>().dcs.is_empty());
     assert!(
@@ -383,11 +340,11 @@ fn default_surface_get_dc_waits_for_gpu_and_release_uploads_gdi_pixels() {
     assert_eq!(f.finish(outcome), 0);
     let dc = f.m.cpu.read_u32(output).unwrap();
     assert_eq!(
-        f.gdi("GetPixel", &[dc, 0, 0]),
+        f.pixel(dc, 0, 0, None),
         0x00000102,
         "GPU contents replace stale staging"
     );
-    assert_eq!(f.gdi("SetPixel", &[dc, 2, 1, 0x00554433]), 0x00554433);
+    assert_eq!(f.pixel(dc, 2, 1, Some(0x00554433)), 0x00554433);
     assert_eq!(f.d3d("IDirect3DSurface9::ReleaseDC", &[surface, dc]), 0);
     assert_eq!(
         f.m.ext.get::<SurfaceStore>().live_surfaces(),
@@ -431,7 +388,7 @@ fn dirty_marks_wait_for_release_dc_continuation_after_a_busy_upload() {
     );
     let surface = f.m.cpu.read_u32(output).unwrap();
     let dc = f.acquire(surface);
-    assert_eq!(f.gdi("SetPixel", &[dc, 0, 0, 0x00010203]), 0x00010203);
+    assert_eq!(f.pixel(dc, 0, 0, Some(0x00010203)), 0x00010203);
     super::super::tests::force_recording_limit(&mut env(&mut f.m), f.device);
     let pause =
         f.m.ext
@@ -552,10 +509,92 @@ fn get_dc_reads_an_upload_accepted_by_the_recording_before_gpu_submission() {
         .unwrap();
     assert_eq!(f.d3d("IDirect3DSurface9::UnlockRect", &[surface]), 0);
     let dc = f.acquire(surface);
-    assert_eq!(f.gdi("GetPixel", &[dc, 0, 0]), 0x00332211);
+    assert_eq!(f.pixel(dc, 0, 0, None), 0x00332211);
     assert_eq!(
         f.m.ext.get::<State>().frames.flushes[recording::Reason::Dc as usize],
         1
     );
     assert_eq!(f.d3d("IDirect3DSurface9::ReleaseDC", &[surface, dc]), 0);
+}
+
+#[test]
+fn memory_dc_guest_calls_keep_the_lease_until_every_continuation_finishes() {
+    let mut f = Fixture::new(false);
+    let surface = f.surface(2, 22);
+    let output = f.packet(0xccccccccu32);
+    {
+        let dc = &mut f.m.ext.get_mut::<State>().provider.dc;
+        dc.create = |_, surface, then| {
+            Outcome::call(0x400000, [surface.pixels, surface.pitch], move |env, _| {
+                (super::super::tests::test_dc().create)(env, surface, then)
+            })
+        };
+        dc.flush = |_, dc, surface, then| {
+            Outcome::call(0x400004, [dc], move |env, _| {
+                (super::super::tests::test_dc().flush)(env, dc, surface, then)
+            })
+        };
+        dc.release = |_, dc, then| {
+            Outcome::call(0x400008, [dc], move |env, _| {
+                (super::super::tests::test_dc().release)(env, dc, then)
+            })
+        };
+    }
+    let Outcome::Call { then, args, .. } =
+        f.call("d3d9.dll", "IDirect3DSurface9::GetDC", &[surface, output])
+    else {
+        panic!("DC creation must call the guest");
+    };
+    let storage = resources::resource(&env(&mut f.m), surface)
+        .unwrap()
+        .storage;
+    assert_eq!(args, [storage, 16]);
+    assert_eq!(f.m.cpu.read_u32(output).unwrap(), 0xcccccccc);
+    assert_eq!(
+        f.d3d("IDirect3DSurface9::LockRect", &[surface, output, 0, 0]),
+        INVALID
+    );
+    let outcome = then(&mut env(&mut f.m), Resume::Returned(0));
+    assert_eq!(f.finish(outcome), 0);
+    let dc = f.m.cpu.read_u32(output).unwrap();
+    assert_eq!(f.pixel(dc, 1, 1, Some(0x00112233)), 0x00112233);
+    let Outcome::Call { then, .. } =
+        f.call("d3d9.dll", "IDirect3DSurface9::ReleaseDC", &[surface, dc])
+    else {
+        panic!("DC flush must call the guest");
+    };
+    assert_eq!(
+        f.d3d("IDirect3DSurface9::GetDC", &[surface, output]),
+        INVALID
+    );
+    let Outcome::Call { then, .. } = then(&mut env(&mut f.m), Resume::Returned(0)) else {
+        panic!("DC destruction must call the guest");
+    };
+    assert!(!f.m.ext.get::<State>().dcs.is_empty());
+    assert_eq!(
+        f.d3d("IDirect3DSurface9::LockRect", &[surface, output, 0, 0]),
+        INVALID
+    );
+    let outcome = then(&mut env(&mut f.m), Resume::Returned(0));
+    assert_eq!(f.finish(outcome), 0);
+    assert!(f.m.ext.get::<State>().dcs.is_empty());
+    assert!(
+        !f.m.ext
+            .get::<crate::test_support::dc::State>()
+            .pixels
+            .contains_key(&dc)
+    );
+    assert_eq!(
+        f.d3d("IDirect3DSurface9::LockRect", &[surface, output, 0, 0]),
+        0
+    );
+    let locked = GuestPtr::<D3DLOCKED_RECT>::new(output)
+        .read(&f.m.cpu)
+        .unwrap();
+    assert_eq!(
+        f.m.cpu.read_u32(locked.pBits + 20).unwrap() & 0xffffff,
+        0x332211
+    );
+    assert_eq!(f.d3d("IDirect3DSurface9::UnlockRect", &[surface]), 0);
+    assert_eq!(f.d3d("IDirect3DSurface9::Release", &[surface]), 0);
 }

@@ -9,83 +9,6 @@
 #endif
 /* Synthetic native fixture: a visible prefix, live registers/flags/FP state,
  * then one scalar operation. Recovery calls Rust in the same native frame. */
-#if defined(__x86_64__)
-.text
-.p2align 4
-.globl adv_posix_probe_start
-.globl adv_posix_probe_load
-.globl adv_posix_probe_store
-.globl adv_posix_probe_recovery
-.globl adv_posix_probe_chain_recovery
-.globl adv_posix_probe_end
-#if !defined(__APPLE__)
-.type adv_posix_probe_start, @function
-#endif
-adv_posix_probe_start:
-    movl %esi, %esi
-    pushq %rbx
-    pushq %rbp
-    pushq %r12
-    pushq %r13
-    pushq %r14
-    pushq %r15
-    subq $8, %rsp
-    stmxcsr (%rsp)
-    movl $0x5f80, 4(%rsp)
-    ldmxcsr 4(%rsp)
-    movdqa adv_posix_probe_pattern(%rip), %xmm8
-    incl (%rcx)
-    movl $0x21, %r10d
-    movl $0x32, %r11d
-    movl $0x43, %ebx
-    movl $0x65, %ebp
-    movl $0x76, %r12d
-    movl $0x87, %r13d
-    movl $0x7fffffff, %eax
-    addl $1, %eax
-    pushfq
-    popq %r14
-    testl %r8d, %r8d
-    jnz 1f
-    /* TEST above is followed by restoring the exact fault-point flags. */
-    pushq %r14
-    popfq
-adv_posix_probe_load:
-    movl (%rdi,%rsi), %r15d
-    movl %r15d, %eax
-    jmp 2f
-1:
-    pushq %r14
-    popfq
-adv_posix_probe_store:
-    movl %edx, (%rdi,%rsi)
-    movl %edx, %eax
-    jmp 2f
-adv_posix_probe_recovery:
-    call *%r9
-    addl $1, %eax
-    jmp 2f
-adv_posix_probe_chain_recovery:
-    movl $0xface, %eax
-2:
-    ldmxcsr (%rsp)
-    addq $8, %rsp
-    popq %r15
-    popq %r14
-    popq %r13
-    popq %r12
-    popq %rbp
-    popq %rbx
-    ret
-adv_posix_probe_end:
-#if !defined(__APPLE__)
-.size adv_posix_probe_start, adv_posix_probe_end-adv_posix_probe_start
-#endif
-.section .rodata
-.p2align 4
-adv_posix_probe_pattern:
-    .fill 16,1,0x5a
-#elif defined(__aarch64__)
 .text
 .p2align 4
 .globl adv_posix_probe_start
@@ -165,7 +88,6 @@ adv_posix_probe_chain_recovery:
 adv_posix_probe_end:
 #if !defined(__APPLE__)
 .size adv_posix_probe_start, adv_posix_probe_end-adv_posix_probe_start
-#endif
 #endif
 #if !defined(__APPLE__)
 .section .note.GNU-stack,"",@progbits

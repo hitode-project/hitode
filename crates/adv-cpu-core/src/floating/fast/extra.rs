@@ -1,4 +1,4 @@
-//! Forms with no binary64 lane. These remain helper calls in Cranelift.
+//! Forms with no binary64 lane. These use exact floating-point helpers.
 //! Rejection is atomic.
 use super::*;
 use raw::{compare, operand, ordinary};

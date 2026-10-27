@@ -58,39 +58,6 @@ pub struct WindowPresenter {
 }
 
 impl WindowPresenter {
-    /// HWND is owned by the calling UI thread and must outlive this presenter,
-    /// including any temporary move to a backend configuration job.
-    #[cfg(windows)]
-    unsafe fn surface(
-        hwnd: *mut std::ffi::c_void,
-        instance: &wgpu::Instance,
-    ) -> Result<wgpu::Surface<'static>, String> {
-        use std::num::NonZeroIsize;
-        let mut window = wgpu::rwh::Win32WindowHandle::new(
-            NonZeroIsize::new(hwnd as isize).ok_or("null GPU window")?,
-        );
-        // Vulkan's Win32 surface requires the actual module instance as well
-        // as HWND; omitting it silently leaves that backend with no surface.
-        window.hinstance = NonZeroIsize::new(unsafe {
-            windows_sys::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(
-                hwnd,
-                windows_sys::Win32::UI::WindowsAndMessaging::GWLP_HINSTANCE,
-            )
-        });
-        if window.hinstance.is_none() {
-            return Err("GPU window has no native module instance".into());
-        }
-        // SAFETY: caller keeps HWND alive until this surface is destroyed.
-        let surface = unsafe {
-            instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
-                raw_display_handle: Some(wgpu::rwh::WindowsDisplayHandle::new().into()),
-                raw_window_handle: window.into(),
-            })
-        }
-        .map_err(|error| error.to_string())?;
-        Ok(surface)
-    }
-
     /// `layer` is the game view's frame `CAMetalLayer` (HOST-VIEW-9).
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     unsafe fn surface(
@@ -184,17 +151,6 @@ impl WindowPresenter {
             presenter
         };
         Ok((gpu, presenter))
-    }
-
-    #[cfg(all(test, windows))]
-    pub(crate) unsafe fn new(
-        hwnd: *mut std::ffi::c_void,
-        context: NativeContext,
-        width: u32,
-        height: u32,
-    ) -> Result<Self, String> {
-        let surface = unsafe { Self::surface(hwnd, &context.instance)? };
-        Self::with_surface(surface, context, width, height)
     }
 
     fn with_surface(
@@ -1019,6 +975,8 @@ pub(crate) struct Rendered {
     #[cfg(target_vendor = "apple")]
     pub(crate) placement: Option<Placement>,
     pub(crate) serial: u64,
+    #[cfg(host_view)]
+    pub(crate) published_at: Option<Instant>,
     pub(crate) canvas: (u32, u32),
     pub(crate) cursor_regions: Arc<[VideoCursorRegion]>,
     #[cfg(target_os = "macos")]
@@ -1141,7 +1099,6 @@ impl Session {
         _wake: &WakeEvent,
     ) -> Result<Rendered, String> {
         let context = self.presenter.context.clone();
-        let submission = context.submission().map_err(|error| error.to_string())?;
         let mut changed = false;
         if self.frames.update() {
             self.stats.consumed += 1;
@@ -1165,10 +1122,15 @@ impl Session {
                 self.contiguous = false;
                 self.native = Some(frame.clone());
                 if update_video {
+                    let submission = context.submission().map_err(|error| error.to_string())?;
                     self.update_video(&context, &submission)?;
                 }
                 changed = true;
             } else {
+                let update_video = video_changed
+                    || self.native.is_some()
+                    || (self.width, self.height) != self.frames.current().extent();
+                let submission = context.submission().map_err(|error| error.to_string())?;
                 self.cursor_regions = Arc::from(self.frames.current().video_cursor_regions()?);
                 if self.native.is_some() {
                     self.snapshot.frames = 0;
@@ -1181,13 +1143,13 @@ impl Session {
                     0
                 };
                 let metal = self.metal_upload;
-                let no_copy = metal && self.video.is_empty();
+                let no_copy = metal;
                 if no_copy {
                     (self.snapshot.width, self.snapshot.height) = frame.extent();
                     self.snapshot.frames = frame.serial();
                     self.snapshot.damage = frame.damage_since(since);
                 } else {
-                    frame.snapshot(&mut self.snapshot)?;
+                    frame.snapshot_base(&mut self.snapshot)?;
                 }
                 if self.snapshot.width == 0 || self.snapshot.height == 0 {
                     return Ok(Rendered {
@@ -1197,6 +1159,8 @@ impl Session {
                         #[cfg(target_vendor = "apple")]
                         placement: None,
                         serial: self.serial,
+                        #[cfg(host_view)]
+                        published_at: self.frames.current().published_at(),
                         canvas: (self.width, self.height),
                         cursor_regions: self.cursor_regions.clone(),
                     });
@@ -1210,7 +1174,24 @@ impl Session {
                         .filter(|_| self.contiguous && self.native.is_none());
                     self.publication = None;
                     self.contiguous = false;
-                    if self.software.is_none() || old_extent != (self.width, self.height) {
+                    #[cfg(target_vendor = "apple")]
+                    let direct = if no_copy {
+                        submission
+                            .software_texture(self.frames.current())
+                            .map_err(|error| error.to_string())?
+                    } else {
+                        None
+                    };
+                    #[cfg(not(target_vendor = "apple"))]
+                    let direct: Option<wgpu::Texture> = None;
+                    let sampled = direct.is_some();
+                    let reset_upload = self.software.as_ref().is_none_or(|(texture, _)| {
+                        !texture.usage().contains(wgpu::TextureUsages::COPY_DST)
+                    }) || old_extent != (self.width, self.height);
+                    if let Some(texture) = direct {
+                        let view = texture.create_view(&Default::default());
+                        self.software = Some((texture, view));
+                    } else if reset_upload {
                         let texture = context.device.create_texture(&wgpu::TextureDescriptor {
                             label: Some("adv final software frame"),
                             size: wgpu::Extent3d {
@@ -1236,30 +1217,38 @@ impl Session {
                         self.software = Some((texture, view));
                     }
                     let texture = &self.software.as_ref().unwrap().0;
-                    if no_copy {
-                        #[cfg(target_vendor = "apple")]
-                        {
-                            submission
-                                .upload_software(texture, self.frames.current(), since)
-                                .map_err(|error| error.to_string())?;
-                            self.stats.gpu_transfer_bytes += self
-                                .snapshot
-                                .damage
-                                .iter()
-                                .map(|r| u64::from(r.w) * u64::from(r.h) * 4)
-                                .sum::<u64>();
+                    if !sampled {
+                        if no_copy {
+                            #[cfg(target_vendor = "apple")]
+                            {
+                                submission
+                                    .upload_software(
+                                        texture,
+                                        self.frames.current(),
+                                        if reset_upload { 0 } else { since },
+                                    )
+                                    .map_err(|error| error.to_string())?;
+                                self.stats.gpu_transfer_bytes += self
+                                    .snapshot
+                                    .damage
+                                    .iter()
+                                    .map(|r| u64::from(r.w) * u64::from(r.h) * 4)
+                                    .sum::<u64>();
+                            }
+                        } else {
+                            let bytes =
+                                crate::software_frame::upload(&submission, texture, &self.snapshot);
+                            self.stats.uploaded_bytes += bytes;
+                            self.stats.converted_bytes += bytes;
                         }
-                    } else {
-                        let bytes =
-                            crate::software_frame::upload(&submission, texture, &self.snapshot);
-                        self.stats.uploaded_bytes += bytes;
-                        self.stats.converted_bytes += bytes;
+                        self.stats.uploads += self.snapshot.damage.len() as u64;
                     }
-                    self.stats.uploads += self.snapshot.damage.len() as u64;
                     self.stats.software_started.get_or_insert_with(Instant::now);
                 }
                 self.native = None;
-                self.overlays.clear();
+                if update_video {
+                    self.update_video(&context, &submission)?;
+                }
             }
         }
         let canvas = (self.width, self.height);
@@ -1276,6 +1265,8 @@ impl Session {
                 #[cfg(target_vendor = "apple")]
                 placement: None,
                 serial: self.serial,
+                #[cfg(host_view)]
+                published_at: self.frames.current().published_at(),
                 canvas,
                 cursor_regions: self.cursor_regions.clone(),
             });
@@ -1290,7 +1281,7 @@ impl Session {
                 .as_ref()
                 .filter(|frame| frame.io_surface().is_some())
         {
-            let completion = submission
+            let completion = frame
                 .display_completion(_wake.clone())
                 .map_err(|e| e.to_string())?;
             self.contiguous = true;
@@ -1300,6 +1291,8 @@ impl Session {
                 result: DrawResult::Presented,
                 placement: Some(placement),
                 serial: self.serial,
+                #[cfg(host_view)]
+                published_at: self.frames.current().published_at(),
                 canvas,
                 cursor_regions: self.cursor_regions.clone(),
                 shared: Some((frame.clone(), completion)),
@@ -1320,6 +1313,7 @@ impl Session {
                 .ok_or("missing final software frame")?
                 .1
         };
+        let submission = context.submission().map_err(|error| error.to_string())?;
         let result = self.presenter.draw_view(
             view,
             size,
@@ -1327,7 +1321,7 @@ impl Session {
             canvas,
             // A frame consumed without reaching `draw_view` still needs upscaling.
             changed || !self.contiguous,
-            self.damage.filter(|_| !repaint),
+            self.damage.filter(|_| !repaint && self.overlays.is_empty()),
             &self.overlays,
             &submission,
         )?;
@@ -1340,6 +1334,8 @@ impl Session {
             placement: matches!(result, DrawResult::Presented).then_some(placement),
             result,
             serial: self.serial,
+            #[cfg(host_view)]
+            published_at: self.frames.current().published_at(),
             canvas,
             cursor_regions: self.cursor_regions.clone(),
         })
@@ -1563,6 +1559,7 @@ impl UiPresenter {
                     return Ok(Rendered {
                         result: DrawResult::Skipped,
                         serial: session.serial,
+                        published_at: session.frames.current().published_at(),
                         canvas: (session.width, session.height),
                         cursor_regions: session.cursor_regions.clone(),
                     });
@@ -1658,8 +1655,28 @@ mod tests {
     }
     use super::*;
     use adv_device::gpu::Gpu;
-    use adv_device::surface::Rect;
+    use adv_device::surface::{Rect, SurfaceMemory};
+    use std::borrow::Cow;
     use std::time::Duration;
+
+    struct Memory(Vec<u8>);
+    impl SurfaceMemory for Memory {
+        fn read(&self, at: u32, len: usize) -> Result<Cow<'_, [u8]>, String> {
+            Ok(Cow::Borrowed(&self.0[at as usize..at as usize + len]))
+        }
+        fn write(&mut self, at: u32, data: &[u8]) -> Result<(), String> {
+            self.0[at as usize..at as usize + data.len()].copy_from_slice(data);
+            Ok(())
+        }
+        fn writable(&self, _: u32, _: usize) -> Result<(), String> {
+            Ok(())
+        }
+        fn copy(&mut self, src: u32, dst: u32, len: usize) -> Result<(), String> {
+            self.0
+                .copy_within(src as usize..src as usize + len, dst as usize);
+            Ok(())
+        }
+    }
 
     // spec: HOST-VIEW-1
     // spec: HOST-VIEW-9
@@ -1924,6 +1941,116 @@ mod tests {
         );
     }
 
+    // spec: HOST-VIEW-3
+    #[test]
+    fn software_video_overlays_match_cpu_composition_without_a_window() {
+        use adv_device::surface::{BlitRect, PixelFormat, Surfaces, frame_mailbox};
+        let mut gpu = pollster::block_on(Gpu::request(!cfg!(host_view))).unwrap();
+        let context = gpu.context().clone();
+        let mut memory = Memory(vec![0; 1024]);
+        let mut surfaces = Surfaces::new(6, 4, 16, 1008, Snapshot::default()).unwrap();
+        let id = surfaces
+            .create(6, 4, false, PixelFormat::Bgra32, &mut memory)
+            .unwrap();
+        memory
+            .write(surfaces[id].pixels, &[31, 63, 95, 255].repeat(24))
+            .unwrap();
+        let (producer, consumer) = frame_mailbox();
+        let wake = WakeEvent::new().unwrap();
+        surfaces.set_frame_mailbox(producer, wake.clone());
+        surfaces.present(id, &memory, surfaces[id].rect()).unwrap();
+        let layer = VideoLayer {
+            frame: VideoFrame {
+                width: 2,
+                height: 1,
+                pitch: 8,
+                bgra: Arc::from([255, 0, 0, 255, 0, 255, 0, 255]),
+            },
+            source: Rect {
+                x: 0,
+                y: 0,
+                w: 2,
+                h: 1,
+            },
+            destination: BlitRect {
+                x: 2,
+                y: 1,
+                w: 2,
+                h: 2,
+            },
+            background: Some((
+                BlitRect {
+                    x: 1,
+                    y: 0,
+                    w: 4,
+                    h: 4,
+                },
+                [9, 0, 0, 255],
+            )),
+            clip: Rect {
+                x: 1,
+                w: 4,
+                ..surfaces[id].rect()
+            },
+            canvas: (6, 4),
+            visible: true,
+            hide_cursor: false,
+        };
+        surfaces.set_video_layer(1, Some(layer), &memory).unwrap();
+        let format = wgpu::TextureFormat::Bgra8Unorm;
+        let presenter = WindowPresenter {
+            surface: None,
+            #[cfg(target_os = "android")]
+            android_window: None,
+            context: context.clone(),
+            configuration: wgpu::SurfaceConfiguration {
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                format,
+                width: 6,
+                height: 4,
+                present_mode: wgpu::PresentMode::Fifo,
+                desired_maximum_frame_latency: 2,
+                alpha_mode: wgpu::CompositeAlphaMode::Opaque,
+                color_space: wgpu::SurfaceColorSpace::Srgb,
+                view_formats: vec![],
+            },
+            compositor: Compositor::new(context.clone(), format),
+            upscaler: crate::Upscaler::Off,
+            scaling: crate::Scaling::Fit,
+            upscaling: None,
+            max_acquire_ns: Cell::new(0),
+            max_configure_ns: 0,
+            upscaled: (0, 0),
+            #[cfg(target_os = "macos")]
+            direct_layer: false,
+        };
+        let mut session = Session::new(presenter, consumer);
+        session.render(6, 4, false, &wake).unwrap();
+        assert_eq!(session.overlays.len(), 1);
+        assert!(session.native.is_none());
+        assert_eq!(session.snapshot.bgra.is_empty(), session.metal_upload);
+        let mut expected = Snapshot::default();
+        session.frames.current().snapshot(&mut expected).unwrap();
+        let output = gpu.image(6, 4).unwrap();
+        session
+            .presenter
+            .compositor
+            .compose_frame(
+                &session.software.as_ref().unwrap().1,
+                output.view(),
+                format,
+                [0., 0., 6., 4.],
+                (6, 4),
+                (6, 4),
+                &session.overlays,
+                &context.submission().unwrap(),
+            )
+            .unwrap();
+        let mut transfer = gpu.readback(&output, None).unwrap();
+        transfer.take_completion_job().unwrap()();
+        assert_eq!(transfer.poll().unwrap().unwrap(), expected.bgra);
+    }
+
     // spec: HOST-VIEW-7
     #[test]
     fn upscalers_process_odd_sized_rgb_frames_without_changing_the_source() {
@@ -2011,235 +2138,6 @@ mod tests {
         let mut transfer = gpu.readback(&source, None).unwrap();
         transfer.take_completion_job().unwrap()();
         assert_eq!(transfer.poll().unwrap().unwrap(), pixels);
-    }
-
-    #[cfg(windows)]
-    fn completed(ui: &mut UiPresenter, wake: &WakeEvent) -> Completed {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            if let Some(done) = ui.poll().unwrap() {
-                return done;
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            assert!(
-                !remaining.is_zero(),
-                "presentation completion did not return"
-            );
-            assert!(wake.wait(Some(remaining)).unwrap());
-        }
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn owned_window_jobs_coalesce_before_conversion_retry_full_and_drain_resize_before_destroy() {
-        for fallback in [false, true]
-            .into_iter()
-            .filter(|fallback| !cfg!(target_os = "macos") || !fallback)
-        {
-            owned_window_regression(fallback);
-        }
-    }
-
-    #[cfg(windows)]
-    fn owned_window_regression(fallback: bool) {
-        use adv_device::surface::{PixelFormat, SurfaceMemory, Surfaces, frame_mailbox};
-        use std::borrow::Cow;
-        struct Memory(Vec<u8>);
-        impl SurfaceMemory for Memory {
-            fn read(&self, at: u32, len: usize) -> Result<Cow<'_, [u8]>, String> {
-                Ok(Cow::Borrowed(&self.0[at as usize..at as usize + len]))
-            }
-            fn write(&mut self, at: u32, data: &[u8]) -> Result<(), String> {
-                self.0[at as usize..at as usize + data.len()].copy_from_slice(data);
-                Ok(())
-            }
-            fn writable(&self, _: u32, _: usize) -> Result<(), String> {
-                Ok(())
-            }
-            fn copy(&mut self, src: u32, dst: u32, len: usize) -> Result<(), String> {
-                self.0
-                    .copy_within(src as usize..src as usize + len, dst as usize);
-                Ok(())
-            }
-        }
-        let mut gpu = pollster::block_on(Gpu::request(fallback)).unwrap();
-        let mut window =
-            crate::window::Window::new("GPU ownership regression", 32, 24, true).unwrap();
-        let context = gpu.context().clone();
-        let execution = WakeEvent::new().unwrap();
-        let wake = WakeEvent::new().unwrap();
-        assert!(context.set_execution_wake(execution.clone()).is_ok());
-        let presenter = window.prepare_native(context.clone()).unwrap();
-        let (producer, consumer) = frame_mailbox();
-        let mut surfaces = Surfaces::new(8, 6, 0x1000, 0x10000, Snapshot::default()).unwrap();
-        surfaces.set_frame_mailbox(producer, wake.clone());
-        let target = surfaces.create_native(&gpu, 8, 6, false).unwrap();
-        gpu.clear(
-            surfaces.native_target(target).unwrap(),
-            Some([0.75, 0.25, 0.125, 1.0]),
-            None,
-        )
-        .unwrap();
-        let mut builder = background::Builder::new(execution.clone()).unwrap();
-        let sender = builder
-            .sender_with_capacity_wake(1, 1, wake.clone())
-            .unwrap();
-        let mut service = builder.start().unwrap();
-        let mut ui = UiPresenter::new(presenter, consumer, sender, wake.clone());
-
-        let started = WakeEvent::new().unwrap();
-        let release = WakeEvent::new().unwrap();
-        let job_started = started.clone();
-        let job_release = release.clone();
-        ui.sender
-            .try_submit(
-                background::Priority::Urgent,
-                background::Task::new(move || {
-                    job_started.notify();
-                    assert!(job_release.wait(Some(Duration::from_secs(10))).unwrap());
-                })
-                .with_wake(wake.clone()),
-            )
-            .unwrap();
-        assert!(started.wait(Some(Duration::from_secs(10))).unwrap());
-        let second_started = WakeEvent::new().unwrap();
-        let second_release = WakeEvent::new().unwrap();
-        let job_started = second_started.clone();
-        let job_release = second_release.clone();
-        ui.sender
-            .try_submit(
-                background::Priority::Urgent,
-                background::Task::new(move || {
-                    job_started.notify();
-                    assert!(job_release.wait(Some(Duration::from_secs(10))).unwrap());
-                })
-                .with_wake(wake.clone()),
-            )
-            .unwrap();
-        for _ in 0..100 {
-            surfaces.present_native(target, &mut gpu).unwrap();
-        }
-        assert!(ui.schedule((32, 24), false).unwrap());
-        assert!(
-            ui.job.as_ref().unwrap().task.is_some(),
-            "full lane returns ownership for retry"
-        );
-        assert!(
-            ui.observer.has_update(),
-            "rejection cannot consume or clear the latest frame"
-        );
-        release.notify();
-        assert!(second_started.wait(Some(Duration::from_secs(10))).unwrap());
-        // Capacity becomes available before the second blocking job finishes.
-        assert!(wake.wait(Some(Duration::from_secs(10))).unwrap());
-        assert!(ui.poll().unwrap().is_none());
-        assert!(ui.job.as_ref().unwrap().ticket.is_some());
-        for _ in 0..50 {
-            surfaces.present_native(target, &mut gpu).unwrap();
-        }
-        second_release.notify();
-        let first = completed(&mut ui, &wake);
-        assert_eq!(first.rendered.serial, 150);
-        assert_eq!(first.rendered.canvas, (8, 6));
-        assert!(matches!(
-            first.rendered.result,
-            DrawResult::Presented | DrawResult::Skipped
-        ));
-        assert_eq!(ui.session.as_ref().unwrap().stats.consumed, 1);
-        assert_eq!(ui.session.as_ref().unwrap().stats.uploads, 0);
-        assert_eq!(gpu.stats().readbacks, 0);
-        assert!(
-            !execution.wait(Some(Duration::ZERO)).unwrap(),
-            "UI jobs never interrupt the guest"
-        );
-
-        // CPU/GDI frames use the exact same final compositor. A burst converts
-        // and uploads once, after the background consumer selects its last frame.
-        let mut memory = Memory(vec![0; 0x11000]);
-        let software = surfaces
-            .create(8, 6, false, PixelFormat::Bgra32, &mut memory)
-            .unwrap();
-        for value in 1..=50 {
-            surfaces
-                .fill_raw(
-                    software,
-                    Rect {
-                        x: 0,
-                        y: 0,
-                        w: 8,
-                        h: 6,
-                    },
-                    value,
-                    &mut memory,
-                )
-                .unwrap();
-            surfaces
-                .present(software, &memory, surfaces[software].rect())
-                .unwrap();
-            surfaces
-                .flush(&memory, adv_device::surface::FlushReason::Immediate)
-                .unwrap();
-        }
-        assert!(window.native_canvas((8, 6)).unwrap());
-        assert!(
-            ui.schedule(window.native_client_size().unwrap(), false)
-                .unwrap()
-        );
-        let second = completed(&mut ui, &wake);
-        assert_eq!(second.rendered.serial, 200);
-        assert_eq!(ui.session.as_ref().unwrap().stats.consumed, 2);
-        assert_eq!(ui.session.as_ref().unwrap().stats.uploads, 1);
-        assert_eq!(
-            ui.session.as_ref().unwrap().snapshot.bgra,
-            [50, 0, 0, 0].repeat(48)
-        );
-        assert_eq!(ui.session.as_ref().unwrap().stats.configurations, 2);
-        // Configuration pause completion intentionally resumes guest Queue use.
-        assert!(execution.wait(Some(Duration::ZERO)).unwrap());
-
-        // A required resize is accepted, cannot be cancelled, and is completed
-        // on shutdown while HWND and its original UI owner are still alive.
-        assert!(window.native_canvas((40, 30)).unwrap());
-        assert!(
-            ui.schedule(window.native_client_size().unwrap(), true)
-                .unwrap()
-        );
-        assert!(!ui.job.as_ref().unwrap().ticket.as_ref().unwrap().cancel());
-        service.shutdown();
-        let last = ui.poll().unwrap().unwrap();
-        assert!(matches!(
-            last.rendered.result,
-            DrawResult::Presented | DrawResult::Skipped
-        ));
-        assert_eq!(ui.session.as_ref().unwrap().stats.configurations, 3);
-        assert_eq!(gpu.stats().readbacks, 0);
-        eprintln!(
-            "native HWND {:?}: {:?}; renderer readbacks={}",
-            context.adapter.get_info(),
-            ui.session.as_ref().unwrap().stats,
-            gpu.stats().readbacks
-        );
-        drop(ui); // Surface and any returned native image die before HWND.
-        drop(window);
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn startup_selects_a_surface_compatible_adapter_and_rejects_a_destroyed_device() {
-        let mut window =
-            crate::window::Window::new("GPU startup regression", 32, 24, true).unwrap();
-        let (gpu, mut presenter) = window.create_native(false).unwrap();
-        assert!(
-            gpu.context()
-                .adapter
-                .is_surface_supported(presenter.surface.as_ref().unwrap())
-        );
-        gpu.context().device.destroy();
-        let _ = gpu.poll();
-        assert!(presenter.configure_exclusive(64, 48).is_err());
-        assert!(gpu.context().submission().is_err());
-        drop(presenter);
-        drop(window);
     }
 
     // spec: HOST-VIEW-3

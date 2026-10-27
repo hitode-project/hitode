@@ -9,7 +9,7 @@
 //!
 //! Arithmetic runs natively under the control word the guest had when the
 //! unit was translated, if it masks every exception, rounds to nearest and
-//! has precision 24, 53 or 64; each instruction checks the control word is
+//! has precision 24, 53 or 64; a run checks the control word is
 //! still that one. Precision 53 takes narrow operands and rounds once in
 //! binary64. Precision 24 also needs single-exact operands, then rounds
 //! that double's significand to 24 bits in integers, keeping the extended
@@ -130,6 +130,7 @@ impl Translator<'_> {
                 }
                 let done = self.x87_body(x, bail);
                 if x.fast == Fast::LoadControl {
+                    self.x87.guarded = false;
                     self.emit(mov(W, X8, X0));
                 }
                 return (done.0, done.1, None);
@@ -217,29 +218,23 @@ impl Translator<'_> {
             // differs.
             self.emit(fmov_from_v(X, X2, v(n)));
             if !self.x87_narrow(n) {
-                let (exact, flagged) = (self.asm.label(), self.asm.label());
-                self.emit_all(&[vumov(3, X16, v(n), 1), lsl_imm(X, X17, X16, 1)]);
-                self.asm.cbz(X, false, X17, exact);
-                // Inexact needs rounding to nearest and PE masked.
-                self.emit(and_imm(W, X17, X8, 0xc00));
-                self.asm.cbz(W, true, X17, bail);
-                self.emit(and_imm(W, X17, X8, u64::from(PE)));
-                self.asm.cbz(W, false, X17, bail);
                 self.emit_all(&[
-                    orr_imm(W, X13, X13, u64::from(PE)),
+                    vumov(3, X16, v(n), 1),
+                    lsl_imm(X, X17, X16, 1),
+                    cmp_imm(X, X17, 0, false),
+                    cset(W, X3, Cond::Ne),
                     eor(X, X17, X16, X2, Lsl, 0),
-                    lsr_imm(X, X17, X17, 63),
-                    bfi(W, X13, X17, 9, 1),
+                    lsr_imm(X, X7, X17, 63),
                 ]);
-                self.asm.b(flagged);
-                self.asm.bind(exact);
-                self.clear_c1();
-                self.asm.bind(flagged);
+                self.store_rounding(width, false, bail);
+                self.store_flags(bail);
             } else {
                 self.clear_c1();
             }
         } else {
-            self.store_rounding(integer, bail);
+            if integer {
+                self.store_rounding(width, true, bail);
+            }
             // The sticky double: the top 53 bits of the value, the lowest
             // ORed with the rest. A low lane of the other sign takes one
             // unit off the high lane's magnitude.
@@ -318,8 +313,10 @@ impl Translator<'_> {
         }
     }
 
-    /// Branches to `to` unless the control word is the one translated for.
-    fn pair_guard(&mut self, to: Label) {
+    /// Caches whether w8's control word matches in its unused bit 16.
+    /// Generic arithmetic reloads w8 and refreshes the bit before rejoining.
+    pub(super) fn pair_control(&mut self) {
+        self.x87.guarded = true;
         let control = u32::from(self.control);
         if control >> 12 != 0 {
             self.emit(sub_imm(W, X16, X8, control >> 12, true));
@@ -327,7 +324,20 @@ impl Translator<'_> {
         } else {
             self.emit(sub_imm(W, X16, X8, control, false));
         }
-        self.asm.cbz(W, true, X16, to);
+        self.emit_all(&[
+            clz(W, X16, X16),
+            lsr_imm(W, X16, X16, 5),
+            bfi(W, X8, X16, 16, 1),
+        ]);
+    }
+
+    fn pair_guard(&mut self, to: Label) {
+        if !self.x87.guarded {
+            self.pair_control();
+        }
+        let label = self.asm.label();
+        self.asm.tbz(false, X8, 16, label);
+        self.push_cold(super::super::Cold::X87Guard { label, generic: to });
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -757,6 +767,7 @@ impl Translator<'_> {
         self.wide_ops(g.op, g.reverse, bail);
         self.pair_from_extended(X0, X1, g.to, g.narrow, bail);
         self.emit(ldrh(X8, X5, runtime::X87_CONTROL));
+        self.pair_control();
         self.asm.b(g.join);
     }
 

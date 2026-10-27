@@ -138,6 +138,7 @@ pub(super) fn create_offscreen(
             surface,
             storage,
             owns_surface: surface.is_some(),
+            lockable: false,
             lock: None,
             container: None,
             levels: Vec::new(),
@@ -178,14 +179,6 @@ pub(super) fn lock_internal(
     }) {
         return outcome;
     }
-    if let Some(r) = resources::resource(env, this.addr()) {
-        let owner = r.device;
-        if recording::has_work(env, owner) {
-            return recording::barrier(env, owner, recording::Reason::Lock, move |env| {
-                lock_internal(env, this, output, rect, flags)
-            });
-        }
-    }
     if let Some((container, level)) = resources::container_level(env, this.addr()) {
         return Outcome::Return(resources::texture_lock(
             env,
@@ -200,7 +193,7 @@ pub(super) fn lock_internal(
         return Outcome::Return(INVALID);
     };
     let back_buffer = lockable_back_buffer(env, this.addr(), r);
-    let gpu_lock = back_buffer || default_offscreen(r);
+    let gpu_lock = back_buffer || r.lockable || default_offscreen(r);
     // DONOTWAIT needs a genuinely nonblocking readiness protocol. Until that
     // exists it is rejected, never silently turned into a Machine wait.
     let allowed_flags = if back_buffer { 0x810 | 0x8000 } else { 0x10 };
@@ -250,6 +243,11 @@ pub(super) fn lock_internal(
         return Outcome::Return(INVALID);
     };
     let storage = r.storage;
+    if recording::has_work(env, owner) {
+        return recording::barrier(env, owner, recording::Reason::Lock, move |env| {
+            lock_internal(env, this, output, rect, flags)
+        });
+    }
     // This is explicit guest staging owned by the same Resource, allocated on
     // the first CPU lock and reused. Creation/Present never read GPU pixels.
     let storage = if storage == 0 {
@@ -381,7 +379,7 @@ pub(super) fn unlock_internal(env: &mut Env<'_>, this: GuestPtr<()>) -> Outcome 
         set_lock(env, id, None);
         return Outcome::Return(0);
     }
-    if !lockable_back_buffer(env, this.addr(), r) && !default_offscreen(r) {
+    if !lockable_back_buffer(env, this.addr(), r) && !r.lockable && !default_offscreen(r) {
         return Outcome::Return(INVALID);
     }
     let provider = env.ext.get::<State>().provider;
@@ -455,31 +453,22 @@ pub(super) fn upload_failed(env: &mut Env<'_>, operation: &Operation, cancelled:
     }
 }
 #[win32(d3d9,name="IDirect3DDevice9::GetRenderTargetData",level=implement)]
-fn transfer_detached(
+pub(super) fn transfer_detached(
     env: &mut Env<'_>,
     this: GuestPtr<()>,
     source: GuestPtr<()>,
     destination: GuestPtr<()>,
 ) -> Outcome {
-    read_target(env, this, source, destination, true)
-}
-pub(super) fn transfer(
-    env: &mut Env<'_>,
-    this: GuestPtr<()>,
-    source: GuestPtr<()>,
-    destination: GuestPtr<()>,
-) -> Outcome {
-    read_target(env, this, source, destination, false)
+    read_target(env, this, source, destination)
 }
 fn read_target(
     env: &mut Env<'_>,
     this: GuestPtr<()>,
     source: GuestPtr<()>,
     destination: GuestPtr<()>,
-    detach: bool,
 ) -> Outcome {
     if let Some(outcome) = settle(env, destination.addr(), move |env| {
-        read_target(env, this, source, destination, detach)
+        read_target(env, this, source, destination)
     }) {
         return outcome;
     }
@@ -487,7 +476,7 @@ fn read_target(
         && recording::has_work(env, owner)
     {
         return recording::barrier(env, owner, recording::Reason::Readback, move |env| {
-            read_target(env, this, source, destination, detach)
+            read_target(env, this, source, destination)
         });
     }
     let Some(owner) = com(env)
@@ -532,7 +521,7 @@ fn read_target(
         return Outcome::Return(INVALID);
     };
     let format = dst.desc.Format;
-    let detach = detach && dst.container.is_none();
+    let detach = dst.container.is_none();
     let Some(length) = format::length(format, dst.desc.Width, dst.desc.Height) else {
         return Outcome::Return(INVALID);
     };

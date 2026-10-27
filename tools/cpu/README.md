@@ -151,10 +151,7 @@ translator work needs no device.
 
 # Running the CPU tests on AArch64
 
-On AArch64 hosts the facade is the a64 engine, so the integration tests drive
-it unchanged. Assertions about the Cranelift execution shape sit in
-`x64_shape!` and are skipped there; tests that only describe that shape (fuel
-per native block, region links, safepoints) are ignored or compiled out on
-AArch64. Run the full suite on a device with
+The facade exposes the a64 engine, and its integration tests run on every
+supported host. Run the full suite on a device with
 `tools/android/run-cpu-tests.ps1 -AllTests -NoFailFast` and judge each log with
 `acceptance.py --strict` against the usual baseline.

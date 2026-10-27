@@ -64,7 +64,7 @@ fn full_x87_units_keep_short_branches_to_cold_code_in_reach() {
         let mut work = Workspace::default();
         let host = HOST_CODE as usize;
         let stubs = Stubs {
-            leaf: host,
+            call: host,
             exit: host,
             dispatch: host,
             lookup: host,
@@ -75,7 +75,7 @@ fn full_x87_units_keep_short_branches_to_cold_code_in_reach() {
             fault: host,
         };
         let features = Features { flagm: false };
-        let leaf = |_, _| false;
+        let no_calls = |_, _| None;
         translate(
             &mut work,
             &mut mem,
@@ -86,7 +86,9 @@ fn full_x87_units_keep_short_branches_to_cold_code_in_reach() {
             features,
             host,
             stubs,
-            &leaf,
+            &no_calls,
+            &|_| None,
+            &|_, _| Vec::new(),
             0x037f,
         );
         assert!(
@@ -114,7 +116,7 @@ fn bytecode_vm_dispatch_instruction_gate() {
     let mut mem = memory(&code, &[]);
     let mut work = Workspace::default();
     let stubs = Stubs {
-        leaf: HOST_CODE as usize,
+        call: HOST_CODE as usize,
         exit: HOST_CODE as usize,
         dispatch: HOST_CODE as usize,
         lookup: HOST_CODE as usize,
@@ -134,18 +136,20 @@ fn bytecode_vm_dispatch_instruction_gate() {
         Features { flagm: false },
         HOST_CODE as usize,
         stubs,
-        &|_, _| false,
+        &|_, _| None,
+        &|_| None,
+        &|_, _| Vec::new(),
         0x037f,
     );
     let branch = work.words().iter().position(|&w| w == br(X17)).unwrap();
     let target_load = work.sites().last().unwrap().0 / 4;
     let before = branch + 1 - target_load;
-    assert_eq!(before, 8, "guest target load through the hit-path br");
+    assert_eq!(before, 9, "guest target load through the hit-path br");
     // LDR (register), option 011: [x17, x19, lsl #3]. The existing
     // encoder's option 010 is UXTW; bit 13 selects the X-register form.
     let resolved = ldr_reg(X, X17, X17, host(0), true) | (1 << 13);
     let baseline = work.words()[2..=branch].to_vec();
-    work.images.push((CODE, 0x30000));
+    work.unit.images.push((CODE, 0x30000));
     mem.protect(DATA, 4096, 1).unwrap();
     translate(
         &mut work,
@@ -157,10 +161,12 @@ fn bytecode_vm_dispatch_instruction_gate() {
         Features { flagm: false },
         HOST_CODE as usize,
         stubs,
-        &|_, _| false,
+        &|_, _| None,
+        &|_| None,
+        &|_, _| Vec::new(),
         0x037f,
     );
-    assert_eq!(work.tables.len(), 1);
+    assert_eq!(work.unit.tables.len(), 1);
     let hot = work.words().iter().position(|&w| w == br(X17)).unwrap();
     assert_eq!(work.words()[hot - 1], resolved);
     let after = 3;
@@ -308,7 +314,7 @@ impl Harness {
             Features { flagm },
             addr(at),
             Stubs {
-                leaf: addr(self.forbidden),
+                call: addr(self.forbidden),
                 exit: addr(self.stubs.exit),
                 dispatch: addr(self.dispatch),
                 lookup: addr(self.forbidden),
@@ -318,11 +324,14 @@ impl Harness {
                 interpret: addr(self.forbidden),
                 fault: addr(self.forbidden),
             },
-            &|_, _| false,
+            &|_, _| None,
+            &|_| None,
+            &|_, _| Vec::new(),
             0x037f,
         );
         assert!(
             !work
+                .unit
                 .trace
                 .insts
                 .iter()
@@ -338,6 +347,9 @@ impl Harness {
         put(offset_of!(runtime::Runtime, cpu), CPU);
         put(offset_of!(runtime::Runtime, window), WINDOW_BASE);
         put(offset_of!(runtime::Runtime, countdown), 100);
+        let permissions = CONTEXT + 0x3000;
+        put(offset_of!(runtime::Runtime, alias_classes), permissions);
+        self.emu.write(permissions, &vec![3; 0x100]);
         self.emu.write(CONTEXT, &context);
         let mut state = vec![0; size_of::<CpuState>()];
         for (n, value) in initial.regs.iter().enumerate() {
@@ -444,7 +456,8 @@ fn bit_scans_preserve_undefined_flags_zero_destinations_and_word_halves() {
         .into_iter()
         .chain((0..32).map(|bit| 1 << bit))
         .collect();
-    for reverse in [false, true] {
+    // TZCNT and LZCNT run as BSF and BSR on this processor.
+    for (reverse, counted) in [(false, false), (true, false), (false, true), (true, true)] {
         for word in [false, true] {
             for dst in 0..8 {
                 for source in 0..3 {
@@ -455,10 +468,11 @@ fn bit_scans_preserve_undefined_flags_zero_destinations_and_word_halves() {
                         let words = [ax, cx, dx, bx, sp, bp, si, di];
                         macro_rules! scan {
                             ($d:expr, $s:expr) => {
-                                if reverse {
-                                    a.bsr($d, $s)
-                                } else {
-                                    a.bsf($d, $s)
+                                match (reverse, counted) {
+                                    (false, false) => a.bsf($d, $s),
+                                    (true, false) => a.bsr($d, $s),
+                                    (false, true) => a.tzcnt($d, $s),
+                                    (true, true) => a.lzcnt($d, $s),
                                 }
                                 .unwrap()
                             };
@@ -488,7 +502,7 @@ fn bit_scans_preserve_undefined_flags_zero_destinations_and_word_halves() {
                             assert_eq!(left, 98);
                             assert_eq!(
                                 got, want,
-                                "reverse={reverse}, word={word}, dst={dst}, source={source}, value={value}, flagm={flagm}"
+                                "reverse={reverse}, counted={counted}, word={word}, dst={dst}, source={source}, value={value}, flagm={flagm}"
                             );
                         }
                     }
@@ -500,22 +514,31 @@ fn bit_scans_preserve_undefined_flags_zero_destinations_and_word_halves() {
 
 // spec: A64-FLAG-2
 #[test]
-fn shifts_by_cl_cover_every_register_and_count_with_live_and_dead_flags() {
+fn shifts_by_cl_cover_registers_memory_and_every_count_with_live_and_dead_flags() {
     let mut h = Harness::new();
-    for dst in 0..8 {
+    for dst in 0..9 {
         for kind in 0..5 {
             for dead in [false, true] {
                 let code = bytes(|a| {
                     a.add(edx, eax).unwrap();
-                    let r = [eax, ecx, edx, ebx, esp, ebp, esi, edi][dst];
-                    match kind {
-                        0 => a.shl(r, cl),
-                        1 => a.shr(r, cl),
-                        2 => a.sar(r, cl),
-                        3 => a.rol(r, cl),
-                        _ => a.ror(r, cl),
+                    macro_rules! shift {
+                        ($dst:expr) => {
+                            match kind {
+                                0 => a.shl($dst, cl),
+                                1 => a.shr($dst, cl),
+                                2 => a.sar($dst, cl),
+                                3 => a.rol($dst, cl),
+                                _ => a.ror($dst, cl),
+                            }
+                            .unwrap()
+                        };
                     }
-                    .unwrap();
+                    if dst == 8 {
+                        shift!(dword_ptr(ebp + 0x1c));
+                        a.mov(edi, dword_ptr(ebp + 0x1c)).unwrap();
+                    } else {
+                        shift!([eax, ecx, edx, ebx, esp, ebp, esi, edi][dst]);
+                    }
                     // SUB writes every flag, making the shift's flags dead.
                     if dead {
                         a.sub(edx, 19).unwrap();
@@ -523,12 +546,15 @@ fn shifts_by_cl_cover_every_register_and_count_with_live_and_dead_flags() {
                 });
                 for count in 0..=255 {
                     let mut state = initial();
-                    state.regs[dst] = 0x8123ffff;
+                    if dst < 8 {
+                        state.regs[dst] = 0x8123ffff;
+                    }
                     state.regs[1] = (state.regs[1] & !255) | count;
-                    let want = reference(&code, &[], &state);
-                    let (got, exit, left) = h.run(&code, &[], &state, false);
+                    let data = [0xff; 0x20];
+                    let want = reference(&code, &data, &state);
+                    let (got, exit, left) = h.run(&code, &data, &state, false);
                     assert_eq!(exit, Exit::Dispatch);
-                    assert_eq!(left, if dead { 97 } else { 98 });
+                    assert_eq!(left, 98 - u64::from(dead) - u64::from(dst == 8));
                     assert_eq!(
                         got, want,
                         "dst={dst}, kind={kind}, dead={dead}, count={count}"
@@ -751,9 +777,9 @@ fn switch_table_recognition_checks_unsigned_bounds_pages_and_index_provenance() 
         let mut mem = memory(&code, &vec![0; 8192]);
         mem.protect(DATA, 8192, 1).unwrap();
         let mut work = Workspace::default();
-        work.images.push((CODE, 0x30000));
+        work.unit.images.push((CODE, 0x30000));
         let stubs = Stubs {
-            leaf: HOST_CODE as usize,
+            call: HOST_CODE as usize,
             exit: HOST_CODE as usize,
             dispatch: HOST_CODE as usize,
             lookup: HOST_CODE as usize,
@@ -777,10 +803,12 @@ fn switch_table_recognition_checks_unsigned_bounds_pages_and_index_provenance() 
                 Features { flagm: false },
                 HOST_CODE as usize,
                 stubs,
-                &|_, _| false,
+                &|_, _| None,
+                &|_| None,
+                &|_, _| Vec::new(),
                 0x037f,
             );
-            let count = work.tables.first().map_or(0, |t| t.targets.len());
+            let count = work.unit.tables.first().map_or(0, |t| t.targets.len());
             assert_eq!(
                 count,
                 if writable_tail { 0 } else { expected },
@@ -827,5 +855,155 @@ fn narrow_immediate_moves_keep_their_value_when_pf_and_af_materialize() {
                 assert_eq!(got, want, "part={part}, recipe={recipe}, flagm={flagm}");
             }
         }
+    }
+}
+
+fn j1_unit(code: &[u8]) -> Workspace {
+    let mut mem = memory(code, &[]);
+    let mut work = Workspace::default();
+    let at = HOST_CODE as usize;
+    translate(
+        &mut work,
+        &mut mem,
+        CODE,
+        &[CODE + code.len() as u32],
+        &|_| false,
+        0,
+        Features { flagm: false },
+        at,
+        Stubs {
+            call: at,
+            exit: at,
+            dispatch: at,
+            lookup: at,
+            lookup_slow: at,
+            ret_miss: at,
+            access: at,
+            interpret: at,
+            fault: at,
+        },
+        &|_, _| None,
+        &|_| None,
+        &|_, _| Vec::new(),
+        0x037f,
+    );
+    work
+}
+
+// spec: A64-FLAG-3, A64-FLAG-5, A64-CTL-7
+#[test]
+fn j1_hot_paths_omit_dead_logic_tests_and_loop_materialization() {
+    let code = bytes(|a| {
+        a.or(eax, ebx).unwrap();
+        a.mov(dword_ptr(edi), eax).unwrap();
+        a.add(ecx, 1).unwrap();
+    });
+    let work = j1_unit(&code);
+    assert!(
+        !work
+            .words()
+            .contains(&tst(W, host(0), host(0), Shift::Lsl, 0))
+    );
+    assert_eq!(work.sites()[0].1.nz, Some(Operand::Guest(0)));
+    let code = bytes(|a| {
+        a.or(eax, ebx).unwrap();
+        a.shl(eax, 3).unwrap();
+        a.mov(dword_ptr(edi), eax).unwrap();
+        a.add(ecx, 1).unwrap();
+    });
+    let work = j1_unit(&code);
+    assert!(!work.words().contains(&mov(W, X10, host(0))));
+    let code = bytes(|a| {
+        let mut top = a.create_label();
+        a.set_label(&mut top).unwrap();
+        a.dec(ecx).unwrap();
+        a.jnz(top).unwrap();
+    });
+    let work = j1_unit(&code);
+    let start = work.code.asm.position(work.code.labels[0]) / 4;
+    let end = work.code.asm.position(work.code.labels[1]) / 4;
+    assert_eq!(
+        &work.words()[start..end],
+        &[sub_imm(W, host(1), host(1), 1, false)]
+    );
+    assert!(
+        work.words()[end..]
+            .iter()
+            .any(|word| word & 0xff00_001f == cbz(W, true, host(1), 0))
+    );
+}
+
+// spec: A64F-FP-7
+#[test]
+fn j1_x87_run_admits_sahf_and_guards_once_until_control_changes() {
+    for change in [false, true] {
+        let code = bytes(|a| {
+            let mut done = a.create_label();
+            a.fld1().unwrap();
+            a.fld1().unwrap();
+            a.fadd_2(st0, st1).unwrap();
+            a.fadd_2(st0, st1).unwrap();
+            if change {
+                a.fldcw(word_ptr(ebx)).unwrap();
+            }
+            a.fadd_2(st0, st1).unwrap();
+            a.fcomp_2(st0, st1).unwrap();
+            a.fnstsw(ax).unwrap();
+            a.sahf().unwrap();
+            a.jb(done).unwrap();
+            a.fld1().unwrap();
+            a.set_label(&mut done).unwrap();
+            a.nop().unwrap();
+        });
+        let work = j1_unit(&code);
+        let hot_end = work
+            .code
+            .marks
+            .iter()
+            .find(|mark| mark.part == Part::Cold)
+            .unwrap()
+            .offset as usize
+            / 4;
+        let hot = &work.words()[..hot_end];
+        let guard = sub_imm(W, X16, temp(1), 0x037f, false);
+        assert_eq!(
+            hot.iter().filter(|&&word| word == guard).count(),
+            if change { 2 } else { 1 }
+        );
+        assert_eq!(
+            hot.iter()
+                .filter(|&&word| word == ldrh(X16, X5, runtime::X87_TAG))
+                .count(),
+            1
+        );
+    }
+}
+
+// spec: A64F-FP-5, A64-REG-5
+#[test]
+fn j1_sse_reuses_mxcsr_and_pe_checks_until_a_control_write() {
+    for control_write in [false, true] {
+        let code = bytes(|a| {
+            a.addss(xmm0, xmm1).unwrap();
+            if control_write {
+                a.ldmxcsr(dword_ptr(ebx)).unwrap();
+            }
+            a.mulss(xmm0, xmm1).unwrap();
+            a.subss(xmm0, xmm1).unwrap();
+        });
+        let work = j1_unit(&code);
+        let hot_end = work
+            .code
+            .marks
+            .iter()
+            .find(|mark| mark.part == Part::Cold)
+            .unwrap()
+            .offset as usize
+            / 4;
+        let loads = work.words()[..hot_end]
+            .iter()
+            .filter(|&&word| word == ldr(W, X13, X5, runtime::MXCSR))
+            .count();
+        assert_eq!(loads, if control_write { 4 } else { 2 });
     }
 }

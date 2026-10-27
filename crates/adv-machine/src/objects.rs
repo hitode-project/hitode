@@ -124,6 +124,7 @@ impl Entry {
 /// One payload table for the process, with independent numeric alias namespaces.
 pub struct Objects {
     table: u64,
+    generation: std::cell::Cell<u64>,
     changed: ObjectChanges,
     changes: std::sync::mpsc::Receiver<(u64, crate::WakePriority)>,
     entries: HashMap<u64, Entry>,
@@ -174,6 +175,7 @@ impl Objects {
 
     pub(crate) fn mark_changed(&self, handle: Handle, priority: crate::WakePriority) {
         if let Some(id) = self.object_id(handle) {
+            self.generation.set(self.generation.get().wrapping_add(1));
             let _ = self.changed.send((id, priority));
         }
     }
@@ -181,6 +183,7 @@ impl Objects {
     pub(crate) fn changed_waiters(&self) -> Vec<(crate::CtxId, crate::WakePriority)> {
         let mut changes = BTreeMap::new();
         for (id, priority) in self.changes.try_iter() {
+            self.generation.set(self.generation.get().wrapping_add(1));
             let previous = changes.entry(id).or_insert(priority);
             *previous = (*previous).min(priority);
         }
@@ -203,6 +206,10 @@ impl Objects {
         }
     }
 
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation.get()
+    }
+
     pub fn reference_limit(&self) -> u32 {
         self.limits.references
     }
@@ -213,6 +220,7 @@ impl Objects {
         let (changed, changes) = std::sync::mpsc::channel();
         Self {
             table,
+            generation: std::cell::Cell::new(0),
             changed,
             changes,
             entries: HashMap::default(),
@@ -477,14 +485,19 @@ impl Objects {
     }
 
     pub fn owned<T: Any>(&self, id: Identity<T>) -> Option<&T> {
-        match &self.entry(id)?.value {
+        if id.table != self.table {
+            return None;
+        }
+        match &self.entries.get(&id.id)?.value {
             Object::Host(value) => value.downcast_ref(),
             _ => None,
         }
     }
 
     pub fn owned_mut<T: Any>(&mut self, id: Identity<T>) -> Option<&mut T> {
-        self.entry(id)?;
+        if id.table != self.table {
+            return None;
+        }
         match &mut self.entries.get_mut(&id.id)?.value {
             Object::Host(value) => value.downcast_mut(),
             _ => None,
@@ -509,6 +522,22 @@ impl Objects {
         let token = self.token(*self.targets.get(&(ns, alias))?);
         self.entry(token)?;
         Some(token)
+    }
+
+    /// `lookup_alias` and `owned` in one pass.
+    pub fn resolve_alias<T: Any>(&self, ns: Namespace, alias: u32) -> Option<(Identity<T>, &T)> {
+        let ns = self.namespace_id(ns)?;
+        let token = self.token(*self.targets.get(&(ns, alias))?);
+        Some((token, self.owned(token)?))
+    }
+
+    /// Whether `alias` names `id`; equals `lookup_alias(ns, alias) == Some(id)`
+    /// for a live identity.
+    pub fn aliases<T: Any>(&self, ns: Namespace, alias: u32, id: Identity<T>) -> bool {
+        id.table == self.table
+            && self
+                .namespace_id(ns)
+                .is_some_and(|ns| self.targets.get(&(ns, alias)) == Some(&id.id))
     }
 
     /// Release one alias reference in precisely this namespace.
@@ -764,6 +793,37 @@ mod tests {
         assert!(objects.insert_host_at(Namespace::DEFAULT, handle, 8u32));
         assert_ne!(objects.object_id(handle), Some(owner));
         assert_eq!(objects.object_id(0), None);
+    }
+
+    #[test]
+    fn single_pass_resolution_matches_lookup_then_owned() {
+        let mut objects = Objects::default();
+        let handle = objects.insert_host(7u32);
+        let id = objects
+            .lookup_alias::<u32>(Namespace::DEFAULT, handle)
+            .unwrap();
+        let (resolved, value) = objects
+            .resolve_alias::<u32>(Namespace::DEFAULT, handle)
+            .unwrap();
+        assert_eq!((resolved, *value), (id, 7));
+        assert!(objects.aliases(Namespace::DEFAULT, handle, id));
+        // Wrong types, foreign namespaces and closed aliases resolve to nothing.
+        assert!(
+            objects
+                .resolve_alias::<u64>(Namespace::DEFAULT, handle)
+                .is_none()
+        );
+        let other = objects.new_namespace().unwrap();
+        assert!(objects.resolve_alias::<u32>(other, handle).is_none());
+        assert!(!objects.aliases(other, handle, id));
+        objects.close(handle);
+        assert!(
+            objects
+                .resolve_alias::<u32>(Namespace::DEFAULT, handle)
+                .is_none()
+        );
+        assert!(!objects.aliases(Namespace::DEFAULT, handle, id));
+        assert!(objects.owned(id).is_none());
     }
 
     #[test]

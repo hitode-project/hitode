@@ -87,10 +87,7 @@ impl HostFeatures {
 
     #[cfg(any(
         test,
-        all(
-            target_arch = "aarch64",
-            any(target_os = "linux", target_os = "android", target_os = "macos")
-        )
+        any(target_os = "linux", target_os = "android", target_os = "macos")
     ))]
     fn insert(&mut self, feature: Self, available: bool) {
         if available {
@@ -142,14 +139,8 @@ impl fmt::Display for HostFeatures {
 
 // Bit positions come from Linux UAPI arch/arm64/include/uapi/asm/hwcap.h:
 // https://github.com/torvalds/linux/blob/v6.12/arch/arm64/include/uapi/asm/hwcap.h
-// FP16 requires FPHP and ASIMDHP, matching Rust std_detect and Cranelift native.
-#[cfg(any(
-    test,
-    all(
-        target_arch = "aarch64",
-        any(target_os = "linux", target_os = "android")
-    )
-))]
+// FP16 requires FPHP and ASIMDHP, matching Rust std_detect.
+#[cfg(any(test, any(target_os = "linux", target_os = "android")))]
 fn from_auxv(hwcap: u64, hwcap2: u64) -> HostFeatures {
     let mut features = HostFeatures::EMPTY;
     for (feature, mask) in [
@@ -179,10 +170,7 @@ fn from_auxv(hwcap: u64, hwcap2: u64) -> HostFeatures {
     features
 }
 
-#[cfg(all(
-    target_arch = "aarch64",
-    any(target_os = "linux", target_os = "android")
-))]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn detect() -> HostFeatures {
     // SAFETY: getauxval reads the process's immutable OS-provided auxiliary vector.
     unsafe {
@@ -193,7 +181,7 @@ fn detect() -> HostFeatures {
     }
 }
 
-#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn detect() -> HostFeatures {
     // Exact, case-sensitive names exported by Apple XNU arm_features.inc and
     // bsd/kern/kern_mib.c (ARM_FEATURE_FLAG). Missing keys remain unavailable.
@@ -235,10 +223,7 @@ fn detect() -> HostFeatures {
     features
 }
 
-#[cfg(not(all(
-    target_arch = "aarch64",
-    any(target_os = "linux", target_os = "android", target_os = "macos")
-)))]
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
 fn detect() -> HostFeatures {
     HostFeatures::EMPTY
 }
@@ -299,10 +284,7 @@ mod tests {
         assert_eq!(from_auxv(1 << 27, 1 << 20).to_string(), "flagm,afp");
     }
 
-    #[cfg(all(
-        target_arch = "aarch64",
-        any(target_os = "linux", target_os = "android", target_os = "macos")
-    ))]
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
     #[test]
     fn agrees_with_rust_runtime_detection() {
         let features = HostFeatures::detected();

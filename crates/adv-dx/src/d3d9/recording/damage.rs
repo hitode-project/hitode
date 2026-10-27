@@ -1,10 +1,10 @@
-//! Conservative per-subresource command comparisons and eight-frame slot history.
+//! Recording-time sequence realignment and conservative eight-frame slot damage.
 use super::*;
 use adv_device::{
     gpu::{AttributeFormat, Image},
     surface::Rect,
 };
-use std::collections::HashSet;
+use rustc_hash::FxHashSet as HashSet;
 pub(super) mod sampling;
 
 pub(super) fn image(operation: &Operation) -> Option<&Image> {
@@ -34,7 +34,7 @@ pub(super) fn bounds(env: &Env<'_>, device: &Device, operation: &Operation) -> R
     }
 }
 fn draw_bounds(env: &Env<'_>, device: &Device, d: &fixed::Draw) -> Option<Rect> {
-    use crate::shader::interpreter::{self, Constants, NoTextures};
+    use crate::shader::interpreter::{self, NoTextures};
     let mut positions = [[0.; 4]; 64];
     let count;
     let point = d.programmable.as_ref().filter(|p| p.parameters[2][3] != 0);
@@ -55,7 +55,7 @@ fn draw_bounds(env: &Env<'_>, device: &Device, d: &fixed::Draw) -> Option<Rect> 
             return None;
         }
         count = d.vertices.len();
-        for (out, v) in positions.iter_mut().zip(&d.vertices) {
+        for (out, v) in positions.iter_mut().zip(d.vertices.iter()) {
             *out = v.position;
         }
     } else {
@@ -64,26 +64,28 @@ fn draw_bounds(env: &Env<'_>, device: &Device, d: &fixed::Draw) -> Option<Rect> 
             return None;
         }
         count = p.vertex_count as usize;
-        let shader = shaders::bound(env, device.shaders.vertex?)?;
-        let translation = shader.translation.as_ref().ok()?;
-        let constants = Constants {
-            f: p.vertex_constants.floats,
-            i: p.vertex_constants.integers,
-            b: p.vertex_constants.booleans,
-            bump_matrix: p.vertex_constants.bump_matrix,
-            bump_luminance: p.vertex_constants.bump_luminance,
-        };
-        for n in 0..p.vertex_count {
-            let input = vertex_input(p, n)?;
-            let output =
-                interpreter::run(&shader.parsed, &input, &constants, &mut NoTextures).ok()?;
-            if point.is_some() && translation.writes_point_size {
-                margin = margin.max(1. + point_size(output.point_size)? * 0.5);
+        if p.parameters[15][0] != 0 {
+            for n in 0..p.vertex_count {
+                let input = vertex_input(p, n)?;
+                positions[n as usize] =
+                    programmable::transformed::position(input.v[0], d.state.viewport)?;
             }
-            let mut position = output.position;
-            position[0] += position[3] / d.state.viewport.width;
-            position[1] -= position[3] / d.state.viewport.height;
-            positions[n as usize] = position;
+        } else {
+            let shader = shaders::bound(env, device.shaders.vertex?)?;
+            let translation = shader.translation.as_ref().ok()?;
+            for n in 0..p.vertex_count {
+                let input = vertex_input(p, n)?;
+                let output =
+                    interpreter::run(&shader.parsed, &input, &p.vertex_constants, &mut NoTextures)
+                        .ok()?;
+                if point.is_some() && translation.writes_point_size {
+                    margin = margin.max(1. + point_size(output.point_size)? * 0.5);
+                }
+                let mut position = output.position;
+                position[0] += position[3] / d.state.viewport.width;
+                position[1] -= position[3] / d.state.viewport.height;
+                positions[n as usize] = position;
+            }
         }
     }
     let v = d.state.viewport;
@@ -119,13 +121,25 @@ fn draw_bounds(env: &Env<'_>, device: &Device, d: &fixed::Draw) -> Option<Rect> 
     .clipped(full(&d.target.image));
     Some(d.state.scissor.map_or(r, |s| r.clipped(s)))
 }
-fn vertex_input(
+pub(in crate::d3d9) fn vertex_input(
     p: &adv_device::gpu::ProgrammableDraw,
     n: u32,
 ) -> Option<crate::shader::interpreter::Inputs> {
     let mut input = crate::shader::interpreter::Inputs::default();
     for stream in &p.streams {
         for a in &stream.attributes {
+            if a.format == AttributeFormat::Bgra8Unorm {
+                let mut bytes = [0; 4];
+                stream.bytes.read_vertex(
+                    n as usize,
+                    stream.stride as usize,
+                    a.offset as usize,
+                    &mut bytes,
+                )?;
+                input.v[a.location as usize] =
+                    [bytes[2], bytes[1], bytes[0], bytes[3]].map(|v| f32::from(v) / 255.);
+                continue;
+            }
             if !matches!(
                 a.format,
                 AttributeFormat::Float1
@@ -136,15 +150,15 @@ fn vertex_input(
                 return None;
             }
             let mut v = [0., 0., 0., 1.];
-            let start = (n * stream.stride + a.offset) as usize;
-            for (component, bytes) in stream
-                .bytes
-                .get(start..start + a.format.size() as usize)?
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .enumerate()
-            {
+            let mut attribute = [0; 16];
+            let bytes = &mut attribute[..a.format.size() as usize];
+            stream.bytes.read_vertex(
+                n as usize,
+                stream.stride as usize,
+                a.offset as usize,
+                bytes,
+            )?;
+            for (component, bytes) in bytes.as_chunks::<4>().0.iter().enumerate() {
                 v[component] = f32::from_le_bytes(*bytes);
             }
             *input.v.get_mut(a.location as usize)? = v;
@@ -207,7 +221,11 @@ impl Damage {
 #[derive(Default)]
 struct Sequence {
     entries: Vec<(u128, Rect)>,
-    samples: HashMap<usize, Samples>,
+    samples: HashMap<usize, Arc<Samples>>,
+    index: HashMap<u128, Vec<usize>>,
+    cursor: usize,
+    damage: Damage,
+    pending: Vec<(usize, usize)>,
     last_write: u64,
     full: Rect,
     view: Rect,
@@ -225,6 +243,49 @@ struct History {
     seen: u64,
 }
 impl History {
+    fn record(&mut self, key: u128, bounds: Rect, samples: Arc<Samples>) {
+        let s = &mut self.next;
+        let at = s.entries.len();
+        let old = self.previous.index.get(&key).and_then(|positions| {
+            let first = positions.partition_point(|&n| n < s.cursor);
+            positions[first..]
+                .iter()
+                .copied()
+                .find(|&n| self.previous.entries[n].1 == bounds)
+        });
+        if let Some(old) = old {
+            for &(_, r) in &self.previous.entries[s.cursor..old] {
+                s.damage.add(r);
+            }
+            s.cursor = old + 1;
+            if let Some(samples) = self.previous.samples.get(&old) {
+                s.samples.insert(at, samples.clone());
+            }
+        } else {
+            if self
+                .previous
+                .entries
+                .get(s.cursor)
+                .is_some_and(|e| e.1 == bounds)
+                && self
+                    .previous
+                    .samples
+                    .get(&s.cursor)
+                    .is_some_and(|old| old.base == samples.base)
+                && !samples.reads.is_empty()
+            {
+                s.pending.push((s.cursor, at));
+                s.cursor += 1;
+            } else {
+                s.damage.add(bounds);
+            }
+            if !samples.reads.is_empty() {
+                s.samples.insert(at, samples);
+            }
+        }
+        s.index.entry(key).or_default().push(at);
+        s.entries.push((key, bounds));
+    }
     fn advance(&mut self, force: bool, changes: &HashMap<Content, Rect>) -> (Rect, Rect) {
         let next = &self.next;
         let mut changed = Damage::default();
@@ -232,28 +293,15 @@ impl History {
             changed.add(next.full);
             self.slots.clear();
         } else {
-            for n in 0..self.previous.entries.len().max(next.entries.len()) {
-                let old = self.previous.entries.get(n);
-                let new = next.entries.get(n);
-                if old != new {
-                    if let (Some((_, old_bounds)), Some((_, bounds)), Some(previous), Some(samples)) = (
-                        old,
-                        new,
-                        self.previous.samples.get(&n),
-                        next.samples.get(&n),
-                    ) && old_bounds == bounds
-                        && let Some(local) = samples.changed(previous, changes, *bounds)
-                    {
-                        changed.add(local);
-                        continue;
-                    }
-                    if let Some((_, r)) = old {
-                        changed.add(*r);
-                    }
-                    if let Some((_, r)) = new {
-                        changed.add(*r);
-                    }
-                }
+            changed.extend(&next.damage);
+            for &(_, bounds) in &self.previous.entries[next.cursor..] {
+                changed.add(bounds);
+            }
+            for &(old, new) in &next.pending {
+                let (_, bounds) = next.entries[new];
+                let local =
+                    next.samples[&new].changed(&self.previous.samples[&old], changes, bounds);
+                changed.add(local.unwrap_or(bounds));
             }
         }
         self.serial += 1;
@@ -281,8 +329,18 @@ impl History {
         std::mem::swap(&mut self.previous, &mut self.next);
         self.next.entries.clear();
         self.next.samples.clear();
+        self.next.index.clear();
+        self.next.cursor = 0;
+        self.next.damage = Damage::default();
+        self.next.pending.clear();
         result
     }
+}
+type Write = (Content, u128, Rect, Rect, u128, bool, Arc<Samples>);
+pub(super) struct Record {
+    writes: Vec<Write>,
+    reads: Vec<Content>,
+    view: Rect,
 }
 #[derive(Default)]
 pub(super) struct Analysis {
@@ -301,16 +359,22 @@ impl Analysis {
             .get(content)
             .is_some_and(|h| !h.next.entries.is_empty())
     }
-    pub fn record(&mut self, p: &key::Prepared, command: u128, contents: &Contents) {
-        let Some(image) = image(&p.operation) else {
-            return;
+    pub fn record(
+        &mut self,
+        p: &key::Prepared,
+        command: u128,
+        contents: &Contents,
+        slot: Option<u128>,
+    ) -> Arc<Record> {
+        let image = image(&p.operation).unwrap();
+        let slot = slot.unwrap_or_else(|| hash(image.view()));
+        let mut record = Record {
+            writes: Vec::new(),
+            reads: p.reads.clone(),
+            view: full(image),
         };
-        let slot = hash(image.view());
-        self.ordinal += 1;
         for &(k, overwrite) in &p.writes {
-            self.unsafe_order |= self.reads.contains(&k);
-            let s = &mut self.histories.entry(k).or_default().next;
-            self.unsafe_order |= !s.entries.is_empty() && s.slot != slot;
+            let s = &self.histories.entry(k).or_default().next;
             let depth = match &p.operation {
                 Operation::Draw(d) => d.target.depth(),
                 Operation::Clear { target, .. } => target.depth(),
@@ -327,10 +391,7 @@ impl Analysis {
                     h: depth.height(),
                 }
             };
-            s.full = bounds;
-            s.last_write = self.ordinal;
-            s.view = full(image);
-            s.shape = hash((
+            let shape = hash((
                 rect(bounds),
                 if k.2 == 0 {
                     image.alpha_mode() as u8
@@ -338,46 +399,75 @@ impl Analysis {
                     depth.unwrap().format() as u8
                 },
             ));
-            s.slot = slot;
-            let bounds = p.bounds.clipped(bounds);
-            if s.entries.is_empty() {
-                s.independent = overwrite && bounds == s.full;
-            }
+            let full = bounds;
+            let bounds = p.bounds.clipped(full);
+            let independent = if s.entries.is_empty() {
+                overwrite && bounds == full
+            } else {
+                s.independent
+            };
             // Only drawing can depend on the old values inside its write bounds.
             // Clears and copies overwrite that region even when the attachment is larger.
             let key = hash((
                 p.write_key(k, command),
-                (matches!(p.operation, Operation::Draw(_)) && !s.independent)
+                (matches!(p.operation, Operation::Draw(_)) && !independent)
                     .then(|| contents.get(&k).copied().unwrap_or(0)),
             ));
-            if !p.samples.is_empty() {
+            let samples = if p.samples.is_empty() {
+                Samples::default()
+            } else {
                 let external: Vec<_> = p
                     .reads
                     .iter()
                     .filter(|k| !p.samples.iter().any(|r| r.source == **k))
                     .map(|k| (*k, contents.get(k).copied().unwrap_or(0)))
                     .collect();
-                s.samples.insert(
-                    s.entries.len(),
-                    Samples {
-                        base: hash((
-                            p.key,
-                            external,
-                            (matches!(p.operation, Operation::Draw(_)) && !s.independent)
-                                .then(|| contents.get(&k).copied().unwrap_or(0)),
-                        )),
-                        reads: p
-                            .samples
-                            .iter()
-                            .map(|r| (*r, contents.get(&r.source).copied().unwrap_or(0)))
-                            .collect(),
-                    },
-                );
+                Samples {
+                    base: hash((
+                        p.key,
+                        external,
+                        (matches!(p.operation, Operation::Draw(_)) && !independent)
+                            .then(|| contents.get(&k).copied().unwrap_or(0)),
+                    )),
+                    reads: p
+                        .samples
+                        .iter()
+                        .map(|r| (*r, contents.get(&r.source).copied().unwrap_or(0)))
+                        .collect(),
+                }
+            };
+            record
+                .writes
+                .push((k, key, bounds, full, shape, overwrite, Arc::new(samples)));
+        }
+        let record = Arc::new(record);
+        self.replay(&record, slot);
+        record
+    }
+    pub fn independent(&self, k: &Content) -> bool {
+        self.histories
+            .get(k)
+            .is_some_and(|h| h.next.independent && !h.next.entries.is_empty())
+    }
+    pub fn replay(&mut self, record: &Record, slot: u128) {
+        self.ordinal += 1;
+        for &(k, key, bounds, full, shape, overwrite, ref samples) in &record.writes {
+            self.unsafe_order |= self.reads.contains(&k);
+            let history = self.histories.entry(k).or_default();
+            let s = &mut history.next;
+            self.unsafe_order |= !s.entries.is_empty() && s.slot != slot;
+            s.full = full;
+            s.last_write = self.ordinal;
+            s.view = record.view;
+            s.shape = shape;
+            s.slot = slot;
+            if s.entries.is_empty() {
+                s.independent = overwrite && bounds == full;
             }
-            s.entries.push((key, bounds));
+            history.record(key, bounds, samples.clone());
         }
         self.reads
-            .extend(p.reads.iter().copied().filter(|k| k.2 == 0));
+            .extend(record.reads.iter().copied().filter(|k| k.2 == 0));
     }
     pub fn plan(&mut self, force: bool) {
         if self.planned {
@@ -391,7 +481,7 @@ impl Analysis {
             .map(|(k, h)| (*k, h.next.last_write))
             .collect();
         order.sort_unstable_by_key(|(_, last)| *last);
-        let mut changes = HashMap::new();
+        let mut changes = HashMap::default();
         for (content, _) in order {
             let h = self.histories.get_mut(&content).unwrap();
             let slot = h.next.slot;
@@ -427,8 +517,10 @@ impl Analysis {
     }
     pub fn finish(&mut self) {
         for h in self.histories.values_mut() {
-            h.next.entries.clear();
-            h.next.samples.clear();
+            if !self.planned && !h.next.entries.is_empty() {
+                std::mem::swap(&mut h.previous, &mut h.next);
+            }
+            h.next = Sequence::default();
         }
         self.reads.clear();
         self.ordinal = 0;

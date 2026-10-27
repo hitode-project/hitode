@@ -9,7 +9,7 @@ import unittest
 from unittest.mock import patch
 
 from sample_matrix import (analyze_report, diagnostic_completeness, milestones, quick_samples, run,
-                           sample_exe, validate_native_baseline, import_warm_archives)
+                           sample_exe, validate_native_baseline)
 
 
 class CampaignTests(unittest.TestCase):
@@ -28,13 +28,15 @@ class CampaignTests(unittest.TestCase):
             def launch(command, **kwargs):
                 self.assertEqual(command[1], "fixture.exe")
                 self.assertEqual(kwargs["cwd"], game.parent)
+                self.assertIn("--wine", command)
+                self.assertIn("--codec-kernels", command)
                 report = Path(command[command.index("--report") + 1])
                 report.write_text(json.dumps({"exe": command[1], "frames": 1}))
                 return SimpleNamespace(wait=lambda timeout: 0)
 
-            args = argparse.Namespace(manifest=manifest, only=None, evidence=None, binary=binary,
+            args = argparse.Namespace(wine=root, manifest=manifest, only=None, evidence=None, binary=binary,
                                       output=root / "output", seconds=1, timeout_grace=1,
-                                      mode="hidden", api_mode="strict", codec="native", trace=False)
+                                      mode="hidden", codec="native", trace=False)
             with patch.dict(os.environ, {"ADV_SAMPLES": str(samples)}), \
                     patch("sample_matrix.subprocess.Popen", side_effect=launch):
                 run(args)
@@ -46,32 +48,13 @@ class CampaignTests(unittest.TestCase):
             result = json.loads((args.output / "results.json").read_text())["samples"][0]
             self.assertEqual(result["command"][1], "$ADV_SAMPLES/title/fixture.exe")
 
-    def test_relative_samples_are_read_only_inputs_under_the_samples_root(self):
+    def test_relative_samples_resolve_under_the_samples_root(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             (root / "fixture.exe").write_bytes(b"fixture")
             with patch.dict(os.environ, {"ADV_SAMPLES": str(root)}):
                 self.assertEqual(sample_exe({"exe": "fixture.exe"}), root / "fixture.exe")
 
-    def test_warm_archives_require_matching_inputs_and_copy_only_cache_files(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory).resolve()
-            source = root / "cold"
-            overlay = source / "one" / "overlay"
-            overlay.mkdir(parents=True)
-            for name in ("jit-warm.bin", "jit-code.bin", "guest-save.dat"):
-                (overlay / name).write_bytes(b"fixture")
-            (source / "results.json").write_text(json.dumps({"binary_sha256": "host", "samples": [
-                {"id": "one", "guest_exe_sha256": "guest", "codepage": 932}]}))
-            destination = root / "hot"
-            destination.mkdir()
-            sample = {"id": "one", "codepage": 932}
-            for binary, guest in (("other", "guest"), ("host", "other")):
-                with self.assertRaisesRegex(ValueError, "does not match"):
-                    import_warm_archives(source, destination, sample, binary, guest)
-            inputs = import_warm_archives(source, destination, sample, "host", "guest")
-            self.assertEqual(set(inputs), {"jit-warm.bin", "jit-code.bin"})
-            self.assertEqual({p.name for p in (destination / "overlay").iterdir()}, set(inputs))
 
     def test_quick_gate_prefers_marked_samples_then_each_engines_first(self):
         samples = [{"id": "a1", "engine": "A"}, {"id": "a2", "engine": "A"},
@@ -86,7 +69,7 @@ class CampaignTests(unittest.TestCase):
             manifest = root / "samples.json"
             manifest.write_text(json.dumps({"samples": [
                 {"id": "one", "exe": str(root / "x.exe"), "min_seconds": 5}]}), encoding="utf-8")
-            args = argparse.Namespace(manifest=manifest, only=None, evidence=None, quick=False)
+            args = argparse.Namespace(wine=root, manifest=manifest, only=None, evidence=None, quick=False)
             with self.assertRaisesRegex(ValueError, "min_seconds_reason"):
                 run(args)
 
@@ -126,9 +109,9 @@ class CampaignTests(unittest.TestCase):
                 launched.append(Path(command[command.index("--report") + 1]).parent.name)
                 return SimpleNamespace(wait=lambda timeout: 0)
 
-            args = argparse.Namespace(manifest=manifest, only=None, evidence=None, binary=game,
+            args = argparse.Namespace(wine=root, manifest=manifest, only=None, evidence=None, binary=game,
                                       output=root / "output", seconds=1, timeout_grace=1, quick=True,
-                                      mode="hidden", api_mode="discovery", codec="native", trace=False)
+                                      mode="hidden", codec="native", trace=False)
             with patch("sample_matrix.subprocess.Popen", side_effect=launch):
                 run(args)
             self.assertEqual(launched, ["one", "three"])
@@ -161,9 +144,9 @@ class CampaignTests(unittest.TestCase):
                                                "api": {"mode": "discovery"}}), encoding="utf-8")
                 return SimpleNamespace(wait=lambda timeout: 0)
 
-            args = argparse.Namespace(manifest=manifest, only=None, evidence=None, binary=game,
+            args = argparse.Namespace(wine=root, manifest=manifest, only=None, evidence=None, binary=game,
                                       output=root / "output", seconds=1, timeout_grace=1,
-                                      mode="hidden", api_mode="discovery", codec="native", trace=False)
+                                      mode="hidden", codec="native", trace=False)
             with patch("sample_matrix.subprocess.Popen", side_effect=launch):
                 run(args)
             result = json.loads((args.output / "results.json").read_text(encoding="utf-8"))
@@ -188,9 +171,9 @@ class CampaignTests(unittest.TestCase):
                                                "api": {"mode": "discovery"}}), encoding="utf-8")
                 return SimpleNamespace(wait=lambda timeout: 0)
 
-            args = argparse.Namespace(manifest=manifest, only=None, evidence=None, binary=game,
+            args = argparse.Namespace(wine=root, manifest=manifest, only=None, evidence=None, binary=game,
                                       output=root / "output", seconds=30, timeout_grace=1,
-                                      mode="hidden", api_mode="discovery", codec="native", trace=False)
+                                      mode="hidden", codec="native", trace=False)
             with patch("sample_matrix.subprocess.Popen", side_effect=launch):
                 run(args)
             result = json.loads((args.output / "results.json").read_text(encoding="utf-8"))["samples"][0]
@@ -218,9 +201,9 @@ class CampaignTests(unittest.TestCase):
                                                    "frames": 1}), encoding="utf-8")
                     return SimpleNamespace(wait=lambda timeout: 0)
 
-                args = argparse.Namespace(manifest=manifest, only=None, evidence=None, binary=game,
+                args = argparse.Namespace(wine=root, manifest=manifest, only=None, evidence=None, binary=game,
                                           output=root / "output", seconds=1, timeout_grace=1,
-                                          mode="hidden", api_mode="discovery", codec="native", trace=trace)
+                                          mode="hidden", codec="native", trace=trace)
                 with patch("sample_matrix.subprocess.Popen", side_effect=launch), patch("sample_matrix.print") as console:
                     run(args)
                 hint = next(call.args[0] for call in console.call_args_list if "guest exited" in call.args[0])

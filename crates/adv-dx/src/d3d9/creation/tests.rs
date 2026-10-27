@@ -2,6 +2,26 @@ use super::super::shaders::{get_pixel, get_vertex, set_pixel, set_vertex};
 use super::*;
 use adv_cpu::backend::Guest;
 
+// spec: WINE-GFX-8, GFX-CAP-3
+#[test]
+fn disabling_npatches_succeeds_without_supporting_tessellation() {
+    let mut m = super::super::tests::machine();
+    let mut env = Env {
+        context: m.sys.current,
+        cpu: &mut m.cpu,
+        sys: &mut m.sys,
+        ext: &mut m.ext,
+        thunk: 0,
+    };
+    let (pointer, _, _, _) = super::super::tests::setup(&mut env);
+    let this = GuestPtr::new(pointer);
+    let versions = device(&env, pointer).unwrap().versions;
+    assert_eq!(set_npatch(&mut env, this, 0.0), 0);
+    assert_eq!(set_npatch(&mut env, this, 1.0), UNAVAILABLE);
+    assert_eq!(set_npatch(&mut env, this, -0.0), 0);
+    assert_eq!(device(&env, pointer).unwrap().versions, versions);
+}
+
 #[test]
 fn dialog_box_mode_is_inert_outside_scene_and_fullscreen_requires_a_gdi_back_buffer() {
     let mut m = super::super::tests::machine();

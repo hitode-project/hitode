@@ -122,7 +122,7 @@ pub fn register(base: usize, size: usize, category: Category) -> Option<Registra
     let sink = sink()?;
     // Android allocator pointers can carry a top-byte tag; instruction PCs do
     // not. Perf maps must use the canonical host address, not the pointer tag.
-    #[cfg(all(target_os = "android", target_arch = "aarch64"))]
+    #[cfg(target_os = "android")]
     let base = base & 0x00ff_ffff_ffff_ffff;
     if size == 0 || base.checked_add(size).is_none() {
         return None;

@@ -1,3 +1,4 @@
+mod alpha;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{
     Arc, Mutex, OnceLock,
@@ -117,7 +118,7 @@ impl NativeContext {
         }
     }
     pub fn submission(&self) -> Result<Submission<'_>, Error> {
-        self.submission_for(SwitchReason::Other)
+        self.enter_submission()
     }
     fn submission_for(&self, _reason: SwitchReason) -> Result<Submission<'_>, Error> {
         let submission = self.enter_submission()?;
@@ -155,7 +156,16 @@ impl Submission<'_> {
             .unwrap()
             .flush(&self.context.queue);
     }
+    fn select_wgpu(&self) {
+        #[cfg(target_vendor = "apple")]
+        self.context
+            .pending
+            .lock()
+            .unwrap()
+            .flush_metal(SwitchReason::Other);
+    }
     pub fn write_buffer(&self, buffer: &wgpu::Buffer, offset: u64, data: &[u8]) {
+        self.select_wgpu();
         self.flush();
         self.context.queue.write_buffer(buffer, offset, data);
     }
@@ -166,6 +176,7 @@ impl Submission<'_> {
         layout: wgpu::TexelCopyBufferLayout,
         size: wgpu::Extent3d,
     ) {
+        self.select_wgpu();
         self.flush();
         self.context
             .queue
@@ -175,10 +186,12 @@ impl Submission<'_> {
         &self,
         commands: impl IntoIterator<Item = wgpu::CommandBuffer>,
     ) -> wgpu::SubmissionIndex {
+        self.select_wgpu();
         self.flush();
         self.context.queue.submit(commands)
     }
     pub fn present(&self, texture: wgpu::SurfaceTexture) {
+        self.select_wgpu();
         self.flush();
         self.context.queue.present(texture);
     }
@@ -409,6 +422,8 @@ pub struct NativeFrame {
     /// What recent publications changed, set when the frame is published.
     pub damage: crate::surface::FrameDamage,
     context: NativeContext,
+    #[cfg(target_vendor = "apple")]
+    completion: Option<metal::DisplayCompletion>,
     _pin: Arc<FramePin>,
 }
 impl NativeFrame {
@@ -503,6 +518,7 @@ pub struct Gpu {
     pipeline_order: VecDeque<PipelineKey>,
     pipeline_limit: usize,
     programmable: program::Cache,
+    alpha_upload: OnceLock<alpha::Upload>,
     attachment_scratch: Option<Image>,
     pub(super) clip: Option<Rect>,
     samplers: HashMap<Sampler, wgpu::Sampler>,
@@ -630,8 +646,7 @@ impl Gpu {
             _software: software.clone(),
         };
         #[cfg(target_vendor = "apple")]
-        if cfg!(target_arch = "aarch64")
-            && std::env::var("ADV_GPU_BACKEND").as_deref() != Ok("wgpu")
+        if std::env::var("ADV_GPU_BACKEND").as_deref() != Ok("wgpu")
             && context.adapter.get_info().backend == wgpu::Backend::Metal
         {
             context.pending.lock().unwrap().metal = Some(metal::State::new(&context)?);
@@ -727,6 +742,7 @@ impl Gpu {
             pipeline_order: VecDeque::new(),
             pipeline_limit: MAX_PIPELINES,
             programmable: program::Cache::default(),
+            alpha_upload: OnceLock::new(),
             attachment_scratch: None,
             clip: None,
             samplers: HashMap::new(),
@@ -774,6 +790,7 @@ impl Gpu {
             pipeline_order: VecDeque::new(),
             pipeline_limit: self.pipeline_limit,
             programmable: program::Cache::default(),
+            alpha_upload: OnceLock::new(),
             attachment_scratch: None,
             clip: None,
             samplers: HashMap::new(),
@@ -1833,6 +1850,8 @@ impl Gpu {
             &submission,
         )?;
         submission.flush();
+        #[cfg(target_vendor = "apple")]
+        let completion = submission.native_completion();
         self.stats.native_frames += 1;
         let pin = FramePin::new(&snapshot)?;
         Ok(NativeFrame {
@@ -1840,6 +1859,8 @@ impl Gpu {
             serial,
             damage: Default::default(),
             context: self.context.clone(),
+            #[cfg(target_vendor = "apple")]
+            completion,
             _pin: pin,
         })
     }
@@ -1869,12 +1890,16 @@ impl Gpu {
         self.own(&image)?;
         let pin = FramePin::new(&image)?;
         submission.flush();
+        #[cfg(target_vendor = "apple")]
+        let completion = submission.native_completion();
         self.stats.native_frames += 1;
         Ok(NativeFrame {
             image,
             serial,
             damage: Default::default(),
             context: self.context.clone(),
+            #[cfg(target_vendor = "apple")]
+            completion,
             _pin: pin,
         })
     }

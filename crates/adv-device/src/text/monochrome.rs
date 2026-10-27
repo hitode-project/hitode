@@ -1,8 +1,7 @@
 //! One-bit text retains pixel indices even when both palette colours are equal.
-#[cfg(not(windows))]
+
 use super::*;
 
-#[cfg(not(windows))]
 pub(super) fn paint(
     text: &mut Text,
     request: &FontRequest,
@@ -63,7 +62,6 @@ pub(super) fn paint(
     Ok(())
 }
 
-#[cfg(any(not(windows), test))]
 fn expand(input: &[u8], pitch: u32, output: &mut [u8], width: u32, height: u32) {
     for y in 0..height {
         for x in 0..width {
@@ -78,7 +76,6 @@ fn expand(input: &[u8], pitch: u32, output: &mut [u8], width: u32, height: u32) 
     }
 }
 
-#[cfg(any(not(windows), test))]
 fn pack(input: &[u8], output: &mut [u8], pitch: u32, width: u32, height: u32) {
     for y in 0..height {
         for x in 0..width {
@@ -93,6 +90,7 @@ fn pack(input: &[u8], output: &mut [u8], pitch: u32, width: u32, height: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // spec: WIN32-GDI-7
     #[test]
     fn coverage_keeps_duplicate_indices_distinct_and_preserves_partial_bits_and_padding() {
         let original = [0xff, 0xad, 0xcc, 0xdd, 0x00, 0x55, 0xee, 0xff];

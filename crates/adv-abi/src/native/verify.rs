@@ -1,0 +1,908 @@
+//! Independent admission of positive-count, forward byte recurrences.
+//!
+//! The checker re-decodes code through the shared integer semantics. Each step
+//! has typed values, ordered memory versions and complete continuation/final
+//! exits. Entry predicates remain obligations for the publication bridge.
+
+use adv_cpu::integer::{self, Operand, Operation};
+use iced_x86::{
+    ConditionCode, Decoder, DecoderOptions, Instruction, Mnemonic, OpKind, Register as X86,
+};
+
+use super::expression::Kind;
+use super::*;
+
+pub const RULE_VERSION: u32 = 5;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Store {
+    pub before: MemoryVersion,
+    pub after: MemoryVersion,
+    pub address: Expression,
+    pub value: Expression,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExitState {
+    pub registers: [Expression; 8],
+    pub flags: Expression,
+    pub memory: MemoryVersion,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExitKind {
+    Continue,
+    Complete,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RegionExit {
+    pub kind: ExitKind,
+    pub target: u32,
+    pub condition: Expression,
+    pub state: ExitState,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Transition {
+    pub store: Store,
+    pub exits: Vec<RegionExit>,
+    pub instructions: u32,
+}
+
+/// Only the independent checker can construct this capability.
+///
+/// ~~~compile_fail
+/// use adv_abi::native::{CandidateBinding, VerifiedBinding};
+/// fn bypass(candidate: CandidateBinding) -> VerifiedBinding { candidate.into() }
+/// ~~~
+#[derive(Clone, Debug)]
+pub struct VerifiedBinding {
+    candidate: CandidateBinding,
+    dependencies: Vec<Dependency>,
+    transition: Transition,
+    conditions: Vec<Predicate>,
+    frame: Option<FrameState>,
+}
+
+impl VerifiedBinding {
+    /// Compile-time bridge inputs for the checked recurrence and scalar tail.
+    /// # Safety
+    /// `kernel` must implement this binding's reference contract, accepting
+    /// source/destination/count under the returned aliasing rule.
+    pub unsafe fn lower(
+        &self,
+        kernel: adv_cpu::native_region::Kernel,
+    ) -> Option<adv_cpu::native_region::NativeRegion> {
+        use adv_cpu::native_region::{
+            Affine, Aliasing, Frame as LowerFrame, FrameInvariant as LowerInvariant, NativeRegion,
+            ReadSpan, Scalar,
+        };
+        let affine = |expression: &Expression| -> Option<Affine> {
+            let (terms, constant) = expression.affine()?;
+            let mut registers = [0; 8];
+            for (target, term) in registers.iter_mut().zip(terms) {
+                *target = match term {
+                    0 => 0,
+                    1 => 1,
+                    u32::MAX => -1,
+                    _ => return None,
+                };
+            }
+            Some(Affine {
+                registers,
+                constant,
+            })
+        };
+        let source_role = match self.candidate.contract.computation {
+            Computation::PngUp | Computation::PngAverage | Computation::PngPaeth => {
+                Input::PreviousRow
+            }
+            Computation::PngSub => Input::ReconstructedPrefix,
+            Computation::Lz77 => Input::History,
+        };
+        let view = &self.candidate.view;
+        let mut inputs = [Affine {
+            registers: [0; 8],
+            constant: 0,
+        }; 3];
+        for (target, expression) in inputs.iter_mut().zip([
+            view.input(source_role)?,
+            &view.output.address,
+            view.input(Input::Length)?,
+        ]) {
+            *target = affine(expression)?;
+        }
+        let mut advances = [0; 8];
+        for (r, value) in self.transition.exits[0].state.registers.iter().enumerate() {
+            if let Some((terms, constant)) = value.affine() {
+                let mut expected = [0; 8];
+                expected[r] = 1;
+                if terms != expected {
+                    return None;
+                }
+                advances[r] = match constant {
+                    0 => 0,
+                    1 => 1,
+                    u32::MAX => -1,
+                    _ => return None,
+                };
+            }
+        }
+        if advances[4] != 0 {
+            return None;
+        }
+        let aliasing = if matches!(
+            self.candidate.contract.computation,
+            Computation::PngUp | Computation::PngAverage | Computation::PngPaeth
+        ) {
+            Aliasing::Disjoint
+        } else {
+            Aliasing::Backward
+        };
+        let mut reads = [
+            Some(ReadSpan {
+                address: inputs[0],
+                aliasing,
+            }),
+            None,
+            None,
+        ];
+        let scalar = if matches!(
+            self.candidate.contract.computation,
+            Computation::PngAverage | Computation::PngPaeth
+        ) {
+            reads[1] = Some(ReadSpan {
+                address: affine(view.input(Input::ReconstructedPrefix)?)?,
+                aliasing: Aliasing::Backward,
+            });
+            let parameter = view.input(Input::BytesPerPixel)?;
+            let mut bounds = [None; 2];
+            if self.candidate.contract.computation == Computation::PngPaeth {
+                reads[2] = Some(ReadSpan {
+                    address: affine(&Expression::binary(
+                        Binary::Subtract,
+                        view.input(Input::PreviousRow)?.clone(),
+                        parameter.clone(),
+                    )?)?,
+                    aliasing: Aliasing::Disjoint,
+                });
+                bounds[0] = Some(inputs[0]);
+            }
+            Some(Scalar {
+                value: affine(parameter)?,
+                upper_bounds: bounds,
+            })
+        } else {
+            None
+        };
+        let frame = if let Some(frame) = &self.frame {
+            let mut invariants = [None; 8];
+            for (out, invariant) in invariants.iter_mut().zip(&frame.invariants) {
+                *out = Some(LowerInvariant {
+                    offset: invariant.offset,
+                    value: affine(&Expression::register(invariant.register))?,
+                });
+            }
+            Some(LowerFrame {
+                address: affine(&frame.span.address)?,
+                bytes: frame.span.length.as_constant()? as u32,
+                writes: !frame.stores.is_empty(),
+                invariants,
+            })
+        } else {
+            None
+        };
+        // SAFETY: admission checked the recurrence, complete effects, additive
+        // cursor updates and scalar-tail restoration; the caller owns kernel identity.
+        Some(unsafe {
+            NativeRegion::new(
+                inputs,
+                advances,
+                self.transition.instructions,
+                reads,
+                scalar,
+                frame,
+                kernel,
+            )
+        })
+    }
+
+    pub fn candidate(&self) -> &CandidateBinding {
+        &self.candidate
+    }
+    pub fn dependencies(&self) -> &[Dependency] {
+        &self.dependencies
+    }
+    pub fn transition(&self) -> &Transition {
+        &self.transition
+    }
+    pub fn conditions(&self) -> &[Predicate] {
+        &self.conditions
+    }
+    pub fn frame(&self) -> Option<&FrameState> {
+        self.frame.as_ref()
+    }
+    pub const fn rule_version(&self) -> u32 {
+        RULE_VERSION
+    }
+}
+
+fn counterexample(offset: u32, reason: &'static str) -> Rejection {
+    Rejection::Counterexample { offset, reason }
+}
+fn unsupported(offset: u32, reason: &'static str) -> Rejection {
+    Rejection::Unsupported { offset, reason }
+}
+
+pub(super) fn register(r: X86) -> Option<Register> {
+    let r = integer::Reg::decode(r)?;
+    (r.shift == 0 && matches!(r.width, 1 | 4)).then_some(Register(r.index))
+}
+
+pub(super) fn plain_memory(i: &Instruction) -> bool {
+    integer::Address::decode(i, false).is_some_and(|a| {
+        !a.word
+            && !a.fs
+            && a.base.is_none_or(|r| r.width == 4)
+            && a.index.is_none_or(|r| r.width == 4)
+            && a.scale == 1
+            && matches!(i.segment_prefix(), X86::None | X86::DS)
+    })
+}
+
+fn add(value: Expression, amount: u32) -> Expression {
+    Expression::binary(
+        Binary::Add,
+        value,
+        Expression::constant(Width::Dword, u64::from(amount)),
+    )
+    .expect("32-bit cursor")
+}
+fn low(value: Expression) -> Expression {
+    Expression::extract(value, 0, Width::Byte).expect("byte or full register")
+}
+pub(super) fn address(i: &Instruction, values: &[Expression; 8]) -> Option<Expression> {
+    if !plain_memory(i) {
+        return None;
+    }
+    let a = integer::Address::decode(i, false)?;
+    let mut value = Expression::constant(Width::Dword, u64::from(a.displacement));
+    for r in [a.base, a.index].into_iter().flatten() {
+        value = Expression::binary(Binary::Add, value, values[r.index as usize].clone())?;
+    }
+    Some(value)
+}
+
+struct Checker {
+    values: [Expression; 8],
+    flags: Expression,
+    reads: Vec<Expression>,
+    store: Option<Store>,
+    defined: [u32; 8],
+    initial_reads: [u32; 8],
+    written: [u32; 8],
+    defined_flags: u32,
+    frame: super::frame::Slots,
+}
+
+impl Checker {
+    fn new() -> Self {
+        Self {
+            values: std::array::from_fn(|r| Expression::register(Register(r as u8))),
+            flags: Expression::flags(),
+            reads: Vec::new(),
+            store: None,
+            defined: [0; 8],
+            initial_reads: [0; 8],
+            written: [0; 8],
+            defined_flags: 0,
+            frame: Default::default(),
+        }
+    }
+    fn read_register(&mut self, r: integer::Reg) {
+        let bits = integer::mask(r.width) << r.shift;
+        self.initial_reads[r.index as usize] |= bits & !self.defined[r.index as usize];
+    }
+    fn write_register(&mut self, r: integer::Reg) {
+        self.defined[r.index as usize] |= integer::mask(r.width) << r.shift;
+        self.written[r.index as usize] |= integer::mask(r.width) << r.shift;
+    }
+    fn address_registers(&mut self, i: &Instruction) {
+        if let Some(a) = integer::Address::decode(i, false) {
+            for r in [a.base, a.index].into_iter().flatten() {
+                self.read_register(r);
+            }
+        }
+    }
+    fn read(&mut self, i: &Instruction) -> Result<Expression, Rejection> {
+        let at = i.ip32();
+        if self.store.is_some() {
+            return Err(unsupported(at, "memory read after a write"));
+        }
+        let a = address(i, &self.values).ok_or_else(|| unsupported(at, "memory address"))?;
+        self.address_registers(i);
+        self.reads.push(a.clone());
+        Ok(Expression::load(MemoryVersion(0), a, Width::Byte).expect("32-bit address"))
+    }
+    fn store(&mut self, i: &Instruction, value: Expression) -> Result<(), Rejection> {
+        let at = i.ip32();
+        let a = address(i, &self.values).ok_or_else(|| unsupported(at, "store address"))?;
+        self.address_registers(i);
+        if self
+            .store
+            .replace(Store {
+                before: self.frame.version(),
+                after: MemoryVersion(self.frame.version().0 + 1),
+                address: a,
+                value: low(value),
+            })
+            .is_some()
+        {
+            return Err(unsupported(at, "more than one memory write per step"));
+        }
+        Ok(())
+    }
+    fn frame_read(
+        &mut self,
+        i: &Instruction,
+        target: Option<Register>,
+    ) -> Result<Expression, Rejection> {
+        let a = address(i, &self.values).ok_or_else(|| unsupported(i.ip32(), "frame address"))?;
+        let offset = super::frame::offset(&a)
+            .ok_or_else(|| unsupported(i.ip32(), "non-fixed dword load"))?;
+        self.address_registers(i);
+        self.frame.read(offset, target, i.ip32())
+    }
+    fn frame_write(&mut self, i: &Instruction, value: Expression) -> Result<(), Rejection> {
+        if self.store.is_some() {
+            return Err(unsupported(i.ip32(), "frame write after output write"));
+        }
+        let a = address(i, &self.values).ok_or_else(|| unsupported(i.ip32(), "frame address"))?;
+        let offset = super::frame::offset(&a)
+            .ok_or_else(|| unsupported(i.ip32(), "non-fixed dword store"))?;
+        self.address_registers(i);
+        self.frame.write(offset, value, i.ip32())
+    }
+    fn flags(&mut self, kind: Mnemonic, left: Expression, right: Expression) {
+        self.flags = Expression::integer_flags(kind, self.flags.clone(), left, right)
+            .expect("decoded integer operands");
+    }
+    fn instruction(&mut self, i: &Instruction) -> Result<(), Rejection> {
+        let at = i.ip32();
+        let bad = || unsupported(at, "instruction form");
+        if i.has_lock_prefix() || i.has_rep_prefix() || i.has_repne_prefix() {
+            return Err(bad());
+        }
+        // Iced dependency bits, not architectural EFLAGS values. Preserved
+        // flags (notably INC/DEC's CF) do not become local definitions.
+        if i.rflags_read() & !self.defined_flags != 0 {
+            return Err(unsupported(
+                at,
+                "condition reads flags before a local definition",
+            ));
+        }
+        match integer::decode(i).ok_or_else(bad)? {
+            Operation::Nop if i.op_count() == 0 => {}
+            Operation::Mov(Operand::Register(r), Operand::Memory(_, 1), false) if r.width == 4 => {
+                let value = self.read(i)?;
+                self.write_register(r);
+                self.values[r.index as usize] =
+                    Expression::extend(value, Width::Dword, false).expect("byte extension");
+            }
+            Operation::Mov(Operand::Register(r), Operand::Memory(_, 1), false)
+                if r.width == 1 && r.shift == 0 =>
+            {
+                let value = self.read(i)?;
+                self.write_register(r);
+                self.values[r.index as usize] =
+                    Expression::insert(self.values[r.index as usize].clone(), value, 0)
+                        .expect("low-byte register write");
+            }
+            Operation::Mov(Operand::Memory(_, 1), Operand::Register(r), false)
+                if r.width == 1 && r.shift == 0 =>
+            {
+                self.read_register(r);
+                self.store(i, self.values[r.index as usize].clone())?;
+            }
+            Operation::Mov(Operand::Register(r), Operand::Memory(_, 4), false) if r.width == 4 => {
+                let value = self.frame_read(i, Some(Register(r.index)))?;
+                self.write_register(r);
+                self.values[r.index as usize] = value;
+            }
+            Operation::Mov(Operand::Memory(_, 4), Operand::Register(r), false) if r.width == 4 => {
+                self.read_register(r);
+                self.frame_write(i, self.values[r.index as usize].clone())?;
+            }
+            Operation::Mov(Operand::Register(a), Operand::Register(b), false)
+                if a.width == 4 && matches!(b.width, 1 | 4) =>
+            {
+                self.read_register(b);
+                let value = self.values[b.index as usize].clone();
+                let value = if b.width == 1 {
+                    Expression::extend(
+                        Expression::extract(value, b.shift, Width::Byte).unwrap(),
+                        Width::Dword,
+                        false,
+                    )
+                    .unwrap()
+                } else {
+                    value
+                };
+                self.write_register(a);
+                self.values[a.index as usize] = value;
+            }
+            Operation::Binary(Mnemonic::Add, Operand::Memory(_, 1), Operand::Register(r))
+                if r.width == 1 && r.shift == 0 =>
+            {
+                self.read_register(r);
+                let left = self.read(i)?;
+                let right = low(self.values[r.index as usize].clone());
+                self.flags(Mnemonic::Add, left.clone(), right.clone());
+                self.store(
+                    i,
+                    Expression::binary(Binary::Add, left, right).expect("byte sum"),
+                )?;
+            }
+            Operation::Unary(kind @ (Mnemonic::Inc | Mnemonic::Dec), Operand::Register(r))
+                if r.width == 4 =>
+            {
+                self.read_register(r);
+                self.write_register(r);
+                let value = self.values[r.index as usize].clone();
+                self.flags(kind, value.clone(), Expression::constant(Width::Dword, 1));
+                self.values[r.index as usize] =
+                    add(value, if kind == Mnemonic::Inc { 1 } else { u32::MAX });
+            }
+            Operation::Binary(Mnemonic::Cmp, Operand::Register(a), Operand::Register(b))
+                if a.width == 4 && b.width == 4 =>
+            {
+                self.read_register(a);
+                self.read_register(b);
+                self.flags(
+                    Mnemonic::Cmp,
+                    self.values[a.index as usize].clone(),
+                    self.values[b.index as usize].clone(),
+                );
+            }
+            Operation::Binary(
+                kind @ (Mnemonic::Add | Mnemonic::Sub),
+                Operand::Register(a),
+                Operand::Register(b),
+            ) if a.width == 4 && b.width == 4 => {
+                self.read_register(a);
+                self.read_register(b);
+                self.write_register(a);
+                let left = self.values[a.index as usize].clone();
+                let right = self.values[b.index as usize].clone();
+                self.flags(kind, left.clone(), right.clone());
+                self.values[a.index as usize] = Expression::binary(
+                    if kind == Mnemonic::Add {
+                        Binary::Add
+                    } else {
+                        Binary::Subtract
+                    },
+                    left,
+                    right,
+                )
+                .unwrap();
+            }
+            Operation::Unary(Mnemonic::Neg, Operand::Register(r)) if r.width == 4 => {
+                self.read_register(r);
+                self.write_register(r);
+                let value = self.values[r.index as usize].clone();
+                let zero = Expression::constant(Width::Dword, 0);
+                self.flags(Mnemonic::Neg, value.clone(), zero.clone());
+                self.values[r.index as usize] =
+                    Expression::binary(Binary::Subtract, zero, value).unwrap();
+            }
+            Operation::Cmov(Operand::Register(r), source, cc) if r.width == 4 => {
+                // The source is read even on the false branch, as in Tier 0.
+                let value = match source {
+                    Operand::Register(b) if b.width == 4 => {
+                        self.read_register(b);
+                        self.values[b.index as usize].clone()
+                    }
+                    Operand::Memory(_, 4) => self.frame_read(i, None)?,
+                    _ => return Err(bad()),
+                };
+                self.read_register(r);
+                self.written[r.index as usize] = u32::MAX;
+                self.values[r.index as usize] = Expression::select(
+                    Expression::condition(cc, self.flags.clone()).unwrap(),
+                    value,
+                    self.values[r.index as usize].clone(),
+                )
+                .unwrap();
+            }
+            Operation::Shift(Mnemonic::Shr, Operand::Register(r), Operand::Immediate(1))
+                if r.width == 4 =>
+            {
+                self.read_register(r);
+                self.write_register(r);
+                let value = self.values[r.index as usize].clone();
+                let one = Expression::constant(Width::Dword, 1);
+                self.flags(Mnemonic::Shr, value.clone(), one.clone());
+                self.values[r.index as usize] =
+                    Expression::binary(Binary::ShiftRight, value, one).unwrap();
+            }
+            _ => return Err(bad()),
+        }
+        self.defined_flags &= !i.rflags_undefined();
+        self.defined_flags |= i.rflags_written() | i.rflags_cleared() | i.rflags_set();
+        Ok(())
+    }
+}
+
+/// Check actual code and establish the forward-loop induction rule.
+pub fn verify(
+    image: &ImageSnapshot,
+    candidate: CandidateBinding,
+    budget: &mut Budget,
+) -> Result<VerifiedBinding, Rejection> {
+    let at = candidate.entry;
+    if image.identity != candidate.image {
+        return Err(counterexample(at, "image identity"));
+    }
+    let computation = candidate.contract.computation;
+    if candidate.contract != ReferenceContract::get(computation) {
+        return Err(counterexample(at, "reference contract identity"));
+    }
+    if candidate.cutpoints != [at] || candidate.exits != [candidate.end] {
+        return Err(counterexample(at, "cutpoints or exits"));
+    }
+    let view = &candidate.view;
+    let source_role = match computation {
+        Computation::Lz77 => Input::History,
+        Computation::PngSub => Input::ReconstructedPrefix,
+        _ => Input::PreviousRow,
+    };
+    let source = view
+        .input(source_role)
+        .ok_or_else(|| counterexample(at, "source mapping"))?
+        .clone();
+    let destination = view.output.address.clone();
+    let remaining = view
+        .input(Input::Length)
+        .ok_or_else(|| counterexample(at, "count mapping"))?
+        .clone();
+    let left = if matches!(computation, Computation::PngAverage | Computation::PngPaeth) {
+        Some(
+            view.input(Input::ReconstructedPrefix)
+                .ok_or_else(|| counterexample(at, "left mapping"))?
+                .clone(),
+        )
+    } else {
+        None
+    };
+    if [source.clone(), destination.clone(), remaining.clone()]
+        .iter()
+        .any(|e| e.affine().is_none())
+    {
+        return Err(unsupported(at, "non-affine loop address or count"));
+    }
+    let expected_view = if let Some(left) = &left {
+        row_view(
+            computation,
+            source.clone(),
+            left.clone(),
+            destination.clone(),
+            remaining.clone(),
+        )
+    } else {
+        byte_view(
+            computation,
+            source.clone(),
+            destination.clone(),
+            remaining.clone(),
+        )
+    };
+    if expected_view.as_ref() != Some(view) {
+        return Err(counterexample(at, "input mapping"));
+    }
+    if candidate.proof
+        != (ProofHint::ForwardBytes {
+            remaining: remaining.clone(),
+        })
+    {
+        return Err(counterexample(at, "loop proof hint"));
+    }
+    let len = candidate
+        .end
+        .checked_sub(at)
+        .filter(|&n| n != 0)
+        .ok_or_else(|| counterexample(at, "region extent"))?;
+    let bytes = image
+        .bytes(at, len)
+        .ok_or_else(|| counterexample(at, "incomplete code dependency"))?;
+    if !image.dependencies.iter().any(|d| {
+        d.kind == DependencyKind::Code
+            && at
+                .checked_sub(d.offset)
+                .and_then(|start| start.checked_add(len))
+                .is_some_and(|end| end as usize <= d.bytes.len())
+            && d.bytes
+                .get((at - d.offset) as usize..(at - d.offset + len) as usize)
+                == Some(bytes)
+    }) {
+        return Err(counterexample(at, "region is not code"));
+    }
+    let mut decoder = Decoder::with_ip(32, bytes, u64::from(at), DecoderOptions::NONE);
+    let mut checker = Checker::new();
+    let mut count = 0;
+    let mut backedge = false;
+    while decoder.can_decode() {
+        if budget.instructions == 0 {
+            return Err(Rejection::Timeout);
+        }
+        budget.instructions -= 1;
+        let i = decoder.decode();
+        count += 1;
+        if i.is_invalid() {
+            return Err(unsupported(i.ip32(), "invalid instruction"));
+        }
+        if i.mnemonic() == Mnemonic::Jne {
+            if i.op0_kind() != OpKind::NearBranch32 {
+                return Err(unsupported(i.ip32(), "nonrelocatable branch width"));
+            }
+            if decoder.can_decode() || i.near_branch_target() != u64::from(at) {
+                return Err(counterexample(i.ip32(), "unaccounted control-flow edge"));
+            }
+            backedge = true;
+            break;
+        }
+        checker.instruction(&i)?;
+    }
+    if !backedge {
+        return Err(counterexample(at, "missing loop backedge"));
+    }
+    let next_remaining = add(remaining.clone(), u32::MAX);
+    let test = match checker.flags.kind() {
+        Kind::IntegerFlags(Mnemonic::Dec, _, left, _) => *left == remaining,
+        Kind::IntegerFlags(Mnemonic::Cmp, _, left, right) => {
+            let difference = Expression::binary(Binary::Subtract, left.clone(), right.clone());
+            let negative = Expression::binary(
+                Binary::Subtract,
+                Expression::constant(Width::Dword, 0),
+                next_remaining.clone(),
+            );
+            difference.as_ref() == Some(&next_remaining) || difference == negative
+        }
+        _ => false,
+    };
+    if !test {
+        return Err(counterexample(
+            at,
+            "loop test is not the decreasing counter",
+        ));
+    }
+    for (value, delta) in [(&source, 1), (&destination, 1), (&remaining, u32::MAX)] {
+        if value.after(&checker.values) != Some(add(value.clone(), delta)) {
+            return Err(counterexample(at, "loop state recurrence"));
+        }
+    }
+    if let Some(left) = &left
+        && left.after(&checker.values) != Some(add(left.clone(), 1))
+    {
+        return Err(counterexample(at, "left state recurrence"));
+    }
+    let copied =
+        Expression::load(MemoryVersion(0), source.clone(), Width::Byte).expect("byte source");
+    let upper = if computation == Computation::PngPaeth {
+        Some(
+            Expression::binary(
+                Binary::Subtract,
+                source.clone(),
+                view.input(Input::BytesPerPixel).unwrap().clone(),
+            )
+            .unwrap(),
+        )
+    } else {
+        None
+    };
+    let expected = if computation == Computation::PngPaeth {
+        let store = checker
+            .store
+            .as_ref()
+            .ok_or_else(|| counterexample(at, "missing output store"))?;
+        super::paeth::prove(&store.value, view, at)?;
+        store.value.clone()
+    } else if computation == Computation::Lz77 {
+        copied.clone()
+    } else {
+        let predictor = if let Some(left) = &left {
+            let left = Expression::extend(
+                Expression::load(MemoryVersion(0), left.clone(), Width::Byte).unwrap(),
+                Width::Dword,
+                false,
+            )
+            .unwrap();
+            let above = Expression::extend(copied.clone(), Width::Dword, false).unwrap();
+            let sum = Expression::binary(Binary::Add, left, above).unwrap();
+            low(Expression::binary(
+                Binary::ShiftRight,
+                sum,
+                Expression::constant(Width::Dword, 1),
+            )
+            .unwrap())
+        } else {
+            copied.clone()
+        };
+        Expression::binary(
+            Binary::Add,
+            Expression::load(MemoryVersion(0), destination.clone(), Width::Byte).unwrap(),
+            predictor,
+        )
+        .unwrap()
+    };
+    let expected_store = Store {
+        before: checker.frame.version(),
+        after: MemoryVersion(checker.frame.version().0 + 1),
+        address: destination.clone(),
+        value: expected,
+    };
+    if !checker.store.as_ref().is_some_and(|s| {
+        s.address == expected_store.address && s.value.same_value(&expected_store.value)
+    }) {
+        return Err(counterexample(at, "byte recurrence"));
+    }
+    if checker.reads.iter().any(|a| {
+        *a != source && *a != destination && left.as_ref() != Some(a) && upper.as_ref() != Some(a)
+    }) {
+        return Err(counterexample(at, "undeclared memory input"));
+    }
+    for r in 0..8 {
+        let r = Register(r);
+        let initial = Expression::register(r);
+        let actual = &checker.values[r.index() as usize];
+        if let Some((terms, _)) = actual.affine()
+            && terms == initial.affine().unwrap().0
+        {
+            continue;
+        }
+        let changed = checker.written[r.index() as usize];
+        if *actual != initial && checker.initial_reads[r.index() as usize] & changed != 0 {
+            return Err(unsupported(
+                at,
+                "scalar tail reads a loop-carried temporary before defining it",
+            ));
+        }
+    }
+    let frame = checker.frame.finish(&checker.values, at)?;
+    let state = ExitState {
+        registers: checker.values,
+        flags: checker.flags,
+        memory: expected_store.after,
+    };
+    let exits = [
+        (ExitKind::Continue, candidate.entry, ConditionCode::ne),
+        (ExitKind::Complete, candidate.end, ConditionCode::e),
+    ]
+    .map(|(kind, target, cc)| RegionExit {
+        kind,
+        target,
+        condition: Expression::condition(cc, state.flags.clone()).expect("flags condition"),
+        state: state.clone(),
+    })
+    .into();
+    let input = MemorySpan {
+        address: source.clone(),
+        length: remaining.clone(),
+    };
+    let output = candidate.view.output.clone();
+    let mut conditions = vec![
+        Predicate::Positive(remaining),
+        Predicate::NoWrap(input.clone()),
+        Predicate::NoWrap(output.clone()),
+        Predicate::Ordinary {
+            span: input.clone(),
+            access: Access::Read,
+        },
+        Predicate::Ordinary {
+            span: output.clone(),
+            access: Access::ReadWrite,
+        },
+        Predicate::WritesOutsideDependencies(output.clone()),
+        Predicate::NoInstructionObservers {
+            entry: at,
+            end: candidate.end,
+        },
+    ];
+    if matches!(
+        computation,
+        Computation::PngUp | Computation::PngAverage | Computation::PngPaeth
+    ) {
+        conditions.push(Predicate::Disjoint(input, output.clone()));
+    } else {
+        conditions.push(Predicate::BackwardDistance {
+            distance: Expression::binary(Binary::Subtract, destination.clone(), source.clone())
+                .expect("32-bit distance"),
+            source,
+            destination: destination.clone(),
+        });
+    }
+    if let Some(left) = left {
+        let span = MemorySpan {
+            address: left.clone(),
+            length: output.length.clone(),
+        };
+        conditions.extend([
+            Predicate::NoWrap(span.clone()),
+            Predicate::Ordinary {
+                span,
+                access: Access::Read,
+            },
+            Predicate::BackwardDistance {
+                source: left.clone(),
+                destination: destination.clone(),
+                distance: Expression::binary(Binary::Subtract, destination, left).unwrap(),
+            },
+        ]);
+    }
+    if let Some(upper) = upper {
+        let span = MemorySpan {
+            address: upper,
+            length: output.length.clone(),
+        };
+        conditions.extend([
+            Predicate::AtMost(
+                view.input(Input::BytesPerPixel).unwrap().clone(),
+                view.input(Input::PreviousRow).unwrap().clone(),
+            ),
+            Predicate::NoWrap(span.clone()),
+            Predicate::Ordinary {
+                span: span.clone(),
+                access: Access::Read,
+            },
+            Predicate::Disjoint(span, output.clone()),
+        ]);
+    }
+    if let Some(frame) = &frame {
+        conditions.extend([
+            Predicate::NoWrap(frame.span.clone()),
+            Predicate::Ordinary {
+                span: frame.span.clone(),
+                access: if frame.stores.is_empty() {
+                    Access::Read
+                } else {
+                    Access::ReadWrite
+                },
+            },
+            Predicate::Disjoint(frame.span.clone(), output.clone()),
+        ]);
+        for invariant in &frame.invariants {
+            let slot = add(frame.span.address.clone(), invariant.offset);
+            conditions.push(Predicate::Equal(
+                Expression::load(MemoryVersion(0), slot, Width::Dword).unwrap(),
+                Expression::register(invariant.register),
+            ));
+        }
+        for input in &checker.reads {
+            conditions.push(Predicate::Disjoint(
+                frame.span.clone(),
+                MemorySpan {
+                    address: input.clone(),
+                    length: output.length.clone(),
+                },
+            ));
+        }
+        if !frame.stores.is_empty() {
+            conditions.push(Predicate::WritesOutsideDependencies(frame.span.clone()));
+        }
+    }
+    Ok(VerifiedBinding {
+        candidate,
+        dependencies: vec![Dependency {
+            offset: at,
+            bytes: bytes.into(),
+            kind: DependencyKind::Code,
+        }],
+        transition: Transition {
+            store: expected_store,
+            exits,
+            instructions: count,
+        },
+        conditions,
+        frame,
+    })
+}

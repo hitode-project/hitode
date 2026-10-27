@@ -101,6 +101,30 @@ fn video_layer() -> VideoLayer {
 }
 
 #[test]
+// spec: DEV-FRAME-11
+fn deleting_the_pending_source_discards_its_frame() {
+    let mut store = store();
+    let mut memory = Memory::new(false);
+    let (producer, mut consumer) = frame_mailbox();
+    store.set_frame_mailbox(producer, adv_sync::WakeEvent::new().unwrap());
+    let first = store
+        .create(5, 4, false, PixelFormat::Bgra32, &mut memory)
+        .unwrap();
+    store.present(first, &memory, store[first].rect()).unwrap();
+    assert!(store.delete(first));
+    assert!(!store.flush(&memory, FlushReason::Immediate).unwrap());
+    assert!(!consumer.update());
+    let second = store
+        .create(5, 4, false, PixelFormat::Bgra32, &mut memory)
+        .unwrap();
+    store
+        .present(second, &memory, store[second].rect())
+        .unwrap();
+    assert!(store.flush(&memory, FlushReason::Immediate).unwrap());
+    assert!(consumer.update());
+}
+
+#[test]
 // spec: MEDIA-VIDEO-4
 fn video_updates_clip_and_restore_an_immutable_base_without_game_present() {
     let mut store = store();
@@ -223,7 +247,7 @@ fn video_updates_clip_and_restore_an_immutable_base_without_game_present() {
 }
 
 #[test]
-// spec: MEDIA-VIDEO-4
+// spec: DEV-FRAME-1, MEDIA-VIDEO-4
 fn video_only_mailbox_coalesces_to_latest_and_capture_uses_same_composition() {
     let memory = Memory::new(false);
     let mut store = store();
@@ -264,13 +288,13 @@ fn foreground_mailbox_moves_between_isolated_stores_with_monotonic_frames() {
         .unwrap();
     let (producer, mut consumer) = frame_mailbox();
     parent.set_frame_mailbox(producer, adv_sync::WakeEvent::new().unwrap());
-    parent_memory
-        .write(parent[parent_surface].pixels, &[1, 2, 3, 4])
-        .unwrap();
     child_memory
         .write(child[child_surface].pixels, &[5, 6, 7, 8])
         .unwrap();
-    for _ in 0..3 {
+    for value in [3, 2, 1] {
+        parent_memory
+            .write(parent[parent_surface].pixels, &[value, 2, 3, 4])
+            .unwrap();
         parent
             .present(
                 parent_surface,
@@ -374,7 +398,15 @@ fn headless_foreground_handoff_keeps_deferred_capture_and_frame_sequence() {
     let child_surface = child
         .create(1, 1, false, PixelFormat::Bgra32, &mut child_memory)
         .unwrap();
-    for _ in 0..3 {
+    for value in 1..=3 {
+        parent
+            .fill_raw(
+                parent_surface,
+                parent[parent_surface].rect(),
+                value,
+                &mut parent_memory,
+            )
+            .unwrap();
         parent
             .present(
                 parent_surface,
@@ -750,7 +782,7 @@ fn shrink_modes_combine_removed_pixels_before_format_conversion() {
 }
 
 #[test]
-// spec: DEV-FRAME-2
+// spec: DEV-FRAME-2, DEV-FRAME-12
 fn immediate_deferred_and_mailbox_frames_preserve_bottom_up_16_bit_static_pixels() {
     for format in [
         PixelFormat::Bgra32,
@@ -812,20 +844,20 @@ fn immediate_deferred_and_mailbox_frames_preserve_bottom_up_16_bit_static_pixels
             });
             if path != 0 {
                 assert_eq!(s.stats.converted_pixels, 0);
-                assert_eq!(s.stats.coalesced_frames, 1);
+                assert_eq!(s.stats.coalesced_frames, 0);
                 s.fill_raw(id, s[id].rect(), 0, &mut m).unwrap();
                 s.delete(id);
                 assert!(s.capture_latest(&m).unwrap());
                 assert!(!s.capture_latest(&m).unwrap());
             }
             assert_eq!(s.presenter.bgra, expected);
-            assert_eq!(s.presenter.frames, 2);
+            assert_eq!(s.presenter.frames, 1);
             if path == 2 {
                 assert!(consumer.update());
                 let mut snapshot = Snapshot::default();
                 consumer.current().snapshot(&mut snapshot).unwrap();
                 assert_eq!(snapshot.bgra, expected);
-                assert_eq!(snapshot.frames, 2);
+                assert_eq!(snapshot.frames, 1);
                 assert!(!consumer.update());
             }
         }
@@ -1557,6 +1589,8 @@ fn overdue_frame_flushes_on_present_or_another_context_wait() {
     let (tx, mut rx) = frame_mailbox();
     s.set_frame_mailbox(tx, adv_sync::WakeEvent::new().unwrap());
     for via_present in [false, true] {
+        s.fill_raw(id, s[id].rect(), u32::from(via_present), &mut m)
+            .unwrap();
         s.present_from(7, id, &m, s[id].rect()).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(55));
         if via_present {
@@ -1608,7 +1642,7 @@ fn capture_resize_palette_and_video_flush_pending_pixels_before_the_change() {
 }
 
 #[test]
-// spec: DEV-FRAME-10
+// spec: DEV-FRAME-10, DEV-FRAME-12
 fn declared_damage_shrinks_to_changed_tiles_against_the_last_publication() {
     for (format, bottom_up) in [
         (PixelFormat::Bgra32, false),
@@ -1624,14 +1658,16 @@ fn declared_damage_shrinks_to_changed_tiles_against_the_last_publication() {
         let mut publish = |s: &mut Surfaces<Snapshot>, m: &Memory| {
             s.present(id, m, s[id].rect()).unwrap();
             s.flush(m, FlushReason::Immediate).unwrap();
-            assert!(consumer.update());
+            if !consumer.update() {
+                return None;
+            }
             let frame = consumer.current();
             let mut shown = Snapshot::default();
             frame.snapshot(&mut shown).unwrap();
             if format == PixelFormat::Bgra32 {
                 assert_eq!(shown.bgra, logical_pixels(s, id, m).concat());
             }
-            frame.damage().to_vec()
+            Some(frame.damage().to_vec())
         };
         let full = Rect {
             x: 0,
@@ -1639,7 +1675,7 @@ fn declared_damage_shrinks_to_changed_tiles_against_the_last_publication() {
             w: 128,
             h: 64,
         };
-        assert_eq!(publish(&mut s, &m), [full]);
+        assert_eq!(publish(&mut s, &m), Some(vec![full]));
         let one = Rect {
             x: 70,
             y: 20,
@@ -1649,16 +1685,16 @@ fn declared_damage_shrinks_to_changed_tiles_against_the_last_publication() {
         s.fill_raw(id, one, 0x0012_3456, &mut m).unwrap();
         assert_eq!(
             publish(&mut s, &m),
-            [Rect {
+            Some(vec![Rect {
                 x: 64,
                 y: 16,
                 w: 64,
                 h: 16
-            }]
+            }])
         );
-        assert_eq!(publish(&mut s, &m), []);
+        assert_eq!(publish(&mut s, &m), None);
         s.fill_raw(id, full, 0x0000_ff00, &mut m).unwrap();
-        assert_eq!(publish(&mut s, &m), [full]);
+        assert_eq!(publish(&mut s, &m), Some(vec![full]));
     }
 }
 
@@ -1705,6 +1741,33 @@ fn source_color_keys_skip_keyed_pixels_when_copying_and_scaling() {
         .unwrap();
     let first: Vec<u8> = logical_pixels(&s, wide, &m).iter().map(|p| p[2]).collect();
     assert_eq!(first, vec![0, 0, 0xff, 0xff, 0, 0, 0, 0]);
+    // Overlapping keyed copies read the source as it was before any write,
+    // and a later call reuses the scratch rows without stale pixels.
+    let strip = s.create(2, 4, false, PixelFormat::Rgb565, &mut m).unwrap();
+    for _ in 0..2 {
+        for (y, value) in [0x11u8, 0x22, 0x33, 0x44].into_iter().enumerate() {
+            m.write(s[strip].row(0, y as u32), &[0, 0, value, value])
+                .unwrap();
+        }
+        let source = Rect {
+            x: 0,
+            y: 0,
+            w: 2,
+            h: 3,
+        };
+        let shifted = BlitRect {
+            x: 0,
+            y: 1,
+            w: 2,
+            h: 3,
+        };
+        s.blit(strip, source, strip, shifted, options, &mut m)
+            .unwrap();
+        let rows: Vec<_> = (0..4)
+            .map(|y| m.read(s[strip].row(0, y), 4).unwrap().into_owned())
+            .collect();
+        assert_eq!(rows, [0x11, 0x11, 0x22, 0x33].map(|v: u8| vec![0, 0, v, v]));
+    }
 }
 
 #[test]
@@ -1898,4 +1961,38 @@ fn sprites_preserve_packed_neighbors_scaling_phase_and_failed_write_transactions
         memory.read(at, 4).unwrap().as_ref(),
         [0x0f, 0xf4, 0xcc, 0xdd]
     );
+}
+
+// spec: DEV-FRAME-12, MEDIA-VIDEO-4
+#[test]
+fn unchanged_base_with_a_retained_video_layer_does_not_republish() {
+    let mut store = store();
+    let mut memory = Memory::new(false);
+    let id = store.primary(&mut memory).unwrap();
+    let (producer, mut consumer) = frame_mailbox();
+    store.set_frame_mailbox(producer, adv_sync::WakeEvent::new().unwrap());
+    store
+        .set_video_layer(1, Some(video_layer()), &memory)
+        .unwrap();
+    store.present(id, &memory, store[id].rect()).unwrap();
+    assert!(store.flush(&memory, FlushReason::Immediate).unwrap());
+    assert!(consumer.update());
+    let before = (store.stats.published_frames, store.stats.copied_bytes);
+    for damage in [
+        store[id].rect(),
+        Rect {
+            x: 0,
+            y: 0,
+            w: 1,
+            h: 1,
+        },
+    ] {
+        store.present(id, &memory, damage).unwrap();
+        assert!(!store.flush(&memory, FlushReason::Immediate).unwrap());
+        assert!(!consumer.update());
+        assert_eq!(
+            (store.stats.published_frames, store.stats.copied_bytes),
+            before
+        );
+    }
 }

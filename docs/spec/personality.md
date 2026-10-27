@@ -2,7 +2,7 @@
 
 ID prefix: PERS
 
-This spec covers the Windows identity the guest sees. It includes implementation levels, exports and diagnostics, observable NT and RTL boundaries, the version profile, native services and ABI ownership. `adv-abi`, `adv-os` and `adv-win32` implement it. [win32.md](win32.md) covers individual Win32 subsystems.
+This spec covers the Windows identity the guest sees. It includes implementation levels, exports and diagnostics, the code page profile and ABI ownership. `adv-abi` and `adv-os` implement it. [win32.md](win32.md) covers individual Win32 subsystems.
 
 ## Scope and acceptance
 
@@ -26,11 +26,6 @@ This spec covers the Windows identity the guest sees. It includes implementation
 **Rule**: Deliberate rejection of unsupported behavior MUST report the API and reason through `adv_abi::warn_unavailable`. Ordinary missing files and timeouts MUST NOT become capability gaps.
 **Verification**: Review — no test distinguishes ordinary failures from capability rejections across every front end.
 
-### PERS-SCOPE-6 Compatibility claims
-
-**Rule**: Zero stub calls or successful return codes MUST NOT establish structural compatibility. Structural failures in live or retired children MUST disqualify the process family.
-**Verification**: Test
-
 ### PERS-SCOPE-8 Excluded targets
 
 **Rule**: The personality MUST NOT advertise x64 guests, D3D11 engines, OpenGL engines, or standalone installer compatibility as supported targets.
@@ -46,18 +41,6 @@ This spec covers the Windows identity the guest sees. It includes implementation
 **Rule**: API front ends MUST preserve explicit ACP and charset selection and MUST NOT silently truncate conversion sources.
 **Verification**: Review — charset tests cover selected APIs, but no test checks source completeness across all conversion front ends.
 
-## Input delivery
-
-### PERS-INPUT-1 Wheel routing
-
-**Rule**: Host wheel messages MUST target the valid keyboard focus independently of mouse capture, retaining screen coordinates. DefWindowProcA/W MUST synchronously forward unhandled WM_MOUSEWHEEL to the parent and return its result, stopping at a window without a parent.
-**Verification**: Test
-
-### PERS-INPUT-2 Legacy device polling
-
-**Rule**: Legacy keyboard/mouse devices MUST expose IDirectInputDevice2A/W with the SDK's 27-slot layout and shared base-interface identity, state, and references. Poll MUST return DIERR_NOTACQUIRED before acquisition, DIERR_INPUTLOST on foreground loss, and DI_NOEFFECT for acquired event-driven devices without consuming input.
-**Verification**: Test
-
 ## Exports and diagnostics
 
 ### PERS-EXPORT-1 Fixed export structure
@@ -68,11 +51,6 @@ This spec covers the Windows identity the guest sees. It includes implementation
 ### PERS-EXPORT-2 Discovery classification
 
 **Rule**: Dynamic discovery MUST expose only implemented or reviewed exports, except under `ADV_PERSONALITY_STRICT`. Forwarders MUST use their final target classification. Exports introduced after Windows 7 MUST remain undiscoverable in both API modes.
-**Verification**: Test
-
-### PERS-EXPORT-3 Review admission
-
-**Rule**: A reviewed export MUST have a callable signature and registered failure. Implementing it MUST remove its review entry.
 **Verification**: Test
 
 ### PERS-EXPORT-4 Reviewed failures
@@ -108,93 +86,11 @@ This spec covers the Windows identity the guest sees. It includes implementation
 **Rule**: Personality diagnostics MUST distinguish rejected probes, reviewed calls, stub calls, and structural mismatches. Rejected names MUST be bounded to 256 entries with explicit dropped counts.
 **Verification**: Review — the complete personality report and its 256-name boundary lack a dedicated end-to-end test.
 
-### PERS-EXPORT-9 Static survey
-
-**Rule**: A survey MUST list, before guest code runs, every static import, constant-named module load or lookup and constant COM class the runtime cannot satisfy. It MUST resolve game modules before host modules, as the loader does, and count lookup sites naming no constant. It MUST omit gaps data/abi/absent.tsv reviews as harmless, each with its reason.
-**Verification**: Test
-
-### PERS-EXPORT-10 Mode contracts
-
-**Rule**: An implementation MAY declare, per scalar parameter, the values it handles as Windows 7 does. A survey MUST report each constant argument outside such a contract, marking calls that discard the result. It MUST list constant arguments to parameters without a contract.
-**Verification**: Test
-
-## Observable API boundaries
-
-### PERS-BRIDGE-1 Observed boundaries
-
-**Rule**: NT and RTL bridges MUST resolve the live guest entry. Only unchanged entries MAY use the host fast path. Unsupported observable boundary preservation MUST emit a capability warning.
-**Verification**: Test
-
-### PERS-BRIDGE-2 File and heap identity
-
-**Rule**: File, enumeration, and heap front ends MUST preserve shared identities and propagate live NT or RTL hook results.
-**Verification**: Test
-
-### PERS-BRIDGE-3 Module and thread boundaries
-
-**Rule**: Loading, module queries, reference changes, and thread creation MUST honor live NT or LDR hooks and their changed parameters or failures.
-**Verification**: Test
-
-### PERS-BRIDGE-4 Synchronization boundaries
-
-**Rule**: Event, mutant, semaphore, and wait front ends MUST share object state with NT services. Hook changes MUST affect actual acquisition, release, or failure.
-**Verification**: Test
-
-### PERS-BRIDGE-5 Exception boundaries
-
-**Rule**: Software exceptions MUST pass through live `RtlRaiseException`, `NtRaiseException`, `KiUserExceptionDispatcher`, and `NtContinue` boundaries. Hook parameter changes MUST reach subsequent handlers.
-**Verification**: Review — available Rust tests cover individual boundaries, not the complete modified-parameter chain described by the native fixture.
-
-### PERS-BRIDGE-6 Unsupported native behavior
-
-**Rule**: Unsupported synchronization security, file-time modification, asynchronous file paths, and NtContinue alert testing MUST fail explicitly rather than imply support through exported names.
-**Verification**: Review — existing boundary tests do not enumerate all rejected security, asynchronous-file, and alert-testing combinations.
-
 ## Windows identity and native services
-
-### PERS-PROFILE-1 Consistent Windows identity
-
-**Rule**: The default profile MUST identify Windows 7 SP1, build 7601, with `PRODUCT_ULTIMATE`. PEB version fields, version APIs, suite information, and product information MUST use the selected profile.
-**Verification**: Test
-
-### PERS-PROFILE-2 Mutable PEB versions
-
-**Rule**: Version APIs backed by PEB fields MUST reflect guest changes to those fields. Suite masks and product type MUST remain derived from the selected profile.
-**Verification**: Review — profile tests change configuration but do not mutate the installed PEB and compare all affected APIs.
-
-### PERS-PROFILE-3 Unmodeled identity channels
-
-**Rule**: System version registry values, synthetic DLL version resources, and `KUSER_SHARED_DATA` MUST NOT be fabricated without a profile-backed implementation.
-**Verification**: Test
-
-### PERS-PROFILE-4 Native service ABI
-
-**Rule**: For profile 6.1.7601, native x86 `INT 2E` MUST use EAX as service number and EDX as argument pointer. Arguments MUST be validated and copied before dispatch. Ordinary returns MUST replace only EAX.
-**Verification**: Test
-
-### PERS-PROFILE-5 Native service failures
-
-**Rule**: Unimplemented catalog services MUST return `STATUS_NOT_IMPLEMENTED`. Unknown services, GUI selectors, and other profiles MUST return `STATUS_INVALID_SYSTEM_SERVICE`. Unreadable arguments MUST return `STATUS_ACCESS_VIOLATION`, while zero-argument services MUST ignore EDX.
-**Verification**: Test
-
-### PERS-PROFILE-6 Native service identity
-
-**Rule**: Implemented Nt/Zw pairs MUST share entries and state. Relocated entries MUST remain callable, and native services MUST preserve waits, APCs, and explicit context restoration.
-**Verification**: Test
 
 ### PERS-PROFILE-7 ANSI code page selection
 
 **Rule**: Without an explicit code page, the ANSI code page MUST be 936 for a Simplified Chinese executable and 932 otherwise. Markers are a name token `chs`, `cn`, `gb` or `zhcn`, a kana-free name with a GBK-only character, or GB2312 data text outnumbering Shift_JIS threefold. An explicit code page MUST replace the detected one before guest code runs.
-**Verification**: Test
-
-### PERS-PROFILE-8 CRT subprocess environment
-
-**Rule**: CRT `system(NULL)` queries MUST report no command processor without changing error cells. Valid `system`, `_spawn*`, `_exec*`, and `_popen` calls MUST fail with ENOENT in this environment. Ordinary subprocess failures MUST NOT emit capability warnings or publish process handles or streams.
-**Verification**: Test
-
-### PERS-PROFILE-9 CRT error cells
-
-**Rule**: CRT error pointers and getters/setters MUST share the existing module/thread cells. UCRT API-set calls MUST use UCRT's cells. Other CRT modules and threads MUST retain independent cells.
 **Verification**: Test
 
 ## ABI ownership
@@ -204,14 +100,11 @@ This spec covers the Windows identity the guest sees. It includes implementation
 **Rule**: API signatures MUST come from `data/abi` and explicit checked aliases. API front ends MUST NOT create conflicting declarations or calling conventions.
 **Verification**: Test
 
+Typed adapters MAY borrow their complete readable argument span for decoding. They MUST preserve scalar and aggregate bits, stack-word rounding, page permissions and the original failing argument when a complete span cannot be borrowed. Zero-argument calls MUST NOT read argument memory.
+
 ### PERS-ABI-2 Layer ownership
 
-**Rule**: PE parsing MUST belong to `adv-pe`, loading policy to `adv-os`, and platform API behavior to its personality front end. Device implementations MUST NOT depend on personality crates.
+**Rule**: PE parsing MUST belong to `adv-pe`, loading policy to `adv-nt`, and platform API behavior to its personality front end. Device implementations MUST NOT depend on personality crates.
 **Verification**: Check — Cargo dependencies and `tools/layering/check_layers.py` enforce the layer direction.
 
-### PERS-ABI-3 Nt and Zw registration
-
-**Rule**: Implemented Nt/Zw pairs MUST share binding identity before native numeric service installation. Missing Zw declarations MUST derive from their matching Nt declarations.
-**Verification**: Test
-
-Withdrawn: PERS-SCOPE-2, PERS-SCOPE-7, PERS-SCOPE-9
+Withdrawn: PERS-EXPORT-10

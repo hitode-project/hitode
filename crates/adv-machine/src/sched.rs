@@ -8,6 +8,8 @@
 pub use crate::objects::Objects;
 use std::any::Any;
 
+use adv_cpu::backend::Reg;
+
 use crate::outcome::{Continuation, DeferredContinuation, WakeReason};
 
 pub type CtxId = u32;
@@ -218,7 +220,13 @@ pub(crate) struct Frame {
     pub unwindable: bool,
     pub then: Continuation,
     pub origin: Origin,
+    /// EBX, EBP, ESI and EDI when the call began, which a callee that
+    /// returns preserves and [`crate::Outcome::ReturnFromCall`] restores.
+    pub callee_saved: [u32; 4],
 }
+
+/// The registers a guest callee preserves.
+pub(crate) const CALLEE_SAVED: [Reg; 4] = [Reg::Ebx, Reg::Ebp, Reg::Esi, Reg::Edi];
 
 pub(crate) enum ReadyResume {
     Woke {
@@ -272,7 +280,7 @@ pub struct Context {
     pub stack_hi: u32,
     /// Initial ESP/EIP, consumed when the register image is first materialized.
     pub(crate) start: Option<(u32, u32)>,
-    pub(crate) initial_registers: Vec<(adv_cpu::backend::Reg, u32)>,
+    pub(crate) initial_registers: Vec<(Reg, u32)>,
     /// Execution storage is reclaimable independently of the thread identity.
     pub(crate) storage: Option<ContextStorage>,
     /// One-shot process bootstrap, consumed only by an actual scheduler selection.
@@ -287,6 +295,7 @@ pub struct Context {
     pub(crate) exact_deadline: bool,
     pub(crate) spin: crate::frame_spin::FrameSpin,
     pub(crate) progress: crate::poll_progress::PollProgress,
+    pub(crate) poll_peek_depth: u32,
     /// Kernel object signaled when this context ends.
     pub thread_handle: Handle,
 }
@@ -588,6 +597,9 @@ mod active_tests {
     fn wait_sys() -> Sys {
         Sys {
             clock: Clock::virtual_time(),
+            poll_wake: None,
+            poll_observed: false,
+            poll_activity: 0,
             invocation_arguments: None,
             trace: Trace::default(),
             thunks: ThunkTable::new(Box::new(Empty)),
@@ -600,6 +612,8 @@ mod active_tests {
             completed_frames: 0,
             frame_pacer: None,
             pid: 0x1000,
+            peb: crate::layout::PEB_ADDR,
+            teb_pages: 1,
             process_identity: process::ProcessIdentity::new(0x1000),
             next_tid: 0x1004,
             images: Images::default(),
@@ -613,6 +627,7 @@ mod active_tests {
             process_return: None,
             process_prepare: None,
             context_wait: None,
+            context_run: None,
             exception_handler: None,
             first_cpu_fault: None,
             latest_cpu_fault: None,
@@ -621,6 +636,7 @@ mod active_tests {
             next_frame_id: 0,
             recent: RecentCalls::new(256),
             host_calls: 0,
+            redirects: HashMap::new(),
             call_limit: None,
             stats: Stats::new(),
             schedule_trace: schedule_trace::ScheduleTrace::default(),
@@ -680,6 +696,7 @@ mod active_tests {
             exact_deadline: false,
             spin: Default::default(),
             progress: Default::default(),
+            poll_peek_depth: 0,
             thread_handle,
             wait_objects: Vec::new(),
         });

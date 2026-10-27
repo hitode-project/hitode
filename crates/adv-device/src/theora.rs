@@ -475,7 +475,7 @@ mod tests {
     }
 }
 
-#[cfg(all(test, target_arch = "aarch64"))]
+#[cfg(test)]
 mod neon_tests {
     unsafe extern "C" {
         fn adv_theora_idct(y: *mut i16, x: *mut i16, last: i32);
@@ -613,7 +613,6 @@ mod neon_tests {
     }
 }
 
-#[cfg(target_arch = "aarch64")]
 mod parallel {
     use std::{
         ffi::c_void,

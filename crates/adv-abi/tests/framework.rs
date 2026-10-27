@@ -14,6 +14,52 @@ const CODE: u32 = 0x0040_0000;
 const DATA: u32 = 0x0041_0000;
 
 #[test]
+// spec: PERS-ABI-1
+fn borrowed_arguments_preserve_bits_aggregate_rounding_and_exact_faults() {
+    use adv_abi::Arguments;
+    use adv_cpu::backend::Reg;
+    let mut cpu = adv_cpu::JitCpu::new(PARK_ADDR, false).unwrap();
+    cpu.map(DATA, PAGE, Prot::RW).unwrap();
+    let end = DATA + PAGE;
+    let bytes: Vec<_> = [
+        0x80000000u32,
+        0x76543210,
+        0xfedcba98,
+        0x00ccbbaa,
+        0x7fc00001,
+    ]
+    .into_iter()
+    .flat_map(u32::to_le_bytes)
+    .collect();
+    for (address, words) in [(DATA + 3, 5), (end - 20, 5), (end - 20, 6)] {
+        cpu.set_reg(Reg::Esp, address - 4);
+        cpu.write(address, &bytes).unwrap();
+        for borrowed in [false, true] {
+            let mut args = if borrowed {
+                Arguments::with_words(&cpu, words)
+            } else {
+                Arguments::new(&cpu)
+            };
+            assert_eq!(args.next::<f32>().unwrap().to_bits(), 0x80000000);
+            assert_eq!(args.next::<u64>().unwrap(), 0xfedcba9876543210);
+            assert_eq!(args.pod::<[u8; 3]>().unwrap(), [0xaa, 0xbb, 0xcc]);
+            assert_eq!(args.next::<f32>().unwrap().to_bits(), 0x7fc00001);
+            if address + 20 == end {
+                let fault = args.next::<u32>().unwrap_err();
+                assert_eq!((fault.addr, fault.len), (end, 4));
+            }
+        }
+    }
+    cpu.set_reg(Reg::Esp, DATA - 4);
+    cpu.protect(DATA, PAGE, Prot::default()).unwrap();
+    let fault = Arguments::with_words(&cpu, 1).next::<u32>().unwrap_err();
+    assert_eq!((fault.addr, fault.len), (DATA, 4));
+    // An unmapped stack is valid for calls whose signature has no arguments.
+    cpu.set_reg(Reg::Esp, u32::MAX);
+    let _ = Arguments::with_words(&cpu, 0);
+}
+
+#[test]
 // spec: PERS-EXPORT-6
 fn data_declarations_have_width_and_cannot_be_function_bindings() {
     use adv_machine::Resolver;
@@ -101,7 +147,6 @@ fn dynamic_availability_exposes_fixed_names_only_with_capability() {
         module: "kernel32.dll",
         name: "FlsAlloc",
         conv: Conv::Stdcall { argc: 1 },
-        env_leaf: None,
         handler: |_| Outcome::Return(u32::MAX),
         level: ImplementationLevel::SafeFail,
     });
@@ -126,7 +171,6 @@ fn a_frontend_under_a_forwarding_name_implements_its_fixed_target() {
         module: "kernel32.dll",
         name: "SetThreadpoolTimer",
         conv: Conv::Stdcall { argc: 4 },
-        env_leaf: None,
         handler: |_| Outcome::Return(0),
         level: ImplementationLevel::Implement,
     });
@@ -628,7 +672,7 @@ fn selected_d3dx_graphics_helpers_keep_sdk_scalar_and_pointer_abi_kinds() {
 
 // spec: EXEC-CORE-4
 #[test]
-fn audio_registration_rejects_both_leaf_kinds() {
+fn audio_bindings_are_recognized_by_name() {
     for (module, name) in [
         ("DSOUND.DLL", "IDirectSoundBuffer8::Play"),
         ("quartz.dll", "IMediaControl::Run"),
@@ -642,23 +686,10 @@ fn audio_registration_rejects_both_leaf_kinds() {
         ("winmm.dll", "PlaySoundW"),
         ("winmm.dll", "sndPlaySoundA"),
     ] {
-        for env_leaf in [false, true] {
-            let result = std::panic::catch_unwind(|| {
-                let mut registry = Registry::default();
-                if env_leaf {
-                    registry.add_env_leaf(
-                        module,
-                        name,
-                        Conv::Stdcall { argc: 0 },
-                        |_| Outcome::Return(0),
-                        |_| Some(0),
-                    );
-                } else {
-                    registry.add_leaf(module, name, Conv::Stdcall { argc: 0 }, |_| 0);
-                }
-            });
-            assert!(result.is_err(), "{module}!{name}: env_leaf={env_leaf}");
-        }
+        assert!(
+            adv_machine::thunk::is_audio_binding(module, name),
+            "{module}!{name}"
+        );
     }
     for name in ["timeGetTime", "timeBeginPeriod", "timeSetEvent"] {
         assert!(!adv_machine::thunk::is_audio_binding("winmm.dll", name));
@@ -667,34 +698,6 @@ fn audio_registration_rejects_both_leaf_kinds() {
         "fixture.dll",
         "waveOutWrite"
     ));
-}
-
-#[test]
-// spec: PERS-EXPORT-10
-fn mode_contracts_name_declared_scalar_parameters() {
-    let mut registry = Registry::default();
-    registry.accept("KERNEL32.dll", "SetFilePointer", "dwMoveMethod", |m| m <= 2);
-    let accepts = registry
-        .accepts("kernel32.dll", "SetFilePointer", "dwMoveMethod")
-        .unwrap();
-    assert!(accepts(2) && !accepts(3));
-    assert!(
-        registry
-            .accepts("kernel32.dll", "SetFilePointer", "lDistanceToMove")
-            .is_none()
-    );
-    for (name, param) in [
-        ("SetFilePointer", "lpDistanceToMoveHigh"),
-        ("SetFilePointer", "dwMode"),
-    ] {
-        let declared = std::panic::catch_unwind(|| {
-            Registry::default().accept("kernel32.dll", name, param, |_| true)
-        });
-        assert!(
-            declared.is_err(),
-            "{param} is not a declared scalar parameter"
-        );
-    }
 }
 
 // spec: PERS-ABI-1, PERS-EXPORT-6

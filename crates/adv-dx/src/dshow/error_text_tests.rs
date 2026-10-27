@@ -10,7 +10,7 @@ use adv_machine::{Clock, Machine, RunResult, layout::PARK_ADDR};
 fn error_text_a_preserves_output_buffers_and_failure_context() {
     for jit in [false, true] {
         let mut registry = Registry::default();
-        adv_win32::register(&mut registry);
+        crate::test_support::register(&mut registry);
         register(&mut registry);
         assert_eq!(
             registry.get("quartz.dll", "AMGetErrorTextA").unwrap().conv,
@@ -28,13 +28,7 @@ fn error_text_a_preserves_output_buffers_and_failure_context() {
             Clock::virtual_time(),
         )
         .unwrap();
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/scratch/dshow-error-text-tests");
-        adv_win32::Win32::install(
-            &mut machine,
-            adv_win32::Win32Config::new(root.join("game"), "fixture.exe", root.join("data")),
-        )
-        .unwrap();
+        crate::test_support::install(&mut machine);
         machine.ext.get_or_default::<adv_abi::ApiDiagnostics>();
         let (code_address, data, readonly) = (0x400000, 0x410000, 0x420000);
         machine.cpu.map(code_address, 4096, Prot::RX).unwrap();

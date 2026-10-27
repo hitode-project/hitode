@@ -4,33 +4,23 @@
 //! A flush owns the device until its Present/readback finishes. Busy restores
 //! only the unexecuted command, so continuations never replay successful prefixes.
 use super::*;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 mod damage;
 mod key;
 mod passes;
+mod reuse;
 pub(super) use key::fixed as fixed_key;
 pub(super) use key::hash;
 pub(super) use key::rect;
+pub(super) use reuse::indexed;
 pub(super) fn draw_key(env: &Env<'_>, pointer: u32) -> u128 {
     let d = device(env, pointer).unwrap();
     let constants = |id: Option<Id>, c: &shaders::Constants| {
-        use std::hash::Hash;
-        let mut h = xxhash_rust::xxh3::Xxh3::new();
-        if let Some(usage) = id
-            .and_then(|id| shaders::bound(env, id))
-            .and_then(|s| s.translation.as_ref().ok())
-            .map(|t| t.constants)
-        {
-            for n in usage.ranges().flat_map(|r| r.start / 16..r.end / 16) {
-                match n {
-                    0..256 => c.floats[n].map(f32::to_bits).hash(&mut h),
-                    256..272 => c.integers[n - 256].hash(&mut h),
-                    272..288 => c.booleans[n - 272].hash(&mut h),
-                    _ => {}
-                }
-            }
-        }
-        h.digest128()
+        c.key(
+            id.and_then(|id| shaders::bound(env, id))
+                .and_then(|s| s.translation.as_ref().ok())
+                .map_or(Default::default(), |t| t.constants),
+        )
     };
     hash((
         d.fixed.key(),
@@ -175,6 +165,7 @@ fn lookups() -> u64 {
 #[derive(Default)]
 pub(super) struct Recording {
     commands: Vec<Operation>,
+    reuse: reuse::Cache,
     passes: passes::Plan,
     damage: damage::Analysis,
     verify_region: Option<adv_device::surface::Rect>,
@@ -199,18 +190,17 @@ pub(super) struct Recording {
     readback: Option<adv_device::gpu::Readback>,
     job: Option<adv_sync::background::Task>,
 }
-pub(super) fn admits_leaf(env: &Env<'_>, pointer: u32, bytes: usize) -> bool {
-    device(env, pointer).is_some_and(|d| {
-        d.frame.active.is_none()
-            && d.frame.commands.len() + 1 < 4096
-            && d.frame.bytes + bytes < 64 * 1024 * 1024
-    })
+impl Recording {
+    pub(super) fn invalidate_streams(&mut self) {
+        self.reuse.invalidate_streams();
+    }
 }
 pub(super) fn forget(env: &mut Env<'_>, owner: Id, pointer: u32) {
     if let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, owner) {
         let f = &mut d.frame;
         let changed = f.contents.forget(pointer);
         f.binding_cache = None;
+        f.reuse.invalidate();
         f.damage.forget(pointer);
         if changed {
             f.partial = true;
@@ -358,19 +348,34 @@ fn barrier_if_busy(
     }
 }
 fn accept(env: &mut Env<'_>, owner: Id, p: key::Prepared) -> Outcome {
+    append(env, owner, &p, None, None)
+}
+fn append(
+    env: &mut Env<'_>,
+    owner: Id,
+    p: &key::Prepared,
+    target: Option<Target>,
+    entry: Option<&reuse::Entry>,
+) -> Outcome {
     #[cfg(feature = "d3d9-counters")]
     let before = lookups();
-    if !matches!(
-        com(env).get_identity(&env.sys.objects, owner),
-        Some(Payload::Device(_))
-    ) {
+    #[cfg(feature = "d3d9-counters")]
+    lookup(1);
+    let Some(Payload::Device(d)) = com(env).get_identity(&env.sys.objects, owner) else {
         return Outcome::Return(INVALID);
-    }
-    let lost = matches!(com(env).get_identity(&env.sys.objects,owner),Some(Payload::Device(d)) if d.gpu_lost);
-    let limit = {
-        let f = frame(env, owner);
-        f.commands.len() + 1 >= 4096 || f.bytes + p.bytes >= 64 * 1024 * 1024
     };
+    let retained = entry.and_then(|e| e.saved.get());
+    let shared = retained.filter(|saved| {
+        p.writes
+            .iter()
+            .zip(&saved.destinations)
+            .all(|((k, _), old)| {
+                d.frame.damage.independent(k) || d.frame.contents.get(k).copied() == *old
+            })
+    });
+    let bytes = if retained.is_some() { 0 } else { p.bytes };
+    let lost = d.gpu_lost;
+    let limit = d.frame.commands.len() + 1 >= 4096 || d.frame.bytes + bytes >= 64 * 1024 * 1024;
     // Ordinary admission unlocks immediately. A limit flush retains its lock
     // until execution, preserving the existing Busy API reservation.
     if (!limit || lost)
@@ -393,22 +398,42 @@ fn accept(env: &mut Env<'_>, owner: Id, p: key::Prepared) -> Outcome {
     let previous = limit.then(|| {
         (
             f.key,
-            p.bytes,
+            bytes,
             p.writes
                 .iter()
                 .map(|(k, _)| (*k, f.contents.get(k).copied(), f.contents.had_base(k)))
                 .collect::<Vec<_>>(),
         )
     });
-    use std::hash::Hash;
-    let mut command = xxhash_rust::xxh3::Xxh3::new();
-    p.key.hash(&mut command);
-    p.reads.len().hash(&mut command);
-    for k in &p.reads {
-        (*k, f.contents.get(k).copied().unwrap_or(0)).hash(&mut command);
-    }
-    let command = command.digest128();
-    f.damage.record(&p, command, &f.contents);
+    let destinations = entry.filter(|e| e.saved.get().is_none()).map(|_| {
+        p.writes
+            .iter()
+            .map(|(k, _)| f.contents.get(k).copied())
+            .collect()
+    });
+    let (command, damage) = if let Some(saved) = shared {
+        let slot = hash(target.as_ref().unwrap().image.view());
+        f.damage.replay(&saved.damage, slot);
+        (saved.command, saved.damage.clone())
+    } else {
+        use std::hash::Hash;
+        let mut command = xxhash_rust::xxh3::Xxh3::new();
+        p.key.hash(&mut command);
+        p.reads.len().hash(&mut command);
+        for k in &p.reads {
+            (*k, f.contents.get(k).copied().unwrap_or(0)).hash(&mut command);
+        }
+        let command = command.digest128();
+        (
+            command,
+            f.damage.record(
+                p,
+                command,
+                &f.contents,
+                target.as_ref().map(|t| hash(t.image.view())),
+            ),
+        )
+    };
     for &(k, overwrite) in &p.writes {
         let command = p.write_key(k, command);
         let slot = f.contents.resolve(k);
@@ -436,16 +461,22 @@ fn accept(env: &mut Env<'_>, owner: Id, p: key::Prepared) -> Outcome {
     }
     f.key = hash((f.key, command));
     #[cfg(feature = "d3d9-counters")]
-    let work = matches!(p.operation, Operation::Draw(_)).then_some((
-        (p.bytes
-            + passes::Plan::bytes(p.reads.len(), p.writes.len())
+    let work = (shared.is_none() && matches!(p.operation, Operation::Draw(_))).then_some((
+        (passes::Plan::bytes(p.reads.len(), p.writes.len())
             + std::mem::size_of::<Operation>()
             + match &p.operation {
-                Operation::Draw(d) => d
-                    .programmable
-                    .as_ref()
-                    .map_or(0, |p| std::mem::size_of_val(p.as_ref())),
-                _ => 0,
+                Operation::Draw(d) => d.programmable.as_ref().map_or(p.bytes, |draw| {
+                    p.bytes - draw.streams.iter().map(|s| s.bytes.len()).sum::<usize>()
+                        + std::mem::size_of_val(draw.as_ref())
+                        + draw.vertex_constants.retained_bytes()
+                        + draw.pixel_constants.retained_bytes()
+                        + draw
+                            .streams
+                            .iter()
+                            .map(|s| s.bytes.retained_bytes())
+                            .sum::<usize>()
+                }),
+                _ => p.bytes,
             }) as u64,
         p.lookups + lookups() - before,
     ));
@@ -458,9 +489,27 @@ fn accept(env: &mut Env<'_>, owner: Id, p: key::Prepared) -> Outcome {
     }
     #[cfg(feature = "d3d9-counters")]
     let f = frame(env, owner);
-    f.bytes += p.bytes;
-    f.passes.record(&p.operation, p.reads, p.writes, p.bounds);
-    f.commands.push(p.operation);
+    f.bytes += bytes;
+    if let Some(saved) = shared {
+        f.passes.replay(saved.pass.clone());
+    } else {
+        let pass = f
+            .passes
+            .record(&p.operation, p.reads.clone(), p.writes.clone(), p.bounds);
+        if let (Some(entry), Some(destinations)) = (entry, destinations) {
+            let _ = entry.saved.set(reuse::Saved {
+                command,
+                damage,
+                pass,
+                destinations,
+            });
+        }
+    }
+    let mut operation = p.operation.clone();
+    if let (Some(target), Operation::Draw(draw)) = (target, &mut operation) {
+        draw.target = target;
+    }
+    f.commands.push(operation);
     let limit = f.commands.len() >= 4096 || f.bytes >= 64 * 1024 * 1024;
     env.ext.get_mut::<State>().frames.recorded_commands += 1;
     if limit {
@@ -501,6 +550,7 @@ fn enter(env: &mut Env<'_>, owner: Id, token: u64, reason: Reason) -> Result<(),
             frame(env, owner).active = Some(token);
             if !matches!(reason, Reason::Present) {
                 frame(env, owner).damage.invalidate();
+                frame(env, owner).reuse.invalidate();
             }
             env.ext.get_mut::<State>().frames.flushes[reason as usize] += 1;
             Ok(())
@@ -536,7 +586,25 @@ pub(super) fn flush(
             f.head += 1;
             continue;
         }
-        let operation = std::mem::replace(&mut f.commands[f.head], Operation::Consumed);
+        let mut operation = std::mem::replace(&mut f.commands[f.head], Operation::Consumed);
+        if let Operation::Clear {
+            color,
+            depth,
+            stencil,
+            ..
+        } = &mut operation
+        {
+            let mask = f.passes.clear_mask(f.head);
+            if mask & 1 == 0 {
+                *color = None;
+            }
+            if mask & 2 == 0 {
+                *depth = None;
+            }
+            if mask & 4 == 0 {
+                *stencil = None;
+            }
+        }
         let clip = if env.ext.get::<State>().verify_frames {
             None
         } else {
@@ -798,8 +866,12 @@ fn finish(env: &mut Env<'_>, owner: Id, token: u64, presentation: u128, serial: 
     f.last_serial = serial;
     f.contents.reset();
     f.key = 0;
+    f.reuse.finish();
     f.partial = false;
     f.verdict = None;
+    if let Some(Payload::Device(d)) = com(env).get_identity(&env.sys.objects, owner) {
+        d.fixed.finish_inputs();
+    }
 }
 fn verify_pixels(
     env: &mut Env<'_>,

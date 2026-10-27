@@ -36,7 +36,7 @@ impl Plan {
             let inst = trace.insts[end];
             if (end != start && (trace.head(end) || trace.merge[end]))
                 || inst.mode != Mode::Plain
-                || inst.leaf.is_some()
+                || inst.call.is_some()
                 || checked(inst.pc)
             {
                 return None;
@@ -73,7 +73,7 @@ impl Plan {
                 | Op::Jcc(..)
                 | Op::Setcc(..)
                 | Op::Cmov(..)
-                | Op::Shift(..)
+                | Op::Shift(_, Src::Reg(_), Some(_))
                 | Op::Imul(..)
                 | Op::Carry(..)
                 | Op::Narrow(..)
@@ -200,7 +200,7 @@ mod tests {
                     .unwrap();
                 stops.push(inst.ip32());
             }
-            trace.build(&memory, 0x10000, &stops, &|_, _| false);
+            trace.build(&memory, 0x10000, &stops, &|_, _| None, &|_| None);
             assert_eq!(
                 Plan::at(&trace, 0, &|_| variant == 5).is_some(),
                 variant == 0

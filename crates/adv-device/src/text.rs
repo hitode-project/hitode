@@ -8,10 +8,7 @@ use std::sync::Arc;
 mod monochrome;
 mod spacing;
 
-#[cfg(not(windows))]
 mod portable;
-#[cfg(windows)]
-mod windows;
 
 /// Legacy text encodings used to select a font's character repertoire. Reserved
 /// selectors are preserved for the native matcher, never guessed as a code page.
@@ -444,7 +441,6 @@ pub struct KerningPair {
 pub const MAX_KERNING_PAIRS: u32 = 1024 * 1024;
 /// The actual portable face and rendering size, for reproducible references.
 /// This reports the selected bytes, including a registered guest resource.
-#[cfg(not(windows))]
 #[derive(Clone, Debug, PartialEq)]
 pub struct FontResolution {
     pub family: String,
@@ -459,6 +455,12 @@ pub struct FontResolution {
     pub horizontal_scale: f32,
     pub profile_sha256: Option<String>,
     pub backend: &'static str,
+}
+/// Installed files and replacements for missing standard families. Each target
+/// lists the physical family's legacy names, including localized spellings.
+pub struct FontReplacements {
+    pub files: Vec<std::path::PathBuf>,
+    pub families: Vec<(Vec<String>, Vec<String>)>,
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CacheStats {
@@ -485,23 +487,14 @@ impl std::fmt::Display for TextError {
 #[derive(Default)]
 pub struct Text {
     overrides: Overrides,
-    #[cfg(windows)]
-    fonts: BTreeMap<FontRequest, windows::Font>,
-    #[cfg(not(windows))]
+
     fonts: BTreeMap<FontRequest, portable::Font>,
-    #[cfg(not(windows))]
+
     backend: portable::Backend,
-    #[cfg(windows)]
-    canvas: Option<windows::Canvas>,
+
     glyphs: BTreeMap<(FontRequest, GlyphRequest), Arc<Glyph>>,
     bytes: usize,
     hits: u64,
-    #[cfg(windows)]
-    resources: BTreeMap<FontResourceId, windows::FontResource>,
-    #[cfg(windows)]
-    next_resource: u64,
-    #[cfg(windows)]
-    resource_bytes: usize,
 }
 
 /// Explicit host font substitutions and text paint quality. Guest outline formats remain unchanged.
@@ -538,10 +531,14 @@ pub const MAX_FONT_RESOURCE_BYTES: usize = 64 * 1024 * 1024;
 pub const FONT_CACHE_CAPACITY: usize = 128;
 /// Start the installed-font scan before the guest first needs it.
 pub fn prefetch_system_fonts() {
-    #[cfg(not(windows))]
     portable::prefetch_system_fonts();
 }
 impl Text {
+    /// Export discovery and family matching to a guest font renderer. Prefer
+    /// real TrueType outlines for legacy families and require their code page.
+    pub fn replacement_fonts(&self) -> Result<FontReplacements, TextError> {
+        self.backend.replacement_fonts()
+    }
     pub fn set_overrides(&mut self, overrides: Overrides) {
         self.invalidate_fonts();
         self.overrides = overrides;
@@ -554,14 +551,7 @@ impl Text {
         face: Option<&str>,
         mode: FontEnumeration,
     ) -> Result<Vec<EnumeratedFont>, TextError> {
-        #[cfg(windows)]
-        {
-            windows::enumeration::enumerate(face, mode)
-        }
-        #[cfg(not(windows))]
-        {
-            self.backend.enumerate(face, mode)
-        }
+        self.backend.enumerate(face, mode)
     }
     /// Install owned backend font data. Successful resource changes invalidate
     /// matching and glyph caches; immutable glyph results held by callers live on.
@@ -583,69 +573,24 @@ impl Text {
         bytes: &[u8],
         file_visibility: Option<bool>,
     ) -> Result<(FontResourceId, u32), TextError> {
-        #[cfg(windows)]
-        {
-            if bytes.is_empty()
-                || self.resources.len() >= MAX_FONT_RESOURCES
-                || bytes.len() > MAX_FONT_RESOURCE_BYTES.saturating_sub(self.resource_bytes)
-            {
-                return Err(TextError::Font("font resource budget exceeded".into()));
-            }
-            let next = self
-                .next_resource
-                .checked_add(1)
-                .ok_or_else(|| TextError::Font("font resource identity exhausted".into()))?;
-            let resource = windows::FontResource::new(bytes, file_visibility)?;
-            let count = resource.faces();
-            self.invalidate_fonts();
-            let id = FontResourceId(next);
-            self.resources.insert(id, resource);
-            self.next_resource = next;
-            self.resource_bytes += bytes.len();
-            Ok((id, count))
-        }
-        #[cfg(not(windows))]
-        {
-            let result = self
-                .backend
-                .add_resource(bytes, file_visibility.unwrap_or(false))?;
-            self.invalidate_fonts();
-            Ok(result)
-        }
+        let result = self
+            .backend
+            .add_resource(bytes, file_visibility.unwrap_or(false))?;
+        self.invalidate_fonts();
+        Ok(result)
     }
 
     /// Unregister before retiring the cached native font references. A failed
     /// backend operation preserves the resource and all existing cache owners.
     pub fn remove_resource(&mut self, id: FontResourceId) -> Result<bool, TextError> {
-        #[cfg(windows)]
-        {
-            let Some(resource) = self.resources.get_mut(&id) else {
-                return Ok(false);
-            };
-            resource.remove()?;
+        let removed = self.backend.remove_resource(id);
+        if removed {
             self.invalidate_fonts();
-            let resource = self.resources.remove(&id).unwrap();
-            self.resource_bytes -= resource.bytes();
-            Ok(true)
         }
-        #[cfg(not(windows))]
-        {
-            let removed = self.backend.remove_resource(id);
-            if removed {
-                self.invalidate_fonts();
-            }
-            Ok(removed)
-        }
+        Ok(removed)
     }
     pub fn resource_stats(&self) -> (usize, usize) {
-        #[cfg(windows)]
-        {
-            (self.resources.len(), self.resource_bytes)
-        }
-        #[cfg(not(windows))]
-        {
-            self.backend.resource_stats()
-        }
+        self.backend.resource_stats()
     }
     /// Refresh font matching after a resource reference changes without a new
     /// backend registration (for example a personality's repeated add/remove).
@@ -722,13 +667,7 @@ impl Text {
         {
             return Err(TextError::Font("invalid text pixel storage".into()));
         }
-        #[cfg(windows)]
-        {
-            self.font(request)?;
-            let canvas = self.canvas.get_or_insert_with(windows::Canvas::default);
-            self.fonts[request].paint(canvas, paint, pixels, palette)
-        }
-        #[cfg(not(windows))]
+
         {
             if let Some(palette) = palette {
                 monochrome::paint(self, request, paint, pixels, palette)
@@ -748,18 +687,7 @@ impl Text {
     fn font_count(&self) -> usize {
         self.fonts.len()
     }
-    #[cfg(windows)]
-    fn font(&mut self, request: &FontRequest) -> Result<&windows::Font, TextError> {
-        if !self.fonts.contains_key(request) {
-            let font = windows::Font::new(&self.overrides.apply(request))?;
-            if self.fonts.len() >= FONT_CACHE_CAPACITY {
-                self.fonts.clear();
-            }
-            self.fonts.insert(request.clone(), font);
-        }
-        Ok(&self.fonts[request])
-    }
-    #[cfg(not(windows))]
+
     fn font(&mut self, request: &FontRequest) -> Result<&portable::Font, TextError> {
         if !self.fonts.contains_key(request) {
             let font = self.backend.font(&self.overrides.apply(request))?;
@@ -774,18 +702,12 @@ impl Text {
     /// as "zh-Hans") when a font provides it, as GDI does. Native GDI already
     /// follows the real UI language.
     pub fn set_language(&mut self, tag: &'static str) {
-        #[cfg(not(windows))]
-        {
-            self.backend.language = Some(tag);
-        }
-        #[cfg(windows)]
-        let _ = tag;
+        self.backend.language = Some(tag);
     }
     /// Use only these discovery directories on portable hosts. This provides a
     /// deterministic font environment for comparisons; guest resources still
     /// take precedence. Default construction discovers system fonts and the
     /// additional directories in ADV_FONT_DIR (the host's path-list syntax).
-    #[cfg(not(windows))]
     pub fn with_font_directories(directories: &[std::path::PathBuf]) -> Self {
         let mut text = Self::default();
         text.backend = portable::Backend::with_directories(directories);
@@ -795,7 +717,6 @@ impl Text {
     /// SHA-256 hashes, collection indices and family names before returning.
     /// Production default construction uses the same profile when
     /// ADV_FONT_PROFILE is set. Guest fonts retain exact-family precedence.
-    #[cfg(not(windows))]
     pub fn with_font_profile(path: &std::path::Path) -> Result<Self, TextError> {
         let backend = portable::Backend::with_profile(path)?;
         let mut text = Self::default();
@@ -805,7 +726,6 @@ impl Text {
     /// Resolve a Unicode character using the same primary/coverage/default
     /// selection as metrics, extent and raster queries. This is diagnostic data,
     /// never a font handle or a guest pointer.
-    #[cfg(not(windows))]
     pub fn resolved_character(
         &mut self,
         request: &FontRequest,
@@ -816,34 +736,13 @@ impl Text {
     /// Describe the logical font retained by the existing provider. Default
     /// requests use the same selected face/profile as measurement and drawing.
     pub fn logical_font(&mut self, request: &FontRequest) -> Result<FontRequest, TextError> {
-        #[cfg(windows)]
-        {
-            self.font(request)?.logical_font()
-        }
-        #[cfg(not(windows))]
-        {
-            Ok(self.font(request)?.logical_font())
-        }
+        Ok(self.font(request)?.logical_font())
     }
     pub fn metrics(&mut self, request: &FontRequest) -> Result<TextMetrics, TextError> {
-        #[cfg(windows)]
-        {
-            self.font(request)?.metrics()
-        }
-        #[cfg(not(windows))]
-        {
-            Ok(self.font(request)?.metrics())
-        }
+        Ok(self.font(request)?.metrics())
     }
     pub fn outline_metrics(&mut self, request: &FontRequest) -> Result<OutlineMetrics, TextError> {
-        #[cfg(windows)]
-        {
-            self.font(request)?.outline_metrics()
-        }
-        #[cfg(not(windows))]
-        {
-            self.font(request)?.outline_metrics()
-        }
+        self.font(request)?.outline_metrics()
     }
     /// Unicode range, default and break characters from the same realized font
     /// that owns numeric metrics and glyph rasterization. These units cannot be
@@ -861,30 +760,16 @@ impl Text {
         request: &FontRequest,
         input: TextInput<'_>,
     ) -> Result<TextExtent, TextError> {
-        #[cfg(windows)]
-        {
-            self.font(request)?.extent(input)
-        }
-        #[cfg(not(windows))]
-        {
-            self.font(request)?.extent(input)
-        }
+        self.font(request)?.extent(input)
     }
     /// Query the selected font's complete Unicode kerning-pair count using the
     /// same realized-font owner as metrics, extents and glyph rasterization.
     pub fn kerning_pair_count(&mut self, request: &FontRequest) -> Result<u32, TextError> {
-        #[cfg(windows)]
-        {
-            Ok(self.font(request)?.kerning_pair_count())
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = request;
-            Err(TextError::Font(
-                "complete Unicode kerning-pair enumeration is unavailable on the portable font backend"
-                    .into(),
-            ))
-        }
+        let _ = request;
+        Err(TextError::Font(
+            "complete Unicode kerning-pair enumeration is unavailable on the portable font backend"
+                .into(),
+        ))
     }
     /// Copy at most capacity real pairs in provider order. The native provider
     /// supports partial buffers, preserving its signed logical-unit adjustments.
@@ -896,11 +781,7 @@ impl Text {
         if capacity == 0 || capacity > MAX_KERNING_PAIRS {
             return Err(TextError::Font("invalid kerning-pair capacity".into()));
         }
-        #[cfg(windows)]
-        {
-            self.font(request)?.kerning_pairs(capacity)
-        }
-        #[cfg(not(windows))]
+
         {
             let _ = request;
             Err(TextError::Font(
@@ -988,17 +869,10 @@ impl Text {
     }
 
     pub fn language_info(&mut self, font: &FontRequest) -> Result<u32, TextError> {
-        #[cfg(windows)]
-        {
-            self.font(font)?.language_info()
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = font;
-            Err(TextError::Font(
-                "complete font language metadata is unavailable on the portable backend".into(),
-            ))
-        }
+        let _ = font;
+        Err(TextError::Font(
+            "complete font language metadata is unavailable on the portable backend".into(),
+        ))
     }
 
     pub fn placement(
@@ -1010,19 +884,10 @@ impl Text {
         buffers: Option<PlacementBuffers>,
         ansi_codepage: u32,
     ) -> Result<Placement, TextError> {
-        #[cfg(windows)]
-        {
-            self.font(font)?
-                .placement(input, maximum, flags, buffers, ansi_codepage)
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = (font, input, maximum, flags, buffers, ansi_codepage);
-            Err(TextError::Font(
-                "native character placement and shaping are unavailable on the portable backend"
-                    .into(),
-            ))
-        }
+        let _ = (font, input, maximum, flags, buffers, ansi_codepage);
+        Err(TextError::Font(
+            "native character placement and shaping are unavailable on the portable backend".into(),
+        ))
     }
 }
 
@@ -1038,7 +903,5 @@ impl Drop for Text {
     fn drop(&mut self) {
         // Restore/delete cached selections before the resource owners retire.
         self.invalidate_fonts();
-        #[cfg(windows)]
-        self.resources.clear();
     }
 }

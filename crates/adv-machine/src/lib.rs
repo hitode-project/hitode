@@ -11,12 +11,13 @@
 //!   the urgency of the event that woke it, never an engine-specific thread role.
 
 pub mod clock;
-mod env_leaf;
 pub mod exception;
 pub mod ext;
 pub mod frame_budget;
 pub mod frame_spin;
 mod guest_words;
+#[cfg(test)]
+mod host_call_tests;
 mod invocation;
 pub mod layout;
 mod leaf;
@@ -38,7 +39,7 @@ pub mod wait_diagnostics;
 mod wake_queue;
 pub use wake_queue::WakePriority;
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use adv_cpu::backend::asm::Asm;
@@ -47,7 +48,6 @@ use adv_cpu::backend::{
 };
 
 pub use clock::{Clock, MAX_PASSIVE_STEP_US};
-pub use env_leaf::EnvLeafHandler;
 pub use ext::Ext;
 pub use guest_words::{GuestWord, GuestWordPool};
 use layout::*;
@@ -84,6 +84,11 @@ type ProcessPrepare = fn(&mut dyn Guest, &mut Sys, &mut Ext) -> Result<(), MemFa
 /// Host-side machine state shared by all handlers.
 pub struct Sys {
     pub clock: Clock,
+    /// Shared execution wake for input, server, media, I/O and APC deliveries.
+    pub poll_wake: Option<adv_sync::WakeEvent>,
+    poll_observed: bool,
+    /// Productive calls invalidate the round even when their context then blocks.
+    poll_activity: u64,
     /// Explicit arguments exist only while a host invocation or its continuation runs.
     invocation_arguments: Option<invocation::Arguments>,
     /// Real time: reusable scheduler slot where round-robin resumes after a host return.
@@ -102,6 +107,13 @@ pub struct Sys {
     /// device output, not a guest thread role or an engine-specific frame loop.
     pub completed_frames: u32,
     pub pid: u32,
+    /// The PEB new threads point at. A personality that lays out its own
+    /// process environment block moves it before the first spawn.
+    pub peb: u32,
+    /// The pages each thread's TEB block holds. A personality whose threads
+    /// keep data after the TEB, as Wine's keep their debug buffers, widens
+    /// it before the first spawn.
+    pub teb_pages: u32,
     pub process_identity: std::sync::Arc<process::ProcessIdentity>,
     next_tid: u32,
     /// Mapped guest images, for backtraces and profiles; the OS layer's loader fills it.
@@ -124,6 +136,9 @@ pub struct Sys {
     pub process_prepare: Option<ProcessPrepare>,
     /// Personality work before a context parks on an Outcome::Block.
     pub context_wait: Option<fn(&mut Env<'_>) -> Option<Outcome>>,
+    /// Personality work each time a context is about to run guest code, at
+    /// most once per scheduling quantum (for example, guest-visible clocks).
+    pub context_run: Option<fn(&mut Env<'_>)>,
     /// Personality-supplied interpretation of precise CPU stops.
     pub exception_handler: Option<exception::ExceptionHandler>,
     /// First backend fault, retained across guest SEH execution and later slices.
@@ -138,6 +153,10 @@ pub struct Sys {
     pub recent: RecentCalls,
     /// Host calls handled so far.
     pub host_calls: u64,
+    /// Guest functions whose translated calls go to a host thunk instead, by
+    /// entry, with the bytes the function begins with
+    /// ([`adv_cpu::backend::TrapHandler::redirect`]).
+    pub redirects: HashMap<u32, (u32, Box<[u8]>)>,
     /// Stop with an error after this many host calls (a debugging aid for guest loops that
     /// never block).
     pub call_limit: Option<u64>,
@@ -201,6 +220,10 @@ pub struct Env<'a> {
     pub thunk: u32,
 }
 
+/// A cold-path admission service supplied by the personality's codec wiring.
+/// It receives immutable current code, never guest state or live memory views.
+pub struct NativeAdmission(pub fn(u32, &[u8]) -> Vec<adv_cpu::native_region::NativeRegion>);
+
 impl Env<'_> {
     /// `i`th stack argument of the current host call. Unreadable args read as 0 (and log).
     pub fn arg(&self, i: u32) -> u32 {
@@ -255,6 +278,21 @@ impl Sys {
         context.suspend_count += 1;
         Some(old)
     }
+    /// Moves the initial stack pointer of a context that has not started: a
+    /// personality that lays out its own start frame on the stack.
+    pub fn set_start_stack(&mut self, id: CtxId, sp: u32) -> bool {
+        match self
+            .contexts
+            .get_mut(id as usize)
+            .and_then(|c| c.start.as_mut())
+        {
+            Some(start) => {
+                start.0 = sp;
+                true
+            }
+            None => false,
+        }
+    }
     pub fn resume_context(&mut self, id: CtxId) -> Option<u32> {
         let context = self.contexts.get_mut(id as usize)?;
         if context.is_done() {
@@ -290,10 +328,11 @@ impl Sys {
         let base = self.vm.alloc_with_guard(cpu, stack_size, PAGE, Prot::RW)?;
         let (lo, hi) = (base + PAGE, base + PAGE + stack_size);
         let tid = self.next_tid;
-        let teb = teb_addr(slot);
+        let teb = teb_block_addr(slot, self.teb_pages);
+        let teb_size = self.teb_pages * PAGE;
         let mut mapped_teb = false;
         let result = (|| {
-            cpu.map(teb, PAGE, Prot::RW)?;
+            cpu.map(teb, teb_size, Prot::RW)?;
             mapped_teb = true;
             for (off, v) in [
                 (teb::EXCEPTION_LIST, u32::MAX),
@@ -302,7 +341,7 @@ impl Sys {
                 (teb::SELF, teb),
                 (teb::PROCESS_ID, self.pid),
                 (teb::THREAD_ID, tid),
-                (teb::PEB, PEB_ADDR),
+                (teb::PEB, self.peb),
             ] {
                 cpu.write_u32(teb + off, v)?;
             }
@@ -329,7 +368,7 @@ impl Sys {
             Ok(sp) => sp,
             Err(error) => {
                 if mapped_teb {
-                    let _ = cpu.unmap(teb, PAGE);
+                    let _ = cpu.unmap(teb, teb_size);
                 }
                 let _ = self.vm.free(cpu, base);
                 return Err(error);
@@ -368,6 +407,7 @@ impl Sys {
             exact_deadline: false,
             spin: Default::default(),
             progress: Default::default(),
+            poll_peek_depth: 0,
             thread_handle,
             wait_objects: Vec::new(),
         });
@@ -436,7 +476,7 @@ impl Sys {
                 self.vm.free(cpu, storage.stack)?;
                 storage.stack = 0;
             }
-            cpu.unmap(context.teb, PAGE)?;
+            cpu.unmap(context.teb, self.teb_pages * PAGE)?;
             context.storage = None;
             context.initial_registers.clear();
             context.bootstrap_pending = None;
@@ -997,6 +1037,46 @@ impl Sys {
         ready.peek().is_some() && ready.all(|c| c.yielded)
     }
 
+    /// Classify this host call as a clock read, empty message peek or yield.
+    pub fn poll_observation(&mut self) {
+        self.poll_observed = true;
+    }
+
+    /// Begin the implementation of a message peek, including its nested host calls.
+    pub fn begin_poll_peek(&mut self) {
+        self.poll_observation();
+        self.contexts[self.current as usize].poll_peek_depth += 1;
+    }
+
+    pub fn end_poll_peek(&mut self, empty: bool) {
+        self.contexts[self.current as usize].poll_peek_depth -= 1;
+        if !empty {
+            self.poll_work();
+        }
+    }
+
+    /// A guest callback or nonempty peek invalidates an enclosing observation.
+    pub fn poll_work(&mut self) {
+        self.poll_activity = self.poll_activity.wrapping_add(1);
+        self.contexts[self.current as usize].progress.new_work();
+    }
+
+    fn poll_generation(&self) -> (u64, u64, Option<u64>) {
+        (
+            self.poll_activity,
+            self.objects.generation(),
+            self.poll_wake.as_ref().map(|wake| wake.generation()),
+        )
+    }
+
+    fn quiet_polling(&self) -> bool {
+        self.poll_wake.is_some()
+            && self
+                .active_contexts()
+                .filter(|c| c.is_ready())
+                .all(|c| c.progress.quiet())
+    }
+
     /// Every ready context repeats earlier yield intervals (PROC-CLOCK-5).
     fn polling_settled(&self) -> bool {
         self.active_contexts()
@@ -1232,6 +1312,7 @@ fn apply(
                     "guest call to {target:#x}: stack write failed: {e}"
                 )));
             }
+            let callee_saved = sched::CALLEE_SAVED.map(|reg| cpu.reg(reg));
             cpu.set_reg(Reg::Esp, sp);
             cpu.set_reg(Reg::Eip, target);
             sys.next_frame_id = id;
@@ -1242,10 +1323,47 @@ fn apply(
                 unwindable,
                 then,
                 origin,
+                callee_saved,
             });
             Ok(())
         }
         Outcome::ResumeExecution(checkpoint) => checkpoint.restore(cpu, sys).map_err(Parked::Fail),
+        Outcome::ReturnFromCall(value) => {
+            let context = sys.current as usize;
+            if sys.contexts[context]
+                .frames
+                .last()
+                .is_none_or(|frame| origin.esp >= frame.return_floor)
+            {
+                return Err(Parked::Fail(
+                    "callback return outside a guest call made for a host call".into(),
+                ));
+            }
+            let Some(Frame {
+                then,
+                origin: outer,
+                callee_saved,
+                ..
+            }) = sys.contexts[context].frames.pop()
+            else {
+                unreachable!()
+            };
+            cpu.set_reg(Reg::Esp, outer.esp);
+            for (reg, value) in sched::CALLEE_SAVED.into_iter().zip(callee_saved) {
+                cpu.set_reg(reg, value);
+            }
+            let out = then(
+                &mut Env {
+                    context: sys.current,
+                    cpu: &mut *cpu,
+                    sys: &mut *sys,
+                    ext: &mut *ext,
+                    thunk: outer.thunk,
+                },
+                Resume::Returned(value),
+            );
+            apply(cpu, sys, ext, out, outer, defer_work)
+        }
         Outcome::Block {
             wait,
             then,
@@ -1528,9 +1646,6 @@ impl Dispatch<'_> {
         self.sys
             .recent
             .push(self.sys.current, index, cpu.read_u32(esp).unwrap_or(0));
-        self.sys.contexts[self.sys.current as usize]
-            .progress
-            .call(index);
         self.sys.host_calls += 1;
         self.sys.stats.total.host_calls += 1;
         if self
@@ -1546,6 +1661,7 @@ impl Dispatch<'_> {
             )));
         }
         let t0 = self.sys.stats.start();
+        self.sys.poll_observed = false;
         let out = (f.handler)(&mut Env {
             context: self.sys.current,
             cpu: &mut *cpu,
@@ -1553,9 +1669,41 @@ impl Dispatch<'_> {
             ext: &mut *self.ext,
             thunk: index,
         });
+        let observed = std::mem::take(&mut self.sys.poll_observed);
+        let context = &mut self.sys.contexts[self.sys.current as usize];
+        let observation = observed || context.poll_peek_depth != 0;
+        context.progress.call(index, observation);
+        if !observation {
+            self.sys.poll_activity = self.sys.poll_activity.wrapping_add(1);
+        }
         let r = apply(cpu, self.sys, self.ext, out, origin, self.defer_work);
         self.sys.stats.host(t0, index, true, &self.sys.thunks);
         r
+    }
+
+    /// The trap action for the result of an INT, which began in frame
+    /// `frame_before`.
+    fn action(
+        &mut self,
+        cpu: &mut dyn Guest,
+        res: Result<(), Parked>,
+        frame_before: u32,
+    ) -> TrapAction {
+        match res {
+            Ok(()) if self.yield_on_frame && self.sys.completed_frames != frame_before => {
+                // Return/Call has already committed its stack and continuation state.
+                // Parking here does not fabricate a Sleep or re-execute the host call.
+                self.parked = Some(Parked::HostYield {
+                    resume_eip: cpu.reg(Reg::Eip),
+                });
+                TrapAction::Park
+            }
+            Ok(()) => TrapAction::Continue,
+            Err(p) => {
+                self.parked = Some(p);
+                TrapAction::Park
+            }
+        }
     }
 
     fn guest_return(&mut self, cpu: &mut dyn Guest) -> Result<(), Parked> {
@@ -1600,78 +1748,39 @@ impl Dispatch<'_> {
 }
 
 impl TrapHandler for Dispatch<'_> {
-    fn leaf_call(&self, pc: u32, word: u32) -> bool {
-        if self.sys.trace.enabled()
-            || self.sys.call_limit.is_some()
-            || !self.sys.thunks.is_thunk_page(pc)
-            || !self.sys.thunks.is_thunk_page(pc.wrapping_sub(5))
-        {
-            return false;
+    fn native_region(&self, pc: u32, code: &[u8]) -> Vec<adv_cpu::native_region::NativeRegion> {
+        if self.sys.trace.enabled() || self.sys.call_limit.is_some() {
+            return Vec::new();
         }
-        self.sys.thunks.transport_index(word).is_some_and(|index| {
-            let f = self.sys.thunks.get(index).f;
-            f.leaf.is_some() || f.env_leaf.is_some()
-        })
+        self.ext
+            .try_get::<NativeAdmission>()
+            .map_or_else(Vec::new, |admission| (admission.0)(pc, code))
     }
 
-    fn on_leaf(&mut self, cpu: &mut dyn Guest, pc: u32, word: u32) -> Option<u64> {
-        if !self.leaf_call(pc, word) {
-            return None;
-        }
-        let esp = cpu.reg(Reg::Esp).wrapping_add(4);
-        if self
-            .sys
-            .current_context()
-            .frames
-            .last()
-            .is_some_and(|frame| esp >= frame.stack)
+    fn host_thunk(&self, pc: u32, word: u32) -> Option<u32> {
+        // Only pristine thunk pairs; hooks that move the INT stay raw traps.
+        if !self.sys.thunks.is_thunk_page(pc)
+            || !self.sys.thunks.is_thunk_page(pc.wrapping_sub(5))
+            || pc == self.sys.guest_return_entry
         {
             return None;
         }
-        if cpu.read_u32(cpu.reg(Reg::Esp)).ok() != Some(word) {
+        self.sys.thunks.transport_index(word)
+    }
+
+    fn on_host_call(&mut self, cpu: &mut dyn Guest, thunk: u32) -> TrapAction {
+        let frame_before = self.sys.completed_frames;
+        cpu.set_reg(Reg::Esp, cpu.reg(Reg::Esp).wrapping_add(4));
+        let res = self.host_call(cpu, thunk);
+        self.action(cpu, res, frame_before)
+    }
+
+    fn redirect(&self, pc: u32) -> Option<(u32, &[u8])> {
+        if self.sys.trace.enabled() || self.sys.call_limit.is_some() {
             return None;
         }
-        let index = self.sys.thunks.transport_index(word)?;
-        let binding = self.sys.thunks.get(index).f;
-        let old_esp = cpu.reg(Reg::Esp);
-        let old_edx = cpu.reg(Reg::Edx);
-        cpu.set_reg(Reg::Esp, esp);
-        let value = if let Some(handler) = binding.env_leaf {
-            handler(&mut Env {
-                context: self.sys.current,
-                cpu: &mut env_leaf::Cpu(cpu),
-                sys: self.sys,
-                ext: self.ext,
-                thunk: index,
-            })
-        } else {
-            Some(binding.leaf?(&mut LeafEnv::new(&mut Env {
-                context: self.sys.current,
-                cpu,
-                sys: self.sys,
-                ext: self.ext,
-                thunk: index,
-            })))
-        };
-        let Some(value) = value else {
-            cpu.set_reg(Reg::Esp, old_esp);
-            cpu.set_reg(Reg::Edx, old_edx);
-            self.sys.stats.leaf_abandons += 1;
-            self.sys.stats.leaf_abandon(index, &self.sys.thunks);
-            return None;
-        };
-        self.sys.recent.push(
-            self.sys.current,
-            index,
-            cpu.read_u32(cpu.reg(Reg::Esp)).unwrap_or(0),
-        );
-        self.sys.contexts[self.sys.current as usize]
-            .progress
-            .call(index);
-        self.sys.host_calls += 1;
-        self.sys.stats.total.host_calls += 1;
-        self.sys.stats.leaf(index, &self.sys.thunks);
-        Some(value)
+        let (target, original) = self.sys.redirects.get(&pc)?;
+        Some((*target, original))
     }
 
     fn guest_time_us(&mut self) -> Option<u64> {
@@ -1723,21 +1832,7 @@ impl TrapHandler for Dispatch<'_> {
                 }
             }
         };
-        match res {
-            Ok(()) if self.yield_on_frame && self.sys.completed_frames != frame_before => {
-                // Return/Call has already committed its stack and continuation state.
-                // Parking here does not fabricate a Sleep or re-execute the host call.
-                self.parked = Some(Parked::HostYield {
-                    resume_eip: cpu.reg(Reg::Eip),
-                });
-                TrapAction::Park
-            }
-            Ok(()) => TrapAction::Continue,
-            Err(p) => {
-                self.parked = Some(p);
-                TrapAction::Park
-            }
-        }
+        self.action(cpu, res, frame_before)
     }
 }
 
@@ -1818,7 +1913,6 @@ impl<B: Backend> Machine<B> {
             "process_entry",
             HostFn {
                 leaf: None,
-                env_leaf: None,
                 conv: Conv::Cdecl { argc: 0 },
                 handler: process_entry,
                 data: 0,
@@ -1853,6 +1947,9 @@ impl<B: Backend> Machine<B> {
         }
         let sys = Sys {
             clock,
+            poll_wake: None,
+            poll_observed: false,
+            poll_activity: 0,
             invocation_arguments: None,
             trace: Trace::default(),
             thunks,
@@ -1865,6 +1962,8 @@ impl<B: Backend> Machine<B> {
             completed_frames: 0,
             frame_pacer: None,
             pid: 0x1000,
+            peb: PEB_ADDR,
+            teb_pages: 1,
             process_identity: process::ProcessIdentity::new(0x1000),
             next_tid: 0x1004,
             images: Images::default(),
@@ -1878,6 +1977,7 @@ impl<B: Backend> Machine<B> {
             process_return: None,
             process_prepare: None,
             context_wait: None,
+            context_run: None,
             exception_handler: None,
             first_cpu_fault: None,
             latest_cpu_fault: None,
@@ -1886,6 +1986,7 @@ impl<B: Backend> Machine<B> {
             next_frame_id: 0,
             recent: RecentCalls::new(256),
             host_calls: 0,
+            redirects: HashMap::new(),
             call_limit: None,
             stats: Stats::new(),
             schedule_trace: schedule_trace::ScheduleTrace::default(),
@@ -2031,6 +2132,7 @@ impl<B: Backend> Machine<B> {
         self.frame_handoff = parent.frame_handoff;
         self.time_skip_source = parent.time_skip_source.clone();
         self.sys.stats.enabled = parent.sys.stats.enabled;
+        self.sys.stats.services_enabled = parent.sys.stats.services_enabled;
         self.sys.call_limit = parent.sys.call_limit;
         self.sys.trace = parent.sys.trace.clone();
     }
@@ -2396,6 +2498,7 @@ impl<B: Backend> Machine<B> {
         // Do not sleep the host after only one poller ran. Every currently ready
         // context must first get a turn in this scheduler invocation.
         self.sys.wakes.begin_slice();
+        let mut poll_generation = self.sys.poll_generation();
         loop {
             if let Some(budget) = hard_budget {
                 let remaining =
@@ -2420,11 +2523,28 @@ impl<B: Backend> Machine<B> {
             }
             self.sys.wake();
             self.sys.advance_if_only_polling();
+            let generation = self.sys.poll_generation();
+            if generation != poll_generation {
+                if (generation.1, generation.2) != (poll_generation.1, poll_generation.2) {
+                    self.sys.wakes.begin_slice();
+                }
+                poll_generation = generation;
+                for context in &mut self.sys.contexts {
+                    context.progress.new_work();
+                }
+            }
             // Real time: polling contexts would spin the host. Hand control back so the host
             // can wait (at most 1 ms) like the OS would schedule them.
+            // Requested skipping retains the full proof: bounded iteration work
+            // can repeat quiet APIs while still advancing the game.
             if !self.sys.clock.is_virtual()
                 && self.sys.only_polling()
-                && self.sys.polling_settled()
+                && (self.sys.polling_settled()
+                    || (self.sys.quiet_polling()
+                        && !self
+                            .time_skip_source
+                            .as_ref()
+                            .is_some_and(|source| source(self.sys.completed_frames == 0))))
                 && self
                     .sys
                     .wakes
@@ -2658,6 +2778,15 @@ impl<B: Backend> Machine<B> {
                 self.cpu.set_execution_budget(hard_budget);
             }
 
+            if let Some(hook) = self.sys.context_run {
+                hook(&mut Env {
+                    context: id,
+                    cpu: &mut self.cpu,
+                    sys: &mut self.sys,
+                    ext: &mut self.ext,
+                    thunk: 0,
+                });
+            }
             let run_started = Instant::now();
             let hook_before = self.sys.stats.total.hook_ns;
             if self.sys.schedule_trace.enabled() {

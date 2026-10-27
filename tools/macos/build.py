@@ -55,11 +55,15 @@ def configure(profile: dict, prefix: Path, mobile: str | None = None) -> list[st
     else:
         target = [f"--extra-cflags=-mmacosx-version-min={profile['minimum_macos']}",
                   f"--extra-ldflags=-mmacosx-version-min={profile['minimum_macos']}"]
+    media = ['--enable-demuxer=mov', '--enable-decoder=aac', '--enable-parser=aac']
+    if mobile != 'android':
+        media += ['--enable-videotoolbox',
+                  '--enable-hwaccel=h264_videotoolbox,hevc_videotoolbox,mpeg2_videotoolbox,mpeg4_videotoolbox']
     return [f'--prefix={prefix}', '--enable-static', '--disable-shared', '--enable-pic',
             '--disable-everything', '--disable-autodetect', '--disable-programs', '--disable-doc',
             '--disable-network', '--disable-debug', '--enable-small', '--disable-avdevice',
             '--disable-avfilter', '--disable-encoders', '--disable-muxers',
-            '--disable-gpl', '--disable-nonfree', '--disable-version3', *target,
+            '--disable-gpl', '--disable-nonfree', '--disable-version3', *target, *media,
             '--enable-demuxer=' + ','.join(profile['demuxers']),
             '--enable-decoder=' + ','.join(profile['decoders']),
             '--enable-parser=' + ','.join(profile['parsers'])]
@@ -120,8 +124,12 @@ def build(jobs: int, ffmpeg_only: bool, mobile: str | None = None) -> dict:
             # bindgen parses FFmpeg's headers against the NDK's libc headers.
             sysroot = (f"export BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android='--sysroot={ndk_toolchain()}/sysroot"
                        f" --target=aarch64-linux-android{profile['minimum_android']}'\n") if mobile == 'android' else ''
+            wine_dist = os.environ.get('ADV_WINE_DIST')
+            wine = (f"export ADV_WINE_DIST={shlex.quote(str(Path(wine_dist).resolve()))}\n"
+                    if wine_dist else '')
             wrapper.write_text('#!/bin/sh\n'
                                f"export FFMPEG_DIR='{prefix}'\n"
+                               f"{wine}"
                                "export LIBCLANG_PATH='/Library/Developer/CommandLineTools/usr/lib'\n"
                                "export CARGO_PROFILE_RELEASE_STRIP=debuginfo\n"
                                "case \" $* \" in *' --release '*)\n"

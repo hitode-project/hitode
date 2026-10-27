@@ -1,17 +1,20 @@
 //! Translation units (A64-TR-3).
 //!
-//! `trace` picks the guest instructions of a unit and analyses them; this
-//! module emits them in trace order, with side exits, edge trampolines and
+//! The front end builds a [`Unit`]: `trace` picks the guest instructions
+//! and analyses them, and `tables` finds the switch tables they index. A
+//! [`Backend`] lowers it (A64-TR-7). The JIT back end, [`Jit`], emits the
+//! instructions in trace order, with side exits, edge trampolines and
 //! refusals after the body, and `ops` emits each instruction.
 //!
-//! Flags follow A64-FLAG-1 to A64-FLAG-5. SF ZF OF live in NZCV. CF lives in NZCV's C in a
+//! Flags follow A64-FLAG-1 to A64-FLAG-5. SF ZF OF live in NZCV or recipes.
+//! CF lives in NZCV's C in a
 //! tracked carry sense, or lazily as a `Carry` over values still in
 //! registers; while C holds it, a `derivable` expression may still compute
 //! it, so an `inc` or `dec` that keeps CF can let C go. PF and AF stay a
 //! recipe over such values until something would overwrite them. Flags no
 //! path reads before writing them again are not computed. Every exit makes
 //! the flags canonical, an internal edge only those its target reads, and
-//! every fault site records sense, carry, recipe and the SIMD dirty mask for
+//! every fault site records sense, carry, flag recipes and the SIMD dirty mask for
 //! the owner. MMX values are published before control edges and observers
 //! (A64F-FP-4), except integer pixel-loop backedges (A64-TR-5). XMM writes
 //! remain immediate outside those loops.
@@ -41,6 +44,7 @@ mod decode;
 pub mod first;
 mod flags;
 mod integer;
+mod native_region;
 mod ops;
 mod pixels;
 mod simd;
@@ -54,6 +58,7 @@ mod x87;
 use iced_x86::ConditionCode;
 
 pub use decode::Helper;
+pub(crate) use flags::Overflow;
 pub use flags::{Carry, Operand, Recipe, Sense};
 pub use trace::MAX_INSTRUCTIONS;
 
@@ -88,6 +93,10 @@ pub struct Site {
     pub sense: Sense,
     pub carry: Carry,
     pub recipe: Recipe,
+    /// A pending result supplies SF and ZF; otherwise NZCV holds them.
+    pub(crate) nz: Option<Operand>,
+    /// OF as hardware V or a recipe over recoverable operands.
+    pub(crate) overflow: Overflow,
     /// Whether the access checks its page first, so a fault here is not
     /// a reason to check it.
     pub checked: bool,
@@ -99,12 +108,69 @@ pub struct Site {
     pub resume: i32,
 }
 
-/// The last unit translated, in buffers the next translation reuses.
+/// A unit as the front end leaves it, for a back end to lower (A64-TR-7):
+/// its trace with the analysis back ends share, and the switch tables it
+/// may index directly.
 #[derive(Default)]
-pub struct Workspace {
+pub struct Unit {
+    /// The executable images, whose read-only tables may be indexed.
     pub(crate) images: Vec<(u32, u32)>,
     pub(crate) tables: Vec<tables::Table>,
     pub(crate) trace: Trace,
+    regions: Vec<(usize, adv_cpu_core::native_region::NativeRegion)>,
+}
+
+impl Unit {
+    /// Traces the unit at `eip`, ending before any of `stops`. Each byte
+    /// the unit depends on is registered with `watch_code`, so a store to
+    /// it reaches the owner. `host` and `redirect` are as for
+    /// [`Trace::build`].
+    pub fn build(
+        &mut self,
+        memory: &mut adv_cpu_core::memory::Memory,
+        eip: u32,
+        stops: &[u32],
+        host: &dyn Fn(u32, u32) -> Option<u32>,
+        redirect: &dyn Fn(u32) -> Option<(u32, Vec<u8>)>,
+    ) {
+        self.regions.clear();
+        self.trace.build(memory, eip, stops, host, redirect);
+        tables::prepare(self, memory);
+        for &(start, len) in &self.trace.code {
+            memory.watch_code(start, len as usize);
+        }
+    }
+
+    /// Guest bytes the unit depends on, as sorted
+    /// (address, length) spans.
+    pub fn code(&self) -> &[(u32, u32)] {
+        &self.trace.code
+    }
+
+    /// What the unit's `interpret` calls run, from the base index its
+    /// back end was given.
+    pub fn helpers(&mut self) -> std::vec::Drain<'_, Helper> {
+        self.trace.helpers.drain(..)
+    }
+}
+
+/// A translator back end (A64-TR-7).
+pub trait Backend {
+    /// Lowers `unit`, traced from `eip`. A back end records where it put
+    /// the unit's tables in them.
+    fn lower(&mut self, unit: &mut Unit, eip: u32);
+}
+
+/// The last unit translated, in buffers the next translation reuses.
+#[derive(Default)]
+pub struct Workspace {
+    pub(crate) unit: Unit,
+    pub(crate) code: Code,
+}
+
+/// The JIT back end's output, in buffers the next unit reuses.
+#[derive(Default)]
+pub struct Code {
     asm: Asm,
     labels: Vec<Label>,
     sites: Vec<(usize, Site)>,
@@ -114,7 +180,7 @@ pub struct Workspace {
     links: Vec<Link>,
     marks: Vec<Mark>,
     retired: u32,
-    pub(crate) channels: bool,
+    pub(crate) uses_permissions: bool,
 }
 
 /// A link point of a unit: a branch to the owner's helper that may become
@@ -131,46 +197,45 @@ pub struct Link {
 
 impl Workspace {
     pub fn words(&self) -> &[u32] {
-        self.asm.words()
+        self.code.asm.words()
     }
 
     /// Byte offset of each site in `words`.
     pub fn sites(&self) -> &[(usize, Site)] {
-        &self.sites
+        &self.code.sites
     }
 
     /// Instructions the entry prepays: the unit runs only with that much
     /// countdown.
     pub fn retired(&self) -> u32 {
-        self.retired
+        self.code.retired
     }
 
     /// Guest bytes the unit depends on, as sorted
     /// (address, length) spans.
     pub fn code(&self) -> &[(u32, u32)] {
-        &self.trace.code
+        self.unit.code()
     }
 
     pub fn links(&self) -> &[Link] {
-        &self.links
+        &self.code.links
     }
 
     /// Where each stretch of the unit starts, for samplers.
     pub fn marks(&self) -> &[Mark] {
-        &self.marks
+        &self.code.marks
     }
 
     /// What the unit's `interpret` calls run, from the base index
     /// `translate` was given on.
     pub fn helpers(&mut self) -> std::vec::Drain<'_, Helper> {
-        self.trace.helpers.drain(..)
+        self.unit.helpers()
     }
 }
 
 /// Host addresses of the `runtime` stubs units branch to.
 #[derive(Clone, Copy, Debug)]
 pub struct Stubs {
-    pub leaf: usize,
     pub exit: usize,
     pub dispatch: usize,
     /// Continues at the guest EIP in w16 through the indirect table.
@@ -183,6 +248,8 @@ pub struct Stubs {
     pub access: usize,
     /// An instruction the interpreter runs.
     pub interpret: usize,
+    /// A recognized host call.
+    pub call: usize,
     /// Where a faulting site leaves.
     pub fault: usize,
 }
@@ -229,6 +296,8 @@ struct State {
     /// CF as an expression over live values, while C also holds it.
     derivable: Option<Carry>,
     recipe: Recipe,
+    nz: Option<Operand>,
+    overflow: Overflow,
 }
 
 impl State {
@@ -238,6 +307,8 @@ impl State {
         carry: Carry::Host,
         derivable: None,
         recipe: Recipe::Canonical,
+        nz: None,
+        overflow: Overflow::Host,
     };
 }
 
@@ -246,6 +317,7 @@ impl State {
 #[derive(Clone, Copy)]
 enum Test {
     Cond(Cond),
+    Zero(Reg, bool),
     /// PF set (true) or clear, from w16's bit 0.
     Parity(bool),
     EcxZero,
@@ -257,6 +329,8 @@ enum Test {
 
 /// Code emitted after the unit body.
 enum Cold {
+    /// A short branch from x87 arithmetic to its distant generic path.
+    X87Guard { label: Label, generic: Label },
     Table {
         index: usize,
         table: Label,
@@ -356,6 +430,7 @@ struct Translator<'a> {
     stubs: Stubs,
     /// Guest instructions whose accesses check their page first.
     checked: &'a dyn Fn(u32) -> bool,
+    regions: &'a [(usize, adv_cpu_core::native_region::NativeRegion)],
     /// The index of the first helper of the unit.
     helpers: u32,
     /// Whether the instruction being emitted is one.
@@ -370,7 +445,7 @@ struct Translator<'a> {
     vector: simd::Vector,
     pixel: Option<pixels::Active>,
     pixel_copies: Vec<pixels::Copy>,
-    channels: &'a mut bool,
+    uses_permissions: &'a mut bool,
     /// The x87 run whose stack lives in host registers, if any.
     x87: x87::Cache,
     /// Sites inside such runs and the stubs that publish before faulting.
@@ -396,75 +471,105 @@ pub fn translate(
     features: Features,
     at: usize,
     stubs: Stubs,
-    leaf: &dyn Fn(u32, u32) -> bool,
+    host: &dyn Fn(u32, u32) -> Option<u32>,
+    redirect: &dyn Fn(u32) -> Option<(u32, Vec<u8>)>,
+    admit: &dyn Fn(u32, &[u8]) -> Vec<adv_cpu_core::native_region::NativeRegion>,
     control: u16,
 ) {
-    work.trace.build(memory, eip, stops, leaf);
-    tables::prepare(work, memory);
-    for &(start, len) in &work.trace.code {
-        memory.watch_code(start, len as usize);
-    }
-    let Workspace {
-        trace,
-        asm,
-        labels,
-        sites,
-        cold,
-        far,
-        links,
-        marks,
-        retired,
-        channels,
-        tables,
-        images: _,
-    } = work;
-    *channels = false;
-    asm.reset();
-    labels.clear();
-    labels.extend((0..trace.len()).map(|_| asm.label()));
-    sites.clear();
-    cold.clear();
-    far.clear();
-    links.clear();
-    marks.clear();
-    let mut t = Translator {
-        asm,
+    work.unit.build(memory, eip, stops, host, redirect);
+    work.unit.prepare_regions(memory, admit, checked);
+    Jit {
+        code: &mut work.code,
         features,
-        trace,
-        labels,
-        sites,
-        cold,
-        marks,
-        far,
-        links,
-        tables,
+        at,
         stubs,
         checked,
         helpers,
-        checking: false,
-        state: State::CANONICAL,
-        index: 0,
-        out: FlagSet::ALL,
-        keep: FlagSet::ALL,
-        vector: simd::Vector::default(),
-        pixel: None,
-        pixel_copies: Vec::new(),
-        channels,
-        x87: x87::Cache::default(),
-        x87_sites: Vec::new(),
         control,
-    };
-    if trace.len() == 0 {
-        // Nothing to translate: other units may still link here.
-        t.exit(Exit::Interpret, eip);
-        *retired = 0;
-    } else {
-        for index in 0..trace.len() {
-            t.instruction(index);
-        }
-        *retired = trace.prepaid(0);
     }
-    t.finish(at);
+    .lower(&mut work.unit, eip);
+}
+
+/// The JIT back end: A64 code for host address `at`, with the parameters
+/// of [`translate`].
+pub struct Jit<'a> {
+    pub code: &'a mut Code,
+    pub features: Features,
+    pub at: usize,
+    pub stubs: Stubs,
+    pub checked: &'a dyn Fn(u32) -> bool,
+    pub helpers: u32,
+    pub control: u16,
+}
+
+impl Backend for Jit<'_> {
+    fn lower(&mut self, unit: &mut Unit, eip: u32) {
+        let Code {
+            asm,
+            labels,
+            sites,
+            cold,
+            far,
+            links,
+            marks,
+            retired,
+            uses_permissions,
+        } = &mut *self.code;
+        let Unit {
+            trace,
+            tables,
+            regions,
+            ..
+        } = unit;
+        *uses_permissions = false;
+        asm.reset();
+        labels.clear();
+        labels.extend((0..trace.len()).map(|_| asm.label()));
+        sites.clear();
+        cold.clear();
+        far.clear();
+        links.clear();
+        marks.clear();
+        let mut t = Translator {
+            asm,
+            features: self.features,
+            trace,
+            labels,
+            sites,
+            cold,
+            marks,
+            far,
+            links,
+            tables,
+            stubs: self.stubs,
+            checked: self.checked,
+            regions,
+            helpers: self.helpers,
+            checking: false,
+            state: State::CANONICAL,
+            index: 0,
+            out: FlagSet::ALL,
+            keep: FlagSet::ALL,
+            vector: simd::Vector::default(),
+            pixel: None,
+            pixel_copies: Vec::new(),
+            uses_permissions,
+            x87: x87::Cache::default(),
+            x87_sites: Vec::new(),
+            control: self.control,
+        };
+        if trace.len() == 0 {
+            // Nothing to translate: other units may still link here.
+            t.exit(Exit::Interpret, eip);
+            *retired = 0;
+        } else {
+            for index in 0..trace.len() {
+                t.instruction(index);
+            }
+            *retired = trace.prepaid(0);
+        }
+        t.finish(self.at);
+    }
 }
 
 impl Translator<'_> {
@@ -529,9 +634,18 @@ impl Translator<'_> {
         self.checking = (self.checked)(inst.pc);
         if self.checking && inst.effects.site {
             self.vector.fp_default = false;
+            self.vector.fp_pe = false;
         }
-        self.out = trace.live_out[index];
-        self.keep = self.out.minus(inst.effects.writes);
+        self.out = trace.observe_out[index];
+        self.keep = trace.observe_out[index].minus(inst.effects.writes);
+        // Other flag writers use their existing exact hardware forms.
+        if !matches!(
+            inst.op,
+            decode::Op::Alu(..) | decode::Op::Step(..) | decode::Op::Shift(..)
+        ) && inst.effects.writes.any(FlagSet::NZV)
+        {
+            self.host_nzv(FlagSet::NZV.minus(inst.effects.writes));
+        }
         let steady = self.pixel.is_some_and(|p| p.steady);
         if self.x87.active && trace.merge[index] {
             self.x87_merge(index);
@@ -567,6 +681,7 @@ impl Translator<'_> {
         }
         if !steady {
             self.asm.bind(self.labels[index]);
+            self.native_batch(index);
             self.pixel_start(index);
             self.channel_batch(index);
         }
@@ -738,6 +853,10 @@ impl Translator<'_> {
                 ]);
                 Test::Parity(cc == Cc::Flags(ConditionCode::p))
             }
+            Cc::Flags(cc @ (ConditionCode::e | ConditionCode::ne)) if self.state.nz.is_some() => {
+                let value = self.narrow(self.state.nz.unwrap());
+                Test::Zero(value, cc == ConditionCode::ne)
+            }
             Cc::Flags(cc) => Test::Cond(self.condition(cc)),
             Cc::EcxZero => Test::EcxZero,
             Cc::CxZero => {
@@ -763,6 +882,7 @@ impl Translator<'_> {
     fn jump_if(&mut self, test: Test, label: Label) {
         match test {
             Test::Cond(cond) => self.asm.b_cond(cond, label),
+            Test::Zero(reg, nonzero) => self.asm.cbz(W, nonzero, reg, label),
             Test::Parity(set) => self.asm.tbz(!set, X16, 0, label),
             Test::EcxZero => self.asm.cbz(W, false, host(1), label),
             Test::CxZero => self.asm.cbz(W, false, X16, label),
@@ -786,6 +906,8 @@ impl Translator<'_> {
                 sense: self.state.sense,
                 carry: self.state.carry,
                 recipe: self.state.recipe,
+                nz: self.state.nz,
+                overflow: self.state.overflow,
                 checked: self.checking,
                 simd_dirty: self.vector.dirty,
                 resume: 0,
@@ -799,10 +921,13 @@ impl Translator<'_> {
         let state = self.state;
         flags.any(FlagSet::CF) && (state.carry != Carry::Host || state.sense != Sense::Subtraction)
             || flags.any(FlagSet::PF.or(FlagSet::AF)) && state.recipe != Recipe::Canonical
+            || flags.any(FlagSet::ZF.or(FlagSet::SF)) && state.nz.is_some()
+            || flags.any(FlagSet::OF) && state.overflow != Overflow::Host
     }
 
     /// Puts `flags` in canonical form; the others keep their form.
     fn convert(&mut self, flags: FlagSet) {
+        self.host_nzv(flags);
         if flags.any(FlagSet::CF) {
             self.host_carry();
             self.set_sense(Sense::Subtraction);
@@ -821,11 +946,19 @@ impl Translator<'_> {
         self.state.carry = Carry::Host;
         self.state.derivable = None;
         self.state.recipe = Recipe::Canonical;
+        self.state.nz = None;
+        self.state.overflow = Overflow::Host;
     }
 
     /// Called before an instruction writes `operand`: keeps what the flags
     /// still need from it. `forget` must follow the write.
     fn prepare(&mut self, operand: Operand) {
+        if self.state.nz == Some(operand) && self.keep.any(FlagSet::SF.or(FlagSet::ZF)) {
+            self.host_nzv(FlagSet::ZF.or(FlagSet::SF));
+        }
+        if self.state.overflow.uses(operand) && self.keep.any(FlagSet::OF) {
+            self.host_nzv(FlagSet::OF);
+        }
         if self.state.recipe.uses(operand) && self.keep.any(FlagSet::PF.or(FlagSet::AF)) {
             self.materialize();
         }
@@ -837,6 +970,12 @@ impl Translator<'_> {
     /// After `operand` changed: drops what still reads it, all dead.
     fn forget(&mut self, operand: Operand) {
         let state = &mut self.state;
+        if state.nz == Some(operand) {
+            state.nz = None;
+        }
+        if state.overflow.uses(operand) {
+            state.overflow = Overflow::Host;
+        }
         if state.recipe.uses(operand) {
             state.recipe = Recipe::Canonical;
         }
@@ -857,12 +996,54 @@ impl Translator<'_> {
     /// A recipe temporary neither the recipe nor a lazy carry reads.
     fn take_temp(&mut self) -> u8 {
         let free = |state: &State, t: u8| {
-            !state.recipe.uses(Operand::Temp(t)) && !state.carry.uses(Operand::Temp(t))
+            !state.recipe.uses(Operand::Temp(t))
+                && !state.carry.uses(Operand::Temp(t))
+                && state.nz != Some(Operand::Temp(t))
+                && !state.overflow.uses(Operand::Temp(t))
         };
         if !free(&self.state, 0) && !free(&self.state, 1) {
-            self.host_carry();
+            self.canonicalize();
         }
         if free(&self.state, 0) { 0 } else { 1 }
+    }
+
+    /// Restores pending N/Z/V without changing C or the other flag sources.
+    fn host_nzv(&mut self, flags: FlagSet) {
+        if flags.any(FlagSet::ZF.or(FlagSet::SF))
+            && let Some(result) = self.state.nz.take()
+        {
+            let result = self.narrow(result);
+            self.emit_all(&[
+                mrs_nzcv(X13),
+                ubfx(W, X14, result, 31, 1),
+                bfi(X, X13, X14, 31, 1),
+                clz(W, X14, result),
+                lsr_imm(W, X14, X14, 5),
+                bfi(X, X13, X14, 30, 1),
+                msr_nzcv(X13),
+            ]);
+        }
+        if !flags.any(FlagSet::OF) {
+            return;
+        }
+        let overflow = std::mem::replace(&mut self.state.overflow, Overflow::Host);
+        let (reg, bit) = match overflow {
+            Overflow::Host => return,
+            Overflow::Clear => (Reg::ZR, 0),
+            Overflow::Bit(a, n) => (self.narrow(a), u32::from(n)),
+            Overflow::Xor(a, n, m) => {
+                let a = self.narrow(a);
+                self.emit(eor(W, X17, a, a, Shift::Lsr, u32::from(n - m)));
+                (X17, u32::from(m))
+            }
+            Overflow::Step(a, increment) => {
+                let a = self.narrow(a);
+                let expected = self.imm(if increment { 0x8000_0000 } else { 0x7fff_ffff }, X14);
+                self.emit_all(&[eor(W, X17, a, expected, Lsl, 0), clz(W, X17, X17)]);
+                (X17, 5)
+            }
+        };
+        self.insert_flags(None, Some((reg, bit)));
     }
 
     /// Makes x10 and x11 canonical for the current recipe; uses w17.
@@ -1008,7 +1189,7 @@ impl Translator<'_> {
             sense: Sense::Addition,
             carry: Carry::Host,
             derivable: Some(carry),
-            recipe: self.state.recipe,
+            ..self.state
         };
     }
 
@@ -1052,6 +1233,7 @@ impl Translator<'_> {
     /// flipping to subtraction sense where no single condition reads it.
     fn condition(&mut self, cc: ConditionCode) -> Cond {
         use ConditionCode as C;
+        self.host_nzv(FlagSet::of(cc));
         if FlagSet::of(cc).any(FlagSet::CF) {
             self.host_carry();
         }
@@ -1156,6 +1338,10 @@ impl Translator<'_> {
 
     fn cold(&mut self, cold: Cold, at: usize) {
         match cold {
+            Cold::X87Guard { label, generic } => {
+                self.asm.bind(label);
+                self.asm.b(generic);
+            }
             Cold::Table { index, table, stub } => self.table_cold(index, table, stub, at),
             Cold::Leave {
                 label,

@@ -52,7 +52,8 @@ pub const RESERVED: &[(u32, u32)] = &[
 ];
 
 pub const PEB_ADDR: u32 = 0x7ffd_f000;
-/// TEB of execution storage slot `i` is at `TEB_TOP - i * PAGE`.
+/// TEB of execution storage slot `i` is at `TEB_TOP - i * PAGE`, or in
+/// blocks of more pages, [`teb_block_addr`].
 pub const TEB_TOP: u32 = 0x7ffd_e000;
 /// Concurrent execution storage limit, independent of retained thread identities.
 pub const MAX_CONTEXTS: u32 = 64;
@@ -64,7 +65,13 @@ pub const fn thunk_addr(index: u32) -> u32 {
 }
 
 pub const fn teb_addr(ctx: u32) -> u32 {
-    TEB_TOP - ctx * PAGE
+    teb_block_addr(ctx, 1)
+}
+
+/// The TEB of slot `ctx` when each slot holds `pages` pages: the TEB
+/// starts the block, and the blocks end at the page above `TEB_TOP`.
+pub const fn teb_block_addr(ctx: u32, pages: u32) -> u32 {
+    TEB_TOP - (ctx * pages + pages - 1) * PAGE
 }
 
 /// TEB/NT_TIB field offsets (x86).

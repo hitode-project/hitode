@@ -18,10 +18,8 @@ These run on the working copy and need `pnpm install --frozen-lockfile` in
 apps/adv-launcher once.
 
 --ci checks that every crate builds with default features (the launcher
-needs media, so it is left out), runs the workspace-lint Clippy gate as CI does, and approximates the
-x87-windows gate with the x86_64-apple-darwin target on a Mac, which covers
-x86_64-only code but not cfg(windows) code. Cargo commands get FFMPEG_DIR and
-LIBCLANG_PATH from Homebrew ffmpeg@8 and the Xcode clang when they are unset.
+needs media, so it is left out) and runs the workspace-lint Clippy gate as CI
+does. Cargo commands get FFMPEG_DIR and LIBCLANG_PATH from Homebrew ffmpeg@8 and the Xcode clang when they are unset.
 
 Committing code on master prints a note: the default branch accepts code only
 through pull requests, so its checks run (CONTRIBUTING.md).
@@ -37,21 +35,14 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 # Generated (tools/abi) or third-party sources: never reformatted.
-UNFORMATTED = ("data/abi/", "vendor/", "crates/adv-cpu-core/softfloat/", "tools/fixtures/vendor/")
+UNFORMATTED = ("data/abi/", "vendor/", "crates/adv-cpu-core/softfloat/")
 LAUNCHER = "apps/adv-launcher/"
 DEFAULT_BRANCHES = ("master", "main")
 # Paths whose changes CI builds or lints; anything else is documentation.
 CODE = (".rs", ".toml", ".lock", ".py", ".c", ".h", ".ps1", ".sh", ".svelte", ".ts", ".js", ".json", ".yml")
-# The Clippy gates of .github/workflows/core-performance.yml: (name, target, arguments).
+# The Clippy gate of .github/workflows/core-performance.yml.
 WORKSPACE_LINT = ["--workspace", "--all-targets", "--locked",
                   "--features", "adv-shell/gpu,adv-shell/media,adv-device/slow-tests"]
-X87_LINT = ["--workspace", "--exclude", "adv-launcher", "--exclude", "adv-jit-helper",
-            "--exclude", "tauri-plugin-storage", "--all-targets", "--release", "--locked",
-            "--features", "adv-shell/gpu"]
-CLIPPY = (("workspace-lint", None, WORKSPACE_LINT),
-          ("x87-windows (x86_64 approximation)", "x86_64-apple-darwin", X87_LINT))
-INVENTORY = ["cargo", "run", "-q", "-p", "adv-runtime", "--features", "gpu",
-             "--example", "host_call_inventory", "--"]
 HOOK = """#!/bin/sh
 # Installed by tools/check.py --install-hook; shared by every worktree.
 if [ -f tools/check.py ]; then
@@ -175,25 +166,10 @@ def master_note() -> None:
               "consider `git switch -c <type>/<topic>`")
 
 
-def installed_targets() -> set[str]:
-    return set(output(["rustup", "target", "list", "--installed"]).split())
-
-
 def clippy() -> bool:
-    env = cargo_env()
-    targets = installed_targets()
-    ok = True
-    for name, target, arguments in CLIPPY:
-        command = ["cargo", "clippy", *arguments]
-        if target is not None:
-            if sys.platform != "darwin":
-                continue
-            if target not in targets:
-                print(f"skip  clippy {name}: run `rustup target add {target}`")
-                continue
-            command += ["--target", target]
-        ok &= run(f"clippy {name}", [*command, "--", "-D", "warnings"], env)
-    return ok
+    """The workspace-lint gate of .github/workflows/core-performance.yml."""
+    return run("clippy workspace-lint",
+               ["cargo", "clippy", *WORKSPACE_LINT, "--", "-D", "warnings"], cargo_env())
 
 
 def default_features() -> bool:
@@ -204,9 +180,8 @@ def default_features() -> bool:
 
 
 def fix() -> bool:
-    """Apply rustfmt and regenerate the generated tables the checks compare against."""
+    """Apply rustfmt."""
     ok = run("cargo fmt", ["cargo", "fmt", "--all"])
-    ok &= run("host call inventory", [*INVENTORY, "--write", "docs/host-call-boundary.tsv"], cargo_env())
     changed = git("status", "--short").decode().rstrip()
     if changed:
         print("changed:\n" + changed)
@@ -233,8 +208,9 @@ def check(everything: bool, ci: bool = False) -> bool:
     ok &= run("layering", [sys.executable, "tools/layering/check_layers.py"])
     ok &= run("vfs namespace", [sys.executable, "tools/vfs/check_namespace.py"])
     ok &= run("specs", [sys.executable, "tools/spec/check_spec.py"])
+    ok &= run("wine protocol", [sys.executable, "tools/wine/protocol.py", "--check"])
+    ok &= run("wine syscalls", [sys.executable, "tools/wine/syscalls.py", "--check"])
     ok &= run("docs", [sys.executable, "tools/docs/check_docs.py"])
-    ok &= run("native fixture recordings", [sys.executable, "tools/fixtures/record_native.py", "--sources"])
     ok &= launcher(everything, ci)
     return ok
 

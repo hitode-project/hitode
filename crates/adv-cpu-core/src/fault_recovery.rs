@@ -13,16 +13,8 @@ use std::sync::OnceLock;
 
 const MAX_REGIONS: usize = 64;
 const MAX_SITES: usize = 4096;
-const GPR_COUNT: u32 = if cfg!(target_arch = "aarch64") {
-    31
-} else {
-    16
-};
-const SIMD_COUNT: u32 = if cfg!(target_arch = "aarch64") {
-    32
-} else {
-    16
-};
+const GPR_COUNT: u32 = 31;
+const SIMD_COUNT: u32 = 32;
 
 type Dispatch = unsafe extern "C" fn(i32, usize, usize, usize, *mut c_void) -> usize;
 unsafe extern "C" {
@@ -265,14 +257,13 @@ unsafe fn capture(context: *const c_void, pc: usize) -> Option<HostContextSnapsh
         pc: pc as u64,
         gpr_count: GPR_COUNT,
         simd_count: SIMD_COUNT,
-        architecture: if cfg!(target_arch = "aarch64") { 2 } else { 1 },
+        architecture: 2,
         ..HostContextSnapshot::default()
     };
     for index in 0..GPR_COUNT {
         snapshot.gpr[index as usize] = unsafe { adv_posix_fault_gpr(context, index) };
     }
-    snapshot.sp =
-        unsafe { adv_posix_fault_gpr(context, if cfg!(target_arch = "aarch64") { 31 } else { 4 }) };
+    snapshot.sp = unsafe { adv_posix_fault_gpr(context, 31) };
     snapshot.flags = unsafe { adv_posix_fault_flags(context) };
     if unsafe {
         adv_posix_fault_fp(

@@ -10,13 +10,5 @@ description = "Run an x86 Windows guest through the ADV runtime"
 [dependencies]
 adv-shell = { path = "../../crates/adv-shell" }
 
-[dev-dependencies]
-adv-runtime = { path = "../../crates/adv-runtime" }
-adv-machine = { path = "../../crates/adv-machine" }
-png = "0.17"
-
-[target.'cfg(windows)'.dev-dependencies]
-windows-sys = { version = "0.60.2", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
-
 [lints]
 workspace = true

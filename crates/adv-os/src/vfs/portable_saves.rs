@@ -36,7 +36,7 @@ pub(super) fn migrate(cfg: &OsConfig) -> io::Result<()> {
     if marker.is_file() {
         return Ok(());
     }
-    let legacy = cfg.data_dir.join("c");
+    let legacy = &cfg.system_dir;
     let roots = [
         vec!["Users", &cfg.user_name, "Documents"],
         vec!["Users", &cfg.user_name, "AppData", "Roaming"],
@@ -47,7 +47,7 @@ pub(super) fn migrate(cfg: &OsConfig) -> io::Result<()> {
     let mut found = false;
     for root in roots {
         let parts = root.into_iter().map(str::to_owned).collect::<Vec<_>>();
-        if let Some(path) = ci_find(&legacy, &parts) {
+        if let Some(path) = ci_find(legacy, &parts) {
             found |= find_saves(&path, &cfg.game_dir)?;
         }
     }

@@ -156,6 +156,7 @@ impl AudioEvent {
     }
 }
 pub(crate) enum Retired {
+    XAudio(Box<crate::xaudio2::Graph>),
     Ring(Box<RingVoice>, Arc<RingState>),
     Owned(Box<OwnedVoice>),
     Pcm(PcmBlock),
@@ -163,6 +164,7 @@ pub(crate) enum Retired {
     Notices(Vec<(u32, u32)>),
 }
 enum Command {
+    XAudio(u64, Box<crate::xaudio2::Graph>),
     Ring(u64, Box<RingVoice>, Arc<RingState>),
     Owned(u64, Box<OwnedVoice>, u64),
     Pcm(PcmBlock, u64),
@@ -180,6 +182,10 @@ enum Command {
     Suspend(bool),
 }
 enum Voice {
+    XAudio {
+        source: u64,
+        graph: Box<crate::xaudio2::Graph>,
+    },
     Ring {
         source: u64,
         voice: Box<RingVoice>,
@@ -194,17 +200,21 @@ enum Voice {
 impl Voice {
     fn source(&self) -> u64 {
         match self {
-            Self::Ring { source, .. } | Self::Owned { source, .. } => *source,
+            Self::Ring { source, .. }
+            | Self::Owned { source, .. }
+            | Self::XAudio { source, .. } => *source,
         }
     }
     fn active(&self) -> bool {
         match self {
+            Self::XAudio { graph, .. } => graph.active(),
             Self::Ring { voice, .. } => voice.active(),
             Self::Owned { voice, .. } => voice.active(),
         }
     }
     fn retire(self) -> Retired {
         match self {
+            Self::XAudio { graph, .. } => Retired::XAudio(graph),
             Self::Ring { voice, state, .. } => Retired::Ring(voice, state),
             Self::Owned { voice, .. } => Retired::Owned(voice),
         }
@@ -368,6 +378,7 @@ impl AudioControl {
                     drop(v);
                     drop(s);
                 }
+                Retired::XAudio(v) => drop(v),
                 Retired::Owned(v) => drop(v),
                 Retired::Pcm(v) => drop(v),
                 Retired::Converter(v) => drop(v),
@@ -605,6 +616,10 @@ impl AudioControl {
         self.local.borrow_mut().rings.remove(&source);
         true
     }
+    pub fn add_xaudio(&self, source: u64, graph: Box<crate::xaudio2::Graph>) -> bool {
+        self.local.borrow_mut().rings.insert(source, (0, 0));
+        self.send(Command::XAudio(source, graph))
+    }
     pub fn push_pcm(&self, mut block: PcmBlock) -> Result<(), PcmBlock> {
         if self
             .local
@@ -751,7 +766,8 @@ impl Engine {
             };
             processed += 1;
             let source = match &command {
-                Command::Ring(id, ..)
+                Command::XAudio(id, ..)
+                | Command::Ring(id, ..)
                 | Command::Owned(id, ..)
                 | Command::Play(id, ..)
                 | Command::Epoch(id, ..)
@@ -773,6 +789,7 @@ impl Engine {
                     .position(|v| v.as_ref().is_some_and(|v| v.source() == id))
             });
             match command {
+                Command::XAudio(source, graph) => self.insert(Voice::XAudio { source, graph }, at),
                 Command::Ring(source, voice, state) => self.insert(
                     Voice::Ring {
                         source,
@@ -929,6 +946,11 @@ impl Engine {
                 }
             }
         }
+        for voice in self.voices.iter_mut().flatten() {
+            if let Voice::XAudio { graph, .. } = voice {
+                graph.service();
+            }
+        }
         let active = self.voices.iter().flatten().filter(|v| v.active()).count() as u64;
         shared.desired_active.store(active, Ordering::Release);
         shared
@@ -961,6 +983,7 @@ impl Engine {
         let reset = new_device_epoch || channels != self.channels;
         for voice in self.voices.iter_mut().flatten() {
             match voice {
+                Voice::XAudio { .. } => {}
                 Voice::Ring { voice, .. } => voice.prepare(rate, reset)?,
                 Voice::Owned { voice, .. } => voice.prepare(rate, reset)?,
             }
@@ -1006,6 +1029,7 @@ impl Engine {
             let mut missing = [0u64; 4];
             for voice in self.voices.iter_mut().flatten() {
                 match voice {
+                    Voice::XAudio { graph, .. } => graph.render(output, channels, self.rate, pts),
                     Voice::Ring {
                         source,
                         voice,
@@ -1121,6 +1145,7 @@ impl Engine {
         // Once per callback, including callbacks larger than a 256-frame mix block.
         for voice in self.voices.iter_mut().flatten() {
             match voice {
+                Voice::XAudio { .. } => {}
                 Voice::Ring { voice, .. } => {
                     let lead = voice.lead_us();
                     voice.lead.observe(lead, &shared.counters);
@@ -1208,6 +1233,7 @@ impl crate::AudioStream {
             let delta = (now - reader.engine.cursor_us).max(0.0);
             for voice in reader.engine.voices.iter_mut().flatten() {
                 match voice {
+                    Voice::XAudio { .. } => {}
                     Voice::Ring { voice, .. } => voice.reanchor(now),
                     Voice::Owned { voice, .. } => {
                         if voice.paused {

@@ -150,7 +150,7 @@ fn every_declaration_type_is_fetched_by_the_gpu_with_d3d_component_defaults() {
             None,
             &inputs,
             &[(false, 0)],
-            false,
+            (false, 0, false),
         )
         .unwrap();
         let program = Program::new(source.into(), vec![false]);
@@ -163,7 +163,7 @@ fn every_declaration_type_is_fetched_by_the_gpu_with_d3d_component_defaults() {
             program,
             streams: vec![
                 VertexStream {
-                    bytes: float(&[-1., 1., 0.5, 1., -1., -3., 0.5, 1., 3., 1., 0.5, 1.]),
+                    bytes: float(&[-1., 1., 0.5, 1., -1., -3., 0.5, 1., 3., 1., 0.5, 1.]).into(),
                     stride: 16,
                     attributes: vec![Attribute {
                         location: 0,
@@ -172,7 +172,7 @@ fn every_declaration_type_is_fetched_by_the_gpu_with_d3d_component_defaults() {
                     }],
                 },
                 VertexStream {
-                    bytes,
+                    bytes: bytes.into(),
                     stride: 0,
                     attributes: vec![Attribute {
                         location: 1,
@@ -183,8 +183,8 @@ fn every_declaration_type_is_fetched_by_the_gpu_with_d3d_component_defaults() {
             ],
             indices: None,
             vertex_count: 3,
-            vertex_constants: ConstantBlock::default(),
-            pixel_constants: ConstantBlock::default(),
+            vertex_constants: ConstantBlock::default().into(),
+            pixel_constants: ConstantBlock::default().into(),
             textures: vec![ProgramTexture {
                 image: None,
                 sampler: state.sampler,
@@ -262,8 +262,16 @@ fn fixed_pixel_stages_combine_a_second_texture_stage() {
     };
     // Stage zero texel (0.5, 1, 1, 1), stage one (1, 0.5, 0.25, 0.5).
     let images = [texel([255, 255, 128, 255]), texel([64, 128, 255, 128])];
-    let source =
-        source::build(None, None, None, None, &[], &[(false, 0), (false, 1)], true).unwrap();
+    let source = source::build(
+        None,
+        None,
+        None,
+        None,
+        &[],
+        &[(false, 0), (false, 1)],
+        (true, 0, false),
+    )
+    .unwrap();
     let program = Program::new(source.into(), vec![false, false]);
     validate_program(&program).unwrap();
     let state = DrawState::new(8, 8);
@@ -287,7 +295,7 @@ fn fixed_pixel_stages_combine_a_second_texture_stage() {
     let draw = ProgrammableDraw {
         program,
         streams: vec![VertexStream {
-            bytes: bytemuck::cast_slice(&vertices).to_vec(),
+            bytes: bytemuck::cast_slice(&vertices).to_vec().into(),
             stride: 40,
             attributes: [
                 (0, 0, AttributeFormat::Float4),
@@ -303,8 +311,8 @@ fn fixed_pixel_stages_combine_a_second_texture_stage() {
         }],
         indices: None,
         vertex_count: 3,
-        vertex_constants: ConstantBlock::default(),
-        pixel_constants: ConstantBlock::default(),
+        vertex_constants: ConstantBlock::default().into(),
+        pixel_constants: ConstantBlock::default().into(),
         textures: images
             .map(|image| ProgramTexture {
                 image: Some(image),

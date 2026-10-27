@@ -100,17 +100,62 @@ impl NativeFrame {
     pub fn io_surface(&self) -> Option<&IOSurfaceRef> {
         self.image.metal.surface.as_deref()
     }
+    pub fn display_completion(
+        &self,
+        wake: adv_sync::WakeEvent,
+    ) -> Result<DisplayCompletion, Error> {
+        if let Some(completion) = &self.completion {
+            completion.0.watch(wake);
+            return Ok(completion.clone());
+        }
+        self.context.submission()?.display_completion(wake)
+    }
 }
 
-pub struct DisplayCompletion(Arc<AtomicBool>, NativeContext);
+#[derive(Default)]
+pub(super) struct Completion {
+    ready: AtomicBool,
+    wakes: Mutex<Vec<adv_sync::WakeEvent>>,
+}
+impl Completion {
+    pub(super) fn ready(&self) -> bool {
+        self.ready.load(Ordering::Acquire)
+    }
+    fn watch(&self, wake: adv_sync::WakeEvent) {
+        let mut wakes = self.wakes.lock().unwrap();
+        if !self.ready() {
+            wakes.push(wake);
+        }
+    }
+    pub(super) fn complete(&self) {
+        let mut wakes = self.wakes.lock().unwrap();
+        self.ready.store(true, Ordering::Release);
+        for wake in wakes.drain(..) {
+            wake.signal();
+        }
+    }
+}
+#[derive(Clone)]
+pub struct DisplayCompletion(Arc<Completion>, NativeContext);
 impl DisplayCompletion {
     pub fn ready(&self) -> Result<bool, Error> {
-        let ready = self.0.load(Ordering::Acquire);
+        let ready = self.0.ready();
         self.1.check()?;
         Ok(ready)
     }
 }
 impl Submission<'_> {
+    pub(in crate::gpu::renderer) fn native_completion(&self) -> Option<DisplayCompletion> {
+        self.context
+            .pending
+            .lock()
+            .unwrap()
+            .metal
+            .as_ref()?
+            .completion
+            .as_ref()
+            .map(|completion| DisplayCompletion(completion.clone(), self.context.clone()))
+    }
     /// Enqueue a completion notification after all producer writes, without
     /// waiting on either the execution, presentation-worker, or UI thread.
     pub fn display_completion(
@@ -124,7 +169,8 @@ impl Submission<'_> {
             .as_raw()
             .commandBuffer()
             .ok_or_else(|| Error::Device("Metal display fence allocation failed".into()))?;
-        let ready = Arc::new(AtomicBool::new(false));
+        let ready = Arc::new(Completion::default());
+        ready.watch(wake);
         let done = ready.clone();
         let failure = self.context.failure.clone();
         let callback = block2::RcBlock::new(
@@ -132,8 +178,7 @@ impl Submission<'_> {
                 if let Some(error) = unsafe { command.as_ref() }.error() {
                     let _ = failure.set(error.to_string());
                 }
-                done.store(true, Ordering::Release);
-                wake.signal();
+                done.complete();
             },
         );
         unsafe { command.addCompletedHandler(block2::RcBlock::as_ptr(&callback)) };

@@ -272,6 +272,32 @@ impl Decoder {
         }
     }
 
+    /// Submit or collect a frame without waiting on the execution owner.
+    pub fn poll_frame(&mut self, media_us: u64) -> Result<Option<Update>, Error> {
+        #[cfg(feature = "media")]
+        {
+            self.inner.poll_frame(media_us)
+        }
+        #[cfg(not(feature = "media"))]
+        {
+            let _ = media_us;
+            Err(Error::Unavailable)
+        }
+    }
+
+    /// Queue a seek before the next asynchronous frame request.
+    pub fn request_seek(&mut self, media_us: u64) -> Result<(), Error> {
+        #[cfg(feature = "media")]
+        {
+            self.inner.request_seek(media_us)
+        }
+        #[cfg(not(feature = "media"))]
+        {
+            let _ = media_us;
+            Err(Error::Unavailable)
+        }
+    }
+
     pub fn frame_at(&mut self, media_us: u64) -> Result<Update, Error> {
         #[cfg(feature = "media")]
         {
@@ -319,3 +345,5 @@ mod tests {
         ));
     }
 }
+
+pub mod wine;

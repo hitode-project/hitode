@@ -7,16 +7,24 @@ use adv_device::gpu::{
 };
 use adv_device::surface::Rect;
 mod input;
+mod state_map;
+use state_map::StateMap;
+
+pub(super) type CapturedSpans = Vec<(u32, Arc<[u8]>)>;
 
 pub(super) struct CachedFixed {
     state: Fixed,
     key: std::cell::Cell<Option<u128>>,
+    inputs: std::cell::RefCell<input::GeometryCache>,
+    pub(super) captures: std::cell::RefCell<Option<CapturedSpans>>,
 }
 impl CachedFixed {
     pub(super) fn new(width: u32, height: u32) -> Self {
         Self {
             state: Fixed::new(width, height),
             key: std::cell::Cell::new(None),
+            inputs: Default::default(),
+            captures: Default::default(),
         }
     }
     pub(super) fn key(&self) -> u128 {
@@ -26,6 +34,35 @@ impl CachedFixed {
         let key = super::recording::fixed_key(&self.state);
         self.key.set(Some(key));
         key
+    }
+    pub(super) fn capture_stream(
+        &self,
+        env: &Env<'_>,
+        address: u32,
+        length: u32,
+    ) -> Result<adv_device::gpu::VertexBytes, u32> {
+        let bytes = match env.cpu.shared_bytes(address, length as usize) {
+            Some(bytes) => std::borrow::Cow::Borrowed(bytes),
+            None => {
+                let mut bytes = vec![0; length as usize];
+                env.cpu.read(address, &mut bytes).map_err(|_| INVALID)?;
+                std::borrow::Cow::Owned(bytes)
+            }
+        };
+        let key = xxhash_rust::xxh3::xxh3_128(&bytes);
+        if let Some(captures) = self.captures.borrow_mut().as_mut() {
+            captures.push((address, Arc::from(bytes.as_ref())));
+        }
+        let mut captures = self.inputs.borrow_mut();
+        if let Some(bytes) = captures.stream(key) {
+            return Ok(bytes);
+        }
+        let bytes = adv_device::gpu::VertexBytes::captured(bytes.into_owned(), key);
+        captures.insert_stream(key, bytes.clone());
+        Ok(bytes)
+    }
+    pub(super) fn finish_inputs(&self) {
+        self.inputs.borrow_mut().finish();
     }
 }
 impl std::ops::Deref for CachedFixed {
@@ -44,11 +81,11 @@ impl std::ops::DerefMut for CachedFixed {
 #[derive(Clone)]
 pub(super) struct Fixed {
     pub(super) fvf: u32,
-    pub(super) render: BTreeMap<i32, u32>,
-    pub(super) stage: BTreeMap<i32, u32>,
-    pub(super) stage_slots: [BTreeMap<i32, u32>; 8],
-    pub(super) sampler: BTreeMap<i32, u32>,
-    pub(super) sampler_slots: [BTreeMap<i32, u32>; 20],
+    pub(super) render: StateMap,
+    pub(super) stage: StateMap,
+    pub(super) stage_slots: [StateMap; 8],
+    pub(super) sampler: StateMap,
+    pub(super) sampler_slots: [StateMap; 20],
     pub(super) viewport: D3DVIEWPORT9,
     pub(super) scissor: RECT,
     pub(super) transforms: [[f32; 16]; 3],
@@ -113,13 +150,14 @@ impl Layout {
             || self.texcoords[0].is_some_and(|(_, _, dimensions)| dimensions != 2)
     }
 }
+#[derive(Clone)]
 pub(super) struct Draw {
     pub target: Target,
     pub image: Option<Image>,
-    pub vertices: Vec<Vertex>,
-    pub texcoords: Option<(usize, Vec<[f32; 4]>)>,
+    pub vertices: Arc<Vec<Vertex>>,
+    pub texcoords: Option<(usize, Arc<Vec<[f32; 4]>>)>,
     pub state: DrawState,
-    pub programmable: Option<Box<adv_device::gpu::ProgrammableDraw>>,
+    pub programmable: Option<Arc<adv_device::gpu::ProgrammableDraw>>,
     pub recording_key: u128,
     pub program_key: u128,
 }
@@ -242,7 +280,7 @@ impl Fixed {
         ];
         Self {
             fvf: 0,
-            render: BTreeMap::from([
+            render: StateMap::from(BTreeMap::from([
                 (7, 0),
                 (8, 3), // FILLMODE: only solid rasterization is implemented.
                 (9, 2), // SHADEMODE: the shared shader interpolates vertex colors.
@@ -277,9 +315,17 @@ impl Fixed {
                 (57, 0),
                 (58, u32::MAX),
                 (59, u32::MAX),
-                (128, 0), // WRAP0: texture coordinate wrapping is disabled.
+                (128, 0), // WRAP0–WRAP7: texture coordinate wrapping is disabled.
+                (129, 0),
+                (130, 0),
+                (131, 0),
+                (132, 0),
+                (133, 0),
+                (134, 0),
+                (135, 0),
                 (136, 1), // CLIPPING: GPU primitive clipping remains enabled.
                 (137, 1),
+                (139, 0), // AMBIENT: only relevant when lighting is enabled.
                 (141, 1), // COLORVERTEX: only relevant when lighting is enabled.
                 (145, 1), // Material sources: COLOR1, COLOR2, MATERIAL, MATERIAL.
                 (146, 2),
@@ -301,7 +347,7 @@ impl Fixed {
                 (207, 2),
                 (208, 1),
                 (209, 1),
-            ]),
+            ])),
             stage_slots: std::array::from_fn(|stage| {
                 let mut states =
                     BTreeMap::from([(7, 0), (8, 0), (9, 0), (10, 0), (22, 0), (23, 0)]);
@@ -310,9 +356,9 @@ impl Fixed {
                     // TEXCOORDINDEX defaults to the stage's own coordinate set.
                     states.insert(11, stage as u32);
                 }
-                states
+                states.into()
             }),
-            stage: BTreeMap::from([
+            stage: StateMap::from(BTreeMap::from([
                 (1, 4),
                 (2, 2),
                 (3, 1),
@@ -321,9 +367,9 @@ impl Fixed {
                 (6, 1),
                 (11, 0), // TEXCOORDINDEX: pass through the first FVF coordinate set.
                 (24, 0), // TEXTURETRANSFORMFLAGS: no texture coordinate transform.
-            ]),
-            sampler: sampler.clone(),
-            sampler_slots: std::array::from_fn(|_| sampler.clone()),
+            ])),
+            sampler: sampler.clone().into(),
+            sampler_slots: std::array::from_fn(|_| sampler.clone().into()),
             viewport: D3DVIEWPORT9 {
                 X: 0,
                 Y: 0,
@@ -345,10 +391,7 @@ impl Fixed {
 }
 pub(super) fn register(registry: &mut Registry) {
     for api in [
-        adv_abi::Api {
-            env_leaf: Some(super::leaf_calls::binding),
-            ..set_fvf_ABI
-        },
+        super::unchanged::unless_unchanged!(set_fvf_ABI, super::unchanged::binding),
         get_fvf_ABI,
         set_render_ABI,
         get_render_ABI,
@@ -362,10 +405,7 @@ pub(super) fn register(registry: &mut Registry) {
         get_scissor_ABI,
         set_transform_ABI,
         get_transform_ABI,
-        adv_abi::Api {
-            env_leaf: Some(super::leaf_calls::draw),
-            ..draw_up_ABI
-        },
+        draw_up_ABI,
     ] {
         registry.register(api);
     }
@@ -402,17 +442,20 @@ pub(super) fn set_fvf(env: &mut Env<'_>, this: GuestPtr<()>, fvf: u32) -> u32 {
     if !valid_fvf(fvf) {
         return UNAVAILABLE;
     }
-    if f.fvf == fvf
+    let previous = f.fvf;
+    if previous == fvf
         && device(env, this.addr())
             .is_some_and(|d| d.recording.is_none() && d.buffers.declaration.is_none())
     {
         return 0;
     }
+    let changed = previous != fvf;
     mutable(env, this.addr()).unwrap().fvf = fvf;
     super::shaders::stateblocks::mark_fixed(
         env,
         this.addr(),
         super::shaders::stateblocks::FixedKey::Fvf,
+        changed,
     );
     let device = com(env)
         .identity::<Payload>(&env.sys.objects, this.addr())
@@ -424,6 +467,7 @@ pub(super) fn set_fvf(env: &mut Env<'_>, this: GuestPtr<()>, fvf: u32) -> u32 {
                 env,
                 this.addr(),
                 super::shaders::stateblocks::FixedKey::Fvf,
+                true,
             );
         }
         return code;
@@ -435,13 +479,19 @@ pub(super) fn set_fvf(env: &mut Env<'_>, this: GuestPtr<()>, fvf: u32) -> u32 {
             return code;
         }
         mutable(env, this.addr()).unwrap().fvf = fvf;
+        super::shaders::stateblocks::mark_fixed(
+            env,
+            this.addr(),
+            super::shaders::stateblocks::FixedKey::Fvf,
+            true,
+        );
     }
     0
 }
 fn device_declaration(env: &Env<'_>, pointer: u32) -> Option<Id> {
     device(env, pointer)?.buffers.declaration
 }
-fn layout(env: &Env<'_>, pointer: u32) -> Result<Layout, Rejected> {
+pub(super) fn layout(env: &Env<'_>, pointer: u32) -> Result<Layout, Rejected> {
     let d = device(env, pointer).ok_or_else(|| rejected(INVALID, "invalid device interface"))?;
     match d.buffers.declaration {
         Some(id) => {
@@ -451,7 +501,7 @@ fn layout(env: &Env<'_>, pointer: u32) -> Result<Layout, Rejected> {
             .ok_or_else(|| rejected(INVALID, "no supported FVF is set")),
     }
 }
-#[win32(d3d9,name="IDirect3DDevice9::GetFVF",level=implement,leaf)]
+#[win32(d3d9,name="IDirect3DDevice9::GetFVF",level=implement)]
 pub(super) fn get_fvf(env: &mut Env<'_>, this: GuestPtr<()>, output: GuestPtr<u32>) -> u32 {
     let Some(f) = current(env, this.addr()) else {
         return INVALID;
@@ -515,7 +565,7 @@ fn stencil_op(value: u32) -> Option<StencilOp> {
         _ => return None,
     })
 }
-#[win32(d3d9,name="IDirect3DDevice9::SetRenderState",level=state,leaf)]
+#[win32(d3d9,name="IDirect3DDevice9::SetRenderState",level=state)]
 pub(super) fn set_render(env: &mut Env<'_>, this: GuestPtr<()>, state: i32, value: u32) -> u32 {
     let Some(f) = mutable(env, this.addr()) else {
         return INVALID;
@@ -538,7 +588,7 @@ pub(super) fn set_render(env: &mut Env<'_>, this: GuestPtr<()>, state: i32, valu
             _ => false,
         },
         28 | 156 => value <= 1,
-        34 => true,
+        34 | 139 => true,
         35 | 140 => value <= 3,
         36..=38 => f32::from_bits(value).is_finite(),
         154 | 155 | 166 => f32::from_bits(value).is_finite() && f32::from_bits(value) > 0.0,
@@ -567,7 +617,7 @@ pub(super) fn set_render(env: &mut Env<'_>, this: GuestPtr<()>, state: i32, valu
         53..=55 | 186..=188 => stencil_op(value).is_some(),
         24 | 57..=59 => true,
         168 => value <= 15,
-        128 => match value {
+        128..=135 => match value {
             0 => true,
             1..=15 => return UNAVAILABLE,
             _ => false,
@@ -578,15 +628,16 @@ pub(super) fn set_render(env: &mut Env<'_>, this: GuestPtr<()>, state: i32, valu
     if !valid {
         return INVALID;
     }
-    f.render.insert(state, value);
+    let changed = f.render.insert(state, value) != Some(value);
     super::shaders::stateblocks::mark_fixed(
         env,
         this.addr(),
         super::shaders::stateblocks::FixedKey::Render(state),
+        changed,
     );
     0
 }
-#[win32(d3d9,name="IDirect3DDevice9::GetRenderState",level=implement,leaf)]
+#[win32(d3d9,name="IDirect3DDevice9::GetRenderState",level=implement)]
 fn get_render(env: &mut Env<'_>, this: GuestPtr<()>, state: i32, output: GuestPtr<u32>) -> u32 {
     let Some(&value) = current(env, this.addr()).and_then(|f| f.render.get(&state)) else {
         return INVALID;
@@ -597,7 +648,7 @@ fn get_render(env: &mut Env<'_>, this: GuestPtr<()>, state: i32, output: GuestPt
         INVALID
     }
 }
-#[win32(d3d9,name="IDirect3DDevice9::SetTextureStageState",level=state,leaf)]
+#[win32(d3d9,name="IDirect3DDevice9::SetTextureStageState",level=state)]
 pub(super) fn set_stage(
     env: &mut Env<'_>,
     this: GuestPtr<()>,
@@ -612,11 +663,12 @@ pub(super) fn set_stage(
         return INVALID;
     }
     if matches!(kind, 7..=10 | 22 | 23) {
-        f.stage_slots[stage as usize].insert(kind, value);
+        let changed = f.stage_slots[stage as usize].insert(kind, value) != Some(value);
         super::shaders::stateblocks::mark_fixed(
             env,
             this.addr(),
             super::shaders::stateblocks::FixedKey::StageSlot(stage as usize, kind),
+            changed,
         );
         return 0;
     }
@@ -641,11 +693,12 @@ pub(super) fn set_stage(
         if !valid {
             return INVALID;
         }
-        f.stage_slots[stage as usize].insert(kind, value);
+        let changed = f.stage_slots[stage as usize].insert(kind, value) != Some(value);
         super::shaders::stateblocks::mark_fixed(
             env,
             this.addr(),
             super::shaders::stateblocks::FixedKey::StageSlot(stage as usize, kind),
+            changed,
         );
         return 0;
     }
@@ -673,15 +726,16 @@ pub(super) fn set_stage(
     if !valid {
         return INVALID;
     }
-    f.stage.insert(kind, value);
+    let changed = f.stage.insert(kind, value) != Some(value);
     super::shaders::stateblocks::mark_fixed(
         env,
         this.addr(),
         super::shaders::stateblocks::FixedKey::Stage(kind),
+        changed,
     );
     0
 }
-#[win32(d3d9,name="IDirect3DDevice9::GetTextureStageState",level=implement,leaf)]
+#[win32(d3d9,name="IDirect3DDevice9::GetTextureStageState",level=implement)]
 fn get_stage(
     env: &mut Env<'_>,
     this: GuestPtr<()>,
@@ -722,7 +776,7 @@ fn address(value: u32) -> Option<Address> {
 fn rgba(argb: u32) -> u32 {
     (argb & 0xff00_ff00) | ((argb >> 16) & 0xff) | ((argb & 0xff) << 16)
 }
-#[win32(d3d9,name="IDirect3DDevice9::SetSamplerState",level=state,leaf)]
+#[win32(d3d9,name="IDirect3DDevice9::SetSamplerState",level=state)]
 pub(super) fn set_sampler(
     env: &mut Env<'_>,
     this: GuestPtr<()>,
@@ -751,11 +805,11 @@ pub(super) fn set_sampler(
     if !valid {
         return INVALID;
     }
-    if slot == 0 {
-        f.sampler.insert(kind, value);
+    let changed = if slot == 0 {
+        f.sampler.insert(kind, value)
     } else {
-        f.sampler_slots[slot].insert(kind, value);
-    }
+        f.sampler_slots[slot].insert(kind, value)
+    } != Some(value);
     super::shaders::stateblocks::mark_fixed(
         env,
         this.addr(),
@@ -764,10 +818,11 @@ pub(super) fn set_sampler(
         } else {
             super::shaders::stateblocks::FixedKey::SamplerSlot(slot, kind)
         },
+        changed,
     );
     0
 }
-#[win32(d3d9,name="IDirect3DDevice9::GetSamplerState",level=implement,leaf)]
+#[win32(d3d9,name="IDirect3DDevice9::GetSamplerState",level=implement)]
 fn get_sampler(
     env: &mut Env<'_>,
     this: GuestPtr<()>,
@@ -793,7 +848,7 @@ fn get_sampler(
         INVALID
     }
 }
-#[win32(d3d9,name="IDirect3DDevice9::SetViewport",level=state,leaf)]
+#[win32(d3d9,name="IDirect3DDevice9::SetViewport",level=state)]
 fn set_viewport(env: &mut Env<'_>, this: GuestPtr<()>, viewport: GuestPtr<D3DVIEWPORT9>) -> u32 {
     let Ok(v) = viewport.read(env.cpu) else {
         return INVALID;
@@ -817,15 +872,33 @@ fn set_viewport(env: &mut Env<'_>, this: GuestPtr<()>, viewport: GuestPtr<D3DVIE
     {
         return INVALID;
     }
-    mutable(env, this.addr()).unwrap().viewport = v;
+    let f = mutable(env, this.addr()).unwrap();
+    let old = f.viewport;
+    let changed = (
+        old.X,
+        old.Y,
+        old.Width,
+        old.Height,
+        old.MinZ.to_bits(),
+        old.MaxZ.to_bits(),
+    ) != (
+        v.X,
+        v.Y,
+        v.Width,
+        v.Height,
+        v.MinZ.to_bits(),
+        v.MaxZ.to_bits(),
+    );
+    f.viewport = v;
     super::shaders::stateblocks::mark_fixed(
         env,
         this.addr(),
         super::shaders::stateblocks::FixedKey::Viewport,
+        changed,
     );
     0
 }
-#[win32(d3d9,name="IDirect3DDevice9::GetViewport",level=implement,leaf)]
+#[win32(d3d9,name="IDirect3DDevice9::GetViewport",level=implement)]
 fn get_viewport(env: &mut Env<'_>, this: GuestPtr<()>, output: GuestPtr<D3DVIEWPORT9>) -> u32 {
     let Some(f) = current(env, this.addr()) else {
         return INVALID;
@@ -837,7 +910,7 @@ fn get_viewport(env: &mut Env<'_>, this: GuestPtr<()>, output: GuestPtr<D3DVIEWP
         INVALID
     }
 }
-#[win32(d3d9,name="IDirect3DDevice9::SetScissorRect",level=state,leaf)]
+#[win32(d3d9,name="IDirect3DDevice9::SetScissorRect",level=state)]
 fn set_scissor(env: &mut Env<'_>, this: GuestPtr<()>, rect: GuestPtr<RECT>) -> u32 {
     let Ok(rect) = rect.read(env.cpu) else {
         return INVALID;
@@ -848,15 +921,19 @@ fn set_scissor(env: &mut Env<'_>, this: GuestPtr<()>, rect: GuestPtr<RECT>) -> u
     if rect.left < 0 || rect.top < 0 || rect.right <= rect.left || rect.bottom <= rect.top {
         return INVALID;
     }
+    let old = f.scissor;
+    let changed = (old.left, old.top, old.right, old.bottom)
+        != (rect.left, rect.top, rect.right, rect.bottom);
     f.scissor = rect;
     super::shaders::stateblocks::mark_fixed(
         env,
         this.addr(),
         super::shaders::stateblocks::FixedKey::Scissor,
+        changed,
     );
     0
 }
-#[win32(d3d9,name="IDirect3DDevice9::GetScissorRect",level=implement,leaf)]
+#[win32(d3d9,name="IDirect3DDevice9::GetScissorRect",level=implement)]
 fn get_scissor(env: &mut Env<'_>, this: GuestPtr<()>, output: GuestPtr<RECT>) -> u32 {
     let Some(f) = current(env, this.addr()) else {
         return INVALID;
@@ -876,7 +953,7 @@ fn transform_slot(kind: i32) -> Option<usize> {
         _ => return None,
     })
 }
-#[win32(d3d9,name="IDirect3DDevice9::SetTransform",level=state,leaf)]
+#[win32(d3d9,name="IDirect3DDevice9::SetTransform",level=state)]
 fn set_transform(
     env: &mut Env<'_>,
     this: GuestPtr<()>,
@@ -895,15 +972,17 @@ fn set_transform(
     let Some(f) = mutable(env, this.addr()) else {
         return INVALID;
     };
+    let changed = f.transforms[slot].map(f32::to_bits) != matrix.map(f32::to_bits);
     f.transforms[slot] = matrix;
     super::shaders::stateblocks::mark_fixed(
         env,
         this.addr(),
         super::shaders::stateblocks::FixedKey::Transform(slot),
+        changed,
     );
     0
 }
-#[win32(d3d9,name="IDirect3DDevice9::GetTransform",level=implement,leaf)]
+#[win32(d3d9,name="IDirect3DDevice9::GetTransform",level=implement)]
 fn get_transform(
     env: &mut Env<'_>,
     this: GuestPtr<()>,
@@ -1134,8 +1213,25 @@ fn prepare_input_checked(
     let last = indices
         .and_then(|v| v.iter().max().copied())
         .unwrap_or(length - 1);
-    let mut input = input::Reader::new(env, pointer, layout, source, first, last)?;
-    let mut input_key = super::recording::hash(indices);
+    let mut input = input::Reader::new(env, pointer, layout, source, first, last, length)?;
+    let base_key = super::recording::draw_key(env, pointer);
+    let captured = input.captured_key(indices, length);
+    let geometry_key = captured.map(|key| super::recording::hash((base_key, kind, count, key)));
+    if let Some(geometry) = geometry_key.and_then(|key| d.fixed.inputs.borrow_mut().get(key)) {
+        let (target, image, state) = prepare_state(env, pointer, kind)?;
+        return Ok(Draw {
+            target,
+            image,
+            state,
+            vertices: geometry.vertices,
+            texcoords: geometry.texcoords,
+            programmable: None,
+            recording_key: geometry_key.unwrap(),
+            program_key: 0,
+        });
+    }
+    let mut input_key = xxhash_rust::xxh3::Xxh3::new();
+    std::hash::Hash::hash(&indices, &mut input_key);
     let mut vertices = Vec::with_capacity(length as usize);
     let coordinate_count = layout.coordinate_count();
     let mut texcoords = if layout.extended_coordinates() {
@@ -1160,7 +1256,9 @@ fn prepare_input_checked(
     for ordinal in 0..length {
         let index = indices.map_or(ordinal, |v| v[ordinal as usize]);
         input.read(env, index)?;
-        input_key = super::recording::hash((input_key, input.key()));
+        if captured.is_none() {
+            input.hash(&mut input_key);
+        }
         let word = |stream: u16, at: u32| input.word(stream, at);
         let float = |stream, at| f32::from_le_bytes(word(stream, at));
         let at = layout.position;
@@ -1247,16 +1345,25 @@ fn prepare_input_checked(
         }
     }
     let (target, image, state) = prepare_state(env, pointer, kind)?;
+    let geometry = input::Geometry {
+        vertices: vertices.into(),
+        texcoords: texcoords.map(|values| (coordinate_count, values.into())),
+    };
+    if let Some(key) = geometry_key {
+        d.fixed.inputs.borrow_mut().insert(key, geometry.clone());
+    }
     Ok(Draw {
         target,
         image,
-        vertices,
-        texcoords: texcoords.map(|values| (coordinate_count, values)),
+        vertices: geometry.vertices,
+        texcoords: geometry.texcoords,
         state,
         programmable: None,
         recording_key: super::recording::hash((
-            super::recording::draw_key(env, pointer),
-            input_key,
+            base_key,
+            kind,
+            count,
+            captured.unwrap_or_else(|| input_key.digest128()),
         )),
         program_key: 0,
     })

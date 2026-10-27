@@ -4,6 +4,10 @@
 #[cfg(target_os = "android")]
 pub mod android;
 #[cfg(any(target_os = "macos", target_os = "android", target_os = "ios"))]
+mod distribution;
+#[cfg(any(target_os = "macos", target_os = "android", target_os = "ios"))]
+mod drive;
+#[cfg(any(target_os = "macos", target_os = "android", target_os = "ios"))]
 #[cfg_attr(target_os = "android", path = "game_android.rs")]
 #[cfg_attr(target_os = "ios", path = "game_ios.rs")]
 mod game;
@@ -27,7 +31,6 @@ use serde::Serialize;
 #[cfg(target_os = "macos")]
 mod chrome;
 #[cfg(any(target_os = "macos", target_os = "android", target_os = "ios"))]
-mod saves;
 #[cfg(any(target_os = "macos", target_os = "android", target_os = "ios"))]
 use game::{post_text, start_game, stop_game};
 
@@ -85,6 +88,10 @@ pub fn run() {
         app.manage(std::sync::Mutex::new(library::Library::load(
             app.path().app_data_dir()?,
         )?));
+        #[cfg(any(target_os = "macos", target_os = "android", target_os = "ios"))]
+        app.manage(adv_shell::Execution::new(distribution::path(
+            &app.path().app_data_dir()?,
+        ))?);
         #[cfg(desktop)]
         {
             let menu = menu::build(app.handle())?;
@@ -110,9 +117,6 @@ pub fn run() {
             .on_window_event(game::window_event)
             .invoke_handler(tauri::generate_handler![
                 host_info,
-                saves::save_info,
-                saves::save_policy,
-                saves::save_action,
                 settings::pick_game_file,
                 settings::font_families,
                 game::set_game_playback,
@@ -141,6 +145,7 @@ pub fn run() {
                 library::library_update,
                 library::library_remove,
                 library::library_restore,
+                drive::reveal_drive,
                 library::reveal_path
             ]);
     #[cfg(all(desktop, not(target_os = "macos")))]
@@ -184,9 +189,6 @@ pub fn run() {
         game::game_frames,
         game::game_presented,
         game::game_dialog,
-        saves::save_info,
-        saves::save_policy,
-        saves::save_action,
         game::game_menu,
         game::game_wheel,
         overlay::set_overlay_input,
@@ -207,6 +209,7 @@ pub fn run() {
         library::library_update,
         library::library_remove,
         library::library_restore,
+        drive::reveal_drive,
         library::reveal_path
     ]);
     #[cfg(target_os = "ios")]
@@ -226,9 +229,6 @@ pub fn run() {
         game::game_frames,
         game::game_presented,
         game::game_dialog,
-        saves::save_info,
-        saves::save_policy,
-        saves::save_action,
         game::game_menu,
         game::game_wheel,
         jit_ios::jit_status,
@@ -254,6 +254,7 @@ pub fn run() {
         library::library_update,
         library::library_remove,
         library::library_restore,
+        drive::reveal_drive,
         library::reveal_path
     ]);
     let app = builder

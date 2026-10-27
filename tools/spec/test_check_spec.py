@@ -42,6 +42,28 @@ class CheckSpecTest(unittest.TestCase):
         self.assertTrue(any("already used" in e for e in errors), errors)
         self.assertTrue(any("does not match EX-GROUP-N" in e for e in errors), errors)
 
+    def test_merged_prefixes_keep_rules_withdrawals_and_references(self) -> None:
+        files = spec("ID prefix: OTHER\n\n" + GOOD + "\n" + GOOD.replace("EX-A-1", "OTHER-A-1")
+                     + "\nWithdrawn: EX-A-2, OTHER-A-2\n",
+                     **{"a.rs": "// spec: EX-A-1, OTHER-A-1"})
+        self.assertEqual(check(files), [])
+        files["b.md"] = "OTHER-A-2 and OTHER-A-3"
+        errors = check(files)
+        self.assertTrue(any("OTHER-A-2 is withdrawn" in e for e in errors), errors)
+        self.assertTrue(any("OTHER-A-3 names no rule" in e for e in errors), errors)
+
+    def test_merged_specs_still_reject_undeclared_prefixes(self) -> None:
+        errors = check(spec("ID prefix: OTHER\n\n" + GOOD.replace("EX-A-1", "THIRD-A-1")))
+        self.assertTrue(any("does not match EX|OTHER-GROUP-N" in e for e in errors), errors)
+
+    def test_merged_prefixes_cannot_belong_to_another_file(self) -> None:
+        files = spec("ID prefix: OTHER\n\n" + GOOD, **{
+            "a.rs": "// spec: EX-A-1, OTHER-A-1",
+            "docs/spec/other.md": "ID prefix: OTHER\n\n" + GOOD.replace("EX-A-1", "OTHER-A-1"),
+        })
+        errors = check(files)
+        self.assertTrue(any("prefix OTHER is already declared" in e for e in errors), errors)
+
     def test_banned_phrases_terms_dates_and_long_sentences(self) -> None:
         long = " ".join(["word"] * 26)
         body = GOOD.replace("The example MUST hold.",

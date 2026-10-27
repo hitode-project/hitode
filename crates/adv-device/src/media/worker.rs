@@ -18,6 +18,8 @@ type Reply = (Result<Option<Update>, Error>, Stats);
 pub(super) struct Worker {
     requests: Sender<Request>,
     replies: Receiver<Reply>,
+    pending: bool,
+    seeks: usize,
     pub info: StreamInfo,
     pub stats: Stats,
 }
@@ -40,6 +42,8 @@ impl Worker {
         Ok(Self {
             requests,
             replies,
+            pending: false,
+            seeks: 0,
             info,
             stats,
         })
@@ -51,6 +55,48 @@ impl Worker {
         let (result, stats) = self.replies.recv().map_err(|_| lost())?;
         self.stats = stats;
         result
+    }
+
+    pub fn poll_frame(&mut self, media_us: u64) -> Result<Option<Update>, Error> {
+        let lost = || Error::Decode("decoder thread ended".into());
+        while self.seeks != 0 {
+            match self.replies.try_recv() {
+                Ok((result, stats)) => {
+                    self.stats = stats;
+                    if result?.is_some() {
+                        self.pending = false;
+                    } else {
+                        self.seeks -= 1;
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(None),
+                Err(_) => return Err(lost()),
+            }
+        }
+        if !self.pending {
+            self.requests
+                .send(Request::At(media_us))
+                .map_err(|_| lost())?;
+            self.pending = true;
+        }
+        match self.replies.try_recv() {
+            Ok((result, stats)) => {
+                self.pending = false;
+                self.stats = stats;
+                result
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => Ok(None),
+            Err(_) => Err(lost()),
+        }
+    }
+
+    pub fn request_seek(&mut self, media_us: u64) -> Result<(), Error> {
+        // Discard an outstanding frame before the ordered seek response.
+        self.requests
+            .send(Request::Seek(media_us))
+            .map_err(|_| Error::Decode("decoder thread ended".into()))?;
+        self.seeks += 1;
+        Ok(())
     }
 
     pub fn frame_at(&mut self, media_us: u64) -> Result<Update, Error> {

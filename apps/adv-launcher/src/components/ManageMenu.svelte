@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { revealC } from "../lib/reveal";
   import { t } from "../lib/i18n.svelte";
   import Icon from "./Icon.svelte";
   import { canReveal, reveal } from "../lib/reveal";
@@ -10,14 +11,13 @@
   interface Props {
     game: Game;
     onclose: () => void;
-    onsaves: () => void;
     /** The dialogs open from the page, so the menu can close under them. */
     onvndb: () => void;
     onrename: () => void;
     onremove: () => void;
   }
 
-  let { game, onclose, onsaves, onvndb, onrename, onremove }: Props = $props();
+  let { game, onclose, onvndb, onrename, onremove }: Props = $props();
 
   let confirming = $state(false);
   let menu = $state<HTMLElement>();
@@ -87,9 +87,9 @@
       <span>{t("隐藏封面")}</span>
       <span class="r ck" class:on={game.nsfw}><Icon name="check" stroke={1.8} /></span>
     </button>
-    <button class="mi" role="menuitem" aria-haspopup="dialog" onclick={onsaves}>
+    <button class="mi" role="menuitem" onclick={() => go(revealC)}>
       <svg class="ic" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="2.8" width="12" height="3.4" rx="1"></rect><path d="M3 6.2v6.3A1.5 1.5 0 0 0 4.5 14h7a1.5 1.5 0 0 0 1.5-1.5V6.2M6.5 9h3"></path></svg>
-      <span>{t("存档…")}</span>
+      <span>{t("打开 C 盘")}</span>
     </button>
     <button class="mi" role="menuitem" onclick={() => go(() => nav.go({ name: "report", gameId: game.id }))}>
       <svg class="ic" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3.5 14V2.5M3.5 3h8.2l-1.7 3 1.7 3H3.5"></path></svg>

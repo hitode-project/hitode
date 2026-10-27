@@ -6,9 +6,9 @@ This page lists how to build, test and package each front end. Games are never p
 
 - Rust stable with rustfmt, and Python 3.
 - CMake, for the test-only Unicorn reference in `adv-unicorn`.
-- For video: FFmpeg 8 headers and libraries, and libclang for bindgen. Set `FFMPEG_DIR` to the FFmpeg root with `include` and `lib` (and `bin` on Windows), and `LIBCLANG_PATH` to the folder holding libclang. The libraries must match the target architecture.
+- For video: FFmpeg 8 headers and libraries, and libclang for bindgen. Set `FFMPEG_DIR` to the FFmpeg root with `include` and `lib`, and `LIBCLANG_PATH` to the folder holding libclang. The libraries must match the target architecture.
   - Development on a Mac may use Homebrew: `brew install ffmpeg@8`, then `export FFMPEG_DIR=$(brew --prefix ffmpeg@8) LIBCLANG_PATH=$(dirname "$(dirname "$(xcrun --find clang)")")/lib`. `tools/check.py` fills in these two values by itself when they are unset.
-  - Release packages never use Homebrew: they link the pinned static FFmpeg that `tools/macos/build.py` builds (below).
+  - Release packages never use Homebrew: they link the pinned static FFmpeg that `tools/macos/build.py` builds (below). On macOS, `media` also links the system VideoToolbox and CoreMedia frameworks required by that build.
   - Without FFmpeg, everything except `media` builds and tests: leave out `adv-shell/media` and test single crates with `-p`, since the workspace suites (`cargo test --workspace`, `cargo test-full`) build the launcher.
 - For the launcher: Node.js and pnpm.
 
@@ -32,6 +32,46 @@ FFMPEG_DIR=<ffmpeg> LIBCLANG_PATH=<libclang dir> \
 
 A dynamic media build needs the FFmpeg libraries next to the runner or on the library search path. Without `media`, video sources fail with `VFW_E_UNSUPPORTED_STREAM` and the report records the gap. `adv-run --help` lists the options.
 
+## Wine media distribution
+
+Wine 11.0's Windows media modules run unchanged. The host implements the Unix
+interfaces of winegstreamer and winedmo through FFmpeg; GStreamer and Wine's
+FFmpeg Unix modules are not needed. Build the host runner with `gpu,media`.
+
+On an i386-capable Linux builder with MinGW and i386 FreeType development files,
+run `tools/wine/build-media.sh SOURCE BUILD DIST STRIPPED_DIST`. It records the
+scalar SSE flags, disabled configure dependencies, the PE-only media target,
+installation, debug stripping and the code identity tables
+(`tools/wine/identity.py DIST STRIPPED_DIST`, which also runs alone on an
+existing pair). An existing build only installs the extra DLL;
+compare checksums of the other installed binaries before and after. `DIST` holds
+`usr/local`; the stripped runtime contains its `lib` and `share` directories.
+
+Run `tools/wine/prefix-template.sh DIST/usr/local OUTPUT` on that builder, then
+install `OUTPUT` at `share/hitode/prefix` in both distributions. The script runs
+Wine's registration entry point for the media COM classes and filter mapper.
+
+The media probes are `crates/adv-runtime/tests/probe/media_*.c`; their headers give
+the compiler commands. Put their executables in `ADV_WINE_PROBES` and set
+`ADV_WINE_DIST` to the installation root. Run
+`cargo test --release -p adv-runtime --features gpu,media --test wine_media`.
+Synthetic fixtures and their FFmpeg generation script live in
+`crates/adv-runtime/tests/fixtures/media`; each committed clip is below 64 KiB.
+Apple static FFmpeg builds enable VideoToolbox and its H.264, HEVC, MPEG-2 and
+MPEG-4 accelerators. Android uses software decoding.
+
+The MIDI output uses OxiSynth and the bundled MIT-licensed FluidR3Mono 2.312
+bank. `vendor/fluidr3mono/FluidR3Mono_GM.sf3` is unchanged from MuseScore's
+[v2.3.2 sound resources](https://github.com/musescore/MuseScore/tree/v2.3.2/share/sound),
+SHA-256 `cfcd66d89e8386823400eca64934b14fbea7bf48ba1f00d21189af1262794ec2`.
+Its notices are in `vendor/fluidr3mono/LICENSE`. The bank is embedded and needs no
+runtime downloads or host MIDI setup. Synthesis runs on the execution owner;
+the session pump feeds the shared PCM mixer with 30 ms of lead. Native WinMM
+consumes wave headers and sequences MIDI streams independently of guest threads.
+The authored `tests/probe/midi.c` in `adv-runtime` checks WinMM, MIDI streams and
+MCI. Build it as its header describes into `ADV_WINE_PROBES`, then run
+`cargo test --release -p adv-runtime --test wine_midi` with `ADV_WINE_DIST` set.
+
 ## Tests
 
 ```sh
@@ -40,11 +80,16 @@ python3 -m unittest discover -s tools/<folder>
 ```
 
 - Run the tests of the crates you changed. The full workspace suite is for batched changes and baseline updates.
+- `python3 tools/codec/png_reference.py` downloads checksum-pinned libpng sources
+  and compiles unchanged row bodies with x86-32 clang under O1, O2 and Os. On
+  AArch64, `cargo test -p adv-drv upstream_png -- --ignored` checks these public
+  references through admission, native bridges and the guest interpreter.
+- `python3 tools/codec/lz77_reference.py` builds pinned zlib 1.1.4's `zmemcpy`
+  and an isolated `inflate_fast` copy loop. On AArch64, run
+  `cargo test -p adv-drv upstream_zlib -- --ignored`. This checks forward copies,
+  including overlapping matches; it does not establish whole-decoder coverage.
 - Tests that need a game read it from `$ADV_SAMPLES`. They are ignored or skip when it is unset, so the default run needs no game files.
-- Fixtures with a recording in `tools/fixtures/native/` run on every host: `cargo test -p adv-runtime --features gpu --test native_reference` compares each CPU backend with the native Windows output. Record or refresh one on Windows with `python tools/fixtures/record_native.py <name>`; `--check` there confirms the build is still deterministic.
-- Windows-only differential tests run a self-written fixture natively and under Hitode. Their build scripts are in `tools/fixtures/`. CI runs them in the advisory `windows-differential.yml` workflow after merges that touch fixtures or `adv-win32`, weekly, and for a branch on demand with `gh workflow run windows-differential.yml --ref <branch>`; without Windows, read the native results in its logs. Failures known on the hosted image are listed in `tools/fixtures/hosted-known-failures.txt`.
-  To check one target, add `-f crate=adv-win32 -f test=crypt32_encoding_native`; omitted inputs run every Windows-only target. Filtered runs do not report unrelated known failures as fixed.
-- On AArch64, `tools/cpu/arm64-check.sh <ref>` runs the CPU suite once and judges it both normally and in strict mode. x64-only tests do not build there.
+- On AArch64, `tools/cpu/arm64-check.sh <ref>` runs the CPU suite once and judges it both normally and in strict mode.
 - Media tests need the FFmpeg variables above: `cargo test -p adv-device --features media`.
 - Direct3D 9 builds only with the `gpu` feature, so `cargo test -p adv-dx` skips it without a word: test it with `cargo test -p adv-dx --features gpu`. Test files pulled in with `include!` are outside `cargo fmt`; format them with `rustfmt --edition 2024 <file>`.
 - The workspace suite builds the launcher, so it needs the FFmpeg variables too.
@@ -65,12 +110,8 @@ The full DAC rate matrices run every Monday at 03:17 UTC or through the manual
 `slow-tests` input. Master pushes populate caches for later pull requests.
 
 Linux core and hardware acceptance checks use `ubuntu-24.04-arm`; release-mode
-Apple Silicon acceptance is also a gate. Windows x64 compatibility checks run
-for shared CPU or x64 changes, Windows source in either side of the diff, native
-fixtures, build configuration and performance tooling, plus weekly and manual
-runs. They test the CPU and lint platform code without building the launcher or
-iOS helper. Cargo caches are separated by job and test group. Mac jobs use three
-workers; Linux and Windows jobs use four. The privacy scan runs on every PR.
+Apple Silicon acceptance is also a gate. Cargo caches are separated by job and
+test group. Mac jobs use three workers; Linux jobs use four. The privacy scan runs on every PR.
 
 ## Launcher
 
@@ -84,7 +125,17 @@ FFMPEG_DIR=<ffmpeg> LIBCLANG_PATH=<libclang dir> pnpm tauri dev
 
 `pnpm check` runs the type check, and `pnpm tauri build` builds a release.
 
-For a macOS release, run `python3 tools/macos/build.py --ffmpeg-only`, then put its printed wrapper folder first on `PATH` and run `pnpm tauri build --target aarch64-apple-darwin --bundles app,dmg`. The wrapper selects the static FFmpeg, remaps build paths and strips release debug records. The bundle is signed ad hoc with Hardened Runtime and only the `allow-jit` entitlement. The version comes from `package.json`, and must match the Cargo workspace version.
+Set `ADV_WINE_DIST` to the complete stripped Wine installation, including its
+prefix template and identity tables, when building a playable launcher. Cargo
+embeds one solid XZ archive with a file-length manifest and content identity, without storing host paths.
+The player expands them once under its private application data before the first
+game, on a background thread. macOS, iOS and Android use the same files and code;
+source-only checks may omit the distribution, but game startup then reports the
+missing build input.
+When generating a mobile Cargo wrapper below, set `ADV_WINE_DIST` at that step;
+the wrapper carries it through Xcode's restricted build environment.
+
+For a macOS release, run `python3 tools/macos/build.py --ffmpeg-only`, then put its printed wrapper folder first on `PATH` and run `pnpm tauri build --target aarch64-apple-darwin --bundles app,dmg`. The wrapper selects the static FFmpeg, remaps build paths and strips release debug records. Preserve a separate dSYM when needed, and run `strip -x` on the bundled executable before its final signature to remove local symbols. The bundle is signed ad hoc with Hardened Runtime and only the `allow-jit` entitlement. The version comes from `package.json`, and must match the Cargo workspace version.
 
 ## macOS release package
 
@@ -104,7 +155,7 @@ python3 tools/macos/package.py
 The runner inside the bundle takes the usual arguments:
 
 ```sh
-target/macos/ADV.app/Contents/MacOS/adv-run --audio \
+target/macos/ADV.app/Contents/MacOS/adv-run --wine <distribution> --audio \
   --data-dir target/investigations/<topic>/data "$ADV_SAMPLES/<game>/<game>.exe"
 ```
 

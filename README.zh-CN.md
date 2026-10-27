@@ -47,7 +47,6 @@ Hitode 不针对某个游戏或引擎做适配，而是实现 32 位 Windows 视
 | macOS（Apple 芯片） | 支持 | |
 | Android（ARMv8-A，64 位） | 支持 | |
 | iOS / iPadOS | 支持 | iPad 和 iOS 26 以上系统尚未实机测试。需自签安装；请用 LocalDevVPN 等工具启用 JIT，否则性能可能不足以游玩。安装方法见 [iOS 教程](docs/ios.zh-CN.md) |
-| Windows x64 | 仅供调试 | 不做性能优化 |
 
 ## 下载
 
@@ -58,22 +57,14 @@ Hitode 不针对某个游戏或引擎做适配，而是实现 32 位 Windows 视
 
 Hitode 分为两部分：一个运行 Windows 程序的**运行时核心**，以及在各平台上承载它的**播放器**。
 
-```mermaid
-flowchart TB
-  game["原版游戏<br/>exe · DLL · 本地化补丁"]
-  subgraph core["运行核心"]
-    direction LR
-    jit["x86 → ARM64 JIT"] ~~~ win["Windows 行为"] ~~~ dev["图形 / 音频 / 视频设备"]
-  end
-  subgraph player["播放器"]
-    direction LR
-    shell["宿主壳<br/>Metal / Vulkan 画面 · 触控与键盘 · 音频"] ~~~ launcher["启动器<br/>游戏库 · 设置 · 游戏内覆盖层"]
-  end
-  os["macOS · iOS / iPadOS · Android"]
-  game --> core --> player --> os
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/architecture-dark.zh-CN.svg">
+  <img src="docs/images/architecture-light.zh-CN.svg" width="760" alt="架构图：原版游戏运行在一个 Hitode 进程里。体验（音频、视频、图形）、系统（NT 内核、Wine server、驱动）和执行（x86 到 ARM64 JIT、原生函数体）由宿主原生实现，Wine 负责长尾兼容。Hitode 运行在 macOS、iOS 和 Android 上。">
+</picture>
 
 思路借鉴主机模拟器：游戏自己的代码原样运行，Hitode 只提供它期待的“硬件”，也就是 Windows 的一个子集、图形音频视频设备、时间和线程。
+
+Windows 行为来自随 Hitode 一起构建的 Wine，它的模块作为 guest 代码运行，负责长尾兼容。玩家能感受到的部分全部是宿主代码：混音、MIDI、视频解码、DirectDraw 和 Direct3D 9，以及它们的计时。NT 内核、Wine server 和驱动都在同一个进程里，层与层直接调用。字节经过校验、确认未被改动的 Wine 函数，可以由原生函数体以宿主代码执行，结果完全相同。
 
 核心也可以脱离启动器单独运行，`adv-run` 是它的命令行入口，便于调试和自动化测试。
 
@@ -85,11 +76,11 @@ flowchart TB
 |---|---|---|---|
 | 支持的游戏 | 特定引擎 | 大多数 Windows 程序 | 32 位视觉小说引擎 |
 | 需要移植版 | 往往需要 | 不需要 | 不需要 |
-| 原版补丁 | 视移植情况 | 可以 | 可以 |
-| 上手配置 | 简单 | 较繁琐 | 选文件夹即可 |
-| 体积 | 小 | 较大 | 小 |
+| 原版与汉化补丁 | 视移植情况 | 可以 | 可以 |
+| 上手 | 简单 | 常要按游戏调整版本和设置 | 选文件夹即可 |
+| 音画 | 移植版原生实现 | Wine 的通用驱动 | 宿主原生实现 |
 
-Hitode 想在两者之间找一个平衡点：照常加载原版程序和补丁，但只实现视觉小说用得上的部分，把精力集中在游玩体验和引擎兼容上。
+Hitode 介于两者之间：照常加载原版程序和补丁，Windows 的长尾行为交给 Wine，玩家能直接感受到的音频、视频和图形由宿主原生实现。所有部分一起构建、一起发布，兼容问题在代码里修一次，所有游戏和平台一起受益，不必为每个游戏单独调设置。
 
 ## 构建
 
@@ -120,7 +111,8 @@ cargo build --release -p adv-run
 
 **运行核心**
 
-- [Wine](https://www.winehq.org/)：它的源码和测试是我们了解 Windows 行为的主要参考。我们没有链接或复制 Wine 的代码。
+- [Wine](https://www.winehq.org/)：Windows 行为来自它的模块，这些模块作为 guest 代码运行；它的服务端也在 Hitode 内运行。它的源码和测试一直是我们了解 Windows 的主要参考。
+- [FreeType](https://freetype.org/)：游戏里的文字由它栅格化。
 - [iced-x86](https://github.com/icedland/iced)：我们 CPU 底下的 x86 解码器。
 - [Unicorn](https://www.unicorn-engine.org/) 和 [QEMU](https://www.qemu.org/)：测试用来对照的参考 CPU。
 - [SingleStepTests/80386](https://github.com/SingleStepTests/80386)：逐条指令的测试向量。
@@ -132,9 +124,10 @@ cargo build --release -p adv-run
 - [StikDebug](https://github.com/StikDebug/StikDebug) 和 [idevice](https://github.com/jkcoxson/idevice)：让 iPhone 和 iPad 不借助电脑也能开启 JIT。
 - [Moonlight](https://moonlight-stream.org/)：触控手势的时序参照它的实现。
 - [Magpie](https://github.com/Blinue/Magpie)：超分着色器移植自它，原作是 [Anime4K](https://github.com/bloc97/Anime4K)、[CuNNy](https://github.com/funnyplanter/CuNNy)、[ArtCNN](https://github.com/Artoriuz/ArtCNN) 和 [mpv_PlayKit](https://github.com/hooke007/mpv_PlayKit) 的 k7_modernAnime。
+- [OxiSynth](https://github.com/PolyMeilex/OxiSynth) 和 FluidR3 Mono 音色库：MIDI 音乐的合成。
 - [FFmpeg](https://ffmpeg.org/) 和 Xiph 的 [libtheora](https://www.theora.org/)：播放游戏自带的视频。
 
-我们还用到了 [wgpu](https://wgpu.rs/)、[Symphonia](https://github.com/pdeljanov/Symphonia)、[cpal](https://github.com/RustAudio/cpal)、[encoding_rs](https://github.com/hsivonen/encoding_rs)、[Tauri](https://tauri.app/) 和 [Svelte](https://svelte.dev/)。
+我们还用到了 [wgpu](https://wgpu.rs/)、[Symphonia](https://github.com/pdeljanov/Symphonia)、[cpal](https://github.com/RustAudio/cpal)、[encoding_rs](https://github.com/hsivonen/encoding_rs)、[corosensei](https://github.com/Amanieu/corosensei)、[Tauri](https://tauri.app/) 和 [Svelte](https://svelte.dev/)。
 
 名字取自《CLANNAD》里伊吹风子一个个亲手雕、送给大家的木海星（ヒトデ）。我们也想把这些老游戏，一份份送到更多人手里。
 
@@ -157,5 +150,9 @@ Hitode 以 [GNU 通用公共许可证第 3 版或任何更新版本](COPYING)发
 - `crates/adv-cpu-core/softfloat`：Berkeley SoftFloat 3e，BSD-3-Clause。
 - `vendor/cpal`（Apache-2.0）和 `vendor/symphonia-codec-adpcm`（MPL-2.0）：打过补丁的上游代码。
 - `vendor/libtheora`：Xiph libtheora 1.2.0 解码部分，BSD-3-Clause，有本地修改，见其 `NOTICE`。
+- `vendor/wine`：Wine 11.0 的服务端及其包含的头文件、服务端启动时加载的 `l_intl.nls`，以及 `ntsyscalls.h` 系统调用表，LGPL-2.1-or-later，未修改，见其 `NOTICE`。
+- `crates/adv-unix/freetype`：FreeType 的 ftgrays 光栅器，按 FreeType License（FTL）使用，见其 `LICENSE.TXT`。
+- `vendor/fluidr3mono`：FluidR3 Mono GM 音色库，MIT，见其 `LICENSE`。
 - `vendor/upscaling`：超分着色器源码，GPL-3.0 与各原作的许可证（Anime4K 为 MIT），见其 `NOTICE`。
-- `tools/fixtures/vendor/minhook`：测试夹具，见其 `LICENSE.txt`。
+
+发行包内的 Wine 模块是 Wine 11.0 的 i386 构建，LGPL-2.1-or-later，构建脚本在 `tools/wine/`。

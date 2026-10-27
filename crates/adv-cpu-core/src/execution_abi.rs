@@ -12,7 +12,7 @@ pub const ARM64_FLAGS: u8 = 8;
 pub const ARM64_CONTEXT: u8 = 27;
 pub const ARM64_WINDOW: u8 = 28;
 
-/// Complete fixed-size host snapshot. `flags` is RFLAGS or ARM64 PSTATE/NZCV;
+/// Complete fixed-size host snapshot. `flags` is ARM64 PSTATE/NZCV;
 /// it is not silently interpreted as guest EFLAGS. Unsupported extended state
 /// must be rejected by the platform adapter before claiming the exception.
 #[repr(C)]
@@ -27,7 +27,7 @@ pub struct HostContextSnapshot {
     pub fpsr: u32,
     pub gpr_count: u32,
     pub simd_count: u32,
-    /// 1 = x86_64, 2 = aarch64. Zero is not a valid captured context.
+    /// 2 = aarch64. Zero is not a valid captured context.
     pub architecture: u32,
 }
 
@@ -86,7 +86,7 @@ mod tests {
     use super::*;
     use std::mem::{offset_of, size_of};
 
-    // spec: EXEC-X64-6
+    // spec: A64-MEM-9
     #[test]
     fn entry_frame_and_signal_snapshot_have_fixed_c_layouts() {
         assert_eq!(offset_of!(HostContextSnapshot, sp), 256);

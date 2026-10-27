@@ -56,12 +56,7 @@ fn evict(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
         .chain(d.shaders.textures.iter().copied().flatten())
         .collect();
     let recording = d.recording.is_some();
-    let identities: Vec<_> = env
-        .sys
-        .objects
-        .hosts_in::<adv_os::com::ComObject<Payload>>(com(env).namespace())
-        .map(|(id, _)| id)
-        .collect();
+    let identities: Vec<_> = d.children.values().copied().collect();
     let mut textures = Vec::new();
     // Admission covers the entire device before removing a single GPU view.
     for id in identities {

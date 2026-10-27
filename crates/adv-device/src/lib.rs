@@ -11,8 +11,8 @@ pub mod constants;
 mod device;
 #[cfg(feature = "gpu")]
 pub mod gpu;
-pub mod image;
 pub mod media;
+pub mod midi;
 pub mod mixer;
 mod owned;
 mod resample;
@@ -20,7 +20,9 @@ pub mod ring;
 pub mod surface;
 pub mod text;
 pub mod theora;
+pub mod ui;
 pub mod vorbis;
+pub mod xaudio2;
 pub use actor::{AudioControl, AudioEvent, RingState};
 #[cfg(feature = "device")]
 pub use device::{Metrics, Output};
@@ -53,5 +55,3 @@ pub struct DeviceClock {
     pub consumed_frames: u64,
     pub queued_frames: u32,
 }
-
-pub mod gdiplus;

@@ -7,7 +7,6 @@ use adv_cpu::{
 };
 use adv_device::surface::{MemoryOperations, MemoryView, Snapshot};
 use adv_machine::{Clock, Conv, Machine, Resume, RunResult, Wait, layout::PARK_ADDR};
-use adv_os::gdi::Gdi;
 use std::borrow::Cow;
 
 const CODE: u32 = 0x400000;
@@ -161,8 +160,13 @@ fn setup(jit: bool, legacy: bool, mut registry: Registry) -> (Machine<JitCpu>, u
         .insert(SurfaceStore::new(800, 600, 0x500000, 65536, Snapshot::default()).unwrap());
     front::install(
         &mut m,
-        Gdi::default(),
         front::Provider {
+            dc: crate::interop::MemoryDc {
+                create: |_, _, _| unreachable!(),
+                flush: |_, _, _, _| unreachable!(),
+                release: |_, _, _| unreachable!(),
+                discard: |_, _| unreachable!(),
+            },
             memory,
             window: |_, _, _| None,
             completed: |_, _| None,
@@ -438,7 +442,7 @@ fn activated_device_initialization_identity_and_release_share_the_function_owner
         front::call(&mut env(&mut m), api::INITIALIZE, &[this, 0]),
         Outcome::Return(0x88760005)
     ));
-    m.cpu.write(DATA + 128, &adv_os::com::IUNKNOWN).unwrap();
+    m.cpu.write(DATA + 128, &adv_abi::com::IUNKNOWN).unwrap();
     assert!(matches!(
         front::call(&mut env(&mut m), api::QUERY, &[this, DATA + 128, DATA + 4]),
         Outcome::Return(0)

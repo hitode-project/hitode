@@ -198,3 +198,44 @@ fn scalar_code_writes_and_locked_forms_keep_the_checked_owner_path() {
         &1u32.to_le_bytes()
     );
 }
+
+// spec: EXEC-CORE-7
+#[test]
+fn watched_nonexecutable_bytes_keep_checked_stores_and_precise_invalidation() {
+    let mut memory = Memory::new(0x10000, 0x20000).unwrap();
+    memory.protect(0x10000, 0x20000, READ | WRITE).unwrap();
+    memory.write(0x10000, &[0x89, 0x06]).unwrap(); // mov [esi], eax
+    memory.protect(0x10000, PAGE_SIZE, READ | EXEC).unwrap();
+    memory.watch_code(0x20040, 4);
+    for (address, len) in [(0x20040, 1), (0x2003f, 2), (0x20041, 4), (0x2003f, 16)] {
+        assert!(memory.direct(address, len, true).is_none());
+        assert!(memory.direct(address, len, false).is_some());
+    }
+    assert!(memory.direct(0x2003c, 4, true).is_some());
+    assert!(memory.direct(0x20044, 4, true).is_some());
+    let mut interpreter = Interpreter::new();
+    let mut state = CpuState {
+        eip: 0x10000,
+        ..Default::default()
+    };
+    state.regs[0] = 0x98765432;
+    for (address, watched) in [(0x20040, true), (0x20044, false)] {
+        memory.dirty_pages.clear();
+        memory.dirty_ranges = Some(Vec::new());
+        let version = memory.versions[0x10000 / PAGE_SIZE];
+        state.eip = 0x10000;
+        state.regs[6] = address;
+        assert_eq!(interpreter.step(&mut state, &mut memory), Step::Executed);
+        assert_eq!(
+            memory.read(address, 4).unwrap(),
+            &state.regs[0].to_le_bytes()
+        );
+        assert_eq!(memory.versions[0x10000 / PAGE_SIZE] != version, watched);
+        assert_eq!(memory.dirty_pages.contains_key(&0x20000), watched);
+        let written = [(address, 4)];
+        assert_eq!(
+            memory.dirty_ranges.as_deref(),
+            Some(if watched { &written[..] } else { &[][..] })
+        );
+    }
+}

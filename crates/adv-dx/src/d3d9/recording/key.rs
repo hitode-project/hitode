@@ -16,7 +16,11 @@ pub(in crate::d3d9) fn rect(r: adv_device::surface::Rect) -> (u32, u32, u32, u32
 fn image(i: &Image) -> (u32, u32, u32, u8) {
     (i.width(), i.height(), i.mip_levels(), i.alpha_mode() as u8)
 }
-fn target_key(t: &Target) -> impl Hash {
+pub(super) type TargetKey = (
+    (u32, u32, u32, u8),
+    Option<(u32, u32, adv_device::gpu::DepthFormat)>,
+);
+pub(super) fn target_key(t: &Target) -> TargetKey {
     (
         image(&t.image),
         t.depth().map(|d| (d.width(), d.height(), d.format())),
@@ -105,38 +109,67 @@ pub(in crate::d3d9) fn fixed(f: &fixed::Fixed) -> u128 {
         clip_planes.map(|m| m.map(f32::to_bits)),
     ))
 }
-pub(super) fn content(env: &Env<'_>, id: Id, level: Option<u32>, aspect: u8) -> Content {
-    #[cfg(feature = "d3d9-counters")]
-    lookup(1);
-    match com(env).get_identity(&env.sys.objects, id) {
-        Some(Payload::Resource(r)) => {
-            let identity = r.container.unwrap_or(id);
-            #[cfg(feature = "d3d9-counters")]
-            lookup(1);
-            let pointer = match com(env).get_identity(&env.sys.objects, identity) {
-                Some(Payload::Resource(r)) => r.pointer,
-                _ => r.pointer,
-            };
-            Content(identity, level.unwrap_or(r.level), aspect, pointer)
+struct ResourceIdentity {
+    owner: Id,
+    pointer: u32,
+    level: u32,
+    levels: u32,
+}
+impl ResourceIdentity {
+    fn resolve(env: &Env<'_>, id: Id) -> Self {
+        #[cfg(feature = "d3d9-counters")]
+        lookup(1);
+        let com = com(env);
+        match com.get_identity(&env.sys.objects, id) {
+            Some(Payload::Resource(r)) => {
+                let owner = r.container.unwrap_or(id);
+                let pointer = if let Some(container) = r.container {
+                    #[cfg(feature = "d3d9-counters")]
+                    lookup(1);
+                    match com.get_identity(&env.sys.objects, container) {
+                        Some(Payload::Resource(parent)) => parent.pointer,
+                        _ => r.pointer,
+                    }
+                } else {
+                    r.pointer
+                };
+                Self {
+                    owner,
+                    pointer,
+                    level: r.level,
+                    levels: r.levels.len().max(1) as u32,
+                }
+            }
+            _ => Self {
+                owner: id,
+                pointer: 0,
+                level: 0,
+                levels: 1,
+            },
         }
-        _ => Content(id, level.unwrap_or(0), aspect, 0),
+    }
+    fn content(&self, level: Option<u32>, aspect: u8) -> Content {
+        Content(
+            self.owner,
+            level.unwrap_or(self.level),
+            aspect,
+            self.pointer,
+        )
     }
 }
+pub(super) fn content(env: &Env<'_>, id: Id, level: Option<u32>, aspect: u8) -> Content {
+    ResourceIdentity::resolve(env, id).content(level, aspect)
+}
 fn sample(env: &Env<'_>, id: Id, out: &mut Vec<Content>) {
-    #[cfg(feature = "d3d9-counters")]
-    lookup(1);
-    let count = match com(env).get_identity(&env.sys.objects, id) {
-        Some(Payload::Resource(r)) => r.levels.len().max(1),
-        _ => 1,
-    };
-    out.extend((0..count as u32).map(|n| content(env, id, Some(n), 0)));
+    let resource = ResourceIdentity::resolve(env, id);
+    out.extend((0..resource.levels).map(|n| resource.content(Some(n), 0)));
 }
 pub(super) struct Bindings {
     signature: (Option<Id>, Option<Id>, u64),
-    output: [Option<Content>; 3],
-    samples: Vec<Content>,
+    pub(super) output: [Option<Content>; 3],
+    pub(super) samples: Vec<Content>,
 }
-fn bind(env: &mut Env<'_>, owner: Id) -> Result<(), u32> {
+pub(super) fn bind(env: &mut Env<'_>, owner: Id) -> Result<(), u32> {
     #[cfg(feature = "d3d9-counters")]
     lookup(1);
     let Some(Payload::Device(d)) = com(env).get_identity(&env.sys.objects, owner) else {
@@ -161,10 +194,11 @@ fn bind(env: &mut Env<'_>, owner: Id) -> Result<(), u32> {
     {
         sample(env, id, &mut samples);
     }
+    let depth = signature.1.map(|id| ResourceIdentity::resolve(env, id));
     let output = [
         signature.0.map(|id| content(env, id, None, 0)),
-        signature.1.map(|id| content(env, id, None, 1)),
-        signature.1.map(|id| content(env, id, None, 2)),
+        depth.as_ref().map(|r| r.content(None, 1)),
+        depth.as_ref().map(|r| r.content(None, 2)),
     ];
     #[cfg(feature = "d3d9-counters")]
     lookup(1);
@@ -175,6 +209,7 @@ fn bind(env: &mut Env<'_>, owner: Id) -> Result<(), u32> {
     });
     Ok(())
 }
+#[derive(Clone)]
 pub(super) struct Prepared {
     #[cfg(feature = "d3d9-counters")]
     pub lookups: u64,
@@ -390,7 +425,13 @@ pub(super) fn prepare(
                 } = p.as_ref();
                 program.textures.hash(&mut h);
                 for s in streams {
-                    (s.stride, &s.attributes, &s.bytes).hash(&mut h);
+                    (s.stride, &s.attributes).hash(&mut h);
+                    s.bytes.content_key().is_some().hash(&mut h);
+                    if let Some(key) = s.bytes.content_key() {
+                        key.hash(&mut h);
+                    } else {
+                        s.bytes.hash(&mut h);
+                    }
                     bytes += s.bytes.len();
                 }
                 (indices, vertex_count).hash(&mut h);
@@ -414,7 +455,7 @@ pub(super) fn prepare(
     if let Operation::Draw(d) = &mut operation
         && d.programmable.is_some()
     {
-        d.vertices = Vec::new();
+        d.vertices = Arc::default();
         d.texcoords = None;
     }
     Ok(Prepared {
@@ -472,10 +513,15 @@ fn validate(operation: &Operation) -> Result<(), u32> {
             pixels,
             ..
         } => {
+            let width = if matches!(pixels, Pixels::Alpha8(_)) {
+                1
+            } else {
+                4
+            };
             bounds(&target.image, *rectangle, false)
-                && u64::from(*pitch) >= u64::from(rectangle.w) * 4
-                && pitch.is_multiple_of(4)
-                && u64::from(*pitch) * u64::from(rectangle.h - 1) + u64::from(rectangle.w) * 4
+                && u64::from(*pitch) >= u64::from(rectangle.w) * width
+                && (width == 1 || pitch.is_multiple_of(4))
+                && u64::from(*pitch) * u64::from(rectangle.h - 1) + u64::from(rectangle.w) * width
                     <= pixels.len() as u64
         }
         Operation::Copy {
@@ -516,7 +562,10 @@ fn validate(operation: &Operation) -> Result<(), u32> {
                 && s.scissor.is_none_or(|r| bounds(&d.target.image, r, false));
             raster
                 && if let Some(p) = &d.programmable {
-                    let n = p.indices.as_ref().map_or(p.vertex_count as usize, Vec::len);
+                    let n = p
+                        .indices
+                        .as_ref()
+                        .map_or(p.vertex_count as usize, |v| v.len());
                     let last = p
                         .indices
                         .as_ref()

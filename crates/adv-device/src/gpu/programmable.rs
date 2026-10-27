@@ -1,6 +1,6 @@
 //! Guest-independent programmable drawing. Vertex storage is uploaded unchanged;
 //! the GPU vertex fetcher and a small unpack expression produce shader inputs.
-use super::{Image, Sampler};
+use super::{ConstantSnapshot, Image, Sampler, VertexBytes};
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -103,7 +103,7 @@ pub struct Attribute {
 }
 #[derive(Clone)]
 pub struct VertexStream {
-    pub bytes: Vec<u8>,
+    pub bytes: VertexBytes,
     pub stride: u32,
     pub attributes: Vec<Attribute>,
 }
@@ -143,10 +143,10 @@ pub struct ProgramTexture {
 pub struct ProgrammableDraw {
     pub program: Program,
     pub streams: Vec<VertexStream>,
-    pub indices: Option<Vec<u32>>,
+    pub indices: Option<super::IndexBytes>,
     pub vertex_count: u32,
-    pub vertex_constants: ConstantBlock,
-    pub pixel_constants: ConstantBlock,
+    pub vertex_constants: ConstantSnapshot,
+    pub pixel_constants: ConstantSnapshot,
     pub textures: Vec<ProgramTexture>,
     /// Viewport, fixed texture/alpha operations and alpha test, then reserved.
     pub parameters: [[u32; 4]; 40],
@@ -178,12 +178,11 @@ impl ProgrammableDraw {
             .into_iter()
             .enumerate()
             .flat_map(|(stage, block)| {
-                self.program.constants[stage].ranges().map(move |r| {
-                    (
-                        stage * std::mem::size_of::<ConstantBlock>() + r.start,
-                        &bytemuck::bytes_of(block)[r],
-                    )
-                })
+                block
+                    .ranges(self.program.constants[stage])
+                    .map(move |(offset, bytes)| {
+                        (stage * std::mem::size_of::<ConstantBlock>() + offset, bytes)
+                    })
             })
             .chain(std::iter::once((
                 2 * std::mem::size_of::<ConstantBlock>(),

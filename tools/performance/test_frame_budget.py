@@ -1,16 +1,15 @@
-"""Frame attribution, checkpoint and transport safety tests with synthetic inputs.
+"""Frame attribution and checkpoint tests with synthetic inputs.
 
 Run: python -m unittest discover -s tools/performance -p test_frame_budget.py
-No game, Android device or GPU is required; output is unittest statistics.
+No game or GPU is required; output is unittest statistics.
 """
 import json
-import os
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import Mock, patch
-import time
+from unittest.mock import patch
 
+import play_session
 import frame_budget as budget
 from scene_schedule import load_scene, validate_reference
 
@@ -125,20 +124,6 @@ class FrameBudgetTests(unittest.TestCase):
         self.assertEqual(result["aot"], {"private_completions": 2, "publications": 1})
         self.assertNotIn("private native bytes", json.dumps(result))
 
-    def test_shared_device_broker_accepts_the_callers_task_name(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            helper = root / "device.ps1"
-            helper.write_text("fixture")
-            with patch.dict(os.environ, {"ADV_DEVICE_TASK": "aot"}), patch.object(budget.subprocess, "run") as invoke:
-                with budget.device_lock(None, root, helper):
-                    pass
-                self.assertEqual(invoke.call_args.kwargs["env"]["ADV_DEVICE_TASK"], "aot")
-            with patch.dict(os.environ, {"ADV_DEVICE_TASK": "aot; unexpected"}), patch.object(budget.subprocess, "run") as invoke:
-                with self.assertRaises(ValueError):
-                    with budget.device_lock(None, root, helper):
-                        pass
-                invoke.assert_not_called()
 
     def test_scene_check_can_push_combined_work_over_the_budget(self):
         row = frame(wall_ns=40_000_000, active_ns=25_000_000, guest_exec_ns=22_000_000,
@@ -183,19 +168,6 @@ class FrameBudgetTests(unittest.TestCase):
         self.assertTrue(estimate["native_over_budget_estimate"])
         self.assertEqual(estimate["retirement_coverage"], "tier0_only")
         self.assertIsNone(budget.native_estimate(frame(cpu={"tier2_blocks": 999_000_000}), 1)["native_time_lower_estimate_ns"])
-    def test_broker_sharing_error_retries_only_acquisition(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            helper = root / "device.ps1"
-            helper.touch()
-            error = budget.subprocess.CalledProcessError(1, ["powershell"])
-            with patch.object(budget.subprocess, "run", side_effect=[error, Mock(), Mock()]) as run, patch.object(budget.time, "sleep") as sleep:
-                with budget.device_lock(None, root, helper):
-                    pass
-                self.assertEqual(run.call_count, 3)
-                self.assertIn("Request-Device", run.call_args_list[1].args[0][-1])
-                self.assertIn("Release-Device", run.call_args_list[2].args[0][-1])
-                sleep.assert_called_once_with(2)
 
     def test_wait_summary_keeps_numeric_data_and_drops_private_labels(self):
         report = {"wait_diagnostics": {"schema": "adv-wait-diagnostics-v1", "sources": {
@@ -207,17 +179,6 @@ class FrameBudgetTests(unittest.TestCase):
         self.assertNotIn("hidden", json.dumps(result))
         self.assertNotIn("private", json.dumps(result))
 
-    def test_broker_uses_the_calling_tasks_queue_name(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            helper = root / "device.ps1"
-            helper.touch()
-            with patch.dict("os.environ", {"ADV_DEVICE_TASK": "wait"}), patch.object(budget.subprocess, "run") as run:
-                with budget.device_lock(None, root, helper):
-                    pass
-                self.assertEqual(run.call_count, 2)
-                for call in run.call_args_list:
-                    self.assertEqual(call.kwargs["env"]["ADV_DEVICE_TASK"], "wait")
 
     def test_compile_overlap_is_explicit_and_worker_time_is_not_charged(self):
         row = frame(cpu={"compile_wait_execution_ns": 30_000_000, "compile_time": 2_000_000_000})
@@ -294,14 +255,6 @@ class FrameBudgetTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 load_scene(path)
 
-    def test_cleanup_rejects_shared_and_traversing_paths(self):
-        adb = Mock()
-        for path in ("/data/local/tmp", "/data/local/tmp/adv-host-a-fonts", "/data/local/tmp/adv-host-bud-../"):
-            with self.assertRaises(ValueError):
-                budget.cleanup_remote(adb, path)
-        adb.call.assert_not_called()
-        budget.cleanup_remote(adb, "/data/local/tmp/adv-host-bud-" + "1" * 32)
-        self.assertIn("readlink /proc/$p/exe", adb.call.call_args.args[1])
 
     def test_all_scenarios_use_known_scenes_and_local_sample_paths(self):
         for path in budget.SCENARIOS.glob("frame-budget-*.json"):
@@ -312,48 +265,8 @@ class FrameBudgetTests(unittest.TestCase):
                 schedule = Path(directory) / "schedule.json"
                 budget.write_json(schedule, scenario["schedule"])
                 if load_scene(schedule) is None:
-                    budget.replay.load_schedule(schedule)
+                    play_session.load_schedule(schedule)
 
-    def test_android_switches_reuse_existing_runner(self):
-        args = Mock(exe_relative="fixture.exe", codepage=932, codec="native", codec_kernels="native",
-                    frame_budget=True, perf_map=True, no_tiering=False, schedule_profile=False,
-                    auto_dialog_ms=50, compile_threads=None, font_diagnostics=False,
-                    font_profile=None, capture_pcm=False, cpu_mask=None)
-        command = budget.replay.runner_command(args, "/private/run", "/readonly/game", 30)
-        self.assertIn("--frame-budget", command)
-        self.assertIn("ADV_PERF_MAP_DIR=/private/run", command)
-        self.assertNotIn("--profile", command)
-
-    def test_deployment_pushes_independent_files_with_a_shared_deadline(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            (root / "data").mkdir()
-            (root / "fixture.txt").write_text("fixture", encoding="utf-8")
-            (root / "data" / "resource.txt").write_text("resource", encoding="utf-8")
-            adb = Mock()
-            budget.deploy_game(adb, root, "/private/game", {}, time.monotonic() + 1000)
-            self.assertEqual(adb.push.call_count, 2)
-            self.assertTrue(all(call.args[0].is_file() for call in adb.push.call_args_list))
-            self.assertLessEqual(adb.timeout, 120)
-            self.assertTrue(adb.call.call_args.kwargs["idempotent"])
-
-    def test_broker_releases_on_failure_without_legacy_lock_or_cooldown(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            helper = root / "device.ps1"
-            helper.touch()
-            with patch.dict(budget.os.environ, {"ADV_DEVICE_TASK": "fixture-cvg"}), \
-                    patch.object(budget.subprocess, "run") as invoke, patch.object(budget.time, "sleep") as sleep:
-                with self.assertRaisesRegex(RuntimeError, "fixture"):
-                    with budget.device_lock(None, root, helper) as deadline:
-                        self.assertGreater(deadline, time.monotonic())
-                        raise RuntimeError("fixture")
-                self.assertEqual(invoke.call_count, 2)
-                self.assertIn("Request-Device", invoke.call_args_list[0].args[0][-1])
-                self.assertIn("Release-Device", invoke.call_args_list[1].args[0][-1])
-                self.assertNotIn("-Done", invoke.call_args_list[1].args[0][-1])
-                self.assertEqual(invoke.call_args.kwargs["env"]["ADV_DEVICE_TASK"], "fixture-cvg")
-                sleep.assert_not_called()
 
     def test_pcm_failure_is_explicit_without_exporting_raw_diagnostics(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -367,39 +280,6 @@ class FrameBudgetTests(unittest.TestCase):
             self.assertEqual(rows[0]["reason"], "pcm_incomplete")
             self.assertNotIn("private details", json.dumps(rows))
             self.assertNotIn("metrics", rows[0])
-
-    def test_deployment_reserves_cleanup_time_before_another_transfer(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            (root / "fixture.txt").touch()
-            adb = Mock()
-            with self.assertRaises(TimeoutError):
-                budget.deploy_game(adb, root, "/private/game", {}, time.monotonic() + 300)
-            adb.push.assert_not_called()
-
-    def test_resume_retries_deployment_without_replacing_guest_evidence(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            output = root / "fixture-cold"
-            output.mkdir()
-            (output / "cmd.txt").write_text("failed deployment", encoding="utf-8")
-            budget.preserve_undeployed(output, root)
-            self.assertFalse(output.exists())
-            self.assertEqual(len(list(root.glob("fixture-cold-undeployed-*"))), 1)
-            output.mkdir()
-            (output / "session.json").write_text("{}", encoding="utf-8")
-            with self.assertRaises(ValueError):
-                budget.preserve_undeployed(output, root)
-            self.assertTrue((output / "session.json").is_file())
-
-    def test_resume_rejects_a_move_outside_the_explicit_run_root(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            output = root / "outside"
-            output.mkdir()
-            with self.assertRaises(ValueError):
-                budget.preserve_undeployed(output, root / "intended")
-            self.assertTrue(output.is_dir())
 
 
 if __name__ == "__main__":

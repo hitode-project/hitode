@@ -1,6 +1,6 @@
 import { inTauri } from "./bridge";
 import { device } from "./device.svelte";
-import { revealPath } from "./host";
+import { revealDrive, revealPath } from "./host";
 
 /**
  * Whether the system file manager can show `path`: anything in the macOS
@@ -10,6 +10,11 @@ export function canReveal(path = ""): boolean {
   if (!inTauri) return false;
   if (device.platform === "macos") return !device.phone;
   return device.platform === "android" && /^\/storage\/emulated\/0(\/|$)/.test(path);
+}
+
+/** Shows drive C:, where games keep data outside their folders. */
+export function revealC(): void {
+  revealDrive().catch((error: unknown) => console.error("reveal_drive failed", error));
 }
 
 /** Shows `path` in Finder, or in the Android Files app. */

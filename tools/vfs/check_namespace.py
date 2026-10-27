@@ -13,7 +13,7 @@ import re
 import sys
 from pathlib import Path
 
-ROOTS = [Path("crates/adv-os/src/vfs.rs"), Path("crates/adv-os/src/vfs"), Path("crates/adv-win32/src")]
+ROOTS = [Path("crates/adv-os/src/vfs.rs"), Path("crates/adv-os/src/vfs")]
 WRAPPERS = Path("crates/adv-os/src/vfs/host.rs")
 CHANGE = re.compile(
     r"\bfs::(create_dir|create_dir_all|remove_file|remove_dir|remove_dir_all|rename|copy|write|hard_link)\("

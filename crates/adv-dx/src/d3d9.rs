@@ -1,28 +1,26 @@
 //! D3D9 interface semantics over common COM identities and neutral GPU commands.
-//! The runtime supplies only surface/window assembly callbacks. Native frames
+//! Assembly supplies private guest allocation, memory DCs and window/display operations. Native frames
 //! use the same store and mailbox as GDI/DirectDraw, without a CPU round trip.
 // Typed SDK signatures determine the parameter count, including COM `this`.
 #![allow(clippy::too_many_arguments)]
+use adv_abi::com::{Com, ComIdentity, Destroyed, Iid, QueryError};
 use adv_abi::types::{D3DPRESENT_PARAMETERS, RECT};
 use adv_abi::{GuestPtr, Handle, Registry, win32};
 use adv_cpu::backend::{Backend, GuestExt, Prot};
 use adv_device::gpu::{Error, Gpu, Target};
 use adv_machine::{Env, Ext, Machine, Object, Objects, Outcome, Wait};
-use adv_os::{
-    Heaps,
-    com::{Com, ComIdentity, Destroyed, Iid, QueryError},
-};
+#[cfg(test)]
+use adv_os::Heaps;
 use resources::Resource;
+#[cfg(all(test, target_arch = "aarch64"))]
+mod call_tests;
 mod capabilities;
 mod creation;
 mod cursor;
 mod dc;
-pub(crate) mod direct;
 mod dirty;
 mod fixed;
 mod format;
-mod leaf_calls;
-pub(crate) mod loading;
 mod memory;
 mod pacing;
 mod presentation;
@@ -30,11 +28,11 @@ mod programmable;
 mod readback;
 mod recording;
 mod residency;
-pub(crate) mod saving;
 mod stretch;
 mod targets;
 #[cfg(test)]
 mod tests;
+mod unchanged;
 mod update_texture;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -56,11 +54,8 @@ const IID_DEVICE: Iid = [
 /// Thin assembly operations; no higher-layer payload is owned by this frontend.
 #[derive(Clone, Copy)]
 pub struct SurfaceProvider {
-    /// Explicit CPU/GDI access, assembled by the runtime without a frontend
-    /// dependency. The borrowed canvas is owned until `release_dc`.
-    pub acquire_dc: fn(&mut Env<'_>, u32, u32, u32, u32) -> Result<u32, String>,
-    pub writeback_dc: fn(&mut Env<'_>, u32, u32, u32) -> Result<(), String>,
-    pub release_dc: fn(&mut Env<'_>, u32),
+    pub allocator: crate::interop::GuestAllocator,
+    pub dc: crate::interop::MemoryDc,
     pub insert: fn(&mut Ext, Target) -> Result<u32, String>,
     pub target: fn(&Ext, u32) -> Option<Target>,
     pub remove: fn(&mut Ext, &mut dyn adv_cpu::backend::Guest, u32) -> Result<(), String>,
@@ -80,6 +75,8 @@ pub struct SurfaceProvider {
     /// Host input policy: bypass refresh pacing while physical Ctrl is held.
     pub fast_forward: fn(&Ext) -> bool,
     pub display: fn(&Ext) -> (u32, u32, u32),
+    /// The display's HMONITOR, as the guest's user32 hands it out.
+    pub monitor: u32,
     /// Time since the host display's latest vsync and its period; None keeps
     /// refresh boundaries on the machine clock.
     pub vsync: fn(&Ext) -> Option<(std::time::Duration, std::time::Duration)>,
@@ -87,8 +84,6 @@ pub struct SurfaceProvider {
     pub mode_changed: fn(&mut Env<'_>, u32, D3DPRESENT_PARAMETERS) -> Outcome,
     pub device_released: fn(&mut Env<'_>, u32),
     pub completed: fn(&mut Env<'_>, u64) -> Option<Outcome>,
-    /// A completed Present that did not wait for a refresh boundary.
-    pub unpaced: fn(&mut Env<'_>),
 }
 
 type Id = ComIdentity<Payload>;
@@ -102,6 +97,7 @@ enum Payload {
     StateBlock(Box<shaders::stateblocks::StateBlock>),
 }
 struct Device {
+    children: BTreeMap<u32, Id>,
     pointer: u32,
     factory: Id,
     surface: u32,
@@ -123,17 +119,67 @@ struct Device {
     shaders: shaders::Bindings,
     recording: Option<shaders::stateblocks::Snapshot>,
     versions: [u64; 15],
+    fingerprints: [u128; 15],
     frame: recording::Recording,
     gpu_lost: bool,
     /// The last refresh boundary, so vsync-locked boundaries keep their phase.
     boundary: Option<u64>,
 }
+impl Device {
+    fn class_key(&self, class: usize) -> u128 {
+        use recording::hash;
+        let f = &self.fixed;
+        match class {
+            0 => hash(&f.render),
+            1 => hash((&f.stage, &f.stage_slots)),
+            2 => hash((&f.sampler, &f.sampler_slots)),
+            3 => hash((
+                f.viewport.X,
+                f.viewport.Y,
+                f.viewport.Width,
+                f.viewport.Height,
+                f.viewport.MinZ.to_bits(),
+                f.viewport.MaxZ.to_bits(),
+            )),
+            4 => hash((
+                f.scissor.left,
+                f.scissor.top,
+                f.scissor.right,
+                f.scissor.bottom,
+            )),
+            5 => hash(f.transforms.map(|v| v.map(f32::to_bits))),
+            6 => hash(f.clip_planes.map(|v| v.map(f32::to_bits))),
+            7 => hash((f.fvf, self.buffers.declaration)),
+            8 => hash(self.shaders.vertex),
+            9 => hash(self.shaders.pixel),
+            10 => hash(self.buffers.streams.map(|s| (s.buffer, s.offset, s.stride))),
+            11 => hash(self.buffers.indices),
+            12 => hash((self.texture, self.shaders.textures)),
+            13 => self.shaders.vertex_constants.fingerprint(),
+            14 => self.shaders.pixel_constants.fingerprint(),
+            _ => unreachable!(),
+        }
+    }
+    fn touch(&mut self, class: usize) {
+        self.versions[class] += 1;
+        self.fingerprints[class] = self.class_key(class);
+    }
+    fn refresh_all(&mut self) {
+        self.fingerprints = std::array::from_fn(|class| self.class_key(class));
+    }
+    /// Refreshes only the classes in `dirty`, one bit per class.
+    fn refresh(&mut self, dirty: u32) {
+        for class in 0..self.fingerprints.len() {
+            if dirty & (1 << class) != 0 {
+                self.fingerprints[class] = self.class_key(class);
+            }
+        }
+    }
+}
+
 pub struct State {
     com: Com,
     tables: BTreeMap<&'static str, u32>,
-    /// Published device and state block thunks by COM slot (GFX-EFFECT-3).
-    device_methods: Vec<u32>,
-    block_methods: Vec<u32>,
     gpu: Option<Gpu>,
     provider: SurfaceProvider,
     pending: Vec<Pending>,
@@ -225,13 +271,14 @@ pub fn diagnostics(ext: &Ext, objects: &Objects) -> Diagnostics {
 #[derive(Clone)]
 enum Pixels {
     Host(Arc<Vec<u8>>),
+    Alpha8(Arc<Vec<u8>>),
     /// GPU staging memory and the content hash of the rows written to it.
     Staged(Arc<adv_device::gpu::Staged>, u64),
 }
 impl Pixels {
     fn len(&self) -> usize {
         match self {
-            Self::Host(pixels) => pixels.len(),
+            Self::Host(pixels) | Self::Alpha8(pixels) => pixels.len(),
             Self::Staged(staged, _) => staged.len(),
         }
     }
@@ -240,7 +287,7 @@ impl Pixels {
 impl std::hash::Hash for Pixels {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         match self {
-            Self::Host(pixels) => pixels.as_slice().hash(state),
+            Self::Host(pixels) | Self::Alpha8(pixels) => pixels.as_slice().hash(state),
             Self::Staged(_, digest) => digest.hash(state),
         }
     }
@@ -248,6 +295,7 @@ impl std::hash::Hash for Pixels {
 
 // Keep ordinary hot commands inline. Only a parked command requires allocation.
 #[allow(clippy::large_enum_variant)]
+#[derive(Clone)]
 enum Operation {
     Clear {
         target: Target,
@@ -316,10 +364,7 @@ pub fn register(registry: &mut Registry) {
         get_direct3d_ABI,
         begin_scene_ABI,
         end_scene_ABI,
-        adv_abi::Api {
-            env_leaf: Some(leaf_calls::draw),
-            ..clear_ABI
-        },
+        clear_ABI,
         present_ABI,
         reset_ABI,
     ] {
@@ -352,7 +397,6 @@ pub fn install<B: Backend>(
     provider: SurfaceProvider,
 ) -> Result<(), String> {
     let mut tables = BTreeMap::new();
-    let (mut device_methods, mut block_methods) = (Vec::new(), Vec::new());
     for interface in [
         "IDirect3D9",
         "IDirect3DDevice9",
@@ -389,15 +433,6 @@ pub fn install<B: Backend>(
                 .cpu
                 .write_u32(table + u32::from(slot) * 4, thunk)
                 .map_err(|e| e.to_string())?;
-            let methods = match interface {
-                "IDirect3DDevice9" => &mut device_methods,
-                "IDirect3DStateBlock9" => &mut block_methods,
-                _ => continue,
-            };
-            if methods.len() <= usize::from(slot) {
-                methods.resize(usize::from(slot) + 1, 0);
-            }
-            methods[usize::from(slot)] = thunk;
         }
         tables.insert(interface, table);
     }
@@ -405,8 +440,6 @@ pub fn install<B: Backend>(
     machine.ext.insert(State {
         com,
         tables,
-        device_methods,
-        block_methods,
         gpu: None,
         provider,
         pending: Vec::new(),
@@ -484,12 +517,23 @@ fn com(env: &Env<'_>) -> Com {
     env.ext.get::<State>().com
 }
 fn alloc(env: &mut Env<'_>, len: u32) -> Option<u32> {
-    let heaps = env.ext.get_mut::<Heaps>();
-    heaps.alloc(env.cpu, &mut env.sys.vm, heaps.process_heap, len, true)
+    let allocator = env.ext.get::<State>().provider.allocator;
+    (allocator.allocate)(env, len)
 }
 fn free(env: &mut Env<'_>, pointer: u32) {
-    let heaps = env.ext.get_mut::<Heaps>();
-    heaps.free(env.cpu, &mut env.sys.vm, heaps.process_heap, pointer);
+    let allocator = env.ext.get::<State>().provider.allocator;
+    (allocator.free)(env, pointer);
+}
+/// The device whose `children` index lists this object.
+fn child_owner(payload: &Payload) -> Option<Id> {
+    Some(match payload {
+        Payload::Resource(r) => r.device,
+        Payload::Buffer(r) => r.device,
+        Payload::Declaration(r) => r.device,
+        Payload::Shader(r) => r.device,
+        Payload::StateBlock(r) => r.device,
+        _ => return None,
+    })
 }
 fn object(
     env: &mut Env<'_>,
@@ -507,6 +551,13 @@ fn object(
         free(env, pointer);
         return None;
     };
+    if let Some(owner) = com(env)
+        .get_identity(&env.sys.objects, id)
+        .and_then(child_owner)
+        && let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, owner)
+    {
+        d.children.insert(pointer, id);
+    }
     let container = match com(env).get_identity(&env.sys.objects, id) {
         Some(Payload::Resource(r)) => r.container,
         _ => None,
@@ -519,6 +570,15 @@ fn object(
     Some((pointer, id))
 }
 fn destroy(env: &mut Env<'_>, destroyed: Destroyed<Payload>) {
+    // Interfaces, not the payload's pointer field, name every registration.
+    if let Some(owner) = child_owner(&destroyed.value)
+        && let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, owner)
+    {
+        for pointer in &destroyed.interfaces {
+            d.children.remove(pointer);
+        }
+    }
+
     if let Payload::Device(device) = destroyed.value {
         let provider = env.ext.get::<State>().provider;
         (provider.device_released)(env, device.pointer);
@@ -999,7 +1059,8 @@ fn create_device(
     let mut fixed =
         fixed::CachedFixed::new(normalized.BackBufferWidth, normalized.BackBufferHeight);
     fixed.auto_depth(normalized.EnableAutoDepthStencil != 0);
-    let device = Device {
+    let mut device = Device {
+        children: BTreeMap::new(),
         pointer: 0,
         factory,
         surface,
@@ -1019,10 +1080,12 @@ fn create_device(
         shaders: shaders::Bindings::default(),
         recording: None,
         versions: [0; 15],
+        fingerprints: [0; 15],
         frame: recording::Recording::default(),
         gpu_lost: false,
         boundary: None,
     };
+    device.refresh_all();
     let Some((pointer, id)) = object(
         env,
         "IDirect3DDevice9",
@@ -1155,9 +1218,11 @@ fn reset(
         .identity::<Payload>(&env.sys.objects, this.addr())
         .unwrap();
     let com = com(env);
-    let outstanding_default = env.sys.objects.hosts_in::<adv_os::com::ComObject<Payload>>(com.namespace())
-        .any(|(id,_)| matches!(com.get_identity(&env.sys.objects,id), Some(Payload::Resource(r))
-            if r.device == device_id && r.desc.Pool == 0 && com.references(&env.sys.objects,id).is_some_and(|n| n != 0)));
+    let outstanding_default = d.children.values().any(|&id| {
+        com.references(&env.sys.objects, id).is_some_and(|n| n != 0)
+            && matches!(com.get_identity(&env.sys.objects, id),
+                Some(Payload::Resource(r)) if r.desc.Pool == 0)
+    });
     if outstanding_default
         || buffers::has_outstanding_default(env, device_id)
         || shaders::stateblocks::has_outstanding(env, device_id)
@@ -1264,7 +1329,7 @@ fn reset(
     }
     (provider.mode_changed)(env, this.addr(), normalized)
 }
-#[win32(d3d9, name = "IDirect3DDevice9::BeginScene", level = state, leaf)]
+#[win32(d3d9, name = "IDirect3DDevice9::BeginScene", level = state)]
 fn begin_scene(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
     let Some(Payload::Device(d)) = com(env).get_mut::<Payload>(&mut env.sys.objects, this.addr())
     else {
@@ -1276,7 +1341,7 @@ fn begin_scene(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
     d.scene = true;
     0
 }
-#[win32(d3d9, name = "IDirect3DDevice9::EndScene", level = state, leaf)]
+#[win32(d3d9, name = "IDirect3DDevice9::EndScene", level = state)]
 fn end_scene(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
     let Some(Payload::Device(d)) = com(env).get_mut::<Payload>(&mut env.sys.objects, this.addr())
     else {
@@ -1343,6 +1408,7 @@ fn execute_gpu(env: &mut Env<'_>, operation: &Operation) -> Result<Completion, E
             rectangle,
         } => match pixels {
             Pixels::Host(pixels) => gpu.upload(&target.image, *rectangle, *pitch, pixels),
+            Pixels::Alpha8(pixels) => gpu.upload_alpha(&target.image, *rectangle, *pitch, pixels),
             Pixels::Staged(staged, _) => gpu.upload_staged(&target.image, *rectangle, staged),
         }
         .map(|()| Completion::Command),
@@ -1381,11 +1447,6 @@ fn completed(env: &mut Env<'_>, result: Completion) -> Outcome {
             return outcome;
         }
         let fast_forward = (provider.fast_forward)(env.ext);
-        // An unpaced Present (IMMEDIATE or occluded) is a whole frame for the
-        // software frame cap: frames above the display rate are never shown.
-        if deadline.is_none() && !fast_forward {
-            (provider.unpaced)(env);
-        }
         // S_PRESENT_OCCLUDED belongs to D3D9Ex. Base Present still succeeds;
         // visibility only suppresses the refresh deadline calculated below.
         return pacing::finish(env, deadline, 0, fast_forward);
@@ -1563,8 +1624,6 @@ pub fn pump<B: Backend>(machine: &mut Machine<B>) -> Result<bool, String> {
     let readback = readback::pump(&mut env);
     dc::reap_cancelled(&mut env);
     update_texture::reap_cancelled(&mut env);
-    loading::reap_cancelled(&mut env);
-    crate::d3dx9::reap_file_exports(&mut env, false);
     Ok(readback || progress)
 }
 /// Process stop cancels map ownership and closes internal wait handles. Accepted
@@ -1588,8 +1647,6 @@ pub fn cancel_pending<B: Backend>(machine: &mut Machine<B>) {
     readback::cancel_pending(&mut env);
     dc::cancel_all(&mut env);
     update_texture::cancel_all(&mut env);
-    loading::cancel_all(&mut env);
-    crate::d3dx9::reap_file_exports(&mut env, true);
 }
 #[win32(d3d9, name = "IDirect3DDevice9::Clear", level = implement)]
 fn clear(

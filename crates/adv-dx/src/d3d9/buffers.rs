@@ -28,7 +28,7 @@ pub(super) struct Buffer {
     pub fvf: u32,
     pub locks: u32,
 }
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct Stream {
     pub buffer: Option<Id>,
     pub offset: u32,
@@ -60,28 +60,13 @@ pub(super) fn register(registry: &mut Registry) {
         index_lock_ABI,
         vertex_unlock_ABI,
         index_unlock_ABI,
-        adv_abi::Api {
-            env_leaf: Some(super::leaf_calls::binding),
-            ..set_stream_ABI
-        },
+        super::unchanged::unless_unchanged!(set_stream_ABI, super::unchanged::binding),
         get_stream_ABI,
-        adv_abi::Api {
-            env_leaf: Some(super::leaf_calls::binding),
-            ..set_indices_ABI
-        },
+        super::unchanged::unless_unchanged!(set_indices_ABI, super::unchanged::binding),
         get_indices_ABI,
-        adv_abi::Api {
-            env_leaf: Some(super::leaf_calls::draw),
-            ..draw_ABI
-        },
-        adv_abi::Api {
-            env_leaf: Some(super::leaf_calls::draw),
-            ..draw_indexed_ABI
-        },
-        adv_abi::Api {
-            env_leaf: Some(super::leaf_calls::draw),
-            ..draw_indexed_up_ABI
-        },
+        draw_ABI,
+        draw_indexed_ABI,
+        draw_indexed_up_ABI,
     ] {
         registry.register(api);
     }
@@ -383,6 +368,11 @@ fn lock(
         return INVALID;
     };
     b.locks = locks;
+    // A retained signature prefix has already checked its stream locks.
+    let owner = b.device;
+    if let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, owner) {
+        d.frame.invalidate_streams();
+    }
     0
 }
 fn unlock(env: &mut Env<'_>, this: u32, kind: Kind) -> u32 {
@@ -483,12 +473,12 @@ fn set_stream(
     let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, device) else {
         return INVALID;
     };
-    d.versions[10] += 1;
     d.buffers.streams[stream as usize] = Stream {
         buffer: new,
         offset: if new.is_some() { offset } else { old.offset },
         stride: if new.is_some() { stride } else { old.stride },
     };
+    d.touch(10);
     if new != old.buffer
         && let Some(id) = old.buffer
         && let Some(Some(dead)) = com(env).release_internal(&mut env.sys.objects, id)
@@ -497,7 +487,7 @@ fn set_stream(
     }
     0
 }
-#[win32(d3d9,name="IDirect3DDevice9::GetStreamSource",level=implement,leaf)]
+#[win32(d3d9,name="IDirect3DDevice9::GetStreamSource",level=implement)]
 fn get_stream(
     env: &mut Env<'_>,
     this: GuestPtr<()>,
@@ -574,8 +564,8 @@ fn set_indices(env: &mut Env<'_>, this: GuestPtr<()>, pointer: GuestPtr<()>) -> 
     let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, device) else {
         return INVALID;
     };
-    d.versions[11] += 1;
     d.buffers.indices = new;
+    d.touch(11);
     if new != old
         && let Some(id) = old
         && let Some(Some(dead)) = com(env).release_internal(&mut env.sys.objects, id)
@@ -584,7 +574,7 @@ fn set_indices(env: &mut Env<'_>, this: GuestPtr<()>, pointer: GuestPtr<()>) -> 
     }
     0
 }
-#[win32(d3d9,name="IDirect3DDevice9::GetIndices",level=implement,leaf)]
+#[win32(d3d9,name="IDirect3DDevice9::GetIndices",level=implement)]
 fn get_indices(env: &mut Env<'_>, this: GuestPtr<()>, output: GuestPtr<u32>) -> u32 {
     let Some(d) = device(env, this.addr()) else {
         return INVALID;
@@ -614,16 +604,19 @@ pub(super) fn clear_up_bindings(env: &mut Env<'_>, this: u32, indexed: bool) {
     let Some(Payload::Device(d)) = com(env).get_mut::<Payload>(&mut env.sys.objects, this) else {
         return;
     };
-    d.versions[10] += 1;
-    if indexed {
-        d.versions[11] += 1;
+    let old = std::mem::take(&mut d.buffers.streams[0]);
+    if old.buffer.is_some() || old.offset != 0 || old.stride != 0 {
+        d.touch(10);
     }
-    let stream = std::mem::take(&mut d.buffers.streams[0]).buffer;
+    let stream = old.buffer;
     let indices = if indexed {
         d.buffers.indices.take()
     } else {
         None
     };
+    if indices.is_some() {
+        d.touch(11);
+    }
     for id in [stream, indices].into_iter().flatten() {
         if let Some(Some(dead)) = com(env).release_internal(&mut env.sys.objects, id) {
             super::destroy(env, dead);
@@ -761,19 +754,18 @@ fn draw_indexed(
             vertices,
             base,
         )?;
-        if super::programmable::active(env, this.addr()) {
-            return super::programmable::prepare(
-                env,
-                this.addr(),
-                kind,
-                count,
-                None,
-                Some(&indices),
-                0,
-            );
-        }
-        fixed::prepare_bound(env, this.addr(), kind, count, 0, Some(&indices))
+        Ok(indices)
     })();
+    let indices = match result {
+        Ok(indices) => indices,
+        Err(error) => return Outcome::Return(error),
+    };
+    if super::programmable::active(env, this.addr()) {
+        return recording::indexed(env, this.addr(), (kind, count, &indices), |env| {
+            super::programmable::prepare(env, this.addr(), kind, count, None, Some(&indices), 0)
+        });
+    }
+    let result = fixed::prepare_bound(env, this.addr(), kind, count, 0, Some(&indices));
     match result {
         Ok(draw) => submit(env, this.addr(), draw, None),
         Err(error) => Outcome::Return(error),
@@ -834,12 +826,12 @@ pub(super) fn reset_bindings(env: &mut Env<'_>, device: Id) {
 }
 pub(super) fn has_outstanding_default(env: &Env<'_>, device: Id) -> bool {
     let com = com(env);
-    env.sys
-        .objects
-        .hosts_in::<adv_os::com::ComObject<Payload>>(com.namespace())
-        .any(|(id, _)| {
-            matches!(com.get_identity(&env.sys.objects, id),
-            Some(Payload::Buffer(buffer)) if buffer.device == device && buffer.pool == 0
+    let Some(Payload::Device(d)) = com.get_identity(&env.sys.objects, device) else {
+        return false;
+    };
+    d.children.values().any(|&id| {
+        matches!(com.get_identity(&env.sys.objects, id),
+            Some(Payload::Buffer(buffer)) if buffer.pool == 0
                 && com.references(&env.sys.objects, id).is_some_and(|n| n != 0))
-        })
+    })
 }

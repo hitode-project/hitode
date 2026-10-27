@@ -58,6 +58,7 @@ fn schedule(
         pixel: ids[1],
         inputs: inputs.iter().map(|i| (i.register, i.format)).collect(),
         second: false,
+        features: (d.fixed.render[&152], d.fixed.render[&28] != 0),
     };
     let state = env.ext.get_mut::<State>();
     let Some(context) = state.gpu.as_ref().map(|gpu| gpu.context().clone()) else {
@@ -76,11 +77,14 @@ fn schedule(
             .flatten()
             .map(|(s, _)| s.bytecode().len() * 4 + crate::shader::MAX_TRANSLATION_BYTES)
             .sum::<usize>();
-    if cache.warming.len() == 16 || cache.warming_bytes + bytes > 32 * 1024 * 1024 {
-        cache.warming.clear();
-        cache.warming_bytes = 0;
+    while cache.warming.len() == 16 || cache.warming_bytes + bytes > 32 * 1024 * 1024 {
+        let (oldest, bytes) = cache.warming_order.pop_front().unwrap();
+        cache.warming.remove(&oldest);
+        cache.warming_bytes -= bytes;
     }
+    cache.warming_order.push_back((key.clone(), bytes));
     cache.warming_bytes += bytes;
+    let features = (false, key.features.0, key.features.1);
     let job = Compile::spawn(bytes, cache.counters.clone(), move || {
         let translations = stages
             .each_ref()
@@ -109,7 +113,7 @@ fn schedule(
             translations[1].as_deref(),
             &inputs,
             &slots,
-            false,
+            features,
         )
         .map_err(|_| "warm source unavailable")?;
         if source.len() > RESERVATION {
@@ -227,7 +231,7 @@ mod tests {
                 register: 0,
             }],
             &[],
-            false,
+            (false, 0, false),
         )
         .unwrap();
         let cache = &env.ext.get::<State>().programs;

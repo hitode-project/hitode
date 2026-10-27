@@ -1,5 +1,5 @@
 //! Color copies and full-source LINEAR scaling share the GPU and COM owners.
-//! Cropped scaling, texture profiles and depth/MSAA remain unavailable.
+//! Cropped scaling and depth/MSAA remain unavailable.
 use super::*;
 use adv_device::surface::Rect;
 
@@ -113,12 +113,6 @@ fn stretch(
         || dst.desc.MultiSampleQuality != 0
     {
         return unavailable(env, "depth-stencil and multisample blits are unavailable");
-    }
-    if src.container.is_some() {
-        return unavailable(
-            env,
-            "texture-level StretchRect requires an unsupported texture-source profile",
-        );
     }
     // RGBX-to-ARGB conversion samples the existing opaque image interpretation;
     // it must not expose the physical unused X byte as stored alpha.

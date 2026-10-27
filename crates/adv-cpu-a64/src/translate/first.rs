@@ -299,7 +299,8 @@ fn step(op: Op, next: u32, cpu: &mut CpuState, memory: &Memory) -> Option<bool> 
         | Op::Simd(_)
         | Op::Strings(_)
         | Op::Integer(_)
-        | Op::X87(_) => {
+        | Op::X87(_)
+        | Op::Fild64(..) => {
             return None;
         }
         Op::Mov(dst, src) => {
@@ -421,7 +422,13 @@ fn step(op: Op, next: u32, cpu: &mut CpuState, memory: &Memory) -> Option<bool> 
             }
         }
         Op::Shift(kind, dst, count) => {
-            cpu.regs[usize::from(dst)] = shift(flags, kind, regs[usize::from(dst)], count);
+            let value = read(dst, &regs, memory)?;
+            let count = count.unwrap_or(regs[1] & 31);
+            let place = Place::of(dst, &regs, memory)?;
+            if count != 0 {
+                let value = shift(flags, kind, value, count);
+                place.commit(value, cpu);
+            }
         }
         Op::Imul(dst, src, imm) => {
             let a = read(src, &regs, memory)?;
@@ -461,7 +468,7 @@ mod tests {
 
     /// Every instruction a first visit completes leaves what the core
     /// interpreter leaves: registers, EIP, EFLAGS and memory.
-    // spec: A64-TR-2
+    // spec: A64-TR-2, A64-FLAG-2
     #[test]
     fn first_visits_match_the_interpreter() {
         let mut rng = Rng(0x2545_f491_4f6c_dd1d);

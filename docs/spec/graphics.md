@@ -2,7 +2,7 @@
 
 ID prefix: GFX
 
-This spec covers shared CPU compositing and the DirectDraw and Direct3D 9 API front ends. It includes capabilities, shaders, vertex input, samplers, buffers, caches, numerical behavior and Effects. `adv-dx` and the GPU renderer in `adv-device` implement them.
+This spec covers shared CPU compositing and the DirectDraw and Direct3D 9 API front ends. It includes capabilities, shaders, vertex input, samplers, buffers, caches and numerical behavior. `adv-dx` and the GPU renderer in `adv-device` implement them.
 
 ## DirectDraw
 
@@ -26,18 +26,6 @@ This spec covers shared CPU compositing and the DirectDraw and Direct3D 9 API fr
 **Rule**: SetColorKey MUST store one inclusive raw range per surface and key kind. Blt and BltFast with source keys MUST skip source pixels in range, comparing only color bits of 32-bit pixels.
 **Verification**: Test
 
-### GFX-BLIT-1 Alpha and color-key transfers
-
-**Rule**: MSIMG32 alpha and color-key transfers and GDI32 aliases MUST share DC mapping, clipping, surfaces, and format conversion. Alpha transfers MUST use premultiplied source colors. Invalid blends, source bounds, and overlapping same-surface rectangles MUST fail before pixel writes.
-**Verification**: Test
-**Basis**: [AlphaBlend](https://learn.microsoft.com/windows/win32/api/wingdi/nf-wingdi-alphablend), [BLENDFUNCTION](https://learn.microsoft.com/windows/win32/api/wingdi/ns-wingdi-blendfunction), and [TransparentBlt](https://learn.microsoft.com/windows/win32/api/wingdi/nf-wingdi-transparentblt).
-
-### GFX-BLIT-2 Gradient meshes
-
-**Rule**: Gradient meshes MUST interpolate 16-bit vertex colors through shared surfaces and DC clipping, ignoring vertex alpha. Invalid mesh indices and unsupported low-color dithering MUST fail before painting. Rectangles and triangles MUST use exclusive rectangle bounds and top-left triangle edges.
-**Verification**: Test
-**Basis**: [GradientFill](https://learn.microsoft.com/windows/win32/api/wingdi/nf-wingdi-gradientfill).
-
 ## Native programmable execution
 
 ### GFX-METAL-1 Apple programmable draws
@@ -52,6 +40,8 @@ This spec covers shared CPU compositing and the DirectDraw and Direct3D 9 API fr
 | Shaders | Naga uses wgpu-hal 30 Metal options; MSL is cached by shader content, texture visibility, vertex layout and point topology variant. Pipeline states retain the existing 64-bit key and capacity limit. Native recipes use the shared background prebuild, demand result and persistent cache (GFX-CACHE-8, GFX-CACHE-10). |
 | Batches | Matching attachments reuse the encoder; adjacent identical constants reuse their ring range. |
 | Observations | GPU reports expose Metal draws, backend switches partitioned into partial clears, copies, uploads, fixed draws, readbacks and other transitions (including entry to Metal), ring bytes written and ring Busy returns. |
+
+Acquiring a submission lease MUST NOT flush queued drawing or change backends. Native frames MUST retain their producer's completion and let direct presentation subscribe to it without an extra queue submission. Actual reference-backend work MUST preserve queue order and invalidate stale native completion tokens.
 
 ## GPU render passes
 
@@ -76,16 +66,17 @@ Metal and wgpu MUST share these rules and report passes, color loads, depth load
 **Rule**: Depth and stencil clears MUST wait on their depth image until a pass attaches it. Whole-image clears MUST become that pass's load actions; partial clears MUST execute as bounded draws before the first draw that tests or writes depth or stencil.
 A clear that cannot absorb a waiting one MUST execute the waiting one first. Deferring a clear MUST end a pass that already attaches the image. Depth images MUST NOT be observable except through attachment.
 Queued clear regions MUST retain their admission-time clip; subsequent drawing clips MUST NOT narrow them when they are materialized.
+Clipped clears MUST retain depth/stencil deferral independently of their color writes. Repeated equal clears inside a pending region MUST NOT materialize an otherwise unused attachment.
 **Verification**: Test
 
 ## D3D9 frame recording
 
 ### GFX-REC-1 Ordered recording and flush boundaries
 
-**Rule**: D3D9 MUST validate recorded commands synchronously and flush before Present, readback, GPU waits, Reset, release, or recording limits. Busy continuations MUST resume the unexecuted suffix without replaying successful commands. Execution-time device failure MUST persist until Reset and be reported by Present or TestCooperativeLevel.
+**Rule**: D3D9 MUST validate new recorded commands synchronously and flush before Present, readback, GPU waits, Reset, release, or recording limits. Busy continuations MUST resume the unexecuted suffix without replaying successful commands. Execution-time device failure MUST persist until Reset and be reported by Present or TestCooperativeLevel.
 **Verification**: Test
 
-Recorded programmable draws retain raw streams once, after consuming neutral inputs for bounds. Binding dependencies are cached until binding changes or resource destruction. Content writes resolve a slot once and index its current/base versions directly; retired slots can be reused.
+Recorded programmable draws capture guest streams and neutral geometry once, before the guest can mutate or release their sources. Immutable vertices and register snapshots are shared with bounds and sampling analysis. Backend byte packing and point expansion occur only when surviving commands execute. Binding dependencies are cached until binding changes or resource destruction. Content writes resolve a slot once and index its current/base versions directly; retired slots can be reused.
 
 Flush limits are 4096 commands or 64 MiB of upload and vertex data. Readback boundaries include GetRenderTargetData, GetFrontBufferData, GPU LockRect and GetDC; unsupported capture retains its ABI failure.
 
@@ -96,7 +87,10 @@ Flush limits are 4096 commands or 64 MiB of upload and vertex data. Readback bou
 
 Full clears replace previous dependencies; partial clears, draws and copies retain them. Upload admission assigns a fresh identity. A partial flush or a private presentation without the shared output prevents elision of that frame. DISCARD presentation may rotate independently reconstructible targets; destination-dependent frames preserve writable contents using an immutable GPU snapshot.
 Clear identities MUST include only the selected value and extent of each written color, depth or stencil component. Draws MUST read only the enabled depth/stencil tests.
-Fixed-state draw keys MAY be cached between mutations, but every mutable state access MUST invalidate the cached key.
+Fixed-state draw keys MAY be cached between mutations, but every mutable state access MUST invalidate the cached key. Fixed-state categories retain shared immutable maps and complete content keys. Identical map insertions preserve that category's key; arbitrary mutable access invalidates it.
+Fixed-state category reads MUST use dense SDK selector tables, and state-block membership and copying MUST use bounded slot bitmaps without per-member heap allocation.
+Fixed-input draws MAY capture each owned vertex stream once per draw when the span reads no more bytes than separate vertex reads. Complete input identities MUST retain index order and exact vertex bytes, including repeated indices; later draws MUST observe buffer writes.
+Owned input captures with identical complete inputs and decoding state MAY reuse immutable decoded geometry across adjacent frames. Each frame generation MUST retain at most 4096 entries and 64 MiB, and cached geometry MUST NOT retain GPU resources. Fixed programmable streams MAY reuse this complete capture identity instead of hashing expanded bytes again; arbitrary byte mutation and point expansion MUST discard that identity.
 
 ### GFX-REC-3 Asynchronous pixel verification
 
@@ -105,7 +99,7 @@ Fixed-state draw keys MAY be cached between mutations, but every mutable state a
 
 ### GFX-REC-4 Conservative damage and bounds
 
-**Rule**: Each target subresource MUST compare ordered command keys and bounds, including sampled content and retained destination dependencies. Changed, added, or removed entries MUST damage both old and new bounds. Damage MUST retain at most four rectangles and conservatively merge overflow without promoting bounded damage to the whole target based on coverage alone.
+**Rule**: Each target subresource MUST accumulate recording-time differences, including sampled content and retained destination dependencies. Changed, added, or removed entries MUST damage both old and new bounds. Damage MUST retain at most four rectangles and conservatively merge overflow without promoting bounded damage to the whole target based on coverage alone.
 **Verification**: Test
 
 Overflow merges into one bounding box. Bounds use decoded XYZRHW or CPU world/view/projection positions, or the scalar vertex shader interpreter for at most 64 float-input vertices. Perspective division and viewport mapping precede one-pixel raster margins, point-size expansion, and viewport/guest-scissor intersection. Nonpositive w, nonfinite values, excessive vertices, unsupported inputs or instructions use full-target bounds. Clear and copy use destination rectangles; CPU uploads use the whole target. Size/format changes and Reset invalidate history. Reading an intermediate target before a later write, or sharing an attachment across target allocations, conservatively forces full execution.
@@ -121,47 +115,38 @@ Intermediate color damage MUST propagate through proven axis-aligned copies and 
 Unknown allocations redraw fully; nonrotating targets have age one. Clear and copy respect the clip. Early flushes conservatively invalidate damage history. DISCARD rotation requires an initial full overwrite so replay reconstructs stale slots exactly. Accumulating frames restore the last logical backbuffer when necessary and keep the snapshot path. Early reads restore that baseline too. Diagnostic verification executes full frames while still computing damage and reading the actual presented allocation. No presentation cadence or audio behavior changes.
 Immutable snapshot presentation MUST preserve known color damage, just as rotating presentation does. Draws whose conservative bounds do not intersect the required execution region MUST be omitted before backend submission.
 
-### GFX-REC-6 D3D9 leaf admission
+### GFX-REC-6 D3D9 unchanged calls
 
-**Rule**: Only the methods below MAY enter EnvLeaf without blocking, guest callbacks or guest memory allocation and release. Draw and Clear admission MUST decline before side effects when recording might flush, wait or execute immediately. Declined calls MUST execute their ordinary adapter with identical state, commands and guest results.
+**Rule**: Binding setters and state-block Capture and Apply that change nothing MUST return D3D_OK before validation, reference transfers or command recording. Calls MUST take their full handler while recording, for invalid objects, and when SetTexture would restore managed residency or flush dirty levels.
 **Verification**: Test
-**Basis**: A64-CTL-12
 
-| Methods | Admission |
+| Methods | Unchanged when |
 |---|---|
-| Set/GetRenderState, Set/GetTextureStageState, Set/GetSamplerState, Set/GetTransform, Set/GetViewport, Set/GetScissorRect | Synchronous state and guest memory access. |
-| GetFVF, GetTexture, GetStreamSource, GetIndices, GetVertexDeclaration, GetVertexShader, GetPixelShader | Query state and retain existing COM identities. |
-| Set/GetVertexShaderConstantF/I/B, Set/GetPixelShaderConstantF/I/B, BeginScene, EndScene | Synchronous constants and scene state. |
-| SetTexture, SetStreamSource, SetIndices, SetVertexShader, SetPixelShader, SetVertexDeclaration, SetFVF, StateBlock Capture/Apply | Any replaced binding retains public ownership; unchanged bindings may have zero public references. SetTexture additionally requires no residency restoration or dirty-level flush. |
-| DrawPrimitive, DrawIndexedPrimitive, DrawPrimitiveUP, DrawIndexedPrimitiveUP, Clear | No active flush; incoming command and conservative byte bound remain strictly below 4096 commands and 64 MiB. UP additionally requires empty bindings it would clear. |
-
-Binding and state-block admission checks all releases before mutation. Calls that
-could free guest storage or restore texture residency decline to the ordinary
-path. Rebinding an unchanged live object avoids redundant validation and reference
-transfers; state-block recording still captures unchanged setter membership.
+| SetTexture, SetStreamSource, SetIndices, SetVertexShader, SetPixelShader, SetVertexDeclaration, SetFVF | The incoming object identity, and any offset, stride or FVF, equal the bound state. |
+| StateBlock Capture, Apply | Every captured value equals the device state. |
 
 ### GFX-REC-7 Shader constant ranges and content hashing
 
 **Rule**: Translation MUST cache external register usage, excluding shader-local definitions. Fingerprints, copies and uploads MUST process only those ranges while preserving exact bits and uniform layout. Recording MUST retain complete xxh3-128 identities, and both backends MUST reserve aligned complete binding windows before writing.
 **Verification**: Test
 
-Usage includes implicit matrix rows, int/bool operands and legacy bump parameters. Relative float addressing covers all 256 float registers except local definitions. Constants, vertices, indices and pixels use 128-bit content keys. Insufficient storage wraps before the complete binding window exceeds the buffer. Packed wgpu uploads retain one queue write per buffer per batch. CPU damage interpretation agrees with complete constants.
+Usage includes implicit matrix rows, int/bool operands and legacy bump parameters. Relative float addressing covers all 256 float registers except local definitions. Constants, vertices, indices and pixels use 128-bit content keys. Insufficient storage wraps before the complete binding window exceeds the buffer. Packed wgpu uploads retain one queue write per buffer per batch. Immutable snapshots retain only used registers, reuse unchanged captures across writes to unused registers and serve CPU damage interpretation directly. Complete constant blocks are materialized only on demand; CPU interpretation agrees with complete constants.
 
 ### GFX-REC-8 Frontend work counters
 
 **Rule**: Diagnostic counter builds MUST report retained bytes and lookups per draw, entries per successful StateBlock Apply, and dead frame/pass eliminations. Ordinary builds MUST compile out work instrumentation.
 **Verification**: Test
 
-The diagnostic Cargo feature is `adv-dx/d3d9-counters`.
+The diagnostic Cargo feature is `adv-dx/d3d9-counters`. Retained payloads are counted per command, including shared snapshots; cumulative recorded bytes do not measure resident memory or memory traffic. Recording limits continue to use the logical upload size.
 
-### GFX-REC-9 Dead target passes
+### GFX-REC-9 Dead target writes
 
-**Rule**: Only complete target passes whose every output is fully overwritten before any read MAY be eliminated. Partial flushes, uploads, partial overwrites, and preserved attachment aspects MUST retain their dependencies. Verification mode MUST execute the complete reference command stream.
+**Rule**: Only operations whose every output is fully overwritten before any read MAY be eliminated, and a clear MUST drop exactly the components so overwritten. Partial flushes, uploads, partial overwrites, and preserved attachment aspects MUST retain their dependencies. Verification mode MUST execute the complete reference command stream.
 **Verification**: Test
 
 A pass is a contiguous group of writes to one target allocation. Backward
 liveness tracks logical resource levels and attachment aspects. Dead frames use
-GFX-REC-2; these and dead passes are the only whole-frame/pass omissions.
+GFX-REC-2; these and dead writes are the only whole-frame/operation omissions.
 Damage clipping remains a conservative region optimization under GFX-REC-4/5.
 
 ### GFX-REC-10 Detached render-target readback
@@ -169,17 +154,15 @@ Damage clipping remains a conservative region optimization under GFX-REC-4/5.
 **Rule**: GetRenderTargetData into a plain system-memory surface MUST queue its copy in submission order and return before completion. LockRect, GetDC, surface export and another readback into that surface MUST wait for the copy first. Texture-level destinations and a busy readback lane MUST keep the blocking path.
 **Verification**: Test
 
+### GFX-REC-11 Differential frame recording
+
+**Rule**: State writes MUST maintain history-independent 128-bit identities, preserving state-block membership and exact values. Eligible unchanged draws MUST reuse shared previous-frame entries, checking guest-writable bytes and realigning after insertions or removals. Reuse MUST preserve commands, conservative damage, and pixels, and unavailable histories and flush boundaries MUST retain full preparation.
+**Verification**: Test
+
 ### GFX-PACE-1 Vsync-locked refresh boundaries
 
-**Rule**: When the host display rate is within 1% of a whole multiple of the guest refresh rate, Present boundaries MUST fall on host vsyncs. An on-time boundary MUST follow the previous one by exactly that multiple of vsyncs. A late Present MUST wait for the next vsync without repaying missed frames, and other rates MUST keep machine-clock boundaries.
+**Rule**: Present boundaries MUST fall on host vsyncs, and a late Present MUST wait for the next one without repaying missed frames. At display rates within 1% of a whole multiple of the guest rate, on-time boundaries MUST be exactly that many vsyncs apart. Other rates MUST snap the guest's rational cadence to the nearest vsync after now.
 **Verification**: Test
-
-### GFX-PACE-2 Unpaced presents beyond the display rate
-
-**Rule**: An IMMEDIATE or occluded Present MUST count as a whole frame for the DEV-FRAME-9 frame cap. Fast-forward MUST bypass that cap.
-**Verification**: Test
-
-The cap holds only the presenting context's next empty PeekMessage, so Present itself still returns at once.
 
 ## Capabilities
 
@@ -222,8 +205,8 @@ The cap holds only the presenting context's next empty PeekMessage, so Present i
 
 Capture and Apply track versions per state category and inspect values only in
 changed categories. They copy only differing captured entries, preserving exact
-float bits, uncaptured state and COM ownership. An unchanged Capture reuses its
-snapshot storage; an unchanged Apply performs no state writes.
+float bits, uncaptured state and COM ownership. Capturing a complete state category shares its immutable map and content key. An unchanged Capture reuses its
+snapshot storage; an unchanged Apply performs no state writes. Redundant fixed-state and constant setters preserve category revisions while recording still captures their membership. Matching Capture/Apply bypass binding preparation and reference transfers; changes outside the captured subset refresh its observed revisions. Applying only shader or buffer changes MUST preserve the fixed-state key cache.
 
 ## Vertex and raster input
 
@@ -239,7 +222,7 @@ snapshot storage; an unchanged Apply performs no state writes.
 
 ### GFX-INPUT-3 Pretransformed vertices
 
-**Rule**: XYZRHW and POSITIONT draws MUST bypass the bound vertex shader while preserving its binding identity and continuing pixel shading. POSITIONT declarations MUST use offset-ordered stream 0 inputs.
+**Rule**: XYZRHW and POSITIONT draws MUST bypass the bound vertex shader while preserving its binding identity and continuing pixel shading. POSITIONT declarations MUST use offset-ordered stream 0 inputs. Programmable pretransformed draws MUST capture stream bytes and indices and map positions in the vertex stage, interpolating only the varyings the pixel stage reads.
 **Verification**: Test
 
 ### GFX-INPUT-4 Fixed texture coordinates
@@ -320,7 +303,7 @@ snapshot storage; an unchanged Apply performs no state writes.
 
 ### GFX-CACHE-5 Repeated shader creation
 
-**Rule**: Identical bytecode MAY reuse successful translations while preserving independent shader objects and exact GetFunction bytes. Each process translation cache MUST retain at most 256 entries, with at most 8 MiB of bytecode, WGSL, and sampler payloads.
+**Rule**: Identical bytecode MAY reuse successful translations while preserving independent shader objects and exact GetFunction bytes. Each process translation cache MUST retain at most 256 entries, with at most 8 MiB of bytecode, WGSL, and sampler payloads. Translation and assembled-program caches MUST evict oldest entries individually instead of clearing unrelated entries.
 **Verification**: Test
 
 ### GFX-CACHE-6 Texture bindings
@@ -342,44 +325,25 @@ Binding changes MUST NOT start speculative module preparation for transient shad
 **Rule**: Shader arithmetic MUST use f32 and preserve D3D9 reference behavior for special values, including zero multiplication, reciprocal zero, and logarithm zero.
 **Verification**: Test
 
-## Effects
-
-### GFX-EFFECT-1 Binary Effect
-
-**Rule**: Precompiled FXO Effects MUST preserve parameter, technique, pass, constant-table, preshader, and pass-state semantics. Effect input parsing MUST remain bounded on truncated or malformed data.
-**Verification**: Test
-
-### GFX-EFFECT-2 Effect boundaries
-
-**Rule**: HLSL source compilation, unsupported FXLC expressions, state managers, parameter blocks, and pools MUST fail explicitly. Version declarations MUST NOT hide these limits behind successful no-ops.
-**Verification**: Review — binary and preshader tests do not enumerate every unsupported Effect interface and source-compilation entry.
-
-### GFX-EFFECT-3 Effect state saving and device calls
-
-**Rule**: A saving Begin MUST record its technique's pass states into one block on first use, capture it later, and apply it at End. OnLostDevice and Release MUST release these blocks. Device and block calls MUST run on the host only while the live vtable entry is the published thunk.
-**Verification**: Test — the hooked and unhooked call gate and host constant upload. Block recording follows Wine's d3dx9 Effect and is checked by game runs.
-
-## D3DX and surface copies
-
-### GFX-D3DX-1 Empty texture correction
-
-**Rule**: `_29` and `_43` texture requirement checks and creation MUST correct dimensions, mip counts, and compatible integer formats using actual D3D9 capabilities. Optional requirement outputs MUST remain unchanged on correction failure. Created textures MUST share D3D9 COM identity, mip storage, locks, and release behavior.
-**Verification**: Test
-
-### GFX-D3DX-2 Matrix and Vec2 operations
-
-**Rule**: `_29` and `_43` math entries MUST share axis rotations and Vec2 transforms, reading inputs before writing overlapping outputs. Normals MUST ignore translation; coordinate transforms MUST divide by homogeneous W and return NaN for zero W.
-**Verification**: Test
+## Surface copies
 
 ### GFX-COPY-1 Texture destinations and RGBX
 
-**Rule**: `StretchRect` into render-target texture surfaces MUST retain container ownership until asynchronous completion. RGBX-to-ARGB copies MUST produce opaque alpha and preserve pixels outside the destination rectangle. Copies MUST NOT consume or modify guest drawing state.
-**Verification**: Review — the native texture-blit script checks pixels and identity, but no annotated test covers asynchronous container retention.
+**Rule**: Texture surfaces used by `StretchRect` MUST retain their container ownership until asynchronous completion. RGBX-to-ARGB copies MUST produce opaque alpha and preserve pixels outside the destination rectangle. Copies MUST NOT consume or modify guest drawing state.
+**Verification**: Test
+
+### GFX-COPY-2 Lockable render targets
+
+**Rule**: Standalone non-multisampled render targets created with Lockable MUST support CPU locks through ordered GPU readback and writable unlock uploads. Targets created without Lockable MUST reject CPU locks. Read-only unlocks MUST preserve GPU contents.
+**Verification**: Test
+**Basis**: Microsoft Direct3D 9 `IDirect3DDevice9::CreateRenderTarget` and `IDirect3DSurface9::LockRect`.
+
+CPU-only surfaces and managed texture-level locks preserve pending recorded commands; only GPU-backed locks require a readback barrier.
 
 ### GFX-STATE-1 Neutral fixed state
 
-**Rule**: DITHERENABLE zero and COLORVERTEX defaults, setters, and queries MUST agree. Enabling dithering MUST fail explicitly.
-**Verification**: Review — the native texture-blit script checks state roundtrips, but no annotated Rust test covers both states.
+**Rule**: Defaults, setters, and queries MUST agree for DITHERENABLE, COLORVERTEX, WRAP0–WRAP7, and AMBIENT. Enabling dithering or texture-coordinate wrapping MUST fail explicitly. AMBIENT MUST accept and preserve every DWORD value.
+**Verification**: Test
 
 Withdrawn: GFX-NUM-2, GFX-NUM-3, GFX-NUM-4, GFX-NUM-5
 

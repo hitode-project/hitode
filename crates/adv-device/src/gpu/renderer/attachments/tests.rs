@@ -203,7 +203,7 @@ fn programmable_draw_uses_logical_viewport_and_shared_depth_without_losing_color
         .unwrap();
     let draw = ProgrammableDraw {
         program: Program::new("@vertex fn vertex_main(@builtin(vertex_index) i:u32) -> @builtin(position) vec4<f32> { let p=array<vec2<f32>,3>(vec2(-1.,1.),vec2(-1.,-3.),vec2(3.,1.)); return vec4(p[i],0.5,1.); } @fragment fn fragment_main() -> @location(0) vec4<f32> { return vec4(1.,0.,1.,1.); }".into(), vec![]),
-        streams: vec![], indices: None, vertex_count: 3, vertex_constants: ConstantBlock::default(), pixel_constants: ConstantBlock::default(), textures: vec![], parameters: [[0;4];40],
+        streams: vec![], indices: None, vertex_count: 3, vertex_constants: ConstantBlock::default().into(), pixel_constants: ConstantBlock::default().into(), textures: vec![], parameters: [[0;4];40],
     };
     let mut state = DrawState::new(4, 4);
     state.depth = Some(Compare::Less);
@@ -275,9 +275,9 @@ fn programmable_batches_preserve_each_upload_and_flush_large_draws_and_consumers
     let before = gpu.stats().submissions;
     let mut draw = ProgrammableDraw {
         program: Program::new("struct C { f: array<vec4<f32>,256> }; @group(0) @binding(1) var<uniform> c:C; struct V { @builtin(position) p:vec4<f32>, @location(0) color:vec4<f32> }; @vertex fn vertex_main(@builtin(vertex_index) i:u32, @location(0) color:vec4<f32>)->V { let p=array<vec2<f32>,3>(vec2(-1.,-1.),vec2(3.,-1.),vec2(-1.,3.)); return V(vec4(p[i%3],0.,1.),color); } @fragment fn fragment_main(v:V)->@location(0) vec4<f32> { return vec4(v.color.x,c.f[0].x,0.,1.); }".into(), vec![]),
-        streams: vec![VertexStream { bytes: vec![], stride: 16, attributes: vec![Attribute { location: 0, offset: 0, format: AttributeFormat::Float4 }] }],
-        indices: Some(vec![]), vertex_count: 6, vertex_constants: ConstantBlock::default(),
-        pixel_constants: ConstantBlock::default(), textures: vec![], parameters: [[0;4];40],
+        streams: vec![VertexStream { bytes: vec![].into(), stride: 16, attributes: vec![Attribute { location: 0, offset: 0, format: AttributeFormat::Float4 }] }],
+        indices: Some(vec![].into()), vertex_count: 6, vertex_constants: ConstantBlock::default().into(),
+        pixel_constants: ConstantBlock::default().into(), textures: vec![], parameters: [[0;4];40],
     };
     let mut state = DrawState::new(64, 1);
     for i in 0..64 {
@@ -286,7 +286,7 @@ fn programmable_batches_preserve_each_upload_and_flush_large_draws_and_consumers
             .into_iter()
             .chain([[1. - red, 0., 0., 1.]; 3])
             .collect::<Vec<_>>();
-        draw.streams[0].bytes = bytemuck::cast_slice(&vertices).to_vec();
+        draw.streams[0].bytes = bytemuck::cast_slice(&vertices).to_vec().into();
         draw.indices = Some((0..3).map(|n| n + (i % 2) * 3).collect());
         draw.pixel_constants.floats[0][0] = i as f32 / 63.;
         state.scissor = Some(Rect {

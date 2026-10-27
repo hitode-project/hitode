@@ -28,6 +28,8 @@ pub(super) struct Resource {
     pub surface: Option<u32>,
     pub storage: u32,
     pub owns_surface: bool,
+    /// CPU access requested for a standalone render target.
+    pub lockable: bool,
     pub lock: Option<Lock>,
     /// Texture levels borrow the parent's storage and delegate public counts.
     pub container: Option<Id>,
@@ -92,6 +94,7 @@ impl Resource {
             surface: None,
             storage: 0,
             owns_surface: false,
+            lockable: false,
             lock: None,
             container: None,
             levels: Vec::new(),
@@ -122,10 +125,7 @@ pub(super) fn register(registry: &mut Registry) {
         texture_desc_ABI,
         texture_lock_ABI,
         texture_unlock_ABI,
-        adv_abi::Api {
-            env_leaf: Some(super::leaf_calls::binding),
-            ..set_texture_ABI
-        },
+        super::unchanged::unless_unchanged!(set_texture_ABI, super::unchanged::binding),
         get_texture_ABI,
         texture_levels_ABI,
         texture_set_lod_ABI,
@@ -251,6 +251,7 @@ fn texture_surface(
             surface: selected.surface,
             storage: 0,
             owns_surface: false,
+            lockable: false,
             lock: None,
             container: Some(container),
             levels: Vec::new(),
@@ -472,6 +473,7 @@ pub(super) fn implicit_back_buffer(
             surface: Some(surface),
             storage: 0,
             owns_surface: false,
+            lockable: false,
             lock: None,
             container: None,
             levels: Vec::new(),
@@ -623,6 +625,7 @@ pub(super) fn create_texture(
             surface: levels[0].surface,
             storage,
             owns_surface: pool < 2,
+            lockable: false,
             lock: None,
             container: None,
             levels,
@@ -1005,12 +1008,12 @@ fn set_texture_binding(
     }
     if let Some(Payload::Device(d)) = com(env).get_mut::<Payload>(&mut env.sys.objects, this.addr())
     {
-        d.versions[12] += 1;
         if slot == 0 {
             d.texture = new;
         } else {
             d.shaders.textures[slot] = new;
         }
+        d.touch(12);
     }
     if let Some(id) = old
         && let Some(Some(dead)) = com(env).release_internal(&mut env.sys.objects, id)
@@ -1020,7 +1023,7 @@ fn set_texture_binding(
     0
 }
 
-#[win32(d3d9,name="IDirect3DDevice9::GetTexture",level=implement,leaf)]
+#[win32(d3d9,name="IDirect3DDevice9::GetTexture",level=implement)]
 fn get_texture(env: &mut Env<'_>, this: GuestPtr<()>, stage: u32, output: GuestPtr<u32>) -> u32 {
     if output.write(env.cpu, 0).is_err() {
         return INVALID;
@@ -1143,6 +1146,7 @@ mod tests {
                 surface: None,
                 storage: 0,
                 owns_surface: false,
+                lockable: false,
                 lock: None,
                 container: None,
                 levels: level_layout(
@@ -1249,6 +1253,7 @@ mod tests {
                 surface: Some(7),
                 storage: 0,
                 owns_surface: false,
+                lockable: false,
                 lock: None,
                 container: None,
                 levels: Vec::new(),
@@ -1313,7 +1318,7 @@ mod tests {
         assert_eq!((lock.Pitch, lock.pBits), (16, base + 128));
         assert!(
             matches!(
-                super::super::readback::transfer(
+                super::super::readback::transfer_detached(
                     &mut env,
                     GuestPtr::new(device_pointer),
                     GuestPtr::new(source),
@@ -1333,7 +1338,7 @@ mod tests {
         );
         assert_eq!(env.cpu.read_u32(base + 128).unwrap(), 0xff00ffff);
         assert!(matches!(
-            super::super::readback::transfer(
+            super::super::readback::transfer_detached(
                 &mut env,
                 GuestPtr::new(device_pointer),
                 GuestPtr::new(source),

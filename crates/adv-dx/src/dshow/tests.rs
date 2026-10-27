@@ -10,8 +10,7 @@ pub(crate) const STACK: u32 = 0x600000;
 
 pub(crate) fn machine() -> Machine<JitCpu> {
     let mut reg = Registry::default();
-    adv_win32::register(&mut reg);
-    adv_win32::ole32::register(&mut reg);
+    crate::test_support::register(&mut reg);
     register(&mut reg);
     crate::wmvcore::register(&mut reg);
     let mut m = Machine::new(
@@ -20,11 +19,7 @@ pub(crate) fn machine() -> Machine<JitCpu> {
         Clock::virtual_time(),
     )
     .unwrap();
-    adv_win32::Win32::install(
-        &mut m,
-        adv_win32::Win32Config::new(".", "dshow-test.exe", "target/dshow-test"),
-    )
-    .unwrap();
+    crate::test_support::install(&mut m);
     install(&mut m);
     m.cpu.map(DATA, 4096, Prot::RW).unwrap();
     m.cpu.map(STACK, 4096, Prot::RW).unwrap();
@@ -63,14 +58,10 @@ pub(super) fn method(m: &mut Machine<JitCpu>, name: &str, args: &[u32]) -> u32 {
 }
 
 pub(super) fn activate(m: &mut Machine<JitCpu>, class: Iid, iid: Iid) -> u32 {
-    m.cpu.write(DATA + 256, &class).unwrap();
-    m.cpu.write(DATA + 272, &iid).unwrap();
-    let hr = handle(
-        m,
-        "ole32.dll",
-        "CoCreateInstance",
-        &[DATA + 256, 0, 1, DATA + 272, DATA + 128],
-    );
+    let outcome = crate::test_support::activate(&mut env(m), class, iid, 0, DATA + 128);
+    let Outcome::Return(hr) = outcome else {
+        panic!("activation needed a guest call")
+    };
     assert_eq!(hr, S_OK);
     m.cpu.read_u32(DATA + 128).unwrap()
 }
@@ -372,74 +363,6 @@ fn rgb_conversion_writes_bottom_up_rows() {
         bytes,
         vec![7, 8, 9, 10, 11, 12, 0, 0, 1, 2, 3, 4, 5, 6, 0, 0]
     );
-}
-
-/// The SDK-compiled empty-graph probe must record the same identity, state,
-/// enumeration and event results here as under native quartz.
-#[cfg(windows)]
-#[test]
-// spec: MEDIA-GRAPH-1
-fn sdk_compiled_empty_graph_matches_native_identity_state_enumeration_and_event_contract() {
-    use adv_machine::RunResult;
-    use adv_os::Process;
-    use std::os::windows::process::CommandExt;
-    use std::{path::Path, process::Command};
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let directory = root.join("target/dshow-sdk-tests");
-    let build = Command::new("powershell.exe")
-        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
-        .arg(root.join("tools/fixtures/build-dshow-empty-graph.ps1"))
-        .arg("-OutputDirectory")
-        .arg(&directory)
-        .output()
-        .unwrap();
-    assert!(
-        build.status.success(),
-        "{}",
-        String::from_utf8_lossy(&build.stderr)
-    );
-    let native = directory.join("native");
-    std::fs::create_dir_all(&native).unwrap();
-    let status = Command::new(directory.join("fixture_dshow_empty_graph.exe"))
-        .current_dir(&native)
-        .creation_flags(0x08000000)
-        .status()
-        .unwrap();
-    assert!(status.success(), "native exit {:?}", status.code());
-    let reference = std::fs::read(native.join("dshow-empty-graph.bin")).unwrap();
-    assert_eq!(reference.len(), 50 * 4);
-    for jit in [false, true] {
-        let profile = directory.join(if jit { "jit" } else { "interpreter" });
-        let config =
-            adv_win32::Win32Config::new(&directory, "fixture_dshow_empty_graph.exe", &profile);
-        let files = adv_os::Vfs::new(&config.os);
-        let mut registry = Registry::default();
-        adv_win32::register(&mut registry);
-        adv_win32::ole32::register(&mut registry);
-        register(&mut registry);
-        let mut machine = Machine::new(
-            JitCpu::new(adv_machine::layout::PARK_ADDR, jit).unwrap(),
-            registry,
-            Clock::virtual_time(),
-        )
-        .unwrap();
-        adv_win32::Win32::install(&mut machine, config).unwrap();
-        install(&mut machine);
-        let exe = machine
-            .load(&files, "fixture_dshow_empty_graph.exe")
-            .unwrap();
-        machine.start_process(exe).unwrap();
-        let run = machine.run_virtual(2_000_000);
-        assert!(matches!(run, RunResult::Exited(0)), "JIT {jit}: {run:?}");
-        let actual = std::fs::read(profile.join("overlay/dshow-empty-graph.bin")).unwrap();
-        assert_eq!(actual, reference, "SDK fixture, JIT enabled {jit}");
-        // Diagnostics exist only once something reports a stub call.
-        let stubs = machine
-            .ext
-            .try_get::<adv_abi::ApiDiagnostics>()
-            .map_or(0, |diagnostics| diagnostics.stub_calls);
-        assert_eq!(stubs, 0);
-    }
 }
 
 #[test]

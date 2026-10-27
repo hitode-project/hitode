@@ -48,6 +48,15 @@ mod state_tests {
             thunk: 0,
         }
     }
+    /// SetVertexShaderConstantF of one register from guest memory.
+    fn vertex_constant(env: &mut Env<'_>, pointer: u32, start: u32, data: &[u8]) -> u32 {
+        env.cpu.write(DATA + 0x1000, data).unwrap();
+        call(
+            env,
+            super::super::shaders::set_vertex_f_ABI,
+            &[pointer, start, DATA + 0x1000, 1],
+        )
+    }
     fn call(env: &mut Env<'_>, api: Api, args: &[u32]) -> u32 {
         env.cpu.write_u32(STACK, 0x12340000).unwrap();
         for (index, word) in args.iter().enumerate() {
@@ -77,6 +86,95 @@ mod state_tests {
         }
         assert_eq!(stage(env, pointer, 11), 0);
         assert_eq!(stage(env, pointer, 24), 0);
+    }
+
+    // spec: GFX-SHADER-4, GFX-REC-7
+    #[test]
+    fn identical_writes_keep_versions_and_recorded_membership_preserves_float_bits() {
+        use super::super::shaders::stateblocks;
+        let mut machine = machine();
+        let mut env = env(&mut machine);
+        let (pointer, _, _, _) = super::super::super::tests::setup(&mut env);
+        let this = GuestPtr::new(pointer);
+        let initial = device(&env, pointer).unwrap().versions;
+        let sampler = device(&env, pointer).unwrap().fixed.sampler[&5];
+        for _ in 0..2 {
+            assert_eq!(call(&mut env, set_render_ABI, &[pointer, 22, 3]), 0);
+            assert_eq!(call(&mut env, set_stage_ABI, &[pointer, 1, 11, 1]), 0);
+            assert_eq!(
+                call(&mut env, set_sampler_ABI, &[pointer, 0, 5, sampler]),
+                0
+            );
+            assert_eq!(vertex_constant(&mut env, pointer, 3, &[0; 16]), 0);
+        }
+        assert_eq!(device(&env, pointer).unwrap().versions, initial);
+        assert_eq!(stateblocks::begin(&mut env, this), 0);
+        assert_eq!(call(&mut env, set_render_ABI, &[pointer, 22, 3]), 0);
+        assert_eq!(vertex_constant(&mut env, pointer, 3, &[0; 16]), 0);
+        assert_eq!(stateblocks::end(&mut env, this, GuestPtr::new(DATA)), 0);
+        let block = GuestPtr::new(env.cpu.read_u32(DATA).unwrap());
+        assert_eq!(device(&env, pointer).unwrap().versions, initial);
+        let bits = [0x8000_0000u32, 0x7fc0_1234, 0, 0];
+        assert_eq!(
+            vertex_constant(&mut env, pointer, 3, bytemuck::cast_slice(&bits)),
+            0
+        );
+        let changed = device(&env, pointer).unwrap().versions;
+        assert_eq!(changed[13], initial[13] + 1);
+        assert_eq!(
+            vertex_constant(&mut env, pointer, 3, bytemuck::cast_slice(&bits)),
+            0
+        );
+        assert_eq!(device(&env, pointer).unwrap().versions, changed);
+        assert_eq!(call(&mut env, set_render_ABI, &[pointer, 22, 1]), 0);
+        assert_eq!(call(&mut env, set_render_ABI, &[pointer, 14, 0]), 0);
+        assert_eq!(stateblocks::apply(&mut env, block), 0);
+        let d = device(&env, pointer).unwrap();
+        assert_eq!(d.fixed.render[&22], 3);
+        assert_eq!(d.fixed.render[&14], 0, "uncaptured state is retained");
+        assert_eq!(
+            d.shaders.vertex_constants.floats[3].map(f32::to_bits),
+            [0; 4]
+        );
+        let restored = d.versions;
+        assert_eq!(stateblocks::apply(&mut env, block), 0);
+        assert_eq!(device(&env, pointer).unwrap().versions, restored);
+    }
+
+    // spec: GFX-REC-2, GFX-SHADER-4
+    #[test]
+    fn applying_only_constants_preserves_the_fixed_state_key() {
+        let mut machine = machine();
+        let mut env = env(&mut machine);
+        let (pointer, _, _, _) = super::super::super::tests::setup(&mut env);
+        assert_eq!(
+            super::super::shaders::stateblocks::create(
+                &mut env,
+                GuestPtr::new(pointer),
+                1,
+                GuestPtr::new(DATA)
+            ),
+            0
+        );
+        let block = env.cpu.read_u32(DATA).unwrap();
+        let key = device(&env, pointer).unwrap().fixed.key();
+        assert_eq!(vertex_constant(&mut env, pointer, 0, &[0x3f; 16]), 0);
+        assert_eq!(
+            super::super::shaders::stateblocks::apply(&mut env, GuestPtr::new(block)),
+            0
+        );
+        let d = device(&env, pointer).unwrap();
+        assert_eq!(d.fixed.key.get(), Some(key));
+        assert_eq!(d.shaders.vertex_constants.floats[0], [0.; 4]);
+        assert_eq!(call(&mut env, set_render_ABI, &[pointer, 22, 1]), 0);
+        device(&env, pointer).unwrap().fixed.key();
+        assert_eq!(
+            super::super::shaders::stateblocks::apply(&mut env, GuestPtr::new(block)),
+            0
+        );
+        let d = device(&env, pointer).unwrap();
+        assert_eq!(d.fixed.key.get(), None);
+        assert_eq!(d.fixed.key(), key);
     }
 
     #[test]
@@ -380,7 +478,7 @@ mod state_tests {
                     )
                     .unwrap();
                     assert_eq!(draw.state.last_pixel, last_pixel != 0);
-                    for vertex in draw.vertices {
+                    for vertex in draw.vertices.iter() {
                         assert_eq!(vertex.color, [128. / 255., 64. / 255., 32. / 255., 1.]);
                         assert_eq!(vertex.uv, [0.25, 0.75]);
                     }

@@ -27,7 +27,7 @@ from pathlib import Path
 
 NOREPLY = "@users.noreply.github.com"
 # Third-party code keeps its authors' addresses.
-EMAIL_EXEMPT = ("vendor/", "crates/adv-cpu-core/softfloat/", "tools/fixtures/vendor/")
+EMAIL_EXEMPT = ("vendor/", "crates/adv-cpu-core/softfloat/")
 EMAIL_ALLOWED_DOMAINS = {"example.com", "example.org", "example.net"}
 # Apple asset scale suffixes such as AppIcon-20x20@2x.png are file names.
 ASSET_SCALE = re.compile(r"[1-9]x(?:-\d+)?\.(?:png|jpe?g|pdf|svg|heic)$")

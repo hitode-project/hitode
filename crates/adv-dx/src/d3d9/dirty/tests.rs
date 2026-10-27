@@ -490,7 +490,7 @@ fn attach_target(m: &mut Machine<JitCpu>, device_pointer: u32) -> Image {
         let back = e
             .sys
             .objects
-            .hosts_in::<adv_os::com::ComObject<Payload>>(com(&e).namespace())
+            .hosts_in::<adv_abi::com::ComObject<Payload>>(com(&e).namespace())
             .find_map(|(id, _)| {
                 matches!(com(&e).get_identity(&e.sys.objects, id),
                 Some(Payload::Resource(r)) if r.kind == Kind::Surface)
@@ -986,7 +986,7 @@ fn a8_bytes_mip_aliases_identity_sampling_and_managed_restoration_match_native()
         let owner = com(&e).identity::<Payload>(&e.sys.objects, device).unwrap();
         let back = com(&e).get_identity(&e.sys.objects, owner).and_then(|payload| {
             if let Payload::Device(d) = payload { d.back_buffer } else { None }
-        }).unwrap_or_else(|| e.sys.objects.hosts_in::<adv_os::com::ComObject<Payload>>(com(&e).namespace())
+        }).unwrap_or_else(|| e.sys.objects.hosts_in::<adv_abi::com::ComObject<Payload>>(com(&e).namespace())
             .find_map(|(id, _)| matches!(com(&e).get_identity(&e.sys.objects, id), Some(Payload::Resource(r)) if r.kind == Kind::Surface && r.container.is_none()).then_some(id)).unwrap());
         if let Some(Payload::Resource(r)) = com(&e).get_identity_mut(&mut e.sys.objects, back) {
             r.surface = Some(target_surface);

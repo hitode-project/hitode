@@ -23,7 +23,7 @@ mod attributes;
 pub mod host;
 mod mutation;
 mod names;
-#[cfg(not(windows))]
+
 pub use mutation::sync_move;
 mod installer_state;
 mod optical;
@@ -185,7 +185,7 @@ impl Vfs {
             overlay: cfg.data_dir.join("overlay"),
             whiteouts: whiteouts::Whiteouts::load(cfg.data_dir.join("whiteouts")),
             install: cfg.install_dir.clone(),
-            other: cfg.data_dir.join("c"),
+            other: cfg.system_dir.clone(),
             optical: BTreeMap::new(),
             memo: Mutex::default(),
         }
@@ -633,23 +633,6 @@ fn normalize_unc(p: &str) -> String {
         result.push('\\');
     }
     result
-}
-
-impl crate::FileSource for Vfs {
-    fn absolute_path(&self, path: &str) -> String {
-        self.normalize(path)
-    }
-    fn read(&self, path: &str) -> Option<Vec<u8>> {
-        if self.is_optical_path(path) {
-            use std::io::Read;
-            let mut file = self.open_optical_file(path).ok()?;
-            let mut bytes = Vec::new();
-            file.read_to_end(&mut bytes).ok()?;
-            return Some(bytes);
-        }
-        let p = self.lookup(path)?;
-        p.is_file().then(|| std::fs::read(p).ok()).flatten()
-    }
 }
 
 /// Flush an explicitly requested durable file barrier, including drive caches.

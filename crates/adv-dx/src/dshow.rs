@@ -20,10 +20,21 @@ mod dmo;
 mod error_text_tests;
 mod filter;
 mod graph;
+pub(crate) mod host;
+pub use host::{Host, Opened, ReadFile};
 mod sample;
 mod stream;
 mod video;
 pub use video::{VideoProvider, VideoWindowGeometry, pump_video, set_video_provider};
+
+/// Playback performed by the native graph, retained after graph release.
+#[derive(Default)]
+pub struct Playback {
+    pub sources: u64,
+    pub video_frames: u64,
+    pub audio_frames: u64,
+    pub completions: u64,
+}
 
 pub(crate) const S_OK: u32 = 0;
 pub(crate) const S_FALSE: u32 = 1;
@@ -300,6 +311,7 @@ pub(crate) struct State {
     pub(crate) sessions: BTreeMap<u32, stream::Session>,
     pub(crate) next_session: u32,
     /// Graph window notifications (PostMessageA thunk, arguments) awaiting a guest call.
+    pub(crate) pending_threads: Vec<u32>,
     pub(crate) pending_posts: Vec<(u32, [u32; 4])>,
 }
 
@@ -359,6 +371,20 @@ pub fn install<B: adv_cpu::backend::Backend>(m: &mut adv_machine::Machine<B>) {
     classes.register(dmo::CLSID_DMO_WRAPPER, dmo::create);
 }
 
+/// Classes exported by the native graph front. Wine retains its audio
+/// renderer factories so external push graphs receive their samples.
+pub fn has_graph_class(class: &Iid) -> bool {
+    [
+        CLSID_FILTERGRAPH,
+        CLSID_FILTERGRAPH_NO_THREAD,
+        CLSID_MPEG1_SPLITTER,
+        CLSID_MPEG_VIDEO_CODEC,
+        CLSID_MPEG_AUDIO_CODEC,
+        dmo::CLSID_DMO_WRAPPER,
+    ]
+    .contains(class)
+}
+
 fn initialize(env: &mut Env<'_>) -> Result<(), String> {
     if env.ext.try_get::<State>().is_some() {
         return Ok(());
@@ -395,6 +421,7 @@ fn initialize(env: &mut Env<'_>) -> Result<(), String> {
         samples: BTreeMap::new(),
         sessions: BTreeMap::new(),
         next_session: 1,
+        pending_threads: Vec::new(),
         pending_posts: Vec::new(),
     });
     Ok(())
@@ -405,11 +432,18 @@ pub(crate) fn state<'a>(env: &'a mut Env<'_>) -> &'a mut State {
 }
 
 pub(crate) fn alloc(env: &mut Env<'_>, len: u32) -> Option<u32> {
+    if let Some(host) = env.ext.try_get::<Host>() {
+        return (host.allocator.allocate)(env, len);
+    }
     let heaps = env.ext.get_mut::<Heaps>();
     heaps.alloc(env.cpu, &mut env.sys.vm, heaps.process_heap, len, true)
 }
 
 pub(crate) fn free(env: &mut Env<'_>, pointer: u32) {
+    if let Some(host) = env.ext.try_get::<Host>() {
+        (host.allocator.free)(env, pointer);
+        return;
+    }
     let heaps = env.ext.get_mut::<Heaps>();
     heaps.free(env.cpu, &mut env.sys.vm, heaps.process_heap, pointer);
 }
@@ -514,7 +548,7 @@ fn destroyed_object(env: &mut Env<'_>, canonical: u32, value: &Obj) {
                 return;
             };
             if let Some(handle) = filter.source.and_then(|s| s.file_handle) {
-                env.sys.objects.close(handle);
+                host::close(env, handle);
             }
             if let Some(dmo) = filter.dmo {
                 dmo::destroyed(env, dmo);
@@ -969,3 +1003,43 @@ impl MediaType {
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+/// Continue a front operation across guest calls and machine waits.
+pub(crate) fn after(env: &mut Env<'_>, outcome: Outcome, finish: Then) -> Outcome {
+    match outcome {
+        Outcome::Return(hr) => finish(env, vec![hr]),
+        Outcome::Call {
+            target,
+            args,
+            then,
+            stack,
+            unwindable,
+        } => Outcome::Call {
+            target,
+            args,
+            then: Box::new(move |env, resume| {
+                let outcome = then(env, resume);
+                after(env, outcome, finish)
+            }),
+            stack,
+            unwindable,
+        },
+        Outcome::Block {
+            wait,
+            then,
+            allow_time_skip,
+        } => Outcome::Block {
+            wait,
+            allow_time_skip,
+            then: Box::new(move |env, resume| {
+                let outcome = then(env, resume);
+                after(env, outcome, finish)
+            }),
+        },
+        Outcome::Defer { then } => Outcome::defer(move |env| {
+            let outcome = then(env);
+            after(env, outcome, finish)
+        }),
+        other => other,
+    }
+}

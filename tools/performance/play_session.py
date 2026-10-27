@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Replay normal/held-key play through the production frontend.
 
-The JSON schedule is an adv-scene-v1 document (shared with Android replay) or a list of {"at": seconds, "command": "key-down 17"},
+The JSON schedule is an adv-scene-v1 document or a list of {"at": seconds, "command": "key-down 17"},
 {"at": seconds, "checkpoint": "normal", "reset_metrics": true} or {"at": seconds, "wait": {...}} entries.
 A wait polls the runner until a visible top-level window's text contains (or class equals)
 {"window": TEXT}, a click at {"hit": [X, Y]} reaches a window whose text contains "text",
@@ -10,7 +10,8 @@ run at their "at" time or as soon as the wait ends, whichever is later.
 Checkpoints save the actual framebuffer and frontend/device report, then optionally
 start a new measurement window. Times are host time since process launch, and every
 command waits for its real acknowledgement; no release may overtake its key-down.
-All guest writes and evidence go to --output. Game assets are never modified.
+Evidence and the Wine prefix go to --output. Wine reads and writes the original
+game folder in place.
 Use --audio --mute-audio --mode hidden (or window) to keep the real audio device
 path active while sending silence to hardware, without enabling capture or tracing.
 session.json records whether the hardware was requested to be muted.
@@ -20,13 +21,12 @@ and marks the session unsuitable for performance comparison.
 --d3d9-sm3 explicitly opts into the runner's SM3 capability profile; SM2 is the default.
 --pin-runner runs a copy of the binary from OUTPUT/bin; session.json records
 the SHA-256 of what actually ran.
-Native caching/static discovery are default; --no-code-cache diagnoses failures.
---warm-code-cache
-imports a previous local archive into the new overlay. --cold clears both caches.
+--wine DIST supplies the required Wine distribution.
 """
 from __future__ import annotations
 
 import argparse
+import ctypes
 import hashlib
 import json
 import math
@@ -39,6 +39,38 @@ import subprocess
 import sys
 import threading
 import time
+
+
+class _MacUsage(ctypes.Structure):
+    # rusage_info_v0 from sys/resource.h; CPU times use Mach absolute ticks.
+    _fields_ = [("uuid", ctypes.c_uint8 * 16)] + [
+        (name, ctypes.c_uint64) for name in (
+            "user_time", "system_time", "idle_wakes", "interrupt_wakes", "pageins",
+            "wired", "resident", "footprint", "started", "exited",
+        )
+    ]
+
+
+def process_usage(pid):
+    """Cumulative macOS process CPU and memory; None when unavailable."""
+    if sys.platform != "darwin":
+        return None
+    function = ctypes.CDLL("/usr/lib/libproc.dylib").proc_pid_rusage
+    function.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+    function.restype = ctypes.c_int
+    usage = _MacUsage()
+    if function(pid, 0, ctypes.byref(usage)):
+        return None
+    timebase = (ctypes.c_uint32 * 2)()
+    basis = ctypes.CDLL("/usr/lib/libSystem.B.dylib").mach_timebase_info
+    basis.argtypes = [ctypes.c_void_p]
+    basis.restype = ctypes.c_int
+    if basis(ctypes.byref(timebase)):
+        return None
+    seconds_per_tick = timebase[0] / timebase[1] / 1e9
+    return {"user_seconds": usage.user_time * seconds_per_tick,
+            "system_seconds": usage.system_time * seconds_per_tick,
+            "resident_bytes": usage.resident, "footprint_bytes": usage.footprint}
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "android"))
@@ -118,8 +150,6 @@ def launch_environment(args: argparse.Namespace, output: Path) -> tuple[dict[str
         if environment.pop(name, None) is not None:
             removed.append(name)
     environment.pop("ADV_PERF_MAP_DIR", None)
-    if getattr(args, "compile_threads", None):
-        environment["ADV_COMPILE_THREADS"] = str(args.compile_threads)
     if getattr(args, "perf_map", False):
         environment["ADV_PERF_MAP_DIR"] = str(output)
     if mute_audio or args.capture_audio:
@@ -171,12 +201,14 @@ def run(args: argparse.Namespace) -> None:
                "--seconds", str(duration), "--auto-dialog-ms", str(getattr(args, "auto_dialog_ms", 50)),
                "--data-dir", str(output / "overlay"), "--report", str(output / "final.json"),
                "--screenshot", str(output / "final.png")]
+    command.extend(["--wine", str(args.wine.resolve(strict=True)),
+                    "--wine-prefix", str(output / "prefix")])
+    if getattr(args, "host_profile", False):
+        command.extend(["--host-profile", str(output / "host-services.csv")])
     for mount in getattr(args, "cdrom", []):
         command.extend(["--cdrom", mount])
     if getattr(args, "frame_budget", False):
         command.append("--frame-budget")
-    if getattr(args, "no_code_cache", False):
-        command.append("--no-code-cache")
     if getattr(args, "headless_gpu", False):
         command.append("--headless-gpu")
     if getattr(args, "no_time_skip", False):
@@ -185,26 +217,11 @@ def run(args: argparse.Namespace) -> None:
         command.append("--" + args.mode)
     if args.audio:
         command.append("--audio")
-    command.extend(["--codec", args.codec])
-    if args.sync_compilation:
-        command.append("--sync-compilation")
-    if args.no_tiering:
-        command.append("--no-tiering")
+    command.extend(["--codec-kernels", args.codec])
     if args.trace:
         command.extend(["--trace", str(output / "api.trace")])
     if getattr(args, "d3d9_sm3", False):
         command.append("--d3d9-sm3")
-    if getattr(args, "cold", False):
-        (output / "overlay" / "jit-warm.bin").unlink(missing_ok=True)
-        (output / "overlay" / "jit-code.bin").unlink(missing_ok=True)
-    if getattr(args, "warm_profile", None):
-        (output / "overlay").mkdir(exist_ok=True)
-        shutil.copy2(args.warm_profile, output / "overlay" / "jit-warm.bin")
-    if getattr(args, "warm_code_cache", None):
-        if getattr(args, "cold", False):
-            raise ValueError("cold replay cannot import native cache")
-        (output / "overlay").mkdir(exist_ok=True)
-        shutil.copy2(args.warm_code_cache, output / "overlay" / "jit-code.bin")
     acknowledgement: queue.Queue[str | None] = queue.Queue()
     actions = []
     metadata = {"command": command, "binary_sha256": hashlib.sha256(executable.read_bytes()).hexdigest(),
@@ -286,6 +303,10 @@ def run(args: argparse.Namespace) -> None:
                     name = step["checkpoint"]
                     if scene and "await" in step:
                         gate_ack = send(await_command(step["await"]), step["await"]["timeout_ms"] / 1000 + 30)
+                    usage = process_usage(process.pid)
+                    if usage is not None:
+                        usage["wall_seconds"] = time.monotonic() - start
+                        (output / f"{name}.process.json").write_text(json.dumps(usage), encoding="utf-8")
                     report_path = output / f"{name}.json"
                     send(f"report {report_path}")
                     report = json.loads(report_path.read_text(encoding="utf-8"))
@@ -355,6 +376,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--exe", required=True, type=Path)
     parser.add_argument("--schedule", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--wine", required=True, type=Path, help="Wine distribution; keep its prefix under OUTPUT")
+    parser.add_argument("--host-profile", action="store_true", help="record host service costs under OUTPUT")
     parser.add_argument("--cdrom", action="append", default=[], metavar="DRIVE=IMAGE",
                         help="mount an image in the guest; repeat for multiple drives")
     parser.add_argument("--auto-dialog-ms", type=int, default=50,
@@ -376,15 +399,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--headless-gpu", action="store_true")
     parser.add_argument("--no-time-skip", action="store_true")
     parser.add_argument("--perf-map", action="store_true")
-    warmth = parser.add_mutually_exclusive_group()
-    warmth.add_argument("--cold", action="store_true")
-    warmth.add_argument("--warm-profile", type=Path)
-    parser.add_argument("--warm-code-cache", type=Path)
-    parser.add_argument("--no-code-cache", action="store_true", help="diagnostic bypass of native caching and image precompilation")
-    parser.add_argument("--compile-threads", type=int, choices=range(1, 9))
-    parser.add_argument("--sync-compilation", action="store_true")
-    parser.add_argument("--no-tiering", action="store_true",
-                        help="disable Fast-to-Speed promotion for matched worker comparisons")
     parser.add_argument("--tail-seconds", type=float, default=3)
     return parser
 

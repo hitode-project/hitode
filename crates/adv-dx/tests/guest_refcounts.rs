@@ -166,7 +166,6 @@ fn run(
 fn every_reference_vtable_matches_host_and_keeps_internal_owners_and_live_patches() {
     let mut registry = Registry::default();
     adv_dx::ddraw::register(&mut registry);
-    adv_dx::dinput::register(&mut registry);
     adv_dx::dsound::register(&mut registry);
     adv_dx::dshow::register(&mut registry);
     #[cfg(feature = "gpu")]

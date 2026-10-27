@@ -1,5 +1,5 @@
 //! SYSTEMMEM to DEFAULT updates over the existing mip layout and GPU uploads.
-//! Dirty regions may conservatively expand to the complete matching mip chain.
+//! Each matched mip uploads only its dirty rectangle, preserving other texels.
 use super::*;
 use adv_device::surface::Rect;
 use resources::{Kind, Lock};
@@ -38,12 +38,15 @@ struct Transfer {
 struct Upload {
     level: u32,
     target: Target,
-    pixels: Arc<Vec<u8>>,
+    pixels: Pixels,
     pitch: u32,
     rectangle: Rect,
     commit: Commit,
 }
 struct Commit {
+    pitch: u32,
+    row: u32,
+    height: u32,
     level: u32,
     address: Option<u32>,
     raw: Arc<Vec<u8>>,
@@ -176,12 +179,17 @@ fn prepare(
     // Snapshot and validate every matched level before any guest/GPU mutation.
     // A later unreadable mip must not cause an avoidable partial first upload.
     for (index, (s, d)) in src.levels[offset..].iter().zip(&dst.levels).enumerate() {
-        let length = format::length(s.desc.Format, s.desc.Width, s.desc.Height).ok_or(INVALID)?;
+        let Some(rectangle) = s.dirty else {
+            continue;
+        };
         let pitch = format::pitch(s.desc.Format, s.desc.Width).ok_or(INVALID)?;
-        let source = src.storage.checked_add(s.offset).ok_or(INVALID)?;
+        let row = format::pitch(s.desc.Format, rectangle.w).ok_or(INVALID)?;
+        let length = (rectangle.h - 1) * pitch + row;
+        let at = rectangle.y * pitch + rectangle.x * format::bytes(s.desc.Format).ok_or(INVALID)?;
+        let source = src.storage.checked_add(s.offset + at).ok_or(INVALID)?;
         adv_abi::guest::check_range(env.cpu, source, length, Prot::READ).map_err(|_| INVALID)?;
         let address = if dst.storage != 0 {
-            let address = dst.storage.checked_add(d.offset).ok_or(INVALID)?;
+            let address = dst.storage.checked_add(d.offset + at).ok_or(INVALID)?;
             adv_abi::guest::check_range(env.cpu, address, length, Prot::WRITE)
                 .map_err(|_| INVALID)?;
             Some(address)
@@ -196,7 +204,8 @@ fn prepare(
         raw.resize(length as usize, 0);
         env.cpu.read(source, &mut raw).map_err(|_| INVALID)?;
         let raw = Arc::new(raw);
-        let (pixels, pitch) = if s.desc.Format == 21 {
+        let raw_pitch = pitch;
+        let (pixels, pitch) = if matches!(s.desc.Format, 21 | 28) {
             // BGRA8 already matches the GPU layout. Keep one immutable owned
             // snapshot for both submission retries and guest shadow writeback.
             (Arc::clone(&raw), pitch)
@@ -209,7 +218,7 @@ fn prepare(
                 raw.as_ref().clone()
             };
             let (pixels, pitch) =
-                format::upload(s.desc.Format, input, pitch, s.desc.Width, s.desc.Height)
+                format::upload(s.desc.Format, input, pitch, rectangle.w, rectangle.h)
                     .ok_or(INVALID)?;
             (Arc::new(pixels), pitch)
         };
@@ -218,15 +227,17 @@ fn prepare(
         remaining.push_back(Upload {
             level,
             target,
-            pixels,
-            pitch,
-            rectangle: Rect {
-                x: 0,
-                y: 0,
-                w: d.desc.Width,
-                h: d.desc.Height,
+            pixels: if s.desc.Format == 28 {
+                Pixels::Alpha8(pixels)
+            } else {
+                Pixels::Host(pixels)
             },
+            pitch,
+            rectangle,
             commit: Commit {
+                pitch: raw_pitch,
+                row,
+                height: rectangle.h,
                 level,
                 address,
                 raw,
@@ -281,7 +292,7 @@ fn next(env: &mut Env<'_>, destination: Id) -> Outcome {
             resource: destination,
             level: Some(upload.level),
             target: upload.target,
-            pixels: Pixels::Host(upload.pixels),
+            pixels: upload.pixels,
             pitch: upload.pitch,
             rectangle: upload.rectangle,
         },
@@ -296,18 +307,28 @@ fn uploaded(env: &mut Env<'_>, destination: Id, outcome: Outcome) -> Outcome {
                 .current
                 .as_ref()
                 .unwrap();
-            if let Some(address) = commit.address
-                && (adv_abi::guest::check_range(
+            if let Some(address) = commit.address {
+                let valid = adv_abi::guest::check_range(
                     env.cpu,
                     address,
                     commit.raw.len() as u32,
                     Prot::WRITE,
                 )
-                .is_err()
-                    || env.cpu.write(address, &commit.raw).is_err())
-            {
-                retire(env, destination, false);
-                return Outcome::Return(INVALID);
+                .is_ok();
+                if !valid
+                    || (0..commit.height).any(|y| {
+                        let at = (y * commit.pitch) as usize;
+                        env.cpu
+                            .write(
+                                address + y * commit.pitch,
+                                &commit.raw[at..at + commit.row as usize],
+                            )
+                            .is_err()
+                    })
+                {
+                    retire(env, destination, false);
+                    return Outcome::Return(INVALID);
+                }
             }
             let level = commit.level;
             if let Some(Payload::Resource(r)) =

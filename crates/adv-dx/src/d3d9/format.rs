@@ -75,6 +75,9 @@ pub(super) fn snapshot(
     let row = self::pitch(format, width)?;
     let mut pixels = vec![0; ((height - 1) * pitch + row) as usize];
     env.cpu.read(address, &mut pixels).ok()?;
+    if format == 28 {
+        return Some((super::Pixels::Alpha8(Arc::new(pixels)), pitch));
+    }
     let (pixels, pitch) = upload(format, pixels, pitch, width, height)?;
     Some((super::Pixels::Host(Arc::new(pixels)), pitch))
 }

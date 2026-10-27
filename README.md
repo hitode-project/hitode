@@ -47,7 +47,6 @@ To find out whether your game runs, import it and try. If it will not start, fre
 | macOS (Apple silicon) | Supported | |
 | Android (ARMv8-A, 64-bit) | Supported | |
 | iOS / iPadOS | Supported | Not yet tested on iPad or on iOS 26 and later. Needs sideloading; enable JIT with LocalDevVPN or a similar tool, or performance may be too low to play. See [the iOS guide](docs/ios.zh-CN.md) (Chinese) |
-| Windows x64 | Debugging only | Not optimized for performance |
 
 ## Download
 
@@ -58,22 +57,14 @@ Builds for each platform are on [GitHub Releases](https://github.com/hitode-proj
 
 Hitode has two parts: a **runtime** that runs Windows programs, and a **player** that hosts it on each platform.
 
-```mermaid
-flowchart TB
-  game["Original game<br/>exe · DLLs · translation patches"]
-  subgraph core["Runtime"]
-    direction LR
-    jit["x86 → ARM64 JIT"] ~~~ win["Windows behavior"] ~~~ dev["Graphics / audio / video devices"]
-  end
-  subgraph player["Player"]
-    direction LR
-    shell["Host shell<br/>Metal / Vulkan display · touch and keyboard · audio"] ~~~ launcher["Launcher<br/>library · settings · in-game overlay"]
-  end
-  os["macOS · iOS / iPadOS · Android"]
-  game --> core --> player --> os
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/architecture-dark.svg">
+  <img src="docs/images/architecture-light.svg" width="760" alt="Architecture: the original game runs in one Hitode process. Host-native code runs the experience (audio, video, graphics), the system (NT kernel, Wine server, drivers) and execution (x86 to ARM64 JIT, native bodies); Wine covers the long tail. Hitode runs on macOS, iOS and Android.">
+</picture>
 
 The approach follows console emulators: the game's own code runs unchanged, and Hitode provides the "hardware" it expects, namely a subset of Windows, graphics, audio and video devices, time and threads.
+
+Windows behavior comes from Wine, built together with the rest of Hitode; its modules run as guest code and cover the long tail. Everything the player feels is host code: audio mixing, MIDI, video decoding, DirectDraw and Direct3D 9, and the timing of all of them. The NT kernel, the Wine server and the drivers run in the same process, so the layers call each other directly. Where a Wine function's bytes are verified unchanged, a native body may run it as host code with the same result.
 
 The runtime also runs without the launcher. `adv-run` is its command-line entry point, for debugging and automated tests.
 
@@ -85,11 +76,11 @@ The runtime also runs without the launcher. `adv-run` is its command-line entry 
 |---|---|---|---|
 | Games | Specific engines | Most Windows programs | 32-bit visual novel engines |
 | Needs a port | Often | No | No |
-| Original patches | Depends on the port | Yes | Yes |
-| Setup | Easy | More involved | Pick a folder |
-| Size | Small | Larger | Small |
+| Original and translation patches | Depends on the port | Yes | Yes |
+| Setup | Easy | Versions and settings often tuned per game | Pick a folder |
+| Audio and video | Native in the port | Wine's general-purpose drivers | Native on the host |
 
-Hitode aims for a balance between the two: it loads the original program and patches as they are, but implements only what visual novels use, and spends its effort on the playing experience and engine compatibility.
+Hitode sits between the two: it loads the original program and patches as they are, takes the long tail of Windows behavior from Wine, and runs audio, video and graphics, the parts players feel directly, natively on the host. Every part is built and released together, so a compatibility problem is fixed once, in code, for every game and platform, without per-game settings.
 
 ## Building
 
@@ -120,7 +111,8 @@ Hitode would not exist without these projects.
 
 **Runtime**
 
-- [Wine](https://www.winehq.org/): its source and tests are our main reference for how Windows behaves. We do not link or copy Wine code.
+- [Wine](https://www.winehq.org/): Windows behavior comes from its modules, which run as guest code, and its server runs inside Hitode. Its source and tests have long been our main reference for how Windows behaves.
+- [FreeType](https://freetype.org/): rasterizes the games' text.
 - [iced-x86](https://github.com/icedland/iced): the x86 decoder under our CPU.
 - [Unicorn](https://www.unicorn-engine.org/) and [QEMU](https://www.qemu.org/): the reference CPUs our tests compare against.
 - [SingleStepTests/80386](https://github.com/SingleStepTests/80386): per-instruction test vectors.
@@ -132,9 +124,10 @@ Hitode would not exist without these projects.
 - [StikDebug](https://github.com/StikDebug/StikDebug) and [idevice](https://github.com/jkcoxson/idevice): JIT on iPhone and iPad without a computer.
 - [Moonlight](https://moonlight-stream.org/): the timing of our touch gestures follows its implementation.
 - [Magpie](https://github.com/Blinue/Magpie): our upscaling shaders are ported from it; the originals are [Anime4K](https://github.com/bloc97/Anime4K), [CuNNy](https://github.com/funnyplanter/CuNNy), [ArtCNN](https://github.com/Artoriuz/ArtCNN) and k7_modernAnime from [mpv_PlayKit](https://github.com/hooke007/mpv_PlayKit).
+- [OxiSynth](https://github.com/PolyMeilex/OxiSynth) and the FluidR3 Mono SoundFont: MIDI music synthesis.
 - [FFmpeg](https://ffmpeg.org/) and Xiph's [libtheora](https://www.theora.org/): playback of the games' own videos.
 
-We also use [wgpu](https://wgpu.rs/), [Symphonia](https://github.com/pdeljanov/Symphonia), [cpal](https://github.com/RustAudio/cpal), [encoding_rs](https://github.com/hsivonen/encoding_rs), [Tauri](https://tauri.app/) and [Svelte](https://svelte.dev/).
+We also use [wgpu](https://wgpu.rs/), [Symphonia](https://github.com/pdeljanov/Symphonia), [cpal](https://github.com/RustAudio/cpal), [encoding_rs](https://github.com/hsivonen/encoding_rs), [corosensei](https://github.com/Amanieu/corosensei), [Tauri](https://tauri.app/) and [Svelte](https://svelte.dev/).
 
 The name comes from the wooden starfish (*hitode*) that Fuko Ibuki carves one by one and gives to everyone in *CLANNAD*. We want to hand these old games, one by one, to more people too.
 
@@ -157,5 +150,9 @@ Third-party parts keep their own licenses:
 - `crates/adv-cpu-core/softfloat`: Berkeley SoftFloat 3e, BSD-3-Clause.
 - `vendor/cpal` (Apache-2.0) and `vendor/symphonia-codec-adpcm` (MPL-2.0): patched upstream code.
 - `vendor/libtheora`: the decoder of Xiph libtheora 1.2.0, BSD-3-Clause, with local changes; see its `NOTICE`.
+- `vendor/wine`: the server of Wine 11.0 and the headers it includes, the `l_intl.nls` table the server loads at startup, and the `ntsyscalls.h` system call table, LGPL-2.1-or-later, unmodified; see its `NOTICE`.
+- `crates/adv-unix/freetype`: the FreeType ftgrays rasterizer, used under the FreeType License (FTL); see its `LICENSE.TXT`.
+- `vendor/fluidr3mono`: the FluidR3 Mono GM SoundFont, MIT; see its `LICENSE`.
 - `vendor/upscaling`: upscaling shader sources, under GPL-3.0 and each original's license (MIT for Anime4K); see its `NOTICE`.
-- `tools/fixtures/vendor/minhook`: a test fixture; see its `LICENSE.txt`.
+
+The Wine modules in release packages are an i386 build of Wine 11.0, LGPL-2.1-or-later; the build scripts are in `tools/wine/`.

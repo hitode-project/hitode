@@ -19,14 +19,11 @@ fn machine_with_limits(native: bool, references: u32) -> Machine<JitCpu> {
         references,
         ..ObjectLimits::default()
     });
-    let mut heaps = Heaps::default();
-    heaps.process_heap = heaps.create(&mut m.cpu, &mut m.sys.vm).unwrap();
-    m.ext.insert(heaps);
+    crate::test_support::install(&mut m);
     let com = Com::new(&mut m.sys.objects).unwrap();
     let provider = SurfaceProvider {
-        acquire_dc: |_, _, _, _, _| Err("ownership-only fixture".into()),
-        writeback_dc: |_, _, _, _| Err("ownership-only fixture".into()),
-        release_dc: |_, _| {},
+        allocator: test_allocator(),
+        dc: test_dc(),
         insert: |_, _| unreachable!("ownership-only fixture"),
         target: |_, _| None,
         remove: |_, _, _| Ok(()),
@@ -40,10 +37,10 @@ fn machine_with_limits(native: bool, references: u32) -> Machine<JitCpu> {
         visible: |_, _, _| Some(false),
         fast_forward: |_| false,
         display: |_| (16, 12, 60),
+        monitor: 0x0001_0001,
         mode_changed: |_, _, _| Outcome::Return(0),
         device_released: |_, _| {},
         completed: |_, _| None,
-        unpaced: |_| {},
     };
     m.ext.insert(State {
         com,
@@ -58,8 +55,6 @@ fn machine_with_limits(native: bool, references: u32) -> Machine<JitCpu> {
             ("IDirect3DPixelShader9", 0),
             ("IDirect3DStateBlock9", 0),
         ]),
-        device_methods: Vec::new(),
-        block_methods: Vec::new(),
         gpu: None,
         provider,
         pending: Vec::new(),
@@ -128,6 +123,7 @@ pub(super) fn setup(env: &mut Env<'_>) -> (u32, Id, u32, Id) {
         "IDirect3DDevice9",
         IID_DEVICE,
         Payload::Device(Box::new(Device {
+            children: BTreeMap::new(),
             pointer: 0,
             factory,
             surface: 0,
@@ -147,6 +143,7 @@ pub(super) fn setup(env: &mut Env<'_>) -> (u32, Id, u32, Id) {
             shaders: shaders::Bindings::default(),
             recording: None,
             versions: [0; 15],
+            fingerprints: [0; 15],
             frame: recording::Recording::default(),
             gpu_lost: false,
             boundary: None,
@@ -155,6 +152,7 @@ pub(super) fn setup(env: &mut Env<'_>) -> (u32, Id, u32, Id) {
     .unwrap();
     if let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, device_id) {
         d.pointer = device;
+        d.refresh_all();
     }
     let (resource, id) = resources::make(
         env,
@@ -173,6 +171,7 @@ pub(super) fn setup(env: &mut Env<'_>) -> (u32, Id, u32, Id) {
             surface: None,
             storage: 0,
             owns_surface: false,
+            lockable: false,
             lock: None,
             container: None,
             levels: Vec::new(),
@@ -236,7 +235,7 @@ fn query_of_bound_zero_reference_resource_retains_parent_once_and_failed_query_r
     let (device, device_id, resource, id) = setup(&mut env);
     let guid = GuestPtr::<Iid>::new(alloc(&mut env, 16).unwrap());
     let output = GuestPtr::<u32>::new(alloc(&mut env, 4).unwrap());
-    guid.write(env.cpu, adv_os::com::IUNKNOWN).unwrap();
+    guid.write(env.cpu, adv_abi::com::IUNKNOWN).unwrap();
     assert!(matches!(
         query(&mut env, GuestPtr::new(resource), guid, output),
         Outcome::Return(0)
@@ -281,7 +280,7 @@ fn parent_reference_limit_refuses_resource_resurrection_without_mutating_counts(
     );
     let guid = GuestPtr::<Iid>::new(alloc(&mut env, 16).unwrap());
     let output = GuestPtr::<u32>::new(alloc(&mut env, 4).unwrap());
-    guid.write(env.cpu, adv_os::com::IUNKNOWN).unwrap();
+    guid.write(env.cpu, adv_abi::com::IUNKNOWN).unwrap();
     assert!(matches!(
         query(&mut env, GuestPtr::new(resource), guid, output),
         Outcome::Return(OUT_OF_MEMORY)
@@ -293,14 +292,13 @@ fn parent_reference_limit_refuses_resource_resurrection_without_mutating_counts(
     assert_eq!(com(&env).references(&env.sys.objects, id), Some(0));
 }
 
-// spec: GFX-PACE-2
+// spec: GFX-PACE-1
 #[test]
 fn base_present_completion_returns_success_without_changing_wait_policy() {
     struct Policy {
         held: bool,
         fence: bool,
         serial: u64,
-        unpaced: u32,
     }
     let mut m = machine();
     m.spawn("present", adv_machine::layout::PARK_ADDR, &[], 0x10000)
@@ -309,11 +307,9 @@ fn base_present_completion_returns_success_without_changing_wait_policy() {
         held: false,
         fence: false,
         serial: 0,
-        unpaced: 0,
     });
     let provider = &mut m.ext.get_mut::<State>().provider;
     provider.fast_forward = |ext| ext.get::<Policy>().held;
-    provider.unpaced = |env| env.ext.get_mut::<Policy>().unpaced += 1;
     provider.completed = |env, serial| {
         let policy = env.ext.get_mut::<Policy>();
         policy.serial = serial;
@@ -335,8 +331,6 @@ fn base_present_completion_returns_success_without_changing_wait_policy() {
         Outcome::Return(0)
     ));
     assert_eq!(env.ext.get::<Policy>().serial, 7);
-    // Unpaced frames reach the frame cap; paced and fast-forwarded ones do not.
-    assert_eq!(env.ext.get::<Policy>().unpaced, 1);
     let at = env.sys.clock.now_us() + 1_000;
     assert!(matches!(
         completed(&mut env, Completion::Presented(8, Some(at))),
@@ -347,8 +341,6 @@ fn base_present_completion_returns_success_without_changing_wait_policy() {
         completed(&mut env, Completion::Presented(9, Some(at))),
         Outcome::Return(0)
     ));
-    completed(&mut env, Completion::Presented(9, None));
-    assert_eq!(env.ext.get::<Policy>().unpaced, 1);
     env.ext.get_mut::<Policy>().fence = true;
     assert!(matches!(
         completed(&mut env, Completion::Presented(10, Some(at))),
@@ -389,7 +381,7 @@ fn get_direct3d_preserves_factory_identity_after_original_release_and_outlives_d
     assert_eq!(output.read(env.cpu).unwrap(), original);
     assert_eq!(com(&env).references(&env.sys.objects, factory), Some(2));
     let iid = GuestPtr::<Iid>::new(alloc(&mut env, 16).unwrap());
-    iid.write(env.cpu, adv_os::com::IUNKNOWN).unwrap();
+    iid.write(env.cpu, adv_abi::com::IUNKNOWN).unwrap();
     assert!(matches!(
         query(&mut env, GuestPtr::new(original), iid, output),
         Outcome::Return(0)
@@ -457,7 +449,7 @@ pub(in crate::d3d9) fn flush_recordings(env: &mut Env<'_>) {
     let ids: Vec<_> = env
         .sys
         .objects
-        .hosts_in::<adv_os::com::ComObject<Payload>>(com(env).namespace())
+        .hosts_in::<adv_abi::com::ComObject<Payload>>(com(env).namespace())
         .filter_map(|(id, _)| {
             matches!(
                 com(env).get_identity(&env.sys.objects, id),
@@ -517,4 +509,20 @@ fn shared_guest_counts_preserve_real_resource_parent_and_internal_lifetimes() {
     );
     assert_eq!(release(&mut env, device), 0);
     assert_eq!(env.sys.objects.alias_count(com(&env).namespace()), 1);
+}
+
+pub(super) fn test_allocator() -> crate::interop::GuestAllocator {
+    crate::interop::GuestAllocator {
+        allocate: |env, length| {
+            let heaps = env.ext.get_mut::<Heaps>();
+            heaps.alloc(env.cpu, &mut env.sys.vm, heaps.process_heap, length, true)
+        },
+        free: |env, pointer| {
+            let heaps = env.ext.get_mut::<Heaps>();
+            heaps.free(env.cpu, &mut env.sys.vm, heaps.process_heap, pointer);
+        },
+    }
+}
+pub(super) fn test_dc() -> crate::interop::MemoryDc {
+    crate::test_support::dc::provider()
 }

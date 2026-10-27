@@ -156,11 +156,6 @@ async fn on_ui<R: Send + 'static>(
         .map_err(|error| error.to_string())?
 }
 
-/// Save operations wait for the game to exit; read on the UI thread.
-pub(crate) fn is_running() -> bool {
-    HOST.with_borrow(|host| host.session.is_some())
-}
-
 fn with_session<R>(f: impl FnOnce(&mut Host, &Session) -> R) -> Result<R, String> {
     HOST.with_borrow_mut(|host| {
         let session = host.session.take().ok_or("no game is running")?;
@@ -184,14 +179,12 @@ pub async fn start_game(
         .unwrap()
         .launch(&id)
         .map_err(|e| e.to_string())?;
-    let backup_data = data_dir.clone();
-    let options = playback.options(exe, data_dir, codepage)?;
+    let options = playback
+        .prepare(window.app_handle(), exe, data_dir, codepage)
+        .await?;
     let host_window = window.clone();
     on_ui(&window, move || {
         HOST.with_borrow_mut(|host| {
-            if crate::saves::busy() {
-                return Err("存档操作正在进行，请稍后启动".into());
-            }
             if host.session.is_some() {
                 return Err("a game is already running".into());
             }
@@ -213,7 +206,7 @@ pub async fn start_game(
             host.attach();
             let finished_window = host_window.clone();
             let started_at = Instant::now();
-            let session = Session::new(
+            let session = Session::new_with_execution(
                 view,
                 options,
                 Box::new(move |result| {
@@ -227,9 +220,9 @@ pub async fn start_game(
                     {
                         log::error!("leaving game mode: {error}");
                     }
-                    crate::saves::after_game(&finished_window, &backup_data);
                     crate::play::finished(&finished_window, id, result, started_at.elapsed());
                 }),
+                &host_window.state::<adv_shell::Execution>(),
             );
             let session = match session {
                 Ok(session) => session,

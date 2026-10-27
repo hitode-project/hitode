@@ -1,4 +1,4 @@
-//! Nonblocking host calls with memory and selected process data, never CPU control.
+//! Handlers that need only memory and selected process data, never CPU control.
 use adv_cpu::backend::{Guest, GuestExt, MemFault, Reg};
 
 use crate::{Clock, Env, Outcome};
@@ -79,6 +79,3 @@ pub fn trap(env: &mut Env<'_>) -> Outcome {
         Outcome::Return(value as u32)
     }
 }
-
-#[cfg(all(test, target_arch = "aarch64"))]
-mod tests;

@@ -2,7 +2,7 @@
 
 ID prefix: PROC
 
-This spec covers `adv-machine`, which schedules guest threads, owns time and dispatches callbacks, and the guest process family that `adv-runtime` runs. The family supports ordinary x86 `CreateProcessA/W` launch chains, including the suspended creation, remote import rewriting and resume that Microsoft Detours performs. [README.md](README.md) explains the format.
+This spec covers `adv-machine`, which schedules guest threads, owns time and dispatches callbacks, and the guest processes of a Wine session that `adv-runtime` runs. [README.md](README.md) explains the format.
 
 ## Machine
 
@@ -29,6 +29,11 @@ This spec covers `adv-machine`, which schedules guest threads, owns time and dis
 ### PROC-MACH-11 Checked stack unwind
 
 **Rule**: Stack-directed checkpoints MUST target the current thread's stack without crossing non-unwindable callbacks. Capture and restoration MUST retain and revalidate ancestor identity, retiring only explicitly unwindable descendants at restoration. Rejected targets MUST preserve registers and continuation ownership.
+**Verification**: Test
+
+### PROC-MACH-12 Ending a guest call early
+
+**Rule**: A host call that ends the innermost guest call without its return MUST resume that call's continuation with the given result. EBX, EBP, ESI and EDI MUST then hold their values from when that call began, as a returning callee leaves them.
 **Verification**: Test
 
 ### PROC-MACH-4 Direct host services
@@ -61,11 +66,13 @@ This spec covers `adv-machine`, which schedules guest threads, owns time and dis
 ### PROC-CLOCK-2 No time skip in a family
 
 **Rule**: Once a child process exists, the family MUST disable Ctrl time skip. A waiting process MUST NOT skip the runnable time of another process.
-**Verification**: Review — no test holds Ctrl while a child process runs.
+**Verification**: Test
 
 ### PROC-CLOCK-3 Clock polling
 
-**Rule**: A context that only rereads the clock MAY wait for the next millisecond on each read. The streak that proves it MUST exceed bounded per-item loops, such as a 256-key scan read twice.
+**Rule**: Clock-only polling MAY wait for the next millisecond after a streak exceeding bounded per-item loops, including two 256-key scans.
+The built-in and Wine stacks MUST share clock-poll admission and preserve their clock API results.
+Clock leaves MUST preserve guest polling observations and decline required waits before clock or poll changes.
 **Verification**: Test
 
 ### PROC-CLOCK-4 Frame spin
@@ -81,6 +88,12 @@ This spec covers `adv-machine`, which schedules guest threads, owns time and dis
 ### PROC-CLOCK-6 Timer ticks
 
 **Rule**: In real time, timed waits and waitable timers MUST expire on the first whole guest millisecond at or after their deadline. Display-paced waits MUST keep exact deadlines. Polling rounds MUST end on the next whole millisecond.
+**Verification**: Test
+
+### PROC-CLOCK-7 Quiet observation rounds
+
+**Rule**: As an alternative to PROC-CLOCK-5, repeated intervals containing only clock reads, empty message peeks and yields MAY wait before 64 repetitions. Every ready context MUST run during the round, with unchanged execution-delivery and object generations. New work or wake-source changes MUST invalidate this proof, preserving clock-tick deadlines and retained wakeups.
+While time skipping is requested, ready polling contexts MUST retain PROC-CLOCK-5's full repeated-interval proof.
 **Verification**: Test
 
 ## Isolation
@@ -102,19 +115,9 @@ This spec covers `adv-machine`, which schedules guest threads, owns time and dis
 
 ## Creation
 
-### PROC-CREATE-1 Publication gate
-
-**Rule**: A child MUST be admitted to scheduling only after the parent call writes both handles and `PROCESS_INFORMATION`. If the creation is cancelled or fails, the child MUST be reclaimed without running its TLS callbacks, DllMain or entry point.
-**Verification**: Test
-
 ### PROC-CREATE-2 Startup parameters
 
 **Rule**: `CreateProcessA/W` MUST copy the command line, ANSI or Unicode environment block, working directory and code page. The PEB parameters, `GetCommandLine` and CRT startup MUST read the same content.
-**Verification**: Test
-
-### PROC-CREATE-3 Suspended creation and injection
-
-**Rule**: Creation MUST map the executable and establish the main thread before resume, without calling guest TLS or DllMain. After resume, the loader MUST read the current import directory from the child's memory, including remote allocations.
 **Verification**: Test
 
 ### PROC-CREATE-4 Suspend counts and thread context
@@ -127,11 +130,6 @@ This spec covers `adv-machine`, which schedules guest threads, owns time and dis
 ### PROC-MEM-1 Remote memory
 
 **Rule**: `VirtualAllocEx`, `VirtualFreeEx`, `VirtualProtectEx`, `VirtualQueryEx`, `ReadProcessMemory` and `WriteProcessMemory` MUST act on the target process. Outputs MUST be validated in the caller's address space. Writes MUST trigger the existing code invalidation.
-**Verification**: Test
-
-### PROC-MEM-2 Failures stay contained
-
-**Rule**: A failed operation MUST NOT change another process, leave a half-created object or skip code invalidation.
 **Verification**: Test
 
 ### PROC-HANDLE-1 Process and thread handles
@@ -154,33 +152,6 @@ This spec covers `adv-machine`, which schedules guest threads, owns time and dis
 **Rule**: Process and thread handles MAY be inherited and duplicated across processes. Creation MUST fail when an inheritable handle has a type that is not shared across processes, and MUST NOT drop it silently.
 **Verification**: Review — no test marks a file or event handle inheritable.
 
-## Scheduling and failure
-
-### PROC-SCHED-1 Single process and family scheduling
-
-**Rule**: Before a child exists, `step()` MUST call the unsliced `Machine::run()`, and `step_for()` MUST use the caller's whole slice. Afterwards, the family MUST share one settled clock and rotate processes in short slices.
-**Verification**: Test
-
-### PROC-SCHED-2 Stable final results
-
-**Rule**: Exit and failure results MUST stay the same on later steps.
-**Verification**: Test
-
-### PROC-SCHED-3 Loader exit
-
-**Rule**: The exit of a launcher process MUST NOT end the session while a child lives. Display, input and reporting MUST move to the remaining child.
-**Verification**: Test
-
-### PROC-SCHED-4 Child failures
-
-**Rule**: An exception in a child MUST end only that child, and the parent MUST be able to read its final state. The native exception status MUST be kept. Missing emulator capabilities MUST report `STATUS_NOT_SUPPORTED`, not an access violation.
-**Verification**: Test
-
-### PROC-SCHED-5 Family reports
-
-**Rule**: The report MUST list each process with its PID, parent PID, image and final state. Missing APIs and acceptance eligibility MUST cover the whole family, including children that have exited.
-**Verification**: Test
-
 ## Devices
 
 ### PROC-DEV-1 Foreground frames
@@ -194,11 +165,6 @@ This spec covers `adv-machine`, which schedules guest threads, owns time and dis
 **Verification**: Review — no single test runs GPU and audio work in two processes.
 
 ## Limits and scope
-
-### PROC-LIMIT-1 Bounded family
-
-**Rule**: A family MUST allow at most 8 live processes, 128 processes in total and 64 pending requests. One remote transfer MUST NOT exceed 64 MiB, an environment block 2 MiB, and inherited aliases 1024. Exceeding a limit MUST fail without publishing a new machine.
-**Verification**: Test
 
 ### PROC-LIMIT-2 Real-time scheduler only
 
@@ -227,5 +193,5 @@ Withdrawn: none
 
 ### PROC-MACH-9 Host boundary accounting
 
-**Rule**: Reports MUST expose non-leaf totals and completed guest and leaf fractions per API. Diagnostics MUST distinguish entries, same-binding fallbacks and linked fallbacks while preserving registers, flags and guest patches. Disabled guest bodies and fallback transfers MUST execute no diagnostic counter instructions.
+**Rule**: Reports MUST expose totals and completed guest fractions per API. Diagnostics MUST distinguish entries, same-binding fallbacks and linked fallbacks while preserving registers, flags and guest patches. Disabled guest bodies and fallback transfers MUST execute no diagnostic counter instructions.
 **Verification**: Test

@@ -16,6 +16,7 @@ use iced_x86::{
     Register as R,
 };
 
+use crate::integer::{AF, Address, CF, OF, Operand, PF, Reg, SF, ZF, condition_true, mask, signed};
 use crate::{CpuState, EXEC, Memory, PAGE_SIZE, READ, WRITE};
 
 mod registers;
@@ -24,13 +25,6 @@ mod simd;
 mod strings;
 #[cfg(test)]
 mod window_tests;
-
-const CF: u32 = 1;
-const PF: u32 = 1 << 2;
-const AF: u32 = 1 << 4;
-const ZF: u32 = 1 << 6;
-const SF: u32 = 1 << 7;
-const OF: u32 = 1 << 11;
 
 /// Outcome of one instruction. Fuel accounting belongs to the caller.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1183,145 +1177,9 @@ impl DecodedBlock {
     }
 }
 
-#[derive(Clone, Copy)]
-struct Reg {
-    index: u8,
-    shift: u8,
-    width: u8,
-}
-
-impl Reg {
-    fn decode(r: R) -> Option<Self> {
-        let number = r as u32;
-        let (index, shift, width) = if (R::EAX as u32..=R::EDI as u32).contains(&number) {
-            (number - R::EAX as u32, 0, 4)
-        } else if (R::AX as u32..=R::DI as u32).contains(&number) {
-            (number - R::AX as u32, 0, 2)
-        } else if (R::AL as u32..=R::BL as u32).contains(&number) {
-            (number - R::AL as u32, 0, 1)
-        } else if (R::AH as u32..=R::BH as u32).contains(&number) {
-            (number - R::AH as u32, 8, 1)
-        } else {
-            return None;
-        };
-        Some(Self {
-            index: index as u8,
-            shift,
-            width,
-        })
-    }
-    fn read(self, regs: &[u32; 8]) -> u32 {
-        (regs[self.index as usize] >> self.shift) & mask(self.width)
-    }
-    fn write(self, regs: &mut [u32; 8], value: u32) {
-        let mask = mask(self.width) << self.shift;
-        let slot = &mut regs[self.index as usize];
-        *slot = (*slot & !mask) | ((value << self.shift) & mask);
-    }
-}
-
-#[derive(Clone, Copy)]
-struct Address {
-    base: Option<Reg>,
-    index: Option<Reg>,
-    scale: u8,
-    displacement: u32,
-    word: bool,
-    fs: bool,
-}
-
 impl Address {
-    fn decode(i: &Instruction, lea: bool) -> Option<Self> {
-        let base = if i.memory_base() == R::None {
-            None
-        } else {
-            Some(Reg::decode(i.memory_base())?)
-        };
-        let index = if i.memory_index() == R::None {
-            None
-        } else {
-            Some(Reg::decode(i.memory_index())?)
-        };
-        // XLAT's implicit address is the sole byte-indexed form: iced supplies
-        // BX/EBX + unsigned AL. The usual address-width wrap still precedes FS.
-        if base.is_some_and(|r| r.width == 1)
-            || (index.is_some_and(|r| r.width == 1)
-                && !(i.code() == Code::Xlat_m8 && i.memory_index() == R::AL))
-        {
-            return None;
-        }
-        if !lea && !matches!(i.memory_segment(), R::DS | R::SS | R::ES | R::CS | R::FS) {
-            return None;
-        }
-        // In a displacement-only address the decoder retains the address width
-        // in the encoded displacement size (16 or 32 bits).
-        let word = base
-            .or(index)
-            .map_or(i.memory_displ_size() == 2, |r| r.width == 2);
-        Some(Self {
-            base,
-            index,
-            scale: i.memory_index_scale() as u8,
-            displacement: i.memory_displacement32(),
-            word,
-            fs: !lea && i.memory_segment() == R::FS,
-        })
-    }
     fn resolve(self, tx: &Transaction) -> u32 {
         self.resolve_regs(&tx.regs, tx.fs_base)
-    }
-    fn resolve_regs(self, regs: &[u32; 8], fs_base: u32) -> u32 {
-        let mut offset = self.displacement;
-        if let Some(r) = self.base {
-            offset = offset.wrapping_add(r.read(regs));
-        }
-        if let Some(r) = self.index {
-            offset = offset.wrapping_add(r.read(regs).wrapping_mul(u32::from(self.scale)));
-        }
-        if self.word {
-            offset &= 0xffff;
-        }
-        offset.wrapping_add(if self.fs { fs_base } else { 0 })
-    }
-}
-
-#[derive(Clone, Copy)]
-enum Operand {
-    Register(Reg),
-    Memory(Address, u8),
-    Immediate(u32),
-}
-
-impl Operand {
-    fn decode(i: &Instruction, n: u32) -> Option<Self> {
-        Some(match i.op_kind(n) {
-            OpKind::Register => Self::Register(Reg::decode(i.op_register(n))?),
-            OpKind::Memory => {
-                let width = i.memory_size().size();
-                if !matches!(width, 1 | 2 | 4) {
-                    return None;
-                }
-                Self::Memory(Address::decode(i, false)?, width as u8)
-            }
-            OpKind::Immediate8 => Self::Immediate(u32::from(i.immediate8())),
-            OpKind::Immediate16 => Self::Immediate(u32::from(i.immediate16())),
-            OpKind::Immediate32 => Self::Immediate(i.immediate32()),
-            OpKind::Immediate8to16 => Self::Immediate(i.immediate8to16() as u32),
-            OpKind::Immediate8to32 => Self::Immediate(i.immediate8to32() as u32),
-            OpKind::NearBranch32 => Self::Immediate(i.near_branch32()),
-            OpKind::NearBranch16 => Self::Immediate(u32::from(i.near_branch16())),
-            _ => return None,
-        })
-    }
-    fn width(self) -> Option<u8> {
-        match self {
-            Self::Register(r) => Some(r.width),
-            Self::Memory(_, width) => Some(width),
-            Self::Immediate(_) => None,
-        }
-    }
-    fn writable(self) -> bool {
-        !matches!(self, Self::Immediate(_))
     }
 }
 
@@ -1441,6 +1299,24 @@ fn same_width(dst: Operand, src: Operand) -> bool {
     src.width().is_none_or(|w| dst.width() == Some(w))
 }
 
+/// Share the actual decoded integer operations rather than recreating a second
+/// instruction decoder in preparation-time analysis.
+pub(crate) fn integer_operation(i: &Instruction) -> Option<crate::integer::Operation> {
+    use crate::integer::Operation;
+    Some(match predecode(i)? {
+        Action::Nop => Operation::Nop,
+        Action::Mov(a, b, sign) => Operation::Mov(a, b, sign),
+        Action::Lea(r, a) => Operation::Lea(r, a),
+        Action::Binary(m, a, b) => Operation::Binary(m, a, b),
+        Action::Unary(m, a) => Operation::Unary(m, a),
+        Action::Shift(m, a, b) => Operation::Shift(m, a, b),
+        Action::Branch(a, cc) => Operation::Branch(a, cc),
+        Action::Set(a, cc) => Operation::Set(a, cc),
+        Action::Cmov(a, b, cc) => Operation::Cmov(a, b, cc),
+        _ => return None,
+    })
+}
+
 fn predecode(i: &Instruction) -> Option<Action> {
     if let Some(operation) = string_operation(i) {
         return Some(Action::String(operation));
@@ -1480,7 +1356,8 @@ fn predecode(i: &Instruction) -> Option<Action> {
         (dst.writable() && same_width(dst, src)).then_some((dst, src))
     };
     Some(match i.mnemonic() {
-        M::Nop | M::Pause => Action::Nop,
+        // ENDBR32 marks indirect branch targets for CET, never enabled here.
+        M::Nop | M::Pause | M::Endbr32 => Action::Nop,
         M::Cpuid => Action::Cpuid,
         M::Rdtsc => Action::Rdtsc,
         M::Xlatb => Action::Mov(Operand::Register(Reg::decode(R::AL)?), op(0)?, false),
@@ -1592,7 +1469,7 @@ fn predecode(i: &Instruction) -> Option<Action> {
             }
             Action::Bit(i.mnemonic(), dst, index, i.op1_kind() == OpKind::Immediate8)
         }
-        M::Bsf | M::Bsr => {
+        M::Bsf | M::Bsr | M::Tzcnt | M::Lzcnt => {
             let (dst, src) = pair()?;
             if !matches!(dst, Operand::Register(_)) {
                 return None;
@@ -2066,7 +1943,7 @@ impl Transaction {
                     self.store(
                         memory,
                         dst,
-                        if kind == M::Bsf {
+                        if !crate::cpu_profile::reverse_scan(kind) {
                             value.trailing_zeros()
                         } else {
                             31 - value.leading_zeros()
@@ -2079,7 +1956,7 @@ impl Transaction {
                 // specified 16-bit byte swap. Our guest compatibility policy
                 // follows observed Intel execution: clear the low word,
                 // preserve the upper word and all flags. Do not delegate this
-                // undefined host instruction on x64 or invent REV16 on ARM.
+                // undefined REV16 behavior on ARM.
                 let value = if reg.width == 2 {
                     0
                 } else {
@@ -2442,51 +2319,6 @@ fn freeze(operand: Operand, tx: &Transaction) -> Operand {
             width,
         ),
         _ => operand,
-    }
-}
-
-fn mask(width: u8) -> u32 {
-    match width {
-        1 => 0xff,
-        2 => 0xffff,
-        4 => u32::MAX,
-        _ => unreachable!(),
-    }
-}
-
-fn signed(value: u32, width: u8) -> i64 {
-    match width {
-        1 => i64::from(value as i8),
-        2 => i64::from(value as i16),
-        4 => i64::from(value as i32),
-        _ => unreachable!(),
-    }
-}
-
-fn condition_true(condition: ConditionCode, flags: u32) -> bool {
-    use ConditionCode::*;
-    let carry = flags & CF != 0;
-    let zero = flags & ZF != 0;
-    let sign = flags & SF != 0;
-    let overflow = flags & OF != 0;
-    match condition {
-        None => true,
-        o => overflow,
-        no => !overflow,
-        b => carry,
-        ae => !carry,
-        e => zero,
-        ne => !zero,
-        be => carry || zero,
-        a => !carry && !zero,
-        s => sign,
-        ns => !sign,
-        p => flags & PF != 0,
-        np => flags & PF == 0,
-        l => sign != overflow,
-        ge => sign == overflow,
-        le => zero || sign != overflow,
-        g => !zero && sign == overflow,
     }
 }
 

@@ -214,7 +214,6 @@ fn native_mmx_writes_only_destination_exponents_and_supersedes_prior_emms() {
     m.restore_context(&snapshot).unwrap();
     assert_eq!(m.state.mmx[2], 0x89ab_cdef);
     assert_eq!(m.state.mmx_mode, 0);
-    support::x64_shape!(assert_eq!(m.stats.interpreter_entries, 0));
 }
 
 #[test]
@@ -254,36 +253,34 @@ fn native_mmx_write_masks_survive_region_links_and_context_boundaries() {
     assembler.emms().unwrap();
     assembler.ret().unwrap();
     let helper = assembler.assemble(u64::from(HELPER)).unwrap();
-    for links in [false, true] {
-        let mut m = machine(&bytes, true);
-        m.write(HELPER, &helper).unwrap();
-        m.protect(HELPER, 4096, READ | EXEC).unwrap();
-        m.add_region(Region::new(HELPER, helper.len())).unwrap();
-        m.set_region_linking(links);
-        m.state.x87.regs = raw_values();
-        m.state.x87.set_top(4);
-        let before = m.state.x87.regs;
-        m.state.regs[0] = 0x0123_4567;
-        m.state.regs[2] = 0x89ab_cdef;
-        m.state.regs[3] = 0x7654_3210;
-        start(&mut m);
-        assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
-        m.save_context().unwrap();
-        assert_eq!(m.state.x87.tag, 0);
-        assert_eq!(m.state.x87.top(), 0);
-        for (slot, previous) in before.into_iter().enumerate() {
-            let written = match slot {
-                1 => Some(0x0123_4567),
-                3 => Some(0x89ab_cdef),
-                6 => Some(0x7654_3210),
-                _ => None,
-            };
-            assert_eq!(
-                m.state.x87.regs[slot],
-                written.map_or(previous, |bits| X87Register::from_parts(bits, 0xffff)),
-            );
-        }
-        support::x64_shape!(assert_eq!(m.stats.interpreter_entries, 0));
+
+    let mut m = machine(&bytes, true);
+    m.write(HELPER, &helper).unwrap();
+    m.protect(HELPER, 4096, READ | EXEC).unwrap();
+    m.add_region(Region::new(HELPER, helper.len())).unwrap();
+
+    m.state.x87.regs = raw_values();
+    m.state.x87.set_top(4);
+    let before = m.state.x87.regs;
+    m.state.regs[0] = 0x0123_4567;
+    m.state.regs[2] = 0x89ab_cdef;
+    m.state.regs[3] = 0x7654_3210;
+    start(&mut m);
+    assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
+    m.save_context().unwrap();
+    assert_eq!(m.state.x87.tag, 0);
+    assert_eq!(m.state.x87.top(), 0);
+    for (slot, previous) in before.into_iter().enumerate() {
+        let written = match slot {
+            1 => Some(0x0123_4567),
+            3 => Some(0x89ab_cdef),
+            6 => Some(0x7654_3210),
+            _ => None,
+        };
+        assert_eq!(
+            m.state.x87.regs[slot],
+            written.map_or(previous, |bits| X87Register::from_parts(bits, 0xffff)),
+        );
     }
 }
 

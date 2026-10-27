@@ -60,14 +60,15 @@ fn compare_gpu(gpu: &mut Gpu, name: &str, shader: Shader, input: &Inputs, consta
         streams: Vec::new(),
         indices: None,
         vertex_count: 3,
-        vertex_constants: ConstantBlock::default(),
+        vertex_constants: ConstantBlock::default().into(),
         pixel_constants: ConstantBlock {
             floats: constants.f,
             integers: constants.i,
             booleans: constants.b,
             bump_matrix: constants.bump_matrix,
             bump_luminance: constants.bump_luminance,
-        },
+        }
+        .into(),
         textures: Vec::new(),
         parameters: [[0; 4]; 40],
     };

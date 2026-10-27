@@ -3,9 +3,9 @@
 
 The manifest contains a samples list of {id, exe, engine, codepage}. A relative
 exe is resolved under $ADV_SAMPLES, so a checked-in manifest such as
-startup-smoke.json names no local path. Guest files
-are read through the runtime VFS; each run gets a fresh write overlay. Hardware
-audio is always muted. Reaching a frame is startup evidence, not playability.
+startup-smoke.json names no local path. Each run gets a fresh Wine prefix.
+Wine reads and writes the game folder in place. Hardware audio is always muted.
+Reaching a frame is startup evidence, not playability.
 Imported but uncalled APIs are recorded separately from actual failure evidence.
 Optional manifest native_baseline evidence names exe_sha256, outcome, source,
 reviewer and note; codepage may be absent/unknown, otherwise it must match.
@@ -13,7 +13,6 @@ reviewer and note; codepage may be absent/unknown, otherwise it must match.
 "quick": true, or else the first sample of each engine, 10 seconds each.
 A sample's min_seconds (with a min_seconds_reason) raises its own limit for an
 engine whose first frame comes later; it never shortens a longer --seconds.
---warm-from reuses only validated JIT archives in fresh overlays.
 Sample roots are process-only inputs: recorded commands use $ADV_SAMPLES and
 the runner receives a filename relative to its sample working directory.
 """
@@ -26,7 +25,6 @@ import math
 import os
 from pathlib import Path
 import re
-import shutil
 import subprocess
 import time
 
@@ -373,27 +371,6 @@ def quick_samples(samples: list[dict]) -> set[str]:
     return set(first.values())
 
 
-def import_warm_archives(source: Path, folder: Path, sample: dict, binary_hash: str, guest_hash: str) -> dict:
-    """Keep guest state fresh and reject archives from another measured input."""
-    previous = json.loads((source / "results.json").read_text(encoding="utf-8-sig"))
-    row = next((r for r in previous["samples"] if r["id"] == sample["id"]), None)
-    if (previous["binary_sha256"] != binary_hash or row is None
-            or row["guest_exe_sha256"] != guest_hash
-            or row.get("codepage", 932) != sample.get("codepage", 932)):
-        raise ValueError("warm input does not match the runner, guest image and codepage")
-    origin = (source / sample["id"] / "overlay").resolve(strict=True)
-    if not origin.is_relative_to(source.resolve(strict=True)):
-        raise ValueError("warm overlay escapes its run root")
-    overlay = folder / "overlay"
-    overlay.mkdir()
-    inputs = {}
-    for name in ("jit-warm.bin", "jit-code.bin"):
-        archive = origin / name
-        if not archive.is_file() or not archive.resolve().is_relative_to(origin):
-            raise ValueError("warm input is missing an owned JIT archive")
-        inputs[name] = digest(archive)
-        shutil.copy2(archive, overlay / name)
-    return inputs
 
 
 def run(args: argparse.Namespace) -> None:
@@ -433,7 +410,7 @@ def run(args: argparse.Namespace) -> None:
     metadata = {"binary": str(binary), "binary_sha256": digest(binary),
                 "manifest": str(args.manifest.resolve()), "seconds_per_sample": args.seconds,
                 "quick_gate": bool(getattr(args, "quick", False)),
-                "mode": args.mode, "api_mode": args.api_mode, "codec": args.codec, "hardware_muted": True,
+                "mode": args.mode, "codec": args.codec, "hardware_muted": True,
                 "auto_dialog_ms": 50, "qualification": "startup probe, not playability or peak throughput",
                 "classification_schema_version": 1, "samples": []}
     write_json(output / "results.json", metadata)
@@ -445,7 +422,8 @@ def run(args: argparse.Namespace) -> None:
         game = sample_exe(sample)
         seconds = max(args.seconds, sample.get("min_seconds", 0))
         command = [str(binary), game.name, "--" + args.mode, "--audio",
-                   "--codec", args.codec, "--api-mode", args.api_mode, "--seconds", str(seconds),
+                   "--wine", str(args.wine.resolve(strict=True)), "--wine-prefix", str(folder / "prefix"),
+                   "--codec-kernels", args.codec, "--seconds", str(seconds),
                    "--codepage", str(sample.get("codepage", 932)),
                    "--auto-dialog-ms", "50", "--data-dir", str(folder / "overlay"),
                    "--report", str(folder / "report.json"),
@@ -461,9 +439,6 @@ def run(args: argparse.Namespace) -> None:
             recorded_command[1] = sample["exe"]
         result = dict(sample, command=recorded_command, guest_exe_sha256=digest(game))
         result["seconds"] = seconds
-        if getattr(args, "warm_from", None):
-            result["warm_inputs"] = import_warm_archives(args.warm_from, folder, sample,
-                                                        metadata["binary_sha256"], result["guest_exe_sha256"])
         (folder / "cmd.txt").write_text(subprocess.list2cmdline(recorded_command) + "\n" +
             f"binary_sha256={metadata['binary_sha256']}\nguest_exe_sha256={result['guest_exe_sha256']}\n" +
             "environment=" + json.dumps({k: v for k, v in environment.items()
@@ -535,6 +510,7 @@ def run(args: argparse.Namespace) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--wine", required=True, type=Path)
     parser.add_argument("--binary", required=True, type=Path)
     parser.add_argument("--manifest", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
@@ -542,11 +518,9 @@ if __name__ == "__main__":
     parser.add_argument("--seconds", type=float, help="per-sample limit (default 20, or 10 with --quick)")
     parser.add_argument("--quick", action="store_true",
                         help="one sample per engine: those marked \"quick\": true, else each engine's first")
-    parser.add_argument("--warm-from", type=Path, help="previous cold run; copy only matching JIT archives into fresh overlays")
     parser.add_argument("--timeout-grace", type=float, default=15)
     parser.add_argument("--mode", choices=("hidden", "headless"), default="hidden")
     parser.add_argument("--codec", choices=("native", "guest"), default="native")
-    parser.add_argument("--api-mode", choices=("strict", "discovery"), default="strict")
     parser.add_argument("--evidence", type=Path, help="reviewed S1-S4 evidence keyed by sample id, tied to report SHA-256")
     parser.add_argument("--trace", action="store_true", help="diagnostic API trace, not a performance measurement")
     parser.add_argument("--runner-arg", action="append", default=[],

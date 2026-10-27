@@ -10,7 +10,7 @@ publish.workspace = true
 [features]
 default = []
 device = ["dep:cpal"]
-gpu = ["dep:wgpu", "dep:bytemuck", "dep:windows", "dep:objc2", "dep:objc2-metal", "dep:objc2-foundation", "dep:objc2-core-foundation", "dep:objc2-core-graphics", "dep:objc2-io-surface", "dep:block2", "dep:naga-types", "dep:libc", "dep:serde"]
+gpu = ["dep:wgpu", "dep:bytemuck", "dep:objc2", "dep:objc2-metal", "dep:objc2-foundation", "dep:objc2-core-foundation", "dep:objc2-core-graphics", "dep:objc2-io-surface", "dep:block2", "dep:naga-types", "dep:libc", "dep:serde"]
 # FFmpeg movie decoding; needs FFMPEG_DIR (see docs/building.md).
 media = ["dep:ffmpeg-next"]
 # Full DAC rate matrices; `cargo test-full` enables it.
@@ -19,18 +19,25 @@ slow-tests = []
 [dependencies]
 cpal = { version = "0.16", optional = true }
 log.workspace = true
-sha2 = "0.10"
+sha2 = { version = "0.10", features = ["asm"] }
 libc = { version = "0.2", optional = true }
 serde = { version = "1", optional = true, features = ["derive", "rc"] }
 serde_json = "1"
 adv-sync = { path = "../adv-sync" }
+oxisynth = { version = "0.1.0", features = ["sf3"] }
 rubato = { version = "0.16", default-features = false }
 symphonia = { version = "0.5.5", default-features = false, features = ["pcm", "adpcm", "vorbis"] }
 ogg = "0.9.2"
-png = "0.17"
 ffmpeg-next = { version = "8.0", optional = true, default-features = false, features = ["codec", "format", "software-scaling", "software-resampling"] }
-wgpu = { version = "=30.0.1", optional = true, default-features = false, features = ["std", "dx12", "vulkan", "gles", "wgsl"] }
+wgpu = { version = "=30.0.1", optional = true, default-features = false, features = ["std", "vulkan", "gles", "wgsl"] }
 bytemuck = { version = "1.23", optional = true, features = ["derive"] }
+
+# One portable outline/raster stack. Font discovery needs no native fontconfig
+# library or unsafe mapping, including on Android.
+skrifa = "0.44"
+zeno = "0.3.3"
+fontdb = { version = "0.24", default-features = false, features = ["fs"] }
+encoding_rs.workspace = true
 
 [dev-dependencies]
 pollster = "0.4"
@@ -40,25 +47,6 @@ cc = "1"
 
 [target.'cfg(target_vendor = "apple")'.dev-dependencies]
 objc2-io-surface = { version = "0.3.2", default-features = false, features = ["std", "IOSurfaceRef", "IOSurfaceTypes", "libc", "objc2-core-foundation"] }
-
-# ARMv8 SHA-256 instructions, selected at run time, for the pinned font
-# profile's file hashes; the portable code is several times slower.
-[target.'cfg(all(target_arch = "aarch64", not(windows)))'.dependencies]
-sha2 = { version = "0.10", features = ["asm"] }
-
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.60.2", features = ["Win32_Graphics_Gdi", "Win32_Graphics_GdiPlus", "Win32_Foundation", "Win32_Globalization"] }
-# The broad gpu-allocator windows range must select wgpu-hal's ABI version,
-# instead of reusing the older windows crate required by the WASAPI backend.
-windows = { version = "=0.62.2", optional = true }
-
-[target.'cfg(not(windows))'.dependencies]
-# One portable outline/raster stack. Font discovery needs no native fontconfig
-# library or unsafe mapping, including on Android.
-skrifa = "0.44"
-zeno = "0.3.3"
-fontdb = { version = "0.24", default-features = false, features = ["fs"] }
-encoding_rs.workspace = true
 
 [lints]
 workspace = true

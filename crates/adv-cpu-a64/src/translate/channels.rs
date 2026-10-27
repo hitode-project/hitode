@@ -28,7 +28,7 @@ impl Plan {
             let inst = trace.insts[index];
             if (index != start && (trace.head(index) || trace.merge[index]))
                 || inst.mode != Mode::Plain
-                || inst.leaf.is_some()
+                || inst.call.is_some()
                 || checked(inst.pc)
                 || (index != end && (inst.next != Next::Fall || inst.taken.is_some()))
             {
@@ -136,7 +136,7 @@ impl Translator<'_> {
         let Some(plan) = Plan::at(self.trace, index, self.checked) else {
             return;
         };
-        *self.channels = true;
+        *self.uses_permissions = true;
         let scalar = self.asm.label();
         let channels = plan.sources.len() as u32;
         let cost = BATCH * plan.instructions;

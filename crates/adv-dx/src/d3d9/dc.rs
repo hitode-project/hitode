@@ -1,7 +1,9 @@
 //! Explicit GDI access borrows the existing lock/readback and upload paths.
 //! A lease owns its controlling resource and device, including across waits.
 use super::*;
+use crate::interop::DcSurface;
 use adv_abi::types::D3DLOCKED_RECT;
+use adv_device::surface::PixelFormat;
 use adv_device::surface::Rect;
 use resources::{Kind, Lock};
 
@@ -116,11 +118,7 @@ fn acquired(env: &mut Env<'_>, owner: Id, outcome: Outcome) -> Outcome {
                 .iter()
                 .find(|l| l.owner == owner)
                 .unwrap();
-            let result = publish(env, lease);
-            if result != 0 {
-                retire(env, owner);
-            }
-            Outcome::Return(result)
+            publish(env, lease)
         }
         Outcome::Block {
             wait,
@@ -140,52 +138,63 @@ fn acquired(env: &mut Env<'_>, owner: Id, outcome: Outcome) -> Outcome {
         }
     }
 }
-fn publish(env: &mut Env<'_>, lease: Lease) -> u32 {
+fn publish(env: &mut Env<'_>, lease: Lease) -> Outcome {
     if adv_abi::guest::check_range(env.cpu, lease.output.addr(), 4, Prot::WRITE).is_err() {
-        return INVALID;
+        return failed_acquire(env, lease.owner, INVALID);
     }
     let Ok(locked) = GuestPtr::<D3DLOCKED_RECT>::new(lease.scratch).read(env.cpu) else {
-        return INVALID;
+        return failed_acquire(env, lease.owner, INVALID);
     };
     let Some(length) = (locked.Pitch as u32).checked_mul(lease.height) else {
-        return INVALID;
+        return failed_acquire(env, lease.owner, INVALID);
     };
     if locked.Pitch <= 0
         || adv_abi::guest::check_range(env.cpu, locked.pBits, length, Prot::READ).is_err()
     {
-        return INVALID;
+        return failed_acquire(env, lease.owner, INVALID);
     }
     let provider = env.ext.get::<State>().provider;
-    let dc = match (provider.acquire_dc)(
-        env,
-        lease.width,
-        lease.height,
-        locked.pBits,
-        locked.Pitch as u32,
-    ) {
-        Ok(dc) if dc != 0 => dc,
-        result => {
-            adv_abi::warn_unavailable(
-                env,
-                "IDirect3DSurface9::GetDC",
-                &format!("GDI canvas allocation failed: {result:?}"),
-            );
-            return OUT_OF_MEMORY;
-        }
+    let surface = DcSurface {
+        surface: None,
+        pixels: locked.pBits,
+        width: lease.width,
+        height: lease.height,
+        pitch: locked.Pitch as u32,
+        format: PixelFormat::Bgra32,
     };
-    let selected = env
-        .ext
-        .get_mut::<State>()
-        .dcs
-        .iter_mut()
-        .find(|l| l.owner == lease.owner)
-        .unwrap();
-    selected.dc = dc;
-    if lease.output.write(env.cpu, dc).is_err() {
-        return INVALID;
-    }
-    selected.phase = Phase::Active;
-    0
+    (provider.dc.create)(
+        env,
+        surface,
+        Box::new(move |env, result| {
+            let dc = match result {
+                Ok(dc) if dc != 0 => dc,
+                result => {
+                    adv_abi::warn_unavailable(
+                        env,
+                        "IDirect3DSurface9::GetDC",
+                        &format!("GDI canvas allocation failed: {result:?}"),
+                    );
+                    return failed_acquire(env, lease.owner, OUT_OF_MEMORY);
+                }
+            };
+            let selected = env
+                .ext
+                .get_mut::<State>()
+                .dcs
+                .iter_mut()
+                .find(|l| l.owner == lease.owner)
+                .unwrap();
+            selected.dc = dc;
+            if lease.output.write(env.cpu, dc).is_err() {
+                return failed_acquire(env, lease.owner, INVALID);
+            }
+            selected.phase = Phase::Active;
+            Outcome::Return(0)
+        }),
+    )
+}
+fn failed_acquire(env: &mut Env<'_>, owner: Id, error: u32) -> Outcome {
+    close(env, owner, Box::new(move |_, _| Outcome::Return(error)))
 }
 
 #[win32(d3d9, name = "IDirect3DSurface9::ReleaseDC", level = implement)]
@@ -212,9 +221,14 @@ fn release(env: &mut Env<'_>, this: GuestPtr<()>, dc: Handle) -> Outcome {
         return Outcome::Return(INVALID);
     }
     let provider = env.ext.get::<State>().provider;
-    if (provider.writeback_dc)(env, dc.0, storage, pitch).is_err() {
-        return Outcome::Return(INVALID);
-    }
+    let surface = DcSurface {
+        surface: None,
+        pixels: storage,
+        width: lease.width,
+        height: lease.height,
+        pitch,
+        format: PixelFormat::Bgra32,
+    };
     let selected = env
         .ext
         .get_mut::<State>()
@@ -224,15 +238,34 @@ fn release(env: &mut Env<'_>, this: GuestPtr<()>, dc: Handle) -> Outcome {
         .unwrap();
     selected.phase = Phase::Releasing;
     selected.context = env.context;
-    let outcome = readback::unlock_internal(env, this);
-    released(env, lease.owner, outcome)
+    (provider.dc.flush)(
+        env,
+        dc.0,
+        surface,
+        Box::new(move |env, result| {
+            if result.is_err() {
+                env.ext
+                    .get_mut::<State>()
+                    .dcs
+                    .iter_mut()
+                    .find(|l| l.owner == lease.owner)
+                    .unwrap()
+                    .phase = Phase::Active;
+                return Outcome::Return(INVALID);
+            }
+            let outcome = readback::unlock_internal(env, this);
+            released(env, lease.owner, outcome)
+        }),
+    )
 }
+
 fn released(env: &mut Env<'_>, owner: Id, outcome: Outcome) -> Outcome {
     match outcome {
-        Outcome::Return(0) => {
-            retire(env, owner);
-            Outcome::Return(0)
-        }
+        Outcome::Return(0) => close(
+            env,
+            owner,
+            Box::new(|_, result| Outcome::Return(if result.is_ok() { 0 } else { INVALID })),
+        ),
         Outcome::Block {
             wait,
             then,
@@ -294,6 +327,35 @@ fn drop_ref(env: &mut Env<'_>, id: Id) {
         destroy(env, dead);
     }
 }
+fn close(env: &mut Env<'_>, owner: Id, then: crate::interop::DcFinished) -> Outcome {
+    let lease = *env
+        .ext
+        .get::<State>()
+        .dcs
+        .iter()
+        .find(|l| l.owner == owner)
+        .unwrap();
+    if lease.dc == 0 {
+        retire(env, owner);
+        return then(env, Ok(()));
+    }
+    let provider = env.ext.get::<State>().provider;
+    (provider.dc.release)(
+        env,
+        lease.dc,
+        Box::new(move |env, result| {
+            env.ext
+                .get_mut::<State>()
+                .dcs
+                .iter_mut()
+                .find(|l| l.owner == owner)
+                .unwrap()
+                .dc = 0;
+            retire(env, owner);
+            then(env, result)
+        }),
+    )
+}
 fn retire(env: &mut Env<'_>, owner: Id) {
     let Some(index) = env
         .ext
@@ -308,7 +370,7 @@ fn retire(env: &mut Env<'_>, owner: Id) {
     reserve(env, lease, false);
     if lease.dc != 0 {
         let provider = env.ext.get::<State>().provider;
-        (provider.release_dc)(env, lease.dc);
+        (provider.dc.discard)(env, lease.dc);
     }
     free(env, lease.scratch);
     drop_ref(env, lease.owner);

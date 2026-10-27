@@ -173,10 +173,38 @@ impl WideStr {
 pub struct Arguments<'a> {
     cpu: &'a dyn Guest,
     word: u32,
+    stack: Option<&'a [u8]>,
 }
 impl<'a> Arguments<'a> {
     pub fn new(cpu: &'a dyn Guest) -> Self {
-        Self { cpu, word: 0 }
+        Self {
+            cpu,
+            word: 0,
+            stack: None,
+        }
+    }
+    /// Borrow a known signature's readable stack span once. Backends without
+    /// ordinary shared storage retain the word-at-a-time decoder and its faults.
+    pub fn with_words(cpu: &'a dyn Guest, words: u8) -> Self {
+        if words == 0 {
+            return Self::new(cpu);
+        }
+        let stack = cpu.reg(Reg::Esp).checked_add(4).and_then(|address| {
+            let length = u32::from(words) * 4;
+            check_range(cpu, address, length, Prot::READ).ok()?;
+            cpu.shared_bytes(address, length as usize)
+        });
+        Self {
+            cpu,
+            word: 0,
+            stack,
+        }
+    }
+    fn borrowed(&mut self, length: usize) -> Option<&'a [u8]> {
+        let start = self.word as usize * 4;
+        let bytes = self.stack?.get(start..start + length)?;
+        self.word += (length as u32).div_ceil(4);
+        Some(bytes)
     }
     #[allow(
         clippy::should_implement_trait,
@@ -188,6 +216,9 @@ impl<'a> Arguments<'a> {
     /// x86 aggregate parameters are copied by value and rounded up to stack words.
     pub fn pod<T: bytemuck::Pod>(&mut self) -> Result<T, MemFault> {
         let length = core::mem::size_of::<T>() as u32;
+        if let Some(bytes) = self.borrowed(length as usize) {
+            return Ok(bytemuck::pod_read_unaligned(bytes));
+        }
         let addr = self
             .cpu
             .reg(Reg::Esp)
@@ -204,6 +235,9 @@ impl<'a> Arguments<'a> {
         Ok(value)
     }
     fn word(&mut self) -> Result<u32, MemFault> {
+        if let Some(bytes) = self.borrowed(4) {
+            return Ok(u32::from_le_bytes(bytes.try_into().unwrap()));
+        }
         let addr = self
             .cpu
             .reg(Reg::Esp)

@@ -1,9 +1,7 @@
 //! Host-facing control of the platform's execution engine.
 //!
-//! Shells configure, report and persist the engine only through [`Engine`],
-//! so the engine behind the `adv-cpu` facade can differ per target
-//! architecture. Options an engine does not have are ignored, and report
-//! fields belong to the engine that produced them.
+//! Shells configure, report and persist the engine through [`Engine`]. Options
+//! the translator does not use are ignored, and report fields describe its work.
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 

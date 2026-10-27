@@ -22,8 +22,8 @@ fn backends() -> impl Iterator<Item = bool> {
 fn draw() -> ProgrammableDraw {
     let mut draw = ProgrammableDraw {
         program: Program::new("struct C { f: array<vec4<f32>,256> }; @group(0) @binding(1) var<uniform> c:C; @vertex fn vertex_main(@location(0) p:vec4<f32>)->@builtin(position) vec4<f32> { return p; } @fragment fn fragment_main()->@location(0) vec4<f32> { return c.f[0]; }".into(), vec![]),
-        streams: vec![VertexStream { stride: 16, bytes: bytemuck::cast_slice(&[[-1f32,-1.,0.5,1.], [3.,-1.,0.5,1.], [-1.,3.,0.5,1.]]).to_vec(), attributes: vec![Attribute { location: 0, offset: 0, format: AttributeFormat::Float4 }] }],
-        indices: None, vertex_count: 3, vertex_constants: ConstantBlock::default(), pixel_constants: ConstantBlock::default(), textures: vec![], parameters: [[0;4];40],
+        streams: vec![VertexStream { stride: 16, bytes: bytemuck::cast_slice(&[[-1f32,-1.,0.5,1.], [3.,-1.,0.5,1.], [-1.,3.,0.5,1.]]).to_vec().into(), attributes: vec![Attribute { location: 0, offset: 0, format: AttributeFormat::Float4 }] }],
+        indices: None, vertex_count: 3, vertex_constants: ConstantBlock::default().into(), pixel_constants: ConstantBlock::default().into(), textures: vec![], parameters: [[0;4];40],
     };
     draw.pixel_constants.floats[0] = [0., 1., 0., 1.];
     draw
@@ -287,6 +287,54 @@ fn depth_clears_wait_for_a_pass_that_attaches_depth() {
 
 // spec: GFX-PASS-3
 #[test]
+fn clipped_repeated_depth_clears_stay_deferred_until_depth_is_used() {
+    for native in backends() {
+        let mut gpu = gpu(native);
+        let target = gpu.target(4, 4, true).unwrap();
+        let green = draw();
+        let mut red = draw();
+        red.pixel_constants.floats[0] = [1., 0., 0., 1.];
+        gpu.clear(&target, Some([0., 0., 0., 1.]), Some(1.))
+            .unwrap();
+        let mut state = DrawState::new(4, 4);
+        state.depth = Some(Compare::Never);
+        gpu.draw_programmable(&target, &green, &state).unwrap();
+        read(&mut gpu, &target.image);
+        let before = gpu.stats();
+        state.depth = None;
+        for width in [2, 1, 2] {
+            gpu.set_clip(Some(Rect { w: width, ..FULL }));
+            gpu.clear_region(&target, FULL, Some([1., 0., 0., 1.]), Some(0.25), None)
+                .unwrap();
+            gpu.draw_programmable(&target, &green, &state).unwrap();
+            gpu.clear_region(&target, FULL, None, Some(0.25), None)
+                .unwrap();
+            read(&mut gpu, &target.image);
+        }
+        let after = gpu.stats();
+        assert_eq!(after.passes - before.passes, 3);
+        assert_eq!(after.color_loads - before.color_loads, 3);
+        assert_eq!(after.depth_loads - before.depth_loads, 0);
+        gpu.set_clip(None);
+        state.depth = Some(Compare::Less);
+        gpu.draw_programmable(&target, &red, &state).unwrap();
+        let pixels = read(&mut gpu, &target.image);
+        for (at, pixel) in pixels.as_chunks::<4>().0.iter().enumerate() {
+            assert_eq!(
+                *pixel,
+                if at % 4 < 2 {
+                    [0, 255, 0, 255]
+                } else {
+                    [0, 0, 255, 255]
+                },
+                "pixel {at}"
+            );
+        }
+    }
+}
+
+// spec: GFX-PASS-3
+#[test]
 fn a_partial_depth_clear_follows_the_deferred_whole_clear() {
     for native in backends() {
         let mut gpu = gpu(native);
@@ -369,5 +417,42 @@ fn staged_uploads_land_after_pending_clears_and_recycle_their_buffer() {
             "the pooled buffer is reused"
         );
         drop(again);
+    }
+}
+
+// spec: DEV-UPDATE-4, GFX-PASS-1
+#[test]
+fn compact_alpha_upload_keeps_padding_and_pixels_outside_the_rectangle() {
+    for native in backends() {
+        let mut gpu = gpu(native);
+        let image = gpu.image(4, 4).unwrap();
+        let target = Target {
+            image: image.clone(),
+            depth: None,
+        };
+        gpu.clear(&target, Some([1., 0., 0., 1.]), None).unwrap();
+        gpu.upload_alpha(
+            &image,
+            Rect {
+                x: 1,
+                y: 1,
+                w: 2,
+                h: 2,
+            },
+            3,
+            &[64, 128, 99, 255, 17],
+        )
+        .unwrap();
+        let pixels = read(&mut gpu, &image);
+        for (n, pixel) in pixels.as_chunks::<4>().0.iter().enumerate() {
+            let expected = match n {
+                5 => [0, 0, 0, 64],
+                6 => [0, 0, 0, 128],
+                9 => [0, 0, 0, 255],
+                10 => [0, 0, 0, 17],
+                _ => [0, 0, 255, 255],
+            };
+            assert_eq!(*pixel, expected);
+        }
     }
 }

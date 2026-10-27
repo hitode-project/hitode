@@ -5,17 +5,29 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 /// A caller-owned trap receiver. API decoding and all host continuation state
 /// belong to the machine and ABI layers, outside the execution layer.
 pub trait ExecutionTrap {
-    fn leaf_call(&self, _pc: u32, _word: u32) -> bool {
-        false
+    /// See [`crate::backend::TrapHandler::native_region`].
+    fn native_region(&self, _pc: u32, _code: &[u8]) -> Vec<crate::native_region::NativeRegion> {
+        Vec::new()
     }
 
-    fn leaf(
+    /// See [`crate::backend::TrapHandler::host_thunk`].
+    fn host_thunk(&self, _pc: u32, _word: u32) -> Option<u32> {
+        None
+    }
+
+    /// `call` for the INT 0x2e of a pair `host_thunk` recognized as
+    /// `thunk`, its token still pushed.
+    fn host_call(
         &mut self,
-        _state: &mut CpuState,
-        _memory: &mut Memory,
-        _pc: u32,
-        _word: u32,
-    ) -> Option<u64> {
+        state: &mut CpuState,
+        memory: &mut Memory,
+        _thunk: u32,
+    ) -> Result<bool, String> {
+        self.call(state, memory, 0x2e)
+    }
+
+    /// See [`crate::backend::TrapHandler::redirect`].
+    fn redirect(&self, _pc: u32) -> Option<(u32, &[u8])> {
         None
     }
 
@@ -102,6 +114,24 @@ pub unsafe extern "C" fn read_timestamp(bridge: *mut u8) -> u64 {
 }
 
 pub fn call_trap(bridge: &mut Bridge<'_>, state: &mut CpuState, vector: u32) -> u32 {
+    trap(bridge, state, vector, |handler, state, memory| {
+        handler.call(state, memory, vector)
+    })
+}
+
+/// `call_trap` for a host call `ExecutionTrap::host_thunk` recognized.
+pub fn call_host(bridge: &mut Bridge<'_>, state: &mut CpuState, thunk: u32) -> u32 {
+    trap(bridge, state, 0x2e, |handler, state, memory| {
+        handler.host_call(state, memory, thunk)
+    })
+}
+
+fn trap(
+    bridge: &mut Bridge<'_>,
+    state: &mut CpuState,
+    vector: u32,
+    call: impl FnOnce(&mut dyn ExecutionTrap, &mut CpuState, &mut Memory) -> Result<bool, String>,
+) -> u32 {
     state.commit_mmx();
     let Some(handler) = bridge.handler.as_mut() else {
         bridge.trap = Some((state.eip, vector as u8));
@@ -111,7 +141,7 @@ pub fn call_trap(bridge: &mut Bridge<'_>, state: &mut CpuState, vector: u32) -> 
     let pc = state.eip;
     bridge.calls += 1;
     let result = catch_unwind(AssertUnwindSafe(|| {
-        handler.call(state, unsafe { &mut *bridge.memory }, vector)
+        call(&mut **handler, state, unsafe { &mut *bridge.memory })
     }))
     .unwrap_or_else(|_| Err("CPU trap handler panicked".into()));
     bridge.clock_due = true;

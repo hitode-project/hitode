@@ -9,17 +9,14 @@ The fixtures retain the observed failures as regression assertions.
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
 import io
 import json
 import math
-import os
 from pathlib import Path
 import subprocess
 import tempfile
-from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import frame_budget as budget
 import play_session
@@ -233,110 +230,7 @@ class SummaryTrustAudit(SyntheticAudit):
                     self.assertIn(row.get("run_status"), ("failed", "incomplete"))
 
 
-class LockAudit(SyntheticAudit):
-    def test_owner_write_failure_releases_the_directory_it_just_created(self):
-        lock = self.root / "device-lock"
-        original_write = Path.write_text
-
-        def write(path, *args, **kwargs):
-            if path == lock / "owner.txt":
-                raise OSError("synthetic owner write failure")
-            return original_write(path, *args, **kwargs)
-
-        with patch.object(budget, "os", SimpleNamespace(name="posix")), \
-                patch.object(Path, "write_text", write), self.assertRaises(OSError):
-            with budget.device_lock(lock, self.root):
-                self.fail("an owner write failure must prevent entry")
-        self.assertFalse(lock.exists())
-
-    def test_competing_owner_finishing_requires_a_fresh_sixty_second_gap(self):
-        lock = self.root / "device-lock"
-        lock.mkdir()
-        (lock / "owner.txt").write_text("synthetic-other-owner", encoding="utf-8")
-        current = [100.0]
-
-        def sleep(seconds):
-            current[0] += seconds
-            if (lock / "owner.txt").exists():
-                (lock / "owner.txt").unlink()
-                lock.rmdir()
-                (self.root / "last-lock-end.txt").write_text(str(current[0]), encoding="utf-8")
-
-        with patch.object(budget, "os", SimpleNamespace(name="posix")), \
-                patch.object(budget.time, "time", side_effect=lambda: current[0]), \
-                patch.object(budget.time, "monotonic", side_effect=lambda: current[0]), \
-                patch.object(budget.time, "sleep", side_effect=sleep), patch("builtins.print"):
-            with budget.device_lock(lock, self.root):
-                self.assertGreaterEqual(current[0], 190.0)
-
-    def test_changed_foreign_owner_is_never_deleted(self):
-        lock = self.root / "device-lock"
-        with patch.object(budget, "os", SimpleNamespace(name="posix")):
-            with budget.device_lock(lock, self.root):
-                (lock / "owner.txt").write_text("synthetic-other-owner", encoding="utf-8")
-        self.assertEqual((lock / "owner.txt").read_text(), "synthetic-other-owner")
-
-
-class CleanupAudit(SyntheticAudit):
-    def mocked_android_run(self, mkdir_fails=False, cleanup_fails=False):
-        samples = self.root / "samples"
-        (samples / "fixture").mkdir(parents=True)
-        binary = self.root / "runner.txt"
-        binary.touch()
-        schedules = self.root / "scenarios"
-        schedules.mkdir()
-        budget.write_json(schedules / "frame-budget-fixture.json", scenario())
-        args = argparse.Namespace(output=self.root / "output", binary=binary,
-                                  games=["fixture"], heats=["cold"], platform="android",
-                                  no_instrumentation=False, perf_map=False, seed_root=None,
-                                  font_profile_source=None, device_lock=self.root / "mock-lock",
-                                  adb="adb", serial="", adb_port=5037, transfer_timeout=1)
-        client = Mock()
-        if mkdir_fails:
-            client.shell.side_effect = RuntimeError("synthetic mkdir collision")
-        owned = "/data/local/tmp/adv-host-sample-" + "1" * 32
-
-        def run_child(command, log, timeout):
-            output = Path(command[command.index("--output") + 1])
-            output.mkdir()
-            budget.write_json(output / "session.json", {"remote_run_directory": owned})
-            (output / "remote-owned.txt").write_text(owned, encoding="utf-8")
-            return 0
-
-        @contextmanager
-        def lock(*args):
-            yield math.inf
-
-        cleanup = Mock(side_effect=[RuntimeError("synthetic cleanup failure"), None]
-                       if cleanup_fails else None)
-        with patch.dict(os.environ, ADV_SAMPLES=str(samples), ADV_ARTIFACT_ROOT=str(self.root)), \
-                patch.object(budget, "SCENARIOS", schedules), \
-                patch.object(budget.replay, "Adb", return_value=client), \
-                patch.object(budget, "device_lock", lock), \
-                patch.object(budget, "cleanup_remote", cleanup), \
-                patch.object(budget, "run_child", side_effect=run_child), \
-                patch.object(budget, "digest", return_value="a" * 64), \
-                patch.object(budget.subprocess, "check_output", return_value=b"synthetic revision"), \
-                patch("builtins.print"):
-            try:
-                budget.run(args)
-            except RuntimeError:
-                if not cleanup_fails:
-                    raise
-        return cleanup, owned
-
-    def test_failed_remote_mkdir_does_not_authorize_recursive_cleanup(self):
-        cleanup, _ = self.mocked_android_run(mkdir_fails=True)
-        cleanup.assert_not_called()
-
-    def test_one_cleanup_failure_does_not_skip_the_other_owned_directory(self):
-        cleanup, owned = self.mocked_android_run(cleanup_fails=True)
-        roots = [call.args[1] for call in cleanup.call_args_list]
-        self.assertIn(owned, roots)
-        self.assertTrue(any(root.startswith("/data/local/tmp/adv-host-bud-") for root in roots))
-
-
-class WindowsProtocolAudit(SyntheticAudit):
+class ReplayProtocolAudit(SyntheticAudit):
     def run_fake_session(self, reply=None, report_changes=None):
         binary = self.root / "runner.txt"
         guest = self.root / "fixture.txt"
@@ -347,13 +241,13 @@ class WindowsProtocolAudit(SyntheticAudit):
                 "frame_fnv1a64": END_HASH, "timeout_ms": 1000, "hold_key": 17}}]}
         self.write("schedule.json", scene)
         output = self.root / "output"
-        args = argparse.Namespace(binary=binary, exe=guest, schedule=self.root / "schedule.json",
+        args = argparse.Namespace(wine=self.root, binary=binary, exe=guest, schedule=self.root / "schedule.json",
                                   output=output, seed_data=None, audio=False, mode="headless",
                                   capture_audio=False, trace=False, tail_seconds=0, codepage=932,
-                                  codec="native", sync_compilation=False,
-                                  no_tiering=False, cold=True)
+                                  codec="native")
 
         class Runner:
+            pid = 123
             returncode = None
 
             def __init__(self):
@@ -377,29 +271,24 @@ class WindowsProtocolAudit(SyntheticAudit):
         with patch.object(play_session.subprocess, "Popen", side_effect=launch), patch("builtins.print"):
             play_session.run(args)
 
-    def test_windows_rejects_the_wrong_acknowledgement_verb(self):
+    def test_replay_rejects_the_wrong_acknowledgement_verb(self):
         with self.assertRaises(RuntimeError):
             self.run_fake_session(reply="control ok key-up 17")
 
-    def test_windows_gate_checks_ack_hash_frame_and_release(self):
+    def test_replay_gate_checks_ack_hash_frame_and_release(self):
         with self.assertRaises(RuntimeError):
             self.run_fake_session(reply=gate_reply(frame_hash=START_HASH, release_posted="false"))
 
-    def test_windows_report_must_match_the_frozen_gate_receipt(self):
+    def test_replay_report_must_match_the_frozen_gate_receipt(self):
         with self.assertRaises(RuntimeError):
             self.run_fake_session(report_changes={"frames": 23,
                                   "scene_gate": {"frozen": False, "pending": True}})
 
-    def test_failed_windows_checkpoint_is_not_performance_eligible(self):
+    def test_failed_replay_checkpoint_is_not_performance_eligible(self):
         with self.assertRaises(RuntimeError):
             self.run_fake_session(report_changes={"failure": "synthetic failure"})
         metadata = budget.load_json(self.root / "output" / "session.json")
         self.assertFalse(metadata["suitable_for_performance_comparison"])
-
-
-class TransportClassificationAudit(unittest.TestCase):
-    def test_push_failed_is_a_retryable_transport_marker(self):
-        self.assertTrue(budget.replay.Adb.transient_transport_error("adb: Push failed"))
 
 
 if __name__ == "__main__":

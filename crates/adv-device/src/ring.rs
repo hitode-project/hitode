@@ -149,9 +149,11 @@ impl RingVoice {
     }
     pub(crate) fn reanchor(&mut self, now: f64) {
         if let Some(at) = self.detached_at.take() {
+            let first = self.phase >> 32;
             let delta = (now - at) * f64::from(self.frequency) * 4294967296.0 / 1_000_000.0;
             let minimum = (self.minimum_position / u64::from(self.align())) << 32;
             self.phase = ((self.phase as f64 + delta).max(minimum as f64)) as u64;
+            self.crossed_notifications(first, self.phase >> 32);
             self.read_frame = self.phase >> 32;
             self.converter.reset();
         }
@@ -415,7 +417,9 @@ impl RingVoice {
                 self.draining = self.draining.saturating_sub(1);
             }
         }
-        let last = self.phase >> 32;
+        self.crossed_notifications(first, self.phase >> 32);
+    }
+    fn crossed_notifications(&mut self, first: u64, last: u64) {
         let total = self.frames();
         for (i, &(offset, _)) in self.notifications.iter().enumerate() {
             if offset == u32::MAX || (!self.looping && first >= total) {
@@ -459,6 +463,38 @@ mod tests {
         fn load_u8(&self, _: usize) -> u8 {
             128
         }
+    }
+
+    // spec: DEV-AUDIO-2
+    #[test]
+    fn device_reanchoring_preserves_start_and_crossed_refill_notifications() {
+        let mut voice = RingVoice::new(RingConfig {
+            view: Arc::new(Silence),
+            bytes: 131,
+            channels: 1,
+            bits: 8,
+            frequency: 1000,
+            output_rate: 1000,
+            notifications: vec![(0, 1), (64, 2), (130, 3)],
+        })
+        .unwrap();
+        voice.written(0, 131);
+        voice.play(true);
+        voice.detach(1_000_000.0);
+        voice.reanchor(1_120_000.0);
+        let mut sent = Vec::new();
+        voice.notifications(|event| {
+            sent.push(event);
+            true
+        });
+        assert_eq!(sent, [1, 2]);
+        sent.clear();
+        voice.render(&mut [0.0; 20], 1, 1000, &mut [0]);
+        voice.notifications(|event| {
+            sent.push(event);
+            true
+        });
+        assert_eq!(sent, [1, 3]);
     }
 
     // spec: MEDIA-AUDIO-4

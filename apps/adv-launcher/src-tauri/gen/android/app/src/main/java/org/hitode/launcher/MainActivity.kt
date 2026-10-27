@@ -156,6 +156,20 @@ class MainActivity : TauriActivity() {
         }
     }
 
+    /** Opens drive C: of the Wine prefix in the system Files app. */
+    fun revealDrive(): Boolean {
+        val uri = DocumentsContract.buildRootUri(DriveProvider.AUTHORITY, DriveProvider.ROOT)
+        val intent = Intent(Intent.ACTION_VIEW)
+            .setDataAndType(uri, DocumentsContract.Root.MIME_TYPE_ITEM)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_LAUNCH_ADJACENT)
+        return try {
+            startActivity(intent)
+            true
+        } catch (_: ActivityNotFoundException) {
+            false
+        }
+    }
+
     fun setCursor(shown: Boolean, x: Float, y: Float) {
         container?.setCursor(shown, x, y)
     }

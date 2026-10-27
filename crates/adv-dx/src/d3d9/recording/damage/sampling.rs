@@ -2,7 +2,7 @@
 use super::*;
 use crate::shader::{
     Opcode, Register, RegisterKind, Shader, SourceModifier,
-    interpreter::{self, Constants, Outputs},
+    interpreter::{self, Outputs},
 };
 use adv_device::gpu::{Address, Filter, Sampler, Topology};
 
@@ -281,7 +281,13 @@ fn draw_reads(env: &Env<'_>, device: &Device, draw: &fixed::Draw) -> Option<Vec<
     let vertex = device
         .shaders
         .vertex
-        .filter(|_| draw.vertices.is_empty())
+        .filter(|_| {
+            draw.vertices.is_empty()
+                && draw
+                    .programmable
+                    .as_ref()
+                    .is_none_or(|p| p.parameters[15][0] == 0)
+        })
         .and_then(|id| shaders::bound(env, id));
     if vertex.is_some_and(|v| {
         v.translation
@@ -366,11 +372,17 @@ fn vertices(
     vertex: Option<&Shader>,
     pixel: Option<&Shader>,
 ) -> Option<Vec<Vertex>> {
-    let count = vertex.map_or(draw.vertices.len(), |_| {
+    let transformed = draw
+        .programmable
+        .as_ref()
+        .is_some_and(|p| p.parameters[15][0] != 0);
+    let count = if vertex.is_none() && !transformed {
+        draw.vertices.len()
+    } else {
         draw.programmable
             .as_ref()
             .map_or(0, |p| p.vertex_count as usize)
-    });
+    };
     if !(3..=64).contains(&count) {
         return None;
     }
@@ -379,20 +391,31 @@ fn vertices(
     for n in 0..count {
         let mut output = if let Some(vertex) = vertex {
             let program = draw.programmable.as_ref()?;
-            let constants = Constants {
-                f: program.vertex_constants.floats,
-                i: program.vertex_constants.integers,
-                b: program.vertex_constants.booleans,
-                bump_matrix: program.vertex_constants.bump_matrix,
-                bump_luminance: program.vertex_constants.bump_luminance,
-            };
             interpreter::run(
                 vertex,
                 &vertex_input(program, n as u32)?,
-                &constants,
+                &program.vertex_constants,
                 &mut interpreter::NoTextures,
             )
             .ok()?
+        } else if transformed {
+            let p = draw.programmable.as_ref()?;
+            let input = vertex_input(p, n as u32)?;
+            let mut output = Outputs {
+                position: programmable::transformed::position(input.v[0], draw.state.viewport)?,
+                colors: [[1.; 4], [0.; 4]],
+                ..Default::default()
+            };
+            for stream in &p.streams {
+                for a in &stream.attributes {
+                    match a.location {
+                        1 => output.colors[0] = input.v[1],
+                        n @ 2..=9 => output.texcoords[(n - 2) as usize] = input.v[n as usize],
+                        _ => {}
+                    }
+                }
+            }
+            output
         } else {
             let v = draw.vertices.get(n)?;
             let mut output = Outputs {

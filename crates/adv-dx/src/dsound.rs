@@ -81,6 +81,8 @@ const CLSID_DEVICE: [u8; 16] = [
 const CLSID_DEVICE8: [u8; 16] = [
     0x3f, 0xcc, 0x01, 0x39, 0xb5, 0x84, 0xa4, 0x4f, 0xba, 0x35, 0xaa, 0x81, 0x72, 0xb8, 0xa0, 0x9b,
 ];
+/// The classes `CoCreateInstance` activates through this front.
+pub const CLASSES: [[u8; 16]; 2] = [CLSID_DEVICE, CLSID_DEVICE8];
 const IID_BUFFER: [u8; 16] = [
     0x85, 0xfa, 0x9a, 0x27, 0x81, 0x49, 0xce, 0x11, 0xa5, 0x21, 0, 0x20, 0xaf, 0x0b, 0xe5, 0x60,
 ];
@@ -297,6 +299,25 @@ pub struct Sound {
     trace_pcm_dir: Option<std::path::PathBuf>,
     trace_pcm_chunks: bool,
     playback_clock: Arc<adv_device::clock::PlaybackClock>,
+    host: Host,
+}
+
+/// What a userland other than the built-in one answers for the front.
+#[derive(Clone, Copy, Default)]
+pub struct Host {
+    /// Guest storage for objects; the process heap when absent.
+    pub allocator: Option<crate::interop::GuestAllocator>,
+    /// Notification events; machine events when absent.
+    pub events: Option<Events>,
+}
+
+/// Notification events that are not machine objects.
+#[derive(Clone, Copy)]
+pub struct Events {
+    /// Whether `handle` may receive position notifications.
+    pub valid: fn(&mut Env<'_>, u32) -> bool,
+    /// Signal `handle` with audio wake priority.
+    pub signal: fn(&mut Env<'_>, u32) -> Result<(), String>,
 }
 impl Sound {
     /// A mixer stream id for another front's owned PCM (movie audio).
@@ -396,7 +417,7 @@ fn unavailable_create8(
 }
 pub fn install<B: Backend>(m: &mut Machine<B>) -> Result<(), String> {
     let audio = AudioControl::new(!m.sys.clock.is_virtual());
-    install_audio(m, audio, false)
+    install_audio(m, audio, false, Host::default())
 }
 
 /// Install process-local COM objects over the session's existing audio stream.
@@ -405,13 +426,24 @@ pub fn install_with_audio<B: Backend>(
     m: &mut Machine<B>,
     audio: AudioControl,
 ) -> Result<(), String> {
-    install_audio(m, audio, true)
+    install_audio(m, audio, true, Host::default())
+}
+
+/// Install the front over `audio` with `host`'s storage and events, for a
+/// userland whose process heap and events are not the built-in stack's.
+pub fn install_on_host<B: Backend>(
+    m: &mut Machine<B>,
+    audio: AudioControl,
+    host: Host,
+) -> Result<(), String> {
+    install_audio(m, audio, true, host)
 }
 
 fn install_audio<B: Backend>(
     m: &mut Machine<B>,
     audio: AudioControl,
     shared: bool,
+    host: Host,
 ) -> Result<(), String> {
     let trace = std::env::var_os("ADV_AUDIO_TRACE")
         .map(|path| {
@@ -493,6 +525,7 @@ fn install_audio<B: Backend>(
         trace_pcm_dir,
         trace_pcm_chunks: std::env::var_os("ADV_AUDIO_DUMP_CHUNKS").is_some(),
         playback_clock,
+        host,
     });
     let classes = m.ext.get_or_default::<adv_os::com::ClassFactories>();
     classes.register(CLSID_DEVICE, create_class);
@@ -552,12 +585,34 @@ fn create_com_device(
     Outcome::Return(0)
 }
 fn alloc(e: &mut Env<'_>, len: u32) -> Option<u32> {
+    if let Some(allocator) = e.ext.get::<Sound>().host.allocator {
+        return (allocator.allocate)(e, len);
+    }
     let heaps = e.ext.get_mut::<Heaps>();
     heaps.alloc(e.cpu, &mut e.sys.vm, heaps.process_heap, len, true)
 }
 fn free(e: &mut Env<'_>, ptr: u32) {
+    if let Some(allocator) = e.ext.get::<Sound>().host.allocator {
+        return (allocator.free)(e, ptr);
+    }
     let heaps = e.ext.get_mut::<Heaps>();
     heaps.free(e.cpu, &mut e.sys.vm, heaps.process_heap, ptr);
+}
+
+/// Signal position notifications on the calling thread.
+fn notify(e: &mut Env<'_>, handles: Vec<u32>) -> Result<(), String> {
+    match e.ext.get::<Sound>().host.events {
+        Some(events) => handles
+            .into_iter()
+            .try_for_each(|handle| (events.signal)(e, handle)),
+        None => {
+            for handle in handles {
+                e.sys
+                    .set_event_with_priority(handle, adv_machine::WakePriority::Audio);
+            }
+            Ok(())
+        }
+    }
 }
 fn release(e: &mut Env<'_>, ptr: u32) -> u32 {
     let s = e.ext.get_mut::<Sound>();
@@ -1247,12 +1302,14 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
         for i in 0..b {
             let offset = e.cpu.read_u32(c + i * 8).map_err(|e| e.to_string())?;
             let handle = e.cpu.read_u32(c + i * 8 + 4).map_err(|e| e.to_string())?;
-            if (offset != u32::MAX && offset >= len)
-                || !matches!(
+            let event = match e.ext.get::<Sound>().host.events {
+                Some(events) => (events.valid)(e, handle),
+                None => matches!(
                     e.sys.objects.get(handle),
                     Some(adv_machine::Object::Event { .. })
-                )
-            {
+                ),
+            };
+            if (offset != u32::MAX && offset >= len) || !event {
                 return Ok(INVALID);
             }
             entries.push((offset, handle));
@@ -1683,10 +1740,8 @@ fn result(e: &mut Env<'_>) -> Result<u32, String> {
         }
         _ => return Err(format!("unimplemented audio method {full}")),
     };
-    for handle in s.ready_notices.drain(..) {
-        e.sys
-            .set_event_with_priority(handle, adv_machine::WakePriority::Audio);
-    }
+    let ready = std::mem::take(&mut s.ready_notices);
+    notify(e, ready)?;
     Ok(value)
 }
 fn call(e: &mut Env<'_>) -> Outcome {
@@ -1699,6 +1754,7 @@ fn call(e: &mut Env<'_>) -> Outcome {
 /// Service device notifications and retirements. The callback owns a PCM read alias.
 pub fn pump<B: Backend>(m: &mut Machine<B>) -> Result<Option<u64>, String> {
     let guest_now = m.sys.clock.now_us();
+    let mut fired = Vec::new();
     let s = m.ext.get_mut::<Sound>();
     s.audio.sync_clock(guest_now);
     for (&source, (_, queued)) in &mut s.pending_release {
@@ -1776,10 +1832,7 @@ pub fn pump<B: Backend>(m: &mut Machine<B>) -> Result<Option<u64>, String> {
             }
             buffer.notice_bytes = progress;
         }
-        for event in s.ready_notices.drain(..) {
-            m.sys
-                .set_event_with_priority(event, adv_machine::WakePriority::Audio);
-        }
+        fired.append(&mut s.ready_notices);
     }
     s.pending_notices
         .retain(|&(source, event, due, generation)| {
@@ -1792,8 +1845,7 @@ pub fn pump<B: Backend>(m: &mut Machine<B>) -> Result<Option<u64>, String> {
                 return false;
             }
             if due <= now {
-                m.sys
-                    .set_event_with_priority(event, adv_machine::WakePriority::Audio);
+                fired.push(event);
                 if let Some(trace) = s.trace.as_mut() {
                     let _ = writeln!(
                         trace,
@@ -1851,6 +1903,20 @@ pub fn pump<B: Backend>(m: &mut Machine<B>) -> Result<Option<u64>, String> {
             }
         }
     }
+    let events = s.host.events;
+    match events {
+        Some(events) => m.visit_context(None, |env| {
+            fired
+                .into_iter()
+                .try_for_each(|handle| (events.signal)(env, handle))
+        })??,
+        None => {
+            for event in fired {
+                m.sys
+                    .set_event_with_priority(event, adv_machine::WakePriority::Audio);
+            }
+        }
+    }
     Ok(next)
 }
 
@@ -1877,8 +1943,7 @@ mod tests {
         audio: Option<AudioControl>,
     ) -> Machine<JitCpu> {
         let mut reg = Registry::default();
-        adv_win32::register(&mut reg);
-        adv_win32::ole32::register(&mut reg);
+        crate::test_support::register(&mut reg);
         register(&mut reg);
         let mut m = Machine::new(
             JitCpu::new(adv_machine::layout::PARK_ADDR, true).unwrap(),
@@ -1887,18 +1952,8 @@ mod tests {
         )
         .unwrap();
         m.sys.set_process_identity(pid).unwrap();
-        // USER32's desktop is itself a common object; the requested budget
-        // below describes resources available to this DirectSound fixture.
-        m.sys.objects = Objects::with_limits(adv_machine::ObjectLimits {
-            objects: limits.objects.saturating_add(1),
-            aliases: limits.aliases.saturating_add(1),
-            ..limits
-        });
-        adv_win32::Win32::install(
-            &mut m,
-            adv_win32::Win32Config::new(".", "audio-test.exe", "target/audio-test"),
-        )
-        .unwrap();
+        m.sys.objects = Objects::with_limits(limits);
+        crate::test_support::install(&mut m);
         match audio {
             Some(audio) => install_with_audio(&mut m, audio).unwrap(),
             None => install(&mut m).unwrap(),
@@ -1959,46 +2014,32 @@ mod tests {
     }
     // spec: EXEC-CORE-4
     #[test]
-    fn real_audio_bindings_mark_dispatch_but_timer_does_not() {
+    fn directsound_binding_marks_dispatch() {
         use adv_cpu::backend::asm::Asm;
-        for api in [
-            "timeGetTime",
-            "waveOutWrite",
-            "IDirectSoundBuffer8::GetStatus",
-        ] {
-            let mut m = machine();
-            let pointer = buffer(
-                &mut m,
-                Format {
-                    rate: 1000,
-                    channels: 1,
-                    bits: 8,
-                },
-                1000,
-            );
-            let code_at = 0x0040_0000;
-            m.cpu.map(code_at, 4096, Prot::RX).unwrap();
-            let module = if api.contains("::") {
-                "dsound.dll"
-            } else {
-                "winmm.dll"
-            };
-            let target = m.resolve_import(module, api).unwrap();
-            let mut code = Asm::new(code_at);
-            if api.contains("::") {
-                code.push_imm(DATA).push_imm(pointer);
-            } else if api == "waveOutWrite" {
-                code.push_imm(0).push_imm(0).push_imm(0);
-            }
-            code.call(target).ret();
-            m.cpu.write(code_at, &code.bytes).unwrap();
-            let thread = m.spawn("audio marker", code_at, &[], 65536).unwrap();
-            assert!(matches!(
-                m.run_virtual(10_000),
-                adv_machine::RunResult::Exited(_)
-            ));
-            assert_eq!(m.sys.audio_called_after(thread, 0), api != "timeGetTime");
-        }
+        let mut m = machine();
+        let pointer = buffer(
+            &mut m,
+            Format {
+                rate: 1000,
+                channels: 1,
+                bits: 8,
+            },
+            1000,
+        );
+        let code_at = 0x0040_0000;
+        m.cpu.map(code_at, 4096, Prot::RX).unwrap();
+        let target = m
+            .resolve_import("dsound.dll", "IDirectSoundBuffer8::GetStatus")
+            .unwrap();
+        let mut code = Asm::new(code_at);
+        code.push_imm(DATA).push_imm(pointer).call(target).ret();
+        m.cpu.write(code_at, &code.bytes).unwrap();
+        let thread = m.spawn("audio marker", code_at, &[], 65536).unwrap();
+        assert!(matches!(
+            m.run_virtual(10_000),
+            adv_machine::RunResult::Exited(_)
+        ));
+        assert!(m.sys.audio_called_after(thread, 0));
     }
 
     fn invoke(m: &mut Machine<JitCpu>, name: &str, args: &[u32]) -> u32 {
@@ -2032,35 +2073,22 @@ mod tests {
         m: &mut Machine<JitCpu>,
         class: [u8; 16],
         iid: [u8; 16],
-        context: u32,
         outer: u32,
         output: u32,
     ) -> Outcome {
-        m.cpu.write(DATA + 256, &class).unwrap();
-        m.cpu.write(DATA + 272, &iid).unwrap();
-        m.resolve_import("ole32.dll", "CoCreateInstance").unwrap();
-        let thunk = m
-            .sys
-            .thunks
-            .iter()
-            .find(|(_, t)| t.module == "ole32.dll" && t.name == "CoCreateInstance")
-            .unwrap()
-            .0;
-        let handler = m.sys.thunks.get(thunk).f.handler;
-        m.cpu.set_reg(Reg::Esp, STACK);
-        for (i, arg) in [DATA + 256, outer, context, DATA + 272, output]
-            .into_iter()
-            .enumerate()
-        {
-            m.cpu.write_u32(STACK + 4 + i as u32 * 4, arg).unwrap();
-        }
-        handler(&mut Env {
-            context: m.sys.current,
-            cpu: &mut m.cpu,
-            sys: &mut m.sys,
-            ext: &mut m.ext,
-            thunk,
-        })
+        crate::test_support::activate(
+            &mut Env {
+                context: m.sys.current,
+                cpu: &mut m.cpu,
+                sys: &mut m.sys,
+                ext: &mut m.ext,
+                thunk: 0,
+            },
+            class,
+            iid,
+            outer,
+            output,
+        )
     }
     #[test]
     fn com_activation_uses_the_same_audio_owner_and_requires_initialize() {
@@ -2074,7 +2102,7 @@ mod tests {
         ];
         for (class, iid) in [(CLSID_DEVICE, IID_DEVICE), (sdk_device8, IID_DEVICE8)] {
             assert!(matches!(
-                activate(&mut m, class, iid, 1, 0, DATA + 128),
+                activate(&mut m, class, iid, 0, DATA + 128),
                 Outcome::Return(0)
             ));
             let ptr = m.cpu.read_u32(DATA + 128).unwrap();
@@ -2110,39 +2138,26 @@ mod tests {
         assert_eq!(invoke(&mut m, "IDirectSound8::Release", &[direct]), 0);
     }
     #[test]
-    fn com_activation_failures_clear_output_without_allocating_or_leaking() {
+    fn class_constructor_failures_do_not_allocate_or_leak() {
         let mut m = machine();
         let owners = m.sys.objects.object_count();
-        for (class, iid, context, outer, expected) in [
-            ([0; 16], IID_DEVICE, 1, 0, 0x80040154),
-            (CLSID_DEVICE, IID_DEVICE, 4, 0, 0x80040154),
-            (CLSID_DEVICE, [0xff; 16], 1, 0, NO_INTERFACE),
-            (CLSID_DEVICE, IID_DEVICE8, 1, 0, NO_INTERFACE),
-            (CLSID_DEVICE, IID_DEVICE, 1, DATA, 0x80040110),
+        for (class, iid, outer, expected) in [
+            (CLSID_DEVICE, [0xff; 16], 0, NO_INTERFACE),
+            (CLSID_DEVICE, IID_DEVICE8, 0, NO_INTERFACE),
+            (CLSID_DEVICE, IID_DEVICE, DATA, 0x80040110),
         ] {
             m.cpu.write_u32(DATA + 128, 0xdeadbeef).unwrap();
             assert!(
-                matches!(activate(&mut m, class, iid, context, outer, DATA + 128), Outcome::Return(hr) if hr == expected)
+                matches!(activate(&mut m, class, iid, outer, DATA + 128), Outcome::Return(hr) if hr == expected)
             );
-            assert_eq!(m.cpu.read_u32(DATA + 128).unwrap(), 0);
+            assert_eq!(m.cpu.read_u32(DATA + 128).unwrap(), 0xdeadbeef);
             assert_eq!(m.sys.objects.object_count(), owners);
         }
         assert!(matches!(
-            activate(&mut m, CLSID_DEVICE, IID_DEVICE, 1, 0, 0),
-            Outcome::Return(0x80004003)
-        ));
-        assert!(matches!(
-            activate(&mut m, CLSID_DEVICE, IID_DEVICE, 1, 0, 0x700000),
+            activate(&mut m, CLSID_DEVICE, IID_DEVICE, 0, 0x700000),
             Outcome::Fail(_)
         ));
         assert_eq!(m.sys.objects.object_count(), owners);
-        let warnings = &m.ext.get::<adv_abi::ApiDiagnostics>().warnings;
-        assert_eq!(
-            warnings.len(),
-            2,
-            "class/context failures only; IID probes remain quiet"
-        );
-        assert!(warnings.values().all(|count| *count == 1));
     }
     fn buffer(m: &mut Machine<JitCpu>, format: Format, bytes: u32) -> u32 {
         let device = device(m);
@@ -2252,7 +2267,7 @@ mod tests {
                     OUT_OF_MEMORY
                 );
                 assert_eq!(m.cpu.read_u32(DATA + 128).unwrap(), 0);
-                assert_eq!(m.sys.objects.object_count(), 1);
+                assert_eq!(m.sys.objects.object_count(), 0);
                 assert_eq!(heap_next(&mut m), next);
             }
         }
@@ -2287,7 +2302,7 @@ mod tests {
                     OUT_OF_MEMORY
                 );
                 assert_eq!(m.cpu.read_u32(DATA + 128).unwrap(), 0);
-                assert_eq!(m.sys.objects.object_count(), 2);
+                assert_eq!(m.sys.objects.object_count(), 1);
                 assert_eq!(heap_next(&mut m), next);
                 assert!(m.ext.get::<Sound>().buffer_ids.is_empty());
                 assert!(m.ext.get::<Sound>().pending_release.is_empty());
@@ -2328,7 +2343,7 @@ mod tests {
                 OUT_OF_MEMORY
             );
             assert_eq!(m.cpu.read_u32(DATA + 128).unwrap(), 0);
-            assert_eq!(m.sys.objects.object_count(), 258);
+            assert_eq!(m.sys.objects.object_count(), 257);
             assert_eq!(heap_next(&mut m), next_header);
             assert!(m.sys.vm.region(next_mapping).is_none());
             assert!(m.cpu.read_u8(next_mapping).is_err());

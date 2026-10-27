@@ -100,8 +100,8 @@ fn continued_trap_preserves_read_and_write_fault_pc_and_committed_prefix() {
 #[test]
 #[ignore = "reference-only trap restart cost diagnostic; no timing gate"]
 fn reference_trap_restart_cost() {
-    use adv_unicorn::Guarded;
     use std::time::Instant;
+    use unicorn_engine::Unicorn;
     use unicorn_engine::{
         RegisterX86,
         unicorn_const::{Arch, HookType, Mode, Prot as UcProt},
@@ -114,7 +114,7 @@ fn reference_trap_restart_cost() {
     }
     const TRAPS: u32 = 100_000;
     for restart in [false, true] {
-        let mut cpu = Guarded::new_with_data(Arch::X86, Mode::MODE_32, Data::default()).unwrap();
+        let mut cpu = Unicorn::new_with_data(Arch::X86, Mode::MODE_32, Data::default()).unwrap();
         cpu.mem_map(u64::from(CODE), 4096, UcProt::READ | UcProt::EXEC)
             .unwrap();
         cpu.mem_map(u64::from(PARK), 4096, UcProt::READ | UcProt::EXEC)

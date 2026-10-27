@@ -119,8 +119,7 @@ fn callback(env: &mut Env<'_>) -> Outcome {
 
 fn fixture(reject_all: bool) -> (Machine<JitCpu>, u32, u32) {
     let mut registry = Registry::default();
-    adv_win32::register(&mut registry);
-    adv_win32::ole32::register(&mut registry);
+    crate::test_support::register(&mut registry);
     register(&mut registry);
     for (op, argc) in [
         (0, 3),
@@ -149,11 +148,7 @@ fn fixture(reject_all: bool) -> (Machine<JitCpu>, u32, u32) {
         Clock::virtual_time(),
     )
     .unwrap();
-    adv_win32::Win32::install(
-        &mut m,
-        adv_win32::Win32Config::new(".", "authored.exe", "target/dshow-render-tests"),
-    )
-    .unwrap();
+    crate::test_support::install(&mut m);
     install(&mut m);
     m.cpu.map(DATA, 4096, Prot::RW).unwrap();
     m.cpu.map(STACK, 4096, Prot::RW).unwrap();

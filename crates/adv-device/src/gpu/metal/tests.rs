@@ -12,8 +12,8 @@ fn read(gpu: &mut Gpu, target: &Target) -> Vec<u8> {
 fn draw() -> ProgrammableDraw {
     ProgrammableDraw {
         program: Program::new("struct C { f: array<vec4<f32>,256> }; @group(0) @binding(1) var<uniform> c:C; @vertex fn vertex_main(@location(0) p:vec4<f32>)->@builtin(position) vec4<f32> { return p; } @fragment fn fragment_main()->@location(0) vec4<f32> { return c.f[0]; }".into(), vec![]),
-        streams: vec![VertexStream { stride: 16, bytes: bytemuck::cast_slice(&[[-1f32,-1.,0.,1.], [3.,-1.,0.,1.], [-1.,3.,0.,1.]]).to_vec(), attributes: vec![Attribute { location: 0, offset: 0, format: AttributeFormat::Float4 }] }],
-        indices: None, vertex_count: 3, vertex_constants: ConstantBlock::default(), pixel_constants: ConstantBlock::default(), textures: vec![], parameters: [[0;4];40],
+        streams: vec![VertexStream { stride: 16, bytes: bytemuck::cast_slice(&[[-1f32,-1.,0.,1.], [3.,-1.,0.,1.], [-1.,3.,0.,1.]]).to_vec().into(), attributes: vec![Attribute { location: 0, offset: 0, format: AttributeFormat::Float4 }] }],
+        indices: None, vertex_count: 3, vertex_constants: ConstantBlock::default().into(), pixel_constants: ConstantBlock::default().into(), textures: vec![], parameters: [[0;4];40],
     }
 }
 // spec: GFX-METAL-1, GFX-BUFFER-2
@@ -121,7 +121,7 @@ fn textured_draw(
     result.program = program.clone();
     result.streams = vec![
         VertexStream {
-            bytes,
+            bytes: bytes.into(),
             stride: stride as u32,
             attributes: vec![Attribute {
                 location: 0,
@@ -130,7 +130,7 @@ fn textured_draw(
             }],
         },
         VertexStream {
-            bytes: attributes,
+            bytes: attributes.into(),
             stride: 12,
             attributes: vec![
                 Attribute {
@@ -320,6 +320,64 @@ struct V { @builtin(position) p:vec4<f32>, @location(0) uv:vec2<f32>, @location(
             }
         }
     }
+}
+
+// spec: GFX-METAL-1
+#[test]
+fn native_frames_reuse_producer_completion_without_flushing_on_a_lease() {
+    let mut gpu = gpu(true);
+    let target = gpu.presentation_target(4, 4, false).unwrap();
+    let draw = draw();
+    let state = DrawState::new(4, 4);
+    gpu.draw_programmable(&target, &draw, &state).unwrap();
+    read(&mut gpu, &target);
+    let context = gpu.context.clone();
+    let (device, queue) = {
+        let pending = context.pending.lock().unwrap();
+        let metal = pending.metal.as_ref().unwrap();
+        (metal.device.clone(), metal.queue.clone())
+    };
+    struct Release(Object<dyn MTLSharedEvent>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            self.0.setSignaledValue(1);
+        }
+    }
+    let release = Release(device.newSharedEvent().unwrap());
+    let blocker = objc2::rc::autoreleasepool(|_| queue.commandBuffer().unwrap());
+    blocker.encodeWaitForEvent_value(release.0.as_ref(), 1);
+    blocker.commit();
+    gpu.draw_programmable(&target, &draw, &state).unwrap();
+    let before = gpu.stats();
+    drop(context.submission().unwrap());
+    assert_eq!(gpu.stats().submissions, before.submissions);
+    assert_eq!(gpu.stats().backend_switches, before.backend_switches);
+    let frame = gpu.completed_frame(target.image.clone(), 1).unwrap();
+    let after = gpu.stats();
+    assert_eq!(after.submissions, before.submissions + 1);
+    assert_eq!(after.backend_switches, before.backend_switches);
+    assert!(frame.completion.is_some());
+    let wakes = [
+        adv_sync::WakeEvent::new().unwrap(),
+        adv_sync::WakeEvent::new().unwrap(),
+    ];
+    let completions = wakes
+        .each_ref()
+        .map(|wake| frame.display_completion(wake.clone()).unwrap());
+    assert!(
+        completions
+            .iter()
+            .all(|completion| !completion.ready().unwrap())
+    );
+    assert_eq!(gpu.stats().submissions, after.submissions);
+    release.0.setSignaledValue(1);
+    for (completion, wake) in completions.iter().zip(&wakes) {
+        while !completion.ready().unwrap() {
+            assert!(wake.wait(Some(std::time::Duration::from_secs(10))).unwrap());
+        }
+    }
+    assert_eq!(gpu.stats().backend_switches, after.backend_switches);
+    assert_eq!(read(&mut gpu, &target).len(), 64);
 }
 
 // spec: GFX-METAL-1
@@ -682,7 +740,7 @@ fn native_bounded_clears_match_wgpu_without_switching_or_submitting() {
                 [3., -1., 0.5, 1.],
                 [-1., 3., 0.5, 1.],
             ];
-            command.streams[0].bytes = bytemuck::cast_slice(&positions).to_vec();
+            command.streams[0].bytes = bytemuck::cast_slice(&positions).to_vec().into();
             command.pixel_constants.floats[0] = [0.8, 0.2, 0.4, 0.6];
             let mut state = DrawState::new(8, 6);
             state.depth = format.map(|_| Compare::Always);

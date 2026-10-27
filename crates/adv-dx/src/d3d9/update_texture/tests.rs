@@ -61,8 +61,10 @@ impl Fixture {
         };
         // Admission-only assembly fixture: no GDI operation is performed on
         // this handle. Real canvas writeback is covered by the DC module.
-        state.provider.acquire_dc = |_, _, _, _, _| Ok(0x1910);
-        state.provider.writeback_dc = |_, _, _, _| Ok(());
+        state.provider.dc.create = |env, _, then| then(env, Ok(0x1910));
+        state.provider.dc.flush = |env, _, _, then| then(env, Ok(()));
+        state.provider.dc.release = |env, _, then| then(env, Ok(()));
+        state.provider.dc.discard = |_, _| {};
         m.cpu.map(STACK, 4096, Prot::RW).unwrap();
         m.cpu.map(0x400000, 4096, Prot::RX).unwrap();
         m.spawn("texture updates", 0x400000, &[], 65536).unwrap();
@@ -532,7 +534,9 @@ fn bgra_snapshot_survives_busy_upload_and_later_dirty_rects() {
     );
     assert_eq!(f.dirty(source), [true]);
     assert_eq!(f.update(source, destination), 0);
-    assert_eq!(f.pixels(&image), [9, 8, 7, 6].repeat(32));
+    let mut expected = [1, 2, 3, 4].repeat(32);
+    expected[9 * 4..11 * 4].copy_from_slice(&[9, 8, 7, 6].repeat(2));
+    assert_eq!(f.pixels(&image), expected);
     assert_eq!(f.dirty(source), [false]);
 }
 
@@ -570,7 +574,11 @@ fn partial_dirty_marks_copy_matching_tail_mips_and_no_dirty_lock_stays_clean() {
         );
     }
     assert_eq!(f.update(source, destination), 0);
-    assert_eq!(f.pixels(&image), [11, 12, 13, 14].repeat(8));
+    let mut expected = [2, 2, 3, 4].repeat(8);
+    for row in 0..2 {
+        expected[row * 16..row * 16 + 8].copy_from_slice(&[11, 12, 13, 14].repeat(2));
+    }
+    assert_eq!(f.pixels(&image), expected);
     assert_eq!(f.dirty(source), [false; 5]);
     let output = f.packet(D3DLOCKED_RECT::default());
     assert_eq!(

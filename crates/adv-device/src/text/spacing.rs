@@ -9,17 +9,10 @@ impl Text {
         request: &FontRequest,
         code: u16,
     ) -> Result<i32, TextError> {
-        #[cfg(windows)]
-        {
-            self.font(request)?.encoded_character_width(code)
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = (request, code);
-            Err(TextError::Glyph(
-                "encoded character advances are unavailable on this text backend".into(),
-            ))
-        }
+        let _ = (request, code);
+        Err(TextError::Glyph(
+            "encoded character advances are unavailable on this text backend".into(),
+        ))
     }
     /// Consecutive Unicode units, including NUL and missing/default characters.
     /// This measures individual advances, independently of string shaping.
@@ -32,11 +25,7 @@ impl Text {
         if last < first {
             return Err(TextError::Glyph("invalid character range".into()));
         }
-        #[cfg(windows)]
-        {
-            self.font(request)?.character_widths(first, last)
-        }
-        #[cfg(not(windows))]
+
         {
             // Character widths are horizontal advances, not rotated ink bounds.
             let mut horizontal = request.clone();

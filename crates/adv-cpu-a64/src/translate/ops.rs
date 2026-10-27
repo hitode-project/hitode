@@ -1,5 +1,6 @@
 //! Each guest instruction's host code, with the flag work liveness allows.
 
+use crate::asm::Label;
 use crate::encode::Extend::{self, Uxtw};
 use crate::encode::Index::{Post, Pre};
 use crate::encode::Shift::{Asr, Lsl, Lsr};
@@ -10,8 +11,8 @@ use super::decode::{Alu, ESP, Mem, Narrow8or16, Op, Part, ShiftKind, Src};
 use super::flags::{Carry, FlagSet, Operand, Recipe, Sense};
 use super::trace::{Inst, Mode};
 use super::{
-    Cold, RUNTIME, SHADOW, State, Translator, WINDOW, X0, X1, X3, X4, X5, X6, X13, X16, X17,
-    biased, host, temp,
+    Cold, RUNTIME, SHADOW, State, Translator, WINDOW, X0, X1, X3, X4, X5, X6, X10, X13, X14, X15,
+    X16, X17, biased, host, temp,
 };
 use crate::runtime::{self, ACCESS_SIGNED, ACCESS_STORE};
 use adv_cpu_core::IndirectBranchKind;
@@ -45,14 +46,15 @@ impl Translator<'_> {
     pub(super) fn op(&mut self, inst: Inst) {
         match inst.op {
             Op::Nop | Op::Jmp(_) => {}
-            Op::Helper(index) => match inst.leaf {
-                Some(word) => self.leaf(inst, word),
+            Op::Helper(index) => match inst.call {
+                Some(thunk) => self.host_call(inst, thunk),
                 None => self.helper(index),
             },
             Op::Simd(simd) => self.simd(simd),
             Op::Strings(strings) => self.strings(strings),
             Op::Integer(integer) => self.integer(integer),
             Op::X87(x87) => self.x87(x87),
+            Op::Fild64(mem, helper, opcode) => self.fild64(mem, helper, opcode),
             Op::Direction(set) => self.emit(movz(W, super::X12, u16::from(set), 0)),
             Op::Mov(Src::Reg(dst), source) => self.mov_register(dst, source),
             Op::Mov(Src::Mem(mem), source) => {
@@ -90,6 +92,8 @@ impl Translator<'_> {
                 self.emit(subs(W, result(index), Reg::ZR, host(index), Lsl, 0));
                 self.commit(index);
                 self.state = State {
+                    nz: None,
+                    overflow: super::Overflow::Host,
                     sense: Sense::Subtraction,
                     carry: Carry::Host,
                     derivable: Some(Carry::Nonzero(guest)),
@@ -235,8 +239,13 @@ impl Translator<'_> {
                 let cond = self.condition(cc);
                 self.clobber(Operand::Guest(dst));
                 self.emit(csel(W, host(dst), value, host(dst), cond));
+                if biased(dst) {
+                    self.emit(add(X, host(dst), WINDOW, host(dst), Lsl, 0));
+                }
             }
-            Op::Shift(kind, dst, count) => self.shift(kind, dst, count),
+            Op::Shift(kind, Src::Reg(dst), Some(count)) => self.shift(kind, dst, count),
+            Op::Shift(kind, dst, None) => self.shift_cl(kind, dst),
+            Op::Shift(_, _, Some(_)) => unreachable!(),
             Op::Imul(dst, source, imm) => self.imul(dst, source, imm),
             Op::Carry(subtract, dst, source) => self.carry(subtract, dst, source),
         }
@@ -268,7 +277,8 @@ impl Translator<'_> {
     pub(super) fn probe(&mut self, link: bool, kind: IndirectBranchKind) {
         self.emit_all(&[
             ldr(X, X17, RUNTIME, runtime::TABLE),
-            ubfx(X, X6, X16, 2, 16),
+            eor(W, X6, X16, X16, Lsr, 16),
+            ubfx(W, X6, X6, 0, 16),
             add(X, X17, X17, X6, Lsl, 4),
             ldp(X, crate::encode::Index::Offset, X6, X17, X17, 0),
             sub(X, X6, X6, X16, Lsl, 0),
@@ -468,12 +478,27 @@ impl Translator<'_> {
     /// unit, with canonical flags; leaves when it asks to. Conditional callers
     /// must also flush before the fork, so their fast path publishes the prefix.
     pub(super) fn helper(&mut self, index: u8) {
+        let index = self.helpers + u32::from(index);
+        self.mov_imm(X1, index);
+        self.owner_call(self.stubs.interpret);
+    }
+
+    /// Makes the host call through `thunk` whose INT is `inst`, with the
+    /// guest synchronized as for a helper (A64-CTL-12).
+    fn host_call(&mut self, inst: Inst, thunk: u32) {
+        self.mov_imm(X1, inst.pc);
+        let thunk = u16::try_from(thunk).expect("thunk index");
+        self.emit(movk(X, X1, thunk, 32));
+        self.owner_call(self.stubs.call);
+    }
+
+    /// Calls `stub` with the argument in x1 and the guest in `CpuState`.
+    fn owner_call(&mut self, stub: usize) {
         self.canonicalize();
-        // The interpreter may change any SIMD register.
+        // The owner may change any SIMD register.
         self.flush_simd();
         self.vector = super::simd::Vector::default();
-        self.mov_imm(X1, self.helpers + u32::from(index));
-        self.far_call(self.stubs.interpret);
+        self.far_call(stub);
         self.state = State::CANONICAL;
         let leave = self.asm.label();
         self.asm.cbz(W, true, X0, leave);
@@ -481,34 +506,6 @@ impl Translator<'_> {
             label: leave,
             refund: self.trace.unused(self.index),
         });
-    }
-
-    fn leaf(&mut self, inst: Inst, word: u32) {
-        self.canonicalize();
-        self.flush_simd();
-        self.vector = super::simd::Vector::default();
-        self.mov_imm(X1, inst.pc);
-        self.mov_imm(super::X2, word);
-        self.far_call(self.stubs.leaf);
-        self.state = State::CANONICAL;
-        // Bit 1 refuses before INT; bit 0 leaves after the completed call.
-        for (bit, exit, eip, extra) in [
-            (1, super::Exit::Interpret, inst.pc, 1),
-            (0, super::Exit::Dispatch, inst.next_pc, 0),
-        ] {
-            let label = self.asm.label();
-            self.asm.tbz(true, X0, bit, label);
-            self.push_cold(Cold::Leave {
-                label,
-                state: State::CANONICAL,
-                simd_dirty: self.vector.dirty,
-                refund: self.trace.unused(self.index) + extra,
-                exit,
-                eip,
-                link: false,
-                x87: None,
-            });
-        }
     }
 
     /// A checked access (A64-MEM-7) of `kind` at the guest address in `address`,
@@ -519,8 +516,29 @@ impl Translator<'_> {
     fn checked(&mut self, address: Reg, rt: Reg, kind: u32, direct: u32) {
         self.flush_simd();
         let slow = self.asm.label();
+        let (site, resume) =
+            self.checked_memory(address, kind & 7, kind & ACCESS_STORE != 0, direct, slow);
+        self.push_cold(Cold::Access {
+            label: slow,
+            resume,
+            site,
+            address,
+            value: rt,
+            kind,
+        });
+    }
+
+    /// Emit one scalar or vector access after the same window/alias checks.
+    /// The caller owns the slow path and publishes its SIMD prefix first.
+    pub(super) fn checked_memory(
+        &mut self,
+        address: Reg,
+        width: u32,
+        store: bool,
+        direct: u32,
+        slow: Label,
+    ) -> (Label, Label) {
         let alias = self.asm.label();
-        let width = kind & 7;
         if width > 1 {
             // The last byte's address differs in bit 12 exactly when the
             // access crosses a page.
@@ -537,7 +555,7 @@ impl Translator<'_> {
         ]);
         // Permitted, not shared, and for a store not a code barrier.
         let bit = |permission: u8| permission.trailing_zeros();
-        let (needed, excluded) = if kind & ACCESS_STORE != 0 {
+        let (needed, excluded) = if store {
             (WRITE, &[EXEC, SHARED][..])
         } else {
             (READ, &[SHARED][..])
@@ -568,14 +586,7 @@ impl Translator<'_> {
         // Keep the access width and extension; only replace its base register.
         self.emit((direct & !(31 << 5)) | (X3.number() << 5));
         self.asm.bind(resume);
-        self.push_cold(Cold::Access {
-            label: slow,
-            resume,
-            site,
-            address,
-            value: rt,
-            kind,
-        });
+        (site, resume)
     }
 
     /// Loads a 32-bit source into a free recipe temporary.
@@ -633,8 +644,16 @@ impl Translator<'_> {
     /// `inc` or `dec`, which keep CF.
     fn step(&mut self, increment: bool, index: u8) {
         let guest = Operand::Guest(index);
-        self.step_flags(increment, host(index), result(index), guest);
+        self.prepare(guest);
+        self.emit(if increment {
+            add_imm(W, result(index), host(index), 1, false)
+        } else {
+            sub_imm(W, result(index), host(index), 1, false)
+        });
+        self.forget(guest);
         self.commit(index);
+        self.state.nz = Some(guest);
+        self.state.overflow = super::Overflow::Step(guest, increment);
         self.state.recipe = if increment {
             Recipe::AddResult(guest, Operand::Imm(1))
         } else {
@@ -657,6 +676,8 @@ impl Translator<'_> {
         });
         self.store(addr, X6);
         self.step_flags(increment, left, Reg::ZR, Operand::Temp(t));
+        self.state.nz = None;
+        self.state.overflow = super::Overflow::Host;
         self.state.recipe = if increment {
             Recipe::Add(Operand::Temp(t), Operand::Imm(1))
         } else {
@@ -727,6 +748,9 @@ impl Translator<'_> {
                 self.prepare(t);
             } else if self.state.recipe.uses(t) {
                 self.materialize();
+            }
+            if site && (self.state.nz == Some(t) || self.state.overflow.uses(t)) {
+                self.host_nzv(FlagSet::NZV);
             }
             if site && self.state.carry.uses(t) {
                 self.host_carry();
@@ -831,6 +855,8 @@ impl Translator<'_> {
         }
         let logic = matches!(alu, Alu::And | Alu::Test | Alu::Or | Alu::Xor);
         self.state = State {
+            nz: None,
+            overflow: super::Overflow::Host,
             sense,
             carry: Carry::Host,
             derivable: logic.then_some(Carry::Clear),
@@ -948,6 +974,8 @@ impl Translator<'_> {
                 // The result overwrites a right operand that is `dst` itself.
                 let same = operand == guest;
                 self.state = State {
+                    nz: None,
+                    overflow: super::Overflow::Host,
                     sense: if subtract {
                         Sense::Subtraction
                     } else {
@@ -986,6 +1014,8 @@ impl Translator<'_> {
                 };
                 self.emit(word);
                 self.state = State {
+                    nz: None,
+                    overflow: super::Overflow::Host,
                     sense: Sense::Addition,
                     carry: Carry::Host,
                     derivable: Some(Carry::Clear),
@@ -1019,16 +1049,22 @@ impl Translator<'_> {
                 };
                 self.emit(word);
                 // The flags NZCV holds, only if read; CF is clear anyway.
-                let nzcv = self.out.any(FlagSet::NZV.or(FlagSet::CF));
+                let nzcv = self.trace.live_out[self.index].any(FlagSet::NZV);
                 if nzcv {
                     self.emit(tst(W, result, result, Lsl, 0));
                 }
                 self.state = State {
+                    nz: None,
+                    overflow: super::Overflow::Host,
                     sense: Sense::Addition,
                     carry: if nzcv { Carry::Host } else { Carry::Clear },
                     derivable: nzcv.then_some(Carry::Clear),
                     recipe: Recipe::Logic(guest),
                 };
+                if !nzcv {
+                    self.state.nz = Some(guest);
+                    self.state.overflow = super::Overflow::Clear;
+                }
                 self.commit(dst);
             }
         }
@@ -1105,6 +1141,8 @@ impl Translator<'_> {
             None => Carry::Clear,
         };
         self.state = State {
+            nz: None,
+            overflow: super::Overflow::Host,
             sense,
             carry,
             derivable: (carry == Carry::Host).then_some(derivable),
@@ -1118,7 +1156,7 @@ impl Translator<'_> {
         use ShiftKind::*;
         let guest = Operand::Guest(dst);
         let (source, result) = (host(dst), result(dst));
-        let out = self.out;
+        let out = self.trace.observe_out[self.index];
         if matches!(kind, Rol | Ror) {
             // Only CF and OF change; the rest keep their form.
             self.clobber(guest);
@@ -1138,6 +1176,9 @@ impl Translator<'_> {
                 self.insert_flags(carry, overflow);
             }
             self.commit(dst);
+            if count == 1 {
+                self.state.overflow = super::Overflow::Host;
+            }
             if lazy {
                 self.state.carry = Carry::Bit(guest, bit as u8);
             } else {
@@ -1147,57 +1188,213 @@ impl Translator<'_> {
             self.state.derivable = None;
             return;
         }
-        // PF comes from the result and AF stays.
-        let recipe = if self.state.recipe.clears_af() || !self.keep.any(FlagSet::AF) {
+        // The original supplies CF; the result supplies N/Z/PF. AF and
+        // multi-bit OF keep their previous sources (A64-FLAG-2).
+        let clear_af = self.state.recipe.clears_af();
+        if clear_af {
+            // PF is replaced, and AF is recoverable as zero.
+            self.state.recipe = Recipe::Canonical;
+        }
+        self.prepare(guest);
+        let recipe = if clear_af {
             Recipe::Logic(guest)
         } else {
             self.materialize();
             Recipe::Parity(guest)
         };
-        let nzcv = out.any(FlagSet::NZV.or(FlagSet::CF));
-        if !nzcv {
-            self.emit(match kind {
-                Shl => lsl_imm(W, result, source, count),
-                Shr => lsr_imm(W, result, source, count),
-                _ => asr_imm(W, result, source, count),
-            });
-        } else if kind == Shl && count == 1 {
-            // CF is the old top bit and OF the new top bit XOR CF.
-            self.emit(adds(W, result, source, source, Lsl, 0));
-        } else {
-            let kept = count > 1 && out.any(FlagSet::OF);
-            if kept {
-                self.emit(cset(W, X17, Cond::Vs));
-            }
-            let shift = match kind {
-                Shl => Lsl,
-                Shr => Lsr,
-                _ => Asr,
-            };
-            // N and Z from the result, C and V clear.
-            self.emit(adds(W, X16, Reg::ZR, source, shift, count));
-            let carry = out
-                .any(FlagSet::CF)
-                .then_some((source, if kind == Shl { 32 - count } else { count - 1 }));
-            let overflow = match kind {
-                _ if kept => Some((X17, 0)),
-                Shr if count == 1 => Some((source, 31)),
-                _ => None,
-            };
-            if carry.is_some() || overflow.is_some() {
-                self.insert_flags(carry, overflow);
-            }
-            if !biased(dst) {
-                self.emit(mov(W, source, X16));
-            }
+        self.state.carry = Carry::Host;
+        self.state.nz = None;
+        if count == 1 {
+            self.state.overflow = super::Overflow::Host;
         }
+        let t = self.take_temp();
+        let original = Operand::Temp(t);
+        self.clobber(original);
+        self.emit(mov(W, temp(t), source));
+        self.emit(match kind {
+            Shl => lsl_imm(W, result, source, count),
+            Shr => lsr_imm(W, result, source, count),
+            _ => asr_imm(W, result, source, count),
+        });
         self.commit(dst);
-        self.state = State {
-            sense: Sense::Addition,
-            carry: Carry::Host,
-            derivable: None,
-            recipe,
+        self.state.carry = Carry::Bit(
+            original,
+            if kind == Shl { 32 - count } else { count - 1 } as u8,
+        );
+        self.state.derivable = None;
+        self.state.recipe = recipe;
+        self.state.nz = Some(guest);
+        if count == 1 {
+            self.state.overflow = match kind {
+                Shl => super::Overflow::Xor(original, 31, 30),
+                Shr => super::Overflow::Bit(original, 31),
+                _ => super::Overflow::Clear,
+            };
+        }
+    }
+
+    /// CL masks the count to five bits; zero keeps the destination and flags.
+    fn shift_cl(&mut self, kind: ShiftKind, dst: Src) {
+        use ShiftKind::*;
+        let ecx = host(1);
+        let written = Op::Shift(kind, dst, None).effects().writes;
+        if let Src::Reg(dst) = dst
+            && !self.out.any(written)
+        {
+            let source = host(dst);
+            // A variable shift takes the count modulo 32, as x86 masks it.
+            self.clobber(Operand::Guest(dst));
+            let result = result(dst);
+            let word = match kind {
+                Shl => shiftv(W, Lsl, result, source, ecx),
+                Shr => shiftv(W, Lsr, result, source, ecx),
+                Sar => shiftv(W, Asr, result, source, ecx),
+                Rol => {
+                    self.emit(sub(W, X17, Reg::ZR, ecx, Lsl, 0));
+                    rorv(W, result, source, X17)
+                }
+                Ror => rorv(W, result, source, ecx),
+            };
+            self.emit(word);
+            self.commit(dst);
+            return;
+        }
+        self.canonicalize();
+        let done = self.asm.label();
+        let zero = matches!(dst, Src::Mem(_)).then(|| self.asm.label());
+        // x7 holds the memory source and x5 its address across checked accesses.
+        let source = match dst {
+            Src::Reg(dst) => host(dst),
+            Src::Mem(mem) => {
+                *self.uses_permissions = true;
+                let address = self.effective(mem);
+                self.emit(mov(W, X5, address));
+                self.load(Addr::Window(X5), temp(0));
+                temp(0)
+            }
+            Src::Imm(_) => unreachable!(),
         };
+        self.emit(and_imm(W, X16, ecx, 31));
+        self.asm.cbz(W, false, X16, zero.unwrap_or(done));
+        // The result in w6; CF and OF as bits of registers when live.
+        let flags = self.out.any(written);
+        let (carry, overflow) = if !flags {
+            let word = match kind {
+                Shl => shiftv(W, Lsl, X6, source, X16),
+                Shr => shiftv(W, Lsr, X6, source, X16),
+                Sar => shiftv(W, Asr, X6, source, X16),
+                Rol => {
+                    self.emit(sub(W, X17, Reg::ZR, X16, Lsl, 0));
+                    rorv(W, X6, source, X17)
+                }
+                Ror => rorv(W, X6, source, X16),
+            };
+            self.emit(word);
+            ((Reg::ZR, 0), (Reg::ZR, 0))
+        } else {
+            match kind {
+                Shl => {
+                    self.emit_all(&[
+                        shiftv(W, Lsl, X6, source, X16),
+                        sub(W, X17, Reg::ZR, X16, Lsl, 0),
+                        shiftv(W, Lsr, X17, source, X17),
+                        eor(W, X15, X17, X6, Lsr, 31),
+                    ]);
+                    ((X17, 0), (X15, 0))
+                }
+                Shr | Sar => {
+                    let shift = if kind == Shr { Lsr } else { Asr };
+                    self.emit_all(&[
+                        shiftv(W, shift, X6, source, X16),
+                        sub_imm(W, X17, X16, 1, false),
+                        shiftv(W, Lsr, X17, source, X17),
+                    ]);
+                    let overflow = if kind == Shr {
+                        (source, 31)
+                    } else {
+                        (Reg::ZR, 0)
+                    };
+                    ((X17, 0), overflow)
+                }
+                Rol => {
+                    self.emit_all(&[
+                        sub(W, X17, Reg::ZR, X16, Lsl, 0),
+                        rorv(W, X6, source, X17),
+                        eor(W, X15, X6, X6, Lsr, 31),
+                    ]);
+                    ((X6, 0), (X15, 0))
+                }
+                Ror => {
+                    self.emit_all(&[rorv(W, X6, source, X16), eor(W, X15, X6, X6, Lsl, 1)]);
+                    ((X6, 31), (X15, 31))
+                }
+            }
+        };
+        // Store before changing any guest flag (A64-FLAG-4).
+        if matches!(dst, Src::Mem(_)) {
+            self.store(Addr::Window(X5), X6);
+        }
+        if flags {
+            // OF changes only for a count of 1; C holds CF in subtraction sense.
+            let old = temp(1);
+            self.emit_all(&[
+                mrs_nzcv(old),
+                ubfx(W, X14, overflow.0, overflow.1, 1),
+                ubfx(W, X13, old, 28, 1),
+                cmp_imm(W, X16, 1, false),
+                csel(W, X14, X14, X13, Cond::Eq),
+                bfi(X, old, X14, 28, 1),
+                ubfx(W, X14, carry.0, carry.1, 1),
+                eor_imm(W, X14, X14, 1),
+                bfi(X, old, X14, 29, 1),
+            ]);
+            if !matches!(kind, Rol | Ror) {
+                self.emit_all(&[
+                    lsr_imm(W, X14, X6, 31),
+                    bfi(X, old, X14, 31, 1),
+                    cmp_imm(W, X6, 0, false),
+                    cset(W, X14, Cond::Eq),
+                    bfi(X, old, X14, 30, 1),
+                    mov(W, X10, X6),
+                ]);
+            }
+            self.emit(msr_nzcv(old));
+        }
+        if let Src::Reg(dst) = dst {
+            self.emit(mov(W, result(dst), X6));
+            self.commit(dst);
+        }
+        if let Some(zero) = zero {
+            self.asm.b(done);
+            self.asm.bind(zero);
+            let slow = self.asm.label();
+            // Zero counts still require WRITE, but must not perform a store.
+            // The preceding load established that both page indices are valid.
+            self.emit_all(&[
+                ldr(X, X3, RUNTIME, runtime::ALIAS_CLASSES),
+                lsr_imm(W, X4, X5, 12),
+                ldr_narrow(Narrow::Byte, X4, X3, X4),
+            ]);
+            self.asm.tbz(false, X4, WRITE.trailing_zeros(), slow);
+            self.emit_all(&[
+                add_imm(W, X4, X5, 3, false),
+                lsr_imm(W, X4, X4, 12),
+                ldr_narrow(Narrow::Byte, X4, X3, X4),
+            ]);
+            self.asm.tbz(false, X4, WRITE.trailing_zeros(), slow);
+            self.push_cold(Cold::Leave {
+                label: slow,
+                state: State::CANONICAL,
+                simd_dirty: self.vector.dirty,
+                refund: self.trace.owed(self.index),
+                exit: super::Exit::Interpret,
+                eip: self.trace.insts[self.index].pc,
+                link: false,
+                x87: self.x87_leaving(),
+            });
+        }
+        self.asm.bind(done);
+        self.state = State::CANONICAL;
     }
 
     /// `imul dst, source[, imm]`: CF and OF report a product that does not
@@ -1227,6 +1424,7 @@ impl Translator<'_> {
                 orr(X, X17, X17, X6, Lsl, 0),
             ]);
             self.insert_flags(Some((X17, 63)), Some((X17, 63)));
+            self.state.overflow = super::Overflow::Host;
             self.state.sense = Sense::Addition;
         }
         self.state.carry = Carry::Host;
@@ -1275,6 +1473,8 @@ impl Translator<'_> {
         self.commit(dst);
         self.state.carry = Carry::Host;
         self.state.derivable = None;
+        self.state.nz = None;
+        self.state.overflow = super::Overflow::Host;
         self.state.recipe = match mixed {
             Some(mixed) => Recipe::Mixed(guest, Operand::Temp(mixed)),
             None => Recipe::Logic(guest),

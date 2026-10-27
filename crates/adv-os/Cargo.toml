@@ -1,6 +1,6 @@
 [package]
 name = "adv-os"
-description = "OS layer: PE loading, the module table, the guest file system, heaps and code pages"
+description = "Shared guest file system, heaps, COM activation and code pages"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,7 +11,6 @@ publish.workspace = true
 adv-abi.workspace = true
 adv-cpu = { path = "../adv-cpu" }
 adv-machine.workspace = true
-adv-pe.workspace = true
 thiserror.workspace = true
 log.workspace = true
 rustc-hash = "2.1"
@@ -26,5 +25,3 @@ workspace = true
 
 [dev-dependencies]
 adv-abi.workspace = true
-adv-unicorn = { path = "../adv-unicorn" }
-adv-samples.workspace = true

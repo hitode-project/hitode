@@ -1,7 +1,5 @@
 use adv_device::surface::{PixelFormat, Snapshot, SurfaceMemory, Surfaces};
 use adv_dx::ddraw::{DirectDraw, IID_DDRAW7, api as dd};
-use adv_os::gdi::{DeviceContexts, WINDOW_DC};
-use adv_win32::gdi32::raster::{Raster, api as gdi};
 use std::borrow::Cow;
 
 struct Memory(Vec<u8>);
@@ -32,9 +30,7 @@ struct Fixture {
     objects: adv_machine::Objects,
     memory: Memory,
     surfaces: Surfaces<Snapshot>,
-    contexts: DeviceContexts,
     ddraw: DirectDraw,
-    raster: Raster,
     device: u32,
 }
 
@@ -79,7 +75,6 @@ impl Fixture {
             objects,
             memory: Memory(vec![0; 65536]),
             surfaces: Surfaces::new(5, 4, 4096, 61440, Snapshot::default()).unwrap(),
-            contexts: DeviceContexts::default(),
             ddraw: DirectDraw::new(
                 adv_dx::ddraw::front::BINDINGS
                     .iter()
@@ -87,7 +82,6 @@ impl Fixture {
                     .chain([(dd::UNIMPLEMENTED_COM, dd::UNIMPLEMENTED_COM * 16)])
                     .collect(),
             ),
-            raster: Raster::default(),
             device: 0,
         }
     }
@@ -97,131 +91,10 @@ impl Fixture {
                 id,
                 args,
                 &mut self.surfaces,
-                &mut self.contexts,
                 &mut self.objects,
                 &mut self.memory,
             )
             .unwrap()
-    }
-    fn gdi(&mut self, id: u32, args: &[u32]) -> u32 {
-        match id {
-            gdi::GET_DC => {
-                self.surfaces.primary(&mut self.memory).unwrap();
-                // Raster operations consume the logical DC's saved modes too.
-                assert!(
-                    self.contexts
-                        .set_stretch_mode(&mut self.objects, WINDOW_DC, 1)
-                        .is_some()
-                );
-                WINDOW_DC
-            }
-            gdi::CREATE_DC => self
-                .raster
-                .create_dc(
-                    &mut self.surfaces,
-                    &mut self.contexts,
-                    &mut self.objects,
-                    &mut self.memory,
-                    args[0],
-                )
-                .unwrap(),
-            gdi::CREATE_DIB => self
-                .raster
-                .create_dib(
-                    &mut self.surfaces,
-                    &mut self.contexts,
-                    &mut self.objects,
-                    &mut self.memory,
-                    args[0],
-                    args[1],
-                    args[2],
-                    args[3],
-                    args[4],
-                    args[5],
-                )
-                .unwrap(),
-            gdi::SELECT => self
-                .raster
-                .select_bitmap(
-                    &mut self.surfaces,
-                    &mut self.contexts,
-                    &mut self.objects,
-                    &mut self.memory,
-                    args[0],
-                    args[1],
-                )
-                .unwrap(),
-            gdi::DELETE_DC => self
-                .raster
-                .delete_dc(
-                    &mut self.surfaces,
-                    &mut self.contexts,
-                    &mut self.objects,
-                    &mut self.memory,
-                    args[0],
-                )
-                .unwrap(),
-            gdi::SET_STRETCH_MODE => self
-                .raster
-                .set_stretch_mode(
-                    &mut self.surfaces,
-                    &mut self.contexts,
-                    &mut self.objects,
-                    &mut self.memory,
-                    args[0],
-                    args[1],
-                )
-                .unwrap(),
-            gdi::DELETE_OBJECT => self
-                .raster
-                .delete_bitmap(
-                    &mut self.surfaces,
-                    &mut self.contexts,
-                    &mut self.objects,
-                    &mut self.memory,
-                    args[0],
-                )
-                .unwrap(),
-            gdi::BITBLT => self
-                .raster
-                .bit_blt(
-                    &mut self.surfaces,
-                    &mut self.contexts,
-                    &mut self.objects,
-                    &mut self.memory,
-                    args[0],
-                    args[1],
-                    args[2],
-                    args[3],
-                    args[4],
-                    args[5],
-                    args[6],
-                    args[7],
-                    args[8],
-                )
-                .unwrap(),
-            gdi::STRETCHBLT => self
-                .raster
-                .stretch_blt(
-                    &mut self.surfaces,
-                    &mut self.contexts,
-                    &mut self.objects,
-                    &mut self.memory,
-                    args[0],
-                    args[1],
-                    args[2],
-                    args[3],
-                    args[4],
-                    args[5],
-                    args[6],
-                    args[7],
-                    args[8],
-                    args[9],
-                    args[10],
-                )
-                .unwrap(),
-            _ => panic!("unexpected raster fixture operation {id}"),
-        }
     }
     fn surface(&mut self, w: u32, h: u32, format: PixelFormat, primary: bool) -> (u32, u32, u32) {
         let mut desc = [0u8; 108];
@@ -256,52 +129,10 @@ impl Fixture {
                 .unwrap();
         }
     }
-    fn dc(&mut self, object: u32) -> u32 {
-        assert_eq!(self.dd(dd::SURFACE_DC, &[object, 32]), 0);
-        self.memory.u32(32).unwrap()
-    }
     fn query(&mut self, object: u32, iid: [u8; 16]) -> u32 {
         self.memory.write(16, &iid).unwrap();
         assert_eq!(self.dd(dd::QUERY, &[object, 16, 32]), 0);
         self.memory.u32(32).unwrap()
-    }
-}
-
-#[test]
-fn indexed_dib_color_table_is_copied_and_blits_to_the_shared_primary() {
-    for height in [-2i32, 2] {
-        let mut f = Fixture::new();
-        let dc = f.gdi(gdi::CREATE_DC, &[0]);
-        let mut info = [0u8; 56];
-        info[..4].copy_from_slice(&40u32.to_le_bytes());
-        info[4..8].copy_from_slice(&3i32.to_le_bytes());
-        info[8..12].copy_from_slice(&height.to_le_bytes());
-        info[12..14].copy_from_slice(&1u16.to_le_bytes());
-        info[14..16].copy_from_slice(&8u16.to_le_bytes());
-        info[32..36].copy_from_slice(&4u32.to_le_bytes());
-        info[40..56].copy_from_slice(&[0, 0, 0, 0, 0, 0, 255, 7, 0, 255, 0, 8, 255, 0, 0, 9]);
-        f.memory.write(256, &info).unwrap();
-        let bitmap = f.gdi(gdi::CREATE_DIB, &[dc, 256, 0, 32, 0, 0]);
-        assert_ne!(bitmap, 0);
-        let bits = f.memory.u32(32).unwrap();
-        assert_eq!(f.surfaces.get(bitmap).unwrap().pitch, 4);
-        let bytes = if height > 0 {
-            [3, 2, 1, 0, 1, 2, 3, 0]
-        } else {
-            [1, 2, 3, 0, 3, 2, 1, 0]
-        };
-        f.memory.write(bits, &bytes).unwrap();
-        // Color ownership is with the bitmap, not the caller's temporary header.
-        f.memory.write(296, &[0; 16]).unwrap();
-        assert_ne!(f.gdi(gdi::SELECT, &[dc, bitmap]), 0);
-        assert_eq!(f.gdi(gdi::GET_DC, &[0]), WINDOW_DC);
-        assert_eq!(
-            f.gdi(gdi::BITBLT, &[WINDOW_DC, 0, 0, 3, 2, dc, 0, 0, 0xcc0020]),
-            1
-        );
-        let pixels = &f.surfaces.presenter.bgra;
-        assert_eq!(&pixels[..12], &[0, 0, 255, 0, 0, 255, 0, 0, 255, 0, 0, 0]);
-        assert_eq!(&pixels[20..32], &[255, 0, 0, 0, 0, 255, 0, 0, 0, 0, 255, 0]);
     }
 }
 
@@ -549,152 +380,4 @@ fn directdraw_overlapping_scaling_and_conversion_preserve_original_pixels() {
     for y in 1..4 {
         assert_eq!(&f.surfaces.presenter.bgra[y * 20..(y + 1) * 20], &changed);
     }
-}
-
-#[test]
-fn gdi_stretch_modes_mirrors_and_clipping_use_the_shared_pixel_store() {
-    let mut f = Fixture::new();
-    let (source, pixels, _) = f.surface(4, 1, PixelFormat::Bgra32, false);
-    f.memory
-        .write(pixels, &[1, 0, 0, 0, 2, 0, 0, 0, 4, 0, 0, 0, 8, 0, 0, 0])
-        .unwrap();
-    f.gdi(gdi::GET_DC, &[0]);
-    let dc = f.dc(source);
-    assert_eq!(f.gdi(gdi::SET_STRETCH_MODE, &[WINDOW_DC, 3]), 1);
-    assert_eq!(
-        f.gdi(
-            gdi::STRETCHBLT,
-            &[
-                WINDOW_DC,
-                (-3i32) as u32,
-                0,
-                6,
-                1,
-                dc,
-                0,
-                0,
-                4,
-                1,
-                0x00cc0020
-            ]
-        ),
-        1
-    );
-    assert_eq!(
-        &f.surfaces.presenter.bgra[..12],
-        &[4, 0, 0, 0, 4, 0, 0, 0, 8, 0, 0, 0]
-    );
-    assert_eq!(
-        f.gdi(
-            gdi::STRETCHBLT,
-            &[
-                WINDOW_DC,
-                4,
-                0,
-                (-4i32) as u32,
-                1,
-                dc,
-                0,
-                0,
-                4,
-                1,
-                0x00cc0020
-            ]
-        ),
-        1
-    );
-    assert_eq!(
-        &f.surfaces.presenter.bgra[..16],
-        &[8, 0, 0, 0, 4, 0, 0, 0, 2, 0, 0, 0, 1, 0, 0, 0]
-    );
-    assert_eq!(f.gdi(gdi::SET_STRETCH_MODE, &[WINDOW_DC, 1]), 3);
-    assert_eq!(
-        f.gdi(
-            gdi::STRETCHBLT,
-            &[WINDOW_DC, 0, 0, 2, 1, dc, 0, 0, 4, 1, 0x00cc0020]
-        ),
-        1
-    );
-    assert_eq!(&f.surfaces.presenter.bgra[..8], &[0; 8]);
-    assert_eq!(f.gdi(gdi::SET_STRETCH_MODE, &[WINDOW_DC, 2]), 1);
-    assert_eq!(
-        f.gdi(
-            gdi::STRETCHBLT,
-            &[WINDOW_DC, 0, 0, 2, 1, dc, 0, 0, 4, 1, 0x00cc0020]
-        ),
-        1
-    );
-    assert_eq!(&f.surfaces.presenter.bgra[..8], &[3, 0, 0, 0, 12, 0, 0, 0]);
-    assert_eq!(f.gdi(gdi::SET_STRETCH_MODE, &[WINDOW_DC, 4]), 0);
-    assert_eq!(f.raster.last_error(), 87);
-    let before = f.surfaces.presenter.bgra.clone();
-    assert_eq!(
-        f.gdi(
-            gdi::STRETCHBLT,
-            &[WINDOW_DC, 0, 0, 2, 1, dc, 3, 0, 4, 1, 0x00cc0020]
-        ),
-        0
-    );
-    assert_eq!(f.surfaces.presenter.bgra, before);
-}
-
-#[test]
-fn failed_directdraw_dc_output_never_publishes_a_gdi_alias() {
-    struct RejectOutput<'a> {
-        memory: &'a mut Memory,
-        reject_preflight: bool,
-    }
-    impl SurfaceMemory for RejectOutput<'_> {
-        fn read(&self, addr: u32, len: usize) -> Result<Cow<'_, [u8]>, String> {
-            self.memory.read(addr, len)
-        }
-        fn write(&mut self, addr: u32, bytes: &[u8]) -> Result<(), String> {
-            if addr == 32 {
-                Err("injected DC publication failure".into())
-            } else {
-                self.memory.write(addr, bytes)
-            }
-        }
-        fn writable(&self, addr: u32, len: usize) -> Result<(), String> {
-            if self.reject_preflight && addr == 32 {
-                Err("injected inaccessible output".into())
-            } else {
-                self.memory.writable(addr, len)
-            }
-        }
-        fn copy(&mut self, src: u32, dst: u32, len: usize) -> Result<(), String> {
-            self.memory.copy(src, dst, len)
-        }
-    }
-    let mut f = Fixture::new();
-    let (surface, _, _) = f.surface(4, 2, PixelFormat::Bgra32, false);
-    let before = f.objects.object_count();
-    for reject_preflight in [true, false] {
-        for _ in 0..8 {
-            f.memory.put_u32(32, 0xcccccccc).unwrap();
-            assert!(
-                f.ddraw
-                    .call(
-                        dd::SURFACE_DC,
-                        &[surface, 32],
-                        &mut f.surfaces,
-                        &mut f.contexts,
-                        &mut f.objects,
-                        &mut RejectOutput {
-                            memory: &mut f.memory,
-                            reject_preflight
-                        }
-                    )
-                    .is_err()
-            );
-            assert_eq!(f.memory.u32(32).unwrap(), 0xcccccccc);
-            assert_eq!(f.objects.object_count(), before);
-            assert_eq!(f.objects.all_hosts::<adv_os::gdi::GdiObj>().count(), 0);
-        }
-    }
-    let dc = f.dc(surface);
-    assert_eq!(f.objects.all_hosts::<adv_os::gdi::GdiObj>().count(), 1);
-    assert_eq!(f.dd(dd::SURFACE_RELEASE_DC, &[surface, dc]), 0);
-    assert_eq!(f.objects.object_count(), before);
-    assert_eq!(f.objects.all_hosts::<adv_os::gdi::GdiObj>().count(), 0);
 }

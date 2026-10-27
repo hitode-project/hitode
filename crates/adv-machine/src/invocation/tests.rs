@@ -78,7 +78,6 @@ impl crate::Resolver for Bindings {
     fn host_fn(&self, _: &str, name: &str) -> Option<crate::HostFn> {
         Some(crate::HostFn {
             leaf: None,
-            env_leaf: None,
             conv: Conv::Stdcall { argc: 2 },
             handler: match name {
                 "invoked" => invoked,

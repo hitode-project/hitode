@@ -60,7 +60,7 @@ fn bound(trace: &Trace, end: usize, reg: u8) -> Option<u32> {
     None
 }
 
-pub(super) fn prepare(work: &mut Workspace, memory: &Memory) {
+pub(super) fn prepare(work: &mut Unit, memory: &Memory) {
     work.tables.clear();
     for i in 0..work.trace.len() {
         let Op::JmpIndirect(Src::Mem(Mem {

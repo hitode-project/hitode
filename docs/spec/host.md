@@ -66,14 +66,9 @@ This spec covers the host shells. It includes launcher overlay input, the game v
 **Rule**: The native frame size MUST use physical pixels: content points multiplied by `backingScaleFactor` on macOS. Native GPU presentation MUST default to preserving aspect ratio and black bars, using sharp-bilinear sampling unless the host selects an upscaler. Pointer positions MUST map back through the same letterbox.
 **Verification**: Test
 
-### HOST-VIEW-2 Retained output
-
-**Rule**: Composing a frame MUST keep the previous output until commit. Retained pixels MUST survive reuse of the caller's buffer and invalid frames. A repaint without a new guest frame MUST show the retained pixels.
-**Verification**: Test
-
 ### HOST-VIEW-3 One composition path
 
-**Rule**: Software frames, GPU surfaces and video MUST share one background composition path. Composition MUST preserve encoded colors, write opaque alpha and keep the letterbox black.
+**Rule**: Software frames and GPU surfaces MUST draw video as GPU overlays through one background composition path, using CPU video composition only for captures. Composition MUST preserve encoded colors, write opaque alpha and keep the letterbox black.
 **Verification**: Test
 
 ### HOST-VIEW-4 Surface configuration off the UI thread
@@ -140,9 +135,15 @@ Every layer is a 3×3 convolution, so a change reaches at most one input pixel p
 Direct presentation requires Core Animation's `contentsOpaque` capability. Other presentations use the drawable compositor. Display callbacks reclaim retired surfaces; a temporary timer also drains pending retirements when the frame clock is idle or occluded.
 ### HOST-SES-1 Embedding
 
-**Rule**: `Session::new(view, options, on_finished)` MUST use the same execution thread and background service startup as the CLI. A session MUST NOT take over the host `NSApplication` delegate or the host window.
+**Rule**: Embedded sessions MUST use the shared shell execution and background services. A session MUST NOT take over the host `NSApplication` delegate or the host window.
 **Applies to**: macOS
 **Verification**: Review — no test can start AppKit on the main thread.
+
+### HOST-SES-12 Player execution lifetime
+
+**Rule**: The player MUST run at most one Wine session on its persistent execution owner. Idle execution MUST block without polling. Bundled Wine files MUST be prepared off the UI thread before game startup, without selecting the built-in stack when unavailable.
+Preparation MUST validate the compressed stream completely before publishing the installation's ready marker.
+**Verification**: Test
 
 ### HOST-SES-2 Wakeups
 
@@ -161,7 +162,7 @@ Direct presentation requires Core Animation's `contentsOpaque` capability. Other
 
 ### HOST-SES-5 Finish callback
 
-**Rule**: The finish callback MUST run once, on the main thread, with `Finished { exit_code, summary }`. It MUST run only after the execution thread and background services join and guest files and the registry are finalized.
+**Rule**: The finish callback MUST run once, on the main thread, with `Finished { exit_code, summary }`. It MUST wait for session execution, background services, guest files, and registry finalization.
 **Applies to**: macOS
 **Verification**: Review — no test can run the AppKit main loop.
 
@@ -175,7 +176,7 @@ Direct presentation requires Core Animation's `contentsOpaque` capability. Other
 
 **Rule**: A paused session MUST NOT run guest code, MUST freeze guest time and MUST suspend audio output until it resumes. A close request MUST resume the session first so the guest can answer. System sleep MUST still suspend only audio output.
 **Applies to**: Launcher, macOS
-**Verification**: Review — the pause path runs only inside the embedded session loop, which no test drives.
+**Verification**: Test
 
 ## Desktop game library
 
@@ -185,11 +186,15 @@ Direct presentation requires Core Animation's `contentsOpaque` capability. Other
 **Applies to**: macOS, Android
 **Verification**: Test
 
-### HOST-SES-9 Display-link frame clock
+### HOST-SES-10 Submit before refresh
 
-**Rule**: On macOS 14 and later, the game view MUST present only inside display-link callbacks, each publishing the vsync grid to guest refresh pacing. The link MUST stay paused while no frame is pending. Older systems MUST keep the timer schedule.
-**Applies to**: macOS, iOS
-**Verification**: Review — the display link runs only inside the AppKit main loop, which no test drives.
+**Rule**: Published frames MUST schedule upload, scaling and presentation outside guest execution as soon as the presentation cap permits. Display links MUST publish refresh timing without gating submission or running without pending content. Hosts without display links MUST retain deadline timers.
+**Verification**: Test
+
+### HOST-SES-11 Requested display cadence
+
+**Rule**: Display rate requests MUST follow publication timestamps, accounting for mailbox drops and excluding repaints. Supported Apple display links and Android native surfaces MUST receive the estimated guest cadence, capped at 60 Hz. Android surfaces MAY replace AND-APP-10's initial 60 Hz request after measuring cadence.
+**Verification**: Test
 
 ### HOST-LIB-1 Storage and removal
 
@@ -215,11 +220,11 @@ Direct presentation requires Core Animation's `contentsOpaque` capability. Other
 **Applies to**: Launcher, macOS
 **Verification**: Review — the command runs on the AppKit main thread and requires a native session.
 
-### HOST-LIB-5 Saved data management
+### HOST-LIB-5 Drive C:
 
-**Rule**: Backups MUST include the game's independent data directory and registry, without modifying original game files. Restore and import MUST replace data only after copying the complete snapshot successfully, and MUST reject operations while a game runs. Automatic retention MUST preserve manual backups and obey the saved policy.
-**Applies to**: Launcher, macOS
-**Verification**: Test
+**Rule**: Games MUST write their own folders in place, and every game MUST share one Wine prefix in the app data directory. The launcher MUST open its drive C:, which holds what games write elsewhere, in the system file manager. iOS MUST keep drive C: in the app's Documents, and Android MUST serve it through a documents provider.
+**Applies to**: Launcher
+**Verification**: Review — the file managers run on a device.
 
 ### HOST-LIB-6 Playtime tracking
 
@@ -229,7 +234,7 @@ Direct presentation requires Core Animation's `contentsOpaque` capability. Other
 
 ### HOST-RUN-1 Presentation controls
 
-**Rule**: Host volume MUST scale device output without modifying source samples. Fit, integer and stretch modes MUST use the same physical-pixel rectangle for presentation and pointer mapping. Integer mode MUST fall back to proportional downscaling when the game exceeds the drawable.
+**Rule**: Host volume MUST scale device output without modifying source samples. Fit, integer and stretch modes MUST use the same physical-pixel rectangle for presentation and pointer mapping. Integer mode and the command-line window MUST show each game pixel as the most whole device pixels that fit, else shrink proportionally.
 **Applies to**: Launcher, macOS
 **Verification**: Test
 
@@ -321,11 +326,6 @@ Direct presentation requires Core Animation's `contentsOpaque` capability. Other
 
 ## Persistence
 
-### HOST-SAVE-1 Registry file
-
-**Rule**: The host MUST write the registry to a temporary file, sync it and atomically replace the old file. A failed write MUST report the error and keep the old content.
-**Verification**: Test
-
 ### HOST-SAVE-2 Guest file semantics
 
 **Rule**: Guest saves MUST keep Windows per-write file semantics. The host MUST NOT add transactions to guest files or truncate the guest exit path.
@@ -337,14 +337,10 @@ Direct presentation requires Core Animation's `contentsOpaque` capability. Other
 **Applies to**: macOS
 **Verification**: Review — no test can observe the drive cache flush.
 
-### HOST-SAVE-4 MoveFileEx durability
-
-**Rule**: With `MOVEFILE_WRITE_THROUGH`, a cross-volume move MUST flush the copy before deleting the source. A failed flush or a denied delete MUST keep the source.
-**Verification**: Test
-
 ### HOST-SAVE-5 Copied installer state
 
 **Rule**: A game folder holding an empty Silky's Plus `<exe>_inst.xml` template MUST get the installer's per-user state on first run. The filled file MUST name the guest game root and executable, and the `save` template MUST be copied beside it unless portable saves serve it.
+Installer state MUST use the active stack's backing directory for the guest C drive.
 **Verification**: Test
 
 ## macOS packaging
@@ -384,16 +380,21 @@ Direct presentation requires Core Animation's `contentsOpaque` capability. Other
 **Rule**: Shipped files MUST NOT contain developer home, checkout or temporary build paths, including native helpers and archive members.
 **Verification**: Test
 
-Withdrawn: HOST-AND-1, HOST-AND-2, HOST-AND-3, HOST-AND-4, HOST-AND-5, HOST-AND-6, HOST-AND-7, HOST-AND-8, HOST-AND-9, HOST-AND-10, HOST-AND-11
+Withdrawn: HOST-AND-1, HOST-AND-2, HOST-AND-3, HOST-AND-4, HOST-AND-5, HOST-AND-6, HOST-AND-7, HOST-AND-8, HOST-AND-9, HOST-AND-10, HOST-AND-11, HOST-SES-9, HOST-SAVE-1
 
 ### HOST-DAMAGE-1 Software texture uploads
 
 **Rule**: The software GPU presenter MUST transfer only damaged rectangles with matching origins and row pitches, without comparing complete frames. New or resized textures MUST receive complete images, while repaint MUST preserve existing textures. Metal uploads MUST retain immutable, page-owned publication storage through completion and decode it identically to CPU snapshots.
 **Verification**: Test
 
-Metal uses no-copy buffers for publications without video overlays: BGRA uses blits, and other formats use integer GPU decoding. Other presentations reuse the consumer's BGRA snapshot.
+Metal uses no-copy buffers for publications without video overlays: BGRA samples buffer-backed textures directly, and other formats use integer GPU decoding. Other presentations reuse the consumer's BGRA snapshot.
 
 ### HOST-DAMAGE-2 Software work counters
 
 **Rule**: Software frame counters MUST expose copied, CPU-converted, CPU-uploaded and GPU-transferred bytes, published frames and empty damage. Byte rates MUST use elapsed real time and exclude diagnostic reference work.
+**Verification**: Test
+
+### HOST-DAMAGE-3 Sample shared snapshots
+
+**Rule**: Metal BGRA software presentation without video overlays MUST sample an immutable buffer-backed texture directly from snapshot storage. The texture MUST retain that storage through GPU use while guest writes and mailbox reuse continue independently.
 **Verification**: Test

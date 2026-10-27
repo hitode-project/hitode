@@ -268,25 +268,23 @@ pub async fn start_game(
         .unwrap()
         .launch(&id)
         .map_err(|e| e.to_string())?;
+    let options = playback
+        .prepare(window.app_handle(), exe, data_dir, codepage)
+        .await?;
     let (reply, result) = std::sync::mpsc::sync_channel(1);
     let host_window = window.clone();
     window
         .run_on_main_thread(move || {
             let started = HOST.with_borrow_mut(|host| {
                 let host = host.as_mut().unwrap();
-                if crate::saves::busy() {
-                    return Err("存档操作正在进行，请稍后启动".into());
-                }
                 if host.session.is_some() {
                     return Err("a game is already running".into());
                 }
-                let backup_data = data_dir.clone();
-                let options = playback.options(exe, data_dir, codepage)?;
                 let view = GameView::new(640, 480)?;
                 host.container.set_game(Some(&view));
                 let finished_window = host_window.clone();
                 let started_at = Instant::now();
-                let session = Session::new(
+                let session = Session::new_with_execution(
                     view,
                     options,
                     Box::new(move |result| {
@@ -298,12 +296,12 @@ pub async fn start_game(
                             host.exit.take().flatten()
                         });
                         let elapsed = started_at.elapsed();
-                        crate::saves::after_game(&finished_window, &backup_data);
                         crate::play::finished(&finished_window, id, result, elapsed);
                         if let Some(code) = exit {
                             finished_window.app_handle().exit(code);
                         }
                     }),
+                    &host_window.state::<adv_shell::Execution>(),
                 );
                 match session {
                     Ok(session) => {
@@ -539,8 +537,4 @@ pub fn game_fps() -> f64 {
             .and_then(|host| host.session.as_ref())
             .map_or(0.0, Session::fps)
     })
-}
-
-pub(crate) fn is_running() -> bool {
-    HOST.with_borrow(|host| host.as_ref().is_some_and(|host| host.session.is_some()))
 }

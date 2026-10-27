@@ -248,6 +248,28 @@ impl Guest for View<'_> {
             .privatize_copy_pages(addr, len as usize)
             .map_err(|_| fault(addr, len as usize))
     }
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    fn map_shared_file(
+        &mut self,
+        addr: u32,
+        len: u32,
+        fd: std::os::fd::BorrowedFd<'_>,
+        offset: u64,
+        prot: Prot,
+    ) -> Result<(), MemFault> {
+        let writable = prot.contains(Prot::WRITE);
+        adv_cpu_core::shared_memory::SharedAllocation::map_file(fd, offset, len as usize, writable)
+            .and_then(|storage| {
+                self.memory
+                    .map_shared_file(addr, len as usize, storage, prot.0)
+            })
+            .map_err(|_| fault(addr, len as usize))
+    }
     fn map_file_pages(
         &mut self,
         addr: u32,
@@ -296,6 +318,15 @@ impl Guest for View<'_> {
             return Err(fault(dst, len));
         }
         self.memory.copy(src, dst, len).map_err(|_| fault(dst, len))
+    }
+    fn fill_memory(&mut self, addr: u32, byte: u8, len: usize) -> Result<(), MemFault> {
+        let len32 = u32::try_from(len).map_err(|_| fault(addr, len))?;
+        if !self.accessible(addr, len32, Prot::WRITE) {
+            return Err(fault(addr, len));
+        }
+        self.memory
+            .fill(addr, &[byte], len)
+            .map_err(|_| fault(addr, len))
     }
     fn push_f64(&mut self, value: f64) {
         self.state.commit_mmx();
@@ -362,6 +393,22 @@ impl Guest for Cpu {
     fn wants_code_images(&self) -> bool {
         cfg!(native) && self.native
     }
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    fn map_shared_file(
+        &mut self,
+        addr: u32,
+        len: u32,
+        fd: std::os::fd::BorrowedFd<'_>,
+        offset: u64,
+        prot: Prot,
+    ) -> Result<(), MemFault> {
+        self.view(|guest| guest.map_shared_file(addr, len, fd, offset, prot))
+    }
     forward! {
         fn register_code_image(&mut self, image: adv_cpu_core::AotImage) -> ();
         fn lock_pages(&mut self, addr: u32, len: u32) -> Result<(), PageLockError>;
@@ -386,6 +433,7 @@ impl Guest for Cpu {
         fn map_shared_counters(&mut self, addr: u32, len: u32)
             -> Result<Rc<dyn adv_cpu_core::backend::CounterStorage>, MemFault>;
         fn copy_memory(&mut self, src: u32, dst: u32, len: usize) -> Result<(), MemFault>;
+        fn fill_memory(&mut self, addr: u32, byte: u8, len: usize) -> Result<(), MemFault>;
         fn push_f64(&mut self, value: f64) -> ();
         fn pop_f64(&mut self) -> Option<f64>;
         fn write(&mut self, addr: u32, data: &[u8]) -> Result<(), MemFault>;
@@ -438,27 +486,39 @@ struct Raw<'a> {
 }
 
 impl ExecutionTrap for Raw<'_> {
-    fn leaf_call(&self, pc: u32, word: u32) -> bool {
-        self.handler.leaf_call(pc, word)
+    fn native_region(
+        &self,
+        pc: u32,
+        code: &[u8],
+    ) -> Vec<adv_cpu_core::native_region::NativeRegion> {
+        self.handler.native_region(pc, code)
     }
 
-    fn leaf(
+    fn host_thunk(&self, pc: u32, word: u32) -> Option<u32> {
+        self.handler.host_thunk(pc, word)
+    }
+
+    fn redirect(&self, pc: u32) -> Option<(u32, &[u8])> {
+        self.handler.redirect(pc)
+    }
+
+    fn host_call(
         &mut self,
         state: &mut CpuState,
         memory: &mut Memory,
-        pc: u32,
-        word: u32,
-    ) -> Option<u64> {
+        thunk: u32,
+    ) -> Result<bool, String> {
+        state.commit_mmx();
         let images = self.images;
-        self.handler.on_leaf(
+        let action = self.handler.on_host_call(
             &mut View {
                 state,
                 memory,
                 images,
             },
-            pc,
-            word,
-        )
+            thunk,
+        );
+        Ok(action == TrapAction::Park)
     }
 
     fn guest_time_us(&mut self) -> Option<u64> {

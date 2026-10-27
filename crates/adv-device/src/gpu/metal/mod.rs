@@ -77,6 +77,7 @@ pub(super) struct State {
     failure: Arc<OnceLock<String>>,
     ring: Ring,
     command: Option<Object<dyn MTLCommandBuffer>>,
+    completion: Option<Arc<display::Completion>>,
     initialization: Option<wgpu::CommandEncoder>,
     reference_queue: wgpu::Queue,
     encoder: Option<Object<dyn MTLRenderCommandEncoder>>,
@@ -118,6 +119,7 @@ impl State {
             gate: context.gate.clone(),
             failure: context.failure.clone(),
             command: None,
+            completion: None,
             initialization: None,
             reference_queue: context.queue.clone(),
             encoder: None,
@@ -155,8 +157,14 @@ impl State {
             self.owner.submissions.fetch_add(1, Ordering::Relaxed);
         }
         if let Some(command) = self.command.take() {
-            self.ring
-                .submitted(&command, self.gate.clone(), self.failure.clone());
+            let completion = Arc::new(display::Completion::default());
+            self.ring.submitted(
+                &command,
+                self.gate.clone(),
+                self.failure.clone(),
+                completion.clone(),
+            );
+            self.completion = Some(completion);
             command.commit();
             self.owner.submissions.fetch_add(1, Ordering::Relaxed);
             self.owner
@@ -168,6 +176,7 @@ impl State {
         self.draws = 0;
     }
     pub(super) fn select_wgpu(&mut self, reason: SwitchReason) {
+        self.completion = None;
         if self.last_metal {
             self.owner.backend_switches.fetch_add(1, Ordering::Relaxed);
             self.owner.backend_switches_by_reason[reason as usize].fetch_add(1, Ordering::Relaxed);
@@ -255,11 +264,10 @@ impl State {
         self.owner = gpu.programmable.batch_stats.clone();
         let attachment = gpu.attachment_color(target)?;
         let white = gpu.white.clone();
-        let images: Vec<_> = draw
+        let images = draw
             .textures
             .iter()
-            .map(|t| t.image.as_ref().unwrap_or(&white))
-            .collect();
+            .map(|t| t.image.as_ref().unwrap_or(&white));
         if initialize || !attachment.image.metal.initialized.load(Ordering::Relaxed) {
             self.flush();
             self.select_wgpu(SwitchReason::Other);
@@ -269,7 +277,7 @@ impl State {
                 .create_command_encoder(&Default::default());
             target.image.initialize_metal(&mut encoder, &self.owner);
             attachment.image.initialize_metal(&mut encoder, &self.owner);
-            for image in &images {
+            for image in images.clone() {
                 image.initialize_metal(&mut encoder, &self.owner);
             }
             gpu.context.queue.submit([encoder.finish()]);
@@ -309,12 +317,16 @@ impl State {
             base
         };
         let sizes_offset = offset;
-        let sizes: Vec<u32> = draw.streams.iter().map(|s| s.bytes.len() as u32).collect();
-        self.ring.write(offset, bytemuck::cast_slice(&sizes));
+        let mut sizes = [0u32; 16];
+        for (size, stream) in sizes.iter_mut().zip(&draw.streams) {
+            *size = stream.bytes.len() as u32;
+        }
+        self.ring
+            .write(offset, bytemuck::cast_slice(&sizes[..draw.streams.len()]));
         offset += 256;
-        let mut offsets = Vec::new();
-        for stream in &draw.streams {
-            offsets.push(offset);
+        let mut offsets = [0u64; 16];
+        for (stream, stream_offset) in draw.streams.iter().zip(&mut offsets) {
+            *stream_offset = offset;
             self.ring.write(offset, &stream.bytes);
             offset += (stream.bytes.len() as u64).next_multiple_of(4);
         }
@@ -452,14 +464,14 @@ impl State {
                     slot,
                 );
             }
-            for (index, offset) in offsets.iter().enumerate() {
+            for (index, offset) in offsets[..draw.streams.len()].iter().enumerate() {
                 encoder.setVertexBuffer_offset_atIndex(
                     Some(&self.ring.buffer),
                     *offset as usize,
                     30 - index,
                 );
             }
-            for (index, (binding, image)) in draw.textures.iter().zip(&images).enumerate() {
+            for (index, (binding, image)) in draw.textures.iter().zip(images.clone()).enumerate() {
                 let slot = draw.program.textures[..index]
                     .iter()
                     .filter(|&&vertex| vertex == draw.program.textures[index])
@@ -500,7 +512,7 @@ impl State {
         self.draws += 1;
         self.owner.metal_draws.fetch_add(1, Ordering::Relaxed);
         self.owner.ring_bytes.fetch_add(
-            (sizes.len() * 4
+            (draw.streams.len() * 4
                 + draw.streams.iter().map(|s| s.bytes.len()).sum::<usize>()
                 + draw.indices.as_ref().map_or(0, |v| v.len() * 4)) as u64,
             Ordering::Relaxed,

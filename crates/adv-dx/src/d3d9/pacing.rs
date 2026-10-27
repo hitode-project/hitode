@@ -39,13 +39,20 @@ fn locked(
     let period = period.as_secs_f64() * 1e6;
     let rate = 1e6 / period;
     let vsyncs = (rate / f64::from(hz)).round();
-    // 59.94 Hz panels lock; 144 Hz and other non-multiples keep the machine clock.
-    if vsyncs < 1.0 || (rate - vsyncs * f64::from(hz)).abs() > 0.01 * rate {
+    if vsyncs < 1.0 {
         return None;
     }
     let now_f = now as f64;
     let origin = now_f - since.as_secs_f64() * 1e6;
     let after_now = origin + ((now_f - origin) / period).floor() * period + period;
+    if (rate - vsyncs * f64::from(hz)).abs() > 0.01 * rate {
+        // Keep the rational guest cadence, selecting its nearest display
+        // opportunity instead of rounding the refresh ratio for every frame.
+        let frame = u128::from(now) * u128::from(hz) / 1_000_000 + 1;
+        let target = (frame * 1_000_000).div_ceil(u128::from(hz)) as f64;
+        let snapped = origin + ((target - origin) / period).round() * period;
+        return Some(snapped.max(after_now).round() as u64);
+    }
     let guest = vsyncs * period;
     let boundary = match previous {
         // On time: one guest period after the last boundary, snapped to its vsync.
@@ -198,7 +205,7 @@ mod tests {
             deadline(1_001_000, 0, 60, false, fast, Some(1_000_000)),
             Ok(Some(1_016_666))
         );
-        // 59.94 Hz follows the panel; 144 Hz falls back to the machine clock.
+        // 59.94 Hz follows the panel; 144 Hz selects a rational guest boundary on its grid.
         assert_eq!(
             deadline(
                 1_000_000,
@@ -212,8 +219,37 @@ mod tests {
         );
         assert_eq!(
             deadline(1_000_000, 1, 60, false, Some((us(0), us(6_944))), None),
-            deadline(1_000_000, 1, 60, false, None, None)
+            Ok(Some(1_013_888))
         );
+    }
+
+    #[test]
+    // spec: GFX-PACE-1
+    fn noninteger_display_rates_keep_guest_cadence_without_phase_drift() {
+        for host_hz in [144u64, 165] {
+            let period = std::time::Duration::from_nanos(1_000_000_000 / host_hz);
+            let mut now = 0;
+            let mut previous = None;
+            let mut last = 0;
+            for frame in 1..=600u64 {
+                let since =
+                    std::time::Duration::from_nanos((now * 1000) % period.as_nanos() as u64);
+                let boundary = deadline(now, 1, 60, false, Some((since, period)), previous)
+                    .unwrap()
+                    .unwrap();
+                assert!(boundary > now);
+                let phase = (boundary as f64 * 1000. / period.as_nanos() as f64).fract();
+                assert!(phase.min(1. - phase) < 0.001);
+                assert!(
+                    (boundary as f64 - frame as f64 * 1_000_000. / 60.).abs()
+                        <= period.as_secs_f64() * 1_000_000.
+                );
+                now = boundary + 4_000;
+                previous = Some(boundary);
+                last = boundary;
+            }
+            assert!((last as i64 - 10_000_000).abs() < 7_000);
+        }
     }
 
     #[test]

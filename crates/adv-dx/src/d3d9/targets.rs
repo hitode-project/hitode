@@ -81,12 +81,7 @@ fn create(
     {
         return Outcome::Return(INVALID);
     }
-    if !matches!(format, 21 | 22)
-        || samples != 0
-        || quality != 0
-        || lockable != 0
-        || !shared.is_null()
-    {
+    if !matches!(format, 21 | 22) || samples != 0 || quality != 0 || !shared.is_null() {
         return Outcome::Return(UNAVAILABLE);
     }
     let target = match env.ext.get::<State>().gpu.as_ref() {
@@ -124,6 +119,7 @@ fn create(
             surface: Some(surface),
             storage: 0,
             owns_surface: true,
+            lockable: lockable != 0,
             lock: None,
             container: None,
             levels: Vec::new(),
@@ -171,9 +167,9 @@ fn set(env: &mut Env<'_>, this: GuestPtr<()>, index: u32, surface: GuestPtr<()>)
     }
     if let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, device_id) {
         d.render_target = Some(new);
-        d.versions[3] += 1;
-        d.versions[4] += 1;
         d.fixed.target_changed(width, height);
+        d.touch(3);
+        d.touch(4);
     }
     if old != Some(new) {
         release_binding(env, old);

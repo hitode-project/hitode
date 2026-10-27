@@ -114,7 +114,7 @@ mod tests {
             for (message, count) in [
                 ("audio: audio warning", 2),
                 ("WARN adv_dx::d3d9::shaders: shader warning", 2),
-                ("ERROR adv_win32::kernel32::module: module error", 1),
+                ("ERROR adv_nt::loader: module error", 1),
                 ("WARN adv_device::text::windows: font warning", 2),
                 ("ERROR adv_device::device: audio error", 2),
                 ("filtered info", 0),
@@ -132,7 +132,7 @@ mod tests {
         log::warn!(target: "adv_device::device", "audio warning");
         log::warn!(target: "adv_dx::d3d9::shaders", "shader warning");
         log::warn!(target: "adv_dx::d3d9::shaders", "shader warning");
-        log::error!(target: "adv_win32::kernel32::module", "module error");
+        log::error!(target: "adv_nt::loader", "module error");
         log::warn!(target: "adv_device::text::windows", "font warning");
         log::warn!(target: "adv_device::text::windows", "font warning");
         log::error!(target: "adv_device::device", "audio error");

@@ -109,8 +109,8 @@ pub enum Op {
     CallIndirect(Src),
     Setcc(ConditionCode, u8),
     Cmov(ConditionCode, u8, Src),
-    /// A register shifted by a count of 1 to 31.
-    Shift(ShiftKind, u8, u32),
+    /// A dword shifted by an immediate count or CL (`None`).
+    Shift(ShiftKind, Src, Option<u32>),
     /// `imul dst, source` or `imul dst, source, imm`.
     Imul(u8, Src, Option<u32>),
     /// `adc` (false) or `sbb` (true) into a register.
@@ -130,6 +130,8 @@ pub enum Op {
     Integer(super::integer::Integer),
     /// An x87 instruction `fast::classify` accepts.
     X87(super::x87::X87),
+    /// An exact signed 64-bit integer load into the extended x87 stack.
+    Fild64(Mem, u8, Option<u16>),
     /// Anything else the interpreter runs without transferring control:
     /// the `interpret` stub runs it, by its index in the trace's helpers.
     Helper(u8),
@@ -278,7 +280,9 @@ pub fn plan(instruction: &Instruction) -> Option<Op> {
     }
     Some(match mnemonic {
         M::Nop => Op::Nop,
-        // Hints that never fault.
+        // Hints that never fault; ENDBR32 marks indirect branch targets for
+        // CET, which the guest never enables.
+        M::Endbr32 => Op::Nop,
         M::Prefetcht0 | M::Prefetcht1 | M::Prefetcht2 | M::Prefetchnta => Op::Nop,
         M::Cld => Op::Direction(false),
         M::Std => Op::Direction(true),
@@ -333,10 +337,12 @@ pub fn plan(instruction: &Instruction) -> Option<Op> {
         M::Cwde => Op::Extend(0, Narrow8or16::Word(0), true),
         M::Cdq => Op::Cdq,
         M::Shl | M::Sal | M::Shr | M::Sar | M::Rol | M::Ror => {
-            let dst = register(0)?;
-            if instruction.op_kind(1) != OpKind::Immediate8 {
-                return None;
-            }
+            let dst = operand(instruction, 0)?;
+            let count = match instruction.op_kind(1) {
+                OpKind::Immediate8 => Some(u32::from(instruction.immediate8()) & 31),
+                OpKind::Register if instruction.op_register(1) == Register::CL => None,
+                _ => return None,
+            };
             let kind = match mnemonic {
                 M::Shl | M::Sal => ShiftKind::Shl,
                 M::Shr => ShiftKind::Shr,
@@ -345,9 +351,10 @@ pub fn plan(instruction: &Instruction) -> Option<Op> {
                 _ => ShiftKind::Ror,
             };
             // A zero count changes nothing, flags included.
-            match u32::from(instruction.immediate8()) & 31 {
-                0 => Op::Nop,
-                count => Op::Shift(kind, dst, count),
+            match (dst, count) {
+                (Src::Reg(_), Some(0)) => Op::Nop,
+                (Src::Reg(_), _) | (Src::Mem(_), None) => Op::Shift(kind, dst, count),
+                _ => return None,
             }
         }
         M::Imul => {
@@ -428,10 +435,7 @@ pub fn plan(instruction: &Instruction) -> Option<Op> {
         | M::Cmovle
         | M::Cmovg => {
             let source = operand(instruction, 1)?;
-            match register(0)? {
-                ESP | EBP => return None,
-                target => Op::Cmov(instruction.condition_code(), target, source),
-            }
+            Op::Cmov(instruction.condition_code(), register(0)?, source)
         }
         _ => return None,
     })
@@ -665,9 +669,13 @@ fn quick_op(b: &mut Bytes, pc: u32) -> Option<Op> {
             }
         }
         0xb8..=0xbf => Op::Mov(Src::Reg(opcode & 7), Src::Imm(b.u32()?)),
-        0xc1 | 0xd1 => {
+        0xc1 | 0xd1 | 0xd3 => {
             let (reg, rm) = b.modrm()?;
-            let count = if opcode == 0xc1 { b.u8()? } else { 1 };
+            let count = match opcode {
+                0xc1 => Some(u32::from(b.u8()?) & 31),
+                0xd1 => Some(1),
+                _ => None,
+            };
             let kind = match reg {
                 0 => ShiftKind::Rol,
                 1 => ShiftKind::Ror,
@@ -676,10 +684,10 @@ fn quick_op(b: &mut Bytes, pc: u32) -> Option<Op> {
                 7 => ShiftKind::Sar,
                 _ => return None,
             };
-            let dst = register(rm)?;
-            match u32::from(count) & 31 {
-                0 => Op::Nop,
-                count => Op::Shift(kind, dst, count),
+            match (rm, count) {
+                (Src::Reg(_), Some(0)) => Op::Nop,
+                (Src::Reg(_), _) | (Src::Mem(_), None) => Op::Shift(kind, rm, count),
+                _ => return None,
             }
         }
         0xc2 => match b.u16()? {
@@ -732,10 +740,10 @@ fn quick_op(b: &mut Bytes, pc: u32) -> Option<Op> {
             let second = b.u8()?;
             let cc = CONDITIONS[usize::from(second & 15)];
             match second {
-                0x40..=0x4f => match b.modrm()? {
-                    (ESP | EBP, _) => return None,
-                    (reg, rm) => Op::Cmov(cc, reg, rm),
-                },
+                0x40..=0x4f => {
+                    let (reg, rm) = b.modrm()?;
+                    Op::Cmov(cc, reg, rm)
+                }
                 0x80..=0x8f => {
                     let rel = b.u32()?;
                     Op::Jcc(Cc::Flags(cc), near(b, rel))
@@ -869,6 +877,12 @@ impl<'m> Fetcher<'m> {
             Op::Strings(strings)
         } else if let Some(integer) = super::integer::plan(&instruction, index) {
             Op::Integer(integer)
+        } else if instruction.code() == iced_x86::Code::Fild_m64int {
+            Op::Fild64(
+                memory(&instruction)?,
+                index,
+                helpers.last().and_then(|h| h.prepared.x87_opcode()),
+            )
         } else if let Some(x87) = super::x87::plan(
             &instruction,
             index,
@@ -923,7 +937,7 @@ impl Op {
             }
             Op::Strings(_) => (F::NONE, F::NONE, true),
             // The helper may run it.
-            Op::X87(_) => (F::NONE, F::NONE, true),
+            Op::X87(_) | Op::Fild64(..) => (F::NONE, F::NONE, true),
             Op::Integer(integer) => integer.effects(),
             Op::Mov(dst, src) => (F::NONE, F::NONE, mem(dst) || mem(src)),
             Op::Alu(_, dst, src) => (F::NONE, F::ALL, mem(dst) || mem(src)),
@@ -941,13 +955,19 @@ impl Op {
             Op::Jcc(Cc::Loop(Some(_)), _) => (F::ZF, F::NONE, false),
             Op::Jcc(..) => (F::NONE, F::NONE, false),
             Op::Cmov(cc, _, source) => (F::of(cc), F::NONE, mem(source)),
-            Op::Shift(kind, _, count) => {
-                let overflow = if count == 1 { F::OF } else { F::NONE };
+            Op::Shift(kind, dst, count) => {
+                let overflow = if count.is_none_or(|count| count == 1) {
+                    F::OF
+                } else {
+                    F::NONE
+                };
                 let writes = match kind {
                     ShiftKind::Rol | ShiftKind::Ror => F::CF,
                     _ => F::CF.or(F::PF).or(F::ZF).or(F::SF),
                 };
-                (F::NONE, writes.or(overflow), false)
+                let writes = writes.or(overflow);
+                let reads = if count.is_none() { writes } else { F::NONE };
+                (reads, writes, mem(dst))
             }
             Op::Imul(_, source, _) => (F::NONE, F::CF.or(F::OF), mem(source)),
             Op::Carry(_, _, source) => (F::CF, F::ALL, mem(source)),
@@ -1093,7 +1113,30 @@ pub(super) mod tests {
         plan(&instruction).map(|op| (op, instruction.len() as u32))
     }
 
-    // spec: A64-TR-1
+    // spec: A64-TR-1, A64-FLAG-2
+    #[test]
+    fn cl_shifts_use_the_shift_path_for_dword_registers_and_memory() {
+        for group in [0, 1, 4, 5, 6, 7] {
+            for dst in 0..8 {
+                for mode in [0x00, 0xc0] {
+                    let bytes = [0xd3, mode | group << 3 | dst, 0, 0, 0, 0, 0];
+                    let expected = iced(&bytes, 0).unwrap();
+                    assert!(matches!(expected.0, Op::Shift(_, _, None)));
+                    assert_eq!(quick(&bytes, 0), Some(expected));
+                }
+            }
+        }
+        for bytes in [
+            &[0xd2, 0xe0][..],
+            &[0x66, 0xd3, 0xe0],
+            &[0xd3, 0xd0],
+            &[0x0f, 0xa5, 0xd0],
+        ] {
+            assert_eq!(iced(bytes, 0), None);
+        }
+    }
+
+    // spec: A64-TR-1, A64-FLAG-2
     #[test]
     fn quick_agrees_with_iced() {
         let mut rng = Rng(0x9e37_79b9_7f4a_7c15);

@@ -103,7 +103,7 @@ fn probes_preserve_results_flags_and_count_each_fallback_without_disabled_instru
             .lines()
             .find(|line| line.starts_with(&format!("\"fixture.dll\",\"{name}\",")))
             .unwrap();
-        assert!(row.ends_with(",1,1,0.500000,0.000000"), "{row}");
+        assert!(row.ends_with(",1,1,0.500000"), "{row}");
     }
     assert_eq!(on.sys.host_calls, 2);
     on.sys

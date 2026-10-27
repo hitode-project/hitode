@@ -1,6 +1,0 @@
-LIBRARY fixture_dynamic
-EXPORTS
-    ProbeAdd @1
-    ProbeReadTls @2
-    ProbeSetTls @3
-    ProbeBase @4

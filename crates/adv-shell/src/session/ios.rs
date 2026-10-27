@@ -1,6 +1,6 @@
 //! The iOS main loop: the wake descriptor and a deadline timer on the main
-//! CFRunLoop, and a display link that runs due presentations on a vsync and
-//! publishes the vsync grid for guest pacing (PROC-CLOCK-4, DEV-FRAME-9).
+//! CFRunLoop, and a display link publishing the vsync grid for guest pacing
+//! (PROC-CLOCK-4).
 use super::Driver;
 use objc2::rc::Retained;
 use objc2::runtime::NSObject;
@@ -45,9 +45,7 @@ define_class!(
                 driver.view.vsync.publish(at, Duration::from_secs_f64(period));
                 driver.view.period.set((period * 1e9) as i64);
             }
-            driver.view.ready.set(true);
             driver.drive();
-            driver.view.ready.set(false);
         }
     }
 );
@@ -131,19 +129,21 @@ impl MainLoop {
         })
     }
 
-    /// A due presentation waits for the next vsync; anything later sleeps on
-    /// the timer.
-    pub(super) fn arm(&self, next: Option<Instant>) -> Result<(), String> {
-        let mut date = f64::MAX;
-        if crate::frontend::request_vsync(next, self.pending.get()) {
+    /// Sample the display clock for new content without delaying submission.
+    pub(super) fn arm(&self, next: Option<Instant>, rate: u32, frame: bool) -> Result<(), String> {
+        self.link.setPreferredFrameRateRange(CAFrameRateRange {
+            minimum: rate as f32,
+            maximum: rate as f32,
+            preferred: rate as f32,
+        });
+        if crate::frontend::request_vsync(frame.then(Instant::now), self.pending.get()) {
             self.pending.set(true);
             self.link.setPaused(false);
-        } else if let Some(next) = next
-            && !self.pending.get()
-        {
-            date = CFAbsoluteTimeGetCurrent()
-                + next.saturating_duration_since(Instant::now()).as_secs_f64();
         }
+        let date = next.map_or(f64::MAX, |next| {
+            CFAbsoluteTimeGetCurrent()
+                + next.saturating_duration_since(Instant::now()).as_secs_f64()
+        });
         if self.timer.is_valid() {
             self.timer.set_next_fire_date(date);
         }

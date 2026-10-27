@@ -24,10 +24,7 @@ pub(super) fn register(registry: &mut Registry) {
         declaration_device_ABI,
         declaration_elements_ABI,
         create_ABI,
-        adv_abi::Api {
-            env_leaf: Some(super::leaf_calls::binding),
-            ..set_ABI
-        },
+        super::unchanged::unless_unchanged!(set_ABI, super::unchanged::binding),
         get_ABI,
     ] {
         registry.register(api);
@@ -294,9 +291,9 @@ pub(super) fn bind(env: &mut Env<'_>, device: Id, new: Option<Id>) -> u32 {
     let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, device) else {
         return INVALID;
     };
-    d.versions[7] += 1;
     d.buffers.declaration = new;
     d.fixed.clear_fvf();
+    d.touch(7);
     if new != old
         && let Some(id) = old
         && let Some(Some(dead)) = com(env).release_internal(&mut env.sys.objects, id)
@@ -325,7 +322,7 @@ pub(super) fn set(env: &mut Env<'_>, this: GuestPtr<()>, pointer: GuestPtr<()>) 
 }
 /// Reports only declarations bound by SetVertexDeclaration; after SetFVF it
 /// returns null where native D3D9 would return an implicit FVF declaration.
-#[win32(d3d9,name="IDirect3DDevice9::GetVertexDeclaration",level=implement,leaf)]
+#[win32(d3d9,name="IDirect3DDevice9::GetVertexDeclaration",level=implement)]
 pub(super) fn get(env: &mut Env<'_>, this: GuestPtr<()>, output: GuestPtr<u32>) -> u32 {
     if output.write(env.cpu, 0).is_err() {
         return INVALID;

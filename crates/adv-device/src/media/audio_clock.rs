@@ -6,6 +6,13 @@ pub(crate) struct AudioClock {
 }
 
 impl AudioClock {
+    #[cfg(feature = "media")]
+    pub fn missing(&mut self, frames: usize, rate: u32) -> u64 {
+        let start = self.next.unwrap_or(0.0);
+        self.next = Some(start + frames as f64 * 1_000_000.0 / f64::from(rate));
+        start.round() as u64
+    }
+
     pub fn stamp(&mut self, pts: u64, frames: usize, rate: u32) -> u64 {
         let raw = pts as f64;
         let start = self

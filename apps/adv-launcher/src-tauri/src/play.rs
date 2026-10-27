@@ -90,6 +90,24 @@ pub struct Playback {
     smoothing: Option<bool>,
 }
 impl Playback {
+    /// Prepare files off the UI thread before creating the native view.
+    pub(crate) async fn prepare(
+        &self,
+        app: &tauri::AppHandle,
+        exe: std::path::PathBuf,
+        data_dir: std::path::PathBuf,
+        codepage: u32,
+    ) -> Result<adv_shell::Options, String> {
+        let mut options = self.options(exe, data_dir, codepage)?;
+        crate::drive::apply(app, &mut options)?;
+        let distribution =
+            crate::distribution::path(&app.path().app_data_dir().map_err(|e| e.to_string())?);
+        tauri::async_runtime::spawn_blocking(move || crate::distribution::prepare(&distribution))
+            .await
+            .map_err(|e| e.to_string())??;
+        Ok(options)
+    }
+
     pub(crate) fn apply(&self, session: &Session) -> Result<(), String> {
         let scale = match self.scale.as_str() {
             "fit" => adv_shell::Scaling::Fit,

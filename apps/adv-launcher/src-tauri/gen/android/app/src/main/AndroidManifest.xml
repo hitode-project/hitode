@@ -17,7 +17,8 @@
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:theme="@style/Theme.adv_launcher"
-        android:usesCleartextTraffic="${usesCleartextTraffic}">
+        android:usesCleartextTraffic="${usesCleartextTraffic}"
+        android:hasFragileUserData="true">
         <activity
             android:configChanges="orientation|keyboardHidden|keyboard|screenSize|locale|smallestScreenSize|screenLayout|uiMode|density|fontScale|layoutDirection|navigation|touchscreen|colorMode"
             android:launchMode="singleTask"
@@ -31,6 +32,18 @@
                 <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- Drive C: of the Wine prefix, in the system Files app. -->
+        <provider
+          android:name=".DriveProvider"
+          android:authorities="org.hitode.launcher.drive"
+          android:exported="true"
+          android:grantUriPermissions="true"
+          android:permission="android.permission.MANAGE_DOCUMENTS">
+          <intent-filter>
+            <action android:name="android.content.action.DOCUMENTS_PROVIDER" />
+          </intent-filter>
+        </provider>
 
         <provider
           android:name="androidx.core.content.FileProvider"

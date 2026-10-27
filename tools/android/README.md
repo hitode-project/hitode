@@ -43,7 +43,7 @@ Tests retry only after confirmed connection failure before execution.
 `-DeviceBudgetSeconds` defaults to 1100 seconds; exhaustion saves completed targets and cleans up without classifying infrastructure errors as test failures.
 
 Replay accepts `--compile-threads 1..8`, corresponding to experimental `ADV_COMPILE_THREADS`; leaving it unset preserves the thread budget.
-`ADV_ARTIFACT_ROOT` can direct replay and summary outputs to the task's local temporary directory; the default is ignored `target/`.
+`ADV_ARTIFACT_ROOT` can direct summary outputs to the task's local temporary directory; the default is ignored `target/`.
 `--record-device-state` records battery temperature, screen, foreground window, and shell CPU ranges after asset verification, before guest startup, and after completion.
 Callers arrange cooling and shared locks; raw state stays local.
 `--cpu-mask <hex-mask>` restricts guest and compiler-thread affinity because adb-shell and foreground-app CPU availability can differ.
@@ -123,75 +123,3 @@ packing, metrics, resources, transforms and pixel formats without proprietary
 fonts. The optional system-font case also exercises Japanese Unicode/DBCS output
 when a Japanese face exists.
 These checks do not open a DAC.
-
-## Fixed game input and frame capture
-
-Stage B adds `adv-scene-v1` schedules alongside the existing timed lists. See
-the B report for tested scope. A scene
-contains ordered `command`, `delay_ms`, or `checkpoint` steps. Checkpoints use:
-
-```json
-{"checkpoint":"chapter","await":{"frame_fnv1a64":"a6968230ebfbf74d","timeout_ms":30000,"hold_key":17},"reset_metrics":true}
-```
-
-`await-frame` arms before holding the key and resuming. Matching a complete raw
-BGRA frame releases the held key and freezes the guest before ACK/report/capture.
-Timeout also releases and freezes, but permanently fails the run. Optional
-`probes` (`x`, `y`, `bgra`) only prefilter the full hash. PNG exports force alpha
-to 255; raw frames may have zero or mixed alpha, so neither raw hashes nor probe
-alpha can be inferred from an exported PNG alone. Use a frozen report as truth.
-`current:true` can accept an already-present setup screen, but cannot hold a key.
-
-Scene runs require `--font-profile DEVICE_PATH --font-manifest LOCAL_JSON`.
-The manifest has `profile:{path,sha256}` and `files:[{path,sha256,bytes}]`.
-All deployed assets, seed files, fonts, codepage and scene steps are bound to the
-reference; reused device assets must each match a local counterpart. Local files
-not deployed are excluded. No game, save or font files are checked into the repo.
-
-`--record-scene-reference OUTPUT/reference.json` records observations only.
-Inspect frozen images and assertions, then approve the reference independently;
-use `--scene-reference` in a separate run to validate it. `--cold` removes only
-the new overlay's JIT archive; `--warm-profile FILE` installs a specific archive.
-Both retain the same save seed. The resulting archive is pulled into the output.
-On arm64 devices the engine is a64, which writes neither archive, so cold and
-warm runs coincide and no archive is expected as evidence.
-
-`--capture-pcm` records bounded DirectSound Play snapshots and excludes the run
-from performance comparisons. Compare them with `codec-pcm-compare.py --reference
-RUN_A --candidate RUN_B --trace audio.log --max-error N --output RESULT.json`.
-Choose the threshold from the codec contract; static Verify and dynamic Native
-are different validation paths. This is source PCM, not mixer or DAC output.
-Use `summarize-baseline.py RUN... --output RESULT.json --table TABLE.md` only for
-approved, otherwise identical cold/warm runs without capture or font diagnostics.
-It retains per-run percentiles and reports compile, wait and gate costs separately.
-
-```powershell
-cargo ndk -t arm64-v8a --platform 29 build -p adv-run --release --target-dir target/android-a0
-python tools/android/replay-sample.py --adb "$env:ANDROID_HOME/platform-tools/adb.exe" --serial '<device-serial>' --binary target/android-a0/aarch64-linux-android/release/adv-run --game-dir '<authorized-local-game-directory>' --exe-relative nana_chs.exe --codepage 936 --schedule tools/performance/scenarios/nana-play.json --output target/arm-samples/nana
-```
-
-Use `--adb-port` if needed. The script copies assets into a fresh device directory
-and uses a separate write overlay. Subsequent runs can reuse the printed/session
-`remote_game_directory` via `--remote-game-dir`; it is never deleted or modified
-by the tool. Local output must be under ignored `target/`. Each input waits for
-the actual control acknowledgement; checkpoints retrieve JSON and PNG. Strict
-API eligibility, nonzero frames, failures, executable hashes and remote exit
-status are checked. Scene progress and text layout still require inspecting PNGs.
-Device execution has an independent timeout even if the adb client disconnects.
-
-For Majiro, use the Japanese executable, CP932, `--no-tiering`, a copied v10 seed
-via `--seed-data`, and `tools/performance/scenarios/majiro-v10-portable.json`.
-The portable schedule preserves load/settings/short Ctrl/advance operations with
-named observations; it is a timed replay, not the historical seven-hash gated
-throughput benchmark. Remove `*.fcd` only from the copied seed to verify new font
-rasterization instead of replaying a Windows glyph cache. Keep a manifest of the
-original and modified seed. No game data or font files belong in Git.
-
-`--font-diagnostics` records requested/resolved font, source and size in
-`stderr.log`; use it for layout acceptance, not timing comparisons. `ADV_FONT_DIR`
-can supplement platform fonts, while `Text::with_font_directories` isolates font
-discovery for API tests. Guest-added fonts take precedence for matching families.
-Android font substitutions need their own layout reference; Windows GDI frame
-hashes are not automatically portable. The seven-color sample's existing 165 s
-script may reach a choice around 90 s, so later Ctrl receipts alone do not prove
-continued story progress.

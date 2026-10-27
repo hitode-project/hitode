@@ -18,6 +18,8 @@ path = "src/main.rs"
 
 [build-dependencies]
 tauri-build = { version = "=2.7.2", features = [] }
+lzma-rust2 = { version = "0.23.0", default-features = false, features = ["std", "xz", "encoder", "optimization"] }
+sha2 = "0.10.9"
 
 [dependencies]
 adv-shell = { path = "../../../crates/adv-shell" }
@@ -30,6 +32,7 @@ chrono = { version = "=0.4.45", default-features = false, features = ["clock"] }
 tauri = { version = "=2.12.3", features = ["macos-private-api"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+lzma-rust2 = { version = "0.23.0", default-features = false, features = ["std", "xz", "optimization"] }
 # Opens the VNDB and release links on every platform.
 tauri-plugin-opener = "=2.7.1"
 
@@ -67,3 +70,6 @@ block2 = "0.6.2"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+lzma-rust2 = { version = "0.23.0", default-features = false, features = ["encoder"] }

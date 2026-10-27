@@ -65,6 +65,7 @@ pub(super) fn register(registry: &mut Registry) {
         set_software_ABI,
         get_software_ABI,
         set_dialogs_ABI,
+        set_npatch_ABI,
     ] {
         registry.register(api);
     }
@@ -123,6 +124,19 @@ fn set_software(env: &mut Env<'_>, this: GuestPtr<()>, software: i32) -> u32 {
 #[win32(d3d9, name = "IDirect3DDevice9::GetSoftwareVertexProcessing", level = implement)]
 fn get_software(env: &mut Env<'_>, this: GuestPtr<()>) -> i32 {
     i32::from(device(env, this.addr()).is_some_and(|d| d.creation.software))
+}
+
+#[win32(d3d9, name = "IDirect3DDevice9::SetNPatchMode", level = implement)]
+fn set_npatch(env: &mut Env<'_>, this: GuestPtr<()>, segments: f32) -> u32 {
+    if device(env, this.addr()).is_none() {
+        return INVALID;
+    }
+    // Wine's wined3d_device_set_npatch_mode needs no work to disable N-patches.
+    // Enabling them remains outside the device's capabilities.
+    if segments != 0.0 {
+        return UNAVAILABLE;
+    }
+    0
 }
 #[cfg(test)]
 mod tests;

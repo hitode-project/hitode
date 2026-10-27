@@ -1,43 +1,15 @@
-//! OS layer: what Windows does for a process before and around the guest's own code.
-//!
-//! * [`loader`] maps PE images, binds imports to guest images or host thunks and queues
-//!   initializers; [`module`] is the module table (`HMODULE`s, exports, resources), kept
-//!   in the machine's [`Ext`] so subsystems such as kernel32 can reach it.
-//! * [`Process`] adds `load` and `start_process` to a [`Machine`].
-//! * [`vfs`] maps guest paths onto the game directory and the data overlay, [`heap`] is
-//!   the guest heap allocator, [`nls`] holds code pages and case mapping and
-//!   [`registry`] is the private virtual registry; every personality layer shares them.
-//!   The process's [`Heaps`] are their own `Ext` entry, and an open file is a
-//!   [`vfs::FileObj`] in the machine's handle table, so any personality can reach both.
-//! * [`gdi`] is the device-context table that GDI and DirectDraw share.
+//! Shared services for native device fronts: VFS, guest heaps, COM activation,
+//! code pages and host key mapping. Wine owns image loading and Windows state.
 
-pub mod clipboard;
 pub mod com;
-pub mod entropy;
-pub mod gdi;
-pub mod global;
 pub mod heap;
-pub mod identity;
 pub mod keyboard;
-pub mod loader;
-pub mod module;
 pub mod nls;
-pub mod processes;
-pub mod processor;
-pub mod registry;
-pub mod scm;
-pub mod synthetic;
-pub mod system_files;
 pub mod vfs;
 
 use std::path::PathBuf;
 
-use adv_cpu::backend::{Backend, MemFault};
-use adv_machine::{CtxId, Ext, Machine};
-
 pub use heap::Heaps;
-pub use loader::{FileSource, HOST_MODULES, HostDir, LoadError, Loader, module_file};
-pub use module::{Module, ModuleId, ModuleKind, Modules, module_key};
 pub use nls::Codec;
 pub use vfs::Vfs;
 
@@ -59,6 +31,8 @@ pub struct OsConfig {
     pub exe_name: String,
     /// Host directory for everything the guest writes (overlay, user profile, registry).
     pub data_dir: PathBuf,
+    /// Host directory behind guest C:, including per-user installer state.
+    pub system_dir: PathBuf,
     pub user_name: String,
     /// Host folder behind guest `C:\Program Files`, written in place: installers
     /// put their files straight into it rather than into the data overlay.
@@ -67,6 +41,7 @@ pub struct OsConfig {
 
 impl OsConfig {
     pub fn new(game_dir: impl Into<PathBuf>, exe_name: &str, data_dir: impl Into<PathBuf>) -> Self {
+        let data_dir = data_dir.into();
         Self {
             codepage: 932,
             game_dir: game_dir.into(),
@@ -74,7 +49,8 @@ impl OsConfig {
             resource_dir: None,
             guest_root: "C:\\Game".into(),
             exe_name: exe_name.into(),
-            data_dir: data_dir.into(),
+            system_dir: data_dir.join("c"),
+            data_dir,
             user_name: "Player".into(),
             install_dir: None,
         }
@@ -87,47 +63,5 @@ impl OsConfig {
         } else {
             format!("{}\\{}", self.guest_root, self.exe_name)
         }
-    }
-}
-
-/// Read-only probes may observe an uninstalled OS without creating an owner.
-pub fn try_modules(ext: &Ext) -> Option<&Modules> {
-    ext.try_get()
-}
-
-/// The process-owned table, installed by OS loading or Win32 installation.
-pub fn modules(ext: &Ext) -> &Modules {
-    ext.get()
-}
-
-/// The module table of `ext`'s process, for loading and reference counts.
-pub fn modules_mut(ext: &mut Ext) -> &mut Modules {
-    ext.get_or_default()
-}
-
-/// Loading and starting a guest process on a [`Machine`].
-pub trait Process {
-    /// Load an image and its dependencies, queueing their initializers for
-    /// [`Process::start_process`].
-    fn load(&mut self, files: &dyn FileSource, path: &str) -> Result<ModuleId, LoadError>;
-
-    /// Create the main context for `exe` (see [`Machine::start_main`]).
-    fn start_process(&mut self, exe: ModuleId) -> Result<CtxId, MemFault>;
-}
-
-impl<B: Backend> Process for Machine<B> {
-    fn load(&mut self, files: &dyn FileSource, path: &str) -> Result<ModuleId, LoadError> {
-        let modules = self.ext.get_or_default::<Modules>();
-        let mut l = Loader::new(&mut self.cpu, &mut self.sys, modules, files);
-        let id = l.load(path)?;
-        let inits = std::mem::take(&mut l.inits);
-        self.sys.process_init.extend(inits);
-        Ok(id)
-    }
-
-    fn start_process(&mut self, exe: ModuleId) -> Result<CtxId, MemFault> {
-        let m = modules(&self.ext).get(exe);
-        let (base, entry, stack, name) = (m.base, m.entry, m.stack_reserve, m.name.clone());
-        self.start_main(base, entry, stack, &name)
     }
 }

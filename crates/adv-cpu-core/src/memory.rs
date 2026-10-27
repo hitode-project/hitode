@@ -1,13 +1,14 @@
 use crate::shared_memory::SharedAllocation;
 use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 mod fast;
 mod locks;
+mod page_map;
 
 pub use fast::FastPermissions;
 
@@ -55,12 +56,17 @@ pub const SHARED: u8 = 8;
 /// A shared PCM page has a stable alias at base + guest offset. Access must
 /// still use only matching byte atomics, even for guest word/vector operations.
 pub const AUDIO: u8 = 16;
+/// A SHARED storage page the guest window shows (unix): translated code
+/// accesses it as ordinary memory, and the rest of `Memory` through its
+/// storage, which holds the same bytes.
+pub const LINEAR: u8 = 128;
 /// Derived grants in immutable native metadata, never guest protection flags.
 pub const FAST_READ: u8 = READ << 5;
 pub const FAST_WRITE: u8 = WRITE << 5;
 
 enum SharedPage {
-    Audio {
+    /// Host shared memory: PCM buffers, counters or a shared file view.
+    Storage {
         storage: Arc<SharedAllocation>,
         offset: usize,
     },
@@ -73,7 +79,7 @@ enum SharedPage {
 impl SharedPage {
     fn read_into(&self, offset: usize, out: &mut [u8]) -> Result<(), String> {
         match self {
-            Self::Audio {
+            Self::Storage {
                 storage,
                 offset: base,
             } => {
@@ -86,10 +92,13 @@ impl SharedPage {
 
     fn write(&mut self, offset: usize, bytes: &[u8]) -> Result<(), String> {
         match self {
-            Self::Audio {
+            Self::Storage {
                 storage,
                 offset: base,
             } => {
+                if !storage.writable() {
+                    return Err("write to a read-only shared file view".into());
+                }
                 storage.store_bytes(*base + offset, bytes);
             }
             Self::File {
@@ -108,14 +117,14 @@ impl SharedPage {
 
     fn file_page(&self) -> bool {
         match self {
-            Self::Audio { .. } => false,
+            Self::Storage { .. } => false,
             Self::File { .. } => true,
         }
     }
 
     fn identity(&self) -> (u8, usize, usize) {
         match self {
-            Self::Audio { storage, offset } => (0, Arc::as_ptr(storage) as usize, *offset),
+            Self::Storage { storage, offset } => (0, Arc::as_ptr(storage) as usize, *offset),
             Self::File { page, .. } => (1, std::rc::Rc::as_ptr(page) as usize, 0),
         }
     }
@@ -143,7 +152,7 @@ pub struct Memory {
     pub dirty_pages: BTreeMap<u32, u64>,
     pub dirty_ranges: Option<Vec<(u32, usize)>>,
     reservation: Option<crate::virtual_memory::Reservation>,
-    shared_pages: BTreeMap<usize, SharedPage>,
+    shared_pages: page_map::PageMap<SharedPage>,
     /// Owned snapshots have no external alias. SHARED is only their first-store
     /// barrier, retired by the same transactional store preparation as COPY.
     private_copy_pages: Vec<Option<bool>>,
@@ -152,12 +161,7 @@ pub struct Memory {
     private_copy_epoch: u64,
     /// File pages whose bytes live in this window's committed pages.
     resident: BTreeMap<usize, std::rc::Rc<crate::backend::FilePage>>,
-    /// Real host pins owned by this window; repeated locks do not add a count.
-    locked_pages: BTreeSet<usize>,
-    #[cfg(windows)]
-    native_protection: bool,
-    #[cfg(windows)]
-    native_read_exceptions: usize,
+
     /// The window `reservation` is placed in; declared after it so the
     /// reservation hands its range back first.
     #[cfg(unix)]
@@ -171,10 +175,6 @@ impl Memory {
     /// Only software-checked memory distinguishes RWX data from code.
     /// Native host protection retains the full EXEC barrier.
     fn selective_code_writes(&self) -> bool {
-        #[cfg(windows)]
-        if self.native_protection {
-            return false;
-        }
         true
     }
 
@@ -256,9 +256,11 @@ impl Memory {
         if range.is_empty() {
             return false;
         }
-        if !self.selective_code_writes() {
-            return (range.start / PAGE_SIZE..=(range.end - 1) / PAGE_SIZE)
-                .any(|page| self.perms[page] & EXEC != 0);
+        if !self.selective_code_writes()
+            && (range.start / PAGE_SIZE..=(range.end - 1) / PAGE_SIZE)
+                .any(|page| self.perms[page] & EXEC != 0)
+        {
+            return true;
         }
         page_spans(range.clone()).any(|(page, bytes)| {
             self.watched[page]
@@ -291,173 +293,6 @@ impl Memory {
             .map(|offset| self.base + ((first + offset) * PAGE_SIZE) as u32)
     }
 
-    #[cfg(windows)]
-    fn native_permission(perms: u8) -> crate::virtual_memory::HostProtection {
-        use crate::virtual_memory::HostProtection as P;
-        if perms & EXEC != 0 || perms & READ != 0 && perms & WRITE == 0 {
-            P::Read
-        } else if perms & WRITE != 0 {
-            P::ReadWrite
-        } else {
-            P::NoAccess
-        }
-    }
-
-    #[cfg(windows)]
-    fn native_read_exception(perms: u8) -> bool {
-        perms & SHARED == 0 && perms & READ == 0 && perms & (WRITE | EXEC) != 0
-    }
-
-    #[cfg(windows)]
-    fn host_no_access(&self, range: &std::ops::Range<usize>) -> bool {
-        !range.is_empty()
-            && self.perms[range.start / PAGE_SIZE..=(range.end - 1) / PAGE_SIZE]
-                .iter()
-                .any(|&p| Self::native_permission(p) as u32 == 1)
-    }
-
-    fn host_copy_required(&self, range: &std::ops::Range<usize>) -> bool {
-        #[cfg(windows)]
-        {
-            self.native_protection && self.host_no_access(range)
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = range;
-            false
-        }
-    }
-
-    #[cfg(windows)]
-    fn host_scope<'a>(
-        reservation: Option<&'a crate::virtual_memory::Reservation>,
-        perms: &[u8],
-        active: bool,
-        range: &std::ops::Range<usize>,
-        write: bool,
-    ) -> Result<Vec<crate::virtual_memory::ProtectionScope<'a>>, String> {
-        let mut scopes = Vec::new();
-        if !active || range.is_empty() {
-            return Ok(scopes);
-        }
-        let reservation = reservation.ok_or("native protection requires reserved memory")?;
-        let desired = if write {
-            crate::virtual_memory::HostProtection::ReadWrite
-        } else {
-            crate::virtual_memory::HostProtection::Read
-        };
-        let mut at = range.start / PAGE_SIZE;
-        let end = (range.end - 1) / PAGE_SIZE + 1;
-        while at < end {
-            let needs = |page: usize| {
-                let p = perms[page];
-                (p & SHARED == 0 || p & AUDIO != 0)
-                    && (if write {
-                        Self::native_permission(p) as u32 != 4
-                    } else {
-                        Self::native_permission(p) as u32 == 1
-                    })
-            };
-            if !needs(at) {
-                at += 1;
-                continue;
-            }
-            let start = at;
-            at += 1;
-            while at < end && needs(at) {
-                at += 1;
-            }
-            scopes.push(unsafe {
-                reservation.temporary_protection(
-                    start * PAGE_SIZE,
-                    (at - start) * PAGE_SIZE,
-                    desired,
-                )
-            }?);
-        }
-        Ok(scopes)
-    }
-
-    /// Enable host permission enforcement for reserved Windows memory. This is
-    /// opt-in until native sites carry complete precise recovery recipes.
-    /// Host initialization remains possible through scoped read/write copies.
-    pub fn enable_native_protection(&mut self) -> Result<(), String> {
-        #[cfg(not(windows))]
-        {
-            Err("native host protection is not available on this host".into())
-        }
-        #[cfg(windows)]
-        {
-            if self.native_protection {
-                return Ok(());
-            }
-            if !self.resident.is_empty() {
-                return Err("native protection excludes resident file views".into());
-            }
-            let reservation = self
-                .reservation
-                .as_ref()
-                .ok_or("native protection requires reserved memory")?;
-            let mut scopes = Vec::new();
-            let mut at = 0;
-            while at < self.perms.len() {
-                if !self.mapped[at] || self.perms[at] & SHARED != 0 && self.perms[at] & AUDIO == 0 {
-                    at += 1;
-                    continue;
-                }
-                let permission = Self::native_permission(self.perms[at]);
-                let start = at;
-                at += 1;
-                while at < self.perms.len()
-                    && self.mapped[at]
-                    && (self.perms[at] & SHARED == 0 || self.perms[at] & AUDIO != 0)
-                    && Self::native_permission(self.perms[at]) as u32 == permission as u32
-                {
-                    at += 1;
-                }
-                scopes.push(unsafe {
-                    reservation.temporary_protection(
-                        start * PAGE_SIZE,
-                        (at - start) * PAGE_SIZE,
-                        permission,
-                    )
-                }?);
-            }
-            for scope in scopes {
-                scope.retain();
-            }
-            self.native_protection = true;
-            // A trap cannot resume with a snapshot that still grants RWX data stores.
-            self.epoch += 1;
-            Ok(())
-        }
-    }
-
-    /// Windows cannot express guest data-read denial on write-only or
-    /// execute-only pages. Native sites must retain software READ checks while
-    /// any ordinary page has that shape. Short address windows keep bounds.
-    #[allow(dead_code)] // Used by verified native sites in the next compiler handoff.
-    pub fn native_fault_reads_available(&self) -> bool {
-        #[cfg(windows)]
-        {
-            self.native_protection
-                && self.native_read_exceptions == 0
-                && self.base == 0
-                && self.len as u64 == 1 << 32
-        }
-        #[cfg(not(windows))]
-        {
-            false
-        }
-    }
-
-    #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
-    pub fn native_fault_window(&self) -> Option<(usize, usize)> {
-        self.reservation
-            .as_ref()
-            .map(|window| (window.ptr.as_ptr() as usize, window.len))
-    }
-
     pub fn new(base: u32, len: usize) -> Result<Self, String> {
         if !(base as usize).is_multiple_of(PAGE_SIZE)
             || len == 0
@@ -485,15 +320,11 @@ impl Memory {
             dirty_pages: BTreeMap::new(),
             dirty_ranges: Some(Vec::new()),
             reservation: None,
-            shared_pages: BTreeMap::new(),
+            shared_pages: Default::default(),
             private_copy_pages: vec![None; len / PAGE_SIZE],
             private_copy_epoch: 0,
             resident: BTreeMap::new(),
-            locked_pages: BTreeSet::new(),
-            #[cfg(windows)]
-            native_protection: false,
-            #[cfg(windows)]
-            native_read_exceptions: 0,
+
             #[cfg(unix)]
             window: None,
             #[cfg(unix)]
@@ -509,15 +340,7 @@ impl Memory {
         {
             return Err("invalid reservation".into());
         }
-        // A full x86 window retains a final inaccessible tail for unaligned
-        // native operands crossing the 4GB limit. Small windows keep guards.
-        #[cfg(windows)]
-        let reserved_len = if base == 0 && len as u64 == 1 << 32 {
-            len + 16384
-        } else {
-            len
-        };
-        #[cfg(not(windows))]
+
         let reserved_len = len;
         let reservation = crate::virtual_memory::Reservation::new(reserved_len)?;
         let origin = epoch_origin();
@@ -536,15 +359,11 @@ impl Memory {
             dirty_pages: BTreeMap::new(),
             dirty_ranges: Some(Vec::new()),
             reservation: Some(reservation),
-            shared_pages: BTreeMap::new(),
+            shared_pages: Default::default(),
             private_copy_pages: vec![None; len / PAGE_SIZE],
             private_copy_epoch: 0,
             resident: BTreeMap::new(),
-            locked_pages: BTreeSet::new(),
-            #[cfg(windows)]
-            native_protection: false,
-            #[cfg(windows)]
-            native_read_exceptions: 0,
+
             #[cfg(unix)]
             window: None,
             #[cfg(unix)]
@@ -696,13 +515,15 @@ impl Memory {
             use crate::virtual_memory::GuestPageProtection;
             self.attach()?;
             let reservation = self.reservation.as_ref().unwrap();
-            let committed =
-                |page: usize| self.mapped[page] && !self.shared_pages.contains_key(&page);
+            let committed = |page: usize| {
+                self.mapped[page]
+                    && (self.perms[page] & LINEAR != 0 || !self.shared_pages.contains_key(&page))
+            };
             // Owned private copies read linearly, as the native permission
             // snapshot says; stores still trap so the first one retires COPY.
             let protection = |page: usize| {
                 let perms = self.perms[page];
-                if perms & SHARED == 0 {
+                if perms & (SHARED | LINEAR) != SHARED {
                     GuestPageProtection::new(perms & 7, self.watched[page])
                 } else if self.private_copy_pages.get(page) == Some(&Some(true)) {
                     GuestPageProtection::new(perms & (READ | EXEC), self.watched[page])
@@ -729,8 +550,7 @@ impl Memory {
                 )?;
             }
         }
-        #[cfg(not(unix))]
-        let _ = pages;
+
         Ok(())
     }
 
@@ -772,18 +592,19 @@ impl Memory {
     pub fn unmap(&mut self, addr: u32, len: usize) -> Result<(), String> {
         let pages = self.pages(addr, len)?;
         self.committed(addr, len)?;
-        // Retire pins while their original committed host addresses still exist.
-        // Failure keeps the remaining ledger and mapping, so reuse cannot inherit it.
-        self.retire_page_locks(pages.clone())
-            .map_err(|error| format!("unpin before unmapping: {error:?}"))?;
         if self.reservation.is_none() {
             return Err("unmapping requires reserved address space".into());
         }
-        for page in pages.clone() {
-            if let Some(file) = self.resident.remove(&page) {
-                file.evict();
-            }
+        let resident: Vec<_> = self
+            .resident
+            .range(pages.clone())
+            .map(|(&page, _)| page)
+            .collect();
+        for page in resident {
+            self.resident.remove(&page).unwrap().evict();
         }
+        #[cfg(unix)]
+        self.unlinearize(pages.clone())?;
         // File overlays are not linear. PCM pages have their own section views
         // in the reservation, whose removal cannot invalidate a callback alias.
         let mut start = pages.start;
@@ -809,10 +630,6 @@ impl Memory {
             start = end;
         }
         for page in pages.clone() {
-            #[cfg(windows)]
-            if Self::native_read_exception(self.perms[page]) {
-                self.native_read_exceptions -= 1;
-            }
             self.shared_pages.remove(&page);
             if self.private_copy_pages[page].take().is_some() {
                 self.private_copy_epoch += 1;
@@ -842,7 +659,9 @@ impl Memory {
         }
         let start = (addr - self.base) as usize / PAGE_SIZE;
         let last = ((addr - self.base) as usize + len - 1) / PAGE_SIZE;
-        for page in start..=last {
+        // Only watched pages hold translated code, so only their changes
+        // invalidate units; mapping a large file view stays per-page cheap.
+        for page in (start..=last).filter(|&page| self.watched[page]) {
             self.dirty_pages
                 .entry(self.base + page as u32 * PAGE_SIZE as u32)
                 .or_insert(self.versions[page]);
@@ -877,17 +696,14 @@ impl Memory {
         if self.overlays(&range) {
             return Err("shared bytes require an atomic copy".into());
         }
-        #[cfg(windows)]
-        if self.native_protection && self.host_no_access(&range) {
-            return Err("protected host bytes require read_into or read_data".into());
-        }
+
         // SAFETY: committed ordinary storage remains immutable for this borrow.
         Ok(unsafe { std::slice::from_raw_parts(self.ptr.as_ptr().add(range.start), range.len()) })
     }
 
     pub fn read_data(&self, addr: u32, len: usize) -> Result<Cow<'_, [u8]>, String> {
         let range = self.committed(addr, len)?;
-        if self.overlays(&range) || self.host_copy_required(&range) {
+        if self.overlays(&range) {
             let mut bytes = vec![0; len];
             self.read_into(addr, &mut bytes)?;
             return Ok(Cow::Owned(bytes));
@@ -905,7 +721,7 @@ impl Memory {
         let Ok(range) = self.committed(addr, expected.len()) else {
             return false;
         };
-        if !self.overlays(&range) && !self.host_copy_required(&range) {
+        if !self.overlays(&range) {
             // SAFETY: bounds checked, allocation alive, shared borrow prevents executor writes.
             let bytes = unsafe {
                 std::slice::from_raw_parts(self.ptr.as_ptr().add(range.start), range.len())
@@ -924,14 +740,7 @@ impl Memory {
 
     pub fn read_into(&self, addr: u32, destination: &mut [u8]) -> Result<(), String> {
         let range = self.committed(addr, destination.len())?;
-        #[cfg(windows)]
-        let _host = Self::host_scope(
-            self.reservation.as_ref(),
-            &self.perms,
-            self.native_protection,
-            &range,
-            false,
-        )?;
+
         if !self.overlays(&range) {
             // SAFETY: committed ordinary storage and non-aliasing caller output.
             unsafe {
@@ -974,6 +783,20 @@ impl Memory {
         Ok(())
     }
 
+    /// Whether an access to `range` must first stage file bytes or, for a
+    /// store, retire a private copy. Shared storage pages need neither.
+    fn stages(&self, range: &std::ops::Range<usize>, write: bool) -> bool {
+        let pages = range.start / PAGE_SIZE..=(range.end - 1) / PAGE_SIZE;
+        (write
+            && pages
+                .clone()
+                .any(|page| self.private_copy_pages.get(page) == Some(&Some(true))))
+            || self
+                .shared_pages
+                .range(pages)
+                .any(|(_, page)| page.file_page())
+    }
+
     /// Whether `page` holds its bytes in the linear storage: it is not
     /// shared, or it is an owned private copy, whose SHARED bit is only a
     /// store barrier (as `native_permissions` treats it).
@@ -990,10 +813,7 @@ impl Memory {
         {
             return Err("shared bytes require an atomic copy".into());
         }
-        #[cfg(windows)]
-        if self.native_protection && self.host_no_access(&range) {
-            return Err("protected host bytes require read_into or read_data".into());
-        }
+
         // SAFETY: committed linear storage remains immutable for this borrow.
         Ok(unsafe { std::slice::from_raw_parts(self.ptr.as_ptr().add(range.start), range.len()) })
     }
@@ -1003,10 +823,6 @@ impl Memory {
     pub fn direct_read(&self, addr: u32, len: usize) -> Option<*const u8> {
         if let Some(p) = self.direct(addr, len, false) {
             return Some(p);
-        }
-        // Private copies may be host-protected under native protection.
-        if cfg!(windows) {
-            return None;
         }
         let offset = addr.wrapping_sub(self.base) as usize;
         let page = offset / PAGE_SIZE;
@@ -1022,8 +838,9 @@ impl Memory {
 
     /// Host address of `len` bytes within one ordinary page that guest code
     /// may access directly: mapped, permitted, not shared, and for writes not
-    /// executable, so no overlay, code invalidation or host protection scope
-    /// is involved. Such pages are host-accessible under native protection.
+    /// observed dependency bytes, so no overlay or invalidation is involved.
+    /// Native host protection also excludes executable pages through `writes_code`.
+    /// Use the pointer before any mapping, protection or code observation changes.
     #[inline]
     pub fn direct(&self, addr: u32, len: usize, write: bool) -> Option<*mut u8> {
         let offset = addr.wrapping_sub(self.base) as usize;
@@ -1034,7 +851,7 @@ impl Memory {
         let page = offset / PAGE_SIZE;
         let perms = self.perms[page];
         let allowed = if write {
-            perms & WRITE != 0 && perms & (EXEC | SHARED) == 0
+            perms & WRITE != 0 && perms & SHARED == 0 && !self.writes_code(&(offset..last + 1))
         } else {
             perms & READ != 0 && perms & SHARED == 0
         };
@@ -1064,7 +881,10 @@ impl Memory {
         }
         let page = range.start / PAGE_SIZE;
         self.perms[page] & (WRITE | EXEC) == WRITE
-            && matches!(self.shared_pages.get(&page), Some(SharedPage::Audio { .. }))
+            && matches!(
+                self.shared_pages.get(&page),
+                Some(SharedPage::Storage { .. })
+            )
     }
 
     /// Distinct guest views can overlap physically. REP must retain its element
@@ -1119,7 +939,7 @@ impl Memory {
         let shared = self
             .shared_pages
             .range(pages.clone())
-            .map(|(&page, storage)| (page, storage.identity()));
+            .map(|(page, storage)| (page, storage.identity()));
         let resident = self
             .resident
             .range(pages)
@@ -1139,34 +959,13 @@ impl Memory {
         if self.mapped[pages.clone()].iter().any(|&mapped| mapped) {
             return Err("overlapping shared audio mapping".into());
         }
-        #[cfg(windows)]
-        for range in self
-            .reservation
-            .as_ref()
-            .unwrap()
-            .section_promotion_ranges(pages.start * PAGE_SIZE, len)?
-        {
-            if self
-                .locked_pages
-                .range(range.start / PAGE_SIZE..range.end / PAGE_SIZE)
-                .next()
-                .is_some()
-            {
-                log::warn!(
-                    "unsupported PCM mapping at guest {addr:#x} (+{len}): private host region {}..{} contains neighbouring physical page pins that promotion would retire",
-                    range.start,
-                    range.end,
-                );
-                return Err("PCM section promotion would replace neighbouring physically pinned private pages".into());
-            }
-        }
+
         let storage = SharedAllocation::new(len)?;
-        #[cfg(windows)]
-        storage.map_linear(self.reservation.as_ref().unwrap(), pages.start * PAGE_SIZE)?;
+
         for (index, page) in pages.clone().enumerate() {
             self.shared_pages.insert(
                 page,
-                SharedPage::Audio {
+                SharedPage::Storage {
                     storage: storage.clone(),
                     offset: index * PAGE_SIZE,
                 },
@@ -1174,10 +973,127 @@ impl Memory {
         }
         Arc::make_mut(&mut self.mapped)[pages.clone()].fill(true);
         self.fast.invalidate(pages.clone());
-        Arc::make_mut(&mut self.perms)[pages]
-            .fill(READ | WRITE | SHARED | if cfg!(windows) { AUDIO } else { 0 });
+        Arc::make_mut(&mut self.perms)[pages.clone()].fill(READ | WRITE | SHARED);
+        #[cfg(unix)]
+        self.linearize(pages);
         self.touch(addr, len);
         Ok(storage)
+    }
+
+    /// Maps `storage`, a shared file view, at `addr` with `perms` (READ,
+    /// and WRITE when the view is writable). Every guest access goes through
+    /// the view, so it sees the file's other mappings at once.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    pub fn map_shared_file(
+        &mut self,
+        addr: u32,
+        len: usize,
+        storage: Arc<SharedAllocation>,
+        perms: u8,
+    ) -> Result<(), String> {
+        let pages = self.pages(addr, len)?;
+        if self.reservation.is_none()
+            || perms & !(READ | WRITE) != 0
+            || perms & READ == 0
+            || self.mapped[pages.clone()].iter().any(|&mapped| mapped)
+        {
+            return Err("invalid or overlapping shared file mapping".into());
+        }
+        for (index, page) in pages.clone().enumerate() {
+            self.shared_pages.insert(
+                page,
+                SharedPage::Storage {
+                    storage: storage.clone(),
+                    offset: index * PAGE_SIZE,
+                },
+            );
+        }
+        Arc::make_mut(&mut self.mapped)[pages.clone()].fill(true);
+        self.fast.invalidate(pages.clone());
+        Arc::make_mut(&mut self.perms)[pages.clone()].fill(perms | SHARED);
+        self.linearize(pages);
+        self.touch(addr, len);
+        Ok(())
+    }
+
+    /// Shows the host pages of the window that storage pages `pages`, just
+    /// mapped with one protection, wholly cover. A view the window cannot
+    /// show (no window, or not host page aligned) keeps reaching its storage
+    /// through `Memory`.
+    #[cfg(unix)]
+    fn linearize(&mut self, pages: std::ops::Range<usize>) {
+        if self.window.is_none() || pages.is_empty() || self.attach().is_err() {
+            return;
+        }
+        let slack = self.window_slack();
+        let reservation = self.reservation.as_ref().unwrap();
+        let Some(host) = reservation
+            .direct_fault_view()
+            .map(|view| view.host_page_size())
+        else {
+            return;
+        };
+        let first = (slack + pages.start * PAGE_SIZE).next_multiple_of(host);
+        let end = (slack + pages.end * PAGE_SIZE) / host * host;
+        if first >= end {
+            return;
+        }
+        let linear = (first - slack) / PAGE_SIZE..(end - slack) / PAGE_SIZE;
+        let Some(SharedPage::Storage { storage, offset }) = self.shared_pages.get(&linear.start)
+        else {
+            return;
+        };
+        let perms = self.perms[linear.start];
+        let Some(source) = storage.host_pages(*offset, end - first, host) else {
+            return;
+        };
+        let protection =
+            crate::virtual_memory::GuestPageProtection::new(perms & (READ | WRITE), false)
+                .expect("guest permissions");
+        // SAFETY: the storage stays mapped while the pages hold it, and
+        // `unmap` and `protect` remove the overlay before they drop it.
+        if let Err(error) =
+            unsafe { reservation.overlay_direct(first, end - first, source, protection) }
+        {
+            log::warn!(
+                "cannot show shared storage at guest page {:#x}: {error}",
+                linear.start
+            );
+            return;
+        }
+        for page in &mut Arc::make_mut(&mut self.perms)[linear.clone()] {
+            *page |= LINEAR;
+        }
+        self.fast.invalidate(linear);
+    }
+
+    /// Ends the window's view of every linear storage overlay that meets
+    /// `pages`; translated code then reaches them through `Memory` again.
+    #[cfg(unix)]
+    fn unlinearize(&mut self, pages: std::ops::Range<usize>) -> Result<(), String> {
+        if !self.perms[pages.clone()].iter().any(|&p| p & LINEAR != 0) {
+            return Ok(());
+        }
+        self.attach()?;
+        let slack = self.window_slack();
+        let removed = self
+            .reservation
+            .as_ref()
+            .unwrap()
+            .remove_overlays(slack + pages.start * PAGE_SIZE, pages.len() * PAGE_SIZE)?;
+        for range in removed {
+            let pages = (range.start - slack) / PAGE_SIZE..(range.end - slack) / PAGE_SIZE;
+            for page in &mut Arc::make_mut(&mut self.perms)[pages.clone()] {
+                *page &= !LINEAR;
+            }
+            self.fast.invalidate(pages);
+        }
+        Ok(())
     }
 
     /// Prepared private bytes may execute without externally mutable code.
@@ -1198,10 +1114,7 @@ impl Memory {
         }
         for page in pages.clone() {
             self.private_copy_pages[page] = Some(true);
-            #[cfg(windows)]
-            if Self::native_read_exception(self.perms[page]) {
-                self.native_read_exceptions -= 1;
-            }
+
             Arc::make_mut(&mut self.perms)[page] |= SHARED;
         }
         self.fast.invalidate(pages);
@@ -1235,33 +1148,12 @@ impl Memory {
             .enumerate()
             .filter_map(|(offset, copy)| (*copy == Some(true)).then_some(begin + offset))
             .collect();
-        // Restore hardware permissions before removing the execution barrier.
-        // A failure leaves all COPY state and inline grants unchanged.
-        #[cfg(windows)]
-        if self.native_protection {
-            let reservation = self.reservation.as_ref().unwrap();
-            let mut scopes = Vec::new();
-            for &page in &changed {
-                scopes.push(unsafe {
-                    reservation.temporary_protection(
-                        page * PAGE_SIZE,
-                        PAGE_SIZE,
-                        Self::native_permission(self.perms[page] & !SHARED),
-                    )
-                }?);
-            }
-            for scope in scopes {
-                scope.retain()
-            }
-        }
+
         self.private_copy_epoch += changed.len() as u64;
         for &page in &changed {
             self.private_copy_pages[page] = Some(false);
             Arc::make_mut(&mut self.perms)[page] &= !SHARED;
-            #[cfg(windows)]
-            if Self::native_read_exception(self.perms[page]) {
-                self.native_read_exceptions += 1;
-            }
+
             self.fast.invalidate(page..page + 1);
         }
         if !changed.is_empty() {
@@ -1314,10 +1206,6 @@ impl Memory {
     /// page. Dropping SHARED never invalidates a native assumption: code
     /// still holding the old permission takes the helper path to these bytes.
     fn make_resident(&mut self, page: usize) {
-        #[cfg(windows)]
-        if self.native_protection {
-            return;
-        }
         if self.reservation.is_none() {
             return;
         }
@@ -1402,11 +1290,11 @@ impl Memory {
         range: &std::ops::Range<usize>,
         write: bool,
     ) -> Result<(), String> {
-        if range.is_empty() {
+        if range.is_empty() || !self.stages(range, write) {
             return Ok(());
         }
         let mut private = Vec::new();
-        for (&index, storage) in self
+        for (index, storage) in self
             .shared_pages
             .range(range.start / PAGE_SIZE..=(range.end - 1) / PAGE_SIZE)
         {
@@ -1467,22 +1355,7 @@ impl Memory {
         if self.writes_code(&dst) {
             self.touch(destination, len);
         }
-        #[cfg(windows)]
-        let _source_host = Self::host_scope(
-            self.reservation.as_ref(),
-            &self.perms,
-            self.native_protection,
-            &src,
-            false,
-        )?;
-        #[cfg(windows)]
-        let _destination_host = Self::host_scope(
-            self.reservation.as_ref(),
-            &self.perms,
-            self.native_protection,
-            &dst,
-            true,
-        )?;
+
         // SAFETY: committed ordinary ranges, exclusively borrowed memory, and
         // ptr::copy preserves memmove overlap semantics.
         unsafe {
@@ -1496,9 +1369,20 @@ impl Memory {
     }
 
     pub fn fill(&mut self, address: u32, pattern: &[u8], len: usize) -> Result<(), String> {
-        self.committed(address, len)?;
+        let range = self.committed(address, len)?;
         if pattern.is_empty() {
             return Err("empty fill pattern".into());
+        }
+        if let [byte] = *pattern
+            && !self.overlays(&range)
+        {
+            if self.writes_code(&range) {
+                self.touch(address, len);
+            }
+
+            // SAFETY: a committed ordinary range of exclusively borrowed memory.
+            unsafe { std::ptr::write_bytes(self.ptr.as_ptr().add(range.start), byte, len) };
+            return Ok(());
         }
         let mut scratch = [0; PAGE_SIZE];
         let mut at = 0;
@@ -1528,14 +1412,7 @@ impl Memory {
         if self.writes_code(&range) {
             self.touch(addr, bytes.len());
         }
-        #[cfg(windows)]
-        let _host = Self::host_scope(
-            self.reservation.as_ref(),
-            &self.perms,
-            self.native_protection,
-            &range,
-            true,
-        )?;
+
         if overlays {
             let mut at = range.start;
             while at < range.end {
@@ -1601,65 +1478,56 @@ impl Memory {
         {
             return Err("executable file views are not supported".into());
         }
-        // Native NOACCESS removes pages from the working set and ends their pin.
-        // Do the same when host protection is disabled; restore prior pins if the
-        // subsequent protection transaction fails.
-        let retired = if perms == 0 {
-            self.retire_page_locks(range.start / PAGE_SIZE..range.end / PAGE_SIZE)
-                .map_err(|error| format!("unpin before NOACCESS: {error:?}"))?
-        } else {
-            Vec::new()
-        };
-        #[cfg(windows)]
-        let host_result = (|| {
-            if self.native_protection {
-                let reservation = self.reservation.as_ref().unwrap();
-                let pages = range.start / PAGE_SIZE..range.end / PAGE_SIZE;
-                let mut scopes = Vec::new();
-                for page in pages.clone() {
-                    if self.perms[page] & SHARED != 0 && self.perms[page] & AUDIO == 0 {
-                        continue;
-                    }
-                    scopes.push(unsafe {
-                        reservation.temporary_protection(
-                            page * PAGE_SIZE,
-                            PAGE_SIZE,
-                            Self::native_permission(perms),
-                        )
-                    }?);
-                }
-                for scope in scopes {
-                    scope.retain();
-                }
-            }
-            Ok::<(), String>(())
-        })();
-        #[cfg(windows)]
-        if let Err(error) = host_result {
-            let restoration = self.restore_page_locks(&retired);
-            return Err(format!("{error}; pin restoration: {restoration:?}"));
-        }
-        #[cfg(not(windows))]
-        {
-            debug_assert!(retired.is_empty());
-        }
         self.fast
             .invalidate(range.start / PAGE_SIZE..range.end / PAGE_SIZE);
         for page in
             &mut Arc::make_mut(&mut self.perms)[range.start / PAGE_SIZE..range.end / PAGE_SIZE]
         {
-            #[cfg(windows)]
-            {
-                self.native_read_exceptions -= usize::from(Self::native_read_exception(*page));
-                self.native_read_exceptions += usize::from(Self::native_read_exception(
-                    perms | (*page & (SHARED | AUDIO)),
-                ));
-            }
-            *page = perms | (*page & (SHARED | AUDIO));
+            *page = perms | (*page & (SHARED | AUDIO | LINEAR));
         }
+        #[cfg(unix)]
+        self.keep_overlays_exact(range.start / PAGE_SIZE..range.end / PAGE_SIZE)?;
         // Revoke validation even if synchronizing host protection fails.
         self.touch(addr, len);
         self.sync_window(range.start / PAGE_SIZE..range.end / PAGE_SIZE)?;
+        Ok(())
+    }
+
+    /// Ends the overlays of host pages among `pages` whose guest pages no
+    /// longer share one protection the storage takes, without EXEC: the
+    /// window would then fault on accesses the guest may make.
+    #[cfg(unix)]
+    fn keep_overlays_exact(&mut self, pages: std::ops::Range<usize>) -> Result<(), String> {
+        if !self.perms[pages.clone()].iter().any(|&p| p & LINEAR != 0) {
+            return Ok(());
+        }
+        let slack = self.window_slack();
+        let host = self
+            .reservation
+            .as_ref()
+            .unwrap()
+            .direct_fault_view()
+            .map_or(PAGE_SIZE, |view| view.host_page_size());
+        let span = host / PAGE_SIZE;
+        let mut first = (slack + pages.start * PAGE_SIZE) / host * host;
+        while first < slack + pages.end * PAGE_SIZE {
+            let chunk = (first - slack) / PAGE_SIZE..(first - slack) / PAGE_SIZE + span;
+            first += host;
+            let perms = &self.perms[chunk.clone()];
+            if perms[0] & LINEAR == 0 {
+                continue;
+            }
+            let writable = matches!(
+                self.shared_pages.get(&chunk.start),
+                Some(SharedPage::Storage { storage, .. }) if storage.writable()
+            );
+            let exact = perms.iter().all(|&p| p & 7 == perms[0] & 7)
+                && perms[0] & EXEC == 0
+                && (writable || perms[0] & WRITE == 0);
+            if !exact {
+                self.unlinearize(chunk)?;
+            }
+        }
         Ok(())
     }
 
@@ -1676,9 +1544,6 @@ impl Memory {
 
 impl Drop for Memory {
     fn drop(&mut self) {
-        // The Reservation release also retires any pin whose host unlock failed.
-        // Heap-backed test windows can never acquire a pin.
-        let _ = self.retire_page_locks(0..self.len / PAGE_SIZE);
         // The reservation hands its range back to the window, which must
         // then hold its views rather than another memory's.
         let _ = self.attach();
@@ -1699,266 +1564,32 @@ impl Drop for Memory {
     }
 }
 
-/// Host protection queries for native-protection tests in this and engine crates.
-#[cfg(all(windows, any(test, feature = "testing")))]
-#[doc(hidden)]
-pub mod testing {
-    use super::Memory;
-
-    #[repr(C)]
-    #[derive(Default)]
-    pub struct MemoryInfo {
-        pub base: usize,
-        pub allocation: usize,
-        pub allocation_protection: u32,
-        pub partition: u16,
-        pub region: usize,
-        pub state: u32,
-        pub protection: u32,
-        pub kind: u32,
-    }
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn VirtualQuery(
-            address: *const std::ffi::c_void,
-            info: *mut std::ffi::c_void,
-            len: usize,
-        ) -> usize;
-    }
-    pub fn query(memory: &Memory, address: u32) -> MemoryInfo {
-        let mut info = MemoryInfo::default();
-        let offset = memory.range(address, 1).unwrap().start;
-        // SAFETY: query-only inspection of this live reserved address window.
-        assert_ne!(
-            unsafe {
-                VirtualQuery(
-                    memory.ptr.as_ptr().add(offset).cast(),
-                    (&mut info as *mut MemoryInfo).cast(),
-                    std::mem::size_of::<MemoryInfo>(),
-                )
-            },
-            0
-        );
-        info
-    }
-}
-
-#[cfg(all(test, windows))]
-mod linear_audio_tests {
-    use super::testing::query;
-    use super::*;
-    #[test]
-    fn private_copy_privatization_restores_native_noaccess_permissions() {
-        for enable_first in [false, true] {
-            let mut memory = Memory::reserve(0x10000, PAGE_SIZE).unwrap();
-            if enable_first {
-                memory.enable_native_protection().unwrap();
-            }
-            memory
-                .map_private_copy_pages(0x10000, &[0x19; PAGE_SIZE], 0)
-                .unwrap();
-            if !enable_first {
-                memory.enable_native_protection().unwrap();
-            }
-            memory.privatize_copy_pages(0x10000, PAGE_SIZE).unwrap();
-            assert_eq!(memory.file_page_copy_on_write(0x10000), Some(false));
-            assert_eq!(query(&memory, 0x10000).protection, 1);
-            memory.write(0x10000, &[0x27]).unwrap();
-            assert_eq!(query(&memory, 0x10000).protection, 1);
-            let mut actual = [0; 1];
-            memory.read_into(0x10000, &mut actual).unwrap();
-            assert_eq!(actual, [0x27]);
-            assert_eq!(query(&memory, 0x10000).protection, 1);
-        }
-    }
-
-    #[test]
-    fn native_policy_host_copies_restore_readonly_noaccess_and_code_versions() {
-        let mut memory = Memory::reserve(0x10000, 0x8000).unwrap();
-        memory.map(0x10000, 0x8000, READ | WRITE).unwrap();
-        memory.write(0x10000, &[0x91, 0x37]).unwrap();
-        memory
-            .protect(0x10000, PAGE_SIZE, READ | WRITE | EXEC)
-            .unwrap();
-        memory.protect(0x11000, PAGE_SIZE, 0).unwrap();
-        memory.enable_native_protection().unwrap();
-        assert_eq!(query(&memory, 0x10000).protection, 2);
-        assert_eq!(query(&memory, 0x11000).protection, 1);
-        let version = memory.versions[0];
-        memory.write(0x10000, &[0x12, 0x34]).unwrap();
-        assert!(memory.versions[0] > version);
-        assert_eq!(query(&memory, 0x10000).protection, 2);
-        memory.write(0x11000, &[0x56, 0x78]).unwrap();
-        assert_eq!(query(&memory, 0x11000).protection, 1);
-        assert!(memory.read(0x11000, 2).is_err());
-        assert_eq!(&*memory.read_data(0x11000, 2).unwrap(), &[0x56, 0x78]);
-        assert_eq!(query(&memory, 0x11000).protection, 1);
-        memory.copy(0x11000, 0x10000, 2).unwrap();
-        assert_eq!(memory.read(0x10000, 2).unwrap(), &[0x56, 0x78]);
-        assert_eq!(query(&memory, 0x10000).protection, 2);
-        assert_eq!(query(&memory, 0x11000).protection, 1);
-        assert_eq!(memory.perms[0], READ | WRITE | EXEC);
-        assert_eq!(memory.perms[1], 0);
-    }
-
-    #[test]
-    fn native_policy_tracks_mapping_changes_and_unrepresentable_read_denials() {
-        let mut memory = Memory::reserve(0, 1usize << 32).unwrap();
-        memory.map(0x10000, PAGE_SIZE, READ | WRITE).unwrap();
-        memory.enable_native_protection().unwrap();
-        assert!(memory.native_fault_reads_available());
-        memory.protect(0x10000, PAGE_SIZE, WRITE).unwrap();
-        assert!(!memory.native_fault_reads_available());
-        assert_eq!(query(&memory, 0x10000).protection, 4);
-        memory.protect(0x10000, PAGE_SIZE, EXEC).unwrap();
-        assert!(!memory.native_fault_reads_available());
-        assert_eq!(query(&memory, 0x10000).protection, 2);
-        memory.unmap(0x10000, PAGE_SIZE).unwrap();
-        assert!(memory.native_fault_reads_available());
-        memory.map(0x20000, PAGE_SIZE, READ).unwrap();
-        assert_eq!(query(&memory, 0x20000).protection, 2);
-        memory.write(0x20000, &[0xab]).unwrap();
-        assert_eq!(query(&memory, 0x20000).protection, 2);
-        assert_eq!(query(&memory, u32::MAX).state, 0x2000);
-        let reservation = memory.reservation.as_ref().unwrap();
-        assert_eq!(reservation.len, (1usize << 32) + 16384);
-    }
-
-    #[test]
-    fn native_policy_pcm_callbacks_and_lazy_file_views_keep_independent_contracts() {
-        let mut memory = Memory::reserve(0x10000, 0x8000).unwrap();
-        let pcm = memory.map_shared_audio(0x10000, PAGE_SIZE).unwrap();
-        let file = crate::backend::FilePage::new([0x37; PAGE_SIZE]);
-        memory
-            .map_file_pages(0x11000, std::slice::from_ref(&file), READ | WRITE, true)
-            .unwrap();
-        memory.enable_native_protection().unwrap();
-        memory.protect(0x10000, PAGE_SIZE, READ).unwrap();
-        memory.write(0x10000, &[0x91]).unwrap();
-        assert_eq!(pcm.load_u8(0), 0x91);
-        assert_eq!(query(&memory, 0x10000).protection, 2);
-        memory.prepare_native_access(0x11000, 1, true).unwrap();
-        memory.write(0x11000, &[0x12]).unwrap();
-        assert_eq!(file.snapshot().unwrap()[0], 0x37);
-        assert_eq!(memory.read_data(0x11000, 1).unwrap()[0], 0x12);
-        assert_eq!(query(&memory, 0x11000).state, 0x2000);
-        drop(memory);
-        assert_eq!(pcm.load_u8(0), 0x91);
-    }
-
-    #[test]
-    fn native_policy_private_hole_conversion_preserves_neighbour_host_permissions() {
-        let mut memory = Memory::reserve(0x10000, 0x8000).unwrap();
-        memory.map(0x10000, 0x8000, READ | WRITE).unwrap();
-        memory.write(0x10000, &[0x91]).unwrap();
-        memory.write(0x12000, &[0x37]).unwrap();
-        memory.unmap(0x11000, PAGE_SIZE).unwrap();
-        memory.protect(0x10000, PAGE_SIZE, READ | EXEC).unwrap();
-        memory.protect(0x12000, PAGE_SIZE, 0).unwrap();
-        memory.enable_native_protection().unwrap();
-        let pcm = memory.map_shared_audio(0x11000, PAGE_SIZE).unwrap();
-        assert_eq!(query(&memory, 0x10000).protection, 2);
-        assert_eq!(query(&memory, 0x12000).protection, 1);
-        assert_eq!(memory.read_data(0x10000, 1).unwrap()[0], 0x91);
-        assert_eq!(memory.read_data(0x12000, 1).unwrap()[0], 0x37);
-        memory.write(0x11000, &[0x12]).unwrap();
-        assert_eq!(pcm.load_u8(0), 0x12);
-    }
-
-    #[test]
-    fn linear_pcm_alias_is_stable_page_aligned_atomic_and_independently_owned() {
-        let mut memory = Memory::reserve(0x10000, 0x8000).unwrap();
-        let ptr = memory.ptr;
-        // Neither the guest address nor its offset is 64KB aligned.
-        let storage = memory.map_shared_audio(0x12000, 0x3000).unwrap();
-        assert_eq!(memory.ptr, ptr);
-        let info = query(&memory, 0x12000);
-        assert_eq!(info.state, 0x1000); // MEM_COMMIT
-        assert_eq!(info.kind, 0x40000); // MEM_MAPPED
-        assert_eq!(info.protection, 4); // PAGE_READWRITE CPU alias
-        assert_eq!(memory.perms[2], READ | WRITE | SHARED | AUDIO);
-        memory.write(0x12000, &[0x37, 0x91]).unwrap();
-        assert_eq!(storage.load_u8(0), 0x37);
-        // Same operations the native lowering may perform: only AtomicU8, and
-        // all bounds/permissions are checked before obtaining a linear pointer.
-        unsafe {
-            (&*ptr.as_ptr().add(0x2001).cast::<AtomicU8>()).store(0xaa, Ordering::Relaxed);
-        }
-        assert_eq!(storage.load_u8(1), 0xaa);
-        let mut bytes = [0; 2];
-        memory.read_into(0x12000, &mut bytes).unwrap();
-        assert_eq!(bytes, [0x37, 0xaa]);
-        assert!(memory.read(0x12000, 2).is_err());
-        memory.protect(0x12000, 0x3000, 0).unwrap();
-        assert_eq!(memory.perms[2], SHARED | AUDIO);
-        assert_eq!(query(&memory, 0x12000).protection, 4); // guest protection is software-owned
-        assert_eq!(storage.load_u8(0), 0x37);
-        memory.protect(0x12000, 0x3000, READ | WRITE).unwrap();
-        memory.write(0x13000, &[0x55]).unwrap();
-        memory.unmap(0x13000, 4096).unwrap();
-        assert_eq!(query(&memory, 0x13000).state, 0x2000); // placeholder remains reserved
-        assert_eq!(query(&memory, 0x12000).kind, 0x40000);
-        memory.map(0x13000, 4096, READ | WRITE).unwrap();
-        memory.write(0x13000, &[0xee]).unwrap();
-        assert_eq!(storage.load_u8(4096), 0x55);
-        drop(memory);
-        assert_eq!(storage.load_u8(0), 0x37);
-        assert_eq!(storage.load_u8(1), 0xaa);
-        assert_eq!(storage.load_u8(4096), 0x55);
-    }
-
-    #[test]
-    fn audio_reuses_a_private_hole_without_moving_or_losing_its_neighbours() {
-        let mut memory = Memory::reserve(0x10000, 0x8000).unwrap();
-        memory.map(0x10000, 0x8000, READ | WRITE).unwrap();
-        let pattern: Vec<_> = (0..0x8000).map(|i| (i % 251) as u8).collect();
-        memory.write(0x10000, &pattern).unwrap();
-        memory.protect(0x10000, 0x2000, READ | EXEC).unwrap();
-        let ptr = memory.ptr;
-        let version = memory.versions[0];
-        memory.unmap(0x12000, 0x2000).unwrap();
-        let alias = memory.map_shared_audio(0x12000, 0x2000).unwrap();
-        assert_eq!(memory.ptr, ptr);
-        assert_eq!(memory.read(0x10000, 0x2000).unwrap(), &pattern[..0x2000]);
-        assert_eq!(memory.read(0x14000, 0x4000).unwrap(), &pattern[0x4000..]);
-        assert_eq!(memory.perms[0], READ | EXEC);
-        assert_eq!(memory.versions[0], version); // intact code need not be invalidated
-        assert!(query(&memory, 0x10000).kind == 0x20000); // private
-        assert_eq!(query(&memory, 0x12000).kind, 0x40000);
-        memory.write(0x12000, &[0x7a]).unwrap();
-        assert_eq!(alias.load_u8(0), 0x7a);
-        memory.unmap(0x12000, 0x2000).unwrap();
-        memory.map(0x12000, 0x2000, READ | WRITE).unwrap();
-        assert_eq!(memory.read(0x12000, 0x2000).unwrap(), &[0; 0x2000]);
-        assert_eq!(memory.read(0x10000, 0x2000).unwrap(), &pattern[..0x2000]);
-        assert_eq!(memory.read(0x14000, 0x4000).unwrap(), &pattern[0x4000..]);
-        assert_eq!(alias.load_u8(0), 0x7a);
-    }
-
-    #[test]
-    fn failed_section_mapping_keeps_the_reservation_available_and_neighbours_intact() {
-        let mut memory = Memory::reserve(0x10000, 0x5000).unwrap();
-        memory.map(0x10000, 0x5000, READ | WRITE).unwrap();
-        memory.write(0x10000, &[0x17]).unwrap();
-        memory.write(0x14000, &[0x73]).unwrap();
-        memory.unmap(0x11000, 0x3000).unwrap();
-        let reservation = memory.reservation.as_ref().unwrap();
-        assert!(
-            reservation
-                .map_section(0x1000, 0x3000, (-3isize) as *mut std::ffi::c_void)
-                .is_err()
-        );
-        assert_eq!(memory.read(0x10000, 1).unwrap(), &[0x17]);
-        assert_eq!(memory.read(0x14000, 1).unwrap(), &[0x73]);
-        memory.map(0x11000, 0x3000, READ | WRITE).unwrap();
-        assert_eq!(memory.read(0x11000, 0x3000).unwrap(), &[0; 0x3000]);
-    }
-}
-
 #[cfg(test)]
 mod file_page_tests {
     use super::*;
     use std::{cell::Cell, rc::Rc};
+
+    // spec: EXEC-CORE-7
+    #[test]
+    fn direct_data_stores_follow_byte_dependencies_on_writable_executable_pages() {
+        for permissions in [READ | WRITE, READ | WRITE | EXEC] {
+            let mut memory = Memory::reserve(0x10000, PAGE_SIZE).unwrap();
+            memory.map(0x10000, PAGE_SIZE, permissions).unwrap();
+            native_store(&memory, 0x10040, &[1; 8]);
+            assert_eq!(memory.read(0x10040, 8).unwrap(), [1; 8]);
+            let epoch = memory.epoch;
+            memory.watch_code(0x10040, 4);
+            assert!(memory.epoch > epoch);
+            assert!(memory.direct(0x10040, 4, true).is_none());
+            assert!(memory.direct(0x1003f, 2, true).is_none());
+            let version = memory.versions[0];
+            native_store(&memory, 0x10044, &[2; 4]);
+            assert_eq!(memory.versions[0], version);
+            memory.write(0x10040, &[3; 4]).unwrap();
+            assert!(memory.versions[0] > version);
+            assert_eq!(memory.read(0x10040, 8).unwrap(), [3, 3, 3, 3, 2, 2, 2, 2]);
+        }
+    }
 
     #[test]
     fn private_copy_pages_keep_execution_cache_and_retire_barriers_per_write() {
@@ -2004,7 +1635,7 @@ mod file_page_tests {
             .unwrap();
         assert!(memory.read(0x10ff0, 4).is_err());
         assert_eq!(memory.read_linear(0x10ff0, 4).unwrap(), [0x37; 4]);
-        assert_eq!(memory.direct_read(0x10ff0, 4).is_some(), !cfg!(windows));
+        assert!(memory.direct_read(0x10ff0, 4).is_some());
         assert!(memory.direct_read(0x10ffe, 4).is_none(), "crosses a page");
         memory.map_shared_audio(0x11000, PAGE_SIZE).unwrap();
         assert!(memory.read_linear(0x10ffe, 4).is_err());
@@ -2426,8 +2057,14 @@ mod window_tests {
             memory.protect(0x3000, 0x1000, 3).unwrap();
             memory.protect(0x4000, 0x4000, 3).unwrap();
             memory.protect(0x8000, 0x4000, 1).unwrap();
-            memory.protect(0xc000, 0x4000, 3).unwrap();
+            memory.protect(0xc000, 0x4000, READ | WRITE | EXEC).unwrap();
             memory.watch_code(0xc000, 1);
+            assert!(memory.direct(0xc000, 1, true).is_none());
+            let alias = memory.direct(0xc004, 4, true).unwrap();
+            // SAFETY: the alias is writable outside the watched byte, even
+            // though the corresponding host window page is write-protected.
+            unsafe { std::ptr::copy_nonoverlapping(b"data".as_ptr(), alias, 4) };
+            assert_eq!(memory.read(0xc004, 4).unwrap(), b"data");
             let window = memory.window_base().unwrap();
             let reservation = memory.reservation.as_ref().unwrap();
             let start = reservation.ptr.as_ptr() as usize - window;
@@ -2461,6 +2098,80 @@ mod window_tests {
                 [0; 6],
                 "{host}: fresh pages are zero"
             );
+        }
+    }
+
+    /// Translated code reaches the host pages of shared storage that the
+    /// window shows as ordinary memory holding the storage's bytes, until a
+    /// protection the window cannot keep exact or the unmap ends the view.
+    // spec: A64-MEM-11, A64-MEM-13
+    #[test]
+    fn the_guest_window_shows_whole_host_pages_of_shared_storage() {
+        use crate::virtual_memory::GuestAccess::{Read, Write};
+        let native = crate::virtual_memory::host_page_size().unwrap();
+        for host in [4096, 16384].into_iter().filter(|host| host % native == 0) {
+            let mut memory = Memory::window_at_host_size(0x10000, 0x40000, host).unwrap();
+            // A guest page past two host pages: on 16K hosts its host page
+            // holds unmapped pages too, so it stays with `Memory`.
+            let len = 2 * host + PAGE_SIZE;
+            let storage = memory.map_shared_audio(0x20000, len).unwrap();
+            let page = |addr: usize| (addr - 0x10000) / PAGE_SIZE;
+            let linear = |memory: &Memory, addr: usize| memory.perms[page(addr)] & LINEAR != 0;
+            let tail = 0x20000 + 2 * host;
+            assert!(
+                linear(&memory, 0x20000) && linear(&memory, tail - PAGE_SIZE),
+                "{host}"
+            );
+            assert_eq!(linear(&memory, tail), host == 4096, "{host}");
+            let snapshot = memory.native_permissions();
+            assert_eq!(
+                snapshot[page(0x20000)] & (SHARED | READ | WRITE),
+                READ | WRITE
+            );
+            assert_eq!(snapshot[page(tail)] & SHARED != 0, host != 4096, "{host}");
+
+            let window = memory.window_base().unwrap();
+            storage.store_bytes(8, b"device");
+            // SAFETY: the window shows the storage read-write there.
+            let shown = unsafe { std::slice::from_raw_parts((window + 0x20008) as *const u8, 6) };
+            assert_eq!(shown, b"device");
+            unsafe {
+                std::ptr::copy_nonoverlapping(b"guest".as_ptr(), (window + 0x20100) as *mut u8, 5)
+            };
+            let mut bytes = [0; 6];
+            memory.read_into(0x20100, &mut bytes[..5]).unwrap();
+            assert_eq!(&bytes[..5], b"guest");
+            memory.write(0x20200, b"host").unwrap();
+            let shown = unsafe { std::slice::from_raw_parts((window + 0x20200) as *const u8, 4) };
+            assert_eq!(shown, b"host");
+
+            // Read-only for one guest page: exact on 4K hosts, mixed on 16K.
+            memory.protect(0x20000, PAGE_SIZE, READ).unwrap();
+            assert_eq!(linear(&memory, 0x20000), host == 4096, "{host}");
+            assert_eq!(linear(&memory, 0x20000 + host), host == 4096, "{host}");
+            let reservation = memory.reservation.as_ref().unwrap();
+            let start = reservation.ptr.as_ptr() as usize - window;
+            let view = reservation.direct_fault_view().unwrap();
+            let allows = |addr: usize, access| view.window_allows(addr - start, PAGE_SIZE, access);
+            assert_eq!(allows(0x20000, Read), host == 4096, "{host}");
+            assert!(!allows(0x20000, Write), "{host}");
+            assert_eq!(allows(0x20000 + host, Write), host == 4096, "{host}");
+            drop(view);
+            memory.read_into(0x20008, &mut bytes).unwrap();
+            assert_eq!(&bytes, b"device");
+
+            memory.unmap(0x20000, len).unwrap();
+            assert!(!linear(&memory, 0x20000 + host), "{host}");
+            let reservation = memory.reservation.as_ref().unwrap();
+            let view = reservation.direct_fault_view().unwrap();
+            assert!(
+                !view.window_allows(0x20000 + host - start, PAGE_SIZE, Read),
+                "{host}"
+            );
+            drop(view);
+            assert_eq!(storage.load_u8(0x100), b'g');
+            memory.map(0x20000, len, READ).unwrap();
+            assert_eq!(memory.read(0x20100, 5).unwrap(), [0; 5], "{host}");
         }
     }
 
@@ -2579,6 +2290,12 @@ mod window_tests {
             assert!(
                 memory.dirty_pages.is_empty(),
                 "unwatched data stays ordinary"
+            );
+            memory.protect(0x18000, 8192, READ | WRITE).unwrap();
+            memory.unmap(0x18000, 8192).unwrap();
+            assert!(
+                memory.dirty_pages.is_empty(),
+                "remapping unwatched pages invalidates nothing"
             );
         }
     }

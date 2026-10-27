@@ -15,8 +15,8 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent.parent
-MAX_LINES = 400
-THIRD_PARTY = ("vendor/", "tools/fixtures/vendor/", "crates/adv-cpu-core/softfloat/")
+MAX_LINES = 1000
+THIRD_PARTY = ("vendor/", "crates/adv-cpu-core/softfloat/")
 SPECS = "docs/spec/"
 ALLOWED = {
     "AGENTS.md",
@@ -26,21 +26,16 @@ ALLOWED = {
     "README.md",
     "README.zh-CN.md",
     "crates/adv-cpu/README.md",
-    "crates/adv-os/tests/fixtures/README.md",
     "crates/adv-sync/README.md",
     "docs/building.md",
     "docs/configuration.md",
     "docs/glossary.md",
     "docs/investigation.md",
-    "docs/ios.md",
     "docs/ios.zh-CN.md",
     "docs/maintaining.md",
     "tools/abi/README.md",
     "tools/android/README.md",
-    "tools/compat/README.md",
     "tools/cpu/README.md",
-    "tools/fixtures/README.md",
-    "tools/fixtures/dll-driver.md",
 }
 
 

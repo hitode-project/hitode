@@ -1,5 +1,7 @@
 //! x86 calling conventions, generated signatures, typed guest values and API diagnostics.
-//! API behavior belongs to adv-win32/adv-dx; this crate never owns their state.
+//! COM interface identity and guest reference counters live in [`com`].
+//! [`dll`] writes host-module PE images and calls their guest imports.
+//! API behavior belongs to adv-dx and the Wine fronts; this crate never owns their state.
 //!
 //! Pointer parameters cannot accidentally become raw integer arguments:
 //! ```compile_fail
@@ -18,13 +20,16 @@ use std::sync::OnceLock;
 
 pub use adv_abi_macros::win32;
 pub use adv_machine::{Conv, Env, GuestCode, Handler, HostFn, Outcome};
-pub use adv_machine::{EnvLeafHandler, LeafEnv, LeafHandler};
+pub use adv_machine::{LeafEnv, LeafHandler};
 
 #[doc(hidden)]
 pub mod capability;
 pub mod code_signature;
+pub mod com;
 pub mod constants;
+pub mod dll;
 pub mod guest;
+pub mod native;
 pub mod ordinals;
 pub mod personality;
 pub mod signature;
@@ -43,9 +48,6 @@ pub use stub::{
     RunMode, StubCall, warn_structural, warn_unavailable,
 };
 
-/// A mode contract: the values of a parameter handled as Windows 7 does.
-pub type Accepts = fn(u32) -> bool;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ImplementationLevel {
     Implement,
@@ -60,7 +62,6 @@ pub struct Api {
     pub name: &'static str,
     pub conv: Conv,
     pub handler: Handler,
-    pub env_leaf: Option<EnvLeafHandler>,
     pub level: ImplementationLevel,
 }
 
@@ -86,9 +87,6 @@ pub struct Registry {
     data: HashMap<(String, String), Vec<u8>>,
     mode: RunMode,
     replacements: std::collections::BTreeSet<String>,
-    /// Mode contracts: the values of a scalar parameter an implementation
-    /// handles as Windows 7 does.
-    modes: HashMap<(String, String), Vec<(&'static str, Accepts)>>,
     /// Development probe: discovery exposes the whole fixed core catalog.
     expose_fixed_exports: bool,
 }
@@ -102,7 +100,6 @@ impl Default for Registry {
             data: HashMap::new(),
             mode: RunMode::Strict,
             replacements: Default::default(),
-            modes: HashMap::new(),
             expose_fixed_exports: std::env::var_os("ADV_PERSONALITY_STRICT")
                 .is_some_and(|value| value == "1"),
         }
@@ -120,46 +117,14 @@ impl Registry {
                     .map(|host| (module.as_str(), name.as_str(), host))
             }))
     }
-    /// Register one implementation for both light calls and ordinary traps.
+    /// Register an implementation that needs only a `LeafEnv`.
     pub fn add_leaf(&mut self, module: &str, name: &str, conv: Conv, handler: LeafHandler) {
-        assert!(
-            !adv_machine::thunk::is_audio_binding(module, name),
-            "audio bindings cannot be leaf calls"
-        );
         self.add(module, name, conv, adv_machine::thunk::leaf_trap);
         self.fns
             .get_mut(&(module.to_ascii_lowercase(), name.to_owned()))
             .expect("just inserted")
             .host
             .leaf = Some(handler);
-    }
-
-    /// Full service leaf; None must precede all observable side effects.
-    ///
-    /// Outcome behaviors cannot opt into the synchronous macro adapter.
-    /// ```compile_fail
-    /// use adv_abi::{win32, Env, Outcome};
-    /// #[win32(kernel32, name = "Sleep", level = implement, leaf)]
-    /// fn sleep(_: &mut Env<'_>, _: u32) -> Outcome { Outcome::Return(0) }
-    /// ```
-    pub fn add_env_leaf(
-        &mut self,
-        module: &str,
-        name: &str,
-        conv: Conv,
-        ordinary: Handler,
-        leaf: EnvLeafHandler,
-    ) {
-        assert!(
-            !adv_machine::thunk::is_audio_binding(module, name),
-            "audio bindings cannot be leaf calls"
-        );
-        self.add(module, name, conv, ordinary);
-        self.fns
-            .get_mut(&(module.to_ascii_lowercase(), name.to_owned()))
-            .expect("just inserted")
-            .host
-            .env_leaf = Some(leaf);
     }
 
     /// Opt in only after validating a complete native provider's ABI.
@@ -193,7 +158,6 @@ impl Registry {
             Entry {
                 host: HostFn {
                     leaf: None,
-                    env_leaf: None,
                     conv,
                     handler,
                     trace: false,
@@ -251,16 +215,7 @@ impl Registry {
 
     /// Preserve immutable binding data when composing typed API decorators.
     pub fn register_with_data(&mut self, api: Api, data: u64) {
-        if let Some(leaf) = api.env_leaf {
-            self.add_env_leaf(api.module, api.name, api.conv, api.handler, leaf);
-            self.fns
-                .get_mut(&(api.module.to_ascii_lowercase(), api.name.to_owned()))
-                .unwrap()
-                .host
-                .data = data;
-        } else {
-            self.add_with_data(api.module, api.name, api.conv, api.handler, data);
-        }
+        self.add_with_data(api.module, api.name, api.conv, api.handler, data);
         self.fns
             .get_mut(&(api.module.to_ascii_lowercase(), api.name.to_owned()))
             .expect("just inserted")
@@ -350,36 +305,6 @@ impl Registry {
         Ok(())
     }
 
-    /// Declare that `module!name` handles `param` as Windows 7 does exactly
-    /// for the values `accepts` passes (PERS-EXPORT-10). Other values reach the
-    /// implementation unchanged; the declaration lets a survey find them first.
-    pub fn accept(&mut self, module: &str, name: &str, param: &'static str, accepts: Accepts) {
-        assert!(
-            signature::lookup(module, name).is_some_and(|s| s
-                .parameters
-                .iter()
-                .any(|p| p.name == param
-                    && p.words == 1
-                    && matches!(p.kind, AbiKind::U32 | AbiKind::I32))),
-            "a mode contract needs a declared scalar parameter: {module}!{name} {param}"
-        );
-        let contracts = self
-            .modes
-            .entry((module.to_ascii_lowercase(), name.to_owned()))
-            .or_default();
-        contracts.retain(|&(p, _)| p != param);
-        contracts.push((param, accepts));
-    }
-
-    /// The mode contract of `param` of `module!name`, when one is declared.
-    pub fn accepts(&self, module: &str, name: &str, param: &str) -> Option<Accepts> {
-        self.modes
-            .get(&(module.to_ascii_lowercase(), name.to_owned()))?
-            .iter()
-            .find(|&&(p, _)| p == param)
-            .map(|&(_, accepts)| accepts)
-    }
-
     pub fn add_traced(&mut self, module: &str, name: &str, conv: Conv, handler: Handler) {
         self.add(module, name, conv, handler);
         self.set_trace(module, name, true);
@@ -393,16 +318,6 @@ impl Registry {
             .unwrap_or_else(|| panic!("guest code for unregistered {module}!{name}"))
             .host
             .guest = Some(guest);
-    }
-
-    /// Attach an audited adapter without replacing ABI metadata or guest code.
-    pub fn set_env_leaf(&mut self, module: &str, name: &str, leaf: EnvLeafHandler) {
-        assert!(!adv_machine::thunk::is_audio_binding(module, name));
-        self.fns
-            .get_mut(&(module.to_ascii_lowercase(), name.to_owned()))
-            .expect("leaf requires an existing implementation")
-            .host
-            .env_leaf = Some(leaf);
     }
 
     pub fn set_trace(&mut self, module: &str, name: &str, on: bool) {
@@ -444,7 +359,6 @@ impl Registry {
             )
             .then_some(HostFn {
                 leaf: None,
-                env_leaf: None,
                 // The unknown ABI never returns, so no cleanup is guessed.
                 conv: Conv::Cdecl { argc: 0 },
                 handler: stub::fixed_dispatch,
@@ -459,7 +373,6 @@ impl Registry {
             .expect("signature in table");
         Some(HostFn {
             leaf: None,
-            env_leaf: None,
             conv: signature.conv.unwrap_or(Conv::Cdecl { argc: 0 }),
             handler: stub::dispatch,
             trace: true,
@@ -688,7 +601,6 @@ mod signature_conflict_cache_tests {
             module: "kernel32.dll",
             name: "SetFilePointerEx",
             conv,
-            env_leaf: None,
             handler: |_| Outcome::Return(0),
             level: ImplementationLevel::Implement,
         }
@@ -789,7 +701,6 @@ mod named_alias_tests {
                 module: "kernel32.dll",
                 name: "lstrcpyA",
                 conv: Conv::Stdcall { argc: 2 },
-                env_leaf: None,
                 handler: |_| Outcome::Return(0),
                 level: ImplementationLevel::Implement,
             },
@@ -945,11 +856,6 @@ impl adv_machine::Resolver for Registry {
     fn implemented(&self, module: &str, name: &str) -> bool {
         self.is_implemented(module, name)
     }
-}
-
-#[doc(hidden)]
-pub fn leaf_edx(env: &Env<'_>) -> u32 {
-    env.cpu.reg(adv_cpu::backend::Reg::Edx)
 }
 
 pub mod library_signature;

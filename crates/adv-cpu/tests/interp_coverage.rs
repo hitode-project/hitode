@@ -1,7 +1,7 @@
 mod support;
 
 use adv_cpu::{CpuState, EXEC, READ, Region, RunOutcome, WRITE};
-use iced_x86::{Mnemonic, code_asm::*};
+use iced_x86::code_asm::*;
 use support::Executor;
 
 const CODE: u32 = 0x10000;
@@ -78,8 +78,6 @@ fn unsupported_sequence_returns_to_the_native_continuation() {
             m.state.regs[0] = value;
         }
         compare(&mut machines, RunOutcome::ReachedStop);
-        support::x64_shape!(assert_eq!(machines[0].stats.interpreter_instructions, 2));
-        support::x64_shape!(assert!(machines[0].stats.native_entries > 0));
     }
 }
 
@@ -106,7 +104,7 @@ fn exact_conversion_hands_canonical_mmx_state_to_native_continuation() {
             m.state.xmm[0][8..].copy_from_slice(&(-2.25f64).to_le_bytes());
         }
         compare(&mut machines, RunOutcome::ReachedStop);
-        support::x64_shape!(assert_eq!(machines[0].stats.interpreter_instructions, 1));
+
         assert_ne!(machines[0].state.mxcsr & 0x20, 0);
     }
 }
@@ -168,7 +166,6 @@ fn executable_fallback_write_revalidates_the_continuation() {
     }
     compare(&mut machines, RunOutcome::ReachedStop);
     assert_eq!(machines[0].state.regs[0], 0);
-    support::x64_shape!(assert!(machines[0].stats.invalidations > 0));
 }
 
 #[test]
@@ -192,11 +189,6 @@ fn xmm_word_extraction_masks_all_immediates_and_zero_extends() {
         ];
     }
     compare(&mut machines, RunOutcome::ReachedStop);
-    support::x64_shape!(assert_eq!(
-        machines[0].stats.cliffs.fallbacks.get(&Mnemonic::Pextrw),
-        None
-    ));
-    support::x64_shape!(assert_eq!(machines[0].stats.interpreter_instructions, 0));
 }
 
 #[test]
@@ -247,7 +239,6 @@ fn xmm_quadword_shifts_use_the_whole_low_count_and_preserve_high_count_bits() {
                     m.write(DATA, &count_bytes).unwrap();
                 }
                 compare(&mut machines, RunOutcome::ReachedStop);
-                support::x64_shape!(assert_eq!(machines[0].stats.interpreter_instructions, 0));
             }
         }
     }
@@ -271,7 +262,6 @@ fn xmm_quadword_immediate_shifts_zero_at_lane_width() {
             m.state.xmm[1].fill(0x81);
         }
         compare(&mut machines, RunOutcome::ReachedStop);
-        support::x64_shape!(assert_eq!(machines[0].stats.interpreter_instructions, 0));
     }
 }
 

@@ -1,8 +1,6 @@
-//! Windows Media Format SDK (wmvcore): the synchronous reader a game uses to pull
-//! compressed ASF samples from its own IStream. The container is read whole and
-//! demuxed by adv-device. Only stream samples are delivered; a reader that asks
-//! for decompressed outputs fails explicitly, and the samples it receives are
-//! decoded by DirectShow's DMO decoder filter.
+//! Windows Media Format SDK synchronous readers. The common demuxer supplies
+//! compressed samples from guest IStreams. Wine assembly also opens filenames
+//! and prepares decoded outputs on a host worker, using the same sample objects.
 use adv_abi::{GuestPtr, Registry, win32};
 use adv_cpu::backend::{GuestExt, Prot};
 use adv_device::media::{self, CodecFormat, Demuxed};
@@ -116,7 +114,9 @@ struct Stream {
 struct Reader {
     /// The opened IStream with one reference held, or 0.
     source: u32,
+    file: Option<u32>,
     media: Option<Demuxed>,
+    decoded: Option<Demuxed>,
     streams: Vec<Stream>,
     /// Eight guest bytes for output pointers of nested guest calls.
     scratch: u32,
@@ -289,6 +289,9 @@ fn release(env: &mut Env<'_>, pointer: u32) -> (u32, Vec<u32>) {
 
 /// Free a reader's host state; returns the guest objects it still referenced.
 fn close(env: &mut Env<'_>, reader: Reader) -> Vec<u32> {
+    if let Some(file) = reader.file {
+        dshow::host::close(env, file);
+    }
     if reader.scratch != 0 {
         dshow::free(env, reader.scratch);
     }
@@ -316,6 +319,7 @@ fn create_sync_reader(
     output: GuestPtr<u32>,
 ) -> Outcome {
     let output = output.addr();
+    env.ext.get_or_default::<NativeSamples>().readers += 1;
     if output == 0 || !env.cpu.accessible(output, 4, Prot::WRITE) {
         return Outcome::Return(E_POINTER);
     }
@@ -445,6 +449,34 @@ fn reader_method(env: &mut Env<'_>, this: u32, method: &str) -> Option<Outcome> 
     let (a1, a2, a3) = (env.arg(1), env.arg(2), env.arg(3));
     let opened = reader(env, this)?.media.is_some();
     match method {
+        "Open" if env.ext.try_get::<dshow::Host>().is_some() => {
+            if opened {
+                return r(NS_E_INVALID_REQUEST);
+            }
+            let read = env.ext.get::<dshow::Host>().read;
+            Some(read(
+                env,
+                a1,
+                Box::new(move |env, result| match result {
+                    Ok((bytes, file)) => {
+                        let outcome = prepare_native(env, this, bytes);
+                        dshow::after(
+                            env,
+                            outcome,
+                            Box::new(move |env, result| {
+                                if result[0] == S_OK {
+                                    reader(env, this).unwrap().file = Some(file);
+                                } else {
+                                    dshow::host::close(env, file);
+                                }
+                                Outcome::Return(result[0])
+                            }),
+                        )
+                    }
+                    Err(hr) => Outcome::Return(hr),
+                }),
+            ))
+        }
         "OpenStream" => {
             if a1 == 0 {
                 return r(E_INVALIDARG);
@@ -458,6 +490,10 @@ fn reader_method(env: &mut Env<'_>, this: u32, method: &str) -> Option<Outcome> 
             if !opened {
                 return r(NS_E_INVALID_REQUEST);
             }
+            let file = reader(env, this)?.file.take();
+            if let Some(file) = file {
+                dshow::host::close(env, file);
+            }
             let reader = reader(env, this)?;
             let held: Vec<u32> = reader
                 .streams
@@ -467,6 +503,7 @@ fn reader_method(env: &mut Env<'_>, this: u32, method: &str) -> Option<Outcome> 
                 .filter(|&p| p != 0)
                 .collect();
             reader.media = None;
+            reader.decoded = None;
             Some(release_guests(env, held, S_OK))
         }
         _ if !opened => r(NS_E_INVALID_REQUEST),
@@ -689,6 +726,20 @@ fn read_chunks(
 }
 
 fn finish_open(env: &mut Env<'_>, this: u32, stream: u32, bytes: Vec<u8>) -> Outcome {
+    if env.ext.try_get::<dshow::Host>().is_some() {
+        let outcome = prepare_native(env, this, bytes);
+        return dshow::after(
+            env,
+            outcome,
+            Box::new(move |env, result| {
+                if result[0] != S_OK {
+                    return Outcome::Return(result[0]);
+                }
+                reader(env, this).unwrap().source = stream;
+                guest_call(env, stream, 1, vec![], |_, _| Outcome::Return(S_OK))
+            }),
+        );
+    }
     let size = bytes.len();
     let demuxed = match media::demux(bytes) {
         Ok(demuxed) => demuxed,
@@ -724,8 +775,13 @@ fn set_range(env: &mut Env<'_>, this: u32, start: u64, duration: i64) {
     } else {
         u64::MAX
     };
-    for (stream, packets) in reader.streams.iter_mut().zip(&media.streams) {
-        let packets = &packets.packets;
+    for (index, stream) in reader.streams.iter_mut().enumerate() {
+        let media = if stream.compressed {
+            media
+        } else {
+            reader.decoded.as_ref().unwrap_or(media)
+        };
+        let packets = &media.streams[index].packets;
         let first = packets.partition_point(|p| p.time_100ns < start);
         stream.cursor = packets[..first.min(packets.len())]
             .iter()
@@ -736,6 +792,84 @@ fn set_range(env: &mut Env<'_>, this: u32, start: u64, duration: i64) {
         }
         stream.end_100ns = end;
         stream.discontinuity = true;
+    }
+}
+
+/// Native reader activity retained after COM objects have been released.
+#[derive(Default)]
+pub struct NativeSamples {
+    pub readers: u64,
+    pub samples: u64,
+}
+
+fn prepare_native(env: &mut Env<'_>, this: u32, bytes: Vec<u8>) -> Outcome {
+    let (send, receive) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = media::demux(bytes)
+            .and_then(|media| {
+                let mut decoded = media.clone();
+                for (input, output) in media.streams.iter().zip(&mut decoded.streams) {
+                    let mut decoder = media::PacketDecoder::open(&input.format)?;
+                    output.packets.clear();
+                    for packet in &input.packets {
+                        for frame in decoder.decode(&packet.data, Some(packet.time_100ns))? {
+                            output.packets.push(decoded_packet(frame, &input.format));
+                        }
+                    }
+                    for frame in decoder.drain()? {
+                        output.packets.push(decoded_packet(frame, &input.format));
+                    }
+                }
+                Ok((media, decoded))
+            })
+            .map_err(|_| NS_E_INVALID_INPUT_FORMAT);
+        let _ = send.send(result);
+    });
+    prepared_native(env, this, receive)
+}
+
+fn decoded_packet(frame: media::Decoded, format: &CodecFormat) -> media::Packet {
+    match frame {
+        media::Decoded::Video(frame) => media::Packet {
+            time_100ns: frame.pts_us * 10,
+            duration_100ns: match format {
+                CodecFormat::Video { frame_100ns, .. } => *frame_100ns,
+                _ => 0,
+            },
+            key: true,
+            data: frame.bgra,
+        },
+        media::Decoded::Audio(frame) => media::Packet {
+            time_100ns: frame.pts_us * 10,
+            duration_100ns: frame.samples.len() as u64 * 10_000_000
+                / (u64::from(frame.channels) * u64::from(frame.sample_rate)),
+            key: true,
+            data: frame
+                .samples
+                .into_iter()
+                .flat_map(|sample| {
+                    ((sample * 32768.0).clamp(-32768.0, 32767.0) as i16).to_le_bytes()
+                })
+                .collect(),
+        },
+    }
+}
+
+type Prepared = std::sync::mpsc::Receiver<Result<(Demuxed, Demuxed), u32>>;
+fn prepared_native(env: &mut Env<'_>, this: u32, receive: Prepared) -> Outcome {
+    match receive.try_recv() {
+        Ok(Ok((media, decoded))) => {
+            let reader = reader(env, this).unwrap();
+            reader.open(media);
+            reader.decoded = Some(decoded);
+            Outcome::Return(S_OK)
+        }
+        Ok(Err(hr)) => Outcome::Return(hr),
+        Err(std::sync::mpsc::TryRecvError::Empty) => Outcome::block(
+            adv_machine::Wait::Until(env.sys.clock.now_us() + 1000),
+            move |env, _| prepared_native(env, this, receive),
+        ),
+        Err(_) => Outcome::Return(E_UNEXPECTED),
     }
 }
 
@@ -767,6 +901,11 @@ fn next_sample(env: &mut Env<'_>, this: u32) -> Outcome {
     let mut any = false;
     for (index, stream) in candidates {
         any = true;
+        let media = if stream.compressed {
+            media
+        } else {
+            state.decoded.as_ref().unwrap_or(media)
+        };
         let Some(packet) = media.streams[index].packets.get(stream.cursor) else {
             continue;
         };
@@ -784,7 +923,7 @@ fn next_sample(env: &mut Env<'_>, this: u32) -> Outcome {
         return Outcome::Return(NS_E_NO_MORE_SAMPLES);
     };
     let stream = &state.streams[index];
-    if !stream.compressed {
+    if !stream.compressed && state.decoded.is_none() {
         adv_abi::warn_unavailable(
             env,
             "IWMSyncReader::GetNextSample",
@@ -799,6 +938,11 @@ fn next_sample(env: &mut Env<'_>, this: u32) -> Outcome {
         stream.number,
         state.scratch,
     );
+    let media = if stream.compressed {
+        media
+    } else {
+        state.decoded.as_ref().unwrap_or(media)
+    };
     let packet = &media.streams[index].packets[cursor];
     let (time, duration, key, data) = (
         packet.time_100ns,
@@ -821,6 +965,7 @@ fn next_sample(env: &mut Env<'_>, this: u32) -> Outcome {
             stream.cursor += 1;
             stream.discontinuity = false;
         }
+        env.ext.get_or_default::<NativeSamples>().samples += 1;
         let _ = env.cpu.write_u32(sample_out, buffer);
         write_u64(env, time_out, time);
         write_u64(env, duration_out, duration);

@@ -226,6 +226,7 @@ mod tests {
             return_floor: 0xffc,
             unwindable: false,
             then: Box::new(|_, _| Outcome::Return(0)),
+            callee_saved: [0; 4],
             origin: Origin {
                 esp: 0x1000,
                 ret_eip: 0,
