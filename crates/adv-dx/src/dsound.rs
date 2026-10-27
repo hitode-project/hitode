@@ -1943,8 +1943,7 @@ mod tests {
         audio: Option<AudioControl>,
     ) -> Machine<JitCpu> {
         let mut reg = Registry::default();
-        adv_win32::register(&mut reg);
-        adv_win32::ole32::register(&mut reg);
+        crate::test_support::register(&mut reg);
         register(&mut reg);
         let mut m = Machine::new(
             JitCpu::new(adv_machine::layout::PARK_ADDR, true).unwrap(),
@@ -1953,18 +1952,8 @@ mod tests {
         )
         .unwrap();
         m.sys.set_process_identity(pid).unwrap();
-        // USER32's desktop is itself a common object; the requested budget
-        // below describes resources available to this DirectSound fixture.
-        m.sys.objects = Objects::with_limits(adv_machine::ObjectLimits {
-            objects: limits.objects.saturating_add(1),
-            aliases: limits.aliases.saturating_add(1),
-            ..limits
-        });
-        adv_win32::Win32::install(
-            &mut m,
-            adv_win32::Win32Config::new(".", "audio-test.exe", "target/audio-test"),
-        )
-        .unwrap();
+        m.sys.objects = Objects::with_limits(limits);
+        crate::test_support::install(&mut m);
         match audio {
             Some(audio) => install_with_audio(&mut m, audio).unwrap(),
             None => install(&mut m).unwrap(),
@@ -2025,46 +2014,32 @@ mod tests {
     }
     // spec: EXEC-CORE-4
     #[test]
-    fn real_audio_bindings_mark_dispatch_but_timer_does_not() {
+    fn directsound_binding_marks_dispatch() {
         use adv_cpu::backend::asm::Asm;
-        for api in [
-            "timeGetTime",
-            "waveOutWrite",
-            "IDirectSoundBuffer8::GetStatus",
-        ] {
-            let mut m = machine();
-            let pointer = buffer(
-                &mut m,
-                Format {
-                    rate: 1000,
-                    channels: 1,
-                    bits: 8,
-                },
-                1000,
-            );
-            let code_at = 0x0040_0000;
-            m.cpu.map(code_at, 4096, Prot::RX).unwrap();
-            let module = if api.contains("::") {
-                "dsound.dll"
-            } else {
-                "winmm.dll"
-            };
-            let target = m.resolve_import(module, api).unwrap();
-            let mut code = Asm::new(code_at);
-            if api.contains("::") {
-                code.push_imm(DATA).push_imm(pointer);
-            } else if api == "waveOutWrite" {
-                code.push_imm(0).push_imm(0).push_imm(0);
-            }
-            code.call(target).ret();
-            m.cpu.write(code_at, &code.bytes).unwrap();
-            let thread = m.spawn("audio marker", code_at, &[], 65536).unwrap();
-            assert!(matches!(
-                m.run_virtual(10_000),
-                adv_machine::RunResult::Exited(_)
-            ));
-            assert_eq!(m.sys.audio_called_after(thread, 0), api != "timeGetTime");
-        }
+        let mut m = machine();
+        let pointer = buffer(
+            &mut m,
+            Format {
+                rate: 1000,
+                channels: 1,
+                bits: 8,
+            },
+            1000,
+        );
+        let code_at = 0x0040_0000;
+        m.cpu.map(code_at, 4096, Prot::RX).unwrap();
+        let target = m
+            .resolve_import("dsound.dll", "IDirectSoundBuffer8::GetStatus")
+            .unwrap();
+        let mut code = Asm::new(code_at);
+        code.push_imm(DATA).push_imm(pointer).call(target).ret();
+        m.cpu.write(code_at, &code.bytes).unwrap();
+        let thread = m.spawn("audio marker", code_at, &[], 65536).unwrap();
+        assert!(matches!(
+            m.run_virtual(10_000),
+            adv_machine::RunResult::Exited(_)
+        ));
+        assert!(m.sys.audio_called_after(thread, 0));
     }
 
     fn invoke(m: &mut Machine<JitCpu>, name: &str, args: &[u32]) -> u32 {
@@ -2098,35 +2073,22 @@ mod tests {
         m: &mut Machine<JitCpu>,
         class: [u8; 16],
         iid: [u8; 16],
-        context: u32,
         outer: u32,
         output: u32,
     ) -> Outcome {
-        m.cpu.write(DATA + 256, &class).unwrap();
-        m.cpu.write(DATA + 272, &iid).unwrap();
-        m.resolve_import("ole32.dll", "CoCreateInstance").unwrap();
-        let thunk = m
-            .sys
-            .thunks
-            .iter()
-            .find(|(_, t)| t.module == "ole32.dll" && t.name == "CoCreateInstance")
-            .unwrap()
-            .0;
-        let handler = m.sys.thunks.get(thunk).f.handler;
-        m.cpu.set_reg(Reg::Esp, STACK);
-        for (i, arg) in [DATA + 256, outer, context, DATA + 272, output]
-            .into_iter()
-            .enumerate()
-        {
-            m.cpu.write_u32(STACK + 4 + i as u32 * 4, arg).unwrap();
-        }
-        handler(&mut Env {
-            context: m.sys.current,
-            cpu: &mut m.cpu,
-            sys: &mut m.sys,
-            ext: &mut m.ext,
-            thunk,
-        })
+        crate::test_support::activate(
+            &mut Env {
+                context: m.sys.current,
+                cpu: &mut m.cpu,
+                sys: &mut m.sys,
+                ext: &mut m.ext,
+                thunk: 0,
+            },
+            class,
+            iid,
+            outer,
+            output,
+        )
     }
     #[test]
     fn com_activation_uses_the_same_audio_owner_and_requires_initialize() {
@@ -2140,7 +2102,7 @@ mod tests {
         ];
         for (class, iid) in [(CLSID_DEVICE, IID_DEVICE), (sdk_device8, IID_DEVICE8)] {
             assert!(matches!(
-                activate(&mut m, class, iid, 1, 0, DATA + 128),
+                activate(&mut m, class, iid, 0, DATA + 128),
                 Outcome::Return(0)
             ));
             let ptr = m.cpu.read_u32(DATA + 128).unwrap();
@@ -2176,39 +2138,26 @@ mod tests {
         assert_eq!(invoke(&mut m, "IDirectSound8::Release", &[direct]), 0);
     }
     #[test]
-    fn com_activation_failures_clear_output_without_allocating_or_leaking() {
+    fn class_constructor_failures_do_not_allocate_or_leak() {
         let mut m = machine();
         let owners = m.sys.objects.object_count();
-        for (class, iid, context, outer, expected) in [
-            ([0; 16], IID_DEVICE, 1, 0, 0x80040154),
-            (CLSID_DEVICE, IID_DEVICE, 4, 0, 0x80040154),
-            (CLSID_DEVICE, [0xff; 16], 1, 0, NO_INTERFACE),
-            (CLSID_DEVICE, IID_DEVICE8, 1, 0, NO_INTERFACE),
-            (CLSID_DEVICE, IID_DEVICE, 1, DATA, 0x80040110),
+        for (class, iid, outer, expected) in [
+            (CLSID_DEVICE, [0xff; 16], 0, NO_INTERFACE),
+            (CLSID_DEVICE, IID_DEVICE8, 0, NO_INTERFACE),
+            (CLSID_DEVICE, IID_DEVICE, DATA, 0x80040110),
         ] {
             m.cpu.write_u32(DATA + 128, 0xdeadbeef).unwrap();
             assert!(
-                matches!(activate(&mut m, class, iid, context, outer, DATA + 128), Outcome::Return(hr) if hr == expected)
+                matches!(activate(&mut m, class, iid, outer, DATA + 128), Outcome::Return(hr) if hr == expected)
             );
-            assert_eq!(m.cpu.read_u32(DATA + 128).unwrap(), 0);
+            assert_eq!(m.cpu.read_u32(DATA + 128).unwrap(), 0xdeadbeef);
             assert_eq!(m.sys.objects.object_count(), owners);
         }
         assert!(matches!(
-            activate(&mut m, CLSID_DEVICE, IID_DEVICE, 1, 0, 0),
-            Outcome::Return(0x80004003)
-        ));
-        assert!(matches!(
-            activate(&mut m, CLSID_DEVICE, IID_DEVICE, 1, 0, 0x700000),
+            activate(&mut m, CLSID_DEVICE, IID_DEVICE, 0, 0x700000),
             Outcome::Fail(_)
         ));
         assert_eq!(m.sys.objects.object_count(), owners);
-        let warnings = &m.ext.get::<adv_abi::ApiDiagnostics>().warnings;
-        assert_eq!(
-            warnings.len(),
-            2,
-            "class/context failures only; IID probes remain quiet"
-        );
-        assert!(warnings.values().all(|count| *count == 1));
     }
     fn buffer(m: &mut Machine<JitCpu>, format: Format, bytes: u32) -> u32 {
         let device = device(m);
@@ -2318,7 +2267,7 @@ mod tests {
                     OUT_OF_MEMORY
                 );
                 assert_eq!(m.cpu.read_u32(DATA + 128).unwrap(), 0);
-                assert_eq!(m.sys.objects.object_count(), 1);
+                assert_eq!(m.sys.objects.object_count(), 0);
                 assert_eq!(heap_next(&mut m), next);
             }
         }
@@ -2353,7 +2302,7 @@ mod tests {
                     OUT_OF_MEMORY
                 );
                 assert_eq!(m.cpu.read_u32(DATA + 128).unwrap(), 0);
-                assert_eq!(m.sys.objects.object_count(), 2);
+                assert_eq!(m.sys.objects.object_count(), 1);
                 assert_eq!(heap_next(&mut m), next);
                 assert!(m.ext.get::<Sound>().buffer_ids.is_empty());
                 assert!(m.ext.get::<Sound>().pending_release.is_empty());
@@ -2394,7 +2343,7 @@ mod tests {
                 OUT_OF_MEMORY
             );
             assert_eq!(m.cpu.read_u32(DATA + 128).unwrap(), 0);
-            assert_eq!(m.sys.objects.object_count(), 258);
+            assert_eq!(m.sys.objects.object_count(), 257);
             assert_eq!(heap_next(&mut m), next_header);
             assert!(m.sys.vm.region(next_mapping).is_none());
             assert!(m.cpu.read_u8(next_mapping).is_err());

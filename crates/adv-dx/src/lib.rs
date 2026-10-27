@@ -17,3 +17,8 @@ pub mod xaudio2;
 
 pub mod interop;
 mod refcounts;
+
+#[cfg(test)]
+extern crate self as adv_dx;
+#[cfg(test)]
+mod test_support;
