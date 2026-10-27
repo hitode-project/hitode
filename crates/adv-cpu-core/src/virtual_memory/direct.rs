@@ -432,14 +432,31 @@ unsafe fn remap(source: NonNull<u8>, target: *mut u8, len: usize) -> bool {
     }
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
+        #[cfg(target_os = "linux")]
+        use libc::{MREMAP_FIXED, MREMAP_MAYMOVE, mremap};
+        // The libc crate binds bionic's mremap only for Linux targets.
+        #[cfg(target_os = "android")]
+        unsafe extern "C" {
+            fn mremap(
+                address: *mut libc::c_void,
+                old_size: libc::size_t,
+                new_size: libc::size_t,
+                flags: libc::c_int,
+                ...
+            ) -> *mut libc::c_void;
+        }
+        #[cfg(target_os = "android")]
+        const MREMAP_MAYMOVE: libc::c_int = 1;
+        #[cfg(target_os = "android")]
+        const MREMAP_FIXED: libc::c_int = 2;
         // A zero old size duplicates a shared mapping instead of moving it.
         // SAFETY: forwarded.
         let mapped = unsafe {
-            libc::mremap(
+            mremap(
                 source.as_ptr().cast(),
                 0,
                 len,
-                libc::MREMAP_MAYMOVE | libc::MREMAP_FIXED,
+                MREMAP_MAYMOVE | MREMAP_FIXED,
                 target.cast::<libc::c_void>(),
             )
         };
