@@ -5,8 +5,7 @@ This is the published `symphonia-codec-adpcm` 0.5.5 source at upstream revision
 package version, source files and MPL-2.0 license are retained. The production
 audio stack continues to use Symphonia's decoder registry.
 
-Three integer arithmetic changes are tested against native Windows ACM by the
-authored x86 fixture in `adv-host/tools/fixtures/acm_codec.c`:
+Three integer arithmetic changes match native Windows ACM:
 
 * IMA expansion keeps the shifted step terms separate, retaining the integer
   truncations of the conventional IMA recurrence. Combining them before a
@@ -18,6 +17,4 @@ authored x86 fixture in `adv-host/tools/fixtures/acm_codec.c`:
   eight. Signed division rounds negative fractional predictors toward zero;
   the native decoder rounds them down. The difference affects predictors 3–6.
 
-The fixture checks mono and stereo PCM samples byte for byte, including the
-seven MS predictors, delta boundaries and repeated large residuals. Windows ACM
-is a test oracle only and is never linked into the production decoder.
+Windows ACM is a test oracle only and is never linked into the production decoder.

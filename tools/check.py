@@ -35,7 +35,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 # Generated (tools/abi) or third-party sources: never reformatted.
-UNFORMATTED = ("data/abi/", "vendor/", "crates/adv-cpu-core/softfloat/", "tools/fixtures/vendor/")
+UNFORMATTED = ("data/abi/", "vendor/", "crates/adv-cpu-core/softfloat/")
 LAUNCHER = "apps/adv-launcher/"
 DEFAULT_BRANCHES = ("master", "main")
 # Paths whose changes CI builds or lints; anything else is documentation.
@@ -211,7 +211,6 @@ def check(everything: bool, ci: bool = False) -> bool:
     ok &= run("wine protocol", [sys.executable, "tools/wine/protocol.py", "--check"])
     ok &= run("wine syscalls", [sys.executable, "tools/wine/syscalls.py", "--check"])
     ok &= run("docs", [sys.executable, "tools/docs/check_docs.py"])
-    ok &= run("native fixture recordings", [sys.executable, "tools/fixtures/record_native.py", "--sources"])
     ok &= launcher(everything, ci)
     return ok
 

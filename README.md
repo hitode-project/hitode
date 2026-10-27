@@ -154,6 +154,5 @@ Third-party parts keep their own licenses:
 - `crates/adv-unix/freetype`: the FreeType ftgrays rasterizer, used under the FreeType License (FTL); see its `LICENSE.TXT`.
 - `vendor/fluidr3mono`: the FluidR3 Mono GM SoundFont, MIT; see its `LICENSE`.
 - `vendor/upscaling`: upscaling shader sources, under GPL-3.0 and each original's license (MIT for Anime4K); see its `NOTICE`.
-- `tools/fixtures/vendor/minhook`: a test fixture; see its `LICENSE.txt`.
 
 The Wine modules in release packages are an i386 build of Wine 11.0, LGPL-2.1-or-later; the build scripts are in `tools/wine/`.

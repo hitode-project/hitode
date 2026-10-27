@@ -16,7 +16,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 MAX_LINES = 1000
-THIRD_PARTY = ("vendor/", "tools/fixtures/vendor/", "crates/adv-cpu-core/softfloat/")
+THIRD_PARTY = ("vendor/", "crates/adv-cpu-core/softfloat/")
 SPECS = "docs/spec/"
 ALLOWED = {
     "AGENTS.md",
@@ -36,8 +36,6 @@ ALLOWED = {
     "tools/abi/README.md",
     "tools/android/README.md",
     "tools/cpu/README.md",
-    "tools/fixtures/README.md",
-    "tools/fixtures/dll-driver.md",
 }
 
 

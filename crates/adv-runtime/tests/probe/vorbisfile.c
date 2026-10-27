@@ -1,6 +1,6 @@
 /* i686-w64-mingw32-gcc -Os -nostdlib -Wl,--entry,_mainCRTStartup -o vorbisfile.exe vorbisfile.c -lkernel32
  * The callback fixture is shared with the native Windows reference tests:
- * i686-w64-mingw32-gcc -Os -nostdlib -Wl,--entry,_mainCRTStartup -o vorbis_codec.exe tools/fixtures/vorbis_codec.c -lkernel32 -lgcc */
+ * i686-w64-mingw32-gcc -Os -nostdlib -Wl,--entry,_mainCRTStartup -o vorbis_codec.exe crates/adv-runtime/tests/probe/vorbisfile.c -lkernel32 -lgcc */
 #include <windows.h>
 
 typedef int (__cdecl *CLEAR)(void *);

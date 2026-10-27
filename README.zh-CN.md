@@ -154,6 +154,5 @@ Hitode 以 [GNU 通用公共许可证第 3 版或任何更新版本](COPYING)发
 - `crates/adv-unix/freetype`：FreeType 的 ftgrays 光栅器，按 FreeType License（FTL）使用，见其 `LICENSE.TXT`。
 - `vendor/fluidr3mono`：FluidR3 Mono GM 音色库，MIT，见其 `LICENSE`。
 - `vendor/upscaling`：超分着色器源码，GPL-3.0 与各原作的许可证（Anime4K 为 MIT），见其 `NOTICE`。
-- `tools/fixtures/vendor/minhook`：测试夹具，见其 `LICENSE.txt`。
 
 发行包内的 Wine 模块是 Wine 11.0 的 i386 构建，LGPL-2.1-or-later，构建脚本在 `tools/wine/`。
