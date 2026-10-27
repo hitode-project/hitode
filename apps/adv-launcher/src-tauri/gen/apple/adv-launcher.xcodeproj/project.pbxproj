@@ -15,6 +15,8 @@
 		4BC56A5F23C6E74BBDAE4D73 /* entry.m in Sources */ = {isa = PBXBuildFile; fileRef = 978BC5FB2AF03C1AA4491FCE /* entry.m */; };
 		627EA91F3A41B9FC970BD399 /* MetalKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 80782AF8123A546BF857BEC8 /* MetalKit.framework */; };
 		7883BE7E491234A2C9621AC0 /* CoreGraphics.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 57009CBD3E73D253F7DFCEC0 /* CoreGraphics.framework */; };
+		C0DEA1A1C0DEA1A1C0DEA101 /* CoreMedia.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = C0DEA1A1C0DEA1A1C0DEA102 /* CoreMedia.framework */; };
+		C0DEA1A1C0DEA1A1C0DEA103 /* VideoToolbox.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = C0DEA1A1C0DEA1A1C0DEA104 /* VideoToolbox.framework */; };
 		7DA03F78CFF9D2C74F250893 /* Security.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 9388E2F289C8FCE1C91E1E86 /* Security.framework */; };
 		865BC026220F8EB73D2EA22D /* WebKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = C3F1B56F26FB843DBEE62519 /* WebKit.framework */; };
 		97D59D793A3208B3D0DE9EB2 /* HitodeJIT.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 1BFDFEDE649BC4961C673A5E /* HitodeJIT.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
@@ -63,6 +65,8 @@
 		536F92517564997B3B60F460 /* vndb.rs */ = {isa = PBXFileReference; path = vndb.rs; sourceTree = "<group>"; };
 		54A678ED2B20ABBA4A0C78B7 /* lib.rs */ = {isa = PBXFileReference; path = lib.rs; sourceTree = "<group>"; };
 		57009CBD3E73D253F7DFCEC0 /* CoreGraphics.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreGraphics.framework; path = System/Library/Frameworks/CoreGraphics.framework; sourceTree = SDKROOT; };
+		C0DEA1A1C0DEA1A1C0DEA102 /* CoreMedia.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreMedia.framework; path = System/Library/Frameworks/CoreMedia.framework; sourceTree = SDKROOT; };
+		C0DEA1A1C0DEA1A1C0DEA104 /* VideoToolbox.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = VideoToolbox.framework; path = System/Library/Frameworks/VideoToolbox.framework; sourceTree = SDKROOT; };
 		5A6D7D1A92ACB3A7C3C49544 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		5B8C58AD3843B2734899951F /* main.rs */ = {isa = PBXFileReference; path = main.rs; sourceTree = "<group>"; };
 		5BCD96957BE0CF9E4D519605 /* mobile_view.rs */ = {isa = PBXFileReference; path = mobile_view.rs; sourceTree = "<group>"; };
@@ -114,6 +118,8 @@
 				D10E30B23671ED3E6CE192CF /* AVFoundation.framework in Frameworks */,
 				356BA95DB4531A35D290E353 /* CoreAudio.framework in Frameworks */,
 				7883BE7E491234A2C9621AC0 /* CoreGraphics.framework in Frameworks */,
+				C0DEA1A1C0DEA1A1C0DEA101 /* CoreMedia.framework in Frameworks */,
+				C0DEA1A1C0DEA1A1C0DEA103 /* VideoToolbox.framework in Frameworks */,
 				CEB79751E93749B575A427D5 /* Metal.framework in Frameworks */,
 				627EA91F3A41B9FC970BD399 /* MetalKit.framework in Frameworks */,
 				1DF18FAB480EB65AD7CEDC6F /* QuartzCore.framework in Frameworks */,
@@ -157,6 +163,8 @@
 				F22BC2D6ED80A024DBAC2AFD /* AVFoundation.framework */,
 				6AD370159BE6EB1818AF6CBF /* CoreAudio.framework */,
 				57009CBD3E73D253F7DFCEC0 /* CoreGraphics.framework */,
+				C0DEA1A1C0DEA1A1C0DEA102 /* CoreMedia.framework */,
+				C0DEA1A1C0DEA1A1C0DEA104 /* VideoToolbox.framework */,
 				9D1144D0508A18D69F2D291D /* Foundation.framework */,
 				201D490131601D1117784255 /* libapp.a */,
 				8C4F921E9773364D9268F34B /* Metal.framework */,
@@ -419,7 +427,7 @@
 				);
 				LIBRARY_SEARCH_PATHS = "$(inherited) $(BUILT_PRODUCTS_DIR)";
 				OTHER_LDFLAGS = "$(inherited) -ladv_jit_helper -liconv -lresolv";
-				DEVELOPMENT_TEAM = "$(APPLE_DEVELOPMENT_TEAM)";
+				DEVELOPMENT_TEAM = "VK84ZNCAA4";
 				PRODUCT_BUNDLE_IDENTIFIER = org.hitode.launcher.JitHelper;
 				PRODUCT_NAME = HitodeJIT;
 				SDKROOT = iphoneos;
@@ -455,10 +463,11 @@
 				"LIBRARY_SEARCH_PATHS[arch=arm64]" = "$(inherited) $(PROJECT_DIR)/Externals/arm64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)";
 				"LIBRARY_SEARCH_PATHS[arch=x86_64]" = "$(inherited) $(PROJECT_DIR)/Externals/x86_64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)";
 				PRODUCT_BUNDLE_IDENTIFIER = org.hitode.launcher;
-				PRODUCT_NAME = Hitode;
+				PRODUCT_NAME = "Hitode";
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";
 				VALID_ARCHS = arm64;
+				DEVELOPMENT_TEAM = "VK84ZNCAA4";
 			};
 			name = release;
 		};
@@ -605,10 +614,11 @@
 				"LIBRARY_SEARCH_PATHS[arch=arm64]" = "$(inherited) $(PROJECT_DIR)/Externals/arm64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)";
 				"LIBRARY_SEARCH_PATHS[arch=x86_64]" = "$(inherited) $(PROJECT_DIR)/Externals/x86_64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)";
 				PRODUCT_BUNDLE_IDENTIFIER = org.hitode.launcher;
-				PRODUCT_NAME = Hitode;
+				PRODUCT_NAME = "Hitode";
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";
 				VALID_ARCHS = arm64;
+				DEVELOPMENT_TEAM = "VK84ZNCAA4";
 			};
 			name = debug;
 		};
@@ -629,7 +639,7 @@
 				);
 				LIBRARY_SEARCH_PATHS = "$(inherited) $(BUILT_PRODUCTS_DIR)";
 				OTHER_LDFLAGS = "$(inherited) -ladv_jit_helper -liconv -lresolv";
-				DEVELOPMENT_TEAM = "$(APPLE_DEVELOPMENT_TEAM)";
+				DEVELOPMENT_TEAM = "VK84ZNCAA4";
 				PRODUCT_BUNDLE_IDENTIFIER = org.hitode.launcher.JitHelper;
 				PRODUCT_NAME = HitodeJIT;
 				SDKROOT = iphoneos;

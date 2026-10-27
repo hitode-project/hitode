@@ -92,11 +92,13 @@ targets:
       - sdk: AVFoundation.framework
       - sdk: CoreAudio.framework
       - sdk: CoreGraphics.framework
+      - sdk: CoreMedia.framework
       - sdk: Metal.framework
       - sdk: MetalKit.framework
       - sdk: QuartzCore.framework
       - sdk: Security.framework
       - sdk: UIKit.framework
+      - sdk: VideoToolbox.framework
       - sdk: WebKit.framework
     preBuildScripts:
       - script: |
