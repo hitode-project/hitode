@@ -199,7 +199,8 @@ The default-off features above conflict with the default-on rule; each must beco
 
 Wine sessions apply the shared engine and diagnostic settings, shader capabilities and cache location,
 font files, family substitutions and smoothing, frame and time limits, and audio output selection.
-`--report` writes the final stop reason and full guest exit code even on a guest failure;
+`--report` includes whole-module Vorbis provider selection and callback/decoding counters.
+It writes the final stop reason and full guest exit code even on a guest failure;
 control snapshots retain `running` until execution stops. CPU, host and scheduling profiles use
 the same writers as the built-in stack. Ctrl acceleration uses the shared live key policy for
 eligible delays and stays disabled once a child process has been created.

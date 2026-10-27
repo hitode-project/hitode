@@ -19,6 +19,8 @@ use adv_pe::{ImportModule, ImportName};
 
 use crate::graphics::{guest_memory, install_store};
 
+pub use adv_drv::codec::vorbisfile;
+
 mod class;
 #[cfg(any(target_vendor = "apple", target_os = "android"))]
 pub mod session;

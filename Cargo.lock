@@ -138,6 +138,7 @@ dependencies = [
  "adv-device",
  "adv-machine",
  "adv-nt",
+ "adv-pe",
  "adv-sync",
  "adv-unix",
  "adv-wineserver",

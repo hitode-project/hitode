@@ -410,6 +410,30 @@ fn report(
         format!("\"scene_gate\": {}", metrics.gate.json()),
         format!("\"wine_boundaries\": {}", session.boundaries().json(24)),
     ];
+    let mut codec = adv_runtime::wine::vorbisfile::stats(&session.machine).map_or_else(
+        || "{\"provider\": \"guest\"}".into(),
+        |s| format!(concat!("{{\"provider\": \"native\", \"opens\": {}, \"failed_opens\": {}, ",
+            "\"clears\": {}, \"active_streams\": {}, \"decoded_packets\": {}, \"decoded_frames\": {}, ",
+            "\"guest_callbacks\": {}, \"read_callbacks\": {}, \"seek_callbacks\": {}, \"tell_callbacks\": {}, ",
+            "\"close_callbacks\": {}, \"callback_bytes\": {}, \"metadata_scans\": {}}}"),
+            s.opens, s.failed_opens, s.clears, s.active_streams, s.decoded_packets, s.decoded_frames,
+            s.guest_callbacks, s.read_callbacks, s.seek_callbacks, s.tell_callbacks, s.close_callbacks, s.callback_bytes, s.metadata_scans),
+    );
+    if let Some(selection) = session
+        .machine
+        .ext
+        .try_get::<adv_runtime::wine::vorbisfile::Selection>()
+    {
+        codec.pop();
+        codec.push_str(&format!(
+            ", \"selection_reason\": {}}}",
+            selection
+                .reason
+                .as_deref()
+                .map_or_else(|| "null".into(), json)
+        ));
+    }
+    fields.push(format!("\"codec\": {codec}"));
     if let Some(diagnostics) = &sys.stats.wait_diagnostics {
         fields.push(format!("\"wait_diagnostics\": {}", diagnostics.json()));
     }
@@ -1371,7 +1395,7 @@ mod tests {
             );
             assert!(reset.contains("\"first_frame_seconds\": null,"), "{reset}");
             assert!(reset.contains("\"frame_observations\": 0"), "{reset}");
-            for unavailable in ["api", "codec", "codec_kernels", "graphics_memory"] {
+            for unavailable in ["api", "codec_kernels", "graphics_memory"] {
                 assert!(
                     !reset.contains(&format!("\"{unavailable}\":")),
                     "{unavailable}"

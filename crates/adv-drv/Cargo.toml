@@ -12,6 +12,7 @@ adv-abi = { path = "../adv-abi" }
 adv-cpu = { path = "../adv-cpu" }
 adv-device = { path = "../adv-device" }
 adv-machine.workspace = true
+adv-pe = { path = "../adv-pe" }
 adv-sync = { path = "../adv-sync" }
 adv-nt = { path = "../adv-nt" }
 adv-unix = { path = "../adv-unix" }

@@ -21,7 +21,7 @@ use crate::unixlib;
 /// Assembly-supplied binding for mapped images and their retirement.
 #[derive(Clone, Copy)]
 pub struct ImageBinding {
-    pub mapped: fn(&mut Env<'_>, u32, &Pe),
+    pub mapped: fn(&mut Env<'_>, u32, &Pe, Option<&std::path::Path>),
     pub unmapped: fn(&mut Env<'_>, u32),
 }
 
@@ -622,7 +622,7 @@ pub fn map_image(env: &mut Env<'_>, mapping: u32) -> Result<View, Error> {
     crate::identity::note_image(env.ext, base, size, path.as_deref(), headers);
     crate::native::bind(env.cpu, env.sys, env.ext, base, &pe);
     if let Some(binding) = env.ext.try_get::<ImageBinding>().copied() {
-        (binding.mapped)(env, base, &pe);
+        (binding.mapped)(env, base, &pe, path.as_deref());
     }
     unixlib::note_image(env, base, path);
     Ok(View {

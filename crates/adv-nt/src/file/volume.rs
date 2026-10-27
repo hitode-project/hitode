@@ -409,10 +409,9 @@ pub(super) fn information(
     Ok((bytes, status))
 }
 
-pub(crate) fn read_all(mounts: &Mounts, fd: std::os::fd::RawFd) -> std::io::Result<Vec<u8>> {
+pub fn read_all(mounts: &Mounts, fd: std::os::fd::RawFd) -> std::io::Result<Vec<u8>> {
     use std::os::fd::FromRawFd;
-    // SAFETY: a descriptor the server gave the process, open for this call;
-    // ManuallyDrop leaves it open.
+    // SAFETY: a descriptor kept open by the caller; ManuallyDrop leaves it open.
     let file = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) });
     let size = file.metadata()?.len();
     let mut bytes = vec![0u8; size as usize];

@@ -424,7 +424,7 @@ FreeType is a host library under WINE-UNIX-6.
 
 ### WINE-DLL-1 Loader-owned entries
 
-**Rule**: Host DLL exports MUST point inside an i386 PE32 image that Wine's loader maps. Entries MUST use their registered calling conventions and machine bindings without storing host addresses, at any load base.
+**Rule**: Installed host DLL exports MUST point inside an i386 PE32 image that Wine's loader maps. Entries MUST use their registered calling conventions and machine bindings without storing host addresses, at any load base.
 **Verification**: Test
 
 ### WINE-DLL-2 Ordinary import calls
@@ -632,6 +632,12 @@ Device decoding follows [device.md](device.md).
 
 **Rule**: Theora bindings MUST retain complete library-family admission and preserve pixels, state, guest allocation lifetime, return values, and callbacks. Calls without admitted decoder state MUST resume guest code before changing guest memory. Verify mode MUST compare native results while publishing guest results.
 **Verification**: Test
+
+### CODEC-MODULE-1 Shipped Vorbisfile modules
+
+**Rule**: Wine MUST bind admitted shipped `vorbisfile.dll` exports to host thunks while preserving names, ordinals, original code, and loader lifetime. Admission MUST retain the provider's ordinal-layout, static-import, delay-import, and dynamic-symbol checks through Wine's file namespace. Guest mode and rejected modules MUST retain guest execution.
+**Verification**: Test
+**Basis**: DEV-AUDIO-3
 
 ## Sessions
 

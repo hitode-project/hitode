@@ -1,6 +1,6 @@
-//! Static codec libraries on Wine's image-mapping path. Admission and the
-//! library ABIs follow the built-in stack; decoding belongs to adv-device.
-//! Redirects leave image bytes unchanged and declined calls use trampolines.
+//! Codec libraries on Wine's image-mapping path. Admission and the library
+//! ABIs follow the built-in stack; decoding belongs to adv-device. Static
+//! kernels use redirects; whole-module exports bind through the mapped EAT.
 #[cfg(all(test, any(target_vendor = "apple", target_os = "android")))]
 use adv_wineserver as _;
 use std::collections::BTreeMap;
@@ -12,6 +12,7 @@ use adv_machine::{Env, Ext, HostFn, Outcome, Sys, layout::PAGE};
 mod mdct;
 mod rows;
 mod theora;
+pub mod vorbisfile;
 
 pub use mdct::{BUNDLED_SIGNATURES, Stats};
 
@@ -54,7 +55,15 @@ pub fn install(ext: &mut Ext, mode: Mode) {
     mdct::install(ext, mode);
     theora::install(ext, mode);
     ext.insert(adv_nt::section::ImageBinding {
-        mapped: |env, base, pe| {
+        mapped: |env, base, pe, path| {
+            match vorbisfile::bind(env, base, pe, path) {
+                Ok(true) => return,
+                Ok(false) => {}
+                Err(error) => {
+                    mdct::rejected(env.ext, error);
+                    return;
+                }
+            }
             let ranges: Vec<_> = pe
                 .sections
                 .iter()
@@ -87,7 +96,9 @@ pub fn stats(ext: &Ext) -> Option<Stats> {
 
 /// The session's resolver delegates codec thunk names here.
 pub fn host_fn(module: &str, name: &str) -> Option<HostFn> {
-    mdct::host_fn(module, name).or_else(|| theora::host_fn(module, name))
+    vorbisfile::host_fn(module, name)
+        .or_else(|| mdct::host_fn(module, name))
+        .or_else(|| theora::host_fn(module, name))
 }
 
 fn note_image(env: &mut Env<'_>, base: u32, size: u32, ranges: &[ExecutableRange]) {

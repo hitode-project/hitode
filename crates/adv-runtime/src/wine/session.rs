@@ -736,6 +736,11 @@ impl Session {
             graphics_driver: super::GRAPHICS_DRIVER,
             fonts: config.fonts,
         };
+        adv_drv::codec::vorbisfile::prepare(
+            &mut machine.ext,
+            &prefix.join("dosdevices"),
+            startup.image,
+        );
         let started = process::start(
             &mut machine,
             &ntdll,
@@ -1149,6 +1154,11 @@ impl Session {
                 graphics_driver: super::GRAPHICS_DRIVER,
                 fonts: &c.fonts,
             };
+            adv_drv::codec::vorbisfile::prepare(
+                &mut machine.ext,
+                &c.prefix.join("dosdevices"),
+                startup.image,
+            );
             process::start_connected(
                 &mut machine,
                 &c.ntdll,
