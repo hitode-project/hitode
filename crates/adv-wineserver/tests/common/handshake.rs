@@ -247,7 +247,20 @@ pub fn handshake(many_files: bool) {
                 assert_ne!(answer.handle, 0);
             }
         }
-        server.step(&clock); // Finish the last descriptor transfer before measuring a quiet request.
+        // Finish the last descriptor transfer before measuring a quiet request.
+        // The watcher thread can report the transfers' readiness after the
+        // step that consumed it, so wait until it stays quiet.
+        server.step(&clock);
+        let mut quiet = 0;
+        while quiet < 2 {
+            std::thread::sleep(Duration::from_millis(20));
+            if server.kernel_ready() {
+                server.step(&clock);
+                quiet = 0;
+            } else {
+                quiet += 1;
+            }
+        }
         let (mut waits, mut events, mut polls) = (0, 0, 0);
         let (mut after_waits, mut after_events, mut after_polls) = (0, 0, 0);
         // SAFETY: the request header occupies fixed; all outputs and descriptors are live.
