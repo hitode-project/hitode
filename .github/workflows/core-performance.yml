@@ -207,7 +207,9 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: '. -> target/workspace-ci'
-          key: ${{ matrix.group }}
+          # ffmpeg-sys does not rerun its build script when FFMPEG_DIR moves,
+          # so a new FFmpeg build must not reuse cached link paths.
+          key: ${{ matrix.group }}-${{ hashFiles('tools/macos/build.py', 'tools/macos/ffmpeg.json') }}
           cache-on-failure: true
           cache-workspace-crates: true
       - name: Compile test programs
