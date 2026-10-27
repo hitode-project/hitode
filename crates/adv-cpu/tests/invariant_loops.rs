@@ -141,7 +141,6 @@ fn unproven_alias_writes_remain_visible_to_every_invariant_read() {
             assert_eq!(word(&jit, SLOT + 4), word(&jit, SLOT));
             assert_eq!(jit.state.regs[2], 0x2244_6688);
             assert_eq!(jit.state.regs[7], 0x7788_99aa);
-            support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
         }
     }
 }
@@ -218,7 +217,6 @@ fn rejected_cross_page_and_executable_writes_keep_exact_prefixes_and_reenter() {
                     jit.memory().read(slot, 8).unwrap(),
                     uc.memory().read(slot, 8).unwrap()
                 );
-                support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
             } else {
                 // Executable guest writes use the existing SMC fallback.
                 assert_eq!(outcome, RunOutcome::ReachedStop);
@@ -269,7 +267,6 @@ fn side_entry_budget_restarts_and_wrapped_invariant_addresses_match_the_oracle()
                 assert!(round != 127);
             }
             assert_eq!(word(&jit, SLOT), 10 + ITERATIONS * 7);
-            support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
         }
     }
 }
@@ -309,7 +306,6 @@ fn shared_file_operands_keep_checked_io_and_observe_each_alias_write() {
             u32::from_le_bytes(actual[..4].try_into().unwrap()),
             10 + ITERATIONS * 7
         );
-        support::x64_shape!(assert_eq!(cpu.stats().interpreter_instructions, 0));
     }
 }
 
@@ -431,7 +427,6 @@ fn scoped_clone_exits_restore_state_and_reprove_a_changed_base_on_reentry() {
             expected_xmm0[..4].copy_from_slice(&untouched_regs[2].to_le_bytes());
             assert_eq!(jit.state.xmm[0], expected_xmm0);
             assert_eq!(jit.state.xmm[1..], sentinels[1..]);
-            support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
         }
     }
 }

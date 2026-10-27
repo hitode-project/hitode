@@ -103,53 +103,6 @@ fn unit(start: u32, entry: u32, len: usize, callees: &[u32]) -> Region {
     region
 }
 
-#[cfg_attr(target_arch = "aarch64", ignore = "Cranelift execution shape")]
-#[test]
-fn observed_callees_run_inside_the_caller_and_follow_their_own_code_pages() {
-    let mut transfers = Vec::new();
-    for callees in [&[][..], &[ADD, XOR]] {
-        let mut jit = machine(&leaf(ADD, false));
-        let mut reference = machine(&leaf(ADD, false));
-        jit.add_region(unit(ROOT, ROOT, 64, callees)).unwrap();
-        // Rust entries count region transfers only while linking is off.
-        jit.set_region_linking(false);
-        for pc in [ADD, XOR, OTHER] {
-            jit.add_region(unit(pc, pc, 16, &[])).unwrap();
-        }
-        for subtract in [false, true] {
-            if subtract {
-                // A callee change on another page must reach the caller's copy.
-                for m in [&mut jit, &mut reference] {
-                    m.protect(CODE, 4096, READ | WRITE).unwrap();
-                    m.write(ADD, &leaf(ADD, true)).unwrap();
-                    m.protect(CODE, 4096, READ | EXEC).unwrap();
-                }
-            }
-            start(&mut jit);
-            start(&mut reference);
-            let before = jit.stats.native_entries;
-            assert_eq!(jit.run(STOP, 10_000).unwrap(), RunOutcome::ReachedStop);
-            assert_eq!(
-                reference.run_unicorn(STOP, 10_000).unwrap(),
-                RunOutcome::ReachedStop
-            );
-            assert_eq!(jit.state.regs, reference.state.regs, "{callees:x?}");
-            assert_eq!(jit.state.mmx, reference.state.mmx);
-            assert_eq!(jit.state.eflags & 0x8d5, reference.state.eflags & 0x8d5);
-            if subtract {
-                support::x64_shape!(assert!(jit.stats.invalidations > 0));
-            } else {
-                support::x64_shape!(assert_eq!(jit.stats.interpreter_entries, 0));
-                transfers.push(jit.stats.native_entries - before);
-            }
-        }
-    }
-    // 64 calls and returns transfer between units; only the 16 calls to the
-    // target that was never observed still do with callees.
-    assert!(transfers[0] >= 128, "{transfers:?}");
-    assert!(transfers[1] <= 40, "{transfers:?}");
-}
-
 #[test]
 fn far_callees_are_dropped_without_changing_the_unit() {
     let mut jit = machine(&leaf(ADD, false));

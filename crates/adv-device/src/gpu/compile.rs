@@ -133,15 +133,7 @@ fn lower_priority() -> bool {
         }
         return pthread_set_qos_class_self_np(0x09, 0) == 0;
     }
-    #[cfg(windows)]
-    unsafe {
-        #[link(name = "kernel32")]
-        unsafe extern "system" {
-            fn GetCurrentThread() -> *mut core::ffi::c_void;
-            fn SetThreadPriority(thread: *mut core::ffi::c_void, priority: i32) -> i32;
-        }
-        return SetThreadPriority(GetCurrentThread(), -2) != 0;
-    }
+
     #[allow(unreachable_code)]
     false
 }

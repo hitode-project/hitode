@@ -27,7 +27,6 @@ fn cold_code_executes_without_native_compilation_or_reference_engine() {
     assert_eq!(m.state.regs[0] as i32, -14);
     assert_eq!(m.state.regs[2] as i32, -3);
     assert_eq!(m.stats.compilations, 0);
-    support::x64_shape!(assert_eq!(m.stats.interpreter_instructions, 5));
 }
 
 #[test]
@@ -87,7 +86,7 @@ fn pending_x87_exception_cannot_be_bypassed_by_cached_mmx() {
     );
     assert_eq!(m.state.regs[0], 1);
     assert_eq!(m.state.x87.regs, registers);
-    support::x64_shape!(assert_eq!(m.stats.native_entries, 0));
+
     m.state.x87.status = 0;
     assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
     assert_eq!(m.state.regs[0], 1);
@@ -102,25 +101,6 @@ fn complete_guest_address_space_includes_the_final_page() {
     assert!(m.memory().read(u32::MAX, 2).is_err());
     m.unmap(0xffff_f000, 4096).unwrap();
     assert!(m.memory().read(u32::MAX, 1).is_err());
-}
-
-#[test]
-#[cfg_attr(target_arch = "aarch64", ignore = "Cranelift execution shape")]
-fn native_guard_with_one_unit_yields_then_delivers_the_precise_fault() {
-    // div ecx is native, but a zero divisor must execute its precise slow path.
-    let mut m = machine(&[0xf7, 0xf1, 0xc3]);
-    m.set_region(Region::new(CODE, 3)).unwrap();
-    m.state.regs[0] = 9;
-    assert_eq!(m.run(STOP, 1).unwrap(), RunOutcome::Budget);
-    assert_eq!(m.state.eip, CODE);
-    assert_eq!(
-        m.run(STOP, 1).unwrap(),
-        RunOutcome::Trap {
-            pc: CODE,
-            vector: 0
-        }
-    );
-    assert_eq!(m.stats.native_entries, 1);
 }
 
 #[test]

@@ -20,13 +20,7 @@ fn main() {
         return;
     }
     let target = env::var("TARGET").unwrap();
-    let arch = match env::var("CARGO_CFG_TARGET_ARCH").unwrap().as_str() {
-        "aarch64" => "aarch64",
-        "x86_64" => "x86_64",
-        "arm" => "arm",
-        "x86" => "i686",
-        other => panic!("unsupported Android arch {other}"),
-    };
+    let arch = "aarch64";
 
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let stubs = manifest.join("../../tools/android/stubs").join(&target);

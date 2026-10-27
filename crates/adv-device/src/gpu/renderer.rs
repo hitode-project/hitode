@@ -646,8 +646,7 @@ impl Gpu {
             _software: software.clone(),
         };
         #[cfg(target_vendor = "apple")]
-        if cfg!(target_arch = "aarch64")
-            && std::env::var("ADV_GPU_BACKEND").as_deref() != Ok("wgpu")
+        if std::env::var("ADV_GPU_BACKEND").as_deref() != Ok("wgpu")
             && context.adapter.get_info().backend == wgpu::Backend::Metal
         {
             context.pending.lock().unwrap().metal = Some(metal::State::new(&context)?);

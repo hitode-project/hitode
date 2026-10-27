@@ -251,36 +251,10 @@ pub fn extended(value: f64) -> Ext {
     )
 }
 
-fn split(a: f64) -> (f64, f64) {
-    let c = 134_217_729.0 * a;
-    let high = c - (c - a);
-    (high, a - high)
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "fma")]
-fn fused_error(a: f64, b: f64, p: f64) -> f64 {
-    a.mul_add(b, -p)
-}
-
 /// Exact `a * b - fl(a * b)`; operands are within `2^±RANGE`.
 #[inline]
 fn product_error(a: f64, b: f64, p: f64) -> f64 {
-    #[cfg(target_arch = "aarch64")]
-    return a.mul_add(b, -p);
-    #[cfg(target_arch = "x86_64")]
-    if std::arch::is_x86_feature_detected!("fma") {
-        // SAFETY: the CPU supports FMA.
-        return unsafe { fused_error(a, b, p) };
-    }
-    #[allow(unreachable_code)]
-    dekker_error(a, b, p)
-}
-
-pub fn dekker_error(a: f64, b: f64, p: f64) -> f64 {
-    let (ah, al) = split(a);
-    let (bh, bl) = split(b);
-    ((ah * bh - p) + ah * bl + al * bh) + al * bl
+    a.mul_add(b, -p)
 }
 
 /// The rounded result and the sign of `exact - rounded` (0 when exact).

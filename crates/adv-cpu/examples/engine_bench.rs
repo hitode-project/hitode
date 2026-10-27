@@ -539,11 +539,7 @@ fn main() {
         sse(n(400_000)),
     ];
     let cold = cold(n(4_000));
-    let name = if cfg!(target_arch = "aarch64") {
-        "a64"
-    } else {
-        "cranelift"
-    };
+    let name = "a64";
     let native = engine(name);
     let reference = || Facade(JitCpu::new(PARK, false).unwrap());
     let jit = || Facade(JitCpu::new(PARK, true).unwrap());

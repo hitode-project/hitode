@@ -27,50 +27,16 @@ impl Stamp {
 pub(super) struct Attributes {
     normal: RefCell<BTreeMap<FileIdentity, Stamp>>,
 }
-/// std::fs::metadata retries ACCESS_DENIED through FindFirstFile, which still
-/// lists a delete-pending name. Native GetFileAttributes opens the instance and
-/// reports STATUS_DELETE_PENDING, so ask the host query first.
-#[cfg(windows)]
-fn host_query(path: &Path) -> io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn GetFileAttributesW(name: *const u16) -> u32;
-    }
-    let name: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
-    // SAFETY: name is a NUL-terminated UTF-16 buffer that outlives the call.
-    if unsafe { GetFileAttributesW(name.as_ptr()) } == u32::MAX {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-#[cfg(not(windows))]
+
 fn host_query(_: &Path) -> io::Result<()> {
     Ok(())
 }
 fn identity(path: &Path, metadata: &Metadata) -> io::Result<FileIdentity> {
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        let _ = metadata;
-        // Zero data access requests only a metadata identity. Share all access
-        // so an existing guest FileObj remains the sole I/O/share owner.
-        let file = std::fs::OpenOptions::new()
-            .access_mode(0)
-            .share_mode(7)
-            .open(path)?;
-        file_identity(&file)
-    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
         let _ = path;
         Ok((metadata.dev(), metadata.ino()))
-    }
-    #[cfg(not(any(windows, unix)))]
-    {
-        let _ = (path, metadata);
-        Err(io::ErrorKind::Unsupported.into())
     }
 }
 impl Attributes {

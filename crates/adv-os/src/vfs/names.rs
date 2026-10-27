@@ -89,28 +89,9 @@ fn listing(dir: &Path) -> Arc<Listing> {
     listing
 }
 
-/// Windows-only filesystem aliases that cannot be answered from directory
-/// entries. Unicode spelling belongs to the shared invariant name index.
-fn host_resolved(name: &str) -> bool {
-    cfg!(windows) && (name.contains('~') || name.ends_with(['.', ' ']))
-}
-
 /// Host entry in `dir` whose name matches the shared Windows invariant casing.
 /// A case-sensitive host must not resolve Unicode paths with different rules.
 pub(super) fn find(dir: &Path, name: &str) -> Option<(PathBuf, Kind)> {
-    if host_resolved(name) {
-        if INDEX.lock().unwrap().volatile.iter().any(|v| v == dir) {
-            UNCACHED.fetch_add(1, Ordering::Relaxed);
-        }
-        let path = dir.join(name);
-        let metadata = std::fs::metadata(&path).ok()?;
-        let kind = if metadata.is_dir() {
-            Kind::Dir
-        } else {
-            Kind::File
-        };
-        return Some((path, kind));
-    }
     let listing = listing(dir);
     let spellings = listing.as_ref().as_ref()?.get(&key(name))?;
     // Exact spelling wins if two host entries differ only by case.

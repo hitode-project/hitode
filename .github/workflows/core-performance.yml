@@ -21,55 +21,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  windows-changes:
-    if: github.event_name != 'push'
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 5
-    outputs:
-      required: ${{ steps.changes.outputs.required }}
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          persist-credentials: false
-          fetch-depth: 0
-      - id: changes
-        name: Select Windows coverage
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          python3 - <<'PY'
-          import os
-          import re
-          import subprocess
-          from pathlib import PurePosixPath
-
-          required = os.environ['EVENT_NAME'] != 'pull_request'
-          if not required:
-              base, head = os.environ['BASE_SHA'], os.environ['HEAD_SHA']
-              paths = subprocess.check_output(['git', 'diff', '--no-renames', '--name-only', '-z', base, head]).decode().split('\0')
-              for path in filter(None, paths):
-                  file = PurePosixPath(path)
-                  if (path.startswith(('crates/adv-cpu-x64/', 'crates/adv-cpu-core/', 'crates/adv-cpu/', 'tools/fixtures/', 'tools/performance/'))
-                      or file.name in ('Cargo.toml', 'Cargo.lock', 'rust-toolchain', 'rust-toolchain.toml')
-                      or path.startswith('.cargo/') or path in ('.github/workflows/core-performance.yml', 'docs/host-call-boundary.tsv')
-                      or file.suffix == '.ps1' or re.search(r'windows|msvc|x64', path, re.I)):
-                      required = True
-                      break
-                  if file.suffix in ('.rs', '.c', '.h'):
-                      # Inspect both versions so removed Windows code also runs its checks.
-                      for ref in (base, head):
-                          source = subprocess.run(['git', 'show', f'{ref}:{path}'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL).stdout
-                          if re.search(rb'\b(windows|msvc)\b', source):
-                              required = True
-                              break
-                  if required:
-                      break
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
-              print(f'required={str(required).lower()}', file=output)
-          PY
-
   core:
     if: github.event_name != 'schedule'
     runs-on: ubuntu-24.04-arm
@@ -291,58 +242,5 @@ jobs:
             ${{ runner.temp }}/workspace-tests.txt
             target/workspace-ci/cargo-timings/
             target/scratch/macos-package/build-static.log
-          if-no-files-found: ignore
-          retention-days: 14
-
-  x87-windows:
-    needs: windows-changes
-    if: needs.windows-changes.outputs.required == 'true'
-    runs-on: windows-latest
-    timeout-minutes: 30
-    env:
-      CARGO_BUILD_JOBS: '4'
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          persist-credentials: false
-      - name: Record Windows environment
-        run: |
-          git rev-parse HEAD | Out-File "$env:RUNNER_TEMP/x87-windows-environment.txt"
-          rustc -Vv | Out-File "$env:RUNNER_TEMP/x87-windows-environment.txt" -Append
-          Get-CimInstance Win32_Processor | Select-Object Name,NumberOfCores,NumberOfLogicalProcessors | Out-File "$env:RUNNER_TEMP/x87-windows-environment.txt" -Append
-          Get-Content "$env:RUNNER_TEMP/x87-windows-environment.txt"
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          cache-on-failure: true
-          cache-workspace-crates: true
-      - name: Check Windows execution and x87 guards
-        run: |
-          cargo test --release --locked -p adv-cpu --lib --tests -- --nocapture 2>&1 | Tee-Object "$env:RUNNER_TEMP/x87-windows-tests.txt"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Lint Windows platform compatibility
-        run: |
-          cargo clippy --workspace --exclude adv-launcher --exclude adv-jit-helper --exclude tauri-plugin-storage --all-targets --release --locked --features adv-shell/gpu -- -D warnings
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Stress callback progress and lifetime checkpoints
-        run: |
-          for ($n = 0; $n -lt 50; $n++) {
-            cargo test --release --locked -p adv-cpu --test shared_audio concurrent_callback -- --test-threads=1 2>&1 | Tee-Object "$env:RUNNER_TEMP/x87-callback-stress.txt" -Append
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          }
-      - name: Compare Windows x87 helper and native emission
-        run: |
-          cargo build --release --locked -p adv-cpu --example x87_native_bench
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python tools/performance/x87_ab.py target/release/examples/x87_native_bench.exe "$env:RUNNER_TEMP/x87-ab" --rounds 5 --samples 31
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        if: always()
-        with:
-          name: x87-windows-${{ github.sha }}
-          path: |
-            ${{ runner.temp }}/x87-windows-environment.txt
-            ${{ runner.temp }}/x87-windows-tests.txt
-            ${{ runner.temp }}/x87-callback-stress.txt
-            ${{ runner.temp }}/x87-ab/
           if-no-files-found: ignore
           retention-days: 14

@@ -57,29 +57,13 @@ unsafe extern "C" fn recover() -> u32 {
 }
 
 fn point(write: bool) -> NativeRecoveryPoint {
-    #[cfg(target_arch = "aarch64")]
     let (registers, flags, address, value) = (
         crate::execution_abi::ARM64_GPRS.map(RecoveryValue::HostRegister),
         RecoveryValue::HostRegister(crate::execution_abi::ARM64_FLAGS),
         RecoveryValue::HostRegister(9),
         RecoveryValue::HostRegister(11),
     );
-    #[cfg(target_arch = "x86_64")]
-    let (registers, flags, address, value) = (
-        [
-            RecoveryValue::HostRegister(0),
-            RecoveryValue::HostRegister(10),
-            RecoveryValue::HostRegister(11),
-            RecoveryValue::HostRegister(3),
-            RecoveryValue::Constant(0x54),
-            RecoveryValue::HostRegister(5),
-            RecoveryValue::HostRegister(12),
-            RecoveryValue::HostRegister(13),
-        ],
-        RecoveryValue::HostRegister(14),
-        RecoveryValue::HostRegister(6),
-        RecoveryValue::HostRegister(2),
-    );
+
     NativeRecoveryPoint {
         host_pc: if write {
             std::ptr::addr_of!(adv_posix_probe_store) as usize
@@ -115,7 +99,7 @@ fn region<'a>(owner: &'a dyn Any, points: &'a [NativeRecoveryPoint]) -> CodeRegi
     unsafe { CodeRegion::new(owner, start, end - start, points) }.unwrap()
 }
 
-// spec: EXEC-X64-10, EXEC-X64-12, A64-MEM-9
+// spec: A64-MEM-9
 #[test]
 fn asynchronous_and_extended_signal_causes_are_refused() {
     unsafe {
@@ -133,7 +117,7 @@ fn asynchronous_and_extended_signal_causes_are_refused() {
     }
 }
 
-// spec: EXEC-X64-10, EXEC-X64-12
+// spec: A64-MEM-9
 #[test]
 fn unsupported_sites_are_rejected_before_native_execution() {
     let mut site = point(false);
@@ -165,7 +149,7 @@ fn unsupported_sites_are_rejected_before_native_execution() {
     assert!(unsafe { CodeRegion::new(&owner, start, end - start, &outside) }.is_err());
 }
 
-// spec: EXEC-X64-11
+// spec: A64-MEM-9
 #[test]
 fn controlled_faults_preserve_prefix_and_continue() {
     if let Ok(case) = std::env::var("ADV_CONTROLLED_FAULT_CASE") {
@@ -189,7 +173,7 @@ fn controlled_faults_preserve_prefix_and_continue() {
         "async_default",
     ] {
         let executable = std::env::current_exe().unwrap();
-        #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+        #[cfg(target_os = "linux")]
         let mut child = if let Some(runner) =
             std::env::var_os("CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER")
         {
@@ -199,7 +183,7 @@ fn controlled_faults_preserve_prefix_and_continue() {
         } else {
             Command::new(&executable)
         };
-        #[cfg(not(all(target_arch = "aarch64", target_os = "linux")))]
+        #[cfg(not(target_os = "linux"))]
         let mut child = Command::new(&executable);
         let result = child
             .arg("--exact")
@@ -223,23 +207,12 @@ fn controlled_faults_preserve_prefix_and_continue() {
 }
 
 fn fp_environment() -> (u32, u32) {
-    #[cfg(target_arch = "aarch64")]
-    {
-        let control: u64;
-        let status: u64;
-        unsafe {
-            core::arch::asm!("mrs {control}, fpcr", "mrs {status}, fpsr", control = out(reg) control, status = out(reg) status, options(nomem, nostack, preserves_flags));
-        }
-        (control as u32, status as u32)
+    let control: u64;
+    let status: u64;
+    unsafe {
+        core::arch::asm!("mrs {control}, fpcr", "mrs {status}, fpsr", control = out(reg) control, status = out(reg) status, options(nomem, nostack, preserves_flags));
     }
-    #[cfg(target_arch = "x86_64")]
-    {
-        let mut control = 0u32;
-        unsafe {
-            core::arch::asm!("stmxcsr [{pointer}]", pointer = in(reg) &mut control, options(nostack, preserves_flags));
-        }
-        (control, 0)
-    }
+    (control as u32, status as u32)
 }
 
 fn run_case(case: &str) {
@@ -501,7 +474,7 @@ fn run_case(case: &str) {
     assert_eq!(snapshot.simd_count, SIMD_COUNT);
     assert_eq!(snapshot.pc as usize, points[0].host_pc);
     assert_ne!(snapshot.sp, 0);
-    #[cfg(target_arch = "aarch64")]
+
     {
         assert_eq!(snapshot.architecture, 2);
         assert_eq!(snapshot.flags & 0xf000_0000, 0x9000_0000);
@@ -513,13 +486,7 @@ fn run_case(case: &str) {
         assert_eq!(snapshot.fpcr, 0x400000);
         assert_eq!(snapshot.fpsr, 0x10);
     }
-    #[cfg(target_arch = "x86_64")]
-    {
-        assert_eq!(snapshot.architecture, 1);
-        assert_eq!(snapshot.flags & 0x8d5, 0x894);
-        assert_eq!(snapshot.simd[8], [0x5a; 16]);
-        assert_eq!(snapshot.fpcr, 0x5f80);
-    }
+
     if mixed {
         assert_eq!(outcome.kind, RecoveryKind::Completed);
         assert_eq!(state.eip, 24);
@@ -580,7 +547,7 @@ fn run_case(case: &str) {
     }
 }
 
-#[cfg(all(target_arch = "aarch64", not(target_os = "macos")))]
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn inactive_sme_records_preserve_fpsimd_capture() {
     unsafe extern "C" {

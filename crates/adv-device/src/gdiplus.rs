@@ -3,10 +3,9 @@
 //! and zeno paths behind the same device objects.
 use std::sync::Arc;
 pub mod matrix;
-#[cfg(not(windows))]
+
 mod portable;
-#[cfg(windows)]
-mod windows;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     Image,
@@ -19,20 +18,14 @@ pub enum Kind {
     Path,
     Gradient,
 }
-pub struct Runtime {
-    #[cfg(windows)]
-    token: usize,
-}
+pub struct Runtime {}
 pub struct Object {
     pub kind: Kind,
     _runtime: Arc<Runtime>,
-    #[cfg(windows)]
-    pointer: *mut std::ffi::c_void,
+
     // Image graphics must keep their target alive after guest DisposeImage.
     _backing: Option<Arc<Object>>,
-    #[cfg(windows)]
-    canvas: Option<windows::Canvas>,
-    #[cfg(not(windows))]
+
     data: std::sync::Mutex<portable::Data>,
 }
 pub enum Create<'a> {
@@ -148,47 +141,14 @@ pub enum PathEdit<'a> {
 }
 impl Runtime {
     pub fn new() -> Result<Arc<Self>, i32> {
-        #[cfg(windows)]
-        {
-            windows::startup()
-        }
-        #[cfg(not(windows))]
-        {
-            Ok(Arc::new(Self {}))
-        }
+        Ok(Arc::new(Self {}))
     }
     pub fn create(self: &Arc<Self>, create: Create<'_>) -> Result<Arc<Object>, i32> {
-        #[cfg(windows)]
-        {
-            windows::create(self, create)
-        }
-        #[cfg(not(windows))]
-        {
-            portable::create(self, create)
-        }
+        portable::create(self, create)
     }
 }
 impl Object {
     pub fn execute(&self, operation: Op<'_>) -> Result<Reply, i32> {
-        #[cfg(windows)]
-        {
-            windows::execute(self, operation)
-        }
-        #[cfg(not(windows))]
-        {
-            portable::execute(self, operation)
-        }
-    }
-}
-impl Drop for Runtime {
-    fn drop(&mut self) {
-        #[cfg(windows)]
-        windows::shutdown(self.token);
-    }
-}
-impl Drop for Object {
-    fn drop(&mut self) {
-        #[cfg(windows)]
-        windows::destroy(self);
+        portable::execute(self, operation)
     }
 }

@@ -1,8 +1,0 @@
-# Differential tests that fail on the GitHub-hosted Windows image, not on a
-# developer's Windows machine. windows-differential.yml reports them without
-# failing. Remove a line once its cause is fixed; the job notes when it passes.
-# name  reason (first seen 2026-10-20)
-d3dx_math2_fronts_match_native  native fixture exits nonzero on the image (d3dx9 runtime not checked yet)
-vectored_and_stack_handlers_resume_full_context_after_yield_like_native  native fixture access violation on the image
-selected_fonts_and_counted_ansi_utf16_extents_match_native_and_three_cpus  native font metrics differ from the authoring machine
-path_lifecycle_and_guest_crt_controls_match_native  native startup word 141 differs on the image

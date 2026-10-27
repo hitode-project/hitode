@@ -16,10 +16,6 @@ const MAX_FILE: usize = MAX_METADATA_BYTES + MAX_TOTAL_BYTES + 20;
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
 fn io_error(error: std::io::Error) -> u32 {
-    #[cfg(windows)]
-    if matches!(error.raw_os_error(), Some(32 | 33)) {
-        return error.raw_os_error().unwrap() as u32;
-    }
     if error.kind() == std::io::ErrorKind::WouldBlock {
         return 33;
     }
@@ -36,11 +32,7 @@ fn lock(path: &Path) -> Result<File, u32> {
     let path = parent.join("registry-v1.lock");
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        options.share_mode(0);
-    }
+
     let file = options.open(path).map_err(io_error)?;
     #[cfg(unix)]
     {
@@ -296,24 +288,6 @@ fn checksum(bytes: &[u8]) -> u64 {
     })
 }
 
-#[cfg(windows)]
-fn replace(from: &Path, to: &Path) -> Result<(), u32> {
-    use std::os::windows::ffi::OsStrExt;
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn MoveFileExW(from: *const u16, to: *const u16, flags: u32) -> i32;
-    }
-    let source: Vec<_> = from.as_os_str().encode_wide().chain([0]).collect();
-    let target: Vec<_> = to.as_os_str().encode_wide().chain([0]).collect();
-    // SAFETY: both vectors contain owned, NUL-terminated file paths; they stay
-    // alive through the synchronous filesystem call. No guest pointer is used.
-    if unsafe { MoveFileExW(source.as_ptr(), target.as_ptr(), 1 | 8) } == 0 {
-        Err(io_error(std::io::Error::last_os_error()))
-    } else {
-        Ok(())
-    }
-}
-#[cfg(not(windows))]
 fn replace(from: &Path, to: &Path) -> Result<(), u32> {
     std::fs::rename(from, to).map_err(io_error)?;
     if let Some(parent) = to.parent() {

@@ -8,9 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 mod architecture;
-mod guard;
 mod watchdog;
-pub use guard::Guarded;
 use watchdog::Watchdog;
 
 use unicorn_engine::unicorn_const::{Arch, HookType, MemType, Mode, Prot as UcProt, uc_error};
@@ -80,12 +78,12 @@ pub struct HookData {
 /// The raw engine as trap handlers see it. A local type, so the guest interface defined in
 /// adv-cpu can be implemented for it; layout-identical to `Unicorn`.
 #[repr(transparent)]
-struct Engine<'a>(Guarded<'a, HookData>);
+struct Engine<'a>(Unicorn<'a, HookData>);
 
 impl<'a> Engine<'a> {
     /// The view a hook gets of the engine it runs in. Only borrowed, so never dropped.
     fn from_mut<'b>(uc: &'b mut Unicorn<'a, HookData>) -> &'b mut Self {
-        // SAFETY: `Engine` and `Guarded` are `repr(transparent)` wrappers around `Unicorn`.
+        // SAFETY: `Engine` is a `repr(transparent)` wrapper around `Unicorn`.
         unsafe { &mut *(uc as *mut Unicorn<'a, HookData>).cast::<Self>() }
     }
 
@@ -125,7 +123,7 @@ impl<'a> Engine<'a> {
 }
 
 impl<'a> Deref for Engine<'a> {
-    type Target = Guarded<'a, HookData>;
+    type Target = Unicorn<'a, HookData>;
     fn deref(&self) -> &Self::Target {
         &self.0
     }
@@ -165,7 +163,7 @@ impl UnicornCpu {
             file_pages: BTreeMap::new(),
             private_copy_pages: BTreeMap::new(),
         };
-        let mut uc = Guarded::new_with_data(Arch::X86, Mode::MODE_32, data)?;
+        let mut uc = Unicorn::new_with_data(Arch::X86, Mode::MODE_32, data)?;
         // Keep one hook for the lifetime of the engine. Adding/removing it per slice
         // invalidates Unicorn's translated blocks and causes cache churn.
         uc.add_block_hook(1, 0, |uc, addr, size| {

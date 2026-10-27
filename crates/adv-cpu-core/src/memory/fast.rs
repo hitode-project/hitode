@@ -224,13 +224,6 @@ mod tests {
             .unwrap();
         let serial = memory.native_permissions();
         assert_eq!(serial[0], READ | WRITE | EXEC);
-        #[cfg(windows)]
-        {
-            memory.protect(0x10000, 4096, 0).unwrap();
-            memory.enable_native_protection().unwrap();
-            assert_eq!(memory.native_permissions()[0], SHARED);
-            assert!(memory.prepare_native_access(0x10000, 1, false).is_err());
-        }
     }
 
     #[test]

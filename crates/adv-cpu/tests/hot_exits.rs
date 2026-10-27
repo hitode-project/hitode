@@ -76,25 +76,22 @@ fn cross_region_implicit_partial_and_vector_writes_survive_a_cold_fault_and_retu
         }
     );
     for strategy in [CompileStrategy::Fast, CompileStrategy::Speed] {
-        for linked in [false, true] {
-            let mut m = fixture(strategy);
-            m.set_region_linking(linked);
-            assert_eq!(m.run(STOP, 100).unwrap(), outcome);
-            assert_eq!(m.state.eip, oracle.state.eip);
-            assert_eq!(m.state.regs, oracle.state.regs);
-            assert_eq!(m.state.eflags, oracle.state.eflags);
-            assert_eq!(m.state.xmm, oracle.state.xmm);
-            assert_eq!(m.state.x87, oracle.state.x87);
-            let prefix = m.state.regs[0];
-            m.protect(DATA, 4096, READ | WRITE).unwrap();
-            m.write(DATA, &123u32.to_le_bytes()).unwrap();
-            assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
-            assert_eq!(m.state.regs[0], prefix, "fault retry replayed the multiply");
-            assert_eq!(m.state.regs[6], 0x1234_0000);
-            assert_eq!(m.state.regs[7], 123);
-            assert_eq!(m.state.regs[4], STACK + 4);
-            support::x64_shape!(assert_eq!(m.stats.interpreter_entries, 0));
-        }
+        let mut m = fixture(strategy);
+
+        assert_eq!(m.run(STOP, 100).unwrap(), outcome);
+        assert_eq!(m.state.eip, oracle.state.eip);
+        assert_eq!(m.state.regs, oracle.state.regs);
+        assert_eq!(m.state.eflags, oracle.state.eflags);
+        assert_eq!(m.state.xmm, oracle.state.xmm);
+        assert_eq!(m.state.x87, oracle.state.x87);
+        let prefix = m.state.regs[0];
+        m.protect(DATA, 4096, READ | WRITE).unwrap();
+        m.write(DATA, &123u32.to_le_bytes()).unwrap();
+        assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
+        assert_eq!(m.state.regs[0], prefix, "fault retry replayed the multiply");
+        assert_eq!(m.state.regs[6], 0x1234_0000);
+        assert_eq!(m.state.regs[7], 123);
+        assert_eq!(m.state.regs[4], STACK + 4);
     }
 }
 
@@ -103,7 +100,7 @@ fn linked_stack_pointer_survives_a_cold_exit_in_a_region_that_does_not_write_it(
     for strategy in [CompileStrategy::Fast, CompileStrategy::Speed] {
         let mut m = Executor::new(CODE, 0x20000).unwrap();
         // Exercise an actual native tail, including under the strict harness.
-        m.set_tier_verification(None);
+
         m.protect(CODE, 0x20000, READ | WRITE).unwrap();
         let prefix = code(CODE, |a| {
             a.push(eax).unwrap();
@@ -120,7 +117,7 @@ fn linked_stack_pointer_survives_a_cold_exit_in_a_region_that_does_not_write_it(
             m.add_region(region).unwrap();
         }
         m.protect(DATA, 4096, 0).unwrap();
-        m.set_region_linking(true);
+
         m.state.eip = CODE;
         m.state.regs[0] = 123;
         m.state.regs[4] = STACK;
@@ -133,8 +130,7 @@ fn linked_stack_pointer_survives_a_cold_exit_in_a_region_that_does_not_write_it(
         );
         assert_eq!(m.state.regs[4], STACK - 4);
         // The fault is reported from the linked region of one Rust entry.
-        support::x64_shape!(assert_eq!(m.stats.native_entries, 1));
+
         assert_eq!(m.memory().read(STACK - 4, 4).unwrap(), 123u32.to_le_bytes());
-        support::x64_shape!(assert_eq!(m.stats.interpreter_entries, 0));
     }
 }

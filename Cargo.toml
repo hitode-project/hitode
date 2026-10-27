@@ -5,7 +5,6 @@ members = [
     "crates/adv-abi-macros",
     "crates/adv-cpu",
     "crates/adv-cpu-core",
-    "crates/adv-cpu-x64",
     "crates/adv-cpu-a64",
     "crates/adv-device",
     "crates/adv-drv",

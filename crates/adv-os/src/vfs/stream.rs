@@ -30,57 +30,6 @@ pub struct StandardInformation {
     pub directory: bool,
 }
 
-#[cfg(windows)]
-fn host_standard_information(file: &std::fs::File) -> io::Result<StandardInformation> {
-    use std::os::windows::io::AsRawHandle;
-    #[repr(C)]
-    struct NativeStandardInformation {
-        allocation_size: i64,
-        end_of_file: i64,
-        number_of_links: u32,
-        delete_pending: u8,
-        directory: u8,
-    }
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn GetFileInformationByHandleEx(
-            file: *mut std::ffi::c_void,
-            class: i32,
-            information: *mut std::ffi::c_void,
-            size: u32,
-        ) -> i32;
-    }
-    let mut information = NativeStandardInformation {
-        allocation_size: 0,
-        end_of_file: 0,
-        number_of_links: 0,
-        delete_pending: 0,
-        directory: 0,
-    };
-    // SAFETY: the File owns a live handle and FileStandardInfo (1) writes the
-    // documented FILE_STANDARD_INFO layout into this writable aligned value.
-    if unsafe {
-        GetFileInformationByHandleEx(
-            file.as_raw_handle(),
-            1,
-            (&mut information as *mut NativeStandardInformation).cast(),
-            std::mem::size_of::<NativeStandardInformation>() as u32,
-        )
-    } == 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(StandardInformation {
-        allocation_size: u64::try_from(information.allocation_size)
-            .map_err(|_| io::ErrorKind::InvalidData)?,
-        end_of_file: u64::try_from(information.end_of_file)
-            .map_err(|_| io::ErrorKind::InvalidData)?,
-        number_of_links: information.number_of_links,
-        delete_pending: information.delete_pending != 0,
-        directory: information.directory != 0,
-    })
-}
-
 #[cfg(unix)]
 fn host_standard_information(file: &std::fs::File) -> io::Result<StandardInformation> {
     use std::os::unix::fs::MetadataExt;
@@ -98,11 +47,6 @@ fn host_standard_information(file: &std::fs::File) -> io::Result<StandardInforma
         delete_pending: metadata.nlink() == 0,
         directory: metadata.is_dir(),
     })
-}
-
-#[cfg(not(any(windows, unix)))]
-fn host_standard_information(_: &std::fs::File) -> io::Result<StandardInformation> {
-    Err(io::ErrorKind::Unsupported.into())
 }
 
 pub enum Metadata {
@@ -275,45 +219,7 @@ mod tests {
     use super::super::section::identity_queries;
     use super::*;
 
-    #[cfg(windows)]
-    fn mark_sparse(file: &std::fs::File) {
-        use std::os::windows::io::AsRawHandle;
-        #[link(name = "kernel32")]
-        unsafe extern "system" {
-            fn DeviceIoControl(
-                file: *mut std::ffi::c_void,
-                code: u32,
-                input: *const std::ffi::c_void,
-                input_size: u32,
-                output: *mut std::ffi::c_void,
-                output_size: u32,
-                returned: *mut u32,
-                overlapped: *mut std::ffi::c_void,
-            ) -> i32;
-        }
-        let mut returned = 0;
-        // SAFETY: the owned handle and returned DWORD are live; FSCTL_SET_SPARSE
-        // requires no input or output data and is performed synchronously.
-        assert_ne!(
-            unsafe {
-                DeviceIoControl(
-                    file.as_raw_handle(),
-                    0x900c4,
-                    std::ptr::null(),
-                    0,
-                    std::ptr::null_mut(),
-                    0,
-                    &mut returned,
-                    std::ptr::null_mut(),
-                )
-            },
-            0,
-            "{}",
-            io::Error::last_os_error()
-        );
-    }
-
-    #[cfg(any(windows, unix))]
+    #[cfg(unix)]
     #[test]
     fn standard_information_uses_sparse_allocation_and_the_opened_linked_instance() {
         let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -330,8 +236,7 @@ mod tests {
             .truncate(true)
             .open(&source)
             .unwrap();
-        #[cfg(windows)]
-        mark_sparse(&file);
+
         file.set_len(0x1_0000_0003).unwrap();
         let mut stream = FileStream::from(file);
         stream.seek(SeekFrom::Start(7)).unwrap();
@@ -345,8 +250,7 @@ mod tests {
         let standard = stream.standard_information().unwrap();
         assert_eq!(standard.end_of_file, 0x1_0000_0003);
         assert!(standard.allocation_size < standard.end_of_file);
-        #[cfg(windows)]
-        assert_eq!(standard.allocation_size, 0);
+
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
@@ -362,11 +266,7 @@ mod tests {
 
         let mut options = std::fs::OpenOptions::new();
         options.read(true);
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::OpenOptionsExt;
-            options.custom_flags(0x02000000); // FILE_FLAG_BACKUP_SEMANTICS
-        }
+
         let opened_directory = FileStream::from(options.open(&directory).unwrap());
         assert!(opened_directory.standard_information().unwrap().directory);
         drop(opened_directory);

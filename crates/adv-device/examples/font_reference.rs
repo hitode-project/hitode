@@ -1,12 +1,6 @@
 //! Deterministic portable CJK references. Run with <profile.json> <output-dir>.
 //! The caller supplies licensed font files; this example contains no font data.
-#[cfg(windows)]
-fn main() {
-    eprintln!("font_reference requires the portable backend on a non-Windows host");
-    std::process::exit(2);
-}
 
-#[cfg(not(windows))]
 fn main() {
     if let Err(error) = reference::run() {
         eprintln!("font reference failed: {error}");
@@ -14,7 +8,6 @@ fn main() {
     }
 }
 
-#[cfg(not(windows))]
 mod reference {
     use adv_device::{
         surface::{PixelFormat, Rect},

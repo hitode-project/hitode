@@ -6,7 +6,7 @@ This page lists how to build, test and package each front end. Games are never p
 
 - Rust stable with rustfmt, and Python 3.
 - CMake, for the test-only Unicorn reference in `adv-unicorn`.
-- For video: FFmpeg 8 headers and libraries, and libclang for bindgen. Set `FFMPEG_DIR` to the FFmpeg root with `include` and `lib` (and `bin` on Windows), and `LIBCLANG_PATH` to the folder holding libclang. The libraries must match the target architecture.
+- For video: FFmpeg 8 headers and libraries, and libclang for bindgen. Set `FFMPEG_DIR` to the FFmpeg root with `include` and `lib`, and `LIBCLANG_PATH` to the folder holding libclang. The libraries must match the target architecture.
   - Development on a Mac may use Homebrew: `brew install ffmpeg@8`, then `export FFMPEG_DIR=$(brew --prefix ffmpeg@8) LIBCLANG_PATH=$(dirname "$(dirname "$(xcrun --find clang)")")/lib`. `tools/check.py` fills in these two values by itself when they are unset.
   - Release packages never use Homebrew: they link the pinned static FFmpeg that `tools/macos/build.py` builds (below). On macOS, `media` also links the system VideoToolbox and CoreMedia frameworks required by that build.
   - Without FFmpeg, everything except `media` builds and tests: leave out `adv-shell/media` and test single crates with `-p`, since the workspace suites (`cargo test --workspace`, `cargo test-full`) build the launcher.
@@ -90,9 +90,7 @@ python3 -m unittest discover -s tools/<folder>
   including overlapping matches; it does not establish whole-decoder coverage.
 - Tests that need a game read it from `$ADV_SAMPLES`. They are ignored or skip when it is unset, so the default run needs no game files.
 - Fixtures with a recording in `tools/fixtures/native/` run on every host: `cargo test -p adv-runtime --features gpu --test native_reference` compares each CPU backend with the native Windows output. Record or refresh one on Windows with `python tools/fixtures/record_native.py <name>`; `--check` there confirms the build is still deterministic.
-- Windows-only differential tests run a self-written fixture natively and under Hitode. Their build scripts are in `tools/fixtures/`. CI runs them in the advisory `windows-differential.yml` workflow after merges that touch fixtures or `adv-win32`, weekly, and for a branch on demand with `gh workflow run windows-differential.yml --ref <branch>`; without Windows, read the native results in its logs. Failures known on the hosted image are listed in `tools/fixtures/hosted-known-failures.txt`.
-  To check one target, add `-f crate=adv-win32 -f test=crypt32_encoding_native`; omitted inputs run every Windows-only target. Filtered runs do not report unrelated known failures as fixed.
-- On AArch64, `tools/cpu/arm64-check.sh <ref>` runs the CPU suite once and judges it both normally and in strict mode. x64-only tests do not build there.
+- On AArch64, `tools/cpu/arm64-check.sh <ref>` runs the CPU suite once and judges it both normally and in strict mode.
 - Media tests need the FFmpeg variables above: `cargo test -p adv-device --features media`.
 - Direct3D 9 builds only with the `gpu` feature, so `cargo test -p adv-dx` skips it without a word: test it with `cargo test -p adv-dx --features gpu`. Test files pulled in with `include!` are outside `cargo fmt`; format them with `rustfmt --edition 2024 <file>`.
 - The workspace suite builds the launcher, so it needs the FFmpeg variables too.
@@ -113,12 +111,8 @@ The full DAC rate matrices run every Monday at 03:17 UTC or through the manual
 `slow-tests` input. Master pushes populate caches for later pull requests.
 
 Linux core and hardware acceptance checks use `ubuntu-24.04-arm`; release-mode
-Apple Silicon acceptance is also a gate. Windows x64 compatibility checks run
-for shared CPU or x64 changes, Windows source in either side of the diff, native
-fixtures, build configuration and performance tooling, plus weekly and manual
-runs. They test the CPU and lint platform code without building the launcher or
-iOS helper. Cargo caches are separated by job and test group. Mac jobs use three
-workers; Linux and Windows jobs use four. The privacy scan runs on every PR.
+Apple Silicon acceptance is also a gate. Cargo caches are separated by job and
+test group. Mac jobs use three workers; Linux jobs use four. The privacy scan runs on every PR.
 
 ## Launcher
 
