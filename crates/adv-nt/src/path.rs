@@ -7,10 +7,9 @@
 //! `\??\unix` names the host's root the same way, as in Wine.
 
 mod index;
+mod listing;
 
 use std::path::{Path, PathBuf};
-
-pub(crate) use index::invalidate;
 
 use crate::status::{self, Status};
 
@@ -77,7 +76,7 @@ pub fn lookup(dosdevices: &Path, name: &[u16]) -> Result<Lookup, Status> {
         PathBuf::from("/")
     } else if is_drive(drive) {
         let root = dosdevices.join(drive.to_ascii_lowercase());
-        if !root.is_dir() {
+        if !listing::is_dir(&root) {
             return Err(status::OBJECT_PATH_NOT_FOUND);
         }
         root
@@ -103,10 +102,25 @@ pub fn lookup(dosdevices: &Path, name: &[u16]) -> Result<Lookup, Status> {
         .filter(|part| !part.is_empty())
         .collect();
 
+    // Wine's shortcut: when the directory exists as written, the walk would
+    // take each of its components as written, so start at the leaf.
     let last = components.len();
-    for (index, component) in components.into_iter().enumerate() {
-        if !path.is_dir() {
+    let mut skip = 0;
+    if let Some((_, parents)) = components.split_last() {
+        let directory = parents
+            .iter()
+            .fold(path.clone(), |path, part| path.join(part));
+        if listing::is_dir(&directory) {
+            path = directory;
+            skip = parents.len();
+        }
+    }
+    for (index, component) in components.into_iter().enumerate().skip(skip) {
+        if !listing::is_dir(&path) {
             return Err(status::OBJECT_PATH_NOT_FOUND);
+        }
+        if index + 1 == last && listing::absent(&path, component) {
+            return Ok(Lookup::Missing(path.join(component)));
         }
         match find(&path, component) {
             Some(found) => path = found,
@@ -118,6 +132,12 @@ pub fn lookup(dosdevices: &Path, name: &[u16]) -> Result<Lookup, Status> {
         return Err(status::OBJECT_NAME_INVALID);
     }
     Ok(Lookup::Found(path))
+}
+
+/// Drop what is known about a file's containing directory for an NT mutation.
+pub(crate) fn invalidate(file: &Path) {
+    index::invalidate(file);
+    listing::invalidate(file);
 }
 
 pub(crate) fn validate_components(name: &str, unix: bool) -> Result<(), Status> {
@@ -214,7 +234,7 @@ mod tests {
         text.encode_utf16().collect()
     }
 
-    // spec: WINE-SYS-5, WINE-SYS-11
+    // spec: WINE-SYS-5, WINE-SYS-11, WINE-SYS-12
     #[test]
     fn drive_paths_resolve_without_regard_to_case() {
         let root = std::env::temp_dir().join(format!("adv-nt-path-{}", std::process::id()));
@@ -242,6 +262,15 @@ mod tests {
         assert_eq!(missing, Lookup::Missing(devices.join("c:/windows/new.txt")));
         assert_eq!(
             lookup(&devices, &utf16(r"\??\c:\none\file")),
+            Err(status::OBJECT_PATH_NOT_FOUND)
+        );
+        std::fs::write(system.join("file.dll"), b"").unwrap();
+        assert_eq!(
+            lookup(&devices, &utf16(r"\??\c:\windows\System32\file.dll\")),
+            Err(status::OBJECT_NAME_INVALID)
+        );
+        assert_eq!(
+            lookup(&devices, &utf16(r"\??\c:\windows\System32\file.dll\x")),
             Err(status::OBJECT_PATH_NOT_FOUND)
         );
         assert_eq!(

@@ -105,6 +105,21 @@ int hitode_asprintf( char **str, const char *format, ... )
     return ret;
 }
 
+/* Counts host calls that may create, remove, rename or change a name, so
+ * cached name probes end with them (WINE-SYS-14). */
+static _Atomic uint64_t names_revision;
+
+uint64_t hitode_names_revision( void )
+{
+    return atomic_load_explicit( &names_revision, memory_order_acquire );
+}
+
+static int names_changed( int ret )
+{
+    atomic_fetch_add_explicit( &names_revision, 1, memory_order_release );
+    return ret;
+}
+
 int hitode_chdir( const char *path )
 {
     int fd = openat( current_dir, path, O_RDONLY | O_DIRECTORY | O_CLOEXEC );
@@ -144,6 +159,15 @@ int hitode_open( const char *path, int flags, ... )
         va_end( args );
     }
     if (!strcmp( path, "/dev/ntsync" )) return hitode_ntsync_open();
+    /* FILE_OPEN_IF opens existing files with O_CREAT; only a new or
+     * truncated file changes what a name probe sees. */
+    if (flags & O_TRUNC) return names_changed( openat( current_dir, path, flags, mode ) );
+    if (flags & O_CREAT)
+    {
+        struct stat st;
+        if (fstatat( current_dir, path, &st, 0 ) == -1)
+            return names_changed( openat( current_dir, path, flags, mode ) );
+    }
     return openat( current_dir, path, flags, mode );
 }
 
@@ -170,27 +194,27 @@ int hitode_lstat( const char *path, struct stat *st )
 
 int hitode_mkdir( const char *path, mode_t mode )
 {
-    return mkdirat( current_dir, path, mode );
+    return names_changed( mkdirat( current_dir, path, mode ) );
 }
 
 int hitode_unlink( const char *path )
 {
-    return unlinkat( current_dir, path, 0 );
+    return names_changed( unlinkat( current_dir, path, 0 ) );
 }
 
 int hitode_rmdir( const char *path )
 {
-    return unlinkat( current_dir, path, AT_REMOVEDIR );
+    return names_changed( unlinkat( current_dir, path, AT_REMOVEDIR ) );
 }
 
 int hitode_rename( const char *from, const char *to )
 {
-    return renameat( current_dir, from, current_dir, to );
+    return names_changed( renameat( current_dir, from, current_dir, to ) );
 }
 
 int hitode_link( const char *from, const char *to )
 {
-    return linkat( current_dir, from, current_dir, to, AT_SYMLINK_FOLLOW );
+    return names_changed( linkat( current_dir, from, current_dir, to, AT_SYMLINK_FOLLOW ) );
 }
 
 ssize_t hitode_readlink( const char *path, char *buf, size_t size )
@@ -200,7 +224,7 @@ ssize_t hitode_readlink( const char *path, char *buf, size_t size )
 
 int hitode_chmod( const char *path, mode_t mode )
 {
-    return fchmodat( current_dir, path, mode, 0 );
+    return names_changed( fchmodat( current_dir, path, mode, 0 ) );
 }
 
 #ifndef __APPLE__

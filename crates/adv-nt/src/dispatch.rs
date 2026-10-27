@@ -396,6 +396,7 @@ fn dispatch_syscall(env: &mut Env<'_>, number: usize) -> Outcome {
     let Some(call) = TABLE[number] else {
         return Outcome::Fail(format!("system call {name} is not implemented"));
     };
+    crate::file::invalidate_syscall(name);
     kuser::refresh(env);
     server::set_time(env);
     let mut args = [0; MAX_ARGUMENTS];

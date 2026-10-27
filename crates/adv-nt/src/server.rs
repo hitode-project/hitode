@@ -874,7 +874,9 @@ impl Channel {
         data: &[&[u8]],
         reply_data: &mut [u8],
     ) -> Result<usize, Error> {
-        crate::registry::invalidate_request(i32::from_ne_bytes(fixed[..4].try_into().unwrap()));
+        let number = i32::from_ne_bytes(fixed[..4].try_into().unwrap());
+        crate::registry::invalidate_request(number);
+        crate::file::invalidate_request(number);
         let request_size: u32 = data.iter().map(|part| part.len() as u32).sum();
         fixed[4..8].copy_from_slice(&request_size.to_ne_bytes());
         fixed[8..12].copy_from_slice(&(reply_data.len() as u32).to_ne_bytes());

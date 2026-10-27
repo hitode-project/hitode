@@ -3,6 +3,7 @@
 
 mod information;
 mod io;
+mod probes;
 pub mod volume;
 
 pub use information::{query, set};
@@ -10,6 +11,7 @@ pub use io::{
     cancel, cancel_ex, cancel_sync, complete_async, create_mailslot, create_named_pipe,
     device_control, flush, flush_ex, lock, notify_change, read, read_scatter, unlock, write_gather,
 };
+pub(crate) use probes::{invalidate_request, invalidate_syscall};
 
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
@@ -571,7 +573,31 @@ fn named_file(
     let Some(name) = &attributes.name else {
         return Err(status::INVALID_PARAMETER.into());
     };
-    let host = match lookup_attributes(env, &attributes)? {
+    let key = (attributes.root, attributes.attributes, name.clone());
+    if let Some(found) = env.ext.get_or_default::<probes::Probes>().get(&key) {
+        return Ok(found?);
+    }
+    let since = probes::revision();
+    let found = probe(env, &attributes, name);
+    let cached = match &found {
+        Ok(found) => Some(Ok(found.clone())),
+        Err(Error::Status(status)) => Some(Err(*status)),
+        Err(Error::Unsupported(_)) => None,
+    };
+    if let Some(cached) = cached {
+        env.ext
+            .get_or_default::<probes::Probes>()
+            .insert(since, key, cached);
+    }
+    found
+}
+
+fn probe(
+    env: &mut Env<'_>,
+    attributes: &Attributes,
+    name: &[u16],
+) -> Result<(PathBuf, std::fs::Metadata, std::fs::Metadata), Error> {
+    let host = match lookup_attributes(env, attributes)? {
         Lookup::Found(host) => host,
         Lookup::Missing(_) => return Err(status::OBJECT_NAME_NOT_FOUND.into()),
         Lookup::Device => {

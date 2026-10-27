@@ -138,6 +138,7 @@ unsafe extern "C" {
     fn hitode_server_key_state(tid: u32, key: u32) -> c_int;
     fn hitode_server_queue() -> c_int;
     fn hitode_server_ready() -> c_int;
+    fn hitode_names_revision() -> u64;
     fn hitode_event_watch(
         queue: c_int,
         notify: extern "C" fn(*mut c_void),
@@ -146,6 +147,13 @@ unsafe extern "C" {
     fn hitode_event_unwatch(watch: *mut c_void);
     static mut master_socket_timeout: i64;
     fn flush_registry();
+}
+
+/// Advances after every server host call that may create, remove, rename or
+/// change a file name's attributes.
+pub fn names_revision() -> u64 {
+    // SAFETY: an atomic load with no preconditions.
+    unsafe { hitode_names_revision() }
 }
 
 /// Wine's non-async key state, without creating a thread's message queue.

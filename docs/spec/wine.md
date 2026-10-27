@@ -158,6 +158,7 @@ DOS device paths without a host drive MUST resolve through the server's symbolic
 ### WINE-SYS-12 Indexed path lookups
 
 **Rule**: Case-insensitive directory misses without possible hashed aliases MUST avoid listings. Indexed lookups MUST preserve case folding, alias rules, and entry precedence. Indexes MUST revalidate directory inode and nanosecond modification time, evict least recently used directories beyond 256, and invalidate directories for NT mutations.
+A name whose directory exists as written MUST resolve by looking up its last component alone.
 **Verification**: Test
 **Basis**: Wine 11.0 `find_file_in_dir` and `get_dir_case_sensitivity`.
 
@@ -165,6 +166,23 @@ DOS device paths without a host drive MUST resolve through the server's symbolic
 
 **Rule**: Cached registry reads MUST preserve information classes, buffer negotiation and value contents. Registry mutations and handle retirement through typed or raw requests MUST invalidate caches across the process family. Caches MUST retain at most 256 complete values per process, each at most 4096 bytes.
 **Verification**: Test
+
+### WINE-SYS-14 Name probe cache
+
+**Rule**: Attribute queries by name MUST repeat their last result until a revision ends, which opening and closing alone MUST NOT do. Server calls that create, truncate, remove, rename, link or chmod a name MUST end it, as MUST file writes, flushes, mappings and information changes. A probe overtaken by a revision MUST NOT be kept.
+**Verification**: Test
+
+Caches hold at most 16384 names per process. Host changes made outside the
+process family may stay unseen until the revision ends.
+
+### WINE-SYS-15 Directory listings for absent names
+
+**Rule**: Path lookups MUST remember known directories, and list a directory once after 32 absent-name lookups. An ASCII name without `~` that matches no listed name MUST then resolve as missing without a host lookup. Server calls that create, remove or rename a name, and NT mutations of a directory, MUST end what is remembered.
+**Verification**: Test
+
+Listed names include every name the host may fold to an ASCII one. Directories
+over 65536 names, or unreadable ones, keep host lookups. File writes and
+metadata changes leave listings intact.
 
 ## NT files
 
