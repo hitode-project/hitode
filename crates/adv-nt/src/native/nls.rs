@@ -207,6 +207,56 @@ fn word(bytes: &[u8], index: u32) -> Option<u16> {
     Some(u16::from_le_bytes(bytes.get(at..at + 2)?.try_into().ok()?))
 }
 
+// Keep full spans checked and tracked, even when only individual entries are read.
+struct Table<'a> {
+    cpu: &'a dyn Guest,
+    at: u32,
+    len: u32,
+    data: Option<&'a [u8]>,
+}
+impl<'a> Table<'a> {
+    fn load(mem: &mut Memory<'a>, at: u32, len: u32) -> Option<Self> {
+        let data = if len == 0 {
+            Some(&[][..])
+        } else {
+            mem.track(at, len)?;
+            if !mem.cpu.accessible(at, len, Prot::READ) {
+                return None;
+            }
+            mem.cpu.shared_bytes(at, len as usize)
+        };
+        Some(Self {
+            cpu: mem.cpu,
+            at,
+            len,
+            data,
+        })
+    }
+    fn byte(&self, index: u32) -> Option<u8> {
+        if let Some(data) = self.data {
+            return data.get(index as usize).copied();
+        }
+        if index >= self.len {
+            return None;
+        }
+        let mut bytes = [0];
+        self.cpu.read(self.at + index, &mut bytes).ok()?;
+        Some(bytes[0])
+    }
+    fn word(&self, index: u32) -> Option<u16> {
+        if let Some(data) = self.data {
+            return word(data, index);
+        }
+        let offset = index.checked_mul(2)?;
+        if offset.checked_add(2)? > self.len {
+            return None;
+        }
+        let mut bytes = [0; 2];
+        self.cpu.read(self.at + offset, &mut bytes).ok()?;
+        Some(u16::from_le_bytes(bytes))
+    }
+}
+
 struct CodePage<'a> {
     code: u16,
     def: u16,
@@ -216,10 +266,10 @@ struct CodePage<'a> {
     mb: u32,
     wc: u32,
     offsets: u32,
-    mb_data: &'a [u8],
-    wc_data: &'a [u8],
-    offset_data: &'a [u8],
-    ranges: &'a [u8],
+    mb_data: Option<Table<'a>>,
+    wc_data: Option<Table<'a>>,
+    offset_data: Option<Table<'a>>,
+    ranges: Option<Table<'a>>,
 }
 impl<'a> CodePage<'a> {
     fn load(mem: &mut Memory<'a>, at: u32) -> Option<Self> {
@@ -241,10 +291,10 @@ impl<'a> CodePage<'a> {
             mb: pointer(cp::MultiByteTable)?,
             wc: pointer(cp::WideCharTable)?,
             offsets: pointer(cp::DBCSOffsets)?,
-            mb_data: &[],
-            wc_data: &[],
-            offset_data: &[],
-            ranges: &[],
+            mb_data: None,
+            wc_data: None,
+            offset_data: None,
+            ranges: None,
         })
     }
     fn tables(
@@ -255,23 +305,25 @@ impl<'a> CodePage<'a> {
         glyph: bool,
     ) -> Option<()> {
         if wide {
-            self.wc_data = mem.read(self.wc, if self.dbcs { 131072 } else { 65536 })?;
+            self.wc_data = Some(Table::load(
+                mem,
+                self.wc,
+                if self.dbcs { 131072 } else { 65536 },
+            )?);
         }
         if decode {
             if glyph && word(mem.read(self.mb + 512, 2)?, 0)? == 256 {
                 self.mb += 514;
             }
-            self.mb_data = mem.read(self.mb, 512)?;
+            self.mb_data = Some(Table::load(mem, self.mb, 512)?);
             if self.offsets != 0 {
-                self.offset_data = mem.read(self.offsets, 512)?;
-                let end = self
-                    .offset_data
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .map(|c| u32::from(u16::from_le_bytes([c[0], c[1]])))
-                    .max()?;
-                self.ranges = mem.read(self.offsets + 512, end * 2)?;
+                let offsets = Table::load(mem, self.offsets, 512)?;
+                let mut end = 0;
+                for i in 0..256 {
+                    end = end.max(u32::from(offsets.word(i)?));
+                }
+                self.offset_data = Some(offsets);
+                self.ranges = Some(Table::load(mem, self.offsets + 512, end * 2)?);
             }
         }
         Some(())
@@ -280,21 +332,21 @@ impl<'a> CodePage<'a> {
         if self.offsets == 0 {
             Some(0)
         } else {
-            word(self.offset_data, index)
+            self.offset_data.as_ref()?.word(index)
         }
     }
     fn dbcs_char(&self, index: u32) -> Option<u16> {
         if index < 256 {
-            word(self.offset_data, index)
+            self.offset_data.as_ref()?.word(index)
         } else {
-            word(self.ranges, index - 256)
+            self.ranges.as_ref()?.word(index - 256)
         }
     }
     fn encode(&self, ch: u16) -> Option<u16> {
         if self.dbcs {
-            word(self.wc_data, u32::from(ch))
+            self.wc_data.as_ref()?.word(u32::from(ch))
         } else {
-            Some(u16::from(*self.wc_data.get(ch as usize)?))
+            Some(u16::from(self.wc_data.as_ref()?.byte(u32::from(ch))?))
         }
     }
     fn valid(&self, flags: u32, ch: u16, encoded: u16) -> Option<bool> {
@@ -305,7 +357,7 @@ impl<'a> CodePage<'a> {
             let off = self.offset(u32::from(encoded >> 8))?;
             self.dbcs_char(u32::from(off) + u32::from(encoded & 0xff))?
         } else {
-            word(self.mb_data, u32::from(encoded))?
+            self.mb_data.as_ref()?.word(u32::from(encoded))?
         };
         Some(decoded == ch)
     }
@@ -512,7 +564,7 @@ fn invalid(cp: &CodePage<'_>, src: &[u8]) -> Option<bool> {
             }
             i += 2;
         } else {
-            let ch = word(cp.mb_data, c)?;
+            let ch = cp.mb_data.as_ref()?.word(c)?;
             if (ch == cp.uni_def && c != u32::from(cp.trans_uni_def))
                 || (0xe000..=0xf8ff).contains(&ch)
             {
@@ -580,7 +632,7 @@ fn multi_byte(env: &Env<'_>) -> Option<(u64, Writes)> {
                 cp.uni_def
             }
         } else {
-            word(cp.mb_data, c)?
+            cp.mb_data.as_ref()?.word(c)?
         };
         if let Some(norm) = &norm {
             let single = ch.to_le_bytes();
@@ -782,7 +834,7 @@ fn rtl_convert(env: &Env<'_>, wide: bool, oem: bool, size: bool) -> Option<(u64,
                 i += 1;
                 cp.dbcs_char(u32::from(off) + u32::from(source[i]))?
             } else {
-                word(cp.mb_data, c)?
+                cp.mb_data.as_ref()?.word(c)?
             };
             if !size {
                 output.extend_from_slice(&ch.to_le_bytes());

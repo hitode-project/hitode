@@ -1463,6 +1463,9 @@ fn cached_code_pages_resume_wine_with_owned_lock() {
 struct CountingGuest<'a> {
     cpu: &'a mut dyn Guest,
     calls: std::cell::Cell<usize>,
+    read_bytes: std::cell::Cell<usize>,
+    largest_read: std::cell::Cell<usize>,
+    lend_tables: bool,
     pages: std::cell::RefCell<std::collections::BTreeSet<u32>>,
     stores: usize,
 }
@@ -1486,6 +1489,9 @@ impl Guest for CountingGuest<'_> {
     }
     fn read(&self, at: u32, data: &mut [u8]) -> Result<(), adv_cpu::backend::MemFault> {
         self.touch(at, data.len());
+        self.read_bytes.set(self.read_bytes.get() + data.len());
+        self.largest_read
+            .set(self.largest_read.get().max(data.len()));
         self.cpu.read(at, data)
     }
     fn write(&mut self, at: u32, data: &[u8]) -> Result<(), adv_cpu::backend::MemFault> {
@@ -1499,8 +1505,8 @@ impl Guest for CountingGuest<'_> {
     }
     fn shared_bytes(&self, at: u32, len: usize) -> Option<&[u8]> {
         self.touch(at, len);
-        // Wine's NLS file mappings require a bulk read instead of a borrow.
-        if !(DATA..DATA + LEN).contains(&at) {
+        // Wine's shared NLS file mappings cannot lend a slice.
+        if !self.lend_tables && !(DATA..DATA + LEN).contains(&at) {
             return None;
         }
         self.cpu.shared_bytes(at, len)
@@ -1551,6 +1557,9 @@ fn counted_body(m: &mut Machine<Cpu>, name: &str, context: u32, args: &[u32]) {
     let mut cpu = CountingGuest {
         cpu: &mut m.cpu,
         calls: std::cell::Cell::new(0),
+        read_bytes: std::cell::Cell::new(0),
+        largest_read: std::cell::Cell::new(0),
+        lend_tables: true,
         pages: std::cell::RefCell::new(std::collections::BTreeSet::new()),
         stores: 0,
     };
@@ -1679,4 +1688,84 @@ fn pe_bodies_access_memory_by_page() {
         context,
         &[1252, 0, large, 0x50000, DATA + 0x4000, 1000],
     );
+}
+
+// spec: NAT-BODY-5, NAT-BODY-7
+#[test]
+fn code_pages_read_unborrowable_entries() {
+    let Some(dist) = dist() else {
+        return;
+    };
+    let (mut m, _, _) = nls_machine(&dist, true);
+    let (mut reference, kb, _) = nls_machine(&dist, false);
+    let context = m.spawn("counted-conversion", CODE, &[], 0x10000).unwrap();
+    let teb = m.sys.contexts[context as usize].teb;
+    for (name, source, flags) in [
+        ("MultiByteToWideChar", [0xd2, 0xbb], 8),
+        ("WideCharToMultiByte", [0x00, 0x4e], 0x400),
+    ] {
+        let wide = name.starts_with("Wide");
+        let argc = if wide { 8 } else { 6 };
+        let args = [
+            936,
+            flags,
+            DATA,
+            if wide { 1 } else { 2 },
+            DATA + 0x4000,
+            8,
+            0,
+            DATA + 0x7000,
+        ];
+        let mut data = vec![0xcc; LEN as usize];
+        data[..2].copy_from_slice(&source);
+        prepare(&mut reference, address(&kb, name), argc, true);
+        let expected = call(&mut reference, &data, &args[..argc]);
+        let expected_result = expected.0.unwrap();
+        m.cpu.write(DATA, &data).unwrap();
+        m.cpu.write_u32(teb + 0x34, 0x1234abcd).unwrap();
+        m.cpu.set_reg(adv_cpu::backend::Reg::Esp, SLOT);
+        for (i, arg) in args[..argc].iter().enumerate() {
+            m.cpu.write_u32(ARGS + i as u32 * 4, *arg).unwrap();
+        }
+        let thunk = m
+            .sys
+            .thunks
+            .published_index(adv_nt::native::MODULE, &format!("kernelbase.dll!{name}"))
+            .unwrap();
+        let body = m.sys.thunks.get(thunk).f.handler;
+        let mut cpu = CountingGuest {
+            cpu: &mut m.cpu,
+            calls: std::cell::Cell::new(0),
+            read_bytes: std::cell::Cell::new(0),
+            largest_read: std::cell::Cell::new(0),
+            lend_tables: false,
+            pages: std::cell::RefCell::new(std::collections::BTreeSet::new()),
+            stores: 0,
+        };
+        let mut env = adv_machine::Env {
+            context,
+            cpu: &mut cpu,
+            sys: &mut m.sys,
+            ext: &mut m.ext,
+            thunk,
+        };
+        assert!(
+            matches!(body(&mut env), adv_machine::Outcome::Return64(value) if value == u64::from(expected_result[0])),
+            "{name} declined or returned a different length"
+        );
+        assert!(
+            cpu.read_bytes.get() < 2048,
+            "{name}: {} bytes read",
+            cpu.read_bytes.get()
+        );
+        assert!(cpu.largest_read.get() < 512, "{name}: copied a table");
+        let mut actual = vec![0; LEN as usize];
+        m.cpu.read(DATA, &mut actual).unwrap();
+        assert_eq!(actual, expected.1, "{name}: output differs");
+        assert_eq!(
+            m.cpu.read_u32(teb + 0x34).unwrap(),
+            expected_result[7],
+            "{name}: LastError differs"
+        );
+    }
 }

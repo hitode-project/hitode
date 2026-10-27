@@ -392,7 +392,7 @@ FreeType is a host library under WINE-UNIX-6.
 
 ### NAT-BODY-7 PE body memory access
 
-**Rule**: PE string and conversion bodies MUST bound guest memory calls by pages and tables touched, rather than input units. Short calls fitting within one page of strings or eight KiB of conversion output MUST NOT allocate heap buffers.
+**Rule**: PE string and conversion bodies MUST bound guest memory calls by pages and tables touched. Tables that cannot be borrowed MAY use indexed entry reads. Short calls fitting within one page of strings or eight KiB of conversion output MUST NOT allocate heap buffers.
 **Verification**: Test
 
 ### NAT-BODY-8 D3DX pixel conversion
