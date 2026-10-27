@@ -28,7 +28,7 @@ pub(super) struct Buffer {
     pub fvf: u32,
     pub locks: u32,
 }
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct Stream {
     pub buffer: Option<Id>,
     pub offset: u32,
@@ -368,6 +368,11 @@ fn lock(
         return INVALID;
     };
     b.locks = locks;
+    // A retained signature prefix has already checked its stream locks.
+    let owner = b.device;
+    if let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, owner) {
+        d.frame.invalidate_streams();
+    }
     0
 }
 fn unlock(env: &mut Env<'_>, this: u32, kind: Kind) -> u32 {

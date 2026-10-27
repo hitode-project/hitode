@@ -419,3 +419,54 @@ fn d3d9_differential_early_readback_keeps_the_remaining_frame_on_the_full_path()
     reuse_draw(&mut f, &[0, 1, 2], &builds);
     assert_eq!(builds.get(), 4, "the next frame can share entries again");
 }
+
+#[test]
+// spec: GFX-REC-11
+fn d3d9_reuse_signature_prefix_rechecks_locked_streams() {
+    let (mut f, _) = reuse_fixture();
+    let builds = std::cell::Cell::new(0);
+    reuse_draw(&mut f, &[0, 1, 2], &builds);
+    reuse_draw(&mut f, &[0, 1, 2], &builds);
+    assert_eq!(builds.get(), 1);
+    let d = f.device;
+    let e = env(&mut f);
+    let buffer = device(&e, d).unwrap().buffers.streams[0].buffer.unwrap();
+    let Some(Payload::Buffer(buffer)) = com(&e).get_identity(&e.sys.objects, buffer) else {
+        panic!()
+    };
+    let buffer = buffer.pointer;
+    let output = f.packet(0u32);
+    for _ in 0..2 {
+        f.okay("IDirect3DVertexBuffer9::Lock", &[buffer, 0, 0, output, 0]);
+    }
+    for _ in 0..2 {
+        let outcome = indexed(&mut env(&mut f), d, (4, 1, &[0, 1, 2]), |env| {
+            builds.set(builds.get() + 1);
+            programmable::prepare(env, d, 4, 1, None, Some(&[0, 1, 2]), 0)
+        });
+        assert!(matches!(outcome, Outcome::Return(INVALID)));
+        f.okay("IDirect3DVertexBuffer9::Unlock", &[buffer]);
+    }
+    assert_eq!(builds.get(), 3);
+    reuse_draw(&mut f, &[0, 1, 2], &builds);
+    assert_eq!(builds.get(), 3, "unlocked streams can reuse retained draws");
+}
+
+#[test]
+// spec: GFX-REC-11
+fn d3d9_reuse_signature_prefix_rechecks_target_shape() {
+    let (mut f, _) = reuse_fixture();
+    let builds = std::cell::Cell::new(0);
+    reuse_draw(&mut f, &[0, 1, 2], &builds);
+    reuse_draw(&mut f, &[0, 1, 2], &builds);
+    assert_eq!(builds.get(), 1);
+    let spare = f.render_target(32, 24, 22);
+    let target = f.target(spare);
+    let back = f.back;
+    let e = env(&mut f);
+    let surface = resources::resource(&e, back).unwrap().surface.unwrap();
+    let replace = e.ext.get::<State>().provider.replace;
+    replace(e.ext, surface, target).unwrap();
+    reuse_draw(&mut f, &[0, 1, 2], &builds);
+    assert_eq!(builds.get(), 2);
+}

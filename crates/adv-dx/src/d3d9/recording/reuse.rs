@@ -6,7 +6,16 @@ use std::hash::Hash;
 #[derive(Default)]
 pub(super) struct Cache {
     targets: HashMap<Id, Sequence>,
+    prefix: Option<Prefix>,
     disabled: bool,
+}
+struct Prefix {
+    request: (i32, u32, Vec<u32>),
+    fingerprints: [u128; 15],
+    streams: [buffers::Stream; 16],
+    indices: Option<Id>,
+    target: (Option<Id>, Option<Id>, key::TargetKey),
+    hash: xxhash_rust::xxh3::Xxh3,
 }
 #[derive(Default)]
 struct Sequence {
@@ -32,7 +41,11 @@ pub(super) struct Saved {
 impl Cache {
     pub(super) fn invalidate(&mut self) {
         self.targets.clear();
+        self.invalidate_streams();
         self.disabled = true;
+    }
+    pub(super) fn invalidate_streams(&mut self) {
+        self.prefix = None;
     }
     /// Whether a retained entry still draws into `image`'s allocation.
     #[cfg(test)]
@@ -57,40 +70,33 @@ impl Cache {
         });
     }
 }
-fn signature(
-    env: &mut Env<'_>,
-    pointer: u32,
+fn prefix(
+    env: &Env<'_>,
+    d: &Device,
     request: (i32, u32, &[u32]),
-) -> Result<(u128, Target), u32> {
-    let owner = com(env)
-        .identity::<Payload>(&env.sys.objects, pointer)
-        .ok_or(INVALID)?;
-    key::bind(env, owner)?;
-    let d = device(env, pointer).ok_or(INVALID)?;
-    if !d.scene
-        || d.needs_reset
-        || d.frame.reuse.disabled
-        || d.frame.partial
-        || d.frame.active.is_some()
-    {
-        return Err(INVALID);
-    }
-    let mut h = xxhash_rust::xxh3::Xxh3::new();
-    #[cfg(any(test, feature = "d3d9-counters"))]
-    debug_assert_eq!(
-        d.fingerprints,
-        std::array::from_fn(|class| d.class_key(class))
-    );
-    (request, d.fingerprints).hash(&mut h);
-    let target = targets::draw_target(env, pointer)?;
-    // Presentation rotates back-buffer images; commands depend only on the
-    // target's shape, and a reused command is rebased onto the current one.
-    (
+    target: &Target,
+) -> Result<(xxhash_rust::xxh3::Xxh3, Option<Prefix>), u32> {
+    let target = (
         d.render_target.or(d.back_buffer),
         d.depth_stencil,
-        key::target_key(&target),
-    )
-        .hash(&mut h);
+        key::target_key(target),
+    );
+    if let Some(p) = &d.frame.reuse.prefix
+        && p.request.0 == request.0
+        && p.request.1 == request.1
+        && p.request.2 == request.2
+        && p.fingerprints == d.fingerprints
+        && p.streams == d.buffers.streams
+        && p.indices == d.buffers.indices
+        && p.target == target
+    {
+        return Ok((p.hash.clone(), None));
+    }
+    let mut h = xxhash_rust::xxh3::Xxh3::new();
+    (request, d.fingerprints).hash(&mut h);
+    // Presentation rotates back-buffer images; commands depend only on the
+    // target's shape, and a reused command is rebased onto the current one.
+    target.hash(&mut h);
     d.buffers
         .streams
         .iter()
@@ -109,6 +115,41 @@ fn signature(
         }
     }
     d.buffers.indices.hash(&mut h);
+    let prefix = Prefix {
+        request: (request.0, request.1, request.2.to_vec()),
+        fingerprints: d.fingerprints,
+        streams: d.buffers.streams,
+        indices: d.buffers.indices,
+        target,
+        hash: h.clone(),
+    };
+    Ok((h, Some(prefix)))
+}
+fn signature(
+    env: &mut Env<'_>,
+    pointer: u32,
+    request: (i32, u32, &[u32]),
+) -> Result<(u128, Target), u32> {
+    let owner = com(env)
+        .identity::<Payload>(&env.sys.objects, pointer)
+        .ok_or(INVALID)?;
+    key::bind(env, owner)?;
+    let d = device(env, pointer).ok_or(INVALID)?;
+    if !d.scene
+        || d.needs_reset
+        || d.frame.reuse.disabled
+        || d.frame.partial
+        || d.frame.active.is_some()
+    {
+        return Err(INVALID);
+    }
+    #[cfg(any(test, feature = "d3d9-counters"))]
+    debug_assert_eq!(
+        d.fingerprints,
+        std::array::from_fn(|class| d.class_key(class))
+    );
+    let target = targets::draw_target(env, pointer)?;
+    let (mut h, prefix) = prefix(env, d, request, &target)?;
     std::iter::once(d.texture)
         .chain(d.shaders.textures)
         .flatten()
@@ -152,6 +193,9 @@ fn signature(
             d.frame.damage.written(content),
         )
             .hash(&mut h);
+    }
+    if let Some(prefix) = prefix {
+        frame(env, owner).reuse.prefix = Some(prefix);
     }
     Ok((h.digest128(), target))
 }

@@ -128,19 +128,19 @@ pub(in crate::d3d9) struct StateBlock {
     pub(in crate::d3d9) device: Id,
     snapshot: Option<Rc<Snapshot>>,
     fingerprints: [u128; 15],
+    classes: u16,
 }
 impl StateBlock {
     /// Whether every class holding a member still matches the device, so
     /// Capture and Apply change nothing.
     fn current(&self, d: &super::super::Device) -> bool {
-        let classes = self.snapshot.as_ref().unwrap().mask.classes();
-        (0..15).all(|c| classes & (1 << c) == 0 || self.fingerprints[c] == d.fingerprints[c])
+        (0..15).all(|c| self.classes & (1 << c) == 0 || self.fingerprints[c] == d.fingerprints[c])
     }
     fn members(&self, d: &super::super::Device) -> Mask {
         let mut m = self.snapshot.as_ref().unwrap().mask.clone();
         let changed = |class| self.fingerprints[class] != d.fingerprints[class];
         // Classes without members never transfer, so they stay clean.
-        m.dirty = (0..15).fold(0, |bits, c| bits | (u16::from(changed(c)) << c)) & m.classes();
+        m.dirty = (0..15).fold(0, |bits, c| bits | (u16::from(changed(c)) << c)) & self.classes;
         if !changed(0) {
             m.render = Default::default();
         }
@@ -595,6 +595,7 @@ fn make(
         Payload::StateBlock(Box::new(StateBlock {
             pointer: 0,
             device,
+            classes: snapshot.mask.classes(),
             snapshot: Some(Rc::new(snapshot)),
             fingerprints,
         })),

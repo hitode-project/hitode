@@ -4,7 +4,7 @@ use adv_device::{
     gpu::{AttributeFormat, Image},
     surface::Rect,
 };
-use std::collections::HashSet;
+use rustc_hash::FxHashSet as HashSet;
 pub(super) mod sampling;
 
 pub(super) fn image(operation: &Operation) -> Option<&Image> {

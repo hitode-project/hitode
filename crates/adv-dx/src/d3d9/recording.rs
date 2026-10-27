@@ -190,6 +190,11 @@ pub(super) struct Recording {
     readback: Option<adv_device::gpu::Readback>,
     job: Option<adv_sync::background::Task>,
 }
+impl Recording {
+    pub(super) fn invalidate_streams(&mut self) {
+        self.reuse.invalidate_streams();
+    }
+}
 pub(super) fn forget(env: &mut Env<'_>, owner: Id, pointer: u32) {
     if let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, owner) {
         let f = &mut d.frame;

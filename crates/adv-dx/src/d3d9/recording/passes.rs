@@ -1,7 +1,7 @@
 //! Backward liveness for complete, contiguous target passes. Uploads remain
 //! barriers: their fresh content keys do not prove a full pixel overwrite.
 use super::*;
-use std::collections::HashSet;
+use rustc_hash::FxHashSet as HashSet;
 
 pub(super) struct Effects {
     pass: u128,
