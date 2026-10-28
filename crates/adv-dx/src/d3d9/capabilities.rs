@@ -128,7 +128,7 @@ fn adapter_monitor(env: &mut Env<'_>, this: GuestPtr<()>, adapter: u32) -> adv_a
     adv_abi::Handle(env.ext.get::<State>().provider.monitor)
 }
 #[win32(d3d9,name="IDirect3DDevice9::GetDisplayMode",level=implement)]
-fn device_display(
+pub(super) fn device_display(
     env: &mut Env<'_>,
     this: GuestPtr<()>,
     swap: u32,

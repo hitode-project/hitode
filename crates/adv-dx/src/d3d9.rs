@@ -106,6 +106,8 @@ enum Payload {
     Declaration(declaration::Declaration),
     Shader(shaders::Shader),
     StateBlock(Box<shaders::stateblocks::StateBlock>),
+    SwapChain(Id),
+    Query(queries::Query),
 }
 struct Device {
     children: BTreeMap<u32, Id>,
@@ -121,6 +123,8 @@ struct Device {
     scene: bool,
     needs_reset: bool,
     back_buffer: Option<Id>,
+    swap_chain: Option<Id>,
+    queries: queries::DeviceState,
     depth_stencil: Option<Id>,
     texture: Option<Id>,
     /// Borrowed surface identity; its controlling resource has one internal ref.
@@ -413,6 +417,8 @@ pub fn register(registry: &mut Registry) {
     update_texture::register(registry);
     shaders::register(registry);
     programmable::register(registry);
+    swapchain::register(registry);
+    queries::register(registry);
     crate::refcounts::install(registry, "d3d9.dll");
 }
 
@@ -433,6 +439,8 @@ pub fn install<B: Backend>(
         "IDirect3DVertexShader9",
         "IDirect3DPixelShader9",
         "IDirect3DStateBlock9",
+        "IDirect3DSwapChain9",
+        "IDirect3DQuery9",
     ] {
         let signatures: Vec<_> = adv_abi::signature::com_signatures()
             .iter()
@@ -558,6 +566,8 @@ fn child_owner(payload: &Payload) -> Option<Id> {
         Payload::Declaration(r) => r.device,
         Payload::Shader(r) => r.device,
         Payload::StateBlock(r) => r.device,
+        Payload::SwapChain(device) => *device,
+        Payload::Query(q) => q.device,
         _ => return None,
     })
 }
@@ -615,7 +625,10 @@ fn destroy(env: &mut Env<'_>, destroyed: Destroyed<Payload>) {
         if let Some(recording) = device.recording {
             shaders::stateblocks::release_snapshot(env, recording);
         }
-        for binding in [device.texture, device.back_buffer].into_iter().flatten() {
+        for binding in [device.texture, device.back_buffer, device.swap_chain]
+            .into_iter()
+            .flatten()
+        {
             if let Some(Some(resource)) = com(env).release_internal(&mut env.sys.objects, binding) {
                 destroy(env, resource);
             }
@@ -632,6 +645,8 @@ fn destroy(env: &mut Env<'_>, destroyed: Destroyed<Payload>) {
         resources::destroy(env, resource);
     } else if let Payload::Buffer(buffer) = destroyed.value {
         buffers::destroy(env, buffer);
+    } else if let Payload::Query(q) = destroyed.value {
+        queries::destroy(env, q);
     } else if let Payload::StateBlock(block) = destroyed.value {
         shaders::stateblocks::destroy(env, *block);
     }
@@ -639,12 +654,38 @@ fn destroy(env: &mut Env<'_>, destroyed: Destroyed<Payload>) {
         free(env, pointer);
     }
 }
+fn child_parent(env: &Env<'_>, pointer: u32, references: u32) -> Option<Id> {
+    let payload = com(env).get::<Payload>(&env.sys.objects, pointer)?;
+    if !matches!(payload, Payload::SwapChain(_) | Payload::Query(_)) {
+        return None;
+    }
+    let id = com(env).identity::<Payload>(&env.sys.objects, pointer)?;
+    (com(env).references(&env.sys.objects, id)? == references)
+        .then(|| child_owner(payload).unwrap())
+}
+fn child_device(env: &mut Env<'_>, owner: Id, output: GuestPtr<u32>) -> u32 {
+    if output.write(env.cpu, 0).is_err() {
+        return INVALID;
+    }
+    let Some(pointer) = com(env).canonical(&env.sys.objects, owner) else {
+        return INVALID;
+    };
+    if add_ref(env, pointer).is_none() {
+        return OUT_OF_MEMORY;
+    }
+    if output.write(env.cpu, pointer).is_err() {
+        release(env, pointer);
+        return INVALID;
+    }
+    0
+}
 fn release_parent(env: &Env<'_>, pointer: u32) -> Option<Id> {
     let pointer = resources::container_pointer(env, pointer).unwrap_or(pointer);
     resources::parent_on_last_public_release(env, pointer)
         .or_else(|| buffers::parent_on_last_public_release(env, pointer))
         .or_else(|| declaration::parent_on_last_public_release(env, pointer))
         .or_else(|| shaders::parent_on_last_public_release(env, pointer))
+        .or_else(|| child_parent(env, pointer, 1))
 }
 fn release(env: &mut Env<'_>, pointer: u32) -> u32 {
     if let Some(parent) = resources::container_pointer(env, pointer) {
@@ -672,7 +713,8 @@ fn add_ref(env: &mut Env<'_>, pointer: u32) -> Option<u32> {
     let parent = resources::parent_on_first_public_retain(env, pointer)
         .or_else(|| buffers::parent_on_first_public_retain(env, pointer))
         .or_else(|| declaration::parent_on_first_public_retain(env, pointer))
-        .or_else(|| shaders::parent_on_first_public_retain(env, pointer));
+        .or_else(|| shaders::parent_on_first_public_retain(env, pointer))
+        .or_else(|| child_parent(env, pointer, 0));
     if let Some(parent) = parent {
         com(env).add_ref_identity(&mut env.sys.objects, parent)?;
     }
@@ -715,7 +757,8 @@ fn query(
     let parent = resources::parent_on_first_public_retain(env, this.addr())
         .or_else(|| buffers::parent_on_first_public_retain(env, this.addr()))
         .or_else(|| declaration::parent_on_first_public_retain(env, this.addr()))
-        .or_else(|| shaders::parent_on_first_public_retain(env, this.addr()));
+        .or_else(|| shaders::parent_on_first_public_retain(env, this.addr()))
+        .or_else(|| child_parent(env, this.addr(), 0));
     if let Some(parent) = parent
         && com(env)
             .add_ref_identity(&mut env.sys.objects, parent)
@@ -788,8 +831,10 @@ macro_rules! unknown {
 mod buffers;
 mod declaration;
 mod depth;
+mod queries;
 mod resources;
 mod shaders;
+mod swapchain;
 unknown!(
     factory_query,
     factory_add_ref,
@@ -1100,6 +1145,8 @@ fn create_device(
         scene: false,
         needs_reset: false,
         back_buffer: None,
+        swap_chain: None,
+        queries: queries::DeviceState::default(),
         depth_stencil: None,
         texture: None,
         render_target: None,

@@ -828,7 +828,7 @@ mod tests;
 // failure contract. Flush accepted work before that boundary, without inventing
 // successful capture or pixels for an API that has no implementation.
 #[win32(d3d9,name="IDirect3DDevice9::GetFrontBufferData",level=safe_fail)]
-fn front(
+pub(super) fn front(
     env: &mut Env<'_>,
     this: GuestPtr<()>,
     _chain: u32,

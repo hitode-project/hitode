@@ -225,6 +225,8 @@ pub(super) fn owner(env: &Env<'_>, id: Id) -> Id {
         Some(Payload::Declaration(d)) => d.device,
         Some(Payload::Shader(s)) => s.device,
         Some(Payload::StateBlock(b)) => b.device,
+        Some(Payload::SwapChain(owner)) => *owner,
+        Some(Payload::Query(q)) => q.device,
         _ => id,
     }
 }
@@ -232,6 +234,42 @@ fn token(env: &mut Env<'_>, owner: Id) -> u64 {
     let f = frame(env, owner);
     f.next = f.next.checked_add(1).expect("flush token exhausted");
     f.next
+}
+pub(super) fn query_pixels(f: &Recording, queries: &mut queries::DeviceState) -> u64 {
+    for operation in &f.commands[queries.scanned..] {
+        if let Operation::Draw(draw) = operation {
+            let area = u64::from(draw.target.image.width()) * u64::from(draw.target.image.height());
+            queries.pixels = queries.pixels.wrapping_add(area);
+        }
+    }
+    queries.scanned = f.commands.len();
+    queries.pixels
+}
+pub(super) fn query_pending(f: &Recording) -> bool {
+    !f.commands.is_empty() || f.active.is_some()
+}
+pub(super) fn query_flush(env: &mut Env<'_>, owner: Id) -> Result<(), Error> {
+    if frame(env, owner).active.is_some() {
+        return Err(Error::Busy);
+    }
+    if frame(env, owner).commands.is_empty() {
+        return Ok(());
+    }
+    let token = token(env, owner);
+    let result = flush(env, owner, token, Reason::Wait);
+    if matches!(result, Err(Error::Busy)) {
+        cancel(
+            env,
+            &Operation::Flush {
+                owner,
+                token,
+                reason: Reason::Wait,
+            },
+        );
+    } else {
+        unlock(env, owner, token);
+    }
+    result.map(|_| ())
 }
 pub(super) fn has_work(env: &mut Env<'_>, owner: Id) -> bool {
     matches!(
@@ -520,13 +558,24 @@ fn append(
             let (key, bytes, contents) = previous.unwrap();
             let f = frame(env, owner);
             assert!(f.head < f.commands.len());
-            f.commands.pop();
+            let rejected = f.commands.pop();
+            let len = f.commands.len();
             f.passes.truncate(f.commands.len());
             f.damage.invalidate();
             f.bytes -= bytes;
             f.key = key;
             for (k, old, had_base) in contents {
                 f.contents.restore(k, old, had_base);
+            }
+            if let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, owner)
+                && d.queries.scanned > len
+            {
+                if let Some(Operation::Draw(draw)) = rejected {
+                    let area = u64::from(draw.target.image.width())
+                        * u64::from(draw.target.image.height());
+                    d.queries.pixels = d.queries.pixels.wrapping_sub(area);
+                }
+                d.queries.scanned = len;
             }
             env.ext.get_mut::<State>().frames.recorded_commands -= 1;
             #[cfg(feature = "d3d9-counters")]
@@ -564,6 +613,11 @@ pub(super) fn flush(
     reason: Reason,
 ) -> Result<Completion, Error> {
     enter(env, owner, token, reason)?;
+    if let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, owner)
+        && d.queries.active != 0
+    {
+        query_pixels(&d.frame, &mut d.queries);
+    }
     if !frame(env, owner).rotate
         && let Some(operation) = restore_operation(env, owner)
     {
@@ -692,8 +746,16 @@ fn release_upload(env: &mut Env<'_>, owner: Id, resource: Id, level: Option<u32>
     }
 }
 pub(super) fn unlock(env: &mut Env<'_>, owner: Id, token: u64) {
-    let f = frame(env, owner);
-    if f.active == Some(token) {
+    let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, owner) else {
+        unreachable!()
+    };
+    if d.frame.active == Some(token) {
+        if d.queries.active != 0 {
+            query_pixels(&d.frame, &mut d.queries);
+        }
+        d.queries.scanned = 0;
+        d.queries.submissions += 1;
+        let f = &mut d.frame;
         let held = std::mem::take(&mut f.held_uploads);
         f.active = None;
         f.commands.clear();

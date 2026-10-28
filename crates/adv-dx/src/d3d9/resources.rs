@@ -498,7 +498,7 @@ pub(super) fn implicit_back_buffer(
     Some(id)
 }
 #[win32(d3d9,name="IDirect3DDevice9::GetBackBuffer",level=implement)]
-fn back_buffer(
+pub(super) fn back_buffer(
     env: &mut Env<'_>,
     this: GuestPtr<()>,
     swap: u32,
