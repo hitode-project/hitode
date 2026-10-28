@@ -60,8 +60,8 @@ targets:
         # Finder file sharing also exposes the app's Documents folder.
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
-        CFBundleShortVersionString: 0.2.0
-        CFBundleVersion: "0.2.0"
+        CFBundleShortVersionString: 0.2.1
+        CFBundleVersion: "0.2.1"
     entitlements:
       path: adv-launcher_iOS/adv-launcher_iOS.entitlements
     scheme:
@@ -126,8 +126,8 @@ targets:
       path: JitHelper/Info.plist
       properties:
         CFBundleDisplayName: Hitode JIT
-        CFBundleShortVersionString: 0.2.0
-        CFBundleVersion: "0.2.0"
+        CFBundleShortVersionString: 0.2.1
+        CFBundleVersion: "0.2.1"
         NSLocalNetworkUsageDescription: Connect to this device through LocalDevVPN to enable JIT.
         NSExtension:
           NSExtensionPointIdentifier: com.apple.ar.viewer
