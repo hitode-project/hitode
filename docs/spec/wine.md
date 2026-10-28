@@ -382,7 +382,7 @@ FreeType is a host library under WINE-UNIX-6.
 
 ### NAT-BODY-4 DIB primitives
 
-**Rule**: DIB bodies MUST preserve Wine's pixels, padding, overlap traversal, bit fields, palette selection, blend arithmetic, and interpolation rounding. Unsupported formats or inaccessible memory MUST decline before writes. Field offsets and data addresses MUST match the pinned Unix module's DWARF.
+**Rule**: DIB bodies MUST preserve Wine's pixels, padding, overlap traversal, bit fields, palette selection, blend arithmetic, and interpolation rounding. Rect and row bodies MUST snapshot only the rows they touch, and unsupported formats or inaccessible memory MUST decline before writes. Field offsets and data addresses MUST match the pinned Unix module's DWARF.
 **Verification**: Test
 
 ### NAT-BODY-5 Code page bodies
