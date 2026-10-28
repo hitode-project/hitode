@@ -155,7 +155,7 @@ pub(super) fn register(registry: &mut Registry) {
     });
 }
 
-pub(super) fn install<B: Backend>(machine: &mut Machine<B>, prefix: &Path) -> Result<(), String> {
+pub(super) fn install<B: Backend>(machine: &mut Machine<B>, drive: &Path) -> Result<(), String> {
     let table = machine
         .sys
         .vm
@@ -183,7 +183,7 @@ pub(super) fn install<B: Backend>(machine: &mut Machine<B>, prefix: &Path) -> Re
         .map(|(name, ordinal)| Export { name, ordinal })
         .collect();
     let image = ModuleImage::build(machine, MODULE, &exports, &[])?;
-    adv_unix::builtin::install(prefix, &image)
+    adv_unix::builtin::install(drive, &image)
         .map(|_| ())
         .map_err(|e| e.to_string())
 }

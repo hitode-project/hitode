@@ -43,7 +43,7 @@ fn gdi_painting_a_window_reaches_the_presenter() {
         Platform(registry),
         |machine, prefix| {
             adv_unix::install(machine);
-            adv_runtime::wine::install(machine, prefix, 640, 480).unwrap();
+            adv_runtime::wine::install(machine, &prefix.join("drive_c"), 640, 480).unwrap();
         },
         |machine| {
             let frame = &machine.ext.get::<SurfaceStore>().presenter;

@@ -130,8 +130,8 @@ pub(super) fn register(registry: &mut Registry) {
     }
 }
 
-pub(super) fn install<B: Backend>(machine: &mut Machine<B>, prefix: &Path) -> Result<(), String> {
-    let system = prefix.join("drive_c/windows/system32");
+pub(super) fn install<B: Backend>(machine: &mut Machine<B>, drive: &Path) -> Result<(), String> {
+    let system = drive.join("windows/system32");
     let path = system.join(MODULE);
     let saved = system.join(ORIGINAL);
     if std::fs::symlink_metadata(&path)
@@ -224,7 +224,7 @@ pub(super) fn install<B: Backend>(machine: &mut Machine<B>, prefix: &Path) -> Re
     }
     let out = raw(directory) + 24;
     bytes[out..out + 4].copy_from_slice(&(retained as u32).to_le_bytes());
-    adv_unix::builtin::install_bytes(prefix, MODULE, bytes).map_err(|e| e.to_string())?;
+    adv_unix::builtin::install_bytes(drive, MODULE, bytes).map_err(|e| e.to_string())?;
     Ok(())
 }
 fn pe_import(name: &str) -> adv_pe::Import {

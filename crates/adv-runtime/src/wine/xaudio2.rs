@@ -29,7 +29,7 @@ pub(super) fn activate<B: Backend>(
 pub(super) fn register(registry: &mut Registry) {
     adv_dx::xaudio2::register(registry);
 }
-pub(super) fn install<B: Backend>(machine: &mut Machine<B>, prefix: &Path) -> Result<(), String> {
+pub(super) fn install<B: Backend>(machine: &mut Machine<B>, drive: &Path) -> Result<(), String> {
     adv_dx::xaudio2::install(
         machine,
         adv_dx::xaudio2::Host {
@@ -40,7 +40,7 @@ pub(super) fn install<B: Backend>(machine: &mut Machine<B>, prefix: &Path) -> Re
     )?;
     machine.ext.insert(Originals([0; 3]));
     for (version, module) in MODULES.into_iter().enumerate() {
-        let path = prefix.join("drive_c/windows/system32").join(module);
+        let path = drive.join("windows/system32").join(module);
         let original = path.with_file_name(ORIGINALS[version]);
         let source = std::fs::canonicalize(if path.is_symlink() { &path } else { &original })
             .map_err(|e| e.to_string())?;
@@ -61,7 +61,7 @@ pub(super) fn install<B: Backend>(machine: &mut Machine<B>, prefix: &Path) -> Re
             })
             .collect();
         let built = ModuleImage::build(machine, module, &exports, &[])?;
-        adv_unix::builtin::install(prefix, &built).map_err(|e| e.to_string())?;
+        adv_unix::builtin::install(drive, &built).map_err(|e| e.to_string())?;
     }
     Ok(())
 }

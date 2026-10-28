@@ -70,7 +70,7 @@ fn wine_identical_redraws_publish_nothing_and_partial_redraws_keep_damage() {
         Platform(registry),
         |machine, prefix| {
             adv_unix::install(machine);
-            adv_runtime::wine::install(machine, prefix, 640, 480).unwrap();
+            adv_runtime::wine::install(machine, &prefix.join("drive_c"), 640, 480).unwrap();
             let image = ModuleImage::build(
                 machine,
                 "frame_probe.dll",
@@ -81,7 +81,7 @@ fn wine_identical_redraws_publish_nothing_and_partial_redraws_keep_damage() {
                 &[],
             )
             .unwrap();
-            adv_unix::builtin::install(prefix, &image).unwrap();
+            adv_unix::builtin::install(&prefix.join("drive_c"), &image).unwrap();
             let (producer, frames) = frame_mailbox();
             machine
                 .ext

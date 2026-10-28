@@ -663,7 +663,7 @@ Device decoding follows [device.md](device.md).
 
 ### WINE-SES-1 Shared prefix
 
-**Rule**: Every game MUST run on the player's one prefix, kept between runs, with drive C: inside it or where the embedder places it. A host MUST provision system32 and the template's module links before first using a drive C:. The program directory MUST use D: or the first unmounted letter after it, with writes in place.
+**Rule**: Every game MUST run on the player's one prefix, kept between runs, with drive C: inside it or where the embedder places it. A host MUST provision system32, the template's module links and its own host modules on the drive C: a session uses. The program directory MUST use D: or the first unmounted letter after it, with writes in place.
 Process startup MUST register the prefix's drive letters in the server namespace.
 **Verification**: Test
 

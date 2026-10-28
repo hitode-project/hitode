@@ -180,7 +180,7 @@ fn host_freetype_matches_i386() {
                 &[],
             )
             .unwrap();
-            adv_unix::builtin::install(prefix, &image).unwrap();
+            adv_unix::builtin::install(&prefix.join("drive_c"), &image).unwrap();
             std::fs::copy(
                 concat!(
                     env!("CARGO_MANIFEST_DIR"),
