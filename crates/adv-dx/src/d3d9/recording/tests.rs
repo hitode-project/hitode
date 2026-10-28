@@ -1535,3 +1535,517 @@ fn releasing_the_last_child_device_owner_flushes_before_indirect_device_teardown
 mod damage_tests;
 
 include!("reuse_tests.rs");
+
+fn package_b_call(f: &mut Fixture, name: &str, args: &[u32]) -> u32 {
+    match f.call(name, args) {
+        Outcome::Return(code) => code,
+        _ => panic!("{name} must return without blocking"),
+    }
+}
+fn package_b_query(f: &mut Fixture, kind: u32) -> u32 {
+    let output = f.packet(0u32);
+    f.okay("IDirect3DDevice9::CreateQuery", &[f.device, kind, output]);
+    f.m.cpu.read_u32(output).unwrap()
+}
+fn package_b_chain(f: &mut Fixture) -> u32 {
+    let output = f.packet(0u32);
+    f.okay("IDirect3DDevice9::GetSwapChain", &[f.device, 0, output]);
+    f.m.cpu.read_u32(output).unwrap()
+}
+
+// spec: GFX-SWAP-1
+#[test]
+fn d3d9_package_b_swap_chain_identity_references_and_device_lifetime() {
+    let mut f = fixture();
+    let chain = package_b_chain(&mut f);
+    let chain2 = package_b_chain(&mut f);
+    assert_eq!(chain, chain2);
+    assert_eq!(
+        package_b_call(&mut f, "IDirect3DSwapChain9::Release", &[chain]),
+        1
+    );
+    assert_eq!(
+        package_b_call(&mut f, "IDirect3DSwapChain9::AddRef", &[chain]),
+        2
+    );
+    assert_eq!(
+        package_b_call(&mut f, "IDirect3DSwapChain9::Release", &[chain]),
+        1
+    );
+    let output = f.packet(0u32);
+    let iid = f.packet([
+        0xf2u8, 0x50, 0x49, 0x79, 0xfc, 0xad, 0x8a, 0x45, 0x90, 0x5e, 0x10, 0xa1, 0x0b, 0x0b, 0x50,
+        0x3b,
+    ]);
+    let unknown = f.packet(adv_abi::com::IUNKNOWN);
+    for iid in [iid, unknown] {
+        f.okay("IDirect3DSwapChain9::QueryInterface", &[chain, iid, output]);
+        assert_eq!(f.m.cpu.read_u32(output).unwrap(), chain);
+        assert_eq!(
+            package_b_call(&mut f, "IDirect3DSwapChain9::Release", &[chain]),
+            1
+        );
+    }
+    let absent = f.packet([0x55u8; 16]);
+    assert_eq!(
+        package_b_call(
+            &mut f,
+            "IDirect3DSwapChain9::QueryInterface",
+            &[chain, absent, output]
+        ),
+        NO_INTERFACE
+    );
+    assert_eq!(f.m.cpu.read_u32(output).unwrap(), 0);
+    assert_eq!(
+        package_b_call(&mut f, "IDirect3DSwapChain9::Release", &[chain]),
+        0
+    );
+    assert_eq!(package_b_chain(&mut f), chain);
+    f.okay("IDirect3DSwapChain9::GetDevice", &[chain, output]);
+    assert_eq!(f.m.cpu.read_u32(output).unwrap(), f.device);
+    let device = f.device;
+    assert_eq!(
+        package_b_call(&mut f, "IDirect3DDevice9::Release", &[device]),
+        2
+    );
+    assert_eq!(
+        package_b_call(&mut f, "IDirect3DDevice9::Release", &[device]),
+        1
+    );
+    assert_eq!(
+        package_b_call(&mut f, "IDirect3DSwapChain9::Release", &[chain]),
+        0
+    );
+    let e = env(&mut f);
+    assert!(com(&e).get::<Payload>(&e.sys.objects, chain).is_none());
+    assert!(com(&e).get::<Payload>(&e.sys.objects, device).is_none());
+}
+
+// spec: GFX-SWAP-1, GFX-CAP-3
+#[test]
+fn d3d9_package_b_swap_chain_getters_reset_and_excluded_additional_chains() {
+    use adv_abi::types::D3DDISPLAYMODE;
+    let mut f = fixture();
+    let device = f.device;
+    let chain = package_b_chain(&mut f);
+    let output = f.packet(0u32);
+    assert_eq!(
+        package_b_call(
+            &mut f,
+            "IDirect3DDevice9::GetSwapChain",
+            &[device, 1, output]
+        ),
+        INVALID
+    );
+    assert_eq!(f.m.cpu.read_u32(output).unwrap(), 0);
+    assert_eq!(
+        package_b_call(
+            &mut f,
+            "IDirect3DDevice9::CreateAdditionalSwapChain",
+            &[device, 0, output]
+        ),
+        UNAVAILABLE
+    );
+    assert_eq!(f.m.cpu.read_u32(output).unwrap(), 0);
+    f.okay("IDirect3DSwapChain9::GetBackBuffer", &[chain, 0, 0, output]);
+    assert_eq!(f.m.cpu.read_u32(output).unwrap(), f.back);
+    let back = f.back;
+    assert_eq!(
+        package_b_call(&mut f, "IDirect3DSurface9::Release", &[back]),
+        0
+    );
+    assert_eq!(
+        package_b_call(
+            &mut f,
+            "IDirect3DSwapChain9::GetBackBuffer",
+            &[chain, 1, 0, output]
+        ),
+        INVALID
+    );
+    let mode = f.packet(D3DDISPLAYMODE::default());
+    f.okay("IDirect3DSwapChain9::GetDisplayMode", &[chain, mode]);
+    let display = GuestPtr::<D3DDISPLAYMODE>::new(mode)
+        .read(&f.m.cpu)
+        .unwrap();
+    assert_eq!(
+        (display.Width, display.Height, display.RefreshRate),
+        (16, 12, 60)
+    );
+    let parameters = f.packet(D3DPRESENT_PARAMETERS::default());
+    f.okay(
+        "IDirect3DSwapChain9::GetPresentParameters",
+        &[chain, parameters],
+    );
+    let mut p = GuestPtr::<D3DPRESENT_PARAMETERS>::new(parameters)
+        .read(&f.m.cpu)
+        .unwrap();
+    assert_eq!(
+        (p.BackBufferWidth, p.BackBufferHeight, p.BackBufferCount),
+        (16, 12, 1)
+    );
+    p.BackBufferWidth = 8;
+    GuestPtr::new(parameters).write(&mut f.m.cpu, p).unwrap();
+    f.okay("IDirect3DDevice9::Reset", &[f.device, parameters]);
+    assert_eq!(package_b_chain(&mut f), chain);
+    f.okay(
+        "IDirect3DSwapChain9::GetPresentParameters",
+        &[chain, parameters],
+    );
+    assert_eq!(f.m.cpu.read_u32(parameters).unwrap(), 8);
+    f.okay("IDirect3DSwapChain9::GetBackBuffer", &[chain, 0, 0, output]);
+    let new_back = f.m.cpu.read_u32(output).unwrap();
+    assert_ne!(new_back, back);
+    let desc = f.packet(adv_abi::types::D3DSURFACE_DESC::default());
+    f.okay("IDirect3DSurface9::GetDesc", &[new_back, desc]);
+    assert_eq!(
+        GuestPtr::<adv_abi::types::D3DSURFACE_DESC>::new(desc)
+            .read(&f.m.cpu)
+            .unwrap()
+            .Width,
+        8
+    );
+}
+
+// spec: GFX-SWAP-1, GFX-PACE-1, GFX-REC-4
+#[test]
+fn d3d9_package_b_swap_chain_present_preserves_pacing_damage_and_capture_boundary() {
+    let mut results = Vec::new();
+    for swap in [false, true] {
+        let mut f = fixture();
+        let chain = package_b_chain(&mut f);
+        f.m.ext.get_mut::<State>().provider.visible = |_, _, _| Some(true);
+        for color in [0xff112233, 0xff445566, 0xff445566] {
+            clear(&mut f, color);
+            let outcome = if swap {
+                f.call("IDirect3DSwapChain9::Present", &[chain, 0, 0, 0, 0, 0])
+            } else {
+                f.call("IDirect3DDevice9::Present", &[f.device, 0, 0, 0, 0])
+            };
+            let Outcome::Block {
+                wait: Wait::Until(at),
+                then,
+                ..
+            } = outcome
+            else {
+                panic!("refresh wait")
+            };
+            f.m.sys.clock.advance_to(at);
+            assert!(matches!(
+                then(
+                    &mut env(&mut f),
+                    adv_machine::Resume::Woke(adv_machine::WakeReason::Timeout)
+                ),
+                Outcome::Return(0)
+            ));
+        }
+        let p = f.m.ext.get::<Presents>();
+        results.push((
+            p.published.clone(),
+            p.damage.clone(),
+            f.m.sys.clock.now_us(),
+            f.m.ext.get::<State>().frames.eliminated_frames,
+        ));
+        clear(&mut f, 0xff778899);
+        let result = f.call("IDirect3DSwapChain9::GetFrontBufferData", &[chain, 0]);
+        assert!(matches!(result, Outcome::Fail(_)));
+        let owner = id(&mut f);
+        assert!(frame(&mut env(&mut f), owner).commands.is_empty());
+    }
+    assert_eq!(results[0], results[1]);
+    assert_eq!(results[0].3, 1);
+}
+
+// spec: GFX-SWAP-1
+#[test]
+fn d3d9_package_b_swap_chain_raster_status_uses_display_phase() {
+    let mut f = fixture();
+    let chain = package_b_chain(&mut f);
+    let output = f.packet([0u32; 2]);
+    f.m.ext.get_mut::<State>().provider.vsync = |_| {
+        Some((
+            std::time::Duration::from_millis(5),
+            std::time::Duration::from_millis(10),
+        ))
+    };
+    f.okay("IDirect3DSwapChain9::GetRasterStatus", &[chain, output]);
+    assert_eq!(
+        GuestPtr::<[u32; 2]>::new(output).read(&f.m.cpu).unwrap(),
+        [0, 6]
+    );
+    f.m.ext.get_mut::<State>().provider.vsync = |_| {
+        Some((
+            std::time::Duration::from_micros(9900),
+            std::time::Duration::from_millis(10),
+        ))
+    };
+    f.okay("IDirect3DSwapChain9::GetRasterStatus", &[chain, output]);
+    assert_eq!(
+        GuestPtr::<[u32; 2]>::new(output).read(&f.m.cpu).unwrap(),
+        [1, 0]
+    );
+}
+
+// spec: GFX-QUERY-1
+#[test]
+fn d3d9_package_b_query_support_metadata_com_and_device_ownership() {
+    let mut f = fixture();
+    let device = f.device;
+    let before = f.m.sys.objects.object_count();
+    for kind in 0..=19 {
+        assert_eq!(
+            package_b_call(&mut f, "IDirect3DDevice9::CreateQuery", &[device, kind, 0]),
+            if (8..=12).contains(&kind) {
+                0
+            } else {
+                UNAVAILABLE
+            }
+        );
+    }
+    assert_eq!(f.m.sys.objects.object_count(), before);
+    let output = f.packet(0u32);
+    assert_eq!(
+        package_b_call(
+            &mut f,
+            "IDirect3DDevice9::CreateQuery",
+            &[device, 4, output]
+        ),
+        UNAVAILABLE
+    );
+    assert_eq!(f.m.cpu.read_u32(output).unwrap(), 0);
+    let unknown = f.packet(adv_abi::com::IUNKNOWN);
+    let iid = f.packet([
+        0x60u8, 0x14, 0x77, 0xd9, 0x95, 0xa6, 0x26, 0x4f, 0xbb, 0xd3, 0x27, 0xb8, 0x40, 0xb5, 0x41,
+        0xcc,
+    ]);
+    for kind in 8..=12 {
+        let q = package_b_query(&mut f, kind);
+        assert_eq!(
+            package_b_call(&mut f, "IDirect3DQuery9::GetType", &[q]),
+            kind
+        );
+        assert_eq!(
+            package_b_call(&mut f, "IDirect3DQuery9::GetDataSize", &[q]),
+            if kind == 10 || kind == 12 { 8 } else { 4 }
+        );
+        assert_eq!(package_b_call(&mut f, "IDirect3DQuery9::AddRef", &[q]), 2);
+        assert_eq!(package_b_call(&mut f, "IDirect3DQuery9::Release", &[q]), 1);
+        for interface in [iid, unknown] {
+            f.okay("IDirect3DQuery9::QueryInterface", &[q, interface, output]);
+            assert_eq!(f.m.cpu.read_u32(output).unwrap(), q);
+            assert_eq!(package_b_call(&mut f, "IDirect3DQuery9::Release", &[q]), 1);
+        }
+        f.okay("IDirect3DQuery9::GetDevice", &[q, output]);
+        assert_eq!(f.m.cpu.read_u32(output).unwrap(), f.device);
+        let device = f.device;
+        assert_eq!(
+            package_b_call(&mut f, "IDirect3DDevice9::Release", &[device]),
+            2
+        );
+        assert_eq!(package_b_call(&mut f, "IDirect3DQuery9::Release", &[q]), 0);
+    }
+    let q = package_b_query(&mut f, 8);
+    let device = f.device;
+    assert_eq!(
+        package_b_call(&mut f, "IDirect3DDevice9::Release", &[device]),
+        1
+    );
+    f.okay("IDirect3DQuery9::Issue", &[q, 1]);
+    assert_eq!(package_b_call(&mut f, "IDirect3DQuery9::Release", &[q]), 0);
+    let e = env(&mut f);
+    assert!(com(&e).get::<Payload>(&e.sys.objects, device).is_none());
+}
+
+// spec: GFX-QUERY-1, GFX-REC-1
+#[test]
+fn d3d9_package_b_event_tracks_issue_boundary_and_flushes_without_guest_waits() {
+    let mut f = fixture();
+    let q = package_b_query(&mut f, 8);
+    let output = f.packet(0xa5a5a5a5u32);
+    clear(&mut f, 0xff112233);
+    f.okay("IDirect3DQuery9::Issue", &[q, 1]);
+    assert_eq!(
+        package_b_call(&mut f, "IDirect3DQuery9::GetData", &[q, output, 4, 0]),
+        1
+    );
+    assert_eq!(f.m.cpu.read_u32(output).unwrap(), 0xa5a5a5a5);
+    assert_eq!(
+        package_b_call(&mut f, "IDirect3DQuery9::GetData", &[q, 0, 0, 1]),
+        0
+    );
+    f.okay("IDirect3DQuery9::GetData", &[q, output, 4, 0]);
+    assert_eq!(f.m.cpu.read_u32(output).unwrap(), 1);
+    clear(&mut f, 0xff445566);
+    f.okay("IDirect3DQuery9::Issue", &[q, 1]);
+    let result = flush(&mut f, Reason::Readback);
+    assert_eq!(f.finish(result), 0);
+    clear(&mut f, 0xff778899);
+    f.okay("IDirect3DQuery9::GetData", &[q, output, 4, 0]);
+    let owner = id(&mut f);
+    assert_eq!(
+        frame(&mut env(&mut f), owner).commands.len(),
+        1,
+        "later work remains recorded"
+    );
+}
+
+// spec: GFX-QUERY-1, GFX-REC-1
+#[test]
+fn d3d9_package_b_query_flush_busy_preserves_suffix_without_blocking_or_replay() {
+    let mut f = fixture();
+    let q = package_b_query(&mut f, 8);
+    let rt = f.render_target(16, 12, 21);
+    let image = f.image(rt);
+    let frozen =
+        f.m.ext
+            .get_mut::<State>()
+            .gpu
+            .as_mut()
+            .unwrap()
+            .completed_frame(image, 1)
+            .unwrap();
+    let d = draw(&mut f);
+    record_draw(&mut f, d);
+    f.okay("IDirect3DDevice9::SetRenderTarget", &[f.device, 0, rt]);
+    clear(&mut f, 0xff112233);
+    f.okay("IDirect3DQuery9::Issue", &[q, 1]);
+    let before = stats(&f).draws;
+    assert_eq!(
+        package_b_call(&mut f, "IDirect3DQuery9::GetData", &[q, 0, 0, 1]),
+        1
+    );
+    assert_eq!(stats(&f).draws, before + 1);
+    assert!(f.m.ext.get::<State>().pending.is_empty());
+    let owner = id(&mut f);
+    assert!(frame(&mut env(&mut f), owner).active.is_none());
+    drop(frozen);
+    f.okay("IDirect3DQuery9::GetData", &[q, 0, 0, 1]);
+    assert_eq!(stats(&f).draws, before + 1);
+    let image = f.image(rt);
+    assert_eq!(&f.pixels(&image)[..4], &[0x33, 0x22, 0x11, 0xff]);
+}
+
+// spec: GFX-QUERY-1
+#[test]
+fn d3d9_package_b_occlusion_sums_bracketed_target_areas_across_flushes() {
+    let mut f = fixture();
+    let q = package_b_query(&mut f, 9);
+    let other = package_b_query(&mut f, 9);
+    let output = f.packet(0u32);
+    let d = draw(&mut f);
+    record_draw(&mut f, d.clone());
+    f.okay("IDirect3DQuery9::Issue", &[q, 2]);
+    f.okay("IDirect3DQuery9::Issue", &[q, 2]);
+    assert_eq!(
+        package_b_call(&mut f, "IDirect3DQuery9::GetData", &[q, 0, 0, 1]),
+        1
+    );
+    record_draw(&mut f, d.clone());
+    f.okay("IDirect3DQuery9::Issue", &[other, 2]);
+    clear(&mut f, 0xff112233);
+    let result = flush(&mut f, Reason::Readback);
+    assert_eq!(f.finish(result), 0);
+    let rt = f.render_target(4, 3, 21);
+    let mut small = d.clone();
+    small.target = f.target(rt);
+    small.state = DrawState::new(4, 3);
+    record_draw(&mut f, small);
+    f.okay("IDirect3DQuery9::Issue", &[q, 1]);
+    f.okay("IDirect3DQuery9::GetData", &[q, output, 4, 1]);
+    assert_eq!(f.m.cpu.read_u32(output).unwrap(), 16 * 12 + 4 * 3);
+    record_draw(&mut f, d);
+    f.okay("IDirect3DQuery9::Issue", &[other, 1]);
+    f.okay("IDirect3DQuery9::GetData", &[other, output, 4, 1]);
+    assert_eq!(f.m.cpu.read_u32(output).unwrap(), 4 * 3 + 16 * 12);
+    f.okay("IDirect3DQuery9::Issue", &[q, 2]);
+    assert_eq!(package_b_call(&mut f, "IDirect3DQuery9::Release", &[q]), 0);
+    let owner = id(&mut f);
+    let e = env(&mut f);
+    let Some(Payload::Device(d)) = com(&e).get_identity(&e.sys.objects, owner) else {
+        unreachable!()
+    };
+    assert_eq!(d.queries.active, 0);
+}
+
+// spec: GFX-QUERY-1, GFX-REC-2
+#[test]
+fn d3d9_package_b_occlusion_includes_draws_in_elided_frames() {
+    let mut f = fixture();
+    let q = package_b_query(&mut f, 9);
+    let output = f.packet(0u32);
+    f.okay("IDirect3DQuery9::Issue", &[q, 2]);
+    for _ in 0..2 {
+        clear(&mut f, 0xff112233);
+        let d = draw(&mut f);
+        record_draw(&mut f, d);
+        present(&mut f);
+    }
+    f.okay("IDirect3DQuery9::Issue", &[q, 1]);
+    f.okay("IDirect3DQuery9::GetData", &[q, output, 4, 0]);
+    assert_eq!(f.m.cpu.read_u32(output).unwrap(), 2 * 16 * 12);
+    assert_eq!(f.m.ext.get::<State>().frames.eliminated_frames, 1);
+}
+
+// spec: GFX-QUERY-1
+#[test]
+fn d3d9_package_b_timestamps_use_host_monotonic_ticks_frequency_and_no_disjoint() {
+    let mut f = fixture();
+    let timestamp = package_b_query(&mut f, 10);
+    let frequency = package_b_query(&mut f, 12);
+    let disjoint = package_b_query(&mut f, 11);
+    let output = f.packet(0u64);
+    f.okay("IDirect3DQuery9::Issue", &[disjoint, 2]);
+    f.okay("IDirect3DQuery9::Issue", &[timestamp, 1]);
+    f.okay("IDirect3DQuery9::GetData", &[timestamp, output, 8, 0]);
+    let first = GuestPtr::<u64>::new(output).read(&f.m.cpu).unwrap();
+    let clock = f.m.sys.clock.now_us();
+    let start = std::time::Instant::now();
+    while start.elapsed() < std::time::Duration::from_millis(1) {
+        std::hint::spin_loop();
+    }
+    f.okay("IDirect3DQuery9::Issue", &[timestamp, 1]);
+    f.okay("IDirect3DQuery9::GetData", &[timestamp, output, 8, 0]);
+    let second = GuestPtr::<u64>::new(output).read(&f.m.cpu).unwrap();
+    assert!(second - first >= 1_000_000);
+    assert_eq!(f.m.sys.clock.now_us(), clock);
+    f.okay("IDirect3DQuery9::Issue", &[frequency, 1]);
+    f.okay("IDirect3DQuery9::GetData", &[frequency, output, 8, 0]);
+    assert_eq!(
+        GuestPtr::<u64>::new(output).read(&f.m.cpu).unwrap(),
+        1_000_000_000
+    );
+    f.okay("IDirect3DQuery9::Issue", &[disjoint, 1]);
+    f.okay("IDirect3DQuery9::GetData", &[disjoint, output, 4, 0]);
+    assert_eq!(f.m.cpu.read_u32(output).unwrap(), 0);
+}
+
+// spec: GFX-QUERY-1
+#[test]
+fn d3d9_package_b_query_rejects_invalid_issue_and_data_arguments() {
+    let mut f = fixture();
+    let q = package_b_query(&mut f, 8);
+    let output = f.packet(0xa5a5a5a5u32);
+    for flags in [0, 2, 3, 4] {
+        assert_eq!(
+            package_b_call(&mut f, "IDirect3DQuery9::Issue", &[q, flags]),
+            INVALID
+        );
+    }
+    for (pointer, size, flags) in [
+        (0, 4, 0),
+        (output, 1, 0),
+        (output, 8, 0),
+        (output, 4, 2),
+        (1, 4, 0),
+    ] {
+        assert_eq!(
+            package_b_call(
+                &mut f,
+                "IDirect3DQuery9::GetData",
+                &[q, pointer, size, flags]
+            ),
+            INVALID
+        );
+    }
+    assert_eq!(f.m.cpu.read_u32(output).unwrap(), 0xa5a5a5a5);
+    f.okay("IDirect3DQuery9::GetData", &[q, 0, 0, 0]);
+}

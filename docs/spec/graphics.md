@@ -164,6 +164,39 @@ Damage clipping remains a conservative region optimization under GFX-REC-4/5.
 **Rule**: Present boundaries MUST fall on host vsyncs, and a late Present MUST wait for the next one without repaying missed frames. At display rates within 1% of a whole multiple of the guest rate, on-time boundaries MUST be exactly that many vsyncs apart. Other rates MUST snap the guest's rational cadence to the nearest vsync after now.
 **Verification**: Test
 
+### GFX-SWAP-1 Implicit swap chain
+
+**Rule**: `GetSwapChain(0)` MUST return one stable, AddRef'd `IDirect3DSwapChain9` identity retained internally until device destruction. Its presentation, backbuffer, display mode and front-buffer capture methods MUST use the device's existing behavior, including pacing and damage. Higher indices MUST return `D3DERR_INVALIDCALL`, and additional swap chains MUST return `D3DERR_NOTAVAILABLE`.
+**Verification**: Test
+
+`QueryInterface` supports `IUnknown` and `IDirect3DSwapChain9`. Public references
+retain the device; `GetDevice` adds a device reference. `GetPresentParameters`
+returns the normalized device parameters, including after Reset. `GetRasterStatus`
+uses the host display phase, or machine-clock refresh phase, with one modeled
+blanking line after the visible rows. Nonzero Present flags are unsupported.
+Front-buffer capture retains the device method's unsupported failure contract.
+
+### GFX-QUERY-1 Nonblocking queries
+
+**Rule**: `CreateQuery` MUST support EVENT, OCCLUSION, TIMESTAMP, TIMESTAMPFREQ and TIMESTAMPDISJOINT, including support probes with a null output pointer. `GetData` MUST return `S_FALSE` until issued recording work is submitted, with `D3DGETDATA_FLUSH` attempting submission without blocking the guest thread. Other query types MUST return `D3DERR_NOTAVAILABLE`.
+**Verification**: Test
+**Basis**: Microsoft Direct3D 9 [queries](https://learn.microsoft.com/en-us/windows/win32/direct3d9/queries).
+
+| Query | Issue flags | Result |
+|---|---|---|
+| EVENT | END | BOOL TRUE after submission of work recorded through Issue. |
+| OCCLUSION | BEGIN, END | DWORD sum of render-target pixel areas for accepted draws inside the bracket, rather than depth-tested fragment counts. Clears and copies do not contribute. |
+| TIMESTAMP | END | UINT64 host monotonic nanoseconds, sampled at Issue. |
+| TIMESTAMPFREQ | END | UINT64 frequency of 1,000,000,000 Hz. |
+| TIMESTAMPDISJOINT | BEGIN, END | BOOL FALSE. |
+
+Queries expose their type, data size and AddRef'd owning device through COM.
+Repeated BEGIN restarts the bracket; GetData during a bracket returns S_FALSE.
+Zero-size GetData polls status without copying data. Nonzero sizes match the
+query's data size, and only zero or D3DGETDATA_FLUSH is accepted for GetData flags.
+New queries are signaled with an unspecified initial answer. Completed queries
+retain their answer until reissued; later recorded work does not delay them.
+
 ## Capabilities
 
 ### GFX-CAP-1 Honest capabilities
@@ -178,7 +211,7 @@ Damage clipping remains a conservative region optimization under GFX-REC-4/5.
 
 ### GFX-CAP-3 Excluded resources
 
-**Rule**: Shader Model 4+, D3D10/11, geometry and tessellation shaders, N-patches, and shader ProcessVertices MUST remain unsupported. Cube textures, volume textures, extra MRTs, and software-VP large constants MUST NOT be advertised as implemented.
+**Rule**: Shader Model 4+, D3D10/11, geometry and tessellation shaders, N-patches, and shader ProcessVertices MUST remain unsupported. Cube textures, volume textures, additional swap chains, extra MRTs, and software-VP large constants MUST NOT be advertised as implemented.
 **Verification**: Test
 
 ## Shaders and state
