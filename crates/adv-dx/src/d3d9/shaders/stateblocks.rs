@@ -344,13 +344,16 @@ pub(in crate::d3d9) fn register(registry: &mut Registry) {
         block_release_ABI,
         block_device_ABI,
         super::super::unchanged::unless_unchanged!(
-            capture_ABI,
+            with_private_releases!(capture_ABI),
             super::super::unchanged::state_block
         ),
-        super::super::unchanged::unless_unchanged!(apply_ABI, super::super::unchanged::state_block),
+        super::super::unchanged::unless_unchanged!(
+            with_private_releases!(apply_ABI),
+            super::super::unchanged::state_block
+        ),
         create_ABI,
         begin_ABI,
-        end_ABI,
+        with_private_releases!(end_ABI),
     ] {
         registry.register(api);
     }

@@ -1,8 +1,10 @@
-//! Cursor requests fail explicitly until the presenter can carry cursor images.
+//! Custom cursor images fail explicitly until the presenter can carry them.
 use super::*;
 
 pub(super) fn register(registry: &mut Registry) {
     registry.register(properties_ABI);
+    registry.register(show_ABI);
+    registry.register(position_ABI);
 }
 
 #[win32(d3d9,name="IDirect3DDevice9::SetCursorProperties",level=safe_fail)]
@@ -52,3 +54,25 @@ fn properties(
 
 #[cfg(test)]
 mod tests;
+
+#[win32(d3d9, name = "IDirect3DDevice9::ShowCursor", level = implement)]
+fn show(env: &mut Env<'_>, this: GuestPtr<()>, visible: i32) -> i32 {
+    let Some(d) = device_mut(env, this.addr()) else {
+        return 0;
+    };
+    i32::from(std::mem::replace(&mut d.misc.cursor_visible, visible != 0))
+}
+#[win32(d3d9, name = "IDirect3DDevice9::SetCursorPosition", level = implement)]
+fn position(env: &mut Env<'_>, this: GuestPtr<()>, x: i32, y: i32, flags: u32) {
+    if flags & !1 != 0 {
+        adv_abi::warn_unavailable(
+            env,
+            "IDirect3DDevice9::SetCursorPosition",
+            "cursor flags other than D3DCURSOR_IMMEDIATE_UPDATE are unsupported",
+        );
+        return;
+    }
+    if let Some(d) = device_mut(env, this.addr()) {
+        d.misc.cursor_position = (x, y);
+    }
+}

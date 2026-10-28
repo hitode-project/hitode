@@ -278,8 +278,9 @@ pub(super) fn copy(
     filter: adv_device::gpu::Filter,
 ) -> Result<(), adv_device::gpu::Error> {
     use adv_device::gpu::{AlphaMode, DrawState, Filter, TextureOp, Vertex};
-    if source.alpha_mode() != AlphaMode::Opaque
-        || destination.image.alpha_mode() != AlphaMode::Stored
+    if (source.alpha_mode() != AlphaMode::Opaque
+        || destination.image.alpha_mode() != AlphaMode::Stored)
+        && ((from.w, from.h) == (to.w, to.h) || filter == Filter::Linear)
     {
         return gpu.blit(source, from, &destination.image, to, filter);
     }

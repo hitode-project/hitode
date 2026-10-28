@@ -181,6 +181,22 @@ Damage clipping remains a conservative region optimization under GFX-REC-4/5.
 **Rule**: Shader Model 4+, D3D10/11, geometry and tessellation shaders, N-patches, and shader ProcessVertices MUST remain unsupported. Cube textures, volume textures, extra MRTs, and software-VP large constants MUST NOT be advertised as implemented.
 **Verification**: Test
 
+### GFX-RES-1 Resource common methods
+
+**Rule**: Resource interfaces MUST share per-object private data, priority, device ownership, and type queries. Private interface pointers MUST receive reference transfers on storage, retrieval, replacement, freeing, and object destruction. Stored-only device state MUST round-trip without changing rendered output.
+**Verification**: Test
+
+| State or operation | Contract |
+|---|---|
+| Private data | GUID keys own copied bytes or a `D3DSPD_IUNKNOWN` interface; insufficient buffers return `D3DERR_MOREDATA` and the required size; null outputs query size successfully. |
+| Priority | SetPriority returns the previous value; default-pool resources always return zero. PreLoad is a no-op. |
+| Device and parent queries | GetDevice and GetDirect3D return AddRef'd interfaces; resource type matches the concrete object. |
+| Texture levels | GetLevelCount reports the stored mip count, or one for AUTOGENMIPMAP. Managed LOD clamps to the mip range and returns its previous value; other pools return zero. |
+| Mipmap generation | The default filter is LINEAR; POINT and LINEAR round-trip. GenerateMipSubLevels regenerates AUTOGENMIPMAP chains from level zero; other textures and single-level chains are unchanged. |
+| Device queries | One swap chain, no vertical blank, scanline zero; ValidateDevice reports one pass or the existing unsupported-stage error. |
+| Stored-only state | Gamma ramps, clip status, palettes, current palette, cursor visibility and cursor position belong to the device. ShowCursor returns previous visibility. |
+| Exclusions | Software rasterizer registration returns `D3DERR_NOTAVAILABLE`; P8 textures and GFX-CAP-3 exclusions remain unsupported. |
+
 ## Shaders and state
 
 ### GFX-SHADER-1 Bounded bytecode

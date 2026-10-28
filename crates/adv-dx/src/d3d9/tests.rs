@@ -58,6 +58,7 @@ fn machine_with_limits(native: bool, references: u32) -> Machine<JitCpu> {
         gpu: None,
         provider,
         pending: Vec::new(),
+        private_releases: Vec::new(),
         transfers: Vec::new(),
         dcs: Vec::new(),
         sender: None,
@@ -147,6 +148,7 @@ pub(super) fn setup(env: &mut Env<'_>) -> (u32, Id, u32, Id) {
             frame: recording::Recording::default(),
             gpu_lost: false,
             boundary: None,
+            misc: Misc::default(),
         })),
     )
     .unwrap();
@@ -177,6 +179,8 @@ pub(super) fn setup(env: &mut Env<'_>) -> (u32, Id, u32, Id) {
             levels: Vec::new(),
             level: 0,
             lod: 0,
+            common: resources::Common::default(),
+            auto_filter: 2,
         },
     )
     .unwrap();
@@ -525,4 +529,812 @@ pub(super) fn test_allocator() -> crate::interop::GuestAllocator {
 }
 pub(super) fn test_dc() -> crate::interop::MemoryDc {
     crate::test_support::dc::provider()
+}
+
+mod package_a {
+    use super::*;
+    use adv_cpu::backend::{Guest, Reg};
+    use adv_machine::Resume;
+
+    const STACK: u32 = 0x550000;
+    const ADD: u32 = 0x410000;
+    const RELEASE: u32 = 0x410004;
+
+    fn fixture() -> (Machine<JitCpu>, Registry, u32) {
+        let mut m = machine_with_limits(false, u32::MAX);
+        m.cpu.map(STACK, 4096, Prot::RW).unwrap();
+        let (device, _, _, _) = setup(&mut env(&mut m));
+        let mut registry = Registry::default();
+        super::super::register(&mut registry);
+        (m, registry, device)
+    }
+    fn env(m: &mut Machine<JitCpu>) -> Env<'_> {
+        Env {
+            context: m.sys.current,
+            cpu: &mut m.cpu,
+            sys: &mut m.sys,
+            ext: &mut m.ext,
+            thunk: 0,
+        }
+    }
+    fn packet<T: bytemuck::Pod>(m: &mut Machine<JitCpu>, value: T) -> u32 {
+        let mut e = env(m);
+        let pointer = alloc(&mut e, std::mem::size_of::<T>() as u32).unwrap();
+        GuestPtr::new(pointer).write(e.cpu, value).unwrap();
+        pointer
+    }
+    fn call(m: &mut Machine<JitCpu>, registry: &Registry, name: &str, args: &[u32]) -> Outcome {
+        m.cpu.set_reg(Reg::Esp, STACK);
+        m.cpu.write_u32(STACK, 0).unwrap();
+        for (i, &arg) in args.iter().enumerate() {
+            m.cpu.write_u32(STACK + 4 + i as u32 * 4, arg).unwrap();
+        }
+        (registry.get("d3d9.dll", name).unwrap().handler)(&mut env(m))
+    }
+    // Model an application-owned IUnknown at its vtable boundary. This checks
+    // actual requested calls, including callbacks made by object destruction.
+    fn finish(m: &mut Machine<JitCpu>, outcome: Outcome) -> u32 {
+        match outcome {
+            Outcome::Return(value) => value,
+            Outcome::Call {
+                target, args, then, ..
+            } => {
+                assert_eq!(args.len(), 1);
+                let count = m.cpu.read_u32(args[0] + 4).unwrap();
+                let count = match target {
+                    ADD => count + 1,
+                    RELEASE => count - 1,
+                    _ => panic!("unexpected COM method"),
+                };
+                m.cpu.write_u32(args[0] + 4, count).unwrap();
+                let next = then(&mut env(m), Resume::Returned(count));
+                finish(m, next)
+            }
+            _ => panic!("unexpected wait"),
+        }
+    }
+    fn result(m: &mut Machine<JitCpu>, registry: &Registry, name: &str, args: &[u32]) -> u32 {
+        let outcome = call(m, registry, name, args);
+        finish(m, outcome)
+    }
+    fn surface(m: &mut Machine<JitCpu>, registry: &Registry, device: u32, pool: u32) -> u32 {
+        let output = packet(m, 0u32);
+        assert_eq!(
+            result(
+                m,
+                registry,
+                "IDirect3DDevice9::CreateOffscreenPlainSurface",
+                &[device, 1, 1, 21, pool, output, 0]
+            ),
+            0
+        );
+        m.cpu.read_u32(output).unwrap()
+    }
+
+    // spec: GFX-RES-1
+    #[test]
+    fn package_a_resource_interfaces_share_implementations() {
+        let (_, registry, _) = fixture();
+        assert!(registry.signature_conflicts().is_empty());
+        for method in [
+            "GetDevice",
+            "GetType",
+            "SetPrivateData",
+            "GetPrivateData",
+            "FreePrivateData",
+            "SetPriority",
+            "GetPriority",
+            "PreLoad",
+        ] {
+            let handler = registry
+                .get("d3d9.dll", &format!("IDirect3DResource9::{method}"))
+                .unwrap()
+                .handler as usize;
+            for interface in [
+                "IDirect3DSurface9",
+                "IDirect3DTexture9",
+                "IDirect3DBaseTexture9",
+                "IDirect3DVertexBuffer9",
+                "IDirect3DIndexBuffer9",
+            ] {
+                assert_eq!(
+                    registry
+                        .get("d3d9.dll", &format!("{interface}::{method}"))
+                        .unwrap()
+                        .handler as usize,
+                    handler
+                );
+            }
+        }
+        for method in [
+            "SetLOD",
+            "GetLOD",
+            "GetLevelCount",
+            "SetAutoGenFilterType",
+            "GetAutoGenFilterType",
+            "GenerateMipSubLevels",
+        ] {
+            assert_eq!(
+                registry
+                    .get("d3d9.dll", &format!("IDirect3DBaseTexture9::{method}"))
+                    .unwrap()
+                    .handler as usize,
+                registry
+                    .get("d3d9.dll", &format!("IDirect3DTexture9::{method}"))
+                    .unwrap()
+                    .handler as usize
+            );
+        }
+    }
+
+    // spec: GFX-RES-1
+    #[test]
+    fn package_a_private_bytes_copy_resize_replace_and_isolate() {
+        let (mut m, registry, device) = fixture();
+        let a = surface(&mut m, &registry, device, 2);
+        let b = surface(&mut m, &registry, device, 2);
+        let guid = packet(&mut m, [7u8; 16]);
+        let data = packet(&mut m, [1u8, 2, 3, 4]);
+        let output = packet(&mut m, [9u8; 8]);
+        let size = packet(&mut m, 2u32);
+        assert_eq!(
+            result(
+                &mut m,
+                &registry,
+                "IDirect3DSurface9::SetPrivateData",
+                &[a, guid, data, 4, 0]
+            ),
+            0
+        );
+        m.cpu.write_u32(data, 0).unwrap();
+        assert_eq!(
+            result(
+                &mut m,
+                &registry,
+                "IDirect3DResource9::GetPrivateData",
+                &[a, guid, output, size]
+            ),
+            0x88760867
+        );
+        assert_eq!(m.cpu.read_u32(size).unwrap(), 4);
+        assert_eq!(m.cpu.read_u32(output).unwrap(), 0x09090909);
+        assert_eq!(
+            result(
+                &mut m,
+                &registry,
+                "IDirect3DSurface9::GetPrivateData",
+                &[a, guid, 0, size]
+            ),
+            0
+        );
+        m.cpu.write_u32(size, 8).unwrap();
+        assert_eq!(
+            result(
+                &mut m,
+                &registry,
+                "IDirect3DSurface9::GetPrivateData",
+                &[a, guid, output, size]
+            ),
+            0
+        );
+        assert_eq!(m.cpu.read_u32(output).unwrap(), 0x04030201);
+        assert_eq!(m.cpu.read_u32(size).unwrap(), 4);
+        assert_eq!(
+            result(
+                &mut m,
+                &registry,
+                "IDirect3DSurface9::GetPrivateData",
+                &[b, guid, output, size]
+            ),
+            0x88760866
+        );
+        assert_eq!(
+            result(
+                &mut m,
+                &registry,
+                "IDirect3DResource9::SetPrivateData",
+                &[a, guid, data, 1, 0]
+            ),
+            0
+        );
+        assert_eq!(
+            result(
+                &mut m,
+                &registry,
+                "IDirect3DSurface9::GetPrivateData",
+                &[a, guid, output, size]
+            ),
+            0
+        );
+        assert_eq!(m.cpu.read_u32(size).unwrap(), 1);
+        assert_eq!(
+            result(
+                &mut m,
+                &registry,
+                "IDirect3DSurface9::FreePrivateData",
+                &[a, guid]
+            ),
+            0
+        );
+        assert_eq!(
+            result(
+                &mut m,
+                &registry,
+                "IDirect3DSurface9::FreePrivateData",
+                &[a, guid]
+            ),
+            0x88760866
+        );
+    }
+
+    // spec: GFX-RES-1
+    #[test]
+    fn package_a_private_unknown_transfers_refs_and_dies_with_resource() {
+        let (mut m, registry, device) = fixture();
+        let resource = surface(&mut m, &registry, device, 2);
+        let guid = packet(&mut m, [3u8; 16]);
+        let table = packet(&mut m, [0u32, ADD, RELEASE]);
+        let unknown = packet(&mut m, [table, 1u32]);
+        let size = packet(&mut m, 4u32);
+        let output = packet(&mut m, 0u32);
+        assert_eq!(
+            result(
+                &mut m,
+                &registry,
+                "IDirect3DSurface9::SetPrivateData",
+                &[resource, guid, unknown, 4, 1]
+            ),
+            0
+        );
+        assert_eq!(m.cpu.read_u32(unknown + 4).unwrap(), 2);
+        m.cpu.write_u32(size, 0).unwrap();
+        assert_eq!(
+            result(
+                &mut m,
+                &registry,
+                "IDirect3DSurface9::GetPrivateData",
+                &[resource, guid, output, size]
+            ),
+            0x88760867
+        );
+        assert_eq!(m.cpu.read_u32(unknown + 4).unwrap(), 2);
+        assert_eq!(
+            result(
+                &mut m,
+                &registry,
+                "IDirect3DSurface9::GetPrivateData",
+                &[resource, guid, output, size]
+            ),
+            0
+        );
+        assert_eq!(m.cpu.read_u32(output).unwrap(), unknown);
+        assert_eq!(m.cpu.read_u32(unknown + 4).unwrap(), 3);
+        assert_eq!(
+            result(
+                &mut m,
+                &registry,
+                "IDirect3DSurface9::SetPrivateData",
+                &[resource, guid, unknown, 4, 1]
+            ),
+            0
+        );
+        assert_eq!(m.cpu.read_u32(unknown + 4).unwrap(), 3);
+        assert_eq!(
+            result(
+                &mut m,
+                &registry,
+                "IDirect3DSurface9::FreePrivateData",
+                &[resource, guid]
+            ),
+            0
+        );
+        assert_eq!(m.cpu.read_u32(unknown + 4).unwrap(), 2);
+        assert_eq!(
+            result(
+                &mut m,
+                &registry,
+                "IDirect3DSurface9::SetPrivateData",
+                &[resource, guid, unknown, 4, 1]
+            ),
+            0
+        );
+        assert_eq!(
+            result(&mut m, &registry, "IDirect3DSurface9::Release", &[resource]),
+            0
+        );
+        assert_eq!(m.cpu.read_u32(unknown + 4).unwrap(), 2);
+        assert!(resources::resource(&env(&mut m), resource).is_none());
+        assert!(m.ext.get::<State>().private_releases.is_empty());
+    }
+
+    // spec: GFX-RES-1
+    #[test]
+    fn package_a_private_unknown_survives_until_last_buffer_binding() {
+        let (mut m, registry, device) = fixture();
+        let output = packet(&mut m, 0u32);
+        assert_eq!(
+            result(
+                &mut m,
+                &registry,
+                "IDirect3DDevice9::CreateVertexBuffer",
+                &[device, 16, 0, 0, 1, output, 0]
+            ),
+            0
+        );
+        let buffer = m.cpu.read_u32(output).unwrap();
+        let guid = packet(&mut m, [2u8; 16]);
+        let table = packet(&mut m, [0u32, ADD, RELEASE]);
+        let unknown = packet(&mut m, [table, 1u32]);
+        assert_eq!(
+            result(
+                &mut m,
+                &registry,
+                "IDirect3DVertexBuffer9::SetPrivateData",
+                &[buffer, guid, unknown, 4, 1]
+            ),
+            0
+        );
+        assert_eq!(
+            result(
+                &mut m,
+                &registry,
+                "IDirect3DDevice9::SetStreamSource",
+                &[device, 0, buffer, 0, 4]
+            ),
+            0
+        );
+        assert_eq!(
+            result(
+                &mut m,
+                &registry,
+                "IDirect3DVertexBuffer9::Release",
+                &[buffer]
+            ),
+            0
+        );
+        assert_eq!(m.cpu.read_u32(unknown + 4).unwrap(), 2);
+        assert!(buffers::buffer(&env(&mut m), buffer).is_some());
+        assert_eq!(
+            result(
+                &mut m,
+                &registry,
+                "IDirect3DDevice9::SetStreamSource",
+                &[device, 0, 0, 0, 0]
+            ),
+            0
+        );
+        assert_eq!(m.cpu.read_u32(unknown + 4).unwrap(), 1);
+        assert!(buffers::buffer(&env(&mut m), buffer).is_none());
+        assert!(m.ext.get::<State>().private_releases.is_empty());
+    }
+
+    // spec: GFX-RES-1
+    #[test]
+    fn package_a_priority_and_device_queries_cover_surfaces_and_buffers() {
+        let (mut m, registry, device) = fixture();
+        let surface = surface(&mut m, &registry, device, 2);
+        let output = packet(&mut m, 0u32);
+        assert_eq!(
+            result(
+                &mut m,
+                &registry,
+                "IDirect3DDevice9::CreateVertexBuffer",
+                &[device, 16, 0, 0, 1, output, 0]
+            ),
+            0
+        );
+        let vertex = m.cpu.read_u32(output).unwrap();
+        assert_eq!(
+            result(
+                &mut m,
+                &registry,
+                "IDirect3DDevice9::CreateIndexBuffer",
+                &[device, 16, 0, 101, 0, output, 0]
+            ),
+            0
+        );
+        let index = m.cpu.read_u32(output).unwrap();
+        for (pointer, interface, kind, previous) in [
+            (surface, "IDirect3DSurface9", 1, 7),
+            (vertex, "IDirect3DVertexBuffer9", 6, 7),
+            (index, "IDirect3DIndexBuffer9", 7, 0),
+        ] {
+            assert_eq!(
+                result(
+                    &mut m,
+                    &registry,
+                    &format!("{interface}::GetType"),
+                    &[pointer]
+                ),
+                kind
+            );
+            assert_eq!(
+                result(
+                    &mut m,
+                    &registry,
+                    &format!("{interface}::SetPriority"),
+                    &[pointer, 7]
+                ),
+                0
+            );
+            assert_eq!(
+                result(
+                    &mut m,
+                    &registry,
+                    &format!("{interface}::GetPriority"),
+                    &[pointer]
+                ),
+                previous
+            );
+            assert_eq!(
+                result(
+                    &mut m,
+                    &registry,
+                    &format!("{interface}::SetPriority"),
+                    &[pointer, 9]
+                ),
+                previous
+            );
+            assert_eq!(
+                result(
+                    &mut m,
+                    &registry,
+                    &format!("{interface}::PreLoad"),
+                    &[pointer]
+                ),
+                0
+            );
+            let id = com(&env(&mut m))
+                .identity::<Payload>(&m.sys.objects, device)
+                .unwrap();
+            let before = m
+                .ext
+                .get::<State>()
+                .com
+                .references(&m.sys.objects, id)
+                .unwrap();
+            assert_eq!(
+                result(
+                    &mut m,
+                    &registry,
+                    &format!("{interface}::GetDevice"),
+                    &[pointer, output]
+                ),
+                0
+            );
+            assert_eq!(m.cpu.read_u32(output).unwrap(), device);
+            assert_eq!(
+                m.ext.get::<State>().com.references(&m.sys.objects, id),
+                Some(before + 1)
+            );
+            release(&mut env(&mut m), device);
+        }
+    }
+
+    // spec: GFX-RES-1
+    #[test]
+    fn package_a_device_parent_raster_and_software_registration() {
+        let (mut m, registry, device) = fixture();
+        let output = packet(&mut m, [9u32; 2]);
+        let factory = super::super::device(&env(&mut m), device).unwrap().factory;
+        let before = m
+            .ext
+            .get::<State>()
+            .com
+            .references(&m.sys.objects, factory)
+            .unwrap();
+        assert_eq!(
+            result(
+                &mut m,
+                &registry,
+                "IDirect3DDevice9::GetDirect3D",
+                &[device, output]
+            ),
+            0
+        );
+        let parent = m.cpu.read_u32(output).unwrap();
+        assert_eq!(
+            m.ext.get::<State>().com.references(&m.sys.objects, factory),
+            Some(before + 1)
+        );
+        assert_eq!(
+            result(
+                &mut m,
+                &registry,
+                "IDirect3DDevice9::GetNumberOfSwapChains",
+                &[device]
+            ),
+            1
+        );
+        assert_eq!(
+            result(
+                &mut m,
+                &registry,
+                "IDirect3DDevice9::GetRasterStatus",
+                &[device, 0, output]
+            ),
+            0
+        );
+        assert_eq!(
+            GuestPtr::<[u32; 2]>::new(output).read(&m.cpu).unwrap(),
+            [0, 0]
+        );
+        assert_eq!(
+            result(
+                &mut m,
+                &registry,
+                "IDirect3DDevice9::GetRasterStatus",
+                &[device, 1, output]
+            ),
+            UNAVAILABLE
+        );
+        assert_eq!(
+            result(
+                &mut m,
+                &registry,
+                "IDirect3D9::RegisterSoftwareDevice",
+                &[parent, 0]
+            ),
+            UNAVAILABLE
+        );
+    }
+
+    // spec: GFX-RES-1
+    #[test]
+    fn package_a_validate_device_matches_unsupported_stage_state() {
+        let (mut m, registry, device) = fixture();
+        let output = packet(&mut m, 99u32);
+        assert_eq!(
+            result(
+                &mut m,
+                &registry,
+                "IDirect3DDevice9::ValidateDevice",
+                &[device, output]
+            ),
+            0
+        );
+        assert_eq!(m.cpu.read_u32(output).unwrap(), 1);
+        for (kind, value) in [(1, 2), (2, 0x12)] {
+            assert_eq!(
+                result(
+                    &mut m,
+                    &registry,
+                    "IDirect3DDevice9::SetTextureStageState",
+                    &[device, 1, kind, value]
+                ),
+                0
+            );
+        }
+        assert_eq!(
+            result(
+                &mut m,
+                &registry,
+                "IDirect3DDevice9::ValidateDevice",
+                &[device, output]
+            ),
+            UNAVAILABLE
+        );
+        assert_eq!(
+            result(
+                &mut m,
+                &registry,
+                "IDirect3DDevice9::SetTextureStageState",
+                &[device, 1, 1, 1]
+            ),
+            0
+        );
+        assert_eq!(
+            result(
+                &mut m,
+                &registry,
+                "IDirect3DDevice9::ValidateDevice",
+                &[device, output]
+            ),
+            0
+        );
+    }
+
+    // spec: GFX-RES-1
+    #[test]
+    fn package_a_gamma_ramp_roundtrips_without_gpu_work() {
+        let (mut m, registry, device) = fixture();
+        let output = packet(&mut m, [[0u16; 256]; 3]);
+        assert_eq!(
+            result(
+                &mut m,
+                &registry,
+                "IDirect3DDevice9::GetGammaRamp",
+                &[device, 0, output]
+            ),
+            0
+        );
+        let gamma = GuestPtr::<[[u16; 256]; 3]>::new(output)
+            .read(&m.cpu)
+            .unwrap();
+        assert_eq!(gamma, [std::array::from_fn(|i| i as u16 * 257); 3]);
+        let changed = [std::array::from_fn(|i| (255 - i) as u16 * 193); 3];
+        let input = packet(&mut m, changed);
+        assert_eq!(
+            result(
+                &mut m,
+                &registry,
+                "IDirect3DDevice9::SetGammaRamp",
+                &[device, 0, 1, input]
+            ),
+            0
+        );
+        assert_eq!(
+            result(
+                &mut m,
+                &registry,
+                "IDirect3DDevice9::GetGammaRamp",
+                &[device, 0, output]
+            ),
+            0
+        );
+        assert_eq!(
+            GuestPtr::<[[u16; 256]; 3]>::new(output)
+                .read(&m.cpu)
+                .unwrap(),
+            changed
+        );
+        assert!(m.ext.get::<State>().pending.is_empty());
+    }
+
+    // spec: GFX-RES-1
+    #[test]
+    fn package_a_clip_status_roundtrips() {
+        let (mut m, registry, device) = fixture();
+        let output = packet(&mut m, [0u32; 2]);
+        assert_eq!(
+            result(
+                &mut m,
+                &registry,
+                "IDirect3DDevice9::GetClipStatus",
+                &[device, output]
+            ),
+            0
+        );
+        assert_eq!(
+            GuestPtr::<[u32; 2]>::new(output).read(&m.cpu).unwrap(),
+            [0, u32::MAX]
+        );
+        let input = packet(&mut m, [0x35u32, 0x10]);
+        assert_eq!(
+            result(
+                &mut m,
+                &registry,
+                "IDirect3DDevice9::SetClipStatus",
+                &[device, input]
+            ),
+            0
+        );
+        assert_eq!(
+            result(
+                &mut m,
+                &registry,
+                "IDirect3DDevice9::GetClipStatus",
+                &[device, output]
+            ),
+            0
+        );
+        assert_eq!(
+            GuestPtr::<[u32; 2]>::new(output).read(&m.cpu).unwrap(),
+            [0x35, 0x10]
+        );
+    }
+
+    // spec: GFX-RES-1
+    #[test]
+    fn package_a_palette_entries_and_selection_roundtrip() {
+        let (mut m, registry, device) = fixture();
+        let output = packet(&mut m, [0u32; 256]);
+        assert_eq!(
+            result(
+                &mut m,
+                &registry,
+                "IDirect3DDevice9::GetPaletteEntries",
+                &[device, 3, output]
+            ),
+            0
+        );
+        assert_eq!(
+            GuestPtr::<[u32; 256]>::new(output).read(&m.cpu).unwrap(),
+            [u32::MAX; 256]
+        );
+        let entries = std::array::from_fn(|i| 0xff000000 | i as u32 * 0x010101);
+        let input = packet(&mut m, entries);
+        assert_eq!(
+            result(
+                &mut m,
+                &registry,
+                "IDirect3DDevice9::SetPaletteEntries",
+                &[device, 3, input]
+            ),
+            0
+        );
+        assert_eq!(
+            result(
+                &mut m,
+                &registry,
+                "IDirect3DDevice9::SetCurrentTexturePalette",
+                &[device, 3]
+            ),
+            0
+        );
+        assert_eq!(
+            result(
+                &mut m,
+                &registry,
+                "IDirect3DDevice9::GetCurrentTexturePalette",
+                &[device, output]
+            ),
+            0
+        );
+        assert_eq!(m.cpu.read_u32(output).unwrap(), 3);
+        assert_eq!(
+            result(
+                &mut m,
+                &registry,
+                "IDirect3DDevice9::GetPaletteEntries",
+                &[device, 3, output]
+            ),
+            0
+        );
+        assert_eq!(
+            GuestPtr::<[u32; 256]>::new(output).read(&m.cpu).unwrap(),
+            entries
+        );
+        assert_eq!(
+            result(
+                &mut m,
+                &registry,
+                "IDirect3DDevice9::SetCurrentTexturePalette",
+                &[device, 65536]
+            ),
+            UNAVAILABLE
+        );
+        assert_eq!(
+            result(
+                &mut m,
+                &registry,
+                "IDirect3DDevice9::CreateTexture",
+                &[device, 1, 1, 1, 0, 41, 2, output, 0]
+            ),
+            UNAVAILABLE
+        );
+    }
+
+    // spec: GFX-RES-1
+    #[test]
+    fn package_a_cursor_visibility_returns_previous_state_and_stores_position() {
+        let (mut m, registry, device) = fixture();
+        for (visible, previous) in [(1, 0), (7, 1), (0, 1), (0, 0)] {
+            assert_eq!(
+                result(
+                    &mut m,
+                    &registry,
+                    "IDirect3DDevice9::ShowCursor",
+                    &[device, visible]
+                ),
+                previous
+            );
+        }
+        assert_eq!(
+            result(
+                &mut m,
+                &registry,
+                "IDirect3DDevice9::SetCursorPosition",
+                &[device, (-8i32) as u32, 17, 1]
+            ),
+            0
+        );
+        assert_eq!(
+            super::super::device(&env(&mut m), device)
+                .unwrap()
+                .misc
+                .cursor_position,
+            (-8, 17)
+        );
+    }
 }

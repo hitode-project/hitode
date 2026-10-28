@@ -27,6 +27,7 @@ pub(super) struct Buffer {
     pub format: i32,
     pub fvf: u32,
     pub locks: u32,
+    pub common: resources::Common,
 }
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct Stream {
@@ -52,21 +53,23 @@ pub(super) fn register(registry: &mut Registry) {
         create_index_ABI,
         vertex_desc_ABI,
         index_desc_ABI,
-        vertex_device_ABI,
-        index_device_ABI,
-        vertex_type_ABI,
-        index_type_ABI,
         vertex_lock_ABI,
         index_lock_ABI,
         vertex_unlock_ABI,
         index_unlock_ABI,
-        super::unchanged::unless_unchanged!(set_stream_ABI, super::unchanged::binding),
+        super::unchanged::unless_unchanged!(
+            with_private_releases!(set_stream_ABI),
+            super::unchanged::binding
+        ),
         get_stream_ABI,
-        super::unchanged::unless_unchanged!(set_indices_ABI, super::unchanged::binding),
+        super::unchanged::unless_unchanged!(
+            with_private_releases!(set_indices_ABI),
+            super::unchanged::binding
+        ),
         get_indices_ABI,
         draw_ABI,
         draw_indexed_ABI,
-        draw_indexed_up_ABI,
+        with_private_releases!(draw_indexed_up_ABI),
     ] {
         registry.register(api);
     }
@@ -104,6 +107,7 @@ pub(super) fn parent_on_first_public_retain(env: &Env<'_>, pointer: u32) -> Opti
     (com(env).references(&env.sys.objects, id)? == 0).then_some(buffer.device)
 }
 pub(super) fn destroy(env: &mut Env<'_>, buffer: Buffer) {
+    resources::destroy_common(env, buffer.common);
     free(env, buffer.storage);
 }
 pub(super) fn release_bindings(env: &mut Env<'_>, bindings: Bindings) {
@@ -183,6 +187,7 @@ fn create(
         format,
         fvf,
         locks: 0,
+        common: resources::Common::default(),
     };
     let Some((pointer, id)) = object(env, interface, iid, Payload::Buffer(payload)) else {
         free(env, storage);
@@ -282,50 +287,6 @@ fn index_desc(env: &mut Env<'_>, this: GuestPtr<()>, output: GuestPtr<D3DINDEXBU
         Size: b.len,
     };
     output.write(env.cpu, desc).map_or(INVALID, |()| 0)
-}
-fn get_device(env: &mut Env<'_>, this: u32, kind: Kind, output: GuestPtr<u32>) -> u32 {
-    if output.write(env.cpu, 0).is_err() {
-        return INVALID;
-    }
-    let Some(b) = buffer(env, this).filter(|b| b.kind == kind) else {
-        return INVALID;
-    };
-    let Some(Payload::Device(d)) = com(env).get_identity(&env.sys.objects, b.device) else {
-        return INVALID;
-    };
-    let pointer = d.pointer;
-    if add_ref(env, pointer).is_none() {
-        return OUT_OF_MEMORY;
-    }
-    if output.write(env.cpu, pointer).is_err() {
-        release(env, pointer);
-        return INVALID;
-    }
-    0
-}
-#[win32(d3d9,name="IDirect3DVertexBuffer9::GetDevice",level=implement)]
-fn vertex_device(env: &mut Env<'_>, this: GuestPtr<()>, output: GuestPtr<u32>) -> u32 {
-    get_device(env, this.addr(), Kind::Vertex, output)
-}
-#[win32(d3d9,name="IDirect3DIndexBuffer9::GetDevice",level=implement)]
-fn index_device(env: &mut Env<'_>, this: GuestPtr<()>, output: GuestPtr<u32>) -> u32 {
-    get_device(env, this.addr(), Kind::Index, output)
-}
-#[win32(d3d9,name="IDirect3DVertexBuffer9::GetType",level=implement)]
-fn vertex_type(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
-    if buffer(env, this.addr()).is_some_and(|b| b.kind == Kind::Vertex) {
-        6
-    } else {
-        0
-    }
-}
-#[win32(d3d9,name="IDirect3DIndexBuffer9::GetType",level=implement)]
-fn index_type(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
-    if buffer(env, this.addr()).is_some_and(|b| b.kind == Kind::Index) {
-        7
-    } else {
-        0
-    }
 }
 
 fn lock(

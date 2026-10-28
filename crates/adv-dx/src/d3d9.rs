@@ -9,6 +9,17 @@ use adv_abi::{GuestPtr, Handle, Registry, win32};
 use adv_cpu::backend::{Backend, GuestExt, Prot};
 use adv_device::gpu::{Error, Gpu, Target};
 use adv_machine::{Env, Ext, Machine, Object, Objects, Outcome, Wait};
+// Only handlers that can destroy a resource need to drain guest COM releases.
+macro_rules! with_private_releases {
+    ($api:expr) => {{
+        const API: adv_abi::Api = $api;
+        fn handler(env: &mut Env<'_>) -> Outcome {
+            let outcome = (API.handler)(env);
+            resources::finish_private_releases(env, outcome)
+        }
+        adv_abi::Api { handler, ..API }
+    }};
+}
 #[cfg(test)]
 use adv_os::Heaps;
 use resources::Resource;
@@ -124,6 +135,7 @@ struct Device {
     gpu_lost: bool,
     /// The last refresh boundary, so vsync-locked boundaries keep their phase.
     boundary: Option<u64>,
+    misc: Misc,
 }
 impl Device {
     fn class_key(&self, class: usize) -> u128 {
@@ -183,6 +195,7 @@ pub struct State {
     gpu: Option<Gpu>,
     provider: SurfaceProvider,
     pending: Vec<Pending>,
+    private_releases: Vec<u32>,
     transfers: Vec<readback::PendingTransfer>,
     dcs: Vec<dc::Lease>,
     sender: Option<adv_sync::background::LocalSender>,
@@ -366,7 +379,19 @@ pub fn register(registry: &mut Registry) {
         end_scene_ABI,
         clear_ABI,
         present_ABI,
-        reset_ABI,
+        with_private_releases!(reset_ABI),
+        register_software_ABI,
+        swapchain_count_ABI,
+        raster_status_ABI,
+        validate_device_ABI,
+        set_gamma_ABI,
+        get_gamma_ABI,
+        set_clip_status_ABI,
+        get_clip_status_ABI,
+        set_palette_entries_ABI,
+        get_palette_entries_ABI,
+        set_current_palette_ABI,
+        get_current_palette_ABI,
     ] {
         registry.register(api);
     }
@@ -443,6 +468,7 @@ pub fn install<B: Backend>(
         gpu: None,
         provider,
         pending: Vec::new(),
+        private_releases: Vec::new(),
         transfers: Vec::new(),
         dcs: Vec::new(),
         sender: None,
@@ -749,10 +775,12 @@ macro_rules! unknown {
                 && !(refs == Some(1)
                     && (stateblock_last || release_parent(env, this.addr()) == Some(owner)))
             {
-                return Outcome::Return(release(env, this.addr()));
+                let value = release(env, this.addr());
+                return resources::finish_private_releases(env, Outcome::Return(value));
             }
             recording::barrier(env, owner, recording::Reason::Release, move |env| {
-                Outcome::Return(release(env, this.addr()))
+                let value = release(env, this.addr());
+                resources::finish_private_releases(env, Outcome::Return(value))
             })
         }
     };
@@ -1084,6 +1112,7 @@ fn create_device(
         frame: recording::Recording::default(),
         gpu_lost: false,
         boundary: None,
+        misc: Misc::default(),
     };
     device.refresh_all();
     let Some((pointer, id)) = object(
@@ -1545,13 +1574,14 @@ fn dispatch_now(env: &mut Env<'_>, owner: Id, operation: Operation) -> Outcome {
                     let pending = env.ext.get_mut::<State>().pending.swap_remove(index);
                     env.sys.objects.close(event);
                     release_pending_owners(env, pending.owner, pending.resources);
-                    match pending
+                    let outcome = match pending
                         .result
                         .expect("GPU wait only signaled after completion")
                     {
                         Ok(value) => completed(env, value),
                         Err(error) => gpu_error(error),
-                    }
+                    };
+                    resources::finish_private_releases(env, outcome)
                 },
             )
         }
@@ -1759,4 +1789,216 @@ fn present(
         return Outcome::Return(DEVICE_LOST);
     }
     recording::present_operation(env, id, surface, deadline, copy.map(|copy| (id, copy)))
+}
+
+struct Misc {
+    gamma: [[u16; 256]; 3],
+    clip_status: [u32; 2],
+    palettes: BTreeMap<u32, [u32; 256]>,
+    palette: u32,
+    cursor_visible: bool,
+    cursor_position: (i32, i32),
+}
+impl Default for Misc {
+    fn default() -> Self {
+        Self {
+            gamma: [std::array::from_fn(|i| i as u16 * 257); 3],
+            clip_status: [0, u32::MAX],
+            palettes: BTreeMap::new(),
+            palette: 0,
+            cursor_visible: false,
+            cursor_position: (0, 0),
+        }
+    }
+}
+fn device_mut<'a>(env: &'a mut Env<'_>, pointer: u32) -> Option<&'a mut Device> {
+    match com(env).get_mut::<Payload>(&mut env.sys.objects, pointer)? {
+        Payload::Device(d) => Some(d),
+        _ => None,
+    }
+}
+#[win32(d3d9, name = "IDirect3D9::RegisterSoftwareDevice", level = implement)]
+fn register_software(env: &mut Env<'_>, _this: GuestPtr<()>, _initialize: GuestPtr<()>) -> u32 {
+    adv_abi::warn_unavailable(
+        env,
+        "IDirect3D9::RegisterSoftwareDevice",
+        "software rasterizer devices are unsupported",
+    );
+    UNAVAILABLE
+}
+#[win32(d3d9, name = "IDirect3DDevice9::GetNumberOfSwapChains", level = implement)]
+fn swapchain_count(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
+    u32::from(device(env, this.addr()).is_some())
+}
+#[win32(d3d9, name = "IDirect3DDevice9::GetRasterStatus", level = implement)]
+fn raster_status(
+    env: &mut Env<'_>,
+    this: GuestPtr<()>,
+    swapchain: u32,
+    output: GuestPtr<[u32; 2]>,
+) -> u32 {
+    if device(env, this.addr()).is_none() {
+        return INVALID;
+    }
+    if swapchain != 0 {
+        adv_abi::warn_unavailable(
+            env,
+            "IDirect3DDevice9::GetRasterStatus",
+            "only the implicit swap chain is supported",
+        );
+        return UNAVAILABLE;
+    }
+    output.write(env.cpu, [0, 0]).map_or(INVALID, |()| 0)
+}
+#[win32(d3d9, name = "IDirect3DDevice9::ValidateDevice", level = implement)]
+fn validate_device(env: &mut Env<'_>, this: GuestPtr<()>, passes: GuestPtr<u32>) -> u32 {
+    let Some(d) = device(env, this.addr()) else {
+        return INVALID;
+    };
+    if d.shaders.pixel.is_none() {
+        if let Err(error) = fixed::second_stage(&d.fixed) {
+            adv_abi::warn_unavailable(env, "IDirect3DDevice9::ValidateDevice", error.reason);
+            return error.code;
+        }
+        if d.texture.is_some()
+            && (fixed::combine(d.fixed.stage[&1], d.fixed.stage[&2], d.fixed.stage[&3]).is_none()
+                || fixed::combine(d.fixed.stage[&4], d.fixed.stage[&5], d.fixed.stage[&6])
+                    .is_none())
+        {
+            adv_abi::warn_unavailable(
+                env,
+                "IDirect3DDevice9::ValidateDevice",
+                "texture stage combination is unsupported by drawing",
+            );
+            return UNAVAILABLE;
+        }
+    }
+    passes.write(env.cpu, 1).map_or(INVALID, |()| 0)
+}
+#[win32(d3d9, name = "IDirect3DDevice9::SetGammaRamp", level = implement)]
+fn set_gamma(
+    env: &mut Env<'_>,
+    this: GuestPtr<()>,
+    swapchain: u32,
+    flags: u32,
+    ramp: GuestPtr<[[u16; 256]; 3]>,
+) {
+    if swapchain != 0 || flags & !1 != 0 {
+        adv_abi::warn_unavailable(
+            env,
+            "IDirect3DDevice9::SetGammaRamp",
+            "unsupported swap chain or gamma flags",
+        );
+        return;
+    }
+    if let Ok(ramp) = ramp.read(env.cpu)
+        && let Some(d) = device_mut(env, this.addr())
+    {
+        d.misc.gamma = ramp;
+    }
+}
+#[win32(d3d9, name = "IDirect3DDevice9::GetGammaRamp", level = implement)]
+fn get_gamma(
+    env: &mut Env<'_>,
+    this: GuestPtr<()>,
+    swapchain: u32,
+    ramp: GuestPtr<[[u16; 256]; 3]>,
+) {
+    if swapchain != 0 {
+        adv_abi::warn_unavailable(
+            env,
+            "IDirect3DDevice9::GetGammaRamp",
+            "only the implicit swap chain is supported",
+        );
+        return;
+    }
+    if let Some(d) = device(env, this.addr()) {
+        let gamma = d.misc.gamma;
+        let _ = ramp.write(env.cpu, gamma);
+    }
+}
+#[win32(d3d9, name = "IDirect3DDevice9::SetClipStatus", level = implement)]
+fn set_clip_status(env: &mut Env<'_>, this: GuestPtr<()>, status: GuestPtr<[u32; 2]>) -> u32 {
+    let Ok(status) = status.read(env.cpu) else {
+        return INVALID;
+    };
+    let Some(d) = device_mut(env, this.addr()) else {
+        return INVALID;
+    };
+    d.misc.clip_status = status;
+    0
+}
+#[win32(d3d9, name = "IDirect3DDevice9::GetClipStatus", level = implement)]
+fn get_clip_status(env: &mut Env<'_>, this: GuestPtr<()>, status: GuestPtr<[u32; 2]>) -> u32 {
+    let Some(d) = device(env, this.addr()) else {
+        return INVALID;
+    };
+    let value = d.misc.clip_status;
+    status.write(env.cpu, value).map_or(INVALID, |()| 0)
+}
+fn palette_supported(env: &mut Env<'_>, number: u32, method: &str) -> bool {
+    if number < 65536 {
+        return true;
+    }
+    adv_abi::warn_unavailable(env, method, "palette numbers must be below 65536");
+    false
+}
+#[win32(d3d9, name = "IDirect3DDevice9::SetPaletteEntries", level = implement)]
+fn set_palette_entries(
+    env: &mut Env<'_>,
+    this: GuestPtr<()>,
+    number: u32,
+    entries: GuestPtr<[u32; 256]>,
+) -> u32 {
+    if !palette_supported(env, number, "IDirect3DDevice9::SetPaletteEntries") {
+        return UNAVAILABLE;
+    }
+    let Ok(entries) = entries.read(env.cpu) else {
+        return INVALID;
+    };
+    let Some(d) = device_mut(env, this.addr()) else {
+        return INVALID;
+    };
+    d.misc.palettes.insert(number, entries);
+    0
+}
+#[win32(d3d9, name = "IDirect3DDevice9::GetPaletteEntries", level = implement)]
+fn get_palette_entries(
+    env: &mut Env<'_>,
+    this: GuestPtr<()>,
+    number: u32,
+    entries: GuestPtr<[u32; 256]>,
+) -> u32 {
+    if !palette_supported(env, number, "IDirect3DDevice9::GetPaletteEntries") {
+        return UNAVAILABLE;
+    }
+    let Some(d) = device(env, this.addr()) else {
+        return INVALID;
+    };
+    let value = d
+        .misc
+        .palettes
+        .get(&number)
+        .copied()
+        .unwrap_or([u32::MAX; 256]);
+    entries.write(env.cpu, value).map_or(INVALID, |()| 0)
+}
+#[win32(d3d9, name = "IDirect3DDevice9::SetCurrentTexturePalette", level = implement)]
+fn set_current_palette(env: &mut Env<'_>, this: GuestPtr<()>, number: u32) -> u32 {
+    if !palette_supported(env, number, "IDirect3DDevice9::SetCurrentTexturePalette") {
+        return UNAVAILABLE;
+    }
+    let Some(d) = device_mut(env, this.addr()) else {
+        return INVALID;
+    };
+    d.misc.palette = number;
+    0
+}
+#[win32(d3d9, name = "IDirect3DDevice9::GetCurrentTexturePalette", level = implement)]
+fn get_current_palette(env: &mut Env<'_>, this: GuestPtr<()>, output: GuestPtr<u32>) -> u32 {
+    let Some(d) = device(env, this.addr()) else {
+        return INVALID;
+    };
+    let value = d.misc.palette;
+    output.write(env.cpu, value).map_or(INVALID, |()| 0)
 }

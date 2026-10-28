@@ -405,7 +405,7 @@ pub(super) fn register(registry: &mut Registry) {
         get_scissor_ABI,
         set_transform_ABI,
         get_transform_ABI,
-        draw_up_ABI,
+        with_private_releases!(draw_up_ABI),
     ] {
         registry.register(api);
     }
@@ -1024,7 +1024,7 @@ pub(super) fn second_stage(f: &Fixed) -> Result<Option<[u32; 4]>, Rejected> {
         s[&11],
     ]))
 }
-fn combine(op: u32, arg1: u32, arg2: u32) -> Option<TextureOp> {
+pub(super) fn combine(op: u32, arg1: u32, arg2: u32) -> Option<TextureOp> {
     let arg = |v| match v {
         0 | 1 => Some(TextureOp::Color),
         2 => Some(TextureOp::Texture),

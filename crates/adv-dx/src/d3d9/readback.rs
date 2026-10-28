@@ -144,6 +144,8 @@ pub(super) fn create_offscreen(
             levels: Vec::new(),
             level: 0,
             lod: 0,
+            common: resources::Common::default(),
+            auto_filter: 2,
         },
     ) else {
         return Outcome::Return(OUT_OF_MEMORY);
