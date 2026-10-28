@@ -647,6 +647,7 @@ impl Native {
                 (stubs.access, "access"),
                 (stubs.interpret, "interpret"),
                 (stubs.call, "call"),
+                (stubs.apply, "apply"),
             ],
         );
         // SAFETY: `enter` follows the C calling convention with the
@@ -686,6 +687,7 @@ impl Native {
                 ret_miss: base + stubs.ret_miss,
                 access: base + stubs.access,
                 interpret: base + stubs.interpret,
+                apply: base + stubs.apply,
                 call: base + stubs.call,
                 fault: base + stubs.fault,
             },

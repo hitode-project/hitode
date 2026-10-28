@@ -33,7 +33,10 @@ impl Unit {
             if body.iter().enumerate().any(|(n, i)| {
                 i.mode != Mode::Plain
                     || i.call.is_some()
-                    || matches!(i.op, super::decode::Op::Helper(_))
+                    || matches!(
+                        i.op,
+                        super::decode::Op::Helper(_) | super::decode::Op::Apply(_)
+                    )
                     || checked(i.pc)
                     || (n != 0 && (self.trace.head(start + n) || self.trace.merge[start + n]))
                     || (n + 1 != body.len()

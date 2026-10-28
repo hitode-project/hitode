@@ -358,6 +358,43 @@ pub fn shift(flags: &mut u32, kind: M, value: u32, count: u32, width: u8) -> u32
     }
 }
 
+/// `shld` (`left`) or `shrd` of a word or dword `value` by `count` in 1 to
+/// 31, filling from `source`.
+pub fn double_shift(
+    flags: &mut u32,
+    left: bool,
+    value: u32,
+    source: u32,
+    count: u32,
+    width: u8,
+) -> u32 {
+    let bits = u32::from(width) * 8;
+    let concat = if left {
+        (u64::from(value) << bits) | u64::from(source)
+    } else {
+        (u64::from(source) << bits) | u64::from(value)
+    };
+    // 16-bit counts 17..31 are architecturally undefined. Use the
+    // conventional 32-bit concatenation rotation, including the original
+    // destination, rather than host shift UB.
+    let result = if width == 2 && left {
+        (concat as u32).rotate_left(count) >> 16
+    } else if width == 2 {
+        (concat as u32).rotate_right(count)
+    } else if left {
+        ((concat << count) >> bits) as u32
+    } else {
+        (concat >> count) as u32
+    } & mask(width);
+    let carry = if left { bits * 2 - count } else { count - 1 };
+    flag(flags, CF, concat & (1u64 << carry) != 0);
+    if count == 1 {
+        flag(flags, OF, ((value ^ result) >> (bits - 1)) & 1 != 0);
+    }
+    szp(flags, result, width);
+    result
+}
+
 pub fn mask(width: u8) -> u32 {
     match width {
         1 => 0xff,

@@ -132,6 +132,8 @@ pub enum Op {
     X87(super::x87::X87),
     /// An exact signed 64-bit integer load into the extended x87 stack.
     Fild64(Mem, u8, Option<u16>),
+    /// An integer instruction an operation helper runs (A64-TR-4).
+    Apply(super::apply::Apply),
     /// Anything else the interpreter runs without transferring control:
     /// the `interpret` stub runs it, by its index in the trace's helpers.
     Helper(u8),
@@ -877,6 +879,8 @@ impl<'m> Fetcher<'m> {
             Op::Strings(strings)
         } else if let Some(integer) = super::integer::plan(&instruction, index) {
             Op::Integer(integer)
+        } else if let Some(apply) = super::apply::plan(&instruction) {
+            Op::Apply(apply)
         } else if instruction.code() == iced_x86::Code::Fild_m64int {
             Op::Fild64(
                 memory(&instruction)?,
@@ -982,6 +986,7 @@ impl Op {
             }
             // The interpreter reads and writes canonical flags.
             Op::Helper(_) => (F::ALL, F::NONE, true),
+            Op::Apply(apply) => (F::ALL, F::ALL, matches!(apply.dst, Part::Mem(_))),
         };
         Effects {
             reads,

@@ -3,7 +3,7 @@
 use super::*;
 
 use crate::integer::flag;
-pub(super) use crate::integer::{arithmetic, binary, shift, szp, unary};
+pub(super) use crate::integer::{arithmetic, binary, double_shift, shift, unary};
 
 pub(super) fn product(flags: &mut u32, a: u32, b: u32, width: u8, signed_form: bool) -> u64 {
     let product = if signed_form {

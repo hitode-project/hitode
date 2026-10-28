@@ -1599,6 +1599,7 @@ mod tests {
                 ret_miss: 0,
                 access: 0,
                 interpret: 0,
+                apply: 0,
                 fault: 0,
             },
             &|_, _| None,

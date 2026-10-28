@@ -52,6 +52,7 @@ impl Translator<'_> {
             },
             Op::Simd(simd) => self.simd(simd),
             Op::Strings(strings) => self.strings(strings),
+            Op::Apply(apply) => self.apply(apply),
             Op::Integer(integer) => self.integer(integer),
             Op::X87(x87) => self.x87(x87),
             Op::Fild64(mem, helper, opcode) => self.fild64(mem, helper, opcode),
@@ -864,8 +865,8 @@ impl Translator<'_> {
         };
     }
 
-    /// Zero-extends the narrow `part` into `rt`; a memory part is at the
-    /// guest address in `address`.
+    /// Zero-extends the 1-, 2- or 4-byte `part` into `rt`; a memory part is
+    /// at the guest address in `address`.
     pub(super) fn narrow_read(&mut self, part: Part, width: u8, address: Reg, rt: Reg) {
         match part {
             Part::Reg(number) => {
@@ -874,12 +875,11 @@ impl Translator<'_> {
             }
             Part::Imm(value) => self.mov_imm(rt, value),
             Part::Mem(_) => {
-                let narrow = if width == 1 {
-                    Narrow::Byte
-                } else {
-                    Narrow::Half
+                let direct = match width {
+                    1 => ldr_narrow(Narrow::Byte, rt, WINDOW, address),
+                    2 => ldr_narrow(Narrow::Half, rt, WINDOW, address),
+                    _ => ldr_reg(W, rt, WINDOW, address, false),
                 };
-                let direct = ldr_narrow(narrow, rt, WINDOW, address);
                 if self.checking {
                     self.checked(address, rt, u32::from(width), direct);
                 } else {
@@ -890,7 +890,7 @@ impl Translator<'_> {
         }
     }
 
-    /// Writes the low bytes of `value` to the narrow `part`. A register part
+    /// Writes the low 1, 2 or 4 bytes of `value` to `part`. A register part
     /// first prepares its guest register, which may use x15 to x17, so
     /// `value` is never one of them.
     pub(super) fn narrow_write(&mut self, part: Part, width: u8, address: Reg, value: Reg) {
@@ -905,12 +905,11 @@ impl Translator<'_> {
                 self.forget(guest);
             }
             Part::Mem(_) => {
-                let narrow = if width == 1 {
-                    Narrow::Byte
-                } else {
-                    Narrow::Half
+                let direct = match width {
+                    1 => str_narrow(Narrow::Byte, value, WINDOW, address),
+                    2 => str_narrow(Narrow::Half, value, WINDOW, address),
+                    _ => str_reg(W, value, WINDOW, address, false),
                 };
-                let direct = str_narrow(narrow, value, WINDOW, address);
                 if self.checking {
                     self.checked(address, value, u32::from(width) | ACCESS_STORE, direct);
                 } else {
