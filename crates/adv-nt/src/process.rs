@@ -672,6 +672,16 @@ fn new_context(
     Ok(context)
 }
 
+/// Forgets the stack `new_context` recorded for `context`, which has ended:
+/// the machine reclaims it, and its range may then be allocated again.
+pub(crate) fn forget_stack(env: &mut Env<'_>, context: CtxId) {
+    let thread = &env.sys.contexts[context as usize];
+    let (stack, end) = (thread.stack_lo - PAGE, thread.stack_hi);
+    if let Some(memory) = env.ext.try_get_mut::<Memory>() {
+        memory.forget(stack, end);
+    }
+}
+
 fn start_context(stack_base: u32) -> u32 {
     ((stack_base - STACK_TOP_RESERVE) & !3) - context::SIZE as u32
 }
@@ -855,4 +865,54 @@ pub fn resume(env: &mut Env<'_>, args: &[u32]) -> adv_machine::Outcome {
         status::check(reply.header.error)?;
         Ok(())
     })())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::{CURRENT_PROCESS, MEM_COMMIT, MEM_RESERVE};
+    use adv_cpu::Cpu;
+    use adv_cpu::backend::Prot;
+    use adv_machine::{Clock, Outcome, layout::PARK_ADDR};
+
+    // spec: NT-PROC-2
+    #[test]
+    fn an_ended_threads_stack_can_be_allocated_again() {
+        let mut machine = Machine::new(
+            Cpu::new(PARK_ADDR, true).unwrap(),
+            crate::dispatch::Platform,
+            Clock::virtual_time(),
+        )
+        .unwrap();
+        let main = machine.spawn("main", PARK_ADDR, &[], 0x1_0000).unwrap();
+        machine.ext.insert(Memory::default());
+        machine
+            .visit_context(Some(main), |env| {
+                let args = env.sys.vm.alloc(env.cpu, PAGE, Prot::RW).unwrap();
+                // A hole under the stack lets a reservation start below it.
+                let hole = env.sys.vm.reserve(0x8_0000).unwrap();
+                let memory = env.ext.get_mut::<Memory>();
+                let thread =
+                    new_context(env.cpu, env.sys, memory, PARK_ADDR, 0, 0, DEFAULT_STACK).unwrap();
+                let stack = env.sys.contexts[thread as usize].stack_lo - PAGE;
+                assert_eq!(stack, hole + 0x8_0000);
+                env.sys.vm.free(env.cpu, hole).unwrap();
+                server::end_thread(env, thread);
+                assert!(env.sys.terminate_context(thread, 0));
+                // The next thread's creation reclaims the stack.
+                env.sys.spawn(env.cpu, "next", PARK_ADDR, &[], 0).unwrap();
+                let mut allocate = |base: u32, size: u32, kind: u32| {
+                    env.cpu.write_u32(args, base).unwrap();
+                    env.cpu.write_u32(args + 4, size).unwrap();
+                    let call = [CURRENT_PROCESS, args, 0, args + 4, kind, PAGE_READWRITE];
+                    match memory::allocate(env, &call) {
+                        Outcome::Return(status) => status,
+                        _ => panic!("allocation did not return"),
+                    }
+                };
+                assert_eq!(allocate(stack - 0x4_0000, 0x10_0000, MEM_RESERVE), 0);
+                assert_eq!(allocate(stack + 0x1_0000, 0x1_0000, MEM_COMMIT), 0);
+            })
+            .unwrap();
+    }
 }

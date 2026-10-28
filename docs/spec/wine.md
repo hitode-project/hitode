@@ -244,7 +244,7 @@ NT services follow Wine 11.0's argument checks, server requests and status codes
 
 ### NT-PROC-2 Process and thread operations
 
-**Rule**: Process enumeration, suspension, thread alerts, continuation, and APC calls MUST follow Wine's behavior within `WINE-SYS-4`. Suspension MUST update machine contexts.
+**Rule**: Process enumeration, suspension, thread alerts, continuation, and APC calls MUST follow Wine's behavior within `WINE-SYS-4`. Suspension MUST update machine contexts. An ended thread's stack MUST leave the process's allocations, so that later allocations of its range succeed.
 **Verification**: Test
 
 ### NT-PROC-3 Jobs and completions
