@@ -333,11 +333,15 @@ fn update_surface(
     }
 }
 
+/// The guest copy of an uploaded surface: source pitch, row bytes, height,
+/// destination address and pitch, and the uploaded bytes.
+type Shadow = (u32, u32, u32, Option<(u32, u32)>, Arc<Vec<u8>>);
+
 fn surface_uploaded(
     env: &mut Env<'_>,
     resource: Id,
     level: Option<u32>,
-    shadow: (u32, u32, u32, Option<(u32, u32)>, Arc<Vec<u8>>),
+    shadow: Shadow,
     outcome: Outcome,
 ) -> Outcome {
     match outcome {

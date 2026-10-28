@@ -2014,7 +2014,7 @@ mod tests {
             };
             for image in images {
                 let bytes = f.pixels(&image);
-                for pixel in bytes.chunks_exact(4) {
+                for pixel in bytes.as_chunks::<4>().0 {
                     assert_eq!(
                         pixel,
                         if filter == 2 {

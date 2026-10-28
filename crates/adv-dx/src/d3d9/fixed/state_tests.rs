@@ -1252,8 +1252,10 @@ mod fixed_completion_lighting {
     #[test]
     fn spot_falloff_and_range() {
         let mut f = Fixed::new(16, 12);
-        let mut l = Light::default();
-        l.enabled = true;
+        let mut l = Light {
+            enabled: true,
+            ..Default::default()
+        };
         l.value[0] = 2;
         l.value[19] = 4f32.to_bits();
         l.value[20] = 2f32.to_bits();
@@ -1277,8 +1279,10 @@ mod fixed_completion_lighting {
     #[test]
     fn normal_inverse_transpose_and_normalization() {
         let mut f = Fixed::new(16, 12);
-        let mut l = Light::default();
-        l.enabled = true;
+        let l = Light {
+            enabled: true,
+            ..Default::default()
+        };
         f.lights.insert(0, l);
         f.transforms[0][10] = 2.;
         let lights = active(&f).ok().unwrap();
@@ -1315,8 +1319,10 @@ mod fixed_completion_lighting {
             f.render.insert(29, 1);
             f.render.insert(142, 0);
             f.render.insert(139, u32::MAX);
-            let mut l = Light::default();
-            l.enabled = true;
+            let mut l = Light {
+                enabled: true,
+                ..Default::default()
+            };
             if state == 146 {
                 l.value[5..8].fill(1f32.to_bits());
             }
@@ -1357,8 +1363,10 @@ mod fixed_completion_lighting {
         f.material[16] = 2.;
         f.render.insert(29, 1);
         f.render.insert(142, 0);
-        let mut l = Light::default();
-        l.enabled = true;
+        let mut l = Light {
+            enabled: true,
+            ..Default::default()
+        };
         l.value[5..8].fill(1f32.to_bits());
         f.lights.insert(0, l);
         let lights = active(&f).ok().unwrap();

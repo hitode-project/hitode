@@ -536,13 +536,17 @@ fn d3d9_package_d_instanced_offsets_match_two_draws() {
         assert_eq!(actual, f.pixels(&image));
         assert!(
             actual
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .enumerate()
                 .any(|(n, p)| n % 16 < 8 && p[2] > 200)
         );
         assert!(
             actual
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .enumerate()
                 .any(|(n, p)| n % 16 >= 8 && p[2] > 200)
         );
@@ -719,7 +723,7 @@ fn d3d9_package_d_instancing_fixed_and_fvf_match_pixels() {
                 f.pixels(&image),
                 "programmable={programmable}, fvf={fvf}"
             );
-            assert!(actual.chunks_exact(4).any(|p| p[1] > 200));
+            assert!(actual.as_chunks::<4>().0.iter().any(|p| p[1] > 200));
             f.okay("IDirect3DDevice9::EndScene", &[f.device]);
         }
     }

@@ -1246,7 +1246,7 @@ mod package_a {
             GuestPtr::<[u32; 256]>::new(output).read(&m.cpu).unwrap(),
             [u32::MAX; 256]
         );
-        let entries = std::array::from_fn(|i| 0xff000000 | i as u32 * 0x010101);
+        let entries = std::array::from_fn(|i| 0xff000000 | (i as u32 * 0x010101));
         let input = packet(&mut m, entries);
         assert_eq!(
             result(
