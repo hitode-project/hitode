@@ -1093,6 +1093,37 @@ fn dib_declines_before_writes() {
     }
 }
 
+// spec: NAT-BODY-4
+#[test]
+fn copies_snapshot_only_touched_rows() {
+    let Some(dist) = dist() else {
+        return;
+    };
+    let table = std::fs::read_to_string(dist.join("share/hitode/identity/win32u.so.tsv")).unwrap();
+    let mut native = machine(&dist, true, None);
+    let mut reference = machine(&dist, false, None);
+    reference.sys.redirects.clear();
+    for seed in [0, 2] {
+        // Rows past the fixture are unmapped; a whole-surface snapshot declines.
+        let mut data = fixture(0, seed);
+        set(&mut data, DST, d::height, 100000);
+        set(&mut data, SRC, d::height, 100000);
+        set(&mut data, ORIGIN, 0, 1);
+        set(&mut data, ORIGIN, 4, 1);
+        let before = adv_nt::native::declines(&native.ext);
+        compare(
+            &mut native,
+            &mut reference,
+            &table,
+            "copy_rect_32",
+            &[DST, RECTS, SRC, ORIGIN, 13, 0],
+            &data,
+            &format!("seed {seed}"),
+        );
+        assert_eq!(adv_nt::native::declines(&native.ext), before);
+    }
+}
+
 // spec: NAT-ID-2, NAT-BODY-4
 #[test]
 fn halftone_declines_nondefault_rounding() {

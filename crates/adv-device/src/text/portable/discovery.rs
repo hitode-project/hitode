@@ -23,7 +23,7 @@ fn read(file: &mut File, offset: u64, length: usize) -> io::Result<Vec<u8>> {
 fn u32_at(data: &[u8], offset: usize) -> u32 {
     u32::from_be_bytes(data[offset..offset + 4].try_into().unwrap())
 }
-fn metadata(file: &mut File, offset: u64) -> io::Result<Vec<u8>> {
+fn metadata(file: &mut File, offset: u64, charmap: bool) -> io::Result<Vec<u8>> {
     let header = read(file, offset, 12)?;
     if &header[..4] == b"ttcf" {
         return Err(io::ErrorKind::InvalidData.into());
@@ -34,9 +34,11 @@ fn metadata(file: &mut File, offset: u64) -> io::Result<Vec<u8>> {
         .as_chunks::<16>()
         .0
         .iter()
-        .filter(|entry| matches!(&entry[..4], b"name" | b"OS/2" | b"post"))
+        .filter(|entry| {
+            matches!(&entry[..4], b"name" | b"OS/2" | b"post") || charmap && &entry[..4] == b"cmap"
+        })
         .collect();
-    if tables.len() > 3 {
+    if tables.len() > 4 {
         return Err(io::ErrorKind::InvalidData.into());
     }
     let count = tables.len() as u16;
@@ -62,7 +64,9 @@ fn metadata(file: &mut File, offset: u64) -> io::Result<Vec<u8>> {
     }
     Ok(data)
 }
-pub(super) fn face_metadata(path: &Path, index: u32) -> io::Result<(Vec<u8>, bool)> {
+/// The naming tables of one face, with its character map when `charmap` is
+/// set, and whether it has TrueType outlines.
+pub(super) fn face_metadata(path: &Path, index: u32, charmap: bool) -> io::Result<(Vec<u8>, bool)> {
     let mut file = File::open(path)?;
     let header = read(&mut file, 0, 12)?;
     let offset = if &header[..4] == b"ttcf" {
@@ -81,7 +85,7 @@ pub(super) fn face_metadata(path: &Path, index: u32) -> io::Result<(Vec<u8>, boo
         .0
         .iter()
         .any(|entry| &entry[..4] == b"glyf");
-    Ok((metadata(&mut file, offset)?, truetype))
+    Ok((metadata(&mut file, offset, charmap)?, truetype))
 }
 #[cfg(any(target_os = "macos", test))]
 fn load_file(db: &mut Database, path: &Path) -> io::Result<()> {
@@ -103,7 +107,7 @@ fn load_file(db: &mut Database, path: &Path) -> io::Result<()> {
         vec![0]
     };
     for (index, offset) in offsets.into_iter().enumerate() {
-        let Ok(data) = metadata(&mut file, u64::from(offset)) else {
+        let Ok(data) = metadata(&mut file, u64::from(offset), false) else {
             continue;
         };
         let mut probe = Database::new();
@@ -202,7 +206,7 @@ mod tests {
             load_file(&mut actual, &path).unwrap();
             compare(&expected, &actual);
             for info in actual.faces() {
-                let (data, truetype) = face_metadata(&path, info.index).unwrap();
+                let (data, truetype) = face_metadata(&path, info.index, false).unwrap();
                 assert!(truetype);
                 let mut metadata = Database::new();
                 metadata.load_font_data(data);

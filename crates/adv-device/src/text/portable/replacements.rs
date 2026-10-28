@@ -36,6 +36,31 @@ fn repertoire(family: &WindowsFamily) -> Encoding {
     }
 }
 
+/// A character that a face claiming a CJK code page must map, because some
+/// fonts without CJK glyphs set these code page bits.
+const SAMPLES: [(Encoding, char); 4] = [
+    (Encoding::Japanese, 'あ'),
+    (Encoding::SimplifiedChinese, '们'),
+    (Encoding::TraditionalChinese, '們'),
+    (Encoding::Korean, '한'),
+];
+
+fn claims_cjk(codepages: u32) -> bool {
+    SAMPLES
+        .iter()
+        .any(|&(encoding, _)| codepages & codepage(encoding) != 0)
+}
+
+/// The claimed code pages whose sample character the face maps.
+fn mapped_codepages(mut codepages: u32, font: Option<&FontRef<'_>>) -> u32 {
+    for (encoding, sample) in SAMPLES {
+        if !font.is_some_and(|font| font.charmap().map(sample).is_some()) {
+            codepages &= !codepage(encoding);
+        }
+    }
+    codepages
+}
+
 fn codepage(encoding: Encoding) -> u32 {
     1 << match encoding {
         Encoding::Japanese => 17,
@@ -66,16 +91,24 @@ fn replacements(candidates: &[Candidate]) -> Vec<(Vec<String>, Vec<String>)> {
         request.pitch = Pitch::Default;
         request.family = Family::Default;
         let names = families(&request);
+        // CJK glyph forms differ by region, so the regional order outranks
+        // the outline type there.
+        let regional = encoding != Encoding::Latin;
         let best = candidates
             .iter()
             .filter(|candidate| candidate.codepages & codepage(encoding) != 0)
             .min_by_key(|candidate| {
+                let order = names
+                    .iter()
+                    .position(|name| candidate.matches(name))
+                    .unwrap_or(names.len());
                 (
-                    !candidate.truetype,
-                    names
-                        .iter()
-                        .position(|name| candidate.matches(name))
-                        .unwrap_or(names.len()),
+                    if regional {
+                        (order, !candidate.truetype)
+                    } else {
+                        (0, !candidate.truetype)
+                    },
+                    order,
                     !candidate.info.monospaced && fixed(&request),
                     candidate.info.style != Style::Normal,
                     candidate.info.weight.0.abs_diff(400),
@@ -102,12 +135,30 @@ impl Backend {
                 Source::File(path) => path,
                 _ => continue,
             };
-            let Ok((data, truetype)) = discovery::face_metadata(path, info.index) else {
+            let Ok((data, truetype)) = discovery::face_metadata(path, info.index, false) else {
                 continue;
             };
             let Ok(font) = FontRef::new(&data) else {
                 continue;
             };
+            let mut codepages = font
+                .os2()
+                .ok()
+                .and_then(|os2| os2.ul_code_page_range_1())
+                .unwrap_or(0);
+            // Read the character map only for the faces that claim CJK. A face
+            // that maps none of its claimed CJK is left out entirely, because
+            // renderers that choose a face by character set read the claim.
+            if claims_cjk(codepages) {
+                let charmap = discovery::face_metadata(path, info.index, true).ok();
+                let charmap = charmap
+                    .as_ref()
+                    .and_then(|(data, _)| FontRef::new(data).ok());
+                codepages = mapped_codepages(codepages, charmap.as_ref());
+                if !claims_cjk(codepages) {
+                    continue;
+                }
+            }
             let names: Vec<_> = legacy_families(&font)
                 .filter(|name| listed(name))
                 .collect::<BTreeSet<_>>()
@@ -120,11 +171,7 @@ impl Backend {
             candidates.push(Candidate {
                 info: info.clone(),
                 names,
-                codepages: font
-                    .os2()
-                    .ok()
-                    .and_then(|os2| os2.ul_code_page_range_1())
-                    .unwrap_or(0),
+                codepages,
                 truetype,
             });
         }
@@ -138,6 +185,29 @@ impl Backend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // spec: DEV-FONT-1, WINE-SES-5
+    #[test]
+    fn claimed_cjk_code_pages_require_mapped_characters() {
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let claimed = codepage(Encoding::Latin)
+            | codepage(Encoding::Japanese)
+            | codepage(Encoding::SimplifiedChinese);
+        let japanese = std::fs::read(fixtures.join("font-resource-japanese.ttf")).unwrap();
+        let japanese = FontRef::new(&japanese).unwrap();
+        assert_eq!(
+            mapped_codepages(claimed, Some(&japanese)),
+            codepage(Encoding::Latin) | codepage(Encoding::Japanese)
+        );
+        let latin = std::fs::read(fixtures.join("font-resource.ttf")).unwrap();
+        let latin = FontRef::new(&latin).unwrap();
+        assert_eq!(
+            mapped_codepages(claimed, Some(&latin)),
+            codepage(Encoding::Latin)
+        );
+        assert_eq!(mapped_codepages(claimed, None), codepage(Encoding::Latin));
+        assert!(claims_cjk(claimed) && !claims_cjk(codepage(Encoding::Latin)));
+    }
 
     // spec: DEV-FONT-1, WINE-SES-5
     #[test]

@@ -201,7 +201,7 @@ PATH=../../target/ios-ffmpeg/bin:$PATH APPLE_DEVELOPMENT_TEAM=<team> \
 - Tauri's Xcode build passes only `HOME` and `PATH` on to Cargo, so `FFMPEG_DIR` cannot be set directly. `build.py --ios` writes a `cargo` wrapper into `target/ios-ffmpeg/bin` that sets it and strips release debug records. Both iOS executables also strip linker debug records on export.
 - The IPA is `src-tauri/gen/apple/build/arm64/Hitode.ipa`. Install it with `xcrun devicectl device install app --device <udid> <ipa>`.
 - Select game folders through Files to read them at their original locations, including outside the app's container. Directory access is restored from bookmarks after relaunch, and cloud files are downloaded before discovery and game launch. Games already in Documents through Finder or `devicectl device copy to --domain-type appDataContainer` are also read in place. Saves and registry stay in the app's private data directory.
-- The AppIcon images are not committed. `python3 apps/adv-launcher/scripts/icons.py` writes them to `src-tauri/icons/ios/`; copy them into `gen/apple/Assets.xcassets/AppIcon.appiconset/` before the first build.
+- The AppIcon images are not committed. `python3 apps/adv-launcher/scripts/icons.py` writes them to `src-tauri/icons/ios/`; the Xcode build copies them into `gen/apple/Assets.xcassets/AppIcon.appiconset/` and fails when they are missing.
 
 ## Local output
 

@@ -13,6 +13,7 @@ adv-machine.workspace = true
 adv-pe.workspace = true
 iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "instr_info"] }
 log.workspace = true
+memchr = "2"
 thiserror.workspace = true
 
 [target.'cfg(unix)'.dependencies]

@@ -75,6 +75,15 @@ fn system_fonts() -> Arc<Database> {
         .clone()
 }
 
+pub(super) fn system_font_families() -> Vec<String> {
+    let names: BTreeSet<_> = system_fonts()
+        .faces()
+        .flat_map(|face| face.families.iter().map(|(name, _)| name.clone()))
+        .filter(|name| listed(name))
+        .collect();
+    names.into_iter().collect()
+}
+
 /// Scan installed fonts on a background thread so the first text call does
 /// not wait for it. A pinned font profile replaces the scan.
 pub(super) fn prefetch_system_fonts() {

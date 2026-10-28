@@ -524,6 +524,7 @@ pub fn init_thread(
 /// pipes close and ends the thread, waking whoever waits for it.
 pub fn end_thread(env: &mut Env<'_>, context: CtxId) {
     crate::process::signals::forget(env, context);
+    crate::process::forget_stack(env, context);
     set_time(env);
     let Some(link) = env.ext.try_get_mut::<Link>() else {
         return;

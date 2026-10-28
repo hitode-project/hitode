@@ -1,5 +1,6 @@
 //! Assembly of the Wine userland with the host fronts, devices and execution.
 pub use adv_device::text::Overrides as FontOverrides;
+pub use adv_device::text::system_font_families;
 pub mod codepage;
 mod debug_views;
 mod font;
