@@ -484,19 +484,13 @@ mod state_tests {
                 }
             }
             if position == 3 {
+                // Lit draws render (GFX-FIXED-1).
                 assert_eq!(call(&mut env, set_render_ABI, &[pointer, 137, 1]), 0);
                 assert_eq!(
                     call(&mut env, draw_up_ABI, &[pointer, 4, 1, vertices, stride]),
-                    UNAVAILABLE
+                    0
                 );
-                assert_eq!(
-                    env.ext
-                        .get::<ApiDiagnostics>()
-                        .warnings
-                        .values()
-                        .sum::<u64>(),
-                    1
-                );
+                assert_eq!(call(&mut env, set_render_ABI, &[pointer, 137, 0]), 0);
             }
         }
         assert_eq!(call(&mut env, end_scene_ABI, &[pointer]), 0);
@@ -694,6 +688,8 @@ mod fixed_completion {
                 depth: None,
                 surface: Some(2),
                 storage: 0,
+                common: resources::Common::default(),
+                auto_filter: 2,
                 owns_surface: false,
                 lockable: false,
                 lock: None,

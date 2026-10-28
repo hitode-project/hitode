@@ -8,6 +8,7 @@ pub(super) fn capture(
     start: u32,
     first: u32,
     last: u32,
+    instanced: bool,
 ) -> Result<Vec<VertexStream>, u32> {
     let d = device(env, pointer).ok_or(INVALID)?;
     let mut streams = Vec::new();
@@ -47,6 +48,12 @@ pub(super) fn capture(
         if stride > 2048 || !stride.is_multiple_of(4) || (stride != 0 && stride < minimum) {
             return Err(INVALID);
         }
+        let instance = instanced && d.buffers.frequencies[n] & buffers::INSTANCE_DATA != 0;
+        let (start, first, last) = if instance {
+            (0, 0, buffers::instances(&d.buffers) - 1)
+        } else {
+            (start, first, last)
+        };
         let offset = start
             .checked_add(first)
             .and_then(|v| v.checked_mul(stride))
@@ -64,8 +71,14 @@ pub(super) fn capture(
             .ok_or(INVALID)?;
         let at = data.checked_add(offset).ok_or(INVALID)?;
         adv_abi::guest::check_range(env.cpu, at, bytes, Prot::READ).map_err(|_| INVALID)?;
-        let raw = d.fixed.capture_stream(env, at, bytes)?;
+        let mut raw = d.fixed.capture_stream(env, at, bytes)?;
+        if instanced && stride != 0 && !bytes.is_multiple_of(stride) {
+            // Metal bounds vertex fetches by complete strides, including the
+            // final record whose unused trailing bytes need no guest storage.
+            raw.resize(bytes.next_multiple_of(stride) as usize, 0);
+        }
         streams.push(VertexStream {
+            instance,
             bytes: raw,
             stride,
             attributes: selected

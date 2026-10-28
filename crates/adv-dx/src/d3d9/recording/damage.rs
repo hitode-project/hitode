@@ -35,6 +35,11 @@ pub(super) fn bounds(env: &Env<'_>, device: &Device, operation: &Operation) -> R
 }
 fn draw_bounds(env: &Env<'_>, device: &Device, d: &fixed::Draw) -> Option<Rect> {
     use crate::shader::interpreter::{self, NoTextures};
+    if d.programmable.as_ref().is_some_and(|p| {
+        p.instance_count != 1 || p.parameters[15][0] == 2 || p.streams.iter().any(|s| s.instance)
+    }) {
+        return None;
+    }
     let mut positions = [[0.; 4]; 64];
     let count;
     let point = d.programmable.as_ref().filter(|p| p.parameters[2][3] != 0);

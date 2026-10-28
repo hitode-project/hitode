@@ -103,6 +103,7 @@ pub struct Attribute {
 }
 #[derive(Clone)]
 pub struct VertexStream {
+    pub instance: bool,
     pub bytes: VertexBytes,
     pub stride: u32,
     pub attributes: Vec<Attribute>,
@@ -141,6 +142,7 @@ pub struct ProgramTexture {
 }
 #[derive(Clone)]
 pub struct ProgrammableDraw {
+    pub instance_count: u32,
     pub program: Program,
     pub streams: Vec<VertexStream>,
     pub indices: Option<super::IndexBytes>,

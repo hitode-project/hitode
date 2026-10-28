@@ -19,8 +19,10 @@ impl Gpu {
             program
         });
         let draw = ProgrammableDraw {
+            instance_count: 1,
             program: program.clone(),
             streams: vec![VertexStream {
+                instance: false,
                 bytes: bytemuck::cast_slice(vertices).to_vec().into(),
                 stride: std::mem::size_of::<Vertex>() as u32,
                 attributes: vec![

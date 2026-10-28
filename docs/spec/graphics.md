@@ -289,6 +289,17 @@ snapshot storage; an unchanged Apply performs no state writes. Redundant fixed-s
 **Rule**: Expanded fixed-function vertex uploads MUST remain within 16 MiB.
 **Verification**: Review — no test reaches the upload limit.
 
+### GFX-INPUT-7 Stream frequencies and instancing
+
+**Rule**: Indexed draws MUST honor stream-zero INDEXEDDATA instance counts and INSTANCEDATA divisor one using instance-step streams and one instanced draw. Declarations and FVF MUST support instancing in programmable and fixed paths. Non-indexed draws MUST ignore stream frequencies.
+**Verification**: Test
+
+| State | Contract |
+|---|---|
+| Set/Get and state blocks | MUST preserve stream frequency values. |
+| Unsupported divisors | MUST return D3DERR_NOTAVAILABLE. |
+| Reset | MUST restore every stream frequency to one. |
+
 ## Samplers
 
 ### GFX-SAMPLER-1 Addressing
@@ -400,6 +411,11 @@ CPU-only surfaces and managed texture-level locks preserve pending recorded comm
 **Rule**: Fixed draws MUST implement D3D9 fog and point scaling as exceptions to GFX-INPUT-5, plus texture factor, shading, blend factors, depth bias and sRGB. Fog and specular MUST follow texture combining without changing the combined alpha. Fixed pipeline variants MUST preserve existing unlit pipeline recipes and cache identities.
 **Verification**: Test
 **Basis**: Microsoft Direct3D 9 fog formulas, texture arguments and shading modes.
+
+### GFX-COPY-3 System-memory surface uploads
+
+**Rule**: UpdateSurface MUST upload matching-format SYSTEMMEM surfaces or texture levels into DEFAULT destinations, honoring optional source rectangles and destination points. Invalid pools, formats, locked surfaces, depth/stencil, multisampling, and out-of-bounds rectangles MUST return D3DERR_INVALIDCALL. Uploads MUST preserve pixels outside the destination rectangle and track resource-level writes.
+**Verification**: Test
 
 ### GFX-STATE-1 Neutral fixed state
 

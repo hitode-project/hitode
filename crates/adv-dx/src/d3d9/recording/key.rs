@@ -431,7 +431,7 @@ pub(super) fn prepare(
                 } = p.as_ref();
                 program.textures.hash(&mut h);
                 for s in streams {
-                    (s.stride, &s.attributes).hash(&mut h);
+                    (s.stride, &s.attributes, s.instance).hash(&mut h);
                     s.bytes.content_key().is_some().hash(&mut h);
                     if let Some(key) = s.bytes.content_key() {
                         key.hash(&mut h);
@@ -440,7 +440,7 @@ pub(super) fn prepare(
                     }
                     bytes += s.bytes.len();
                 }
-                (indices, vertex_count).hash(&mut h);
+                (indices, vertex_count, p.instance_count).hash(&mut h);
                 bytes += indices
                     .as_ref()
                     .map_or(0, |i| std::mem::size_of_val(i.as_slice()));
@@ -581,6 +581,7 @@ fn validate(operation: &Operation) -> Result<(), u32> {
                     n <= 0x300000
                         && count(s.topology, n)
                         && last < p.vertex_count
+                        && p.instance_count != 0
                         && p.textures.len() == p.program.textures.len()
                         && p.streams.iter().map(|s| s.bytes.len()).sum::<usize>()
                             <= 16 * 1024 * 1024
@@ -594,7 +595,11 @@ fn validate(operation: &Operation) -> Result<(), u32> {
                                             && a.location < 16
                                             && locations.insert(a.location)
                                             && (s.stride == 0 || end <= s.stride)
-                                            && u64::from(last) * u64::from(s.stride)
+                                            && u64::from(if s.instance {
+                                                p.instance_count - 1
+                                            } else {
+                                                last
+                                            }) * u64::from(s.stride)
                                                 + u64::from(end)
                                                 <= s.bytes.len() as u64
                                     })

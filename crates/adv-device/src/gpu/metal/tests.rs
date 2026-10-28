@@ -11,8 +11,9 @@ fn read(gpu: &mut Gpu, target: &Target) -> Vec<u8> {
 }
 fn draw() -> ProgrammableDraw {
     ProgrammableDraw {
+        instance_count: 1,
         program: Program::new("struct C { f: array<vec4<f32>,256> }; @group(0) @binding(1) var<uniform> c:C; @vertex fn vertex_main(@location(0) p:vec4<f32>)->@builtin(position) vec4<f32> { return p; } @fragment fn fragment_main()->@location(0) vec4<f32> { return c.f[0]; }".into(), vec![]),
-        streams: vec![VertexStream { stride: 16, bytes: bytemuck::cast_slice(&[[-1f32,-1.,0.,1.], [3.,-1.,0.,1.], [-1.,3.,0.,1.]]).to_vec().into(), attributes: vec![Attribute { location: 0, offset: 0, format: AttributeFormat::Float4 }] }],
+        streams: vec![VertexStream { instance: false, stride: 16, bytes: bytemuck::cast_slice(&[[-1f32,-1.,0.,1.], [3.,-1.,0.,1.], [-1.,3.,0.,1.]]).to_vec().into(), attributes: vec![Attribute { location: 0, offset: 0, format: AttributeFormat::Float4 }] }],
         indices: None, vertex_count: 3, vertex_constants: ConstantBlock::default().into(), pixel_constants: ConstantBlock::default().into(), textures: vec![], parameters: [[0;4];40],
     }
 }
@@ -121,6 +122,7 @@ fn textured_draw(
     result.program = program.clone();
     result.streams = vec![
         VertexStream {
+            instance: false,
             bytes: bytes.into(),
             stride: stride as u32,
             attributes: vec![Attribute {
@@ -130,6 +132,7 @@ fn textured_draw(
             }],
         },
         VertexStream {
+            instance: false,
             bytes: attributes.into(),
             stride: 12,
             attributes: vec![

@@ -872,3 +872,119 @@ fn color_fill_writes_default_pool_rectangles_and_rejects_other_pools() {
         assert_eq!(release(&mut env(&mut f.m), handle), 0);
     }
 }
+
+// spec: GFX-COPY-3
+#[test]
+fn d3d9_package_d_update_surface_full_and_rect_pixels() {
+    let mut f = Fixture::new();
+    f.m.ext
+        .get_mut::<State>()
+        .tables
+        .insert("IDirect3DTexture9", 0);
+    for levels in [false, true] {
+        let output = f.packet(0u32);
+        let mut surfaces = Vec::new();
+        let mut textures = Vec::new();
+        for pool in [2, 0] {
+            let surface = if levels {
+                f.okay(
+                    "IDirect3DDevice9::CreateTexture",
+                    &[
+                        f.device,
+                        8,
+                        6,
+                        2,
+                        if pool == 0 { 0x200 } else { 0 },
+                        21,
+                        pool,
+                        output,
+                        0,
+                    ],
+                );
+                let texture = f.m.cpu.read_u32(output).unwrap();
+                textures.push(texture);
+                f.okay("IDirect3DTexture9::GetSurfaceLevel", &[texture, 1, output]);
+                f.m.cpu.read_u32(output).unwrap()
+            } else {
+                f.surface(4, 3, 21, pool)
+            };
+            surfaces.push(surface);
+        }
+        let (source, destination) = (surfaces[0], surfaces[1]);
+        let input: Vec<u32> = (0..12).map(|n| 0xff102030 + n * 0x010203).collect();
+        let locked = f.lock(source, 0, 0);
+        f.m.cpu
+            .write(locked.pBits, bytemuck::cast_slice(&input))
+            .unwrap();
+        f.okay("IDirect3DSurface9::UnlockRect", &[source]);
+        f.okay(
+            "IDirect3DDevice9::UpdateSurface",
+            &[f.device, source, 0, destination, 0],
+        );
+        if levels {
+            f.okay("IDirect3DDevice9::SetTexture", &[f.device, 0, textures[1]]);
+            let locked = f.lock(destination, 0, 0x10);
+            assert_eq!(f.m.cpu.read_u32(locked.pBits).unwrap(), input[0]);
+            f.okay("IDirect3DSurface9::UnlockRect", &[destination]);
+        }
+        let image = f.image(destination);
+        assert_eq!(f.pixels(&image), bytemuck::cast_slice::<_, u8>(&input));
+        let rect = f.packet(RECT {
+            left: 1,
+            top: 1,
+            right: 3,
+            bottom: 3,
+        });
+        let point = f.packet(POINT { x: 0, y: 0 });
+        f.okay(
+            "IDirect3DDevice9::UpdateSurface",
+            &[f.device, source, rect, destination, point],
+        );
+        let mut expected = input.clone();
+        for y in 0..2 {
+            for x in 0..2 {
+                expected[y * 4 + x] = input[(y + 1) * 4 + x + 1];
+            }
+        }
+        assert_eq!(f.pixels(&image), bytemuck::cast_slice::<_, u8>(&expected));
+    }
+}
+
+// spec: GFX-COPY-3
+#[test]
+fn d3d9_package_d_update_surface_rejects_pools_formats_locks_and_bounds() {
+    let mut f = Fixture::new();
+    let system = f.surface(4, 3, 21, 2);
+    let default = f.surface(4, 3, 21, 0);
+    let other_format = f.surface(4, 3, 22, 0);
+    for (source, destination) in [(default, default), (system, system), (system, other_format)] {
+        let outcome = f.call(
+            "IDirect3DDevice9::UpdateSurface",
+            &[f.device, source, 0, destination, 0],
+        );
+        assert_eq!(f.finish(outcome), INVALID);
+    }
+    for surface in [system, default] {
+        f.lock(surface, 0, 0);
+        let outcome = f.call(
+            "IDirect3DDevice9::UpdateSurface",
+            &[f.device, system, 0, default, 0],
+        );
+        assert_eq!(f.finish(outcome), INVALID);
+        f.okay("IDirect3DSurface9::UnlockRect", &[surface]);
+    }
+    let rect = f.packet(RECT {
+        left: 0,
+        top: 0,
+        right: 5,
+        bottom: 3,
+    });
+    let point = f.packet(POINT { x: 1, y: 0 });
+    for (rect, point) in [(rect, 0), (0, point)] {
+        let outcome = f.call(
+            "IDirect3DDevice9::UpdateSurface",
+            &[f.device, system, rect, default, point],
+        );
+        assert_eq!(f.finish(outcome), INVALID);
+    }
+}

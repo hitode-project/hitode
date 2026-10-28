@@ -181,7 +181,13 @@ pub(super) fn build(
             }
         }
     } else if transformed {
-        s.push_str("let viewport=bitcast<vec4<f32>>(draw_parameters.values[0]);let w=1.0/a0.w;out.position=vec4<f32>((((a0.x+0.5-viewport.z)/viewport.x)*2.0-1.0)*w,(1.0-((a0.y+0.5-viewport.w)/viewport.y)*2.0)*w,a0.z*w,w);let clip_position=out.position;out.fog=1.0;\n");
+        s.push_str("let viewport=bitcast<vec4<f32>>(draw_parameters.values[0]);\n");
+        if inputs[0].format == AttributeFormat::Float3 {
+            s.push_str("let p=vec4<f32>(a0,1.0);let matrix=mat4x4<f32>(bitcast<vec4<f32>>(draw_parameters.values[36]),bitcast<vec4<f32>>(draw_parameters.values[37]),bitcast<vec4<f32>>(draw_parameters.values[38]),bitcast<vec4<f32>>(draw_parameters.values[39]));out.position=matrix*p;out.position.x+=out.position.w/viewport.x;out.position.y-=out.position.w/viewport.y;\n");
+        } else {
+            s.push_str("let w=1.0/a0.w;out.position=vec4<f32>((((a0.x+0.5-viewport.z)/viewport.x)*2.0-1.0)*w,(1.0-((a0.y+0.5-viewport.w)/viewport.y)*2.0)*w,a0.z*w,w);\n");
+        }
+        s.push_str("let clip_position=out.position;out.fog=1.0;\n");
         let color = inputs
             .iter()
             .find(|i| i.register == 1)

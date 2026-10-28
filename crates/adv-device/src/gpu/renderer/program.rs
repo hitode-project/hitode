@@ -4,7 +4,7 @@ use super::*;
 pub(super) struct Key {
     pub(super) program: u64,
     pub(super) textures: Vec<bool>,
-    pub(super) streams: Vec<(u32, Vec<Attribute>)>,
+    pub(super) streams: Vec<(u32, Vec<Attribute>, bool)>,
     pub(super) raster: PipelineKey,
 }
 #[derive(Clone)]
@@ -664,7 +664,11 @@ impl Pipeline {
             .map(|(s, a)| {
                 Some(wgpu::VertexBufferLayout {
                     array_stride: u64::from(s.0),
-                    step_mode: wgpu::VertexStepMode::Vertex,
+                    step_mode: if s.2 {
+                        wgpu::VertexStepMode::Instance
+                    } else {
+                        wgpu::VertexStepMode::Vertex
+                    },
                     attributes: a,
                 })
             })
@@ -776,7 +780,8 @@ impl Gpu {
         validate(target, &[dummy; 3][..probe], state)?;
         let clipped = self.clipped_state(*state, &target.image);
         let state = &clipped;
-        if count == 0
+        if draw.instance_count == 0
+            || count == 0
             || count > 0x300000
             || match state.topology {
                 Topology::Lines => !count.is_multiple_of(2),
@@ -817,7 +822,12 @@ impl Gpu {
                     || a.location >= 16
                     || locations & (1 << a.location) != 0
                     || (stream.stride != 0 && end > stream.stride)
-                    || u64::from(last) * u64::from(stream.stride) + u64::from(end)
+                    || u64::from(if stream.instance {
+                        draw.instance_count - 1
+                    } else {
+                        last
+                    }) * u64::from(stream.stride)
+                        + u64::from(end)
                         > stream.bytes.len() as u64
                 {
                     return Err(invalid("vertex attribute outside uploaded span"));
@@ -885,7 +895,7 @@ impl Gpu {
             streams: draw
                 .streams
                 .iter()
-                .map(|s| (s.stride, s.attributes.clone()))
+                .map(|s| (s.stride, s.attributes.clone(), s.instance))
                 .collect(),
             raster,
         };
@@ -1007,9 +1017,9 @@ impl Gpu {
                         .slice(offset..offset + index_size),
                     wgpu::IndexFormat::Uint32,
                 );
-                pass.draw_indexed(0..count as u32, 0, 0..1);
+                pass.draw_indexed(0..count as u32, 0, 0..draw.instance_count);
             } else {
-                pass.draw(0..draw.vertex_count, 0..1);
+                pass.draw(0..draw.vertex_count, 0..draw.instance_count);
             }
         }
         self.finish_batch(&mut pending, target, &attachment, immediate);

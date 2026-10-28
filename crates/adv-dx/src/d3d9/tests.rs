@@ -1098,7 +1098,7 @@ mod package_a {
             0
         );
         assert_eq!(m.cpu.read_u32(output).unwrap(), 1);
-        for (kind, value) in [(1, 2), (2, 0x12)] {
+        for (kind, value) in [(1, 2), (2, 4)] {
             assert_eq!(
                 result(
                     &mut m,

@@ -498,18 +498,20 @@ impl State {
                 Topology::TriangleStrip => MTLPrimitiveType::TriangleStrip,
             };
             if let Some(indices) = &draw.indices {
-                encoder.drawIndexedPrimitives_indexCount_indexType_indexBuffer_indexBufferOffset(
+                encoder.drawIndexedPrimitives_indexCount_indexType_indexBuffer_indexBufferOffset_instanceCount(
                     primitive,
                     indices.len(),
                     MTLIndexType::UInt32,
                     &self.ring.buffer,
                     index_offset as usize,
+                    draw.instance_count as usize,
                 );
             } else {
-                encoder.drawPrimitives_vertexStart_vertexCount(
+                encoder.drawPrimitives_vertexStart_vertexCount_instanceCount(
                     primitive,
                     0,
                     draw.vertex_count as usize,
+                    draw.instance_count as usize,
                 );
             }
         }
