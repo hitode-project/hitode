@@ -33,6 +33,7 @@ pub(super) fn raster(s: DrawState) -> u128 {
         cull,
         blend,
         alpha_blend,
+        blend_constant,
         depth,
         depth_write,
         stencil,
@@ -46,7 +47,7 @@ pub(super) fn raster(s: DrawState) -> u128 {
         alpha_test,
         alpha_reference,
     } = s;
-    hash((
+    let key = hash((
         hash((
             topology,
             last_pixel,
@@ -74,7 +75,8 @@ pub(super) fn raster(s: DrawState) -> u128 {
         color_write,
         alpha_test,
         alpha_reference.to_bits(),
-    ))
+    ));
+    blend_constant.map_or(key, |color| hash((key, color)))
 }
 pub(in crate::d3d9) fn fixed(f: &fixed::Fixed) -> u128 {
     let fixed::Fixed {
@@ -88,6 +90,8 @@ pub(in crate::d3d9) fn fixed(f: &fixed::Fixed) -> u128 {
         scissor,
         transforms,
         clip_planes,
+        material,
+        lights,
     } = f;
     hash((
         fvf,
@@ -107,6 +111,8 @@ pub(in crate::d3d9) fn fixed(f: &fixed::Fixed) -> u128 {
         (scissor.left, scissor.top, scissor.right, scissor.bottom),
         transforms.map(|m| m.map(f32::to_bits)),
         clip_planes.map(|m| m.map(f32::to_bits)),
+        material.map(f32::to_bits),
+        lights,
     ))
 }
 struct ResourceIdentity {

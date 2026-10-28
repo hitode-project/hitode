@@ -133,6 +133,8 @@ impl<'a> Reader<'a> {
             layout.position,
             if layout.transformed { 16 } else { 12 },
         ))
+        .chain(layout.normal.map(|(stream, at)| (stream, at, 12)))
+        .chain(layout.specular.map(|(stream, at)| (stream, at, 4)))
         .chain(layout.color.map(|at| (layout.streams[1], at, 4)))
         .chain(
             layout

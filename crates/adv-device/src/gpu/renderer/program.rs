@@ -960,6 +960,15 @@ impl Gpu {
         {
             let pass = pending.pass.as_mut().unwrap();
             pass.set_pipeline(&pipeline.pipeline);
+            if let Some(color) = state.blend_constant {
+                let c = |n: u32| f64::from((color >> n) & 255u32) / 255.;
+                pass.set_blend_constant(wgpu::Color {
+                    r: c(0),
+                    g: c(8),
+                    b: c(16),
+                    a: c(24),
+                });
+            }
             pass.set_bind_group(0, &pipeline.constants, &[base; 3]);
             pass.set_bind_group(1, &textures, &[]);
             let v = state.viewport;
