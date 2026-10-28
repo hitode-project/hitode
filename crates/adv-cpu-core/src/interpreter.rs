@@ -1774,9 +1774,6 @@ impl Transaction {
     fn flag(&mut self, bit: u32, value: bool) {
         self.flags = (self.flags & !bit) | if value { bit } else { 0 };
     }
-    fn szp(&mut self, value: u32, width: u8) {
-        registers::szp(&mut self.flags, value, width);
-    }
     fn arithmetic(&mut self, a: u32, b: u32, carry: u32, width: u8, subtract: bool) -> u32 {
         registers::arithmetic(&mut self.flags, a, b, carry, width, subtract)
     }
@@ -1867,39 +1864,14 @@ impl Transaction {
                 self.check_write(memory, dst)?;
                 if count != 0 {
                     let width = dst.width().unwrap();
-                    let bits = u32::from(width) * 8;
-                    let concat = if kind == M::Shld {
-                        (u64::from(value) << bits) | u64::from(source)
-                    } else {
-                        (u64::from(source) << bits) | u64::from(value)
-                    };
-                    // 16-bit counts 17..31 are architecturally undefined. Use
-                    // the conventional 32-bit concatenation rotation, including
-                    // the original destination, rather than host shift UB.
-                    let result = if width == 2 && kind == M::Shld {
-                        (concat as u32).rotate_left(count) >> 16
-                    } else if width == 2 {
-                        (concat as u32).rotate_right(count)
-                    } else if kind == M::Shld {
-                        ((concat << count) >> bits) as u32
-                    } else {
-                        (concat >> count) as u32
-                    } & mask(width);
-                    self.flag(
-                        CF,
-                        concat
-                            & (1u64
-                                << if kind == M::Shld {
-                                    bits * 2 - count
-                                } else {
-                                    count - 1
-                                })
-                            != 0,
+                    let result = registers::double_shift(
+                        &mut self.flags,
+                        kind == M::Shld,
+                        value,
+                        source,
+                        count,
+                        width,
                     );
-                    if count == 1 {
-                        self.flag(OF, ((value ^ result) >> (bits - 1)) & 1 != 0);
-                    }
-                    self.szp(result, width);
                     self.store(memory, dst, result)?;
                 }
             }

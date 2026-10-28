@@ -26,9 +26,11 @@
 //! the rest call the `access` stub, so soft pages cost a helper call
 //! rather than a fault.
 //!
-//! An instruction the translator does not handle but the interpreter runs
-//! without transferring control calls the `interpret` stub with canonical
-//! flags, and the unit goes on unless the helper asks it to leave.
+//! An instruction the translator has no native form for but the
+//! interpreter runs without transferring control calls an operation helper
+//! (`apply`), which keeps guest state and SIMD caches in place, or else the
+//! `interpret` stub with canonical flags; the unit goes on unless the
+//! helper asks it to leave.
 //!
 //! Host registers beyond the guest map of A64-REG-1: x16 and x17 address and exit
 //! scratch, x6 a value scratch, x7 and x8 the recipe temporaries, which the
@@ -39,6 +41,7 @@
 //! v16-v23, with v0-v6 as scratch; an x87 run keeps its stack values in
 //! v24-v31.
 
+pub(crate) mod apply;
 mod channels;
 mod decode;
 pub mod first;
@@ -248,6 +251,8 @@ pub struct Stubs {
     pub access: usize,
     /// An instruction the interpreter runs.
     pub interpret: usize,
+    /// An operation helper on operands in registers.
+    pub apply: usize,
     /// A recognized host call.
     pub call: usize,
     /// Where a faulting site leaves.

@@ -72,6 +72,7 @@ fn full_x87_units_keep_short_branches_to_cold_code_in_reach() {
             ret_miss: host,
             access: host,
             interpret: host,
+            apply: host,
             fault: host,
         };
         let features = Features { flagm: false };
@@ -124,6 +125,7 @@ fn bytecode_vm_dispatch_instruction_gate() {
         ret_miss: HOST_CODE as usize,
         access: HOST_CODE as usize,
         interpret: HOST_CODE as usize,
+        apply: HOST_CODE as usize,
         fault: HOST_CODE as usize,
     };
     translate(
@@ -322,6 +324,7 @@ impl Harness {
                 ret_miss: addr(self.forbidden),
                 access: addr(self.forbidden),
                 interpret: addr(self.forbidden),
+                apply: addr(self.forbidden),
                 fault: addr(self.forbidden),
             },
             &|_, _| None,
@@ -787,6 +790,7 @@ fn switch_table_recognition_checks_unsigned_bounds_pages_and_index_provenance() 
             ret_miss: HOST_CODE as usize,
             access: HOST_CODE as usize,
             interpret: HOST_CODE as usize,
+            apply: HOST_CODE as usize,
             fault: HOST_CODE as usize,
         };
         for writable_tail in [false, true] {
@@ -880,6 +884,7 @@ fn j1_unit(code: &[u8]) -> Workspace {
             ret_miss: at,
             access: at,
             interpret: at,
+            apply: at,
             fault: at,
         },
         &|_, _| None,

@@ -89,6 +89,9 @@ pub struct Runtime {
     /// EIP in `CpuState`. Bits 32 and up are the instructions it charges
     /// beyond the one prepaid, signed.
     pub interpret: u64,
+    /// `apply(op, value, source, count, nzcv, x10, x11) -> result and
+    /// flags`, called by `apply` (`translate::apply::run`).
+    pub apply: u64,
     /// The `Exit` that left translated code.
     pub exit: u32,
     /// The recipe temporaries x7 and x8 at the exit, for fault recovery.
@@ -130,6 +133,7 @@ impl Runtime {
             alias: 0,
             alias_classes: 0,
             interpret: 0,
+            apply: crate::translate::apply::run as *const () as u64,
             exit: 0,
             temps: [0; 2],
             branch: 0,
@@ -183,6 +187,8 @@ pub struct Stubs {
     pub access: usize,
     /// Where translated code has the owner interpret an instruction.
     pub interpret: usize,
+    /// Where translated code runs an operation helper.
+    pub apply: usize,
     /// Where translated code makes a recognized host call.
     pub call: usize,
 }
@@ -231,6 +237,7 @@ const SHADOW_TOP: u32 = field(offset_of!(Runtime, shadow_top));
 const RESUME: u32 = field(offset_of!(Runtime, resume));
 const ACCESS: u32 = field(offset_of!(Runtime, access));
 const INTERPRET: u32 = field(offset_of!(Runtime, interpret));
+const APPLY: u32 = field(offset_of!(Runtime, apply));
 const CALL: u32 = field(offset_of!(Runtime, call));
 #[cfg(test)]
 pub(crate) const CHANNEL_BATCHES: u32 = field(offset_of!(Runtime, channel_batches));
@@ -311,6 +318,8 @@ pub fn stubs() -> Stubs {
     emit_interpret(&mut asm, INTERPRET);
     let call = asm.offset();
     emit_interpret(&mut asm, CALL);
+    let apply = asm.offset();
+    emit_apply(&mut asm);
     Stubs {
         call,
         code: asm.finish(),
@@ -324,6 +333,7 @@ pub fn stubs() -> Stubs {
         shadow_reset,
         access,
         interpret,
+        apply,
     }
 }
 
@@ -359,10 +369,9 @@ fn emit_interpret(asm: &mut Asm, slot: u32) {
     ]);
 }
 
-/// `access`, called with w1 the guest address, x2 the site, w3 a value to
-/// store and w4 the kind. Keeps x5-x17 and NZCV; x0-x4 and x30 are free
-/// wherever translated code accesses memory.
-fn emit_access(asm: &mut Asm, fault: crate::asm::Label) {
+/// Saves what light helpers keep (A64-REG-4): x5-x17, NZCV, LR and the
+/// XMM registers units cache.
+fn emit_save_light(asm: &mut Asm) {
     asm.emit_all(&[
         stp(X, Pre, r(5), r(6), SP, -128),
         stp(X, Offset, r(7), r(8), SP, 16),
@@ -370,17 +379,19 @@ fn emit_access(asm: &mut Asm, fault: crate::asm::Label) {
         stp(X, Offset, r(11), r(12), SP, 48),
         stp(X, Offset, r(13), r(14), SP, 64),
         stp(X, Offset, r(15), r(16), SP, 80),
-        mrs_nzcv(r(0)),
-        stp(X, Offset, r(17), r(0), SP, 96),
+        mrs_nzcv(r(16)),
+        stp(X, Offset, r(17), r(16), SP, 96),
         str(X, Reg::LR, SP, 112),
-        // The XMM registers units cache.
         stp_v(VSize::Q, Pre, v(16), v(17), SP, -128),
         stp_v(VSize::Q, Offset, v(18), v(19), SP, 32),
         stp_v(VSize::Q, Offset, v(20), v(21), SP, 64),
         stp_v(VSize::Q, Offset, v(22), v(23), SP, 96),
-        mov(X, r(0), RUNTIME),
-        ldr(X, r(16), RUNTIME, ACCESS),
-        blr(r(16)),
+    ]);
+}
+
+/// Restores what `emit_save_light` saved; uses x1.
+fn emit_restore_light(asm: &mut Asm) {
+    asm.emit_all(&[
         ldp_v(VSize::Q, Offset, v(22), v(23), SP, 96),
         ldp_v(VSize::Q, Offset, v(20), v(21), SP, 64),
         ldp_v(VSize::Q, Offset, v(18), v(19), SP, 32),
@@ -395,6 +406,35 @@ fn emit_access(asm: &mut Asm, fault: crate::asm::Label) {
         ldp(X, Offset, r(7), r(8), SP, 16),
         ldp(X, Post, r(5), r(6), SP, 128),
     ]);
+}
+
+/// `apply`, called with w0 to w3 the operation and its operands and the
+/// guest flags canonical. Keeps what `access` keeps, NZCV included, and
+/// returns `translate::apply::run`'s result in x0; x1 to x4 are free.
+fn emit_apply(asm: &mut Asm) {
+    emit_save_light(asm);
+    asm.emit_all(&[
+        mrs_nzcv(r(4)),
+        mov(X, r(5), r(10)),
+        mov(X, r(6), r(11)),
+        ldr(X, r(16), RUNTIME, APPLY),
+        blr(r(16)),
+    ]);
+    emit_restore_light(asm);
+    asm.emit(ret(Reg::LR));
+}
+
+/// `access`, called with w1 the guest address, x2 the site, w3 a value to
+/// store and w4 the kind. Keeps x5-x17 and NZCV; x0-x4 and x30 are free
+/// wherever translated code accesses memory.
+fn emit_access(asm: &mut Asm, fault: crate::asm::Label) {
+    emit_save_light(asm);
+    asm.emit_all(&[
+        mov(X, r(0), RUNTIME),
+        ldr(X, r(16), RUNTIME, ACCESS),
+        blr(r(16)),
+    ]);
+    emit_restore_light(asm);
     // Refused: the site faults, with the state exactly that before it.
     asm.tbz(true, r(0), 32, fault);
     asm.emit(ret(Reg::LR));

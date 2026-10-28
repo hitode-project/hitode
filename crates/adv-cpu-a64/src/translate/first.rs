@@ -292,6 +292,7 @@ fn step(op: Op, next: u32, cpu: &mut CpuState, memory: &Memory) -> Option<bool> 
         // The interpreter runs these: `Fetcher::helpers` is off here, and
         // narrow forms are rare in code that runs once.
         Op::Helper(_)
+        | Op::Apply(_)
         | Op::Narrow(..)
         | Op::StepMemory(..)
         | Op::NarrowStep(..)

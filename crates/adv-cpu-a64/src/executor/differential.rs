@@ -133,7 +133,7 @@ fn integer(a: &mut CodeAssembler, rng: &mut Rng, w: AsmRegister32, r: AsmRegiste
         operand
     };
     let other = rng.pick(&WRITABLE);
-    match rng.below(10) {
+    match rng.below(11) {
         0 => {
             let memory = (rng.below(2) == 0).then(|| mem(a, rng));
             if rng.below(2) == 0 {
@@ -230,6 +230,10 @@ fn integer(a: &mut CodeAssembler, rng: &mut Rng, w: AsmRegister32, r: AsmRegiste
             }
             a.sahf().unwrap()
         }
+        10 => {
+            let m = mem(a, rng);
+            operations(a, rng, w, m)
+        }
         _ => {
             let reverse = rng.below(2) == 0;
             if rng.below(2) == 0 {
@@ -244,6 +248,61 @@ fn integer(a: &mut CodeAssembler, rng: &mut Rng, w: AsmRegister32, r: AsmRegiste
                 .unwrap()
             }
         }
+    }
+}
+
+/// Shifts and double shifts in the forms operation helpers run: narrow
+/// and memory destinations, immediate and CL counts across the width.
+fn operations(a: &mut CodeAssembler, rng: &mut Rng, w: AsmRegister32, m: AsmMemoryOperand) {
+    if rng.below(2) == 0 {
+        let count = rng.pick(&[0u32, 1, 2, 7, 8, 9, 15, 16, 17, 31, 32, 33]);
+        a.mov(ecx, count).unwrap();
+    }
+    let count = rng.pick(&[1u32, 2, 7, 8, 9, 15, 16, 17, 31, 33]);
+    let by_cl = rng.below(2) == 0;
+    let kind = rng.below(7);
+    macro_rules! shift {
+        ($dst:expr) => {
+            if by_cl {
+                shift!($dst, cl)
+            } else {
+                shift!($dst, count)
+            }
+        };
+        ($dst:expr, $count:expr) => {
+            match kind {
+                0 => a.shl($dst, $count),
+                1 => a.shr($dst, $count),
+                2 => a.sar($dst, $count),
+                3 => a.rol($dst, $count),
+                4 => a.ror($dst, $count),
+                5 => a.rcl($dst, $count),
+                _ => a.rcr($dst, $count),
+            }
+            .unwrap()
+        };
+    }
+    macro_rules! double {
+        ($dst:expr, $src:expr) => {
+            match (kind % 2 == 0, by_cl) {
+                (true, true) => a.shld($dst, $src, cl),
+                (true, false) => a.shld($dst, $src, count),
+                (false, true) => a.shrd($dst, $src, cl),
+                (false, false) => a.shrd($dst, $src, count),
+            }
+            .unwrap()
+        };
+    }
+    match rng.below(8) {
+        0 => shift!(rng.pick(&SET_BYTES)),
+        1 => shift!(byte_ptr(m)),
+        2 => shift!(rng.pick(&[ax, cx, dx, di, bp])),
+        3 => shift!(word_ptr(m)),
+        4 => shift!(dword_ptr(m)),
+        5 => double!(w, rng.pick(&READABLE)),
+        6 => double!(dword_ptr(m), rng.pick(&READABLE)),
+        _ if rng.below(2) == 0 => double!(rng.pick(&[ax, cx, dx, di, bp]), rng.pick(&WORDS)),
+        _ => double!(word_ptr(m), rng.pick(&WORDS)),
     }
 }
 
