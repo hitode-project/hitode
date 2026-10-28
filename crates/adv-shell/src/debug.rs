@@ -44,6 +44,8 @@ pub(crate) fn start(options: &crate::Options, windowed: bool, wake: WakeEvent) -
         })
 }
 
+/// Host return addresses a sample lists above its PC.
+const CALLERS: usize = 4;
 /// Guest instructions a snapshot describes by form and code size.
 const HOT_INSTRUCTIONS: usize = 60;
 /// How long a socket request waits for a guest boundary.
@@ -91,7 +93,23 @@ pub(crate) fn unix_us() -> u64 {
 
 /// Whether the session should serve a debugger.
 pub(crate) fn requested(option: bool) -> bool {
-    option || std::env::var_os("ADV_DEBUG").is_some_and(|value| value != "0")
+    option || std::env::var_os("ADV_DEBUG").is_some_and(|value| value != "0") || android_property()
+}
+
+/// Android apps take no environment from adb, so `adb shell setprop
+/// debug.hitode.debug 1` asks the next session for a debugger.
+#[cfg(target_os = "android")]
+fn android_property() -> bool {
+    let mut value = [0 as libc::c_char; libc::PROP_VALUE_MAX as usize];
+    // SAFETY: the buffer holds PROP_VALUE_MAX bytes, as the call requires.
+    let length =
+        unsafe { libc::__system_property_get(c"debug.hitode.debug".as_ptr(), value.as_mut_ptr()) };
+    length > 0 && value[0] != b'0' as libc::c_char
+}
+
+#[cfg(not(target_os = "android"))]
+fn android_property() -> bool {
+    false
 }
 
 /// The folder holding one socket per debuggable session.
@@ -162,6 +180,9 @@ impl Debugger {
         let directory = socket_dir();
         let socket = directory.join(format!("{}-{}.sock", std::process::id(), unix_us()));
         listen(&directory, &socket, shared.clone())?;
+        #[cfg(target_os = "android")]
+        eprintln!("debug: serving the abstract socket hitode-debug");
+        #[cfg(not(target_os = "android"))]
         eprintln!("debug: serving {}", socket.display());
         Ok(Self {
             shared,
@@ -377,8 +398,18 @@ impl Debugger {
             .collect();
         let name = format!("snap-{}-{label}", now / 1000);
         let mut text = String::new();
+        // The execution thread is stopped while a snapshot is written, so
+        // its cost is logged by section.
+        let mut timing = Vec::new();
+        let mut clock = std::time::Instant::now();
         let mut section = |title: &str, body: String| {
             text.push_str(&format!("== {title}\n{body}\n\n"));
+            timing.push(format!(
+                "{} {}ms",
+                title.split(' ').next().unwrap_or(title),
+                clock.elapsed().as_millis()
+            ));
+            clock = std::time::Instant::now();
         };
         section("info", self.shared.info.clone());
         section("marks", marks_text(&self.shared, 0));
@@ -408,6 +439,11 @@ impl Debugger {
         self.snapshot_baseline = std::mem::replace(&mut self.slow_baseline, reset);
         section("modules", runtime.modules_report());
         section("report", runtime.report());
+        eprintln!(
+            "debug: snapshot {name} took {}ms: {}",
+            (unix_us() - now) / 1000,
+            timing.join(", ")
+        );
         std::fs::create_dir_all(&self.snapshot_dir).map_err(|e| e.to_string())?;
         let path = self.snapshot_dir.join(format!("{name}.txt"));
         std::fs::write(&path, &text).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -561,6 +597,16 @@ fn part_name(part: adv_runtime::JitPart) -> &'static str {
 }
 
 fn classify(sample: &profile::Sample) -> Classified {
+    if sample.depth == 0 {
+        return Classified {
+            unix_us: sample.unix_us,
+            kind: Kind::Idle,
+            eip: None,
+            inst: None,
+            part: "-".into(),
+            host: None,
+        };
+    }
     let frames = &sample.frames[..usize::from(sample.depth)];
     let at_ns = u128::from(sample.unix_us) * 1000;
     let pc = frames.first().copied().unwrap_or_default();
@@ -725,13 +771,23 @@ fn host_image() -> String {
 }
 
 fn samples_text(shared: &Shared, since: u64) -> String {
-    let mut text = vec!["unix_us\tkind\teip\tinst\tpart\tpc\timage\tsymbol".to_owned()];
+    let mut text = vec!["unix_us\tkind\teip\tinst\tpart\tpc\timage\tsymbol\tcallers".to_owned()];
     let hex = |eip: Option<u32>| eip.map_or_else(|| "-".into(), |eip| format!("{eip:#010x}"));
     for sample in shared.profiler.since(since) {
         let row = classify(&sample);
         let (image, name) = row.host.and_then(symbol).unwrap_or_default();
+        // A host sample's LR and the return addresses above it: leaf
+        // functions such as memcpy are named by who called them.
+        let callers = match row.host {
+            Some(_) => sample.frames[1..usize::from(sample.depth).min(CALLERS + 1)]
+                .iter()
+                .map(|frame| format!("{frame:#x}"))
+                .collect::<Vec<_>>()
+                .join(","),
+            None => "-".into(),
+        };
         text.push(format!(
-            "{}\t{:?}\t{}\t{}\t{}\t{}\t{image}\t{name}",
+            "{}\t{:?}\t{}\t{}\t{}\t{}\t{image}\t{name}\t{callers}",
             row.unix_us,
             row.kind,
             hex(row.eip),
@@ -923,7 +979,7 @@ fn immediate(shared: &Shared, command: &str, args: &[&str]) -> Option<Result<Str
         "profile" => match args.first().copied() {
             None => Ok(format!("sampler at {} Hz", shared.profiler.hz())),
             Some(_) if !shared.profiler.supported => {
-                Err("the in-process sampler supports Apple arm64 hosts only".into())
+                Err("the in-process sampler supports arm64 hosts only".into())
             }
             Some("off") => {
                 shared.profiler.set_hz(0);
@@ -968,12 +1024,26 @@ at a guest boundary: threads, stack CONTEXT [FRAMES], calls [COUNT], gaps,
   snap [LABEL]";
 
 #[cfg(unix)]
+#[cfg_attr(target_os = "android", allow(unused_variables))]
 fn listen(directory: &Path, socket: &Path, shared: Arc<Shared>) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
-    std::fs::create_dir_all(directory).map_err(|e| format!("{}: {e}", directory.display()))?;
-    let _ = std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700));
-    let listener = UnixListener::bind(socket).map_err(|e| format!("{}: {e}", socket.display()))?;
+    // Android's private data directory is closed to adb, so the socket has
+    // an abstract name that `adb forward tcp:0 localabstract:hitode-debug`
+    // reaches.
+    #[cfg(target_os = "android")]
+    let listener = {
+        use std::os::android::net::SocketAddrExt;
+        let address = std::os::unix::net::SocketAddr::from_abstract_name(ANDROID_SOCKET)
+            .map_err(|e| e.to_string())?;
+        UnixListener::bind_addr(&address).map_err(|e| format!("@hitode-debug: {e}"))?
+    };
+    #[cfg(not(target_os = "android"))]
+    let listener = {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(directory).map_err(|e| format!("{}: {e}", directory.display()))?;
+        let _ = std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700));
+        UnixListener::bind(socket).map_err(|e| format!("{}: {e}", socket.display()))?
+    };
     listener.set_nonblocking(true).map_err(|e| e.to_string())?;
     std::thread::Builder::new()
         .name("adv-debug-listen".into())
@@ -999,6 +1069,9 @@ fn listen(directory: &Path, socket: &Path, shared: Arc<Shared>) -> Result<(), St
 fn listen(_: &Path, _: &Path, _: Arc<Shared>) -> Result<(), String> {
     Err("the debugger socket needs a Unix host".into())
 }
+
+#[cfg(target_os = "android")]
+const ANDROID_SOCKET: &[u8] = b"hitode-debug";
 
 #[cfg(unix)]
 fn connection(stream: std::os::unix::net::UnixStream, shared: &Shared) {
