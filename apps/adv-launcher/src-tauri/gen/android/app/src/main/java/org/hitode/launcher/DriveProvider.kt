@@ -36,9 +36,12 @@ class DriveProvider : DocumentsProvider() {
         )
     }
 
-    /** Where `drive.rs` keeps drive C: on Android: the app data directory's prefix. */
+    /**
+     * Where `drive.rs` keeps drive C: on Android: the prefix in Tauri's app
+     * data directory, which is the app's own data directory.
+     */
     private val drive: File
-        get() = File(File(context!!.dataDir, context!!.packageName), "wine/drive_c")
+        get() = File(context!!.dataDir, "wine/drive_c")
 
     override fun onCreate() = true
 
