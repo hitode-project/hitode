@@ -102,6 +102,15 @@ targets:
       - sdk: WebKit.framework
     preBuildScripts:
       - script: |
+          # The AppIcon images are generated, not committed: an asset catalog without
+          # them builds an app with no icon.
+          icons="$SRCROOT/Assets.xcassets/AppIcon.appiconset"
+          for name in $(sed -n 's/.*"filename" *: *"\([^"]*\)".*/\1/p' "$icons/Contents.json"); do
+            [ -f "$icons/$name" ] || cp "$SRCROOT/../../icons/ios/$name" "$icons/" || {
+              echo "error: AppIcon $name is missing; run apps/adv-launcher/scripts/icons.py" >&2
+              exit 1
+            }
+          done
           pnpm tauri ios xcode-script -v --platform "${PLATFORM_DISPLAY_NAME:?}" --sdk-root "${SDKROOT:?}" --framework-search-paths "${FRAMEWORK_SEARCH_PATHS:?}" --header-search-paths "${HEADER_SEARCH_PATHS:?}" --gcc-preprocessor-definitions "${GCC_PREPROCESSOR_DEFINITIONS:-}" --configuration "${CONFIGURATION:?}" ${FORCE_COLOR} ${ARCHS:?}
         name: Build Rust Code
         basedOnDependencyAnalysis: false

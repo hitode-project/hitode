@@ -244,7 +244,7 @@ NT services follow Wine 11.0's argument checks, server requests and status codes
 
 ### NT-PROC-2 Process and thread operations
 
-**Rule**: Process enumeration, suspension, thread alerts, continuation, and APC calls MUST follow Wine's behavior within `WINE-SYS-4`. Suspension MUST update machine contexts.
+**Rule**: Process enumeration, suspension, thread alerts, continuation, and APC calls MUST follow Wine's behavior within `WINE-SYS-4`. Suspension MUST update machine contexts. An ended thread's stack MUST leave the process's allocations, so that later allocations of its range succeed.
 **Verification**: Test
 
 ### NT-PROC-3 Jobs and completions
@@ -382,7 +382,7 @@ FreeType is a host library under WINE-UNIX-6.
 
 ### NAT-BODY-4 DIB primitives
 
-**Rule**: DIB bodies MUST preserve Wine's pixels, padding, overlap traversal, bit fields, palette selection, blend arithmetic, and interpolation rounding. Unsupported formats or inaccessible memory MUST decline before writes. Field offsets and data addresses MUST match the pinned Unix module's DWARF.
+**Rule**: DIB bodies MUST preserve Wine's pixels, padding, overlap traversal, bit fields, palette selection, blend arithmetic, and interpolation rounding. Rect and row bodies MUST snapshot only the rows they touch, and unsupported formats or inaccessible memory MUST decline before writes. Field offsets and data addresses MUST match the pinned Unix module's DWARF.
 **Verification**: Test
 
 ### NAT-BODY-5 Code page bodies
@@ -423,6 +423,16 @@ FreeType is a host library under WINE-UNIX-6.
 ### NAT-BODY-12 Queue key state
 
 **Rule**: The native `win32u.dll!NtUserGetKeyState` body MUST return Wine's synchronized queue key state, masked and sign-extended, to the guest. Missing server links, threads or queues MUST retain guest execution without creating a queue or leaving server errors or references.
+**Verification**: Test
+
+### NAT-BODY-13 Statically linked helpers
+
+**Rule**: Runtime helpers that game images link statically MUST bind only where an executable section holds their exact bytes, each copy under its own thunk. Borland's division bodies MUST return EDX:EAX, pop the divisor and zero ECX, and its copies MUST set EAX, ECX and EDX as its code does. A zero divisor or a forward copy into the source's tail MUST retain guest execution.
+**Verification**: Test
+
+### NAT-BODY-14 Engine pixel routines
+
+**Rule**: Engine pixel bodies MUST write the pixels the routine writes, bit for bit, even where its pair paths round unlike its single-pixel path. They MUST keep every register the routine keeps. A destination overlapping a source other than in place MUST retain guest execution.
 **Verification**: Test
 
 ## Host DLL images
@@ -677,7 +687,7 @@ UI projection refreshes MUST wake execution only when they queue new guest work.
 
 ### WINE-SES-5 Regional text
 
-**Rule**: A session's system and user locales MUST follow its ANSI code page: ja-JP for 932, zh-CN for 936. Wine MUST load fonts discovered by the portable backend, including nested directories. Missing standard families MUST use its regional matching order, require the declared character set, and prefer actual TrueType outlines without overriding installed families.
+**Rule**: Session locales MUST follow the ANSI code page: ja-JP for 932, zh-CN for 936. Wine MUST load portable-backend fonts whose declared CJK sets map a sample character. Missing standard families MUST take a face with their character set, never override installed families, and rank CJK by regional order before TrueType.
 **Verification**: Test
 
 macOS simplified Chinese matching prefers Heiti SC before Songti SC. Songti's

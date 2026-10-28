@@ -7,6 +7,8 @@ mod execution;
 mod frame_pacer;
 mod frontend;
 #[cfg(host_view)]
+pub use adv_runtime::system_font_families;
+#[cfg(host_view)]
 pub use execution::Execution;
 #[cfg(host_view)]
 mod logging;

@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Interactive debugger for a running Hitode session (adv-run --debug, or the
-launcher / adv-run started with ADV_DEBUG=1).
+launcher / adv-run started with ADV_DEBUG=1; on Android, `adb shell setprop
+debug.hitode.debug 1` before starting the game, then --adb).
 
 Usage:
   python3 tools/debug/hitode_debug.py list
-  python3 tools/debug/hitode_debug.py [--pid PID | --socket PATH] [COMMAND ...]
+  python3 tools/debug/hitode_debug.py [--pid PID | --socket PATH | --adb] [COMMAND ...]
   python3 tools/debug/hitode_debug.py --snapshot FILE tl|prof|analyze [OPTIONS]
 
 Without COMMAND it opens a prompt. Session commands (see `help`) go to the
@@ -46,13 +47,21 @@ def socket_dir():
 
 
 class Session:
-    def __init__(self, path):
+    def __init__(self, path=None, port=None):
+        """A local socket path, or a TCP port that adb forwards to an
+        Android session."""
         self.path = path
-        self.pid = int(path.name.split("-")[0])
-        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.sock.connect(str(path))
+        if port is None:
+            self.pid = int(path.name.split("-")[0])
+            self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.sock.connect(str(path))
+        else:
+            self.sock = socket.create_connection(("127.0.0.1", port))
         self.reader = self.sock.makefile("r", encoding="utf-8")
         self.next_id = 0
+        if port is not None:
+            self.info = dict(line.split("=", 1) for line in self.text("info").splitlines() if "=" in line)
+            self.pid = int(self.info.get("pid", 0))
 
     def ask(self, line):
         """(ok, text) for one request line."""
@@ -183,9 +192,41 @@ def readable(name):
     return "::".join(parts) or name
 
 
+def android_symbolize(addresses, image):
+    """Host addresses in an Android session's library through the NDK's
+    llvm-symbolizer and the unstripped local build (HITODE_ANDROID_LIB)."""
+    library = Path(os.environ.get("HITODE_ANDROID_LIB") or
+                   ROOT / "target" / "aarch64-linux-android" / "release" / Path(image[0]).name)
+    ndk = Path(os.environ.get("ANDROID_NDK_HOME", ""))
+    tools = sorted(ndk.glob("toolchains/llvm/prebuilt/*/bin/llvm-symbolizer"))
+    if not library.exists() or not tools:
+        return {}
+    base = int(image[1], 16)
+    # Addresses in other images would give negative offsets.
+    addresses = [address for address in addresses if int(address, 16) > base]
+    offsets = [f"{int(address, 16) - base:#x}" for address in addresses]
+    try:
+        out = subprocess.run([str(tools[0]), f"--obj={library}", "--functions=linkage",
+                              "--no-inlines", "--output-style=JSON", *offsets],
+                             capture_output=True, text=True, timeout=120).stdout
+        # One JSON array of address records.
+        records = json.loads(out or "[]")
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return {}
+    names = {}
+    for address, record in zip(addresses, records):
+        symbol = (record.get("Symbol") or [{}])[0].get("FunctionName", "")
+        if symbol and symbol != "??":
+            names[address] = readable(symbol)
+    return names
+
+
 def symbolize(pid, addresses, image=None):
-    """Host addresses to names through atos on macOS; empty elsewhere. With
-    image=(path, base) it reads the binary, so the process may have ended."""
+    """Host addresses to names through atos on macOS, or llvm-symbolizer for
+    an Android image; empty elsewhere. With image=(path, base) it reads the
+    binary, so the process may have ended."""
+    if image and image[0].startswith("/data/") and addresses:
+        return android_symbolize(addresses, image)
     if sys.platform != "darwin" or not addresses:
         return {}
     target = ["-o", image[0], "-l", image[1]] if image else ["-p", str(pid)]
@@ -516,7 +557,9 @@ def show_profile(session, args):
         for (where, part), count in instructions(busy, modules).most_common(options.top * 2):
             print(f"  {count:6} {100 * count / len(busy):5.1f}% {where} {part}")
     hosts = Counter(s["pc"] for s in busy if s["kind"] in ("Host", "HostFromGuest"))
-    names = symbolize(session.pid, [pc for pc, _ in hosts.most_common(200)])
+    info = getattr(session, "info", {})
+    image = (info["host_image"], info["host_base"]) if "host_base" in info else None
+    names = symbolize(session.pid, [pc for pc, _ in hosts.most_common(200)], image)
     by_name = Counter()
     for pc, count in hosts.items():
         sample = next(s for s in busy if s["pc"] == pc)
@@ -524,6 +567,20 @@ def show_profile(session, args):
     print("host functions in busy samples:")
     for name, count in by_name.most_common(options.top):
         print(f"  {count:6} {100 * count / len(busy):5.1f}% {name[:140]}")
+    chains = Counter(s["callers"] for s in busy
+                     if s["kind"] in ("Host", "HostFromGuest") and s.get("callers", "-") not in ("-", ""))
+    if chains:
+        frames = Counter(frame for chain, count in chains.items() for frame in chain.split(","))
+        called = symbolize(session.pid, [frame for frame, _ in frames.most_common(400)], image)
+        by_chain = Counter()
+        for s in busy:
+            chain = s.get("callers", "-")
+            if s["kind"] in ("Host", "HostFromGuest") and chain not in ("-", ""):
+                pc = names.get(s["pc"]) or f"{s['image']}!{s['symbol'] or s['pc']}"
+                by_chain[" <- ".join([pc, *(called.get(f, f) for f in chain.split(","))])] += 1
+        print("host call chains in busy samples (function <- callers):")
+        for chain, count in by_chain.most_common(options.top):
+            print(f"  {count:6} {100 * count / len(busy):5.1f}% {chain[:400]}")
 
 
 def write(name, body):
@@ -565,6 +622,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--pid", type=int)
     parser.add_argument("--socket", type=Path)
+    parser.add_argument("--adb", action="store_true",
+                        help="attach to the Android session that `adb shell setprop debug.hitode.debug 1` started")
     parser.add_argument("--snapshot", type=Path, help="read a pulled snapshot instead of a session")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     options = parser.parse_args()
@@ -577,6 +636,16 @@ def main():
         command, args = options.command[0], options.command[1:]
         {"tl": show_timeline, "prof": show_profile, "analyze": show_analysis}[command](snapshot, args)
         return
+    if options.adb:
+        port = subprocess.run(["adb", "forward", "tcp:0", "localabstract:hitode-debug"],
+                              capture_output=True, text=True, check=True).stdout.strip()
+        session = Session(port=int(port))
+        print(f"attached to the Android session {session.pid} on port {port}")
+        if options.command:
+            run(session, shlex.join(options.command))
+        else:
+            interact(session)
+        return
     path = options.socket
     if path is None:
         live = [p for p, alive in sessions() if alive and (options.pid is None or p.name.startswith(f"{options.pid}-"))]
@@ -587,6 +656,11 @@ def main():
     if options.command:
         run(session, shlex.join(options.command))
         return
+    print(f"attached to {path.name}; `help` lists commands, Ctrl+D leaves")
+    interact(session)
+
+
+def interact(session):
     try:
         import readline
         history = Path.home() / ".hitode_debug_history"
@@ -594,7 +668,6 @@ def main():
             readline.read_history_file(history)
     except (ImportError, OSError):
         readline = None
-    print(f"attached to {path.name}; `help` lists commands, Ctrl+D leaves")
     try:
         while True:
             try:

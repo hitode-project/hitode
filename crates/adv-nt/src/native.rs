@@ -23,6 +23,7 @@ mod crt;
 mod dib;
 #[cfg(any(target_vendor = "apple", target_os = "android"))]
 mod input;
+mod linked;
 mod mixer;
 mod nls;
 mod pixels;
@@ -143,11 +144,14 @@ static BODIES: std::sync::LazyLock<Vec<Body>> = std::sync::LazyLock::new(|| {
     }
     bodies.extend(png::bodies());
     bodies.extend(zlib::bodies());
+    bodies.extend(linked::bodies());
     bodies
 });
 
-/// The host functions of the bodies.
+/// The host functions of the bodies. A linked helper's thunk names its
+/// body and address, as `body@address`.
 pub(crate) fn host_fn(name: &str) -> Option<HostFn> {
+    let name = name.split_once('@').map_or(name, |(body, _)| body);
     let (index, body) = bodies().enumerate().find(|(_, body)| body.name == name)?;
     Some(HostFn {
         leaf: None,
@@ -190,6 +194,19 @@ struct Trampolines {
 
 /// Binds the bodies of the image `pe`, mapped at `base`.
 pub(crate) fn bind(cpu: &mut dyn Guest, sys: &mut Sys, ext: &mut Ext, base: u32, pe: &adv_pe::Pe) {
+    if !ext
+        .try_get::<Images>()
+        .is_some_and(|images| images.0.contains_key(&base))
+    {
+        // A game image: only helpers it links statically are known.
+        for section in &pe.sections {
+            if section.characteristics & adv_pe::scn::MEM_EXECUTE != 0 {
+                let start = base + section.virtual_address;
+                linked::bind(cpu, sys, ext, start, section.mem_size());
+            }
+        }
+        return;
+    }
     let mut relocations = pe.relocations().unwrap_or_default();
     relocations.sort_unstable();
     bind_relocated(cpu, sys, ext, base, &relocations);

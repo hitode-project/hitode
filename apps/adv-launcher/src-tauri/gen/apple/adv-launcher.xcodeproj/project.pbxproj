@@ -381,7 +381,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "pnpm tauri ios xcode-script -v --platform \"${PLATFORM_DISPLAY_NAME:?}\" --sdk-root \"${SDKROOT:?}\" --framework-search-paths \"${FRAMEWORK_SEARCH_PATHS:?}\" --header-search-paths \"${HEADER_SEARCH_PATHS:?}\" --gcc-preprocessor-definitions \"${GCC_PREPROCESSOR_DEFINITIONS:-}\" --configuration \"${CONFIGURATION:?}\" ${FORCE_COLOR} ${ARCHS:?}\n";
+			shellScript = "# The AppIcon images are generated, not committed: an asset catalog without\n# them builds an app with no icon.\nicons=\"$SRCROOT/Assets.xcassets/AppIcon.appiconset\"\nfor name in $(sed -n 's/.*\"filename\" *: *\"\\([^\"]*\\)\".*/\\1/p' \"$icons/Contents.json\"); do\n  [ -f \"$icons/$name\" ] || cp \"$SRCROOT/../../icons/ios/$name\" \"$icons/\" || {\n    echo \"error: AppIcon $name is missing; run apps/adv-launcher/scripts/icons.py\" >&2\n    exit 1\n  }\ndone\npnpm tauri ios xcode-script -v --platform \"${PLATFORM_DISPLAY_NAME:?}\" --sdk-root \"${SDKROOT:?}\" --framework-search-paths \"${FRAMEWORK_SEARCH_PATHS:?}\" --header-search-paths \"${HEADER_SEARCH_PATHS:?}\" --gcc-preprocessor-definitions \"${GCC_PREPROCESSOR_DEFINITIONS:-}\" --configuration \"${CONFIGURATION:?}\" ${FORCE_COLOR} ${ARCHS:?}\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 

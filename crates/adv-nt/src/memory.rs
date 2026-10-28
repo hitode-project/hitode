@@ -105,6 +105,18 @@ impl Memory {
         );
     }
 
+    /// Forgets the platform's private region at `base..end`, which the
+    /// platform releases itself, so it cannot shadow a later allocation.
+    pub fn forget(&mut self, base: u32, end: u32) {
+        if self
+            .regions
+            .get(&base)
+            .is_some_and(|region| region.kind == Kind::Private && region.end(base) == end)
+        {
+            self.regions.remove(&base);
+        }
+    }
+
     fn prot(&self, protection: u32) -> Result<Prot, Status> {
         let prot = match protection & !(PAGE_GUARD | PAGE_NOCACHE | PAGE_WRITECOMBINE) {
             PAGE_NOACCESS => Prot(0),

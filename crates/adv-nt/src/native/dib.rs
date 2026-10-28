@@ -1,6 +1,7 @@
 //! Wine 11's DIB primitives, with the pinned Unix module's layouts.
-//! Work stays in host snapshots until every access succeeds. Overlapping
-//! surfaces share a snapshot, preserving Wine's traversal and aliasing.
+//! Work stays in host snapshots of the rows touched until every access
+//! succeeds. Overlapping surfaces share a snapshot, preserving Wine's
+//! traversal and aliasing.
 
 use adv_cpu::backend::{Guest, Prot, Reg};
 use adv_machine::{Conv, Env, Outcome, Sys};
@@ -241,21 +242,47 @@ impl Dib {
                     .wrapping_div(8) as u32,
             )
     }
+    fn row_bytes(&self) -> Option<u32> {
+        u32::try_from(self.width)
+            .ok()?
+            .checked_mul(self.bpp)?
+            .div_ceil(32)
+            .checked_mul(4)
+    }
     fn load(&self, mem: &mut Memory<'_>, writable: bool) -> Option<()> {
         let rows = u32::try_from(self.height.checked_sub(1)?).ok()?;
         let stride = self.stride.unsigned_abs();
-        let len = rows.checked_mul(stride)?.checked_add(
-            u32::try_from(self.width)
-                .ok()?
-                .checked_mul(self.bpp)?
-                .div_ceil(32)
-                .checked_mul(4)?,
-        )?;
+        let len = rows.checked_mul(stride)?.checked_add(self.row_bytes()?)?;
         let base = if self.stride < 0 {
             self.bits.checked_sub(rows.checked_mul(stride)?)?
         } else {
             self.bits
         };
+        mem.load(base, len, writable)
+    }
+    /// Snapshots only the rows `rows` of the clip rect touches, or the whole
+    /// surface when they leave it, so stray accesses still decline.
+    fn load_rows(
+        &self,
+        mem: &mut Memory<'_>,
+        writable: bool,
+        rows: std::ops::Range<i32>,
+    ) -> Option<()> {
+        if rows.is_empty() {
+            return Some(());
+        }
+        let first = self.top.checked_add(rows.start)?;
+        let last = self.top.checked_add(rows.end - 1)?;
+        if first < 0 || last >= self.height {
+            return self.load(mem, writable);
+        }
+        let len = ((last - first) as u32)
+            .checked_mul(self.stride.unsigned_abs())?
+            .checked_add(self.row_bytes()?)?;
+        let lowest = if self.stride < 0 { last } else { first };
+        let base = self
+            .bits
+            .wrapping_add(lowest.wrapping_mul(self.stride) as u32);
         mem.load(base, len, writable)
     }
     fn rgb(&self, pixel: u32) -> [u32; 3] {
@@ -389,6 +416,15 @@ fn rects(cpu: &dyn Guest, at: u32, count: u32) -> Option<Vec<[i32; 4]>> {
             .collect(),
     )
 }
+/// The rows any of `rects` covers.
+fn span(rects: &[[i32; 4]]) -> std::ops::Range<i32> {
+    let rows = rects.iter().filter(|r| r[1] < r[3]);
+    let start = rows.clone().map(|r| r[1]).min().unwrap_or(0);
+    start..rows.map(|r| r[3]).max().unwrap_or(0)
+}
+fn shift(rows: &std::ops::Range<i32>, by: i32) -> Option<std::ops::Range<i32>> {
+    Some(rows.start.checked_add(by)?..rows.end.checked_add(by)?)
+}
 fn point(cpu: &dyn Guest, at: u32) -> Option<(i32, i32)> {
     let b = read(cpu, at, point::SIZE)?;
     Some((word(&b, point::x) as i32, word(&b, point::y) as i32))
@@ -458,7 +494,7 @@ fn solid_rects(env: &mut Env<'_>) -> Option<u64> {
         cpu: env.cpu,
         regions: Vec::new(),
     };
-    dib.load(&mut mem, true)?;
+    dib.load_rows(&mut mem, true, span(&rects))?;
     for [l, t, r, b] in rects {
         let len = usize::try_from(r.checked_sub(l)?)
             .ok()?
@@ -524,7 +560,7 @@ fn pattern_rects(env: &mut Env<'_>) -> Option<u64> {
         cpu: env.cpu,
         regions: Vec::new(),
     };
-    dib.load(&mut mem, true)?;
+    dib.load_rows(&mut mem, true, span(&rects))?;
     let mut mask = brush.clone();
     mask.left = 0;
     mask.top = 0;
@@ -570,8 +606,8 @@ fn copy_rect(env: &mut Env<'_>) -> Option<u64> {
         cpu: env.cpu,
         regions: Vec::new(),
     };
-    dst.load(&mut mem, true)?;
-    src.load(&mut mem, false)?;
+    dst.load_rows(&mut mem, true, t..b)?;
+    src.load_rows(&mut mem, false, shift(&(0..b.wrapping_sub(t)), sy)?)?;
     for row in 0..b - t {
         let row = if overlap & 8 != 0 {
             b - t - row - 1
@@ -731,8 +767,9 @@ fn blend_rects(env: &mut Env<'_>) -> Option<u64> {
         cpu: env.cpu,
         regions: Vec::new(),
     };
-    dst.load(&mut mem, true)?;
-    src.load(&mut mem, false)?;
+    let rows = span(&rects);
+    dst.load_rows(&mut mem, true, rows.clone())?;
+    src.load_rows(&mut mem, false, shift(&rows, sy)?)?;
     for [l, t, r, b] in rects {
         for y in t..b {
             if dst.kind == FUNCS_8888 {
@@ -832,7 +869,7 @@ fn gradient_rect(env: &mut Env<'_>) -> Option<u64> {
         cpu: env.cpu,
         regions: Vec::new(),
     };
-    dst.load(&mut mem, true)?;
+    dst.load_rows(&mut mem, true, t..b)?;
     for y in t..b {
         let (left, right) = if mode == 2 {
             let x1 = if y < xy[1].1 {
@@ -929,8 +966,8 @@ fn mask_rect(env: &mut Env<'_>) -> Option<u64> {
         cpu: env.cpu,
         regions: Vec::new(),
     };
-    dst.load(&mut mem, true)?;
-    src.load(&mut mem, false)?;
+    dst.load_rows(&mut mem, true, t..b)?;
+    src.load_rows(&mut mem, false, shift(&(0..b.wrapping_sub(t)), sy)?)?;
     for y in t..b {
         for x in l..r {
             let pos = (sx & 7) + x - l;
@@ -987,8 +1024,8 @@ fn glyph(env: &mut Env<'_>, subpixel: bool) -> Option<u64> {
         cpu: env.cpu,
         regions: Vec::new(),
     };
-    dst.load(&mut mem, true)?;
-    glyph.load(&mut mem, false)?;
+    dst.load_rows(&mut mem, true, t..b)?;
+    glyph.load_rows(&mut mem, false, shift(&(0..b.wrapping_sub(t)), sy)?)?;
     for y in t..b {
         for x in l..r {
             let mask = mem.pixel(
@@ -1063,8 +1100,8 @@ fn scale_row(env: &mut Env<'_>, shrink: bool) -> Option<u64> {
         cpu: env.cpu,
         regions: Vec::new(),
     };
-    dst.load(&mut mem, true)?;
-    src.load(&mut mem, false)?;
+    dst.load_rows(&mut mem, true, dy..dy.checked_add(1)?)?;
+    src.load_rows(&mut mem, false, sy..sy.checked_add(1)?)?;
     for _ in 0..word(&p, stretch::length) {
         let at = dst.at(dx, dy);
         let src = mem.pixel(src.at(sx, sy), dst.size())?;
