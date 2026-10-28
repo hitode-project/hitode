@@ -425,6 +425,16 @@ FreeType is a host library under WINE-UNIX-6.
 **Rule**: The native `win32u.dll!NtUserGetKeyState` body MUST return Wine's synchronized queue key state, masked and sign-extended, to the guest. Missing server links, threads or queues MUST retain guest execution without creating a queue or leaving server errors or references.
 **Verification**: Test
 
+### NAT-BODY-13 Statically linked helpers
+
+**Rule**: Runtime helpers that game images link statically MUST bind only where an executable section holds their exact bytes, each copy under its own thunk. Borland's division bodies MUST return EDX:EAX, pop the divisor and zero ECX, and its copies MUST set EAX, ECX and EDX as its code does. A zero divisor or a forward copy into the source's tail MUST retain guest execution.
+**Verification**: Test
+
+### NAT-BODY-14 Engine pixel routines
+
+**Rule**: Engine pixel bodies MUST write the pixels the routine writes, bit for bit, even where its pair paths round unlike its single-pixel path. They MUST keep every register the routine keeps. A destination overlapping a source other than in place MUST retain guest execution.
+**Verification**: Test
+
 ## Host DLL images
 
 ### WINE-DLL-1 Loader-owned entries
