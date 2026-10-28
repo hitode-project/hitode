@@ -10,7 +10,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "adv-abi"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "adv-abi-macros",
  "adv-cpu",
@@ -24,7 +24,7 @@ dependencies = [
 
 [[package]]
 name = "adv-abi-macros"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -33,7 +33,7 @@ dependencies = [
 
 [[package]]
 name = "adv-cpu"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "adv-cpu-a64",
  "adv-sync",
@@ -45,7 +45,7 @@ dependencies = [
 
 [[package]]
 name = "adv-cpu-a64"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "adv-cpu-core",
  "adv-sync",
@@ -59,7 +59,7 @@ dependencies = [
 
 [[package]]
 name = "adv-cpu-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "adv-sync",
  "cc",
@@ -74,7 +74,7 @@ dependencies = [
 
 [[package]]
 name = "adv-device"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "adv-sync",
  "block2",
@@ -108,7 +108,7 @@ dependencies = [
 
 [[package]]
 name = "adv-drv"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "adv-abi",
  "adv-cpu",
@@ -123,7 +123,7 @@ dependencies = [
 
 [[package]]
 name = "adv-dx"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "adv-abi",
  "adv-cpu",
@@ -144,7 +144,7 @@ dependencies = [
 
 [[package]]
 name = "adv-jit-helper"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "idevice",
  "objc2",
@@ -157,7 +157,7 @@ dependencies = [
 
 [[package]]
 name = "adv-launcher"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "adv-report",
  "adv-shell",
@@ -189,7 +189,7 @@ dependencies = [
 
 [[package]]
 name = "adv-machine"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "adv-abi",
  "adv-cpu",
@@ -202,7 +202,7 @@ dependencies = [
 
 [[package]]
 name = "adv-nt"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "adv-cpu",
  "adv-device",
@@ -218,7 +218,7 @@ dependencies = [
 
 [[package]]
 name = "adv-os"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "adv-abi",
  "adv-cpu",
@@ -233,7 +233,7 @@ dependencies = [
 
 [[package]]
 name = "adv-pe"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "adv-samples",
  "serde_json",
@@ -242,7 +242,7 @@ dependencies = [
 
 [[package]]
 name = "adv-report"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -285,14 +285,14 @@ dependencies = [
 
 [[package]]
 name = "adv-samples"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "adv-pe",
 ]
 
 [[package]]
 name = "adv-shell"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "adv-device",
  "adv-machine",
@@ -319,14 +319,14 @@ dependencies = [
 
 [[package]]
 name = "adv-sync"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "adv-unicorn"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "adv-cpu",
  "unicorn-engine",
@@ -334,7 +334,7 @@ dependencies = [
 
 [[package]]
 name = "adv-unix"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "adv-abi",
  "adv-cpu",
@@ -351,7 +351,7 @@ dependencies = [
 
 [[package]]
 name = "adv-wineserver"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "cc",
  "corosensei",
@@ -5934,7 +5934,7 @@ dependencies = [
 
 [[package]]
 name = "tauri-plugin-storage"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "getrandom 0.3.4",
  "serde",
