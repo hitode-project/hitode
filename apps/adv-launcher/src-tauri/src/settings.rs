@@ -80,12 +80,12 @@ fn fresh_folder(parent: &std::path::Path) -> Result<PathBuf, String> {
 #[tauri::command]
 pub async fn font_families(path: Option<PathBuf>) -> Result<Vec<String>, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        // The game's renderer discovers installed fonts, including Android's.
+        let Some(path) = path else {
+            return Ok(adv_shell::system_font_families());
+        };
         let mut db = fontdb::Database::new();
-        if let Some(path) = path {
-            db.load_font_file(path).map_err(|e| e.to_string())?;
-        } else {
-            db.load_system_fonts();
-        }
+        db.load_font_file(path).map_err(|e| e.to_string())?;
         let mut names: Vec<_> = db
             .faces()
             .flat_map(|face| face.families.iter().map(|(name, _)| name.clone()))

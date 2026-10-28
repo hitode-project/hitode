@@ -533,6 +533,11 @@ pub const FONT_CACHE_CAPACITY: usize = 128;
 pub fn prefetch_system_fonts() {
     portable::prefetch_system_fonts();
 }
+/// The installed families that guest renderers can use, sorted, as a font
+/// menu lists them.
+pub fn system_font_families() -> Vec<String> {
+    portable::system_font_families()
+}
 impl Text {
     /// Export discovery and family matching to a guest font renderer. Prefer
     /// real TrueType outlines for legacy families and require their code page.

@@ -687,7 +687,7 @@ UI projection refreshes MUST wake execution only when they queue new guest work.
 
 ### WINE-SES-5 Regional text
 
-**Rule**: A session's system and user locales MUST follow its ANSI code page: ja-JP for 932, zh-CN for 936. Wine MUST load fonts discovered by the portable backend, including nested directories. Missing standard families MUST use its regional matching order, require the declared character set, and prefer actual TrueType outlines without overriding installed families.
+**Rule**: Session locales MUST follow the ANSI code page: ja-JP for 932, zh-CN for 936. Wine MUST load portable-backend fonts whose declared CJK sets map a sample character. Missing standard families MUST take a face with their character set, never override installed families, and rank CJK by regional order before TrueType.
 **Verification**: Test
 
 macOS simplified Chinese matching prefers Heiti SC before Songti SC. Songti's
