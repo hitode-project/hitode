@@ -83,14 +83,14 @@ fn wine_loads_host_exports_and_calls_hookable_imports() {
             let original = prefix.join("drive_c/windows/system32/version.dll");
             let target = std::fs::read_link(&original).unwrap();
             let before = std::fs::read(&target).unwrap();
-            adv_unix::builtin::install(prefix, &image).unwrap();
+            adv_unix::builtin::install(&prefix.join("drive_c"), &image).unwrap();
             assert!(!original.is_symlink());
             let installed = std::fs::read(&original).unwrap();
             assert_eq!(&installed[0x40..0x51], b"Wine builtin DLL\0");
             assert_eq!(std::fs::read(&target).unwrap(), before);
             use std::os::unix::fs::MetadataExt;
             let inode = std::fs::metadata(&original).unwrap().ino();
-            adv_unix::builtin::install(prefix, &image).unwrap();
+            adv_unix::builtin::install(&prefix.join("drive_c"), &image).unwrap();
             assert_eq!(std::fs::metadata(&original).unwrap().ino(), inode);
         },
     ) else {

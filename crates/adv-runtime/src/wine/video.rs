@@ -110,7 +110,7 @@ fn forward(env: &mut Env<'_>) -> Outcome {
     import.call(env, args, |_, result| Outcome::Return(result.value()))
 }
 
-pub(super) fn install<B: Backend>(machine: &mut Machine<B>, prefix: &Path) -> Result<(), String> {
+pub(super) fn install<B: Backend>(machine: &mut Machine<B>, drive: &Path) -> Result<(), String> {
     adv_dx::dshow::install(machine);
     machine.ext.get_mut::<adv_os::Heaps>().process_heap = machine.ext.get::<super::Heap>().0;
     machine.ext.insert(adv_dx::dshow::Host {
@@ -168,7 +168,7 @@ pub(super) fn install<B: Backend>(machine: &mut Machine<B>, prefix: &Path) -> Re
         },
     );
     for &(module, original, exports) in MODULES {
-        let directory = prefix.join("drive_c/windows/system32");
+        let directory = drive.join("windows/system32");
         let retained = directory.join(original);
         if !retained.exists() {
             std::fs::copy(directory.join(module), retained).map_err(|e| e.to_string())?;
@@ -192,7 +192,7 @@ pub(super) fn install<B: Backend>(machine: &mut Machine<B>, prefix: &Path) -> Re
             .map(|&(name, ordinal, _)| Export { name, ordinal })
             .collect();
         let image = ModuleImage::build(machine, module, &exports, &imports)?;
-        adv_unix::builtin::install(prefix, &image).map_err(|e| e.to_string())?;
+        adv_unix::builtin::install(drive, &image).map_err(|e| e.to_string())?;
     }
     Ok(())
 }

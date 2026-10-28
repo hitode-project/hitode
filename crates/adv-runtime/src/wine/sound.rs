@@ -67,10 +67,10 @@ fn no_driver(env: &mut adv_machine::Env<'_>, out: u32) -> Outcome {
 }
 
 /// Install the front over the session's audio stream and put its image in
-/// `prefix`, in place of Wine's.
+/// drive C: at `drive`, in place of Wine's.
 pub(super) fn install<B: Backend>(
     machine: &mut Machine<B>,
-    prefix: &Path,
+    drive: &Path,
     allocator: adv_dx::interop::GuestAllocator,
 ) -> Result<(), String> {
     if machine.ext.try_get::<adv_device::AudioControl>().is_none() {
@@ -97,6 +97,6 @@ pub(super) fn install<B: Backend>(
         .map(|(name, ordinal)| Export { name, ordinal })
         .collect();
     let built = ModuleImage::build(machine, MODULE, &exports, &[])?;
-    adv_unix::builtin::install(prefix, &built).map_err(|e| e.to_string())?;
+    adv_unix::builtin::install(drive, &built).map_err(|e| e.to_string())?;
     Ok(())
 }

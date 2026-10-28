@@ -74,11 +74,11 @@ pub fn register(registry: &mut Registry) {
 }
 
 /// Install the surface store, the graphics fronts and the user driver, and
-/// put their images in `prefix`, in place of Wine's. Call before the process
-/// starts with [`GRAPHICS_DRIVER`].
+/// put their images on drive C: at `drive`, in place of Wine's. Call before
+/// the process starts with [`GRAPHICS_DRIVER`].
 pub fn install<B: Backend>(
     machine: &mut Machine<B>,
-    prefix: &Path,
+    drive: &Path,
     width: u32,
     height: u32,
 ) -> Result<(), String> {
@@ -95,28 +95,28 @@ pub fn install<B: Backend>(
     )?;
     class::install(machine)?;
     let ddraw: Vec<_> = DDRAW_EXPORTS.into_iter().chain(class::EXPORTS).collect();
-    install_image(machine, prefix, DDRAW, &ddraw)?;
+    install_image(machine, drive, DDRAW, &ddraw)?;
     let heap = machine
         .ext
         .get_or_default::<adv_os::Heaps>()
         .create(&mut machine.cpu, &mut machine.sys.vm)
         .map_err(|e| e.to_string())?;
     machine.ext.insert(Heap(heap));
-    sound::install(machine, prefix, allocator())?;
-    video::install(machine, prefix)?;
-    winmm::install(machine, prefix)?;
-    xaudio2::install(machine, prefix)?;
+    sound::install(machine, drive, allocator())?;
+    video::install(machine, drive)?;
+    winmm::install(machine, drive)?;
+    xaudio2::install(machine, drive)?;
     #[cfg(feature = "gpu")]
     {
         adv_dx::d3d9::install(machine, d3d9_provider())?;
-        install_image(machine, prefix, D3D9, &D3D9_EXPORTS)?;
+        install_image(machine, drive, D3D9, &D3D9_EXPORTS)?;
     }
     let provider = adv_drv::Provider {
         memory: guest_memory,
         completed: crate::graphics::frame_completed,
     };
     adv_drv::media::install(machine)?;
-    adv_drv::install(machine, prefix, provider)
+    adv_drv::install(machine, drive, provider)
 }
 
 /// A thread that waits has ended its frame: publish the software frame it
@@ -160,7 +160,7 @@ fn geometry(
 /// Build the image of front `image`, which imports GDI for its memory DCs.
 fn install_image<B: Backend>(
     machine: &mut Machine<B>,
-    prefix: &Path,
+    drive: &Path,
     image: usize,
     names: &[&str],
 ) -> Result<(), String> {
@@ -183,7 +183,7 @@ fn install_image<B: Backend>(
             .collect(),
     }];
     let built = ModuleImage::build(machine, IMAGES[image], &exports, &imports)?;
-    adv_unix::builtin::install(prefix, &built).map_err(|e| e.to_string())?;
+    adv_unix::builtin::install(drive, &built).map_err(|e| e.to_string())?;
     Ok(())
 }
 

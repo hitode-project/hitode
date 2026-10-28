@@ -380,7 +380,7 @@ mod os {
                 }
                 // SAFETY: the script's debugger is attached and services the breakpoint.
                 let region = unsafe { prepare_region(std::ptr::null_mut(), len) };
-                NonNull::new(region).filter(|r| r.as_ptr() as usize % PAGE == 0)
+                NonNull::new(region).filter(|r| (r.as_ptr() as usize).is_multiple_of(PAGE))
             })
             .ok_or("the debugger did not prepare an executable region")?;
         SCRIPTED.store(true, Ordering::Relaxed);

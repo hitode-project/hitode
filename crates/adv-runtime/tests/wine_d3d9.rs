@@ -44,7 +44,7 @@ fn wine_gdi_draws_into_d3d9_surfaces_that_reach_the_presenter() {
         Platform(registry),
         |machine, prefix| {
             adv_unix::install(machine);
-            adv_runtime::wine::install(machine, prefix, 640, 480).unwrap();
+            adv_runtime::wine::install(machine, &prefix.join("drive_c"), 640, 480).unwrap();
             // As the shell attaches a GPU: its wake, and the readback worker.
             let gpu = block_on(adv_device::gpu::Gpu::request(false)).unwrap();
             let wake = adv_sync::WakeEvent::new().unwrap();

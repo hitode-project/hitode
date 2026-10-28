@@ -20,12 +20,14 @@ import java.nio.file.attribute.BasicFileAttributes
 /**
  * Drive C: of the player's Wine prefix as a root of the system Files app,
  * so players reach what games write outside their folders. A document id is
- * the path below the drive, empty for the drive itself.
+ * `C:` for the drive and `C:/` plus the path below it: DocumentsUI rejects
+ * the empty id of a root document.
  */
 class DriveProvider : DocumentsProvider() {
     companion object {
         const val AUTHORITY = "org.hitode.launcher.drive"
         const val ROOT = "drive"
+        private const val DRIVE = "C:"
         private val ROOT_COLUMNS = arrayOf(
             Root.COLUMN_ROOT_ID, Root.COLUMN_FLAGS, Root.COLUMN_TITLE,
             Root.COLUMN_DOCUMENT_ID, Root.COLUMN_ICON,
@@ -36,19 +38,24 @@ class DriveProvider : DocumentsProvider() {
         )
     }
 
-    /** Where `drive.rs` keeps drive C: on Android: the app data directory's prefix. */
+    /**
+     * Where `drive.rs` keeps drive C: on Android: the prefix in Tauri's app
+     * data directory, which is the app's own data directory.
+     */
     private val drive: File
-        get() = File(File(context!!.dataDir, context!!.packageName), "wine/drive_c")
+        get() = File(context!!.dataDir, "wine/drive_c")
 
     override fun onCreate() = true
 
     private fun file(id: String): File {
         // Ids name paths below the drive; its links lead into the Wine installation.
-        if (id.split('/').any { it == ".." }) throw FileNotFoundException(id)
-        return if (id.isEmpty()) drive else File(drive, id)
+        if (id == DRIVE) return drive
+        val path = id.removePrefix("$DRIVE/")
+        if (path == id || path.split('/').any { it == ".." }) throw FileNotFoundException(id)
+        return File(drive, path)
     }
 
-    private fun id(file: File) = file.toRelativeString(drive)
+    private fun id(file: File) = file.toRelativeString(drive).let { if (it.isEmpty()) DRIVE else "$DRIVE/$it" }
 
     /**
      * Whether the player may change `file`: what the drive's links lead to is
@@ -93,7 +100,7 @@ class DriveProvider : DocumentsProvider() {
             flags = if (file.isDirectory) Document.FLAG_DIR_SUPPORTS_CREATE else Document.FLAG_SUPPORTS_WRITE
             if (file != drive) flags = flags or Document.FLAG_SUPPORTS_DELETE or Document.FLAG_SUPPORTS_RENAME
         }
-        val name = if (file == drive) "C:" else file.name
+        val name = if (file == drive) DRIVE else file.name
         cursor.newRow()
             .add(Document.COLUMN_DOCUMENT_ID, id(file))
             .add(Document.COLUMN_DISPLAY_NAME, name)
@@ -110,7 +117,7 @@ class DriveProvider : DocumentsProvider() {
             .add(Root.COLUMN_ROOT_ID, ROOT)
             .add(Root.COLUMN_FLAGS, Root.FLAG_SUPPORTS_CREATE or Root.FLAG_SUPPORTS_IS_CHILD)
             .add(Root.COLUMN_TITLE, "Hitode C:")
-            .add(Root.COLUMN_DOCUMENT_ID, "")
+            .add(Root.COLUMN_DOCUMENT_ID, DRIVE)
             .add(Root.COLUMN_ICON, R.mipmap.ic_launcher)
         return cursor
     }
@@ -132,7 +139,7 @@ class DriveProvider : DocumentsProvider() {
     }
 
     override fun isChildDocument(parentDocumentId: String, documentId: String) =
-        parentDocumentId.isEmpty() || documentId.startsWith("$parentDocumentId/")
+        documentId.startsWith("$parentDocumentId/")
 
     override fun getDocumentType(documentId: String) = type(file(documentId))
 
@@ -158,14 +165,14 @@ class DriveProvider : DocumentsProvider() {
     }
 
     override fun deleteDocument(documentId: String) {
-        if (documentId.isEmpty()) throw FileNotFoundException(documentId)
+        if (documentId == DRIVE) throw FileNotFoundException(documentId)
         delete(mutable(file(documentId)))
     }
 
     override fun renameDocument(documentId: String, displayName: String): String {
         val source = mutable(file(documentId))
         val target = child(source.parentFile, displayName)
-        if (documentId.isEmpty() || !source.renameTo(target)) throw FileNotFoundException(documentId)
+        if (documentId == DRIVE || !source.renameTo(target)) throw FileNotFoundException(documentId)
         return id(target)
     }
 }

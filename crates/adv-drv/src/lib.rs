@@ -36,12 +36,12 @@ pub fn register(registry: &mut Registry) {
     user::register(registry);
 }
 
-/// Install the drivers over the surface store and put their images in
-/// `prefix`. Call before the process starts with [`user::MODULE`] as its
+/// Install the drivers over the surface store and put their images on
+/// drive C: at `drive`. Call before the process starts with [`user::MODULE`] as its
 /// graphics driver.
 pub fn install<B: Backend>(
     machine: &mut Machine<B>,
-    prefix: &Path,
+    drive: &Path,
     provider: Provider,
 ) -> Result<(), String> {
     machine.ext.insert(provider);
@@ -49,8 +49,8 @@ pub fn install<B: Backend>(
         .ext
         .insert(adv_nt::process::Desktop(user::start_desktop));
     let image = user::image(machine)?;
-    adv_unix::builtin::install(prefix, &image).map_err(|e| e.to_string())?;
-    audio::install(machine, prefix)?;
+    adv_unix::builtin::install(drive, &image).map_err(|e| e.to_string())?;
+    audio::install(machine, drive)?;
     Ok(())
 }
 

@@ -112,6 +112,7 @@ impl Drop for Session {
 struct Settings {
     dist: PathBuf,
     prefix: PathBuf,
+    drive: PathBuf,
     locale: u32,
     fonts: String,
     debug: String,
@@ -415,7 +416,7 @@ fn prefix(config: &Config<'_>) -> Result<(PathBuf, PathBuf), String> {
 /// and the user driver installed.
 fn new_machine(
     config: &Config<'_>,
-    prefix: &Path,
+    drive: &Path,
     clock: adv_machine::Clock,
     wake: &WakeEvent,
     audio: &adv_device::AudioControl,
@@ -436,7 +437,7 @@ fn new_machine(
     Session::install_codec_kernels(&mut machine, adv_drv::codec::Mode::Native);
     machine.ext.insert(audio.clone());
     adv_drv::media::set_wake(&mut machine.ext, wake.clone());
-    super::install(&mut machine, prefix, config.width, config.height)?;
+    super::install(&mut machine, drive, config.width, config.height)?;
     Ok(machine)
 }
 
@@ -669,7 +670,7 @@ impl Session {
         let audio = adv_device::AudioControl::new(true);
         if !host.booted() {
             fonts::clear_links(&drive)?;
-            let mut boot = new_machine(&process_config, &prefix, clock.clone(), &wake, &audio)?;
+            let mut boot = new_machine(&process_config, &drive, clock.clone(), &wake, &audio)?;
             boot.ext.insert(mounts.clone());
             let command_line = format!("\"{WINEBOOT}\" --restart");
             let startup = Startup {
@@ -714,7 +715,7 @@ impl Session {
 
         let mut fonts = host.fonts.prepare(&config, &drive, options)?;
         let config = process_config;
-        let mut machine = new_machine(&config, &prefix, clock, &wake, &audio)?;
+        let mut machine = new_machine(&config, &drive, clock, &wake, &audio)?;
         machine.ext.insert(mounts);
         prepare(&mut machine)?;
         let startup = Startup {
@@ -774,6 +775,7 @@ impl Session {
             settings: Settings {
                 dist: config.dist.to_owned(),
                 prefix: prefix.clone(),
+                drive: drive.clone(),
                 locale: config.locale,
                 fonts: config.fonts.to_owned(),
                 debug: config.debug.to_owned(),
@@ -1096,7 +1098,7 @@ impl Session {
             };
             let mut machine = new_machine(
                 &config,
-                &c.prefix,
+                &c.drive,
                 self.machine.sys.clock.clone(),
                 &self.wake,
                 &self.audio,
