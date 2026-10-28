@@ -5,6 +5,7 @@ use adv_device::surface::Rect;
 
 pub(super) fn register(registry: &mut Registry) {
     registry.register(stretch_ABI);
+    registry.register(color_fill_ABI);
 }
 
 fn rectangle(env: &Env<'_>, pointer: GuestPtr<RECT>, width: u32, height: u32) -> Result<Rect, u32> {
@@ -185,6 +186,83 @@ fn stretch(
                 adv_device::gpu::Filter::Nearest
             },
             resources,
+        },
+    )
+}
+
+/// A fill uploads host pixels: readback and frame recording see an ordinary
+/// write of the rectangle, as for an unlocked surface.
+#[win32(d3d9, name = "IDirect3DDevice9::ColorFill", level = implement)]
+fn color_fill(
+    env: &mut Env<'_>,
+    this: GuestPtr<()>,
+    surface: GuestPtr<()>,
+    rect: GuestPtr<RECT>,
+    color: u32,
+) -> Outcome {
+    let Some(owner) = com(env)
+        .identity::<Payload>(&env.sys.objects, this.addr())
+        .filter(|_| device(env, this.addr()).is_some())
+    else {
+        return Outcome::Return(INVALID);
+    };
+    let Some(r) = resources::resource(env, surface.addr()) else {
+        return Outcome::Return(INVALID);
+    };
+    // Render targets, offscreen plain surfaces and render-target texture
+    // levels in the default pool accept fills.
+    if r.kind != resources::Kind::Surface
+        || r.device != owner
+        || r.desc.Pool != 0
+        || r.depth.is_some()
+        || (r.container.is_some() && r.desc.Usage & 1 == 0)
+        || resources::locked(env, r)
+    {
+        return Outcome::Return(INVALID);
+    }
+    let to = match rectangle(env, rect, r.desc.Width, r.desc.Height) {
+        Ok(rect) => rect,
+        Err(error) => return Outcome::Return(error),
+    };
+    if !matches!(r.desc.Format, 21 | 22) || r.desc.MultiSampleType != 0 {
+        adv_abi::warn_unavailable(
+            env,
+            "IDirect3DDevice9::ColorFill",
+            &format!(
+                "fills support single-sample formats 21/22: format={} multisample={}",
+                r.desc.Format, r.desc.MultiSampleType
+            ),
+        );
+        return Outcome::Return(UNAVAILABLE);
+    }
+    let provider = env.ext.get::<State>().provider;
+    let Some(target) = r.surface.and_then(|id| (provider.target)(env.ext, id)) else {
+        return Outcome::Return(INVALID);
+    };
+    let (resource, level) = match r.container {
+        Some(container) => (container, Some(r.level)),
+        None => (
+            com(env)
+                .identity::<Payload>(&env.sys.objects, surface.addr())
+                .unwrap(),
+            None,
+        ),
+    };
+    let mut texel = color.to_le_bytes();
+    if r.desc.Format == 22 {
+        texel[3] = 255;
+    }
+    let pixels = texel.repeat(to.w as usize * to.h as usize);
+    dispatch(
+        env,
+        owner,
+        Operation::Upload {
+            resource,
+            level,
+            target,
+            pixels: Pixels::Host(Arc::new(pixels)),
+            pitch: to.w * 4,
+            rectangle: to,
         },
     )
 }

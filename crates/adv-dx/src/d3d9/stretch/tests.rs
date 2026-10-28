@@ -821,3 +821,54 @@ fn linear_scaling_handles_single_texel_axes_and_rejects_unsupported_profiles() {
     assert_eq!(release(&mut env(&mut f.m), plain), 0);
     assert_eq!(release(&mut env(&mut f.m), destination), 0);
 }
+
+// spec: GFX-CAP-1
+#[test]
+fn color_fill_writes_default_pool_rectangles_and_rejects_other_pools() {
+    let mut f = Fixture::new();
+    let surface = f.surface(4, 2, 22, 0);
+    let image = f.image(surface);
+    f.okay(
+        "IDirect3DDevice9::ColorFill",
+        &[f.device, surface, 0, 0x00112233],
+    );
+    let rect = f.packet(RECT {
+        left: 1,
+        top: 1,
+        right: 3,
+        bottom: 2,
+    });
+    f.okay(
+        "IDirect3DDevice9::ColorFill",
+        &[f.device, surface, rect, 0x80445566],
+    );
+    let actual = f.pixels(&image);
+    for y in 0..2 {
+        for x in 0..4 {
+            let expected = if y == 1 && (1..3).contains(&x) {
+                0xff445566u32
+            } else {
+                0xff112233
+            };
+            let at = (y * 4 + x) * 4;
+            assert_eq!(&actual[at..at + 4], &expected.to_le_bytes(), "({x}, {y})");
+        }
+    }
+    let system = f.surface(4, 2, 21, 2);
+    let outcome = f.call("IDirect3DDevice9::ColorFill", &[f.device, system, 0, 0]);
+    assert_eq!(f.finish(outcome), INVALID);
+    let outside = f.packet(RECT {
+        left: 0,
+        top: 0,
+        right: 5,
+        bottom: 2,
+    });
+    let outcome = f.call(
+        "IDirect3DDevice9::ColorFill",
+        &[f.device, surface, outside, 0],
+    );
+    assert_ne!(f.finish(outcome), 0);
+    for handle in [surface, system] {
+        assert_eq!(release(&mut env(&mut f.m), handle), 0);
+    }
+}

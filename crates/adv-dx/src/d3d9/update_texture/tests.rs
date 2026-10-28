@@ -264,6 +264,18 @@ fn tail_mips_upload_to_gpu_and_dynamic_shadow_and_clean_source_is_a_noop() {
 }
 
 #[test]
+// spec: GFX-CAP-1
+fn software_processing_usage_creates_system_memory_textures() {
+    let mut f = Fixture::new();
+    let output = f.packet(0u32);
+    let args = [f.device, 8, 4, 1, 0x10, 21, 2, output, 0];
+    assert_eq!(f.invoke("IDirect3DDevice9::CreateTexture", &args), 0);
+    let texture = f.m.cpu.read_u32(output).unwrap();
+    assert_ne!(texture, 0);
+    assert_ne!(f.lock(texture, 0, 0).pBits, 0);
+}
+
+#[test]
 // spec: DEV-UPDATE-1
 fn invalid_pool_format_mip_shape_and_locks_or_dc_preserve_source_marks() {
     let mut f = Fixture::new();

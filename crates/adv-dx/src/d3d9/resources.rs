@@ -540,6 +540,9 @@ pub(super) fn create_texture(
     if device(env, this.addr()).is_none() {
         return Outcome::Return(INVALID);
     }
+    // Software vertex processing does not apply to textures; the runtime
+    // accepts the flag in every pool.
+    let usage = usage & !0x10;
     if !shared.is_null()
         || format::bytes(format).is_none()
         || !(0..=3).contains(&pool)
