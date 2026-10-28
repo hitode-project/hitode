@@ -17,8 +17,9 @@ pub(crate) fn init() {
 }
 
 /// Mobile apps have no console, so records at info and above go to the
-/// system log: bionic's syslog writes to logcat, and iOS's to the unified
-/// log. Call it first; an embedding host that has a logger keeps it.
+/// system log: bionic's syslog writes to logcat, and NSLog to iOS's unified
+/// log, which a sandboxed app's syslog never reaches. Call it first; an
+/// embedding host that has a logger keeps it.
 #[cfg(mobile)]
 pub fn init_system_log() {
     struct SystemLog;
@@ -31,15 +32,33 @@ pub fn init_system_log() {
             if !self.enabled(record.metadata()) {
                 return;
             }
-            let priority = match record.level() {
-                log::Level::Error => libc::LOG_ERR,
-                log::Level::Warn => libc::LOG_WARNING,
-                _ => libc::LOG_NOTICE,
-            };
             let text = format!("{}: {}", record.target(), record.args()).replace('\0', " ");
-            let text = std::ffi::CString::new(text).unwrap();
-            // SAFETY: a constant format consuming one C string.
-            unsafe { libc::syslog(priority, c"%s".as_ptr(), text.as_ptr()) };
+            #[cfg(target_os = "ios")]
+            {
+                use objc2_foundation::{NSString, ns_string};
+                unsafe extern "C" {
+                    fn NSLog(format: *const NSString, ...);
+                }
+                let level = match record.level() {
+                    log::Level::Error => "error",
+                    log::Level::Warn => "warning",
+                    _ => "notice",
+                };
+                let text = NSString::from_str(&format!("{level}: {text}"));
+                // SAFETY: a constant format consuming one object.
+                unsafe { NSLog(ns_string!("%@"), &*text as *const NSString) };
+            }
+            #[cfg(not(target_os = "ios"))]
+            {
+                let priority = match record.level() {
+                    log::Level::Error => libc::LOG_ERR,
+                    log::Level::Warn => libc::LOG_WARNING,
+                    _ => libc::LOG_NOTICE,
+                };
+                let text = std::ffi::CString::new(text).unwrap();
+                // SAFETY: a constant format consuming one C string.
+                unsafe { libc::syslog(priority, c"%s".as_ptr(), text.as_ptr()) };
+            }
         }
 
         fn flush(&self) {}
