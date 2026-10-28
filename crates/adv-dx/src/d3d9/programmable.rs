@@ -300,6 +300,30 @@ fn prepare_checked(
     if indices.is_some_and(|i| i.len() != length as usize) {
         return Err(INVALID);
     }
+    let instanced =
+        indices.is_some() && up.is_none() && d.buffers.frequencies[0] & buffers::INDEXED_DATA != 0;
+    let instance_count = if instanced {
+        buffers::instances(&d.buffers)
+    } else {
+        1
+    };
+    let fixed_raw = instanced && vs.is_none();
+    let fixed_layout = if fixed_raw {
+        Some(fixed::layout(env, pointer).map_err(|e| e.code)?)
+    } else {
+        None
+    };
+    if let Some(layout) = fixed_layout {
+        if !layout.transformed && d.fixed.render[&137] != 0 {
+            return Err(UNAVAILABLE);
+        }
+        if d.shaders.vertex.is_none()
+            && d.shaders.pixel.is_none()
+            && (d.fixed.render[&28] != 0 || d.fixed.render[&152] != 0)
+        {
+            return Err(UNAVAILABLE);
+        }
+    }
     let mut vertex_count;
     let mut output_indices = indices.map(|v| v.iter().copied().collect::<IndexBytes>());
     let (mut draw, mut streams, input_spec) = if let Some(vs) = &vs {
@@ -316,7 +340,7 @@ fn prepare_checked(
         if let Some(i) = &mut output_indices {
             i.rebase(first);
         }
-        let streams = streams::capture(env, pointer, &inputs, up, start, first, last)?;
+        let streams = streams::capture(env, pointer, &inputs, up, start, first, last, instanced)?;
         let (target, image, state) =
             fixed::prepare_state(env, pointer, kind).map_err(|e| e.code)?;
         (
@@ -333,7 +357,7 @@ fn prepare_checked(
             streams,
             inputs,
         )
-    } else if pretransformed(env, pointer)? {
+    } else if fixed_raw || pretransformed(env, pointer)? {
         let layout = fixed::layout(env, pointer).map_err(|e| e.code)?;
         let inputs = transformed::inputs(layout);
         let first = indices.and_then(|v| v.iter().min().copied()).unwrap_or(0);
@@ -348,15 +372,17 @@ fn prepare_checked(
         if let Some(indices) = &mut output_indices {
             indices.rebase(first);
         }
-        let streams = streams::capture(env, pointer, &inputs, up, start, first, last)?;
+        let streams = streams::capture(env, pointer, &inputs, up, start, first, last, instanced)?;
         let (target, image, state) =
             fixed::prepare_state(env, pointer, kind).map_err(|e| e.code)?;
-        transformed::validate(
-            &streams,
-            state.viewport,
-            output_indices.as_ref().map(|v| v.as_slice()),
-            vertex_count,
-        )?;
+        if layout.transformed {
+            transformed::validate(
+                &streams,
+                state.viewport,
+                output_indices.as_ref().map(|v| v.as_slice()),
+                vertex_count,
+            )?;
+        }
         (
             fixed::Draw {
                 target,
@@ -383,6 +409,7 @@ fn prepare_checked(
         output_indices = None;
         let count = draw.texcoords.as_ref().map(|(count, _)| *count);
         let mut stream = VertexStream {
+            instance: false,
             bytes: VertexBytes::fixed(
                 draw.vertices.clone(),
                 draw.texcoords.clone(),
@@ -530,6 +557,20 @@ fn prepare_checked(
     parameters[2][3] = u32::from(kind == 1);
     parameters[13] = second.unwrap_or_default();
     parameters[15][0] = u32::from(transformed);
+    if fixed_layout.is_some_and(|layout| !layout.transformed) {
+        parameters[15][0] = 2;
+        let mut matrix = d.fixed.transforms[0];
+        for next in &d.fixed.transforms[1..] {
+            matrix = std::array::from_fn(|i| {
+                (0..4)
+                    .map(|k| matrix[(i / 4) * 4 + k] * next[k * 4 + i % 4])
+                    .sum()
+            });
+        }
+        for n in 0..4 {
+            parameters[36 + n] = std::array::from_fn(|k| matrix[n * 4 + k].to_bits());
+        }
+    }
     parameters[3] = [
         d.fixed.render[&152],
         d.fixed.render[&28],
@@ -631,6 +672,7 @@ fn prepare_checked(
         program
     };
     draw.programmable = Some(Arc::new(ProgrammableDraw {
+        instance_count,
         program,
         streams,
         indices: output_indices,

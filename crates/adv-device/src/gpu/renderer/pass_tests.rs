@@ -21,8 +21,9 @@ fn backends() -> impl Iterator<Item = bool> {
 }
 fn draw() -> ProgrammableDraw {
     let mut draw = ProgrammableDraw {
+        instance_count: 1,
         program: Program::new("struct C { f: array<vec4<f32>,256> }; @group(0) @binding(1) var<uniform> c:C; @vertex fn vertex_main(@location(0) p:vec4<f32>)->@builtin(position) vec4<f32> { return p; } @fragment fn fragment_main()->@location(0) vec4<f32> { return c.f[0]; }".into(), vec![]),
-        streams: vec![VertexStream { stride: 16, bytes: bytemuck::cast_slice(&[[-1f32,-1.,0.5,1.], [3.,-1.,0.5,1.], [-1.,3.,0.5,1.]]).to_vec().into(), attributes: vec![Attribute { location: 0, offset: 0, format: AttributeFormat::Float4 }] }],
+        streams: vec![VertexStream { instance: false, stride: 16, bytes: bytemuck::cast_slice(&[[-1f32,-1.,0.5,1.], [3.,-1.,0.5,1.], [-1.,3.,0.5,1.]]).to_vec().into(), attributes: vec![Attribute { location: 0, offset: 0, format: AttributeFormat::Float4 }] }],
         indices: None, vertex_count: 3, vertex_constants: ConstantBlock::default().into(), pixel_constants: ConstantBlock::default().into(), textures: vec![], parameters: [[0;4];40],
     };
     draw.pixel_constants.floats[0] = [0., 1., 0., 1.];

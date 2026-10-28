@@ -271,6 +271,11 @@ fn coordinates(shader: &Shader, vertex: Option<&Shader>) -> Option<Vec<(usize, [
 }
 
 fn draw_reads(env: &Env<'_>, device: &Device, draw: &fixed::Draw) -> Option<Vec<Read>> {
+    if draw.programmable.as_ref().is_some_and(|p| {
+        p.instance_count != 1 || p.parameters[15][0] == 2 || p.streams.iter().any(|s| s.instance)
+    }) {
+        return None;
+    }
     if !matches!(
         draw.state.topology,
         Topology::Triangles | Topology::TriangleStrip

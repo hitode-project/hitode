@@ -43,6 +43,7 @@ struct Mask {
     fvf: bool,
     declaration: bool,
     streams: Slots<usize, 1>,
+    frequencies: Slots<usize, 1>,
     indices: bool,
     texture: bool,
     textures: Slots<usize, 1>,
@@ -74,6 +75,7 @@ impl Mask {
         .filter(|v| *v)
         .count()
             + self.streams.len()
+            + self.frequencies.len()
             + self.textures.len()
             + self.render.len()
             + self.stage.len()
@@ -103,7 +105,7 @@ impl Mask {
             self.fvf || self.declaration,
             self.vertex,
             self.pixel,
-            !self.streams.is_empty(),
+            !self.streams.is_empty() || !self.frequencies.is_empty(),
             self.indices,
             self.texture || !self.textures.is_empty(),
             constants(&self.vertex_constants),
@@ -166,6 +168,7 @@ impl StateBlock {
         m.pixel &= changed(9);
         if !changed(10) {
             m.streams = Default::default();
+            m.frequencies = Default::default();
         }
         m.indices &= changed(11);
         m.texture &= changed(12);
@@ -502,6 +505,11 @@ fn mask(env: &Env<'_>, device: Id, kind: i32) -> Option<Mask> {
         fvf: vertex,
         declaration: vertex,
         streams: if all {
+            (0..16).collect()
+        } else {
+            Slots::default()
+        },
+        frequencies: if vertex {
             (0..16).collect()
         } else {
             Slots::default()
@@ -890,6 +898,9 @@ fn transfer<'a>(
     for i in &mask.streams {
         buffers.streams[i] = source_buffers.streams[i];
     }
+    for i in &mask.frequencies {
+        buffers.frequencies[i] = source_buffers.frequencies[i];
+    }
     if mask.indices {
         buffers.indices = source_buffers.indices;
     }
@@ -1070,6 +1081,11 @@ pub(in crate::d3d9) fn record_texture_slot(
         return Some(INVALID);
     }
     record(env, device, Slot::TextureAt(index), new)
+}
+pub(in crate::d3d9) fn record_frequency(snapshot: &mut Snapshot, stream: usize, setting: u32) {
+    snapshot.mask.frequencies.insert(stream);
+    snapshot.mask.dirty |= 1 << 10;
+    snapshot.buffers.frequencies[stream] = setting;
 }
 pub(in crate::d3d9) fn record_stream(
     env: &mut Env<'_>,

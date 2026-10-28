@@ -34,11 +34,32 @@ pub(super) struct Stream {
     pub offset: u32,
     pub stride: u32,
 }
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(super) struct Bindings {
     pub streams: [Stream; 16],
+    pub frequencies: [u32; 16],
     pub indices: Option<Id>,
     pub declaration: Option<Id>,
+}
+impl Default for Bindings {
+    fn default() -> Self {
+        Self {
+            streams: [Stream::default(); 16],
+            frequencies: [1; 16],
+            indices: None,
+            declaration: None,
+        }
+    }
+}
+pub(super) const INDEXED_DATA: u32 = 0x4000_0000;
+pub(super) const INSTANCE_DATA: u32 = 0x8000_0000;
+pub(super) fn instances(bindings: &Bindings) -> u32 {
+    let setting = bindings.frequencies[0];
+    if setting & INDEXED_DATA != 0 {
+        setting & 0x3fff_ffff
+    } else {
+        1
+    }
 }
 pub(super) fn register(registry: &mut Registry) {
     for api in [
@@ -62,6 +83,8 @@ pub(super) fn register(registry: &mut Registry) {
         index_unlock_ABI,
         super::unchanged::unless_unchanged!(set_stream_ABI, super::unchanged::binding),
         get_stream_ABI,
+        set_stream_freq_ABI,
+        get_stream_freq_ABI,
         super::unchanged::unless_unchanged!(set_indices_ABI, super::unchanged::binding),
         get_indices_ABI,
         draw_ABI,
@@ -534,6 +557,52 @@ fn get_stream(
     }
     0
 }
+#[win32(d3d9, name = "IDirect3DDevice9::SetStreamSourceFreq", level = implement)]
+fn set_stream_freq(env: &mut Env<'_>, this: GuestPtr<()>, stream: u32, setting: u32) -> u32 {
+    if device(env, this.addr()).is_none()
+        || stream >= 16
+        || setting & 0x3fff_ffff == 0
+        || setting & (INDEXED_DATA | INSTANCE_DATA) == (INDEXED_DATA | INSTANCE_DATA)
+        || (stream == 0 && setting & INSTANCE_DATA != 0)
+        || (stream != 0 && setting & INDEXED_DATA != 0)
+    {
+        return INVALID;
+    }
+    if setting != 1 && setting & INDEXED_DATA == 0 && setting != INSTANCE_DATA | 1 {
+        adv_abi::warn_unavailable(
+            env,
+            "IDirect3DDevice9::SetStreamSourceFreq",
+            "stream divisors other than one are unavailable",
+        );
+        return UNAVAILABLE;
+    }
+    let Some(Payload::Device(d)) = com(env).get_mut::<Payload>(&mut env.sys.objects, this.addr())
+    else {
+        return INVALID;
+    };
+    if let Some(record) = &mut d.recording {
+        super::shaders::stateblocks::record_frequency(record, stream as usize, setting);
+    } else if d.buffers.frequencies[stream as usize] != setting {
+        d.buffers.frequencies[stream as usize] = setting;
+        d.touch(10);
+    }
+    0
+}
+#[win32(d3d9, name = "IDirect3DDevice9::GetStreamSourceFreq", level = implement)]
+fn get_stream_freq(
+    env: &mut Env<'_>,
+    this: GuestPtr<()>,
+    stream: u32,
+    output: GuestPtr<u32>,
+) -> u32 {
+    let Some(d) = device(env, this.addr()) else {
+        return INVALID;
+    };
+    let Some(&setting) = d.buffers.frequencies.get(stream as usize) else {
+        return INVALID;
+    };
+    output.write(env.cpu, setting).map_or(INVALID, |()| 0)
+}
 #[win32(d3d9,name="IDirect3DDevice9::SetIndices",level=state)]
 fn set_indices(env: &mut Env<'_>, this: GuestPtr<()>, pointer: GuestPtr<()>) -> u32 {
     let Some(d) = device(env, this.addr()) else {
@@ -760,7 +829,9 @@ fn draw_indexed(
         Ok(indices) => indices,
         Err(error) => return Outcome::Return(error),
     };
-    if super::programmable::active(env, this.addr()) {
+    if super::programmable::active(env, this.addr())
+        || device(env, this.addr()).is_some_and(|d| d.buffers.frequencies[0] & INDEXED_DATA != 0)
+    {
         return recording::indexed(env, this.addr(), (kind, count, &indices), |env| {
             super::programmable::prepare(env, this.addr(), kind, count, None, Some(&indices), 0)
         });

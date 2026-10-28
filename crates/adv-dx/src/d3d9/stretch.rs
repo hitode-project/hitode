@@ -1,11 +1,13 @@
 //! Color copies and full-source LINEAR scaling share the GPU and COM owners.
 //! Cropped scaling and depth/MSAA remain unavailable.
 use super::*;
+use adv_abi::types::POINT;
 use adv_device::surface::Rect;
 
 pub(super) fn register(registry: &mut Registry) {
     registry.register(stretch_ABI);
     registry.register(color_fill_ABI);
+    registry.register(update_surface_ABI);
 }
 
 fn rectangle(env: &Env<'_>, pointer: GuestPtr<RECT>, width: u32, height: u32) -> Result<Rect, u32> {
@@ -188,6 +190,198 @@ fn stretch(
             resources,
         },
     )
+}
+
+#[win32(d3d9, name = "IDirect3DDevice9::UpdateSurface", level = implement)]
+fn update_surface(
+    env: &mut Env<'_>,
+    this: GuestPtr<()>,
+    source: GuestPtr<()>,
+    source_rect: GuestPtr<RECT>,
+    destination: GuestPtr<()>,
+    destination_point: GuestPtr<POINT>,
+) -> Outcome {
+    let prepared = (|| {
+        let owner = com(env)
+            .identity::<Payload>(&env.sys.objects, this.addr())
+            .filter(|_| device(env, this.addr()).is_some())
+            .ok_or(INVALID)?;
+        let src = resources::resource(env, source.addr()).ok_or(INVALID)?;
+        let dst = resources::resource(env, destination.addr()).ok_or(INVALID)?;
+        if src.kind != resources::Kind::Surface
+            || dst.kind != resources::Kind::Surface
+            || src.device != owner
+            || dst.device != owner
+            || src.desc.Pool != 2
+            || dst.desc.Pool != 0
+            || src.desc.Format != dst.desc.Format
+            || src.depth.is_some()
+            || dst.depth.is_some()
+            || src.desc.MultiSampleType != 0
+            || dst.desc.MultiSampleType != 0
+            || resources::locked(env, src)
+            || resources::locked(env, dst)
+        {
+            return Err(INVALID);
+        }
+        let from = rectangle(env, source_rect, src.desc.Width, src.desc.Height)?;
+        let point = if destination_point.is_null() {
+            POINT { x: 0, y: 0 }
+        } else {
+            destination_point.read(env.cpu).map_err(|_| INVALID)?
+        };
+        if point.x < 0
+            || point.y < 0
+            || (point.x as u32)
+                .checked_add(from.w)
+                .is_none_or(|v| v > dst.desc.Width)
+            || (point.y as u32)
+                .checked_add(from.h)
+                .is_none_or(|v| v > dst.desc.Height)
+        {
+            return Err(INVALID);
+        }
+        let pitch = format::pitch(src.desc.Format, src.desc.Width).ok_or(UNAVAILABLE)?;
+        let row = format::pitch(src.desc.Format, from.w).ok_or(UNAVAILABLE)?;
+        let address = resources::storage(env, src)
+            .ok_or(INVALID)?
+            .checked_add(
+                from.y * pitch + from.x * format::bytes(src.desc.Format).ok_or(UNAVAILABLE)?,
+            )
+            .ok_or(INVALID)?;
+        adv_abi::guest::check_range(env.cpu, address, (from.h - 1) * pitch + row, Prot::READ)
+            .map_err(|_| INVALID)?;
+        let provider = env.ext.get::<State>().provider;
+        let target = dst
+            .surface
+            .and_then(|id| (provider.target)(env.ext, id))
+            .ok_or(INVALID)?;
+        let (resource, level) = match dst.container {
+            Some(container) => (container, Some(dst.level)),
+            None => (
+                com(env)
+                    .identity::<Payload>(&env.sys.objects, destination.addr())
+                    .ok_or(INVALID)?,
+                None,
+            ),
+        };
+        let mut raw = vec![0; ((from.h - 1) * pitch + row) as usize];
+        env.cpu.read(address, &mut raw).map_err(|_| INVALID)?;
+        let raw = Arc::new(raw);
+        let source_pitch = pitch;
+        let (pixels, pitch) = if matches!(src.desc.Format, 21 | 28) {
+            (Arc::clone(&raw), pitch)
+        } else {
+            let (pixels, pitch) =
+                format::upload(src.desc.Format, raw.as_ref().clone(), pitch, from.w, from.h)
+                    .ok_or(INVALID)?;
+            (Arc::new(pixels), pitch)
+        };
+        let pixels = if src.desc.Format == 28 {
+            Pixels::Alpha8(pixels)
+        } else {
+            Pixels::Host(pixels)
+        };
+        let shadow = resources::storage(env, dst).map(|address| {
+            let pitch = format::pitch(dst.desc.Format, dst.desc.Width).unwrap();
+            (
+                address
+                    + point.y as u32 * pitch
+                    + point.x as u32 * format::bytes(dst.desc.Format).unwrap(),
+                pitch,
+            )
+        });
+        if let Some((address, pitch)) = shadow {
+            adv_abi::guest::check_range(env.cpu, address, (from.h - 1) * pitch + row, Prot::WRITE)
+                .map_err(|_| INVALID)?;
+        }
+        Ok((
+            owner,
+            resource,
+            level,
+            (source_pitch, row, from.h, shadow, raw),
+            Operation::Upload {
+                resource,
+                level,
+                target,
+                pixels,
+                pitch,
+                rectangle: Rect {
+                    x: point.x as u32,
+                    y: point.y as u32,
+                    w: from.w,
+                    h: from.h,
+                },
+            },
+        ))
+    })();
+    match prepared {
+        Ok((owner, resource, level, shadow, operation)) => {
+            let outcome = dispatch(env, owner, operation);
+            surface_uploaded(env, resource, level, shadow, outcome)
+        }
+        Err(error) => {
+            if error == UNAVAILABLE {
+                adv_abi::warn_unavailable(
+                    env,
+                    "IDirect3DDevice9::UpdateSurface",
+                    "unsupported surface upload format",
+                );
+            }
+            Outcome::Return(error)
+        }
+    }
+}
+
+fn surface_uploaded(
+    env: &mut Env<'_>,
+    resource: Id,
+    level: Option<u32>,
+    shadow: (u32, u32, u32, Option<(u32, u32)>, Arc<Vec<u8>>),
+    outcome: Outcome,
+) -> Outcome {
+    match outcome {
+        Outcome::Return(0) => {
+            let (source_pitch, row, height, destination, raw) = shadow;
+            if matches!(
+                com(env).get_identity(&env.sys.objects, resource),
+                Some(Payload::Resource(_))
+            ) {
+                if let Some((address, pitch)) = destination {
+                    for y in 0..height {
+                        let at = (y * source_pitch) as usize;
+                        if env
+                            .cpu
+                            .write(address + y * pitch, &raw[at..at + row as usize])
+                            .is_err()
+                        {
+                            return Outcome::Return(INVALID);
+                        }
+                    }
+                }
+                if let Some(level) = level
+                    && let Some(Payload::Resource(r)) =
+                        com(env).get_identity_mut(&mut env.sys.objects, resource)
+                {
+                    r.levels[level as usize].dirty = None;
+                }
+            }
+            Outcome::Return(0)
+        }
+        Outcome::Block {
+            wait,
+            then,
+            allow_time_skip,
+        } => Outcome::Block {
+            wait,
+            allow_time_skip,
+            then: Box::new(move |env, resume| {
+                let outcome = then(env, resume);
+                surface_uploaded(env, resource, level, shadow, outcome)
+            }),
+        },
+        other => other,
+    }
 }
 
 /// A fill uploads host pixels: readback and frame recording see an ordinary

@@ -152,7 +152,10 @@ impl Device {
             7 => hash((f.fvf, self.buffers.declaration)),
             8 => hash(self.shaders.vertex),
             9 => hash(self.shaders.pixel),
-            10 => hash(self.buffers.streams.map(|s| (s.buffer, s.offset, s.stride))),
+            10 => hash((
+                self.buffers.streams.map(|s| (s.buffer, s.offset, s.stride)),
+                self.buffers.frequencies,
+            )),
             11 => hash(self.buffers.indices),
             12 => hash((self.texture, self.shaders.textures)),
             13 => self.shaders.vertex_constants.fingerprint(),

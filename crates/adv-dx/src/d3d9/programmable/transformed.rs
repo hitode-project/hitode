@@ -6,7 +6,11 @@ pub(super) fn inputs(layout: fixed::Layout) -> Vec<Input> {
     let mut inputs = vec![Input {
         stream: layout.streams[0] as usize,
         offset: layout.position,
-        format: AttributeFormat::Float4,
+        format: if layout.transformed {
+            AttributeFormat::Float4
+        } else {
+            AttributeFormat::Float3
+        },
         register: 0,
     }];
     if let Some(offset) = layout.color {
@@ -66,7 +70,7 @@ pub(super) fn validate(
                 stream
                     .bytes
                     .read_vertex(
-                        n as usize,
+                        if stream.instance { 0 } else { n as usize },
                         stream.stride as usize,
                         attribute.offset as usize,
                         bytes,

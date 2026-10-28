@@ -373,3 +373,103 @@ fn zero_indexed_up_frees_zero_public_bindings_and_clears_offset_stride_without_g
     assert_eq!(com(&env).references(&env.sys.objects, id), Some(1));
     assert!(env.ext.get::<State>().gpu.is_none());
 }
+
+// spec: GFX-INPUT-7
+#[test]
+fn d3d9_package_d_stream_frequencies_preserve_stateblocks_and_reset() {
+    let mut f = super::super::stretch::tests::Fixture::new();
+    let output = f.packet(0u32);
+    for stream in [0, 1, 15] {
+        f.okay(
+            "IDirect3DDevice9::GetStreamSourceFreq",
+            &[f.device, stream, output],
+        );
+        assert_eq!(f.m.cpu.read_u32(output).unwrap(), 1);
+    }
+    for (stream, setting) in [(0, INDEXED_DATA | 2), (1, INSTANCE_DATA | 1)] {
+        f.okay(
+            "IDirect3DDevice9::SetStreamSourceFreq",
+            &[f.device, stream, setting],
+        );
+        f.okay(
+            "IDirect3DDevice9::GetStreamSourceFreq",
+            &[f.device, stream, output],
+        );
+        assert_eq!(f.m.cpu.read_u32(output).unwrap(), setting);
+    }
+    f.okay("IDirect3DDevice9::CreateStateBlock", &[f.device, 1, output]);
+    let all = f.m.cpu.read_u32(output).unwrap();
+    f.okay("IDirect3DDevice9::CreateStateBlock", &[f.device, 3, output]);
+    let vertex = f.m.cpu.read_u32(output).unwrap();
+    f.okay("IDirect3DDevice9::BeginStateBlock", &[f.device]);
+    f.okay(
+        "IDirect3DDevice9::SetStreamSourceFreq",
+        &[f.device, 0, INDEXED_DATA | 3],
+    );
+    f.okay("IDirect3DDevice9::EndStateBlock", &[f.device, output]);
+    let recorded = f.m.cpu.read_u32(output).unwrap();
+    f.okay(
+        "IDirect3DDevice9::GetStreamSourceFreq",
+        &[f.device, 0, output],
+    );
+    assert_eq!(f.m.cpu.read_u32(output).unwrap(), INDEXED_DATA | 2);
+    f.okay("IDirect3DStateBlock9::Apply", &[recorded]);
+    f.okay(
+        "IDirect3DDevice9::GetStreamSourceFreq",
+        &[f.device, 0, output],
+    );
+    assert_eq!(f.m.cpu.read_u32(output).unwrap(), INDEXED_DATA | 3);
+    f.okay("IDirect3DStateBlock9::Apply", &[all]);
+    f.okay(
+        "IDirect3DDevice9::GetStreamSourceFreq",
+        &[f.device, 0, output],
+    );
+    assert_eq!(f.m.cpu.read_u32(output).unwrap(), INDEXED_DATA | 2);
+    for (stream, setting, expected) in [
+        (16, 1, INVALID),
+        (0, 0, INVALID),
+        (0, INSTANCE_DATA | 1, INVALID),
+        (1, INDEXED_DATA | 2, INVALID),
+        (1, INSTANCE_DATA | 2, UNAVAILABLE),
+        (1, 2, UNAVAILABLE),
+        (0, INDEXED_DATA | INSTANCE_DATA | 1, INVALID),
+    ] {
+        let outcome = f.call(
+            "IDirect3DDevice9::SetStreamSourceFreq",
+            &[f.device, stream, setting],
+        );
+        assert_eq!(f.finish(outcome), expected);
+    }
+    f.okay(
+        "IDirect3DDevice9::SetStreamSourceFreq",
+        &[f.device, 0, INDEXED_DATA | 4],
+    );
+    f.okay("IDirect3DStateBlock9::Apply", &[vertex]);
+    f.okay(
+        "IDirect3DDevice9::GetStreamSourceFreq",
+        &[f.device, 0, output],
+    );
+    assert_eq!(f.m.cpu.read_u32(output).unwrap(), INDEXED_DATA | 2);
+    for block in [all, vertex, recorded] {
+        f.okay("IDirect3DStateBlock9::Release", &[block]);
+    }
+    let parameters = {
+        let e = Env {
+            context: f.m.sys.current,
+            cpu: &mut f.m.cpu,
+            sys: &mut f.m.sys,
+            ext: &mut f.m.ext,
+            thunk: 0,
+        };
+        device(&e, f.device).unwrap().parameters
+    };
+    let parameters = f.packet(parameters);
+    f.okay("IDirect3DDevice9::Reset", &[f.device, parameters]);
+    for stream in 0..16 {
+        f.okay(
+            "IDirect3DDevice9::GetStreamSourceFreq",
+            &[f.device, stream, output],
+        );
+        assert_eq!(f.m.cpu.read_u32(output).unwrap(), 1);
+    }
+}
