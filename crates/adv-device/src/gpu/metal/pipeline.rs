@@ -452,6 +452,8 @@ fn factor(value: Factor) -> MTLBlendFactor {
         Factor::DestinationAlpha => MTLBlendFactor::DestinationAlpha,
         Factor::OneMinusDestinationAlpha => MTLBlendFactor::OneMinusDestinationAlpha,
         Factor::SourceAlphaSaturated => MTLBlendFactor::SourceAlphaSaturated,
+        Factor::Constant => MTLBlendFactor::BlendColor,
+        Factor::OneMinusConstant => MTLBlendFactor::OneMinusBlendColor,
     }
 }
 fn operation(value: BlendOp) -> MTLBlendOperation {

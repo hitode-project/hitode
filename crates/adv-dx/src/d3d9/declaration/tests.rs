@@ -181,6 +181,16 @@ fn only_fvf_equivalent_inputs_map_onto_the_fixed_pipeline() {
         fixed_layout(&encode(SPRITE)),
         Ok(fixed::Layout::from_fvf(0x144).unwrap())
     );
+    assert_eq!(
+        fixed_layout(&encode(&[
+            (0, 0, 2, 0, 0),
+            (0, 12, 2, 3, 0),
+            (0, 24, 4, 10, 0),
+            (0, 28, 4, 10, 1),
+            (0, 32, 1, 5, 0)
+        ])),
+        Ok(fixed::Layout::from_fvf(0x1d2).unwrap())
+    );
     let permuted = fixed_layout(&encode(&[
         (0, 0, 1, 5, 0),
         (0, 8, 4, 10, 0),
@@ -192,6 +202,8 @@ fn only_fvf_equivalent_inputs_map_onto_the_fixed_pipeline() {
             transformed: false,
             position: 12,
             color: Some(8),
+            normal: None,
+            specular: None,
             texcoords: [Some((0, 0, 2)), None, None, None, None, None, None, None],
             streams: [0; 2],
             size: 24,
@@ -200,7 +212,7 @@ fn only_fvf_equivalent_inputs_map_onto_the_fixed_pipeline() {
     for (list, reason) in [
         (&[(16, 0, 2, 0, 0)][..], "outside the bound stream range"),
         (
-            &[(0, 0, 2, 0, 0), (0, 12, 2, 3, 0)][..],
+            &[(0, 0, 2, 0, 0), (0, 12, 1, 3, 0)][..],
             "no fixed-function equivalent",
         ),
         (

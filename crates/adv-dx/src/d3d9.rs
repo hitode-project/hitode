@@ -130,7 +130,7 @@ impl Device {
         use recording::hash;
         let f = &self.fixed;
         match class {
-            0 => hash(&f.render),
+            0 => hash((&f.render, f.material.map(f32::to_bits), &f.lights)),
             1 => hash((&f.stage, &f.stage_slots)),
             2 => hash((&f.sampler, &f.sampler_slots)),
             3 => hash((

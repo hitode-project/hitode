@@ -13,9 +13,9 @@ pub(super) mod warmup;
 pub(super) use warmup::warm;
 #[cfg(test)]
 mod tests;
-// Generational shader identities cover immutable declarations and sampler slots.
-// Only input registers and formats affect the assembled entry points.
-#[derive(Clone, PartialEq, Eq, Hash)]
+// Shader identities, input registers and fixed-function variants determine the
+// assembled entry points.
+#[derive(Clone, PartialEq, Eq)]
 struct ProgramKey {
     vertex: Option<Id>,
     pixel: Option<Id>,
@@ -23,6 +23,19 @@ struct ProgramKey {
     /// Whether the fixed pixel stages combine a second texture stage.
     second: bool,
     features: (u32, bool),
+    fixed: u32,
+}
+impl std::hash::Hash for ProgramKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.vertex.hash(state);
+        self.pixel.hash(state);
+        self.inputs.hash(state);
+        self.second.hash(state);
+        self.features.hash(state);
+        if self.fixed != 0 {
+            self.fixed.hash(state);
+        }
+    }
 }
 #[derive(Default)]
 pub(super) struct ProgramCache {
@@ -87,8 +100,29 @@ pub(super) fn active(env: &Env<'_>, pointer: u32) -> bool {
     device(env, pointer).is_some_and(|d| {
         d.shaders.vertex.is_some()
             || d.shaders.pixel.is_some()
+            || fixed_features(
+                &d.fixed,
+                fixed::layout(env, pointer).ok().map(|l| l.transformed),
+            ) != 0
             || !matches!(fixed::second_stage(&d.fixed), Ok(None))
     })
+}
+fn fixed_features(f: &fixed::Fixed, transformed: Option<bool>) -> u32 {
+    u32::from(transformed == Some(false) && f.render[&137] != 0)
+        | (u32::from(f.render[&29] != 0) << 1)
+        | (u32::from(f.render[&9] == 1) << 2)
+        | (u32::from(
+            [2, 3, 5, 6]
+                .iter()
+                .any(|k| f.stage[k] > 2 || (f.stage_slots[1][&1] != 1 && f.stage_slots[1][k] > 2)),
+        ) << 3)
+        | (u32::from(f.render[&194] != 0) << 4)
+        | (u32::from(f.render[&28] != 0) << 5)
+        | (u32::from(
+            f.render[&157] != 0 || f.render[&156] != 0 || f.render[&154] != 1f32.to_bits(),
+        ) << 6)
+        | (u32::from(f.render[&175] != 0 || f.render[&195] != 0) << 7)
+        | (u32::from(transformed == Some(false) && f.render[&157] != 0) << 8)
 }
 fn format(kind: u8) -> Result<AttributeFormat, u32> {
     use AttributeFormat::*;
@@ -333,7 +367,10 @@ fn prepare_checked(
             streams,
             inputs,
         )
-    } else if pretransformed(env, pointer)? {
+    } else if pretransformed(env, pointer)?
+        && fixed_features(&d.fixed, Some(true)) == 0
+        && fixed::layout(env, pointer).is_ok_and(|l| l.specular.is_none())
+    {
         let layout = fixed::layout(env, pointer).map_err(|e| e.code)?;
         let inputs = transformed::inputs(layout);
         let first = indices.and_then(|v| v.iter().min().copied()).unwrap_or(0);
@@ -404,8 +441,18 @@ fn prepare_checked(
         };
         let mut inputs = Vec::new();
         if let Some(count) = count {
+            let f = &device(env, pointer).unwrap().fixed;
+            let layout = fixed::layout(env, pointer).map_err(|e| e.code)?;
+            let effects = f.render[&29] != 0 || f.render[&28] != 0 || layout.specular.is_some();
+            let scaled = kind == 1 && !layout.transformed && f.render[&157] != 0;
             for n in 0..count {
-                let location = 2 + n as u32;
+                let location = if effects && n == layout.coordinate_count().max(1) {
+                    10
+                } else if scaled && n == count - 1 {
+                    11
+                } else {
+                    2 + n as u32
+                };
                 let offset = 32 + n as u32 * 16;
                 stream.attributes.push(Attribute {
                     location,
@@ -529,6 +576,15 @@ fn prepare_checked(
     );
     parameters[2][3] = u32::from(kind == 1);
     parameters[13] = second.unwrap_or_default();
+    parameters[36] = fixed::lighting::color(d.fixed.render[&60]).map(f32::to_bits);
+    parameters[37] = [
+        d.fixed.stage[&1],
+        d.fixed.stage[&2] | d.fixed.stage[&3] << 8,
+        d.fixed.stage[&4],
+        d.fixed.stage[&5] | d.fixed.stage[&6] << 8,
+    ];
+
+    parameters[38] = [d.fixed.render[&195], d.fixed.render[&175], 0, 0];
     parameters[15][0] = u32::from(transformed);
     parameters[3] = [
         d.fixed.render[&152],
@@ -587,6 +643,14 @@ fn prepare_checked(
         inputs: input_spec.iter().map(|i| (i.register, i.format)).collect(),
         second: second.is_some(),
         features: (d.fixed.render[&152], d.fixed.render[&28] != 0),
+        fixed: fixed_features(
+            &d.fixed,
+            if vs.is_none() {
+                Some(pretransformed(env, pointer)?)
+            } else {
+                None
+            },
+        ) & if kind == 1 { u32::MAX } else { !256 },
     };
     draw.program_key = recording::hash(&key);
     let cache = &mut env.ext.get_mut::<State>().programs;
@@ -612,7 +676,7 @@ fn prepare_checked(
                 pt,
                 &input_spec,
                 &slots,
-                (second.is_some(), key.features.0, key.features.1),
+                (second.is_some(), key.features.0, key.features.1, key.fixed),
             )?;
             let mut program = Program::new(source.into(), slots.iter().map(|s| s.0).collect());
             program.constants = usage;

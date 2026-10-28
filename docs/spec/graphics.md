@@ -340,6 +340,18 @@ Binding changes MUST NOT start speculative module preparation for transient shad
 
 CPU-only surfaces and managed texture-level locks preserve pending recorded commands; only GPU-backed locks require a readback barrier.
 
+### GFX-FIXED-1 Lighting and materials
+
+**Rule**: Fixed vertex processing MUST apply directional, point and spot lighting, material sources, ambient, emissive and enabled specular contributions using D3D9 equations. Light and material setters, queries and state blocks MUST preserve their values, with arbitrary light indices and at most eight active lights per draw. `MultiplyTransform` MUST premultiply the stored transform by the supplied matrix.
+**Verification**: Test
+**Basis**: Microsoft Direct3D 9 mathematics of lighting and `IDirect3DDevice9::MultiplyTransform`.
+
+### GFX-FIXED-2 Fog, texture factor and shading
+
+**Rule**: Fixed draws MUST implement D3D9 fog and point scaling as exceptions to GFX-INPUT-5, plus texture factor, shading, blend factors, depth bias and sRGB. Fog and specular MUST follow texture combining without changing the combined alpha. Fixed pipeline variants MUST preserve existing unlit pipeline recipes and cache identities.
+**Verification**: Test
+**Basis**: Microsoft Direct3D 9 fog formulas, texture arguments and shading modes.
+
 ### GFX-STATE-1 Neutral fixed state
 
 **Rule**: Defaults, setters, and queries MUST agree for DITHERENABLE, COLORVERTEX, WRAP0–WRAP7, and AMBIENT. Enabling dithering or texture-coordinate wrapping MUST fail explicitly. AMBIENT MUST accept and preserve every DWORD value.

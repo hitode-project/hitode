@@ -40,10 +40,15 @@ pub(super) fn build(
     pt: Option<&Translation>,
     inputs: &[Input],
     slots: &[(bool, u8)],
-    features: (bool, u32, bool),
+    features: (bool, u32, bool, u32),
 ) -> Result<String, u32> {
-    let (second, clip, fog) = features;
-    let used = varyings(ps, second);
+    let (second, clip, fog, fixed) = features;
+    let specular = ps.is_none() && fixed & 2 != 0;
+    let flat = fixed & 4 != 0;
+    let factor = ps.is_none() && fixed & 8 != 0;
+    let vertex_fog = vs.is_none() && fixed & 32 != 0;
+    let mut used = varyings(ps, second);
+    used[1] |= specular;
     let mut s = TYPES.replace("struct Interpolated", "struct Varyings");
     for n in 0..13 {
         s = s.replace(&format!("@location({n}) "), "");
@@ -52,7 +57,12 @@ pub(super) fn build(
     s.push_str("struct Interpolated { @builtin(position) position:vec4<f32>,\n");
     for (n, name) in fields().iter().enumerate() {
         if used[n] {
-            writeln!(s, "@location({n}) {name}:vec4<f32>,").unwrap();
+            let interpolation = if flat && n < 2 {
+                "@interpolate(flat, first) "
+            } else {
+                ""
+            };
+            writeln!(s, "@location({n}) {interpolation}{name}:vec4<f32>,").unwrap();
         }
     }
     if clip & 15 != 0 {
@@ -65,6 +75,9 @@ pub(super) fn build(
         s.push_str("@location(12) fog:f32,\n");
     }
     s.push_str("}\n");
+    if factor || (second && fixed != 0) {
+        s = s.replace("switch a {case 0u:{return diffuse;}case 1u:{return current;}default:{return texel;}}", "var v=texel;switch (a&15u) {case 0u:{v=diffuse;}case 1u:{v=current;}case 3u:{v=bitcast<vec4<f32>>(draw_parameters.values[36]);}default:{}}if (a&32u)!=0u {v=vec4<f32>(v.a);}if (a&16u)!=0u {v=vec4<f32>(1.0)-v;}return v;");
+    }
     s.push_str(adv_device::gpu::BORDER_WGSL);
     for (ordinal, &(vertex, index)) in slots.iter().enumerate() {
         let p = if vertex { "vs" } else { "ps" };
@@ -188,7 +201,13 @@ pub(super) fn build(
             s.push_str("out.t0=vec4<f32>(a2,0.0,1.0);\n");
         } else {
             for input in inputs {
-                writeln!(s, "out.t{}=a{};", input.register - 2, input.register).unwrap();
+                if input.register == 11 {
+                    continue;
+                } else if input.register == 10 {
+                    s.push_str("out.c1=a10;out.fog=a10.w;\n");
+                } else {
+                    writeln!(s, "out.t{}=a{};", input.register - 2, input.register).unwrap();
+                }
             }
         }
     }
@@ -208,6 +227,8 @@ pub(super) fn build(
     s.push_str("if draw_parameters.values[2].w!=0u {\nlet corners=array<vec2<f32>,6>(vec2<f32>(-1.0,1.0),vec2<f32>(-1.0,-1.0),vec2<f32>(1.0,1.0),vec2<f32>(1.0,1.0),vec2<f32>(-1.0,-1.0),vec2<f32>(1.0,-1.0));let corner=corners[ordinal%6u];\n");
     if vt.is_some_and(|t| t.writes_point_size) {
         s.push_str("var size=result.point_size;\n");
+    } else if fixed & 256 != 0 {
+        s.push_str("var size=a11.x;\n");
     } else {
         s.push_str("var size=bitcast<f32>(draw_parameters.values[11].w);\n");
     }
@@ -228,7 +249,7 @@ pub(super) fn build(
         s.push_str(",out.fog");
     }
     s.push_str(");}\n");
-    let depth = pt.is_some_and(|p| p.writes_depth);
+    let depth = pt.is_some_and(|p| p.writes_depth) || fixed & 128 != 0;
     if depth {
         s.push_str(
             "struct FragmentOutput {@location(0) color:vec4<f32>,@builtin(frag_depth) depth:f32}\n",
@@ -300,17 +321,35 @@ pub(super) fn build(
         s.push_str("let result=ps_run(registers);var color=result.colors[0];\n");
     } else {
         s.push_str("var texel=ps_sample_0(input.t0,0u);if draw_parameters.values[2].x!=0u {texel.a=1.0;}\nlet rgb=adv_combine(draw_parameters.values[1].x,input.c0,texel).rgb;let alpha=adv_combine(draw_parameters.values[1].y,input.c0,texel).a;var color=vec4<f32>(rgb,alpha);\n");
+        if factor {
+            s.push_str("{let stage=draw_parameters.values[37];let rgb=adv_stage(stage.x,adv_argument(stage.y&255u,input.c0,input.c0,texel),adv_argument(stage.y>>8u,input.c0,input.c0,texel),input.c0).rgb;let alpha=adv_stage(stage.z,adv_argument(stage.w&255u,input.c0,input.c0,texel),adv_argument(stage.w>>8u,input.c0,input.c0,texel),input.c0).a;color=vec4<f32>(rgb,alpha);if stage.x==1u {color=input.c0;}}\n");
+        }
         if second {
             // Stage one: operation, arguments and coordinate set as D3D values.
             s.push_str("{let stage=draw_parameters.values[13];var coords=array<vec4<f32>,8>(input.t0,input.t1,input.t2,input.t3,input.t4,input.t5,input.t6,input.t7);let texel=ps_sample_1(coords[stage.w&7u],0u);\nlet rgb=adv_stage(stage.x,adv_argument(stage.y&255u,input.c0,color,texel),adv_argument(stage.y>>8u,input.c0,color,texel),color).rgb;\nlet alpha=adv_stage(stage.z&255u,adv_argument((stage.z>>8u)&255u,input.c0,color,texel),adv_argument(stage.z>>16u,input.c0,color,texel),color).a;color=vec4<f32>(rgb,alpha);}\n");
         }
     }
+    if specular {
+        s.push_str("color=vec4<f32>(clamp(color.rgb+input.c1.rgb,vec3<f32>(0.0),vec3<f32>(1.0)),color.a);\n");
+    }
     s.push_str("if !adv_alpha(color.a) {discard;}\n");
-    if fog && ps.is_none_or(|p| p.version.major < 3) {
+    if vertex_fog && ps.is_none_or(|p| p.version.major < 3) {
+        s.push_str("color=vec4<f32>(mix(bitcast<vec4<f32>>(draw_parameters.values[10]).rgb,color.rgb,clamp(input.fog,0.0,1.0)),color.a);\n");
+    } else if fog && ps.is_none_or(|p| p.version.major < 3) {
         s.push_str("if draw_parameters.values[3].y!=0u {var factor=input.fog;let mode=draw_parameters.values[3].z;let values=bitcast<vec4<f32>>(draw_parameters.values[11]);let distance=input.position.z;if mode==1u {factor=exp(-values.z*distance);}else if mode==2u {factor=exp(-pow(values.z*distance,2.0));}else if mode==3u {factor=(values.y-distance)/(values.y-values.x);}color=vec4<f32>(mix(bitcast<vec4<f32>>(draw_parameters.values[10]).rgb,color.rgb,clamp(factor,0.0,1.0)),color.a);}\n");
     }
-    if depth {
+    if fixed & 16 != 0 {
+        s.push_str("let linear=clamp(color.rgb,vec3<f32>(0.0),vec3<f32>(1.0));color=vec4<f32>(select(1.055*pow(linear,vec3<f32>(1.0/2.4))-0.055,12.92*linear,linear<=vec3<f32>(0.0031308)),color.a);\n");
+    }
+    if depth && fixed & 128 == 0 {
         s.push_str("return FragmentOutput(color,clamp(result.depth,0.0,1.0));}\n");
+    } else if depth {
+        let original = if pt.is_some_and(|p| p.writes_depth) {
+            "result.depth"
+        } else {
+            "input.position.z"
+        };
+        writeln!(s,"let depth_bias=bitcast<vec4<f32>>(draw_parameters.values[38]);let z={original}+depth_bias.x+depth_bias.y*max(abs(dpdx(input.position.z)),abs(dpdy(input.position.z)));return FragmentOutput(color,clamp(z,0.0,1.0));}}").unwrap();
     } else {
         s.push_str("return color;}\n");
     }

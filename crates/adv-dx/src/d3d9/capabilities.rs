@@ -319,6 +319,8 @@ pub(super) fn caps(env: &Env<'_>) -> Result<D3DCAPS9, u32> {
         MaxTextureAspectRatio: texture_size,
         MaxAnisotropy: 1,
         MaxVertexW: 1.0,
+        MaxActiveLights: 8,
+        VertexProcessingCaps: 0x2 | 0x8 | 0x10 | 0x20,
         FVFCaps: 1,
         // Do not advertise general modulation/add/subtract until all argument
         // combinations work. Selected textured-quad combinations already draw.

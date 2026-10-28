@@ -423,6 +423,10 @@ impl State {
                 Cull::CounterClockwise => MTLCullMode::Front,
             });
             encoder.setStencilReferenceValue(state.stencil_reference & 255);
+            if let Some(color) = state.blend_constant {
+                let c = |n: u32| ((color >> n) & 255u32) as f32 / 255.;
+                encoder.setBlendColorRed_green_blue_alpha(c(0), c(8), c(16), c(24));
+            }
             let v = state.viewport;
             encoder.setViewport(MTLViewport {
                 originX: v.x as f64,

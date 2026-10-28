@@ -59,6 +59,7 @@ fn schedule(
         inputs: inputs.iter().map(|i| (i.register, i.format)).collect(),
         second: false,
         features: (d.fixed.render[&152], d.fixed.render[&28] != 0),
+        fixed: fixed_features(&d.fixed, None),
     };
     let state = env.ext.get_mut::<State>();
     let Some(context) = state.gpu.as_ref().map(|gpu| gpu.context().clone()) else {
@@ -84,7 +85,7 @@ fn schedule(
     }
     cache.warming_order.push_back((key.clone(), bytes));
     cache.warming_bytes += bytes;
-    let features = (false, key.features.0, key.features.1);
+    let features = (false, key.features.0, key.features.1, key.fixed);
     let job = Compile::spawn(bytes, cache.counters.clone(), move || {
         let translations = stages
             .each_ref()
@@ -231,7 +232,7 @@ mod tests {
                 register: 0,
             }],
             &[],
-            (false, 0, false),
+            (false, 0, false, 0),
         )
         .unwrap();
         let cache = &env.ext.get::<State>().programs;

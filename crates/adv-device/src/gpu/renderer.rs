@@ -1550,6 +1550,15 @@ impl Gpu {
         {
             let pass = pending.pass.as_mut().unwrap();
             pass.set_pipeline(&pipeline);
+            if let Some(color) = state.blend_constant {
+                let c = |n: u32| f64::from((color >> n) & 255u32) / 255.;
+                pass.set_blend_constant(wgpu::Color {
+                    r: c(0),
+                    g: c(8),
+                    b: c(16),
+                    a: c(24),
+                });
+            }
             if state.stencil.is_some() {
                 pass.set_stencil_reference(state.stencil_reference & 255);
             }
@@ -2140,6 +2149,8 @@ fn factor(f: Factor) -> wgpu::BlendFactor {
         Factor::DestinationAlpha => wgpu::BlendFactor::DstAlpha,
         Factor::OneMinusDestinationAlpha => wgpu::BlendFactor::OneMinusDstAlpha,
         Factor::SourceAlphaSaturated => wgpu::BlendFactor::SrcAlphaSaturated,
+        Factor::Constant => wgpu::BlendFactor::Constant,
+        Factor::OneMinusConstant => wgpu::BlendFactor::OneMinusConstant,
     }
 }
 fn blend(b: Blend) -> wgpu::BlendComponent {

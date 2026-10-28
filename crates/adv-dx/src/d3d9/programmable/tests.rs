@@ -150,7 +150,7 @@ fn every_declaration_type_is_fetched_by_the_gpu_with_d3d_component_defaults() {
             None,
             &inputs,
             &[(false, 0)],
-            (false, 0, false),
+            (false, 0, false, 0),
         )
         .unwrap();
         let program = Program::new(source.into(), vec![false]);
@@ -269,7 +269,7 @@ fn fixed_pixel_stages_combine_a_second_texture_stage() {
         None,
         &[],
         &[(false, 0), (false, 1)],
-        (true, 0, false),
+        (true, 0, false, 0),
     )
     .unwrap();
     let program = Program::new(source.into(), vec![false, false]);
@@ -332,4 +332,42 @@ fn fixed_pixel_stages_combine_a_second_texture_stage() {
         got.iter().zip(want).all(|(&a, b)| a.abs_diff(b) <= 2),
         "{got:?} expected {want:?}"
     );
+}
+
+// spec: GFX-FIXED-2, GFX-CACHE-8
+#[test]
+fn fixed_completion_unlit_pipeline_identity() {
+    let key = ProgramKey {
+        vertex: None,
+        pixel: None,
+        inputs: Vec::new(),
+        second: false,
+        features: (0, false),
+        fixed: 0,
+    };
+    assert_eq!(
+        recording::hash(&key),
+        recording::hash((key.vertex, key.pixel, &key.inputs, key.second, key.features))
+    );
+    let source = source::build(
+        None,
+        None,
+        None,
+        None,
+        &[],
+        &[(false, 0)],
+        (false, 0, false, 0),
+    )
+    .unwrap();
+    assert_eq!(
+        xxhash_rust::xxh3::xxh3_128(source.as_bytes()),
+        12730266951233098795822423985951590738
+    );
+    for fixed in [1, 2, 4, 8, 32] {
+        let changed = ProgramKey {
+            fixed,
+            ..key.clone()
+        };
+        assert_ne!(recording::hash(&key), recording::hash(&changed));
+    }
 }
