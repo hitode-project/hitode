@@ -202,6 +202,7 @@ fn programmable_draw_uses_logical_viewport_and_shared_depth_without_losing_color
         .with_depth(Some(gpu.depth(8, 6, DepthFormat::Unorm16).unwrap()))
         .unwrap();
     let draw = ProgrammableDraw {
+        instance_count: 1,
         program: Program::new("@vertex fn vertex_main(@builtin(vertex_index) i:u32) -> @builtin(position) vec4<f32> { let p=array<vec2<f32>,3>(vec2(-1.,1.),vec2(-1.,-3.),vec2(3.,1.)); return vec4(p[i],0.5,1.); } @fragment fn fragment_main() -> @location(0) vec4<f32> { return vec4(1.,0.,1.,1.); }".into(), vec![]),
         streams: vec![], indices: None, vertex_count: 3, vertex_constants: ConstantBlock::default().into(), pixel_constants: ConstantBlock::default().into(), textures: vec![], parameters: [[0;4];40],
     };
@@ -274,8 +275,9 @@ fn programmable_batches_preserve_each_upload_and_flush_large_draws_and_consumers
     gpu.clear(&target, Some([0.; 4]), None).unwrap();
     let before = gpu.stats().submissions;
     let mut draw = ProgrammableDraw {
+        instance_count: 1,
         program: Program::new("struct C { f: array<vec4<f32>,256> }; @group(0) @binding(1) var<uniform> c:C; struct V { @builtin(position) p:vec4<f32>, @location(0) color:vec4<f32> }; @vertex fn vertex_main(@builtin(vertex_index) i:u32, @location(0) color:vec4<f32>)->V { let p=array<vec2<f32>,3>(vec2(-1.,-1.),vec2(3.,-1.),vec2(-1.,3.)); return V(vec4(p[i%3],0.,1.),color); } @fragment fn fragment_main(v:V)->@location(0) vec4<f32> { return vec4(v.color.x,c.f[0].x,0.,1.); }".into(), vec![]),
-        streams: vec![VertexStream { bytes: vec![].into(), stride: 16, attributes: vec![Attribute { location: 0, offset: 0, format: AttributeFormat::Float4 }] }],
+        streams: vec![VertexStream { instance: false, bytes: vec![].into(), stride: 16, attributes: vec![Attribute { location: 0, offset: 0, format: AttributeFormat::Float4 }] }],
         indices: Some(vec![].into()), vertex_count: 6, vertex_constants: ConstantBlock::default().into(),
         pixel_constants: ConstantBlock::default().into(), textures: vec![], parameters: [[0;4];40],
     };

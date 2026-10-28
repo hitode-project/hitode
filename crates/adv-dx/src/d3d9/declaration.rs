@@ -91,6 +91,8 @@ fn fixed_layout(elements: &[[u8; 8]]) -> Result<fixed::Layout, &'static str> {
     let mut texcoords = [None; 8];
     let mut size = 0;
     let mut streams = [0; 2];
+    let mut normal = None;
+    let mut specular = None;
     for element in elements.iter().take_while(|e| !end(e)) {
         let stream = u16::from_le_bytes([element[0], element[1]]);
         if stream >= 16 {
@@ -118,6 +120,14 @@ fn fixed_layout(elements: &[[u8; 8]]) -> Result<fixed::Layout, &'static str> {
                 streams[1] = stream;
                 4
             }
+            (3, 0, 2) if normal.is_none() => {
+                normal = Some((stream, offset));
+                12
+            }
+            (10, 1, 4) if specular.is_none() => {
+                specular = Some((stream, offset));
+                4
+            }
             (5, n @ 0..=7, kind @ 0..=3) if texcoords[n as usize].is_none() => {
                 let dimensions = kind + 1;
                 texcoords[n as usize] = Some((stream, offset, dimensions));
@@ -133,6 +143,8 @@ fn fixed_layout(elements: &[[u8; 8]]) -> Result<fixed::Layout, &'static str> {
         transformed,
         position,
         color,
+        normal,
+        specular,
         texcoords,
         streams,
         size,

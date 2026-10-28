@@ -164,6 +164,39 @@ Damage clipping remains a conservative region optimization under GFX-REC-4/5.
 **Rule**: Present boundaries MUST fall on host vsyncs, and a late Present MUST wait for the next one without repaying missed frames. At display rates within 1% of a whole multiple of the guest rate, on-time boundaries MUST be exactly that many vsyncs apart. Other rates MUST snap the guest's rational cadence to the nearest vsync after now.
 **Verification**: Test
 
+### GFX-SWAP-1 Implicit swap chain
+
+**Rule**: `GetSwapChain(0)` MUST return one stable, AddRef'd `IDirect3DSwapChain9` identity retained internally until device destruction. Its presentation, backbuffer, display mode and front-buffer capture methods MUST use the device's existing behavior, including pacing and damage. Higher indices MUST return `D3DERR_INVALIDCALL`, and additional swap chains MUST return `D3DERR_NOTAVAILABLE`.
+**Verification**: Test
+
+`QueryInterface` supports `IUnknown` and `IDirect3DSwapChain9`. Public references
+retain the device; `GetDevice` adds a device reference. `GetPresentParameters`
+returns the normalized device parameters, including after Reset. `GetRasterStatus`
+uses the host display phase, or machine-clock refresh phase, with one modeled
+blanking line after the visible rows. Nonzero Present flags are unsupported.
+Front-buffer capture retains the device method's unsupported failure contract.
+
+### GFX-QUERY-1 Nonblocking queries
+
+**Rule**: `CreateQuery` MUST support EVENT, OCCLUSION, TIMESTAMP, TIMESTAMPFREQ and TIMESTAMPDISJOINT, including support probes with a null output pointer. `GetData` MUST return `S_FALSE` until issued recording work is submitted, with `D3DGETDATA_FLUSH` attempting submission without blocking the guest thread. Other query types MUST return `D3DERR_NOTAVAILABLE`.
+**Verification**: Test
+**Basis**: Microsoft Direct3D 9 [queries](https://learn.microsoft.com/en-us/windows/win32/direct3d9/queries).
+
+| Query | Issue flags | Result |
+|---|---|---|
+| EVENT | END | BOOL TRUE after submission of work recorded through Issue. |
+| OCCLUSION | BEGIN, END | DWORD sum of render-target pixel areas for accepted draws inside the bracket, rather than depth-tested fragment counts. Clears and copies do not contribute. |
+| TIMESTAMP | END | UINT64 host monotonic nanoseconds, sampled at Issue. |
+| TIMESTAMPFREQ | END | UINT64 frequency of 1,000,000,000 Hz. |
+| TIMESTAMPDISJOINT | BEGIN, END | BOOL FALSE. |
+
+Queries expose their type, data size and AddRef'd owning device through COM.
+Repeated BEGIN restarts the bracket; GetData during a bracket returns S_FALSE.
+Zero-size GetData polls status without copying data. Nonzero sizes match the
+query's data size, and only zero or D3DGETDATA_FLUSH is accepted for GetData flags.
+New queries are signaled with an unspecified initial answer. Completed queries
+retain their answer until reissued; later recorded work does not delay them.
+
 ## Capabilities
 
 ### GFX-CAP-1 Honest capabilities
@@ -178,8 +211,24 @@ Damage clipping remains a conservative region optimization under GFX-REC-4/5.
 
 ### GFX-CAP-3 Excluded resources
 
-**Rule**: Shader Model 4+, D3D10/11, geometry and tessellation shaders, N-patches, and shader ProcessVertices MUST remain unsupported. Cube textures, volume textures, extra MRTs, and software-VP large constants MUST NOT be advertised as implemented.
+**Rule**: Shader Model 4+, D3D10/11, geometry and tessellation shaders, N-patches, and shader ProcessVertices MUST remain unsupported. Cube textures, volume textures, additional swap chains, extra MRTs, and software-VP large constants MUST NOT be advertised as implemented.
 **Verification**: Test
+
+### GFX-RES-1 Resource common methods
+
+**Rule**: Resource interfaces MUST share per-object private data, priority, device ownership, and type queries. Private interface pointers MUST receive reference transfers on storage, retrieval, replacement, freeing, and object destruction. Stored-only device state MUST round-trip without changing rendered output.
+**Verification**: Test
+
+| State or operation | Contract |
+|---|---|
+| Private data | GUID keys own copied bytes or a `D3DSPD_IUNKNOWN` interface; insufficient buffers return `D3DERR_MOREDATA` and the required size; null outputs query size successfully. |
+| Priority | SetPriority returns the previous value; default-pool resources always return zero. PreLoad is a no-op. |
+| Device and parent queries | GetDevice and GetDirect3D return AddRef'd interfaces; resource type matches the concrete object. |
+| Texture levels | GetLevelCount reports the stored mip count, or one for AUTOGENMIPMAP. Managed LOD clamps to the mip range and returns its previous value; other pools return zero. |
+| Mipmap generation | The default filter is LINEAR; POINT and LINEAR round-trip. GenerateMipSubLevels regenerates AUTOGENMIPMAP chains from level zero; other textures and single-level chains are unchanged. |
+| Device queries | One swap chain, no vertical blank, scanline zero; ValidateDevice reports one pass or the existing unsupported-stage error. |
+| Stored-only state | Gamma ramps, clip status, palettes, current palette, cursor visibility and cursor position belong to the device. ShowCursor returns previous visibility. |
+| Exclusions | Software rasterizer registration returns `D3DERR_NOTAVAILABLE`; P8 textures and GFX-CAP-3 exclusions remain unsupported. |
 
 ## Shaders and state
 
@@ -239,6 +288,17 @@ snapshot storage; an unchanged Apply performs no state writes. Redundant fixed-s
 
 **Rule**: Expanded fixed-function vertex uploads MUST remain within 16 MiB.
 **Verification**: Review — no test reaches the upload limit.
+
+### GFX-INPUT-7 Stream frequencies and instancing
+
+**Rule**: Indexed draws MUST honor stream-zero INDEXEDDATA instance counts and INSTANCEDATA divisor one using instance-step streams and one instanced draw. Declarations and FVF MUST support instancing in programmable and fixed paths. Non-indexed draws MUST ignore stream frequencies.
+**Verification**: Test
+
+| State | Contract |
+|---|---|
+| Set/Get and state blocks | MUST preserve stream frequency values. |
+| Unsupported divisors | MUST return D3DERR_NOTAVAILABLE. |
+| Reset | MUST restore every stream frequency to one. |
 
 ## Samplers
 
@@ -339,6 +399,23 @@ Binding changes MUST NOT start speculative module preparation for transient shad
 **Basis**: Microsoft Direct3D 9 `IDirect3DDevice9::CreateRenderTarget` and `IDirect3DSurface9::LockRect`.
 
 CPU-only surfaces and managed texture-level locks preserve pending recorded commands; only GPU-backed locks require a readback barrier.
+
+### GFX-FIXED-1 Lighting and materials
+
+**Rule**: Fixed vertex processing MUST apply directional, point and spot lighting, material sources, ambient, emissive and enabled specular contributions using D3D9 equations. Light and material setters, queries and state blocks MUST preserve their values, with arbitrary light indices and at most eight active lights per draw. `MultiplyTransform` MUST premultiply the stored transform by the supplied matrix.
+**Verification**: Test
+**Basis**: Microsoft Direct3D 9 mathematics of lighting and `IDirect3DDevice9::MultiplyTransform`.
+
+### GFX-FIXED-2 Fog, texture factor and shading
+
+**Rule**: Fixed draws MUST implement D3D9 fog and point scaling as exceptions to GFX-INPUT-5, plus texture factor, shading, blend factors, depth bias and sRGB. Fog and specular MUST follow texture combining without changing the combined alpha. Fixed pipeline variants MUST preserve existing unlit pipeline recipes and cache identities.
+**Verification**: Test
+**Basis**: Microsoft Direct3D 9 fog formulas, texture arguments and shading modes.
+
+### GFX-COPY-3 System-memory surface uploads
+
+**Rule**: UpdateSurface MUST upload matching-format SYSTEMMEM surfaces or texture levels into DEFAULT destinations, honoring optional source rectangles and destination points. Invalid pools, formats, locked surfaces, depth/stencil, multisampling, and out-of-bounds rectangles MUST return D3DERR_INVALIDCALL. Uploads MUST preserve pixels outside the destination rectangle and track resource-level writes.
+**Verification**: Test
 
 ### GFX-STATE-1 Neutral fixed state
 

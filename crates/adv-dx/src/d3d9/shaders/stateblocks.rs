@@ -36,6 +36,9 @@ impl ConstantMask {
 #[derive(Clone, Default)]
 struct Mask {
     dirty: u16,
+    material: bool,
+    lights: std::collections::BTreeSet<u32>,
+    light_enable: std::collections::BTreeSet<u32>,
     vertex: bool,
     pixel: bool,
     vertex_constants: ConstantMask,
@@ -43,6 +46,7 @@ struct Mask {
     fvf: bool,
     declaration: bool,
     streams: Slots<usize, 1>,
+    frequencies: Slots<usize, 1>,
     indices: bool,
     texture: bool,
     textures: Slots<usize, 1>,
@@ -61,6 +65,7 @@ impl Mask {
     fn items(&self) -> u64 {
         let constants = |m: &ConstantMask| m.floats.len() + m.integers.len() + m.booleans.len();
         ([
+            self.material,
             self.vertex,
             self.pixel,
             self.fvf,
@@ -73,7 +78,10 @@ impl Mask {
         .into_iter()
         .filter(|v| *v)
         .count()
+            + self.lights.len()
+            + self.light_enable.len()
             + self.streams.len()
+            + self.frequencies.len()
             + self.textures.len()
             + self.render.len()
             + self.stage.len()
@@ -93,7 +101,10 @@ impl Mask {
             !(m.floats.is_empty() && m.integers.is_empty() && m.booleans.is_empty())
         };
         [
-            !self.render.is_empty(),
+            !self.render.is_empty()
+                || self.material
+                || !self.lights.is_empty()
+                || !self.light_enable.is_empty(),
             !(self.stage.is_empty() && self.stage_slots.is_empty()),
             !(self.sampler.is_empty() && self.sampler_slots.is_empty()),
             self.viewport,
@@ -103,7 +114,7 @@ impl Mask {
             self.fvf || self.declaration,
             self.vertex,
             self.pixel,
-            !self.streams.is_empty(),
+            !self.streams.is_empty() || !self.frequencies.is_empty(),
             self.indices,
             self.texture || !self.textures.is_empty(),
             constants(&self.vertex_constants),
@@ -143,6 +154,9 @@ impl StateBlock {
         m.dirty = (0..15).fold(0, |bits, c| bits | (u16::from(changed(c)) << c)) & self.classes;
         if !changed(0) {
             m.render = Default::default();
+            m.material = false;
+            m.lights.clear();
+            m.light_enable.clear();
         }
         if !changed(1) {
             m.stage = Default::default();
@@ -166,6 +180,7 @@ impl StateBlock {
         m.pixel &= changed(9);
         if !changed(10) {
             m.streams = Default::default();
+            m.frequencies = Default::default();
         }
         m.indices &= changed(11);
         m.texture &= changed(12);
@@ -214,6 +229,8 @@ impl Snapshot {
                 scissor: d.fixed.scissor,
                 transforms: d.fixed.transforms,
                 clip_planes: d.fixed.clip_planes,
+                material: d.fixed.material,
+                lights: d.fixed.lights.clone(),
             },
             shaders: d.shaders.clone(),
             buffers: d.buffers.clone(),
@@ -278,6 +295,9 @@ pub(in crate::d3d9) fn unchanged(env: &mut Env<'_>, pointer: u32, _capture: bool
 }
 pub(in crate::d3d9) enum FixedKey {
     Fvf,
+    Material,
+    Light(u32),
+    LightEnable(u32),
     Render(i32),
     Stage(i32),
     StageSlot(usize, i32),
@@ -299,7 +319,10 @@ pub(in crate::d3d9) fn mark_fixed(env: &mut Env<'_>, pointer: u32, key: FixedKey
         }
         let class = match key {
             FixedKey::Fvf => 7,
-            FixedKey::Render(_) => 0,
+            FixedKey::Render(_)
+            | FixedKey::Material
+            | FixedKey::Light(_)
+            | FixedKey::LightEnable(_) => 0,
             FixedKey::Stage(_) | FixedKey::StageSlot(_, _) => 1,
             FixedKey::Sampler(_) | FixedKey::SamplerSlot(_, _) => 2,
             FixedKey::Viewport => 3,
@@ -312,6 +335,13 @@ pub(in crate::d3d9) fn mark_fixed(env: &mut Env<'_>, pointer: u32, key: FixedKey
     };
     match key {
         FixedKey::Fvf => r.mask.fvf = true,
+        FixedKey::Material => r.mask.material = true,
+        FixedKey::Light(i) => {
+            r.mask.lights.insert(i);
+        }
+        FixedKey::LightEnable(i) => {
+            r.mask.light_enable.insert(i);
+        }
         FixedKey::Render(i) => {
             r.mask.render.insert(i);
         }
@@ -344,13 +374,16 @@ pub(in crate::d3d9) fn register(registry: &mut Registry) {
         block_release_ABI,
         block_device_ABI,
         super::super::unchanged::unless_unchanged!(
-            capture_ABI,
+            with_private_releases!(capture_ABI),
             super::super::unchanged::state_block
         ),
-        super::super::unchanged::unless_unchanged!(apply_ABI, super::super::unchanged::state_block),
+        super::super::unchanged::unless_unchanged!(
+            with_private_releases!(apply_ABI),
+            super::super::unchanged::state_block
+        ),
         create_ABI,
         begin_ABI,
-        end_ABI,
+        with_private_releases!(end_ABI),
     ] {
         registry.register(api);
     }
@@ -487,6 +520,17 @@ fn mask(env: &Env<'_>, device: Id, kind: i32) -> Option<Mask> {
     ];
     Some(Mask {
         dirty: 0,
+        material: vertex,
+        lights: if vertex {
+            d.fixed.lights.keys().copied().collect()
+        } else {
+            Default::default()
+        },
+        light_enable: if vertex {
+            d.fixed.lights.keys().copied().collect()
+        } else {
+            Default::default()
+        },
         vertex,
         pixel,
         vertex_constants: if vertex {
@@ -502,6 +546,11 @@ fn mask(env: &Env<'_>, device: Id, kind: i32) -> Option<Mask> {
         fvf: vertex,
         declaration: vertex,
         streams: if all {
+            (0..16).collect()
+        } else {
+            Slots::default()
+        },
+        frequencies: if vertex {
             (0..16).collect()
         } else {
             Slots::default()
@@ -890,6 +939,9 @@ fn transfer<'a>(
     for i in &mask.streams {
         buffers.streams[i] = source_buffers.streams[i];
     }
+    for i in &mask.frequencies {
+        buffers.frequencies[i] = source_buffers.frequencies[i];
+    }
     if mask.indices {
         buffers.indices = source_buffers.indices;
     }
@@ -899,7 +951,10 @@ fn transfer<'a>(
     for slot in &mask.textures {
         shaders.textures[slot] = source_shaders.textures[slot];
     }
-    if mask.fvf
+    if mask.material
+        || !mask.lights.is_empty()
+        || !mask.light_enable.is_empty()
+        || mask.fvf
         || mask.viewport
         || mask.scissor
         || !mask.render.is_empty()
@@ -911,6 +966,15 @@ fn transfer<'a>(
         || !mask.clip_planes.is_empty()
     {
         let fixed = fixed();
+        if mask.material {
+            fixed.material = source_fixed.material;
+        }
+        for &i in &mask.lights {
+            fixed.lights.entry(i).or_default().value = source_fixed.lights[&i].value;
+        }
+        for &i in &mask.light_enable {
+            fixed.lights.entry(i).or_default().enabled = source_fixed.lights[&i].enabled;
+        }
         if mask.fvf {
             fixed.fvf = source_fixed.fvf;
         }
@@ -1070,6 +1134,11 @@ pub(in crate::d3d9) fn record_texture_slot(
         return Some(INVALID);
     }
     record(env, device, Slot::TextureAt(index), new)
+}
+pub(in crate::d3d9) fn record_frequency(snapshot: &mut Snapshot, stream: usize, setting: u32) {
+    snapshot.mask.frequencies.insert(stream);
+    snapshot.mask.dirty |= 1 << 10;
+    snapshot.buffers.frequencies[stream] = setting;
 }
 pub(in crate::d3d9) fn record_stream(
     env: &mut Env<'_>,

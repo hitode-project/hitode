@@ -38,6 +38,8 @@ pub(super) struct Resource {
     pub levels: Vec<Level>,
     pub level: u32,
     pub lod: u32,
+    pub common: Common,
+    pub auto_filter: i32,
 }
 #[derive(Clone, Copy)]
 pub(super) struct Level {
@@ -100,6 +102,8 @@ impl Resource {
             levels: Vec::new(),
             level: 0,
             lod: 0,
+            common: resources::Common::default(),
+            auto_filter: 2,
         }
     }
 }
@@ -112,6 +116,7 @@ pub(super) struct Lock {
     pub ready: bool,
 }
 pub(super) fn register(registry: &mut Registry) {
+    register_common(registry);
     for api in [
         surface_query_ABI,
         surface_add_ref_ABI,
@@ -125,17 +130,13 @@ pub(super) fn register(registry: &mut Registry) {
         texture_desc_ABI,
         texture_lock_ABI,
         texture_unlock_ABI,
-        super::unchanged::unless_unchanged!(set_texture_ABI, super::unchanged::binding),
+        super::unchanged::unless_unchanged!(
+            with_private_releases!(set_texture_ABI),
+            super::unchanged::binding
+        ),
         get_texture_ABI,
-        texture_levels_ABI,
-        texture_set_lod_ABI,
-        texture_get_lod_ABI,
         texture_surface_ABI,
         surface_container_ABI,
-        surface_device_ABI,
-        texture_device_ABI,
-        surface_type_ABI,
-        texture_type_ABI,
     ] {
         registry.register(api);
     }
@@ -257,6 +258,8 @@ fn texture_surface(
             levels: Vec::new(),
             level,
             lod: 0,
+            common: resources::Common::default(),
+            auto_filter: 2,
         };
         let Some((pointer, id)) = object(
             env,
@@ -335,14 +338,17 @@ fn surface_container(
     query(env, GuestPtr::new(pointer), iid, output)
 }
 
-fn resource_device(env: &mut Env<'_>, this: u32, output: GuestPtr<u32>) -> u32 {
+#[win32(d3d9, name = "IDirect3DResource9::GetDevice", level = implement)]
+fn resource_device(env: &mut Env<'_>, this: GuestPtr<()>, output: GuestPtr<u32>) -> u32 {
     if output.write(env.cpu, 0).is_err() {
         return INVALID;
     }
-    let Some(r) = resource(env, this) else {
-        return INVALID;
+    let owner = match com(env).get::<Payload>(&env.sys.objects, this.addr()) {
+        Some(Payload::Resource(r)) => r.device,
+        Some(Payload::Buffer(b)) => b.device,
+        _ => return INVALID,
     };
-    let Some(Payload::Device(d)) = com(env).get_identity(&env.sys.objects, r.device) else {
+    let Some(Payload::Device(d)) = com(env).get_identity(&env.sys.objects, owner) else {
         return INVALID;
     };
     let pointer = d.pointer;
@@ -355,24 +361,24 @@ fn resource_device(env: &mut Env<'_>, this: u32, output: GuestPtr<u32>) -> u32 {
     }
     0
 }
-#[win32(d3d9,name="IDirect3DSurface9::GetDevice",level=implement)]
-fn surface_device(env: &mut Env<'_>, this: GuestPtr<()>, output: GuestPtr<u32>) -> u32 {
-    resource_device(env, this.addr(), output)
-}
-#[win32(d3d9,name="IDirect3DTexture9::GetDevice",level=implement)]
-fn texture_device(env: &mut Env<'_>, this: GuestPtr<()>, output: GuestPtr<u32>) -> u32 {
-    resource_device(env, this.addr(), output)
-}
-#[win32(d3d9,name="IDirect3DSurface9::GetType",level=implement)]
-fn surface_type(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
-    u32::from(resource(env, this.addr()).is_some_and(|r| r.kind == Kind::Surface))
-}
-#[win32(d3d9,name="IDirect3DTexture9::GetType",level=implement)]
-fn texture_type(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
-    if resource(env, this.addr()).is_some_and(|r| r.kind == Kind::Texture) {
-        3
-    } else {
-        0
+#[win32(d3d9, name = "IDirect3DResource9::GetType", level = implement)]
+fn resource_type(env: &mut Env<'_>, this: GuestPtr<()>) -> i32 {
+    match com(env).get::<Payload>(&env.sys.objects, this.addr()) {
+        Some(Payload::Resource(r)) => {
+            if r.kind == Kind::Texture {
+                3
+            } else {
+                1
+            }
+        }
+        Some(Payload::Buffer(b)) => {
+            if b.kind == buffers::Kind::Vertex {
+                6
+            } else {
+                7
+            }
+        }
+        _ => 0,
     }
 }
 pub(super) fn parent_on_last_public_release(env: &Env<'_>, pointer: u32) -> Option<Id> {
@@ -402,6 +408,7 @@ pub(super) fn destroy(env: &mut Env<'_>, r: Resource) {
             let _ = (provider.remove)(env.ext, env.cpu, surface);
         }
     }
+    destroy_common(env, r.common);
 }
 fn owned_surfaces(r: &Resource) -> Vec<u32> {
     if !r.owns_surface {
@@ -479,6 +486,8 @@ pub(super) fn implicit_back_buffer(
             levels: Vec::new(),
             level: 0,
             lod: 0,
+            common: resources::Common::default(),
+            auto_filter: 2,
         },
     )?;
     if !com(env).retain_internal(&mut env.sys.objects, id) {
@@ -489,7 +498,7 @@ pub(super) fn implicit_back_buffer(
     Some(id)
 }
 #[win32(d3d9,name="IDirect3DDevice9::GetBackBuffer",level=implement)]
-fn back_buffer(
+pub(super) fn back_buffer(
     env: &mut Env<'_>,
     this: GuestPtr<()>,
     swap: u32,
@@ -540,6 +549,9 @@ pub(super) fn create_texture(
     if device(env, this.addr()).is_none() {
         return Outcome::Return(INVALID);
     }
+    // Software vertex processing does not apply to textures; the runtime
+    // accepts the flag in every pool.
+    let usage = usage & !0x10;
     if !shared.is_null()
         || format::bytes(format).is_none()
         || !(0..=3).contains(&pool)
@@ -631,6 +643,8 @@ pub(super) fn create_texture(
             levels,
             level: 0,
             lod: 0,
+            common: resources::Common::default(),
+            auto_filter: 2,
         },
     ) else {
         return Outcome::Return(OUT_OF_MEMORY);
@@ -721,9 +735,15 @@ fn texture_desc(
 fn texture_levels(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
     resource(env, this.addr())
         .filter(|r| r.kind == Kind::Texture)
-        .map_or(0, |r| r.levels.len() as u32)
+        .map_or(0, |r| {
+            if r.desc.Usage & 0x400 != 0 {
+                1
+            } else {
+                r.levels.len() as u32
+            }
+        })
 }
-#[win32(d3d9,name="IDirect3DTexture9::SetLOD",level=state)]
+#[win32(d3d9,name="IDirect3DTexture9::SetLOD",level=implement)]
 fn texture_set_lod(env: &mut Env<'_>, this: GuestPtr<()>, lod: u32) -> u32 {
     let Some(Payload::Resource(r)) = com(env).get_mut::<Payload>(&mut env.sys.objects, this.addr())
     else {
@@ -733,7 +753,11 @@ fn texture_set_lod(env: &mut Env<'_>, this: GuestPtr<()>, lod: u32) -> u32 {
         return 0;
     }
     let old = r.lod;
-    r.lod = lod.min((r.levels.len() as u32).saturating_sub(1));
+    r.lod = if r.desc.Usage & 0x400 != 0 {
+        0
+    } else {
+        lod.min((r.levels.len() as u32).saturating_sub(1))
+    };
     old
 }
 #[win32(d3d9,name="IDirect3DTexture9::GetLOD",level=implement)]
@@ -1055,6 +1079,441 @@ fn get_texture(env: &mut Env<'_>, this: GuestPtr<()>, stage: u32, output: GuestP
     0
 }
 
+const NOT_FOUND: u32 = 0x88760866;
+const MORE_DATA: u32 = 0x88760867;
+
+#[derive(Default)]
+pub(super) struct Common {
+    private: BTreeMap<Iid, PrivateData>,
+    priority: u32,
+}
+#[derive(Clone)]
+enum PrivateData {
+    Bytes(Vec<u8>),
+    Unknown(u32),
+}
+fn common<'a>(env: &'a Env<'_>, pointer: u32) -> Option<(&'a Common, i32)> {
+    match com(env).get::<Payload>(&env.sys.objects, pointer)? {
+        Payload::Resource(r) => Some((&r.common, r.desc.Pool)),
+        Payload::Buffer(b) => Some((&b.common, b.pool)),
+        _ => None,
+    }
+}
+fn common_mut<'a>(env: &'a mut Env<'_>, pointer: u32) -> Option<(&'a mut Common, i32)> {
+    match com(env).get_mut::<Payload>(&mut env.sys.objects, pointer)? {
+        Payload::Resource(r) => Some((&mut r.common, r.desc.Pool)),
+        Payload::Buffer(b) => Some((&mut b.common, b.pool)),
+        _ => None,
+    }
+}
+pub(super) fn destroy_common(env: &mut Env<'_>, common: Common) {
+    for value in common.private.into_values() {
+        if let PrivateData::Unknown(pointer) = value {
+            env.ext.get_mut::<State>().private_releases.push(pointer);
+        }
+    }
+}
+// Destruction can happen in a binding transfer or after an asynchronous copy.
+// Complete guest releases at that operation's ABI boundary, outside host borrows.
+pub(super) fn finish_private_releases(env: &mut Env<'_>, outcome: Outcome) -> Outcome {
+    match outcome {
+        Outcome::Call {
+            target,
+            args,
+            then,
+            stack,
+            unwindable,
+        } => Outcome::Call {
+            target,
+            args,
+            stack,
+            unwindable,
+            then: Box::new(move |env, resume| {
+                let outcome = then(env, resume);
+                finish_private_releases(env, outcome)
+            }),
+        },
+        Outcome::Block {
+            wait,
+            then,
+            allow_time_skip,
+        } => Outcome::Block {
+            wait,
+            allow_time_skip,
+            then: Box::new(move |env, resume| {
+                let outcome = then(env, resume);
+                finish_private_releases(env, outcome)
+            }),
+        },
+        Outcome::Defer { then } => Outcome::defer(move |env| {
+            let outcome = then(env);
+            finish_private_releases(env, outcome)
+        }),
+        outcome => {
+            let Some(pointer) = env.ext.get_mut::<State>().private_releases.pop() else {
+                return outcome;
+            };
+            unknown_call(env, pointer, 2, move |env| {
+                finish_private_releases(env, outcome)
+            })
+        }
+    }
+}
+fn unknown_call(
+    env: &mut Env<'_>,
+    pointer: u32,
+    slot: u32,
+    then: impl FnOnce(&mut Env<'_>) -> Outcome + 'static,
+) -> Outcome {
+    let target = env
+        .cpu
+        .read_u32(pointer)
+        .and_then(|table| env.cpu.read_u32(table + slot * 4));
+    let Ok(target) = target else {
+        return Outcome::Return(INVALID);
+    };
+    if target == 0 {
+        return Outcome::Return(INVALID);
+    }
+    Outcome::call(target, [pointer], move |env, _| then(env))
+}
+fn register_common(registry: &mut Registry) {
+    macro_rules! methods {
+        ($interface:literal, $($api:ident => $method:literal),+ $(,)?) => {
+            $(registry.register(adv_abi::Api {
+                name: concat!($interface, "::", $method), ..$api
+            });)+
+        };
+    }
+    macro_rules! resource_interface {
+        ($interface:literal) => {
+            methods!($interface,
+                resource_device_ABI => "GetDevice",
+                resource_type_ABI => "GetType",
+                set_private_ABI => "SetPrivateData",
+                get_private_ABI => "GetPrivateData",
+                free_private_ABI => "FreePrivateData",
+                set_priority_ABI => "SetPriority",
+                get_priority_ABI => "GetPriority",
+                preload_ABI => "PreLoad",
+            );
+        };
+    }
+    resource_interface!("IDirect3DResource9");
+    resource_interface!("IDirect3DSurface9");
+    resource_interface!("IDirect3DTexture9");
+    resource_interface!("IDirect3DBaseTexture9");
+    resource_interface!("IDirect3DVertexBuffer9");
+    resource_interface!("IDirect3DIndexBuffer9");
+    macro_rules! texture_interface {
+        ($interface:literal) => {
+            methods!($interface,
+                texture_levels_ABI => "GetLevelCount",
+                texture_set_lod_ABI => "SetLOD",
+                texture_get_lod_ABI => "GetLOD",
+                set_auto_filter_ABI => "SetAutoGenFilterType",
+                get_auto_filter_ABI => "GetAutoGenFilterType",
+                generate_mips_ABI => "GenerateMipSubLevels",
+            );
+        };
+    }
+    texture_interface!("IDirect3DBaseTexture9");
+    texture_interface!("IDirect3DTexture9");
+}
+#[win32(d3d9, name = "IDirect3DResource9::SetPrivateData", level = implement)]
+fn set_private(
+    env: &mut Env<'_>,
+    this: GuestPtr<()>,
+    guid: GuestPtr<Iid>,
+    data: GuestPtr<()>,
+    size: u32,
+    flags: u32,
+) -> Outcome {
+    let Ok(guid) = guid.read(env.cpu) else {
+        return Outcome::Return(INVALID);
+    };
+    if common(env, this.addr()).is_none() {
+        return Outcome::Return(INVALID);
+    }
+    if flags & !1 != 0 {
+        adv_abi::warn_unavailable(
+            env,
+            "IDirect3DResource9::SetPrivateData",
+            "private data flags other than D3DSPD_IUNKNOWN are unsupported",
+        );
+        return Outcome::Return(UNAVAILABLE);
+    }
+    if flags == 1 {
+        if size != 4 || data.is_null() {
+            return Outcome::Return(INVALID);
+        }
+        unknown_call(env, data.addr(), 1, move |env| {
+            store_private(env, this.addr(), guid, PrivateData::Unknown(data.addr()))
+        })
+    } else {
+        if adv_abi::guest::check_range(env.cpu, data.addr(), size, Prot::READ).is_err() {
+            return Outcome::Return(INVALID);
+        }
+        let mut bytes = vec![0; size as usize];
+        if env.cpu.read(data.addr(), &mut bytes).is_err() {
+            return Outcome::Return(INVALID);
+        }
+        store_private(env, this.addr(), guid, PrivateData::Bytes(bytes))
+    }
+}
+fn store_private(env: &mut Env<'_>, pointer: u32, guid: Iid, value: PrivateData) -> Outcome {
+    let Some((common, _)) = common_mut(env, pointer) else {
+        if let PrivateData::Unknown(pointer) = value {
+            return unknown_call(env, pointer, 2, |_| Outcome::Return(INVALID));
+        }
+        return Outcome::Return(INVALID);
+    };
+    if let Some(PrivateData::Unknown(old)) = common.private.insert(guid, value) {
+        unknown_call(env, old, 2, |_| Outcome::Return(0))
+    } else {
+        Outcome::Return(0)
+    }
+}
+#[win32(d3d9, name = "IDirect3DResource9::GetPrivateData", level = implement)]
+fn get_private(
+    env: &mut Env<'_>,
+    this: GuestPtr<()>,
+    guid: GuestPtr<Iid>,
+    data: GuestPtr<()>,
+    size: GuestPtr<u32>,
+) -> Outcome {
+    let Ok(guid) = guid.read(env.cpu) else {
+        return Outcome::Return(INVALID);
+    };
+    let Some((common, _)) = common(env, this.addr()) else {
+        return Outcome::Return(INVALID);
+    };
+    let Some(value) = common.private.get(&guid).cloned() else {
+        return Outcome::Return(NOT_FOUND);
+    };
+    let Ok(capacity) = size.read(env.cpu) else {
+        return Outcome::Return(INVALID);
+    };
+    let needed = match &value {
+        PrivateData::Bytes(bytes) => bytes.len() as u32,
+        PrivateData::Unknown(_) => 4,
+    };
+    if size.write(env.cpu, needed).is_err() {
+        return Outcome::Return(INVALID);
+    }
+    if data.is_null() {
+        return Outcome::Return(0);
+    }
+    if capacity < needed {
+        return Outcome::Return(MORE_DATA);
+    }
+    match value {
+        PrivateData::Bytes(bytes) => {
+            if adv_abi::guest::check_range(env.cpu, data.addr(), needed, Prot::WRITE).is_err() {
+                return Outcome::Return(INVALID);
+            }
+            Outcome::Return(env.cpu.write(data.addr(), &bytes).map_or(INVALID, |()| 0))
+        }
+        PrivateData::Unknown(pointer) => {
+            if GuestPtr::<u32>::new(data.addr())
+                .write(env.cpu, pointer)
+                .is_err()
+            {
+                return Outcome::Return(INVALID);
+            }
+            unknown_call(env, pointer, 1, |_| Outcome::Return(0))
+        }
+    }
+}
+#[win32(d3d9, name = "IDirect3DResource9::FreePrivateData", level = implement)]
+fn free_private(env: &mut Env<'_>, this: GuestPtr<()>, guid: GuestPtr<Iid>) -> Outcome {
+    let Ok(guid) = guid.read(env.cpu) else {
+        return Outcome::Return(INVALID);
+    };
+    let Some((common, _)) = common_mut(env, this.addr()) else {
+        return Outcome::Return(INVALID);
+    };
+    match common.private.remove(&guid) {
+        Some(PrivateData::Unknown(pointer)) => {
+            unknown_call(env, pointer, 2, |_| Outcome::Return(0))
+        }
+        Some(PrivateData::Bytes(_)) => Outcome::Return(0),
+        None => Outcome::Return(NOT_FOUND),
+    }
+}
+#[win32(d3d9, name = "IDirect3DResource9::SetPriority", level = implement)]
+fn set_priority(env: &mut Env<'_>, this: GuestPtr<()>, priority: u32) -> u32 {
+    let Some((common, pool)) = common_mut(env, this.addr()) else {
+        return 0;
+    };
+    if pool == 0 {
+        return 0;
+    }
+    std::mem::replace(&mut common.priority, priority)
+}
+#[win32(d3d9, name = "IDirect3DResource9::GetPriority", level = implement)]
+fn get_priority(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
+    common(env, this.addr()).map_or(
+        0,
+        |(common, pool)| if pool == 0 { 0 } else { common.priority },
+    )
+}
+#[win32(d3d9, name = "IDirect3DResource9::PreLoad", level = implement)]
+fn preload(_env: &mut Env<'_>, _this: GuestPtr<()>) {}
+#[win32(d3d9, name = "IDirect3DBaseTexture9::SetAutoGenFilterType", level = implement)]
+fn set_auto_filter(env: &mut Env<'_>, this: GuestPtr<()>, filter: i32) -> u32 {
+    if resource(env, this.addr()).is_none_or(|r| r.kind != Kind::Texture) {
+        return INVALID;
+    }
+    if !matches!(filter, 1 | 2) {
+        adv_abi::warn_unavailable(
+            env,
+            "IDirect3DBaseTexture9::SetAutoGenFilterType",
+            "autogenerated mipmaps support POINT and LINEAR filtering",
+        );
+        return UNAVAILABLE;
+    }
+    let Some(Payload::Resource(r)) = com(env).get_mut::<Payload>(&mut env.sys.objects, this.addr())
+    else {
+        return INVALID;
+    };
+    r.auto_filter = filter;
+    0
+}
+#[win32(d3d9, name = "IDirect3DBaseTexture9::GetAutoGenFilterType", level = implement)]
+fn get_auto_filter(env: &mut Env<'_>, this: GuestPtr<()>) -> i32 {
+    resource(env, this.addr())
+        .filter(|r| r.kind == Kind::Texture)
+        .map_or(0, |r| r.auto_filter)
+}
+#[win32(d3d9, name = "IDirect3DBaseTexture9::GenerateMipSubLevels", level = implement)]
+fn generate_mips(env: &mut Env<'_>, this: GuestPtr<()>) -> Outcome {
+    let Some(r) = resource(env, this.addr()).filter(|r| r.kind == Kind::Texture) else {
+        return Outcome::Return(INVALID);
+    };
+    if r.desc.Usage & 0x400 == 0 || r.levels.len() <= 1 {
+        return Outcome::Return(0);
+    }
+    generate_next(env, this.addr(), 1)
+}
+fn generate_next(env: &mut Env<'_>, pointer: u32, index: usize) -> Outcome {
+    let Some(r) = resource(env, pointer) else {
+        return Outcome::Return(INVALID);
+    };
+    let Some(level) = r.levels.get(index) else {
+        return Outcome::Return(0);
+    };
+    let provider = env.ext.get::<State>().provider;
+    let Some(source) = r.levels[index - 1]
+        .surface
+        .and_then(|s| (provider.target)(env.ext, s))
+    else {
+        return Outcome::Return(INVALID);
+    };
+    let Some(destination) = level.surface.and_then(|s| (provider.target)(env.ext, s)) else {
+        return Outcome::Return(INVALID);
+    };
+    let owner = r.device;
+    let id = com(env)
+        .identity::<Payload>(&env.sys.objects, pointer)
+        .unwrap();
+    let temporary = match env.ext.get::<State>().gpu.as_ref().unwrap().target(
+        level.desc.Width,
+        level.desc.Height,
+        false,
+    ) {
+        Ok(target) => target.with_alpha_mode(source.image.alpha_mode()),
+        Err(error) => return gpu_error(error),
+    };
+    // The copy service excludes sampling and writing one allocation. Scale to
+    // a temporary image, then copy its pixels into the destination mip view.
+    let operation = Operation::Copy {
+        source: source.image.clone(),
+        rectangle: Rect {
+            x: 0,
+            y: 0,
+            w: source.image.width(),
+            h: source.image.height(),
+        },
+        region: level.whole(),
+        destination: temporary.clone(),
+        filter: if r.auto_filter == 2 {
+            adv_device::gpu::Filter::Linear
+        } else {
+            adv_device::gpu::Filter::Nearest
+        },
+        resources: [id, id],
+    };
+    let outcome = dispatch(env, owner, operation);
+    copy_generated(env, pointer, index, temporary, destination, outcome)
+}
+fn copy_generated(
+    env: &mut Env<'_>,
+    pointer: u32,
+    index: usize,
+    temporary: Target,
+    destination: Target,
+    outcome: Outcome,
+) -> Outcome {
+    match outcome {
+        Outcome::Return(0) => {
+            let Some(r) = resource(env, pointer) else {
+                return Outcome::Return(INVALID);
+            };
+            let owner = r.device;
+            let id = com(env)
+                .identity::<Payload>(&env.sys.objects, pointer)
+                .unwrap();
+            let region = r.levels[index].whole();
+            let outcome = dispatch(
+                env,
+                owner,
+                Operation::Copy {
+                    source: temporary.image,
+                    rectangle: region,
+                    destination,
+                    region,
+                    filter: adv_device::gpu::Filter::Nearest,
+                    resources: [id, id],
+                },
+            );
+            generated(env, pointer, index, outcome)
+        }
+        Outcome::Block {
+            wait,
+            then,
+            allow_time_skip,
+        } => Outcome::Block {
+            wait,
+            allow_time_skip,
+            then: Box::new(move |env, resume| {
+                let outcome = then(env, resume);
+                copy_generated(env, pointer, index, temporary, destination, outcome)
+            }),
+        },
+        other => other,
+    }
+}
+
+fn generated(env: &mut Env<'_>, pointer: u32, index: usize, outcome: Outcome) -> Outcome {
+    match outcome {
+        Outcome::Return(0) => generate_next(env, pointer, index + 1),
+        Outcome::Block {
+            wait,
+            then,
+            allow_time_skip,
+        } => Outcome::Block {
+            wait,
+            allow_time_skip,
+            then: Box::new(move |env, resume| {
+                let outcome = then(env, resume);
+                generated(env, pointer, index, outcome)
+            }),
+        },
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1164,6 +1623,8 @@ mod tests {
                 .0,
                 level: 0,
                 lod: 0,
+                common: resources::Common::default(),
+                auto_filter: 2,
             },
         )
         .unwrap();
@@ -1259,6 +1720,8 @@ mod tests {
                 levels: Vec::new(),
                 level: 0,
                 lod: 0,
+                common: resources::Common::default(),
+                auto_filter: 2,
             },
         )
         .unwrap();
@@ -1369,5 +1832,199 @@ mod tests {
         );
         assert!(env.ext.get::<Heaps>().owner(env.cpu, base).is_none());
         release(&mut env, source);
+    }
+    // spec: GFX-RES-1
+    #[test]
+    fn package_a_texture_lod_filter_and_priority_roundtrip() {
+        let mut f = super::super::stretch::tests::Fixture::new();
+        f.m.ext
+            .get_mut::<State>()
+            .tables
+            .insert("IDirect3DTexture9", 0);
+        let output = f.packet(0u32);
+        f.okay(
+            "IDirect3DDevice9::CreateTexture",
+            &[f.device, 8, 4, 0, 0, 21, 1, output, 0],
+        );
+        let texture = f.m.cpu.read_u32(output).unwrap();
+        for (method, args, expected) in [
+            ("GetType", vec![texture], 3),
+            ("GetLevelCount", vec![texture], 4),
+            ("GetLOD", vec![texture], 0),
+            ("SetLOD", vec![texture, u32::MAX], 0),
+            ("GetLOD", vec![texture], 3),
+            ("SetLOD", vec![texture, 1], 3),
+            ("GetLOD", vec![texture], 1),
+            ("GetAutoGenFilterType", vec![texture], 2),
+            ("SetAutoGenFilterType", vec![texture, 1], 0),
+            ("GetAutoGenFilterType", vec![texture], 1),
+            ("SetAutoGenFilterType", vec![texture, 2], 0),
+            ("SetAutoGenFilterType", vec![texture, 3], UNAVAILABLE),
+            ("GetAutoGenFilterType", vec![texture], 2),
+            ("SetPriority", vec![texture, 17], 0),
+            ("SetPriority", vec![texture, 29], 17),
+            ("GetPriority", vec![texture], 29),
+            ("PreLoad", vec![texture], 0),
+        ] {
+            let outcome = f.call(&format!("IDirect3DBaseTexture9::{method}"), &args);
+            assert_eq!(f.finish(outcome), expected, "{method}");
+        }
+        let mut e = Env {
+            context: f.m.sys.current,
+            cpu: &mut f.m.cpu,
+            sys: &mut f.m.sys,
+            ext: &mut f.m.ext,
+            thunk: 0,
+        };
+        let before = recording::command_keys(&mut e, f.device);
+        assert!(matches!(
+            generate_mips(&mut e, GuestPtr::new(texture)),
+            Outcome::Return(0)
+        ));
+        assert_eq!(recording::command_keys(&mut e, f.device), before);
+        f.okay(
+            "IDirect3DDevice9::CreateTexture",
+            &[f.device, 8, 4, 0, 0, 21, 0, output, 0],
+        );
+        let default_texture = f.m.cpu.read_u32(output).unwrap();
+        let outcome = f.call("IDirect3DTexture9::SetLOD", &[default_texture, 3]);
+        assert_eq!(f.finish(outcome), 0);
+        let outcome = f.call("IDirect3DTexture9::GetLOD", &[default_texture]);
+        assert_eq!(f.finish(outcome), 0);
+    }
+
+    // spec: GFX-RES-1
+    #[test]
+    fn package_a_autogen_single_level_is_noop() {
+        let mut m = super::super::tests::machine();
+        let mut e = Env {
+            context: m.sys.current,
+            cpu: &mut m.cpu,
+            sys: &mut m.sys,
+            ext: &mut m.ext,
+            thunk: 0,
+        };
+        let (device, _, _, _) = super::super::tests::setup(&mut e);
+        e.ext
+            .get_mut::<State>()
+            .tables
+            .insert("IDirect3DTexture9", 0);
+        let output = GuestPtr::new(alloc(&mut e, 4).unwrap());
+        assert!(matches!(
+            create_texture(
+                &mut e,
+                GuestPtr::new(device),
+                1,
+                1,
+                1,
+                0,
+                21,
+                2,
+                output,
+                GuestPtr::new(0)
+            ),
+            Outcome::Return(0)
+        ));
+        let texture = output.read(e.cpu).unwrap();
+        let Some(Payload::Resource(r)) = com(&e).get_mut::<Payload>(&mut e.sys.objects, texture)
+        else {
+            panic!()
+        };
+        r.desc.Usage |= 0x400;
+        assert!(matches!(
+            generate_mips(&mut e, GuestPtr::new(texture)),
+            Outcome::Return(0)
+        ));
+    }
+
+    // spec: GFX-RES-1
+    #[test]
+    fn package_a_autogen_regenerates_gpu_mips_from_level_zero() {
+        let mut f = super::super::stretch::tests::Fixture::new();
+        f.m.ext
+            .get_mut::<State>()
+            .tables
+            .insert("IDirect3DTexture9", 0);
+        let output = f.packet(0u32);
+        f.okay(
+            "IDirect3DDevice9::CreateTexture",
+            &[f.device, 4, 4, 0, 0, 21, 1, output, 0],
+        );
+        let texture = f.m.cpu.read_u32(output).unwrap();
+        let locked = f.packet(adv_abi::types::D3DLOCKED_RECT::default());
+        f.okay("IDirect3DTexture9::LockRect", &[texture, 0, locked, 0, 0]);
+        let lock: adv_abi::types::D3DLOCKED_RECT = GuestPtr::new(locked).read(&f.m.cpu).unwrap();
+        for y in 0..4 {
+            for x in 0..4 {
+                let value = if (x + y) % 2 == 0 {
+                    0xff000000
+                } else {
+                    0xffffffff
+                };
+                f.m.cpu
+                    .write_u32(lock.pBits + y * lock.Pitch as u32 + x * 4, value)
+                    .unwrap();
+            }
+        }
+        f.okay("IDirect3DTexture9::UnlockRect", &[texture, 0]);
+        // Resource metadata selects the method's AUTOGENMIPMAP branch;
+        // CreateTexture's supported usage combinations are a separate contract.
+        {
+            let e = Env {
+                context: f.m.sys.current,
+                cpu: &mut f.m.cpu,
+                sys: &mut f.m.sys,
+                ext: &mut f.m.ext,
+                thunk: 0,
+            };
+            let Some(Payload::Resource(r)) =
+                com(&e).get_mut::<Payload>(&mut e.sys.objects, texture)
+            else {
+                panic!()
+            };
+            r.desc.Usage |= 0x400;
+        }
+        let outcome = f.call("IDirect3DBaseTexture9::GetLevelCount", &[texture]);
+        assert_eq!(f.finish(outcome), 1);
+        let outcome = f.call("IDirect3DTexture9::SetLOD", &[texture, 2]);
+        assert_eq!(f.finish(outcome), 0);
+        let outcome = f.call("IDirect3DTexture9::GetLOD", &[texture]);
+        assert_eq!(f.finish(outcome), 0);
+        for filter in [2, 1] {
+            f.okay(
+                "IDirect3DTexture9::SetAutoGenFilterType",
+                &[texture, filter],
+            );
+            f.okay("IDirect3DTexture9::GenerateMipSubLevels", &[texture]);
+            let images: Vec<_> = {
+                let e = Env {
+                    context: f.m.sys.current,
+                    cpu: &mut f.m.cpu,
+                    sys: &mut f.m.sys,
+                    ext: &mut f.m.ext,
+                    thunk: 0,
+                };
+                let r = resource(&e, texture).unwrap();
+                let provider = e.ext.get::<State>().provider;
+                r.levels
+                    .iter()
+                    .skip(1)
+                    .map(|l| (provider.target)(e.ext, l.surface.unwrap()).unwrap().image)
+                    .collect()
+            };
+            for image in images {
+                let bytes = f.pixels(&image);
+                for pixel in bytes.as_chunks::<4>().0 {
+                    assert_eq!(
+                        pixel,
+                        if filter == 2 {
+                            &[128, 128, 128, 255]
+                        } else {
+                            &[0, 0, 0, 255]
+                        }
+                    );
+                }
+            }
+        }
     }
 }

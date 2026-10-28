@@ -80,6 +80,8 @@ pub enum Factor {
     DestinationAlpha,
     OneMinusDestinationAlpha,
     SourceAlphaSaturated,
+    Constant,
+    OneMinusConstant,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum BlendOp {
@@ -178,6 +180,7 @@ pub struct DrawState {
     pub blend: Option<Blend>,
     /// None uses the color blend component for alpha too.
     pub alpha_blend: Option<Blend>,
+    pub blend_constant: Option<u32>,
     pub depth: Option<Compare>,
     pub depth_write: bool,
     pub stencil: Option<Stencil>,
@@ -200,6 +203,7 @@ impl DrawState {
             cull: Cull::None,
             blend: None,
             alpha_blend: None,
+            blend_constant: None,
             depth: None,
             depth_write: false,
             stencil: None,

@@ -12,7 +12,7 @@ pub(super) fn alpha_mode(format: u32) -> adv_device::gpu::AlphaMode {
 }
 
 pub(super) fn register(registry: &mut Registry) {
-    for api in [create_ABI, set_ABI, get_ABI] {
+    for api in [create_ABI, with_private_releases!(set_ABI), get_ABI] {
         registry.register(api);
     }
 }
@@ -125,6 +125,8 @@ fn create(
             levels: Vec::new(),
             level: 0,
             lod: 0,
+            common: resources::Common::default(),
+            auto_filter: 2,
         },
     ) else {
         return Outcome::Return(OUT_OF_MEMORY);

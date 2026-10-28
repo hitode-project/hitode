@@ -144,6 +144,8 @@ pub(super) fn create_offscreen(
             levels: Vec::new(),
             level: 0,
             lod: 0,
+            common: resources::Common::default(),
+            auto_filter: 2,
         },
     ) else {
         return Outcome::Return(OUT_OF_MEMORY);
@@ -826,7 +828,7 @@ mod tests;
 // failure contract. Flush accepted work before that boundary, without inventing
 // successful capture or pixels for an API that has no implementation.
 #[win32(d3d9,name="IDirect3DDevice9::GetFrontBufferData",level=safe_fail)]
-fn front(
+pub(super) fn front(
     env: &mut Env<'_>,
     this: GuestPtr<()>,
     _chain: u32,

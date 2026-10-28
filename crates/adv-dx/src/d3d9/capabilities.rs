@@ -128,7 +128,7 @@ fn adapter_monitor(env: &mut Env<'_>, this: GuestPtr<()>, adapter: u32) -> adv_a
     adv_abi::Handle(env.ext.get::<State>().provider.monitor)
 }
 #[win32(d3d9,name="IDirect3DDevice9::GetDisplayMode",level=implement)]
-fn device_display(
+pub(super) fn device_display(
     env: &mut Env<'_>,
     this: GuestPtr<()>,
     swap: u32,
@@ -319,6 +319,8 @@ pub(super) fn caps(env: &Env<'_>) -> Result<D3DCAPS9, u32> {
         MaxTextureAspectRatio: texture_size,
         MaxAnisotropy: 1,
         MaxVertexW: 1.0,
+        MaxActiveLights: 8,
+        VertexProcessingCaps: 0x2 | 0x8 | 0x10 | 0x20,
         FVFCaps: 1,
         // Do not advertise general modulation/add/subtract until all argument
         // combinations work. Selected textured-quad combinations already draw.

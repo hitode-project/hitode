@@ -178,31 +178,35 @@ impl Builder {
             .streams
             .iter()
             .enumerate()
-            .map(|(n, (stride, attributes))| msl::VertexBufferMapping {
-                id: 30 - n as u32,
-                stride: if *stride == 0 {
-                    attributes
+            .map(
+                |(n, (stride, attributes, instance))| msl::VertexBufferMapping {
+                    id: 30 - n as u32,
+                    stride: if *stride == 0 {
+                        attributes
+                            .iter()
+                            .map(|a| a.offset + a.format.size())
+                            .max()
+                            .unwrap()
+                    } else {
+                        *stride
+                    },
+                    step_mode: if *stride == 0 {
+                        msl::VertexBufferStepMode::Constant
+                    } else if *instance {
+                        msl::VertexBufferStepMode::ByInstance
+                    } else {
+                        msl::VertexBufferStepMode::ByVertex
+                    },
+                    attributes: attributes
                         .iter()
-                        .map(|a| a.offset + a.format.size())
-                        .max()
-                        .unwrap()
-                } else {
-                    *stride
+                        .map(|a| msl::AttributeMapping {
+                            shader_location: a.location,
+                            offset: a.offset,
+                            format: format(a.format),
+                        })
+                        .collect(),
                 },
-                step_mode: if *stride == 0 {
-                    msl::VertexBufferStepMode::Constant
-                } else {
-                    msl::VertexBufferStepMode::ByVertex
-                },
-                attributes: attributes
-                    .iter()
-                    .map(|a| msl::AttributeMapping {
-                        shader_location: a.location,
-                        offset: a.offset,
-                        format: format(a.format),
-                    })
-                    .collect(),
-            })
+            )
             .collect();
         let mut functions = Vec::new();
         for (stage, name) in [
@@ -452,6 +456,8 @@ fn factor(value: Factor) -> MTLBlendFactor {
         Factor::DestinationAlpha => MTLBlendFactor::DestinationAlpha,
         Factor::OneMinusDestinationAlpha => MTLBlendFactor::OneMinusDestinationAlpha,
         Factor::SourceAlphaSaturated => MTLBlendFactor::SourceAlphaSaturated,
+        Factor::Constant => MTLBlendFactor::BlendColor,
+        Factor::OneMinusConstant => MTLBlendFactor::OneMinusBlendColor,
     }
 }
 fn operation(value: BlendOp) -> MTLBlendOperation {

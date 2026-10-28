@@ -15,7 +15,7 @@ pub(super) fn format(value: u32) -> Option<DepthFormat> {
     }
 }
 pub(super) fn register(registry: &mut Registry) {
-    for api in [create_ABI, set_ABI, get_ABI] {
+    for api in [create_ABI, with_private_releases!(set_ABI), get_ABI] {
         registry.register(api);
     }
 }

@@ -1,4 +1,5 @@
 use super::*;
+use adv_cpu::backend::Guest;
 use adv_device::gpu::*;
 include!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -150,7 +151,7 @@ fn every_declaration_type_is_fetched_by_the_gpu_with_d3d_component_defaults() {
             None,
             &inputs,
             &[(false, 0)],
-            (false, 0, false),
+            (false, 0, false, 0),
         )
         .unwrap();
         let program = Program::new(source.into(), vec![false]);
@@ -160,9 +161,11 @@ fn every_declaration_type_is_fetched_by_the_gpu_with_d3d_component_defaults() {
         parameters[0] = [8f32.to_bits(), 8f32.to_bits(), 0, 0];
         parameters[1][2] = 7;
         let draw = ProgrammableDraw {
+            instance_count: 1,
             program,
             streams: vec![
                 VertexStream {
+                    instance: false,
                     bytes: float(&[-1., 1., 0.5, 1., -1., -3., 0.5, 1., 3., 1., 0.5, 1.]).into(),
                     stride: 16,
                     attributes: vec![Attribute {
@@ -172,6 +175,7 @@ fn every_declaration_type_is_fetched_by_the_gpu_with_d3d_component_defaults() {
                     }],
                 },
                 VertexStream {
+                    instance: false,
                     bytes: bytes.into(),
                     stride: 0,
                     attributes: vec![Attribute {
@@ -269,7 +273,7 @@ fn fixed_pixel_stages_combine_a_second_texture_stage() {
         None,
         &[],
         &[(false, 0), (false, 1)],
-        (true, 0, false),
+        (true, 0, false, 0),
     )
     .unwrap();
     let program = Program::new(source.into(), vec![false, false]);
@@ -293,8 +297,10 @@ fn fixed_pixel_stages_combine_a_second_texture_stage() {
         vertices.extend([0.5, 0.5]);
     }
     let draw = ProgrammableDraw {
+        instance_count: 1,
         program,
         streams: vec![VertexStream {
+            instance: false,
             bytes: bytemuck::cast_slice(&vertices).to_vec().into(),
             stride: 40,
             attributes: [
@@ -332,4 +338,393 @@ fn fixed_pixel_stages_combine_a_second_texture_stage() {
         got.iter().zip(want).all(|(&a, b)| a.abs_diff(b) <= 2),
         "{got:?} expected {want:?}"
     );
+}
+
+// spec: GFX-FIXED-2, GFX-CACHE-8
+#[test]
+fn fixed_completion_unlit_pipeline_identity() {
+    let key = ProgramKey {
+        vertex: None,
+        pixel: None,
+        inputs: Vec::new(),
+        second: false,
+        features: (0, false),
+        fixed: 0,
+    };
+    assert_eq!(
+        recording::hash(&key),
+        recording::hash((key.vertex, key.pixel, &key.inputs, key.second, key.features))
+    );
+    let source = source::build(
+        None,
+        None,
+        None,
+        None,
+        &[],
+        &[(false, 0)],
+        (false, 0, false, 0),
+    )
+    .unwrap();
+    assert_eq!(
+        xxhash_rust::xxh3::xxh3_128(source.as_bytes()),
+        12730266951233098795822423985951590738
+    );
+    for fixed in [1, 2, 4, 8, 32] {
+        let changed = ProgramKey {
+            fixed,
+            ..key.clone()
+        };
+        assert_ne!(recording::hash(&key), recording::hash(&changed));
+    }
+}
+
+// spec: GFX-INPUT-7
+#[test]
+fn d3d9_package_d_instanced_offsets_match_two_draws() {
+    use crate::d3d9::stretch::tests::Fixture;
+    for native in [false, true] {
+        let mut f = Fixture::with_native(adv_machine::ObjectLimits::default(), native);
+        let output = f.packet(0u32);
+        let tokens = f.packet([
+            0xfffe0200u32,
+            0x0200001f,
+            0x80000000,
+            0x900f0000,
+            0x0200001f,
+            0x80000005,
+            0x900f0001,
+            0x03000002,
+            0xc00f0000,
+            0x90e40000,
+            0x90e40001,
+            0x02000001,
+            0xd00f0000,
+            0xa0e40000,
+            0xffff,
+        ]);
+        f.okay(
+            "IDirect3DDevice9::CreateVertexShader",
+            &[f.device, tokens, output],
+        );
+        let shader = f.m.cpu.read_u32(output).unwrap();
+        f.okay("IDirect3DDevice9::SetVertexShader", &[f.device, shader]);
+        let color = f.packet([1f32, 0.25, 0.5, 1.]);
+        f.okay(
+            "IDirect3DDevice9::SetVertexShaderConstantF",
+            &[f.device, 0, color, 1],
+        );
+        let elements = f.packet([
+            [0u8, 0, 0, 0, 3, 0, 0, 0],
+            [1, 0, 0, 0, 3, 0, 5, 0],
+            [255, 0, 0, 0, 17, 0, 0, 0],
+        ]);
+        f.okay(
+            "IDirect3DDevice9::CreateVertexDeclaration",
+            &[f.device, elements, output],
+        );
+        let declaration = f.m.cpu.read_u32(output).unwrap();
+        f.okay(
+            "IDirect3DDevice9::SetVertexDeclaration",
+            &[f.device, declaration],
+        );
+        let positions = [
+            [-0.85f32, 0.7, 0.5, 1.],
+            [-0.85, -0.7, 0.5, 1.],
+            [-0.15, 0.7, 0.5, 1.],
+        ];
+        let offsets = [[0f32, 0., 0., 0.], [1., 0., 0., 0.]];
+        for (n, bytes) in [
+            bytemuck::cast_slice(&positions),
+            bytemuck::cast_slice(&offsets),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            f.okay(
+                "IDirect3DDevice9::CreateVertexBuffer",
+                &[f.device, bytes.len() as u32, 0, 0, 1, output, 0],
+            );
+            let buffer = f.m.cpu.read_u32(output).unwrap();
+            f.okay("IDirect3DVertexBuffer9::Lock", &[buffer, 0, 0, output, 0]);
+            f.m.cpu
+                .write(f.m.cpu.read_u32(output).unwrap(), bytes)
+                .unwrap();
+            f.okay("IDirect3DVertexBuffer9::Unlock", &[buffer]);
+            f.okay(
+                "IDirect3DDevice9::SetStreamSource",
+                &[f.device, n as u32, buffer, 0, 16],
+            );
+        }
+        f.okay(
+            "IDirect3DDevice9::CreateIndexBuffer",
+            &[f.device, 6, 0, 101, 1, output, 0],
+        );
+        let index = f.m.cpu.read_u32(output).unwrap();
+        f.okay("IDirect3DIndexBuffer9::Lock", &[index, 0, 0, output, 0]);
+        f.m.cpu
+            .write(
+                f.m.cpu.read_u32(output).unwrap(),
+                bytemuck::cast_slice(&[0u16, 1, 2]),
+            )
+            .unwrap();
+        f.okay("IDirect3DIndexBuffer9::Unlock", &[index]);
+        f.okay("IDirect3DDevice9::SetIndices", &[f.device, index]);
+        for (state, value) in [(7, 0), (22, 1)] {
+            f.okay(
+                "IDirect3DDevice9::SetRenderState",
+                &[f.device, state, value],
+            );
+        }
+        f.okay("IDirect3DDevice9::BeginScene", &[f.device]);
+        f.okay(
+            "IDirect3DDevice9::Clear",
+            &[f.device, 0, 0, 1, 0xff000000, 1f32.to_bits(), 0],
+        );
+        f.okay(
+            "IDirect3DDevice9::SetStreamSourceFreq",
+            &[f.device, 0, buffers::INDEXED_DATA | 2],
+        );
+        f.okay(
+            "IDirect3DDevice9::SetStreamSourceFreq",
+            &[f.device, 1, buffers::INSTANCE_DATA | 1],
+        );
+        let before = f.m.ext.get::<State>().gpu.as_ref().unwrap().stats().draws;
+        f.okay(
+            "IDirect3DDevice9::DrawIndexedPrimitive",
+            &[f.device, 4, 0, 0, 3, 0, 1],
+        );
+        let image = f.image(f.back);
+        let actual = f.pixels(&image);
+        assert_eq!(
+            f.m.ext.get::<State>().gpu.as_ref().unwrap().stats().draws - before,
+            1
+        );
+        f.okay(
+            "IDirect3DDevice9::Clear",
+            &[f.device, 0, 0, 1, 0xff000000, 1f32.to_bits(), 0],
+        );
+        for stream in [0, 1] {
+            f.okay(
+                "IDirect3DDevice9::SetStreamSourceFreq",
+                &[f.device, stream, 1],
+            );
+        }
+        let e = Env {
+            context: f.m.sys.current,
+            cpu: &mut f.m.cpu,
+            sys: &mut f.m.sys,
+            ext: &mut f.m.ext,
+            thunk: 0,
+        };
+        let binding = device(&e, f.device).unwrap().buffers.streams[1];
+        let Some(Payload::Buffer(buffer)) =
+            com(&e).get_identity(&e.sys.objects, binding.buffer.unwrap())
+        else {
+            panic!()
+        };
+        let pointer = buffer.pointer;
+        for offset in [0, 16] {
+            f.okay(
+                "IDirect3DDevice9::SetStreamSource",
+                &[f.device, 1, pointer, offset, 0],
+            );
+            f.okay(
+                "IDirect3DDevice9::DrawIndexedPrimitive",
+                &[f.device, 4, 0, 0, 3, 0, 1],
+            );
+        }
+        assert_eq!(actual, f.pixels(&image));
+        assert!(
+            actual
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .enumerate()
+                .any(|(n, p)| n % 16 < 8 && p[2] > 200)
+        );
+        assert!(
+            actual
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .enumerate()
+                .any(|(n, p)| n % 16 >= 8 && p[2] > 200)
+        );
+        f.okay(
+            "IDirect3DDevice9::Clear",
+            &[f.device, 0, 0, 1, 0xff000000, 1f32.to_bits(), 0],
+        );
+        f.okay(
+            "IDirect3DDevice9::SetStreamSource",
+            &[f.device, 1, pointer, 0, 0],
+        );
+        f.okay(
+            "IDirect3DDevice9::SetStreamSourceFreq",
+            &[f.device, 0, buffers::INDEXED_DATA | 2],
+        );
+        f.okay(
+            "IDirect3DDevice9::SetStreamSourceFreq",
+            &[f.device, 1, buffers::INSTANCE_DATA | 1],
+        );
+        f.okay("IDirect3DDevice9::DrawPrimitive", &[f.device, 4, 0, 1]);
+        let ignored = f.pixels(&image);
+        f.okay(
+            "IDirect3DDevice9::Clear",
+            &[f.device, 0, 0, 1, 0xff000000, 1f32.to_bits(), 0],
+        );
+        for stream in [0, 1] {
+            f.okay(
+                "IDirect3DDevice9::SetStreamSourceFreq",
+                &[f.device, stream, 1],
+            );
+        }
+        f.okay("IDirect3DDevice9::DrawPrimitive", &[f.device, 4, 0, 1]);
+        assert_eq!(ignored, f.pixels(&image));
+        f.okay("IDirect3DDevice9::EndScene", &[f.device]);
+    }
+}
+
+// spec: GFX-INPUT-7
+#[test]
+fn d3d9_package_d_instancing_fixed_and_fvf_match_pixels() {
+    for programmable in [false, true] {
+        for fvf in [false, true] {
+            let mut f = crate::d3d9::stretch::tests::Fixture::new();
+            let output = f.packet(0u32);
+            if programmable {
+                let tokens = f.packet([
+                    0xfffe0101u32,
+                    0x1f,
+                    0x80000000,
+                    0x900f0000,
+                    0x1f,
+                    0x8000000a,
+                    0x900f0001,
+                    1,
+                    0xc00f0000,
+                    0x90e40000,
+                    1,
+                    0xd00f0000,
+                    0x90e40001,
+                    0xffff,
+                ]);
+                f.okay(
+                    "IDirect3DDevice9::CreateVertexShader",
+                    &[f.device, tokens, output],
+                );
+                let shader = f.m.cpu.read_u32(output).unwrap();
+                f.okay("IDirect3DDevice9::SetVertexShader", &[f.device, shader]);
+            }
+            let positions = [[-0.8f32, 0.8, 0.5], [-0.8, -0.8, 0.5], [0.8, 0.8, 0.5]];
+            let vertices: Vec<u32> = positions
+                .into_iter()
+                .flat_map(|p| [p[0].to_bits(), p[1].to_bits(), p[2].to_bits(), 0xff00ff00])
+                .collect();
+            let colors = [0xffff0000u32, 0xff00ff00];
+            for (stream, bytes, stride) in [
+                (0, bytemuck::cast_slice(&vertices), 16),
+                (1, bytemuck::cast_slice(&colors), 4),
+            ] {
+                f.okay(
+                    "IDirect3DDevice9::CreateVertexBuffer",
+                    &[f.device, bytes.len() as u32, 0, 0, 1, output, 0],
+                );
+                let buffer = f.m.cpu.read_u32(output).unwrap();
+                f.okay("IDirect3DVertexBuffer9::Lock", &[buffer, 0, 0, output, 0]);
+                f.m.cpu
+                    .write(f.m.cpu.read_u32(output).unwrap(), bytes)
+                    .unwrap();
+                f.okay("IDirect3DVertexBuffer9::Unlock", &[buffer]);
+                f.okay(
+                    "IDirect3DDevice9::SetStreamSource",
+                    &[f.device, stream, buffer, 0, stride],
+                );
+            }
+            if fvf {
+                f.okay("IDirect3DDevice9::SetFVF", &[f.device, 0x42]);
+            } else {
+                let elements = f.packet([
+                    [0u8, 0, 0, 0, 2, 0, 0, 0],
+                    [1, 0, 0, 0, 4, 0, 10, 0],
+                    [255, 0, 0, 0, 17, 0, 0, 0],
+                ]);
+                f.okay(
+                    "IDirect3DDevice9::CreateVertexDeclaration",
+                    &[f.device, elements, output],
+                );
+                let declaration = f.m.cpu.read_u32(output).unwrap();
+                f.okay(
+                    "IDirect3DDevice9::SetVertexDeclaration",
+                    &[f.device, declaration],
+                );
+            }
+            f.okay(
+                "IDirect3DDevice9::CreateIndexBuffer",
+                &[f.device, 6, 0, 101, 1, output, 0],
+            );
+            let index = f.m.cpu.read_u32(output).unwrap();
+            f.okay("IDirect3DIndexBuffer9::Lock", &[index, 0, 0, output, 0]);
+            f.m.cpu
+                .write(
+                    f.m.cpu.read_u32(output).unwrap(),
+                    bytemuck::cast_slice(&[0u16, 1, 2]),
+                )
+                .unwrap();
+            f.okay("IDirect3DIndexBuffer9::Unlock", &[index]);
+            f.okay("IDirect3DDevice9::SetIndices", &[f.device, index]);
+            for (state, value) in [(7, 0), (22, 1), (137, 0)] {
+                f.okay(
+                    "IDirect3DDevice9::SetRenderState",
+                    &[f.device, state, value],
+                );
+            }
+            f.okay("IDirect3DDevice9::BeginScene", &[f.device]);
+            f.okay(
+                "IDirect3DDevice9::Clear",
+                &[f.device, 0, 0, 1, 0xff000000, 1f32.to_bits(), 0],
+            );
+            f.okay(
+                "IDirect3DDevice9::SetStreamSourceFreq",
+                &[f.device, 0, buffers::INDEXED_DATA | 2],
+            );
+            f.okay(
+                "IDirect3DDevice9::SetStreamSourceFreq",
+                &[f.device, 1, buffers::INSTANCE_DATA | 1],
+            );
+            let before = f.m.ext.get::<State>().gpu.as_ref().unwrap().stats().draws;
+            f.okay(
+                "IDirect3DDevice9::DrawIndexedPrimitive",
+                &[f.device, 4, 0, 0, 3, 0, 1],
+            );
+            let image = f.image(f.back);
+            let actual = f.pixels(&image);
+            assert_eq!(
+                f.m.ext.get::<State>().gpu.as_ref().unwrap().stats().draws - before,
+                1
+            );
+            f.okay(
+                "IDirect3DDevice9::Clear",
+                &[f.device, 0, 0, 1, 0xff000000, 1f32.to_bits(), 0],
+            );
+            for stream in [0, 1] {
+                f.okay(
+                    "IDirect3DDevice9::SetStreamSourceFreq",
+                    &[f.device, stream, 1],
+                );
+            }
+            f.okay("IDirect3DDevice9::SetFVF", &[f.device, 0x42]);
+            let data = f.packet(<[u32; 12]>::try_from(vertices).unwrap());
+            f.okay(
+                "IDirect3DDevice9::DrawPrimitiveUP",
+                &[f.device, 4, 1, data, 16],
+            );
+            assert_eq!(
+                actual,
+                f.pixels(&image),
+                "programmable={programmable}, fvf={fvf}"
+            );
+            assert!(actual.as_chunks::<4>().0.iter().any(|p| p[1] > 200));
+            f.okay("IDirect3DDevice9::EndScene", &[f.device]);
+        }
+    }
 }

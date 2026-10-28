@@ -27,6 +27,7 @@ pub(super) struct Buffer {
     pub format: i32,
     pub fvf: u32,
     pub locks: u32,
+    pub common: resources::Common,
 }
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct Stream {
@@ -34,11 +35,32 @@ pub(super) struct Stream {
     pub offset: u32,
     pub stride: u32,
 }
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(super) struct Bindings {
     pub streams: [Stream; 16],
+    pub frequencies: [u32; 16],
     pub indices: Option<Id>,
     pub declaration: Option<Id>,
+}
+impl Default for Bindings {
+    fn default() -> Self {
+        Self {
+            streams: [Stream::default(); 16],
+            frequencies: [1; 16],
+            indices: None,
+            declaration: None,
+        }
+    }
+}
+pub(super) const INDEXED_DATA: u32 = 0x4000_0000;
+pub(super) const INSTANCE_DATA: u32 = 0x8000_0000;
+pub(super) fn instances(bindings: &Bindings) -> u32 {
+    let setting = bindings.frequencies[0];
+    if setting & INDEXED_DATA != 0 {
+        setting & 0x3fff_ffff
+    } else {
+        1
+    }
 }
 pub(super) fn register(registry: &mut Registry) {
     for api in [
@@ -52,21 +74,25 @@ pub(super) fn register(registry: &mut Registry) {
         create_index_ABI,
         vertex_desc_ABI,
         index_desc_ABI,
-        vertex_device_ABI,
-        index_device_ABI,
-        vertex_type_ABI,
-        index_type_ABI,
         vertex_lock_ABI,
         index_lock_ABI,
         vertex_unlock_ABI,
         index_unlock_ABI,
-        super::unchanged::unless_unchanged!(set_stream_ABI, super::unchanged::binding),
+        super::unchanged::unless_unchanged!(
+            with_private_releases!(set_stream_ABI),
+            super::unchanged::binding
+        ),
         get_stream_ABI,
-        super::unchanged::unless_unchanged!(set_indices_ABI, super::unchanged::binding),
+        set_stream_freq_ABI,
+        get_stream_freq_ABI,
+        super::unchanged::unless_unchanged!(
+            with_private_releases!(set_indices_ABI),
+            super::unchanged::binding
+        ),
         get_indices_ABI,
         draw_ABI,
         draw_indexed_ABI,
-        draw_indexed_up_ABI,
+        with_private_releases!(draw_indexed_up_ABI),
     ] {
         registry.register(api);
     }
@@ -104,6 +130,7 @@ pub(super) fn parent_on_first_public_retain(env: &Env<'_>, pointer: u32) -> Opti
     (com(env).references(&env.sys.objects, id)? == 0).then_some(buffer.device)
 }
 pub(super) fn destroy(env: &mut Env<'_>, buffer: Buffer) {
+    resources::destroy_common(env, buffer.common);
     free(env, buffer.storage);
 }
 pub(super) fn release_bindings(env: &mut Env<'_>, bindings: Bindings) {
@@ -183,6 +210,7 @@ fn create(
         format,
         fvf,
         locks: 0,
+        common: resources::Common::default(),
     };
     let Some((pointer, id)) = object(env, interface, iid, Payload::Buffer(payload)) else {
         free(env, storage);
@@ -282,50 +310,6 @@ fn index_desc(env: &mut Env<'_>, this: GuestPtr<()>, output: GuestPtr<D3DINDEXBU
         Size: b.len,
     };
     output.write(env.cpu, desc).map_or(INVALID, |()| 0)
-}
-fn get_device(env: &mut Env<'_>, this: u32, kind: Kind, output: GuestPtr<u32>) -> u32 {
-    if output.write(env.cpu, 0).is_err() {
-        return INVALID;
-    }
-    let Some(b) = buffer(env, this).filter(|b| b.kind == kind) else {
-        return INVALID;
-    };
-    let Some(Payload::Device(d)) = com(env).get_identity(&env.sys.objects, b.device) else {
-        return INVALID;
-    };
-    let pointer = d.pointer;
-    if add_ref(env, pointer).is_none() {
-        return OUT_OF_MEMORY;
-    }
-    if output.write(env.cpu, pointer).is_err() {
-        release(env, pointer);
-        return INVALID;
-    }
-    0
-}
-#[win32(d3d9,name="IDirect3DVertexBuffer9::GetDevice",level=implement)]
-fn vertex_device(env: &mut Env<'_>, this: GuestPtr<()>, output: GuestPtr<u32>) -> u32 {
-    get_device(env, this.addr(), Kind::Vertex, output)
-}
-#[win32(d3d9,name="IDirect3DIndexBuffer9::GetDevice",level=implement)]
-fn index_device(env: &mut Env<'_>, this: GuestPtr<()>, output: GuestPtr<u32>) -> u32 {
-    get_device(env, this.addr(), Kind::Index, output)
-}
-#[win32(d3d9,name="IDirect3DVertexBuffer9::GetType",level=implement)]
-fn vertex_type(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
-    if buffer(env, this.addr()).is_some_and(|b| b.kind == Kind::Vertex) {
-        6
-    } else {
-        0
-    }
-}
-#[win32(d3d9,name="IDirect3DIndexBuffer9::GetType",level=implement)]
-fn index_type(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
-    if buffer(env, this.addr()).is_some_and(|b| b.kind == Kind::Index) {
-        7
-    } else {
-        0
-    }
 }
 
 fn lock(
@@ -533,6 +517,52 @@ fn get_stream(
         return INVALID;
     }
     0
+}
+#[win32(d3d9, name = "IDirect3DDevice9::SetStreamSourceFreq", level = implement)]
+fn set_stream_freq(env: &mut Env<'_>, this: GuestPtr<()>, stream: u32, setting: u32) -> u32 {
+    if device(env, this.addr()).is_none()
+        || stream >= 16
+        || setting & 0x3fff_ffff == 0
+        || setting & (INDEXED_DATA | INSTANCE_DATA) == (INDEXED_DATA | INSTANCE_DATA)
+        || (stream == 0 && setting & INSTANCE_DATA != 0)
+        || (stream != 0 && setting & INDEXED_DATA != 0)
+    {
+        return INVALID;
+    }
+    if setting != 1 && setting & INDEXED_DATA == 0 && setting != INSTANCE_DATA | 1 {
+        adv_abi::warn_unavailable(
+            env,
+            "IDirect3DDevice9::SetStreamSourceFreq",
+            "stream divisors other than one are unavailable",
+        );
+        return UNAVAILABLE;
+    }
+    let Some(Payload::Device(d)) = com(env).get_mut::<Payload>(&mut env.sys.objects, this.addr())
+    else {
+        return INVALID;
+    };
+    if let Some(record) = &mut d.recording {
+        super::shaders::stateblocks::record_frequency(record, stream as usize, setting);
+    } else if d.buffers.frequencies[stream as usize] != setting {
+        d.buffers.frequencies[stream as usize] = setting;
+        d.touch(10);
+    }
+    0
+}
+#[win32(d3d9, name = "IDirect3DDevice9::GetStreamSourceFreq", level = implement)]
+fn get_stream_freq(
+    env: &mut Env<'_>,
+    this: GuestPtr<()>,
+    stream: u32,
+    output: GuestPtr<u32>,
+) -> u32 {
+    let Some(d) = device(env, this.addr()) else {
+        return INVALID;
+    };
+    let Some(&setting) = d.buffers.frequencies.get(stream as usize) else {
+        return INVALID;
+    };
+    output.write(env.cpu, setting).map_or(INVALID, |()| 0)
 }
 #[win32(d3d9,name="IDirect3DDevice9::SetIndices",level=state)]
 fn set_indices(env: &mut Env<'_>, this: GuestPtr<()>, pointer: GuestPtr<()>) -> u32 {
@@ -760,7 +790,9 @@ fn draw_indexed(
         Ok(indices) => indices,
         Err(error) => return Outcome::Return(error),
     };
-    if super::programmable::active(env, this.addr()) {
+    if super::programmable::active(env, this.addr())
+        || device(env, this.addr()).is_some_and(|d| d.buffers.frequencies[0] & INDEXED_DATA != 0)
+    {
         return recording::indexed(env, this.addr(), (kind, count, &indices), |env| {
             super::programmable::prepare(env, this.addr(), kind, count, None, Some(&indices), 0)
         });

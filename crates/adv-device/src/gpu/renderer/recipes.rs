@@ -6,7 +6,7 @@ use compile::{Compile, CompileCounters};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const LIMIT: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -15,7 +15,7 @@ pub(super) enum Recipe {
     Program {
         source: Arc<str>,
         textures: Vec<bool>,
-        streams: Vec<(u32, Vec<Attribute>)>,
+        streams: Vec<(u32, Vec<Attribute>, bool)>,
         raster: PipelineKey,
     },
 }
@@ -294,6 +294,7 @@ mod tests {
                     offset: 0,
                     format: AttributeFormat::Float4,
                 }],
+                false,
             )],
             raster: match recipe(15) {
                 Recipe::Fixed(k) => k,

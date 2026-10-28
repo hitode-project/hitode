@@ -35,6 +35,7 @@ fn quad(color: [f32; 4]) -> [Vertex; 6] {
 }
 fn draw() -> ProgrammableDraw {
     ProgrammableDraw {
+        instance_count: 1,
         program: Program::new("struct C { f: array<vec4<f32>,256> }; @group(0) @binding(1) var<uniform> c:C; @vertex fn vertex_main(@builtin(vertex_index) i:u32)->@builtin(position) vec4<f32> { let p=array<vec2<f32>,3>(vec2(-1.,-1.),vec2(3.,-1.),vec2(-1.,3.)); return vec4(p[i],0.,1.); } @fragment fn fragment_main()->@location(0) vec4<f32> { return c.f[0]; }".into(), vec![]),
         streams: vec![], indices: None, vertex_count: 3,
         vertex_constants: ConstantBlock::default().into(), pixel_constants: ConstantBlock::default().into(),

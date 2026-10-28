@@ -42,6 +42,7 @@ jobs:
         with:
           workspaces: '. -> target/core-ci'
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
           cache-workspace-crates: true
       - name: Lint execution layer
         run: cargo clippy --release --locked -p adv-cpu --all-targets -- -D warnings
@@ -113,6 +114,7 @@ jobs:
         with:
           workspaces: '. -> target/workspace-ci'
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
           cache-workspace-crates: true
       - name: Build every crate with default features
         timeout-minutes: 10
@@ -136,7 +138,7 @@ jobs:
   workspace:
     name: workspace (${{ matrix.group }}, macOS ARM64)
     runs-on: macos-14
-    timeout-minutes: 20
+    timeout-minutes: 35
     strategy:
       fail-fast: false
       matrix:
@@ -211,9 +213,10 @@ jobs:
           # so a new FFmpeg build must not reuse cached link paths.
           key: ${{ matrix.group }}-${{ hashFiles('tools/macos/build.py', 'tools/macos/ffmpeg.json') }}
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
           cache-workspace-crates: true
       - name: Compile test programs
-        timeout-minutes: 12
+        timeout-minutes: 25
         run: |
           set -o pipefail
           read -r -a packages <<< "$WORKSPACE_PACKAGES"

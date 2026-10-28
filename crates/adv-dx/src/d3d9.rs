@@ -9,6 +9,17 @@ use adv_abi::{GuestPtr, Handle, Registry, win32};
 use adv_cpu::backend::{Backend, GuestExt, Prot};
 use adv_device::gpu::{Error, Gpu, Target};
 use adv_machine::{Env, Ext, Machine, Object, Objects, Outcome, Wait};
+// Only handlers that can destroy a resource need to drain guest COM releases.
+macro_rules! with_private_releases {
+    ($api:expr) => {{
+        const API: adv_abi::Api = $api;
+        fn handler(env: &mut Env<'_>) -> Outcome {
+            let outcome = (API.handler)(env);
+            resources::finish_private_releases(env, outcome)
+        }
+        adv_abi::Api { handler, ..API }
+    }};
+}
 #[cfg(test)]
 use adv_os::Heaps;
 use resources::Resource;
@@ -95,6 +106,8 @@ enum Payload {
     Declaration(declaration::Declaration),
     Shader(shaders::Shader),
     StateBlock(Box<shaders::stateblocks::StateBlock>),
+    SwapChain(Id),
+    Query(queries::Query),
 }
 struct Device {
     children: BTreeMap<u32, Id>,
@@ -110,6 +123,8 @@ struct Device {
     scene: bool,
     needs_reset: bool,
     back_buffer: Option<Id>,
+    swap_chain: Option<Id>,
+    queries: queries::DeviceState,
     depth_stencil: Option<Id>,
     texture: Option<Id>,
     /// Borrowed surface identity; its controlling resource has one internal ref.
@@ -124,13 +139,14 @@ struct Device {
     gpu_lost: bool,
     /// The last refresh boundary, so vsync-locked boundaries keep their phase.
     boundary: Option<u64>,
+    misc: Misc,
 }
 impl Device {
     fn class_key(&self, class: usize) -> u128 {
         use recording::hash;
         let f = &self.fixed;
         match class {
-            0 => hash(&f.render),
+            0 => hash((&f.render, f.material.map(f32::to_bits), &f.lights)),
             1 => hash((&f.stage, &f.stage_slots)),
             2 => hash((&f.sampler, &f.sampler_slots)),
             3 => hash((
@@ -152,7 +168,10 @@ impl Device {
             7 => hash((f.fvf, self.buffers.declaration)),
             8 => hash(self.shaders.vertex),
             9 => hash(self.shaders.pixel),
-            10 => hash(self.buffers.streams.map(|s| (s.buffer, s.offset, s.stride))),
+            10 => hash((
+                self.buffers.streams.map(|s| (s.buffer, s.offset, s.stride)),
+                self.buffers.frequencies,
+            )),
             11 => hash(self.buffers.indices),
             12 => hash((self.texture, self.shaders.textures)),
             13 => self.shaders.vertex_constants.fingerprint(),
@@ -183,6 +202,7 @@ pub struct State {
     gpu: Option<Gpu>,
     provider: SurfaceProvider,
     pending: Vec<Pending>,
+    private_releases: Vec<u32>,
     transfers: Vec<readback::PendingTransfer>,
     dcs: Vec<dc::Lease>,
     sender: Option<adv_sync::background::LocalSender>,
@@ -366,7 +386,19 @@ pub fn register(registry: &mut Registry) {
         end_scene_ABI,
         clear_ABI,
         present_ABI,
-        reset_ABI,
+        with_private_releases!(reset_ABI),
+        register_software_ABI,
+        swapchain_count_ABI,
+        raster_status_ABI,
+        validate_device_ABI,
+        set_gamma_ABI,
+        get_gamma_ABI,
+        set_clip_status_ABI,
+        get_clip_status_ABI,
+        set_palette_entries_ABI,
+        get_palette_entries_ABI,
+        set_current_palette_ABI,
+        get_current_palette_ABI,
     ] {
         registry.register(api);
     }
@@ -388,6 +420,8 @@ pub fn register(registry: &mut Registry) {
     update_texture::register(registry);
     shaders::register(registry);
     programmable::register(registry);
+    swapchain::register(registry);
+    queries::register(registry);
     crate::refcounts::install(registry, "d3d9.dll");
 }
 
@@ -408,6 +442,8 @@ pub fn install<B: Backend>(
         "IDirect3DVertexShader9",
         "IDirect3DPixelShader9",
         "IDirect3DStateBlock9",
+        "IDirect3DSwapChain9",
+        "IDirect3DQuery9",
     ] {
         let signatures: Vec<_> = adv_abi::signature::com_signatures()
             .iter()
@@ -443,6 +479,7 @@ pub fn install<B: Backend>(
         gpu: None,
         provider,
         pending: Vec::new(),
+        private_releases: Vec::new(),
         transfers: Vec::new(),
         dcs: Vec::new(),
         sender: None,
@@ -532,6 +569,8 @@ fn child_owner(payload: &Payload) -> Option<Id> {
         Payload::Declaration(r) => r.device,
         Payload::Shader(r) => r.device,
         Payload::StateBlock(r) => r.device,
+        Payload::SwapChain(device) => *device,
+        Payload::Query(q) => q.device,
         _ => return None,
     })
 }
@@ -589,7 +628,10 @@ fn destroy(env: &mut Env<'_>, destroyed: Destroyed<Payload>) {
         if let Some(recording) = device.recording {
             shaders::stateblocks::release_snapshot(env, recording);
         }
-        for binding in [device.texture, device.back_buffer].into_iter().flatten() {
+        for binding in [device.texture, device.back_buffer, device.swap_chain]
+            .into_iter()
+            .flatten()
+        {
             if let Some(Some(resource)) = com(env).release_internal(&mut env.sys.objects, binding) {
                 destroy(env, resource);
             }
@@ -606,6 +648,8 @@ fn destroy(env: &mut Env<'_>, destroyed: Destroyed<Payload>) {
         resources::destroy(env, resource);
     } else if let Payload::Buffer(buffer) = destroyed.value {
         buffers::destroy(env, buffer);
+    } else if let Payload::Query(q) = destroyed.value {
+        queries::destroy(env, q);
     } else if let Payload::StateBlock(block) = destroyed.value {
         shaders::stateblocks::destroy(env, *block);
     }
@@ -613,12 +657,38 @@ fn destroy(env: &mut Env<'_>, destroyed: Destroyed<Payload>) {
         free(env, pointer);
     }
 }
+fn child_parent(env: &Env<'_>, pointer: u32, references: u32) -> Option<Id> {
+    let payload = com(env).get::<Payload>(&env.sys.objects, pointer)?;
+    if !matches!(payload, Payload::SwapChain(_) | Payload::Query(_)) {
+        return None;
+    }
+    let id = com(env).identity::<Payload>(&env.sys.objects, pointer)?;
+    (com(env).references(&env.sys.objects, id)? == references)
+        .then(|| child_owner(payload).unwrap())
+}
+fn child_device(env: &mut Env<'_>, owner: Id, output: GuestPtr<u32>) -> u32 {
+    if output.write(env.cpu, 0).is_err() {
+        return INVALID;
+    }
+    let Some(pointer) = com(env).canonical(&env.sys.objects, owner) else {
+        return INVALID;
+    };
+    if add_ref(env, pointer).is_none() {
+        return OUT_OF_MEMORY;
+    }
+    if output.write(env.cpu, pointer).is_err() {
+        release(env, pointer);
+        return INVALID;
+    }
+    0
+}
 fn release_parent(env: &Env<'_>, pointer: u32) -> Option<Id> {
     let pointer = resources::container_pointer(env, pointer).unwrap_or(pointer);
     resources::parent_on_last_public_release(env, pointer)
         .or_else(|| buffers::parent_on_last_public_release(env, pointer))
         .or_else(|| declaration::parent_on_last_public_release(env, pointer))
         .or_else(|| shaders::parent_on_last_public_release(env, pointer))
+        .or_else(|| child_parent(env, pointer, 1))
 }
 fn release(env: &mut Env<'_>, pointer: u32) -> u32 {
     if let Some(parent) = resources::container_pointer(env, pointer) {
@@ -646,7 +716,8 @@ fn add_ref(env: &mut Env<'_>, pointer: u32) -> Option<u32> {
     let parent = resources::parent_on_first_public_retain(env, pointer)
         .or_else(|| buffers::parent_on_first_public_retain(env, pointer))
         .or_else(|| declaration::parent_on_first_public_retain(env, pointer))
-        .or_else(|| shaders::parent_on_first_public_retain(env, pointer));
+        .or_else(|| shaders::parent_on_first_public_retain(env, pointer))
+        .or_else(|| child_parent(env, pointer, 0));
     if let Some(parent) = parent {
         com(env).add_ref_identity(&mut env.sys.objects, parent)?;
     }
@@ -689,7 +760,8 @@ fn query(
     let parent = resources::parent_on_first_public_retain(env, this.addr())
         .or_else(|| buffers::parent_on_first_public_retain(env, this.addr()))
         .or_else(|| declaration::parent_on_first_public_retain(env, this.addr()))
-        .or_else(|| shaders::parent_on_first_public_retain(env, this.addr()));
+        .or_else(|| shaders::parent_on_first_public_retain(env, this.addr()))
+        .or_else(|| child_parent(env, this.addr(), 0));
     if let Some(parent) = parent
         && com(env)
             .add_ref_identity(&mut env.sys.objects, parent)
@@ -749,10 +821,12 @@ macro_rules! unknown {
                 && !(refs == Some(1)
                     && (stateblock_last || release_parent(env, this.addr()) == Some(owner)))
             {
-                return Outcome::Return(release(env, this.addr()));
+                let value = release(env, this.addr());
+                return resources::finish_private_releases(env, Outcome::Return(value));
             }
             recording::barrier(env, owner, recording::Reason::Release, move |env| {
-                Outcome::Return(release(env, this.addr()))
+                let value = release(env, this.addr());
+                resources::finish_private_releases(env, Outcome::Return(value))
             })
         }
     };
@@ -760,8 +834,10 @@ macro_rules! unknown {
 mod buffers;
 mod declaration;
 mod depth;
+mod queries;
 mod resources;
 mod shaders;
+mod swapchain;
 unknown!(
     factory_query,
     factory_add_ref,
@@ -1072,6 +1148,8 @@ fn create_device(
         scene: false,
         needs_reset: false,
         back_buffer: None,
+        swap_chain: None,
+        queries: queries::DeviceState::default(),
         depth_stencil: None,
         texture: None,
         render_target: None,
@@ -1084,6 +1162,7 @@ fn create_device(
         frame: recording::Recording::default(),
         gpu_lost: false,
         boundary: None,
+        misc: Misc::default(),
     };
     device.refresh_all();
     let Some((pointer, id)) = object(
@@ -1545,13 +1624,14 @@ fn dispatch_now(env: &mut Env<'_>, owner: Id, operation: Operation) -> Outcome {
                     let pending = env.ext.get_mut::<State>().pending.swap_remove(index);
                     env.sys.objects.close(event);
                     release_pending_owners(env, pending.owner, pending.resources);
-                    match pending
+                    let outcome = match pending
                         .result
                         .expect("GPU wait only signaled after completion")
                     {
                         Ok(value) => completed(env, value),
                         Err(error) => gpu_error(error),
-                    }
+                    };
+                    resources::finish_private_releases(env, outcome)
                 },
             )
         }
@@ -1759,4 +1839,216 @@ fn present(
         return Outcome::Return(DEVICE_LOST);
     }
     recording::present_operation(env, id, surface, deadline, copy.map(|copy| (id, copy)))
+}
+
+struct Misc {
+    gamma: [[u16; 256]; 3],
+    clip_status: [u32; 2],
+    palettes: BTreeMap<u32, [u32; 256]>,
+    palette: u32,
+    cursor_visible: bool,
+    cursor_position: (i32, i32),
+}
+impl Default for Misc {
+    fn default() -> Self {
+        Self {
+            gamma: [std::array::from_fn(|i| i as u16 * 257); 3],
+            clip_status: [0, u32::MAX],
+            palettes: BTreeMap::new(),
+            palette: 0,
+            cursor_visible: false,
+            cursor_position: (0, 0),
+        }
+    }
+}
+fn device_mut<'a>(env: &'a mut Env<'_>, pointer: u32) -> Option<&'a mut Device> {
+    match com(env).get_mut::<Payload>(&mut env.sys.objects, pointer)? {
+        Payload::Device(d) => Some(d),
+        _ => None,
+    }
+}
+#[win32(d3d9, name = "IDirect3D9::RegisterSoftwareDevice", level = implement)]
+fn register_software(env: &mut Env<'_>, _this: GuestPtr<()>, _initialize: GuestPtr<()>) -> u32 {
+    adv_abi::warn_unavailable(
+        env,
+        "IDirect3D9::RegisterSoftwareDevice",
+        "software rasterizer devices are unsupported",
+    );
+    UNAVAILABLE
+}
+#[win32(d3d9, name = "IDirect3DDevice9::GetNumberOfSwapChains", level = implement)]
+fn swapchain_count(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
+    u32::from(device(env, this.addr()).is_some())
+}
+#[win32(d3d9, name = "IDirect3DDevice9::GetRasterStatus", level = implement)]
+fn raster_status(
+    env: &mut Env<'_>,
+    this: GuestPtr<()>,
+    swapchain: u32,
+    output: GuestPtr<[u32; 2]>,
+) -> u32 {
+    if device(env, this.addr()).is_none() {
+        return INVALID;
+    }
+    if swapchain != 0 {
+        adv_abi::warn_unavailable(
+            env,
+            "IDirect3DDevice9::GetRasterStatus",
+            "only the implicit swap chain is supported",
+        );
+        return UNAVAILABLE;
+    }
+    output.write(env.cpu, [0, 0]).map_or(INVALID, |()| 0)
+}
+#[win32(d3d9, name = "IDirect3DDevice9::ValidateDevice", level = implement)]
+fn validate_device(env: &mut Env<'_>, this: GuestPtr<()>, passes: GuestPtr<u32>) -> u32 {
+    let Some(d) = device(env, this.addr()) else {
+        return INVALID;
+    };
+    if d.shaders.pixel.is_none() {
+        if let Err(error) = fixed::second_stage(&d.fixed) {
+            adv_abi::warn_unavailable(env, "IDirect3DDevice9::ValidateDevice", error.reason);
+            return error.code;
+        }
+        if d.texture.is_some()
+            && (fixed::combine(d.fixed.stage[&1], d.fixed.stage[&2], d.fixed.stage[&3]).is_none()
+                || fixed::combine(d.fixed.stage[&4], d.fixed.stage[&5], d.fixed.stage[&6])
+                    .is_none())
+        {
+            adv_abi::warn_unavailable(
+                env,
+                "IDirect3DDevice9::ValidateDevice",
+                "texture stage combination is unsupported by drawing",
+            );
+            return UNAVAILABLE;
+        }
+    }
+    passes.write(env.cpu, 1).map_or(INVALID, |()| 0)
+}
+#[win32(d3d9, name = "IDirect3DDevice9::SetGammaRamp", level = implement)]
+fn set_gamma(
+    env: &mut Env<'_>,
+    this: GuestPtr<()>,
+    swapchain: u32,
+    flags: u32,
+    ramp: GuestPtr<[[u16; 256]; 3]>,
+) {
+    if swapchain != 0 || flags & !1 != 0 {
+        adv_abi::warn_unavailable(
+            env,
+            "IDirect3DDevice9::SetGammaRamp",
+            "unsupported swap chain or gamma flags",
+        );
+        return;
+    }
+    if let Ok(ramp) = ramp.read(env.cpu)
+        && let Some(d) = device_mut(env, this.addr())
+    {
+        d.misc.gamma = ramp;
+    }
+}
+#[win32(d3d9, name = "IDirect3DDevice9::GetGammaRamp", level = implement)]
+fn get_gamma(
+    env: &mut Env<'_>,
+    this: GuestPtr<()>,
+    swapchain: u32,
+    ramp: GuestPtr<[[u16; 256]; 3]>,
+) {
+    if swapchain != 0 {
+        adv_abi::warn_unavailable(
+            env,
+            "IDirect3DDevice9::GetGammaRamp",
+            "only the implicit swap chain is supported",
+        );
+        return;
+    }
+    if let Some(d) = device(env, this.addr()) {
+        let gamma = d.misc.gamma;
+        let _ = ramp.write(env.cpu, gamma);
+    }
+}
+#[win32(d3d9, name = "IDirect3DDevice9::SetClipStatus", level = implement)]
+fn set_clip_status(env: &mut Env<'_>, this: GuestPtr<()>, status: GuestPtr<[u32; 2]>) -> u32 {
+    let Ok(status) = status.read(env.cpu) else {
+        return INVALID;
+    };
+    let Some(d) = device_mut(env, this.addr()) else {
+        return INVALID;
+    };
+    d.misc.clip_status = status;
+    0
+}
+#[win32(d3d9, name = "IDirect3DDevice9::GetClipStatus", level = implement)]
+fn get_clip_status(env: &mut Env<'_>, this: GuestPtr<()>, status: GuestPtr<[u32; 2]>) -> u32 {
+    let Some(d) = device(env, this.addr()) else {
+        return INVALID;
+    };
+    let value = d.misc.clip_status;
+    status.write(env.cpu, value).map_or(INVALID, |()| 0)
+}
+fn palette_supported(env: &mut Env<'_>, number: u32, method: &str) -> bool {
+    if number < 65536 {
+        return true;
+    }
+    adv_abi::warn_unavailable(env, method, "palette numbers must be below 65536");
+    false
+}
+#[win32(d3d9, name = "IDirect3DDevice9::SetPaletteEntries", level = implement)]
+fn set_palette_entries(
+    env: &mut Env<'_>,
+    this: GuestPtr<()>,
+    number: u32,
+    entries: GuestPtr<[u32; 256]>,
+) -> u32 {
+    if !palette_supported(env, number, "IDirect3DDevice9::SetPaletteEntries") {
+        return UNAVAILABLE;
+    }
+    let Ok(entries) = entries.read(env.cpu) else {
+        return INVALID;
+    };
+    let Some(d) = device_mut(env, this.addr()) else {
+        return INVALID;
+    };
+    d.misc.palettes.insert(number, entries);
+    0
+}
+#[win32(d3d9, name = "IDirect3DDevice9::GetPaletteEntries", level = implement)]
+fn get_palette_entries(
+    env: &mut Env<'_>,
+    this: GuestPtr<()>,
+    number: u32,
+    entries: GuestPtr<[u32; 256]>,
+) -> u32 {
+    if !palette_supported(env, number, "IDirect3DDevice9::GetPaletteEntries") {
+        return UNAVAILABLE;
+    }
+    let Some(d) = device(env, this.addr()) else {
+        return INVALID;
+    };
+    let value = d
+        .misc
+        .palettes
+        .get(&number)
+        .copied()
+        .unwrap_or([u32::MAX; 256]);
+    entries.write(env.cpu, value).map_or(INVALID, |()| 0)
+}
+#[win32(d3d9, name = "IDirect3DDevice9::SetCurrentTexturePalette", level = implement)]
+fn set_current_palette(env: &mut Env<'_>, this: GuestPtr<()>, number: u32) -> u32 {
+    if !palette_supported(env, number, "IDirect3DDevice9::SetCurrentTexturePalette") {
+        return UNAVAILABLE;
+    }
+    let Some(d) = device_mut(env, this.addr()) else {
+        return INVALID;
+    };
+    d.misc.palette = number;
+    0
+}
+#[win32(d3d9, name = "IDirect3DDevice9::GetCurrentTexturePalette", level = implement)]
+fn get_current_palette(env: &mut Env<'_>, this: GuestPtr<()>, output: GuestPtr<u32>) -> u32 {
+    let Some(d) = device(env, this.addr()) else {
+        return INVALID;
+    };
+    let value = d.misc.palette;
+    output.write(env.cpu, value).map_or(INVALID, |()| 0)
 }

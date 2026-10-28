@@ -133,11 +133,16 @@ mod disabled_stage_tests {
         assert_eq!(second(&env), Ok(None));
         assert!(!programmable::active(&env, pointer));
         assert_eq!(set_stage(&mut env, this, 0, 1, 4), 0);
-        // Specular, temporary and modified arguments are not combined.
-        for value in [4, 5, 0x12, 0x21] {
+        // Specular and temporary arguments are not combined; modified
+        // supported sources are (GFX-FIXED-2).
+        for value in [4, 5, 0x14, 0x25] {
             assert_eq!(set_stage(&mut env, this, 1, 2, value), 0);
             assert_eq!(second(&env), Err(UNAVAILABLE));
             assert!(programmable::active(&env, pointer));
+        }
+        for value in [3, 0x12, 0x21] {
+            assert_eq!(set_stage(&mut env, this, 1, 2, value), 0);
+            assert_eq!(second(&env).unwrap().unwrap()[1] & 0xff, value);
         }
         assert_eq!(set_stage(&mut env, this, 1, 2, 0), 0);
         assert_eq!(second(&env).unwrap().unwrap()[1], 1 << 8);

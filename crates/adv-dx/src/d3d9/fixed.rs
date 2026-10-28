@@ -7,6 +7,7 @@ use adv_device::gpu::{
 };
 use adv_device::surface::Rect;
 mod input;
+pub(super) mod lighting;
 mod state_map;
 use state_map::StateMap;
 
@@ -90,6 +91,8 @@ pub(super) struct Fixed {
     pub(super) scissor: RECT,
     pub(super) transforms: [[f32; 16]; 3],
     pub(super) clip_planes: [[f32; 4]; 6],
+    pub(super) material: [f32; 17],
+    pub(super) lights: BTreeMap<u32, lighting::Light>,
 }
 /// Byte offsets and source streams of the FVF-equivalent fixed inputs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -97,6 +100,8 @@ pub(super) struct Layout {
     pub transformed: bool,
     pub position: u32,
     pub color: Option<u32>,
+    pub normal: Option<(u16, u32)>,
+    pub specular: Option<(u16, u32)>,
     pub texcoords: [Option<(u16, u32, u8)>; 8],
     /// POSITION/POSITIONT and COLOR0 source stream numbers.
     pub streams: [u16; 2],
@@ -116,7 +121,9 @@ impl Layout {
                 size - bytes
             })
         };
+        let normal = field(fvf & 0x10 != 0, 12).map(|at| (0, at));
         let color = field(fvf & 0x40 != 0, 4);
+        let specular = field(fvf & 0x80 != 0, 4).map(|at| (0, at));
         let mut texcoords = [None; 8];
         for (n, coordinate) in texcoords
             .iter_mut()
@@ -132,6 +139,8 @@ impl Layout {
             transformed,
             position: 0,
             color,
+            normal,
+            specular,
             texcoords,
             streams: [0; 2],
             size,
@@ -283,7 +292,7 @@ impl Fixed {
             render: StateMap::from(BTreeMap::from([
                 (7, 0),
                 (8, 3), // FILLMODE: only solid rasterization is implemented.
-                (9, 2), // SHADEMODE: the shared shader interpolates vertex colors.
+                (9, 2), // SHADEMODE: GOURAUD.
                 (14, 1),
                 (15, 0),
                 (16, 1), // LASTPIXEL: consumed by the shared line rasterizer.
@@ -301,11 +310,29 @@ impl Fixed {
                 (37, 1f32.to_bits()),
                 (38, 1f32.to_bits()),
                 (140, 0),
+                (48, 0),        // RANGEFOGENABLE.
+                (60, u32::MAX), // TEXTUREFACTOR.
+                (142, 1),       // LOCALVIEWER.
+                (143, 0),       // NORMALIZENORMALS.
+                (157, 0),
+                (158, 1f32.to_bits()),
+                (159, 0),
+                (160, 0),
+                (162, u32::MAX),
+                (165, 0),
+                (170, 0),
+                (172, 3),
+                (173, 1),
+                (175, 0),
+                (176, 0),
+                (193, u32::MAX),
+                (194, 0),
+                (195, 0),
                 (154, 1f32.to_bits()),
                 (155, 1f32.to_bits()),
                 (156, 0),
                 (166, 64f32.to_bits()),
-                (29, 0), // SPECULARENABLE: supported FVFs supply zero specular RGB.
+                (29, 0), // SPECULARENABLE.
                 (26, 0), // DITHERENABLE: the renderer does not dither.
                 (52, 0),
                 (53, 1),
@@ -325,7 +352,7 @@ impl Fixed {
                 (135, 0),
                 (136, 1), // CLIPPING: GPU primitive clipping remains enabled.
                 (137, 1),
-                (139, 0), // AMBIENT: only relevant when lighting is enabled.
+                (139, 0), // AMBIENT.
                 (141, 1), // COLORVERTEX: only relevant when lighting is enabled.
                 (145, 1), // Material sources: COLOR1, COLOR2, MATERIAL, MATERIAL.
                 (146, 2),
@@ -336,6 +363,17 @@ impl Fixed {
                 (161, 1), // Inert on the supported single-sample render targets.
                 (167, 0), // INDEXEDVERTEXBLENDENABLE: no matrix indices.
                 (168, 15),
+                (190, 15),
+                (191, 15),
+                (192, 15),
+                (198, 0),
+                (199, 0),
+                (200, 0),
+                (201, 0),
+                (202, 0),
+                (203, 0),
+                (204, 0),
+                (205, 0),
                 (171, 1),
                 (174, 0),
                 (185, 0),
@@ -386,10 +424,15 @@ impl Fixed {
             },
             transforms: [identity; 3],
             clip_planes: [[0.; 4]; 6],
+            material: [
+                1., 1., 1., 1., 1., 1., 1., 1., 0., 0., 0., 0., 0., 0., 0., 0., 0.,
+            ],
+            lights: BTreeMap::new(),
         }
     }
 }
 pub(super) fn register(registry: &mut Registry) {
+    lighting::register(registry);
     for api in [
         super::unchanged::unless_unchanged!(set_fvf_ABI, super::unchanged::binding),
         get_fvf_ABI,
@@ -405,7 +448,8 @@ pub(super) fn register(registry: &mut Registry) {
         get_scissor_ABI,
         set_transform_ABI,
         get_transform_ABI,
-        draw_up_ABI,
+        multiply_transform_ABI,
+        with_private_releases!(draw_up_ABI),
     ] {
         registry.register(api);
     }
@@ -424,13 +468,11 @@ fn current<'a>(env: &'a Env<'_>, pointer: u32) -> Option<&'a Fixed> {
     Some(&device(env, pointer)?.fixed)
 }
 fn valid_fvf(fvf: u32) -> bool {
-    // SPECULARENABLE is observable state, but these prelit/lighting-off inputs
-    // have no specular color. Keep SPECULAR (0x80) unavailable until that color
-    // is propagated through the neutral vertex and post-texture RGB stage.
     let count = (fvf >> 8) & 15;
     let sizes = fvf >> 16;
     matches!(fvf & 0x0e, 2 | 4)
-        && fvf & !(0x0e | 0x40 | 0xf00 | 0xffff0000) == 0
+        && fvf & !(0x0e | 0x10 | 0x40 | 0x80 | 0xf00 | 0xffff0000) == 0
+        && !(fvf & 0x0e == 4 && fvf & 0x10 != 0)
         && count <= 8
         && (count == 8 || sizes >> (count * 2) == 0)
 }
@@ -526,6 +568,10 @@ fn factor(value: u32) -> Option<Factor> {
         9 => Factor::DestinationColor,
         10 => Factor::OneMinusDestinationColor,
         11 => Factor::SourceAlphaSaturated,
+        12 => Factor::SourceAlpha,
+        13 => Factor::OneMinusSourceAlpha,
+        14 => Factor::Constant,
+        15 => Factor::OneMinusConstant,
         _ => return None,
     })
 }
@@ -577,18 +623,24 @@ pub(super) fn set_render(env: &mut Env<'_>, this: GuestPtr<()>, state: i32, valu
             _ => false,
         },
         9 => match value {
-            2 => true, // GOURAUD is the existing neutral renderer's shading mode.
-            1 | 3 => return UNAVAILABLE,
+            1 | 2 => true,
+            3 => return UNAVAILABLE,
             _ => false,
         },
-        7 | 14 | 15 | 16 | 27 | 29 | 52 | 137 | 141 | 161 | 174 | 185 | 206 => value <= 1,
+        7 | 14 | 15 | 16 | 27 | 29 | 52 | 137 | 141 | 142 | 143 | 48 | 157 | 161 | 174 | 176
+        | 194 | 185 | 206 => value <= 1,
         26 => match value {
             0 => true,
             1 => return UNAVAILABLE,
             _ => false,
         },
         28 | 156 => value <= 1,
-        34 | 139 => true,
+        34 | 60 | 139 | 162 | 193 => true,
+        165 => value <= 1,
+        170 => f32::from_bits(value).is_finite(),
+        158..=160 | 175 | 195 => f32::from_bits(value).is_finite(),
+        172 | 173 => (1..=3).contains(&value),
+        190..=192 => value <= 15,
         35 | 140 => value <= 3,
         36..=38 => f32::from_bits(value).is_finite(),
         154 | 155 | 166 => f32::from_bits(value).is_finite() && f32::from_bits(value) > 0.0,
@@ -597,13 +649,7 @@ pub(super) fn set_render(env: &mut Env<'_>, this: GuestPtr<()>, state: i32, valu
             1 => return UNAVAILABLE,
             _ => false,
         },
-        136 => match value {
-            1 => true,
-            0 => return UNAVAILABLE,
-            _ => false,
-        },
-        // Material sources only affect lighting. Supported prelit and
-        // lighting-off draws use vertex colors; lit draws still fail explicitly.
+        136 => value <= 1,
         145..=148 => value <= 2,
         151 => match value {
             0 => true,
@@ -617,7 +663,7 @@ pub(super) fn set_render(env: &mut Env<'_>, this: GuestPtr<()>, state: i32, valu
         53..=55 | 186..=188 => stencil_op(value).is_some(),
         24 | 57..=59 => true,
         168 => value <= 15,
-        128..=135 => match value {
+        128..=135 | 198..=205 => match value {
             0 => true,
             1..=15 => return UNAVAILABLE,
             _ => false,
@@ -704,7 +750,7 @@ pub(super) fn set_stage(
     }
     let valid = match kind {
         1 | 4 => matches!(value, 1 | 2 | 3 | 4 | 7 | 10),
-        2 | 3 | 5 | 6 => value <= 2,
+        2 | 3 | 5 | 6 => value & !0x3f == 0 && value & 0xf <= 3,
         11 => {
             // Up to eight FVF coordinate sets and the SDK's four automatic
             // generation modes are legal; this decoder supplies set zero only.
@@ -1002,6 +1048,46 @@ fn get_transform(
         INVALID
     }
 }
+#[win32(d3d9,name="IDirect3DDevice9::MultiplyTransform",level=implement)]
+fn multiply_transform(
+    env: &mut Env<'_>,
+    this: GuestPtr<()>,
+    kind: i32,
+    matrix: GuestPtr<[f32; 16]>,
+) -> u32 {
+    let Some(slot) = transform_slot(kind) else {
+        adv_abi::warn_unavailable(
+            env,
+            "IDirect3DDevice9::MultiplyTransform",
+            "unsupported transform slot",
+        );
+        return UNAVAILABLE;
+    };
+    let Ok(matrix) = matrix.read(env.cpu) else {
+        return INVALID;
+    };
+    if matrix.iter().any(|v| !v.is_finite()) {
+        return INVALID;
+    }
+    let Some(f) = mutable(env, this.addr()) else {
+        return INVALID;
+    };
+    let result = std::array::from_fn(|n| {
+        row(
+            matrix[n / 4 * 4..n / 4 * 4 + 4].try_into().unwrap(),
+            &f.transforms[slot],
+        )[n % 4]
+    });
+    let changed = f.transforms[slot].map(f32::to_bits) != result.map(f32::to_bits);
+    f.transforms[slot] = result;
+    super::shaders::stateblocks::mark_fixed(
+        env,
+        this.addr(),
+        super::shaders::stateblocks::FixedKey::Transform(slot),
+        changed,
+    );
+    0
+}
 /// The enabled second stage as `[color op, color arguments, alpha op and
 /// arguments, coordinate set]`, each argument a byte; `None` when the first
 /// or second stage is disabled.
@@ -1010,11 +1096,11 @@ pub(super) fn second_stage(f: &Fixed) -> Result<Option<[u32; 4]>, Rejected> {
     if f.stage[&1] == 1 || s[&1] == 1 {
         return Ok(None);
     }
-    // Diffuse, current and texture, without modifiers.
-    if [2, 3, 5, 6].iter().any(|k| s[k] > 2) {
+    // Diffuse, current, texture and texture factor, including argument modifiers.
+    if [2, 3, 5, 6].iter().any(|k| s[k] & 0xf > 3) {
         return Err(rejected(
             UNAVAILABLE,
-            "texture stage 1 arguments other than diffuse, current and texture are unavailable",
+            "texture stage 1 argument source is unavailable",
         ));
     }
     Ok(Some([
@@ -1024,9 +1110,9 @@ pub(super) fn second_stage(f: &Fixed) -> Result<Option<[u32; 4]>, Rejected> {
         s[&11],
     ]))
 }
-fn combine(op: u32, arg1: u32, arg2: u32) -> Option<TextureOp> {
+pub(super) fn combine(op: u32, arg1: u32, arg2: u32) -> Option<TextureOp> {
     let arg = |v| match v {
-        0 | 1 => Some(TextureOp::Color),
+        0 | 1 | 3..=0x3f => Some(TextureOp::Color),
         2 => Some(TextureOp::Texture),
         _ => None,
     };
@@ -1042,6 +1128,7 @@ fn combine(op: u32, arg1: u32, arg2: u32) -> Option<TextureOp> {
             }
         }
         10 if arg1 <= 1 && arg2 == 2 => TextureOp::Subtract,
+        _ if arg1 > 2 || arg2 > 2 => TextureOp::Color,
         _ => return None,
     })
 }
@@ -1183,24 +1270,18 @@ fn prepare_input_checked(
     if !d.scene {
         return Err(rejected(INVALID, "draw outside BeginScene/EndScene"));
     }
-    if d.shaders.vertex.is_none()
-        && d.shaders.pixel.is_none()
-        && (f.render[&28] != 0
-            || f.render[&152] != 0
-            || (kind == 1 && (f.render[&154] != 1f32.to_bits() || f.render[&156] != 0)))
-    {
+    if d.shaders.vertex.is_none() && d.shaders.pixel.is_none() && f.render[&152] != 0 {
         return Err(rejected(
             UNAVAILABLE,
-            "fog, clip planes and sized points require the programmable draw path",
+            "clip planes require the programmable draw path",
         ));
     }
     let layout = layout(env, pointer)?;
-    if !layout.transformed && f.render[&137] != 0 {
-        return Err(rejected(
-            UNAVAILABLE,
-            "untransformed vertices require unsupported lighting",
-        ));
-    }
+    let lit = !layout.transformed && f.render[&137] != 0;
+    let lights = if lit { lighting::active(f)? } else { [None; 8] };
+    let normal_matrix = lit.then(|| lighting::normal_matrix(f));
+    let effects = f.render[&29] != 0 || f.render[&28] != 0 || layout.specular.is_some();
+    let scaled = kind == 1 && !layout.transformed && f.render[&157] != 0;
     let length = primitive_length(kind, count)
         .map_err(|code| rejected(code, "invalid or excessive primitive count"))?;
     if indices.is_some_and(|v| v.len() != length as usize) {
@@ -1233,8 +1314,12 @@ fn prepare_input_checked(
     let mut input_key = xxhash_rust::xxh3::Xxh3::new();
     std::hash::Hash::hash(&indices, &mut input_key);
     let mut vertices = Vec::with_capacity(length as usize);
-    let coordinate_count = layout.coordinate_count();
-    let mut texcoords = if layout.extended_coordinates() {
+    let coordinate_count = if effects || scaled {
+        layout.coordinate_count().max(1) + usize::from(effects) + usize::from(scaled)
+    } else {
+        layout.coordinate_count()
+    };
+    let mut texcoords = if layout.extended_coordinates() || effects || scaled {
         let output_length = if kind == 6 {
             count.checked_mul(3).ok_or(INVALID)?
         } else {
@@ -1264,6 +1349,12 @@ fn prepare_input_checked(
         let at = layout.position;
         let ps = layout.streams[0];
         let mut p = [float(ps, at), float(ps, at + 4), float(ps, at + 8), 1.];
+        let eye = if lit || scaled || (!layout.transformed && f.render[&28] != 0) {
+            row(row(p, &f.transforms[0]), &f.transforms[1])
+        } else {
+            [0.; 4]
+        };
+        let raw_z = p[2];
         if layout.transformed {
             let rhw = float(ps, at + 12);
             if rhw == 0. || !rhw.is_finite() {
@@ -1300,7 +1391,40 @@ fn prepare_input_checked(
                 (argb >> 24) as f32 / 255.,
             ];
         }
-        let mut coordinates = [[0., 0., 0., 1.]; 8];
+        let mut specular = layout.specular.map_or([0.; 4], |(stream, at)| {
+            lighting::color(u32::from_le_bytes(word(stream, at)))
+        });
+        if lit {
+            let normal = layout.normal.map_or([0.; 3], |(stream, at)| {
+                [
+                    float(stream, at),
+                    float(stream, at + 4),
+                    float(stream, at + 8),
+                ]
+            });
+            (color, specular) = lighting::illuminate(
+                f,
+                &lights,
+                eye,
+                normal,
+                normal_matrix.as_ref().unwrap(),
+                layout.color.map(|_| color),
+                layout.specular.map(|_| specular),
+            );
+        }
+        let mut coordinates = [[0., 0., 0., 1.]; 10];
+        if effects {
+            let fog = lighting::fog(f, layout.transformed, raw_z, eye, specular[3]);
+            coordinates[layout.coordinate_count().max(1)] =
+                [specular[0], specular[1], specular[2], fog];
+        }
+        if scaled {
+            let distance = (eye[0] * eye[0] + eye[1] * eye[1] + eye[2] * eye[2]).sqrt();
+            let [a, b, c] = [158, 159, 160].map(|k| f32::from_bits(f.render[&k]));
+            coordinates[coordinate_count - 1][0] = f.viewport.Height as f32
+                * f32::from_bits(f.render[&154])
+                / (a + b * distance + c * distance * distance).sqrt();
+        }
         for (n, coordinate) in layout.texcoords.iter().enumerate() {
             if let Some((stream, offset, dimensions)) = *coordinate {
                 for (component, value) in
@@ -1473,6 +1597,17 @@ pub(super) fn prepare_state(
             destination: factor(f.render[&20]).ok_or(INVALID)?,
             operation: operation(f.render[&171]).ok_or(INVALID)?,
         });
+        match f.render[&19] {
+            12 => state.blend.as_mut().unwrap().destination = Factor::OneMinusSourceAlpha,
+            13 => state.blend.as_mut().unwrap().destination = Factor::SourceAlpha,
+            _ => {}
+        }
+        if [19, 20, 207, 208]
+            .iter()
+            .any(|k| matches!(f.render[k], 14 | 15))
+        {
+            state.blend_constant = Some(rgba(f.render[&193]));
+        }
         if f.render[&206] != 0 {
             state.alpha_blend = Some(Blend {
                 source: factor(f.render[&207]).ok_or(INVALID)?,
@@ -1663,7 +1798,7 @@ mod tests {
 
     #[test]
     // spec: GFX-INPUT-5
-    fn programmable_raster_states_do_not_silently_change_the_fixed_path_contract() {
+    fn fixed_completion_user_clip_planes_stay_explicit() {
         let mut m = super::super::tests::machine();
         let mut env = Env {
             context: m.sys.current,
@@ -1679,27 +1814,21 @@ mod tests {
             panic!("test device");
         };
         d.scene = true;
-        for (state, value, kind) in [
-            (28, 1, 5),
-            (152, 1, 5),
-            (154, 4f32.to_bits(), 1),
-            (156, 1, 1),
-        ] {
-            let original = current(&env, device).unwrap().render[&state];
-            assert_eq!(set_render(&mut env, this, state, value), 0);
-            // Rejection happens before vertex access or queued GPU work.
-            let error = prepare_checked(&env, device, kind, 1, GuestPtr::new(0), 16, None)
-                .err()
-                .unwrap();
-            assert_eq!(error.code, UNAVAILABLE);
-            assert!(error.reason.contains("programmable draw path"));
-            assert_eq!(set_render(&mut env, this, state, original), 0);
-        }
+        let original = current(&env, device).unwrap().render[&152];
+        assert_eq!(set_render(&mut env, this, 152, 1), 0);
+        // Rejection happens before vertex access or queued GPU work.
+        let error = prepare_checked(&env, device, 5, 1, GuestPtr::new(0), 16, None)
+            .err()
+            .unwrap();
+        assert_eq!(error.code, UNAVAILABLE);
+        assert!(error.reason.contains("programmable draw path"));
+        assert_eq!(set_render(&mut env, this, 152, original), 0);
         assert!(env.ext.get::<State>().pending.is_empty());
     }
 
     #[test]
-    fn no_specular_fvf_profile_exposes_bool_state_without_accepting_specular_inputs() {
+    // spec: GFX-FIXED-1
+    fn fixed_completion_specular_fvf_and_bool_roundtrip() {
         let mut m = super::super::tests::machine();
         let mut env = Env {
             context: m.sys.current,
@@ -1722,15 +1851,16 @@ mod tests {
         assert_eq!(set_render(&mut env, this, 29, 2), INVALID);
         assert_eq!(get_render(&mut env, this, 29, output), 0);
         assert_eq!(output.read(env.cpu).unwrap(), 1);
-        assert_eq!(set_fvf(&mut env, this, 0xc4), UNAVAILABLE);
+        assert_eq!(set_fvf(&mut env, this, 0xc4), 0);
         assert_eq!(get_fvf(&mut env, this, output), 0);
-        assert_eq!(output.read(env.cpu).unwrap(), 0x44);
+        assert_eq!(output.read(env.cpu).unwrap(), 0xc4);
         assert!(env.ext.get::<State>().pending.is_empty());
         assert!(env.ext.get::<State>().transfers.is_empty());
     }
 
     #[test]
-    fn gouraud_default_roundtrip_and_rejected_modes_preserve_state_and_output() {
+    // spec: GFX-FIXED-2
+    fn fixed_completion_shading_roundtrip_and_invalid_modes() {
         let mut m = super::super::tests::machine();
         let mut env = Env {
             context: m.sys.current,
@@ -1746,12 +1876,7 @@ mod tests {
         assert_eq!(get_render(&mut env, this, 9, output), 0);
         assert_eq!(output.read(env.cpu).unwrap(), 2);
         assert_eq!(set_render(&mut env, this, 9, 2), 0);
-        for (value, error) in [
-            (1, UNAVAILABLE),
-            (3, UNAVAILABLE),
-            (0, INVALID),
-            (u32::MAX, INVALID),
-        ] {
+        for (value, error) in [(3, UNAVAILABLE), (0, INVALID), (u32::MAX, INVALID)] {
             assert_eq!(set_render(&mut env, this, 9, value), error);
             assert_eq!(get_render(&mut env, this, 9, output), 0);
             assert_eq!(output.read(env.cpu).unwrap(), 2);

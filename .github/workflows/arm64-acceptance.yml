@@ -38,6 +38,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
           cache-workspace-crates: true
       - name: Lint execution layer
         if: github.event_name != 'pull_request'
@@ -105,6 +106,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
           cache-workspace-crates: true
       - name: Build execution layer and tests
         run: |
