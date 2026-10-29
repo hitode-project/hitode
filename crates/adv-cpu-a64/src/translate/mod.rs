@@ -336,8 +336,9 @@ enum Test {
 
 /// Code emitted after the unit body.
 enum Cold {
-    /// A short branch from x87 arithmetic to its distant generic path.
-    X87Guard { label: Label, generic: Label },
+    /// A short branch's way to distant cold code: x87 arithmetic to its
+    /// generic path, or a parity jcc to an exit that publishes a run.
+    Bridge { label: Label, to: Label },
     Table {
         index: usize,
         table: Label,
@@ -846,8 +847,19 @@ impl Translator<'_> {
             }
             Edge::Exit(eip) => {
                 let test = self.test(cc);
+                let x87 = self.x87_leaving();
                 let label = self.asm.label();
-                self.jump_if(test, label);
+                if matches!(test, Test::Parity(_)) && x87.is_some() {
+                    // tbz reaches only short cold code.
+                    let bridge = self.asm.label();
+                    self.jump_if(test, bridge);
+                    self.push_cold(Cold::Bridge {
+                        label: bridge,
+                        to: label,
+                    });
+                } else {
+                    self.jump_if(test, label);
+                }
                 self.push_cold(Cold::Leave {
                     label,
                     state: self.state,
@@ -856,7 +868,7 @@ impl Translator<'_> {
                     exit: Exit::Dispatch,
                     eip,
                     link: true,
-                    x87: self.x87_leaving(),
+                    x87,
                 });
             }
             Edge::Interpret(_) => unreachable!("a jcc target dispatches"),
@@ -1365,9 +1377,9 @@ impl Translator<'_> {
 
     fn cold(&mut self, cold: Cold, at: usize) {
         match cold {
-            Cold::X87Guard { label, generic } => {
+            Cold::Bridge { label, to } => {
                 self.asm.bind(label);
-                self.asm.b(generic);
+                self.asm.b(to);
             }
             Cold::Table { index, table, stub } => self.table_cold(index, table, stub, at),
             Cold::Leave {
@@ -1532,8 +1544,8 @@ impl Translator<'_> {
         // Cold code goes in the order it was asked for, so a tbz anywhere
         // in the body is no farther from its target than the body or the
         // short cold code is long. Long x87 paths and exits that publish a
-        // run, reached only by wider branches or a fault's resume offset,
-        // follow, and tables come last.
+        // run, reached only by wider branches, a bridge or a fault's resume
+        // offset, follow, and tables come last.
         let rank = |cold: &Cold| match cold {
             Cold::Table { .. } => 2,
             Cold::X87(_)
