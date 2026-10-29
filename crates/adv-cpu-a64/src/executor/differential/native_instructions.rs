@@ -697,6 +697,128 @@ fn scalar_moves_word_extraction_bit_tests_and_leave_match_at_budget_cuts() {
     }
 }
 
+// spec: A64-MEM-7
+#[test]
+fn checked_strings_cross_ordinary_blocked_and_alias_pages_at_element_boundaries() {
+    for form in 0..3 {
+        let width = if form == 1 { 4 } else { 1 };
+        for source in [false, true] {
+            if source && form == 1 {
+                continue;
+            }
+            for backward in [false, true] {
+                let boundary = if backward {
+                    DATA
+                } else {
+                    DATA + DATA_LEN as u32
+                };
+                let page = if backward { boundary - 4096 } else { boundary };
+                // Unaligned STOSD also tests an element spanning both pages.
+                let start = if backward {
+                    boundary + 16 - width + u32::from(width == 4)
+                } else {
+                    boundary - 16 + u32::from(width == 4)
+                };
+                let prefix = if backward {
+                    16 / width
+                } else {
+                    (16 - u32::from(width == 4)) / width
+                };
+                for alias in [false, true] {
+                    for rep in [false, true] {
+                        for count in [prefix, prefix + 8] {
+                            if !rep && count == prefix {
+                                continue;
+                            }
+                            let mut p = fixture(|a| {
+                                let a = if rep { a.repe() } else { a };
+                                match form {
+                                    0 => a.movsb(),
+                                    1 => a.stosd(),
+                                    _ => a.cmpsb(),
+                                }
+                                .unwrap();
+                            });
+                            p.data.fill(if form == 1 { 0 } else { 0x5a });
+                            if form == 0 {
+                                let destination = if source {
+                                    0x1c0..0x240
+                                } else if backward {
+                                    0..64
+                                } else {
+                                    DATA_LEN - 64..DATA_LEN
+                                };
+                                p.data[destination].fill(0);
+                            }
+                            p.state.eflags =
+                                (p.state.eflags & !0x400) | (u32::from(backward) << 10);
+                            p.state.regs[0] = 0x5a5a5a5a;
+                            p.state.regs[1] = count;
+                            let at = if rep {
+                                start
+                            } else if backward {
+                                start - prefix * width
+                            } else {
+                                start + prefix * width
+                            };
+                            p.state.regs[6] = if source { at } else { DATA + 0x200 };
+                            p.state.regs[7] = if source { DATA + 0x200 } else { at };
+                            for flagm in [false, true] {
+                                for checks in [Checks::All, Checks::Slow] {
+                                    let config = (Features { flagm }, false, checks);
+                                    let mut native = executor(&p, config, false);
+                                    let mut oracle = executor(&p, config, true);
+                                    for cpu in [&mut native, &mut oracle] {
+                                        if alias {
+                                            // Only this 4 KiB page is accessible in its host page.
+                                            // On 16 KiB hosts the window needs the ordinary alias.
+                                            cpu.protect(page, 4096, 3).unwrap();
+                                            let value = if form == 1 || (form == 0 && !source) {
+                                                0
+                                            } else {
+                                                0x5a
+                                            };
+                                            cpu.write(page, &[value; 4096]).unwrap();
+                                        } else {
+                                            cpu.unmap(page, 4096).unwrap();
+                                        }
+                                    }
+                                    let outcome = native.run(p.stop, 100).unwrap();
+                                    assert_eq!(
+                                        outcome,
+                                        oracle.run(p.stop, 100).unwrap(),
+                                        "form {form} source {source} backward {backward} alias {alias} rep {rep} count {count} {config:?}"
+                                    );
+                                    same(&native, &oracle);
+                                    if alias {
+                                        assert_eq!(
+                                            native.memory().read(page, 4096).unwrap(),
+                                            oracle.memory().read(page, 4096).unwrap()
+                                        );
+                                    }
+                                    if checks == Checks::All {
+                                        assert!(native.stats.native_entries > 0);
+                                        let blocked = !alias && (!rep || count > prefix);
+                                        assert_eq!(
+                                            native.native.as_ref().unwrap().diagnostics.helpers,
+                                            u64::from(blocked),
+                                            "helpers before blocked element"
+                                        );
+                                        assert_eq!(
+                                            native.native.as_ref().unwrap().diagnostics.faults,
+                                            0
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 // spec: A64-MEM-1, A64-MEM-2, A64-MEM-4, A64-MEM-7, A64-MEM-8
 #[test]
 fn checked_ordinary_pages_avoid_helpers_and_follow_permission_changes() {
