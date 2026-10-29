@@ -8,8 +8,10 @@
 //! outside the range or precision the rule admits) the instruction's
 //! interpreter helper runs it in place and the unit goes on. Nothing is
 //! stored before every check has passed, and memory is accessed only with
-//! the guest flags in NZCV. Runs of such instructions keep the stack in
-//! host registers instead (see `cache`).
+//! the guest flags in NZCV, so checked accesses (A64-MEM-7) take the same
+//! path and a refusal faults before anything is committed. Runs of such
+//! instructions keep the stack in host registers instead (see `cache`);
+//! they leave out checked accesses.
 //!
 //! Arithmetic needs exact doubles within `2^±fast::RANGE`, masked
 //! exceptions, round to nearest and precision 24, 53 or 64; it rounds once in
@@ -34,6 +36,7 @@ use crate::encode::*;
 use crate::jit_map::Part;
 use crate::runtime;
 
+use super::access::{Addr, Dir};
 use super::decode::{Mem, memory};
 use super::flags::Operand;
 use super::{RUNTIME, Translator, WINDOW, X0, X1, X2, X3, X4, X5, X6, X13, X14, X15, X16, X17};
@@ -113,7 +116,6 @@ impl Translator<'_> {
         self.emit(mov(W, X6, address));
         self.cpu();
         let slow = self.asm.label();
-        let memory_slow = self.asm.label();
         let done = self.asm.label();
         self.emit_all(&[
             mrs_nzcv(X4),
@@ -123,14 +125,13 @@ impl Translator<'_> {
         self.asm.tbz(true, X13, 7, slow);
         self.asm.cbz(W, true, X16, slow);
         self.emit_all(&[ubfx(W, X15, X13, 11, 3), ldrh(X14, X5, runtime::X87_TAG)]);
-        let load = ldr_reg(X, X0, WINDOW, X6, false);
         if self.checking {
-            self.emit(mov(X, X7, X4));
-            self.checked_memory(X6, 8, false, load, memory_slow);
-            self.emit(mov(X, X4, X7));
+            self.vector_access(VMem::D, V0, X6, false);
+            self.emit(fmov_from_v(X, X0, V0));
+            self.x87_accessed();
         } else {
             self.site();
-            self.emit(load);
+            self.emit(ldr_reg(X, X0, WINDOW, X6, false));
         }
         // Normalize the unsigned magnitude straight into raw80. No host-double
         // conversion or rounding loses the low bits of large signed integers.
@@ -164,10 +165,6 @@ impl Translator<'_> {
         }
         self.emit_all(&[str(W, X6, X5, runtime::X87_DP), msr_nzcv(X4)]);
         self.asm.b(done);
-        self.asm.bind(memory_slow);
-        if self.checking {
-            self.emit(mov(X, X4, X7));
-        }
         self.asm.bind(slow);
         self.emit(msr_nzcv(X4));
         self.helper(helper);
@@ -180,10 +177,6 @@ impl Translator<'_> {
             return;
         }
         self.flush_simd();
-        if self.checking && x.mem.is_some() {
-            self.helper(x.helper);
-            return;
-        }
         self.canonicalize();
         if let Some(mem) = x.mem {
             let address = self.effective(mem);
@@ -306,8 +299,8 @@ impl Translator<'_> {
                 self.clear_c1();
             }
             Fast::LoadControl => {
-                self.site();
-                self.emit(ldr_narrow(Narrow::Half, X0, WINDOW, X6));
+                self.access(Addr::Window(X6), 2, Dir::Load, X0);
+                self.x87_accessed();
                 // Unmasking a pending exception takes the interpreter.
                 self.emit_all(&[bic(W, X16, X13, X0, Lsl, 0), and_imm(W, X16, X16, 0x3f)]);
                 self.asm.cbz(W, true, X16, slow);
@@ -326,8 +319,8 @@ impl Translator<'_> {
                 };
                 match x.mem {
                     Some(_) => {
-                        self.site();
-                        self.emit(str_narrow(Narrow::Half, value, WINDOW, X6));
+                        self.access(Addr::Window(X6), 2, Dir::Store, value);
+                        self.x87_accessed();
                     }
                     None => {
                         self.clobber(Operand::Guest(0));
@@ -490,9 +483,17 @@ impl Translator<'_> {
         }
         self.store_flags(slow);
         self.emit(msr_nzcv(X4));
-        self.site();
         let size = if width == 8 { X } else { W };
-        self.emit(str_reg(size, X2, WINDOW, X6, false));
+        if self.checking {
+            // The `access` stub's arguments take x1 to x4.
+            self.emit(fmov_to_v(size, V1, X2));
+            let vmem = if width == 8 { VMem::D } else { VMem::S };
+            self.vector_access(vmem, V1, X6, true);
+            self.x87_accessed();
+        } else {
+            self.site();
+            self.emit(str_reg(size, X2, WINDOW, X6, false));
+        }
         if pop {
             self.pop();
         }
@@ -1200,15 +1201,24 @@ impl Translator<'_> {
     /// `memory_operand` with a binary64 operand's biased exponent minus
     /// `bounds.0` at most `bounds.1`, unless it is a zero.
     fn memory_bounded(&mut self, source: Source, d: VReg, bounds: (u32, u32), slow: Label) {
-        self.site();
+        match source {
+            Source::F32 | Source::F64 => {
+                let size = if source == Source::F32 {
+                    VMem::S
+                } else {
+                    VMem::D
+                };
+                self.vector_access(size, d, X6, false);
+            }
+            Source::I16 => self.access(Addr::Window(X6), 2, Dir::Signed, X16),
+            Source::I32 => self.access(Addr::Window(X6), 4, Dir::Load, X16),
+            Source::St(_) => unreachable!("not a memory operand"),
+        }
+        self.x87_accessed();
         match source {
             Source::F32 => {
                 let ok = self.asm.label();
-                self.emit_all(&[
-                    vldr_reg(VMem::S, d, WINDOW, X6),
-                    fmov_from_v(W, X16, d),
-                    lsl_imm(W, X17, X16, 1),
-                ]);
+                self.emit_all(&[fmov_from_v(W, X16, d), lsl_imm(W, X17, X16, 1)]);
                 self.asm.cbz(W, false, X17, ok);
                 self.emit_all(&[
                     ubfx(W, X17, X16, 23, 8),
@@ -1222,11 +1232,7 @@ impl Translator<'_> {
             }
             Source::F64 => {
                 let ok = self.asm.label();
-                self.emit_all(&[
-                    vldr_reg(VMem::D, d, WINDOW, X6),
-                    fmov_from_v(X, X16, d),
-                    lsl_imm(X, X17, X16, 1),
-                ]);
+                self.emit_all(&[fmov_from_v(X, X16, d), lsl_imm(X, X17, X16, 1)]);
                 self.asm.cbz(X, false, X17, ok);
                 let (low, span) = bounds;
                 self.emit_all(&[
@@ -1237,12 +1243,8 @@ impl Translator<'_> {
                 self.asm.b_cond(Cond::Hi, slow);
                 self.asm.bind(ok);
             }
-            Source::I16 => self.emit_all(&[
-                ldr_narrow(Narrow::SignedHalf, X16, WINDOW, X6),
-                scvtf(W, d, X16),
-            ]),
-            Source::I32 => self.emit_all(&[ldr_reg(W, X16, WINDOW, X6, false), scvtf(W, d, X16)]),
-            Source::St(_) => unreachable!("not a memory operand"),
+            Source::I16 | Source::I32 => self.emit(scvtf(W, d, X16)),
+            Source::St(_) => unreachable!(),
         }
     }
 
@@ -1439,6 +1441,14 @@ impl Translator<'_> {
             shiftv(W, Shift::Lsl, X17, X17, X16),
             orr(W, X14, X14, X17, Lsl, 0),
         ]);
+    }
+
+    /// After an access: a checked one uses x4 as scratch, and NZCV holds
+    /// the guest flags at every access, so it reloads x4 from there.
+    fn x87_accessed(&mut self) {
+        if self.checking {
+            self.emit(mrs_nzcv(X4));
+        }
     }
 
     fn pop(&mut self) {
