@@ -71,7 +71,12 @@ pub fn read(env: &mut Env<'_>, args: &[u32]) -> Outcome {
             }
             return Err(status::INVALID_PARAMETER.into());
         }
-        let mut bytes = vec![0; length as usize];
+        let reader = volume::mounts(env).reader(fd.fd);
+        let mut fallback = None;
+        let bytes = match env.cpu.writable_bytes(buffer, length as usize) {
+            Some(bytes) => bytes,
+            None => fallback.insert(vec![0; length as usize]).as_mut_slice(),
+        };
         let position = if fd.kind == FD_TYPE_FILE {
             position.filter(|off| *off != FILE_USE_FILE_POINTER_POSITION)
         } else {
@@ -80,8 +85,8 @@ pub fn read(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         let mut total = 0;
         let count = loop {
             // SAFETY: a live server descriptor and a writable buffer of length bytes.
-            let count = if let Some(reader) = volume::mounts(env).reader(fd.fd) {
-                let reader = reader.map_err(|_| 0xc000_0185u32)?;
+            let count = if let Some(reader) = &reader {
+                let reader = reader.as_ref().map_err(|_| 0xc000_0185u32)?;
                 let at =
                     position.unwrap_or_else(|| unsafe { libc::lseek(fd.fd, 0, libc::SEEK_CUR) });
                 let at_unsigned = u64::try_from(at).map_err(|_| status::INVALID_PARAMETER)?;
@@ -152,7 +157,9 @@ pub fn read(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         } else {
             return Err(0xc000_014bu32.into());
         }; // STATUS_PIPE_BROKEN
-        write_bytes(env, buffer, &bytes[..count as usize])?;
+        if let Some(bytes) = fallback {
+            write_bytes(env, buffer, &bytes[..count as usize])?;
+        }
         write_u32(env, io, status)?;
         write_u32(env, io + 4, count)?;
         if event != 0 {
@@ -921,15 +928,24 @@ fn segmented_io(env: &mut Env<'_>, args: &[u32], writing: bool) -> Outcome {
             } else {
                 remaining.wrapping_sub(pos).min(4096 - pos)
             };
-            let mut bytes = vec![0; count as usize];
-            if writing && env.cpu.read(address, &mut bytes).is_err() {
-                code = 0xc000_00e8; // STATUS_INVALID_USER_BUFFER
-                break;
-            }
             if !writing && !env.cpu.accessible(address, count, Prot::WRITE) {
                 code = status::ACCESS_VIOLATION;
                 break;
             }
+            let mut fallback = None;
+            let bytes = if writing {
+                let bytes = fallback.insert(vec![0; count as usize]);
+                if env.cpu.read(address, bytes).is_err() {
+                    code = 0xc000_00e8; // STATUS_INVALID_USER_BUFFER
+                    break;
+                }
+                bytes.as_mut_slice()
+            } else {
+                match env.cpu.writable_bytes(address, count as usize) {
+                    Some(bytes) => bytes,
+                    None => fallback.insert(vec![0; count as usize]).as_mut_slice(),
+                }
+            };
             // SAFETY: a live regular file and a buffer of count bytes.
             let result = unsafe {
                 match (writing, position) {
@@ -963,7 +979,7 @@ fn segmented_io(env: &mut Env<'_>, args: &[u32], writing: bool) -> Outcome {
                 break;
             }
             let result = result as u32;
-            if !writing {
+            if !writing && let Some(bytes) = fallback {
                 write_bytes(env, address, &bytes[..result as usize])?;
             }
             total += result;

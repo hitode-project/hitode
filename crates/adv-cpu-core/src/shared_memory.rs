@@ -1,5 +1,6 @@
 //! Device storage has two independent OS views. Guest accesses use byte atomics
 //! through the writable view; callbacks can only load the read-only alias.
+//! Read-only file storage also supplies retained input to serial host libraries.
 use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -11,6 +12,21 @@ pub struct SharedAllocation {
     writable: bool,
 }
 
+/// A retained read-only file range for serial host libraries. Its mapping
+/// survives guest decommit, unmap and protection changes.
+pub struct ReadOnlyFileView {
+    storage: Arc<SharedAllocation>,
+    offset: usize,
+}
+
+impl ReadOnlyFileView {
+    /// Raw input for a host library; no Rust slice aliases shared file bytes.
+    pub fn as_ptr(&self) -> *const u8 {
+        // SAFETY: construction checked the range and retains its allocation.
+        unsafe { self.storage.mapping.read.as_ptr().add(self.offset) }
+    }
+}
+
 impl crate::backend::CounterStorage for Arc<SharedAllocation> {
     fn load(&self, offset: usize) -> u32 {
         u32::from_le_bytes(std::array::from_fn(|i| self.load_u8(offset + i)))
@@ -20,8 +36,9 @@ impl crate::backend::CounterStorage for Arc<SharedAllocation> {
     }
 }
 
-// SAFETY: mapping ownership and addresses are immutable. Every exposed data
-// access is a byte-width atomic. No ordinary shared Rust slice is produced.
+// SAFETY: mapping ownership and addresses are immutable. Writable storage
+// exposes only byte atomics; retained raw host input requires read-only storage.
+// No ordinary shared Rust slice is produced.
 unsafe impl Send for SharedAllocation {}
 unsafe impl Sync for SharedAllocation {}
 
@@ -60,6 +77,20 @@ impl SharedAllocation {
             len,
             writable,
         }))
+    }
+
+    pub(crate) fn read_only_view(
+        self: &Arc<Self>,
+        offset: usize,
+        len: usize,
+    ) -> Option<ReadOnlyFileView> {
+        if self.writable || offset.checked_add(len)? > self.len {
+            return None;
+        }
+        Some(ReadOnlyFileView {
+            storage: self.clone(),
+            offset,
+        })
     }
 
     /// Whether host stores may reach the storage.

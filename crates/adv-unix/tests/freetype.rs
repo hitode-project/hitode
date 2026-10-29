@@ -26,10 +26,16 @@ impl Resolver for Platform {
                 adv_unix::Platform.host_fn("libc.so.6", "dlsym")?
             }
             ("test-libc", name) => return adv_unix::Platform.host_fn("libc.so.6", name),
+            ("file-view-freetype", name) => {
+                return adv_unix::Platform.host_fn("libfreetype.so.6", name);
+            }
             _ => adv_unix::Platform.host_fn(module, name)?,
         };
         if module == "freetype-test.dll" {
             function.conv = Conv::Stdcall { argc: 2 };
+        }
+        if module == "libfreetype.so.6" && name == "FT_New_Memory_Face" {
+            function.handler = file_view_face;
         }
         if name == "dlopen" || name == "OpenFreeType" {
             function.handler = open;
@@ -39,8 +45,74 @@ impl Resolver for Platform {
     fn provides(&self, module: &str) -> bool {
         module == "freetype-test.dll"
             || module == "test-libc"
+            || module == "file-view-freetype"
             || adv_unix::Platform.provides(module)
     }
+}
+
+// spec: WINE-UNIX-6, A64-MEM-13
+// Exercise the byte oracle with file-backed host input, then remove and reuse
+// the guest view before glyph loads. FreeType must retain its own input view.
+fn file_view_face(env: &mut Env<'_>) -> Outcome {
+    use adv_nt::memory::{self, Memory, PAGE_READONLY};
+    use std::io::Write;
+    use std::os::fd::AsFd;
+    let mut args: [u32; 5] = std::array::from_fn(|i| env.arg(i as u32));
+    if args[1] == 0 || args[2] == 0 || (args[2] as i32) < 0 {
+        return (adv_unix::Platform
+            .host_fn("libfreetype.so.6", "FT_New_Memory_Face")
+            .unwrap()
+            .handler)(env);
+    }
+    let mut bytes = vec![0; args[2] as usize];
+    env.cpu.read(args[1], &mut bytes).unwrap();
+    let size = args[2].next_multiple_of(4096);
+    let path = std::env::temp_dir().join(format!("adv-freetype-view-{}", std::process::id()));
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .unwrap();
+    std::fs::remove_file(path).unwrap();
+    file.write_all(&bytes).unwrap();
+    file.set_len(size.into()).unwrap();
+    let base = memory::map_shared_view(
+        env.cpu,
+        &mut env.sys.vm,
+        env.ext.get_or_default::<Memory>(),
+        file.as_fd(),
+        0,
+        size,
+        PAGE_READONLY,
+    )
+    .unwrap();
+    assert!(env.cpu.read_only_file_view(base, bytes.len()).is_some());
+    env.ext
+        .get_or_default::<Opened>()
+        .0
+        .push(("file-view-input".into(), base));
+    args[1] = base;
+    let binding = env
+        .sys
+        .thunks
+        .resolve(env.cpu, "file-view-freetype", "FT_New_Memory_Face")
+        .unwrap();
+    Outcome::call_aligned(env, binding, args, move |env, returned| {
+        memory::remove_view(
+            env.cpu,
+            &mut env.sys.vm,
+            env.ext.get_or_default::<Memory>(),
+            base,
+        );
+        env.cpu.map(base, size, adv_cpu::backend::Prot::RW).unwrap();
+        env.cpu.fill_memory(base, 0, size as usize).unwrap();
+        env.cpu
+            .protect(base, size, adv_cpu::backend::Prot(0))
+            .unwrap();
+        env.cpu.unmap(base, size).unwrap();
+        Outcome::Return(returned.value())
+    })
 }
 
 #[derive(Default)]
@@ -192,6 +264,9 @@ fn host_freetype_matches_i386() {
         },
         |machine| {
             let opens = &machine.ext.get_or_default::<Opened>().0;
+            if mode == "host" {
+                assert!(opens.iter().any(|(name, _)| name == "file-view-input"));
+            }
             let ft: Vec<_> = opens
                 .iter()
                 .filter(|(name, _)| name == "libfreetype.so.6")

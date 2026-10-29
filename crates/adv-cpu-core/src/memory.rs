@@ -701,6 +701,56 @@ impl Memory {
         Ok(unsafe { std::slice::from_raw_parts(self.ptr.as_ptr().add(range.start), range.len()) })
     }
 
+    /// Borrow writable ordinary storage while the execution owner is paused.
+    /// A watched page always retains the normal store/invalidation path.
+    pub fn writable_bytes(&mut self, addr: u32, len: usize) -> Option<&mut [u8]> {
+        let range = self.committed(addr, len).ok()?;
+        if !range.is_empty()
+            && (range.start / PAGE_SIZE..=(range.end - 1) / PAGE_SIZE).any(|page| {
+                self.perms[page] & (WRITE | SHARED) != WRITE
+                    || self.watched[page]
+                    || self.resident.contains_key(&page)
+            })
+        {
+            return None;
+        }
+        // SAFETY: the entire range is committed, writable, exclusively owned
+        // ordinary storage, with no code observations to invalidate.
+        Some(unsafe {
+            std::slice::from_raw_parts_mut(self.ptr.as_ptr().add(range.start), range.len())
+        })
+    }
+
+    /// Retain a contiguous read-only file allocation independently of guest
+    /// unmapping or protection changes. No file bytes are touched here.
+    pub fn read_only_file_view(
+        &self,
+        addr: u32,
+        len: usize,
+    ) -> Option<crate::shared_memory::ReadOnlyFileView> {
+        let range = self.committed(addr, len).ok()?;
+        if range.is_empty() {
+            return None;
+        }
+        let first = range.start / PAGE_SIZE;
+        let SharedPage::Storage { storage, offset } = self.shared_pages.get(&first)? else {
+            return None;
+        };
+        for page in first..=(range.end - 1) / PAGE_SIZE {
+            if self.perms[page] & READ == 0 {
+                return None;
+            }
+            match self.shared_pages.get(&page)? {
+                SharedPage::Storage {
+                    storage: next,
+                    offset: at,
+                } if Arc::ptr_eq(storage, next) && *at == offset + (page - first) * PAGE_SIZE => {}
+                _ => return None,
+            }
+        }
+        storage.read_only_view(offset + range.start % PAGE_SIZE, len)
+    }
+
     pub fn read_data(&self, addr: u32, len: usize) -> Result<Cow<'_, [u8]>, String> {
         let range = self.committed(addr, len)?;
         if self.overlays(&range) {
@@ -1568,6 +1618,54 @@ impl Drop for Memory {
 mod file_page_tests {
     use super::*;
     use std::{cell::Cell, rc::Rc};
+
+    // spec: EXEC-CORE-7, A64-MEM-13
+    #[test]
+    fn writable_bytes_require_ordinary_unwatched_writable_pages() {
+        let mut memory = Memory::reserve(0x10000, 5 * PAGE_SIZE).unwrap();
+        memory.map(0x10000, 3 * PAGE_SIZE, READ | WRITE).unwrap();
+        memory
+            .writable_bytes(0x10ffe, 4)
+            .unwrap()
+            .copy_from_slice(&[1, 2, 3, 4]);
+        assert_eq!(memory.read(0x10ffe, 4).unwrap(), &[1, 2, 3, 4]);
+        assert!(memory.writable_bytes(0x12fff, 2).is_none(), "unmapped tail");
+        assert!(memory.writable_bytes(0xffff, 2).is_none());
+        memory.protect(0x11000, PAGE_SIZE, READ).unwrap();
+        assert!(
+            memory.writable_bytes(0x10ffe, 4).is_none(),
+            "read-only tail"
+        );
+        memory.watch_code(0x10010, 1);
+        assert!(
+            memory.writable_bytes(0x10020, 1).is_none(),
+            "whole watched page"
+        );
+        memory
+            .protect(0x12000, PAGE_SIZE, READ | WRITE | EXEC)
+            .unwrap();
+        memory.watch_code(0x12000, 1);
+        assert!(memory.writable_bytes(0x12000, 1).is_none(), "code");
+        memory
+            .map_file_pages(
+                0x13000,
+                &[crate::backend::FilePage::new([0; PAGE_SIZE])],
+                READ | WRITE,
+                false,
+            )
+            .unwrap();
+        assert!(memory.writable_bytes(0x13000, 1).is_none(), "file page");
+        memory.prepare_native_access(0x13000, 1, false).unwrap();
+        assert!(
+            memory.writable_bytes(0x13000, 1).is_none(),
+            "resident file page"
+        );
+        memory.map_shared_audio(0x14000, PAGE_SIZE).unwrap();
+        assert!(
+            memory.writable_bytes(0x14000, 1).is_none(),
+            "shared storage"
+        );
+    }
 
     // spec: EXEC-CORE-7
     #[test]

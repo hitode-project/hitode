@@ -1,5 +1,5 @@
 //! Host FreeType 2.13.2 behind Wine's i386 ABI. Only guest addresses enter
-//! the mirrors; faces and their memory-face input stay owned by this module.
+//! the mirrors; faces retain read-only file storage or owned memory-face input.
 //! Layouts follow the 2.13.2 public headers compiled for i386 (32-bit long
 //! and pointers, four-byte maximum alignment). The standalone raster uses
 //! i386 conic subdivision on every host; 64-bit FreeType's DDA differs in
@@ -11,7 +11,7 @@ use std::ffi::{CStr, CString};
 use std::mem::size_of;
 use std::ptr;
 
-use adv_cpu::backend::GuestExt;
+use adv_cpu::backend::{GuestExt, ReadOnlyFileView};
 use adv_machine::{Conv, Env, Outcome};
 use freetype_sys as ft;
 
@@ -148,13 +148,26 @@ struct Face {
     host: ft::FT_Face,
     library: u32,
     // FreeType borrows this allocation until FT_Done_Face.
-    _input: Option<Vec<u8>>,
+    _input: Option<Input>,
     charmaps: Vec<(u32, ft::FT_CharMap)>,
     tables: HashMap<u32, u32>,
     names: Vec<u32>,
     data: u32,
     capacity: usize,
 }
+enum Input {
+    File(ReadOnlyFileView),
+    Owned(Vec<u8>),
+}
+impl Input {
+    fn as_ptr(&self) -> *const u8 {
+        match self {
+            Self::File(view) => view.as_ptr(),
+            Self::Owned(bytes) => bytes.as_ptr(),
+        }
+    }
+}
+
 impl Drop for Face {
     fn drop(&mut self) {
         // SAFETY: this is the unique owner, including the input buffer.
@@ -314,15 +327,20 @@ fn new_face(env: &mut Env<'_>, memory: bool) -> Outcome {
     let mut host = ptr::null_mut();
     let mut input = None;
     let error;
-    // SAFETY: inputs are copied out of the guest, outputs are host handles.
+    // SAFETY: owned input or a retained file mapping stays alive with the face;
+    // outputs are host handles.
     unsafe {
         if memory {
             if (args[2] as i32) < 0 {
                 return Outcome::Return(ft::FT_Err_Invalid_Argument as u32);
             }
-            let bytes = match read(env, args[1], args[2] as usize) {
-                Ok(bytes) => bytes,
-                Err(e) => return Outcome::Fail(e),
+            let bytes = if let Some(view) = env.cpu.read_only_file_view(args[1], args[2] as usize) {
+                Input::File(view)
+            } else {
+                match read(env, args[1], args[2] as usize) {
+                    Ok(bytes) => Input::Owned(bytes),
+                    Err(e) => return Outcome::Fail(e),
+                }
             };
             error = ft::FT_New_Memory_Face(
                 host_library,

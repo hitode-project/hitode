@@ -287,6 +287,16 @@ impl Guest for View<'_> {
     fn shared_bytes(&self, addr: u32, len: usize) -> Option<&[u8]> {
         self.memory.read(addr, len).ok()
     }
+    fn writable_bytes(&mut self, addr: u32, len: usize) -> Option<&mut [u8]> {
+        self.memory.writable_bytes(addr, len)
+    }
+    fn read_only_file_view(
+        &self,
+        addr: u32,
+        len: usize,
+    ) -> Option<adv_cpu_core::backend::ReadOnlyFileView> {
+        self.memory.read_only_file_view(addr, len)
+    }
     fn map_shared_audio(&mut self, addr: u32, len: u32) -> Result<SharedRegion, MemFault> {
         let read_alias = self
             .memory
@@ -461,6 +471,16 @@ impl Guest for Cpu {
     }
     fn shared_bytes(&self, addr: u32, len: usize) -> Option<&[u8]> {
         self.inner.memory.read(addr, len).ok()
+    }
+    fn writable_bytes(&mut self, addr: u32, len: usize) -> Option<&mut [u8]> {
+        self.inner.memory.writable_bytes(addr, len)
+    }
+    fn read_only_file_view(
+        &self,
+        addr: u32,
+        len: usize,
+    ) -> Option<adv_cpu_core::backend::ReadOnlyFileView> {
+        self.inner.memory.read_only_file_view(addr, len)
     }
     fn reg(&self, r: Reg) -> u32 {
         get(&self.inner.state, r)

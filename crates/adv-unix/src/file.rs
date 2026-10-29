@@ -196,13 +196,19 @@ fn read(env: &mut Env<'_>) -> Outcome {
     let Some(fd) = descriptor(env, env.arg(0)) else {
         return fail(env, EBADF, u32::MAX);
     };
-    let mut bytes = vec![0u8; count as usize];
-    // SAFETY: bytes holds count bytes.
+    let mut fallback = None;
+    let bytes = match env.cpu.writable_bytes(buffer, count as usize) {
+        Some(bytes) => bytes,
+        None => fallback.insert(vec![0; count as usize]).as_mut_slice(),
+    };
+    // SAFETY: bytes holds count writable bytes.
     let read = unsafe { ::libc::read(fd, bytes.as_mut_ptr().cast(), bytes.len()) };
     if read < 0 {
         return fail(env, host_errno(), u32::MAX);
     }
-    match env.cpu.write(buffer, &bytes[..read as usize]) {
+    match fallback.as_ref().map_or(Ok(()), |bytes| {
+        env.cpu.write(buffer, &bytes[..read as usize])
+    }) {
         Ok(()) => Outcome::Return(read as u32),
         Err(_) => fail(env, 14 /* EFAULT */, u32::MAX),
     }

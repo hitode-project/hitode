@@ -127,10 +127,36 @@ fn alpha_blend(env: &mut Env<'_>) -> Option<u64> {
     if dest != src && !disjoint(dest, len, src, len) {
         return None;
     }
+    let size = u32::try_from(4 * len).ok()?;
+    dest.checked_add(size)?;
+    if !env.cpu.accessible(dest, size, Prot::RW) {
+        return None;
+    }
     let s = view(env.cpu, src, len, Prot::READ)?;
-    let mut d = view(env.cpu, dest, len, Prot::RW)?.into_owned();
+    // Equal input/output needs a snapshot; disjoint ordinary input can stay
+    // borrowed while only the destination bytes are mutated below.
+    let s = if src == dest {
+        Cow::Owned(s.into_owned())
+    } else {
+        s
+    };
+    let source = s.as_ptr();
+    let _owned_source = match s {
+        Cow::Owned(bytes) => Some(bytes),
+        _ => None,
+    };
+    let mut fallback = None;
+    let d = match env.cpu.writable_bytes(dest, 4 * len) {
+        Some(bytes) => bytes,
+        None => fallback
+            .insert(view(env.cpu, dest, len, Prot::RW)?.into_owned())
+            .as_mut_slice(),
+    };
+    // SAFETY: the input is either separately owned above or ordinary storage
+    // disjoint from the writable destination. No guest mappings change here.
+    let s = unsafe { std::slice::from_raw_parts(source, 4 * len) };
     let over = |d: &mut [u8], i: usize| {
-        let (from, to) = (pixel(d, i), pixel(&s, i));
+        let (from, to) = (pixel(d, i), pixel(s, i));
         let alpha = (to >> 24) as u16;
         let out = if alpha == 0xff {
             to
@@ -142,26 +168,27 @@ fn alpha_blend(env: &mut Env<'_>) -> Option<u64> {
     let mut i = 0;
     if len > 4 {
         if dest & 4 != 0 {
-            over(&mut d, 0);
+            over(d, 0);
             i = 1;
         }
         while i + 4 < len {
-            let to = pair(&s, i);
+            let to = pair(s, i);
             let alpha = [(to >> 24) as u16 & 0xff, (to >> 56) as u16];
             if alpha[0] & alpha[1] == 0xff {
-                set(&mut d, i, &to.to_le_bytes());
+                set(d, i, &to.to_le_bytes());
             } else if alpha[0] | alpha[1] != 0 {
-                let out = lerp(pair(&d, i), to, alpha);
-                set(&mut d, i, &out.to_le_bytes());
+                let out = lerp(pair(d, i), to, alpha);
+                set(d, i, &out.to_le_bytes());
             }
             i += 2;
         }
     }
     for i in i..len {
-        over(&mut d, i);
+        over(d, i);
     }
-    drop(s);
-    env.cpu.write(dest, &d).ok()?;
+    if let Some(bytes) = fallback {
+        env.cpu.write(dest, &bytes).ok()?;
+    }
     kept(env)
 }
 
@@ -178,20 +205,47 @@ fn ps_alpha_blend(env: &mut Env<'_>) -> Option<u64> {
     if (dest != src && !disjoint(dest, len, src, len)) || (src ^ (end - 1)) >> 31 != 0 {
         return None;
     }
+    let size = u32::try_from(4 * len).ok()?;
+    dest.checked_add(size)?;
+    if !env.cpu.accessible(dest, size, Prot::RW) {
+        return None;
+    }
     let s = view(env.cpu, src, len, Prot::READ)?;
-    let mut d = view(env.cpu, dest, len, Prot::RW)?.into_owned();
+    // Equal input/output needs a snapshot; disjoint ordinary input can stay
+    // borrowed while only the destination bytes are mutated below.
+    let s = if src == dest {
+        Cow::Owned(s.into_owned())
+    } else {
+        s
+    };
+    let source = s.as_ptr();
+    let _owned_source = match s {
+        Cow::Owned(bytes) => Some(bytes),
+        _ => None,
+    };
+    let mut fallback = None;
+    let d = match env.cpu.writable_bytes(dest, 4 * len) {
+        Some(bytes) => bytes,
+        None => fallback
+            .insert(view(env.cpu, dest, len, Prot::RW)?.into_owned())
+            .as_mut_slice(),
+    };
+    // SAFETY: the input is either separately owned above or ordinary storage
+    // disjoint from the writable destination. No guest mappings change here.
+    let s = unsafe { std::slice::from_raw_parts(source, 4 * len) };
     let alpha = |pair: u64| [(pair >> 25) as u16 & 0x7f, (pair >> 57) as u16];
     for i in (0..len - 1).step_by(2) {
-        let out = ps_lerp(pair(&d, i), pair(&s, i), alpha(pair(&s, i)));
-        set(&mut d, i, &out.to_le_bytes());
+        let out = ps_lerp(pair(d, i), pair(s, i), alpha(pair(s, i)));
+        set(d, i, &out.to_le_bytes());
     }
     if len % 2 == 1 {
-        let to = pixel(&s, len - 1).into();
-        let out = ps_lerp(pixel(&d, len - 1).into(), to, alpha(to)) as u32;
-        set(&mut d, len - 1, &out.to_le_bytes());
+        let to = pixel(s, len - 1).into();
+        let out = ps_lerp(pixel(d, len - 1).into(), to, alpha(to)) as u32;
+        set(d, len - 1, &out.to_le_bytes());
     }
-    drop(s);
-    env.cpu.write(dest, &d).ok()?;
+    if let Some(bytes) = fallback {
+        env.cpu.write(dest, &bytes).ok()?;
+    }
     kept(env)
 }
 
@@ -206,7 +260,11 @@ fn fill_argb(env: &mut Env<'_>) -> Option<u64> {
     if dest.checked_add(size).is_none() || !env.cpu.accessible(dest, size, Prot::WRITE) {
         return None;
     }
-    env.cpu.write(dest, &value.to_le_bytes().repeat(len)).ok()?;
+    if let Some(bytes) = env.cpu.writable_bytes(dest, size as usize) {
+        bytes.as_chunks_mut::<4>().0.fill(value.to_le_bytes());
+    } else {
+        env.cpu.write(dest, &value.to_le_bytes().repeat(len)).ok()?;
+    }
     Some(u64::from(env.cpu.reg(Reg::Edx)) << 32 | u64::from(value))
 }
 
@@ -238,26 +296,48 @@ fn interp_stretch_copy(env: &mut Env<'_>) -> Option<u64> {
     }
     let s1 = view(env.cpu, row1, span, Prot::READ)?;
     let s2 = view(env.cpu, row2, span, Prot::READ)?;
+    let (p1, p2) = (s1.as_ptr(), s2.as_ptr());
+    let _owned1 = match s1 {
+        Cow::Owned(bytes) => Some(bytes),
+        _ => None,
+    };
+    let _owned2 = match s2 {
+        Cow::Owned(bytes) => Some(bytes),
+        _ => None,
+    };
+    let mut fallback = None;
+    let d = match env.cpu.writable_bytes(dest, 4 * len) {
+        Some(bytes) => bytes,
+        None => fallback.insert(vec![0; 4 * len]).as_mut_slice(),
+    };
+    // SAFETY: both inputs are separately owned or ordinary storage disjoint
+    // from the output, and no mapping changes occur during this computation.
+    let (s1, s2) = unsafe {
+        (
+            std::slice::from_raw_parts(p1, 4 * span),
+            std::slice::from_raw_parts(p2, 4 * span),
+        )
+    };
     let factor = blend_y.wrapping_add(blend_y >> 7) as u16;
     // Pixel `i`'s rows, top then bottom, from both rows' pairs at its position.
     let rows = |i: usize| {
         let (at, f) = (((x(i) >> 16) - first) as usize, (x(i) >> 8 & 0xff) as u16);
-        let (top, bottom) = (pair(&s1, at), pair(&s2, at));
+        let (top, bottom) = (pair(s1, at), pair(s2, at));
         lerp(join(top, bottom), join(top >> 32, bottom >> 32), [f; 2])
     };
-    let mut d = vec![0; 4 * len];
     for i in (0..len - 1).step_by(2) {
         let (a, b) = (rows(i), rows(i + 1));
         let out = lerp(join(a, b), join(a >> 32, b >> 32), [factor; 2]);
-        set(&mut d, i, &out.to_le_bytes());
+        set(d, i, &out.to_le_bytes());
     }
     if len % 2 == 1 {
         let a = rows(len - 1);
         let out = lerp(a & 0xffff_ffff, a >> 32, [factor, 0]) as u32;
-        set(&mut d, len - 1, &out.to_le_bytes());
+        set(d, len - 1, &out.to_le_bytes());
     }
-    drop((s1, s2));
-    env.cpu.write(dest, &d).ok()?;
+    if let Some(bytes) = fallback {
+        env.cpu.write(dest, &bytes).ok()?;
+    }
     kept(env)
 }
 
