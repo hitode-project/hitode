@@ -2,7 +2,7 @@
 //!
 //! A run is a stretch of x87 instructions without a head after the first,
 //! and the integer instructions between them that do not observe x87
-//! state: no helper, checked or segment access, stack operation or
+//! state: no instruction helper, segment access, stack operation or
 //! transfer other than a forward jcc. A
 //! merge inside it is reached only from the run, by arrivals that agree on
 //! which slots hold values; there every value moves to the host register
@@ -19,6 +19,8 @@
 //! of the last instruction that records them. Before integer instructions
 //! the status word with TOP goes to `CpuState` and the guest flags back to
 //! NZCV; the next x87 instruction reloads both.
+//! Across an access, x0-x3 hold no run state; guest flags in x4 pass through
+//! NZCV for checked accesses, as outside runs.
 //!
 //! The run publishes at its end, at a jcc leaving it, and before
 //! anything that observes `CpuState`: an instruction whose fast path does
@@ -410,25 +412,16 @@ impl Translator<'_> {
     fn cacheable(&self, index: usize) -> Option<X87> {
         let inst = self.trace.insts[index];
         match inst.op {
-            Op::X87(x)
-                if !matches!(x.fast, Fast::Examine | Fast::Round | Fast::Scale)
-                    && !(x.mem.is_some() && (self.checked)(inst.pc)) =>
-            {
-                Some(x)
-            }
+            Op::X87(x) if !matches!(x.fast, Fast::Examine | Fast::Round | Fast::Scale) => Some(x),
             _ => None,
         }
     }
 
     /// Whether the integer instruction at `index` may sit inside a run:
-    /// it neither faults nor observes x87 state, and leaves only through
+    /// it does not observe x87 state, and leaves only through
     /// a jcc out of the trace.
     fn joins(&self, index: usize) -> bool {
         let inst = self.trace.insts[index];
-        // A checked access may call a helper, which keeps no vector register.
-        if inst.effects.site && (self.checked)(inst.pc) {
-            return false;
-        }
         let register = |src: Src| !matches!(src, Src::Mem(mem) if mem.fs);
         match inst.op {
             Op::Integer(super::super::integer::Integer::Sahf)
@@ -1191,6 +1184,7 @@ impl Translator<'_> {
             model: self.x87.before,
             saved: self.x87.saved,
             suspended: self.x87.suspended,
+            checked: self.checking,
         });
     }
 
@@ -1203,12 +1197,16 @@ impl Translator<'_> {
         model: Model,
         saved: bool,
         suspended: bool,
+        checked: bool,
     ) {
         self.asm.bind(label);
         self.remark(Part::X87Publish);
+        // Checked accesses use x4 as scratch, leaving the guest flags in NZCV.
+        if suspended || checked {
+            self.emit(mrs_nzcv(X4));
+        }
         if suspended {
             self.emit_all(&[
-                mrs_nzcv(X4),
                 ldr(X, X5, RUNTIME, runtime::CPU_STATE),
                 ldrh(X13, X5, runtime::X87_STATUS),
                 ubfx(W, X15, X13, 11, 3),

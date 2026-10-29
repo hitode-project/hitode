@@ -357,7 +357,8 @@ unsafe extern "C" fn dispatch(runtime: *mut Runtime, eip: u32, point: usize) -> 
 /// Called by the `access` stub for a checked access of `kind` the window
 /// cannot take: performs it as the interpreter would, returning a scalar
 /// or transferring a vector through `Runtime::access_vector`. Refusal records
-/// `site` as faulting and sets bit 32. Stores to
+/// `site` as faulting, supplies its publication continuation in
+/// `Runtime::access_resume` and sets bit 32. Stores to
 /// code are refused too, so the interpreter invalidates the code.
 unsafe extern "C" fn access(
     runtime: *mut Runtime,
@@ -407,6 +408,15 @@ unsafe extern "C" fn access(
         None => {
             native.diagnostics.refused += 1;
             native.faults.pc.set(site);
+            let resume = native.faults.site(site).map_or(0, |site| site.resume);
+            // SAFETY: the runtime is live and translated code is in this helper.
+            unsafe {
+                (*runtime).access_resume = if resume != 0 {
+                    site.wrapping_add_signed(resume as isize) as u64
+                } else {
+                    0
+                };
+            }
             1 << 32
         }
     }
