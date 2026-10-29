@@ -33,6 +33,13 @@ pub enum Part {
     X87Wide,
     /// An SSE operation from clearing FPSR to reading its exceptions back.
     FpStatus,
+    /// Dirty MMX and XMM registers written back to `CpuState` (A64-REG-5).
+    SimdPublish,
+    /// Registers an arrival loads for its merge's entry (A64-REG-5).
+    SimdLoad,
+    /// The x87 and MXCSR checks before MMX and SSE instructions (A64F-FP-4,
+    /// A64F-FP-5).
+    SimdGuard,
 }
 
 /// Where a stretch starts: byte offset in the unit, guest instruction.
