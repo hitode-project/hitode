@@ -1,7 +1,8 @@
 /* The window probe: GDI paints a visible window in WM_PAINT, and the window
  * is read back through its DC. On Hitode the window surface is what the host
- * presents. It exits with 0 only when the text inked the window and the rest
- * kept the fill.
+ * presents. Showing the window activates the application, so it and a hidden
+ * top-level window each receive WM_ACTIVATEAPP. It exits with 0 only when the
+ * text inked the window and the rest kept the fill.
  * Build: i686-w64-mingw32-gcc -O1 -o window.exe window.c -lgdi32 */
 #include <windows.h>
 #include <stdio.h>
@@ -11,10 +12,11 @@
 #define WHITE 0xffffff
 #define BLUE 0x0000ff
 
-static int painted;
+static int painted, activated;
 
 static LRESULT CALLBACK procedure(HWND window, UINT message, WPARAM wparam, LPARAM lparam)
 {
+    if (message == WM_ACTIVATEAPP && wparam) activated++;
     if (message == WM_PAINT)
     {
         PAINTSTRUCT paint;
@@ -40,7 +42,7 @@ int main(void)
 {
     WNDCLASSW class = {0};
     BITMAPINFO info = {{sizeof(info.bmiHeader), WIDTH, -HEIGHT, 1, 32, BI_RGB}};
-    HWND window;
+    HWND hidden, window;
     HDC dc, memory;
     HBITMAP bitmap;
     DWORD *bits, end;
@@ -51,6 +53,9 @@ int main(void)
     class.hInstance = GetModuleHandleW(NULL);
     class.lpszClassName = L"probe";
     if (!RegisterClassW(&class)) return 2;
+    hidden = CreateWindowExW(0, L"probe", L"hidden", WS_POPUP, 0, 0, 0, 0, NULL, NULL,
+                             class.hInstance, NULL);
+    if (!hidden) return 3;
     window = CreateWindowExW(0, L"probe", L"probe", WS_POPUP | WS_VISIBLE, 0, 0, WIDTH, HEIGHT,
                              NULL, NULL, class.hInstance, NULL);
     if (!window) return 3;
@@ -75,8 +80,10 @@ int main(void)
     DeleteObject(bitmap);
     ReleaseDC(window, dc);
     DestroyWindow(window);
+    DestroyWindow(hidden);
 
-    printf("painted=%d inked=%d background=%d other=%d\n", painted, inked, background, other);
+    printf("painted=%d inked=%d background=%d other=%d activated=%d\n", painted, inked, background,
+           other, activated);
     fflush(stdout);
     return !(painted && inked > 0 && background + inked == WIDTH * HEIGHT);
 }

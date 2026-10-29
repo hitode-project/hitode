@@ -65,7 +65,7 @@ fn gdi_painting_a_window_reaches_the_presenter() {
     // The same line as the probe prints on Wine.
     assert_eq!(
         output.lines().collect::<Vec<_>>(),
-        ["painted=1 inked=43 background=2005 other=0"]
+        ["painted=1 inked=43 background=2005 other=0 activated=2"]
     );
     let (size, frames, inked, background) = presented.unwrap();
     assert!(frames >= 1, "no frame was presented");

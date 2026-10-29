@@ -41,6 +41,7 @@ const SURFACE_FUNCS: u32 = 1024;
 /// Rectangles in `struct window_rects`: window, client, visible.
 const CLIENT_RECT: u32 = 16;
 const VISIBLE_RECT: u32 = 32;
+const SWP_NOACTIVATE: u32 = 0x10;
 const SWP_SHOWWINDOW: u32 = 0x40;
 const SWP_HIDEWINDOW: u32 = 0x80;
 const DESKTOP_CLASS_ATOM: u32 = 32769;
@@ -221,6 +222,9 @@ fn is_desktop(env: &Env<'_>, hwnd: u32) -> bool {
 /// Explorer's desktop startup, on the thread that asked for the desktop:
 /// create the desktop and message windows, then show the desktop over the
 /// virtual screen. The thread owns them as explorer's desktop thread would.
+/// Explorer's desktop is never this thread's active window, so showing it does
+/// not activate it: the first window the process activates then receives
+/// WM_ACTIVATEAPP, as it would coming from explorer's thread.
 pub(super) fn start_desktop(env: &mut Env<'_>, then: Started) -> Outcome {
     let exports = module_base(env.cpu, env.sys.peb, "user32.dll").and_then(|base| {
         let export = |name| module_export(env.cpu, base, name);
@@ -264,7 +268,7 @@ pub(super) fn start_desktop(env: &mut Env<'_>, then: Started) -> Outcome {
                         top as u32,
                         width,
                         height,
-                        SWP_SHOWWINDOW,
+                        SWP_SHOWWINDOW | SWP_NOACTIVATE,
                     ];
                     Outcome::call(position, args, move |env, _| then(env))
                 },
