@@ -123,3 +123,63 @@ fn x87_arithmetic_and_compares_take_full_significands_under_every_control() {
         }
     }
 }
+
+// spec: A64-MEM-7
+#[test]
+fn checked_x87_accesses_complete_and_refuse_without_instruction_helpers() {
+    let forms: [fn(&mut CodeAssembler); 16] = [
+        |a| a.fld(dword_ptr(eax)).unwrap(),
+        |a| a.fld(qword_ptr(eax)).unwrap(),
+        |a| a.fild(word_ptr(eax)).unwrap(),
+        |a| a.fild(dword_ptr(eax)).unwrap(),
+        |a| a.fild(qword_ptr(eax)).unwrap(),
+        |a| a.fstp(dword_ptr(eax)).unwrap(),
+        |a| a.fst(qword_ptr(eax)).unwrap(),
+        |a| a.fistp(dword_ptr(eax)).unwrap(),
+        |a| a.fistp(qword_ptr(eax)).unwrap(),
+        |a| a.fadd(qword_ptr(eax)).unwrap(),
+        |a| a.fmul(dword_ptr(eax)).unwrap(),
+        |a| a.fiadd(dword_ptr(eax)).unwrap(),
+        |a| a.fcomp(qword_ptr(eax)).unwrap(),
+        |a| a.fldcw(word_ptr(eax)).unwrap(),
+        |a| a.fnstcw(word_ptr(eax)).unwrap(),
+        |a| a.fnstsw(word_ptr(eax)).unwrap(),
+    ];
+    for (n, form) in forms.into_iter().enumerate() {
+        for address in [DATA + 128, DATA + 4096 - 2, HOLE] {
+            let mut program = fixture(|a| {
+                // Lazy flags stay live across the access.
+                a.add(edx, 17).unwrap();
+                a.mov(eax, address).unwrap();
+                form(a);
+                a.adc(edx, 0).unwrap();
+            });
+            // Normals as binary32 and binary64, and a control word that
+            // masks every exception.
+            if address != HOLE {
+                let at = (address - DATA) as usize;
+                program.data[at..at + 8].copy_from_slice(&0x3ff0_0000_3f80_027fu64.to_le_bytes());
+            }
+            program
+                .state
+                .x87
+                .push(X87Register::from_parts(3 << 62, 0x3fff));
+            program
+                .state
+                .x87
+                .push(X87Register::from_parts(1 << 63, 0x4000));
+            for flagm in [false, true] {
+                let config = (Features { flagm }, false, Checks::Slow);
+                let mut native = executor(&program, config, false);
+                let mut oracle = executor(&program, config, true);
+                let outcome = native.run(program.stop, 100).unwrap();
+                assert_eq!(outcome, oracle.run(program.stop, 100).unwrap(), "form {n}");
+                same(&native, &oracle);
+                let diagnostics = &native.native.as_ref().unwrap().diagnostics;
+                assert!(diagnostics.accesses > 0, "form {n} uses access");
+                assert_eq!(diagnostics.helpers, 0, "form {n} avoids interpret");
+                assert_eq!(diagnostics.refused, u64::from(address == HOLE), "form {n}");
+            }
+        }
+    }
+}
