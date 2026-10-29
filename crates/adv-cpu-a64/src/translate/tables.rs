@@ -67,6 +67,7 @@ pub(super) fn prepare(work: &mut Unit, memory: &Memory) {
             base: None,
             index: Some(reg),
             scale: 4,
+            address_bits: 32,
             disp,
             fs: false,
         })) = work.trace.insts[i].op

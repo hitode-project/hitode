@@ -1,6 +1,5 @@
-//! Integer instructions outside the lazy flag forms: rotates through
-//! carry, exchanges, the widening multiply and divide, bit scans, byte
-//! swaps and `sahf`.
+//! Integer instructions outside the lazy flag forms, including partial
+//! registers, bit strings, widening arithmetic and exchanges.
 //!
 //! A divide whose divisor is zero or whose quotient does not fit leaves
 //! the work, and the #DE, to the `interpret` helper.
@@ -13,12 +12,16 @@ use crate::encode::Shift::{Lsl, Lsr};
 use crate::encode::Size::{W, X};
 use crate::encode::*;
 
-use super::decode::{Mem, Part, ShiftKind, Src, memory};
+use super::decode::{Mem, Part, ShiftKind, Src, memory, memory_sized};
 use super::flags::FlagSet;
 use super::{
     Carry, Operand, Recipe, Sense, State, Translator, X6, X10, X11, X13, X14, X15, X16, X17,
     biased, host, temp,
 };
+
+// Partial-width forms canonicalize before borrowing the recipe temporaries.
+const X7: Reg = Reg::new(7);
+const X8: Reg = Reg::new(8);
 
 const EAX: u8 = 0;
 const ECX: u8 = 1;
@@ -46,6 +49,20 @@ pub enum Integer {
     Divide(Src, bool, u8),
     Sahf,
     TestBit(Src, u8),
+    Bit(M, Part, Part, u8),
+    Product(Part, Option<(Part, Option<u32>)>, bool, u8),
+    Quotient(Part, bool, u8, u8),
+    Exchange(M, Part, u8, u8),
+    Cwd,
+    MemoryNeg(Part, u8),
+    Set(iced_x86::ConditionCode, Part),
+    Cmov(iced_x86::ConditionCode, Part, Part, u8),
+    Extend(Part, Part, u8, u8, bool),
+    Complement(Part, u8),
+    ClearWord(u8),
+    Touch(Mem),
+    Xlat(Mem),
+    CarryFlag(M),
 }
 
 impl Integer {
@@ -54,6 +71,28 @@ impl Integer {
         use FlagSet as F;
         let mem = |src: Src| matches!(src, Src::Mem(_));
         match self {
+            Integer::Bit(_, dst, _, _) => (F::NONE, F::CF, matches!(dst, Part::Mem(_))),
+            Integer::Product(src, other, _, _) => (
+                F::NONE,
+                F::CF.or(F::OF),
+                matches!(src, Part::Mem(_)) || matches!(other, Some((Part::Mem(_), _))),
+            ),
+            Integer::Quotient(..) => (F::NONE, F::NONE, true),
+            Integer::Exchange(kind, dst, _, _) => (
+                F::NONE,
+                if kind == M::Xchg { F::NONE } else { F::ALL },
+                matches!(dst, Part::Mem(_)),
+            ),
+            Integer::MemoryNeg(_, _) => (F::NONE, F::ALL, true),
+            Integer::Set(cc, dst) => (F::of(cc), F::NONE, matches!(dst, Part::Mem(_))),
+            Integer::Cmov(cc, _, src, _) => (F::of(cc), F::NONE, matches!(src, Part::Mem(_))),
+            Integer::Extend(_, src, _, _, _) => (F::NONE, F::NONE, matches!(src, Part::Mem(_))),
+            Integer::Cwd | Integer::ClearWord(_) => (F::NONE, F::NONE, false),
+            Integer::Complement(dst, _) => (F::NONE, F::NONE, matches!(dst, Part::Mem(_))),
+            Integer::Touch(_) | Integer::Xlat(_) => (F::NONE, F::NONE, true),
+            Integer::CarryFlag(kind) => {
+                (if kind == M::Cmc { F::CF } else { F::NONE }, F::CF, false)
+            }
             Integer::NarrowNeg(..) => (F::NONE, F::ALL, false),
             Integer::NarrowShift(kind, _, width, count) => {
                 let mut writes = F::PF.or(F::ZF).or(F::SF);
@@ -107,13 +146,134 @@ pub fn plan(instruction: &Instruction, helper: u8) -> Option<Integer> {
     let mnemonic = instruction.mnemonic();
     // Locked exchanges are ordinary ones: guest threads take turns.
     if instruction.has_lock_prefix()
-        && !(matches!(mnemonic, M::Xadd | M::Xchg | M::Cmpxchg | M::Cmpxchg8b)
-            && instruction.op_kind(0) == OpKind::Memory)
+        && !(matches!(
+            mnemonic,
+            M::Xadd
+                | M::Xchg
+                | M::Cmpxchg
+                | M::Cmpxchg8b
+                | M::Bts
+                | M::Btr
+                | M::Btc
+                | M::Not
+                | M::Neg
+        ) && instruction.op_kind(0) == OpKind::Memory)
     {
         return None;
     }
     if mnemonic == M::Cmpxchg8b && instruction.op0_kind() == OpKind::Memory {
         return Some(Integer::CompareExchange8(memory(instruction)?, helper));
+    }
+    let width = match instruction.op0_kind() {
+        OpKind::Register => instruction.op0_register().size() as u8,
+        OpKind::Memory => instruction.memory_size().size() as u8,
+        _ => 0,
+    };
+    let part = |n| {
+        if instruction.op_kind(n) == OpKind::Memory {
+            memory_sized(instruction).map(Part::Mem)
+        } else {
+            super::decode::part(instruction, n, width)
+        }
+    };
+    if mnemonic == M::Neg && instruction.op0_kind() == OpKind::Memory {
+        return Some(Integer::MemoryNeg(part(0)?, width));
+    }
+    let cc = instruction.condition_code();
+    if cc != iced_x86::ConditionCode::None {
+        return if instruction.op_count() == 1 {
+            Some(Integer::Set(cc, part(0)?))
+        } else {
+            Some(Integer::Cmov(cc, part(0)?, part(1)?, width))
+        };
+    }
+    if matches!(mnemonic, M::Movsx | M::Movzx)
+        && (width == 2
+            || instruction.op1_kind() == OpKind::Memory
+                && memory_sized(instruction).is_some_and(|m| m.address_bits == 16))
+    {
+        let source_width = if instruction.op1_kind() == OpKind::Memory {
+            instruction.memory_size().size() as u8
+        } else {
+            instruction.op1_register().size() as u8
+        };
+        return Some(Integer::Extend(
+            part(0)?,
+            if instruction.op1_kind() == OpKind::Memory {
+                Part::Mem(memory_sized(instruction)?)
+            } else {
+                super::decode::part(instruction, 1, source_width)?
+            },
+            source_width,
+            width,
+            mnemonic == M::Movsx,
+        ));
+    }
+    if mnemonic == M::Not && (width != 4 || instruction.op0_kind() == OpKind::Memory) {
+        return Some(Integer::Complement(part(0)?, width));
+    }
+    if mnemonic == M::Bswap && width == 2 {
+        let Part::Reg(index) = part(0)? else {
+            return None;
+        };
+        return Some(Integer::ClearWord(index));
+    }
+    if mnemonic == M::Clflush {
+        return Some(Integer::Touch(memory_sized(instruction)?));
+    }
+    if mnemonic == M::Xlatb {
+        let mut address = *instruction;
+        address.set_memory_index(iced_x86::Register::None);
+        return Some(Integer::Xlat(memory_sized(&address)?));
+    }
+    if matches!(mnemonic, M::Bt | M::Bts | M::Btr | M::Btc)
+        && matches!(width, 2 | 4)
+        && !(mnemonic == M::Bt
+            && width == 4
+            && instruction.op1_kind() == OpKind::Immediate8
+            && operand(0).is_some())
+    {
+        return Some(Integer::Bit(mnemonic, part(0)?, part(1)?, width));
+    }
+    if matches!(width, 1 | 2)
+        || width == 4
+            && (operand(0).is_none()
+                || matches!(mnemonic, M::Xchg | M::Xadd | M::Cmpxchg) && register(1).is_none()
+                || mnemonic == M::Imul
+                    && instruction.op_count() > 1
+                    && instruction.op1_kind() == OpKind::Memory
+                    && memory_sized(instruction).is_some_and(|m| m.address_bits == 16))
+    {
+        if matches!(mnemonic, M::Mul | M::Imul) {
+            let other = if instruction.op_count() == 1 {
+                None
+            } else {
+                Some((
+                    part(1)?,
+                    (instruction.op_count() == 3).then(|| instruction.immediate(2) as u32),
+                ))
+            };
+            return Some(Integer::Product(
+                part(0)?,
+                other,
+                mnemonic == M::Imul,
+                width,
+            ));
+        }
+        if matches!(mnemonic, M::Div | M::Idiv) {
+            return Some(Integer::Quotient(
+                part(0)?,
+                mnemonic == M::Idiv,
+                width,
+                helper,
+            ));
+        }
+        if matches!(mnemonic, M::Xchg | M::Xadd | M::Cmpxchg) {
+            let Part::Reg(src) = part(1)? else {
+                return None;
+            };
+            return Some(Integer::Exchange(mnemonic, part(0)?, src, width));
+        }
     }
     let dst = instruction.op0_register();
     if instruction.op0_kind() == OpKind::Register && (dst.is_gpr8() || dst.is_gpr16()) {
@@ -139,6 +299,8 @@ pub fn plan(instruction: &Instruction, helper: u8) -> Option<Integer> {
     }
     Some(match mnemonic {
         M::Cbw => Integer::Cbw,
+        M::Cwd => Integer::Cwd,
+        M::Clc | M::Stc | M::Cmc => Integer::CarryFlag(mnemonic),
         M::Bsf | M::Bsr | M::Tzcnt | M::Lzcnt => {
             let dst = instruction.op0_register();
             let width = if dst.is_gpr16() {
@@ -177,7 +339,7 @@ pub fn plan(instruction: &Instruction, helper: u8) -> Option<Integer> {
         M::Xadd => Integer::Xadd(operand(0)?, register(1)?),
         M::Xchg => Integer::Xchg(operand(0)?, register(1)?),
         M::Cmpxchg => Integer::CompareExchange(operand(0)?, register(1)?, helper),
-        M::Bswap => Integer::Bswap(register(0)?),
+        M::Bswap => Integer::Bswap(instruction.op0_register().number() as u8),
         M::Mul | M::Imul if instruction.op_count() == 1 => {
             Integer::Multiply(operand(0)?, mnemonic == M::Imul)
         }
@@ -193,6 +355,107 @@ pub fn plan(instruction: &Instruction, helper: u8) -> Option<Integer> {
 impl Translator<'_> {
     pub(super) fn integer(&mut self, op: Integer) {
         match op {
+            Integer::Bit(kind, dst, index, width) => self.bit(kind, dst, index, width),
+            Integer::Product(dst, other, signed, width) => self.product(dst, other, signed, width),
+            Integer::Quotient(src, signed, width, helper) => {
+                self.quotient(src, signed, width, helper)
+            }
+            Integer::Exchange(kind, dst, src, width) => self.exchange(kind, dst, src, width),
+            Integer::MemoryNeg(dst, width) => {
+                self.canonicalize();
+                let address = self.part_address(dst);
+                self.narrow_read(dst, width, address, X13);
+                self.emit(sub(W, X6, Reg::ZR, X13, Lsl, 0));
+                self.narrow_write(dst, width, address, X6);
+                self.emit_all(&[
+                    mov(W, X10, X6),
+                    eor(W, X11, X13, X6, Lsl, 0),
+                    lsl_imm(W, X13, X13, 32 - 8 * u32::from(width)),
+                    subs(W, Reg::ZR, Reg::ZR, X13, Lsl, 0),
+                ]);
+                self.state = State::CANONICAL;
+            }
+            Integer::Set(cc, dst) => {
+                self.canonicalize();
+                self.set_value(cc);
+                let address = self.part_address(dst);
+                self.narrow_write(dst, 1, address, X6);
+            }
+            Integer::Cmov(cc, dst, src, width) => {
+                self.canonicalize();
+                let address = self.part_address(src);
+                self.narrow_read(dst, width, Reg::ZR, X7);
+                self.narrow_read(src, width, address, X8);
+                if matches!(cc, iced_x86::ConditionCode::p | iced_x86::ConditionCode::np) {
+                    self.set_value(cc);
+                    let done = self.asm.label();
+                    self.asm.cbz(W, false, X6, done);
+                    self.narrow_write(dst, width, Reg::ZR, X8);
+                    self.asm.bind(done);
+                } else {
+                    let cond = self.condition(cc);
+                    self.emit(csel(W, X6, X8, X7, cond));
+                    self.narrow_write(dst, width, Reg::ZR, X6);
+                }
+            }
+            Integer::Extend(dst, src, width, destination_width, signed) => {
+                let address = self.part_address(src);
+                self.narrow_read(src, width, address, X6);
+                if signed {
+                    self.emit(sbfx(W, X6, X6, 0, 8 * u32::from(width)));
+                }
+                self.narrow_write(dst, destination_width, Reg::ZR, X6);
+            }
+            Integer::Complement(dst, width) => {
+                self.canonicalize();
+                let address = self.part_address(dst);
+                self.narrow_read(dst, width, address, X6);
+                self.emit(mvn(W, X6, X6));
+                self.narrow_write(dst, width, address, X6);
+            }
+            Integer::ClearWord(dst) => {
+                self.emit(movz(W, X6, 0, 0));
+                self.narrow_write(Part::Reg(dst), 2, Reg::ZR, X6);
+            }
+            Integer::Xlat(mem) => {
+                let address = self.flat(mem);
+                self.emit_all(&[
+                    and_imm(W, X13, host(EAX), 255),
+                    add(W, X16, address, X13, Lsl, 0),
+                ]);
+                let address = self.finish_address(mem, X16);
+                self.access(
+                    super::access::Addr::Window(address),
+                    1,
+                    super::access::Dir::Load,
+                    X6,
+                );
+                self.narrow_write(Part::Reg(EAX), 1, Reg::ZR, X6);
+            }
+            Integer::Touch(mem) => {
+                let address = self.effective(mem);
+                self.access(
+                    super::access::Addr::Window(address),
+                    1,
+                    super::access::Dir::Load,
+                    X6,
+                );
+            }
+            Integer::Cwd => {
+                self.canonicalize();
+                self.emit(sbfx(W, X6, host(EAX), 15, 1));
+                self.narrow_write(Part::Reg(EDX), 2, Reg::ZR, X6);
+            }
+            Integer::CarryFlag(kind) => {
+                self.canonicalize();
+                self.emit(mrs_nzcv(X13));
+                self.emit(match kind {
+                    M::Clc => orr_imm(X, X13, X13, 1 << 29),
+                    M::Stc => and_imm(X, X13, X13, !(1 << 29)),
+                    _ => eor_imm(X, X13, X13, 1 << 29),
+                });
+                self.emit(msr_nzcv(X13));
+            }
             Integer::NarrowNeg(dst, width) => {
                 self.canonicalize();
                 self.narrow_read(Part::Reg(dst), width, Reg::ZR, X13);
@@ -221,7 +484,12 @@ impl Translator<'_> {
             }
             Integer::Bswap(index) => {
                 self.clobber(Operand::Guest(index));
-                self.emit(rev(W, host(index), host(index)));
+                if biased(index) {
+                    self.emit(rev(W, super::ops::result(index), host(index)));
+                    self.commit(index);
+                } else {
+                    self.emit(rev(W, host(index), host(index)));
+                }
             }
             Integer::Multiply(src, signed) => self.multiply(src, signed),
             Integer::Divide(src, signed, helper) => self.divide(src, signed, helper),
@@ -235,6 +503,213 @@ impl Translator<'_> {
                 self.state.derivable = None;
             }
         }
+    }
+
+    fn set_value(&mut self, cc: iced_x86::ConditionCode) {
+        if matches!(cc, iced_x86::ConditionCode::p | iced_x86::ConditionCode::np) {
+            self.emit_all(&[
+                eor(W, X6, X10, X10, Lsr, 4),
+                eor(W, X6, X6, X6, Lsr, 2),
+                eor(W, X6, X6, X6, Lsr, 1),
+                ubfx(W, X6, X6, 0, 1),
+            ]);
+            if cc == iced_x86::ConditionCode::p {
+                self.emit(eor_imm(W, X6, X6, 1));
+            }
+        } else {
+            let cond = self.condition(cc);
+            self.emit(cset(W, X6, cond));
+        }
+    }
+
+    fn part_address(&mut self, part: Part) -> Reg {
+        match part {
+            Part::Mem(mem) => self.effective(mem),
+            _ => Reg::ZR,
+        }
+    }
+
+    fn bit(&mut self, kind: M, dst: Part, index: Part, width: u8) {
+        self.canonicalize();
+        let bits = 8 * u32::from(width);
+        self.narrow_read(index, width, Reg::ZR, X8);
+        let address = self.part_address(dst);
+        if matches!(dst, Part::Mem(_)) && matches!(index, Part::Reg(_)) {
+            self.emit_all(&[
+                sbfx(W, X14, X8, 0, bits),
+                asr_imm(W, X14, X14, bits.trailing_zeros()),
+                add(W, X16, address, X14, Lsl, u32::from(width).trailing_zeros()),
+            ]);
+        } else if address != Reg::ZR {
+            self.emit(mov(W, X16, address));
+        }
+        self.narrow_read(dst, width, X16, X7);
+        self.emit_all(&[
+            and_imm(W, X8, X8, u64::from(bits - 1)),
+            shiftv(W, Lsr, X14, X7, X8),
+        ]);
+        if kind != M::Bt {
+            self.emit_all(&[movz(W, X6, 1, 0), shiftv(W, Lsl, X6, X6, X8)]);
+            self.emit(match kind {
+                M::Bts => orr(W, X6, X7, X6, Lsl, 0),
+                M::Btr => bic(W, X6, X7, X6, Lsl, 0),
+                _ => eor(W, X6, X7, X6, Lsl, 0),
+            });
+            self.narrow_write(dst, width, X16, X6);
+        }
+        self.insert_flags(Some((X14, 0)), None);
+        self.state.sense = Sense::Addition;
+        self.state.carry = Carry::Host;
+        self.state.derivable = None;
+    }
+
+    fn product(&mut self, dst: Part, other: Option<(Part, Option<u32>)>, signed: bool, width: u8) {
+        self.canonicalize();
+        let source = other.map_or(dst, |(src, _)| src);
+        let address = self.part_address(source);
+        self.narrow_read(source, width, address, X8);
+        match other {
+            Some((_, Some(imm))) => self.mov_imm(X7, imm),
+            Some((_, None)) => self.narrow_read(dst, width, Reg::ZR, X7),
+            None => self.narrow_read(Part::Reg(EAX), width, Reg::ZR, X7),
+        }
+        let bits = 8 * u32::from(width);
+        if signed {
+            self.emit_all(&[sbfx(W, X7, X7, 0, bits), sbfx(W, X8, X8, 0, bits)]);
+        }
+        self.emit(if signed {
+            smull(X6, X7, X8)
+        } else {
+            umull(X6, X7, X8)
+        });
+        self.emit(if signed {
+            sbfx(X, X14, X6, 0, bits)
+        } else {
+            ubfx(X, X14, X6, 0, bits)
+        });
+        self.emit_all(&[
+            eor(X, X14, X14, X6, Lsl, 0),
+            clz(X, X14, X14),
+            eor_imm(W, X14, X14, 64),
+            mov(W, X8, X14),
+        ]);
+        if other.is_some() {
+            self.narrow_write(dst, width, Reg::ZR, X6);
+        } else if width == 1 {
+            self.narrow_write(Part::Reg(EAX), 2, Reg::ZR, X6);
+        } else {
+            self.narrow_write(Part::Reg(EAX), width, Reg::ZR, X6);
+            self.emit(lsr_imm(X, X6, X6, bits));
+            self.narrow_write(Part::Reg(EDX), width, Reg::ZR, X6);
+        }
+        self.insert_flags(Some((X8, 6)), Some((X8, 6)));
+        self.state.overflow = super::Overflow::Host;
+        self.state.sense = Sense::Addition;
+        self.state.carry = Carry::Host;
+        self.state.derivable = None;
+    }
+
+    fn quotient(&mut self, src: Part, signed: bool, width: u8, helper: u8) {
+        self.flush_simd();
+        self.canonicalize();
+        let address = self.part_address(src);
+        self.narrow_read(src, width, address, X8);
+        let (slow, done) = (self.asm.label(), self.asm.label());
+        self.asm.cbz(W, false, X8, slow);
+        let bits = 8 * u32::from(width);
+        if width == 1 {
+            self.emit(ubfx(W, X7, host(EAX), 0, 16));
+        } else {
+            self.emit_all(&[
+                ubfx(W, X7, host(EAX), 0, bits),
+                ubfx(W, X14, host(EDX), 0, bits),
+                orr(X, X7, X7, X14, Lsl, bits),
+            ]);
+        }
+        if signed {
+            self.emit_all(&[
+                sbfx(X, X7, X7, 0, bits * 2),
+                sbfx(X, X8, X8, 0, bits),
+                sdiv(X, X6, X7, X8),
+                sbfx(X, X14, X6, 0, bits),
+            ]);
+        } else {
+            self.emit_all(&[udiv(X, X6, X7, X8), ubfx(X, X14, X6, 0, bits)]);
+        }
+        self.emit(eor(X, X14, X14, X6, Lsl, 0));
+        self.asm.cbz(X, true, X14, slow);
+        self.emit(msub(X, X7, X6, X8, X7));
+        self.narrow_write(Part::Reg(EAX), width, Reg::ZR, X6);
+        self.narrow_write(
+            Part::Reg(if width == 1 { 4 } else { EDX }),
+            width,
+            Reg::ZR,
+            X7,
+        );
+        self.asm.b(done);
+        self.asm.bind(slow);
+        self.helper(helper);
+        self.asm.bind(done);
+        self.state = State::CANONICAL;
+    }
+
+    fn exchange(&mut self, kind: M, dst: Part, src: u8, width: u8) {
+        self.canonicalize();
+        let address = self.part_address(dst);
+        self.narrow_read(dst, width, address, X7);
+        self.narrow_read(Part::Reg(src), width, Reg::ZR, X8);
+        if kind == M::Cmpxchg {
+            self.narrow_read(Part::Reg(EAX), width, Reg::ZR, X14);
+            self.emit(eor(W, X6, X14, X7, Lsl, 0));
+            let (unequal, flags) = (self.asm.label(), self.asm.label());
+            self.asm.cbz(W, true, X6, unequal);
+            self.narrow_write(dst, width, address, X8);
+            self.asm.b(flags);
+            self.asm.bind(unequal);
+            if matches!(dst, Part::Mem(_)) {
+                self.narrow_write(dst, width, address, X7);
+            }
+            self.narrow_write(Part::Reg(EAX), width, Reg::ZR, X7);
+            self.asm.bind(flags);
+            self.emit_all(&[mov(W, X8, X7), mov(W, X7, X14), sub(W, X6, X7, X8, Lsl, 0)]);
+        } else {
+            self.emit(if kind == M::Xadd {
+                add(W, X6, X7, X8, Lsl, 0)
+            } else {
+                mov(W, X6, X8)
+            });
+            // Register aliases follow the interpreter's source-then-destination order.
+            if matches!(dst, Part::Mem(_)) {
+                self.narrow_write(dst, width, address, X6);
+                self.narrow_write(Part::Reg(src), width, Reg::ZR, X7);
+            } else {
+                self.narrow_write(Part::Reg(src), width, Reg::ZR, X7);
+                self.narrow_write(dst, width, Reg::ZR, X6);
+            }
+            if kind == M::Xchg {
+                return;
+            }
+        }
+        let shift = 32 - 8 * u32::from(width);
+        self.emit_all(&[
+            mov(W, X10, X6),
+            eor(W, X11, X7, X8, Lsl, 0),
+            eor(W, X11, X11, X6, Lsl, 0),
+            lsl_imm(W, X13, X7, shift),
+        ]);
+        self.emit(if kind == M::Xadd {
+            adds(W, Reg::ZR, X13, X8, Lsl, shift)
+        } else {
+            subs(W, Reg::ZR, X13, X8, Lsl, shift)
+        });
+        self.state = State {
+            sense: if kind == M::Xadd {
+                Sense::Addition
+            } else {
+                Sense::Subtraction
+            },
+            ..State::CANONICAL
+        };
     }
 
     fn compare_exchange(&mut self, dst: Src, src: u8, helper: u8) {
@@ -692,8 +1167,7 @@ mod tests {
             plan(&decode(&[0xf7, 0x36]), 5),
             Some(Integer::Divide(Src::Mem(_), false, 5))
         ));
-        // Narrow CL shifts and byte divide still decline.
+        // Narrow CL shifts still decline.
         assert_eq!(plan(&decode(&[0x66, 0xd3, 0xe0]), 0), None);
-        assert_eq!(plan(&decode(&[0xf6, 0x36]), 0), None);
     }
 }

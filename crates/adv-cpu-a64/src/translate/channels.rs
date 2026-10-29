@@ -122,6 +122,7 @@ impl Plan {
                 base: Some(destination),
                 index: None,
                 scale: 1,
+                address_bits: 32,
                 disp: offset,
                 fs: false,
             },

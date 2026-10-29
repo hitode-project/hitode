@@ -28,7 +28,7 @@
 //! every arrival counts, fall-through and jumps included.
 
 use super::decode::Op;
-use super::simd::{Guards, Kind};
+use super::simd::Guards;
 use super::trace::{Edge, Mode, Next, Trace};
 
 /// What a merge holds on arrival.
@@ -43,22 +43,15 @@ pub(super) struct Entry {
 
 /// The SIMD registers an instruction reads and writes, as `Vector::dirty`
 /// numbers them, or `None` when it may drop the cache.
-fn footprint(trace: &Trace, index: usize, checked: &dyn Fn(u32) -> bool) -> Option<(u16, u16)> {
+fn footprint(trace: &Trace, index: usize, _checked: &dyn Fn(u32) -> bool) -> Option<(u16, u16)> {
     let inst = trace.insts[index];
     if inst.call.is_some() || inst.mode == Mode::Real {
         return None;
     }
     match inst.op {
-        Op::Simd(simd)
-            if !(checked(inst.pc)
-                && simd.memory()
-                && matches!(simd.kind, Kind::InsertWord | Kind::StoreControl)) =>
-        {
-            Some(simd.footprint())
-        }
+        Op::Simd(simd) => Some(simd.footprint()),
         // Helpers, slow paths that call them and owner calls drop it.
-        Op::Simd(_)
-        | Op::Helper(_)
+        Op::Helper(_)
         | Op::Strings(_)
         | Op::Integer(_)
         | Op::X87(_)

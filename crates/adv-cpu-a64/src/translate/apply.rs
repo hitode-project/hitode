@@ -327,14 +327,6 @@ mod tests {
             a.adc(dword_ptr(ebx + 8), eax).unwrap();
             a.sbb(cx, word_ptr(esi)).unwrap();
             a.adc(bh, 3).unwrap();
-            a.neg(dword_ptr(edi)).unwrap();
-            a.not(word_ptr(ebx)).unwrap();
-            a.sete(byte_ptr(ebx + 1)).unwrap();
-            a.cmovne(dx, word_ptr(esi)).unwrap();
-            a.cmovb(si, di).unwrap();
-            a.movsx(cx, byte_ptr(edi)).unwrap();
-            a.movzx(dx, al).unwrap();
-            a.movsx(cx, bh).unwrap();
         });
         for op in ops {
             assert!(matches!(op, Op::Apply(_)), "{op:?}");
