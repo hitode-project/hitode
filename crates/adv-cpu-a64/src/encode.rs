@@ -892,6 +892,7 @@ pub enum Same {
     Sshl = 0x08,
     Ushl = 0x20 | 0x08,
     Addp = 0x17,
+    Uabd = 0x20 | 0x0e,
 }
 
 /// `<op> vd.<arr>, vn.<arr>, vm.<arr>`.
@@ -1186,6 +1187,11 @@ pub const fn vshrn(arr: Arr, rd: VReg, rn: VReg, shift: u32) -> u32 {
     let bits = arr.bits();
     assert!(arr.log2() < 3 && shift >= 1 && shift <= bits);
     0x0F00_8400 | arr.q() | (2 * bits - shift) << 16 | rn.number() << 5 | rd.number()
+}
+
+/// `uaddlp vd.<2×arr>, vn.<arr>`: sums adjacent unsigned lanes.
+pub const fn vaddlp(arr: Arr, rd: VReg, rn: VReg) -> u32 {
+    0x2E20_2800 | arr.q() | arr.log2() << 22 | rn.number() << 5 | rd.number()
 }
 
 /// `smull`/`umull vd.<2×arr>, vn.<arr>, vm.<arr>` on the low half, or

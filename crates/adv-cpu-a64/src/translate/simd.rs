@@ -23,9 +23,11 @@
 //! SIMD instructions.
 //! Checked SIMD accesses share scalar window/alias permission checks and
 //! complete soft and crossing accesses through the owner without publishing
-//! or dropping the cache. Memory `pinsrw` and `stmxcsr` use instruction helpers.
+//! or dropping the cache, including memory `pinsrw` and `stmxcsr`.
 //!
-//! SSE arithmetic and conversions run in NEON while MXCSR is the default:
+//! Packed float-to-integer conversions handle every MXCSR rounding mode,
+//! DAZ, sticky exceptions and integer indefinite before publishing their result.
+//! Other SSE arithmetic and conversions run in NEON while MXCSR is the default:
 //! masked exceptions, round to nearest, no DAZ or FTZ. There the A64
 //! result is the x86 one whenever the operation raises nothing but
 //! inexact: a quiet NaN operand propagates as the first source, as on x86.
@@ -51,7 +53,7 @@ use crate::encode::Size::{W, X};
 use crate::encode::*;
 use crate::runtime::{self, Exit};
 
-use super::decode::{Mem, memory};
+use super::decode::{Mem, memory, memory_sized};
 use super::flags::Operand;
 use super::residency::Entry;
 use crate::asm::Label;
@@ -81,6 +83,13 @@ pub enum Kind {
     Move,
     /// Scalar register moves: only the lane of `1 << log2` bytes changes.
     MoveLow(u8),
+    MoveHalf(bool),
+    PackedToInt(bool),
+    SignMask(bool),
+    ShuffleWords(bool),
+    Shufpd,
+    MulDwords,
+    SadBytes,
     /// A selected 16-bit lane, zero-extended into a GPR.
     ExtractWord,
     /// One sign bit per byte of an MMX or XMM source.
@@ -88,6 +97,7 @@ pub enum Kind {
     InsertWord,
     ShiftBytes(bool),
     StoreControl,
+    LoadControl,
     /// Scalar integer conversion: double precision selector.
     ScalarFromInt(bool),
     /// Scalar to signed dword: double precision and truncation selectors.
@@ -228,6 +238,10 @@ impl Simd {
     /// `Translator::simd` establishes them.
     pub fn guarding(&self, before: Guards) -> Guards {
         let mut after = before;
+        if self.kind == Kind::LoadControl {
+            after.fp_default = false;
+            after.fp_pe = false;
+        }
         if self.mmx() {
             after.ready = self.kind != Kind::Emms;
         }
@@ -248,9 +262,14 @@ impl Simd {
         };
         // As the lowering below reads its destination.
         let reads_dst = match self.kind {
-            Kind::Emms | Kind::Move | Kind::ExtractWord | Kind::ByteMask | Kind::StoreControl => {
-                false
-            }
+            Kind::Emms
+            | Kind::Move
+            | Kind::ExtractWord
+            | Kind::ByteMask
+            | Kind::StoreControl
+            | Kind::PackedToInt(_)
+            | Kind::SignMask(_)
+            | Kind::ShuffleWords(_) => false,
             Kind::ShiftBytes(_) => self.imm < 16,
             Kind::ShiftImm(op, log2) => {
                 let bits = Arr::new(u32::from(log2), self.full()).bits();
@@ -293,6 +312,7 @@ const NO_MEM: Mem = Mem {
     base: None,
     index: None,
     scale: 1,
+    address_bits: 32,
     disp: 0,
     fs: false,
 };
@@ -325,11 +345,20 @@ pub fn plan(instruction: &Instruction, helper: u8) -> Option<Simd> {
     let (dst, src) = match instruction.op_count() {
         0 => (Loc::Imm, Loc::Imm),
         1 if mnemonic == M::Stmxcsr => (loc(0)?, Loc::Imm),
+        1 if mnemonic == M::Ldmxcsr => (Loc::Imm, loc(0)?),
         2 | 3 => (loc(0)?, loc(1)?),
         _ => return None,
     };
     let kind = match mnemonic {
-        M::Emms => Kind::Emms,
+        M::Emms | M::Femms => Kind::Emms,
+        M::Movmskps | M::Movmskpd => Kind::SignMask(mnemonic == M::Movmskpd),
+        M::Pshufhw | M::Pshuflw => Kind::ShuffleWords(mnemonic == M::Pshufhw),
+        M::Shufpd => Kind::Shufpd,
+        M::Pmuludq => Kind::MulDwords,
+        M::Psadbw => Kind::SadBytes,
+        M::Movlhps | M::Movhlps => Kind::MoveHalf(mnemonic == M::Movlhps),
+        M::Cvttps2dq | M::Cvtps2dq => Kind::PackedToInt(mnemonic == M::Cvttps2dq),
+        M::Movq2dq | M::Movdq2q => Kind::Move,
         M::Movd
         | M::Movq
         | M::Movaps
@@ -351,6 +380,7 @@ pub fn plan(instruction: &Instruction, helper: u8) -> Option<Simd> {
         M::Pinsrw => Kind::InsertWord,
         M::Psrldq | M::Pslldq => Kind::ShiftBytes(mnemonic == M::Pslldq),
         M::Stmxcsr => Kind::StoreControl,
+        M::Ldmxcsr => Kind::LoadControl,
         M::Cvtsi2ss | M::Cvtsi2sd => Kind::ScalarFromInt(mnemonic == M::Cvtsi2sd),
         M::Cvttss2si => Kind::ScalarToInt(false, true),
         M::Cvttsd2si => Kind::ScalarToInt(true, true),
@@ -469,9 +499,14 @@ pub fn plan(instruction: &Instruction, helper: u8) -> Option<Simd> {
     let (d, s) = (class(dst), class(src));
     let valid = match kind {
         Kind::Emms => true,
+        Kind::SignMask(_) => d == 3 && s == 2,
+        Kind::ShuffleWords(_) | Kind::Shufpd => d == 2 && (s == 2 || src == Loc::Mem),
         Kind::ExtractWord | Kind::ByteMask => d == 3 && matches!(s, 1 | 2),
         Kind::InsertWord => matches!(d, 1 | 2) && (s == 3 || src == Loc::Mem),
         Kind::StoreControl => dst == Loc::Mem,
+        Kind::LoadControl => src == Loc::Mem,
+        Kind::MoveHalf(_) => d == 2 && s == 2,
+        Kind::PackedToInt(_) => d == 2 && (s == 2 || src == Loc::Mem),
         Kind::ShiftBytes(_) => d == 2 && src == Loc::Imm,
         Kind::ScalarFromInt(_) => d == 2 && (s == 3 || src == Loc::Mem),
         Kind::ScalarToInt(..) => d == 3 && (s == 2 || src == Loc::Mem),
@@ -485,6 +520,9 @@ pub fn plan(instruction: &Instruction, helper: u8) -> Option<Simd> {
         | Kind::FlagCompare(_)
         | Kind::Compare(..)
         | Kind::MinMax(..) => d == 2 && (s == 2 || src == Loc::Mem),
+        Kind::Move if matches!(mnemonic, M::Movq2dq | M::Movdq2q) => {
+            matches!((d, s), (1, 2) | (2, 1))
+        }
         Kind::Move => match (d, s) {
             (1 | 2, 0) | (0, 1 | 2) | (1 | 2, 3) | (3, 1 | 2) => true,
             _ => d == s && matches!(d, 1 | 2),
@@ -493,7 +531,13 @@ pub fn plan(instruction: &Instruction, helper: u8) -> Option<Simd> {
     };
     let three = matches!(
         kind,
-        Kind::Shuffle(_) | Kind::Shufps | Kind::Compare(..) | Kind::ExtractWord | Kind::InsertWord
+        Kind::Shuffle(_)
+            | Kind::ShuffleWords(_)
+            | Kind::Shufpd
+            | Kind::Shufps
+            | Kind::Compare(..)
+            | Kind::ExtractWord
+            | Kind::InsertWord
     );
     let imm_ok = match kind {
         Kind::ShiftImm(..) | Kind::ShiftBytes(_) => instruction.op_count() == 2,
@@ -504,7 +548,22 @@ pub fn plan(instruction: &Instruction, helper: u8) -> Option<Simd> {
         return None;
     }
     let mem = if dst == Loc::Mem || src == Loc::Mem {
-        memory(instruction)?
+        if matches!(
+            kind,
+            Kind::InsertWord
+                | Kind::StoreControl
+                | Kind::LoadControl
+                | Kind::PackedToInt(_)
+                | Kind::FromInt(false)
+                | Kind::ShuffleWords(_)
+                | Kind::Shufpd
+                | Kind::MulDwords
+                | Kind::SadBytes
+        ) {
+            memory_sized(instruction)?
+        } else {
+            memory(instruction)?
+        }
     } else {
         NO_MEM
     };
@@ -514,7 +573,7 @@ pub fn plan(instruction: &Instruction, helper: u8) -> Option<Simd> {
     } else {
         match mnemonic {
             M::Movd => 4,
-            M::Movq | M::Movsd => 8,
+            M::Movq | M::Movsd | M::Movq2dq | M::Movdq2q => 8,
             _ => 16,
         }
     };
@@ -611,13 +670,6 @@ fn vmem(bytes: u8) -> VMem {
 
 impl Translator<'_> {
     pub(super) fn simd(&mut self, simd: Simd) {
-        if self.checking
-            && simd.memory()
-            && matches!(simd.kind, Kind::InsertWord | Kind::StoreControl)
-        {
-            self.helper(simd.helper);
-            return;
-        }
         let mmx = simd.mmx();
         let ready = self.vector.guards.ready;
         if mmx && !ready {
@@ -658,6 +710,45 @@ impl Translator<'_> {
     fn simd_body(&mut self, simd: Simd, address: Reg) {
         let full = simd.full();
         match simd.kind {
+            Kind::SignMask(double) => {
+                let s = self.register(simd.src);
+                let Loc::Gpr(index) = simd.dst else {
+                    unreachable!()
+                };
+                self.clobber(Operand::Guest(index));
+                self.emit_all(&[
+                    vshift(
+                        ShiftImm::Ushr,
+                        if double { Arr::D2 } else { Arr::S4 },
+                        V0,
+                        s,
+                        if double { 63 } else { 31 },
+                    ),
+                    vumov(3, X16, V0, 0),
+                    vumov(3, X17, V0, 1),
+                ]);
+                if double {
+                    self.emit(orr(W, X13, X16, X17, Shift::Lsl, 1));
+                } else {
+                    self.emit_all(&[
+                        orr(X, X13, X16, X16, Shift::Lsr, 31),
+                        orr(X, X17, X17, X17, Shift::Lsr, 31),
+                        and_imm(W, X13, X13, 3),
+                        and_imm(W, X17, X17, 3),
+                        orr(W, X13, X13, X17, Shift::Lsl, 2),
+                    ]);
+                }
+                self.emit(mov(W, super::ops::result(index), X13));
+                self.commit(index);
+                return;
+            }
+            Kind::MoveHalf(high) => {
+                let s = self.register(simd.src);
+                let d = self.register(simd.dst);
+                self.emit(vins(3, d, u32::from(high), s, u32::from(!high)));
+                return self.written(simd.dst);
+            }
+            Kind::PackedToInt(truncate) => return self.packed_to_int(simd, address, truncate),
             Kind::Emms => {
                 self.flush_simd();
                 self.cpu();
@@ -721,8 +812,12 @@ impl Translator<'_> {
                 let value = match simd.src {
                     Loc::Gpr(index) => host(index),
                     Loc::Mem => {
-                        self.site();
-                        self.emit(ldr_narrow(Narrow::Half, X17, WINDOW, address));
+                        self.access(
+                            super::access::Addr::Window(address),
+                            2,
+                            super::access::Dir::Load,
+                            X17,
+                        );
                         X17
                     }
                     _ => unreachable!(),
@@ -747,11 +842,31 @@ impl Translator<'_> {
                 }
                 return self.written(simd.dst);
             }
+            Kind::LoadControl => {
+                self.access(
+                    super::access::Addr::Window(address),
+                    4,
+                    super::access::Dir::Load,
+                    X13,
+                );
+                let bail = self.bail();
+                self.emit(and_imm(W, X17, X13, 0xffff0000));
+                self.asm.cbz(W, true, X17, bail);
+                self.cpu();
+                self.emit(str(W, X13, X5, runtime::MXCSR));
+                self.vector.guards.fp_default = false;
+                self.vector.guards.fp_pe = false;
+                return;
+            }
             Kind::StoreControl => {
                 self.cpu();
                 self.emit(ldr(W, X13, X5, runtime::MXCSR));
-                self.site();
-                self.emit(str_reg(W, X13, WINDOW, address, false));
+                self.access(
+                    super::access::Addr::Window(address),
+                    4,
+                    super::access::Dir::Store,
+                    X13,
+                );
                 return;
             }
             Kind::Half(high) => return self.half(simd, high, address),
@@ -829,8 +944,49 @@ impl Translator<'_> {
             Loc::Imm => unreachable!("handled above"),
             loc => self.register(loc),
         };
-        let d = self.destination(simd.dst, true);
+        let d = self.destination(simd.dst, !matches!(simd.kind, Kind::ShuffleWords(_)));
         match simd.kind {
+            Kind::ShuffleWords(high) => {
+                self.emit(vmov(true, V0, s));
+                let base = if high { 4 } else { 0 };
+                for lane in 0..4 {
+                    self.emit(vins(
+                        1,
+                        V0,
+                        base + lane,
+                        s,
+                        base + (u32::from(simd.imm) >> (lane * 2) & 3),
+                    ));
+                }
+                self.emit(vmov(true, d, V0));
+            }
+            Kind::Shufpd => {
+                self.emit_all(&[
+                    vins(3, V0, 0, d, u32::from(simd.imm & 1)),
+                    vins(3, V0, 1, s, u32::from(simd.imm >> 1 & 1)),
+                    vmov(true, d, V0),
+                ]);
+            }
+            Kind::MulDwords => {
+                if full {
+                    self.emit_all(&[
+                        vpermute(Permute::Uzp1, Arr::S4, V0, d, d),
+                        vpermute(Permute::Uzp1, Arr::S4, V2, s, s),
+                        vmull(false, Arr::S2, d, V0, V2),
+                    ]);
+                } else {
+                    self.emit_all(&[vmull(false, Arr::S2, V0, d, s), vmov(false, d, V0)]);
+                }
+            }
+            Kind::SadBytes => {
+                self.emit_all(&[
+                    vsame(Same::Uabd, Arr::new(0, full), V0, d, s),
+                    vaddlp(Arr::new(0, full), V0, V0),
+                    vaddlp(Arr::new(1, full), V0, V0),
+                    vaddlp(Arr::new(2, full), V0, V0),
+                    vmov(full, d, V0),
+                ]);
+            }
             Kind::MoveLow(log2) => self.emit(vins(u32::from(log2), d, 0, s, 0)),
             Kind::Same(op, log2) => self.emit(vsame(op, Arr::new(u32::from(log2), full), d, d, s)),
             Kind::Logic(op) => self.emit(vlogic(op, full, d, d, s)),
@@ -900,6 +1056,7 @@ impl Translator<'_> {
             | Kind::InsertWord
             | Kind::ShiftBytes(_)
             | Kind::StoreControl
+            | Kind::LoadControl
             | Kind::ExtractWord
             | Kind::ByteMask
             | Kind::ShiftImm(..)
@@ -916,8 +1073,99 @@ impl Translator<'_> {
             | Kind::Compare(..)
             | Kind::MinMax(..)
             | Kind::ToInt(_)
-            | Kind::Half(_) => unreachable!(),
+            | Kind::Half(_)
+            | Kind::SignMask(_)
+            | Kind::MoveHalf(_)
+            | Kind::PackedToInt(_) => unreachable!(),
         }
+        self.written(simd.dst);
+    }
+
+    /// Packed binary32 conversions use the interpreter's rounding and sticky
+    /// exception rules, including integer indefinite on every invalid lane.
+    fn packed_to_int(&mut self, simd: Simd, address: Reg, truncate: bool) {
+        use super::{X0, X1, X2, X6};
+        let s = if simd.src == Loc::Mem {
+            self.simd_access(VMem::Q, V1, address, false);
+            V1
+        } else {
+            self.register(simd.src)
+        };
+        self.cpu();
+        self.emit_all(&[ldr(W, X13, X5, runtime::MXCSR), movz(W, X0, 0, 0)]);
+        let temp = VReg::new(3);
+        for lane in 0..4 {
+            let (normal, daz, converted, invalid) = (
+                self.asm.label(),
+                self.asm.label(),
+                self.asm.label(),
+                self.asm.label(),
+            );
+            self.emit_all(&[vumov(2, X16, s, lane), ubfx(W, X17, X16, 23, 8)]);
+            self.asm.cbz(W, true, X17, normal);
+            self.emit(lsl_imm(W, X17, X16, 1));
+            self.asm.cbz(W, false, X17, normal);
+            self.asm.tbz(true, X13, 6, daz);
+            self.emit(orr_imm(W, X0, X0, 2));
+            self.asm.b(normal);
+            self.asm.bind(daz);
+            self.emit(and_imm(W, X16, X16, 1 << 31));
+            self.asm.bind(normal);
+            self.emit_all(&[
+                msr_fpsr(Reg::ZR),
+                fmov_to_v(W, temp, X16),
+                unary(Unary::Widen, temp, temp),
+                fmov_from_v(X, X1, temp),
+            ]);
+            if truncate {
+                self.emit(unary(Unary::Frintz, V2, temp));
+            } else {
+                let (down, up, zero, rounded) = (
+                    self.asm.label(),
+                    self.asm.label(),
+                    self.asm.label(),
+                    self.asm.label(),
+                );
+                self.emit(ubfx(W, X17, X13, 13, 2));
+                self.asm.tbz(true, X17, 1, up);
+                self.asm.tbz(true, X17, 0, down);
+                self.emit(unary(Unary::Frintn, V2, temp));
+                self.asm.b(rounded);
+                self.asm.bind(down);
+                self.emit(unary(Unary::Frintm, V2, temp));
+                self.asm.b(rounded);
+                self.asm.bind(up);
+                self.asm.tbz(true, X17, 0, zero);
+                self.emit(unary(Unary::Frintp, V2, temp));
+                self.asm.b(rounded);
+                self.asm.bind(zero);
+                self.emit(unary(Unary::Frintz, V2, temp));
+                self.asm.bind(rounded);
+            }
+            self.emit_all(&[fcvt_int(X, true, X6, V2), mrs_fpsr(X17)]);
+            self.asm.tbz(true, X17, 0, invalid);
+            self.emit_all(&[sbfx(X, X17, X6, 0, 32), eor(X, X17, X17, X6, Shift::Lsl, 0)]);
+            self.asm.cbz(X, true, X17, invalid);
+            self.emit_all(&[fmov_from_v(X, X17, V2), eor(X, X17, X17, X1, Shift::Lsl, 0)]);
+            self.asm.cbz(X, false, X17, converted);
+            self.emit(orr_imm(W, X0, X0, 0x20));
+            self.asm.b(converted);
+            self.asm.bind(invalid);
+            self.emit_all(&[movz(W, X6, 0x8000, 16), orr_imm(W, X0, X0, 1)]);
+            self.asm.bind(converted);
+            self.emit(vins_general(2, V0, lane, X6));
+        }
+        // An unmasked exception is settled by the interpreter before publishing
+        // the destination or MXCSR, just like the other native SIMD operations.
+        let bail = self.bail();
+        self.emit_all(&[lsr_imm(W, X1, X13, 7), bic(W, X2, X0, X1, Shift::Lsl, 0)]);
+        self.asm.cbz(W, true, X2, bail);
+        self.emit_all(&[
+            orr(W, X13, X13, X0, Shift::Lsl, 0),
+            str(W, X13, X5, runtime::MXCSR),
+        ]);
+        let d = self.destination(simd.dst, false);
+        self.emit(vmov(true, d, V0));
         self.written(simd.dst);
     }
 

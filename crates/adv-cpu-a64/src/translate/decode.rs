@@ -22,6 +22,8 @@ pub struct Mem {
     pub base: Option<u8>,
     pub index: Option<u8>,
     pub scale: u32,
+    /// Effective address width before adding the segment base.
+    pub address_bits: u8,
     pub disp: u32,
     /// Relative to the FS base rather than flat.
     pub fs: bool,
@@ -54,11 +56,11 @@ pub enum ShiftKind {
     Ror,
 }
 
-/// An operand of an 8- or 16-bit instruction.
+/// An operand of an 8-, 16- or 32-bit instruction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Part {
-    /// A byte register as `Narrow8or16::Byte` numbers it, or a word
-    /// register by guest index.
+    /// A byte register as `Narrow8or16::Byte` numbers it. Word and dword
+    /// registers use guest indices.
     Reg(u8),
     Imm(u32),
     Mem(Mem),
@@ -159,9 +161,28 @@ pub(super) fn memory(instruction: &Instruction) -> Option<Mem> {
         base: register(instruction.memory_base())?,
         index: register(instruction.memory_index())?,
         scale: instruction.memory_index_scale(),
+        address_bits: 32,
         disp: instruction.memory_displacement32(),
         fs,
     })
+}
+
+/// The same address model, also accepting word address registers. Wrapping
+/// precedes the segment base, as in the interpreter's `Address::resolve_regs`.
+pub(super) fn memory_sized(instruction: &Instruction) -> Option<Mem> {
+    let mut normalized = *instruction;
+    let word = instruction.memory_base().is_gpr16() || instruction.memory_index().is_gpr16();
+    if instruction.memory_base().is_gpr16() {
+        normalized.set_memory_base(instruction.memory_base().full_register32());
+    }
+    if instruction.memory_index().is_gpr16() {
+        normalized.set_memory_index(instruction.memory_index().full_register32());
+    }
+    let mut mem = memory(&normalized)?;
+    if word {
+        mem.address_bits = 16;
+    }
+    Some(mem)
 }
 
 /// The width of an instruction's first operand, if it is 8 or 16 bits.
@@ -174,22 +195,30 @@ fn narrow_width(instruction: &Instruction) -> Option<u8> {
     matches!(size, 1 | 2).then_some(size as u8)
 }
 
-/// Operand `n` of an 8- or 16-bit instruction of `width` bytes.
-fn part(instruction: &Instruction, n: u32, width: u8) -> Option<Part> {
-    let mask = if width == 1 { 0xff } else { 0xffff };
+/// Operand `n` of an integer instruction of `width` bytes.
+pub(super) fn part(instruction: &Instruction, n: u32, width: u8) -> Option<Part> {
+    let mask = match width {
+        1 => 0xff,
+        2 => 0xffff,
+        _ => u32::MAX,
+    };
     match instruction.op_kind(n) {
         OpKind::Register => {
             let register = instruction.op_register(n);
             let fits = if width == 1 {
                 register.is_gpr8()
-            } else {
+            } else if width == 2 {
                 register.is_gpr16()
+            } else {
+                register.is_gpr32()
             };
             fits.then(|| Part::Reg(register.number() as u8))
         }
-        OpKind::Immediate8 | OpKind::Immediate16 | OpKind::Immediate8to16 => {
-            Some(Part::Imm(instruction.immediate(n) as u32 & mask))
-        }
+        OpKind::Immediate8
+        | OpKind::Immediate16
+        | OpKind::Immediate8to16
+        | OpKind::Immediate32
+        | OpKind::Immediate8to32 => Some(Part::Imm(instruction.immediate(n) as u32 & mask)),
         OpKind::Memory => memory(instruction).map(Part::Mem),
         _ => None,
     }
@@ -220,6 +249,13 @@ pub fn plan(instruction: &Instruction) -> Option<Op> {
             ))
     {
         return None;
+    }
+    if matches!(instruction.mnemonic(), M::Rol | M::Ror | M::Rcl | M::Rcr)
+        && instruction.op0_kind() == OpKind::Register
+        && instruction.op1_kind() == OpKind::Immediate8
+        && instruction.immediate8() & 31 == 0
+    {
+        return Some(Op::Nop);
     }
     let count = instruction.op_count();
     let two = || Some((operand(instruction, 0)?, operand(instruction, 1)?));
@@ -281,13 +317,19 @@ pub fn plan(instruction: &Instruction) -> Option<Op> {
         ));
     }
     Some(match mnemonic {
-        M::Nop => Op::Nop,
+        M::Nop | M::Pause => Op::Nop,
+        M::Lfence | M::Sfence | M::Mfence if instruction.segment_prefix() != Register::GS => {
+            Op::Nop
+        }
         // Hints that never fault; ENDBR32 marks indirect branch targets for
         // CET, which the guest never enables.
         M::Endbr32 => Op::Nop,
         M::Prefetcht0 | M::Prefetcht1 | M::Prefetcht2 | M::Prefetchnta => Op::Nop,
         M::Cld => Op::Direction(false),
         M::Std => Op::Direction(true),
+        M::Movnti if instruction.memory_size().size() == 4 => {
+            Op::Mov(Src::Mem(memory_sized(instruction)?), Src::Reg(register(1)?))
+        }
         M::Mov => match two()? {
             (Src::Imm(_), _) | (Src::Mem(_), Src::Mem(_)) => return None,
             (dst, src) => Op::Mov(dst, src),
@@ -557,6 +599,7 @@ impl Bytes<'_> {
             base,
             index,
             scale,
+            address_bits: 32,
             disp,
             fs: false,
         };
@@ -662,6 +705,7 @@ fn quick_op(b: &mut Bytes, pc: u32) -> Option<Op> {
                 base: None,
                 index: None,
                 scale: 1,
+                address_bits: 32,
                 disp: b.u32()?,
                 fs: false,
             });

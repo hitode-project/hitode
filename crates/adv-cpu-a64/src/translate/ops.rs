@@ -347,6 +347,15 @@ impl Translator<'_> {
     /// The guest address of `mem` in a W register; uses w16 and w17.
     pub(super) fn effective(&mut self, mem: Mem) -> Reg {
         let flat = self.flat(mem);
+        self.finish_address(mem, flat)
+    }
+
+    /// Wraps an offset to its address size, then adds the segment base.
+    pub(super) fn finish_address(&mut self, mem: Mem, mut flat: Reg) -> Reg {
+        if mem.address_bits == 16 {
+            self.emit(ubfx(W, X16, flat, 0, 16));
+            flat = X16;
+        }
         if !mem.fs {
             return flat;
         }
@@ -358,8 +367,8 @@ impl Translator<'_> {
         X16
     }
 
-    /// `effective` without a segment base.
-    fn flat(&mut self, mem: Mem) -> Reg {
+    /// The base, index and displacement before wrapping or adding a segment base.
+    pub(super) fn flat(&mut self, mem: Mem) -> Reg {
         let mut current = mem.base.map(host);
         if let Some(index) = mem.index {
             let shift = mem.scale.trailing_zeros();

@@ -26,10 +26,10 @@ use super::flags::FlagSet;
 
 /// Longest trace, in guest instructions.
 pub const MAX_INSTRUCTIONS: usize = 96;
-/// What an x87 instruction counts toward `MAX_INSTRUCTIONS`: each emits
-/// some hundred host instructions, and a unit must stay within the 32 KiB
-/// reach of `tbz` to its cold code.
-const X87_WEIGHT: usize = 4;
+/// What a wide x87 or packed conversion counts toward `MAX_INSTRUCTIONS`:
+/// each emits hundreds of host instructions, and a unit must stay within
+/// the 32 KiB reach of `tbz` to its cold code.
+const WIDE_WEIGHT: usize = 4;
 /// Deepest inlined call.
 const MAX_DEPTH: u8 = 8;
 /// Room an inlined callee should still have.
@@ -205,8 +205,15 @@ impl Trace {
                 break;
             };
             let next_pc = pc.wrapping_add(size);
-            weight += if matches!(op, Op::X87(_) | Op::Fild64(..)) {
-                X87_WEIGHT
+            weight += if matches!(op, Op::X87(_) | Op::Fild64(..))
+                || matches!(
+                    op,
+                    Op::Simd(super::simd::Simd {
+                        kind: super::simd::Kind::PackedToInt(_),
+                        ..
+                    })
+                ) {
+                WIDE_WEIGHT
             } else {
                 1
             };

@@ -6,6 +6,7 @@ mod channels;
 mod helper_gaps;
 mod jump_tables;
 mod mmx_lazy;
+mod native_forms;
 mod native_regions;
 mod pixel_loops;
 mod x87_wide;

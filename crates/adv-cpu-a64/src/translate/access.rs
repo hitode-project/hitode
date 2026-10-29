@@ -84,6 +84,7 @@ impl Translator<'_> {
         if let (Some(base), None) = (mem.base, mem.index)
             && biased(base)
             && !self.checking
+            && mem.address_bits == 32
             && !mem.fs
         {
             // Offsets well inside the guards: an access past 0 or 4 GiB
