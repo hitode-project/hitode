@@ -986,7 +986,7 @@ impl Op {
             }
             // The interpreter reads and writes canonical flags.
             Op::Helper(_) => (F::ALL, F::NONE, true),
-            Op::Apply(apply) => (F::ALL, F::ALL, matches!(apply.dst, Part::Mem(_))),
+            Op::Apply(apply) => (F::ALL, F::ALL, apply.memory().is_some()),
         };
         Effects {
             reads,

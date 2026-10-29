@@ -1345,7 +1345,7 @@ fn narrow(
     rng: &mut Rng,
     mem: impl Fn(&mut CodeAssembler, &mut Rng) -> AsmMemoryOperand,
 ) {
-    let (op, form) = (rng.below(8), rng.below(5));
+    let (op, form) = (rng.below(10), rng.below(7));
     let imm = rng.imm();
     macro_rules! apply {
         ($dst:expr, $src:expr) => {
@@ -1365,7 +1365,20 @@ fn narrow(
                 3 => a.and($dst, $src),
                 4 => a.or($dst, $src),
                 5 => a.xor($dst, $src),
+                8 => a.adc($dst, $src),
+                9 => a.sbb($dst, $src),
                 _ => a.cmp($dst, $src),
+            }
+            .unwrap()
+        };
+    }
+    // Unary and flag-reading forms, mostly operation helpers (A64-TR-4).
+    macro_rules! unary {
+        ($dst:expr) => {
+            match op % 3 {
+                0 => a.neg($dst),
+                1 => a.not($dst),
+                _ => a.inc($dst),
             }
             .unwrap()
         };
@@ -1383,9 +1396,18 @@ fn narrow(
                 let m = mem(a, rng);
                 apply!(byte_ptr(m), src)
             }
-            _ => {
+            4 => {
                 let m = mem(a, rng);
                 apply!(byte_ptr(m), imm & 0x7f)
+            }
+            5 => unary!(dst),
+            _ => {
+                let m = mem(a, rng);
+                match op % 3 {
+                    0 => a.setb(byte_ptr(m)).unwrap(),
+                    1 => a.setg(byte_ptr(m)).unwrap(),
+                    _ => unary!(byte_ptr(m)),
+                }
             }
         }
     } else {
@@ -1403,9 +1425,27 @@ fn narrow(
                 let m = mem(a, rng);
                 apply!(word_ptr(m), src)
             }
-            _ => {
+            4 => {
                 let m = mem(a, rng);
                 apply!(word_ptr(m), imm & 0x7fff)
+            }
+            5 => {
+                let m = mem(a, rng);
+                match op % 2 {
+                    0 => unary!(word_ptr(m)),
+                    _ => unary!(dword_ptr(m)),
+                }
+            }
+            _ => {
+                let m = mem(a, rng);
+                match op % 5 {
+                    0 => a.cmovb(dst, src),
+                    1 => a.cmovg(dst, word_ptr(m)),
+                    2 => a.movsx(dst, rng.pick(&BYTES)),
+                    3 => a.movsx(dst, byte_ptr(m)),
+                    _ => a.adc(dword_ptr(m), rng.pick(&[eax, ecx, edx, esi])),
+                }
+                .unwrap()
             }
         }
     }

@@ -1,47 +1,59 @@
 //! Operation helpers (A64-TR-4): integer instructions without native forms
-//! run the interpreter's own semantics on operands in host registers. The
+//! run the interpreter's own semantics on operands in host registers. They
+//! cover what `adv_cpu_core::integer::decode` exports, plus double shifts:
+//! a mnemonic or condition, a destination and up to one source. The
 //! unit reads the operands, memory through its usual access paths, calls
 //! `run` through the `apply` stub, which keeps guest registers, temporaries
 //! and SIMD caches, then writes the result and, after that last access, the
 //! flags (A64-FLAG-4).
 
-use adv_cpu_core::integer;
-use iced_x86::{Instruction, Mnemonic as M, OpKind, Register};
+use adv_cpu_core::integer::{self, Operand, Operation};
+use iced_x86::{ConditionCode, Instruction, Mnemonic as M, OpKind, Register};
 
 use crate::encode::Size::{W, X};
 use crate::encode::*;
 
-use super::decode::{Part, memory};
+use super::decode::{Mem, Part, memory};
 use super::{State, Translator, X0, X1, X2, X3, X6, X10, X11, X13, X14, host};
 
 const ECX: u8 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
 pub enum Semantic {
-    Shl,
-    Shr,
-    Sar,
-    Rol,
-    Ror,
-    Rcl,
-    Rcr,
-    Shld,
-    Shrd,
+    /// The shift, binary, unary or extension operation of this mnemonic.
+    Op(M),
+    Set(ConditionCode),
+    Cmov(ConditionCode),
 }
 
 impl Semantic {
-    const ALL: [Self; 9] = [
-        Self::Shl,
-        Self::Shr,
-        Self::Sar,
-        Self::Rol,
-        Self::Ror,
-        Self::Rcl,
-        Self::Rcr,
-        Self::Shld,
-        Self::Shrd,
-    ];
+    /// The tag in bits 0-7 and the mnemonic or condition from bit 16.
+    fn pack(self) -> u32 {
+        match self {
+            Self::Op(kind) => (kind as u32) << 16,
+            Self::Set(condition) => 1 | (condition as u32) << 16,
+            Self::Cmov(condition) => 2 | (condition as u32) << 16,
+        }
+    }
+
+    fn unpack(op: u32) -> Self {
+        let value = (op >> 16) as usize;
+        let condition = || ConditionCode::try_from(value).unwrap();
+        match op & 0xff {
+            0 => Self::Op(M::try_from(value).unwrap()),
+            1 => Self::Set(condition()),
+            _ => Self::Cmov(condition()),
+        }
+    }
+
+    /// Whether `run` reads the destination's value.
+    fn reads(self) -> bool {
+        !matches!(self, Self::Set(_) | Self::Op(M::Movsx | M::Movzx))
+    }
+
+    fn writes(self) -> bool {
+        !matches!(self, Self::Op(M::Cmp | M::Test))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,27 +69,79 @@ pub struct Apply {
     /// 1, 2 or 4 bytes.
     pub width: u8,
     pub dst: Part,
-    /// The register a double shift fills from.
-    pub source: Option<u8>,
-    pub count: Count,
+    /// The second operand and its width: a binary, CMOV or extension
+    /// source, or the register a double shift fills from.
+    pub source: Option<(Part, u8)>,
+    /// A shift's count.
+    pub count: Option<Count>,
+}
+
+impl Apply {
+    /// The operand in memory, if one is.
+    pub fn memory(&self) -> Option<Mem> {
+        [Some(self.dst), self.source.map(|(part, _)| part)]
+            .into_iter()
+            .find_map(|part| match part {
+                Some(Part::Mem(mem)) => Some(mem),
+                _ => None,
+            })
+    }
 }
 
 /// The operation helper running `instruction`, if one does.
 pub fn plan(instruction: &Instruction) -> Option<Apply> {
-    let semantic = match instruction.mnemonic() {
-        M::Shl | M::Sal => Semantic::Shl,
-        M::Shr => Semantic::Shr,
-        M::Sar => Semantic::Sar,
-        M::Rol => Semantic::Rol,
-        M::Ror => Semantic::Ror,
-        M::Rcl => Semantic::Rcl,
-        M::Rcr => Semantic::Rcr,
-        M::Shld => Semantic::Shld,
-        M::Shrd => Semantic::Shrd,
+    if matches!(instruction.mnemonic(), M::Shld | M::Shrd) {
+        return double_shift(instruction);
+    }
+    // Byte registers numbered as `Narrow8or16::Byte` numbers them.
+    let part = |operand: Operand, width: u8| match operand {
+        Operand::Register(r) => Some((Part::Reg(r.index + r.shift / 2), r.width)),
+        Operand::Memory(_, width) => Some((Part::Mem(memory(instruction)?), width)),
+        Operand::Immediate(value) => Some((Part::Imm(value), width)),
+    };
+    let (semantic, dst, source, count) = match integer::decode(instruction)? {
+        Operation::Shift(kind, dst, count) => {
+            let count = match count {
+                // A zero count changes nothing but still checks the write:
+                // the interpreter keeps that.
+                Operand::Immediate(count) => match count & 31 {
+                    0 => return None,
+                    count => Count::Imm(count as u8),
+                },
+                _ => Count::Cl,
+            };
+            (Semantic::Op(kind), dst, None, Some(count))
+        }
+        Operation::Binary(kind, dst, source) => (Semantic::Op(kind), dst, Some(source), None),
+        Operation::Unary(kind, dst) => (Semantic::Op(kind), dst, None, None),
+        Operation::Mov(dst, source, signed) => {
+            let kind = if signed { M::Movsx } else { M::Movzx };
+            (Semantic::Op(kind), dst, Some(source), None)
+        }
+        Operation::Set(dst, condition) => (Semantic::Set(condition), dst, None, None),
+        Operation::Cmov(dst, source, condition) => {
+            (Semantic::Cmov(condition), dst, Some(source), None)
+        }
         _ => return None,
     };
+    let (dst, width) = part(dst, 0)?;
+    let source = match source {
+        Some(source) => Some(part(source, width)?),
+        None => None,
+    };
+    matches!(width, 1 | 2 | 4).then_some(Apply {
+        semantic,
+        width,
+        dst,
+        source,
+        count,
+    })
+}
+
+/// SHLD or SHRD, which the shared integer decoder leaves out.
+fn double_shift(instruction: &Instruction) -> Option<Apply> {
     let gpr = |register: Register| {
-        (register.is_gpr8() || register.is_gpr16() || register.is_gpr32())
+        (register.is_gpr16() || register.is_gpr32())
             .then(|| (register.number() as u8, register.size() as u8))
     };
     let (dst, width) = match instruction.op0_kind() {
@@ -91,56 +155,55 @@ pub fn plan(instruction: &Instruction) -> Option<Apply> {
         ),
         _ => return None,
     };
-    let double = matches!(semantic, Semantic::Shld | Semantic::Shrd);
-    let source = if double {
-        let (number, size) = gpr(instruction.op1_register())?;
-        if instruction.op1_kind() != OpKind::Register || size != width {
-            return None;
-        }
-        Some(number)
-    } else {
-        None
-    };
-    let at = if double { 2 } else { 1 };
-    let count = match instruction.op_kind(at) {
-        // A zero count changes nothing but still checks the write: the
-        // interpreter keeps that.
+    let (source, size) = gpr(instruction.op1_register())?;
+    if instruction.op1_kind() != OpKind::Register || size != width {
+        return None;
+    }
+    let count = match instruction.op2_kind() {
         OpKind::Immediate8 => match instruction.immediate8() & 31 {
             0 => return None,
             count => Count::Imm(count),
         },
-        OpKind::Register if instruction.op_register(at) == Register::CL => Count::Cl,
+        OpKind::Register if instruction.op2_register() == Register::CL => Count::Cl,
         _ => return None,
     };
-    (matches!(width, 1 | 2 | 4) && !(double && width == 1)).then_some(Apply {
-        semantic,
+    matches!(width, 2 | 4).then_some(Apply {
+        semantic: Semantic::Op(instruction.mnemonic()),
         width,
         dst,
-        source,
-        count,
+        source: Some((Part::Reg(source), width)),
+        count: Some(count),
     })
 }
 
 impl Translator<'_> {
     pub(super) fn apply(&mut self, op: Apply) {
         self.canonicalize();
-        let address = match op.dst {
-            Part::Mem(mem) => self.effective(mem),
-            _ => Reg::ZR,
+        let address = match op.memory() {
+            Some(mem) => self.effective(mem),
+            None => Reg::ZR,
         };
-        self.narrow_read(op.dst, op.width, address, X6);
-        if let Some(source) = op.source {
-            self.narrow_read(Part::Reg(source), op.width, Reg::ZR, X2);
+        if op.semantic.reads() {
+            self.narrow_read(op.dst, op.width, address, X6);
+        }
+        let mut width = 0;
+        if let Some((source, size)) = op.source {
+            self.narrow_read(source, size, address, X2);
+            width = size;
         }
         match op.count {
-            Count::Imm(count) => self.mov_imm(X3, u32::from(count)),
-            Count::Cl => self.emit(and_imm(W, X3, host(ECX), 31)),
+            Some(Count::Imm(count)) => self.mov_imm(X3, u32::from(count)),
+            Some(Count::Cl) => self.emit(and_imm(W, X3, host(ECX), 31)),
+            None => {}
         }
         self.emit(mov(W, X1, X6));
-        self.mov_imm(X0, op.semantic as u32 | u32::from(op.width) << 8);
+        let packed = op.semantic.pack() | u32::from(op.width) << 8 | u32::from(width) << 12;
+        self.mov_imm(X0, packed);
         self.far_call(self.stubs.apply);
         self.emit_all(&[mov(W, X6, X0), lsr_imm(X, X14, X0, 32)]);
-        self.narrow_write(op.dst, op.width, address, X6);
+        if op.semantic.writes() {
+            self.narrow_write(op.dst, op.width, address, X6);
+        }
         // The packed flags: NZCV in bits 0-3, AF in bit 4, x10 in bit 5.
         self.emit_all(&[
             lsl_imm(W, X13, X14, 28),
@@ -152,10 +215,11 @@ impl Translator<'_> {
     }
 }
 
-/// Called by the `apply` stub: operation `op` (its `Semantic` in bits 0-7
-/// and width above) of `value`, `source` and `count`, with the canonical
-/// flags NZCV (subtraction sense), x10 and x11. Returns the result in the
-/// low half and the flags packed as `Translator::apply` unpacks them.
+/// Called by the `apply` stub: operation `op` (`Semantic::pack`, the width
+/// in bits 8-11 and the source's in bits 12-15) of `value`, `source` and
+/// `count`, with the canonical flags NZCV (subtraction sense), x10 and x11.
+/// Returns the result in the low half and the flags packed as
+/// `Translator::apply` unpacks them.
 pub(crate) extern "C" fn run(
     op: u32,
     value: u32,
@@ -172,35 +236,31 @@ pub(crate) extern "C" fn run(
         | (u32::from(n(30)) * integer::ZF)
         | (u32::from(n(31)) * integer::SF)
         | (u32::from(n(28)) * integer::OF);
-    let semantic = Semantic::ALL[(op & 0xff) as usize];
-    let width = (op >> 8) as u8;
+    let (width, source_width) = ((op >> 8 & 15) as u8, (op >> 12 & 15) as u8);
     // A zero CL count leaves the value and flags as they were.
     let count = count & 31;
-    let result = if count == 0 {
-        value
-    } else {
-        match semantic {
-            Semantic::Shld | Semantic::Shrd => integer::double_shift(
-                &mut flags,
-                semantic == Semantic::Shld,
-                value,
-                source,
-                count,
-                width,
-            ),
-            _ => {
-                let kind = match semantic {
-                    Semantic::Shl => M::Shl,
-                    Semantic::Shr => M::Shr,
-                    Semantic::Sar => M::Sar,
-                    Semantic::Rol => M::Rol,
-                    Semantic::Ror => M::Ror,
-                    Semantic::Rcl => M::Rcl,
-                    _ => M::Rcr,
-                };
-                integer::shift(&mut flags, kind, value, count, width)
-            }
+    let result = match Semantic::unpack(op) {
+        Semantic::Set(condition) => u32::from(integer::condition_true(condition, flags)),
+        Semantic::Cmov(condition) if integer::condition_true(condition, flags) => source,
+        Semantic::Cmov(_) => value,
+        Semantic::Op(M::Movsx) => integer::signed(source, source_width) as u32,
+        Semantic::Op(M::Movzx) => source,
+        Semantic::Op(kind @ (M::Inc | M::Dec | M::Not | M::Neg)) => {
+            integer::unary(&mut flags, kind, value, width)
         }
+        Semantic::Op(M::Shl | M::Shr | M::Sar | M::Rol | M::Ror | M::Rcl | M::Rcr)
+        | Semantic::Op(M::Shld | M::Shrd)
+            if count == 0 =>
+        {
+            value
+        }
+        Semantic::Op(kind @ (M::Shld | M::Shrd)) => {
+            integer::double_shift(&mut flags, kind == M::Shld, value, source, count, width)
+        }
+        Semantic::Op(kind @ (M::Shl | M::Shr | M::Sar | M::Rol | M::Ror | M::Rcl | M::Rcr)) => {
+            integer::shift(&mut flags, kind, value, count, width)
+        }
+        Semantic::Op(kind) => integer::binary(&mut flags, kind, value, source, width),
     };
     let has = |bit: u32| u64::from(flags & bit != 0);
     let packed = has(integer::OF)
@@ -258,5 +318,26 @@ mod tests {
         // A zero count still checks the write, which the interpreter does.
         let zero = decode(|a| a.shl(dword_ptr(ebx), 32).unwrap());
         assert!(matches!(zero[..], [Op::Helper(_)]), "{zero:?}");
+    }
+
+    // spec: A64-TR-4
+    #[test]
+    fn integer_forms_without_native_forms_run_as_operation_helpers() {
+        let ops = decode(|a| {
+            a.adc(dword_ptr(ebx + 8), eax).unwrap();
+            a.sbb(cx, word_ptr(esi)).unwrap();
+            a.adc(bh, 3).unwrap();
+            a.neg(dword_ptr(edi)).unwrap();
+            a.not(word_ptr(ebx)).unwrap();
+            a.sete(byte_ptr(ebx + 1)).unwrap();
+            a.cmovne(dx, word_ptr(esi)).unwrap();
+            a.cmovb(si, di).unwrap();
+            a.movsx(cx, byte_ptr(edi)).unwrap();
+            a.movzx(dx, al).unwrap();
+            a.movsx(cx, bh).unwrap();
+        });
+        for op in ops {
+            assert!(matches!(op, Op::Apply(_)), "{op:?}");
+        }
     }
 }
