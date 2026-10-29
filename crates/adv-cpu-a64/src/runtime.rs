@@ -26,8 +26,9 @@
 //! Checked accesses (A64-MEM-7) call `access` when the page class table rules
 //! out the window: it saves every register translated code may keep live,
 //! has the owner's `access` helper perform the access, and returns the
-//! loaded value in w0; when the owner refuses, it leaves as the fault stub
-//! would for a host fault at the access, whose site the helper recorded.
+//! loaded value in w0; when the owner refuses, it captures v8-v23 as the
+//! fault handler does and leaves as the fault stub would for a host fault
+//! at the access, whose site the helper recorded.
 //!
 //! Instructions the translator leaves to the interpreter call `interpret`
 //! with canonical flags: it stores the guest as `exit` does, has the
@@ -78,6 +79,9 @@ pub struct Runtime {
     /// `access(runtime, address, site, value, kind) -> value`, called by
     /// `access`; bit 32 set refuses.
     pub access: u64,
+    /// Where a refused access stores v8-v23, as the fault handler captures
+    /// them from a host fault.
+    pub fault_simd: u64,
     /// The page class table: a byte per guest page, its permissions as
     /// `Memory::native_permissions` has them.
     pub classes: u64,
@@ -129,6 +133,7 @@ impl Runtime {
             shadow_top: 0,
             resume: 0,
             access: 0,
+            fault_simd: 0,
             classes: 0,
             alias: 0,
             alias_classes: 0,
@@ -236,6 +241,7 @@ pub(crate) const TABLE: u32 = field(offset_of!(Runtime, table));
 const SHADOW_TOP: u32 = field(offset_of!(Runtime, shadow_top));
 const RESUME: u32 = field(offset_of!(Runtime, resume));
 const ACCESS: u32 = field(offset_of!(Runtime, access));
+const FAULT_SIMD: u32 = field(offset_of!(Runtime, fault_simd));
 const INTERPRET: u32 = field(offset_of!(Runtime, interpret));
 const APPLY: u32 = field(offset_of!(Runtime, apply));
 const CALL: u32 = field(offset_of!(Runtime, call));
@@ -435,9 +441,18 @@ fn emit_access(asm: &mut Asm, fault: crate::asm::Label) {
         blr(r(16)),
     ]);
     emit_restore_light(asm);
-    // Refused: the site faults, with the state exactly that before it.
-    asm.tbz(true, r(0), 32, fault);
+    let refused = asm.label();
+    asm.tbz(true, r(0), 32, refused);
     asm.emit(ret(Reg::LR));
+    // Refused: the site faults, with the state exactly that before it,
+    // dirty SIMD registers included.
+    asm.bind(refused);
+    asm.emit(ldr(X, r(16), RUNTIME, FAULT_SIMD));
+    for n in 0..8u8 {
+        let (low, high) = (v(8 + 2 * n), v(9 + 2 * n));
+        asm.emit(stp_v(VSize::Q, Offset, low, high, r(16), 32 * i32::from(n)));
+    }
+    asm.b(fault);
 }
 
 /// The indirect table probe for the EIP in w16: branches to its unit, or to

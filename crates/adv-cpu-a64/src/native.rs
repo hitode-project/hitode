@@ -802,6 +802,7 @@ impl Native {
             (*runtime).cpu = cpu;
             (*runtime).helper = dispatch as *const () as u64;
             (*runtime).access = access as *const () as u64;
+            (*runtime).fault_simd = (*faults).simd.as_ptr() as u64;
             (*runtime).interpret = interpret as *const () as u64;
             (*runtime).call = call as *const () as u64;
             (*runtime).owner = &raw mut owner as u64;
