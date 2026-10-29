@@ -53,7 +53,7 @@ This spec covers the native audio and video API front ends: DirectSound storage,
 
 ### MEDIA-GRAPH-2 File sources
 
-**Rule**: AddSourceFilter MUST use ordinary guest file APIs and reject missing, unsupported, or invalid inputs without publishing a source. The decoder-owning filter MUST retain the file sharing lock until release.
+**Rule**: AddSourceFilter MUST use ordinary guest file APIs and reject missing, unsupported, or invalid inputs without publishing a source. The WM ASF Reader class MUST be this file source, loaded through IFileSourceFilter. The decoder-owning filter MUST retain the file sharing lock until release.
 **Verification**: Test
 
 ### MEDIA-GRAPH-3 Render negotiation

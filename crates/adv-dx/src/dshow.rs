@@ -189,6 +189,14 @@ const CLSID_MPEG_AUDIO_CODEC: Iid = guid(
     0x11ce,
     [0x9b, 0xd9, 0x00, 0x00, 0xe2, 0x02, 0x59, 0x9c],
 );
+/// qasf's WM ASF Reader: a file source whose Load hands the file to the
+/// common decoder, so Windows Media streams render natively.
+pub(crate) const CLSID_WMASF_READER: Iid = guid(
+    0x1874_63a0,
+    0x5bb7,
+    0x11d3,
+    [0xac, 0xbe, 0x00, 0x80, 0xc7, 0x5e, 0x24, 0x6e],
+);
 const CLSID_DSOUND_RENDER: Iid = guid(
     0x7937_6820,
     0x07d0,
@@ -378,6 +386,7 @@ pub fn install<B: adv_cpu::backend::Backend>(m: &mut adv_machine::Machine<B>) {
     classes.register(CLSID_DSOUND_RENDER, filter::create_audio_renderer);
     classes.register(CLSID_AUDIO_RENDER, filter::create_audio_renderer);
     classes.register(dmo::CLSID_DMO_WRAPPER, dmo::create);
+    classes.register(CLSID_WMASF_READER, filter::create_asf_reader);
 }
 
 /// Classes exported by the native graph front. Wine retains its audio
@@ -390,6 +399,7 @@ pub fn has_graph_class(class: &Iid) -> bool {
         CLSID_MPEG_VIDEO_CODEC,
         CLSID_MPEG_AUDIO_CODEC,
         dmo::CLSID_DMO_WRAPPER,
+        CLSID_WMASF_READER,
     ]
     .contains(class)
 }

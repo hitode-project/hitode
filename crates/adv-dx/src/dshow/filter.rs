@@ -106,6 +106,17 @@ pub(crate) fn create_audio_decoder(
         super::CLSID_MPEG_AUDIO_CODEC,
     )
 }
+pub(crate) fn create_asf_reader(env: &mut Env<'_>, iid: Iid, outer: u32, output: u32) -> Outcome {
+    create_filter(
+        env,
+        iid,
+        outer,
+        output,
+        Role::FileSource,
+        super::CLSID_WMASF_READER,
+    )
+}
+
 pub(crate) fn create_audio_renderer(
     env: &mut Env<'_>,
     iid: Iid,
