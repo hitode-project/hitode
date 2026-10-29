@@ -75,9 +75,11 @@ MCI. Build it as its header describes into `ADV_WINE_PROBES`, then run
 ## Tests
 
 ```sh
-cargo test -p <crate>
+cargo nextest run -p <crate>
 python3 -m unittest discover -s tools/<folder>
 ```
+
+- Every test run has a timeout, so a hang fails instead of running on. `cargo nextest run` kills a test after 5 minutes (`.config/nextest.toml`); install it with `brew install cargo-nextest` or `cargo install cargo-nextest --locked`. Under plain `cargo test`, on Unix hosts, `tools/test-timeout.sh` fails a whole test binary after 15 minutes (`ADV_TEST_LIMIT` seconds). Doctests run outside both.
 
 - Run the tests of the crates you changed. The full workspace suite is for batched changes and baseline updates.
 - `python3 tools/codec/png_reference.py` downloads checksum-pinned libpng sources

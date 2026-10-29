@@ -3,5 +3,10 @@
 # the slow matrices; weekly and manual CI runs enable them.
 test-full = ["test", "--workspace", "--features", "adv-device/slow-tests"]
 
+# Test binaries that hang fail with a timeout (tools/test-timeout.sh); the
+# simulator runner below takes precedence on its target.
+[target.'cfg(unix)']
+runner = "tools/test-timeout.sh"
+
 [target.aarch64-apple-ios-sim]
 runner = "tools/ios/sim-test.sh"
