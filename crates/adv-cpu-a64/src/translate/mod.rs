@@ -53,6 +53,7 @@ mod integer;
 mod native_region;
 mod ops;
 mod pixels;
+mod residency;
 mod simd;
 mod strings;
 pub(crate) mod tables;
@@ -361,10 +362,18 @@ enum Cold {
     Edge {
         label: Label,
         state: State,
+        vector: simd::Vector,
         from: usize,
         to: usize,
         /// What an x87 run it leaves from does first.
         x87: Option<x87::Arrive>,
+    },
+    /// A backward edge arriving without some of its merge's entry set.
+    Load {
+        label: Label,
+        vector: simd::Vector,
+        entry: u16,
+        target: Label,
     },
     /// A backward edge whose check failed: undo it, then leave if the
     /// branch is taken.
@@ -451,6 +460,8 @@ struct Translator<'a> {
     /// Of those, the ones it does not write.
     keep: FlagSet,
     vector: simd::Vector,
+    /// The SIMD registers each merge holds on arrival (`residency`).
+    entry: Vec<u16>,
     pixel: Option<pixels::Active>,
     pixel_copies: Vec<pixels::Copy>,
     uses_permissions: &'a mut bool,
@@ -559,6 +570,7 @@ impl Backend for Jit<'_> {
             out: FlagSet::ALL,
             keep: FlagSet::ALL,
             vector: simd::Vector::default(),
+            entry: residency::entries(trace, self.checked),
             pixel: None,
             pixel_copies: Vec::new(),
             uses_permissions,
@@ -659,9 +671,8 @@ impl Translator<'_> {
             self.x87_merge(index);
         }
         if !steady && (trace.head(index) || trace.merge[index]) {
-            // Control may arrive from elsewhere.
-            self.flush_simd();
-            self.vector = simd::Vector::default();
+            // Control may arrive from elsewhere, holding the entry set.
+            self.coerce(self.entry[index]);
         } else if !matches!(inst.op, decode::Op::Simd(_) | decode::Op::X87(_)) {
             // Other instructions may use x5.
             self.vector.cpu = false;
@@ -722,7 +733,7 @@ impl Translator<'_> {
 
     /// An unconditional internal edge from the current instruction.
     fn jump(&mut self, to: usize) {
-        self.flush_simd();
+        self.coerce(self.entry[to]);
         self.convert(self.trace.live_in[to]);
         let net = self.trace.net(self.index, to);
         if net > 0 {
@@ -747,7 +758,9 @@ impl Translator<'_> {
 
     /// A jcc at the current instruction whose taken edge is `taken`.
     fn branch(&mut self, cc: decode::Cc, taken: Edge) {
-        if self.pixel.is_none() {
+        // Internal edges publish on both paths, as merges hold nothing
+        // dirty; a side exit's cold path publishes for itself.
+        if self.pixel.is_none() && matches!(taken, Edge::Internal(_)) {
             self.flush_simd();
         }
         let from = self.index;
@@ -762,7 +775,18 @@ impl Translator<'_> {
                 } else {
                     self.trace.live_in[to]
                 });
-                let target = pixel.map_or(self.labels[to], |p| p.entry);
+                let mut target = pixel.map_or(self.labels[to], |p| p.entry);
+                if pixel.is_none() && !self.holds(self.entry[to]) {
+                    // Only paths that dropped the cache get here.
+                    let load = self.asm.label();
+                    self.push_cold(Cold::Load {
+                        label: load,
+                        vector: self.vector,
+                        entry: self.entry[to],
+                        target,
+                    });
+                    target = load;
+                }
                 let test = self.test(cc);
                 let net = self.trace.net(from, to);
                 if net > 0 {
@@ -799,6 +823,7 @@ impl Translator<'_> {
                     self.push_cold(Cold::Edge {
                         label,
                         state: self.state,
+                        vector: self.vector,
                         from,
                         to,
                         x87: None,
@@ -811,6 +836,7 @@ impl Translator<'_> {
                 if self.trace.net(from, to) == 0
                     && !self.needs(self.trace.live_in[to])
                     && x87.is_none()
+                    && self.holds(self.entry[to])
                 {
                     self.jump_if(test, self.labels[to]);
                 } else {
@@ -819,6 +845,7 @@ impl Translator<'_> {
                     self.push_cold(Cold::Edge {
                         label,
                         state: self.state,
+                        vector: self.vector,
                         from,
                         to,
                         x87,
@@ -1372,17 +1399,30 @@ impl Translator<'_> {
             Cold::Edge {
                 label,
                 state,
+                vector,
                 from,
                 to,
                 x87,
             } => {
                 self.asm.bind(label);
                 self.state = state;
+                self.vector = vector;
                 self.index = from;
                 if let Some(x87) = x87 {
                     self.x87_arrive(x87, from, to);
                 }
                 self.jump(to);
+            }
+            Cold::Load {
+                label,
+                vector,
+                entry,
+                target,
+            } => {
+                self.asm.bind(label);
+                self.vector = vector;
+                self.coerce(entry);
+                self.asm.b(target);
             }
             Cold::Refuse {
                 label,

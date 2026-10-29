@@ -2,17 +2,16 @@
 //!
 //! A unit caches MMX registers in d8-d15 and XMM registers in v16-v23.
 //! A register is loaded from `CpuState` when the unit first reads it.
-//! XMM writes immediately update `CpuState`, except inside integer pixel loops.
-//! MMX writes mark d8-d15 dirty;
-//! control edges outside those loops, helpers, host calls and x87/EMMS entries
-//! spill them to MMX and the aliased x87 significand and exponent (0xffff).
-//! Pixel-loop exits also publish dirty XMM registers. Direct faults record
-//! both dirty masks and recover that prefix from the
-//! signal context before re-executing the interrupted instruction.
-//! The cache is forgotten where control can arrive from elsewhere
-//! (region heads and merges) and after a helper, which may change any
-//! register; d8-d15 survive the Rust calls between, and the `access`
-//! stub keeps v0-v7 and v16-v23.
+//! Writes mark it dirty; internal edges outside integer pixel loops,
+//! exits, helpers, host calls and x87/EMMS entries publish dirty MMX to MMX
+//! and the aliased x87 significand and exponent (0xffff), and dirty XMM to
+//! XMM. Direct faults record the dirty mask and recover that prefix from
+//! the signal context before re-executing the interrupted instruction.
+//! Region heads hold nothing; a merge holds its entry set
+//! (`translate::residency`), which arrivals load what they lack of.
+//! A helper may change any register, so the cache is forgotten after one;
+//! d8-d15 survive the Rust calls between, and the `access` and `apply`
+//! stubs keep v0-v7 and v16-v23.
 //!
 //! The first MMX instruction after the cache is forgotten leaves for the
 //! interpreter if an x87 exception is pending, and once it completes sets
@@ -219,6 +218,37 @@ impl Simd {
     /// Whether the destination is 128 bits wide.
     fn full(&self) -> bool {
         matches!(self.dst, Loc::Xmm(_))
+    }
+
+    /// The registers it surely reads and those it may write, as
+    /// `Vector::dirty` numbers them (`translate::residency`).
+    pub fn footprint(&self) -> (u16, u16) {
+        let bit = |loc| match loc {
+            Loc::Mmx(n) => 1u16 << n,
+            Loc::Xmm(n) => 1 << (8 + n),
+            _ => 0,
+        };
+        // As the lowering below reads its destination.
+        let reads_dst = match self.kind {
+            Kind::Emms | Kind::Move | Kind::ExtractWord | Kind::ByteMask | Kind::StoreControl => {
+                false
+            }
+            Kind::ShiftBytes(_) => self.imm < 16,
+            Kind::ShiftImm(op, log2) => {
+                let bits = Arr::new(u32::from(log2), self.full()).bits();
+                u32::from(self.imm) < bits || op == ShiftImm::Sshr
+            }
+            Kind::FlagCompare(_) => true,
+            _ => !self.floating(),
+        };
+        let writes = match self.kind {
+            Kind::FlagCompare(_) => 0,
+            _ => bit(self.dst),
+        };
+        (
+            bit(self.src) | if reads_dst { bit(self.dst) } else { 0 },
+            writes,
+        )
     }
 }
 
@@ -498,8 +528,6 @@ pub struct Vector {
     mmx: u8,
     /// MMX (bits 0–7) and XMM (bits 8–15) needing publication.
     pub dirty: u16,
-    /// Integer pixel loops defer XMM publication until an observer.
-    pub deferred: bool,
     /// XMM registers in v16-v23, by bit.
     xmm: u8,
     /// No x87 exception is pending, and TOP and the tags are 0.
@@ -1404,7 +1432,7 @@ impl Translator<'_> {
         }
     }
 
-    /// Defers MMX writes and pixel-loop XMM writes; publishes other XMM writes.
+    /// Defers the write until an edge or observer publishes it.
     fn written(&mut self, loc: Loc) {
         match loc {
             Loc::Mmx(n) => {
@@ -1413,16 +1441,36 @@ impl Translator<'_> {
             }
             Loc::Xmm(n) => {
                 self.vector.xmm |= 1 << n;
-                if self.vector.deferred {
-                    self.vector.dirty |= 1 << (8 + n);
-                    return;
-                }
-                self.cpu();
-                let offset = runtime::XMM + 16 * u32::from(n);
-                self.at_cpu(false, VMem::Q, VReg::new(16 + n), offset);
+                self.vector.dirty |= 1 << (8 + n);
             }
             _ => unreachable!("not a SIMD register"),
         }
+    }
+
+    /// Whether the cache holds every register of `entry`, a merge's entry
+    /// set (`translate::residency`).
+    pub(super) fn holds(&self, entry: u16) -> bool {
+        let held = u16::from(self.vector.mmx) | u16::from(self.vector.xmm) << 8;
+        entry & !held == 0
+    }
+
+    /// Arrives at a merge whose entry set is `entry`: publishes, loads what
+    /// the cache lacks of it, and forgets the rest.
+    pub(super) fn coerce(&mut self, entry: u16) {
+        self.flush_simd();
+        for n in 0..8 {
+            if entry & (1 << n) != 0 {
+                self.register(Loc::Mmx(n));
+            }
+            if entry & (1 << (8 + n)) != 0 {
+                self.register(Loc::Xmm(n));
+            }
+        }
+        self.vector = Vector {
+            mmx: entry as u8,
+            xmm: (entry >> 8) as u8,
+            ..Vector::default()
+        };
     }
 
     /// Publishes the SIMD prefix without changing flags, addresses, x5 or SIMD
