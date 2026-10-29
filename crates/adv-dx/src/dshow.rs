@@ -115,6 +115,12 @@ pub(crate) const IID_IMEDIAPOSITION: Iid = quartz(0x56a8_68b2);
 pub(crate) const IID_IBASICAUDIO: Iid = quartz(0x56a8_68b3);
 pub(crate) const IID_IVIDEOWINDOW: Iid = quartz(0x56a8_68b4);
 pub(crate) const IID_IBASICVIDEO: Iid = quartz(0x56a8_68b5);
+pub(crate) const IID_IOBJECTWITHSITE: Iid = guid(
+    0xfc48_01a3,
+    0x2ba9,
+    0x11cf,
+    [0xa2, 0x29, 0x00, 0xaa, 0x00, 0x3d, 0x73, 0x52],
+);
 pub(crate) const IID_IMEDIAFILTER: Iid = quartz(0x56a8_6899);
 pub(crate) const IID_IBASEFILTER: Iid = quartz(0x56a8_6895);
 pub(crate) const IID_IENUMFILTERS: Iid = quartz(0x56a8_6893);
@@ -210,6 +216,7 @@ pub(crate) enum Face {
     BasicVideo,
     VideoWindow,
     MediaFilter,
+    ObjectWithSite,
     BaseFilter,
     FileSource,
     EnumFilters,
@@ -222,7 +229,7 @@ pub(crate) enum Face {
     DmoWrapper,
 }
 
-const FACES: [(Face, &str); 20] = [
+const FACES: [(Face, &str); 21] = [
     (Face::FilterGraph, "IFilterGraph2"),
     (Face::MediaControl, "IMediaControl"),
     (Face::MediaEvent, "IMediaEventEx"),
@@ -233,6 +240,7 @@ const FACES: [(Face, &str); 20] = [
     (Face::BasicVideo, "IBasicVideo"),
     (Face::VideoWindow, "IVideoWindow"),
     (Face::MediaFilter, "IMediaFilter"),
+    (Face::ObjectWithSite, "IObjectWithSite"),
     (Face::BaseFilter, "IBaseFilter"),
     (Face::FileSource, "IFileSourceFilter"),
     (Face::EnumFilters, "IEnumFilters"),
@@ -262,6 +270,7 @@ impl Face {
             Face::BasicVideo => &[IID_IBASICVIDEO],
             Face::VideoWindow => &[IID_IVIDEOWINDOW],
             Face::MediaFilter => &[IID_IMEDIAFILTER, IID_IPERSIST],
+            Face::ObjectWithSite => &[IID_IOBJECTWITHSITE],
             Face::BaseFilter => &[IID_IBASEFILTER, IID_IMEDIAFILTER, IID_IPERSIST],
             Face::FileSource => &[IID_IFILESOURCEFILTER],
             Face::EnumFilters => &[IID_IENUMFILTERS],
@@ -609,7 +618,8 @@ fn dispatch(env: &mut Env<'_>) -> Outcome {
         | Face::BasicAudio
         | Face::BasicVideo
         | Face::VideoWindow
-        | Face::MediaFilter => graph::call(env, face, &method, this),
+        | Face::MediaFilter
+        | Face::ObjectWithSite => graph::call(env, face, &method, this),
         Face::BaseFilter
         | Face::FileSource
         | Face::EnumFilters

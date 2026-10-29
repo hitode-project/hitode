@@ -48,7 +48,7 @@ This spec covers the native audio and video API front ends: DirectSound storage,
 
 ### MEDIA-GRAPH-1 Graph interfaces
 
-**Rule**: Graph interfaces MUST share identity and state for connection, playback, events, seeking, position, volume, and event reception. System splitting and decoding MUST use the common media decoder.
+**Rule**: Graph interfaces MUST share identity and state for connection, playback, events, seeking, position, volume, and event reception. The graph MUST hold one reference to its IObjectWithSite site, which GetSite queries, until replaced or released. System splitting and decoding MUST use the common media decoder.
 **Verification**: Test
 
 ### MEDIA-GRAPH-2 File sources
