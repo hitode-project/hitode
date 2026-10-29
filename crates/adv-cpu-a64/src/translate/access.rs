@@ -17,6 +17,8 @@ use super::{Cold, RUNTIME, Translator, WINDOW, X3, X4, X5, biased, host};
 use crate::runtime::{self, ACCESS_SIGNED, ACCESS_STORE};
 use adv_cpu_core::memory::{EXEC, READ, SHARED, WRITE};
 
+pub(super) const PAGE_SHIFT: u32 = 12;
+
 /// An address operand ready for a load or store.
 #[derive(Clone, Copy)]
 pub(super) enum Addr {
@@ -222,31 +224,8 @@ impl Translator<'_> {
         slow: Label,
     ) -> (Label, Label) {
         let alias = self.asm.label();
-        if width > 1 {
-            // The last byte's address differs in bit 12 exactly when the
-            // access crosses a page.
-            self.emit_all(&[
-                add_imm(W, X4, address, width - 1, false),
-                eor(W, X4, X4, address, Lsl, 0),
-            ]);
-            self.asm.tbz(true, X4, 12, slow);
-        }
-        self.emit_all(&[
-            ldr(X, X3, RUNTIME, runtime::CLASSES),
-            lsr_imm(W, X4, address, 12),
-            ldr_narrow(Narrow::Byte, X4, X3, X4),
-        ]);
-        // Permitted, not shared, and for a store not a code barrier.
-        let bit = |permission: u8| permission.trailing_zeros();
-        let (needed, excluded) = if store {
-            (WRITE, &[EXEC, SHARED][..])
-        } else {
-            (READ, &[SHARED][..])
-        };
-        self.asm.tbz(false, X4, bit(needed), slow);
-        for &permission in excluded {
-            self.asm.tbz(true, X4, bit(permission), alias);
-        }
+        self.page_crossing(address, width, slow);
+        self.check_class(address, runtime::CLASSES, store, alias, slow);
         let (site, resume) = (self.asm.label(), self.asm.label());
         self.asm.bind(site);
         self.site();
@@ -255,20 +234,60 @@ impl Translator<'_> {
         self.asm.bind(alias);
         // The window class already granted the guest R/W bit, so this index
         // is inside Memory's raw table even when its base is not zero.
-        self.emit_all(&[
-            ldr(X, X3, RUNTIME, runtime::ALIAS_CLASSES),
-            lsr_imm(W, X4, address, 12),
-            ldr_narrow(Narrow::Byte, X4, X3, X4),
-        ]);
-        self.asm.tbz(false, X4, bit(needed), slow);
-        for &permission in excluded {
-            self.asm.tbz(true, X4, bit(permission), slow);
-        }
+        self.checked_alias(address, store, slow);
         self.emit(ldr(X, X3, RUNTIME, runtime::ALIAS));
         self.site();
         // Keep the access width and extension; only replace its base register.
         self.emit((direct & !(31 << 5)) | (X3.number() << 5));
         self.asm.bind(resume);
         (site, resume)
+    }
+
+    /// Branch when the last byte enters another page, preserving NZCV.
+    pub(super) fn page_crossing(&mut self, address: Reg, width: u32, crossing: Label) {
+        if width > 1 {
+            self.emit_all(&[
+                add_imm(W, X4, address, width - 1, false),
+                eor(W, X4, X4, address, Lsl, 0),
+            ]);
+            self.asm.tbz(true, X4, PAGE_SHIFT, crossing);
+        }
+    }
+
+    /// Select the window or alias for one page. Uses x3 and x4, preserving NZCV.
+    pub(super) fn checked_base(&mut self, address: Reg, store: bool, base: Reg, slow: Label) {
+        let (alias, done) = (self.asm.label(), self.asm.label());
+        self.check_class(address, runtime::CLASSES, store, alias, slow);
+        self.emit(mov(X, base, WINDOW));
+        self.asm.b(done);
+        self.asm.bind(alias);
+        self.checked_alias(address, store, slow);
+        self.emit(ldr(X, base, RUNTIME, runtime::ALIAS));
+        self.asm.bind(done);
+    }
+
+    /// Verify the alias class after the window class granted the guest permission.
+    pub(super) fn checked_alias(&mut self, address: Reg, store: bool, slow: Label) {
+        self.check_class(address, runtime::ALIAS_CLASSES, store, slow, slow);
+    }
+
+    /// Test guest permission and excluded classes with the same scratch and NZCV contract.
+    fn check_class(&mut self, address: Reg, table: u32, store: bool, excluded: Label, slow: Label) {
+        self.emit_all(&[
+            ldr(X, X3, RUNTIME, table),
+            lsr_imm(W, X4, address, PAGE_SHIFT),
+            ldr_narrow(Narrow::Byte, X4, X3, X4),
+        ]);
+        // Permitted, not shared, and for a store not a code barrier.
+        let bit = |permission: u8| permission.trailing_zeros();
+        let (needed, blocked) = if store {
+            (WRITE, &[EXEC, SHARED][..])
+        } else {
+            (READ, &[SHARED][..])
+        };
+        self.asm.tbz(false, X4, bit(needed), slow);
+        for &permission in blocked {
+            self.asm.tbz(true, X4, bit(permission), excluded);
+        }
     }
 }

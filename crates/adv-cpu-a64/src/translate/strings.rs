@@ -13,17 +13,26 @@
 //! As in the interpreter, each element of a REP is a unit of the countdown.
 //! When one unit is left, the `interpret` helper runs the next element, so
 //! a REP the countdown cannot finish stops part way exactly as in the
-//! interpreter, flags and continuation included. Checked
-//! instructions (A64-MEM-6) and segment or address-size overrides stay with the
-//! interpreter too.
+//! interpreter, flags and continuation included. Checked instructions reuse
+//! the loop, caching each pointer's page and window or alias base. Entering
+//! a different page, including an element's last byte, uses the access
+//! emitter's permission checks without changing NZCV. A crossing element
+//! needs one view that allows both pages. A blocked element hands its current
+//! state to the interpreter. Segment or address-size overrides
+//! stay with the interpreter.
 
 use iced_x86::{Code, Instruction, Register};
 
+use crate::asm::Label;
 use crate::encode::Shift::Lsl;
 use crate::encode::Size::{W, X};
 use crate::encode::*;
 
-use super::{State, Translator, WINDOW, X6, X9, X10, X11, X12, X16, X17, host, temp};
+use super::access::PAGE_SHIFT;
+use super::{
+    State, Translator, WINDOW, X0, X1, X2, X4, X5, X6, X9, X10, X11, X12, X13, X14, X15, X16, X17,
+    host, temp,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -50,7 +59,7 @@ pub struct Strings {
     /// 1, 2 or 4 bytes.
     pub width: u8,
     pub rep: Rep,
-    /// The helper that runs the instruction when it is checked.
+    /// The helper that finishes the instruction on the slow path.
     pub helper: u8,
 }
 
@@ -120,23 +129,21 @@ pub fn plan(instruction: &Instruction, helper: u8) -> Option<Strings> {
 impl Translator<'_> {
     pub(super) fn strings(&mut self, op: Strings) {
         self.flush_simd();
-        if self.checking {
-            self.helper(op.helper);
-            return;
-        }
         self.canonicalize();
         let (narrow, log) = match op.width {
             1 => (Some(Narrow::Byte), 0),
             2 => (Some(Narrow::Half), 1),
             _ => (None, 2),
         };
-        let load = |rt: Reg, address: Reg| match narrow {
-            Some(narrow) => ldr_narrow(narrow, rt, WINDOW, address),
-            None => ldr_reg(W, rt, WINDOW, address, false),
+        let source = if self.checking { X2 } else { WINDOW };
+        let destination = if self.checking { X15 } else { WINDOW };
+        let load = |rt: Reg, address: Reg, base: Reg| match narrow {
+            Some(narrow) => ldr_narrow(narrow, rt, base, address),
+            None => ldr_reg(W, rt, base, address, false),
         };
         let store = |rt: Reg, address: Reg| match narrow {
-            Some(narrow) => str_narrow(narrow, rt, WINDOW, address),
-            None => str_reg(W, rt, WINDOW, address, false),
+            Some(narrow) => str_narrow(narrow, rt, destination, address),
+            None => str_reg(W, rt, destination, address, false),
         };
         let (eax, ecx, esi, edi) = (host(EAX), host(ECX), host(ESI), host(EDI));
         let rep = op.rep != Rep::None;
@@ -155,12 +162,30 @@ impl Translator<'_> {
             movz(W, X17, u16::from(op.width), 0),
             sub(W, X17, X17, X12, Lsl, log + 1),
         ]);
+        if self.checking {
+            // No guest page has this index: the first element checks both pointers.
+            self.emit_all(&[movz(W, X13, 0xffff, 16), movz(W, X14, 0xffff, 16)]);
+        }
         self.asm.bind(top);
+        if self.checking {
+            if matches!(op.kind, Kind::Movs | Kind::Lods | Kind::Cmps) {
+                self.string_page(esi, op.width, false, (X13, X0, source), slow);
+            }
+            if op.kind != Kind::Lods {
+                self.string_page(
+                    edi,
+                    op.width,
+                    matches!(op.kind, Kind::Movs | Kind::Stos),
+                    (X14, X1, destination),
+                    slow,
+                );
+            }
+        }
         // The compared operands: the left one and w7.
         let left = match op.kind {
             Kind::Movs => {
                 self.site();
-                self.emit(load(X6, esi));
+                self.emit(load(X6, esi, source));
                 self.site();
                 self.emit_all(&[
                     store(X6, edi),
@@ -176,7 +201,7 @@ impl Translator<'_> {
             }
             Kind::Lods => {
                 self.site();
-                self.emit(load(X6, esi));
+                self.emit(load(X6, esi, source));
                 self.emit_all(&[
                     match op.width {
                         4 => mov(W, eax, X6),
@@ -188,15 +213,18 @@ impl Translator<'_> {
             }
             Kind::Scas => {
                 self.site();
-                self.emit_all(&[load(temp(0), edi), add(W, edi, edi, X17, Lsl, 0)]);
+                self.emit_all(&[
+                    load(temp(0), edi, destination),
+                    add(W, edi, edi, X17, Lsl, 0),
+                ]);
                 Some(eax)
             }
             Kind::Cmps => {
                 self.site();
-                self.emit(load(X6, esi));
+                self.emit(load(X6, esi, source));
                 self.site();
                 self.emit_all(&[
-                    load(temp(0), edi),
+                    load(temp(0), edi, destination),
                     add(W, esi, esi, X17, Lsl, 0),
                     add(W, edi, edi, X17, Lsl, 0),
                 ]);
@@ -226,13 +254,58 @@ impl Translator<'_> {
         if let Some(left) = left {
             self.compare(left, temp(0), op.width);
         }
-        if rep {
+        if rep || self.checking {
             self.asm.b(done);
             self.asm.bind(slow);
             self.helper(op.helper);
         }
         self.asm.bind(done);
         self.state = State::CANONICAL;
+    }
+
+    /// Cache one pointer's last checked page and base, selecting a base for this element.
+    fn string_page(
+        &mut self,
+        address: Reg,
+        width: u8,
+        store: bool,
+        (page, base, element): (Reg, Reg, Reg),
+        slow: Label,
+    ) {
+        let same = self.asm.label();
+        self.emit_all(&[
+            lsr_imm(W, X4, address, PAGE_SHIFT),
+            eor(W, X4, X4, page, Lsl, 0),
+        ]);
+        self.asm.cbz(W, false, X4, same);
+        self.checked_base(address, store, base, slow);
+        self.emit(lsr_imm(W, page, address, PAGE_SHIFT));
+        self.asm.bind(same);
+        self.emit(mov(X, element, base));
+        if width > 1 {
+            let (crossing, done) = (self.asm.label(), self.asm.label());
+            self.page_crossing(address, u32::from(width), crossing);
+            self.asm.b(done);
+            self.asm.bind(crossing);
+            self.emit(add_imm(W, X5, address, u32::from(width) - 1, false));
+            self.checked_base(X5, store, base, slow);
+            self.emit_all(&[
+                lsr_imm(W, page, X5, PAGE_SHIFT),
+                eor(X, X4, element, base, Lsl, 0),
+            ]);
+            self.asm.cbz(X, false, X4, done);
+            // Mixed views need the alias on both pages. Verify the raw class
+            // of the window page too; its window grant may cover LINEAR or EXEC.
+            let last = self.asm.label();
+            self.emit(eor(X, X4, element, WINDOW, Lsl, 0));
+            self.asm.cbz(X, true, X4, last);
+            self.checked_alias(address, store, slow);
+            self.emit(mov(X, element, base));
+            self.asm.b(done);
+            self.asm.bind(last);
+            self.checked_alias(X5, store, slow);
+            self.asm.bind(done);
+        }
     }
 
     /// Canonical flags of `left - right` at `width`; `left` may have bits
