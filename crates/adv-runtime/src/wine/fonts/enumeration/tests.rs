@@ -16,3 +16,14 @@ fn encoded_strings_keep_guest_codepage_and_complete_dbcs_characters() {
     assert_eq!(&wide[..4], &[0x3d, 0xd8, 0x00, 0xde]);
     assert_eq!(&wide[4..], &[0, 0]);
 }
+
+// spec: WIN32-GDI-12
+#[test]
+fn full_enumerations_list_faces_that_fit_ansi_buffers() {
+    let codec = adv_os::Codec::new(932);
+    assert!(listed(&codec, "ＭＳ Ｐゴシック"));
+    // 28 bytes in Shift_JIS, then 36: engines copy these into 32-byte buffers.
+    assert!(listed(&codec, "游明朝体+36ポかな ミディアム"));
+    assert!(!listed(&codec, "游明朝体+36ポかな エクストラボールド"));
+    assert!(!listed(&codec, "Avenir Next Condensed Ultra Light"));
+}

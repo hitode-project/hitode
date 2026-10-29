@@ -203,6 +203,10 @@ pub(super) fn start_w(
     };
     start(env, dc, face, callback, param, mode, true)
 }
+/// A face name fits LF_FACESIZE both in UTF-16 and in the guest's ANSI code page.
+fn listed(codec: &adv_os::nls::Codec, face: &str) -> bool {
+    face.encode_utf16().count() < 32 && codec.encode(face).len() < 32
+}
 const SCRATCH: u32 = 512;
 const METRICS_OFFSET: u32 = 352;
 struct Enumeration {
@@ -258,6 +262,14 @@ pub(super) fn start(
             return Outcome::Return(0);
         }
     };
+    let mut fonts = fonts;
+    if face.as_deref().is_none_or(str::is_empty) {
+        // GDI names fit LF_FACESIZE even in the ANSI code page, and engines
+        // copy them into fixed buffers. Longer host names stay selectable but
+        // are not listed.
+        let codec = &env.ext.get::<Fonts>().codec;
+        fonts.retain(|font| listed(codec, &font.font.face));
+    }
     if fonts.is_empty() {
         return Outcome::Return(1);
     }
