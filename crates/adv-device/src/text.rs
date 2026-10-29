@@ -495,7 +495,11 @@ pub struct Text {
     glyphs: BTreeMap<(FontRequest, GlyphRequest), Arc<Glyph>>,
     bytes: usize,
     hits: u64,
+    /// Enumerations by face, mode and language: each reads every font, and
+    /// engines repeat them. Dropped with the fonts.
+    enumerations: std::sync::Mutex<Vec<(Enumerated, Vec<EnumeratedFont>)>>,
 }
+type Enumerated = (Option<String>, FontEnumeration, Option<&'static str>);
 
 /// Explicit host font substitutions and text paint quality. Guest outline formats remain unchanged.
 #[derive(Clone, Debug, Default)]
@@ -656,6 +660,23 @@ impl Text {
         face: Option<&str>,
         mode: FontEnumeration,
     ) -> Result<Vec<EnumeratedFont>, TextError> {
+        let key = (face.map(str::to_owned), mode, self.backend.language);
+        let mut cache = self
+            .enumerations
+            .lock()
+            .map_err(|_| TextError::Font("font cache lock poisoned".into()))?;
+        if let Some((_, fonts)) = cache.iter().find(|(known, _)| *known == key) {
+            return Ok(fonts.clone());
+        }
+        let fonts = self.enumerate_fonts(face, mode)?;
+        cache.push((key, fonts.clone()));
+        Ok(fonts)
+    }
+    fn enumerate_fonts(
+        &self,
+        face: Option<&str>,
+        mode: FontEnumeration,
+    ) -> Result<Vec<EnumeratedFont>, TextError> {
         if let Some(face) = face
             && let Some(target) = self
                 .overrides
@@ -714,6 +735,9 @@ impl Text {
     /// Refresh font matching after a resource reference changes without a new
     /// backend registration (for example a personality's repeated add/remove).
     pub fn invalidate_fonts(&mut self) {
+        if let Ok(enumerations) = self.enumerations.get_mut() {
+            enumerations.clear();
+        }
         self.fonts.clear();
         self.glyphs.clear();
         self.bytes = 0;
