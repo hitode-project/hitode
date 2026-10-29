@@ -923,7 +923,7 @@ impl Translator<'_> {
 
     /// The prologue of a run from the current instruction.
     fn x87_open(&mut self) -> bool {
-        if self.pixel.is_some() || self.cacheable(self.index).is_none() {
+        if self.cacheable(self.index).is_none() {
             return false;
         }
         let start = self.index;

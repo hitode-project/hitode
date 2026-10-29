@@ -85,7 +85,7 @@ impl Translator<'_> {
     }
 
     pub(super) fn native_batch(&mut self, index: usize) {
-        if self.x87.active || self.pixel.is_some() {
+        if self.x87.active {
             return;
         }
         let regions: Vec<_> = self

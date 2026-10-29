@@ -15,9 +15,8 @@
 //! path reads before writing them again are not computed. Every exit makes
 //! the flags canonical, an internal edge only those its target reads, and
 //! every fault site records sense, carry, flag recipes and the SIMD dirty mask for
-//! the owner. MMX values are published before control edges and observers
-//! (A64F-FP-4), except integer pixel-loop backedges (A64-TR-5). XMM writes
-//! remain immediate outside those loops.
+//! the owner. SIMD values are published before observers and at edges
+//! into merges that do not keep them dirty (A64F-FP-4, A64-REG-5).
 //!
 //! Memory accesses go straight to the window, where a host fault at a
 //! site reaches the owner (A64-MEM-5, A64-MEM-6). Instructions the owner has seen fault
@@ -52,7 +51,6 @@ mod flags;
 mod integer;
 mod native_region;
 mod ops;
-mod pixels;
 mod residency;
 mod simd;
 mod strings;
@@ -464,8 +462,6 @@ struct Translator<'a> {
     vector: simd::Vector,
     /// What each merge holds on arrival (`residency`).
     entry: Vec<residency::Entry>,
-    pixel: Option<pixels::Active>,
-    pixel_copies: Vec<pixels::Copy>,
     uses_permissions: &'a mut bool,
     /// The x87 run whose stack lives in host registers, if any.
     x87: x87::Cache,
@@ -573,8 +569,6 @@ impl Backend for Jit<'_> {
             keep: FlagSet::ALL,
             vector: simd::Vector::default(),
             entry: residency::entries(trace, self.checked),
-            pixel: None,
-            pixel_copies: Vec::new(),
             uses_permissions,
             x87: x87::Cache::default(),
             x87_sites: Vec::new(),
@@ -664,11 +658,10 @@ impl Translator<'_> {
         {
             self.host_nzv(FlagSet::NZV.minus(inst.effects.writes));
         }
-        let steady = self.pixel.is_some_and(|p| p.steady);
         if self.x87.active && trace.merge[index] {
             self.x87_merge(index);
         }
-        if !steady && (trace.head(index) || trace.merge[index]) {
+        if trace.head(index) || trace.merge[index] {
             // Control may arrive from elsewhere, holding the entry; edges
             // arrive through `jump` and `branch`.
             if index > 0 && trace.insts[index - 1].next == Next::Fall {
@@ -680,7 +673,7 @@ impl Translator<'_> {
             // Other instructions may use x5.
             self.vector.cpu = false;
         }
-        if !steady && trace.head(index) {
+        if trace.head(index) {
             // Arrivals are canonical: the entry, or a return.
             let prepaid = trace.prepaid(index);
             let refuse = self.asm.label();
@@ -697,23 +690,17 @@ impl Translator<'_> {
                 x87: None,
             });
             self.state = State::CANONICAL;
-        } else if !steady && trace.merge[index] {
+        } else if trace.merge[index] {
             self.convert(trace.live_in[index]);
             self.state = State::CANONICAL;
         }
-        if !steady {
-            self.asm.bind(self.labels[index]);
-            self.native_batch(index);
-            self.pixel_start(index);
-            self.channel_batch(index);
-        }
+        self.asm.bind(self.labels[index]);
+        self.native_batch(index);
+        self.channel_batch(index);
         if self.x87.active && !matches!(inst.op, decode::Op::X87(_)) {
             self.x87_integer();
         }
         self.op(inst);
-        if self.pixel_end() {
-            return;
-        }
         if let Next::Edge(edge) = inst.next {
             self.follow(edge);
         }
@@ -761,25 +748,18 @@ impl Translator<'_> {
 
     /// A jcc at the current instruction whose taken edge is `taken`.
     fn branch(&mut self, cc: decode::Cc, taken: Edge) {
-        // Internal edges publish on both paths, as merges hold nothing
-        // dirty; a side exit's cold path publishes for itself.
-        if self.pixel.is_none() && matches!(taken, Edge::Internal(_)) {
-            self.flush_simd();
+        // Internal edges publish on both paths what their merge does not
+        // count dirty; a side exit's cold path publishes for itself.
+        if let Edge::Internal(to) = taken {
+            self.publish(!self.entry[to].dirty);
         }
         let from = self.index;
         match taken {
             Edge::Internal(to) if to <= from => {
                 // A loop: convert on both paths, then check inline.
-                let pixel = self
-                    .pixel
-                    .filter(|p| p.plan.end == from && p.plan.start == to);
-                self.convert(if pixel.is_some() {
-                    FlagSet::ALL
-                } else {
-                    self.trace.live_in[to]
-                });
-                let mut target = pixel.map_or(self.labels[to], |p| p.entry);
-                if pixel.is_none() && !self.holds(self.entry[to]) {
+                self.convert(self.trace.live_in[to]);
+                let mut target = self.labels[to];
+                if !self.holds(self.entry[to]) {
                     // Only paths that dropped the cache get here.
                     let load = self.asm.label();
                     self.push_cold(Cold::Load {
@@ -1533,7 +1513,6 @@ impl Translator<'_> {
     }
 
     fn finish(mut self, at: usize) {
-        self.pixel_copies();
         // Cold code goes in the order it was asked for, so a tbz anywhere
         // in the body is no farther from its target than the body or the
         // short cold code is long. Long x87 paths, reached only by wider

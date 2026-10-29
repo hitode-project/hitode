@@ -1,18 +1,26 @@
-//! SIMD residency across merges (A64-REG-5).
+//! SIMD residency across merges (A64-REG-5, A64-TR-5).
 //!
 //! A merge used to drop the SIMD cache, so a loop reloaded every MMX and
-//! XMM register it read on every iteration. Instead each merge has an entry
-//! set: registers the unit holds clean in d8-d15 and v16-v23 on arrival.
-//! Arrivals publish their dirty registers, as every edge did, and load any
-//! of the set they lack; registers outside it are forgotten.
+//! XMM register it read on every iteration. Instead each merge has an
+//! entry: registers the unit holds in d8-d15 and v16-v23 on arrival, those
+//! of them it treats as dirty, and guards. Arrivals publish their other
+//! dirty registers, load any of the entry they lack, and forget the rest.
 //!
-//! The set never adds work to a path. A register is in it only if every
-//! path from the merge reads it before writing it, dropping the cache or
-//! leaving, so a load an arrival makes replaces the one the merge's code
-//! would make. A jcc's taken edge cannot load without a branch of its own,
-//! so the set also holds only registers that every jcc arrival holds, as a
-//! forward pass over the trace finds. Paths that hold less than that pass
-//! assumed load through cold code.
+//! A register is in the entry if every path from the merge reads it before
+//! writing it, dropping the cache or leaving, so a load an arrival makes
+//! replaces the one the merge's code would make. A loop head also holds
+//! the registers its body writes when no instruction there drops the cache:
+//! the loop's entry loads them once, and its backedges then publish
+//! nothing, as a peeled first iteration would achieve with twice the code.
+//! A jcc's taken edge cannot load without a branch of its own, so the entry
+//! also holds only registers that every jcc arrival holds, as a forward
+//! pass over the trace finds. Paths that hold less than that pass assumed
+//! load through cold code.
+//!
+//! Any dirty set is correct: an arrival publishes what it holds dirty
+//! outside it, and a clean register counted dirty is only published again.
+//! A merge counts dirty what some arrival brings dirty, so no edge
+//! publishes a register the merge's code keeps writing.
 //!
 //! An entry also holds the guards (`Guards`) every arrival has passed, so
 //! loops stop rechecking pending x87 exceptions and MXCSR each iteration.
@@ -26,8 +34,10 @@ use super::trace::{Edge, Mode, Next, Trace};
 /// What a merge holds on arrival.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct Entry {
-    /// Clean SIMD registers, as `Vector::dirty` numbers them.
+    /// Cached SIMD registers, as `Vector::dirty` numbers them.
     pub regs: u16,
+    /// Those of `regs` counted dirty.
+    pub dirty: u16,
     pub guards: Guards,
 }
 
@@ -87,12 +97,29 @@ pub(super) fn entries(trace: &Trace, checked: &dyn Fn(u32) -> bool) -> Vec<Entry
             None => 0,
         };
     }
+    // Loop heads also hold what their bodies write, unless the cache drops.
+    for (index, inst) in trace.insts.iter().enumerate() {
+        let jump = match inst.next {
+            Next::Edge(edge) => Some(edge),
+            _ => None,
+        };
+        for edge in [inst.taken, jump] {
+            if let Some(Edge::Internal(head)) = edge
+                && head <= index
+                && let Some(writes) =
+                    (head..=index).try_fold(0, |writes, n| footprints[n].map(|(_, w)| writes | w))
+            {
+                need[head] |= writes;
+            }
+        }
+    }
     // Forward: registers jcc arrivals hold and guards every arrival
     // holds, narrowing loop heads until the backedges agree.
     let mut entry: Vec<_> = need
         .iter()
         .map(|&regs| Entry {
             regs,
+            dirty: 0,
             guards: Guards::ALL,
         })
         .collect();
@@ -113,6 +140,7 @@ pub(super) fn entries(trace: &Trace, checked: &dyn Fn(u32) -> bool) -> Vec<Entry
                 (None, _) => Entry::default(),
                 (Some((reads, writes)), op) => Entry {
                     regs: state.regs | reads | writes,
+                    dirty: 0,
                     guards: match op {
                         Op::Simd(simd) => simd.guarding(state.guards),
                         _ => state.guards,
@@ -131,10 +159,46 @@ pub(super) fn entries(trace: &Trace, checked: &dyn Fn(u32) -> bool) -> Vec<Entry
         for (entry, &(regs, guards)) in entry.iter_mut().zip(&held) {
             let narrowed = Entry {
                 regs: entry.regs & regs,
+                dirty: 0,
                 guards: entry.guards.meet(guards),
             };
             changed |= narrowed != *entry;
             *entry = narrowed;
+        }
+        if !changed {
+            break;
+        }
+    }
+    // Dirty: what some arrival brings dirty, widening until arrivals agree.
+    // An internal jcc publishes, on both paths, what its target does not
+    // count dirty.
+    loop {
+        let mut arrived = vec![0u16; len];
+        let mut dirty = 0;
+        for index in 0..len {
+            if trace.head(index) {
+                dirty = 0;
+            } else if trace.merge[index] {
+                if trace.insts[index - 1].next == Next::Fall {
+                    arrived[index] |= dirty;
+                }
+                dirty = entry[index].dirty;
+            }
+            let inst = trace.insts[index];
+            dirty = footprints[index].map_or(0, |(_, writes)| dirty | writes);
+            if let Some(Edge::Internal(to)) = inst.taken {
+                arrived[to] |= dirty;
+                dirty &= entry[to].dirty;
+            }
+            if let Next::Edge(Edge::Internal(to)) = inst.next {
+                arrived[to] |= dirty;
+            }
+        }
+        let mut changed = false;
+        for (entry, arrived) in entry.iter_mut().zip(arrived) {
+            let widened = entry.dirty | (arrived & entry.regs);
+            changed |= widened != entry.dirty;
+            entry.dirty = widened;
         }
         if !changed {
             return entry;
@@ -196,11 +260,24 @@ mod tests {
     // spec: A64-REG-5
     #[test]
     fn merges_hold_what_every_path_reads_and_jcc_arrivals_hold() {
-        // mm0, mm1 and xmm2 are read every iteration; xmm3 is only written.
-        assert_eq!(head_entry(0).regs, 0b11 | 1 << 10);
-        // A side exit before the reads, or a helper, makes loads speculative.
-        assert_eq!(head_entry(1).regs, 0);
-        assert_eq!(head_entry(2).regs, 0);
+        // mm0, mm1 and xmm2 are read every iteration; the body writes mm0
+        // and xmm3, which stay dirty across the backedge, and the prefix
+        // arrives with mm1 and xmm2 dirty.
+        let (written_mm0, written_xmm3) = (1u16, 1u16 << 11);
+        let entry = head_entry(0);
+        assert_eq!(entry.regs, 0b11 | 1 << 10 | written_xmm3);
+        assert_eq!(entry.dirty, entry.regs);
+        // A side exit before the reads makes their loads speculative; the
+        // written registers still stay.
+        assert_eq!(head_entry(1).regs, written_mm0 | written_xmm3);
+        // A helper in the body drops the cache every iteration.
+        assert_eq!(
+            head_entry(2),
+            Entry {
+                guards: head_entry(2).guards,
+                ..Entry::default()
+            }
+        );
     }
 
     // spec: A64-REG-5

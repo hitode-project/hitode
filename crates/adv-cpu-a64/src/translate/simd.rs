@@ -2,13 +2,13 @@
 //!
 //! A unit caches MMX registers in d8-d15 and XMM registers in v16-v23.
 //! A register is loaded from `CpuState` when the unit first reads it.
-//! Writes mark it dirty; internal edges outside integer pixel loops,
-//! exits, helpers, host calls and x87/EMMS entries publish dirty MMX to MMX
-//! and the aliased x87 significand and exponent (0xffff), and dirty XMM to
-//! XMM. Direct faults record the dirty mask and recover that prefix from
-//! the signal context before re-executing the interrupted instruction.
-//! Region heads hold nothing; a merge holds its entry set
-//! (`translate::residency`), which arrivals load what they lack of.
+//! Writes mark it dirty; exits, helpers, host calls and x87/EMMS entries
+//! publish dirty MMX to MMX and the aliased x87 significand and exponent
+//! (0xffff), and dirty XMM to XMM. Direct faults record the dirty mask and
+//! recover that prefix from the signal context before re-executing the
+//! interrupted instruction. Region heads hold nothing; a merge holds its
+//! entry (`translate::residency`): internal edges publish what it does not
+//! count dirty and load what they lack of it.
 //! A helper may change any register, so the cache is forgotten after one;
 //! d8-d15 survive the Rust calls between, and the `access` and `apply`
 //! stubs keep v0-v7 and v16-v23.
@@ -592,6 +592,7 @@ impl Vector {
         Self {
             mmx: entry.regs as u8,
             xmm: (entry.regs >> 8) as u8,
+            dirty: entry.dirty,
             guards: entry.guards,
             ..Self::default()
         }
@@ -1512,8 +1513,9 @@ impl Translator<'_> {
         entry.regs & !held == 0 && entry.guards.within(self.vector.guards)
     }
 
-    /// Arrives at a merge whose entry is `entry`: publishes, loads what
-    /// the cache lacks of it, and forgets the rest.
+    /// Arrives at a merge whose entry is `entry`: publishes what it holds
+    /// dirty outside the entry's dirty set, loads what the cache lacks of
+    /// it, and forgets the rest.
     pub(super) fn coerce(&mut self, entry: Entry) {
         // Guards cannot be re-established here; the analysis must agree.
         assert!(
@@ -1521,7 +1523,7 @@ impl Translator<'_> {
             "an arrival at {:#x} lacks guards",
             self.trace.insts[self.index].pc
         );
-        self.flush_simd();
+        self.publish(!entry.dirty);
         for n in 0..8 {
             if entry.regs & (1 << n) != 0 {
                 self.register(Loc::Mmx(n));
@@ -1536,7 +1538,12 @@ impl Translator<'_> {
     /// Publishes the SIMD prefix without changing flags, addresses, x5 or SIMD
     /// temporaries. x0/x3/x4 are free at control and observer boundaries.
     pub(super) fn flush_simd(&mut self) {
-        let dirty = self.vector.dirty;
+        self.publish(self.vector.dirty);
+    }
+
+    /// Publishes the dirty registers of `mask`, as `flush_simd` does.
+    pub(super) fn publish(&mut self, mask: u16) {
+        let dirty = self.vector.dirty & mask;
         if dirty == 0 {
             return;
         }
@@ -1568,7 +1575,7 @@ impl Translator<'_> {
                 ));
             }
         }
-        self.vector.dirty = 0;
+        self.vector.dirty &= !dirty;
     }
 
     /// Loads the `CpuState` pointer into x5 unless it is there.

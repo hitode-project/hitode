@@ -78,7 +78,7 @@ fn pixel_blends_preserve_every_state_at_budget_cuts_overlap_and_side_exits() {
             let mut p = program(xmm, side);
             if side {
                 let mut tail = CodeAssembler::new(32).unwrap();
-                // Observe both register banks after leaving the steady body.
+                // Observe both register banks after leaving the loop with them dirty.
                 tail.movq(qword_ptr((DATA + 0x3000) as i32), mm3).unwrap();
                 tail.movdqu(xmmword_ptr((DATA + 0x3100) as i32), xmm5)
                     .unwrap();
@@ -121,13 +121,13 @@ fn pixel_blends_preserve_every_state_at_budget_cuts_overlap_and_side_exits() {
 
 // spec: A64-TR-5, A64-MEM-5, A64-MEM-10, A64-FLAG-4, A64-VER-1
 #[test]
-fn steady_pixel_faults_recover_both_simd_banks_and_retry_the_original_instruction() {
+fn resident_pixel_faults_recover_both_simd_banks_and_retry_the_original_instruction() {
     for xmm in [false, true] {
         for store in [false, true] {
             for crossing in [false, true] {
                 let mut p = program(xmm, false);
                 let width = if xmm { 8 } else { 4 };
-                // Two complete iterations precede the fault, in the steady copy.
+                // Two complete iterations precede the fault, past the first backedge.
                 p.state.regs[if store { 7 } else { 6 }] =
                     DATA + DATA_LEN as u32 - width * 2 - if crossing { 1 } else { 0 };
                 for flagm in [false, true] {
@@ -174,7 +174,7 @@ fn steady_pixel_faults_recover_both_simd_banks_and_retry_the_original_instructio
 
 // spec: A64-TR-5, A64-CTL-10, A64-VER-1
 #[test]
-fn pixel_code_changes_invalidate_the_steady_copy_and_preserve_pending_x87_exceptions() {
+fn pixel_code_changes_invalidate_the_loop_and_preserve_pending_x87_exceptions() {
     for xmm in [false, true] {
         let p = program(xmm, false);
         let config = (Features { flagm: true }, false, Checks::Adaptive);
