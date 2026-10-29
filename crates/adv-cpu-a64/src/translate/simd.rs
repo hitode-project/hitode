@@ -1612,7 +1612,7 @@ impl Translator<'_> {
             exit: Exit::Interpret,
             eip: inst.pc,
             link: false,
-            x87: None,
+            x87: self.x87_leaving(),
         });
         label
     }

@@ -166,6 +166,7 @@ impl Translator<'_> {
                             state: self.state,
                             refund: self.trace.unused(self.index),
                             branch: self.indirect(IndirectBranchKind::Return),
+                            x87: self.x87_leaving(),
                         });
                     }
                     _ => {

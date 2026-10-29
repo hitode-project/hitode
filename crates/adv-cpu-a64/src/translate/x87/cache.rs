@@ -2,8 +2,9 @@
 //!
 //! A run is a stretch of x87 instructions without a head after the first,
 //! and the integer instructions between them that do not observe x87
-//! state: no instruction helper, segment access, stack operation or
-//! transfer other than a forward jcc. A
+//! state or v24-v31: no instruction helper, segment access, MMX, SSE
+//! writing a vector register, or transfer other than a forward jcc, an
+//! inlined call or an inlined return, whose miss publishes the run. A
 //! merge inside it is reached only from the run, by arrivals that agree on
 //! which slots hold values; there every value moves to the host register
 //! of its slot, values only some arrivals hold are fetched, and stale ones
@@ -45,7 +46,8 @@ use crate::jit_map::Part;
 use crate::runtime;
 
 use super::super::decode::{self, Cc, Narrow8or16, Op, Src};
-use super::super::trace::{Edge, Next};
+use super::super::simd::Kind;
+use super::super::trace::{Edge, Mode, Next};
 use super::super::{
     Cold as UnitCold, RUNTIME, State, Translator, X0, X1, X2, X3, X13, X14, X15, X16, X17,
 };
@@ -418,12 +420,25 @@ impl Translator<'_> {
     }
 
     /// Whether the integer instruction at `index` may sit inside a run:
-    /// it does not observe x87 state, and leaves only through
-    /// a jcc out of the trace.
+    /// it does not observe x87 state or v24-v31, and leaves only through
+    /// a jcc out of the trace or the miss of an inlined return.
     fn joins(&self, index: usize) -> bool {
         let inst = self.trace.insts[index];
         let register = |src: Src| !matches!(src, Src::Mem(mem) if mem.fs);
         match inst.op {
+            Op::Push(src) => register(src),
+            Op::Pop(_) | Op::Leave => true,
+            Op::Call(_) => inst.mode == Mode::Plain,
+            Op::Ret(_) => matches!(inst.mode, Mode::Inline(_)),
+            // SSE that writes no vector register keeps the SIMD cache clean,
+            // as the run's sites and exits assume.
+            Op::Simd(simd) => {
+                !simd.mmx()
+                    && simd.footprint().1 == 0
+                    && !((self.checked)(inst.pc)
+                        && simd.memory()
+                        && matches!(simd.kind, Kind::InsertWord | Kind::StoreControl))
+            }
             Op::Integer(super::super::integer::Integer::Sahf)
             | Op::Nop
             | Op::Step(..)
