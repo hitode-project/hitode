@@ -613,9 +613,10 @@ fn asf_reader_load_probes_windows_media_video_and_audio() {
     let mut m = machine();
     m.spawn("authored", adv_machine::layout::PARK_ADDR, &[], 65536)
         .unwrap();
-    // ffmpeg -f lavfi -i testsrc=size=32x16:rate=10 -f lavfi -i sine=frequency=440:sample_rate=22050
-    // -t 0.3 -c:v wmv2 -b:v 50k -c:a wmav2 -b:a 32k -ac 1 -f asf asf_movie.wmv
-    let guest_path = authored("wmv", include_bytes!("fixtures/asf_movie.wmv"));
+    let guest_path = authored(
+        "wmv",
+        include_bytes!("../../../../../adv-device/tests/fixtures/asf_movie.wmv"),
+    );
     // query() stages its IID at DATA + 256.
     wide(&mut m, DATA + 512, &guest_path);
     let reader = activate(&mut m, CLSID_WMASF_READER, IID_IBASEFILTER);

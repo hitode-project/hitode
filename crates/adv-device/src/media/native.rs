@@ -164,19 +164,41 @@ impl Input {
                 .clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64;
             end = end.max(time);
         }
-        // SAFETY: restore this same open context before any decoder uses it.
-        let result = unsafe {
-            ff::ffi::av_seek_frame(self.context.as_mut_ptr(), -1, 0, ff::ffi::AVSEEK_FLAG_BYTE)
-        };
-        if result < 0 {
-            return Err(ff::Error::from(result).into());
-        }
+        self.rewind()?;
         let origin = if origin == ff::ffi::AV_NOPTS_VALUE {
             0
         } else {
             origin * 10
         };
         Ok(end.saturating_sub(origin).max(0) as u64)
+    }
+
+    /// Return to the first packet. MPEG program, elementary and transport
+    /// streams rewind by bytes, since timestamp seeks in unindexed MPEG-PS can
+    /// land past the first sequence header. Other containers keep a header
+    /// before their packets, so the demuxer seeks and resets its own state.
+    fn rewind(&mut self) -> Result<(), Error> {
+        let bytes = matches!(
+            self.context.format().name(),
+            "mpeg" | "mpegvideo" | "mpegts"
+        );
+        // SAFETY: the context is open and owns its AVIO.
+        let result = unsafe {
+            let context = self.context.as_mut_ptr();
+            if bytes {
+                ff::ffi::avformat_seek_file(context, -1, 0, 0, 0, ff::ffi::AVSEEK_FLAG_BYTE)
+            } else {
+                let start = match (*context).start_time {
+                    ff::ffi::AV_NOPTS_VALUE => 0,
+                    start => start,
+                };
+                ff::ffi::avformat_seek_file(context, -1, i64::MIN, start, start, 0)
+            }
+        };
+        if result < 0 {
+            return Err(ff::Error::from(result).into());
+        }
+        Ok(())
     }
 }
 
@@ -640,21 +662,7 @@ impl Native {
 
     pub fn seek(&mut self, media_us: u64) -> Result<(), Error> {
         if media_us == 0 {
-            // Rewind by bytes: timestamp seeks in unindexed MPEG-PS can land past
-            // the first sequence header.
-            let result = unsafe {
-                ff::ffi::avformat_seek_file(
-                    self.input.context.as_mut_ptr(),
-                    -1,
-                    0,
-                    0,
-                    0,
-                    ff::ffi::AVSEEK_FLAG_BYTE,
-                )
-            };
-            if result < 0 {
-                return Err(ff::Error::from(result).into());
-            }
+            self.input.rewind()?;
         } else {
             let ts = (media_us.min(i64::MAX as u64) as i64).saturating_add(self.origin_us);
             self.input.context.seek(ts, ..ts)?;
