@@ -24,7 +24,9 @@
 //! too often are checked instead: each access first reads its page's
 //! class, and one that stays in a page the window may take directly does;
 //! the rest call the `access` stub, so soft pages cost a helper call
-//! rather than a fault.
+//! rather than a fault. Integer code reaches either form through one
+//! emitter (`access`), and a refused access faults like a host fault, so
+//! dirty SIMD registers stay in place.
 //!
 //! An instruction the translator has no native form for but the
 //! interpreter runs without transferring control calls an operation helper
@@ -41,6 +43,7 @@
 //! v16-v23, with v0-v6 as scratch; an x87 run keeps its stack values in
 //! v24-v31.
 
+mod access;
 pub(crate) mod apply;
 mod channels;
 mod decode;

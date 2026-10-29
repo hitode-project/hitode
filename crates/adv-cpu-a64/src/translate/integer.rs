@@ -249,12 +249,7 @@ impl Translator<'_> {
                 self.emit_all(&[mov(W, X17, address), and_imm(W, X13, X17, 3)]);
                 self.asm.cbz(W, true, X13, slow);
                 let load = ldr_reg(W, X6, super::WINDOW, X17, false);
-                if self.checking {
-                    self.checked_memory(X17, 4, false, load, slow);
-                } else {
-                    self.site();
-                    self.emit(load);
-                }
+                self.access_or(X17, 4, false, load, slow);
             }
             Src::Imm(_) => unreachable!(),
         }
@@ -266,12 +261,7 @@ impl Translator<'_> {
             Src::Reg(index) => self.emit(mov(W, host(index), host(src))),
             Src::Mem(_) => {
                 let store = str_reg(W, host(src), super::WINDOW, X17, false);
-                if self.checking {
-                    self.checked_memory(X17, 4, true, store, slow);
-                } else {
-                    self.site();
-                    self.emit(store);
-                }
+                self.access_or(X17, 4, true, store, slow);
             }
             Src::Imm(_) => unreachable!(),
         }
@@ -281,12 +271,7 @@ impl Translator<'_> {
             // A mismatch still writes: read-only destinations must fault before
             // changing either EAX or the comparison flags.
             let store = str_reg(W, X6, super::WINDOW, X17, false);
-            if self.checking {
-                self.checked_memory(X17, 4, true, store, slow);
-            } else {
-                self.site();
-                self.emit(store);
-            }
+            self.access_or(X17, 4, true, store, slow);
         }
         self.emit(mov(W, host(EAX), X6));
         self.asm.bind(flags);
@@ -305,18 +290,19 @@ impl Translator<'_> {
 
     fn compare_exchange8(&mut self, mem: Mem, helper: u8) {
         self.flush_simd();
-        if self.checking {
-            self.helper(helper);
-            return;
-        }
         self.canonicalize();
         let address = self.effective(mem);
         self.emit(mov(W, X17, address));
         let slow = self.asm.label();
         self.emit(and_imm(W, X13, X17, 7));
         self.asm.cbz(W, true, X13, slow);
-        self.site();
-        self.emit(ldr_reg(X, X6, super::WINDOW, X17, false));
+        self.access_or(
+            X17,
+            8,
+            false,
+            ldr_reg(X, X6, super::WINDOW, X17, false),
+            slow,
+        );
         self.emit_all(&[
             orr(X, X13, host(EAX), host(EDX), Lsl, 32),
             eor(X, X13, X13, X6, Lsl, 0),
@@ -325,13 +311,23 @@ impl Translator<'_> {
         let done = self.asm.label();
         self.asm.cbz(X, true, X13, unequal);
         self.emit(orr(X, X15, host(3), host(ECX), Lsl, 32));
-        self.site();
-        self.emit(str_reg(X, X15, super::WINDOW, X17, false));
+        self.access_or(
+            X17,
+            8,
+            true,
+            str_reg(X, X15, super::WINDOW, X17, false),
+            slow,
+        );
         self.emit_all(&[mrs_nzcv(X14), orr_imm(X, X14, X14, 1 << 30), msr_nzcv(X14)]);
         self.asm.b(done);
         self.asm.bind(unequal);
-        self.site();
-        self.emit(str_reg(X, X6, super::WINDOW, X17, false));
+        self.access_or(
+            X17,
+            8,
+            true,
+            str_reg(X, X6, super::WINDOW, X17, false),
+            slow,
+        );
         self.emit_all(&[
             mov(W, host(EAX), X6),
             lsr_imm(X, X13, X6, 32),

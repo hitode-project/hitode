@@ -1,12 +1,12 @@
 //! Each guest instruction's host code, with the flag work liveness allows.
 
-use crate::asm::Label;
 use crate::encode::Extend::{self, Uxtw};
-use crate::encode::Index::{Post, Pre};
+use crate::encode::Index::Pre;
 use crate::encode::Shift::{Asr, Lsl, Lsr};
 use crate::encode::Size::{W, X};
 use crate::encode::*;
 
+use super::access::{Addr, Dir};
 use super::decode::{Alu, ESP, Mem, Narrow8or16, Op, Part, ShiftKind, Src};
 use super::flags::{Carry, FlagSet, Operand, Recipe, Sense};
 use super::trace::{Inst, Mode};
@@ -14,18 +14,9 @@ use super::{
     Cold, RUNTIME, SHADOW, State, Translator, WINDOW, X0, X1, X3, X4, X5, X6, X10, X13, X14, X15,
     X16, X17, biased, host, temp,
 };
-use crate::runtime::{self, ACCESS_SIGNED, ACCESS_STORE};
+use crate::runtime;
 use adv_cpu_core::IndirectBranchKind;
-use adv_cpu_core::memory::{EXEC, READ, SHARED, WRITE};
-
-/// An address operand ready for a load or store.
-#[derive(Clone, Copy)]
-pub(super) enum Addr {
-    /// A W register holding the guest address: `[x27, w, uxtw]`.
-    Window(Reg),
-    /// A biased stack register plus an offset the guards cover.
-    Biased(Reg, i32),
-}
+use adv_cpu_core::memory::WRITE;
 
 /// The register a 32-bit result for guest `index` is computed into.
 pub(super) fn result(index: u8) -> Reg {
@@ -131,14 +122,7 @@ impl Translator<'_> {
                 let (esp, guest) = (Operand::Guest(ESP), Operand::Guest(index));
                 self.prepare(esp);
                 self.prepare(guest);
-                if self.checking {
-                    let direct = ldr_reg(W, result(index), WINDOW, host(ESP), false);
-                    self.checked(host(ESP), result(index), 4, direct);
-                    self.emit(add_imm(X, host(ESP), host(ESP), 4, false));
-                } else {
-                    self.site();
-                    self.emit(ldr_indexed(W, Post, result(index), host(ESP), 4));
-                }
+                self.load(Addr::Pop, result(index));
                 self.forget(esp);
                 self.forget(guest);
                 self.commit(index);
@@ -146,12 +130,7 @@ impl Translator<'_> {
             Op::Leave => {
                 self.prepare(Operand::Guest(ESP));
                 self.prepare(Operand::Guest(5));
-                let addr = if self.checking {
-                    Addr::Window(host(5))
-                } else {
-                    Addr::Biased(host(5), 0)
-                };
-                self.load(addr, X6);
+                self.load(Addr::Biased(host(5), 0), X6);
                 self.emit(add_imm(W, X16, host(5), 4, false));
                 self.emit(add_ext(X, host(ESP), WINDOW, X16, Uxtw, 0));
                 self.emit(add_ext(X, host(5), WINDOW, X6, Uxtw, 0));
@@ -170,14 +149,7 @@ impl Translator<'_> {
                 self.flush_simd();
                 let esp = Operand::Guest(ESP);
                 self.prepare(esp);
-                if self.checking {
-                    let direct = ldr_reg(W, X16, WINDOW, host(ESP), false);
-                    self.checked(host(ESP), X16, 4, direct);
-                    self.emit(add_imm(X, host(ESP), host(ESP), 4, false));
-                } else {
-                    self.site();
-                    self.emit(ldr_indexed(W, Post, X16, host(ESP), 4));
-                }
+                self.load(Addr::Pop, X16);
                 self.forget(esp);
                 if release != 0 {
                     self.emit(add_imm(X, host(ESP), host(ESP), u32::from(release), false));
@@ -326,16 +298,7 @@ impl Translator<'_> {
     fn push(&mut self, value: Reg) {
         let esp = Operand::Guest(ESP);
         self.prepare(esp);
-        if self.checking {
-            // ESP wraps like the guest's, and stays biased.
-            self.emit(sub_imm(W, X5, host(ESP), 4, false));
-            let direct = str_reg(W, value, WINDOW, X5, false);
-            self.checked(X5, value, 4 | ACCESS_STORE, direct);
-            self.emit(add_ext(X, host(ESP), WINDOW, X5, Uxtw, 0));
-        } else {
-            self.site();
-            self.emit(str_indexed(W, Pre, value, host(ESP), -4));
-        }
+        self.store(Addr::Push, value);
         self.forget(esp);
     }
 
@@ -431,50 +394,6 @@ impl Translator<'_> {
         }
     }
 
-    /// An address for a 32-bit access to `mem`; a checked one is always in
-    /// a register.
-    pub(super) fn address(&mut self, mem: Mem) -> Addr {
-        if let (Some(base), None) = (mem.base, mem.index)
-            && biased(base)
-            && !self.checking
-            && !mem.fs
-        {
-            // Offsets well inside the guards: an access past 0 or 4 GiB
-            // faults there and the interpreter wraps it exactly.
-            let disp = mem.disp as i32;
-            if (0..16384).contains(&disp) && disp % 4 == 0 || (-256..256).contains(&disp) {
-                return Addr::Biased(host(base), disp);
-            }
-        }
-        Addr::Window(self.effective(mem))
-    }
-
-    pub(super) fn load(&mut self, addr: Addr, rt: Reg) {
-        if let (true, Addr::Window(a)) = (self.checking, addr) {
-            self.checked(a, rt, 4, ldr_reg(W, rt, WINDOW, a, false));
-            return;
-        }
-        self.site();
-        self.emit(match addr {
-            Addr::Window(a) => ldr_reg(W, rt, WINDOW, a, false),
-            Addr::Biased(b, d) if d >= 0 && d % 4 == 0 => ldr(W, rt, b, d as u32),
-            Addr::Biased(b, d) => ldur(W, rt, b, d),
-        });
-    }
-
-    pub(super) fn store(&mut self, addr: Addr, rt: Reg) {
-        if let (true, Addr::Window(a)) = (self.checking, addr) {
-            self.checked(a, rt, 4 | ACCESS_STORE, str_reg(W, rt, WINDOW, a, false));
-            return;
-        }
-        self.site();
-        self.emit(match addr {
-            Addr::Window(a) => str_reg(W, rt, WINDOW, a, false),
-            Addr::Biased(b, d) if d >= 0 && d % 4 == 0 => str(W, rt, b, d as u32),
-            Addr::Biased(b, d) => stur(W, rt, b, d),
-        });
-    }
-
     /// Has the interpreter run the instruction at helper `index` of the
     /// unit, with canonical flags; leaves when it asks to. Conditional callers
     /// must also flush before the fork, so their fast path publishes the prefix.
@@ -509,87 +428,6 @@ impl Translator<'_> {
         });
     }
 
-    /// A checked access (A64-MEM-7) of `kind` at the guest address in `address`,
-    /// whose window form is `direct`: the window takes it if it stays in
-    /// one page whose class allows it. Ordinary pages blocked by the host
-    /// page intersection use the alias after a raw guest permission check.
-    /// The remaining cases use `access`. Uses x3 and x4.
-    fn checked(&mut self, address: Reg, rt: Reg, kind: u32, direct: u32) {
-        self.flush_simd();
-        let slow = self.asm.label();
-        let (site, resume) =
-            self.checked_memory(address, kind & 7, kind & ACCESS_STORE != 0, direct, slow);
-        self.push_cold(Cold::Access {
-            label: slow,
-            resume,
-            site,
-            address,
-            value: rt,
-            kind,
-        });
-    }
-
-    /// Emit one scalar or vector access after the same window/alias checks.
-    /// The caller owns the slow path and publishes its SIMD prefix first.
-    pub(super) fn checked_memory(
-        &mut self,
-        address: Reg,
-        width: u32,
-        store: bool,
-        direct: u32,
-        slow: Label,
-    ) -> (Label, Label) {
-        let alias = self.asm.label();
-        if width > 1 {
-            // The last byte's address differs in bit 12 exactly when the
-            // access crosses a page.
-            self.emit_all(&[
-                add_imm(W, X4, address, width - 1, false),
-                eor(W, X4, X4, address, Lsl, 0),
-            ]);
-            self.asm.tbz(true, X4, 12, slow);
-        }
-        self.emit_all(&[
-            ldr(X, X3, RUNTIME, runtime::CLASSES),
-            lsr_imm(W, X4, address, 12),
-            ldr_narrow(Narrow::Byte, X4, X3, X4),
-        ]);
-        // Permitted, not shared, and for a store not a code barrier.
-        let bit = |permission: u8| permission.trailing_zeros();
-        let (needed, excluded) = if store {
-            (WRITE, &[EXEC, SHARED][..])
-        } else {
-            (READ, &[SHARED][..])
-        };
-        self.asm.tbz(false, X4, bit(needed), slow);
-        for &permission in excluded {
-            self.asm.tbz(true, X4, bit(permission), alias);
-        }
-        let (site, resume) = (self.asm.label(), self.asm.label());
-        self.asm.bind(site);
-        self.site();
-        self.emit(direct);
-        self.asm.b(resume);
-        self.asm.bind(alias);
-        // The window class already granted the guest R/W bit, so this index
-        // is inside Memory's raw table even when its base is not zero.
-        self.emit_all(&[
-            ldr(X, X3, RUNTIME, runtime::ALIAS_CLASSES),
-            lsr_imm(W, X4, address, 12),
-            ldr_narrow(Narrow::Byte, X4, X3, X4),
-        ]);
-        self.asm.tbz(false, X4, bit(needed), slow);
-        for &permission in excluded {
-            self.asm.tbz(true, X4, bit(permission), slow);
-        }
-        self.emit(ldr(X, X3, RUNTIME, runtime::ALIAS));
-        self.site();
-        // Keep the access width and extension; only replace its base register.
-        self.emit((direct & !(31 << 5)) | (X3.number() << 5));
-        self.asm.bind(resume);
-        (site, resume)
-    }
-
     /// Loads a 32-bit source into a free recipe temporary.
     fn load_temp(&mut self, mem: Mem) -> u8 {
         let t = self.take_temp();
@@ -620,22 +458,9 @@ impl Translator<'_> {
             }
             Narrow8or16::Mem(mem, half) => {
                 let address = self.effective(mem);
-                let narrow = match (half, signed) {
-                    (false, false) => Narrow::Byte,
-                    (false, true) => Narrow::SignedByte,
-                    (true, false) => Narrow::Half,
-                    (true, true) => Narrow::SignedHalf,
-                };
                 self.prepare(guest);
-                let direct = ldr_narrow(narrow, result(dst), WINDOW, address);
-                if self.checking {
-                    let width = if half { 2 } else { 1 };
-                    let kind = width | if signed { ACCESS_SIGNED } else { 0 };
-                    self.checked(address, result(dst), kind, direct);
-                } else {
-                    self.site();
-                    self.emit(direct);
-                }
+                let dir = if signed { Dir::Signed } else { Dir::Load };
+                self.access(Addr::Window(address), 1 + u8::from(half), dir, result(dst));
                 self.forget(guest);
             }
         }
@@ -874,19 +699,7 @@ impl Translator<'_> {
                 self.emit(ubfx(W, rt, host(index), lsb, 8 * u32::from(width)));
             }
             Part::Imm(value) => self.mov_imm(rt, value),
-            Part::Mem(_) => {
-                let direct = match width {
-                    1 => ldr_narrow(Narrow::Byte, rt, WINDOW, address),
-                    2 => ldr_narrow(Narrow::Half, rt, WINDOW, address),
-                    _ => ldr_reg(W, rt, WINDOW, address, false),
-                };
-                if self.checking {
-                    self.checked(address, rt, u32::from(width), direct);
-                } else {
-                    self.site();
-                    self.emit(direct);
-                }
-            }
+            Part::Mem(_) => self.access(Addr::Window(address), width, Dir::Load, rt),
         }
     }
 
@@ -904,19 +717,7 @@ impl Translator<'_> {
                 self.emit(bfi(size, host(index), value, lsb, 8 * u32::from(width)));
                 self.forget(guest);
             }
-            Part::Mem(_) => {
-                let direct = match width {
-                    1 => str_narrow(Narrow::Byte, value, WINDOW, address),
-                    2 => str_narrow(Narrow::Half, value, WINDOW, address),
-                    _ => str_reg(W, value, WINDOW, address, false),
-                };
-                if self.checking {
-                    self.checked(address, value, u32::from(width) | ACCESS_STORE, direct);
-                } else {
-                    self.site();
-                    self.emit(direct);
-                }
-            }
+            Part::Mem(_) => self.access(Addr::Window(address), width, Dir::Store, value),
             Part::Imm(_) => unreachable!("not a destination"),
         }
     }

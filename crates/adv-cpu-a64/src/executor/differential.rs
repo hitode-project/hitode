@@ -2167,6 +2167,67 @@ fn stores_to_data_on_a_code_page_stop_faulting() {
     assert!((checked..=2 * checked).contains(&faults), "{faults} faults");
 }
 
+/// Checked accesses leave dirty MMX registers in place: an access the
+/// owner refuses faults with them as a host fault would, for loads, stores,
+/// narrow forms and the stack.
+// spec: A64-MEM-7, A64F-FP-4
+#[cfg(native)]
+#[test]
+fn refused_checked_accesses_keep_dirty_mmx() {
+    let forms: [fn(&mut CodeAssembler); 4] = [
+        |a| a.mov(ecx, dword_ptr(eax + 8)).unwrap(),
+        |a| a.mov(word_ptr(eax), cx).unwrap(),
+        |a| a.movsx(ecx, byte_ptr(eax)).unwrap(),
+        |a| {
+            a.mov(esp, eax).unwrap();
+            a.push(ecx).unwrap();
+        },
+    ];
+    for (n, form) in forms.into_iter().enumerate() {
+        for checks in [Checks::All, Checks::Slow] {
+            let mut a = CodeAssembler::new(32).unwrap();
+            a.mov(eax, HOLE + 16).unwrap();
+            a.mov(edx, 0x1234_5678).unwrap();
+            a.movd(mm0, edx).unwrap();
+            a.paddd(mm0, mm0).unwrap();
+            a.psllq(mm0, 4).unwrap();
+            form(&mut a);
+            a.nop().unwrap();
+            let code = a.assemble(u64::from(CODE)).unwrap();
+            let mut state = CpuState {
+                eip: CODE,
+                ..CpuState::default()
+            };
+            state.regs[4] = STACK_TOP;
+            let program = Program {
+                stop: CODE + code.len() as u32 - 1,
+                code,
+                data: vec![0; DATA_LEN],
+                state,
+            };
+            let context = format!("form {n} {checks:?}");
+            let (outcome, state, memory) = reference(&program, u64::MAX >> 1);
+            let mut executor = Executor::new(BASE, LEN).unwrap();
+            let native = executor.native.as_mut().unwrap();
+            native.first_visits = false;
+            native.checks = checks;
+            load(executor.memory_mut(), &program);
+            executor.state = program.state.clone();
+            let run = executor.run(program.stop, u64::MAX >> 1).unwrap();
+            assert_eq!(run, outcome, "{context}");
+            assert_eq!(executor.state.regs, state.regs, "{context}");
+            assert_eq!(executor.state.eip, state.eip, "{context}");
+            assert_eq!(executor.state.mmx, state.mmx, "{context}");
+            assert_eq!(executor.state.x87, state.x87, "{context}");
+            assert!(snapshot(executor.memory()) == memory, "{context}");
+            assert!(
+                executor.native.as_ref().unwrap().diagnostics.refused > 0,
+                "{context}: refused through `access`"
+            );
+        }
+    }
+}
+
 /// A fault in the middle of an x87 run, with results only in host
 /// registers and renamed slots: the state it leaves is the interpreter's
 /// before the faulting instruction, for a store and for an operand.
