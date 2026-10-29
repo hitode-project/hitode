@@ -423,7 +423,13 @@ fn packaged(path: &Path) -> bool {
             nsis |= head.get(at..at + 8)? == b".ndata\0\0";
             end = end.max(u64::from(u32_at(at + 16)?) + u64::from(u32_at(at + 20)?));
         }
-        Some(console || nsis || (sections > 0 && len - end.min(len) > len / 2))
+        // LiveMaker appends its game archive ("vf" ... "lv") to the program.
+        let mut overlay = [0; 2];
+        let archive = file.seek(SeekFrom::Start(end)).is_ok()
+            && file.read_exact(&mut overlay).is_ok()
+            && overlay == *b"vf";
+        let bundle = sections > 0 && len - end.min(len) > len / 2 && !archive;
+        Some(console || nsis || bundle)
     };
     read().unwrap_or(false)
 }
@@ -687,6 +693,15 @@ mod tests {
         let found = inspect(&Vec::new(), &dir).unwrap();
         let suggested = found.suggested.map(|i| found.exes[i].path.as_str());
         assert_eq!(suggested, Some("game.exe"));
+        // A program carrying its engine's archive is still the game.
+        fs::remove_file(dir.join("game.exe")).unwrap();
+        exe("live.exe", b".text\0\0\0", 512, 1024 * 8, 2);
+        let mut live = fs::read(dir.join("live.exe")).unwrap();
+        live[1024..1026].copy_from_slice(b"vf");
+        fs::write(dir.join("live.exe"), live).unwrap();
+        let found = inspect(&Vec::new(), &dir).unwrap();
+        let suggested = found.suggested.map(|i| found.exes[i].path.as_str());
+        assert_eq!(suggested, Some("live.exe"));
         fs::remove_dir_all(dir).unwrap();
     }
     fn pe(dir: &Path, name: &str, machine: u16, size: usize) {

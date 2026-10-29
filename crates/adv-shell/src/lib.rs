@@ -53,11 +53,7 @@ use std::time::Duration;
 
 /// The ANSI code page `--codepage auto` would pick for this executable.
 pub fn detect_codepage(exe: &Path) -> std::io::Result<u32> {
-    let bytes = std::fs::read(exe)?;
-    Ok(adv_runtime::codepage::detect(
-        &exe.file_name().unwrap_or_default().to_string_lossy(),
-        &bytes,
-    ))
+    adv_runtime::codepage::detect_file(exe)
 }
 
 pub struct Options {

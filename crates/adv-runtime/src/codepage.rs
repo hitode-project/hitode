@@ -5,12 +5,38 @@
 //! as Japanese. Text that lives only in archives is not visible here.
 use adv_os::nls;
 use std::collections::BTreeSet;
+use std::io::Read;
+use std::path::Path;
 
 const JAPANESE: u32 = 932;
 const SIMPLIFIED_CHINESE: u32 = 936;
 const NAME_MARKERS: [&str; 4] = ["chs", "cn", "gb", "zhcn"];
 const MIN_CHINESE: usize = 16;
 const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
+
+/// Longest header block read before the section table is known.
+const HEADERS: u64 = 64 * 1024;
+
+/// Code page for the executable at `path`, reading only its headers and
+/// sections: some engines append all their assets, often gigabytes, after
+/// the image.
+pub fn detect_file(path: &Path) -> std::io::Result<u32> {
+    let mut file = std::fs::File::open(path)?;
+    let mut image = Vec::new();
+    (&mut file).take(HEADERS).read_to_end(&mut image)?;
+    let end = adv_pe::Pe::parse_headers(&image).map_or(0, |pe| {
+        pe.sections
+            .iter()
+            .map(|s| u64::from(s.raw_offset) + u64::from(s.raw_size))
+            .max()
+            .unwrap_or(0)
+    });
+    if let Some(rest) = end.checked_sub(image.len() as u64) {
+        file.take(rest).read_to_end(&mut image)?;
+    }
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    Ok(detect(&name, &image))
+}
 
 /// Code page for the executable `name` with contents `image`.
 pub fn detect(name: &str, image: &[u8]) -> u32 {
@@ -127,6 +153,36 @@ mod tests {
             data.push(0);
         }
         data
+    }
+
+    #[test]
+    // spec: PERS-PROFILE-7
+    fn file_detection_reads_the_sections_and_skips_appended_data() {
+        let chinese = strings(
+            encoding_rs::GBK,
+            &[
+                "是否读取存档数据？",
+                "确定要结束游戏吗？",
+                "请选择一个存档位置",
+            ],
+        );
+        let mut bytes = image(&chinese);
+        // Appended Japanese text outweighs the sections, but is not read.
+        let appended = strings(
+            encoding_rs::SHIFT_JIS,
+            &["セーブデータを読み込みますか？"; 8],
+        );
+        for _ in 0..64 {
+            bytes.extend_from_slice(&appended);
+        }
+        let path = std::env::temp_dir().join(format!("adv-codepage-{}.exe", std::process::id()));
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(
+            detect_file(&path).unwrap(),
+            detect("game.exe", &image(&chinese))
+        );
+        assert_eq!(detect_file(&path).unwrap(), SIMPLIFIED_CHINESE);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
