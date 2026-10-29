@@ -20,7 +20,7 @@ pub(super) fn bodies() -> impl Iterator<Item = Body> {
     helpers().map(|&(name, conv, _, body)| Body {
         name: name.into(),
         conv,
-        body,
+        body: Some(body),
         handler: resume_original,
     })
 }

@@ -17,11 +17,14 @@ use adv_dx::interop::{DcCreated, DcFinished, DcSurface, MemoryDc};
 use adv_machine::{Env, Machine, Outcome};
 use adv_pe::{ImportModule, ImportName};
 
-use crate::graphics::{Snapshot, Surfaces, guest_memory, install_store};
+#[cfg(feature = "gpu")]
+use crate::graphics::{Snapshot, Surfaces};
+use crate::graphics::{guest_memory, install_store};
 
 pub use adv_drv::codec::vorbisfile;
 
 mod class;
+mod fonts;
 #[cfg(any(target_vendor = "apple", target_os = "android"))]
 pub mod session;
 /// Codec library acceleration on the image-mapping path.

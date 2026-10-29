@@ -538,7 +538,107 @@ pub fn prefetch_system_fonts() {
 pub fn system_font_families() -> Vec<String> {
     portable::system_font_families()
 }
+/// Immutable data of one realized OpenType face, including its TTC index.
+#[derive(Clone)]
+pub struct FontFile {
+    pub data: Arc<dyn AsRef<[u8]> + Send + Sync>,
+    pub index: u32,
+}
+impl FontFile {
+    /// The selected sfnt item starts at its TTC directory offset.
+    pub fn item_offset(&self) -> usize {
+        let bytes = self.data.as_ref().as_ref();
+        if bytes.starts_with(b"ttcf") {
+            let at = 12 + self.index as usize * 4;
+            u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap()) as usize
+        } else {
+            0
+        }
+    }
+    pub fn table(&self, tag: [u8; 4]) -> Option<&[u8]> {
+        let bytes = self.data.as_ref().as_ref();
+        let at = self.item_offset();
+        let count = u16::from_be_bytes(bytes.get(at + 4..at + 6)?.try_into().ok()?) as usize;
+        for entry in bytes
+            .get(at + 12..at + 12 + count * 16)?
+            .as_chunks::<16>()
+            .0
+            .iter()
+        {
+            if entry[..4] == tag {
+                let offset = u32::from_be_bytes(entry[8..12].try_into().unwrap()) as usize;
+                let len = u32::from_be_bytes(entry[12..16].try_into().unwrap()) as usize;
+                return bytes.get(offset..offset + len);
+            }
+        }
+        None
+    }
+}
 impl Text {
+    /// Realize a face addressed by owned resource data rather than family matching.
+    pub fn resource_font(
+        &mut self,
+        id: FontResourceId,
+        index: u32,
+        height: i32,
+        simulations: u32,
+    ) -> Result<FontRequest, TextError> {
+        let request = FontRequest {
+            face: format!("resource-{}-{index}", id.0),
+            height,
+            weight: if simulations & 1 != 0 { 700 } else { 400 },
+            italic: simulations & 2 != 0,
+            default: None,
+            width: 0,
+            baseline_angle: 0,
+            glyph_angle: 0,
+            underline: false,
+            strikeout: false,
+            encoding: Encoding::Automatic,
+            precision: Precision::Default,
+            clipping: Clipping {
+                precision: ClipPrecision::Default,
+                transform_rotation: false,
+                force_outline: false,
+                disable_association: false,
+                embedded: false,
+            },
+            quality: Quality::Default,
+            pitch: Pitch::Default,
+            family: Family::Default,
+        };
+        if !self.fonts.contains_key(&request) {
+            let font = self.backend.resource_font(id, index, &request)?;
+            if self.fonts.len() >= FONT_CACHE_CAPACITY {
+                self.fonts.clear();
+            }
+            self.fonts.insert(request.clone(), font);
+        }
+        Ok(request)
+    }
+    pub fn font_is_linked(&mut self, request: &FontRequest) -> Result<bool, TextError> {
+        Ok(self.font(request)?.is_linked())
+    }
+    pub fn font_file(&mut self, request: &FontRequest) -> Result<FontFile, TextError> {
+        Ok(self.font(request)?.file())
+    }
+    pub fn signature(&mut self, request: &FontRequest) -> Result<FontSignature, TextError> {
+        self.font(request)?.signature()
+    }
+    pub fn glyph_indices(
+        &mut self,
+        request: &FontRequest,
+        units: &[u16],
+        missing: u16,
+    ) -> Result<Vec<u16>, TextError> {
+        self.font(request)?.glyph_indices(units, missing)
+    }
+    pub fn char_width_info(&mut self, request: &FontRequest) -> Result<[i32; 2], TextError> {
+        self.font(request)?.width_info()
+    }
+    pub fn simulations(&mut self, request: &FontRequest) -> Result<u32, TextError> {
+        Ok(self.font(request)?.simulations())
+    }
     /// Export discovery and family matching to a guest font renderer. Prefer
     /// real TrueType outlines for legacy families and require their code page.
     pub fn replacement_fonts(&self) -> Result<FontReplacements, TextError> {
@@ -556,6 +656,20 @@ impl Text {
         face: Option<&str>,
         mode: FontEnumeration,
     ) -> Result<Vec<EnumeratedFont>, TextError> {
+        if let Some(face) = face
+            && let Some(target) = self
+                .overrides
+                .families
+                .iter()
+                .find_map(|(name, target)| name.eq_ignore_ascii_case(face).then_some(target))
+        {
+            let mut fonts = self.backend.enumerate(Some(target), mode)?;
+            for font in &mut fonts {
+                font.font.face = face.to_owned();
+                font.substitute = true;
+            }
+            return Ok(fonts);
+        }
         self.backend.enumerate(face, mode)
     }
     /// Install owned backend font data. Successful resource changes invalidate
@@ -770,12 +884,9 @@ impl Text {
     /// Query the selected font's complete Unicode kerning-pair count using the
     /// same realized-font owner as metrics, extents and glyph rasterization.
     pub fn kerning_pair_count(&mut self, request: &FontRequest) -> Result<u32, TextError> {
-        let _ = request;
-        Err(TextError::Font(
-            "complete Unicode kerning-pair enumeration is unavailable on the portable font backend"
-                .into(),
-        ))
+        Ok(self.font(request)?.kerning_pairs()?.len() as u32)
     }
+
     /// Copy at most capacity real pairs in provider order. The native provider
     /// supports partial buffers, preserving its signed logical-unit adjustments.
     pub fn kerning_pairs(
@@ -787,14 +898,11 @@ impl Text {
             return Err(TextError::Font("invalid kerning-pair capacity".into()));
         }
 
-        {
-            let _ = request;
-            Err(TextError::Font(
-                "complete Unicode kerning-pair enumeration is unavailable on the portable font backend"
-                    .into(),
-            ))
-        }
+        let mut pairs = self.font(request)?.kerning_pairs()?;
+        pairs.truncate(capacity as usize);
+        Ok(pairs)
     }
+
     pub fn glyph(
         &mut self,
         font: &FontRequest,
@@ -874,10 +982,7 @@ impl Text {
     }
 
     pub fn language_info(&mut self, font: &FontRequest) -> Result<u32, TextError> {
-        let _ = font;
-        Err(TextError::Font(
-            "complete font language metadata is unavailable on the portable backend".into(),
-        ))
+        self.font(font)?.language_info()
     }
 
     pub fn placement(
@@ -889,10 +994,8 @@ impl Text {
         buffers: Option<PlacementBuffers>,
         ansi_codepage: u32,
     ) -> Result<Placement, TextError> {
-        let _ = (font, input, maximum, flags, buffers, ansi_codepage);
-        Err(TextError::Font(
-            "native character placement and shaping are unavailable on the portable backend".into(),
-        ))
+        self.font(font)?
+            .placement(input, maximum, flags, buffers, ansi_codepage)
     }
 }
 

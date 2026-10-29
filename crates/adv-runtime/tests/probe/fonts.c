@@ -1,4 +1,5 @@
-/* Authored font discovery, aliases, TrueType enumeration and glyph pixels.
+/* Authored font discovery, aliases, TrueType enumeration of TrueType and CFF
+ * faces, and glyph pixels.
  * Build: i686-w64-mingw32-gcc -O2 -Wall fonts.c -o fonts.exe -lgdi32 */
 #include <windows.h>
 #include <stdio.h>
@@ -121,6 +122,11 @@ int main(int argc, char **argv)
     };
     for (i = 0; i < sizeof(names) / sizeof(names[0]); ++i) ok &= check_face(dc, names[i]);
     printf("aliases=%d\n", ok);
+    /* A CFF face enumerates and rasterizes as TrueType, like the standard
+       families games filter for. */
+    i = check_face(dc, L"ADV Japanese CFF Fixture");
+    printf("cff=%d\n", i);
+    ok &= i;
     SelectObject(dc, bitmap);
     ZeroMemory(pixels, 64 * 48 * 4);
     font = CreateFontW(-32, 0, 0, 0, 400, 0, 0, 0, SHIFTJIS_CHARSET,

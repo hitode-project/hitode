@@ -35,6 +35,8 @@ bytemuck = { version = "1.23", optional = true, features = ["derive"] }
 # One portable outline/raster stack. Font discovery needs no native fontconfig
 # library or unsafe mapping, including on Android.
 skrifa = "0.44"
+rustybuzz = "0.20"
+unicode-bidi = "0.3"
 zeno = "0.3.3"
 fontdb = { version = "0.24", default-features = false, features = ["fs"] }
 encoding_rs.workspace = true

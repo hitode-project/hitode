@@ -364,7 +364,7 @@ pub(super) fn bodies() -> Vec<Body> {
                 bodies.push(Body {
                     name: format!("{module}!{name}").into(),
                     conv: Conv::Cdecl { argc },
-                    body,
+                    body: Some(body),
                     handler: resume_original,
                 });
             }

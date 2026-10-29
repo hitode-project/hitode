@@ -31,6 +31,11 @@ pub trait ExecutionTrap {
         None
     }
 
+    /// Required host services also replace their entry in interpreted runs.
+    fn required_redirect(&self, _pc: u32) -> Option<(u32, &[u8])> {
+        None
+    }
+
     /// The execution owner's guest clock for RDTSC. This must not block,
     /// allocate, perform IO, lock, or panic. None uses the standalone counter.
     fn guest_time_us(&mut self) -> Option<u64> {

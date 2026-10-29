@@ -1074,12 +1074,15 @@ fn clipping_background_alignment_and_pixel_formats_preserve_storage() {
                 bytes: &mut bytes
             }
         )
-        .is_err()
+        .is_ok()
     );
-    assert_eq!(
-        bytes, before,
-        "unsupported run cannot partly paint its background"
+    assert!(
+        bytes
+            .chunks(4)
+            .all(|pixel| pixel[..3] == [0; 3] || pixel[..3] == [255; 3]),
+        "an unshaped run fills its whole background and inks the glyph"
     );
+    assert_ne!(bytes, before);
 }
 
 struct Memory(Vec<u8>);

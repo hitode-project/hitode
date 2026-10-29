@@ -145,7 +145,7 @@ Wine's original stream and bit state; errors retain guest execution.
 - **Graphics:** GDI, DirectDraw and Direct3D 9 share neutral surfaces and drawing services. Direct3D 9 shaders are translated within the limits in [docs/spec/graphics.md](docs/spec/graphics.md). Device services follow [docs/spec/device.md](docs/spec/device.md).
 - **Audio:** one mixer resamples with rubato and decodes with Symphonia. Wine MIDI output synthesizes through OxiSynth with the bundled General MIDI bank. Shared PCM buffers are read through stable views, so a device never reads storage that the guest has freed.
 - **Video:** DirectShow, MCI and wmvcore decode through FFmpeg when built with the `media` feature. See [docs/spec/media.md](docs/spec/media.md).
-- **Fonts:** fontdb, skrifa and zeno. Fonts that the guest supplies take priority.
+- **Fonts:** `adv-runtime::wine::fonts` owns GDI data, layout, DIB composition and DirectWrite glyph services over `adv-device::text` (fontdb, skrifa and zeno). Required native bodies serve interpreted and translated calls; Wine's font backend stays dormant. Fonts that the guest supplies take priority.
 
 ## Front ends
 
@@ -160,7 +160,7 @@ between games. Each game has its own session, machines, devices and mount source
 teardown saves the registry and releases every client before the finish callback.
 The host provisions and boots the prefix once per server, then installs game
 fonts without loading them in wineboot. System font discovery is reused between
-sessions; each session applies its own font links and registry overrides.
+sessions; each session applies its own Text resources and font overrides.
 The execution owner blocks between games. The launcher prepares the embedded Wine
 distribution off the UI thread; native views and input keep the same shell channels.
 

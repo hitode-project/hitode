@@ -17,8 +17,12 @@ use zeno::{Command, Vector};
 
 mod discovery;
 mod enumeration;
+mod placement;
 mod profile;
+mod quadratic;
+mod queries;
 mod replacements;
+mod synthesis;
 
 // System TTCs such as PingFang exceed the guest font-resource budget.
 const MAX_SYSTEM_FONT_BYTES: usize = 128 * 1024 * 1024;
@@ -31,6 +35,7 @@ struct FaceStore {
     digests: BTreeMap<usize, (FontBytes, String)>,
     file_bytes: usize,
 }
+#[derive(Clone)]
 struct Resource {
     faces: Vec<ID>,
     bytes: usize,
@@ -51,6 +56,7 @@ pub(super) struct Backend {
 /// Installed fonts are scanned once per process; a backend's resources copy
 /// the shared database on first change.
 static SYSTEM_FONTS: OnceLock<Arc<Database>> = OnceLock::new();
+static DIRECTORY_FONTS: Mutex<BTreeMap<PathBuf, Arc<Database>>> = Mutex::new(BTreeMap::new());
 
 fn system_fonts() -> Arc<Database> {
     SYSTEM_FONTS
@@ -127,10 +133,23 @@ impl Backend {
                         |error| format!("font profile {}: {error}", path.display()),
                     )?))
                 } else if let Some(directories) = &self.directories {
+                    let mut catalogs = DIRECTORY_FONTS.lock().map_err(|e| e.to_string())?;
+                    let mut database = Database::new();
                     for directory in directories {
-                        db.load_fonts_dir(directory);
+                        let fonts = catalogs.entry(directory.clone()).or_insert_with(|| {
+                            let mut db = Database::new();
+                            db.load_fonts_dir(directory);
+                            Arc::new(db)
+                        });
+                        for face in fonts.faces() {
+                            database.push_face_info(face.clone());
+                        }
                     }
-                    None
+                    let database = Arc::new(database);
+                    return Ok(Discovery {
+                        database,
+                        profile: None,
+                    });
                 } else {
                     return Ok(Discovery {
                         database: system_fonts(),
@@ -183,7 +202,11 @@ impl Backend {
         }
         self.discovery()?;
         let db = Arc::make_mut(&mut self.database.get_mut().unwrap().as_mut().unwrap().database);
-        let faces: Vec<_> = db.load_font_source(source).into_iter().collect();
+        let faces: Vec<_> = probe
+            .faces()
+            .cloned()
+            .map(|face| db.push_face_info(face))
+            .collect();
         let count = faces.len() as u32;
         let id = FontResourceId(next);
         self.resources.insert(
@@ -213,6 +236,13 @@ impl Backend {
     }
     pub(super) fn font(&self, request: &FontRequest) -> Result<Font, TextError> {
         validate_font(request)?;
+        if let Some(name) = request.face.strip_prefix("resource-")
+            && let Some((id, index)) = name.split_once('-')
+            && let (Ok(id), Ok(index)) = (id.parse::<u64>(), index.parse::<u32>())
+        {
+            return self.resource_font(FontResourceId(id), index, request);
+        }
+
         let discovery = self.discovery()?;
         let db = Arc::clone(&discovery.database);
         let profile = discovery.profile.clone();
@@ -276,6 +306,43 @@ impl Backend {
         })?;
         let face = load_face(&db, &self.store, primary, None)?;
         Font::new(request, db, Arc::clone(&self.store), candidates, face, None)
+    }
+    pub(super) fn resource_font(
+        &self,
+        id: FontResourceId,
+        index: u32,
+        request: &FontRequest,
+    ) -> Result<Font, TextError> {
+        let discovery = self.discovery()?;
+        let resource = self
+            .resources
+            .get(&id)
+            .ok_or_else(|| TextError::Font("invalid font resource".into()))?;
+        let face_id = resource
+            .faces
+            .iter()
+            .copied()
+            .find(|id| {
+                discovery
+                    .database
+                    .face(*id)
+                    .is_some_and(|f| f.index == index)
+            })
+            .ok_or_else(|| TextError::Font("invalid collection index".into()))?;
+        let face = load_face(
+            &discovery.database,
+            &self.store,
+            face_id,
+            discovery.profile.as_deref(),
+        )?;
+        Font::new(
+            request,
+            discovery.database.clone(),
+            self.store.clone(),
+            vec![face_id],
+            face,
+            discovery.profile.clone(),
+        )
     }
     pub(super) fn enumerate(
         &self,
@@ -669,23 +736,10 @@ fn validate_font(request: &FontRequest) -> Result<(), TextError> {
     if request.height.unsigned_abs() > 16384 || request.width.unsigned_abs() > 16384 {
         return Err(TextError::Font("invalid font dimensions".into()));
     }
-    if request.baseline_angle != 0 || request.glyph_angle != 0 || request.face.starts_with('@') {
-        return Err(TextError::Font(
-            "portable rotated or vertical fonts are unsupported".into(),
-        ));
-    }
-    if matches!(
-        request.precision,
-        Precision::Raster | Precision::Device | Precision::Reserved(_)
-    ) {
-        return Err(TextError::Font(
-            "portable raster/device font precision is unsupported".into(),
-        ));
-    }
     Ok(())
 }
 fn family_matches(db: &Database, face: &FaceInfo, name: &str) -> bool {
-    let name = name.to_lowercase();
+    let name = name.trim_start_matches('@').to_lowercase();
     face.families
         .iter()
         .any(|family| family.0.to_lowercase() == name)
@@ -745,7 +799,7 @@ fn macos_cjk_families(region: &str) -> &'static [&'static str] {
 }
 
 fn families(request: &FontRequest) -> Vec<String> {
-    let name = request.face.to_lowercase();
+    let name = request.face.trim_start_matches('@').to_lowercase();
     let named_sans = matches!(
         name.as_str(),
         "simhei"
@@ -1380,27 +1434,38 @@ impl Font {
     }
     fn advance(&self, face: &Face, glyph: GlyphId, code: Option<u32>) -> Result<f32, TextError> {
         let font = face.font()?;
+        let bold = if normalized_weight(&self.request) >= 600
+            && face.info.weight.0 < 600
+            && font.axes().get_by_tag(skrifa::Tag::new(b"wght")).is_none()
+        {
+            (self.em / 24.0).round().max(1.0)
+        } else {
+            0.0
+        };
+        if self.request.face.starts_with('@')
+            && let Ok(vmtx) = font.vmtx()
+            && let Some(advance) = vmtx.advance(glyph)
+        {
+            let scale = self.em / f32::from(font.head().map_err(font_error)?.units_per_em());
+            return Ok((f32::from(advance) * scale * self.xscale).round() + bold);
+        }
+
         if fixed(&self.request)
             && let Some(code) = code
             && code != 0
             && font.charmap().map(code) == Some(glyph)
         {
             let full = matches!(code, 0x1100..=0x11ff | 0x2e80..=0xa4cf | 0xac00..=0xd7af | 0xf900..=0xfaff | 0xfe10..=0xfe6f | 0xff01..=0xff60 | 0xffe0..=0xffe6 | 0x20000..=0x3ffff);
-            return Ok((self.em * if full { 1.0 } else { 0.5 } * self.xscale).round());
+            return Ok((self.em * if full { 1.0 } else { 0.5 } * self.xscale).round() + bold);
         }
         let loc = location(&font, &self.request);
         font.glyph_metrics(Size::new(self.em), &loc)
             .advance_width(glyph)
-            .map(|n| (n * self.xscale).round())
+            .map(|n| (n * self.xscale).round() + bold)
             .ok_or_else(|| TextError::Glyph("invalid glyph advance".into()))
     }
     pub(super) fn run(&self, input: TextInput<'_>) -> Result<Vec<u32>, TextError> {
         let decoded = decode(input, self.request.encoding)?;
-        // These scripts require shaping/bidi. Report that capability boundary
-        // before any paint writes rather than silently drawing isolated forms.
-        if decoded.chars().any(|c| matches!(u32::from(c), 0x0300..=0x036f | 0x0590..=0x0eff | 0x200c..=0x200f | 0x202a..=0x202e | 0x2066..=0x2069 | 0xfe00..=0xfe0f | 0xe0100..=0xe01ef)) {
-            return Err(TextError::Font("portable text shaping/bidi is unsupported for this run".into()));
-        }
         Ok(decoded.chars().map(u32::from).collect())
     }
     pub(super) fn extent(&self, input: TextInput<'_>) -> Result<TextExtent, TextError> {
@@ -1566,6 +1631,25 @@ impl Font {
             }
         };
         let font = face.font()?;
+        let glyph = if self.request.face.starts_with('@')
+            && let Some(code) = code
+            && let Some(c) = char::from_u32(code)
+        {
+            let face = rustybuzz::Face::from_slice(face.data.as_ref().as_ref(), face.index)
+                .ok_or_else(|| TextError::Font("invalid vertical face".into()))?;
+            let mut buffer = rustybuzz::UnicodeBuffer::new();
+            buffer.add(c, 0);
+            buffer.set_direction(rustybuzz::Direction::TopToBottom);
+            buffer.guess_segment_properties();
+            let shaped = rustybuzz::shape(&face, &[], buffer);
+            shaped
+                .glyph_infos()
+                .first()
+                .map_or(glyph, |g| GlyphId::new(g.glyph_id))
+        } else {
+            glyph
+        };
+
         let loc = location(&font, &self.request);
         let outlines = font.outline_glyphs();
         let outline = outlines.get(glyph).ok_or_else(|| {
@@ -1580,7 +1664,7 @@ impl Font {
             && font.axes().get_by_tag(skrifa::Tag::new(b"slnt")).is_none();
         let mut pen = Pen {
             commands: Vec::new(),
-            transform: request.transform,
+            transform: Transform::IDENTITY,
             xscale: self.xscale,
             italic,
         };
@@ -1622,8 +1706,28 @@ impl Font {
                 .draw(DrawSettings::unhinted(Size::new(self.em), &loc), &mut pen)
                 .map_err(|e| TextError::Glyph(format!("glyph outline: {e}")))?;
         }
+        let bold = normalized_weight(&self.request) >= 600
+            && face.info.weight.0 < 600
+            && font.axes().get_by_tag(skrifa::Tag::new(b"wght")).is_none();
+        if bold {
+            synthesis::embolden(&mut pen.commands, (self.em / 24.0).round().max(1.0));
+        }
+        let angle = self.request.glyph_angle
+            + if self.request.face.starts_with('@') {
+                900
+            } else {
+                0
+            };
+        let matrix = compose(rotation(angle), request.transform);
+        for command in &mut pen.commands {
+            *command = synthesis::transform(*command, matrix);
+        }
         let advance = self.advance(&face, glyph, code)?;
-        let (advance_x, advance_y) = transform_point(request.transform, advance, 0.0);
+        let (advance_x, advance_y) = transform_point(
+            compose(rotation(self.request.baseline_angle), request.transform),
+            advance,
+            0.0,
+        );
         let advance = |n: f32| {
             i16::try_from(n.round() as i32)
                 .map_err(|_| TextError::Glyph("glyph advance overflow".into()))
@@ -1786,6 +1890,27 @@ fn codec(encoding: Encoding) -> Result<&'static encoding_rs::Encoding, TextError
         }
     })
 }
+fn rotation(angle: i32) -> Transform {
+    let angle = (angle.rem_euclid(3600) as f64 / 10.0).to_radians();
+    let (sin, cos) = angle.sin_cos();
+    Transform {
+        xx: (cos * 65536.0).round() as i32,
+        xy: (sin * 65536.0).round() as i32,
+        yx: (-sin * 65536.0).round() as i32,
+        yy: (cos * 65536.0).round() as i32,
+    }
+}
+fn compose(a: Transform, b: Transform) -> Transform {
+    let mul = |x: i32, y: i32, z: i32, w: i32| {
+        ((i64::from(x) * i64::from(y) + i64::from(z) * i64::from(w)) / 65536) as i32
+    };
+    Transform {
+        xx: mul(a.xx, b.xx, a.xy, b.yx),
+        xy: mul(a.xx, b.xy, a.xy, b.yy),
+        yx: mul(a.yx, b.xx, a.yy, b.yx),
+        yy: mul(a.yx, b.xy, a.yy, b.yy),
+    }
+}
 fn transform_point(matrix: Transform, x: f32, y: f32) -> (f32, f32) {
     (
         (matrix.xx as f32 * x + matrix.yx as f32 * y) / 65536.0,
@@ -1866,9 +1991,12 @@ fn contours(commands: &[Command], format: GlyphFormat) -> Result<Vec<Contour>, T
             }
             Command::CurveTo(a, b, p) => {
                 if format == GlyphFormat::QuadraticOutline {
-                    return Err(TextError::Glyph(
-                        "cubic font cannot provide an exact quadratic outline".into(),
-                    ));
+                    let contour = contours
+                        .last_mut()
+                        .ok_or_else(|| TextError::Glyph("invalid outline path".into()))?;
+                    quadratic::append([current, a, b, p], &mut contour.curves);
+                    current = p;
+                    continue;
                 }
                 current = p;
                 Curve::Cubic(vec![point(a), point(b), point(p)])
