@@ -13,9 +13,11 @@
 //! d8-d15 survive the Rust calls between, and the `access` and `apply`
 //! stubs keep v0-v7 and v16-v23.
 //!
-//! The first MMX instruction after the cache is forgotten leaves for the
-//! interpreter if an x87 exception is pending, and once it completes sets
-//! TOP and every tag to 0, as each MMX instruction does. `movaps`-style
+//! An MMX instruction without the x87 guard (`Guards::ready`) leaves for
+//! the interpreter if an x87 exception is pending, and once it completes
+//! sets TOP and every tag to 0, as each MMX instruction does. Guards hold
+//! until a helper, x87 instruction or EMMS, and survive a merge every
+//! arrival of which passed them. `movaps`-style
 //! accesses that are not 16-byte aligned leave for the interpreter too,
 //! which raises the fault. The cpu pointer stays in x5 across a run of
 //! SIMD instructions.
@@ -51,6 +53,7 @@ use crate::runtime::{self, Exit};
 
 use super::decode::{Mem, memory};
 use super::flags::Operand;
+use super::residency::Entry;
 use crate::asm::Label;
 
 use super::{Cold, RUNTIME, Translator, WINDOW, X5, X13, X14, X16, X17, host};
@@ -218,6 +221,20 @@ impl Simd {
     /// Whether the destination is 128 bits wide.
     fn full(&self) -> bool {
         matches!(self.dst, Loc::Xmm(_))
+    }
+
+    /// The guards that hold after it continues, given those `before`, as
+    /// `Translator::simd` establishes them.
+    pub fn guarding(&self, before: Guards) -> Guards {
+        let mut after = before;
+        if self.mmx() {
+            after.ready = self.kind != Kind::Emms;
+        }
+        if self.floating() {
+            after.fp_default = true;
+            after.fp_pe |= self.inexact();
+        }
+        after
     }
 
     /// The registers it surely reads and those it may write, as
@@ -530,14 +547,55 @@ pub struct Vector {
     pub dirty: u16,
     /// XMM registers in v16-v23, by bit.
     xmm: u8,
-    /// No x87 exception is pending, and TOP and the tags are 0.
-    ready: bool,
     /// x5 holds the `CpuState` pointer.
     pub cpu: bool,
+    pub guards: Guards,
+}
+
+/// Facts about `CpuState` that guards established on every path here.
+/// Nothing but helpers, x87 instructions and EMMS changes them, so they
+/// survive merges whose arrivals all hold them (`translate::residency`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Guards {
+    /// No x87 exception is pending, and TOP and the tags are 0.
+    pub ready: bool,
     /// MXCSR's control bits have passed the native SSE guard.
     pub fp_default: bool,
     /// MXCSR PE is set on every path continuing inside this unit.
     pub fp_pe: bool,
+}
+
+impl Guards {
+    pub const ALL: Self = Self {
+        ready: true,
+        fp_default: true,
+        fp_pe: true,
+    };
+
+    /// The guards both hold.
+    pub fn meet(self, other: Self) -> Self {
+        Self {
+            ready: self.ready && other.ready,
+            fp_default: self.fp_default && other.fp_default,
+            fp_pe: self.fp_pe && other.fp_pe,
+        }
+    }
+
+    fn within(self, other: Self) -> bool {
+        self.meet(other) == self
+    }
+}
+
+impl Vector {
+    /// What a merge's code assumes on arrival.
+    pub(super) fn at(entry: Entry) -> Self {
+        Self {
+            mmx: entry.regs as u8,
+            xmm: (entry.regs >> 8) as u8,
+            guards: entry.guards,
+            ..Self::default()
+        }
+    }
 }
 
 fn vmem(bytes: u8) -> VMem {
@@ -559,7 +617,7 @@ impl Translator<'_> {
             return;
         }
         let mmx = simd.mmx();
-        let ready = self.vector.ready;
+        let ready = self.vector.guards.ready;
         if mmx && !ready {
             self.cpu();
             let bail = self.bail();
@@ -587,7 +645,7 @@ impl Translator<'_> {
                 strh(X17, X5, runtime::X87_STATUS),
                 strh(Reg::ZR, X5, runtime::X87_TAG),
             ]);
-            self.vector.ready = true;
+            self.vector.guards.ready = true;
         }
     }
 
@@ -598,7 +656,7 @@ impl Translator<'_> {
                 self.flush_simd();
                 self.cpu();
                 self.emit_all(&[movz(W, X17, 0xffff, 0), strh(X17, X5, runtime::X87_TAG)]);
-                self.vector.ready = false;
+                self.vector.guards.ready = false;
                 return;
             }
             Kind::Move => return self.simd_move(simd, address),
@@ -925,15 +983,15 @@ impl Translator<'_> {
         let bail = self.bail();
         let (slow, resume) = (self.asm.label(), self.asm.label());
         let inexact = simd.inexact();
-        let first_pe = inexact && !self.vector.fp_pe;
-        if inexact && !self.vector.fp_pe || !self.vector.fp_default {
+        let first_pe = inexact && !self.vector.guards.fp_pe;
+        if inexact && !self.vector.guards.fp_pe || !self.vector.guards.fp_default {
             self.emit(ldr(W, X13, X5, runtime::MXCSR));
         }
         // Masked exceptions, nearest, no DAZ or FTZ; flags may be set.
-        if !self.vector.fp_default {
+        if !self.vector.guards.fp_default {
             self.emit_all(&[and_imm(W, X17, X13, 0xffc0), eor_imm(W, X17, X17, 0x1f80)]);
             self.asm.cbz(W, true, X17, bail);
-            self.vector.fp_default = true;
+            self.vector.guards.fp_default = true;
         }
         let s = match simd.src {
             Loc::Mem => {
@@ -955,9 +1013,9 @@ impl Translator<'_> {
             _ => [None, Some(s)],
         };
         let operands = Operands { s, inputs };
-        if inexact && !self.vector.fp_pe {
+        if inexact && !self.vector.guards.fp_pe {
             self.asm.tbz(false, X13, 5, slow);
-            self.vector.fp_pe = true;
+            self.vector.guards.fp_pe = true;
         }
         self.denormals(simd, operands, Some(slow));
         let tiny = self.floating_fast(simd, operands, slow);
@@ -1447,30 +1505,32 @@ impl Translator<'_> {
         }
     }
 
-    /// Whether the cache holds every register of `entry`, a merge's entry
-    /// set (`translate::residency`).
-    pub(super) fn holds(&self, entry: u16) -> bool {
+    /// Whether the cache holds every register and guard of `entry`, a
+    /// merge's entry (`translate::residency`).
+    pub(super) fn holds(&self, entry: Entry) -> bool {
         let held = u16::from(self.vector.mmx) | u16::from(self.vector.xmm) << 8;
-        entry & !held == 0
+        entry.regs & !held == 0 && entry.guards.within(self.vector.guards)
     }
 
-    /// Arrives at a merge whose entry set is `entry`: publishes, loads what
+    /// Arrives at a merge whose entry is `entry`: publishes, loads what
     /// the cache lacks of it, and forgets the rest.
-    pub(super) fn coerce(&mut self, entry: u16) {
+    pub(super) fn coerce(&mut self, entry: Entry) {
+        // Guards cannot be re-established here; the analysis must agree.
+        assert!(
+            entry.guards.within(self.vector.guards),
+            "an arrival at {:#x} lacks guards",
+            self.trace.insts[self.index].pc
+        );
         self.flush_simd();
         for n in 0..8 {
-            if entry & (1 << n) != 0 {
+            if entry.regs & (1 << n) != 0 {
                 self.register(Loc::Mmx(n));
             }
-            if entry & (1 << (8 + n)) != 0 {
+            if entry.regs & (1 << (8 + n)) != 0 {
                 self.register(Loc::Xmm(n));
             }
         }
-        self.vector = Vector {
-            mmx: entry as u8,
-            xmm: (entry >> 8) as u8,
-            ..Vector::default()
-        };
+        self.vector = Vector::at(entry);
     }
 
     /// Publishes the SIMD prefix without changing flags, addresses, x5 or SIMD
