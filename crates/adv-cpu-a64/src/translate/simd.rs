@@ -1992,7 +1992,16 @@ mod tests {
         assert_eq!(by.kind, Kind::ShiftBy(ShiftImm::Sshr, 1));
         let low = plan(&decode(|a| a.movss(xmm1, xmm2).unwrap()), 0).unwrap();
         assert_eq!(low.kind, Kind::MoveLow(2));
-        assert!(plan(&decode(|a| a.movq2dq(xmm1, mm2).unwrap()), 0).is_none());
+        let movq2dq = plan(&decode(|a| a.movq2dq(xmm1, mm2).unwrap()), 0).unwrap();
+        assert_eq!(
+            (movq2dq.kind, movq2dq.dst, movq2dq.src, movq2dq.width),
+            (Kind::Move, Loc::Xmm(1), Loc::Mmx(2), 8)
+        );
+        let movdq2q = plan(&decode(|a| a.movdq2q(mm1, xmm2).unwrap()), 0).unwrap();
+        assert_eq!(
+            (movdq2q.kind, movdq2q.dst, movdq2q.src, movdq2q.width),
+            (Kind::Move, Loc::Mmx(1), Loc::Xmm(2), 8)
+        );
         let add = plan(&decode(|a| a.addss(xmm1, dword_ptr(esi)).unwrap()), 0).unwrap();
         assert_eq!((add.kind, add.width), (Kind::Float(Float::Fadd, true), 4));
         assert!(add.floating());

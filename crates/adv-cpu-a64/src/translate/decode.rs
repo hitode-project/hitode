@@ -741,8 +741,12 @@ fn quick_op(b: &mut Bytes, pc: u32) -> Option<Op> {
             _ => return None,
         },
         0xc3 => Op::Ret(0),
-        // `rep ret`, which older compilers emit after a branch.
-        0xf3 if b.u8()? == 0xc3 => Op::Ret(0),
+        // PAUSE and `rep ret`, which older compilers emit after a branch.
+        0xf3 => match b.u8()? {
+            0x90 => Op::Nop,
+            0xc3 => Op::Ret(0),
+            _ => return None,
+        },
         // Operand-size padding: `xchg ax, ax` and `nop r/m16`.
         0x66 => match b.u8()? {
             0x90 => Op::Nop,
