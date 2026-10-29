@@ -26,8 +26,8 @@
 //! Checked accesses (A64-MEM-7) call `access` when the page class table rules
 //! out the window: it saves every register translated code may keep live,
 //! has the owner's `access` helper perform the access, and returns the
-//! loaded value in w0; when the owner refuses, it captures v8-v23 as the
-//! fault handler does and leaves as the fault stub would for a host fault
+//! loaded scalar in w0 or vector in `Runtime::access_vector`; refusal
+//! captures v8-v23 as the fault handler does and leaves as for a host fault
 //! at the access, whose site the helper recorded.
 //!
 //! Instructions the translator leaves to the interpreter call `interpret`
@@ -35,9 +35,9 @@
 //! owner's `interpret` helper run the instruction, loads the guest back as
 //! `enter` does and returns the helper's status, 0 to continue.
 //!
-//! Units publish dirty SIMD registers before calling stubs and cache them
-//! in d8-d15 and v16-v23 (`translate::simd`), so only `access`, which
-//! returns into the unit, keeps v16-v23. Arithmetic flags cross the boundary
+//! Units cache SIMD in d8-d15 and v16-v23 (`translate::simd`). They publish
+//! dirty registers before stubs other than `access`, which preserves the
+//! cache and v0-v7 temporaries. Arithmetic flags cross the boundary
 //! in the canonical block-exit form of A64-FLAG-1: NZCV in subtraction sense, x10 a
 //! value whose low byte has PF's parity, x11 a value whose bit 4 is AF, and
 //! x12 DF. x87 state stays in `CpuState` outside x87 runs (A64F-FP-1, A64F-FP-7).
@@ -77,7 +77,7 @@ pub struct Runtime {
     /// Where `shadow_reset` resumes.
     pub resume: u64,
     /// `access(runtime, address, site, value, kind) -> value`, called by
-    /// `access`; bit 32 set refuses.
+    /// `access`; vectors use `access_vector`, and bit 32 set refuses.
     pub access: u64,
     /// Where a refused access stores v8-v23, as the fault handler captures
     /// them from a host fault.
@@ -107,6 +107,9 @@ pub struct Runtime {
     /// the host call through thunk `site >> 32` whose INT is at the low
     /// half: statuses and charges as for `interpret`.
     pub call: u64,
+    /// Values of 8- and 16-byte checked accesses, shared with the owner;
+    /// 16-byte aligned for `ldr q`.
+    pub access_vector: [u8; 16],
     #[cfg(test)]
     pub channel_batches: u64,
     #[cfg(test)]
@@ -124,6 +127,7 @@ impl Runtime {
             native_batches: 0,
             cpu,
             window,
+            access_vector: [0; 16],
             shadow: 0,
             countdown: u64::MAX >> 1,
             host_sp: 0,
@@ -210,8 +214,8 @@ pub const fn table_slot(eip: u32) -> usize {
 pub const SHADOW_SENTINELS: usize = 4;
 
 /// An `access` kind is the width in bytes, with these bits.
-pub const ACCESS_STORE: u32 = 8;
-pub const ACCESS_SIGNED: u32 = 16;
+pub const ACCESS_STORE: u32 = 32;
+pub const ACCESS_SIGNED: u32 = 64;
 
 const fn r(number: u8) -> Reg {
     Reg::new(number)
@@ -241,6 +245,8 @@ pub(crate) const TABLE: u32 = field(offset_of!(Runtime, table));
 const SHADOW_TOP: u32 = field(offset_of!(Runtime, shadow_top));
 const RESUME: u32 = field(offset_of!(Runtime, resume));
 const ACCESS: u32 = field(offset_of!(Runtime, access));
+pub(crate) const ACCESS_VECTOR: u32 = field(offset_of!(Runtime, access_vector));
+const _: () = assert!(ACCESS_VECTOR.is_multiple_of(16));
 const FAULT_SIMD: u32 = field(offset_of!(Runtime, fault_simd));
 const INTERPRET: u32 = field(offset_of!(Runtime, interpret));
 const APPLY: u32 = field(offset_of!(Runtime, apply));
@@ -415,7 +421,7 @@ fn emit_restore_light(asm: &mut Asm) {
 }
 
 /// `apply`, called with w0 to w3 the operation and its operands and the
-/// guest flags canonical. Keeps what `access` keeps, NZCV included, and
+/// guest flags canonical. Keeps x5-x17, v16-v23 and NZCV, and
 /// returns `translate::apply::run`'s result in x0; x1 to x4 are free.
 fn emit_apply(asm: &mut Asm) {
     emit_save_light(asm);
@@ -433,12 +439,21 @@ fn emit_apply(asm: &mut Asm) {
 /// `access`, called with w1 the guest address, x2 the site, w3 a value to
 /// store and w4 the kind. Keeps x5-x17 and NZCV; x0-x4 and x30 are free
 /// wherever translated code accesses memory.
+/// Also preserves v0-v7 temporaries and the v16-v23 cache.
 fn emit_access(asm: &mut Asm, fault: crate::asm::Label) {
     emit_save_light(asm);
     asm.emit_all(&[
+        stp_v(VSize::Q, Pre, v(0), v(1), SP, -128),
+        stp_v(VSize::Q, Offset, v(2), v(3), SP, 32),
+        stp_v(VSize::Q, Offset, v(4), v(5), SP, 64),
+        stp_v(VSize::Q, Offset, v(6), v(7), SP, 96),
         mov(X, r(0), RUNTIME),
         ldr(X, r(16), RUNTIME, ACCESS),
         blr(r(16)),
+        ldp_v(VSize::Q, Offset, v(6), v(7), SP, 96),
+        ldp_v(VSize::Q, Offset, v(4), v(5), SP, 64),
+        ldp_v(VSize::Q, Offset, v(2), v(3), SP, 32),
+        ldp_v(VSize::Q, Post, v(0), v(1), SP, 128),
     ]);
     emit_restore_light(asm);
     let refused = asm.label();

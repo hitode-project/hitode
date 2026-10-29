@@ -24,7 +24,7 @@
 //! too often are checked instead: each access first reads its page's
 //! class, and one that stays in a page the window may take directly does;
 //! the rest call the `access` stub, so soft pages cost a helper call
-//! rather than a fault. Integer code reaches either form through one
+//! rather than a fault. Integer and SIMD code reach either form through one
 //! emitter (`access`), and a refused access faults like a host fault, so
 //! dirty SIMD registers stay in place.
 //!
@@ -402,7 +402,7 @@ enum Cold {
         resume: Label,
         site: Label,
         address: Reg,
-        value: Reg,
+        value: access::Value,
         kind: u32,
     },
     /// The `interpret` helper asked to leave with the exit + 1 in w0, at
@@ -1444,12 +1444,24 @@ impl Translator<'_> {
                 self.asm.adr(X2, site);
                 let store = kind & crate::runtime::ACCESS_STORE != 0;
                 if store {
-                    self.emit(mov(W, X3, value));
+                    self.emit(match value {
+                        access::Value::Scalar(reg) => mov(W, X3, reg),
+                        access::Value::Vector(VMem::S, reg) => fmov_from_v(W, X3, reg),
+                        access::Value::Vector(size, reg) => {
+                            vstr(size, reg, RUNTIME, crate::runtime::ACCESS_VECTOR)
+                        }
+                    });
                 }
                 self.emit(movz(W, X4, kind as u16, 0));
                 self.far_call(self.stubs.access);
                 if !store {
-                    self.emit(mov(W, value, X0));
+                    self.emit(match value {
+                        access::Value::Scalar(reg) => mov(W, reg, X0),
+                        access::Value::Vector(VMem::S, reg) => fmov_to_v(W, reg, X0),
+                        access::Value::Vector(size, reg) => {
+                            vldr(size, reg, RUNTIME, crate::runtime::ACCESS_VECTOR)
+                        }
+                    });
                 }
                 self.asm.b(resume);
             }

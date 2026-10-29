@@ -1,4 +1,4 @@
-//! The access emitter (A64-MEM-7): integer code describes each guest data
+//! The access emitter (A64-MEM-7): integer and SIMD code describe each guest data
 //! access, and this picks its form. An unchecked access records a site and
 //! uses the window or a biased stack register. A checked one tests the page
 //! class inline and leaves the line only for pages the window cannot take;
@@ -38,6 +38,12 @@ pub(super) enum Dir {
     /// Sign-extends the bytes read.
     Signed,
     Store,
+}
+
+/// The register a checked access transfers through the stub.
+pub(super) enum Value {
+    Scalar(Reg),
+    Vector(VMem, VReg),
 }
 
 impl Dir {
@@ -170,15 +176,39 @@ impl Translator<'_> {
     fn checked(&mut self, address: Reg, rt: Reg, kind: u32, direct: u32) {
         let slow = self.asm.label();
         let (site, resume) =
-            self.checked_memory(address, kind & 7, kind & ACCESS_STORE != 0, direct, slow);
+            self.checked_memory(address, kind & 31, kind & ACCESS_STORE != 0, direct, slow);
         self.push_cold(Cold::Access {
             label: slow,
             resume,
             site,
             address,
-            value: rt,
+            value: Value::Scalar(rt),
             kind,
         });
+    }
+
+    /// A vector access using the same sites and permission checks as integers.
+    pub(super) fn vector_access(&mut self, size: VMem, value: VReg, address: Reg, store: bool) {
+        let direct = if store {
+            vstr_reg(size, value, WINDOW, address)
+        } else {
+            vldr_reg(size, value, WINDOW, address)
+        };
+        if self.checking {
+            let slow = self.asm.label();
+            let (site, resume) = self.checked_memory(address, size.bytes(), store, direct, slow);
+            self.push_cold(Cold::Access {
+                label: slow,
+                resume,
+                site,
+                address,
+                value: Value::Vector(size, value),
+                kind: size.bytes() | if store { ACCESS_STORE } else { 0 },
+            });
+        } else {
+            self.site();
+            self.emit(direct);
+        }
     }
 
     /// Emit one scalar or vector access after the same window/alias checks.
