@@ -335,7 +335,7 @@ impl Translator<'_> {
         }
         let label = self.asm.label();
         self.asm.tbz(false, X8, 16, label);
-        self.push_cold(super::super::Cold::X87Guard { label, generic: to });
+        self.push_cold(super::super::Cold::Bridge { label, to });
     }
 
     #[allow(clippy::too_many_arguments)]

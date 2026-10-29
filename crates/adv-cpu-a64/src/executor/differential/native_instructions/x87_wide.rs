@@ -322,3 +322,52 @@ fn cached_x87_runs_span_calls_stack_operations_and_sse() {
         }
     }
 }
+
+// spec: A64F-FP-7
+#[test]
+fn parity_exits_from_long_runs_reach_their_publication() {
+    use crate::jit_map::{enable_memory, units_of};
+    enable_memory();
+    // Precision 64 makes each operation long, so the exit that publishes
+    // the run lies beyond tbz reach of the parity jcc.
+    for (a, b) in [(1.5f64, 2.5f64), (2.5, 1.5)] {
+        let mut program = fixture(|asm| {
+            let mut done = asm.create_label();
+            asm.fld(qword_ptr(ebx)).unwrap();
+            asm.fld(qword_ptr(ebx + 8)).unwrap();
+            asm.fcom_2(st0, st1).unwrap();
+            asm.fnstsw(ax).unwrap();
+            asm.test(ah, 5).unwrap();
+            asm.jp(done).unwrap();
+            for k in 0..20 {
+                asm.fmul_2(st0, st1).unwrap();
+                asm.fadd(qword_ptr(ebx + 16 + 8 * (k % 4))).unwrap();
+                asm.fdiv_2(st0, st1).unwrap();
+                asm.fsub(qword_ptr(ebx + 16)).unwrap();
+            }
+            asm.fstp(qword_ptr(ebx + 56)).unwrap();
+            asm.set_label(&mut done).unwrap();
+        });
+        for (at, value) in [(0, a), (8, b), (16, 0.75), (24, 1.25), (32, 3.0), (40, 0.5)] {
+            program.data[at..at + 8].copy_from_slice(&value.to_le_bytes());
+        }
+        program.state.x87.control = 0x037f;
+        let config = (Features { flagm: false }, false, Checks::All);
+        let mut native = executor(&program, config, false);
+        let mut oracle = executor(&program, config, true);
+        assert_eq!(
+            native.run(program.stop, 100).unwrap(),
+            oracle.run(program.stop, 100).unwrap(),
+            "{a} {b}"
+        );
+        same(&native, &oracle);
+        let engine = native.native.as_ref().unwrap();
+        let base = engine.unit_address(CODE).unwrap();
+        let (_, marks) = units_of(CODE)
+            .into_iter()
+            .rfind(|&(unit, _)| unit == base)
+            .expect("the unit was recorded");
+        let end = marks.last().unwrap().offset;
+        assert!(end > 1 << 15, "unit of {end} bytes is within tbz reach");
+    }
+}
