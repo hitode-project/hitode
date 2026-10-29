@@ -642,6 +642,14 @@ impl Translator<'_> {
         self.mark(eip, part);
     }
 
+    /// Marks the code `emit` adds as `part`, then returns to the part before.
+    fn as_part(&mut self, part: Part, emit: impl FnOnce(&mut Self)) {
+        let before = self.marks.last().map_or(Part::Body, |mark| mark.part);
+        self.remark(part);
+        emit(self);
+        self.remark(before);
+    }
+
     fn instruction(&mut self, index: usize) {
         let trace = self.trace;
         let inst = trace.insts[index];

@@ -593,6 +593,9 @@ fn part_name(part: adv_runtime::JitPart) -> &'static str {
         adv_runtime::JitPart::X87Publish => "x87-publish",
         adv_runtime::JitPart::X87Wide => "x87-wide",
         adv_runtime::JitPart::FpStatus => "fp-status",
+        adv_runtime::JitPart::SimdPublish => "simd-publish",
+        adv_runtime::JitPart::SimdLoad => "simd-load",
+        adv_runtime::JitPart::SimdGuard => "simd-guard",
     }
 }
 
@@ -803,17 +806,20 @@ fn samples_text(shared: &Shared, since: u64) -> String {
 /// part of their code, and host code bytes by part in the newest unit, so
 /// a client can group scattered instructions by mechanism.
 fn hot_text(shared: &Shared, since: u64, runtime: &impl DebugTarget<Backend = Cpu>) -> String {
-    const PARTS: [&str; 8] = [
+    const PARTS: [&str; 11] = [
         "body",
         "cold",
         "x87-entry",
         "x87-publish",
         "x87-wide",
         "fp-status",
+        "simd-publish",
+        "simd-load",
+        "simd-guard",
         "host",
         "stub",
     ];
-    let mut counts: HashMap<u32, [usize; 8]> = HashMap::new();
+    let mut counts: HashMap<u32, [usize; 11]> = HashMap::new();
     for sample in shared.profiler.since(since).iter().map(classify) {
         let Some(inst) = sample.inst else { continue };
         let part = if sample.part.starts_with("stub:") {

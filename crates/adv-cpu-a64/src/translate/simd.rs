@@ -55,6 +55,7 @@ use super::decode::{Mem, memory};
 use super::flags::Operand;
 use super::residency::Entry;
 use crate::asm::Label;
+use crate::jit_map::Part;
 
 use super::{Cold, RUNTIME, Translator, WINDOW, X5, X13, X14, X16, X17, host};
 
@@ -620,10 +621,12 @@ impl Translator<'_> {
         let mmx = simd.mmx();
         let ready = self.vector.guards.ready;
         if mmx && !ready {
-            self.cpu();
-            let bail = self.bail();
-            self.emit(ldrh(X16, X5, runtime::X87_STATUS));
-            self.asm.tbz(true, X16, 7, bail);
+            self.as_part(Part::SimdGuard, |t| {
+                t.cpu();
+                let bail = t.bail();
+                t.emit(ldrh(X16, X5, runtime::X87_STATUS));
+                t.asm.tbz(true, X16, 7, bail);
+            });
         }
         let address = if simd.memory() {
             let address = self.effective(simd.mem);
@@ -639,13 +642,15 @@ impl Translator<'_> {
         };
         self.simd_body(simd, address);
         if mmx && simd.kind != Kind::Emms && !ready {
-            self.cpu();
-            self.emit_all(&[
-                ldrh(X17, X5, runtime::X87_STATUS),
-                and_imm(W, X17, X17, 0xffff_c7ff),
-                strh(X17, X5, runtime::X87_STATUS),
-                strh(Reg::ZR, X5, runtime::X87_TAG),
-            ]);
+            self.as_part(Part::SimdGuard, |t| {
+                t.cpu();
+                t.emit_all(&[
+                    ldrh(X17, X5, runtime::X87_STATUS),
+                    and_imm(W, X17, X17, 0xffff_c7ff),
+                    strh(X17, X5, runtime::X87_STATUS),
+                    strh(Reg::ZR, X5, runtime::X87_TAG),
+                ]);
+            });
             self.vector.guards.ready = true;
         }
     }
@@ -985,15 +990,18 @@ impl Translator<'_> {
         let (slow, resume) = (self.asm.label(), self.asm.label());
         let inexact = simd.inexact();
         let first_pe = inexact && !self.vector.guards.fp_pe;
-        if inexact && !self.vector.guards.fp_pe || !self.vector.guards.fp_default {
-            self.emit(ldr(W, X13, X5, runtime::MXCSR));
-        }
-        // Masked exceptions, nearest, no DAZ or FTZ; flags may be set.
-        if !self.vector.guards.fp_default {
-            self.emit_all(&[and_imm(W, X17, X13, 0xffc0), eor_imm(W, X17, X17, 0x1f80)]);
-            self.asm.cbz(W, true, X17, bail);
-            self.vector.guards.fp_default = true;
-        }
+        let guards = self.vector.guards;
+        self.as_part(Part::SimdGuard, |t| {
+            if inexact && !guards.fp_pe || !guards.fp_default {
+                t.emit(ldr(W, X13, X5, runtime::MXCSR));
+            }
+            // Masked exceptions, nearest, no DAZ or FTZ; flags may be set.
+            if !guards.fp_default {
+                t.emit_all(&[and_imm(W, X17, X13, 0xffc0), eor_imm(W, X17, X17, 0x1f80)]);
+                t.asm.cbz(W, true, X17, bail);
+            }
+        });
+        self.vector.guards.fp_default = true;
         let s = match simd.src {
             Loc::Mem => {
                 self.simd_access(vmem(simd.width), V1, address, false);
@@ -1015,7 +1023,7 @@ impl Translator<'_> {
         };
         let operands = Operands { s, inputs };
         if inexact && !self.vector.guards.fp_pe {
-            self.asm.tbz(false, X13, 5, slow);
+            self.as_part(Part::SimdGuard, |t| t.asm.tbz(false, X13, 5, slow));
             self.vector.guards.fp_pe = true;
         }
         self.denormals(simd, operands, Some(slow));
@@ -1524,14 +1532,16 @@ impl Translator<'_> {
             self.trace.insts[self.index].pc
         );
         self.publish(!entry.dirty);
-        for n in 0..8 {
-            if entry.regs & (1 << n) != 0 {
-                self.register(Loc::Mmx(n));
+        self.as_part(Part::SimdLoad, |t| {
+            for n in 0..8 {
+                if entry.regs & (1 << n) != 0 {
+                    t.register(Loc::Mmx(n));
+                }
+                if entry.regs & (1 << (8 + n)) != 0 {
+                    t.register(Loc::Xmm(n));
+                }
             }
-            if entry.regs & (1 << (8 + n)) != 0 {
-                self.register(Loc::Xmm(n));
-            }
-        }
+        });
         self.vector = Vector::at(entry);
     }
 
@@ -1547,6 +1557,10 @@ impl Translator<'_> {
         if dirty == 0 {
             return;
         }
+        self.as_part(Part::SimdPublish, |t| t.emit_publish(dirty));
+    }
+
+    fn emit_publish(&mut self, dirty: u16) {
         self.emit_all(&[
             ldr(X, super::X3, RUNTIME, runtime::CPU_STATE),
             movz(W, super::X0, 0xffff, 0),
@@ -1699,6 +1713,11 @@ mod tests {
                 .iter()
                 .all(|i| !matches!(i.op, super::super::decode::Op::Helper(_)))
         );
+        // Samples can tell the residency code from the body.
+        let parts: Vec<_> = work.marks().iter().map(|mark| mark.part).collect();
+        for part in [Part::SimdGuard, Part::SimdPublish] {
+            assert!(parts.contains(&part), "{part:?}");
+        }
     }
 
     #[test]
