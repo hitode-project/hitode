@@ -476,7 +476,7 @@ FreeType is a host library under WINE-UNIX-6.
 
 ### WINE-GFX-5 In-process desktop
 
-**Rule**: When win32u starts explorer for its desktop, the process MUST NOT start. The calling thread MUST instead create the desktop and message windows as explorer does. It MUST then show the desktop over the virtual screen.
+**Rule**: When win32u starts explorer for its desktop, the process MUST NOT start. The calling thread MUST instead create the desktop and message windows as explorer does. It MUST then show the desktop over the virtual screen without activating it, so the first window the process activates receives `WM_ACTIVATEAPP`.
 **Verification**: Test
 
 ### WINE-GFX-6 Direct3D 9 on Wine
