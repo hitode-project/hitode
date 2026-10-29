@@ -567,15 +567,25 @@ fn allocate_in(
     if kind & MEM_COMMIT != 0 {
         let (base, region) = memory(env).region_of(start).expect("region");
         let first = ((start - base) / PAGE) as usize;
-        let reserved: Vec<u32> = (0..(length / PAGE) as usize)
-            .filter(|&page| region.pages[first + page].is_none())
-            .map(|page| start + page as u32 * PAGE)
-            .collect();
+        let mut reserved: Vec<(u32, u32)> = Vec::new();
+        for page in 0..(length / PAGE) as usize {
+            if region.pages[first + page].is_some() {
+                continue;
+            }
+            let address = start + page as u32 * PAGE;
+            if let Some((base, size)) = reserved.last_mut()
+                && *base + *size == address
+            {
+                *size += PAGE;
+            } else {
+                reserved.push((address, PAGE));
+            }
+        }
         for page in &mut region.pages[first..first + (length / PAGE) as usize] {
             *page = Some(protection);
         }
-        for page in reserved {
-            if env.cpu.map(page, PAGE, prot).is_err() {
+        for (address, size) in reserved {
+            if env.cpu.map(address, size, prot).is_err() {
                 return Err(status::NO_MEMORY);
             }
         }
@@ -1576,6 +1586,151 @@ mod volume_tests {
     use super::*;
     use adv_cpu::{Cpu, backend::FilePage};
     use std::{cell::Cell, rc::Rc};
+
+    struct Mappings {
+        cpu: Cpu,
+        calls: Vec<(u32, u32)>,
+    }
+    impl Guest for Mappings {
+        fn reg(&self, r: adv_cpu::backend::Reg) -> u32 {
+            self.cpu.reg(r)
+        }
+        fn set_reg(&mut self, r: adv_cpu::backend::Reg, value: u32) {
+            self.cpu.set_reg(r, value);
+        }
+        fn read(&self, at: u32, bytes: &mut [u8]) -> Result<(), adv_cpu::backend::MemFault> {
+            self.cpu.read(at, bytes)
+        }
+        fn write(&mut self, at: u32, bytes: &[u8]) -> Result<(), adv_cpu::backend::MemFault> {
+            self.cpu.write(at, bytes)
+        }
+        fn accessible(&self, at: u32, len: u32, prot: Prot) -> bool {
+            self.cpu.accessible(at, len, prot)
+        }
+        fn map(&mut self, at: u32, len: u32, prot: Prot) -> Result<(), adv_cpu::backend::MemFault> {
+            self.calls.push((at, len));
+            self.cpu.map(at, len, prot)
+        }
+        fn protect(
+            &mut self,
+            at: u32,
+            len: u32,
+            prot: Prot,
+        ) -> Result<(), adv_cpu::backend::MemFault> {
+            self.cpu.protect(at, len, prot)
+        }
+        fn unmap(&mut self, at: u32, len: u32) -> Result<(), adv_cpu::backend::MemFault> {
+            self.cpu.unmap(at, len)
+        }
+    }
+
+    // spec: A64-MEM-4
+    #[test]
+    fn allocation_batches_new_runs_and_preserves_committed_pages() {
+        use adv_machine::{Clock, Machine, layout::PARK_ADDR};
+        let mut machine = Machine::new(
+            Cpu::new(PARK_ADDR, false).unwrap(),
+            crate::dispatch::Platform,
+            Clock::virtual_time(),
+        )
+        .unwrap();
+        machine.cpu.map(0x10000, PAGE, Prot::RW).unwrap();
+        let mut cpu = Mappings {
+            cpu: machine.cpu,
+            calls: Vec::new(),
+        };
+        let mut env = Env {
+            context: 0,
+            cpu: &mut cpu,
+            sys: &mut machine.sys,
+            ext: &mut machine.ext,
+            thunk: 0,
+        };
+        let base = 0x200000;
+        env.cpu.write_u32(0x10000, base).unwrap();
+        env.cpu.write_u32(0x10004, 16 * PAGE).unwrap();
+        allocate_in(
+            &mut env,
+            &[
+                CURRENT_PROCESS,
+                0x10000,
+                0,
+                0x10004,
+                MEM_RESERVE,
+                PAGE_READWRITE,
+            ],
+            0,
+            0,
+            GRANULE,
+        )
+        .unwrap();
+        for (page, count) in [(2, 1), (7, 2)] {
+            env.cpu.write_u32(0x10000, base + page * PAGE).unwrap();
+            env.cpu.write_u32(0x10004, count * PAGE).unwrap();
+            allocate_in(
+                &mut env,
+                &[
+                    CURRENT_PROCESS,
+                    0x10000,
+                    0,
+                    0x10004,
+                    MEM_COMMIT,
+                    PAGE_READWRITE,
+                ],
+                0,
+                0,
+                GRANULE,
+            )
+            .unwrap();
+            env.cpu
+                .fill_memory(base + page * PAGE, 0x5a, (count * PAGE) as usize)
+                .unwrap();
+        }
+        cpu.calls.clear();
+        let mut env = Env {
+            context: 0,
+            cpu: &mut cpu,
+            sys: &mut machine.sys,
+            ext: &mut machine.ext,
+            thunk: 0,
+        };
+        env.cpu.write_u32(0x10000, base).unwrap();
+        env.cpu.write_u32(0x10004, 16 * PAGE).unwrap();
+        allocate_in(
+            &mut env,
+            &[
+                CURRENT_PROCESS,
+                0x10000,
+                0,
+                0x10004,
+                MEM_COMMIT,
+                PAGE_READONLY,
+            ],
+            0,
+            0,
+            GRANULE,
+        )
+        .unwrap();
+        let mut bytes = vec![0; (16 * PAGE) as usize];
+        env.cpu.read(base, &mut bytes).unwrap();
+        for page in 0..16 {
+            assert!(
+                bytes[page * PAGE as usize..(page + 1) * PAGE as usize]
+                    .iter()
+                    .all(|&b| b == if [2, 7, 8].contains(&page) { 0x5a } else { 0 })
+            );
+        }
+        assert!(env.cpu.accessible(base, 16 * PAGE, Prot::READ));
+        assert!(!env.cpu.accessible(base, 16 * PAGE, Prot::WRITE));
+        assert_eq!(
+            cpu.calls,
+            [
+                (base, 2 * PAGE),
+                (base + 3 * PAGE, 4 * PAGE),
+                (base + 9 * PAGE, 7 * PAGE)
+            ]
+        );
+    }
 
     struct Source(Vec<Rc<FilePage>>);
     impl crate::file::volume::ReadFile for Source {

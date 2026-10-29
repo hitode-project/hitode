@@ -32,6 +32,7 @@ macro_rules! bitflags_lite {
 
 pub mod asm;
 pub mod file_page;
+pub use crate::shared_memory::ReadOnlyFileView;
 pub use file_page::FilePage;
 pub mod x87;
 pub use adv_sync::shared::{SharedReadView, SharedRegion};
@@ -308,6 +309,18 @@ pub trait Guest {
     /// Optional stable shared bytes while this guest borrow is alive. Software devices
     /// can consume frames without a second guest-to-host copy; other backends return None.
     fn shared_bytes(&self, _addr: u32, _len: usize) -> Option<&[u8]> {
+        None
+    }
+    /// Mutable ordinary guest bytes while this exclusive borrow is alive.
+    /// Shared/file pages, missing WRITE permission and code-watched pages
+    /// return None; callers retain the normal `write` fallback. Producing this
+    /// borrow does not relocate storage or change mappings, so disjoint raw
+    /// input pointers from `shared_bytes` remain valid during it.
+    fn writable_bytes(&mut self, _addr: u32, _len: usize) -> Option<&mut [u8]> {
+        None
+    }
+    /// Retained contiguous read-only file input, independent of the guest VM.
+    fn read_only_file_view(&self, _addr: u32, _len: usize) -> Option<ReadOnlyFileView> {
         None
     }
     /// Overlap-safe guest memory copy. Backends with shared storage can override this.
