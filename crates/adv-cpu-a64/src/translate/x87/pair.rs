@@ -29,7 +29,7 @@ use crate::encode::Size::{W, X};
 use crate::encode::*;
 use crate::runtime;
 
-use super::super::{Translator, WINDOW, X0, X1, X2, X3, X5, X6, X13, X16, X17};
+use super::super::{Translator, X0, X1, X2, X3, X5, X13, X16, X17};
 use super::{C0, C1, C2, C3, V0, V1, V2, V3, V4, V5, X7, X8, X87};
 
 const V6: VReg = VReg::new(6);
@@ -258,9 +258,7 @@ impl Translator<'_> {
             self.store_sticky(width, integer, bail);
             self.store_flags(bail);
         }
-        self.site();
-        let size = if width == 8 { X } else { W };
-        self.emit(str_reg(size, X2, WINDOW, X6, false));
+        self.x87_store_access(width);
         if pop {
             self.x87_pop();
         }

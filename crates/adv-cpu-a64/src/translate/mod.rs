@@ -428,6 +428,8 @@ enum Cold {
         model: x87::Model,
         saved: bool,
         suspended: bool,
+        /// Its access is checked, leaving the guest flags in NZCV only.
+        checked: bool,
     },
 }
 
@@ -1512,7 +1514,8 @@ impl Translator<'_> {
                 model,
                 saved,
                 suspended,
-            } => self.x87_fault(label, model, saved, suspended),
+                checked,
+            } => self.x87_fault(label, model, saved, suspended, checked),
             Cold::Helper { label, refund } => {
                 self.asm.bind(label);
                 if refund != 0 {

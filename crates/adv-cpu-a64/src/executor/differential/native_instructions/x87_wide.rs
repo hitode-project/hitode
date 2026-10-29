@@ -183,3 +183,73 @@ fn checked_x87_accesses_complete_and_refuse_without_instruction_helpers() {
         }
     }
 }
+
+// spec: A64-MEM-7 A64F-FP-7
+#[test]
+fn cached_x87_runs_span_checked_accesses_and_publish_on_refusal() {
+    use crate::jit_map::{Part, enable_memory, units_of};
+    enable_memory();
+    // Refuse an integer load, an x87 arithmetic source, or an x87 store
+    // after the run has changed values, tags, TOP and status.
+    for fault in [None, Some(0), Some(1), Some(2)] {
+        let integer = if fault == Some(0) { HOLE } else { DATA + 64 };
+        let source = if fault == Some(1) { HOLE } else { DATA + 16 };
+        let dest = if fault == Some(2) { HOLE } else { DATA + 32 };
+        let mut program = fixture(|a| {
+            a.add(edx, 17).unwrap();
+            a.fld(qword_ptr(ebx)).unwrap();
+            a.fld(qword_ptr(ebx + 8)).unwrap();
+            a.fadd_2(st0, st2).unwrap();
+            a.fmul(qword_ptr(ebx + 16)).unwrap();
+            a.fstp(qword_ptr(ebx + 24)).unwrap();
+            a.fld(st0).unwrap();
+            a.add(ecx, dword_ptr(integer as i32)).unwrap();
+            a.fadd(qword_ptr(source as i32)).unwrap();
+            a.fstp(qword_ptr(dest as i32)).unwrap();
+            a.fld(dword_ptr(ebx + 48)).unwrap();
+            a.fmul_2(st0, st1).unwrap();
+            a.fstp(dword_ptr(ebx + 52)).unwrap();
+            a.fstp(qword_ptr(ebx + 56)).unwrap();
+            a.adc(edx, 0).unwrap();
+        });
+        for (at, value) in [(0, 2.5f64), (8, 1.25), (16, 3.0)] {
+            program.data[at..at + 8].copy_from_slice(&value.to_le_bytes());
+        }
+        program.data[48..52].copy_from_slice(&1.5f32.to_le_bytes());
+        program.data[64..68].copy_from_slice(&u32::MAX.to_le_bytes());
+        program
+            .state
+            .x87
+            .push(X87Register::from_parts(0xb000_0000_0000_0123, 0x3fff));
+        program.state.x87.status |= 0x220;
+        for checks in [Checks::All, Checks::Slow] {
+            for flagm in [false, true] {
+                let config = (Features { flagm }, false, checks);
+                let mut native = executor(&program, config, false);
+                let mut oracle = executor(&program, config, true);
+                assert_eq!(
+                    native.run(program.stop, 100).unwrap(),
+                    oracle.run(program.stop, 100).unwrap(),
+                    "{fault:?}, {checks:?}, flagm={flagm}"
+                );
+                same(&native, &oracle);
+                let engine = native.native.as_ref().unwrap();
+                assert_eq!(engine.diagnostics.helpers, 0, "avoids interpret");
+                assert_eq!(engine.diagnostics.refused, u64::from(fault.is_some()));
+                if checks == Checks::Slow {
+                    assert!(engine.diagnostics.accesses > 0, "owner completes accesses");
+                }
+                let base = engine.unit_address(CODE).unwrap();
+                let (_, marks) = units_of(CODE)
+                    .into_iter()
+                    .rfind(|&(unit, _)| unit == base)
+                    .expect("the unit was recorded");
+                assert_eq!(
+                    marks.iter().filter(|m| m.part == Part::X87Entry).count(),
+                    1,
+                    "one cached run across checked accesses: {marks:?}"
+                );
+            }
+        }
+    }
+}

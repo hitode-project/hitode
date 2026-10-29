@@ -10,8 +10,7 @@
 //! stored before every check has passed, and memory is accessed only with
 //! the guest flags in NZCV, so checked accesses (A64-MEM-7) take the same
 //! path and a refusal faults before anything is committed. Runs of such
-//! instructions keep the stack in host registers instead (see `cache`);
-//! they leave out checked accesses.
+//! instructions keep the stack in host registers instead (see `cache`).
 //!
 //! Arithmetic needs exact doubles within `2^±fast::RANGE`, masked
 //! exceptions, round to nearest and precision 24, 53 or 64; it rounds once in
@@ -299,6 +298,7 @@ impl Translator<'_> {
                 self.clear_c1();
             }
             Fast::LoadControl => {
+                self.x87_accessing();
                 self.access(Addr::Window(X6), 2, Dir::Load, X0);
                 self.x87_accessed();
                 // Unmasking a pending exception takes the interpreter.
@@ -319,6 +319,7 @@ impl Translator<'_> {
                 };
                 match x.mem {
                     Some(_) => {
+                        self.x87_accessing();
                         self.access(Addr::Window(X6), 2, Dir::Store, value);
                         self.x87_accessed();
                     }
@@ -483,8 +484,17 @@ impl Translator<'_> {
         }
         self.store_flags(slow);
         self.emit(msr_nzcv(X4));
+        self.x87_store_access(width);
+        if pop {
+            self.pop();
+        }
+    }
+
+    /// Stores the rounded value in x2, preserving the guest flags in x4.
+    fn x87_store_access(&mut self, width: u8) {
         let size = if width == 8 { X } else { W };
         if self.checking {
+            self.x87_accessing();
             // The `access` stub's arguments take x1 to x4.
             self.emit(fmov_to_v(size, V1, X2));
             let vmem = if width == 8 { VMem::D } else { VMem::S };
@@ -493,9 +503,6 @@ impl Translator<'_> {
         } else {
             self.site();
             self.emit(str_reg(size, X2, WINDOW, X6, false));
-        }
-        if pop {
-            self.pop();
         }
     }
 
@@ -1201,6 +1208,7 @@ impl Translator<'_> {
     /// `memory_operand` with a binary64 operand's biased exponent minus
     /// `bounds.0` at most `bounds.1`, unless it is a zero.
     fn memory_bounded(&mut self, source: Source, d: VReg, bounds: (u32, u32), slow: Label) {
+        self.x87_accessing();
         match source {
             Source::F32 | Source::F64 => {
                 let size = if source == Source::F32 {
@@ -1441,6 +1449,14 @@ impl Translator<'_> {
             shiftv(W, Shift::Lsl, X17, X17, X16),
             orr(W, X14, X14, X17, Lsl, 0),
         ]);
+    }
+
+    /// A run holds guest flags in x4 between instructions. Checked accesses
+    /// take x0-x4, so carry those flags through NZCV as the uncached path does.
+    fn x87_accessing(&mut self) {
+        if self.checking && self.x87.active {
+            self.emit(msr_nzcv(X4));
+        }
     }
 
     /// After an access: a checked one uses x4 as scratch, and NZCV holds

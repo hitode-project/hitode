@@ -28,7 +28,8 @@
 //! has the owner's `access` helper perform the access, and returns the
 //! loaded scalar in w0 or vector in `Runtime::access_vector`; refusal
 //! captures v8-v23 as the fault handler does and leaves as for a host fault
-//! at the access, whose site the helper recorded.
+//! at the access, whose site the helper recorded, through its x87 publish
+//! continuation when present. The stub also preserves the x87 run in v24-v31.
 //!
 //! Instructions the translator leaves to the interpreter call `interpret`
 //! with canonical flags: it stores the guest as `exit` does, has the
@@ -77,7 +78,8 @@ pub struct Runtime {
     /// Where `shadow_reset` resumes.
     pub resume: u64,
     /// `access(runtime, address, site, value, kind) -> value`, called by
-    /// `access`; vectors use `access_vector`, and bit 32 set refuses.
+    /// `access`; vectors use `access_vector`, and bit 32 set refuses with
+    /// the publication continuation in `access_resume`.
     pub access: u64,
     /// Where a refused access stores v8-v23, as the fault handler captures
     /// them from a host fault.
@@ -114,6 +116,8 @@ pub struct Runtime {
     pub channel_batches: u64,
     #[cfg(test)]
     pub native_batches: u64,
+    /// A refused access's x87 publish continuation, or zero for `fault`.
+    pub access_resume: u64,
 }
 
 impl Runtime {
@@ -137,6 +141,7 @@ impl Runtime {
             shadow_top: 0,
             resume: 0,
             access: 0,
+            access_resume: 0,
             fault_simd: 0,
             classes: 0,
             alias: 0,
@@ -245,6 +250,7 @@ pub(crate) const TABLE: u32 = field(offset_of!(Runtime, table));
 const SHADOW_TOP: u32 = field(offset_of!(Runtime, shadow_top));
 const RESUME: u32 = field(offset_of!(Runtime, resume));
 const ACCESS: u32 = field(offset_of!(Runtime, access));
+const ACCESS_RESUME: u32 = field(offset_of!(Runtime, access_resume));
 pub(crate) const ACCESS_VECTOR: u32 = field(offset_of!(Runtime, access_vector));
 const _: () = assert!(ACCESS_VECTOR.is_multiple_of(16));
 const FAULT_SIMD: u32 = field(offset_of!(Runtime, fault_simd));
@@ -439,21 +445,30 @@ fn emit_apply(asm: &mut Asm) {
 /// `access`, called with w1 the guest address, x2 the site, w3 a value to
 /// store and w4 the kind. Keeps x5-x17 and NZCV; x0-x4 and x30 are free
 /// wherever translated code accesses memory.
-/// Also preserves v0-v7 temporaries and the v16-v23 cache.
+/// Also preserves v0-v7 temporaries, the v16-v23 cache and v24-v31 x87 pairs;
+/// AAPCS64 keeps the MMX halves of v8-v15.
 fn emit_access(asm: &mut Asm, fault: crate::asm::Label) {
     emit_save_light(asm);
     asm.emit_all(&[
-        stp_v(VSize::Q, Pre, v(0), v(1), SP, -128),
+        stp_v(VSize::Q, Pre, v(0), v(1), SP, -256),
         stp_v(VSize::Q, Offset, v(2), v(3), SP, 32),
         stp_v(VSize::Q, Offset, v(4), v(5), SP, 64),
         stp_v(VSize::Q, Offset, v(6), v(7), SP, 96),
+        stp_v(VSize::Q, Offset, v(24), v(25), SP, 128),
+        stp_v(VSize::Q, Offset, v(26), v(27), SP, 160),
+        stp_v(VSize::Q, Offset, v(28), v(29), SP, 192),
+        stp_v(VSize::Q, Offset, v(30), v(31), SP, 224),
         mov(X, r(0), RUNTIME),
         ldr(X, r(16), RUNTIME, ACCESS),
         blr(r(16)),
+        ldp_v(VSize::Q, Offset, v(30), v(31), SP, 224),
+        ldp_v(VSize::Q, Offset, v(28), v(29), SP, 192),
+        ldp_v(VSize::Q, Offset, v(26), v(27), SP, 160),
+        ldp_v(VSize::Q, Offset, v(24), v(25), SP, 128),
         ldp_v(VSize::Q, Offset, v(6), v(7), SP, 96),
         ldp_v(VSize::Q, Offset, v(4), v(5), SP, 64),
         ldp_v(VSize::Q, Offset, v(2), v(3), SP, 32),
-        ldp_v(VSize::Q, Post, v(0), v(1), SP, 128),
+        ldp_v(VSize::Q, Post, v(0), v(1), SP, 256),
     ]);
     emit_restore_light(asm);
     let refused = asm.label();
@@ -467,7 +482,9 @@ fn emit_access(asm: &mut Asm, fault: crate::asm::Label) {
         let (low, high) = (v(8 + 2 * n), v(9 + 2 * n));
         asm.emit(stp_v(VSize::Q, Offset, low, high, r(16), 32 * i32::from(n)));
     }
-    asm.b(fault);
+    asm.emit(ldr(X, r(0), RUNTIME, ACCESS_RESUME));
+    asm.cbz(X, false, r(0), fault);
+    asm.emit(br(r(0)));
 }
 
 /// The indirect table probe for the EIP in w16: branches to its unit, or to
