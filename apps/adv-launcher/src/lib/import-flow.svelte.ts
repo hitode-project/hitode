@@ -69,20 +69,24 @@ export interface ScanRow {
   exes: string[];
   inLib: boolean;
   noExe: boolean;
+  /** No program was suggested; the row offers the others, unticked. */
+  unsure: boolean;
   /** Only an installer was found. */
   setup: boolean;
   found: ScanFound;
 }
 
 function scanRow(f: ScanFound): ScanRow {
+  const exe = f.exe ?? f.exes.find((e) => e.arch === "x86") ?? null;
   return {
     id: f.folder,
     name: f.title,
     path: f.relative || ".",
-    exe: f.exe?.path ?? "",
+    exe: exe?.path ?? "",
     exes: f.exes.filter((e) => e.arch === "x86").map((e) => e.path),
     inLib: f.inLibrary !== null,
-    noExe: f.exe === null && !f.setup,
+    noExe: exe === null && !f.setup,
+    unsure: f.exe === null && exe !== null,
     setup: f.setup,
     found: f,
   };
@@ -164,6 +168,7 @@ export class ScanPick {
       const found = inTauri ? await libraryScan(this.root, this.depth) : fakeScan(this.depth);
       if (run !== this.#scan) return;
       this.rows = found.map(scanRow);
+      this.off = Object.fromEntries(this.rows.filter((g) => g.unsure).map((g) => [g.id, true]));
       this.phase = "ready";
     } catch (error) {
       if (run === this.#scan) this.#fail(error);
@@ -181,7 +186,7 @@ export class ScanPick {
 
   exeOf(g: ScanRow): ExeCandidate | null {
     const picked = this.exe[g.id];
-    return g.found.exes.find((e) => e.path === picked) ?? g.found.exe;
+    return g.found.exes.find((e) => e.path === (picked ?? g.exe)) ?? null;
   }
 
   encOf(g: ScanRow): Enc {
