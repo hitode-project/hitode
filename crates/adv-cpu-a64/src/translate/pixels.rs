@@ -110,7 +110,6 @@ impl Translator<'_> {
                 steady: false,
             });
         }
-        self.vector.deferred = self.pixel.is_some();
     }
 
     /// Returns true when the steady copy has transferred to the shared tail.
@@ -130,7 +129,6 @@ impl Translator<'_> {
         });
         self.asm.bind(active.resume);
         self.flush_simd();
-        self.vector.deferred = false;
         self.pixel = None;
         false
     }
