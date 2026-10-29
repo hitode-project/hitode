@@ -253,3 +253,72 @@ fn cached_x87_runs_span_checked_accesses_and_publish_on_refusal() {
         }
     }
 }
+
+// spec: A64F-FP-7
+#[test]
+fn cached_x87_runs_span_calls_stack_operations_and_sse() {
+    use crate::jit_map::{Part, enable_memory, units_of};
+    enable_memory();
+    // A run through an inlined callee converting with SSE, as `_ftol2`
+    // does; the SSE store may be refused, and the callee may change its
+    // return address so that the inlined return misses.
+    for variant in 0..3 {
+        let store = if variant == 1 { HOLE } else { DATA + 48 };
+        let mut program = fixture(|a| {
+            let (mut f, mut done) = (a.create_label(), a.create_label());
+            a.fld(qword_ptr(ebx)).unwrap();
+            a.fld(qword_ptr(ebx + 8)).unwrap();
+            a.call(f).unwrap();
+            a.mov(dword_ptr(ebx + 40), eax).unwrap();
+            a.push(ecx).unwrap();
+            a.movsd_2(qword_ptr(store as i32), xmm1).unwrap();
+            a.pop(edx).unwrap();
+            a.faddp(st1, st0).unwrap();
+            a.fstp(qword_ptr(ebx + 24)).unwrap();
+            a.jmp(done).unwrap();
+            a.set_label(&mut f).unwrap();
+            a.push(ebp).unwrap();
+            a.mov(ebp, esp).unwrap();
+            a.sub(esp, 8).unwrap();
+            a.and(esp, -8).unwrap();
+            a.fld(st0).unwrap();
+            a.fmul_2(st0, st2).unwrap();
+            a.fstp(qword_ptr(esp)).unwrap();
+            a.cvttsd2si(eax, qword_ptr(esp)).unwrap();
+            if variant == 2 {
+                // Return past the 3-byte store after the call.
+                a.add(dword_ptr(ebp + 4), 3).unwrap();
+            }
+            a.leave().unwrap();
+            a.ret().unwrap();
+            a.set_label(&mut done).unwrap();
+        });
+        for (at, value) in [(0, 2.5f64), (8, 1.25)] {
+            program.data[at..at + 8].copy_from_slice(&value.to_le_bytes());
+        }
+        program.state.xmm[1][..8].copy_from_slice(&4.0f64.to_le_bytes());
+        for checks in [Checks::All, Checks::Slow] {
+            let config = (Features { flagm: false }, false, checks);
+            let mut native = executor(&program, config, false);
+            let mut oracle = executor(&program, config, true);
+            assert_eq!(
+                native.run(program.stop, 100).unwrap(),
+                oracle.run(program.stop, 100).unwrap(),
+                "{variant}, {checks:?}"
+            );
+            same(&native, &oracle);
+            let engine = native.native.as_ref().unwrap();
+            assert_eq!(engine.diagnostics.helpers, 0, "avoids interpret");
+            let base = engine.unit_address(CODE).unwrap();
+            let (_, marks) = units_of(CODE)
+                .into_iter()
+                .rfind(|&(unit, _)| unit == base)
+                .expect("the unit was recorded");
+            assert_eq!(
+                marks.iter().filter(|m| m.part == Part::X87Entry).count(),
+                1,
+                "one cached run through the callee: {marks:?}"
+            );
+        }
+    }
+}
