@@ -4,8 +4,7 @@
 //! A register is loaded from `CpuState` when the unit first reads it.
 //! XMM writes immediately update `CpuState`, except inside integer pixel loops.
 //! MMX writes mark d8-d15 dirty;
-//! control edges outside those loops, helpers, host calls, checked accesses
-//! and x87/EMMS entries
+//! control edges outside those loops, helpers, host calls and x87/EMMS entries
 //! spill them to MMX and the aliased x87 significand and exponent (0xffff).
 //! Pixel-loop exits also publish dirty XMM registers. Direct faults record
 //! both dirty masks and recover that prefix from the
@@ -13,7 +12,7 @@
 //! The cache is forgotten where control can arrive from elsewhere
 //! (region heads and merges) and after a helper, which may change any
 //! register; d8-d15 survive the Rust calls between, and the `access`
-//! stub keeps v16-v23.
+//! stub keeps v0-v7 and v16-v23.
 //!
 //! The first MMX instruction after the cache is forgotten leaves for the
 //! interpreter if an x87 exception is pending, and once it completes sets
@@ -21,8 +20,9 @@
 //! accesses that are not 16-byte aligned leave for the interpreter too,
 //! which raises the fault. The cpu pointer stays in x5 across a run of
 //! SIMD instructions.
-//! Checked moves share scalar window/alias permission checks; ordinary
-//! accesses stay native, while soft and crossing accesses re-execute in full.
+//! Checked SIMD accesses share scalar window/alias permission checks and
+//! complete soft and crossing accesses through the owner without publishing
+//! or dropping the cache. Memory `pinsrw` and `stmxcsr` use instruction helpers.
 //!
 //! SSE arithmetic and conversions run in NEON while MXCSR is the default:
 //! masked exceptions, round to nearest, no DAZ or FTZ. There the A64
@@ -143,7 +143,7 @@ pub struct Simd {
     pub width: u8,
     /// A 16-byte memory operand that must be aligned.
     pub aligned: bool,
-    /// The helper that runs the instruction when it must be checked.
+    /// The helper for forms without native lowering.
     pub helper: u8,
 }
 
@@ -523,23 +523,18 @@ fn vmem(bytes: u8) -> VMem {
 
 impl Translator<'_> {
     pub(super) fn simd(&mut self, simd: Simd) {
-        let slow = if self.checking && simd.memory() {
-            if simd.kind != Kind::Move {
-                self.helper(simd.helper);
-                return;
-            }
-            self.canonicalize();
-            self.flush_simd();
-            self.vector = Vector::default();
-            Some(self.asm.label())
-        } else {
-            None
-        };
+        if self.checking
+            && simd.memory()
+            && matches!(simd.kind, Kind::InsertWord | Kind::StoreControl)
+        {
+            self.helper(simd.helper);
+            return;
+        }
         let mmx = simd.mmx();
         let ready = self.vector.ready;
         if mmx && !ready {
             self.cpu();
-            let bail = slow.unwrap_or_else(|| self.bail());
+            let bail = self.bail();
             self.emit(ldrh(X16, X5, runtime::X87_STATUS));
             self.asm.tbz(true, X16, 7, bail);
         }
@@ -547,7 +542,7 @@ impl Translator<'_> {
             let address = self.effective(simd.mem);
             if simd.aligned {
                 // NZCV holds guest flags.
-                let bail = slow.unwrap_or_else(|| self.bail());
+                let bail = self.bail();
                 self.emit(and_imm(W, X17, address, 15));
                 self.asm.cbz(W, true, X17, bail);
             }
@@ -555,11 +550,7 @@ impl Translator<'_> {
         } else {
             Reg::ZR
         };
-        if slow.is_some() {
-            self.simd_move(simd, address, slow);
-        } else {
-            self.simd_body(simd, address);
-        }
+        self.simd_body(simd, address);
         if mmx && simd.kind != Kind::Emms && !ready {
             self.cpu();
             self.emit_all(&[
@@ -569,14 +560,6 @@ impl Translator<'_> {
                 strh(Reg::ZR, X5, runtime::X87_TAG),
             ]);
             self.vector.ready = true;
-        }
-        if let Some(slow) = slow {
-            self.flush_simd();
-            let done = self.asm.label();
-            self.asm.b(done);
-            self.asm.bind(slow);
-            self.helper(simd.helper);
-            self.asm.bind(done);
         }
     }
 
@@ -590,7 +573,7 @@ impl Translator<'_> {
                 self.vector.ready = false;
                 return;
             }
-            Kind::Move => return self.simd_move(simd, address, None),
+            Kind::Move => return self.simd_move(simd, address),
             Kind::ExtractWord => {
                 let Loc::Gpr(index) = simd.dst else {
                     unreachable!()
@@ -710,8 +693,13 @@ impl Translator<'_> {
                 let arr = Arr::new(u32::from(log2), full);
                 match simd.src {
                     Loc::Mem => {
-                        self.site();
-                        self.emit(ldr_reg(X, X16, WINDOW, address, false));
+                        if self.checking {
+                            self.simd_access(vmem(simd.width), V1, address, false);
+                            self.emit(fmov_from_v(X, X16, V1));
+                        } else {
+                            self.site();
+                            self.emit(ldr_reg(X, X16, WINDOW, address, false));
+                        }
                     }
                     loc => {
                         let s = self.register(loc);
@@ -743,8 +731,7 @@ impl Translator<'_> {
         }
         let s = match simd.src {
             Loc::Mem => {
-                self.site();
-                self.emit(vldr_reg(vmem(simd.width), V1, WINDOW, address));
+                self.simd_access(vmem(simd.width), V1, address, false);
                 V1
             }
             Loc::Imm => unreachable!("handled above"),
@@ -842,12 +829,12 @@ impl Translator<'_> {
         self.written(simd.dst);
     }
 
-    fn simd_move(&mut self, simd: Simd, address: Reg, slow: Option<Label>) {
+    fn simd_move(&mut self, simd: Simd, address: Reg) {
         let size = vmem(simd.width);
         match (simd.dst, simd.src) {
             (Loc::Mem, src) => {
                 let s = self.register(src);
-                self.simd_access(size, s, address, true, slow);
+                self.simd_access(size, s, address, true);
             }
             (Loc::Gpr(index), src) => {
                 let s = self.register(src);
@@ -857,7 +844,7 @@ impl Translator<'_> {
             }
             (dst, Loc::Mem) => {
                 let d = self.destination(dst, false);
-                self.simd_access(size, d, address, false, slow);
+                self.simd_access(size, d, address, false);
                 self.written(dst);
             }
             (dst, Loc::Gpr(index)) => {
@@ -874,25 +861,8 @@ impl Translator<'_> {
         }
     }
 
-    fn simd_access(
-        &mut self,
-        size: VMem,
-        value: VReg,
-        address: Reg,
-        store: bool,
-        slow: Option<Label>,
-    ) {
-        let direct = if store {
-            vstr_reg(size, value, WINDOW, address)
-        } else {
-            vldr_reg(size, value, WINDOW, address)
-        };
-        if let Some(slow) = slow {
-            self.checked_memory(address, size.bytes(), store, direct, slow);
-        } else {
-            self.site();
-            self.emit(direct);
-        }
+    fn simd_access(&mut self, size: VMem, value: VReg, address: Reg, store: bool) {
+        self.vector_access(size, value, address, store);
     }
 
     /// `movlps` or `movhps`: one 64-bit lane of an XMM register.
@@ -906,15 +876,11 @@ impl Translator<'_> {
             } else {
                 s
             };
-            self.site();
-            self.emit(vstr_reg(VMem::D, value, WINDOW, address));
+            self.simd_access(VMem::D, value, address, true);
         } else {
             let d = self.register(simd.dst);
-            self.site();
-            self.emit_all(&[
-                vldr_reg(VMem::D, V1, WINDOW, address),
-                vins(3, d, lane, V1, 0),
-            ]);
+            self.simd_access(VMem::D, V1, address, false);
+            self.emit(vins(3, d, lane, V1, 0));
             self.written(simd.dst);
         }
     }
@@ -943,8 +909,7 @@ impl Translator<'_> {
         }
         let s = match simd.src {
             Loc::Mem => {
-                self.site();
-                self.emit(vldr_reg(vmem(simd.width), V1, WINDOW, address));
+                self.simd_access(vmem(simd.width), V1, address, false);
                 V1
             }
             Loc::Gpr(index) => {

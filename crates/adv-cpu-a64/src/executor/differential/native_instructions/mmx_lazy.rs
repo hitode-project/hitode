@@ -196,3 +196,72 @@ fn mmx_prefix_survives_fast_paths_with_conditional_helpers() {
         cuts(&program, &[1, 8, 9, 11, 13, 100]);
     }
 }
+
+// spec: A64-MEM-7, A64F-FP-4
+#[test]
+fn checked_simd_accesses_complete_and_refuse_without_instruction_helpers() {
+    let forms: [fn(&mut CodeAssembler); 15] = [
+        |a| a.movd(mm0, dword_ptr(eax)).unwrap(),
+        |a| a.movd(dword_ptr(eax), mm7).unwrap(),
+        |a| a.movq(mm0, qword_ptr(eax)).unwrap(),
+        |a| a.movq(qword_ptr(eax), mm7).unwrap(),
+        |a| a.movdqu(xmm0, xmmword_ptr(eax)).unwrap(),
+        |a| a.movdqu(xmmword_ptr(eax), xmm0).unwrap(),
+        |a| a.punpcklbw(mm2, dword_ptr(eax)).unwrap(),
+        |a| a.paddw(mm2, qword_ptr(eax)).unwrap(),
+        |a| a.pmullw(xmm0, xmmword_ptr(eax)).unwrap(),
+        |a| a.psrlw(mm2, qword_ptr(eax)).unwrap(),
+        |a| a.movhps(xmm0, qword_ptr(eax)).unwrap(),
+        |a| a.movhps(qword_ptr(eax), xmm0).unwrap(),
+        |a| a.addss(xmm3, dword_ptr(eax)).unwrap(),
+        |a| a.addsd(xmm4, qword_ptr(eax)).unwrap(),
+        |a| a.cvtsi2ss(xmm3, dword_ptr(eax)).unwrap(),
+    ];
+    for (n, form) in forms.into_iter().enumerate() {
+        for address in [DATA + 128, DATA + 4096 - 2, HOLE] {
+            // The packed XMM arithmetic form retains its alignment exit.
+            let address = if n == 8 { address & !15 } else { address };
+            let mut program = seeded(fixture(|a| {
+                prefix(a);
+                a.pxor(xmm0, xmm1).unwrap();
+                a.paddw(xmm0, xmm2).unwrap();
+                // Keep lazy flags and both modified SIMD banks live at the access.
+                a.add(edx, 17).unwrap();
+                a.mov(eax, address).unwrap();
+                form(a);
+                a.adc(edx, 0).unwrap();
+                a.paddw(mm7, mm2).unwrap();
+                a.paddw(xmm0, xmm2).unwrap();
+                a.movq(qword_ptr((DATA + 512) as i32), mm7).unwrap();
+                a.movdqu(xmmword_ptr((DATA + 528) as i32), xmm0).unwrap();
+            }));
+            program.state.xmm = std::array::from_fn(|n| [17 * n as u8; 16]);
+            program.state.xmm[3] = [0; 16];
+            program.state.xmm[4] = [0; 16];
+            program.state.mxcsr |= 1 << 5;
+            for chunk in program.data.as_chunks_mut::<8>().0 {
+                chunk.copy_from_slice(&1.0f64.to_le_bytes());
+            }
+            for flagm in [false, true] {
+                let config = (Features { flagm }, false, Checks::Slow);
+                let mut native = executor(&program, config, false);
+                let mut oracle = executor(&program, config, true);
+                let outcome = native.run(program.stop, 100).unwrap();
+                assert_eq!(outcome, oracle.run(program.stop, 100).unwrap(), "form {n}");
+                same(&native, &oracle);
+                let diagnostics = &native.native.as_ref().unwrap().diagnostics;
+                assert!(diagnostics.accesses > 0, "form {n} uses access");
+                assert_eq!(diagnostics.helpers, 0, "form {n} avoids interpret");
+                assert_eq!(diagnostics.refused, u64::from(address == HOLE), "form {n}");
+                assert_eq!(
+                    matches!(
+                        outcome,
+                        RunOutcome::ReadFault { .. } | RunOutcome::WriteFault { .. }
+                    ),
+                    address == HOLE,
+                    "form {n}"
+                );
+            }
+        }
+    }
+}

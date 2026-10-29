@@ -355,8 +355,9 @@ unsafe extern "C" fn dispatch(runtime: *mut Runtime, eip: u32, point: usize) -> 
 }
 
 /// Called by the `access` stub for a checked access of `kind` the window
-/// cannot take: performs it as the interpreter would and returns a loaded
-/// value, or records `site` as faulting and refuses with bit 32. Stores to
+/// cannot take: performs it as the interpreter would, returning a scalar
+/// or transferring a vector through `Runtime::access_vector`. Refusal records
+/// `site` as faulting and sets bit 32. Stores to
 /// code are refused too, so the interpreter invalidates the code.
 unsafe extern "C" fn access(
     runtime: *mut Runtime,
@@ -369,11 +370,23 @@ unsafe extern "C" fn access(
     let owner = unsafe { &mut *((*runtime).owner as *mut Owner) };
     let (native, memory) = unsafe { (&mut *owner.native, &mut *owner.memory) };
     native.diagnostics.accesses += 1;
-    let width = (kind & 7) as usize;
+    let width = (kind & 31) as usize;
+    // SAFETY: the runtime is live; the cold path shares this transfer field.
+    let vector = unsafe { &mut (*runtime).access_vector };
     let done = if kind & runtime::ACCESS_STORE != 0 {
+        let scalar = value.to_le_bytes();
+        let bytes = if width > 4 {
+            &vector[..width]
+        } else {
+            &scalar[..width]
+        };
         (accessible(memory, address, width as u8, WRITE)
             && !memory.stores_code(address, width)
-            && memory.write(address, &value.to_le_bytes()[..width]).is_ok())
+            && memory.write(address, bytes).is_ok())
+        .then_some(0)
+    } else if width > 4 {
+        (accessible(memory, address, width as u8, READ)
+            && memory.read_into(address, &mut vector[..width]).is_ok())
         .then_some(0)
     } else {
         let mut bytes = [0; 4];
