@@ -372,7 +372,7 @@ enum Cold {
     Load {
         label: Label,
         vector: simd::Vector,
-        entry: u16,
+        entry: residency::Entry,
         target: Label,
     },
     /// A backward edge whose check failed: undo it, then leave if the
@@ -460,8 +460,8 @@ struct Translator<'a> {
     /// Of those, the ones it does not write.
     keep: FlagSet,
     vector: simd::Vector,
-    /// The SIMD registers each merge holds on arrival (`residency`).
-    entry: Vec<u16>,
+    /// What each merge holds on arrival (`residency`).
+    entry: Vec<residency::Entry>,
     pixel: Option<pixels::Active>,
     pixel_copies: Vec<pixels::Copy>,
     uses_permissions: &'a mut bool,
@@ -652,10 +652,6 @@ impl Translator<'_> {
         self.index = index;
         self.mark(inst.pc, Part::Body);
         self.checking = (self.checked)(inst.pc);
-        if self.checking && inst.effects.site {
-            self.vector.fp_default = false;
-            self.vector.fp_pe = false;
-        }
         self.out = trace.observe_out[index];
         self.keep = trace.observe_out[index].minus(inst.effects.writes);
         // Other flag writers use their existing exact hardware forms.
@@ -671,8 +667,13 @@ impl Translator<'_> {
             self.x87_merge(index);
         }
         if !steady && (trace.head(index) || trace.merge[index]) {
-            // Control may arrive from elsewhere, holding the entry set.
-            self.coerce(self.entry[index]);
+            // Control may arrive from elsewhere, holding the entry; edges
+            // arrive through `jump` and `branch`.
+            if index > 0 && trace.insts[index - 1].next == Next::Fall {
+                self.coerce(self.entry[index]);
+            } else {
+                self.vector = simd::Vector::at(self.entry[index]);
+            }
         } else if !matches!(inst.op, decode::Op::Simd(_) | decode::Op::X87(_)) {
             // Other instructions may use x5.
             self.vector.cpu = false;
