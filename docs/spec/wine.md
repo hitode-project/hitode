@@ -315,6 +315,8 @@ The host owns text services under WINE-UNIX-6.
 **Rule**: Host font services MUST own font data, text layout, text composition, and DirectWrite glyphs. Wine's font module and FreeType paths MUST remain dormant. Every face MUST appear as TrueType to the guest.
 **Verification**: Test
 
+Native font initialization also fills win32u's ANSI, OEM and UTF-8 code page tables from the PEB, as Wine's does.
+
 ## Threads
 
 ### WINE-THR-1 One scheduling authority

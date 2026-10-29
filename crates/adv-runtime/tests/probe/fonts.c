@@ -150,6 +150,24 @@ int main(int argc, char **argv)
     printf("private=%d\n", size.cx == 20);
     SelectObject(dc, old);
     DeleteObject(font);
+    {
+        /* ANSI window text converts through win32u's code page tables. */
+        WNDCLASSA wc = {0};
+        char title[8] = {0};
+        HWND window;
+        wc.lpfnWndProc = DefWindowProcA;
+        wc.hInstance = GetModuleHandleA(NULL);
+        wc.lpszClassName = "adv-ansi";
+        RegisterClassA(&wc);
+        window = CreateWindowExA(0, "adv-ansi", "\x82\xa0", 0, 0, 0, 1, 1,
+                                 NULL, NULL, wc.hInstance, NULL);
+        i = window && GetWindowTextLengthA(window) == 2
+            && GetWindowTextA(window, title, sizeof(title)) == 2
+            && !strcmp(title, "\x82\xa0");
+        printf("ansi=%d\n", i);
+        ok &= i;
+        DestroyWindow(window);
+    }
     DeleteDC(dc);
     DeleteObject(bitmap);
     return ok ? 0 : 1;

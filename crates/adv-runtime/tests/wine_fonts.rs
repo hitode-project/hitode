@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-// spec: WINE-SES-5, WINE-SES-8, DEV-FONT-1
+// spec: WINE-SES-5, WINE-SES-8, DEV-FONT-1, WINE-UNIX-6
 #[test]
 fn discovered_fonts_and_aliases_survive_prefix_reuse() {
     let (Some(dist), Some(probes)) = (
@@ -130,6 +130,7 @@ fn discovered_fonts_and_aliases_survive_prefix_reuse() {
                 "cff=1",
                 "pixels=1",
                 "private=1",
+                "ansi=1",
             ]
         } else {
             vec![
@@ -139,6 +140,7 @@ fn discovered_fonts_and_aliases_survive_prefix_reuse() {
                 "cff=1",
                 "pixels=1",
                 "private=1",
+                "ansi=1",
             ]
         };
         assert_eq!(text.lines().collect::<Vec<_>>(), expected);

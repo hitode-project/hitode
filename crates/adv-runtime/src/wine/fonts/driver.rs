@@ -12,6 +12,65 @@ fn write(env: &mut Env<'_>, pointer: u32, bytes: &[u8]) -> Outcome {
         Outcome::Return(0)
     }
 }
+/// The tables Wine's `update_codepage` fills: win32u's own ANSI and OEM
+/// conversions read them.
+fn code_pages(env: &mut Env<'_>, module: u32) {
+    let teb = env.sys.contexts[env.context as usize].teb;
+    let peb = env.cpu.read_u32(teb + 0x30).unwrap();
+    for (data, table) in [
+        (0, layout::UTF8_CP),
+        (env.cpu.read_u32(peb + 0x58).unwrap(), layout::ANSI_CP),
+        (env.cpu.read_u32(peb + 0x5c).unwrap(), layout::OEM_CP),
+    ] {
+        let info = code_page_table(env, data);
+        env.cpu.write(module + table, &info).unwrap();
+    }
+}
+
+/// `RtlInitCodePageTable` over NLS data at `data`; zero means UTF-8.
+fn code_page_table(env: &Env<'_>, data: u32) -> [u8; layout::cptable::SIZE] {
+    use layout::cptable;
+    let unit = |at: u32| env.cpu.read_u16(at).unwrap();
+    let mut info = [0; cptable::SIZE];
+    let mut put = |offset: usize, bytes: &[u8]| {
+        info[offset..offset + bytes.len()].copy_from_slice(bytes);
+    };
+    if data == 0 || unit(data + 2) == 65001 {
+        for (i, value) in [65001u16, 4, 0x3f, 0xfffd, 0x3f, 0x3f]
+            .into_iter()
+            .enumerate()
+        {
+            put(i * 2, &value.to_le_bytes());
+        }
+        return info;
+    }
+    for i in 0..6 {
+        put(i * 2, &unit(data + 2 + i as u32 * 2).to_le_bytes());
+    }
+    let mut lead = [0; 12];
+    env.cpu.read(data + 14, &mut lead).unwrap();
+    put(cptable::LeadByte, &lead);
+    let mut ptr = data + u32::from(unit(data)) * 2;
+    put(
+        cptable::WideCharTable,
+        &(ptr + (u32::from(unit(ptr)) + 1) * 2).to_le_bytes(),
+    );
+    ptr += 2;
+    put(cptable::MultiByteTable, &ptr.to_le_bytes());
+    ptr += 256 * 2;
+    let glyphs = unit(ptr) != 0;
+    ptr += 2;
+    if glyphs {
+        ptr += 256 * 2;
+    }
+    put(cptable::DBCSRanges, &ptr.to_le_bytes());
+    if unit(ptr) != 0 {
+        put(12, &1u16.to_le_bytes());
+        put(cptable::DBCSOffsets, &(ptr + 2).to_le_bytes());
+    }
+    info
+}
+
 pub(super) fn run(env: &mut Env<'_>, name: &'static str) -> Outcome {
     let (module, name) = name.split_once('!').expect("font body identity");
     let args: [u32; 10] = std::array::from_fn(|i| env.arg(i as u32));
@@ -43,9 +102,9 @@ pub(super) fn run(env: &mut Env<'_>, name: &'static str) -> Outcome {
         "font_init" => {
             let user = adv_nt::environment::user_key(env).unwrap();
             let key = adv_nt::registry::open_for_reading(env, 0, &user).unwrap();
-            env.cpu
-                .write_u32(super::module(env).unwrap() + layout::HKCU_KEY, key)
-                .unwrap();
+            let module = super::module(env).unwrap();
+            env.cpu.write_u32(module + layout::HKCU_KEY, key).unwrap();
+            code_pages(env, module);
             return Outcome::Return(96);
         }
         "init_freetype_lib" => return Outcome::Return(0),

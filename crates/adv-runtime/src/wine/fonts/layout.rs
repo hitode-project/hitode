@@ -244,6 +244,18 @@ pub const FONT_FUNCS: u32 = 0x1f1884;
 pub const FONT_DRIVER: u32 = 0x1d0620;
 pub const DIB_DRIVER: u32 = 0x1d4be0;
 pub const HKCU_KEY: u32 = 0x1e678c;
+pub const ANSI_CP: u32 = 0x1e6760;
+pub const OEM_CP: u32 = 0x1f1600;
+pub const UTF8_CP: u32 = 0x1f1640;
+/// `CPTABLEINFO`, as `RtlInitCodePageTable` fills it.
+pub mod cptable {
+    pub const SIZE: usize = 0x2c;
+    pub const LeadByte: usize = 0xe;
+    pub const MultiByteTable: usize = 0x1c;
+    pub const WideCharTable: usize = 0x20;
+    pub const DBCSRanges: usize = 0x24;
+    pub const DBCSOffsets: usize = 0x28;
+}
 
 #[cfg(test)]
 mod tests {
