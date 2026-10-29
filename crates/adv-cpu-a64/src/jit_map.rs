@@ -22,6 +22,8 @@ static MEMORY: AtomicBool = AtomicBool::new(false);
 pub enum Part {
     /// The instruction's inline code.
     Body,
+    /// REP string element execution.
+    Rep,
     /// Its out-of-line paths: exits, misses, helper calls.
     Cold,
     /// The checks that open an x87 run (A64F-FP-7).

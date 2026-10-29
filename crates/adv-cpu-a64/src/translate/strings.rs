@@ -147,6 +147,9 @@ impl Translator<'_> {
         };
         let (eax, ecx, esi, edi) = (host(EAX), host(ECX), host(ESI), host(EDI));
         let rep = op.rep != Rep::None;
+        if rep {
+            self.remark(crate::jit_map::Part::Rep);
+        }
         let (top, finish, slow, done) = (
             self.asm.label(),
             self.asm.label(),

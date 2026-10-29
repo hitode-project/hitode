@@ -21,6 +21,7 @@ These terms have one meaning across the docs, specs, code comments and reports. 
 | predecode window | 预解码窗口 | A bounded run of instructions with a boundary index that Tier 0 caches to reuse local branches, calls and returns. |
 | a64 | a64 | The translation engine for every AArch64 host. It keeps guest registers in fixed host registers, accesses memory directly through a guarded window and translates in one pass without an IR. |
 | region / entry / link | 区域／入口／链接 | A region is a bounded unit of guest code. An entry is where the dispatcher enters a region. A link is a direct transfer between regions that does not return to the Rust dispatch loop. |
+| execution form | 执行形式 | The path that executes an instruction: translated unit code, an operation helper, an interpret call, or interpreter execution including first visits. Interpreted REP elements are counted separately; native ones count as translated work. |
 | execution contract | 执行契约 | The state, memory access, exit and recovery rules that Tier 0 and the AArch64 translator share. `CpuState` is the authoritative state. |
 | code cache | 代码缓存 | Translated code retained in one process. |
 | soft page | 软页 | A host page protected more strictly than the 4 KiB permission table says, for mixed permissions, translated code, shared audio memory or first file access. Accesses fault and are emulated, and hot access sites are translated again as checked accesses. |

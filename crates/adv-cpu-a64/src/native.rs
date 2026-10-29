@@ -439,9 +439,17 @@ unsafe extern "C" fn interpret(runtime: *mut Runtime, index: u32, countdown: u64
     native.helper_counts[index as usize] += 1;
     let (epoch, dirty) = (memory.epoch, memory.dirty_pages.len());
     let units = countdown.saturating_add(1).min(u64::from(u32::MAX)) as u32;
+    let count = cpu.regs[1];
     let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         helper.prepared.execute(cpu, memory, units)
     }));
+    if let (Some(forms), Ok(execution)) = (&mut native.retired_forms, &run) {
+        let (retired, elements) = helper
+            .prepared
+            .retirement(*execution, cpu, helper.pc, count);
+        forms[2] += retired;
+        forms[4] += elements;
+    }
     let (status, charge) = match run {
         Ok(Execution {
             step: Step::Executed,
@@ -485,6 +493,9 @@ unsafe extern "C" fn interpret(runtime: *mut Runtime, index: u32, countdown: u64
             (LEAVE, -1)
         }
     };
+    if native.retired_forms.is_some() {
+        native.helper_units += (charge + 1) as u64;
+    }
     if status != 0 {
         native.diagnostics.helper_exits += 1;
     }
@@ -614,6 +625,8 @@ pub(crate) struct Native {
     pub(crate) deadline: Option<u64>,
     /// Diagnostic counts of how runs end; see `Diagnostics`.
     pub(crate) diagnostics: Diagnostics,
+    pub(crate) retired_forms: Option<[u64; 5]>,
+    helper_units: u64,
     /// Each placed unit's host address and entry, ascending.
     placed: Vec<(usize, u32)>,
     /// The permissions the page class table was made from, and the table
@@ -736,6 +749,8 @@ impl Native {
             work: translate::Workspace::default(),
             helpers: Vec::new(),
             helper_counts: Vec::new(),
+            retired_forms: None,
+            helper_units: 0,
             helper_eips: FxHashMap::default(),
             pending: None,
             generation: 0,
@@ -746,6 +761,13 @@ impl Native {
             runtime,
             control: 0,
         })
+    }
+
+    pub(crate) fn count_forms(&mut self, enabled: bool) {
+        self.retired_forms = enabled.then_some([0; 5]);
+        if enabled {
+            crate::jit_map::enable_memory();
+        }
     }
 
     /// Runs the unit at `cpu.eip` if it completes at most `fuel` guest
@@ -768,6 +790,9 @@ impl Native {
             Some(entry) => (entry, 0),
             None if self.first_visit(cpu.eip) => {
                 let visit = translate::first::run(cpu, memory, stop, fuel.min(SLICE));
+                if let Some(forms) = &mut self.retired_forms {
+                    forms[3] += u64::from(visit.retired);
+                }
                 self.diagnostics.first_visits += 1;
                 self.diagnostics.first_declined += u64::from(visit.declined);
                 let exit = if visit.declined {
@@ -801,6 +826,10 @@ impl Native {
             }));
         }
         debug_assert_eq!(cpu.lazy_flags[3], 0, "lazy flags settle before entry");
+        self.runtime.count_forms = u64::from(self.retired_forms.is_some());
+        self.runtime.applied = 0;
+        self.runtime.apply_return = 0;
+        self.helper_units = 0;
         let budget = fuel.min(SLICE);
         if self.uses_permissions || self.checks != Checks::Adaptive || !self.checked.is_empty() {
             self.classify(memory);
@@ -866,12 +895,26 @@ impl Native {
                 }
             }
             retired -= u64::from(site.refund);
+            if self.retired_forms.is_some()
+                && self.runtime.apply_return != 0
+                && pc >= self.runtime.apply_return as usize
+                && crate::jit_map::locate(self.runtime.apply_return as usize - 4, u128::MAX)
+                    .is_some_and(|location| location.eip == Some(site.eip))
+            {
+                self.runtime.applied -= 1;
+            }
             if !site.checked {
                 self.unchecked_faults += 1;
                 self.strike(site.eip, pc);
             } else {
                 self.diagnostics.checked_faults += 1;
             }
+        }
+        if let Some(forms) = &mut self.retired_forms {
+            // Native REP elements stay in translated fuel: telling them
+            // apart would cost emitted code in every REP loop.
+            forms[0] += retired - self.runtime.applied - self.helper_units;
+            forms[1] += self.runtime.applied;
         }
         let retired = retired as u32;
         Ok(Some(Run {

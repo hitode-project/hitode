@@ -140,7 +140,7 @@ impl Options {
             artifacts: Some(self.data_dir.clone()),
             code_cache: !self.no_code_cache,
             precompile: !self.no_code_cache,
-            frame_timing: self.frame_budget,
+            frame_timing: self.frame_budget || debug::requested(self.debug),
             profiling: self.profile,
         })?;
         if self.frame_budget {

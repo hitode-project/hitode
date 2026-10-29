@@ -476,7 +476,7 @@ impl DebugTarget for DebugSession<'_> {
     fn profile_place(&self, address: u32) -> String {
         format!("{address:#010x} (sample process unavailable)")
     }
-    fn debug_counters(&self) -> [u64; 3] {
+    fn debug_counters(&self) -> [u64; 8] {
         self.session.debug_counters()
     }
     fn calls_report(&self, count: usize) -> String {

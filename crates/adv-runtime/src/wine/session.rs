@@ -97,7 +97,7 @@ pub struct Session {
     idle: BTreeMap<i32, Option<u64>>,
     foreground: i32,
     delivered: u64,
-    retired_debug: [u64; 3],
+    retired_debug: [u64; 8],
     retired_boundaries: adv_nt::counters::Boundaries,
 }
 
@@ -767,7 +767,7 @@ impl Session {
             fonts,
             foreground: shared.id.get(),
             delivered: 0,
-            retired_debug: [0; 3],
+            retired_debug: [0; 8],
             retired_boundaries: Default::default(),
             shared,
             finished: None,
