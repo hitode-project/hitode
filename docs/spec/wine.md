@@ -392,11 +392,6 @@ Field offsets match the pinned module's DWARF. The mixer runs as a host-call bod
 **Rule**: DIB bodies MUST preserve Wine's pixels, padding, overlap traversal, bit fields, palette selection, blend arithmetic and interpolation rounding. They MUST cover every format, palette depth, brush and floating-point control their primitive accepts. Field offsets and data addresses MUST match the pinned Unix module's DWARF.
 **Verification**: Test
 
-### NAT-BODY-5 Code page bodies
-
-**Rule**: PE code page bodies MUST use Wine's loaded conversion and normalization tables and preserve its output bytes, lengths, default-character indicators and errors. Their structure offsets and global addresses MUST match the pinned modules' DWARF. Cached-page lookups MUST decline while Wine's locale lock is held.
-**Verification**: Test
-
 ### NAT-BODY-6 CRT bodies
 
 **Rule**: Locale-independent CRT string and memory bodies MUST return the results and write the bytes the Windows CRT does, for every length and overlap. Inaccessible memory MUST follow A64-CALL-4.
@@ -863,4 +858,4 @@ UI projection refreshes MUST wake execution only when they queue new guest work.
 **Rule**: Native sources MUST accept PCM, IEEE float, Microsoft ADPCM and xWMA buffers. Compressed decoding MUST use host code.
 **Verification**: Test
 
-Withdrawn: WINE-TEST-2, NAT-BODY-7
+Withdrawn: WINE-TEST-2, NAT-BODY-5, NAT-BODY-7

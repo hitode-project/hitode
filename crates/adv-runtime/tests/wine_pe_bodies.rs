@@ -1,4 +1,4 @@
-//! The Win32 conversion exports reach native bodies in a normal Wine process.
+//! Win32 conversion results agree in translated and interpreted Wine processes.
 #![cfg(any(target_vendor = "apple", target_os = "android"))]
 use adv_runtime::wine::session::{Config, Session, Stop};
 use std::{
@@ -41,26 +41,6 @@ fn probe(jit: bool) -> Option<String> {
     })
     .unwrap();
     let stop = session.run(Instant::now() + Duration::from_secs(60));
-    let mut csv = Vec::new();
-    session
-        .machine
-        .sys
-        .stats
-        .write_host_csv(&session.machine.cpu, &session.machine.sys.thunks, &mut csv)
-        .unwrap();
-    let csv = String::from_utf8(csv).unwrap();
-    if jit {
-        // Even if every decline was this export's, bodies ran over 100 times.
-        let declines = adv_nt::native::declines(&session.machine.ext);
-        for name in ["MultiByteToWideChar", "WideCharToMultiByte"] {
-            let row = csv
-                .lines()
-                .find(|l| l.contains(&format!("\"kernelbase.dll!{name}\"")))
-                .unwrap_or_else(|| panic!("no calls for {name}: {csv}"));
-            let calls: u64 = row.split(',').nth(2).unwrap().parse().unwrap();
-            assert!(calls > 100 + declines, "{row}, {declines} declines");
-        }
-    }
     drop(session);
     drop(stdout);
     let output = std::fs::read_to_string(root.join("stdout")).unwrap();
@@ -70,18 +50,16 @@ fn probe(jit: bool) -> Option<String> {
     Some(output)
 }
 
-// spec: NAT-BODY-5
 #[test]
-#[ignore = "interpreter subprocess of code_page_exports_reach_bodies"]
+#[ignore = "interpreter subprocess of code_page_results_match_wine"]
 fn code_page_probe_interpreter() {
     if let Some(output) = probe(false) {
         println!("probe-output={}", output.trim());
     }
 }
 
-// spec: NAT-BODY-5
 #[test]
-fn code_page_exports_reach_bodies() {
+fn code_page_results_match_wine() {
     if wine::wine().is_none() {
         return;
     }

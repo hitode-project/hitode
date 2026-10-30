@@ -34,7 +34,6 @@ mod input;
 pub use input::UserServices;
 mod linked;
 mod mixer;
-mod nls;
 mod own_calls;
 mod pixels;
 mod png;
@@ -356,62 +355,6 @@ static BODIES: std::sync::LazyLock<Vec<Body>> = std::sync::LazyLock::new(|| {
             body: None,
             handler: resume_original,
             direct: Some(input::KEYBOARD_STATE),
-        },
-        Body {
-            name: "kernelbase.dll!MultiByteToWideChar".into(),
-            conv: Conv::Stdcall { argc: 6 },
-            body: Some(nls::multi_byte_to_wide_char),
-            handler: resume_original,
-            direct: None,
-        },
-        Body {
-            name: "kernelbase.dll!WideCharToMultiByte".into(),
-            conv: Conv::Stdcall { argc: 8 },
-            body: Some(nls::wide_char_to_multi_byte),
-            handler: resume_original,
-            direct: None,
-        },
-        Body {
-            name: "ntdll.dll!RtlMultiByteToUnicodeN".into(),
-            conv: Conv::Stdcall { argc: 5 },
-            body: Some(nls::rtl_multi_byte_to_unicode_n),
-            handler: resume_original,
-            direct: None,
-        },
-        Body {
-            name: "ntdll.dll!RtlUnicodeToMultiByteN".into(),
-            conv: Conv::Stdcall { argc: 5 },
-            body: Some(nls::rtl_unicode_to_multi_byte_n),
-            handler: resume_original,
-            direct: None,
-        },
-        Body {
-            name: "ntdll.dll!RtlMultiByteToUnicodeSize".into(),
-            conv: Conv::Stdcall { argc: 3 },
-            body: Some(nls::rtl_multi_byte_to_unicode_size),
-            handler: resume_original,
-            direct: None,
-        },
-        Body {
-            name: "ntdll.dll!RtlUnicodeToMultiByteSize".into(),
-            conv: Conv::Stdcall { argc: 3 },
-            body: Some(nls::rtl_unicode_to_multi_byte_size),
-            handler: resume_original,
-            direct: None,
-        },
-        Body {
-            name: "ntdll.dll!RtlOemToUnicodeN".into(),
-            conv: Conv::Stdcall { argc: 5 },
-            body: Some(nls::rtl_oem_to_unicode_n),
-            handler: resume_original,
-            direct: None,
-        },
-        Body {
-            name: "ntdll.dll!RtlUnicodeToOemN".into(),
-            conv: Conv::Stdcall { argc: 5 },
-            body: Some(nls::rtl_unicode_to_oem_n),
-            handler: resume_original,
-            direct: None,
         },
     ];
     bodies.extend(crt::bodies());
