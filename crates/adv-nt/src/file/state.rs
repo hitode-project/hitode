@@ -1,8 +1,8 @@
-//! Shared file positions: duplicate handles and processes refer to one cell.
+//! Shared file positions: the server fd retains the cell across duplicate and
+//! inherited handles, including clients that have not admitted a descriptor.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
-use std::rc::{Rc, Weak};
+use std::rc::Rc;
 
 #[derive(Default)]
 pub(crate) struct States(RefCell<Vec<Option<Entry>>>);
@@ -13,10 +13,6 @@ pub(crate) struct Entry {
     pub kind: i32,
     pub position: Rc<Cell<i64>>,
     pub immutable: Option<[u8; 22]>,
-}
-
-thread_local! {
-    static POSITIONS: RefCell<HashMap<usize, Weak<Cell<i64>>>> = RefCell::new(HashMap::new());
 }
 
 impl States {
@@ -37,24 +33,10 @@ impl States {
         &self,
         handle: u32,
         fd: i32,
-        identity: usize,
+        position: Rc<Cell<i64>>,
         immutable: Option<[u8; 22]>,
         kind: i32,
     ) {
-        let position = POSITIONS.with_borrow_mut(|positions| {
-            if let Some(position) = positions.get(&identity).and_then(Weak::upgrade) {
-                return position;
-            }
-            // SAFETY: descriptor admission established a live regular file.
-            let at = if kind == 1 {
-                unsafe { libc::lseek(fd, 0, libc::SEEK_CUR) }
-            } else {
-                0
-            };
-            let position = Rc::new(Cell::new(at));
-            positions.insert(identity, Rc::downgrade(&position));
-            position
-        });
         let mut entries = self.0.borrow_mut();
         let index = (handle >> 2) as usize;
         let len = entries.len().max(index + 1);

@@ -53,7 +53,21 @@ int main(void)
     if (RegOpenKeyExA(HKEY_CURRENT_USER, path, 0, KEY_ALL_ACCESS, &key)) return 1;
     value = 44;
     check("reopen", !RegSetValueExA(key, "value", 0, REG_DWORD, (BYTE *)&value, sizeof(value)) && query(key, 44));
+    HKEY other;
+    const char other_path[] = "Software\\HitodeRegistryCacheOther";
+    value = 45;
+    check("retire_setup", !RegCreateKeyExA(HKEY_CURRENT_USER, other_path, 0, NULL, 0,
+        KEY_ALL_ACCESS, NULL, &other, NULL)
+        && !RegSetValueExA(other, "value", 0, REG_DWORD, (BYTE *)&value, sizeof(value)));
+    RegCloseKey(other);
+    check("retire_warm", query(key, 44));
+    /* No registry mutation occurs between this cached read and reopening an
+     * existing key. The in-process server reuses the retired handle slot. */
     RegCloseKey(key);
+    check("retired_handle", !RegOpenKeyExA(HKEY_CURRENT_USER, other_path, 0,
+        KEY_ALL_ACCESS, &key) && query(key, 45));
+    RegCloseKey(key);
+    RegDeleteKeyA(HKEY_CURRENT_USER, other_path);
     RegDeleteKeyA(HKEY_CURRENT_USER, path);
     return 0;
 }

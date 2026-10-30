@@ -761,8 +761,13 @@ fn file_bodies_use_known_positions_and_immutable_sizes_without_a_descriptor() {
     let states = std::rc::Rc::new(crate::file::state::States::default());
     let mut standard = [0; 22];
     standard[8..16].copy_from_slice(&123u64.to_le_bytes());
-    states.insert(4, -1, 1, Some(standard), 1);
-    states.get(4).unwrap().position.set(42);
+    states.insert(
+        4,
+        -1,
+        std::rc::Rc::new(std::cell::Cell::new(42)),
+        Some(standard),
+        1,
+    );
     let services = Services {
         state: std::rc::Rc::as_ptr(&states).cast(),
         teb: 0x3000,
@@ -804,7 +809,13 @@ fn file_bodies_use_known_positions_and_immutable_sizes_without_a_descriptor() {
     assert_eq!(states.get(4).unwrap().position.get(), 49);
     drop(call);
     for (handle, kind) in [(8, 2), (12, 5), (16, 3)] {
-        states.insert(handle, -1, handle as usize, None, kind);
+        states.insert(
+            handle,
+            -1,
+            std::rc::Rc::new(std::cell::Cell::new(0)),
+            None,
+            kind,
+        );
         let body = services::bodies()
             .find(|body| body.name.ends_with("GetFileSizeEx"))
             .unwrap()

@@ -169,7 +169,7 @@ A name whose directory exists as written MUST resolve by looking up its last com
 
 ### WINE-SYS-13 Registry value cache
 
-**Rule**: Cached registry reads MUST preserve information classes, buffer negotiation and value contents. Registry mutations and handle retirement through typed or raw requests MUST invalidate caches across the process family. Caches MUST retain at most 256 complete values per process, each at most 4096 bytes.
+**Rule**: Cached registry reads MUST preserve information classes, buffer negotiation and value contents. Registry mutations and handle retirement MUST invalidate caches across the process family. Caches MUST retain at most 256 complete values per process, each at most 4096 bytes.
 **Verification**: Test
 
 ### WINE-SYS-14 Name probe cache
@@ -425,7 +425,7 @@ Field offsets match the pinned module's DWARF. The mixer runs as a host-call bod
 | Objects | Waits with a zero timeout, `SetEvent`, `ResetEvent`, `ReleaseSemaphore`, `ReleaseMutex` |
 | Files | File position queries and changes, `GetFileSize`, `GetFileSizeEx` |
 
-Windows empty A/W peeks preserve last error and MSG, dispatch pending sent messages despite filters, and skip GETMESSAGE/FOREGROUNDIDLE hooks. Measured WoW64 empty peeks hand off about once per 100 calls, including PM_NOYIELD; the body requests that completed-call handoff from its owner. Driver jobs, dirty surfaces, internal messages and matching messages or timers requiring server processing retain the full path. The ANSI wrapper keeps its pending character conversion state and reaches the shared empty-peek body through NtUserPeekMessage.
+Windows empty A/W peeks preserve last error and MSG, dispatch pending sent messages despite filters, and skip GETMESSAGE/FOREGROUNDIDLE hooks. Measured WoW64 empty peeks hand off about once per 100 calls, including PM_NOYIELD; the body requests that completed-call handoff from its owner. Driver jobs, dirty surfaces, internal messages and matching messages or timers requiring server processing retain the full path. The ANSI wrapper keeps its pending character conversion state and reaches the shared empty-peek body through NtUserPeekMessage. The full USER path advances pending server activity before Wine reads its shared queue bits. File cursors belong to server fd ownership, including inherited and duplicate handles whose clients have not admitted a descriptor.
 
 ### NAT-BODY-8 D3DX pixel conversion
 

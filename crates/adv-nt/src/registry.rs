@@ -42,8 +42,8 @@ thread_local! {
     static REVISION: Cell<u64> = const { Cell::new(0) };
 }
 
-/// Every typed and raw request passes here before the server can change keys
-/// or retire handles. Processes share the execution owner's revision.
+/// Typed/raw requests and direct handle closes pass here before the server can
+/// change keys or retire handles. Processes share the execution owner's revision.
 pub(crate) fn invalidate_request(number: i32) {
     use crate::protocol::{
         CloseHandleRequest, DupHandleRequest, LoadRegistryRequest, RenameKeyRequest,

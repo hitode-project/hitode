@@ -12,6 +12,8 @@
 //! bytes in shared memory, retaining the pipes as descriptor identities.
 //! Its close and SCM_RIGHTS wrappers keep each duplicate attached to its queue;
 //! clients use the same wrappers, serialized with the server by the execution owner.
+//! The fd wrapper retains a shared Rust cursor until Wine destroys the fd, so
+//! closing a client cache cannot reset an inherited handle's position.
 //!
 //! Apple and Android targets build the server; elsewhere the crate is empty.
 #![cfg(any(target_vendor = "apple", target_os = "android"))]
@@ -20,6 +22,7 @@ use std::cell::Cell;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
@@ -147,7 +150,12 @@ unsafe extern "C" {
         out: *mut u32,
     ) -> c_int;
     fn hitode_server_close_handle(tid: u32, handle: u32) -> u32;
-    fn hitode_server_object(tid: u32, handle: u32) -> usize;
+    fn hitode_server_file_position(
+        tid: u32,
+        handle: u32,
+        create: extern "C" fn(i64) -> *mut c_void,
+        release: extern "C" fn(*mut c_void),
+    ) -> *const Cell<i64>;
     fn hitode_server_file_kind(tid: u32, handle: u32) -> i32;
     fn hitode_server_sync_fd(
         tid: u32,
@@ -222,10 +230,26 @@ pub fn file_kind(tid: u32, handle: u32) -> i32 {
     unsafe { hitode_server_file_kind(tid, handle) }
 }
 
-/// The server object's identity, for sharing descriptor state at admission.
-pub fn object_identity(tid: u32, handle: u32) -> usize {
-    // SAFETY: clients and the server run serially on the execution owner.
-    unsafe { hitode_server_object(tid, handle) }
+/// A cursor retained by the server fd until its final inherited/duplicate owner
+/// retires, even when no client has admitted a descriptor.
+pub fn file_position(tid: u32, handle: u32) -> Option<Rc<Cell<i64>>> {
+    extern "C" fn create(offset: i64) -> *mut c_void {
+        Rc::into_raw(Rc::new(Cell::new(offset))).cast_mut().cast()
+    }
+    extern "C" fn release(pointer: *mut c_void) {
+        // SAFETY: C owns the one reference returned by create, until fd destruction.
+        drop(unsafe { Rc::from_raw(pointer.cast::<Cell<i64>>()) });
+    }
+    // SAFETY: the execution owner serializes fd access; C retains its reference
+    // until the server fd is destroyed, and returns a live Cell allocation.
+    let position = unsafe { hitode_server_file_position(tid, handle, create, release) };
+    if position.is_null() {
+        return None;
+    }
+    Some(unsafe {
+        Rc::increment_strong_count(position);
+        Rc::from_raw(position)
+    })
 }
 
 /// Close through the same handle table while the server is suspended.

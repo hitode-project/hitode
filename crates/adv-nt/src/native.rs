@@ -81,6 +81,8 @@ fn resume_input(env: &mut adv_machine::Env<'_>) -> adv_machine::Outcome {
             Err(error) => return crate::status::finish(Err(error)),
         }
     }
+    // Pending driver descriptors must reach the server before Wine reads QS_DRIVER.
+    crate::server::run(env);
     resume_original(env)
 }
 
