@@ -17,6 +17,7 @@ runner as they are; these are shaped here:
   speed [SECONDS] [--range A:B | --marks A:B | --frame N]
                             sample shares, retired instructions, ns/inst, MIPS
                             and hottest guest units by execution form
+  boundary [reset]          native body host work and tail calls
   snap [LABEL], pull [NAME] save a snapshot under target/investigations/debug
   analyze [--gap MS]        snapshot now and explain each stall in it
   watch [--gap MS]          pull, save and analyze every new snapshot until
@@ -89,7 +90,8 @@ class Snapshot:
     SECTIONS = {"timeline": "timeline (last 30 s)", "samples": "samples (last 30 s)",
                 "hot": "hot instructions (last 30 s)",
                 "retirement": "retirement (last 30 s)",
-                "modules": "modules", "marks": "marks", "info": "info"}
+                "modules": "modules", "marks": "marks", "info": "info",
+                "boundary": "boundary (since previous snapshot)"}
 
     def __init__(self, path=None, text=None):
         self.sections, title = {}, None

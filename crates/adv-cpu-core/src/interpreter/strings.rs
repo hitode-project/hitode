@@ -2,7 +2,7 @@
 use super::*;
 
 /// A batch cannot fault after validation or touch code. PCM destinations keep
-/// byte-atomic writes. Limit it at page and address-size boundaries; the scalar path
+/// word-atomic writes. Limit it at page and address-size boundaries; the scalar path
 /// handles crossing elements and preserves their exact fault priority.
 fn batch(state: &mut CpuState, memory: &mut Memory, op: StringOp, budget: u32) -> u32 {
     if !matches!(op.kind, StringKind::Movs | StringKind::Stos) {
@@ -43,7 +43,7 @@ fn batch(state: &mut CpuState, memory: &mut Memory, op: StringOp, budget: u32) -
     match memory.direct(destination, len, true) {
         None => {
             // A forward copy from ordinary RAM to PCM can validate once per page.
-            // It still publishes through Memory's byte-atomic audio stores.
+            // It still publishes through Memory's word-atomic audio stores.
             if reverse
                 || op.kind != StringKind::Movs
                 || memory.direct(source, len, false).is_none()

@@ -167,13 +167,7 @@ fn set(s: &mut CpuState, r: Reg, v: u32) {
 }
 
 fn accessible(memory: &Memory, addr: u32, len: u32, prot: Prot) -> bool {
-    let Ok(r) = memory.committed(addr, len as usize) else {
-        return false;
-    };
-    r.is_empty()
-        || memory.perms[r.start / 4096..=(r.end - 1) / 4096]
-            .iter()
-            .all(|p| p & prot.0 == prot.0)
+    memory.accessible(addr, len as usize, prot.0)
 }
 
 impl Guest for View<'_> {
@@ -289,6 +283,15 @@ impl Guest for View<'_> {
     }
     fn writable_bytes(&mut self, addr: u32, len: usize) -> Option<&mut [u8]> {
         self.memory.writable_bytes(addr, len)
+    }
+    fn pinned(&self, addr: u32, len: usize) -> Option<adv_cpu_core::backend::Pinned> {
+        self.memory.pinned(addr, len)
+    }
+    fn still_pinned(&self, pinned: &adv_cpu_core::backend::Pinned) -> bool {
+        self.memory.still_pinned(pinned)
+    }
+    fn host_access(&self) -> adv_cpu_core::backend::HostAccess {
+        self.memory.host_access()
     }
     fn read_only_file_view(
         &self,
@@ -474,6 +477,15 @@ impl Guest for Cpu {
     }
     fn writable_bytes(&mut self, addr: u32, len: usize) -> Option<&mut [u8]> {
         self.inner.memory.writable_bytes(addr, len)
+    }
+    fn pinned(&self, addr: u32, len: usize) -> Option<adv_cpu_core::backend::Pinned> {
+        self.inner.memory.pinned(addr, len)
+    }
+    fn still_pinned(&self, pinned: &adv_cpu_core::backend::Pinned) -> bool {
+        self.inner.memory.still_pinned(pinned)
+    }
+    fn host_access(&self) -> adv_cpu_core::backend::HostAccess {
+        self.inner.memory.host_access()
     }
     fn read_only_file_view(
         &self,

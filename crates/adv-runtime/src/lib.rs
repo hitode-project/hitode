@@ -18,6 +18,10 @@ pub use adv_cpu::jit_map::{
 pub use adv_cpu::{CompileStrategy, Cpu, Engine, EngineOptions, HostFeatures};
 #[cfg(target_os = "ios")]
 pub use adv_cpu::{code_pool_state, prepare_code_pool_after_attach, prepare_code_pool_if_debugged};
+pub use adv_nt::native::{
+    BodyCount as NativeBodyCount, Boundary as NativeBoundary,
+    debugger_attached as native_debugger_attached,
+};
 pub use debug_views::DebugTarget;
 
 /// Reserves the guest window for the life of the app (IOS-MEM-3); call it

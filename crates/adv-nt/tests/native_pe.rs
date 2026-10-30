@@ -815,13 +815,43 @@ fn nls_machine(dist: &Path, jit: bool) -> (Machine<Cpu>, Pe, Pe) {
     (m, kb, nt)
 }
 
+fn shared_nls_machine(dist: &Path, jit: bool) -> (Machine<Cpu>, Pe, Pe) {
+    use std::os::fd::AsFd;
+    let (mut machine, kb, nt) = nls_machine(dist, jit);
+    for (at, name) in PAGES
+        .iter()
+        .enumerate()
+        .map(|(i, page)| (0x2000000 + i as u32 * 0x40000, format!("c_{page}.nls")))
+        .chain([(NORM, "normnfc.nls".into())])
+    {
+        let file = std::fs::File::open(dist.join("share/wine/nls").join(name)).unwrap();
+        let len = (file.metadata().unwrap().len() as u32 + 0xfff) & !0xfff;
+        machine.cpu.unmap(at, len).unwrap();
+        machine
+            .cpu
+            .map_shared_file(at, len, file.as_fd(), 0, Prot::READ)
+            .unwrap();
+    }
+    (machine, kb, nt)
+}
+
+// spec: NAT-BODY-5, NAT-BODY-15
+#[test]
+fn code_pages_shared_tables_match_wine() {
+    compare_code_pages(shared_nls_machine);
+}
+
 // spec: NAT-BODY-5
 #[test]
 fn code_pages_match_wine() {
+    compare_code_pages(nls_machine);
+}
+
+fn compare_code_pages(factory: fn(&Path, bool) -> (Machine<Cpu>, Pe, Pe)) {
     let Some(dist) = dist() else {
         return;
     };
-    let (mut native, kb, nt) = nls_machine(&dist, true);
+    let (mut native, kb, nt) = factory(&dist, true);
     let (mut reference, _, _) = nls_machine(&dist, false);
     let mut rng = Rng(0x61ace5ff6e379b2d);
     for name in [

@@ -227,6 +227,11 @@ impl Link {
         );
     }
 
+    #[cfg(any(target_vendor = "apple", target_os = "android"))]
+    pub(crate) fn known_tid(&self, context: CtxId) -> Option<u32> {
+        self.threads.get(&context).map(|thread| thread.tid)
+    }
+
     fn thread(&mut self, context: CtxId) -> Result<&mut Thread, Error> {
         self.threads
             .get_mut(&context)

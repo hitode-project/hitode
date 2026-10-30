@@ -2,20 +2,21 @@
 //! pointer may cross into a device callback.
 use std::sync::Arc;
 
-/// A stable, byte-atomic, read-only view. Implementations must retain their
-/// backing allocation for this object's lifetime and support concurrent byte
-/// atomic stores by the guest owner. Loads never lock, allocate, or perform IO.
-/// Wide mixed-size atomics and ordinary concurrent Rust writes are forbidden.
-/// A CPU may map another view at a stable linear guest address, but native
-/// word/SIMD accesses to that view must lower to matching byte atomics. A guest
-/// unmap/protection change only affects the CPU view; this read view retains its
-/// independent storage and OS read-only protection until its last owner drops.
+/// A stable, atomically read view. Implementations retain their backing
+/// allocation and support concurrent atomic stores by the guest owner.
+/// Loads never lock, allocate, or perform IO. Every concurrent Rust accessor
+/// uses one aligned atomic width; byte loads may extract lanes from a word.
+/// Overlapping mixed-width accesses involving writes and ordinary Rust byte
+/// references are forbidden. Native guest code accesses linear OS aliases under
+/// their shared-memory contract. Guest unmapping and protection changes affect
+/// only the CPU view; this view retains its independent storage and OS read-only
+/// protection until its last owner drops.
 pub trait SharedReadView: Send + Sync {
     fn len(&self) -> usize;
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
-    /// Return one relaxed atomic byte; out-of-range reads return zero.
+    /// Return one byte using a relaxed atomic load; out-of-range reads return zero.
     fn load_u8(&self, index: usize) -> u8;
     fn copy_into(&self, offset: usize, destination: &mut [u8]) {
         for (index, byte) in destination.iter_mut().enumerate() {

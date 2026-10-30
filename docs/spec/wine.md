@@ -400,7 +400,7 @@ Required host text services follow WINE-UNIX-6 in interpreted and translated exe
 
 ### NAT-BODY-7 PE body memory access
 
-**Rule**: PE string and conversion bodies MUST bound guest memory calls by pages and tables touched. Tables that cannot be borrowed MAY use indexed entry reads. Short calls fitting within one page of strings or eight KiB of conversion output MUST NOT allocate heap buffers.
+**Rule**: `Memory` MUST cache host page-range validation by mapping generation, advanced by mapping, protection, storage, watch, and residency changes. Tables that cannot be borrowed MAY use indexed entry reads. Repeated identical calls within one page of strings or eight KiB of conversion output MUST NOT allocate temporary heap buffers.
 **Verification**: Test
 
 ### NAT-BODY-8 D3DX pixel conversion
@@ -436,6 +436,11 @@ Required host text services follow WINE-UNIX-6 in interpreted and translated exe
 ### NAT-BODY-14 Engine pixel routines
 
 **Rule**: Engine pixel bodies MUST write the pixels the routine writes, bit for bit, even where its pair paths round unlike its single-pixel path. They MUST keep every register the routine keeps. A destination overlapping a source other than in place MUST retain guest execution.
+**Verification**: Test
+
+### NAT-BODY-15 Native host work
+
+**Rule**: A body's host work MUST scale with bytes passed and returned, plus a constant. Immutable guest data MUST use `native::memo`. In debug builds and tests, `native::run` MUST reject declines after guest writes under NAT-BODY-1.
 **Verification**: Test
 
 ## Host DLL images

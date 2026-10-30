@@ -1,9 +1,79 @@
-//! Device storage has two independent OS views. Guest accesses use byte atomics
+//! Device storage has two independent OS views. Host accesses use aligned word atomics
 //! through the writable view; callbacks can only load the read-only alias.
 //! Read-only file storage also supplies retained input to serial host libraries.
 use std::ptr::NonNull;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
+
+// SAFETY contract for both helpers: the touched words lie in live OS mappings,
+// rounded to host pages, including padding around the logical range. All Rust
+// accessors use aligned AtomicU32, even single-byte callbacks and edge stores:
+// overlapping mixed-width atomic reads/writes would be undefined behavior.
+// Edges extract bytes or update masked lanes with a word RMW, preserving their
+// neighbours. Four-byte relaxed loads support read-only mappings; no ordinary
+// Rust reference to shared bytes is formed. Guest machine code and external
+// mappings follow the OS shared-memory contract, outside Rust's access model.
+#[inline]
+pub(crate) unsafe fn atomic_copy(mut source: *const u8, mut out: &mut [u8]) {
+    let edge = source as usize % 4;
+    if edge != 0 && !out.is_empty() {
+        let count = (4 - edge).min(out.len());
+        // SAFETY: caller supplies the live, padded mapping described above.
+        let value = unsafe { (&*source.sub(edge).cast::<AtomicU32>()).load(Ordering::Relaxed) };
+        copy_edge(value, edge, &mut out[..count]);
+        source = unsafe { source.add(count) };
+        out = &mut out[count..];
+    }
+    while out.len() >= 4 {
+        // SAFETY: aligned shared word; caller output is ordinary, disjoint memory.
+        unsafe {
+            let value = (&*source.cast::<AtomicU32>()).load(Ordering::Relaxed);
+            out.as_mut_ptr().cast::<u32>().write_unaligned(value);
+            source = source.add(4);
+        }
+        out = &mut out[4..];
+    }
+    if !out.is_empty() {
+        // SAFETY: the final aligned word lies in the mapping's host-page padding.
+        let value = unsafe { (&*source.cast::<AtomicU32>()).load(Ordering::Relaxed) };
+        copy_edge(value, 0, out);
+    }
+}
+
+#[inline]
+fn copy_edge(value: u32, edge: usize, out: &mut [u8]) {
+    let bytes = value.to_ne_bytes();
+    out[0] = bytes[edge];
+    if out.len() > 1 {
+        out[1] = bytes[edge + 1];
+    }
+    if out.len() > 2 {
+        out[2] = bytes[edge + 2];
+    }
+}
+
+pub(crate) unsafe fn atomic_store(mut destination: *mut u8, mut input: &[u8]) {
+    while !input.is_empty() {
+        let edge = destination as usize % 4;
+        let count = (4 - edge).min(input.len());
+        // SAFETY: caller supplies the writable, padded mapping described above.
+        let atom = unsafe { &*destination.sub(edge).cast::<AtomicU32>() };
+        if count == 4 {
+            atom.store(
+                u32::from_ne_bytes(input[..4].try_into().unwrap()),
+                Ordering::Relaxed,
+            );
+        } else {
+            let _ = atom.try_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+                let mut bytes = old.to_ne_bytes();
+                bytes[edge..edge + count].copy_from_slice(&input[..count]);
+                Some(u32::from_ne_bytes(bytes))
+            });
+        }
+        destination = unsafe { destination.add(count) };
+        input = &input[count..];
+    }
+}
 
 pub struct SharedAllocation {
     mapping: os::Mapping,
@@ -20,6 +90,10 @@ pub struct ReadOnlyFileView {
 }
 
 impl ReadOnlyFileView {
+    pub(crate) fn same_storage(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.storage, &other.storage) && self.offset == other.offset
+    }
+
     /// Raw input for a host library; no Rust slice aliases shared file bytes.
     pub fn as_ptr(&self) -> *const u8 {
         // SAFETY: construction checked the range and retains its allocation.
@@ -29,7 +103,9 @@ impl ReadOnlyFileView {
 
 impl crate::backend::CounterStorage for Arc<SharedAllocation> {
     fn load(&self, offset: usize) -> u32 {
-        u32::from_le_bytes(std::array::from_fn(|i| self.load_u8(offset + i)))
+        let mut bytes = [0; 4];
+        crate::backend::SharedReadView::copy_into(self.as_ref(), offset, &mut bytes);
+        u32::from_le_bytes(bytes)
     }
     fn store(&self, offset: usize, value: u32) {
         self.store_bytes(offset, &value.to_le_bytes());
@@ -37,7 +113,7 @@ impl crate::backend::CounterStorage for Arc<SharedAllocation> {
 }
 
 // SAFETY: mapping ownership and addresses are immutable. Writable storage
-// exposes only byte atomics; retained raw host input requires read-only storage.
+// exposes only aligned word atomics; retained raw host input requires read-only storage.
 // No ordinary shared Rust slice is produced.
 unsafe impl Send for SharedAllocation {}
 unsafe impl Sync for SharedAllocation {}
@@ -119,24 +195,15 @@ impl SharedAllocation {
         if index >= self.len {
             return 0;
         }
-        // SAFETY: byte alignment is one, the mapping stays alive through self,
-        // and AtomicU8 relaxed loads work on OS read-only memory (Rust atomic
-        // module's documented small-atomic read-only exception). Only matching
-        // byte-width atomic stores through the other physical alias can race.
-        unsafe {
-            (&*self.mapping.read.as_ptr().add(index).cast::<AtomicU8>()).load(Ordering::Relaxed)
-        }
+        let mut byte = [0];
+        // SAFETY: index is in the live, host-page-rounded allocation.
+        unsafe { atomic_copy(self.mapping.read.as_ptr().add(index), &mut byte) };
+        byte[0]
     }
 
     #[cfg(any(test, feature = "testing"))]
     pub fn store_u8(&self, index: usize, value: u8) {
-        assert!(self.writable && index < self.len);
-        // SAFETY: same stable storage and byte-width access as load_u8; this
-        // alias is writable. No mixed-width or non-atomic stores are permitted.
-        unsafe {
-            (&*self.mapping.write.as_ptr().add(index).cast::<AtomicU8>())
-                .store(value, Ordering::Relaxed)
-        };
+        self.store_bytes(index, &[value]);
     }
 
     pub fn store_bytes(&self, offset: usize, input: &[u8]) {
@@ -146,19 +213,8 @@ impl SharedAllocation {
                 .checked_add(input.len())
                 .is_some_and(|end| end <= self.len)
         );
-        // SAFETY: the range is checked once and every write remains a matching
-        // AtomicU8 store through the independently retained writable OS view.
-        for (index, &byte) in input.iter().enumerate() {
-            unsafe {
-                (&*self
-                    .mapping
-                    .write
-                    .as_ptr()
-                    .add(offset + index)
-                    .cast::<AtomicU8>())
-                    .store(byte, Ordering::Relaxed)
-            };
-        }
+        // SAFETY: checked logical range in the writable, padded OS view.
+        unsafe { atomic_store(self.mapping.write.as_ptr().add(offset), input) };
     }
 }
 
@@ -171,17 +227,13 @@ impl crate::backend::SharedReadView for SharedAllocation {
     }
     fn copy_into(&self, offset: usize, destination: &mut [u8]) {
         let count = self.len.saturating_sub(offset).min(destination.len());
-        for (index, byte) in destination[..count].iter_mut().enumerate() {
-            // SAFETY: checked in-range byte-atomic access through the read-only
-            // OS alias. No ordinary Rust reference to shared data is produced.
-            *byte = unsafe {
-                (&*self
-                    .mapping
-                    .read
-                    .as_ptr()
-                    .add(offset + index)
-                    .cast::<AtomicU8>())
-                    .load(Ordering::Relaxed)
+        if count != 0 {
+            // SAFETY: checked range in the live, padded read-only OS view.
+            unsafe {
+                atomic_copy(
+                    self.mapping.read.as_ptr().add(offset),
+                    &mut destination[..count],
+                )
             };
         }
         destination[count..].fill(0);
@@ -419,17 +471,12 @@ mod os {
                 storage.store_u8(len - 1, 0x37);
                 assert_eq!(storage.load_u8(len - 1), 0x37);
                 if len < rounded {
-                    // SAFETY: padding is backed by both live OS mappings. Even
-                    // internal test access uses matching byte atomics; no public
-                    // read operation may expose these out-of-logical-range bytes.
+                    // SAFETY: padding is backed by both live OS mappings.
                     unsafe {
-                        (&*storage.mapping.write.as_ptr().add(len).cast::<AtomicU8>())
-                            .store(0xa5, Ordering::Relaxed);
-                        assert_eq!(
-                            (&*storage.mapping.read.as_ptr().add(len).cast::<AtomicU8>())
-                                .load(Ordering::Relaxed),
-                            0xa5
-                        );
+                        atomic_store(storage.mapping.write.as_ptr().add(len), &[0xa5]);
+                        let mut padding = [0];
+                        atomic_copy(storage.mapping.read.as_ptr().add(len), &mut padding);
+                        assert_eq!(padding, [0xa5]);
                     }
                 }
                 assert_eq!(storage.load_u8(len), 0);

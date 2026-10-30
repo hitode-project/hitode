@@ -157,6 +157,8 @@ pub(crate) struct Debugger {
     slow_baseline: HashMap<(u32, u32), [u64; 3]>,
     /// Slow-path counts at the previous snapshot.
     snapshot_baseline: HashMap<(u32, u32), [u64; 3]>,
+    boundary_baseline: HashMap<(u32, usize), adv_runtime::NativeBodyCount>,
+    boundary_snapshot_baseline: HashMap<(u32, usize), adv_runtime::NativeBodyCount>,
     /// The longest busy gap waiting for its snapshot, and when it ended.
     stall: Option<(u64, u64)>,
     stall_snapshots: usize,
@@ -186,6 +188,7 @@ impl Debugger {
         eprintln!("debug: serving the abstract socket hitode-debug");
         #[cfg(not(target_os = "android"))]
         eprintln!("debug: serving {}", socket.display());
+        adv_runtime::native_debugger_attached(true);
         Ok(Self {
             shared,
             receiver,
@@ -200,6 +203,8 @@ impl Debugger {
                 native_entries: 0,
                 interpreter_entries: 0,
             },
+            boundary_baseline: HashMap::new(),
+            boundary_snapshot_baseline: HashMap::new(),
             slow_baseline: HashMap::new(),
             snapshot_baseline: HashMap::new(),
             stall: None,
@@ -339,6 +344,7 @@ impl Debugger {
                 runtime.disassemble(address, args.get(1).map_or(Ok(16), |n| number(n))? as usize)
             }
             "slow" => Ok(self.slow(runtime, args.first() == Some(&"reset"))),
+            "boundary" => Ok(self.boundary(runtime, args.first() == Some(&"reset"))),
             "report" => Ok(runtime.report()),
             "snap" => {
                 let label = args.first().copied().unwrap_or("manual");
@@ -401,6 +407,28 @@ impl Debugger {
             let _ = (runtime, reset, &self.slow_baseline);
             "slow-path sites are recorded by the a64 backend only".into()
         }
+    }
+
+    /// Native body host work since the last reset for this process.
+    fn boundary(&mut self, runtime: &impl DebugTarget<Backend = Cpu>, reset: bool) -> String {
+        let machine = runtime.machine();
+        let pid = machine.sys.pid;
+        let Some(boundary) = machine.ext.try_get::<adv_runtime::NativeBoundary>() else {
+            return "no native body calls".into();
+        };
+        if reset {
+            self.boundary_baseline.retain(|&(owner, _), _| owner != pid);
+            self.boundary_baseline.extend(
+                boundary
+                    .bodies
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .map(|(i, row)| ((pid, i), row)),
+            );
+            return "native boundary counts reset".into();
+        }
+        boundary_text(boundary, pid, &self.boundary_baseline)
     }
 
     /// Writes and keeps a snapshot; returns its name.
@@ -467,6 +495,17 @@ impl Debugger {
         self.slow_baseline = previous;
         self.slow(runtime, true);
         self.snapshot_baseline = std::mem::replace(&mut self.slow_baseline, reset);
+        let reset = std::mem::take(&mut self.boundary_baseline);
+        self.boundary_baseline = std::mem::take(&mut self.boundary_snapshot_baseline);
+        section(
+            "boundary (since previous snapshot)",
+            self.boundary(runtime, false),
+        );
+        let previous = std::mem::take(&mut self.boundary_baseline);
+        section("boundary (whole session)", self.boundary(runtime, false));
+        self.boundary_baseline = previous;
+        self.boundary(runtime, true);
+        self.boundary_snapshot_baseline = std::mem::replace(&mut self.boundary_baseline, reset);
         section("modules", runtime.modules_report());
         section("report", runtime.report());
         eprintln!(
@@ -492,9 +531,66 @@ impl Debugger {
 
 impl Drop for Debugger {
     fn drop(&mut self) {
+        adv_runtime::native_debugger_attached(false);
         self.shared.stopped.store(true, Ordering::Release);
         let _ = std::fs::remove_file(&self.socket);
     }
+}
+
+fn boundary_text(
+    boundary: &adv_runtime::NativeBoundary,
+    pid: u32,
+    baseline: &HashMap<(u32, usize), adv_runtime::NativeBodyCount>,
+) -> String {
+    let mut rows: Vec<_> = boundary
+        .bodies
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(i, row)| row.since(baseline.get(&(pid, i)).copied().unwrap_or_default()))
+        .filter(|row| row.calls != 0)
+        .collect();
+    let timed = rows.iter().any(|row| row.timed_calls != 0);
+    rows.sort_by_key(|row| {
+        std::cmp::Reverse(if timed {
+            row.nanos
+        } else {
+            row.access.read_bytes + row.access.written_bytes
+        })
+    });
+    let mut text =
+        vec!["  calls declines       ms read/(write+1) shared fallbacks tlb-miss body".to_owned()];
+    for row in rows.into_iter().take(30) {
+        let time = if row.timed_calls == 0 {
+            "-".into()
+        } else {
+            format!("{:.3}", row.nanos as f64 / 1e6)
+        };
+        let access = row.access;
+        text.push(format!(
+            "{:>7} {:>8} {time:>8} {:>14.2} {:>6} {:>9} {:>8} {}",
+            row.calls,
+            row.declines,
+            access.read_bytes as f64 / (access.written_bytes as f64 + 1.0),
+            access.shared_copies,
+            access.fallbacks,
+            access.tlb_misses,
+            row.name
+        ));
+    }
+    text.push("tail calls (oldest first)".into());
+    for tail in boundary.tails() {
+        if tail.call > baseline.get(&(pid, tail.body)).map_or(0, |row| row.calls) {
+            text.push(format!(
+                "{} args={:08x?} {:.1}us {:?}",
+                tail.name,
+                tail.arguments,
+                tail.duration.as_secs_f64() * 1e6,
+                tail.access
+            ));
+        }
+    }
+    text.join("\n")
 }
 
 fn number(text: &str) -> Result<u32, String> {
@@ -1088,8 +1184,9 @@ const HELP: &str = "\
 answered at once: ping, help, info, timeline [SECONDS], retirement [SECONDS], marks, mark [LABEL],
   samples [SECONDS], profile [off|HZ], snaps, pull [NAME]
 at a guest boundary: threads, stack CONTEXT [FRAMES], calls [COUNT], gaps,
-  modules, mem ADDRESS [LENGTH], dis ADDRESS [COUNT], slow [reset], report,
-  snap [LABEL]\nclient reports: tl, prof, speed [SECONDS] [--range A:B | --marks A:B | --frame N], analyze, watch";
+  modules, mem ADDRESS [LENGTH], dis ADDRESS [COUNT], slow [reset], boundary [reset], report,
+  snap [LABEL]
+client reports: tl, prof, speed [SECONDS] [--range A:B | --marks A:B | --frame N], analyze, watch";
 
 #[cfg(unix)]
 #[cfg_attr(target_os = "android", allow(unused_variables))]
@@ -1209,5 +1306,112 @@ mod tests {
         assert_eq!(number("0x401000"), Ok(0x401000));
         assert_eq!(number("12"), Ok(12));
         assert!(number("zz").is_err());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod boundary_tests {
+    use super::*;
+    struct Empty;
+    impl adv_machine::Resolver for Empty {
+        fn host_fn(&self, _: &str, _: &str) -> Option<adv_machine::HostFn> {
+            None
+        }
+        fn provides(&self, _: &str) -> bool {
+            false
+        }
+    }
+    struct Target(adv_machine::Machine<Cpu>);
+    impl DebugTarget for Target {
+        type Backend = Cpu;
+        fn machine(&self) -> &adv_machine::Machine<Cpu> {
+            &self.0
+        }
+        fn guest_place(&self, _: u32) -> String {
+            String::new()
+        }
+        fn modules_report(&self) -> String {
+            String::new()
+        }
+        fn image_ranges(&self) -> Result<Vec<(u32, u32)>, String> {
+            Ok(Vec::new())
+        }
+        fn contexts_report(&self) -> String {
+            String::new()
+        }
+        fn api_gaps_report(&self) -> String {
+            String::new()
+        }
+        fn report(&self) -> String {
+            String::new()
+        }
+    }
+    // spec: NAT-BODY-15
+    #[test]
+    fn boundary_command_ranks_resets_and_snapshots() {
+        let mut target = Target(
+            adv_machine::Machine::new(
+                Cpu::new(adv_machine::layout::PARK_ADDR, false).unwrap(),
+                Empty,
+                adv_machine::Clock::virtual_time(),
+            )
+            .unwrap(),
+        );
+        let boundary = target.0.ext.get_or_default::<adv_runtime::NativeBoundary>();
+        boundary.bodies[0].name = "small";
+        boundary.bodies[0].calls = 2;
+        boundary.bodies[0].access.read_bytes = 16;
+        boundary.bodies[1].name = "large";
+        boundary.bodies[1].calls = 4;
+        boundary.bodies[1].declines = 1;
+        boundary.bodies[1].access.read_bytes = 1024;
+        let text = boundary_text(boundary, target.0.sys.pid, &HashMap::new());
+        assert!(text.find("large").unwrap() < text.find("small").unwrap());
+        assert!(text.contains("16.00"));
+        boundary.bodies[0].timed_calls = 2;
+        boundary.bodies[0].nanos = 2_000_000;
+        boundary.bodies[1].timed_calls = 4;
+        boundary.bodies[1].nanos = 1_000_000;
+        let text = boundary_text(boundary, target.0.sys.pid, &HashMap::new());
+        assert!(text.find("small").unwrap() < text.find("large").unwrap());
+        let root = std::env::temp_dir().join(format!("adv-boundary-debug-{}", std::process::id()));
+        let mut debugger =
+            Debugger::start("boundary test".into(), &root, WakeEvent::new().unwrap()).unwrap();
+        assert!(
+            debugger
+                .execute("boundary reset", &target)
+                .unwrap()
+                .contains("reset")
+        );
+        assert!(
+            !debugger
+                .execute("boundary", &target)
+                .unwrap()
+                .contains("small")
+        );
+        target.0.ext.get_mut::<adv_runtime::NativeBoundary>().bodies[0].calls += 1;
+        assert!(
+            debugger
+                .execute("boundary", &target)
+                .unwrap()
+                .contains("small")
+        );
+        debugger.snapshot("boundary", &target).unwrap();
+        {
+            let snapshots = debugger.shared.snapshots.lock().unwrap();
+            let text = &snapshots.back().unwrap().1;
+            assert!(text.contains("== boundary (since previous snapshot)"));
+            assert!(text.contains("== boundary (whole session)"));
+            assert!(text.contains("small"));
+        }
+        assert!(
+            debugger
+                .execute("boundary", &target)
+                .unwrap()
+                .contains("small"),
+            "snapshot preserves command baseline"
+        );
+        drop(debugger);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

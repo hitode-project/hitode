@@ -79,12 +79,10 @@ fn filter(env: &mut Env<'_>, kind: PngFilter, one: bool) -> Option<u64> {
         env.cpu.shared_bytes(previous, len as usize)?
     };
     let mut stack = [0; 8192];
-    let mut heap = Vec::new();
     let output = if len as usize <= stack.len() {
         &mut stack[..len as usize]
     } else {
-        heap.resize(len as usize, 0);
-        &mut heap[..]
+        super::scratch(env.ext, len as usize)
     };
     env.cpu.read(row, output).ok()?;
     if !kernel(kind, output, above, bpp) {
