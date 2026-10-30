@@ -52,6 +52,12 @@ fn word(bytes: &[u8], at: usize) -> u32 {
 fn short(bytes: &[u8], at: usize) -> u32 {
     u32::from(u16::from_le_bytes(bytes[at..at + 2].try_into().unwrap()))
 }
+fn read_into(cpu: &dyn Guest, at: u32, bytes: &mut [u8]) -> Option<()> {
+    if !cpu.accessible(at, u32::try_from(bytes.len()).ok()?, Prot::READ) {
+        return None;
+    }
+    cpu.read(at, bytes).ok()
+}
 fn read(cpu: &dyn Guest, at: u32, len: usize) -> Option<Vec<u8>> {
     if !cpu.accessible(at, u32::try_from(len).ok()?, Prot::READ) {
         return None;
@@ -74,12 +80,29 @@ struct Region {
     bytes: Vec<u8>,
     dirty: std::ops::Range<usize>,
 }
+#[derive(Default)]
+struct Buffers {
+    regions: Vec<Region>,
+    spare: Vec<Vec<u8>>,
+    colors: Vec<u32>,
+    lookup: Vec<u16>,
+}
 struct Memory<'a> {
     cpu: &'a mut dyn Guest,
-    regions: Vec<Region>,
+    pool: &'a mut Buffers,
+}
+impl Drop for Memory<'_> {
+    fn drop(&mut self) {
+        for r in self.pool.regions.drain(..) {
+            self.pool.spare.push(r.bytes);
+        }
+    }
 }
 impl Memory<'_> {
     fn load(&mut self, base: u32, len: u32, writable: bool) -> Option<()> {
+        self.region(base, len, writable, true)
+    }
+    fn region(&mut self, base: u32, len: u32, writable: bool, snapshot: bool) -> Option<()> {
         base.checked_add(len)?;
         if !self
             .cpu
@@ -87,17 +110,28 @@ impl Memory<'_> {
         {
             return None;
         }
+        if self.get(base, len as usize).is_some() {
+            return Some(());
+        }
         let mut start = base;
         let mut end = base + len;
-        for r in &self.regions {
+        for r in &self.pool.regions {
             if start < r.base + r.bytes.len() as u32 && r.base < end {
                 start = start.min(r.base);
                 end = end.max(r.base + r.bytes.len() as u32);
             }
         }
-        let mut bytes = read(self.cpu, start, (end - start) as usize)?;
+        let len = (end - start) as usize;
+        let index = self.pool.spare.iter().position(|b| b.capacity() >= len);
+        let mut bytes = index
+            .map(|i| self.pool.spare.swap_remove(i))
+            .unwrap_or_default();
+        bytes.resize(len, 0);
+        if snapshot {
+            read_into(self.cpu, start, &mut bytes)?;
+        }
         let mut dirty = bytes.len()..0;
-        self.regions.retain(|r| {
+        self.pool.regions.retain_mut(|r| {
             if start <= r.base && r.base + r.bytes.len() as u32 <= end {
                 let offset = (r.base - start) as usize;
                 bytes[offset..offset + r.bytes.len()].copy_from_slice(&r.bytes);
@@ -105,12 +139,13 @@ impl Memory<'_> {
                     dirty.start = dirty.start.min(offset + r.dirty.start);
                     dirty.end = dirty.end.max(offset + r.dirty.end);
                 }
+                self.pool.spare.push(std::mem::take(&mut r.bytes));
                 false
             } else {
                 true
             }
         });
-        self.regions.push(Region {
+        self.pool.regions.push(Region {
             base: start,
             bytes,
             dirty,
@@ -118,13 +153,13 @@ impl Memory<'_> {
         Some(())
     }
     fn get(&self, at: u32, len: usize) -> Option<&[u8]> {
-        self.regions.iter().find_map(|r| {
+        self.pool.regions.iter().find_map(|r| {
             let offset = at.checked_sub(r.base)? as usize;
             r.bytes.get(offset..offset.checked_add(len)?)
         })
     }
     fn get_mut(&mut self, at: u32, len: usize) -> Option<&mut [u8]> {
-        for r in &mut self.regions {
+        for r in &mut self.pool.regions {
             if let Some(offset) = at.checked_sub(r.base).map(|n| n as usize)
                 && let Some(end) = offset.checked_add(len)
                 && end <= r.bytes.len()
@@ -147,10 +182,49 @@ impl Memory<'_> {
             .copy_from_slice(&value.to_le_bytes()[..bytes]);
         Some(())
     }
+    fn copy(&mut self, src: u32, dst: u32, len: usize) -> Option<()> {
+        let (si, so) = self.locate(src, len)?;
+        let (di, offset) = self.locate(dst, len)?;
+        if si == di {
+            self.get_mut(dst, len)?;
+            self.pool.regions[si]
+                .bytes
+                .copy_within(so..so + len, offset);
+        } else {
+            let (source, target) = self.pair(src, len, dst, len)?;
+            target.copy_from_slice(source);
+        }
+        Some(())
+    }
+    fn locate(&self, at: u32, len: usize) -> Option<(usize, usize)> {
+        self.pool.regions.iter().enumerate().find_map(|(i, r)| {
+            let offset = at.checked_sub(r.base)? as usize;
+            r.bytes.get(offset..offset.checked_add(len)?)?;
+            Some((i, offset))
+        })
+    }
+    fn pair(&mut self, src: u32, slen: usize, dst: u32, dlen: usize) -> Option<(&[u8], &mut [u8])> {
+        let (si, so) = self.locate(src, slen)?;
+        let (di, offset) = self.locate(dst, dlen)?;
+        self.get_mut(dst, dlen)?;
+        if si == di {
+            let bytes = &mut self.pool.regions[si].bytes;
+            if so + slen <= offset {
+                let (a, b) = bytes.split_at_mut(offset);
+                Some((&a[so..so + slen], &mut b[..dlen]))
+            } else {
+                let (a, b) = bytes.split_at_mut(so);
+                Some((&b[..slen], &mut a[offset..offset + dlen]))
+            }
+        } else {
+            let [a, b] = self.pool.regions.get_disjoint_mut([si, di]).ok()?;
+            Some((&a.bytes[so..so + slen], &mut b.bytes[offset..offset + dlen]))
+        }
+    }
     fn commit(self) -> Option<u64> {
         // A merged source may extend beyond a destination; check only the
         // dirty interval before committing any region.
-        for r in &self.regions {
+        for r in &self.pool.regions {
             if !r.dirty.is_empty()
                 && !self.cpu.accessible(
                     r.base + r.dirty.start as u32,
@@ -161,10 +235,10 @@ impl Memory<'_> {
                 return None;
             }
         }
-        for r in self.regions {
+        for r in &self.pool.regions {
             if !r.dirty.is_empty() {
                 self.cpu
-                    .write(r.base + r.dirty.start as u32, &r.bytes[r.dirty])
+                    .write(r.base + r.dirty.start as u32, &r.bytes[r.dirty.clone()])
                     .ok()?;
             }
         }
@@ -191,7 +265,8 @@ struct Dib {
 }
 impl Dib {
     fn read(cpu: &dyn Guest, at: u32, base: u32) -> Option<Self> {
-        let bytes = read(cpu, at, d::SIZE)?;
+        let mut bytes = [0; d::SIZE];
+        read_into(cpu, at, &mut bytes)?;
         let kind = word(&bytes, d::funcs).wrapping_sub(base);
         Some(Self {
             bpp: word(&bytes, d::bit_count),
@@ -249,7 +324,7 @@ impl Dib {
             .div_ceil(32)
             .checked_mul(4)
     }
-    fn load(&self, mem: &mut Memory<'_>, writable: bool) -> Option<()> {
+    fn bounds(&self) -> Option<(u32, u32)> {
         let rows = u32::try_from(self.height.checked_sub(1)?).ok()?;
         let stride = self.stride.unsigned_abs();
         let len = rows.checked_mul(stride)?.checked_add(self.row_bytes()?)?;
@@ -258,7 +333,39 @@ impl Dib {
         } else {
             self.bits
         };
+        Some((base, len))
+    }
+    fn load(&self, mem: &mut Memory<'_>, writable: bool) -> Option<()> {
+        let (base, len) = self.bounds()?;
         mem.load(base, len, writable)
+    }
+    fn contains(&self, at: u32, len: u32) -> Option<()> {
+        let (base, size) = self.bounds()?;
+        (at >= base && at.checked_add(len)? <= base.checked_add(size)?).then_some(())
+    }
+    // Output rows need no old bytes. Keep stride gaps and halftone padding
+    // outside these regions, and retain the surface's original access bounds.
+    fn output_rows(&self, mem: &mut Memory<'_>, rows: i32, len: u32) -> Option<()> {
+        if rows > 0 {
+            let (base, len) = self.rows(0..rows)?;
+            if !mem.cpu.accessible(base, len, Prot::RW) {
+                return None;
+            }
+        }
+        let mut y = 0;
+        while y < rows {
+            let n = if self.stride.unsigned_abs() == len {
+                rows - y
+            } else {
+                1
+            };
+            let at = self.at(0, if self.stride < 0 { y + n - 1 } else { y });
+            let count = len.checked_mul(n as u32)?;
+            self.contains(at, count)?;
+            mem.region(at, count, true, false)?;
+            y += n;
+        }
+        Some(())
     }
     /// Snapshots only the rows `rows` of the clip rect touches, or the whole
     /// surface when they leave it, so stray accesses still decline.
@@ -271,10 +378,14 @@ impl Dib {
         if rows.is_empty() {
             return Some(());
         }
+        let (base, len) = self.rows(rows)?;
+        mem.load(base, len, writable)
+    }
+    fn rows(&self, rows: std::ops::Range<i32>) -> Option<(u32, u32)> {
         let first = self.top.checked_add(rows.start)?;
         let last = self.top.checked_add(rows.end - 1)?;
         if first < 0 || last >= self.height {
-            return self.load(mem, writable);
+            return self.bounds();
         }
         let len = ((last - first) as u32)
             .checked_mul(self.stride.unsigned_abs())?
@@ -283,7 +394,7 @@ impl Dib {
         let base = self
             .bits
             .wrapping_add(lowest.wrapping_mul(self.stride) as u32);
-        mem.load(base, len, writable)
+        Some((base, len))
     }
     fn rgb(&self, pixel: u32) -> [u32; 3] {
         if self.kind == FUNCS_8888 || self.kind == FUNCS_24 {
@@ -309,7 +420,7 @@ impl Dib {
             })
         }
     }
-    fn palette(&self, cpu: &dyn Guest, base: u32) -> Option<Vec<u32>> {
+    fn palette(&self, cpu: &dyn Guest, base: u32, colors: &mut Vec<u32>) -> Option<()> {
         let (at, count) = if self.colors != 0 {
             (self.colors, self.color_count)
         } else {
@@ -323,15 +434,17 @@ impl Dib {
                 1 << self.bpp,
             )
         };
-        let bytes = read(cpu, at, count as usize * rgb::SIZE)?;
-        Some(
-            bytes
-                .as_chunks::<{ rgb::SIZE }>()
-                .0
-                .iter()
-                .map(|b| word(b, 0))
-                .collect(),
-        )
+        let len = count.checked_mul(rgb::SIZE as u32)?;
+        if !cpu.accessible(at, len, Prot::READ) {
+            return None;
+        }
+        colors.resize(count as usize, 0);
+        for (i, color) in colors.iter_mut().enumerate() {
+            let mut bytes = [0; rgb::SIZE];
+            cpu.read(at + (i * rgb::SIZE) as u32, &mut bytes).ok()?;
+            *color = word(&bytes, 0);
+        }
+        Some(())
     }
 }
 fn destination(env: &Env<'_>) -> Option<Dib> {
@@ -426,7 +539,8 @@ fn shift(rows: &std::ops::Range<i32>, by: i32) -> Option<std::ops::Range<i32>> {
     Some(rows.start.checked_add(by)?..rows.end.checked_add(by)?)
 }
 fn point(cpu: &dyn Guest, at: u32) -> Option<(i32, i32)> {
-    let b = read(cpu, at, point::SIZE)?;
+    let mut b = [0; point::SIZE];
+    read_into(cpu, at, &mut b)?;
     Some((word(&b, point::x) as i32, word(&b, point::y) as i32))
 }
 fn rop(dst: u32, src: u32, code: u32) -> u32 {
@@ -492,7 +606,7 @@ fn solid_rects(env: &mut Env<'_>) -> Option<u64> {
     let (and, xor) = (env.arg(3), env.arg(4));
     let mut mem = Memory {
         cpu: env.cpu,
-        regions: Vec::new(),
+        pool: env.ext.get_or_default::<Buffers>(),
     };
     dib.load_rows(&mut mem, true, span(&rects))?;
     for [l, t, r, b] in rects {
@@ -509,14 +623,30 @@ fn solid_rects(env: &mut Env<'_>) -> Option<u64> {
 fn solid_line(env: &mut Env<'_>) -> Option<u64> {
     let dib = destination(env)?;
     let (mut x, mut y) = point(env.cpu, env.arg(1))?;
-    let p = read(env.cpu, env.arg(2), line::SIZE)?;
+    let mut p = [0; line::SIZE];
+    read_into(env.cpu, env.arg(2), &mut p)?;
     let mut err = word(&p, line::err_start) as i32;
     let (and, xor) = (env.arg(3), env.arg(4));
     let mut mem = Memory {
         cpu: env.cpu,
-        regions: Vec::new(),
+        pool: env.ext.get_or_default::<Buffers>(),
     };
-    dib.load(&mut mem, true)?;
+    let (mut ey, mut e, mut low, mut high) = (y, err, y, y);
+    for _ in 1..word(&p, line::length) {
+        let minor = e.wrapping_add(word(&p, line::bias) as i32) > 0;
+        let add = if minor {
+            line::err_add_1
+        } else {
+            line::err_add_2
+        };
+        e = e.wrapping_add(word(&p, add) as i32);
+        if word(&p, line::x_major) == 0 || minor {
+            ey = ey.wrapping_add(word(&p, line::y_inc) as i32);
+        }
+        low = low.min(ey);
+        high = high.max(ey);
+    }
+    dib.load_rows(&mut mem, true, low..high.checked_add(1)?)?;
     for _ in 0..word(&p, line::length) {
         let at = dib.at(x, y);
         let val = mem.pixel(at, dib.size())?;
@@ -558,7 +688,7 @@ fn pattern_rects(env: &mut Env<'_>) -> Option<u64> {
     }
     let mut mem = Memory {
         cpu: env.cpu,
-        regions: Vec::new(),
+        pool: env.ext.get_or_default::<Buffers>(),
     };
     dib.load_rows(&mut mem, true, span(&rects))?;
     let mut mask = brush.clone();
@@ -604,7 +734,7 @@ fn copy_rect(env: &mut Env<'_>) -> Option<u64> {
     let (code, overlap) = (env.arg(4), env.arg(5));
     let mut mem = Memory {
         cpu: env.cpu,
-        regions: Vec::new(),
+        pool: env.ext.get_or_default::<Buffers>(),
     };
     dst.load_rows(&mut mem, true, t..b)?;
     src.load_rows(&mut mem, false, shift(&(0..b.wrapping_sub(t)), sy)?)?;
@@ -765,7 +895,7 @@ fn blend_rects(env: &mut Env<'_>) -> Option<u64> {
     let src_alpha = blend[blend::AlphaFormat] & 1 != 0;
     let mut mem = Memory {
         cpu: env.cpu,
-        regions: Vec::new(),
+        pool: env.ext.get_or_default::<Buffers>(),
     };
     let rows = span(&rects);
     dst.load_rows(&mut mem, true, rows.clone())?;
@@ -867,7 +997,7 @@ fn gradient_rect(env: &mut Env<'_>) -> Option<u64> {
     }
     let mut mem = Memory {
         cpu: env.cpu,
-        regions: Vec::new(),
+        pool: env.ext.get_or_default::<Buffers>(),
     };
     dst.load_rows(&mut mem, true, t..b)?;
     for y in t..b {
@@ -956,7 +1086,8 @@ fn mask_rect(env: &mut Env<'_>) -> Option<u64> {
     let [l, t, r, b] = rects(env.cpu, env.arg(1), 1)?[0];
     let (sx, sy) = point(env.cpu, env.arg(3))?;
     let code = env.arg(4);
-    let colors = src.palette(env.cpu, base)?;
+    let mut colors = Vec::new();
+    src.palette(env.cpu, base, &mut colors)?;
     let colors: Vec<_> = colors
         .iter()
         .take(2)
@@ -964,7 +1095,7 @@ fn mask_rect(env: &mut Env<'_>) -> Option<u64> {
         .collect();
     let mut mem = Memory {
         cpu: env.cpu,
-        regions: Vec::new(),
+        pool: env.ext.get_or_default::<Buffers>(),
     };
     dst.load_rows(&mut mem, true, t..b)?;
     src.load_rows(&mut mem, false, shift(&(0..b.wrapping_sub(t)), sy)?)?;
@@ -1022,7 +1153,7 @@ fn glyph(env: &mut Env<'_>, subpixel: bool) -> Option<u64> {
     };
     let mut mem = Memory {
         cpu: env.cpu,
-        regions: Vec::new(),
+        pool: env.ext.get_or_default::<Buffers>(),
     };
     dst.load_rows(&mut mem, true, t..b)?;
     glyph.load_rows(&mut mem, false, shift(&(0..b.wrapping_sub(t)), sy)?)?;
@@ -1098,7 +1229,7 @@ fn scale_row(env: &mut Env<'_>, shrink: bool) -> Option<u64> {
     let mut new_pixel = true;
     let mut mem = Memory {
         cpu: env.cpu,
-        regions: Vec::new(),
+        pool: env.ext.get_or_default::<Buffers>(),
     };
     dst.load_rows(&mut mem, true, dy..dy.checked_add(1)?)?;
     src.load_rows(&mut mem, false, sy..sy.checked_add(1)?)?;
@@ -1175,7 +1306,9 @@ fn convert_to(env: &mut Env<'_>) -> Option<u64> {
     ) {
         return None;
     }
-    let [l, t, r, b] = rects(env.cpu, env.arg(2), 1)?[0];
+    let mut rect = [0; rect::SIZE];
+    read_into(env.cpu, env.arg(2), &mut rect)?;
+    let [l, t, r, b] = std::array::from_fn(|i| word(&rect, i * 4) as i32);
     let dither = env.arg(3) != 0;
     let width = u32::try_from(r - l).ok()?;
     let row_len = u32::try_from(dst.width)
@@ -1185,11 +1318,11 @@ fn convert_to(env: &mut Env<'_>) -> Option<u64> {
         .checked_mul(4)?;
     let used = width.checked_mul(dst.bpp)?.div_ceil(8);
     let pad = row_len.checked_sub(used)?;
-    let colors = if dst.bpp <= 8 {
-        dst.palette(env.cpu, base)?
-    } else {
-        Vec::new()
-    };
+    let pool = env.ext.get_or_default::<Buffers>();
+    if dst.bpp <= 8 {
+        dst.palette(env.cpu, base, &mut pool.colors)?;
+    }
+    let colors = &pool.colors;
     let background = if dst.bpp == 1 {
         let bg = *colors.first()?;
         if bg >> 16 == 0x10ff {
@@ -1212,32 +1345,39 @@ fn convert_to(env: &mut Env<'_>) -> Option<u64> {
             && src.kind != FUNCS_555
             && src.bpp == dst.bpp
             && src.masks == dst.masks);
-    let mut mem = Memory {
-        cpu: env.cpu,
-        regions: Vec::new(),
-    };
-    dst.load(&mut mem, true)?;
-    src.load(&mut mem, false)?;
+    let mut mem = Memory { cpu: env.cpu, pool };
     if raw && src.stride > 0 && src.stride == dst.stride && pad == 0 {
         let len = usize::try_from(b - t)
             .ok()?
             .checked_mul(src.stride as usize)?;
-        let bytes = mem.get(src.at(l, t), len)?.to_vec();
-        mem.get_mut(dst.at(0, 0), len)?.copy_from_slice(&bytes);
+        let (sa, da) = (src.at(l, t), dst.at(0, 0));
+        src.contains(sa, u32::try_from(len).ok()?)?;
+        dst.contains(da, u32::try_from(len).ok()?)?;
+        if t < b {
+            for (dib, rows, prot) in [(&src, t..b, Prot::READ), (&dst, 0..b - t, Prot::RW)] {
+                let (base, count) = dib.rows(rows)?;
+                if !mem.cpu.accessible(base, count, prot) {
+                    return None;
+                }
+            }
+        }
+        mem.load(sa, len as u32, false)?;
+        mem.region(da, len as u32, true, false)?;
+        mem.copy(sa, da, len)?;
         return mem.commit();
     }
+    src.load_rows(&mut mem, false, t..b)?;
+    dst.output_rows(&mut mem, b - t, row_len)?;
     // Wine's 8-bit conversion caches the nearest entry at the center of each
     // five-bit RGB bucket. Other indexed destinations use the exact color.
-    let mut lookup = if dst.bpp == 8 {
-        vec![u16::MAX; 32768]
-    } else {
-        Vec::new()
-    };
+    if dst.bpp == 8 {
+        mem.pool.lookup.resize(32768, u16::MAX);
+        mem.pool.lookup.fill(u16::MAX);
+    }
     for y in t..b {
         let da = dst.at(0, y - t);
         if raw {
-            let bytes = mem.get(src.at(l, y), used as usize)?.to_vec();
-            mem.get_mut(da, used as usize)?.copy_from_slice(&bytes);
+            mem.copy(src.at(l, y), da, used as usize)?;
         } else if dst.bpp > 8 && {
             let source = u64::from(src.at(l, y));
             let target = u64::from(da);
@@ -1246,8 +1386,8 @@ fn convert_to(env: &mut Env<'_>) -> Option<u64> {
         } {
             // Resolve disjoint rows once; overlapping conversions retain Wine's
             // per-pixel traversal below.
-            let source = mem.get(src.at(l, y), width as usize * src.size())?.to_vec();
-            let target = mem.get_mut(da, used as usize)?;
+            let (source, target) =
+                mem.pair(src.at(l, y), width as usize * src.size(), da, used as usize)?;
             for (input, output) in source
                 .chunks_exact(src.size())
                 .zip(target.chunks_exact_mut(dst.size()))
@@ -1267,14 +1407,15 @@ fn convert_to(env: &mut Env<'_>) -> Option<u64> {
                     8 => {
                         let pos =
                             ((rgb[0] & 248) >> 3) | ((rgb[1] & 248) << 2) | ((rgb[2] & 248) << 7);
-                        let value = &mut lookup[pos as usize];
+                        let value = &mut mem.pool.lookup[pos as usize];
                         if *value == u16::MAX {
-                            *value = nearest(&colors, rgb.map(|v| (v & 248) | 4)) as u16;
+                            *value = nearest(&mem.pool.colors, rgb.map(|v| (v & 248) | 4)) as u16;
                         }
-                        mem.put(da + xx, 1, u32::from(*value))?;
+                        let value = u32::from(*value);
+                        mem.put(da + xx, 1, value)?;
                     }
                     4 => {
-                        let value = nearest(&colors, rgb);
+                        let value = nearest(&mem.pool.colors, rgb);
                         let at = da + xx / 2;
                         let value = if xx & 1 == 0 {
                             (value << 4) & 240
@@ -1298,7 +1439,7 @@ fn convert_to(env: &mut Env<'_>) -> Option<u64> {
                             } else {
                                 rgb
                             };
-                            u32::from(nearest(&colors, rgb) != 0)
+                            u32::from(nearest(&mem.pool.colors, rgb) != 0)
                         };
                         let at = da + xx / 8;
                         let old = if xx & 7 == 0 { 0 } else { mem.pixel(at, 1)? };
@@ -1314,7 +1455,8 @@ fn convert_to(env: &mut Env<'_>) -> Option<u64> {
 }
 
 fn coords(cpu: &dyn Guest, at: u32) -> Option<([i32; 4], [i32; 4])> {
-    let bytes = read(cpu, at, coords::SIZE)?;
+    let mut bytes = [0; coords::SIZE];
+    read_into(cpu, at, &mut bytes)?;
     let (x, y, w, h) = (
         word(&bytes, coords::x) as i32,
         word(&bytes, coords::y) as i32,
@@ -1376,10 +1518,14 @@ fn halftone(env: &mut Env<'_>) -> Option<u64> {
     let mut fy = start_y as f32;
     let mut mem = Memory {
         cpu: env.cpu,
-        regions: Vec::new(),
+        pool: env.ext.get_or_default::<Buffers>(),
     };
-    dst.load(&mut mem, true)?;
-    src.load(&mut mem, false)?;
+    src.load_rows(&mut mem, false, sr[1]..sr[3])?;
+    dst.output_rows(
+        &mut mem,
+        height,
+        (width as u32).checked_mul(dst.size() as u32)?,
+    )?;
     for y in 0..height {
         fy = fy.clamp(sr[1] as f32, (sr[3] - 1) as f32);
         let y0 = fy as i32;
