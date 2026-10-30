@@ -33,9 +33,6 @@ struct Images {
 pub fn install(ext: &mut Ext, mode: Mode) {
     if mode == Mode::Native {
         ext.insert(adv_machine::NativeAdmission(rows::admit));
-        ext.insert(adv_nt::native::InflateFast::new(
-            adv_device::codec_kernel::inflate_fast,
-        ));
         ext.insert(adv_nt::native::PngRows(|filter, row, previous, bpp| {
             use adv_device::codec_kernel;
             use adv_nt::native::PngFilter;

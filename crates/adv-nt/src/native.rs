@@ -38,7 +38,6 @@ mod pixels;
 mod png;
 mod zlib;
 pub use png::{PngFilter, PngRows};
-pub use zlib::InflateFast;
 
 /// The module the bodies' thunks are registered under.
 pub const MODULE: &str = "hitode.native";
@@ -431,10 +430,17 @@ fn run_body(env: &mut Env<'_>, index: usize, body: &'static Body) -> Outcome {
 #[derive(Default)]
 struct FullScratch(adv_cpu::body::Scratch);
 
-/// The entry of each direct body's function by thunk index, where a fault
-/// on its full path is raised.
+/// Each bound direct body's entry and inputs, reached by thunk index.
 #[derive(Default)]
-struct Entries(HashMap<u32, u32>);
+struct Entries(Vec<Option<(u32, adv_cpu::body::DirectBody)>>);
+impl Entries {
+    fn insert(&mut self, thunk: u32, entry: u32, direct: adv_cpu::body::DirectBody) {
+        if self.0.len() <= thunk as usize {
+            self.0.resize(thunk as usize + 1, None);
+        }
+        self.0[thunk as usize] = Some((entry, direct));
+    }
+}
 
 /// A direct body on the full path, which completes every access a guest
 /// instruction would and raises the guest's fault where it would fault.
@@ -445,8 +451,17 @@ fn run_full(
 ) -> Outcome {
     use adv_cpu::backend::{Fault, FaultKind, Reg};
     use adv_cpu::body::{ECX, EDX, GuestMem, Input, Stop};
-    let inputs = std::array::from_fn(|n| match body.direct.inputs.get(n) {
-        Some(&Input::Stack(k)) => env.arg(u32::from(k)),
+    let bound = env
+        .ext
+        .get_or_default::<Entries>()
+        .0
+        .get(env.thunk as usize)
+        .copied()
+        .flatten();
+    let direct = bound.map_or(body.direct, |(_, direct)| direct);
+    let inputs = std::array::from_fn(|n| match direct.inputs[n] {
+        Some(Input::Stack(k)) => env.arg(u32::from(k)),
+        Some(Input::Const(value)) => value,
         Some(Input::Eax) => env.cpu.reg(Reg::Eax),
         Some(Input::Ecx) => env.cpu.reg(Reg::Ecx),
         Some(Input::Edx) => env.cpu.reg(Reg::Edx),
@@ -467,14 +482,21 @@ fn run_full(
                 Outcome::Return(ret.value as u32)
             }
         }
-        Err(Stop::Fault { address, write }) => {
-            let Some(&pc) = env.ext.get_or_default::<Entries>().0.get(&env.thunk) else {
+        Err(stop @ (Stop::Fault { .. } | Stop::DivideByZero)) => {
+            let Some((pc, _)) = bound else {
                 return Outcome::Fail("direct body without an entry".into());
             };
-            let kind = if write {
-                FaultKind::Write(address)
-            } else {
-                FaultKind::Read(address)
+            let kind = match stop {
+                Stop::Fault {
+                    address,
+                    write: true,
+                } => FaultKind::Write(address),
+                Stop::Fault {
+                    address,
+                    write: false,
+                } => FaultKind::Read(address),
+                Stop::DivideByZero => FaultKind::IntegerDivideByZero,
+                _ => unreachable!(),
             };
             Outcome::Raise(Fault { kind, pc })
         }
@@ -635,14 +657,19 @@ fn bind_one(
     } else {
         thunk
     };
-    sys.redirects.insert(entry, (target, original.into()));
+    let body_name = name.split_once('@').map_or(name, |(body, _)| body);
     if let Some(direct) = bodies()
-        .find(|body| body.name == name)
+        .find(|body| body.name == body_name)
         .and_then(|body| body.direct)
     {
-        sys.direct_bodies.insert(entry, direct.direct);
-        ext.get_or_default::<Entries>().0.insert(index, entry);
+        let mut direct = direct.direct;
+        if name.ends_with("!inflate_fast") {
+            direct.inputs = zlib::inputs(cpu, ext, entry)?;
+        }
+        sys.direct_bodies.insert(entry, direct);
+        ext.get_or_default::<Entries>().insert(index, entry, direct);
     }
+    sys.redirects.insert(entry, (target, original.into()));
     Ok(())
 }
 

@@ -247,7 +247,7 @@ impl Translator<'_> {
         *self.uses_permissions = true;
         let body = bound.body;
         let base = if bound.entry { 4 } else { 0 };
-        for (n, &input) in body.inputs.iter().enumerate() {
+        for (n, &input) in body.inputs.iter().flatten().enumerate() {
             let rd = Reg::new(1 + n as u8);
             match input {
                 Input::Stack(k) => {
@@ -260,6 +260,7 @@ impl Translator<'_> {
                         self.load(Addr::Biased(host(ESP), disp as i32), rd);
                     }
                 }
+                Input::Const(value) => self.mov_imm(rd, value),
                 Input::Eax => self.emit(mov(W, rd, host(0))),
                 Input::Ecx => self.emit(mov(W, rd, host(1))),
                 Input::Edx => self.emit(mov(W, rd, host(2))),

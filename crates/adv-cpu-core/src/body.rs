@@ -26,6 +26,8 @@ pub enum Stop {
     Slow,
     /// The guest would fault at `address`.
     Fault { address: u32, write: bool },
+    /// Integer division by zero at the bound function entry.
+    DivideByZero,
     /// The function would wait, call guest code or request the server:
     /// its guest code runs once instead (A64-CALL-6).
     Guest,
@@ -59,6 +61,8 @@ impl From<u64> for Ret {
 pub enum Input {
     /// The stack argument at this index: `[esp + 4 * n]` at the call.
     Stack(u8),
+    /// A value fixed when this function binds.
+    Const(u32),
     Eax,
     Ecx,
     Edx,
@@ -125,8 +129,8 @@ pub type BodyFn =
 #[derive(Clone, Copy, Debug)]
 pub struct DirectBody {
     pub call: BodyFn,
-    /// What w1 onwards carry, at most seven.
-    pub inputs: &'static [Input],
+    /// What w1 onwards carry: packed inputs followed by `None` padding.
+    pub inputs: [Option<Input>; 7],
     /// The guest registers it sets: [`EAX`], [`EDX`], [`ECX`].
     pub outputs: u8,
     /// Argument bytes the function's return pops.
@@ -161,10 +165,17 @@ macro_rules! body {
                 let mut window = unsafe { $crate::body::Window::new(&*context) };
                 $body(&mut window, [a, b, c, d, e, f, g]).into()
             }
+            let declared: &[$crate::body::Input] = $inputs;
+            let mut inputs = [None; 7];
+            let mut n = 0;
+            while n < declared.len() {
+                inputs[n] = Some(declared[n]);
+                n += 1;
+            }
             $crate::body::Body {
                 direct: $crate::body::DirectBody {
                     call,
-                    inputs: $inputs,
+                    inputs,
                     outputs: $outputs,
                     pop: $pop,
                 },
@@ -186,6 +197,23 @@ pub trait Mem {
     /// before its zero unit, which is readable too; or `max` when none of
     /// the first `max` units is zero, only those being readable.
     fn terminated(&mut self, at: u32, unit: u32, max: u32) -> Result<u32, Stop>;
+    /// Check a body's read and write spans together. Overlapping spans share
+    /// storage even when the full path cannot borrow the guest's bytes.
+    fn spans<const N: usize>(
+        &mut self,
+        spans: [(u32, u32, bool); N],
+    ) -> Result<[*mut u8; N], Stop> {
+        let mut pointers = [std::ptr::null_mut(); N];
+        for (i, (at, len, write)) in spans.into_iter().enumerate() {
+            pointers[i] = if write {
+                self.output(at, len)?
+            } else {
+                self.input(at, len)?.cast_mut()
+            };
+        }
+        Ok(pointers)
+    }
+
     /// Makes outputs visible to the guest. Bodies call it once, last.
     fn commit(&mut self) -> Result<(), Stop>;
 
@@ -256,8 +284,9 @@ impl Mem for Window {
             if self.class(page) & (READ | SHARED) != READ {
                 return Err(Stop::Slow);
             }
-            // Units that start on this page; one may end on the next.
-            let room = (((page + 1) << PAGE_SHIFT).wrapping_sub(start)).div_ceil(unit);
+            // Finish this page before checking the next one. Only a unit
+            // starting in its final byte can require two pages.
+            let room = ((((page + 1) << PAGE_SHIFT).wrapping_sub(start)) / unit).max(1);
             let count = room.min(max - found);
             let end = start.checked_add(count * unit - 1).ok_or(Stop::Slow)?;
             if end >> PAGE_SHIFT != page && self.class(page + 1) & (READ | SHARED) != READ {
@@ -283,12 +312,33 @@ impl Mem for Window {
 fn zero(bytes: &[u8], unit: u32) -> Option<u32> {
     match unit {
         1 => memchr(bytes),
-        2 => bytes
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .position(|pair| *pair == [0, 0])
-            .map(|at| at as u32),
+        2 => {
+            #[cfg(not(target_arch = "aarch64"))]
+            let offset = 0;
+            #[cfg(target_arch = "aarch64")]
+            let offset = {
+                use std::arch::aarch64::*;
+                let mut offset = 0;
+                // SAFETY: a vector stays inside the checked page span, and
+                // unaligned vector loads are supported by AArch64.
+                unsafe {
+                    while offset + 16 <= bytes.len() {
+                        let lanes = vld1q_u16(bytes.as_ptr().add(offset).cast());
+                        if vmaxvq_u16(vceqzq_u16(lanes)) != 0 {
+                            break;
+                        }
+                        offset += 16;
+                    }
+                }
+                offset
+            };
+            bytes[offset..]
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .position(|pair| *pair == [0, 0])
+                .map(|at| ((offset / 2) + at) as u32)
+        }
         _ => bytes
             .chunks_exact(unit as usize)
             .position(|unit| unit.iter().all(|&byte| byte == 0))
@@ -317,7 +367,7 @@ pub struct GuestMem<'a> {
 pub struct Scratch {
     buffers: Vec<Vec<u8>>,
     /// Outputs copied into buffers: guest address and buffer.
-    pending: Vec<(u32, usize)>,
+    pending: Vec<(u32, usize, usize, usize)>,
 }
 
 impl<'a> GuestMem<'a> {
@@ -397,8 +447,84 @@ impl Mem for GuestMem<'_> {
                 address: fault.addr,
                 write: false,
             })?;
-        self.scratch.pending.push((at, index));
+        self.scratch.pending.push((at, index, 0, len as usize));
         Ok(pointer)
+    }
+
+    fn spans<const N: usize>(
+        &mut self,
+        spans: [(u32, u32, bool); N],
+    ) -> Result<[*mut u8; N], Stop> {
+        let mut pointers = [std::ptr::null_mut(); N];
+        let mut groups = std::array::from_fn::<_, N, _>(|i| i);
+        for (i, &(at, len, write)) in spans.iter().enumerate() {
+            let prot = if write { Prot::RW } else { Prot::READ };
+            if len != 0 && !self.cpu.accessible(at, len, prot) {
+                return Err(self.fault(at, len, prot));
+            }
+            pointers[i] = if len == 0 {
+                std::ptr::NonNull::dangling().as_ptr()
+            } else if write {
+                self.cpu
+                    .writable_bytes(at, len as usize)
+                    .map_or(std::ptr::null_mut(), |bytes| bytes.as_mut_ptr())
+            } else {
+                self.cpu
+                    .shared_bytes(at, len as usize)
+                    .map_or(std::ptr::null_mut(), |bytes| bytes.as_ptr().cast_mut())
+            };
+            for j in 0..i {
+                let (other, size, _) = spans[j];
+                if len != 0
+                    && size != 0
+                    && u64::from(at) < u64::from(other) + u64::from(size)
+                    && u64::from(other) < u64::from(at) + u64::from(len)
+                {
+                    let old = groups[i];
+                    let new = groups[j];
+                    for group in &mut groups {
+                        if *group == old {
+                            *group = new;
+                        }
+                    }
+                }
+            }
+        }
+        for group in 0..N {
+            if !(0..N).any(|i| groups[i] == group && pointers[i].is_null()) {
+                continue;
+            }
+            let mut begin = u64::MAX;
+            let mut end = 0;
+            for (i, &(at, len, _)) in spans.iter().enumerate() {
+                if groups[i] == group {
+                    begin = begin.min(u64::from(at));
+                    end = end.max(u64::from(at) + u64::from(len));
+                }
+            }
+            let (index, pointer) = self.buffer((end - begin) as u32);
+            for (i, &(at, len, write)) in spans.iter().enumerate() {
+                if groups[i] != group {
+                    continue;
+                }
+                let offset = (u64::from(at) - begin) as usize;
+                self.cpu
+                    .read(
+                        at,
+                        &mut self.scratch.buffers[index][offset..offset + len as usize],
+                    )
+                    .map_err(|fault| Stop::Fault {
+                        address: fault.addr,
+                        write: false,
+                    })?;
+                // SAFETY: every member lies inside this group's shared buffer.
+                pointers[i] = unsafe { pointer.add(offset) };
+                if write {
+                    self.scratch.pending.push((at, index, offset, len as usize));
+                }
+            }
+        }
+        Ok(pointers)
     }
 
     fn terminated(&mut self, at: u32, unit: u32, max: u32) -> Result<u32, Stop> {
@@ -406,19 +532,23 @@ impl Mem for GuestMem<'_> {
         let mut chunk = [0u8; 4096];
         while found < max {
             let start = at.wrapping_add(found * unit);
-            let room = ((((start >> PAGE_SHIFT) + 1) << PAGE_SHIFT).wrapping_sub(start))
-                .div_ceil(unit)
-                .min(1 << 10);
+            let room =
+                (((((start >> PAGE_SHIFT) + 1) << PAGE_SHIFT).wrapping_sub(start)) / unit).max(1);
             let count = room.min(max - found);
             let len = count * unit;
             if !self.cpu.accessible(start, len, Prot::READ) {
                 return Err(self.fault(start, len, Prot::READ));
             }
-            let bytes = &mut chunk[..len as usize];
-            self.cpu.read(start, bytes).map_err(|fault| Stop::Fault {
-                address: fault.addr,
-                write: false,
-            })?;
+            let bytes = if let Some(bytes) = self.cpu.shared_bytes(start, len as usize) {
+                bytes
+            } else {
+                let bytes = &mut chunk[..len as usize];
+                self.cpu.read(start, bytes).map_err(|fault| Stop::Fault {
+                    address: fault.addr,
+                    write: false,
+                })?;
+                bytes
+            };
             if let Some(zero) = zero(bytes, unit) {
                 return Ok(found + zero);
             }
@@ -428,9 +558,9 @@ impl Mem for GuestMem<'_> {
     }
 
     fn commit(&mut self) -> Result<(), Stop> {
-        for &(at, index) in &self.scratch.pending {
+        for &(at, index, offset, len) in &self.scratch.pending {
             self.cpu
-                .write(at, &self.scratch.buffers[index])
+                .write(at, &self.scratch.buffers[index][offset..offset + len])
                 .map_err(|fault| Stop::Fault {
                     address: fault.addr,
                     write: true,

@@ -2,7 +2,7 @@
 
 use adv_cpu::backend::{Guest, Prot};
 use adv_cpu::body::{EAX, EDX, Input, Mem, Ret, Stop};
-use adv_machine::{Conv, Env, layout::PAGE};
+use adv_machine::{Conv, layout::PAGE};
 
 use super::{Body, resume_original};
 
@@ -18,14 +18,6 @@ fn page(cpu: &dyn Guest, at: u32, width: u32, limit: u32) -> Option<&[u8]> {
         return None;
     }
     cpu.shared_bytes(at, len as usize)
-}
-
-fn value(bytes: &[u8], width: u32) -> u32 {
-    if width == 1 {
-        u32::from(bytes[0])
-    } else {
-        u32::from(u16::from_le_bytes([bytes[0], bytes[1]]))
-    }
 }
 
 pub(super) fn string(cpu: &dyn Guest, at: u32, width: u32) -> Option<&[u8]> {
@@ -108,199 +100,288 @@ fn compare_bytes<M: Mem>(mem: &mut M, [mut a, mut b, mut len, ..]: [u32; 7]) -> 
     Ok(Ret::from(0u32))
 }
 
-fn compare(env: &Env<'_>, width: u32, mut limit: u32, terminated: bool, sign: bool) -> Option<u64> {
-    let (mut a, mut b) = (env.arg(0), env.arg(1));
-    let (mut x, mut y) = (&[][..], &[][..]);
-    while limit != 0 {
-        if x.is_empty() {
-            x = page(env.cpu, a, width, limit)?;
-        }
-        if y.is_empty() {
-            y = page(env.cpu, b, width, limit)?;
-        }
-        let len = y.len().min(x.len());
-        if !terminated {
-            let order = x[..len].cmp(&y[..len]);
-            if order != std::cmp::Ordering::Equal {
-                return Some(u64::from(order as i32 as u32));
-            }
-        } else {
-            let stop = if width == 1 {
-                x[..len]
-                    .iter()
-                    .zip(&y[..len])
-                    .position(|(&x, &y)| x != y || x == 0)
-            } else {
-                x[..len]
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .zip(y[..len].as_chunks::<2>().0)
-                    .position(|(x, y)| x != y || *x == [0, 0])
-            };
-            if let Some(i) = stop {
-                let at = i * width as usize;
-                let diff = value(&x[at..], width) as i32 - value(&y[at..], width) as i32;
-                return Some(u64::from((if sign { diff.signum() } else { diff }) as u32));
-            }
-        }
-        x = &x[len..];
-        y = &y[len..];
-        limit -= len as u32 / width;
-        if limit != 0 {
-            a = a.checked_add(len as u32)?;
-            b = b.checked_add(len as u32)?;
-        }
+// A checked page span, including the complete unaligned wide unit when needed.
+fn span<M: Mem>(mem: &mut M, at: u32, width: u32, limit: u32) -> Result<(*const u8, u32), Stop> {
+    let count = ((PAGE - at % PAGE) / width).max(1).min(limit);
+    Ok((mem.input(at, count * width)?, count))
+}
+
+// SAFETY: callers hold a checked span containing this unit.
+unsafe fn unit(pointer: *const u8, width: u32) -> u32 {
+    if width == 1 {
+        u32::from(unsafe { pointer.read() })
+    } else {
+        u32::from(u16::from_le(unsafe {
+            pointer.cast::<u16>().read_unaligned()
+        }))
     }
-    Some(0)
 }
 
-pub(super) fn strcmp(env: &mut Env<'_>) -> Option<u64> {
-    compare(env, 1, u32::MAX, true, true)
-}
-
-pub(super) fn strncmp(env: &mut Env<'_>) -> Option<u64> {
-    compare(env, 1, env.arg(2), true, false)
-}
-
-pub(super) fn strncmp_sign(env: &mut Env<'_>) -> Option<u64> {
-    compare(env, 1, env.arg(2), true, true)
-}
-
-pub(super) fn wcscmp(env: &mut Env<'_>) -> Option<u64> {
-    compare(env, 2, u32::MAX, true, false)
-}
-
-pub(super) fn wcscmp_sign(env: &mut Env<'_>) -> Option<u64> {
-    compare(env, 2, u32::MAX, true, true)
-}
-
-pub(super) fn wcsncmp(env: &mut Env<'_>) -> Option<u64> {
-    compare(env, 2, env.arg(2), true, false)
-}
-
-fn length(env: &Env<'_>, width: u32, limit: u32) -> Option<u64> {
-    Some(u64::from(scan_length(env.cpu, env.arg(0), width, limit)?))
-}
-
-pub(super) fn strlen(env: &mut Env<'_>) -> Option<u64> {
-    length(env, 1, u32::MAX)
-}
-pub(super) fn strnlen(env: &mut Env<'_>) -> Option<u64> {
-    length(env, 1, env.arg(1))
-}
-pub(super) fn wcslen(env: &mut Env<'_>) -> Option<u64> {
-    length(env, 2, u32::MAX)
-}
-pub(super) fn wcsnlen(env: &mut Env<'_>) -> Option<u64> {
-    length(env, 2, env.arg(1))
-}
-
-fn find(env: &Env<'_>, width: u32, mut limit: u32, terminated: bool, last: bool) -> Option<u64> {
-    let mut at = env.arg(0);
-    let ch = env.arg(1) & if width == 1 { 0xff } else { 0xffff };
-    let mut found = 0;
-    while limit != 0 {
-        let bytes = page(env.cpu, at, width, limit)?;
-        for (i, unit) in bytes.chunks_exact(width as usize).enumerate() {
-            let x = value(unit, width);
-            if x == ch {
-                found = at + i as u32 * width;
-                if !last {
-                    return Some(u64::from(found));
+pub(super) fn compare_strings<
+    M: Mem,
+    const WIDTH: u32,
+    const BOUNDED: bool,
+    const SIGN: bool,
+    const SIMD: bool,
+>(
+    mem: &mut M,
+    [mut a, mut b, n, ..]: [u32; 7],
+) -> Result<Ret, Stop> {
+    let mut left = if BOUNDED { n } else { u32::MAX };
+    while left != 0 {
+        let count = left
+            .min(((PAGE - a % PAGE) / WIDTH).max(1))
+            .min(((PAGE - b % PAGE) / WIDTH).max(1));
+        let x = mem.input(a, count * WIDTH)?;
+        let y = mem.input(b, count * WIDTH)?;
+        let mut i = 0;
+        #[cfg(target_arch = "aarch64")]
+        if SIMD {
+            use std::arch::aarch64::*;
+            // SAFETY: a vector stays inside both checked spans. The scalar
+            // loop locates the first zero or unequal unit in a stopping vector.
+            unsafe {
+                while i + 16 / WIDTH <= count {
+                    let xp = x.add((i * WIDTH) as usize);
+                    let yp = y.add((i * WIDTH) as usize);
+                    let done = if WIDTH == 1 {
+                        let xv = vld1q_u8(xp);
+                        let yv = vld1q_u8(yp);
+                        vminvq_u8(vandq_u8(vceqq_u8(xv, yv), vmvnq_u8(vceqzq_u8(xv)))) != 255
+                    } else {
+                        let xv = vld1q_u16(xp.cast());
+                        let yv = vld1q_u16(yp.cast());
+                        vminvq_u16(vandq_u16(vceqq_u16(xv, yv), vmvnq_u16(vceqzq_u16(xv)))) != 65535
+                    };
+                    if done {
+                        break;
+                    }
+                    i += 16 / WIDTH;
                 }
             }
-            if terminated && x == 0 {
-                return Some(u64::from(found));
+        }
+        while i < count {
+            // SAFETY: i indexes a unit in each checked span.
+            let (x, y) = unsafe {
+                (
+                    unit(x.add((i * WIDTH) as usize), WIDTH),
+                    unit(y.add((i * WIDTH) as usize), WIDTH),
+                )
+            };
+            if x != y || x == 0 {
+                let difference = x as i32 - y as i32;
+                return Ok(Ret::from(
+                    (if SIGN {
+                        difference.signum()
+                    } else {
+                        difference
+                    }) as u32,
+                ));
+            }
+            i += 1;
+        }
+        left -= count;
+        a = a.wrapping_add(count * WIDTH);
+        b = b.wrapping_add(count * WIDTH);
+    }
+    Ok(0u32.into())
+}
+
+fn length<M: Mem, const WIDTH: u32, const BOUNDED: bool>(
+    mem: &mut M,
+    [at, n, ..]: [u32; 7],
+) -> Result<Ret, Stop> {
+    Ok(mem
+        .terminated(at, WIDTH, if BOUNDED { n } else { u32::MAX })?
+        .into())
+}
+
+fn find<M: Mem, const WIDTH: u32, const TERMINATED: bool, const LAST: bool>(
+    mem: &mut M,
+    [mut at, ch, n, ..]: [u32; 7],
+) -> Result<Ret, Stop> {
+    // Windows 11 x86 truncates the search character to its byte/wide unit.
+    let ch = ch & if WIDTH == 1 { 255 } else { 65535 };
+    let mut left = if TERMINATED { u32::MAX } else { n };
+    let mut found = 0;
+    while left != 0 {
+        let (pointer, count) = span(mem, at, WIDTH, left)?;
+        for i in 0..count {
+            // SAFETY: i indexes a checked unit.
+            let x = unsafe { unit(pointer.add((i * WIDTH) as usize), WIDTH) };
+            if x == ch {
+                found = at.wrapping_add(i * WIDTH);
+                if !LAST {
+                    return Ok(found.into());
+                }
+            }
+            if TERMINATED && x == 0 {
+                return Ok(found.into());
             }
         }
-        limit -= bytes.len() as u32 / width;
-        if limit != 0 {
-            at = at.checked_add(bytes.len() as u32)?;
-        }
+        left -= count;
+        at = at.wrapping_add(count * WIDTH);
     }
-    Some(u64::from(found))
+    Ok(found.into())
 }
 
-pub(super) fn memchr(env: &mut Env<'_>) -> Option<u64> {
-    find(env, 1, env.arg(2), false, false)
-}
-pub(super) fn strchr(env: &mut Env<'_>) -> Option<u64> {
-    find(env, 1, u32::MAX, true, false)
-}
-pub(super) fn strrchr(env: &mut Env<'_>) -> Option<u64> {
-    find(env, 1, u32::MAX, true, true)
-}
-pub(super) fn wcschr(env: &mut Env<'_>) -> Option<u64> {
-    find(env, 2, u32::MAX, true, false)
-}
-pub(super) fn wcsrchr(env: &mut Env<'_>) -> Option<u64> {
-    find(env, 2, u32::MAX, true, true)
-}
-
-fn copy(env: &mut Env<'_>, width: u32, append: bool) -> Option<u64> {
-    let (dst, src) = (env.arg(0), env.arg(1));
-    let data = string(env.cpu, src, width)?;
-    let offset = if append {
-        string(env.cpu, dst, width)?.len() as u32 - width
+fn copy_string<M: Mem, const WIDTH: u32, const APPEND: bool>(
+    mem: &mut M,
+    [dst, src, ..]: [u32; 7],
+) -> Result<Ret, Stop> {
+    let offset = if APPEND {
+        mem.terminated(dst, WIDTH, u32::MAX)? * WIDTH
     } else {
         0
     };
-    let at = dst.checked_add(offset)?;
-    let end = at.checked_add(data.len() as u32)?;
-    // Wine copies forwards. Let it handle aliases whose writes change later reads.
-    if at < src.checked_add(data.len() as u32)? && src < end {
-        return None;
+    let count = mem.terminated(src, WIDTH, u32::MAX)? + 1;
+    let [from, to] = mem.spans([
+        (src, count * WIDTH, false),
+        (dst.wrapping_add(offset), count * WIDTH, true),
+    ])?;
+    // Windows 11 x86 strcpy/wcscpy also copy an overlapping source tail
+    // into its preceding destination ("qAB" + 1 -> "AB").
+    // SAFETY: both complete spans are checked; copies proceed in unit order.
+    unsafe {
+        for i in 0..count {
+            let at = (i * WIDTH) as usize;
+            if WIDTH == 1 {
+                to.add(at).write(from.add(at).read());
+            } else {
+                to.add(at)
+                    .cast::<u16>()
+                    .write_unaligned(from.add(at).cast::<u16>().read_unaligned());
+            }
+        }
     }
-    let len = data.len();
-    if !env.cpu.accessible(at, len as u32, Prot::WRITE) {
-        return None;
-    }
-    env.cpu.copy_memory(src, at, len).ok()?;
-    Some(u64::from(dst))
+    mem.commit()?;
+    Ok(dst.into())
 }
 
-pub(super) fn strcpy(env: &mut Env<'_>) -> Option<u64> {
-    copy(env, 1, false)
-}
-pub(super) fn wcscpy(env: &mut Env<'_>) -> Option<u64> {
-    copy(env, 2, false)
-}
-pub(super) fn strcat(env: &mut Env<'_>) -> Option<u64> {
-    copy(env, 1, true)
-}
-pub(super) fn wcscat(env: &mut Env<'_>) -> Option<u64> {
-    copy(env, 2, true)
-}
-
-fn substring(env: &Env<'_>, width: u32, check_haystack: bool) -> Option<u64> {
-    if check_haystack && value(page(env.cpu, env.arg(0), width, 1)?, width) == 0 {
-        return Some(0);
+// Two-Way search over unaligned UTF-16 units. A byte search cannot skip
+// unaligned matches: its non-overlapping iterator can skip a valid wide one.
+pub(super) fn wide_substring(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    let (h, n) = (haystack.len() / 2, needle.len() / 2);
+    let get = |bytes: &[u8], i: usize| u16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]]);
+    let suffix = |reverse: bool| {
+        let (mut left, mut right, mut offset, mut period) = (-1isize, 0usize, 1usize, 1usize);
+        while right + offset < n {
+            let a = get(needle, (left + offset as isize) as usize);
+            let b = get(needle, right + offset);
+            if a == b {
+                if offset == period {
+                    right += period;
+                    offset = 1;
+                } else {
+                    offset += 1;
+                }
+            } else if (a > b) != reverse {
+                right += offset;
+                offset = 1;
+                period = (right as isize - left) as usize;
+            } else {
+                left = right as isize;
+                right += 1;
+                offset = 1;
+                period = 1;
+            }
+        }
+        (left, period)
+    };
+    let (a, ap) = suffix(false);
+    let (b, bp) = suffix(true);
+    let (critical, mut period) = if a > b {
+        ((a + 1) as usize, ap)
+    } else {
+        ((b + 1) as usize, bp)
+    };
+    let remembered = if period + critical <= n
+        && (0..critical).all(|i| get(needle, i) == get(needle, period + i))
+    {
+        n - period
+    } else {
+        period = critical.saturating_sub(1).max(n - critical) + 1;
+        0
+    };
+    let (mut at, mut memory) = (0, 0);
+    while at + n <= h {
+        let mut i = critical.max(memory);
+        while i < n && get(needle, i) == get(haystack, at + i) {
+            i += 1;
+        }
+        if i < n {
+            at += i + 1 - critical;
+            memory = 0;
+            continue;
+        }
+        i = critical;
+        while i > memory && get(needle, i - 1) == get(haystack, at + i - 1) {
+            i -= 1;
+        }
+        if i <= memory {
+            return Some(at * 2);
+        }
+        at += period;
+        memory = remembered;
     }
-    let needle = string(env.cpu, env.arg(1), width)?;
-    let needle = &needle[..needle.len() - width as usize];
-    if needle.is_empty() {
-        return Some(u64::from(env.arg(0)));
+    None
+}
+
+fn substring<M: Mem, const WIDTH: u32>(
+    mem: &mut M,
+    [haystack, needle, ..]: [u32; 7],
+) -> Result<Ret, Stop> {
+    let n = mem.terminated(needle, WIDTH, u32::MAX)?;
+    if n == 0 {
+        return Ok(haystack.into());
     }
-    let haystack = string(env.cpu, env.arg(0), width)?;
-    let offset = haystack
-        .windows(needle.len())
-        .enumerate()
-        .step_by(width as usize)
-        .find_map(|(i, window)| (window == needle).then_some(i));
-    Some(offset.map_or(0, |i| u64::from(env.arg(0)) + i as u64))
+    let h = mem.terminated(haystack, WIDTH, u32::MAX)?;
+    if n > h {
+        return Ok(0u32.into());
+    }
+    let x = mem.input(haystack, h * WIDTH)?;
+    let y = mem.input(needle, n * WIDTH)?;
+    // SAFETY: the complete strings were checked. Both searches are linear
+    // and allocation-free; wide matches start on a unit.
+    let (x, y) = unsafe {
+        (
+            std::slice::from_raw_parts(x, (h * WIDTH) as usize),
+            std::slice::from_raw_parts(y, (n * WIDTH) as usize),
+        )
+    };
+    let found = if WIDTH == 1 {
+        memchr::memmem::find(x, y)
+    } else {
+        wide_substring(x, y)
+    };
+    Ok(found.map_or(0, |i| haystack.wrapping_add(i as u32)).into())
 }
 
-pub(super) fn strstr(env: &mut Env<'_>) -> Option<u64> {
-    substring(env, 1, false)
+macro_rules! string_body {
+    ($name:ident, $function:path, $argc:literal) => {
+        adv_cpu::body!($name = $function, inputs: match $argc { 1 => &[Input::Stack(0)], 2 => &[Input::Stack(0), Input::Stack(1)], _ => ARGS }, outputs: EAX, pop: 0);
+    };
 }
-pub(super) fn wcsstr(env: &mut Env<'_>) -> Option<u64> {
-    substring(env, 2, true)
-}
-
-pub(super) fn strstr_nt(env: &mut Env<'_>) -> Option<u64> {
-    substring(env, 1, true)
-}
+string_body!(MEMCHR, find::<_, 1, false, false>, 3);
+string_body!(STRLEN, length::<_, 1, false>, 1);
+string_body!(STRNLEN, length::<_, 1, true>, 2);
+string_body!(WCSLEN, length::<_, 2, false>, 1);
+string_body!(WCSNLEN, length::<_, 2, true>, 2);
+string_body!(STRCMP, compare_strings::<_, 1, false, true, true>, 2);
+string_body!(STRNCMP, compare_strings::<_, 1, true, false, true>, 3);
+string_body!(STRNCMP_SIGN, compare_strings::<_, 1, true, true, true>, 3);
+string_body!(WCSCMP, compare_strings::<_, 2, false, true, true>, 2);
+string_body!(WCSNCMP, compare_strings::<_, 2, true, false, true>, 3);
+string_body!(STRCHR, find::<_, 1, true, false>, 2);
+string_body!(STRRCHR, find::<_, 1, true, true>, 2);
+string_body!(WCSCHR, find::<_, 2, true, false>, 2);
+string_body!(WCSRCHR, find::<_, 2, true, true>, 2);
+string_body!(STRCPY, copy_string::<_, 1, false>, 2);
+string_body!(WCSCPY, copy_string::<_, 2, false>, 2);
+string_body!(STRCAT, copy_string::<_, 1, true>, 2);
+string_body!(WCSCAT, copy_string::<_, 2, true>, 2);
+string_body!(STRSTR, substring::<_, 1>, 2);
+string_body!(WCSSTR, substring::<_, 2>, 2);
 
 const ALL: &[&str] = &[
     "ntdll.dll",
@@ -333,7 +414,6 @@ const DIFF_COMPARISONS: &[&str] = &[
     "msvcr100.dll",
     "msvcrtd.dll",
 ];
-const NTDLL: &[&str] = &["ntdll.dll"];
 const CRT: &[&str] = &[
     "msvcrt.dll",
     "ucrtbase.dll",
@@ -355,63 +435,44 @@ const SIGN_COMPARISONS: &[&str] = &[
 ];
 
 pub(super) fn bodies() -> Vec<Body> {
-    let direct: &[(&str, adv_cpu::body::Body, &[&str])] = &[
-        ("memset", MEMSET, ALL),
-        ("memmove", MEMMOVE, CRT),
-        ("memcmp", MEMCMP, ALL),
+    // Windows 11 x86: strcmp/wcscmp/memcmp return a sign in all three
+    // system CRTs. strncmp alone differs: ntdll/msvcrt subtract, UCRT signs.
+    // strstr/wcsstr return the haystack for an empty needle, even if empty.
+    let table: &[(&str, u8, adv_cpu::body::Body, &[&str])] = &[
+        ("memset", 3, MEMSET, ALL),
+        ("memmove", 3, MEMMOVE, CRT),
+        ("memcmp", 3, MEMCMP, ALL),
+        ("memchr", 3, MEMCHR, ALL),
+        ("strlen", 1, STRLEN, ALL),
+        ("strnlen", 2, STRNLEN, WITH_STRNLEN),
+        ("wcslen", 1, WCSLEN, ALL),
+        ("wcsnlen", 2, WCSNLEN, WITH_STRNLEN),
+        ("strcmp", 2, STRCMP, ALL),
+        ("strncmp", 3, STRNCMP, DIFF_COMPARISONS),
+        ("strncmp", 3, STRNCMP_SIGN, SIGN_COMPARISONS),
+        ("wcscmp", 2, WCSCMP, ALL),
+        ("wcsncmp", 3, WCSNCMP, ALL),
+        ("strchr", 2, STRCHR, ALL),
+        ("strrchr", 2, STRRCHR, ALL),
+        ("wcschr", 2, WCSCHR, ALL),
+        ("wcsrchr", 2, WCSRCHR, ALL),
+        ("strcpy", 2, STRCPY, ALL),
+        ("wcscpy", 2, WCSCPY, ALL),
+        ("strcat", 2, STRCAT, ALL),
+        ("wcscat", 2, WCSCAT, ALL),
+        ("strstr", 2, STRSTR, ALL),
+        ("wcsstr", 2, WCSSTR, ALL),
     ];
     let mut bodies = Vec::new();
-    for &(name, body, modules) in direct {
+    for &(name, argc, body, modules) in table {
         for module in modules {
             bodies.push(Body {
                 name: format!("{module}!{name}").into(),
-                conv: Conv::Cdecl { argc: 3 },
+                conv: Conv::Cdecl { argc },
                 body: None,
                 handler: resume_original,
                 direct: Some(body),
             });
-        }
-    }
-    type Variant = (super::BodyFn, &'static [&'static str]);
-    let table: &[(&str, u8, &[Variant])] = &[
-        ("memchr", 3, &[(memchr, ALL)]),
-        ("strlen", 1, &[(strlen, ALL)]),
-        ("strnlen", 2, &[(strnlen, WITH_STRNLEN)]),
-        ("wcslen", 1, &[(wcslen, ALL)]),
-        ("wcsnlen", 2, &[(wcsnlen, WITH_STRNLEN)]),
-        ("strcmp", 2, &[(strcmp, ALL)]),
-        (
-            "strncmp",
-            3,
-            &[
-                (strncmp, DIFF_COMPARISONS),
-                (strncmp_sign, SIGN_COMPARISONS),
-            ],
-        ),
-        ("wcscmp", 2, &[(wcscmp, NTDLL), (wcscmp_sign, CRT)]),
-        ("wcsncmp", 3, &[(wcsncmp, ALL)]),
-        ("strchr", 2, &[(strchr, ALL)]),
-        ("strrchr", 2, &[(strrchr, ALL)]),
-        ("wcschr", 2, &[(wcschr, ALL)]),
-        ("wcsrchr", 2, &[(wcsrchr, ALL)]),
-        ("strcpy", 2, &[(strcpy, ALL)]),
-        ("wcscpy", 2, &[(wcscpy, ALL)]),
-        ("strcat", 2, &[(strcat, ALL)]),
-        ("wcscat", 2, &[(wcscat, ALL)]),
-        ("strstr", 2, &[(strstr_nt, NTDLL), (strstr, CRT)]),
-        ("wcsstr", 2, &[(wcsstr, ALL)]),
-    ];
-    for &(name, argc, variants) in table {
-        for &(body, modules) in variants {
-            for module in modules {
-                bodies.push(Body {
-                    name: format!("{module}!{name}").into(),
-                    conv: Conv::Cdecl { argc },
-                    body: Some(body),
-                    handler: resume_original,
-                    direct: None,
-                });
-            }
         }
     }
     bodies

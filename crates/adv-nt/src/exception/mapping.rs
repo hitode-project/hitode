@@ -72,6 +72,7 @@ fn map_stop(
                 ACCESS_VIOLATION
             }
             FaultKind::InvalidInstruction => ILLEGAL_INSTRUCTION,
+            FaultKind::IntegerDivideByZero => INTEGER_DIVIDE_BY_ZERO,
             FaultKind::Other(reason) => {
                 if matches!(
                     instruction(cpu, pc).mnemonic(),

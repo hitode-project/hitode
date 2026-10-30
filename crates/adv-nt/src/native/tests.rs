@@ -39,6 +39,7 @@ const PAGE: usize = 4096;
 struct TestGuest {
     bytes: Box<[u8; 8 * PAGE]>,
     regs: [u32; 16],
+    lend: bool,
     access: Cell<HostAccess>,
 }
 impl TestGuest {
@@ -96,9 +97,13 @@ impl Guest for TestGuest {
         self.range(addr, len as usize, prot).is_some()
     }
     fn shared_bytes(&self, addr: u32, len: usize) -> Option<&[u8]> {
-        Some(&self.bytes[self.range(addr, len, Prot::READ)?])
+        self.lend
+            .then_some(&self.bytes[self.range(addr, len, Prot::READ)?])
     }
     fn writable_bytes(&mut self, addr: u32, len: usize) -> Option<&mut [u8]> {
+        if !self.lend {
+            return None;
+        }
         let range = self.range(addr, len, Prot::WRITE)?;
         self.writes(len);
         Some(&mut self.bytes[range])
@@ -140,6 +145,7 @@ fn guest() -> TestGuest {
     let mut cpu = TestGuest {
         bytes: Box::new([0; 8 * PAGE]),
         regs: [0; 16],
+        lend: true,
         access: Cell::new(HostAccess::default()),
     };
     cpu.regs[Reg::Esp as usize] = 7 * PAGE as u32;
@@ -186,11 +192,12 @@ fn native_body_decline_allocation_gate() {
             .published_index(MODULE, &body.name)
             .unwrap();
         // Where a fault on the full path is raised.
-        machine
-            .ext
-            .get_or_default::<Entries>()
-            .0
-            .insert(thunk, 0x1000);
+        if let Some(direct) = body.direct {
+            machine
+                .ext
+                .get_or_default::<Entries>()
+                .insert(thunk, 0x1000, direct.direct);
+        }
         for round in 0..64 {
             for i in 0..8 {
                 let value = if round == 0 {
@@ -325,11 +332,17 @@ fn native_boundary_counts_untimed_calls_and_keeps_tail_ring() {
         cpu.write_u32(at + i as u32 * 4, *value).unwrap();
     }
     cpu.bytes[0x4000..0x4010].copy_from_slice(b"fifteen letters\0");
-    // Direct bodies run outside the boundary; strcpy still crosses it.
-    let strcpy = BODIES
-        .iter()
-        .find(|body| &*body.name == "ntdll.dll!strcpy")
-        .unwrap();
+    fn copy(env: &mut Env<'_>) -> Option<u64> {
+        env.cpu.copy_memory(env.arg(1), env.arg(0), 16).ok()?;
+        Some(u64::from(env.arg(0)))
+    }
+    static ORDINARY: Body = Body {
+        name: std::borrow::Cow::Borrowed("test!ordinary_copy"),
+        conv: Conv::Cdecl { argc: 2 },
+        body: Some(copy),
+        handler: resume_original,
+        direct: None,
+    };
     run_body(
         &mut Env {
             cpu: &mut cpu,
@@ -339,7 +352,7 @@ fn native_boundary_counts_untimed_calls_and_keeps_tail_ring() {
             thunk: 0,
         },
         0,
-        strcpy,
+        &ORDINARY,
     );
     debugger_attached(true);
     run_body(
@@ -351,7 +364,7 @@ fn native_boundary_counts_untimed_calls_and_keeps_tail_ring() {
             thunk: 0,
         },
         1,
-        strcpy,
+        &ORDINARY,
     );
     debugger_attached(false);
     assert_eq!(machine.ext.get::<Boundary>().bodies[1].timed_calls, 1);
@@ -552,4 +565,138 @@ fn native_nls_memo_and_output_scratch_allocate_only_when_cold() {
     let mut output = [0; 1024];
     env.cpu.read(dst, &mut output).unwrap();
     assert!(output.as_chunks::<2>().0.iter().all(|ch| *ch == [b'A', 0]));
+}
+
+// spec: NAT-BODY-6, NAT-BODY-10, NAT-BODY-19
+#[test]
+fn crt_and_adler_neon_match_scalar() {
+    use adv_cpu::body::{GuestMem, Scratch};
+    let mut cpu = guest();
+    let mut scratch = Scratch::default();
+    let mut seed = 0x73a1_62d9u32;
+    for len in 0..=512u32 {
+        for byte in &mut cpu.bytes[2 * PAGE..4 * PAGE] {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            *byte = seed as u8 | 1;
+        }
+        for width in [1, 2] {
+            let a = 2 * PAGE as u32 + len % 16;
+            let b = 3 * PAGE as u32 + (len * 7) % 16;
+            for i in 0..len * width {
+                cpu.bytes[(b + i) as usize] = cpu.bytes[(a + i) as usize];
+            }
+            cpu.bytes[(a + len * width) as usize..(a + len * width + width) as usize].fill(0);
+            cpu.bytes[(b + len * width) as usize..(b + len * width + width) as usize].fill(0);
+            for different in [false, true] {
+                if different && len != 0 {
+                    cpu.bytes[(b + len / 2 * width) as usize] ^= 0x42;
+                }
+                let args = [a, b, len + 1, 0, 0, 0, 0];
+                let mut mem = GuestMem::new(&mut cpu, &mut scratch);
+                let (scalar, neon) = if width == 1 {
+                    (
+                        crt::compare_strings::<_, 1, true, true, false>(&mut mem, args),
+                        crt::compare_strings::<_, 1, true, true, true>(&mut mem, args),
+                    )
+                } else {
+                    (
+                        crt::compare_strings::<_, 2, true, true, false>(&mut mem, args),
+                        crt::compare_strings::<_, 2, true, true, true>(&mut mem, args),
+                    )
+                };
+                assert_eq!(neon, scalar, "length {len}, width {width}");
+            }
+        }
+        let args = [seed, 2 * PAGE as u32, len, 0, 0, 0, 0];
+        let mut mem = GuestMem::new(&mut cpu, &mut scratch);
+        assert_eq!(
+            zlib::adler32::<_, true>(&mut mem, args),
+            zlib::adler32::<_, false>(&mut mem, args)
+        );
+    }
+}
+
+// spec: NAT-BODY-6, NAT-BODY-11, NAT-BODY-13, NAT-BODY-17
+#[test]
+fn direct_bodies_preserve_aliases_without_borrowed_memory() {
+    use adv_cpu::body::{GuestMem, Scratch};
+    for (name, args) in [
+        ("borland!memcpy", [0x5101, 0x5100, 63, 0, 0, 0, 0]),
+        ("borland!memmove", [0x5101, 0x5100, 63, 0, 0, 0, 0]),
+        ("msvcrt.dll!strcpy", [0x5100, 0x5101, 0, 0, 0, 0, 0]),
+        (
+            "windowscodecs.dll!inflate_fast",
+            [0x2100, 512, 0, 0, 0, 0, 0],
+        ),
+    ] {
+        let body = BODIES
+            .iter()
+            .find(|body| body.name == name)
+            .unwrap()
+            .direct
+            .unwrap();
+        let mut expected = None;
+        for lend in [true, false] {
+            let mut cpu = guest();
+            cpu.lend = lend;
+            for (i, byte) in cpu.bytes[5 * PAGE..6 * PAGE].iter_mut().enumerate() {
+                *byte = i as u8;
+            }
+            cpu.write(0x5101, b"overlapping string\0").unwrap();
+            if name.ends_with("inflate_fast") {
+                for (at, value) in [
+                    (0x2100, 0x5100u32),
+                    (0x2104, 32),
+                    (0x210c, 0x5101),
+                    (0x2110, 512),
+                    (0x211c, 0x3000),
+                    (0x3050, 0x1100),
+                    (0x3054, 0x4100),
+                    (0x3058, 1),
+                    (0x305c, 1),
+                    (0x4bc4, 1),
+                ] {
+                    cpu.bytes[at as usize..at as usize + 4].copy_from_slice(&value.to_le_bytes());
+                }
+                // A root table of one-bit literals keeps every overwritten
+                // compressed byte decodable, exposing later live input reads.
+                cpu.bytes[0x1100..0x1108].copy_from_slice(&[0, 1, b'A', 0, 0, 1, b'B', 0]);
+            }
+            let mut scratch = Scratch::default();
+            let result = (body.full)(&mut GuestMem::new(&mut cpu, &mut scratch), args);
+            assert!(result.is_ok(), "{name}: {result:?}");
+            if let Some((ret, bytes)) = &expected {
+                assert_eq!(&result, ret, "{name}");
+                assert_eq!(&cpu.bytes, bytes, "{name}");
+            } else {
+                expected = Some((result, cpu.bytes));
+            }
+        }
+    }
+}
+
+// spec: NAT-BODY-6
+#[test]
+fn wide_substrings_search_overlapping_unit_patterns() {
+    for hay in 0..256u32 {
+        let units: [u16; 8] = std::array::from_fn(|i| 0x4141 + ((hay >> i) & 1) as u16);
+        let bytes: [u8; 16] = std::array::from_fn(|i| units[i / 2].to_le_bytes()[i % 2]);
+        for len in 1..=8 {
+            for needle in 0..1u32 << len {
+                let target: [u16; 8] = std::array::from_fn(|i| 0x4141 + ((needle >> i) & 1) as u16);
+                let pattern: [u8; 16] = std::array::from_fn(|i| target[i / 2].to_le_bytes()[i % 2]);
+                let expected = units
+                    .windows(len)
+                    .position(|window| window == &target[..len])
+                    .map(|i| i * 2);
+                assert_eq!(
+                    crt::wide_substring(&bytes, &pattern[..len * 2]),
+                    expected,
+                    "haystack {hay:#x}, needle {needle:#x}, length {len}"
+                );
+            }
+        }
+    }
 }

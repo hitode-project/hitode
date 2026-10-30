@@ -368,8 +368,10 @@ Native font initialization also fills win32u's ANSI, OEM and UTF-8 code page tab
 
 ### NAT-BODY-1 Body semantics
 
-**Rule**: An ordinary native body that accepts a call MUST leave the guest state Wine's function would leave. Registers and flags the calling convention does not keep are exempt. Otherwise it MUST decline before any side effect, and the call MUST run Wine's function from its entry with the caller's frame.
+**Rule**: A body bound to a Windows API MUST leave the state the function leaves on Windows, including results, output bytes, errors and the last-error value. Other bodies MUST leave the state their bound guest code leaves. Registers and flags the calling convention does not keep are exempt.
 **Verification**: Test
+
+Windows behavior is measured on Windows 11 with the ACP and locale under test.
 
 Required host text services follow WINE-UNIX-6 in interpreted and translated execution.
 
@@ -380,8 +382,10 @@ Required host text services follow WINE-UNIX-6 in interpreted and translated exe
 
 ### NAT-BODY-3 DirectSound mixer
 
-**Rule**: The DirectSound mixer body MUST preserve Wine's float samples, scratch data, buffer positions, frequency accumulators, states, shared lock words, and stopped result. It MUST decline before writes when locks would wait, notifications would fire, effects or 3D apply, conversions are unsupported, or required memory is inaccessible. Its field offsets MUST match the pinned module's DWARF.
+**Rule**: The DirectSound mixer body MUST preserve Wine's float samples, scratch data, buffer positions, frequency accumulators, states, shared lock words and stopped result. It MUST cover every format, channel count, resampling ratio, 3D setting and floating-point control the function accepts. It MAY return to guest code under A64-CALL-6 only when a lock would wait or an effect object runs.
 **Verification**: Test
+
+Field offsets match the pinned module's DWARF. The mixer runs as a host-call body, so notifications use machine services.
 
 ### NAT-BODY-4 DIB primitives
 
@@ -395,7 +399,7 @@ Required host text services follow WINE-UNIX-6 in interpreted and translated exe
 
 ### NAT-BODY-6 CRT bodies
 
-**Rule**: Locale-independent PE string and memory bodies MUST preserve Wine's bytes, return values, bounds and overlap behavior. An access that would fault MUST decline before any write.
+**Rule**: Locale-independent CRT string and memory bodies MUST return the results and write the bytes the Windows CRT does, for every length and overlap. Inaccessible memory MUST follow A64-CALL-4.
 **Verification**: Test
 
 ### NAT-BODY-16 Complete bodies
@@ -420,12 +424,12 @@ Required host text services follow WINE-UNIX-6 in interpreted and translated exe
 
 ### NAT-BODY-10 Embedded zlib checksums
 
-**Rule**: Adler-32 bodies MUST preserve the pinned zlib's seeded checksum, short-input arithmetic and null-buffer initialization. Inaccessible input MUST retain guest execution.
+**Rule**: Adler-32 bodies MUST preserve the pinned zlib's seeded checksum, short-input arithmetic and null-buffer initialization.
 **Verification**: Test
 
 ### NAT-BODY-11 DEFLATE fast batches
 
-**Rule**: Native DEFLATE batches MUST preserve Wine's output, consumed input, bit reservoir, stream pointers and block-end state. Rejected batches MUST retain guest execution before guest writes. Stream and window layouts MUST match the pinned module's DWARF.
+**Rule**: Native DEFLATE batches MUST preserve Wine's output, consumed input, bit reservoir, stream pointers and block-end state. They MUST cover every stream the function accepts, including output overlapping its inputs. Stream and window layouts MUST match the pinned module's DWARF.
 **Verification**: Test
 
 ### NAT-BODY-12 Queue key state
@@ -435,7 +439,7 @@ Required host text services follow WINE-UNIX-6 in interpreted and translated exe
 
 ### NAT-BODY-13 Statically linked helpers
 
-**Rule**: Runtime helpers that game images link statically MUST bind only where an executable section holds their exact bytes, each copy under its own thunk. Borland's division bodies MUST return EDX:EAX, pop the divisor and zero ECX, and its copies MUST set EAX, ECX and EDX as its code does. A zero divisor or a forward copy into the source's tail MUST retain guest execution.
+**Rule**: Runtime helpers that game images link statically MUST bind only where an executable section holds their exact bytes, each copy under its own thunk. Borland's division bodies MUST return EDX:EAX, pop the divisor, zero ECX, and raise `EXCEPTION_INT_DIVIDE_BY_ZERO` under A64-CALL-4 for a zero divisor. Its copies MUST set EAX, ECX, EDX and overlapping bytes as its code does.
 **Verification**: Test
 
 ### NAT-BODY-14 Engine pixel routines
@@ -445,7 +449,12 @@ Required host text services follow WINE-UNIX-6 in interpreted and translated exe
 
 ### NAT-BODY-15 Native host work
 
-**Rule**: A body's host work MUST scale with bytes passed and returned, plus a constant. Immutable guest data MUST use `native::memo`. In debug builds and tests, `native::run` MUST reject declines after guest writes under NAT-BODY-1.
+**Rule**: A body's host work MUST scale with bytes passed and returned, plus a constant. Tables derived from immutable data MUST be built at most once per process and reached without hashing per call. Bodies MUST NOT read clocks, allocate heap memory or take host locks per call, except where their function does.
+**Verification**: Test
+
+### NAT-BODY-19 Host features
+
+**Rule**: Bodies MAY use host instruction set features detected at startup, such as NEON table lookups, CRC32, PMULL and dot products. The variant MUST be chosen when the function binds, without per-call feature checks. Every variant MUST produce identical results.
 **Verification**: Test
 
 ## Host DLL images

@@ -132,6 +132,7 @@ pub enum FaultKind {
     Write(u32),
     Fetch(u32),
     InvalidInstruction,
+    IntegerDivideByZero,
     /// Backend-specific error text.
     Other(String),
 }

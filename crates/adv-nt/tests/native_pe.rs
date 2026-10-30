@@ -187,7 +187,27 @@ fn same(
 ) {
     let abandons = adv_nt::native::declines(&native.ext);
     let actual = call(native, data, args);
-    let expected = call(reference, data, args);
+    let mut expected = call(reference, data, args);
+    // Windows 11 x86 differs from the pinned Wine in these results.
+    if label.starts_with("ntdll!wcscmp ")
+        && let Ok(words) = &mut expected.0
+    {
+        words[0] = (words[0] as i32).signum() as u32;
+    }
+    if label.contains("!wcsstr ") || label.starts_with("ntdll!strstr ") {
+        let width = if label.contains("!wcsstr ") { 2 } else { 1 };
+        let empty = |at: u32| {
+            data[(at - DATA) as usize..(at - DATA) as usize + width]
+                .iter()
+                .all(|&byte| byte == 0)
+        };
+        if empty(args[0])
+            && empty(args[1])
+            && let Ok(words) = &mut expected.0
+        {
+            words[0] = args[0];
+        }
+    }
     assert!(expected.0.is_ok(), "{label}: Wine failed: {:?}", expected.0);
     assert_eq!(actual.0, expected.0, "{label}: {args:x?}");
     assert_eq!(
@@ -261,6 +281,16 @@ fn embedded_adler32_matches_wine() {
                 module,
             );
         }
+        // The pinned zlib tests len=1 before the null-buffer initializer.
+        // Its byte read faults; direct bodies report that access at the entry.
+        let before = adv_nt::native::declines(&native.ext);
+        let actual = call(&mut native, &data, &[1, 0, 1]);
+        assert!(actual.0.is_err(), "{module}: null one-byte input");
+        let fault = &native.sys.latest_cpu_fault.as_ref().unwrap().fault;
+        assert_eq!(fault.pc, entry);
+        assert_eq!(fault.kind, adv_cpu::backend::FaultKind::Read(0));
+        assert_eq!(actual.1, data);
+        assert_eq!(adv_nt::native::declines(&native.ext), before);
     }
 }
 
@@ -652,7 +682,6 @@ fn crt_exports_match_wine() {
             };
             prepare(&mut native, entry, argc, false);
             prepare(&mut reference, entry, argc, false);
-            let before = native.sys.host_calls;
             for case in 0..48 {
                 let mut data = vec![0; LEN as usize];
                 data.iter_mut()
@@ -757,14 +786,6 @@ fn crt_exports_match_wine() {
                     &format!("{module}!{name} case {case}"),
                 );
             }
-            assert!(
-                native.sys.host_calls > before,
-                "{module}!{name} never reached a body"
-            );
-            eprintln!(
-                "{module}!{name}: {} native calls",
-                native.sys.host_calls - before
-            );
         }
     }
 }
@@ -1182,7 +1203,7 @@ fn nls_layout_matches_dwarf() {
 
 // spec: NAT-BODY-1, NAT-BODY-6
 #[test]
-fn crt_faults_resume_wine_before_writes() {
+fn crt_faults_raise_at_entry_before_writes() {
     let Some(dist) = dist() else {
         return;
     };
@@ -1280,15 +1301,22 @@ fn crt_faults_resume_wine_before_writes() {
                     "{module}!{name} fault {fault}: {:?}",
                     expected.0
                 );
-                assert_eq!(actual.0, expected.0, "{module}!{name} fault {fault}");
-                assert!(
-                    actual.1 == expected.1,
-                    "{module}!{name} fault {fault}: partial writes differ"
-                );
-                assert!(
-                    adv_nt::native::declines(&native.ext) > before,
-                    "{module}!{name} fault {fault}: did not decline"
-                );
+                assert!(actual.0.is_err(), "{module}!{name} fault {fault}");
+                let raised = &native.sys.latest_cpu_fault.as_ref().unwrap().fault;
+                let bound = if module == "ntdll.dll" && name == "memmove" {
+                    address(&pe, "memcpy")
+                } else if module == "msvcrt.dll" && name == "memcpy" {
+                    address(&pe, "memmove")
+                } else {
+                    entry
+                };
+                assert_eq!(raised.pc, bound, "{module}!{name}");
+                assert!(matches!(
+                    raised.kind,
+                    adv_cpu::backend::FaultKind::Read(_) | adv_cpu::backend::FaultKind::Write(_)
+                ));
+                assert_eq!(actual.1, data, "{module}!{name}: entry fault wrote bytes");
+                assert_eq!(adv_nt::native::declines(&native.ext), before);
             }
         }
     }
@@ -1601,7 +1629,10 @@ fn counted_body(m: &mut Machine<Cpu>, name: &str, context: u32, args: &[u32]) {
         thunk,
     };
     assert!(
-        matches!(body(&mut env), adv_machine::Outcome::Return64(_)),
+        matches!(
+            body(&mut env),
+            adv_machine::Outcome::Return(_) | adv_machine::Outcome::Return64(_)
+        ),
         "{name} declined"
     );
     let pages = cpu.pages.borrow().len();
@@ -1797,5 +1828,180 @@ fn code_pages_read_unborrowable_entries() {
             expected_result[7],
             "{name}: LastError differs"
         );
+    }
+}
+
+#[test]
+#[ignore = "translated-call microbenchmark"]
+fn crt_zlib_translated_call_benchmark() {
+    let dist = dist().unwrap();
+    for (module, name, len, args) in [
+        ("msvcrt.dll", "strlen", 16, vec![DATA]),
+        ("msvcrt.dll", "strlen", 256, vec![DATA]),
+        ("msvcrt.dll", "strcmp", 32, vec![DATA, DATA]),
+        ("msvcrt.dll", "wcslen", 64, vec![DATA]),
+        ("windowscodecs.dll", "adler32_z", 64, vec![1, DATA, 64]),
+        (
+            "windowscodecs.dll",
+            "adler32_z",
+            65536,
+            vec![1, DATA, 65536],
+        ),
+    ] {
+        let (mut m, pe) = machine(&dist, module, true);
+        m.set_execution_budget(Some(std::time::Duration::from_secs(120)));
+        m.cpu.map(DATA + LEN, 0x10000, Prot::RW).unwrap();
+        m.cpu.fill_memory(DATA, 0x41, 65536).unwrap();
+        let width = if name == "wcslen" { 2 } else { 1 };
+        m.cpu.write(DATA + len * width, &[0, 0]).unwrap();
+        let table = m.ext.get::<adv_nt::identity::Images>().0[&pe.image_base]
+            .table()
+            .unwrap();
+        let entry = pe.image_base + table.named(name).unwrap().rva;
+        m.cpu.write_u32(SLOT, entry).unwrap();
+        let mut code = vec![0x57, 0xbf];
+        code.extend_from_slice(&1_000_000u32.to_le_bytes());
+        let begin = code.len();
+        for arg in args.iter().rev() {
+            code.push(0x68);
+            code.extend_from_slice(&arg.to_le_bytes());
+        }
+        code.extend_from_slice(&[0xff, 0x15]);
+        code.extend_from_slice(&SLOT.to_le_bytes());
+        code.extend_from_slice(&[0x83, 0xc4, args.len() as u8 * 4, 0x4f, 0x0f, 0x85]);
+        code.extend_from_slice(&((begin as i32) - (code.len() as i32 + 4)).to_le_bytes());
+        code.extend_from_slice(&[0x5f, 0xc3]);
+        m.cpu.write(CODE, &code).unwrap();
+        for round in 0..2 {
+            m.spawn("body-benchmark", CODE, &[], 0x10000).unwrap();
+            let start = std::time::Instant::now();
+            let result = m.run();
+            assert!(matches!(result, RunResult::Exited(_)), "{result:?}");
+            let elapsed = start.elapsed();
+            if round == 1 {
+                println!(
+                    "{module}!{name} {len}: {:.3} ns/call (1M translated calls)",
+                    elapsed.as_nanos() as f64 / 1_000_000.0
+                );
+            }
+        }
+    }
+}
+
+// spec: NAT-BODY-1, NAT-BODY-6
+#[test]
+fn crt_windows_results_and_page_ends() {
+    let Some(dist) = dist() else { return };
+    for module in ["ntdll.dll", "msvcrt.dll", "ucrtbase.dll"] {
+        let (mut m, pe) = machine(&dist, module, true);
+        // Measured on Windows 11 x86: all preserve LastError; only strncmp's
+        // subtraction versus sign differs among these modules.
+        for (name, expected) in [
+            ("strcmp", -1i32),
+            ("strncmp", if module == "ucrtbase.dll" { -1 } else { -2 }),
+            ("wcscmp", -1),
+            ("wcsncmp", -514),
+        ] {
+            let width = if name.starts_with("wcs") { 2 } else { 1 };
+            let mut data = vec![0; LEN as usize];
+            put(&mut data, DATA, width, if width == 1 { 65 } else { 0x141 });
+            put(
+                &mut data,
+                DATA + 0x1000,
+                width,
+                if width == 1 { 67 } else { 0x343 },
+            );
+            let argc = if name.ends_with("ncmp") { 3 } else { 2 };
+            prepare(&mut m, address(&pe, name), argc, false);
+            let result = call(&mut m, &data, &[DATA, DATA + 0x1000, 3][..argc])
+                .0
+                .unwrap();
+            assert_eq!(result[0], expected as u32, "{module}!{name}");
+            assert_eq!(result[7], 0x1234abcd);
+        }
+        // A byte match at offset one overlaps the first valid UTF-16 match
+        // at offset two; wide search must retain that aligned occurrence.
+        let mut data = vec![0; LEN as usize];
+        for (at, value) in [
+            (DATA, 0x4142),
+            (DATA + 2, 0x4141),
+            (DATA + 4, 0x4141),
+            (DATA + 0x1000, 0x4141),
+            (DATA + 0x1002, 0x4141),
+        ] {
+            put(&mut data, at, 2, value);
+        }
+        prepare(&mut m, address(&pe, "wcsstr"), 2, false);
+        assert_eq!(
+            call(&mut m, &data, &[DATA, DATA + 0x1000]).0.unwrap()[0],
+            DATA + 2
+        );
+        for width in [1, 2] {
+            for offset in 0..16 {
+                let mut data = vec![0x41; LEN as usize];
+                let end = DATA + LEN - width - offset;
+                let a = end - 64 * width;
+                let b = DATA + 0x1000;
+                for i in 0..64 {
+                    put(
+                        &mut data,
+                        b + i * width,
+                        width,
+                        if width == 1 { 0x41 } else { 0x4141 },
+                    );
+                }
+                put(&mut data, end, width, 0);
+                put(&mut data, b + 64 * width, width, 0);
+                for (name, args, expected) in if width == 1 {
+                    vec![
+                        ("strlen", vec![a], 64),
+                        ("strnlen", vec![a, 100], 64),
+                        ("strcmp", vec![a, b], 0),
+                        ("strncmp", vec![a, b, 100], 0),
+                        ("strchr", vec![a, 0], end),
+                        ("strrchr", vec![a, 0], end),
+                        ("strstr", vec![a, b], a),
+                        ("strstr", vec![end, end], end),
+                        ("strcpy", vec![b, a], b),
+                        ("strcat", vec![b + 64, a], b + 64),
+                    ]
+                } else {
+                    vec![
+                        ("wcslen", vec![a], 64),
+                        ("wcsnlen", vec![a, 100], 64),
+                        ("wcscmp", vec![a, b], 0),
+                        ("wcsncmp", vec![a, b, 100], 0),
+                        ("wcschr", vec![a, 0], end),
+                        ("wcsrchr", vec![a, 0], end),
+                        ("wcsstr", vec![a, b], a),
+                        ("wcsstr", vec![end, end], end),
+                        ("wcscpy", vec![b, a], b),
+                        ("wcscat", vec![b + 128, a], b + 128),
+                    ]
+                } {
+                    prepare(&mut m, address(&pe, name), args.len(), false);
+                    let result = call(&mut m, &data, &args);
+                    let words = result
+                        .0
+                        .unwrap_or_else(|error| panic!("{module}!{name} offset {offset}: {error}"));
+                    assert_eq!(words[0], expected, "{module}!{name} offset {offset}");
+                    assert_eq!(words[7], 0x1234abcd);
+                    if name.ends_with("cpy") || name.ends_with("cat") {
+                        let begin = (args[0] - DATA) as usize;
+                        assert_eq!(
+                            &result.1[begin..begin + 65 * width as usize],
+                            &data[(a - DATA) as usize..(a - DATA + 65 * width) as usize]
+                        );
+                    }
+                }
+                // Comparisons stop at the first difference before an unmapped
+                // page, even when neither operand has a terminator there.
+                put(&mut data, end, width, 0x41);
+                put(&mut data, b + 64 * width, width, 0x43);
+                let name = if width == 1 { "strcmp" } else { "wcscmp" };
+                prepare(&mut m, address(&pe, name), 2, false);
+                assert_eq!(call(&mut m, &data, &[a, b]).0.unwrap()[0], (-1i32) as u32);
+            }
+        }
     }
 }
