@@ -658,13 +658,13 @@ fn bind_one(
         thunk
     };
     let body_name = name.split_once('@').map_or(name, |(body, _)| body);
-    if let Some(direct) = bodies()
+    if let Some(body) = bodies()
         .find(|body| body.name == body_name)
         .and_then(|body| body.direct)
     {
-        let mut direct = direct.direct;
-        if name.ends_with("!inflate_fast") {
-            direct.inputs = zlib::inputs(cpu, ext, entry)?;
+        let mut direct = body.direct;
+        if let Some(bind) = body.bind {
+            direct.inputs = bind(cpu, entry, &original)?;
         }
         sys.direct_bodies.insert(entry, direct);
         ext.get_or_default::<Entries>().insert(index, entry, direct);
