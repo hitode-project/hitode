@@ -216,7 +216,16 @@ fn same(
             words[0] = args[0];
         }
     }
-    assert!(expected.0.is_ok(), "{label}: Wine failed: {:?}", expected.0);
+    assert!(
+        expected.0.is_ok(),
+        "{label}: Wine failed: {:?}, stack {:x?}",
+        expected.0,
+        (0..4)
+            .map(|i| reference
+                .cpu
+                .read_u32(reference.cpu.reg(adv_cpu::backend::Reg::Esp) + i * 4))
+            .collect::<Vec<_>>()
+    );
     assert_eq!(actual.0, expected.0, "{label}: {args:x?}");
     assert_eq!(
         adv_nt::native::declines(&native.ext),
@@ -226,7 +235,12 @@ fn same(
     assert!(
         actual.1 == expected.1,
         "{label}: output differs, args {args:x?}; first difference {:?}",
-        actual.1.iter().zip(&expected.1).position(|(a, b)| a != b)
+        actual
+            .1
+            .iter()
+            .zip(&expected.1)
+            .enumerate()
+            .find(|(_, (a, b))| a != b)
     );
 }
 fn put(data: &mut [u8], at: u32, width: u32, value: u32) {
@@ -308,19 +322,6 @@ fn png_row_family_matches_wine() {
     let Some(dist) = dist() else { return };
     let (mut native, pe) = machine(&dist, "windowscodecs.dll", true);
     let (mut reference, _) = machine(&dist, "windowscodecs.dll", false);
-    native
-        .ext
-        .insert(adv_nt::native::PngRows(|filter, row, previous, bpp| {
-            use adv_device::codec_kernel;
-            use adv_nt::native::PngFilter;
-            match filter {
-                PngFilter::Sub => codec_kernel::png_sub(row, bpp),
-                PngFilter::Up => codec_kernel::png_up(row, previous),
-                PngFilter::Average => codec_kernel::png_average(row, previous, bpp),
-                PngFilter::Paeth => codec_kernel::png_paeth(row, previous, bpp),
-            }
-            .is_ok()
-        }));
     let table = native.ext.get::<adv_nt::identity::Images>().0[&pe.image_base]
         .table()
         .unwrap();
@@ -345,19 +346,21 @@ fn png_row_family_matches_wine() {
                 }
                 put(&mut data, DATA + 4, 4, len);
                 put(&mut data, DATA + 11, 1, depth);
-                let args = [DATA, DATA + 0x4000, DATA + 0x1000];
-                let before = adv_nt::native::declines(&native.ext);
-                let mut actual = call(&mut native, &data, &args);
-                let mut expected = call(&mut reference, &data, &args);
-                // These functions return void; EAX is not part of their ABI.
-                actual.0.as_mut().unwrap()[0] = 0;
-                expected.0.as_mut().unwrap()[0] = 0;
-                assert_eq!(actual, expected, "{name} depth={depth} len={len}");
-                assert_eq!(
-                    adv_nt::native::declines(&native.ext),
-                    before,
-                    "row was not accelerated"
-                );
+                for previous in [DATA + 0x1000, DATA + 0x4000, DATA + 0x3fff, DATA + 0x4001] {
+                    let args = [DATA, DATA + 0x4000, previous];
+                    let before = adv_nt::native::declines(&native.ext);
+                    let mut actual = call(&mut native, &data, &args);
+                    let mut expected = call(&mut reference, &data, &args);
+                    // These functions return void; EAX is not part of their ABI.
+                    actual.0.as_mut().unwrap()[0] = 0;
+                    expected.0.as_mut().unwrap()[0] = 0;
+                    assert_eq!(actual, expected, "{name} depth={depth} len={len}");
+                    assert_eq!(
+                        adv_nt::native::declines(&native.ext),
+                        before,
+                        "row was not accelerated"
+                    );
+                }
             }
         }
     }
@@ -561,14 +564,16 @@ fn d3dx_integer_pixels_match_wine_and_preserve_hooks() {
         "D3DX wide row",
     );
     let args = [DP, DF, SP, SF, 3, 0];
-    let mut input = data.clone();
-    put(&mut input, DP, 4, DATA + 0x1002);
-    let before = adv_nt::native::declines(&native.ext);
-    let actual = call(&mut native, &input, &args);
-    let expected = call(&mut reference, &input, &args);
-    assert_eq!(actual, expected, "overlapping pixels retain Wine");
-    assert!(actual.0.is_ok());
-    assert!(adv_nt::native::declines(&native.ext) > before);
+    for target in [DATA + 0x1002, DATA + 0x0ffe] {
+        let mut input = data.clone();
+        put(&mut input, DP, 4, target);
+        let before = adv_nt::native::declines(&native.ext);
+        let actual = call(&mut native, &input, &args);
+        let expected = call(&mut reference, &input, &args);
+        assert_eq!(actual, expected, "overlapping pixels preserve traversal");
+        assert!(actual.0.is_ok());
+        assert_eq!(adv_nt::native::declines(&native.ext), before);
+    }
     let helper = pe.image_base + table.named("make_argb_color").unwrap().rva;
     let mut original = [0; 6];
     native.cpu.read(helper, &mut original).unwrap();
@@ -582,7 +587,7 @@ fn d3dx_integer_pixels_match_wine_and_preserve_hooks() {
     let expected = call(&mut reference, &data, &args);
     assert_eq!(actual, expected, "patched pixel helper");
     assert!(actual.0.is_ok());
-    assert!(adv_nt::native::declines(&native.ext) > before);
+    assert_eq!(adv_nt::native::declines(&native.ext), before);
 
     let slot = pe
         .imports()
@@ -609,7 +614,7 @@ fn d3dx_integer_pixels_match_wine_and_preserve_hooks() {
     let expected = call(&mut reference, &data, &args);
     assert_eq!(actual, expected, "patched copy import");
     assert!(actual.0.is_ok());
-    assert!(adv_nt::native::declines(&native.ext) > before);
+    assert_eq!(adv_nt::native::declines(&native.ext), before);
 }
 
 // spec: NAT-BODY-1, NAT-BODY-6
@@ -2010,6 +2015,603 @@ fn crt_windows_results_and_page_ends() {
                 prepare(&mut m, address(&pe, name), 2, false);
                 assert_eq!(call(&mut m, &data, &[a, b]).0.unwrap()[0], (-1i32) as u32);
             }
+        }
+    }
+}
+
+// spec: NAT-BODY-8, NAT-BODY-16
+#[test]
+fn d3dx_all_formats_filters_and_overlap() {
+    let Some(dist) = dist() else { return };
+    let (mut native, pe) = machine(&dist, "d3dx9_43.dll", true);
+    let (mut reference, _) = machine(&dist, "d3dx9_43.dll", false);
+    let table = native.ext.get::<adv_nt::identity::Images>().0[&pe.image_base]
+        .table()
+        .unwrap();
+    let getter = table.named("get_d3dx_pixel_format_info").unwrap();
+    let formats = pe
+        .relocations()
+        .unwrap()
+        .into_iter()
+        .filter(|r| *r >= getter.rva && *r < getter.rva + getter.size)
+        .find_map(|r| {
+            let at = native.cpu.read_u32(pe.image_base + r).ok()?;
+            let mut b = [0; 40];
+            native.cpu.read(at, &mut b).ok()?;
+            (b[..12] == [0, 0, 0, 0, 0, 8, 8, 8, 0, 16, 8, 0]).then_some(at)
+        })
+        .unwrap();
+    let entry = pe.image_base + table.named("d3dx_load_pixels_from_pixels").unwrap().rva;
+    // The reference conversion owns temporary buffers. A guest bump allocator
+    // supplies the same malloc/free contract without loading another CRT.
+    const HEAP: u32 = 0x20000000;
+    const BUMP: u32 = SLOT + 0x200;
+    let mut crt =
+        Pe::parse(&std::fs::read(dist.join("lib/wine/i386-windows/ucrtbase.dll")).unwrap())
+            .unwrap();
+    crt.rebase(0x30000000).unwrap();
+    crt.image_base = 0x30000000;
+    let mut user =
+        Pe::parse(&std::fs::read(dist.join("lib/wine/i386-windows/user32.dll")).unwrap()).unwrap();
+    user.rebase(0x40000000).unwrap();
+    user.image_base = 0x40000000;
+    for m in [&mut native, &mut reference] {
+        map(m, &crt);
+        map(m, &user);
+        for import in pe.imports().unwrap().into_iter().flat_map(|m| m.imports) {
+            if let ImportName::Name { name, .. } = import.name
+                && m.cpu.read_u32(pe.image_base + import.iat_rva).unwrap() == CODE + 0xf00
+                && let Some(target) =
+                    [&crt, &user].into_iter().find_map(|library| {
+                        library.exports().unwrap().into_iter().find_map(|e| {
+                            match (e.name, e.target) {
+                                (Some(n), ExportTarget::Rva(rva)) if n == name => {
+                                    Some(library.image_base + rva)
+                                }
+                                _ => None,
+                            }
+                        })
+                    })
+            {
+                m.cpu
+                    .write_u32(pe.image_base + import.iat_rva, target)
+                    .unwrap();
+            }
+        }
+        m.cpu.map(HEAP, 0x100000, Prot::RW).unwrap();
+        let mut malloc = vec![0xa1];
+        malloc.extend_from_slice(&BUMP.to_le_bytes());
+        malloc.extend_from_slice(&[
+            0x8b, 0x4c, 0x24, 4, 0x83, 0xc1, 15, 0x83, 0xe1, 0xf0, 0x01, 0x0d,
+        ]);
+        malloc.extend_from_slice(&BUMP.to_le_bytes());
+        malloc.push(0xc3);
+        m.cpu.write(CODE + 0xa00, &malloc).unwrap();
+        m.cpu.write(CODE + 0xa40, &[0xc3]).unwrap();
+        for imported in pe.imports().unwrap().into_iter().flat_map(|m| m.imports) {
+            if let ImportName::Name { name, .. } = imported.name {
+                let target = match name.as_str() {
+                    "malloc" => CODE + 0xa00,
+                    "free" => CODE + 0xa40,
+                    _ => continue,
+                };
+                m.cpu
+                    .write_u32(pe.image_base + imported.iat_rva, target)
+                    .unwrap();
+            }
+        }
+        prepare(m, entry, 6, false);
+    }
+    let mut rng = Rng(0x735a4d2cba1968f0);
+    for id in 0..=58 {
+        for (sid, did) in [(id, 1), (1, id), (id, id)] {
+            let mut sf = [0; 40];
+            let mut df = [0; 40];
+            native.cpu.read(formats + sid * 40, &mut sf).unwrap();
+            native.cpu.read(formats + did * 40, &mut df).unwrap();
+            for filter in 1..=5 {
+                for shape in 0..3 {
+                    let mut data: Vec<_> = (0..LEN).map(|_| rng.next() as u8).collect();
+                    let dw: u32 = if shape == 0 { 4 } else { 2 };
+                    for (at, f) in [(DATA + 128, sf), (DATA + 192, df)] {
+                        data[(at - DATA) as usize..(at - DATA) as usize + 40].copy_from_slice(&f);
+                    }
+                    for (at, buffer, w, h, f) in [
+                        (DATA, DATA + 0x1000, 4, 4, sf),
+                        (DATA + 64, DATA + 0x4000, dw, dw, df),
+                    ] {
+                        let bw = u32::from_le_bytes(f[16..20].try_into().unwrap());
+                        let bh = u32::from_le_bytes(f[20..24].try_into().unwrap());
+                        let block = u32::from_le_bytes(f[24..28].try_into().unwrap());
+                        let pitch = w.div_ceil(bw) * block + 8;
+                        let depth = if shape == 2 {
+                            if at == DATA { 4 } else { 2 }
+                        } else {
+                            1
+                        };
+                        for (off, value) in [
+                            (0, buffer),
+                            (4, pitch),
+                            (8, pitch * h.div_ceil(bh)),
+                            (12, DATA + 0x6000),
+                            (16, w),
+                            (20, h),
+                            (24, depth),
+                            (28, 0),
+                            (32, 0),
+                            (36, w),
+                            (40, h),
+                        ] {
+                            put(&mut data, at + off, 4, value);
+                        }
+                    }
+                    if sf[32..36] == 3u32.to_le_bytes() {
+                        // Include finite, negative, infinity and NaN float encodings.
+                        let bytes = u32::from_le_bytes(sf[12..16].try_into().unwrap());
+                        for y in 0..4 {
+                            for x in 0..4 {
+                                let p = 0x1000 + y * (4 * bytes + 8) + x * bytes;
+                                for c in 0..4 {
+                                    let bits = sf[4 + c];
+                                    if bits == 0 {
+                                        continue;
+                                    }
+                                    let shift = sf[8 + c] as usize / 8;
+                                    let values = [
+                                        0u32, 0x3f000000, 0xbf800000, 0x7fc00000, 0x7f800000,
+                                        0xff800000,
+                                    ];
+                                    let value = if bits == 16 {
+                                        [0u32, 0x3800, 0xbc00, 0x7e00, 0x7c00, 0xfc00]
+                                            [(x + y + c as u32) as usize % 6]
+                                    } else {
+                                        values[(x + y + c as u32) as usize % 6]
+                                    };
+                                    data[p as usize + shift
+                                        ..p as usize + shift + bits as usize / 8]
+                                        .copy_from_slice(&value.to_le_bytes()[..bits as usize / 8]);
+                                }
+                            }
+                        }
+                    }
+                    let args = [
+                        DATA + 64,
+                        DATA + 192,
+                        DATA,
+                        DATA + 128,
+                        filter,
+                        if shape == 0 { 0 } else { 0x7f123456 },
+                    ];
+                    for m in [&mut native, &mut reference] {
+                        m.cpu.write_u32(BUMP, HEAP).unwrap();
+                    }
+                    same(
+                        &mut native,
+                        &mut reference,
+                        &data,
+                        &args,
+                        &format!("D3DX formats {sid}->{did} filter {filter} shape {shape}"),
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn translated_loop(m: &mut Machine<Cpu>, entry: u32, args: &[u32], iterations: u32) -> f64 {
+    let mut code = vec![0x55, 0xbd];
+    code.extend_from_slice(&iterations.to_le_bytes());
+    let start = code.len();
+    for arg in args.iter().rev() {
+        code.push(0x68);
+        code.extend_from_slice(&arg.to_le_bytes());
+    }
+    code.push(0xe8);
+    let next = CODE + code.len() as u32 + 4;
+    code.extend_from_slice(&entry.wrapping_sub(next).to_le_bytes());
+    code.extend_from_slice(&[0x83, 0xc4, (args.len() * 4) as u8, 0x4d, 0x75]);
+    code.push((start as isize - code.len() as isize - 1) as u8);
+    code.extend_from_slice(&[0x5d, 0x31, 0xc0, 0xc3]);
+    m.cpu.write(CODE, &code).unwrap();
+    m.spawn("pixel-bench", CODE, &[], 0x10000).unwrap();
+    let start = std::time::Instant::now();
+    let result = m.run();
+    let seconds = start.elapsed().as_secs_f64();
+    assert!(matches!(result, RunResult::Exited(0)), "{result:?}");
+    seconds * 1e9 / f64::from(iterations)
+}
+
+// spec: NAT-BODY-8, NAT-BODY-9
+#[test]
+#[ignore = "translated pixel micro-benchmark; nextest enforces a timeout"]
+fn translated_pe_pixel_microbenchmark() {
+    let Some(dist) = dist() else { return };
+    for module in ["d3dx9_43.dll", "windowscodecs.dll"] {
+        let (mut m, pe) = machine(&dist, module, true);
+        let table = m.ext.get::<adv_nt::identity::Images>().0[&pe.image_base]
+            .table()
+            .unwrap();
+        let (name, args, n) = if module.starts_with("d3dx") {
+            let source = 0x20000000;
+            let target = 0x21000000;
+            for at in [source, target] {
+                m.cpu.map(at, 0x40000, Prot::RW).unwrap();
+                m.cpu.write(at, &vec![0x7f; 0x40000]).unwrap();
+            }
+            let mut data = vec![0; LEN as usize];
+            for (at, buffer) in [(DATA, target), (DATA + 64, source)] {
+                for (off, value) in [
+                    (0, buffer),
+                    (4, 1024),
+                    (8, 0x40000),
+                    (12, 0),
+                    (16, 256),
+                    (20, 256),
+                    (24, 1),
+                    (28, 0),
+                    (32, 0),
+                    (36, 256),
+                    (40, 256),
+                ] {
+                    put(&mut data, at + off, 4, value);
+                }
+            }
+            for (at, id, bits, shifts) in [
+                (DATA + 128, 3, [8u8; 4], [24u8, 0, 8, 16]),
+                (DATA + 192, 1, [8u8; 4], [24u8, 16, 8, 0]),
+            ] {
+                for (off, value) in [
+                    (0, id),
+                    (4, u32::from_le_bytes(bits)),
+                    (8, u32::from_le_bytes(shifts)),
+                    (12, 4),
+                    (16, 1),
+                    (20, 1),
+                    (24, 4),
+                    (28, 1),
+                    (32, 1),
+                    (36, 0),
+                ] {
+                    put(&mut data, at + off, 4, value);
+                }
+            }
+            m.cpu.write(DATA, &data).unwrap();
+            (
+                "d3dx_load_pixels_from_pixels",
+                vec![DATA, DATA + 128, DATA + 64, DATA + 192, 2, 0],
+                1000,
+            )
+        } else {
+            m.cpu.write(DATA, &vec![0x71; LEN as usize]).unwrap();
+            m.cpu.write_u32(DATA + 4, 1024).unwrap();
+            m.cpu.write(DATA + 11, &[32]).unwrap();
+            (
+                "png_read_filter_row_paeth_multibyte_pixel",
+                vec![DATA, DATA + 0x1000, DATA + 0x2000],
+                10000,
+            )
+        };
+        let entry = pe.image_base + table.named(name).unwrap().rva;
+        translated_loop(&mut m, entry, &args, 10);
+        let mut samples = [0.0; 5];
+        for value in &mut samples {
+            *value = translated_loop(&mut m, entry, &args, n);
+        }
+        samples.sort_by(f64::total_cmp);
+        eprintln!(
+            "{name}: {:.3} ns/call (median of 5, {:.3}..{:.3})",
+            samples[2], samples[0], samples[4]
+        );
+    }
+}
+
+// spec: NAT-BODY-8, NAT-BODY-9, NAT-BODY-16
+#[test]
+fn pixel_bodies_fault_at_entry() {
+    let Some(dist) = dist() else { return };
+    for (module, name, argc) in [
+        (
+            "windowscodecs.dll",
+            "png_read_filter_row_paeth_multibyte_pixel",
+            3,
+        ),
+        ("d3dx9_43.dll", "d3dx_load_pixels_from_pixels", 6),
+    ] {
+        for write in [false, true] {
+            let (mut m, pe) = machine(&dist, module, true);
+            let table = m.ext.get::<adv_nt::identity::Images>().0[&pe.image_base]
+                .table()
+                .unwrap();
+            let entry = pe.image_base + table.named(name).unwrap().rva;
+            prepare(&mut m, entry, argc, false);
+            let mut data = vec![0x71; LEN as usize];
+            let mut args = if argc == 3 {
+                put(&mut data, DATA + 4, 4, 32);
+                put(&mut data, DATA + 11, 1, 32);
+                vec![DATA, DATA + 0x1000, DATA + 0x2000]
+            } else {
+                for (at, buffer) in [(DATA, DATA + 0x1000), (DATA + 64, DATA + 0x2000)] {
+                    for (off, value) in [
+                        (0, buffer),
+                        (4, 16),
+                        (8, 16),
+                        (12, 0),
+                        (16, 4),
+                        (20, 1),
+                        (24, 1),
+                        (28, 0),
+                        (32, 0),
+                        (36, 4),
+                        (40, 1),
+                    ] {
+                        put(&mut data, at + off, 4, value);
+                    }
+                }
+                for at in [DATA + 128, DATA + 192] {
+                    for (off, value) in [
+                        (0, 1),
+                        (4, 0x08080808),
+                        (8, 0x00081018),
+                        (12, 4),
+                        (16, 1),
+                        (20, 1),
+                        (24, 4),
+                        (28, 1),
+                        (32, 1),
+                        (36, 0),
+                    ] {
+                        put(&mut data, at + off, 4, value);
+                    }
+                }
+                vec![DATA, DATA + 128, DATA + 64, DATA + 192, 2, 0]
+            };
+            for _ in 0..2 {
+                assert!(call(&mut m, &data, &args).0.is_ok());
+            }
+            if write {
+                if argc == 3 {
+                    args[1] = 0;
+                } else {
+                    put(&mut data, DATA, 4, 0);
+                }
+            } else {
+                args[0] = 0;
+            }
+            let (result, bytes) = call(&mut m, &data, &args);
+            assert!(result.is_err());
+            assert_eq!(bytes, data);
+            let fault = &m.sys.latest_cpu_fault.as_ref().unwrap().fault;
+            assert_eq!(fault.pc, entry);
+            assert_eq!(
+                fault.kind,
+                if write {
+                    adv_cpu::backend::FaultKind::Write(0)
+                } else {
+                    adv_cpu::backend::FaultKind::Read(if argc == 3 { 4 } else { 0 })
+                }
+            );
+            assert_eq!(adv_nt::native::declines(&m.ext), 0);
+        }
+    }
+}
+
+// spec: NAT-BODY-9, NAT-BODY-16
+#[test]
+fn png_metadata_overlap_keeps_read_order() {
+    let Some(dist) = dist() else { return };
+    let (mut native, pe) = machine(&dist, "windowscodecs.dll", true);
+    let (mut reference, _) = machine(&dist, "windowscodecs.dll", false);
+    let table = native.ext.get::<adv_nt::identity::Images>().0[&pe.image_base]
+        .table()
+        .unwrap();
+    for name in [
+        "png_read_filter_row_sub",
+        "png_read_filter_row_up",
+        "png_read_filter_row_avg",
+        "png_read_filter_row_paeth_1byte_pixel",
+        "png_read_filter_row_paeth_multibyte_pixel",
+    ] {
+        let entry = pe.image_base + table.named(name).unwrap().rva;
+        for m in [&mut native, &mut reference] {
+            prepare(m, entry, 3, false);
+        }
+        let mut data = vec![0x71; LEN as usize];
+        put(&mut data, DATA + 4, 4, 32);
+        put(&mut data, DATA + 11, 1, 32);
+        put(&mut data, DATA + 0x1000, 4, 1);
+        let args = [DATA, DATA + 4, DATA + 0x1000];
+        let mut actual = call(&mut native, &data, &args);
+        let mut expected = call(&mut reference, &data, &args);
+        actual.0.as_mut().unwrap()[0] = 0;
+        expected.0.as_mut().unwrap()[0] = 0;
+        assert_eq!(actual, expected, "{name}");
+        assert_eq!(adv_nt::native::declines(&native.ext), 0);
+    }
+}
+
+// spec: NAT-BODY-8, NAT-BODY-16
+#[test]
+fn d3dx_float_controls_match_wine() {
+    let Some(dist) = dist() else { return };
+    let (mut native, pe) = machine(&dist, "d3dx9_43.dll", true);
+    let (mut reference, _) = machine(&dist, "d3dx9_43.dll", false);
+    let table = native.ext.get::<adv_nt::identity::Images>().0[&pe.image_base]
+        .table()
+        .unwrap();
+    let entry = pe.image_base + table.named("d3dx_load_pixels_from_pixels").unwrap().rva;
+    for hilo in [true, false] {
+        let mut data = vec![0x71; LEN as usize];
+        for (at, buffer, width, height, bytes) in [
+            (DATA, DATA + 0x1000, 2, 2, if hilo { 2 } else { 16 }),
+            (
+                DATA + 64,
+                DATA + 0x4000,
+                if hilo { 2 } else { 1 },
+                if hilo { 2 } else { 1 },
+                16,
+            ),
+        ] {
+            for (off, val) in [
+                (0, buffer),
+                (4, width * bytes),
+                (8, width * height * bytes),
+                (12, 0),
+                (16, width),
+                (20, height),
+                (24, 1),
+                (28, 0),
+                (32, 0),
+                (36, width),
+                (40, height),
+            ] {
+                put(&mut data, at + off, 4, val);
+            }
+        }
+        for at in [DATA + 128, DATA + 192] {
+            for (off, val) in [
+                (0, 41),
+                (4, 0x20202020),
+                (8, 0x40200060),
+                (12, 16),
+                (16, 1),
+                (20, 1),
+                (24, 16),
+                (28, 3),
+                (32, 3),
+                (36, 0),
+            ] {
+                put(&mut data, at + off, 4, val);
+            }
+        }
+        if hilo {
+            for (off, val) in [
+                (0, 50),
+                (4, 0x00080800),
+                (8, 0x00080000),
+                (12, 2),
+                (24, 2),
+                (28, 0),
+                (32, 6),
+            ] {
+                put(&mut data, DATA + 128 + off, 4, val);
+            }
+            for (i, pixel) in [0x3cd8u32, 0x0a64, 0, 0x0101].into_iter().enumerate() {
+                put(&mut data, DATA + 0x1000 + i as u32 * 2, 2, pixel);
+            }
+        } else {
+            for (i, pixel) in [
+                [0x00800000u32, 1, 0x3f800000, 0x3dcc_cccd],
+                [0, 1, 0x3f800000, 0x3e4c_cccd],
+                [0, 1, 0x3f000000, 0x3e99_999a],
+                [0, 1, 0x3e800000, 0x3ecc_cccd],
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                for (c, value) in pixel.into_iter().enumerate() {
+                    put(
+                        &mut data,
+                        DATA + 0x1000 + i as u32 * 16 + c as u32 * 4,
+                        4,
+                        value,
+                    );
+                }
+            }
+        }
+        for mxcsr in [0x1f80u32, 0x1fc0, 0x9f80, 0x9fc0, 0x3f80, 0x5f80, 0x7f80] {
+            for cw in [0x037fu16, 0x077f, 0x0b7f, 0x0f7f] {
+                for m in [&mut native, &mut reference] {
+                    prepare(m, entry, 6, false);
+                    m.cpu.write_u32(SLOT + 0x300, mxcsr).unwrap();
+                    m.cpu.write(SLOT + 0x304, &cw.to_le_bytes()).unwrap();
+                    let mut code = [0; 256];
+                    m.cpu.read(CODE, &mut code).unwrap();
+                    let mut prefix = vec![0x0f, 0xae, 0x15];
+                    prefix.extend_from_slice(&(SLOT + 0x300).to_le_bytes());
+                    prefix.extend_from_slice(&[0xd9, 0x2d]);
+                    prefix.extend_from_slice(&(SLOT + 0x304).to_le_bytes());
+                    prefix.extend_from_slice(&code);
+                    m.cpu.write(CODE, &prefix).unwrap();
+                }
+                same(
+                    &mut native,
+                    &mut reference,
+                    &data,
+                    &[
+                        DATA + 64,
+                        DATA + 192,
+                        DATA,
+                        DATA + 128,
+                        if hilo { 2 } else { 5 },
+                        0,
+                    ],
+                    &format!("D3DX float control {mxcsr:x}/{cw:x} hilo {hilo}"),
+                );
+            }
+        }
+        if !hilo {
+            for m in [&mut native, &mut reference] {
+                prepare(m, entry, 6, false);
+                m.cpu.write_u32(SLOT + 0x300, 0x0f80).unwrap();
+                let mut code = [0; 256];
+                m.cpu.read(CODE, &mut code).unwrap();
+                let mut prefix = vec![0x0f, 0xae, 0x15];
+                prefix.extend_from_slice(&(SLOT + 0x300).to_le_bytes());
+                prefix.extend_from_slice(&code);
+                m.cpu.write(CODE, &prefix).unwrap();
+            }
+            let args = [DATA + 64, DATA + 192, DATA, DATA + 128, 5, 0];
+            let actual = call(&mut native, &data, &args);
+            let expected = call(&mut reference, &data, &args);
+            assert!(actual.0.is_err() && expected.0.is_err());
+            assert_eq!(&actual.1[0x4000..0x4010], &expected.1[0x4000..0x4010]);
+            let fault = &native.sys.latest_cpu_fault.as_ref().unwrap().fault;
+            assert_eq!(fault.pc, entry);
+            assert_eq!(fault.kind, adv_cpu::backend::FaultKind::Trap(19));
+            assert_eq!(adv_nt::native::declines(&native.ext), 0);
+        }
+    }
+}
+
+// spec: NAT-BODY-9, NAT-BODY-16
+#[test]
+fn png_short_rows_and_wrapped_average_complete() {
+    let Some(dist) = dist() else { return };
+    for name in [
+        "png_read_filter_row_sub",
+        "png_read_filter_row_up",
+        "png_read_filter_row_avg",
+        "png_read_filter_row_paeth_1byte_pixel",
+        "png_read_filter_row_paeth_multibyte_pixel",
+    ] {
+        for len in [0, 1, 3, 7] {
+            let (mut native, pe) = machine(&dist, "windowscodecs.dll", true);
+            let (mut reference, _) = machine(&dist, "windowscodecs.dll", false);
+            let table = native.ext.get::<adv_nt::identity::Images>().0[&pe.image_base]
+                .table()
+                .unwrap();
+            let entry = pe.image_base + table.named(name).unwrap().rva;
+            for m in [&mut native, &mut reference] {
+                prepare(m, entry, 3, false);
+            }
+            let mut data = vec![0x71; LEN as usize];
+            put(&mut data, DATA + 4, 4, len);
+            put(&mut data, DATA + 11, 1, 64);
+            let args = [DATA, DATA + 0x1000, DATA + 0x2000];
+            let mut actual = call(&mut native, &data, &args);
+            let mut expected = call(&mut reference, &data, &args);
+            if name == "png_read_filter_row_avg" {
+                assert!(actual.0.is_err() && expected.0.is_err());
+                assert_eq!(actual.1, data);
+                let fault = &native.sys.latest_cpu_fault.as_ref().unwrap().fault;
+                assert_eq!(fault.pc, entry);
+                assert_eq!(fault.kind, adv_cpu::backend::FaultKind::Read(DATA + LEN));
+            } else {
+                actual.0.as_mut().unwrap()[0] = 0;
+                expected.0.as_mut().unwrap()[0] = 0;
+                assert_eq!(actual, expected, "{name} len {len}");
+            }
+            assert_eq!(adv_nt::native::declines(&native.ext), 0);
         }
     }
 }

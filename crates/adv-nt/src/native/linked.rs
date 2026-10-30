@@ -4,13 +4,10 @@
 use adv_cpu::backend::Guest;
 use adv_machine::{Conv, Ext, Sys};
 
-use super::{Body, BodyFn, resume_original};
+use super::{Body, resume_original};
 
 mod borland;
 mod tvpgl;
-
-/// A helper's body name, calling convention, code and body.
-type Helper = (&'static str, Conv, &'static [u8], BodyFn);
 
 fn helpers() -> impl Iterator<Item = (&'static str, Conv, &'static [u8])> {
     borland::HELPERS
@@ -36,9 +33,9 @@ pub(super) fn bodies() -> impl Iterator<Item = Body> {
         .chain(tvpgl::HELPERS.iter().map(|&(name, conv, _, body)| Body {
             name: name.into(),
             conv,
-            body: Some(body),
+            body: None,
             handler: resume_original,
-            direct: None,
+            direct: Some(body),
         }))
 }
 

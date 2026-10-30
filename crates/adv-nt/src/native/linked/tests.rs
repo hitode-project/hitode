@@ -251,9 +251,11 @@ fn tvpgl_alpha_blend_matches_its_code() {
             2 => (-(case as i32 % 3)) as u32,
             _ => rng.below(64) as u32,
         };
-        let dest = BUF + 4 * rng.below(16) as u32 + u32::from(case % 7 == 0);
+        let dest = BUF + 128 + 4 * rng.below(16) as u32 + u32::from(case % 7 == 0);
         let src = match case % 5 {
             0 => dest,
+            1 => dest + 4,
+            2 => dest - 4,
             _ => BUF + 0x2000 + 4 * rng.below(16) as u32,
         };
         let pixels = pixels(&mut rng);
@@ -296,7 +298,12 @@ fn tvpgl_interp_stretch_copy_matches_its_code() {
             3 => rng.next() as u32,
             _ => rng.below(0x100) as u32,
         };
-        let dest = BUF + 4 * rng.below(64) as u32;
+        let dest = match case % 4 {
+            0 => src1 + 4,
+            1 => src1 - 4,
+            2 => src2 + 4,
+            _ => BUF + 4 * rng.below(64) as u32,
+        };
         let pixels = pixels(&mut rng);
         let args = [dest, len, src1, src2, blend_y, start, step];
         check_buffer(&mut machines, helper, &pixels, &args, false);
@@ -350,6 +357,8 @@ fn tvpgl_ps_alpha_blend_matches_its_code() {
         let src = BUF + 0x2000 + 4 * rng.below(16) as u32 + u32::from(case % 7 == 0);
         let dest = match case % 5 {
             0 => src,
+            1 => src + 4,
+            2 => src - 4,
             _ => BUF + 4 * rng.below(16) as u32,
         };
         let pixels = pixels(&mut rng);
@@ -386,4 +395,60 @@ fn tvpgl_fill_argb_matches_its_code() {
     let [native, _] = &machines;
     assert!(native.sys.host_calls > 0);
     assert_eq!(super::super::declines(&native.ext), 0);
+}
+
+// spec: NAT-BODY-14, NAT-BODY-16
+#[test]
+fn tvpgl_faults_at_entry() {
+    for name in [
+        "TVPAlphaBlend",
+        "TVPPsAlphaBlend",
+        "TVPFillARGB",
+        "TVPInterpStretchCopy",
+    ] {
+        let helper = index(&format!("kirikiri2!{name}"));
+        let mut m = machine(true);
+        let good = if name == "TVPFillARGB" {
+            vec![BUF, 1, 0]
+        } else if name == "TVPInterpStretchCopy" {
+            vec![BUF, 1, BUF + 16, BUF + 32, 128, 0, 0]
+        } else {
+            vec![BUF, BUF + 16, 1]
+        };
+        for _ in 0..2 {
+            call(&mut m, helper, 0, &good).unwrap();
+        }
+        let mut bad = good;
+        bad[0] = 0;
+        assert!(call(&mut m, helper, 0, &bad).is_err());
+        let fault = &m.sys.latest_cpu_fault.as_ref().unwrap().fault;
+        assert_eq!(
+            fault.pc,
+            HELPERS
+                + helpers()
+                    .iter()
+                    .take(helper)
+                    .map(|h| h.2.len() as u32)
+                    .sum::<u32>()
+        );
+        assert_eq!(fault.kind, adv_cpu::backend::FaultKind::Write(0));
+        assert_eq!(super::super::declines(&m.ext), 0);
+    }
+}
+
+// spec: NAT-BODY-14, NAT-BODY-16
+#[test]
+fn tvpgl_signed_address_traversal_matches_its_code() {
+    let mut machines = [machine(true), machine(false)];
+    let helper = index("kirikiri2!TVPPsAlphaBlend");
+    for m in &mut machines {
+        m.cpu.map(0x7ffff000, 0x1000, Prot::RW).unwrap();
+        m.cpu.write(0x7ffff000, &vec![0x71; 0x1000]).unwrap();
+    }
+    let mut rng = Rng(0x3290bafe);
+    for (src, len) in [(0x7ffffff8, 4), (0x7fffffe4, 12), (0x7fffffe8, 6)] {
+        let pixels = pixels(&mut rng);
+        check_buffer(&mut machines, helper, &pixels, &[BUF, src, len], false);
+    }
+    assert_eq!(super::super::declines(&machines[0].ext), 0);
 }

@@ -1,250 +1,215 @@
-//! Wine 11's DIB primitives, with the pinned Unix module's layouts.
-//! Work stays in host snapshots of the rows touched until every access
-//! succeeds. Overlapping surfaces share a snapshot, preserving Wine's
-//! traversal and aliasing.
+//! Wine 11 DIB primitives over checked, directly accessible guest spans.
 
-use adv_cpu::backend::{Guest, Prot, Reg};
-use adv_machine::{Conv, Env, Outcome, Sys};
-
+use adv_cpu::body::{EAX, EDX, Input, Mem, Ret, Stop};
+use adv_machine::Conv;
 #[path = "dib_layout.rs"]
 mod layout;
 use layout::{dib as d, *};
 
-macro_rules! handler {
-    (halftone) => {
-        resume_halftone
-    };
-    ($body:ident) => {
-        super::resume_original
-    };
+struct Access<'a, M: Mem> {
+    mem: &'a mut M,
+    stop: Option<Stop>,
 }
-macro_rules! bodies {
-    ($( $body:ident, $argc:literal => [$($name:literal),*]; )*) => {
-        pub(super) const BODIES: &[super::Body] = &[$($(
-            super::Body {
-                name: std::borrow::Cow::Borrowed(concat!("win32u.so!", $name)),
-                conv: Conv::Cdecl { argc: $argc },
-                body: Some($body),
-                handler: handler!($body),
-                direct: None,
-            },
-        )*)*];
-    };
+impl<M: Mem> Access<'_, M> {
+    fn input(&mut self, at: u32, len: u32) -> Option<*const u8> {
+        match self.mem.input(at, len) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                self.stop = Some(e);
+                None
+            }
+        }
+    }
+    fn read(&mut self, at: u32, bytes: &mut [u8]) -> Result<(), ()> {
+        let p = self.input(at, bytes.len() as u32).ok_or(())?;
+        // SAFETY: input checked the complete argument.
+        unsafe {
+            std::ptr::copy_nonoverlapping(p, bytes.as_mut_ptr(), bytes.len());
+        }
+        Ok(())
+    }
 }
-bodies! {
-    solid_rects, 5 => ["solid_rects_32", "solid_rects_24", "solid_rects_16"];
-    solid_line, 5 => ["solid_line_32", "solid_line_24", "solid_line_16"];
-    pattern_rects, 6 => ["pattern_rects_32", "pattern_rects_24", "pattern_rects_16"];
-    copy_rect, 6 => ["copy_rect_32", "copy_rect_24", "copy_rect_16"];
-    blend_rects, 6 => ["blend_rects_8888", "blend_rects_32", "blend_rects_24", "blend_rects_555", "blend_rects_16"];
-    gradient_rect, 4 => ["gradient_rect_8888", "gradient_rect_32", "gradient_rect_24", "gradient_rect_555", "gradient_rect_16"];
-    mask_rect, 5 => ["mask_rect_32", "mask_rect_24", "mask_rect_16"];
-    draw_glyph, 6 => ["draw_glyph_8888", "draw_glyph_32", "draw_glyph_24", "draw_glyph_555", "draw_glyph_16"];
-    draw_subpixel_glyph, 6 => ["draw_subpixel_glyph_8888", "draw_subpixel_glyph_32", "draw_subpixel_glyph_24", "draw_subpixel_glyph_555", "draw_subpixel_glyph_16"];
-    stretch_row, 7 => ["stretch_row_32", "stretch_row_24", "stretch_row_16"];
-    shrink_row, 7 => ["shrink_row_32", "shrink_row_24", "shrink_row_16"];
-    convert_to, 4 => ["convert_to_8888", "convert_to_32", "convert_to_24", "convert_to_555", "convert_to_16", "convert_to_8", "convert_to_4", "convert_to_1"];
-    halftone, 5 => ["halftone_888", "halftone_32", "halftone_24", "halftone_555", "halftone_16"];
+struct Args<'a, M: Mem> {
+    cpu: Access<'a, M>,
+    args: [u32; 7],
+    base: u32,
 }
-
 fn word(bytes: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
 }
 fn short(bytes: &[u8], at: usize) -> u32 {
     u32::from(u16::from_le_bytes(bytes[at..at + 2].try_into().unwrap()))
 }
-fn read_into(cpu: &dyn Guest, at: u32, bytes: &mut [u8]) -> Option<()> {
-    if !cpu.accessible(at, u32::try_from(bytes.len()).ok()?, Prot::READ) {
-        return None;
-    }
+fn read_into(cpu: &mut Access<'_, impl Mem>, at: u32, bytes: &mut [u8]) -> Option<()> {
     cpu.read(at, bytes).ok()
 }
-fn read(cpu: &dyn Guest, at: u32, len: usize) -> Option<Vec<u8>> {
-    if !cpu.accessible(at, u32::try_from(len).ok()?, Prot::READ) {
-        return None;
-    }
-    let mut bytes = vec![0; len];
-    cpu.read(at, &mut bytes).ok()?;
-    Some(bytes)
-}
-fn module(env: &Env<'_>) -> Option<u32> {
-    env.ext
-        .try_get::<crate::identity::Images>()?
-        .0
-        .values()
-        .find(|m| m.name == "win32u.so")
-        .map(|m| m.base)
+fn read<'a>(cpu: &mut Access<'_, impl Mem>, at: u32, len: usize) -> Option<&'a [u8]> {
+    let p = cpu.input(at, len as u32)?;
+    // SAFETY: the range remains live until the body returns.
+    Some(unsafe { std::slice::from_raw_parts(p, len) })
 }
 
+#[derive(Clone, Copy)]
 struct Region {
     base: u32,
-    bytes: Vec<u8>,
-    dirty: std::ops::Range<usize>,
+    len: u32,
+    write: bool,
+    pointer: *mut u8,
 }
-#[derive(Default)]
-struct Buffers {
-    regions: Vec<Region>,
-    spare: Vec<Vec<u8>>,
-    colors: Vec<u32>,
-    lookup: Vec<u16>,
+struct Memory<'a, 'b, M: Mem> {
+    cpu: &'a mut Access<'b, M>,
+    regions: [Region; 3],
+    count: usize,
+    prepared: bool,
 }
-struct Memory<'a> {
-    cpu: &'a mut dyn Guest,
-    pool: &'a mut Buffers,
-}
-impl Drop for Memory<'_> {
-    fn drop(&mut self) {
-        for r in self.pool.regions.drain(..) {
-            self.pool.spare.push(r.bytes);
+impl<'a, 'b, M: Mem> Memory<'a, 'b, M> {
+    fn new(cpu: &'a mut Access<'b, M>) -> Self {
+        Self {
+            cpu,
+            regions: [Region {
+                base: 0,
+                len: 0,
+                write: false,
+                pointer: std::ptr::null_mut(),
+            }; 3],
+            count: 0,
+            prepared: false,
         }
     }
-}
-impl Memory<'_> {
-    fn load(&mut self, base: u32, len: u32, writable: bool) -> Option<()> {
-        self.region(base, len, writable, true)
-    }
-    fn region(&mut self, base: u32, len: u32, writable: bool, snapshot: bool) -> Option<()> {
-        base.checked_add(len)?;
-        if !self
-            .cpu
-            .accessible(base, len, if writable { Prot::RW } else { Prot::READ })
-        {
-            return None;
-        }
-        if self.get(base, len as usize).is_some() {
-            return Some(());
-        }
-        let mut start = base;
-        let mut end = base + len;
-        for r in &self.pool.regions {
-            if start < r.base + r.bytes.len() as u32 && r.base < end {
-                start = start.min(r.base);
-                end = end.max(r.base + r.bytes.len() as u32);
-            }
-        }
-        let len = (end - start) as usize;
-        let index = self.pool.spare.iter().position(|b| b.capacity() >= len);
-        let mut bytes = index
-            .map(|i| self.pool.spare.swap_remove(i))
-            .unwrap_or_default();
-        bytes.resize(len, 0);
-        if snapshot {
-            read_into(self.cpu, start, &mut bytes)?;
-        }
-        let mut dirty = bytes.len()..0;
-        self.pool.regions.retain_mut(|r| {
-            if start <= r.base && r.base + r.bytes.len() as u32 <= end {
-                let offset = (r.base - start) as usize;
-                bytes[offset..offset + r.bytes.len()].copy_from_slice(&r.bytes);
-                if !r.dirty.is_empty() {
-                    dirty.start = dirty.start.min(offset + r.dirty.start);
-                    dirty.end = dirty.end.max(offset + r.dirty.end);
-                }
-                self.pool.spare.push(std::mem::take(&mut r.bytes));
-                false
-            } else {
-                true
-            }
-        });
-        self.pool.regions.push(Region {
-            base: start,
-            bytes,
-            dirty,
-        });
+    fn load(&mut self, base: u32, len: u32, write: bool) -> Option<()> {
+        self.regions[self.count] = Region {
+            base,
+            len,
+            write,
+            pointer: std::ptr::null_mut(),
+        };
+        self.count += 1;
         Some(())
     }
-    fn get(&self, at: u32, len: usize) -> Option<&[u8]> {
-        self.pool.regions.iter().find_map(|r| {
-            let offset = at.checked_sub(r.base)? as usize;
-            r.bytes.get(offset..offset.checked_add(len)?)
-        })
+    fn prepare(&mut self) -> Option<()> {
+        if !self.prepared {
+            let spans = self.regions.map(|r| (r.base, r.len, r.write));
+            match self.cpu.mem.spans(spans) {
+                Ok(pointers) => {
+                    for (r, p) in self.regions.iter_mut().zip(pointers) {
+                        r.pointer = p;
+                    }
+                }
+                Err(e) => {
+                    self.cpu.stop = Some(e);
+                    return None;
+                }
+            }
+            self.prepared = true;
+        }
+        Some(())
     }
-    fn get_mut(&mut self, at: u32, len: usize) -> Option<&mut [u8]> {
-        for r in &mut self.pool.regions {
-            if let Some(offset) = at.checked_sub(r.base).map(|n| n as usize)
-                && let Some(end) = offset.checked_add(len)
-                && end <= r.bytes.len()
-            {
-                r.dirty.start = r.dirty.start.min(offset);
-                r.dirty.end = r.dirty.end.max(end);
-                return r.bytes.get_mut(offset..end);
+    fn pointer(&mut self, at: u32, len: usize) -> Option<*mut u8> {
+        self.prepare()?;
+        for r in &self.regions[..self.count] {
+            if at >= r.base && u64::from(at) + len as u64 <= u64::from(r.base) + u64::from(r.len) {
+                return Some(r.pointer.wrapping_add((at - r.base) as usize));
             }
         }
+        self.cpu.stop = Some(Stop::Fault {
+            address: at,
+            write: true,
+        });
         None
     }
-    fn pixel(&self, at: u32, bytes: usize) -> Option<u32> {
-        let data = self.get(at, bytes)?;
-        let mut value = [0; 4];
-        value[..bytes].copy_from_slice(data);
-        Some(u32::from_le_bytes(value))
+    fn get_mut(&mut self, at: u32, len: usize) -> Option<&mut [u8]> {
+        let p = self.pointer(at, len)?;
+        // SAFETY: the complete row is checked, and callers use disjoint slices.
+        Some(unsafe { std::slice::from_raw_parts_mut(p, len) })
     }
-    fn put(&mut self, at: u32, bytes: usize, value: u32) -> Option<()> {
-        self.get_mut(at, bytes)?
-            .copy_from_slice(&value.to_le_bytes()[..bytes]);
+    fn pixel(&mut self, at: u32, size: usize) -> Option<u32> {
+        let p = self.pointer(at, size)?;
+        let mut bytes = [0; 4];
+        // SAFETY: pointer checked this pixel. Reads precede writes for aliases.
+        unsafe {
+            std::ptr::copy_nonoverlapping(p, bytes.as_mut_ptr(), size);
+        }
+        Some(u32::from_le_bytes(bytes))
+    }
+    fn put(&mut self, at: u32, size: usize, value: u32) -> Option<()> {
+        let p = self.pointer(at, size)?;
+        // SAFETY: pointer checked this pixel.
+        unsafe {
+            std::ptr::copy_nonoverlapping(value.to_le_bytes().as_ptr(), p, size);
+        }
         Some(())
     }
     fn copy(&mut self, src: u32, dst: u32, len: usize) -> Option<()> {
-        let (si, so) = self.locate(src, len)?;
-        let (di, offset) = self.locate(dst, len)?;
-        if si == di {
-            self.get_mut(dst, len)?;
-            self.pool.regions[si]
-                .bytes
-                .copy_within(so..so + len, offset);
-        } else {
-            let (source, target) = self.pair(src, len, dst, len)?;
-            target.copy_from_slice(source);
+        let s = self.pointer(src, len)?;
+        let d = self.pointer(dst, len)?;
+        // SAFETY: both spans are checked; Wine uses memmove for row copies.
+        unsafe {
+            std::ptr::copy(s, d, len);
         }
         Some(())
     }
-    fn locate(&self, at: u32, len: usize) -> Option<(usize, usize)> {
-        self.pool.regions.iter().enumerate().find_map(|(i, r)| {
-            let offset = at.checked_sub(r.base)? as usize;
-            r.bytes.get(offset..offset.checked_add(len)?)?;
-            Some((i, offset))
+    fn pair(&mut self, src: u32, slen: usize, dst: u32, dlen: usize) -> Option<(&[u8], &mut [u8])> {
+        let s = self.pointer(src, slen)?;
+        let d = self.pointer(dst, dlen)?;
+        // SAFETY: callers establish disjoint row ranges before forming slices.
+        Some(unsafe {
+            (
+                std::slice::from_raw_parts(s, slen),
+                std::slice::from_raw_parts_mut(d, dlen),
+            )
         })
     }
-    fn pair(&mut self, src: u32, slen: usize, dst: u32, dlen: usize) -> Option<(&[u8], &mut [u8])> {
-        let (si, so) = self.locate(src, slen)?;
-        let (di, offset) = self.locate(dst, dlen)?;
-        self.get_mut(dst, dlen)?;
-        if si == di {
-            let bytes = &mut self.pool.regions[si].bytes;
-            if so + slen <= offset {
-                let (a, b) = bytes.split_at_mut(offset);
-                Some((&a[so..so + slen], &mut b[..dlen]))
-            } else {
-                let (a, b) = bytes.split_at_mut(so);
-                Some((&b[..slen], &mut a[offset..offset + dlen]))
+    fn commit(mut self) -> Option<u64> {
+        self.prepare()?;
+        match self.cpu.mem.commit() {
+            Ok(()) => Some(0),
+            Err(e) => {
+                self.cpu.stop = Some(e);
+                None
             }
-        } else {
-            let [a, b] = self.pool.regions.get_disjoint_mut([si, di]).ok()?;
-            Some((&a.bytes[so..so + slen], &mut b.bytes[offset..offset + dlen]))
         }
     }
-    fn commit(self) -> Option<u64> {
-        // A merged source may extend beyond a destination; check only the
-        // dirty interval before committing any region.
-        for r in &self.pool.regions {
-            if !r.dirty.is_empty()
-                && !self.cpu.accessible(
-                    r.base + r.dirty.start as u32,
-                    r.dirty.len() as u32,
-                    Prot::WRITE,
-                )
-            {
-                return None;
+}
+macro_rules! bodies {
+    ($( $body:ident, $direct:ident, $argc:literal => [$($name:literal),*]; )*) => {
+        mod direct {
+            use super::*;
+            $(fn $body<M: Mem>(mem: &mut M, args: [u32; 7]) -> Result<Ret, Stop> {
+                let mut env = Args { cpu: Access { mem, stop: None }, args, base: if $argc < 7 { args[6] } else { 0 } };
+                match super::$body(&mut env) {
+                    Some(value) => Ok(value.into()),
+                    None => Err(env.cpu.stop.unwrap_or(Stop::DivideByZero)),
+                }
             }
+            adv_cpu::body!(pub(super) $direct = $body, inputs: &{
+                let mut inputs = [Input::Const(0); 7];
+                let mut i = 0; while i < $argc { inputs[i] = Input::Stack(i as u8); i += 1; }
+                inputs
+            }, outputs: EAX | EDX, pop: 0);)*
         }
-        for r in &self.pool.regions {
-            if !r.dirty.is_empty() {
-                self.cpu
-                    .write(r.base + r.dirty.start as u32, &r.bytes[r.dirty.clone()])
-                    .ok()?;
-            }
-        }
-        Some(0)
-    }
+        pub(super) const BODIES: &[super::Body] = &[$($(
+            super::Body {
+                name: std::borrow::Cow::Borrowed(concat!("win32u.so!", $name)),
+                conv: Conv::Cdecl { argc: $argc }, body: None,
+                handler: super::resume_original, direct: Some(direct::$direct),
+            },
+        )*)*];
+    };
+}
+bodies! {
+    solid_rects, SOLID_RECTS, 5 => ["solid_rects_32", "solid_rects_24", "solid_rects_16"];
+    solid_line, SOLID_LINE, 5 => ["solid_line_32", "solid_line_24", "solid_line_16"];
+    pattern_rects, PATTERN_RECTS, 6 => ["pattern_rects_32", "pattern_rects_24", "pattern_rects_16"];
+    copy_rect, COPY_RECT, 6 => ["copy_rect_32", "copy_rect_24", "copy_rect_16"];
+    blend_rects, BLEND_RECTS, 6 => ["blend_rects_8888", "blend_rects_32", "blend_rects_24", "blend_rects_555", "blend_rects_16"];
+    gradient_rect, GRADIENT_RECT, 4 => ["gradient_rect_8888", "gradient_rect_32", "gradient_rect_24", "gradient_rect_555", "gradient_rect_16"];
+    mask_rect, MASK_RECT, 5 => ["mask_rect_32", "mask_rect_24", "mask_rect_16"];
+    draw_glyph, DRAW_GLYPH, 6 => ["draw_glyph_8888", "draw_glyph_32", "draw_glyph_24", "draw_glyph_555", "draw_glyph_16"];
+    draw_subpixel_glyph, DRAW_SUBPIXEL_GLYPH, 6 => ["draw_subpixel_glyph_8888", "draw_subpixel_glyph_32", "draw_subpixel_glyph_24", "draw_subpixel_glyph_555", "draw_subpixel_glyph_16"];
+    stretch_row, STRETCH_ROW, 7 => ["stretch_row_32", "stretch_row_24", "stretch_row_16"];
+    shrink_row, SHRINK_ROW, 7 => ["shrink_row_32", "shrink_row_24", "shrink_row_16"];
+    convert_to, CONVERT_TO, 4 => ["convert_to_8888", "convert_to_32", "convert_to_24", "convert_to_555", "convert_to_16", "convert_to_8", "convert_to_4", "convert_to_1"];
+    halftone, HALFTONE, 4 => ["halftone_888", "halftone_32", "halftone_24", "halftone_555", "halftone_16"];
 }
 
 #[derive(Clone)]
@@ -265,7 +230,7 @@ struct Dib {
     color_count: u32,
 }
 impl Dib {
-    fn read(cpu: &dyn Guest, at: u32, base: u32) -> Option<Self> {
+    fn read(cpu: &mut Access<'_, impl Mem>, at: u32, base: u32) -> Option<Self> {
         let mut bytes = [0; d::SIZE];
         read_into(cpu, at, &mut bytes)?;
         let kind = word(&bytes, d::funcs).wrapping_sub(base);
@@ -298,13 +263,6 @@ impl Dib {
             color_count: word(&bytes, d::color_table_size),
         })
     }
-    fn supported(&self) -> Option<()> {
-        matches!(
-            self.kind,
-            FUNCS_8888 | FUNCS_32 | FUNCS_24 | FUNCS_555 | FUNCS_16
-        )
-        .then_some(())
-    }
     fn size(&self) -> usize {
         self.bpp.div_ceil(8) as usize
     }
@@ -319,83 +277,98 @@ impl Dib {
             )
     }
     fn row_bytes(&self) -> Option<u32> {
-        u32::try_from(self.width)
-            .ok()?
-            .checked_mul(self.bpp)?
-            .div_ceil(32)
-            .checked_mul(4)
+        Some(
+            (self.width as u32)
+                .wrapping_mul(self.bpp)
+                .div_ceil(32)
+                .wrapping_mul(4),
+        )
     }
-    fn bounds(&self) -> Option<(u32, u32)> {
-        let rows = u32::try_from(self.height.checked_sub(1)?).ok()?;
-        let stride = self.stride.unsigned_abs();
-        let len = rows.checked_mul(stride)?.checked_add(self.row_bytes()?)?;
-        let base = if self.stride < 0 {
-            self.bits.checked_sub(rows.checked_mul(stride)?)?
-        } else {
-            self.bits
-        };
-        Some((base, len))
+    fn load(&self, mem: &mut Memory<'_, '_, impl Mem>, writable: bool) -> Option<()> {
+        self.load_rows(mem, writable, 0..self.height)
     }
-    fn load(&self, mem: &mut Memory<'_>, writable: bool) -> Option<()> {
-        let (base, len) = self.bounds()?;
-        mem.load(base, len, writable)
-    }
-    fn contains(&self, at: u32, len: u32) -> Option<()> {
-        let (base, size) = self.bounds()?;
-        (at >= base && at.checked_add(len)? <= base.checked_add(size)?).then_some(())
-    }
-    // Output rows need no old bytes. Keep stride gaps and halftone padding
-    // outside these regions, and retain the surface's original access bounds.
-    fn output_rows(&self, mem: &mut Memory<'_>, rows: i32, len: u32) -> Option<()> {
-        if rows > 0 {
-            let (base, len) = self.rows(0..rows)?;
-            if !mem.cpu.accessible(base, len, Prot::RW) {
-                return None;
-            }
+    fn output_rows(&self, mem: &mut Memory<'_, '_, impl Mem>, rows: i32, len: u32) -> Option<()> {
+        if rows <= 0 {
+            return Some(());
         }
-        let mut y = 0;
-        while y < rows {
-            let n = if self.stride.unsigned_abs() == len {
-                rows - y
-            } else {
-                1
-            };
-            let at = self.at(0, if self.stride < 0 { y + n - 1 } else { y });
-            let count = len.checked_mul(n as u32)?;
-            self.contains(at, count)?;
-            mem.region(at, count, true, false)?;
-            y += n;
-        }
-        Some(())
+        let at = self.at(0, if self.stride < 0 { rows - 1 } else { 0 });
+        mem.load(
+            at,
+            (rows as u32 - 1)
+                .wrapping_mul(self.stride.unsigned_abs())
+                .wrapping_add(len),
+            true,
+        )
     }
-    /// Snapshots only the rows `rows` of the clip rect touches, or the whole
-    /// surface when they leave it, so stray accesses still decline.
+    fn load_rect(
+        &self,
+        mem: &mut Memory<'_, '_, impl Mem>,
+        writable: bool,
+        [l, t, r, b]: [i32; 4],
+    ) -> Option<()> {
+        if l >= r || t >= b {
+            return Some(());
+        }
+        let at = self.at(l, if self.stride < 0 { b - 1 } else { t });
+        let bytes = (((self.left + r) as u32).wrapping_mul(self.bpp).div_ceil(8))
+            .wrapping_sub(((self.left + l) as u32).wrapping_mul(self.bpp) / 8);
+        let len = ((b - t - 1) as u32)
+            .wrapping_mul(self.stride.unsigned_abs())
+            .wrapping_add(bytes);
+        mem.load(at, len, writable)
+    }
+    fn load_rects(
+        &self,
+        mem: &mut Memory<'_, '_, impl Mem>,
+        writable: bool,
+        rects: Rects,
+        sx: i32,
+        sy: i32,
+    ) -> Option<()> {
+        let bounds = rects.iter().filter(|r| r[0] < r[2] && r[1] < r[3]).fold(
+            [i32::MAX, i32::MAX, i32::MIN, i32::MIN],
+            |a, b| {
+                [
+                    a[0].min(b[0]),
+                    a[1].min(b[1]),
+                    a[2].max(b[2]),
+                    a[3].max(b[3]),
+                ]
+            },
+        );
+        self.load_rect(
+            mem,
+            writable,
+            [
+                bounds[0].wrapping_add(sx),
+                bounds[1].wrapping_add(sy),
+                bounds[2].wrapping_add(sx),
+                bounds[3].wrapping_add(sy),
+            ],
+        )
+    }
     fn load_rows(
         &self,
-        mem: &mut Memory<'_>,
+        mem: &mut Memory<'_, '_, impl Mem>,
         writable: bool,
         rows: std::ops::Range<i32>,
     ) -> Option<()> {
         if rows.is_empty() {
             return Some(());
         }
-        let (base, len) = self.rows(rows)?;
-        mem.load(base, len, writable)
-    }
-    fn rows(&self, rows: std::ops::Range<i32>) -> Option<(u32, u32)> {
-        let first = self.top.checked_add(rows.start)?;
-        let last = self.top.checked_add(rows.end - 1)?;
-        if first < 0 || last >= self.height {
-            return self.bounds();
-        }
-        let len = ((last - first) as u32)
-            .checked_mul(self.stride.unsigned_abs())?
-            .checked_add(self.row_bytes()?)?;
-        let lowest = if self.stride < 0 { last } else { first };
-        let base = self
-            .bits
-            .wrapping_add(lowest.wrapping_mul(self.stride) as u32);
-        Some((base, len))
+        let at = self.bits.wrapping_add(
+            (self.top
+                + if self.stride < 0 {
+                    rows.end - 1
+                } else {
+                    rows.start
+                })
+            .wrapping_mul(self.stride) as u32,
+        );
+        let len = ((rows.end - rows.start - 1) as u32)
+            .wrapping_mul(self.stride.unsigned_abs())
+            .wrapping_add(self.row_bytes()?);
+        mem.load(at, len, writable)
     }
     fn rgb(&self, pixel: u32) -> [u32; 3] {
         if self.kind == FUNCS_8888 || self.kind == FUNCS_24 {
@@ -421,7 +394,12 @@ impl Dib {
             })
         }
     }
-    fn palette(&self, cpu: &dyn Guest, base: u32, colors: &mut Vec<u32>) -> Option<()> {
+    fn palette(
+        &self,
+        cpu: &mut Access<'_, impl Mem>,
+        base: u32,
+        colors: &mut [u32; 256],
+    ) -> Option<usize> {
         let (at, count) = if self.colors != 0 {
             (self.colors, self.color_count)
         } else {
@@ -429,61 +407,21 @@ impl Dib {
                 base + match self.bpp {
                     1 => TABLE_1,
                     4 => TABLE_4,
-                    8 => TABLE_8,
-                    _ => return None,
+                    _ => TABLE_8,
                 },
                 1 << self.bpp,
             )
         };
-        let len = count.checked_mul(rgb::SIZE as u32)?;
-        if !cpu.accessible(at, len, Prot::READ) {
-            return None;
-        }
-        colors.resize(count as usize, 0);
-        for (i, color) in colors.iter_mut().enumerate() {
-            let mut bytes = [0; rgb::SIZE];
-            cpu.read(at + (i * rgb::SIZE) as u32, &mut bytes).ok()?;
+        for (i, color) in colors[..count as usize].iter_mut().enumerate() {
+            let mut bytes = [0; 4];
+            cpu.read(at.wrapping_add(i as u32 * 4), &mut bytes).ok()?;
             *color = word(&bytes, 0);
         }
-        Some(())
+        Some(count as usize)
     }
 }
-fn destination(env: &Env<'_>) -> Option<Dib> {
-    let dib = Dib::read(env.cpu, env.arg(0), module(env)?)?;
-    let name = &env.sys.thunks.get(env.thunk).name;
-    let (family, format) = name.rsplit_once('_')?;
-    let common = [
-        "solid_rects",
-        "solid_line",
-        "pattern_rects",
-        "copy_rect",
-        "mask_rect",
-        "stretch_row",
-        "shrink_row",
-    ]
-    .iter()
-    .any(|f| family.ends_with(f));
-    let valid = if common {
-        match format {
-            "32" => dib.bpp == 32 && matches!(dib.kind, FUNCS_8888 | FUNCS_32),
-            "24" => dib.bpp == 24 && dib.kind == FUNCS_24,
-            "16" => dib.bpp == 16 && matches!(dib.kind, FUNCS_555 | FUNCS_16),
-            _ => false,
-        }
-    } else {
-        match format {
-            "888" | "8888" => dib.bpp == 32 && dib.kind == FUNCS_8888,
-            "32" => dib.bpp == 32 && dib.kind == FUNCS_32,
-            "24" => dib.bpp == 24 && dib.kind == FUNCS_24,
-            "555" => dib.bpp == 16 && dib.kind == FUNCS_555,
-            "16" => dib.bpp == 16 && dib.kind == FUNCS_16,
-            "8" => dib.bpp == 8 && dib.kind == FUNCS_8,
-            "4" => dib.bpp == 4 && dib.kind == FUNCS_4,
-            "1" => dib.bpp == 1 && dib.kind == FUNCS_1,
-            _ => false,
-        }
-    };
-    valid.then_some(dib)
+fn destination(env: &mut Args<'_, impl Mem>) -> Option<Dib> {
+    Dib::read(&mut env.cpu, env.args[0], env.base)
 }
 
 fn field_mask(len: u32) -> u32 {
@@ -512,34 +450,35 @@ fn put_field(mut field: u32, shift: i32, len: u32) -> u32 {
         field.wrapping_shl(shift as u32)
     }
 }
-fn rects(cpu: &dyn Guest, at: u32, count: u32) -> Option<Vec<[i32; 4]>> {
-    let bytes = read(cpu, at, (count as i32).max(0) as usize * rect::SIZE)?;
-    Some(
-        bytes
-            .as_chunks::<{ rect::SIZE }>()
-            .0
-            .iter()
-            .map(|b| {
-                [
-                    word(b, rect::left) as i32,
-                    word(b, rect::top) as i32,
-                    word(b, rect::right) as i32,
-                    word(b, rect::bottom) as i32,
-                ]
+#[derive(Clone, Copy)]
+struct Rects {
+    bytes: *const u8,
+    count: usize,
+}
+fn rects(cpu: &mut Access<'_, impl Mem>, at: u32, count: u32) -> Option<Rects> {
+    let count = (count as i32).max(0) as usize;
+    Some(Rects {
+        bytes: cpu.input(at, (count * rect::SIZE) as u32)?,
+        count,
+    })
+}
+impl Rects {
+    fn get(self, i: usize) -> [i32; 4] {
+        // SAFETY: rects checked every rectangle before any writes.
+        unsafe {
+            std::array::from_fn(|j| {
+                self.bytes
+                    .add(i * 16 + j * 4)
+                    .cast::<i32>()
+                    .read_unaligned()
             })
-            .collect(),
-    )
+        }
+    }
+    fn iter(self) -> impl Iterator<Item = [i32; 4]> + Clone {
+        (0..self.count).map(move |i| self.get(i))
+    }
 }
-/// The rows any of `rects` covers.
-fn span(rects: &[[i32; 4]]) -> std::ops::Range<i32> {
-    let rows = rects.iter().filter(|r| r[1] < r[3]);
-    let start = rows.clone().map(|r| r[1]).min().unwrap_or(0);
-    start..rows.map(|r| r[3]).max().unwrap_or(0)
-}
-fn shift(rows: &std::ops::Range<i32>, by: i32) -> Option<std::ops::Range<i32>> {
-    Some(rows.start.checked_add(by)?..rows.end.checked_add(by)?)
-}
-fn point(cpu: &dyn Guest, at: u32) -> Option<(i32, i32)> {
+fn point(cpu: &mut Access<'_, impl Mem>, at: u32) -> Option<(i32, i32)> {
     let mut b = [0; point::SIZE];
     read_into(cpu, at, &mut b)?;
     Some((word(&b, point::x) as i32, word(&b, point::y) as i32))
@@ -601,16 +540,16 @@ fn solid_row(bytes: &mut [u8], size: usize, and: u32, xor: u32) {
 }
 
 // spec: NAT-BODY-4
-fn solid_rects(env: &mut Env<'_>) -> Option<u64> {
+fn solid_rects(env: &mut Args<'_, impl Mem>) -> Option<u64> {
+    if env.args[1] as i32 <= 0 {
+        return Some(0);
+    }
     let dib = destination(env)?;
-    let rects = rects(env.cpu, env.arg(2), env.arg(1))?;
-    let (and, xor) = (env.arg(3), env.arg(4));
-    let mut mem = Memory {
-        cpu: env.cpu,
-        pool: env.ext.get_or_default::<Buffers>(),
-    };
-    dib.load_rows(&mut mem, true, span(&rects))?;
-    for [l, t, r, b] in rects {
+    let rects = rects(&mut env.cpu, env.args[2], env.args[1])?;
+    let (and, xor) = (env.args[3], env.args[4]);
+    let mut mem = Memory::new(&mut env.cpu);
+    dib.load_rects(&mut mem, true, rects, 0, 0)?;
+    for [l, t, r, b] in rects.iter() {
         let len = usize::try_from(r.checked_sub(l)?)
             .ok()?
             .checked_mul(dib.size())?;
@@ -621,17 +560,14 @@ fn solid_rects(env: &mut Env<'_>) -> Option<u64> {
     mem.commit()
 }
 
-fn solid_line(env: &mut Env<'_>) -> Option<u64> {
+fn solid_line(env: &mut Args<'_, impl Mem>) -> Option<u64> {
     let dib = destination(env)?;
-    let (mut x, mut y) = point(env.cpu, env.arg(1))?;
+    let (mut x, mut y) = point(&mut env.cpu, env.args[1])?;
     let mut p = [0; line::SIZE];
-    read_into(env.cpu, env.arg(2), &mut p)?;
+    read_into(&mut env.cpu, env.args[2], &mut p)?;
     let mut err = word(&p, line::err_start) as i32;
-    let (and, xor) = (env.arg(3), env.arg(4));
-    let mut mem = Memory {
-        cpu: env.cpu,
-        pool: env.ext.get_or_default::<Buffers>(),
-    };
+    let (and, xor) = (env.args[3], env.args[4]);
+    let mut mem = Memory::new(&mut env.cpu);
     let (mut ey, mut e, mut low, mut high) = (y, err, y, y);
     for _ in 1..word(&p, line::length) {
         let minor = e.wrapping_add(word(&p, line::bias) as i32) > 0;
@@ -676,22 +612,22 @@ fn solid_line(env: &mut Env<'_>) -> Option<u64> {
     mem.commit()
 }
 
-fn pattern_rects(env: &mut Env<'_>) -> Option<u64> {
-    let base = module(env)?;
+fn pattern_rects(env: &mut Args<'_, impl Mem>) -> Option<u64> {
+    if env.args[1] as i32 <= 0 {
+        return Some(0);
+    }
+    let base = env.base;
     let dib = destination(env)?;
-    let rects = rects(env.cpu, env.arg(2), env.arg(1))?;
-    let origin = point(env.cpu, env.arg(3))?;
-    let brush = Dib::read(env.cpu, env.arg(4), base)?;
-    let masks = read(env.cpu, env.arg(5), masks::SIZE)?;
-    let (and, xor) = (word(&masks, masks::and_), word(&masks, masks::xor_));
-    if brush.width <= 0 || brush.height <= 0 {
+    let rects = rects(&mut env.cpu, env.args[2], env.args[1])?;
+    let origin = point(&mut env.cpu, env.args[3])?;
+    let brush = Dib::read(&mut env.cpu, env.args[4], base)?;
+    let masks = read(&mut env.cpu, env.args[5], masks::SIZE)?;
+    let (and, xor) = (word(masks, masks::and_), word(masks, masks::xor_));
+    if brush.width == 0 || brush.height == 0 {
         return None;
     }
-    let mut mem = Memory {
-        cpu: env.cpu,
-        pool: env.ext.get_or_default::<Buffers>(),
-    };
-    dib.load_rows(&mut mem, true, span(&rects))?;
+    let mut mem = Memory::new(&mut env.cpu);
+    dib.load_rects(&mut mem, true, rects, 0, 0)?;
     let mut mask = brush.clone();
     mask.left = 0;
     mask.top = 0;
@@ -702,9 +638,20 @@ fn pattern_rects(env: &mut Env<'_>) -> Option<u64> {
         mask.bits = and;
         mask.load(&mut mem, false)?;
     }
-    for [l, t, r, b] in rects {
+    for [l, t, r, b] in rects.iter() {
         for y in t..b {
             let by = (y - origin.1).rem_euclid(brush.height);
+            if and == 0 {
+                let mut x = l;
+                while x < r {
+                    let bx = (x - origin.0).rem_euclid(brush.width);
+                    let n = (r - x).min(brush.width - bx);
+                    let sa = xor.wrapping_add((by * brush.stride + bx * dib.size() as i32) as u32);
+                    mem.copy(sa, dib.at(x, y), n as usize * dib.size())?;
+                    x += n;
+                }
+                continue;
+            }
             for x in l..r {
                 let bx = (x - origin.0).rem_euclid(brush.width);
                 let offset = by
@@ -726,19 +673,20 @@ fn pattern_rects(env: &mut Env<'_>) -> Option<u64> {
     mem.commit()
 }
 
-fn copy_rect(env: &mut Env<'_>) -> Option<u64> {
-    let base = module(env)?;
+fn copy_rect(env: &mut Args<'_, impl Mem>) -> Option<u64> {
+    let base = env.base;
     let dst = destination(env)?;
-    let src = Dib::read(env.cpu, env.arg(2), base)?;
-    let [l, t, r, b] = rects(env.cpu, env.arg(1), 1)?[0];
-    let (sx, sy) = point(env.cpu, env.arg(3))?;
-    let (code, overlap) = (env.arg(4), env.arg(5));
-    let mut mem = Memory {
-        cpu: env.cpu,
-        pool: env.ext.get_or_default::<Buffers>(),
-    };
-    dst.load_rows(&mut mem, true, t..b)?;
-    src.load_rows(&mut mem, false, shift(&(0..b.wrapping_sub(t)), sy)?)?;
+    let src = Dib::read(&mut env.cpu, env.args[2], base)?;
+    let [l, t, r, b] = rects(&mut env.cpu, env.args[1], 1)?.get(0);
+    let (sx, sy) = point(&mut env.cpu, env.args[3])?;
+    let (code, overlap) = (env.args[4], env.args[5]);
+    let mut mem = Memory::new(&mut env.cpu);
+    dst.load_rect(&mut mem, true, [l, t, r, b])?;
+    src.load_rect(
+        &mut mem,
+        false,
+        [sx, sy, sx.wrapping_add(r - l), sy.wrapping_add(b - t)],
+    )?;
     for row in 0..b - t {
         let row = if overlap & 8 != 0 {
             b - t - row - 1
@@ -749,8 +697,7 @@ fn copy_rect(env: &mut Env<'_>) -> Option<u64> {
         let sa = src.at(sx, sy + row);
         let len = usize::try_from(r - l).ok()? * dst.size();
         if code == 13 {
-            let data = mem.get(sa, len)?.to_vec();
-            mem.get_mut(da, len)?.copy_from_slice(&data);
+            mem.copy(sa, da, len)?;
         } else {
             // Wine's 24-bit path performs ROPs byte by byte, including reverse copies.
             let size = if dst.bpp == 24 { 1 } else { dst.size() };
@@ -885,23 +832,22 @@ fn blend_8888_row(dst: &mut [u8], src: &[u8], alpha: u32, source_alpha: bool, co
     }
 }
 
-fn blend_rects(env: &mut Env<'_>) -> Option<u64> {
-    let base = module(env)?;
+fn blend_rects(env: &mut Args<'_, impl Mem>) -> Option<u64> {
+    if env.args[1] as i32 <= 0 {
+        return Some(0);
+    }
+    let base = env.base;
     let dst = destination(env)?;
-    let src = Dib::read(env.cpu, env.arg(3), base)?;
-    let rects = rects(env.cpu, env.arg(2), env.arg(1))?;
-    let (sx, sy) = point(env.cpu, env.arg(4))?;
-    let blend = env.arg(5).to_le_bytes();
+    let src = Dib::read(&mut env.cpu, env.args[3], base)?;
+    let rects = rects(&mut env.cpu, env.args[2], env.args[1])?;
+    let (sx, sy) = point(&mut env.cpu, env.args[4])?;
+    let blend = env.args[5].to_le_bytes();
     let alpha = u32::from(blend[blend::SourceConstantAlpha]);
     let src_alpha = blend[blend::AlphaFormat] & 1 != 0;
-    let mut mem = Memory {
-        cpu: env.cpu,
-        pool: env.ext.get_or_default::<Buffers>(),
-    };
-    let rows = span(&rects);
-    dst.load_rows(&mut mem, true, rows.clone())?;
-    src.load_rows(&mut mem, false, shift(&rows, sy)?)?;
-    for [l, t, r, b] in rects {
+    let mut mem = Memory::new(&mut env.cpu);
+    dst.load_rects(&mut mem, true, rects, 0, 0)?;
+    src.load_rects(&mut mem, false, rects, sx, sy)?;
+    for [l, t, r, b] in rects.iter() {
         for y in t..b {
             if dst.kind == FUNCS_8888 {
                 let da = dst.at(l, y);
@@ -910,14 +856,8 @@ fn blend_rects(env: &mut Env<'_>) -> Option<u64> {
                 if u64::from(da) + len as u64 <= u64::from(sa)
                     || u64::from(sa) + len as u64 <= u64::from(da)
                 {
-                    let source = mem.get(sa, len)?.to_vec();
-                    blend_8888_row(
-                        mem.get_mut(da, len)?,
-                        &source,
-                        alpha,
-                        src_alpha,
-                        src.compression,
-                    );
+                    let (source, target) = mem.pair(sa, len, da, len)?;
+                    blend_8888_row(target, source, alpha, src_alpha, src.compression);
                     continue;
                 }
             }
@@ -958,34 +898,29 @@ fn edge(y: i32, a: (i32, i32), b: (i32, i32)) -> Option<i32> {
     let (x, yy) = if b.0 > a.0 { b } else { a };
     Some(x + (y - yy).wrapping_mul(b.0 - a.0).checked_div(b.1 - a.1)?)
 }
-fn gradient_rect(env: &mut Env<'_>) -> Option<u64> {
+fn gradient_rect(env: &mut Args<'_, impl Mem>) -> Option<u64> {
     let dst = destination(env)?;
-    let [l, t, r, b] = rects(env.cpu, env.arg(1), 1)?[0];
-    let mode = env.arg(3);
-    let vertices = read(
-        env.cpu,
-        env.arg(2),
-        vertex::SIZE * if mode == 2 { 3 } else { 2 },
+    let [l, t, r, b] = rects(&mut env.cpu, env.args[1], 1)?.get(0);
+    let mode = env.args[3];
+    let mut vertices = [0; vertex::SIZE * 3];
+    read_into(
+        &mut env.cpu,
+        env.args[2],
+        &mut vertices[..vertex::SIZE * if mode == 2 { 3 } else { 2 }],
     )?;
-    let xy: Vec<_> = vertices
-        .as_chunks::<{ vertex::SIZE }>()
-        .0
-        .iter()
-        .map(|v| (word(v, vertex::x) as i32, word(v, vertex::y) as i32))
-        .collect();
-    let colors: Vec<[u32; 4]> = vertices
-        .as_chunks::<{ vertex::SIZE }>()
-        .0
-        .iter()
-        .map(|v| {
-            [
-                short(v, vertex::Red),
-                short(v, vertex::Green),
-                short(v, vertex::Blue),
-                short(v, vertex::Alpha),
-            ]
-        })
-        .collect();
+    let xy: [(i32, i32); 3] = std::array::from_fn(|i| {
+        let v = &vertices[i * vertex::SIZE..];
+        (word(v, vertex::x) as i32, word(v, vertex::y) as i32)
+    });
+    let colors: [[u32; 4]; 3] = std::array::from_fn(|i| {
+        let v = &vertices[i * vertex::SIZE..];
+        [
+            short(v, vertex::Red),
+            short(v, vertex::Green),
+            short(v, vertex::Blue),
+            short(v, vertex::Alpha),
+        ]
+    });
     let det = if mode == 2 {
         (xy[2].1 - xy[1].1)
             .wrapping_mul(xy[2].0 - xy[0].0)
@@ -996,11 +931,8 @@ fn gradient_rect(env: &mut Env<'_>) -> Option<u64> {
     if det == 0 {
         return Some(0);
     }
-    let mut mem = Memory {
-        cpu: env.cpu,
-        pool: env.ext.get_or_default::<Buffers>(),
-    };
-    dst.load_rows(&mut mem, true, t..b)?;
+    let mut mem = Memory::new(&mut env.cpu);
+    dst.load_rect(&mut mem, true, [l, t, r, b])?;
     for y in t..b {
         let (left, right) = if mode == 2 {
             let x1 = if y < xy[1].1 {
@@ -1077,29 +1009,25 @@ fn gradient_rect(env: &mut Env<'_>) -> Option<u64> {
     Some(1)
 }
 
-fn mask_rect(env: &mut Env<'_>) -> Option<u64> {
-    let base = module(env)?;
+fn mask_rect(env: &mut Args<'_, impl Mem>) -> Option<u64> {
+    let base = env.base;
     let dst = destination(env)?;
-    let src = Dib::read(env.cpu, env.arg(2), base)?;
-    if src.bpp != 1 {
-        return None;
-    }
-    let [l, t, r, b] = rects(env.cpu, env.arg(1), 1)?[0];
-    let (sx, sy) = point(env.cpu, env.arg(3))?;
-    let code = env.arg(4);
-    let mut colors = Vec::new();
-    src.palette(env.cpu, base, &mut colors)?;
-    let colors: Vec<_> = colors
-        .iter()
-        .take(2)
-        .map(|p| dst.pack([(p >> 16) & 255, (p >> 8) & 255, p & 255]))
-        .collect();
-    let mut mem = Memory {
-        cpu: env.cpu,
-        pool: env.ext.get_or_default::<Buffers>(),
-    };
-    dst.load_rows(&mut mem, true, t..b)?;
-    src.load_rows(&mut mem, false, shift(&(0..b.wrapping_sub(t)), sy)?)?;
+    let mut src = Dib::read(&mut env.cpu, env.args[2], base)?;
+    let [l, t, r, b] = rects(&mut env.cpu, env.args[1], 1)?.get(0);
+    let (sx, sy) = point(&mut env.cpu, env.args[3])?;
+    let code = env.args[4];
+    let mut colors = [0; 256];
+    src.color_count = 2;
+    src.palette(&mut env.cpu, base, &mut colors)?;
+    let colors = colors.map(|p| dst.pack([(p >> 16) & 255, (p >> 8) & 255, p & 255]));
+    src.bpp = 1;
+    let mut mem = Memory::new(&mut env.cpu);
+    dst.load_rect(&mut mem, true, [l, t, r, b])?;
+    src.load_rect(
+        &mut mem,
+        false,
+        [sx, sy, sx.wrapping_add(r - l), sy.wrapping_add(b - t)],
+    )?;
     for y in t..b {
         for x in l..r {
             let pos = (sx & 7) + x - l;
@@ -1123,41 +1051,42 @@ fn aa_color(dst: u32, text: u32, min: u32, max: u32) -> u32 {
         text.wrapping_sub((text - dst).wrapping_mul(text.wrapping_sub(min)) / text) & 255
     }
 }
-fn draw_glyph(env: &mut Env<'_>) -> Option<u64> {
+fn draw_glyph(env: &mut Args<'_, impl Mem>) -> Option<u64> {
     glyph(env, false)
 }
-fn draw_subpixel_glyph(env: &mut Env<'_>) -> Option<u64> {
+fn draw_subpixel_glyph(env: &mut Args<'_, impl Mem>) -> Option<u64> {
     glyph(env, true)
 }
-fn glyph(env: &mut Env<'_>, subpixel: bool) -> Option<u64> {
-    let base = module(env)?;
+fn glyph(env: &mut Args<'_, impl Mem>, subpixel: bool) -> Option<u64> {
+    let base = env.base;
     let dst = destination(env)?;
-    let glyph = Dib::read(env.cpu, env.arg(2), base)?;
-    let [l, t, r, b] = rects(env.cpu, env.arg(1), 1)?[0];
-    let (sx, sy) = point(env.cpu, env.arg(3))?;
-    let text_pixel = env.arg(4);
+    let glyph = Dib::read(&mut env.cpu, env.args[2], base)?;
+    let [l, t, r, b] = rects(&mut env.cpu, env.args[1], 1)?.get(0);
+    let (sx, sy) = point(&mut env.cpu, env.args[3])?;
+    let text_pixel = env.args[4];
     let text = dst.rgb(text_pixel);
     let ranges = if subpixel {
-        Vec::new()
+        &[]
     } else {
-        read(env.cpu, env.arg(5), intensity::SIZE * 17)?
+        read(&mut env.cpu, env.args[5], intensity::SIZE * 17)?
     };
-    let gamma = if subpixel && dst.bpp != 16 && env.arg(5) != 0 {
-        let gamma = read(env.cpu, env.arg(5), gamma::SIZE)?;
-        if word(&gamma, gamma::gamma) != 1000 {
+    let gamma = if subpixel && dst.bpp != 16 && env.args[5] != 0 {
+        let gamma = read(&mut env.cpu, env.args[5], gamma::SIZE)?;
+        if word(gamma, gamma::gamma) != 1000 {
             gamma
         } else {
-            Vec::new()
+            &[]
         }
     } else {
-        Vec::new()
+        &[]
     };
-    let mut mem = Memory {
-        cpu: env.cpu,
-        pool: env.ext.get_or_default::<Buffers>(),
-    };
-    dst.load_rows(&mut mem, true, t..b)?;
-    glyph.load_rows(&mut mem, false, shift(&(0..b.wrapping_sub(t)), sy)?)?;
+    let mut mem = Memory::new(&mut env.cpu);
+    dst.load_rect(&mut mem, true, [l, t, r, b])?;
+    glyph.load_rect(
+        &mut mem,
+        false,
+        [sx, sy, sx.wrapping_add(r - l), sy.wrapping_add(b - t)],
+    )?;
     for y in t..b {
         for x in l..r {
             let mask = mem.pixel(
@@ -1207,34 +1136,31 @@ fn glyph(env: &mut Env<'_>, subpixel: bool) -> Option<u64> {
     mem.commit()
 }
 
-fn stretch_row(env: &mut Env<'_>) -> Option<u64> {
+fn stretch_row(env: &mut Args<'_, impl Mem>) -> Option<u64> {
     scale_row(env, false)
 }
-fn shrink_row(env: &mut Env<'_>) -> Option<u64> {
+fn shrink_row(env: &mut Args<'_, impl Mem>) -> Option<u64> {
     scale_row(env, true)
 }
-fn scale_row(env: &mut Env<'_>, shrink: bool) -> Option<u64> {
-    let base = module(env)?;
+fn scale_row(env: &mut Args<'_, impl Mem>, shrink: bool) -> Option<u64> {
+    let base = env.base;
     let dst = destination(env)?;
-    let src = Dib::read(env.cpu, env.arg(2), base)?;
-    let (mut dx, dy) = point(env.cpu, env.arg(1))?;
-    let (mut sx, sy) = point(env.cpu, env.arg(3))?;
-    let p = read(env.cpu, env.arg(4), stretch::SIZE)?;
-    let (mode, keep) = (env.arg(5), env.arg(6) != 0);
+    let src = Dib::read(&mut env.cpu, env.args[2], base)?;
+    let (mut dx, dy) = point(&mut env.cpu, env.args[1])?;
+    let (mut sx, sy) = point(&mut env.cpu, env.args[3])?;
+    let p = read(&mut env.cpu, env.args[4], stretch::SIZE)?;
+    let (mode, keep) = (env.args[5], env.args[6] != 0);
     let code = match mode {
         1 => 9,
         2 => 15,
         _ => 13,
     };
-    let mut err = word(&p, stretch::err_start) as i32;
+    let mut err = word(p, stretch::err_start) as i32;
     let mut new_pixel = true;
-    let mut mem = Memory {
-        cpu: env.cpu,
-        pool: env.ext.get_or_default::<Buffers>(),
-    };
+    let mut mem = Memory::new(&mut env.cpu);
     dst.load_rows(&mut mem, true, dy..dy.checked_add(1)?)?;
     src.load_rows(&mut mem, false, sy..sy.checked_add(1)?)?;
-    for _ in 0..word(&p, stretch::length) {
+    for _ in 0..word(p, stretch::length) {
         let at = dst.at(dx, dy);
         let src = mem.pixel(src.at(sx, sy), dst.size())?;
         let value = if (shrink && mode != 3) || (!shrink && mode != 3 && keep) {
@@ -1250,20 +1176,20 @@ fn scale_row(env: &mut Env<'_>, shrink: bool) -> Option<u64> {
         mem.put(at, dst.size(), value)?;
         new_pixel = false;
         if shrink {
-            sx = sx.wrapping_add(word(&p, stretch::src_inc) as i32);
+            sx = sx.wrapping_add(word(p, stretch::src_inc) as i32);
         } else {
-            dx = dx.wrapping_add(word(&p, stretch::dst_inc) as i32);
+            dx = dx.wrapping_add(word(p, stretch::dst_inc) as i32);
         }
         if err > 0 {
             if shrink {
-                dx = dx.wrapping_add(word(&p, stretch::dst_inc) as i32);
+                dx = dx.wrapping_add(word(p, stretch::dst_inc) as i32);
                 new_pixel = true;
             } else {
-                sx = sx.wrapping_add(word(&p, stretch::src_inc) as i32);
+                sx = sx.wrapping_add(word(p, stretch::src_inc) as i32);
             }
-            err = err.wrapping_add(word(&p, stretch::err_add_1) as i32);
+            err = err.wrapping_add(word(p, stretch::err_add_1) as i32);
         } else {
-            err = err.wrapping_add(word(&p, stretch::err_add_2) as i32);
+            err = err.wrapping_add(word(p, stretch::err_add_2) as i32);
         }
     }
     mem.commit()
@@ -1403,21 +1329,14 @@ fn row<const S: u8, const D: u8>(input: &[u8], output: &mut [u8], src: &Dib, dst
     }
 }
 
-fn convert_to(env: &mut Env<'_>) -> Option<u64> {
-    let base = module(env)?;
+fn convert_to(env: &mut Args<'_, impl Mem>) -> Option<u64> {
+    let base = env.base;
     let dst = destination(env)?;
-    let src = Dib::read(env.cpu, env.arg(1), base)?;
-    src.supported()?;
-    if !matches!(
-        dst.kind,
-        FUNCS_8888 | FUNCS_32 | FUNCS_24 | FUNCS_555 | FUNCS_16 | FUNCS_8 | FUNCS_4 | FUNCS_1
-    ) {
-        return None;
-    }
+    let src = Dib::read(&mut env.cpu, env.args[1], base)?;
     let mut rect = [0; rect::SIZE];
-    read_into(env.cpu, env.arg(2), &mut rect)?;
+    read_into(&mut env.cpu, env.args[2], &mut rect)?;
     let [l, t, r, b] = std::array::from_fn(|i| word(&rect, i * 4) as i32);
-    let dither = env.arg(3) != 0;
+    let dither = env.args[3] != 0;
     let width = u32::try_from(r - l).ok()?;
     let row_len = u32::try_from(dst.width)
         .ok()?
@@ -1426,15 +1345,28 @@ fn convert_to(env: &mut Env<'_>) -> Option<u64> {
         .checked_mul(4)?;
     let used = width.checked_mul(dst.bpp)?.div_ceil(8);
     let pad = row_len.checked_sub(used)?;
-    let pool = env.ext.get_or_default::<Buffers>();
-    if dst.bpp <= 8 {
-        dst.palette(env.cpu, base, &mut pool.colors)?;
+    let mut palette = [0; 256];
+    let count = if dst.bpp <= 8 {
+        dst.palette(&mut env.cpu, base, &mut palette)?
+    } else {
+        0
+    };
+    let colors = &palette[..count];
+    let mut source_palette = [0; 256];
+    if src.bpp <= 8 {
+        let mut indexed = src.clone();
+        indexed.color_count = 1 << src.bpp;
+        indexed.palette(&mut env.cpu, base, &mut source_palette)?;
     }
-    let colors = &pool.colors;
     let background = if dst.bpp == 1 {
         let bg = *colors.first()?;
         if bg >> 16 == 0x10ff {
             bg & 0xffff
+        } else if src.bpp <= 8 {
+            nearest(
+                &source_palette[..src.color_count as usize],
+                [(bg >> 16) & 255, (bg >> 8) & 255, bg & 255],
+            )
         } else if src.bpp == 24 {
             ((bg >> 16) & 255) | (bg & 0xff00) | ((bg & 255) << 16)
         } else {
@@ -1453,41 +1385,29 @@ fn convert_to(env: &mut Env<'_>) -> Option<u64> {
             && src.kind != FUNCS_555
             && src.bpp == dst.bpp
             && src.masks == dst.masks);
-    let mut mem = Memory { cpu: env.cpu, pool };
+    let same_palette = src.bpp <= 8
+        && src.bpp == dst.bpp
+        && src.color_count == dst.color_count
+        && source_palette[..count] == palette[..count];
+    let aligned = (src.left + l) as u32 & (8 / src.bpp.min(8) - 1) == 0;
+    let raw = raw || (same_palette && aligned && dst.bpp != 1);
+    let mut mem = Memory::new(&mut env.cpu);
     if raw && src.stride > 0 && src.stride == dst.stride && pad == 0 {
-        let len = usize::try_from(b - t)
-            .ok()?
-            .checked_mul(src.stride as usize)?;
+        let len = (b - t) as usize * src.stride as usize;
         let (sa, da) = (src.at(l, t), dst.at(0, 0));
-        src.contains(sa, u32::try_from(len).ok()?)?;
-        dst.contains(da, u32::try_from(len).ok()?)?;
-        if t < b {
-            for (dib, rows, prot) in [(&src, t..b, Prot::READ), (&dst, 0..b - t, Prot::RW)] {
-                let (base, count) = dib.rows(rows)?;
-                if !mem.cpu.accessible(base, count, prot) {
-                    return None;
-                }
-            }
-        }
         mem.load(sa, len as u32, false)?;
-        mem.region(da, len as u32, true, false)?;
+        mem.load(da, len as u32, true)?;
         mem.copy(sa, da, len)?;
         return mem.commit();
     }
     src.load_rows(&mut mem, false, t..b)?;
     dst.output_rows(&mut mem, b - t, row_len)?;
-    // Wine's 8-bit conversion caches the nearest entry at the center of each
-    // five-bit RGB bucket. Other indexed destinations use the exact color.
-    if dst.bpp == 8 {
-        mem.pool.lookup.resize(32768, u16::MAX);
-        mem.pool.lookup.fill(u16::MAX);
-    }
     let kernel = row_kernel(&src, &dst);
     for y in t..b {
         let da = dst.at(0, y - t);
         if raw {
             mem.copy(src.at(l, y), da, used as usize)?;
-        } else if dst.bpp > 8 && {
+        } else if dst.bpp > 8 && src.bpp > 8 && {
             let source = u64::from(src.at(l, y));
             let target = u64::from(da);
             source + u64::from(width) * src.size() as u64 <= target
@@ -1500,23 +1420,38 @@ fn convert_to(env: &mut Env<'_>) -> Option<u64> {
             kernel?(source, target, &src, &dst);
         } else {
             for x in l..r {
-                let pixel = mem.pixel(src.at(x, y), src.size())?;
-                let rgb = src.rgb(pixel);
+                let pixel = if src.bpp < 8 {
+                    let pos = (src.left + x) as u32 * src.bpp;
+                    (mem.pixel(src.at(x, y), 1)? >> (8 - src.bpp - pos % 8)) & ((1 << src.bpp) - 1)
+                } else {
+                    mem.pixel(src.at(x, y), src.size())?
+                };
+                let rgb = if src.bpp <= 8 {
+                    let c = source_palette[pixel as usize];
+                    [(c >> 16) & 255, (c >> 8) & 255, c & 255]
+                } else {
+                    src.rgb(pixel)
+                };
                 let xx = (x - l) as u32;
+                let index = if src.bpp == 1 && source_palette[pixel as usize] >> 16 == 0x10ff {
+                    Some(source_palette[pixel as usize] & 0xffff)
+                } else {
+                    None
+                };
                 match dst.bpp {
                     16 | 24 | 32 => mem.put(dst.at(x - l, y - t), dst.size(), dst.pack(rgb))?,
                     8 => {
-                        let pos =
-                            ((rgb[0] & 248) >> 3) | ((rgb[1] & 248) << 2) | ((rgb[2] & 248) << 7);
-                        let value = &mut mem.pool.lookup[pos as usize];
-                        if *value == u16::MAX {
-                            *value = nearest(&mem.pool.colors, rgb.map(|v| (v & 248) | 4)) as u16;
-                        }
-                        let value = u32::from(*value);
+                        let value = if let Some(index) = index {
+                            index
+                        } else if src.bpp <= 8 {
+                            nearest(colors, rgb)
+                        } else {
+                            nearest(colors, rgb.map(|v| (v & 248) | 4))
+                        };
                         mem.put(da + xx, 1, value)?;
                     }
                     4 => {
-                        let value = nearest(&mem.pool.colors, rgb);
+                        let value = index.unwrap_or_else(|| nearest(colors, rgb));
                         let at = da + xx / 2;
                         let value = if xx & 1 == 0 {
                             (value << 4) & 240
@@ -1531,7 +1466,9 @@ fn convert_to(env: &mut Env<'_>) -> Option<u64> {
                             raw_pixel =
                                 ((pixel >> 16) & 255) | (pixel & 0xff00) | ((pixel & 255) << 16);
                         }
-                        let value = if dst.color_count == 1 {
+                        let value = if let Some(index) = index {
+                            (index >> (7 - (xx & 7))) & 1
+                        } else if dst.color_count == 1 {
                             u32::from(raw_pixel == background)
                         } else {
                             let rgb = if dither {
@@ -1540,7 +1477,7 @@ fn convert_to(env: &mut Env<'_>) -> Option<u64> {
                             } else {
                                 rgb
                             };
-                            u32::from(nearest(&mem.pool.colors, rgb) != 0)
+                            u32::from(nearest(colors, rgb) != 0)
                         };
                         let at = da + xx / 8;
                         let old = if xx & 7 == 0 { 0 } else { mem.pixel(at, 1)? };
@@ -1555,7 +1492,7 @@ fn convert_to(env: &mut Env<'_>) -> Option<u64> {
     mem.commit()
 }
 
-fn coords(cpu: &dyn Guest, at: u32) -> Option<([i32; 4], [i32; 4])> {
+fn coords(cpu: &mut Access<'_, impl Mem>, at: u32) -> Option<([i32; 4], [i32; 4])> {
     let mut bytes = [0; coords::SIZE];
     read_into(cpu, at, &mut bytes)?;
     let (x, y, w, h) = (
@@ -1592,19 +1529,22 @@ fn coords(cpu: &dyn Guest, at: u32) -> Option<([i32; 4], [i32; 4])> {
 fn interpolate(start: u32, end: u32, delta: f32) -> u32 {
     (start as f32 + (end as i32 - start as i32) as f32 * delta + 0.5) as u8 as u32
 }
-fn halftone(env: &mut Env<'_>) -> Option<u64> {
-    if env.arg(4) & !0x3f != 0x1f80 {
-        return None;
-    }
-    let base = module(env)?;
+fn halftone(env: &mut Args<'_, impl Mem>) -> Option<u64> {
+    let _control = super::pixels::FloatControl::new(env.args[4]);
+    let base = env.base;
     let dst = destination(env)?;
-    let src = Dib::read(env.cpu, env.arg(2), base)?;
-    src.supported()?;
-    let (dc, dr) = coords(env.cpu, env.arg(1))?;
-    let (sc, sr) = coords(env.cpu, env.arg(3))?;
+    let src = Dib::read(&mut env.cpu, env.args[2], base)?;
+    let (dc, dr) = coords(&mut env.cpu, env.args[1])?;
+    let (sc, sr) = coords(&mut env.cpu, env.args[3])?;
     let (width, height) = (dr[2] - dr[0], dr[3] - dr[1]);
     let (sw, sh) = (sr[2] - sr[0], sr[3] - sr[1]);
     if width <= 0 || height <= 0 || sw <= 0 || sh <= 0 {
+        return Some(0);
+    }
+    // Even an integral sample adds 0.5 before truncation, raising SSE
+    // precision when that exception is unmasked in the pinned primitive.
+    if env.args[4] & 0x1000 == 0 {
+        env.cpu.stop = Some(Stop::Trap(19));
         return None;
     }
     let (mx, my) = ((dc[2] < 0) != (sc[2] < 0), (dc[3] < 0) != (sc[3] < 0));
@@ -1617,10 +1557,7 @@ fn halftone(env: &mut Env<'_>) -> Option<u64> {
         (if my { -sh } else { sh }) as f32 / height as f32,
     );
     let mut fy = start_y as f32;
-    let mut mem = Memory {
-        cpu: env.cpu,
-        pool: env.ext.get_or_default::<Buffers>(),
-    };
+    let mut mem = Memory::new(&mut env.cpu);
     src.load_rows(&mut mem, false, sr[1]..sr[3])?;
     dst.output_rows(
         &mut mem,
@@ -1657,24 +1594,53 @@ fn halftone(env: &mut Env<'_>) -> Option<u64> {
     mem.commit()
 }
 
-// Capture the guest's SSE controls through the adapter.
-pub(super) fn entry(cpu: &mut dyn Guest, sys: &mut Sys, thunk: u32) -> Result<u32, String> {
-    let at = sys
-        .vm
-        .alloc(cpu, 0x1000, Prot::RX)
-        .map_err(|e| e.to_string())?;
-    let mut code = vec![0x83, 0xec, 4, 0x0f, 0xae, 0x1c, 0x24];
-    for _ in 0..4 {
-        code.extend_from_slice(&[0xff, 0x74, 0x24, 20]);
+#[cfg(test)]
+mod tests {
+    // spec: NAT-BODY-19
+    #[test]
+    fn neon_rows_match_scalar() {
+        for size in [2, 3, 4] {
+            for len in 0..98 {
+                for and in [0, 0x7f1f3fff, u32::MAX] {
+                    let mut actual: Vec<_> = (0..len).map(|i| (i * 71) as u8).collect();
+                    let mut expected = actual.clone();
+                    for (i, b) in expected.iter_mut().enumerate() {
+                        *b = (*b & (and >> ((i % size) * 8)) as u8)
+                            ^ (0xabf54321u32 >> ((i % size) * 8)) as u8;
+                    }
+                    super::solid_row(&mut actual, size, and, 0xabf54321);
+                    assert_eq!(actual, expected);
+                }
+            }
+        }
+        for len in 1..34 {
+            for alpha in [0, 1, 127, 128, 254, 255] {
+                for source_alpha in [false, true] {
+                    for compression in [0, 3] {
+                        let mut actual: Vec<_> = (0..len * 4).map(|i| (i * 79) as u8).collect();
+                        let mut expected = actual.clone();
+                        let source: Vec<_> = (0..len * 4).map(|i| (i * 31 + 17) as u8).collect();
+                        for i in 0..len {
+                            let v = super::blend_8888_pixel(
+                                super::word(&expected, i * 4),
+                                super::word(&source, i * 4),
+                                alpha,
+                                source_alpha,
+                                compression,
+                            );
+                            expected[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+                        }
+                        super::blend_8888_row(
+                            &mut actual,
+                            &source,
+                            alpha,
+                            source_alpha,
+                            compression,
+                        );
+                        assert_eq!(actual, expected);
+                    }
+                }
+            }
+        }
     }
-    code.push(0xe8);
-    let next = at + code.len() as u32 + 4;
-    code.extend_from_slice(&thunk.wrapping_sub(next).to_le_bytes());
-    code.extend_from_slice(&[0x83, 0xc4, 20, 0xc3]);
-    cpu.write(at, &code).map_err(|e| e.to_string())?;
-    Ok(at)
-}
-fn resume_halftone(env: &mut Env<'_>) -> Outcome {
-    env.cpu.set_reg(Reg::Esp, env.cpu.reg(Reg::Esp) + 24);
-    super::resume_original(env)
 }

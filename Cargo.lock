@@ -211,6 +211,7 @@ dependencies = [
  "adv-machine",
  "adv-pe",
  "adv-wineserver",
+ "cc",
  "iced-x86",
  "libc",
  "log",

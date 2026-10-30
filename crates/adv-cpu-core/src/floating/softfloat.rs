@@ -75,7 +75,7 @@ pub(super) fn binary(a: X87Register, b: X87Register, op: u8) -> X87Register {
 pub fn rounded_up() -> bool {
     unsafe { adv_sf_round_up() != 0 }
 }
-pub(super) fn unary(a: X87Register, op: u8) -> X87Register {
+pub fn unary(a: X87Register, op: u8) -> X87Register {
     let mut out = Extended::default();
     unsafe { adv_sf_ext_unary(&a.into(), &mut out, op) };
     out.into()
