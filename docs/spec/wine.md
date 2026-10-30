@@ -425,6 +425,8 @@ Field offsets match the pinned module's DWARF. The mixer runs as a host-call bod
 | Objects | Waits with a zero timeout, `SetEvent`, `ResetEvent`, `ReleaseSemaphore`, `ReleaseMutex` |
 | Files | File position queries and changes, `GetFileSize`, `GetFileSizeEx` |
 
+Windows empty A/W peeks preserve last error and MSG, dispatch pending sent messages despite filters, and skip GETMESSAGE/FOREGROUNDIDLE hooks. Measured WoW64 empty peeks hand off about once per 100 calls, including PM_NOYIELD; the body requests that completed-call handoff from its owner. Driver jobs, dirty surfaces, internal messages and matching messages or timers requiring server processing retain the full path. The ANSI wrapper keeps its pending character conversion state and reaches the shared empty-peek body through NtUserPeekMessage.
+
 ### NAT-BODY-8 D3DX pixel conversion
 
 **Rule**: D3DX pixel bodies MUST preserve channel values, filter coordinates, color keys and padding with layouts matching the pinned module's DWARF. Unsupported formats or filters, overlapping buffers and inaccessible memory MUST decline before writes. Changed helper code or copy imports MUST retain guest execution.

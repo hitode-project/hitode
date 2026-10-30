@@ -29,6 +29,7 @@ pub mod process;
 pub mod sched;
 pub mod schedule_trace;
 pub mod scheduling;
+pub mod service;
 #[cfg(test)]
 mod spawn_tests;
 pub mod stats;
@@ -98,8 +99,6 @@ pub struct Sys {
     /// Shared execution wake for input, server, media, I/O and APC deliveries.
     pub poll_wake: Option<adv_sync::WakeEvent>,
     poll_observed: bool,
-    /// Productive calls invalidate the round even when their context then blocks.
-    poll_activity: u64,
     /// Explicit arguments exist only while a host invocation or its continuation runs.
     invocation_arguments: Option<invocation::Arguments>,
     /// Real time: reusable scheduler slot where round-robin resumes after a host return.
@@ -266,9 +265,30 @@ impl Env<'_> {
 }
 
 impl Sys {
+    /// Bind a complete body to a published host thunk and its copied entries.
+    /// The registered handler remains the full path.
+    pub fn bind_thunk_body(&mut self, index: u32, body: adv_cpu::body::DirectBody) {
+        let at = layout::thunk_addr(index);
+        let skip = if self.thunks.get(index).guest_slot.is_some() {
+            12
+        } else {
+            6
+        };
+        self.redirects
+            .insert(at, (at + skip, self.thunks.pristine_entry(index).into()));
+        self.direct_bodies.insert(at, body);
+    }
+
     pub fn services(&self, ext: &Ext) -> adv_cpu::body::Services {
         let mut services = adv_cpu::body::Services {
             clock: self.clock.body_pointer(),
+            context: self.current,
+            thread_state: self
+                .contexts
+                .get(self.current as usize)
+                .map_or(std::ptr::null(), |ctx| {
+                    std::rc::Rc::as_ptr(&ctx.services).cast()
+                }),
             epoch_us: self.clock.epoch_us,
             thread: self
                 .contexts
@@ -455,6 +475,7 @@ impl Sys {
             exact_deadline: false,
             spin: Default::default(),
             progress: Default::default(),
+            services: Default::default(),
             poll_peek_depth: 0,
             thread_handle,
             wait_objects: Vec::new(),
@@ -1105,13 +1126,13 @@ impl Sys {
 
     /// A guest callback or nonempty peek invalidates an enclosing observation.
     pub fn poll_work(&mut self) {
-        self.poll_activity = self.poll_activity.wrapping_add(1);
+        self.clock.work();
         self.contexts[self.current as usize].progress.new_work();
     }
 
     fn poll_generation(&self) -> (u64, u64, Option<u64>) {
         (
-            self.poll_activity,
+            self.clock.activity(),
             self.objects.generation(),
             self.poll_wake.as_ref().map(|wake| wake.generation()),
         )
@@ -1240,6 +1261,9 @@ enum Parked {
     },
     /// Return to the host after committing a frame-producing trap, without a guest wait.
     HostYield {
+        resume_eip: u32,
+    },
+    ServiceYield {
         resume_eip: u32,
     },
     Deferred {
@@ -1734,7 +1758,7 @@ impl Dispatch<'_> {
         let observation = observed || context.poll_peek_depth != 0;
         context.progress.call(index, observation);
         if !observation {
-            self.sys.poll_activity = self.sys.poll_activity.wrapping_add(1);
+            self.sys.clock.work();
         }
         let r = apply(cpu, self.sys, self.ext, out, origin, self.defer_work);
         self.sys.stats.host(t0, index, true, &self.sys.thunks);
@@ -1812,6 +1836,13 @@ impl Dispatch<'_> {
 }
 
 impl TrapHandler for Dispatch<'_> {
+    fn on_body_yield(&mut self, cpu: &mut dyn Guest) -> TrapAction {
+        self.parked = Some(Parked::ServiceYield {
+            resume_eip: cpu.reg(Reg::Eip),
+        });
+        TrapAction::Park
+    }
+
     fn body_services(&self) -> adv_cpu::body::Services {
         self.sys.services(self.ext)
     }
@@ -2039,7 +2070,6 @@ impl<B: Backend> Machine<B> {
             body_services: None,
             poll_wake: None,
             poll_observed: false,
-            poll_activity: 0,
             invocation_arguments: None,
             trace: Trace::default(),
             thunks,
@@ -2395,6 +2425,12 @@ impl<B: Backend> Machine<B> {
                 };
                 ctx.yielded = false;
                 return Some(RunResult::HostRequest);
+            }
+            Parked::ServiceYield { resume_eip } => {
+                self.cpu.set_reg(Reg::Eip, resume_eip);
+                ctx.yielded = true;
+                ctx.progress.yielded(resume_eip);
+                self.sys.schedule_trace.event("yield", id, 0, 0, 0);
             }
             Parked::HostYield { resume_eip } => {
                 // Both current backends park by replacing EIP with PARK_ADDR.
@@ -2926,6 +2962,9 @@ impl<B: Backend> Machine<B> {
             let retired = self.cpu.retired_instructions() - retired_before;
             if let Some(c) = self.sys.contexts.get_mut(id as usize) {
                 c.spin.ran(run_elapsed);
+                if c.services.new_work.replace(false) {
+                    c.progress.new_work();
+                }
                 c.progress.ran(retired);
             }
             if self.sys.schedule_trace.enabled() {

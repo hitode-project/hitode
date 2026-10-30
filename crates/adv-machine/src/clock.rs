@@ -76,6 +76,8 @@ struct ClockState {
     active_skip_us: Cell<u64>,
     real_progress: Cell<RealProgress>,
     allowance: Cell<Allowance>,
+    activity: Cell<u64>,
+    poll: Cell<ClockPoll>,
     #[cfg(target_arch = "aarch64")]
     host: CounterClock,
 }
@@ -166,6 +168,8 @@ impl Clock {
                 active_skip_us: Cell::new(0),
                 real_progress: Cell::new(RealProgress::default()),
                 allowance: Cell::new(Allowance::Working),
+                activity: Cell::new(0),
+                poll: Cell::new(ClockPoll::default()),
                 #[cfg(target_arch = "aarch64")]
                 host: CounterClock::new(),
             }),
@@ -200,38 +204,97 @@ impl Clock {
 
     #[inline]
     fn read(state: &ClockState, epoch_us: u64) -> u64 {
-        epoch_us
-            + state.active_skip_us.get()
-            + match state.mode.get() {
-                ClockMode::Real {
-                    started,
-                    paused_at,
-                    paused_for_us,
-                } => {
-                    let elapsed = || {
-                        #[cfg(target_arch = "aarch64")]
-                        {
-                            state.host.elapsed_us()
-                        }
-                        #[cfg(not(target_arch = "aarch64"))]
-                        {
-                            started.elapsed().as_micros() as u64
-                        }
-                    };
-                    let wall_us = paused_at
-                        .map_or_else(elapsed, |at| at.duration_since(started).as_micros() as u64)
-                        .saturating_sub(paused_for_us);
-                    let mut progress = state.real_progress.get();
-                    let elapsed = progress.observe(
-                        wall_us,
-                        state.allowance.get(),
-                        epoch_us.saturating_add(state.active_skip_us.get()),
-                    );
-                    state.real_progress.set(progress);
-                    elapsed
-                }
-                ClockMode::Virtual(t) => t,
+        let (now, progress) = Self::sample(state, epoch_us);
+        if let Some(progress) = progress {
+            state.real_progress.set(progress);
+        }
+        now
+    }
+
+    #[inline]
+    fn sample(state: &ClockState, epoch_us: u64) -> (u64, Option<RealProgress>) {
+        let mut next_progress = None;
+        let elapsed = match state.mode.get() {
+            ClockMode::Real {
+                started,
+                paused_at,
+                paused_for_us,
+            } => {
+                let elapsed = || {
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        state.host.elapsed_us()
+                    }
+                    #[cfg(not(target_arch = "aarch64"))]
+                    {
+                        started.elapsed().as_micros() as u64
+                    }
+                };
+                let wall_us = paused_at
+                    .map_or_else(elapsed, |at| at.duration_since(started).as_micros() as u64)
+                    .saturating_sub(paused_for_us);
+                let mut progress = state.real_progress.get();
+                let elapsed = progress.observe(
+                    wall_us,
+                    state.allowance.get(),
+                    epoch_us.saturating_add(state.active_skip_us.get()),
+                );
+                next_progress = Some(progress);
+                elapsed
             }
+            ClockMode::Virtual(time) => time,
+        };
+        (
+            epoch_us + state.active_skip_us.get() + elapsed,
+            next_progress,
+        )
+    }
+
+    pub(crate) fn activity(&self) -> u64 {
+        self.state.activity.get()
+    }
+
+    pub(crate) fn work(&self) {
+        self.state
+            .activity
+            .set(self.state.activity.get().wrapping_add(1));
+    }
+
+    /// # Safety
+    /// `state` must name the live execution owner's shared clock storage.
+    pub unsafe fn body_work(state: *const std::ffi::c_void) {
+        let state = unsafe { &*state.cast::<ClockState>() };
+        state.activity.set(state.activity.get().wrapping_add(1));
+    }
+
+    /// Admit a clock read without changing clock or admission state on a wait.
+    /// # Safety
+    /// `state` must name the live execution owner's shared clock storage.
+    pub unsafe fn body_poll(
+        state: *const std::ffi::c_void,
+        epoch_us: u64,
+        context: CtxId,
+    ) -> Option<u64> {
+        let state = unsafe { &*state.cast::<ClockState>() };
+        let (mut now, progress) = Self::sample(state, epoch_us);
+        let mode = state.mode.get();
+        if matches!(mode, ClockMode::Virtual(_)) {
+            now += 1;
+        }
+        let mut poll = state.poll.get();
+        let activity = state.activity.get();
+        if poll.next_streak(context, activity, now) >= POLL_STREAK {
+            return None;
+        }
+        if let ClockMode::Virtual(time) = mode {
+            state.mode.set(ClockMode::Virtual(time + 1));
+        }
+        if let Some(progress) = progress {
+            state.real_progress.set(progress);
+        }
+        poll.record(context, activity, now);
+        state.poll.set(poll);
+        Some(now)
     }
 
     /// Account the host's planned idle interval. An indefinite object/input
@@ -360,18 +423,18 @@ const POLL_GAP_US: u64 = 50;
 
 /// The last clock read and how many reads on that context came back to back,
 /// with no other host call and almost no guest time between them.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ClockPoll {
     context: Option<CtxId>,
-    call: u64,
+    activity: u64,
     read_us: u64,
     streak: u32,
 }
 
 impl ClockPoll {
-    fn next_streak(&self, context: CtxId, call: u64, now: u64) -> u32 {
+    fn next_streak(&self, context: CtxId, activity: u64, now: u64) -> u32 {
         if self.context == Some(context)
-            && self.call + 1 == call
+            && self.activity == activity
             && now.saturating_sub(self.read_us) <= POLL_GAP_US
         {
             self.streak.saturating_add(1)
@@ -380,9 +443,9 @@ impl ClockPoll {
         }
     }
 
-    fn record(&mut self, context: CtxId, call: u64, now: u64) {
-        self.streak = self.next_streak(context, call, now);
-        (self.context, self.call, self.read_us) = (Some(context), call, now);
+    fn record(&mut self, context: CtxId, activity: u64, now: u64) {
+        self.streak = self.next_streak(context, activity, now);
+        (self.context, self.activity, self.read_us) = (Some(context), activity, now);
     }
 }
 
@@ -394,19 +457,22 @@ pub fn poll_clock(
     env: &mut Env<'_>,
     finish: impl FnOnce(&mut Env<'_>, u64) -> Outcome + 'static,
 ) -> Outcome {
+    env.sys.poll_observation();
     let now = env.sys.clock.guest_now_us();
-    let (context, call) = (env.sys.current, env.sys.host_calls);
-    let poll = env.ext.get_or_default::<ClockPoll>();
-    poll.record(context, call, now);
+    let clock = &env.sys.clock;
+    let mut poll = clock.state.poll.get();
+    poll.record(env.context, clock.activity(), now);
+    clock.state.poll.set(poll);
     if poll.streak < POLL_STREAK {
         return finish(env, now);
     }
     let next_ms = (now / 1000 + 1) * 1000;
     Outcome::block_timed(Wait::Until(next_ms), move |env, _| {
         let now = env.sys.clock.guest_now_us();
-        let call = env.sys.host_calls;
-        let poll = env.ext.get_or_default::<ClockPoll>();
-        (poll.call, poll.read_us) = (call, now);
+        let clock = &env.sys.clock;
+        let mut poll = clock.state.poll.get();
+        (poll.activity, poll.read_us) = (clock.activity(), now);
+        clock.state.poll.set(poll);
         finish(env, now)
     })
 }
@@ -414,6 +480,26 @@ pub fn poll_clock(
 #[cfg(test)]
 mod tests {
     use super::{Allowance, Clock, MAX_PASSIVE_STEP_US, RealProgress};
+
+    // spec: PROC-CLOCK-3, NAT-BODY-18
+    #[test]
+    fn body_clock_poll_admission_is_shared_and_does_not_change_state_before_waiting() {
+        let clock = Clock::virtual_time();
+        for _ in 0..super::POLL_STREAK - 1 {
+            assert!(unsafe { Clock::body_poll(clock.body_pointer(), clock.epoch_us, 0) }.is_some());
+        }
+        let before = (clock.now_us(), clock.state.poll.get());
+        assert_eq!(
+            unsafe { Clock::body_poll(clock.body_pointer(), clock.epoch_us, 0) },
+            None
+        );
+        assert_eq!((clock.now_us(), clock.state.poll.get()), before);
+        clock.work();
+        assert!(unsafe { Clock::body_poll(clock.body_pointer(), clock.epoch_us, 0) }.is_some());
+        assert_eq!(clock.state.poll.get().streak, 1);
+        assert!(unsafe { Clock::body_poll(clock.body_pointer(), clock.epoch_us, 1) }.is_some());
+        assert_eq!(clock.state.poll.get().streak, 1);
+    }
 
     // spec: NAT-BODY-2
     #[cfg(target_arch = "aarch64")]

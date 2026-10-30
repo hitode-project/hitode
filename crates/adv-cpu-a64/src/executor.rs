@@ -622,6 +622,13 @@ impl Executor {
             } else if let Some(exit) = self.run_native(stop, bridge)? {
                 match exit {
                     Exit::Dispatch => continue,
+                    Exit::Yield => {
+                        if let Some(handler) = bridge.handler.as_mut() {
+                            bridge.parked =
+                                handler.body_yield(&mut self.state, &mut self.memory)?;
+                        }
+                        continue;
+                    }
                     // The helper ran the instruction; the owner completes it.
                     #[cfg(native)]
                     Exit::Stepped => {

@@ -58,10 +58,12 @@ struct Callbacks {
 pub(super) fn register(registry: &mut Registry) {
     for (index, &(name, _, argc)) in exports::EXPORTS.iter().enumerate() {
         if name == "timeGetTime" {
-            registry.add(MODULE, name, Conv::Stdcall { argc }, |env| {
-                env.sys.poll_observation();
-                adv_machine::clock::poll_clock(env, |_, us| Outcome::Return((us / 1000) as u32))
-            });
+            registry.add(
+                MODULE,
+                name,
+                Conv::Stdcall { argc },
+                adv_machine::service::time_get_time,
+            );
             continue;
         }
         registry.add_with_data(
@@ -188,6 +190,19 @@ pub(super) fn install<B: Backend>(machine: &mut Machine<B>, drive: &Path) -> Res
                 .collect(),
         },
     ];
+    machine
+        .sys
+        .thunks
+        .publish(&mut machine.cpu, MODULE, "timeGetTime")
+        .map_err(|e| e.to_string())?;
+    let index = machine
+        .sys
+        .thunks
+        .published_index(MODULE, "timeGetTime")
+        .unwrap();
+    machine
+        .sys
+        .bind_thunk_body(index, adv_machine::service::TIME_GET_TIME.direct);
     let image = ModuleImage::build(machine, MODULE, &exports, &imports)?;
     // ModuleImage names host bindings. Wine's first three exports have no names.
     let mut bytes = image.bytes().to_vec();

@@ -184,3 +184,11 @@ Game assets, screenshots, traces and anything taken from a game stay local and n
 | Building, testing and packaging | [docs/building.md](docs/building.md) |
 | Tools for debugging a game | [docs/investigation.md](docs/investigation.md) |
 | Host shells and platforms | [docs/spec/host.md](docs/spec/host.md), [docs/spec/android.md](docs/spec/android.md), [docs/building.md](docs/building.md) |
+
+## A call, from guest to body
+
+The loader publishes imports through [`ThunkTable`](crates/adv-machine/src/thunk.rs), and [`native::bind`](crates/adv-nt/src/native.rs) attaches distribution bodies after checking their code identity. Runtime services attach a body with [`Sys::bind_thunk_body`](crates/adv-machine/src/lib.rs); [`section::bind_builtin_bodies`](crates/adv-nt/src/section.rs) carries that binding to the copied entries in their PE images.
+
+The translator's [`Trace`](crates/adv-cpu-a64/src/translate/trace.rs) follows fixed forwarding instructions and import slots to a bound body, watching the chain and the bound entry for patches. [`ops::body`](crates/adv-cpu-a64/src/translate/ops.rs) calls its window form directly, without storing a guest return address (A64-CALL-1/2/5). [`BodyContext`](crates/adv-cpu-core/src/body.rs) supplies memory windows and shared service allocations; bodies never borrow the machine or extension owners through these pointers.
+
+The same generic body runs over `GuestMem` on [`run_full`](crates/adv-nt/src/native.rs), completing accesses the window cannot take (A64-CALL-4, NAT-BODY-17). `Stop::Guest` reaches guest code or the registered service handler when a callback, wait or server request is required (A64-CALL-6). A completed body can request a yield; generated code commits the return and [`Machine`](crates/adv-machine/src/lib.rs) schedules the handoff at its continuation.

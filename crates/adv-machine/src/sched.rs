@@ -295,6 +295,7 @@ pub struct Context {
     pub(crate) exact_deadline: bool,
     pub(crate) spin: crate::frame_spin::FrameSpin,
     pub(crate) progress: crate::poll_progress::PollProgress,
+    pub(crate) services: std::rc::Rc<crate::service::Thread>,
     pub(crate) poll_peek_depth: u32,
     /// Kernel object signaled when this context ends.
     pub thread_handle: Handle,
@@ -600,7 +601,6 @@ mod active_tests {
             body_services: None,
             poll_wake: None,
             poll_observed: false,
-            poll_activity: 0,
             invocation_arguments: None,
             trace: Trace::default(),
             thunks: ThunkTable::new(Box::new(Empty)),
@@ -699,6 +699,7 @@ mod active_tests {
             exact_deadline: false,
             spin: Default::default(),
             progress: Default::default(),
+            services: Default::default(),
             poll_peek_depth: 0,
             thread_handle,
             wait_objects: Vec::new(),

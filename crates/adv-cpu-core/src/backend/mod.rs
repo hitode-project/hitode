@@ -454,6 +454,11 @@ pub trait GuestExt: Guest {
 impl<G: Guest + ?Sized> GuestExt for G {}
 
 pub trait TrapHandler {
+    /// A service body completed and asks the owner to yield at its continuation.
+    fn on_body_yield(&mut self, _cpu: &mut dyn Guest) -> TrapAction {
+        TrapAction::Continue
+    }
+
     /// Shared service storage retained by the execution owner for this run.
     fn body_services(&self) -> crate::body::Services {
         crate::body::Services::default()

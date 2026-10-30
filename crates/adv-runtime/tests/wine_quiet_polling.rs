@@ -95,7 +95,9 @@ fn wine_peek_and_time_loop_idles_and_notifications_wake_it() {
     );
     let after = session.machine.cpu.read_u32(fields[4]).unwrap();
     assert!(
-        after - before < 10,
+        // Windows empty peeks hand off about once per 100 calls, even
+        // with PM_NOYIELD; the completed-body path preserves that cadence.
+        after - before <= 100,
         "quiet round took {} peeks",
         after - before
     );

@@ -5,6 +5,11 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 /// A caller-owned trap receiver. API decoding and all host continuation state
 /// belong to the machine and ABI layers, outside the execution layer.
 pub trait ExecutionTrap {
+    /// The body has committed its results and its return epilogue.
+    fn body_yield(&mut self, _state: &mut CpuState, _memory: &mut Memory) -> Result<bool, String> {
+        Ok(false)
+    }
+
     /// Shared service storage retained by the execution owner for this run.
     fn body_services(&self) -> crate::body::Services {
         crate::body::Services::default()

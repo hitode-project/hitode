@@ -32,7 +32,7 @@ pub enum Stop {
     /// Integer division by zero at the bound function entry.
     DivideByZero,
     /// The function would wait, call guest code or request the server:
-    /// its guest code runs once instead (A64-CALL-6).
+    /// its guest code or registered service handler runs instead (A64-CALL-6).
     Guest,
 }
 
@@ -42,6 +42,8 @@ pub struct Ret {
     /// EDX:EAX.
     pub value: u64,
     pub ecx: u32,
+    /// The call completed; let the execution owner yield before continuing.
+    pub yield_now: bool,
 }
 
 impl From<u32> for Ret {
@@ -49,13 +51,18 @@ impl From<u32> for Ret {
         Self {
             value: u64::from(eax),
             ecx: 0,
+            yield_now: false,
         }
     }
 }
 
 impl From<u64> for Ret {
     fn from(value: u64) -> Self {
-        Self { value, ecx: 0 }
+        Self {
+            value,
+            ecx: 0,
+            yield_now: false,
+        }
     }
 }
 
@@ -76,9 +83,10 @@ pub const EAX: u8 = 1;
 pub const EDX: u8 = 2;
 pub const ECX: u8 = 4;
 
-/// The body's status in bits 32 and up of x1: nonzero runs the call again
-/// on the full path.
+/// The body stopped: run the call again on its full path.
 pub const SLOW: u64 = 1 << 32;
+/// The body completed: commit its return and ask the owner to yield.
+pub const YIELD: u64 = 1 << 33;
 
 /// Shared host storage and thread identity, captured before native entry.
 #[repr(C)]
@@ -89,6 +97,9 @@ pub struct Services {
     pub state: *const std::ffi::c_void,
     pub thread: u32,
     pub teb: u32,
+    pub context: u32,
+    pub thread_state: *const std::ffi::c_void,
+    pub user_state: *const std::ffi::c_void,
 }
 
 impl Default for Services {
@@ -99,6 +110,9 @@ impl Default for Services {
             state: std::ptr::null(),
             thread: 0,
             teb: 0,
+            context: 0,
+            thread_state: std::ptr::null(),
+            user_state: std::ptr::null(),
         }
     }
 }
@@ -133,7 +147,7 @@ impl Default for BodyContext {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BodyResult {
     pub value: u64,
-    /// ECX in the low half; [`SLOW`] above it.
+    /// ECX in the low half; [`SLOW`] and completed-call [`YIELD`] above it.
     pub extra: u64,
 }
 
@@ -142,7 +156,7 @@ impl From<Result<Ret, Stop>> for BodyResult {
         match result {
             Ok(ret) => Self {
                 value: ret.value,
-                extra: u64::from(ret.ecx),
+                extra: u64::from(ret.ecx) | if ret.yield_now { YIELD } else { 0 },
             },
             Err(_) => Self {
                 value: 0,

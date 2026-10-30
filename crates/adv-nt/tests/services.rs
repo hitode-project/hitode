@@ -224,6 +224,7 @@ fn check_input_bodies(machine: &mut adv_machine::Env<'_>) {
         bytes.as_slice(),
         pattern.iter().map(|byte| byte & 0x81).collect::<Vec<_>>()
     );
+    check_user_services(machine, at);
     benchmark_input_bodies(tid);
     machine.ext.insert(InputChecked);
     use adv_cpu::backend::GuestExt;
@@ -318,4 +319,76 @@ fn benchmark_input_bodies(tid: u32) {
         }
         assert!(machine.sys.host_calls < 16);
     }
+}
+
+// spec: NAT-BODY-18
+fn check_user_services(env: &mut adv_machine::Env<'_>, at: u32) {
+    use adv_cpu::backend::GuestExt;
+    use adv_cpu::body::{GuestMem, Scratch, Stop};
+    let state = input_body::UserServices::default();
+    let mut services = env.sys.services(env.ext);
+    services.user_state = std::rc::Rc::as_ptr(&state.0).cast();
+    let pending = state.pending(services.context);
+    let mut scratch = Scratch::default();
+    let mut call = |body: adv_cpu::body::Body, args| {
+        (body.full)(
+            &mut GuestMem::for_body(env.cpu, &mut scratch, services),
+            args,
+        )
+    };
+    assert_eq!(call(input_body::QUEUE_STATUS, [0; 7]).unwrap().value, 0);
+    assert_eq!(call(input_body::INPUT_STATE, [0; 7]).unwrap().value, 0);
+    // On a noninteractive station Windows returns these distinct errors.
+    assert_eq!(
+        call(input_body::ASYNC_STATE, [42, 0, 0, 0, 0, 0, 0])
+            .unwrap()
+            .value,
+        0
+    );
+    assert_eq!(
+        call(input_body::CURSOR_POS, [at, 0, 0, 0, 0, 0, 0])
+            .unwrap()
+            .value,
+        0
+    );
+    for flags in [0, 1, 2, 3, u32::MAX] {
+        assert_eq!(
+            call(input_body::PEEK, [0, 0, 0, 0, flags, 0, 0])
+                .unwrap()
+                .value,
+            0
+        );
+    }
+    pending.set(1);
+    for body in [
+        input_body::ASYNC_STATE,
+        input_body::INPUT_STATE,
+        input_body::QUEUE_STATUS,
+        input_body::PEEK,
+    ] {
+        let args = [1, 0, 0, 0, 0, 0, 0];
+        assert_eq!(call(body, args), Err(Stop::Guest));
+    }
+    pending.set(u32::MAX); // A driver job runs even with a zero queue mask.
+    assert_eq!(call(input_body::QUEUE_STATUS, [0; 7]), Err(Stop::Guest));
+    pending.set(0);
+    // A dirty surface requires its guest flush callback, a clean one does not.
+    state.surface(at, true);
+    env.cpu.write(at, &[0; 108]).unwrap();
+    env.cpu.write_u32(at + 28, 64).unwrap();
+    env.cpu.write_u32(at + 32, 64).unwrap();
+    env.cpu.write_u32(at + 68, 8).unwrap();
+    env.cpu.write_u32(at + 72, 8).unwrap();
+    let mut mem = GuestMem::for_body(env.cpu, &mut scratch, services);
+    assert_eq!((input_body::PEEK.full)(&mut mem, [0; 7]), Err(Stop::Guest));
+    state.surface(at, false);
+    env.cpu.write_u32(services.teb + 0x34, 0x12345678).unwrap();
+    let mut mem = GuestMem::for_body(env.cpu, &mut scratch, services);
+    assert_eq!(
+        (input_body::QUEUE_STATUS.full)(&mut mem, [0x8000, 0, 0, 0, 0, 0, 0])
+            .unwrap()
+            .value,
+        0
+    );
+    assert_eq!(env.cpu.read_u32(services.teb + 0x34).unwrap(), 1004);
 }

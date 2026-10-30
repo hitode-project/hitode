@@ -74,6 +74,7 @@ fn copy<M: Mem, const MOVE: bool>(mem: &mut M, [dst, src, len, ..]: [u32; 7]) ->
     Ok(Ret {
         value: u64::from(len) << 32 | u64::from(dst),
         ecx: if MOVE && dst == src { len } else { 0 },
+        yield_now: false,
     })
 }
 

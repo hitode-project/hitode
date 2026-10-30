@@ -3731,6 +3731,31 @@ impl Request for SetQueueFdRequest {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
+pub struct GetMsgQueueRequest {
+    pub header: RequestHeader,
+    pub _pad0: [u8; 4],
+}
+const _: () = assert!(size_of::<GetMsgQueueRequest>() == 16);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GetMsgQueueReply {
+    pub header: ReplyHeader,
+    pub locator: [u8; 16],
+}
+const _: () = assert!(size_of::<GetMsgQueueReply>() == 24);
+const _: () = assert!(std::mem::offset_of!(GetMsgQueueReply, locator) == 8);
+
+impl Request for GetMsgQueueRequest {
+    const NUMBER: i32 = 114;
+    type Reply = GetMsgQueueReply;
+    fn header(&mut self) -> &mut RequestHeader {
+        &mut self.header
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct RenameKeyRequest {
     pub header: RequestHeader,
     pub hkey: u32,

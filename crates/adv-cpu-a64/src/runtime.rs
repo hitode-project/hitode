@@ -171,6 +171,8 @@ pub enum Exit {
     Fault = 2,
     /// The `interpret` helper left a step for the owner to complete.
     Stepped = 3,
+    /// A completed service call requests an execution-owner yield.
+    Yield = 4,
 }
 
 impl Exit {
@@ -180,6 +182,7 @@ impl Exit {
             1 => Some(Self::Dispatch),
             2 => Some(Self::Fault),
             3 => Some(Self::Stepped),
+            4 => Some(Self::Yield),
             _ => None,
         }
     }

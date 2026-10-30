@@ -2,6 +2,12 @@
 
 use adv_cpu::body::{EAX, Input, Mem, Ret, Stop};
 
+fn complete<M: Mem>(mem: &M, value: u32) -> Result<Ret, Stop> {
+    // SAFETY: body services retain their shared machine allocations.
+    unsafe { adv_machine::service::work(mem.services()) };
+    Ok(Ret::from(value))
+}
+
 adv_cpu::body!(pub(super) NT_COUNTER = nt_counter, inputs: &[Input::Stack(0), Input::Stack(1)], outputs: EAX, pop: 8);
 adv_cpu::body!(pub(super) COUNTER = counter, inputs: &[Input::Stack(0)], outputs: EAX, pop: 4);
 
@@ -19,7 +25,7 @@ fn output<M: Mem>(mem: &mut M, at: u32) -> Result<*mut u8, Stop> {
 // (not four-byte aligned) outputs return STATUS_DATATYPE_MISALIGNMENT.
 fn nt_counter<M: Mem>(mem: &mut M, [at, frequency, ..]: [u32; 7]) -> Result<Ret, Stop> {
     if at & 3 != 0 {
-        return Ok(Ret::from(0x8000_0002u32));
+        return complete(mem, 0x8000_0002u32);
     }
     let outputs = (|| {
         let counter = output(mem, at)?;
@@ -35,8 +41,8 @@ fn nt_counter<M: Mem>(mem: &mut M, [at, frequency, ..]: [u32; 7]) -> Result<Ret,
     })();
     let (counter, frequency) = match outputs {
         Ok(Some(outputs)) => outputs,
-        Ok(None) => return Ok(Ret::from(0x8000_0002u32)),
-        Err(Stop::Fault { .. }) => return Ok(Ret::from(crate::status::ACCESS_VIOLATION)),
+        Ok(None) => return complete(mem, 0x8000_0002u32),
+        Err(Stop::Fault { .. }) => return complete(mem, crate::status::ACCESS_VIOLATION),
         Err(stop) => return Err(stop),
     };
     let counter_value = ticks(mem);
@@ -50,7 +56,7 @@ fn nt_counter<M: Mem>(mem: &mut M, [at, frequency, ..]: [u32; 7]) -> Result<Ret,
         }
     }
     mem.commit()?;
-    Ok(Ret::from(0u32))
+    complete(mem, 0u32)
 }
 
 // Windows 11's Win32 and Rtl entries return TRUE without changing last error;
@@ -61,7 +67,7 @@ fn counter<M: Mem>(mem: &mut M, [at, ..]: [u32; 7]) -> Result<Ret, Stop> {
     // SAFETY: the complete output was checked.
     unsafe { output.cast::<u64>().write_unaligned(value.to_le()) };
     mem.commit()?;
-    Ok(Ret::from(1u32))
+    complete(mem, 1u32)
 }
 
 adv_cpu::body!(GET_FILE_SIZE = get_file_size, inputs: &[Input::Stack(0), Input::Stack(1)], outputs: EAX, pop: 8);
@@ -83,7 +89,7 @@ fn error<M: Mem>(mem: &mut M, error: u32, value: u32) -> Result<Ret, Stop> {
     // SAFETY: checked thread-local last-error output.
     unsafe { last_error.cast::<u32>().write_unaligned(error.to_le()) };
     mem.commit()?;
-    Ok(Ret::from(value))
+    complete(mem, value)
 }
 
 fn dos_error(status: u32) -> u32 {
@@ -138,7 +144,7 @@ fn get_file_size<M: Mem>(mem: &mut M, [handle, high, ..]: [u32; 7]) -> Result<Re
         }
     }
     mem.commit()?;
-    Ok(Ret::from(size as u32))
+    complete(mem, size as u32)
 }
 
 fn get_file_size_ex<M: Mem>(mem: &mut M, [handle, at, ..]: [u32; 7]) -> Result<Ret, Stop> {
@@ -151,7 +157,7 @@ fn get_file_size_ex<M: Mem>(mem: &mut M, [handle, at, ..]: [u32; 7]) -> Result<R
     // SAFETY: checked output; Win32's store faults on an inaccessible pointer.
     unsafe { out.cast::<u64>().write_unaligned(size.to_le()) };
     mem.commit()?;
-    Ok(Ret::from(1u32))
+    complete(mem, 1u32)
 }
 
 fn position(file: &crate::file::state::Entry, distance: i64, method: u32) -> Result<i64, u32> {
@@ -198,7 +204,7 @@ fn set_file_pointer_ex<M: Mem>(
         unsafe { output.cast::<i64>().write_unaligned(at.to_le()) };
         mem.commit()?;
     }
-    Ok(Ret::from(1u32))
+    complete(mem, 1u32)
 }
 
 fn set_file_pointer<M: Mem>(
@@ -248,7 +254,7 @@ fn set_file_pointer<M: Mem>(
         unsafe { last.cast::<u32>().write_unaligned(0) };
     }
     mem.commit()?;
-    Ok(Ret::from(at as u32))
+    complete(mem, at as u32)
 }
 
 pub(super) fn bodies() -> impl Iterator<Item = super::Body> {
@@ -342,7 +348,7 @@ mod objects {
             unsafe { output.cast::<u32>().write_unaligned(value[0].to_le()) };
             mem.commit()?;
         }
-        Ok(Ret::from(1u32))
+        complete(mem, 1u32)
     }
 
     fn set_event<M: Mem>(mem: &mut M, [handle, ..]: [u32; 7]) -> Result<Ret, Stop> {
@@ -398,8 +404,8 @@ mod objects {
             }
         }
         match ntsync::service_wait(&fds[..handles.len()], mem.services().thread, all) {
-            Ok(Some((index, dead))) => Ok(Ret::from(index + if dead { 0x80 } else { 0 })),
-            Ok(None) if timeout == 0 => Ok(Ret::from(258u32)),
+            Ok(Some((index, dead))) => complete(mem, index + if dead { 0x80 } else { 0 }),
+            Ok(None) if timeout == 0 => complete(mem, 258u32),
             Ok(None) => Err(Stop::Guest),
             Err(_) => error(mem, 6, u32::MAX),
         }

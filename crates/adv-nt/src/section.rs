@@ -618,6 +618,7 @@ pub fn map_image(env: &mut Env<'_>, mapping: u32) -> Result<View, Error> {
     for (rva, size) in builtin_code(&file, &pe) {
         env.sys.thunks.register_thunk_pages(base + rva, size);
     }
+    bind_builtin_bodies(env, base, &pe);
     let headers = &file[..(pe.size_of_headers as usize).min(file.len())];
     crate::identity::note_image(env.ext, base, size, path.as_deref(), headers);
     crate::native::bind(env.cpu, env.sys, env.ext, base, &pe);
@@ -631,6 +632,49 @@ pub fn map_image(env: &mut Env<'_>, mapping: u32) -> Result<View, Error> {
         relocated: base != preferred,
         info,
     })
+}
+
+/// Copied host entries retain the body attached to their transport binding.
+fn bind_builtin_bodies(env: &mut Env<'_>, base: u32, pe: &Pe) {
+    let Ok(exports) = pe.exports() else {
+        return;
+    };
+    for export in exports {
+        let adv_pe::ExportTarget::Rva(rva) = export.target else {
+            continue;
+        };
+        let entry = base + rva;
+        if !env.sys.thunks.is_thunk_page(entry) {
+            continue;
+        }
+        let mut bytes = [0; 21];
+        if env.cpu.read(entry, &mut bytes).is_err()
+            || bytes[..7] != [0x8b, 0xff, 0x55, 0x8b, 0xec, 0x5d, 0xba]
+            || bytes[11] != 0x68
+            || bytes[16..18] != [0xcd, 0x2e]
+        {
+            continue;
+        }
+        let word = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
+        let Some(index) = env.sys.thunks.transport_index(word) else {
+            continue;
+        };
+        let Some(&body) = env
+            .sys
+            .direct_bodies
+            .get(&adv_machine::layout::thunk_addr(index))
+        else {
+            continue;
+        };
+        let length = match env.sys.thunks.get(index).f.conv {
+            adv_machine::Conv::Stdcall { .. } => 21,
+            _ => 19,
+        };
+        env.sys
+            .redirects
+            .insert(entry, (entry + 6, bytes[..length].into()));
+        env.sys.direct_bodies.insert(entry, body);
+    }
 }
 
 /// Code sections of a builtin image, as (RVA, size). They hold copied host
