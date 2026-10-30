@@ -81,9 +81,20 @@ fn allocate_tls_block(vm: &mut Vm, cpu: &mut dyn Guest, image: &TlsImage) -> Res
 
 type ProcessPrepare = fn(&mut dyn Guest, &mut Sys, &mut Ext) -> Result<(), MemFault>;
 
+thread_local! {
+    static DEBUGGER_ATTACHED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The debugger lifetime on the execution owner.
+pub fn debugger_attached(attached: bool) {
+    DEBUGGER_ATTACHED.set(attached);
+}
+
 /// Host-side machine state shared by all handlers.
 pub struct Sys {
     pub clock: Clock,
+    /// Personality service storage and server thread identity for direct bodies.
+    pub body_services: Option<fn(&Sys, &Ext, &mut adv_cpu::body::Services)>,
     /// Shared execution wake for input, server, media, I/O and APC deliveries.
     pub poll_wake: Option<adv_sync::WakeEvent>,
     poll_observed: bool,
@@ -255,6 +266,38 @@ impl Env<'_> {
 }
 
 impl Sys {
+    pub fn services(&self, ext: &Ext) -> adv_cpu::body::Services {
+        let mut services = adv_cpu::body::Services {
+            clock: self.clock.body_pointer(),
+            epoch_us: self.clock.epoch_us,
+            thread: self
+                .contexts
+                .get(self.current as usize)
+                .map_or(0, |c| c.tid),
+            teb: self
+                .contexts
+                .get(self.current as usize)
+                .map_or(0, |c| c.teb),
+            ..Default::default()
+        };
+        if let Some(prepare) = self.body_services {
+            prepare(self, ext, &mut services);
+        }
+        services
+    }
+
+    /// Modes that require host-call observations (EXEC-CALL-1).
+    pub fn diagnostics(&self) -> u8 {
+        u8::from(DEBUGGER_ATTACHED.get())
+            | (u8::from(self.trace.enabled()) << 1)
+            | (u8::from(
+                self.stats.enabled
+                    || self.stats.services_enabled
+                    || self.stats.frame_budget.is_some(),
+            ) << 2)
+            | (u8::from(self.call_limit.is_some()) << 3)
+    }
+
     /// Assign a distinct process identity before creating any guest context.
     pub fn set_process_identity(&mut self, pid: u32) -> Result<(), &'static str> {
         if !self.contexts.is_empty() || pid > u32::MAX - 0x1000 {
@@ -1638,11 +1681,12 @@ impl Dispatch<'_> {
     }
 
     fn host_call(&mut self, cpu: &mut dyn Guest, index: u32) -> Result<(), Parked> {
-        if self.sys.thunks.get(index).audio {
+        let binding = self.sys.thunks.get(index);
+        let (audio, f) = (binding.audio, binding.f);
+        if audio {
             self.sys.contexts[self.sys.current as usize].audio_call_us =
                 Some(self.sys.clock.now_us());
         }
-        let f = self.sys.thunks.get(index).f;
         let esp = cpu.reg(Reg::Esp);
         self.unwind_escaped(cpu, |frame| esp >= frame.stack, "callback")?;
         let trace_args = (self.sys.trace.enabled() && (f.trace || self.sys.trace.all)).then(|| {
@@ -1657,9 +1701,11 @@ impl Dispatch<'_> {
             trace_args,
             interrupted: false,
         };
-        self.sys
-            .recent
-            .push(self.sys.current, index, cpu.read_u32(esp).unwrap_or(0));
+        if self.sys.diagnostics() != 0 {
+            self.sys
+                .recent
+                .push(self.sys.current, index, cpu.read_u32(esp).unwrap_or(0));
+        }
         self.sys.host_calls += 1;
         self.sys.stats.total.host_calls += 1;
         if self
@@ -1766,6 +1812,14 @@ impl Dispatch<'_> {
 }
 
 impl TrapHandler for Dispatch<'_> {
+    fn body_services(&self) -> adv_cpu::body::Services {
+        self.sys.services(self.ext)
+    }
+
+    fn diagnostics(&self) -> u8 {
+        self.sys.diagnostics()
+    }
+
     fn native_region(&self, pc: u32, code: &[u8]) -> Vec<adv_cpu::native_region::NativeRegion> {
         if !self.sys.required_redirects.contains(&pc)
             && (self.sys.trace.enabled() || self.sys.call_limit.is_some())
@@ -1804,7 +1858,7 @@ impl TrapHandler for Dispatch<'_> {
     }
 
     fn direct_body(&self, pc: u32) -> Option<adv_cpu::body::DirectBody> {
-        if self.sys.trace.enabled() || self.sys.call_limit.is_some() {
+        if self.sys.diagnostics() != 0 {
             return None;
         }
         self.sys.direct_bodies.get(&pc).copied()
@@ -1982,6 +2036,7 @@ impl<B: Backend> Machine<B> {
         }
         let sys = Sys {
             clock,
+            body_services: None,
             poll_wake: None,
             poll_observed: false,
             poll_activity: 0,

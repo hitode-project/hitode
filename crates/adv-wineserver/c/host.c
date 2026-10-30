@@ -57,6 +57,8 @@ __attribute__((weak)) int hitode_ntsync_ioctl( int fd, unsigned long request, vo
     return ioctl( fd, request, arg );
 }
 __attribute__((weak)) void hitode_ntsync_forget( int fd ) {}
+__attribute__((weak)) int hitode_ntsync_close( int fd ) { hitode_ntsync_forget( fd ); return 0; }
+__attribute__((weak)) int hitode_ntsync_export( int fd ) { return fd; }
 __attribute__((weak)) void hitode_ntsync_transfer( int fd, int operation ) {}
 
 int hitode_ioctl( int fd, unsigned long request, ... )
@@ -537,8 +539,8 @@ void hitode_channel_forget( int fd )
 
 int hitode_close( int fd )
 {
+    if (hitode_ntsync_close( fd )) return 0;
     hitode_channel_forget( fd );
-    hitode_ntsync_forget( fd );
     return close( fd );
 }
 
@@ -678,6 +680,11 @@ static struct transfer *transfers;
 
 ssize_t hitode_sendmsg( int fd, const struct msghdr *msg, int flags )
 {
+    struct msghdr local = *msg;
+    char control[msg->msg_controllen ? msg->msg_controllen : 1];
+    if (msg->msg_controllen) memcpy( control, msg->msg_control, msg->msg_controllen );
+    local.msg_control = control;
+    msg = &local;
     struct cmsghdr *cmsg;
     struct transfer *pending = NULL, *item;
     ssize_t ret;
@@ -691,7 +698,9 @@ ssize_t hitode_sendmsg( int fd, const struct msghdr *msg, int flags )
         count = (cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int);
         for (i = 0; i < count; i++)
         {
-            struct endpoint *end = endpoint( fds[i] );
+            struct endpoint *end;
+            if ((fds[i] = hitode_ntsync_export( fds[i] )) == -1) { ret = -1; goto done; }
+            end = endpoint( fds[i] );
             struct stat st;
             if (!end || !end->channel) continue;
             if (!(item = malloc( sizeof(*item) ))) { errno = ENOMEM; ret = -1; goto done; }

@@ -136,6 +136,17 @@ unsafe extern "C" {
     fn hitode_server_running(running: c_int);
     fn hitode_server_input() -> u64;
     fn hitode_server_key_state(tid: u32, key: u32) -> c_int;
+    fn hitode_server_keyboard_state(tid: u32, state: *mut u8) -> c_int;
+    fn hitode_server_close_handle(tid: u32, handle: u32) -> u32;
+    fn hitode_server_object(tid: u32, handle: u32) -> usize;
+    fn hitode_server_file_kind(tid: u32, handle: u32) -> i32;
+    fn hitode_server_sync_fd(
+        tid: u32,
+        handle: u32,
+        access: u32,
+        kind: i32,
+        status: *mut u32,
+    ) -> i32;
     fn hitode_server_queue() -> c_int;
     fn hitode_server_ready() -> c_int;
     fn hitode_names_revision() -> u64;
@@ -154,6 +165,47 @@ unsafe extern "C" {
 pub fn names_revision() -> u64 {
     // SAFETY: an atomic load with no preconditions.
     unsafe { hitode_names_revision() }
+}
+
+/// Whether the thread already owns a queue, without creating one.
+pub fn has_queue(tid: u32) -> bool {
+    // SAFETY: NULL requests only the existence check.
+    unsafe { hitode_server_keyboard_state(tid, std::ptr::null_mut()) != 0 }
+}
+
+/// Copy the queue state without synchronizing it, as NtUserGetKeyboardState does.
+/// # Safety
+/// `state` must hold 256 writable bytes.
+pub unsafe fn keyboard_state(tid: u32, state: *mut u8) -> bool {
+    // SAFETY: the caller supplies the output; server state is execution-owner serial.
+    unsafe { hitode_server_keyboard_state(tid, state) != 0 }
+}
+
+/// Existing synchronization state, without a request or descriptor transfer.
+pub fn sync_fd(tid: u32, handle: u32, access: u32, kind: i32) -> Result<i32, u32> {
+    let mut status = 0;
+    // SAFETY: clients run only while the server is suspended; status is writable.
+    let fd = unsafe { hitode_server_sync_fd(tid, handle, access, kind, &mut status) };
+    if status == 0 { Ok(fd) } else { Err(status) }
+}
+
+/// File kind without transferring a Unix descriptor.
+pub fn file_kind(tid: u32, handle: u32) -> i32 {
+    // SAFETY: clients and the server run serially on the execution owner.
+    unsafe { hitode_server_file_kind(tid, handle) }
+}
+
+/// The server object's identity, for sharing descriptor state at admission.
+pub fn object_identity(tid: u32, handle: u32) -> usize {
+    // SAFETY: clients and the server run serially on the execution owner.
+    unsafe { hitode_server_object(tid, handle) }
+}
+
+/// Close through the same handle table while the server is suspended.
+#[cfg(any(target_vendor = "apple", target_os = "android"))]
+pub fn close_handle(tid: u32, handle: u32) -> u32 {
+    // SAFETY: the execution owner serializes clients and the in-process server.
+    unsafe { hitode_server_close_handle(tid, handle) }
 }
 
 /// Wine's non-async key state, without creating a thread's message queue.

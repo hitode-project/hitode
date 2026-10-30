@@ -377,7 +377,7 @@ Required host text services follow WINE-UNIX-6 in interpreted and translated exe
 
 ### NAT-BODY-2 Performance counter body
 
-**Rule**: The native body of `ntdll.dll!NtQueryPerformanceCounter` MUST use the system call's counter computation and machine clock. It MUST return success and write the counter and optional frequency as the system call does. A null counter or an unwritable output MUST make the body decline before any write.
+**Rule**: Bodies of `kernelbase.dll!QueryPerformanceCounter`, `ntdll.dll!RtlQueryPerformanceCounter` and `ntdll.dll!NtQueryPerformanceCounter` MUST use the system call's counter computation and machine clock. They MUST write the counter and return what Windows returns. Inaccessible outputs MUST produce the status or exception Windows produces.
 **Verification**: Test
 
 ### NAT-BODY-3 DirectSound mixer
@@ -412,6 +412,19 @@ Field offsets match the pinned module's DWARF. The mixer runs as a host-call bod
 **Rule**: Bodies MUST reach guest memory through one access type, which on AArch64 reads the window and class table under A64-CALL-4. Other hosts MUST give that type the same results through `Memory`. Bodies MUST read and write guest bytes in place, copying only where their function's semantics need a snapshot.
 **Verification**: Test
 
+### NAT-BODY-18 Direct and service bodies
+
+**Rule**: Hot functions that complete without waits, thread switches or guest calls MUST bind as direct bodies under A64-CALL-2. Service bodies MAY change host state, such as server objects, queues and file positions, but MUST NOT read guest registers or schedule threads. Each binding MUST declare its calling convention, argument bytes and result registers.
+**Verification**: Test
+
+| Group | Service functions |
+|---|---|
+| Time | `QueryPerformanceCounter`, `timeGetTime` |
+| Input | `GetKeyState`, `GetAsyncKeyState`, `GetKeyboardState`, `GetCursorPos` |
+| Queues | `PeekMessageA` and `PeekMessageW` finding no message, `GetQueueStatus`, `GetInputState` |
+| Objects | Waits with a zero timeout, `SetEvent`, `ResetEvent`, `ReleaseSemaphore`, `ReleaseMutex` |
+| Files | File position queries and changes, `GetFileSize`, `GetFileSizeEx` |
+
 ### NAT-BODY-8 D3DX pixel conversion
 
 **Rule**: D3DX pixel bodies MUST preserve channel values, filter coordinates, color keys and padding with layouts matching the pinned module's DWARF. Unsupported formats or filters, overlapping buffers and inaccessible memory MUST decline before writes. Changed helper code or copy imports MUST retain guest execution.
@@ -434,7 +447,7 @@ Field offsets match the pinned module's DWARF. The mixer runs as a host-call bod
 
 ### NAT-BODY-12 Queue key state
 
-**Rule**: The native `win32u.dll!NtUserGetKeyState` body MUST return Wine's synchronized queue key state, masked and sign-extended, to the guest. Missing server links, threads or queues MUST retain guest execution without creating a queue or leaving server errors or references.
+**Rule**: The `win32u.dll!NtUserGetKeyState` body MUST return Wine's synchronized queue key state, masked and sign-extended, to the guest. A thread without a queue MAY return to guest code under A64-CALL-6, without creating a queue or leaving server errors or references.
 **Verification**: Test
 
 ### NAT-BODY-13 Statically linked helpers

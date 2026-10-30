@@ -221,7 +221,7 @@ fn output_completion_never_masks_a_handler_failure() {
 fn expired_watchdog_stops_before_explicit_deferred_work_without_frame_handoff() {
     use std::sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicU32, Ordering},
     };
 
     for jit in [false, true] {
@@ -229,13 +229,13 @@ fn expired_watchdog_stops_before_explicit_deferred_work_without_frame_handoff() 
         r.add("test", "present", Conv::Stdcall { argc: 0 }, |env| {
             env.sys.complete_frame();
             env.ext
-                .get::<Arc<AtomicBool>>()
-                .store(true, Ordering::Release);
+                .get::<Arc<AtomicU32>>()
+                .fetch_or(adv_sync::pending::INTERRUPT, Ordering::Release);
             Outcome::defer(|_| panic!("expired watchdog ran subsequent host work"))
         });
         let mut m = setup(JitCpu::new(PARK, jit).unwrap(), r);
         m.set_frame_handoff(false);
-        let flag = Arc::new(AtomicBool::new(false));
+        let flag = Arc::new(AtomicU32::new(0));
         m.cpu.executor_mut().set_host_interrupt_flag(flag.clone());
         m.ext.insert(flag.clone());
         let present = m.resolve_import("test", "present").unwrap();
@@ -250,7 +250,7 @@ fn expired_watchdog_stops_before_explicit_deferred_work_without_frame_handoff() 
         // A short wall budget can expire during cold execution before the frame
         // handler runs. Pause explicitly after it commits the frame and queues
         // Defer, then expire the watchdog at that retained driver boundary.
-        while !flag.load(Ordering::Acquire) {
+        while flag.load(Ordering::Acquire) & adv_sync::pending::INTERRUPT == 0 {
             let result = m.run_slice(Duration::from_millis(200));
             assert!(matches!(result, SliceResult::Yielded), "{result:?}");
         }
@@ -264,7 +264,7 @@ fn expired_watchdog_stops_before_explicit_deferred_work_without_frame_handoff() 
         // Hard expiration must win over the queued continuation and any frame
         // handoff; no real-time sleep or startup-speed assumption is required.
         m.set_execution_budget(Some(Duration::ZERO));
-        flag.store(false, Ordering::Release);
+        flag.fetch_and(!adv_sync::pending::INTERRUPT, Ordering::Release);
         let SliceResult::Complete(RunResult::Failed(error)) =
             m.run_slice(Duration::from_millis(200))
         else {
@@ -282,20 +282,20 @@ fn expired_watchdog_stops_before_explicit_deferred_work_without_frame_handoff() 
 fn an_external_interrupt_still_returns_after_output_and_resumes_without_replay() {
     use std::sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicU32, Ordering},
     };
     for jit in [false, true] {
         let mut r = Registry::default();
         r.add("test", "present", Conv::Stdcall { argc: 0 }, |env| {
             env.sys.complete_frame();
             env.ext
-                .get::<Arc<AtomicBool>>()
-                .store(true, Ordering::Release);
+                .get::<Arc<AtomicU32>>()
+                .fetch_or(adv_sync::pending::INTERRUPT, Ordering::Release);
             Outcome::Return(0)
         });
         let mut m = setup(JitCpu::new(PARK, jit).unwrap(), r);
         m.set_frame_handoff(false);
-        let flag = Arc::new(AtomicBool::new(false));
+        let flag = Arc::new(AtomicU32::new(0));
         m.cpu.executor_mut().set_host_interrupt_flag(flag.clone());
         m.ext.insert(flag.clone());
         let present = m.resolve_import("test", "present").unwrap();
@@ -312,7 +312,7 @@ fn an_external_interrupt_still_returns_after_output_and_resumes_without_replay()
         ));
         assert_eq!(m.sys.scheduling.external_interrupts, 1);
         assert_eq!(m.sys.scheduling.frame_host_yields, 0);
-        flag.store(false, Ordering::Release);
+        flag.fetch_and(!adv_sync::pending::INTERRUPT, Ordering::Release);
         assert!(matches!(
             m.run_slice(Duration::from_millis(200)),
             SliceResult::Complete(RunResult::Exited(0))

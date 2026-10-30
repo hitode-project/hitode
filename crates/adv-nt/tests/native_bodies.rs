@@ -165,7 +165,8 @@ fn ntdll_memcpy_matches_wine() {
     );
     assert_eq!(reference.sys.host_calls, 0);
     // A source that runs into an unmapped page: Wine's code faults inside
-    // the function, the body as its entry's first instruction (A64-CALL-4).
+    // the function, the body as its entry's first instruction (A64-CALL-4),
+    // before it writes anything or runs guest code.
     let args = [DATA, DATA + DATA_LEN - 100, 500];
     let entry = native.cpu.read_u32(SLOT).unwrap();
     let faulted = call(&mut native, &data, args).unwrap_err();
@@ -176,4 +177,8 @@ fn ntdll_memcpy_matches_wine() {
     );
     let at_entry = format!("Fault {{ kind: Read({}), pc: {entry} }}", DATA + DATA_LEN);
     assert!(faulted.contains(&at_entry), "{faulted}");
+    assert_eq!(adv_nt::native::declines(&native.ext), 0);
+    let mut copied = [0; 100];
+    native.cpu.read(DATA, &mut copied).unwrap();
+    assert_eq!(copied[..], data[..100]);
 }

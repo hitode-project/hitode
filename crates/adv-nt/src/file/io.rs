@@ -87,13 +87,21 @@ pub fn read(env: &mut Env<'_>, args: &[u32]) -> Outcome {
             // SAFETY: a live server descriptor and a writable buffer of length bytes.
             let count = if let Some(reader) = &reader {
                 let reader = reader.as_ref().map_err(|_| 0xc000_0185u32)?;
-                let at =
-                    position.unwrap_or_else(|| unsafe { libc::lseek(fd.fd, 0, libc::SEEK_CUR) });
+                let at = position.unwrap_or_else(|| {
+                    fd.file.as_ref().map_or_else(
+                        || unsafe { libc::lseek(fd.fd, 0, libc::SEEK_CUR) },
+                        |file| file.position.get(),
+                    )
+                }) + if fd.file.is_some() || position.is_some() {
+                    total as i64
+                } else {
+                    0
+                };
                 let at_unsigned = u64::try_from(at).map_err(|_| status::INVALID_PARAMETER)?;
                 let count = reader
                     .read_at(at_unsigned, &mut bytes[total..])
                     .map_err(|_| 0xc000_0185u32)?;
-                if position.is_none() {
+                if position.is_none() && fd.file.is_none() {
                     unsafe {
                         libc::lseek(fd.fd, at + count as i64, libc::SEEK_SET);
                     }
@@ -105,6 +113,12 @@ pub fn read(env: &mut Env<'_>, args: &[u32]) -> Outcome {
                         Some(off) => {
                             libc::pread(fd.fd, bytes.as_mut_ptr().cast(), bytes.len(), off)
                         }
+                        None if fd.file.is_some() => libc::pread(
+                            fd.fd,
+                            bytes[total..].as_mut_ptr().cast(),
+                            bytes.len() - total,
+                            fd.file.as_ref().unwrap().position.get() + total as i64,
+                        ),
                         None => libc::read(
                             fd.fd,
                             bytes[total..].as_mut_ptr().cast(),
@@ -140,7 +154,12 @@ pub fn read(env: &mut Env<'_>, args: &[u32]) -> Outcome {
             }
             return Err(status.into());
         };
-        if let Some(off) = position
+        if let Some(file) = &fd.file {
+            if !asynchronous {
+                file.position
+                    .set(position.unwrap_or_else(|| file.position.get()) + i64::from(count));
+            }
+        } else if let Some(off) = position
             && !asynchronous
         {
             // SAFETY: the same live regular file; Wine advances its synchronous position.
@@ -955,12 +974,24 @@ fn segmented_io(env: &mut Env<'_>, args: &[u32], writing: bool) -> Outcome {
                         bytes.len(),
                         off + i64::from(total),
                     ),
+                    (true, None) if fd.file.is_some() => libc::pwrite(
+                        fd.fd,
+                        bytes.as_ptr().cast(),
+                        bytes.len(),
+                        fd.file.as_ref().unwrap().position.get(),
+                    ),
                     (true, None) => libc::write(fd.fd, bytes.as_ptr().cast(), bytes.len()),
                     (false, Some(off)) => libc::pread(
                         fd.fd,
                         bytes.as_mut_ptr().cast(),
                         bytes.len(),
                         off + i64::from(total),
+                    ),
+                    (false, None) if fd.file.is_some() => libc::pread(
+                        fd.fd,
+                        bytes.as_mut_ptr().cast(),
+                        bytes.len(),
+                        fd.file.as_ref().unwrap().position.get(),
                     ),
                     (false, None) => libc::read(fd.fd, bytes.as_mut_ptr().cast(), bytes.len()),
                 }
@@ -981,6 +1012,11 @@ fn segmented_io(env: &mut Env<'_>, args: &[u32], writing: bool) -> Outcome {
             let result = result as u32;
             if !writing && let Some(bytes) = fallback {
                 write_bytes(env, address, &bytes[..result as usize])?;
+            }
+            if position.is_none()
+                && let Some(file) = &fd.file
+            {
+                file.position.set(file.position.get() + i64::from(result));
             }
             total += result;
             remaining = remaining.wrapping_sub(result);

@@ -15,6 +15,7 @@ use crate::layout::{DYN_END, DYN_START, GRANULE, PAGE};
 pub struct Vm {
     /// Reserved regions: start -> size.
     used: BTreeMap<u32, u32>,
+    first_free: u32,
 }
 
 impl Default for Vm {
@@ -31,6 +32,7 @@ impl Vm {
     pub fn new() -> Self {
         Self {
             used: BTreeMap::new(),
+            first_free: DYN_START,
         }
     }
 
@@ -50,9 +52,26 @@ impl Vm {
                 .is_some_and(|(&s, _)| u64::from(s) < end)
     }
 
+    /// First free dynamic granule. Reservations advance it; releases expose holes.
+    pub fn first_free(&self) -> u32 {
+        self.first_free
+    }
+
+    fn advance_free(&mut self) {
+        while let Some((base, size)) = self.containing(self.first_free) {
+            let end = u64::from(base) + u64::from(size);
+            self.first_free = end
+                .next_multiple_of(u64::from(GRANULE))
+                .min(u64::from(DYN_END)) as u32;
+            if self.first_free == DYN_END {
+                break;
+            }
+        }
+    }
+
     fn find_free(&self, size: u32) -> Option<u32> {
-        let mut cursor = DYN_START;
-        for (&start, &len) in self.used.range(..DYN_END) {
+        let mut cursor = self.first_free;
+        for (&start, &len) in self.used.range(self.first_free..DYN_END) {
             if start >= cursor && start - cursor >= size {
                 return Some(cursor);
             }
@@ -70,6 +89,7 @@ impl Vm {
             return false;
         }
         self.used.insert(addr, size);
+        self.advance_free();
         true
     }
 
@@ -78,12 +98,14 @@ impl Vm {
         let size = size.max(1).checked_add(GRANULE - 1)? & !(GRANULE - 1);
         let addr = self.find_free(size)?;
         self.used.insert(addr, size);
+        self.advance_free();
         Some(addr)
     }
 
     /// Roll back a reservation whose mapping failed, without touching CPU pages.
     pub(crate) fn cancel_reservation(&mut self, addr: u32) {
         self.used.remove(&addr);
+        self.first_free = self.first_free.min(addr.max(DYN_START));
     }
 
     /// Reserve exactly `size` bytes at a free granule-aligned address. Like a
@@ -93,6 +115,7 @@ impl Vm {
         let granules = size.max(1).checked_add(GRANULE - 1)? & !(GRANULE - 1);
         let addr = self.find_free(granules)?;
         self.used.insert(addr, size.max(1));
+        self.advance_free();
         Some(addr)
     }
 
@@ -102,6 +125,7 @@ impl Vm {
         let size = self.used[&addr];
         if let Err(error) = cpu.map(addr, size, prot) {
             self.used.remove(&addr);
+            self.first_free = self.first_free.min(addr.max(DYN_START));
             return Err(error);
         }
         Ok(addr)
@@ -125,6 +149,7 @@ impl Vm {
         let total = self.used[&addr];
         if let Err(error) = cpu.map(addr + guard, total - guard, prot) {
             self.used.remove(&addr);
+            self.first_free = self.first_free.min(addr.max(DYN_START));
             return Err(error);
         }
         Ok(addr)
@@ -168,6 +193,7 @@ impl Vm {
             }
         }
         self.used.remove(&addr);
+        self.first_free = self.first_free.min(addr.max(DYN_START));
         Ok(())
     }
 }
@@ -221,6 +247,21 @@ mod tests {
         fn has_locked_pages(&self, _: u32, _: u32) -> bool {
             self.locked
         }
+    }
+
+    // spec: EXEC-CALL-3
+    #[test]
+    fn allocations_skip_the_reserved_prefix_and_reuse_freed_holes() {
+        let mut vm = Vm::new();
+        for page in 0..4096 {
+            assert!(vm.reserve_at(DYN_START + page * GRANULE, GRANULE));
+        }
+        assert_eq!(vm.first_free(), DYN_START + 4096 * GRANULE);
+        let hole = DYN_START + 31 * GRANULE;
+        vm.cancel_reservation(hole);
+        assert_eq!(vm.first_free(), hole);
+        assert_eq!(vm.reserve(GRANULE), Some(hole));
+        assert_eq!(vm.first_free(), DYN_START + 4096 * GRANULE);
     }
 
     #[test]

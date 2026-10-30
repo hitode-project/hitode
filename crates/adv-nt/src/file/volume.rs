@@ -326,6 +326,17 @@ impl Mounts {
             .get(&(metadata.dev(), metadata.ino()))
             .cloned()
     }
+    pub(crate) fn file_standard(&self, fd: RawFd) -> Option<[u8; 22]> {
+        let identity = self.of_fd(fd).filter(|file| !file.entry.directory)?;
+        // SAFETY: borrow the descriptor during its cold admission.
+        let file = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) });
+        let metadata = file.metadata().ok()?;
+        let mut bytes = [0; 22];
+        bytes[..8].copy_from_slice(&identity.entry.allocated.to_le_bytes());
+        bytes[8..16].copy_from_slice(&identity.entry.size.to_le_bytes());
+        bytes[16..20].copy_from_slice(&(metadata.nlink() as u32).to_le_bytes());
+        Some(bytes)
+    }
     pub fn reader(&self, fd: RawFd) -> Option<io::Result<Rc<dyn ReadFile>>> {
         self.of_fd(fd)
             .filter(|file| !file.entry.directory)

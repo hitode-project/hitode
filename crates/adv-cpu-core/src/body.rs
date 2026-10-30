@@ -18,6 +18,9 @@ use crate::backend::{Guest, Prot};
 use crate::memory::{EXEC, READ, SHARED, WRITE};
 
 const PAGE_SHIFT: u32 = 12;
+/// Body-page flags, separate from native two-page grants.
+pub const ALIAS: u8 = 1 << 5;
+pub const NO_ALIAS: u8 = 1 << 6;
 
 /// Why a body stopped before finishing. It has written nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -77,22 +80,50 @@ pub const ECX: u8 = 4;
 /// on the full path.
 pub const SLOW: u64 = 1 << 32;
 
+/// Shared host storage and thread identity, captured before native entry.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct Services {
+    pub clock: *const std::ffi::c_void,
+    pub epoch_us: u64,
+    pub state: *const std::ffi::c_void,
+    pub thread: u32,
+    pub teb: u32,
+}
+
+impl Default for Services {
+    fn default() -> Self {
+        Self {
+            clock: std::ptr::null(),
+            epoch_us: 0,
+            state: std::ptr::null(),
+            thread: 0,
+            teb: 0,
+        }
+    }
+}
+
 /// What generated code passes in x0.
 #[repr(C)]
 #[derive(Debug)]
 pub struct BodyContext {
     /// Host address of guest address 0 in the window.
     pub window: *mut u8,
-    /// A class byte per 4 KiB guest page, as `Memory::native_permissions`
-    /// has them.
+    /// Private linear storage, for pages restricted only by window host protection.
+    pub alias: *mut u8,
+    /// A class byte per 4 KiB guest page. ALIAS selects private storage;
+    /// NO_ALIAS confines overlays to the window.
     pub classes: *const u8,
+    pub services: Services,
 }
 
 impl Default for BodyContext {
     fn default() -> Self {
         Self {
             window: std::ptr::null_mut(),
+            alias: std::ptr::null_mut(),
             classes: std::ptr::null(),
+            services: Services::default(),
         }
     }
 }
@@ -189,6 +220,11 @@ macro_rules! body {
 /// the pointers stay valid until the body returns. Overlapping input and
 /// output ranges are the body's to order.
 pub trait Mem {
+    /// Shared host state; a body never reaches the machine or its extensions.
+    fn services(&self) -> Services {
+        Services::default()
+    }
+
     /// The `len` bytes at `at`, to read.
     fn input(&mut self, at: u32, len: u32) -> Result<*const u8, Stop>;
     /// The `len` bytes at `at`, holding their current bytes, to write.
@@ -236,7 +272,9 @@ fn pages(at: u32, len: u32) -> Option<std::ops::RangeInclusive<u32>> {
 /// (A64-MEM-7), and anything else is the full path's.
 pub struct Window {
     window: *mut u8,
+    alias: *mut u8,
     classes: *const u8,
+    services: Services,
 }
 
 impl Window {
@@ -245,7 +283,9 @@ impl Window {
     pub unsafe fn new(context: &BodyContext) -> Self {
         Self {
             window: context.window,
+            alias: context.alias,
             classes: context.classes,
+            services: context.services,
         }
     }
 
@@ -255,19 +295,34 @@ impl Window {
     }
 
     fn check(&self, at: u32, len: u32, need: u8, deny: u8) -> Result<*mut u8, Stop> {
+        let mut flags = 0;
         if len != 0 {
             let pages = pages(at, len).ok_or(Stop::Slow)?;
             for page in pages {
-                if self.class(page) & (need | deny) != need {
+                let class = self.class(page);
+                if class & (need | deny) != need {
                     return Err(Stop::Slow);
                 }
+                flags |= class;
             }
         }
-        Ok(self.window.wrapping_add(at as usize))
+        let base = if flags & ALIAS != 0 {
+            if flags & NO_ALIAS != 0 {
+                return Err(Stop::Slow);
+            }
+            self.alias
+        } else {
+            self.window
+        };
+        Ok(base.wrapping_add(at as usize))
     }
 }
 
 impl Mem for Window {
+    fn services(&self) -> Services {
+        self.services
+    }
+
     fn input(&mut self, at: u32, len: u32) -> Result<*const u8, Stop> {
         self.check(at, len, READ, SHARED).map(<*mut u8>::cast_const)
     }
@@ -281,7 +336,8 @@ impl Mem for Window {
         while found < max {
             let start = at.wrapping_add(found * unit);
             let page = start >> PAGE_SHIFT;
-            if self.class(page) & (READ | SHARED) != READ {
+            let mut classes = self.class(page);
+            if classes & (READ | SHARED) != READ {
                 return Err(Stop::Slow);
             }
             // Finish this page before checking the next one. Only a unit
@@ -289,10 +345,22 @@ impl Mem for Window {
             let room = ((((page + 1) << PAGE_SHIFT).wrapping_sub(start)) / unit).max(1);
             let count = room.min(max - found);
             let end = start.checked_add(count * unit - 1).ok_or(Stop::Slow)?;
-            if end >> PAGE_SHIFT != page && self.class(page + 1) & (READ | SHARED) != READ {
-                return Err(Stop::Slow);
+            if end >> PAGE_SHIFT != page {
+                let next = self.class(page + 1);
+                if next & (READ | SHARED) != READ {
+                    return Err(Stop::Slow);
+                }
+                classes |= next;
             }
-            let bytes = self.window.wrapping_add(start as usize).cast_const();
+            let base = if classes & ALIAS != 0 {
+                if classes & NO_ALIAS != 0 {
+                    return Err(Stop::Slow);
+                }
+                self.alias
+            } else {
+                self.window
+            };
+            let bytes = base.wrapping_add(start as usize).cast_const();
             // SAFETY: the pages holding these units are readable.
             let units = unsafe { std::slice::from_raw_parts(bytes, (count * unit) as usize) };
             if let Some(zero) = zero(units, unit) {
@@ -360,6 +428,7 @@ pub struct GuestMem<'a> {
     scratch: &'a mut Scratch,
     /// Buffers this call holds.
     used: usize,
+    services: Services,
 }
 
 /// What the full path reuses from call to call.
@@ -377,7 +446,14 @@ impl<'a> GuestMem<'a> {
             cpu,
             scratch,
             used: 0,
+            services: Services::default(),
         }
+    }
+
+    pub fn for_body(cpu: &'a mut dyn Guest, scratch: &'a mut Scratch, services: Services) -> Self {
+        let mut mem = Self::new(cpu, scratch);
+        mem.services = services;
+        mem
     }
 
     /// The first byte of `[at, at + len)` that `prot` rules out.
@@ -410,6 +486,10 @@ impl<'a> GuestMem<'a> {
 }
 
 impl Mem for GuestMem<'_> {
+    fn services(&self) -> Services {
+        self.services
+    }
+
     fn input(&mut self, at: u32, len: u32) -> Result<*const u8, Stop> {
         if len == 0 {
             return Ok(std::ptr::NonNull::dangling().as_ptr());
@@ -582,7 +662,9 @@ mod tests {
         }
         let window = Window {
             window: bytes.as_mut_ptr(),
+            alias: bytes.as_mut_ptr(),
             classes: table.as_ptr(),
+            services: Services::default(),
         };
         (window, table)
     }
@@ -619,5 +701,27 @@ mod tests {
         let (mut w, _table) = window(&[(0, READ)], &mut bytes);
         assert_eq!(w.terminated(0xffe, 1, u32::MAX), Err(Stop::Slow));
         assert_eq!(w.terminated(0xffe, 1, 2), Ok(2), "only units it reads");
+    }
+    // spec: A64-CALL-4, A64-MEM-8
+    #[test]
+    fn body_aliases_take_only_private_unwatched_pages() {
+        let mut window_bytes = vec![0; 8192];
+        let mut alias_bytes = vec![7; 8192];
+        let (mut mem, mut table) = window(
+            &[(0, READ | WRITE | ALIAS), (1, READ | WRITE)],
+            &mut window_bytes,
+        );
+        mem.alias = alias_bytes.as_mut_ptr();
+        // SAFETY: both checked pages use ordinary private alias storage.
+        assert_eq!(unsafe { *mem.input(4090, 12).unwrap() }, 7);
+        let output = mem.output(4090, 12).unwrap();
+        // SAFETY: the checked output spans the same private alias pages.
+        unsafe { std::ptr::write_bytes(output, 9, 12) };
+        assert_eq!(&alias_bytes[4090..4102], &[9; 12]);
+        assert_eq!(&window_bytes[4090..4102], &[0; 12]);
+        table[1] |= NO_ALIAS;
+        assert_eq!(mem.input(4090, 12), Err(Stop::Slow));
+        table[0] |= EXEC;
+        assert_eq!(mem.output(0, 1), Err(Stop::Slow));
     }
 }

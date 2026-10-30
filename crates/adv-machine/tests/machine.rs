@@ -60,6 +60,8 @@ fn execution_budget_reports_running_context_pc_and_recent_calls() {
         a.bytes.extend_from_slice(&[0xeb, 0xfe]); // no trap, Sleep or other cooperative scheduling point
     });
     t.m.spawn("M", CODE, &[], 0x1_0000).unwrap();
+    // Recent calls are recorded only with diagnostics on (EXEC-CALL-1).
+    t.m.sys.stats.enabled = true;
     t.m.set_execution_budget(Some(Duration::from_millis(30)));
     let guest_time = t.m.sys.clock.now_us();
     let start = Instant::now();

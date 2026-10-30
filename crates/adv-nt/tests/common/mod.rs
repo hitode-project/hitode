@@ -168,6 +168,27 @@ pub fn run_probe_inspect(
     prepare: impl FnOnce(&mut Machine<Cpu>, &std::path::Path),
     inspect: impl FnOnce(&mut Machine<Cpu>),
 ) -> Option<(RunResult, String)> {
+    run_probe_engine(
+        name,
+        real_time,
+        graphics_driver,
+        resolver,
+        prepare,
+        inspect,
+        false,
+    )
+}
+
+#[allow(dead_code, reason = "only native-body fixtures select an engine")]
+pub fn run_probe_engine(
+    name: &str,
+    real_time: bool,
+    graphics_driver: &str,
+    resolver: impl Resolver,
+    prepare: impl FnOnce(&mut Machine<Cpu>, &std::path::Path),
+    inspect: impl FnOnce(&mut Machine<Cpu>),
+    native: bool,
+) -> Option<(RunResult, String)> {
     let _ = log::set_logger(&WineLog).map(|()| log::set_max_level(log::LevelFilter::Warn));
     let Some(dist) = std::env::var_os("ADV_WINE_DIST").map(PathBuf::from) else {
         eprintln!("skipped: ADV_WINE_DIST is not set");
@@ -237,7 +258,7 @@ pub fn run_probe_inspect(
         signals: signals.clone(),
     };
 
-    let cpu = Cpu::new(PARK_ADDR, false).unwrap();
+    let cpu = Cpu::new(PARK_ADDR, native).unwrap();
     let mut machine = Machine::new(cpu, resolver, machine_clock).unwrap();
     prepare(&mut machine, &prefix);
     let mut fds = [0; 2];

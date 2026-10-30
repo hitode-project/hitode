@@ -518,6 +518,14 @@ struct Raw<'a> {
 }
 
 impl ExecutionTrap for Raw<'_> {
+    fn body_services(&self) -> adv_cpu_core::body::Services {
+        self.handler.body_services()
+    }
+
+    fn diagnostics(&self) -> u8 {
+        self.handler.diagnostics()
+    }
+
     fn native_region(
         &self,
         pc: u32,

@@ -98,6 +98,7 @@ fn performance_counter_matches_wine() {
     let mut native = machine(&dll, &image);
     let mut reference = machine(&dll, &image);
     reference.sys.redirects.clear();
+    reference.sys.stats.services_enabled = true;
     const CASES: u32 = 300;
     for case in 0..CASES {
         let now = 1_000_000 + u64::from(case) * 12_345_678;
@@ -128,7 +129,7 @@ fn performance_counter_matches_wine() {
             .map(|tally| tally.calls)
             .sum::<u64>()
     };
-    assert!(native.sys.host_calls > u64::from(CASES / 2));
+    assert!(native.sys.host_calls < reference.sys.host_calls);
     assert!(
         syscalls(&native) < u64::from(CASES / 2),
         "the body bypasses system calls"
@@ -144,6 +145,6 @@ fn performance_counter_matches_wine() {
         assert_eq!(got, call(&mut reference, counter, frequency));
         assert_eq!(got[0], adv_nt::status::ACCESS_VIOLATION);
         assert_eq!(got[1], got[2]);
-        assert_eq!(adv_nt::native::declines(&native.ext), abandons + 1);
+        assert_eq!(adv_nt::native::declines(&native.ext), abandons);
     }
 }

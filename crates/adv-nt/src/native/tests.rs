@@ -41,6 +41,7 @@ struct TestGuest {
     regs: [u32; 16],
     lend: bool,
     access: Cell<HostAccess>,
+    snapshots: Cell<usize>,
 }
 impl TestGuest {
     fn range(&self, addr: u32, len: usize, prot: Prot) -> Option<std::ops::Range<usize>> {
@@ -109,6 +110,7 @@ impl Guest for TestGuest {
         Some(&mut self.bytes[range])
     }
     fn host_access(&self) -> HostAccess {
+        self.snapshots.set(self.snapshots.get() + 1);
         self.access.get()
     }
     fn copy_memory(&mut self, src: u32, dst: u32, len: usize) -> Result<(), MemFault> {
@@ -147,6 +149,7 @@ fn guest() -> TestGuest {
         regs: [0; 16],
         lend: true,
         access: Cell::new(HostAccess::default()),
+        snapshots: Cell::new(0),
     };
     cpu.regs[Reg::Esp as usize] = 7 * PAGE as u32;
     cpu
@@ -229,7 +232,7 @@ fn native_body_decline_allocation_gate() {
                 // Direct bodies never decline; their full path raises
                 // faults before it writes (NAT-BODY-16, A64-CALL-4).
                 let unchanged = match (function, body.direct) {
-                    (_, Some(direct)) => match run_full(&mut env, direct, body.handler) {
+                    (_, Some(direct)) => match run_full(&mut env, direct, |_| Outcome::Return(0)) {
                         Outcome::Raise(_) => true,
                         Outcome::Return(_) | Outcome::Return64(_) => false,
                         _ => panic!("{} failed on its full path", body.name),
@@ -277,6 +280,7 @@ fn native_boundary_rejects_write_then_decline() {
         direct: None,
     };
     let mut machine = machine();
+    machine.sys.stats.services_enabled = true;
     let mut cpu = guest();
     run_body(
         &mut Env {
@@ -326,6 +330,7 @@ fn a_body_that_would_wait_runs_its_guest_code_once() {
 #[test]
 fn native_boundary_counts_untimed_calls_and_keeps_tail_ring() {
     let mut machine = machine();
+    machine.sys.stats.services_enabled = true;
     let mut cpu = guest();
     let at = 7 * PAGE as u32 + 4;
     for (i, value) in [0x3000, 0x4000].iter().enumerate() {
@@ -699,4 +704,164 @@ fn wide_substrings_search_overlapping_unit_patterns() {
             }
         }
     }
+}
+
+// spec: EXEC-CALL-1
+#[test]
+fn disabled_body_diagnostics_take_no_memory_snapshots_or_records() {
+    static QUIET: Body = Body {
+        name: std::borrow::Cow::Borrowed("fixture!quiet"),
+        conv: Conv::Stdcall { argc: 0 },
+        body: Some(|_| Some(7)),
+        handler: |_| Outcome::Return(0),
+        direct: None,
+    };
+    let mut machine = machine();
+    let context = machine
+        .spawn("quiet body", PARK_ADDR, &[], 0x10000)
+        .unwrap();
+    let mut cpu = guest();
+    let mut env = Env {
+        cpu: &mut cpu,
+        sys: &mut machine.sys,
+        ext: &mut machine.ext,
+        context,
+        thunk: 0,
+    };
+    assert!(matches!(
+        run_body(&mut env, 0, &QUIET),
+        Outcome::Return64(7)
+    ));
+    assert_eq!(cpu.snapshots.get(), 0);
+    assert!(machine.ext.try_get::<Boundary>().is_none());
+    machine.sys.stats.services_enabled = true;
+    let mut env = Env {
+        cpu: &mut cpu,
+        sys: &mut machine.sys,
+        ext: &mut machine.ext,
+        context,
+        thunk: 0,
+    };
+    assert!(matches!(
+        run_body(&mut env, 0, &QUIET),
+        Outcome::Return64(7)
+    ));
+    assert_eq!(cpu.snapshots.get(), 2);
+    assert_eq!(machine.ext.get::<Boundary>().bodies[0].calls, 1);
+}
+
+// spec: EXEC-CALL-3, NAT-BODY-18
+#[test]
+fn file_bodies_use_known_positions_and_immutable_sizes_without_a_descriptor() {
+    use adv_cpu::body::{GuestMem, Scratch, Services};
+    let states = std::rc::Rc::new(crate::file::state::States::default());
+    let mut standard = [0; 22];
+    standard[8..16].copy_from_slice(&123u64.to_le_bytes());
+    states.insert(4, -1, 1, Some(standard), 1);
+    states.get(4).unwrap().position.set(42);
+    let services = Services {
+        state: std::rc::Rc::as_ptr(&states).cast(),
+        teb: 0x3000,
+        ..Default::default()
+    };
+    let mut cpu = guest();
+    let mut scratch = Scratch::default();
+    let mut call = |name: &str, args| {
+        let body = services::bodies()
+            .find(|body| body.name.ends_with(name))
+            .unwrap()
+            .direct
+            .unwrap();
+        (body.full)(
+            &mut GuestMem::for_body(&mut cpu, &mut scratch, services),
+            args,
+        )
+    };
+    assert_eq!(
+        call("GetFileSize", [4, 0, 0, 0, 0, 0, 0]).unwrap().value,
+        123
+    );
+    assert_eq!(
+        call("GetFileSizeEx", [4, 0x2000, 0, 0, 0, 0, 0])
+            .unwrap()
+            .value,
+        1
+    );
+    assert_eq!(
+        call("SetFilePointer", [4, 0, 0, 1, 0, 0, 0]).unwrap().value,
+        42
+    );
+    assert_eq!(
+        call("SetFilePointerEx", [4, 7, 0, 0x2000, 1, 0, 0])
+            .unwrap()
+            .value,
+        1
+    );
+    assert_eq!(states.get(4).unwrap().position.get(), 49);
+    drop(call);
+    for (handle, kind) in [(8, 2), (12, 5), (16, 3)] {
+        states.insert(handle, -1, handle as usize, None, kind);
+        let body = services::bodies()
+            .find(|body| body.name.ends_with("GetFileSizeEx"))
+            .unwrap()
+            .direct
+            .unwrap();
+        let result = (body.full)(
+            &mut GuestMem::for_body(&mut cpu, &mut scratch, services),
+            [handle, 0x2000, 0, 0, 0, 0, 0],
+        )
+        .unwrap();
+        assert_eq!(result.value, u64::from(kind != 3));
+    }
+}
+
+// spec: NAT-BODY-2
+#[test]
+fn counter_bodies_preserve_windows_fault_status_alignment_and_overlap() {
+    use adv_cpu::body::{GuestMem, Scratch, Services, Stop};
+    let clock = Clock::virtual_time();
+    let services = Services {
+        clock: clock.body_pointer(),
+        epoch_us: clock.epoch_us,
+        ..Default::default()
+    };
+    let mut cpu = guest();
+    let mut scratch = Scratch::default();
+    for (counter, frequency, status) in [
+        (0, 0, crate::status::ACCESS_VIOLATION),
+        (0x2001, 0, 0x80000002),
+        (0x2000, 0x1000, crate::status::ACCESS_VIOLATION),
+        (0x2000, 0x2001, 0x80000002),
+        (0, 0x2001, crate::status::ACCESS_VIOLATION),
+        (0x2000, 0x2000, 0),
+    ] {
+        cpu.bytes[0x2000..0x2010].fill(0xcc);
+        let result = (services::NT_COUNTER.full)(
+            &mut GuestMem::for_body(&mut cpu, &mut scratch, services),
+            [counter, frequency, 0, 0, 0, 0, 0],
+        )
+        .unwrap();
+        assert_eq!(result.value as u32, status);
+        if status != 0 {
+            assert_eq!(&cpu.bytes[0x2000..0x2010], &[0xcc; 16]);
+        } else {
+            assert_eq!(&cpu.bytes[0x2000..0x2008], &10_000_000u64.to_le_bytes());
+        }
+    }
+    assert!(matches!(
+        (services::COUNTER.full)(
+            &mut GuestMem::for_body(&mut cpu, &mut scratch, services),
+            [0; 7]
+        ),
+        Err(Stop::Fault { write: true, .. })
+    ));
+    assert_eq!(
+        (services::COUNTER.full)(
+            &mut GuestMem::for_body(&mut cpu, &mut scratch, services),
+            [0x2001, 0, 0, 0, 0, 0, 0]
+        )
+        .unwrap()
+        .value,
+        1
+    );
 }

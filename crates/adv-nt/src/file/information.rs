@@ -128,10 +128,20 @@ fn query_in(
     let fd = match server::handle_fd(env, handle) {
         Ok(fd) => fd,
         Err(Error::Status(status::BAD_DEVICE_TYPE)) => {
+            if let Some(file) = server::pipe_state(env, handle)?
+                && class == FILE_POSITION_INFORMATION
+            {
+                write_bytes(env, buffer, &file.position.get().to_le_bytes())?;
+                return Ok((status::SUCCESS, 8));
+            }
             return query_server(env, handle, buffer, length, class);
         }
         Err(error) => return Err(error),
     };
+    // Windows 11 returns STATUS_NOT_IMPLEMENTED for socket size/position queries.
+    if fd.kind == 3 && matches!(class, FILE_STANDARD_INFORMATION | FILE_POSITION_INFORMATION) {
+        return Err(status::NOT_IMPLEMENTED.into());
+    }
     if matches!(class, FILE_PIPE_INFORMATION | FILE_PIPE_LOCAL_INFORMATION) {
         drop(fd);
         return query_server(env, handle, buffer, length, class);
@@ -148,9 +158,26 @@ fn query_in(
     env.cpu
         .read(buffer, &mut bytes)
         .map_err(|_| status::ACCESS_VIOLATION)?;
+    if let Some(standard) = fd.state.as_ref().and_then(|file| file.immutable)
+        && matches!(
+            class,
+            FILE_STANDARD_INFORMATION | FILE_END_OF_FILE_INFORMATION
+        )
+    {
+        if class == FILE_STANDARD_INFORMATION {
+            bytes[..22].copy_from_slice(&standard);
+        } else {
+            bytes.copy_from_slice(&standard[8..16]);
+        }
+        write_bytes(env, buffer, &bytes)?;
+        return Ok((status::SUCCESS, size));
+    }
     if class == FILE_POSITION_INFORMATION {
         // SAFETY: the server's descriptor is live for this call.
-        let position = unsafe { libc::lseek(fd.fd, 0, libc::SEEK_CUR) };
+        let position = fd.state.as_ref().map_or_else(
+            || unsafe { libc::lseek(fd.fd, 0, libc::SEEK_CUR) },
+            |file| file.position.get(),
+        );
         if position == -1 {
             return Err(write_error().into());
         }
@@ -166,6 +193,45 @@ fn query_in(
         }
         let mounts = volume::mounts(env);
         let optical = mounts.metadata(&metadata);
+        if class == FILE_STANDARD_INFORMATION || class == FILE_END_OF_FILE_INFORMATION {
+            if class == FILE_END_OF_FILE_INFORMATION {
+                bytes.copy_from_slice(
+                    &if metadata.is_dir() {
+                        0
+                    } else {
+                        metadata.size()
+                    }
+                    .to_le_bytes(),
+                );
+            } else {
+                let allocated = if metadata.is_dir() {
+                    0
+                } else {
+                    optical
+                        .as_ref()
+                        .map_or(metadata.blocks() * 512, |entry| entry.allocated)
+                };
+                let size = if metadata.is_dir() {
+                    0
+                } else {
+                    metadata.size()
+                };
+                bytes[..8].copy_from_slice(&allocated.to_le_bytes());
+                bytes[8..16].copy_from_slice(&size.to_le_bytes());
+                bytes[16..20].copy_from_slice(
+                    &(if metadata.is_dir() {
+                        1
+                    } else {
+                        metadata.nlink() as u32
+                    })
+                    .to_le_bytes(),
+                );
+                bytes[20] = 0;
+                bytes[21] = u8::from(metadata.is_dir());
+            }
+            write_bytes(env, buffer, &bytes)?;
+            return Ok((status::SUCCESS, size));
+        }
         let mut basic = optical.as_ref().map_or_else(
             || basic_information(std::path::Path::new(""), &metadata, &metadata),
             |entry| entry.basic(),
@@ -220,7 +286,10 @@ fn query_in(
                 bytes[72..80].fill(0);
                 bytes[88..92].fill(0);
                 // SAFETY: the server's descriptor is live for this call.
-                let position = unsafe { libc::lseek(fd.fd, 0, libc::SEEK_CUR) };
+                let position = fd.state.as_ref().map_or_else(
+                    || unsafe { libc::lseek(fd.fd, 0, libc::SEEK_CUR) },
+                    |file| file.position.get(),
+                );
                 bytes[80..88].copy_from_slice(&position.to_le_bytes());
                 bytes[92..96].copy_from_slice(&1u32.to_le_bytes());
             }
@@ -427,9 +496,30 @@ fn set_in(
         }
         FILE_POSITION_INFORMATION => {
             let offset = read_i64(env, buffer)?;
-            let fd = server::handle_fd(env, handle)?;
+            let fd = match server::handle_fd(env, handle) {
+                Ok(fd) => fd,
+                Err(Error::Status(status::BAD_DEVICE_TYPE)) => {
+                    if let Some(file) = server::pipe_state(env, handle)? {
+                        if offset < 0 {
+                            return Err(status::INVALID_PARAMETER.into());
+                        }
+                        file.position.set(offset);
+                        return Ok(());
+                    }
+                    return Err(status::BAD_DEVICE_TYPE.into());
+                }
+                Err(error) => return Err(error),
+            };
+            if fd.kind == 3 {
+                return Err(status::NOT_IMPLEMENTED.into());
+            }
             // SAFETY: a live descriptor, with an offset supplied by the guest.
-            if unsafe { libc::lseek(fd.fd, offset, libc::SEEK_SET) } == -1 {
+            if let Some(file) = &fd.state {
+                if offset < 0 {
+                    return Err(status::INVALID_PARAMETER.into());
+                }
+                file.position.set(offset);
+            } else if unsafe { libc::lseek(fd.fd, offset, libc::SEEK_SET) } == -1 {
                 return Err(write_error().into());
             }
         }

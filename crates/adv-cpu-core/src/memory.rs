@@ -171,6 +171,7 @@ pub struct Memory {
     map_generation: u64,
     host_range: [Cell<HostRange>; 8],
     host_access: Cell<HostAccess>,
+    host_diagnostics: bool,
     /// Owner-specific validation stamp for Tier 0 page dependencies.
     pub(crate) code_generation: u64,
     /// Allocation identity survives moves and cannot alias a reused host address.
@@ -210,24 +211,33 @@ impl Memory {
         self.map_generation
     }
 
+    /// Enable memory-work accounting with the execution owner's diagnostics.
+    pub fn count_host_access(&mut self, enabled: bool) {
+        self.host_diagnostics = enabled;
+    }
+
     pub fn host_access(&self) -> HostAccess {
         self.host_access.get()
     }
 
     #[inline]
     fn count_read(&self, len: usize) {
-        let mut counts = self.host_access.get();
-        counts.reads += 1;
-        counts.read_bytes += len as u64;
-        self.host_access.set(counts);
+        if self.host_diagnostics {
+            let mut counts = self.host_access.get();
+            counts.reads += 1;
+            counts.read_bytes += len as u64;
+            self.host_access.set(counts);
+        }
     }
 
     #[inline]
     fn count_write(&self, len: usize) {
-        let mut counts = self.host_access.get();
-        counts.writes += 1;
-        counts.written_bytes += len as u64;
-        self.host_access.set(counts);
+        if self.host_diagnostics {
+            let mut counts = self.host_access.get();
+            counts.writes += 1;
+            counts.written_bytes += len as u64;
+            self.host_access.set(counts);
+        }
     }
 
     #[inline]
@@ -251,9 +261,11 @@ impl Memory {
             generation: self.map_generation,
             ..HostRange::EMPTY
         };
-        let mut counts = self.host_access.get();
-        counts.tlb_misses += 1;
-        self.host_access.set(counts);
+        if self.host_diagnostics {
+            let mut counts = self.host_access.get();
+            counts.tlb_misses += 1;
+            self.host_access.set(counts);
+        }
         for page in first as usize..=last as usize {
             info.committed &= self.mapped[page];
             info.protection &= self.perms[page];
@@ -468,6 +480,7 @@ impl Memory {
             map_generation: origin,
             host_range: [const { Cell::new(HostRange::EMPTY) }; 8],
             host_access: Cell::new(HostAccess::default()),
+            host_diagnostics: false,
             code_generation: origin,
             versions: vec![origin; len / PAGE_SIZE],
             watched: vec![false; len / PAGE_SIZE],
@@ -511,6 +524,7 @@ impl Memory {
             map_generation: origin,
             host_range: [const { Cell::new(HostRange::EMPTY) }; 8],
             host_access: Cell::new(HostAccess::default()),
+            host_diagnostics: false,
             code_generation: origin,
             versions: vec![origin; len / PAGE_SIZE],
             watched: vec![false; len / PAGE_SIZE],
@@ -974,17 +988,21 @@ impl Memory {
         destination: &mut [u8],
     ) -> Result<(), String> {
         if let Some((storage, offset)) = self.storage_run(&range, info) {
-            let mut counts = self.host_access.get();
-            counts.shared_copies += 1;
-            self.host_access.set(counts);
+            if self.host_diagnostics {
+                let mut counts = self.host_access.get();
+                counts.shared_copies += 1;
+                self.host_access.set(counts);
+            }
             crate::backend::SharedReadView::copy_into(storage.as_ref(), offset, destination);
             return Ok(());
         }
         let mut at = range.start;
         while at < range.end {
-            let mut counts = self.host_access.get();
-            counts.fallbacks += 1;
-            self.host_access.set(counts);
+            if self.host_diagnostics {
+                let mut counts = self.host_access.get();
+                counts.fallbacks += 1;
+                self.host_access.set(counts);
+            }
             let page = at / PAGE_SIZE;
             let len = (PAGE_SIZE - at % PAGE_SIZE).min(range.end - at);
             let output = &mut destination[at - range.start..at - range.start + len];
@@ -992,12 +1010,14 @@ impl Memory {
                 // SAFETY: committed, page-padded PCM alias; all Rust accessors
                 // use the word atomic contract in shared_memory.
                 unsafe { crate::shared_memory::atomic_copy(self.ptr.as_ptr().add(at), output) };
-                let mut counts = self.host_access.get();
-                counts.shared_copies += 1;
-                self.host_access.set(counts);
+                if self.host_diagnostics {
+                    let mut counts = self.host_access.get();
+                    counts.shared_copies += 1;
+                    self.host_access.set(counts);
+                }
             } else if let Some(storage) = self.shared_pages.get(&page) {
                 storage.read_into(at % PAGE_SIZE, output)?;
-                if matches!(storage, SharedPage::Storage { .. }) {
+                if matches!(storage, SharedPage::Storage { .. }) && self.host_diagnostics {
                     let mut counts = self.host_access.get();
                     counts.shared_copies += 1;
                     self.host_access.set(counts);
@@ -1670,9 +1690,11 @@ impl Memory {
                 }
                 storage.store_bytes(offset, bytes);
                 self.count_write(bytes.len());
-                let mut counts = self.host_access.get();
-                counts.shared_copies += 1;
-                self.host_access.set(counts);
+                if self.host_diagnostics {
+                    let mut counts = self.host_access.get();
+                    counts.shared_copies += 1;
+                    self.host_access.set(counts);
+                }
                 return Ok(());
             }
             let mut at = range.start;
@@ -1695,15 +1717,17 @@ impl Memory {
                         )
                     };
                 }
-                let mut counts = self.host_access.get();
-                counts.writes += u64::from(at == range.start);
-                counts.written_bytes += len as u64;
-                counts.fallbacks += 1;
-                counts.shared_copies += u64::from(matches!(
-                    self.shared_pages.get(&page),
-                    Some(SharedPage::Storage { .. })
-                ));
-                self.host_access.set(counts);
+                if self.host_diagnostics {
+                    let mut counts = self.host_access.get();
+                    counts.writes += u64::from(at == range.start);
+                    counts.written_bytes += len as u64;
+                    counts.fallbacks += 1;
+                    counts.shared_copies += u64::from(matches!(
+                        self.shared_pages.get(&page),
+                        Some(SharedPage::Storage { .. })
+                    ));
+                    self.host_access.set(counts);
+                }
                 at += len;
             }
             return Ok(());

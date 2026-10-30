@@ -9,17 +9,23 @@
 //! The serial software-checked owner exposes linear COPY reads while retaining
 //! EXEC as a first-store barrier. This never grants guest execute permission.
 use super::{EXEC, LINEAR, READ, SHARED, WRITE};
+use std::cell::UnsafeCell;
+use std::collections::BTreeMap;
 use std::ops::Range;
+use std::rc::Rc;
+
 use std::sync::Arc;
 
-/// Dirty ranges kept apart before they collapse into one union.
-const MAX_DIRTY_RANGES: usize = 64;
+type Table = (usize, Rc<UnsafeCell<Box<[u8]>>>);
 
 pub struct FastPermissions {
     bytes: Arc<Vec<u8>>,
     /// Disjoint, sorted page ranges to recompute; distant changes stay apart.
-    dirty: Vec<Range<usize>>,
+    dirty: BTreeMap<usize, usize>,
     selective: bool,
+    /// Address-space table for windows whose guest base is nonzero.
+    native: Option<Table>,
+    body: Option<Table>,
     /// Counts the snapshots whose bytes differ from the one before.
     version: u64,
 }
@@ -32,8 +38,10 @@ impl FastPermissions {
     pub(super) fn from_snapshot(bytes: Arc<Vec<u8>>) -> Self {
         Self {
             bytes,
-            dirty: Vec::new(),
+            dirty: BTreeMap::new(),
             selective: false,
+            native: None,
+            body: None,
             version: 0,
         }
     }
@@ -45,27 +53,51 @@ impl FastPermissions {
         self.version
     }
 
+    /// A stable full-address-space view. Partial refreshes update only their pages.
+    pub fn native_table(&mut self, first: usize) -> *const u8 {
+        if first == 0 && self.bytes.len() == 1 << 20 {
+            return self.bytes.as_ptr();
+        }
+        let (_, table) = self.native.get_or_insert_with(|| {
+            let mut table = vec![0; 1 << 20].into_boxed_slice();
+            table[first..first + self.bytes.len()].copy_from_slice(&self.bytes);
+            (first, Rc::new(UnsafeCell::new(table)))
+        });
+        // SAFETY: updates are serialized with native execution, which keeps only pointers.
+        unsafe { (&*table.get()).as_ptr() }
+    }
+
+    /// Body classes also name private alias accesses on mixed host pages.
+    pub fn body_table(&mut self, first: usize) -> *const u8 {
+        if self.body.is_none() {
+            self.body = Some((
+                first,
+                Rc::new(UnsafeCell::new(vec![0; 1 << 20].into_boxed_slice())),
+            ));
+            self.invalidate(0..self.bytes.len());
+        }
+        // SAFETY: the shared allocation is stable and native execution is paused.
+        unsafe { (&*self.body.as_ref().unwrap().1.get()).as_ptr() }
+    }
+
     pub(super) fn invalidate(&mut self, pages: Range<usize>) {
         if pages.is_empty() {
             return;
         }
-        let mut affected = pages.start.saturating_sub(1)..pages.end;
-        // Absorb every range this one touches, keeping the rest in order.
-        let first = self
-            .dirty
-            .partition_point(|range| range.end < affected.start);
-        let last = self
-            .dirty
-            .partition_point(|range| range.start <= affected.end);
-        for range in self.dirty.drain(first..last) {
-            affected = range.start.min(affected.start)..range.end.max(affected.end);
+        let mut start = pages.start.saturating_sub(1);
+        let mut end = pages.end;
+        if let Some((&before, &after)) = self.dirty.range(..=start).next_back()
+            && after >= start
+        {
+            self.dirty.remove(&before);
+            start = before;
+            end = end.max(after);
         }
-        self.dirty.insert(first, affected);
-        // Bound the bookkeeping: past this many, one union is cheaper to keep.
-        if self.dirty.len() > MAX_DIRTY_RANGES {
-            let union = self.dirty[0].start..self.dirty[self.dirty.len() - 1].end;
-            self.dirty = vec![union];
+        while let Some((&before, &after)) = self.dirty.range(start..=end).next() {
+            self.dirty.remove(&before);
+            end = end.max(after);
         }
+        self.dirty.insert(start, end);
     }
 
     /// The returned allocation must remain pinned for the entire native chain,
@@ -92,8 +124,10 @@ impl FastPermissions {
         }
         // Guest pages of one host page share its protection: ask once each.
         let mut host = None;
+        let body = &mut self.body;
         let mut permission = |page: usize| {
-            let mut permissions = permissions[page];
+            let raw = permissions[page];
+            let mut permissions = raw;
             if let Some(watched) = watched {
                 if !watched[page] {
                     permissions &= !EXEC;
@@ -120,11 +154,15 @@ impl FastPermissions {
             if permissions & LINEAR != 0 {
                 permissions &= !(SHARED | LINEAR);
             }
+            let mut body_class = permissions;
             if let Some((span, allows)) = window {
                 let host = match host {
                     Some((index, allows)) if index == page / span => allows,
                     _ => host.insert((page / span, allows(page))).1,
                 };
+                if permissions & (READ | WRITE) & !host != 0 {
+                    body_class |= crate::body::ALIAS;
+                }
                 if permissions & READ != 0 && host & READ == 0 {
                     permissions |= SHARED;
                 }
@@ -132,12 +170,22 @@ impl FastPermissions {
                     permissions |= EXEC;
                 }
             }
+            if raw & SHARED != 0 {
+                body_class |= crate::body::NO_ALIAS;
+            }
+            if let Some((first, table)) = body {
+                // SAFETY: no generated access runs while the owner refreshes classes.
+                unsafe {
+                    (&mut *table.get())[*first + page] = body_class;
+                }
+            }
             permissions
         };
         if !self.dirty.is_empty() {
             self.version += 1;
             let bytes = Arc::make_mut(&mut self.bytes);
-            for mut pages in std::mem::take(&mut self.dirty) {
+            for (start, end) in std::mem::take(&mut self.dirty) {
+                let mut pages = start..end;
                 // A change to one guest page may change its whole host page.
                 if let Some((span, _)) = window {
                     pages = (pages.start / span * span).saturating_sub(1)
@@ -145,6 +193,7 @@ impl FastPermissions {
                     pages.end = pages.end.min(permissions.len());
                 }
                 let mut next = None;
+                let changed = pages.clone();
                 for page in pages {
                     let current = next.take().unwrap_or_else(|| permission(page));
                     // Exact checks use the same base as the derived grants.
@@ -160,6 +209,13 @@ impl FastPermissions {
                             }
                         }) << 5);
                 }
+                if let Some((first, table)) = &mut self.native {
+                    // SAFETY: all generated accesses are paused during table refresh.
+                    unsafe {
+                        (&mut *table.get())[*first + changed.start..*first + changed.end]
+                            .copy_from_slice(&bytes[changed]);
+                    }
+                }
             }
         }
         self.bytes.clone()
@@ -170,6 +226,25 @@ impl FastPermissions {
 mod tests {
     use super::*;
     use crate::memory::AUDIO;
+
+    // spec: A64-MEM-8, EXEC-CALL-3
+    #[test]
+    fn many_sparse_changes_do_not_refresh_the_gaps() {
+        let mut permissions = vec![READ; 4096];
+        let mut table = FastPermissions::new(permissions.len());
+        let body = table.body_table(0);
+        drop(table.snapshot(&permissions, None, &[], None));
+        permissions[24] = 0;
+        for page in (16..=2048).step_by(16) {
+            permissions[page] = READ | WRITE;
+            table.invalidate(page..page + 1);
+        }
+        let bytes = table.snapshot(&permissions, None, &[], None);
+        assert_eq!(bytes[24] & 31, READ);
+        // SAFETY: the body table is retained by table and updates are complete.
+        assert_eq!(unsafe { *body.add(24) }, READ);
+        assert_eq!(bytes[2048] & 31, READ | WRITE);
+    }
 
     #[test]
     fn distant_changes_recompute_only_their_own_pages() {

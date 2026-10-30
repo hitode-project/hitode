@@ -325,6 +325,25 @@ pub fn query_performance_counter(env: &mut Env<'_>, args: &[u32]) -> Outcome {
     let &[counter, frequency] = args else {
         unreachable!()
     };
+    if counter & 3 != 0 {
+        return Outcome::Return(0x8000_0002);
+    }
+    if !env
+        .cpu
+        .accessible(counter, 8, adv_cpu::backend::Prot::WRITE)
+    {
+        return Outcome::Return(status::ACCESS_VIOLATION);
+    }
+    if frequency & 3 != 0 {
+        return Outcome::Return(0x8000_0002);
+    }
+    if frequency != 0
+        && !env
+            .cpu
+            .accessible(frequency, 8, adv_cpu::backend::Prot::WRITE)
+    {
+        return Outcome::Return(status::ACCESS_VIOLATION);
+    }
     let ticks = performance_counter(env);
     status::finish((|| {
         write_bytes(env, counter, &ticks.to_le_bytes())?;

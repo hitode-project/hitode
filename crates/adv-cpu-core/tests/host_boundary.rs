@@ -196,6 +196,8 @@ fn host_boundary_pinned_identity_revalidates() {
 #[test]
 fn host_boundary_counters_distinguish_contiguous_and_page_copies() {
     let mut memory = Memory::reserve(0, 8 * PAGE_SIZE).unwrap();
+    // Counting is a diagnostic (EXEC-CALL-1).
+    memory.count_host_access(true);
     memory
         .map(PAGE_SIZE as u32, 2 * PAGE_SIZE, READ | WRITE)
         .unwrap();

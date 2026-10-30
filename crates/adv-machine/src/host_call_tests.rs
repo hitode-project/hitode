@@ -465,3 +465,97 @@ fn a_raised_fault_is_the_entrys_first_instruction_faulting() {
     assert_eq!(machine.cpu.reg(Reg::Esp), DATA + 0x3f00 - 8);
     assert_eq!(machine.cpu.read_u32(DATA + 0x3f00 - 8).unwrap(), CODE + 10);
 }
+
+// spec: EXEC-CALL-1
+#[test]
+fn ordinary_host_call_without_diagnostics_reads_no_stack_or_clock() {
+    struct Empty;
+    impl Resolver for Empty {
+        fn provides(&self, _: &str) -> bool {
+            true
+        }
+        fn host_fn(&self, _: &str, _: &str) -> Option<HostFn> {
+            Some(HostFn {
+                conv: Conv::Stdcall { argc: 0 },
+                handler: |_| Outcome::Return(7),
+                data: 0,
+                trace: false,
+                guest: None,
+                leaf: None,
+            })
+        }
+    }
+    struct Unreadable {
+        regs: [u32; 16],
+        reads: std::cell::Cell<usize>,
+    }
+    impl Guest for Unreadable {
+        fn reg(&self, reg: Reg) -> u32 {
+            self.regs[reg as usize]
+        }
+        fn set_reg(&mut self, reg: Reg, value: u32) {
+            self.regs[reg as usize] = value;
+        }
+        fn read(&self, addr: u32, bytes: &mut [u8]) -> Result<(), MemFault> {
+            self.reads.set(self.reads.get() + 1);
+            Err(MemFault {
+                addr,
+                len: bytes.len() as u32,
+            })
+        }
+        fn write(&mut self, addr: u32, bytes: &[u8]) -> Result<(), MemFault> {
+            Err(MemFault {
+                addr,
+                len: bytes.len() as u32,
+            })
+        }
+        fn map(&mut self, addr: u32, len: u32, _: Prot) -> Result<(), MemFault> {
+            Err(MemFault { addr, len })
+        }
+        fn protect(&mut self, addr: u32, len: u32, _: Prot) -> Result<(), MemFault> {
+            Err(MemFault { addr, len })
+        }
+        fn unmap(&mut self, addr: u32, len: u32) -> Result<(), MemFault> {
+            Err(MemFault { addr, len })
+        }
+    }
+    let mut machine = Machine::new(
+        JitCpu::new(PARK_ADDR, true).unwrap(),
+        Empty,
+        Clock::virtual_time(),
+    )
+    .unwrap();
+    machine.spawn("quiet call", CODE, &[], 65536).unwrap();
+    let target = machine.resolve_import("fixture", "empty").unwrap();
+    let index = (target - layout::THUNK_BASE) / layout::THUNK_STRIDE;
+    let mut cpu = Unreadable {
+        regs: [0; 16],
+        reads: Default::default(),
+    };
+    let lookups = thunk::LOOKUPS.get();
+    let clocks = stats::CLOCK_READS.get();
+    let mut dispatch = Dispatch {
+        sys: &mut machine.sys,
+        ext: &mut machine.ext,
+        parked: None,
+        yield_on_frame: false,
+        defer_work: false,
+    };
+    assert!(dispatch.host_call(&mut cpu, index).is_ok());
+    assert_eq!(thunk::LOOKUPS.get() - lookups, 1);
+    assert_eq!(stats::CLOCK_READS.get(), clocks);
+    assert_eq!(cpu.reads.get(), 0);
+    assert_eq!(machine.sys.recent.iter().count(), 0);
+    machine.sys.stats.services_enabled = true;
+    let mut dispatch = Dispatch {
+        sys: &mut machine.sys,
+        ext: &mut machine.ext,
+        parked: None,
+        yield_on_frame: false,
+        defer_work: false,
+    };
+    assert!(dispatch.host_call(&mut cpu, index).is_ok());
+    assert_eq!(cpu.reads.get(), 1);
+    assert_eq!(machine.sys.recent.iter().count(), 1);
+    assert_eq!(stats::CLOCK_READS.get(), clocks + 1);
+}

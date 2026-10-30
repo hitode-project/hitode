@@ -781,6 +781,10 @@ pub fn release_semaphore(env: &mut Env<'_>, args: &[u32]) -> Outcome {
     let &[handle, count, previous] = args else {
         unreachable!()
     };
+    // Windows 11 rejects zero and negative releases with ERROR_INVALID_PARAMETER.
+    if count as i32 <= 0 {
+        return Outcome::Return(status::INVALID_PARAMETER);
+    }
     status::finish((|| {
         if let Some(value) = inproc_operation(env, handle, 4, 2, ntsync::SEM_RELEASE, [count, 0])? {
             if previous != 0 {
@@ -1970,7 +1974,11 @@ fn debug_event(env: &mut Env<'_>, args: [u32; 4], wait: bool) -> Outcome {
                                 {
                                     partial = u16::from_le_bytes([header[4], header[5]]) != 0x14c;
                                 }
-                                libc::lseek(fd.fd, 0, libc::SEEK_SET);
+                                if let Some(file) = &fd.file {
+                                    file.position.set(0);
+                                } else {
+                                    libc::lseek(fd.fd, 0, libc::SEEK_SET);
+                                }
                             }
                         }
                     }
