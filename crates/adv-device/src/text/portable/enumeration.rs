@@ -1,30 +1,53 @@
 //! Charset discovery follows the font's OS/2 code page flags, not its name.
 use super::*;
 
-pub(super) fn repertoires(font: EnumeratedFont, query: Encoding) -> Vec<EnumeratedFont> {
+/// OpenType OS/2 ulCodePageRange1 bits in the order Windows enumerates a
+/// face's charsets after the ANSI code page's own. Windows never enumerates
+/// the Macintosh or OEM bits. Script names are neutral English labels;
+/// unlike native Windows this backend does not localize them to the host UI.
+const REPERTOIRES: [(u32, Encoding, &str); 16] = [
+    (0, Encoding::Latin, "Western"),
+    (17, Encoding::Japanese, "Japanese"),
+    (19, Encoding::Korean, "Korean"),
+    (21, Encoding::Johab, "Korean Johab"),
+    (18, Encoding::SimplifiedChinese, "Chinese GB2312"),
+    (20, Encoding::TraditionalChinese, "Chinese Big5"),
+    (5, Encoding::Hebrew, "Hebrew"),
+    (6, Encoding::Arabic, "Arabic"),
+    (3, Encoding::Greek, "Greek"),
+    (4, Encoding::Turkish, "Turkish"),
+    (7, Encoding::Baltic, "Baltic"),
+    (1, Encoding::EasternEuropean, "Central European"),
+    (2, Encoding::Cyrillic, "Cyrillic"),
+    (16, Encoding::Thai, "Thai"),
+    (8, Encoding::Vietnamese, "Vietnamese"),
+    (31, Encoding::Symbol, "Symbol"),
+];
+
+/// Whether a face's OS/2 code page flags declare `encoding`.
+pub(super) fn declares(codepages: u32, encoding: Encoding) -> bool {
+    REPERTOIRES
+        .iter()
+        .any(|&(bit, known, _)| known == encoding && codepages & (1 << bit) != 0)
+}
+
+/// The charsets a face enumerates for `query`; DEFAULT_CHARSET lists the
+/// ANSI code page's charset first, as Windows does.
+pub(super) fn repertoires(
+    font: EnumeratedFont,
+    query: Encoding,
+    ansi: Encoding,
+) -> Vec<EnumeratedFont> {
     let signature = font.signature.unwrap_or_default();
-    // OpenType OS/2 ulCodePageRange1. Script names are neutral English labels;
-    // unlike native Windows this backend does not localize them to the host UI.
-    let repertoires = [
-        (0, Encoding::Latin, "Western"),
-        (1, Encoding::EasternEuropean, "Central European"),
-        (2, Encoding::Cyrillic, "Cyrillic"),
-        (3, Encoding::Greek, "Greek"),
-        (4, Encoding::Turkish, "Turkish"),
-        (5, Encoding::Hebrew, "Hebrew"),
-        (6, Encoding::Arabic, "Arabic"),
-        (7, Encoding::Baltic, "Baltic"),
-        (8, Encoding::Vietnamese, "Vietnamese"),
-        (16, Encoding::Thai, "Thai"),
-        (17, Encoding::Japanese, "Japanese"),
-        (18, Encoding::SimplifiedChinese, "Chinese GB2312"),
-        (19, Encoding::Korean, "Korean"),
-        (20, Encoding::TraditionalChinese, "Chinese Big5"),
-        (21, Encoding::Johab, "Korean Johab"),
-        (29, Encoding::MacRoman, "Macintosh"),
-        (30, Encoding::Oem, "OEM"),
-        (31, Encoding::Symbol, "Symbol"),
-    ];
+    let repertoires = REPERTOIRES
+        .iter()
+        .filter(|&&(_, encoding, _)| encoding == ansi)
+        .chain(
+            REPERTOIRES
+                .iter()
+                .filter(|&&(_, encoding, _)| encoding != ansi),
+        )
+        .copied();
     let mut output = Vec::new();
     for (bit, encoding, script) in repertoires {
         if signature.codepages[0] & (1 << bit) == 0

@@ -847,6 +847,15 @@ impl Text {
     pub fn set_language(&mut self, tag: &'static str) {
         self.backend.language = Some(tag);
     }
+    /// The charset of the guest's ANSI code page: default and Macintosh
+    /// requests realize it when a face declares it, and extended enumeration
+    /// lists it first, as Windows does.
+    pub fn set_ansi_encoding(&mut self, encoding: Encoding) {
+        if self.backend.ansi != Some(encoding) {
+            self.backend.ansi = Some(encoding);
+            self.invalidate_fonts();
+        }
+    }
     /// Use only these discovery directories on portable hosts. This provides a
     /// deterministic font environment for comparisons; guest resources still
     /// take precedence. Default construction discovers system fonts and the
