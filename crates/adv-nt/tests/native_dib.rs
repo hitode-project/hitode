@@ -1164,3 +1164,883 @@ fn halftone_declines_nondefault_rounding() {
     }
     assert!(adv_nt::native::declines(&native.ext) > before);
 }
+
+fn prepare_body(m: &mut Machine<Cpu>, name: &str, args: &[u32]) -> u32 {
+    if m.sys.contexts.is_empty() {
+        m.spawn("body", CODE, &[], 0x10000).unwrap();
+    }
+    let thunk = m
+        .sys
+        .thunks
+        .published_index(adv_nt::native::MODULE, &format!("win32u.so!{name}"))
+        .unwrap();
+    m.cpu.set_reg(adv_cpu::backend::Reg::Esp, RESULT + 0x800);
+    for (i, arg) in args.iter().enumerate() {
+        m.cpu
+            .write_u32(RESULT + 0x804 + i as u32 * 4, *arg)
+            .unwrap();
+    }
+    thunk
+}
+fn body(m: &mut Machine<Cpu>, thunk: u32) -> adv_machine::Outcome {
+    let f = m.sys.thunks.get(thunk).f.handler;
+    f(&mut adv_machine::Env {
+        cpu: &mut m.cpu,
+        sys: &mut m.sys,
+        ext: &mut m.ext,
+        context: 0,
+        thunk,
+    })
+}
+
+// Captured from c2e87f32: changed destination bytes from the original bodies.
+// Unchanged bytes come from the deterministic input, including padding/gaps.
+fn recorded_bytes(golden: &mut &[u8], data: &[u8], actual: &[u8]) {
+    let count = u16::from_le_bytes(golden[..2].try_into().unwrap()) as usize;
+    let mut expected = [0; 256];
+    expected.copy_from_slice(&data[0x4000..0x4100]);
+    for pair in golden[2..2 + count * 2].as_chunks::<2>().0 {
+        expected[pair[0] as usize] = pair[1];
+    }
+    *golden = &golden[2 + count * 2..];
+    assert_eq!(actual, expected);
+}
+
+// Small surfaces with sentinel bytes in both DIB padding and stride gaps.
+fn row_fixture(dst: usize, src: usize, seed: u32, top: u32, alias: bool) -> Vec<u8> {
+    let mut data = fixture(dst, seed);
+    dib(&mut data, SRC, src, SOURCE_BITS, seed / 2);
+    for (address, format, bits, negative) in [
+        (DST, dst, DEST_BITS, seed & 1 != 0),
+        (
+            SRC,
+            src,
+            if alias { DEST_BITS + 4 } else { SOURCE_BITS },
+            seed & 2 != 0,
+        ),
+    ] {
+        let stride = (9 * FORMATS[format].1).div_ceil(32) * 4 + 4;
+        set(&mut data, address, d::width, 9);
+        set(&mut data, address, d::height, 6);
+        set(
+            &mut data,
+            address,
+            d::stride,
+            if negative {
+                (-(stride as i32)) as u32
+            } else {
+                stride
+            },
+        );
+        set(
+            &mut data,
+            address,
+            d::bits,
+            bits + if negative { stride * 5 } else { 0 },
+        );
+    }
+    set(&mut data, DST, d::rect + rect::top, top);
+    for (field, value) in [
+        (rect::left, 1),
+        (rect::top, top),
+        (rect::right, 8),
+        (rect::bottom, top + 2),
+    ] {
+        set(&mut data, RECTS, field, value);
+    }
+    data
+}
+
+// spec: NAT-BODY-1, NAT-BODY-4
+#[test]
+fn touched_bodies_preserve_recorded_bytes() {
+    let Some(dist) = dist() else {
+        return;
+    };
+    let mut m = machine(&dist, true, None);
+    let mut golden = include_bytes!("fixtures/native_dib.bin").as_slice();
+    for family in ["convert_to", "halftone", "solid_line"] {
+        for (dst, format) in
+            FORMATS
+                .iter()
+                .enumerate()
+                .take(if family == "convert_to" { 8 } else { 5 })
+        {
+            for src in 0..if family == "solid_line" { 1 } else { 5 } {
+                for seed in 0..8 {
+                    for top in [0, 2, 4] {
+                        let mut data = row_fixture(dst, src, seed, top, seed & 4 != 0);
+                        let suffix = if family == "solid_line" {
+                            match format.1 {
+                                32 => "32",
+                                24 => "24",
+                                _ => "16",
+                            }
+                        } else if family == "halftone" && dst == 0 {
+                            "888"
+                        } else {
+                            format.0
+                        };
+                        let name = format!("{family}_{suffix}");
+                        let args = match family {
+                            "convert_to" => vec![DST, SRC, RECTS, seed % 2],
+                            "halftone" => {
+                                for (address, y, w, h) in [(EXTRA, 0, 7, 2), (PARAMS, top, 8, 2)] {
+                                    for (field, value) in [
+                                        (coords::x, 0),
+                                        (coords::y, y),
+                                        (coords::width, w),
+                                        (coords::height, h),
+                                        (coords::visrect + rect::left, 0),
+                                        (coords::visrect + rect::top, y),
+                                        (coords::visrect + rect::right, w),
+                                        (coords::visrect + rect::bottom, y + h),
+                                    ] {
+                                        set(&mut data, address, field, value);
+                                    }
+                                }
+                                vec![DST, EXTRA, SRC, PARAMS, 0x1f80]
+                            }
+                            _ => {
+                                set(&mut data, DST, d::rect + rect::top, 0);
+                                set(&mut data, ORIGIN, 0, if seed & 4 != 0 { 7 } else { 1 });
+                                set(
+                                    &mut data,
+                                    ORIGIN,
+                                    4,
+                                    if seed & 4 != 0 { top + 1 } else { top },
+                                );
+                                for (field, value) in [
+                                    (line::err_start, u32::MAX),
+                                    (line::err_add_1, (-2i32) as u32),
+                                    (line::err_add_2, 1),
+                                    (line::bias, 0),
+                                    (line::length, 3),
+                                    (line::x_inc, if seed & 4 != 0 { u32::MAX } else { 1 }),
+                                    (line::y_inc, if seed & 4 != 0 { u32::MAX } else { 1 }),
+                                    (line::x_major, 1),
+                                ] {
+                                    set(&mut data, PARAMS, field, value);
+                                }
+                                vec![
+                                    DST,
+                                    ORIGIN,
+                                    PARAMS,
+                                    if seed & 2 != 0 { 0 } else { 0x7f3f1fff },
+                                    0x432176ab,
+                                ]
+                            }
+                        };
+                        m.cpu.write(DATA, &data).unwrap();
+                        let thunk = prepare_body(&mut m, &name, &args);
+                        assert!(
+                            matches!(body(&mut m, thunk), adv_machine::Outcome::Return64(_)),
+                            "{name} src {src} seed {seed} top {top}"
+                        );
+                        let mut bytes = [0; 256];
+                        m.cpu.read(DEST_BITS, &mut bytes).unwrap();
+                        recorded_bytes(&mut golden, &data, &bytes);
+                        m.cpu.write(DATA, &data).unwrap();
+                        prepare_body(&mut m, &name, &args);
+                        ALLOCATIONS.with(|n| n.set(Some(0)));
+                        let result = body(&mut m, thunk);
+                        let allocations = ALLOCATIONS.with(|n| n.replace(None)).unwrap();
+                        assert!(matches!(result, adv_machine::Outcome::Return64(_)));
+                        assert_eq!(allocations, 0, "{name} src {src} seed {seed} top {top}");
+                    }
+                }
+            }
+        }
+    }
+    assert!(golden.is_empty());
+}
+
+fn thread_seconds() -> f64 {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: time is writable for the complete timespec.
+    assert_eq!(
+        unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut time) },
+        0
+    );
+    time.tv_sec as f64 + time.tv_nsec as f64 * 1e-9
+}
+
+// spec: NAT-BODY-4
+#[test]
+#[ignore = "manual micro-benchmark; nextest enforces a timeout"]
+fn convert_microbenchmark() {
+    let Some(dist) = dist() else {
+        return;
+    };
+    let mut m = machine(&dist, true, None);
+    for (src, dst, label) in [
+        (0, 2, "8888->24"),
+        (0, 1, "8888->8888 bitfields"),
+        (0, 3, "8888->555"),
+        (0, 4, "8888->565"),
+        (2, 0, "24->8888"),
+    ] {
+        let mut data = fixture(dst, 0);
+        dib(&mut data, SRC, src, SOURCE_BITS, 0);
+        if dst == 1 {
+            for (field, value) in [
+                (d::red_shift, 16),
+                (d::green_shift, 8),
+                (d::blue_shift, 0),
+                (d::red_mask, 0xff0000),
+                (d::green_mask, 0xff00),
+                (d::blue_mask, 0xff),
+            ] {
+                set(&mut data, DST, field, value);
+            }
+        }
+        let source = 0x20000000;
+        let target = 0x21000000;
+        if src == 0 && dst == 2 {
+            m.cpu
+                .map(source, (960 * 540 * 4 + 4095) & !4095, Prot::RW)
+                .unwrap();
+            m.cpu
+                .map(target, (960 * 540 * 4 + 4095) & !4095, Prot::RW)
+                .unwrap();
+        }
+        let pixels: Vec<_> = (0..960 * 540 * 4).map(|i| (i * 71) as u8).collect();
+        m.cpu.write(source, &pixels).unwrap();
+        for (address, bits, bpp) in [(DST, target, FORMATS[dst].1), (SRC, source, FORMATS[src].1)] {
+            for (field, value) in [
+                (d::bits, bits),
+                (d::width, 960),
+                (d::height, 540),
+                (d::stride, 960 * bpp / 8),
+            ] {
+                set(&mut data, address, field, value);
+            }
+        }
+        for rows in [540, 16] {
+            for (field, value) in [
+                (rect::left, 0),
+                (rect::top, 0),
+                (rect::right, 960),
+                (rect::bottom, rows),
+            ] {
+                set(&mut data, RECTS, field, value);
+            }
+            m.cpu.write(DATA, &data).unwrap();
+            let thunk = prepare_body(
+                &mut m,
+                &format!("convert_to_{}", FORMATS[dst].0),
+                &[DST, SRC, RECTS, 0],
+            );
+            for _ in 0..10 {
+                assert!(matches!(
+                    body(&mut m, thunk),
+                    adv_machine::Outcome::Return64(_)
+                ));
+            }
+            let mut samples = [0.0f64; 5];
+            for sample in &mut samples {
+                let start = thread_seconds();
+                for _ in 0..200 {
+                    assert!(matches!(
+                        body(&mut m, thunk),
+                        adv_machine::Outcome::Return64(_)
+                    ));
+                }
+                *sample = (thread_seconds() - start) * 1e6 / 200.0;
+            }
+            samples.sort_by(f64::total_cmp);
+            eprintln!(
+                "convert 960x{rows} {label}: {:.3} CPU us/call, {:.3} ns/pixel (median of 5 batches of 200 warm calls; range {:.3}..{:.3})",
+                samples[2],
+                samples[2] * 1000.0 / (960 * rows) as f64,
+                samples[0],
+                samples[4]
+            );
+        }
+    }
+}
+
+thread_local! { static ALLOCATIONS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) }; }
+struct Allocator;
+fn allocation() {
+    ALLOCATIONS.with(|n| {
+        if let Some(count) = n.get() {
+            n.set(Some(count + 1));
+        }
+    });
+}
+// SAFETY: all storage operations delegate to System with the original arguments.
+unsafe impl std::alloc::GlobalAlloc for Allocator {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        allocation();
+        unsafe { std::alloc::System.alloc(layout) }
+    }
+    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        allocation();
+        unsafe { std::alloc::System.alloc_zeroed(layout) }
+    }
+    unsafe fn realloc(&self, p: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
+        allocation();
+        unsafe { std::alloc::System.realloc(p, layout, size) }
+    }
+    unsafe fn dealloc(&self, p: *mut u8, layout: std::alloc::Layout) {
+        unsafe { std::alloc::System.dealloc(p, layout) }
+    }
+}
+#[global_allocator]
+static ALLOCATOR: Allocator = Allocator;
+
+struct AccessGuest<'a> {
+    cpu: &'a mut dyn Guest,
+    reads: std::cell::RefCell<Vec<(u32, usize)>>,
+    writes: Vec<(u32, usize)>,
+    denied: Option<(u32, usize)>,
+}
+impl AccessGuest<'_> {
+    fn allowed(&self, at: u32, len: usize) -> bool {
+        !self.denied.is_some_and(|(row, size)| {
+            u64::from(at) < u64::from(row) + size as u64
+                && u64::from(row) < u64::from(at) + len as u64
+        })
+    }
+}
+impl Guest for AccessGuest<'_> {
+    fn reg(&self, r: adv_cpu::backend::Reg) -> u32 {
+        self.cpu.reg(r)
+    }
+    fn set_reg(&mut self, r: adv_cpu::backend::Reg, value: u32) {
+        self.cpu.set_reg(r, value);
+    }
+    fn read(&self, at: u32, data: &mut [u8]) -> Result<(), adv_cpu::backend::MemFault> {
+        self.reads.borrow_mut().push((at, data.len()));
+        if !self.allowed(at, data.len()) {
+            return Err(adv_cpu::backend::MemFault {
+                addr: at,
+                len: data.len() as u32,
+            });
+        }
+        self.cpu.read(at, data)
+    }
+    fn write(&mut self, at: u32, data: &[u8]) -> Result<(), adv_cpu::backend::MemFault> {
+        self.writes.push((at, data.len()));
+        if !self.allowed(at, data.len()) {
+            return Err(adv_cpu::backend::MemFault {
+                addr: at,
+                len: data.len() as u32,
+            });
+        }
+        self.cpu.write(at, data)
+    }
+    fn accessible(&self, at: u32, len: u32, prot: Prot) -> bool {
+        self.allowed(at, len as usize) && self.cpu.accessible(at, len, prot)
+    }
+    fn map(&mut self, at: u32, len: u32, prot: Prot) -> Result<(), adv_cpu::backend::MemFault> {
+        self.cpu.map(at, len, prot)
+    }
+    fn unmap(&mut self, at: u32, len: u32) -> Result<(), adv_cpu::backend::MemFault> {
+        self.cpu.unmap(at, len)
+    }
+    fn protect(&mut self, at: u32, len: u32, prot: Prot) -> Result<(), adv_cpu::backend::MemFault> {
+        self.cpu.protect(at, len, prot)
+    }
+}
+
+// spec: NAT-BODY-1, NAT-BODY-4
+#[test]
+fn touched_bodies_limit_access_and_decline_without_writes() {
+    let Some(dist) = dist() else {
+        return;
+    };
+    let mut m = machine(&dist, true, None);
+    for family in ["convert_to_8888", "halftone_888", "solid_line_32"] {
+        for negative in [false, true] {
+            for denied in [
+                None,
+                Some(DEST_BITS),
+                Some(DEST_BITS + 256),
+                Some(SOURCE_BITS + 384),
+            ] {
+                let mut data = fixture(0, 0);
+                for (address, bits) in [(DST, DEST_BITS), (SRC, SOURCE_BITS)] {
+                    set(&mut data, address, d::height, 100000);
+                    // Declared rows outside this band are inaccessible.
+                    set(
+                        &mut data,
+                        address,
+                        d::stride,
+                        if negative { (-128i32) as u32 } else { 128 },
+                    );
+                    set(
+                        &mut data,
+                        address,
+                        d::bits,
+                        bits + if negative { 128 * 99999 } else { 0 },
+                    );
+                    set(
+                        &mut data,
+                        address,
+                        d::rect + rect::top,
+                        if negative { 99994 } else { 0 },
+                    );
+                }
+                // Physical destination rows 1..3; source rows 2..4.
+                set(
+                    &mut data,
+                    DST,
+                    d::rect + rect::top,
+                    if negative { 99997 } else { 1 },
+                );
+                for (field, value) in [
+                    (rect::left, 0),
+                    (rect::top, 2),
+                    (rect::right, 32),
+                    (rect::bottom, 4),
+                ] {
+                    set(&mut data, RECTS, field, value);
+                }
+                set(&mut data, ORIGIN, 0, 1);
+                set(&mut data, ORIGIN, 4, 0);
+                for (field, value) in [
+                    (line::err_start, 0),
+                    (line::err_add_1, 0),
+                    (line::err_add_2, 0),
+                    (line::bias, 0),
+                    (line::length, 2),
+                    (line::x_inc, 1),
+                    (line::y_inc, 1),
+                    (line::x_major, 0),
+                ] {
+                    set(&mut data, PARAMS, field, value);
+                }
+                for (address, y) in [(EXTRA, 0), (PARAMS + 0x100, 2)] {
+                    for (field, value) in [
+                        (coords::x, 0),
+                        (coords::y, y),
+                        (coords::width, 32),
+                        (coords::height, 2),
+                        (coords::visrect + rect::left, 0),
+                        (coords::visrect + rect::top, y),
+                        (coords::visrect + rect::right, 32),
+                        (coords::visrect + rect::bottom, y + 2),
+                    ] {
+                        set(&mut data, address, field, value);
+                    }
+                }
+                let args = match family {
+                    "convert_to_8888" => vec![DST, SRC, RECTS, 0],
+                    "halftone_888" => vec![DST, EXTRA, SRC, PARAMS + 0x100, 0x1f80],
+                    _ => vec![DST, ORIGIN, PARAMS, 0x7fffffff, 0x87654321],
+                };
+                m.cpu.write(DATA, &data).unwrap();
+                let thunk = prepare_body(&mut m, family, &args);
+                let f = m.sys.thunks.get(thunk).f.handler;
+                let mut cpu = AccessGuest {
+                    cpu: &mut m.cpu,
+                    reads: Default::default(),
+                    writes: Vec::new(),
+                    denied: denied.map(|row| (row, 128)),
+                };
+                let before = adv_nt::native::declines(&m.ext);
+                let result = f(&mut adv_machine::Env {
+                    cpu: &mut cpu,
+                    sys: &mut m.sys,
+                    ext: &mut m.ext,
+                    context: 0,
+                    thunk,
+                });
+                if denied == Some(DEST_BITS + 256)
+                    || (family != "solid_line_32" && denied == Some(SOURCE_BITS + 384))
+                {
+                    assert!(
+                        !matches!(result, adv_machine::Outcome::Return64(_)),
+                        "{family} accepted inaccessible row"
+                    );
+                    assert_eq!(adv_nt::native::declines(&m.ext), before + 1);
+                    assert!(cpu.writes.is_empty());
+                    let mut actual = [0; 512];
+                    cpu.cpu.read(DEST_BITS, &mut actual).unwrap();
+                    assert_eq!(actual, data[0x4000..0x4200]);
+                } else {
+                    assert!(
+                        matches!(result, adv_machine::Outcome::Return64(_)),
+                        "{family} declined"
+                    );
+                    let target_reads: Vec<_> = cpu
+                        .reads
+                        .borrow()
+                        .iter()
+                        .copied()
+                        .filter(|(at, _)| (DEST_BITS..DEST_BITS + 0x4000).contains(at))
+                        .collect();
+                    if family == "solid_line_32" {
+                        assert_eq!(target_reads, [(DEST_BITS + 128, 256)]);
+                    } else {
+                        assert!(
+                            target_reads.is_empty(),
+                            "{family} read destination: {target_reads:?}"
+                        );
+                    }
+                    for &(at, len) in cpu.reads.borrow().iter() {
+                        if (SOURCE_BITS..SOURCE_BITS + 0x4000).contains(&at) {
+                            assert_eq!((at, len), (SOURCE_BITS + 256, 256));
+                        }
+                    }
+                    assert!(!cpu.writes.is_empty());
+                    for (at, len) in cpu.writes {
+                        assert!(
+                            at >= DEST_BITS + 128 && at + len as u32 <= DEST_BITS + 384,
+                            "{family} wrote outside touched rows"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+// spec: NAT-BODY-4
+#[test]
+fn raw_conversions_preserve_recorded_bytes() {
+    let Some(dist) = dist() else {
+        return;
+    };
+    let mut m = machine(&dist, true, None);
+    let mut golden = include_bytes!("fixtures/native_dib_raw.bin").as_slice();
+    for (format, info) in FORMATS.iter().enumerate().take(5) {
+        for signs in 0..4 {
+            for alias in 0..3 {
+                for top in [0, 2] {
+                    for rows in [0, 2] {
+                        let mut data = row_fixture(format, format, signs, 0, false);
+                        for (address, bits, negative) in [
+                            (
+                                DST,
+                                DEST_BITS + if alias == 2 { 4 } else { 0 },
+                                signs & 1 != 0,
+                            ),
+                            (
+                                SRC,
+                                if alias == 0 {
+                                    SOURCE_BITS
+                                } else {
+                                    DEST_BITS + if alias == 1 { 4 } else { 0 }
+                                },
+                                signs & 2 != 0,
+                            ),
+                        ] {
+                            let stride = info.1 + 4;
+                            set(&mut data, address, d::width, 8);
+                            set(
+                                &mut data,
+                                address,
+                                d::stride,
+                                if negative {
+                                    (-(stride as i32)) as u32
+                                } else {
+                                    stride
+                                },
+                            );
+                            set(
+                                &mut data,
+                                address,
+                                d::bits,
+                                bits + if negative { stride * 5 } else { 0 },
+                            );
+                        }
+                        for (field, value) in [
+                            (rect::left, 0),
+                            (rect::top, top),
+                            (rect::right, 8),
+                            (rect::bottom, top + rows),
+                        ] {
+                            set(&mut data, RECTS, field, value);
+                        }
+                        m.cpu.write(DATA, &data).unwrap();
+                        let name = format!("convert_to_{}", info.0);
+                        let thunk = prepare_body(&mut m, &name, &[DST, SRC, RECTS, 0]);
+                        assert!(
+                            matches!(body(&mut m, thunk), adv_machine::Outcome::Return64(_)),
+                            "{name} signs {signs} alias {alias} top {top} rows {rows}"
+                        );
+                        let mut bytes = [0; 256];
+                        m.cpu.read(DEST_BITS, &mut bytes).unwrap();
+                        recorded_bytes(&mut golden, &data, &bytes);
+                        m.cpu.write(DATA, &data).unwrap();
+                        prepare_body(&mut m, &name, &[DST, SRC, RECTS, 0]);
+                        ALLOCATIONS.with(|n| n.set(Some(0)));
+                        let result = body(&mut m, thunk);
+                        let allocations = ALLOCATIONS.with(|n| n.replace(None)).unwrap();
+                        assert!(matches!(result, adv_machine::Outcome::Return64(_)));
+                        assert_eq!(
+                            allocations, 0,
+                            "{name} signs {signs} alias {alias} top {top} rows {rows}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    assert!(golden.is_empty());
+}
+
+// spec: NAT-BODY-1, NAT-BODY-4
+#[test]
+fn halftone_keeps_touched_row_access_requirements() {
+    let Some(dist) = dist() else {
+        return;
+    };
+    let mut m = machine(&dist, true, None);
+    let mut data = fixture(0, 0);
+    dib(&mut data, SRC, 0, SOURCE_BITS, 0);
+    for address in [EXTRA, PARAMS] {
+        for (field, value) in [
+            (coords::x, 0),
+            (coords::y, 0),
+            (coords::width, 7),
+            (coords::height, 2),
+            (coords::visrect + rect::left, 0),
+            (coords::visrect + rect::top, 0),
+            (coords::visrect + rect::right, 7),
+            (coords::visrect + rect::bottom, 2),
+        ] {
+            set(&mut data, address, field, value);
+        }
+    }
+    for at in [DEST_BITS + 28, SOURCE_BITS + 28] {
+        m.cpu.write(DATA, &data).unwrap();
+        let thunk = prepare_body(&mut m, "halftone_888", &[DST, EXTRA, SRC, PARAMS, 0x1f80]);
+        let f = m.sys.thunks.get(thunk).f.handler;
+        // This byte lies outside the converted pixels, within a touched row.
+        let mut cpu = AccessGuest {
+            cpu: &mut m.cpu,
+            reads: Default::default(),
+            writes: Vec::new(),
+            denied: Some((at, 1)),
+        };
+        let result = f(&mut adv_machine::Env {
+            cpu: &mut cpu,
+            sys: &mut m.sys,
+            ext: &mut m.ext,
+            context: 0,
+            thunk,
+        });
+        assert!(!matches!(result, adv_machine::Outcome::Return64(_)));
+        assert!(cpu.writes.is_empty());
+    }
+}
+
+// Wine's per-pixel conversion: unpack each source channel to eight bits, then
+// pack it into the destination field. Destination padding is cleared.
+fn reference_pixel(data: &[u8], (src, dst): (usize, usize), pixel: u32) -> u32 {
+    let field = |address: u32, offset: usize| {
+        let at = (address - DATA) as usize + offset;
+        u32::from_le_bytes(data[at..at + 4].try_into().unwrap())
+    };
+    let channels = |address: u32| {
+        (
+            [d::red_shift, d::green_shift, d::blue_shift].map(|f| field(address, f) as i32),
+            [d::red_len, d::green_len, d::blue_len].map(|f| field(address, f)),
+        )
+    };
+    let mask = |len: u32| (255u32 << (8 - len.min(8))) & 255;
+    let rgb = match src {
+        0 | 2 => [(pixel >> 16) & 255, (pixel >> 8) & 255, pixel & 255],
+        3 => [
+            ((pixel >> 7) & 248) | ((pixel >> 12) & 7),
+            ((pixel >> 2) & 248) | ((pixel >> 7) & 7),
+            ((pixel << 3) & 248) | ((pixel >> 2) & 7),
+        ],
+        _ => {
+            let (shifts, lens) = channels(SRC);
+            std::array::from_fn(|i| {
+                let shift = shifts[i] - (8 - lens[i] as i32);
+                let value = if shift < 0 {
+                    pixel.wrapping_shl(-shift as u32)
+                } else {
+                    pixel.wrapping_shr(shift as u32)
+                } & mask(lens[i]);
+                value | value.wrapping_shr(lens[i])
+            })
+        }
+    };
+    match dst {
+        0 | 2 => (rgb[0] & 255) << 16 | (rgb[1] & 255) << 8 | (rgb[2] & 255),
+        3 => ((rgb[0] << 7) & 0x7c00) | ((rgb[1] << 2) & 0x3e0) | ((rgb[2] >> 3) & 31),
+        _ => {
+            let (shifts, lens) = channels(DST);
+            (0..3).fold(0, |p, i| {
+                let shift = shifts[i] - (8 - lens[i] as i32);
+                let value = rgb[i] & mask(lens[i]);
+                p | if shift < 0 {
+                    value.wrapping_shr(-shift as u32)
+                } else {
+                    value.wrapping_shl(shift as u32)
+                }
+            })
+        }
+    }
+}
+
+// spec: NAT-BODY-4
+#[test]
+fn true_color_rows_match_wine_pixel_path() {
+    let Some(dist) = dist() else {
+        return;
+    };
+    let mut m = machine(&dist, true, None);
+    for (src, source) in FORMATS.iter().enumerate().take(5) {
+        for (dst, target) in FORMATS.iter().enumerate().take(5) {
+            for width in [1, 2, 3, 7, 8, 9, 15, 16, 17, 960] {
+                for seed in [0, 2, 4, 6] {
+                    for signs in 0..4 {
+                        let mut data = fixture(dst, seed);
+                        dib(&mut data, SRC, src, SOURCE_BITS, seed + 2);
+                        for (address, bits, bpp, extra, negative) in [
+                            (SRC, SOURCE_BITS, source.1, 2, signs & 1 != 0),
+                            (DST, DEST_BITS, target.1, 1, signs & 2 != 0),
+                        ] {
+                            let row_len = ((width + extra) * bpp).div_ceil(32) * 4;
+                            let stride = row_len + 4;
+                            set(&mut data, address, d::width, width + extra);
+                            set(&mut data, address, d::height, 3);
+                            set(
+                                &mut data,
+                                address,
+                                d::stride,
+                                if negative {
+                                    (-(stride as i32)) as u32
+                                } else {
+                                    stride
+                                },
+                            );
+                            set(
+                                &mut data,
+                                address,
+                                d::bits,
+                                bits + if negative { 2 * stride } else { 0 },
+                            );
+                        }
+                        for (field, value) in [
+                            (rect::left, 1),
+                            (rect::top, 1),
+                            (rect::right, width + 1),
+                            (rect::bottom, 3),
+                        ] {
+                            set(&mut data, RECTS, field, value);
+                        }
+                        m.cpu.write(DATA, &data).unwrap();
+                        let name = format!("convert_to_{}", target.0);
+                        let thunk = prepare_body(&mut m, &name, &[DST, SRC, RECTS, 0]);
+                        assert!(
+                            matches!(body(&mut m, thunk), adv_machine::Outcome::Return64(_)),
+                            "{src}->{dst} width {width} seed {seed} signs {signs}"
+                        );
+                        let row_len = ((width + 1) * target.1).div_ceil(32) * 4;
+                        let stride = row_len + 4;
+                        let mut actual = vec![0; (3 * stride) as usize];
+                        m.cpu.read(DEST_BITS, &mut actual).unwrap();
+                        let mut expected = data[0x4000..0x4000 + actual.len()].to_vec();
+                        let (ssize, dsize) = (source.1.div_ceil(8), target.1.div_ceil(8));
+                        // Wine copies matching formats verbatim, including unused bits.
+                        let masks = |address: u32| {
+                            [d::red_mask, d::green_mask, d::blue_mask].map(|f| {
+                                let at = (address - DATA) as usize + f;
+                                u32::from_le_bytes(data[at..at + 4].try_into().unwrap())
+                            })
+                        };
+                        let raw = (src == dst && matches!(src, 0 | 2 | 3))
+                            || (matches!(dst, 1 | 4)
+                                && !matches!(src, 0 | 3)
+                                && source.1 == target.1
+                                && masks(SRC) == masks(DST));
+                        let source_stride = ((width + 2) * source.1).div_ceil(32) * 4 + 4;
+                        for y in 0..2 {
+                            let at = (if signs & 2 != 0 { 2 - y } else { y } * stride) as usize;
+                            let from = (0x8000
+                                + if signs & 1 != 0 { 1 - y } else { y + 1 } * source_stride
+                                + ssize) as usize;
+                            let row = &mut expected[at..at + row_len as usize];
+                            row.fill(0);
+                            for x in 0..width as usize {
+                                let mut pixel = [0; 4];
+                                let input = from + x * ssize as usize;
+                                pixel[..ssize as usize]
+                                    .copy_from_slice(&data[input..input + ssize as usize]);
+                                let pixel = u32::from_le_bytes(pixel);
+                                let value = if raw {
+                                    pixel
+                                } else {
+                                    reference_pixel(&data, (src, dst), pixel)
+                                };
+                                let output = x * dsize as usize;
+                                row[output..output + dsize as usize]
+                                    .copy_from_slice(&value.to_le_bytes()[..dsize as usize]);
+                            }
+                        }
+                        assert_eq!(
+                            actual, expected,
+                            "{src}->{dst} width {width} seed {seed} signs {signs}"
+                        );
+                        m.cpu.write(DATA, &data).unwrap();
+                        prepare_body(&mut m, &name, &[DST, SRC, RECTS, 0]);
+                        ALLOCATIONS.with(|n| n.set(Some(0)));
+                        let result = body(&mut m, thunk);
+                        let allocations = ALLOCATIONS.with(|n| n.replace(None)).unwrap();
+                        assert!(matches!(result, adv_machine::Outcome::Return64(_)));
+                        assert_eq!(
+                            allocations, 0,
+                            "{src}->{dst} width {width} seed {seed} signs {signs}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+// spec: NAT-BODY-1, NAT-BODY-4
+#[test]
+fn conversion_keeps_declared_source_pixel_width() {
+    let Some(dist) = dist() else {
+        return;
+    };
+    let mut m = machine(&dist, true, None);
+    let mut data = fixture(0, 0);
+    dib(&mut data, SRC, 2, SOURCE_BITS, 0);
+    // The existing body accepts headers whose declared pixel width differs
+    // from the format table's usual width. Preserve that per-pixel behavior.
+    set(&mut data, SRC, d::bit_count, 32);
+    set(&mut data, SRC, d::stride, 128);
+    for (field, value) in [
+        (rect::left, 0),
+        (rect::top, 0),
+        (rect::right, 9),
+        (rect::bottom, 2),
+    ] {
+        set(&mut data, RECTS, field, value);
+    }
+    let mut expected = data[0x4000..0x4100].to_vec();
+    for y in 0..2 {
+        for x in 0..9 {
+            let at = y * 128 + x * 4;
+            // The old rgb/pack path reads a DWORD and copies its BGR channels.
+            expected[at..at + 3].copy_from_slice(&data[0x8000 + at..0x8000 + at + 3]);
+            expected[at + 3] = 0;
+        }
+        expected[y * 128 + 36..y * 128 + 128].fill(0);
+    }
+    for _ in 0..2 {
+        m.cpu.write(DATA, &data).unwrap();
+        let thunk = prepare_body(&mut m, "convert_to_8888", &[DST, SRC, RECTS, 0]);
+        assert!(matches!(
+            body(&mut m, thunk),
+            adv_machine::Outcome::Return64(_)
+        ));
+        let mut actual = [0; 256];
+        m.cpu.read(DEST_BITS, &mut actual).unwrap();
+        assert_eq!(actual.as_slice(), expected);
+    }
+}
