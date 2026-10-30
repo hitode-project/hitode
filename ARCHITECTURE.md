@@ -91,10 +91,10 @@ A guest call to a function that has a native body, such as `memcpy` or `SetEvent
 2. **Translate the call.** A trace resolves `call [slot]` and `jmp [slot]` when it is translated, and watches the slot and the entry bytes. A call reaching an intact entry with a direct body becomes an `Op::Body` site. Other transfers to a redirected entry go to its thunk.
    Code: [`Trace::build`](crates/adv-cpu-a64/src/translate/trace.rs), [`Redirect`](crates/adv-cpu-a64/src/translate/trace.rs), [`Bound`](crates/adv-cpu-a64/src/translate/trace.rs), [`Op::Body`](crates/adv-cpu-a64/src/translate/decode.rs), [`TrapHandler::direct_body`](crates/adv-cpu-core/src/backend/mod.rs).
    Rules: A64-CALL-1, A64-CTL-11, A64-CTL-14.
-3. **Run the body on the window.** The site loads the inputs into w1–w7, points x0 at the body context, and calls the body as an AAPCS64 leaf, without the call stub. The body checks each 4 KiB page's class once, then reads and writes the guest window directly. The site writes the declared result registers and pops the arguments.
+3. **Run the body on the window.** The site loads the declared stack, register, floating-control and bound constant inputs into w1–w7, points x0 at the body context, and calls the body as an AAPCS64 leaf, without the call stub. The body checks each 4 KiB page's class once, then reads and writes the guest window directly. The site writes the declared result registers and pops the arguments.
    Code: [`Translator::body`](crates/adv-cpu-a64/src/translate/ops.rs), [`body`](crates/adv-cpu-core/src/body.rs) (the macro), [`BodyContext`](crates/adv-cpu-core/src/body.rs), [`DirectBody`](crates/adv-cpu-core/src/body.rs), [`Window`](crates/adv-cpu-core/src/body.rs).
    Rules: A64-CALL-2, A64-CALL-4, NAT-BODY-17.
-4. **Leave for the full path.** A page the window may not take, such as a guard, file, shared or watched page, stops the body with `Stop::Slow` before it writes anything. A call site then exits to interpret the call, and an entry site dispatches to the thunk.
+4. **Leave for the full path.** A page the window may not take, such as a guard, file, shared or watched page, stops the body with `Stop::Slow` before it writes anything. Unmasked pixel arithmetic also takes this path, so a trap retains the writes that precede it. A call site then exits to interpret the call, and an entry site dispatches to the thunk.
    Code: [`Stop`](crates/adv-cpu-core/src/body.rs), [`Translator::body`](crates/adv-cpu-a64/src/translate/ops.rs).
    Rules: A64-CALL-4, A64-CALL-5.
 5. **Run the full path.** The interpreter takes the entry's redirect to the thunk, and the machine runs its handler. A direct body runs again over `GuestMem`, which completes every access as a guest instruction would. A body that is not yet direct runs here with the handler's environment.
@@ -161,10 +161,13 @@ and the scalar tail's complete scratch effects. Paeth forms with internal
 branches retain guest execution. These LZ77 copy bridges preserve overlapping
 history; surrounding symbol decoding, window wrap and stream state remain guest work.
 
-Wine's pinned libpng row entries call the same device kernels through NT native
-bodies and a row service supplied by the codec assembly, including branch-based
-Paeth implementations. D3DX9 versions 24–43 share normalized integer pixel
-conversion, row copying and point sampling; other formats retain Wine's bodies.
+Wine's pinned libpng row entries use direct scalar filters on every host, including
+branch-based Paeth and overlapping rows. D3DX9 versions 24–43 share direct pixel
+conversion over checked guest spans, including floating, indexed and compressed
+formats. The pinned Wine conversion kernels handle channel arithmetic, filters
+and block codecs; disjoint 32-bit rows use a byte shuffle. Admission finishes
+after the loader resolves copy imports, on the first entry, and watches the
+helper code and import targets with the function.
 Wine's embedded zlib copies share direct Adler-32 and `inflate_fast` bodies.
 The decoder reads input, code tables and ring history in place, so output can
 alias those inputs. It publishes zlib's stream and bit state, including error

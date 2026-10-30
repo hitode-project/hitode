@@ -542,6 +542,16 @@ impl Translator<'_> {
                 Input::Eax => self.emit(mov(W, rd, host(0))),
                 Input::Ecx => self.emit(mov(W, rd, host(1))),
                 Input::Edx => self.emit(mov(W, rd, host(2))),
+                Input::Mxcsr => {
+                    self.emit(ldr(X, X16, RUNTIME, runtime::CPU_STATE));
+                    self.emit(ldr(W, rd, X16, runtime::MXCSR));
+                }
+                Input::FloatControl => {
+                    self.emit(ldr(X, X16, RUNTIME, runtime::CPU_STATE));
+                    self.emit(ldr(W, rd, X16, runtime::MXCSR));
+                    self.emit(ldrh(X16, X16, runtime::X87_CONTROL));
+                    self.emit(bfi(W, rd, X16, 16, 16));
+                }
             }
         }
         let call = body.call as usize as u64;

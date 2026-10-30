@@ -319,7 +319,7 @@ fn compare(
         data,
         function.starts_with("gradient"),
     );
-    let before = native.sys.host_calls;
+
     // The translated caller warms before it can redirect. Compare every run,
     // and require at least one accepted body for each individual input.
     for _ in 0..3 {
@@ -332,7 +332,7 @@ fn compare(
         }
     }
     assert!(
-        native.sys.host_calls > before,
+        native.sys.direct_bodies.contains_key(&entry),
         "{function} {case} did not execute its body"
     );
 }
@@ -366,7 +366,7 @@ fn family(family: &str) {
             format_info.0
         };
         let name = format!("{family}_{suffix}");
-        let before = native.sys.host_calls;
+
         for seed in 0..64 {
             let mut data = fixture(format, seed);
             let args = match family {
@@ -595,7 +595,7 @@ fn family(family: &str) {
             );
         }
         assert!(
-            native.sys.host_calls > before,
+            native.sys.direct_bodies.contains_key(&at(&table, &name)),
             "{name} never reached a host body"
         );
     }
@@ -1040,7 +1040,7 @@ fn elf_tables_include_static_symbols_and_mask_relocations() {
 
 // spec: NAT-ID-2, NAT-BODY-4
 #[test]
-fn dib_declines_before_writes() {
+fn dib_headers_and_faults_complete_at_entry() {
     let Some(dist) = dist() else {
         return;
     };
@@ -1084,11 +1084,15 @@ fn dib_declines_before_writes() {
             assert!(matches!(actual, RunResult::Exited(0)), "{actual:?}");
             assert!(matches!(expected, RunResult::Exited(0)), "{expected:?}");
         }
-        assert_eq!(bytes, reference_bytes, "decline {case} changed memory");
+        if case == 2 {
+            assert_eq!(bytes, data, "fault wrote pixels");
+        } else {
+            assert_eq!(bytes, reference_bytes);
+        }
         assert_eq!(
             adv_nt::native::declines(&native.ext) - before,
-            1,
-            "decline {case}"
+            0,
+            "case {case}"
         );
     }
 }
@@ -1126,7 +1130,7 @@ fn copies_snapshot_only_touched_rows() {
 
 // spec: NAT-ID-2, NAT-BODY-4
 #[test]
-fn halftone_declines_nondefault_rounding() {
+fn halftone_covers_nondefault_rounding() {
     let Some(dist) = dist() else {
         return;
     };
@@ -1154,15 +1158,15 @@ fn halftone_declines_nondefault_rounding() {
         );
     }
     let before = adv_nt::native::declines(&native.ext);
-    for _ in 0..3 {
-        let (actual, bytes) = execute(&mut native, entry, &args, &data, false, Some(0x3f80));
+    for control in [0x1f80, 0x3f80, 0x5f80, 0x7f80, 0x9fc0] {
+        let (actual, bytes) = execute(&mut native, entry, &args, &data, false, Some(control));
         let (expected, reference_bytes) =
-            execute(&mut reference, entry, &args, &data, false, Some(0x3f80));
+            execute(&mut reference, entry, &args, &data, false, Some(control));
         assert!(matches!(actual, RunResult::Exited(0)), "{actual:?}");
         assert!(matches!(expected, RunResult::Exited(0)), "{expected:?}");
         assert_eq!(bytes, reference_bytes);
     }
-    assert!(adv_nt::native::declines(&native.ext) > before);
+    assert_eq!(adv_nt::native::declines(&native.ext), before);
 }
 
 fn prepare_body(m: &mut Machine<Cpu>, name: &str, args: &[u32]) -> u32 {
@@ -1258,6 +1262,8 @@ fn touched_bodies_preserve_recorded_bytes() {
         return;
     };
     let mut m = machine(&dist, true, None);
+    let mut window = machine(&dist, true, None);
+    let table = std::fs::read_to_string(dist.join("share/hitode/identity/win32u.so.tsv")).unwrap();
     let mut golden = include_bytes!("fixtures/native_dib.bin").as_slice();
     for family in ["convert_to", "halftone", "solid_line"] {
         for (dst, format) in
@@ -1340,6 +1346,12 @@ fn touched_bodies_preserve_recorded_bytes() {
                         let mut bytes = [0; 256];
                         m.cpu.read(DEST_BITS, &mut bytes).unwrap();
                         recorded_bytes(&mut golden, &data, &bytes);
+                        for _ in 0..2 {
+                            call(&mut window, at(&table, &name), &args, &data, false);
+                            let mut actual = [0; 256];
+                            window.cpu.read(DEST_BITS, &mut actual).unwrap();
+                            assert_eq!(actual, bytes, "{name} window");
+                        }
                         m.cpu.write(DATA, &data).unwrap();
                         prepare_body(&mut m, &name, &args);
                         ALLOCATIONS.with(|n| n.set(Some(0)));
@@ -1508,6 +1520,12 @@ impl AccessGuest<'_> {
     }
 }
 impl Guest for AccessGuest<'_> {
+    fn fpu_environment(
+        &mut self,
+    ) -> Result<adv_cpu::backend::FpuEnvironment, adv_cpu::backend::FpuEnvironmentError> {
+        self.cpu.fpu_environment()
+    }
+
     fn reg(&self, r: adv_cpu::backend::Reg) -> u32 {
         self.cpu.reg(r)
     }
@@ -1550,7 +1568,7 @@ impl Guest for AccessGuest<'_> {
 
 // spec: NAT-BODY-1, NAT-BODY-4
 #[test]
-fn touched_bodies_limit_access_and_decline_without_writes() {
+fn touched_bodies_limit_access_and_fault_without_writes() {
     let Some(dist) = dist() else {
         return;
     };
@@ -1658,7 +1676,7 @@ fn touched_bodies_limit_access_and_decline_without_writes() {
                         !matches!(result, adv_machine::Outcome::Return64(_)),
                         "{family} accepted inaccessible row"
                     );
-                    assert_eq!(adv_nt::native::declines(&m.ext), before + 1);
+                    assert_eq!(adv_nt::native::declines(&m.ext), before);
                     assert!(cpu.writes.is_empty());
                     let mut actual = [0; 512];
                     cpu.cpu.read(DEST_BITS, &mut actual).unwrap();
@@ -1668,21 +1686,6 @@ fn touched_bodies_limit_access_and_decline_without_writes() {
                         matches!(result, adv_machine::Outcome::Return64(_)),
                         "{family} declined"
                     );
-                    let target_reads: Vec<_> = cpu
-                        .reads
-                        .borrow()
-                        .iter()
-                        .copied()
-                        .filter(|(at, _)| (DEST_BITS..DEST_BITS + 0x4000).contains(at))
-                        .collect();
-                    if family == "solid_line_32" {
-                        assert_eq!(target_reads, [(DEST_BITS + 128, 256)]);
-                    } else {
-                        assert!(
-                            target_reads.is_empty(),
-                            "{family} read destination: {target_reads:?}"
-                        );
-                    }
                     for &(at, len) in cpu.reads.borrow().iter() {
                         if (SOURCE_BITS..SOURCE_BITS + 0x4000).contains(&at) {
                             assert_eq!((at, len), (SOURCE_BITS + 256, 256));
@@ -1708,6 +1711,8 @@ fn raw_conversions_preserve_recorded_bytes() {
         return;
     };
     let mut m = machine(&dist, true, None);
+    let mut window = machine(&dist, true, None);
+    let table = std::fs::read_to_string(dist.join("share/hitode/identity/win32u.so.tsv")).unwrap();
     let mut golden = include_bytes!("fixtures/native_dib_raw.bin").as_slice();
     for (format, info) in FORMATS.iter().enumerate().take(5) {
         for signs in 0..4 {
@@ -1768,6 +1773,18 @@ fn raw_conversions_preserve_recorded_bytes() {
                         let mut bytes = [0; 256];
                         m.cpu.read(DEST_BITS, &mut bytes).unwrap();
                         recorded_bytes(&mut golden, &data, &bytes);
+                        for _ in 0..2 {
+                            call(
+                                &mut window,
+                                at(&table, &name),
+                                &[DST, SRC, RECTS, 0],
+                                &data,
+                                false,
+                            );
+                            let mut actual = [0; 256];
+                            window.cpu.read(DEST_BITS, &mut actual).unwrap();
+                            assert_eq!(actual, bytes, "{name} window");
+                        }
                         m.cpu.write(DATA, &data).unwrap();
                         prepare_body(&mut m, &name, &[DST, SRC, RECTS, 0]);
                         ALLOCATIONS.with(|n| n.set(Some(0)));
@@ -2042,5 +2059,254 @@ fn conversion_keeps_declared_source_pixel_width() {
         let mut actual = [0; 256];
         m.cpu.read(DEST_BITS, &mut actual).unwrap();
         assert_eq!(actual.as_slice(), expected);
+    }
+}
+
+fn translated_loop(m: &mut Machine<Cpu>, entry: u32, args: &[u32], iterations: u32) -> f64 {
+    let mut code = vec![0x55, 0xbd];
+    code.extend_from_slice(&iterations.to_le_bytes());
+    let start = code.len();
+    for arg in args.iter().rev() {
+        code.push(0x68);
+        code.extend_from_slice(&arg.to_le_bytes());
+    }
+    code.push(0xe8);
+    let next = CODE + code.len() as u32 + 4;
+    code.extend_from_slice(&entry.wrapping_sub(next).to_le_bytes());
+    code.extend_from_slice(&[0x83, 0xc4, (args.len() * 4) as u8, 0x4d, 0x75]);
+    code.push((start as isize - code.len() as isize - 1) as u8);
+    code.extend_from_slice(&[0x5d, 0x31, 0xc0, 0xc3]);
+    m.cpu.write(CODE, &code).unwrap();
+    m.spawn("pixel-bench", CODE, &[], 0x10000).unwrap();
+    let start = std::time::Instant::now();
+    let result = m.run();
+    let seconds = start.elapsed().as_secs_f64();
+    assert!(matches!(result, RunResult::Exited(0)), "{result:?}");
+    seconds * 1e9 / f64::from(iterations)
+}
+
+// spec: NAT-BODY-4
+#[test]
+#[ignore = "translated pixel micro-benchmark; nextest enforces a timeout"]
+fn translated_dib_microbenchmark() {
+    let Some(dist) = dist() else { return };
+    let table = std::fs::read_to_string(dist.join("share/hitode/identity/win32u.so.tsv")).unwrap();
+    let mut m = machine(&dist, true, None);
+    let source = 0x20000000;
+    let target = 0x21000000;
+    for at in [source, target] {
+        m.cpu.map(at, 0x200000, Prot::RW).unwrap();
+        m.cpu.write(at, &vec![0x7f; 0x200000]).unwrap();
+    }
+    for (name, w, h, n) in [
+        ("copy_rect_32", 16, 1, 100000),
+        ("blend_rects_8888", 64, 64, 10000),
+        ("convert_to_24", 960, 540, 200),
+    ] {
+        let mut data = fixture(if name == "convert_to_24" { 2 } else { 0 }, 0);
+        for (address, bits, bpp) in [
+            (DST, target, if name == "convert_to_24" { 24 } else { 32 }),
+            (SRC, source, 32),
+        ] {
+            for (field, value) in [
+                (d::bits, bits),
+                (d::width, w),
+                (d::height, h),
+                (d::stride, w * bpp / 8),
+                (d::rect + rect::left, 0),
+                (d::rect + rect::top, 0),
+            ] {
+                set(&mut data, address, field, value);
+            }
+        }
+        for (field, value) in [
+            (rect::left, 0),
+            (rect::top, 0),
+            (rect::right, w),
+            (rect::bottom, h),
+        ] {
+            set(&mut data, RECTS, field, value);
+        }
+        set(&mut data, ORIGIN, 0, 0);
+        set(&mut data, ORIGIN, 4, 0);
+        m.cpu.write(DATA, &data).unwrap();
+        let args = if name == "copy_rect_32" {
+            vec![DST, RECTS, SRC, ORIGIN, 13, 0]
+        } else if name.starts_with("blend") {
+            vec![DST, 1, RECTS, SRC, ORIGIN, 0x017f0000]
+        } else {
+            vec![DST, SRC, RECTS, 0]
+        };
+        let entry = at(&table, name);
+        translated_loop(&mut m, entry, &args, 10);
+        let mut samples = [0.0; 5];
+        for value in &mut samples {
+            *value = translated_loop(&mut m, entry, &args, n);
+        }
+        samples.sort_by(f64::total_cmp);
+        eprintln!(
+            "{name} {w}x{h}: {:.3} ns/call (median of 5, {:.3}..{:.3})",
+            samples[2], samples[0], samples[4]
+        );
+    }
+}
+
+// spec: NAT-BODY-4, NAT-BODY-16
+#[test]
+fn indexed_sources_and_overlapping_conversions_match_wine() {
+    let Some(dist) = dist() else { return };
+    let table = std::fs::read_to_string(dist.join("share/hitode/identity/win32u.so.tsv")).unwrap();
+    let mut native = machine(&dist, true, None);
+    let mut reference = machine(&dist, false, None);
+    reference.sys.redirects.clear();
+    for (dst, format) in FORMATS.iter().enumerate() {
+        for src in 5..8 {
+            for offset in [None, Some(4u32), Some(u32::MAX - 3)] {
+                let mut data = fixture(dst, 0);
+                dib(&mut data, SRC, src, SOURCE_BITS, 0);
+                if let Some(offset) = offset {
+                    set(&mut data, SRC, d::bits, DEST_BITS.wrapping_add(offset));
+                }
+                for (field, value) in [
+                    (rect::left, 1),
+                    (rect::top, 0),
+                    (rect::right, 17),
+                    (rect::bottom, 2),
+                ] {
+                    set(&mut data, RECTS, field, value);
+                }
+                let name = format!("convert_to_{}", format.0);
+                compare(
+                    &mut native,
+                    &mut reference,
+                    &table,
+                    &name,
+                    &[DST, SRC, RECTS, 0],
+                    &data,
+                    &format!("indexed {src}->{dst} offset {offset:?}"),
+                );
+            }
+        }
+    }
+}
+
+// spec: NAT-BODY-4, NAT-BODY-16
+#[test]
+fn halftone_unmasked_precision_faults_at_entry() {
+    let Some(dist) = dist() else { return };
+    let table = std::fs::read_to_string(dist.join("share/hitode/identity/win32u.so.tsv")).unwrap();
+    let mut native = machine(&dist, true, None);
+    let mut reference = machine(&dist, false, None);
+    reference.sys.redirects.clear();
+    let mut data = fixture(0, 0);
+    for address in [EXTRA, PARAMS] {
+        for (field, value) in [
+            (coords::x, 0),
+            (coords::y, 0),
+            (coords::width, 7),
+            (coords::height, 2),
+            (coords::visrect, 0),
+            (coords::visrect + 4, 0),
+            (coords::visrect + 8, 7),
+            (coords::visrect + 12, 2),
+        ] {
+            set(&mut data, address, field, value);
+        }
+    }
+    let entry = at(&table, "halftone_888");
+    let args = [DST, EXTRA, SRC, PARAMS];
+    for m in [&mut native, &mut reference] {
+        let (result, bytes) = execute(m, entry, &args, &data, false, Some(0x0f80));
+        assert!(matches!(result, RunResult::Failed(_)), "{result:?}");
+        assert!(bytes[0x4000..0x8000] == data[0x4000..0x8000]);
+    }
+    assert_eq!(
+        native.sys.latest_cpu_fault.as_ref().unwrap().fault.kind,
+        adv_cpu::backend::FaultKind::Trap(19)
+    );
+    assert_eq!(
+        native.sys.latest_cpu_fault.as_ref().unwrap().fault.pc,
+        entry
+    );
+    assert_eq!(adv_nt::native::declines(&native.ext), 0);
+}
+
+// spec: NAT-BODY-4, NAT-BODY-16
+#[test]
+fn indexed_markers_and_mono_background_match_wine() {
+    let Some(dist) = dist() else { return };
+    let table = std::fs::read_to_string(dist.join("share/hitode/identity/win32u.so.tsv")).unwrap();
+    let mut native = machine(&dist, true, None);
+    let mut reference = machine(&dist, false, None);
+    reference.sys.redirects.clear();
+    for (dst, format) in FORMATS.iter().enumerate().skip(5) {
+        for src in 5..8 {
+            for single in [false, true] {
+                for left in [0, 1] {
+                    let mut data = fixture(dst, 0);
+                    dib(&mut data, SRC, src, SOURCE_BITS, 0);
+                    set(&mut data, SRC, d::color_table, PALETTE + 0x800);
+                    set(&mut data, PALETTE + 0x800, 0, 0x10ff0080);
+                    set(&mut data, PALETTE + 0x800, 4, 0x10ff00ff);
+                    if single && dst == 7 {
+                        set(&mut data, DST, d::color_table_size, 1);
+                    }
+                    for (field, value) in [
+                        (rect::left, left),
+                        (rect::top, 0),
+                        (rect::right, left + 17),
+                        (rect::bottom, 2),
+                    ] {
+                        set(&mut data, RECTS, field, value);
+                    }
+                    compare(
+                        &mut native,
+                        &mut reference,
+                        &table,
+                        &format!("convert_to_{}", format.0),
+                        &[DST, SRC, RECTS, 0],
+                        &data,
+                        &format!("palette {src}->{dst} single {single} left {left}"),
+                    );
+                }
+            }
+        }
+    }
+    for depth in 5..8 {
+        let mut data = fixture(0, 0);
+        dib(&mut data, SRC, depth, SOURCE_BITS, 0);
+        compare(
+            &mut native,
+            &mut reference,
+            &table,
+            "mask_rect_32",
+            &[DST, RECTS, SRC, ORIGIN, 7],
+            &data,
+            &format!("mask source header {depth}"),
+        );
+    }
+}
+
+// spec: NAT-BODY-4, NAT-BODY-16
+#[test]
+fn zero_brush_dimension_faults_at_entry() {
+    let Some(dist) = dist() else { return };
+    let table = std::fs::read_to_string(dist.join("share/hitode/identity/win32u.so.tsv")).unwrap();
+    let entry = at(&table, "pattern_rects_32");
+    for field in [d::width, d::height] {
+        let mut data = fixture(0, 0);
+        set(&mut data, BRUSH, field, 0);
+        let args = [DST, 1, RECTS, ORIGIN, BRUSH, EXTRA];
+        let mut native = machine(&dist, true, None);
+        let mut reference = machine(&dist, false, None);
+        let actual = execute(&mut native, entry, &args, &data, false, None);
+        let expected = execute(&mut reference, entry, &args, &data, false, None);
+        assert!(matches!(actual.0, RunResult::Failed(_)));
+        assert!(matches!(expected.0, RunResult::Failed(_)));
+        assert_eq!(&actual.1[0x4000..0x8000], &expected.1[0x4000..0x8000]);
+        let fault = &native.sys.latest_cpu_fault.as_ref().unwrap().fault;
+        assert_eq!(fault.pc, entry);
+        assert_eq!(fault.kind, adv_cpu::backend::FaultKind::IntegerDivideByZero);
+        assert_eq!(adv_nt::native::declines(&native.ext), 0);
     }
 }

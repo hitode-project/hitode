@@ -389,7 +389,7 @@ Field offsets match the pinned module's DWARF. The mixer runs as a host-call bod
 
 ### NAT-BODY-4 DIB primitives
 
-**Rule**: DIB bodies MUST preserve Wine's pixels, padding, overlap traversal, bit fields, palette selection, blend arithmetic, and interpolation rounding. Rect and row bodies MUST snapshot only the rows they touch, and unsupported formats or inaccessible memory MUST decline before writes. Field offsets and data addresses MUST match the pinned Unix module's DWARF.
+**Rule**: DIB bodies MUST preserve Wine's pixels, padding, overlap traversal, bit fields, palette selection, blend arithmetic and interpolation rounding. They MUST cover every format, palette depth, brush and floating-point control their primitive accepts. Field offsets and data addresses MUST match the pinned Unix module's DWARF.
 **Verification**: Test
 
 ### NAT-BODY-5 Code page bodies
@@ -427,12 +427,12 @@ Field offsets match the pinned module's DWARF. The mixer runs as a host-call bod
 
 ### NAT-BODY-8 D3DX pixel conversion
 
-**Rule**: D3DX pixel bodies MUST preserve channel values, filter coordinates, color keys and padding with layouts matching the pinned module's DWARF. Unsupported formats or filters, overlapping buffers and inaccessible memory MUST decline before writes. Changed helper code or copy imports MUST retain guest execution.
+**Rule**: D3DX pixel bodies MUST preserve channel values, filter coordinates, color keys and padding with layouts matching the pinned module's DWARF. They MUST cover every format, filter and overlap the function accepts. Changed helper code or copy imports MUST leave the function unbound.
 **Verification**: Test
 
 ### NAT-BODY-9 PNG row bodies
 
-**Rule**: PNG row bodies MUST preserve Wine's Sub, Up, Average and Paeth bytes and row metadata through the shared device kernels. Missing kernels, overlapping rows and inaccessible memory MUST retain guest execution before writes. Row metadata offsets MUST match the pinned module's DWARF.
+**Rule**: PNG row bodies MUST preserve Wine's Sub, Up, Average and Paeth bytes and row metadata for every pixel depth and row overlap. Every host MUST provide each filter, scalar where no device kernel exists. Row metadata offsets MUST match the pinned module's DWARF.
 **Verification**: Test
 
 ### NAT-BODY-10 Embedded zlib checksums
@@ -457,7 +457,7 @@ Field offsets match the pinned module's DWARF. The mixer runs as a host-call bod
 
 ### NAT-BODY-14 Engine pixel routines
 
-**Rule**: Engine pixel bodies MUST write the pixels the routine writes, bit for bit, even where its pair paths round unlike its single-pixel path. They MUST keep every register the routine keeps. A destination overlapping a source other than in place MUST retain guest execution.
+**Rule**: Engine pixel bodies MUST write the pixels the routine writes, bit for bit, even where its pair paths round unlike its single-pixel path. They MUST keep every register the routine keeps. Overlapping sources and destinations MUST be read and written in the routine's order.
 **Verification**: Test
 
 ### NAT-BODY-15 Native host work

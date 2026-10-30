@@ -22,7 +22,7 @@ const PAGE_SHIFT: u32 = 12;
 pub const ALIAS: u8 = 1 << 5;
 pub const NO_ALIAS: u8 = 1 << 6;
 
-/// Why a body stopped before finishing. It has written nothing.
+/// Why a body stopped before finishing. Slow and Guest precede every write.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stop {
     /// A page the window form may not take: the full path runs the call.
@@ -31,6 +31,9 @@ pub enum Stop {
     Fault { address: u32, write: bool },
     /// Integer division by zero at the bound function entry.
     DivideByZero,
+    /// An architectural trap at the bound function entry; the full path
+    /// retains writes completed before the trapping arithmetic.
+    Trap(u8),
     /// The function would wait, call guest code or request the server:
     /// its guest code runs once instead (A64-CALL-6).
     Guest,
@@ -69,6 +72,10 @@ pub enum Input {
     Eax,
     Ecx,
     Edx,
+    /// SSE floating-point controls at the call.
+    Mxcsr,
+    /// MXCSR in the low half and the x87 control word in the high half.
+    FloatControl,
 }
 
 /// Guest registers a body sets ([`DirectBody::outputs`]).
@@ -225,6 +232,9 @@ macro_rules! body {
 /// the pointers stay valid until the body returns. Overlapping input and
 /// output ranges are the body's to order.
 pub trait Mem {
+    /// The window form retries fault-capable floating work before any write.
+    const WINDOW: bool = false;
+
     /// Shared host state; a body never reaches the machine or its extensions.
     fn services(&self) -> Services {
         Services::default()
@@ -324,6 +334,7 @@ impl Window {
 }
 
 impl Mem for Window {
+    const WINDOW: bool = true;
     fn services(&self) -> Services {
         self.services
     }

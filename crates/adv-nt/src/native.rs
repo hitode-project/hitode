@@ -40,7 +40,6 @@ mod pixels;
 mod png;
 mod services;
 mod zlib;
-pub use png::{PngFilter, PngRows};
 
 /// The module the bodies' thunks are registered under.
 pub const MODULE: &str = "hitode.native";
@@ -358,9 +357,9 @@ static BODIES: std::sync::LazyLock<Vec<Body>> = std::sync::LazyLock::new(|| {
         bodies.push(Body {
             name: format!("d3dx9_{version}.dll!d3dx_load_pixels_from_pixels").into(),
             conv: Conv::Cdecl { argc: 6 },
-            body: Some(pixels::load),
+            body: None,
             handler: resume_original,
-            direct: None,
+            direct: Some(pixels::LOAD),
         });
     }
     bodies.extend(png::bodies());
@@ -480,7 +479,7 @@ fn run_full(
     handler: adv_machine::Handler,
 ) -> Outcome {
     use adv_cpu::backend::{Fault, FaultKind, Reg};
-    use adv_cpu::body::{ECX, EDX, GuestMem, Input, Stop};
+    use adv_cpu::body::{EAX, ECX, EDX, GuestMem, Input, Stop};
     let bound = env
         .ext
         .get_or_default::<Entries>()
@@ -489,12 +488,32 @@ fn run_full(
         .copied()
         .flatten();
     let direct = bound.map_or(body.direct, |(_, direct)| direct);
+    if let Some((entry, _)) = bound
+        && !env.sys.direct_bodies.contains_key(&entry)
+        && pixels::bind_call(env.cpu, env.sys, env.ext, entry, direct).is_none()
+    {
+        env.sys.redirects.remove(&entry);
+        return resume_original(env);
+    }
     let inputs = std::array::from_fn(|n| match direct.inputs[n] {
         Some(Input::Stack(k)) => env.arg(u32::from(k)),
         Some(Input::Const(value)) => value,
         Some(Input::Eax) => env.cpu.reg(Reg::Eax),
         Some(Input::Ecx) => env.cpu.reg(Reg::Ecx),
         Some(Input::Edx) => env.cpu.reg(Reg::Edx),
+        Some(Input::Mxcsr) => {
+            env.cpu
+                .fpu_environment()
+                .expect("body CPU has SSE controls")
+                .mxcsr
+        }
+        Some(Input::FloatControl) => {
+            let control = env
+                .cpu
+                .fpu_environment()
+                .expect("body CPU has floating controls");
+            control.mxcsr | u32::from(control.x87_control) << 16
+        }
         None => 0,
     });
     let mut scratch = std::mem::take(&mut env.ext.get_or_default::<FullScratch>().0);
@@ -513,10 +532,14 @@ fn run_full(
             if outputs & EDX != 0 {
                 Outcome::Return64(ret.value)
             } else {
-                Outcome::Return(ret.value as u32)
+                Outcome::Return(if outputs & EAX != 0 {
+                    ret.value as u32
+                } else {
+                    env.cpu.reg(Reg::Eax)
+                })
             }
         }
-        Err(stop @ (Stop::Fault { .. } | Stop::DivideByZero)) => {
+        Err(stop @ (Stop::Fault { .. } | Stop::DivideByZero | Stop::Trap(_))) => {
             let Some((pc, _)) = bound else {
                 return Outcome::Fail("direct body without an entry".into());
             };
@@ -530,6 +553,7 @@ fn run_full(
                     write: false,
                 } => FaultKind::Read(address),
                 Stop::DivideByZero => FaultKind::IntegerDivideByZero,
+                Stop::Trap(vector) => FaultKind::Trap(vector),
                 _ => unreachable!(),
             };
             Outcome::Raise(Fault { kind, pc })
@@ -568,8 +592,8 @@ pub(crate) fn bind(cpu: &mut dyn Guest, sys: &mut Sys, ext: &mut Ext, base: u32,
     }
     let mut relocations = pe.relocations().unwrap_or_default();
     relocations.sort_unstable();
-    bind_relocated(cpu, sys, ext, base, &relocations);
     pixels::prepare(cpu, ext, base, pe, &relocations);
+    bind_relocated(cpu, sys, ext, base, &relocations);
 }
 
 pub(crate) fn bind_relocated(
@@ -695,8 +719,6 @@ fn bind_one(
     let target = if name == "dsound.dll!DSOUND_MixToPrimary" {
         mixer::prepare(cpu, sys, ext, entry)?;
         thunk
-    } else if name.starts_with("win32u.so!halftone_") {
-        dib::entry(cpu, sys, thunk)?
     } else {
         thunk
     };
@@ -709,7 +731,21 @@ fn bind_one(
         if let Some(bind) = body.bind {
             direct.inputs = bind(cpu, entry, &original)?;
         }
-        sys.direct_bodies.insert(entry, direct);
+        if name.starts_with("win32u.so!") {
+            if let Some(image) = ext
+                .try_get::<Images>()
+                .and_then(|images| images.containing(entry))
+                && direct.inputs[6] == Some(adv_cpu::body::Input::Const(0))
+            {
+                direct.inputs[6] = Some(adv_cpu::body::Input::Const(image.base));
+            }
+            if name.starts_with("win32u.so!halftone_") {
+                direct.inputs[4] = Some(adv_cpu::body::Input::Mxcsr);
+            }
+        }
+        if !name.starts_with("d3dx9_") {
+            sys.direct_bodies.insert(entry, direct);
+        }
         ext.get_or_default::<Entries>().insert(index, entry, direct);
     }
     sys.redirects.insert(entry, (target, original.into()));
