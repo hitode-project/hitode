@@ -1,13 +1,13 @@
 #![cfg(any(target_vendor = "apple", target_os = "android"))]
 use adv_nt::ntsync::*;
 use adv_wineserver as _;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd};
 
 fn device() -> Fd {
     let fd = hitode_ntsync_open();
     assert!(fd >= 0);
     // SAFETY: open returns a new owned descriptor.
-    unsafe { OwnedFd::from_raw_fd(fd) }.into()
+    unsafe { Fd::from_raw_fd(fd) }
 }
 fn call(fd: &Fd, command: u32, value: [u32; 2]) -> Result<[u32; 2], i32> {
     let mut value = value;
@@ -19,7 +19,7 @@ fn create(device: &Fd, command: u32, mut value: [u32; 2]) -> Fd {
     // SAFETY: creation takes the two supplied u32 fields.
     let fd = unsafe { ioctl(device.as_raw_fd(), command, value.as_mut_ptr()) }.unwrap();
     // SAFETY: creation returns a new owned descriptor.
-    unsafe { OwnedFd::from_raw_fd(fd) }.into()
+    unsafe { Fd::from_raw_fd(fd) }
 }
 fn wait(device: &Fd, objects: &[&Fd], owner: u32, alert: Option<&Fd>, all: bool) -> Pending {
     let objects: Vec<_> = objects.iter().map(|o| o.as_raw_fd()).collect();
@@ -191,7 +191,7 @@ fn descriptors_survive_rights_and_close() {
         assert_eq!(hitode_recvmsg(b.as_raw_fd(), &mut msg, 0), 4);
         let copy =
             std::ptr::read_unaligned(libc::CMSG_DATA(libc::CMSG_FIRSTHDR(&msg)).cast::<i32>());
-        let copy = Fd::from(OwnedFd::from_raw_fd(copy));
+        let copy = Fd::from_raw_fd(copy);
         assert_eq!(call(&copy, EVENT_READ, [0; 2]), Ok([1, 1]));
         let raw = copy.as_raw_fd();
         drop(copy);

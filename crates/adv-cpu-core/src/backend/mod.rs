@@ -453,6 +453,16 @@ pub trait GuestExt: Guest {
 impl<G: Guest + ?Sized> GuestExt for G {}
 
 pub trait TrapHandler {
+    /// Shared service storage retained by the execution owner for this run.
+    fn body_services(&self) -> crate::body::Services {
+        crate::body::Services::default()
+    }
+
+    /// Diagnostic modes affecting translated bindings; changes discard units.
+    fn diagnostics(&self) -> u8 {
+        0
+    }
+
     /// Preparation only: admit the complete offered loop body. This is never
     /// called by generated code; the returned capability obeys NativeRegion's
     /// safety contract and is invalidated with the translation's code bytes.

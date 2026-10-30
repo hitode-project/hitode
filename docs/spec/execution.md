@@ -55,6 +55,23 @@ Cached successors MUST match entry EIP and block-cache generation. They MUST pas
 With software-checked memory, executable permission alone MUST NOT prevent `Memory::direct` writes to ordinary writable bytes outside observed dependencies.
 Native host protection MUST retain its executable-page write barrier.
 
+## Host calls
+
+### EXEC-CALL-1 Host call bookkeeping
+
+**Rule**: With diagnostics off, an ordinary host call MUST NOT read a clock, read the guest stack, record recent calls or count memory work. It MUST look up its thunk once. Toggling diagnostics MUST discard translated units, so generated code carries no diagnostic branches.
+**Verification**: Test
+
+### EXEC-CALL-2 Host call entry checks
+
+**Rule**: `native::call` MUST classify alias snapshots only after the memory epoch changes. Interrupt, stop and pending-work checks before a handler MUST read one pending word.
+**Verification**: Test
+
+### EXEC-CALL-3 Work proportional to the operation
+
+**Rule**: Host work for mapping, protection and watch changes MUST be proportional to the changed pages. Tables and snapshots MUST NOT be copied or rebuilt whole for a partial change. Handle closes and file position or size queries MUST NOT issue host system calls when the host state already holds the answer.
+**Verification**: Test
+
 ## Native computation admission
 
 ### EXEC-NATIVE-1 Verified bindings

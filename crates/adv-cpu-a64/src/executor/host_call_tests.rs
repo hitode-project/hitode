@@ -21,15 +21,17 @@ const THUNK_INDEX: u32 = 7;
 
 struct Calls {
     enabled: bool,
+    diagnostics: u8,
     direct: u32,
     traps: u32,
     delay: bool,
-    interrupt: Option<Arc<AtomicBool>>,
+    interrupt: Option<Arc<AtomicU32>>,
 }
 impl Calls {
     fn new(enabled: bool) -> Self {
         Self {
             enabled,
+            diagnostics: 0,
             direct: 0,
             traps: 0,
             delay: false,
@@ -45,6 +47,10 @@ impl Calls {
     }
 }
 impl ExecutionTrap for Calls {
+    fn diagnostics(&self) -> u8 {
+        self.diagnostics
+    }
+
     fn host_thunk(&self, pc: u32, word: u32) -> Option<u32> {
         (self.enabled && pc == THUNK + 5 && [WORD, WORD + 1].contains(&word)).then_some(THUNK_INDEX)
     }
@@ -63,7 +69,7 @@ impl ExecutionTrap for Calls {
             }
         }
         if let Some(flag) = &self.interrupt {
-            flag.store(true, Ordering::Release);
+            flag.fetch_or(adv_sync::pending::INTERRUPT, Ordering::Release);
         }
         self.result(state, memory);
         Ok(false)
@@ -217,7 +223,7 @@ fn deadline_and_interrupt_leave_before_the_instruction_after_a_call() {
             .unwrap();
         executor.state = initial;
         executor.write(DATA + 40, &0u32.to_le_bytes()).unwrap();
-        let flag = Arc::new(AtomicBool::new(false));
+        let flag = Arc::new(AtomicU32::new(0));
         executor.set_host_interrupt_flag(flag.clone());
         if delayed {
             calls.delay = true;
@@ -316,4 +322,36 @@ fn host_call_observes_dirty_mmx_and_x87_aliases_in_an_inlined_call() {
             }
         }
     }
+}
+
+// spec: EXEC-CALL-1
+#[test]
+fn diagnostic_mode_changes_discard_units_and_gate_memory_counts() {
+    let (mut executor, stop) = fixture((false, false, Checks::All));
+    let initial = executor.state.clone();
+    let mut calls = Calls::new(true);
+    executor
+        .run_with_traps(stop, 100, &mut calls, false)
+        .unwrap();
+    let before = executor.native.as_ref().unwrap().diagnostics.clears;
+    let counts = executor.memory.host_access();
+    for mode in [1, 2, 4, 0] {
+        executor.state = initial.clone();
+        calls.diagnostics = mode;
+        executor
+            .run_with_traps(stop, 100, &mut calls, false)
+            .unwrap();
+    }
+    assert_eq!(
+        executor.native.as_ref().unwrap().diagnostics.clears,
+        before + 4
+    );
+    let observed = executor.memory.host_access();
+    assert!(observed.reads > counts.reads);
+    assert!(observed.writes > counts.writes);
+    executor.state = initial;
+    executor
+        .run_with_traps(stop, 100, &mut calls, false)
+        .unwrap();
+    assert_eq!(executor.memory.host_access(), observed);
 }

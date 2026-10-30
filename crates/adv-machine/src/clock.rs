@@ -50,7 +50,7 @@ impl RealProgress {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub enum ClockMode {
     /// Wall-clock time since machine start.
     Real {
@@ -62,14 +62,27 @@ pub enum ClockMode {
     Virtual(u64),
 }
 
-#[derive(Clone)]
 pub struct Clock {
-    mode: ClockMode,
     /// Added to every reading so tick counts don't start at zero (some code treats 0 as unset).
     pub epoch_us: u64,
-    active_skip_us: u64,
+    state: std::rc::Rc<ClockState>,
+}
+
+#[derive(Clone)]
+struct ClockState {
+    mode: Cell<ClockMode>,
+    active_skip_us: Cell<u64>,
     real_progress: Cell<RealProgress>,
     allowance: Cell<Allowance>,
+}
+
+impl Clone for Clock {
+    fn clone(&self) -> Self {
+        Self {
+            epoch_us: self.epoch_us,
+            state: std::rc::Rc::new((*self.state).clone()),
+        }
+    }
 }
 
 /// QueryPerformanceFrequency. 10 MHz, as on current Windows.
@@ -77,37 +90,58 @@ pub const QPC_FREQ: u64 = 10_000_000;
 
 impl Clock {
     pub fn real() -> Self {
-        Self {
-            mode: ClockMode::Real {
-                started: Instant::now(),
-                paused_at: None,
-                paused_for_us: 0,
-            },
-            epoch_us: 1_000_000,
-            active_skip_us: 0,
-            real_progress: Cell::new(RealProgress::default()),
-            allowance: Cell::new(Allowance::Working),
-        }
+        Self::new(ClockMode::Real {
+            started: Instant::now(),
+            paused_at: None,
+            paused_for_us: 0,
+        })
     }
 
     pub fn virtual_time() -> Self {
+        Self::new(ClockMode::Virtual(0))
+    }
+
+    fn new(mode: ClockMode) -> Self {
         Self {
-            mode: ClockMode::Virtual(0),
             epoch_us: 1_000_000,
-            active_skip_us: 0,
-            real_progress: Cell::new(RealProgress::default()),
-            allowance: Cell::new(Allowance::Working),
+            state: std::rc::Rc::new(ClockState {
+                mode: Cell::new(mode),
+                active_skip_us: Cell::new(0),
+                real_progress: Cell::new(RealProgress::default()),
+                allowance: Cell::new(Allowance::Working),
+            }),
         }
     }
 
+    /// Shared clock storage survives exclusive borrows of the machine.
+    pub fn body_pointer(&self) -> *const std::ffi::c_void {
+        std::rc::Rc::as_ptr(&self.state).cast()
+    }
+
+    /// Counter service, including the two virtual-time observations of NT entry.
+    /// # Safety
+    /// `state` must come from the live execution owner's `body_pointer`.
+    pub unsafe fn body_counter(state: *const std::ffi::c_void, epoch_us: u64) -> u64 {
+        // SAFETY: the owner retains this shared allocation for the run.
+        let state = unsafe { &*state.cast::<ClockState>() };
+        if let ClockMode::Virtual(time) = state.mode.get() {
+            state.mode.set(ClockMode::Virtual(time + 2));
+        }
+        Self::read(state, epoch_us) * 10
+    }
+
     pub fn is_virtual(&self) -> bool {
-        matches!(self.mode, ClockMode::Virtual(_))
+        matches!(self.state.mode.get(), ClockMode::Virtual(_))
     }
 
     pub fn now_us(&self) -> u64 {
-        self.epoch_us
-            + self.active_skip_us
-            + match &self.mode {
+        Self::read(&self.state, self.epoch_us)
+    }
+
+    fn read(state: &ClockState, epoch_us: u64) -> u64 {
+        epoch_us
+            + state.active_skip_us.get()
+            + match state.mode.get() {
                 ClockMode::Real {
                     started,
                     paused_at,
@@ -115,19 +149,19 @@ impl Clock {
                 } => {
                     let wall_us = (paused_at
                         .unwrap_or_else(Instant::now)
-                        .duration_since(*started)
+                        .duration_since(started)
                         .as_micros() as u64)
-                        .saturating_sub(*paused_for_us);
-                    let mut progress = self.real_progress.get();
+                        .saturating_sub(paused_for_us);
+                    let mut progress = state.real_progress.get();
                     let elapsed = progress.observe(
                         wall_us,
-                        self.allowance.get(),
-                        self.epoch_us.saturating_add(self.active_skip_us),
+                        state.allowance.get(),
+                        epoch_us.saturating_add(state.active_skip_us.get()),
                     );
-                    self.real_progress.set(progress);
+                    state.real_progress.set(progress);
                     elapsed
                 }
-                ClockMode::Virtual(t) => *t,
+                ClockMode::Virtual(t) => t,
             }
     }
 
@@ -135,7 +169,8 @@ impl Clock {
     /// wait permits elapsed wall time; no simulation was runnable in that time.
     pub fn begin_wait(&mut self, deadline: Option<u64>) {
         self.now_us();
-        self.allowance
+        self.state
+            .allowance
             .set(deadline.map_or(Allowance::UnboundedWait, Allowance::Until));
     }
 
@@ -143,11 +178,11 @@ impl Clock {
     /// consumes only actual elapsed time and leaves no future waiting credit.
     pub fn begin_work(&mut self) {
         self.now_us();
-        self.allowance.set(Allowance::Working);
+        self.state.allowance.set(Allowance::Working);
     }
 
     pub fn passive_stalls(&self) -> (u64, u64) {
-        let progress = self.real_progress.get();
+        let progress = self.state.real_progress.get();
         (progress.clamps, progress.discarded_us)
     }
 
@@ -162,8 +197,8 @@ impl Clock {
     /// A reading the guest can observe (timeGetTime, QPC, ...). In virtual mode every
     /// reading advances time by 1 µs, so busy-waits on the clock terminate.
     pub fn guest_now_us(&mut self) -> u64 {
-        if let ClockMode::Virtual(t) = &mut self.mode {
-            *t += 1;
+        if let ClockMode::Virtual(t) = self.state.mode.get() {
+            self.state.mode.set(ClockMode::Virtual(t + 1));
         }
         self.now_us()
     }
@@ -186,8 +221,10 @@ impl Clock {
 
     /// Virtual mode: move time forward to `us` (never backwards). Real mode: no-op.
     pub fn advance_to(&mut self, us: u64) {
-        if let ClockMode::Virtual(t) = &mut self.mode {
-            *t = (*t).max(us.saturating_sub(self.epoch_us));
+        if let ClockMode::Virtual(t) = self.state.mode.get() {
+            self.state
+                .mode
+                .set(ClockMode::Virtual(t.max(us.saturating_sub(self.epoch_us))));
         }
     }
 
@@ -196,7 +233,7 @@ impl Clock {
     /// This never changes a device clock or compensates a passive host stall.
     pub(crate) fn skip_to(&mut self, deadline: u64) -> u64 {
         if matches!(
-            self.mode,
+            self.state.mode.get(),
             ClockMode::Real {
                 paused_at: Some(_),
                 ..
@@ -205,11 +242,15 @@ impl Clock {
             return 0;
         }
         let delta = deadline.saturating_sub(self.now_us());
-        match &mut self.mode {
-            ClockMode::Virtual(time) => *time = time.saturating_add(delta),
-            ClockMode::Real { .. } => {
-                self.active_skip_us = self.active_skip_us.saturating_add(delta)
-            }
+        match self.state.mode.get() {
+            ClockMode::Virtual(time) => self
+                .state
+                .mode
+                .set(ClockMode::Virtual(time.saturating_add(delta))),
+            ClockMode::Real { .. } => self
+                .state
+                .active_skip_us
+                .set(self.state.active_skip_us.get().saturating_add(delta)),
         }
         delta
     }
@@ -217,22 +258,26 @@ impl Clock {
     /// Freeze guest-visible real time while the frontend is backgrounded.
     pub fn pause(&mut self) {
         self.now_us();
-        if let ClockMode::Real { paused_at, .. } = &mut self.mode {
+        let mut mode = self.state.mode.get();
+        if let ClockMode::Real { paused_at, .. } = &mut mode {
             paused_at.get_or_insert_with(Instant::now);
         }
+        self.state.mode.set(mode);
     }
 
     /// Continue real time without counting the interval spent in the background.
     pub fn resume(&mut self) {
+        let mut mode = self.state.mode.get();
         if let ClockMode::Real {
             paused_at,
             paused_for_us,
             ..
-        } = &mut self.mode
+        } = &mut mode
             && let Some(at) = paused_at.take()
         {
             *paused_for_us += at.elapsed().as_micros() as u64;
         }
+        self.state.mode.set(mode);
     }
 }
 

@@ -11,9 +11,11 @@
 //! the function would fault on. Required text services supply a complete handler
 //! and replace the entry in both execution modes, without a trampoline.
 //!
-//! Every crossing records host memory work; attached debugger sessions also keep
-//! durations and outliers. Immutable file inputs retain derived values by pinned
-//! identity, and temporary snapshots reuse execution-owner scratch.
+//! Direct bodies share their memory implementation between generated and full
+//! paths. Service bodies reach shared clock and file storage through BodyContext,
+//! without borrowing Sys or Ext. Diagnostics record host memory work; debugger
+//! sessions also keep durations and outliers. Immutable file inputs retain derived
+//! values by pinned identity, and temporary snapshots reuse execution-owner scratch.
 
 use std::collections::HashMap;
 
@@ -36,6 +38,7 @@ mod nls;
 mod own_calls;
 mod pixels;
 mod png;
+mod services;
 mod zlib;
 pub use png::{PngFilter, PngRows};
 pub use zlib::InflateFast;
@@ -75,6 +78,7 @@ thread_local! {
 /// The shell's existing debugger lifetime, on the guest execution thread.
 pub fn debugger_attached(attached: bool) {
     DEBUGGER_ATTACHED.set(attached);
+    adv_machine::debugger_attached(attached);
 }
 
 #[derive(Clone, Copy, Default)]
@@ -258,17 +262,39 @@ static BODIES: std::sync::LazyLock<Vec<Body>> = std::sync::LazyLock::new(|| {
         Body {
             name: "ntdll.dll!NtQueryPerformanceCounter".into(),
             conv: Conv::Stdcall { argc: 2 },
-            body: Some(query_performance_counter),
+            body: None,
             handler: resume_original,
-            direct: None,
+            direct: Some(services::NT_COUNTER),
+        },
+        Body {
+            name: "ntdll.dll!RtlQueryPerformanceCounter".into(),
+            conv: Conv::Stdcall { argc: 1 },
+            body: None,
+            handler: resume_original,
+            direct: Some(services::COUNTER),
+        },
+        Body {
+            name: "kernelbase.dll!QueryPerformanceCounter".into(),
+            conv: Conv::Stdcall { argc: 1 },
+            body: None,
+            handler: resume_original,
+            direct: Some(services::COUNTER),
         },
         #[cfg(any(target_vendor = "apple", target_os = "android"))]
         Body {
             name: "win32u.dll!NtUserGetKeyState".into(),
             conv: Conv::Stdcall { argc: 1 },
-            body: Some(input::key_state),
+            body: None,
             handler: resume_original,
-            direct: None,
+            direct: Some(input::KEY_STATE),
+        },
+        #[cfg(any(target_vendor = "apple", target_os = "android"))]
+        Body {
+            name: "win32u.dll!NtUserGetKeyboardState".into(),
+            conv: Conv::Stdcall { argc: 1 },
+            body: None,
+            handler: resume_original,
+            direct: Some(input::KEYBOARD_STATE),
         },
         Body {
             name: "kernelbase.dll!MultiByteToWideChar".into(),
@@ -328,6 +354,7 @@ static BODIES: std::sync::LazyLock<Vec<Body>> = std::sync::LazyLock::new(|| {
         },
     ];
     bodies.extend(crt::bodies());
+    bodies.extend(services::bodies());
     for version in 24..=43 {
         bodies.push(Body {
             name: format!("d3dx9_{version}.dll!d3dx_load_pixels_from_pixels").into(),
@@ -382,9 +409,7 @@ fn run(env: &mut Env<'_>) -> Outcome {
 }
 
 fn run_body(env: &mut Env<'_>, index: usize, body: &'static Body) -> Outcome {
-    if let Some(direct) = body.direct {
-        return run_full(env, direct, body.handler);
-    }
+    let diagnostics = env.sys.diagnostics() != 0;
     let timed = DEBUGGER_ATTACHED.get();
     let arguments = if timed {
         std::array::from_fn(|i| {
@@ -397,27 +422,32 @@ fn run_body(env: &mut Env<'_>, index: usize, body: &'static Body) -> Outcome {
     } else {
         [0; 6]
     };
-    let before = env.cpu.host_access();
+    let before = diagnostics.then(|| env.cpu.host_access());
     let start = timed.then(std::time::Instant::now);
-    let result = match body.body {
-        Some(run) => run(env).map(Outcome::Return64),
-        None => Some((body.handler)(env)),
+    let declined_before = diagnostics.then(|| declines(env.ext));
+    let result = if let Some(direct) = body.direct {
+        Some(run_full(env, direct, body.handler))
+    } else {
+        match body.body {
+            Some(run) => run(env).map(Outcome::Return64),
+            None => Some((body.handler)(env)),
+        }
     };
+    let declined =
+        result.is_none() || declined_before.is_some_and(|before| declines(env.ext) != before);
     let elapsed = start.map(|start| start.elapsed());
-    let access = access_delta(env.cpu.host_access(), before);
+    let access = before.map(|before| access_delta(env.cpu.host_access(), before));
     #[cfg(any(debug_assertions, test))]
     assert!(
-        result.is_some() || access.writes == 0,
+        result.is_some() || access.is_none_or(|access| access.writes == 0),
         "{} declined after guest writes (NAT-BODY-1)",
         body.name
     );
-    env.ext.get_or_default::<Boundary>().record(
-        index,
-        result.is_none(),
-        access,
-        elapsed,
-        arguments,
-    );
+    if let Some(access) = access {
+        env.ext
+            .get_or_default::<Boundary>()
+            .record(index, declined, access, elapsed, arguments);
+    }
     match result {
         Some(outcome) => outcome,
         None => {
@@ -453,7 +483,11 @@ fn run_full(
         None => 0,
     });
     let mut scratch = std::mem::take(&mut env.ext.get_or_default::<FullScratch>().0);
-    let result = (body.full)(&mut GuestMem::new(env.cpu, &mut scratch), inputs);
+    let services = env.sys.services(env.ext);
+    let result = (body.full)(
+        &mut GuestMem::for_body(env.cpu, &mut scratch, services),
+        inputs,
+    );
     env.ext.get_or_default::<FullScratch>().0 = scratch;
     let outputs = body.direct.outputs;
     match result {
@@ -523,6 +557,14 @@ pub(crate) fn bind_relocated(
     base: u32,
     relocations: &[u32],
 ) {
+    sys.body_services = Some(|sys, ext, services| {
+        if let Some(link) = ext.try_get::<crate::server::Link>() {
+            services.thread = link.known_tid(sys.current).unwrap_or(0);
+            services.state = std::rc::Rc::as_ptr(&link.files).cast();
+        } else {
+            services.thread = 0;
+        }
+    });
     let Some(module) = ext
         .try_get::<Images>()
         .and_then(|images| images.0.get(&base))
@@ -690,31 +732,6 @@ fn resume_original(env: &mut Env<'_>) -> Outcome {
         }
         Err(error) => Outcome::Fail(error.to_string()),
     }
-}
-
-// spec: NAT-BODY-2
-fn query_performance_counter(env: &mut Env<'_>) -> Option<u64> {
-    let (counter, frequency) = (env.arg(0), env.arg(1));
-    if counter == 0
-        || !env.cpu.accessible(counter, 8, Prot::WRITE)
-        || (frequency != 0 && !env.cpu.accessible(frequency, 8, Prot::WRITE))
-    {
-        return None;
-    }
-    // The syscall boundary's system-time reads advance the virtual clock.
-    if env.sys.clock.is_virtual() {
-        crate::kuser::refresh(env);
-        crate::server::set_time(env);
-    }
-    let ticks = crate::system::performance_counter(env);
-    env.cpu.write(counter, &ticks.to_le_bytes()).ok()?;
-    if frequency != 0 {
-        env.cpu
-            .write(frequency, &crate::system::TICKS_PER_SECOND.to_le_bytes())
-            .ok()?;
-    }
-    env.sys.poll_observation();
-    Some(u64::from(crate::status::SUCCESS))
 }
 
 #[cfg(test)]

@@ -110,6 +110,9 @@ pub struct Stats {
     per_thunk: Vec<(u64, u64, u64)>,
 }
 
+#[cfg(test)]
+thread_local! { pub(crate) static CLOCK_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
 impl Stats {
     pub fn new() -> Self {
         Self {
@@ -124,7 +127,11 @@ impl Stats {
     /// Start a timing, if enabled.
     #[inline]
     pub fn start(&self) -> Option<Instant> {
-        (self.enabled || self.services_enabled || self.frame_budget.is_some()).then(Instant::now)
+        (self.enabled || self.services_enabled || self.frame_budget.is_some()).then(|| {
+            #[cfg(test)]
+            CLOCK_READS.set(CLOCK_READS.get() + 1);
+            Instant::now()
+        })
     }
 
     /// Host handler or continuation time for `thunk`, inside or outside `Backend::run`.

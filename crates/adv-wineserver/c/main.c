@@ -14,6 +14,7 @@
 #include "winternl.h"
 
 #include "file.h"
+#include "handle.h"
 #include "process.h"
 #include "thread.h"
 #include "request.h"
@@ -115,3 +116,43 @@ C_ASSERT( offsetof(struct context_data, seg) == 288 );
 C_ASSERT( offsetof(struct context_data, fp) == 304 );
 C_ASSERT( offsetof(struct context_data, debug) == 824 );
 C_ASSERT( offsetof(struct context_data, ext) == 944 );
+
+/* The execution owner calls this while the server coroutine is suspended. */
+unsigned int hitode_server_close_handle( unsigned int tid, unsigned int handle )
+{
+    struct thread *saved_current = current, *thread;
+    unsigned int saved_global = global_error, saved_error = get_error(), status;
+    thread = get_thread_from_id( tid );
+    if (!thread) status = STATUS_INVALID_CID;
+    else
+    {
+        current = thread;
+        status = close_handle( thread->process, handle );
+        current = saved_current;
+        release_object( thread );
+    }
+    global_error = saved_global;
+    if (current) current->error = saved_error;
+    return status;
+}
+
+/* Cold descriptor admission uses object identity to share file positions. */
+uintptr_t hitode_server_object( unsigned int tid, unsigned int handle )
+{
+    struct thread *thread;
+    struct object *obj;
+    uintptr_t identity = 0;
+    unsigned int saved_global = global_error, saved_error = get_error();
+    if ((thread = get_thread_from_id( tid )))
+    {
+        if ((obj = get_handle_obj( thread->process, handle, 0, NULL )))
+        {
+            identity = (uintptr_t)obj;
+            release_object( obj );
+        }
+        release_object( thread );
+    }
+    global_error = saved_global;
+    if (current) current->error = saved_error;
+    return identity;
+}

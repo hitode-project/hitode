@@ -597,6 +597,7 @@ mod active_tests {
     fn wait_sys() -> Sys {
         Sys {
             clock: Clock::virtual_time(),
+            body_services: None,
             poll_wake: None,
             poll_observed: false,
             poll_activity: 0,

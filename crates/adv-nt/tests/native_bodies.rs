@@ -156,13 +156,13 @@ fn ntdll_memcpy_matches_wine() {
         );
     }
     assert!(
-        native.sys.host_calls > u64::from(CASES / 2),
-        "the native body ran {} times",
+        native.sys.host_calls < u64::from(CASES / 2),
+        "the direct body crossed the host boundary {} times",
         native.sys.host_calls
     );
     assert_eq!(reference.sys.host_calls, 0);
-    // A source that runs into an unmapped page: the body declines, and
-    // Wine's code copies up to the fault.
+    // An inaccessible source fails the complete body's preflight, before
+    // it writes or enters guest code.
     let args = [DATA, DATA + DATA_LEN - 100, 500];
     let (faulted, expected) = (
         call(&mut native, &data, args),
@@ -171,11 +171,15 @@ fn ntdll_memcpy_matches_wine() {
     assert!(faulted.is_err(), "{faulted:?}");
     assert_eq!(
         adv_nt::native::declines(&native.ext),
-        1,
-        "the body declined"
+        0,
+        "the complete body ran guest code"
     );
-    assert_eq!(faulted, expected);
+    // A64-CALL-4 reports a direct body's fault at its entry; guest code
+    // reports the load instruction. Both must identify the same bad read.
+    let bad_read = format!("kind: Read({})", DATA + DATA_LEN);
+    assert!(faulted.unwrap_err().contains(&bad_read));
+    assert!(expected.unwrap_err().contains(&bad_read));
     let mut copied = [0; 100];
     native.cpu.read(DATA, &mut copied).unwrap();
-    assert_eq!(copied[..], data[DATA_LEN as usize - 100..]);
+    assert_eq!(copied[..], data[..100]);
 }

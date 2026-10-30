@@ -7,7 +7,7 @@
 //! pass the same semantic tests.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
 use adv_cpu_core::instruction_trace::Trace;
@@ -72,8 +72,10 @@ pub struct Executor {
     pub(crate) faults: rustc_hash::FxHashMap<u32, u64>,
     interpreter: Interpreter,
     timestamp: adv_cpu_core::timestamp::Counter,
-    interrupt: Arc<AtomicBool>,
+    interrupt: Arc<AtomicU32>,
     host_interrupts: bool,
+    diagnostics: u8,
+    alarm: Option<adv_sync::pending::Deadline>,
     deadline: Option<Instant>,
     /// `ADV_INTERP_TRACE_*` observations of an interpreter-only executor.
     pub(crate) instruction_trace: Option<Box<Trace>>,
@@ -152,8 +154,10 @@ impl Executor {
             faults: Default::default(),
             interpreter: Interpreter::new(),
             timestamp: Default::default(),
-            interrupt: Arc::new(AtomicBool::new(false)),
+            interrupt: Arc::new(AtomicU32::new(0)),
             host_interrupts: true,
+            diagnostics: 0,
+            alarm: None,
             deadline: None,
             instruction_trace: (!translate).then(Trace::from_env).flatten(),
             #[cfg(native)]
@@ -251,14 +255,23 @@ impl Executor {
 
     pub fn set_deadline(&mut self, deadline: Option<Instant>) {
         self.deadline = deadline;
+        if deadline.is_some() && self.alarm.is_none() {
+            self.alarm = Some(adv_sync::pending::Deadline::new(self.interrupt.clone()));
+        }
+        if let Some(alarm) = &self.alarm {
+            alarm.set(deadline, &self.interrupt);
+        }
     }
 
-    pub fn set_host_interrupt_flag(&mut self, interrupt: Arc<AtomicBool>) {
+    pub fn set_host_interrupt_flag(&mut self, interrupt: Arc<AtomicU32>) {
+        self.alarm = None;
         self.interrupt = interrupt;
+        self.set_deadline(self.deadline);
     }
 
     pub fn host_interrupt_pending(&self) -> bool {
-        self.host_interrupts && self.interrupt.load(Ordering::Acquire)
+        self.host_interrupts
+            && self.interrupt.load(Ordering::Acquire) & adv_sync::pending::INTERRUPT != 0
     }
 
     pub fn set_host_interrupts(&mut self, enabled: bool) {
@@ -378,6 +391,15 @@ impl Executor {
         budget: u64,
         handler: Option<&mut dyn ExecutionTrap>,
     ) -> Result<RunOutcome, String> {
+        let diagnostics = handler.as_ref().map_or(0, |handler| handler.diagnostics());
+        if self.diagnostics != diagnostics {
+            self.diagnostics = diagnostics;
+            self.memory.count_host_access(diagnostics != 0);
+            #[cfg(native)]
+            if let Some(native) = &mut self.native {
+                native.clear();
+            }
+        }
         // Another process of the family may have used the shared window.
         self.memory.attach()?;
         let mut bridge = Bridge {
@@ -398,8 +420,23 @@ impl Executor {
         };
         #[cfg(native)]
         if let Some(native) = &mut self.native {
+            native.set_body_services(
+                bridge
+                    .handler
+                    .as_ref()
+                    .map_or_else(Default::default, |h| h.body_services()),
+            );
             native.deadline = self.deadline.map(crate::native::deadline);
-            native.interrupt = self.host_interrupts.then(|| self.interrupt.clone());
+            native.interrupt = Some(self.interrupt.clone());
+            native.pending_mask = if self.host_interrupts {
+                u32::MAX
+            } else {
+                !adv_sync::pending::INTERRUPT
+            };
+            self.interrupt.fetch_and(
+                !(adv_sync::pending::STOP | adv_sync::pending::WORK),
+                Ordering::AcqRel,
+            );
         }
         // Observations follow only interpreter-only runs, as in the x64 engine.
         let mut trace = self
