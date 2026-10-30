@@ -4,7 +4,6 @@ use adv_cpu::{
     CpuState, EXEC, Executor, Memory, READ, Region, RunOutcome, WRITE,
     interpreter::{Interpreter, Step},
 };
-use iced_x86::Code;
 use support::Oracle;
 
 const CODE: u32 = 0x40000;
@@ -220,23 +219,21 @@ fn single_step_trap_occurs_after_the_byte_and_next_pc_commit() {
 }
 
 #[test]
-fn gs_stays_outside_the_flat_profile_and_lock_is_invalid() {
-    for (code, expected) in [
-        (
-            vec![0x65, 0xd7],
-            Step::Unsupported {
-                pc: CODE,
-                code: Code::Xlat_m8,
-            },
-        ),
-        (vec![0xf0, 0xd7], Step::InvalidInstruction { pc: CODE }),
-    ] {
-        let mut memory = memory(&code);
-        let before = state();
-        let mut actual = before.clone();
-        assert_eq!(Interpreter::new().step(&mut actual, &mut memory), expected);
-        assert_eq!(actual, before);
-    }
+fn gs_is_flat_and_lock_is_invalid() {
+    // GS is flat, as WoW64's 0x2b selector is: the prefix changes nothing.
+    let (mut flat, mut gs) = (state(), state());
+    let step =
+        |state: &mut CpuState, code: &[u8]| Interpreter::new().step(state, &mut memory(code));
+    assert_eq!(step(&mut flat, &[0xd7]), Step::Executed);
+    assert_eq!(step(&mut gs, &[0x65, 0xd7]), Step::Executed);
+    gs.eip -= 1;
+    assert_eq!(gs, flat);
+    let mut locked = state();
+    assert_eq!(
+        step(&mut locked, &[0xf0, 0xd7]),
+        Step::InvalidInstruction { pc: CODE }
+    );
+    assert_eq!(locked, state());
 }
 
 #[test]
