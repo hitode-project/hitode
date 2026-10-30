@@ -624,6 +624,26 @@ fn common_m80_roundtrips_cover_encodings_controls_and_faults() {
     }
 }
 
+// spec: A64-TR-4, A64F-FP-2, A64-VER-1, A64-VER-2
+#[test]
+fn common_gs_x87_memory_forms_keep_native_runs() {
+    let mut p = fixture(|a| {
+        a.fld(dword_ptr(ebx).gs()).unwrap();
+        a.fadd(qword_ptr(ebx + 8).gs()).unwrap();
+        a.fstp(qword_ptr(ebx + 16).gs()).unwrap();
+        a.fld(qword_ptr(ebx + 16).gs()).unwrap();
+        a.fstp(dword_ptr(ebx + 24).gs()).unwrap();
+    });
+    p.data[..4].copy_from_slice(&1.5f32.to_bits().to_le_bytes());
+    p.data[8..16].copy_from_slice(&2.25f64.to_bits().to_le_bytes());
+    p.state.fs_base = DATA;
+    for config in configs() {
+        for budget in [1, 2, 3, 4, 5, 100] {
+            check(&p, config, budget, config.2 != Checks::Slow);
+        }
+    }
+}
+
 // spec: A64F-FP-8, A64-VER-1
 #[test]
 fn common_x87_leaves_match_interpreter_in_runs() {
