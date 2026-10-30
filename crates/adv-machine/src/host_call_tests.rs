@@ -384,6 +384,42 @@ fn import_calls_reach_direct_bodies_until_the_slot_or_entry_changes() {
     assert_eq!(results(&mut machine), [23, 23, 23]);
 }
 
+// spec: A64-CALL-1, A64-CALL-2, A64-CALL-5
+#[test]
+fn forwarding_chains_call_the_body_without_a_guest_return_store() {
+    let mut machine = bound_fixture(21);
+    let first = CODE + 0x300;
+    let second = CODE + 0x340;
+    let inner = SLOT + 4;
+    // A balanced hot-patch frame followed by two import forwarding jumps.
+    let mut bytes = vec![0x8b, 0xff, 0x55, 0x8b, 0xec, 0x5d, 0xe9];
+    bytes.extend_from_slice(&second.wrapping_sub(first + 11).to_le_bytes());
+    machine.cpu.write(first, &bytes).unwrap();
+    let mut bytes = vec![0xff, 0x25];
+    bytes.extend_from_slice(&inner.to_le_bytes());
+    machine.cpu.write(second, &bytes).unwrap();
+    machine.cpu.write_u32(SLOT, first).unwrap();
+    machine.cpu.write_u32(inner, FUNCTION).unwrap();
+    assert_eq!(results(&mut machine)[2], 63);
+    let below_arguments = DATA + 0x3ef8;
+    machine.cpu.write_u32(below_arguments, 0x1357_2468).unwrap();
+    run(&mut machine);
+    assert_eq!(machine.cpu.reg(Reg::Eax), 63);
+    assert_eq!(machine.cpu.read_u32(below_arguments).unwrap(), 0x1357_2468);
+    machine.cpu.write_u32(inner, OTHER).unwrap();
+    assert_eq!(results(&mut machine), [22; 3]);
+    machine.cpu.write_u32(inner, FUNCTION).unwrap();
+    assert_eq!(results(&mut machine)[2], 63);
+    // A changed forwarding entry must run, including its register effects.
+    let mut changed = vec![0xbb]; // mov ebx, 99
+    changed.extend_from_slice(&99u32.to_le_bytes());
+    changed.push(0xe9);
+    changed.extend_from_slice(&second.wrapping_sub(first + 10).to_le_bytes());
+    machine.cpu.write(first, &changed).unwrap();
+    assert_eq!(results(&mut machine)[2], 63);
+    assert_eq!(machine.cpu.reg(Reg::Ebx), 99);
+}
+
 // spec: A64-CALL-4
 #[test]
 fn a_body_the_window_stops_runs_on_the_full_path() {

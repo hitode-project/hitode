@@ -151,10 +151,18 @@ static void benchmark_bodies(void) {
 }
 static void audit_guest_time_queries(void) {
     LONG (WINAPI *alert)(void)=(void *)GetProcAddress(GetModuleHandleA("ntdll.dll"),"NtTestAlert");
+    BOOL (WINAPI *rtl)(LARGE_INTEGER *)=(void *)GetProcAddress(GetModuleHandleA("ntdll.dll"),"RtlQueryPerformanceCounter");
+    LONG (WINAPI *nt)(LARGE_INTEGER *,LARGE_INTEGER *)=(void *)GetProcAddress(GetModuleHandleA("ntdll.dll"),"NtQueryPerformanceCounter");
+    static LARGE_INTEGER counter;
     LARGE_INTEGER frequency;
     SetLastError(0x5a17e20); alert(); QueryPerformanceFrequency(&frequency); SetLastError(0x5a17e21); alert();
     SetLastError(0x5a17e22); alert(); GetTickCount(); SetLastError(0x5a17e23); alert();
     SetLastError(0x5a17e24); alert(); GetTickCount64(); SetLastError(0x5a17e25); alert();
+    /* Warm both call sites and output storage before auditing the boundary. */
+    for(unsigned n=0;n<1000;n++) { QueryPerformanceCounter(&counter); rtl(&counter); nt(&counter,NULL); }
+    SetLastError(0x5a17e26); alert(); for(unsigned n=0;n<1000;n++) QueryPerformanceCounter(&counter); SetLastError(0x5a17e27); alert();
+    SetLastError(0x5a17e28); alert(); for(unsigned n=0;n<1000;n++) rtl(&counter); SetLastError(0x5a17e29); alert();
+    SetLastError(0x5a17e2a); alert(); for(unsigned n=0;n<1000;n++) nt(&counter,NULL); SetLastError(0x5a17e2b); alert();
 }
 static void warm_direct_body(void) {
     static char bytes[32]; unsigned int i;

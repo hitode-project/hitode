@@ -8,7 +8,7 @@ struct Platform;
 struct InputChecked;
 #[derive(Default)]
 struct TimeAudits {
-    begin: [u64; 3],
+    begin: [u64; 6],
     done: u8,
 }
 static SYSCALL_HANDLER: std::sync::OnceLock<adv_machine::Handler> = std::sync::OnceLock::new();
@@ -31,14 +31,19 @@ impl adv_machine::Resolver for Platform {
                     let marker = env.cpu.read_u32(env.ctx().teb + 0x34).unwrap_or(0);
                     if marker == 0x5a17e13 {
                         check_input_bodies(env);
-                    } else if (0x5a17e20..=0x5a17e25).contains(&marker) {
+                    } else if (0x5a17e20..=0x5a17e2b).contains(&marker) {
                         let index = ((marker - 0x5a17e20) / 2) as usize;
                         let calls = env.sys.host_calls;
+                        let traced = env.sys.trace.enabled();
                         let audit = env.ext.get_or_default::<TimeAudits>();
                         if marker & 1 == 0 {
                             audit.begin[index] = calls;
                         } else {
-                            assert_eq!(calls - audit.begin[index], 1);
+                            if index < 3 || !traced {
+                                assert_eq!(calls - audit.begin[index], 1);
+                            } else {
+                                assert!(calls - audit.begin[index] > 1);
+                            }
                             audit.done |= 1 << index;
                         }
                     }
@@ -64,7 +69,7 @@ fn worker(trace: bool) {
         },
         |machine| {
             assert!(machine.ext.try_get::<InputChecked>().is_some());
-            assert_eq!(machine.ext.get::<TimeAudits>().done, 7);
+            assert_eq!(machine.ext.get::<TimeAudits>().done, 63);
         },
         true,
     ) else {

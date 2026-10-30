@@ -1,6 +1,8 @@
 //! The single guest time source. timeGetTime, GetTickCount, QueryPerformanceCounter and
 //! every wait deadline read this clock, so a run can be made deterministic (virtual time)
 //! or recorded and replayed later.
+//! AArch64 reads its monotonic counter directly, with integer scaling shared
+//! by the machine and service bodies; no guest floating-point flags change.
 
 use crate::{CtxId, Env, Outcome, Wait};
 use std::cell::Cell;
@@ -74,6 +76,61 @@ struct ClockState {
     active_skip_us: Cell<u64>,
     real_progress: Cell<RealProgress>,
     allowance: Cell<Allowance>,
+    #[cfg(target_arch = "aarch64")]
+    host: CounterClock,
+}
+
+/// The same monotonic hardware counter the native executor uses for deadlines.
+/// Scaling at construction keeps clock services free of host library calls.
+#[cfg(target_arch = "aarch64")]
+#[derive(Clone, Copy)]
+struct CounterClock {
+    origin: u64,
+    multiplier: u64,
+    shift: u32,
+}
+
+#[cfg(target_arch = "aarch64")]
+impl CounterClock {
+    fn ticks() -> u64 {
+        let ticks;
+        // SAFETY: the supported AArch64 hosts expose the virtual counter at EL0.
+        unsafe { std::arch::asm!("mrs {}, cntvct_el0", out(reg) ticks, options(nomem, nostack)) };
+        ticks
+    }
+
+    fn new() -> Self {
+        let frequency: u64;
+        // SAFETY: CNTFRQ describes the same accessible virtual counter.
+        unsafe {
+            std::arch::asm!("mrs {}, cntfrq_el0", out(reg) frequency, options(nomem, nostack))
+        };
+        Self::scaled(Self::ticks(), frequency)
+    }
+
+    fn scaled(origin: u64, frequency: u64) -> Self {
+        let mut shift = 64;
+        let multiplier = loop {
+            let multiplier = (1_000_000u128 << shift).div_ceil(u128::from(frequency));
+            if let Ok(multiplier) = u64::try_from(multiplier) {
+                break multiplier;
+            }
+            shift -= 1;
+        };
+        Self {
+            origin,
+            multiplier,
+            shift,
+        }
+    }
+
+    fn elapsed_us(self) -> u64 {
+        self.micros(Self::ticks().wrapping_sub(self.origin))
+    }
+
+    fn micros(self, ticks: u64) -> u64 {
+        ((u128::from(ticks) * u128::from(self.multiplier)) >> self.shift) as u64
+    }
 }
 
 impl Clone for Clock {
@@ -109,6 +166,8 @@ impl Clock {
                 active_skip_us: Cell::new(0),
                 real_progress: Cell::new(RealProgress::default()),
                 allowance: Cell::new(Allowance::Working),
+                #[cfg(target_arch = "aarch64")]
+                host: CounterClock::new(),
             }),
         }
     }
@@ -121,6 +180,7 @@ impl Clock {
     /// Counter service, including the two virtual-time observations of NT entry.
     /// # Safety
     /// `state` must come from the live execution owner's `body_pointer`.
+    #[inline]
     pub unsafe fn body_counter(state: *const std::ffi::c_void, epoch_us: u64) -> u64 {
         // SAFETY: the owner retains this shared allocation for the run.
         let state = unsafe { &*state.cast::<ClockState>() };
@@ -138,6 +198,7 @@ impl Clock {
         Self::read(&self.state, self.epoch_us)
     }
 
+    #[inline]
     fn read(state: &ClockState, epoch_us: u64) -> u64 {
         epoch_us
             + state.active_skip_us.get()
@@ -147,10 +208,18 @@ impl Clock {
                     paused_at,
                     paused_for_us,
                 } => {
-                    let wall_us = (paused_at
-                        .unwrap_or_else(Instant::now)
-                        .duration_since(started)
-                        .as_micros() as u64)
+                    let elapsed = || {
+                        #[cfg(target_arch = "aarch64")]
+                        {
+                            state.host.elapsed_us()
+                        }
+                        #[cfg(not(target_arch = "aarch64"))]
+                        {
+                            started.elapsed().as_micros() as u64
+                        }
+                    };
+                    let wall_us = paused_at
+                        .map_or_else(elapsed, |at| at.duration_since(started).as_micros() as u64)
                         .saturating_sub(paused_for_us);
                     let mut progress = state.real_progress.get();
                     let elapsed = progress.observe(
@@ -345,6 +414,20 @@ pub fn poll_clock(
 #[cfg(test)]
 mod tests {
     use super::{Allowance, Clock, MAX_PASSIVE_STEP_US, RealProgress};
+
+    // spec: NAT-BODY-2
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn counter_scaling_preserves_microseconds_without_floating_point() {
+        for frequency in [32768, 1_000_000, 19_200_000, 24_000_000, 1_000_000_000] {
+            let clock = super::CounterClock::scaled(0, frequency);
+            for ticks in [0, 1, frequency - 1, frequency, frequency + 1, 1 << 48] {
+                let reference = u128::from(ticks) * 1_000_000 / u128::from(frequency);
+                let got = u128::from(clock.micros(ticks));
+                assert!((reference..=reference + 1).contains(&got));
+            }
+        }
+    }
 
     #[test]
     fn passive_stalls_are_discarded_without_future_catch_up_or_clock_rewind() {
