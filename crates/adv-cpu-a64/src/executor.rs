@@ -437,6 +437,7 @@ impl Executor {
             return Ok(None);
         };
         let fuel = self.state.fuel;
+        native.clock = (bridge as *mut Bridge<'_>).cast();
         // Host calls run in place only with a handler to take them.
         let traps = if bridge.handler.is_some() {
             bridge.memory = &mut self.memory;
@@ -750,8 +751,8 @@ mod speed_tests {
         let mut again = a.create_label();
         a.mov(ebp, 3).unwrap();
         a.set_label(&mut again).unwrap();
-        a.shrd(eax, edx, cl).unwrap(); // operation helper
-        a.lahf().unwrap(); // interpret helper
+        a.shrd(eax, edx, cl).unwrap(); // native form
+        a.cpuid().unwrap(); // interpret helper
         a.mov(ecx, 5).unwrap();
         a.rep().movsb().unwrap();
         a.dec(ebp).unwrap();
@@ -788,7 +789,7 @@ mod speed_tests {
                 [0, 0, 0, 21, 15]
             } else {
                 // Native REP elements count as translated work.
-                [25, 3, 3, 2, 0]
+                [28, 0, 3, 2, 0]
             };
             assert_eq!(
                 cpu.retired_forms(),
@@ -846,13 +847,13 @@ mod speed_tests {
 
     // spec: WINE-UI-8, A64-MEM-5
     #[test]
-    fn speed_retired_forms_refund_faulting_apply_and_rep() {
+    fn speed_retired_forms_refund_faulting_instructions_and_rep() {
         let mut cpu = Executor::address_space().unwrap();
         cpu.map(0x10000, 0x4000, 7).unwrap();
         cpu.map(0x20000, 0x4000, 3).unwrap();
         cpu.native.as_mut().unwrap().first_visits = false;
         cpu.count_tier0(true);
-        // NEG through apply reads successfully, but its store faults.
+        // Native NEG reads successfully, but its store faults.
         cpu.write(0x10000, &[0xf7, 0x1b]).unwrap();
         cpu.protect(0x20000, 0x4000, 1).unwrap();
         cpu.state.eip = 0x10000;

@@ -11,8 +11,8 @@ use super::decode::{Alu, ESP, Mem, Narrow8or16, Op, Part, ShiftKind, Src};
 use super::flags::{Carry, FlagSet, Operand, Recipe, Sense};
 use super::trace::{Inst, Mode};
 use super::{
-    Cold, RUNTIME, SHADOW, State, Translator, WINDOW, X0, X1, X3, X4, X5, X6, X9, X10, X13, X14,
-    X15, X16, X17, biased, host, temp,
+    Cold, RUNTIME, SHADOW, State, Translator, WINDOW, X0, X1, X3, X4, X5, X6, X9, X10, X11, X13,
+    X14, X15, X16, X17, biased, host, temp,
 };
 use crate::runtime::{self, Exit};
 use adv_cpu_core::IndirectBranchKind;
@@ -38,15 +38,46 @@ fn part_register(number: u8, width: u8) -> (u8, u32) {
 
 impl Translator<'_> {
     pub(super) fn op(&mut self, inst: Inst) {
+        if let Some((mem, width, helper)) = inst.locked {
+            self.locked(inst, mem, width, helper);
+            return;
+        }
         match inst.op {
             Op::Nop | Op::Jmp(_) => {}
-            Op::Helper(index) => match inst.call {
-                Some(thunk) => self.host_call(inst, thunk),
-                None => self.helper(index),
-            },
+            Op::Helper(index) => self.helper(index),
+            Op::Syscall => self.host_call(inst, inst.call.unwrap_or(u32::MAX)),
+            Op::Timestamp => self.timestamp(),
+            Op::PushFlags(width) => {
+                self.read_flags();
+                self.emit(and_imm(W, X6, X6, !0x30000u32 as u64));
+                if width == 4 {
+                    self.push(X6);
+                } else {
+                    self.push_part(Part::Reg(0), width, true);
+                }
+            }
+            Op::PopFlags(width, helper) => self.pop_flags(width, helper),
+            Op::Stack(kind, part, width, helper) => self.stack(kind, part, width, helper),
+            Op::Lahf => {
+                self.read_flags();
+                self.emit(orr_imm(W, X6, X6, 2));
+                self.narrow_write(Part::Reg(4), 1, Reg::ZR, X6);
+            }
+            Op::PopMemory(mut mem) => {
+                self.prepare(Operand::Guest(ESP));
+                self.load(Addr::Biased(host(ESP), 0), X6);
+                if mem.base == Some(ESP) {
+                    mem.disp = mem.disp.wrapping_add(4);
+                }
+                let addr = self.address(mem);
+                self.store(addr, X6);
+                self.emit(add_imm(W, X16, host(ESP), 4, false));
+                self.emit(add_ext(X, host(ESP), WINDOW, X16, Uxtw, 0));
+                self.forget(Operand::Guest(ESP));
+            }
             Op::Simd(simd) => self.simd(simd),
             Op::Strings(strings) => self.strings(strings),
-            Op::Apply(apply) => self.apply(apply),
+            Op::Parts(parts) => self.parts(parts),
             Op::Integer(integer) => self.integer(integer),
             Op::X87(x87) => self.x87(x87),
             Op::Fild64(mem, helper, opcode) => self.fild64(mem, helper, opcode),
@@ -125,7 +156,11 @@ impl Translator<'_> {
                 let (esp, guest) = (Operand::Guest(ESP), Operand::Guest(index));
                 self.prepare(esp);
                 self.prepare(guest);
-                self.load(Addr::Pop, result(index));
+                if index == ESP {
+                    self.load(Addr::Biased(host(ESP), 0), X16);
+                } else {
+                    self.load(Addr::Pop, result(index));
+                }
                 self.forget(esp);
                 self.forget(guest);
                 self.commit(index);
@@ -198,6 +233,249 @@ impl Translator<'_> {
             Op::Imul(dst, source, imm) => self.imul(dst, source, imm),
             Op::Carry(subtract, dst, source) => self.carry(subtract, dst, source),
         }
+    }
+
+    fn locked(&mut self, mut inst: Inst, mem: Mem, width: u8, helper: u8) {
+        self.flush_simd();
+        self.vector = super::simd::Vector::default();
+        self.canonicalize();
+        *self.uses_permissions = true;
+        let (slow, done) = (self.asm.label(), self.asm.label());
+        let mut address = self.effective(mem);
+        if let Op::Integer(super::integer::Integer::Bit(_, _, index @ Part::Reg(_), width)) =
+            inst.op
+        {
+            self.narrow_read(index, width, Reg::ZR, X6);
+            self.emit_all(&[
+                sbfx(W, X6, X6, 0, 8 * u32::from(width)),
+                asr_imm(W, X6, X6, if width == 2 { 4 } else { 5 }),
+                add(W, X16, address, X6, Lsl, if width == 2 { 1 } else { 2 }),
+            ]);
+            address = X16;
+        }
+        self.locked_page(address, slow);
+        if width > 1 {
+            self.emit(add_imm(W, X5, address, u32::from(width) - 1, false));
+            self.locked_page(X5, slow);
+        }
+        inst.locked = None;
+        self.op(inst);
+        self.canonicalize();
+        self.asm.b(done);
+        self.asm.bind(slow);
+        self.state = State::CANONICAL;
+        self.helper(helper);
+        self.asm.bind(done);
+    }
+
+    /// Raw SHARED is authoritative even when a shared allocation is window-visible.
+    fn locked_page(&mut self, address: Reg, slow: crate::asm::Label) {
+        self.emit(lsr_imm(W, X4, address, 12));
+        let (first, count) = self.trace.memory_pages;
+        if first != 0 || count != 1 << 20 {
+            if first != 0 {
+                self.mov_imm(X3, first);
+                self.emit(sub(W, X3, X4, X3, Lsl, 0));
+            } else {
+                self.emit(mov(W, X3, X4));
+            }
+            self.mov_imm(super::X2, count);
+            self.emit(sub(X, X3, X3, super::X2, Lsl, 0));
+            self.asm.tbz(false, X3, 63, slow);
+        }
+        self.emit_all(&[
+            ldr(X, X3, RUNTIME, runtime::ALIAS_CLASSES),
+            ldr_narrow(Narrow::Byte, X4, X3, X4),
+        ]);
+        self.asm.tbz(true, X4, 3, slow);
+    }
+
+    /// Materialize the arithmetic flags and DF over the other EFLAGS bits.
+    fn read_flags(&mut self) {
+        self.canonicalize();
+        self.emit_all(&[
+            mrs_nzcv(X13),
+            ldr(X, X5, RUNTIME, runtime::CPU_STATE),
+            ldr(W, X6, X5, runtime::EFLAGS),
+            movz(W, X14, runtime::MAPPED_FLAGS as u16, 0),
+            bic(W, X6, X6, X14, Lsl, 0),
+            ubfx(W, X14, X13, 30, 2),
+            orr(W, X6, X6, X14, Lsl, 6),
+            ubfx(W, X14, X13, 29, 1),
+            eor_imm(W, X14, X14, 1),
+            orr(W, X6, X6, X14, Lsl, 0),
+            ubfx(W, X14, X13, 28, 1),
+            orr(W, X6, X6, X14, Lsl, 11),
+            and_imm(W, X14, X11, 0x10),
+            orr(W, X6, X6, X14, Lsl, 0),
+            eor(W, X14, X10, X10, Lsr, 4),
+            eor(W, X14, X14, X14, Lsr, 2),
+            eor(W, X14, X14, X14, Lsr, 1),
+            and_imm(W, X14, X14, 1),
+            eor_imm(W, X14, X14, 1),
+            orr(W, X6, X6, X14, Lsl, 2),
+            orr(W, X6, X6, super::X12, Lsl, 10),
+        ]);
+    }
+
+    fn pop_flags(&mut self, width: u8, helper: u8) {
+        self.flush_simd();
+        self.vector = super::simd::Vector::default();
+        self.canonicalize();
+        self.access(Addr::Window(host(ESP)), width, Dir::Load, X6);
+        let (slow, done) = (self.asm.label(), self.asm.label());
+        self.asm.tbz(true, X6, 8, slow);
+        self.prepare(Operand::Guest(ESP));
+        self.emit_all(&[
+            add_imm(W, X16, host(ESP), u32::from(width), false),
+            add_ext(X, host(ESP), WINDOW, X16, Uxtw, 0),
+            ldr(X, X5, RUNTIME, runtime::CPU_STATE),
+            ldr(W, X13, X5, runtime::EFLAGS),
+        ]);
+        self.mov_imm(X14, 0x244dd5 & if width == 2 { 0xffff } else { u32::MAX });
+        self.emit_all(&[
+            bic(W, X13, X13, X14, Lsl, 0),
+            and(W, X6, X6, X14, Lsl, 0),
+            orr(W, X6, X6, X13, Lsl, 0),
+            orr_imm(W, X6, X6, 2),
+            str(W, X6, X5, runtime::EFLAGS),
+            and_imm(W, X13, X6, 0xc0),
+            ubfx(W, X14, X6, 0, 1),
+            eor_imm(W, X14, X14, 1),
+            orr(W, X13, X13, X14, Lsl, 5),
+            ubfx(W, X14, X6, 11, 1),
+            orr(W, X13, X13, X14, Lsl, 4),
+            lsl_imm(W, X13, X13, 24),
+            msr_nzcv(X13),
+            ubfx(W, X10, X6, 2, 1),
+            eor_imm(W, X10, X10, 1),
+            and_imm(W, X11, X6, 0x10),
+            ubfx(W, super::X12, X6, 10, 1),
+        ]);
+        self.forget(Operand::Guest(ESP));
+        self.asm.b(done);
+        self.asm.bind(slow);
+        self.helper(helper);
+        self.asm.bind(done);
+        self.state = State::CANONICAL;
+    }
+
+    fn push_part(&mut self, part: Part, width: u8, flags: bool) {
+        self.canonicalize();
+        if !flags {
+            let address = self.part_address(part);
+            self.narrow_read(part, width, address, X6);
+        }
+        self.emit(sub_imm(W, X5, host(ESP), u32::from(width), false));
+        self.access(Addr::Window(X5), width, Dir::Store, X6);
+        self.clobber(Operand::Guest(ESP));
+        self.emit(add_ext(X, host(ESP), WINDOW, X5, Uxtw, 0));
+    }
+
+    fn stack(&mut self, kind: iced_x86::Mnemonic, mut part: Part, width: u8, helper: u8) {
+        use iced_x86::Mnemonic as M;
+        if kind == M::Push {
+            self.push_part(part, width, false);
+            return;
+        }
+        self.canonicalize();
+        if kind == M::Pop || kind == M::Leave {
+            let source = if kind == M::Leave { host(5) } else { host(ESP) };
+            self.access(Addr::Window(source), width, Dir::Load, X6);
+            if let Part::Mem(ref mut mem) = part {
+                if mem.base == Some(ESP) {
+                    mem.disp = mem.disp.wrapping_add(u32::from(width));
+                }
+                let addr = self.effective(*mem);
+                self.narrow_write(part, width, addr, X6);
+            }
+            self.emit(add_imm(W, X16, source, u32::from(width), false));
+            self.emit(add_ext(X, host(ESP), WINDOW, X16, Uxtw, 0));
+            if matches!(part, Part::Reg(_)) {
+                self.narrow_write(part, width, Reg::ZR, X6);
+            }
+            return;
+        }
+        self.flush_simd();
+        self.vector = super::simd::Vector::default();
+        // Validate the complete stack span before any write or register change.
+        *self.uses_permissions = true;
+        let push = matches!(kind, M::Pushad | M::Pusha);
+        let span = u32::from(width) * 8;
+        let (slow, done) = (self.asm.label(), self.asm.label());
+        if push {
+            self.emit(sub_imm(W, X5, host(ESP), span, false));
+        } else {
+            self.emit(mov(W, X5, host(ESP)));
+        }
+        self.page_crossing(X5, span, slow);
+        self.checked_base(X5, push, X6, slow);
+        if push {
+            for index in 0..8u8 {
+                self.emit(add_imm(
+                    W,
+                    X16,
+                    X5,
+                    u32::from(7 - index) * u32::from(width),
+                    false,
+                ));
+                self.site();
+                self.emit(if width == 4 {
+                    str_reg(W, host(index), X6, X16, false)
+                } else {
+                    str_narrow(Narrow::Half, host(index), X6, X16)
+                });
+            }
+            self.emit(add_ext(X, host(ESP), WINDOW, X5, Uxtw, 0));
+        } else {
+            let indices = [7u8, 6, 5, 3, 2, 1, 0];
+            let values = [X0, X1, super::X2, temp(0), temp(1), X13, X14];
+            for (index, value) in indices.into_iter().zip(values) {
+                self.emit(add_imm(
+                    W,
+                    X16,
+                    X5,
+                    u32::from(7 - index) * u32::from(width),
+                    false,
+                ));
+                self.site();
+                self.emit(if width == 4 {
+                    ldr_reg(W, value, X6, X16, false)
+                } else {
+                    ldr_narrow(Narrow::Half, value, X6, X16)
+                });
+            }
+            for (index, value) in indices.into_iter().zip(values) {
+                self.narrow_write(Part::Reg(index), width, Reg::ZR, value);
+            }
+            self.emit(add_imm(W, X5, X5, span, false));
+            self.emit(add_ext(X, host(ESP), WINDOW, X5, Uxtw, 0));
+        }
+        self.asm.b(done);
+        self.asm.bind(slow);
+        self.helper(helper);
+        self.asm.bind(done);
+    }
+
+    fn timestamp(&mut self) {
+        self.flush_simd();
+        self.vector = super::simd::Vector::default();
+        self.canonicalize();
+        self.emit_all(&[
+            stp(X, Pre, X9, X10, SP, -48),
+            stp(X, Index::Offset, X11, super::X12, SP, 16),
+            mrs_nzcv(X13),
+            str(X, X13, SP, 32),
+            mov(X, X0, RUNTIME),
+            ldr(X, X16, RUNTIME, runtime::TIMESTAMP),
+            blr(X16),
+            mov(W, host(0), X0),
+            lsr_imm(X, host(2), X0, 32),
+            ldr(X, X13, SP, 32),
+            msr_nzcv(X13),
+            ldp(X, Index::Offset, X11, super::X12, SP, 16),
+            ldp(X, Post, X9, X10, SP, 48),
+        ]);
     }
 
     /// A return popping `release` argument bytes besides its address.
@@ -505,8 +783,12 @@ impl Translator<'_> {
     /// guest synchronized as for a helper (A64-CTL-12).
     fn host_call(&mut self, inst: Inst, thunk: u32) {
         self.mov_imm(X1, inst.pc);
-        let thunk = u16::try_from(thunk).expect("thunk index");
-        self.emit(movk(X, X1, thunk, 32));
+        let raw = thunk == u32::MAX;
+        if !raw {
+            self.emit(movk(X, X1, u16::try_from(thunk).expect("thunk index"), 32));
+        }
+        let length = inst.next_pc.wrapping_sub(inst.pc) as u16;
+        self.emit(movk(X, X1, length | u16::from(raw) << 15, 48));
         self.owner_call(self.stubs.call);
     }
 
@@ -658,7 +940,14 @@ impl Translator<'_> {
     /// the recipe temporaries, so PF and AF recipes see their low bits; the
     /// flags come from the operands shifted to the top of a W register.
     /// Stores precede the flags (A64-FLAG-4).
-    fn narrow_op(&mut self, alu: Option<Alu>, width: u8, dst: Part, src: Part, step: bool) {
+    pub(super) fn narrow_op(
+        &mut self,
+        alu: Option<Alu>,
+        width: u8,
+        dst: Part,
+        src: Part,
+        step: bool,
+    ) {
         let step = step && self.keep.any(FlagSet::CF);
         if step {
             self.convert(FlagSet::CF);

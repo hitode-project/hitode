@@ -95,9 +95,8 @@ pub struct Runtime {
     /// EIP in `CpuState`. Bits 32 and up are the instructions it charges
     /// beyond the one prepaid, signed.
     pub interpret: u64,
-    /// `apply(op, value, source, count, nzcv, x10, x11) -> result and
-    /// flags`, called by `apply` (`translate::apply::run`).
-    pub apply: u64,
+    /// Read the owning bridge's timestamp without publishing guest state.
+    pub timestamp: u64,
     /// The `Exit` that left translated code.
     pub exit: u32,
     /// The recipe temporaries x7 and x8 at the exit, for fault recovery.
@@ -106,8 +105,8 @@ pub struct Runtime {
     /// low half, `IndirectBranchKind` above; 0 when the owner has taken it.
     pub branch: u64,
     /// `call(runtime, site, countdown) -> status`, called by `call` for
-    /// the host call through thunk `site >> 32` whose INT is at the low
-    /// half: statuses and charges as for `interpret`.
+    /// a host call whose site packs EIP, thunk, INT length and recognition:
+    /// statuses and charges as for `interpret`.
     pub call: u64,
     /// Values of 8- and 16-byte checked accesses, shared with the owner;
     /// 16-byte aligned for `ldr q`.
@@ -118,11 +117,6 @@ pub struct Runtime {
     pub native_batches: u64,
     /// A refused access's x87 publish continuation, or zero for `fault`.
     pub access_resume: u64,
-    /// Diagnostic retirement accounting, enabled by the owner.
-    pub count_forms: u64,
-    /// Apply calls in this chain, refunded if their final store faults.
-    pub applied: u64,
-    pub apply_return: u64,
     /// What direct bodies receive in x0: the window and `classes`.
     pub body: adv_cpu_core::body::BodyContext,
 }
@@ -131,10 +125,8 @@ impl Runtime {
     pub fn new(cpu: *mut CpuState, window: u64) -> Self {
         assert_eq!(window % (1 << 32), 0, "the window is 4 GiB aligned");
         Self {
-            count_forms: 0,
-            applied: 0,
-            apply_return: 0,
             call: 0,
+            timestamp: 0,
             #[cfg(test)]
             channel_batches: 0,
             #[cfg(test)]
@@ -157,7 +149,6 @@ impl Runtime {
             alias: 0,
             alias_classes: 0,
             interpret: 0,
-            apply: crate::translate::apply::run as *const () as u64,
             exit: 0,
             temps: [0; 2],
             branch: 0,
@@ -212,9 +203,7 @@ pub struct Stubs {
     pub access: usize,
     /// Where translated code has the owner interpret an instruction.
     pub interpret: usize,
-    /// Where translated code runs an operation helper.
-    pub apply: usize,
-    /// Where translated code makes a recognized host call.
+    /// Where translated code calls an INT 0x2e handler.
     pub call: usize,
 }
 
@@ -266,11 +255,8 @@ pub(crate) const ACCESS_VECTOR: u32 = field(offset_of!(Runtime, access_vector));
 const _: () = assert!(ACCESS_VECTOR.is_multiple_of(16));
 const FAULT_SIMD: u32 = field(offset_of!(Runtime, fault_simd));
 const INTERPRET: u32 = field(offset_of!(Runtime, interpret));
-const COUNT_FORMS: u32 = field(offset_of!(Runtime, count_forms));
-const APPLIED: u32 = field(offset_of!(Runtime, applied));
-const APPLY_RETURN: u32 = field(offset_of!(Runtime, apply_return));
-const APPLY: u32 = field(offset_of!(Runtime, apply));
 const CALL: u32 = field(offset_of!(Runtime, call));
+pub(crate) const TIMESTAMP: u32 = field(offset_of!(Runtime, timestamp));
 #[cfg(test)]
 pub(crate) const CHANNEL_BATCHES: u32 = field(offset_of!(Runtime, channel_batches));
 #[cfg(test)]
@@ -296,7 +282,8 @@ pub(crate) const X87_IP: u32 = field(offset_of!(CpuState, x87.ip));
 pub(crate) const X87_DP: u32 = field(offset_of!(CpuState, x87.dp));
 pub(crate) const MMX_MODE: u32 = field(offset_of!(CpuState, mmx_mode));
 pub(crate) const MXCSR: u32 = field(offset_of!(CpuState, mxcsr));
-const EFLAGS: u32 = field(offset_of!(CpuState, eflags));
+pub(crate) const EFLAGS: u32 = field(offset_of!(CpuState, eflags));
+pub(crate) const SEGMENTS: u32 = field(offset_of!(CpuState, segments.selectors));
 
 /// CF PF AF ZF SF DF OF: the flags the stubs map.
 pub const MAPPED_FLAGS: u32 = 0xcd5;
@@ -351,8 +338,6 @@ pub fn stubs() -> Stubs {
     emit_interpret(&mut asm, INTERPRET);
     let call = asm.offset();
     emit_interpret(&mut asm, CALL);
-    let apply = asm.offset();
-    emit_apply(&mut asm);
     Stubs {
         call,
         code: asm.finish(),
@@ -366,7 +351,6 @@ pub fn stubs() -> Stubs {
         shadow_reset,
         access,
         interpret,
-        apply,
     }
 }
 
@@ -443,36 +427,6 @@ fn emit_restore_light(asm: &mut Asm) {
         ldp(X, Offset, r(7), r(8), SP, 16),
         ldp(X, Post, r(5), r(6), SP, 128),
     ]);
-}
-
-/// `apply`, called with w0 to w3 the operation and its operands and the
-/// guest flags canonical. Keeps x5-x17, v16-v23 and NZCV, and
-/// returns `translate::apply::run`'s result in x0; x1 to x4 are free.
-fn emit_apply(asm: &mut Asm) {
-    emit_save_light(asm);
-    let uncounted = asm.label();
-    asm.emit(ldr(X, r(16), RUNTIME, COUNT_FORMS));
-    asm.cbz(X, false, r(16), uncounted);
-    asm.emit_all(&[
-        ldr(X, r(16), RUNTIME, APPLIED),
-        add_imm(X, r(16), r(16), 1, false),
-        str(X, r(16), RUNTIME, APPLIED),
-        str(X, Reg::LR, RUNTIME, APPLY_RETURN),
-    ]);
-    asm.bind(uncounted);
-    asm.emit_all(&[
-        mrs_nzcv(r(4)),
-        mov(X, r(5), r(10)),
-        mov(X, r(6), r(11)),
-        ldr(X, r(16), RUNTIME, APPLY),
-        // The frame chain records the guest return address for samplers.
-        stp(X, Pre, RUNTIME, Reg::LR, SP, -16),
-        add_imm(X, RUNTIME, SP, 0, false),
-        blr(r(16)),
-        ldp(X, Post, RUNTIME, Reg::LR, SP, 16),
-    ]);
-    emit_restore_light(asm);
-    asm.emit(ret(Reg::LR));
 }
 
 /// `access`, called with w1 the guest address, x2 the site, w3 a value to

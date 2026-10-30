@@ -16,7 +16,7 @@ pub enum Operation {
 }
 
 pub fn operation(i: &Instruction) -> Option<Operation> {
-    if i.has_lock_prefix() || i.segment_prefix() == R::GS {
+    if i.has_lock_prefix() {
         return None;
     }
     if x87::supported(i) {
@@ -441,4 +441,135 @@ fn reg_index(r: R) -> Option<usize> {
         R::EDI | R::DI => 7,
         _ => return None,
     })
+}
+
+/// Execute a register-only x87 operation using the interpreter's arithmetic.
+///
+/// # Safety
+/// `state` is the live exclusive CPU image; `code` names a transcendental form.
+/// Only x87 state and its MMX aliases are read or written.
+pub unsafe extern "C" fn x87_leaf(state: *mut CpuState, code: u32, pc: u32, opcode: u32) -> u32 {
+    // SAFETY: the translated run owns this CPU image for the call.
+    let state = unsafe { &mut *state };
+    let before = state.x87.clone();
+    let mut instruction = Instruction::default();
+    instruction.set_code(iced_x86::Code::try_from(code as usize).unwrap());
+    let mut tx = Transaction {
+        state,
+        pc,
+        opcode: Some(opcode as u16),
+        write: None,
+        x87_exception: false,
+        sse_exception: false,
+    };
+    if x87::transcendental(&instruction, &mut tx).is_err() {
+        tx.state.x87 = before;
+        return 1;
+    }
+    if tx.x87_exception {
+        let pending = tx.state.x87.clone();
+        tx.state.x87 = before;
+        tx.state.x87.status = (tx.state.x87.status & !0x82ff) | (pending.status & 0x82ff);
+        tx.state.x87.ip = pending.ip;
+        tx.state.x87.opcode = pending.opcode;
+    }
+    tx.state.refresh_mmx();
+    0
+}
+
+#[cfg(test)]
+mod leaf_tests {
+    use super::*;
+    use crate::X87Register as Ext;
+    use iced_x86::Code;
+
+    // spec: A64F-FP-8
+    #[test]
+    fn x87_leaf_matches_transactions_for_rounding_precision_and_exceptions() {
+        let values = [
+            Ext::from_parts(0, 0),
+            Ext::from_parts(0, 0x8000),
+            Ext::from_parts(0xc000000000000000, 0x3ffd),
+            Ext::from_parts(0xa000000000000000, 0xc000),
+            Ext::from_parts(0x8000000000000001, 0x3fff),
+            Ext::from_parts(0x8000000000000000, 0x7fff),
+            Ext::from_parts(0x8000000000000000, 0xffff),
+            Ext::from_parts(0xc000000000000011, 0x7fff),
+            Ext::from_parts(0x8000000000000001, 0x7fff),
+            Ext::from_parts(1, 0),
+            Ext::from_parts(0x8000000000000000, 0),
+            Ext::from_parts(1, 0x4000),
+            Ext::from_parts(0x8000000000000000, 1),
+            Ext::from_parts(0x8000000000000000, 0x7ffe),
+        ];
+        let mut memory = Memory::new(0x10000, 4096).unwrap();
+        for code in [
+            Code::Fsin,
+            Code::Fcos,
+            Code::Fsincos,
+            Code::Fptan,
+            Code::Fpatan,
+            Code::F2xm1,
+            Code::Fyl2x,
+            Code::Fyl2xp1,
+            Code::Fscale,
+            Code::Fprem,
+            Code::Fprem1,
+        ] {
+            let mut instruction = Instruction::default();
+            instruction.set_code(code);
+            instruction.set_next_ip(0x10002);
+            for (n, &value) in values.iter().enumerate() {
+                for rc in 0..4 {
+                    for pc in [0, 0x200, 0x300] {
+                        for masks in [0x3f, 0x1f, 0x3e, 0x3d, 0] {
+                            for empty in [false, true] {
+                                let mut state = CpuState {
+                                    eip: 0x10000,
+                                    ..Default::default()
+                                };
+                                state.x87.control = 0x40 | pc | rc << 10 | masks;
+                                state.x87.set_top(5);
+                                state.x87.regs[5] = value;
+                                state.x87.regs[6] = values[(n + 3) % values.len()];
+                                state
+                                    .x87
+                                    .set_physical_tag(5, if empty { 3 } else { value.tag() });
+                                state.x87.set_physical_tag(6, state.x87.regs[6].tag());
+                                state.refresh_mmx();
+                                let mut expected = state.clone();
+                                let outcome = execute(
+                                    &instruction,
+                                    Operation::X87,
+                                    Some(0x123),
+                                    &mut expected,
+                                    &mut memory,
+                                    true,
+                                );
+                                let mut actual = state.clone();
+                                // SAFETY: this is an exclusive CPU image and an audited register form.
+                                let status =
+                                    unsafe { x87_leaf(&mut actual, code as u32, state.eip, 0x123) };
+                                if outcome == Step::Executed {
+                                    assert_eq!(status, 0);
+                                    assert_eq!(
+                                        actual.x87, expected.x87,
+                                        "{code:?} {value:?} control={:#x}",
+                                        state.x87.control
+                                    );
+                                    assert_eq!(actual.mmx, expected.mmx);
+                                } else {
+                                    assert_eq!(status, 1);
+                                    assert_eq!(actual.x87, state.x87);
+                                }
+                                assert_eq!(actual.regs, state.regs);
+                                assert_eq!(actual.eflags, state.eflags);
+                                assert_eq!(actual.eip, state.eip);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

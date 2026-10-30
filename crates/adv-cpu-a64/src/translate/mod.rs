@@ -27,11 +27,8 @@
 //! emitter (`access`), and a refused access faults like a host fault, so
 //! dirty SIMD registers stay in place.
 //!
-//! An instruction the translator has no native form for but the
-//! interpreter runs without transferring control calls an operation helper
-//! (`apply`), which keeps guest state and SIMD caches in place, or else the
-//! `interpret` stub with canonical flags; the unit goes on unless the
-//! helper asks it to leave.
+//! The exceptional cases in A64-TR-4 use the `interpret` stub with
+//! canonical flags; ordinary instructions remain in generated code.
 //!
 //! Host registers beyond the guest map of A64-REG-1: x16 and x17 address and exit
 //! scratch, x6 a value scratch, x7 and x8 the recipe temporaries, which the
@@ -43,7 +40,6 @@
 //! v24-v31.
 
 mod access;
-pub(crate) mod apply;
 mod channels;
 mod decode;
 pub mod first;
@@ -51,6 +47,7 @@ mod flags;
 mod integer;
 mod native_region;
 mod ops;
+pub(crate) mod parts;
 mod residency;
 mod simd;
 mod strings;
@@ -253,9 +250,7 @@ pub struct Stubs {
     pub access: usize,
     /// An instruction the interpreter runs.
     pub interpret: usize,
-    /// An operation helper on operands in registers.
-    pub apply: usize,
-    /// A recognized host call.
+    /// An INT 0x2e handler call.
     pub call: usize,
     /// Where a faulting site leaves.
     pub fault: usize,

@@ -543,7 +543,7 @@ impl Memory {
     }
 
     #[cfg(unix)]
-    fn window_at_host_size(base: u32, len: usize, host_size: usize) -> Result<Self, String> {
+    pub fn window_at_host_size(base: u32, len: usize, host_size: usize) -> Result<Self, String> {
         if !len.is_multiple_of(PAGE_SIZE) || len == 0 || u64::from(base) + len as u64 > 1 << 32 {
             return Err("invalid guest window".into());
         }

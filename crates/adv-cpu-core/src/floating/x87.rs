@@ -470,82 +470,17 @@ pub(super) fn execute(i: &Instruction, tx: &mut Transaction, memory: &Memory) ->
             rounded(tx);
             set(tx, 0, result);
         }
-        M::Fscale => {
-            metadata(tx);
-            let a = operand(tx, 0);
-            let b = operand(tx, 1);
-            let (result, flags) = super::transcendental::scale(a, b, tx.state.x87.control);
-            exceptions(tx, flags);
-            rounded(tx);
-            set(tx, 0, result);
-        }
-        M::Fprem | M::Fprem1 => {
-            metadata(tx);
-            let a = operand(tx, 0);
-            let b = operand(tx, 1);
-            let (result, flags, quotient) = remainder(a, b, m == M::Fprem1, tx.state.x87.control);
-            exceptions(tx, flags);
-            if let Some(quotient) = quotient {
-                tx.state.x87.status = (tx.state.x87.status & !(C0 | C1 | C2 | C3))
-                    | if quotient & 4 != 0 { C0 } else { 0 }
-                    | if quotient & 1 != 0 { C1 } else { 0 }
-                    | if quotient & 2 != 0 { C3 } else { 0 };
-            } else {
-                tx.state.x87.status |= C2;
-            }
-            set(tx, 0, result);
-        }
-        M::Fyl2x | M::Fyl2xp1 | M::Fpatan => {
-            metadata(tx);
-            let x = operand(tx, 0);
-            let y = operand(tx, 1);
-            let (result, flags) = if m == M::Fpatan {
-                super::transcendental::atan2(y, x, tx.state.x87.control)
-            } else {
-                super::transcendental::log_product(x, y, m == M::Fyl2xp1, tx.state.x87.control)
-            };
-            exceptions(tx, flags);
-            rounded(tx);
-            set(tx, 1, result);
-            pop(tx);
-        }
-        M::F2xm1 => {
-            metadata(tx);
-            let x = operand(tx, 0);
-            let Some((result, flags)) =
-                super::transcendental::exp2_minus_one(x, tx.state.x87.control)
-            else {
-                return Err(tx.unsupported(i));
-            };
-            exceptions(tx, flags);
-            rounded(tx);
-            set(tx, 0, result);
-        }
-        M::Fsin | M::Fcos | M::Fsincos | M::Fptan => {
-            metadata(tx);
-            let x = operand(tx, 0);
-            if let Some(((sine, cosine), flags)) =
-                super::transcendental::sin_cos(x, tx.state.x87.control)
-            {
-                exceptions(tx, flags);
-                rounded(tx);
-                tx.state.x87.status &= !C2;
-                if m == M::Fptan {
-                    sf::configure(tx.state.x87.control | 0x300);
-                    let result = sf::binary(sine, cosine, 3);
-                    rounded(tx);
-                    set(tx, 0, result);
-                    push(tx, Ext::from_parts(1 << 63, 0x3fff));
-                } else {
-                    set(tx, 0, if m == M::Fcos { cosine } else { sine });
-                    if m == M::Fsincos {
-                        push(tx, cosine);
-                    }
-                }
-            } else {
-                tx.state.x87.status = (tx.state.x87.status & !C1) | C2;
-            }
-        }
+        M::Fscale
+        | M::Fprem
+        | M::Fprem1
+        | M::Fyl2x
+        | M::Fyl2xp1
+        | M::Fpatan
+        | M::F2xm1
+        | M::Fsin
+        | M::Fcos
+        | M::Fsincos
+        | M::Fptan => transcendental(i, tx)?,
         M::Fxtract => {
             metadata(tx);
             let a = operand(tx, 0);
@@ -1012,4 +947,90 @@ fn remainder(a: Ext, b: Ext, nearest: bool, control: u16) -> (Ext, u16, Option<u
     // x87 condition codes expose the low quotient magnitude bits, irrespective
     // of operand signs; the remainder's sign is handled separately above.
     (result, 0, if partial { None } else { Some(quotient) })
+}
+
+/// Shared by instruction transactions and the run's AAPCS64 leaf.
+pub(super) fn transcendental(i: &Instruction, tx: &mut Transaction) -> Result<(), Step> {
+    let m = i.mnemonic();
+    sf::configure(tx.state.x87.control);
+    match m {
+        M::Fscale => {
+            metadata(tx);
+            let a = operand(tx, 0);
+            let b = operand(tx, 1);
+            let (result, flags) = super::transcendental::scale(a, b, tx.state.x87.control);
+            exceptions(tx, flags);
+            rounded(tx);
+            set(tx, 0, result);
+        }
+        M::Fprem | M::Fprem1 => {
+            metadata(tx);
+            let a = operand(tx, 0);
+            let b = operand(tx, 1);
+            let (result, flags, quotient) = remainder(a, b, m == M::Fprem1, tx.state.x87.control);
+            exceptions(tx, flags);
+            if let Some(quotient) = quotient {
+                tx.state.x87.status = (tx.state.x87.status & !(C0 | C1 | C2 | C3))
+                    | if quotient & 4 != 0 { C0 } else { 0 }
+                    | if quotient & 1 != 0 { C1 } else { 0 }
+                    | if quotient & 2 != 0 { C3 } else { 0 };
+            } else {
+                tx.state.x87.status |= C2;
+            }
+            set(tx, 0, result);
+        }
+        M::Fyl2x | M::Fyl2xp1 | M::Fpatan => {
+            metadata(tx);
+            let x = operand(tx, 0);
+            let y = operand(tx, 1);
+            let (result, flags) = if m == M::Fpatan {
+                super::transcendental::atan2(y, x, tx.state.x87.control)
+            } else {
+                super::transcendental::log_product(x, y, m == M::Fyl2xp1, tx.state.x87.control)
+            };
+            exceptions(tx, flags);
+            rounded(tx);
+            set(tx, 1, result);
+            pop(tx);
+        }
+        M::F2xm1 => {
+            metadata(tx);
+            let x = operand(tx, 0);
+            let Some((result, flags)) =
+                super::transcendental::exp2_minus_one(x, tx.state.x87.control)
+            else {
+                return Err(tx.unsupported(i));
+            };
+            exceptions(tx, flags);
+            rounded(tx);
+            set(tx, 0, result);
+        }
+        M::Fsin | M::Fcos | M::Fsincos | M::Fptan => {
+            metadata(tx);
+            let x = operand(tx, 0);
+            if let Some(((sine, cosine), flags)) =
+                super::transcendental::sin_cos(x, tx.state.x87.control)
+            {
+                exceptions(tx, flags);
+                rounded(tx);
+                tx.state.x87.status &= !C2;
+                if m == M::Fptan {
+                    sf::configure(tx.state.x87.control | 0x300);
+                    let result = sf::binary(sine, cosine, 3);
+                    rounded(tx);
+                    set(tx, 0, result);
+                    push(tx, Ext::from_parts(1 << 63, 0x3fff));
+                } else {
+                    set(tx, 0, if m == M::Fcos { cosine } else { sine });
+                    if m == M::Fsincos {
+                        push(tx, cosine);
+                    }
+                }
+            } else {
+                tx.state.x87.status = (tx.state.x87.status & !C1) | C2;
+            }
+        }
+        _ => unreachable!("transcendental leaf"),
+    }
+    Ok(())
 }

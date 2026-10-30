@@ -456,7 +456,7 @@ unsafe extern "C" fn interpret(runtime: *mut Runtime, index: u32, countdown: u64
             units,
         }) => {
             let same = memory.epoch == epoch && memory.dirty_pages.len() == dirty;
-            let status = if same && cpu.eip == helper.next {
+            let status = if same && cpu.eip == helper.next && cpu.eflags & 0x100 == 0 {
                 0
             } else {
                 LEAVE
@@ -502,9 +502,8 @@ unsafe extern "C" fn interpret(runtime: *mut Runtime, index: u32, countdown: u64
     (charge as u64) << 32 | u64::from(status)
 }
 
-/// Called by the `call` stub for the host call through thunk `site >> 32`
-/// whose INT is at `site as u32`: as `interpret` has the INT make it, but
-/// without decoding the INT or rereading its token (A64-CTL-12).
+/// Called by the `call` stub: EIP in bits 0-31, thunk in 32-47, INT length
+/// in 48-51, and bit 63 for an unrecognized INT (A64-CTL-12).
 unsafe extern "C" fn call(runtime: *mut Runtime, site: u64, _countdown: u64) -> u64 {
     const LEAVE: u32 = Exit::Dispatch as u32 + 1;
     // SAFETY: as in `interpret`.
@@ -520,12 +519,16 @@ unsafe extern "C" fn call(runtime: *mut Runtime, site: u64, _countdown: u64) -> 
     // SAFETY: as in `interpret`.
     let bridge = unsafe { &mut *owner.bridge.cast::<Bridge<'_>>() };
     // The INT has committed its next PC.
-    let next = pc.wrapping_add(2);
+    let next = pc.wrapping_add((site >> 48 & 15) as u32);
     cpu.eip = next;
     let before = (memory.epoch, memory.dirty_pages.len());
-    let thunk = (site >> 32) as u32;
+    let thunk = (site >> 32 & 0xffff) as u32;
     if host(native, memory, bridge, cpu, before, next, |b, c| {
-        call_host(b, c, thunk)
+        if site >> 63 != 0 {
+            call_trap(b, c, 0x2e)
+        } else {
+            call_host(b, c, thunk)
+        }
     }) {
         0
     } else {
@@ -564,6 +567,15 @@ fn host(
         native.classify(memory);
     }
     resumes
+}
+
+/// Read the owner's counter without synchronizing guest architectural state.
+unsafe extern "C" fn timestamp(runtime: *mut Runtime) -> u64 {
+    // SAFETY: generated code runs with this owner's live bridge.
+    let owner = unsafe { &mut *((*runtime).owner as *mut Owner) };
+    // SAFETY: Executor installs its live bridge before every native entry.
+    let clock = unsafe { (*owner.native).clock };
+    unsafe { &mut *clock.cast::<Bridge<'_>>() }.read_timestamp()
 }
 
 /// The virtual counter, which reads in a few nanoseconds where
@@ -656,6 +668,8 @@ pub(crate) struct Native {
     pub(crate) features: Features,
     faults: Faults,
     runtime: Box<Runtime>,
+    /// Live timestamp bridge, including runs without a trap handler.
+    pub(crate) clock: *mut std::ffi::c_void,
     /// The x87 control word of the CPU a run starts on.
     control: u16,
 }
@@ -683,7 +697,6 @@ impl Native {
                 (stubs.access, "access"),
                 (stubs.interpret, "interpret"),
                 (stubs.call, "call"),
-                (stubs.apply, "apply"),
             ],
         );
         // SAFETY: `enter` follows the C calling convention with the
@@ -723,7 +736,6 @@ impl Native {
                 ret_miss: base + stubs.ret_miss,
                 access: base + stubs.access,
                 interpret: base + stubs.interpret,
-                apply: base + stubs.apply,
                 call: base + stubs.call,
                 fault: base + stubs.fault,
             },
@@ -759,6 +771,7 @@ impl Native {
             stops: Vec::new(),
             features: features(),
             runtime,
+            clock: std::ptr::null_mut(),
             control: 0,
         })
     }
@@ -826,9 +839,6 @@ impl Native {
             }));
         }
         debug_assert_eq!(cpu.lazy_flags[3], 0, "lazy flags settle before entry");
-        self.runtime.count_forms = u64::from(self.retired_forms.is_some());
-        self.runtime.applied = 0;
-        self.runtime.apply_return = 0;
         self.helper_units = 0;
         let budget = fuel.min(SLICE);
         if self.uses_permissions || self.checks != Checks::Adaptive || !self.checked.is_empty() {
@@ -857,6 +867,7 @@ impl Native {
             (*runtime).fault_simd = (*faults).simd.as_ptr() as u64;
             (*runtime).interpret = interpret as *const () as u64;
             (*runtime).call = call as *const () as u64;
+            (*runtime).timestamp = timestamp as *const () as u64;
             (*runtime).owner = &raw mut owner as u64;
             let previous = ACTIVE.replace(faults);
             enter(runtime, entry.unit);
@@ -895,14 +906,6 @@ impl Native {
                 }
             }
             retired -= u64::from(site.refund);
-            if self.retired_forms.is_some()
-                && self.runtime.apply_return != 0
-                && pc >= self.runtime.apply_return as usize
-                && crate::jit_map::locate(self.runtime.apply_return as usize - 4, u128::MAX)
-                    .is_some_and(|location| location.eip == Some(site.eip))
-            {
-                self.runtime.applied -= 1;
-            }
             if !site.checked {
                 self.unchecked_faults += 1;
                 self.strike(site.eip, pc);
@@ -913,8 +916,7 @@ impl Native {
         if let Some(forms) = &mut self.retired_forms {
             // Native REP elements stay in translated fuel: telling them
             // apart would cost emitted code in every REP loop.
-            forms[0] += retired - self.runtime.applied - self.helper_units;
-            forms[1] += self.runtime.applied;
+            forms[0] += retired - self.helper_units;
         }
         let retired = retired as u32;
         Ok(Some(Run {

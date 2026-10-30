@@ -124,6 +124,24 @@ impl Translator<'_> {
         let dp = x.mem.is_some();
         let mut generic = None;
         match x.fast {
+            Fast::Leaf(m) => {
+                self.pair_leaf(m, x, bail);
+                return (false, false, None);
+            }
+            Fast::Load80 => {
+                let to = self.x87_alloc();
+                self.pair_m80(false, bail);
+                self.pair_from_extended(X0, X1, to, false, bail);
+                self.x87.model.push();
+                self.x87_set(0, to, false);
+                self.clear_c1();
+            }
+            Fast::Store80 => {
+                self.pair_to_extended(self.x87.model.reg(0), X0, X1);
+                self.pair_m80(true, bail);
+                self.x87_pop();
+                self.clear_c1();
+            }
             Fast::Wait | Fast::LoadControl | Fast::StoreControl | Fast::StoreStatus => {
                 if x.fast == Fast::StoreStatus {
                     self.x87_status();
@@ -202,6 +220,94 @@ impl Translator<'_> {
             Fast::Round | Fast::Scale | Fast::Examine => unreachable!("not cached"),
         }
         (dp, true, generic)
+    }
+
+    /// Publish the run's x87 image around its arithmetic leaf, keeping the run open.
+    fn pair_leaf(&mut self, m: iced_x86::Mnemonic, x: X87, bail: Label) {
+        self.x87_publish(self.x87.model, X13);
+        self.x87_leaf_call(m, x, bail);
+    }
+
+    pub(super) fn x87_leaf_call(&mut self, m: iced_x86::Mnemonic, x: X87, bail: Label) {
+        use crate::encode::Index::{Offset, Post, Pre};
+        let code = match m {
+            iced_x86::Mnemonic::Fsin => iced_x86::Code::Fsin,
+            iced_x86::Mnemonic::Fcos => iced_x86::Code::Fcos,
+            iced_x86::Mnemonic::Fsincos => iced_x86::Code::Fsincos,
+            iced_x86::Mnemonic::Fptan => iced_x86::Code::Fptan,
+            iced_x86::Mnemonic::Fpatan => iced_x86::Code::Fpatan,
+            iced_x86::Mnemonic::F2xm1 => iced_x86::Code::F2xm1,
+            iced_x86::Mnemonic::Fyl2x => iced_x86::Code::Fyl2x,
+            iced_x86::Mnemonic::Fyl2xp1 => iced_x86::Code::Fyl2xp1,
+            iced_x86::Mnemonic::Fscale => iced_x86::Code::Fscale,
+            iced_x86::Mnemonic::Fprem => iced_x86::Code::Fprem,
+            _ => iced_x86::Code::Fprem1,
+        };
+        let sp = Reg::new(31);
+        self.emit_all(&[
+            stp(X, Pre, super::X4, X5, sp, -48),
+            stp(X, Offset, super::super::X9, super::super::X10, sp, 16),
+            stp(X, Offset, super::super::X11, super::super::X12, sp, 32),
+        ]);
+        self.emit(mov(X, X0, X5));
+        self.mov_imm(X1, code as u32);
+        self.mov_imm(X2, self.trace.insts[self.index].pc);
+        self.mov_imm(X3, u32::from(x.opcode.unwrap()));
+        let call = adv_cpu_core::floating::x87_leaf as *const () as u64;
+        self.emit(movz(X, X16, call as u16, 0));
+        for shift in [16, 32, 48] {
+            self.emit(movk(X, X16, (call >> shift) as u16, shift));
+        }
+        self.emit(blr(X16));
+        self.emit_all(&[
+            ldp(X, Offset, super::super::X11, super::super::X12, sp, 32),
+            ldp(X, Offset, super::super::X9, super::super::X10, sp, 16),
+            ldp(X, Post, super::X4, X5, sp, 48),
+        ]);
+        self.asm.cbz(W, true, X0, bail);
+        self.x87.model = super::cache::Model::default();
+        self.x87.guarded = false;
+        self.vector = super::super::simd::Vector::default();
+        self.emit_all(&[
+            ldrh(X13, X5, runtime::X87_STATUS),
+            ldrh(X8, X5, runtime::X87_CONTROL),
+            ubfx(W, super::X15, X13, 11, 3),
+        ]);
+    }
+
+    /// A ten-byte operand uses one page and two exact-width accesses.
+    fn pair_m80(&mut self, store: bool, bail: Label) {
+        let (fail, ready) = (self.asm.label(), self.asm.label());
+        self.emit_all(&[
+            add_imm(W, X16, super::X6, 9, false),
+            eor(W, X16, X16, super::X6, Lsl, 0),
+        ]);
+        self.asm.tbz(true, X16, 12, bail);
+        if self.checking {
+            self.emit(msr_nzcv(super::X4));
+            self.checked_base(super::X6, store, X2, fail);
+            self.emit(mrs_nzcv(super::X4));
+        } else {
+            self.emit(mov(X, X2, super::WINDOW));
+        }
+        self.emit(add_imm(W, X3, super::X6, 8, false));
+        self.site();
+        self.emit(if store {
+            str_reg(X, X0, X2, super::X6, false)
+        } else {
+            ldr_reg(X, X0, X2, super::X6, false)
+        });
+        self.site();
+        self.emit(if store {
+            str_narrow(Narrow::Half, X1, X2, X3)
+        } else {
+            ldr_narrow(Narrow::Half, X1, X2, X3)
+        });
+        self.asm.b(ready);
+        self.asm.bind(fail);
+        self.emit(mrs_nzcv(super::X4));
+        self.asm.b(bail);
+        self.asm.bind(ready);
     }
 
     /// ST(i) = the new value in host register `n`.

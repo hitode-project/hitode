@@ -170,6 +170,12 @@ fn effects(fast: Fast) -> (Vec<Effect>, bool) {
     let mut list = Vec::new();
     let mut fresh = false;
     match fast {
+        Fast::Leaf(_) => {}
+        Fast::Load80 => {
+            list.push(Push);
+            fresh = true;
+        }
+        Fast::Store80 => list.extend([Read(0), Pop]),
         Fast::Wait | Fast::LoadControl | Fast::StoreControl | Fast::StoreStatus => {}
         Fast::Load(Source::St(i)) => list.extend([Read(i), Push]),
         Fast::Load(_) | Fast::Constant(_) => {
@@ -424,6 +430,9 @@ impl Translator<'_> {
     /// a jcc out of the trace or the miss of an inlined return.
     fn joins(&self, index: usize) -> bool {
         let inst = self.trace.insts[index];
+        if inst.locked.is_some() {
+            return false;
+        }
         let register = |src: Src| !matches!(src, Src::Mem(mem) if mem.fs);
         match inst.op {
             Op::Push(src) => register(src),
@@ -512,6 +521,7 @@ impl Translator<'_> {
         let mut pending: Vec<(usize, [Known; 8], u8)> = Vec::new();
         // Whether the instruction before jumps instead of falling through.
         let mut gap = false;
+        let mut after_leaf = false;
         'run: for index in start..self.trace.len() {
             if index != start && self.trace.head(index) {
                 break;
@@ -567,7 +577,17 @@ impl Translator<'_> {
             gap = false;
             match self.cacheable(index) {
                 Some(x) => {
-                    if step(&mut known, &mut delta, &mut need, x.fast).is_none() {
+                    if matches!(x.fast, Fast::Leaf(_)) {
+                        if pending.iter().any(|p| p.0 > index) {
+                            break;
+                        }
+                        known = [Known::Unknown; 8];
+                        delta = 0;
+                        after_leaf = true;
+                    }
+                    let mut local = Need::default();
+                    let needed = if after_leaf { &mut local } else { &mut need };
+                    if step(&mut known, &mut delta, needed, x.fast).is_none() {
                         break;
                     }
                     end = Some(index);
@@ -682,6 +702,11 @@ impl Translator<'_> {
                 .expect("a planned run");
             (self.x87.hot[offset + 1], self.x87.help[offset + 1], need)
         });
+        if matches!(x.fast, Fast::Leaf(_))
+            && let Some((_, help, need)) = next
+        {
+            self.x87_checks(model, need, help);
+        }
         self.push_cold(UnitCold::X87(Cold {
             index,
             helper: x.helper,
@@ -1100,7 +1125,7 @@ impl Translator<'_> {
 
     /// Stores `model` with status word `status` into `CpuState`; uses x0
     /// to x2, x16, x17, d0 and d1.
-    fn x87_publish(&mut self, model: Model, status: Reg) {
+    pub(super) fn x87_publish(&mut self, model: Model, status: Reg) {
         for (r, slot) in model.slots.iter().enumerate() {
             if let Slot::Dirty(n) | Slot::Freed(Some(n)) = *slot {
                 self.x87_store_slot(r, n);
@@ -1239,16 +1264,46 @@ impl Translator<'_> {
             self.remark(Part::X87Wide);
             self.pair_generic(generic, cold.bail);
         }
+        let leaf = match self.trace.insts[cold.index].op {
+            Op::X87(
+                x @ X87 {
+                    fast: Fast::Leaf(m),
+                    ..
+                },
+            ) => Some((m, x)),
+            _ => None,
+        };
+        let fallback = leaf.map(|_| self.asm.label());
         self.asm.bind(cold.bail);
-        self.remark(Part::X87Publish);
-        self.x87_publish(cold.before, if cold.saved { X14 } else { X13 });
+        if let Some(fallback) = fallback {
+            // The leaf published its input before calling; its pair registers are dead.
+            self.asm.b(fallback);
+        } else {
+            self.remark(Part::X87Publish);
+            self.x87_publish(cold.before, if cold.saved { X14 } else { X13 });
+        }
         self.asm.bind(cold.help);
         self.remark(Part::Cold);
         self.index = cold.index;
         self.state = State::CANONICAL;
         self.vector = super::super::simd::Vector::default();
-        self.emit(msr_nzcv(X4));
-        self.helper(cold.helper);
+        if let Some((m, x)) = leaf {
+            let fallback = fallback.unwrap();
+            let resume = self.asm.label();
+            // A preceding helper may have left values outside the pair format.
+            // The arithmetic leaf reads their canonical raw80 image directly.
+            self.x87_checks(Model::default(), Need::default(), fallback);
+            self.x87_leaf_call(m, x, fallback);
+            self.emit(msr_nzcv(X4));
+            self.asm.b(resume);
+            self.asm.bind(fallback);
+            self.emit(msr_nzcv(X4));
+            self.helper(cold.helper);
+            self.asm.bind(resume);
+        } else {
+            self.emit(msr_nzcv(X4));
+            self.helper(cold.helper);
+        }
         self.emit(ldr(X, X5, RUNTIME, runtime::CPU_STATE));
         let Some((hot, help, need)) = cold.next else {
             self.asm.b(cold.done);

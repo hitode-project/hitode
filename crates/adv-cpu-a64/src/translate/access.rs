@@ -152,25 +152,6 @@ impl Translator<'_> {
         }
     }
 
-    /// `direct`, an access of `width` bytes at the guest address in
-    /// `address`, or a branch to `slow` where a checked one cannot take the
-    /// window or alias. The caller's slow path completes the instruction.
-    pub(super) fn access_or(
-        &mut self,
-        address: Reg,
-        width: u32,
-        store: bool,
-        direct: u32,
-        slow: Label,
-    ) {
-        if self.checking {
-            self.checked_memory(address, width, store, direct, slow);
-        } else {
-            self.site();
-            self.emit(direct);
-        }
-    }
-
     /// A checked access (A64-MEM-7) of `kind` at the guest address in `address`,
     /// whose window form is `direct`: the window takes it if it stays in
     /// one page whose class allows it. Ordinary pages blocked by the host
