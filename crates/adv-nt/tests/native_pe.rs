@@ -803,417 +803,6 @@ fn crt_exports_match_wine() {
     }
 }
 
-const KB: u32 = 0x7b000000;
-const NT: u32 = 0x7bc00000;
-const TABLES: u32 = 0x1800000;
-const NORM: u32 = 0x1c00000;
-const PAGES: [u32; 7] = [932, 936, 949, 950, 1252, 437, 1258];
-
-fn nls_machine(dist: &Path, jit: bool) -> (Machine<Cpu>, Pe, Pe) {
-    let (mut m, kb) = machine(dist, "kernelbase.dll", jit);
-    let nt =
-        Pe::parse(&std::fs::read(dist.join("lib/wine/i386-windows/ntdll.dll")).unwrap()).unwrap();
-    m.cpu.map(TABLES, 0x1000, Prot::RW).unwrap();
-    for (i, page) in PAGES.iter().enumerate() {
-        let bytes = std::fs::read(dist.join(format!("share/wine/nls/c_{page}.nls"))).unwrap();
-        let at = 0x2000000 + i as u32 * 0x40000;
-        m.cpu
-            .map(at, (bytes.len() as u32 + 0xfff) & !0xfff, Prot::READ)
-            .unwrap();
-        m.cpu.write(at, &bytes).unwrap();
-        prepare(&mut m, address(&nt, "RtlInitCodePageTable"), 2, true);
-        call(
-            &mut m,
-            &vec![0; LEN as usize],
-            &[at, TABLES + i as u32 * 0x2c],
-        )
-        .0
-        .unwrap();
-    }
-    let bytes = std::fs::read(dist.join("share/wine/nls/normnfc.nls")).unwrap();
-    m.cpu
-        .map(NORM, (bytes.len() as u32 + 0xfff) & !0xfff, Prot::READ)
-        .unwrap();
-    m.cpu.write(NORM, &bytes).unwrap();
-    m.cpu.write_u32(KB + 0xbf45c, NORM).unwrap();
-    m.cpu
-        .copy_memory(TABLES + 4 * 0x2c, KB + 0xc0b00, 0x2c)
-        .unwrap();
-    m.cpu
-        .copy_memory(TABLES + 5 * 0x2c, KB + 0xc0ac0, 0x2c)
-        .unwrap();
-    m.cpu
-        .copy_memory(TABLES, KB + 0xbf480, PAGES.len() * 0x2c)
-        .unwrap();
-    m.cpu.write_u32(KB + 0xbf460, PAGES.len() as u32).unwrap();
-    (m, kb, nt)
-}
-
-fn shared_nls_machine(dist: &Path, jit: bool) -> (Machine<Cpu>, Pe, Pe) {
-    use std::os::fd::AsFd;
-    let (mut machine, kb, nt) = nls_machine(dist, jit);
-    for (at, name) in PAGES
-        .iter()
-        .enumerate()
-        .map(|(i, page)| (0x2000000 + i as u32 * 0x40000, format!("c_{page}.nls")))
-        .chain([(NORM, "normnfc.nls".into())])
-    {
-        let file = std::fs::File::open(dist.join("share/wine/nls").join(name)).unwrap();
-        let len = (file.metadata().unwrap().len() as u32 + 0xfff) & !0xfff;
-        machine.cpu.unmap(at, len).unwrap();
-        machine
-            .cpu
-            .map_shared_file(at, len, file.as_fd(), 0, Prot::READ)
-            .unwrap();
-    }
-    (machine, kb, nt)
-}
-
-// spec: NAT-BODY-5, NAT-BODY-15
-#[test]
-fn code_pages_shared_tables_match_wine() {
-    compare_code_pages(shared_nls_machine);
-}
-
-// spec: NAT-BODY-5
-#[test]
-fn code_pages_match_wine() {
-    compare_code_pages(nls_machine);
-}
-
-fn compare_code_pages(factory: fn(&Path, bool) -> (Machine<Cpu>, Pe, Pe)) {
-    let Some(dist) = dist() else {
-        return;
-    };
-    let (mut native, kb, nt) = factory(&dist, true);
-    let (mut reference, _, _) = nls_machine(&dist, false);
-    let mut rng = Rng(0x61ace5ff6e379b2d);
-    for name in [
-        "MultiByteToWideChar",
-        "WideCharToMultiByte",
-        "RtlMultiByteToUnicodeN",
-        "RtlUnicodeToMultiByteN",
-        "RtlMultiByteToUnicodeSize",
-        "RtlUnicodeToMultiByteSize",
-        "RtlOemToUnicodeN",
-        "RtlUnicodeToOemN",
-    ] {
-        let kernel = !name.starts_with("Rtl");
-        let wide = name.starts_with("Wide") || name.starts_with("RtlUnicode");
-        let size = name.ends_with("Size");
-        let argc = if kernel {
-            if wide { 8 } else { 6 }
-        } else if size {
-            3
-        } else {
-            5
-        };
-        let entry = address(if kernel { &kb } else { &nt }, name);
-        assert!(
-            native.sys.redirects.contains_key(&entry),
-            "{name} not bound"
-        );
-        prepare(&mut native, entry, argc, true);
-        prepare(&mut reference, entry, argc, true);
-        for (page_index, page) in PAGES.iter().enumerate() {
-            for m in [&mut native, &mut reference] {
-                m.cpu
-                    .copy_memory(TABLES + page_index as u32 * 0x2c, NT + 0x723e0, 0x2c)
-                    .unwrap();
-                m.cpu
-                    .copy_memory(TABLES + page_index as u32 * 0x2c, NT + 0x723e0 + 0x2c, 0x2c)
-                    .unwrap();
-            }
-            let before = native.sys.host_calls;
-            let flag_count = if !kernel {
-                1
-            } else if wide {
-                64
-            } else {
-                16
-            };
-            for flag_bits in 0..flag_count {
-                let flags = if wide {
-                    (if flag_bits & 1 != 0 { 0x10 } else { 0 })
-                        | (if flag_bits & 2 != 0 { 0x20 } else { 0 })
-                        | (if flag_bits & 4 != 0 { 0x40 } else { 0 })
-                        | (if flag_bits & 8 != 0 { 0x80 } else { 0 })
-                        | (if flag_bits & 16 != 0 { 0x200 } else { 0 })
-                        | (if flag_bits & 32 != 0 { 0x400 } else { 0 })
-                } else {
-                    flag_bits
-                };
-                for case in 0..12 {
-                    let mut data = vec![0xcc; LEN as usize];
-                    let src = DATA + case % 4;
-                    let dst = DATA + 0x4000 + case % 4;
-                    let n = if case < 4 {
-                        case + 1
-                    } else {
-                        rng.next() % 100 + 2
-                    };
-                    if wide {
-                        for i in 0..n {
-                            put(&mut data, src + 2 * i, 2, rng.next() & 0xffff);
-                        }
-                        let edge: &[u16] = match case % 6 {
-                            0 => &[0x65, 0x301, 0, 0xd800, 0xdc00],
-                            1 => &[0x304b, 0x3099, 0x4e00, 0xffff],
-                            2 => &[0x41, 0x30a, 0x65, 0x301, 0x323],
-                            3 => &[0x41, 0x308, 0x1100, 0x1161],
-                            4 => &[0x3f, 0x100, 0x20ac, 0xe000],
-                            _ => &[0xfffd, 0xff, 0xdfff, 0x1, 0],
-                        };
-                        for (i, ch) in edge.iter().take(n as usize).enumerate() {
-                            put(&mut data, src + i as u32 * 2, 2, u32::from(*ch));
-                        }
-                        put(&mut data, src + n * 2, 2, 0);
-                    } else {
-                        for i in 0..n {
-                            put(&mut data, src + i, 1, rng.next());
-                        }
-                        let edge: &[u8] = match case % 6 {
-                            0 => &[0x81, 0],
-                            1 => &[0xff, 0x81, 0xff],
-                            2 => &[0x82, 0xa0, 0x81],
-                            3 => &[0, 0x81],
-                            4 => &[0xa1, 0xa1, 0xff, 0xfe],
-                            _ => &[0x80, 0x81, 0xff, 0x7f],
-                        };
-                        for (i, ch) in edge.iter().take(n as usize).enumerate() {
-                            put(&mut data, src + i as u32, 1, u32::from(*ch));
-                        }
-                        put(
-                            &mut data,
-                            src + n - 1,
-                            1,
-                            if case % 2 == 0 { 0x81 } else { 0xff },
-                        );
-                        put(&mut data, src + n, 1, 0);
-                    }
-                    let capacity = match case % 6 {
-                        0 => 0,
-                        1 => 1,
-                        2 => n / 2,
-                        3 => n,
-                        _ => n * 4 + 10,
-                    };
-                    let used = if case % 3 != 0 { DATA + 0x7000 } else { 0 };
-                    let def = if case % 4 == 0 { 0 } else { DATA + 0x7004 };
-                    put(
-                        &mut data,
-                        DATA + 0x7004,
-                        2,
-                        if case % 2 == 0 { 0x4081 } else { 0x21 },
-                    );
-                    let srclen = if case % 5 == 4 { u32::MAX } else { n };
-                    let args = if kernel {
-                        let mut args = vec![
-                            *page,
-                            flags,
-                            src,
-                            srclen,
-                            if capacity == 0 { 0 } else { dst },
-                            capacity,
-                        ];
-                        if wide {
-                            args.extend_from_slice(&[def, used]);
-                        }
-                        args
-                    } else if size {
-                        vec![DATA + 0x7000, src, n * if wide { 2 } else { 1 } + case % 2]
-                    } else {
-                        vec![
-                            dst,
-                            capacity,
-                            used,
-                            src,
-                            n * if wide { 2 } else { 1 } + case % 2,
-                        ]
-                    };
-                    same(
-                        &mut native,
-                        &mut reference,
-                        &data,
-                        &args,
-                        &format!("{name} cp{page} flags{flags:x} case{case}"),
-                    );
-                }
-            }
-            assert!(
-                native.sys.host_calls > before,
-                "{name} cp{page} never accepted a call"
-            );
-        }
-    }
-}
-
-// spec: NAT-BODY-5
-#[test]
-fn nls_layout_matches_dwarf() {
-    let Some(dist) = dist() else {
-        return;
-    };
-    let source = include_str!("../src/native/nls.rs");
-    for module in ["ntdll", "kernelbase"] {
-        let dll = dist
-            .with_file_name("wine11-sse-dist")
-            .join(format!("usr/local/lib/wine/i386-windows/{module}.dll"));
-        let pe = Pe::parse(&std::fs::read(&dll).unwrap()).unwrap();
-        let dump = std::process::Command::new("dwarfdump")
-            .arg("--debug-info")
-            .arg(dll)
-            .output()
-            .unwrap();
-        assert!(dump.status.success());
-        let text = String::from_utf8(dump.stdout).unwrap();
-        let entries: Vec<_> = text.split("\n0x").collect();
-        let structure = |name: &str| {
-            let start = entries
-                .iter()
-                .position(|e| {
-                    e.contains(":   DW_TAG_structure_type")
-                        && e.contains(&format!("DW_AT_name\t(\"{name}\")"))
-                })
-                .unwrap();
-            entries[start + 1..]
-                .iter()
-                .take_while(|e| !e.contains(":     NULL"))
-                .copied()
-                .collect::<Vec<_>>()
-        };
-        let variable = |name: &str| {
-            let entry = entries
-                .iter()
-                .find(|e| {
-                    e.contains(":   DW_TAG_variable")
-                        && e.contains(&format!("DW_AT_name\t(\"{name}\")"))
-                })
-                .unwrap();
-            let addr = entry
-                .split("DW_OP_addr 0x")
-                .nth(1)
-                .unwrap()
-                .split(')')
-                .next()
-                .unwrap();
-            u32::from_str_radix(addr, 16).unwrap() - pe.image_base
-        };
-        for (block, name) in [
-            ("cp", "_CPTABLEINFO"),
-            ("norm", "norm_table"),
-            ("critical", "_RTL_CRITICAL_SECTION"),
-            ("kb", ""),
-        ] {
-            if block == "kb" && module != "kernelbase" {
-                continue;
-            }
-            let fields = if block == "kb" {
-                Vec::new()
-            } else {
-                structure(name)
-            };
-            let constants = source
-                .split(&format!("mod {block} {{"))
-                .nth(1)
-                .unwrap()
-                .split('}')
-                .next()
-                .unwrap();
-            for line in constants.lines().filter(|l| l.contains("pub const")) {
-                let field = line
-                    .split("pub const ")
-                    .nth(1)
-                    .unwrap()
-                    .split(':')
-                    .next()
-                    .unwrap();
-                let value = line.split("= ").nth(1).unwrap().trim_end_matches(';');
-                let expected = if let Some(hex) = value.strip_prefix("0x") {
-                    u32::from_str_radix(hex, 16).unwrap()
-                } else {
-                    value.parse().unwrap()
-                };
-                let actual = if block == "kb" {
-                    variable(field)
-                } else if field == "SIZE" {
-                    let entry = entries
-                        .iter()
-                        .find(|e| {
-                            e.contains(":   DW_TAG_structure_type")
-                                && e.contains(&format!("DW_AT_name\t(\"{name}\")"))
-                        })
-                        .unwrap();
-                    u32::from_str_radix(
-                        entry
-                            .split("DW_AT_byte_size\t(0x")
-                            .nth(1)
-                            .unwrap()
-                            .split(')')
-                            .next()
-                            .unwrap(),
-                        16,
-                    )
-                    .unwrap()
-                } else {
-                    let member = fields
-                        .iter()
-                        .find(|e| e.contains(&format!("DW_AT_name\t(\"{field}\")")))
-                        .unwrap();
-                    u32::from_str_radix(
-                        member
-                            .split("DW_AT_data_member_location\t(0x")
-                            .nth(1)
-                            .unwrap()
-                            .split(')')
-                            .next()
-                            .unwrap(),
-                        16,
-                    )
-                    .unwrap()
-                };
-                assert_eq!(actual, expected, "{module}: {name}.{field}");
-            }
-        }
-        if module == "ntdll" {
-            let constant = |name: &str| {
-                let value = source
-                    .split(&format!("const {name}: u32 = 0x"))
-                    .nth(1)
-                    .unwrap()
-                    .split(';')
-                    .next()
-                    .unwrap();
-                u32::from_str_radix(value, 16).unwrap()
-            };
-            assert_eq!(variable("nls_info"), constant("NLS_INFO"));
-            for (name, field, offset) in [
-                ("_NLSTABLEINFO", "AnsiTableInfo", constant("ANSI_TABLE")),
-                ("_NLSTABLEINFO", "OemTableInfo", 0),
-                ("_TEB", "LastErrorValue", constant("LAST_ERROR")),
-            ] {
-                let fields = structure(name);
-                let member = fields
-                    .iter()
-                    .find(|e| e.contains(&format!("DW_AT_name\t(\"{field}\")")))
-                    .unwrap();
-                let actual = member
-                    .split("DW_AT_data_member_location\t(0x")
-                    .nth(1)
-                    .unwrap()
-                    .split(')')
-                    .next()
-                    .unwrap();
-                assert_eq!(
-                    u32::from_str_radix(actual, 16).unwrap(),
-                    offset,
-                    "{name}.{field}"
-                );
-            }
-        }
-    }
-}
-
 // spec: NAT-BODY-1, NAT-BODY-6
 #[test]
 fn crt_faults_raise_at_entry_before_writes() {
@@ -1332,202 +921,6 @@ fn crt_faults_raise_at_entry_before_writes() {
                 assert_eq!(adv_nt::native::declines(&native.ext), before);
             }
         }
-    }
-}
-
-// spec: NAT-BODY-1, NAT-BODY-5
-#[test]
-fn code_page_faults_resume_wine_before_writes() {
-    let Some(dist) = dist() else {
-        return;
-    };
-    for name in [
-        "MultiByteToWideChar",
-        "WideCharToMultiByte",
-        "RtlMultiByteToUnicodeN",
-        "RtlUnicodeToMultiByteN",
-        "RtlMultiByteToUnicodeSize",
-        "RtlUnicodeToMultiByteSize",
-        "RtlOemToUnicodeN",
-        "RtlUnicodeToOemN",
-    ] {
-        for fault in 0..if name.ends_with("Size") { 2 } else { 3 } {
-            let (mut native, kb, nt) = nls_machine(&dist, true);
-            let (mut reference, _, _) = nls_machine(&dist, false);
-            let kernel = !name.starts_with("Rtl");
-            let wide = name.starts_with("Wide") || name.starts_with("RtlUnicode");
-            let size = name.ends_with("Size");
-            for m in [&mut native, &mut reference] {
-                m.cpu.copy_memory(TABLES, NT + 0x723e0, 0x2c).unwrap();
-                m.cpu
-                    .copy_memory(TABLES, NT + 0x723e0 + 0x2c, 0x2c)
-                    .unwrap();
-            }
-            let data = vec![0x41; LEN as usize];
-            let argc = if kernel {
-                if wide { 8 } else { 6 }
-            } else if size {
-                3
-            } else {
-                5
-            };
-            let entry = address(if kernel { &kb } else { &nt }, name);
-            prepare(&mut native, entry, argc, true);
-            prepare(&mut reference, entry, argc, true);
-            let args = if kernel {
-                let mut args = vec![932, 0, DATA, 12, DATA + 0x4000, 32];
-                if wide {
-                    args.extend_from_slice(&[0, DATA + 0x7000]);
-                }
-                args
-            } else if size {
-                vec![DATA + 0x7000, DATA, 12]
-            } else {
-                vec![DATA + 0x4000, 32, DATA + 0x7000, DATA, 12]
-            };
-            for _ in 0..4 {
-                same(&mut native, &mut reference, &data, &args, name);
-            }
-            let before = adv_nt::native::declines(&native.ext);
-            let mut args = args;
-            if fault == 0 {
-                args[if kernel {
-                    2
-                } else if size {
-                    1
-                } else {
-                    3
-                }] = DATA + LEN - 4;
-            } else if size {
-                args[0] = DATA + LEN - 2;
-            } else if fault == 1 {
-                args[if kernel { 4 } else { 0 }] = DATA + LEN - 2;
-            } else if kernel && !wide {
-                native
-                    .cpu
-                    .protect(DATA + 0x4000, 0x1000, Prot::READ)
-                    .unwrap();
-                reference
-                    .cpu
-                    .protect(DATA + 0x4000, 0x1000, Prot::READ)
-                    .unwrap();
-            } else {
-                args[if kernel { 7 } else { 2 }] = DATA + LEN - 2;
-            }
-            let actual = call(&mut native, &data, &args);
-            let expected = call(&mut reference, &data, &args);
-            assert!(
-                expected.0.is_err(),
-                "{name} fault {fault}: {:?}",
-                expected.0
-            );
-            assert_eq!(actual.0, expected.0, "{name} fault {fault}");
-            assert!(
-                actual.1 == expected.1,
-                "{name} fault {fault}: partial writes differ"
-            );
-            assert!(
-                adv_nt::native::declines(&native.ext) > before,
-                "{name} fault {fault}: did not decline"
-            );
-        }
-    }
-}
-
-// spec: NAT-BODY-5
-#[test]
-fn code_page_parameters_match_wine() {
-    let Some(dist) = dist() else {
-        return;
-    };
-    let (mut native, kb, _) = nls_machine(&dist, true);
-    let (mut reference, _, _) = nls_machine(&dist, false);
-    for m in [&mut native, &mut reference] {
-        m.cpu.write_u32(KB + 0x871b8, 932).unwrap();
-    }
-    for name in ["MultiByteToWideChar", "WideCharToMultiByte"] {
-        let wide = name.starts_with("Wide");
-        let argc = if wide { 8 } else { 6 };
-        prepare(&mut native, address(&kb, name), argc, true);
-        prepare(&mut reference, address(&kb, name), argc, true);
-        let mut data = vec![0x41; LEN as usize];
-        put(&mut data, DATA + 24, if wide { 2 } else { 1 }, 0);
-        for case in 0..24 {
-            let mut args = [932, 0, DATA, 12, DATA + 0x4000, 32, 0, DATA + 0x7000];
-            match case % 12 {
-                0 => args[2] = 0,
-                1 => args[3] = 0,
-                2 => args[4] = 0,
-                3 => args[5] = u32::MAX,
-                4 => args[1] = 0x10000,
-                5 => args[3] = u32::MAX - 1,
-                6 => {
-                    args[4] = 0;
-                    args[5] = 0;
-                }
-                7 => args[0] = 0,
-                8 => args[0] = 1,
-                9 => args[0] = 65010,
-                _ => {}
-            }
-            same(&mut native, &mut reference, &data, &args[..argc], name);
-        }
-    }
-}
-
-// spec: NAT-BODY-1, NAT-BODY-5
-#[test]
-fn cached_code_pages_resume_wine_with_owned_lock() {
-    let Some(dist) = dist() else {
-        return;
-    };
-    let (mut native, kb, _) = nls_machine(&dist, true);
-    let (mut reference, _, _) = nls_machine(&dist, false);
-    for name in ["MultiByteToWideChar", "WideCharToMultiByte"] {
-        let wide = name.starts_with("Wide");
-        let argc = if wide { 8 } else { 6 };
-        let entry = address(&kb, name);
-        let args = [932, 0, DATA, 12, DATA + 0x4000, 32, 0, DATA + 0x7000];
-        let data = vec![0x41; LEN as usize];
-        for m in [&mut native, &mut reference] {
-            m.cpu.write_u32(KB + 0x871a4, u32::MAX).unwrap();
-            m.cpu.write_u32(KB + 0x871a8, 0).unwrap();
-            m.cpu.write_u32(KB + 0x871ac, 0).unwrap();
-            prepare(m, entry, argc, true);
-        }
-        for _ in 0..4 {
-            same(&mut native, &mut reference, &data, &args[..argc], name);
-        }
-        for m in [&mut native, &mut reference] {
-            let mut original = [0; 256];
-            m.cpu.read(CODE, &mut original).unwrap();
-            // The caller owns the locale lock. Wine reenters it recursively.
-            let mut code = vec![0x64, 0xa1, 0x24, 0, 0, 0, 0xa3];
-            code.extend_from_slice(&(KB + 0x871ac).to_le_bytes());
-            for (at, value) in [(KB + 0x871a4, 0u32), (KB + 0x871a8, 1)] {
-                code.extend_from_slice(&[0xc7, 0x05]);
-                code.extend_from_slice(&at.to_le_bytes());
-                code.extend_from_slice(&value.to_le_bytes());
-            }
-            code.extend_from_slice(&original);
-            m.cpu.write(CODE, &code).unwrap();
-        }
-        let before = adv_nt::native::declines(&native.ext);
-        for _ in 0..4 {
-            let actual = call(&mut native, &data, &args[..argc]);
-            let expected = call(&mut reference, &data, &args[..argc]);
-            assert!(expected.0.is_ok(), "{name}: {:?}", expected.0);
-            assert_eq!(actual.0, expected.0, "{name}");
-            assert!(actual.1 == expected.1, "{name}: bytes differ");
-            for m in [&mut native, &mut reference] {
-                assert_eq!(m.cpu.read_u32(KB + 0x871a4).unwrap(), 0);
-                assert_eq!(m.cpu.read_u32(KB + 0x871a8).unwrap(), 1);
-            }
-        }
-        assert!(
-            adv_nt::native::declines(&native.ext) > before,
-            "{name}: locked lookup did not decline"
-        );
     }
 }
 
@@ -1661,7 +1054,7 @@ fn counted_body(m: &mut Machine<Cpu>, name: &str, context: u32, args: &[u32]) {
     );
 }
 
-// spec: NAT-BODY-5, NAT-BODY-6, NAT-BODY-15
+// spec: NAT-BODY-6, NAT-BODY-15
 #[test]
 fn pe_bodies_access_memory_by_page() {
     let Some(dist) = dist() else {
@@ -1703,144 +1096,6 @@ fn pe_bodies_access_memory_by_page() {
                 counted_body(&mut m, &format!("{module}!{export}"), context, &args);
             }
         }
-    }
-    let (mut m, _, _) = nls_machine(&dist, true);
-    let context = m.spawn("counted-conversion", CODE, &[], 0x10000).unwrap();
-    for code in [1252, 932] {
-        for flags in [0, 2, 8] {
-            for len in [1000, u32::MAX] {
-                m.cpu.write(DATA, &[0x41; 1000]).unwrap();
-                m.cpu.write(DATA + 1000, &[0]).unwrap();
-                counted_body(
-                    &mut m,
-                    "kernelbase.dll!MultiByteToWideChar",
-                    context,
-                    &[code, flags, DATA, len, DATA + 0x4000, 2000],
-                );
-            }
-        }
-        for flags in [0, 0x200, 0x400] {
-            for len in [1000, u32::MAX] {
-                for i in 0..1000 {
-                    m.cpu.write(DATA + i * 2, &0x41u16.to_le_bytes()).unwrap();
-                }
-                m.cpu.write(DATA + 2000, &[0, 0]).unwrap();
-                counted_body(
-                    &mut m,
-                    "kernelbase.dll!WideCharToMultiByte",
-                    context,
-                    &[
-                        code,
-                        flags,
-                        DATA,
-                        len,
-                        DATA + 0x4000,
-                        2000,
-                        0,
-                        DATA + 0x7000,
-                    ],
-                );
-            }
-        }
-    }
-    // Exercise bulk shared reads and outputs that exceed the stack buffers.
-    let large = 0x900000;
-    m.cpu.map(large, 0x50000, Prot::RW).unwrap();
-    m.cpu.fill_memory(large, 0x41, 0x50000).unwrap();
-    counted_body(
-        &mut m,
-        "kernelbase.dll!MultiByteToWideChar",
-        context,
-        &[1252, 0, large, 5000, DATA + 0x4000, 5000],
-    );
-    let mut output = [0; 10000];
-    m.cpu.read(DATA + 0x4000, &mut output).unwrap();
-    assert!(output.as_chunks::<2>().0.iter().all(|ch| *ch == [0x41, 0]));
-    counted_body(
-        &mut m,
-        "kernelbase.dll!MultiByteToWideChar",
-        context,
-        &[1252, 0, large, 0x50000, DATA + 0x4000, 1000],
-    );
-}
-
-// spec: NAT-BODY-5, NAT-BODY-15
-#[test]
-fn code_pages_read_unborrowable_entries() {
-    let Some(dist) = dist() else {
-        return;
-    };
-    let (mut m, _, _) = nls_machine(&dist, true);
-    let (mut reference, kb, _) = nls_machine(&dist, false);
-    let context = m.spawn("counted-conversion", CODE, &[], 0x10000).unwrap();
-    let teb = m.sys.contexts[context as usize].teb;
-    for (name, source, flags) in [
-        ("MultiByteToWideChar", [0xd2, 0xbb], 8),
-        ("WideCharToMultiByte", [0x00, 0x4e], 0x400),
-    ] {
-        let wide = name.starts_with("Wide");
-        let argc = if wide { 8 } else { 6 };
-        let args = [
-            936,
-            flags,
-            DATA,
-            if wide { 1 } else { 2 },
-            DATA + 0x4000,
-            8,
-            0,
-            DATA + 0x7000,
-        ];
-        let mut data = vec![0xcc; LEN as usize];
-        data[..2].copy_from_slice(&source);
-        prepare(&mut reference, address(&kb, name), argc, true);
-        let expected = call(&mut reference, &data, &args[..argc]);
-        let expected_result = expected.0.unwrap();
-        m.cpu.write(DATA, &data).unwrap();
-        m.cpu.write_u32(teb + 0x34, 0x1234abcd).unwrap();
-        m.cpu.set_reg(adv_cpu::backend::Reg::Esp, SLOT);
-        for (i, arg) in args[..argc].iter().enumerate() {
-            m.cpu.write_u32(ARGS + i as u32 * 4, *arg).unwrap();
-        }
-        let thunk = m
-            .sys
-            .thunks
-            .published_index(adv_nt::native::MODULE, &format!("kernelbase.dll!{name}"))
-            .unwrap();
-        let body = m.sys.thunks.get(thunk).f.handler;
-        let mut cpu = CountingGuest {
-            cpu: &mut m.cpu,
-            calls: std::cell::Cell::new(0),
-            read_bytes: std::cell::Cell::new(0),
-            largest_read: std::cell::Cell::new(0),
-            lend_tables: false,
-            pages: std::cell::RefCell::new(std::collections::BTreeSet::new()),
-            stores: 0,
-        };
-        let mut env = adv_machine::Env {
-            context,
-            cpu: &mut cpu,
-            sys: &mut m.sys,
-            ext: &mut m.ext,
-            thunk,
-        };
-        assert!(
-            matches!(body(&mut env), adv_machine::Outcome::Return64(value) if value == u64::from(expected_result[0])),
-            "{name} declined or returned a different length"
-        );
-        assert!(
-            cpu.read_bytes.get() < 2048,
-            "{name}: {} bytes read",
-            cpu.read_bytes.get()
-        );
-        assert!(cpu.largest_read.get() < 512, "{name}: copied a table");
-        let mut actual = vec![0; LEN as usize];
-        m.cpu.read(DATA, &mut actual).unwrap();
-        assert_eq!(actual, expected.1, "{name}: output differs");
-        assert_eq!(
-            m.cpu.read_u32(teb + 0x34).unwrap(),
-            expected_result[7],
-            "{name}: LastError differs"
-        );
     }
 }
 
@@ -2747,4 +2002,201 @@ fn d3dx_block_rounding_wraps_and_zero_divisors_fault() {
     assert_eq!(fault.pc, entry);
     assert_eq!(fault.kind, adv_cpu::backend::FaultKind::IntegerDivideByZero);
     assert_eq!(adv_nt::native::declines(&native.ext), 0);
+}
+
+// spec: NAT-BODY-20
+#[test]
+fn nls_layout_matches_dwarf() {
+    let Some(dist) = dist() else {
+        return;
+    };
+    let source = include_str!("../src/native/nls.rs");
+    for module in ["kernelbase", "ntdll"] {
+        let dll = dist
+            .with_file_name("wine11-sse-dist")
+            .join(format!("usr/local/lib/wine/i386-windows/{module}.dll"));
+        let pe = Pe::parse(&std::fs::read(&dll).unwrap()).unwrap();
+        let dump = std::process::Command::new("dwarfdump")
+            .arg("--debug-info")
+            .arg(dll)
+            .output()
+            .unwrap();
+        assert!(dump.status.success());
+        let text = String::from_utf8(dump.stdout).unwrap();
+        let entries: Vec<_> = text.split("\n0x").collect();
+        let named = |tag: &str, name: &str| -> usize {
+            entries
+                .iter()
+                .position(|e| {
+                    e.contains(&format!(":   DW_TAG_{tag}"))
+                        && e.contains(&format!("DW_AT_name\t(\"{name}\")"))
+                })
+                .unwrap_or_else(|| panic!("missing {module}: {tag} {name}"))
+        };
+        let reference = |entry: usize| -> usize {
+            let id = entries[entry]
+                .split("DW_AT_type\t(0x")
+                .nth(1)
+                .unwrap()
+                .split([' ', ')'])
+                .next()
+                .unwrap();
+            entries
+                .iter()
+                .position(|e| e.starts_with(&format!("{id}:")))
+                .unwrap()
+        };
+        let structure = |name: &str| -> usize {
+            if let Some(variable) = name.strip_prefix('@') {
+                return reference(named("variable", variable));
+            }
+            if let Some(typedef) = name.strip_prefix('$') {
+                return reference(named("typedef", typedef));
+            }
+            named("structure_type", name)
+        };
+        let hex_field = |entry: &str, field: &str| -> u32 {
+            let value = entry
+                .split(&format!("{field}\t(0x"))
+                .nth(1)
+                .unwrap()
+                .split(')')
+                .next()
+                .unwrap();
+            u32::from_str_radix(value, 16).unwrap()
+        };
+        let variable = |name: &str| -> u32 {
+            let entry = entries[named("variable", name)];
+            let addr = entry
+                .split("DW_OP_addr 0x")
+                .nth(1)
+                .unwrap()
+                .split(')')
+                .next()
+                .unwrap();
+            u32::from_str_radix(addr, 16).unwrap() - pe.image_base
+        };
+        let member = |name: &str, field: &str| -> u32 {
+            let entry = structure(name);
+            if field == "SIZE" {
+                return hex_field(entries[entry], "DW_AT_byte_size");
+            }
+            let field = entries[entry + 1..]
+                .iter()
+                .take_while(|e| !e.contains(":     NULL"))
+                .find(|e| e.contains(&format!("DW_AT_name\t(\"{field}\")")))
+                .unwrap();
+            hex_field(field, "DW_AT_data_member_location")
+        };
+        if module == "kernelbase" {
+            for (block, name) in [
+                ("cp", "_CPTABLEINFO"),
+                ("kb", ""),
+                ("sort", "@sort"),
+                ("sortguid", "sortguid"),
+                ("compression", "sort_compression"),
+                ("expansion", "sort_expansion"),
+                ("jamo", "jamo_sort"),
+                ("locale_header", "$NLS_LOCALE_HEADER"),
+                ("locale_data", "$NLS_LOCALE_DATA"),
+                ("lcid_index", "$NLS_LOCALE_LCID_INDEX"),
+                ("lcname_index", "$NLS_LOCALE_LCNAME_INDEX"),
+                ("critical", "_RTL_CRITICAL_SECTION"),
+                ("teb", "_TEB"),
+            ] {
+                let constants = source
+                    .split(&format!("mod {block} {{"))
+                    .nth(1)
+                    .unwrap()
+                    .split('}')
+                    .next()
+                    .unwrap();
+                for line in constants.lines().filter(|line| line.contains("pub const")) {
+                    let field = line
+                        .split("pub const ")
+                        .nth(1)
+                        .unwrap()
+                        .split(':')
+                        .next()
+                        .unwrap();
+                    let value = line.split("= ").nth(1).unwrap().trim_end_matches(';');
+                    let expected = if let Some(hex) = value.strip_prefix("0x") {
+                        u32::from_str_radix(hex, 16).unwrap()
+                    } else {
+                        value.parse().unwrap()
+                    };
+                    let actual = if block == "kb" {
+                        variable(field)
+                    } else {
+                        member(name, field)
+                    };
+                    assert_eq!(actual, expected, "{module}: {block}.{field}");
+                }
+            }
+        } else {
+            for (constant, actual) in [
+                ("NT_NLS_INFO", variable("nls_info")),
+                ("NT_UPPER_CASE", member("_NLSTABLEINFO", "UpperCaseTable")),
+            ] {
+                let value = source
+                    .split(&format!("const {constant}: u32 = 0x"))
+                    .nth(1)
+                    .unwrap()
+                    .split(';')
+                    .next()
+                    .unwrap();
+                assert_eq!(
+                    actual,
+                    u32::from_str_radix(value, 16).unwrap(),
+                    "{constant}"
+                );
+            }
+        }
+    }
+}
+
+// spec: NAT-BODY-20
+#[test]
+fn nls_name_pool_offsets_identify_wine_search_entries() {
+    let Some(dist) = dist() else {
+        return;
+    };
+    let data = std::fs::read(dist.join("share/wine/nls/locale.nls")).unwrap();
+    let word = |at: usize| u16::from_le_bytes(data[at..at + 2].try_into().unwrap());
+    let dword = |at: usize| u32::from_le_bytes(data[at..at + 4].try_into().unwrap()) as usize;
+    // Wine load_locale_nls's file header and NLS_LOCALE_HEADER indexes.
+    let header = dword(0x10);
+    let names = header + dword(header + 0x30);
+    let lcids = header + dword(header + 0x2c);
+    let strings = header + dword(header + 0x40);
+    let normalized = |offset: u16| -> Vec<u16> {
+        let at = strings + usize::from(offset) * 2;
+        (0..usize::from(word(at)))
+            .map(|i| word(at + 2 + i * 2))
+            .take_while(|ch| *ch != 0)
+            .map(|ch| match ch {
+                ch @ 0x61..=0x7a => ch - 32,
+                0x5f => 0x2d,
+                ch => ch,
+            })
+            .collect()
+    };
+    let names: Vec<_> = (0..usize::from(word(header + 0x28)))
+        .map(|i| {
+            let offset = word(names + i * 8);
+            (offset, normalized(offset))
+        })
+        .collect();
+    assert!(
+        names.windows(2).all(|pair| pair[0].1 < pair[1].1),
+        "Wine's normalized name index must be unique and sorted"
+    );
+    for i in 0..usize::from(word(header + 0x1e)) {
+        let offset = word(lcids + i * 8 + 6);
+        let expected = names
+            .binary_search_by(|entry| entry.1.cmp(&normalized(offset)))
+            .unwrap();
+        let identity = names.iter().position(|entry| entry.0 == offset).unwrap();
+        assert_eq!(identity, expected, "LCID index {i}");
+    }
 }

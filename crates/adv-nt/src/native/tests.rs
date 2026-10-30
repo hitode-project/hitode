@@ -513,83 +513,6 @@ fn native_memo_tracks_pinned_storage_and_type() {
     assert_eq!(derived.get(), 2);
 }
 
-// spec: NAT-BODY-5, NAT-BODY-15
-#[test]
-fn native_nls_memo_and_output_scratch_allocate_only_when_cold() {
-    use std::{io::Write, os::fd::AsFd};
-    let mut machine = machine();
-    let context = machine
-        .spawn("nls-scratch", PARK_ADDR, &[], 0x10000)
-        .unwrap();
-    let base = 0x1000000;
-    crate::identity::note_image(
-        &mut machine.ext,
-        base,
-        0x100000,
-        Some(std::path::Path::new(
-            "fixture/lib/wine/i386-windows/kernelbase.dll",
-        )),
-        &[],
-    );
-    machine
-        .cpu
-        .map(base + 0xc0000, PAGE as u32, Prot::RW)
-        .unwrap();
-    let mut info = [0; 44];
-    info[..2].copy_from_slice(&932u16.to_le_bytes());
-    info[12..14].copy_from_slice(&1u16.to_le_bytes());
-    let tables = 0x3000000u32;
-    info[28..32].copy_from_slice(&tables.to_le_bytes());
-    info[40..44].copy_from_slice(&(tables + 512).to_le_bytes());
-    machine.cpu.write(base + 0xc0b00, &info).unwrap();
-    let path = std::env::temp_dir().join(format!("adv-native-nls-{}", std::process::id()));
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .open(&path)
-        .unwrap();
-    std::fs::remove_file(path).unwrap();
-    let mut bytes = [0; PAGE];
-    for i in 0..256 {
-        bytes[2 * i..2 * i + 2].copy_from_slice(&(i as u16).to_le_bytes());
-    }
-    file.write_all(&bytes).unwrap();
-    machine
-        .cpu
-        .map_shared_file(tables, PAGE as u32, file.as_fd(), 0, Prot::READ)
-        .unwrap();
-    let src = 0x4000000;
-    let dst = src + PAGE as u32;
-    let stack = dst + PAGE as u32;
-    machine.cpu.map(src, 3 * PAGE as u32, Prot::RW).unwrap();
-    machine.cpu.write(src, &[b'A'; 512]).unwrap();
-    machine.cpu.set_reg(Reg::Esp, stack);
-    for (i, value) in [0, 0, src, 512, dst, 512].iter().enumerate() {
-        machine
-            .cpu
-            .write_u32(stack + 4 + i as u32 * 4, *value)
-            .unwrap();
-    }
-    let mut env = Env {
-        cpu: &mut machine.cpu,
-        sys: &mut machine.sys,
-        ext: &mut machine.ext,
-        context,
-        thunk: 0,
-    };
-    assert_eq!(nls::multi_byte_to_wide_char(&mut env), Some(512));
-    ALLOCATIONS.set(0);
-    COUNTING.set(true);
-    let result = nls::multi_byte_to_wide_char(&mut env);
-    COUNTING.set(false);
-    assert_eq!(result, Some(512));
-    assert_eq!(ALLOCATIONS.get(), 0);
-    let mut output = [0; 1024];
-    env.cpu.read(dst, &mut output).unwrap();
-    assert!(output.as_chunks::<2>().0.iter().all(|ch| *ch == [b'A', 0]));
-}
-
 // spec: NAT-BODY-6, NAT-BODY-10, NAT-BODY-19
 #[test]
 fn crt_and_adler_neon_match_scalar() {
@@ -1071,4 +994,10 @@ fn crt_comparison_lengths_match_windows() {
             }
         }
     }
+}
+
+// spec: NAT-BODY-20, NAT-BODY-15, NAT-BODY-17
+#[test]
+fn comparisons_cross_pages_without_allocating() {
+    nls::check_comparison_memory(&mut machine().cpu);
 }

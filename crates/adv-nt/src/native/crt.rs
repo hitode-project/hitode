@@ -1,51 +1,9 @@
 //! Locale-independent Wine 11 PE string and memory functions.
 
-use adv_cpu::backend::{Guest, Prot};
 use adv_cpu::body::{EAX, EDX, Inline, Input, Mem, Ret, Stop};
 use adv_machine::{Conv, layout::PAGE};
 
 use super::{Body, resume_original};
-
-// Each slice stops at a guest page boundary, except an unaligned wide unit
-// straddling it, whose two page spans are checked separately.
-fn page(cpu: &dyn Guest, at: u32, width: u32, limit: u32) -> Option<&[u8]> {
-    let rest = PAGE - at % PAGE;
-    let len = (rest / width).max(1).min(limit) * width;
-    at.checked_add(len - 1)?;
-    if !cpu.accessible(at, len.min(rest), Prot::READ)
-        || (len > rest && !cpu.accessible(at + rest, len - rest, Prot::READ))
-    {
-        return None;
-    }
-    cpu.shared_bytes(at, len as usize)
-}
-
-pub(super) fn string(cpu: &dyn Guest, at: u32, width: u32) -> Option<&[u8]> {
-    let len = scan_length(cpu, at, width, u32::MAX)?
-        .checked_add(1)?
-        .checked_mul(width)?;
-    cpu.shared_bytes(at, len as usize)
-}
-
-fn scan_length(cpu: &dyn Guest, mut at: u32, width: u32, limit: u32) -> Option<u32> {
-    let mut count = 0;
-    while count < limit {
-        let bytes = page(cpu, at, width, limit - count)?;
-        let zero = if width == 1 {
-            bytes.iter().position(|&ch| ch == 0)
-        } else {
-            bytes.as_chunks::<2>().0.iter().position(|ch| *ch == [0, 0])
-        };
-        if let Some(i) = zero {
-            return count.checked_add(i as u32);
-        }
-        count += bytes.len() as u32 / width;
-        if count < limit {
-            at = at.checked_add(bytes.len() as u32)?;
-        }
-    }
-    Some(limit)
-}
 
 const ARGS: &[Input] = &[Input::Stack(0), Input::Stack(1), Input::Stack(2)];
 
