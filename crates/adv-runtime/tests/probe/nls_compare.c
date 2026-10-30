@@ -5,6 +5,7 @@
 #include <windows.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <wchar.h>
 #include <string.h>
 
 static uint32_t seed = 0x735a2d91;
@@ -18,14 +19,20 @@ static const WCHAR alphabet[] = {
 };
 static const DWORD bits[] = {1,2,4,8,0x10,0x20,0x1000,0x10000,0x20000,0x8000000,0x10000000,0x40000000};
 static unsigned count;
-static uint32_t hash = 2166136261u;
 static void result(int value) {
     DWORD error = GetLastError();
-    hash = (hash ^ (uint32_t)value) * 16777619u;
-    hash = (hash ^ error) * 16777619u;
-    if (++count % 64 == 0) printf("%u %08lx\n", count, (unsigned long)hash);
+    ++count;
+    printf("%d %08lx\n",value,(unsigned long)error);
 }
 #define CALL(expr) do { SetLastError(0x13579); result(expr); } while (0)
+static BOOL CALLBACK compare_locale_entry(WCHAR *text) {
+    LCID id=(LCID)wcstoul(text,NULL,16);
+    const WCHAR *a=L"I\x00c6" L"ch-\x00e9" L"a";
+    const WCHAR *b=L"\x0131" L"AEcH-eA";
+    CALL(CompareStringW(id,0,a,-1,b,-1));
+    CALL(CompareStringW(id,1,a,-1,b,-1));
+    return TRUE;
+}
 int main(void) {
     const LCID locales[] = {0x411,0x804,0x404,0x412,0x409,0x7f,0x400,0x800};
     const WCHAR *names[] = {L"ja-JP",L"zh-CN",L"zh-TW",L"ko-KR",L"en-US",L"",NULL,L"!x-sys-default-locale"};
@@ -123,6 +130,70 @@ int main(void) {
         CALL(CompareStringEx(L"invalid-locale",c&1?0:0x40,a,0,b,0,NULL,NULL,0));
         CALL(CompareStringA(0xdeadbeef,c&1?0:0x40,x,0,y,0));
     }
-    printf("done %u %08lx\n",count,(unsigned long)hash);
+    /* Identical strings cannot bypass any Wine flag or locale validation. */
+    for (unsigned l=0;l<8;++l) for (unsigned c=0;c<4096;++c) {
+        DWORD flags=0;
+        for (unsigned bit=0;bit<12;++bit) if(c&(1u<<bit)) flags|=bits[bit];
+        CALL(CompareStringW(locales[l],flags,L"a\0b",3,L"a\0b",3));
+        CALL(CompareStringEx(names[l],flags,L"a\0b",3,L"a\0b",3,NULL,NULL,0));
+        CALL(CompareStringA(locales[l],flags,"a\0b",3,"a\0b",3));
+        CALL(CompareStringOrdinal(L"a\0b",3,L"a\0b",3,flags));
+    }
+    const WCHAR *ends[][2] = {
+        {L"a\x0301z",L"a\x0302y"}, {L"a\x0301",L"\x00e1"},
+        {L"a\x0301z",L"az"}, {L"a\x0301-",L"a-\x0301"},
+        {L"\x304b\x3099",L"\x304c"}, {L"\x30ab\x3099",L"\x30ac"},
+        {L"\x30cf\x309a",L"\x30d1"}, {L"\xff76\xff9e",L"\x30ac"},
+        {L"\xff8a\xff9f",L"\x30d1"}, {L"\x3042\x309d",L"\x3042\x3042"},
+        {L"\x00c6z",L"AEz"}, {L"\xfb03z",L"ffiz"}, {L"\x0152z",L"OEz"},
+        {L"chz",L"cHz"}, {L"dzsz",L"dZsz"}, {L"csz",L"cSz"},
+        {L"a-b",L"ab-"}, {L"a'b",L"ab'"}, {L"a b",L"ab"},
+        {L"a\x00ad" L"b",L"ab"}, {L"a\x200b" L"b",L"ab"},
+        {L"\x3042",L"\x30a2"}, {L"A",L"\xff21"}, {L"\xff71",L"\x30a2"},
+        {L"\x00e9",L"e"}, {L"A",L"a"}, {L"a--",L"a.."},
+        {L"a\x0301\x0308",L"a\x0308\x0301"}, {L"a\0Z",L"a\0Y"}
+    };
+    const DWORD shortcut_flags[] = {0,1,2,4,8,0x10,0x20,0x11,0x22,0x1000,0x10000,0x20000,0x30000,0x30003,0x30024,0x10000000,0x08000001};
+    const LCID shortcut_locales[] = {0x411,0x409,0x40c,0xc0c,0x405,0x40e,0x40a};
+    const unsigned prefixes[] = {0,1,2,15,129,257,768};
+    for(unsigned pair=0;pair<sizeof(ends)/sizeof(*ends);++pair)
+      for(unsigned p=0;p<sizeof(prefixes)/sizeof(*prefixes);++p) {
+        unsigned prefix=prefixes[p];
+        for(unsigned i=0;i<prefix;++i) a[i]=b[i]=L"Abcd X"[i%6];
+        unsigned alen=pair==28?3:lstrlenW(ends[pair][0]), blen=pair==28?3:lstrlenW(ends[pair][1]);
+        memcpy(a+prefix,ends[pair][0],alen*2); memcpy(b+prefix,ends[pair][1],blen*2);
+        a[prefix+alen]=b[prefix+blen]=0;
+        for(unsigned l=0;l<7;++l) for(unsigned f=0;f<sizeof(shortcut_flags)/sizeof(*shortcut_flags);++f) {
+          CALL(CompareStringW(shortcut_locales[l],shortcut_flags[f],a,prefix+alen,b,prefix+blen));
+          CALL(CompareStringW(shortcut_locales[l],shortcut_flags[f],a,-1,b,-1));
+          int ac=WideCharToMultiByte(shortcut_locales[l]==0x411?932:1252,0,a,prefix+alen,x,1024,NULL,NULL);
+          int bc=WideCharToMultiByte(shortcut_locales[l]==0x411?932:1252,0,b,prefix+blen,y,1024,NULL,NULL);
+          x[ac]=y[bc]=0;
+          CALL(CompareStringA(shortcut_locales[l],shortcut_flags[f],x,ac,y,bc));
+        }
+      }
+    const DWORD invalid_flags[] = {0,0x40,0x100,0x80000000,0xffffffff};
+    const LCID invalid_locales[] = {0xdeadbeef,0xffff,0x10000409};
+    for(unsigned l=0;l<3;++l) for(unsigned f=0;f<5;++f) {
+      CALL(CompareStringW(invalid_locales[l],invalid_flags[f],L"same",-1,L"same",-1));
+      CALL(CompareStringA(invalid_locales[l],invalid_flags[f],"same",-1,"same",-1));
+      CALL(CompareStringEx(L"invalid-locale",invalid_flags[f],L"same",-1,L"same",-1,NULL,NULL,0));
+    }
+    const int lengths[] = {-2,-1,0,1,4};
+    for(unsigned i=0;i<5;++i) for(unsigned j=0;j<5;++j) for(unsigned f=0;f<5;++f) {
+      CALL(CompareStringW(0x409,invalid_flags[f],NULL,lengths[i],L"same",lengths[j]));
+      CALL(CompareStringW(0xdeadbeef,invalid_flags[f],L"same",lengths[i],NULL,lengths[j]));
+      CALL(CompareStringA(0x409,invalid_flags[f],NULL,lengths[i],"same",lengths[j]));
+    }
+    static WCHAR long_a[40004],long_b[40004];
+    const unsigned long_prefixes[] = {32765,32766,32767,32768,39900};
+    for(unsigned p=0;p<5;++p) {
+      unsigned prefix=long_prefixes[p];
+      for(unsigned i=0;i<prefix;++i) long_a[i]=long_b[i]='A';
+      memcpy(long_a+prefix,L"a-b",8); memcpy(long_b+prefix,L"ab-",8);
+      for(unsigned f=0;f<4;++f) CALL(CompareStringW(0x409,f,long_a,prefix+3,long_b,prefix+3));
+    }
+    if (!EnumSystemLocalesW(compare_locale_entry,LCID_SUPPORTED)) return 2;
+    printf("done %u\n",count);
     return 0;
 }

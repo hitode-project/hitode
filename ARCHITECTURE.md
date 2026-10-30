@@ -112,8 +112,8 @@ A guest call to a function that has a native body, such as `memcpy` or `SetEvent
 
 Wine's eight kernelbase string comparison bodies port Wine 11's collation code
 and read its loaded sort, locale and code page tables in place. ANSI sources
-use stack conversion buffers and decode long tails on demand;
-bounded stack weight buffers stream long secondary keys.
+decode on demand, and comparison levels stream weights through stack buffers.
+Byte identity and independent ordinary prefixes avoid conversion and weight work.
 Locale cache publication, code page loading and owned locale locks stay in Wine.
 The bodies' `Input::Args` names the argument block and `Input::Teb` carries FS
 base through both translated calls and the full path (NAT-BODY-20).

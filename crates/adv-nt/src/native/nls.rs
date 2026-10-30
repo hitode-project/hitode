@@ -25,13 +25,15 @@
  */
 //! Wine 11 `kernelbase/locale.c` comparison, reading Wine's NLS data in place.
 //!
-//! Function names follow Wine. Secondary keys exceeding the stack window are
-//! streamed one window at a time; ANSI sources use stack buffers rather than
-//! allocating Wine's temporary UTF-16 strings. Cold locale resolution stays in
+//! Function names follow Wine. Comparison levels stream their weights, and
+//! ANSI arguments decode directly from the caller's bytes without UTF-16 buffers.
+//! Cold locale resolution stays in
 //! Wine because it requests the registry and publishes shared cache entries.
 
 use adv_cpu::body::{EAX, Input, Mem, Ret, Stop};
 use std::mem::MaybeUninit;
+
+mod stream;
 
 type Result<T> = std::result::Result<T, Error>;
 enum Error {
@@ -405,137 +407,29 @@ fn get_codepage_table<M: Mem>(m: &mut Memory<'_, M>, base: u32, code: u32) -> Re
     Err(Stop::Guest.into())
 }
 
-// A UTF-16 view. ANSI input is decoded in place with a cursor; random access
-// for compressions and kana repeat marks replays from the nearest cursor.
+// Wine's ordinal comparison needs only a wide source and its checked page.
 struct Source {
     at: u32,
     len: u32,
-    bytes: u32,
-    cp: Option<CodePage>,
     input: ReadPage,
-    converted: [MaybeUninit<u16>; 130],
-    cursor: std::cell::Cell<(u32, u32)>,
 }
 impl Source {
     fn wide<M: Mem>(m: &mut Memory<'_, M>, at: u32, len: u32) -> Result<Self> {
-        let len = if len as i32 >= 0 {
-            len
-        } else {
+        let len = if (len as i32) < 0 {
             terminated(m, at, 2)?
+        } else {
+            len
         };
         Ok(Self {
             at,
             len,
-            bytes: 0,
-            cp: None,
             input: ReadPage::new(),
-            converted: [MaybeUninit::uninit(); 130],
-            cursor: std::cell::Cell::new((0, 0)),
         })
-    }
-    fn ansi<M: Mem>(m: &mut Memory<'_, M>, at: u32, len: u32, cp: &CodePage) -> Result<Self> {
-        let bytes = if len as i32 >= 0 {
-            len
-        } else {
-            terminated(m, at, 1)?
-        };
-        let mut source = Self {
-            at,
-            len: bytes,
-            bytes,
-            cp: Some(cp.clone()),
-            input: ReadPage::new(),
-            converted: [MaybeUninit::uninit(); 130],
-            cursor: std::cell::Cell::new((0, 0)),
-        };
-        let (mut pos, mut count) = (0, 0);
-        while pos < bytes {
-            let (scalar, size) = if cp.code == 65001 {
-                decode_utf8_char(m, at + pos, bytes - pos)?
-            } else if cp.offsets != 0 {
-                let (ch, size) = mbstowcs_dbcs(m, cp, at + pos, bytes - pos, &source.input)?;
-                (u32::from(ch), size)
-            } else {
-                (u32::from(mbstowcs_sbcs(m, cp, at + pos, &source.input)?), 1)
-            };
-            let units = if scalar > 0xffff { 2 } else { 1 };
-            if count < 130 {
-                source.converted[count as usize].write(if units == 1 {
-                    scalar as u16
-                } else {
-                    0xd800 | ((scalar - 0x10000) >> 10) as u16
-                });
-                if units == 2 && count + 1 < 130 {
-                    source.converted[count as usize + 1]
-                        .write(0xdc00 | ((scalar - 0x10000) & 0x3ff) as u16);
-                }
-                if count + units >= 130 {
-                    source.cursor.set(if count + units == 130 {
-                        (130, pos + size)
-                    } else {
-                        (count, pos)
-                    });
-                }
-            }
-            pos += size;
-            count += units;
-        }
-        source.len = count;
-        Ok(source)
     }
     #[inline(always)]
     fn get<M: Mem>(&self, m: &mut Memory<'_, M>, index: u32) -> Result<u16> {
-        let Some(cp) = self.cp.as_ref() else {
-            return self
-                .input
-                .word(m, self.at.wrapping_add(index.wrapping_mul(2)));
-        };
-        if index < 130 {
-            // SAFETY: ansi initializes every converted unit below min(len,130).
-            return Ok(unsafe { self.converted[index as usize].assume_init() });
-        }
-        if cp.code == 65001 {
-            return self.utf8(m, index);
-        }
-        if cp.offsets == 0 {
-            return mbstowcs_sbcs(m, cp, self.at + index, &self.input);
-        }
-        let (mut count, mut pos) = self.cursor.get();
-        if count > index {
-            (count, pos) = (0, 0);
-        }
-        loop {
-            let (ch, size) = mbstowcs_dbcs(m, cp, self.at + pos, self.bytes - pos, &self.input)?;
-            if count == index {
-                self.cursor.set((count + 1, pos + size));
-                return Ok(ch);
-            }
-            count += 1;
-            pos += size;
-        }
-    }
-    // Wine utf8_mbstowcs, including surrogate pairs and replacement units.
-    fn utf8<M: Mem>(&self, m: &mut Memory<'_, M>, index: u32) -> Result<u16> {
-        let (mut count, mut pos) = self.cursor.get();
-        if count > index {
-            (count, pos) = (0, 0);
-        }
-        loop {
-            let (ch, size) = decode_utf8_char(m, self.at + pos, self.bytes - pos)?;
-            let units = if ch > 0xffff { 2 } else { 1 };
-            if index < count + units {
-                self.cursor.set((count, pos));
-                return Ok(if units == 1 {
-                    ch as u16
-                } else if count == index {
-                    0xd800 | ((ch - 0x10000) >> 10) as u16
-                } else {
-                    0xdc00 | ((ch - 0x10000) & 0x3ff) as u16
-                });
-            }
-            count += units;
-            pos += size;
-        }
+        self.input
+            .word(m, self.at.wrapping_add(index.wrapping_mul(2)))
     }
 }
 // Wine strlen/lstrlenW: scan each granted page up to its zero unit.
@@ -679,15 +573,44 @@ fn compare_locale_names<M: Mem>(m: &mut Memory<'_, M>, a: u32, b: u32) -> Result
             _ => ch,
         }
     }
-    let (left, right) = (ReadPage::new(), ReadPage::new());
     let mut pos = 0;
     loop {
-        let x = fold(left.word(m, a.wrapping_add(pos))?);
-        let y = fold(right.word(m, b.wrapping_add(pos))?);
-        if x == 0 || x != y {
-            return Ok(i32::from(x) - i32::from(y));
+        let (at, bt) = (a.wrapping_add(pos), b.wrapping_add(pos));
+        let (left, right) = (m.page(at >> 12)?, m.page(bt >> 12)?);
+        let count = ((4096 - (at & 4095)).min(4096 - (bt & 4095)) / 2).max(1);
+        for i in 0..count {
+            let (x, y) = if (at & 4095) == 4095
+                || (bt & 4095) == 4095
+                || (!M::WINDOW && (left.is_null() || right.is_null()))
+            {
+                (
+                    m.word(at.wrapping_add(i * 2))?,
+                    m.word(bt.wrapping_add(i * 2))?,
+                )
+            } else {
+                // SAFETY: every complete wide unit lies in its granted page.
+                unsafe {
+                    (
+                        u16::from_le(
+                            left.add(((at & 4095) + i * 2) as usize)
+                                .cast::<u16>()
+                                .read_unaligned(),
+                        ),
+                        u16::from_le(
+                            right
+                                .add(((bt & 4095) + i * 2) as usize)
+                                .cast::<u16>()
+                                .read_unaligned(),
+                        ),
+                    )
+                }
+            };
+            let (x, y) = (fold(x), fold(y));
+            if x == 0 || x != y {
+                return Ok(i32::from(x) - i32::from(y));
+            }
         }
-        pos += 2;
+        pos += count * 2;
     }
 }
 // Wine find_lcid_entry.
@@ -709,6 +632,63 @@ fn find_lcid_entry<M: Mem>(m: &mut Memory<'_, M>, base: u32, lcid: u32) -> Resul
     }
     Ok(None)
 }
+// LCID resolution passes a name from Wine's own string pool. Its unique
+// shared offset identifies the same LCNAME entry as Wine's lexical search;
+// the pinned-data test checks uniqueness under compare_locale_names. Scan the
+// loaded records in place, without building a reverse index or copying names.
+fn find_lcname_offset<M: Mem>(
+    m: &mut Memory<'_, M>,
+    index: u32,
+    count: u32,
+    offset: u16,
+) -> Result<Option<u32>> {
+    let mut pos = 0;
+    while pos < count {
+        let at = index + pos * lcname_index::SIZE;
+        let pointer = m.page(at >> 12)?;
+        let room = ((4096 - (at & 4095)) / lcname_index::SIZE).min(count - pos);
+        if room == 0 || (!M::WINDOW && pointer.is_null()) {
+            if m.word(at + lcname_index::name)? == offset {
+                return Ok(Some(pos));
+            }
+            pos += 1;
+            continue;
+        }
+        // SAFETY: these complete records are in a retained readable page.
+        let pointer = unsafe { pointer.add((at & 4095) as usize) };
+        let mut i = 0;
+        #[cfg(target_arch = "aarch64")]
+        while i + 8 <= room {
+            use std::arch::aarch64::*;
+            // SAFETY: NEON is baseline AArch64; ld4 reads eight eight-byte
+            // records in this checked range and selects their name fields.
+            let (low, high) = unsafe {
+                let names = vld4q_u16(pointer.add((i * 8) as usize).cast::<u16>()).0;
+                let mask = vreinterpretq_u64_u16(vceqq_u16(names, vdupq_n_u16(offset)));
+                (vgetq_lane_u64::<0>(mask), vgetq_lane_u64::<1>(mask))
+            };
+            if low != 0 {
+                return Ok(Some(pos + i + low.trailing_zeros() / 16));
+            }
+            if high != 0 {
+                return Ok(Some(pos + i + 4 + high.trailing_zeros() / 16));
+            }
+            i += 8;
+        }
+        while i < room {
+            // SAFETY: the name word is inside this checked record.
+            let name = unsafe {
+                u16::from_le(pointer.add((i * 8) as usize).cast::<u16>().read_unaligned())
+            };
+            if name == offset {
+                return Ok(Some(pos + i));
+            }
+            i += 1;
+        }
+        pos += room;
+    }
+    Ok(None)
+}
 // Wine find_lcname_entry.
 fn find_lcname_entry<M: Mem>(
     m: &mut Memory<'_, M>,
@@ -718,10 +698,17 @@ fn find_lcname_entry<M: Mem>(
     let header = m.dword(base + kb::locale_table)?;
     let index = m.dword(base + kb::lcnames_index)?;
     let strings = m.dword(base + kb::locale_strings)?;
-    let (mut min, mut max) = (
-        0i32,
-        i32::from(m.word(header + locale_header::nb_lcnames)?) - 1,
-    );
+    let count = u32::from(m.word(header + locale_header::nb_lcnames)?);
+    let delta = name.wrapping_sub(strings.wrapping_add(2));
+    if delta <= u32::from(u16::MAX) * 2
+        && delta & 1 == 0
+        && let Some(pos) = find_lcname_offset(m, index, count, (delta / 2) as u16)?
+    {
+        return Ok(Some((index + pos * lcname_index::SIZE, pos)));
+    }
+    // Other pointers, including equal text stored at a different pool offset,
+    // still need Wine's content comparison rather than pointer identity.
+    let (mut min, mut max) = (0i32, count as i32 - 1);
     while min <= max {
         let pos = (min + max) / 2;
         let at = index + pos as u32 * lcname_index::SIZE;
@@ -859,14 +846,23 @@ struct SortId {
 }
 impl SortId {
     fn load<M: Mem>(m: &mut Memory<'_, M>, at: u32, flags: u32) -> Result<Self> {
-        let mut except = m.dword(at + sortguid::except)?;
-        let ling_except = m.dword(at + sortguid::ling_except)?;
+        let fields = m.read::<16>(at + sortguid::flags)?;
+        let field = |offset: u32| {
+            u32::from_le_bytes(
+                fields
+                    [(offset - sortguid::flags) as usize..(offset - sortguid::flags) as usize + 4]
+                    .try_into()
+                    .unwrap(),
+            )
+        };
+        let mut except = field(sortguid::except);
+        let ling_except = field(sortguid::ling_except);
         if flags & LING_CASING != 0 && except != 0 && ling_except != 0 {
             except = ling_except;
         }
         Ok(Self {
-            flags: m.dword(at + sortguid::flags)?,
-            compr: m.dword(at + sortguid::compr)?,
+            flags: field(sortguid::flags),
+            compr: field(sortguid::compr),
             except,
         })
     }
@@ -875,11 +871,7 @@ struct Sort {
     index_page: ReadPage,
     key_page: ReadPage,
     keys: u32,
-    expansions: u32,
-    compressions: u32,
-    compr_data: u32,
-    jamo: u32,
-    compr_count: u32,
+    at: u32,
 }
 impl Sort {
     fn load<M: Mem>(m: &mut Memory<'_, M>, base: u32) -> Result<Self> {
@@ -888,11 +880,7 @@ impl Sort {
             index_page: ReadPage::new(),
             key_page: ReadPage::new(),
             keys: m.dword(at + sort::keys)?,
-            expansions: m.dword(at + sort::expansions)?,
-            compressions: m.dword(at + sort::compressions)?,
-            compr_data: m.dword(at + sort::compr_data)?,
-            jamo: m.dword(at + sort::jamo)?,
-            compr_count: m.dword(at + sort::compr_count)?,
+            at,
         })
     }
 }
@@ -932,296 +920,6 @@ fn get_char_weights<M: Mem>(
     Ok(sort.key_page.dword(m, sort.keys + index * 4)?.into())
 }
 
-const KEY_WINDOW: usize = 128;
-// Wine sortkey, with a bounded capture window instead of new_buf. Logical
-// lengths and the last mutable weight survive even outside that window.
-struct SortKey {
-    buf: [MaybeUninit<u8>; KEY_WINDOW],
-    window: u32,
-    len: u32,
-    max: u32,
-    last: u8,
-    significant: u32,
-    first_significant: u32,
-    ignore: u8,
-    start: u32,
-    end: u32,
-    reverse: bool,
-}
-impl SortKey {
-    fn new(max: u32, window: u32, ignore: u8) -> Self {
-        Self {
-            buf: [MaybeUninit::uninit(); KEY_WINDOW],
-            window,
-            len: 0,
-            max,
-            last: 0,
-            significant: 0,
-            first_significant: u32::MAX,
-            ignore,
-            start: 0,
-            end: 0,
-            reverse: false,
-        }
-    }
-    #[inline(always)]
-    fn ignored(&self, value: u8) -> bool {
-        if self.ignore == 2 {
-            value <= 2
-        } else {
-            value == self.ignore
-        }
-    }
-    #[inline(always)]
-    fn capture(&mut self, index: u32, value: u8) {
-        if let Some(offset) = index.checked_sub(self.window)
-            && offset < KEY_WINDOW as u32
-        {
-            self.buf[offset as usize].write(value);
-        }
-    }
-    #[inline(always)]
-    fn value(&self, index: u32) -> Option<u8> {
-        let offset = index.checked_sub(self.window)?;
-        if offset >= KEY_WINDOW as u32 {
-            return None;
-        }
-        // SAFETY: callers request only emitted weights in the capture window.
-        Some(unsafe { self.buf[offset as usize].assume_init() })
-    }
-    #[inline(always)]
-    fn finish_last(&mut self) {
-        if self.len != 0 && !self.ignored(self.last) {
-            self.significant = self.len;
-            self.first_significant = self.first_significant.min(self.len - 1);
-        }
-    }
-    fn trim(&mut self, reverse: bool) {
-        if self.window == 0 && self.len <= KEY_WINDOW as u32 {
-            self.reverse = reverse;
-            self.start = 0;
-            self.end = self.len;
-            if reverse {
-                while self.start < self.end && self.ignored(self.value(self.start).unwrap()) {
-                    self.start += 1;
-                }
-            } else {
-                while self.end > self.start && self.ignored(self.value(self.end - 1).unwrap()) {
-                    self.end -= 1;
-                }
-            }
-            return;
-        }
-        self.finish_last();
-        self.reverse = reverse;
-        if reverse {
-            self.start = self.first_significant.min(self.len);
-            self.end = self.len;
-        } else {
-            self.start = 0;
-            self.end = self.significant;
-        }
-    }
-    fn size(&self) -> u32 {
-        self.end - self.start
-    }
-    fn index(&self, i: u32) -> u32 {
-        if self.reverse {
-            self.end - 1 - i
-        } else {
-            self.start + i
-        }
-    }
-}
-// Wine append_sortkey. Allocation is replaced by streaming capture windows.
-#[inline(always)]
-fn append_sortkey(key: &mut SortKey, val: u8) {
-    if key.len >= key.max {
-        return;
-    }
-    if key.window == 0 && key.len < KEY_WINDOW as u32 {
-        key.buf[key.len as usize].write(val);
-        key.len += 1;
-        return;
-    }
-    if key.window == 0 && key.len == KEY_WINDOW as u32 {
-        for i in 0..key.len - 1 {
-            let value = key.value(i).unwrap();
-            if !key.ignored(value) {
-                key.significant = i + 1;
-                key.first_significant = key.first_significant.min(i);
-            }
-        }
-        key.last = key.value(key.len - 1).unwrap();
-    }
-    key.finish_last();
-    key.capture(key.len, val);
-    key.last = val;
-    key.len += 1;
-}
-
-struct SortKeyState {
-    key_primary: SortKey,
-    key_diacritic: SortKey,
-    key_case: SortKey,
-    key_special: SortKey,
-    key_extra: [SortKey; 4],
-    primary_pos: u32,
-}
-// Wine init_sortkey_state.
-fn init_sortkey_state(flags: u32, len: u32, window: u32) -> SortKeyState {
-    let nonspace = flags & IGNORENONSPACE == 0;
-    SortKeyState {
-        key_primary: SortKey::new(len.wrapping_mul(8), 0, 0),
-        key_diacritic: SortKey::new(if nonspace { len.wrapping_mul(3) } else { 0 }, window, 2),
-        key_case: SortKey::new(len.wrapping_mul(3), window, 2),
-        key_special: SortKey::new(len.wrapping_mul(4), window, 0),
-        key_extra: std::array::from_fn(|i| {
-            SortKey::new(
-                if i < 2 && !nonspace { 0 } else { len },
-                window,
-                [0xc6, 3, 0xe4, 0xc5][i],
-            )
-        }),
-        primary_pos: 0,
-    }
-}
-// Wine append_normal_weights.
-#[inline(always)]
-fn append_normal_weights(id: SortId, state: &mut SortKeyState, mut w: Weights, flags: u32) {
-    append_sortkey(&mut state.key_primary, w.script);
-    append_sortkey(&mut state.key_primary, w.primary);
-    if (169..=175).contains(&w.script) || (id.flags & 1 != 0 && (192..=239).contains(&w.script)) {
-        append_sortkey(&mut state.key_primary, w.diacritic);
-        append_sortkey(&mut state.key_case, w.case);
-        return;
-    }
-    if w.script <= 41 && w.script != 40 {
-        if flags & LING_IGNOREDIACRITIC != 0 {
-            w.diacritic = 2;
-        }
-        if flags & LING_IGNORECASE != 0 {
-            w.case = 2;
-        }
-    }
-    append_sortkey(&mut state.key_diacritic, w.diacritic);
-    append_sortkey(&mut state.key_case, w.case);
-}
-// Wine append_nonspace_weights.
-#[inline(always)]
-fn append_nonspace_weights(key: &mut SortKey, mut w: Weights, flags: u32) {
-    if flags & LING_IGNOREDIACRITIC != 0 {
-        w.diacritic = 2;
-    }
-    if key.len != 0 {
-        if key.window == 0 && key.len <= KEY_WINDOW as u32 {
-            key.capture(
-                key.len - 1,
-                key.value(key.len - 1).unwrap().wrapping_add(w.diacritic),
-            );
-            return;
-        }
-        key.last = key.last.wrapping_add(w.diacritic);
-        key.capture(key.len - 1, key.last);
-    } else {
-        append_sortkey(key, w.diacritic);
-    }
-}
-// Wine append_expansion_weights, is_compare TRUE.
-fn append_expansion_weights(id: SortId, state: &mut SortKeyState, w: Weights, flags: u32) {
-    match w.script {
-        0 => (),
-        1 => append_nonspace_weights(&mut state.key_diacritic, w, flags),
-        _ => append_normal_weights(id, state, w, flags),
-    }
-}
-// Wine compression_size.
-fn compression_size(len: u32) -> u32 {
-    2 + len + (len & 1)
-}
-// Wine find_compression, including wcsncmp's embedded-zero termination.
-fn find_compression<M: Mem>(
-    m: &mut Memory<'_, M>,
-    src: &Source,
-    pos: u32,
-    table: u32,
-    count: u16,
-    len: u32,
-) -> Result<Option<Weights>> {
-    let size = compression_size(len);
-    let (mut min, mut max) = (0i32, i32::from(count) - 1);
-    while min <= max {
-        let mid = (min + max) / 2;
-        let at = table + mid as u32 * size * 2;
-        let mut res = 0;
-        for i in 0..len {
-            let a = src.get(m, pos + i)?;
-            let b = m.word(at + i * 2)?;
-            res = i32::from(a) - i32::from(b);
-            if a == 0 || res != 0 {
-                break;
-            }
-        }
-        if res == 0 {
-            return Ok(Some(
-                m.dword(table + (mid as u32 + 1) * size * 2 - 4)?.into(),
-            ));
-        }
-        if res > 0 {
-            min = mid + 1;
-        } else {
-            max = mid - 1;
-        }
-    }
-    Ok(None)
-}
-// Wine get_compression_weights.
-fn get_compression_weights<M: Mem>(
-    m: &mut Memory<'_, M>,
-    sort: &Sort,
-    compression: u32,
-    tables: &mut [u32; 8],
-    src: &Source,
-    pos: u32,
-    w: &mut Weights,
-) -> Result<u32> {
-    if compression >= sort.compr_count {
-        return Ok(0);
-    }
-    let compr = sort.compressions + compression * compression::SIZE;
-    let maxlen = match w.case & 0xc0 {
-        0xc0 => 8,
-        0x80 => 5,
-        0x40 => 3,
-        _ => 1,
-    };
-    let mut maxlen = maxlen.min(src.len - pos);
-    let minchar = m.word(compr + compression::minchar)?;
-    let maxchar = m.word(compr + compression::maxchar)?;
-    for i in 0..maxlen {
-        let ch = src.get(m, pos + i)?;
-        if ch < minchar || ch > maxchar {
-            maxlen = i;
-            break;
-        }
-    }
-    if tables[0] == 0 {
-        tables[0] = sort.compr_data + 2 * m.dword(compr + compression::offset)?;
-        for i in 1..8 {
-            tables[i] = tables[i - 1]
-                + 2 * u32::from(m.word(compr + compression::len + 2 * (i as u32 - 1))?)
-                    * compression_size(i as u32 + 1);
-        }
-    }
-    for i in (0..maxlen.saturating_sub(1)).rev() {
-        let count = m.word(compr + compression::len + 2 * i)?;
-        if let Some(found) = find_compression(m, src, pos, tables[i as usize], count, i + 2)? {
-            *w = found;
-            return Ok(i + 1);
-        }
-    }
-    Ok(0)
-}
 // Wine get_digit_zero_char.
 fn get_digit_zero_char(ch: u16) -> u16 {
     const ZEROES: [u16; 28] = [
@@ -1236,322 +934,6 @@ fn get_digit_zero_char(ch: u16) -> u16 {
         0
     }
 }
-// Wine append_digit_weights.
-fn append_digit_weights<M: Mem>(
-    m: &mut Memory<'_, M>,
-    key: &mut SortKey,
-    src: &Source,
-    pos: u32,
-) -> Result<Option<u32>> {
-    let first = src.get(m, pos)?;
-    let zero = get_digit_zero_char(first);
-    if zero == 0 {
-        return Ok(None);
-    }
-    let mut values = [0u8; 19];
-    values[0] = (first - zero) as u8;
-    let mut len = 1;
-    while len < 19 && len < src.len - pos {
-        let ch = src.get(m, pos + len)?;
-        if ch < zero || ch > zero + 9 {
-            break;
-        }
-        values[len as usize] = (ch - zero) as u8;
-        len += 1;
-    }
-    let leading = values[..len as usize]
-        .iter()
-        .position(|v| *v != 0)
-        .unwrap_or(len as usize) as u32;
-    for v in [13, 2, (2 + len - leading) as u8] {
-        append_sortkey(key, v);
-    }
-    let mut val = 2u8;
-    for i in leading..len {
-        if (len - i) % 2 != 0 {
-            append_sortkey(
-                key,
-                (val << 4).wrapping_add(values[i as usize]).wrapping_add(2),
-            );
-        } else {
-            val = values[i as usize] + 2;
-        }
-    }
-    append_sortkey(key, (0xfe - leading) as u8);
-    Ok(Some(len - 1))
-}
-// Wine append_extra_kana_weights.
-#[allow(clippy::too_many_arguments)]
-fn append_extra_kana_weights<M: Mem>(
-    m: &mut Memory<'_, M>,
-    sort: &Sort,
-    keys: &mut [SortKey; 4],
-    src: &Source,
-    mut pos: u32,
-    except: u32,
-    case_mask: u8,
-    w: &mut Weights,
-) -> Result<bool> {
-    let mut extra1 = 3;
-    let mut case_weight = w.case;
-    if w.primary <= 1 {
-        loop {
-            if pos == 0 {
-                return Ok(false);
-            }
-            pos -= 1;
-            let ch = src.get(m, pos)?;
-            let mut prev = get_char_weights(m, sort, ch, except)?;
-            if prev.script <= 1 {
-                continue;
-            }
-            if prev.script == 2 {
-                return Ok(false);
-            }
-            if prev.script != 3 {
-                *w = prev;
-                return Ok(true);
-            }
-            if prev.primary <= 1 {
-                continue;
-            }
-            case_weight = prev.case & case_mask;
-            if w.primary == 1 {
-                prev.primary &= 0x87;
-                case_weight = (case_weight & !1) | (w.case & 1);
-            }
-            extra1 = 4 + w.primary;
-            w.primary = prev.primary;
-            break;
-        }
-    }
-    for (key, value) in keys.iter_mut().zip([
-        0xc4 | (case_weight & 2),
-        extra1,
-        0xc4 | (case_weight & 0x20),
-        0xc4 | (case_weight & 1),
-    ]) {
-        append_sortkey(key, value);
-    }
-    w.script = 34;
-    Ok(true)
-}
-// Wine append_hangul_weights.
-fn append_hangul_weights<M: Mem>(
-    m: &mut Memory<'_, M>,
-    sort: &Sort,
-    key: &mut SortKey,
-    src: &Source,
-    start: u32,
-    except: u32,
-) -> Result<u32> {
-    let (mut leading, mut vowel, mut trailing) = (0x5f, 0x60, None);
-    let mut pos = start;
-    let ch = src.get(m, pos)?;
-    if (0x1100..=0x115f).contains(&ch) {
-        leading = u32::from(ch - 0x1100);
-        pos += 1;
-    } else if (0xa960..=0xa97c).contains(&ch) {
-        leading = u32::from(ch - (0xa960 - 0x100));
-        pos += 1;
-    }
-    if pos < src.len {
-        let ch = src.get(m, pos)?;
-        if (0x1160..=0x11a7).contains(&ch) {
-            vowel = u32::from(ch - 0x1100);
-            pos += 1;
-        } else if (0xd7b0..=0xd7c6).contains(&ch) {
-            vowel = u32::from(ch - (0xd7b0 - 0x11d));
-            pos += 1;
-        }
-    }
-    if pos < src.len {
-        let ch = src.get(m, pos)?;
-        if (0x11a8..=0x11ff).contains(&ch) {
-            trailing = Some(u32::from(ch - 0x1100));
-            pos += 1;
-        } else if (0xd7cb..=0xd7fb).contains(&ch) {
-            trailing = Some(u32::from(ch - (0xd7cb - 0x134)));
-            pos += 1;
-        }
-    }
-    let jamo = |m: &mut Memory<'_, M>, index| {
-        m.read::<{ jamo::SIZE as usize }>(sort.jamo + index * jamo::SIZE)
-    };
-    let mut l = jamo(m, leading)?;
-    let mut v = jamo(m, vowel)?;
-    let mut t = if let Some(t) = trailing {
-        jamo(m, t)?
-    } else {
-        [0; 8]
-    };
-    if l[jamo::is_old] == 0 && v[jamo::is_old] == 0 && t[jamo::is_old] == 0 {
-        pos = start + 1;
-        vowel = 0x60;
-        trailing = None;
-        v = jamo(m, vowel)?;
-        t = [0; 8];
-    }
-    let leading_off = l[jamo::leading].max(v[jamo::leading]);
-    let vowel_off = l[jamo::vowel].max(v[jamo::vowel]);
-    let trailing_off = l[jamo::trailing]
-        .max(v[jamo::trailing])
-        .max(t[jamo::trailing]);
-    let mut composed = 0xac00u16.wrapping_add(
-        (u16::from(leading_off) * 21 + u16::from(vowel_off)) * 28 + u16::from(trailing_off),
-    );
-    let filler = if leading == 0x5f || vowel == 0x60 {
-        composed = composed.wrapping_sub(1);
-        0x80
-    } else {
-        0
-    };
-    if composed < 0xac00 {
-        composed = 0x3260;
-    }
-    let w = get_char_weights(m, sort, composed, except)?;
-    l[jamo::weight] |= filler;
-    for value in [
-        w.script,
-        w.primary,
-        0xff,
-        l[jamo::weight],
-        0xff,
-        v[jamo::weight],
-        0xff,
-        if trailing.is_some() {
-            t[jamo::weight]
-        } else {
-            2
-        },
-    ] {
-        append_sortkey(key, value);
-    }
-    Ok(pos - start - 1)
-}
-
-// Wine append_weights, is_compare TRUE.
-#[allow(clippy::too_many_arguments)]
-fn append_weights<M: Mem>(
-    m: &mut Memory<'_, M>,
-    sort: &Sort,
-    id: SortId,
-    flags: u32,
-    src: &Source,
-    pos: u32,
-    case_mask: u8,
-    tables: &mut [u32; 8],
-    s: &mut SortKeyState,
-) -> Result<u32> {
-    let ch = src.get(m, pos)?;
-    let mut w = get_char_weights(m, sort, ch, id.except)?;
-    let mut index = (u16::from(w.case & !0xc0) << 8) | u16::from(w.diacritic);
-    let mut ret = 1;
-    if w.case & 0xc0 != 0 {
-        ret += get_compression_weights(m, sort, id.compr, tables, src, pos, &mut w)?;
-    }
-    w.case &= case_mask;
-    match w.script {
-        0 => (),
-        1 => append_nonspace_weights(&mut s.key_diacritic, w, flags),
-        2 => {
-            while w.script == 2 {
-                let ch =
-                    m.word(sort.expansions + u32::from(index) * expansion::SIZE + expansion::exp)?;
-                w = get_char_weights(m, sort, ch, id.except)?;
-                w.case &= case_mask;
-                append_expansion_weights(id, s, w, flags);
-                let ch = m.word(
-                    sort.expansions + u32::from(index) * expansion::SIZE + expansion::exp + 2,
-                )?;
-                w = get_char_weights(m, sort, ch, id.except)?;
-                index = (u16::from(w.case) << 8) | u16::from(w.diacritic);
-                w.case &= case_mask;
-            }
-            append_expansion_weights(id, s, w, flags);
-        }
-        3 => {
-            if append_extra_kana_weights(
-                m,
-                sort,
-                &mut s.key_extra,
-                src,
-                pos,
-                id.except,
-                case_mask,
-                &mut w,
-            )? {
-                w.case = 2;
-                append_normal_weights(id, s, w, flags);
-            } else {
-                append_sortkey(&mut s.key_primary, 0xff);
-                append_sortkey(&mut s.key_primary, 0xff);
-            }
-        }
-        4 => {
-            ret += append_hangul_weights(m, sort, &mut s.key_primary, src, pos, id.except)?;
-            append_sortkey(&mut s.key_diacritic, 2);
-            append_sortkey(&mut s.key_case, 2);
-        }
-        5 => {
-            for value in [0xfd, 0xff, w.primary, w.diacritic] {
-                append_sortkey(&mut s.key_primary, value);
-            }
-            append_sortkey(&mut s.key_diacritic, 2);
-            append_sortkey(&mut s.key_case, 2);
-        }
-        6 if flags & IGNORESYMBOLS == 0 && flags & STRINGSORT == 0 => {
-            let len = (-(i64::from(s.key_primary.len) + i64::from(s.primary_pos)) / 2 - 1) as i16;
-            if flags & LING_IGNORECASE != 0 {
-                w.case = 2;
-            }
-            if flags & LING_IGNOREDIACRITIC != 0 {
-                w.diacritic = 2;
-            }
-            for value in [
-                (len >> 8) as u8,
-                len as u8,
-                w.primary,
-                w.case | w.diacritic.wrapping_shl(3),
-            ] {
-                append_sortkey(&mut s.key_special, value);
-            }
-        }
-        6..=12 => {
-            if flags & IGNORESYMBOLS == 0 {
-                append_sortkey(&mut s.key_primary, w.script);
-                append_sortkey(&mut s.key_primary, w.primary);
-                append_sortkey(&mut s.key_diacritic, w.diacritic);
-                append_sortkey(&mut s.key_case, w.case);
-            }
-        }
-        13 if flags & DIGITSASNUMBERS != 0 => {
-            if let Some(extra) = append_digit_weights(m, &mut s.key_primary, src, pos)? {
-                ret += extra;
-                append_sortkey(&mut s.key_diacritic, w.diacritic);
-                append_sortkey(&mut s.key_case, w.case);
-            } else {
-                append_normal_weights(id, s, w, flags);
-            }
-        }
-        _ => append_normal_weights(id, s, w, flags),
-    }
-    Ok(ret)
-}
-// Wine remove_unneeded_weights and reverse_sortkey. Reversal is a view so
-// even arbitrarily long French diacritic keys need no allocated buffer.
-fn remove_unneeded_weights(id: SortId, state: &mut SortKeyState) -> bool {
-    state.key_special.end = state.key_special.len;
-    state.key_diacritic.trim(id.flags & 0x10 != 0);
-    state.key_case.trim(false);
-    let have_extra = state.key_extra[2].len != 0;
-    if have_extra {
-        for key in &mut state.key_extra {
-            key.trim(false);
-        }
-    }
-    have_extra
-}
 fn case_mask(flags: u32) -> u8 {
     let mut mask = 0x3f;
     if flags & IGNORECASE != 0 {
@@ -1564,262 +946,6 @@ fn case_mask(flags: u32) -> u8 {
         mask &= !0x20;
     }
     mask
-}
-fn secondary(state: &mut SortKeyState, index: usize) -> &mut SortKey {
-    match index {
-        0 => &mut state.key_diacritic,
-        1 => &mut state.key_case,
-        2..=5 => &mut state.key_extra[index - 2],
-        _ => &mut state.key_special,
-    }
-}
-// Stream one secondary key through the bounded stack window. Keep its last
-// byte pending until the next weight or end of input: a nonspace mark can
-// still add to that byte. Other key streams are discarded as they are emitted.
-struct KeyStream {
-    state: SortKeyState,
-    tables: [u32; 8],
-    pos: u32,
-    key: usize,
-}
-impl KeyStream {
-    fn new(flags: u32, len: u32, key: usize, first: u32) -> Self {
-        Self {
-            state: init_sortkey_state(flags, len, first),
-            tables: [0; 8],
-            pos: 0,
-            key,
-        }
-    }
-    #[allow(clippy::too_many_arguments)]
-    fn value<M: Mem>(
-        &mut self,
-        m: &mut Memory<'_, M>,
-        sort: &Sort,
-        id: SortId,
-        flags: u32,
-        src: &Source,
-        index: u32,
-    ) -> Result<u8> {
-        while self.pos < src.len && secondary(&mut self.state, self.key).len <= index + 1 {
-            let key = secondary(&mut self.state, self.key);
-            if key.len.saturating_sub(key.window) > KEY_WINDOW as u32 - 8 {
-                // Wine reserves at most three case/diacritic bytes or four
-                // special bytes per source unit. Leave eight emission slots.
-                key.last = key.value(key.len - 1).unwrap();
-                let from = (index - key.window) as usize;
-                let count = (key.len - index) as usize;
-                key.buf.copy_within(from..from + count, 0);
-                key.window = index;
-            }
-            self.pos += append_weights(
-                m,
-                sort,
-                id,
-                flags,
-                src,
-                self.pos,
-                case_mask(flags),
-                &mut self.tables,
-                &mut self.state,
-            )?;
-            self.state.primary_pos = self
-                .state
-                .primary_pos
-                .wrapping_add(self.state.key_primary.len);
-            self.state.key_primary.len = 0;
-        }
-        Ok(secondary(&mut self.state, self.key).value(index).unwrap())
-    }
-}
-#[allow(clippy::too_many_arguments)]
-fn compare_long_sortkeys<M: Mem>(
-    m: &mut Memory<'_, M>,
-    sort: &Sort,
-    id: SortId,
-    flags: u32,
-    sources: [&Source; 2],
-    keys: [&SortKey; 2],
-    index: usize,
-    shorter_wins: bool,
-) -> Result<i32> {
-    let [a, b] = keys;
-    let size = a.size().min(b.size());
-    let first_a = if a.reverse { a.end - size } else { a.start };
-    let first_b = if b.reverse { b.end - size } else { b.start };
-    let mut left = KeyStream::new(flags, sources[0].len, index, first_a);
-    let mut right = KeyStream::new(flags, sources[1].len, index, first_b);
-    let mut difference = 0;
-    for i in 0..size {
-        let x = left.value(m, sort, id, flags, sources[0], first_a + i)?;
-        let y = right.value(m, sort, id, flags, sources[1], first_b + i)?;
-        let diff = i32::from(x) - i32::from(y);
-        if diff != 0 {
-            if !a.reverse {
-                return Ok(diff);
-            }
-            // Reversed diacritics compare from the end: the last forward
-            // difference is the first difference in Wine's reversed buffers.
-            difference = diff;
-        }
-    }
-    if difference != 0 {
-        return Ok(difference);
-    }
-    let order = a.size().cmp(&b.size()) as i32;
-    Ok(if shorter_wins { -order } else { order })
-}
-// Wine compare_sortkeys. Long keys use ordered streams; reversed diacritics
-// use the last forward difference, with suffix alignment from their lengths.
-#[allow(clippy::too_many_arguments)]
-fn compare_sortkeys<M: Mem>(
-    m: &mut Memory<'_, M>,
-    sort: &Sort,
-    id: SortId,
-    flags: u32,
-    sources: [&Source; 2],
-    keys: [&mut SortKey; 2],
-    index: usize,
-    shorter_wins: bool,
-) -> Result<i32> {
-    let [a, b] = keys;
-    if a.end > KEY_WINDOW as u32 || b.end > KEY_WINDOW as u32 {
-        return compare_long_sortkeys(m, sort, id, flags, sources, [a, b], index, shorter_wins);
-    }
-    for i in 0..a.size().min(b.size()) {
-        let diff =
-            i32::from(a.value(a.index(i)).unwrap()) - i32::from(b.value(b.index(i)).unwrap());
-        if diff != 0 {
-            return Ok(diff);
-        }
-    }
-    let order = a.size().cmp(&b.size()) as i32;
-    Ok(if shorter_wins { -order } else { order })
-}
-// Equal UTF-16 streams have equal Wine keys. For ignore-case pairs, the
-// ordinary append_normal_weights case is also equal when every masked weight
-// agrees. Compression starters and context-dependent scripts use compare_string.
-fn equal_weights<M: Mem>(
-    m: &mut Memory<'_, M>,
-    sort: &Sort,
-    id: SortId,
-    flags: u32,
-    a: &Source,
-    b: &Source,
-) -> Result<bool> {
-    if a.len != b.len {
-        return Ok(false);
-    }
-    let mut equal = true;
-    for i in 0..a.len {
-        if a.get(m, i)? != b.get(m, i)? {
-            equal = false;
-            break;
-        }
-    }
-    if equal {
-        return Ok(true);
-    }
-    if flags & IGNORECASE == 0 {
-        return Ok(false);
-    }
-    let mask = case_mask(flags);
-    for i in 0..a.len {
-        let (x, y) = (a.get(m, i)?, b.get(m, i)?);
-        let wx = get_char_weights(m, sort, x, id.except)?;
-        if (wx.case & 0xc0 != 0 && id.compr < sort.compr_count)
-            || (wx.script < 14 && !((6..=12).contains(&wx.script) && x == y))
-        {
-            return Ok(false);
-        }
-        let wy = if x == y {
-            wx
-        } else {
-            get_char_weights(m, sort, y, id.except)?
-        };
-        if wy.case & 0xc0 != 0
-            || wx.primary != wy.primary
-            || wx.script != wy.script
-            || wx.diacritic != wy.diacritic
-            || wx.case & mask != wy.case & mask
-        {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-// Wine compare_string. Its primary keys are consumed incrementally; the
-// secondary keys retain their logical lengths and bounded stack captures.
-fn compare_string<M: Mem>(
-    m: &mut Memory<'_, M>,
-    sort: &Sort,
-    id: SortId,
-    flags: u32,
-    a: &Source,
-    b: &Source,
-) -> Result<i32> {
-    let (mut s1, mut s2) = (
-        init_sortkey_state(flags, a.len, 0),
-        init_sortkey_state(flags, b.len, 0),
-    );
-    let (mut pos1, mut pos2) = (0, 0);
-    let mut tables = [0; 8];
-    let mask = case_mask(flags);
-    while pos1 < a.len || pos2 < b.len {
-        while pos1 < a.len && s1.key_primary.len == 0 {
-            pos1 += append_weights(m, sort, id, flags, a, pos1, mask, &mut tables, &mut s1)?;
-        }
-        while pos2 < b.len && s2.key_primary.len == 0 {
-            pos2 += append_weights(m, sort, id, flags, b, pos2, mask, &mut tables, &mut s2)?;
-        }
-        let len = s1.key_primary.len.min(s2.key_primary.len);
-        if len == 0 {
-            break;
-        }
-        for i in 0..len {
-            let diff = i32::from(s1.key_primary.value(i).unwrap())
-                - i32::from(s2.key_primary.value(i).unwrap());
-            if diff != 0 {
-                return Ok(diff);
-            }
-        }
-        for state in [&mut s1, &mut s2] {
-            let key = &mut state.key_primary;
-            for i in len..key.len {
-                key.capture(i - len, key.value(i).unwrap());
-            }
-            key.len -= len;
-            state.primary_pos = state.primary_pos.wrapping_add(len);
-        }
-    }
-    let order = s1.key_primary.len.cmp(&s2.key_primary.len) as i32;
-    if order != 0 {
-        return Ok(order);
-    }
-    let extra1 = remove_unneeded_weights(id, &mut s1);
-    let extra2 = remove_unneeded_weights(id, &mut s2);
-    for index in 0..7 {
-        if index == 2 && extra1 != extra2 {
-            return Ok(i32::from(extra1) - i32::from(extra2));
-        }
-        if (2..6).contains(&index) && !extra1 {
-            continue;
-        }
-        let diff = compare_sortkeys(
-            m,
-            sort,
-            id,
-            flags,
-            [a, b],
-            [secondary(&mut s1, index), secondary(&mut s2, index)],
-            index,
-            (2..6).contains(&index) && index != 3,
-        )?;
-        if diff != 0 {
-            return Ok(diff);
-        }
-    }
-    Ok(0)
 }
 // Wine casemap (also ntdll's casemap for RtlCompareUnicodeStrings).
 fn casemap<M: Mem>(m: &mut Memory<'_, M>, table: u32, ch: u16) -> Result<u16> {
@@ -1835,6 +961,11 @@ fn compare_string_ordinal<M: Mem>(
     b: &Source,
     ignore_case: bool,
 ) -> Result<u32> {
+    // Equal code units remain equal under Wine's ordinal case mapping.
+    // The caller has already checked pointers and normalized both lengths.
+    if stream::same_bytes(m, a.at, a.len * 2, b.at, b.len * 2, 2)? {
+        return Ok(2);
+    }
     let table = if ignore_case {
         m.dword(nt + NT_NLS_INFO + NT_UPPER_CASE)?
     } else {
@@ -1915,7 +1046,7 @@ fn compare<M: Mem>(m: &mut Memory<'_, M>, args: [u32; 7], kind: u32) -> Result<u
     } else {
         (arg(0), arg(1), arg(2), arg(3), arg(4), arg(5))
     };
-    let mut sources = None;
+    let width = if ansi { 1 } else { 2 };
     if ansi {
         if s1 == 0 || s2 == 0 {
             return m.error(thread, 87);
@@ -1923,24 +1054,36 @@ fn compare<M: Mem>(m: &mut Memory<'_, M>, args: [u32; 7], kind: u32) -> Result<u
         if flags & DIGITSASNUMBERS != 0 {
             return m.error(thread, 1004);
         }
-        // strlen precedes locale/code-page resolution in CompareStringA.
-        let n1 = if (n1 as i32) < 0 {
-            terminated(m, s1, 1)?
+    }
+    let raw_length = |len: u32| {
+        if (len as i32) < 0 {
+            u32::MAX
         } else {
-            n1
-        };
-        let n2 = if (n2 as i32) < 0 {
-            terminated(m, s2, 1)?
-        } else {
-            n2
-        };
-        let code = get_lcid_codepage(m, base, locale, flags)?;
-        // An empty ANSI pair performs no code-page lookup.
-        if n1 == 0 && n2 == 0 {
-            sources = Some((Source::wide(m, s1, 0)?, Source::wide(m, s2, 0)?));
-        } else {
-            let cp = get_codepage_table(m, base, code)?;
-            sources = Some((Source::ansi(m, s1, n1, &cp)?, Source::ansi(m, s2, n2, &cp)?));
+            len * width
+        }
+    };
+    let (mut bytes1, mut bytes2) = (raw_length(n1), raw_length(n2));
+    // Mixed explicit/terminated lengths must first become comparable lengths.
+    if ansi && (bytes1 == u32::MAX) != (bytes2 == u32::MAX) {
+        if bytes1 == u32::MAX {
+            bytes1 = terminated(m, s1, width)? * width;
+        }
+        if bytes2 == u32::MAX {
+            bytes2 = terminated(m, s2, width)? * width;
+        }
+    }
+    let mut identity = false;
+    if ansi {
+        identity = stream::same_bytes(m, s1, bytes1, s2, bytes2, width)?;
+        if !identity {
+            if bytes1 == u32::MAX {
+                bytes1 = terminated(m, s1, 1)?;
+            }
+            if bytes2 == u32::MAX {
+                bytes2 = terminated(m, s2, 1)?;
+            }
+            stream::validate(m, s1, bytes1)?;
+            stream::validate(m, s2, bytes2)?;
         }
     }
     let name = if kind == 2 {
@@ -1972,24 +1115,63 @@ fn compare<M: Mem>(m: &mut Memory<'_, M>, args: [u32; 7], kind: u32) -> Result<u
     if s1 == 0 || s2 == 0 {
         return m.error(thread, 87);
     }
-    let (a, b) = if let Some(sources) = sources {
-        sources
+    if !ansi {
+        if (bytes1 == u32::MAX) != (bytes2 == u32::MAX) {
+            if bytes1 == u32::MAX {
+                bytes1 = terminated(m, s1, width)? * width;
+            }
+            if bytes2 == u32::MAX {
+                bytes2 = terminated(m, s2, width)? * width;
+            }
+        }
+        identity = stream::same_bytes(m, s1, bytes1, s2, bytes2, width)?;
+    }
+    if identity {
+        // Identical ANSI bytes yield identical conversions in the same code
+        // page. ACP is already loaded; other pages still use Wine's lookup so
+        // cold loads, owned locale locks and their last-error effects stay Wine's.
+        if ansi
+            && bytes1 != 0
+            && (bytes1 != u32::MAX || m.byte(s1)? != 0)
+            && flags & USE_CP_ACP == 0
+            && locale != m.dword(base + kb::system_lcid)?
+        {
+            let code = get_lcid_codepage(m, base, locale, flags)?;
+            get_codepage_table(m, base, code)?;
+        }
+        return Ok(if lstrcmp { 0 } else { 2 });
+    }
+    let cp = if ansi && (bytes1 != 0 || bytes2 != 0) {
+        let code = get_lcid_codepage(m, base, locale, flags)?;
+        Some(get_codepage_table(m, base, code)?)
     } else {
-        (Source::wide(m, s1, n1)?, Source::wide(m, s2, n2)?)
+        None
     };
     let sort = Sort::load(m, base)?;
     let id = SortId::load(m, at, flags)?;
-    let value = if equal_weights(m, &sort, id, flags, &a, &b)? {
-        2
+    let texts = [
+        stream::Text::new(s1, bytes1, cp.as_ref()),
+        stream::Text::new(s2, bytes2, cp.as_ref()),
+    ];
+    // Encoding is fixed for a comparison, so each stream uses one decoder
+    // specialization instead of selecting wide/SBCS/DBCS/UTF-8 per character.
+    let order = if !ansi {
+        stream::compare::<M, 0>(m, &sort, id, flags, texts)?
+    } else if cp.as_ref().unwrap().code == 65001 {
+        stream::compare::<M, 3>(m, &sort, id, flags, texts)?
+    } else if cp.as_ref().unwrap().offsets != 0 {
+        stream::compare::<M, 2>(m, &sort, id, flags, texts)?
     } else {
-        compare_string(m, &sort, id, flags, &a, &b)?.signum() + 2
+        stream::compare::<M, 1>(m, &sort, id, flags, texts)?
     };
+    let value = order.signum() + 2;
     Ok(if lstrcmp {
         (value - 2) as u32
     } else {
         value as u32
     })
 }
+
 fn run<M: Mem>(mem: &mut M, args: [u32; 7], kind: u32) -> std::result::Result<Ret, Stop> {
     let mut memory = Memory::new(mem, None);
     match compare(&mut memory, args, kind) {
@@ -2276,4 +1458,22 @@ pub(super) fn check_comparison_memory(cpu: &mut dyn adv_cpu::backend::Guest) {
             write: false
         })
     );
+    // CompareStringA converts both complete spans before CompareStringW can
+    // reject flags or decide an early primary difference.
+    cpu.protect(a & !0xfff, 0x1000, Prot::RW).unwrap();
+    cpu.protect((a & !0xfff) + 0x1000, 0x1000, Prot(0)).unwrap();
+    let b = BASE + 0x110fff;
+    cpu.write(a, b"A").unwrap();
+    cpu.write(b, b"B").unwrap();
+    for (i, arg) in [0x411, 0x40, a, 2, b, 2].iter().enumerate() {
+        cpu.write_u32(stack + 4 * i as u32, *arg).unwrap();
+    }
+    assert_eq!(
+        (COMPARE_A.full)(&mut GuestMem::new(cpu, &mut scratch), inputs),
+        Err(Stop::Fault {
+            address: a + 1,
+            write: false
+        })
+    );
+    assert_eq!(cpu.read_u32(thread + teb::LastErrorValue).unwrap(), 0x13579);
 }

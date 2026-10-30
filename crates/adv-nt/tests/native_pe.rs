@@ -2101,3 +2101,49 @@ fn nls_layout_matches_dwarf() {
         }
     }
 }
+
+// spec: NAT-BODY-20
+#[test]
+fn nls_name_pool_offsets_identify_wine_search_entries() {
+    let Some(dist) = dist() else {
+        return;
+    };
+    let data = std::fs::read(dist.join("share/wine/nls/locale.nls")).unwrap();
+    let word = |at: usize| u16::from_le_bytes(data[at..at + 2].try_into().unwrap());
+    let dword = |at: usize| u32::from_le_bytes(data[at..at + 4].try_into().unwrap()) as usize;
+    // Wine load_locale_nls's file header and NLS_LOCALE_HEADER indexes.
+    let header = dword(0x10);
+    let names = header + dword(header + 0x30);
+    let lcids = header + dword(header + 0x2c);
+    let strings = header + dword(header + 0x40);
+    let normalized = |offset: u16| -> Vec<u16> {
+        let at = strings + usize::from(offset) * 2;
+        (0..usize::from(word(at)))
+            .map(|i| word(at + 2 + i * 2))
+            .take_while(|ch| *ch != 0)
+            .map(|ch| match ch {
+                ch @ 0x61..=0x7a => ch - 32,
+                0x5f => 0x2d,
+                ch => ch,
+            })
+            .collect()
+    };
+    let names: Vec<_> = (0..usize::from(word(header + 0x28)))
+        .map(|i| {
+            let offset = word(names + i * 8);
+            (offset, normalized(offset))
+        })
+        .collect();
+    assert!(
+        names.windows(2).all(|pair| pair[0].1 < pair[1].1),
+        "Wine's normalized name index must be unique and sorted"
+    );
+    for i in 0..usize::from(word(header + 0x1e)) {
+        let offset = word(lcids + i * 8 + 6);
+        let expected = names
+            .binary_search_by(|entry| entry.1.cmp(&normalized(offset)))
+            .unwrap();
+        let identity = names.iter().position(|entry| entry.0 == offset).unwrap();
+        assert_eq!(identity, expected, "LCID index {i}");
+    }
+}

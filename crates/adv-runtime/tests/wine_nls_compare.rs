@@ -105,14 +105,15 @@ fn comparisons_match_wine() {
     let expected: Vec<_> = expected
         .lines()
         .filter(|line| {
-            line.starts_with(|ch: char| ch.is_ascii_digit()) || line.starts_with("done ")
+            line.starts_with(|ch: char| ch.is_ascii_digit() || ch == '-')
+                || line.starts_with("done ")
         })
         .collect();
     eprintln!("oracle {}", expected.last().unwrap());
     let actual = probe(false).unwrap();
     let actual: Vec<_> = actual.lines().collect();
     assert_eq!(actual.len(), expected.len());
-    for (actual, expected) in actual.into_iter().zip(expected) {
-        assert_eq!(actual, expected);
+    for (case, (actual, expected)) in actual.into_iter().zip(expected).enumerate() {
+        assert_eq!(actual, expected, "comparison call {}", case + 1);
     }
 }
