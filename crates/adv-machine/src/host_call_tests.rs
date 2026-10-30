@@ -384,6 +384,42 @@ fn import_calls_reach_direct_bodies_until_the_slot_or_entry_changes() {
     assert_eq!(results(&mut machine), [23, 23, 23]);
 }
 
+// spec: A64-CALL-1, A64-CALL-2, A64-CALL-5
+#[test]
+fn forwarding_chains_call_the_body_without_a_guest_return_store() {
+    let mut machine = bound_fixture(21);
+    let first = CODE + 0x300;
+    let second = CODE + 0x340;
+    let inner = SLOT + 4;
+    // A balanced hot-patch frame followed by two import forwarding jumps.
+    let mut bytes = vec![0x8b, 0xff, 0x55, 0x8b, 0xec, 0x5d, 0xe9];
+    bytes.extend_from_slice(&second.wrapping_sub(first + 11).to_le_bytes());
+    machine.cpu.write(first, &bytes).unwrap();
+    let mut bytes = vec![0xff, 0x25];
+    bytes.extend_from_slice(&inner.to_le_bytes());
+    machine.cpu.write(second, &bytes).unwrap();
+    machine.cpu.write_u32(SLOT, first).unwrap();
+    machine.cpu.write_u32(inner, FUNCTION).unwrap();
+    assert_eq!(results(&mut machine)[2], 63);
+    let below_arguments = DATA + 0x3ef8;
+    machine.cpu.write_u32(below_arguments, 0x1357_2468).unwrap();
+    run(&mut machine);
+    assert_eq!(machine.cpu.reg(Reg::Eax), 63);
+    assert_eq!(machine.cpu.read_u32(below_arguments).unwrap(), 0x1357_2468);
+    machine.cpu.write_u32(inner, OTHER).unwrap();
+    assert_eq!(results(&mut machine), [22; 3]);
+    machine.cpu.write_u32(inner, FUNCTION).unwrap();
+    assert_eq!(results(&mut machine)[2], 63);
+    // A changed forwarding entry must run, including its register effects.
+    let mut changed = vec![0xbb]; // mov ebx, 99
+    changed.extend_from_slice(&99u32.to_le_bytes());
+    changed.push(0xe9);
+    changed.extend_from_slice(&second.wrapping_sub(first + 10).to_le_bytes());
+    machine.cpu.write(first, &changed).unwrap();
+    assert_eq!(results(&mut machine)[2], 63);
+    assert_eq!(machine.cpu.reg(Reg::Ebx), 99);
+}
+
 // spec: A64-CALL-4
 #[test]
 fn a_body_the_window_stops_runs_on_the_full_path() {
@@ -558,4 +594,73 @@ fn ordinary_host_call_without_diagnostics_reads_no_stack_or_clock() {
     assert_eq!(cpu.reads.get(), 1);
     assert_eq!(machine.sys.recent.iter().count(), 1);
     assert_eq!(stats::CLOCK_READS.get(), clocks + 1);
+}
+
+fn yielding_triple<M: adv_cpu::body::Mem>(
+    mem: &mut M,
+    args: [u32; 7],
+) -> Result<adv_cpu::body::Ret, adv_cpu::body::Stop> {
+    let mut ret = triple(mem, args)?;
+    ret.yield_now = true;
+    Ok(ret)
+}
+adv_cpu::body!(YIELDING_TRIPLE = yielding_triple, inputs: &[adv_cpu::body::Input::Stack(0)], outputs: adv_cpu::body::EAX, pop: 0);
+
+// spec: A64-CALL-2, A64-CALL-5, NAT-BODY-18
+#[test]
+fn a_completed_body_yields_at_its_continuation_without_repeating_work() {
+    for entry in [false, true] {
+        let mut machine = bound_fixture(21);
+        machine
+            .sys
+            .direct_bodies
+            .insert(FUNCTION, YIELDING_TRIPLE.direct);
+        let next = if entry {
+            let mut code = Asm::new(CODE);
+            code.push_imm(21);
+            code.bytes.push(0xbf);
+            code.bytes.extend_from_slice(&FUNCTION.to_le_bytes());
+            code.bytes.extend_from_slice(&[0xff, 0xd7]);
+            let next = CODE + code.bytes.len() as u32;
+            code.add_esp(4).jmp(PARK_ADDR);
+            machine.cpu.write(CODE, &code.bytes).unwrap();
+            next
+        } else {
+            CODE + 11
+        };
+        let mut yielded = false;
+        for _ in 0..4 {
+            machine.cpu.set_reg(Reg::Eip, CODE);
+            machine.cpu.set_reg(Reg::Esp, DATA + 0x3f00);
+            let mut dispatch = Dispatch {
+                sys: &mut machine.sys,
+                ext: &mut machine.ext,
+                parked: None,
+                yield_on_frame: false,
+                defer_work: false,
+            };
+            assert!(matches!(machine.cpu.run(&mut dispatch), Exit::Parked));
+            let Some(reason) = dispatch.parked.take() else {
+                continue;
+            };
+            assert!(matches!(reason, Parked::ServiceYield { resume_eip } if resume_eip == next));
+            assert_eq!(machine.cpu.reg(Reg::Eax), 63);
+            assert_eq!(machine.cpu.reg(Reg::Esp), DATA + 0x3efc);
+            assert!(machine.park(reason).is_none());
+            assert_eq!(machine.cpu.reg(Reg::Eip), next);
+            let mut dispatch = Dispatch {
+                sys: &mut machine.sys,
+                ext: &mut machine.ext,
+                parked: None,
+                yield_on_frame: false,
+                defer_work: false,
+            };
+            assert!(matches!(machine.cpu.run(&mut dispatch), Exit::Parked));
+            assert!(dispatch.parked.is_none());
+            assert_eq!(machine.cpu.reg(Reg::Eax), 63);
+            assert_eq!(machine.cpu.reg(Reg::Esp), DATA + 0x3f00);
+            yielded = true;
+        }
+        assert!(yielded);
+    }
 }

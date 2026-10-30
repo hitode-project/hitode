@@ -554,9 +554,8 @@ impl Translator<'_> {
         self.emit(blr(X16));
         self.emit(ldp(X, Post, X9, super::X12, SP, 16));
         self.state = State::CANONICAL;
-        self.emit(ubfx(X, X16, X1, 32, 32));
         let slow = self.asm.label();
-        self.asm.cbz(W, true, X16, slow);
+        self.asm.tbz(true, X1, 32, slow);
         let (exit, eip, link) = if bound.entry {
             (Exit::Dispatch, bound.thunk, true)
         } else {
@@ -584,10 +583,43 @@ impl Translator<'_> {
             self.clobber(Operand::Guest(1));
             self.emit(mov(W, host(1), X1));
         }
+        if !bound.entry && body.pop != 0 {
+            self.emit(add_imm(X, host(ESP), host(ESP), u32::from(body.pop), false));
+        }
+        let yielded = self.asm.label();
+        self.asm.tbz(true, X1, 33, yielded);
+        self.push_cold(Cold::BodyYield {
+            label: yielded,
+            entry: bound.entry,
+            release: body.pop,
+            eip: inst.next_pc,
+            refund: self.trace.unused(self.index),
+        });
         if bound.entry {
             self.ret(inst, body.pop);
-        } else if body.pop != 0 {
-            self.emit(add_imm(X, host(ESP), host(ESP), u32::from(body.pop), false));
+        }
+    }
+
+    /// Complete an entry return before handing the committed call to its owner.
+    pub(super) fn body_yield(&mut self, entry: bool, release: u16, eip: u32, refund: u32) {
+        self.state = State::CANONICAL;
+        self.vector = super::simd::Vector::default();
+        if entry {
+            self.prepare(Operand::Guest(ESP));
+            self.load(Addr::Pop, X16);
+            self.forget(Operand::Guest(ESP));
+            if release != 0 {
+                self.emit(add_imm(X, host(ESP), host(ESP), u32::from(release), false));
+            }
+            self.canonicalize();
+            if refund != 0 {
+                self.emit(add_imm(X, X9, X9, refund, false));
+            }
+            self.emit(mov(W, X1, X16));
+            self.emit(movz(W, X0, Exit::Yield as u16, 0));
+            self.far(self.stubs.exit);
+        } else {
+            self.leave(Exit::Yield, eip, refund, false, false);
         }
     }
 

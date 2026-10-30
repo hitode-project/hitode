@@ -145,6 +145,7 @@ pub(super) fn image<B: Backend>(machine: &mut Machine<B>) -> Result<ModuleImage,
             .map_err(|e| e.to_string())?;
     }
     machine.ext.insert(Funcs(funcs));
+    machine.ext.insert(adv_nt::native::UserServices::default());
     machine.ext.insert(input::Presentation::default());
     display::install(machine)?;
     ModuleImage::build_with_entry(machine, MODULE, Some("DllMain"), &[], &[])

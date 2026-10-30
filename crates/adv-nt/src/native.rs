@@ -30,8 +30,8 @@ mod crt;
 mod dib;
 mod fonts;
 pub use fonts::FontFrontend;
-#[cfg(any(target_vendor = "apple", target_os = "android"))]
 mod input;
+pub use input::UserServices;
 mod linked;
 mod mixer;
 mod nls;
@@ -59,6 +59,67 @@ struct Body {
     /// The body as generated code calls it directly (A64-CALL-2); `body`
     /// is then unused.
     direct: Option<adv_cpu::body::Body>,
+}
+
+#[cfg(any(target_vendor = "apple", target_os = "android"))]
+fn resume_input(env: &mut adv_machine::Env<'_>) -> adv_machine::Outcome {
+    let tid = crate::server::current_tid(env);
+    if let Ok(tid) = tid
+        && !adv_wineserver::has_queue(tid)
+    {
+        // All these Windows entries create a GUI queue on first use. The
+        // server request owns that cold allocation, outside the body.
+        let mut request = crate::protocol::GetMsgQueueRequest::default();
+        match crate::server::request(env, &mut request, &[], &mut []) {
+            Ok((reply, _)) if reply.header.error == 0 => {
+                let index = env.sys.thunks.get(env.thunk).f.data as usize;
+                let body = body_at(index).direct.unwrap();
+                return run_full(env, body, resume_original);
+            }
+            Ok((reply, _)) => return input_queue_error(env, reply.header.error),
+            Err(crate::status::Error::Status(status)) => return input_queue_error(env, status),
+            Err(error) => return crate::status::finish(Err(error)),
+        }
+    }
+    resume_original(env)
+}
+
+#[cfg(any(target_vendor = "apple", target_os = "android"))]
+fn input_queue_error(env: &mut Env<'_>, status: u32) -> Outcome {
+    use adv_cpu::backend::GuestExt;
+    let convert = match env
+        .ext
+        .get::<crate::process::Ntdll>()
+        .export("RtlNtStatusToDosError")
+    {
+        Ok(convert) => convert,
+        Err(error) => return Outcome::Fail(error.to_string()),
+    };
+    Outcome::call(convert, [status], |env, error| {
+        match env.cpu.write_u32(env.ctx().teb + 0x34, error.value()) {
+            Ok(()) => Outcome::Return(0),
+            Err(error) => Outcome::Fail(error.to_string()),
+        }
+    })
+}
+
+#[cfg(any(target_vendor = "apple", target_os = "android"))]
+fn input_bodies() -> impl Iterator<Item = Body> {
+    [
+        ("win32u.dll!NtUserGetAsyncKeyState", 1, input::ASYNC_STATE),
+        ("win32u.dll!NtUserGetCursorPos", 1, input::CURSOR_POS),
+        ("win32u.dll!NtUserGetQueueStatus", 1, input::QUEUE_STATUS),
+        ("user32.dll!GetInputState", 0, input::INPUT_STATE),
+        ("win32u.dll!NtUserPeekMessage", 5, input::PEEK),
+    ]
+    .into_iter()
+    .map(|(name, argc, direct)| Body {
+        name: name.into(),
+        conv: adv_machine::Conv::Stdcall { argc },
+        body: None,
+        handler: resume_input,
+        direct: Some(direct),
+    })
 }
 
 /// Calls whose body declined, so that Wine's own code ran.
@@ -354,6 +415,8 @@ static BODIES: std::sync::LazyLock<Vec<Body>> = std::sync::LazyLock::new(|| {
     ];
     bodies.extend(crt::bodies());
     bodies.extend(services::bodies());
+    #[cfg(any(target_vendor = "apple", target_os = "android"))]
+    bodies.extend(input_bodies());
     for version in 24..=43 {
         bodies.push(Body {
             name: format!("d3dx9_{version}.dll!d3dx_load_pixels_from_pixels").into(),
@@ -510,10 +573,15 @@ fn run_full(
             if outputs & ECX != 0 {
                 env.cpu.set_reg(Reg::Ecx, ret.ecx);
             }
-            if outputs & EDX != 0 {
+            let outcome = if outputs & EDX != 0 {
                 Outcome::Return64(ret.value)
             } else {
                 Outcome::Return(ret.value as u32)
+            };
+            if ret.yield_now {
+                Outcome::block(adv_machine::Wait::Yield, move |_, _| outcome)
+            } else {
+                outcome
             }
         }
         Err(stop @ (Stop::Fault { .. } | Stop::DivideByZero)) => {
@@ -580,6 +648,11 @@ pub(crate) fn bind_relocated(
     relocations: &[u32],
 ) {
     sys.body_services = Some(|sys, ext, services| {
+        #[cfg(any(target_vendor = "apple", target_os = "android"))]
+        if let Some(user) = ext.try_get::<UserServices>() {
+            services.user_state = std::rc::Rc::as_ptr(&user.0).cast();
+        }
+
         if let Some(link) = ext.try_get::<crate::server::Link>() {
             services.thread = link.known_tid(sys.current).unwrap_or(0);
             services.state = std::rc::Rc::as_ptr(&link.files).cast();
@@ -622,6 +695,13 @@ pub(crate) fn bind_relocated(
     let text = ext.try_get::<FontFrontend>().is_some();
     let bodies = BODIES.iter().chain(dib::BODIES);
     for body in bodies.chain(fonts::BODIES.iter().filter(|_| text)) {
+        #[cfg(any(target_vendor = "apple", target_os = "android"))]
+        if input_bodies().any(|candidate| candidate.name == body.name)
+            && ext.try_get::<UserServices>().is_none()
+        {
+            continue;
+        }
+
         let Some(name) = body
             .name
             .strip_prefix(module.name.as_str())

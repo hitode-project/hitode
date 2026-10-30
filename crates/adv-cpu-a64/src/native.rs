@@ -891,6 +891,7 @@ impl Native {
             Exit::Fault => self.diagnostics.faults += 1,
             Exit::Dispatch => self.diagnostics.dispatches += 1,
             Exit::Stepped => {}
+            Exit::Yield => self.runtime.shadow = self.shadow.top(),
         }
         let mut retired = budget - self.runtime.countdown;
         if exit == Exit::Fault {

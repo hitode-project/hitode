@@ -518,6 +518,15 @@ struct Raw<'a> {
 }
 
 impl ExecutionTrap for Raw<'_> {
+    fn body_yield(&mut self, state: &mut CpuState, memory: &mut Memory) -> Result<bool, String> {
+        state.commit_mmx();
+        Ok(self.handler.on_body_yield(&mut View {
+            state,
+            memory,
+            images: self.images,
+        }) == TrapAction::Park)
+    }
+
     fn body_services(&self) -> adv_cpu_core::body::Services {
         self.handler.body_services()
     }

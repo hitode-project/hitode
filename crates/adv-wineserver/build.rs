@@ -9,6 +9,7 @@ const EXPORTS: &[&str] = &[
     "hitode_server_main",
     "hitode_server_key_state",
     "hitode_server_keyboard_state",
+    "hitode_server_user",
     "hitode_server_close_handle",
     "hitode_server_object",
     "hitode_server_sync_fd",

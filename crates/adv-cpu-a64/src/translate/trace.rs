@@ -166,6 +166,107 @@ fn slot(pc: u32, frame: u16) -> usize {
     (key.wrapping_mul(0x9E37_79B1) >> 24) as usize & (SLOTS - 1)
 }
 
+/// Resolve forwarding entries whose register and stack effects cancel before
+/// their tail transfer. Every instruction and pointer slot is a code dependency.
+fn forwarded_body(
+    memory: &Memory,
+    mut pc: u32,
+    redirect: &dyn Fn(u32) -> Option<Redirect>,
+    stops: &Stops<'_>,
+) -> Option<(Bound, Vec<(u32, u32)>)> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Value {
+        Register(u8),
+        Stack(i32),
+    }
+    let initial = std::array::from_fn::<_, 8, _>(|r| {
+        if r == 4 {
+            Value::Stack(0)
+        } else {
+            Value::Register(r as u8)
+        }
+    });
+    let mut registers = initial;
+    let mut stack = Vec::new();
+    let mut seen = Vec::new();
+    let mut watched = Vec::new();
+    let mut fetcher = Fetcher::new(memory);
+    while !seen.contains(&pc) {
+        if stops.contains(pc) {
+            return None;
+        }
+        seen.push(pc);
+        if registers == initial
+            && stack.is_empty()
+            && let Some(Redirect {
+                target,
+                original,
+                checks,
+                body: Some(body),
+            }) = redirect(pc)
+        {
+            let same = |at: u32, original: &[u8]| {
+                let mut bytes = vec![0; original.len()];
+                memory.read_into(at, &mut bytes).is_ok() && bytes == original
+            };
+            if same(pc, &original) && checks.iter().all(|(at, bytes)| same(*at, bytes)) {
+                watched.push((pc, original.len() as u32));
+                watched.extend(checks.iter().map(|(at, bytes)| (*at, bytes.len() as u32)));
+                return Some((
+                    Bound {
+                        body,
+                        thunk: target,
+                        entry: false,
+                    },
+                    watched,
+                ));
+            }
+        }
+        let (op, size) = fetcher.fetch(pc)?;
+        watched.push((pc, size));
+        let next = pc.wrapping_add(size);
+        pc = match op {
+            Op::Nop => next,
+            Op::Mov(Src::Reg(dst), Src::Reg(src)) if dst != 4 => {
+                registers[usize::from(dst)] = registers[usize::from(src)];
+                next
+            }
+            Op::Push(Src::Reg(reg)) => {
+                let Value::Stack(offset) = registers[4] else {
+                    return None;
+                };
+                stack.push(registers[usize::from(reg)]);
+                registers[4] = Value::Stack(offset - 4);
+                next
+            }
+            Op::Pop(reg) if reg != 4 => {
+                let Value::Stack(offset) = registers[4] else {
+                    return None;
+                };
+                registers[usize::from(reg)] = stack.pop()?;
+                registers[4] = Value::Stack(offset + 4);
+                next
+            }
+            Op::Jmp(target) if registers == initial && stack.is_empty() => target,
+            Op::JmpIndirect(Src::Mem(slot))
+                if registers == initial
+                    && stack.is_empty()
+                    && slot.base.is_none()
+                    && slot.index.is_none()
+                    && !slot.fs
+                    && slot.address_bits == 32 =>
+            {
+                let mut bytes = [0; 4];
+                memory.read_into(slot.disp, &mut bytes).ok()?;
+                watched.push((slot.disp, 4));
+                u32::from_le_bytes(bytes)
+            }
+            _ => return None,
+        };
+    }
+    None
+}
+
 impl Trace {
     /// Traces from `entry`, ending before any of `stops` except at the
     /// entry. `redirect` gives, for a function entry whose calls go
@@ -257,7 +358,7 @@ impl Trace {
             let next_pc = pc.wrapping_add(size);
             // Import slots and the entries calls reach are watched like code,
             // so a transfer through them is static (A64-CALL-1).
-            let mut watched = [None; 2];
+            let mut watched = Vec::new();
             let op = match op {
                 Op::CallIndirect(Src::Mem(slot)) | Op::JmpIndirect(Src::Mem(slot))
                     if slot.base.is_none()
@@ -268,7 +369,7 @@ impl Trace {
                     let mut target = [0; 4];
                     match memory.read_into(slot.disp, &mut target) {
                         Ok(()) => {
-                            watched[0] = Some((slot.disp, 4));
+                            watched.push((slot.disp, 4));
                             let target = u32::from_le_bytes(target);
                             if matches!(op, Op::CallIndirect(_)) {
                                 Op::Call(target)
@@ -285,21 +386,10 @@ impl Trace {
                 Op::Call(target)
                     if target != next_pc && self.bodies.len() <= usize::from(u8::MAX) =>
                 {
-                    match intact(target) {
-                        Some(Redirect {
-                            target: thunk,
-                            original,
-                            body: Some(body),
-                            checks,
-                        }) => {
-                            watched[1] = Some((target, original.len() as u32));
-                            self.code
-                                .extend(checks.iter().map(|(at, bytes)| (*at, bytes.len() as u32)));
-                            self.bodies.push(Bound {
-                                body,
-                                thunk,
-                                entry: false,
-                            });
+                    match forwarded_body(memory, target, redirect, &stops) {
+                        Some((bound, dependencies)) => {
+                            watched.extend(dependencies);
+                            self.bodies.push(bound);
                             Op::Body(self.bodies.len() as u8 - 1)
                         }
                         _ => op,
@@ -354,7 +444,7 @@ impl Trace {
             if inst.call.is_some() {
                 self.code.push((pc.wrapping_sub(5), 7));
             }
-            self.code.extend(watched.into_iter().flatten());
+            self.code.extend(watched);
             // A continuation must be new to the trace and leave room after it.
             let continuation = || {
                 len + 4 < MAX_INSTRUCTIONS

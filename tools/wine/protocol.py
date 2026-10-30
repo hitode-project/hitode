@@ -133,6 +133,7 @@ REQUESTS = [
     "get_new_process_info",
     "get_startup_info",
     "set_queue_fd",
+    "get_msg_queue",
     "rename_key",
     "load_registry",
     "unload_registry",

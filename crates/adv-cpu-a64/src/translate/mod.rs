@@ -331,6 +331,13 @@ enum Test {
 
 /// Code emitted after the unit body.
 enum Cold {
+    BodyYield {
+        label: Label,
+        entry: bool,
+        release: u16,
+        eip: u32,
+        refund: u32,
+    },
     /// A short branch's way to distant cold code: x87 arithmetic to its
     /// generic path, or a parity jcc to an exit that publishes a run.
     Bridge { label: Label, to: Label },
@@ -1372,6 +1379,16 @@ impl Translator<'_> {
 
     fn cold(&mut self, cold: Cold, at: usize) {
         match cold {
+            Cold::BodyYield {
+                label,
+                entry,
+                release,
+                eip,
+                refund,
+            } => {
+                self.asm.bind(label);
+                self.body_yield(entry, release, eip, refund);
+            }
             Cold::Bridge { label, to } => {
                 self.asm.bind(label);
                 self.asm.b(to);

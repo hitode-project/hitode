@@ -290,6 +290,7 @@ pub fn run_probe_engine(
         Box::new(runtime),
     )
     .unwrap();
+    adv_nt::identity::note_ntdll(&mut machine, &ntdll_path, &ntdll);
     drop(stdout);
     assert_ne!(started.thread.pid, 0);
 

@@ -137,6 +137,15 @@ unsafe extern "C" {
     fn hitode_server_input() -> u64;
     fn hitode_server_key_state(tid: u32, key: u32) -> c_int;
     fn hitode_server_keyboard_state(tid: u32, state: *mut u8) -> c_int;
+    fn hitode_server_user(
+        tid: u32,
+        op: u32,
+        a: u32,
+        b: u32,
+        c: u32,
+        d: u32,
+        out: *mut u32,
+    ) -> c_int;
     fn hitode_server_close_handle(tid: u32, handle: u32) -> u32;
     fn hitode_server_object(tid: u32, handle: u32) -> usize;
     fn hitode_server_file_kind(tid: u32, handle: u32) -> i32;
@@ -179,6 +188,24 @@ pub fn has_queue(tid: u32) -> bool {
 pub unsafe fn keyboard_state(tid: u32, state: *mut u8) -> bool {
     // SAFETY: the caller supplies the output; server state is execution-owner serial.
     unsafe { hitode_server_keyboard_state(tid, state) != 0 }
+}
+
+/// Snapshot or update an existing USER service state without a request.
+pub fn user_service(tid: u32, op: u32, args: [u32; 4]) -> Option<[u32; 4]> {
+    let mut out = [0; 4];
+    // SAFETY: the execution owner serializes the server, with a complete output.
+    let complete = unsafe {
+        hitode_server_user(
+            tid,
+            op,
+            args[0],
+            args[1],
+            args[2],
+            args[3],
+            out.as_mut_ptr(),
+        )
+    };
+    (complete != 0).then_some(out)
 }
 
 /// Existing synchronization state, without a request or descriptor transfer.

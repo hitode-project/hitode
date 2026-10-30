@@ -5,6 +5,7 @@ use std::cell::Cell;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::io::{PipeReader, PipeWriter, Read, Write};
 use std::os::fd::AsRawFd;
+use std::rc::Rc;
 
 use adv_abi::{Conv, Env, Outcome, Registry};
 use adv_machine::{CtxId, Ext};
@@ -71,6 +72,32 @@ struct Queue {
     write: PipeWriter,
     events: VecDeque<Event>,
     processing: bool,
+    pending: Rc<Cell<u32>>,
+    counts: [usize; 4],
+}
+impl Queue {
+    fn changed(&mut self, event: &Event, added: bool) {
+        let mask = match event {
+            Event::Input(input) => input.mask,
+            Event::Job(_) => 8,
+        };
+        for bit in 0..4 {
+            if mask & (1 << bit) != 0 {
+                if added {
+                    self.counts[bit] += 1;
+                } else {
+                    self.counts[bit] -= 1;
+                }
+            }
+        }
+        self.pending.set(if self.counts[3] != 0 {
+            u32::MAX
+        } else {
+            (0..3).fold(0, |mask, bit| {
+                mask | if self.counts[bit] != 0 { 1 << bit } else { 0 }
+            })
+        });
+    }
 }
 
 /// Keys and mouse buttons the host holds down, by virtual key.
@@ -107,6 +134,10 @@ pub(super) fn init(env: &mut Env<'_>) -> Result<(), String> {
         adv_nt::status::check(answer?.0.header.error)
     };
     set(env).map_err(|e| format!("{MODULE}: {e:?}"))?;
+    let pending = env
+        .ext
+        .get::<adv_nt::native::UserServices>()
+        .pending(env.context);
     env.ext.get_mut::<Queues>().0.insert(
         env.context,
         Queue {
@@ -114,6 +145,8 @@ pub(super) fn init(env: &mut Env<'_>) -> Result<(), String> {
             write,
             events: VecDeque::new(),
             processing: false,
+            pending,
+            counts: [0; 4],
         },
     );
     Ok(())
@@ -151,6 +184,7 @@ fn push(ext: &mut Ext, context: CtxId, event: Event) -> Result<(), String> {
     if queue.events.is_empty() {
         queue.write.write_all(&[1]).map_err(|e| e.to_string())?;
     }
+    queue.changed(&event, true);
     queue.events.push_back(event);
     Ok(())
 }
@@ -298,6 +332,7 @@ fn next(env: &mut Env<'_>, mask: u32) -> Outcome {
     };
     env.sys.poll_work();
     let event = queue.events.remove(index).unwrap();
+    queue.changed(&event, false);
     if queue.events.is_empty()
         && let Err(error) = queue.read.read_exact(&mut [0])
     {
