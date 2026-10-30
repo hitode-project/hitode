@@ -45,13 +45,17 @@ pub(super) struct Entry {
 /// numbers them, or `None` when it may drop the cache.
 fn footprint(trace: &Trace, index: usize, _checked: &dyn Fn(u32) -> bool) -> Option<(u16, u16)> {
     let inst = trace.insts[index];
-    if inst.call.is_some() || inst.mode == Mode::Real {
+    if inst.call.is_some() || inst.locked.is_some() || inst.mode == Mode::Real {
         return None;
     }
     match inst.op {
         Op::Simd(simd) => Some(simd.footprint()),
         // Helpers, slow paths that call them and owner calls drop it.
-        Op::Helper(_)
+        Op::Syscall
+        | Op::Timestamp
+        | Op::PopFlags(..)
+        | Op::Stack(..)
+        | Op::Helper(_)
         | Op::Strings(_)
         | Op::Integer(_)
         | Op::X87(_)
@@ -222,6 +226,7 @@ mod tests {
                 a.jz(done).unwrap();
             }
             2 => a.cpuid().unwrap(),
+            5 => a.lock().add(dword_ptr(esi), 1).unwrap(),
             _ => {}
         }
         a.paddw(mm0, mm1).unwrap();
@@ -251,7 +256,7 @@ mod tests {
         entries(&trace, &|_| false)[head]
     }
 
-    // spec: A64-REG-5
+    // spec: A64-REG-5, A64-ISA-6
     #[test]
     fn merges_hold_what_every_path_reads_and_jcc_arrivals_hold() {
         // mm0, mm1 and xmm2 are read every iteration; the body writes mm0
@@ -269,6 +274,14 @@ mod tests {
             head_entry(2),
             Entry {
                 guards: head_entry(2).guards,
+                ..Entry::default()
+            }
+        );
+        // A locked access may take its SHARED instruction helper.
+        assert_eq!(
+            head_entry(5),
+            Entry {
+                guards: head_entry(5).guards,
                 ..Entry::default()
             }
         );

@@ -79,7 +79,12 @@ fn address(mem: Mem, regs: &[u32; 8]) -> Option<u32> {
     let index = mem
         .index
         .map_or(0, |index| regs[usize::from(index)].wrapping_mul(mem.scale));
-    Some(base.wrapping_add(index).wrapping_add(mem.disp))
+    let address = base.wrapping_add(index).wrapping_add(mem.disp);
+    Some(if mem.address_bits == 16 {
+        address & 0xffff
+    } else {
+        address
+    })
 }
 
 fn load(address: u32, len: usize, memory: &Memory) -> Option<u32> {
@@ -291,9 +296,16 @@ fn step(op: Op, next: u32, cpu: &mut CpuState, memory: &Memory) -> Option<bool> 
         Op::Nop => {}
         // The interpreter runs these: `Fetcher::helpers` is off here, and
         // narrow forms are rare in code that runs once.
-        Op::Helper(_)
+        Op::PopMemory(_)
+        | Op::PushFlags(_)
+        | Op::PopFlags(..)
+        | Op::Stack(..)
+        | Op::Lahf
+        | Op::Timestamp
+        | Op::Syscall
+        | Op::Helper(_)
         | Op::Body(_)
-        | Op::Apply(_)
+        | Op::Parts(_)
         | Op::Narrow(..)
         | Op::StepMemory(..)
         | Op::NarrowStep(..)

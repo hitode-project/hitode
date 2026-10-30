@@ -317,3 +317,260 @@ fn host_call_observes_dirty_mmx_and_x87_aliases_in_an_inlined_call() {
         }
     }
 }
+
+#[test]
+#[ignore = "10M instruction microbenchmark"]
+fn syscall_microbenchmark() {
+    struct Return;
+    impl ExecutionTrap for Return {
+        fn call(
+            &mut self,
+            _state: &mut CpuState,
+            _memory: &mut Memory,
+            vector: u32,
+        ) -> Result<bool, String> {
+            assert_eq!(vector, 0x2e);
+            Ok(false)
+        }
+    }
+    let (mut cpu, _) = fixture((false, false, Checks::Adaptive));
+    let mut a = iced_x86::code_asm::CodeAssembler::new(32).unwrap();
+    use iced_x86::code_asm::*;
+    a.mov(ecx, 10_000_000u32).unwrap();
+    let mut top = a.create_label();
+    a.set_label(&mut top).unwrap();
+    a.int(0x2e).unwrap();
+    a.dec(ecx).unwrap();
+    a.jnz(top).unwrap();
+    let bytes = a.assemble(u64::from(CODE)).unwrap();
+    let stop = CODE + bytes.len() as u32;
+    cpu.write(CODE, &bytes).unwrap();
+    assert_eq!(
+        cpu.run_with_traps(stop, 100, &mut Return, false).unwrap(),
+        RunOutcome::Budget
+    );
+    cpu.state.eip = CODE;
+    let helpers = cpu.native.as_ref().unwrap().diagnostics.helpers;
+    let now = Instant::now();
+    assert_eq!(
+        cpu.run_with_traps(stop, 40_000_000, &mut Return, false)
+            .unwrap(),
+        RunOutcome::ReachedStop
+    );
+    println!(
+        "W11 int ns/instruction={:.3} helpers={}",
+        now.elapsed().as_nanos() as f64 / 10_000_000.0,
+        cpu.native.as_ref().unwrap().diagnostics.helpers - helpers
+    );
+}
+
+// spec: A64-TR-4, A64-CTL-12, A64-VER-1
+#[test]
+fn common_raw_syscalls_and_timestamp_reads_use_native_calls() {
+    struct Clock {
+        now: u64,
+        calls: u32,
+    }
+    impl ExecutionTrap for Clock {
+        fn guest_time_us(&mut self) -> Option<u64> {
+            self.now += 1;
+            Some(self.now)
+        }
+        fn call(
+            &mut self,
+            state: &mut CpuState,
+            _: &mut Memory,
+            vector: u32,
+        ) -> Result<bool, String> {
+            assert_eq!(vector, 0x2e);
+            self.calls += 1;
+            state.regs[3] = state.regs[0];
+            Ok(false)
+        }
+    }
+    for first in [false, true] {
+        for checks in [Checks::Adaptive, Checks::All] {
+            for budget in [1, 2, 3, 4, 100] {
+                let make = |interpreted| {
+                    let (mut cpu, _) = fixture((false, first, checks));
+                    // RDTSC; INT 2e; RDTSC; ADC EDI,0; NOP.
+                    cpu.write(
+                        CODE,
+                        &[0x0f, 0x31, 0xcd, 0x2e, 0x0f, 0x31, 0x83, 0xd7, 0, 0x90],
+                    )
+                    .unwrap();
+                    cpu.interpreter_only = interpreted;
+                    cpu
+                };
+                let (mut a, mut b) = (make(false), make(true));
+                let (mut ca, mut cb) = (
+                    Clock {
+                        now: 4294966,
+                        calls: 0,
+                    },
+                    Clock {
+                        now: 4294966,
+                        calls: 0,
+                    },
+                );
+                let stop = CODE + 9;
+                assert_eq!(
+                    a.run_with_traps(stop, budget, &mut ca, false).unwrap(),
+                    b.run_with_traps(stop, budget, &mut cb, false).unwrap()
+                );
+                assert_eq!(
+                    a.state.clone().capture_architecture(),
+                    b.state.clone().capture_architecture()
+                );
+                assert_eq!(
+                    a.run_with_traps(stop, 100, &mut ca, false).unwrap(),
+                    b.run_with_traps(stop, 100, &mut cb, false).unwrap()
+                );
+                assert_eq!(
+                    a.state.clone().capture_architecture(),
+                    b.state.clone().capture_architecture()
+                );
+                assert_eq!(ca.calls, cb.calls);
+                if !first {
+                    assert_eq!(a.native.as_ref().unwrap().diagnostics.helpers, 0);
+                }
+            }
+        }
+    }
+}
+
+// spec: A64-CTL-12, A64-VER-1
+#[test]
+fn common_prefixed_syscalls_continue_at_the_decoded_next_instruction() {
+    struct Returns(u32);
+    impl ExecutionTrap for Returns {
+        fn call(
+            &mut self,
+            state: &mut CpuState,
+            _: &mut Memory,
+            vector: u32,
+        ) -> Result<bool, String> {
+            assert_eq!(vector, 0x2e);
+            assert_eq!(state.eip, self.0);
+            state.regs[0] = 0x1234;
+            Ok(false)
+        }
+    }
+    for prefix in [0x66u8, 0xf2, 0xf3, 0x64, 0x65] {
+        for first in [false, true] {
+            for budget in [1, 2, 100] {
+                let make = |interpreted| {
+                    let (mut cpu, _) = fixture((false, first, Checks::All));
+                    cpu.write(CODE, &[prefix, 0xcd, 0x2e, 0x83, 0xc0, 1, 0x90])
+                        .unwrap();
+                    cpu.interpreter_only = interpreted;
+                    cpu
+                };
+                let (mut a, mut b) = (make(false), make(true));
+                let outcome = a
+                    .run_with_traps(CODE + 6, budget, &mut Returns(CODE + 3), false)
+                    .unwrap();
+                assert_eq!(
+                    outcome,
+                    b.run_with_traps(CODE + 6, budget, &mut Returns(CODE + 3), false)
+                        .unwrap()
+                );
+                assert_eq!(
+                    a.state.clone().capture_architecture(),
+                    b.state.clone().capture_architecture()
+                );
+                assert_eq!(
+                    a.run_with_traps(CODE + 6, 100, &mut Returns(CODE + 3), false)
+                        .unwrap(),
+                    b.run_with_traps(CODE + 6, 100, &mut Returns(CODE + 3), false)
+                        .unwrap()
+                );
+                assert_eq!(
+                    a.state.clone().capture_architecture(),
+                    b.state.clone().capture_architecture()
+                );
+                if !first {
+                    assert_eq!(a.native.as_ref().unwrap().diagnostics.helpers, 0);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "before/after counter and syscall helper census"]
+fn common_counter_conversion_counts() {
+    struct Counter;
+    impl ExecutionTrap for Counter {
+        fn guest_time_us(&mut self) -> Option<u64> {
+            Some(1)
+        }
+        fn call(&mut self, _: &mut CpuState, _: &mut Memory, vector: u32) -> Result<bool, String> {
+            assert_eq!(vector, 0x2e);
+            Ok(false)
+        }
+    }
+    for (name, code) in [("rdtsc", [0x0f, 0x31]), ("int_2e", [0xcd, 0x2e])] {
+        let (mut cpu, _) = fixture((false, false, Checks::Adaptive));
+        cpu.write(CODE, &code).unwrap();
+        cpu.count_tier0(true);
+        assert_eq!(
+            cpu.run_with_traps(CODE + 2, 100, &mut Counter, false)
+                .unwrap(),
+            RunOutcome::ReachedStop
+        );
+        let counts = cpu.retired_forms().unwrap();
+        println!(
+            "CENSUS {name} {} {} {} ReachedStop",
+            counts[1], counts[2], counts[3]
+        );
+    }
+}
+
+// spec: A64-TR-4
+#[test]
+fn common_standalone_rdtsc_uses_the_owner_counter_without_a_trap_handler() {
+    for checks in [Checks::Adaptive, Checks::All, Checks::Slow] {
+        for first in [false, true] {
+            let (mut cpu, _) = fixture((false, first, checks));
+            cpu.state.regs[3] = DATA;
+            let flags = cpu.state.eflags;
+            // RDTSC; MOV [EBX],EAX; MOV [EBX+4],EDX; RDTSC; NOP.
+            cpu.write(
+                CODE,
+                &[0x0f, 0x31, 0x89, 0x03, 0x89, 0x53, 4, 0x0f, 0x31, 0x90],
+            )
+            .unwrap();
+            assert_eq!(cpu.run(CODE + 9, 100).unwrap(), RunOutcome::ReachedStop);
+            let first_ticks =
+                u64::from_le_bytes(cpu.memory.read(DATA, 8).unwrap().try_into().unwrap());
+            let second_ticks = u64::from(cpu.state.regs[0]) | u64::from(cpu.state.regs[2]) << 32;
+            assert!(second_ticks > first_ticks);
+            assert_eq!(cpu.state.eflags, flags);
+            if !first {
+                assert_eq!(cpu.native.as_ref().unwrap().diagnostics.helpers, 0);
+                assert_eq!(cpu.stats.interpreter_entries, 0);
+            }
+        }
+    }
+}
+
+// spec: A64-CTL-12, A64-VER-1
+#[test]
+fn common_unhandled_syscalls_refund_the_int_and_preserve_its_fault_pc() {
+    for prefix in [&[][..], &[0x66], &[0x65]] {
+        let (mut cpu, _) = fixture((false, false, Checks::All));
+        let mut code = prefix.to_vec();
+        code.extend_from_slice(&[0xcd, 0x2e, 0x90]);
+        cpu.write(CODE, &code).unwrap();
+        assert_eq!(
+            cpu.run(CODE + code.len() as u32 - 1, 100).unwrap(),
+            RunOutcome::Trap {
+                pc: CODE,
+                vector: 0x2e
+            }
+        );
+        assert_eq!(cpu.state.eip, CODE + code.len() as u32 - 1);
+        assert_eq!(cpu.native.as_ref().unwrap().diagnostics.helpers, 0);
+    }
+}

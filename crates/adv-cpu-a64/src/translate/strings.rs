@@ -18,8 +18,8 @@
 //! a different page, including an element's last byte, uses the access
 //! emitter's permission checks without changing NZCV. A crossing element
 //! needs one view that allows both pages. A blocked element hands its current
-//! state to the interpreter. Segment or address-size overrides
-//! stay with the interpreter.
+//! state to the interpreter. Source overrides use FS's thread base or the
+//! flat segment base. Word address-size overrides stay with the interpreter.
 
 use iced_x86::{Code, Instruction, Register};
 
@@ -61,6 +61,7 @@ pub struct Strings {
     pub rep: Rep,
     /// The helper that finishes the instruction on the slow path.
     pub helper: u8,
+    pub fs: bool,
 }
 
 impl Strings {
@@ -105,17 +106,13 @@ pub fn plan(instruction: &Instruction, helper: u8) -> Option<Strings> {
             MemorySegSI | MemorySegDI | MemoryESDI
         )
     });
-    if short
-        || instruction.has_lock_prefix()
-        || !matches!(instruction.segment_prefix(), Register::None | Register::DS)
-    {
+    if short || instruction.has_lock_prefix() {
         return None;
     }
-    let compares = matches!(kind, Kind::Scas | Kind::Cmps);
     let rep = match (instruction.has_rep_prefix(), instruction.has_repne_prefix()) {
         (false, false) => Rep::None,
         (true, false) => Rep::Rep,
-        (false, true) if compares => Rep::Repne,
+        (false, true) => Rep::Repne,
         _ => return None,
     };
     Some(Strings {
@@ -123,6 +120,8 @@ pub fn plan(instruction: &Instruction, helper: u8) -> Option<Strings> {
         width,
         rep,
         helper,
+        fs: matches!(kind, Kind::Movs | Kind::Lods | Kind::Cmps)
+            && instruction.segment_prefix() == Register::FS,
     })
 }
 
@@ -170,9 +169,18 @@ impl Translator<'_> {
             self.emit_all(&[movz(W, X13, 0xffff, 16), movz(W, X14, 0xffff, 16)]);
         }
         self.asm.bind(top);
+        let from = if op.fs {
+            let address = Reg::new(8);
+            self.emit(ldr(X, address, super::RUNTIME, crate::runtime::CPU_STATE));
+            self.emit(ldr(W, address, address, crate::runtime::FS_BASE));
+            self.emit(add(W, address, address, esi, Lsl, 0));
+            address
+        } else {
+            esi
+        };
         if self.checking {
             if matches!(op.kind, Kind::Movs | Kind::Lods | Kind::Cmps) {
-                self.string_page(esi, op.width, false, (X13, X0, source), slow);
+                self.string_page(from, op.width, false, (X13, X0, source), slow);
             }
             if op.kind != Kind::Lods {
                 self.string_page(
@@ -188,7 +196,7 @@ impl Translator<'_> {
         let left = match op.kind {
             Kind::Movs => {
                 self.site();
-                self.emit(load(X6, esi, source));
+                self.emit(load(X6, from, source));
                 self.site();
                 self.emit_all(&[
                     store(X6, edi),
@@ -204,7 +212,7 @@ impl Translator<'_> {
             }
             Kind::Lods => {
                 self.site();
-                self.emit(load(X6, esi, source));
+                self.emit(load(X6, from, source));
                 self.emit_all(&[
                     match op.width {
                         4 => mov(W, eax, X6),
@@ -224,7 +232,7 @@ impl Translator<'_> {
             }
             Kind::Cmps => {
                 self.site();
-                self.emit(load(X6, esi, source));
+                self.emit(load(X6, from, source));
                 self.site();
                 self.emit_all(&[
                     load(temp(0), edi, destination),
@@ -360,12 +368,15 @@ mod tests {
         let cmpsw = plan(|a| a.repe().cmpsw().unwrap()).unwrap();
         assert_eq!((cmpsw.width, cmpsw.rep), (2, Rep::Rep));
         assert_eq!(plan(|a| a.lodsb().unwrap()).unwrap().rep, Rep::None);
-        // A source in FS, and REPNE before a move, stay with the interpreter.
+        // Source overrides and either repeat prefix retain a native loop.
         let fs_movsd = [0x64, 0xa5];
         let decoded =
             iced_x86::Decoder::with_ip(32, &fs_movsd, 0x1000, iced_x86::DecoderOptions::NONE)
                 .decode();
-        assert!(super::plan(&decoded, 0).is_none());
-        assert!(plan(|a| a.repne().stosd().unwrap()).is_none());
+        assert!(super::plan(&decoded, 0).unwrap().fs);
+        assert_eq!(
+            plan(|a| a.repne().stosd().unwrap()).unwrap().rep,
+            Rep::Repne
+        );
     }
 }

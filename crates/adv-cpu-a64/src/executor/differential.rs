@@ -251,7 +251,7 @@ fn integer(a: &mut CodeAssembler, rng: &mut Rng, w: AsmRegister32, r: AsmRegiste
     }
 }
 
-/// Shifts and double shifts in the forms operation helpers run: narrow
+/// Shifts and double shifts over native partial operands: narrow
 /// and memory destinations, immediate and CL counts across the width.
 fn operations(a: &mut CodeAssembler, rng: &mut Rng, w: AsmRegister32, m: AsmMemoryOperand) {
     if rng.below(2) == 0 {
@@ -1372,7 +1372,7 @@ fn narrow(
             .unwrap()
         };
     }
-    // Unary and flag-reading forms, mostly operation helpers (A64-TR-4).
+    // Unary and flag-reading native forms (A64-TR-4).
     macro_rules! unary {
         ($dst:expr) => {
             match op % 3 {
@@ -1869,7 +1869,7 @@ fn reference(program: &Program, budget: u64) -> (RunOutcome, CpuState, Vec<u8>) 
 }
 
 fn snapshot(memory: &Memory) -> Vec<u8> {
-    let mut bytes = memory.read(DATA, DATA_LEN).unwrap().to_vec();
+    let mut bytes = memory.read_data(DATA, DATA_LEN).unwrap().to_vec();
     bytes.extend_from_slice(
         memory
             .read(STACK, (STACK_TOP + 0x1000 - STACK) as usize)

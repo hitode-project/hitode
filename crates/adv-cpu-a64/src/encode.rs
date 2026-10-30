@@ -798,6 +798,22 @@ pub const fn mrs_fpsr(rt: Reg) -> u32 {
     0xD53B_4420 | rt.number()
 }
 
+/// `mrs rt, fpcr`.
+pub const fn mrs_fpcr(rt: Reg) -> u32 {
+    0xD53B_4400 | rt.number()
+}
+
+/// `msr fpcr, rt`.
+pub const fn msr_fpcr(rt: Reg) -> u32 {
+    0xD51B_4400 | rt.number()
+}
+
+/// Scalar or packed binary32/64 square root.
+pub const fn fsqrt(scalar: bool, double: bool, rd: VReg, rn: VReg) -> u32 {
+    let base = if scalar { 0x1E21_C000 } else { 0x6EA1_F800 };
+    base | (double as u32) << 22 | rn.number() << 5 | rd.number()
+}
+
 /// `msr fpsr, rt`.
 pub const fn msr_fpsr(rt: Reg) -> u32 {
     0xD51B_4420 | rt.number()

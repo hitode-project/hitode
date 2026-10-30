@@ -73,7 +73,22 @@ pub struct X87 {
 
 /// The `X87` for `instruction`, whose interpreter helper is `helper`.
 pub fn plan(instruction: &Instruction, helper: u8, opcode: Option<u16>) -> Option<X87> {
-    let fast = fast::classify(instruction)?;
+    let fast = match instruction.mnemonic() {
+        iced_x86::Mnemonic::Fld if instruction.memory_size().size() == 10 => Fast::Load80,
+        iced_x86::Mnemonic::Fstp if instruction.memory_size().size() == 10 => Fast::Store80,
+        m @ (iced_x86::Mnemonic::Fsin
+        | iced_x86::Mnemonic::Fcos
+        | iced_x86::Mnemonic::Fsincos
+        | iced_x86::Mnemonic::Fptan
+        | iced_x86::Mnemonic::Fpatan
+        | iced_x86::Mnemonic::F2xm1
+        | iced_x86::Mnemonic::Fyl2x
+        | iced_x86::Mnemonic::Fyl2xp1
+        | iced_x86::Mnemonic::Fscale
+        | iced_x86::Mnemonic::Fprem
+        | iced_x86::Mnemonic::Fprem1) => Fast::Leaf(m),
+        _ => fast::classify(instruction)?,
+    };
     let mem = if instruction.op0_kind() == OpKind::Memory {
         Some(memory(instruction)?)
     } else {
@@ -235,6 +250,7 @@ impl Translator<'_> {
         let mut dp = x.mem.is_some();
         let mut metadata = true;
         match x.fast {
+            Fast::Load80 | Fast::Store80 | Fast::Leaf(_) => unreachable!("cached forms"),
             Fast::Wait => metadata = false,
             Fast::Round => self.x87_round(slow),
             Fast::Scale => self.x87_scale(slow),

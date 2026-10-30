@@ -1323,7 +1323,7 @@ fn string_operation(i: &Instruction) -> Option<StringOp> {
     if i.has_lock_prefix()
         || !matches!(
             i.segment_prefix(),
-            R::None | R::CS | R::DS | R::ES | R::SS | R::FS
+            R::None | R::CS | R::DS | R::ES | R::SS | R::FS | R::GS
         )
     {
         return None;

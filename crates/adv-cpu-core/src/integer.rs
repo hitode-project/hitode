@@ -103,7 +103,12 @@ impl Address {
         {
             return None;
         }
-        if !lea && !matches!(i.memory_segment(), R::DS | R::SS | R::ES | R::CS | R::FS) {
+        if !lea
+            && !matches!(
+                i.memory_segment(),
+                R::DS | R::SS | R::ES | R::CS | R::FS | R::GS
+            )
+        {
             return None;
         }
         // In a displacement-only address the decoder retains the address width

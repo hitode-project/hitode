@@ -35,7 +35,7 @@ impl Unit {
                     || i.call.is_some()
                     || matches!(
                         i.op,
-                        super::decode::Op::Helper(_) | super::decode::Op::Apply(_)
+                        super::decode::Op::Helper(_) | super::decode::Op::Parts(_)
                     )
                     || checked(i.pc)
                     || (n != 0 && (self.trace.head(start + n) || self.trace.merge[start + n]))

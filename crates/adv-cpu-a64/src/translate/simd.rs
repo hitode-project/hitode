@@ -10,7 +10,7 @@
 //! entry (`translate::residency`): internal edges publish what it does not
 //! count dirty and load what they lack of it.
 //! A helper may change any register, so the cache is forgotten after one;
-//! d8-d15 survive the Rust calls between, and the `access` and `apply`
+//! d8-d15 survive the Rust calls between, and the `access`
 //! stubs keep v0-v7 and v16-v23.
 //!
 //! An MMX instruction without the x87 guard (`Guards::ready`) leaves for
@@ -59,7 +59,7 @@ use super::residency::Entry;
 use crate::asm::Label;
 use crate::jit_map::Part;
 
-use super::{Cold, RUNTIME, Translator, WINDOW, X5, X13, X14, X16, X17, host};
+use super::{Cold, RUNTIME, Translator, WINDOW, X5, X6, X13, X14, X16, X17, host};
 
 const V0: VReg = VReg::new(0);
 const V1: VReg = VReg::new(1);
@@ -84,7 +84,8 @@ pub enum Kind {
     /// Scalar register moves: only the lane of `1 << log2` bytes changes.
     MoveLow(u8),
     MoveHalf(bool),
-    PackedToInt(bool),
+    MaskMove,
+    PackedToInt(bool, bool),
     SignMask(bool),
     ShuffleWords(bool),
     Shufpd,
@@ -132,15 +133,16 @@ pub enum Kind {
     /// Single to double precision, packed or scalar (`true`).
     Widen(bool),
     /// Scalar double to single precision.
-    Narrow,
+    Narrow(bool),
+    Approximate(bool, bool),
     /// COMIS/UCOMIS, using the interpreter for NaNs.
     FlagCompare(bool),
     /// CMPPS/CMPSS/CMPPD/CMPSD: scalar and double-precision selectors.
     Compare(bool, bool),
     /// `maxps` (true) or `minps`, or their scalar forms (`.1`).
-    MinMax(bool, bool),
+    MinMax(bool, bool, bool),
+    Sqrt(bool, bool),
     /// `cvtps2pi`, or `cvttps2pi` (true).
-    ToInt(bool),
     /// `movlps` or `movhps` (true): a 64-bit half to or from memory.
     Half(bool),
 }
@@ -162,7 +164,7 @@ pub struct Simd {
 
 impl Simd {
     pub fn memory(&self) -> bool {
-        self.dst == Loc::Mem || self.src == Loc::Mem
+        self.dst == Loc::Mem || self.src == Loc::Mem || self.kind == Kind::MaskMove
     }
 
     /// Whether it is an MMX instruction, with the x87 effects of one.
@@ -182,11 +184,11 @@ impl Simd {
                 | Kind::ScalarToInt(..)
                 | Kind::FromInt(_)
                 | Kind::Widen(_)
-                | Kind::Narrow
+                | Kind::Narrow(..)
                 | Kind::FlagCompare(_)
                 | Kind::Compare(..)
                 | Kind::MinMax(..)
-                | Kind::ToInt(_)
+                | Kind::Sqrt(..)
         )
     }
 
@@ -194,13 +196,13 @@ impl Simd {
     fn inexact(&self) -> bool {
         matches!(
             self.kind,
-            Kind::Float(..)
+            Kind::Sqrt(..)
+                | Kind::Float(..)
                 | Kind::Double(..)
                 | Kind::ScalarFromInt(false)
                 | Kind::ScalarToInt(..)
                 | Kind::FromInt(false)
-                | Kind::Narrow
-                | Kind::ToInt(_)
+                | Kind::Narrow(..)
         )
     }
 
@@ -208,10 +210,12 @@ impl Simd {
     fn double(&self) -> bool {
         matches!(
             self.kind,
-            Kind::Compare(_, true)
+            Kind::Sqrt(_, true)
+                | Kind::MinMax(_, _, true)
+                | Kind::Compare(_, true)
                 | Kind::Double(..)
                 | Kind::FlagCompare(true)
-                | Kind::Narrow
+                | Kind::Narrow(..)
                 | Kind::ScalarToInt(true, _)
         )
     }
@@ -219,12 +223,13 @@ impl Simd {
     /// Whether a `floating` instruction reads only the low lane.
     fn scalar(&self) -> bool {
         match self.kind {
-            Kind::Float(_, scalar)
+            Kind::Sqrt(scalar, _)
+            | Kind::Float(_, scalar)
             | Kind::Double(_, scalar)
             | Kind::Compare(scalar, _)
-            | Kind::MinMax(_, scalar)
+            | Kind::MinMax(_, scalar, _)
             | Kind::Widen(scalar) => scalar,
-            Kind::FlagCompare(_) | Kind::Narrow | Kind::ScalarToInt(..) => true,
+            Kind::FlagCompare(_) | Kind::Narrow(true) | Kind::ScalarToInt(..) => true,
             _ => false,
         }
     }
@@ -267,7 +272,7 @@ impl Simd {
             | Kind::ExtractWord
             | Kind::ByteMask
             | Kind::StoreControl
-            | Kind::PackedToInt(_)
+            | Kind::PackedToInt(..)
             | Kind::SignMask(_)
             | Kind::ShuffleWords(_) => false,
             Kind::ShiftBytes(_) => self.imm < 16,
@@ -279,7 +284,7 @@ impl Simd {
             _ => !self.floating(),
         };
         let writes = match self.kind {
-            Kind::FlagCompare(_) => 0,
+            Kind::FlagCompare(_) | Kind::MaskMove => 0,
             _ => bit(self.dst),
         };
         (
@@ -341,6 +346,31 @@ pub fn plan(instruction: &Instruction, helper: u8) -> Option<Simd> {
         OpKind::Immediate8 => Some(Loc::Imm),
         _ => None,
     };
+    if matches!(instruction.mnemonic(), M::Maskmovq | M::Maskmovdqu) {
+        return Some(Simd {
+            kind: Kind::MaskMove,
+            dst: loc(1)?,
+            src: loc(2)?,
+            mem: Mem {
+                base: Some(7),
+                fs: instruction.segment_prefix() == iced_x86::Register::FS,
+                address_bits: if instruction.op0_kind() == OpKind::MemorySegDI {
+                    16
+                } else {
+                    32
+                },
+                ..NO_MEM
+            },
+            imm: 0,
+            width: if instruction.mnemonic() == M::Maskmovq {
+                8
+            } else {
+                16
+            },
+            aligned: false,
+            helper,
+        });
+    }
     let mnemonic = instruction.mnemonic();
     let (dst, src) = match instruction.op_count() {
         0 => (Loc::Imm, Loc::Imm),
@@ -357,7 +387,23 @@ pub fn plan(instruction: &Instruction, helper: u8) -> Option<Simd> {
         M::Pmuludq => Kind::MulDwords,
         M::Psadbw => Kind::SadBytes,
         M::Movlhps | M::Movhlps => Kind::MoveHalf(mnemonic == M::Movlhps),
-        M::Cvttps2dq | M::Cvtps2dq => Kind::PackedToInt(mnemonic == M::Cvttps2dq),
+        M::Cvttps2dq
+        | M::Cvtps2dq
+        | M::Cvtpd2dq
+        | M::Cvttpd2dq
+        | M::Cvtps2pi
+        | M::Cvttps2pi
+        | M::Cvtpd2pi
+        | M::Cvttpd2pi => Kind::PackedToInt(
+            matches!(
+                mnemonic,
+                M::Cvttps2dq | M::Cvttpd2dq | M::Cvttps2pi | M::Cvttpd2pi
+            ),
+            matches!(
+                mnemonic,
+                M::Cvtpd2dq | M::Cvttpd2dq | M::Cvtpd2pi | M::Cvttpd2pi
+            ),
+        ),
         M::Movq2dq | M::Movdq2q => Kind::Move,
         M::Movd
         | M::Movq
@@ -468,23 +514,35 @@ pub fn plan(instruction: &Instruction, helper: u8) -> Option<Simd> {
         M::Subsd => Kind::Double(Float::Fsub, true),
         M::Mulsd => Kind::Double(Float::Fmul, true),
         M::Divsd => Kind::Double(Float::Fdiv, true),
-        M::Cvtdq2ps => Kind::FromInt(false),
-        M::Cvtdq2pd => Kind::FromInt(true),
+        M::Divpd => Kind::Double(Float::Fdiv, false),
+        M::Sqrtss => Kind::Sqrt(true, false),
+        M::Sqrtsd => Kind::Sqrt(true, true),
+        M::Sqrtps => Kind::Sqrt(false, false),
+        M::Sqrtpd => Kind::Sqrt(false, true),
+        M::Maxpd => Kind::MinMax(true, false, true),
+        M::Minpd => Kind::MinMax(false, false, true),
+        M::Maxsd => Kind::MinMax(true, true, true),
+        M::Minsd => Kind::MinMax(false, true, true),
+        M::Cvtdq2ps | M::Cvtpi2ps => Kind::FromInt(false),
+        M::Cvtdq2pd | M::Cvtpi2pd => Kind::FromInt(true),
         M::Cvtps2pd => Kind::Widen(false),
         M::Cvtss2sd => Kind::Widen(true),
-        M::Cvtsd2ss => Kind::Narrow,
+        M::Cvtsd2ss => Kind::Narrow(true),
+        M::Cvtpd2ps => Kind::Narrow(false),
+        M::Rcpps | M::Rcpss | M::Rsqrtps | M::Rsqrtss => Kind::Approximate(
+            matches!(mnemonic, M::Rsqrtps | M::Rsqrtss),
+            matches!(mnemonic, M::Rcpss | M::Rsqrtss),
+        ),
         M::Comiss | M::Ucomiss => Kind::FlagCompare(false),
         M::Comisd | M::Ucomisd => Kind::FlagCompare(true),
         M::Cmpps => Kind::Compare(false, false),
         M::Cmpss => Kind::Compare(true, false),
         M::Cmppd => Kind::Compare(false, true),
         M::Cmpsd => Kind::Compare(true, true),
-        M::Maxps => Kind::MinMax(true, false),
-        M::Minps => Kind::MinMax(false, false),
-        M::Maxss => Kind::MinMax(true, true),
-        M::Minss => Kind::MinMax(false, true),
-        M::Cvtps2pi => Kind::ToInt(false),
-        M::Cvttps2pi => Kind::ToInt(true),
+        M::Maxps => Kind::MinMax(true, false, false),
+        M::Minps => Kind::MinMax(false, false, false),
+        M::Maxss => Kind::MinMax(true, true, false),
+        M::Minss => Kind::MinMax(false, true, false),
         M::Movlps | M::Movlpd => Kind::Half(false),
         M::Movhps | M::Movhpd => Kind::Half(true),
         _ => return None,
@@ -499,24 +557,27 @@ pub fn plan(instruction: &Instruction, helper: u8) -> Option<Simd> {
     let (d, s) = (class(dst), class(src));
     let valid = match kind {
         Kind::Emms => true,
+        Kind::MaskMove => unreachable!("implicit memory plan"),
         Kind::SignMask(_) => d == 3 && s == 2,
         Kind::ShuffleWords(_) | Kind::Shufpd => d == 2 && (s == 2 || src == Loc::Mem),
-        Kind::ExtractWord | Kind::ByteMask => d == 3 && matches!(s, 1 | 2),
+        Kind::ExtractWord => (d == 3 || dst == Loc::Mem) && matches!(s, 1 | 2),
+        Kind::ByteMask => d == 3 && matches!(s, 1 | 2),
         Kind::InsertWord => matches!(d, 1 | 2) && (s == 3 || src == Loc::Mem),
         Kind::StoreControl => dst == Loc::Mem,
         Kind::LoadControl => src == Loc::Mem,
         Kind::MoveHalf(_) => d == 2 && s == 2,
-        Kind::PackedToInt(_) => d == 2 && (s == 2 || src == Loc::Mem),
+        Kind::PackedToInt(..) => matches!(d, 1 | 2) && (s == 2 || src == Loc::Mem),
         Kind::ShiftBytes(_) => d == 2 && src == Loc::Imm,
         Kind::ScalarFromInt(_) => d == 2 && (s == 3 || src == Loc::Mem),
+        Kind::Approximate(..) => d == 2 && (s == 2 || src == Loc::Mem),
+        Kind::FromInt(_) => d == 2 && matches!(s, 0..=2),
         Kind::ScalarToInt(..) => d == 3 && (s == 2 || src == Loc::Mem),
-        Kind::ToInt(_) => d == 1 && (s == 2 || src == Loc::Mem),
         Kind::Half(_) => d == 2 && src == Loc::Mem || dst == Loc::Mem && s == 2,
-        Kind::Float(..)
+        Kind::Sqrt(..)
+        | Kind::Float(..)
         | Kind::Double(..)
-        | Kind::FromInt(_)
         | Kind::Widen(_)
-        | Kind::Narrow
+        | Kind::Narrow(..)
         | Kind::FlagCompare(_)
         | Kind::Compare(..)
         | Kind::MinMax(..) => d == 2 && (s == 2 || src == Loc::Mem),
@@ -553,7 +614,7 @@ pub fn plan(instruction: &Instruction, helper: u8) -> Option<Simd> {
             Kind::InsertWord
                 | Kind::StoreControl
                 | Kind::LoadControl
-                | Kind::PackedToInt(_)
+                | Kind::PackedToInt(..)
                 | Kind::FromInt(false)
                 | Kind::ShuffleWords(_)
                 | Kind::Shufpd
@@ -572,6 +633,7 @@ pub fn plan(instruction: &Instruction, helper: u8) -> Option<Simd> {
         size
     } else {
         match mnemonic {
+            M::Cvtps2pi | M::Cvttps2pi | M::Cvtpi2ps | M::Cvtpi2pd => 8,
             M::Movd => 4,
             M::Movq | M::Movsd | M::Movq2dq | M::Movdq2q => 8,
             _ => 16,
@@ -671,6 +733,7 @@ fn vmem(bytes: u8) -> VMem {
 impl Translator<'_> {
     pub(super) fn simd(&mut self, simd: Simd) {
         let mmx = simd.mmx();
+        let first_pe = mmx && simd.floating() && simd.inexact() && !self.vector.guards.fp_pe;
         let ready = self.vector.guards.ready;
         if mmx && !ready {
             self.as_part(Part::SimdGuard, |t| {
@@ -705,11 +768,22 @@ impl Translator<'_> {
             });
             self.vector.guards.ready = true;
         }
+        if mmx {
+            self.pe_ready(first_pe);
+        }
     }
 
     fn simd_body(&mut self, simd: Simd, address: Reg) {
         let full = simd.full();
         match simd.kind {
+            Kind::MaskMove => {
+                self.mask_move(simd, address);
+                return;
+            }
+            Kind::Approximate(root, scalar) => {
+                self.approximate(simd, address, root, scalar);
+                return;
+            }
             Kind::SignMask(double) => {
                 let s = self.register(simd.src);
                 let Loc::Gpr(index) = simd.dst else {
@@ -748,7 +822,9 @@ impl Translator<'_> {
                 self.emit(vins(3, d, u32::from(high), s, u32::from(!high)));
                 return self.written(simd.dst);
             }
-            Kind::PackedToInt(truncate) => return self.packed_to_int(simd, address, truncate),
+            Kind::PackedToInt(truncate, double) => {
+                return self.packed_to_int(simd, address, truncate, double);
+            }
             Kind::Emms => {
                 self.flush_simd();
                 self.cpu();
@@ -758,9 +834,6 @@ impl Translator<'_> {
             }
             Kind::Move => return self.simd_move(simd, address),
             Kind::ExtractWord => {
-                let Loc::Gpr(index) = simd.dst else {
-                    unreachable!()
-                };
                 let s = self.register(simd.src);
                 let lane = u32::from(
                     simd.imm
@@ -770,9 +843,19 @@ impl Translator<'_> {
                             3
                         },
                 );
-                self.clobber(Operand::Guest(index));
-                self.emit(vumov(1, super::ops::result(index), s, lane));
-                self.commit(index);
+                if let Loc::Gpr(index) = simd.dst {
+                    self.clobber(Operand::Guest(index));
+                    self.emit(vumov(1, super::ops::result(index), s, lane));
+                    self.commit(index);
+                } else {
+                    self.emit(vumov(1, X6, s, lane));
+                    self.access(
+                        super::access::Addr::Window(address),
+                        2,
+                        super::access::Dir::Store,
+                        X6,
+                    );
+                }
                 return;
             }
             Kind::ByteMask => {
@@ -876,11 +959,11 @@ impl Translator<'_> {
             | Kind::ScalarToInt(..)
             | Kind::FromInt(_)
             | Kind::Widen(_)
-            | Kind::Narrow
+            | Kind::Narrow(..)
             | Kind::FlagCompare(_)
             | Kind::Compare(..)
             | Kind::MinMax(..)
-            | Kind::ToInt(_) => {
+            | Kind::Sqrt(..) => {
                 return self.floating(simd, address);
             }
             Kind::ShiftImm(op, log2) => {
@@ -1068,25 +1151,32 @@ impl Translator<'_> {
             | Kind::ScalarToInt(..)
             | Kind::FromInt(_)
             | Kind::Widen(_)
-            | Kind::Narrow
+            | Kind::Narrow(..)
             | Kind::FlagCompare(_)
             | Kind::Compare(..)
             | Kind::MinMax(..)
-            | Kind::ToInt(_)
+            | Kind::MaskMove
+            | Kind::Approximate(..)
+            | Kind::Sqrt(..)
             | Kind::Half(_)
             | Kind::SignMask(_)
             | Kind::MoveHalf(_)
-            | Kind::PackedToInt(_) => unreachable!(),
+            | Kind::PackedToInt(..) => unreachable!(),
         }
         self.written(simd.dst);
     }
 
     /// Packed binary32 conversions use the interpreter's rounding and sticky
     /// exception rules, including integer indefinite on every invalid lane.
-    fn packed_to_int(&mut self, simd: Simd, address: Reg, truncate: bool) {
+    fn packed_to_int(&mut self, simd: Simd, address: Reg, truncate: bool, double: bool) {
         use super::{X0, X1, X2, X6};
         let s = if simd.src == Loc::Mem {
-            self.simd_access(VMem::Q, V1, address, false);
+            self.simd_access(
+                if simd.width == 8 { VMem::D } else { VMem::Q },
+                V1,
+                address,
+                false,
+            );
             V1
         } else {
             self.register(simd.src)
@@ -1094,29 +1184,48 @@ impl Translator<'_> {
         self.cpu();
         self.emit_all(&[ldr(W, X13, X5, runtime::MXCSR), movz(W, X0, 0, 0)]);
         let temp = VReg::new(3);
-        for lane in 0..4 {
+        self.emit(vzero(true, V0));
+        for lane in 0..if double || matches!(simd.dst, Loc::Mmx(_)) {
+            2
+        } else {
+            4
+        } {
             let (normal, daz, converted, invalid) = (
                 self.asm.label(),
                 self.asm.label(),
                 self.asm.label(),
                 self.asm.label(),
             );
-            self.emit_all(&[vumov(2, X16, s, lane), ubfx(W, X17, X16, 23, 8)]);
+            self.emit_all(&[
+                vumov(if double { 3 } else { 2 }, X16, s, lane),
+                ubfx(
+                    if double { X } else { W },
+                    X17,
+                    X16,
+                    if double { 52 } else { 23 },
+                    if double { 11 } else { 8 },
+                ),
+            ]);
             self.asm.cbz(W, true, X17, normal);
-            self.emit(lsl_imm(W, X17, X16, 1));
-            self.asm.cbz(W, false, X17, normal);
+            self.emit(lsl_imm(if double { X } else { W }, X17, X16, 1));
+            self.asm.cbz(if double { X } else { W }, false, X17, normal);
             self.asm.tbz(true, X13, 6, daz);
             self.emit(orr_imm(W, X0, X0, 2));
             self.asm.b(normal);
             self.asm.bind(daz);
-            self.emit(and_imm(W, X16, X16, 1 << 31));
+            self.emit(and_imm(
+                if double { X } else { W },
+                X16,
+                X16,
+                1 << if double { 63 } else { 31 },
+            ));
             self.asm.bind(normal);
-            self.emit_all(&[
-                msr_fpsr(Reg::ZR),
-                fmov_to_v(W, temp, X16),
-                unary(Unary::Widen, temp, temp),
-                fmov_from_v(X, X1, temp),
-            ]);
+            self.emit(msr_fpsr(Reg::ZR));
+            self.emit(fmov_to_v(if double { X } else { W }, temp, X16));
+            if !double {
+                self.emit(unary(Unary::Widen, temp, temp));
+            }
+            self.emit(fmov_from_v(X, X1, temp));
             if truncate {
                 self.emit(unary(Unary::Frintz, V2, temp));
             } else {
@@ -1165,7 +1274,7 @@ impl Translator<'_> {
             str(W, X13, X5, runtime::MXCSR),
         ]);
         let d = self.destination(simd.dst, false);
-        self.emit(vmov(true, d, V0));
+        self.emit(vmov(simd.full(), d, V0));
         self.written(simd.dst);
     }
 
@@ -1222,6 +1331,109 @@ impl Translator<'_> {
             self.simd_access(VMem::D, V1, address, false);
             self.emit(vins(3, d, lane, V1, 0));
             self.written(simd.dst);
+        }
+    }
+
+    fn approximate(&mut self, simd: Simd, address: Reg, root: bool, scalar: bool) {
+        use super::{X0, X1};
+        let source = if simd.src == Loc::Mem {
+            self.simd_access(if scalar { VMem::S } else { VMem::Q }, V1, address, false);
+            V1
+        } else {
+            self.register(simd.src)
+        };
+        self.canonicalize();
+        // Approximations ignore MXCSR and never publish exceptions.
+        self.emit_all(&[mrs_nzcv(X13), mrs_fpcr(X14), msr_fpcr(Reg::ZR)]);
+        let v3 = VReg::new(3);
+        for lane in 0..if scalar { 1 } else { 4 } {
+            let [nan, small, negative, infinite, finish] =
+                std::array::from_fn(|_| self.asm.label());
+            self.emit_all(&[
+                vumov(2, X16, source, lane),
+                and_imm(W, X17, X16, 0x7fff_ffff),
+                and_imm(W, X1, X16, 1 << 31),
+                movz(W, X0, 0x7f80, 16),
+                cmp(W, X17, X0, Shift::Lsl, 0),
+            ]);
+            self.asm.b_cond(Cond::Hi, nan);
+            self.emit(cmp_imm(W, X17, 0x800, true));
+            self.asm.b_cond(Cond::Lo, small);
+            if root {
+                self.asm.tbz(true, X16, 31, negative);
+            }
+            self.emit(cmp(W, X17, X0, Shift::Lsl, 0));
+            self.asm.b_cond(Cond::Eq, infinite);
+            self.emit(fmov_to_v(W, V2, X16));
+            if root {
+                self.emit(fsqrt(true, false, V2, V2));
+            }
+            self.emit_all(&[
+                movz(W, X0, 0x3f80, 16),
+                fmov_to_v(W, v3, X0),
+                sfloat(Float::Fdiv, V2, v3, V2),
+                fmov_from_v(W, X6, V2),
+                add_imm(W, X6, X6, 0x800, false),
+                and_imm(W, X6, X6, 0xffff_f000),
+                and_imm(W, X17, X6, 0x7f80_0000),
+            ]);
+            self.asm.cbz(W, false, X17, infinite);
+            self.asm.b(finish);
+            self.asm.bind(nan);
+            self.emit(orr_imm(W, X6, X16, 0x0040_0000));
+            self.asm.b(finish);
+            self.asm.bind(small);
+            self.emit(orr(W, X6, X1, X0, Shift::Lsl, 0));
+            self.asm.b(finish);
+            self.asm.bind(negative);
+            self.emit(movz(W, X6, 0xffc0, 16));
+            self.asm.b(finish);
+            self.asm.bind(infinite);
+            self.emit(mov(W, X6, X1));
+            self.asm.bind(finish);
+            self.emit(vins_general(2, V0, lane, X6));
+        }
+        self.emit_all(&[msr_fpcr(X14), msr_nzcv(X13)]);
+        let destination = self.destination(simd.dst, scalar);
+        self.emit(if scalar {
+            vins(2, destination, 0, V0, 0)
+        } else {
+            vmov(true, destination, V0)
+        });
+        self.written(simd.dst);
+    }
+
+    fn mask_move(&mut self, simd: Simd, address: Reg) {
+        self.canonicalize();
+        let data = self.register(simd.dst);
+        let mask = self.register(simd.src);
+        let slow = self.bail();
+        let guest = Reg::new(7);
+        self.emit(mov(W, guest, address));
+        *self.uses_permissions = true;
+        // Check every selected byte before any store; unselected bytes are untouched.
+        for lane in 0..u32::from(simd.width) {
+            let skip = self.asm.label();
+            self.emit(vumov(0, X6, mask, lane));
+            self.asm.tbz(false, X6, 7, skip);
+            self.emit(add_imm(X, X16, guest, lane, false));
+            self.asm.tbz(true, X16, 32, slow);
+            self.checked_base(X16, true, super::X2, slow);
+            self.checked_alias(X16, true, slow);
+            self.asm.bind(skip);
+        }
+        self.emit(ldr(X, super::X2, RUNTIME, runtime::ALIAS));
+        for lane in 0..u32::from(simd.width) {
+            let skip = self.asm.label();
+            self.emit(vumov(0, X6, mask, lane));
+            self.asm.tbz(false, X6, 7, skip);
+            self.emit_all(&[
+                vumov(0, X6, data, lane),
+                add_imm(W, X16, guest, lane, false),
+            ]);
+            self.site();
+            self.emit(str_narrow(Narrow::Byte, X6, super::X2, X16));
+            self.asm.bind(skip);
         }
     }
 
@@ -1292,7 +1504,7 @@ impl Translator<'_> {
             self.clobber(Operand::Guest(index));
             self.emit(fmov_from_v(W, super::ops::result(index), V0));
             self.commit(index);
-            self.pe_ready(first_pe);
+            self.pe_ready(first_pe && !simd.mmx());
             return;
         }
         if matches!(simd.kind, Kind::FlagCompare(_)) {
@@ -1314,23 +1526,35 @@ impl Translator<'_> {
             simd.dst,
             matches!(
                 simd.kind,
-                Kind::Widen(true) | Kind::Narrow | Kind::ScalarFromInt(_)
+                Kind::Sqrt(true, _)
+                    | Kind::Widen(true)
+                    | Kind::Narrow(true)
+                    | Kind::ScalarFromInt(_)
             ),
         );
+        if simd.kind == Kind::FromInt(false) && simd.width == 8 {
+            let d = self.register(simd.dst);
+            self.emit(vins(3, d, 0, V0, 0));
+            self.written(simd.dst);
+            self.pe_ready(first_pe && !simd.mmx());
+            return;
+        }
         self.emit(match simd.kind {
             Kind::Compare(true, double) => vins(if double { 3 } else { 2 }, d, 0, V0, 0),
-            Kind::ScalarFromInt(false)
+            Kind::Sqrt(true, false)
+            | Kind::ScalarFromInt(false)
             | Kind::Float(_, true)
-            | Kind::MinMax(_, true)
-            | Kind::Narrow => vins(2, d, 0, V0, 0),
-            Kind::ScalarFromInt(true) | Kind::Double(_, true) | Kind::Widen(true) => {
-                vins(3, d, 0, V0, 0)
-            }
-            Kind::ToInt(_) => vmov(false, d, V0),
+            | Kind::MinMax(_, true, false)
+            | Kind::Narrow(true) => vins(2, d, 0, V0, 0),
+            Kind::Sqrt(true, true)
+            | Kind::MinMax(_, true, true)
+            | Kind::ScalarFromInt(true)
+            | Kind::Double(_, true)
+            | Kind::Widen(true) => vins(3, d, 0, V0, 0),
             _ => vmov(true, d, V0),
         });
         self.written(simd.dst);
-        self.pe_ready(first_pe);
+        self.pe_ready(first_pe && !simd.mmx());
     }
 
     /// An exact slow operation can leave PE clear; finish it, then leave
@@ -1364,8 +1588,7 @@ impl Translator<'_> {
         let [a, _] = operands.inputs;
         let s = operands.s;
         match simd.kind {
-            // Rare: always exact through FPSR.
-            Kind::ToInt(_) => {
+            Kind::Narrow(false) => {
                 self.asm.b(slow);
                 return None;
             }
@@ -1406,6 +1629,18 @@ impl Translator<'_> {
                 }
             }
             _ => {}
+        }
+        if let Kind::Sqrt(scalar, double) = simd.kind {
+            self.floating_op(simd, operands);
+            self.emit(vcompare(Float::Fcmeq, scalar, double, v3, V0, V0));
+            if scalar {
+                self.emit(fmov_from_v(W, X16, v3));
+                self.asm.cbz(W, false, X16, slow);
+            } else {
+                self.emit_all(&[vnot(true, v3, v3), umaxv(v3, v3), fmov_from_v(W, X16, v3)]);
+                self.asm.cbz(W, true, X16, slow);
+            }
+            return None;
         }
         self.floating_op(simd, operands);
         match simd.kind {
@@ -1457,7 +1692,7 @@ impl Translator<'_> {
                 self.asm.cbz(W, true, X16, slow);
                 None
             }
-            Kind::Narrow => {
+            Kind::Narrow(..) => {
                 let tiny = self.result_bits(false, V0, true);
                 let label = self.asm.label();
                 self.asm.cbz(W, false, tiny, label);
@@ -1529,7 +1764,7 @@ impl Translator<'_> {
             return;
         }
         let arr = match simd.kind {
-            Kind::ToInt(_) | Kind::Widen(false) => Arr::S2,
+            Kind::Widen(false) => Arr::S2,
             _ if double => Arr::D2,
             _ => Arr::S4,
         };
@@ -1601,6 +1836,9 @@ impl Translator<'_> {
                 };
                 self.emit_all(&[fcvt_int(W, truncate, X16, source), fmov_to_v(W, V0, X16)]);
             }
+            Kind::Sqrt(scalar, double) => {
+                self.emit(fsqrt(scalar, double, V0, s));
+            }
             Kind::Double(op, true) => self.emit(dfloat(op, V0, d.unwrap(), s)),
             Kind::Double(op, false) => self.emit(vfloat(op, true, V0, d.unwrap(), s) | 1 << 22),
             Kind::FromInt(false) => self.emit(vfromint(V0, s)),
@@ -1613,7 +1851,16 @@ impl Translator<'_> {
             ]),
             Kind::Widen(false) => self.emit(vwiden(V0, s)),
             Kind::Widen(true) => self.emit(unary(Unary::Widen, V0, s)),
-            Kind::Narrow => self.emit(unary(Unary::Narrow, V0, s)),
+            Kind::Narrow(scalar) => {
+                self.emit(unary(Unary::Narrow, V0, s));
+                if !scalar {
+                    self.emit_all(&[
+                        vins(3, V2, 0, s, 1),
+                        unary(Unary::Narrow, V2, V2),
+                        vins(2, V0, 1, V2, 0),
+                    ]);
+                }
+            }
             Kind::FlagCompare(double) => {
                 let d = d.unwrap();
                 // Relational comparisons send every NaN to the original helper,
@@ -1645,22 +1892,17 @@ impl Translator<'_> {
                     self.emit(vnot(true, V0, V0));
                 }
             }
-            Kind::MinMax(max, scalar) => {
+            Kind::MinMax(max, scalar, double) => {
                 let d = d.unwrap();
                 // The first source where it compares above (max) or
                 // below (min) the second, else the second; any NaN is
                 // invalid for the compare.
                 let (a, b) = if max { (d, s) } else { (s, d) };
                 self.emit_all(&[
-                    if scalar {
-                        sfcmgt(V0, a, b)
-                    } else {
-                        vfloat(Float::Fcmgt, true, V0, a, b)
-                    },
+                    vcompare(Float::Fcmgt, scalar, double, V0, a, b),
                     vlogic(Logic::Bsl, true, V0, d, s),
                 ]);
             }
-            Kind::ToInt(truncate) => self.emit(vtoint(truncate, false, V0, s)),
             _ => unreachable!(),
         }
     }
@@ -1681,7 +1923,7 @@ impl Translator<'_> {
             self.asm.tbz(true, X17, if double { 11 } else { 8 }, slow);
             let zeros = match simd.kind {
                 Kind::Float(Float::Fmul, _) | Kind::Double(Float::Fmul, _) => operands.inputs,
-                Kind::Narrow => [Some(operands.s), None],
+                Kind::Narrow(..) => [Some(operands.s), None],
                 _ => [operands.inputs[0], None],
             };
             for zero in zeros.into_iter().flatten() {
@@ -1941,7 +2183,6 @@ mod tests {
                 ret_miss: 0,
                 access: 0,
                 interpret: 0,
-                apply: 0,
                 fault: 0,
             },
             &|_, _| None,

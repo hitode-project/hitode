@@ -73,6 +73,7 @@ pub enum Mode {
 pub struct Inst {
     /// The thunk of a recognized host call (A64-CTL-12).
     pub call: Option<u32>,
+    pub locked: Option<(super::decode::Mem, u8, u8)>,
     pub pc: u32,
     pub next_pc: u32,
     pub op: Op,
@@ -118,6 +119,7 @@ pub struct Trace {
     pub helpers: Vec<Helper>,
     /// What each `Op::Body` calls.
     pub bodies: Vec<Bound>,
+    pub memory_pages: (u32, u32),
 }
 
 /// Where a function entry's calls go instead (A64-CTL-14): `target` while
@@ -176,6 +178,7 @@ impl Trace {
         host: &dyn Fn(u32, u32) -> Option<u32>,
         redirect: &dyn Fn(u32) -> Option<Redirect>,
     ) {
+        self.memory_pages = (memory.base >> 12, (memory.len >> 12) as u32);
         self.insts.clear();
         self.code.clear();
         self.bodies.clear();
@@ -292,7 +295,9 @@ impl Trace {
                 || matches!(
                     op,
                     Op::Simd(super::simd::Simd {
-                        kind: super::simd::Kind::PackedToInt(_),
+                        kind: super::simd::Kind::PackedToInt(..)
+                            | super::simd::Kind::MaskMove
+                            | super::simd::Kind::Approximate(..),
                         ..
                     })
                 ) {
@@ -306,7 +311,8 @@ impl Trace {
                 _ => self.code.push((pc, size)),
             }
             let mut inst = Inst {
-                call: if matches!(op, Op::Helper(_)) && size == 2 {
+                locked: fetcher.locked,
+                call: if matches!(op, Op::Syscall) && size == 2 {
                     let mut bytes = [0; 7];
                     memory
                         .read_into(pc.wrapping_sub(5), &mut bytes)
