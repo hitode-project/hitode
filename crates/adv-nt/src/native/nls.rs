@@ -2,7 +2,7 @@
 
 use adv_cpu::backend::{Guest, Prot};
 use adv_machine::Env;
-use std::mem::MaybeUninit;
+use std::{mem::MaybeUninit, rc::Rc};
 
 // Offsets and RVAs checked against the pinned PE modules' DWARF.
 #[allow(non_upper_case_globals)]
@@ -47,39 +47,40 @@ const NLS_INFO: u32 = 0x723e0;
 const ANSI_TABLE: u32 = 0x2c;
 const LAST_ERROR: u32 = 0x34;
 
-// Short conversions keep their output on the stack; only larger results spill.
+// Short conversions stay inline; the single variable output spills into reusable scratch.
 struct Buffer {
-    stack: [u8; 8192],
+    stack: [u8; 256],
     len: usize,
-    heap: Vec<u8>,
+    heap: usize,
 }
 impl Buffer {
     fn new() -> Self {
         Self {
-            stack: [0; 8192],
+            stack: [0; 256],
             len: 0,
-            heap: Vec::new(),
+            heap: usize::MAX,
         }
     }
-    fn extend_from_slice(&mut self, data: &[u8]) {
+    fn extend_from_slice(&mut self, data: &[u8], heap: &mut Vec<u8>) {
         if self.len + data.len() <= self.stack.len() {
             self.stack[self.len..self.len + data.len()].copy_from_slice(data);
         } else {
-            if self.heap.is_empty() {
-                self.heap.extend_from_slice(&self.stack[..self.len]);
+            if self.heap == usize::MAX {
+                self.heap = heap.len();
+                heap.extend_from_slice(&self.stack[..self.len]);
             }
-            self.heap.extend_from_slice(data);
+            heap.extend_from_slice(data);
         }
         self.len += data.len();
     }
-    fn push(&mut self, ch: u8) {
-        self.extend_from_slice(&[ch]);
+    fn push(&mut self, ch: u8, heap: &mut Vec<u8>) {
+        self.extend_from_slice(&[ch], heap);
     }
-    fn bytes(&self) -> &[u8] {
+    fn bytes<'a>(&'a self, heap: &'a [u8]) -> &'a [u8] {
         if self.len <= self.stack.len() {
             &self.stack[..self.len]
         } else {
-            &self.heap
+            &heap[self.heap..self.heap + self.len]
         }
     }
 }
@@ -92,6 +93,8 @@ struct Writes {
 }
 struct Memory<'a> {
     cpu: &'a dyn Guest,
+    memo: &'a mut super::Memos,
+    heap: &'a mut Vec<u8>,
     scratch: &'a mut [MaybeUninit<u8>],
     copies: &'a mut Vec<Vec<u8>>,
     reads: [(u32, u32); 20],
@@ -103,9 +106,13 @@ impl<'a> Memory<'a> {
         cpu: &'a dyn Guest,
         scratch: &'a mut [MaybeUninit<u8>],
         copies: &'a mut Vec<Vec<u8>>,
+        memo: &'a mut super::Memos,
+        heap: &'a mut Vec<u8>,
     ) -> Self {
         Self {
             cpu,
+            memo,
+            heap,
             scratch,
             copies,
             reads: [(0, 0); 20],
@@ -127,6 +134,9 @@ impl<'a> Memory<'a> {
             return Some(&[]);
         }
         self.track(at, len)?;
+        self.bytes(at, len)
+    }
+    fn bytes(&mut self, at: u32, len: u32) -> Option<&'a [u8]> {
         if !self.cpu.accessible(at, len, Prot::READ) {
             return None;
         }
@@ -173,7 +183,7 @@ impl<'a> Memory<'a> {
     }
     fn number(&mut self, at: u32, value: u32) {
         let mut data = Buffer::new();
-        data.extend_from_slice(&value.to_le_bytes());
+        data.extend_from_slice(&value.to_le_bytes(), self.heap);
         self.output(at, data);
     }
     fn finish(self, result: u32) -> Option<(u64, Writes)> {
@@ -196,9 +206,10 @@ impl<'a> Memory<'a> {
         Some((u64::from(result), self.writes))
     }
 }
-fn commit(cpu: &mut dyn Guest, (result, writes): (u64, Writes)) -> Option<u64> {
+fn commit(env: &mut Env<'_>, (result, writes): (u64, Writes)) -> Option<u64> {
+    let heap = &env.ext.get::<super::Scratch>().0;
     for (at, data) in writes.entries.into_iter().flatten() {
-        cpu.write(at, data.bytes()).ok()?;
+        env.cpu.write(at, data.bytes(heap)).ok()?;
     }
     Some(result)
 }
@@ -207,19 +218,44 @@ fn word(bytes: &[u8], index: u32) -> Option<u16> {
     Some(u16::from_le_bytes(bytes.get(at..at + 2)?.try_into().ok()?))
 }
 
+struct TableData {
+    bytes: Box<[u8]>,
+    max_word: u32,
+    glyph: bool,
+}
+
 // Keep full spans checked and tracked, even when only individual entries are read.
 struct Table<'a> {
     cpu: &'a dyn Guest,
     at: u32,
     len: u32,
     data: Option<&'a [u8]>,
+    memo: Option<Rc<TableData>>,
 }
 impl<'a> Table<'a> {
     fn load(mem: &mut Memory<'a>, at: u32, len: u32) -> Option<Self> {
+        mem.track(at, len)?;
+        let memo = mem
+            .memo
+            .get(mem.cpu, at, len as usize, |bytes| {
+                Rc::new(TableData {
+                    bytes: bytes.into(),
+                    max_word: bytes
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|w| u32::from(u16::from_le_bytes(*w)))
+                        .max()
+                        .unwrap_or(0),
+                    glyph: bytes == [0, 1],
+                })
+            })
+            .cloned();
         let data = if len == 0 {
             Some(&[][..])
+        } else if memo.is_some() {
+            None
         } else {
-            mem.track(at, len)?;
             if !mem.cpu.accessible(at, len, Prot::READ) {
                 return None;
             }
@@ -230,10 +266,42 @@ impl<'a> Table<'a> {
             at,
             len,
             data,
+            memo,
         })
     }
+    fn full(mem: &mut Memory<'a>, at: u32, len: u32) -> Option<Self> {
+        let mut table = Self::load(mem, at, len)?;
+        if table.bytes().is_none() {
+            table.data = Some(mem.bytes(at, len)?);
+        }
+        Some(table)
+    }
+    fn empty(cpu: &'a dyn Guest) -> Self {
+        Self {
+            cpu,
+            at: 0,
+            len: 0,
+            data: Some(&[]),
+            memo: None,
+        }
+    }
+    fn bytes(&self) -> Option<&[u8]> {
+        self.memo.as_ref().map(|m| m.bytes.as_ref()).or(self.data)
+    }
+    fn max_word(&self) -> Option<u32> {
+        if let Some(memo) = &self.memo {
+            return Some(memo.max_word);
+        }
+        (0..self.len / 2).try_fold(0, |end, i| Some(end.max(u32::from(self.word(i)?))))
+    }
+    fn glyph(&self) -> Option<bool> {
+        match &self.memo {
+            Some(memo) => Some(memo.glyph),
+            None => Some(self.word(0)? == 256),
+        }
+    }
     fn byte(&self, index: u32) -> Option<u8> {
-        if let Some(data) = self.data {
+        if let Some(data) = self.bytes() {
             return data.get(index as usize).copied();
         }
         if index >= self.len {
@@ -244,7 +312,7 @@ impl<'a> Table<'a> {
         Some(bytes[0])
     }
     fn word(&self, index: u32) -> Option<u16> {
-        if let Some(data) = self.data {
+        if let Some(data) = self.bytes() {
             return word(data, index);
         }
         let offset = index.checked_mul(2)?;
@@ -312,16 +380,13 @@ impl<'a> CodePage<'a> {
             )?);
         }
         if decode {
-            if glyph && word(mem.read(self.mb + 512, 2)?, 0)? == 256 {
+            if glyph && Table::load(mem, self.mb + 512, 2)?.glyph()? {
                 self.mb += 514;
             }
             self.mb_data = Some(Table::load(mem, self.mb, 512)?);
             if self.offsets != 0 {
                 let offsets = Table::load(mem, self.offsets, 512)?;
-                let mut end = 0;
-                for i in 0..256 {
-                    end = end.max(u32::from(offsets.word(i)?));
-                }
+                let end = offsets.max_word()?;
                 self.offset_data = Some(offsets);
                 self.ranges = Some(Table::load(mem, self.offsets + 512, end * 2)?);
             }
@@ -420,33 +485,35 @@ fn error(mem: &mut Memory<'_>, teb: u32, value: u32) {
 struct Normalization<'a> {
     decomp_size: u32,
     comp_size: u32,
-    l1: &'a [u8],
-    l2: &'a [u8],
-    hashes: &'a [u8],
-    pairs: &'a [u8],
-    seq: &'a [u8],
+    l1: Table<'a>,
+    l2: Table<'a>,
+    hashes: Table<'a>,
+    pairs: Table<'a>,
+    seq: Table<'a>,
 }
 impl<'a> Normalization<'a> {
     fn load(mem: &mut Memory<'a>, table: u32, compose: bool) -> Option<Self> {
-        let header = mem.read(table, 0x44)?;
-        let offset = |field| Some(u32::from(word(header, field / 2)?) * 2);
+        let header = Table::full(mem, table, 0x44)?;
+        let offset = |field| Some(u32::from(header.word(field / 2)?) * 2);
         let mut result = Self {
-            decomp_size: u32::from(word(header, norm::decomp_size / 2)?),
-            comp_size: u32::from(word(header, norm::comp_size / 2)?),
-            l1: &[],
-            l2: &[],
-            hashes: &[],
-            pairs: &[],
-            seq: &[],
+            decomp_size: u32::from(header.word(norm::decomp_size / 2)?),
+            comp_size: u32::from(header.word(norm::comp_size / 2)?),
+            l1: Table::empty(mem.cpu),
+            l2: Table::empty(mem.cpu),
+            hashes: Table::empty(mem.cpu),
+            pairs: Table::empty(mem.cpu),
+            seq: Table::empty(mem.cpu),
         };
         if compose {
-            result.hashes = mem.read(
+            result.hashes = Table::full(
+                mem,
                 table.checked_add(offset(norm::comp_hash)?)?,
                 (result.comp_size + 1) * 2,
             )?;
-            result.seq = mem.read(
+            result.seq = Table::full(
+                mem,
                 table.checked_add(offset(norm::comp_seq)?)?,
-                u32::from(word(result.hashes, result.comp_size)?) * 2,
+                u32::from(result.hashes.word(result.comp_size)?) * 2,
             )?;
         } else {
             let fields = [
@@ -457,10 +524,11 @@ impl<'a> Normalization<'a> {
                 norm::decomp_seq,
                 norm::comp_hash,
             ];
-            let mut slices = [&[][..]; 5];
+            let mut slices = std::array::from_fn::<_, 5, _>(|_| Table::empty(mem.cpu));
             for (i, fields) in fields.windows(2).enumerate() {
                 let start = offset(fields[0])?;
-                slices[i] = mem.read(
+                slices[i] = Table::full(
+                    mem,
                     table.checked_add(start)?,
                     offset(fields[1])?.checked_sub(start)?,
                 )?;
@@ -477,12 +545,12 @@ impl<'a> Normalization<'a> {
     }
     fn compose(&self, a: u16, b: u16) -> Option<u16> {
         let hash = (u32::from(a) + 95 * u32::from(b)).checked_rem(self.comp_size)?;
-        let mut pos = u32::from(word(self.hashes, hash)?);
-        let end = u32::from(word(self.hashes, hash + 1)?);
+        let mut pos = u32::from(self.hashes.word(hash)?);
+        let end = u32::from(self.hashes.word(hash + 1)?);
         while pos < end {
             let mut chars = [0; 3];
             for ch in &mut chars {
-                *ch = word(self.seq, pos)?;
+                *ch = self.seq.word(pos)?;
                 pos += if (0xd800..=0xdbff).contains(ch) { 2 } else { 1 };
             }
             if chars[0] == a && chars[1] == b {
@@ -494,15 +562,14 @@ impl<'a> Normalization<'a> {
     // None inside Some denotes a character with no decomposition.
     fn decompose(&self, ch: u16) -> Option<Option<&[u8]>> {
         let hash = u32::from(ch).checked_rem(self.decomp_size)?;
-        let mut pos = word(self.hashes, hash)?;
+        let mut pos = self.hashes.word(hash)?;
         let encoded = if pos >> 13 != 0 {
-            let off = *self.l1.get(ch as usize / 128)?;
+            let off = self.l1.byte(u32::from(ch) / 128)?;
             let props = if off == 0 || off >= 0xfb {
                 off.rotate_left(5)
             } else {
-                *self
-                    .l2
-                    .get((usize::from(off) - 1) * 128 + ch as usize % 128)?
+                self.l2
+                    .byte((u32::from(off) - 1) * 128 + u32::from(ch) % 128)?
             };
             if props != 0xbf {
                 return Some(None);
@@ -510,38 +577,39 @@ impl<'a> Normalization<'a> {
             pos
         } else {
             let mut i = hash + 1;
-            while i < self.decomp_size && word(self.hashes, i)? >> 13 != 0 {
+            while i < self.decomp_size && self.hashes.word(i)? >> 13 != 0 {
                 i += 1;
             }
             let end = if i < self.decomp_size {
-                word(self.hashes, i)?
+                self.hashes.word(i)?
             } else {
                 let mut end = pos;
-                while word(self.pairs, u32::from(end) * 2)? != 0 {
+                while self.pairs.word(u32::from(end) * 2)? != 0 {
                     end += 1;
                 }
                 end
             };
-            while pos < end && word(self.pairs, u32::from(pos) * 2)? != ch {
+            while pos < end && self.pairs.word(u32::from(pos) * 2)? != ch {
                 pos += 1;
             }
             if pos >= end {
                 return Some(None);
             }
-            word(self.pairs, u32::from(pos) * 2 + 1)?
+            self.pairs.word(u32::from(pos) * 2 + 1)?
         };
         let start = u32::from(encoded & 0x1fff);
         let mut len = u32::from(encoded >> 13);
         if len == 7 {
-            while word(self.seq, start + len)? != 0 {
+            while self.seq.word(start + len)? != 0 {
                 len += 1;
             }
         }
-        if word(self.seq, start)? == 0 {
+        if self.seq.word(start)? == 0 {
             len = 0;
         }
         Some(Some(
             self.seq
+                .bytes()?
                 .get(start as usize * 2..(start + len) as usize * 2)?,
         ))
     }
@@ -579,10 +647,10 @@ fn invalid(cp: &CodePage<'_>, src: &[u8]) -> Option<bool> {
 // spec: NAT-BODY-5
 pub(super) fn multi_byte_to_wide_char(env: &mut Env<'_>) -> Option<u64> {
     let output = multi_byte(env)?;
-    commit(env.cpu, output)
+    commit(env, output)
 }
 
-fn multi_byte(env: &Env<'_>) -> Option<(u64, Writes)> {
+fn multi_byte(env: &mut Env<'_>) -> Option<(u64, Writes)> {
     let (code, flags, src, len, dst, cap) = (
         env.arg(0),
         env.arg(1),
@@ -594,7 +662,10 @@ fn multi_byte(env: &Env<'_>) -> Option<(u64, Writes)> {
     let (base, teb) = (base(env, "kernelbase.dll")?, env.ctx().teb);
     let mut scratch = [MaybeUninit::uninit(); 256 * 1024];
     let mut copies = Vec::new();
-    let mut mem = Memory::new(env.cpu, &mut scratch, &mut copies);
+    env.ext.get_or_default::<super::Memos>();
+    let (memo, heap) = env.ext.get2_mut::<super::Memos, super::Scratch>();
+    heap.0.clear();
+    let mut mem = Memory::new(env.cpu, &mut scratch, &mut copies, memo, &mut heap.0);
     if src == 0 || len == 0 || (dst == 0 && cap != 0) || cap < 0 {
         error(&mut mem, teb, 87);
         return mem.finish(0);
@@ -642,12 +713,12 @@ fn multi_byte(env: &Env<'_>) -> Option<(u64, Writes)> {
             }
             count += chars.len() / 2;
             if cap != 0 {
-                output.extend_from_slice(chars);
+                output.extend_from_slice(chars, mem.heap);
             }
         } else {
             count += 1;
             if cap != 0 {
-                output.extend_from_slice(&ch.to_le_bytes());
+                output.extend_from_slice(&ch.to_le_bytes(), mem.heap);
             }
         }
         i += 1;
@@ -664,10 +735,10 @@ fn multi_byte(env: &Env<'_>) -> Option<(u64, Writes)> {
 
 pub(super) fn wide_char_to_multi_byte(env: &mut Env<'_>) -> Option<u64> {
     let output = wide_char(env)?;
-    commit(env.cpu, output)
+    commit(env, output)
 }
 
-fn wide_char(env: &Env<'_>) -> Option<(u64, Writes)> {
+fn wide_char(env: &mut Env<'_>) -> Option<(u64, Writes)> {
     let (code, flags, src, len, dst, cap, def, used) = (
         env.arg(0),
         env.arg(1),
@@ -681,7 +752,10 @@ fn wide_char(env: &Env<'_>) -> Option<(u64, Writes)> {
     let (base, teb) = (base(env, "kernelbase.dll")?, env.ctx().teb);
     let mut scratch = [MaybeUninit::uninit(); 256 * 1024];
     let mut copies = Vec::new();
-    let mut mem = Memory::new(env.cpu, &mut scratch, &mut copies);
+    env.ext.get_or_default::<super::Memos>();
+    let (memo, heap) = env.ext.get2_mut::<super::Memos, super::Scratch>();
+    heap.0.clear();
+    let mut mem = Memory::new(env.cpu, &mut scratch, &mut copies, memo, &mut heap.0);
     if src == 0 || len == 0 || (dst == 0 && cap != 0) || cap < 0 {
         error(&mut mem, teb, 87);
         return mem.finish(0);
@@ -763,9 +837,9 @@ fn wide_char(env: &Env<'_>) -> Option<(u64, Writes)> {
         count += size;
         if cap != 0 {
             if size == 2 {
-                output.push((encoded >> 8) as u8);
+                output.push((encoded >> 8) as u8, mem.heap);
             }
-            output.push(encoded as u8);
+            output.push(encoded as u8, mem.heap);
         }
         i += consumed;
     }
@@ -784,10 +858,10 @@ fn wide_char(env: &Env<'_>) -> Option<(u64, Writes)> {
 
 fn rtl(env: &mut Env<'_>, wide: bool, oem: bool, size: bool) -> Option<u64> {
     let output = rtl_convert(env, wide, oem, size)?;
-    commit(env.cpu, output)
+    commit(env, output)
 }
 
-fn rtl_convert(env: &Env<'_>, wide: bool, oem: bool, size: bool) -> Option<(u64, Writes)> {
+fn rtl_convert(env: &mut Env<'_>, wide: bool, oem: bool, size: bool) -> Option<(u64, Writes)> {
     let base = base(env, "ntdll.dll")?;
     let (dst, cap, result, src, len) = if size {
         (0, 0, env.arg(0), env.arg(1), env.arg(2))
@@ -796,7 +870,10 @@ fn rtl_convert(env: &Env<'_>, wide: bool, oem: bool, size: bool) -> Option<(u64,
     };
     let mut scratch = [MaybeUninit::uninit(); 256 * 1024];
     let mut copies = Vec::new();
-    let mut mem = Memory::new(env.cpu, &mut scratch, &mut copies);
+    env.ext.get_or_default::<super::Memos>();
+    let (memo, heap) = env.ext.get2_mut::<super::Memos, super::Scratch>();
+    heap.0.clear();
+    let mut mem = Memory::new(env.cpu, &mut scratch, &mut copies, memo, &mut heap.0);
     let mut cp = CodePage::load(&mut mem, base + NLS_INFO + if oem { 0 } else { ANSI_TABLE })?;
     if cp.code == 65001 {
         return None;
@@ -821,9 +898,9 @@ fn rtl_convert(env: &Env<'_>, wide: bool, oem: bool, size: bool) -> Option<(u64,
             }
             if !size {
                 if n == 2 {
-                    output.push((encoded >> 8) as u8);
+                    output.push((encoded >> 8) as u8, mem.heap);
                 }
-                output.push(encoded as u8);
+                output.push(encoded as u8, mem.heap);
             }
             i += 2;
             count += n;
@@ -837,7 +914,7 @@ fn rtl_convert(env: &Env<'_>, wide: bool, oem: bool, size: bool) -> Option<(u64,
                 cp.mb_data.as_ref()?.word(c)?
             };
             if !size {
-                output.extend_from_slice(&ch.to_le_bytes());
+                output.extend_from_slice(&ch.to_le_bytes(), mem.heap);
             }
             i += 1;
             count += 1;

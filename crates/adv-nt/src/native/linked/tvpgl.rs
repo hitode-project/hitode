@@ -3,8 +3,6 @@
 //! word arithmetic, so their pixels match bit for bit. The routines keep
 //! every register but EAX.
 
-use std::borrow::Cow;
-
 use adv_cpu::backend::{Guest, Prot, Reg};
 use adv_machine::{Conv, Env};
 
@@ -90,18 +88,23 @@ fn set(bytes: &mut [u8], index: usize, value: &[u8]) {
 }
 
 /// `len` pixels at `at`, if guest code could access them with `prot`.
-fn view(cpu: &dyn Guest, at: u32, len: usize, prot: Prot) -> Option<Cow<'_, [u8]>> {
+fn view<'a>(
+    cpu: &'a dyn Guest,
+    at: u32,
+    len: usize,
+    prot: Prot,
+    scratch: &'a mut [u8],
+) -> Option<&'a [u8]> {
     let size = u32::try_from(4 * len).ok()?;
     at.checked_add(size)?;
     if !cpu.accessible(at, size, prot) {
         return None;
     }
     if let Some(bytes) = cpu.shared_bytes(at, 4 * len) {
-        return Some(Cow::Borrowed(bytes));
+        return Some(bytes);
     }
-    let mut bytes = vec![0; 4 * len];
-    cpu.read(at, &mut bytes).ok()?;
-    Some(Cow::Owned(bytes))
+    cpu.read(at, scratch).ok()?;
+    Some(scratch)
 }
 
 fn disjoint(a: u32, a_len: usize, b: u32, b_len: usize) -> bool {
@@ -132,25 +135,25 @@ fn alpha_blend(env: &mut Env<'_>) -> Option<u64> {
     if !env.cpu.accessible(dest, size, Prot::RW) {
         return None;
     }
-    let s = view(env.cpu, src, len, Prot::READ)?;
-    // Equal input/output needs a snapshot; disjoint ordinary input can stay
-    // borrowed while only the destination bytes are mutated below.
-    let s = if src == dest {
-        Cow::Owned(s.into_owned())
+    if !env.cpu.accessible(src, size, Prot::READ) {
+        return None;
+    }
+    let (input, output) = super::super::scratch(env.ext, 8 * len).split_at_mut(4 * len);
+    // Equal input/output needs a snapshot; disjoint ordinary input may be borrowed.
+    let source = if src == dest {
+        env.cpu.read(src, input).ok()?;
+        input.as_ptr()
     } else {
-        s
+        view(env.cpu, src, len, Prot::READ, input)?.as_ptr()
     };
-    let source = s.as_ptr();
-    let _owned_source = match s {
-        Cow::Owned(bytes) => Some(bytes),
-        _ => None,
-    };
-    let mut fallback = None;
+    let mut fallback = false;
     let d = match env.cpu.writable_bytes(dest, 4 * len) {
         Some(bytes) => bytes,
-        None => fallback
-            .insert(view(env.cpu, dest, len, Prot::RW)?.into_owned())
-            .as_mut_slice(),
+        None => {
+            fallback = true;
+            env.cpu.read(dest, output).ok()?;
+            &mut *output
+        }
     };
     // SAFETY: the input is either separately owned above or ordinary storage
     // disjoint from the writable destination. No guest mappings change here.
@@ -186,8 +189,8 @@ fn alpha_blend(env: &mut Env<'_>) -> Option<u64> {
     for i in i..len {
         over(d, i);
     }
-    if let Some(bytes) = fallback {
-        env.cpu.write(dest, &bytes).ok()?;
+    if fallback {
+        env.cpu.write(dest, output).ok()?;
     }
     kept(env)
 }
@@ -210,25 +213,25 @@ fn ps_alpha_blend(env: &mut Env<'_>) -> Option<u64> {
     if !env.cpu.accessible(dest, size, Prot::RW) {
         return None;
     }
-    let s = view(env.cpu, src, len, Prot::READ)?;
-    // Equal input/output needs a snapshot; disjoint ordinary input can stay
-    // borrowed while only the destination bytes are mutated below.
-    let s = if src == dest {
-        Cow::Owned(s.into_owned())
+    if !env.cpu.accessible(src, size, Prot::READ) {
+        return None;
+    }
+    let (input, output) = super::super::scratch(env.ext, 8 * len).split_at_mut(4 * len);
+    // Equal input/output needs a snapshot; disjoint ordinary input may be borrowed.
+    let source = if src == dest {
+        env.cpu.read(src, input).ok()?;
+        input.as_ptr()
     } else {
-        s
+        view(env.cpu, src, len, Prot::READ, input)?.as_ptr()
     };
-    let source = s.as_ptr();
-    let _owned_source = match s {
-        Cow::Owned(bytes) => Some(bytes),
-        _ => None,
-    };
-    let mut fallback = None;
+    let mut fallback = false;
     let d = match env.cpu.writable_bytes(dest, 4 * len) {
         Some(bytes) => bytes,
-        None => fallback
-            .insert(view(env.cpu, dest, len, Prot::RW)?.into_owned())
-            .as_mut_slice(),
+        None => {
+            fallback = true;
+            env.cpu.read(dest, output).ok()?;
+            &mut *output
+        }
     };
     // SAFETY: the input is either separately owned above or ordinary storage
     // disjoint from the writable destination. No guest mappings change here.
@@ -243,8 +246,8 @@ fn ps_alpha_blend(env: &mut Env<'_>) -> Option<u64> {
         let out = ps_lerp(pixel(d, len - 1).into(), to, alpha(to)) as u32;
         set(d, len - 1, &out.to_le_bytes());
     }
-    if let Some(bytes) = fallback {
-        env.cpu.write(dest, &bytes).ok()?;
+    if fallback {
+        env.cpu.write(dest, output).ok()?;
     }
     kept(env)
 }
@@ -263,7 +266,9 @@ fn fill_argb(env: &mut Env<'_>) -> Option<u64> {
     if let Some(bytes) = env.cpu.writable_bytes(dest, size as usize) {
         bytes.as_chunks_mut::<4>().0.fill(value.to_le_bytes());
     } else {
-        env.cpu.write(dest, &value.to_le_bytes().repeat(len)).ok()?;
+        let bytes = super::super::scratch(env.ext, 4 * len);
+        bytes.as_chunks_mut::<4>().0.fill(value.to_le_bytes());
+        env.cpu.write(dest, bytes).ok()?;
     }
     Some(u64::from(env.cpu.reg(Reg::Edx)) << 32 | u64::from(value))
 }
@@ -294,21 +299,23 @@ fn interp_stretch_copy(env: &mut Env<'_>) -> Option<u64> {
     {
         return None;
     }
-    let s1 = view(env.cpu, row1, span, Prot::READ)?;
-    let s2 = view(env.cpu, row2, span, Prot::READ)?;
-    let (p1, p2) = (s1.as_ptr(), s2.as_ptr());
-    let _owned1 = match s1 {
-        Cow::Owned(bytes) => Some(bytes),
-        _ => None,
-    };
-    let _owned2 = match s2 {
-        Cow::Owned(bytes) => Some(bytes),
-        _ => None,
-    };
-    let mut fallback = None;
+    let row_bytes = u32::try_from(4 * span).ok()?;
+    if !env.cpu.accessible(row1, row_bytes, Prot::READ)
+        || !env.cpu.accessible(row2, row_bytes, Prot::READ)
+    {
+        return None;
+    }
+    let (rows, output) = super::super::scratch(env.ext, 8 * span + 4 * len).split_at_mut(8 * span);
+    let (top_scratch, bottom_scratch) = rows.split_at_mut(4 * span);
+    let p1 = view(env.cpu, row1, span, Prot::READ, top_scratch)?.as_ptr();
+    let p2 = view(env.cpu, row2, span, Prot::READ, bottom_scratch)?.as_ptr();
+    let mut fallback = false;
     let d = match env.cpu.writable_bytes(dest, 4 * len) {
         Some(bytes) => bytes,
-        None => fallback.insert(vec![0; 4 * len]).as_mut_slice(),
+        None => {
+            fallback = true;
+            &mut *output
+        }
     };
     // SAFETY: both inputs are separately owned or ordinary storage disjoint
     // from the output, and no mapping changes occur during this computation.
@@ -335,8 +342,8 @@ fn interp_stretch_copy(env: &mut Env<'_>) -> Option<u64> {
         let out = lerp(a & 0xffff_ffff, a >> 32, [factor, 0]) as u32;
         set(d, len - 1, &out.to_le_bytes());
     }
-    if let Some(bytes) = fallback {
-        env.cpu.write(dest, &bytes).ok()?;
+    if fallback {
+        env.cpu.write(dest, output).ok()?;
     }
     kept(env)
 }

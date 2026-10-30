@@ -10,10 +10,14 @@
 //! whenever it accepts a call, and declines anything else, such as memory
 //! the function would fault on. Required text services supply a complete handler
 //! and replace the entry in both execution modes, without a trampoline.
+//!
+//! Every crossing records host memory work; attached debugger sessions also keep
+//! durations and outliers. Immutable file inputs retain derived values by pinned
+//! identity, and temporary snapshots reuse execution-owner scratch.
 
 use std::collections::HashMap;
 
-use adv_cpu::backend::{Guest, Prot};
+use adv_cpu::backend::{Guest, HostAccess, Prot};
 use adv_machine::layout::PAGE;
 use adv_machine::{Conv, Env, Ext, HostFn, Outcome, Sys};
 use iced_x86::{Decoder, DecoderOptions, FlowControl, OpKind};
@@ -58,6 +62,177 @@ struct Declines(u64);
 /// The calls whose body declined so far.
 pub fn declines(ext: &Ext) -> u64 {
     ext.try_get::<Declines>().map_or(0, |declines| declines.0)
+}
+
+thread_local! {
+    static DEBUGGER_ATTACHED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The shell's existing debugger lifetime, on the guest execution thread.
+pub fn debugger_attached(attached: bool) {
+    DEBUGGER_ATTACHED.set(attached);
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct BodyCount {
+    pub name: &'static str,
+    pub calls: u64,
+    pub declines: u64,
+    pub timed_calls: u64,
+    pub nanos: u64,
+    pub access: HostAccess,
+}
+impl BodyCount {
+    pub fn since(self, base: Self) -> Self {
+        Self {
+            name: self.name,
+            calls: self.calls - base.calls,
+            declines: self.declines - base.declines,
+            timed_calls: self.timed_calls - base.timed_calls,
+            nanos: self.nanos - base.nanos,
+            access: access_delta(self.access, base.access),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct TailCall {
+    pub body: usize,
+    pub call: u64,
+    pub name: &'static str,
+    pub arguments: [u32; 6],
+    pub duration: std::time::Duration,
+    pub access: HostAccess,
+}
+
+pub struct Boundary {
+    pub bodies: Vec<BodyCount>,
+    tails: [Option<TailCall>; 16],
+    next: usize,
+}
+impl Default for Boundary {
+    fn default() -> Self {
+        Self {
+            bodies: bodies()
+                .map(|body| BodyCount {
+                    name: &body.name,
+                    ..BodyCount::default()
+                })
+                .collect(),
+            tails: [None; 16],
+            next: 0,
+        }
+    }
+}
+impl Boundary {
+    pub fn tails(&self) -> impl Iterator<Item = &TailCall> {
+        (0..16).filter_map(|i| self.tails[(self.next + i) % 16].as_ref())
+    }
+    fn record(
+        &mut self,
+        index: usize,
+        declined: bool,
+        access: HostAccess,
+        elapsed: Option<std::time::Duration>,
+        arguments: [u32; 6],
+    ) {
+        let row = &mut self.bodies[index];
+        row.calls += 1;
+        row.declines += u64::from(declined);
+        row.access.reads += access.reads;
+        row.access.read_bytes += access.read_bytes;
+        row.access.writes += access.writes;
+        row.access.written_bytes += access.written_bytes;
+        row.access.shared_copies += access.shared_copies;
+        row.access.fallbacks += access.fallbacks;
+        row.access.tlb_misses += access.tlb_misses;
+        if let Some(duration) = elapsed {
+            let nanos = duration.as_nanos() as u64;
+            if row.timed_calls != 0 && nanos > 100_000 && nanos > 16 * (row.nanos / row.timed_calls)
+            {
+                self.tails[self.next] = Some(TailCall {
+                    body: index,
+                    call: row.calls,
+                    name: row.name,
+                    arguments,
+                    duration,
+                    access,
+                });
+                self.next = (self.next + 1) % 16;
+            }
+            row.timed_calls += 1;
+            row.nanos += nanos;
+        }
+    }
+}
+fn access_delta(after: HostAccess, before: HostAccess) -> HostAccess {
+    HostAccess {
+        reads: after.reads - before.reads,
+        read_bytes: after.read_bytes - before.read_bytes,
+        writes: after.writes - before.writes,
+        written_bytes: after.written_bytes - before.written_bytes,
+        shared_copies: after.shared_copies - before.shared_copies,
+        fallbacks: after.fallbacks - before.fallbacks,
+        tlb_misses: after.tlb_misses - before.tlb_misses,
+    }
+}
+
+#[derive(Default)]
+struct Scratch(Vec<u8>);
+
+/// Reusable temporary bytes, valid until the next scratch request on this Ext.
+/// They hold stale data from earlier requests: callers write before reading.
+pub fn scratch(ext: &mut Ext, len: usize) -> &mut [u8] {
+    let bytes = &mut ext.get_or_default::<Scratch>().0;
+    bytes.resize(len, 0);
+    bytes
+}
+
+struct MemoValue {
+    pinned: adv_cpu::backend::Pinned,
+    value: Box<dyn std::any::Any>,
+}
+#[derive(Default)]
+struct Memos(HashMap<(u32, usize, std::any::TypeId), MemoValue>);
+impl Memos {
+    fn get<T: 'static>(
+        &mut self,
+        cpu: &dyn Guest,
+        addr: u32,
+        len: usize,
+        derive: impl FnOnce(&[u8]) -> T,
+    ) -> Option<&T> {
+        let key = (addr, len, std::any::TypeId::of::<T>());
+        if !self
+            .0
+            .get(&key)
+            .is_some_and(|memo| cpu.still_pinned(&memo.pinned))
+        {
+            let pinned = cpu.pinned(addr, len)?;
+            let mut bytes = vec![0; len];
+            cpu.read(addr, &mut bytes).ok()?;
+            self.0.insert(
+                key,
+                MemoValue {
+                    pinned,
+                    value: Box::new(derive(&bytes)),
+                },
+            );
+        }
+        self.0.get(&key)?.value.downcast_ref()
+    }
+}
+
+/// Derive immutable guest data once per retained file identity.
+pub fn memo<'a, T: 'static>(
+    env: &'a mut Env<'_>,
+    addr: u32,
+    len: usize,
+    derive: impl FnOnce(&[u8]) -> T,
+) -> Option<&'a T> {
+    env.ext
+        .get_or_default::<Memos>()
+        .get(env.cpu, addr, len, derive)
 }
 
 static BODIES: std::sync::LazyLock<Vec<Body>> = std::sync::LazyLock::new(|| {
@@ -186,11 +361,45 @@ fn body_at(index: usize) -> &'static Body {
 fn run(env: &mut Env<'_>) -> Outcome {
     let index = env.sys.thunks.get(env.thunk).f.data as usize;
     let body = body_at(index);
-    let Some(run) = body.body else {
-        return (body.handler)(env);
+    run_body(env, index, body)
+}
+
+fn run_body(env: &mut Env<'_>, index: usize, body: &'static Body) -> Outcome {
+    let timed = DEBUGGER_ATTACHED.get();
+    let arguments = if timed {
+        std::array::from_fn(|i| {
+            if i < usize::from(body.conv.argc()) {
+                env.arg(i as u32)
+            } else {
+                0
+            }
+        })
+    } else {
+        [0; 6]
     };
-    match run(env) {
-        Some(value) => Outcome::Return64(value),
+    let before = env.cpu.host_access();
+    let start = timed.then(std::time::Instant::now);
+    let result = match body.body {
+        Some(run) => run(env).map(Outcome::Return64),
+        None => Some((body.handler)(env)),
+    };
+    let elapsed = start.map(|start| start.elapsed());
+    let access = access_delta(env.cpu.host_access(), before);
+    #[cfg(any(debug_assertions, test))]
+    assert!(
+        result.is_some() || access.writes == 0,
+        "{} declined after guest writes (NAT-BODY-1)",
+        body.name
+    );
+    env.ext.get_or_default::<Boundary>().record(
+        index,
+        result.is_none(),
+        access,
+        elapsed,
+        arguments,
+    );
+    match result {
+        Some(outcome) => outcome,
         None => {
             env.ext.get_or_default::<Declines>().0 += 1;
             (body.handler)(env)
@@ -408,3 +617,6 @@ fn query_performance_counter(env: &mut Env<'_>) -> Option<u64> {
     env.sys.poll_observation();
     Some(u64::from(crate::status::SUCCESS))
 }
+
+#[cfg(test)]
+mod tests;

@@ -162,14 +162,18 @@ pub(super) fn mix(env: &mut Env<'_>) -> Option<u64> {
         .clone();
     let table = module.table()?;
     let pe_address = |name: &str| table.named(name).map(|f| module.base + f.rva);
+    let (mxcsr, control) = (env.arg(4), env.arg(5));
+    env.ext.get_or_default::<Verified>();
+    let (verified, scratch) = env.ext.get2_mut::<Verified, super::Scratch>();
     // Function pointers can be hooked independently of the mixer itself.
-    let identify = |cpu: &dyn Guest, verified: &mut Verified, address: u32| -> Option<&str> {
+    let mut identify = |cpu: &dyn Guest, verified: &mut Verified, address: u32| -> Option<&str> {
         let f = table.at(address.checked_sub(module.base)?)?;
         if module.base + f.rva != address {
             return None;
         }
-        let mut bytes = vec![0; f.size as usize];
-        cpu.read(address, &mut bytes).ok()?;
+        let bytes = &mut scratch.0;
+        bytes.resize(f.size as usize, 0);
+        cpu.read(address, bytes).ok()?;
         if verified
             .0
             .get(&address)
@@ -180,12 +184,10 @@ pub(super) fn mix(env: &mut Env<'_>) -> Option<u64> {
             {
                 return None;
             }
-            verified.0.insert(address, bytes.into());
+            verified.0.insert(address, bytes.as_slice().into());
         }
         Some(&f.name)
     };
-    let (mxcsr, control) = (env.arg(4), env.arg(5));
-    let verified = env.ext.get_or_default::<Verified>();
     for name in [
         "secondarybuffer_is_audible",
         "mixieee32",
