@@ -33,6 +33,8 @@ struct Args<'a, M: Mem> {
     cpu: Access<'a, M>,
     args: [u32; 7],
     base: u32,
+    bpp: u32,
+    kind: u32,
 }
 fn word(bytes: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
@@ -171,50 +173,55 @@ impl<'a, 'b, M: Mem> Memory<'a, 'b, M> {
     }
 }
 macro_rules! bodies {
-    ($( $body:ident, $direct:ident, $argc:literal => [$($name:literal),*]; )*) => {
+    ($( $body:ident, $argc:literal => [$($name:ident: $bpp:literal, $kind:ident);*]; )*) => {
         mod direct {
             use super::*;
-            $(fn $body<M: Mem>(mem: &mut M, args: [u32; 7]) -> Result<Ret, Stop> {
-                let mut env = Args { cpu: Access { mem, stop: None }, args, base: if $argc < 7 { args[6] } else { 0 } };
-                match super::$body(&mut env) {
-                    Some(value) => Ok(value.into()),
-                    None => Err(env.cpu.stop.unwrap_or(Stop::DivideByZero)),
+            $($(pub(super) mod $name {
+                use super::*;
+                fn run<M: Mem>(mem: &mut M, args: [u32; 7]) -> Result<Ret, Stop> {
+                    let mut env = Args { cpu: Access { mem, stop: None }, args,
+                        base: if $argc < 7 { args[6] } else { 0 }, bpp: $bpp, kind: $kind };
+                    match super::super::$body(&mut env) {
+                        Some(value) => Ok(value.into()),
+                        None => Err(env.cpu.stop.unwrap_or(Stop::DivideByZero)),
+                    }
                 }
-            }
-            adv_cpu::body!(pub(super) $direct = $body, inputs: &{
-                let mut inputs = [Input::Const(0); 7];
-                let mut i = 0; while i < $argc { inputs[i] = Input::Stack(i as u8); i += 1; }
-                inputs
-            }, outputs: EAX | EDX, pop: 0);)*
+                adv_cpu::body!(pub(in crate::native::dib) BODY = run, inputs: &{
+                    let mut inputs = [Input::Const(0); 7];
+                    let mut i = 0; while i < $argc { inputs[i] = Input::Stack(i as u8); i += 1; }
+                    inputs
+                }, outputs: EAX | EDX, pop: 0);
+            })*)*
         }
         pub(super) const BODIES: &[super::Body] = &[$($(
             super::Body {
-                name: std::borrow::Cow::Borrowed(concat!("win32u.so!", $name)),
+                name: std::borrow::Cow::Borrowed(concat!("win32u.so!", stringify!($name))),
                 conv: Conv::Cdecl { argc: $argc }, body: None,
-                handler: super::resume_original, direct: Some(direct::$direct),
+                handler: super::resume_original, direct: Some(direct::$name::BODY),
             },
         )*)*];
     };
 }
 bodies! {
-    solid_rects, SOLID_RECTS, 5 => ["solid_rects_32", "solid_rects_24", "solid_rects_16"];
-    solid_line, SOLID_LINE, 5 => ["solid_line_32", "solid_line_24", "solid_line_16"];
-    pattern_rects, PATTERN_RECTS, 6 => ["pattern_rects_32", "pattern_rects_24", "pattern_rects_16"];
-    copy_rect, COPY_RECT, 6 => ["copy_rect_32", "copy_rect_24", "copy_rect_16"];
-    blend_rects, BLEND_RECTS, 6 => ["blend_rects_8888", "blend_rects_32", "blend_rects_24", "blend_rects_555", "blend_rects_16"];
-    gradient_rect, GRADIENT_RECT, 4 => ["gradient_rect_8888", "gradient_rect_32", "gradient_rect_24", "gradient_rect_555", "gradient_rect_16"];
-    mask_rect, MASK_RECT, 5 => ["mask_rect_32", "mask_rect_24", "mask_rect_16"];
-    draw_glyph, DRAW_GLYPH, 6 => ["draw_glyph_8888", "draw_glyph_32", "draw_glyph_24", "draw_glyph_555", "draw_glyph_16"];
-    draw_subpixel_glyph, DRAW_SUBPIXEL_GLYPH, 6 => ["draw_subpixel_glyph_8888", "draw_subpixel_glyph_32", "draw_subpixel_glyph_24", "draw_subpixel_glyph_555", "draw_subpixel_glyph_16"];
-    stretch_row, STRETCH_ROW, 7 => ["stretch_row_32", "stretch_row_24", "stretch_row_16"];
-    shrink_row, SHRINK_ROW, 7 => ["shrink_row_32", "shrink_row_24", "shrink_row_16"];
-    convert_to, CONVERT_TO, 4 => ["convert_to_8888", "convert_to_32", "convert_to_24", "convert_to_555", "convert_to_16", "convert_to_8", "convert_to_4", "convert_to_1"];
-    halftone, HALFTONE, 4 => ["halftone_888", "halftone_32", "halftone_24", "halftone_555", "halftone_16"];
+    solid_rects, 5 => [solid_rects_32: 32, FUNCS_32; solid_rects_24: 24, FUNCS_24; solid_rects_16: 16, FUNCS_16];
+    solid_line, 5 => [solid_line_32: 32, FUNCS_32; solid_line_24: 24, FUNCS_24; solid_line_16: 16, FUNCS_16];
+    pattern_rects, 6 => [pattern_rects_32: 32, FUNCS_32; pattern_rects_24: 24, FUNCS_24; pattern_rects_16: 16, FUNCS_16];
+    copy_rect, 6 => [copy_rect_32: 32, FUNCS_32; copy_rect_24: 24, FUNCS_24; copy_rect_16: 16, FUNCS_16];
+    blend_rects, 6 => [blend_rects_8888: 32, FUNCS_8888; blend_rects_32: 32, FUNCS_32; blend_rects_24: 24, FUNCS_24; blend_rects_555: 16, FUNCS_555; blend_rects_16: 16, FUNCS_16];
+    gradient_rect, 4 => [gradient_rect_8888: 32, FUNCS_8888; gradient_rect_32: 32, FUNCS_32; gradient_rect_24: 24, FUNCS_24; gradient_rect_555: 16, FUNCS_555; gradient_rect_16: 16, FUNCS_16];
+    mask_rect, 5 => [mask_rect_32: 32, FUNCS_32; mask_rect_24: 24, FUNCS_24; mask_rect_16: 16, FUNCS_16];
+    draw_glyph, 6 => [draw_glyph_8888: 32, FUNCS_8888; draw_glyph_32: 32, FUNCS_32; draw_glyph_24: 24, FUNCS_24; draw_glyph_555: 16, FUNCS_555; draw_glyph_16: 16, FUNCS_16];
+    draw_subpixel_glyph, 6 => [draw_subpixel_glyph_8888: 32, FUNCS_8888; draw_subpixel_glyph_32: 32, FUNCS_32; draw_subpixel_glyph_24: 24, FUNCS_24; draw_subpixel_glyph_555: 16, FUNCS_555; draw_subpixel_glyph_16: 16, FUNCS_16];
+    stretch_row, 7 => [stretch_row_32: 32, FUNCS_32; stretch_row_24: 24, FUNCS_24; stretch_row_16: 16, FUNCS_16];
+    shrink_row, 7 => [shrink_row_32: 32, FUNCS_32; shrink_row_24: 24, FUNCS_24; shrink_row_16: 16, FUNCS_16];
+    convert_to, 4 => [convert_to_8888: 32, FUNCS_8888; convert_to_32: 32, FUNCS_32; convert_to_24: 24, FUNCS_24; convert_to_555: 16, FUNCS_555; convert_to_16: 16, FUNCS_16; convert_to_8: 8, FUNCS_8; convert_to_4: 4, FUNCS_4; convert_to_1: 1, FUNCS_1];
+    halftone, 4 => [halftone_888: 32, FUNCS_8888; halftone_32: 32, FUNCS_32; halftone_24: 24, FUNCS_24; halftone_555: 16, FUNCS_555; halftone_16: 16, FUNCS_16];
 }
 
 #[derive(Clone)]
 struct Dib {
     bpp: u32,
+    pixel_bpp: u32,
     kind: u32,
     width: i32,
     height: i32,
@@ -236,6 +243,7 @@ impl Dib {
         let kind = word(&bytes, d::funcs).wrapping_sub(base);
         Some(Self {
             bpp: word(&bytes, d::bit_count),
+            pixel_bpp: word(&bytes, d::bit_count),
             kind,
             width: word(&bytes, d::width) as i32,
             height: word(&bytes, d::height) as i32,
@@ -264,24 +272,27 @@ impl Dib {
         })
     }
     fn size(&self) -> usize {
-        self.bpp.div_ceil(8) as usize
+        self.pixel_bpp.div_ceil(8) as usize
     }
     fn at(&self, x: i32, y: i32) -> u32 {
+        let x = self.left.wrapping_add(x);
+        let offset = match self.pixel_bpp {
+            1 => x / 8,
+            4 => x / 2,
+            _ => x.wrapping_mul(self.size() as i32),
+        };
         self.bits
             .wrapping_add(self.top.wrapping_add(y).wrapping_mul(self.stride) as u32)
-            .wrapping_add(
-                self.left
-                    .wrapping_add(x)
-                    .wrapping_mul(self.bpp as i32)
-                    .wrapping_div(8) as u32,
-            )
+            .wrapping_add(offset as u32)
     }
     fn row_bytes(&self) -> Option<u32> {
         Some(
-            (self.width as u32)
-                .wrapping_mul(self.bpp)
-                .div_ceil(32)
-                .wrapping_mul(4),
+            (self
+                .width
+                .wrapping_mul(self.pixel_bpp as i32)
+                .wrapping_add(31)
+                >> 3) as u32
+                & !3,
         )
     }
     fn load(&self, mem: &mut Memory<'_, '_, impl Mem>, writable: bool) -> Option<()> {
@@ -291,7 +302,14 @@ impl Dib {
         if rows <= 0 {
             return Some(());
         }
-        let at = self.at(0, if self.stride < 0 { rows - 1 } else { 0 });
+        let at = self.at(
+            0,
+            if self.stride < 0 {
+                rows.wrapping_sub(1)
+            } else {
+                0
+            },
+        );
         mem.load(
             at,
             (rows as u32 - 1)
@@ -309,10 +327,47 @@ impl Dib {
         if l >= r || t >= b {
             return Some(());
         }
-        let at = self.at(l, if self.stride < 0 { b - 1 } else { t });
-        let bytes = (((self.left + r) as u32).wrapping_mul(self.bpp).div_ceil(8))
-            .wrapping_sub(((self.left + l) as u32).wrapping_mul(self.bpp) / 8);
-        let len = ((b - t - 1) as u32)
+        self.load_extent(
+            mem,
+            writable,
+            l,
+            t,
+            r.wrapping_sub(l) as u32,
+            b.wrapping_sub(t) as u32,
+        )
+    }
+    fn load_extent(
+        &self,
+        mem: &mut Memory<'_, '_, impl Mem>,
+        writable: bool,
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+    ) -> Option<()> {
+        if width == 0 || height == 0 {
+            return Some(());
+        }
+        let at = self.at(
+            x,
+            if self.stride < 0 {
+                y.wrapping_add(height.wrapping_sub(1) as i32)
+            } else {
+                y
+            },
+        );
+        let bytes = if self.pixel_bpp >= 8 {
+            width.wrapping_mul(self.size() as u32)
+        } else {
+            let pos = (self.left.wrapping_add(x) as u32).wrapping_mul(self.pixel_bpp) & 7;
+            width
+                .wrapping_mul(self.pixel_bpp)
+                .wrapping_add(pos)
+                .wrapping_add(7)
+                / 8
+        };
+        let len = height
+            .wrapping_sub(1)
             .wrapping_mul(self.stride.unsigned_abs())
             .wrapping_add(bytes);
         mem.load(at, len, writable)
@@ -321,31 +376,29 @@ impl Dib {
         &self,
         mem: &mut Memory<'_, '_, impl Mem>,
         writable: bool,
-        rects: Rects,
+        rects: impl Iterator<Item = [i32; 4]>,
         sx: i32,
         sy: i32,
     ) -> Option<()> {
-        let bounds = rects.iter().filter(|r| r[0] < r[2] && r[1] < r[3]).fold(
-            [i32::MAX, i32::MAX, i32::MIN, i32::MIN],
-            |a, b| {
-                [
-                    a[0].min(b[0]),
-                    a[1].min(b[1]),
-                    a[2].max(b[2]),
-                    a[3].max(b[3]),
-                ]
-            },
-        );
-        self.load_rect(
-            mem,
-            writable,
-            [
-                bounds[0].wrapping_add(sx),
-                bounds[1].wrapping_add(sy),
-                bounds[2].wrapping_add(sx),
-                bounds[3].wrapping_add(sy),
-            ],
-        )
+        let mut bounds: Option<(u32, u32)> = None;
+        for [l, t, r, b] in rects.filter(|r| r[1] < r[3]) {
+            let first = self.at(l.wrapping_add(sx), t.wrapping_add(sy));
+            let last = self.at(l.wrapping_add(sx), b.wrapping_sub(1).wrapping_add(sy));
+            let len = r.wrapping_sub(l).wrapping_mul(self.size() as i32) as u32;
+            let start = first.min(last);
+            let end = first.max(last).wrapping_add(len);
+            bounds = Some(bounds.map_or((start, end), |(a, b)| (a.min(start), b.max(end))));
+        }
+        if let Some((start, end)) = bounds {
+            mem.load(start, end.wrapping_sub(start), writable)?;
+        }
+        Some(())
+    }
+    fn load_row(&self, mem: &mut Memory<'_, '_, impl Mem>, writable: bool, y: i32) -> Option<()> {
+        let at = self
+            .bits
+            .wrapping_add(self.top.wrapping_add(y).wrapping_mul(self.stride) as u32);
+        mem.load(at, self.row_bytes()?, writable)
     }
     fn load_rows(
         &self,
@@ -357,15 +410,15 @@ impl Dib {
             return Some(());
         }
         let at = self.bits.wrapping_add(
-            (self.top
-                + if self.stride < 0 {
-                    rows.end - 1
+            self.top
+                .wrapping_add(if self.stride < 0 {
+                    rows.end.wrapping_sub(1)
                 } else {
                     rows.start
                 })
-            .wrapping_mul(self.stride) as u32,
+                .wrapping_mul(self.stride) as u32,
         );
-        let len = ((rows.end - rows.start - 1) as u32)
+        let len = (rows.end.wrapping_sub(rows.start).wrapping_sub(1) as u32)
             .wrapping_mul(self.stride.unsigned_abs())
             .wrapping_add(self.row_bytes()?);
         mem.load(at, len, writable)
@@ -394,34 +447,90 @@ impl Dib {
             })
         }
     }
-    fn palette(
-        &self,
-        cpu: &mut Access<'_, impl Mem>,
-        base: u32,
-        colors: &mut [u32; 256],
-    ) -> Option<usize> {
+    fn palette(&self, cpu: &mut Access<'_, impl Mem>, base: u32) -> Option<Palette> {
         let (at, count) = if self.colors != 0 {
             (self.colors, self.color_count)
         } else {
             (
-                base + match self.bpp {
-                    1 => TABLE_1,
-                    4 => TABLE_4,
-                    _ => TABLE_8,
+                match self.bpp {
+                    1 => base.wrapping_add(TABLE_1),
+                    4 => base.wrapping_add(TABLE_4),
+                    8 => base.wrapping_add(TABLE_8),
+                    _ => 0,
                 },
-                1 << self.bpp,
+                1u32.wrapping_shl(self.bpp),
             )
         };
-        for (i, color) in colors[..count as usize].iter_mut().enumerate() {
-            let mut bytes = [0; 4];
-            cpu.read(at.wrapping_add(i as u32 * 4), &mut bytes).ok()?;
-            *color = word(&bytes, 0);
+        // rgb_to_pixel_colortable assigns the DWORD size to an i386 int.
+        let len = (count as i32).max(0) as u32;
+        let mut remaining = u64::from(len) * 4;
+        let mut address = at;
+        while remaining != 0 {
+            let bytes = remaining
+                .min((1u64 << 32) - u64::from(address))
+                .min(u64::from(u32::MAX)) as u32;
+            cpu.input(address, bytes)?;
+            address = address.wrapping_add(bytes);
+            remaining -= u64::from(bytes);
         }
-        Some(count as usize)
+        let mut palette = Palette {
+            at,
+            len,
+            cached: [0; 256],
+        };
+        for i in 0..len.min(256) {
+            let mut bytes = [0; 4];
+            cpu.read(at.wrapping_add(i.wrapping_mul(4)), &mut bytes)
+                .ok()?;
+            palette.cached[i as usize] = word(&bytes, 0);
+        }
+        Some(palette)
     }
 }
+struct Palette {
+    at: u32,
+    len: u32,
+    cached: [u32; 256],
+}
+impl Palette {
+    fn get(&self, cpu: &mut Access<'_, impl Mem>, index: u32) -> Option<u32> {
+        if index < self.len && index < 256 {
+            return Some(self.cached[index as usize]);
+        }
+        let mut bytes = [0; 4];
+        cpu.read(self.at.wrapping_add(index.wrapping_mul(4)), &mut bytes)
+            .ok()?;
+        Some(word(&bytes, 0))
+    }
+    fn nearest(&self, cpu: &mut Access<'_, impl Mem>, rgb: [u32; 3]) -> Option<u32> {
+        let mut best = u32::MAX;
+        let mut index = 0;
+        for i in 0..self.len {
+            let color = self.get(cpu, i)?;
+            let mut diff = 0;
+            for (c, shift) in rgb.into_iter().zip([16, 8, 0]) {
+                let d = c as i32 - ((color >> shift) & 255) as i32;
+                diff += (d * d) as u32;
+            }
+            if diff < best {
+                best = diff;
+                index = i;
+            }
+            if diff == 0 {
+                break;
+            }
+        }
+        Some(index)
+    }
+}
+
 fn destination(env: &mut Args<'_, impl Mem>) -> Option<Dib> {
-    Dib::read(&mut env.cpu, env.args[0], env.base)
+    let mut dib = Dib::read(&mut env.cpu, env.args[0], env.base)?;
+    // Pixel addressing and arithmetic come from the bound primitive's C type;
+    // bit_count remains available to the primitive's palette/header checks.
+    dib.pixel_bpp = env.bpp;
+    dib.kind = env.kind;
+    Some(dib)
 }
 
 fn field_mask(len: u32) -> u32 {
@@ -432,9 +541,9 @@ fn field_mask(len: u32) -> u32 {
     }
 }
 fn get_field(mut field: u32, shift: i32, len: u32) -> u32 {
-    let shift = shift - (8 - len as i32);
+    let shift = shift.wrapping_sub(8i32.wrapping_sub(len as i32));
     field = if shift < 0 {
-        field.wrapping_shl(-shift as u32)
+        field.wrapping_shl(shift.wrapping_neg() as u32)
     } else {
         field.wrapping_shr(shift as u32)
     };
@@ -442,10 +551,10 @@ fn get_field(mut field: u32, shift: i32, len: u32) -> u32 {
     field | field.wrapping_shr(len)
 }
 fn put_field(mut field: u32, shift: i32, len: u32) -> u32 {
-    let shift = shift - (8 - len as i32);
+    let shift = shift.wrapping_sub(8i32.wrapping_sub(len as i32));
     field &= field_mask(len);
     if shift < 0 {
-        field.wrapping_shr(-shift as u32)
+        field.wrapping_shr(shift.wrapping_neg() as u32)
     } else {
         field.wrapping_shl(shift as u32)
     }
@@ -510,8 +619,8 @@ fn solid_row(bytes: &mut [u8], size: usize, and: u32, xor: u32) {
     let mut a = [0; 48];
     let mut b = [0; 48];
     for i in 0..48 {
-        a[i] = (and >> ((i % size) * 8)) as u8;
-        b[i] = (xor >> ((i % size) * 8)) as u8;
+        a[i] = and.wrapping_shr(((i % size) * 8) as u32) as u8;
+        b[i] = xor.wrapping_shr(((i % size) * 8) as u32) as u8;
     }
     let mut at = 0;
     #[cfg(target_arch = "aarch64")]
@@ -548,11 +657,9 @@ fn solid_rects(env: &mut Args<'_, impl Mem>) -> Option<u64> {
     let rects = rects(&mut env.cpu, env.args[2], env.args[1])?;
     let (and, xor) = (env.args[3], env.args[4]);
     let mut mem = Memory::new(&mut env.cpu);
-    dib.load_rects(&mut mem, true, rects, 0, 0)?;
+    dib.load_rects(&mut mem, true, rects.iter().filter(|r| r[0] < r[2]), 0, 0)?;
     for [l, t, r, b] in rects.iter() {
-        let len = usize::try_from(r.checked_sub(l)?)
-            .ok()?
-            .checked_mul(dib.size())?;
+        let len = r.wrapping_sub(l).wrapping_mul(dib.size() as i32) as u32 as usize;
         for y in t..b {
             solid_row(mem.get_mut(dib.at(l, y), len)?, dib.size(), and, xor);
         }
@@ -562,54 +669,81 @@ fn solid_rects(env: &mut Args<'_, impl Mem>) -> Option<u64> {
 
 fn solid_line(env: &mut Args<'_, impl Mem>) -> Option<u64> {
     let dib = destination(env)?;
-    let (mut x, mut y) = point(&mut env.cpu, env.args[1])?;
+    let (x, y) = point(&mut env.cpu, env.args[1])?;
     let mut p = [0; line::SIZE];
     read_into(&mut env.cpu, env.args[2], &mut p)?;
     let mut err = word(&p, line::err_start) as i32;
     let (and, xor) = (env.args[3], env.args[4]);
-    let mut mem = Memory::new(&mut env.cpu);
-    let (mut ey, mut e, mut low, mut high) = (y, err, y, y);
-    for _ in 1..word(&p, line::length) {
-        let minor = e.wrapping_add(word(&p, line::bias) as i32) > 0;
-        let add = if minor {
-            line::err_add_1
-        } else {
-            line::err_add_2
-        };
-        e = e.wrapping_add(word(&p, add) as i32);
-        if word(&p, line::x_major) == 0 || minor {
-            ey = ey.wrapping_add(word(&p, line::y_inc) as i32);
-        }
-        low = low.min(ey);
-        high = high.max(ey);
+    if word(&p, line::length) == 0 {
+        return Some(0);
     }
-    dib.load_rows(&mut mem, true, low..high.checked_add(1)?)?;
-    for _ in 0..word(&p, line::length) {
-        let at = dib.at(x, y);
-        let val = mem.pixel(at, dib.size())?;
-        mem.put(at, dib.size(), (val & and) ^ xor)?;
-        let minor = err.wrapping_add(word(&p, line::bias) as i32) > 0;
-        err = err.wrapping_add(word(
-            &p,
-            if minor {
-                line::err_add_1
-            } else {
-                line::err_add_2
-            },
-        ) as i32);
-        if word(&p, line::x_major) != 0 {
-            x = x.wrapping_add(word(&p, line::x_inc) as i32);
-            if minor {
-                y = y.wrapping_add(word(&p, line::y_inc) as i32);
-            }
+    // The primitive touches this pixel before advancing its line state. Check
+    // it before walking the remaining coordinates of a possibly faulting line.
+    if let Err(stop) = env.cpu.mem.output(dib.at(x, y), dib.size() as u32) {
+        env.cpu.stop = Some(stop);
+        return None;
+    }
+    let size = dib.size() as u32;
+    let row_inc = dib.stride.wrapping_mul(word(&p, line::y_inc) as i32);
+    let row_inc = if matches!(size, 2 | 4) {
+        row_inc / size as i32 * size as i32
+    } else {
+        row_inc
+    };
+    let column_inc = (word(&p, line::x_inc) as i32).wrapping_mul(size as i32);
+    let (major, minor) = if word(&p, line::x_major) != 0 {
+        (column_inc, row_inc)
+    } else {
+        (row_inc, column_inc)
+    };
+    let mut at = dib.at(x, y);
+    let (mut next, mut e, mut low, mut high) = (at, err, at, at);
+    let mut page = at >> 12;
+    for _ in 1..word(&p, line::length) {
+        if e.wrapping_add(word(&p, line::bias) as i32) > 0 {
+            next = next.wrapping_add(minor as u32);
+            e = e.wrapping_add(word(&p, line::err_add_1) as i32);
         } else {
-            y = y.wrapping_add(word(&p, line::y_inc) as i32);
-            if minor {
-                x = x.wrapping_add(word(&p, line::x_inc) as i32);
-            }
+            e = e.wrapping_add(word(&p, line::err_add_2) as i32);
         }
+        next = next.wrapping_add(major as u32);
+        if next >> 12 != page {
+            if let Err(stop) = env.cpu.mem.output(next, size) {
+                env.cpu.stop = Some(stop);
+                return None;
+            }
+            page = next >> 12;
+        }
+        low = low.min(next);
+        high = high.max(next);
+    }
+    let mut mem = Memory::new(&mut env.cpu);
+    mem.load(low, high.wrapping_sub(low).wrapping_add(size), true)?;
+    for _ in 0..word(&p, line::length) {
+        let val = mem.pixel(at, size as usize)?;
+        mem.put(at, size as usize, (val & and) ^ xor)?;
+        if err.wrapping_add(word(&p, line::bias) as i32) > 0 {
+            at = at.wrapping_add(minor as u32);
+            err = err.wrapping_add(word(&p, line::err_add_1) as i32);
+        } else {
+            err = err.wrapping_add(word(&p, line::err_add_2) as i32);
+        }
+        at = at.wrapping_add(major as u32);
     }
     mem.commit()
+}
+
+fn brush_offset(edge: i32, size: i32, origin: i32) -> Option<i32> {
+    if edge.wrapping_sub(origin) >= 0 {
+        edge.wrapping_sub(origin).checked_rem(size)
+    } else {
+        let offset = origin.wrapping_sub(edge).checked_rem(size)?;
+        Some(if offset != 0 {
+            size.wrapping_sub(offset)
+        } else {
+            0
+        })
+    }
 }
 
 fn pattern_rects(env: &mut Args<'_, impl Mem>) -> Option<u64> {
@@ -627,46 +761,68 @@ fn pattern_rects(env: &mut Args<'_, impl Mem>) -> Option<u64> {
         return None;
     }
     let mut mem = Memory::new(&mut env.cpu);
-    dib.load_rects(&mut mem, true, rects, 0, 0)?;
+    dib.load_rects(&mut mem, true, rects.iter().filter(|r| r[0] < r[2]), 0, 0)?;
     let mut mask = brush.clone();
     mask.left = 0;
     mask.top = 0;
-    mask.bpp = dib.bpp;
+    mask.pixel_bpp = dib.pixel_bpp;
     mask.bits = xor;
     mask.load(&mut mem, false)?;
     if and != 0 {
         mask.bits = and;
         mask.load(&mut mem, false)?;
     }
+    let size = dib.size() as i32;
+    let row_step = if matches!(size, 2 | 4) {
+        brush.stride / size * size
+    } else {
+        brush.stride
+    };
     for [l, t, r, b] in rects.iter() {
+        let mut by = brush_offset(t, brush.height, origin.1)?;
+        let first_x = brush_offset(l, brush.width, origin.0)?;
+        let row_offset = by.wrapping_mul(brush.stride);
+        let row_offset = if matches!(size, 2 | 4) {
+            row_offset / size * size
+        } else {
+            row_offset
+        } as u32;
+        let (mut row_and, mut row_xor) =
+            (and.wrapping_add(row_offset), xor.wrapping_add(row_offset));
         for y in t..b {
-            let by = (y - origin.1).rem_euclid(brush.height);
+            let mut bx = first_x;
             if and == 0 {
                 let mut x = l;
                 while x < r {
-                    let bx = (x - origin.0).rem_euclid(brush.width);
-                    let n = (r - x).min(brush.width - bx);
-                    let sa = xor.wrapping_add((by * brush.stride + bx * dib.size() as i32) as u32);
-                    mem.copy(sa, dib.at(x, y), n as usize * dib.size())?;
-                    x += n;
+                    let n = r.wrapping_sub(x).min(brush.width.wrapping_sub(bx));
+                    let sa = row_xor.wrapping_add(bx.wrapping_mul(size) as u32);
+                    mem.copy(sa, dib.at(x, y), n.wrapping_mul(size) as u32 as usize)?;
+                    x = x.wrapping_add(n);
+                    bx = 0;
                 }
-                continue;
+            } else {
+                for x in l..r {
+                    let offset = bx.wrapping_mul(size) as u32;
+                    let v = mem.pixel(row_xor.wrapping_add(offset), size as usize)?;
+                    let at = dib.at(x, y);
+                    let value = (mem.pixel(at, size as usize)?
+                        & mem.pixel(row_and.wrapping_add(offset), size as usize)?)
+                        ^ v;
+                    mem.put(at, size as usize, value)?;
+                    bx = bx.wrapping_add(1);
+                    if bx == brush.width {
+                        bx = 0;
+                    }
+                }
             }
-            for x in l..r {
-                let bx = (x - origin.0).rem_euclid(brush.width);
-                let offset = by
-                    .wrapping_mul(brush.stride)
-                    .wrapping_add(bx * dib.size() as i32) as u32;
-                let v = mem.pixel(xor.wrapping_add(offset), dib.size())?;
-                let at = dib.at(x, y);
-                let value = if and == 0 {
-                    v
-                } else {
-                    (mem.pixel(at, dib.size())?
-                        & mem.pixel(and.wrapping_add(offset), dib.size())?)
-                        ^ v
-                };
-                mem.put(at, dib.size(), value)?;
+            by = by.wrapping_add(1);
+            if by == brush.height {
+                by = 0;
+                row_and = and;
+                row_xor = xor;
+            } else {
+                row_and = row_and.wrapping_add(row_step as u32);
+                row_xor = row_xor.wrapping_add(row_step as u32);
             }
         }
     }
@@ -676,31 +832,35 @@ fn pattern_rects(env: &mut Args<'_, impl Mem>) -> Option<u64> {
 fn copy_rect(env: &mut Args<'_, impl Mem>) -> Option<u64> {
     let base = env.base;
     let dst = destination(env)?;
-    let src = Dib::read(&mut env.cpu, env.args[2], base)?;
+    let mut src = Dib::read(&mut env.cpu, env.args[2], base)?;
+    src.pixel_bpp = dst.pixel_bpp;
     let [l, t, r, b] = rects(&mut env.cpu, env.args[1], 1)?.get(0);
     let (sx, sy) = point(&mut env.cpu, env.args[3])?;
     let (code, overlap) = (env.args[4], env.args[5]);
     let mut mem = Memory::new(&mut env.cpu);
     dst.load_rect(&mut mem, true, [l, t, r, b])?;
-    src.load_rect(
+    src.load_extent(
         &mut mem,
         false,
-        [sx, sy, sx.wrapping_add(r - l), sy.wrapping_add(b - t)],
+        sx,
+        sy,
+        r.wrapping_sub(l) as u32,
+        b.wrapping_sub(t) as u32,
     )?;
-    for row in 0..b - t {
+    for row in 0..b.wrapping_sub(t) {
         let row = if overlap & 8 != 0 {
-            b - t - row - 1
+            b.wrapping_sub(t).wrapping_sub(row).wrapping_sub(1)
         } else {
             row
         };
-        let da = dst.at(l, t + row);
-        let sa = src.at(sx, sy + row);
-        let len = usize::try_from(r - l).ok()? * dst.size();
+        let da = dst.at(l, t.wrapping_add(row));
+        let sa = src.at(sx, sy.wrapping_add(row));
+        let len = r.wrapping_sub(l).wrapping_mul(dst.size() as i32) as u32 as usize;
         if code == 13 {
             mem.copy(sa, da, len)?;
         } else {
             // Wine's 24-bit path performs ROPs byte by byte, including reverse copies.
-            let size = if dst.bpp == 24 { 1 } else { dst.size() };
+            let size = if dst.pixel_bpp == 24 { 1 } else { dst.size() };
             for i in 0..len / size {
                 let i = if overlap & 2 != 0 {
                     len / size - i - 1
@@ -709,11 +869,11 @@ fn copy_rect(env: &mut Args<'_, impl Mem>) -> Option<u64> {
                 };
                 let offset = (i * size) as u32;
                 let value = rop(
-                    mem.pixel(da + offset, size)?,
-                    mem.pixel(sa + offset, size)?,
+                    mem.pixel(da.wrapping_add(offset), size)?,
+                    mem.pixel(sa.wrapping_add(offset), size)?,
                     code,
                 );
-                mem.put(da + offset, size, value)?;
+                mem.put(da.wrapping_add(offset), size, value)?;
             }
         }
     }
@@ -832,27 +992,62 @@ fn blend_8888_row(dst: &mut [u8], src: &[u8], alpha: u32, source_alpha: bool, co
     }
 }
 
+// The admitted loops compare left/right before their first pixel, then use
+// the wrapped signed difference for continuation. An overflowing positive
+// coordinate interval therefore still executes its first pixel.
+fn blend_width(left: i32, right: i32) -> i32 {
+    if left >= right {
+        0
+    } else {
+        let width = right.wrapping_sub(left);
+        if width > 0 { width } else { 1 }
+    }
+}
+
 fn blend_rects(env: &mut Args<'_, impl Mem>) -> Option<u64> {
     if env.args[1] as i32 <= 0 {
         return Some(0);
     }
     let base = env.base;
     let dst = destination(env)?;
-    let src = Dib::read(&mut env.cpu, env.args[3], base)?;
+    let mut src = Dib::read(&mut env.cpu, env.args[3], base)?;
+    src.pixel_bpp = 32;
     let rects = rects(&mut env.cpu, env.args[2], env.args[1])?;
     let (sx, sy) = point(&mut env.cpu, env.args[4])?;
     let blend = env.args[5].to_le_bytes();
     let alpha = u32::from(blend[blend::SourceConstantAlpha]);
     let src_alpha = blend[blend::AlphaFormat] & 1 != 0;
     let mut mem = Memory::new(&mut env.cpu);
-    dst.load_rects(&mut mem, true, rects, 0, 0)?;
-    src.load_rects(&mut mem, false, rects, sx, sy)?;
+    dst.load_rects(
+        &mut mem,
+        true,
+        rects
+            .iter()
+            .filter(|r| r[0] < r[2])
+            .map(|[l, t, r, b]| [l, t, l.wrapping_add(blend_width(l, r)), b]),
+        0,
+        0,
+    )?;
+    src.load_rects(
+        &mut mem,
+        false,
+        rects
+            .iter()
+            .filter(|r| r[0] < r[2])
+            .map(|[l, t, r, b]| [l, t, l.wrapping_add(blend_width(l, r)), b]),
+        sx,
+        sy,
+    )?;
     for [l, t, r, b] in rects.iter() {
+        let width = blend_width(l, r);
+        if width <= 0 {
+            continue;
+        }
         for y in t..b {
             if dst.kind == FUNCS_8888 {
                 let da = dst.at(l, y);
-                let sa = src.at(l + sx, y + sy);
-                let len = usize::try_from(r - l).ok()?.checked_mul(4)?;
+                let sa = src.at(l.wrapping_add(sx), y.wrapping_add(sy));
+                let len = width.wrapping_mul(4) as u32 as usize;
                 if u64::from(da) + len as u64 <= u64::from(sa)
                     || u64::from(sa) + len as u64 <= u64::from(da)
                 {
@@ -861,8 +1056,9 @@ fn blend_rects(env: &mut Args<'_, impl Mem>) -> Option<u64> {
                     continue;
                 }
             }
-            for x in l..r {
-                let s = mem.pixel(src.at(x + sx, y + sy), 4)?;
+            for column in 0..width {
+                let x = l.wrapping_add(column);
+                let s = mem.pixel(src.at(x.wrapping_add(sx), y.wrapping_add(sy)), 4)?;
                 let at = dst.at(x, y);
                 let d = mem.pixel(at, dst.size())?;
                 let rgb = dst.rgb(d);
@@ -896,12 +1092,21 @@ fn blend_rects(env: &mut Args<'_, impl Mem>) -> Option<u64> {
 const BAYER4: [[i64; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
 fn edge(y: i32, a: (i32, i32), b: (i32, i32)) -> Option<i32> {
     let (x, yy) = if b.0 > a.0 { b } else { a };
-    Some(x + (y - yy).wrapping_mul(b.0 - a.0).checked_div(b.1 - a.1)?)
+    Some(
+        x.wrapping_add(
+            y.wrapping_sub(yy)
+                .wrapping_mul(b.0.wrapping_sub(a.0))
+                .checked_div(b.1.wrapping_sub(a.1))?,
+        ),
+    )
 }
 fn gradient_rect(env: &mut Args<'_, impl Mem>) -> Option<u64> {
     let dst = destination(env)?;
     let [l, t, r, b] = rects(&mut env.cpu, env.args[1], 1)?.get(0);
     let mode = env.args[3];
+    if mode > 2 {
+        return Some(1);
+    }
     let mut vertices = [0; vertex::SIZE * 3];
     read_into(
         &mut env.cpu,
@@ -922,9 +1127,16 @@ fn gradient_rect(env: &mut Args<'_, impl Mem>) -> Option<u64> {
         ]
     });
     let det = if mode == 2 {
-        (xy[2].1 - xy[1].1)
-            .wrapping_mul(xy[2].0 - xy[0].0)
-            .wrapping_sub((xy[2].0 - xy[1].0).wrapping_mul(xy[2].1 - xy[0].1))
+        xy[2]
+            .1
+            .wrapping_sub(xy[1].1)
+            .wrapping_mul(xy[2].0.wrapping_sub(xy[0].0))
+            .wrapping_sub(
+                xy[2]
+                    .0
+                    .wrapping_sub(xy[1].0)
+                    .wrapping_mul(xy[2].1.wrapping_sub(xy[0].1)),
+            )
     } else {
         1
     };
@@ -950,11 +1162,15 @@ fn gradient_rect(env: &mut Args<'_, impl Mem>) -> Option<u64> {
             for i in 0..4 {
                 c[i] = match mode {
                     0 | 1 => {
-                        let pos = if mode == 0 { x - xy[0].0 } else { y - xy[0].1 } as u32;
-                        let len = if mode == 0 {
-                            xy[1].0 - xy[0].0
+                        let pos = if mode == 0 {
+                            x.wrapping_sub(xy[0].0)
                         } else {
-                            xy[1].1 - xy[0].1
+                            y.wrapping_sub(xy[0].1)
+                        } as u32;
+                        let len = if mode == 0 {
+                            xy[1].0.wrapping_sub(xy[0].0)
+                        } else {
+                            xy[1].1.wrapping_sub(xy[0].1)
                         } as u32;
                         i64::from(
                             colors[0][i]
@@ -965,14 +1181,28 @@ fn gradient_rect(env: &mut Args<'_, impl Mem>) -> Option<u64> {
                     }
                     2 => {
                         let a = i64::from(
-                            (xy[1].1 - xy[2].1)
-                                .wrapping_mul(x - xy[2].0)
-                                .wrapping_sub((xy[1].0 - xy[2].0).wrapping_mul(y - xy[2].1)),
+                            xy[1]
+                                .1
+                                .wrapping_sub(xy[2].1)
+                                .wrapping_mul(x.wrapping_sub(xy[2].0))
+                                .wrapping_sub(
+                                    xy[1]
+                                        .0
+                                        .wrapping_sub(xy[2].0)
+                                        .wrapping_mul(y.wrapping_sub(xy[2].1)),
+                                ),
                         );
                         let bb = i64::from(
-                            (xy[2].1 - xy[0].1)
-                                .wrapping_mul(x - xy[2].0)
-                                .wrapping_sub((xy[2].0 - xy[0].0).wrapping_mul(y - xy[2].1)),
+                            xy[2]
+                                .1
+                                .wrapping_sub(xy[0].1)
+                                .wrapping_mul(x.wrapping_sub(xy[2].0))
+                                .wrapping_sub(
+                                    xy[2]
+                                        .0
+                                        .wrapping_sub(xy[0].0)
+                                        .wrapping_mul(y.wrapping_sub(xy[2].1)),
+                                ),
                         );
                         (i64::from(colors[0][i]) * a
                             + i64::from(colors[1][i]) * bb
@@ -982,10 +1212,7 @@ fn gradient_rect(env: &mut Args<'_, impl Mem>) -> Option<u64> {
                     _ => continue,
                 };
             }
-            if mode > 2 {
-                continue;
-            }
-            let out = if dst.bpp == 16 {
+            let out = if dst.pixel_bpp == 16 {
                 let bias = BAYER4[y.rem_euclid(4) as usize][x.rem_euclid(4) as usize];
                 let rgb = std::array::from_fn(|i| {
                     let v = ((c[i] / 128 + bias) / 16).clamp(0, 31) as u32;
@@ -1016,22 +1243,29 @@ fn mask_rect(env: &mut Args<'_, impl Mem>) -> Option<u64> {
     let [l, t, r, b] = rects(&mut env.cpu, env.args[1], 1)?.get(0);
     let (sx, sy) = point(&mut env.cpu, env.args[3])?;
     let code = env.args[4];
-    let mut colors = [0; 256];
     src.color_count = 2;
-    src.palette(&mut env.cpu, base, &mut colors)?;
-    let colors = colors.map(|p| dst.pack([(p >> 16) & 255, (p >> 8) & 255, p & 255]));
-    src.bpp = 1;
+    let palette = src.palette(&mut env.cpu, base)?;
+    let colors = [palette.get(&mut env.cpu, 0)?, palette.get(&mut env.cpu, 1)?]
+        .map(|p| dst.pack([(p >> 16) & 255, (p >> 8) & 255, p & 255]));
+    src.pixel_bpp = 1;
     let mut mem = Memory::new(&mut env.cpu);
     dst.load_rect(&mut mem, true, [l, t, r, b])?;
-    src.load_rect(
+    src.load_extent(
         &mut mem,
         false,
-        [sx, sy, sx.wrapping_add(r - l), sy.wrapping_add(b - t)],
+        sx,
+        sy,
+        r.wrapping_sub(l) as u32,
+        b.wrapping_sub(t) as u32,
     )?;
     for y in t..b {
         for x in l..r {
-            let pos = (sx & 7) + x - l;
-            let value = mem.pixel(src.at(sx, sy + y - t).wrapping_add((pos / 8) as u32), 1)?;
+            let pos = (sx & 7).wrapping_add(x).wrapping_sub(l);
+            let value = mem.pixel(
+                src.at(sx, sy.wrapping_add(y).wrapping_sub(t))
+                    .wrapping_add((pos / 8) as u32),
+                1,
+            )?;
             let bit = 7 - (pos & 7);
             let color = *colors.get(((value >> bit) & 1) as usize)?;
             let at = dst.at(x, y);
@@ -1060,7 +1294,8 @@ fn draw_subpixel_glyph(env: &mut Args<'_, impl Mem>) -> Option<u64> {
 fn glyph(env: &mut Args<'_, impl Mem>, subpixel: bool) -> Option<u64> {
     let base = env.base;
     let dst = destination(env)?;
-    let glyph = Dib::read(&mut env.cpu, env.args[2], base)?;
+    let mut glyph = Dib::read(&mut env.cpu, env.args[2], base)?;
+    glyph.pixel_bpp = if subpixel { 32 } else { 8 };
     let [l, t, r, b] = rects(&mut env.cpu, env.args[1], 1)?.get(0);
     let (sx, sy) = point(&mut env.cpu, env.args[3])?;
     let text_pixel = env.args[4];
@@ -1070,7 +1305,7 @@ fn glyph(env: &mut Args<'_, impl Mem>, subpixel: bool) -> Option<u64> {
     } else {
         read(&mut env.cpu, env.args[5], intensity::SIZE * 17)?
     };
-    let gamma = if subpixel && dst.bpp != 16 && env.args[5] != 0 {
+    let gamma = if subpixel && dst.pixel_bpp != 16 && env.args[5] != 0 {
         let gamma = read(&mut env.cpu, env.args[5], gamma::SIZE)?;
         if word(gamma, gamma::gamma) != 1000 {
             gamma
@@ -1082,15 +1317,21 @@ fn glyph(env: &mut Args<'_, impl Mem>, subpixel: bool) -> Option<u64> {
     };
     let mut mem = Memory::new(&mut env.cpu);
     dst.load_rect(&mut mem, true, [l, t, r, b])?;
-    glyph.load_rect(
+    glyph.load_extent(
         &mut mem,
         false,
-        [sx, sy, sx.wrapping_add(r - l), sy.wrapping_add(b - t)],
+        sx,
+        sy,
+        r.wrapping_sub(l) as u32,
+        b.wrapping_sub(t) as u32,
     )?;
     for y in t..b {
         for x in l..r {
             let mask = mem.pixel(
-                glyph.at(sx + x - l, sy + y - t),
+                glyph.at(
+                    sx.wrapping_add(x).wrapping_sub(l),
+                    sy.wrapping_add(y).wrapping_sub(t),
+                ),
                 if subpixel { 4 } else { 1 },
             )?;
             if mask == 0 || (!subpixel && mask <= 1) {
@@ -1145,7 +1386,8 @@ fn shrink_row(env: &mut Args<'_, impl Mem>) -> Option<u64> {
 fn scale_row(env: &mut Args<'_, impl Mem>, shrink: bool) -> Option<u64> {
     let base = env.base;
     let dst = destination(env)?;
-    let src = Dib::read(&mut env.cpu, env.args[2], base)?;
+    let mut src = Dib::read(&mut env.cpu, env.args[2], base)?;
+    src.pixel_bpp = dst.pixel_bpp;
     let (mut dx, dy) = point(&mut env.cpu, env.args[1])?;
     let (mut sx, sy) = point(&mut env.cpu, env.args[3])?;
     let p = read(&mut env.cpu, env.args[4], stretch::SIZE)?;
@@ -1158,8 +1400,8 @@ fn scale_row(env: &mut Args<'_, impl Mem>, shrink: bool) -> Option<u64> {
     let mut err = word(p, stretch::err_start) as i32;
     let mut new_pixel = true;
     let mut mem = Memory::new(&mut env.cpu);
-    dst.load_rows(&mut mem, true, dy..dy.checked_add(1)?)?;
-    src.load_rows(&mut mem, false, sy..sy.checked_add(1)?)?;
+    dst.load_row(&mut mem, true, dy)?;
+    src.load_row(&mut mem, false, sy)?;
     for _ in 0..word(p, stretch::length) {
         let at = dst.at(dx, dy);
         let src = mem.pixel(src.at(sx, sy), dst.size())?;
@@ -1195,25 +1437,6 @@ fn scale_row(env: &mut Args<'_, impl Mem>, shrink: bool) -> Option<u64> {
     mem.commit()
 }
 
-fn nearest(colors: &[u32], rgb: [u32; 3]) -> u32 {
-    let mut best = u32::MAX;
-    let mut index = 0;
-    for (i, &color) in colors.iter().enumerate() {
-        let mut diff = 0;
-        for (c, shift) in rgb.into_iter().zip([16, 8, 0]) {
-            let d = c as i32 - ((color >> shift) & 255) as i32;
-            diff += (d * d) as u32;
-        }
-        if diff < best {
-            best = diff;
-            index = i as u32;
-        }
-        if diff == 0 {
-            break;
-        }
-    }
-    index
-}
 fn bayer16(x: i32, y: i32) -> u32 {
     let (x, y) = (x as u32, y as u32);
     let mut value = 0;
@@ -1275,10 +1498,18 @@ fn row<const S: u8, const D: u8>(input: &[u8], output: &mut [u8], src: &Dib, dst
     // A signed field shift becomes one left and one right shift, with one zero.
     // Keep the original wrapping counts, masks and replicated low bits.
     let fields = |dib: &Dib| {
-        let shifts = std::array::from_fn::<_, 3, _>(|i| dib.shifts[i] - (8 - dib.lens[i] as i32));
+        let shifts = std::array::from_fn::<_, 3, _>(|i| {
+            dib.shifts[i].wrapping_sub(8i32.wrapping_sub(dib.lens[i] as i32))
+        });
         (
             dib.lens.map(field_mask),
-            shifts.map(|s| if s < 0 { (-s as u32) & 31 } else { 0 }),
+            shifts.map(|s| {
+                if s < 0 {
+                    (s.wrapping_neg() as u32) & 31
+                } else {
+                    0
+                }
+            }),
             shifts.map(|s| if s >= 0 { s as u32 & 31 } else { 0 }),
         )
     };
@@ -1337,36 +1568,35 @@ fn convert_to(env: &mut Args<'_, impl Mem>) -> Option<u64> {
     read_into(&mut env.cpu, env.args[2], &mut rect)?;
     let [l, t, r, b] = std::array::from_fn(|i| word(&rect, i * 4) as i32);
     let dither = env.args[3] != 0;
-    let width = u32::try_from(r - l).ok()?;
-    let row_len = u32::try_from(dst.width)
-        .ok()?
-        .checked_mul(dst.bpp)?
-        .div_ceil(32)
-        .checked_mul(4)?;
-    let used = width.checked_mul(dst.bpp)?.div_ceil(8);
-    let pad = row_len.checked_sub(used)?;
-    let mut palette = [0; 256];
-    let count = if dst.bpp <= 8 {
-        dst.palette(&mut env.cpu, base, &mut palette)?
-    } else {
-        0
-    };
-    let colors = &palette[..count];
-    let mut source_palette = [0; 256];
-    if src.bpp <= 8 {
-        let mut indexed = src.clone();
-        indexed.color_count = 1 << src.bpp;
-        indexed.palette(&mut env.cpu, base, &mut source_palette)?;
+    // The admitted converters have no default arm in their source-depth switch.
+    if !matches!(src.bpp, 1 | 4 | 8 | 16 | 24 | 32) {
+        return Some(0);
     }
-    let background = if dst.bpp == 1 {
-        let bg = *colors.first()?;
+    let width = r.wrapping_sub(l) as u32;
+    let row_len = dst.row_bytes()?;
+    let used = width.wrapping_mul(dst.pixel_bpp).wrapping_add(7) / 8;
+    let pad = row_len.wrapping_sub(used);
+    let palette = if dst.pixel_bpp <= 8 {
+        Some(dst.palette(&mut env.cpu, base)?)
+    } else {
+        None
+    };
+    let source_palette = if src.bpp <= 8 {
+        let mut indexed = src.clone();
+        indexed.color_count = 1u32 << src.bpp;
+        Some(indexed.palette(&mut env.cpu, base)?)
+    } else {
+        None
+    };
+    let background = if dst.pixel_bpp == 1 {
+        let bg = palette.as_ref()?.get(&mut env.cpu, 0)?;
         if bg >> 16 == 0x10ff {
             bg & 0xffff
         } else if src.bpp <= 8 {
-            nearest(
-                &source_palette[..src.color_count as usize],
-                [(bg >> 16) & 255, (bg >> 8) & 255, bg & 255],
-            )
+            let source = src.clone();
+            source
+                .palette(&mut env.cpu, base)?
+                .nearest(&mut env.cpu, [(bg >> 16) & 255, (bg >> 8) & 255, bg & 255])?
         } else if src.bpp == 24 {
             ((bg >> 16) & 255) | (bg & 0xff00) | ((bg & 255) << 16)
         } else {
@@ -1383,17 +1613,31 @@ fn convert_to(env: &mut Args<'_, impl Mem>) -> Option<u64> {
         || (matches!(dst.kind, FUNCS_32 | FUNCS_16)
             && src.kind != FUNCS_8888
             && src.kind != FUNCS_555
-            && src.bpp == dst.bpp
+            && src.bpp == dst.pixel_bpp
             && src.masks == dst.masks);
-    let same_palette = src.bpp <= 8
-        && src.bpp == dst.bpp
-        && src.color_count == dst.color_count
-        && source_palette[..count] == palette[..count];
-    let aligned = (src.left + l) as u32 & (8 / src.bpp.min(8) - 1) == 0;
-    let raw = raw || (same_palette && aligned && dst.bpp != 1);
+    let same_palette = if src.bpp <= 8 && src.bpp == dst.pixel_bpp {
+        if src.colors == 0 || dst.colors == 0 {
+            src.colors == dst.colors
+        } else {
+            let mut same = true;
+            for i in 0..1u32 << src.bpp {
+                if source_palette.as_ref()?.get(&mut env.cpu, i)?
+                    != palette.as_ref()?.get(&mut env.cpu, i)?
+                {
+                    same = false;
+                    break;
+                }
+            }
+            same
+        }
+    } else {
+        false
+    };
+    let aligned = src.left.wrapping_add(l) as u32 & (8 / src.bpp.min(8) - 1) == 0;
+    let raw = raw || (same_palette && aligned && dst.pixel_bpp != 1);
     let mut mem = Memory::new(&mut env.cpu);
     if raw && src.stride > 0 && src.stride == dst.stride && pad == 0 {
-        let len = (b - t) as usize * src.stride as usize;
+        let len = b.wrapping_sub(t).wrapping_mul(src.stride) as u32 as usize;
         let (sa, da) = (src.at(l, t), dst.at(0, 0));
         mem.load(sa, len as u32, false)?;
         mem.load(da, len as u32, true)?;
@@ -1401,13 +1645,13 @@ fn convert_to(env: &mut Args<'_, impl Mem>) -> Option<u64> {
         return mem.commit();
     }
     src.load_rows(&mut mem, false, t..b)?;
-    dst.output_rows(&mut mem, b - t, row_len)?;
+    dst.output_rows(&mut mem, b.wrapping_sub(t), row_len)?;
     let kernel = row_kernel(&src, &dst);
     for y in t..b {
-        let da = dst.at(0, y - t);
+        let da = dst.at(0, y.wrapping_sub(t));
         if raw {
             mem.copy(src.at(l, y), da, used as usize)?;
-        } else if dst.bpp > 8 && src.bpp > 8 && {
+        } else if dst.pixel_bpp > 8 && src.bpp > 8 && {
             let source = u64::from(src.at(l, y));
             let target = u64::from(da);
             source + u64::from(width) * src.size() as u64 <= target
@@ -1415,44 +1659,59 @@ fn convert_to(env: &mut Args<'_, impl Mem>) -> Option<u64> {
         } {
             // Resolve disjoint rows once; overlapping conversions retain Wine's
             // per-pixel traversal below.
-            let (source, target) =
-                mem.pair(src.at(l, y), width as usize * src.size(), da, used as usize)?;
+            let (source, target) = mem.pair(
+                src.at(l, y),
+                width.wrapping_mul(src.size() as u32) as usize,
+                da,
+                used as usize,
+            )?;
             kernel?(source, target, &src, &dst);
         } else {
             for x in l..r {
                 let pixel = if src.bpp < 8 {
-                    let pos = (src.left + x) as u32 * src.bpp;
+                    let pos = (src.left.wrapping_add(x) as u32).wrapping_mul(src.bpp);
                     (mem.pixel(src.at(x, y), 1)? >> (8 - src.bpp - pos % 8)) & ((1 << src.bpp) - 1)
                 } else {
                     mem.pixel(src.at(x, y), src.size())?
                 };
                 let rgb = if src.bpp <= 8 {
-                    let c = source_palette[pixel as usize];
+                    let c = source_palette.as_ref()?.get(mem.cpu, pixel)?;
                     [(c >> 16) & 255, (c >> 8) & 255, c & 255]
                 } else {
                     src.rgb(pixel)
                 };
-                let xx = (x - l) as u32;
-                let index = if src.bpp == 1 && source_palette[pixel as usize] >> 16 == 0x10ff {
-                    Some(source_palette[pixel as usize] & 0xffff)
+                let xx = x.wrapping_sub(l) as u32;
+                let index = if src.bpp == 1 {
+                    let color = source_palette.as_ref()?.get(mem.cpu, pixel)?;
+                    (color >> 16 == 0x10ff).then_some(color & 0xffff)
                 } else {
                     None
                 };
-                match dst.bpp {
-                    16 | 24 | 32 => mem.put(dst.at(x - l, y - t), dst.size(), dst.pack(rgb))?,
+                match dst.pixel_bpp {
+                    16 | 24 | 32 => mem.put(
+                        dst.at(x.wrapping_sub(l), y.wrapping_sub(t)),
+                        dst.size(),
+                        dst.pack(rgb),
+                    )?,
                     8 => {
                         let value = if let Some(index) = index {
                             index
                         } else if src.bpp <= 8 {
-                            nearest(colors, rgb)
+                            palette.as_ref()?.nearest(mem.cpu, rgb)?
                         } else {
-                            nearest(colors, rgb.map(|v| (v & 248) | 4))
+                            palette
+                                .as_ref()?
+                                .nearest(mem.cpu, rgb.map(|v| (v & 248) | 4))?
                         };
-                        mem.put(da + xx, 1, value)?;
+                        mem.put(da.wrapping_add(xx), 1, value)?;
                     }
                     4 => {
-                        let value = index.unwrap_or_else(|| nearest(colors, rgb));
-                        let at = da + xx / 2;
+                        let value = if let Some(index) = index {
+                            index
+                        } else {
+                            palette.as_ref()?.nearest(mem.cpu, rgb)?
+                        };
+                        let at = da.wrapping_add(xx / 2);
                         let value = if xx & 1 == 0 {
                             (value << 4) & 240
                         } else {
@@ -1477,9 +1736,9 @@ fn convert_to(env: &mut Args<'_, impl Mem>) -> Option<u64> {
                             } else {
                                 rgb
                             };
-                            u32::from(nearest(colors, rgb) != 0)
+                            u32::from(palette.as_ref()?.nearest(mem.cpu, rgb)? != 0)
                         };
-                        let at = da + xx / 8;
+                        let at = da.wrapping_add(xx / 8);
                         let old = if xx & 7 == 0 { 0 } else { mem.pixel(at, 1)? };
                         mem.put(at, 1, old | value << (7 - (xx & 7)))?;
                     }
@@ -1487,7 +1746,9 @@ fn convert_to(env: &mut Args<'_, impl Mem>) -> Option<u64> {
                 }
             }
         }
-        mem.get_mut(da + used, pad as usize)?.fill(0);
+        if pad != 0 {
+            mem.get_mut(da.wrapping_add(used), pad as usize)?.fill(0);
+        }
     }
     mem.commit()
 }
@@ -1527,7 +1788,7 @@ fn coords(cpu: &mut Access<'_, impl Mem>, at: u32) -> Option<([i32; 4], [i32; 4]
     Some(([x, y, w, h], rect))
 }
 fn interpolate(start: u32, end: u32, delta: f32) -> u32 {
-    (start as f32 + (end as i32 - start as i32) as f32 * delta + 0.5) as u8 as u32
+    (start as f32 + (end as i32).wrapping_sub(start as i32) as f32 * delta + 0.5) as u8 as u32
 }
 fn halftone(env: &mut Args<'_, impl Mem>) -> Option<u64> {
     let _control = super::pixels::FloatControl::new(env.args[4]);
@@ -1536,8 +1797,8 @@ fn halftone(env: &mut Args<'_, impl Mem>) -> Option<u64> {
     let src = Dib::read(&mut env.cpu, env.args[2], base)?;
     let (dc, dr) = coords(&mut env.cpu, env.args[1])?;
     let (sc, sr) = coords(&mut env.cpu, env.args[3])?;
-    let (width, height) = (dr[2] - dr[0], dr[3] - dr[1]);
-    let (sw, sh) = (sr[2] - sr[0], sr[3] - sr[1]);
+    let (width, height) = (dr[2].wrapping_sub(dr[0]), dr[3].wrapping_sub(dr[1]));
+    let (sw, sh) = (sr[2].wrapping_sub(sr[0]), sr[3].wrapping_sub(sr[1]));
     if width <= 0 || height <= 0 || sw <= 0 || sh <= 0 {
         return Some(0);
     }
@@ -1549,12 +1810,12 @@ fn halftone(env: &mut Args<'_, impl Mem>) -> Option<u64> {
     }
     let (mx, my) = ((dc[2] < 0) != (sc[2] < 0), (dc[3] < 0) != (sc[3] < 0));
     let (start_x, start_y) = (
-        if mx { sr[2] - 1 } else { sr[0] },
-        if my { sr[3] - 1 } else { sr[1] },
+        if mx { sr[2].wrapping_sub(1) } else { sr[0] },
+        if my { sr[3].wrapping_sub(1) } else { sr[1] },
     );
     let (inc_x, inc_y) = (
-        (if mx { -sw } else { sw }) as f32 / width as f32,
-        (if my { -sh } else { sh }) as f32 / height as f32,
+        (if mx { sw.wrapping_neg() } else { sw }) as f32 / width as f32,
+        (if my { sh.wrapping_neg() } else { sh }) as f32 / height as f32,
     );
     let mut fy = start_y as f32;
     let mut mem = Memory::new(&mut env.cpu);
@@ -1562,18 +1823,18 @@ fn halftone(env: &mut Args<'_, impl Mem>) -> Option<u64> {
     dst.output_rows(
         &mut mem,
         height,
-        (width as u32).checked_mul(dst.size() as u32)?,
+        (width as u32).wrapping_mul(dst.size() as u32),
     )?;
     for y in 0..height {
-        fy = fy.clamp(sr[1] as f32, (sr[3] - 1) as f32);
+        fy = fy.clamp(sr[1] as f32, (sr[3].wrapping_sub(1)) as f32);
         let y0 = fy as i32;
-        let y1 = (y0 + 1).clamp(sr[1], sr[3] - 1);
+        let y1 = y0.wrapping_add(1).clamp(sr[1], sr[3].wrapping_sub(1));
         let dy = fy - y0 as f32;
         let mut fx = start_x as f32;
         for x in 0..width {
-            fx = fx.clamp(sr[0] as f32, (sr[2] - 1) as f32);
+            fx = fx.clamp(sr[0] as f32, (sr[2].wrapping_sub(1)) as f32);
             let x0 = fx as i32;
-            let x1 = (x0 + 1).clamp(sr[0], sr[2] - 1);
+            let x1 = x0.wrapping_add(1).clamp(sr[0], sr[2].wrapping_sub(1));
             let dx = fx - x0 as f32;
             let c00 = src.rgb(mem.pixel(src.at(x0, y0), src.size())?);
             let c01 = src.rgb(mem.pixel(src.at(x1, y0), src.size())?);
@@ -1605,7 +1866,7 @@ mod tests {
                     let mut actual: Vec<_> = (0..len).map(|i| (i * 71) as u8).collect();
                     let mut expected = actual.clone();
                     for (i, b) in expected.iter_mut().enumerate() {
-                        *b = (*b & (and >> ((i % size) * 8)) as u8)
+                        *b = (*b & and.wrapping_shr(((i % size) * 8) as u32) as u8)
                             ^ (0xabf54321u32 >> ((i % size) * 8)) as u8;
                     }
                     super::solid_row(&mut actual, size, and, 0xabf54321);

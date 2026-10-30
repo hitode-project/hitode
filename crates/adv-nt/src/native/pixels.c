@@ -429,6 +429,11 @@ static void pixel_restore_status(uint32_t status)
 #endif
 }
 static void pixel_raise(unsigned vector) { pixel_trap = vector; longjmp(pixel_jump, 1); }
+/* The pinned assertions call the guest CRT. These descriptor checks precede
+ * the first guest pixel store, so the call can enter its guest assertion path. */
+#undef assert
+#define assert(condition) do { if (!(condition)) pixel_raise(256); } while (0)
+
 static void pixel_check(void)
 {
     if ((pixel_controls & 0x1f80) != 0x1f80 &&

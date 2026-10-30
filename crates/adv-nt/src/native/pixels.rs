@@ -50,7 +50,7 @@ pub(super) fn prepare(cpu: &dyn Guest, ext: &mut Ext, base: u32, pe: &adv_pe::Pe
             {
                 continue;
             }
-            let at = base + f.rva;
+            let at = base.wrapping_add(f.rva);
             if !identity::intact(cpu, at, f, |a| {
                 relocs.binary_search(&a.wrapping_sub(base)).is_ok()
             }) {
@@ -69,7 +69,7 @@ pub(super) fn prepare(cpu: &dyn Guest, ext: &mut Ext, base: u32, pe: &adv_pe::Pe
                 if let adv_pe::ImportName::Name { name, .. } = i.name
                     && matches!(name.as_str(), "memcpy" | "memmove" | "memset")
                 {
-                    return Some((base + i.iat_rva, name));
+                    return Some((base.wrapping_add(i.iat_rva), name));
                 }
                 None
             })
@@ -226,7 +226,7 @@ fn pixels<M: Mem>(mem: &mut M, at: u32) -> Result<(Pixels, u32, u32), Stop> {
         word(&b, 12),
     ))
 }
-fn span(p: &Pixels, f: &Format, write: bool, at: u32) -> Result<u32, Stop> {
+fn span(p: &Pixels, f: &Format, copy: bool, write: bool, at: u32) -> Result<u32, Stop> {
     let [w, h, d] = p.size;
     if w == 0 || h == 0 || d == 0 || f.block == 0 {
         return Ok(0);
@@ -241,15 +241,32 @@ fn span(p: &Pixels, f: &Format, write: bool, at: u32) -> Result<u32, Stop> {
     } else {
         h
     };
-    let rows = height.div_ceil(f.bh);
-    let row = width.div_ceil(f.bw).checked_mul(f.block);
-    let len = row.and_then(|row| {
-        (d - 1)
-            .checked_mul(p.slice)?
-            .checked_add((rows - 1).checked_mul(p.pitch)?)?
-            .checked_add(row)
-    });
-    let len = len.ok_or(Stop::Fault { address: at, write })?;
+    let rows = height
+        .wrapping_add(f.bh.wrapping_sub(1))
+        .checked_div(f.bh)
+        .ok_or(Stop::DivideByZero)?;
+    let blocks = width
+        .wrapping_add(f.bw.wrapping_sub(1))
+        .checked_div(f.bw)
+        .ok_or(Stop::DivideByZero)?;
+    let row = if copy {
+        Some(blocks.wrapping_mul(f.block))
+    } else {
+        blocks.checked_mul(f.block)
+    };
+    if rows == 0 || row == Some(0) {
+        return Ok(0);
+    }
+    // These are host borrow bounds, rather than an i386 expression. A
+    // wrapped admission length must not lend a shorter buffer to the kernel.
+    let len = row
+        .and_then(|row| {
+            d.wrapping_sub(1)
+                .checked_mul(p.slice)?
+                .checked_add(rows.wrapping_sub(1).checked_mul(p.pitch)?)?
+                .checked_add(row)
+        })
+        .ok_or(Stop::Fault { address: at, write })?;
     Ok(len)
 }
 adv_cpu::body!(pub(super) LOAD = load, inputs: &[Input::Stack(0),Input::Stack(1),Input::Stack(2),Input::Stack(3),Input::Stack(4),Input::Stack(5),Input::FloatControl], outputs: EAX, pop: 0);
@@ -266,12 +283,12 @@ fn load<M: Mem>(mem: &mut M, [dp, df, sp, sf, filter, key, mxcsr]: [u32; 7]) -> 
     let copy = df.id == sf.id
         && dst.size == src.size
         && key == 0
-        && dst.size[0] % df.bw == 0
-        && dst.size[1] % df.bh == 0
-        && (src.rect[0] as u32 & (sf.bw - 1)) == 0
-        && (src.rect[1] as u32 & (sf.bh - 1)) == 0
-        && (dst.rect[0] as u32 & (df.bw - 1)) == 0
-        && (dst.rect[1] as u32 & (df.bh - 1)) == 0;
+        && dst.size[0].checked_rem(df.bw).ok_or(Stop::DivideByZero)? == 0
+        && dst.size[1].checked_rem(df.bh).ok_or(Stop::DivideByZero)? == 0
+        && (src.rect[0] as u32 & sf.bw.wrapping_sub(1)) == 0
+        && (src.rect[1] as u32 & sf.bh.wrapping_sub(1)) == 0
+        && (dst.rect[0] as u32 & df.bw.wrapping_sub(1)) == 0
+        && (dst.rect[1] as u32 & df.bh.wrapping_sub(1)) == 0;
     if !copy
         && (sf.id == 58
             || df.id == 58
@@ -283,14 +300,14 @@ fn load<M: Mem>(mem: &mut M, [dp, df, sp, sf, filter, key, mxcsr]: [u32; 7]) -> 
     {
         return Ok(0x80004001u32.into());
     }
-    let mut dl = span(&dst, &df, true, da)?;
+    let mut dl = span(&dst, &df, copy, true, da)?;
     if !copy && filter & 15 == 1 && src.size[1] < dst.size[1] {
         dl = dl.max(dst.size[1].wrapping_mul(dst.pitch));
     }
     if !copy && filter & 15 == 1 && src.size[2] < dst.size[2] {
         dl = dl.max(dst.size[2].wrapping_mul(dst.slice));
     }
-    let sl = span(&src, &sf, false, sa)?;
+    let sl = span(&src, &sf, copy, false, sa)?;
     let pl = if !copy && (sf.alpha == 5 || sf.rgb == 5) {
         1024
     } else {
@@ -333,6 +350,10 @@ fn load<M: Mem>(mem: &mut M, [dp, df, sp, sf, filter, key, mxcsr]: [u32; 7]) -> 
     // SAFETY: layouts are repr(C), and every external byte the kernels access
     // belongs to these checked spans. Their temporary buffers are kernel-owned.
     let result = unsafe { adv_pixel_convert(&mut dst, &df, &mut src, &sf, filter, key, mxcsr) };
+    if result >> 32 == 256 {
+        // The primitive calls the guest CRT assertion handler (A64-CALL-6).
+        return Err(Stop::Guest);
+    }
     mem.commit()?;
     if result >> 32 != 0 {
         Err(Stop::Trap((result >> 32) as u8))
@@ -367,28 +388,34 @@ fn shuffle(dst: &Pixels, src: &Pixels, df: &Format, sf: &Format, d: *mut u8, s: 
         };
         for z in 0..dst.size[2] {
             for y in 0..dst.size[1] {
-                let target = d.add((z * dst.slice + y * dst.pitch) as usize);
-                let source = s.add((z * src.slice + y * src.pitch) as usize);
+                let target = d.add(
+                    z.wrapping_mul(dst.slice)
+                        .wrapping_add(y.wrapping_mul(dst.pitch)) as usize,
+                );
+                let source = s.add(
+                    z.wrapping_mul(src.slice)
+                        .wrapping_add(y.wrapping_mul(src.pitch)) as usize,
+                );
                 let mut x = 0;
                 #[cfg(target_arch = "aarch64")]
                 {
                     use std::arch::aarch64::*;
-                    while x + 4 <= dst.size[0] {
+                    while dst.size[0] - x >= 4 {
                         let value = vorrq_u8(
-                            vqtbl1q_u8(vld1q_u8(source.add(x as usize * 4)), index),
+                            vqtbl1q_u8(vld1q_u8(source.add(x.wrapping_mul(4) as usize)), index),
                             constant,
                         );
-                        vst1q_u8(target.add(x as usize * 4), value);
+                        vst1q_u8(target.add(x.wrapping_mul(4) as usize), value);
                         x += 4;
                     }
                 }
                 while x < dst.size[0] {
                     for c in 0..4 {
                         let from = indices[c] as usize;
-                        *target.add(x as usize * 4 + c) = if from == 255 {
+                        *target.add(x.wrapping_mul(4) as usize + c) = if from == 255 {
                             fill[c]
                         } else {
-                            *source.add(x as usize * 4 + from)
+                            *source.add(x.wrapping_mul(4) as usize + from)
                         };
                     }
                     x += 1;

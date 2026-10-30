@@ -2615,3 +2615,83 @@ fn png_short_rows_and_wrapped_average_complete() {
         }
     }
 }
+
+// spec: NAT-BODY-8, NAT-BODY-16
+#[test]
+fn d3dx_block_rounding_wraps_and_zero_divisors_fault() {
+    let Some(dist) = dist() else { return };
+    let (mut native, pe) = machine(&dist, "d3dx9_43.dll", true);
+    let (mut reference, _) = machine(&dist, "d3dx9_43.dll", false);
+    let table = native.ext.get::<adv_nt::identity::Images>().0[&pe.image_base]
+        .table()
+        .unwrap();
+    let entry = pe.image_base + table.named("d3dx_load_pixels_from_pixels").unwrap().rva;
+    for m in [&mut native, &mut reference] {
+        prepare(m, entry, 6, false);
+    }
+    let mut data = vec![0x71; LEN as usize];
+    for (at, buffer) in [(DATA, DATA + 0x1000), (DATA + 64, DATA + 0x2000)] {
+        for (off, value) in [
+            (0, buffer),
+            (4, 4),
+            (8, 4),
+            (12, 0),
+            (16, 1),
+            (20, 1),
+            (24, 1),
+            (28, 0),
+            (32, 0),
+            (36, 1),
+            (40, 1),
+        ] {
+            put(&mut data, at + off, 4, value);
+        }
+    }
+    for at in [DATA + 128, DATA + 192] {
+        for (off, value) in [
+            (0, 1),
+            (4, 0x08080808),
+            (8, 0x00081018),
+            (12, 4),
+            (16, 1),
+            (20, 1),
+            (24, 4),
+            (28, 1),
+            (32, 1),
+            (36, 0),
+        ] {
+            put(&mut data, at + off, 4, value);
+        }
+    }
+    let args = [DATA, DATA + 128, DATA + 64, DATA + 192, 2, 0];
+    same(
+        &mut native,
+        &mut reference,
+        &data,
+        &args,
+        "D3DX ordinary block copy",
+    );
+    // UINT addition in copy_pixels rounds this width down to zero blocks.
+    for at in [DATA, DATA + 64] {
+        put(&mut data, at + 16, 4, u32::MAX);
+    }
+    for at in [DATA + 128, DATA + 192] {
+        put(&mut data, at + 16, 4, u32::MAX);
+    }
+    same(
+        &mut native,
+        &mut reference,
+        &data,
+        &args,
+        "D3DX wrapped block count",
+    );
+    put(&mut data, DATA + 128 + 16, 4, 0);
+    let actual = call(&mut native, &data, &args);
+    let expected = call(&mut reference, &data, &args);
+    assert!(actual.0.is_err() && expected.0.is_err());
+    assert_eq!(actual.1, data);
+    let fault = &native.sys.latest_cpu_fault.as_ref().unwrap().fault;
+    assert_eq!(fault.pc, entry);
+    assert_eq!(fault.kind, adv_cpu::backend::FaultKind::IntegerDivideByZero);
+    assert_eq!(adv_nt::native::declines(&native.ext), 0);
+}

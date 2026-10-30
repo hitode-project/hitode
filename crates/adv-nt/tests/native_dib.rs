@@ -2318,3 +2318,293 @@ fn zero_brush_dimension_faults_at_entry() {
         assert_eq!(adv_nt::native::declines(&native.ext), 0);
     }
 }
+
+// spec: NAT-BODY-4, NAT-BODY-16
+#[test]
+fn wrapped_coordinates_and_fields_match_i386() {
+    let Some(dist) = dist() else { return };
+    let table = std::fs::read_to_string(dist.join("share/hitode/identity/win32u.so.tsv")).unwrap();
+    let mut native = machine(&dist, true, None);
+    let mut reference = machine(&dist, false, None);
+    reference.sys.redirects.clear();
+    for case in 0..8 {
+        let mut data = fixture(0, 0);
+        for (field, value) in [
+            (rect::left, 0),
+            (rect::top, 0),
+            (rect::right, 1),
+            (rect::bottom, 1),
+        ] {
+            set(&mut data, RECTS, field, value);
+        }
+        let (name, args) = match case {
+            0 => {
+                // The i386 byte address wraps back into the mapped output.
+                set(&mut data, DST, d::rect + rect::left, i32::MAX as u32);
+                set(&mut data, DST, d::rect + rect::top, i32::MAX as u32);
+                set(&mut data, RECTS, rect::top, 1);
+                set(&mut data, RECTS, rect::bottom, 2);
+                set(&mut data, DST, d::bits, DEST_BITS + 4);
+                (
+                    "solid_rects_32",
+                    vec![DST, 1, RECTS, 0x7f192837, 0x17263549],
+                )
+            }
+            1 => {
+                set(&mut data, DST, d::rect + rect::top, i32::MAX as u32);
+                set(&mut data, ORIGIN, point::x, 0);
+                set(&mut data, ORIGIN, point::y, 1);
+                for (field, value) in [
+                    (line::length, 2),
+                    (line::err_start, 0),
+                    (line::bias, 0),
+                    (line::err_add_2, 0),
+                    (line::x_major, 1),
+                    (line::x_inc, 1),
+                    (line::y_inc, 0),
+                ] {
+                    set(&mut data, PARAMS, field, value);
+                }
+                (
+                    "solid_line_32",
+                    vec![DST, ORIGIN, PARAMS, 0x7f192837, 0x17263549],
+                )
+            }
+            2 => {
+                set(&mut data, RECTS, rect::left, i32::MIN as u32);
+                set(&mut data, RECTS, rect::right, i32::MAX as u32);
+                set(&mut data, ORIGIN, point::x, 0);
+                set(&mut data, ORIGIN, point::y, 0);
+                (
+                    "blend_rects_8888",
+                    vec![DST, 1, RECTS, SRC, ORIGIN, 0x017f0000],
+                )
+            }
+            3 => {
+                set(&mut data, RECTS, rect::right, 4);
+                set(&mut data, BRUSH, d::width, 7);
+                set(&mut data, BRUSH, d::height, 5);
+                set(&mut data, EXTRA, masks::and_, MASK_BITS + 0x1000);
+                set(&mut data, EXTRA, masks::xor_, MASK_BITS);
+                set(&mut data, ORIGIN, point::x, i32::MIN as u32);
+                set(&mut data, ORIGIN, point::y, 0);
+                (
+                    "pattern_rects_32",
+                    vec![DST, 1, RECTS, ORIGIN, BRUSH, EXTRA],
+                )
+            }
+            4 => {
+                dib(&mut data, SRC, 1, SOURCE_BITS, 0);
+                for (field, value) in [
+                    (d::red_shift, i32::MIN as u32),
+                    (d::green_shift, i32::MAX as u32),
+                    (d::blue_shift, 40),
+                    (d::red_len, 16),
+                    (d::green_len, 31),
+                    (d::blue_len, 1),
+                ] {
+                    set(&mut data, SRC, field, value);
+                }
+                ("convert_to_8888", vec![DST, SRC, RECTS, 0])
+            }
+            5 => {
+                for (i, x) in [i32::MIN as u32, i32::MAX as u32].into_iter().enumerate() {
+                    set(
+                        &mut data,
+                        EXTRA + i as u32 * vertex::SIZE as u32,
+                        vertex::x,
+                        x,
+                    );
+                    for field in [vertex::Red, vertex::Green, vertex::Blue, vertex::Alpha] {
+                        let at = (EXTRA - DATA) as usize + i * vertex::SIZE + field;
+                        data[at..at + 2]
+                            .copy_from_slice(&(0x4183u16.wrapping_mul(i as u16 + 1)).to_le_bytes());
+                    }
+                }
+                ("gradient_rect_8888", vec![DST, RECTS, EXTRA, 0])
+            }
+            6 => {
+                for address in [DST, SRC] {
+                    set(&mut data, address, d::rect + rect::top, 1);
+                }
+                for address in [ORIGIN, PARAMS] {
+                    set(&mut data, address, point::x, 0);
+                    set(&mut data, address, point::y, i32::MAX as u32);
+                }
+                for (field, value) in [
+                    (stretch::length, 1),
+                    (stretch::dst_inc, 1),
+                    (stretch::src_inc, 1),
+                    (stretch::err_start, 0),
+                    (stretch::err_add_2, 0),
+                ] {
+                    set(&mut data, EXTRA, field, value);
+                }
+                (
+                    "stretch_row_32",
+                    vec![DST, ORIGIN, SRC, PARAMS, EXTRA, 3, 0],
+                )
+            }
+            _ => {
+                for field in [rect::right, rect::bottom] {
+                    set(&mut data, RECTS, field, 2);
+                }
+                for field in [rect::left, rect::top] {
+                    set(&mut data, SRC, d::rect + field, 1);
+                }
+                for field in [point::x, point::y] {
+                    set(&mut data, ORIGIN, field, i32::MAX as u32);
+                }
+                ("copy_rect_32", vec![DST, RECTS, SRC, ORIGIN, 13, 0])
+            }
+        };
+        compare(
+            &mut native,
+            &mut reference,
+            &table,
+            name,
+            &args,
+            &data,
+            &format!("wrapped case {case}"),
+        );
+    }
+    for (format, &(suffix, bpp, _)) in FORMATS.iter().take(5).enumerate() {
+        for blend in [0x017f0000, 0x01ff0000, 0x007f0000] {
+            let mut data = fixture(format, 0);
+            dib(&mut data, SRC, 0, SOURCE_BITS, 0);
+            set(
+                &mut data,
+                DST,
+                d::bits,
+                DEST_BITS.wrapping_sub((i32::MIN as u32).wrapping_mul(bpp / 8)),
+            );
+            for (field, value) in [
+                (rect::left, i32::MIN as u32),
+                (rect::top, 0),
+                (rect::right, i32::MAX as u32),
+                (rect::bottom, 1),
+            ] {
+                set(&mut data, RECTS, field, value);
+            }
+            set(&mut data, ORIGIN, point::x, 0);
+            set(&mut data, ORIGIN, point::y, 0);
+            compare(
+                &mut native,
+                &mut reference,
+                &table,
+                &format!("blend_rects_{suffix}"),
+                &[DST, 1, RECTS, SRC, ORIGIN, blend],
+                &data,
+                "wrapped loop admission",
+            );
+        }
+    }
+    assert_eq!(adv_nt::native::declines(&native.ext), 0);
+}
+
+// spec: NAT-BODY-4, NAT-BODY-16
+#[test]
+fn palette_count_uses_i386_int_without_a_host_array_bound() {
+    let Some(dist) = dist() else { return };
+    let table = std::fs::read_to_string(dist.join("share/hitode/identity/win32u.so.tsv")).unwrap();
+    let mut native = machine(&dist, true, None);
+    let mut reference = machine(&dist, false, None);
+    reference.sys.redirects.clear();
+    for count in [258, u32::MAX] {
+        let mut data = fixture(0, 0);
+        dib(&mut data, DST, 5, DEST_BITS, 0);
+        set(&mut data, DST, d::color_table_size, count);
+        for (field, value) in [
+            (rect::left, 0),
+            (rect::top, 0),
+            (rect::right, 1),
+            (rect::bottom, 1),
+        ] {
+            set(&mut data, RECTS, field, value);
+        }
+        for i in 0..258 {
+            set(
+                &mut data,
+                PALETTE,
+                i * 4,
+                if i == 257 { 0 } else { 0xffffff },
+            );
+        }
+        set(&mut data, SOURCE_BITS, 0, 0);
+        compare(
+            &mut native,
+            &mut reference,
+            &table,
+            "convert_to_8",
+            &[DST, SRC, RECTS, 0],
+            &data,
+            &format!("palette count {count}"),
+        );
+    }
+}
+
+// spec: NAT-BODY-4, NAT-BODY-16
+#[test]
+fn fixed_pixel_types_do_not_use_unrelated_header_depths() {
+    let Some(dist) = dist() else { return };
+    let table = std::fs::read_to_string(dist.join("share/hitode/identity/win32u.so.tsv")).unwrap();
+    let mut native = machine(&dist, true, None);
+    let mut reference = machine(&dist, false, None);
+    reference.sys.redirects.clear();
+    for depth in [0, u32::MAX] {
+        for name in [
+            "solid_rects_32",
+            "solid_line_32",
+            "pattern_rects_32",
+            "copy_rect_32",
+            "blend_rects_8888",
+            "draw_glyph_8888",
+        ] {
+            let mut data = fixture(0, 0);
+            for address in [DST, SRC, BRUSH] {
+                set(&mut data, address, d::bit_count, depth);
+            }
+            for (field, value) in [
+                (rect::left, 0),
+                (rect::top, 0),
+                (rect::right, 1),
+                (rect::bottom, 1),
+            ] {
+                set(&mut data, RECTS, field, value);
+            }
+            for field in [point::x, point::y] {
+                set(&mut data, ORIGIN, field, 0);
+            }
+            for (field, value) in [
+                (line::length, 1),
+                (line::x_major, 1),
+                (line::x_inc, 0),
+                (line::y_inc, 0),
+            ] {
+                set(&mut data, PARAMS, field, value);
+            }
+            set(&mut data, EXTRA, masks::and_, MASK_BITS + 0x1000);
+            set(&mut data, EXTRA, masks::xor_, MASK_BITS);
+            let args = match name {
+                "solid_rects_32" => vec![DST, 1, RECTS, 0, 0x17354628],
+                "solid_line_32" => vec![DST, ORIGIN, PARAMS, 0, 0x17354628],
+                "pattern_rects_32" => vec![DST, 1, RECTS, ORIGIN, BRUSH, EXTRA],
+                "copy_rect_32" => vec![DST, RECTS, SRC, ORIGIN, 13, 0],
+                "blend_rects_8888" => vec![DST, 1, RECTS, SRC, ORIGIN, 0x017f0000],
+                _ => {
+                    set(&mut data, SOURCE_BITS, 0, 16);
+                    vec![DST, RECTS, SRC, ORIGIN, 0x17354628, EXTRA]
+                }
+            };
+            compare(
+                &mut native,
+                &mut reference,
+                &table,
+                name,
+                &args,
+                &data,
+                &format!("unused bit_count {depth}"),
+            );
+        }
+    }
+}
