@@ -54,7 +54,12 @@ impl Resolver for Platform {
                                     calls - audit.begin > 1,
                                     "timer must request server deadline processing"
                                 );
-                            } else if !traced {
+                            } else if traced {
+                                assert!(
+                                    calls - audit.begin > 1,
+                                    "guest service must cross the boundary"
+                                );
+                            } else {
                                 assert_eq!(
                                     calls - audit.begin,
                                     1,
