@@ -135,24 +135,3 @@ unsigned int hitode_server_close_handle( unsigned int tid, unsigned int handle )
     if (current) current->error = saved_error;
     return status;
 }
-
-/* Cold descriptor admission uses object identity to share file positions. */
-uintptr_t hitode_server_object( unsigned int tid, unsigned int handle )
-{
-    struct thread *thread;
-    struct object *obj;
-    uintptr_t identity = 0;
-    unsigned int saved_global = global_error, saved_error = get_error();
-    if ((thread = get_thread_from_id( tid )))
-    {
-        if ((obj = get_handle_obj( thread->process, handle, 0, NULL )))
-        {
-            identity = (uintptr_t)obj;
-            release_object( obj );
-        }
-        release_object( thread );
-    }
-    global_error = saved_global;
-    if (current) current->error = saved_error;
-    return identity;
-}

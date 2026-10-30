@@ -430,6 +430,9 @@ fn registry() {
             "child_update",
             "delete",
             "reopen",
+            "retire_setup",
+            "retire_warm",
+            "retired_handle",
         ],
     );
 }

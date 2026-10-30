@@ -658,11 +658,12 @@ pub fn handle_fd(env: &mut Env<'_>, handle: u32) -> Result<HandleFd, crate::stat
         let tid = link
             .known_tid(context)
             .ok_or_else(|| broken(Error::NoThread(context)))?;
-        let identity = adv_wineserver::object_identity(tid, handle);
+        let position = adv_wineserver::file_position(tid, handle)
+            .expect("an admitted file descriptor retains its server fd");
         let immutable = crate::file::volume::mounts(env).file_standard(raw);
         let link = env.ext.get::<Link>();
         link.files
-            .insert(handle, raw, identity, immutable, reply.r#type);
+            .insert(handle, raw, position, immutable, reply.r#type);
     }
     let state = env.ext.get::<Link>().files.get(handle);
     let file = state.clone().filter(|file| file.kind == 1);
@@ -689,9 +690,10 @@ pub(crate) fn pipe_state(
     {
         let tid = current_tid(env)?;
         if adv_wineserver::file_kind(tid, handle) == 6 {
-            let identity = adv_wineserver::object_identity(tid, handle);
+            let position = adv_wineserver::file_position(tid, handle)
+                .expect("an admitted file descriptor retains its server fd");
             let states = &env.ext.get::<Link>().files;
-            states.insert(handle, -1, identity, None, 6);
+            states.insert(handle, -1, position, None, 6);
             return Ok(states.get(handle));
         }
     }
@@ -701,7 +703,11 @@ pub(crate) fn pipe_state(
 /// Closes `handle` in the server and forgets its descriptor.
 pub fn close(env: &mut Env<'_>, handle: u32) -> Result<(), crate::status::Error> {
     #[cfg(any(target_vendor = "apple", target_os = "android"))]
-    crate::status::check(adv_wineserver::close_handle(current_tid(env)?, handle))?;
+    {
+        // Direct closes bypass Channel::call_raw's handle-retirement invalidation.
+        crate::registry::invalidate_request(crate::protocol::CloseHandleRequest::NUMBER);
+        crate::status::check(adv_wineserver::close_handle(current_tid(env)?, handle))?;
+    }
     #[cfg(not(any(target_vendor = "apple", target_os = "android")))]
     {
         let mut request = crate::protocol::CloseHandleRequest {

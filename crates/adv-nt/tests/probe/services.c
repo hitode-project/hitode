@@ -101,7 +101,14 @@ static int checks(void) {
     CHECK(!SetFilePointerEx(file,distance,&position,FILE_BEGIN) && GetLastError()==ERROR_NEGATIVE_SEEK);
     high=0; CHECK(SetFilePointer(file,0xffffffff,&high,FILE_BEGIN)==0xffffffff && high==0 && GetLastError()==0);
     distance.QuadPart=0; CHECK(SetFilePointerEx(file,distance,&position,FILE_BEGIN));
-    CloseHandle(duplicate); CloseHandle(file); DeleteFileW(L"service-file.tmp");
+    CloseHandle(duplicate);
+    distance.QuadPart=4; CHECK(SetFilePointerEx(file,distance,&position,FILE_BEGIN));
+    /* The destination has never admitted a descriptor when the source retires. */
+    CHECK(DuplicateHandle(GetCurrentProcess(),file,GetCurrentProcess(),&duplicate,0,FALSE,
+                          DUPLICATE_SAME_ACCESS|DUPLICATE_CLOSE_SOURCE));
+    CHECK(SetFilePointer(duplicate,0,NULL,FILE_CURRENT)==4);
+    CHECK(ReadFile(duplicate,bytes,2,&read,NULL) && read==2 && !memcmp(bytes,"45",2));
+    CloseHandle(duplicate); DeleteFileW(L"service-file.tmp");
     {
         HANDLE pipe[2], nonfile[3];
         CHECK(CreatePipe(&pipe[0],&pipe[1],NULL,4096));
