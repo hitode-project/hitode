@@ -81,6 +81,35 @@ For the Wine stack, `adv-abi::dll` writes host-module PE images through `adv-pe`
 6. **Present.** The shell takes the newest finished frame and presents it through wgpu (Metal on macOS). Dropping a host frame never skips a draw, lock or readback that the guest can observe.
 7. **Sound and input.** DirectSound and waveOut share one mixer and playback clock, and the host audio callback only reads mixed PCM. Host input events become USER messages in the guest's queues.
 
+## A call, from guest to body
+
+A guest call to a function that has a native body, such as `memcpy` or `SetEvent`, takes the steps below. Each step names its code and the rules it follows. `tools/docs/check_docs.py` fails a commit when a named file or symbol no longer exists, or a cited rule is withdrawn, so the change that moves a step also updates its text.
+
+1. **Bind at load.** When `adv-nt` maps a distribution module, each body whose function bytes match the identity table binds the function's entry. The entry then leads to a thunk, and a direct body is also recorded under its entry. Runtime helpers that game images link statically bind wherever their bytes appear.
+   Code: [`bind`](crates/adv-nt/src/native.rs), [`bind_one`](crates/adv-nt/src/native.rs), [`intact`](crates/adv-nt/src/identity.rs), [`Sys::direct_bodies`](crates/adv-machine/src/lib.rs), [`linked::bind`](crates/adv-nt/src/native/linked.rs).
+   Rules: A64-CTL-14, NAT-BODY-13, NAT-BODY-18.
+2. **Translate the call.** A trace resolves `call [slot]` and `jmp [slot]` when it is translated, and watches the slot and the entry bytes. A call reaching an intact entry with a direct body becomes an `Op::Body` site. Other transfers to a redirected entry go to its thunk.
+   Code: [`Trace::build`](crates/adv-cpu-a64/src/translate/trace.rs), [`Redirect`](crates/adv-cpu-a64/src/translate/trace.rs), [`Bound`](crates/adv-cpu-a64/src/translate/trace.rs), [`Op::Body`](crates/adv-cpu-a64/src/translate/decode.rs), [`TrapHandler::direct_body`](crates/adv-cpu-core/src/backend/mod.rs).
+   Rules: A64-CALL-1, A64-CTL-11, A64-CTL-14.
+3. **Run the body on the window.** The site loads the inputs into w1–w7, points x0 at the body context, and calls the body as an AAPCS64 leaf, without the call stub. The body checks each 4 KiB page's class once, then reads and writes the guest window directly. The site writes the declared result registers and pops the arguments.
+   Code: [`Translator::body`](crates/adv-cpu-a64/src/translate/ops.rs), [`body`](crates/adv-cpu-core/src/body.rs) (the macro), [`BodyContext`](crates/adv-cpu-core/src/body.rs), [`DirectBody`](crates/adv-cpu-core/src/body.rs), [`Window`](crates/adv-cpu-core/src/body.rs).
+   Rules: A64-CALL-2, A64-CALL-4, NAT-BODY-17.
+4. **Leave for the full path.** A page the window may not take, such as a guard, file, shared or watched page, stops the body with `Stop::Slow` before it writes anything. A call site then exits to interpret the call, and an entry site dispatches to the thunk.
+   Code: [`Stop`](crates/adv-cpu-core/src/body.rs), [`Translator::body`](crates/adv-cpu-a64/src/translate/ops.rs).
+   Rules: A64-CALL-4, A64-CALL-5.
+5. **Run the full path.** The interpreter takes the entry's redirect to the thunk, and the machine runs its handler. A direct body runs again over `GuestMem`, which completes every access as a guest instruction would. A body that is not yet direct runs here with the handler's environment.
+   Code: [`run_inner`](crates/adv-cpu-a64/src/executor.rs), [`Dispatch::on_host_call`](crates/adv-machine/src/lib.rs), [`run`](crates/adv-nt/src/native.rs), [`run_body`](crates/adv-nt/src/native.rs), [`run_full`](crates/adv-nt/src/native.rs), [`GuestMem`](crates/adv-cpu-core/src/body.rs).
+   Rules: A64-CALL-5, NAT-BODY-16, NAT-BODY-17.
+6. **Return, raise or run guest code.** A result returns as the function's `ret` would. A fault, including division by zero, raises the guest exception as if the entry's first instruction faulted. A body whose function would wait, call guest code or request the server runs the function's own code once, through a trampoline.
+   Code: [`Outcome::Raise`](crates/adv-machine/src/outcome.rs), [`apply`](crates/adv-machine/src/lib.rs), [`exception`](crates/adv-machine/src/lib.rs), [`resume_original`](crates/adv-nt/src/native.rs), [`trampoline`](crates/adv-nt/src/native.rs).
+   Rules: A64-CALL-4, A64-CALL-6.
+7. **Reach host state.** Service bodies, such as event signals and file positions, change host state through the `Services` the body context carries. That state lives in storage the machine also reaches only through shared handles, so no exclusive borrow aliases it.
+   Code: [`Services`](crates/adv-cpu-core/src/body.rs), [`TrapHandler::body_services`](crates/adv-cpu-core/src/backend/mod.rs), [`services::bodies`](crates/adv-nt/src/native/services.rs).
+   Rules: NAT-BODY-18.
+8. **Call without a body.** System calls (`int 0x2e`) and other thunks call their handler through the call stub, which synchronizes guest state. With diagnostics off, the call reads no clock and records nothing.
+   Code: [`call`](crates/adv-cpu-a64/src/native.rs), [`Dispatch::on_host_call`](crates/adv-machine/src/lib.rs).
+   Rules: A64-CTL-12, EXEC-CALL-1, EXEC-CALL-2.
+
 ## Execution
 
 The `adv-cpu` facade exposes the AArch64 engine:
@@ -169,7 +198,7 @@ On macOS, guest menus appear in the native menu bar and guest dialogs become chi
 
 - CPU behavior is checked with self-written instruction and fault fixtures, differential runs against the interpreter, and Unicorn as a test-only reference.
 - Windows behavior is checked in Wine sessions: self-written probes and Wine's own conformance tests run on the Wine stack and compare their results with the native contract.
-- `tools/check.py` runs before every commit. It checks formatting, privacy, layering, the specs and the launcher front end.
+- `tools/check.py` runs before every commit. It checks formatting, privacy, layering, the specs, the code and rules this guide names, and the launcher front end.
 - Rules in `docs/spec/` name their verification, and tests cite the rules they check with `// spec:` markers.
 
 Game assets, screenshots, traces and anything taken from a game stay local and never enter the repository.
