@@ -854,6 +854,14 @@ fn read(env: &mut Env<'_>, context: CtxId, done: Done) -> Outcome {
         Ok(buffer) => buffer,
         Err(error) => return Outcome::Fail(format!("{MODULE}: {error}")),
     };
+    // Reused pages keep an earlier snapshot's strings, and a query that
+    // fails writes nothing: start every slot empty.
+    if let Err(error) = env.cpu.write(
+        buffer,
+        &vec![0; (STRIDE * hwnds.len().max(1) as u32) as usize],
+    ) {
+        return Outcome::Fail(format!("{MODULE}: {error}"));
+    }
     let mut list = vec![
         ("GetFocus", vec![]),
         ("GetActiveWindow", vec![]),
