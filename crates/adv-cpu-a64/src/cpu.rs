@@ -568,9 +568,22 @@ impl ExecutionTrap for Raw<'_> {
 }
 
 impl Backend for Cpu {
+    fn frame_counters(&self) -> Option<adv_cpu_core::frame_counters::FrameCounters> {
+        Some(adv_cpu_core::frame_counters::FrameCounters {
+            retired_forms: self.inner.retired_forms()?,
+            retired_tier0_instructions: self.inner.tier0_instructions().unwrap_or_default(),
+            native_entries: self.inner.stats.native_entries,
+            interpreter_entries: self.inner.stats.interpreter_entries,
+            ..Default::default()
+        })
+    }
+
     fn new_process(&mut self) -> Result<Self, String> {
         let mut child = Self::new(self.park, self.native)?;
         child.budget = self.budget;
+        child
+            .inner
+            .count_tier0(self.inner.retired_forms().is_some());
         let sender = self.background_sender()?;
         child.service = self.service.clone();
         child.set_background_sender(sender)?;
@@ -728,6 +741,7 @@ impl Engine for Cpu {
         EngineCounters {
             native_entries: stats.native_entries,
             interpreter_entries: stats.interpreter_entries,
+            retired_forms: self.inner.retired_forms(),
         }
     }
 
@@ -747,7 +761,7 @@ impl Engine for Cpu {
                 "\"engine\": \"a64\",\n  \"native_entries\": {},\n  \"interpreter_entries\": {},\n",
                 "  \"interpreter_instructions\": {},\n  \"compilations\": {},\n",
                 "  \"native_code_bytes\": {},\n  \"tier_verification\": {},\n",
-                "  \"a64_diagnostics\": {},\n",
+                "  \"a64_diagnostics\": {},\n  \"retired_forms\": {},\n",
                 "  \"interpreted_forms\": {{{}}},
   \"fault_forms\": {{{}}},
 ",
@@ -760,6 +774,9 @@ impl Engine for Cpu {
             stats.native_code_bytes,
             stats.verification.json(),
             json(&self.inner.diagnostics()),
+            self.inner
+                .retired_forms()
+                .map_or_else(|| "null".into(), |forms| format!("{forms:?}")),
             forms(0),
             forms(1),
             forms(2),

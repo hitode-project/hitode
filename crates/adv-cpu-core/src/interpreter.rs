@@ -178,6 +178,7 @@ pub struct Interpreter {
     capacity: usize,
     decodes: u64,
     pub frame_retired: Option<u64>,
+    pub frame_rep_elements: u64,
     /// Discovery and tracing observe every transfer before windows may loop.
     pub observe_transfers: bool,
 }
@@ -203,6 +204,7 @@ impl Interpreter {
             capacity,
             decodes: 0,
             frame_retired: None,
+            frame_rep_elements: 0,
             observe_transfers: false,
         }
     }
@@ -264,9 +266,11 @@ impl Interpreter {
             }
             decoded
         };
+        let count = state.regs[1];
         let execution = execute_decoded(&decoded, state, memory, max_units, None);
         if let Some(retired) = &mut self.frame_retired {
             *retired += retired_instruction(&decoded, execution, state, pc);
+            self.frame_rep_elements += rep_elements(&decoded, count, state);
         }
         execution
     }
@@ -312,7 +316,9 @@ impl Interpreter {
                         memory,
                         max_units,
                         stop,
-                        self.frame_retired.as_mut(),
+                        self.frame_retired
+                            .as_mut()
+                            .map(|retired| (retired, &mut self.frame_rep_elements)),
                         self.observe_transfers,
                     );
                 }
@@ -334,7 +340,9 @@ impl Interpreter {
                     memory,
                     max_units,
                     stop,
-                    self.frame_retired.as_mut(),
+                    self.frame_retired
+                        .as_mut()
+                        .map(|retired| (retired, &mut self.frame_rep_elements)),
                     self.observe_transfers,
                 );
             }
@@ -368,7 +376,9 @@ impl Interpreter {
             memory,
             max_units,
             stop,
-            self.frame_retired.as_mut(),
+            self.frame_retired
+                .as_mut()
+                .map(|retired| (retired, &mut self.frame_rep_elements)),
             self.observe_transfers,
         )
     }
@@ -470,7 +480,12 @@ fn execute_decoded(
         }
     };
     if let Action::String(operation) = instruction.action {
-        return strings::execute::<true>(
+        let execute = if operation.repeat {
+            strings::repeat
+        } else {
+            strings::execute::<true>
+        };
+        return execute(
             state,
             memory,
             operation,
@@ -629,6 +644,19 @@ fn retired_instruction(decoded: &Decoded, execution: Execution, state: &CpuState
         )
     } else {
         1
+    }
+}
+
+fn rep_elements(decoded: &Decoded, before: u32, state: &CpuState) -> u64 {
+    match decoded {
+        Decoded::Ready(Predecoded {
+            action: Action::String(op),
+            ..
+        }) if op.repeat => {
+            let mask = if op.word { 0xffff } else { u32::MAX };
+            u64::from((before & mask) - (state.regs[1] & mask))
+        }
+        _ => 0,
     }
 }
 
@@ -854,6 +882,20 @@ impl Prepared {
         Some(Self { decoded, x87 })
     }
 
+    /// Completed instructions and REP elements for diagnostic accounting.
+    pub fn retirement(
+        &self,
+        execution: Execution,
+        state: &CpuState,
+        pc: u32,
+        count: u32,
+    ) -> (u64, u64) {
+        (
+            retired_instruction(&self.decoded, execution, state, pc),
+            rep_elements(&self.decoded, count, state),
+        )
+    }
+
     /// The x87 opcode (FOP) the instruction records, if it records one.
     pub fn x87_opcode(&self) -> Option<u16> {
         self.x87.as_ref().and_then(|op| op.opcode)
@@ -1054,13 +1096,13 @@ impl DecodedBlock {
         memory: &mut Memory,
         max_units: u32,
         stop: u32,
-        retired: Option<&mut u64>,
+        counts: Option<(&mut u64, &mut u64)>,
         observe_transfers: bool,
     ) -> (Execution, u32) {
         if observe_transfers || !self.local_branches {
-            self.execute_mode::<true>(state, memory, max_units, stop, retired)
+            self.execute_mode::<true>(state, memory, max_units, stop, counts)
         } else {
-            self.execute_mode::<false>(state, memory, max_units, stop, retired)
+            self.execute_mode::<false>(state, memory, max_units, stop, counts)
         }
     }
 
@@ -1070,17 +1112,19 @@ impl DecodedBlock {
         memory: &mut Memory,
         max_units: u32,
         stop: u32,
-        retired: Option<&mut u64>,
+        // Retired instructions and REP elements, counted only for diagnostics.
+        counts: Option<(&mut u64, &mut u64)>,
     ) -> (Execution, u32) {
         // Specialize the ordinary block loop: disabled diagnostics must not
         // add a retirement branch to every interpreted instruction.
-        match retired {
-            Some(retired) => {
-                self.execute::<OBSERVE>(state, memory, max_units, stop, |d, e, s, pc| {
+        match counts {
+            Some((retired, elements)) => {
+                self.execute::<OBSERVE>(state, memory, max_units, stop, |d, e, s, pc, count| {
+                    *elements += rep_elements(d, count, s);
                     *retired += retired_instruction(d, e, s, pc)
                 })
             }
-            None => self.execute::<OBSERVE>(state, memory, max_units, stop, |_, _, _, _| {}),
+            None => self.execute::<OBSERVE>(state, memory, max_units, stop, |_, _, _, _, _| {}),
         }
     }
 
@@ -1090,7 +1134,7 @@ impl DecodedBlock {
         memory: &mut Memory,
         max_units: u32,
         stop: u32,
-        mut retire: impl FnMut(&Decoded, Execution, &CpuState, u32),
+        mut retire: impl FnMut(&Decoded, Execution, &CpuState, u32, u32),
     ) -> (Execution, u32) {
         let epoch = memory.epoch;
         let mut result = Execution {
@@ -1105,6 +1149,7 @@ impl DecodedBlock {
             if result.units == max_units || state.eip != pc || pc == stop {
                 break;
             }
+            let count = state.regs[1];
             let execution = if let Decoded::Ready(instruction) = decoded
                 && !instruction.exclusive
                 && state.rep.is_none()
@@ -1126,7 +1171,7 @@ impl DecodedBlock {
                     Some(&mut deferred_mmx),
                 )
             };
-            retire(decoded, execution, state, pc);
+            retire(decoded, execution, state, pc, count);
             result.units += execution.units;
             result.step = execution.step;
             last_units = execution.units;

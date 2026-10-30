@@ -24,6 +24,8 @@ pub fn reason_index(reason: InterpreterReason) -> usize {
 /// Units differ by tier: Tier 0 retires instruction/REP units; Tier 2 retires blocks.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FrameCounters {
+    /// Translated, apply, interpret, interpreter, and REP elements.
+    pub retired_forms: [u64; 5],
     pub tier0_units: u64,
     pub tier2_blocks: u64,
     /// Confirmed retired Tier 0 instructions only; never present this as all tiers.
@@ -56,6 +58,7 @@ impl FrameCounters {
         macro_rules! delta {
             ($($field:ident),*) => { Self {
                 $($field: self.$field.saturating_sub(before.$field),)*
+                retired_forms: std::array::from_fn(|i| self.retired_forms[i].saturating_sub(before.retired_forms[i])),
                 reasons: std::array::from_fn(|i| self.reasons[i].saturating_sub(before.reasons[i])),
                 reason_ns: std::array::from_fn(|i| self.reason_ns[i].saturating_sub(before.reason_ns[i])),
                 compile_wait_stage_ns: std::array::from_fn(|i| self.compile_wait_stage_ns[i].saturating_sub(before.compile_wait_stage_ns[i])),
@@ -94,11 +97,12 @@ impl FrameCounters {
             .join(",");
         format!(
             concat!(
-                "{{\"tier0_units\":{},\"tier2_blocks\":{},\"retired_tier0_instructions\":{},",
+                "{{\"retired_forms\":{:?},\"tier0_units\":{},\"tier2_blocks\":{},\"retired_tier0_instructions\":{},",
                 "\"native_entries\":{},\"interpreter_entries\":{},\"sync_compile_ns\":{},",
                 "\"compile_wait_execution_ns\":{},\"compile_wait_stage_ns\":{:?},\"compile_worker_ns\":{},\"publication_ns\":{},\"compile_wait_units\":{},\"invalidations\":{},",
                 "\"recompilations\":{},\"compilations\":{},\"x87_helpers\":{},\"softfloat_calls\":{},\"reasons\":{{{}}},\"reason_ns\":{{{}}}}}"
             ),
+            self.retired_forms,
             self.tier0_units,
             self.tier2_blocks,
             self.retired_tier0_instructions,

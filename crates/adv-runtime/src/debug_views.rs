@@ -24,7 +24,7 @@ pub trait DebugTarget {
     fn calls_report(&self, count: usize) -> String {
         self.machine().sys.recent_calls_tail(count).join("\n")
     }
-    fn debug_counters(&self) -> [u64; 3]
+    fn debug_counters(&self) -> [u64; 8]
     where
         Self::Backend: adv_cpu::Engine,
     {
@@ -33,6 +33,11 @@ pub trait DebugTarget {
             self.machine().sys.host_calls,
             cpu.native_entries,
             cpu.interpreter_entries,
+            cpu.retired_forms.unwrap_or_default()[0],
+            cpu.retired_forms.unwrap_or_default()[1],
+            cpu.retired_forms.unwrap_or_default()[2],
+            cpu.retired_forms.unwrap_or_default()[3],
+            cpu.retired_forms.unwrap_or_default()[4],
         ]
     }
     fn contexts_report(&self) -> String;

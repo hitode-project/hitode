@@ -45,7 +45,7 @@ pub(crate) fn start(options: &crate::Options, windowed: bool, wake: WakeEvent) -
 }
 
 /// Host return addresses a sample lists above its PC.
-const CALLERS: usize = 4;
+const CALLERS: usize = profile::FRAMES - 1;
 /// Guest instructions a snapshot describes by form and code size.
 const HOT_INSTRUCTIONS: usize = 60;
 /// How long a socket request waits for a guest boundary.
@@ -136,6 +136,7 @@ struct Request {
 struct Shared {
     info: String,
     timeline: Mutex<VecDeque<FrameRow>>,
+    retirement: Mutex<VecDeque<(u64, [u64; 5])>>,
     marks: Mutex<Vec<(u64, String)>>,
     snapshots: Mutex<VecDeque<(String, String)>>,
     profiler: Arc<profile::Profiler>,
@@ -170,6 +171,7 @@ impl Debugger {
         let shared = Arc::new(Shared {
             info: format!("{info}\n{}", host_image()),
             timeline: Mutex::new(VecDeque::with_capacity(1024)),
+            retirement: Mutex::default(),
             marks: Mutex::default(),
             snapshots: Mutex::default(),
             profiler: profile::Profiler::start_on_current_thread(),
@@ -233,12 +235,36 @@ impl Debugger {
         runtime: &impl DebugTarget<Backend = Cpu>,
     ) {
         self.busy_us += step.as_micros() as u64;
+        let [
+            host_calls,
+            native_entries,
+            interpreter_entries,
+            translated,
+            apply,
+            interpret,
+            interpreter,
+            rep_elements,
+        ] = runtime.debug_counters();
+        let at = unix_us();
+        {
+            let mut retirement = self
+                .shared
+                .retirement
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if retirement.len() == TIMELINE_CAPACITY {
+                retirement.pop_front();
+            }
+            retirement.push_back((
+                at,
+                [translated, apply, interpret, interpreter, rep_elements],
+            ));
+        }
         if presented == self.last.frame {
             return;
         }
-        let [host_calls, native_entries, interpreter_entries] = runtime.debug_counters();
         let row = FrameRow {
-            unix_us: unix_us(),
+            unix_us: at,
             frame: presented,
             busy_us: std::mem::take(&mut self.busy_us),
             host_calls,
@@ -415,6 +441,10 @@ impl Debugger {
         section("marks", marks_text(&self.shared, 0));
         section("timeline (last 30 s)", timeline_text(&self.shared, since));
         section(
+            "retirement (last 30 s)",
+            retirement_text(&self.shared, since),
+        );
+        section(
             "profile (last 30 s)",
             profile_summary(&self.shared, since, runtime),
         );
@@ -509,6 +539,23 @@ fn marks_text(shared: &Shared, since: u64) -> String {
         .join("\n")
 }
 
+fn retirement_text(shared: &Shared, since: u64) -> String {
+    let rows = shared.retirement.lock().unwrap_or_else(|p| p.into_inner());
+    let mut text =
+        vec!["unix_us\ttranslated\tapply\tinterpret\tinterpreter\trep_elements".to_owned()];
+    text.extend(
+        rows.iter()
+            .filter(|(at, _)| *at >= since)
+            .map(|(at, counts)| {
+                format!(
+                    "{at}\t{}\t{}\t{}\t{}\t{}",
+                    counts[0], counts[1], counts[2], counts[3], counts[4]
+                )
+            }),
+    );
+    text.join("\n")
+}
+
 fn timeline_text(shared: &Shared, since: u64) -> String {
     let timeline = shared.timeline.lock().unwrap_or_else(|p| p.into_inner());
     let start = timeline.partition_point(|row| row.unix_us < since);
@@ -588,6 +635,7 @@ fn stub(_: usize) -> Option<&'static str> {
 fn part_name(part: adv_runtime::JitPart) -> &'static str {
     match part {
         adv_runtime::JitPart::Body => "body",
+        adv_runtime::JitPart::Rep => "rep-elements",
         adv_runtime::JitPart::Cold => "cold",
         adv_runtime::JitPart::X87Entry => "x87-entry",
         adv_runtime::JitPart::X87Publish => "x87-publish",
@@ -774,7 +822,9 @@ fn host_image() -> String {
 }
 
 fn samples_text(shared: &Shared, since: u64) -> String {
-    let mut text = vec!["unix_us\tkind\teip\tinst\tpart\tpc\timage\tsymbol\tcallers".to_owned()];
+    let mut text = vec![
+        "unix_us\tkind\teip\tinst\tpart\tpc\timage\tsymbol\tcallers\tstubs\towner_part".to_owned(),
+    ];
     let hex = |eip: Option<u32>| eip.map_or_else(|| "-".into(), |eip| format!("{eip:#010x}"));
     for sample in shared.profiler.since(since) {
         let row = classify(&sample);
@@ -789,8 +839,17 @@ fn samples_text(shared: &Shared, since: u64) -> String {
                 .join(","),
             None => "-".into(),
         };
+        let stubs = sample.frames[..usize::from(sample.depth)]
+            .iter()
+            .filter_map(|&pc| stub(pc))
+            .collect::<Vec<_>>()
+            .join(",");
+        let owner_part = sample.frames[..usize::from(sample.depth)]
+            .iter()
+            .find_map(|&pc| locate(pc, u128::from(sample.unix_us) * 1000))
+            .map_or("-", |location| location.part);
         text.push(format!(
-            "{}\t{:?}\t{}\t{}\t{}\t{}\t{image}\t{name}\t{callers}",
+            "{}\t{:?}\t{}\t{}\t{}\t{}\t{image}\t{name}\t{callers}\t{stubs}\t{owner_part}",
             row.unix_us,
             row.kind,
             hex(row.eip),
@@ -822,7 +881,9 @@ fn hot_text(shared: &Shared, since: u64, runtime: &impl DebugTarget<Backend = Cp
     let mut counts: HashMap<u32, [usize; 11]> = HashMap::new();
     for sample in shared.profiler.since(since).iter().map(classify) {
         let Some(inst) = sample.inst else { continue };
-        let part = if sample.part.starts_with("stub:") {
+        let part = if sample.part == "rep-elements" {
+            "body"
+        } else if sample.part.starts_with("stub:") {
             "stub"
         } else {
             sample.part.as_str()
@@ -971,6 +1032,7 @@ fn immediate(shared: &Shared, command: &str, args: &[&str]) -> Option<Result<Str
                 .map_or(0, |row| row.frame)
         )),
         "timeline" => Ok(timeline_text(shared, seconds_back(30))),
+        "retirement" => Ok(retirement_text(shared, seconds_back(30))),
         "marks" => Ok(marks_text(shared, 0)),
         "mark" => {
             let label = if args.is_empty() {
@@ -1023,11 +1085,11 @@ fn immediate(shared: &Shared, command: &str, args: &[&str]) -> Option<Result<Str
 
 #[cfg(unix)]
 const HELP: &str = "\
-answered at once: ping, help, info, timeline [SECONDS], marks, mark [LABEL],
+answered at once: ping, help, info, timeline [SECONDS], retirement [SECONDS], marks, mark [LABEL],
   samples [SECONDS], profile [off|HZ], snaps, pull [NAME]
 at a guest boundary: threads, stack CONTEXT [FRAMES], calls [COUNT], gaps,
   modules, mem ADDRESS [LENGTH], dis ADDRESS [COUNT], slow [reset], report,
-  snap [LABEL]";
+  snap [LABEL]\nclient reports: tl, prof, speed [SECONDS] [--range A:B | --marks A:B | --frame N], analyze, watch";
 
 #[cfg(unix)]
 #[cfg_attr(target_os = "android", allow(unused_variables))]

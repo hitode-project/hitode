@@ -178,10 +178,28 @@ impl Executor {
 
     pub(crate) fn count_tier0(&mut self, enabled: bool) {
         self.interpreter.frame_retired = enabled.then_some(0);
+        self.interpreter.frame_rep_elements = 0;
+        #[cfg(native)]
+        if let Some(native) = &mut self.native {
+            native.count_forms(enabled);
+        }
     }
 
     pub(crate) fn tier0_instructions(&self) -> Option<u64> {
         self.interpreter.frame_retired
+    }
+
+    pub(crate) fn retired_forms(&self) -> Option<[u64; 5]> {
+        let retired = self.interpreter.frame_retired?;
+        #[allow(unused_mut)]
+        let mut forms = [0; 5];
+        #[cfg(native)]
+        if let Some(native) = &self.native {
+            forms = native.retired_forms.unwrap_or_default();
+        }
+        forms[3] += retired;
+        forms[4] += self.interpreter.frame_rep_elements;
+        Some(forms)
     }
 
     pub fn memory(&self) -> &Memory {
@@ -438,13 +456,16 @@ impl Executor {
             let n = self.verified.entry(entry).or_default();
             *n += 1;
             let verifier = self.verifier.as_mut().unwrap();
+            let counted = self.interpreter.frame_retired.take();
             let trace = verifier.record(
                 entry,
                 stop,
                 &mut self.interpreter,
                 &mut self.state,
                 &mut self.memory,
-            )?;
+            );
+            self.interpreter.frame_retired = counted;
+            let trace = trace?;
             let fuel = fuel.min(tier_verify::MAX_STEPS as u64);
             let run = native.run(
                 &mut self.state,
@@ -710,3 +731,146 @@ mod instruction_trace_tests {
 }
 #[cfg(all(test, native))]
 mod host_call_tests;
+
+#[cfg(all(test, native))]
+mod speed_tests {
+    use super::*;
+    use iced_x86::code_asm::*;
+
+    // spec: WINE-UI-8, A64-TR-2, A64-TR-4
+    #[test]
+    fn speed_retired_forms_join_native_helpers_first_visits_and_rep() {
+        const CODE: u32 = 0x10000;
+        const FIRST: u32 = 0x11000;
+        const DATA: u32 = 0x20000;
+        let mut a = CodeAssembler::new(32).unwrap();
+        let mut again = a.create_label();
+        a.mov(ebp, 3).unwrap();
+        a.set_label(&mut again).unwrap();
+        a.shrd(eax, edx, cl).unwrap(); // operation helper
+        a.lahf().unwrap(); // interpret helper
+        a.mov(ecx, 5).unwrap();
+        a.rep().movsb().unwrap();
+        a.dec(ebp).unwrap();
+        a.jnz(again).unwrap();
+        let code = a.assemble(u64::from(CODE)).unwrap();
+        let stop = CODE + code.len() as u32;
+        let mut a = CodeAssembler::new(32).unwrap();
+        a.nop().unwrap();
+        a.jmp(u64::from(CODE)).unwrap();
+        let first = a.assemble(u64::from(FIRST)).unwrap();
+        for interpreted in [false, true] {
+            let mut cpu = Executor::address_space().unwrap();
+            cpu.interpreter_only = interpreted;
+            cpu.map(CODE, 0x4000, 7).unwrap();
+            cpu.map(DATA, 0x4000, 3).unwrap();
+            cpu.write(CODE, &code).unwrap();
+            cpu.write(FIRST, &first).unwrap();
+            let start = |cpu: &mut Executor, pc| {
+                cpu.state = CpuState::default();
+                cpu.state.eip = pc;
+                cpu.state.regs[6] = DATA + 0x100;
+                cpu.state.regs[7] = DATA + 0x200;
+            };
+            assert_eq!(cpu.retired_forms(), None);
+            // Warm the loop's entries without visiting FIRST.
+            for _ in 0..3 {
+                start(&mut cpu, CODE);
+                assert_eq!(cpu.run(stop, 1000).unwrap(), RunOutcome::ReachedStop);
+            }
+            cpu.count_tier0(true);
+            start(&mut cpu, FIRST);
+            assert_eq!(cpu.run(stop, 1000).unwrap(), RunOutcome::ReachedStop);
+            let expected = if interpreted {
+                [0, 0, 0, 21, 15]
+            } else {
+                // Native REP elements count as translated work.
+                [25, 3, 3, 2, 0]
+            };
+            assert_eq!(
+                cpu.retired_forms(),
+                Some(expected),
+                "interpreted={interpreted}"
+            );
+            // A zero-length REP still retires an instruction, with no elements.
+            cpu.count_tier0(true);
+            start(&mut cpu, FIRST);
+            cpu.write(FIRST, &[0xf3, 0xa4]).unwrap();
+            cpu.state.eip = FIRST;
+            assert_eq!(cpu.run(FIRST + 2, 10).unwrap(), RunOutcome::ReachedStop);
+            assert_eq!(cpu.retired_forms().unwrap().iter().take(4).sum::<u64>(), 1);
+            assert_eq!(cpu.retired_forms().unwrap()[4], 0);
+        }
+    }
+
+    // spec: WINE-UI-8
+    #[test]
+    fn speed_retired_forms_count_partial_rep_and_single_steps() {
+        let mut cpu = Executor::address_space().unwrap();
+        cpu.map(0x10000, 0x4000, 7).unwrap();
+        cpu.map(0x20000, 0x4000, 3).unwrap();
+        cpu.write(0x10000, &[0xf3, 0xa4]).unwrap();
+        cpu.native.as_mut().unwrap().first_visits = false;
+        cpu.count_tier0(true);
+        cpu.state.eip = 0x10000;
+        cpu.state.regs[1] = 9;
+        cpu.state.regs[6] = 0x20000;
+        cpu.state.regs[7] = 0x20100;
+        // Native elements count as translated; the cut element is interpreted.
+        assert_eq!(cpu.run(0x10002, 4).unwrap(), RunOutcome::Budget);
+        assert_eq!(cpu.retired_forms(), Some([3, 0, 0, 0, 1]));
+        assert_eq!(cpu.run(0x10002, 20).unwrap(), RunOutcome::ReachedStop);
+        assert_eq!(cpu.retired_forms(), Some([8, 0, 0, 0, 1]));
+        cpu.count_tier0(true);
+        cpu.write(0x11000, &[0x90]).unwrap();
+        cpu.state.eip = 0x11000;
+        cpu.state.eflags |= 1 << 8;
+        assert!(matches!(
+            cpu.run(0x11001, 10).unwrap(),
+            RunOutcome::Trap { vector: 1, .. }
+        ));
+        assert_eq!(cpu.retired_forms(), Some([0, 0, 0, 1, 0]));
+        cpu.count_tier0(true);
+        cpu.write(0x12000, &[0xcc]).unwrap(); // an exit interpreted by the owner
+        cpu.state.eip = 0x12000;
+        cpu.state.eflags &= !(1 << 8);
+        assert!(matches!(
+            cpu.run(0x12001, 10).unwrap(),
+            RunOutcome::Trap { vector: 3, .. }
+        ));
+        assert_eq!(cpu.retired_forms(), Some([0, 0, 0, 1, 0]));
+    }
+
+    // spec: WINE-UI-8, A64-MEM-5
+    #[test]
+    fn speed_retired_forms_refund_faulting_apply_and_rep() {
+        let mut cpu = Executor::address_space().unwrap();
+        cpu.map(0x10000, 0x4000, 7).unwrap();
+        cpu.map(0x20000, 0x4000, 3).unwrap();
+        cpu.native.as_mut().unwrap().first_visits = false;
+        cpu.count_tier0(true);
+        // NEG through apply reads successfully, but its store faults.
+        cpu.write(0x10000, &[0xf7, 0x1b]).unwrap();
+        cpu.protect(0x20000, 0x4000, 1).unwrap();
+        cpu.state.eip = 0x10000;
+        cpu.state.regs[3] = 0x20000;
+        assert!(matches!(
+            cpu.run(0x10002, 100).unwrap(),
+            RunOutcome::WriteFault { .. }
+        ));
+        assert_eq!(cpu.retired_forms(), Some([0; 5]));
+        // REP retains completed elements when its next source faults.
+        cpu.count_tier0(true);
+        cpu.protect(0x20000, 0x4000, 3).unwrap();
+        cpu.write(0x11000, &[0xf3, 0xa4]).unwrap();
+        cpu.state.eip = 0x11000;
+        cpu.state.regs[1] = 5;
+        cpu.state.regs[6] = 0x23ffe;
+        cpu.state.regs[7] = 0x20000;
+        assert!(matches!(
+            cpu.run(0x11002, 100).unwrap(),
+            RunOutcome::ReadFault { .. }
+        ));
+        assert_eq!(cpu.retired_forms(), Some([2, 0, 0, 0, 0]));
+    }
+}

@@ -552,6 +552,11 @@ Child processes MUST defer native GPU presentation to the session's consumer bef
 **Rule**: Wine sessions MUST serve the shared debugger when requested, including while paused or frame-frozen. Boundary reads MUST inspect the presented process without running guest code. Unsupported API diagnostics MUST be explicit.
 **Verification**: Test
 
+### WINE-UI-8 Effective guest speed
+
+**Rule**: Diagnostic retirement MUST distinguish translated code, operation helpers, interpret calls, and interpreter execution, with interpreted REP elements counted separately. The debugger MUST join matching counter intervals and execution-thread samples into per-form shares, retirement, nanoseconds per instruction, effective MIPS, and hottest guest units. Busy-gap analysis MUST include this report, separating checked accesses, host calls, memory slow paths, and waiting.
+**Verification**: Test
+
 ### WINE-UI-7 Native dialog presentation
 
 **Rule**: A shown top-level window MUST be read before its first flush. A dialog the host projects, such as a message box, MUST NOT present frames. Its icon MUST NOT show as an unavailable control.

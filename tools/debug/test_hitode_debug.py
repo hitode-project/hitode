@@ -1,10 +1,13 @@
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
+from unittest.mock import patch
 
 import tempfile
 from collections import Counter
 from pathlib import Path
 
-from hitode_debug import Snapshot, analyze, code_parts, form_lines, forms, explain_stall, frame_gaps, instructions, parse_slow, regions, parse_modules, place, readable, slices, table
+from hitode_debug import Snapshot, analyze, run, show_speed, speed_form, speed_table, code_parts, form_lines, forms, explain_stall, frame_gaps, instructions, parse_slow, regions, parse_modules, place, readable, slices, table
 
 
 class ReplyShapeTests(unittest.TestCase):
@@ -119,6 +122,80 @@ class ReplyShapeTests(unittest.TestCase):
         report = analyze(snapshot)
         self.assertIn("stall t=0.05..2.05s frame 3: 2000 ms, busy 100%", report)
         self.assertIn("=> generated code: aqua.exe+0x1000 holds 8 samples", report)
+
+
+class SpeedTests(unittest.TestCase):
+    def snapshot(self):
+        header = "unix_us\tkind\teip\tinst\tpart\tpc\timage\tsymbol\tcallers\tstubs\towner_part"
+        rows = [
+            ("Guest", "body", "-", "", "", "-", ""),
+            ("Guest", "x87-publish", "-", "", "", "-", ""),
+            ("HostFromGuest", "host", "0x10", "adv_cpu_a64::translate::apply::run", "", "-", "apply"),
+            ("HostFromGuest", "host", "0x20", "sqrt", "", "0x90", "interpret"),
+            ("Host", "-", "0x30", "adv_cpu_a64::translate::first::run", "", "-", ""),
+            ("Guest", "rep-elements", "-", "", "", "-", ""),
+            ("HostFromGuest", "host", "0x40", "adv_cpu_a64::native::access", "", "-", "access"),
+            ("HostFromGuest", "host", "0x50", "adv_dx::surface::draw", "", "-", "call"),
+            ("Host", "-", "0x60", "memcpy", "", "0x91", ""),
+            ("Host", "-", "0x70", "semaphore_wait_trap", "", "-", ""),
+        ]
+        samples = [f"{1050000 + i * 100000}\t{kind}\t0x00401000\t0x00401000\t{part}\t{pc}\t{image}\t{symbol}\t{callers}\t{stubs}\t-"
+                   for i, (kind, part, pc, symbol, image, callers, stubs) in enumerate(rows)]
+        return Snapshot(text="\n".join([
+            "== info", "pid=42", "== retirement (last 30 s)",
+            "unix_us\ttranslated\tapply\tinterpret\tinterpreter\trep_elements",
+            "1000000\t100\t20\t30\t40\t50",
+            "2000000\t100000100\t1000020\t500030\t2000040\t50000050",
+            "== timeline (last 30 s)",
+            "unix_us\tframe\tbusy_us\thost_calls\tnative_entries\tinterpreter_entries",
+            "1000000\t1\t0\t0\t0\t0", "2000000\t2\t900000\t1\t1\t1",
+            "== marks", "1000000\tbefore", "2000000\tafter",
+            "== samples (last 30 s)", header, *samples,
+            "== modules", "0x00400000 0x10000 Image    fixture.exe"]))
+
+    # spec: WINE-UI-8
+    @patch("hitode_debug.symbolize", return_value={
+        "0x90": "adv_cpu_a64::native::interpret",
+        "0x91": "adv_cpu_core::memory::Memory::read_data"})
+    def test_speed_command_joins_forms_and_exact_counter_deltas(self, _):
+        snapshot = self.snapshot()
+        output = StringIO()
+        with redirect_stdout(output):
+            run(snapshot, "speed")
+        text = output.getvalue()
+        self.assertIn("10 samples, 1.000000 s", text)
+        self.assertRegex(text, r"translated\s+2\s+20.0%\s+100000000\s+2.00\s+500.00")
+        self.assertRegex(text, r"apply\s+1\s+10.0%\s+1000000\s+100.00\s+10.00")
+        self.assertRegex(text, r"total active\s+9\s+90.0%\s+103500000\s+8.70\s+115.00")
+        self.assertIn("fixture.exe+0x1000", text)
+        self.assertIn("adv_dx::surface::draw", text)
+        self.assertIn("REP elements are work units", text)
+        for selection in ("--range 0:1", "--marks 0:1", "--frame 2"):
+            output = StringIO()
+            with redirect_stdout(output):
+                show_speed(snapshot, selection.split())
+            self.assertEqual(output.getvalue(), text)
+        self.assertIn("speed: 10 samples", analyze(snapshot))
+
+    # spec: WINE-UI-8
+    def test_speed_uses_stub_owners_and_does_not_invent_rates(self):
+        base = {"kind": "HostFromGuest", "part": "host", "pc": "0x1", "callers": "0x2"}
+        self.assertEqual(speed_form(dict(base, stubs="access"),
+                                   {"0x1": "memcpy", "0x2": "adv_cpu_core::memory::Memory::read"})[0], "access")
+        self.assertEqual(speed_form(dict(base, stubs="interpret,call"), {})[0], "host calls")
+        self.assertEqual(speed_form(dict(base, stubs="interpret", owner_part="rep-elements"), {})[0], "rep_elements")
+        self.assertEqual(speed_form(base, {"0x1": "adv_cpu_core::interpreter::strings::repeat"})[0], "rep_elements")
+        self.assertEqual(speed_form(base, {"0x1": "adv_cpu_core::interpreter::strings::execute"})[0], "interpreter")
+        snapshot = self.snapshot()
+        counters = table(snapshot.text("retirement"))
+        self.assertIn("insufficient retirement checkpoints", speed_table(snapshot, [], counters, 1100000, 1900000))
+        text = speed_table(snapshot, [], counters, 1000000, 2000000)
+        self.assertIn("n/a", text)
+        self.assertNotIn("inf", text)
+        # Retired work without a sample in its form has no estimated rate.
+        text = speed_table(snapshot, [{"unix_us": "1500000", "kind": "Idle"}], counters, 1000000, 2000000)
+        self.assertRegex(text, r"apply\s+0\s+0.0%\s+1000000\s+n/a\s+n/a")
+
 
 
 if __name__ == "__main__":

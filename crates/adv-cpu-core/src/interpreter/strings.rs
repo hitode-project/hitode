@@ -135,6 +135,21 @@ fn batch(state: &mut CpuState, memory: &mut Memory, op: StringOp, budget: u32) -
     count
 }
 
+/// Keep REP work identifiable in sampled host stacks, including interpreter-only runs.
+#[inline(never)]
+pub(super) fn repeat(
+    state: &mut CpuState,
+    memory: &mut Memory,
+    operation: StringOp,
+    next: u32,
+    max_units: u32,
+    debug: bool,
+) -> Execution {
+    let execution = execute::<true>(state, memory, operation, next, max_units, debug);
+    // Retain this frame even when the executor below is not inlined.
+    std::hint::black_box(execution)
+}
+
 pub(super) fn execute<const BATCH: bool>(
     state: &mut CpuState,
     memory: &mut Memory,

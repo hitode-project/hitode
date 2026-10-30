@@ -67,6 +67,8 @@ pub struct ProfileSample {
 pub struct EngineCounters {
     pub native_entries: u64,
     pub interpreter_entries: u64,
+    /// Translated, apply, interpret, interpreter, and REP elements, in that order.
+    pub retired_forms: Option<[u64; 5]>,
 }
 
 /// The execution engine as the host shell sees it.

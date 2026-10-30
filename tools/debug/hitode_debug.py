@@ -6,7 +6,7 @@ debug.hitode.debug 1` before starting the game, then --adb).
 Usage:
   python3 tools/debug/hitode_debug.py list
   python3 tools/debug/hitode_debug.py [--pid PID | --socket PATH | --adb] [COMMAND ...]
-  python3 tools/debug/hitode_debug.py --snapshot FILE tl|prof|analyze [OPTIONS]
+  python3 tools/debug/hitode_debug.py --snapshot FILE tl|prof|speed|analyze [OPTIONS]
 
 Without COMMAND it opens a prompt. Session commands (see `help`) go to the
 runner as they are; these are shaped here:
@@ -14,6 +14,9 @@ runner as they are; these are shaped here:
   prof [SECONDS] [--slice MS] [--mark N] [--window S] [--range A:B]
                             sampled execution thread by slice, hottest guest
                             units (module+offset) and host functions
+  speed [SECONDS] [--range A:B | --marks A:B | --frame N]
+                            sample shares, retired instructions, ns/inst, MIPS
+                            and hottest guest units by execution form
   snap [LABEL], pull [NAME] save a snapshot under target/investigations/debug
   analyze [--gap MS]        snapshot now and explain each stall in it
   watch [--gap MS]          pull, save and analyze every new snapshot until
@@ -21,7 +24,7 @@ runner as they are; these are shaped here:
                             target/investigations/debug/<pid>-analysis.txt
 Alt+Shift+F12 in the game window marks the moment and keeps a snapshot; a
 busy frame gap of 250 ms or more keeps one by itself 2 s later. `snaps`
-lists them and `pull` fetches one; `--snapshot` runs `tl`, `prof` and
+lists them and `pull` fetches one; `--snapshot` runs `tl`, `prof`, `speed` and
 `analyze` over a pulled snapshot after the session has ended. Output stays local: snapshots hold
 game text and must not enter the repository.
 """
@@ -81,10 +84,11 @@ class Session:
 
 
 class Snapshot:
-    """A pulled snapshot answering the requests `tl` and `prof` make."""
+    """A pulled snapshot answering client report requests."""
 
     SECTIONS = {"timeline": "timeline (last 30 s)", "samples": "samples (last 30 s)",
                 "hot": "hot instructions (last 30 s)",
+                "retirement": "retirement (last 30 s)",
                 "modules": "modules", "marks": "marks", "info": "info"}
 
     def __init__(self, path=None, text=None):
@@ -381,6 +385,8 @@ def analyze(snapshot, gap_ms=100.0, top=6):
         snapshot.sections.get("slow paths (since previous snapshot)")
         or snapshot.sections.get("slow paths (whole session)", []))
     names = host_names(snapshot, samples)
+    retirement = table(snapshot.text("retirement")) if "retirement (last 30 s)" in snapshot.sections else []
+    speed_names = speed_symbols(snapshot, samples) if retirement else {}
     out = []
     if len(rows) < 2:
         return "fewer than two frames in the snapshot"
@@ -439,6 +445,8 @@ def analyze(snapshot, gap_ms=100.0, top=6):
             for total_runs, interpreted, faulted, helper, eip, rest in near[:4]:
                 out.append(f"  slow    {total_runs:8} at {rest} (interpreted {interpreted}, "
                            f"helper {helper}) near {label}")
+        if busy >= 50:
+            out.append(speed_table(snapshot, samples, retirement, start, end, top, speed_names))
         if not inside:
             out.append("  => no samples in this gap (sampler off, or a snapshot from before samples were kept)"
                        + ("; waiting" if busy < 50 else "; busy"))
@@ -505,6 +513,156 @@ def show_timeline(session, args):
         print(f"  t={(end - first) / 1e6:7.2f}s gap {gap:8.1f} ms busy {busy:5.1f}% "
               f"host_calls {row['host_calls']:>8} native {row['native_entries']:>8} "
               f"interpreted {row['interpreter_entries']:>6}")
+
+
+# Order also defines the five engine counter columns. REP elements are separate
+# work, and never enter the instruction total a second time.
+SPEED_FORMS = ("translated", "apply", "interpret", "interpreter", "rep_elements")
+SPEED_BUCKETS = (*SPEED_FORMS, "access", "host calls", "memory", "waiting", "other host")
+
+
+def speed_symbols(session, samples):
+    """Resolve the recorded host frames together, preserving each sample's chain."""
+    addresses = set()
+    for sample in samples:
+        if sample.get("pc", "-") != "-":
+            addresses.add(sample["pc"])
+        addresses.update(f for f in sample.get("callers", "-").split(",") if f not in ("", "-"))
+    info = getattr(session, "info", {})
+    image = (info["host_image"], info["host_base"]) if "host_base" in info else None
+    names = symbolize(session.pid, sorted(addresses), image)
+    for sample in samples:
+        pc = sample.get("pc", "-")
+        if pc != "-" and pc not in names:
+            names[pc] = f"{sample.get('image', '')}!{readable(sample.get('symbol', '')) or pc}"
+    return names
+
+
+def speed_form(sample, names):
+    """Execution form from unit marks, shared stubs, and symbolized host owners."""
+    part = sample.get("part", "-")
+    stubs = set(sample.get("stubs", "").split(","))
+    if part.startswith("stub:"):
+        stubs.add(part[5:])
+    chain = [names.get(sample.get("pc"), ""),
+             *(names.get(f, f) for f in sample.get("callers", "-").split(","))]
+    leaf = chain[0]
+    if sample["kind"] == "Idle" or any(name in leaf for name in (
+            "mach_msg", "semaphore_wait", "__psynch_cvwait", "__ulock_wait", "nanosleep",
+            "kevent", "pthread_cond_wait", "mach_wait_until", "__psynch_mutexwait",
+            "__semwait_signal", "semaphore_timedwait", "__select", "__pselect", "usleep")):
+        return "waiting", leaf
+    # A host boundary may be called through an interpret helper. Charge its
+    # synchronous work to the host function, rather than to that helper.
+    if "call" in stubs or any(any(token in name for token in (
+            "adv_cpu_core::trap::call_trap", "adv_cpu_core::trap::call_host",
+            "adv_abi::", "adv_nt::dispatch", "adv_unix::dispatch")) for name in chain):
+        return "host calls", leaf
+    if "access" in stubs or any("adv_cpu_a64::native::access" in name for name in chain):
+        return "access", leaf
+    if any(any(token in name for token in (
+            "adv_cpu_core::memory::", "adv_cpu_core::virtual_memory::")) for name in chain):
+        return "memory", leaf
+    if part == "rep-elements" or sample.get("owner_part") == "rep-elements" or any(
+            "adv_cpu_core::interpreter::strings::repeat" in name for name in chain):
+        return "rep_elements", leaf
+    if "apply" in stubs or any("translate::apply::run" in name for name in chain):
+        return "apply", leaf
+    if "interpret" in stubs or any("adv_cpu_a64::native::interpret" in name for name in chain):
+        return "interpret", leaf
+    if any(any(token in name for token in (
+            "adv_cpu_a64::translate::first::", "adv_cpu_core::interpreter::")) for name in chain):
+        return "interpreter", leaf
+    if sample["kind"] == "Guest":
+        return "translated", leaf
+    if any("adv_cpu_a64::native::dispatch" in name or "adv_cpu_a64::translate::" in name for name in chain):
+        return "other host", leaf
+    if sample["kind"] == "HostFromGuest":
+        return "host calls", leaf
+    return "other host", leaf
+
+
+def speed_table(session, samples, counters, low, high, top=3, names=None):
+    """Join samples to cumulative counters at matching execution boundaries.
+
+    Windows are trimmed inward to recorded counter checkpoints. No counter
+    interpolation or extrapolation is used; a frame gap has exact checkpoints.
+    Sample shares estimate time, so the rates are statistical estimates.
+    """
+    points = [r for r in counters if low <= int(r["unix_us"]) <= high]
+    if len(points) < 2:
+        return "speed: insufficient retirement checkpoints in this window"
+    first, last = points[0], points[-1]
+    start, end = int(first["unix_us"]), int(last["unix_us"])
+    inside = [s for s in samples if start < int(s["unix_us"]) <= end]
+    retired = {f: int(last[f]) - int(first[f]) for f in SPEED_FORMS}
+    names = speed_symbols(session, inside) if names is None else names
+    counts, units, hosts = Counter(), defaultdict(Counter), Counter()
+    for sample in inside:
+        form, host = speed_form(sample, names)
+        counts[form] += 1
+        eip = sample.get("eip", "-")
+        units[form][eip] += 1
+        if form == "host calls":
+            hosts[host] += 1
+    modules = parse_modules(session.text("modules"))
+    duration_ns = (end - start) * 1000
+    n = len(inside)
+    out = [f"speed: {n} samples, {(end - start) / 1e6:.6f} s at retirement checkpoints "
+           f"{start}..{end} us (sample-estimated time)",
+           "  form             samples   share       retired      ns/inst  effective MIPS"]
+
+    def row(form, count, instructions, ns):
+        share = f"{100 * count / n:6.1f}%" if n else "     n/a"
+        rate = f"{ns / instructions:12.2f} {instructions * 1000 / ns:15.2f}" \
+            if instructions and ns else f"{'n/a':>12} {'n/a':>15}"
+        return f"  {form:<16} {count:7} {share} {str(instructions) if instructions is not None else '-':>13} {rate}"
+
+    for form in SPEED_BUCKETS:
+        ns = duration_ns * counts[form] / n if n else 0
+        out.append(row(form, counts[form], retired.get(form), ns))
+        for eip, count in units[form].most_common(top):
+            label = place(int(eip, 16), modules) if eip != "-" else "unattributed guest unit"
+            out.append(f"    {count:6} samples {duration_ns * count / n / 1e6:9.3f} ms  {label}")
+    active = n - counts["waiting"]
+    out.append(row("total active", active, sum(retired[f] for f in SPEED_FORMS[:4]),
+                   duration_ns * active / n if n else 0))
+    out.append(f"  total samples: {n}; REP elements are work units, excluded from the instruction total")
+    for host, count in hosts.most_common(top):
+        out.append(f"  host call {count:6} samples  {host}")
+    return "\n".join(out)
+
+
+def show_speed(session, args):
+    parser = argparse.ArgumentParser(prog="speed")
+    parser.add_argument("seconds", nargs="?", type=int, default=30)
+    select = parser.add_mutually_exclusive_group()
+    select.add_argument("--range", help="A:B seconds from the first retirement checkpoint")
+    select.add_argument("--marks", help="A:B mark indices, newest is -1")
+    select.add_argument("--frame", type=int, help="gap ending at frame N")
+    parser.add_argument("--top", type=int, default=3)
+    options = parser.parse_args(args)
+    counters = table(session.text(f"retirement {options.seconds}"))
+    samples = table(session.text(f"samples {options.seconds}"))
+    if len(counters) < 2:
+        print("speed: insufficient retirement checkpoints in this window")
+        return
+    low, high = int(counters[0]["unix_us"]), int(counters[-1]["unix_us"])
+    low = max(low, high - options.seconds * 1_000_000)
+    if options.range:
+        low, high = (low + float(edge) * 1e6 for edge in options.range.split(":"))
+    elif options.marks:
+        marks = [line.split("\t") for line in session.text("marks").splitlines() if line]
+        low, high = (int(marks[int(edge)][0]) for edge in options.marks.split(":"))
+    elif options.frame is not None:
+        rows = table(session.text(f"timeline {options.seconds}"))
+        at = next(i for i, row in enumerate(rows) if int(row["frame"]) == options.frame)
+        if at == 0:
+            raise ValueError("the preceding frame is outside this window")
+        low, high = int(rows[at - 1]["unix_us"]), int(rows[at]["unix_us"])
+    if high <= low:
+        raise ValueError("speed window must end after it starts")
+    print(speed_table(session, samples, counters, low, high, options.top))
 
 
 def show_profile(session, args):
@@ -607,6 +765,8 @@ def run(session, line):
         show_timeline(session, args)
     elif command == "prof":
         show_profile(session, args)
+    elif command == "speed":
+        show_speed(session, args)
     elif command == "analyze":
         show_analysis(session, args)
     elif command == "watch":
@@ -634,7 +794,7 @@ def main():
     if options.snapshot is not None:
         snapshot = Snapshot(options.snapshot)
         command, args = options.command[0], options.command[1:]
-        {"tl": show_timeline, "prof": show_profile, "analyze": show_analysis}[command](snapshot, args)
+        {"tl": show_timeline, "prof": show_profile, "speed": show_speed, "analyze": show_analysis}[command](snapshot, args)
         return
     if options.adb:
         port = subprocess.run(["adb", "forward", "tcp:0", "localabstract:hitode-debug"],

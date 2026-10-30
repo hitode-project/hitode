@@ -38,7 +38,7 @@ This spec covers the contract that Tier 0 and the AArch64 translator share. The 
 **Rule**: Diagnostic reports MUST count completed Tier 0 instructions separately from instruction/REP-element work units. Throughput MUST divide retired instructions by elapsed host wall seconds, including waits. Disabled counting MUST report null, without adding default hot-path timing.
 **Verification**: Test
 
-Exact retirement is enabled by `--profile` or `--frame-budget`. The synthetic `tier0_baseline` example exercises integer loops, REP strings, x87, MMX mixed with integer operations and indirect calls, asserting completed-instruction counts.
+Exact retirement is enabled by `--profile`, `--frame-budget`, or the live debugger. The synthetic `tier0_baseline` example exercises integer loops, REP strings, x87, MMX mixed with integer operations and indirect calls, asserting completed-instruction counts.
 
 ### EXEC-CORE-6 Tier 0 decode cache validity
 

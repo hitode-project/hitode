@@ -118,12 +118,20 @@ pub struct Runtime {
     pub native_batches: u64,
     /// A refused access's x87 publish continuation, or zero for `fault`.
     pub access_resume: u64,
+    /// Diagnostic retirement accounting, enabled by the owner.
+    pub count_forms: u64,
+    /// Apply calls in this chain, refunded if their final store faults.
+    pub applied: u64,
+    pub apply_return: u64,
 }
 
 impl Runtime {
     pub fn new(cpu: *mut CpuState, window: u64) -> Self {
         assert_eq!(window % (1 << 32), 0, "the window is 4 GiB aligned");
         Self {
+            count_forms: 0,
+            applied: 0,
+            apply_return: 0,
             call: 0,
             #[cfg(test)]
             channel_batches: 0,
@@ -255,6 +263,9 @@ pub(crate) const ACCESS_VECTOR: u32 = field(offset_of!(Runtime, access_vector));
 const _: () = assert!(ACCESS_VECTOR.is_multiple_of(16));
 const FAULT_SIMD: u32 = field(offset_of!(Runtime, fault_simd));
 const INTERPRET: u32 = field(offset_of!(Runtime, interpret));
+const COUNT_FORMS: u32 = field(offset_of!(Runtime, count_forms));
+const APPLIED: u32 = field(offset_of!(Runtime, applied));
+const APPLY_RETURN: u32 = field(offset_of!(Runtime, apply_return));
 const APPLY: u32 = field(offset_of!(Runtime, apply));
 const CALL: u32 = field(offset_of!(Runtime, call));
 #[cfg(test)]
@@ -372,7 +383,11 @@ fn emit_interpret(asm: &mut Asm, slot: u32) {
         mov(X, r(1), r(6)),
         mov(X, r(2), r(9)),
         ldr(X, r(16), RUNTIME, slot),
+        // The frame chain records the guest return address for samplers.
+        stp(X, Pre, RUNTIME, Reg::LR, SP, -16),
+        add_imm(X, RUNTIME, SP, 0, false),
         blr(r(16)),
+        ldp(X, Post, RUNTIME, Reg::LR, SP, 16),
         mov(X, r(6), r(0)),
         ldr(X, r(0), RUNTIME, CPU),
     ]);
@@ -431,12 +446,26 @@ fn emit_restore_light(asm: &mut Asm) {
 /// returns `translate::apply::run`'s result in x0; x1 to x4 are free.
 fn emit_apply(asm: &mut Asm) {
     emit_save_light(asm);
+    let uncounted = asm.label();
+    asm.emit(ldr(X, r(16), RUNTIME, COUNT_FORMS));
+    asm.cbz(X, false, r(16), uncounted);
+    asm.emit_all(&[
+        ldr(X, r(16), RUNTIME, APPLIED),
+        add_imm(X, r(16), r(16), 1, false),
+        str(X, r(16), RUNTIME, APPLIED),
+        str(X, Reg::LR, RUNTIME, APPLY_RETURN),
+    ]);
+    asm.bind(uncounted);
     asm.emit_all(&[
         mrs_nzcv(r(4)),
         mov(X, r(5), r(10)),
         mov(X, r(6), r(11)),
         ldr(X, r(16), RUNTIME, APPLY),
+        // The frame chain records the guest return address for samplers.
+        stp(X, Pre, RUNTIME, Reg::LR, SP, -16),
+        add_imm(X, RUNTIME, SP, 0, false),
         blr(r(16)),
+        ldp(X, Post, RUNTIME, Reg::LR, SP, 16),
     ]);
     emit_restore_light(asm);
     asm.emit(ret(Reg::LR));
@@ -460,7 +489,11 @@ fn emit_access(asm: &mut Asm, fault: crate::asm::Label) {
         stp_v(VSize::Q, Offset, v(30), v(31), SP, 224),
         mov(X, r(0), RUNTIME),
         ldr(X, r(16), RUNTIME, ACCESS),
+        // The frame chain records the guest return address for samplers.
+        stp(X, Pre, RUNTIME, Reg::LR, SP, -16),
+        add_imm(X, RUNTIME, SP, 0, false),
         blr(r(16)),
+        ldp(X, Post, RUNTIME, Reg::LR, SP, 16),
         ldp_v(VSize::Q, Offset, v(30), v(31), SP, 224),
         ldp_v(VSize::Q, Offset, v(28), v(29), SP, 192),
         ldp_v(VSize::Q, Offset, v(26), v(27), SP, 160),

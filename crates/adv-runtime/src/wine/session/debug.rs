@@ -2,19 +2,24 @@
 use super::*;
 use adv_cpu::backend::GuestExt;
 
-pub(super) fn counters(machine: &Machine<Cpu>) -> [u64; 3] {
+pub(super) fn counters(machine: &Machine<Cpu>) -> [u64; 8] {
     use crate::Engine;
     let cpu = machine.cpu.counters();
     [
         machine.sys.host_calls,
         cpu.native_entries,
         cpu.interpreter_entries,
+        cpu.retired_forms.unwrap_or_default()[0],
+        cpu.retired_forms.unwrap_or_default()[1],
+        cpu.retired_forms.unwrap_or_default()[2],
+        cpu.retired_forms.unwrap_or_default()[3],
+        cpu.retired_forms.unwrap_or_default()[4],
     ]
 }
 
 impl Session {
     /// Cumulative family counters, including processes that have exited.
-    pub fn debug_counters(&self) -> [u64; 3] {
+    pub fn debug_counters(&self) -> [u64; 8] {
         let mut totals = self.retired_debug;
         self.debug_processes(|machine| {
             for (total, count) in totals.iter_mut().zip(counters(machine)) {
