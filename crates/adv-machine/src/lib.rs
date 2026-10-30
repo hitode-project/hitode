@@ -2201,15 +2201,21 @@ impl<B: Backend> Machine<B> {
         task: impl FnOnce(&mut Env<'_>) -> R,
     ) -> Result<R, String> {
         let prior = self.loaded;
-        if let Some(id) = context {
-            if self
+        let done = |sys: &Sys, id: CtxId| sys.contexts.get(id as usize).is_none_or(|c| c.is_done());
+        let target = match context {
+            Some(id) if done(&self.sys, id) => return Err("invalid target context".into()),
+            Some(id) => Some(id),
+            // The thread that ran last may have exited, and an ended thread
+            // has no server channel: host work then runs as a live thread.
+            None if done(&self.sys, self.sys.current) => self
                 .sys
                 .contexts
-                .get(id as usize)
-                .is_none_or(|c| c.is_done())
-            {
-                return Err("invalid target context".into());
-            }
+                .iter()
+                .find(|c| !c.is_done())
+                .map(|c| c.id),
+            None => None,
+        };
+        if let Some(id) = target {
             self.switch_to(id).map_err(|e| e.to_string())?;
         }
         let result = task(&mut Env {

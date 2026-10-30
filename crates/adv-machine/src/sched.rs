@@ -1185,6 +1185,24 @@ mod active_tests {
     }
 
     #[test]
+    fn host_work_after_a_thread_exit_runs_as_a_live_thread() {
+        let mut machine = machine();
+        for _ in 0..3 {
+            machine
+                .spawn("live", layout::PARK_ADDR, &[], 65536)
+                .unwrap();
+        }
+        assert!(machine.sys.terminate_context_stopped(0, 0));
+        machine.sys.current = 2;
+        assert!(machine.park(crate::Parked::ExitThread(7)).is_none());
+        let context = machine.visit_context(None, |env| env.context).unwrap();
+        assert_eq!(context, 1);
+        // A live current thread keeps running the host work.
+        let context = machine.visit_context(None, |env| env.context).unwrap();
+        assert_eq!(context, 1);
+    }
+
+    #[test]
     fn failed_reclaim_keeps_pending_storage_for_retry() {
         let mut machine = machine();
         machine
