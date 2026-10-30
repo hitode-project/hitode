@@ -1885,6 +1885,23 @@ fn crt_zlib_translated_call_benchmark() {
             vec![DATA + 0x1000, DATA, 16],
             true,
         ),
+        ("msvcrt.dll", "strlen", 256, vec![DATA], false),
+        ("msvcrt.dll", "strcmp", 32, vec![DATA, DATA], false),
+        ("msvcrt.dll", "wcslen", 64, vec![DATA], false),
+        (
+            "windowscodecs.dll",
+            "adler32_z",
+            64,
+            vec![1, DATA, 64],
+            false,
+        ),
+        (
+            "windowscodecs.dll",
+            "adler32_z",
+            65536,
+            vec![1, DATA, 65536],
+            false,
+        ),
     ] {
         let (mut m, pe) = machine(&dist, module, true);
         m.set_execution_budget(Some(std::time::Duration::from_secs(120)));
@@ -1897,8 +1914,13 @@ fn crt_zlib_translated_call_benchmark() {
             .unwrap();
         let entry = pe.image_base + table.named(name).unwrap().rva;
         m.cpu.write_u32(SLOT, entry).unwrap();
+        let iterations = if name == "adler32_z" {
+            1_000_000u32
+        } else {
+            10_000_000
+        };
         let mut code = vec![0x57, 0xbf];
-        code.extend_from_slice(&1_000_000u32.to_le_bytes());
+        code.extend_from_slice(&iterations.to_le_bytes());
         let begin = code.len();
         for (n, arg) in args.iter().enumerate().rev() {
             if dynamic && n == 2 {
@@ -1924,8 +1946,8 @@ fn crt_zlib_translated_call_benchmark() {
             let elapsed = start.elapsed();
             if round == 1 {
                 println!(
-                    "{module}!{name} {len} dynamic={dynamic}: {:.3} ns/call (1M translated calls)",
-                    elapsed.as_nanos() as f64 / 1_000_000.0
+                    "{module}!{name} {len} dynamic={dynamic}: {:.3} ns/call ({iterations} translated calls)",
+                    elapsed.as_nanos() as f64 / f64::from(iterations)
                 );
             }
         }

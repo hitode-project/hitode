@@ -301,7 +301,7 @@ fn redirected_functions_run_the_target_while_their_bytes_are_unchanged() {
     assert_eq!(results(&mut machine), [22, 22, 22]);
 }
 
-const SLOT: u32 = DATA + 16;
+const SLOT: u32 = DATA + 0x4000;
 /// A copy of `PLUS_ONE` that nothing redirects.
 const OTHER: u32 = FUNCTION + 0x100;
 
@@ -327,7 +327,7 @@ fn bound_fixture(argument: u32) -> Machine<JitCpu> {
     .unwrap();
     machine.spawn("direct body test", CODE, &[], 65536).unwrap();
     machine.cpu.map(CODE, 0x4000, Prot::RWX).unwrap();
-    machine.cpu.map(DATA, 0x4000, Prot::RW).unwrap();
+    machine.cpu.map(DATA, 0x8000, Prot::RW).unwrap();
     let mut code = Asm::new(CODE);
     code.push_imm(argument);
     code.bytes.extend_from_slice(&[0xff, 0x15]);
@@ -662,5 +662,284 @@ fn a_completed_body_yields_at_its_continuation_without_repeating_work() {
             yielded = true;
         }
         assert!(yielded);
+    }
+}
+
+fn vector_triple<M: adv_cpu::body::Mem>(
+    mem: &mut M,
+    args: [u32; 7],
+) -> Result<adv_cpu::body::Ret, adv_cpu::body::Stop> {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        let saved: u64;
+        std::arch::asm!("mrs {saved}, fpcr", "msr fpcr, {control}", saved = out(reg) saved, control = in(reg) 0x400000u64, options(nostack));
+        std::arch::asm!(
+            "movi v9.16b, #0", "movi v16.16b, #0", "movi v17.16b, #0",
+            "movi v18.16b, #0", "movi v19.16b, #0", "movi v20.16b, #0",
+            "movi v21.16b, #0", "movi v22.16b, #0", "movi v23.16b, #0",
+            out("v9") _, out("v16") _, out("v17") _, out("v18") _, out("v19") _,
+            out("v20") _, out("v21") _, out("v22") _, out("v23") _, options(nostack)
+        );
+        std::arch::asm!("msr fpcr, {saved}", saved = in(reg) saved, options(nostack));
+    }
+    triple(mem, args)
+}
+adv_cpu::body!(VECTOR_TRIPLE = vector_triple, inputs: &[adv_cpu::body::Input::Stack(0)], outputs: adv_cpu::body::EAX, pop: 0);
+
+struct VectorBody;
+impl Resolver for VectorBody {
+    fn provides(&self, _: &str) -> bool {
+        true
+    }
+    fn host_fn(&self, _: &str, _: &str) -> Option<HostFn> {
+        Some(HostFn {
+            conv: Conv::Cdecl { argc: 1 },
+            handler: |env| Outcome::Return(env.arg(0) * 3),
+            data: 0,
+            trace: false,
+            guest: None,
+            leaf: None,
+        })
+    }
+}
+
+// spec: A64-CALL-3
+#[test]
+fn direct_body_keeps_dirty_mmx_and_xmm_values() {
+    let mut results = Vec::new();
+    for jit in [false, true] {
+        let mut machine = Machine::new(
+            JitCpu::new(PARK_ADDR, jit).unwrap(),
+            VectorBody,
+            Clock::virtual_time(),
+        )
+        .unwrap();
+        machine.spawn("vector body", CODE, &[], 65536).unwrap();
+        machine.cpu.map(CODE, 0x4000, Prot::RX).unwrap();
+        machine.cpu.map(DATA, 0x8000, Prot::RW).unwrap();
+        machine.cpu.write(FUNCTION, &PLUS_ONE).unwrap();
+        machine.cpu.write_u32(SLOT, FUNCTION).unwrap();
+        let thunk = machine.resolve_import("fixture", "vector").unwrap();
+        machine
+            .sys
+            .redirects
+            .insert(FUNCTION, (thunk, PLUS_ONE.into()));
+        machine
+            .sys
+            .direct_bodies
+            .insert(FUNCTION, VECTOR_TRIPLE.direct);
+        #[cfg(target_arch = "aarch64")]
+        let before_fpcr: u64;
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            std::arch::asm!("mrs {saved}, fpcr", saved = out(reg) before_fpcr, options(nostack));
+        }
+
+        let mut code = vec![
+            0x66, 0x0f, 0x76, 0xc0, // pcmpeqd xmm0, xmm0
+            0x0f, 0x76, 0xc9, // pcmpeqd mm1, mm1
+            0x68,
+        ];
+        code.extend_from_slice(&21u32.to_le_bytes());
+        code.extend_from_slice(&[0xff, 0x15]);
+        code.extend_from_slice(&SLOT.to_le_bytes());
+        code.extend_from_slice(&[0x83, 0xc4, 4, 0x66, 0x0f, 0x7f, 0x05]);
+        code.extend_from_slice(&(DATA + 0x100).to_le_bytes());
+        code.extend_from_slice(&[0x0f, 0x7f, 0x0d]);
+        code.extend_from_slice(&(DATA + 0x110).to_le_bytes());
+        code.push(0xe9);
+        code.extend_from_slice(
+            &PARK_ADDR
+                .wrapping_sub(CODE + code.len() as u32 + 4)
+                .to_le_bytes(),
+        );
+        machine.cpu.write(CODE, &code).unwrap();
+        for _ in 0..4 {
+            run(&mut machine);
+        }
+        assert_eq!(machine.cpu.reg(Reg::Eax), 63);
+        let mut output = [0; 24];
+        machine.cpu.read(DATA + 0x100, &mut output).unwrap();
+        assert_eq!(output, [0xff; 24]);
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            let after_fpcr: u64;
+            std::arch::asm!("mrs {saved}, fpcr", saved = out(reg) after_fpcr, options(nostack));
+            assert_eq!(after_fpcr, before_fpcr);
+        }
+        results.push((
+            output,
+            machine.cpu.reg(Reg::Edx),
+            machine.cpu.reg(Reg::Eflags) & 0x400,
+        ));
+    }
+    assert_eq!(results[0], results[1]);
+}
+
+fn memory_body<M: adv_cpu::body::Mem>(
+    mem: &mut M,
+    [a, b, n, kind, ..]: [u32; 7],
+) -> Result<adv_cpu::body::Ret, adv_cpu::body::Stop> {
+    if kind == 2 {
+        for i in 0..n {
+            let x = unsafe { mem.input(a + i, 1)?.read() };
+            let y = unsafe { mem.input(b + i, 1)?.read() };
+            if x != y {
+                return Ok((x.cmp(&y) as i32 as u32).into());
+            }
+        }
+        return Ok(0u32.into());
+    }
+    if n != 0 {
+        let from = if kind == 0 {
+            mem.input(b, n)?
+        } else {
+            std::ptr::null()
+        };
+        let to = mem.output(a, n)?;
+        unsafe {
+            if kind == 0 {
+                std::ptr::copy(from, to, n as usize);
+            } else {
+                std::ptr::write_bytes(to, b as u8, n as usize);
+            }
+        }
+        mem.commit()?;
+    }
+    Ok(if kind == 0 {
+        u64::from(a) << 32 | u64::from(a)
+    } else {
+        u64::from(a)
+    }
+    .into())
+}
+fn memory_move<M: adv_cpu::body::Mem>(
+    mem: &mut M,
+    mut args: [u32; 7],
+) -> Result<adv_cpu::body::Ret, adv_cpu::body::Stop> {
+    args[3] = 0;
+    memory_body(mem, args)
+}
+fn memory_set<M: adv_cpu::body::Mem>(
+    mem: &mut M,
+    mut args: [u32; 7],
+) -> Result<adv_cpu::body::Ret, adv_cpu::body::Stop> {
+    args[3] = 1;
+    memory_body(mem, args)
+}
+fn memory_compare<M: adv_cpu::body::Mem>(
+    mem: &mut M,
+    mut args: [u32; 7],
+) -> Result<adv_cpu::body::Ret, adv_cpu::body::Stop> {
+    args[3] = 2;
+    memory_body(mem, args)
+}
+const MEMORY_ARGS: &[adv_cpu::body::Input] = &[
+    adv_cpu::body::Input::Stack(0),
+    adv_cpu::body::Input::Stack(1),
+    adv_cpu::body::Input::Stack(2),
+];
+adv_cpu::body!(MEMORY_MOVE = memory_move, inputs: MEMORY_ARGS, outputs: adv_cpu::body::EAX | adv_cpu::body::EDX, pop: 0, inline: Some(adv_cpu::body::Inline::Move));
+adv_cpu::body!(MEMORY_SET = memory_set, inputs: MEMORY_ARGS, outputs: adv_cpu::body::EAX, pop: 0, inline: Some(adv_cpu::body::Inline::Set));
+adv_cpu::body!(MEMORY_COMPARE = memory_compare, inputs: MEMORY_ARGS, outputs: adv_cpu::body::EAX, pop: 0, inline: Some(adv_cpu::body::Inline::Compare));
+
+fn full_memory(env: &mut Env<'_>, kind: u32) -> Outcome {
+    let args = [env.arg(0), env.arg(1), env.arg(2), kind, 0, 0, 0];
+    let mut scratch = adv_cpu::body::Scratch::default();
+    let mut memory = adv_cpu::body::GuestMem::new(env.cpu, &mut scratch);
+    match memory_body(&mut memory, args) {
+        Ok(ret) if kind == 0 => Outcome::Return64(ret.value),
+        Ok(ret) => Outcome::Return(ret.value as u32),
+        Err(adv_cpu::body::Stop::Fault { address, write }) => {
+            Outcome::Raise(adv_cpu::backend::Fault {
+                kind: if write {
+                    adv_cpu::backend::FaultKind::Write(address)
+                } else {
+                    adv_cpu::backend::FaultKind::Read(address)
+                },
+                pc: FUNCTION,
+            })
+        }
+        Err(stop) => panic!("unexpected full-path stop: {stop:?}"),
+    }
+}
+struct MemoryBody(u32);
+impl Resolver for MemoryBody {
+    fn provides(&self, _: &str) -> bool {
+        true
+    }
+    fn host_fn(&self, _: &str, _: &str) -> Option<HostFn> {
+        Some(HostFn {
+            conv: Conv::Cdecl { argc: 3 },
+            handler: match self.0 {
+                0 => |e| full_memory(e, 0),
+                1 => |e| full_memory(e, 1),
+                _ => |e| full_memory(e, 2),
+            },
+            data: 0,
+            trace: false,
+            guest: None,
+            leaf: None,
+        })
+    }
+}
+
+// spec: A64-CALL-2, A64-CALL-3, A64-CALL-4, A64-CALL-8
+#[test]
+fn memory_body_call_sites_match_the_interpreter_and_full_handlers() {
+    for (kind, body) in [MEMORY_MOVE, MEMORY_SET, MEMORY_COMPARE]
+        .into_iter()
+        .enumerate()
+    {
+        for len in [0, 4, 8, 16, 63, 64, 65] {
+            for blocked in [false, true] {
+                let execute = |jit| {
+                    let mut m = Machine::new(
+                        JitCpu::new(PARK_ADDR, jit).unwrap(),
+                        MemoryBody(kind as u32),
+                        Clock::virtual_time(),
+                    )
+                    .unwrap();
+                    m.spawn("memory body", CODE, &[], 65536).unwrap();
+                    m.cpu.map(CODE, 0x4000, Prot::RX).unwrap();
+                    m.cpu.map(DATA, 0x8000, Prot::RW).unwrap();
+                    let a = DATA + 0x101;
+                    let b = if kind == 1 { 0xa5 } else { DATA + 0x100 };
+                    let thunk = m.resolve_import("fixture", "memory").unwrap();
+                    m.cpu.write(FUNCTION, &PLUS_ONE).unwrap();
+                    m.sys.redirects.insert(FUNCTION, (thunk, PLUS_ONE.into()));
+                    m.sys.direct_bodies.insert(FUNCTION, body.direct);
+                    m.cpu.write_u32(SLOT, FUNCTION).unwrap();
+                    let mut code = Asm::new(CODE);
+                    code.push_imm(len).push_imm(b).push_imm(a);
+                    code.bytes.extend_from_slice(&[0xff, 0x15]);
+                    code.bytes.extend_from_slice(&SLOT.to_le_bytes());
+                    code.add_esp(12).jmp(PARK_ADDR);
+                    m.cpu.write(CODE, &code.bytes).unwrap();
+                    let seed: Vec<u8> = (0..128).map(|n| (n * 71) as u8).collect();
+                    for _ in 0..4 {
+                        m.cpu.write(DATA + 0x100, &seed).unwrap();
+                        if blocked {
+                            m.cpu.protect(DATA, 0x4000, Prot::RWX).unwrap();
+                        }
+                        run(&mut m);
+                    }
+                    let mut bytes = [0; 128];
+                    m.cpu.read(DATA + 0x100, &mut bytes).unwrap();
+                    (
+                        m.cpu.reg(Reg::Eax),
+                        m.cpu.reg(Reg::Edx),
+                        m.cpu.reg(Reg::Esp),
+                        m.cpu.reg(Reg::Eflags) & 0x400,
+                        bytes,
+                    )
+                };
+                assert_eq!(
+                    execute(true),
+                    execute(false),
+                    "kind={kind} len={len} blocked={blocked}"
+                );
+            }
+        }
     }
 }
