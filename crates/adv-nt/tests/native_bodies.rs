@@ -3,16 +3,15 @@
 //! Two machines map the distribution's ntdll.dll and bind its bodies; the
 //! reference then drops its redirects, so it runs Wine's code. The same
 //! random calls must leave the same memory, return registers and stack in
-//! both, and a call that faults must fault at the same place after copying
-//! the same bytes. `ADV_WINE_DIST` names the distribution; without it the
-//! test is skipped.
+//! both, and a call that faults must fault on the same byte.
+//! `ADV_WINE_DIST` names the distribution; without it the test is skipped.
 
 #[cfg(any(target_vendor = "apple", target_os = "android"))]
 use adv_wineserver as _;
 use std::path::{Path, PathBuf};
 
 use adv_cpu::Cpu;
-use adv_cpu::backend::{Guest, GuestExt, Prot};
+use adv_cpu::backend::{Backend, Guest, GuestExt, Prot};
 use adv_machine::{Clock, Machine, RunResult, layout::PARK_ADDR};
 use adv_nt::dispatch::Platform;
 use adv_pe::Pe;
@@ -115,7 +114,7 @@ fn call(machine: &mut Machine<Cpu>, data: &[u8], args: [u32; 3]) -> Result<Vec<u
     Ok(words)
 }
 
-// spec: NAT-BODY-1
+// spec: NAT-BODY-1, A64-CALL-4, A64-CALL-5
 #[test]
 fn ntdll_memcpy_matches_wine() {
     let Some(dist) = std::env::var_os("ADV_WINE_DIST").map(PathBuf::from) else {
@@ -155,27 +154,26 @@ fn ntdll_memcpy_matches_wine() {
             "memcpy({dst:#x}, {src:#x}, {n:#x})"
         );
     }
+    // A direct body call retires as its call instruction (A64-CALL-5);
+    // Wine's code retires its whole loop.
+    let retired = |machine: &Machine<Cpu>| machine.cpu.retired_instructions();
     assert!(
-        native.sys.host_calls > u64::from(CASES / 2),
-        "the native body ran {} times",
-        native.sys.host_calls
+        retired(&native) * 4 < retired(&reference),
+        "the native body did not run: {} against {} instructions",
+        retired(&native),
+        retired(&reference)
     );
     assert_eq!(reference.sys.host_calls, 0);
-    // A source that runs into an unmapped page: the body declines, and
-    // Wine's code copies up to the fault.
+    // A source that runs into an unmapped page: Wine's code faults inside
+    // the function, the body as its entry's first instruction (A64-CALL-4).
     let args = [DATA, DATA + DATA_LEN - 100, 500];
-    let (faulted, expected) = (
-        call(&mut native, &data, args),
-        call(&mut reference, &data, args),
+    let entry = native.cpu.read_u32(SLOT).unwrap();
+    let faulted = call(&mut native, &data, args).unwrap_err();
+    let expected = call(&mut reference, &data, args).unwrap_err();
+    assert!(
+        expected.contains(&format!("kind: Read({})", DATA + DATA_LEN)),
+        "{expected}"
     );
-    assert!(faulted.is_err(), "{faulted:?}");
-    assert_eq!(
-        adv_nt::native::declines(&native.ext),
-        1,
-        "the body declined"
-    );
-    assert_eq!(faulted, expected);
-    let mut copied = [0; 100];
-    native.cpu.read(DATA, &mut copied).unwrap();
-    assert_eq!(copied[..], data[DATA_LEN as usize - 100..]);
+    let at_entry = format!("Fault {{ kind: Read({}), pc: {entry} }}", DATA + DATA_LEN);
+    assert!(faulted.contains(&at_entry), "{faulted}");
 }
