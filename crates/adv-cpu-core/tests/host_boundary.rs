@@ -239,3 +239,49 @@ fn host_boundary_counters_distinguish_contiguous_and_page_copies() {
     assert!(memory.write(3 * PAGE_SIZE as u32, &[1]).is_err());
     assert_eq!(memory.host_access().writes, after.writes);
 }
+
+// spec: NAT-BODY-7
+#[test]
+fn host_boundary_tlb_keeps_alternating_pages_and_replaces_collisions() {
+    let mut memory = Memory::reserve(0, 12 * PAGE_SIZE).unwrap();
+    memory
+        .map(PAGE_SIZE as u32, 3 * PAGE_SIZE, READ | WRITE)
+        .unwrap();
+    let mut bytes = [0; 16];
+    for page in 1..=3 {
+        memory
+            .read_into(page * PAGE_SIZE as u32, &mut bytes)
+            .unwrap();
+    }
+    let misses = memory.host_access().tlb_misses;
+    for _ in 0..10 {
+        for page in 1..=3 {
+            memory
+                .read_into(page * PAGE_SIZE as u32, &mut bytes)
+                .unwrap();
+        }
+    }
+    assert_eq!(memory.host_access().tlb_misses, misses);
+    let alias = 9 * PAGE_SIZE as u32;
+    memory.map(alias, PAGE_SIZE, READ).unwrap();
+    memory.write(alias, &[0x55; 16]).unwrap();
+    for _ in 0..3 {
+        memory.read_into(alias, &mut bytes).unwrap();
+        assert_eq!(bytes, [0x55; 16]);
+        memory.read_into(PAGE_SIZE as u32, &mut bytes).unwrap();
+        assert_eq!(bytes, [0; 16]);
+    }
+    memory.protect(alias, PAGE_SIZE, 0).unwrap();
+    assert!(!memory.accessible(alias, 16, READ));
+    memory.unmap(alias, PAGE_SIZE).unwrap();
+    assert!(memory.read_into(alias, &mut bytes).is_err());
+    let page = FilePage::new([0x66; PAGE_SIZE]);
+    memory
+        .map_file_pages(alias, &[page], READ | WRITE, false)
+        .unwrap();
+    memory.prepare_native_access(alias, 16, false).unwrap();
+    assert!(memory.writable_bytes(alias, 16).is_none());
+    memory.unmap(alias, PAGE_SIZE).unwrap();
+    memory.map(alias, PAGE_SIZE, READ | WRITE).unwrap();
+    assert!(memory.writable_bytes(alias, 16).is_some());
+}

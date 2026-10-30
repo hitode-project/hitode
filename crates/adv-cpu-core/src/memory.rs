@@ -134,8 +134,8 @@ impl SharedPage {
 
 #[derive(Clone, Copy)]
 struct HostRange {
-    first: usize,
-    last: usize,
+    first: u32,
+    last: u32,
     generation: u64,
     committed: bool,
     protection: u8,
@@ -143,7 +143,21 @@ struct HostRange {
     watched: bool,
     resident: bool,
     // The first page retains the storage; its lookup is O(1) on a cache hit.
-    storage_offset: Option<usize>,
+    storage_offset: usize,
+}
+
+impl HostRange {
+    const EMPTY: Self = Self {
+        first: u32::MAX,
+        last: u32::MAX,
+        generation: 0,
+        committed: true,
+        protection: u8::MAX,
+        flags: 0,
+        watched: false,
+        resident: false,
+        storage_offset: usize::MAX,
+    };
 }
 
 /// A fixed, page-aligned guest window. Both executors borrow this same allocation.
@@ -155,7 +169,7 @@ pub struct Memory {
     pub fast: FastPermissions,
     pub epoch: u64,
     map_generation: u64,
-    host_range: Cell<Option<HostRange>>,
+    host_range: [Cell<HostRange>; 8],
     host_access: Cell<HostAccess>,
     /// Owner-specific validation stamp for Tier 0 page dependencies.
     pub(crate) code_generation: u64,
@@ -180,6 +194,7 @@ pub struct Memory {
     private_copy_epoch: u64,
     /// File pages whose bytes live in this window's committed pages.
     resident: BTreeMap<usize, std::rc::Rc<crate::backend::FilePage>>,
+    resident_pages: Vec<bool>,
 
     /// The window `reservation` is placed in; declared after it so the
     /// reservation hands its range back first.
@@ -217,65 +232,51 @@ impl Memory {
 
     #[inline]
     fn host_range(&self, range: &std::ops::Range<usize>) -> HostRange {
-        if !range.is_empty()
-            && let Some(cached) = self.host_range.get()
-            && (cached.first, cached.last, cached.generation)
-                == (
-                    range.start / PAGE_SIZE,
-                    (range.end - 1) / PAGE_SIZE,
-                    self.map_generation,
-                )
-        {
+        if range.is_empty() {
+            return HostRange::EMPTY;
+        }
+        let first = (range.start / PAGE_SIZE) as u32;
+        let last = ((range.end - 1) / PAGE_SIZE) as u32;
+        let cached = self.host_range[first as usize & 7].get();
+        if (cached.first, cached.last, cached.generation) == (first, last, self.map_generation) {
             return cached;
         }
-        self.walk_host_range(range)
+        self.walk_host_range(first, last)
     }
 
-    fn walk_host_range(&self, range: &std::ops::Range<usize>) -> HostRange {
-        let first = range.start / PAGE_SIZE;
-        let last = range.end.saturating_sub(1) / PAGE_SIZE;
+    fn walk_host_range(&self, first: u32, last: u32) -> HostRange {
         let mut info = HostRange {
             first,
             last,
             generation: self.map_generation,
-            committed: true,
-            protection: u8::MAX,
-            flags: 0,
-            watched: false,
-            resident: false,
-            storage_offset: None,
+            ..HostRange::EMPTY
         };
-        if range.is_empty() {
-            return info;
-        }
         let mut counts = self.host_access.get();
         counts.tlb_misses += 1;
         self.host_access.set(counts);
-        let storage = match self.shared_pages.get(&first) {
-            Some(SharedPage::Storage { storage, offset }) => {
-                info.storage_offset = Some(*offset);
-                Some(storage)
-            }
-            _ => None,
-        };
-        for page in first..=last {
+        for page in first as usize..=last as usize {
             info.committed &= self.mapped[page];
             info.protection &= self.perms[page];
             info.flags |= self.perms[page];
             info.watched |= self.watched[page];
-            info.resident |= self.resident.contains_key(&page);
-            if let Some(offset) = info.storage_offset {
-                match self.shared_pages.get(&page) {
-                    Some(SharedPage::Storage {
-                        storage: next,
-                        offset: at,
-                    }) if storage.is_some_and(|storage| Arc::ptr_eq(storage, next))
-                        && *at == offset + (page - first) * PAGE_SIZE => {}
-                    _ => info.storage_offset = None,
+            info.resident |= self.resident_pages[page];
+        }
+        if info.protection & SHARED != 0
+            && let Some(SharedPage::Storage { storage, offset }) =
+                self.shared_pages.get(&(first as usize))
+        {
+            info.storage_offset = *offset;
+            for page in first as usize + 1..=last as usize {
+                if !matches!(self.shared_pages.get(&page),
+                    Some(SharedPage::Storage { storage: next, offset: at })
+                        if Arc::ptr_eq(storage, next) && *at == offset + (page - first as usize) * PAGE_SIZE)
+                {
+                    info.storage_offset = usize::MAX;
+                    break;
                 }
             }
         }
-        self.host_range.set(Some(info));
+        self.host_range[first as usize & 7].set(info);
         info
     }
 
@@ -283,10 +284,14 @@ impl Memory {
     fn storage_run(
         &self,
         range: &std::ops::Range<usize>,
+        info: HostRange,
     ) -> Option<(&Arc<SharedAllocation>, usize)> {
-        let info = self.host_range(range);
-        let offset = info.storage_offset? + range.start % PAGE_SIZE;
-        let SharedPage::Storage { storage, .. } = self.shared_pages.get(&info.first)? else {
+        if info.storage_offset == usize::MAX {
+            return None;
+        }
+        let offset = info.storage_offset + range.start % PAGE_SIZE;
+        let SharedPage::Storage { storage, .. } = self.shared_pages.get(&(info.first as usize))?
+        else {
             return None;
         };
         Some((storage, offset))
@@ -461,7 +466,7 @@ impl Memory {
             fast: FastPermissions::new(len / PAGE_SIZE),
             epoch: origin,
             map_generation: origin,
-            host_range: Cell::new(None),
+            host_range: [const { Cell::new(HostRange::EMPTY) }; 8],
             host_access: Cell::new(HostAccess::default()),
             code_generation: origin,
             versions: vec![origin; len / PAGE_SIZE],
@@ -475,6 +480,7 @@ impl Memory {
             private_copy_pages: vec![None; len / PAGE_SIZE],
             private_copy_epoch: 0,
             resident: BTreeMap::new(),
+            resident_pages: vec![false; len / PAGE_SIZE],
 
             #[cfg(unix)]
             window: None,
@@ -503,7 +509,7 @@ impl Memory {
             fast: FastPermissions::new(len / PAGE_SIZE),
             epoch: origin,
             map_generation: origin,
-            host_range: Cell::new(None),
+            host_range: [const { Cell::new(HostRange::EMPTY) }; 8],
             host_access: Cell::new(HostAccess::default()),
             code_generation: origin,
             versions: vec![origin; len / PAGE_SIZE],
@@ -517,6 +523,7 @@ impl Memory {
             private_copy_pages: vec![None; len / PAGE_SIZE],
             private_copy_epoch: 0,
             resident: BTreeMap::new(),
+            resident_pages: vec![false; len / PAGE_SIZE],
 
             #[cfg(unix)]
             window: None,
@@ -582,6 +589,7 @@ impl Memory {
         memory.fast = FastPermissions::new(len / PAGE_SIZE);
         memory.versions = vec![origin; len / PAGE_SIZE];
         memory.watched = vec![false; len / PAGE_SIZE];
+        memory.resident_pages = vec![false; len / PAGE_SIZE];
         memory.mapped = Arc::new(vec![false; len / PAGE_SIZE]);
         memory.reservation = Some(reservation);
         memory.window = Some(window);
@@ -726,8 +734,10 @@ impl Memory {
     }
 
     pub fn accessible(&self, addr: u32, len: usize, protection: u8) -> bool {
-        self.committed(addr, len)
-            .is_ok_and(|range| self.host_range(&range).protection & protection == protection)
+        self.range(addr, len).is_ok_and(|range| {
+            let info = self.host_range(&range);
+            info.committed && info.protection & protection == protection
+        })
     }
 
     pub fn map(&mut self, addr: u32, len: usize, perms: u8) -> Result<(), String> {
@@ -761,6 +771,7 @@ impl Memory {
             .collect();
         for page in resident {
             self.resident.remove(&page).unwrap().evict();
+            self.resident_pages[page] = false;
         }
         #[cfg(unix)]
         self.unlinearize(pages.clone())?;
@@ -892,7 +903,7 @@ impl Memory {
         if self.host_range(&range).protection & READ == 0 {
             return None;
         }
-        let (storage, offset) = self.storage_run(&range)?;
+        let (storage, offset) = self.storage_run(&range, self.host_range(&range))?;
         storage.read_only_view(offset, len)
     }
 
@@ -934,18 +945,15 @@ impl Memory {
         })
     }
 
+    #[inline]
     pub fn read_into(&self, addr: u32, destination: &mut [u8]) -> Result<(), String> {
-        let range = self.committed(addr, destination.len())?;
-        self.count_read(destination.len());
-        if let Some((storage, offset)) = self.storage_run(&range) {
-            let mut counts = self.host_access.get();
-            counts.shared_copies += 1;
-            self.host_access.set(counts);
-            crate::backend::SharedReadView::copy_into(storage.as_ref(), offset, destination);
-            return Ok(());
+        let range = self.range(addr, destination.len())?;
+        let info = self.host_range(&range);
+        if !info.committed {
+            return Err(format!("unmapped guest memory at {addr:#x}"));
         }
-
-        if !self.overlays(&range) {
+        self.count_read(destination.len());
+        if info.flags & SHARED == 0 {
             // SAFETY: committed ordinary storage and non-aliasing caller output.
             unsafe {
                 std::ptr::copy_nonoverlapping(
@@ -954,6 +962,22 @@ impl Memory {
                     range.len(),
                 )
             };
+            return Ok(());
+        }
+        self.read_overlay(range, info, destination)
+    }
+
+    fn read_overlay(
+        &self,
+        range: std::ops::Range<usize>,
+        info: HostRange,
+        destination: &mut [u8],
+    ) -> Result<(), String> {
+        if let Some((storage, offset)) = self.storage_run(&range, info) {
+            let mut counts = self.host_access.get();
+            counts.shared_copies += 1;
+            self.host_access.set(counts);
+            crate::backend::SharedReadView::copy_into(storage.as_ref(), offset, destination);
             return Ok(());
         }
         let mut at = range.start;
@@ -1446,6 +1470,7 @@ impl Memory {
         self.map_generation += 1;
         self.shared_pages.remove(&page);
         self.resident.insert(page, storage);
+        self.resident_pages[page] = true;
         Arc::make_mut(&mut self.perms)[page] &= !SHARED;
         if self.sync_window(page..page + 1).is_err() {
             // Translated code then reaches the page as a soft page.
@@ -1626,19 +1651,20 @@ impl Memory {
     /// must validate WRITE permission before using this operation.
     pub fn write(&mut self, addr: u32, bytes: &[u8]) -> Result<(), String> {
         let range = self.committed(addr, bytes.len())?;
-        let overlays = self.overlays(&range);
+        let info = self.host_range(&range);
+        let overlays = info.flags & SHARED != 0;
         // Keep ordinary stores allocation-free. Overlay stores resolve every
         // fallible page read and private COW snapshot before committing bytes,
         // so a later I/O failure cannot leave a restarted scalar store half done.
-        if overlays && self.host_range(&range).storage_offset.is_none() {
+        if overlays && info.storage_offset == usize::MAX {
             self.prepare_file_range(&range, true)?;
         }
-        if self.host_range(&range).watched && self.writes_code(&range) {
+        if info.watched && self.writes_code(&range) {
             self.touch(addr, bytes.len());
         }
 
         if overlays {
-            if let Some((storage, offset)) = self.storage_run(&range) {
+            if let Some((storage, offset)) = self.storage_run(&range, info) {
                 if !storage.writable() {
                     return Err("write to a read-only shared file view".into());
                 }

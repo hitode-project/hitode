@@ -20,7 +20,7 @@ pub(crate) unsafe fn atomic_copy(mut source: *const u8, mut out: &mut [u8]) {
         let count = (4 - edge).min(out.len());
         // SAFETY: caller supplies the live, padded mapping described above.
         let value = unsafe { (&*source.sub(edge).cast::<AtomicU32>()).load(Ordering::Relaxed) };
-        out[..count].copy_from_slice(&value.to_ne_bytes()[edge..edge + count]);
+        copy_edge(value, edge, &mut out[..count]);
         source = unsafe { source.add(count) };
         out = &mut out[count..];
     }
@@ -36,7 +36,19 @@ pub(crate) unsafe fn atomic_copy(mut source: *const u8, mut out: &mut [u8]) {
     if !out.is_empty() {
         // SAFETY: the final aligned word lies in the mapping's host-page padding.
         let value = unsafe { (&*source.cast::<AtomicU32>()).load(Ordering::Relaxed) };
-        out.copy_from_slice(&value.to_ne_bytes()[..out.len()]);
+        copy_edge(value, 0, out);
+    }
+}
+
+#[inline]
+fn copy_edge(value: u32, edge: usize, out: &mut [u8]) {
+    let bytes = value.to_ne_bytes();
+    out[0] = bytes[edge];
+    if out.len() > 1 {
+        out[1] = bytes[edge + 1];
+    }
+    if out.len() > 2 {
+        out[2] = bytes[edge + 2];
     }
 }
 
