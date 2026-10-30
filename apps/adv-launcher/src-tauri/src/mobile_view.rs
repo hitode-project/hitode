@@ -6,8 +6,8 @@ use std::collections::HashMap;
 
 use adv_shell::mobile::{Insets, Layout, Rect};
 use adv_shell::window::{
-    DialogControl, DialogEvent, DialogSet, DialogTarget, MenuBar, MenuCommand, MenuEvent, MenuItem,
-    ViewEvent,
+    DialogControl, DialogEvent, DialogFont, DialogSet, DialogTarget, MenuBar, MenuCommand,
+    MenuEvent, MenuItem, ViewEvent,
 };
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, WebviewWindow};
@@ -155,6 +155,10 @@ struct Control {
     selection: i32,
     range: Option<(i32, i32)>,
     value: i32,
+    /// A static's text alignment: 0 left, 1 center, 2 right.
+    align: u8,
+    /// The control's own em size in guest pixels, when it sets a font.
+    font_size: Option<f64>,
 }
 
 /// A visible guest dialog for the overlay.
@@ -165,6 +169,9 @@ struct Dialog {
     text: String,
     width: i32,
     height: i32,
+    /// The dialog font's em size in guest pixels and whether it is bold.
+    font_size: f64,
+    bold: bool,
     controls: Vec<Control>,
 }
 
@@ -211,7 +218,7 @@ fn dialogs(set: &DialogSet) -> Vec<Dialog> {
                     c.visible.then(|| Control {
                         target: c.target.into(),
                         kind: kind(c),
-                        text: caption(&c.text),
+                        text: c.caption(),
                         x,
                         y,
                         width: c.rect.right - c.rect.left,
@@ -222,6 +229,8 @@ fn dialogs(set: &DialogSet) -> Vec<Dialog> {
                         selection: c.selection,
                         range: c.range,
                         value: c.value,
+                        align: c.alignment(),
+                        font_size: c.font.as_ref().and_then(DialogFont::em),
                     })
                 })
                 .collect();
@@ -230,6 +239,9 @@ fn dialogs(set: &DialogSet) -> Vec<Dialog> {
                 text: d.text.clone(),
                 width: d.client_size.0,
                 height: d.client_size.1,
+                // MS Shell Dlg at 8 points is an 11 pixel em at 96 DPI.
+                font_size: d.font.as_ref().and_then(DialogFont::em).unwrap_or(11.0),
+                bold: d.font.as_ref().is_some_and(|f| f.weight >= 600),
                 controls,
             }
         })

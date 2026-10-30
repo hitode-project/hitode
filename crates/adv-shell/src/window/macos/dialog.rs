@@ -236,14 +236,7 @@ fn font(source: Option<&DialogFont>) -> Retained<NSFont> {
     let Some(source) = source else {
         return NSFont::systemFontOfSize(NSFont::smallSystemFontSize());
     };
-    // A negative LOGFONT height is the em size, a positive one the cell.
-    let size = if source.height < 0 {
-        f64::from(-source.height)
-    } else if source.height > 0 {
-        f64::from(source.height) * 0.8
-    } else {
-        NSFont::smallSystemFontSize()
-    };
+    let size = source.em().unwrap_or_else(NSFont::smallSystemFontSize);
     NSFont::fontWithName_size(&NSString::from_str(&source.face), size).unwrap_or_else(|| {
         if source.weight >= 600 {
             NSFont::boldSystemFontOfSize(size)
@@ -314,7 +307,7 @@ fn create(mtm: MainThreadMarker, target: &Target, control: &DialogControl) -> Re
                 } else {
                     NSTextField::labelWithString(&text, mtm)
                 };
-                label.setAlignment(match control.style & 3 {
+                label.setAlignment(match control.alignment() {
                     1 => NSTextAlignment::Center,
                     2 => NSTextAlignment::Right,
                     _ => NSTextAlignment::Left,
@@ -520,7 +513,14 @@ impl HostDialog {
                     },
                 );
             }
-            project(output, native, control, rect, source.font.as_ref());
+            project(
+                output,
+                native,
+                control,
+                rect,
+                source.font.as_ref(),
+                source.client_size.0,
+            );
         }
     }
 }
@@ -532,12 +532,13 @@ fn project(
     control: &DialogControl,
     rect: (i32, i32, i32, i32),
     inherited: Option<&DialogFont>,
+    width: i32,
 ) {
     let view = &native.view;
     view.setFrame(frame(rect));
     view.setHidden(!control.visible);
     let text = if control.supported {
-        control.text.clone()
+        control.caption()
     } else {
         format!("Unavailable: {} · {}", control.class, control.text)
     };
@@ -609,11 +610,65 @@ fn project(
         }
         field.setEnabled(control.enabled && control.supported);
         field.setFont(Some(&font));
+        if native.kind == Kind::Label {
+            view.setFrame(label_frame(
+                field,
+                &font,
+                &text,
+                control.alignment(),
+                rect,
+                width,
+            ));
+        }
     }
     native.source = DialogControl {
         text,
         ..control.clone()
     };
+}
+
+/// A label's frame. AppKit insets label text by 2 points a side and its fonts
+/// measure wider than the guest's, so a single line the guest fits keeps its
+/// alignment and grows to its own width inside the client area.
+fn label_frame(
+    field: &NSTextField,
+    font: &NSFont,
+    text: &str,
+    alignment: u8,
+    rect: (i32, i32, i32, i32),
+    width: i32,
+) -> NSRect {
+    let mut frame = frame(rect);
+    frame.origin.x -= 2.0;
+    frame.size.width += 4.0;
+    let line = (font.ascender() - font.descender() + font.leading()).ceil();
+    let Some(cell) = field.cell() else {
+        return frame;
+    };
+    if text.contains(['\n', '\r']) || frame.size.height >= 2.0 * line {
+        return frame;
+    }
+    let natural = cell
+        .cellSizeForBounds(NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(f64::from(width.max(1)) * 4.0, 2.0 * line),
+        ))
+        .width
+        .ceil();
+    let grow = natural - frame.size.width;
+    if grow > 0.0 {
+        frame.origin.x -= match alignment {
+            1 => grow / 2.0,
+            2 => grow,
+            _ => 0.0,
+        };
+        frame.size.width = natural;
+        let width = f64::from(width.max(1));
+        frame.origin.x = frame.origin.x.min(width - frame.size.width).max(0.0);
+        frame.size.width = frame.size.width.min(width - frame.origin.x);
+    }
+    frame.size.height = frame.size.height.max(line);
+    frame
 }
 
 #[derive(Default)]

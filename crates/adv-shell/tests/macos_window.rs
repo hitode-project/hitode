@@ -29,7 +29,7 @@ mod mac {
         CFAbsoluteTimeGetCurrent, CFRunLoop, CFRunLoopTimer, CFRunLoopTimerContext,
         kCFRunLoopCommonModes,
     };
-    use objc2_foundation::{NSNotification, NSPoint, NSString};
+    use objc2_foundation::{NSNotification, NSPoint, NSRect, NSSize, NSString};
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -600,6 +600,83 @@ mod mac {
         );
         assert_eq!(inputs(dispatch(&mut window)).len(), 1);
         println!("ok dialogs");
+
+        // A message box as Wine lays it out: captions lose their mnemonics
+        // and the prompt, sized for the guest's narrower font, stays whole.
+        let font = adv_runtime::DialogFont {
+            face: "Tahoma".into(),
+            height: -11,
+            weight: 400,
+            italic: false,
+            charset: 1,
+        };
+        let mut prompt = control(
+            0x211,
+            "Static",
+            0x5002_0080,
+            "Are you sure you want to exit?",
+            0,
+        );
+        (
+            prompt.rect.left,
+            prompt.rect.top,
+            prompt.rect.right,
+            prompt.rect.bottom,
+        ) = (56, 17, 204, 30);
+        let mut yes = control(0x212, "Button", 0x5001_0001, "&Yes", 0);
+        (yes.rect.left, yes.rect.top, yes.rect.right, yes.rect.bottom) = (50, 48, 102, 74);
+        let mut no = control(0x213, "Button", 0x5001_0000, "&No", 0);
+        (no.rect.left, no.rect.top, no.rect.right, no.rect.bottom) = (108, 48, 160, 74);
+        let mut message = set.dialogs[0].clone();
+        message.text = "Exit".into();
+        message.style = 0;
+        message.client_size = (216, 82);
+        message.font = Some(font);
+        message.controls = vec![prompt, yes, no];
+        window
+            .set_dialogs(&DialogSet {
+                dialogs: vec![message],
+            })
+            .unwrap();
+        let panel = find_window(mtm, "Exit");
+        let views = subviews(&panel);
+        let label = views[0].downcast_ref::<NSTextField>().unwrap();
+        let natural = label
+            .cell()
+            .unwrap()
+            .cellSizeForBounds(NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1e4, 1e4)));
+        let frame = label.frame();
+        assert!(
+            frame.size.width >= natural.width.ceil(),
+            "{frame:?} {natural:?}"
+        );
+        assert!(
+            frame.size.height >= natural.height.floor(),
+            "{frame:?} {natural:?}"
+        );
+        assert!(frame.origin.x >= 0.0 && frame.origin.x + frame.size.width <= 216.0);
+        let titles: Vec<_> = views[1..]
+            .iter()
+            .map(|view| view.downcast_ref::<NSButton>().unwrap().title().to_string())
+            .collect();
+        assert_eq!(titles, ["Yes", "No"]);
+        let content = panel.contentView().unwrap();
+        let bounds = content.bounds();
+        let image = content
+            .bitmapImageRepForCachingDisplayInRect(bounds)
+            .unwrap();
+        content.cacheDisplayInRect_toBitmapImageRep(bounds, &image);
+        let png = unsafe {
+            image.representationUsingType_properties(
+                objc2_app_kit::NSBitmapImageFileType::PNG,
+                &objc2_foundation::NSDictionary::new(),
+            )
+        }
+        .unwrap();
+        let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("message-box.png");
+        std::fs::write(&path, png.to_vec()).unwrap();
+        window.set_dialogs(&DialogSet::default()).unwrap();
+        println!("ok dialog captions ({})", path.display());
 
         // Exercise delegate notifications without showing a window, sleeping
         // the machine, or terminating the test process.

@@ -15,9 +15,22 @@
     selection: number;
     range: [number, number] | null;
     value: number;
+    /** A static's text alignment: 0 left, 1 center, 2 right. */
+    align: 0 | 1 | 2;
+    /** The control's own em size in guest pixels, when it sets a font. */
+    fontSize: number | null;
   };
   /** A visible guest dialog, in its client pixels (mobile_view.rs `game_dialogs`). */
-  export type GuestDialog = { target: DialogTarget; text: string; width: number; height: number; controls: DialogControl[] };
+  export type GuestDialog = {
+    target: DialogTarget;
+    text: string;
+    width: number;
+    height: number;
+    /** The dialog font's em size in guest pixels. */
+    fontSize: number;
+    bold: boolean;
+    controls: DialogControl[];
+  };
 </script>
 
 <script lang="ts">
@@ -51,7 +64,16 @@
   }
 
   const box = (c: DialogControl, s: number) =>
-    `left: ${c.x * s}px; top: ${c.y * s}px; width: ${c.width * s}px; height: ${c.height * s}px`;
+    `left: ${c.x * s}px; top: ${c.y * s}px; width: ${c.width * s}px; height: ${c.height * s}px` +
+    (c.fontSize ? `; font-size: ${c.fontSize * s}px` : "");
+  /**
+   * A label the guest sized for one line stays one line: host fonts measure
+   * wider than the guest's, so it overflows by its alignment instead of
+   * wrapping into a clipped second line.
+   */
+  const single = (c: DialogControl, d: GuestDialog) =>
+    !c.text.includes("\n") && c.height < 2 * (c.fontSize ?? d.fontSize) * 1.25;
+  const justify = ["flex-start", "center", "flex-end"];
   /** Group boxes sit under the controls they frame. */
   const framed = (d: GuestDialog) => [
     ...d.controls.filter((c) => c.kind === "group" || c.kind === "frame"),
@@ -64,7 +86,7 @@
 <div class="scrim fade" {@attach modal}>
   {#each dialogs as dialog (dialog.target.hwnd)}
     {@const s = scale(dialog)}
-    <div class="dialog" role="dialog" aria-modal="true" aria-label={dialog.text} lang="ja" style="--s: {s}">
+    <div class="dialog" role="dialog" aria-modal="true" aria-label={dialog.text} lang="ja" style="--s: {s}; font-size: {dialog.fontSize * s}px" class:bold={dialog.bold}>
       {#if dialog.text}<div class="caption">{dialog.text}</div>{/if}
       <div class="client" style="width: {dialog.width * s}px; height: {dialog.height * s}px">
         {#each framed(dialog) as c (c.target.hwnd)}
@@ -82,7 +104,11 @@
           {:else if c.kind === "frame"}
             <div class="frame" style={box(c, s)}></div>
           {:else if c.kind === "label"}
-            <div class="label" class:off={!c.enabled} style={box(c, s)}>{c.text}</div>
+            {#if single(c, dialog)}
+              <div class="label single" class:off={!c.enabled} style="{box(c, s)}; justify-content: {justify[c.align]}"><span>{c.text}</span></div>
+            {:else}
+              <div class="label" class:off={!c.enabled} style="{box(c, s)}; text-align: {['left', 'center', 'right'][c.align]}">{c.text}</div>
+            {/if}
           {:else if c.kind === "edit"}
             <input class="edit" style={box(c, s)} disabled={!c.enabled} value={c.text} autocomplete="off" spellcheck="false"
               onchange={(e) => send({ kind: "text", target: c.target, text: e.currentTarget.value })} />
@@ -128,7 +154,9 @@
     border: 1px solid var(--line);
     box-shadow: 0 24px 64px rgba(0, 0, 0, 0.5);
     overflow: hidden;
-    font-size: calc(12px * var(--s));
+  }
+  .dialog.bold .client {
+    font-weight: 600;
   }
   .caption {
     padding: 12px 16px 0;
@@ -155,6 +183,7 @@
     border-radius: 8px;
     background: var(--field);
     cursor: pointer;
+    white-space: nowrap;
   }
   .push:active {
     background: var(--accent);
@@ -208,8 +237,13 @@
   }
   .label {
     white-space: pre-wrap;
-    line-height: 1.35;
-    overflow: hidden;
+    line-height: 1.25;
+    overflow: visible;
+  }
+  .label.single {
+    display: flex;
+    align-items: flex-start;
+    white-space: pre;
   }
   .edit {
     border: 1px solid var(--line);

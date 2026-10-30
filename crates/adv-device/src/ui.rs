@@ -110,6 +110,53 @@ impl DialogEvent {
     }
 }
 
+impl DialogFont {
+    /// The em size in guest pixels: a negative LOGFONT height is the em, a
+    /// positive one the cell, which an em fills to about 80%.
+    pub fn em(&self) -> Option<f64> {
+        match self.height {
+            0 => None,
+            h if h < 0 => Some(f64::from(-h)),
+            h => Some(f64::from(h) * 0.8),
+        }
+    }
+}
+
+impl DialogControl {
+    /// A static's horizontal text alignment: 0 left, 1 center, 2 right.
+    pub fn alignment(&self) -> u8 {
+        if self.class.eq_ignore_ascii_case("Static") && matches!(self.style & 0x1f, 1 | 2) {
+            (self.style & 0x1f) as u8
+        } else {
+            0
+        }
+    }
+
+    /// The text as the control paints it: buttons and statics without
+    /// SS_NOPREFIX underline the character after `&`, and `&&` shows one `&`.
+    pub fn caption(&self) -> String {
+        let prefixed = self.class.eq_ignore_ascii_case("Button")
+            || (self.class.eq_ignore_ascii_case("Static") && self.style & 0x80 == 0);
+        if prefixed {
+            without_mnemonics(&self.text)
+        } else {
+            self.text.clone()
+        }
+    }
+}
+
+/// `text` without mnemonic markers.
+pub fn without_mnemonics(text: &str) -> String {
+    let mut caption = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '&' || chars.next_if_eq(&'&').is_some() {
+            caption.push(c);
+        }
+    }
+    caption
+}
+
 /// Whether a standard control can be shown natively.
 pub fn supported(class: &str, style: u32, list_box: bool) -> bool {
     // Owner-drawn buttons retain guest input/state; the platform adapter can
@@ -217,4 +264,60 @@ pub struct InputView {
     pub active: u32,
     pub capture: u32,
     pub windows: Vec<WindowView>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn control(class: &str, style: u32, text: &str) -> DialogControl {
+        DialogControl {
+            target: DialogTarget::default(),
+            class: class.into(),
+            style,
+            ex_style: 0,
+            text: text.into(),
+            rect: Rect::default(),
+            visible: true,
+            enabled: true,
+            check: 0,
+            items: Vec::new(),
+            selection: -1,
+            range: None,
+            value: 0,
+            font: None,
+            supported: true,
+        }
+    }
+
+    #[test]
+    fn captions_drop_mnemonics_where_the_control_paints_them() {
+        assert_eq!(control("Button", 0, "&Yes").caption(), "Yes");
+        assert_eq!(
+            control("button", 0, "Save && &Quit").caption(),
+            "Save & Quit"
+        );
+        assert_eq!(control("Static", 0, "&Name:").caption(), "Name:");
+        // SS_NOPREFIX statics and edit text show every ampersand.
+        assert_eq!(control("Static", 0x80, "A & B").caption(), "A & B");
+        assert_eq!(control("Edit", 0, "a&b").caption(), "a&b");
+    }
+
+    #[test]
+    fn font_em_and_static_alignment_follow_win32() {
+        let font = |height| DialogFont {
+            face: "Tahoma".into(),
+            height,
+            weight: 400,
+            italic: false,
+            charset: 1,
+        };
+        assert_eq!(font(-11).em(), Some(11.0));
+        assert_eq!(font(15).em(), Some(12.0));
+        assert_eq!(font(0).em(), None);
+        assert_eq!(control("Static", 0x5002_0001, "").alignment(), 1);
+        assert_eq!(control("Static", 0x5002_0002, "").alignment(), 2);
+        assert_eq!(control("Static", 0x5002_0080, "").alignment(), 0);
+        assert_eq!(control("Button", 1, "").alignment(), 0);
+    }
 }
