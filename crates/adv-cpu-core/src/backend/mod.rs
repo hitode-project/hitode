@@ -13,6 +13,26 @@ use std::time::Duration;
 pub use crate::{ArchitecturalState, StateError};
 use thiserror::Error;
 
+/// Cumulative host memory work, owned by the guest execution worker.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HostAccess {
+    pub reads: u64,
+    pub read_bytes: u64,
+    pub writes: u64,
+    pub written_bytes: u64,
+    pub shared_copies: u64,
+    pub fallbacks: u64,
+    pub tlb_misses: u64,
+}
+
+/// Identity of a retained contiguous read-only file range.
+pub struct Pinned {
+    pub(crate) addr: u32,
+    pub(crate) len: usize,
+    pub(crate) generation: std::cell::Cell<u64>,
+    pub(crate) view: ReadOnlyFileView,
+}
+
 /// Tiny `bitflags`-style newtype, so we don't pull a dependency for one type.
 macro_rules! bitflags_lite {
     ($(#[$m:meta])* $name:ident : $t:ty { $($flag:ident = $v:expr),* $(,)? }) => {
@@ -37,7 +57,7 @@ pub use file_page::FilePage;
 pub mod x87;
 pub use adv_sync::shared::{SharedReadView, SharedRegion};
 
-/// Execution-owner-only byte-atomic storage for guest COM reference words.
+/// Execution-owner-only atomic storage for guest COM reference words.
 /// The Rc returned by Guest prevents transfer to device callbacks.
 pub trait CounterStorage {
     fn load(&self, offset: usize) -> u32;
@@ -318,6 +338,18 @@ pub trait Guest {
     /// input pointers from `shared_bytes` remain valid during it.
     fn writable_bytes(&mut self, _addr: u32, _len: usize) -> Option<&mut [u8]> {
         None
+    }
+    /// Identify immutable file input, retaining its storage independently of mappings.
+    fn pinned(&self, _addr: u32, _len: usize) -> Option<Pinned> {
+        None
+    }
+    /// Revalidate identity after mapping changes; unchanged generations need no walk.
+    fn still_pinned(&self, _pinned: &Pinned) -> bool {
+        false
+    }
+    /// Cumulative memory work on the guest execution worker.
+    fn host_access(&self) -> HostAccess {
+        HostAccess::default()
     }
     /// Retained contiguous read-only file input, independent of the guest VM.
     fn read_only_file_view(&self, _addr: u32, _len: usize) -> Option<ReadOnlyFileView> {

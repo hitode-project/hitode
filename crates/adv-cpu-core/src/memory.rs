@@ -1,10 +1,12 @@
+use crate::backend::{HostAccess, Pinned};
 use crate::shared_memory::SharedAllocation;
 use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::ptr::NonNull;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 mod fast;
 mod locks;
@@ -54,7 +56,7 @@ pub const EXEC: u8 = 4;
 /// Internal execution barrier; never exposed as a guest protection flag.
 pub const SHARED: u8 = 8;
 /// A shared PCM page has a stable alias at base + guest offset. Access must
-/// still use only matching byte atomics, even for guest word/vector operations.
+/// still use aligned word atomics, including masked updates at byte edges.
 pub const AUDIO: u8 = 16;
 /// A SHARED storage page the guest window shows (unix): translated code
 /// accesses it as ordinary memory, and the rest of `Memory` through its
@@ -130,6 +132,20 @@ impl SharedPage {
     }
 }
 
+#[derive(Clone, Copy)]
+struct HostRange {
+    first: usize,
+    last: usize,
+    generation: u64,
+    committed: bool,
+    protection: u8,
+    flags: u8,
+    watched: bool,
+    resident: bool,
+    // The first page retains the storage; its lookup is O(1) on a cache hit.
+    storage_offset: Option<usize>,
+}
+
 /// A fixed, page-aligned guest window. Both executors borrow this same allocation.
 pub struct Memory {
     pub base: u32,
@@ -138,6 +154,9 @@ pub struct Memory {
     pub perms: Arc<Vec<u8>>,
     pub fast: FastPermissions,
     pub epoch: u64,
+    map_generation: u64,
+    host_range: Cell<Option<HostRange>>,
+    host_access: Cell<HostAccess>,
     /// Owner-specific validation stamp for Tier 0 page dependencies.
     pub(crate) code_generation: u64,
     /// Allocation identity survives moves and cannot alias a reused host address.
@@ -172,6 +191,134 @@ pub struct Memory {
 }
 
 impl Memory {
+    pub fn map_generation(&self) -> u64 {
+        self.map_generation
+    }
+
+    pub fn host_access(&self) -> HostAccess {
+        self.host_access.get()
+    }
+
+    #[inline]
+    fn count_read(&self, len: usize) {
+        let mut counts = self.host_access.get();
+        counts.reads += 1;
+        counts.read_bytes += len as u64;
+        self.host_access.set(counts);
+    }
+
+    #[inline]
+    fn count_write(&self, len: usize) {
+        let mut counts = self.host_access.get();
+        counts.writes += 1;
+        counts.written_bytes += len as u64;
+        self.host_access.set(counts);
+    }
+
+    #[inline]
+    fn host_range(&self, range: &std::ops::Range<usize>) -> HostRange {
+        if !range.is_empty()
+            && let Some(cached) = self.host_range.get()
+            && (cached.first, cached.last, cached.generation)
+                == (
+                    range.start / PAGE_SIZE,
+                    (range.end - 1) / PAGE_SIZE,
+                    self.map_generation,
+                )
+        {
+            return cached;
+        }
+        self.walk_host_range(range)
+    }
+
+    fn walk_host_range(&self, range: &std::ops::Range<usize>) -> HostRange {
+        let first = range.start / PAGE_SIZE;
+        let last = range.end.saturating_sub(1) / PAGE_SIZE;
+        let mut info = HostRange {
+            first,
+            last,
+            generation: self.map_generation,
+            committed: true,
+            protection: u8::MAX,
+            flags: 0,
+            watched: false,
+            resident: false,
+            storage_offset: None,
+        };
+        if range.is_empty() {
+            return info;
+        }
+        let mut counts = self.host_access.get();
+        counts.tlb_misses += 1;
+        self.host_access.set(counts);
+        let storage = match self.shared_pages.get(&first) {
+            Some(SharedPage::Storage { storage, offset }) => {
+                info.storage_offset = Some(*offset);
+                Some(storage)
+            }
+            _ => None,
+        };
+        for page in first..=last {
+            info.committed &= self.mapped[page];
+            info.protection &= self.perms[page];
+            info.flags |= self.perms[page];
+            info.watched |= self.watched[page];
+            info.resident |= self.resident.contains_key(&page);
+            if let Some(offset) = info.storage_offset {
+                match self.shared_pages.get(&page) {
+                    Some(SharedPage::Storage {
+                        storage: next,
+                        offset: at,
+                    }) if storage.is_some_and(|storage| Arc::ptr_eq(storage, next))
+                        && *at == offset + (page - first) * PAGE_SIZE => {}
+                    _ => info.storage_offset = None,
+                }
+            }
+        }
+        self.host_range.set(Some(info));
+        info
+    }
+
+    #[inline]
+    fn storage_run(
+        &self,
+        range: &std::ops::Range<usize>,
+    ) -> Option<(&Arc<SharedAllocation>, usize)> {
+        let info = self.host_range(range);
+        let offset = info.storage_offset? + range.start % PAGE_SIZE;
+        let SharedPage::Storage { storage, .. } = self.shared_pages.get(&info.first)? else {
+            return None;
+        };
+        Some((storage, offset))
+    }
+
+    pub fn pinned(&self, addr: u32, len: usize) -> Option<Pinned> {
+        let range = self.committed(addr, len).ok()?;
+        if self.host_range(&range).flags & WRITE != 0 {
+            return None;
+        }
+        Some(Pinned {
+            addr,
+            len,
+            generation: Cell::new(self.map_generation),
+            view: self.read_only_file_view(addr, len)?,
+        })
+    }
+
+    pub fn still_pinned(&self, pinned: &Pinned) -> bool {
+        if pinned.generation.get() == self.map_generation {
+            return true;
+        }
+        let Some(current) = self.pinned(pinned.addr, pinned.len) else {
+            return false;
+        };
+        if !pinned.view.same_storage(&current.view) {
+            return false;
+        }
+        pinned.generation.set(self.map_generation);
+        true
+    }
+
     /// Only software-checked memory distinguishes RWX data from code.
     /// Native host protection retains the full EXEC barrier.
     fn selective_code_writes(&self) -> bool {
@@ -223,6 +370,7 @@ impl Memory {
             (begin - u64::from(self.base)) as usize,
             (end - u64::from(self.base)) as usize,
         );
+        self.map_generation += 1;
         let mut fresh = None;
         for (page, bytes) in page_spans(begin..end) {
             let bits = self
@@ -312,6 +460,9 @@ impl Memory {
             perms: Arc::new(vec![0; len / PAGE_SIZE]),
             fast: FastPermissions::new(len / PAGE_SIZE),
             epoch: origin,
+            map_generation: origin,
+            host_range: Cell::new(None),
+            host_access: Cell::new(HostAccess::default()),
             code_generation: origin,
             versions: vec![origin; len / PAGE_SIZE],
             watched: vec![false; len / PAGE_SIZE],
@@ -351,6 +502,9 @@ impl Memory {
             perms: Arc::new(vec![0; len / PAGE_SIZE]),
             fast: FastPermissions::new(len / PAGE_SIZE),
             epoch: origin,
+            map_generation: origin,
+            host_range: Cell::new(None),
+            host_access: Cell::new(HostAccess::default()),
             code_generation: origin,
             versions: vec![origin; len / PAGE_SIZE],
             watched: vec![false; len / PAGE_SIZE],
@@ -562,16 +716,18 @@ impl Memory {
         Ok(r.start / PAGE_SIZE..r.end / PAGE_SIZE)
     }
 
+    #[inline]
     pub fn committed(&self, addr: u32, len: usize) -> Result<std::ops::Range<usize>, String> {
         let r = self.range(addr, len)?;
-        if !r.is_empty()
-            && self.mapped[r.start / PAGE_SIZE..=(r.end - 1) / PAGE_SIZE]
-                .iter()
-                .any(|&v| !v)
-        {
+        if !self.host_range(&r).committed {
             return Err(format!("unmapped guest memory at {addr:#x}"));
         }
         Ok(r)
+    }
+
+    pub fn accessible(&self, addr: u32, len: usize, protection: u8) -> bool {
+        self.committed(addr, len)
+            .is_ok_and(|range| self.host_range(&range).protection & protection == protection)
     }
 
     pub fn map(&mut self, addr: u32, len: usize, perms: u8) -> Result<(), String> {
@@ -580,9 +736,11 @@ impl Memory {
             return Err("invalid or overlapping mapping".into());
         }
         self.commit_pages(pages.start * PAGE_SIZE, len)?;
+        self.map_generation += 1;
         Arc::make_mut(&mut self.mapped)[pages.clone()].fill(true);
         if let Err(error) = self.protect(addr, len, perms) {
             self.decommit_pages(pages.start * PAGE_SIZE, len)?;
+            self.map_generation += 1;
             Arc::make_mut(&mut self.mapped)[pages].fill(false);
             return Err(error);
         }
@@ -595,6 +753,7 @@ impl Memory {
         if self.reservation.is_none() {
             return Err("unmapping requires reserved address space".into());
         }
+        self.map_generation += 1;
         let resident: Vec<_> = self
             .resident
             .range(pages.clone())
@@ -697,6 +856,7 @@ impl Memory {
             return Err("shared bytes require an atomic copy".into());
         }
 
+        self.count_read(len);
         // SAFETY: committed ordinary storage remains immutable for this borrow.
         Ok(unsafe { std::slice::from_raw_parts(self.ptr.as_ptr().add(range.start), range.len()) })
     }
@@ -705,15 +865,12 @@ impl Memory {
     /// A watched page always retains the normal store/invalidation path.
     pub fn writable_bytes(&mut self, addr: u32, len: usize) -> Option<&mut [u8]> {
         let range = self.committed(addr, len).ok()?;
-        if !range.is_empty()
-            && (range.start / PAGE_SIZE..=(range.end - 1) / PAGE_SIZE).any(|page| {
-                self.perms[page] & (WRITE | SHARED) != WRITE
-                    || self.watched[page]
-                    || self.resident.contains_key(&page)
-            })
+        let info = self.host_range(&range);
+        if info.protection & WRITE == 0 || info.flags & SHARED != 0 || info.watched || info.resident
         {
             return None;
         }
+        self.count_write(len);
         // SAFETY: the entire range is committed, writable, exclusively owned
         // ordinary storage, with no code observations to invalidate.
         Some(unsafe {
@@ -732,23 +889,11 @@ impl Memory {
         if range.is_empty() {
             return None;
         }
-        let first = range.start / PAGE_SIZE;
-        let SharedPage::Storage { storage, offset } = self.shared_pages.get(&first)? else {
+        if self.host_range(&range).protection & READ == 0 {
             return None;
-        };
-        for page in first..=(range.end - 1) / PAGE_SIZE {
-            if self.perms[page] & READ == 0 {
-                return None;
-            }
-            match self.shared_pages.get(&page)? {
-                SharedPage::Storage {
-                    storage: next,
-                    offset: at,
-                } if Arc::ptr_eq(storage, next) && *at == offset + (page - first) * PAGE_SIZE => {}
-                _ => return None,
-            }
         }
-        storage.read_only_view(offset + range.start % PAGE_SIZE, len)
+        let (storage, offset) = self.storage_run(&range)?;
+        storage.read_only_view(offset, len)
     }
 
     pub fn read_data(&self, addr: u32, len: usize) -> Result<Cow<'_, [u8]>, String> {
@@ -758,6 +903,7 @@ impl Memory {
             self.read_into(addr, &mut bytes)?;
             return Ok(Cow::Owned(bytes));
         }
+        self.count_read(len);
         // SAFETY: bounds checked, allocation alive, shared borrow prevents executor writes.
         Ok(Cow::Borrowed(unsafe {
             std::slice::from_raw_parts(self.ptr.as_ptr().add(range.start), range.len())
@@ -790,6 +936,14 @@ impl Memory {
 
     pub fn read_into(&self, addr: u32, destination: &mut [u8]) -> Result<(), String> {
         let range = self.committed(addr, destination.len())?;
+        self.count_read(destination.len());
+        if let Some((storage, offset)) = self.storage_run(&range) {
+            let mut counts = self.host_access.get();
+            counts.shared_copies += 1;
+            self.host_access.set(counts);
+            crate::backend::SharedReadView::copy_into(storage.as_ref(), offset, destination);
+            return Ok(());
+        }
 
         if !self.overlays(&range) {
             // SAFETY: committed ordinary storage and non-aliasing caller output.
@@ -804,20 +958,26 @@ impl Memory {
         }
         let mut at = range.start;
         while at < range.end {
+            let mut counts = self.host_access.get();
+            counts.fallbacks += 1;
+            self.host_access.set(counts);
             let page = at / PAGE_SIZE;
             let len = (PAGE_SIZE - at % PAGE_SIZE).min(range.end - at);
             let output = &mut destination[at - range.start..at - range.start + len];
             if self.perms[page] & AUDIO != 0 {
-                for (index, byte) in output.iter_mut().enumerate() {
-                    // SAFETY: committed linear PCM views stay live for this
-                    // memory borrow. Guest and callback use matching AtomicU8.
-                    *byte = unsafe {
-                        (&*self.ptr.as_ptr().add(at + index).cast::<AtomicU8>())
-                            .load(Ordering::Relaxed)
-                    };
-                }
+                // SAFETY: committed, page-padded PCM alias; all Rust accessors
+                // use the word atomic contract in shared_memory.
+                unsafe { crate::shared_memory::atomic_copy(self.ptr.as_ptr().add(at), output) };
+                let mut counts = self.host_access.get();
+                counts.shared_copies += 1;
+                self.host_access.set(counts);
             } else if let Some(storage) = self.shared_pages.get(&page) {
                 storage.read_into(at % PAGE_SIZE, output)?;
+                if matches!(storage, SharedPage::Storage { .. }) {
+                    let mut counts = self.host_access.get();
+                    counts.shared_copies += 1;
+                    self.host_access.set(counts);
+                }
             } else {
                 // SAFETY: committed ordinary page, valid non-aliasing output.
                 unsafe {
@@ -909,11 +1069,9 @@ impl Memory {
         (allowed && self.mapped[page]).then(|| unsafe { self.ptr.as_ptr().add(offset) })
     }
 
+    #[inline]
     fn overlays(&self, range: &std::ops::Range<usize>) -> bool {
-        !range.is_empty()
-            && self.perms[range.start / PAGE_SIZE..=(range.end - 1) / PAGE_SIZE]
-                .iter()
-                .any(|p| p & SHARED != 0)
+        self.host_range(range).flags & SHARED != 0
     }
 
     pub fn shared_range(&self, address: u32, len: usize) -> bool {
@@ -1021,6 +1179,7 @@ impl Memory {
                 },
             );
         }
+        self.map_generation += 1;
         Arc::make_mut(&mut self.mapped)[pages.clone()].fill(true);
         self.fast.invalidate(pages.clone());
         Arc::make_mut(&mut self.perms)[pages.clone()].fill(READ | WRITE | SHARED);
@@ -1063,6 +1222,7 @@ impl Memory {
                 },
             );
         }
+        self.map_generation += 1;
         Arc::make_mut(&mut self.mapped)[pages.clone()].fill(true);
         self.fast.invalidate(pages.clone());
         Arc::make_mut(&mut self.perms)[pages.clone()].fill(perms | SHARED);
@@ -1116,6 +1276,7 @@ impl Memory {
             );
             return;
         }
+        self.map_generation += 1;
         for page in &mut Arc::make_mut(&mut self.perms)[linear.clone()] {
             *page |= LINEAR;
         }
@@ -1131,6 +1292,7 @@ impl Memory {
         }
         self.attach()?;
         let slack = self.window_slack();
+        self.map_generation += 1;
         let removed = self
             .reservation
             .as_ref()
@@ -1162,6 +1324,7 @@ impl Memory {
             let _ = self.unmap(addr, bytes.len());
             return Err(error);
         }
+        self.map_generation += 1;
         for page in pages.clone() {
             self.private_copy_pages[page] = Some(true);
 
@@ -1199,6 +1362,9 @@ impl Memory {
             .filter_map(|(offset, copy)| (*copy == Some(true)).then_some(begin + offset))
             .collect();
 
+        if !changed.is_empty() {
+            self.map_generation += 1;
+        }
         self.private_copy_epoch += changed.len() as u64;
         for &page in &changed {
             self.private_copy_pages[page] = Some(false);
@@ -1243,6 +1409,7 @@ impl Memory {
                 },
             );
         }
+        self.map_generation += 1;
         Arc::make_mut(&mut self.mapped)[pages.clone()].fill(true);
         self.fast.invalidate(pages.clone());
         Arc::make_mut(&mut self.perms)[pages].fill(perms | SHARED);
@@ -1276,6 +1443,7 @@ impl Memory {
             let _ = self.decommit_pages(page * PAGE_SIZE, PAGE_SIZE);
             return;
         }
+        self.map_generation += 1;
         self.shared_pages.remove(&page);
         self.resident.insert(page, storage);
         Arc::make_mut(&mut self.perms)[page] &= !SHARED;
@@ -1310,7 +1478,7 @@ impl Memory {
     /// the same execution owner retains this memory borrow.
     ///
     /// This does not expose an ordinary shared Rust slice. PCM still requires
-    /// matching byte atomics; executable-page stores stay in the cold lane.
+    /// aligned word atomics; executable-page stores stay in the cold lane.
     pub fn prepare_native_access(
         &mut self,
         addr: u32,
@@ -1363,6 +1531,9 @@ impl Memory {
         if write {
             self.prepare_private_copy_range(range)?;
         }
+        if !private.is_empty() {
+            self.map_generation += 1;
+        }
         for (index, prepared) in private {
             let Some(SharedPage::File {
                 page,
@@ -1406,6 +1577,8 @@ impl Memory {
             self.touch(destination, len);
         }
 
+        self.count_read(len);
+        self.count_write(len);
         // SAFETY: committed ordinary ranges, exclusively borrowed memory, and
         // ptr::copy preserves memmove overlap semantics.
         unsafe {
@@ -1430,6 +1603,7 @@ impl Memory {
                 self.touch(address, len);
             }
 
+            self.count_write(len);
             // SAFETY: a committed ordinary range of exclusively borrowed memory.
             unsafe { std::ptr::write_bytes(self.ptr.as_ptr().add(range.start), byte, len) };
             return Ok(());
@@ -1456,28 +1630,33 @@ impl Memory {
         // Keep ordinary stores allocation-free. Overlay stores resolve every
         // fallible page read and private COW snapshot before committing bytes,
         // so a later I/O failure cannot leave a restarted scalar store half done.
-        if overlays && !range.is_empty() {
+        if overlays && self.host_range(&range).storage_offset.is_none() {
             self.prepare_file_range(&range, true)?;
         }
-        if self.writes_code(&range) {
+        if self.host_range(&range).watched && self.writes_code(&range) {
             self.touch(addr, bytes.len());
         }
 
         if overlays {
+            if let Some((storage, offset)) = self.storage_run(&range) {
+                if !storage.writable() {
+                    return Err("write to a read-only shared file view".into());
+                }
+                storage.store_bytes(offset, bytes);
+                self.count_write(bytes.len());
+                let mut counts = self.host_access.get();
+                counts.shared_copies += 1;
+                self.host_access.set(counts);
+                return Ok(());
+            }
             let mut at = range.start;
             while at < range.end {
                 let page = at / PAGE_SIZE;
                 let len = (PAGE_SIZE - at % PAGE_SIZE).min(range.end - at);
                 let input = &bytes[at - range.start..at - range.start + len];
                 if self.perms[page] & AUDIO != 0 {
-                    for (index, &byte) in input.iter().enumerate() {
-                        // SAFETY: validated live writable OS view and only
-                        // byte-atomic stores, including split word/SIMD writes.
-                        unsafe {
-                            (&*self.ptr.as_ptr().add(at + index).cast::<AtomicU8>())
-                                .store(byte, Ordering::Relaxed)
-                        };
-                    }
+                    // SAFETY: live writable PCM alias, using matching word atomics.
+                    unsafe { crate::shared_memory::atomic_store(self.ptr.as_ptr().add(at), input) };
                 } else if let Some(storage) = self.shared_pages.get_mut(&page) {
                     storage.write(at % PAGE_SIZE, input)?;
                 } else {
@@ -1490,10 +1669,20 @@ impl Memory {
                         )
                     };
                 }
+                let mut counts = self.host_access.get();
+                counts.writes += u64::from(at == range.start);
+                counts.written_bytes += len as u64;
+                counts.fallbacks += 1;
+                counts.shared_copies += u64::from(matches!(
+                    self.shared_pages.get(&page),
+                    Some(SharedPage::Storage { .. })
+                ));
+                self.host_access.set(counts);
                 at += len;
             }
             return Ok(());
         }
+        self.count_write(bytes.len());
         // SAFETY: checked range and exclusive borrow; source cannot alias this allocation.
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -1528,6 +1717,7 @@ impl Memory {
         {
             return Err("executable file views are not supported".into());
         }
+        self.map_generation += 1;
         self.fast
             .invalidate(range.start / PAGE_SIZE..range.end / PAGE_SIZE);
         for page in

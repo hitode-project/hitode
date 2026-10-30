@@ -1,5 +1,4 @@
 //! Guarded bulk execution of REP copies, fills, comparisons and scans.
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Instant;
 
 use iced_x86::{Code, Instruction, OpKind, Register};
@@ -165,7 +164,7 @@ fn execute(bridge: &mut crate::trap::Bridge<'_>, state: &mut CpuState, operation
     if shared {
         // Dedicated device storage must never reach the raw-pointer bulk paths.
         // Preserve full-range permission validation and bounded REP progress;
-        // Audio helpers use byte atomics; worker-owned file views use page copies.
+        // Audio helpers use word atomics; worker-owned file views use page copies.
         if copy
             && memory
                 .prepare_native_access(src, bytes as usize, false)
@@ -295,8 +294,8 @@ fn readable_elements(
 }
 
 /// The complete element and its pages were checked by readable_elements. A wide
-/// guest element on PCM is composed only from matching byte atomic accesses;
-/// concurrent readers may observe a mixture of bytes, as the PCM protocol allows.
+/// guest element on PCM uses the same aligned word atomics as other accessors;
+/// concurrent readers may observe separate words, as the PCM protocol allows.
 #[inline(always)]
 unsafe fn read_element<const KIND: u8>(
     memory: &Memory,
@@ -310,12 +309,10 @@ unsafe fn read_element<const KIND: u8>(
         unsafe { memory.ptr.as_ptr().add((address - memory.base) as usize) }
     };
     if KIND == 1 {
-        let mut value = 0;
-        for byte in 0..width {
-            let atom = unsafe { &*pointer.add(byte as usize).cast::<AtomicU8>() };
-            value |= u32::from(atom.load(Ordering::Relaxed)) << (byte * 8);
-        }
-        value
+        let mut bytes = [0; 4];
+        // SAFETY: readable_elements checked the live PCM pages, including padding.
+        unsafe { crate::shared_memory::atomic_copy(pointer, &mut bytes[..width as usize]) };
+        u32::from_le_bytes(bytes)
     } else {
         unsafe {
             match width {
@@ -359,7 +356,7 @@ struct FileSpan<'a> {
     bytes: &'a [u8],
 }
 
-// Keep the byte-atomic alternatives out of the ordinary loop's optimization
+// Keep the word-atomic alternatives out of the ordinary loop's optimization
 // unit. Width and access modes are fixed for a checked span; dispatch costs one
 // call per page, while no classification or width test runs for each element.
 #[inline(never)]
