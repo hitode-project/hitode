@@ -33,6 +33,7 @@ mod input;
 mod linked;
 mod mixer;
 mod nls;
+mod own_calls;
 mod pixels;
 mod png;
 mod zlib;
@@ -451,17 +452,29 @@ pub(crate) fn bind_relocated(
     else {
         return;
     };
-    if !BODIES
+    let bodies = BODIES
         .iter()
         .chain(dib::BODIES)
         .chain(fonts::BODIES)
-        .any(|body| body.name.starts_with(module.name.as_str()))
-    {
+        .any(|body| body.name.starts_with(module.name.as_str()));
+    let own = own_calls::covers(&module.name);
+    if !bodies && !own {
         return;
     }
     let Some(table) = module.table() else {
         return;
     };
+    let relocated = |address: u32| {
+        relocations
+            .binary_search(&address.wrapping_sub(base))
+            .is_ok()
+    };
+    if own {
+        own_calls::bind(cpu, sys, ext, base, &module.name, &table, relocated);
+    }
+    if !bodies {
+        return;
+    }
     // Text bodies need the runtime's frontend; machines assembled without
     // text services keep Wine's code.
     let text = ext.try_get::<FontFrontend>().is_some();
@@ -478,11 +491,6 @@ pub(crate) fn bind_relocated(
             continue;
         };
         let entry = base + function.rva;
-        let relocated = |address: u32| {
-            relocations
-                .binary_search(&address.wrapping_sub(base))
-                .is_ok()
-        };
         if !identity::intact(cpu, entry, function, relocated) {
             log::debug!("{}: bytes differ from the distribution", body.name);
             continue;
@@ -521,14 +529,13 @@ fn bind_one(
     let length = first.len();
     // A PIC prologue's call observes its original return address. Pushing
     // that address and jumping preserves both the helper and its return.
-    let mut trampoline = if call {
+    let moved = if call {
         let mut code = vec![0x68];
         code.extend_from_slice(&(entry + length as u32).to_le_bytes());
         code
     } else {
         original[..length].to_vec()
     };
-    trampoline.push(0xe9);
     let resume = if call {
         first.near_branch32()
     } else {
@@ -539,20 +546,10 @@ fn bind_one(
         .publish(cpu, MODULE, name)
         .map_err(|e| e.to_string())?;
     let index = sys.thunks.published_index(MODULE, name).ok_or("no thunk")?;
-    let trampolines = ext.get_or_default::<Trampolines>();
-    if trampolines.page == 0 || trampolines.used + trampoline.len() as u32 + 4 > PAGE {
-        trampolines.page = sys
-            .vm
-            .alloc(cpu, PAGE, Prot::RWX)
-            .map_err(|e| e.to_string())?;
-        trampolines.used = 0;
-    }
-    let at = trampolines.page + trampolines.used;
-    let next = at + trampoline.len() as u32 + 4;
-    trampoline.extend_from_slice(&resume.wrapping_sub(next).to_le_bytes());
-    cpu.write(at, &trampoline).map_err(|e| e.to_string())?;
-    trampolines.used = next - trampolines.page;
-    trampolines.by_thunk.insert(index, at);
+    let at = trampoline(cpu, sys, ext, moved, resume)?;
+    ext.get_or_default::<Trampolines>()
+        .by_thunk
+        .insert(index, at);
     let target = if name == "dsound.dll!DSOUND_MixToPrimary" {
         mixer::entry(cpu, sys, thunk)?
     } else if name.starts_with("win32u.so!halftone_") {
@@ -562,6 +559,32 @@ fn bind_one(
     };
     sys.redirects.insert(entry, (target, original.into()));
     Ok(())
+}
+
+/// Places `code` followed by a jump to `resume` in the process's trampoline
+/// pages, and returns its address.
+fn trampoline(
+    cpu: &mut dyn Guest,
+    sys: &mut Sys,
+    ext: &mut Ext,
+    mut code: Vec<u8>,
+    resume: u32,
+) -> Result<u32, String> {
+    code.push(0xe9);
+    let trampolines = ext.get_or_default::<Trampolines>();
+    if trampolines.page == 0 || trampolines.used + code.len() as u32 + 4 > PAGE {
+        trampolines.page = sys
+            .vm
+            .alloc(cpu, PAGE, Prot::RWX)
+            .map_err(|e| e.to_string())?;
+        trampolines.used = 0;
+    }
+    let at = trampolines.page + trampolines.used;
+    let next = at + code.len() as u32 + 4;
+    code.extend_from_slice(&resume.wrapping_sub(next).to_le_bytes());
+    cpu.write(at, &code).map_err(|e| e.to_string())?;
+    trampolines.used = next - trampolines.page;
+    Ok(at)
 }
 
 /// The ordinary handler of a body's thunk, entered when the body declined:
