@@ -35,6 +35,7 @@ impl CpuFaultSnapshot {
             FaultKind::Fetch(_) => "fetch",
             FaultKind::InvalidInstruction => "invalid_instruction",
             FaultKind::IntegerDivideByZero => "integer_divide_by_zero",
+            FaultKind::Trap(_) => "trap",
             FaultKind::Other(_) => "other",
         }
     }

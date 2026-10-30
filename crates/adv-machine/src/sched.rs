@@ -637,6 +637,7 @@ mod active_tests {
             recent: RecentCalls::new(256),
             host_calls: 0,
             redirects: HashMap::new(),
+            redirect_checks: Default::default(),
             required_redirects: Default::default(),
             direct_bodies: HashMap::new(),
             call_limit: None,

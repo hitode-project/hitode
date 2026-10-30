@@ -83,6 +83,7 @@ impl Trace {
                 FaultKind::Fetch(address) => ("fetch", Some(("execute", *address))),
                 FaultKind::InvalidInstruction => ("invalid_instruction", None),
                 FaultKind::IntegerDivideByZero => ("integer_divide_by_zero", None),
+                FaultKind::Trap(_) => ("trap", None),
                 FaultKind::Other(_) => ("other", None),
             };
             let _ = write!(

@@ -24,6 +24,20 @@ pub fn map(
     event: &Exception,
     state: &ArchitecturalState,
 ) -> Result<Record, String> {
+    if let Exception::Fault(adv_cpu::backend::Fault {
+        kind: FaultKind::Trap(vector),
+        pc,
+    }) = event
+    {
+        return map_stop(
+            cpu,
+            &Exception::Trap {
+                vector: *vector,
+                pc: *pc,
+            },
+            state,
+        );
+    }
     let pc = match event {
         Exception::Fault(fault) => fault.pc,
         Exception::Trap { pc, .. } => *pc,
@@ -73,6 +87,7 @@ fn map_stop(
             }
             FaultKind::InvalidInstruction => ILLEGAL_INSTRUCTION,
             FaultKind::IntegerDivideByZero => INTEGER_DIVIDE_BY_ZERO,
+            FaultKind::Trap(_) => unreachable!("normalized architectural trap"),
             FaultKind::Other(reason) => {
                 if matches!(
                     instruction(cpu, pc).mnemonic(),

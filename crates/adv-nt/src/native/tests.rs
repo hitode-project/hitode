@@ -5,8 +5,8 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
 thread_local! {
-    static COUNTING: Cell<bool> = const { Cell::new(false) };
-    static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+    pub(super) static COUNTING: Cell<bool> = const { Cell::new(false) };
+    pub(super) static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
 }
 struct Allocator;
 #[global_allocator]
@@ -235,7 +235,11 @@ fn native_body_decline_allocation_gate() {
                         _ => panic!("{} failed on its full path", body.name),
                     },
                     (Some(function), None) => function(&mut env).is_none(),
-                    (None, None) => panic!("{} has no body", body.name),
+                    (None, None) => match (body.handler)(&mut env) {
+                        Outcome::Raise(_) => true,
+                        Outcome::Return(_) => false,
+                        _ => panic!("{} failed on its host path", body.name),
+                    },
                 };
                 COUNTING.set(false);
                 let allocations = ALLOCATIONS.get();

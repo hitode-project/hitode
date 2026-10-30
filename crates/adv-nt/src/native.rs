@@ -249,9 +249,9 @@ static BODIES: std::sync::LazyLock<Vec<Body>> = std::sync::LazyLock::new(|| {
         },
         Body {
             name: "dsound.dll!DSOUND_MixToPrimary".into(),
-            conv: Conv::Cdecl { argc: 6 },
-            body: Some(mixer::mix),
-            handler: mixer::resume,
+            conv: Conv::Cdecl { argc: 1 },
+            body: None,
+            handler: mixer::mix,
             direct: None,
         },
         Body {
@@ -651,7 +651,8 @@ fn bind_one(
         .by_thunk
         .insert(index, at);
     let target = if name == "dsound.dll!DSOUND_MixToPrimary" {
-        mixer::entry(cpu, sys, thunk)?
+        mixer::prepare(cpu, sys, ext, entry)?;
+        thunk
     } else if name.starts_with("win32u.so!halftone_") {
         dib::entry(cpu, sys, thunk)?
     } else {

@@ -533,6 +533,9 @@ impl ExecutionTrap for Raw<'_> {
     fn redirect(&self, pc: u32) -> Option<(u32, &[u8])> {
         self.handler.redirect(pc)
     }
+    fn redirect_checks(&self, pc: u32) -> &[(u32, Box<[u8]>)] {
+        self.handler.redirect_checks(pc)
+    }
     fn required_redirect(&self, pc: u32) -> Option<(u32, &[u8])> {
         self.handler.required_redirect(pc)
     }
