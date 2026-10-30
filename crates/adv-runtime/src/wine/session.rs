@@ -438,6 +438,13 @@ fn new_machine(
     machine.ext.insert(audio.clone());
     adv_drv::media::set_wake(&mut machine.ext, wake.clone());
     super::install(&mut machine, drive, config.width, config.height)?;
+    // Sessions replace this with their configured fonts; booting needs none
+    // and must not wait for system discovery.
+    super::fonts::install(
+        &mut machine,
+        adv_device::text::Text::with_font_directories(&[]),
+        config.locale,
+    );
     Ok(machine)
 }
 
@@ -669,7 +676,6 @@ impl Session {
         // what `--init` installs, and no services run.
         let audio = adv_device::AudioControl::new(true);
         if !host.booted() {
-            fonts::clear_links(&drive)?;
             let mut boot = new_machine(&process_config, &drive, clock.clone(), &wake, &audio)?;
             boot.ext.insert(mounts.clone());
             let command_line = format!("\"{WINEBOOT}\" --restart");
@@ -1103,7 +1109,7 @@ impl Session {
                 &self.wake,
                 &self.audio,
             )?;
-            self.fonts.configure(&mut machine);
+            self.fonts.configure(&mut machine)?;
             adv_drv::codec::install(&mut machine.ext, adv_drv::codec::mode(&self.machine.ext));
             machine.inherit_policy(&self.machine);
             machine.sys.frame_pacer = self.machine.sys.frame_pacer.clone();

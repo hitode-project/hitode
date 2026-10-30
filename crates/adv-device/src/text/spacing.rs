@@ -9,10 +9,16 @@ impl Text {
         request: &FontRequest,
         code: u16,
     ) -> Result<i32, TextError> {
-        let _ = (request, code);
-        Err(TextError::Glyph(
-            "encoded character advances are unavailable on this text backend".into(),
-        ))
+        self.glyph(
+            request,
+            GlyphRequest {
+                character: Character::Encoded(u32::from(code)),
+                format: GlyphFormat::Metrics,
+                hinted: true,
+                transform: Transform::IDENTITY,
+            },
+        )
+        .map(|g| i32::from(g.metrics.advance_x))
     }
     /// Consecutive Unicode units, including NUL and missing/default characters.
     /// This measures individual advances, independently of string shaping.

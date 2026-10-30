@@ -157,6 +157,8 @@ pub struct Sys {
     /// entry, with the bytes the function begins with
     /// ([`adv_cpu::backend::TrapHandler::redirect`]).
     pub redirects: HashMap<u32, (u32, Box<[u8]>)>,
+    /// Entries supplied by required host services in both execution modes.
+    pub required_redirects: std::collections::HashSet<u32>,
     /// Stop with an error after this many host calls (a debugging aid for guest loops that
     /// never block).
     pub call_limit: Option<u64>,
@@ -1749,7 +1751,9 @@ impl Dispatch<'_> {
 
 impl TrapHandler for Dispatch<'_> {
     fn native_region(&self, pc: u32, code: &[u8]) -> Vec<adv_cpu::native_region::NativeRegion> {
-        if self.sys.trace.enabled() || self.sys.call_limit.is_some() {
+        if !self.sys.required_redirects.contains(&pc)
+            && (self.sys.trace.enabled() || self.sys.call_limit.is_some())
+        {
             return Vec::new();
         }
         self.ext
@@ -1777,6 +1781,14 @@ impl TrapHandler for Dispatch<'_> {
 
     fn redirect(&self, pc: u32) -> Option<(u32, &[u8])> {
         if self.sys.trace.enabled() || self.sys.call_limit.is_some() {
+            return None;
+        }
+        let (target, original) = self.sys.redirects.get(&pc)?;
+        Some((*target, original))
+    }
+
+    fn required_redirect(&self, pc: u32) -> Option<(u32, &[u8])> {
+        if !self.sys.required_redirects.contains(&pc) {
             return None;
         }
         let (target, original) = self.sys.redirects.get(&pc)?;
@@ -1987,6 +1999,7 @@ impl<B: Backend> Machine<B> {
             recent: RecentCalls::new(256),
             host_calls: 0,
             redirects: HashMap::new(),
+            required_redirects: Default::default(),
             call_limit: None,
             stats: Stats::new(),
             schedule_trace: schedule_trace::ScheduleTrace::default(),

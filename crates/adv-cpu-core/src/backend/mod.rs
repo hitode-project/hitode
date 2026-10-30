@@ -448,6 +448,11 @@ pub trait TrapHandler {
         None
     }
 
+    /// Required host services also replace their entry in interpreted runs.
+    fn required_redirect(&self, _pc: u32) -> Option<(u32, &[u8])> {
+        None
+    }
+
     /// The execution owner's guest clock, when one is installed. CPU reference
     /// counters use the same domain as guest OS time; this is not device time.
     /// A standalone backend may use its own reference clock when absent.

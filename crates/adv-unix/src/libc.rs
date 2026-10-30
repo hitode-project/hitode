@@ -4,8 +4,8 @@
 //! Functions whose behavior ntdll.dll's C runtime exports share, such as
 //! `memcpy` or `cos`, bind to those exports ([`shared_with_ntdll`]). The
 //! heap is the process heap. The rest are host functions with glibc's
-//! semantics. FreeType is built into the host; other shared libraries load
-//! from Wine's Unix directory. Files opened as streams are absent.
+//! semantics. Shared libraries load from Wine's Unix directory. Files opened
+//! as streams are absent.
 
 use adv_cpu::backend::{GuestExt, Reg};
 use adv_machine::layout::teb;
@@ -81,7 +81,7 @@ fn string(env: &Env<'_>, address: u32, max: usize) -> Result<Vec<u8>, String> {
 
 /// Calls ntdll.dll's heap function `name` on the process heap with
 /// `args` after the heap, and passes on its result.
-pub(crate) fn heap_call(
+fn heap_call(
     env: &mut Env<'_>,
     name: &str,
     args: &[u32],
@@ -634,21 +634,14 @@ fn fopen(env: &mut Env<'_>) -> Outcome {
 }
 
 /// dlopen(name, flags): the shared libraries present are those next to
-/// the Unix libraries of Wine's modules, or the built-in host FreeType.
+/// the Unix libraries of Wine's modules.
 fn dlopen(env: &mut Env<'_>) -> Outcome {
     let name = match string(env, env.arg(0), MAX_STRING) {
         Ok(name) => PathBuf::from(OsString::from_vec(name)),
         Err(error) => return Outcome::Fail(format!("dlopen: {error}")),
     };
-    if name == Path::new(crate::freetype::SONAME) {
-        return Outcome::Return(crate::freetype::HANDLE);
-    }
     let libraries = env.ext.get_or_default::<Libraries>();
-    let directory = libraries.0.first().and_then(|first| first.path.parent());
-    let path = match directory {
-        Some(directory) if name.parent() == Some(Path::new("")) => directory.join(&name),
-        _ => name,
-    };
+    let path = search_path(libraries.0.first().map(|first| first.path.as_path()), name);
     let shown = path.clone();
     loader::open(
         env,
@@ -662,6 +655,14 @@ fn dlopen(env: &mut Env<'_>) -> Outcome {
     )
 }
 
+/// Where `dlopen` looks for `name`: bare names next to the first Unix library.
+fn search_path(first: Option<&Path>, name: PathBuf) -> PathBuf {
+    match first.and_then(Path::parent) {
+        Some(directory) if name.parent() == Some(Path::new("")) => directory.join(&name),
+        _ => name,
+    }
+}
+
 /// dlsym(handle, name): a symbol of the library `handle` names, or of any
 /// for RTLD_DEFAULT.
 fn dlsym(env: &mut Env<'_>) -> Outcome {
@@ -670,19 +671,6 @@ fn dlsym(env: &mut Env<'_>) -> Outcome {
         Ok(name) => String::from_utf8_lossy(&name).into_owned(),
         Err(error) => return Outcome::Fail(format!("dlsym: {error}")),
     };
-    if handle == crate::freetype::HANDLE {
-        if crate::freetype::function(&name).is_none() {
-            return Outcome::Return(0);
-        }
-        return match env
-            .sys
-            .thunks
-            .resolve(env.cpu, crate::freetype::SONAME, &name)
-        {
-            Ok(address) => Outcome::Return(address),
-            _ => Outcome::Return(0),
-        };
-    }
     let libraries = &env.ext.get_or_default::<Libraries>().0;
     let address = libraries
         .iter()
@@ -721,6 +709,24 @@ mod tests {
     use adv_machine::{Clock, Machine, layout::PARK_ADDR};
     #[cfg(any(target_vendor = "apple", target_os = "android"))]
     use adv_wineserver as _;
+
+    // spec: WINE-UNIX-4
+    #[test]
+    fn bare_names_resolve_next_to_the_unix_libraries() {
+        let first = Path::new("/wine/lib/wine/i386-unix/ntdll.so");
+        assert_eq!(
+            search_path(Some(first), "libexample.so".into()),
+            Path::new("/wine/lib/wine/i386-unix/libexample.so")
+        );
+        assert_eq!(
+            search_path(Some(first), "/usr/lib/libexample.so".into()),
+            Path::new("/usr/lib/libexample.so")
+        );
+        assert_eq!(
+            search_path(None, "libexample.so".into()),
+            Path::new("libexample.so")
+        );
+    }
 
     // spec: WINE-UNIX-5
     #[test]

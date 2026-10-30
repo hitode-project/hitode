@@ -303,18 +303,19 @@ An ntdll.dll export with no known convention stops the load. A weak symbol nothi
 **Rule**: Except for host libraries, `dlopen` of a bare name MUST look next to the Unix libraries already loaded. A Unix library MUST open host files only for reading, and map them as shared read-only views. `ntdll_get_data_dir` MUST name `share/wine` of that installation.
 **Verification**: Test
 
-FreeType is a host library under WINE-UNIX-6.
+The host owns text services under WINE-UNIX-6.
 
 ### WINE-UNIX-5 Fixed-point formatting
 
 **Rule**: Unix library printf-family functions MUST consume `%f` and `%F` arguments as i386 doubles, preserving flags, width, precision and following arguments. Bounded output MUST retain the full formatted length and terminate any nonempty buffer.
 **Verification**: Test
 
-### WINE-UNIX-6 Host FreeType
+### WINE-UNIX-6 Host font frontend
 
-**Rule**: Wine's `libfreetype.so.6` requests MUST resolve to host FreeType 2.13.2 with the distribution's rendering defaults. Guest records and referenced buffers MUST use i386 layouts in guest heap memory and reflect completed host mutations. Glyph bytes, metrics and function results MUST match the distribution's i386 FreeType.
+**Rule**: Host font services MUST own font data, text layout, text composition, and DirectWrite glyphs. Wine's font module and FreeType paths MUST remain dormant. Every face MUST appear as TrueType to the guest.
 **Verification**: Test
-**Basis**: Wine 11.0 `win32u/freetype.c` and FreeType 2.13.2 public headers.
+
+Native font initialization also fills win32u's ANSI, OEM and UTF-8 code page tables from the PEB, as Wine's does.
 
 ## Threads
 
@@ -367,8 +368,10 @@ FreeType is a host library under WINE-UNIX-6.
 
 ### NAT-BODY-1 Body semantics
 
-**Rule**: A native body that accepts a call MUST leave the guest state Wine's function would leave. Registers and flags the calling convention does not keep are exempt. Otherwise it MUST decline before any side effect, and the call MUST run Wine's function from its entry with the caller's frame.
+**Rule**: An ordinary native body that accepts a call MUST leave the guest state Wine's function would leave. Registers and flags the calling convention does not keep are exempt. Otherwise it MUST decline before any side effect, and the call MUST run Wine's function from its entry with the caller's frame.
 **Verification**: Test
+
+Required host text services follow WINE-UNIX-6 in interpreted and translated execution.
 
 ### NAT-BODY-2 Performance counter body
 
@@ -692,12 +695,8 @@ UI projection refreshes MUST wake execution only when they queue new guest work.
 
 ### WINE-SES-5 Regional text
 
-**Rule**: Session locales MUST follow the ANSI code page: ja-JP for 932, zh-CN for 936. Wine MUST load portable-backend fonts whose declared CJK sets map a sample character. Missing standard families MUST take a face with their character set, never override installed families, and rank CJK by regional order before TrueType.
+**Rule**: Session locales MUST follow the ANSI code page: ja-JP for 932, zh-CN for 936. Text MUST use portable matching and regional replacements without overriding installed families. Font discovery MUST be shared across sessions and scan each directory once per process.
 **Verification**: Test
-
-macOS simplified Chinese matching prefers Heiti SC before Songti SC. Songti's
-Black and Bold faces also declare the Regular selection flag; Wine can choose
-Black for a normal-weight request to that family.
 
 ### WINE-SES-6 Installed system subdirectories
 
@@ -711,7 +710,7 @@ Black for a normal-weight request to that family.
 
 ### WINE-SES-8 Host font choices
 
-**Rule**: Explicit host font choices MUST override matching font-creation requests without changing caller buffers, including when the requested family is installed. Font files, substitutions, and smoothing MUST apply before rendering and follow child processes. Session font links, replacements, substitutions, and smoothing MUST NOT affect later sessions.
+**Rule**: Explicit host font choices MUST override matching font-creation requests without changing caller buffers, including when the requested family is installed. Font files, substitutions, and smoothing MUST apply before rendering and follow child processes. Session font resources, substitutions, and smoothing MUST NOT affect later sessions.
 **Verification**: Test
 
 ### WINE-SES-9 Mounted file ownership

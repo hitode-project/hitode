@@ -131,7 +131,11 @@ fn extended_enumeration_filters_declared_repertoires_and_keeps_real_signatures()
 fn legacy_family_names_select_and_enumerate_like_gdi() {
     let mut text = Text::with_font_directories(&[]);
     text.add_file_resource(SINGLE, true).unwrap();
+    // Repeated enumerations are served from a cache that resource changes drop.
+    let before = installed(text.enumerate(None, FontEnumeration::Families).unwrap()).len();
     text.add_file_resource(LEGACY, true).unwrap();
+    let after = installed(text.enumerate(None, FontEnumeration::Families).unwrap()).len();
+    assert_eq!((before, after), (1, 2));
     for name in ["测试字体 Medium", "adv resource fixture medium"] {
         let metrics = text.metrics(&font(name)).unwrap();
         assert_eq!((metrics.height, metrics.ascent), (48, 40), "{name}");
@@ -1074,12 +1078,15 @@ fn clipping_background_alignment_and_pixel_formats_preserve_storage() {
                 bytes: &mut bytes
             }
         )
-        .is_err()
+        .is_ok()
     );
-    assert_eq!(
-        bytes, before,
-        "unsupported run cannot partly paint its background"
+    assert!(
+        bytes
+            .chunks(4)
+            .all(|pixel| pixel[..3] == [0; 3] || pixel[..3] == [255; 3]),
+        "an unshaped run fills its whole background and inks the glyph"
     );
+    assert_ne!(bytes, before);
 }
 
 struct Memory(Vec<u8>);

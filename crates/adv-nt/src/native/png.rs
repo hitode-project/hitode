@@ -26,7 +26,7 @@ pub(super) fn bodies() -> Vec<super::Body> {
         .map(|(name, body)| super::Body {
             name: format!("windowscodecs.dll!{name}").into(),
             conv: Conv::Cdecl { argc: 3 },
-            body: *body,
+            body: Some(*body),
             handler: super::resume_original,
         })
         .collect()

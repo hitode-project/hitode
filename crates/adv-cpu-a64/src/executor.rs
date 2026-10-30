@@ -556,6 +556,16 @@ impl Executor {
             {
                 self.state.rep = None;
             }
+            if let Some(handler) = bridge.handler.as_ref()
+                && let Some((target, original)) = handler.required_redirect(self.state.eip)
+                && self
+                    .memory
+                    .read_data(self.state.eip, original.len())
+                    .is_ok_and(|bytes| bytes.as_ref() == original)
+            {
+                self.state.eip = target;
+                continue;
+            }
             let single_step = self.state.eflags & (1 << 8) != 0;
             // A restored TF or RF needs precise instruction boundaries.
             let precise_flags = self.state.eflags & ((1 << 8) | (1 << 16)) != 0;
@@ -564,9 +574,9 @@ impl Executor {
                 trace.prepare(units, &self.state, &self.memory)
             });
             let (execution, last_units) = if precise_flags || observed.is_some() {
-                let execution =
-                    self.interpreter
-                        .run_chunk(&mut self.state, &mut self.memory, units);
+                let execution = self
+                    .interpreter
+                    .run_chunk(&mut self.state, &mut self.memory, 1);
                 (execution, execution.units)
             } else if let Some(exit) = self.run_native(stop, bridge)? {
                 match exit {

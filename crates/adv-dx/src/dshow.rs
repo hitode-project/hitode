@@ -115,6 +115,12 @@ pub(crate) const IID_IMEDIAPOSITION: Iid = quartz(0x56a8_68b2);
 pub(crate) const IID_IBASICAUDIO: Iid = quartz(0x56a8_68b3);
 pub(crate) const IID_IVIDEOWINDOW: Iid = quartz(0x56a8_68b4);
 pub(crate) const IID_IBASICVIDEO: Iid = quartz(0x56a8_68b5);
+pub(crate) const IID_IOBJECTWITHSITE: Iid = guid(
+    0xfc48_01a3,
+    0x2ba9,
+    0x11cf,
+    [0xa2, 0x29, 0x00, 0xaa, 0x00, 0x3d, 0x73, 0x52],
+);
 pub(crate) const IID_IMEDIAFILTER: Iid = quartz(0x56a8_6899);
 pub(crate) const IID_IBASEFILTER: Iid = quartz(0x56a8_6895);
 pub(crate) const IID_IENUMFILTERS: Iid = quartz(0x56a8_6893);
@@ -183,6 +189,14 @@ const CLSID_MPEG_AUDIO_CODEC: Iid = guid(
     0x11ce,
     [0x9b, 0xd9, 0x00, 0x00, 0xe2, 0x02, 0x59, 0x9c],
 );
+/// qasf's WM ASF Reader: a file source whose Load hands the file to the
+/// common decoder, so Windows Media streams render natively.
+pub(crate) const CLSID_WMASF_READER: Iid = guid(
+    0x1874_63a0,
+    0x5bb7,
+    0x11d3,
+    [0xac, 0xbe, 0x00, 0x80, 0xc7, 0x5e, 0x24, 0x6e],
+);
 const CLSID_DSOUND_RENDER: Iid = guid(
     0x7937_6820,
     0x07d0,
@@ -210,6 +224,7 @@ pub(crate) enum Face {
     BasicVideo,
     VideoWindow,
     MediaFilter,
+    ObjectWithSite,
     BaseFilter,
     FileSource,
     EnumFilters,
@@ -222,7 +237,7 @@ pub(crate) enum Face {
     DmoWrapper,
 }
 
-const FACES: [(Face, &str); 20] = [
+const FACES: [(Face, &str); 21] = [
     (Face::FilterGraph, "IFilterGraph2"),
     (Face::MediaControl, "IMediaControl"),
     (Face::MediaEvent, "IMediaEventEx"),
@@ -233,6 +248,7 @@ const FACES: [(Face, &str); 20] = [
     (Face::BasicVideo, "IBasicVideo"),
     (Face::VideoWindow, "IVideoWindow"),
     (Face::MediaFilter, "IMediaFilter"),
+    (Face::ObjectWithSite, "IObjectWithSite"),
     (Face::BaseFilter, "IBaseFilter"),
     (Face::FileSource, "IFileSourceFilter"),
     (Face::EnumFilters, "IEnumFilters"),
@@ -262,6 +278,7 @@ impl Face {
             Face::BasicVideo => &[IID_IBASICVIDEO],
             Face::VideoWindow => &[IID_IVIDEOWINDOW],
             Face::MediaFilter => &[IID_IMEDIAFILTER, IID_IPERSIST],
+            Face::ObjectWithSite => &[IID_IOBJECTWITHSITE],
             Face::BaseFilter => &[IID_IBASEFILTER, IID_IMEDIAFILTER, IID_IPERSIST],
             Face::FileSource => &[IID_IFILESOURCEFILTER],
             Face::EnumFilters => &[IID_IENUMFILTERS],
@@ -369,6 +386,7 @@ pub fn install<B: adv_cpu::backend::Backend>(m: &mut adv_machine::Machine<B>) {
     classes.register(CLSID_DSOUND_RENDER, filter::create_audio_renderer);
     classes.register(CLSID_AUDIO_RENDER, filter::create_audio_renderer);
     classes.register(dmo::CLSID_DMO_WRAPPER, dmo::create);
+    classes.register(CLSID_WMASF_READER, filter::create_asf_reader);
 }
 
 /// Classes exported by the native graph front. Wine retains its audio
@@ -381,6 +399,7 @@ pub fn has_graph_class(class: &Iid) -> bool {
         CLSID_MPEG_VIDEO_CODEC,
         CLSID_MPEG_AUDIO_CODEC,
         dmo::CLSID_DMO_WRAPPER,
+        CLSID_WMASF_READER,
     ]
     .contains(class)
 }
@@ -609,7 +628,8 @@ fn dispatch(env: &mut Env<'_>) -> Outcome {
         | Face::BasicAudio
         | Face::BasicVideo
         | Face::VideoWindow
-        | Face::MediaFilter => graph::call(env, face, &method, this),
+        | Face::MediaFilter
+        | Face::ObjectWithSite => graph::call(env, face, &method, this),
         Face::BaseFilter
         | Face::FileSource
         | Face::EnumFilters

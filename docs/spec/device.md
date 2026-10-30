@@ -172,7 +172,7 @@ Unmatched libraries MUST execute their guest implementations.
 
 ### DEV-FONT-1 Font selection
 
-**Rule**: Font services MUST preserve guest-font priority and code-page rules unless the host explicitly selects a replacement family. Host replacements MUST apply consistently to metrics and drawing, and changes MUST invalidate cached fonts and glyphs. Caching MUST remain below observable API entry points.
+**Rule**: Font services MUST preserve guest-font priority and code-page rules unless the host explicitly selects a replacement family. Host replacements MUST apply consistently to metrics and drawing, with caches kept below observable API entry points and dropped on any change. Cubic outlines requested as quadratic MUST use uniform midpoint quadratics within 1/16 pixel, using at most 16 pieces per cubic.
 **Verification**: Test
 
 ### DEV-FONT-2 Font resource budgets

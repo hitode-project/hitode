@@ -6,14 +6,12 @@
 //! object into the guest like the PE images around it. Most of what it
 //! imports from ntdll.so binds to ntdll.dll's exports of the same name; the
 //! rest of ntdll.so, and the parts of the C library the libraries use, are
-//! host functions. FreeType is built into the host with i386 mirrors of
-//! the public records win32u reads.
+//! host functions. Text services are supplied by the runtime font frontend.
 #![cfg(unix)]
 
 pub mod builtin;
 pub mod elf;
 mod file;
-mod freetype;
 mod libc;
 pub mod loader;
 mod ntdll;
@@ -44,7 +42,6 @@ impl Resolver for Platform {
             LIBC | LIBM => libc::function(name)
                 .or_else(|| file::function(name))
                 .or_else(|| pthread::function(name))?,
-            freetype::SONAME => freetype::function(name)?,
             _ => return None,
         };
         Some(HostFn {
@@ -58,7 +55,7 @@ impl Resolver for Platform {
     }
 
     fn provides(&self, module: &str) -> bool {
-        matches!(module, NTDLL | LIBC | LIBM | freetype::SONAME)
+        matches!(module, NTDLL | LIBC | LIBM)
     }
 }
 

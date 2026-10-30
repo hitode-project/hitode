@@ -1,4 +1,5 @@
-/* Authored font discovery, aliases, TrueType enumeration and glyph pixels.
+/* Authored font discovery, aliases, TrueType enumeration of TrueType and CFF
+ * faces, and glyph pixels.
  * Build: i686-w64-mingw32-gcc -O2 -Wall fonts.c -o fonts.exe -lgdi32 */
 #include <windows.h>
 #include <stdio.h>
@@ -121,6 +122,11 @@ int main(int argc, char **argv)
     };
     for (i = 0; i < sizeof(names) / sizeof(names[0]); ++i) ok &= check_face(dc, names[i]);
     printf("aliases=%d\n", ok);
+    /* A CFF face enumerates and rasterizes as TrueType, like the standard
+       families games filter for. */
+    i = check_face(dc, L"ADV Japanese CFF Fixture");
+    printf("cff=%d\n", i);
+    ok &= i;
     SelectObject(dc, bitmap);
     ZeroMemory(pixels, 64 * 48 * 4);
     font = CreateFontW(-32, 0, 0, 0, 400, 0, 0, 0, SHIFTJIS_CHARSET,
@@ -144,6 +150,24 @@ int main(int argc, char **argv)
     printf("private=%d\n", size.cx == 20);
     SelectObject(dc, old);
     DeleteObject(font);
+    {
+        /* ANSI window text converts through win32u's code page tables. */
+        WNDCLASSA wc = {0};
+        char title[8] = {0};
+        HWND window;
+        wc.lpfnWndProc = DefWindowProcA;
+        wc.hInstance = GetModuleHandleA(NULL);
+        wc.lpszClassName = "adv-ansi";
+        RegisterClassA(&wc);
+        window = CreateWindowExA(0, "adv-ansi", "\x82\xa0", 0, 0, 0, 1, 1,
+                                 NULL, NULL, wc.hInstance, NULL);
+        i = window && GetWindowTextLengthA(window) == 2
+            && GetWindowTextA(window, title, sizeof(title)) == 2
+            && !strcmp(title, "\x82\xa0");
+        printf("ansi=%d\n", i);
+        ok &= i;
+        DestroyWindow(window);
+    }
     DeleteDC(dc);
     DeleteObject(bitmap);
     return ok ? 0 : 1;

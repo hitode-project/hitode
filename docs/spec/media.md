@@ -48,12 +48,12 @@ This spec covers the native audio and video API front ends: DirectSound storage,
 
 ### MEDIA-GRAPH-1 Graph interfaces
 
-**Rule**: Graph interfaces MUST share identity and state for connection, playback, events, seeking, position, volume, and event reception. System splitting and decoding MUST use the common media decoder.
+**Rule**: Graph interfaces MUST share identity and state for connection, playback, events, seeking, position, volume, and event reception. The graph MUST hold one reference to its IObjectWithSite site, which GetSite queries, until replaced or released. System splitting and decoding MUST use the common media decoder.
 **Verification**: Test
 
 ### MEDIA-GRAPH-2 File sources
 
-**Rule**: AddSourceFilter MUST use ordinary guest file APIs and reject missing, unsupported, or invalid inputs without publishing a source. The decoder-owning filter MUST retain the file sharing lock until release.
+**Rule**: AddSourceFilter MUST use ordinary guest file APIs and reject missing, unsupported, or invalid inputs without publishing a source. The WM ASF Reader class MUST be this file source, loaded through IFileSourceFilter. The decoder-owning filter MUST retain the file sharing lock until release.
 **Verification**: Test
 
 ### MEDIA-GRAPH-3 Render negotiation
@@ -85,7 +85,7 @@ This spec covers the native audio and video API front ends: DirectSound storage,
 
 ### MEDIA-STREAM-1 Pull delivery
 
-**Rule**: IAsyncReader sources MUST connect through host filters and negotiate RGB32, RGB24, RGB565, or RGB555 with guest renderers and host allocators. Video delivery MUST run on a dedicated guest thread using graph time, with audio entering the shared mixer.
+**Rule**: IAsyncReader sources MUST connect through host filters and negotiate RGB32, RGB24, RGB565, or RGB555 with guest renderers and host allocators. Video delivery MUST run on a dedicated guest thread using graph time, with audio entering the shared mixer. Rewinding MUST restart decoding at the first packet of every container.
 **Verification**: Test
 
 ### MEDIA-STREAM-2 Rejected push

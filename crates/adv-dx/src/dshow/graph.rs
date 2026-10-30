@@ -20,6 +20,7 @@ const AM_MEDIAEVENT_NONOTIFY: u32 = 1;
 const EC_USERABORT: u32 = 2;
 const EC_ERRORABORT: u32 = 3;
 const E_ABORT: u32 = 0x8000_4004;
+const E_FAIL: u32 = 0x8000_4005;
 const TIME_FORMAT_MEDIA_TIME: Iid = guid(
     0x7b78_5574,
     0x8c82,
@@ -37,9 +38,12 @@ pub(crate) struct Member {
 
 pub(crate) struct Graph {
     /// IFilterGraph2, IMediaControl, IMediaEventEx, IMediaSeeking, IMediaPosition,
-    /// IBasicAudio, IMediaEventSink, IMediaFilter, IBasicVideo, IVideoWindow.
+    /// IBasicAudio, IMediaEventSink, IMediaFilter, IBasicVideo, IVideoWindow,
+    /// IObjectWithSite.
     pub faces: Vec<u32>,
     pub members: Vec<Member>,
+    /// The guest site set through IObjectWithSite, holding one reference.
+    site: u32,
     pub state: u32,
     events: VecDeque<(u32, u32, u32)>,
     event: Handle,
@@ -85,7 +89,7 @@ impl Graph {
     }
 }
 
-const GRAPH_FACES: [Face; 10] = [
+const GRAPH_FACES: [Face; 11] = [
     Face::FilterGraph,
     Face::MediaControl,
     Face::MediaEvent,
@@ -96,6 +100,7 @@ const GRAPH_FACES: [Face; 10] = [
     Face::MediaFilter,
     Face::BasicVideo,
     Face::VideoWindow,
+    Face::ObjectWithSite,
 ];
 
 pub(crate) fn create(env: &mut Env<'_>, iid: Iid, outer: u32, output: u32) -> Outcome {
@@ -124,6 +129,7 @@ pub(crate) fn create(env: &mut Env<'_>, iid: Iid, outer: u32, output: u32) -> Ou
         Graph {
             faces,
             members: Vec::new(),
+            site: 0,
             state: STOPPED,
             events: VecDeque::new(),
             event,
@@ -207,6 +213,10 @@ fn teardown(env: &mut Env<'_>, graph: u32, then: Then) -> Outcome {
             calls.push_back(Call(filter, 2, vec![]));
         }
     }
+    let site = std::mem::take(&mut g(env, graph).site);
+    if site != 0 {
+        calls.push_back(Call(site, 2, vec![]));
+    }
     state(env).graphs.get_mut(&graph).unwrap().members.clear();
     let event = state(env).graphs[&graph].event;
     let public_event = state(env).graphs[&graph].public_event;
@@ -230,6 +240,37 @@ fn teardown(env: &mut Env<'_>, graph: u32, then: Then) -> Outcome {
             then(env, results)
         }),
     )
+}
+
+/// Quartz keeps one reference to the site and answers GetSite by querying it;
+/// players hand the graph key providers this way before loading protected media.
+fn set_site(env: &mut Env<'_>, graph: u32, site: u32) -> Outcome {
+    let old = std::mem::replace(&mut g(env, graph).site, site);
+    let mut calls = VecDeque::new();
+    if site != 0 {
+        calls.push_back(Call(site, 1, vec![]));
+    }
+    if old != 0 {
+        calls.push_back(Call(old, 2, vec![]));
+    }
+    chain(
+        env,
+        calls,
+        Vec::new(),
+        Box::new(|_, _| Outcome::Return(S_OK)),
+    )
+}
+
+fn get_site(env: &mut Env<'_>, graph: u32, iid: u32, output: u32) -> Outcome {
+    if output == 0 {
+        return Outcome::Return(E_POINTER);
+    }
+    let _ = env.cpu.write_u32(output, 0);
+    let site = g(env, graph).site;
+    if site == 0 {
+        return Outcome::Return(E_FAIL);
+    }
+    guest_call(env, site, 0, vec![iid, output], |_, hr| Outcome::Return(hr))
 }
 
 fn graph_of(env: &Env<'_>, this: u32) -> Option<u32> {
@@ -328,6 +369,8 @@ pub(crate) fn call(env: &mut Env<'_>, face: Face, method: &str, this: u32) -> Op
             r(S_OK)
         }
         (Face::MediaFilter, "SetSyncSource") => r(S_OK),
+        (Face::ObjectWithSite, "SetSite") => Some(set_site(env, graph, env.arg(1))),
+        (Face::ObjectWithSite, "GetSite") => Some(get_site(env, graph, env.arg(1), env.arg(2))),
         (Face::MediaFilter, "GetSyncSource") => {
             let _ = env.cpu.write_u32(env.arg(1), 0);
             r(S_FALSE)
