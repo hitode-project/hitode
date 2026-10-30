@@ -154,7 +154,7 @@ fn machine() -> Machine<adv_cpu::Cpu> {
     .unwrap()
 }
 
-// spec: NAT-BODY-1, NAT-BODY-15
+// spec: NAT-BODY-1, NAT-BODY-15, NAT-BODY-16
 #[test]
 fn native_body_decline_allocation_gate() {
     let mut machine = machine();
@@ -174,7 +174,7 @@ fn native_body_decline_allocation_gate() {
     }
     let mut calls = 0;
     for (index, body) in BODIES.iter().chain(dib::BODIES).enumerate() {
-        let function = body.body.expect("gate entries have ordinary bodies");
+        let function = body.body;
         machine
             .sys
             .thunks
@@ -185,6 +185,12 @@ fn native_body_decline_allocation_gate() {
             .thunks
             .published_index(MODULE, &body.name)
             .unwrap();
+        // Where a fault on the full path is raised.
+        machine
+            .ext
+            .get_or_default::<Entries>()
+            .0
+            .insert(thunk, 0x1000);
         for round in 0..64 {
             for i in 0..8 {
                 let value = if round == 0 {
@@ -213,12 +219,22 @@ fn native_body_decline_allocation_gate() {
                 };
                 ALLOCATIONS.set(0);
                 COUNTING.set(repeat == 1 && index < BODIES.len());
-                let result = function(&mut env);
+                // Direct bodies never decline; their full path raises
+                // faults before it writes (NAT-BODY-16, A64-CALL-4).
+                let unchanged = match (function, body.direct) {
+                    (_, Some(direct)) => match run_full(&mut env, direct, body.handler) {
+                        Outcome::Raise(_) => true,
+                        Outcome::Return(_) | Outcome::Return64(_) => false,
+                        _ => panic!("{} failed on its full path", body.name),
+                    },
+                    (Some(function), None) => function(&mut env).is_none(),
+                    (None, None) => panic!("{} has no body", body.name),
+                };
                 COUNTING.set(false);
                 let allocations = ALLOCATIONS.get();
                 assert!(
-                    result.is_some() || cpu.bytes == before,
-                    "{} declined after mutation, round {round}",
+                    !unchanged || cpu.bytes == before,
+                    "{} declined or faulted after mutation, round {round}",
                     body.name
                 );
                 assert_eq!(
@@ -251,6 +267,7 @@ fn native_boundary_rejects_write_then_decline() {
         conv: Conv::Cdecl { argc: 0 },
         body: Some(bad),
         handler: resume_original,
+        direct: None,
     };
     let mut machine = machine();
     let mut cpu = guest();
@@ -268,14 +285,51 @@ fn native_boundary_rejects_write_then_decline() {
 }
 
 // spec: NAT-BODY-15
+fn waits<M: adv_cpu::body::Mem>(
+    _: &mut M,
+    _: [u32; 7],
+) -> Result<adv_cpu::body::Ret, adv_cpu::body::Stop> {
+    Err(adv_cpu::body::Stop::Guest)
+}
+adv_cpu::body!(WAITS = waits, inputs: &[], outputs: adv_cpu::body::EAX, pop: 0);
+
+fn guest_code(_: &mut Env<'_>) -> Outcome {
+    Outcome::Return(7)
+}
+
+// spec: A64-CALL-6
+#[test]
+fn a_body_that_would_wait_runs_its_guest_code_once() {
+    let mut machine = machine();
+    let mut cpu = guest();
+    let mut env = Env {
+        cpu: &mut cpu,
+        sys: &mut machine.sys,
+        ext: &mut machine.ext,
+        context: 0,
+        thunk: 0,
+    };
+    assert!(matches!(
+        run_full(&mut env, WAITS, guest_code),
+        Outcome::Return(7)
+    ));
+    assert_eq!(machine.ext.get::<Declines>().0, 1);
+}
+
 #[test]
 fn native_boundary_counts_untimed_calls_and_keeps_tail_ring() {
     let mut machine = machine();
     let mut cpu = guest();
     let at = 7 * PAGE as u32 + 4;
-    for (i, value) in [0x3000, 0x4000, 16].iter().enumerate() {
+    for (i, value) in [0x3000, 0x4000].iter().enumerate() {
         cpu.write_u32(at + i as u32 * 4, *value).unwrap();
     }
+    cpu.bytes[0x4000..0x4010].copy_from_slice(b"fifteen letters\0");
+    // Direct bodies run outside the boundary; strcpy still crosses it.
+    let strcpy = BODIES
+        .iter()
+        .find(|body| &*body.name == "ntdll.dll!strcpy")
+        .unwrap();
     run_body(
         &mut Env {
             cpu: &mut cpu,
@@ -285,7 +339,7 @@ fn native_boundary_counts_untimed_calls_and_keeps_tail_ring() {
             thunk: 0,
         },
         0,
-        &BODIES[0],
+        strcpy,
     );
     debugger_attached(true);
     run_body(
@@ -297,7 +351,7 @@ fn native_boundary_counts_untimed_calls_and_keeps_tail_ring() {
             thunk: 0,
         },
         1,
-        &BODIES[0],
+        strcpy,
     );
     debugger_attached(false);
     assert_eq!(machine.ext.get::<Boundary>().bodies[1].timed_calls, 1);
@@ -357,7 +411,7 @@ fn native_scratch_reuses_storage() {
     assert_eq!(ALLOCATIONS.get(), 0);
 }
 
-// spec: NAT-BODY-15, NAT-BODY-7
+// spec: NAT-BODY-15
 #[test]
 fn native_memo_tracks_pinned_storage_and_type() {
     use std::{io::Write, os::fd::AsFd};

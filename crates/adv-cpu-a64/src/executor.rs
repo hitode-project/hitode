@@ -556,8 +556,11 @@ impl Executor {
             {
                 self.state.rep = None;
             }
+            // Interpreted runs reach the owner's target too (A64-CTL-14).
             if let Some(handler) = bridge.handler.as_ref()
-                && let Some((target, original)) = handler.required_redirect(self.state.eip)
+                && let Some((target, original)) = handler
+                    .required_redirect(self.state.eip)
+                    .or_else(|| handler.redirect(self.state.eip))
                 && self
                     .memory
                     .read_data(self.state.eip, original.len())

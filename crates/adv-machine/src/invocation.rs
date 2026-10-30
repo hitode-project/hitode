@@ -156,6 +156,10 @@ impl Invocation {
                 self.record(env, 0, Some("resume"));
                 Outcome::ResumeExecution(checkpoint)
             }
+            Outcome::Raise(fault) => {
+                self.record(env, 0, Some("fault"));
+                Outcome::Raise(fault)
+            }
             Outcome::ReturnFromCall(value) => {
                 self.record(env, value, Some("callback return"));
                 Outcome::ReturnFromCall(value)

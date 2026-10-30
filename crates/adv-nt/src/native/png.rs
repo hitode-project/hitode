@@ -28,6 +28,7 @@ pub(super) fn bodies() -> Vec<super::Body> {
             conv: Conv::Cdecl { argc: 3 },
             body: Some(*body),
             handler: super::resume_original,
+            direct: None,
         })
         .collect()
 }

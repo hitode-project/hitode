@@ -17,6 +17,7 @@ pub(super) fn bodies() -> Vec<super::Body> {
         conv: Conv::Cdecl { argc: 3 },
         body: Some(adler32),
         handler: super::resume_original,
+        direct: None,
     })
     .collect();
     bodies.extend(
@@ -31,6 +32,7 @@ pub(super) fn bodies() -> Vec<super::Body> {
             conv: Conv::Cdecl { argc: 2 },
             body: Some(inflate_fast),
             handler: super::resume_original,
+            direct: None,
         }),
     );
     bodies

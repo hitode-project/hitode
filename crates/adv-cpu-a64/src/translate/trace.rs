@@ -21,7 +21,7 @@
 
 use adv_cpu_core::memory::Memory;
 
-use super::decode::{Effects, Fetcher, Helper, Op};
+use super::decode::{Effects, Fetcher, Helper, Op, Src};
 use super::flags::FlagSet;
 
 /// Longest trace, in guest instructions.
@@ -116,6 +116,27 @@ pub struct Trace {
     pub failure: u8,
     /// What each `Op::Helper` runs.
     pub helpers: Vec<Helper>,
+    /// What each `Op::Body` calls.
+    pub bodies: Vec<Bound>,
+}
+
+/// Where a function entry's calls go instead (A64-CTL-14): `target` while
+/// the entry still holds `original`, or `body` called in place.
+pub struct Redirect {
+    pub target: u32,
+    pub original: Vec<u8>,
+    pub body: Option<adv_cpu_core::body::DirectBody>,
+}
+
+/// A direct body call (A64-CALL-2).
+#[derive(Clone, Copy, Debug)]
+pub struct Bound {
+    pub body: adv_cpu_core::body::DirectBody,
+    /// The full path, which a body that stops leaves for.
+    pub thunk: u32,
+    /// At the entry itself, the return address pushed, rather than at a
+    /// call that pushes nothing.
+    pub entry: bool,
 }
 
 /// The stops, behind a one-word filter: most EIPs are not stops.
@@ -153,10 +174,11 @@ impl Trace {
         entry: u32,
         stops: &[u32],
         host: &dyn Fn(u32, u32) -> Option<u32>,
-        redirect: &dyn Fn(u32) -> Option<(u32, Vec<u8>)>,
+        redirect: &dyn Fn(u32) -> Option<Redirect>,
     ) {
         self.insts.clear();
         self.code.clear();
+        self.bodies.clear();
         self.frames.clear();
         self.frames.push(Frame {
             parent: 0,
@@ -186,14 +208,26 @@ impl Trace {
                 self.insts[len - 1].next = Next::Edge(edge);
                 break;
             }
-            let redirected = redirect(pc).filter(|(_, original)| {
-                let mut bytes = vec![0; original.len()];
-                memory.read_into(pc, &mut bytes).is_ok() && bytes == *original
-            });
-            let fetched = match redirected {
-                Some((target, original)) => {
-                    self.code.push((pc, original.len() as u32));
-                    Some((Op::Jmp(target), 0))
+            let intact = |entry: u32| {
+                redirect(entry).filter(|redirect| {
+                    let mut bytes = vec![0; redirect.original.len()];
+                    memory.read_into(entry, &mut bytes).is_ok() && bytes == redirect.original
+                })
+            };
+            let fetched = match intact(pc) {
+                Some(redirect) => {
+                    self.code.push((pc, redirect.original.len() as u32));
+                    match redirect.body {
+                        Some(body) if self.bodies.len() <= usize::from(u8::MAX) => {
+                            self.bodies.push(Bound {
+                                body,
+                                thunk: redirect.target,
+                                entry: true,
+                            });
+                            Some((Op::Body(self.bodies.len() as u8 - 1), 0))
+                        }
+                        _ => Some((Op::Jmp(redirect.target), 0)),
+                    }
                 }
                 None => fetcher.fetch(pc),
             };
@@ -205,6 +239,55 @@ impl Trace {
                 break;
             };
             let next_pc = pc.wrapping_add(size);
+            // Import slots and the entries calls reach are watched like code,
+            // so a transfer through them is static (A64-CALL-1).
+            let mut watched = [None; 2];
+            let op = match op {
+                Op::CallIndirect(Src::Mem(slot)) | Op::JmpIndirect(Src::Mem(slot))
+                    if slot.base.is_none()
+                        && slot.index.is_none()
+                        && !slot.fs
+                        && slot.address_bits == 32 =>
+                {
+                    let mut target = [0; 4];
+                    match memory.read_into(slot.disp, &mut target) {
+                        Ok(()) => {
+                            watched[0] = Some((slot.disp, 4));
+                            let target = u32::from_le_bytes(target);
+                            if matches!(op, Op::CallIndirect(_)) {
+                                Op::Call(target)
+                            } else {
+                                Op::Jmp(target)
+                            }
+                        }
+                        Err(_) => op,
+                    }
+                }
+                _ => op,
+            };
+            let op = match op {
+                Op::Call(target)
+                    if target != next_pc && self.bodies.len() <= usize::from(u8::MAX) =>
+                {
+                    match intact(target) {
+                        Some(Redirect {
+                            target: thunk,
+                            original,
+                            body: Some(body),
+                        }) => {
+                            watched[1] = Some((target, original.len() as u32));
+                            self.bodies.push(Bound {
+                                body,
+                                thunk,
+                                entry: false,
+                            });
+                            Op::Body(self.bodies.len() as u8 - 1)
+                        }
+                        _ => op,
+                    }
+                }
+                _ => op,
+            };
             weight += if matches!(op, Op::X87(_) | Op::Fild64(..))
                 || matches!(
                     op,
@@ -249,6 +332,7 @@ impl Trace {
             if inst.call.is_some() {
                 self.code.push((pc.wrapping_sub(5), 7));
             }
+            self.code.extend(watched.into_iter().flatten());
             // A continuation must be new to the trace and leave room after it.
             let continuation = || {
                 len + 4 < MAX_INSTRUCTIONS
@@ -277,6 +361,15 @@ impl Trace {
                 Op::CallIndirect(_) if continuation() => {
                     inst.mode = Mode::Real;
                     Some((next_pc, frame))
+                }
+                Op::Body(index) if self.bodies[usize::from(index)].entry && frame != 0 => {
+                    let Frame { parent, ret, .. } = self.frames[usize::from(frame)];
+                    inst.mode = Mode::Inline(ret);
+                    Some((ret, parent))
+                }
+                Op::Body(index) if self.bodies[usize::from(index)].entry => {
+                    inst.next = Next::Dynamic;
+                    None
                 }
                 Op::Ret(_) if frame != 0 => {
                     let Frame { parent, ret, .. } = self.frames[usize::from(frame)];

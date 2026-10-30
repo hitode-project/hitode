@@ -57,6 +57,7 @@ fn footprint(trace: &Trace, index: usize, _checked: &dyn Fn(u32) -> bool) -> Opt
         | Op::X87(_)
         | Op::Fild64(..)
         | Op::Call(_)
+        | Op::Body(_)
         | Op::CallIndirect(_)
         | Op::JmpIndirect(_)
         | Op::Ret(_) => None,

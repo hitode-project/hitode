@@ -398,9 +398,14 @@ Required host text services follow WINE-UNIX-6 in interpreted and translated exe
 **Rule**: Locale-independent PE string and memory bodies MUST preserve Wine's bytes, return values, bounds and overlap behavior. An access that would fault MUST decline before any write.
 **Verification**: Test
 
-### NAT-BODY-7 PE body memory access
+### NAT-BODY-16 Complete bodies
 
-**Rule**: `Memory` MUST cache host page-range validation by mapping generation, advanced by mapping, protection, storage, watch, and residency changes. Tables that cannot be borrowed MAY use indexed entry reads. Repeated identical calls within one page of strings or eight KiB of conversion output MUST NOT allocate temporary heap buffers.
+**Rule**: A body MUST complete every call its function accepts, for all argument values, code pages, locales, formats, overlaps and floating-point controls. It MAY return to guest code only under A64-CALL-6. Faults, including division by zero, MUST raise the exception the function raises.
+**Verification**: Test
+
+### NAT-BODY-17 Body memory access
+
+**Rule**: Bodies MUST reach guest memory through one access type, which on AArch64 reads the window and class table under A64-CALL-4. Other hosts MUST give that type the same results through `Memory`. Bodies MUST read and write guest bytes in place, copying only where their function's semantics need a snapshot.
 **Verification**: Test
 
 ### NAT-BODY-8 D3DX pixel conversion
@@ -834,4 +839,4 @@ UI projection refreshes MUST wake execution only when they queue new guest work.
 **Rule**: Native sources MUST accept PCM, IEEE float, Microsoft ADPCM and xWMA buffers. Compressed decoding MUST use host code.
 **Verification**: Test
 
-Withdrawn: WINE-TEST-2
+Withdrawn: WINE-TEST-2, NAT-BODY-7

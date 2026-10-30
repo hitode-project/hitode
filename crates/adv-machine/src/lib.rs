@@ -159,6 +159,9 @@ pub struct Sys {
     pub redirects: HashMap<u32, (u32, Box<[u8]>)>,
     /// Entries supplied by required host services in both execution modes.
     pub required_redirects: std::collections::HashSet<u32>,
+    /// Redirected entries that generated code calls a body for directly
+    /// (A64-CALL-2); the redirect's thunk runs the same body on the full path.
+    pub direct_bodies: HashMap<u32, adv_cpu::body::DirectBody>,
     /// Stop with an error after this many host calls (a debugging aid for guest loops that
     /// never block).
     pub call_limit: Option<u64>,
@@ -1210,6 +1213,8 @@ enum Parked {
     ExitProcess(u32),
     Fail(String),
     Exception(u8),
+    /// A host call raised this fault at the function's entry.
+    Raise(adv_cpu::backend::Fault),
 }
 
 /// Apply a handler's outcome to the guest. `Err` means the context must park.
@@ -1330,6 +1335,13 @@ fn apply(
             Ok(())
         }
         Outcome::ResumeExecution(checkpoint) => checkpoint.restore(cpu, sys).map_err(Parked::Fail),
+        // As if the function's first instruction faulted: the return
+        // address on the stack, the guest's handlers above it.
+        Outcome::Raise(fault) => {
+            cpu.set_reg(Reg::Esp, origin.esp);
+            cpu.set_reg(Reg::Eip, fault.pc);
+            Err(Parked::Raise(fault))
+        }
         Outcome::ReturnFromCall(value) => {
             let context = sys.current as usize;
             if sys.contexts[context]
@@ -1701,6 +1713,10 @@ impl Dispatch<'_> {
                 TrapAction::Park
             }
             Ok(()) => TrapAction::Continue,
+            Err(Parked::Raise(fault)) => {
+                let res = self.exception(cpu, exception::Exception::Fault(fault));
+                self.action(cpu, res, frame_before)
+            }
             Err(p) => {
                 self.parked = Some(p);
                 TrapAction::Park
@@ -1785,6 +1801,13 @@ impl TrapHandler for Dispatch<'_> {
         }
         let (target, original) = self.sys.redirects.get(&pc)?;
         Some((*target, original))
+    }
+
+    fn direct_body(&self, pc: u32) -> Option<adv_cpu::body::DirectBody> {
+        if self.sys.trace.enabled() || self.sys.call_limit.is_some() {
+            return None;
+        }
+        self.sys.direct_bodies.get(&pc).copied()
     }
 
     fn required_redirect(&self, pc: u32) -> Option<(u32, &[u8])> {
@@ -2000,6 +2023,7 @@ impl<B: Backend> Machine<B> {
             host_calls: 0,
             redirects: HashMap::new(),
             required_redirects: Default::default(),
+            direct_bodies: HashMap::new(),
             call_limit: None,
             stats: Stats::new(),
             schedule_trace: schedule_trace::ScheduleTrace::default(),
@@ -2301,9 +2325,15 @@ impl<B: Backend> Machine<B> {
 
     /// Record why the current context parked. `Some` ends the run.
     fn park(&mut self, p: Parked) -> Option<RunResult> {
+        // Only a host call's own outcome raises: `Dispatch::action` takes it.
+        let p = match p {
+            Parked::Raise(fault) => Parked::Fail(format!("a continuation raised {fault:?}")),
+            p => p,
+        };
         let id = self.sys.current;
         let ctx = &mut self.sys.contexts[id as usize];
         match p {
+            Parked::Raise(_) => unreachable!("made a failure above"),
             Parked::HostRequest { then, origin } => {
                 ctx.state = State::Ready {
                     resume: Some(ReadyResume::Deferred { then, origin }),

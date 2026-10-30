@@ -65,7 +65,7 @@ use iced_x86::ConditionCode;
 pub use decode::Helper;
 pub(crate) use flags::Overflow;
 pub use flags::{Carry, Operand, Recipe, Sense};
-pub use trace::MAX_INSTRUCTIONS;
+pub use trace::{Bound, MAX_INSTRUCTIONS, Redirect};
 
 use adv_cpu_core::IndirectBranchKind;
 
@@ -136,7 +136,7 @@ impl Unit {
         eip: u32,
         stops: &[u32],
         host: &dyn Fn(u32, u32) -> Option<u32>,
-        redirect: &dyn Fn(u32) -> Option<(u32, Vec<u8>)>,
+        redirect: &dyn Fn(u32) -> Option<Redirect>,
     ) {
         self.regions.clear();
         self.trace.build(memory, eip, stops, host, redirect);
@@ -491,7 +491,7 @@ pub fn translate(
     at: usize,
     stubs: Stubs,
     host: &dyn Fn(u32, u32) -> Option<u32>,
-    redirect: &dyn Fn(u32) -> Option<(u32, Vec<u8>)>,
+    redirect: &dyn Fn(u32) -> Option<Redirect>,
     admit: &dyn Fn(u32, &[u8]) -> Vec<adv_cpu_core::native_region::NativeRegion>,
     control: u16,
 ) {

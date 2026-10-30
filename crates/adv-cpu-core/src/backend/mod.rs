@@ -472,11 +472,16 @@ pub trait TrapHandler {
         self.on_trap(cpu, 0x2e)
     }
 
-    /// Where translated code continues instead of entering the function at
-    /// `pc`, while the bytes there are still the returned ones. The
-    /// interpreter runs the function itself, so the target must behave as
-    /// the function does.
+    /// Where execution continues instead of entering the function at `pc`,
+    /// while the bytes there are still the returned ones (A64-CTL-14). The
+    /// target must behave as the function does.
     fn redirect(&self, _pc: u32) -> Option<(u32, &[u8])> {
+        None
+    }
+
+    /// The direct body that runs in place of the function at `pc`, which
+    /// `redirect` also redirects (A64-CALL-2).
+    fn direct_body(&self, _pc: u32) -> Option<crate::body::DirectBody> {
         None
     }
 

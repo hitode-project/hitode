@@ -54,6 +54,9 @@ struct Body {
     body: Option<BodyFn>,
     /// Runs the function itself after the body declined.
     handler: adv_machine::Handler,
+    /// The body as generated code calls it directly (A64-CALL-2); `body`
+    /// is then unused.
+    direct: Option<adv_cpu::body::Body>,
 }
 
 /// Calls whose body declined, so that Wine's own code ran.
@@ -241,20 +244,23 @@ static BODIES: std::sync::LazyLock<Vec<Body>> = std::sync::LazyLock::new(|| {
         Body {
             name: "ntdll.dll!memcpy".into(),
             conv: Conv::Cdecl { argc: 3 },
-            body: Some(memmove),
+            body: None,
             handler: resume_original,
+            direct: Some(crt::MEMMOVE),
         },
         Body {
             name: "dsound.dll!DSOUND_MixToPrimary".into(),
             conv: Conv::Cdecl { argc: 6 },
             body: Some(mixer::mix),
             handler: mixer::resume,
+            direct: None,
         },
         Body {
             name: "ntdll.dll!NtQueryPerformanceCounter".into(),
             conv: Conv::Stdcall { argc: 2 },
             body: Some(query_performance_counter),
             handler: resume_original,
+            direct: None,
         },
         #[cfg(any(target_vendor = "apple", target_os = "android"))]
         Body {
@@ -262,54 +268,63 @@ static BODIES: std::sync::LazyLock<Vec<Body>> = std::sync::LazyLock::new(|| {
             conv: Conv::Stdcall { argc: 1 },
             body: Some(input::key_state),
             handler: resume_original,
+            direct: None,
         },
         Body {
             name: "kernelbase.dll!MultiByteToWideChar".into(),
             conv: Conv::Stdcall { argc: 6 },
             body: Some(nls::multi_byte_to_wide_char),
             handler: resume_original,
+            direct: None,
         },
         Body {
             name: "kernelbase.dll!WideCharToMultiByte".into(),
             conv: Conv::Stdcall { argc: 8 },
             body: Some(nls::wide_char_to_multi_byte),
             handler: resume_original,
+            direct: None,
         },
         Body {
             name: "ntdll.dll!RtlMultiByteToUnicodeN".into(),
             conv: Conv::Stdcall { argc: 5 },
             body: Some(nls::rtl_multi_byte_to_unicode_n),
             handler: resume_original,
+            direct: None,
         },
         Body {
             name: "ntdll.dll!RtlUnicodeToMultiByteN".into(),
             conv: Conv::Stdcall { argc: 5 },
             body: Some(nls::rtl_unicode_to_multi_byte_n),
             handler: resume_original,
+            direct: None,
         },
         Body {
             name: "ntdll.dll!RtlMultiByteToUnicodeSize".into(),
             conv: Conv::Stdcall { argc: 3 },
             body: Some(nls::rtl_multi_byte_to_unicode_size),
             handler: resume_original,
+            direct: None,
         },
         Body {
             name: "ntdll.dll!RtlUnicodeToMultiByteSize".into(),
             conv: Conv::Stdcall { argc: 3 },
             body: Some(nls::rtl_unicode_to_multi_byte_size),
             handler: resume_original,
+            direct: None,
         },
         Body {
             name: "ntdll.dll!RtlOemToUnicodeN".into(),
             conv: Conv::Stdcall { argc: 5 },
             body: Some(nls::rtl_oem_to_unicode_n),
             handler: resume_original,
+            direct: None,
         },
         Body {
             name: "ntdll.dll!RtlUnicodeToOemN".into(),
             conv: Conv::Stdcall { argc: 5 },
             body: Some(nls::rtl_unicode_to_oem_n),
             handler: resume_original,
+            direct: None,
         },
     ];
     bodies.extend(crt::bodies());
@@ -319,6 +334,7 @@ static BODIES: std::sync::LazyLock<Vec<Body>> = std::sync::LazyLock::new(|| {
             conv: Conv::Cdecl { argc: 6 },
             body: Some(pixels::load),
             handler: resume_original,
+            direct: None,
         });
     }
     bodies.extend(png::bodies());
@@ -366,6 +382,9 @@ fn run(env: &mut Env<'_>) -> Outcome {
 }
 
 fn run_body(env: &mut Env<'_>, index: usize, body: &'static Body) -> Outcome {
+    if let Some(direct) = body.direct {
+        return run_full(env, direct, body.handler);
+    }
     let timed = DEBUGGER_ATTACHED.get();
     let arguments = if timed {
         std::array::from_fn(|i| {
@@ -405,6 +424,65 @@ fn run_body(env: &mut Env<'_>, index: usize, body: &'static Body) -> Outcome {
             env.ext.get_or_default::<Declines>().0 += 1;
             (body.handler)(env)
         }
+    }
+}
+
+/// What the full path of direct bodies reuses.
+#[derive(Default)]
+struct FullScratch(adv_cpu::body::Scratch);
+
+/// The entry of each direct body's function by thunk index, where a fault
+/// on its full path is raised.
+#[derive(Default)]
+struct Entries(HashMap<u32, u32>);
+
+/// A direct body on the full path, which completes every access a guest
+/// instruction would and raises the guest's fault where it would fault.
+fn run_full(
+    env: &mut Env<'_>,
+    body: adv_cpu::body::Body,
+    handler: adv_machine::Handler,
+) -> Outcome {
+    use adv_cpu::backend::{Fault, FaultKind, Reg};
+    use adv_cpu::body::{ECX, EDX, GuestMem, Input, Stop};
+    let inputs = std::array::from_fn(|n| match body.direct.inputs.get(n) {
+        Some(&Input::Stack(k)) => env.arg(u32::from(k)),
+        Some(Input::Eax) => env.cpu.reg(Reg::Eax),
+        Some(Input::Ecx) => env.cpu.reg(Reg::Ecx),
+        Some(Input::Edx) => env.cpu.reg(Reg::Edx),
+        None => 0,
+    });
+    let mut scratch = std::mem::take(&mut env.ext.get_or_default::<FullScratch>().0);
+    let result = (body.full)(&mut GuestMem::new(env.cpu, &mut scratch), inputs);
+    env.ext.get_or_default::<FullScratch>().0 = scratch;
+    let outputs = body.direct.outputs;
+    match result {
+        Ok(ret) => {
+            if outputs & ECX != 0 {
+                env.cpu.set_reg(Reg::Ecx, ret.ecx);
+            }
+            if outputs & EDX != 0 {
+                Outcome::Return64(ret.value)
+            } else {
+                Outcome::Return(ret.value as u32)
+            }
+        }
+        Err(Stop::Fault { address, write }) => {
+            let Some(&pc) = env.ext.get_or_default::<Entries>().0.get(&env.thunk) else {
+                return Outcome::Fail("direct body without an entry".into());
+            };
+            let kind = if write {
+                FaultKind::Write(address)
+            } else {
+                FaultKind::Read(address)
+            };
+            Outcome::Raise(Fault { kind, pc })
+        }
+        Err(Stop::Guest) => {
+            env.ext.get_or_default::<Declines>().0 += 1;
+            (handler)(env)
+        }
+        Err(Stop::Slow) => Outcome::Fail("the full path left a direct body".into()),
     }
 }
 
@@ -558,6 +636,13 @@ fn bind_one(
         thunk
     };
     sys.redirects.insert(entry, (target, original.into()));
+    if let Some(direct) = bodies()
+        .find(|body| body.name == name)
+        .and_then(|body| body.direct)
+    {
+        sys.direct_bodies.insert(entry, direct.direct);
+        ext.get_or_default::<Entries>().0.insert(index, entry);
+    }
     Ok(())
 }
 
@@ -605,15 +690,6 @@ fn resume_original(env: &mut Env<'_>) -> Outcome {
         }
         Err(error) => Outcome::Fail(error.to_string()),
     }
-}
-
-/// memmove(dst, src, n): EAX and EDX are `dst`, as Wine's code leaves them.
-fn memmove(env: &mut Env<'_>) -> Option<u64> {
-    let (dst, src, n) = (env.arg(0), env.arg(1), env.arg(2));
-    if n != 0 {
-        env.cpu.copy_memory(src, dst, n as usize).ok()?;
-    }
-    Some(u64::from(dst) << 32 | u64::from(dst))
 }
 
 // spec: NAT-BODY-2

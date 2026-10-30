@@ -23,7 +23,7 @@ fn read_only_storage() -> Arc<SharedAllocation> {
     SharedAllocation::map_file(file.as_fd(), 0, 2 * PAGE_SIZE, false).unwrap()
 }
 
-// spec: NAT-BODY-7
+// spec: NAT-BODY-17
 #[test]
 fn host_boundary_generation_mutations() {
     let mut memory = Memory::reserve(0, 8 * PAGE_SIZE).unwrap();
@@ -76,7 +76,7 @@ fn host_boundary_generation_mutations() {
     changed!(memory.privatize_copy_pages(at, PAGE_SIZE).unwrap());
 }
 
-// spec: NAT-BODY-7
+// spec: NAT-BODY-17
 #[test]
 fn host_boundary_tlb_hits_follow_protect_unmap_and_watch() {
     let mut memory = Memory::reserve(0, 8 * PAGE_SIZE).unwrap();
@@ -155,7 +155,7 @@ fn host_boundary_word_copies_all_alignments_and_lengths() {
     }
 }
 
-// spec: NAT-BODY-7
+// spec: NAT-BODY-17
 #[test]
 fn host_boundary_pinned_identity_revalidates() {
     let mut memory = Memory::reserve(0, 8 * PAGE_SIZE).unwrap();
@@ -192,7 +192,7 @@ fn host_boundary_pinned_identity_revalidates() {
     assert!(!other.still_pinned(&pinned));
 }
 
-// spec: NAT-BODY-7
+// spec: NAT-BODY-17
 #[test]
 fn host_boundary_counters_distinguish_contiguous_and_page_copies() {
     let mut memory = Memory::reserve(0, 8 * PAGE_SIZE).unwrap();
@@ -240,7 +240,7 @@ fn host_boundary_counters_distinguish_contiguous_and_page_copies() {
     assert_eq!(memory.host_access().writes, after.writes);
 }
 
-// spec: NAT-BODY-7
+// spec: NAT-BODY-17
 #[test]
 fn host_boundary_tlb_keeps_alternating_pages_and_replaces_collisions() {
     let mut memory = Memory::reserve(0, 12 * PAGE_SIZE).unwrap();

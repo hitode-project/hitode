@@ -1129,6 +1129,10 @@ impl Native {
             }
             table.as_ptr() as u64
         };
+        self.runtime.body = adv_cpu_core::body::BodyContext {
+            window: self.runtime.window as *mut u8,
+            classes: self.runtime.classes as *const u8,
+        };
         self.snapshot = Some(snapshot);
     }
 
@@ -1270,7 +1274,11 @@ impl Native {
                     .handler
                     .as_ref()?;
                 let (target, original) = handler.redirect(pc)?;
-                Some((target, original.to_vec()))
+                Some(translate::Redirect {
+                    target,
+                    original: original.to_vec(),
+                    body: handler.direct_body(pc),
+                })
             },
             &|pc, code| {
                 if self.bridge.is_null() {

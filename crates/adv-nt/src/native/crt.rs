@@ -1,6 +1,7 @@
 //! Locale-independent Wine 11 PE string and memory functions.
 
 use adv_cpu::backend::{Guest, Prot};
+use adv_cpu::body::{EAX, EDX, Input, Mem, Ret, Stop};
 use adv_machine::{Conv, Env, layout::PAGE};
 
 use super::{Body, resume_original};
@@ -54,24 +55,57 @@ fn scan_length(cpu: &dyn Guest, mut at: u32, width: u32, limit: u32) -> Option<u
     Some(limit)
 }
 
-// spec: NAT-BODY-6
-pub(super) fn memmove(env: &mut Env<'_>) -> Option<u64> {
-    let (dst, src, len) = (env.arg(0), env.arg(1), env.arg(2));
+const ARGS: &[Input] = &[Input::Stack(0), Input::Stack(1), Input::Stack(2)];
+
+// memmove(dst, src, n), and Wine's memcpy, which jumps to it.
+adv_cpu::body!(pub(super) MEMMOVE = move_bytes, inputs: ARGS, outputs: EAX | EDX, pop: 0);
+adv_cpu::body!(MEMSET = fill, inputs: ARGS, outputs: EAX, pop: 0);
+adv_cpu::body!(MEMCMP = compare_bytes, inputs: ARGS, outputs: EAX, pop: 0);
+
+/// EAX and EDX are `dst`, as Wine's code leaves them.
+fn move_bytes<M: Mem>(mem: &mut M, [dst, src, len, ..]: [u32; 7]) -> Result<Ret, Stop> {
     if len != 0 {
-        if !env.cpu.accessible(src, len, Prot::READ) || !env.cpu.accessible(dst, len, Prot::WRITE) {
-            return None;
-        }
-        env.cpu.copy_memory(src, dst, len as usize).ok()?;
+        let from = mem.input(src, len)?;
+        let to = mem.output(dst, len)?;
+        // SAFETY: both ranges are checked; `copy` orders overlapping ones.
+        unsafe { std::ptr::copy(from, to, len as usize) };
+        mem.commit()?;
     }
-    Some(u64::from(dst) << 32 | u64::from(dst))
+    Ok(Ret::from(u64::from(dst) << 32 | u64::from(dst)))
 }
 
-pub(super) fn memset(env: &mut Env<'_>) -> Option<u64> {
-    let (dst, ch, len) = (env.arg(0), env.arg(1), env.arg(2));
+fn fill<M: Mem>(mem: &mut M, [dst, ch, len, ..]: [u32; 7]) -> Result<Ret, Stop> {
     if len != 0 {
-        env.cpu.fill_memory(dst, ch as u8, len as usize).ok()?;
+        let to = mem.output(dst, len)?;
+        // SAFETY: the range is checked.
+        unsafe { std::ptr::write_bytes(to, ch as u8, len as usize) };
+        mem.commit()?;
     }
-    Some(u64::from(dst))
+    Ok(Ret::from(dst))
+}
+
+/// The sign of the first difference: bytes past it are never read, so a
+/// page beyond it may be inaccessible.
+fn compare_bytes<M: Mem>(mem: &mut M, [mut a, mut b, mut len, ..]: [u32; 7]) -> Result<Ret, Stop> {
+    while len != 0 {
+        let to_page = |at: u32| PAGE - at % PAGE;
+        let chunk = len.min(to_page(a)).min(to_page(b));
+        let x = mem.input(a, chunk)?;
+        let y = mem.input(b, chunk)?;
+        // SAFETY: both chunks are checked.
+        let (x, y) = unsafe {
+            (
+                std::slice::from_raw_parts(x, chunk as usize),
+                std::slice::from_raw_parts(y, chunk as usize),
+            )
+        };
+        let order = x.cmp(y);
+        if order.is_ne() {
+            return Ok(Ret::from(order as i32 as u32));
+        }
+        (a, b, len) = (a.wrapping_add(chunk), b.wrapping_add(chunk), len - chunk);
+    }
+    Ok(Ret::from(0u32))
 }
 
 fn compare(env: &Env<'_>, width: u32, mut limit: u32, terminated: bool, sign: bool) -> Option<u64> {
@@ -119,10 +153,6 @@ fn compare(env: &Env<'_>, width: u32, mut limit: u32, terminated: bool, sign: bo
         }
     }
     Some(0)
-}
-
-pub(super) fn memcmp(env: &mut Env<'_>) -> Option<u64> {
-    compare(env, 1, env.arg(2), false, true)
 }
 
 pub(super) fn strcmp(env: &mut Env<'_>) -> Option<u64> {
@@ -325,11 +355,25 @@ const SIGN_COMPARISONS: &[&str] = &[
 ];
 
 pub(super) fn bodies() -> Vec<Body> {
+    let direct: &[(&str, adv_cpu::body::Body, &[&str])] = &[
+        ("memset", MEMSET, ALL),
+        ("memmove", MEMMOVE, CRT),
+        ("memcmp", MEMCMP, ALL),
+    ];
+    let mut bodies = Vec::new();
+    for &(name, body, modules) in direct {
+        for module in modules {
+            bodies.push(Body {
+                name: format!("{module}!{name}").into(),
+                conv: Conv::Cdecl { argc: 3 },
+                body: None,
+                handler: resume_original,
+                direct: Some(body),
+            });
+        }
+    }
     type Variant = (super::BodyFn, &'static [&'static str]);
     let table: &[(&str, u8, &[Variant])] = &[
-        ("memset", 3, &[(memset, ALL)]),
-        ("memmove", 3, &[(memmove, CRT)]),
-        ("memcmp", 3, &[(memcmp, ALL)]),
         ("memchr", 3, &[(memchr, ALL)]),
         ("strlen", 1, &[(strlen, ALL)]),
         ("strnlen", 2, &[(strnlen, WITH_STRNLEN)]),
@@ -357,7 +401,6 @@ pub(super) fn bodies() -> Vec<Body> {
         ("strstr", 2, &[(strstr_nt, NTDLL), (strstr, CRT)]),
         ("wcsstr", 2, &[(wcsstr, ALL)]),
     ];
-    let mut bodies = Vec::new();
     for &(name, argc, variants) in table {
         for &(body, modules) in variants {
             for module in modules {
@@ -366,6 +409,7 @@ pub(super) fn bodies() -> Vec<Body> {
                     conv: Conv::Cdecl { argc },
                     body: Some(body),
                     handler: resume_original,
+                    direct: None,
                 });
             }
         }

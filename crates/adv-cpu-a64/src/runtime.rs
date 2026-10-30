@@ -123,6 +123,8 @@ pub struct Runtime {
     /// Apply calls in this chain, refunded if their final store faults.
     pub applied: u64,
     pub apply_return: u64,
+    /// What direct bodies receive in x0: the window and `classes`.
+    pub body: adv_cpu_core::body::BodyContext,
 }
 
 impl Runtime {
@@ -159,6 +161,7 @@ impl Runtime {
             exit: 0,
             temps: [0; 2],
             branch: 0,
+            body: adv_cpu_core::body::BodyContext::default(),
         }
     }
 }
@@ -273,6 +276,7 @@ pub(crate) const CHANNEL_BATCHES: u32 = field(offset_of!(Runtime, channel_batche
 #[cfg(test)]
 pub(crate) const NATIVE_BATCHES: u32 = field(offset_of!(Runtime, native_batches));
 pub(crate) const CLASSES: u32 = field(offset_of!(Runtime, classes));
+pub(crate) const BODY: u32 = field(offset_of!(Runtime, body));
 pub(crate) const ALIAS: u32 = field(offset_of!(Runtime, alias));
 pub(crate) const ALIAS_CLASSES: u32 = field(offset_of!(Runtime, alias_classes));
 pub(crate) const CPU_STATE: u32 = CPU;

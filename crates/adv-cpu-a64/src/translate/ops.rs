@@ -1,7 +1,7 @@
 //! Each guest instruction's host code, with the flag work liveness allows.
 
 use crate::encode::Extend::{self, Uxtw};
-use crate::encode::Index::Pre;
+use crate::encode::Index::{Post, Pre};
 use crate::encode::Shift::{Asr, Lsl, Lsr};
 use crate::encode::Size::{W, X};
 use crate::encode::*;
@@ -11,12 +11,15 @@ use super::decode::{Alu, ESP, Mem, Narrow8or16, Op, Part, ShiftKind, Src};
 use super::flags::{Carry, FlagSet, Operand, Recipe, Sense};
 use super::trace::{Inst, Mode};
 use super::{
-    Cold, RUNTIME, SHADOW, State, Translator, WINDOW, X0, X1, X3, X4, X5, X6, X10, X13, X14, X15,
-    X16, X17, biased, host, temp,
+    Cold, RUNTIME, SHADOW, State, Translator, WINDOW, X0, X1, X3, X4, X5, X6, X9, X10, X13, X14,
+    X15, X16, X17, biased, host, temp,
 };
-use crate::runtime;
+use crate::runtime::{self, Exit};
 use adv_cpu_core::IndirectBranchKind;
 use adv_cpu_core::memory::WRITE;
+
+/// The stack pointer, which register 31 names in load and store pairs.
+const SP: Reg = Reg::new(31);
 
 /// The register a 32-bit result for guest `index` is computed into.
 pub(super) fn result(index: u8) -> Reg {
@@ -145,36 +148,8 @@ impl Translator<'_> {
                 }
             }
             Op::Jcc(cc, _) => self.branch(cc, inst.taken.expect("jcc edges are resolved")),
-            Op::Ret(release) => {
-                self.flush_simd();
-                let esp = Operand::Guest(ESP);
-                self.prepare(esp);
-                self.load(Addr::Pop, X16);
-                self.forget(esp);
-                if release != 0 {
-                    self.emit(add_imm(X, host(ESP), host(ESP), u32::from(release), false));
-                }
-                match inst.mode {
-                    Mode::Inline(expected) => {
-                        // The callee may have changed its return address.
-                        self.mov_imm(X17, expected);
-                        self.emit(sub(W, X17, X16, X17, Lsl, 0));
-                        let label = self.asm.label();
-                        self.asm.cbz(W, true, X17, label);
-                        self.push_cold(Cold::Lookup {
-                            label,
-                            state: self.state,
-                            refund: self.trace.unused(self.index),
-                            branch: self.indirect(IndirectBranchKind::Return),
-                            x87: self.x87_leaving(),
-                        });
-                    }
-                    _ => {
-                        self.settle();
-                        self.shadow_return();
-                    }
-                }
-            }
+            Op::Body(index) => self.body(inst, self.trace.bodies[usize::from(index)]),
+            Op::Ret(release) => self.ret(inst, release),
             Op::JmpIndirect(source) => {
                 if !self.table_jump(source) {
                     self.target_to_w16(source);
@@ -222,6 +197,118 @@ impl Translator<'_> {
             Op::Shift(_, _, Some(_)) => unreachable!(),
             Op::Imul(dst, source, imm) => self.imul(dst, source, imm),
             Op::Carry(subtract, dst, source) => self.carry(subtract, dst, source),
+        }
+    }
+
+    /// A return popping `release` argument bytes besides its address.
+    fn ret(&mut self, inst: Inst, release: u16) {
+        self.flush_simd();
+        let esp = Operand::Guest(ESP);
+        self.prepare(esp);
+        self.load(Addr::Pop, X16);
+        self.forget(esp);
+        if release != 0 {
+            self.emit(add_imm(X, host(ESP), host(ESP), u32::from(release), false));
+        }
+        match inst.mode {
+            Mode::Inline(expected) => {
+                // The callee may have changed its return address.
+                self.mov_imm(X17, expected);
+                self.emit(sub(W, X17, X16, X17, Lsl, 0));
+                let label = self.asm.label();
+                self.asm.cbz(W, true, X17, label);
+                self.push_cold(Cold::Lookup {
+                    label,
+                    state: self.state,
+                    refund: self.trace.unused(self.index),
+                    branch: self.indirect(IndirectBranchKind::Return),
+                    x87: self.x87_leaving(),
+                });
+            }
+            _ => {
+                self.settle();
+                self.shadow_return();
+            }
+        }
+    }
+
+    /// Calls direct body `bound` (A64-CALL-2): at a call, whose arguments
+    /// start at ESP and whose return address is never stored, or at the
+    /// entry, returning as the function does. A body that stops leaves for
+    /// the full path before anything changed: a call runs again in the
+    /// interpreter, whose transfer reaches the thunk, and an entry continues
+    /// at the thunk.
+    fn body(&mut self, inst: Inst, bound: super::Bound) {
+        use adv_cpu_core::body::{EAX, ECX, EDX, Input};
+        // AAPCS64 keeps x19-x29 and d8-d15: the guest map survives; the
+        // countdown, DF in x12 and the XMM cache do not.
+        self.flush_simd();
+        self.vector = super::simd::Vector::default();
+        *self.uses_permissions = true;
+        let body = bound.body;
+        let base = if bound.entry { 4 } else { 0 };
+        for (n, &input) in body.inputs.iter().enumerate() {
+            let rd = Reg::new(1 + n as u8);
+            match input {
+                Input::Stack(k) => {
+                    let disp = base + 4 * u32::from(k);
+                    if self.checking {
+                        self.emit(add_imm(W, X16, host(ESP), disp, false));
+                        self.load(Addr::Window(X16), X6);
+                        self.emit(mov(W, rd, X6));
+                    } else {
+                        self.load(Addr::Biased(host(ESP), disp as i32), rd);
+                    }
+                }
+                Input::Eax => self.emit(mov(W, rd, host(0))),
+                Input::Ecx => self.emit(mov(W, rd, host(1))),
+                Input::Edx => self.emit(mov(W, rd, host(2))),
+            }
+        }
+        let call = body.call as usize as u64;
+        self.emit(stp(X, Pre, X9, super::X12, SP, -16));
+        self.emit(add_imm(X, X0, RUNTIME, runtime::BODY, false));
+        self.emit(movz(X, X16, call as u16, 0));
+        for shift in [16, 32, 48] {
+            self.emit(movk(X, X16, (call >> shift) as u16, shift));
+        }
+        self.emit(blr(X16));
+        self.emit(ldp(X, Post, X9, super::X12, SP, 16));
+        self.state = State::CANONICAL;
+        self.emit(ubfx(X, X16, X1, 32, 32));
+        let slow = self.asm.label();
+        self.asm.cbz(W, true, X16, slow);
+        let (exit, eip, link) = if bound.entry {
+            (Exit::Dispatch, bound.thunk, true)
+        } else {
+            (Exit::Interpret, inst.pc, false)
+        };
+        self.push_cold(Cold::Leave {
+            label: slow,
+            state: State::CANONICAL,
+            simd_dirty: 0,
+            refund: self.trace.owed(self.index),
+            exit,
+            eip,
+            link,
+            x87: None,
+        });
+        if body.outputs & EAX != 0 {
+            self.clobber(Operand::Guest(0));
+            self.emit(mov(W, host(0), X0));
+        }
+        if body.outputs & EDX != 0 {
+            self.clobber(Operand::Guest(2));
+            self.emit(ubfx(X, host(2), X0, 32, 32));
+        }
+        if body.outputs & ECX != 0 {
+            self.clobber(Operand::Guest(1));
+            self.emit(mov(W, host(1), X1));
+        }
+        if bound.entry {
+            self.ret(inst, body.pop);
+        } else if body.pop != 0 {
+            self.emit(add_imm(X, host(ESP), host(ESP), u32::from(body.pop), false));
         }
     }
 

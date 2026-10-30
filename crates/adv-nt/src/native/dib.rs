@@ -26,6 +26,7 @@ macro_rules! bodies {
                 conv: Conv::Cdecl { argc: $argc },
                 body: Some($body),
                 handler: handler!($body),
+                direct: None,
             },
         )*)*];
     };

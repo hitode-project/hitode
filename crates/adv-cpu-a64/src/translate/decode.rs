@@ -139,6 +139,8 @@ pub enum Op {
     /// Anything else the interpreter runs without transferring control:
     /// the `interpret` stub runs it, by its index in the trace's helpers.
     Helper(u8),
+    /// A direct body call, by its index in the trace's bodies (A64-CALL-2).
+    Body(u8),
 }
 
 fn gpr32(register: Register) -> Option<u8> {
@@ -1034,6 +1036,8 @@ impl Op {
             }
             // The interpreter reads and writes canonical flags.
             Op::Helper(_) => (F::ALL, F::NONE, true),
+            // Calls leave the arithmetic flags undefined (A64-CALL-2).
+            Op::Body(_) => (F::NONE, F::ALL, true),
             Op::Apply(apply) => (F::ALL, F::ALL, apply.memory().is_some()),
         };
         Effects {

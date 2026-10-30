@@ -290,8 +290,8 @@ fn redirected_functions_run_the_target_while_their_bytes_are_unchanged() {
             })
             .collect::<Vec<_>>()
     };
-    // The first visit may run in the interpreter, which runs the function.
-    assert_eq!(results(&mut machine)[1..], [42, 42]);
+    // Interpreted first visits reach the target too.
+    assert_eq!(results(&mut machine), [42, 42, 42]);
     let mut changed = PLUS_ONE;
     changed[6] = 2;
     machine.cpu.write(FUNCTION, &changed).unwrap();
@@ -299,4 +299,169 @@ fn redirected_functions_run_the_target_while_their_bytes_are_unchanged() {
     machine.sys.trace = Trace::to_writer(Box::new(std::io::sink()));
     machine.cpu.write(FUNCTION, &PLUS_ONE).unwrap();
     assert_eq!(results(&mut machine), [22, 22, 22]);
+}
+
+const SLOT: u32 = DATA + 16;
+/// A copy of `PLUS_ONE` that nothing redirects.
+const OTHER: u32 = FUNCTION + 0x100;
+
+/// Three times the dword its argument points at, or the argument itself
+/// when it is below `DATA`.
+fn triple<M: adv_cpu::body::Mem>(
+    mem: &mut M,
+    [at, ..]: [u32; 7],
+) -> Result<adv_cpu::body::Ret, adv_cpu::body::Stop> {
+    let value = if at < DATA { at } else { mem.u32(at)? };
+    Ok(adv_cpu::body::Ret::from(value * 3))
+}
+adv_cpu::body!(TRIPLE = triple, inputs: &[adv_cpu::body::Input::Stack(0)], outputs: adv_cpu::body::EAX, pop: 0);
+
+/// `push argument; call [SLOT]; add esp, 4`, then the park, with `FUNCTION`
+/// in the slot, redirected to the doubling thunk and bound to `TRIPLE`.
+fn bound_fixture(argument: u32) -> Machine<JitCpu> {
+    let mut machine = Machine::new(
+        JitCpu::new(PARK_ADDR, true).unwrap(),
+        Doubling,
+        Clock::virtual_time(),
+    )
+    .unwrap();
+    machine.spawn("direct body test", CODE, &[], 65536).unwrap();
+    machine.cpu.map(CODE, 0x4000, Prot::RWX).unwrap();
+    machine.cpu.map(DATA, 0x4000, Prot::RW).unwrap();
+    let mut code = Asm::new(CODE);
+    code.push_imm(argument);
+    code.bytes.extend_from_slice(&[0xff, 0x15]);
+    code.bytes.extend_from_slice(&SLOT.to_le_bytes());
+    code.add_esp(4).jmp(PARK_ADDR);
+    machine.cpu.write(CODE, &code.bytes).unwrap();
+    machine.cpu.write(FUNCTION, &PLUS_ONE).unwrap();
+    machine.cpu.write(OTHER, &PLUS_ONE).unwrap();
+    machine.cpu.write_u32(SLOT, FUNCTION).unwrap();
+    let thunk = machine.resolve_import("fixture.dll", "double").unwrap();
+    machine
+        .sys
+        .redirects
+        .insert(FUNCTION, (thunk, PLUS_ONE.into()));
+    machine.sys.direct_bodies.insert(FUNCTION, TRIPLE.direct);
+    machine
+}
+
+fn results(machine: &mut Machine<JitCpu>) -> Vec<u32> {
+    (0..3)
+        .map(|_| {
+            run(machine);
+            machine.cpu.reg(Reg::Eax)
+        })
+        .collect()
+}
+
+// spec: A64-CALL-1, A64-CALL-2, A64-CALL-5, A64-CTL-11
+#[test]
+fn import_calls_reach_direct_bodies_until_the_slot_or_entry_changes() {
+    let mut machine = bound_fixture(21);
+    // Interpreted visits take the thunk, and so does the run whose
+    // translation first watches the slot's page; translated calls then
+    // call the body.
+    let first = results(&mut machine);
+    assert!(
+        first.iter().all(|&value| value == 42 || value == 63),
+        "{first:?}"
+    );
+    assert_eq!(first[2], 63);
+    assert_eq!(
+        machine.cpu.reg(Reg::Esp),
+        DATA + 0x3f00,
+        "the stack balances"
+    );
+    // A write to the import slot reaches translated calls (A64-CALL-1).
+    machine.cpu.write_u32(SLOT, OTHER).unwrap();
+    assert_eq!(results(&mut machine), [22, 22, 22]);
+    // So does a patch of the entry (A64-CTL-11).
+    machine.cpu.write_u32(SLOT, FUNCTION).unwrap();
+    let mut changed = PLUS_ONE;
+    changed[6] = 2;
+    machine.cpu.write(FUNCTION, &changed).unwrap();
+    assert_eq!(results(&mut machine), [23, 23, 23]);
+}
+
+// spec: A64-CALL-4
+#[test]
+fn a_body_the_window_stops_runs_on_the_full_path() {
+    let mut machine = bound_fixture(DATA + 0x100);
+    machine.cpu.write_u32(DATA + 0x100, 5).unwrap();
+    assert_eq!(results(&mut machine)[2], 15);
+    // An unmapped page stops the window form before it writes anything;
+    // the full path, here the doubling thunk, decides.
+    let unmapped = DATA + 0x10000;
+    let mut machine = bound_fixture(unmapped);
+    assert_eq!(results(&mut machine), [unmapped * 2; 3]);
+}
+
+struct Raising;
+impl crate::Resolver for Raising {
+    fn provides(&self, _: &str) -> bool {
+        true
+    }
+    fn host_fn(&self, _: &str, _: &str) -> Option<crate::HostFn> {
+        Some(crate::HostFn {
+            conv: Conv::Cdecl { argc: 1 },
+            handler: |env| {
+                Outcome::Raise(adv_cpu::backend::Fault {
+                    kind: adv_cpu::backend::FaultKind::Read(env.arg(0)),
+                    pc: FUNCTION,
+                })
+            },
+            data: 0,
+            trace: false,
+            guest: None,
+            leaf: None,
+        })
+    }
+}
+
+// spec: A64-CALL-4
+#[test]
+fn a_raised_fault_is_the_entrys_first_instruction_faulting() {
+    let mut machine = Machine::new(
+        JitCpu::new(PARK_ADDR, true).unwrap(),
+        Raising,
+        Clock::virtual_time(),
+    )
+    .unwrap();
+    machine.spawn("raise test", CODE, &[], 65536).unwrap();
+    machine.cpu.map(CODE, 0x4000, Prot::RWX).unwrap();
+    machine.cpu.map(DATA, 0x4000, Prot::RW).unwrap();
+    let thunk = machine.resolve_import("fixture.dll", "raise").unwrap();
+    let mut code = Asm::new(CODE);
+    code.push_imm(0x1234)
+        .call(FUNCTION)
+        .add_esp(4)
+        .jmp(PARK_ADDR);
+    machine.cpu.write(CODE, &code.bytes).unwrap();
+    machine.cpu.write(FUNCTION, &PLUS_ONE).unwrap();
+    machine
+        .sys
+        .redirects
+        .insert(FUNCTION, (thunk, PLUS_ONE.into()));
+    machine.cpu.set_reg(Reg::Eip, CODE);
+    machine.cpu.set_reg(Reg::Esp, DATA + 0x3f00);
+    let mut dispatch = Dispatch {
+        sys: &mut machine.sys,
+        ext: &mut machine.ext,
+        parked: None,
+        yield_on_frame: false,
+        defer_work: false,
+    };
+    assert!(matches!(machine.cpu.run(&mut dispatch), Exit::Parked));
+    // Without a guest exception handler the fault stops the machine, with
+    // the state at the entry: its return address on the stack.
+    let Some(Parked::Fail(message)) = dispatch.parked else {
+        panic!("the fault did not stop the machine");
+    };
+    assert!(
+        message.contains("Read(4660)") && message.contains(&format!("pc: {FUNCTION}")),
+        "{message}"
+    );
+    assert_eq!(machine.cpu.reg(Reg::Esp), DATA + 0x3f00 - 8);
+    assert_eq!(machine.cpu.read_u32(DATA + 0x3f00 - 8).unwrap(), CODE + 10);
 }

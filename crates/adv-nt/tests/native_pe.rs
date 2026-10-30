@@ -1617,7 +1617,7 @@ fn counted_body(m: &mut Machine<Cpu>, name: &str, context: u32, args: &[u32]) {
     );
 }
 
-// spec: NAT-BODY-5, NAT-BODY-6, NAT-BODY-7
+// spec: NAT-BODY-5, NAT-BODY-6, NAT-BODY-15
 #[test]
 fn pe_bodies_access_memory_by_page() {
     let Some(dist) = dist() else {
@@ -1720,7 +1720,7 @@ fn pe_bodies_access_memory_by_page() {
     );
 }
 
-// spec: NAT-BODY-5, NAT-BODY-7
+// spec: NAT-BODY-5, NAT-BODY-15
 #[test]
 fn code_pages_read_unborrowable_entries() {
     let Some(dist) = dist() else {

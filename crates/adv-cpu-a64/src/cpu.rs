@@ -536,6 +536,9 @@ impl ExecutionTrap for Raw<'_> {
     fn required_redirect(&self, pc: u32) -> Option<(u32, &[u8])> {
         self.handler.required_redirect(pc)
     }
+    fn direct_body(&self, pc: u32) -> Option<adv_cpu_core::body::DirectBody> {
+        self.handler.direct_body(pc)
+    }
 
     fn host_call(
         &mut self,
