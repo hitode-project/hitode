@@ -2247,8 +2247,17 @@ mod tests {
         assert_eq!((add.kind, add.width), (Kind::Float(Float::Fadd, true), 4));
         assert!(add.floating());
         let convert = plan(&decode(|a| a.cvttps2pi(mm1, xmm2).unwrap()), 0).unwrap();
-        assert!(convert.mmx() && convert.floating());
-        assert!(plan(&decode(|a| a.sqrtps(xmm1, xmm2).unwrap()), 0).is_none());
+        assert_eq!(
+            (convert.kind, convert.dst, convert.src),
+            (Kind::PackedToInt(true, false), Loc::Mmx(1), Loc::Xmm(2))
+        );
+        assert!(convert.mmx() && !convert.floating());
+        let sqrt = plan(&decode(|a| a.sqrtps(xmm1, xmm2).unwrap()), 0).unwrap();
+        assert_eq!(
+            (sqrt.kind, sqrt.dst, sqrt.src),
+            (Kind::Sqrt(false, false), Loc::Xmm(1), Loc::Xmm(2))
+        );
+        assert!(sqrt.floating());
         assert!(plan(&decode(|a| a.emms().unwrap()), 0).unwrap().mmx());
     }
 }

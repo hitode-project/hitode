@@ -121,7 +121,7 @@ fn source(i: &Instruction, integer: bool) -> Option<Source> {
 }
 
 pub fn classify(i: &Instruction) -> Option<Fast> {
-    if i.has_lock_prefix() || i.segment_prefix() == R::GS {
+    if i.has_lock_prefix() {
         return None;
     }
     let m = i.mnemonic();

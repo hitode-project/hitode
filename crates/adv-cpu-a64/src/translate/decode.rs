@@ -1291,11 +1291,16 @@ pub(super) mod tests {
             if let Some(actual) = actual {
                 assert_eq!(Some(actual), expected, "{bytes:02x?} at {pc:#x}");
             }
-            // Narrow and memory `inc`/`dec` forms are iced's alone.
-            let quick_form = !matches!(
-                expected,
-                Some((Op::Narrow(..) | Op::StepMemory(..) | Op::NarrowStep(..), _))
-            );
+            // Narrow forms, memory INC/DEC, POP ESP and word addresses use iced.
+            // Their native plans do not expand quick's coverage contract.
+            let quick_form = !bytes.starts_with(&[0x67])
+                && !matches!(
+                    expected,
+                    Some((
+                        Op::Narrow(..) | Op::StepMemory(..) | Op::NarrowStep(..) | Op::Pop(ESP),
+                        _
+                    ))
+                );
             if expected.is_some() && quick_form && round % 8 != 0 {
                 planned += 1;
                 covered += u32::from(actual.is_some());

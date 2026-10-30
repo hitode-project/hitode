@@ -1505,7 +1505,7 @@ mod tests {
         iced_x86::Decoder::with_ip(32, &bytes, 0x1000, 0).decode()
     }
 
-    // spec: A64F-FP-2
+    // spec: A64F-FP-2, A64F-FP-8
     #[test]
     fn plans_take_the_fast_forms_with_their_operands() {
         let load = plan(
@@ -1533,8 +1533,13 @@ mod tests {
         assert!(plan(&decode(|a| a.fnstsw(ax).unwrap()), 0, None).is_some());
         let control = plan(&decode(|a| a.fldcw(word_ptr(esp + 4)).unwrap()), 0, None).unwrap();
         assert_eq!(control.fast, Fast::LoadControl);
-        assert!(plan(&decode(|a| a.fld(tword_ptr(esi)).unwrap()), 0, None).is_none());
-        assert!(plan(&decode(|a| a.fld(dword_ptr(esi).gs()).unwrap()), 0, None).is_none());
+        let load80 = plan(&decode(|a| a.fld(tword_ptr(esi)).unwrap()), 0, None).unwrap();
+        assert_eq!(load80.fast, Fast::Load80);
+        let store80 = plan(&decode(|a| a.fstp(tword_ptr(esi)).unwrap()), 0, None).unwrap();
+        assert_eq!((store80.fast, store80.mem), (Fast::Store80, load80.mem));
+        let gs_load = plan(&decode(|a| a.fld(dword_ptr(esi).gs()).unwrap()), 0, None).unwrap();
+        assert_eq!(gs_load.fast, Fast::Load(Source::F32));
+        assert_eq!(gs_load.mem, load80.mem);
         assert!(plan(&decode(|a| a.fsqrt().unwrap()), 0, None).is_none());
     }
 }
