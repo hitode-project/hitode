@@ -1,8 +1,9 @@
 mod support;
 use adv_cpu::{CompileStrategy, EXEC, READ, Region, RunOutcome, WRITE};
+use adv_sync::pending::INTERRUPT;
 use iced_x86::code_asm::*;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 use support::Executor;
 
@@ -356,12 +357,12 @@ fn versioned_invariant_loop_interrupts_and_resumes_exactly() {
     m.state.regs = regs(100_000_000, SRC, DST);
     m.write(SRC, &1u32.to_le_bytes()).unwrap();
     m.write(DST, &0u32.to_le_bytes()).unwrap();
-    let flag = Arc::new(AtomicBool::new(false));
+    let flag = Arc::new(AtomicU32::new(0));
     m.set_host_interrupt_flag(flag.clone());
     let notify = flag.clone();
     let producer = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(2));
-        notify.store(true, Ordering::Release);
+        notify.store(INTERRUPT, Ordering::Release);
     });
     let elapsed = Instant::now();
     let outcome = m.run(STOP, 1 << 40).unwrap();
@@ -374,7 +375,7 @@ fn versioned_invariant_loop_interrupts_and_resumes_exactly() {
     let sum = u32::from_le_bytes(m.memory().read(DST, 4).unwrap().try_into().unwrap());
     assert_eq!(sum, completed);
 
-    flag.store(false, Ordering::Release);
+    flag.store(0, Ordering::Release);
     m.state.regs[1] = 10;
     assert_eq!(m.run(STOP, 1 << 20).unwrap(), RunOutcome::ReachedStop);
     assert_eq!(m.state.regs[3], completed + 10);
@@ -634,12 +635,12 @@ fn large_counter_steps_do_not_wrap_the_batch_funding_threshold() {
         jit.state.regs = initial;
         jit.state.eip = CODE;
         jit.state.eflags = 0x202;
-        let flag = Arc::new(AtomicBool::new(false));
+        let flag = Arc::new(AtomicU32::new(0));
         jit.set_host_interrupt_flag(flag.clone());
         let notify = flag.clone();
         let producer = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(50));
-            notify.store(true, Ordering::Release);
+            notify.store(INTERRUPT, Ordering::Release);
         });
         let result = jit.run(STOP, 1 << 30).unwrap();
         producer.join().unwrap();
@@ -1323,12 +1324,12 @@ fn batched_loop_interrupts_and_resumes_exactly() {
     // Complete the prologue and ten six-instruction iterations first, so an
     // interrupt arriving at the next entry still observes a nonempty prefix.
     assert_eq!(m.run(STOP, 61).unwrap(), RunOutcome::Budget);
-    let flag = Arc::new(AtomicBool::new(false));
+    let flag = Arc::new(AtomicU32::new(0));
     m.set_host_interrupt_flag(flag.clone());
     let notify = flag.clone();
     let producer = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(2));
-        notify.store(true, Ordering::Release);
+        notify.store(INTERRUPT, Ordering::Release);
     });
     let outcome = m.run(STOP, 1 << 40).unwrap();
     producer.join().unwrap();
@@ -1338,7 +1339,7 @@ fn batched_loop_interrupts_and_resumes_exactly() {
     assert_eq!(m.state.regs[1], 100_000_000 - completed);
     assert_eq!(m.state.regs[0], 6);
     assert_eq!(m.memory().read(DST, 1).unwrap(), [6]);
-    flag.store(false, Ordering::Release);
+    flag.store(0, Ordering::Release);
     m.state.regs[1] = 11;
     assert_eq!(m.run(STOP, 1 << 20).unwrap(), RunOutcome::ReachedStop);
     assert_eq!(m.state.regs[2], completed + 11);
@@ -1401,7 +1402,7 @@ fn transfer_interrupt(width: u32, fill: bool, looping: bool) {
     m.state.eip = CODE;
     // Finish compilation before starting the interrupt producer.
     assert_eq!(m.run(STOP, 64).unwrap(), RunOutcome::Budget);
-    let flag = Arc::new(AtomicBool::new(false));
+    let flag = Arc::new(AtomicU32::new(0));
     m.set_host_interrupt_flag(flag.clone());
     let budget = 1 << 40;
     // How long the copy runs depends on host memory bandwidth (a fast ARM64
@@ -1412,11 +1413,11 @@ fn transfer_interrupt(width: u32, fill: bool, looping: bool) {
     for delay in [200, 50, 1000, 20, 2000, 5] {
         m.state.regs = regs(count, SRC, SRC);
         m.state.eip = CODE;
-        flag.store(false, Ordering::Release);
+        flag.store(0, Ordering::Release);
         let notify = flag.clone();
         let producer = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_micros(delay));
-            notify.store(true, Ordering::Release);
+            notify.store(INTERRUPT, Ordering::Release);
         });
         let outcome = m.run(STOP, budget).unwrap();
         producer.join().unwrap();
@@ -1433,7 +1434,7 @@ fn transfer_interrupt(width: u32, fill: bool, looping: bool) {
     assert_eq!(m.state.regs[7], SRC + done * width);
     assert_eq!(m.state.mmx[0], 0);
 
-    flag.store(false, Ordering::Release);
+    flag.store(0, Ordering::Release);
     m.state.regs[1] = 11;
     assert_eq!(m.run(STOP, 100).unwrap(), RunOutcome::ReachedStop);
     assert_eq!(
