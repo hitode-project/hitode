@@ -748,7 +748,7 @@ mod speed_tests {
         a.mov(ebp, 3).unwrap();
         a.set_label(&mut again).unwrap();
         a.shrd(eax, edx, cl).unwrap(); // operation helper
-        a.xlatb().unwrap(); // interpret helper
+        a.lahf().unwrap(); // interpret helper
         a.mov(ecx, 5).unwrap();
         a.rep().movsb().unwrap();
         a.dec(ebp).unwrap();
@@ -769,7 +769,6 @@ mod speed_tests {
             let start = |cpu: &mut Executor, pc| {
                 cpu.state = CpuState::default();
                 cpu.state.eip = pc;
-                cpu.state.regs[3] = DATA;
                 cpu.state.regs[6] = DATA + 0x100;
                 cpu.state.regs[7] = DATA + 0x200;
             };
