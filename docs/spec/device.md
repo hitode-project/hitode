@@ -190,6 +190,11 @@ Unmatched libraries MUST execute their guest implementations.
 **Rule**: Enumerating without a family name MUST report each family once, preferring its regular style, and once per character set for extended enumeration. Host-private families, whose names start with a period, and unnamed faces MUST be left out.
 **Verification**: Test
 
+### DEV-FONT-6 Windows font layer
+
+**Rule**: Fonts shipped with the Windows installation MUST be discovered only for families that no host font provides, after every host face. Glyph association MUST NOT draw from a symbol-encoded face that the request did not select.
+**Verification**: Test
+
 ## Optical media
 
 ### DEV-DISC-1 Mount configuration

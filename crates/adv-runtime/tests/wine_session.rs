@@ -329,7 +329,8 @@ fn program_session(child: bool) {
     }
     assert!(frames >= 1, "no frame was presented");
     assert_eq!(size, (64, 32));
-    assert_eq!(inked, 43);
+    // "Hi" in Wine's Tahoma at -16, non-antialiased, from the native rasterizer.
+    assert_eq!(inked, 75);
 }
 
 // spec: WINE-UI-1, WINE-UI-2

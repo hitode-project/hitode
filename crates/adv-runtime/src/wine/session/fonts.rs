@@ -68,6 +68,7 @@ fn create_font(
 
 pub(super) struct Fonts {
     directories: Option<Vec<PathBuf>>,
+    windows: PathBuf,
     resources: Vec<Vec<u8>>,
     overrides: crate::FontOverrides,
     locale: u32,
@@ -78,13 +79,21 @@ pub(super) struct Fonts {
 /// Discovery is retained by the device's process-wide directory catalog.
 #[derive(Default)]
 pub(super) struct Catalog {
-    fonts: BTreeMap<String, Rc<FontReplacements>>,
+    fonts: BTreeMap<(String, PathBuf), Rc<FontReplacements>>,
 }
 struct SavedSetting {
     key: String,
     name: String,
     value: Option<(u32, Vec<u8>)>,
 }
+fn text(directories: Option<&[PathBuf]>, windows: &Path) -> Text {
+    match directories {
+        Some(directories) => Text::with_font_directories(directories),
+        None => Text::default(),
+    }
+    .with_windows_fonts(windows)
+}
+
 impl Catalog {
     pub fn prepare(
         &mut self,
@@ -100,19 +109,21 @@ impl Catalog {
                 .map(|path| PathBuf::from(path.replace('\\', "/")))
                 .collect()
         });
-        let catalog = if let Some(catalog) = self.fonts.get(config.fonts) {
+        // Wine's own fonts stand in for the Windows ones the host lacks, as
+        // its font engine did before the native bodies replaced it.
+        let windows = config.dist.join("share/wine/fonts");
+        let key = (config.fonts.to_owned(), windows.clone());
+        let catalog = if let Some(catalog) = self.fonts.get(&key) {
             catalog.clone()
         } else {
-            let text = match &directories {
-                Some(dirs) => Text::with_font_directories(dirs),
-                None => Text::default(),
-            };
+            let text = text(directories.as_deref(), &windows);
             let catalog = Rc::new(text.replacement_fonts().map_err(|e| e.to_string())?);
-            self.fonts.insert(config.fonts.to_owned(), catalog.clone());
+            self.fonts.insert(key, catalog.clone());
             catalog
         };
         Ok(Fonts {
             directories,
+            windows,
             resources: crate::font::read_resources(&options.font_files)?,
             overrides: options.fonts.clone(),
             locale: config.locale,
@@ -123,10 +134,7 @@ impl Catalog {
 }
 impl Fonts {
     pub fn configure(&self, machine: &mut Machine<Cpu>) -> Result<(), String> {
-        let mut text = match &self.directories {
-            Some(dirs) => Text::with_font_directories(dirs),
-            None => Text::default(),
-        };
+        let mut text = text(self.directories.as_deref(), &self.windows);
         for bytes in &self.resources {
             text.add_file_resource(bytes, true)
                 .map_err(|e| e.to_string())?;
