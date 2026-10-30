@@ -1104,3 +1104,123 @@ fn body_forwarding_keeps_arguments_an_intervening_instruction_observes() {
     assert_eq!(cpu.memory.read(DATA + 0x100, 0x104).unwrap(), expected);
     assert_eq!(read_word(&cpu.memory, DATA + 0x180).unwrap(), 16);
 }
+
+// spec: A64-CALL-2, A64-CALL-8, A64-VER-2
+#[test]
+fn inline_body_memory_and_esp_producers_preserve_fallback_arguments() {
+    use iced_x86::code_asm::*;
+    for host_size in [4096, 16384]
+        .into_iter()
+        .filter(|&size| size >= adv_cpu_core::virtual_memory::host_page_size().unwrap())
+    {
+        for producer in 0..3 {
+            let (mut cpu, mut calls, _) = small_fixture(
+                host_size,
+                crate::body::Inline::Move,
+                [DATA + 0x100, DATA + 0x200, 16],
+                3,
+                false,
+            );
+            cpu.write(DATA + 0x3000, &(DATA + 0x200).to_le_bytes())
+                .unwrap();
+            let mut a = CodeAssembler::new(32).unwrap();
+            a.push(16).unwrap();
+            if producer == 0 {
+                a.push(dword_ptr((DATA + 0x3000) as i32)).unwrap();
+            } else if producer == 1 {
+                a.push(esp).unwrap();
+            } else {
+                a.push((DATA + 0x200) as i32).unwrap();
+            }
+            if producer == 2 {
+                a.push(esp).unwrap();
+            } else {
+                a.push((DATA + 0x100) as i32).unwrap();
+            }
+            a.call(dword_ptr((DATA + 0x4000) as i32)).unwrap();
+            a.add(esp, 12).unwrap();
+            let code = a.assemble(u64::from(CODE)).unwrap();
+            let stop = CODE + code.len() as u32;
+            cpu.write(CODE, &code).unwrap();
+            cpu.write(DATA + 0x200, &[0x71; 16]).unwrap();
+            let initial = cpu.state.clone();
+            cpu.run_with_traps(stop, 1000, &mut calls, true).unwrap();
+            let expected = cpu.memory.read(DATA + 0x100, 16).unwrap().to_vec();
+            let stack = cpu.memory.read(STACK + 0x2fe0, 64).unwrap().to_vec();
+            let regs = cpu.state.regs;
+            cpu.state = initial;
+            cpu.write(DATA + 0x100, &[0; 16]).unwrap();
+            cpu.write(STACK + 0x2fe0, &[0; 64]).unwrap();
+            BODY_CALLS.set(0);
+            cpu.run_with_traps(stop, 1000, &mut calls, false).unwrap();
+            assert_eq!(cpu.state.regs, regs, "producer={producer}");
+            assert_eq!(cpu.memory.read(DATA + 0x100, 16).unwrap(), expected);
+            if producer == 0 {
+                assert_eq!(
+                    BODY_CALLS.get(),
+                    0,
+                    "known length with a memory pointer expands"
+                );
+                assert_eq!(
+                    read_word(&cpu.memory, STACK + 0x2ff4).unwrap(),
+                    0,
+                    "the destination push is omitted"
+                );
+            } else {
+                assert_eq!(
+                    BODY_CALLS.get(),
+                    1,
+                    "a stack alias takes the out-of-line body"
+                );
+                assert_eq!(cpu.memory.read(STACK + 0x2ff4, 44).unwrap(), &stack[20..]);
+            }
+        }
+    }
+}
+
+// spec: A64-CALL-2, A64-CALL-8
+#[test]
+fn inline_body_length_discovery_stops_at_a_merge() {
+    use iced_x86::code_asm::*;
+    for branch in [0, 1] {
+        let (mut cpu, mut calls, _) = small_fixture(
+            adv_cpu_core::virtual_memory::host_page_size().unwrap(),
+            crate::body::Inline::Move,
+            [DATA + 0x100, DATA + 0x200, 16],
+            3,
+            false,
+        );
+        let mut a = CodeAssembler::new(32).unwrap();
+        let mut merge = a.create_label();
+        a.push(32).unwrap();
+        a.test(ecx, ecx).unwrap();
+        a.je(merge).unwrap();
+        a.add(esp, 4).unwrap();
+        a.push(16).unwrap();
+        a.set_label(&mut merge).unwrap();
+        a.push((DATA + 0x200) as i32).unwrap();
+        a.push((DATA + 0x100) as i32).unwrap();
+        a.call(dword_ptr((DATA + 0x4000) as i32)).unwrap();
+        a.add(esp, 12).unwrap();
+        let code = a.assemble(u64::from(CODE)).unwrap();
+        let stop = CODE + code.len() as u32;
+        cpu.write(CODE, &code).unwrap();
+        cpu.write(DATA + 0x200, &[0x71; 32]).unwrap();
+        cpu.state.regs[1] = branch;
+        let initial = cpu.state.clone();
+        cpu.run_with_traps(stop, 1000, &mut calls, true).unwrap();
+        let expected = cpu.memory.read(DATA + 0x100, 32).unwrap().to_vec();
+        let regs = cpu.state.regs;
+        cpu.state = initial;
+        cpu.write(DATA + 0x100, &[0; 32]).unwrap();
+        BODY_CALLS.set(0);
+        cpu.run_with_traps(stop, 1000, &mut calls, false).unwrap();
+        assert_eq!(cpu.state.regs, regs);
+        assert_eq!(cpu.memory.read(DATA + 0x100, 32).unwrap(), expected);
+        assert_eq!(
+            BODY_CALLS.get(),
+            1,
+            "the merged argument remains a stack load"
+        );
+    }
+}

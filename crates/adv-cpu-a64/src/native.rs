@@ -1144,7 +1144,6 @@ impl Native {
             } else {
                 memory.fast.body_table((memory.base >> 12) as usize)
             },
-            blocked_stack: u32::MAX,
             services: self.runtime.body.services,
         };
         self.classified_epoch = Some(memory.epoch);

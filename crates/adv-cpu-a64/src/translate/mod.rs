@@ -338,14 +338,7 @@ enum Cold {
         body: adv_cpu_core::body::DirectBody,
         len: u32,
         vector: simd::Vector,
-    },
-    BodySlow {
-        label: Label,
         pushes: Vec<decode::Src>,
-        simd_dirty: u16,
-        refund: u32,
-        eip: u32,
-        entry: bool,
     },
     BodyYield {
         label: Label,
@@ -1405,36 +1398,15 @@ impl Translator<'_> {
                 body,
                 len,
                 vector,
+                pushes,
             } => {
                 self.asm.bind(label);
                 self.vector = vector;
+                // Materialize before the body can observe or overwrite arguments.
+                self.body_stores(&pushes);
                 self.mov_imm(X3, len);
                 self.body_call(body);
                 self.asm.b(resume);
-            }
-            Cold::BodySlow {
-                label,
-                pushes,
-                simd_dirty,
-                refund,
-                eip,
-                entry,
-            } => {
-                self.asm.bind(label);
-                self.state = State::CANONICAL;
-                self.vector.dirty = simd_dirty;
-                self.body_stores(&pushes);
-                self.leave(
-                    if entry {
-                        Exit::Dispatch
-                    } else {
-                        Exit::Interpret
-                    },
-                    eip,
-                    refund,
-                    entry,
-                    false,
-                );
             }
             Cold::BodyYield {
                 label,

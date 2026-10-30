@@ -52,7 +52,7 @@ impl Translator<'_> {
                 .take(if kind == Inline::Set { 1 } else { 2 })
             {
                 if !granted[arg] {
-                    self.emit(ldr(W, X3, RUNTIME, runtime::BODY_BLOCKED_STACK));
+                    self.emit(ldr(W, X3, RUNTIME, runtime::BODY_STACK));
                     self.emit(lsr_imm(W, X4, if arg == 0 { X1 } else { x2 }, 12));
                     self.emit(sub(W, X4, X4, X3, Lsl, 0));
                     self.asm.cbz(W, false, X4, slow);
@@ -294,7 +294,7 @@ impl Translator<'_> {
             }
             self.body_page(X16, len, true, slow);
             self.emit(lsr_imm(W, X16, X16, 12));
-            self.emit(str(W, X16, RUNTIME, runtime::BODY_BLOCKED_STACK));
+            self.emit(str(W, X16, RUNTIME, runtime::BODY_STACK));
             let mut pages = Vec::new();
             let mut registers: Vec<(u8, u32, bool)> = Vec::new();
             for index in 0..self.trace.len() {
@@ -305,9 +305,9 @@ impl Translator<'_> {
                     continue;
                 };
                 let pushes = self.body_pushes(index);
-                if !matches!(pushes.get(2), Some(Src::Imm(1..=64))) {
+                let Some(len @ 1..=64) = self.body_length(index) else {
                     continue;
-                }
+                };
                 for arg in 0..if kind == adv_cpu_core::body::Inline::Set {
                     1
                 } else {
@@ -317,16 +317,13 @@ impl Translator<'_> {
                     if let Some(Src::Reg(reg)) = pushes.get(arg)
                         && self.body_invariant(*reg)
                     {
-                        let Some(Src::Imm(len)) = pushes.get(2) else {
-                            unreachable!()
-                        };
                         if let Some((_, span, grant)) =
                             registers.iter_mut().find(|(r, _, _)| r == reg)
                         {
-                            *span = (*span).max(*len);
+                            *span = (*span).max(len);
                             *grant |= write;
                         } else {
-                            registers.push((*reg, *len, write));
+                            registers.push((*reg, len, write));
                         }
                     }
                     if let Some(Src::Imm(at)) = pushes.get(arg) {
@@ -363,14 +360,6 @@ impl Translator<'_> {
                 link: false,
                 x87: None,
             });
-        } else if self
-            .trace
-            .insts
-            .iter()
-            .any(|inst| matches!(inst.op, Op::Body(_)))
-        {
-            self.mov_imm(X16, u32::MAX);
-            self.emit(str(W, X16, RUNTIME, runtime::BODY_BLOCKED_STACK));
         }
     }
 
@@ -395,6 +384,33 @@ impl Translator<'_> {
         source
     }
 
+    /// Only expansions omit stores: ordinary body calls keep their original
+    /// stack accesses, with no per-page stack-alias exclusion in the body.
+    pub(super) fn body_length(&self, index: usize) -> Option<u32> {
+        let Op::Body(n) = self.trace.insts[index].op else {
+            return None;
+        };
+        let bound = self.trace.bodies[usize::from(n)];
+        if bound.entry || bound.body.inline.is_none() {
+            return None;
+        }
+        for (argument, before) in (index.saturating_sub(3)..index).rev().enumerate() {
+            if self.trace.head(before + 1) || self.trace.merge[before + 1] {
+                return None;
+            }
+            let Op::Push(source) = self.trace.insts[before].op else {
+                return None;
+            };
+            if argument == 2 {
+                return match self.pushed_value(before, source) {
+                    Src::Imm(len) if len <= 64 => Some(len),
+                    _ => None,
+                };
+            }
+        }
+        None
+    }
+
     /// A suffix of adjacent argument pushes has no observer or budget edge.
     /// Its registers cannot change before the call, so cold exits can recreate it.
     pub(super) fn body_pushes(&self, index: usize) -> Vec<Src> {
@@ -402,7 +418,7 @@ impl Translator<'_> {
             return Vec::new();
         };
         let bound = self.trace.bodies[usize::from(n)];
-        if bound.entry {
+        if self.body_length(index).is_none() {
             return Vec::new();
         }
         let count = bound
@@ -531,21 +547,25 @@ mod tests {
     // spec: A64-CALL-2, A64-CALL-3, A64-CALL-8
     #[test]
     fn body_fast_paths_fit_the_original_call_sites() {
-        for (kind, len, original, dynamic) in [
-            (Some(Inline::Move), 4, 23, false),
-            (Some(Inline::Move), 16, 23, false),
-            (Some(Inline::Move), 64, 23, false),
-            (Some(Inline::Compare), 8, 22, false),
-            (Some(Inline::Set), 64, 21, false),
-            (None, 16, 15, false),
-            (None, 16, 25, true),
+        for (kind, len, original, dynamic, arity) in [
+            (Some(Inline::Move), 4, 23, false, 3),
+            (Some(Inline::Move), 16, 23, false, 3),
+            (Some(Inline::Move), 64, 23, false, 3),
+            (Some(Inline::Compare), 8, 22, false, 3),
+            (Some(Inline::Set), 64, 21, false, 3),
+            (None, 16, 15, false, 1),
+            (None, 32, 19, false, 2),
+            (None, 64, 21, false, 3),
+            (None, 64, 15, false, 1),
+            (None, 256, 15, false, 1),
+            (None, 16, 25, true, 3),
         ]
         .into_iter()
         .chain((1..=64).flat_map(|len| {
             [
-                (Some(Inline::Move), len, 23, false),
-                (Some(Inline::Set), len, 21, false),
-                (Some(Inline::Compare), len, 22, false),
+                (Some(Inline::Move), len, 23, false, 3),
+                (Some(Inline::Set), len, 21, false, 3),
+                (Some(Inline::Compare), len, 22, false, 3),
             ]
         })) {
             let mut a = CodeAssembler::new(32).unwrap();
@@ -562,7 +582,11 @@ mod tests {
                     len,
                 ]
             } else {
-                vec![0x20100]
+                match arity {
+                    2 => vec![0x20100, 0x21200],
+                    3 => vec![1, 0x20100, len],
+                    _ => vec![0x20100],
+                }
             };
             for (index, &arg) in args.iter().enumerate().rev() {
                 if dynamic && index == 2 {
@@ -646,7 +670,14 @@ mod tests {
             println!(
                 "{kind:?} {len} dynamic={dynamic}: {count} A64 instructions (original {original})"
             );
-            assert!(count <= original, "{kind:?} {len}: {count} > {original}");
+            if kind.is_none() {
+                assert_eq!(
+                    count, original,
+                    "ordinary body calls keep their original emission"
+                );
+            } else {
+                assert!(count <= original, "{kind:?} {len}: {count} > {original}");
+            }
         }
     }
 }

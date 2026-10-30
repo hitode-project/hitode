@@ -536,12 +536,7 @@ impl Translator<'_> {
         *self.uses_permissions = true;
         let body = bound.body;
         let pushes = self.body_pushes(self.index);
-        let inline = body
-            .inline
-            .zip(pushes.get(2).and_then(|source| match source {
-                Src::Imm(len) if *len <= 64 => Some(*len),
-                _ => None,
-            }));
+        let inline = body.inline.zip(self.body_length(self.index));
         if !pushes.is_empty() {
             self.prepare(Operand::Guest(ESP));
             if self.body_stack_span().is_none() {
@@ -585,7 +580,7 @@ impl Translator<'_> {
         }
         if !pushes.is_empty() && self.body_stack_span().is_none() {
             self.emit(lsr_imm(W, X16, host(ESP), 12));
-            self.emit(str(W, X16, RUNTIME, runtime::BODY_BLOCKED_STACK));
+            self.emit(str(W, X16, RUNTIME, runtime::BODY_STACK));
         }
         let base = if bound.entry { 4 } else { 0 };
         for (n, &input) in body.inputs.iter().flatten().enumerate() {
@@ -664,6 +659,7 @@ impl Translator<'_> {
                 body,
                 len,
                 vector: self.vector,
+                pushes,
             });
         } else {
             self.body_call(body);
@@ -671,13 +667,19 @@ impl Translator<'_> {
         self.state = State::CANONICAL;
         let slow = self.asm.label();
         self.asm.tbz(true, X1, 32, slow);
-        self.push_cold(Cold::BodySlow {
+        self.push_cold(Cold::Leave {
             label: slow,
-            pushes,
+            state: State::CANONICAL,
             simd_dirty: self.vector.dirty,
             refund: self.trace.owed(self.index),
+            exit: if bound.entry {
+                Exit::Dispatch
+            } else {
+                Exit::Interpret
+            },
             eip: if bound.entry { bound.thunk } else { inst.pc },
-            entry: bound.entry,
+            link: bound.entry,
+            x87: None,
         });
         if body.outputs & EAX != 0 {
             self.clobber(Operand::Guest(0));

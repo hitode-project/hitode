@@ -135,8 +135,6 @@ pub struct BodyContext {
     /// A class byte per 4 KiB guest page. ALIAS selects private storage;
     /// NO_ALIAS confines overlays to the window.
     pub classes: *const u8,
-    /// An omitted argument-stack page; accesses retry after materialization.
-    pub blocked_stack: u32,
     pub services: Services,
 }
 
@@ -146,7 +144,6 @@ impl Default for BodyContext {
             window: std::ptr::null_mut(),
             alias: std::ptr::null_mut(),
             classes: std::ptr::null(),
-            blocked_stack: u32::MAX,
             services: Services::default(),
         }
     }
@@ -320,7 +317,6 @@ pub struct Window {
     window: *mut u8,
     alias: *mut u8,
     classes: *const u8,
-    blocked_stack: u32,
     services: Services,
 }
 
@@ -332,15 +328,11 @@ impl Window {
             window: context.window,
             alias: context.alias,
             classes: context.classes,
-            blocked_stack: context.blocked_stack,
             services: context.services,
         }
     }
 
     fn class(&self, page: u32) -> u8 {
-        if page == self.blocked_stack {
-            return 0;
-        }
         // SAFETY: the table has a byte for every page of the 4 GiB space.
         unsafe { *self.classes.add(page as usize) }
     }
@@ -716,7 +708,6 @@ mod tests {
             window: bytes.as_mut_ptr(),
             alias: bytes.as_mut_ptr(),
             classes: table.as_ptr(),
-            blocked_stack: u32::MAX,
             services: Services::default(),
         };
         (window, table)
