@@ -1376,61 +1376,90 @@ fn convert_microbenchmark() {
         return;
     };
     let mut m = machine(&dist, true, None);
-    let mut data = fixture(2, 0);
-    dib(&mut data, SRC, 0, SOURCE_BITS, 0);
-    let source = 0x20000000;
-    let target = 0x21000000;
-    m.cpu
-        .map(source, (960 * 540 * 4 + 4095) & !4095, Prot::RW)
-        .unwrap();
-    m.cpu
-        .map(target, (960 * 540 * 3 + 4095) & !4095, Prot::RW)
-        .unwrap();
-    let pixels: Vec<_> = (0..960 * 540 * 4).map(|i| (i * 71) as u8).collect();
-    m.cpu.write(source, &pixels).unwrap();
-    for (address, bits, bpp) in [(DST, target, 24), (SRC, source, 32)] {
-        for (field, value) in [
-            (d::bits, bits),
-            (d::width, 960),
-            (d::height, 540),
-            (d::stride, 960 * bpp / 8),
-        ] {
-            set(&mut data, address, field, value);
+    for (src, dst, label) in [
+        (0, 2, "8888->24"),
+        (0, 1, "8888->8888 bitfields"),
+        (0, 3, "8888->555"),
+        (0, 4, "8888->565"),
+        (2, 0, "24->8888"),
+    ] {
+        let mut data = fixture(dst, 0);
+        dib(&mut data, SRC, src, SOURCE_BITS, 0);
+        if dst == 1 {
+            for (field, value) in [
+                (d::red_shift, 16),
+                (d::green_shift, 8),
+                (d::blue_shift, 0),
+                (d::red_mask, 0xff0000),
+                (d::green_mask, 0xff00),
+                (d::blue_mask, 0xff),
+            ] {
+                set(&mut data, DST, field, value);
+            }
         }
-    }
-    for rows in [540, 16] {
-        for (field, value) in [
-            (rect::left, 0),
-            (rect::top, 0),
-            (rect::right, 960),
-            (rect::bottom, rows),
-        ] {
-            set(&mut data, RECTS, field, value);
+        let source = 0x20000000;
+        let target = 0x21000000;
+        if src == 0 && dst == 2 {
+            m.cpu
+                .map(source, (960 * 540 * 4 + 4095) & !4095, Prot::RW)
+                .unwrap();
+            m.cpu
+                .map(target, (960 * 540 * 4 + 4095) & !4095, Prot::RW)
+                .unwrap();
         }
-        m.cpu.write(DATA, &data).unwrap();
-        let thunk = prepare_body(&mut m, "convert_to_24", &[DST, SRC, RECTS, 0]);
-        for _ in 0..10 {
-            assert!(matches!(
-                body(&mut m, thunk),
-                adv_machine::Outcome::Return64(_)
-            ));
+        let pixels: Vec<_> = (0..960 * 540 * 4).map(|i| (i * 71) as u8).collect();
+        m.cpu.write(source, &pixels).unwrap();
+        for (address, bits, bpp) in [(DST, target, FORMATS[dst].1), (SRC, source, FORMATS[src].1)] {
+            for (field, value) in [
+                (d::bits, bits),
+                (d::width, 960),
+                (d::height, 540),
+                (d::stride, 960 * bpp / 8),
+            ] {
+                set(&mut data, address, field, value);
+            }
         }
-        let mut samples = [0.0f64; 5];
-        for sample in &mut samples {
-            let start = thread_seconds();
-            for _ in 0..200 {
+        for rows in [540, 16] {
+            for (field, value) in [
+                (rect::left, 0),
+                (rect::top, 0),
+                (rect::right, 960),
+                (rect::bottom, rows),
+            ] {
+                set(&mut data, RECTS, field, value);
+            }
+            m.cpu.write(DATA, &data).unwrap();
+            let thunk = prepare_body(
+                &mut m,
+                &format!("convert_to_{}", FORMATS[dst].0),
+                &[DST, SRC, RECTS, 0],
+            );
+            for _ in 0..10 {
                 assert!(matches!(
                     body(&mut m, thunk),
                     adv_machine::Outcome::Return64(_)
                 ));
             }
-            *sample = (thread_seconds() - start) * 1e6 / 200.0;
+            let mut samples = [0.0f64; 5];
+            for sample in &mut samples {
+                let start = thread_seconds();
+                for _ in 0..200 {
+                    assert!(matches!(
+                        body(&mut m, thunk),
+                        adv_machine::Outcome::Return64(_)
+                    ));
+                }
+                *sample = (thread_seconds() - start) * 1e6 / 200.0;
+            }
+            samples.sort_by(f64::total_cmp);
+            eprintln!(
+                "convert 960x{rows} {label}: {:.3} CPU us/call, {:.3} ns/pixel (median of 5 batches of 200 warm calls; range {:.3}..{:.3})",
+                samples[2],
+                samples[2] * 1000.0 / (960 * rows) as f64,
+                samples[0],
+                samples[4]
+            );
         }
-        samples.sort_by(f64::total_cmp);
-        eprintln!(
-            "convert 960x{rows} 32->24: {:.3} CPU us/call (median of 5 batches of 200 warm calls; range {:.3}..{:.3})",
-            samples[2], samples[0], samples[4]
-        );
     }
 }
 
@@ -1800,5 +1829,218 @@ fn halftone_keeps_touched_row_access_requirements() {
         });
         assert!(!matches!(result, adv_machine::Outcome::Return64(_)));
         assert!(cpu.writes.is_empty());
+    }
+}
+
+// Wine's per-pixel conversion: unpack each source channel to eight bits, then
+// pack it into the destination field. Destination padding is cleared.
+fn reference_pixel(data: &[u8], (src, dst): (usize, usize), pixel: u32) -> u32 {
+    let field = |address: u32, offset: usize| {
+        let at = (address - DATA) as usize + offset;
+        u32::from_le_bytes(data[at..at + 4].try_into().unwrap())
+    };
+    let channels = |address: u32| {
+        (
+            [d::red_shift, d::green_shift, d::blue_shift].map(|f| field(address, f) as i32),
+            [d::red_len, d::green_len, d::blue_len].map(|f| field(address, f)),
+        )
+    };
+    let mask = |len: u32| (255u32 << (8 - len.min(8))) & 255;
+    let rgb = match src {
+        0 | 2 => [(pixel >> 16) & 255, (pixel >> 8) & 255, pixel & 255],
+        3 => [
+            ((pixel >> 7) & 248) | ((pixel >> 12) & 7),
+            ((pixel >> 2) & 248) | ((pixel >> 7) & 7),
+            ((pixel << 3) & 248) | ((pixel >> 2) & 7),
+        ],
+        _ => {
+            let (shifts, lens) = channels(SRC);
+            std::array::from_fn(|i| {
+                let shift = shifts[i] - (8 - lens[i] as i32);
+                let value = if shift < 0 {
+                    pixel.wrapping_shl(-shift as u32)
+                } else {
+                    pixel.wrapping_shr(shift as u32)
+                } & mask(lens[i]);
+                value | value.wrapping_shr(lens[i])
+            })
+        }
+    };
+    match dst {
+        0 | 2 => (rgb[0] & 255) << 16 | (rgb[1] & 255) << 8 | (rgb[2] & 255),
+        3 => ((rgb[0] << 7) & 0x7c00) | ((rgb[1] << 2) & 0x3e0) | ((rgb[2] >> 3) & 31),
+        _ => {
+            let (shifts, lens) = channels(DST);
+            (0..3).fold(0, |p, i| {
+                let shift = shifts[i] - (8 - lens[i] as i32);
+                let value = rgb[i] & mask(lens[i]);
+                p | if shift < 0 {
+                    value.wrapping_shr(-shift as u32)
+                } else {
+                    value.wrapping_shl(shift as u32)
+                }
+            })
+        }
+    }
+}
+
+// spec: NAT-BODY-4
+#[test]
+fn true_color_rows_match_wine_pixel_path() {
+    let Some(dist) = dist() else {
+        return;
+    };
+    let mut m = machine(&dist, true, None);
+    for (src, source) in FORMATS.iter().enumerate().take(5) {
+        for (dst, target) in FORMATS.iter().enumerate().take(5) {
+            for width in [1, 2, 3, 7, 8, 9, 15, 16, 17, 960] {
+                for seed in [0, 2, 4, 6] {
+                    for signs in 0..4 {
+                        let mut data = fixture(dst, seed);
+                        dib(&mut data, SRC, src, SOURCE_BITS, seed + 2);
+                        for (address, bits, bpp, extra, negative) in [
+                            (SRC, SOURCE_BITS, source.1, 2, signs & 1 != 0),
+                            (DST, DEST_BITS, target.1, 1, signs & 2 != 0),
+                        ] {
+                            let row_len = ((width + extra) * bpp).div_ceil(32) * 4;
+                            let stride = row_len + 4;
+                            set(&mut data, address, d::width, width + extra);
+                            set(&mut data, address, d::height, 3);
+                            set(
+                                &mut data,
+                                address,
+                                d::stride,
+                                if negative {
+                                    (-(stride as i32)) as u32
+                                } else {
+                                    stride
+                                },
+                            );
+                            set(
+                                &mut data,
+                                address,
+                                d::bits,
+                                bits + if negative { 2 * stride } else { 0 },
+                            );
+                        }
+                        for (field, value) in [
+                            (rect::left, 1),
+                            (rect::top, 1),
+                            (rect::right, width + 1),
+                            (rect::bottom, 3),
+                        ] {
+                            set(&mut data, RECTS, field, value);
+                        }
+                        m.cpu.write(DATA, &data).unwrap();
+                        let name = format!("convert_to_{}", target.0);
+                        let thunk = prepare_body(&mut m, &name, &[DST, SRC, RECTS, 0]);
+                        assert!(
+                            matches!(body(&mut m, thunk), adv_machine::Outcome::Return64(_)),
+                            "{src}->{dst} width {width} seed {seed} signs {signs}"
+                        );
+                        let row_len = ((width + 1) * target.1).div_ceil(32) * 4;
+                        let stride = row_len + 4;
+                        let mut actual = vec![0; (3 * stride) as usize];
+                        m.cpu.read(DEST_BITS, &mut actual).unwrap();
+                        let mut expected = data[0x4000..0x4000 + actual.len()].to_vec();
+                        let (ssize, dsize) = (source.1.div_ceil(8), target.1.div_ceil(8));
+                        // Wine copies matching formats verbatim, including unused bits.
+                        let masks = |address: u32| {
+                            [d::red_mask, d::green_mask, d::blue_mask].map(|f| {
+                                let at = (address - DATA) as usize + f;
+                                u32::from_le_bytes(data[at..at + 4].try_into().unwrap())
+                            })
+                        };
+                        let raw = (src == dst && matches!(src, 0 | 2 | 3))
+                            || (matches!(dst, 1 | 4)
+                                && !matches!(src, 0 | 3)
+                                && source.1 == target.1
+                                && masks(SRC) == masks(DST));
+                        let source_stride = ((width + 2) * source.1).div_ceil(32) * 4 + 4;
+                        for y in 0..2 {
+                            let at = (if signs & 2 != 0 { 2 - y } else { y } * stride) as usize;
+                            let from = (0x8000
+                                + if signs & 1 != 0 { 1 - y } else { y + 1 } * source_stride
+                                + ssize) as usize;
+                            let row = &mut expected[at..at + row_len as usize];
+                            row.fill(0);
+                            for x in 0..width as usize {
+                                let mut pixel = [0; 4];
+                                let input = from + x * ssize as usize;
+                                pixel[..ssize as usize]
+                                    .copy_from_slice(&data[input..input + ssize as usize]);
+                                let pixel = u32::from_le_bytes(pixel);
+                                let value = if raw {
+                                    pixel
+                                } else {
+                                    reference_pixel(&data, (src, dst), pixel)
+                                };
+                                let output = x * dsize as usize;
+                                row[output..output + dsize as usize]
+                                    .copy_from_slice(&value.to_le_bytes()[..dsize as usize]);
+                            }
+                        }
+                        assert_eq!(
+                            actual, expected,
+                            "{src}->{dst} width {width} seed {seed} signs {signs}"
+                        );
+                        m.cpu.write(DATA, &data).unwrap();
+                        prepare_body(&mut m, &name, &[DST, SRC, RECTS, 0]);
+                        ALLOCATIONS.with(|n| n.set(Some(0)));
+                        let result = body(&mut m, thunk);
+                        let allocations = ALLOCATIONS.with(|n| n.replace(None)).unwrap();
+                        assert!(matches!(result, adv_machine::Outcome::Return64(_)));
+                        assert_eq!(
+                            allocations, 0,
+                            "{src}->{dst} width {width} seed {seed} signs {signs}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+// spec: NAT-BODY-1, NAT-BODY-4
+#[test]
+fn conversion_keeps_declared_source_pixel_width() {
+    let Some(dist) = dist() else {
+        return;
+    };
+    let mut m = machine(&dist, true, None);
+    let mut data = fixture(0, 0);
+    dib(&mut data, SRC, 2, SOURCE_BITS, 0);
+    // The existing body accepts headers whose declared pixel width differs
+    // from the format table's usual width. Preserve that per-pixel behavior.
+    set(&mut data, SRC, d::bit_count, 32);
+    set(&mut data, SRC, d::stride, 128);
+    for (field, value) in [
+        (rect::left, 0),
+        (rect::top, 0),
+        (rect::right, 9),
+        (rect::bottom, 2),
+    ] {
+        set(&mut data, RECTS, field, value);
+    }
+    let mut expected = data[0x4000..0x4100].to_vec();
+    for y in 0..2 {
+        for x in 0..9 {
+            let at = y * 128 + x * 4;
+            // The old rgb/pack path reads a DWORD and copies its BGR channels.
+            expected[at..at + 3].copy_from_slice(&data[0x8000 + at..0x8000 + at + 3]);
+            expected[at + 3] = 0;
+        }
+        expected[y * 128 + 36..y * 128 + 128].fill(0);
+    }
+    for _ in 0..2 {
+        m.cpu.write(DATA, &data).unwrap();
+        let thunk = prepare_body(&mut m, "convert_to_8888", &[DST, SRC, RECTS, 0]);
+        assert!(matches!(
+            body(&mut m, thunk),
+            adv_machine::Outcome::Return64(_)
+        ));
+        let mut actual = [0; 256];
+        m.cpu.read(DEST_BITS, &mut actual).unwrap();
+        assert_eq!(actual.as_slice(), expected);
     }
 }

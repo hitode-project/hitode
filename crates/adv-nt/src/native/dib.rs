@@ -1295,6 +1295,113 @@ fn bayer16(x: i32, y: i32) -> u32 {
     }
     value
 }
+// The format indices fix both pixel widths and color operations before the row
+// loop: 8888, 24, 555, 32-bit fields, 16-bit fields.
+type Row = fn(&[u8], &mut [u8], &Dib, &Dib);
+fn row_kernel(src: &Dib, dst: &Dib) -> Option<Row> {
+    let index = |kind| match kind {
+        FUNCS_8888 => Some(0),
+        FUNCS_24 => Some(1),
+        FUNCS_555 => Some(2),
+        FUNCS_32 => Some(3),
+        FUNCS_16 => Some(4),
+        _ => None,
+    };
+    macro_rules! targets {
+        ($s:literal) => {
+            [
+                row::<$s, 0>,
+                row::<$s, 1>,
+                row::<$s, 2>,
+                row::<$s, 3>,
+                row::<$s, 4>,
+            ]
+        };
+    }
+    const KERNELS: [[Row; 5]; 5] = [
+        targets!(0),
+        targets!(1),
+        targets!(2),
+        targets!(3),
+        targets!(4),
+    ];
+    let (s, d) = (index(src.kind)?, index(dst.kind)?);
+    // Keep the accepted source header's declared pixel width.
+    Some(if src.size() == [4, 3, 2, 4, 2][s] {
+        KERNELS[s][d]
+    } else {
+        row_pixels
+    })
+}
+fn row_pixels(source: &[u8], target: &mut [u8], src: &Dib, dst: &Dib) {
+    for (input, output) in source
+        .chunks_exact(src.size())
+        .zip(target.chunks_exact_mut(dst.size()))
+    {
+        let mut pixel = [0; 4];
+        pixel[..src.size()].copy_from_slice(input);
+        let value = dst.pack(src.rgb(u32::from_le_bytes(pixel)));
+        output.copy_from_slice(&value.to_le_bytes()[..dst.size()]);
+    }
+}
+fn row<const S: u8, const D: u8>(input: &[u8], output: &mut [u8], src: &Dib, dst: &Dib) {
+    // A signed field shift becomes one left and one right shift, with one zero.
+    // Keep the original wrapping counts, masks and replicated low bits.
+    let fields = |dib: &Dib| {
+        let shifts = std::array::from_fn::<_, 3, _>(|i| dib.shifts[i] - (8 - dib.lens[i] as i32));
+        (
+            dib.lens.map(field_mask),
+            shifts.map(|s| if s < 0 { (-s as u32) & 31 } else { 0 }),
+            shifts.map(|s| if s >= 0 { s as u32 & 31 } else { 0 }),
+        )
+    };
+    let (sm, sl, sr) = if S >= 3 {
+        fields(src)
+    } else {
+        ([0; 3], [0; 3], [0; 3])
+    };
+    let (dm, dl, dr) = if D >= 3 {
+        fields(dst)
+    } else {
+        ([0; 3], [0; 3], [0; 3])
+    };
+    let lens = src.lens;
+    for (input, output) in input
+        .chunks_exact([4, 3, 2, 4, 2][S as usize])
+        .zip(output.chunks_exact_mut([4, 3, 2, 4, 2][D as usize]))
+    {
+        let pixel = match S {
+            0 | 3 => u32::from_le_bytes(input.try_into().unwrap()),
+            1 => u32::from(input[0]) | u32::from(input[1]) << 8 | u32::from(input[2]) << 16,
+            _ => u32::from(u16::from_le_bytes(input.try_into().unwrap())),
+        };
+        let rgb = match S {
+            0 | 1 => [(pixel >> 16) & 255, (pixel >> 8) & 255, pixel & 255],
+            2 => [
+                ((pixel >> 7) & 248) | ((pixel >> 12) & 7),
+                ((pixel >> 2) & 248) | ((pixel >> 7) & 7),
+                ((pixel << 3) & 248) | ((pixel >> 2) & 7),
+            ],
+            _ => std::array::from_fn(|i| {
+                let field = pixel.wrapping_shl(sl[i]).wrapping_shr(sr[i]) & sm[i];
+                field | field.wrapping_shr(lens[i])
+            }),
+        };
+        let value = match D {
+            0 | 1 => (rgb[0] & 255) << 16 | (rgb[1] & 255) << 8 | (rgb[2] & 255),
+            2 => ((rgb[0] << 7) & 0x7c00) | ((rgb[1] << 2) & 0x3e0) | ((rgb[2] >> 3) & 31),
+            _ => (0..3).fold(0, |p, i| {
+                p | (rgb[i] & dm[i]).wrapping_shr(dl[i]).wrapping_shl(dr[i])
+            }),
+        };
+        match D {
+            0 | 3 => output.copy_from_slice(&value.to_le_bytes()),
+            1 => output.copy_from_slice(&[value as u8, (value >> 8) as u8, (value >> 16) as u8]),
+            _ => output.copy_from_slice(&(value as u16).to_le_bytes()),
+        }
+    }
+}
+
 fn convert_to(env: &mut Env<'_>) -> Option<u64> {
     let base = module(env)?;
     let dst = destination(env)?;
@@ -1374,6 +1481,7 @@ fn convert_to(env: &mut Env<'_>) -> Option<u64> {
         mem.pool.lookup.resize(32768, u16::MAX);
         mem.pool.lookup.fill(u16::MAX);
     }
+    let kernel = row_kernel(&src, &dst);
     for y in t..b {
         let da = dst.at(0, y - t);
         if raw {
@@ -1388,15 +1496,7 @@ fn convert_to(env: &mut Env<'_>) -> Option<u64> {
             // per-pixel traversal below.
             let (source, target) =
                 mem.pair(src.at(l, y), width as usize * src.size(), da, used as usize)?;
-            for (input, output) in source
-                .chunks_exact(src.size())
-                .zip(target.chunks_exact_mut(dst.size()))
-            {
-                let mut pixel = [0; 4];
-                pixel[..src.size()].copy_from_slice(input);
-                let value = dst.pack(src.rgb(u32::from_le_bytes(pixel)));
-                output.copy_from_slice(&value.to_le_bytes()[..dst.size()]);
-            }
+            kernel?(source, target, &src, &dst);
         } else {
             for x in l..r {
                 let pixel = mem.pixel(src.at(x, y), src.size())?;
