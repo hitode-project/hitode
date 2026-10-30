@@ -49,6 +49,9 @@ pub(super) struct Backend {
     resources: BTreeMap<FontResourceId, Resource>,
     /// BCP 47 tag of the guest UI language, which names enumerated families.
     pub(super) language: Option<&'static str>,
+    /// The charset of the guest's ANSI code page, which DEFAULT_CHARSET
+    /// requests realize; Western when unset.
+    pub(super) ansi: Option<Encoding>,
     next_resource: u64,
     resource_bytes: usize,
     store: Arc<Mutex<FaceStore>>,
@@ -278,6 +281,7 @@ impl Backend {
             let face = load_face(&db, &self.store, primary, Some(profile))?;
             return Font::new(
                 request,
+                self.ansi.unwrap_or(Encoding::Latin),
                 db,
                 Arc::clone(&self.store),
                 candidates,
@@ -305,7 +309,15 @@ impl Backend {
             TextError::Font("no OpenType fonts found; install fonts or set ADV_FONT_DIR".into())
         })?;
         let face = load_face(&db, &self.store, primary, None)?;
-        Font::new(request, db, Arc::clone(&self.store), candidates, face, None)
+        Font::new(
+            request,
+            self.ansi.unwrap_or(Encoding::Latin),
+            db,
+            Arc::clone(&self.store),
+            candidates,
+            face,
+            None,
+        )
     }
     pub(super) fn resource_font(
         &self,
@@ -337,6 +349,7 @@ impl Backend {
         )?;
         Font::new(
             request,
+            self.ansi.unwrap_or(Encoding::Latin),
             discovery.database.clone(),
             self.store.clone(),
             vec![face_id],
@@ -382,11 +395,20 @@ impl Backend {
         };
         let faces: Vec<_> = match named {
             Some(name) if !present(name) => substitute(name).into_iter().collect(),
-            Some(name) => db
-                .faces()
-                .filter(|info| family_matches(db, info, name))
-                .map(|info| (info, None))
-                .collect(),
+            Some(name) => {
+                // A family's faces come in Wine's style order, not file order:
+                // win32u takes the first face's full name as the real face
+                // name, so a bold file listed first renames the regular font.
+                let mut faces: Vec<_> = db
+                    .faces()
+                    .filter(|info| family_matches(db, info, name))
+                    .map(|info| (info, None))
+                    .collect();
+                faces.sort_by_key(|(info, _)| {
+                    u8::from(info.weight.0 >= 700) + 2 * u8::from(info.style != Style::Normal)
+                });
+                faces
+            }
             // Windows always ships its standard families, so a full enumeration
             // lists the missing ones the same way.
             None => db
@@ -515,7 +537,9 @@ impl Backend {
                 continue;
             }
             let fonts = match mode {
-                FontEnumeration::FamiliesEx(encoding) => enumeration::repertoires(result, encoding),
+                FontEnumeration::FamiliesEx(encoding) => {
+                    enumeration::repertoires(result, encoding, self.ansi.unwrap_or(Encoding::Latin))
+                }
                 _ => vec![result],
             };
             for font in fonts {
@@ -1139,13 +1163,15 @@ pub(super) struct Font {
 impl Font {
     fn new(
         request: &FontRequest,
+        ansi: Encoding,
         database: Arc<Database>,
         store: Arc<Mutex<FaceStore>>,
         candidates: Vec<ID>,
         primary: Arc<Face>,
         profile: Option<Arc<profile::Loaded>>,
     ) -> Result<Self, TextError> {
-        let (em, xscale, metrics) = font_metrics(&primary.font()?, request)?;
+        let (em, xscale, mut metrics) = font_metrics(&primary.font()?, request)?;
+        metrics.encoding = realized(request.encoding, ansi, &primary.font()?);
         diagnostic(
             request,
             &primary,
@@ -1889,6 +1915,27 @@ fn codec(encoding: Encoding) -> Result<&'static encoding_rs::Encoding, TextError
             ));
         }
     })
+}
+/// The charset a request realizes, as GDI's font mapper reports it: a
+/// default or Macintosh request takes the ANSI code page's charset when the
+/// face declares it and Western otherwise; Windows never realizes Macintosh.
+fn realized(requested: Encoding, ansi: Encoding, font: &FontRef<'_>) -> Encoding {
+    if !matches!(
+        requested,
+        Encoding::Automatic | Encoding::MacRoman | Encoding::Reserved(_)
+    ) {
+        return requested;
+    }
+    let codepages = font
+        .os2()
+        .ok()
+        .and_then(|os2| os2.ul_code_page_range_1())
+        .unwrap_or(0);
+    if enumeration::declares(codepages, ansi) {
+        ansi
+    } else {
+        Encoding::Latin
+    }
 }
 fn rotation(angle: i32) -> Transform {
     let angle = (angle.rem_euclid(3600) as f64 / 10.0).to_radians();

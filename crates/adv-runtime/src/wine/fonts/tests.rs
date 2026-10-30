@@ -149,3 +149,73 @@ fn text_extent_rejects_short_readonly_and_overflowing_ranges_without_partial_siz
         "invalid outputs fail before native font matching"
     );
 }
+
+/// Selects `charset` into the fixture's font, then runs `f` on its request.
+fn with_charset<R>(
+    machine: &mut Machine<JitCpu>,
+    dc: u32,
+    charset: u8,
+    f: impl FnOnce(&Env<'_>, &FontRequest) -> R,
+) -> R {
+    let env = Env {
+        context: machine.sys.current,
+        cpu: &mut machine.cpu,
+        sys: &mut machine.sys,
+        ext: &mut machine.ext,
+        thunk: 0,
+    };
+    let font = env
+        .cpu
+        .read_u32(dc_pointer(&env, dc).unwrap() + layout::dc::hFont)
+        .unwrap();
+    let pointer = object(&env, font, 10).unwrap();
+    env.cpu
+        .write(pointer + layout::font::logfont + 23, &[charset])
+        .unwrap();
+    let request = font_request(&env, dc);
+    f(&env, &request)
+}
+
+// spec: WIN32-GDI-10
+#[test]
+fn ansi_text_decodes_through_the_code_page_windows_uses() {
+    let (mut machine, _, dc) = fixture();
+    // A Macintosh or default font decodes through the ANSI code page (932
+    // here), as Windows realizes neither as Macintosh.
+    for charset in [0, 1, 77] {
+        let units = with_charset(&mut machine, dc, charset, |env, request| {
+            ansi_text(env, request, b"\x82\xa0").unwrap()
+        });
+        assert_eq!(units, [0x3042], "charset {charset}");
+        // A lone lead byte shows its Latin-1 glyph.
+        let units = with_charset(&mut machine, dc, charset, |env, request| {
+            ansi_text(env, request, b"\x82").unwrap()
+        });
+        assert_eq!(units, [0x201a], "charset {charset}");
+    }
+    // Glyph outlines read only the packed low word of the character.
+    for character in [0x82a0, 0x15ce_82a0, 0xffff_82a0] {
+        let decoded = with_charset(&mut machine, dc, 0, |env, request| {
+            ansi_character(env, request, character)
+        });
+        assert_eq!(decoded, Character::Unicode(0x3042), "{character:#x}");
+    }
+    // A single byte that is a character of the font's code page stays one.
+    let units = with_charset(&mut machine, dc, 128, |env, request| {
+        ansi_text(env, request, b"\xbb").unwrap()
+    });
+    assert_eq!(units, [0xff7b]);
+}
+
+// spec: WIN32-GDI-10
+#[test]
+fn default_and_macintosh_requests_realize_a_charset_the_face_declares() {
+    let (mut machine, data, dc) = fixture();
+    // The Latin fixture lacks the Shift_JIS repertoire, so both realize ANSI.
+    for charset in [1, 77] {
+        with_charset(&mut machine, dc, charset, |_, _| ());
+        assert_eq!(invoke(&mut machine, data, "GetTextCharset", &[dc]), 0);
+    }
+    with_charset(&mut machine, dc, 128, |_, _| ());
+    assert_eq!(invoke(&mut machine, data, "GetTextCharset", &[dc]), 128);
+}

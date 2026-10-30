@@ -576,6 +576,9 @@ fn drive(
                             session.set_suspended(paused);
                         });
                         session.close();
+                        // A hosted view waits for the guest, which may ask to
+                        // confirm; a second quit request forces the close.
+                        #[cfg(not(host_view))]
                         close_at.get_or_insert_with(Instant::now);
                     }
                     #[cfg(host_view)]

@@ -175,6 +175,89 @@ fn legacy_family_names_select_and_enumerate_like_gdi() {
     );
 }
 
+/// `font` with its OS/2 weight class set to `weight`.
+fn weighted(font: &[u8], weight: u16) -> Vec<u8> {
+    let mut font = font.to_vec();
+    let tables = usize::from(u16::from_be_bytes([font[4], font[5]]));
+    let record = (0..tables)
+        .map(|i| 12 + 16 * i)
+        .find(|&at| &font[at..at + 4] == b"OS/2")
+        .expect("fixture has an OS/2 table");
+    let os2 = u32::from_be_bytes(font[record + 8..record + 12].try_into().unwrap()) as usize;
+    font[os2 + 4..os2 + 6].copy_from_slice(&weight.to_be_bytes());
+    font
+}
+
+#[test]
+// spec: DEV-FONT-3
+fn named_enumeration_lists_the_regular_face_first() {
+    let mut text = Text::with_font_directories(&[]);
+    // A bold file that sorts first, as "Tahoma Bold.ttf" precedes "Tahoma.ttf".
+    text.add_file_resource(&weighted(SINGLE, 700), true)
+        .unwrap();
+    text.add_file_resource(&weighted(SINGLE, 400), true)
+        .unwrap();
+    let entries = text
+        .enumerate(Some("ADV Resource Fixture"), FontEnumeration::Families)
+        .unwrap();
+    let weights: Vec<_> = entries.iter().map(|entry| entry.font.weight).collect();
+    assert_eq!(weights, [400, 700]);
+}
+
+/// `font` declaring the OS/2 ulCodePageRange1 `bits`.
+fn declaring(font: &[u8], bits: u32) -> Vec<u8> {
+    let mut font = font.to_vec();
+    let tables = usize::from(u16::from_be_bytes([font[4], font[5]]));
+    let record = (0..tables)
+        .map(|i| 12 + 16 * i)
+        .find(|&at| &font[at..at + 4] == b"OS/2")
+        .expect("fixture has an OS/2 table");
+    let os2 = u32::from_be_bytes(font[record + 8..record + 12].try_into().unwrap()) as usize;
+    assert!(u16::from_be_bytes([font[os2], font[os2 + 1]]) >= 1);
+    font[os2 + 78..os2 + 82].copy_from_slice(&bits.to_be_bytes());
+    font
+}
+
+#[test]
+// spec: DEV-FONT-3
+fn extended_enumeration_lists_charsets_in_windows_order() {
+    let mut text = Text::with_font_directories(&[]);
+    // Western, Japanese, Simplified Chinese, Macintosh and OEM.
+    let bits = 1 | 1 << 17 | 1 << 18 | 1 << 29 | 1 << 30;
+    text.add_file_resource(&declaring(SINGLE, bits), true)
+        .unwrap();
+    text.set_ansi_encoding(Encoding::SimplifiedChinese);
+    let encodings: Vec<_> = text
+        .enumerate(
+            Some("ADV Resource Fixture"),
+            FontEnumeration::FamiliesEx(Encoding::Automatic),
+        )
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.font.encoding)
+        .collect();
+    assert_eq!(
+        encodings,
+        [
+            Encoding::SimplifiedChinese,
+            Encoding::Latin,
+            Encoding::Japanese
+        ]
+    );
+    // A default request realizes the code page's charset the face declares.
+    let mut request = font("ADV Resource Fixture");
+    request.encoding = Encoding::Automatic;
+    assert_eq!(
+        text.metrics(&request).unwrap().encoding,
+        Encoding::SimplifiedChinese
+    );
+    request.encoding = Encoding::MacRoman;
+    assert_eq!(
+        text.metrics(&request).unwrap().encoding,
+        Encoding::SimplifiedChinese
+    );
+}
+
 #[test]
 // spec: DEV-FONT-3
 fn enumeration_skips_faces_it_cannot_measure() {

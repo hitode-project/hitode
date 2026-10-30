@@ -52,6 +52,12 @@ pub(super) fn install<B: adv_cpu::backend::Backend>(
         0x804 => 936,
         _ => 1252,
     };
+    let mut text = text;
+    text.set_ansi_encoding(match acp {
+        932 => Encoding::Japanese,
+        936 => Encoding::SimplifiedChinese,
+        _ => Encoding::Latin,
+    });
     let mut apis = Registry::default();
     register(&mut apis);
     machine.ext.insert(Fonts {
@@ -163,7 +169,13 @@ fn request_for_handle(env: &Env<'_>, font: u32) -> FontRequest {
 /// Symbol and other explicit repertoires retain their existing backend mapping.
 fn ansi_codepage(env: &Env<'_>, request: &FontRequest) -> Option<u32> {
     Some(match request.encoding {
-        Encoding::Automatic | Encoding::Latin | Encoding::Oem => env.ext.get::<Fonts>().codec.acp,
+        // GDI decodes these through the ANSI code page; Windows never
+        // realizes a Macintosh font.
+        Encoding::Automatic
+        | Encoding::Latin
+        | Encoding::Oem
+        | Encoding::MacRoman
+        | Encoding::Reserved(_) => env.ext.get::<Fonts>().codec.acp,
         Encoding::Japanese => 932,
         Encoding::SimplifiedChinese => 936,
         _ => return None,
@@ -182,19 +194,23 @@ fn ansi_units(env: &Env<'_>, request: &FontRequest, bytes: &[u8]) -> Option<(Vec
 /// A counted ANSI string for text output and extents.
 fn ansi_text(env: &Env<'_>, request: &FontRequest, bytes: &[u8]) -> Option<Vec<u16>> {
     // Native GDI decodes a string of one byte in an ANSI_CHARSET font as
-    // cp1252, even where the ACP is a DBCS code page; longer strings use the
-    // ACP. Text drawn a byte at a time therefore shows Latin-1 glyphs.
-    if matches!(request.encoding, Encoding::Latin) && bytes.len() == 1 {
-        return Some(env.ext.get::<Fonts>().codec.to_utf16(1252, bytes));
+    // cp1252, even where the ACP is a DBCS code page, and so a lone lead byte
+    // in any font; longer strings use the code page. Text drawn a byte at a
+    // time therefore shows Latin-1 glyphs.
+    let codec = &env.ext.get::<Fonts>().codec;
+    if let [byte] = bytes
+        && (matches!(request.encoding, Encoding::Latin)
+            || ansi_codepage(env, request).is_some_and(|cp| codec.is_lead_byte(cp, *byte)))
+    {
+        return Some(codec.to_utf16(1252, bytes));
     }
     ansi_units(env, request, bytes).map(|(units, _)| units)
 }
 
 fn ansi_character(env: &Env<'_>, font: &FontRequest, character: u32) -> Character {
-    // Preserve native handling of values outside the packed ANSI low word.
-    if character > u32::from(u16::MAX) {
-        return Character::Encoded(character);
-    }
+    // Native GDI reads only the packed low word; engines pass whatever the
+    // register's high half held.
+    let character = character & 0xffff;
     let Some(codepage) = ansi_codepage(env, font) else {
         return Character::Encoded(character);
     };
