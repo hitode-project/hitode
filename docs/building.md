@@ -91,6 +91,7 @@ python3 -m unittest discover -s tools/<folder>
   `cargo test -p adv-drv upstream_zlib -- --ignored`. This checks forward copies,
   including overlapping matches; it does not establish whole-decoder coverage.
 - Tests that need a game read it from `$ADV_SAMPLES`. They are ignored or skip when it is unset, so the default run needs no game files.
+- Wine integration tests in `adv-runtime`, and the `adv-nt` tests that bind bodies to Wine's DLLs, read the stripped installation from `ADV_WINE_DIST` and the built probes from `ADV_WINE_PROBES`. Without them they print `skipped` and pass, so a run without both variables proves nothing about them. Set both whenever a change can reach the Wine stack, including every merge check. The installation must carry the identity tables under `share/hitode/identity` (see above); without them bodies never bind. Each probe is `crates/adv-runtime/tests/probe/<name>.c`, built as its header says into `ADV_WINE_PROBES`.
 - On AArch64, `tools/cpu/arm64-check.sh <ref>` runs the CPU suite once and judges it both normally and in strict mode.
 - Media tests need the FFmpeg variables above: `cargo test -p adv-device --features media`.
 - Direct3D 9 builds only with the `gpu` feature, so `cargo test -p adv-dx` skips it without a word: test it with `cargo test -p adv-dx --features gpu`. Test files pulled in with `include!` are outside `cargo fmt`; format them with `rustfmt --edition 2024 <file>`.
