@@ -161,8 +161,12 @@ fn synthetic_movie_decodes_video_pcm_seek_and_real_eof() {
             );
             video_count += 1;
         }
+        // A repeated time never repeats a picture; audio may top up its lead.
         let repeat = decoder.frame_at(time).unwrap();
-        assert!(repeat.video.is_none() && repeat.audio.is_empty());
+        assert!(repeat.video.is_none());
+        for audio in &repeat.audio {
+            audible |= audio.samples.iter().any(|sample| sample.abs() > 0.001);
+        }
         if update.ended {
             ended = true;
             break;
@@ -179,4 +183,32 @@ fn synthetic_movie_decodes_video_pcm_seek_and_real_eof() {
         restarted.video.is_some(),
         "rewind must restore the first due frame"
     );
+}
+
+#[test]
+// spec: MEDIA-STREAM-1
+fn asf_rewind_restarts_at_the_first_packet() {
+    // ffmpeg -f lavfi -i testsrc=size=32x16:rate=10 -f lavfi -i sine=frequency=440:sample_rate=22050
+    // -t 1 -c:v wmv2 -g 5 -b:v 50k -c:a wmav2 -b:a 32k -ac 1 -f asf asf_movie.wmv
+    let movie = include_bytes!("fixtures/asf_movie.wmv").to_vec();
+    let mut decoder = Decoder::open_memory(movie).unwrap();
+    let pass = |decoder: &mut Decoder| {
+        let mut frames = Vec::new();
+        for time in (0..=1_200_000).step_by(50_000) {
+            let update = decoder.frame_at(time).unwrap();
+            if let Some(video) = update.video {
+                frames.push((video.pts_us, video.bgra));
+            }
+            if update.ended {
+                break;
+            }
+        }
+        frames
+    };
+    let first = pass(&mut decoder);
+    assert!(first.len() >= 8, "{} frames", first.len());
+    decoder.seek(0).unwrap();
+    // A header read as packets, or a stale packet parser, corrupts or drops
+    // frames until the next keyframe.
+    assert!(pass(&mut decoder) == first);
 }

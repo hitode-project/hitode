@@ -1,7 +1,5 @@
 use super::*;
-use crate::dshow::tests::{activate, env, machine};
-#[cfg(feature = "media")]
-use crate::dshow::tests::{method, query};
+use crate::dshow::tests::{activate, env, machine, method, query};
 use adv_cpu::backend::{Guest, Reg};
 use adv_machine::{Machine, Resume};
 use adv_os::vfs::host;
@@ -89,15 +87,30 @@ fn file_source_validates_outputs_and_does_not_publish_failed_opens() {
 
 #[cfg(feature = "media")]
 fn authored_wave() -> String {
+    authored("wav", &wave())
+}
+
+/// Write `bytes` under the test root and return its guest path.
+#[cfg(feature = "media")]
+fn authored(extension: &str, bytes: &[u8]) -> String {
     let root = Path::new("./target/dshow-source-tests");
     host::create_dir_all(root).unwrap();
     static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let filename = format!(
-        "authored-{}-{}.wav",
+        "authored-{}-{}.{extension}",
         std::process::id(),
         NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     );
     let path = root.join(&filename);
+    host::write(&path, bytes).unwrap();
+    format!(
+        "TARGET\\DSHOW-SOURCE-TESTS\\{}",
+        filename.to_ascii_uppercase()
+    )
+}
+
+#[cfg(feature = "media")]
+fn wave() -> Vec<u8> {
     let samples = 800u32;
     let size = samples * 2;
     let mut wave = Vec::new();
@@ -114,11 +127,7 @@ fn authored_wave() -> String {
     wave.extend_from_slice(b"data");
     wave.extend_from_slice(&size.to_le_bytes());
     wave.resize(wave.len() + size as usize, 0);
-    host::write(&path, &wave).unwrap();
-    format!(
-        "TARGET\\DSHOW-SOURCE-TESTS\\{}",
-        filename.to_ascii_uppercase()
-    )
+    wave
 }
 
 #[cfg(feature = "media")]
@@ -572,5 +581,65 @@ fn render_ex_reuses_video_and_audio_renderers_and_normal_mode_creates_new_ones_w
     method(&mut m, "IBaseFilter::Release", &[second_source]);
     assert_eq!(invoke(&mut m, graph, "IFilterGraph2", "Release", &[]), 0);
     assert!(m.ext.get::<State>().filters.is_empty());
+    assert!(m.sys.objects.hosts::<FileObj>().next().is_none());
+}
+
+#[test]
+// spec: MEDIA-GRAPH-2
+fn asf_reader_is_a_native_file_source_until_loaded() {
+    let mut m = machine();
+    assert!(has_graph_class(&CLSID_WMASF_READER));
+    let reader = activate(&mut m, CLSID_WMASF_READER, IID_IBASEFILTER);
+    assert_eq!(
+        method(&mut m, "IBaseFilter::GetClassID", &[reader, DATA + 64]),
+        S_OK
+    );
+    let mut class = [0; 16];
+    m.cpu.read(DATA + 64, &mut class).unwrap();
+    assert_eq!(class, CLSID_WMASF_READER);
+    let state = m.ext.get::<State>();
+    assert_eq!(state.filters[&reader].role, Role::FileSource);
+    assert!(state.filters[&reader].source_path.is_empty());
+    let file_face = query(&mut m, reader, IID_IFILESOURCEFILTER);
+    method(&mut m, "IFileSourceFilter::Release", &[file_face]);
+    assert_eq!(method(&mut m, "IBaseFilter::Release", &[reader]), 0);
+    assert!(m.ext.get::<State>().filters.is_empty());
+}
+
+#[cfg(feature = "media")]
+#[test]
+// spec: MEDIA-GRAPH-2
+fn asf_reader_load_probes_windows_media_video_and_audio() {
+    let mut m = machine();
+    m.spawn("authored", adv_machine::layout::PARK_ADDR, &[], 65536)
+        .unwrap();
+    let guest_path = authored(
+        "wmv",
+        include_bytes!("../../../../../adv-device/tests/fixtures/asf_movie.wmv"),
+    );
+    // query() stages its IID at DATA + 256.
+    wide(&mut m, DATA + 512, &guest_path);
+    let reader = activate(&mut m, CLSID_WMASF_READER, IID_IBASEFILTER);
+    let file_face = query(&mut m, reader, IID_IFILESOURCEFILTER);
+    assert_eq!(
+        invoke(
+            &mut m,
+            file_face,
+            "IFileSourceFilter",
+            "Load",
+            &[DATA + 512, 0]
+        ),
+        S_OK
+    );
+    let info = m.ext.get::<State>().filters[&reader]
+        .source
+        .as_ref()
+        .and_then(|s| s.info.clone())
+        .unwrap();
+    let video = info.video.unwrap();
+    assert_eq!((video.width, video.height), (32, 16));
+    assert_eq!(info.audio.unwrap().sample_rate, 22050);
+    method(&mut m, "IFileSourceFilter::Release", &[file_face]);
+    assert_eq!(method(&mut m, "IBaseFilter::Release", &[reader]), 0);
     assert!(m.sys.objects.hosts::<FileObj>().next().is_none());
 }

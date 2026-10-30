@@ -867,6 +867,11 @@ IFileSourceFilter	1	AddRef	u32	u32	this:IFileSourceFilter*:ptr:1
 IFileSourceFilter	2	Release	u32	u32	this:IFileSourceFilter*:ptr:1
 IFileSourceFilter	3	Load	i32	Windows.Win32.Foundation.HRESULT	this:IFileSourceFilter*:ptr:1|pszFileName:Windows.Win32.Foundation.PWSTR:str16:1|pmt:Windows.Win32.Media.MediaFoundation.AM_MEDIA_TYPE*:ptr:1
 IFileSourceFilter	4	GetCurFile	i32	Windows.Win32.Foundation.HRESULT	this:IFileSourceFilter*:ptr:1|ppszFileName:Windows.Win32.Foundation.PWSTR*:ptr:1|pmt:Windows.Win32.Media.MediaFoundation.AM_MEDIA_TYPE*:ptr:1
+IObjectWithSite	0	QueryInterface	i32	Windows.Win32.Foundation.HRESULT	this:IObjectWithSite*:ptr:1|riid:System.Guid*:ptr:1|ppvObject:void**:ptr:1
+IObjectWithSite	1	AddRef	u32	u32	this:IObjectWithSite*:ptr:1
+IObjectWithSite	2	Release	u32	u32	this:IObjectWithSite*:ptr:1
+IObjectWithSite	3	SetSite	i32	Windows.Win32.Foundation.HRESULT	this:IObjectWithSite*:ptr:1|pUnkSite:Windows.Win32.System.Com.IUnknown:ptr:1
+IObjectWithSite	4	GetSite	i32	Windows.Win32.Foundation.HRESULT	this:IObjectWithSite*:ptr:1|riid:System.Guid*:ptr:1|ppvSite:void**:ptr:1
 ITfThreadMgr	0	QueryInterface	i32	Windows.Win32.Foundation.HRESULT	this:ITfThreadMgr*:ptr:1|riid:System.Guid*:ptr:1|ppvObject:void**:ptr:1
 ITfThreadMgr	1	AddRef	u32	u32	this:ITfThreadMgr*:ptr:1
 ITfThreadMgr	2	Release	u32	u32	this:ITfThreadMgr*:ptr:1

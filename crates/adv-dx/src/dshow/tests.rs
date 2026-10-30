@@ -242,6 +242,127 @@ fn graph_faces_share_identity_and_report_state() {
     assert_eq!(m.cpu.read_u32(DATA).unwrap(), 0);
 }
 
+/// Run a quartz method that calls back into the guest exactly once per item
+/// of `expected`, checking each call's target and arguments.
+fn method_calls(
+    m: &mut Machine<JitCpu>,
+    name: &str,
+    args: &[u32],
+    expected: &[(u32, &[u32], u32)],
+) -> u32 {
+    m.resolve_import("quartz.dll", name).unwrap();
+    let thunk = m
+        .sys
+        .thunks
+        .iter()
+        .find(|(_, t)| t.module == "quartz.dll" && t.name == name)
+        .unwrap()
+        .0;
+    let handler = m.sys.thunks.get(thunk).f.handler;
+    m.cpu.set_reg(Reg::Esp, STACK);
+    for (i, &arg) in args.iter().enumerate() {
+        m.cpu.write_u32(STACK + 4 + i as u32 * 4, arg).unwrap();
+    }
+    let mut outcome = handler(&mut Env {
+        context: m.sys.current,
+        cpu: &mut m.cpu,
+        sys: &mut m.sys,
+        ext: &mut m.ext,
+        thunk,
+    });
+    for &(target, args, value) in expected {
+        let Outcome::Call {
+            target: called,
+            args: passed,
+            then,
+            ..
+        } = outcome
+        else {
+            panic!("{name} must call {target:#x}");
+        };
+        assert_eq!((called, passed.as_slice()), (target, args));
+        outcome = then(&mut env(m), adv_machine::Resume::Returned(value));
+    }
+    match outcome {
+        Outcome::Return(value) => value,
+        _ => panic!("{name} made an unexpected guest call"),
+    }
+}
+
+#[test]
+// spec: MEDIA-GRAPH-1
+fn graph_holds_its_site_and_answers_get_site_through_it() {
+    let mut m = machine();
+    let graph = activate(&mut m, CLSID_FILTERGRAPH, IID_IGRAPHBUILDER);
+    let with_site = query(&mut m, graph, IID_IOBJECTWITHSITE);
+    let (output, iid) = (DATA + 16, DATA + 256);
+    m.cpu.write_u32(output, 0xdead).unwrap();
+    assert_eq!(
+        method(
+            &mut m,
+            "IObjectWithSite::GetSite",
+            &[with_site, iid, output]
+        ),
+        0x8000_4005
+    );
+    assert_eq!(m.cpu.read_u32(output).unwrap(), 0);
+    // Two guest sites whose QueryInterface, AddRef and Release are distinct targets.
+    let sites = [DATA + 512, DATA + 576];
+    for (i, &site) in sites.iter().enumerate() {
+        let table = site + 4;
+        m.cpu.write_u32(site, table).unwrap();
+        for slot in 0..3 {
+            m.cpu
+                .write_u32(table + slot * 4, 0x7000_0000 + (i as u32) * 16 + slot)
+                .unwrap();
+        }
+    }
+    let (query_first, add_first, release_first) = (0x7000_0000, 0x7000_0001, 0x7000_0002);
+    let (add_second, release_second) = (0x7000_0011, 0x7000_0012);
+    let set = "IObjectWithSite::SetSite";
+    let first: &[u32] = &[sites[0]];
+    assert_eq!(
+        method_calls(
+            &mut m,
+            set,
+            &[with_site, sites[0]],
+            &[(add_first, first, 2)]
+        ),
+        S_OK
+    );
+    assert_eq!(
+        method_calls(
+            &mut m,
+            "IObjectWithSite::GetSite",
+            &[with_site, iid, output],
+            &[(query_first, &[sites[0], iid, output], S_OK)],
+        ),
+        S_OK
+    );
+    let second: &[u32] = &[sites[1]];
+    assert_eq!(
+        method_calls(
+            &mut m,
+            set,
+            &[with_site, sites[1]],
+            &[(add_second, second, 2), (release_first, first, 1)],
+        ),
+        S_OK
+    );
+    // Releasing the graph's last references returns the site's reference.
+    method(&mut m, "IObjectWithSite::Release", &[with_site]);
+    assert_eq!(
+        method_calls(
+            &mut m,
+            "IFilterGraph2::Release",
+            &[graph],
+            &[(release_second, second, 1)],
+        ),
+        0
+    );
+    assert!(m.ext.get::<State>().graphs.is_empty());
+}
+
 #[test]
 // spec: MEDIA-GRAPH-1
 fn filter_enumerators_fall_out_of_sync_on_removal_until_reset() {
