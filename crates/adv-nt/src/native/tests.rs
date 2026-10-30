@@ -109,6 +109,15 @@ impl Guest for TestGuest {
         self.writes(len);
         Some(&mut self.bytes[range])
     }
+    // A Win32 thread's initial controls: x87 at 53-bit precision, all masked.
+    fn fpu_environment(
+        &mut self,
+    ) -> Result<adv_cpu::backend::FpuEnvironment, adv_cpu::backend::FpuEnvironmentError> {
+        Ok(adv_cpu::backend::FpuEnvironment {
+            x87_control: 0x027f,
+            mxcsr: 0x1f80,
+        })
+    }
     fn host_access(&self) -> HostAccess {
         self.snapshots.set(self.snapshots.get() + 1);
         self.access.get()
@@ -194,8 +203,10 @@ fn native_body_decline_allocation_gate() {
             .thunks
             .published_index(MODULE, &body.name)
             .unwrap();
-        // Where a fault on the full path is raised.
+        // Bound as `bind_one` binds it, so a fault on the full path is
+        // raised at the entry.
         if let Some(direct) = body.direct {
+            machine.sys.direct_bodies.insert(0x1000, direct.direct);
             machine
                 .ext
                 .get_or_default::<Entries>()
@@ -235,7 +246,10 @@ fn native_body_decline_allocation_gate() {
                     (_, Some(direct)) => match run_full(&mut env, direct, |_| Outcome::Return(0)) {
                         Outcome::Raise(_) => true,
                         Outcome::Return(_) | Outcome::Return64(_) => false,
-                        _ => panic!("{} failed on its full path", body.name),
+                        Outcome::Fail(why) => {
+                            panic!("{} failed on its full path: {why}", body.name)
+                        }
+                        _ => panic!("{} left its full path", body.name),
                     },
                     (Some(function), None) => function(&mut env).is_none(),
                     (None, None) => match (body.handler)(&mut env) {
