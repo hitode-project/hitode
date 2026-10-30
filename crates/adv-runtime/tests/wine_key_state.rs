@@ -17,6 +17,10 @@ fn probe(jit: bool) -> Option<String> {
                     adv_machine::Clock::virtual_time(),
                 )
                 .unwrap();
+            } else {
+                // Interpreted runs follow redirects too (A64-CTL-14); tracing
+                // keeps the reference on Wine's own code.
+                machine.sys.trace = adv_machine::Trace::to_writer(Box::new(std::io::sink()));
             }
             adv_unix::install(machine);
         },
