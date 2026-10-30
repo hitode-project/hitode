@@ -235,22 +235,55 @@ fn copy_string<M: Mem, const WIDTH: u32, const APPEND: bool>(
         0
     };
     let count = mem.terminated(src, WIDTH, u32::MAX)? + 1;
+    let target = dst.wrapping_add(offset);
+    if WIDTH == 1 && target > src && target - src < count {
+        let delta = target - src;
+        let peel = (4 - src % 4) % 4;
+        let zero = count - 1;
+        let survives = if zero < peel {
+            delta > zero
+        } else {
+            delta > zero || (zero - peel) % 4 >= delta
+        };
+        if !survives {
+            // This overlap propagates nonzero bytes forever. Check the accesses
+            // in copy order, raising the same first blocked access without
+            // exposing a partial window write before a full-path retry.
+            let (mut read, mut write) = (src, target);
+            loop {
+                let n = (PAGE - read % PAGE).min(PAGE - write % PAGE);
+                mem.input(read, n)?;
+                mem.output(write, n)?;
+                read = read.wrapping_add(n);
+                write = write.wrapping_add(n);
+            }
+        }
+    }
     let [from, to] = mem.spans([
         (src, count * WIDTH, false),
         (dst.wrapping_add(offset), count * WIDTH, true),
     ])?;
-    // Windows 11 x86 strcpy/wcscpy also copy an overlapping source tail
-    // into its preceding destination ("qAB" + 1 -> "AB").
-    // SAFETY: both complete spans are checked; copies proceed in unit order.
+    // The x86 Windows probe (ntdll, msvcrt and ucrtbase, lengths 0..1025,
+    // every byte alignment and right displacement 1..32) finds one copy
+    // family: wide copies use memmove; narrow copies peel to source dword
+    // alignment, then load each dword before storing it.
+    // SAFETY: both complete spans are checked and share live aliasing.
     unsafe {
-        for i in 0..count {
-            let at = (i * WIDTH) as usize;
-            if WIDTH == 1 {
-                to.add(at).write(from.add(at).read());
-            } else {
-                to.add(at)
-                    .cast::<u16>()
-                    .write_unaligned(from.add(at).cast::<u16>().read_unaligned());
+        if WIDTH == 2 {
+            std::ptr::copy(from, to, (count * WIDTH) as usize);
+        } else {
+            let peel = ((4 - src % 4) % 4).min(count);
+            let mut i = 0;
+            while i < peel {
+                to.add(i as usize).write(from.add(i as usize).read());
+                i += 1;
+            }
+            while i < count {
+                let n = (count - i).min(4) as usize;
+                let mut block = [0; 4];
+                std::ptr::copy_nonoverlapping(from.add(i as usize), block.as_mut_ptr(), n);
+                std::ptr::copy_nonoverlapping(block.as_ptr(), to.add(i as usize), n);
+                i += n as u32;
             }
         }
     }

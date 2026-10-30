@@ -38,6 +38,10 @@ pub mod buffer {
     pub const put: usize = 0x128;
     pub const put_aux: usize = 0x12c;
     pub const num_filters: usize = 0x130;
+    pub const filters: usize = 0x134;
+}
+pub mod filter {
+    pub const inplace: usize = 20;
 }
 pub mod wave {
     pub const nChannels: usize = 2;

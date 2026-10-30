@@ -168,6 +168,8 @@ pub struct Sys {
     /// entry, with the bytes the function begins with
     /// ([`adv_cpu::backend::TrapHandler::redirect`]).
     pub redirects: HashMap<u32, (u32, Box<[u8]>)>,
+    /// Additional helper code checked and watched with each redirect.
+    pub redirect_checks: HashMap<u32, Vec<adv_cpu::backend::CodeCheck>>,
     /// Entries supplied by required host services in both execution modes.
     pub required_redirects: std::collections::HashSet<u32>,
     /// Redirected entries that generated code calls a body for directly
@@ -1857,6 +1859,10 @@ impl TrapHandler for Dispatch<'_> {
         Some((*target, original))
     }
 
+    fn redirect_checks(&self, pc: u32) -> &[(u32, Box<[u8]>)] {
+        self.sys.redirect_checks.get(&pc).map_or(&[], Vec::as_slice)
+    }
+
     fn direct_body(&self, pc: u32) -> Option<adv_cpu::body::DirectBody> {
         if self.sys.diagnostics() != 0 {
             return None;
@@ -2077,6 +2083,7 @@ impl<B: Backend> Machine<B> {
             recent: RecentCalls::new(256),
             host_calls: 0,
             redirects: HashMap::new(),
+            redirect_checks: Default::default(),
             required_redirects: Default::default(),
             direct_bodies: HashMap::new(),
             call_limit: None,

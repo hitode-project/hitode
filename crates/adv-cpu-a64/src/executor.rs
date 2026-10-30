@@ -603,6 +603,14 @@ impl Executor {
                     .memory
                     .read_data(self.state.eip, original.len())
                     .is_ok_and(|bytes| bytes.as_ref() == original)
+                && handler
+                    .redirect_checks(self.state.eip)
+                    .iter()
+                    .all(|(at, original)| {
+                        self.memory
+                            .read_data(*at, original.len())
+                            .is_ok_and(|bytes| bytes.as_ref() == original.as_ref())
+                    })
             {
                 self.state.eip = target;
                 continue;

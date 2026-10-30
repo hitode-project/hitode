@@ -5,8 +5,8 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
 thread_local! {
-    static COUNTING: Cell<bool> = const { Cell::new(false) };
-    static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+    pub(super) static COUNTING: Cell<bool> = const { Cell::new(false) };
+    pub(super) static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
 }
 struct Allocator;
 #[global_allocator]
@@ -238,7 +238,11 @@ fn native_body_decline_allocation_gate() {
                         _ => panic!("{} failed on its full path", body.name),
                     },
                     (Some(function), None) => function(&mut env).is_none(),
-                    (None, None) => panic!("{} has no body", body.name),
+                    (None, None) => match (body.handler)(&mut env) {
+                        Outcome::Raise(_) => true,
+                        Outcome::Return(_) => false,
+                        _ => panic!("{} failed on its host path", body.name),
+                    },
                 };
                 COUNTING.set(false);
                 let allocations = ALLOCATIONS.get();
@@ -864,4 +868,182 @@ fn counter_bodies_preserve_windows_fault_status_alignment_and_overlap() {
         .value,
         1
     );
+}
+
+// spec: NAT-BODY-6
+#[test]
+fn crt_right_overlap_matches_windows() {
+    use adv_cpu::body::{GuestMem, Scratch};
+    // Windows 11, i686: 87 lengths (0..65 plus both sides of 80/96/112/
+    // 128/256/512/1024), 16 source alignments, displacements 1..32.
+    // FNV64 folds length/alignment/displacement, relative EAX, LastError,
+    // and FNV32 of the whole 4 KiB data page for every returning call.
+    // Faults are at the entry; A64-CALL-4 permits leaving no partial writes.
+    let golden = [
+        ("strcpy", 10480, 0x2669460801a819c1u64),
+        ("wcscpy", 44544, 0xcc44497392c08fb6),
+        ("strcat", 24, 0xa4a8d98bd156332e),
+        ("wcscat", 19328, 0x4a30339f44241035),
+    ];
+    let mut lengths: Vec<u32> = (0..=65).collect();
+    lengths.extend([
+        79, 80, 81, 95, 96, 97, 111, 112, 113, 127, 128, 129, 255, 256, 257, 511, 512, 513, 1023,
+        1024, 1025,
+    ]);
+    for module in ["ntdll.dll", "msvcrt.dll", "ucrtbase.dll"] {
+        for (name, expected_count, expected_hash) in golden {
+            let body = bodies()
+                .find(|body| body.name == format!("{module}!{name}"))
+                .unwrap()
+                .direct
+                .unwrap();
+            let width = if name.starts_with('w') { 2 } else { 1 };
+            let mut cpu = guest();
+            let mut scratch = Scratch::default();
+            let mut count = 0;
+            let mut hash = 0xcbf29ce484222325u64;
+            for &len in &lengths {
+                for align in 0..16 {
+                    for delta in 1..=32 {
+                        for (i, byte) in cpu.bytes[5 * PAGE..6 * PAGE].iter_mut().enumerate() {
+                            *byte = (1 + (i * 37 + 11) % 251) as u8;
+                        }
+                        let src = 0x5100 + align;
+                        cpu.bytes[(src + len * width) as usize..(src + (len + 1) * width) as usize]
+                            .fill(0);
+                        let result = (body.full)(
+                            &mut GuestMem::new(&mut cpu, &mut scratch),
+                            [src + delta, src, 0, 0, 0, 0, 0],
+                        );
+                        let Ok(result) = result else { continue };
+                        count += 1;
+                        let page = cpu.bytes[5 * PAGE..6 * PAGE]
+                            .iter()
+                            .fold(2166136261u32, |h, b| {
+                                (h ^ u32::from(*b)).wrapping_mul(16777619)
+                            });
+                        for value in [
+                            len,
+                            align,
+                            delta,
+                            (result.value as u32).wrapping_sub(src + delta),
+                            0x1234abcd,
+                            page,
+                        ] {
+                            for byte in value.to_le_bytes() {
+                                hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+                            }
+                        }
+                    }
+                }
+            }
+            assert_eq!(
+                (count, hash),
+                (expected_count, expected_hash),
+                "{module}!{name}"
+            );
+        }
+    }
+}
+
+// spec: NAT-BODY-1, NAT-BODY-6
+#[test]
+fn crt_comparison_lengths_match_windows() {
+    use adv_cpu::body::{GuestMem, Scratch};
+    // Same i686 Windows sweep as crt_right_overlap_matches_windows, with
+    // both operand orders and a mismatch at (displacement - 1) % length.
+    // No threshold through 1025 changes sign/difference conventions.
+    let mut lengths: Vec<u32> = (0..=65).collect();
+    lengths.extend([
+        79, 80, 81, 95, 96, 97, 111, 112, 113, 127, 128, 129, 255, 256, 257, 511, 512, 513, 1023,
+        1024, 1025,
+    ]);
+    for module in [
+        "ntdll.dll",
+        "msvcrt.dll",
+        "ucrtbase.dll",
+        "msvcr70.dll",
+        "msvcr71.dll",
+        "msvcr80.dll",
+        "msvcr90.dll",
+        "msvcr100.dll",
+        "msvcr110.dll",
+        "msvcr120.dll",
+        "msvcrtd.dll",
+    ] {
+        for (name, width) in [
+            ("strcmp", 1),
+            ("strncmp", 1),
+            ("wcscmp", 2),
+            ("wcsncmp", 2),
+            ("memcmp", 1),
+        ] {
+            let body = bodies()
+                .find(|body| body.name == format!("{module}!{name}"))
+                .unwrap()
+                .direct
+                .unwrap();
+            let difference = if name == "wcsncmp" {
+                24536
+            } else if name == "strncmp"
+                && matches!(
+                    module,
+                    "ntdll.dll"
+                        | "msvcrt.dll"
+                        | "msvcr80.dll"
+                        | "msvcr90.dll"
+                        | "msvcr100.dll"
+                        | "msvcrtd.dll"
+                )
+            {
+                216
+            } else {
+                1
+            };
+            let mut cpu = guest();
+            let mut scratch = Scratch::default();
+            for &len in &lengths {
+                for align in 0..16 {
+                    for delta in 1..=32 {
+                        let a = 0x2100 + align;
+                        let b = 0x3100 + delta % 16;
+                        for at in [a, b] {
+                            cpu.bytes[at as usize..(at + len * width) as usize].fill(0x41);
+                            cpu.bytes
+                                [(at + len * width) as usize..(at + (len + 1) * width) as usize]
+                                .fill(0);
+                        }
+                        if len != 0 {
+                            let offset = (delta - 1) % len * width;
+                            cpu.bytes[(a + offset) as usize] = 0x11;
+                            cpu.bytes[(b + offset) as usize] = 0xe9;
+                            if width == 2 {
+                                cpu.bytes[(a + offset + 1) as usize] = 0x14;
+                                cpu.bytes[(b + offset + 1) as usize] = 0x73;
+                            }
+                        }
+                        let (a, b, sign) = if delta & 1 == 0 {
+                            (a, b, -1i32)
+                        } else {
+                            (b, a, 1)
+                        };
+                        let actual = (body.full)(
+                            &mut GuestMem::new(&mut cpu, &mut scratch),
+                            [a, b, len, 0, 0, 0, 0],
+                        )
+                        .unwrap();
+                        assert_eq!(
+                            actual.value as u32,
+                            if len == 0 {
+                                0
+                            } else {
+                                (difference * sign) as u32
+                            },
+                            "{module}!{name}: length {len}, alignment {align}, displacement {delta}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }

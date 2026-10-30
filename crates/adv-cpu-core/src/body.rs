@@ -168,10 +168,14 @@ pub struct DirectBody {
     pub pop: u16,
 }
 
+/// Cold preparation of fixed inputs from the bound function's guest bytes.
+pub type BindInputs = fn(&dyn Guest, u32, &[u8]) -> Result<[Option<Input>; 7], String>;
+
 /// A body: its window form and its full-path form.
 #[derive(Clone, Copy)]
 pub struct Body {
     pub direct: DirectBody,
+    pub bind: Option<BindInputs>,
     pub full: fn(&mut GuestMem<'_>, [u32; 7]) -> Result<Ret, Stop>,
 }
 
@@ -210,6 +214,7 @@ macro_rules! body {
                     outputs: $outputs,
                     pop: $pop,
                 },
+                bind: None,
                 full: |memory, inputs| $body(memory, inputs),
             }
         };

@@ -41,6 +41,11 @@ pub trait ExecutionTrap {
         None
     }
 
+    /// Additional code dependencies checked and watched with a redirection.
+    fn redirect_checks(&self, _pc: u32) -> &[(u32, Box<[u8]>)] {
+        &[]
+    }
+
     /// Required host services also replace their entry in interpreted runs.
     fn required_redirect(&self, _pc: u32) -> Option<(u32, &[u8])> {
         None

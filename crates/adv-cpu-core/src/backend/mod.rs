@@ -133,9 +133,14 @@ pub enum FaultKind {
     Fetch(u32),
     InvalidInstruction,
     IntegerDivideByZero,
+    /// An architectural exception raised by a host body.
+    Trap(u8),
     /// Backend-specific error text.
     Other(String),
 }
+
+/// Guest code bytes that a redirected function depends on.
+pub type CodeCheck = (u32, Box<[u8]>);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrapAction {
@@ -488,6 +493,11 @@ pub trait TrapHandler {
     /// target must behave as the function does.
     fn redirect(&self, _pc: u32) -> Option<(u32, &[u8])> {
         None
+    }
+
+    /// Additional code dependencies checked and watched with a redirection.
+    fn redirect_checks(&self, _pc: u32) -> &[(u32, Box<[u8]>)] {
+        &[]
     }
 
     /// The direct body that runs in place of the function at `pc`, which

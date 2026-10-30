@@ -32,7 +32,10 @@ pub(super) fn bodies() -> Vec<super::Body> {
             conv: Conv::Cdecl { argc: 2 },
             body: None,
             handler: super::resume_original,
-            direct: Some(INFLATE_FAST),
+            direct: Some(adv_cpu::body::Body {
+                bind: Some(inputs),
+                ..INFLATE_FAST
+            }),
         }),
     );
     bodies
@@ -126,21 +129,11 @@ adv_cpu::body!(INFLATE_FAST = inflate_fast, inputs: &[Input::Stack(0), Input::St
 
 // Error pointers belong to this module, including after relocation. Resolve
 // them once when binding, then pass them as fixed direct-body inputs.
-pub(super) fn inputs(
+fn inputs(
     cpu: &dyn adv_cpu::backend::Guest,
-    ext: &adv_machine::Ext,
     entry: u32,
+    code: &[u8],
 ) -> Result<[Option<Input>; 7], String> {
-    let module = ext
-        .get::<crate::identity::Images>()
-        .containing(entry)
-        .ok_or("missing zlib image")?;
-    let table = module.table().ok_or("missing zlib identity")?;
-    let function = table
-        .at(entry - module.base)
-        .ok_or("missing inflate entry")?;
-    let mut code = vec![0; function.size as usize];
-    cpu.read(entry, &mut code).map_err(|e| e.to_string())?;
     let mut messages = [0; 3];
     let texts = [
         b"invalid literal/length code\0".as_slice(),
@@ -148,7 +141,7 @@ pub(super) fn inputs(
         b"invalid distance too far back\0",
     ];
     for instruction in
-        iced_x86::Decoder::with_ip(32, &code, u64::from(entry), iced_x86::DecoderOptions::NONE)
+        iced_x86::Decoder::with_ip(32, code, u64::from(entry), iced_x86::DecoderOptions::NONE)
     {
         for operand in 0..instruction.op_count() {
             if instruction.op_kind(operand) == iced_x86::OpKind::Immediate32 {

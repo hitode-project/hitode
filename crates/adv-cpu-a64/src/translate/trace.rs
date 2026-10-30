@@ -127,6 +127,7 @@ pub struct Trace {
 pub struct Redirect {
     pub target: u32,
     pub original: Vec<u8>,
+    pub checks: Vec<(u32, Box<[u8]>)>,
     pub body: Option<adv_cpu_core::body::DirectBody>,
 }
 
@@ -214,12 +215,24 @@ impl Trace {
             let intact = |entry: u32| {
                 redirect(entry).filter(|redirect| {
                     let mut bytes = vec![0; redirect.original.len()];
-                    memory.read_into(entry, &mut bytes).is_ok() && bytes == redirect.original
+                    memory.read_into(entry, &mut bytes).is_ok()
+                        && bytes == redirect.original
+                        && redirect.checks.iter().all(|(at, original)| {
+                            let mut bytes = vec![0; original.len()];
+                            memory.read_into(*at, &mut bytes).is_ok()
+                                && bytes.as_slice() == original.as_ref()
+                        })
                 })
             };
             let fetched = match intact(pc) {
                 Some(redirect) => {
                     self.code.push((pc, redirect.original.len() as u32));
+                    self.code.extend(
+                        redirect
+                            .checks
+                            .iter()
+                            .map(|(at, bytes)| (*at, bytes.len() as u32)),
+                    );
                     match redirect.body {
                         Some(body) if self.bodies.len() <= usize::from(u8::MAX) => {
                             self.bodies.push(Bound {
@@ -277,8 +290,11 @@ impl Trace {
                             target: thunk,
                             original,
                             body: Some(body),
+                            checks,
                         }) => {
                             watched[1] = Some((target, original.len() as u32));
+                            self.code
+                                .extend(checks.iter().map(|(at, bytes)| (*at, bytes.len() as u32)));
                             self.bodies.push(Bound {
                                 body,
                                 thunk,

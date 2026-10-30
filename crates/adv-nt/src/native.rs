@@ -253,9 +253,9 @@ static BODIES: std::sync::LazyLock<Vec<Body>> = std::sync::LazyLock::new(|| {
         },
         Body {
             name: "dsound.dll!DSOUND_MixToPrimary".into(),
-            conv: Conv::Cdecl { argc: 6 },
-            body: Some(mixer::mix),
-            handler: mixer::resume,
+            conv: Conv::Cdecl { argc: 1 },
+            body: None,
+            handler: mixer::mix,
             direct: None,
         },
         Body {
@@ -693,20 +693,21 @@ fn bind_one(
         .by_thunk
         .insert(index, at);
     let target = if name == "dsound.dll!DSOUND_MixToPrimary" {
-        mixer::entry(cpu, sys, thunk)?
+        mixer::prepare(cpu, sys, ext, entry)?;
+        thunk
     } else if name.starts_with("win32u.so!halftone_") {
         dib::entry(cpu, sys, thunk)?
     } else {
         thunk
     };
     let body_name = name.split_once('@').map_or(name, |(body, _)| body);
-    if let Some(direct) = bodies()
+    if let Some(body) = bodies()
         .find(|body| body.name == body_name)
         .and_then(|body| body.direct)
     {
-        let mut direct = direct.direct;
-        if name.ends_with("!inflate_fast") {
-            direct.inputs = zlib::inputs(cpu, ext, entry)?;
+        let mut direct = body.direct;
+        if let Some(bind) = body.bind {
+            direct.inputs = bind(cpu, entry, &original)?;
         }
         sys.direct_bodies.insert(entry, direct);
         ext.get_or_default::<Entries>().insert(index, entry, direct);

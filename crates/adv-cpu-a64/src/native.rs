@@ -1295,6 +1295,7 @@ impl Native {
                 Some(translate::Redirect {
                     target,
                     original: original.to_vec(),
+                    checks: handler.redirect_checks(pc).to_vec(),
                     body: handler.direct_body(pc),
                 })
             },
