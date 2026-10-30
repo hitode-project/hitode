@@ -40,6 +40,7 @@
 //! v24-v31.
 
 mod access;
+mod body;
 mod channels;
 mod decode;
 pub mod first;
@@ -331,8 +332,17 @@ enum Test {
 
 /// Code emitted after the unit body.
 enum Cold {
+    InlineBody {
+        label: Label,
+        resume: Label,
+        body: adv_cpu_core::body::DirectBody,
+        len: u32,
+        vector: simd::Vector,
+        pushes: Vec<decode::Src>,
+    },
     BodyYield {
         label: Label,
+        vector: simd::Vector,
         entry: bool,
         release: u16,
         eip: u32,
@@ -705,6 +715,9 @@ impl Translator<'_> {
         } else if trace.merge[index] {
             self.convert(trace.live_in[index]);
             self.state = State::CANONICAL;
+        }
+        if index == 0 {
+            self.body_stack_guard();
         }
         self.asm.bind(self.labels[index]);
         self.native_batch(index);
@@ -1379,14 +1392,33 @@ impl Translator<'_> {
 
     fn cold(&mut self, cold: Cold, at: usize) {
         match cold {
+            Cold::InlineBody {
+                label,
+                resume,
+                body,
+                len,
+                vector,
+                pushes,
+            } => {
+                self.asm.bind(label);
+                self.vector = vector;
+                // Materialize before the body can observe or overwrite arguments.
+                self.body_stores(&pushes);
+                self.mov_imm(X3, len);
+                self.body_call(body);
+                self.asm.b(resume);
+            }
             Cold::BodyYield {
                 label,
+                vector,
                 entry,
                 release,
                 eip,
                 refund,
             } => {
                 self.asm.bind(label);
+                self.vector = vector;
+                self.flush_simd();
                 self.body_yield(entry, release, eip, refund);
             }
             Cold::Bridge { label, to } => {

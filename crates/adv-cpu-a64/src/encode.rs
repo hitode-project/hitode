@@ -597,6 +597,11 @@ pub const fn ldr_indexed(size: Size, index: Index, rt: Reg, rn: Reg, offset: i32
     indexed(0x3840_0000, size, index, rt, rn, offset)
 }
 
+/// `ldrb wt, [rn], #offset` or `ldrb wt, [rn, #offset]!`.
+pub const fn ldrb_indexed(index: Index, rt: Reg, rn: Reg, offset: i32) -> u32 {
+    indexed(0x3840_0000, Size::W, index, rt, rn, offset) & !(3 << 30)
+}
+
 /// `str rt, [rn], #offset` or `str rt, [rn, #offset]!`; `rn` 31 is SP.
 pub const fn str_indexed(size: Size, index: Index, rt: Reg, rn: Reg, offset: i32) -> u32 {
     indexed(0x3800_0000, size, index, rt, rn, offset)
@@ -1277,9 +1282,11 @@ pub const fn vzero(full: bool, rd: VReg) -> u32 {
     0x2F00_E400 | (full as u32) << 30 | rd.number()
 }
 
-/// Width of a SIMD and floating-point register access: S, D or Q.
+/// Width of a SIMD and floating-point register access: B, H, S, D or Q.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VMem {
+    B,
+    H,
     S,
     D,
     Q,
@@ -1289,6 +1296,8 @@ impl VMem {
     /// The `size` and load `opc` fields.
     const fn fields(self) -> u32 {
         match self {
+            Self::B => 1 << 22,
+            Self::H => 1 << 30 | 1 << 22,
             Self::S => 2 << 30 | 1 << 22,
             Self::D => 3 << 30 | 1 << 22,
             Self::Q => 3 << 22,
@@ -1297,6 +1306,8 @@ impl VMem {
 
     pub const fn bytes(self) -> u32 {
         match self {
+            Self::B => 1,
+            Self::H => 2,
             Self::S => 4,
             Self::D => 8,
             Self::Q => 16,

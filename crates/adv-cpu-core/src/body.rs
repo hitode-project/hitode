@@ -177,10 +177,20 @@ impl From<Result<Ret, Stop>> for BodyResult {
 pub type BodyFn =
     unsafe extern "C" fn(*const BodyContext, u32, u32, u32, u32, u32, u32, u32) -> BodyResult;
 
+/// An exact memory operation that a constant-length call can expand inline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Inline {
+    Move,
+    Set,
+    Compare,
+}
+
 /// A body as generated code calls it.
 #[derive(Clone, Copy, Debug)]
 pub struct DirectBody {
     pub call: BodyFn,
+    /// An exact expansion for the first three inputs: destination, source or byte, length.
+    pub inline: Option<Inline>,
     /// What w1 onwards carry: packed inputs followed by `None` padding.
     pub inputs: [Option<Input>; 7],
     /// The guest registers it sets: [`EAX`], [`EDX`], [`ECX`].
@@ -205,6 +215,9 @@ pub struct Body {
 #[macro_export]
 macro_rules! body {
     ($vis:vis $name:ident = $body:path, inputs: $inputs:expr, outputs: $outputs:expr, pop: $pop:expr) => {
+        $crate::body!($vis $name = $body, inputs: $inputs, outputs: $outputs, pop: $pop, inline: None);
+    };
+    ($vis:vis $name:ident = $body:path, inputs: $inputs:expr, outputs: $outputs:expr, pop: $pop:expr, inline: $inline:expr) => {
         $vis const $name: $crate::body::Body = {
             #[allow(clippy::too_many_arguments)]
             unsafe extern "C" fn call(
@@ -231,6 +244,7 @@ macro_rules! body {
             $crate::body::Body {
                 direct: $crate::body::DirectBody {
                     call,
+                    inline: $inline,
                     inputs,
                     outputs: $outputs,
                     pop: $pop,

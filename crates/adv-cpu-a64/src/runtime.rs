@@ -119,6 +119,8 @@ pub struct Runtime {
     pub access_resume: u64,
     /// What direct bodies receive in x0: the window and `classes`.
     pub body: adv_cpu_core::body::BodyContext,
+    pub body_value: u32,
+    pub body_stack: u32,
 }
 
 impl Runtime {
@@ -153,6 +155,8 @@ impl Runtime {
             temps: [0; 2],
             branch: 0,
             body: adv_cpu_core::body::BodyContext::default(),
+            body_value: 0,
+            body_stack: 0,
         }
     }
 }
@@ -266,6 +270,10 @@ pub(crate) const CHANNEL_BATCHES: u32 = field(offset_of!(Runtime, channel_batche
 pub(crate) const NATIVE_BATCHES: u32 = field(offset_of!(Runtime, native_batches));
 pub(crate) const CLASSES: u32 = field(offset_of!(Runtime, classes));
 pub(crate) const BODY: u32 = field(offset_of!(Runtime, body));
+pub(crate) const BODY_VALUE: u32 = field(offset_of!(Runtime, body_value));
+pub(crate) const BODY_CLASSES: u32 =
+    BODY + offset_of!(adv_cpu_core::body::BodyContext, classes) as u32;
+pub(crate) const BODY_STACK: u32 = field(offset_of!(Runtime, body_stack));
 pub(crate) const ALIAS: u32 = field(offset_of!(Runtime, alias));
 pub(crate) const ALIAS_CLASSES: u32 = field(offset_of!(Runtime, alias_classes));
 pub(crate) const CPU_STATE: u32 = CPU;

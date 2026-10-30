@@ -2035,6 +2035,39 @@ impl Translator<'_> {
         self.vector = Vector::at(entry);
     }
 
+    pub(super) fn body_cache(&mut self) {
+        // Clean values remain in CpuState; only unpublished values are live
+        // across a body that may fault before its return.
+        self.vector.xmm &= (self.vector.dirty >> 8) as u8;
+    }
+
+    /// Only the XMM cache is caller-saved; AAPCS64 preserves MMX in d8-d15.
+    pub(super) fn body_simd(&mut self, restore: bool) {
+        let count = self.vector.xmm.count_ones();
+        if count != 0 {
+            let sp = Reg::new(31);
+            if !restore {
+                self.emit(sub_imm(X, sp, sp, count * 16, false));
+            }
+            let mut offset = 0;
+            for n in 0..8 {
+                if self.vector.xmm & (1 << n) != 0 {
+                    let v = VReg::new(16 + n);
+                    self.emit(if restore {
+                        vldr(VMem::Q, v, sp, offset)
+                    } else {
+                        vstr(VMem::Q, v, sp, offset)
+                    });
+                    offset += 16;
+                }
+            }
+            if restore {
+                self.emit(add_imm(X, sp, sp, count * 16, false));
+            }
+        }
+        self.vector.cpu = false;
+    }
+
     /// Publishes the SIMD prefix without changing flags, addresses, x5 or SIMD
     /// temporaries. x0/x3/x4 are free at control and observer boundaries.
     pub(super) fn flush_simd(&mut self) {

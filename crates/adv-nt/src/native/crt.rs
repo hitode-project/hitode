@@ -1,7 +1,7 @@
 //! Locale-independent Wine 11 PE string and memory functions.
 
 use adv_cpu::backend::{Guest, Prot};
-use adv_cpu::body::{EAX, EDX, Input, Mem, Ret, Stop};
+use adv_cpu::body::{EAX, EDX, Inline, Input, Mem, Ret, Stop};
 use adv_machine::{Conv, layout::PAGE};
 
 use super::{Body, resume_original};
@@ -50,9 +50,9 @@ fn scan_length(cpu: &dyn Guest, mut at: u32, width: u32, limit: u32) -> Option<u
 const ARGS: &[Input] = &[Input::Stack(0), Input::Stack(1), Input::Stack(2)];
 
 // memmove(dst, src, n), and Wine's memcpy, which jumps to it.
-adv_cpu::body!(pub(super) MEMMOVE = move_bytes, inputs: ARGS, outputs: EAX | EDX, pop: 0);
-adv_cpu::body!(MEMSET = fill, inputs: ARGS, outputs: EAX, pop: 0);
-adv_cpu::body!(MEMCMP = compare_bytes, inputs: ARGS, outputs: EAX, pop: 0);
+adv_cpu::body!(pub(super) MEMMOVE = move_bytes, inputs: ARGS, outputs: EAX | EDX, pop: 0, inline: Some(Inline::Move));
+adv_cpu::body!(MEMSET = fill, inputs: ARGS, outputs: EAX, pop: 0, inline: Some(Inline::Set));
+adv_cpu::body!(MEMCMP = compare_bytes, inputs: ARGS, outputs: EAX, pop: 0, inline: Some(Inline::Compare));
 
 /// EAX and EDX are `dst`, as Wine's code leaves them.
 fn move_bytes<M: Mem>(mem: &mut M, [dst, src, len, ..]: [u32; 7]) -> Result<Ret, Stop> {

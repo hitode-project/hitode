@@ -137,6 +137,18 @@ impl Translator<'_> {
                 self.emit(sbfx(W, host(2), host(0), 31, 1));
             }
             Op::Push(source) => {
+                if self.forwarded_push(self.index) {
+                    match source {
+                        Src::Mem(mem) => {
+                            let addr = self.address(mem);
+                            self.load(addr, X6);
+                            self.emit(str(W, X6, RUNTIME, runtime::BODY_VALUE));
+                        }
+                        Src::Reg(ESP) => self.emit(str(W, host(ESP), RUNTIME, runtime::BODY_VALUE)),
+                        _ => {}
+                    }
+                    return;
+                }
                 let value = match source {
                     Src::Reg(ESP) => {
                         self.emit(mov(W, X6, host(ESP)));
@@ -520,17 +532,74 @@ impl Translator<'_> {
         use adv_cpu_core::body::{EAX, ECX, EDX, Input};
         // AAPCS64 keeps x19-x29 and d8-d15: the guest map survives; the
         // countdown, DF in x12 and the XMM cache do not.
-        self.flush_simd();
-        self.vector = super::simd::Vector::default();
+        self.body_cache();
         *self.uses_permissions = true;
         let body = bound.body;
+        let pushes = self.body_pushes(self.index);
+        let inline = body.inline.zip(self.body_length(self.index));
+        if !pushes.is_empty() {
+            self.prepare(Operand::Guest(ESP));
+            if self.body_stack_span().is_none() {
+                let retry = self.asm.label();
+                // Check the complete stack input span before committing any omitted
+                // push. A blocked or crossing stack runs those pushes in Tier 0.
+                let count = body
+                    .inputs
+                    .iter()
+                    .flatten()
+                    .filter_map(|input| {
+                        if let Input::Stack(k) = input {
+                            Some(u32::from(*k) + 1)
+                        } else {
+                            None
+                        }
+                    })
+                    .max()
+                    .unwrap();
+                self.emit(sub_imm(W, X16, host(ESP), pushes.len() as u32 * 4, false));
+                self.body_page(X16, count * 4, true, retry);
+                self.push_cold(Cold::Leave {
+                    label: retry,
+                    state: self.state,
+                    simd_dirty: self.vector.dirty,
+                    refund: self.trace.owed(self.index - pushes.len()),
+                    exit: Exit::Interpret,
+                    eip: self.trace.insts[self.index - pushes.len()].pc,
+                    link: false,
+                    x87: None,
+                });
+            }
+            self.emit(sub_imm(
+                X,
+                host(ESP),
+                host(ESP),
+                pushes.len() as u32 * 4,
+                false,
+            ));
+            self.forget(Operand::Guest(ESP));
+        }
+        if !pushes.is_empty() && self.body_stack_span().is_none() {
+            self.emit(lsr_imm(W, X16, host(ESP), 12));
+            self.emit(str(W, X16, RUNTIME, runtime::BODY_STACK));
+        }
         let base = if bound.entry { 4 } else { 0 };
         for (n, &input) in body.inputs.iter().flatten().enumerate() {
             let rd = Reg::new(1 + n as u8);
+            if n == 2 && inline.is_some() {
+                continue;
+            }
             match input {
                 Input::Stack(k) => {
                     let disp = base + 4 * u32::from(k);
-                    if self.checking {
+                    if let Some(source) = pushes.get(usize::from(k)) {
+                        match *source {
+                            Src::Imm(value) => self.mov_imm(rd, value),
+                            Src::Reg(ESP) | Src::Mem(_) => {
+                                self.emit(ldr(W, rd, RUNTIME, runtime::BODY_VALUE))
+                            }
+                            Src::Reg(reg) => self.emit(mov(W, rd, host(reg))),
+                        }
+                    } else if self.checking {
                         self.emit(add_imm(W, X16, host(ESP), disp, false));
                         self.load(Addr::Window(X16), X6);
                         self.emit(mov(W, rd, X6));
@@ -554,31 +623,62 @@ impl Translator<'_> {
                 }
             }
         }
-        let call = body.call as usize as u64;
-        self.emit(stp(X, Pre, X9, super::X12, SP, -16));
-        self.emit(add_imm(X, X0, RUNTIME, runtime::BODY, false));
-        self.emit(movz(X, X16, call as u16, 0));
-        for shift in [16, 32, 48] {
-            self.emit(movk(X, X16, (call >> shift) as u16, shift));
+        let mut inline_done = None;
+        if let Some((kind, len)) = inline {
+            let (slow, resume) = (self.asm.label(), self.asm.label());
+            let known = std::array::from_fn(|n| match pushes.get(n) {
+                Some(Src::Imm(value)) => Some(*value),
+                _ => None,
+            });
+            self.inline_body(kind, len, slow, known);
+            let done = self.asm.label();
+            self.state = State::CANONICAL;
+            if body.outputs & EAX != 0 {
+                self.emit(mov(
+                    W,
+                    host(0),
+                    if kind == adv_cpu_core::body::Inline::Compare {
+                        X0
+                    } else {
+                        X1
+                    },
+                ));
+            }
+            if body.outputs & EDX != 0 {
+                self.emit(mov(W, host(2), X1));
+            }
+            if body.pop != 0 {
+                self.emit(add_imm(X, host(ESP), host(ESP), u32::from(body.pop), false));
+            }
+            self.asm.b(done);
+            inline_done = Some(done);
+            self.asm.bind(resume);
+            self.push_cold(Cold::InlineBody {
+                label: slow,
+                resume,
+                body,
+                len,
+                vector: self.vector,
+                pushes,
+            });
+        } else {
+            self.body_call(body);
         }
-        self.emit(blr(X16));
-        self.emit(ldp(X, Post, X9, super::X12, SP, 16));
         self.state = State::CANONICAL;
         let slow = self.asm.label();
         self.asm.tbz(true, X1, 32, slow);
-        let (exit, eip, link) = if bound.entry {
-            (Exit::Dispatch, bound.thunk, true)
-        } else {
-            (Exit::Interpret, inst.pc, false)
-        };
         self.push_cold(Cold::Leave {
             label: slow,
             state: State::CANONICAL,
-            simd_dirty: 0,
+            simd_dirty: self.vector.dirty,
             refund: self.trace.owed(self.index),
-            exit,
-            eip,
-            link,
+            exit: if bound.entry {
+                Exit::Dispatch
+            } else {
+                Exit::Interpret
+            },
+            eip: if bound.entry { bound.thunk } else { inst.pc },
+            link: bound.entry,
             x87: None,
         });
         if body.outputs & EAX != 0 {
@@ -600,11 +700,15 @@ impl Translator<'_> {
         self.asm.tbz(true, X1, 33, yielded);
         self.push_cold(Cold::BodyYield {
             label: yielded,
+            vector: self.vector,
             entry: bound.entry,
             release: body.pop,
             eip: inst.next_pc,
             refund: self.trace.unused(self.index),
         });
+        if let Some(done) = inline_done {
+            self.asm.bind(done);
+        }
         if bound.entry {
             self.ret(inst, body.pop);
         }

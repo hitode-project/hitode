@@ -1848,17 +1848,59 @@ fn code_pages_read_unborrowable_entries() {
 #[ignore = "translated-call microbenchmark"]
 fn crt_zlib_translated_call_benchmark() {
     let dist = dist().unwrap();
-    for (module, name, len, args) in [
-        ("msvcrt.dll", "strlen", 16, vec![DATA]),
-        ("msvcrt.dll", "strlen", 256, vec![DATA]),
-        ("msvcrt.dll", "strcmp", 32, vec![DATA, DATA]),
-        ("msvcrt.dll", "wcslen", 64, vec![DATA]),
-        ("windowscodecs.dll", "adler32_z", 64, vec![1, DATA, 64]),
+    for (module, name, len, args, dynamic) in [
+        (
+            "msvcrt.dll",
+            "memcpy",
+            4,
+            vec![DATA + 0x1000, DATA, 4],
+            false,
+        ),
+        (
+            "msvcrt.dll",
+            "memcpy",
+            16,
+            vec![DATA + 0x1000, DATA, 16],
+            false,
+        ),
+        (
+            "msvcrt.dll",
+            "memcpy",
+            64,
+            vec![DATA + 0x1000, DATA, 64],
+            false,
+        ),
+        (
+            "msvcrt.dll",
+            "memcmp",
+            8,
+            vec![DATA, DATA + 0x1000, 8],
+            false,
+        ),
+        ("msvcrt.dll", "strlen", 16, vec![DATA], false),
+        (
+            "msvcrt.dll",
+            "memcpy",
+            16,
+            vec![DATA + 0x1000, DATA, 16],
+            true,
+        ),
+        ("msvcrt.dll", "strlen", 256, vec![DATA], false),
+        ("msvcrt.dll", "strcmp", 32, vec![DATA, DATA], false),
+        ("msvcrt.dll", "wcslen", 64, vec![DATA], false),
+        (
+            "windowscodecs.dll",
+            "adler32_z",
+            64,
+            vec![1, DATA, 64],
+            false,
+        ),
         (
             "windowscodecs.dll",
             "adler32_z",
             65536,
             vec![1, DATA, 65536],
+            false,
         ),
     ] {
         let (mut m, pe) = machine(&dist, module, true);
@@ -1872,12 +1914,23 @@ fn crt_zlib_translated_call_benchmark() {
             .unwrap();
         let entry = pe.image_base + table.named(name).unwrap().rva;
         m.cpu.write_u32(SLOT, entry).unwrap();
+        let iterations = if name == "adler32_z" {
+            1_000_000u32
+        } else {
+            10_000_000
+        };
         let mut code = vec![0x57, 0xbf];
-        code.extend_from_slice(&1_000_000u32.to_le_bytes());
+        code.extend_from_slice(&iterations.to_le_bytes());
         let begin = code.len();
-        for arg in args.iter().rev() {
-            code.push(0x68);
-            code.extend_from_slice(&arg.to_le_bytes());
+        for (n, arg) in args.iter().enumerate().rev() {
+            if dynamic && n == 2 {
+                m.cpu.write_u32(ARGS, *arg).unwrap();
+                code.extend_from_slice(&[0xff, 0x35]);
+                code.extend_from_slice(&ARGS.to_le_bytes());
+            } else {
+                code.push(0x68);
+                code.extend_from_slice(&arg.to_le_bytes());
+            }
         }
         code.extend_from_slice(&[0xff, 0x15]);
         code.extend_from_slice(&SLOT.to_le_bytes());
@@ -1893,8 +1946,8 @@ fn crt_zlib_translated_call_benchmark() {
             let elapsed = start.elapsed();
             if round == 1 {
                 println!(
-                    "{module}!{name} {len}: {:.3} ns/call (1M translated calls)",
-                    elapsed.as_nanos() as f64 / 1_000_000.0
+                    "{module}!{name} {len} dynamic={dynamic}: {:.3} ns/call ({iterations} translated calls)",
+                    elapsed.as_nanos() as f64 / f64::from(iterations)
                 );
             }
         }
