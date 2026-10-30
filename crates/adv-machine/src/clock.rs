@@ -422,7 +422,7 @@ pub const POLL_STREAK: u32 = 2048;
 const POLL_GAP_US: u64 = 50;
 
 /// The last clock read and how many reads on that context came back to back,
-/// with no other host call and almost no guest time between them.
+/// with no productive service work and almost no guest time between them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ClockPoll {
     context: Option<CtxId>,

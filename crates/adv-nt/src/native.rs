@@ -30,9 +30,7 @@ mod crt;
 mod dib;
 mod fonts;
 pub use fonts::FontFrontend;
-#[cfg(any(target_vendor = "apple", target_os = "android"))]
 mod input;
-#[cfg(any(target_vendor = "apple", target_os = "android"))]
 pub use input::UserServices;
 mod linked;
 mod mixer;
