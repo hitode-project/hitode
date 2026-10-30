@@ -15,7 +15,7 @@ pub(super) fn bodies() -> Vec<super::Body> {
     .map(|module| super::Body {
         name: format!("{module}!adler32_z").into(),
         conv: Conv::Cdecl { argc: 3 },
-        body: adler32,
+        body: Some(adler32),
         handler: super::resume_original,
     })
     .collect();
@@ -29,7 +29,7 @@ pub(super) fn bodies() -> Vec<super::Body> {
         .map(|module| super::Body {
             name: format!("{module}!inflate_fast").into(),
             conv: Conv::Cdecl { argc: 2 },
-            body: inflate_fast,
+            body: Some(inflate_fast),
             handler: super::resume_original,
         }),
     );

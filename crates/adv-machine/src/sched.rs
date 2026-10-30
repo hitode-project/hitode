@@ -637,6 +637,7 @@ mod active_tests {
             recent: RecentCalls::new(256),
             host_calls: 0,
             redirects: HashMap::new(),
+            required_redirects: Default::default(),
             call_limit: None,
             stats: Stats::new(),
             schedule_trace: schedule_trace::ScheduleTrace::default(),

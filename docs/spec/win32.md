@@ -52,4 +52,19 @@ This spec covers the Win32 state the shared crates still own: image rebasing, he
 **Rule**: ANSI widths and kerning MUST use the selected charset and device-provided default glyph. Wide outline metrics MUST preserve their own native short-buffer rules. Portable wide metrics MUST take first and last characters from the Unicode cmap, and break and default characters from OS/2 usFirstCharIndex.
 **Verification**: Test
 
+### WIN32-GDI-11 Character placement
+
+**Rule**: Character placement MUST validate bounded output arrays and preserve partial-result behavior. ANSI placement MUST use the guest ACP and retain explicit-charset conversion. Placement arrays MUST use the same realized fonts as measurement and drawing.
+**Verification**: Test
+
+### WIN32-GDI-14 Paragraph drawing
+
+**Rule**: `DrawTextA/W` MUST handle CR, LF, CRLF, external leading, and bottom clipping while preserving the input RECT outside `DT_CALCRECT`. Wrapping, tabs, prefixes, ellipses, and alignment MUST share selected-font advances, the guest ACP, and DC clipping.
+**Verification**: Test
+
+### WIN32-GDI-15 Memory fonts
+
+**Rule**: AddFontMemResourceEx MUST register a copy as a process-private, non-enumerable resource, report its face count, and return a distinct handle. RemoveFontMemResourceEx MUST release only that registration. Process cleanup MUST release remaining memory fonts.
+**Verification**: Test
+
 Withdrawn: WIN32-IMAGE-5

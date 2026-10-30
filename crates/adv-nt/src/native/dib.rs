@@ -24,7 +24,7 @@ macro_rules! bodies {
             super::Body {
                 name: std::borrow::Cow::Borrowed(concat!("win32u.so!", $name)),
                 conv: Conv::Cdecl { argc: $argc },
-                body: $body,
+                body: Some($body),
                 handler: handler!($body),
             },
         )*)*];

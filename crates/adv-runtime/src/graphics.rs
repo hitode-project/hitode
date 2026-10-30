@@ -5,9 +5,11 @@ use adv_machine::{Env, Machine, Outcome};
 use std::borrow::Cow;
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "gpu")]
+pub use adv_device::surface::Surfaces;
 pub use adv_device::surface::{
     FrameConsumer, FrameProducer, FrameView, GraphicsStats, PendingFrame, Presenter, Snapshot,
-    SurfaceMemory, Surfaces, VideoCursorRegion, frame_mailbox,
+    SurfaceMemory, VideoCursorRegion, frame_mailbox,
 };
 /// One byte-access adapter, borrowed on the stack by the fronts.
 pub(crate) fn guest_memory<'a>(cpu: &'a mut (dyn Guest + 'a)) -> MemoryView<'a, dyn Guest + 'a> {
