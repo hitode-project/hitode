@@ -467,6 +467,11 @@ Windows empty A/W peeks preserve last error and MSG, dispatch pending sent messa
 **Rule**: Bodies MAY use host instruction set features detected at startup, such as NEON table lookups, CRC32, PMULL and dot products. The variant MUST be chosen when the function binds, without per-call feature checks. Every variant MUST produce identical results.
 **Verification**: Test
 
+### NAT-BODY-20 Wine string comparison data
+
+**Rule**: Comparison bodies MUST read Wine's loaded sort, locale and code page data in place and return Wine's results and last error. They MUST NOT load, copy or correct NLS data.
+**Verification**: Test
+
 ## Host DLL images
 
 ### WINE-DLL-1 Loader-owned entries

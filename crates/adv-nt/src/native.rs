@@ -34,6 +34,7 @@ mod input;
 pub use input::UserServices;
 mod linked;
 mod mixer;
+mod nls;
 mod own_calls;
 mod pixels;
 mod png;
@@ -358,6 +359,7 @@ static BODIES: std::sync::LazyLock<Vec<Body>> = std::sync::LazyLock::new(|| {
         },
     ];
     bodies.extend(crt::bodies());
+    bodies.extend(nls::bodies());
     bodies.extend(services::bodies());
     #[cfg(any(target_vendor = "apple", target_os = "android"))]
     bodies.extend(input_bodies());
@@ -506,6 +508,8 @@ fn run_full(
     let inputs = std::array::from_fn(|n| match direct.inputs[n] {
         Some(Input::Stack(k)) => env.arg(u32::from(k)),
         Some(Input::Const(value)) => value,
+        Some(Input::Args) => env.cpu.reg(Reg::Esp).wrapping_add(4),
+        Some(Input::Teb) => env.ctx().teb,
         Some(Input::Eax) => env.cpu.reg(Reg::Eax),
         Some(Input::Ecx) => env.cpu.reg(Reg::Ecx),
         Some(Input::Edx) => env.cpu.reg(Reg::Edx),
@@ -755,6 +759,21 @@ fn bind_one(
         let mut direct = body.direct;
         if let Some(bind) = body.bind {
             direct.inputs = bind(cpu, entry, &original)?;
+        }
+        if name.starts_with("kernelbase.dll!CompareString")
+            || name.starts_with("kernelbase.dll!lstrcmp")
+        {
+            direct.inputs[2] = Some(adv_cpu::body::Input::Const(
+                ext.get::<Images>().containing(entry).unwrap().base,
+            ));
+            direct.inputs[3] = Some(adv_cpu::body::Input::Const(
+                ext.get::<Images>()
+                    .0
+                    .values()
+                    .find(|image| image.name == "ntdll.dll")
+                    .unwrap()
+                    .base,
+            ));
         }
         if name.starts_with("win32u.so!") {
             if let Some(image) = ext

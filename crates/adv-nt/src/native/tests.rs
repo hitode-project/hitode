@@ -995,3 +995,9 @@ fn crt_comparison_lengths_match_windows() {
         }
     }
 }
+
+// spec: NAT-BODY-20, NAT-BODY-15, NAT-BODY-17
+#[test]
+fn comparisons_cross_pages_without_allocating() {
+    nls::check_comparison_memory(&mut machine().cpu);
+}

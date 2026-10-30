@@ -539,6 +539,11 @@ impl Translator<'_> {
                     }
                 }
                 Input::Const(value) => self.mov_imm(rd, value),
+                Input::Args => self.emit(add_imm(W, rd, host(ESP), base, false)),
+                Input::Teb => {
+                    self.emit(ldr(X, X16, RUNTIME, runtime::CPU_STATE));
+                    self.emit(ldr(W, rd, X16, runtime::FS_BASE));
+                }
                 Input::Eax => self.emit(mov(W, rd, host(0))),
                 Input::Ecx => self.emit(mov(W, rd, host(1))),
                 Input::Edx => self.emit(mov(W, rd, host(2))),

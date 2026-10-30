@@ -76,6 +76,10 @@ pub enum Input {
     Stack(u8),
     /// A value fixed when this function binds.
     Const(u32),
+    /// Address of the first stack argument, excluding the return address.
+    Args,
+    /// FS base (the current thread's TEB).
+    Teb,
     Eax,
     Ecx,
     Edx,
@@ -254,6 +258,19 @@ pub trait Mem {
         Services::default()
     }
 
+    /// Read a scalar without retaining or allocating a snapshot.
+    fn read<const N: usize>(&mut self, at: u32) -> Result<[u8; N], Stop> {
+        let pointer = self.input(at, N as u32)?;
+        // SAFETY: input checked all N bytes; the result is a scalar value.
+        Ok(unsafe { pointer.cast::<[u8; N]>().read_unaligned() })
+    }
+
+    /// Grant a readable page whose storage remains live until commit.
+    /// Shared writable storage stays on scalar reads.
+    fn read_page(&mut self, _page: u32) -> Result<Option<*const u8>, Stop> {
+        Ok(None)
+    }
+
     /// The `len` bytes at `at`, to read.
     fn input(&mut self, at: u32, len: u32) -> Result<*const u8, Stop>;
     /// The `len` bytes at `at`, holding their current bytes, to write.
@@ -318,11 +335,13 @@ impl Window {
         }
     }
 
+    #[inline]
     fn class(&self, page: u32) -> u8 {
         // SAFETY: the table has a byte for every page of the 4 GiB space.
         unsafe { *self.classes.add(page as usize) }
     }
 
+    #[inline]
     fn check(&self, at: u32, len: u32, need: u8, deny: u8) -> Result<*mut u8, Stop> {
         let mut flags = 0;
         if len != 0 {
@@ -349,6 +368,12 @@ impl Window {
 
 impl Mem for Window {
     const WINDOW: bool = true;
+    #[inline]
+    fn read_page(&mut self, page: u32) -> Result<Option<*const u8>, Stop> {
+        self.check(page << PAGE_SHIFT, 1 << PAGE_SHIFT, READ, SHARED)
+            .map(|pointer| Some(pointer.cast_const()))
+    }
+
     fn services(&self) -> Services {
         self.services
     }
@@ -516,6 +541,36 @@ impl<'a> GuestMem<'a> {
 }
 
 impl Mem for GuestMem<'_> {
+    fn read_page(&mut self, page: u32) -> Result<Option<*const u8>, Stop> {
+        let at = page << PAGE_SHIFT;
+        let len = 1 << PAGE_SHIFT;
+        if !self.cpu.accessible(at, len, Prot::READ) {
+            return Ok(None);
+        }
+        if let Some(bytes) = self.cpu.shared_bytes(at, len as usize) {
+            return Ok(Some(bytes.as_ptr()));
+        }
+        // The guest mapping retains the allocation for this body borrow.
+        // read_only_file_view exposes a raw pointer, never a Rust reference
+        // to file bytes, and no body access changes the guest VM mappings.
+        Ok(self
+            .cpu
+            .read_only_file_view(at, len as usize)
+            .map(|view| view.as_ptr()))
+    }
+
+    fn read<const N: usize>(&mut self, at: u32) -> Result<[u8; N], Stop> {
+        if N != 0 && !self.cpu.accessible(at, N as u32, Prot::READ) {
+            return Err(self.fault(at, N as u32, Prot::READ));
+        }
+        let mut bytes = [0; N];
+        self.cpu.read(at, &mut bytes).map_err(|fault| Stop::Fault {
+            address: fault.addr,
+            write: false,
+        })?;
+        Ok(bytes)
+    }
+
     fn services(&self) -> Services {
         self.services
     }

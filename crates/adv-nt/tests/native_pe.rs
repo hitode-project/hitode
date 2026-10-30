@@ -1950,3 +1950,154 @@ fn d3dx_block_rounding_wraps_and_zero_divisors_fault() {
     assert_eq!(fault.kind, adv_cpu::backend::FaultKind::IntegerDivideByZero);
     assert_eq!(adv_nt::native::declines(&native.ext), 0);
 }
+
+// spec: NAT-BODY-20
+#[test]
+fn nls_layout_matches_dwarf() {
+    let Some(dist) = dist() else {
+        return;
+    };
+    let source = include_str!("../src/native/nls.rs");
+    for module in ["kernelbase", "ntdll"] {
+        let dll = dist
+            .with_file_name("wine11-sse-dist")
+            .join(format!("usr/local/lib/wine/i386-windows/{module}.dll"));
+        let pe = Pe::parse(&std::fs::read(&dll).unwrap()).unwrap();
+        let dump = std::process::Command::new("dwarfdump")
+            .arg("--debug-info")
+            .arg(dll)
+            .output()
+            .unwrap();
+        assert!(dump.status.success());
+        let text = String::from_utf8(dump.stdout).unwrap();
+        let entries: Vec<_> = text.split("\n0x").collect();
+        let named = |tag: &str, name: &str| -> usize {
+            entries
+                .iter()
+                .position(|e| {
+                    e.contains(&format!(":   DW_TAG_{tag}"))
+                        && e.contains(&format!("DW_AT_name\t(\"{name}\")"))
+                })
+                .unwrap_or_else(|| panic!("missing {module}: {tag} {name}"))
+        };
+        let reference = |entry: usize| -> usize {
+            let id = entries[entry]
+                .split("DW_AT_type\t(0x")
+                .nth(1)
+                .unwrap()
+                .split([' ', ')'])
+                .next()
+                .unwrap();
+            entries
+                .iter()
+                .position(|e| e.starts_with(&format!("{id}:")))
+                .unwrap()
+        };
+        let structure = |name: &str| -> usize {
+            if let Some(variable) = name.strip_prefix('@') {
+                return reference(named("variable", variable));
+            }
+            if let Some(typedef) = name.strip_prefix('$') {
+                return reference(named("typedef", typedef));
+            }
+            named("structure_type", name)
+        };
+        let hex_field = |entry: &str, field: &str| -> u32 {
+            let value = entry
+                .split(&format!("{field}\t(0x"))
+                .nth(1)
+                .unwrap()
+                .split(')')
+                .next()
+                .unwrap();
+            u32::from_str_radix(value, 16).unwrap()
+        };
+        let variable = |name: &str| -> u32 {
+            let entry = entries[named("variable", name)];
+            let addr = entry
+                .split("DW_OP_addr 0x")
+                .nth(1)
+                .unwrap()
+                .split(')')
+                .next()
+                .unwrap();
+            u32::from_str_radix(addr, 16).unwrap() - pe.image_base
+        };
+        let member = |name: &str, field: &str| -> u32 {
+            let entry = structure(name);
+            if field == "SIZE" {
+                return hex_field(entries[entry], "DW_AT_byte_size");
+            }
+            let field = entries[entry + 1..]
+                .iter()
+                .take_while(|e| !e.contains(":     NULL"))
+                .find(|e| e.contains(&format!("DW_AT_name\t(\"{field}\")")))
+                .unwrap();
+            hex_field(field, "DW_AT_data_member_location")
+        };
+        if module == "kernelbase" {
+            for (block, name) in [
+                ("cp", "_CPTABLEINFO"),
+                ("kb", ""),
+                ("sort", "@sort"),
+                ("sortguid", "sortguid"),
+                ("compression", "sort_compression"),
+                ("expansion", "sort_expansion"),
+                ("jamo", "jamo_sort"),
+                ("locale_header", "$NLS_LOCALE_HEADER"),
+                ("locale_data", "$NLS_LOCALE_DATA"),
+                ("lcid_index", "$NLS_LOCALE_LCID_INDEX"),
+                ("lcname_index", "$NLS_LOCALE_LCNAME_INDEX"),
+                ("critical", "_RTL_CRITICAL_SECTION"),
+                ("teb", "_TEB"),
+            ] {
+                let constants = source
+                    .split(&format!("mod {block} {{"))
+                    .nth(1)
+                    .unwrap()
+                    .split('}')
+                    .next()
+                    .unwrap();
+                for line in constants.lines().filter(|line| line.contains("pub const")) {
+                    let field = line
+                        .split("pub const ")
+                        .nth(1)
+                        .unwrap()
+                        .split(':')
+                        .next()
+                        .unwrap();
+                    let value = line.split("= ").nth(1).unwrap().trim_end_matches(';');
+                    let expected = if let Some(hex) = value.strip_prefix("0x") {
+                        u32::from_str_radix(hex, 16).unwrap()
+                    } else {
+                        value.parse().unwrap()
+                    };
+                    let actual = if block == "kb" {
+                        variable(field)
+                    } else {
+                        member(name, field)
+                    };
+                    assert_eq!(actual, expected, "{module}: {block}.{field}");
+                }
+            }
+        } else {
+            for (constant, actual) in [
+                ("NT_NLS_INFO", variable("nls_info")),
+                ("NT_UPPER_CASE", member("_NLSTABLEINFO", "UpperCaseTable")),
+            ] {
+                let value = source
+                    .split(&format!("const {constant}: u32 = 0x"))
+                    .nth(1)
+                    .unwrap()
+                    .split(';')
+                    .next()
+                    .unwrap();
+                assert_eq!(
+                    actual,
+                    u32::from_str_radix(value, 16).unwrap(),
+                    "{constant}"
+                );
+            }
+        }
+    }
+}
