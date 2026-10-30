@@ -16,6 +16,14 @@ mod elf;
 mod layout;
 use layout::{dib as d, *};
 
+#[allow(dead_code)]
+mod wine {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../adv-nt/tests/common/wine.rs"
+    ));
+}
+
 const BASE: u32 = 0x1000_0000;
 const CODE: u32 = 0x400000;
 const DATA: u32 = 0x500000;
@@ -34,7 +42,7 @@ const MASK_BITS: u32 = DATA + 0xc000;
 const RESULT: u32 = DATA + 0x18000;
 
 fn dist() -> Option<PathBuf> {
-    std::env::var_os("ADV_WINE_DIST").map(PathBuf::from)
+    wine::dist()
 }
 fn set(data: &mut [u8], base: u32, offset: usize, value: u32) {
     let at = (base - DATA) as usize + offset;

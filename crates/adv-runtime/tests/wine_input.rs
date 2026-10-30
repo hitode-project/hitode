@@ -5,23 +5,26 @@
 use std::fs::File;
 use std::io::Read;
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
 use adv_machine::{RunResult, SliceResult};
 use adv_runtime::wine::session::{Config, Session, Stop};
 
+#[allow(dead_code)]
+mod wine {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../adv-nt/tests/common/wine.rs"
+    ));
+}
+
 fn read(output: &mut File, text: &mut String) {
     let _ = output.read_to_string(text);
 }
 
 fn run(probe: &str, gpu: bool) {
-    let (Some(dist), Some(probes)) = (
-        std::env::var_os("ADV_WINE_DIST").map(PathBuf::from),
-        std::env::var_os("ADV_WINE_PROBES").map(PathBuf::from),
-    ) else {
-        eprintln!("skipped: ADV_WINE_DIST or ADV_WINE_PROBES is not set");
+    let Some(wine::Wine { dist, probes }) = wine::wine() else {
         return;
     };
     let root = std::env::temp_dir().join(format!("adv-wine-{probe}-{}", std::process::id()));

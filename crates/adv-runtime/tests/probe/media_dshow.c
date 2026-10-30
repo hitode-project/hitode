@@ -1,4 +1,4 @@
-/* i686-w64-mingw32-gcc -mcrtdll=msvcrt-os -O2 media_dshow.c -o media_dshow.exe -lstrmiids -lole32 -loleaut32 -luuid */
+/* Build: i686-w64-mingw32-gcc -mcrtdll=msvcrt-os -O2 media_dshow.c -o media_dshow.exe -lstrmiids -lole32 -loleaut32 -luuid */
 #define COBJMACROS
 #include <windows.h>
 #include <dshow.h>

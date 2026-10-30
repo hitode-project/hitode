@@ -4,6 +4,14 @@
 mod common;
 use adv_abi::Registry;
 use adv_machine::{HostFn, Resolver, RunResult};
+
+#[allow(dead_code)]
+mod wine {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../adv-nt/tests/common/wine.rs"
+    ));
+}
 struct Platform(Registry);
 #[derive(Default)]
 struct Audits {
@@ -133,8 +141,7 @@ fn user_reference() {
 // spec: NAT-BODY-18, A64-CALL-5, A64-CALL-6, PROC-CLOCK-7
 #[test]
 fn user_services_preserve_windows_empty_queue_behavior() {
-    if std::env::var_os("ADV_WINE_DIST").is_none() || std::env::var_os("ADV_WINE_PROBES").is_none()
-    {
+    if wine::wine().is_none() {
         return;
     }
     for name in ["user_native", "user_reference"] {

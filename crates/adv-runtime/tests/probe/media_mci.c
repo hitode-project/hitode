@@ -1,4 +1,4 @@
-/* i686-w64-mingw32-gcc -mcrtdll=msvcrt-os -O2 media_mci.c -o media_mci.exe -lwinmm */
+/* Build: i686-w64-mingw32-gcc -mcrtdll=msvcrt-os -O2 media_mci.c -o media_mci.exe -lwinmm */
 #include <windows.h>
 #include <mmsystem.h>
 #include <stdio.h>

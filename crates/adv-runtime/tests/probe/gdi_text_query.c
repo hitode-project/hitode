@@ -1,3 +1,4 @@
+/* Build: i686-w64-mingw32-gcc -O2 -Wall gdi_text_query.c -o gdi_text_query.exe -lgdi32 */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 

@@ -4,17 +4,19 @@ use adv_runtime::wine::session::{Config, Session, Stop};
 use std::{
     fs::File,
     os::fd::AsRawFd,
-    path::PathBuf,
     time::{Duration, Instant},
 };
 
+#[allow(dead_code)]
+mod wine {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../adv-nt/tests/common/wine.rs"
+    ));
+}
+
 fn probe(jit: bool) -> Option<String> {
-    let (Some(dist), Some(probes)) = (
-        std::env::var_os("ADV_WINE_DIST").map(PathBuf::from),
-        std::env::var_os("ADV_WINE_PROBES").map(PathBuf::from),
-    ) else {
-        return None;
-    };
+    let wine::Wine { dist, probes } = wine::wine()?;
     let root = std::env::temp_dir().join(format!("adv-pe-bodies-{}", std::process::id()));
     let game = root.join("game");
     std::fs::create_dir_all(&game).unwrap();
@@ -80,8 +82,7 @@ fn code_page_probe_interpreter() {
 // spec: NAT-BODY-5
 #[test]
 fn code_page_exports_reach_bodies() {
-    if std::env::var_os("ADV_WINE_DIST").is_none() || std::env::var_os("ADV_WINE_PROBES").is_none()
-    {
+    if wine::wine().is_none() {
         return;
     }
     let reference = std::process::Command::new(std::env::current_exe().unwrap())

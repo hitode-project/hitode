@@ -1,3 +1,4 @@
+/* Build: i686-w64-mingw32-gcc -O2 -Wall drawtext-lines.c -o drawtext-lines.exe -lgdi32 -luser32 */
 /* Authored A/W paragraph oracle: no sample input or visible windows.
  * Outputs drawtext-lines.bin with return values, unchanged rectangles and
  * RGB hashes of a selected DIB; native cursor and settings are untouched. */

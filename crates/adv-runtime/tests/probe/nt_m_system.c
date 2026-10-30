@@ -1,4 +1,4 @@
-/* i686-w64-mingw32-gcc -O2 -Wall -o "$ADV_WINE_PROBES/nt_m_system.exe" nt_m_system.c -ladvapi32 */
+/* Build: i686-w64-mingw32-gcc -O2 -Wall -o nt_m_system.exe nt_m_system.c -ladvapi32 */
 #define _WIN32_WINNT 0x0a00
 #include <windows.h>
 #include <winternl.h>

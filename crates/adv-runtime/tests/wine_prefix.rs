@@ -1,25 +1,28 @@
 //! A session's prefix comes from the template and its identity is fixed: a
 //! program sees the template's user and the virtual machine, never the host.
 //!
-//! It needs `ADV_WINE_DIST` and `ADV_WINE_PROBES`, as the probe tests do.
+//! It needs `ADV_WINE_DIST`, as the probe tests do.
 #![cfg(any(target_vendor = "apple", target_os = "android"))]
 
 use std::fs::File;
 use std::io::Read;
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use adv_runtime::wine::session::{Config, Session, Stop};
 
+#[allow(dead_code)]
+mod wine {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../adv-nt/tests/common/wine.rs"
+    ));
+}
+
 // spec: WINE-SES-3, WINE-SES-4
 #[test]
 fn a_session_sees_the_template_user_and_the_virtual_machine() {
-    let (Some(dist), Some(probes)) = (
-        std::env::var_os("ADV_WINE_DIST").map(PathBuf::from),
-        std::env::var_os("ADV_WINE_PROBES").map(PathBuf::from),
-    ) else {
-        eprintln!("skipped: ADV_WINE_DIST or ADV_WINE_PROBES is not set");
+    let Some(wine::Wine { dist, probes }) = wine::wine() else {
         return;
     };
     let root = std::env::temp_dir().join(format!("adv-wine-prefix-{}", std::process::id()));

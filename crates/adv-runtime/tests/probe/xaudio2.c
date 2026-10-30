@@ -1,6 +1,7 @@
 /* Authored XAudio2 graph, buffer, callback and fallback checks. No windows.
- * Build twice: i686-w64-mingw32-gcc -O2 -Wall -DVERSION=7 xaudio2.c -o xaudio27.exe -lole32 -luuid
- *              i686-w64-mingw32-gcc -O2 -Wall -DVERSION=9 xaudio2.c -o xaudio29.exe -lole32 -luuid */
+ * Build: i686-w64-mingw32-gcc -O2 -Wall -DVERSION=7 xaudio2.c -o xaudio27.exe -lole32 -luuid
+ * Build: i686-w64-mingw32-gcc -O2 -Wall -DVERSION=8 xaudio2.c -o xaudio28.exe -lole32 -luuid
+ * Build: i686-w64-mingw32-gcc -O2 -Wall -DVERSION=9 xaudio2.c -o xaudio29.exe -lole32 -luuid */
 #define COBJMACROS
 #include <windows.h>
 #include <xaudio2.h>

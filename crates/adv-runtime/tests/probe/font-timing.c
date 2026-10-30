@@ -1,3 +1,4 @@
+/* Build: i686-w64-mingw32-gcc -O2 -Wall font-timing.c -o font-timing.exe -lgdi32 -luser32 */
 /* Headless session/first-glyph and guest-plus-host drawing benchmark. */
 #include <windows.h>
 #include <stdio.h>

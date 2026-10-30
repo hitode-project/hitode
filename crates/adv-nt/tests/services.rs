@@ -4,6 +4,14 @@ mod common;
 #[path = "../src/native/input.rs"]
 mod input_body;
 
+#[allow(dead_code)]
+mod wine {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../adv-nt/tests/common/wine.rs"
+    ));
+}
+
 struct Platform;
 struct InputChecked;
 #[derive(Default)]
@@ -96,9 +104,7 @@ fn service_reference() {
 // spec: NAT-BODY-2, NAT-BODY-18, EXEC-CALL-3
 #[test]
 fn service_bodies_match_guest_results_and_slow_cases() {
-    if std::env::var_os("ADV_WINE_DIST").is_none() || std::env::var_os("ADV_WINE_PROBES").is_none()
-    {
-        eprintln!("skipped: ADV_WINE_DIST and ADV_WINE_PROBES are required");
+    if wine::wine().is_none() {
         return;
     }
     let run = |name| {

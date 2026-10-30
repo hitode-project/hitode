@@ -9,14 +9,18 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[allow(dead_code)]
+mod wine {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../adv-nt/tests/common/wine.rs"
+    ));
+}
+
 // spec: WINE-SES-5, WINE-SES-8, DEV-FONT-1, WINE-UNIX-6
 #[test]
 fn discovered_fonts_and_aliases_survive_prefix_reuse() {
-    let (Some(dist), Some(probes)) = (
-        std::env::var_os("ADV_WINE_DIST").map(PathBuf::from),
-        std::env::var_os("ADV_WINE_PROBES").map(PathBuf::from),
-    ) else {
-        eprintln!("skipped: ADV_WINE_DIST or ADV_WINE_PROBES is not set");
+    let Some(wine::Wine { dist, probes }) = wine::wine() else {
         return;
     };
     let child = std::env::var_os("ADV_FONT_PROBE_ROOT");
@@ -148,8 +152,7 @@ fn discovered_fonts_and_aliases_survive_prefix_reuse() {
 }
 
 fn probe(name: &str, draw: bool) -> Option<(Vec<u8>, String, Duration, String)> {
-    let dist = PathBuf::from(std::env::var_os("ADV_WINE_DIST")?);
-    let probes = PathBuf::from(std::env::var_os("ADV_WINE_PROBES")?);
+    let wine::Wine { dist, probes } = wine::wine()?;
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/font-probes")
         .join(format!("{}-{name}-{}", std::process::id(), u8::from(draw)));

@@ -11,6 +11,14 @@ use std::path::{Path, PathBuf};
 #[path = "native_pe/deflate.rs"]
 mod deflate;
 
+#[allow(dead_code)]
+mod wine {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../adv-nt/tests/common/wine.rs"
+    ));
+}
+
 const CODE: u32 = 0x400000;
 const SLOT: u32 = 0x410000;
 const ARGS: u32 = SLOT + 4;
@@ -28,7 +36,7 @@ impl Rng {
     }
 }
 fn dist() -> Option<PathBuf> {
-    std::env::var_os("ADV_WINE_DIST").map(PathBuf::from)
+    wine::dist()
 }
 fn address(pe: &Pe, name: &str) -> u32 {
     pe.exports()

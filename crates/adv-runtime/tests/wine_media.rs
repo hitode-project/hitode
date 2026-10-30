@@ -7,6 +7,14 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+#[allow(dead_code)]
+mod wine {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../adv-nt/tests/common/wine.rs"
+    ));
+}
+
 fn probe(name: &str, expected: &str) {
     // wineserver owns C globals and can run only once in a host process.
     let thread = std::thread::current();
@@ -24,21 +32,13 @@ fn probe(name: &str, expected: &str) {
         );
         return;
     }
-    let (Some(dist), Some(probes)) = (
-        std::env::var_os("ADV_WINE_DIST"),
-        std::env::var_os("ADV_WINE_PROBES"),
-    ) else {
-        eprintln!("skipped: ADV_WINE_DIST or ADV_WINE_PROBES is not set");
+    let Some(wine::Wine { dist, probes }) = wine::wine() else {
         return;
     };
     let root = std::env::temp_dir().join(format!("adv-media-{}-{name}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();
     let exe = root.join(format!("media_{name}.exe"));
-    std::fs::copy(
-        PathBuf::from(probes).join(format!("media_{name}.exe")),
-        &exe,
-    )
-    .unwrap();
+    std::fs::copy(probes.join(format!("media_{name}.exe")), &exe).unwrap();
     let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/media");
     for name in [
         "synthetic.mpg",
@@ -52,7 +52,6 @@ fn probe(name: &str, expected: &str) {
     // SAFETY: two fresh descriptors, transferred once to File ownership.
     assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
     let (mut output, stdout) = unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) };
-    let dist = PathBuf::from(dist);
     let config = Config {
         dist: &dist,
         prefix: &root.join("prefix"),

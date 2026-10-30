@@ -1,8 +1,8 @@
 /* Host input probe: a decorated window at a nonzero screen origin waits
  * for mouse and keyboard hardware input, then exits on F12's release.
  * Build: i686-w64-mingw32-gcc -mcrtdll=msvcrt-os -O1 -o input.exe input.c -lgdi32 -luser32
- * DirectDraw: add -DINPUT_DDRAW -lddraw -ldxguid, output input_ddraw.exe.
- * Direct3D 9: add -DINPUT_D3D9 -ld3d9, output input_d3d9.exe. */
+ * Build: i686-w64-mingw32-gcc -mcrtdll=msvcrt-os -O1 -DINPUT_DDRAW -o input_ddraw.exe input.c -lgdi32 -luser32 -lddraw -ldxguid
+ * Build: i686-w64-mingw32-gcc -mcrtdll=msvcrt-os -O1 -DINPUT_D3D9 -o input_d3d9.exe input.c -lgdi32 -luser32 -ld3d9 */
 #define COBJMACROS
 #include <windows.h>
 #ifdef INPUT_DDRAW

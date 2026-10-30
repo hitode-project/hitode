@@ -8,7 +8,6 @@ use adv_runtime::wine::{
 use std::{
     fs::File,
     os::fd::AsRawFd,
-    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -16,14 +15,18 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[allow(dead_code)]
+mod wine {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../adv-nt/tests/common/wine.rs"
+    ));
+}
+
 // spec: WINE-AUD-8, WINE-AUD-9, WINE-AUD-10, WINE-AUD-11
 #[test]
 fn native_winmm_callbacks_sounds_and_forwarding() {
-    let (Some(dist), Some(probes)) = (
-        std::env::var_os("ADV_WINE_DIST").map(PathBuf::from),
-        std::env::var_os("ADV_WINE_PROBES").map(PathBuf::from),
-    ) else {
-        eprintln!("skipped: ADV_WINE_DIST or ADV_WINE_PROBES is not set");
+    let Some(wine::Wine { dist, probes }) = wine::wine() else {
         return;
     };
     let root = std::env::temp_dir().join(format!("adv-wine-winmm-{}", std::process::id()));

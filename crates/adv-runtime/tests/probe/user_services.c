@@ -2,8 +2,8 @@
  * peeks preserve MSG and last error, dispatch sent messages despite filters,
  * skip GETMESSAGE/FOREGROUNDIDLE hooks, and yield even with PM_NOYIELD.
  * Build: i686-w64-mingw32-gcc -O2 -Wall user_services.c -o user_services.exe -luser32 -lwinmm
- * Also build user_services_reference.exe with -DWINE_REFERENCE: Wine differs
- * from Windows on cold queues and the excluded error cases. */
+ * Wine differs from Windows on cold queues and the excluded error cases:
+ * Build: i686-w64-mingw32-gcc -O2 -Wall -DWINE_REFERENCE user_services.c -o user_services_reference.exe -luser32 -lwinmm */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <mmsystem.h>

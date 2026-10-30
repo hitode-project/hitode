@@ -1,3 +1,4 @@
+/* Build: i686-w64-mingw32-gcc -O2 -Wall font-resource-private.c -o font-resource-private.exe -lgdi32 */
 /* Authored private, hidden font resource lifetime oracle. */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>

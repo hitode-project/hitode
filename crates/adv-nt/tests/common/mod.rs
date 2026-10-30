@@ -1,11 +1,9 @@
 //! Runs a probe from `tests/probe` on Wine's ntdll.dll with the
 //! in-process server.
 //!
-//! The tests need a Wine 11.0 i386 build and the probes built from
-//! `tests/probe`: `ADV_WINE_DIST` names the directory that holds
-//! `lib/wine/i386-windows` (and `i386-unix` for the Unix libraries) and
-//! `share/wine/nls`, and `ADV_WINE_PROBES` the
-//! directory that holds the probes. Without them the tests are skipped.
+//! The tests need the stripped Wine 11.0 i386 installation that
+//! `ADV_WINE_DIST` names, and build the probes from `tests/probe` themselves
+//! (`wine.rs`). Without the installation they are skipped.
 //! The server keeps its state in globals, so each test binary runs one
 //! probe.
 //!
@@ -17,7 +15,7 @@ use std::cell::{Cell, RefCell};
 use std::fs::File;
 use std::io::Read;
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::path::PathBuf;
+
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -26,6 +24,14 @@ use adv_machine::{Machine, Resolver, RunResult, SliceResult, layout::PARK_ADDR};
 use adv_nt::server::{Progress, Time};
 use adv_nt::{dispatch::Platform, params::Startup, process};
 use adv_wineserver::{Clock, Config, Server, State};
+
+#[allow(dead_code)]
+mod wine {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../adv-nt/tests/common/wine.rs"
+    ));
+}
 
 /// The guest's clocks, as the client last showed them to the server.
 struct GuestClock(Cell<Time>);
@@ -190,14 +196,7 @@ pub fn run_probe_engine(
     native: bool,
 ) -> Option<(RunResult, String)> {
     let _ = log::set_logger(&WineLog).map(|()| log::set_max_level(log::LevelFilter::Warn));
-    let Some(dist) = std::env::var_os("ADV_WINE_DIST").map(PathBuf::from) else {
-        eprintln!("skipped: ADV_WINE_DIST is not set");
-        return None;
-    };
-    let Some(probes) = std::env::var_os("ADV_WINE_PROBES").map(PathBuf::from) else {
-        eprintln!("skipped: ADV_WINE_PROBES is not set");
-        return None;
-    };
+    let wine::Wine { dist, probes } = wine::wine()?;
     let ntdll_path = dist.join("lib/wine/i386-windows/ntdll.dll");
     let ntdll = std::fs::read(&ntdll_path)
         .unwrap_or_else(|error| panic!("{}: {error}", ntdll_path.display()));

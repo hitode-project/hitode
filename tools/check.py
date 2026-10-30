@@ -210,6 +210,7 @@ def check(everything: bool, ci: bool = False) -> bool:
     ok &= run("specs", [sys.executable, "tools/spec/check_spec.py"])
     ok &= run("wine protocol", [sys.executable, "tools/wine/protocol.py", "--check"])
     ok &= run("wine syscalls", [sys.executable, "tools/wine/syscalls.py", "--check"])
+    ok &= run("wine probes", [sys.executable, "tools/wine/probes.py", "--check"])
     ok &= run("docs", [sys.executable, "tools/docs/check_docs.py"])
     ok &= launcher(everything, ci)
     return ok

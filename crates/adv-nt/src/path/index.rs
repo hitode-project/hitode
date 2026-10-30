@@ -171,6 +171,13 @@ fn case_sensitive(_: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[allow(dead_code)]
+    mod wine {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../adv-nt/tests/common/wine.rs"
+        ));
+    }
     use super::*;
 
     fn alias(name: &str) -> String {
@@ -275,7 +282,7 @@ mod tests {
 
     #[cfg(any(target_vendor = "apple", target_os = "android"))]
     fn rename_through_nt(root: &Path, name: &str) {
-        let Some(install) = std::env::var_os("ADV_WINE_DIST") else {
+        let Some(install) = wine::dist() else {
             return;
         };
         use crate::{file, server};
@@ -303,7 +310,7 @@ mod tests {
             &adv_wineserver::Config {
                 prefix: root.to_owned(),
                 server_dir: root.join("server"),
-                install: install.into(),
+                install,
                 debug: 0,
             },
             &Time,

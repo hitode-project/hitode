@@ -1,3 +1,4 @@
+/* Build: i686-w64-mingw32-gcc -O2 -Wall font-stack.c -o font-stack.exe -lgdi32 */
 /* Authored text-stack records. Only memory DCs and owned DIB sections. */
 #include <windows.h>
 #include <stdio.h>

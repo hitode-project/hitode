@@ -88,8 +88,8 @@ Header macros, placeholder names in script examples and names read only to clear
 | `ADV_TEXT_DIAGNOSTICS` | Diagnostic | Off |
 | `ADV_TIER1_CENSUS` | Diagnostic | Off; census of x87 exact-path forms |
 | `ADV_VERIFY_FRAMES` | Diagnostic | Off; `1` executes every D3D9 frame and asynchronously compares pixels outside computed damage with the previous readback |
-| `ADV_WINE_DIST` | Build / Fixture | The Wine installation embedded into the player; required for playable builds and Wine integration tests |
-| `ADV_WINE_PROBES` | Fixture | Unset: Wine integration tests skip and pass; the directory of built `tests/probe` executables |
+| `ADV_WINE_DIST` | Build / Fixture | The Wine installation embedded into the player; required for playable builds. Unset: Wine integration tests skip and pass; set: it must be complete |
+| `ADV_WINE_PROBES` | Fixture | Set by device runners to probes the host built; elsewhere tests build them |
 
 The `adv-dx/d3d9-counters` Cargo feature adds a D3D9 work report: retained
 recording bytes and lookup operations per draw, changed entries per StateBlock

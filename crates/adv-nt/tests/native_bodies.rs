@@ -8,13 +8,21 @@
 
 #[cfg(any(target_vendor = "apple", target_os = "android"))]
 use adv_wineserver as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use adv_cpu::Cpu;
 use adv_cpu::backend::{Backend, Guest, GuestExt, Prot};
 use adv_machine::{Clock, Machine, RunResult, layout::PARK_ADDR};
 use adv_nt::dispatch::Platform;
 use adv_pe::Pe;
+
+#[allow(dead_code)]
+mod wine {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../adv-nt/tests/common/wine.rs"
+    ));
+}
 
 const CODE: u32 = 0x0040_0000;
 /// The function's address, then its arguments, then what the call left in
@@ -117,8 +125,7 @@ fn call(machine: &mut Machine<Cpu>, data: &[u8], args: [u32; 3]) -> Result<Vec<u
 // spec: NAT-BODY-1, A64-CALL-4, A64-CALL-5
 #[test]
 fn ntdll_memcpy_matches_wine() {
-    let Some(dist) = std::env::var_os("ADV_WINE_DIST").map(PathBuf::from) else {
-        eprintln!("skipped: ADV_WINE_DIST is not set");
+    let Some(dist) = wine::dist() else {
         return;
     };
     let dll = dist.join("lib/wine/i386-windows/ntdll.dll");

@@ -1,5 +1,5 @@
 /* The harness supplies enabled backup/restore privileges and a completion reserve.
- * Build: i686-w64-mingw32-gcc -O0 -Wall -o "$ADV_WINE_PROBES/nt_l_process.exe" nt_l_process.c -ladvapi32 */
+ * Build: i686-w64-mingw32-gcc -O0 -Wall -o nt_l_process.exe nt_l_process.c -ladvapi32 */
 #define _WIN32_WINNT 0x0602
 #include <windows.h>
 #include <winternl.h>

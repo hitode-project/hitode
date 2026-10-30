@@ -52,8 +52,7 @@ install `OUTPUT` at `share/hitode/prefix` in both distributions. The script runs
 Wine's registration entry point for the media COM classes and filter mapper.
 
 The media probes are `crates/adv-runtime/tests/probe/media_*.c`; their headers give
-the compiler commands. Put their executables in `ADV_WINE_PROBES` and set
-`ADV_WINE_DIST` to the installation root. Run
+the compiler commands. Set `ADV_WINE_DIST` to the installation root and run
 `cargo test --release -p adv-runtime --features gpu,media --test wine_media`.
 Synthetic fixtures and their FFmpeg generation script live in
 `crates/adv-runtime/tests/fixtures/media`; each committed clip is below 64 KiB.
@@ -69,8 +68,8 @@ runtime downloads or host MIDI setup. Synthesis runs on the execution owner;
 the session pump feeds the shared PCM mixer with 30 ms of lead. Native WinMM
 consumes wave headers and sequences MIDI streams independently of guest threads.
 The authored `tests/probe/midi.c` in `adv-runtime` checks WinMM, MIDI streams and
-MCI. Build it as its header describes into `ADV_WINE_PROBES`, then run
-`cargo test --release -p adv-runtime --test wine_midi` with `ADV_WINE_DIST` set.
+MCI. Run `cargo test --release -p adv-runtime --test wine_midi` with
+`ADV_WINE_DIST` set.
 
 ## Tests
 
@@ -91,7 +90,7 @@ python3 -m unittest discover -s tools/<folder>
   `cargo test -p adv-drv upstream_zlib -- --ignored`. This checks forward copies,
   including overlapping matches; it does not establish whole-decoder coverage.
 - Tests that need a game read it from `$ADV_SAMPLES`. They are ignored or skip when it is unset, so the default run needs no game files.
-- Wine integration tests in `adv-runtime`, and the `adv-nt` tests that bind bodies to Wine's DLLs, read the stripped installation from `ADV_WINE_DIST` and the built probes from `ADV_WINE_PROBES`. Without them they print `skipped` and pass, so a run without both variables proves nothing about them. Set both whenever a change can reach the Wine stack, including every merge check. The installation must carry the identity tables under `share/hitode/identity` (see above); without them bodies never bind. Each probe is `crates/adv-runtime/tests/probe/<name>.c`, built as its header says into `ADV_WINE_PROBES`.
+- Tests that run Wine read the stripped installation from `ADV_WINE_DIST`. Unset, they print `skipped` and pass, so such a run proves nothing about them: set it whenever a change can reach the Wine stack, including every merge check. Set, the installation must be complete, with its identity tables and prefix template, or the tests fail. They build their probes from `crates/*/tests/probe/*.c` with `tools/wine/probes.py`, which needs `i686-w64-mingw32-gcc` on `PATH`: each source names its outputs in `Build:` header lines, and a changed source is always rebuilt. Tests reach both only through `crates/adv-nt/tests/common/wine.rs`; `tools/check.py` rejects any other read.
 - On AArch64, `tools/cpu/arm64-check.sh <ref>` runs the CPU suite once and judges it both normally and in strict mode.
 - Media tests need the FFmpeg variables above: `cargo test -p adv-device --features media`.
 - Direct3D 9 builds only with the `gpu` feature, so `cargo test -p adv-dx` skips it without a word: test it with `cargo test -p adv-dx --features gpu`. Test files pulled in with `include!` are outside `cargo fmt`; format them with `rustfmt --edition 2024 <file>`.

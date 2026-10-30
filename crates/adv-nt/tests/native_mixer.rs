@@ -11,6 +11,14 @@ use std::path::{Path, PathBuf};
 mod layout;
 use layout::{buffer as b, device as d, volume as v, *};
 
+#[allow(dead_code)]
+mod wine {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../adv-nt/tests/common/wine.rs"
+    ));
+}
+
 const CODE: u32 = 0x400000;
 const DATA: u32 = 0x500000;
 const LEN: u32 = 0x100000;
@@ -19,7 +27,7 @@ const ALL: u32 = DATA + 0xc000;
 const FRAMES: u32 = 37;
 
 fn dist() -> Option<PathBuf> {
-    std::env::var_os("ADV_WINE_DIST").map(PathBuf::from)
+    wine::dist()
 }
 fn set(data: &mut [u8], at: usize, value: u32) {
     data[at..at + 4].copy_from_slice(&value.to_le_bytes());

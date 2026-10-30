@@ -2,23 +2,26 @@
 //! GDI drew to the primary surface, and the frame reaches the mailbox while
 //! the program waits for messages, with nothing reading it back.
 //!
-//! It needs `ADV_WINE_DIST` and `ADV_WINE_PROBES`, as the probe tests do.
+//! It needs `ADV_WINE_DIST`, as the probe tests do.
 #![cfg(any(target_vendor = "apple", target_os = "android"))]
 
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use adv_device::surface::{Snapshot, SurfaceStore, frame_mailbox};
 use adv_runtime::wine::session::{Config, Session, Stop};
 
+#[allow(dead_code)]
+mod wine {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../adv-nt/tests/common/wine.rs"
+    ));
+}
+
 // spec: WINE-GFX-7
 #[test]
 fn a_waiting_program_publishes_its_frame_to_the_ui() {
-    let (Some(dist), Some(probes)) = (
-        std::env::var_os("ADV_WINE_DIST").map(PathBuf::from),
-        std::env::var_os("ADV_WINE_PROBES").map(PathBuf::from),
-    ) else {
-        eprintln!("skipped: ADV_WINE_DIST or ADV_WINE_PROBES is not set");
+    let Some(wine::Wine { dist, probes }) = wine::wine() else {
         return;
     };
     let root = std::env::temp_dir().join(format!("adv-wine-display-{}", std::process::id()));
