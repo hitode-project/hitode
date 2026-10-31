@@ -901,8 +901,10 @@ impl Session {
                         if let Err(error) = self.select(next) {
                             return Stop::Failed(error);
                         }
-                        if self.foreground == id {
-                            self.foreground = next;
+                        if self.foreground == id
+                            && let Err(error) = self.set_foreground(next)
+                        {
+                            return Stop::Failed(error);
                         }
                         let retired = self.shared.driver.borrow_mut().parked.remove(&id).unwrap();
                         for (total, count) in
