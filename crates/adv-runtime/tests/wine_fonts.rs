@@ -670,6 +670,8 @@ fn painted_reference(
         return original;
     }
     if bpp == 4 || bpp == 8 {
+        // spec: WIN32-GDI-16 Windows draws text on palette DIBs without antialiasing.
+        request.quality = Quality::Monochrome;
         let max = (1u32 << bpp) - 1;
         let mut pixels = vec![0; 128 * 96 * 4];
         for (i, pixel) in pixels.as_chunks_mut::<4>().0.iter_mut().enumerate() {
