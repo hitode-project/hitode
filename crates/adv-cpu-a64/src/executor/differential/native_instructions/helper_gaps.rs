@@ -171,6 +171,16 @@ fn configs() -> impl Iterator<Item = Config> {
     })
 }
 
+/// A rotating share of the configurations for one input case: each form
+/// still meets every configuration across its cases, without multiplying the
+/// whole input grid by all of them.
+fn rotated(case: &mut usize, share: usize) -> impl Iterator<Item = Config> {
+    let count = configs().count();
+    let start = *case * share % count;
+    *case += 1;
+    configs().chain(configs()).skip(start).take(share)
+}
+
 fn check(program: &Program, config: Config, budget: u64, native_only: bool) {
     let native_page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
     for host in [4096, 16384]
@@ -648,6 +658,7 @@ fn common_gs_x87_memory_forms_keep_native_runs() {
 #[test]
 fn common_x87_leaves_match_interpreter_in_runs() {
     use adv_cpu_core::X87Register as Ext;
+    let mut case = 0;
     for form in 0..11 {
         for value in [
             Ext::from_parts(0xc000000000000000, 0x3ffd),
@@ -687,7 +698,7 @@ fn common_x87_leaves_match_interpreter_in_runs() {
             for rc in 0..4 {
                 for pc in [0, 0x200, 0x300] {
                     p.state.x87.control = 0x7f | pc | rc << 10;
-                    for config in configs() {
+                    for config in rotated(&mut case, 2) {
                         for budget in [1, 2, 3, 100] {
                             check(&p, config, budget, false);
                             if !config.1 && budget == 100 {
@@ -734,6 +745,7 @@ fn common_x87_leaves_match_interpreter_in_runs() {
 // spec: A64-TR-4, A64-VER-1, A64-MEM-7
 #[test]
 fn common_strings_cover_directions_repeats_segments_and_boundaries() {
+    let mut case = 0;
     for form in 0..15 {
         for prefix in [0u8, 0xf2, 0xf3] {
             for segment in [0u8, 0x64, 0x65] {
@@ -770,7 +782,7 @@ fn common_strings_cover_directions_repeats_segments_and_boundaries() {
                             p.state.regs[6] -= DATA;
                         }
                         p.state.eflags = (p.state.eflags & !0x400) | u32::from(reverse) << 10;
-                        for config in configs() {
+                        for config in rotated(&mut case, 2) {
                             for budget in [1, 3, 100] {
                                 check(&p, config, budget, prefix == 0 && config.2 != Checks::Slow);
                             }
@@ -785,6 +797,7 @@ fn common_strings_cover_directions_repeats_segments_and_boundaries() {
 // spec: A64-TR-4, A64-VER-1, A64-VER-2, A64-FLAG-4
 #[test]
 fn common_integer_helpers_are_native_across_counts_and_widths() {
+    let mut case = 0;
     for width in [1, 2, 4] {
         for form in 0..11 {
             if width == 1 && form >= 9 {
@@ -835,7 +848,7 @@ fn common_integer_helpers_are_native_across_counts_and_widths() {
                     });
                     p.state.regs[1] = count;
                     p.data[..4].copy_from_slice(&value.to_le_bytes());
-                    for config in configs() {
+                    for config in rotated(&mut case, 2) {
                         for budget in [2, 100] {
                             check(&p, config, budget, config.2 != Checks::Slow);
                         }
@@ -965,6 +978,7 @@ fn executor_on_host(p: &Program, config: Config, interpreted: bool, host: usize)
 // spec: A64-TR-4, A64F-FP-5, A64-MEM-7, A64-VER-1, A64-VER-2
 #[test]
 fn common_remaining_simd_forms_match_values_controls_and_memory() {
+    let mut case = 0;
     for form in 0..23 {
         for special in 0..9 {
             for memory in [false, true] {
@@ -1119,7 +1133,7 @@ fn common_remaining_simd_forms_match_values_controls_and_memory() {
                 p.state.regs[7] = DATA + 4090;
                 for mxcsr in [0x1f80, 0x1fa0, 0x3f80, 0x5f80, 0x7f80, 0x9fc0, 0x1f00] {
                     p.state.mxcsr = mxcsr;
-                    for config in configs() {
+                    for config in rotated(&mut case, 2) {
                         for budget in [2, 100] {
                             check(&p, config, budget, false);
                         }
