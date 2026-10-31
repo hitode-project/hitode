@@ -1,6 +1,9 @@
 import unittest
 
-from check_docs import check_guide
+from unittest import mock
+
+import check_docs
+from check_docs import check_guide, check_map
 
 SOURCE = """pub struct Sys {
     pub direct_bodies: Map,
@@ -44,6 +47,33 @@ class CheckGuideTest(unittest.TestCase):
             "G.md: cites EX-A-2, which is withdrawn",
             "G.md: cites EX-B-9, which no spec defines",
         ])
+
+    def test_a_module_link_names_its_module(self) -> None:
+        self.assertEqual(guide("[`ops`](a/ops.rs)"), [])
+
+
+LIB = """pub mod cache;
+mod translate;
+#[cfg(test)]
+mod tests;
+#[cfg(all(test, emulator))]
+mod emulator;
+"""
+CRATE = {"crates/c/src/lib.rs": LIB}
+
+
+class CheckMapTest(unittest.TestCase):
+    def check(self, text: str) -> list[str]:
+        with mock.patch.object(check_docs, "MAPPED", ("c",)):
+            return check_map("G.md", text, CRATE.get)
+
+    def test_every_module_outside_tests_is_mapped(self) -> None:
+        text = "[`cache`](crates/c/src/cache.rs) [`translate`](crates/c/src/translate/mod.rs)"
+        self.assertEqual(self.check(text), [])
+
+    def test_an_unmapped_module_fails(self) -> None:
+        self.assertEqual(self.check("[`cache`](crates/c/src/cache.rs)"),
+                         ["G.md: module map misses c::translate"])
 
 
 if __name__ == "__main__":

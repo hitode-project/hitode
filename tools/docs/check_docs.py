@@ -14,6 +14,11 @@ one code symbol, such as [`Translator::body`](crates/.../ops.rs), must name
 a symbol the linked file defines, segment by segment; a leading segment may be
 the file's own module name. Every spec ID they cite must be a rule that
 exists and is not withdrawn.
+
+The module map in ARCHITECTURE.md must cover the core crates in MAPPED: every
+top-level module their lib.rs declares outside test builds needs a link to
+its file, so adding, moving or removing a module updates the map too. A link
+whose text is the linked file's own module name names that module.
 """
 from __future__ import annotations
 
@@ -48,12 +53,15 @@ ALLOWED = {
 }
 
 GUIDES = ("ARCHITECTURE.md",)
+MAP = "ARCHITECTURE.md"
+MAPPED = ("adv-cpu-a64", "adv-cpu-core", "adv-machine", "adv-nt")
 
 LINK = re.compile(r"\[([^\]]+)\]\(([^)\s]+)\)")
 SYMBOL = re.compile(r"`([A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)*)`")
 RULE = re.compile(r"^### ([A-Z0-9]+-[A-Z0-9]+-[0-9]+) ", re.M)
 WITHDRAWN = re.compile(r"^Withdrawn: (.*)$", re.M)
 PREFIX = re.compile(r"^ID prefix: ([A-Z0-9]+)$", re.M)
+MODULE = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod ([a-z_][a-z0-9_]*);", re.M)
 
 
 def defines(source: str, name: str) -> bool:
@@ -89,6 +97,8 @@ def check_guide(name: str, text: str, read: Callable[[str], str | None],
         if symbol is None or not path.endswith(".rs"):
             continue
         segments = symbol.group(1).split("::")
+        if segments == [module(path)]:
+            continue
         if len(segments) > 1 and segments[0] == module(path):
             segments = segments[1:]
         for segment in segments:
@@ -101,6 +111,33 @@ def check_guide(name: str, text: str, read: Callable[[str], str | None],
                 problems.append(f"{name}: cites {rule}, which is withdrawn")
             elif rule not in rules:
                 problems.append(f"{name}: cites {rule}, which no spec defines")
+    return problems
+
+
+def modules(lib: str) -> list[str]:
+    """Top-level modules that `lib` (a lib.rs) declares outside test builds."""
+    lines = lib.splitlines()
+    found = []
+    for i, line in enumerate(lines):
+        m = MODULE.match(line)
+        if m and not (i and re.search(r"cfg\(.*\btest\b", lines[i - 1])):
+            found.append(m.group(1))
+    return found
+
+
+def check_map(name: str, text: str, read: Callable[[str], str | None]) -> list[str]:
+    """Core-crate modules that guide `name` does not link to."""
+    targets = {target.split("#")[0] for _, target in LINK.findall(text)}
+    problems = []
+    for crate in MAPPED:
+        src = f"crates/{crate}/src"
+        lib = read(f"{src}/lib.rs")
+        if lib is None:
+            problems.append(f"{name}: maps {crate}, which has no {src}/lib.rs")
+            continue
+        for module_name in modules(lib):
+            if not {f"{src}/{module_name}.rs", f"{src}/{module_name}/mod.rs"} & targets:
+                problems.append(f"{name}: module map misses {crate}::{module_name}")
     return problems
 
 
@@ -125,6 +162,7 @@ def guides() -> list[str]:
     for name in GUIDES:
         problems += check_guide(name, (ROOT / name).read_text(encoding="utf-8"), read,
                                 rules, withdrawn, prefixes)
+    problems += check_map(MAP, (ROOT / MAP).read_text(encoding="utf-8"), read)
     return problems
 
 
