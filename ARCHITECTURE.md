@@ -85,8 +85,8 @@ For the Wine stack, `adv-abi::dll` writes host-module PE images through `adv-pe`
 
 A guest call to a function that has a native body, such as `memcpy` or `SetEvent`, takes the steps below. Each step names its code and the rules it follows. `tools/docs/check_docs.py` fails a commit when a named file or symbol no longer exists, or a cited rule is withdrawn, so the change that moves a step also updates its text.
 
-1. **Bind at load.** When `adv-nt` maps a distribution module, each body whose function bytes match the identity table binds the function's entry. The entry then leads to a thunk, and a direct body is also recorded under its entry. Runtime helpers that game images link statically bind wherever their bytes appear.
-   Code: [`bind`](crates/adv-nt/src/native.rs), [`bind_one`](crates/adv-nt/src/native.rs), [`intact`](crates/adv-nt/src/identity.rs), [`Sys::direct_bodies`](crates/adv-machine/src/lib.rs), [`linked::bind`](crates/adv-nt/src/native/linked.rs).
+1. **Bind at load.** The loader publishes imports through the thunk table. When `adv-nt` maps a distribution module, each body whose function bytes match the identity table binds the function's entry. The entry then leads to a thunk, and a direct body is also recorded under its entry. Runtime services bind a body to their own thunk, and the copied entries of host-module images carry that binding. Runtime helpers that game images link statically bind wherever their bytes appear.
+   Code: [`ThunkTable`](crates/adv-machine/src/thunk.rs), [`bind`](crates/adv-nt/src/native.rs), [`bind_one`](crates/adv-nt/src/native.rs), [`intact`](crates/adv-nt/src/identity.rs), [`Sys::direct_bodies`](crates/adv-machine/src/lib.rs), [`Sys::bind_thunk_body`](crates/adv-machine/src/lib.rs), [`section::bind_builtin_bodies`](crates/adv-nt/src/section.rs), [`linked::bind`](crates/adv-nt/src/native/linked.rs).
    Rules: A64-CTL-14, NAT-BODY-13, NAT-BODY-18.
 2. **Translate the call.** A trace resolves `call [slot]` and `jmp [slot]` when it is translated, and watches the slot and the entry bytes. A call reaching an intact entry with a direct body becomes an `Op::Body` site. Other transfers to a redirected entry go to its thunk.
    Code: [`Trace::build`](crates/adv-cpu-a64/src/translate/trace.rs), [`Redirect`](crates/adv-cpu-a64/src/translate/trace.rs), [`Bound`](crates/adv-cpu-a64/src/translate/trace.rs), [`Op::Body`](crates/adv-cpu-a64/src/translate/decode.rs), [`TrapHandler::direct_body`](crates/adv-cpu-core/src/backend/mod.rs).
@@ -100,7 +100,7 @@ A guest call to a function that has a native body, such as `memcpy` or `SetEvent
 5. **Run the full path.** The interpreter takes the entry's redirect to the thunk, and the machine runs its handler. A direct body runs again over `GuestMem`, which completes every access as a guest instruction would. A body that is not yet direct runs here with the handler's environment.
    Code: [`run_inner`](crates/adv-cpu-a64/src/executor.rs), [`Dispatch::on_host_call`](crates/adv-machine/src/lib.rs), [`run`](crates/adv-nt/src/native.rs), [`run_body`](crates/adv-nt/src/native.rs), [`run_full`](crates/adv-nt/src/native.rs), [`GuestMem`](crates/adv-cpu-core/src/body.rs).
    Rules: A64-CALL-5, NAT-BODY-16, NAT-BODY-17.
-6. **Return, raise or run guest code.** A result returns as the function's `ret` would. A fault, including division by zero, raises the guest exception as if the entry's first instruction faulted. A body whose function would wait, call guest code or request the server runs the function's own code once, through a trampoline.
+6. **Return, raise or run guest code.** A result returns as the function's `ret` would. A fault, including division by zero, raises the guest exception as if the entry's first instruction faulted. A body whose function would wait, call guest code or request the server runs the function's own code once, through a trampoline. A completed body may also ask to yield: generated code commits the return, and the machine hands off at the continuation.
    Code: [`Outcome::Raise`](crates/adv-machine/src/outcome.rs), [`apply`](crates/adv-machine/src/lib.rs), [`exception`](crates/adv-machine/src/lib.rs), [`resume_original`](crates/adv-nt/src/native.rs), [`trampoline`](crates/adv-nt/src/native.rs).
    Rules: A64-CALL-4, A64-CALL-6.
 7. **Reach host state.** Service bodies, such as event signals and file positions, change host state through the `Services` the body context carries. That state lives in storage the machine also reaches only through shared handles, so no exclusive borrow aliases it. The server fd retains its shared file cursor until its last owner retires, including inherited handles without a client descriptor cache.
@@ -117,6 +117,73 @@ Byte identity and independent ordinary prefixes avoid conversion and weight work
 Locale cache publication, code page loading and owned locale locks stay in Wine.
 The bodies' `Input::Args` names the argument block and `Input::Teb` carries FS
 base through both translated calls and the full path (NAT-BODY-20).
+
+## Core crates, by module
+
+The four crates a guest call crosses, one row per role. The rules stay in the specs; a row says where to look. `tools/docs/check_docs.py` fails a commit when a top-level module of these crates is missing here, so a new or moved module updates its row.
+
+### adv-cpu-a64
+
+| Modules | Responsible for | Not responsible for |
+|---|---|---|
+| [`translate`](crates/adv-cpu-a64/src/translate/mod.rs) | Translation units: trace selection and analysis, switch tables, and the JIT back end that lowers a unit to AArch64 code, including body call sites (A64-TR-3, A64-TR-7) | Executable memory; running units |
+| [`native`](crates/adv-cpu-a64/src/native.rs) | Running translated code: dispatch and unit lookup, link patching, safepoints, host calls from translated code and the entry to fault recovery | Choosing guest instructions |
+| [`executor`](crates/adv-cpu-a64/src/executor.rs) | The engine's execution owner: first visits, when an entry is translated (A64-TR-2), exits, traps, fuel and deadlines, interpreter-only runs | Code generation |
+| [`cpu`](crates/adv-cpu-a64/src/cpu.rs) | `Backend` and `Engine` over the executor, as the machine layer drives them | Scheduling |
+| [`runtime`](crates/adv-cpu-a64/src/runtime.rs) | The execution thread's runtime context and the stubs that move guest state into and out of the fixed host registers (A64-REG-1) |  |
+| [`cache`](crates/adv-cpu-a64/src/cache.rs) | Executable storage leased from the process code pool, never writable and executable through one mapping (A64-CTL-1, A64-CTL-2) | What code goes into it |
+| [`asm`](crates/adv-cpu-a64/src/asm.rs), [`encode`](crates/adv-cpu-a64/src/encode.rs) | An instruction buffer with labels; `const fn` AArch64 encoders checked against clang vectors | Instruction selection |
+| [`jit_map`](crates/adv-cpu-a64/src/jit_map.rs) | Opt-in maps of placed units for samplers | Changing translation |
+
+### adv-cpu-core
+
+| Modules | Responsible for | Not responsible for |
+|---|---|---|
+| [`backend`](crates/adv-cpu-core/src/backend/mod.rs) | The guest CPU interface the machine drives: `Backend::run`, `TrapHandler` and its body and service hooks | Scheduling; anything about Win32 |
+| [`interpreter`](crates/adv-cpu-core/src/interpreter.rs) | Tier 0: predecoded integer execution with restartable faults, also the oracle for differential tests | x87 and SSE arithmetic |
+| [`floating`](crates/adv-cpu-core/src/floating.rs), [`state`](crates/adv-cpu-core/src/state.rs) | Exact, transactional x87, SSE and packed-integer execution; executor-independent floating state |  |
+| [`integer`](crates/adv-cpu-core/src/integer.rs), [`strings`](crates/adv-cpu-core/src/strings.rs) | Integer operand and flag semantics shared by execution and preparation-time analysis; guarded REP copies, fills, comparisons and scans |  |
+| [`architecture`](crates/adv-cpu-core/src/architecture.rs) | Guest architectural state | OS context layouts, which `adv-nt::context` owns |
+| [`memory`](crates/adv-cpu-core/src/memory.rs) | The guest window: page permissions and classes, watched code, dirty ranges and host ranges | Address-space policy, which `adv-machine::vm` owns |
+| [`virtual_memory`](crates/adv-cpu-core/src/virtual_memory.rs), [`dual_view`](crates/adv-cpu-core/src/dual_view.rs), [`shared_memory`](crates/adv-cpu-core/src/shared_memory.rs) | Stable host reservations and coherent aliased views for code, devices and shared guest storage |  |
+| [`body`](crates/adv-cpu-core/src/body.rs) | Direct bodies: the `body!` macro, `BodyContext`, and the `Window` and `GuestMem` accesses shared by both paths (A64-CALL-2, NAT-BODY-17) | Which functions have bodies, which `adv-nt::native` decides |
+| [`trap`](crates/adv-cpu-core/src/trap.rs), [`file_memory`](crates/adv-cpu-core/src/file_memory.rs) | The raw trap boundary shared by native and interpreted code; native accesses to file-backed and lazy pages |  |
+| [`fault_recovery`](crates/adv-cpu-core/src/fault_recovery.rs), [`fault_recipe`](crates/adv-cpu-core/src/fault_recipe.rs), [`execution_abi`](crates/adv-cpu-core/src/execution_abi.rs) | Exact scalar recovery from host faults in native code, and the state contract it restores |  |
+| [`code_pool`](crates/adv-cpu-core/src/code_pool.rs), [`code_image`](crates/adv-cpu-core/src/code_image.rs) | Leases in the prepared executable pool; the image metadata the loader hands to the engine | Code generation |
+| [`native_region`](crates/adv-cpu-core/src/native_region.rs) | Lowering data for an admitted byte region | Proving the region, which `adv-abi::native` does |
+| [`engine`](crates/adv-cpu-core/src/engine.rs), [`host_features`](crates/adv-cpu-core/src/host_features.rs), [`cpu_profile`](crates/adv-cpu-core/src/cpu_profile.rs) | Engine options and reports for shells; the host's ARM64 features; the fixed virtual processor identity that guests see | Exposing host features to guests |
+| [`timestamp`](crates/adv-cpu-core/src/timestamp.rs) | A 1 GHz guest reference counter | The guest clock, which `adv-machine::clock` owns |
+| [`cliffs`](crates/adv-cpu-core/src/cliffs.rs), [`frame_counters`](crates/adv-cpu-core/src/frame_counters.rs), [`instruction_trace`](crates/adv-cpu-core/src/instruction_trace.rs), [`perf_map`](crates/adv-cpu-core/src/perf_map.rs), [`tier_verify`](crates/adv-cpu-core/src/tier_verify.rs) | Diagnostics: slow-path counters, frame snapshots, interpreter traces, sampler maps and opt-in tier verification against the interpreter | Changing execution |
+
+### adv-machine
+
+| Modules | Responsible for | Not responsible for |
+|---|---|---|
+| [`Machine`](crates/adv-machine/src/lib.rs), [`Sys`](crates/adv-machine/src/lib.rs) | The crate root: host-call dispatch, direct-body binding and the delivery of a handler's outcome |  |
+| [`thunk`](crates/adv-machine/src/thunk.rs), [`patch`](crates/adv-machine/src/patch.rs) | Host function binding, the hookable thunk page, and detours of guest functions | Signatures, which `adv-abi` owns |
+| [`outcome`](crates/adv-machine/src/outcome.rs), [`invocation`](crates/adv-machine/src/invocation.rs), [`leaf`](crates/adv-machine/src/leaf.rs), [`service`](crates/adv-machine/src/service.rs) | What a handler asks for next, as continuations that never block the host; invoking existing bindings; memory-only handlers; work that bodies record for the machine |  |
+| [`sched`](crates/adv-machine/src/sched.rs), [`scheduling`](crates/adv-machine/src/scheduling.rs), [`wake_queue`](crates/adv-machine/src/wake_queue.rs) | Guest contexts and the cooperative scheduler, host-side allowances and wake preference |  |
+| [`clock`](crates/adv-machine/src/clock.rs), [`frame_spin`](crates/adv-machine/src/frame_spin.rs), [`poll_progress`](crates/adv-machine/src/poll_progress.rs) | The single guest time source; frame spin and productive polling (PROC-CLOCK-4, PROC-CLOCK-5) | Host presentation timing |
+| [`exception`](crates/adv-machine/src/exception.rs) | Delivery of precise CPU stops through the continuation stack | Exception records and handler search, which `adv-nt::exception` owns |
+| [`vm`](crates/adv-machine/src/vm.rs), [`layout`](crates/adv-machine/src/layout.rs), [`guest_words`](crates/adv-machine/src/guest_words.rs) | Guest address-space bookkeeping and the layout of host-owned regions; words shared with authored guest code | Mapping pages, which `adv-cpu-core::memory` does |
+| [`process`](crates/adv-machine/src/process.rs), [`objects`](crates/adv-machine/src/objects.rs), [`ext`](crates/adv-machine/src/ext.rs) | The process facts the machine needs, owned payloads and alias namespaces, and per-subsystem state by type | Image loading; API handle semantics |
+| [`trace`](crates/adv-machine/src/trace.rs), [`stats`](crates/adv-machine/src/stats.rs), [`frame_budget`](crates/adv-machine/src/frame_budget.rs), [`schedule_trace`](crates/adv-machine/src/schedule_trace.rs), [`wait_diagnostics`](crates/adv-machine/src/wait_diagnostics.rs) | Diagnostics: the host-call trace, cost accounting, frame budgets, and scheduler and wait observations |  |
+
+### adv-nt
+
+| Modules | Responsible for | Not responsible for |
+|---|---|---|
+| [`dispatch`](crates/adv-nt/src/dispatch.rs), [`syscalls`](crates/adv-nt/src/syscalls.rs), [`unix`](crates/adv-nt/src/unix.rs), [`unixlib`](crates/adv-nt/src/unixlib.rs), [`win32k`](crates/adv-nt/src/win32k.rs) | Where ntdll.dll leaves the guest: system calls, Unix calls, builtin Unix libraries, win32k calls and user-mode callbacks | What `win32u.so` does with its calls |
+| [`native`](crates/adv-nt/src/native.rs), [`identity`](crates/adv-nt/src/identity.rs) | Native bodies of distribution functions, and the code identity that admits them | Guest memory access inside bodies, which `adv-cpu-core::body` owns |
+| [`process`](crates/adv-nt/src/process.rs), [`thread`](crates/adv-nt/src/thread.rs), [`params`](crates/adv-nt/src/params.rs), [`environment`](crates/adv-nt/src/environment.rs), [`apc`](crates/adv-nt/src/apc.rs) | Process startup and exit, threads, the parameters block, the initial environment and system APCs |  |
+| [`memory`](crates/adv-nt/src/memory.rs), [`section`](crates/adv-nt/src/section.rs), [`image`](crates/adv-nt/src/image.rs) | Virtual memory services, sections and image views |  |
+| [`exception`](crates/adv-nt/src/exception.rs), [`context`](crates/adv-nt/src/context.rs) | CPU exceptions, delivered as Wine's i386 signal handler delivers them, and the i386 CONTEXT record |  |
+| [`server`](crates/adv-nt/src/server.rs), [`protocol`](crates/adv-nt/src/protocol.rs) | The wineserver client and its generated request layouts | The server, which `adv-wineserver` is |
+| [`file`](crates/adv-nt/src/file.rs), [`directory`](crates/adv-nt/src/directory.rs), [`path`](crates/adv-nt/src/path.rs), [`object`](crates/adv-nt/src/object.rs) | File system calls, directory listings, NT names to host paths, and object attributes |  |
+| [`sync`](crates/adv-nt/src/sync.rs), [`ntsync`](crates/adv-nt/src/ntsync.rs) | Waits and synchronization objects, over an in-process ntsync device | Parking, which the machine does |
+| [`registry`](crates/adv-nt/src/registry.rs), [`token`](crates/adv-nt/src/token.rs), [`atom`](crates/adv-nt/src/atom.rs) | Calls on the registry, tokens and atoms that the server holds |  |
+| [`information`](crates/adv-nt/src/information.rs), [`system`](crates/adv-nt/src/system.rs), [`kuser`](crates/adv-nt/src/kuser.rs), [`timezone`](crates/adv-nt/src/timezone.rs), [`nls`](crates/adv-nt/src/nls.rs), [`debug`](crates/adv-nt/src/debug.rs) | Process, thread and system information, KUSER_SHARED_DATA, the time zone, NLS sections and Wine's debug channels |  |
+| [`status`](crates/adv-nt/src/status.rs), [`counters`](crates/adv-nt/src/counters.rs) | NTSTATUS values and boundary counters |  |
 
 ## Execution
 
@@ -209,7 +276,7 @@ On macOS, guest menus appear in the native menu bar and guest dialogs become chi
 
 - CPU behavior is checked with self-written instruction and fault fixtures, differential runs against the interpreter, and Unicorn as a test-only reference.
 - Windows behavior is checked in Wine sessions: self-written probes and Wine's own conformance tests run on the Wine stack and compare their results with the native contract.
-- `tools/check.py` runs before every commit. It checks formatting, privacy, layering, the specs, the code and rules this guide names, and the launcher front end.
+- `tools/check.py` runs before every commit. It checks formatting, privacy, layering, the specs, the code, rules and core-crate modules this guide names, and the launcher front end.
 - Rules in `docs/spec/` name their verification, and tests cite the rules they check with `// spec:` markers.
 
 Game assets, screenshots, traces and anything taken from a game stay local and never enter the repository.
@@ -224,11 +291,3 @@ Game assets, screenshots, traces and anything taken from a game stay local and n
 | Building, testing and packaging | [docs/building.md](docs/building.md) |
 | Tools for debugging a game | [docs/investigation.md](docs/investigation.md) |
 | Host shells and platforms | [docs/spec/host.md](docs/spec/host.md), [docs/spec/android.md](docs/spec/android.md), [docs/building.md](docs/building.md) |
-
-## A call, from guest to body
-
-The loader publishes imports through [`ThunkTable`](crates/adv-machine/src/thunk.rs), and [`native::bind`](crates/adv-nt/src/native.rs) attaches distribution bodies after checking their code identity. Runtime services attach a body with [`Sys::bind_thunk_body`](crates/adv-machine/src/lib.rs); [`section::bind_builtin_bodies`](crates/adv-nt/src/section.rs) carries that binding to the copied entries in their PE images.
-
-The translator's [`Trace`](crates/adv-cpu-a64/src/translate/trace.rs) follows fixed forwarding instructions and import slots to a bound body, watching the chain and the bound entry for patches. [`ops::body`](crates/adv-cpu-a64/src/translate/ops.rs) calls its window form directly, without storing a guest return address (A64-CALL-1/2/5). [`BodyContext`](crates/adv-cpu-core/src/body.rs) supplies memory windows and shared service allocations; bodies never borrow the machine or extension owners through these pointers.
-
-The same generic body runs over `GuestMem` on [`run_full`](crates/adv-nt/src/native.rs), completing accesses the window cannot take (A64-CALL-4, NAT-BODY-17). `Stop::Guest` reaches guest code or the registered service handler when a callback, wait or server request is required (A64-CALL-6). A completed body can request a yield; generated code commits the return and [`Machine`](crates/adv-machine/src/lib.rs) schedules the handoff at its continuation.
