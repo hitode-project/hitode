@@ -3,6 +3,8 @@
 //! view that adv-shell presents into.
 #[cfg(target_os = "android")]
 pub mod android;
+#[cfg(any(target_os = "macos", test))]
+mod close;
 #[cfg(any(target_os = "macos", target_os = "android", target_os = "ios"))]
 mod distribution;
 #[cfg(any(target_os = "macos", target_os = "android", target_os = "ios"))]
@@ -185,7 +187,6 @@ pub fn run() {
         game::set_touch_mode,
         game::game_mouse_button,
         game::game_key,
-        game::keep_game,
         game::game_frames,
         game::game_presented,
         game::game_dialog,
@@ -225,7 +226,6 @@ pub fn run() {
         game::set_touch_mode,
         game::game_mouse_button,
         game::game_key,
-        game::keep_game,
         game::game_frames,
         game::game_presented,
         game::game_dialog,

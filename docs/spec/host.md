@@ -216,7 +216,7 @@ Preparation MUST validate the compressed stream completely before publishing the
 
 ### HOST-LIB-4 Stop game
 
-**Rule**: `stop_game` MUST first request normal session closure, then force closure if another request remains pending. With no running session it MUST return `no game is running`. Completion MUST use the existing finish callback and `game_finished` event without quitting the launcher.
+**Rule**: `stop_game` MUST request normal session closure, and force closure only when the game screen's explicit 强制结束 passes `force`. With no running session it MUST return `no game is running`. Completion MUST use the existing finish callback and `game_finished` event without quitting the launcher.
 **Applies to**: Launcher, macOS
 **Verification**: Review — the command runs on the AppKit main thread and requires a native session.
 
@@ -320,9 +320,17 @@ Preparation MUST validate the compressed stream completely before publishing the
 
 ### HOST-LIFE-7 Launcher quit
 
-**Rule**: The launcher MUST replace the predefined Quit item with one that calls `AppHandle::exit`, because tao does not intercept `terminate:`. While a game runs, Quit and the window's close button MUST end only the game, and a second use while it closes MUST force it. After a game starts, the launcher MUST handle the Apple quit event, which quits once the game has closed.
+**Rule**: The launcher MUST replace the predefined Quit item with one that calls `AppHandle::exit`, because tao does not intercept `terminate:`. While a game runs, Quit and the window's close button MUST end only the game, as HOST-LIFE-8 times them. After a game starts, the launcher MUST handle the Apple quit event, which quits once the game has closed.
 **Applies to**: Launcher, macOS
 **Verification**: Review — the Tauri menu and Apple events cannot run in a test.
+
+### HOST-LIFE-8 Close gestures
+
+**Rule**: Each press of the launcher's close button or Quit MUST ask the game to close, unless a press asked within the last 3 seconds. Such a repeat MUST force the game after the double-click interval, at most 1 second, and MUST do nothing before it.
+**Applies to**: Launcher, macOS
+**Verification**: Test
+
+> Note: Windows posts `WM_CLOSE` for each click on a close box. A player who declined the game's own prompt is therefore asked again, not forced. A press within the double-click interval is a double click, not a decision.
 
 ## Persistence
 

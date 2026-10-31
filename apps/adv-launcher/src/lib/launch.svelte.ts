@@ -1,6 +1,6 @@
 import { t } from "./i18n.svelte";
 import { untrack } from "svelte";
-import { call, inTauri, onHostEvent } from "./bridge";
+import { inTauri, onHostEvent } from "./bridge";
 import { pauseGame, startGame, stopGame, type GameFinished, type RunSummary } from "./host";
 import { jit } from "./jit.svelte";
 import { library } from "./library.svelte";
@@ -109,9 +109,8 @@ class Runs {
   }
 
   /**
-   * Asks the game to quit; a second call, or `force`, ends it at once. A game
-   * still starting is stopped once it has started. The end arrives as
-   * game_finished.
+   * Asks the game to quit, or with `force` ends it at once. A game still
+   * starting is stopped once it has started. The end arrives as game_finished.
    */
   async stop(gameId: string, force = false): Promise<void> {
     this.stopping[gameId] = true;
@@ -125,14 +124,12 @@ class Runs {
         return;
       }
     }
-    await quiet(stopGame(), "stop_game");
-    if (force) await quiet(stopGame(), "stop_game");
+    await quiet(stopGame(force), "stop_game");
   }
 
-  /** Mobile: the game stays after a stop request it declined. */
+  /** The game stays after a stop request it declined; the next stop asks again. */
   keep(gameId: string): void {
     delete this.stopping[gameId];
-    void call("keep_game", {}, null).catch(() => {});
   }
 
   /** The summary of the game's last run: this session's, else the library's record. */

@@ -16,7 +16,7 @@ use objc2::{
 };
 use objc2_app_kit::{
     NSApplication, NSApplicationDidBecomeActiveNotification,
-    NSApplicationDidResignActiveNotification, NSView, NSWindow,
+    NSApplicationDidResignActiveNotification, NSEvent, NSView, NSWindow,
     NSWindowDidChangeOcclusionStateNotification, NSWindowDidDeminiaturizeNotification,
     NSWindowDidMiniaturizeNotification, NSWindowOcclusionState, NSWorkspace,
     NSWorkspaceDidWakeNotification, NSWorkspaceWillPowerOffNotification,
@@ -25,7 +25,11 @@ use objc2_app_kit::{
 use objc2_foundation::{
     NSAppleEventManager, NSNotificationCenter, NSObjectProtocol, NSOperationQueue,
 };
-use std::{cell::RefCell, sync::Mutex, time::Instant};
+use std::{
+    cell::RefCell,
+    sync::Mutex,
+    time::{Duration, Instant},
+};
 use tauri::{Emitter, Manager, WebviewWindow};
 
 /// `kCoreEventClass` and `kAEQuitApplication`.
@@ -58,8 +62,10 @@ struct Host {
     session: Option<Session>,
     playback: Option<Playback>,
     paused: bool,
-    // Pending game close, with an exit code only when the application should quit.
-    exit: Option<Option<i32>>,
+    /// The exit code the application quits with once the game has closed.
+    exit: Option<i32>,
+    /// When the close button or Quit last asked the game to close.
+    asked: Option<Instant>,
     quit: Retained<QuitHandler>,
     /// The last overlay change applied to the webview's visibility.
     overlay_change: u64,
@@ -213,6 +219,7 @@ pub fn setup(app: &tauri::App) -> tauri::Result<()> {
                 playback: None,
                 paused: false,
                 exit: None,
+                asked: None,
                 quit,
                 observers,
                 overlay_change: 0,
@@ -293,7 +300,8 @@ pub async fn start_game(
                             host.session.take();
                             host.container.set_game(None);
                             host.focus(Target::Overlay);
-                            host.exit.take().flatten()
+                            host.asked = None;
+                            host.exit.take()
                         });
                         let elapsed = started_at.elapsed();
                         crate::play::finished(&finished_window, id, result, elapsed);
@@ -353,19 +361,29 @@ pub async fn start_game(
     .map_err(|error| error.to_string())?
 }
 
-/// Asks the running game to close while the launcher stays; asked again while
-/// it is closing, the game is forced. Returns false when no game is running.
+/// The close button or Quit, pressed while a game runs: asks the game to close
+/// while the launcher stays, or forces it when pressed again soon after
+/// (HOST-LIFE-8). Returns false when no game is running.
 pub(crate) fn end_game() -> bool {
     HOST.with_borrow_mut(|host| host.as_mut().is_some_and(Host::end_game))
 }
 
+/// Asks the running game to close, or forces it.
 #[tauri::command]
-pub async fn stop_game(window: WebviewWindow) -> Result<(), String> {
+pub async fn stop_game(window: WebviewWindow, force: bool) -> Result<(), String> {
     let (reply, result) = std::sync::mpsc::sync_channel(1);
     window
         .run_on_main_thread(move || {
-            let stopped = end_game()
-                .then_some(())
+            let stopped = HOST
+                .with_borrow(|host| {
+                    let session = host.as_ref()?.session.as_ref()?;
+                    if force {
+                        session.force_close();
+                    } else {
+                        session.request_close();
+                    }
+                    Some(())
+                })
                 .ok_or("no game is running".to_string());
             let _ = reply.send(stopped);
         })
@@ -478,7 +496,7 @@ pub fn run_event(_: &tauri::AppHandle, event: tauri::RunEvent) {
                 api.prevent_exit();
                 // A second quit while the game is still closing forces it,
                 // as the standalone shell's Quit item does.
-                if host.exit.replace(Some(code.unwrap_or(0))).is_some() {
+                if host.exit.replace(code.unwrap_or(0)).is_some() {
                     session.force_close();
                 } else {
                     session.request_close();
@@ -489,17 +507,19 @@ pub fn run_event(_: &tauri::AppHandle, event: tauri::RunEvent) {
 }
 
 impl Host {
-    /// Asks the running game to close, or forces it when already asked.
-    /// Returns false when no game is running.
     fn end_game(&mut self) -> bool {
         let Some(session) = &self.session else {
             return false;
         };
-        if self.exit.is_some() {
-            session.force_close();
-        } else {
-            self.exit = Some(None);
-            session.request_close();
+        let now = Instant::now();
+        let double_click = Duration::from_secs_f64(NSEvent::doubleClickInterval());
+        match crate::close::press(self.asked, now, double_click) {
+            crate::close::Press::Ask => {
+                self.asked = Some(now);
+                session.request_close();
+            }
+            crate::close::Press::Repeat => {}
+            crate::close::Press::Force => session.force_close(),
         }
         true
     }

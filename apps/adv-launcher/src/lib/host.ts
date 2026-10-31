@@ -89,8 +89,9 @@ export function startGame(id: string): Promise<void> {
 export function pauseGame(paused: boolean): Promise<void> {
   return call("pause_game", { paused }, undefined);
 }
-export function stopGame(): Promise<void> {
-  return call("stop_game", {}, undefined);
+/** Asks the running game to close, or with `force` ends it at once. */
+export function stopGame(force = false): Promise<void> {
+  return call("stop_game", { force }, undefined);
 }
 /** Opens drive C: of the Wine prefix, where games' other saved data is. */
 export function revealDrive(): Promise<void> {

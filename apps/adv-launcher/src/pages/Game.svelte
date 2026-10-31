@@ -228,7 +228,10 @@
     }
   }
 
-  /** Asked once, the game quits on its own terms; asked again, it is forced. */
+  /**
+   * A quit was requested and the game has not ended. Only the quitting bar's
+   * 强制结束 forces it; 返回游戏 or the game's end clears this.
+   */
   const stopping = $derived(runs.stopping[gameId] === true);
 
   /**
@@ -241,9 +244,10 @@
   }
 
   /**
-   * Phone: the library button asks the game to quit with no confirmation of
-   * our own. The controls step aside so the game's own prompt can be
-   * answered; only forcing the game asks first.
+   * Asks the game to quit and steps aside so its own prompt can be answered;
+   * the quitting bar stays until the game ends or the player returns to it.
+   * The phone's library button comes here with no confirmation of our own;
+   * only forcing the game asks first.
    */
   let forceAsk = $state(false);
   function leave() {
@@ -316,7 +320,7 @@
     <div class="fps mono" {@attach shown}>{measuredFps.toFixed(0)} FPS</div>
   {/if}
 
-  {#if phone && gameView && stopping}
+  {#if gameView && stopping}
     <div class="quitting surface over fade" role="status" {@attach region}>
       {#if forceAsk}
         <span>{t("强制结束游戏？")}</span>
@@ -419,13 +423,13 @@
           {#if phone}
             <div style="flex: 1"></div>
             <div style="display: flex; flex-direction: column; gap: 8px">
-              <button class="danger-btn" onclick={quit}>{stopping ? t("强制结束") : t("退出")}</button>
+              <button class="danger-btn" onclick={leave}>{t("退出")}</button>
               <button class="secondary" onclick={() => (view = "menu")}>{t("取消")}</button>
             </div>
           {:else}
             <div style="display: flex; gap: 8px; margin-top: 18px">
               <button class="secondary" style="flex: 1" onclick={() => (view = "menu")}>{t("取消")}</button>
-              <button class="danger-btn" style="flex: 1" onclick={quit}>{stopping ? t("强制结束") : t("退出")}</button>
+              <button class="danger-btn" style="flex: 1" onclick={leave}>{t("退出")}</button>
             </div>
           {/if}
         </div>
