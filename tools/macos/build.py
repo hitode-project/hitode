@@ -28,6 +28,8 @@ import platform
 import shlex
 import shutil
 import subprocess
+import sys
+import time
 import urllib.request
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -73,6 +75,20 @@ def digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def download(url: str, attempts: int = 5) -> bytes:
+    # The FFmpeg server resets connections now and then, on CI as at home.
+    for attempt in range(1, attempts + 1):
+        try:
+            with urllib.request.urlopen(url, timeout=60) as response:
+                return response.read()
+        except OSError as error:
+            if attempt == attempts:
+                raise
+            print(f'download failed ({error}); retry {attempt} of {attempts - 1}', file=sys.stderr)
+            time.sleep(5 * attempt)
+    raise AssertionError('unreachable')
+
+
 def remap_flags() -> list[str]:
     return [f'--remap-path-prefix={source}={target}' for source, target in [
         (Path.home(), '/home'),
@@ -96,8 +112,7 @@ def build(jobs: int, ffmpeg_only: bool, mobile: str | None = None) -> dict:
     log_dir.mkdir(parents=True, exist_ok=True)
     archive = base.parent / f"ffmpeg-{profile['version']}.tar.xz"
     if not archive.exists():
-        with urllib.request.urlopen(profile['url'], timeout=60) as response:
-            archive.write_bytes(response.read())
+        archive.write_bytes(download(profile['url']))
     if digest(archive) != profile['sha256']:
         raise ValueError('FFmpeg source checksum mismatch')
     with (log_dir / (f'build-static-{mobile}.log' if mobile else 'build-static.log')).open('w') as log:
