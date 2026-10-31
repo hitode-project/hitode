@@ -24,7 +24,8 @@ struct Calls {
     diagnostics: u8,
     direct: u32,
     traps: u32,
-    delay: bool,
+    // The call outlasts the deadline: it returns once the alarm has fired.
+    delay: Option<Arc<AtomicU32>>,
     interrupt: Option<Arc<AtomicU32>>,
 }
 impl Calls {
@@ -34,7 +35,7 @@ impl Calls {
             diagnostics: 0,
             direct: 0,
             traps: 0,
-            delay: false,
+            delay: None,
             interrupt: None,
         }
     }
@@ -62,9 +63,11 @@ impl ExecutionTrap for Calls {
     ) -> Result<bool, String> {
         assert_eq!((thunk, state.eip), (THUNK_INDEX, THUNK + 7));
         self.direct += 1;
-        if self.delay {
-            let end = Instant::now() + std::time::Duration::from_millis(20);
-            while Instant::now() < end {
+        if let Some(flag) = &self.delay {
+            let end = Instant::now() + std::time::Duration::from_secs(5);
+            while flag.load(Ordering::Acquire) & adv_sync::pending::INTERRUPT == 0
+                && Instant::now() < end
+            {
                 std::hint::spin_loop();
             }
         }
@@ -226,7 +229,7 @@ fn deadline_and_interrupt_leave_before_the_instruction_after_a_call() {
         let flag = Arc::new(AtomicU32::new(0));
         executor.set_host_interrupt_flag(flag.clone());
         if delayed {
-            calls.delay = true;
+            calls.delay = Some(flag);
             executor.set_deadline(Some(Instant::now() + std::time::Duration::from_millis(5)));
         } else {
             calls.interrupt = Some(flag);

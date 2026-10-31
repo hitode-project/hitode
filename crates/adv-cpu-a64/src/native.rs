@@ -59,6 +59,17 @@ type Enter = unsafe extern "C" fn(*mut Runtime, usize);
 /// An indirect table entry no EIP matches.
 const EMPTY: [u64; 2] = [u64::MAX, 0];
 
+/// Doubling copies fill the 1 MiB table with a few memcpys; an element-wise
+/// fill dominates executor creation in unoptimized test builds.
+fn empty_table() -> Box<[[u64; 2]]> {
+    let mut table = Vec::with_capacity(runtime::TABLE_LEN);
+    table.push(EMPTY);
+    while table.len() < runtime::TABLE_LEN {
+        table.extend_from_within(..table.len().min(runtime::TABLE_LEN - table.len()));
+    }
+    table.into_boxed_slice()
+}
+
 /// Faults at unchecked sites after which an instruction is checked (A64-MEM-6).
 pub(crate) const CHECK_AFTER: u32 = 8;
 
@@ -700,7 +711,7 @@ impl Native {
         // SAFETY: `enter` follows the C calling convention with the
         // signature of `Enter`; see `runtime::emit_enter`.
         let enter = unsafe { std::mem::transmute::<usize, Enter>(base + stubs.enter) };
-        let mut table = vec![EMPTY; runtime::TABLE_LEN].into_boxed_slice();
+        let mut table = empty_table();
         let shadow = ShadowStack::new()?;
         let mut runtime = Box::new(Runtime::new(std::ptr::null_mut(), window as u64));
         runtime.table = table.as_mut_ptr() as u64;
