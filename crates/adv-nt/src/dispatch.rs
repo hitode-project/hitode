@@ -376,7 +376,7 @@ impl Resolver for Platform {
 /// stub's return address at `[esp]` and its caller's frame above it, so
 /// argument `i` is `env.arg(i + 1)`.
 fn syscall(env: &mut Env<'_>) -> Outcome {
-    let since = Instant::now();
+    let since = (env.sys.diagnostics() != 0).then(Instant::now);
     let number = env.cpu.reg(Reg::Eax) as usize;
     let outcome = dispatch_syscall(env, number);
     counters::syscall(env, number as u32, since);
@@ -408,7 +408,7 @@ fn dispatch_syscall(env: &mut Env<'_>, number: usize) -> Outcome {
 }
 
 fn unix_call(env: &mut Env<'_>) -> Outcome {
-    let since = Instant::now();
+    let since = (env.sys.diagnostics() != 0).then(Instant::now);
     let (handle, high, code, args) = (env.arg(0), env.arg(1), env.arg(2), env.arg(3));
     let outcome = match (handle, high) {
         (NTDLL_UNIXLIB, 0) => unix::call(env, code, args),

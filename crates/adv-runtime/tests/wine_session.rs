@@ -1,22 +1,28 @@
 //! A Wine session as the shell runs one: a kept prefix, real time, and a GPU
 //! whose completions wake the run loop.
 //!
-//! It needs `ADV_WINE_DIST` and `ADV_WINE_PROBES`, as the probe tests do.
+//! It needs `ADV_WINE_DIST`, as the probe tests do.
 #![cfg(all(any(target_vendor = "apple", target_os = "android"), feature = "gpu"))]
 
 use std::fs::File;
 use std::io::Read;
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use adv_runtime::wine::session::{Config, Session, Stop};
 
+#[allow(dead_code)]
+mod wine {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../adv-nt/tests/common/wine.rs"
+    ));
+}
+
 // spec: WINE-SES-10, WINE-SES-8, WINE-SES-3, WINE-SES-1, WINE-DLL-3, WINE-SES-2
 #[test]
 fn sequential_sessions_reclaim_clients_and_keep_the_prefix() {
-    if std::env::var_os("ADV_WINE_DIST").is_none() || std::env::var_os("ADV_WINE_PROBES").is_none()
-    {
+    if wine::wine().is_none() {
         return;
     }
     assert!(
@@ -37,8 +43,7 @@ fn sequential_sessions_reclaim_clients_and_keep_the_prefix() {
 #[ignore = "subprocess entry: Wine owns process-global server state"]
 fn sequential_sessions_child() {
     use adv_runtime::wine::session::{Host, SessionOptions};
-    let dist = PathBuf::from(std::env::var_os("ADV_WINE_DIST").unwrap());
-    let probes = PathBuf::from(std::env::var_os("ADV_WINE_PROBES").unwrap());
+    let wine::Wine { dist, probes } = wine::wine().unwrap();
     let root = std::env::temp_dir().join(format!("adv-wine-lifecycle-{}", std::process::id()));
     let first = root.join("first");
     let second = root.join("second");
@@ -234,11 +239,7 @@ fn native_child_session() {
 }
 
 fn program_session(child: bool) {
-    let (Some(dist), Some(probes)) = (
-        std::env::var_os("ADV_WINE_DIST").map(PathBuf::from),
-        std::env::var_os("ADV_WINE_PROBES").map(PathBuf::from),
-    ) else {
-        eprintln!("skipped: ADV_WINE_DIST or ADV_WINE_PROBES is not set");
+    let Some(wine::Wine { dist, probes }) = wine::wine() else {
         return;
     };
     let root = std::env::temp_dir().join(format!("adv-wine-session-{}", std::process::id()));
@@ -328,7 +329,8 @@ fn program_session(child: bool) {
     }
     assert!(frames >= 1, "no frame was presented");
     assert_eq!(size, (64, 32));
-    assert_eq!(inked, 43);
+    // "Hi" in Wine's Tahoma at -16, non-antialiased, from the native rasterizer.
+    assert_eq!(inked, 75);
 }
 
 // spec: WINE-UI-1, WINE-UI-2
@@ -359,11 +361,7 @@ fn popup_choice_and_cancel_child() {
     use adv_runtime::MenuEvent;
     use std::sync::atomic::Ordering;
 
-    let (Some(dist), Some(probes)) = (
-        std::env::var_os("ADV_WINE_DIST").map(PathBuf::from),
-        std::env::var_os("ADV_WINE_PROBES").map(PathBuf::from),
-    ) else {
-        eprintln!("skipped: ADV_WINE_DIST or ADV_WINE_PROBES is not set");
+    let Some(wine::Wine { dist, probes }) = wine::wine() else {
         return;
     };
     let root = std::env::temp_dir().join(format!("adv-wine-popup-{}", std::process::id()));
@@ -471,11 +469,7 @@ fn a_message_box_is_projected_natively_from_its_first_frame() {
 fn message_box_child() {
     use adv_runtime::DialogEvent;
 
-    let (Some(dist), Some(probes)) = (
-        std::env::var_os("ADV_WINE_DIST").map(PathBuf::from),
-        std::env::var_os("ADV_WINE_PROBES").map(PathBuf::from),
-    ) else {
-        eprintln!("skipped: ADV_WINE_DIST or ADV_WINE_PROBES is not set");
+    let Some(wine::Wine { dist, probes }) = wine::wine() else {
         return;
     };
     let root = std::env::temp_dir().join(format!("adv-wine-box-{}", std::process::id()));

@@ -3,6 +3,14 @@
 #[path = "../../adv-nt/tests/common/mod.rs"]
 mod common;
 
+#[allow(dead_code)]
+mod wine {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../adv-nt/tests/common/wine.rs"
+    ));
+}
+
 fn probe(jit: bool) -> Option<String> {
     let (result, output) = common::run_probe_inspect(
         "key_state.exe",
@@ -17,6 +25,10 @@ fn probe(jit: bool) -> Option<String> {
                     adv_machine::Clock::virtual_time(),
                 )
                 .unwrap();
+            } else {
+                // Interpreted runs follow redirects too (A64-CTL-14); tracing
+                // keeps the reference on Wine's own code.
+                machine.sys.trace = adv_machine::Trace::to_writer(Box::new(std::io::sink()));
             }
             adv_unix::install(machine);
         },
@@ -56,8 +68,7 @@ fn key_state_interpreter() {
 // spec: NAT-BODY-12
 #[test]
 fn key_state_matches_wine() {
-    if std::env::var_os("ADV_WINE_DIST").is_none() || std::env::var_os("ADV_WINE_PROBES").is_none()
-    {
+    if wine::wine().is_none() {
         return;
     }
     let reference = std::process::Command::new(std::env::current_exe().unwrap())

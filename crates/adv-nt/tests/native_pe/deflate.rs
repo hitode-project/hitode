@@ -211,7 +211,7 @@ fn compare(
     );
 }
 
-// spec: NAT-BODY-1, NAT-BODY-11, DEV-CODEC-2
+// spec: NAT-BODY-1, NAT-BODY-11
 #[test]
 fn fast_batches_preserve_wine_state() {
     let Some(dist) = dist() else { return };
@@ -223,9 +223,6 @@ fn fast_batches_preserve_wine_state() {
     ] {
         let (mut native, pe) = machine(&dist, module, true);
         let (mut reference, _) = machine(&dist, module, false);
-        native.ext.insert(adv_nt::native::InflateFast::new(
-            adv_device::codec_kernel::inflate_fast,
-        ));
         for machine in [&mut native, &mut reference] {
             machine.cpu.map(WINDOW, 32768, Prot::RW).unwrap();
             let window: Vec<u8> = (0..32768).map(|i| (i as u8).wrapping_mul(37)).collect();
@@ -311,6 +308,41 @@ fn fast_batches_preserve_wine_state() {
                     }
                 }
             }
+            // The live output aliases compressed input; later reads observe
+            // bytes already written by the decoder, rather than a snapshot.
+            for delta in [-16i32, -1, 0, 1, 4, 16] {
+                let mut data = base.clone();
+                let tokens: Vec<_> = (0..300)
+                    .map(|i| Token::Literal((i as u8).wrapping_mul(19)))
+                    .collect();
+                let (hold, bytes) = encoded(&tokens, 0);
+                for (at, value) in [
+                    (DATA, INPUT),
+                    (DATA + 4, bytes.len() as u32),
+                    (DATA + 12, INPUT.wrapping_add_signed(delta)),
+                    (DATA + 16, 512),
+                    (DATA + 28, STATE),
+                    (STATE + 4, 16200),
+                    (STATE + 44, 32768),
+                    (STATE + 48, 0),
+                    (STATE + 52, 0),
+                    (STATE + 56, WINDOW),
+                    (STATE + 60, hold),
+                    (STATE + 64, 0),
+                    (STATE + 7108, 1),
+                ] {
+                    put(&mut data, at, 4, value);
+                }
+                data[0x3000..0x3000 + bytes.len()].copy_from_slice(&bytes);
+                compare(
+                    &mut native,
+                    &mut reference,
+                    &data,
+                    512,
+                    true,
+                    &format!("{module} input overlap {delta}"),
+                );
+            }
             // Exercise every length/distance extra-bit width at its upper edge.
             let tokens: Vec<Token> = LENGTHS
                 .iter()
@@ -348,9 +380,9 @@ fn fast_batches_preserve_wine_state() {
                 true,
                 "all extra-bit widths",
             );
-            // Invalid codes and unavailable history must reach Wine's own error
-            // path with the original input, output and bit state intact.
-            for invalid_code in [false, true] {
+            // Error exits retain the pinned decoder's partial output, message,
+            // stream pointers and reservoir; sane=0 also reads retained history.
+            for (invalid_code, sane) in [(false, 1), (true, 1), (false, 0)] {
                 let mut data = base.clone();
                 let (hold, bytes) = encoded(&[Token::Literal(7), Token::Match(258, 32768)], 0);
                 for (at, value) in [
@@ -366,7 +398,7 @@ fn fast_batches_preserve_wine_state() {
                     (STATE + 56, WINDOW),
                     (STATE + 60, hold),
                     (STATE + 64, 0),
-                    (STATE + 7108, 1),
+                    (STATE + 7108, sane),
                 ] {
                     put(&mut data, at, 4, value);
                 }
@@ -383,8 +415,8 @@ fn fast_batches_preserve_wine_state() {
                     &mut reference,
                     &data,
                     10240,
-                    false,
-                    "invalid stream",
+                    true,
+                    "history checks and invalid codes",
                 );
             }
         }

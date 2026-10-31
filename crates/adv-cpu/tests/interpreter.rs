@@ -891,14 +891,15 @@ fn fs_and_word_addressing_resolve_before_guest_range_checks() {
         Step::Executed
     );
     assert_eq!(initial.regs[0], 0x5566_7788);
-    memory.write(CODE, &[0x65, 0xa1, 0x20, 0, 0, 0]).unwrap(); // GS unsupported
+    // GS is flat, as WoW64's 0x2b selector is.
+    memory.write(CODE, &[0x65, 0xa1, 0x20, 0, 0, 0]).unwrap();
+    memory.write(0x20, &0x0bad_f00du32.to_le_bytes()).unwrap();
     initial.eip = CODE;
-    let before = initial.clone();
-    assert!(matches!(
+    assert_eq!(
         Interpreter::new().step(&mut initial, &mut memory),
-        Step::Unsupported { pc: CODE, .. }
-    ));
-    assert_eq!(initial, before);
+        Step::Executed
+    );
+    assert_eq!(initial.regs[0], 0x0bad_f00d);
 }
 
 #[test]

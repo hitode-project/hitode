@@ -23,8 +23,8 @@ use adv_machine::{CtxId, Env, Sys};
 use crate::counters::Tally;
 
 use crate::protocol::{
-    AllocFileHandleRequest, CloseHandleRequest, FIXED_SIZE, GetHandleFdRequest,
-    InitFirstThreadRequest, InitThreadRequest, PROTOCOL_VERSION, Request,
+    AllocFileHandleRequest, FIXED_SIZE, GetHandleFdRequest, InitFirstThreadRequest,
+    InitThreadRequest, PROTOCOL_VERSION, Request,
 };
 
 // The shim owns the table shared by all processes on this execution owner.
@@ -134,12 +134,14 @@ pub struct Link {
     /// Host descriptors of handles the server allows to cache, as Wine's
     /// fd cache keeps them: until the handle is closed.
     fds: HashMap<u32, Cached>,
+    pub(crate) files: Rc<crate::file::state::States>,
     threads: HashMap<CtxId, Thread>,
     inproc_device: Option<crate::ntsync::Fd>,
     inproc: HashMap<u32, InprocFd>,
     ready: Box<UnsafeCell<HashSet<CtxId>>>,
     /// Requests sent, by number; see [`crate::counters`].
     pub(crate) requests: HashMap<i32, Tally>,
+    diagnostics: bool,
 }
 
 /// A guest thread as the server knows it.
@@ -172,6 +174,8 @@ pub struct HandleFd {
     /// Closed when this is dropped, for a descriptor the server does not
     /// let the process cache.
     _owned: Option<OwnedFd>,
+    pub(crate) file: Option<crate::file::state::Entry>,
+    pub(crate) state: Option<crate::file::state::Entry>,
 }
 
 impl Link {
@@ -189,11 +193,13 @@ impl Link {
             progress,
             time,
             fds: HashMap::new(),
+            files: Rc::new(crate::file::state::States::default()),
             threads: HashMap::new(),
             inproc_device: connection.inproc_device,
             inproc: HashMap::new(),
             ready: Box::new(UnsafeCell::new(HashSet::new())),
             requests: HashMap::new(),
+            diagnostics: false,
         };
         link.add_thread(main, tid, connection.channel, sys);
         link
@@ -255,15 +261,16 @@ impl Link {
                 unsafe { &*(request as *const R).cast::<crate::protocol::GetApcResultRequest>() };
             self.inproc.remove(&result.handle);
         }
-        if R::NUMBER == crate::protocol::DupHandleRequest::NUMBER {
+        let closing = if R::NUMBER == crate::protocol::DupHandleRequest::NUMBER {
             // SAFETY: NUMBER selects the generated repr(C) request layout.
             let duplicate =
                 unsafe { &*(request as *const R).cast::<crate::protocol::DupHandleRequest>() };
-            if duplicate.options & 1 != 0 {
-                self.inproc.remove(&duplicate.src_handle);
-            }
-        }
-        let (time, since) = (self.time, Instant::now());
+            (duplicate.options & 1 != 0 && duplicate.src_process == u32::MAX)
+                .then_some(duplicate.src_handle)
+        } else {
+            None
+        };
+        let (time, since) = (self.time, self.diagnostics.then(Instant::now));
         let thread = self
             .threads
             .get_mut(&context)
@@ -278,7 +285,21 @@ impl Link {
             data,
             reply_data,
         );
-        self.requests.entry(R::NUMBER).or_default().add(since);
+        if let Some(handle) = closing
+            && let Ok((reply, _)) = &answer
+        {
+            // SAFETY: closing is set only for DupHandleReply, whose handle follows its header.
+            let duplicate =
+                unsafe { &*(reply as *const R::Reply).cast::<crate::protocol::DupHandleReply>() };
+            if duplicate.handle != handle {
+                self.files.remove(handle);
+                self.fds.remove(&handle);
+                self.inproc.remove(&handle);
+            }
+        }
+        if let Some(since) = since {
+            self.requests.entry(R::NUMBER).or_default().add(since);
+        }
         answer
     }
 
@@ -295,10 +316,13 @@ impl Link {
         if word(0) as i32 == crate::protocol::GetApcResultRequest::NUMBER {
             self.inproc.remove(&word(12));
         }
-        if word(0) as i32 == crate::protocol::DupHandleRequest::NUMBER && word(32) & 1 != 0 {
-            self.inproc.remove(&word(16));
-        }
-        let (time, since) = (self.time, Instant::now());
+        let closing = (word(0) as i32 == crate::protocol::DupHandleRequest::NUMBER
+            && word(32) & 1 != 0
+            && word(12) == u32::MAX)
+            .then(|| word(16));
+        let close =
+            (word(0) as i32 == crate::protocol::CloseHandleRequest::NUMBER).then(|| word(12));
+        let (time, since) = (self.time, self.diagnostics.then(Instant::now));
         let number = i32::from_ne_bytes(fixed[..4].try_into().unwrap());
         let thread = self
             .threads
@@ -314,7 +338,21 @@ impl Link {
             data,
             reply_data,
         );
-        self.requests.entry(number).or_default().add(since);
+        if answer.is_ok() {
+            let status = u32::from_ne_bytes(fixed[..4].try_into().unwrap());
+            let duplicate = u32::from_ne_bytes(fixed[8..12].try_into().unwrap());
+            if let Some(handle) = closing
+                .filter(|&handle| handle != duplicate)
+                .or(close.filter(|_| status == 0))
+            {
+                self.files.remove(handle);
+                self.fds.remove(&handle);
+                self.inproc.remove(&handle);
+            }
+        }
+        if let Some(since) = since {
+            self.requests.entry(number).or_default().add(since);
+        }
         answer
     }
 }
@@ -331,6 +369,7 @@ pub fn set_time(env: &mut Env<'_>) {
     crate::ntsync::set_time(time);
     if let Some(link) = env.ext.try_get_mut::<Link>() {
         link.time = time;
+        link.diagnostics = env.sys.diagnostics() != 0;
     }
 }
 
@@ -582,6 +621,8 @@ pub fn handle_fd(env: &mut Env<'_>, handle: u32) -> Result<HandleFd, crate::stat
             kind: cached.kind,
             options: cached.options,
             _owned: None,
+            file: link.files.get(handle).filter(|file| file.kind == 1),
+            state: link.files.get(handle),
         });
     }
     let mut request = GetHandleFdRequest {
@@ -612,25 +653,74 @@ pub fn handle_fd(env: &mut Env<'_>, handle: u32) -> Result<HandleFd, crate::stat
     } else {
         Some(fd)
     };
+    #[cfg(any(target_vendor = "apple", target_os = "android"))]
+    if reply.cacheable != 0 || reply.r#type != 1 {
+        let tid = link
+            .known_tid(context)
+            .ok_or_else(|| broken(Error::NoThread(context)))?;
+        let position = adv_wineserver::file_position(tid, handle)
+            .expect("an admitted file descriptor retains its server fd");
+        let immutable = crate::file::volume::mounts(env).file_standard(raw);
+        let link = env.ext.get::<Link>();
+        link.files
+            .insert(handle, raw, position, immutable, reply.r#type);
+    }
+    let state = env.ext.get::<Link>().files.get(handle);
+    let file = state.clone().filter(|file| file.kind == 1);
     deliver(env);
     Ok(HandleFd {
         fd: raw,
         kind: reply.r#type,
         options: reply.options,
         _owned: owned,
+        file,
+        state,
     })
+}
+
+/// Server-only pipes have a Windows position without a Unix descriptor.
+pub(crate) fn pipe_state(
+    env: &mut Env<'_>,
+    handle: u32,
+) -> Result<Option<crate::file::state::Entry>, crate::status::Error> {
+    if let Some(state) = env.ext.get::<Link>().files.get(handle) {
+        return Ok(Some(state));
+    }
+    #[cfg(any(target_vendor = "apple", target_os = "android"))]
+    {
+        let tid = current_tid(env)?;
+        if adv_wineserver::file_kind(tid, handle) == 6 {
+            let position = adv_wineserver::file_position(tid, handle)
+                .expect("an admitted file descriptor retains its server fd");
+            let states = &env.ext.get::<Link>().files;
+            states.insert(handle, -1, position, None, 6);
+            return Ok(states.get(handle));
+        }
+    }
+    Ok(None)
 }
 
 /// Closes `handle` in the server and forgets its descriptor.
 pub fn close(env: &mut Env<'_>, handle: u32) -> Result<(), crate::status::Error> {
+    #[cfg(any(target_vendor = "apple", target_os = "android"))]
+    {
+        // Direct closes bypass Channel::call_raw's handle-retirement invalidation.
+        crate::registry::invalidate_request(crate::protocol::CloseHandleRequest::NUMBER);
+        crate::status::check(adv_wineserver::close_handle(current_tid(env)?, handle))?;
+    }
+    #[cfg(not(any(target_vendor = "apple", target_os = "android")))]
+    {
+        let mut request = crate::protocol::CloseHandleRequest {
+            handle,
+            ..Default::default()
+        };
+        let (reply, _) = self::request(env, &mut request, &[], &mut [])?;
+        crate::status::check(reply.header.error)?;
+    }
+    link(env)?.files.remove(handle);
     link(env)?.fds.remove(&handle);
     link(env)?.inproc.remove(&handle);
-    let mut request = CloseHandleRequest {
-        handle,
-        ..Default::default()
-    };
-    let (reply, _) = self::request(env, &mut request, &[], &mut [])?;
-    crate::status::check(reply.header.error)
+    Ok(())
 }
 
 /// Sends a request on behalf of a system call. A status the server

@@ -7,6 +7,14 @@ use adv_drv::codec::{self, Mode, vorbisfile};
 use adv_pe::{Export, ExportTarget, scn, write::DllWriter};
 use adv_runtime::wine::session::{Config, Host, SessionOptions, Stop};
 
+#[allow(dead_code)]
+mod wine {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../adv-nt/tests/common/wine.rs"
+    ));
+}
+
 fn dll() -> Vec<u8> {
     let mut writer = DllWriter::new("vorbisfile.dll", 0x1800_0000);
     let code = writer
@@ -66,11 +74,7 @@ fn dll() -> Vec<u8> {
 // spec: CODEC-MODULE-1, DEV-AUDIO-3
 #[test]
 fn shipped_module_admission_and_callback_decoding() {
-    let (Some(dist), Some(probes)) = (
-        std::env::var_os("ADV_WINE_DIST").map(PathBuf::from),
-        std::env::var_os("ADV_WINE_PROBES").map(PathBuf::from),
-    ) else {
-        eprintln!("skipped: ADV_WINE_DIST or ADV_WINE_PROBES is not set");
+    let Some(wine::Wine { dist, probes }) = wine::wine() else {
         return;
     };
     let root = std::env::temp_dir().join(format!("adv-wine-vorbisfile-{}", std::process::id()));

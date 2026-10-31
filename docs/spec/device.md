@@ -145,11 +145,6 @@ Device reconnection MUST retain refill notifications crossed while reanchoring a
 | PNG Paeth | Break ties in left, above, upper-left order |
 | LZ77 | Ordered reads include newly written history for overlapping matches |
 
-### DEV-CODEC-2 DEFLATE batches
-
-**Rule**: DEFLATE batches MUST preserve Huffman decoding, extra bits, overlapping matches, chronological window history and speculative input rollback. Decoding MUST use caller-owned scratch without allocation, guest access or I/O. Rejection MAY leave partial scratch bytes but MUST NOT publish stream state.
-**Verification**: Test
-
 ### DEV-VIDEO-1 Native packet decoding
 
 **Rule**: Whole-packet Theora replacements MAY own opaque decoder state after complete library-family admission.
@@ -195,6 +190,11 @@ Unmatched libraries MUST execute their guest implementations.
 **Rule**: Enumerating without a family name MUST report each family once, preferring its regular style, and once per character set for extended enumeration. Host-private families, whose names start with a period, and unnamed faces MUST be left out.
 **Verification**: Test
 
+### DEV-FONT-6 Windows font layer
+
+**Rule**: Fonts shipped with the Windows installation MUST be discovered only for families that no host font provides, after every host face. Glyph association MUST NOT draw from a symbol-encoded face that the request did not select.
+**Verification**: Test
+
 ## Optical media
 
 ### DEV-DISC-1 Mount configuration
@@ -237,4 +237,4 @@ Unmatched libraries MUST execute their guest implementations.
 **Rule**: UDF, BIN/CUE, multisession audio, raw device IOCTLs, CD audio, and physical-medium information MUST NOT be inferred from ISO data support. Runtime eject and media-change notifications MUST remain unavailable.
 **Verification**: Review — no test enumerates all unsupported formats and device operations or runtime media-change requests.
 
-Withdrawn: none
+Withdrawn: DEV-CODEC-2

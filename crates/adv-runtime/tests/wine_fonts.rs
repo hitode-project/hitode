@@ -9,14 +9,18 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[allow(dead_code)]
+mod wine {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../adv-nt/tests/common/wine.rs"
+    ));
+}
+
 // spec: WINE-SES-5, WINE-SES-8, DEV-FONT-1, WINE-UNIX-6
 #[test]
 fn discovered_fonts_and_aliases_survive_prefix_reuse() {
-    let (Some(dist), Some(probes)) = (
-        std::env::var_os("ADV_WINE_DIST").map(PathBuf::from),
-        std::env::var_os("ADV_WINE_PROBES").map(PathBuf::from),
-    ) else {
-        eprintln!("skipped: ADV_WINE_DIST or ADV_WINE_PROBES is not set");
+    let Some(wine::Wine { dist, probes }) = wine::wine() else {
         return;
     };
     let child = std::env::var_os("ADV_FONT_PROBE_ROOT");
@@ -148,8 +152,7 @@ fn discovered_fonts_and_aliases_survive_prefix_reuse() {
 }
 
 fn probe(name: &str, draw: bool) -> Option<(Vec<u8>, String, Duration, String)> {
-    let dist = PathBuf::from(std::env::var_os("ADV_WINE_DIST")?);
-    let probes = PathBuf::from(std::env::var_os("ADV_WINE_PROBES")?);
+    let wine::Wine { dist, probes } = wine::wine()?;
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/font-probes")
         .join(format!("{}-{name}-{}", std::process::id(), u8::from(draw)));
@@ -498,6 +501,30 @@ fn directwrite_uses_the_host_cff_glyphs_without_freetype() {
     assert!(stats.contains("dwrite.so!get_glyph_bitmap"), "{stats}");
 }
 
+// spec: DEV-FONT-6
+#[test]
+fn wine_fonts_fill_missing_families_but_never_link_symbols() {
+    if wine::dist().is_none() {
+        return;
+    }
+    let mut text = direct_text();
+    let mut latin = request("ADV Resource Fixture", -19);
+    latin.encoding = adv_device::text::Encoding::Latin;
+    // The fixture has no "W". Symbol sorts before Tahoma and maps it into
+    // its private range, but only a selected Symbol draws it.
+    let missing = text.resolved_character(&latin, 'W'.into()).unwrap();
+    assert_eq!(
+        (missing.family.as_str(), missing.default_glyph),
+        ("Tahoma", false)
+    );
+    latin.face = "Symbol".into();
+    let symbol = text.resolved_character(&latin, 'W'.into()).unwrap();
+    assert_eq!(
+        (symbol.family.as_str(), symbol.default_glyph),
+        ("Symbol", false)
+    );
+}
+
 fn request(face: &str, height: i32) -> adv_device::text::FontRequest {
     use adv_device::text::*;
     FontRequest {
@@ -525,10 +552,13 @@ fn request(face: &str, height: i32) -> adv_device::text::FontRequest {
         family: Family::Default,
     }
 }
+/// The session's font environment: the fixtures, and Wine's fonts for the
+/// families they lack.
 fn direct_text() -> adv_device::text::Text {
     adv_device::text::Text::with_font_directories(&[
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../adv-device/tests/fixtures")
     ])
+    .with_windows_fonts(&wine::dist().unwrap().join("share/wine/fonts"))
 }
 fn glyph_metrics(metrics: adv_device::text::GlyphMetrics) -> Vec<u8> {
     [
@@ -869,7 +899,9 @@ fn query_reference() -> Vec<u8> {
             words.extend([1, 1]);
             for source in [latin.as_slice(), dbcs.as_slice()] {
                 for n in 0..=7 {
-                    let cp = if charset == 0 && n == 1 {
+                    // GDI decodes one byte as cp1252 in an ANSI font, and a
+                    // lone lead byte in any font.
+                    let cp = if n == 1 && (charset == 0 || codec.is_lead_byte(932, source[0])) {
                         1252
                     } else if charset == 2 {
                         936

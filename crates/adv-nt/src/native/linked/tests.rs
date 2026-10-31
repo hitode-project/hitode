@@ -16,7 +16,7 @@ const SAVED: u32 = OUT + 32;
 const BUF: u32 = 0x0042_0000;
 const BUF_LEN: usize = 0x4000;
 
-fn helpers() -> Vec<&'static super::Helper> {
+fn helpers() -> Vec<(&'static str, Conv, &'static [u8])> {
     super::helpers().collect()
 }
 
@@ -41,7 +41,7 @@ fn machine(native: bool) -> Machine<Cpu> {
     m.cpu.map(DATA, 0x1000, Prot::RW).unwrap();
     m.cpu.map(BUF, BUF_LEN as u32, Prot::RW).unwrap();
     let mut at = HELPERS;
-    for (index, &&(_, conv, bytes, _)) in helpers().iter().enumerate() {
+    for (index, &(_, conv, bytes)) in helpers().iter().enumerate() {
         let (Conv::Cdecl { argc } | Conv::Stdcall { argc }) = conv else {
             unreachable!()
         };
@@ -164,17 +164,25 @@ fn borland_division_matches_its_code() {
 
 // spec: NAT-BODY-13
 #[test]
-fn borland_division_by_zero_faults_in_its_code() {
+fn borland_division_by_zero_faults_at_entry() {
     for helper in divisions() {
         // A fault ends the machine's run, so each call gets fresh machines.
-        let expected = call(&mut machine(false), helper, 1 << 32, &[0, 0]);
-        assert!(expected.is_err());
+        assert!(call(&mut machine(false), helper, 1 << 32, &[0, 0]).is_err());
+        let expected = HELPERS
+            + helpers()
+                .iter()
+                .take(helper)
+                .map(|h| h.2.len() as u32)
+                .sum::<u32>();
         let mut native = machine(true);
         let mut warm = || call(&mut native, helper, 7, &[2, 0]).unwrap();
         warm();
         warm();
-        assert_eq!(call(&mut native, helper, 1 << 32, &[0, 0]), expected);
-        assert_eq!(super::super::declines(&native.ext), 1, "helper {helper}");
+        assert!(call(&mut native, helper, 1 << 32, &[0, 0]).is_err());
+        let fault = &native.sys.latest_cpu_fault.as_ref().unwrap().fault;
+        assert_eq!(fault.pc, expected);
+        assert_eq!(fault.kind, adv_cpu::backend::FaultKind::IntegerDivideByZero);
+        assert_eq!(super::super::declines(&native.ext), 0, "helper {helper}");
     }
 }
 
@@ -243,9 +251,11 @@ fn tvpgl_alpha_blend_matches_its_code() {
             2 => (-(case as i32 % 3)) as u32,
             _ => rng.below(64) as u32,
         };
-        let dest = BUF + 4 * rng.below(16) as u32 + u32::from(case % 7 == 0);
+        let dest = BUF + 128 + 4 * rng.below(16) as u32 + u32::from(case % 7 == 0);
         let src = match case % 5 {
             0 => dest,
+            1 => dest + 4,
+            2 => dest - 4,
             _ => BUF + 0x2000 + 4 * rng.below(16) as u32,
         };
         let pixels = pixels(&mut rng);
@@ -288,7 +298,12 @@ fn tvpgl_interp_stretch_copy_matches_its_code() {
             3 => rng.next() as u32,
             _ => rng.below(0x100) as u32,
         };
-        let dest = BUF + 4 * rng.below(64) as u32;
+        let dest = match case % 4 {
+            0 => src1 + 4,
+            1 => src1 - 4,
+            2 => src2 + 4,
+            _ => BUF + 4 * rng.below(64) as u32,
+        };
         let pixels = pixels(&mut rng);
         let args = [dest, len, src1, src2, blend_y, start, step];
         check_buffer(&mut machines, helper, &pixels, &args, false);
@@ -303,7 +318,6 @@ fn tvpgl_interp_stretch_copy_matches_its_code() {
 fn borland_copies_match_their_code() {
     let mut machines = [machine(true), machine(false)];
     let mut rng = Rng(0x5851_f42d_4c95_7f2d);
-    let mut overlapping_memcpy = 0;
     for name in ["borland!memcpy", "borland!memmove"] {
         let helper = index(name);
         for case in 0..200u32 {
@@ -318,16 +332,13 @@ fn borland_copies_match_their_code() {
                 2 => src + rng.below(u64::from(n) + 1) as u32,
                 _ => BUF + 0x800 + rng.below(0x400) as u32,
             };
-            overlapping_memcpy +=
-                u64::from(name == "borland!memcpy" && dest > src && dest - src < n);
             let bytes: Vec<u8> = (0..BUF_LEN).map(|_| rng.next() as u8).collect();
             check_buffer(&mut machines, helper, &bytes, &[dest, src, n], true);
         }
     }
     let [native, _] = &machines;
     assert!(native.sys.host_calls > 0);
-    // Each overlapping memcpy declines on both native calls.
-    assert_eq!(super::super::declines(&native.ext), 2 * overlapping_memcpy);
+    assert_eq!(super::super::declines(&native.ext), 0);
 }
 
 // spec: NAT-BODY-14
@@ -346,6 +357,8 @@ fn tvpgl_ps_alpha_blend_matches_its_code() {
         let src = BUF + 0x2000 + 4 * rng.below(16) as u32 + u32::from(case % 7 == 0);
         let dest = match case % 5 {
             0 => src,
+            1 => src + 4,
+            2 => src - 4,
             _ => BUF + 4 * rng.below(16) as u32,
         };
         let pixels = pixels(&mut rng);
@@ -382,4 +395,60 @@ fn tvpgl_fill_argb_matches_its_code() {
     let [native, _] = &machines;
     assert!(native.sys.host_calls > 0);
     assert_eq!(super::super::declines(&native.ext), 0);
+}
+
+// spec: NAT-BODY-14, NAT-BODY-16
+#[test]
+fn tvpgl_faults_at_entry() {
+    for name in [
+        "TVPAlphaBlend",
+        "TVPPsAlphaBlend",
+        "TVPFillARGB",
+        "TVPInterpStretchCopy",
+    ] {
+        let helper = index(&format!("kirikiri2!{name}"));
+        let mut m = machine(true);
+        let good = if name == "TVPFillARGB" {
+            vec![BUF, 1, 0]
+        } else if name == "TVPInterpStretchCopy" {
+            vec![BUF, 1, BUF + 16, BUF + 32, 128, 0, 0]
+        } else {
+            vec![BUF, BUF + 16, 1]
+        };
+        for _ in 0..2 {
+            call(&mut m, helper, 0, &good).unwrap();
+        }
+        let mut bad = good;
+        bad[0] = 0;
+        assert!(call(&mut m, helper, 0, &bad).is_err());
+        let fault = &m.sys.latest_cpu_fault.as_ref().unwrap().fault;
+        assert_eq!(
+            fault.pc,
+            HELPERS
+                + helpers()
+                    .iter()
+                    .take(helper)
+                    .map(|h| h.2.len() as u32)
+                    .sum::<u32>()
+        );
+        assert_eq!(fault.kind, adv_cpu::backend::FaultKind::Write(0));
+        assert_eq!(super::super::declines(&m.ext), 0);
+    }
+}
+
+// spec: NAT-BODY-14, NAT-BODY-16
+#[test]
+fn tvpgl_signed_address_traversal_matches_its_code() {
+    let mut machines = [machine(true), machine(false)];
+    let helper = index("kirikiri2!TVPPsAlphaBlend");
+    for m in &mut machines {
+        m.cpu.map(0x7ffff000, 0x1000, Prot::RW).unwrap();
+        m.cpu.write(0x7ffff000, &vec![0x71; 0x1000]).unwrap();
+    }
+    let mut rng = Rng(0x3290bafe);
+    for (src, len) in [(0x7ffffff8, 4), (0x7fffffe4, 12), (0x7fffffe8, 6)] {
+        let pixels = pixels(&mut rng);
+        check_buffer(&mut machines, helper, &pixels, &[BUF, src, len], false);
+    }
+    assert_eq!(super::super::declines(&machines[0].ext), 0);
 }

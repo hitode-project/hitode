@@ -5,6 +5,21 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 /// A caller-owned trap receiver. API decoding and all host continuation state
 /// belong to the machine and ABI layers, outside the execution layer.
 pub trait ExecutionTrap {
+    /// The body has committed its results and its return epilogue.
+    fn body_yield(&mut self, _state: &mut CpuState, _memory: &mut Memory) -> Result<bool, String> {
+        Ok(false)
+    }
+
+    /// Shared service storage retained by the execution owner for this run.
+    fn body_services(&self) -> crate::body::Services {
+        crate::body::Services::default()
+    }
+
+    /// Diagnostic modes affecting translated bindings; changes discard units.
+    fn diagnostics(&self) -> u8 {
+        0
+    }
+
     /// See [`crate::backend::TrapHandler::native_region`].
     fn native_region(&self, _pc: u32, _code: &[u8]) -> Vec<crate::native_region::NativeRegion> {
         Vec::new()
@@ -31,8 +46,18 @@ pub trait ExecutionTrap {
         None
     }
 
+    /// Additional code dependencies checked and watched with a redirection.
+    fn redirect_checks(&self, _pc: u32) -> &[(u32, Box<[u8]>)] {
+        &[]
+    }
+
     /// Required host services also replace their entry in interpreted runs.
     fn required_redirect(&self, _pc: u32) -> Option<(u32, &[u8])> {
+        None
+    }
+
+    /// See [`crate::backend::TrapHandler::direct_body`].
+    fn direct_body(&self, _pc: u32) -> Option<crate::body::DirectBody> {
         None
     }
 

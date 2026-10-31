@@ -8,6 +8,12 @@ use std::process::Command;
 const EXPORTS: &[&str] = &[
     "hitode_server_main",
     "hitode_server_key_state",
+    "hitode_server_keyboard_state",
+    "hitode_server_user",
+    "hitode_server_close_handle",
+    "hitode_server_file_position",
+    "hitode_server_sync_fd",
+    "hitode_server_file_kind",
     "server_dir",
     "master_socket_timeout",
     "flush_registry",
@@ -30,6 +36,13 @@ fn main() {
     for source in &mut sources {
         if source.file_name().is_some_and(|name| name == "queue.c") {
             *source = "c/queue.c".into();
+        } else if source.file_name().is_some_and(|name| name == "fd.c") {
+            *source = "c/fd.c".into();
+        } else if source
+            .file_name()
+            .is_some_and(|name| name == "inproc_sync.c")
+        {
+            *source = "c/inproc_sync.c".into();
         }
     }
     let mut server = cc::Build::new();

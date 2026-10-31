@@ -11,9 +11,11 @@
 //! the function would fault on. Required text services supply a complete handler
 //! and replace the entry in both execution modes, without a trampoline.
 //!
-//! Every crossing records host memory work; attached debugger sessions also keep
-//! durations and outliers. Immutable file inputs retain derived values by pinned
-//! identity, and temporary snapshots reuse execution-owner scratch.
+//! Direct bodies share their memory implementation between generated and full
+//! paths. Service bodies reach shared clock and file storage through BodyContext,
+//! without borrowing Sys or Ext. Diagnostics record host memory work; debugger
+//! sessions also keep durations and outliers. Immutable file inputs retain derived
+//! values by pinned identity, and temporary snapshots reuse execution-owner scratch.
 
 use std::collections::HashMap;
 
@@ -28,17 +30,16 @@ mod crt;
 mod dib;
 mod fonts;
 pub use fonts::FontFrontend;
-#[cfg(any(target_vendor = "apple", target_os = "android"))]
 mod input;
+pub use input::UserServices;
 mod linked;
 mod mixer;
 mod nls;
 mod own_calls;
 mod pixels;
 mod png;
+mod services;
 mod zlib;
-pub use png::{PngFilter, PngRows};
-pub use zlib::InflateFast;
 
 /// The module the bodies' thunks are registered under.
 pub const MODULE: &str = "hitode.native";
@@ -54,6 +55,72 @@ struct Body {
     body: Option<BodyFn>,
     /// Runs the function itself after the body declined.
     handler: adv_machine::Handler,
+    /// The body as generated code calls it directly (A64-CALL-2); `body`
+    /// is then unused.
+    direct: Option<adv_cpu::body::Body>,
+}
+
+#[cfg(any(target_vendor = "apple", target_os = "android"))]
+fn resume_input(env: &mut adv_machine::Env<'_>) -> adv_machine::Outcome {
+    let tid = crate::server::current_tid(env);
+    if let Ok(tid) = tid
+        && !adv_wineserver::has_queue(tid)
+    {
+        // All these Windows entries create a GUI queue on first use. The
+        // server request owns that cold allocation, outside the body.
+        let mut request = crate::protocol::GetMsgQueueRequest::default();
+        match crate::server::request(env, &mut request, &[], &mut []) {
+            Ok((reply, _)) if reply.header.error == 0 => {
+                let index = env.sys.thunks.get(env.thunk).f.data as usize;
+                let body = body_at(index).direct.unwrap();
+                return run_full(env, body, resume_original);
+            }
+            Ok((reply, _)) => return input_queue_error(env, reply.header.error),
+            Err(crate::status::Error::Status(status)) => return input_queue_error(env, status),
+            Err(error) => return crate::status::finish(Err(error)),
+        }
+    }
+    // Pending driver descriptors must reach the server before Wine reads QS_DRIVER.
+    crate::server::run(env);
+    resume_original(env)
+}
+
+#[cfg(any(target_vendor = "apple", target_os = "android"))]
+fn input_queue_error(env: &mut Env<'_>, status: u32) -> Outcome {
+    use adv_cpu::backend::GuestExt;
+    let convert = match env
+        .ext
+        .get::<crate::process::Ntdll>()
+        .export("RtlNtStatusToDosError")
+    {
+        Ok(convert) => convert,
+        Err(error) => return Outcome::Fail(error.to_string()),
+    };
+    Outcome::call(convert, [status], |env, error| {
+        match env.cpu.write_u32(env.ctx().teb + 0x34, error.value()) {
+            Ok(()) => Outcome::Return(0),
+            Err(error) => Outcome::Fail(error.to_string()),
+        }
+    })
+}
+
+#[cfg(any(target_vendor = "apple", target_os = "android"))]
+fn input_bodies() -> impl Iterator<Item = Body> {
+    [
+        ("win32u.dll!NtUserGetAsyncKeyState", 1, input::ASYNC_STATE),
+        ("win32u.dll!NtUserGetCursorPos", 1, input::CURSOR_POS),
+        ("win32u.dll!NtUserGetQueueStatus", 1, input::QUEUE_STATUS),
+        ("user32.dll!GetInputState", 0, input::INPUT_STATE),
+        ("win32u.dll!NtUserPeekMessage", 5, input::PEEK),
+    ]
+    .into_iter()
+    .map(|(name, argc, direct)| Body {
+        name: name.into(),
+        conv: adv_machine::Conv::Stdcall { argc },
+        body: None,
+        handler: resume_input,
+        direct: Some(direct),
+    })
 }
 
 /// Calls whose body declined, so that Wine's own code ran.
@@ -72,6 +139,7 @@ thread_local! {
 /// The shell's existing debugger lifetime, on the guest execution thread.
 pub fn debugger_attached(attached: bool) {
     DEBUGGER_ATTACHED.set(attached);
+    adv_machine::debugger_attached(attached);
 }
 
 #[derive(Clone, Copy, Default)]
@@ -241,84 +309,67 @@ static BODIES: std::sync::LazyLock<Vec<Body>> = std::sync::LazyLock::new(|| {
         Body {
             name: "ntdll.dll!memcpy".into(),
             conv: Conv::Cdecl { argc: 3 },
-            body: Some(memmove),
+            body: None,
             handler: resume_original,
+            direct: Some(crt::MEMMOVE),
         },
         Body {
             name: "dsound.dll!DSOUND_MixToPrimary".into(),
-            conv: Conv::Cdecl { argc: 6 },
-            body: Some(mixer::mix),
-            handler: mixer::resume,
+            conv: Conv::Cdecl { argc: 1 },
+            body: None,
+            handler: mixer::mix,
+            direct: None,
         },
         Body {
             name: "ntdll.dll!NtQueryPerformanceCounter".into(),
             conv: Conv::Stdcall { argc: 2 },
-            body: Some(query_performance_counter),
+            body: None,
             handler: resume_original,
+            direct: Some(services::NT_COUNTER),
+        },
+        Body {
+            name: "ntdll.dll!RtlQueryPerformanceCounter".into(),
+            conv: Conv::Stdcall { argc: 1 },
+            body: None,
+            handler: resume_original,
+            direct: Some(services::COUNTER),
+        },
+        Body {
+            name: "kernelbase.dll!QueryPerformanceCounter".into(),
+            conv: Conv::Stdcall { argc: 1 },
+            body: None,
+            handler: resume_original,
+            direct: Some(services::COUNTER),
         },
         #[cfg(any(target_vendor = "apple", target_os = "android"))]
         Body {
             name: "win32u.dll!NtUserGetKeyState".into(),
             conv: Conv::Stdcall { argc: 1 },
-            body: Some(input::key_state),
+            body: None,
             handler: resume_original,
+            direct: Some(input::KEY_STATE),
         },
+        #[cfg(any(target_vendor = "apple", target_os = "android"))]
         Body {
-            name: "kernelbase.dll!MultiByteToWideChar".into(),
-            conv: Conv::Stdcall { argc: 6 },
-            body: Some(nls::multi_byte_to_wide_char),
+            name: "win32u.dll!NtUserGetKeyboardState".into(),
+            conv: Conv::Stdcall { argc: 1 },
+            body: None,
             handler: resume_original,
-        },
-        Body {
-            name: "kernelbase.dll!WideCharToMultiByte".into(),
-            conv: Conv::Stdcall { argc: 8 },
-            body: Some(nls::wide_char_to_multi_byte),
-            handler: resume_original,
-        },
-        Body {
-            name: "ntdll.dll!RtlMultiByteToUnicodeN".into(),
-            conv: Conv::Stdcall { argc: 5 },
-            body: Some(nls::rtl_multi_byte_to_unicode_n),
-            handler: resume_original,
-        },
-        Body {
-            name: "ntdll.dll!RtlUnicodeToMultiByteN".into(),
-            conv: Conv::Stdcall { argc: 5 },
-            body: Some(nls::rtl_unicode_to_multi_byte_n),
-            handler: resume_original,
-        },
-        Body {
-            name: "ntdll.dll!RtlMultiByteToUnicodeSize".into(),
-            conv: Conv::Stdcall { argc: 3 },
-            body: Some(nls::rtl_multi_byte_to_unicode_size),
-            handler: resume_original,
-        },
-        Body {
-            name: "ntdll.dll!RtlUnicodeToMultiByteSize".into(),
-            conv: Conv::Stdcall { argc: 3 },
-            body: Some(nls::rtl_unicode_to_multi_byte_size),
-            handler: resume_original,
-        },
-        Body {
-            name: "ntdll.dll!RtlOemToUnicodeN".into(),
-            conv: Conv::Stdcall { argc: 5 },
-            body: Some(nls::rtl_oem_to_unicode_n),
-            handler: resume_original,
-        },
-        Body {
-            name: "ntdll.dll!RtlUnicodeToOemN".into(),
-            conv: Conv::Stdcall { argc: 5 },
-            body: Some(nls::rtl_unicode_to_oem_n),
-            handler: resume_original,
+            direct: Some(input::KEYBOARD_STATE),
         },
     ];
     bodies.extend(crt::bodies());
+    bodies.extend(nls::bodies());
+    bodies.extend(services::bodies());
+    #[cfg(any(target_vendor = "apple", target_os = "android"))]
+    bodies.extend(input_bodies());
     for version in 24..=43 {
         bodies.push(Body {
             name: format!("d3dx9_{version}.dll!d3dx_load_pixels_from_pixels").into(),
             conv: Conv::Cdecl { argc: 6 },
-            body: Some(pixels::load),
+            body: None,
             handler: resume_original,
+            direct: Some(pixels::LOAD),
         });
     }
     bodies.extend(png::bodies());
@@ -366,6 +417,7 @@ fn run(env: &mut Env<'_>) -> Outcome {
 }
 
 fn run_body(env: &mut Env<'_>, index: usize, body: &'static Body) -> Outcome {
+    let diagnostics = env.sys.diagnostics() != 0;
     let timed = DEBUGGER_ATTACHED.get();
     let arguments = if timed {
         std::array::from_fn(|i| {
@@ -378,33 +430,156 @@ fn run_body(env: &mut Env<'_>, index: usize, body: &'static Body) -> Outcome {
     } else {
         [0; 6]
     };
-    let before = env.cpu.host_access();
+    let before = diagnostics.then(|| env.cpu.host_access());
     let start = timed.then(std::time::Instant::now);
-    let result = match body.body {
-        Some(run) => run(env).map(Outcome::Return64),
-        None => Some((body.handler)(env)),
+    let declined_before = diagnostics.then(|| declines(env.ext));
+    let result = if let Some(direct) = body.direct {
+        Some(run_full(env, direct, body.handler))
+    } else {
+        match body.body {
+            Some(run) => run(env).map(Outcome::Return64),
+            None => Some((body.handler)(env)),
+        }
     };
+    let declined =
+        result.is_none() || declined_before.is_some_and(|before| declines(env.ext) != before);
     let elapsed = start.map(|start| start.elapsed());
-    let access = access_delta(env.cpu.host_access(), before);
+    let access = before.map(|before| access_delta(env.cpu.host_access(), before));
     #[cfg(any(debug_assertions, test))]
     assert!(
-        result.is_some() || access.writes == 0,
+        result.is_some() || access.is_none_or(|access| access.writes == 0),
         "{} declined after guest writes (NAT-BODY-1)",
         body.name
     );
-    env.ext.get_or_default::<Boundary>().record(
-        index,
-        result.is_none(),
-        access,
-        elapsed,
-        arguments,
-    );
+    if let Some(access) = access {
+        env.ext
+            .get_or_default::<Boundary>()
+            .record(index, declined, access, elapsed, arguments);
+    }
     match result {
         Some(outcome) => outcome,
         None => {
             env.ext.get_or_default::<Declines>().0 += 1;
             (body.handler)(env)
         }
+    }
+}
+
+/// What the full path of direct bodies reuses.
+#[derive(Default)]
+struct FullScratch(adv_cpu::body::Scratch);
+
+/// Each bound direct body's entry and inputs, reached by thunk index.
+#[derive(Default)]
+struct Entries(Vec<Option<(u32, adv_cpu::body::DirectBody)>>);
+impl Entries {
+    fn insert(&mut self, thunk: u32, entry: u32, direct: adv_cpu::body::DirectBody) {
+        if self.0.len() <= thunk as usize {
+            self.0.resize(thunk as usize + 1, None);
+        }
+        self.0[thunk as usize] = Some((entry, direct));
+    }
+}
+
+/// A direct body on the full path, which completes every access a guest
+/// instruction would and raises the guest's fault where it would fault.
+fn run_full(
+    env: &mut Env<'_>,
+    body: adv_cpu::body::Body,
+    handler: adv_machine::Handler,
+) -> Outcome {
+    use adv_cpu::backend::{Fault, FaultKind, Reg};
+    use adv_cpu::body::{EAX, ECX, EDX, GuestMem, Input, Stop};
+    let bound = env
+        .ext
+        .get_or_default::<Entries>()
+        .0
+        .get(env.thunk as usize)
+        .copied()
+        .flatten();
+    let direct = bound.map_or(body.direct, |(_, direct)| direct);
+    if let Some((entry, _)) = bound
+        && !env.sys.direct_bodies.contains_key(&entry)
+        && pixels::bind_call(env.cpu, env.sys, env.ext, entry, direct).is_none()
+    {
+        env.sys.redirects.remove(&entry);
+        return resume_original(env);
+    }
+    let inputs = std::array::from_fn(|n| match direct.inputs[n] {
+        Some(Input::Stack(k)) => env.arg(u32::from(k)),
+        Some(Input::Const(value)) => value,
+        Some(Input::Args) => env.cpu.reg(Reg::Esp).wrapping_add(4),
+        Some(Input::Teb) => env.ctx().teb,
+        Some(Input::Eax) => env.cpu.reg(Reg::Eax),
+        Some(Input::Ecx) => env.cpu.reg(Reg::Ecx),
+        Some(Input::Edx) => env.cpu.reg(Reg::Edx),
+        Some(Input::Mxcsr) => {
+            env.cpu
+                .fpu_environment()
+                .expect("body CPU has SSE controls")
+                .mxcsr
+        }
+        Some(Input::FloatControl) => {
+            let control = env
+                .cpu
+                .fpu_environment()
+                .expect("body CPU has floating controls");
+            control.mxcsr | u32::from(control.x87_control) << 16
+        }
+        None => 0,
+    });
+    let mut scratch = std::mem::take(&mut env.ext.get_or_default::<FullScratch>().0);
+    let services = env.sys.services(env.ext);
+    let result = (body.full)(
+        &mut GuestMem::for_body(env.cpu, &mut scratch, services),
+        inputs,
+    );
+    env.ext.get_or_default::<FullScratch>().0 = scratch;
+    let outputs = body.direct.outputs;
+    match result {
+        Ok(ret) => {
+            if outputs & ECX != 0 {
+                env.cpu.set_reg(Reg::Ecx, ret.ecx);
+            }
+            let outcome = if outputs & EDX != 0 {
+                Outcome::Return64(ret.value)
+            } else {
+                Outcome::Return(if outputs & EAX != 0 {
+                    ret.value as u32
+                } else {
+                    env.cpu.reg(Reg::Eax)
+                })
+            };
+            if ret.yield_now {
+                Outcome::block(adv_machine::Wait::Yield, move |_, _| outcome)
+            } else {
+                outcome
+            }
+        }
+        Err(stop @ (Stop::Fault { .. } | Stop::DivideByZero | Stop::Trap(_))) => {
+            let Some((pc, _)) = bound else {
+                return Outcome::Fail("direct body without an entry".into());
+            };
+            let kind = match stop {
+                Stop::Fault {
+                    address,
+                    write: true,
+                } => FaultKind::Write(address),
+                Stop::Fault {
+                    address,
+                    write: false,
+                } => FaultKind::Read(address),
+                Stop::DivideByZero => FaultKind::IntegerDivideByZero,
+                Stop::Trap(vector) => FaultKind::Trap(vector),
+                _ => unreachable!(),
+            };
+            Outcome::Raise(Fault { kind, pc })
+        }
+        Err(Stop::Guest) => {
+            env.ext.get_or_default::<Declines>().0 += 1;
+            (handler)(env)
+        }
+        Err(Stop::Slow) => Outcome::Fail("the full path left a direct body".into()),
     }
 }
 
@@ -434,8 +609,8 @@ pub(crate) fn bind(cpu: &mut dyn Guest, sys: &mut Sys, ext: &mut Ext, base: u32,
     }
     let mut relocations = pe.relocations().unwrap_or_default();
     relocations.sort_unstable();
-    bind_relocated(cpu, sys, ext, base, &relocations);
     pixels::prepare(cpu, ext, base, pe, &relocations);
+    bind_relocated(cpu, sys, ext, base, &relocations);
 }
 
 pub(crate) fn bind_relocated(
@@ -445,6 +620,19 @@ pub(crate) fn bind_relocated(
     base: u32,
     relocations: &[u32],
 ) {
+    sys.body_services = Some(|sys, ext, services| {
+        #[cfg(any(target_vendor = "apple", target_os = "android"))]
+        if let Some(user) = ext.try_get::<UserServices>() {
+            services.user_state = std::rc::Rc::as_ptr(&user.0).cast();
+        }
+
+        if let Some(link) = ext.try_get::<crate::server::Link>() {
+            services.thread = link.known_tid(sys.current).unwrap_or(0);
+            services.state = std::rc::Rc::as_ptr(&link.files).cast();
+        } else {
+            services.thread = 0;
+        }
+    });
     let Some(module) = ext
         .try_get::<Images>()
         .and_then(|images| images.0.get(&base))
@@ -480,6 +668,13 @@ pub(crate) fn bind_relocated(
     let text = ext.try_get::<FontFrontend>().is_some();
     let bodies = BODIES.iter().chain(dib::BODIES);
     for body in bodies.chain(fonts::BODIES.iter().filter(|_| text)) {
+        #[cfg(any(target_vendor = "apple", target_os = "android"))]
+        if input_bodies().any(|candidate| candidate.name == body.name)
+            && ext.try_get::<UserServices>().is_none()
+        {
+            continue;
+        }
+
         let Some(name) = body
             .name
             .strip_prefix(module.name.as_str())
@@ -551,12 +746,52 @@ fn bind_one(
         .by_thunk
         .insert(index, at);
     let target = if name == "dsound.dll!DSOUND_MixToPrimary" {
-        mixer::entry(cpu, sys, thunk)?
-    } else if name.starts_with("win32u.so!halftone_") {
-        dib::entry(cpu, sys, thunk)?
+        mixer::prepare(cpu, sys, ext, entry)?;
+        thunk
     } else {
         thunk
     };
+    let body_name = name.split_once('@').map_or(name, |(body, _)| body);
+    if let Some(body) = bodies()
+        .find(|body| body.name == body_name)
+        .and_then(|body| body.direct)
+    {
+        let mut direct = body.direct;
+        if let Some(bind) = body.bind {
+            direct.inputs = bind(cpu, entry, &original)?;
+        }
+        if name.starts_with("kernelbase.dll!CompareString")
+            || name.starts_with("kernelbase.dll!lstrcmp")
+        {
+            direct.inputs[2] = Some(adv_cpu::body::Input::Const(
+                ext.get::<Images>().containing(entry).unwrap().base,
+            ));
+            direct.inputs[3] = Some(adv_cpu::body::Input::Const(
+                ext.get::<Images>()
+                    .0
+                    .values()
+                    .find(|image| image.name == "ntdll.dll")
+                    .unwrap()
+                    .base,
+            ));
+        }
+        if name.starts_with("win32u.so!") {
+            if let Some(image) = ext
+                .try_get::<Images>()
+                .and_then(|images| images.containing(entry))
+                && direct.inputs[6] == Some(adv_cpu::body::Input::Const(0))
+            {
+                direct.inputs[6] = Some(adv_cpu::body::Input::Const(image.base));
+            }
+            if name.starts_with("win32u.so!halftone_") {
+                direct.inputs[4] = Some(adv_cpu::body::Input::Mxcsr);
+            }
+        }
+        if !name.starts_with("d3dx9_") {
+            sys.direct_bodies.insert(entry, direct);
+        }
+        ext.get_or_default::<Entries>().insert(index, entry, direct);
+    }
     sys.redirects.insert(entry, (target, original.into()));
     Ok(())
 }
@@ -605,40 +840,6 @@ fn resume_original(env: &mut Env<'_>) -> Outcome {
         }
         Err(error) => Outcome::Fail(error.to_string()),
     }
-}
-
-/// memmove(dst, src, n): EAX and EDX are `dst`, as Wine's code leaves them.
-fn memmove(env: &mut Env<'_>) -> Option<u64> {
-    let (dst, src, n) = (env.arg(0), env.arg(1), env.arg(2));
-    if n != 0 {
-        env.cpu.copy_memory(src, dst, n as usize).ok()?;
-    }
-    Some(u64::from(dst) << 32 | u64::from(dst))
-}
-
-// spec: NAT-BODY-2
-fn query_performance_counter(env: &mut Env<'_>) -> Option<u64> {
-    let (counter, frequency) = (env.arg(0), env.arg(1));
-    if counter == 0
-        || !env.cpu.accessible(counter, 8, Prot::WRITE)
-        || (frequency != 0 && !env.cpu.accessible(frequency, 8, Prot::WRITE))
-    {
-        return None;
-    }
-    // The syscall boundary's system-time reads advance the virtual clock.
-    if env.sys.clock.is_virtual() {
-        crate::kuser::refresh(env);
-        crate::server::set_time(env);
-    }
-    let ticks = crate::system::performance_counter(env);
-    env.cpu.write(counter, &ticks.to_le_bytes()).ok()?;
-    if frequency != 0 {
-        env.cpu
-            .write(frequency, &crate::system::TICKS_PER_SECOND.to_le_bytes())
-            .ok()?;
-    }
-    env.sys.poll_observation();
-    Some(u64::from(crate::status::SUCCESS))
 }
 
 #[cfg(test)]

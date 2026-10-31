@@ -896,6 +896,52 @@ fn explicit_directories_discover_fixture_faces_without_host_font_dependencies() 
     assert_eq!(restored.data, before.data);
 }
 
+// spec: DEV-FONT-6
+#[test]
+fn windows_fonts_fill_only_families_the_host_lacks() {
+    let host = FixtureDirectory::new();
+    let windows = FixtureDirectory::new();
+    // The same family with a taller cell, and a family the host lacks.
+    std::fs::write(windows.0.join("single.ttf"), LEGACY).unwrap();
+    std::fs::write(
+        windows.0.join("collection.ttc"),
+        include_bytes!("fixtures/font-resource-japanese.ttf"),
+    )
+    .unwrap();
+    let mut plain = Text::with_font_directories(std::slice::from_ref(&host.0));
+    let mut layered =
+        Text::with_font_directories(std::slice::from_ref(&host.0)).with_windows_fonts(&windows.0);
+    let request = font("ADV Resource Fixture");
+    assert_eq!(
+        layered.metrics(&request).unwrap(),
+        plain.metrics(&request).unwrap()
+    );
+    let names = |text: &Text| {
+        installed(text.enumerate(None, FontEnumeration::Families).unwrap())
+            .into_iter()
+            .map(|entry| entry.font.face)
+            .collect::<BTreeSet<_>>()
+    };
+    let added: Vec<_> = names(&layered)
+        .difference(&names(&plain))
+        .cloned()
+        .collect();
+    assert_eq!(added, ["ADV Japanese Fixture"]);
+    let japanese = font("ADV Japanese Fixture");
+    assert!(
+        plain
+            .resolved_character(&japanese, 0x3042)
+            .unwrap()
+            .default_glyph
+    );
+    assert!(
+        !layered
+            .resolved_character(&japanese, 0x3042)
+            .unwrap()
+            .default_glyph
+    );
+}
+
 /// Tests may execute on another host than the compiler (notably Android).
 /// Materialize the authored input on that host and retire only our own files.
 struct FixtureDirectory(PathBuf);

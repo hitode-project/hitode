@@ -27,6 +27,8 @@ These terms have one meaning across the docs, specs, code comments and reports. 
 | soft page | 软页 | A host page protected more strictly than the 4 KiB permission table says, for mixed permissions, translated code, shared audio memory or first file access. Accesses fault and are emulated, and hot access sites are translated again as checked accesses. |
 | biased ESP / EBP | 偏置 ESP／EBP | In a64, x23 and x24 hold the window base plus ESP and EBP. The window is 4 GiB aligned, so the low 32 bits are the guest value. |
 | carry sense | 进位感 | How a64 maps the ARM C flag to x86 CF: add sense means C equals CF, subtract sense means C is the inverse of CF. Block boundaries use subtract sense. |
+| direct body | 直接 body | A native body that generated code and the interpreter call as an AAPCS64 leaf function, without the `call` stub or guest state synchronization; see A64-CALL-2. |
+| service body | 服务 body | A direct body that MAY change host state, such as server objects, queues and file positions, without reading guest registers or scheduling threads; see NAT-BODY-18. |
 | direct host call | 直接宿主调用 | A recognized API thunk that an a64 unit calls through the `call` stub, running the ordinary handler with full guest state and continuing in the unit when it returns; see A64-CTL-12. |
 | shadow return stack | 影子返回栈 | The a64 stack of `{host continuation, guest return EIP}` pairs for each guest thread or fiber. A guest call uses BL, and a checked return uses RET so the hardware predicts it. |
 | TXM | TXM | The iOS mechanism, from iOS 26 on A15 and later, in which hardware supervises executable pages. A third-party app can execute only memory that a debugger has allowed. |

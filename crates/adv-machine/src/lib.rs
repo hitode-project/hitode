@@ -29,6 +29,7 @@ pub mod process;
 pub mod sched;
 pub mod schedule_trace;
 pub mod scheduling;
+pub mod service;
 #[cfg(test)]
 mod spawn_tests;
 pub mod stats;
@@ -81,14 +82,23 @@ fn allocate_tls_block(vm: &mut Vm, cpu: &mut dyn Guest, image: &TlsImage) -> Res
 
 type ProcessPrepare = fn(&mut dyn Guest, &mut Sys, &mut Ext) -> Result<(), MemFault>;
 
+thread_local! {
+    static DEBUGGER_ATTACHED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The debugger lifetime on the execution owner.
+pub fn debugger_attached(attached: bool) {
+    DEBUGGER_ATTACHED.set(attached);
+}
+
 /// Host-side machine state shared by all handlers.
 pub struct Sys {
     pub clock: Clock,
+    /// Personality service storage and server thread identity for direct bodies.
+    pub body_services: Option<fn(&Sys, &Ext, &mut adv_cpu::body::Services)>,
     /// Shared execution wake for input, server, media, I/O and APC deliveries.
     pub poll_wake: Option<adv_sync::WakeEvent>,
     poll_observed: bool,
-    /// Productive calls invalidate the round even when their context then blocks.
-    poll_activity: u64,
     /// Explicit arguments exist only while a host invocation or its continuation runs.
     invocation_arguments: Option<invocation::Arguments>,
     /// Real time: reusable scheduler slot where round-robin resumes after a host return.
@@ -157,8 +167,13 @@ pub struct Sys {
     /// entry, with the bytes the function begins with
     /// ([`adv_cpu::backend::TrapHandler::redirect`]).
     pub redirects: HashMap<u32, (u32, Box<[u8]>)>,
+    /// Additional helper code checked and watched with each redirect.
+    pub redirect_checks: HashMap<u32, Vec<adv_cpu::backend::CodeCheck>>,
     /// Entries supplied by required host services in both execution modes.
     pub required_redirects: std::collections::HashSet<u32>,
+    /// Redirected entries that generated code calls a body for directly
+    /// (A64-CALL-2); the redirect's thunk runs the same body on the full path.
+    pub direct_bodies: HashMap<u32, adv_cpu::body::DirectBody>,
     /// Stop with an error after this many host calls (a debugging aid for guest loops that
     /// never block).
     pub call_limit: Option<u64>,
@@ -252,6 +267,59 @@ impl Env<'_> {
 }
 
 impl Sys {
+    /// Bind a complete body to a published host thunk and its copied entries.
+    /// The registered handler remains the full path.
+    pub fn bind_thunk_body(&mut self, index: u32, body: adv_cpu::body::DirectBody) {
+        let at = layout::thunk_addr(index);
+        let skip = if self.thunks.get(index).guest_slot.is_some() {
+            12
+        } else {
+            6
+        };
+        self.redirects
+            .insert(at, (at + skip, self.thunks.pristine_entry(index).into()));
+        self.direct_bodies.insert(at, body);
+    }
+
+    pub fn services(&self, ext: &Ext) -> adv_cpu::body::Services {
+        let mut services = adv_cpu::body::Services {
+            clock: self.clock.body_pointer(),
+            context: self.current,
+            thread_state: self
+                .contexts
+                .get(self.current as usize)
+                .map_or(std::ptr::null(), |ctx| {
+                    std::rc::Rc::as_ptr(&ctx.services).cast()
+                }),
+            epoch_us: self.clock.epoch_us,
+            thread: self
+                .contexts
+                .get(self.current as usize)
+                .map_or(0, |c| c.tid),
+            teb: self
+                .contexts
+                .get(self.current as usize)
+                .map_or(0, |c| c.teb),
+            ..Default::default()
+        };
+        if let Some(prepare) = self.body_services {
+            prepare(self, ext, &mut services);
+        }
+        services
+    }
+
+    /// Modes that require host-call observations (EXEC-CALL-1).
+    pub fn diagnostics(&self) -> u8 {
+        u8::from(DEBUGGER_ATTACHED.get())
+            | (u8::from(self.trace.enabled()) << 1)
+            | (u8::from(
+                self.stats.enabled
+                    || self.stats.services_enabled
+                    || self.stats.frame_budget.is_some(),
+            ) << 2)
+            | (u8::from(self.call_limit.is_some()) << 3)
+    }
+
     /// Assign a distinct process identity before creating any guest context.
     pub fn set_process_identity(&mut self, pid: u32) -> Result<(), &'static str> {
         if !self.contexts.is_empty() || pid > u32::MAX - 0x1000 {
@@ -409,6 +477,7 @@ impl Sys {
             exact_deadline: false,
             spin: Default::default(),
             progress: Default::default(),
+            services: Default::default(),
             poll_peek_depth: 0,
             thread_handle,
             wait_objects: Vec::new(),
@@ -1059,13 +1128,13 @@ impl Sys {
 
     /// A guest callback or nonempty peek invalidates an enclosing observation.
     pub fn poll_work(&mut self) {
-        self.poll_activity = self.poll_activity.wrapping_add(1);
+        self.clock.work();
         self.contexts[self.current as usize].progress.new_work();
     }
 
     fn poll_generation(&self) -> (u64, u64, Option<u64>) {
         (
-            self.poll_activity,
+            self.clock.activity(),
             self.objects.generation(),
             self.poll_wake.as_ref().map(|wake| wake.generation()),
         )
@@ -1196,6 +1265,9 @@ enum Parked {
     HostYield {
         resume_eip: u32,
     },
+    ServiceYield {
+        resume_eip: u32,
+    },
     Deferred {
         then: outcome::DeferredContinuation,
         origin: Origin,
@@ -1210,6 +1282,8 @@ enum Parked {
     ExitProcess(u32),
     Fail(String),
     Exception(u8),
+    /// A host call raised this fault at the function's entry.
+    Raise(adv_cpu::backend::Fault),
 }
 
 /// Apply a handler's outcome to the guest. `Err` means the context must park.
@@ -1330,6 +1404,13 @@ fn apply(
             Ok(())
         }
         Outcome::ResumeExecution(checkpoint) => checkpoint.restore(cpu, sys).map_err(Parked::Fail),
+        // As if the function's first instruction faulted: the return
+        // address on the stack, the guest's handlers above it.
+        Outcome::Raise(fault) => {
+            cpu.set_reg(Reg::Esp, origin.esp);
+            cpu.set_reg(Reg::Eip, fault.pc);
+            Err(Parked::Raise(fault))
+        }
         Outcome::ReturnFromCall(value) => {
             let context = sys.current as usize;
             if sys.contexts[context]
@@ -1626,11 +1707,12 @@ impl Dispatch<'_> {
     }
 
     fn host_call(&mut self, cpu: &mut dyn Guest, index: u32) -> Result<(), Parked> {
-        if self.sys.thunks.get(index).audio {
+        let binding = self.sys.thunks.get(index);
+        let (audio, f) = (binding.audio, binding.f);
+        if audio {
             self.sys.contexts[self.sys.current as usize].audio_call_us =
                 Some(self.sys.clock.now_us());
         }
-        let f = self.sys.thunks.get(index).f;
         let esp = cpu.reg(Reg::Esp);
         self.unwind_escaped(cpu, |frame| esp >= frame.stack, "callback")?;
         let trace_args = (self.sys.trace.enabled() && (f.trace || self.sys.trace.all)).then(|| {
@@ -1645,9 +1727,11 @@ impl Dispatch<'_> {
             trace_args,
             interrupted: false,
         };
-        self.sys
-            .recent
-            .push(self.sys.current, index, cpu.read_u32(esp).unwrap_or(0));
+        if self.sys.diagnostics() != 0 {
+            self.sys
+                .recent
+                .push(self.sys.current, index, cpu.read_u32(esp).unwrap_or(0));
+        }
         self.sys.host_calls += 1;
         self.sys.stats.total.host_calls += 1;
         if self
@@ -1676,7 +1760,7 @@ impl Dispatch<'_> {
         let observation = observed || context.poll_peek_depth != 0;
         context.progress.call(index, observation);
         if !observation {
-            self.sys.poll_activity = self.sys.poll_activity.wrapping_add(1);
+            self.sys.clock.work();
         }
         let r = apply(cpu, self.sys, self.ext, out, origin, self.defer_work);
         self.sys.stats.host(t0, index, true, &self.sys.thunks);
@@ -1701,6 +1785,10 @@ impl Dispatch<'_> {
                 TrapAction::Park
             }
             Ok(()) => TrapAction::Continue,
+            Err(Parked::Raise(fault)) => {
+                let res = self.exception(cpu, exception::Exception::Fault(fault));
+                self.action(cpu, res, frame_before)
+            }
             Err(p) => {
                 self.parked = Some(p);
                 TrapAction::Park
@@ -1750,6 +1838,21 @@ impl Dispatch<'_> {
 }
 
 impl TrapHandler for Dispatch<'_> {
+    fn on_body_yield(&mut self, cpu: &mut dyn Guest) -> TrapAction {
+        self.parked = Some(Parked::ServiceYield {
+            resume_eip: cpu.reg(Reg::Eip),
+        });
+        TrapAction::Park
+    }
+
+    fn body_services(&self) -> adv_cpu::body::Services {
+        self.sys.services(self.ext)
+    }
+
+    fn diagnostics(&self) -> u8 {
+        self.sys.diagnostics()
+    }
+
     fn native_region(&self, pc: u32, code: &[u8]) -> Vec<adv_cpu::native_region::NativeRegion> {
         if !self.sys.required_redirects.contains(&pc)
             && (self.sys.trace.enabled() || self.sys.call_limit.is_some())
@@ -1785,6 +1888,17 @@ impl TrapHandler for Dispatch<'_> {
         }
         let (target, original) = self.sys.redirects.get(&pc)?;
         Some((*target, original))
+    }
+
+    fn redirect_checks(&self, pc: u32) -> &[(u32, Box<[u8]>)] {
+        self.sys.redirect_checks.get(&pc).map_or(&[], Vec::as_slice)
+    }
+
+    fn direct_body(&self, pc: u32) -> Option<adv_cpu::body::DirectBody> {
+        if self.sys.diagnostics() != 0 {
+            return None;
+        }
+        self.sys.direct_bodies.get(&pc).copied()
     }
 
     fn required_redirect(&self, pc: u32) -> Option<(u32, &[u8])> {
@@ -1959,9 +2073,9 @@ impl<B: Backend> Machine<B> {
         }
         let sys = Sys {
             clock,
+            body_services: None,
             poll_wake: None,
             poll_observed: false,
-            poll_activity: 0,
             invocation_arguments: None,
             trace: Trace::default(),
             thunks,
@@ -1999,7 +2113,9 @@ impl<B: Backend> Machine<B> {
             recent: RecentCalls::new(256),
             host_calls: 0,
             redirects: HashMap::new(),
+            redirect_checks: Default::default(),
             required_redirects: Default::default(),
+            direct_bodies: HashMap::new(),
             call_limit: None,
             stats: Stats::new(),
             schedule_trace: schedule_trace::ScheduleTrace::default(),
@@ -2301,15 +2417,27 @@ impl<B: Backend> Machine<B> {
 
     /// Record why the current context parked. `Some` ends the run.
     fn park(&mut self, p: Parked) -> Option<RunResult> {
+        // Only a host call's own outcome raises: `Dispatch::action` takes it.
+        let p = match p {
+            Parked::Raise(fault) => Parked::Fail(format!("a continuation raised {fault:?}")),
+            p => p,
+        };
         let id = self.sys.current;
         let ctx = &mut self.sys.contexts[id as usize];
         match p {
+            Parked::Raise(_) => unreachable!("made a failure above"),
             Parked::HostRequest { then, origin } => {
                 ctx.state = State::Ready {
                     resume: Some(ReadyResume::Deferred { then, origin }),
                 };
                 ctx.yielded = false;
                 return Some(RunResult::HostRequest);
+            }
+            Parked::ServiceYield { resume_eip } => {
+                self.cpu.set_reg(Reg::Eip, resume_eip);
+                ctx.yielded = true;
+                ctx.progress.yielded(resume_eip);
+                self.sys.schedule_trace.event("yield", id, 0, 0, 0);
             }
             Parked::HostYield { resume_eip } => {
                 // Both current backends park by replacing EIP with PARK_ADDR.
@@ -2841,6 +2969,9 @@ impl<B: Backend> Machine<B> {
             let retired = self.cpu.retired_instructions() - retired_before;
             if let Some(c) = self.sys.contexts.get_mut(id as usize) {
                 c.spin.ran(run_elapsed);
+                if c.services.new_work.replace(false) {
+                    c.progress.new_work();
+                }
                 c.progress.ran(retired);
             }
             if self.sys.schedule_trace.enabled() {

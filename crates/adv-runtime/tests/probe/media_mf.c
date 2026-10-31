@@ -1,4 +1,4 @@
-/* i686-w64-mingw32-gcc -mcrtdll=msvcrt-os -O2 media_mf.c -o media_mf.exe -lmfreadwrite -lmfplat -lmfuuid -lole32 -luuid */
+/* Build: i686-w64-mingw32-gcc -mcrtdll=msvcrt-os -O2 media_mf.c -o media_mf.exe -lmfreadwrite -lmfplat -lmfuuid -lole32 -luuid */
 #define COBJMACROS
 #include <windows.h>
 #include <mfapi.h>

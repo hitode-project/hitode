@@ -102,6 +102,13 @@ pub enum Op {
     Cdq,
     Push(Src),
     Pop(u8),
+    PopMemory(Mem),
+    PushFlags(u8),
+    PopFlags(u8, u8),
+    Stack(Mnemonic, Part, u8, u8),
+    Lahf,
+    Timestamp,
+    Syscall,
     Leave,
     Jmp(u32),
     Call(u32),
@@ -134,11 +141,13 @@ pub enum Op {
     X87(super::x87::X87),
     /// An exact signed 64-bit integer load into the extended x87 stack.
     Fild64(Mem, u8, Option<u16>),
-    /// An integer instruction an operation helper runs (A64-TR-4).
-    Apply(super::apply::Apply),
+    /// A native integer instruction over partial operands (A64-TR-4).
+    Parts(super::parts::Parts),
     /// Anything else the interpreter runs without transferring control:
     /// the `interpret` stub runs it, by its index in the trace's helpers.
     Helper(u8),
+    /// A direct body call, by its index in the trace's bodies (A64-CALL-2).
+    Body(u8),
 }
 
 fn gpr32(register: Register) -> Option<u8> {
@@ -146,22 +155,29 @@ fn gpr32(register: Register) -> Option<u8> {
 }
 
 pub(super) fn memory(instruction: &Instruction) -> Option<Mem> {
-    // CS, DS, SS and ES are flat; FS has the thread's base, and GS is left
-    // to the interpreter.
+    // The flat execution profile gives every segment except FS a zero base.
     let fs = match instruction.segment_prefix() {
         Register::FS => true,
-        Register::GS => return None,
+        Register::GS => false,
         _ => false,
     };
     let register = |register| match register {
         Register::None => Some(None),
+        register if register.is_gpr16() => Some(Some(register.number() as u8)),
         register => gpr32(register).map(Some),
     };
     Some(Mem {
         base: register(instruction.memory_base())?,
         index: register(instruction.memory_index())?,
         scale: instruction.memory_index_scale(),
-        address_bits: 32,
+        address_bits: if instruction.memory_base().is_gpr16()
+            || instruction.memory_index().is_gpr16()
+            || instruction.memory_displ_size() == 2
+        {
+            16
+        } else {
+            32
+        },
         disp: instruction.memory_displacement32(),
         fs,
     })
@@ -318,9 +334,7 @@ pub fn plan(instruction: &Instruction) -> Option<Op> {
     }
     Some(match mnemonic {
         M::Nop | M::Pause => Op::Nop,
-        M::Lfence | M::Sfence | M::Mfence if instruction.segment_prefix() != Register::GS => {
-            Op::Nop
-        }
+        M::Lfence | M::Sfence | M::Mfence => Op::Nop,
         // Hints that never fault; ENDBR32 marks indirect branch targets for
         // CET, which the guest never enables.
         M::Endbr32 => Op::Nop,
@@ -419,10 +433,16 @@ pub fn plan(instruction: &Instruction) -> Option<Op> {
         },
         M::Leave if instruction.code() == iced_x86::Code::Leaved => Op::Leave,
         M::Push if count == 1 => Op::Push(operand(instruction, 0)?),
-        M::Pop => match register(0)? {
-            ESP => return None,
-            register => Op::Pop(register),
+        M::Pop => match operand(instruction, 0)? {
+            Src::Reg(register) => Op::Pop(register),
+            Src::Mem(mem) => Op::PopMemory(mem),
+            Src::Imm(_) => return None,
         },
+        M::Pushfd => Op::PushFlags(4),
+        M::Pushf => Op::PushFlags(2),
+        M::Lahf => Op::Lahf,
+        M::Rdtsc => Op::Timestamp,
+        M::Int if instruction.immediate8() == 0x2e => Op::Syscall,
         M::Jmp => match instruction.op_kind(0) {
             OpKind::NearBranch32 => Op::Jmp(instruction.near_branch32()),
             OpKind::Register | OpKind::Memory => Op::JmpIndirect(operand(instruction, 0)?),
@@ -850,6 +870,7 @@ pub struct Fetcher<'m> {
     /// Whether instructions `plan` declines become `Op::Helper`, kept
     /// here.
     pub helpers: Option<Vec<Helper>>,
+    pub locked: Option<(Mem, u8, u8)>,
 }
 
 impl<'m> Fetcher<'m> {
@@ -861,12 +882,14 @@ impl<'m> Fetcher<'m> {
             decoder: None,
             failure: 0,
             helpers: None,
+            locked: None,
         }
     }
 
     /// The `Op` and length of the instruction at `pc`, if it is entirely in
     /// executable memory and handled.
     pub fn fetch(&mut self, pc: u32) -> Option<(Op, u32)> {
+        self.locked = None;
         const PAGE: u32 = 0x1000;
         let page = pc & !(PAGE - 1);
         if self.page != Some(page) {
@@ -903,7 +926,9 @@ impl<'m> Fetcher<'m> {
             return None;
         }
         let len = instruction.len();
-        if let Some(op) = plan(&instruction) {
+        let locked = instruction.has_lock_prefix()
+            || instruction.mnemonic() == Mnemonic::Xchg && instruction.op0_kind() == OpKind::Memory;
+        if !locked && let Some(op) = plan(&instruction) {
             return Some((op, len as u32));
         }
         let helpers = self.helpers.as_mut()?;
@@ -921,33 +946,70 @@ impl<'m> Fetcher<'m> {
         });
         // SIMD instructions keep their helper for when they are checked.
         let index = (helpers.len() - 1) as u8;
-        let op = if let Some(simd) = super::simd::plan(&instruction, index) {
-            Op::Simd(simd)
-        } else if let Some(strings) = super::strings::plan(&instruction, index) {
-            Op::Strings(strings)
-        } else if let Some(integer) = super::integer::plan(&instruction, index) {
-            Op::Integer(integer)
-        } else if let Some(apply) = super::apply::plan(&instruction) {
-            Op::Apply(apply)
-        } else if instruction.code() == iced_x86::Code::Fild_m64int {
-            Op::Fild64(
-                memory(&instruction)?,
+        if locked {
+            self.locked = Some((
+                memory_sized(&instruction)?,
+                instruction.memory_size().size() as u8,
                 index,
-                helpers.last().and_then(|h| h.prepared.x87_opcode()),
-            )
-        } else if let Some(x87) = super::x87::plan(
-            &instruction,
-            index,
-            helpers
-                .last()
-                .and_then(|helper| helper.prepared.x87_opcode()),
-        ) {
-            Op::X87(x87)
-        } else {
-            Op::Helper(index)
-        };
+            ));
+        }
+        let opcode = helpers.last().and_then(|h| h.prepared.x87_opcode());
+        let op = deferred_plan(&instruction, index, opcode).unwrap_or(Op::Helper(index));
         Some((op, len as u32))
     }
+}
+
+/// Native forms selected after preparing their exceptional interpreter case.
+fn deferred_plan(instruction: &Instruction, index: u8, opcode: Option<u16>) -> Option<Op> {
+    let mut native = *instruction;
+    native.set_has_lock_prefix(false);
+    let instruction = native;
+    Some(if let Some(op) = plan(&instruction) {
+        op
+    } else if matches!(instruction.mnemonic(), Mnemonic::Popfd | Mnemonic::Popf) {
+        Op::PopFlags(
+            if instruction.mnemonic() == Mnemonic::Popf {
+                2
+            } else {
+                4
+            },
+            index,
+        )
+    } else if matches!(
+        instruction.mnemonic(),
+        Mnemonic::Push
+            | Mnemonic::Pop
+            | Mnemonic::Pushad
+            | Mnemonic::Pusha
+            | Mnemonic::Popad
+            | Mnemonic::Popa
+            | Mnemonic::Leave
+    ) {
+        let m = instruction.mnemonic();
+        let width = if matches!(m, Mnemonic::Pushad | Mnemonic::Popad) {
+            4
+        } else {
+            2
+        };
+        let part = if matches!(m, Mnemonic::Push | Mnemonic::Pop) {
+            part(&instruction, 0, width)?
+        } else {
+            Part::Reg(5)
+        };
+        Op::Stack(m, part, width, index)
+    } else if let Some(simd) = super::simd::plan(&instruction, index) {
+        Op::Simd(simd)
+    } else if let Some(strings) = super::strings::plan(&instruction, index) {
+        Op::Strings(strings)
+    } else if let Some(integer) = super::integer::plan(&instruction, index) {
+        Op::Integer(integer)
+    } else if let Some(parts) = super::parts::plan(&instruction) {
+        Op::Parts(parts)
+    } else if instruction.code() == iced_x86::Code::Fild_m64int {
+        Op::Fild64(memory(&instruction)?, index, opcode)
+    } else {
+        Op::X87(super::x87::plan(&instruction, index, opcode)?)
+    })
 }
 
 /// What an instruction does to the flags, and whether it may fault.
@@ -1033,8 +1095,14 @@ impl Op {
                 (F::NONE, F::ALL.minus(F::CF), matches!(dst, Part::Mem(_)))
             }
             // The interpreter reads and writes canonical flags.
-            Op::Helper(_) => (F::ALL, F::NONE, true),
-            Op::Apply(apply) => (F::ALL, F::ALL, apply.memory().is_some()),
+            Op::Helper(_) | Op::Syscall | Op::Timestamp => (F::ALL, F::NONE, true),
+            Op::Stack(..) => (F::NONE, F::NONE, true),
+            Op::PopMemory(_) => (F::NONE, F::NONE, true),
+            Op::PushFlags(_) | Op::Lahf => (F::ALL, F::NONE, true),
+            Op::PopFlags(..) => (F::ALL, F::ALL, true),
+            // Calls leave the arithmetic flags undefined (A64-CALL-2).
+            Op::Body(_) => (F::NONE, F::ALL, true),
+            Op::Parts(parts) => (F::ALL, F::ALL, parts.memory().is_some()),
         };
         Effects {
             reads,
@@ -1223,11 +1291,16 @@ pub(super) mod tests {
             if let Some(actual) = actual {
                 assert_eq!(Some(actual), expected, "{bytes:02x?} at {pc:#x}");
             }
-            // Narrow and memory `inc`/`dec` forms are iced's alone.
-            let quick_form = !matches!(
-                expected,
-                Some((Op::Narrow(..) | Op::StepMemory(..) | Op::NarrowStep(..), _))
-            );
+            // Narrow forms, memory INC/DEC, POP ESP and word addresses use iced.
+            // Their native plans do not expand quick's coverage contract.
+            let quick_form = !bytes.starts_with(&[0x67])
+                && !matches!(
+                    expected,
+                    Some((
+                        Op::Narrow(..) | Op::StepMemory(..) | Op::NarrowStep(..) | Op::Pop(ESP),
+                        _
+                    ))
+                );
             if expected.is_some() && quick_form && round % 8 != 0 {
                 planned += 1;
                 covered += u32::from(actual.is_some());
@@ -1235,5 +1308,70 @@ pub(super) mod tests {
         }
         // Declining is always correct, but it should be rare.
         assert!(covered * 100 >= planned * 95, "{covered} of {planned}");
+    }
+}
+
+#[cfg(test)]
+mod whitelist_audit {
+    use super::*;
+    // spec: A64-TR-4
+    #[test]
+    fn common_form_audit() {
+        let mut missing = std::collections::BTreeSet::new();
+        for prefix in [
+            &[][..],
+            &[0x66],
+            &[0x67],
+            &[0x64],
+            &[0x65],
+            &[0xf0],
+            &[0xf2],
+            &[0xf3],
+        ] {
+            for extended in [false, true] {
+                for opcode in 0..=255u8 {
+                    for modrm in 0..=255u8 {
+                        let mut bytes = prefix.to_vec();
+                        if extended {
+                            bytes.push(0x0f);
+                        }
+                        bytes.extend_from_slice(&[opcode, modrm]);
+                        bytes.resize(16, 0);
+                        let i =
+                            Decoder::with_ip(32, &bytes, 0x10000, DecoderOptions::NONE).decode();
+                        if i.is_invalid()
+                            || i.flow_control() != FlowControl::Next
+                            || Prepared::new(&i, &bytes[..i.len()]).is_none()
+                        {
+                            continue;
+                        }
+                        let native = deferred_plan(&i, 0, None).is_some();
+                        let floating = adv_cpu_core::floating::operation(&i)
+                            == Some(adv_cpu_core::floating::Operation::X87);
+                        let word_string = (0..i.op_count()).any(|n| {
+                            matches!(
+                                i.op_kind(n),
+                                OpKind::MemorySegSI | OpKind::MemorySegDI | OpKind::MemoryESDI
+                            )
+                        });
+                        let allowed = floating
+                            || word_string
+                            || matches!(
+                                i.mnemonic(),
+                                Mnemonic::Cpuid
+                                    | Mnemonic::Cli
+                                    | Mnemonic::Sti
+                                    | Mnemonic::Sgdt
+                                    | Mnemonic::Sidt
+                                    | Mnemonic::Sldt
+                            );
+                        if !native && !allowed {
+                            missing.insert(format!("{:?} prefix={prefix:x?}", i.code()));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(missing.is_empty(), "forms outside A64-TR-4: {missing:#?}");
     }
 }

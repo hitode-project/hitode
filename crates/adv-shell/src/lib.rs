@@ -122,7 +122,9 @@ impl Options {
                 // Pending input/audio notifications must be drained before jumping.
                 // Until the first frame nothing is on screen to pace, so timed waits
                 // only delay first entry; afterwards skipping follows the Ctrl keys.
-                !pending_input.load(std::sync::atomic::Ordering::Acquire)
+                pending_input.load(std::sync::atomic::Ordering::Acquire)
+                    & adv_sync::pending::INTERRUPT
+                    == 0
                     && (startup
                         || [0x11, 0xa2, 0xa3]
                             .iter()

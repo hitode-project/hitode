@@ -81,6 +81,43 @@ For the Wine stack, `adv-abi::dll` writes host-module PE images through `adv-pe`
 6. **Present.** The shell takes the newest finished frame and presents it through wgpu (Metal on macOS). Dropping a host frame never skips a draw, lock or readback that the guest can observe.
 7. **Sound and input.** DirectSound and waveOut share one mixer and playback clock, and the host audio callback only reads mixed PCM. Host input events become USER messages in the guest's queues.
 
+## A call, from guest to body
+
+A guest call to a function that has a native body, such as `memcpy` or `SetEvent`, takes the steps below. Each step names its code and the rules it follows. `tools/docs/check_docs.py` fails a commit when a named file or symbol no longer exists, or a cited rule is withdrawn, so the change that moves a step also updates its text.
+
+1. **Bind at load.** When `adv-nt` maps a distribution module, each body whose function bytes match the identity table binds the function's entry. The entry then leads to a thunk, and a direct body is also recorded under its entry. Runtime helpers that game images link statically bind wherever their bytes appear.
+   Code: [`bind`](crates/adv-nt/src/native.rs), [`bind_one`](crates/adv-nt/src/native.rs), [`intact`](crates/adv-nt/src/identity.rs), [`Sys::direct_bodies`](crates/adv-machine/src/lib.rs), [`linked::bind`](crates/adv-nt/src/native/linked.rs).
+   Rules: A64-CTL-14, NAT-BODY-13, NAT-BODY-18.
+2. **Translate the call.** A trace resolves `call [slot]` and `jmp [slot]` when it is translated, and watches the slot and the entry bytes. A call reaching an intact entry with a direct body becomes an `Op::Body` site. Other transfers to a redirected entry go to its thunk.
+   Code: [`Trace::build`](crates/adv-cpu-a64/src/translate/trace.rs), [`Redirect`](crates/adv-cpu-a64/src/translate/trace.rs), [`Bound`](crates/adv-cpu-a64/src/translate/trace.rs), [`Op::Body`](crates/adv-cpu-a64/src/translate/decode.rs), [`TrapHandler::direct_body`](crates/adv-cpu-core/src/backend/mod.rs).
+   Rules: A64-CALL-1, A64-CTL-11, A64-CTL-14.
+3. **Run the body on the window.** The site forwards profitable adjacent argument pushes for inline expansions, loads other declared stack, register, floating-control and bound constant inputs into w1–w7, points x0 at the body context, and calls the body as an AAPCS64 leaf, saving only unpublished caller-saved XMM values. Constant memory calls up to 64 bytes expand inline; blocked or crossing spans take the body. Omitted argument stores are restored before an out-of-line body runs, so ordinary bodies need no stack-alias exclusion. The body checks each 4 KiB page's class once, then reads and writes the guest window directly. The site writes the declared result registers and pops the arguments.
+   Code: [`Translator::body`](crates/adv-cpu-a64/src/translate/ops.rs), [`Translator::inline_body`](crates/adv-cpu-a64/src/translate/body.rs), [`body`](crates/adv-cpu-core/src/body.rs) (the macro), [`BodyContext`](crates/adv-cpu-core/src/body.rs), [`DirectBody`](crates/adv-cpu-core/src/body.rs), [`Window`](crates/adv-cpu-core/src/body.rs).
+   Rules: A64-CALL-2, A64-CALL-3, A64-CALL-4, A64-CALL-8, NAT-BODY-17.
+4. **Leave for the full path.** A page the window may not take, such as a guard, file, shared or watched page, stops the body with `Stop::Slow` before it writes anything. Unmasked pixel arithmetic also takes this path, so a trap retains the writes that precede it. A call site then exits to interpret the call, and an entry site dispatches to the thunk.
+   Code: [`Stop`](crates/adv-cpu-core/src/body.rs), [`Translator::body`](crates/adv-cpu-a64/src/translate/ops.rs).
+   Rules: A64-CALL-4, A64-CALL-5.
+5. **Run the full path.** The interpreter takes the entry's redirect to the thunk, and the machine runs its handler. A direct body runs again over `GuestMem`, which completes every access as a guest instruction would. A body that is not yet direct runs here with the handler's environment.
+   Code: [`run_inner`](crates/adv-cpu-a64/src/executor.rs), [`Dispatch::on_host_call`](crates/adv-machine/src/lib.rs), [`run`](crates/adv-nt/src/native.rs), [`run_body`](crates/adv-nt/src/native.rs), [`run_full`](crates/adv-nt/src/native.rs), [`GuestMem`](crates/adv-cpu-core/src/body.rs).
+   Rules: A64-CALL-5, NAT-BODY-16, NAT-BODY-17.
+6. **Return, raise or run guest code.** A result returns as the function's `ret` would. A fault, including division by zero, raises the guest exception as if the entry's first instruction faulted. A body whose function would wait, call guest code or request the server runs the function's own code once, through a trampoline.
+   Code: [`Outcome::Raise`](crates/adv-machine/src/outcome.rs), [`apply`](crates/adv-machine/src/lib.rs), [`exception`](crates/adv-machine/src/lib.rs), [`resume_original`](crates/adv-nt/src/native.rs), [`trampoline`](crates/adv-nt/src/native.rs).
+   Rules: A64-CALL-4, A64-CALL-6.
+7. **Reach host state.** Service bodies, such as event signals and file positions, change host state through the `Services` the body context carries. That state lives in storage the machine also reaches only through shared handles, so no exclusive borrow aliases it. The server fd retains its shared file cursor until its last owner retires, including inherited handles without a client descriptor cache.
+   Code: [`Services`](crates/adv-cpu-core/src/body.rs), [`TrapHandler::body_services`](crates/adv-cpu-core/src/backend/mod.rs), [`services::bodies`](crates/adv-nt/src/native/services.rs).
+   Rules: NAT-BODY-18.
+8. **Call without a body.** System calls (`int 0x2e`) and other thunks call their handler through the call stub, which synchronizes guest state. With diagnostics off, the call reads no clock and records nothing.
+   Code: [`call`](crates/adv-cpu-a64/src/native.rs), [`Dispatch::on_host_call`](crates/adv-machine/src/lib.rs).
+   Rules: A64-CTL-12, EXEC-CALL-1, EXEC-CALL-2.
+
+Wine's eight kernelbase string comparison bodies port Wine 11's collation code
+and read its loaded sort, locale and code page tables in place. ANSI sources
+decode on demand, and comparison levels stream weights through stack buffers.
+Byte identity and independent ordinary prefixes avoid conversion and weight work.
+Locale cache publication, code page loading and owned locale locks stay in Wine.
+The bodies' `Input::Args` names the argument block and `Input::Teb` carries FS
+base through both translated calls and the full path (NAT-BODY-20).
+
 ## Execution
 
 The `adv-cpu` facade exposes the AArch64 engine:
@@ -132,15 +169,17 @@ and the scalar tail's complete scratch effects. Paeth forms with internal
 branches retain guest execution. These LZ77 copy bridges preserve overlapping
 history; surrounding symbol decoding, window wrap and stream state remain guest work.
 
-Wine's pinned libpng row entries call the same device kernels through NT native
-bodies and a row service supplied by the codec assembly, including branch-based
-Paeth implementations. D3DX9 versions 24–43 share normalized integer pixel
-conversion, row copying and point sampling; other formats retain Wine's bodies.
-Wine's embedded zlib copies share a bounded Adler-32 checksum body. Their pinned
-`inflate_fast` entries run complete Huffman/extra-bit/history batches in the device
-kernel. Input, code tables and split ring history are borrowed; one reusable output
-buffer keeps rejection free of guest writes. Successful batches publish output and
-Wine's original stream and bit state; errors retain guest execution.
+Wine's pinned libpng row entries use direct scalar filters on every host, including
+branch-based Paeth and overlapping rows. D3DX9 versions 24–43 share direct pixel
+conversion over checked guest spans, including floating, indexed and compressed
+formats. The pinned Wine conversion kernels handle channel arithmetic, filters
+and block codecs; disjoint 32-bit rows use a byte shuffle. Admission finishes
+after the loader resolves copy imports, on the first entry, and watches the
+helper code and import targets with the function.
+Wine's embedded zlib copies share direct Adler-32 and `inflate_fast` bodies.
+The decoder reads input, code tables and ring history in place, so output can
+alias those inputs. It publishes zlib's stream and bit state, including error
+messages and block ends; error-message addresses resolve when the module binds.
 
 - **Graphics:** GDI, DirectDraw and Direct3D 9 share neutral surfaces and drawing services. Direct3D 9 shaders are translated within the limits in [docs/spec/graphics.md](docs/spec/graphics.md). Device services follow [docs/spec/device.md](docs/spec/device.md).
 - **Audio:** one mixer resamples with rubato and decodes with Symphonia. Wine MIDI output synthesizes through OxiSynth with the bundled General MIDI bank. Shared PCM buffers are read through stable views, so a device never reads storage that the guest has freed.
@@ -170,7 +209,7 @@ On macOS, guest menus appear in the native menu bar and guest dialogs become chi
 
 - CPU behavior is checked with self-written instruction and fault fixtures, differential runs against the interpreter, and Unicorn as a test-only reference.
 - Windows behavior is checked in Wine sessions: self-written probes and Wine's own conformance tests run on the Wine stack and compare their results with the native contract.
-- `tools/check.py` runs before every commit. It checks formatting, privacy, layering, the specs and the launcher front end.
+- `tools/check.py` runs before every commit. It checks formatting, privacy, layering, the specs, the code and rules this guide names, and the launcher front end.
 - Rules in `docs/spec/` name their verification, and tests cite the rules they check with `// spec:` markers.
 
 Game assets, screenshots, traces and anything taken from a game stay local and never enter the repository.
@@ -185,3 +224,11 @@ Game assets, screenshots, traces and anything taken from a game stay local and n
 | Building, testing and packaging | [docs/building.md](docs/building.md) |
 | Tools for debugging a game | [docs/investigation.md](docs/investigation.md) |
 | Host shells and platforms | [docs/spec/host.md](docs/spec/host.md), [docs/spec/android.md](docs/spec/android.md), [docs/building.md](docs/building.md) |
+
+## A call, from guest to body
+
+The loader publishes imports through [`ThunkTable`](crates/adv-machine/src/thunk.rs), and [`native::bind`](crates/adv-nt/src/native.rs) attaches distribution bodies after checking their code identity. Runtime services attach a body with [`Sys::bind_thunk_body`](crates/adv-machine/src/lib.rs); [`section::bind_builtin_bodies`](crates/adv-nt/src/section.rs) carries that binding to the copied entries in their PE images.
+
+The translator's [`Trace`](crates/adv-cpu-a64/src/translate/trace.rs) follows fixed forwarding instructions and import slots to a bound body, watching the chain and the bound entry for patches. [`ops::body`](crates/adv-cpu-a64/src/translate/ops.rs) calls its window form directly, without storing a guest return address (A64-CALL-1/2/5). [`BodyContext`](crates/adv-cpu-core/src/body.rs) supplies memory windows and shared service allocations; bodies never borrow the machine or extension owners through these pointers.
+
+The same generic body runs over `GuestMem` on [`run_full`](crates/adv-nt/src/native.rs), completing accesses the window cannot take (A64-CALL-4, NAT-BODY-17). `Stop::Guest` reaches guest code or the registered service handler when a callback, wait or server request is required (A64-CALL-6). A completed body can request a yield; generated code commits the return and [`Machine`](crates/adv-machine/src/lib.rs) schedules the handoff at its continuation.

@@ -60,9 +60,15 @@ impl Env<'_> {
             trace: self.sys.trace.enabled() && (function.trace || self.sys.trace.all),
             esp: self.cpu.reg(Reg::Esp),
             eip: self.cpu.reg(Reg::Eip),
-            caller: self.caller(),
+            caller: if self.sys.diagnostics() != 0 {
+                self.caller()
+            } else {
+                0
+            },
         };
-        self.sys.recent.push(self.context, binding, call.caller);
+        if self.sys.diagnostics() != 0 {
+            self.sys.recent.push(self.context, binding, call.caller);
+        }
         let outcome = call.scope(self, function.handler);
         call.complete(self, outcome)
     }
@@ -155,6 +161,10 @@ impl Invocation {
             Outcome::ResumeExecution(checkpoint) => {
                 self.record(env, 0, Some("resume"));
                 Outcome::ResumeExecution(checkpoint)
+            }
+            Outcome::Raise(fault) => {
+                self.record(env, 0, Some("fault"));
+                Outcome::Raise(fault)
             }
             Outcome::ReturnFromCall(value) => {
                 self.record(env, value, Some("callback return"));

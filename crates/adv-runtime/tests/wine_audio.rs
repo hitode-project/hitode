@@ -4,19 +4,22 @@
 use std::fs::File;
 use std::io::Read;
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use adv_runtime::wine::session::{Config, Session, Stop};
 
+#[allow(dead_code)]
+mod wine {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../adv-nt/tests/common/wine.rs"
+    ));
+}
+
 // spec: WINE-AUD-1, WINE-AUD-2, WINE-AUD-3, WINE-AUD-4, WINE-AUD-7, WINE-THR-1
 #[test]
 fn wine_audio_reaches_the_host_stream() {
-    let (Some(dist), Some(probes)) = (
-        std::env::var_os("ADV_WINE_DIST").map(PathBuf::from),
-        std::env::var_os("ADV_WINE_PROBES").map(PathBuf::from),
-    ) else {
-        eprintln!("skipped: ADV_WINE_DIST or ADV_WINE_PROBES is not set");
+    let Some(wine::Wine { dist, probes }) = wine::wine() else {
         return;
     };
     let root = std::env::temp_dir().join(format!("adv-wine-audio-{}", std::process::id()));

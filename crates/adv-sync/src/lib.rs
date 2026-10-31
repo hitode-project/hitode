@@ -2,6 +2,7 @@
 pub mod background;
 pub mod input;
 pub mod mailbox;
+pub mod pending;
 pub mod shared;
 pub mod spsc;
 pub mod vsync;

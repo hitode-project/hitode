@@ -1,22 +1,25 @@
 //! Drive C: may live outside the prefix, as on iOS, where the player keeps it
 //! in Documents: the session installs its host modules there.
 //!
-//! It needs `ADV_WINE_DIST` and `ADV_WINE_PROBES`, as the probe tests do.
+//! It needs `ADV_WINE_DIST`, as the probe tests do.
 #![cfg(any(target_vendor = "apple", target_os = "android"))]
 
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use adv_runtime::wine::session::{Config, Session, Stop};
 
+#[allow(dead_code)]
+mod wine {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../adv-nt/tests/common/wine.rs"
+    ));
+}
+
 // spec: WINE-SES-1
 #[test]
 fn host_modules_go_to_a_drive_c_outside_the_prefix() {
-    let (Some(dist), Some(probes)) = (
-        std::env::var_os("ADV_WINE_DIST").map(PathBuf::from),
-        std::env::var_os("ADV_WINE_PROBES").map(PathBuf::from),
-    ) else {
-        eprintln!("skipped: ADV_WINE_DIST or ADV_WINE_PROBES is not set");
+    let Some(wine::Wine { dist, probes }) = wine::wine() else {
         return;
     };
     let root = std::env::temp_dir().join(format!("adv-wine-drive-{}", std::process::id()));

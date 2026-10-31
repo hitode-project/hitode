@@ -169,7 +169,7 @@ A name whose directory exists as written MUST resolve by looking up its last com
 
 ### WINE-SYS-13 Registry value cache
 
-**Rule**: Cached registry reads MUST preserve information classes, buffer negotiation and value contents. Registry mutations and handle retirement through typed or raw requests MUST invalidate caches across the process family. Caches MUST retain at most 256 complete values per process, each at most 4096 bytes.
+**Rule**: Cached registry reads MUST preserve information classes, buffer negotiation and value contents. Registry mutations and handle retirement MUST invalidate caches across the process family. Caches MUST retain at most 256 complete values per process, each at most 4096 bytes.
 **Verification**: Test
 
 ### WINE-SYS-14 Name probe cache
@@ -368,79 +368,108 @@ Native font initialization also fills win32u's ANSI, OEM and UTF-8 code page tab
 
 ### NAT-BODY-1 Body semantics
 
-**Rule**: An ordinary native body that accepts a call MUST leave the guest state Wine's function would leave. Registers and flags the calling convention does not keep are exempt. Otherwise it MUST decline before any side effect, and the call MUST run Wine's function from its entry with the caller's frame.
+**Rule**: A body bound to a Windows API MUST leave the state the function leaves on Windows, including results, output bytes, errors and the last-error value. Other bodies MUST leave the state their bound guest code leaves. Registers and flags the calling convention does not keep are exempt.
 **Verification**: Test
+
+Windows behavior is measured on Windows 11 with the ACP and locale under test.
 
 Required host text services follow WINE-UNIX-6 in interpreted and translated execution.
 
 ### NAT-BODY-2 Performance counter body
 
-**Rule**: The native body of `ntdll.dll!NtQueryPerformanceCounter` MUST use the system call's counter computation and machine clock. It MUST return success and write the counter and optional frequency as the system call does. A null counter or an unwritable output MUST make the body decline before any write.
+**Rule**: Bodies of `kernelbase.dll!QueryPerformanceCounter`, `ntdll.dll!RtlQueryPerformanceCounter` and `ntdll.dll!NtQueryPerformanceCounter` MUST use the system call's counter computation and machine clock. They MUST write the counter and return what Windows returns. Inaccessible outputs MUST produce the status or exception Windows produces.
 **Verification**: Test
 
 ### NAT-BODY-3 DirectSound mixer
 
-**Rule**: The DirectSound mixer body MUST preserve Wine's float samples, scratch data, buffer positions, frequency accumulators, states, shared lock words, and stopped result. It MUST decline before writes when locks would wait, notifications would fire, effects or 3D apply, conversions are unsupported, or required memory is inaccessible. Its field offsets MUST match the pinned module's DWARF.
+**Rule**: The DirectSound mixer body MUST preserve Wine's float samples, scratch data, buffer positions, frequency accumulators, states, shared lock words and stopped result. It MUST cover every format, channel count, resampling ratio, 3D setting and floating-point control the function accepts. It MAY return to guest code under A64-CALL-6 only when a lock would wait or an effect object runs.
 **Verification**: Test
+
+Field offsets match the pinned module's DWARF. The mixer runs as a host-call body, so notifications use machine services.
 
 ### NAT-BODY-4 DIB primitives
 
-**Rule**: DIB bodies MUST preserve Wine's pixels, padding, overlap traversal, bit fields, palette selection, blend arithmetic, and interpolation rounding. Rect and row bodies MUST snapshot only the rows they touch, and unsupported formats or inaccessible memory MUST decline before writes. Field offsets and data addresses MUST match the pinned Unix module's DWARF.
-**Verification**: Test
-
-### NAT-BODY-5 Code page bodies
-
-**Rule**: PE code page bodies MUST use Wine's loaded conversion and normalization tables and preserve its output bytes, lengths, default-character indicators and errors. Their structure offsets and global addresses MUST match the pinned modules' DWARF. Cached-page lookups MUST decline while Wine's locale lock is held.
+**Rule**: DIB bodies MUST preserve Wine's pixels, padding, overlap traversal, bit fields, palette selection, blend arithmetic and interpolation rounding. They MUST cover every format, palette depth, brush and floating-point control their primitive accepts. Field offsets and data addresses MUST match the pinned Unix module's DWARF.
 **Verification**: Test
 
 ### NAT-BODY-6 CRT bodies
 
-**Rule**: Locale-independent PE string and memory bodies MUST preserve Wine's bytes, return values, bounds and overlap behavior. An access that would fault MUST decline before any write.
+**Rule**: Locale-independent CRT string and memory bodies MUST return the results and write the bytes the Windows CRT does, for every length and overlap. Inaccessible memory MUST follow A64-CALL-4.
 **Verification**: Test
 
-### NAT-BODY-7 PE body memory access
+### NAT-BODY-16 Complete bodies
 
-**Rule**: `Memory` MUST cache host page-range validation by mapping generation, advanced by mapping, protection, storage, watch, and residency changes. Tables that cannot be borrowed MAY use indexed entry reads. Repeated identical calls within one page of strings or eight KiB of conversion output MUST NOT allocate temporary heap buffers.
+**Rule**: A body MUST complete every call its function accepts, for all argument values, code pages, locales, formats, overlaps and floating-point controls. It MAY return to guest code only under A64-CALL-6. Faults, including division by zero, MUST raise the exception the function raises.
 **Verification**: Test
+
+### NAT-BODY-17 Body memory access
+
+**Rule**: Bodies MUST reach guest memory through one access type, which on AArch64 reads the window and class table under A64-CALL-4. Other hosts MUST give that type the same results through `Memory`. Bodies MUST read and write guest bytes in place, copying only where their function's semantics need a snapshot.
+**Verification**: Test
+
+### NAT-BODY-18 Direct and service bodies
+
+**Rule**: Hot functions that complete without waits, thread switches or guest calls MUST bind as direct bodies under A64-CALL-2. Service bodies MAY change host state, such as server objects, queues and file positions, but MUST NOT read guest registers or schedule threads. Each binding MUST declare its calling convention, argument bytes and result registers.
+**Verification**: Test
+
+| Group | Service functions |
+|---|---|
+| Time | `QueryPerformanceCounter`, `timeGetTime` |
+| Input | `GetKeyState`, `GetAsyncKeyState`, `GetKeyboardState`, `GetCursorPos` |
+| Queues | `PeekMessageA` and `PeekMessageW` finding no message, `GetQueueStatus`, `GetInputState` |
+| Objects | Waits with a zero timeout, `SetEvent`, `ResetEvent`, `ReleaseSemaphore`, `ReleaseMutex` |
+| Files | File position queries and changes, `GetFileSize`, `GetFileSizeEx` |
+
+Windows empty A/W peeks preserve last error and MSG, dispatch pending sent messages despite filters, and skip GETMESSAGE/FOREGROUNDIDLE hooks. Measured WoW64 empty peeks hand off about once per 100 calls, including PM_NOYIELD; the body requests that completed-call handoff from its owner. Driver jobs, dirty surfaces, internal messages and matching messages or timers requiring server processing retain the full path. The ANSI wrapper keeps its pending character conversion state and reaches the shared empty-peek body through NtUserPeekMessage. The full USER path advances pending server activity before Wine reads its shared queue bits. File cursors belong to server fd ownership, including inherited and duplicate handles whose clients have not admitted a descriptor.
 
 ### NAT-BODY-8 D3DX pixel conversion
 
-**Rule**: D3DX pixel bodies MUST preserve channel values, filter coordinates, color keys and padding with layouts matching the pinned module's DWARF. Unsupported formats or filters, overlapping buffers and inaccessible memory MUST decline before writes. Changed helper code or copy imports MUST retain guest execution.
+**Rule**: D3DX pixel bodies MUST preserve channel values, filter coordinates, color keys and padding with layouts matching the pinned module's DWARF. They MUST cover every format, filter and overlap the function accepts. Changed helper code or copy imports MUST leave the function unbound.
 **Verification**: Test
 
 ### NAT-BODY-9 PNG row bodies
 
-**Rule**: PNG row bodies MUST preserve Wine's Sub, Up, Average and Paeth bytes and row metadata through the shared device kernels. Missing kernels, overlapping rows and inaccessible memory MUST retain guest execution before writes. Row metadata offsets MUST match the pinned module's DWARF.
+**Rule**: PNG row bodies MUST preserve Wine's Sub, Up, Average and Paeth bytes and row metadata for every pixel depth and row overlap. Every host MUST provide each filter, scalar where no device kernel exists. Row metadata offsets MUST match the pinned module's DWARF.
 **Verification**: Test
 
 ### NAT-BODY-10 Embedded zlib checksums
 
-**Rule**: Adler-32 bodies MUST preserve the pinned zlib's seeded checksum, short-input arithmetic and null-buffer initialization. Inaccessible input MUST retain guest execution.
+**Rule**: Adler-32 bodies MUST preserve the pinned zlib's seeded checksum, short-input arithmetic and null-buffer initialization.
 **Verification**: Test
 
 ### NAT-BODY-11 DEFLATE fast batches
 
-**Rule**: Native DEFLATE batches MUST preserve Wine's output, consumed input, bit reservoir, stream pointers and block-end state. Rejected batches MUST retain guest execution before guest writes. Stream and window layouts MUST match the pinned module's DWARF.
+**Rule**: Native DEFLATE batches MUST preserve Wine's output, consumed input, bit reservoir, stream pointers and block-end state. They MUST cover every stream the function accepts, including output overlapping its inputs. Stream and window layouts MUST match the pinned module's DWARF.
 **Verification**: Test
 
 ### NAT-BODY-12 Queue key state
 
-**Rule**: The native `win32u.dll!NtUserGetKeyState` body MUST return Wine's synchronized queue key state, masked and sign-extended, to the guest. Missing server links, threads or queues MUST retain guest execution without creating a queue or leaving server errors or references.
+**Rule**: The `win32u.dll!NtUserGetKeyState` body MUST return Wine's synchronized queue key state, masked and sign-extended, to the guest. A thread without a queue MAY return to guest code under A64-CALL-6, without creating a queue or leaving server errors or references.
 **Verification**: Test
 
 ### NAT-BODY-13 Statically linked helpers
 
-**Rule**: Runtime helpers that game images link statically MUST bind only where an executable section holds their exact bytes, each copy under its own thunk. Borland's division bodies MUST return EDX:EAX, pop the divisor and zero ECX, and its copies MUST set EAX, ECX and EDX as its code does. A zero divisor or a forward copy into the source's tail MUST retain guest execution.
+**Rule**: Runtime helpers that game images link statically MUST bind only where an executable section holds their exact bytes, each copy under its own thunk. Borland's division bodies MUST return EDX:EAX, pop the divisor, zero ECX, and raise `EXCEPTION_INT_DIVIDE_BY_ZERO` under A64-CALL-4 for a zero divisor. Its copies MUST set EAX, ECX, EDX and overlapping bytes as its code does.
 **Verification**: Test
 
 ### NAT-BODY-14 Engine pixel routines
 
-**Rule**: Engine pixel bodies MUST write the pixels the routine writes, bit for bit, even where its pair paths round unlike its single-pixel path. They MUST keep every register the routine keeps. A destination overlapping a source other than in place MUST retain guest execution.
+**Rule**: Engine pixel bodies MUST write the pixels the routine writes, bit for bit, even where its pair paths round unlike its single-pixel path. They MUST keep every register the routine keeps. Overlapping sources and destinations MUST be read and written in the routine's order.
 **Verification**: Test
 
 ### NAT-BODY-15 Native host work
 
-**Rule**: A body's host work MUST scale with bytes passed and returned, plus a constant. Immutable guest data MUST use `native::memo`. In debug builds and tests, `native::run` MUST reject declines after guest writes under NAT-BODY-1.
+**Rule**: A body's host work MUST scale with bytes passed and returned, plus a constant. Tables derived from immutable data MUST be built at most once per process and reached without hashing per call. Bodies MUST NOT read clocks, allocate heap memory or take host locks per call, except where their function does.
+**Verification**: Test
+
+### NAT-BODY-19 Host features
+
+**Rule**: Bodies MAY use host instruction set features detected at startup, such as NEON table lookups, CRC32, PMULL and dot products. The variant MUST be chosen when the function binds, without per-call feature checks. Every variant MUST produce identical results.
+**Verification**: Test
+
+### NAT-BODY-20 Wine string comparison data
+
+**Rule**: Comparison bodies MUST read Wine's loaded sort, locale and code page data in place and return Wine's results and last error. They MUST NOT load, copy or correct NLS data.
 **Verification**: Test
 
 ## Host DLL images
@@ -834,4 +863,4 @@ UI projection refreshes MUST wake execution only when they queue new guest work.
 **Rule**: Native sources MUST accept PCM, IEEE float, Microsoft ADPCM and xWMA buffers. Compressed decoding MUST use host code.
 **Verification**: Test
 
-Withdrawn: WINE-TEST-2
+Withdrawn: WINE-TEST-2, NAT-BODY-5, NAT-BODY-7

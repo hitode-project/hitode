@@ -5,6 +5,7 @@
 #[doc(hidden)]
 pub mod architecture;
 pub mod backend;
+pub mod body;
 #[doc(hidden)]
 pub mod cliffs;
 mod code_image;

@@ -3,8 +3,15 @@
 use adv_runtime::wine::session::{Config, Host, SessionOptions, Stop};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
+
+#[allow(dead_code)]
+mod wine {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../adv-nt/tests/common/wine.rs"
+    ));
+}
 
 const IMAGE: &[u8] = include_bytes!("../../adv-os/tests/fixtures/optical.iso");
 
@@ -46,10 +53,7 @@ fn with_modules(files: &[(&str, Vec<u8>)]) -> Vec<u8> {
 // spec: DEV-DISC-1, DEV-DISC-3, DEV-DISC-4, DEV-DISC-6, DEV-DISC-7, WINE-SES-1, WINE-SES-4, WINE-SES-9, WINE-SES-10
 #[test]
 fn mounted_volumes_and_install_paths_survive_processes_and_prefix_reuse() {
-    let (Some(dist), Some(probes)) = (
-        std::env::var_os("ADV_WINE_DIST").map(PathBuf::from),
-        std::env::var_os("ADV_WINE_PROBES").map(PathBuf::from),
-    ) else {
+    let Some(wine::Wine { dist, probes }) = wine::wine() else {
         return;
     };
     if std::env::var_os("ADV_NT_PROBE_CHILD").is_none() {

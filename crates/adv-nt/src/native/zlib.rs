@@ -1,6 +1,6 @@
 //! Pinned Wine zlib ABIs, shared by its embedded copies.
-use adv_cpu::backend::Prot;
-use adv_machine::{Conv, Env};
+use adv_cpu::body::{EAX, Input, Mem, Ret, Stop};
+use adv_machine::Conv;
 
 pub(super) fn bodies() -> Vec<super::Body> {
     let mut bodies: Vec<_> = [
@@ -15,8 +15,9 @@ pub(super) fn bodies() -> Vec<super::Body> {
     .map(|module| super::Body {
         name: format!("{module}!adler32_z").into(),
         conv: Conv::Cdecl { argc: 3 },
-        body: Some(adler32),
+        body: None,
         handler: super::resume_original,
+        direct: Some(ADLER32),
     })
     .collect();
     bodies.extend(
@@ -29,28 +30,33 @@ pub(super) fn bodies() -> Vec<super::Body> {
         .map(|module| super::Body {
             name: format!("{module}!inflate_fast").into(),
             conv: Conv::Cdecl { argc: 2 },
-            body: Some(inflate_fast),
+            body: None,
             handler: super::resume_original,
+            direct: Some(adv_cpu::body::Body {
+                bind: Some(inputs),
+                ..INFLATE_FAST
+            }),
         }),
     );
     bodies
 }
 
 // spec: NAT-BODY-10
-fn adler32(env: &mut Env<'_>) -> Option<u64> {
+pub(super) fn adler32<M: Mem, const SIMD: bool>(
+    mem: &mut M,
+    [seed, input, len, ..]: [u32; 7],
+) -> Result<Ret, Stop> {
     const BASE: u32 = 65521;
-    let (seed, input, len) = (env.arg(0), env.arg(1), env.arg(2));
     // zlib checks the one-byte case before its null-buffer initializer.
     if input == 0 && len != 1 {
-        return Some(1);
+        return Ok(1u32.into());
     }
     let bytes = if len == 0 {
         &[][..]
     } else {
-        if !env.cpu.accessible(input, len, Prot::READ) {
-            return None;
-        }
-        env.cpu.shared_bytes(input, len as usize)?
+        let pointer = mem.input(input, len)?;
+        // SAFETY: the complete input was checked.
+        unsafe { std::slice::from_raw_parts(pointer, len as usize) }
     };
     let (mut a, mut b) = (seed & 0xffff, seed >> 16);
     if len == 1 {
@@ -78,6 +84,27 @@ fn adler32(env: &mut Env<'_>) -> Option<u64> {
             let (groups, tail) = block.as_chunks::<16>();
             for group in groups {
                 let (mut sum, mut weighted) = (0, 0);
+                #[cfg(target_arch = "aarch64")]
+                if SIMD {
+                    use std::arch::aarch64::*;
+                    // SAFETY: every group contains sixteen checked bytes;
+                    // NEON is mandatory on the AArch64 product targets.
+                    unsafe {
+                        let bytes = vld1q_u8(group.as_ptr());
+                        let weights = vld1q_u8(
+                            [16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1].as_ptr(),
+                        );
+                        sum = u32::from(vaddlvq_u8(bytes));
+                        weighted = vaddlvq_u16(vmull_u8(vget_low_u8(bytes), vget_low_u8(weights)))
+                            + vaddlvq_u16(vmull_high_u8(bytes, weights));
+                    }
+                } else {
+                    for (i, &byte) in group.iter().enumerate() {
+                        sum += u32::from(byte);
+                        weighted += u32::from(byte) * (16 - i as u32);
+                    }
+                }
+                #[cfg(not(target_arch = "aarch64"))]
                 for (i, &byte) in group.iter().enumerate() {
                     sum += u32::from(byte);
                     weighted += u32::from(byte) * (16 - i as u32);
@@ -93,157 +120,264 @@ fn adler32(env: &mut Env<'_>) -> Option<u64> {
             b %= BASE;
         }
     }
-    Some(u64::from(a | (b << 16)))
+    Ok((a | (b << 16)).into())
 }
 
-/// Stateless fast-batch math, supplied by the device assembly. Histories are
-/// chronological, tables pair code bytes with root widths, reservoir is (hold,
-/// bits); success returns (input used, output used, end of block).
-pub type InflateKernel = fn(
-    &[u8],
-    &mut [u8],
-    [&[u8]; 3],
-    [(&[u8], u32); 2],
-    &mut (u32, u32),
-) -> Option<(usize, usize, bool)>;
+const ARGS: &[Input] = &[Input::Stack(0), Input::Stack(1), Input::Stack(2)];
+adv_cpu::body!(ADLER32 = adler32::<_, true>, inputs: ARGS, outputs: EAX, pop: 0);
+adv_cpu::body!(INFLATE_FAST = inflate_fast, inputs: &[Input::Stack(0), Input::Stack(1)], outputs: EAX, pop: 0);
 
-/// One reusable output buffer for all streams on this execution owner.
-pub struct InflateFast {
-    kernel: InflateKernel,
-    output: Vec<u8>,
-}
-impl InflateFast {
-    pub fn new(kernel: InflateKernel) -> Self {
-        Self {
-            kernel,
-            output: Vec::new(),
+// Error pointers belong to this module, including after relocation. Resolve
+// them once when binding, then pass them as fixed direct-body inputs.
+fn inputs(
+    cpu: &dyn adv_cpu::backend::Guest,
+    entry: u32,
+    code: &[u8],
+) -> Result<[Option<Input>; 7], String> {
+    let mut messages = [0; 3];
+    let texts = [
+        b"invalid literal/length code\0".as_slice(),
+        b"invalid distance code\0",
+        b"invalid distance too far back\0",
+    ];
+    for instruction in
+        iced_x86::Decoder::with_ip(32, code, u64::from(entry), iced_x86::DecoderOptions::NONE)
+    {
+        for operand in 0..instruction.op_count() {
+            if instruction.op_kind(operand) == iced_x86::OpKind::Immediate32 {
+                let pointer = instruction.immediate32();
+                for (i, text) in texts.iter().enumerate() {
+                    let mut bytes = [0; 32];
+                    if cpu.read(pointer, &mut bytes[..text.len()]).is_ok()
+                        && &bytes[..text.len()] == *text
+                    {
+                        messages[i] = pointer;
+                    }
+                }
+            }
         }
     }
+    if messages.contains(&0) {
+        return Err("missing zlib error message operand".into());
+    }
+    Ok([
+        Some(Input::Stack(0)),
+        Some(Input::Stack(1)),
+        Some(Input::Const(messages[0])),
+        Some(Input::Const(messages[1])),
+        Some(Input::Const(messages[2])),
+        None,
+        None,
+    ])
 }
-fn word(bytes: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+
+// SAFETY: every helper accesses a byte or dword in a checked guest span.
+unsafe fn word(bytes: *const u8, offset: usize) -> u32 {
+    u32::from_le(unsafe { bytes.add(offset).cast::<u32>().read_unaligned() })
 }
-fn overlap(a: (u32, u32), b: (u32, u32)) -> bool {
-    a.1 != 0
-        && b.1 != 0
-        && u64::from(a.0) < u64::from(b.0) + u64::from(b.1)
-        && u64::from(b.0) < u64::from(a.0) + u64::from(a.1)
+unsafe fn set(bytes: *mut u8, offset: usize, value: u32) {
+    unsafe {
+        bytes
+            .add(offset)
+            .cast::<u32>()
+            .write_unaligned(value.to_le())
+    };
 }
 
 // spec: NAT-BODY-11
-fn inflate_fast(env: &mut Env<'_>) -> Option<u64> {
-    let kernel = env.ext.try_get::<InflateFast>()?.kernel;
-    let (stream, start) = (env.arg(0), env.arg(1));
-    let mut header = [0; 32];
-    env.cpu.read(stream, &mut header).ok()?;
-    let (input, avail_in, output, avail_out, state) = (
-        word(&header, 0),
-        word(&header, 4),
-        word(&header, 12),
-        word(&header, 16),
-        word(&header, 28),
-    );
-    // Wine i386 z_stream and inflate_state layouts are confirmed by DWARF.
-    let mut fields = [0; 96];
-    env.cpu.read(state, &mut fields).ok()?;
-    let (mode, wsize, whave, wnext, window) = (
-        word(&fields, 4),
-        word(&fields, 44),
-        word(&fields, 48),
-        word(&fields, 52),
-        word(&fields, 56),
-    );
-    let mut reservoir = (word(&fields, 60), word(&fields, 64));
-    let (lcode, dcode, lbits, dbits) = (
-        word(&fields, 80),
-        word(&fields, 84),
-        word(&fields, 88),
-        word(&fields, 92),
-    );
-    if mode != 16200
-        || avail_in < 6
-        || avail_out < 258
-        || reservoir.1 >= 8
-        || start < avail_out
-        || whave > wsize
-        || (whave != 0 && wnext >= wsize)
-        || !env.cpu.accessible(stream, 20, Prot::RW)
-        || !env.cpu.accessible(state + 4, 4, Prot::WRITE)
-        || !env.cpu.accessible(state + 60, 8, Prot::WRITE)
-        || !env.cpu.accessible(output, avail_out, Prot::WRITE)
-    {
-        return None;
-    }
-    let prefix_len = (start - avail_out).min(32768);
-    let prefix = output.checked_sub(prefix_len)?;
-    let reads = [
-        (input, avail_in),
-        (state, 7120),
-        (stream, 32),
-        (lcode, 852 * 4),
-        (dcode, 592 * 4),
-        (window, if whave == 0 { 0 } else { wsize }),
-        (prefix, prefix_len),
-    ];
-    for span in reads {
-        if overlap((output, avail_out), span) {
-            return None;
-        }
-    }
-    // Borrow input, code tables and ring segments directly; only output needs
-    // scratch so a rejected batch cannot expose partial guest writes.
-    let bytes = |at, len| {
-        if len == 0 {
-            return Some(&[][..]);
-        }
-        if !env.cpu.accessible(at, len, Prot::READ) {
-            return None;
-        }
-        env.cpu.shared_bytes(at, len as usize)
-    };
-    let input_bytes = bytes(input, avail_in)?;
-    let ltable = bytes(lcode, 852 * 4)?;
-    let dtable = bytes(dcode, 592 * 4)?;
-    let window_bytes = bytes(window, if whave == 0 { 0 } else { wsize })?;
-    let (first, second) = if whave == 0 {
-        (&[][..], &[][..])
-    } else {
-        let at = if wnext >= whave {
-            wnext - whave
-        } else {
-            wsize - (whave - wnext)
-        } as usize;
-        let count = (whave as usize).min(window_bytes.len() - at);
+fn inflate_fast<M: Mem>(
+    mem: &mut M,
+    [stream, start, bad_length, bad_distance, too_far, ..]: [u32; 7],
+) -> Result<Ret, Stop> {
+    let header = mem.input(stream, 32)?;
+    // SAFETY: the header contains each field.
+    let (input, avail_in, output, avail_out, state) = unsafe {
         (
-            &window_bytes[at..at + count],
-            &window_bytes[..whave as usize - count],
+            word(header, 0),
+            word(header, 4),
+            word(header, 12),
+            word(header, 16),
+            word(header, 28),
         )
     };
-    let history = [first, second, bytes(prefix, prefix_len)?];
-    let service = env.ext.get_mut::<InflateFast>();
-    if service.output.len() < avail_out as usize {
-        service.output.resize(avail_out as usize, 0);
-    }
-    let scratch = &mut service.output[..avail_out as usize];
-    let (read, written, ended) = kernel(
-        input_bytes,
-        scratch,
+    let fields = mem.input(state, 96)?;
+    // Wine i386 z_stream and inflate_state layouts match the pinned DWARF.
+    // SAFETY: all these fields belong to the checked state prefix.
+    let (wsize, whave, wnext, window, mut hold, mut bits, lcode, dcode, lbits, dbits) = unsafe {
+        (
+            word(fields, 44),
+            word(fields, 48),
+            word(fields, 52),
+            word(fields, 56),
+            word(fields, 60),
+            word(fields, 64),
+            word(fields, 80),
+            word(fields, 84),
+            word(fields, 88),
+            word(fields, 92),
+        )
+    };
+    let prefix_len = start.wrapping_sub(avail_out);
+    let [
+        source,
+        literals,
+        distances,
         history,
-        [(ltable, lbits), (dtable, dbits)],
-        &mut reservoir,
-    )?;
-    env.cpu.write(output, &scratch[..written]).ok()?;
-    header[..4].copy_from_slice(&input.wrapping_add(read as u32).to_le_bytes());
-    header[4..8].copy_from_slice(&(avail_in - read as u32).to_le_bytes());
-    header[12..16].copy_from_slice(&output.wrapping_add(written as u32).to_le_bytes());
-    header[16..20].copy_from_slice(&(avail_out - written as u32).to_le_bytes());
-    env.cpu.write(stream, &header[..8]).ok()?;
-    env.cpu.write(stream + 12, &header[12..20]).ok()?;
-    if ended {
-        env.cpu.write(state + 4, &16191u32.to_le_bytes()).ok()?;
+        prefix,
+        dest,
+        header,
+        fields,
+        sane,
+    ] = mem.spans([
+        (input, avail_in, false),
+        (lcode, 852 * 4, false),
+        (dcode, 592 * 4, false),
+        (window, wsize, false),
+        (output.wrapping_sub(prefix_len), prefix_len, false),
+        (output, avail_out, true),
+        (stream, 32, true),
+        (state, 68, true),
+        (state.wrapping_add(7108), 4, false),
+    ])?;
+    let (mut read, mut written) = (0u32, 0u32);
+    let (mut mode, mut message) = (None, 0);
+    let lmask = (1u32 << lbits) - 1;
+    let dmask = (1u32 << dbits) - 1;
+    // Raw pointers deliberately retain live aliasing: output may overwrite
+    // later input, table entries or sliding-window bytes, exactly as zlib does.
+    // SAFETY: each accepted stream supplies the complete spans checked above;
+    // at least six input and 258 output bytes remain at every iteration.
+    unsafe {
+        'decode: loop {
+            if bits < 15 {
+                hold = hold.wrapping_add(u32::from(source.add(read as usize).read()) << bits);
+                read += 1;
+                bits += 8;
+                hold = hold.wrapping_add(u32::from(source.add(read as usize).read()) << bits);
+                read += 1;
+                bits += 8;
+            }
+            let mut here = literals.add((hold & lmask) as usize * 4);
+            let mut op;
+            let mut len;
+            loop {
+                let used = u32::from(here.add(1).read());
+                hold >>= used;
+                bits -= used;
+                op = u32::from(here.read());
+                len = u32::from(u16::from_le(here.add(2).cast::<u16>().read_unaligned()));
+                if op == 0 {
+                    dest.add(written as usize).write(len as u8);
+                    written += 1;
+                    break;
+                } else if op & 16 != 0 {
+                    op &= 15;
+                    if bits < op {
+                        hold =
+                            hold.wrapping_add(u32::from(source.add(read as usize).read()) << bits);
+                        read += 1;
+                        bits += 8;
+                    }
+                    len += hold & ((1 << op) - 1);
+                    hold >>= op;
+                    bits -= op;
+                    if bits < 15 {
+                        hold =
+                            hold.wrapping_add(u32::from(source.add(read as usize).read()) << bits);
+                        read += 1;
+                        bits += 8;
+                        hold =
+                            hold.wrapping_add(u32::from(source.add(read as usize).read()) << bits);
+                        read += 1;
+                        bits += 8;
+                    }
+                    here = distances.add((hold & dmask) as usize * 4);
+                    let mut dist;
+                    loop {
+                        let used = u32::from(here.add(1).read());
+                        hold >>= used;
+                        bits -= used;
+                        op = u32::from(here.read());
+                        dist = u32::from(u16::from_le(here.add(2).cast::<u16>().read_unaligned()));
+                        if op & 16 != 0 {
+                            op &= 15;
+                            while bits < op {
+                                hold = hold.wrapping_add(
+                                    u32::from(source.add(read as usize).read()) << bits,
+                                );
+                                read += 1;
+                                bits += 8;
+                            }
+                            dist += hold & ((1 << op) - 1);
+                            hold >>= op;
+                            bits -= op;
+                            break;
+                        } else if op & 64 == 0 {
+                            here = distances.add((dist + (hold & ((1 << op) - 1))) as usize * 4);
+                        } else {
+                            mode = Some(16209);
+                            message = bad_distance;
+                            break 'decode;
+                        }
+                    }
+                    let available = prefix_len + written;
+                    let mut back = dist.saturating_sub(available);
+                    if back > whave && word(sane, 0) != 0 {
+                        mode = Some(16209);
+                        message = too_far;
+                        break 'decode;
+                    }
+                    while len != 0 {
+                        let byte = if back != 0 {
+                            let at = if wnext >= back {
+                                wnext - back
+                            } else {
+                                wsize.wrapping_add(wnext).wrapping_sub(back)
+                            };
+                            back -= 1;
+                            history.add(at as usize).read()
+                        } else if dist > written {
+                            prefix.add((prefix_len + written - dist) as usize).read()
+                        } else {
+                            dest.add((written - dist) as usize).read()
+                        };
+                        dest.add(written as usize).write(byte);
+                        written += 1;
+                        len -= 1;
+                    }
+                    break;
+                } else if op & 64 == 0 {
+                    here = literals.add((len + (hold & ((1 << op) - 1))) as usize * 4);
+                } else {
+                    if op & 32 != 0 {
+                        mode = Some(16191);
+                    } else {
+                        mode = Some(16209);
+                        message = bad_length;
+                    }
+                    break 'decode;
+                }
+            }
+            if read >= avail_in.wrapping_sub(5) || written >= avail_out.wrapping_sub(257) {
+                break;
+            }
+        }
+        read -= bits >> 3;
+        bits &= 7;
+        hold &= (1 << bits) - 1;
+        set(header, 0, input.wrapping_add(read));
+        set(header, 4, avail_in.wrapping_sub(read));
+        set(header, 12, output.wrapping_add(written));
+        set(header, 16, avail_out.wrapping_sub(written));
+        if let Some(mode) = mode {
+            set(fields, 4, mode);
+        }
+        if message != 0 {
+            set(header, 24, message);
+        }
+        set(fields, 60, hold);
+        set(fields, 64, bits);
     }
-    fields[60..64].copy_from_slice(&reservoir.0.to_le_bytes());
-    fields[64..68].copy_from_slice(&reservoir.1.to_le_bytes());
-    env.cpu.write(state + 60, &fields[60..68]).ok()?;
-    Some(0)
+    mem.commit()?;
+    Ok(0u32.into())
 }

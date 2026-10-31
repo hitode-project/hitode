@@ -1,7 +1,5 @@
 //! Stateless codec math. Buffers, plans and scratch belong to one caller;
 //! no guest pointers, stream state or I/O enter these kernels.
-mod deflate;
-pub use deflate::inflate_fast;
 
 use symphonia::core::dsp::mdct::Imdct;
 

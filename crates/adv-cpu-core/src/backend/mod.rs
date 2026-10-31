@@ -132,9 +132,15 @@ pub enum FaultKind {
     Write(u32),
     Fetch(u32),
     InvalidInstruction,
+    IntegerDivideByZero,
+    /// An architectural exception raised by a host body.
+    Trap(u8),
     /// Backend-specific error text.
     Other(String),
 }
+
+/// Guest code bytes that a redirected function depends on.
+pub type CodeCheck = (u32, Box<[u8]>);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrapAction {
@@ -453,6 +459,21 @@ pub trait GuestExt: Guest {
 impl<G: Guest + ?Sized> GuestExt for G {}
 
 pub trait TrapHandler {
+    /// A service body completed and asks the owner to yield at its continuation.
+    fn on_body_yield(&mut self, _cpu: &mut dyn Guest) -> TrapAction {
+        TrapAction::Continue
+    }
+
+    /// Shared service storage retained by the execution owner for this run.
+    fn body_services(&self) -> crate::body::Services {
+        crate::body::Services::default()
+    }
+
+    /// Diagnostic modes affecting translated bindings; changes discard units.
+    fn diagnostics(&self) -> u8 {
+        0
+    }
+
     /// Preparation only: admit the complete offered loop body. This is never
     /// called by generated code; the returned capability obeys NativeRegion's
     /// safety contract and is invalidated with the translation's code bytes.
@@ -472,11 +493,21 @@ pub trait TrapHandler {
         self.on_trap(cpu, 0x2e)
     }
 
-    /// Where translated code continues instead of entering the function at
-    /// `pc`, while the bytes there are still the returned ones. The
-    /// interpreter runs the function itself, so the target must behave as
-    /// the function does.
+    /// Where execution continues instead of entering the function at `pc`,
+    /// while the bytes there are still the returned ones (A64-CTL-14). The
+    /// target must behave as the function does.
     fn redirect(&self, _pc: u32) -> Option<(u32, &[u8])> {
+        None
+    }
+
+    /// Additional code dependencies checked and watched with a redirection.
+    fn redirect_checks(&self, _pc: u32) -> &[(u32, Box<[u8]>)] {
+        &[]
+    }
+
+    /// The direct body that runs in place of the function at `pc`, which
+    /// `redirect` also redirects (A64-CALL-2).
+    fn direct_body(&self, _pc: u32) -> Option<crate::body::DirectBody> {
         None
     }
 

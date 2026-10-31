@@ -865,6 +865,13 @@ impl Text {
         text.backend = portable::Backend::with_directories(directories);
         text
     }
+    /// Add the fonts a Windows installation ships in `directory`, for the
+    /// families no discovered host font has. Call before adding resources.
+    pub fn with_windows_fonts(mut self, directory: &std::path::Path) -> Self {
+        self.backend.set_windows_fonts(directory);
+        self.invalidate_fonts();
+        self
+    }
     /// Load a pinned, isolated portable font profile and validate all files,
     /// SHA-256 hashes, collection indices and family names before returning.
     /// Production default construction uses the same profile when

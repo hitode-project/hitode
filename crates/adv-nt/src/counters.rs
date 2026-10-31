@@ -124,12 +124,14 @@ fn syscall_name(number: u32) -> String {
     }
 }
 
-pub(crate) fn syscall(env: &mut Env<'_>, number: u32, since: Instant) {
+pub(crate) fn syscall(env: &mut Env<'_>, number: u32, since: Option<Instant>) {
+    let Some(since) = since else { return };
     let counters = env.ext.get_or_default::<Boundaries>();
     counters.syscalls.entry(number).or_default().add(since);
 }
 
-pub(crate) fn unix(env: &mut Env<'_>, table: u32, code: u32, since: Instant) {
+pub(crate) fn unix(env: &mut Env<'_>, table: u32, code: u32, since: Option<Instant>) {
+    let Some(since) = since else { return };
     let counters = env.ext.get_or_default::<Boundaries>();
     counters.unix.entry((table, code)).or_default().add(since);
 }

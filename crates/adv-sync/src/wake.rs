@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 #[cfg(unix)]
@@ -106,20 +106,21 @@ mod os {
 #[derive(Clone)]
 pub struct WakeEvent {
     handle: Arc<os::Handle>,
-    interrupt: Arc<AtomicBool>,
+    interrupt: Arc<AtomicU32>,
     generation: Arc<AtomicU64>,
 }
 impl WakeEvent {
     pub fn new() -> std::io::Result<Self> {
         Ok(Self {
             handle: Arc::new(os::Handle::new()?),
-            interrupt: Arc::new(AtomicBool::new(false)),
+            interrupt: Arc::new(AtomicU32::new(0)),
             generation: Arc::new(AtomicU64::new(0)),
         })
     }
     pub fn signal(&self) {
         self.generation.fetch_add(1, Ordering::AcqRel);
-        self.interrupt.store(true, Ordering::Release);
+        self.interrupt
+            .fetch_or(crate::pending::INTERRUPT, Ordering::Release);
         self.notify();
     }
     /// Execution deliveries since creation, including repeated signals before a drain.
@@ -139,13 +140,16 @@ impl WakeEvent {
         self.handle.wait(timeout)
     }
     /// Native/interpreted backedges may read this flag without reading a clock.
-    pub fn interrupt_flag(&self) -> Arc<AtomicBool> {
+    pub fn interrupt_flag(&self) -> Arc<AtomicU32> {
         self.interrupt.clone()
     }
     /// Call before draining channels, never after: a concurrent new delivery
     /// must keep its interrupt until the next drain, including during guest work.
     pub fn take_interrupt(&self) -> bool {
-        self.interrupt.swap(false, Ordering::AcqRel)
+        self.interrupt
+            .fetch_and(!crate::pending::INTERRUPT, Ordering::AcqRel)
+            & crate::pending::INTERRUPT
+            != 0
     }
 
     /// The pipe's read end, readable while a wake is pending, for a host
@@ -181,7 +185,7 @@ mod tests {
     fn wake_before_wait_is_retained_and_cross_thread_signal_interrupts_wait() {
         let wake = WakeEvent::new().unwrap();
         wake.signal();
-        assert!(wake.interrupt_flag().load(Ordering::Acquire));
+        assert_ne!(wake.interrupt_flag().load(Ordering::Acquire), 0);
         assert!(wake.take_interrupt());
         assert!(!wake.take_interrupt());
         assert!(wake.wait(Some(Duration::ZERO)).unwrap());
@@ -196,7 +200,7 @@ mod tests {
         let wake = WakeEvent::new().unwrap();
         wake.notify();
         assert!(wake.wait(Some(Duration::ZERO)).unwrap());
-        assert!(!wake.interrupt_flag().load(Ordering::Acquire));
+        assert_eq!(wake.interrupt_flag().load(Ordering::Acquire), 0);
         let notify = wake.clone();
         let producer = std::thread::spawn(move || notify.notify());
         assert!(wake.wait(Some(Duration::from_secs(2))).unwrap());

@@ -228,6 +228,9 @@ fn surface(
             .get_or_default::<Surfaces>()
             .0
             .insert(created, surface);
+        env.ext
+            .get::<adv_nt::native::UserServices>()
+            .surface(created, true);
         check!(env.cpu.write_u32(output, created));
         Outcome::Return(1)
     })
@@ -332,6 +335,9 @@ fn flush(env: &mut Env<'_>) -> Outcome {
 fn destroy(env: &mut Env<'_>) -> Outcome {
     let address = env.arg(0);
     if let Some(surface) = env.ext.get_or_default::<Surfaces>().0.remove(&address) {
+        env.ext
+            .get::<adv_nt::native::UserServices>()
+            .surface(address, false);
         if let Some((sid, _, _, _)) = surface.view {
             env.ext.get_mut::<SurfaceStore>().delete(sid);
         }

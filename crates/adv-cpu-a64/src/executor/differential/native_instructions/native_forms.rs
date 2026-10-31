@@ -47,7 +47,6 @@ fn no_operation_calls(p: &Program) {
         ret_miss: at + 0x10010,
         access: at + 0x10014,
         interpret: at + 0x10018,
-        apply: at + 0x1001c,
         call: at + 0x10020,
         fault: at + 0x10024,
     };
@@ -66,19 +65,15 @@ fn no_operation_calls(p: &Program) {
         &|_, _| Vec::new(),
         0x037f,
     );
-    let division = iced_x86::Decoder::new(32, &p.code, 0).iter().any(|i| {
+    let exceptional = iced_x86::Decoder::new(32, &p.code, 0).iter().any(|i| {
         matches!(
             i.mnemonic(),
             iced_x86::Mnemonic::Div | iced_x86::Mnemonic::Idiv
-        )
+        ) || i.has_lock_prefix()
+            || i.mnemonic() == iced_x86::Mnemonic::Xchg && i.op0_kind() == iced_x86::OpKind::Memory
     });
     for (n, &word) in work.words().iter().enumerate() {
-        assert_ne!(
-            word,
-            crate::encode::bl((stubs.apply - at) as i32 - n as i32 * 4),
-            "apply call"
-        );
-        if !division {
+        if !exceptional {
             assert_ne!(
                 word,
                 crate::encode::bl((stubs.interpret - at) as i32 - n as i32 * 4),

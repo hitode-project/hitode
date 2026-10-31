@@ -518,6 +518,23 @@ struct Raw<'a> {
 }
 
 impl ExecutionTrap for Raw<'_> {
+    fn body_yield(&mut self, state: &mut CpuState, memory: &mut Memory) -> Result<bool, String> {
+        state.commit_mmx();
+        Ok(self.handler.on_body_yield(&mut View {
+            state,
+            memory,
+            images: self.images,
+        }) == TrapAction::Park)
+    }
+
+    fn body_services(&self) -> adv_cpu_core::body::Services {
+        self.handler.body_services()
+    }
+
+    fn diagnostics(&self) -> u8 {
+        self.handler.diagnostics()
+    }
+
     fn native_region(
         &self,
         pc: u32,
@@ -533,8 +550,14 @@ impl ExecutionTrap for Raw<'_> {
     fn redirect(&self, pc: u32) -> Option<(u32, &[u8])> {
         self.handler.redirect(pc)
     }
+    fn redirect_checks(&self, pc: u32) -> &[(u32, Box<[u8]>)] {
+        self.handler.redirect_checks(pc)
+    }
     fn required_redirect(&self, pc: u32) -> Option<(u32, &[u8])> {
         self.handler.required_redirect(pc)
+    }
+    fn direct_body(&self, pc: u32) -> Option<adv_cpu_core::body::DirectBody> {
+        self.handler.direct_body(pc)
     }
 
     fn host_call(

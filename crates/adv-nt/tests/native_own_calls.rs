@@ -8,10 +8,17 @@ use adv_pe::Pe;
 use adv_wineserver as _;
 use iced_x86::{Decoder, DecoderOptions, Mnemonic, OpKind};
 
+#[allow(dead_code)]
+mod wine {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../adv-nt/tests/common/wine.rs"
+    ));
+}
+
 #[test]
 fn dialogs_create_windows_past_the_exports() {
-    let Some(dist) = std::env::var_os("ADV_WINE_DIST") else {
-        eprintln!("skipped: ADV_WINE_DIST is unset");
+    let Some(dist) = wine::dist() else {
         return;
     };
     let dll = std::path::Path::new(&dist).join("lib/wine/i386-windows/user32.dll");

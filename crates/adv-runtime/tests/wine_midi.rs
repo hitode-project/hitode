@@ -4,7 +4,6 @@ use adv_runtime::wine::session::{Config, Session, Stop};
 use std::{
     fs::File,
     os::fd::AsRawFd,
-    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -12,14 +11,18 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[allow(dead_code)]
+mod wine {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../adv-nt/tests/common/wine.rs"
+    ));
+}
+
 // spec: WINE-AUD-5, WINE-AUD-6, WINE-AUD-12
 #[test]
 fn midi_messages_streams_and_mci_produce_pcm() {
-    let (Some(dist), Some(probes)) = (
-        std::env::var_os("ADV_WINE_DIST").map(PathBuf::from),
-        std::env::var_os("ADV_WINE_PROBES").map(PathBuf::from),
-    ) else {
-        eprintln!("skipped: ADV_WINE_DIST or ADV_WINE_PROBES is not set");
+    let Some(wine::Wine { dist, probes }) = wine::wine() else {
         return;
     };
     let root = std::env::temp_dir().join(format!("adv-wine-midi-{}", std::process::id()));

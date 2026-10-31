@@ -1092,9 +1092,16 @@ fn usable(set: &DialogSet) -> impl Iterator<Item = &adv_runtime::DialogWindow> {
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
+    #[allow(dead_code)]
+    mod wine {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../adv-nt/tests/common/wine.rs"
+        ));
+    }
     use super::*;
     use std::io::{BufRead, BufReader, Write};
-    use std::path::PathBuf;
+
     use std::process::{Command, Stdio};
 
     // spec: WINE-UI-5, WINE-SES-7
@@ -1102,7 +1109,7 @@ mod tests {
     #[ignore = "subprocess entry for execution limit reports"]
     fn limits_child() {
         let root = std::env::current_dir().unwrap();
-        let dist = PathBuf::from(std::env::var_os("ADV_WINE_DIST").unwrap());
+        let dist = wine::dist().unwrap();
         let frames = root.join("frames").exists();
         let mut options = Options::new(
             root.join(if frames { "d3d9.exe" } else { "popup_menu.exe" }),
@@ -1153,10 +1160,7 @@ mod tests {
     // spec: WINE-UI-5, WINE-SES-7
     #[test]
     fn final_reports_cover_limits_and_failure() {
-        let (Some(_), Some(probes)) = (
-            std::env::var_os("ADV_WINE_DIST"),
-            std::env::var_os("ADV_WINE_PROBES"),
-        ) else {
+        let Some(wine::Wine { dist: _, probes }) = wine::wine() else {
             return;
         };
         let root = std::env::temp_dir().join(format!("adv-wine-limits-{}", std::process::id()));
@@ -1218,9 +1222,9 @@ mod tests {
     #[ignore = "subprocess entry for the headless control test"]
     fn headless_control_child() {
         let root = std::env::current_dir().unwrap();
-        let dist = std::env::var_os("ADV_WINE_DIST").unwrap();
+        let dist = wine::dist().unwrap();
         let mut options = Options::new(root.join("popup_menu.exe"), root.join("data"));
-        options.wine = Some(dist.clone().into());
+        options.wine = Some(dist.clone());
         options.wine_prefix = Some(root.join("prefix"));
         options.headless = true;
         options.debug = true;
@@ -1237,11 +1241,11 @@ mod tests {
     // spec: WINE-UI-1, WINE-UI-2, WINE-UI-3, WINE-UI-4, WINE-UI-5, WINE-UI-6, WINE-SES-7
     #[test]
     fn headless_wine_control() {
-        let (Some(_dist), Some(probes)) = (
-            std::env::var_os("ADV_WINE_DIST"),
-            std::env::var_os("ADV_WINE_PROBES"),
-        ) else {
-            eprintln!("skipped: ADV_WINE_DIST or ADV_WINE_PROBES is not set");
+        let Some(wine::Wine {
+            dist: _dist,
+            probes,
+        }) = wine::wine()
+        else {
             return;
         };
         let root = std::env::temp_dir().join(format!("adv-wine-control-{}", std::process::id()));

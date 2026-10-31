@@ -1,4 +1,5 @@
-/* Offscreen DIB primitives. Build with -lgdi32 -lmsimg32. */
+/* Offscreen DIB primitives.
+ * Build: i686-w64-mingw32-gcc -O2 -Wall dib_bodies.c -o dib_bodies.exe -lgdi32 -lmsimg32 */
 #include <windows.h>
 #include <stdio.h>
 #include <stdint.h>

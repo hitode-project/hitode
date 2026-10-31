@@ -27,11 +27,8 @@
 //! emitter (`access`), and a refused access faults like a host fault, so
 //! dirty SIMD registers stay in place.
 //!
-//! An instruction the translator has no native form for but the
-//! interpreter runs without transferring control calls an operation helper
-//! (`apply`), which keeps guest state and SIMD caches in place, or else the
-//! `interpret` stub with canonical flags; the unit goes on unless the
-//! helper asks it to leave.
+//! The exceptional cases in A64-TR-4 use the `interpret` stub with
+//! canonical flags; ordinary instructions remain in generated code.
 //!
 //! Host registers beyond the guest map of A64-REG-1: x16 and x17 address and exit
 //! scratch, x6 a value scratch, x7 and x8 the recipe temporaries, which the
@@ -43,7 +40,7 @@
 //! v24-v31.
 
 mod access;
-pub(crate) mod apply;
+mod body;
 mod channels;
 mod decode;
 pub mod first;
@@ -51,6 +48,7 @@ mod flags;
 mod integer;
 mod native_region;
 mod ops;
+pub(crate) mod parts;
 mod residency;
 mod simd;
 mod strings;
@@ -65,7 +63,7 @@ use iced_x86::ConditionCode;
 pub use decode::Helper;
 pub(crate) use flags::Overflow;
 pub use flags::{Carry, Operand, Recipe, Sense};
-pub use trace::MAX_INSTRUCTIONS;
+pub use trace::{Bound, MAX_INSTRUCTIONS, Redirect};
 
 use adv_cpu_core::IndirectBranchKind;
 
@@ -136,7 +134,7 @@ impl Unit {
         eip: u32,
         stops: &[u32],
         host: &dyn Fn(u32, u32) -> Option<u32>,
-        redirect: &dyn Fn(u32) -> Option<(u32, Vec<u8>)>,
+        redirect: &dyn Fn(u32) -> Option<Redirect>,
     ) {
         self.regions.clear();
         self.trace.build(memory, eip, stops, host, redirect);
@@ -253,9 +251,7 @@ pub struct Stubs {
     pub access: usize,
     /// An instruction the interpreter runs.
     pub interpret: usize,
-    /// An operation helper on operands in registers.
-    pub apply: usize,
-    /// A recognized host call.
+    /// An INT 0x2e handler call.
     pub call: usize,
     /// Where a faulting site leaves.
     pub fault: usize,
@@ -336,6 +332,22 @@ enum Test {
 
 /// Code emitted after the unit body.
 enum Cold {
+    InlineBody {
+        label: Label,
+        resume: Label,
+        body: adv_cpu_core::body::DirectBody,
+        len: u32,
+        vector: simd::Vector,
+        pushes: Vec<decode::Src>,
+    },
+    BodyYield {
+        label: Label,
+        vector: simd::Vector,
+        entry: bool,
+        release: u16,
+        eip: u32,
+        refund: u32,
+    },
     /// A short branch's way to distant cold code: x87 arithmetic to its
     /// generic path, or a parity jcc to an exit that publishes a run.
     Bridge { label: Label, to: Label },
@@ -491,7 +503,7 @@ pub fn translate(
     at: usize,
     stubs: Stubs,
     host: &dyn Fn(u32, u32) -> Option<u32>,
-    redirect: &dyn Fn(u32) -> Option<(u32, Vec<u8>)>,
+    redirect: &dyn Fn(u32) -> Option<Redirect>,
     admit: &dyn Fn(u32, &[u8]) -> Vec<adv_cpu_core::native_region::NativeRegion>,
     control: u16,
 ) {
@@ -703,6 +715,9 @@ impl Translator<'_> {
         } else if trace.merge[index] {
             self.convert(trace.live_in[index]);
             self.state = State::CANONICAL;
+        }
+        if index == 0 {
+            self.body_stack_guard();
         }
         self.asm.bind(self.labels[index]);
         self.native_batch(index);
@@ -1377,6 +1392,35 @@ impl Translator<'_> {
 
     fn cold(&mut self, cold: Cold, at: usize) {
         match cold {
+            Cold::InlineBody {
+                label,
+                resume,
+                body,
+                len,
+                vector,
+                pushes,
+            } => {
+                self.asm.bind(label);
+                self.vector = vector;
+                // Materialize before the body can observe or overwrite arguments.
+                self.body_stores(&pushes);
+                self.mov_imm(X3, len);
+                self.body_call(body);
+                self.asm.b(resume);
+            }
+            Cold::BodyYield {
+                label,
+                vector,
+                entry,
+                release,
+                eip,
+                refund,
+            } => {
+                self.asm.bind(label);
+                self.vector = vector;
+                self.flush_simd();
+                self.body_yield(entry, release, eip, refund);
+            }
             Cold::Bridge { label, to } => {
                 self.asm.bind(label);
                 self.asm.b(to);

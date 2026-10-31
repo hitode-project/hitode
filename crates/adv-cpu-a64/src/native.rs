@@ -24,13 +24,9 @@
 //! Soft pages (A64-MEM-6): an instruction whose unchecked sites fault
 //! `CHECK_AFTER` times is checked from then on. The unit that faulted goes,
 //! and its next translation checks each access of the instruction against
-//! the page class table, a snapshot of `Memory::native_permissions` the
-//! runtime points at. Accesses the window cannot take call `access`, which
-//! performs them through `Memory` without leaving translated code. Raw permission
-//! snapshots are pinned only while generated accesses can run, released across
-//! host traps and refreshed before a continuing chain resumes. A stale
-//! table is harmless: the direct form is still a site, and `access`
-//! refuses anything the interpreter would not do.
+//! the page class table derived from `Memory::native_permissions`. Both tables belong to Memory; native execution keeps
+//! pointers, without retaining Arc snapshots that would force whole-table copies.
+//! Mapping changes and code discovery refresh changed pages before reentry.
 //!
 //! Code invalidation: translation registers its guest bytes with
 //! `watch_code`, which write-protects them in the window, so any store to
@@ -456,7 +452,7 @@ unsafe extern "C" fn interpret(runtime: *mut Runtime, index: u32, countdown: u64
             units,
         }) => {
             let same = memory.epoch == epoch && memory.dirty_pages.len() == dirty;
-            let status = if same && cpu.eip == helper.next {
+            let status = if same && cpu.eip == helper.next && cpu.eflags & 0x100 == 0 {
                 0
             } else {
                 LEAVE
@@ -502,9 +498,8 @@ unsafe extern "C" fn interpret(runtime: *mut Runtime, index: u32, countdown: u64
     (charge as u64) << 32 | u64::from(status)
 }
 
-/// Called by the `call` stub for the host call through thunk `site >> 32`
-/// whose INT is at `site as u32`: as `interpret` has the INT make it, but
-/// without decoding the INT or rereading its token (A64-CTL-12).
+/// Called by the `call` stub: EIP in bits 0-31, thunk in 32-47, INT length
+/// in 48-51, and bit 63 for an unrecognized INT (A64-CTL-12).
 unsafe extern "C" fn call(runtime: *mut Runtime, site: u64, _countdown: u64) -> u64 {
     const LEAVE: u32 = Exit::Dispatch as u32 + 1;
     // SAFETY: as in `interpret`.
@@ -517,15 +512,23 @@ unsafe extern "C" fn call(runtime: *mut Runtime, site: u64, _countdown: u64) -> 
         cpu.eip = pc;
         return (-1i64 as u64) << 32 | u64::from(Exit::Interpret as u32 + 1);
     }
+    if native.pending_work() {
+        cpu.eip = pc;
+        return (-1i64 as u64) << 32 | u64::from(LEAVE);
+    }
     // SAFETY: as in `interpret`.
     let bridge = unsafe { &mut *owner.bridge.cast::<Bridge<'_>>() };
     // The INT has committed its next PC.
-    let next = pc.wrapping_add(2);
+    let next = pc.wrapping_add((site >> 48 & 15) as u32);
     cpu.eip = next;
     let before = (memory.epoch, memory.dirty_pages.len());
-    let thunk = (site >> 32) as u32;
+    let thunk = (site >> 32 & 0xffff) as u32;
     if host(native, memory, bridge, cpu, before, next, |b, c| {
-        call_host(b, c, thunk)
+        if site >> 63 != 0 {
+            call_trap(b, c, 0x2e)
+        } else {
+            call_host(b, c, thunk)
+        }
     }) {
         0
     } else {
@@ -549,21 +552,29 @@ fn host(
 ) -> bool {
     // Generated accesses are paused. Let host mapping changes update the
     // raw permissions in place instead of copying the whole table.
-    let classified = native.alias_snapshot.take().is_some();
-    let resumes = call(bridge, cpu) == 0
+    let status = call(bridge, cpu);
+    if status != 0
+        && let Some(word) = &native.interrupt
+    {
+        word.fetch_or(
+            adv_sync::pending::WORK,
+            std::sync::atomic::Ordering::Release,
+        );
+    }
+    status == 0
         && memory.epoch == epoch
         && memory.dirty_pages.len() == dirty
         && cpu.eip == next
-        && !native.past()
-        && !native
-            .interrupt
-            .as_ref()
-            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
-        && !native.stops.contains(&next);
-    if resumes && classified {
-        native.classify(memory);
-    }
-    resumes
+        && !native.pending_work()
+}
+
+/// Read the owner's counter without synchronizing guest architectural state.
+unsafe extern "C" fn timestamp(runtime: *mut Runtime) -> u64 {
+    // SAFETY: generated code runs with this owner's live bridge.
+    let owner = unsafe { &mut *((*runtime).owner as *mut Owner) };
+    // SAFETY: Executor installs its live bridge before every native entry.
+    let clock = unsafe { (*owner.native).clock };
+    unsafe { &mut *clock.cast::<Bridge<'_>>() }.read_timestamp()
 }
 
 /// The virtual counter, which reads in a few nanoseconds where
@@ -593,7 +604,8 @@ pub(crate) struct Native {
     /// Entries of units that own switch tables.
     table_sources: FxHashSet<u32>,
     bridge: *mut std::ffi::c_void,
-    pub(crate) interrupt: Option<Arc<std::sync::atomic::AtomicBool>>,
+    pub(crate) interrupt: Option<Arc<std::sync::atomic::AtomicU32>>,
+    pub(crate) pending_mask: u32,
     cache: CodeCache,
     enter: Enter,
     stubs: Stubs,
@@ -629,13 +641,11 @@ pub(crate) struct Native {
     helper_units: u64,
     /// Each placed unit's host address and entry, ascending.
     placed: Vec<(usize, u32)>,
-    /// The permissions the page class table was made from, and the table
-    /// when it is not that snapshot itself.
-    snapshot: Option<Arc<Vec<u8>>>,
-    alias_snapshot: Option<Arc<Vec<u8>>>,
-    /// `FastPermissions::version` of `snapshot`.
-    version: u64,
-    classes: Option<Box<[u8]>>,
+    /// The memory epoch last classified, and the all-slow test table.
+    classified_epoch: Option<u64>,
+    classes: Option<Arc<Vec<u8>>>,
+    #[cfg(test)]
+    classifications: u64,
     /// Buffers of the last translation.
     work: translate::Workspace,
     /// What the units' `interpret` calls run, until the cache clears,
@@ -656,6 +666,8 @@ pub(crate) struct Native {
     pub(crate) features: Features,
     faults: Faults,
     runtime: Box<Runtime>,
+    /// Live timestamp bridge, including runs without a trap handler.
+    pub(crate) clock: *mut std::ffi::c_void,
     /// The x87 control word of the CPU a run starts on.
     control: u16,
 }
@@ -683,7 +695,6 @@ impl Native {
                 (stubs.access, "access"),
                 (stubs.interpret, "interpret"),
                 (stubs.call, "call"),
-                (stubs.apply, "apply"),
             ],
         );
         // SAFETY: `enter` follows the C calling convention with the
@@ -701,6 +712,7 @@ impl Native {
             table_sources: FxHashSet::default(),
             bridge: std::ptr::null_mut(),
             interrupt: None,
+            pending_mask: u32::MAX,
             stub_len: cache.used(),
             faults: Faults {
                 start: base,
@@ -723,7 +735,6 @@ impl Native {
                 ret_miss: base + stubs.ret_miss,
                 access: base + stubs.access,
                 interpret: base + stubs.interpret,
-                apply: base + stubs.apply,
                 call: base + stubs.call,
                 fault: base + stubs.fault,
             },
@@ -742,9 +753,9 @@ impl Native {
             deadline: None,
             diagnostics: Diagnostics::default(),
             placed: Vec::new(),
-            snapshot: None,
-            alias_snapshot: None,
-            version: 0,
+            classified_epoch: None,
+            #[cfg(test)]
+            classifications: 0,
             classes: None,
             work: translate::Workspace::default(),
             helpers: Vec::new(),
@@ -759,6 +770,7 @@ impl Native {
             stops: Vec::new(),
             features: features(),
             runtime,
+            clock: std::ptr::null_mut(),
             control: 0,
         })
     }
@@ -826,13 +838,16 @@ impl Native {
             }));
         }
         debug_assert_eq!(cpu.lazy_flags[3], 0, "lazy flags settle before entry");
-        self.runtime.count_forms = u64::from(self.retired_forms.is_some());
-        self.runtime.applied = 0;
-        self.runtime.apply_return = 0;
         self.helper_units = 0;
         let budget = fuel.min(SLICE);
         if self.uses_permissions || self.checks != Checks::Adaptive || !self.checked.is_empty() {
             self.classify(memory);
+        }
+        if let Some(word) = &self.interrupt {
+            word.fetch_and(
+                !(adv_sync::pending::STOP | adv_sync::pending::WORK),
+                std::sync::atomic::Ordering::AcqRel,
+            );
         }
         self.cache.sync();
         self.faults.end.set(self.cache.next());
@@ -857,6 +872,7 @@ impl Native {
             (*runtime).fault_simd = (*faults).simd.as_ptr() as u64;
             (*runtime).interpret = interpret as *const () as u64;
             (*runtime).call = call as *const () as u64;
+            (*runtime).timestamp = timestamp as *const () as u64;
             (*runtime).owner = &raw mut owner as u64;
             let previous = ACTIVE.replace(faults);
             enter(runtime, entry.unit);
@@ -864,7 +880,6 @@ impl Native {
         }
         self.runtime.cpu = std::ptr::null_mut();
         self.runtime.owner = 0;
-        self.alias_snapshot = None;
         if let Some(error) = owner.error {
             return Err(error);
         }
@@ -876,6 +891,7 @@ impl Native {
             Exit::Fault => self.diagnostics.faults += 1,
             Exit::Dispatch => self.diagnostics.dispatches += 1,
             Exit::Stepped => {}
+            Exit::Yield => self.runtime.shadow = self.shadow.top(),
         }
         let mut retired = budget - self.runtime.countdown;
         if exit == Exit::Fault {
@@ -895,14 +911,6 @@ impl Native {
                 }
             }
             retired -= u64::from(site.refund);
-            if self.retired_forms.is_some()
-                && self.runtime.apply_return != 0
-                && pc >= self.runtime.apply_return as usize
-                && crate::jit_map::locate(self.runtime.apply_return as usize - 4, u128::MAX)
-                    .is_some_and(|location| location.eip == Some(site.eip))
-            {
-                self.runtime.applied -= 1;
-            }
             if !site.checked {
                 self.unchecked_faults += 1;
                 self.strike(site.eip, pc);
@@ -913,8 +921,7 @@ impl Native {
         if let Some(forms) = &mut self.retired_forms {
             // Native REP elements stay in translated fuel: telling them
             // apart would cost emitted code in every REP loop.
-            forms[0] += retired - self.runtime.applied - self.helper_units;
-            forms[1] += self.runtime.applied;
+            forms[0] += retired - self.helper_units;
         }
         let retired = retired as u32;
         Ok(Some(Run {
@@ -922,6 +929,10 @@ impl Native {
             retired,
             translated,
         }))
+    }
+
+    pub(crate) fn set_body_services(&mut self, services: adv_cpu_core::body::Services) {
+        self.runtime.body.services = services;
     }
 
     /// The unit at `eip`, translated if needed; a nonzero `point` is
@@ -1024,6 +1035,12 @@ impl Native {
         self.units.remove(&eip).is_some()
     }
 
+    fn pending_work(&self) -> bool {
+        self.interrupt.as_ref().is_some_and(|word| {
+            word.load(std::sync::atomic::Ordering::Acquire) & self.pending_mask != 0
+        })
+    }
+
     /// Whether the run's deadline has passed.
     pub(crate) fn past(&self) -> bool {
         self.deadline.is_some_and(|at| ticks() >= at)
@@ -1098,38 +1115,38 @@ impl Native {
 
     /// Points the runtime at the page classes of the current permissions.
     fn classify(&mut self, memory: &mut Memory) {
-        // A helper may publish new page metadata. Pin the raw permissions for
-        // this native invocation, just like the window's permission snapshot.
+        if self.classified_epoch == Some(memory.epoch) {
+            return;
+        }
+        #[cfg(test)]
+        {
+            self.classifications += 1;
+        }
         self.runtime.alias =
             (memory.ptr.as_ptr() as usize).wrapping_sub(memory.base as usize) as u64;
         self.runtime.alias_classes =
             (memory.perms.as_ptr() as usize).wrapping_sub((memory.base >> 12) as usize) as u64;
-        self.alias_snapshot = Some(memory.perms.clone());
-        // Holding no reference while the table refreshes lets it update in
-        // place instead of copying a byte for every page.
-        let held = self.snapshot.take().map(|old| Arc::as_ptr(&old));
-        let snapshot = memory.native_permissions();
-        let version = memory.fast.version();
-        if held == Some(Arc::as_ptr(&snapshot)) && version == self.version {
-            self.snapshot = Some(snapshot);
-            return;
-        }
-        self.version = version;
-        let first = (memory.base >> 12) as usize;
-        let direct = self.checks != Checks::Slow && first == 0 && snapshot.len() == CLASSES;
-        self.runtime.classes = if direct {
-            snapshot.as_ptr() as u64
+        memory.fast.body_table((memory.base >> 12) as usize);
+        // Drop this temporary Arc before a helper can modify the tables.
+        drop(memory.native_permissions());
+        self.runtime.classes = if self.checks == Checks::Slow {
+            self.classes
+                .get_or_insert_with(|| Arc::new(vec![0; CLASSES]))
+                .as_ptr()
         } else {
-            let table = self
-                .classes
-                .get_or_insert_with(|| vec![0; CLASSES].into_boxed_slice());
-            // A slow table stays empty: no page may be taken directly.
-            if self.checks != Checks::Slow {
-                table[first..first + snapshot.len()].copy_from_slice(&snapshot);
-            }
-            table.as_ptr() as u64
+            memory.fast.native_table((memory.base >> 12) as usize)
+        } as u64;
+        self.runtime.body = adv_cpu_core::body::BodyContext {
+            window: self.runtime.window as *mut u8,
+            alias: self.runtime.alias as *mut u8,
+            classes: if self.checks == Checks::Slow {
+                self.runtime.classes as *const u8
+            } else {
+                memory.fast.body_table((memory.base >> 12) as usize)
+            },
+            services: self.runtime.body.services,
         };
-        self.snapshot = Some(snapshot);
+        self.classified_epoch = Some(memory.epoch);
     }
 
     /// Empties the indirect table and the shadow stack, which may lead to
@@ -1145,11 +1162,17 @@ impl Native {
             return;
         }
         self.stops.push(stop);
+        if let Some(word) = &self.interrupt {
+            word.fetch_or(
+                adv_sync::pending::STOP,
+                std::sync::atomic::Ordering::Release,
+            );
+        }
         self.clear();
     }
 
     /// Clears the cache as a whole (A64-CTL-1).
-    fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         self.diagnostics.clears += 1;
         self.cache.truncate(self.stub_len);
         self.units.clear();
@@ -1270,7 +1293,12 @@ impl Native {
                     .handler
                     .as_ref()?;
                 let (target, original) = handler.redirect(pc)?;
-                Some((target, original.to_vec()))
+                Some(translate::Redirect {
+                    target,
+                    original: original.to_vec(),
+                    checks: handler.redirect_checks(pc).to_vec(),
+                    body: handler.direct_body(pc),
+                })
             },
             &|pc, code| {
                 if self.bridge.is_null() {
@@ -1477,7 +1505,7 @@ mod tests {
 
     // spec: A64-MEM-8, A64-CTL-8
     #[test]
-    fn raw_permissions_are_pinned_only_while_generated_accesses_can_run() {
+    fn raw_permissions_remain_owned_by_memory() {
         use adv_cpu_core::memory::{EXEC, READ, WRITE};
         use adv_cpu_core::trap::ExecutionTrap;
 
@@ -1649,5 +1677,58 @@ mod tests {
         }
         native.discard_switch_target(targets[0]);
         assert!(native.table.iter().all(|entry| *entry == EMPTY));
+    }
+    // spec: A64-MEM-8, EXEC-CALL-3
+    #[test]
+    fn one_page_changes_keep_both_native_tables_in_place() {
+        let (mut memory, mut native) = native();
+        memory.map(0x8000, 0x2000, READ | WRITE).unwrap();
+        native.classify(&mut memory);
+        let raw = memory.perms.as_ptr();
+        let classes = native.runtime.classes;
+        let body_classes = native.runtime.body.classes;
+        let owner = memory.native_permissions();
+        let derived = owner.as_ptr();
+        drop(owner);
+        memory.protect(0x8000, 0x1000, READ).unwrap();
+        native.classify(&mut memory);
+        assert_eq!(native.runtime.classes, classes);
+        assert_eq!(memory.perms.as_ptr(), raw);
+        assert_eq!(memory.native_permissions().as_ptr(), derived);
+        assert_eq!(native.runtime.body.classes, body_classes);
+        assert_eq!(memory.perms[8], READ);
+        assert_eq!(unsafe { *(classes as *const u8).add(8) } & 7, READ);
+        assert_eq!(unsafe { *body_classes.add(9) } & 7, READ | WRITE);
+        memory.map(0xa000, 0x1000, READ | WRITE).unwrap();
+        native.classify(&mut memory);
+        assert_eq!(memory.perms.as_ptr(), raw);
+        assert_eq!(native.runtime.classes, classes);
+        memory.unmap(0xa000, 0x1000).unwrap();
+        native.classify(&mut memory);
+        assert_eq!(memory.perms.as_ptr(), raw);
+        assert_eq!(native.runtime.classes, classes);
+        memory.watch_code(0x9000, 1);
+        native.classify(&mut memory);
+        assert_eq!(native.runtime.classes, classes);
+        assert_eq!(
+            unsafe { *(classes as *const u8).add(9) } & 7,
+            READ | WRITE | adv_cpu_core::memory::EXEC
+        );
+    }
+
+    // spec: EXEC-CALL-2
+    #[test]
+    fn unchanged_epochs_do_not_classify_aliases() {
+        let (mut memory, mut native) = native();
+        memory.map(0x8000, 0x1000, READ | WRITE).unwrap();
+        native.classify(&mut memory);
+        let classifications = native.classifications;
+        for _ in 0..20 {
+            native.classify(&mut memory);
+        }
+        assert_eq!(native.classifications, classifications);
+        memory.protect(0x8000, 0x1000, READ).unwrap();
+        native.classify(&mut memory);
+        assert_eq!(native.classifications, classifications + 1);
     }
 }

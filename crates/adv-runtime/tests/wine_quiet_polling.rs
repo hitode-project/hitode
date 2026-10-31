@@ -7,9 +7,16 @@ use std::{
     fs::File,
     io::Read,
     os::fd::{AsRawFd, FromRawFd},
-    path::PathBuf,
     time::{Duration, Instant},
 };
+
+#[allow(dead_code)]
+mod wine {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../adv-nt/tests/common/wine.rs"
+    ));
+}
 
 fn until(session: &mut Session, output: &mut File, text: &mut String, expected: &str) {
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -24,11 +31,7 @@ fn until(session: &mut Session, output: &mut File, text: &mut String, expected: 
 // spec: PROC-CLOCK-7, PROC-CLOCK-3, PROC-CLOCK-5, PROC-CLOCK-6
 #[test]
 fn wine_peek_and_time_loop_idles_and_notifications_wake_it() {
-    let (Some(dist), Some(probes)) = (
-        std::env::var_os("ADV_WINE_DIST").map(PathBuf::from),
-        std::env::var_os("ADV_WINE_PROBES").map(PathBuf::from),
-    ) else {
-        eprintln!("skipped: ADV_WINE_DIST or ADV_WINE_PROBES is not set");
+    let Some(wine::Wine { dist, probes }) = wine::wine() else {
         return;
     };
     let root = std::env::temp_dir().join(format!("adv-quiet-poll-{}", std::process::id()));
@@ -95,7 +98,9 @@ fn wine_peek_and_time_loop_idles_and_notifications_wake_it() {
     );
     let after = session.machine.cpu.read_u32(fields[4]).unwrap();
     assert!(
-        after - before < 10,
+        // Windows empty peeks hand off about once per 100 calls, even
+        // with PM_NOYIELD; the completed-body path preserves that cadence.
+        after - before <= 100,
         "quiet round took {} peeks",
         after - before
     );

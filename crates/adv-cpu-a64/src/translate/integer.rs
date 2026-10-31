@@ -39,8 +39,7 @@ pub enum Integer {
     Xadd(Src, u8),
     /// `xchg dst, src`.
     Xchg(Src, u8),
-    CompareExchange(Src, u8, u8),
-    CompareExchange8(Mem, u8),
+    CompareExchange8(Mem),
     Cbw,
     Bswap(u8),
     /// `mul` or `imul` (true) of EAX into EDX:EAX.
@@ -48,6 +47,8 @@ pub enum Integer {
     /// `div` or `idiv` (true) of EDX:EAX, with the helper that raises #DE.
     Divide(Src, bool, u8),
     Sahf,
+    Lea16(u8, Mem),
+    ReadSegment(Part, u8, u8),
     TestBit(Src, u8),
     Bit(M, Part, Part, u8),
     Product(Part, Option<(Part, Option<u32>)>, bool, u8),
@@ -114,12 +115,13 @@ impl Integer {
             }
             Integer::Xadd(dst, _) => (F::NONE, F::ALL, mem(dst)),
             Integer::Xchg(dst, _) => (F::NONE, F::NONE, mem(dst)),
-            Integer::CompareExchange(dst, ..) => (F::NONE, F::ALL, mem(dst)),
             Integer::CompareExchange8(..) => (F::NONE, F::ZF, true),
             Integer::Bswap(_) | Integer::Cbw => (F::NONE, F::NONE, false),
             Integer::Multiply(src, _) => (F::NONE, F::CF.or(F::OF), mem(src)),
             // The helper reads every flag.
             Integer::Divide(..) => (F::NONE, F::NONE, true),
+            Integer::Lea16(..) => (F::NONE, F::NONE, false),
+            Integer::ReadSegment(_, _, _) => (F::NONE, F::NONE, true),
             Integer::Sahf => (F::NONE, F::ALL.minus(F::OF), false),
             Integer::TestBit(src, _) => (F::NONE, F::CF, mem(src)),
         }
@@ -144,6 +146,14 @@ pub fn plan(instruction: &Instruction, helper: u8) -> Option<Integer> {
         _ => None,
     };
     let mnemonic = instruction.mnemonic();
+    if mnemonic == M::Lea && instruction.op0_register().is_gpr16() {
+        let mut mem = memory_sized(instruction)?;
+        mem.fs = false;
+        return Some(Integer::Lea16(
+            instruction.op0_register().number() as u8,
+            mem,
+        ));
+    }
     // Locked exchanges are ordinary ones: guest threads take turns.
     if instruction.has_lock_prefix()
         && !(matches!(
@@ -162,7 +172,7 @@ pub fn plan(instruction: &Instruction, helper: u8) -> Option<Integer> {
         return None;
     }
     if mnemonic == M::Cmpxchg8b && instruction.op0_kind() == OpKind::Memory {
-        return Some(Integer::CompareExchange8(memory(instruction)?, helper));
+        return Some(Integer::CompareExchange8(memory_sized(instruction)?));
     }
     let width = match instruction.op0_kind() {
         OpKind::Register => instruction.op0_register().size() as u8,
@@ -275,6 +285,21 @@ pub fn plan(instruction: &Instruction, helper: u8) -> Option<Integer> {
             return Some(Integer::Exchange(mnemonic, part(0)?, src, width));
         }
     }
+    if mnemonic == M::Mov
+        && instruction.op1_kind() == OpKind::Register
+        && instruction.op1_register().is_segment_register()
+    {
+        let width = if instruction.op0_kind() == OpKind::Memory {
+            2
+        } else {
+            instruction.op0_register().size() as u8
+        };
+        return Some(Integer::ReadSegment(
+            super::decode::part(instruction, 0, width)?,
+            width,
+            instruction.op1_register().number() as u8,
+        ));
+    }
     let dst = instruction.op0_register();
     if instruction.op0_kind() == OpKind::Register && (dst.is_gpr8() || dst.is_gpr16()) {
         let width = dst.size() as u8;
@@ -338,7 +363,7 @@ pub fn plan(instruction: &Instruction, helper: u8) -> Option<Integer> {
         }
         M::Xadd => Integer::Xadd(operand(0)?, register(1)?),
         M::Xchg => Integer::Xchg(operand(0)?, register(1)?),
-        M::Cmpxchg => Integer::CompareExchange(operand(0)?, register(1)?, helper),
+        M::Cmpxchg => Integer::Exchange(M::Cmpxchg, part(0)?, register(1)?, width),
         M::Bswap => Integer::Bswap(instruction.op0_register().number() as u8),
         M::Mul | M::Imul if instruction.op_count() == 1 => {
             Integer::Multiply(operand(0)?, mnemonic == M::Imul)
@@ -476,8 +501,7 @@ impl Translator<'_> {
             Integer::Through(left, dst, count) => self.through(left, dst, count),
             Integer::Xadd(dst, src) => self.xadd(dst, src),
             Integer::Xchg(dst, src) => self.xchg(dst, src),
-            Integer::CompareExchange(dst, src, helper) => self.compare_exchange(dst, src, helper),
-            Integer::CompareExchange8(mem, helper) => self.compare_exchange8(mem, helper),
+            Integer::CompareExchange8(mem) => self.compare_exchange8(mem),
             Integer::Cbw => {
                 self.clobber(Operand::Guest(EAX));
                 self.emit_all(&[sbfx(W, X13, host(EAX), 0, 8), bfi(W, host(EAX), X13, 0, 16)]);
@@ -493,6 +517,21 @@ impl Translator<'_> {
             }
             Integer::Multiply(src, signed) => self.multiply(src, signed),
             Integer::Divide(src, signed, helper) => self.divide(src, signed, helper),
+            Integer::Lea16(dst, mem) => {
+                let address = self.effective(mem);
+                self.emit(mov(W, X6, address));
+                self.narrow_write(Part::Reg(dst), 2, Reg::ZR, X6);
+            }
+            Integer::ReadSegment(dst, width, segment) => {
+                let address = self.part_address(dst);
+                self.emit(ldr(X, X13, super::RUNTIME, crate::runtime::CPU_STATE));
+                self.emit(ldrh(
+                    X6,
+                    X13,
+                    crate::runtime::SEGMENTS + 2 * u32::from(segment),
+                ));
+                self.narrow_write(dst, width, address, X6);
+            }
             Integer::Sahf => self.sahf(),
             Integer::TestBit(src, bit) => {
                 let source = self.source(src);
@@ -522,7 +561,7 @@ impl Translator<'_> {
         }
     }
 
-    fn part_address(&mut self, part: Part) -> Reg {
+    pub(super) fn part_address(&mut self, part: Part) -> Reg {
         match part {
             Part::Mem(mem) => self.effective(mem),
             _ => Reg::ZR,
@@ -712,72 +751,13 @@ impl Translator<'_> {
         };
     }
 
-    fn compare_exchange(&mut self, dst: Src, src: u8, helper: u8) {
-        self.flush_simd();
-        self.canonicalize();
-        let slow = self.asm.label();
-        let done = self.asm.label();
-        match dst {
-            Src::Reg(index) => self.emit(mov(W, X6, host(index))),
-            Src::Mem(mem) => {
-                let address = self.effective(mem);
-                self.emit_all(&[mov(W, X17, address), and_imm(W, X13, X17, 3)]);
-                self.asm.cbz(W, true, X13, slow);
-                let load = ldr_reg(W, X6, super::WINDOW, X17, false);
-                self.access_or(X17, 4, false, load, slow);
-            }
-            Src::Imm(_) => unreachable!(),
-        }
-        self.emit_all(&[mov(W, X15, host(EAX)), eor(W, X13, X15, X6, Lsl, 0)]);
-        let unequal = self.asm.label();
-        let flags = self.asm.label();
-        self.asm.cbz(W, true, X13, unequal);
-        match dst {
-            Src::Reg(index) => self.emit(mov(W, host(index), host(src))),
-            Src::Mem(_) => {
-                let store = str_reg(W, host(src), super::WINDOW, X17, false);
-                self.access_or(X17, 4, true, store, slow);
-            }
-            Src::Imm(_) => unreachable!(),
-        }
-        self.asm.b(flags);
-        self.asm.bind(unequal);
-        if matches!(dst, Src::Mem(_)) {
-            // A mismatch still writes: read-only destinations must fault before
-            // changing either EAX or the comparison flags.
-            let store = str_reg(W, X6, super::WINDOW, X17, false);
-            self.access_or(X17, 4, true, store, slow);
-        }
-        self.emit(mov(W, host(EAX), X6));
-        self.asm.bind(flags);
-        self.emit_all(&[
-            subs(W, X14, X15, X6, Lsl, 0),
-            mov(W, X10, X14),
-            eor(W, X11, X15, X6, Lsl, 0),
-            eor(W, X11, X11, X14, Lsl, 0),
-        ]);
-        self.asm.b(done);
-        self.asm.bind(slow);
-        self.helper(helper);
-        self.asm.bind(done);
-        self.state = State::CANONICAL;
-    }
-
-    fn compare_exchange8(&mut self, mem: Mem, helper: u8) {
+    fn compare_exchange8(&mut self, mem: Mem) {
         self.flush_simd();
         self.canonicalize();
         let address = self.effective(mem);
         self.emit(mov(W, X17, address));
-        let slow = self.asm.label();
-        self.emit(and_imm(W, X13, X17, 7));
-        self.asm.cbz(W, true, X13, slow);
-        self.access_or(
-            X17,
-            8,
-            false,
-            ldr_reg(X, X6, super::WINDOW, X17, false),
-            slow,
-        );
+        self.vector_access(VMem::D, VReg::new(0), X17, false);
+        self.emit(fmov_from_v(X, X6, VReg::new(0)));
         self.emit_all(&[
             orr(X, X13, host(EAX), host(EDX), Lsl, 32),
             eor(X, X13, X13, X6, Lsl, 0),
@@ -786,23 +766,13 @@ impl Translator<'_> {
         let done = self.asm.label();
         self.asm.cbz(X, true, X13, unequal);
         self.emit(orr(X, X15, host(3), host(ECX), Lsl, 32));
-        self.access_or(
-            X17,
-            8,
-            true,
-            str_reg(X, X15, super::WINDOW, X17, false),
-            slow,
-        );
+        self.emit(fmov_to_v(X, VReg::new(0), X15));
+        self.vector_access(VMem::D, VReg::new(0), X17, true);
         self.emit_all(&[mrs_nzcv(X14), orr_imm(X, X14, X14, 1 << 30), msr_nzcv(X14)]);
         self.asm.b(done);
         self.asm.bind(unequal);
-        self.access_or(
-            X17,
-            8,
-            true,
-            str_reg(X, X6, super::WINDOW, X17, false),
-            slow,
-        );
+        self.emit(fmov_to_v(X, VReg::new(0), X6));
+        self.vector_access(VMem::D, VReg::new(0), X17, true);
         self.emit_all(&[
             mov(W, host(EAX), X6),
             lsr_imm(X, X13, X6, 32),
@@ -811,9 +781,6 @@ impl Translator<'_> {
             and_imm(X, X14, X14, !(1u64 << 30)),
             msr_nzcv(X14),
         ]);
-        self.asm.b(done);
-        self.asm.bind(slow);
-        self.helper(helper);
         self.asm.bind(done);
         self.state = State::CANONICAL;
     }

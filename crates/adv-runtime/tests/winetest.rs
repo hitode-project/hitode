@@ -13,6 +13,14 @@ use std::time::{Duration, Instant};
 
 use adv_runtime::wine::session::{Config, Session, Stop};
 
+#[allow(dead_code)]
+mod wine {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../adv-nt/tests/common/wine.rs"
+    ));
+}
+
 /// Cases that pass on standard Wine, as `<module>_<test>`.
 const CASES: &[&str] = &[
     "gdi32_bitmap",
@@ -64,8 +72,7 @@ fn wine_conformance_cases_pass() {
     if std::env::var_os(CASE).is_some() {
         return;
     }
-    if std::env::var_os("ADV_WINE_DIST").is_none() || std::env::var_os("ADV_WINETEST_DIR").is_none()
-    {
+    if wine::dist().is_none() || std::env::var_os("ADV_WINETEST_DIR").is_none() {
         eprintln!("skipped: ADV_WINE_DIST or ADV_WINETEST_DIR is not set");
         return;
     }
@@ -107,7 +114,7 @@ fn run_case() {
         return;
     };
     let case = case.into_string().unwrap();
-    let dist = PathBuf::from(std::env::var_os("ADV_WINE_DIST").unwrap());
+    let dist = wine::dist().unwrap();
     let tests = PathBuf::from(std::env::var_os("ADV_WINETEST_DIR").unwrap());
     let root = std::env::temp_dir().join(format!("adv-winetest-{case}-{}", std::process::id()));
     let game = root.join("game");

@@ -69,6 +69,9 @@ pub enum Outcome {
     },
     /// Resume a checked architectural checkpoint without an API return epilogue.
     ResumeExecution(crate::exception::Checkpoint),
+    /// Raise the guest exception `fault` would, as if the function's first
+    /// instruction at `fault.pc` faulted.
+    Raise(adv_cpu::backend::Fault),
     /// End the innermost guest call on this context as if its callee had
     /// returned this EAX, abandoning the current host call and the guest
     /// frames between them (NtCallbackReturn). The current host call must be

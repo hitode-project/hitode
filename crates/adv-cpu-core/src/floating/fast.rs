@@ -82,6 +82,9 @@ pub enum Fast {
     Round,
     Scale,
     Examine,
+    Load80,
+    Store80,
+    Leaf(M),
 }
 
 fn st(r: R) -> Option<u8> {
@@ -118,7 +121,7 @@ fn source(i: &Instruction, integer: bool) -> Option<Source> {
 }
 
 pub fn classify(i: &Instruction) -> Option<Fast> {
-    if i.has_lock_prefix() || i.segment_prefix() == R::GS {
+    if i.has_lock_prefix() {
         return None;
     }
     let m = i.mnemonic();
@@ -483,7 +486,10 @@ pub fn execute(
     memory: &mut Memory,
 ) -> Option<u32> {
     // Classified for a64 only; shared callers keep the path they had before.
-    if matches!(fast, Fast::Round | Fast::Scale | Fast::Examine) {
+    if matches!(
+        fast,
+        Fast::Round | Fast::Scale | Fast::Examine | Fast::Load80 | Fast::Store80 | Fast::Leaf(_)
+    ) {
         return execute_other(op, state, memory);
     }
     let i = &op.instruction;
@@ -507,7 +513,12 @@ pub fn execute(
     match fast {
         // ES and deferred MMX were checked above. WAIT changes neither C1 nor
         // the last x87 instruction/data metadata, regardless of the control word.
-        Fast::Round | Fast::Scale | Fast::Examine => unreachable!(),
+        Fast::Round
+        | Fast::Scale
+        | Fast::Examine
+        | Fast::Load80
+        | Fast::Store80
+        | Fast::Leaf(_) => unreachable!(),
         Fast::Wait => metadata = false,
         Fast::Load(source) => {
             let (value, at) = raw::source(source, i, state, memory)?;

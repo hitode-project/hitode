@@ -56,7 +56,7 @@ pub fn configure(control: u16) {
     // SAFETY: the shim modifies only this thread's SoftFloat operation settings.
     unsafe { adv_sf_config(rounding(control >> 10), precision) }
 }
-pub(super) fn configure_sse(mxcsr: u32) {
+pub fn configure_sse(mxcsr: u32) {
     unsafe { adv_sf_config(rounding((mxcsr >> 13) as u16), 80) }
 }
 pub fn flags() -> u16 {
@@ -75,12 +75,12 @@ pub(super) fn binary(a: X87Register, b: X87Register, op: u8) -> X87Register {
 pub fn rounded_up() -> bool {
     unsafe { adv_sf_round_up() != 0 }
 }
-pub(super) fn unary(a: X87Register, op: u8) -> X87Register {
+pub fn unary(a: X87Register, op: u8) -> X87Register {
     let mut out = Extended::default();
     unsafe { adv_sf_ext_unary(&a.into(), &mut out, op) };
     out.into()
 }
-pub(super) fn from(bits: u64, kind: u8) -> X87Register {
+pub fn from(bits: u64, kind: u8) -> X87Register {
     let mut out = Extended::default();
     unsafe { adv_sf_ext_from(bits, kind, &mut out) };
     out.into()
@@ -91,10 +91,10 @@ pub fn to(a: X87Register, kind: u8, rc: u8) -> u64 {
 pub(super) fn compare(a: X87Register, b: X87Register, signal: bool) -> u8 {
     unsafe { adv_sf_ext_compare(&a.into(), &b.into(), u8::from(signal)) }
 }
-pub(super) fn sse_binary(a: u64, b: u64, op: u8, width: u8) -> u64 {
+pub fn sse_binary(a: u64, b: u64, op: u8, width: u8) -> u64 {
     unsafe { adv_sf_sse_binary(a, b, op, width) }
 }
-pub(super) fn sse_convert(bits: u64, from: u8, to: u8, rc: u8) -> u64 {
+pub fn sse_convert(bits: u64, from: u8, to: u8, rc: u8) -> u64 {
     unsafe { adv_sf_sse_convert(bits, from, to, rc) }
 }
 pub(super) fn scale(a: X87Register, count: i32) -> X87Register {

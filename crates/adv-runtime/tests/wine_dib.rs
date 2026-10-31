@@ -5,6 +5,14 @@ mod common;
 
 use adv_machine::{Env, HostFn, Outcome, Resolver};
 
+#[allow(dead_code)]
+mod wine {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../adv-nt/tests/common/wine.rs"
+    ));
+}
+
 #[derive(Default)]
 struct Calls(std::collections::HashMap<String, u32>);
 struct Platform;
@@ -37,8 +45,7 @@ fn counted(env: &mut Env<'_>) -> Outcome {
 // spec: NAT-ID-2, NAT-BODY-4
 #[test]
 fn offscreen_gdi_reaches_dib_bodies() {
-    if std::env::var_os("ADV_WINE_DIST").is_none() || std::env::var_os("ADV_WINE_PROBES").is_none()
-    {
+    if wine::wine().is_none() {
         return;
     }
     // Each run needs its own process because Wine's server holds global state.

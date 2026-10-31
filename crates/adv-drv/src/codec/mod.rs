@@ -33,20 +33,6 @@ struct Images {
 pub fn install(ext: &mut Ext, mode: Mode) {
     if mode == Mode::Native {
         ext.insert(adv_machine::NativeAdmission(rows::admit));
-        ext.insert(adv_nt::native::InflateFast::new(
-            adv_device::codec_kernel::inflate_fast,
-        ));
-        ext.insert(adv_nt::native::PngRows(|filter, row, previous, bpp| {
-            use adv_device::codec_kernel;
-            use adv_nt::native::PngFilter;
-            match filter {
-                PngFilter::Sub => codec_kernel::png_sub(row, bpp),
-                PngFilter::Up => codec_kernel::png_up(row, previous),
-                PngFilter::Average => codec_kernel::png_average(row, previous, bpp),
-                PngFilter::Paeth => codec_kernel::png_paeth(row, previous, bpp),
-            }
-            .is_ok()
-        }));
     }
     ext.insert(Images {
         mode,

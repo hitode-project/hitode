@@ -688,7 +688,10 @@ mod tests {
             ..Default::default()
         }));
         assert!(!wake.wait(Some(Duration::ZERO)).unwrap());
-        assert!(!wake.interrupt_flag().load(Ordering::Acquire));
+        assert_eq!(
+            wake.interrupt_flag().load(Ordering::Acquire) & adv_sync::pending::INTERRUPT,
+            0
+        );
         let mut performance = performance::Performance::default();
         assert!(worker.pump(&mut performance).is_empty());
         #[cfg(host_view)]

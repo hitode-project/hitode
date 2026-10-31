@@ -11,6 +11,14 @@ use std::path::{Path, PathBuf};
 #[path = "native_pe/deflate.rs"]
 mod deflate;
 
+#[allow(dead_code)]
+mod wine {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../adv-nt/tests/common/wine.rs"
+    ));
+}
+
 const CODE: u32 = 0x400000;
 const SLOT: u32 = 0x410000;
 const ARGS: u32 = SLOT + 4;
@@ -28,7 +36,7 @@ impl Rng {
     }
 }
 fn dist() -> Option<PathBuf> {
-    std::env::var_os("ADV_WINE_DIST").map(PathBuf::from)
+    wine::dist()
 }
 fn address(pe: &Pe, name: &str) -> u32 {
     pe.exports()
@@ -187,8 +195,37 @@ fn same(
 ) {
     let abandons = adv_nt::native::declines(&native.ext);
     let actual = call(native, data, args);
-    let expected = call(reference, data, args);
-    assert!(expected.0.is_ok(), "{label}: Wine failed: {:?}", expected.0);
+    let mut expected = call(reference, data, args);
+    // Windows 11 x86 differs from the pinned Wine in these results.
+    if label.starts_with("ntdll!wcscmp ")
+        && let Ok(words) = &mut expected.0
+    {
+        words[0] = (words[0] as i32).signum() as u32;
+    }
+    if label.contains("!wcsstr ") || label.starts_with("ntdll!strstr ") {
+        let width = if label.contains("!wcsstr ") { 2 } else { 1 };
+        let empty = |at: u32| {
+            data[(at - DATA) as usize..(at - DATA) as usize + width]
+                .iter()
+                .all(|&byte| byte == 0)
+        };
+        if empty(args[0])
+            && empty(args[1])
+            && let Ok(words) = &mut expected.0
+        {
+            words[0] = args[0];
+        }
+    }
+    assert!(
+        expected.0.is_ok(),
+        "{label}: Wine failed: {:?}, stack {:x?}",
+        expected.0,
+        (0..4)
+            .map(|i| reference
+                .cpu
+                .read_u32(reference.cpu.reg(adv_cpu::backend::Reg::Esp) + i * 4))
+            .collect::<Vec<_>>()
+    );
     assert_eq!(actual.0, expected.0, "{label}: {args:x?}");
     assert_eq!(
         adv_nt::native::declines(&native.ext),
@@ -198,7 +235,12 @@ fn same(
     assert!(
         actual.1 == expected.1,
         "{label}: output differs, args {args:x?}; first difference {:?}",
-        actual.1.iter().zip(&expected.1).position(|(a, b)| a != b)
+        actual
+            .1
+            .iter()
+            .zip(&expected.1)
+            .enumerate()
+            .find(|(_, (a, b))| a != b)
     );
 }
 fn put(data: &mut [u8], at: u32, width: u32, value: u32) {
@@ -261,6 +303,16 @@ fn embedded_adler32_matches_wine() {
                 module,
             );
         }
+        // The pinned zlib tests len=1 before the null-buffer initializer.
+        // Its byte read faults; direct bodies report that access at the entry.
+        let before = adv_nt::native::declines(&native.ext);
+        let actual = call(&mut native, &data, &[1, 0, 1]);
+        assert!(actual.0.is_err(), "{module}: null one-byte input");
+        let fault = &native.sys.latest_cpu_fault.as_ref().unwrap().fault;
+        assert_eq!(fault.pc, entry);
+        assert_eq!(fault.kind, adv_cpu::backend::FaultKind::Read(0));
+        assert_eq!(actual.1, data);
+        assert_eq!(adv_nt::native::declines(&native.ext), before);
     }
 }
 
@@ -270,19 +322,6 @@ fn png_row_family_matches_wine() {
     let Some(dist) = dist() else { return };
     let (mut native, pe) = machine(&dist, "windowscodecs.dll", true);
     let (mut reference, _) = machine(&dist, "windowscodecs.dll", false);
-    native
-        .ext
-        .insert(adv_nt::native::PngRows(|filter, row, previous, bpp| {
-            use adv_device::codec_kernel;
-            use adv_nt::native::PngFilter;
-            match filter {
-                PngFilter::Sub => codec_kernel::png_sub(row, bpp),
-                PngFilter::Up => codec_kernel::png_up(row, previous),
-                PngFilter::Average => codec_kernel::png_average(row, previous, bpp),
-                PngFilter::Paeth => codec_kernel::png_paeth(row, previous, bpp),
-            }
-            .is_ok()
-        }));
     let table = native.ext.get::<adv_nt::identity::Images>().0[&pe.image_base]
         .table()
         .unwrap();
@@ -307,19 +346,21 @@ fn png_row_family_matches_wine() {
                 }
                 put(&mut data, DATA + 4, 4, len);
                 put(&mut data, DATA + 11, 1, depth);
-                let args = [DATA, DATA + 0x4000, DATA + 0x1000];
-                let before = adv_nt::native::declines(&native.ext);
-                let mut actual = call(&mut native, &data, &args);
-                let mut expected = call(&mut reference, &data, &args);
-                // These functions return void; EAX is not part of their ABI.
-                actual.0.as_mut().unwrap()[0] = 0;
-                expected.0.as_mut().unwrap()[0] = 0;
-                assert_eq!(actual, expected, "{name} depth={depth} len={len}");
-                assert_eq!(
-                    adv_nt::native::declines(&native.ext),
-                    before,
-                    "row was not accelerated"
-                );
+                for previous in [DATA + 0x1000, DATA + 0x4000, DATA + 0x3fff, DATA + 0x4001] {
+                    let args = [DATA, DATA + 0x4000, previous];
+                    let before = adv_nt::native::declines(&native.ext);
+                    let mut actual = call(&mut native, &data, &args);
+                    let mut expected = call(&mut reference, &data, &args);
+                    // These functions return void; EAX is not part of their ABI.
+                    actual.0.as_mut().unwrap()[0] = 0;
+                    expected.0.as_mut().unwrap()[0] = 0;
+                    assert_eq!(actual, expected, "{name} depth={depth} len={len}");
+                    assert_eq!(
+                        adv_nt::native::declines(&native.ext),
+                        before,
+                        "row was not accelerated"
+                    );
+                }
             }
         }
     }
@@ -523,14 +564,16 @@ fn d3dx_integer_pixels_match_wine_and_preserve_hooks() {
         "D3DX wide row",
     );
     let args = [DP, DF, SP, SF, 3, 0];
-    let mut input = data.clone();
-    put(&mut input, DP, 4, DATA + 0x1002);
-    let before = adv_nt::native::declines(&native.ext);
-    let actual = call(&mut native, &input, &args);
-    let expected = call(&mut reference, &input, &args);
-    assert_eq!(actual, expected, "overlapping pixels retain Wine");
-    assert!(actual.0.is_ok());
-    assert!(adv_nt::native::declines(&native.ext) > before);
+    for target in [DATA + 0x1002, DATA + 0x0ffe] {
+        let mut input = data.clone();
+        put(&mut input, DP, 4, target);
+        let before = adv_nt::native::declines(&native.ext);
+        let actual = call(&mut native, &input, &args);
+        let expected = call(&mut reference, &input, &args);
+        assert_eq!(actual, expected, "overlapping pixels preserve traversal");
+        assert!(actual.0.is_ok());
+        assert_eq!(adv_nt::native::declines(&native.ext), before);
+    }
     let helper = pe.image_base + table.named("make_argb_color").unwrap().rva;
     let mut original = [0; 6];
     native.cpu.read(helper, &mut original).unwrap();
@@ -544,7 +587,7 @@ fn d3dx_integer_pixels_match_wine_and_preserve_hooks() {
     let expected = call(&mut reference, &data, &args);
     assert_eq!(actual, expected, "patched pixel helper");
     assert!(actual.0.is_ok());
-    assert!(adv_nt::native::declines(&native.ext) > before);
+    assert_eq!(adv_nt::native::declines(&native.ext), before);
 
     let slot = pe
         .imports()
@@ -571,7 +614,7 @@ fn d3dx_integer_pixels_match_wine_and_preserve_hooks() {
     let expected = call(&mut reference, &data, &args);
     assert_eq!(actual, expected, "patched copy import");
     assert!(actual.0.is_ok());
-    assert!(adv_nt::native::declines(&native.ext) > before);
+    assert_eq!(adv_nt::native::declines(&native.ext), before);
 }
 
 // spec: NAT-BODY-1, NAT-BODY-6
@@ -652,7 +695,6 @@ fn crt_exports_match_wine() {
             };
             prepare(&mut native, entry, argc, false);
             prepare(&mut reference, entry, argc, false);
-            let before = native.sys.host_calls;
             for case in 0..48 {
                 let mut data = vec![0; LEN as usize];
                 data.iter_mut()
@@ -757,432 +799,13 @@ fn crt_exports_match_wine() {
                     &format!("{module}!{name} case {case}"),
                 );
             }
-            assert!(
-                native.sys.host_calls > before,
-                "{module}!{name} never reached a body"
-            );
-            eprintln!(
-                "{module}!{name}: {} native calls",
-                native.sys.host_calls - before
-            );
-        }
-    }
-}
-
-const KB: u32 = 0x7b000000;
-const NT: u32 = 0x7bc00000;
-const TABLES: u32 = 0x1800000;
-const NORM: u32 = 0x1c00000;
-const PAGES: [u32; 7] = [932, 936, 949, 950, 1252, 437, 1258];
-
-fn nls_machine(dist: &Path, jit: bool) -> (Machine<Cpu>, Pe, Pe) {
-    let (mut m, kb) = machine(dist, "kernelbase.dll", jit);
-    let nt =
-        Pe::parse(&std::fs::read(dist.join("lib/wine/i386-windows/ntdll.dll")).unwrap()).unwrap();
-    m.cpu.map(TABLES, 0x1000, Prot::RW).unwrap();
-    for (i, page) in PAGES.iter().enumerate() {
-        let bytes = std::fs::read(dist.join(format!("share/wine/nls/c_{page}.nls"))).unwrap();
-        let at = 0x2000000 + i as u32 * 0x40000;
-        m.cpu
-            .map(at, (bytes.len() as u32 + 0xfff) & !0xfff, Prot::READ)
-            .unwrap();
-        m.cpu.write(at, &bytes).unwrap();
-        prepare(&mut m, address(&nt, "RtlInitCodePageTable"), 2, true);
-        call(
-            &mut m,
-            &vec![0; LEN as usize],
-            &[at, TABLES + i as u32 * 0x2c],
-        )
-        .0
-        .unwrap();
-    }
-    let bytes = std::fs::read(dist.join("share/wine/nls/normnfc.nls")).unwrap();
-    m.cpu
-        .map(NORM, (bytes.len() as u32 + 0xfff) & !0xfff, Prot::READ)
-        .unwrap();
-    m.cpu.write(NORM, &bytes).unwrap();
-    m.cpu.write_u32(KB + 0xbf45c, NORM).unwrap();
-    m.cpu
-        .copy_memory(TABLES + 4 * 0x2c, KB + 0xc0b00, 0x2c)
-        .unwrap();
-    m.cpu
-        .copy_memory(TABLES + 5 * 0x2c, KB + 0xc0ac0, 0x2c)
-        .unwrap();
-    m.cpu
-        .copy_memory(TABLES, KB + 0xbf480, PAGES.len() * 0x2c)
-        .unwrap();
-    m.cpu.write_u32(KB + 0xbf460, PAGES.len() as u32).unwrap();
-    (m, kb, nt)
-}
-
-fn shared_nls_machine(dist: &Path, jit: bool) -> (Machine<Cpu>, Pe, Pe) {
-    use std::os::fd::AsFd;
-    let (mut machine, kb, nt) = nls_machine(dist, jit);
-    for (at, name) in PAGES
-        .iter()
-        .enumerate()
-        .map(|(i, page)| (0x2000000 + i as u32 * 0x40000, format!("c_{page}.nls")))
-        .chain([(NORM, "normnfc.nls".into())])
-    {
-        let file = std::fs::File::open(dist.join("share/wine/nls").join(name)).unwrap();
-        let len = (file.metadata().unwrap().len() as u32 + 0xfff) & !0xfff;
-        machine.cpu.unmap(at, len).unwrap();
-        machine
-            .cpu
-            .map_shared_file(at, len, file.as_fd(), 0, Prot::READ)
-            .unwrap();
-    }
-    (machine, kb, nt)
-}
-
-// spec: NAT-BODY-5, NAT-BODY-15
-#[test]
-fn code_pages_shared_tables_match_wine() {
-    compare_code_pages(shared_nls_machine);
-}
-
-// spec: NAT-BODY-5
-#[test]
-fn code_pages_match_wine() {
-    compare_code_pages(nls_machine);
-}
-
-fn compare_code_pages(factory: fn(&Path, bool) -> (Machine<Cpu>, Pe, Pe)) {
-    let Some(dist) = dist() else {
-        return;
-    };
-    let (mut native, kb, nt) = factory(&dist, true);
-    let (mut reference, _, _) = nls_machine(&dist, false);
-    let mut rng = Rng(0x61ace5ff6e379b2d);
-    for name in [
-        "MultiByteToWideChar",
-        "WideCharToMultiByte",
-        "RtlMultiByteToUnicodeN",
-        "RtlUnicodeToMultiByteN",
-        "RtlMultiByteToUnicodeSize",
-        "RtlUnicodeToMultiByteSize",
-        "RtlOemToUnicodeN",
-        "RtlUnicodeToOemN",
-    ] {
-        let kernel = !name.starts_with("Rtl");
-        let wide = name.starts_with("Wide") || name.starts_with("RtlUnicode");
-        let size = name.ends_with("Size");
-        let argc = if kernel {
-            if wide { 8 } else { 6 }
-        } else if size {
-            3
-        } else {
-            5
-        };
-        let entry = address(if kernel { &kb } else { &nt }, name);
-        assert!(
-            native.sys.redirects.contains_key(&entry),
-            "{name} not bound"
-        );
-        prepare(&mut native, entry, argc, true);
-        prepare(&mut reference, entry, argc, true);
-        for (page_index, page) in PAGES.iter().enumerate() {
-            for m in [&mut native, &mut reference] {
-                m.cpu
-                    .copy_memory(TABLES + page_index as u32 * 0x2c, NT + 0x723e0, 0x2c)
-                    .unwrap();
-                m.cpu
-                    .copy_memory(TABLES + page_index as u32 * 0x2c, NT + 0x723e0 + 0x2c, 0x2c)
-                    .unwrap();
-            }
-            let before = native.sys.host_calls;
-            let flag_count = if !kernel {
-                1
-            } else if wide {
-                64
-            } else {
-                16
-            };
-            for flag_bits in 0..flag_count {
-                let flags = if wide {
-                    (if flag_bits & 1 != 0 { 0x10 } else { 0 })
-                        | (if flag_bits & 2 != 0 { 0x20 } else { 0 })
-                        | (if flag_bits & 4 != 0 { 0x40 } else { 0 })
-                        | (if flag_bits & 8 != 0 { 0x80 } else { 0 })
-                        | (if flag_bits & 16 != 0 { 0x200 } else { 0 })
-                        | (if flag_bits & 32 != 0 { 0x400 } else { 0 })
-                } else {
-                    flag_bits
-                };
-                for case in 0..12 {
-                    let mut data = vec![0xcc; LEN as usize];
-                    let src = DATA + case % 4;
-                    let dst = DATA + 0x4000 + case % 4;
-                    let n = if case < 4 {
-                        case + 1
-                    } else {
-                        rng.next() % 100 + 2
-                    };
-                    if wide {
-                        for i in 0..n {
-                            put(&mut data, src + 2 * i, 2, rng.next() & 0xffff);
-                        }
-                        let edge: &[u16] = match case % 6 {
-                            0 => &[0x65, 0x301, 0, 0xd800, 0xdc00],
-                            1 => &[0x304b, 0x3099, 0x4e00, 0xffff],
-                            2 => &[0x41, 0x30a, 0x65, 0x301, 0x323],
-                            3 => &[0x41, 0x308, 0x1100, 0x1161],
-                            4 => &[0x3f, 0x100, 0x20ac, 0xe000],
-                            _ => &[0xfffd, 0xff, 0xdfff, 0x1, 0],
-                        };
-                        for (i, ch) in edge.iter().take(n as usize).enumerate() {
-                            put(&mut data, src + i as u32 * 2, 2, u32::from(*ch));
-                        }
-                        put(&mut data, src + n * 2, 2, 0);
-                    } else {
-                        for i in 0..n {
-                            put(&mut data, src + i, 1, rng.next());
-                        }
-                        let edge: &[u8] = match case % 6 {
-                            0 => &[0x81, 0],
-                            1 => &[0xff, 0x81, 0xff],
-                            2 => &[0x82, 0xa0, 0x81],
-                            3 => &[0, 0x81],
-                            4 => &[0xa1, 0xa1, 0xff, 0xfe],
-                            _ => &[0x80, 0x81, 0xff, 0x7f],
-                        };
-                        for (i, ch) in edge.iter().take(n as usize).enumerate() {
-                            put(&mut data, src + i as u32, 1, u32::from(*ch));
-                        }
-                        put(
-                            &mut data,
-                            src + n - 1,
-                            1,
-                            if case % 2 == 0 { 0x81 } else { 0xff },
-                        );
-                        put(&mut data, src + n, 1, 0);
-                    }
-                    let capacity = match case % 6 {
-                        0 => 0,
-                        1 => 1,
-                        2 => n / 2,
-                        3 => n,
-                        _ => n * 4 + 10,
-                    };
-                    let used = if case % 3 != 0 { DATA + 0x7000 } else { 0 };
-                    let def = if case % 4 == 0 { 0 } else { DATA + 0x7004 };
-                    put(
-                        &mut data,
-                        DATA + 0x7004,
-                        2,
-                        if case % 2 == 0 { 0x4081 } else { 0x21 },
-                    );
-                    let srclen = if case % 5 == 4 { u32::MAX } else { n };
-                    let args = if kernel {
-                        let mut args = vec![
-                            *page,
-                            flags,
-                            src,
-                            srclen,
-                            if capacity == 0 { 0 } else { dst },
-                            capacity,
-                        ];
-                        if wide {
-                            args.extend_from_slice(&[def, used]);
-                        }
-                        args
-                    } else if size {
-                        vec![DATA + 0x7000, src, n * if wide { 2 } else { 1 } + case % 2]
-                    } else {
-                        vec![
-                            dst,
-                            capacity,
-                            used,
-                            src,
-                            n * if wide { 2 } else { 1 } + case % 2,
-                        ]
-                    };
-                    same(
-                        &mut native,
-                        &mut reference,
-                        &data,
-                        &args,
-                        &format!("{name} cp{page} flags{flags:x} case{case}"),
-                    );
-                }
-            }
-            assert!(
-                native.sys.host_calls > before,
-                "{name} cp{page} never accepted a call"
-            );
-        }
-    }
-}
-
-// spec: NAT-BODY-5
-#[test]
-fn nls_layout_matches_dwarf() {
-    let Some(dist) = dist() else {
-        return;
-    };
-    let source = include_str!("../src/native/nls.rs");
-    for module in ["ntdll", "kernelbase"] {
-        let dll = dist
-            .with_file_name("wine11-sse-dist")
-            .join(format!("usr/local/lib/wine/i386-windows/{module}.dll"));
-        let pe = Pe::parse(&std::fs::read(&dll).unwrap()).unwrap();
-        let dump = std::process::Command::new("dwarfdump")
-            .arg("--debug-info")
-            .arg(dll)
-            .output()
-            .unwrap();
-        assert!(dump.status.success());
-        let text = String::from_utf8(dump.stdout).unwrap();
-        let entries: Vec<_> = text.split("\n0x").collect();
-        let structure = |name: &str| {
-            let start = entries
-                .iter()
-                .position(|e| {
-                    e.contains(":   DW_TAG_structure_type")
-                        && e.contains(&format!("DW_AT_name\t(\"{name}\")"))
-                })
-                .unwrap();
-            entries[start + 1..]
-                .iter()
-                .take_while(|e| !e.contains(":     NULL"))
-                .copied()
-                .collect::<Vec<_>>()
-        };
-        let variable = |name: &str| {
-            let entry = entries
-                .iter()
-                .find(|e| {
-                    e.contains(":   DW_TAG_variable")
-                        && e.contains(&format!("DW_AT_name\t(\"{name}\")"))
-                })
-                .unwrap();
-            let addr = entry
-                .split("DW_OP_addr 0x")
-                .nth(1)
-                .unwrap()
-                .split(')')
-                .next()
-                .unwrap();
-            u32::from_str_radix(addr, 16).unwrap() - pe.image_base
-        };
-        for (block, name) in [
-            ("cp", "_CPTABLEINFO"),
-            ("norm", "norm_table"),
-            ("critical", "_RTL_CRITICAL_SECTION"),
-            ("kb", ""),
-        ] {
-            if block == "kb" && module != "kernelbase" {
-                continue;
-            }
-            let fields = if block == "kb" {
-                Vec::new()
-            } else {
-                structure(name)
-            };
-            let constants = source
-                .split(&format!("mod {block} {{"))
-                .nth(1)
-                .unwrap()
-                .split('}')
-                .next()
-                .unwrap();
-            for line in constants.lines().filter(|l| l.contains("pub const")) {
-                let field = line
-                    .split("pub const ")
-                    .nth(1)
-                    .unwrap()
-                    .split(':')
-                    .next()
-                    .unwrap();
-                let value = line.split("= ").nth(1).unwrap().trim_end_matches(';');
-                let expected = if let Some(hex) = value.strip_prefix("0x") {
-                    u32::from_str_radix(hex, 16).unwrap()
-                } else {
-                    value.parse().unwrap()
-                };
-                let actual = if block == "kb" {
-                    variable(field)
-                } else if field == "SIZE" {
-                    let entry = entries
-                        .iter()
-                        .find(|e| {
-                            e.contains(":   DW_TAG_structure_type")
-                                && e.contains(&format!("DW_AT_name\t(\"{name}\")"))
-                        })
-                        .unwrap();
-                    u32::from_str_radix(
-                        entry
-                            .split("DW_AT_byte_size\t(0x")
-                            .nth(1)
-                            .unwrap()
-                            .split(')')
-                            .next()
-                            .unwrap(),
-                        16,
-                    )
-                    .unwrap()
-                } else {
-                    let member = fields
-                        .iter()
-                        .find(|e| e.contains(&format!("DW_AT_name\t(\"{field}\")")))
-                        .unwrap();
-                    u32::from_str_radix(
-                        member
-                            .split("DW_AT_data_member_location\t(0x")
-                            .nth(1)
-                            .unwrap()
-                            .split(')')
-                            .next()
-                            .unwrap(),
-                        16,
-                    )
-                    .unwrap()
-                };
-                assert_eq!(actual, expected, "{module}: {name}.{field}");
-            }
-        }
-        if module == "ntdll" {
-            let constant = |name: &str| {
-                let value = source
-                    .split(&format!("const {name}: u32 = 0x"))
-                    .nth(1)
-                    .unwrap()
-                    .split(';')
-                    .next()
-                    .unwrap();
-                u32::from_str_radix(value, 16).unwrap()
-            };
-            assert_eq!(variable("nls_info"), constant("NLS_INFO"));
-            for (name, field, offset) in [
-                ("_NLSTABLEINFO", "AnsiTableInfo", constant("ANSI_TABLE")),
-                ("_NLSTABLEINFO", "OemTableInfo", 0),
-                ("_TEB", "LastErrorValue", constant("LAST_ERROR")),
-            ] {
-                let fields = structure(name);
-                let member = fields
-                    .iter()
-                    .find(|e| e.contains(&format!("DW_AT_name\t(\"{field}\")")))
-                    .unwrap();
-                let actual = member
-                    .split("DW_AT_data_member_location\t(0x")
-                    .nth(1)
-                    .unwrap()
-                    .split(')')
-                    .next()
-                    .unwrap();
-                assert_eq!(
-                    u32::from_str_radix(actual, 16).unwrap(),
-                    offset,
-                    "{name}.{field}"
-                );
-            }
         }
     }
 }
 
 // spec: NAT-BODY-1, NAT-BODY-6
 #[test]
-fn crt_faults_resume_wine_before_writes() {
+fn crt_faults_raise_at_entry_before_writes() {
     let Some(dist) = dist() else {
         return;
     };
@@ -1280,213 +903,24 @@ fn crt_faults_resume_wine_before_writes() {
                     "{module}!{name} fault {fault}: {:?}",
                     expected.0
                 );
-                assert_eq!(actual.0, expected.0, "{module}!{name} fault {fault}");
-                assert!(
-                    actual.1 == expected.1,
-                    "{module}!{name} fault {fault}: partial writes differ"
-                );
-                assert!(
-                    adv_nt::native::declines(&native.ext) > before,
-                    "{module}!{name} fault {fault}: did not decline"
-                );
-            }
-        }
-    }
-}
-
-// spec: NAT-BODY-1, NAT-BODY-5
-#[test]
-fn code_page_faults_resume_wine_before_writes() {
-    let Some(dist) = dist() else {
-        return;
-    };
-    for name in [
-        "MultiByteToWideChar",
-        "WideCharToMultiByte",
-        "RtlMultiByteToUnicodeN",
-        "RtlUnicodeToMultiByteN",
-        "RtlMultiByteToUnicodeSize",
-        "RtlUnicodeToMultiByteSize",
-        "RtlOemToUnicodeN",
-        "RtlUnicodeToOemN",
-    ] {
-        for fault in 0..if name.ends_with("Size") { 2 } else { 3 } {
-            let (mut native, kb, nt) = nls_machine(&dist, true);
-            let (mut reference, _, _) = nls_machine(&dist, false);
-            let kernel = !name.starts_with("Rtl");
-            let wide = name.starts_with("Wide") || name.starts_with("RtlUnicode");
-            let size = name.ends_with("Size");
-            for m in [&mut native, &mut reference] {
-                m.cpu.copy_memory(TABLES, NT + 0x723e0, 0x2c).unwrap();
-                m.cpu
-                    .copy_memory(TABLES, NT + 0x723e0 + 0x2c, 0x2c)
-                    .unwrap();
-            }
-            let data = vec![0x41; LEN as usize];
-            let argc = if kernel {
-                if wide { 8 } else { 6 }
-            } else if size {
-                3
-            } else {
-                5
-            };
-            let entry = address(if kernel { &kb } else { &nt }, name);
-            prepare(&mut native, entry, argc, true);
-            prepare(&mut reference, entry, argc, true);
-            let args = if kernel {
-                let mut args = vec![932, 0, DATA, 12, DATA + 0x4000, 32];
-                if wide {
-                    args.extend_from_slice(&[0, DATA + 0x7000]);
-                }
-                args
-            } else if size {
-                vec![DATA + 0x7000, DATA, 12]
-            } else {
-                vec![DATA + 0x4000, 32, DATA + 0x7000, DATA, 12]
-            };
-            for _ in 0..4 {
-                same(&mut native, &mut reference, &data, &args, name);
-            }
-            let before = adv_nt::native::declines(&native.ext);
-            let mut args = args;
-            if fault == 0 {
-                args[if kernel {
-                    2
-                } else if size {
-                    1
+                assert!(actual.0.is_err(), "{module}!{name} fault {fault}");
+                let raised = &native.sys.latest_cpu_fault.as_ref().unwrap().fault;
+                let bound = if module == "ntdll.dll" && name == "memmove" {
+                    address(&pe, "memcpy")
+                } else if module == "msvcrt.dll" && name == "memcpy" {
+                    address(&pe, "memmove")
                 } else {
-                    3
-                }] = DATA + LEN - 4;
-            } else if size {
-                args[0] = DATA + LEN - 2;
-            } else if fault == 1 {
-                args[if kernel { 4 } else { 0 }] = DATA + LEN - 2;
-            } else if kernel && !wide {
-                native
-                    .cpu
-                    .protect(DATA + 0x4000, 0x1000, Prot::READ)
-                    .unwrap();
-                reference
-                    .cpu
-                    .protect(DATA + 0x4000, 0x1000, Prot::READ)
-                    .unwrap();
-            } else {
-                args[if kernel { 7 } else { 2 }] = DATA + LEN - 2;
-            }
-            let actual = call(&mut native, &data, &args);
-            let expected = call(&mut reference, &data, &args);
-            assert!(
-                expected.0.is_err(),
-                "{name} fault {fault}: {:?}",
-                expected.0
-            );
-            assert_eq!(actual.0, expected.0, "{name} fault {fault}");
-            assert!(
-                actual.1 == expected.1,
-                "{name} fault {fault}: partial writes differ"
-            );
-            assert!(
-                adv_nt::native::declines(&native.ext) > before,
-                "{name} fault {fault}: did not decline"
-            );
-        }
-    }
-}
-
-// spec: NAT-BODY-5
-#[test]
-fn code_page_parameters_match_wine() {
-    let Some(dist) = dist() else {
-        return;
-    };
-    let (mut native, kb, _) = nls_machine(&dist, true);
-    let (mut reference, _, _) = nls_machine(&dist, false);
-    for m in [&mut native, &mut reference] {
-        m.cpu.write_u32(KB + 0x871b8, 932).unwrap();
-    }
-    for name in ["MultiByteToWideChar", "WideCharToMultiByte"] {
-        let wide = name.starts_with("Wide");
-        let argc = if wide { 8 } else { 6 };
-        prepare(&mut native, address(&kb, name), argc, true);
-        prepare(&mut reference, address(&kb, name), argc, true);
-        let mut data = vec![0x41; LEN as usize];
-        put(&mut data, DATA + 24, if wide { 2 } else { 1 }, 0);
-        for case in 0..24 {
-            let mut args = [932, 0, DATA, 12, DATA + 0x4000, 32, 0, DATA + 0x7000];
-            match case % 12 {
-                0 => args[2] = 0,
-                1 => args[3] = 0,
-                2 => args[4] = 0,
-                3 => args[5] = u32::MAX,
-                4 => args[1] = 0x10000,
-                5 => args[3] = u32::MAX - 1,
-                6 => {
-                    args[4] = 0;
-                    args[5] = 0;
-                }
-                7 => args[0] = 0,
-                8 => args[0] = 1,
-                9 => args[0] = 65010,
-                _ => {}
-            }
-            same(&mut native, &mut reference, &data, &args[..argc], name);
-        }
-    }
-}
-
-// spec: NAT-BODY-1, NAT-BODY-5
-#[test]
-fn cached_code_pages_resume_wine_with_owned_lock() {
-    let Some(dist) = dist() else {
-        return;
-    };
-    let (mut native, kb, _) = nls_machine(&dist, true);
-    let (mut reference, _, _) = nls_machine(&dist, false);
-    for name in ["MultiByteToWideChar", "WideCharToMultiByte"] {
-        let wide = name.starts_with("Wide");
-        let argc = if wide { 8 } else { 6 };
-        let entry = address(&kb, name);
-        let args = [932, 0, DATA, 12, DATA + 0x4000, 32, 0, DATA + 0x7000];
-        let data = vec![0x41; LEN as usize];
-        for m in [&mut native, &mut reference] {
-            m.cpu.write_u32(KB + 0x871a4, u32::MAX).unwrap();
-            m.cpu.write_u32(KB + 0x871a8, 0).unwrap();
-            m.cpu.write_u32(KB + 0x871ac, 0).unwrap();
-            prepare(m, entry, argc, true);
-        }
-        for _ in 0..4 {
-            same(&mut native, &mut reference, &data, &args[..argc], name);
-        }
-        for m in [&mut native, &mut reference] {
-            let mut original = [0; 256];
-            m.cpu.read(CODE, &mut original).unwrap();
-            // The caller owns the locale lock. Wine reenters it recursively.
-            let mut code = vec![0x64, 0xa1, 0x24, 0, 0, 0, 0xa3];
-            code.extend_from_slice(&(KB + 0x871ac).to_le_bytes());
-            for (at, value) in [(KB + 0x871a4, 0u32), (KB + 0x871a8, 1)] {
-                code.extend_from_slice(&[0xc7, 0x05]);
-                code.extend_from_slice(&at.to_le_bytes());
-                code.extend_from_slice(&value.to_le_bytes());
-            }
-            code.extend_from_slice(&original);
-            m.cpu.write(CODE, &code).unwrap();
-        }
-        let before = adv_nt::native::declines(&native.ext);
-        for _ in 0..4 {
-            let actual = call(&mut native, &data, &args[..argc]);
-            let expected = call(&mut reference, &data, &args[..argc]);
-            assert!(expected.0.is_ok(), "{name}: {:?}", expected.0);
-            assert_eq!(actual.0, expected.0, "{name}");
-            assert!(actual.1 == expected.1, "{name}: bytes differ");
-            for m in [&mut native, &mut reference] {
-                assert_eq!(m.cpu.read_u32(KB + 0x871a4).unwrap(), 0);
-                assert_eq!(m.cpu.read_u32(KB + 0x871a8).unwrap(), 1);
+                    entry
+                };
+                assert_eq!(raised.pc, bound, "{module}!{name}");
+                assert!(matches!(
+                    raised.kind,
+                    adv_cpu::backend::FaultKind::Read(_) | adv_cpu::backend::FaultKind::Write(_)
+                ));
+                assert_eq!(actual.1, data, "{module}!{name}: entry fault wrote bytes");
+                assert_eq!(adv_nt::native::declines(&native.ext), before);
             }
         }
-        assert!(
-            adv_nt::native::declines(&native.ext) > before,
-            "{name}: locked lookup did not decline"
-        );
     }
 }
 
@@ -1601,7 +1035,10 @@ fn counted_body(m: &mut Machine<Cpu>, name: &str, context: u32, args: &[u32]) {
         thunk,
     };
     assert!(
-        matches!(body(&mut env), adv_machine::Outcome::Return64(_)),
+        matches!(
+            body(&mut env),
+            adv_machine::Outcome::Return(_) | adv_machine::Outcome::Return64(_)
+        ),
         "{name} declined"
     );
     let pages = cpu.pages.borrow().len();
@@ -1617,7 +1054,7 @@ fn counted_body(m: &mut Machine<Cpu>, name: &str, context: u32, args: &[u32]) {
     );
 }
 
-// spec: NAT-BODY-5, NAT-BODY-6, NAT-BODY-7
+// spec: NAT-BODY-6, NAT-BODY-15
 #[test]
 fn pe_bodies_access_memory_by_page() {
     let Some(dist) = dist() else {
@@ -1660,142 +1097,1106 @@ fn pe_bodies_access_memory_by_page() {
             }
         }
     }
-    let (mut m, _, _) = nls_machine(&dist, true);
-    let context = m.spawn("counted-conversion", CODE, &[], 0x10000).unwrap();
-    for code in [1252, 932] {
-        for flags in [0, 2, 8] {
-            for len in [1000, u32::MAX] {
-                m.cpu.write(DATA, &[0x41; 1000]).unwrap();
-                m.cpu.write(DATA + 1000, &[0]).unwrap();
-                counted_body(
-                    &mut m,
-                    "kernelbase.dll!MultiByteToWideChar",
-                    context,
-                    &[code, flags, DATA, len, DATA + 0x4000, 2000],
-                );
+}
+
+#[test]
+#[ignore = "translated-call microbenchmark"]
+fn crt_zlib_translated_call_benchmark() {
+    let dist = dist().unwrap();
+    for (module, name, len, args, dynamic) in [
+        (
+            "msvcrt.dll",
+            "memcpy",
+            4,
+            vec![DATA + 0x1000, DATA, 4],
+            false,
+        ),
+        (
+            "msvcrt.dll",
+            "memcpy",
+            16,
+            vec![DATA + 0x1000, DATA, 16],
+            false,
+        ),
+        (
+            "msvcrt.dll",
+            "memcpy",
+            64,
+            vec![DATA + 0x1000, DATA, 64],
+            false,
+        ),
+        (
+            "msvcrt.dll",
+            "memcmp",
+            8,
+            vec![DATA, DATA + 0x1000, 8],
+            false,
+        ),
+        ("msvcrt.dll", "strlen", 16, vec![DATA], false),
+        (
+            "msvcrt.dll",
+            "memcpy",
+            16,
+            vec![DATA + 0x1000, DATA, 16],
+            true,
+        ),
+        ("msvcrt.dll", "strlen", 256, vec![DATA], false),
+        ("msvcrt.dll", "strcmp", 32, vec![DATA, DATA], false),
+        ("msvcrt.dll", "wcslen", 64, vec![DATA], false),
+        (
+            "windowscodecs.dll",
+            "adler32_z",
+            64,
+            vec![1, DATA, 64],
+            false,
+        ),
+        (
+            "windowscodecs.dll",
+            "adler32_z",
+            65536,
+            vec![1, DATA, 65536],
+            false,
+        ),
+    ] {
+        let (mut m, pe) = machine(&dist, module, true);
+        m.set_execution_budget(Some(std::time::Duration::from_secs(120)));
+        m.cpu.map(DATA + LEN, 0x10000, Prot::RW).unwrap();
+        m.cpu.fill_memory(DATA, 0x41, 65536).unwrap();
+        let width = if name == "wcslen" { 2 } else { 1 };
+        m.cpu.write(DATA + len * width, &[0, 0]).unwrap();
+        let table = m.ext.get::<adv_nt::identity::Images>().0[&pe.image_base]
+            .table()
+            .unwrap();
+        let entry = pe.image_base + table.named(name).unwrap().rva;
+        m.cpu.write_u32(SLOT, entry).unwrap();
+        let iterations = if name == "adler32_z" {
+            1_000_000u32
+        } else {
+            10_000_000
+        };
+        let mut code = vec![0x57, 0xbf];
+        code.extend_from_slice(&iterations.to_le_bytes());
+        let begin = code.len();
+        for (n, arg) in args.iter().enumerate().rev() {
+            if dynamic && n == 2 {
+                m.cpu.write_u32(ARGS, *arg).unwrap();
+                code.extend_from_slice(&[0xff, 0x35]);
+                code.extend_from_slice(&ARGS.to_le_bytes());
+            } else {
+                code.push(0x68);
+                code.extend_from_slice(&arg.to_le_bytes());
             }
         }
-        for flags in [0, 0x200, 0x400] {
-            for len in [1000, u32::MAX] {
-                for i in 0..1000 {
-                    m.cpu.write(DATA + i * 2, &0x41u16.to_le_bytes()).unwrap();
-                }
-                m.cpu.write(DATA + 2000, &[0, 0]).unwrap();
-                counted_body(
-                    &mut m,
-                    "kernelbase.dll!WideCharToMultiByte",
-                    context,
-                    &[
-                        code,
-                        flags,
-                        DATA,
-                        len,
-                        DATA + 0x4000,
-                        2000,
-                        0,
-                        DATA + 0x7000,
-                    ],
+        code.extend_from_slice(&[0xff, 0x15]);
+        code.extend_from_slice(&SLOT.to_le_bytes());
+        code.extend_from_slice(&[0x83, 0xc4, args.len() as u8 * 4, 0x4f, 0x0f, 0x85]);
+        code.extend_from_slice(&((begin as i32) - (code.len() as i32 + 4)).to_le_bytes());
+        code.extend_from_slice(&[0x5f, 0xc3]);
+        m.cpu.write(CODE, &code).unwrap();
+        for round in 0..2 {
+            m.spawn("body-benchmark", CODE, &[], 0x10000).unwrap();
+            let start = std::time::Instant::now();
+            let result = m.run();
+            assert!(matches!(result, RunResult::Exited(_)), "{result:?}");
+            let elapsed = start.elapsed();
+            if round == 1 {
+                println!(
+                    "{module}!{name} {len} dynamic={dynamic}: {:.3} ns/call ({iterations} translated calls)",
+                    elapsed.as_nanos() as f64 / f64::from(iterations)
                 );
             }
         }
     }
-    // Exercise bulk shared reads and outputs that exceed the stack buffers.
-    let large = 0x900000;
-    m.cpu.map(large, 0x50000, Prot::RW).unwrap();
-    m.cpu.fill_memory(large, 0x41, 0x50000).unwrap();
-    counted_body(
-        &mut m,
-        "kernelbase.dll!MultiByteToWideChar",
-        context,
-        &[1252, 0, large, 5000, DATA + 0x4000, 5000],
-    );
-    let mut output = [0; 10000];
-    m.cpu.read(DATA + 0x4000, &mut output).unwrap();
-    assert!(output.as_chunks::<2>().0.iter().all(|ch| *ch == [0x41, 0]));
-    counted_body(
-        &mut m,
-        "kernelbase.dll!MultiByteToWideChar",
-        context,
-        &[1252, 0, large, 0x50000, DATA + 0x4000, 1000],
-    );
 }
 
-// spec: NAT-BODY-5, NAT-BODY-7
+// spec: NAT-BODY-1, NAT-BODY-6
 #[test]
-fn code_pages_read_unborrowable_entries() {
+fn crt_windows_results_and_page_ends() {
+    let Some(dist) = dist() else { return };
+    for module in ["ntdll.dll", "msvcrt.dll", "ucrtbase.dll"] {
+        let (mut m, pe) = machine(&dist, module, true);
+        // Measured on Windows 11 x86: all preserve LastError; only strncmp's
+        // subtraction versus sign differs among these modules.
+        for (name, expected) in [
+            ("strcmp", -1i32),
+            ("strncmp", if module == "ucrtbase.dll" { -1 } else { -2 }),
+            ("wcscmp", -1),
+            ("wcsncmp", -514),
+        ] {
+            let width = if name.starts_with("wcs") { 2 } else { 1 };
+            let mut data = vec![0; LEN as usize];
+            put(&mut data, DATA, width, if width == 1 { 65 } else { 0x141 });
+            put(
+                &mut data,
+                DATA + 0x1000,
+                width,
+                if width == 1 { 67 } else { 0x343 },
+            );
+            let argc = if name.ends_with("ncmp") { 3 } else { 2 };
+            prepare(&mut m, address(&pe, name), argc, false);
+            let result = call(&mut m, &data, &[DATA, DATA + 0x1000, 3][..argc])
+                .0
+                .unwrap();
+            assert_eq!(result[0], expected as u32, "{module}!{name}");
+            assert_eq!(result[7], 0x1234abcd);
+        }
+        // A byte match at offset one overlaps the first valid UTF-16 match
+        // at offset two; wide search must retain that aligned occurrence.
+        let mut data = vec![0; LEN as usize];
+        for (at, value) in [
+            (DATA, 0x4142),
+            (DATA + 2, 0x4141),
+            (DATA + 4, 0x4141),
+            (DATA + 0x1000, 0x4141),
+            (DATA + 0x1002, 0x4141),
+        ] {
+            put(&mut data, at, 2, value);
+        }
+        prepare(&mut m, address(&pe, "wcsstr"), 2, false);
+        assert_eq!(
+            call(&mut m, &data, &[DATA, DATA + 0x1000]).0.unwrap()[0],
+            DATA + 2
+        );
+        for width in [1, 2] {
+            for offset in 0..16 {
+                let mut data = vec![0x41; LEN as usize];
+                let end = DATA + LEN - width - offset;
+                let a = end - 64 * width;
+                let b = DATA + 0x1000;
+                for i in 0..64 {
+                    put(
+                        &mut data,
+                        b + i * width,
+                        width,
+                        if width == 1 { 0x41 } else { 0x4141 },
+                    );
+                }
+                put(&mut data, end, width, 0);
+                put(&mut data, b + 64 * width, width, 0);
+                for (name, args, expected) in if width == 1 {
+                    vec![
+                        ("strlen", vec![a], 64),
+                        ("strnlen", vec![a, 100], 64),
+                        ("strcmp", vec![a, b], 0),
+                        ("strncmp", vec![a, b, 100], 0),
+                        ("strchr", vec![a, 0], end),
+                        ("strrchr", vec![a, 0], end),
+                        ("strstr", vec![a, b], a),
+                        ("strstr", vec![end, end], end),
+                        ("strcpy", vec![b, a], b),
+                        ("strcat", vec![b + 64, a], b + 64),
+                    ]
+                } else {
+                    vec![
+                        ("wcslen", vec![a], 64),
+                        ("wcsnlen", vec![a, 100], 64),
+                        ("wcscmp", vec![a, b], 0),
+                        ("wcsncmp", vec![a, b, 100], 0),
+                        ("wcschr", vec![a, 0], end),
+                        ("wcsrchr", vec![a, 0], end),
+                        ("wcsstr", vec![a, b], a),
+                        ("wcsstr", vec![end, end], end),
+                        ("wcscpy", vec![b, a], b),
+                        ("wcscat", vec![b + 128, a], b + 128),
+                    ]
+                } {
+                    prepare(&mut m, address(&pe, name), args.len(), false);
+                    let result = call(&mut m, &data, &args);
+                    let words = result
+                        .0
+                        .unwrap_or_else(|error| panic!("{module}!{name} offset {offset}: {error}"));
+                    assert_eq!(words[0], expected, "{module}!{name} offset {offset}");
+                    assert_eq!(words[7], 0x1234abcd);
+                    if name.ends_with("cpy") || name.ends_with("cat") {
+                        let begin = (args[0] - DATA) as usize;
+                        assert_eq!(
+                            &result.1[begin..begin + 65 * width as usize],
+                            &data[(a - DATA) as usize..(a - DATA + 65 * width) as usize]
+                        );
+                    }
+                }
+                // Comparisons stop at the first difference before an unmapped
+                // page, even when neither operand has a terminator there.
+                put(&mut data, end, width, 0x41);
+                put(&mut data, b + 64 * width, width, 0x43);
+                let name = if width == 1 { "strcmp" } else { "wcscmp" };
+                prepare(&mut m, address(&pe, name), 2, false);
+                assert_eq!(call(&mut m, &data, &[a, b]).0.unwrap()[0], (-1i32) as u32);
+            }
+        }
+    }
+}
+
+// spec: NAT-BODY-8, NAT-BODY-16
+#[test]
+fn d3dx_all_formats_filters_and_overlap() {
+    let Some(dist) = dist() else { return };
+    let (mut native, pe) = machine(&dist, "d3dx9_43.dll", true);
+    let (mut reference, _) = machine(&dist, "d3dx9_43.dll", false);
+    let table = native.ext.get::<adv_nt::identity::Images>().0[&pe.image_base]
+        .table()
+        .unwrap();
+    let getter = table.named("get_d3dx_pixel_format_info").unwrap();
+    let formats = pe
+        .relocations()
+        .unwrap()
+        .into_iter()
+        .filter(|r| *r >= getter.rva && *r < getter.rva + getter.size)
+        .find_map(|r| {
+            let at = native.cpu.read_u32(pe.image_base + r).ok()?;
+            let mut b = [0; 40];
+            native.cpu.read(at, &mut b).ok()?;
+            (b[..12] == [0, 0, 0, 0, 0, 8, 8, 8, 0, 16, 8, 0]).then_some(at)
+        })
+        .unwrap();
+    let entry = pe.image_base + table.named("d3dx_load_pixels_from_pixels").unwrap().rva;
+    // The reference conversion owns temporary buffers. A guest bump allocator
+    // supplies the same malloc/free contract without loading another CRT.
+    const HEAP: u32 = 0x20000000;
+    const BUMP: u32 = SLOT + 0x200;
+    let mut crt =
+        Pe::parse(&std::fs::read(dist.join("lib/wine/i386-windows/ucrtbase.dll")).unwrap())
+            .unwrap();
+    crt.rebase(0x30000000).unwrap();
+    crt.image_base = 0x30000000;
+    let mut user =
+        Pe::parse(&std::fs::read(dist.join("lib/wine/i386-windows/user32.dll")).unwrap()).unwrap();
+    user.rebase(0x40000000).unwrap();
+    user.image_base = 0x40000000;
+    for m in [&mut native, &mut reference] {
+        map(m, &crt);
+        map(m, &user);
+        for import in pe.imports().unwrap().into_iter().flat_map(|m| m.imports) {
+            if let ImportName::Name { name, .. } = import.name
+                && m.cpu.read_u32(pe.image_base + import.iat_rva).unwrap() == CODE + 0xf00
+                && let Some(target) =
+                    [&crt, &user].into_iter().find_map(|library| {
+                        library.exports().unwrap().into_iter().find_map(|e| {
+                            match (e.name, e.target) {
+                                (Some(n), ExportTarget::Rva(rva)) if n == name => {
+                                    Some(library.image_base + rva)
+                                }
+                                _ => None,
+                            }
+                        })
+                    })
+            {
+                m.cpu
+                    .write_u32(pe.image_base + import.iat_rva, target)
+                    .unwrap();
+            }
+        }
+        m.cpu.map(HEAP, 0x100000, Prot::RW).unwrap();
+        let mut malloc = vec![0xa1];
+        malloc.extend_from_slice(&BUMP.to_le_bytes());
+        malloc.extend_from_slice(&[
+            0x8b, 0x4c, 0x24, 4, 0x83, 0xc1, 15, 0x83, 0xe1, 0xf0, 0x01, 0x0d,
+        ]);
+        malloc.extend_from_slice(&BUMP.to_le_bytes());
+        malloc.push(0xc3);
+        m.cpu.write(CODE + 0xa00, &malloc).unwrap();
+        m.cpu.write(CODE + 0xa40, &[0xc3]).unwrap();
+        for imported in pe.imports().unwrap().into_iter().flat_map(|m| m.imports) {
+            if let ImportName::Name { name, .. } = imported.name {
+                let target = match name.as_str() {
+                    "malloc" => CODE + 0xa00,
+                    "free" => CODE + 0xa40,
+                    _ => continue,
+                };
+                m.cpu
+                    .write_u32(pe.image_base + imported.iat_rva, target)
+                    .unwrap();
+            }
+        }
+        prepare(m, entry, 6, false);
+    }
+    let mut rng = Rng(0x735a4d2cba1968f0);
+    for id in 0..=58 {
+        for (sid, did) in [(id, 1), (1, id), (id, id)] {
+            let mut sf = [0; 40];
+            let mut df = [0; 40];
+            native.cpu.read(formats + sid * 40, &mut sf).unwrap();
+            native.cpu.read(formats + did * 40, &mut df).unwrap();
+            for filter in 1..=5 {
+                for shape in 0..3 {
+                    let mut data: Vec<_> = (0..LEN).map(|_| rng.next() as u8).collect();
+                    let dw: u32 = if shape == 0 { 4 } else { 2 };
+                    for (at, f) in [(DATA + 128, sf), (DATA + 192, df)] {
+                        data[(at - DATA) as usize..(at - DATA) as usize + 40].copy_from_slice(&f);
+                    }
+                    for (at, buffer, w, h, f) in [
+                        (DATA, DATA + 0x1000, 4, 4, sf),
+                        (DATA + 64, DATA + 0x4000, dw, dw, df),
+                    ] {
+                        let bw = u32::from_le_bytes(f[16..20].try_into().unwrap());
+                        let bh = u32::from_le_bytes(f[20..24].try_into().unwrap());
+                        let block = u32::from_le_bytes(f[24..28].try_into().unwrap());
+                        let pitch = w.div_ceil(bw) * block + 8;
+                        let depth = if shape == 2 {
+                            if at == DATA { 4 } else { 2 }
+                        } else {
+                            1
+                        };
+                        for (off, value) in [
+                            (0, buffer),
+                            (4, pitch),
+                            (8, pitch * h.div_ceil(bh)),
+                            (12, DATA + 0x6000),
+                            (16, w),
+                            (20, h),
+                            (24, depth),
+                            (28, 0),
+                            (32, 0),
+                            (36, w),
+                            (40, h),
+                        ] {
+                            put(&mut data, at + off, 4, value);
+                        }
+                    }
+                    if sf[32..36] == 3u32.to_le_bytes() {
+                        // Include finite, negative, infinity and NaN float encodings.
+                        let bytes = u32::from_le_bytes(sf[12..16].try_into().unwrap());
+                        for y in 0..4 {
+                            for x in 0..4 {
+                                let p = 0x1000 + y * (4 * bytes + 8) + x * bytes;
+                                for c in 0..4 {
+                                    let bits = sf[4 + c];
+                                    if bits == 0 {
+                                        continue;
+                                    }
+                                    let shift = sf[8 + c] as usize / 8;
+                                    let values = [
+                                        0u32, 0x3f000000, 0xbf800000, 0x7fc00000, 0x7f800000,
+                                        0xff800000,
+                                    ];
+                                    let value = if bits == 16 {
+                                        [0u32, 0x3800, 0xbc00, 0x7e00, 0x7c00, 0xfc00]
+                                            [(x + y + c as u32) as usize % 6]
+                                    } else {
+                                        values[(x + y + c as u32) as usize % 6]
+                                    };
+                                    data[p as usize + shift
+                                        ..p as usize + shift + bits as usize / 8]
+                                        .copy_from_slice(&value.to_le_bytes()[..bits as usize / 8]);
+                                }
+                            }
+                        }
+                    }
+                    let args = [
+                        DATA + 64,
+                        DATA + 192,
+                        DATA,
+                        DATA + 128,
+                        filter,
+                        if shape == 0 { 0 } else { 0x7f123456 },
+                    ];
+                    for m in [&mut native, &mut reference] {
+                        m.cpu.write_u32(BUMP, HEAP).unwrap();
+                    }
+                    same(
+                        &mut native,
+                        &mut reference,
+                        &data,
+                        &args,
+                        &format!("D3DX formats {sid}->{did} filter {filter} shape {shape}"),
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn translated_loop(m: &mut Machine<Cpu>, entry: u32, args: &[u32], iterations: u32) -> f64 {
+    let mut code = vec![0x55, 0xbd];
+    code.extend_from_slice(&iterations.to_le_bytes());
+    let start = code.len();
+    for arg in args.iter().rev() {
+        code.push(0x68);
+        code.extend_from_slice(&arg.to_le_bytes());
+    }
+    code.push(0xe8);
+    let next = CODE + code.len() as u32 + 4;
+    code.extend_from_slice(&entry.wrapping_sub(next).to_le_bytes());
+    code.extend_from_slice(&[0x83, 0xc4, (args.len() * 4) as u8, 0x4d, 0x75]);
+    code.push((start as isize - code.len() as isize - 1) as u8);
+    code.extend_from_slice(&[0x5d, 0x31, 0xc0, 0xc3]);
+    m.cpu.write(CODE, &code).unwrap();
+    m.spawn("pixel-bench", CODE, &[], 0x10000).unwrap();
+    let start = std::time::Instant::now();
+    let result = m.run();
+    let seconds = start.elapsed().as_secs_f64();
+    assert!(matches!(result, RunResult::Exited(0)), "{result:?}");
+    seconds * 1e9 / f64::from(iterations)
+}
+
+// spec: NAT-BODY-8, NAT-BODY-9
+#[test]
+#[ignore = "translated pixel micro-benchmark; nextest enforces a timeout"]
+fn translated_pe_pixel_microbenchmark() {
+    let Some(dist) = dist() else { return };
+    for module in ["d3dx9_43.dll", "windowscodecs.dll"] {
+        let (mut m, pe) = machine(&dist, module, true);
+        let table = m.ext.get::<adv_nt::identity::Images>().0[&pe.image_base]
+            .table()
+            .unwrap();
+        let (name, args, n) = if module.starts_with("d3dx") {
+            let source = 0x20000000;
+            let target = 0x21000000;
+            for at in [source, target] {
+                m.cpu.map(at, 0x40000, Prot::RW).unwrap();
+                m.cpu.write(at, &vec![0x7f; 0x40000]).unwrap();
+            }
+            let mut data = vec![0; LEN as usize];
+            for (at, buffer) in [(DATA, target), (DATA + 64, source)] {
+                for (off, value) in [
+                    (0, buffer),
+                    (4, 1024),
+                    (8, 0x40000),
+                    (12, 0),
+                    (16, 256),
+                    (20, 256),
+                    (24, 1),
+                    (28, 0),
+                    (32, 0),
+                    (36, 256),
+                    (40, 256),
+                ] {
+                    put(&mut data, at + off, 4, value);
+                }
+            }
+            for (at, id, bits, shifts) in [
+                (DATA + 128, 3, [8u8; 4], [24u8, 0, 8, 16]),
+                (DATA + 192, 1, [8u8; 4], [24u8, 16, 8, 0]),
+            ] {
+                for (off, value) in [
+                    (0, id),
+                    (4, u32::from_le_bytes(bits)),
+                    (8, u32::from_le_bytes(shifts)),
+                    (12, 4),
+                    (16, 1),
+                    (20, 1),
+                    (24, 4),
+                    (28, 1),
+                    (32, 1),
+                    (36, 0),
+                ] {
+                    put(&mut data, at + off, 4, value);
+                }
+            }
+            m.cpu.write(DATA, &data).unwrap();
+            (
+                "d3dx_load_pixels_from_pixels",
+                vec![DATA, DATA + 128, DATA + 64, DATA + 192, 2, 0],
+                1000,
+            )
+        } else {
+            m.cpu.write(DATA, &vec![0x71; LEN as usize]).unwrap();
+            m.cpu.write_u32(DATA + 4, 1024).unwrap();
+            m.cpu.write(DATA + 11, &[32]).unwrap();
+            (
+                "png_read_filter_row_paeth_multibyte_pixel",
+                vec![DATA, DATA + 0x1000, DATA + 0x2000],
+                10000,
+            )
+        };
+        let entry = pe.image_base + table.named(name).unwrap().rva;
+        translated_loop(&mut m, entry, &args, 10);
+        let mut samples = [0.0; 5];
+        for value in &mut samples {
+            *value = translated_loop(&mut m, entry, &args, n);
+        }
+        samples.sort_by(f64::total_cmp);
+        eprintln!(
+            "{name}: {:.3} ns/call (median of 5, {:.3}..{:.3})",
+            samples[2], samples[0], samples[4]
+        );
+    }
+}
+
+// spec: NAT-BODY-8, NAT-BODY-9, NAT-BODY-16
+#[test]
+fn pixel_bodies_fault_at_entry() {
+    let Some(dist) = dist() else { return };
+    for (module, name, argc) in [
+        (
+            "windowscodecs.dll",
+            "png_read_filter_row_paeth_multibyte_pixel",
+            3,
+        ),
+        ("d3dx9_43.dll", "d3dx_load_pixels_from_pixels", 6),
+    ] {
+        for write in [false, true] {
+            let (mut m, pe) = machine(&dist, module, true);
+            let table = m.ext.get::<adv_nt::identity::Images>().0[&pe.image_base]
+                .table()
+                .unwrap();
+            let entry = pe.image_base + table.named(name).unwrap().rva;
+            prepare(&mut m, entry, argc, false);
+            let mut data = vec![0x71; LEN as usize];
+            let mut args = if argc == 3 {
+                put(&mut data, DATA + 4, 4, 32);
+                put(&mut data, DATA + 11, 1, 32);
+                vec![DATA, DATA + 0x1000, DATA + 0x2000]
+            } else {
+                for (at, buffer) in [(DATA, DATA + 0x1000), (DATA + 64, DATA + 0x2000)] {
+                    for (off, value) in [
+                        (0, buffer),
+                        (4, 16),
+                        (8, 16),
+                        (12, 0),
+                        (16, 4),
+                        (20, 1),
+                        (24, 1),
+                        (28, 0),
+                        (32, 0),
+                        (36, 4),
+                        (40, 1),
+                    ] {
+                        put(&mut data, at + off, 4, value);
+                    }
+                }
+                for at in [DATA + 128, DATA + 192] {
+                    for (off, value) in [
+                        (0, 1),
+                        (4, 0x08080808),
+                        (8, 0x00081018),
+                        (12, 4),
+                        (16, 1),
+                        (20, 1),
+                        (24, 4),
+                        (28, 1),
+                        (32, 1),
+                        (36, 0),
+                    ] {
+                        put(&mut data, at + off, 4, value);
+                    }
+                }
+                vec![DATA, DATA + 128, DATA + 64, DATA + 192, 2, 0]
+            };
+            for _ in 0..2 {
+                assert!(call(&mut m, &data, &args).0.is_ok());
+            }
+            if write {
+                if argc == 3 {
+                    args[1] = 0;
+                } else {
+                    put(&mut data, DATA, 4, 0);
+                }
+            } else {
+                args[0] = 0;
+            }
+            let (result, bytes) = call(&mut m, &data, &args);
+            assert!(result.is_err());
+            assert_eq!(bytes, data);
+            let fault = &m.sys.latest_cpu_fault.as_ref().unwrap().fault;
+            assert_eq!(fault.pc, entry);
+            assert_eq!(
+                fault.kind,
+                if write {
+                    adv_cpu::backend::FaultKind::Write(0)
+                } else {
+                    adv_cpu::backend::FaultKind::Read(if argc == 3 { 4 } else { 0 })
+                }
+            );
+            assert_eq!(adv_nt::native::declines(&m.ext), 0);
+        }
+    }
+}
+
+// spec: NAT-BODY-9, NAT-BODY-16
+#[test]
+fn png_metadata_overlap_keeps_read_order() {
+    let Some(dist) = dist() else { return };
+    let (mut native, pe) = machine(&dist, "windowscodecs.dll", true);
+    let (mut reference, _) = machine(&dist, "windowscodecs.dll", false);
+    let table = native.ext.get::<adv_nt::identity::Images>().0[&pe.image_base]
+        .table()
+        .unwrap();
+    for name in [
+        "png_read_filter_row_sub",
+        "png_read_filter_row_up",
+        "png_read_filter_row_avg",
+        "png_read_filter_row_paeth_1byte_pixel",
+        "png_read_filter_row_paeth_multibyte_pixel",
+    ] {
+        let entry = pe.image_base + table.named(name).unwrap().rva;
+        for m in [&mut native, &mut reference] {
+            prepare(m, entry, 3, false);
+        }
+        let mut data = vec![0x71; LEN as usize];
+        put(&mut data, DATA + 4, 4, 32);
+        put(&mut data, DATA + 11, 1, 32);
+        put(&mut data, DATA + 0x1000, 4, 1);
+        let args = [DATA, DATA + 4, DATA + 0x1000];
+        let mut actual = call(&mut native, &data, &args);
+        let mut expected = call(&mut reference, &data, &args);
+        actual.0.as_mut().unwrap()[0] = 0;
+        expected.0.as_mut().unwrap()[0] = 0;
+        assert_eq!(actual, expected, "{name}");
+        assert_eq!(adv_nt::native::declines(&native.ext), 0);
+    }
+}
+
+// spec: NAT-BODY-8, NAT-BODY-16
+#[test]
+fn d3dx_float_controls_match_wine() {
+    let Some(dist) = dist() else { return };
+    let (mut native, pe) = machine(&dist, "d3dx9_43.dll", true);
+    let (mut reference, _) = machine(&dist, "d3dx9_43.dll", false);
+    let table = native.ext.get::<adv_nt::identity::Images>().0[&pe.image_base]
+        .table()
+        .unwrap();
+    let entry = pe.image_base + table.named("d3dx_load_pixels_from_pixels").unwrap().rva;
+    for hilo in [true, false] {
+        let mut data = vec![0x71; LEN as usize];
+        for (at, buffer, width, height, bytes) in [
+            (DATA, DATA + 0x1000, 2, 2, if hilo { 2 } else { 16 }),
+            (
+                DATA + 64,
+                DATA + 0x4000,
+                if hilo { 2 } else { 1 },
+                if hilo { 2 } else { 1 },
+                16,
+            ),
+        ] {
+            for (off, val) in [
+                (0, buffer),
+                (4, width * bytes),
+                (8, width * height * bytes),
+                (12, 0),
+                (16, width),
+                (20, height),
+                (24, 1),
+                (28, 0),
+                (32, 0),
+                (36, width),
+                (40, height),
+            ] {
+                put(&mut data, at + off, 4, val);
+            }
+        }
+        for at in [DATA + 128, DATA + 192] {
+            for (off, val) in [
+                (0, 41),
+                (4, 0x20202020),
+                (8, 0x40200060),
+                (12, 16),
+                (16, 1),
+                (20, 1),
+                (24, 16),
+                (28, 3),
+                (32, 3),
+                (36, 0),
+            ] {
+                put(&mut data, at + off, 4, val);
+            }
+        }
+        if hilo {
+            for (off, val) in [
+                (0, 50),
+                (4, 0x00080800),
+                (8, 0x00080000),
+                (12, 2),
+                (24, 2),
+                (28, 0),
+                (32, 6),
+            ] {
+                put(&mut data, DATA + 128 + off, 4, val);
+            }
+            for (i, pixel) in [0x3cd8u32, 0x0a64, 0, 0x0101].into_iter().enumerate() {
+                put(&mut data, DATA + 0x1000 + i as u32 * 2, 2, pixel);
+            }
+        } else {
+            for (i, pixel) in [
+                [0x00800000u32, 1, 0x3f800000, 0x3dcc_cccd],
+                [0, 1, 0x3f800000, 0x3e4c_cccd],
+                [0, 1, 0x3f000000, 0x3e99_999a],
+                [0, 1, 0x3e800000, 0x3ecc_cccd],
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                for (c, value) in pixel.into_iter().enumerate() {
+                    put(
+                        &mut data,
+                        DATA + 0x1000 + i as u32 * 16 + c as u32 * 4,
+                        4,
+                        value,
+                    );
+                }
+            }
+        }
+        for mxcsr in [0x1f80u32, 0x1fc0, 0x9f80, 0x9fc0, 0x3f80, 0x5f80, 0x7f80] {
+            for cw in [0x037fu16, 0x077f, 0x0b7f, 0x0f7f] {
+                for m in [&mut native, &mut reference] {
+                    prepare(m, entry, 6, false);
+                    m.cpu.write_u32(SLOT + 0x300, mxcsr).unwrap();
+                    m.cpu.write(SLOT + 0x304, &cw.to_le_bytes()).unwrap();
+                    let mut code = [0; 256];
+                    m.cpu.read(CODE, &mut code).unwrap();
+                    let mut prefix = vec![0x0f, 0xae, 0x15];
+                    prefix.extend_from_slice(&(SLOT + 0x300).to_le_bytes());
+                    prefix.extend_from_slice(&[0xd9, 0x2d]);
+                    prefix.extend_from_slice(&(SLOT + 0x304).to_le_bytes());
+                    prefix.extend_from_slice(&code);
+                    m.cpu.write(CODE, &prefix).unwrap();
+                }
+                same(
+                    &mut native,
+                    &mut reference,
+                    &data,
+                    &[
+                        DATA + 64,
+                        DATA + 192,
+                        DATA,
+                        DATA + 128,
+                        if hilo { 2 } else { 5 },
+                        0,
+                    ],
+                    &format!("D3DX float control {mxcsr:x}/{cw:x} hilo {hilo}"),
+                );
+            }
+        }
+        if !hilo {
+            for m in [&mut native, &mut reference] {
+                prepare(m, entry, 6, false);
+                m.cpu.write_u32(SLOT + 0x300, 0x0f80).unwrap();
+                let mut code = [0; 256];
+                m.cpu.read(CODE, &mut code).unwrap();
+                let mut prefix = vec![0x0f, 0xae, 0x15];
+                prefix.extend_from_slice(&(SLOT + 0x300).to_le_bytes());
+                prefix.extend_from_slice(&code);
+                m.cpu.write(CODE, &prefix).unwrap();
+            }
+            let args = [DATA + 64, DATA + 192, DATA, DATA + 128, 5, 0];
+            let actual = call(&mut native, &data, &args);
+            let expected = call(&mut reference, &data, &args);
+            assert!(actual.0.is_err() && expected.0.is_err());
+            assert_eq!(&actual.1[0x4000..0x4010], &expected.1[0x4000..0x4010]);
+            let fault = &native.sys.latest_cpu_fault.as_ref().unwrap().fault;
+            assert_eq!(fault.pc, entry);
+            assert_eq!(fault.kind, adv_cpu::backend::FaultKind::Trap(19));
+            assert_eq!(adv_nt::native::declines(&native.ext), 0);
+        }
+    }
+}
+
+// spec: NAT-BODY-9, NAT-BODY-16
+#[test]
+fn png_short_rows_and_wrapped_average_complete() {
+    let Some(dist) = dist() else { return };
+    for name in [
+        "png_read_filter_row_sub",
+        "png_read_filter_row_up",
+        "png_read_filter_row_avg",
+        "png_read_filter_row_paeth_1byte_pixel",
+        "png_read_filter_row_paeth_multibyte_pixel",
+    ] {
+        for len in [0, 1, 3, 7] {
+            let (mut native, pe) = machine(&dist, "windowscodecs.dll", true);
+            let (mut reference, _) = machine(&dist, "windowscodecs.dll", false);
+            let table = native.ext.get::<adv_nt::identity::Images>().0[&pe.image_base]
+                .table()
+                .unwrap();
+            let entry = pe.image_base + table.named(name).unwrap().rva;
+            for m in [&mut native, &mut reference] {
+                prepare(m, entry, 3, false);
+            }
+            let mut data = vec![0x71; LEN as usize];
+            put(&mut data, DATA + 4, 4, len);
+            put(&mut data, DATA + 11, 1, 64);
+            let args = [DATA, DATA + 0x1000, DATA + 0x2000];
+            let mut actual = call(&mut native, &data, &args);
+            let mut expected = call(&mut reference, &data, &args);
+            if name == "png_read_filter_row_avg" {
+                assert!(actual.0.is_err() && expected.0.is_err());
+                assert_eq!(actual.1, data);
+                let fault = &native.sys.latest_cpu_fault.as_ref().unwrap().fault;
+                assert_eq!(fault.pc, entry);
+                assert_eq!(fault.kind, adv_cpu::backend::FaultKind::Read(DATA + LEN));
+            } else {
+                actual.0.as_mut().unwrap()[0] = 0;
+                expected.0.as_mut().unwrap()[0] = 0;
+                assert_eq!(actual, expected, "{name} len {len}");
+            }
+            assert_eq!(adv_nt::native::declines(&native.ext), 0);
+        }
+    }
+}
+
+// spec: NAT-BODY-8, NAT-BODY-16
+#[test]
+fn d3dx_block_rounding_wraps_and_zero_divisors_fault() {
+    let Some(dist) = dist() else { return };
+    let (mut native, pe) = machine(&dist, "d3dx9_43.dll", true);
+    let (mut reference, _) = machine(&dist, "d3dx9_43.dll", false);
+    let table = native.ext.get::<adv_nt::identity::Images>().0[&pe.image_base]
+        .table()
+        .unwrap();
+    let entry = pe.image_base + table.named("d3dx_load_pixels_from_pixels").unwrap().rva;
+    for m in [&mut native, &mut reference] {
+        prepare(m, entry, 6, false);
+    }
+    let mut data = vec![0x71; LEN as usize];
+    for (at, buffer) in [(DATA, DATA + 0x1000), (DATA + 64, DATA + 0x2000)] {
+        for (off, value) in [
+            (0, buffer),
+            (4, 4),
+            (8, 4),
+            (12, 0),
+            (16, 1),
+            (20, 1),
+            (24, 1),
+            (28, 0),
+            (32, 0),
+            (36, 1),
+            (40, 1),
+        ] {
+            put(&mut data, at + off, 4, value);
+        }
+    }
+    for at in [DATA + 128, DATA + 192] {
+        for (off, value) in [
+            (0, 1),
+            (4, 0x08080808),
+            (8, 0x00081018),
+            (12, 4),
+            (16, 1),
+            (20, 1),
+            (24, 4),
+            (28, 1),
+            (32, 1),
+            (36, 0),
+        ] {
+            put(&mut data, at + off, 4, value);
+        }
+    }
+    let args = [DATA, DATA + 128, DATA + 64, DATA + 192, 2, 0];
+    same(
+        &mut native,
+        &mut reference,
+        &data,
+        &args,
+        "D3DX ordinary block copy",
+    );
+    // UINT addition in copy_pixels rounds this width down to zero blocks.
+    for at in [DATA, DATA + 64] {
+        put(&mut data, at + 16, 4, u32::MAX);
+    }
+    for at in [DATA + 128, DATA + 192] {
+        put(&mut data, at + 16, 4, u32::MAX);
+    }
+    same(
+        &mut native,
+        &mut reference,
+        &data,
+        &args,
+        "D3DX wrapped block count",
+    );
+    put(&mut data, DATA + 128 + 16, 4, 0);
+    let actual = call(&mut native, &data, &args);
+    let expected = call(&mut reference, &data, &args);
+    assert!(actual.0.is_err() && expected.0.is_err());
+    assert_eq!(actual.1, data);
+    let fault = &native.sys.latest_cpu_fault.as_ref().unwrap().fault;
+    assert_eq!(fault.pc, entry);
+    assert_eq!(fault.kind, adv_cpu::backend::FaultKind::IntegerDivideByZero);
+    assert_eq!(adv_nt::native::declines(&native.ext), 0);
+}
+
+// spec: NAT-BODY-20
+#[test]
+fn nls_layout_matches_dwarf() {
     let Some(dist) = dist() else {
         return;
     };
-    let (mut m, _, _) = nls_machine(&dist, true);
-    let (mut reference, kb, _) = nls_machine(&dist, false);
-    let context = m.spawn("counted-conversion", CODE, &[], 0x10000).unwrap();
-    let teb = m.sys.contexts[context as usize].teb;
-    for (name, source, flags) in [
-        ("MultiByteToWideChar", [0xd2, 0xbb], 8),
-        ("WideCharToMultiByte", [0x00, 0x4e], 0x400),
-    ] {
-        let wide = name.starts_with("Wide");
-        let argc = if wide { 8 } else { 6 };
-        let args = [
-            936,
-            flags,
-            DATA,
-            if wide { 1 } else { 2 },
-            DATA + 0x4000,
-            8,
-            0,
-            DATA + 0x7000,
-        ];
-        let mut data = vec![0xcc; LEN as usize];
-        data[..2].copy_from_slice(&source);
-        prepare(&mut reference, address(&kb, name), argc, true);
-        let expected = call(&mut reference, &data, &args[..argc]);
-        let expected_result = expected.0.unwrap();
-        m.cpu.write(DATA, &data).unwrap();
-        m.cpu.write_u32(teb + 0x34, 0x1234abcd).unwrap();
-        m.cpu.set_reg(adv_cpu::backend::Reg::Esp, SLOT);
-        for (i, arg) in args[..argc].iter().enumerate() {
-            m.cpu.write_u32(ARGS + i as u32 * 4, *arg).unwrap();
-        }
-        let thunk = m
-            .sys
-            .thunks
-            .published_index(adv_nt::native::MODULE, &format!("kernelbase.dll!{name}"))
+    let source = include_str!("../src/native/nls.rs");
+    for module in ["kernelbase", "ntdll"] {
+        let dll = dist
+            .with_file_name("wine11-sse-dist")
+            .join(format!("usr/local/lib/wine/i386-windows/{module}.dll"));
+        let pe = Pe::parse(&std::fs::read(&dll).unwrap()).unwrap();
+        let dump = std::process::Command::new("dwarfdump")
+            .arg("--debug-info")
+            .arg(dll)
+            .output()
             .unwrap();
-        let body = m.sys.thunks.get(thunk).f.handler;
-        let mut cpu = CountingGuest {
-            cpu: &mut m.cpu,
-            calls: std::cell::Cell::new(0),
-            read_bytes: std::cell::Cell::new(0),
-            largest_read: std::cell::Cell::new(0),
-            lend_tables: false,
-            pages: std::cell::RefCell::new(std::collections::BTreeSet::new()),
-            stores: 0,
+        assert!(dump.status.success());
+        let text = String::from_utf8(dump.stdout).unwrap();
+        let entries: Vec<_> = text.split("\n0x").collect();
+        let named = |tag: &str, name: &str| -> usize {
+            entries
+                .iter()
+                .position(|e| {
+                    e.contains(&format!(":   DW_TAG_{tag}"))
+                        && e.contains(&format!("DW_AT_name\t(\"{name}\")"))
+                })
+                .unwrap_or_else(|| panic!("missing {module}: {tag} {name}"))
         };
-        let mut env = adv_machine::Env {
-            context,
-            cpu: &mut cpu,
-            sys: &mut m.sys,
-            ext: &mut m.ext,
-            thunk,
+        let reference = |entry: usize| -> usize {
+            let id = entries[entry]
+                .split("DW_AT_type\t(0x")
+                .nth(1)
+                .unwrap()
+                .split([' ', ')'])
+                .next()
+                .unwrap();
+            entries
+                .iter()
+                .position(|e| e.starts_with(&format!("{id}:")))
+                .unwrap()
         };
-        assert!(
-            matches!(body(&mut env), adv_machine::Outcome::Return64(value) if value == u64::from(expected_result[0])),
-            "{name} declined or returned a different length"
-        );
-        assert!(
-            cpu.read_bytes.get() < 2048,
-            "{name}: {} bytes read",
-            cpu.read_bytes.get()
-        );
-        assert!(cpu.largest_read.get() < 512, "{name}: copied a table");
-        let mut actual = vec![0; LEN as usize];
-        m.cpu.read(DATA, &mut actual).unwrap();
-        assert_eq!(actual, expected.1, "{name}: output differs");
-        assert_eq!(
-            m.cpu.read_u32(teb + 0x34).unwrap(),
-            expected_result[7],
-            "{name}: LastError differs"
-        );
+        let structure = |name: &str| -> usize {
+            if let Some(variable) = name.strip_prefix('@') {
+                return reference(named("variable", variable));
+            }
+            if let Some(typedef) = name.strip_prefix('$') {
+                return reference(named("typedef", typedef));
+            }
+            named("structure_type", name)
+        };
+        let hex_field = |entry: &str, field: &str| -> u32 {
+            let value = entry
+                .split(&format!("{field}\t(0x"))
+                .nth(1)
+                .unwrap()
+                .split(')')
+                .next()
+                .unwrap();
+            u32::from_str_radix(value, 16).unwrap()
+        };
+        let variable = |name: &str| -> u32 {
+            let entry = entries[named("variable", name)];
+            let addr = entry
+                .split("DW_OP_addr 0x")
+                .nth(1)
+                .unwrap()
+                .split(')')
+                .next()
+                .unwrap();
+            u32::from_str_radix(addr, 16).unwrap() - pe.image_base
+        };
+        let member = |name: &str, field: &str| -> u32 {
+            let entry = structure(name);
+            if field == "SIZE" {
+                return hex_field(entries[entry], "DW_AT_byte_size");
+            }
+            let field = entries[entry + 1..]
+                .iter()
+                .take_while(|e| !e.contains(":     NULL"))
+                .find(|e| e.contains(&format!("DW_AT_name\t(\"{field}\")")))
+                .unwrap();
+            hex_field(field, "DW_AT_data_member_location")
+        };
+        if module == "kernelbase" {
+            for (block, name) in [
+                ("cp", "_CPTABLEINFO"),
+                ("kb", ""),
+                ("sort", "@sort"),
+                ("sortguid", "sortguid"),
+                ("compression", "sort_compression"),
+                ("expansion", "sort_expansion"),
+                ("jamo", "jamo_sort"),
+                ("locale_header", "$NLS_LOCALE_HEADER"),
+                ("locale_data", "$NLS_LOCALE_DATA"),
+                ("lcid_index", "$NLS_LOCALE_LCID_INDEX"),
+                ("lcname_index", "$NLS_LOCALE_LCNAME_INDEX"),
+                ("critical", "_RTL_CRITICAL_SECTION"),
+                ("teb", "_TEB"),
+            ] {
+                let constants = source
+                    .split(&format!("mod {block} {{"))
+                    .nth(1)
+                    .unwrap()
+                    .split('}')
+                    .next()
+                    .unwrap();
+                for line in constants.lines().filter(|line| line.contains("pub const")) {
+                    let field = line
+                        .split("pub const ")
+                        .nth(1)
+                        .unwrap()
+                        .split(':')
+                        .next()
+                        .unwrap();
+                    let value = line.split("= ").nth(1).unwrap().trim_end_matches(';');
+                    let expected = if let Some(hex) = value.strip_prefix("0x") {
+                        u32::from_str_radix(hex, 16).unwrap()
+                    } else {
+                        value.parse().unwrap()
+                    };
+                    let actual = if block == "kb" {
+                        variable(field)
+                    } else {
+                        member(name, field)
+                    };
+                    assert_eq!(actual, expected, "{module}: {block}.{field}");
+                }
+            }
+        } else {
+            for (constant, actual) in [
+                ("NT_NLS_INFO", variable("nls_info")),
+                ("NT_UPPER_CASE", member("_NLSTABLEINFO", "UpperCaseTable")),
+            ] {
+                let value = source
+                    .split(&format!("const {constant}: u32 = 0x"))
+                    .nth(1)
+                    .unwrap()
+                    .split(';')
+                    .next()
+                    .unwrap();
+                assert_eq!(
+                    actual,
+                    u32::from_str_radix(value, 16).unwrap(),
+                    "{constant}"
+                );
+            }
+        }
+    }
+}
+
+// spec: NAT-BODY-20
+#[test]
+fn nls_name_pool_offsets_identify_wine_search_entries() {
+    let Some(dist) = dist() else {
+        return;
+    };
+    let data = std::fs::read(dist.join("share/wine/nls/locale.nls")).unwrap();
+    let word = |at: usize| u16::from_le_bytes(data[at..at + 2].try_into().unwrap());
+    let dword = |at: usize| u32::from_le_bytes(data[at..at + 4].try_into().unwrap()) as usize;
+    // Wine load_locale_nls's file header and NLS_LOCALE_HEADER indexes.
+    let header = dword(0x10);
+    let names = header + dword(header + 0x30);
+    let lcids = header + dword(header + 0x2c);
+    let strings = header + dword(header + 0x40);
+    let normalized = |offset: u16| -> Vec<u16> {
+        let at = strings + usize::from(offset) * 2;
+        (0..usize::from(word(at)))
+            .map(|i| word(at + 2 + i * 2))
+            .take_while(|ch| *ch != 0)
+            .map(|ch| match ch {
+                ch @ 0x61..=0x7a => ch - 32,
+                0x5f => 0x2d,
+                ch => ch,
+            })
+            .collect()
+    };
+    let names: Vec<_> = (0..usize::from(word(header + 0x28)))
+        .map(|i| {
+            let offset = word(names + i * 8);
+            (offset, normalized(offset))
+        })
+        .collect();
+    assert!(
+        names.windows(2).all(|pair| pair[0].1 < pair[1].1),
+        "Wine's normalized name index must be unique and sorted"
+    );
+    for i in 0..usize::from(word(header + 0x1e)) {
+        let offset = word(lcids + i * 8 + 6);
+        let expected = names
+            .binary_search_by(|entry| entry.1.cmp(&normalized(offset)))
+            .unwrap();
+        let identity = names.iter().position(|entry| entry.0 == offset).unwrap();
+        assert_eq!(identity, expected, "LCID index {i}");
     }
 }

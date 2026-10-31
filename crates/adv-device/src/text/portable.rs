@@ -46,6 +46,9 @@ pub(super) struct Backend {
     database: OnceLock<Result<Discovery, String>>,
     directories: Option<Vec<PathBuf>>,
     profile_path: Option<PathBuf>,
+    /// Fonts the Windows installation ships (Tahoma, Marlett, Symbol...).
+    /// They fill only families the host lacks; a profile ignores them.
+    windows: Option<PathBuf>,
     resources: BTreeMap<FontResourceId, Resource>,
     /// BCP 47 tag of the guest UI language, which names enumerated families.
     pub(super) language: Option<&'static str>,
@@ -60,6 +63,42 @@ pub(super) struct Backend {
 /// the shared database on first change.
 static SYSTEM_FONTS: OnceLock<Arc<Database>> = OnceLock::new();
 static DIRECTORY_FONTS: Mutex<BTreeMap<PathBuf, Arc<Database>>> = Mutex::new(BTreeMap::new());
+static SYSTEM_WITH_WINDOWS: Mutex<BTreeMap<PathBuf, Arc<Database>>> = Mutex::new(BTreeMap::new());
+
+fn directory_fonts(
+    catalogs: &mut BTreeMap<PathBuf, Arc<Database>>,
+    directory: &std::path::Path,
+) -> Arc<Database> {
+    catalogs
+        .entry(directory.to_owned())
+        .or_insert_with(|| {
+            let mut db = Database::new();
+            db.load_fonts_dir(directory);
+            Arc::new(db)
+        })
+        .clone()
+}
+
+/// Append the faces of `windows` whose families `host` has none of. Host
+/// faces keep their IDs and come first, so every family the host has
+/// resolves, falls back and enumerates exactly as without the layer.
+fn fill_gaps(host: &Database, windows: &Database) -> Database {
+    let known: BTreeSet<String> = host
+        .faces()
+        .flat_map(|face| face.families.iter().map(|(name, _)| name.to_lowercase()))
+        .collect();
+    let mut database = host.clone();
+    for face in windows.faces() {
+        if !face
+            .families
+            .iter()
+            .any(|(name, _)| known.contains(&name.to_lowercase()))
+        {
+            database.push_face_info(face.clone());
+        }
+    }
+    database
+}
 
 fn system_fonts() -> Arc<Database> {
     SYSTEM_FONTS
@@ -113,6 +152,11 @@ impl Backend {
             ..Self::default()
         }
     }
+    pub(super) fn set_windows_fonts(&mut self, directory: &std::path::Path) {
+        debug_assert!(self.resources.is_empty());
+        self.windows = Some(directory.to_owned());
+        self.database = OnceLock::new();
+    }
     pub(super) fn with_profile(path: &std::path::Path) -> Result<Self, TextError> {
         let backend = Self {
             profile_path: Some(path.to_owned()),
@@ -139,16 +183,27 @@ impl Backend {
                     let mut catalogs = DIRECTORY_FONTS.lock().map_err(|e| e.to_string())?;
                     let mut database = Database::new();
                     for directory in directories {
-                        let fonts = catalogs.entry(directory.clone()).or_insert_with(|| {
-                            let mut db = Database::new();
-                            db.load_fonts_dir(directory);
-                            Arc::new(db)
-                        });
-                        for face in fonts.faces() {
+                        for face in directory_fonts(&mut catalogs, directory).faces() {
                             database.push_face_info(face.clone());
                         }
                     }
-                    let database = Arc::new(database);
+                    if let Some(windows) = &self.windows {
+                        database = fill_gaps(&database, &directory_fonts(&mut catalogs, windows));
+                    }
+                    return Ok(Discovery {
+                        database: Arc::new(database),
+                        profile: None,
+                    });
+                } else if let Some(windows) = &self.windows {
+                    let fonts = directory_fonts(
+                        &mut *DIRECTORY_FONTS.lock().map_err(|e| e.to_string())?,
+                        windows,
+                    );
+                    let mut layered = SYSTEM_WITH_WINDOWS.lock().map_err(|e| e.to_string())?;
+                    let database = layered
+                        .entry(windows.clone())
+                        .or_insert_with(|| Arc::new(fill_gaps(&system_fonts(), &fonts)))
+                        .clone();
                     return Ok(Discovery {
                         database,
                         profile: None,
@@ -1411,12 +1466,13 @@ impl Font {
         let mut found = None;
         for &id in &self.candidates {
             let face = load_face(&self.database, &self.store, id, self.profile.as_deref())?;
-            if let Some(glyph) = face
-                .font()?
-                .charmap()
-                .map(code)
-                .filter(|glyph| glyph.to_u32() != 0)
-            {
+            let charmap = face.font()?.charmap();
+            // A symbol font maps ASCII into its private range; Windows never
+            // links one for another font's text.
+            if id != self.primary.info.id && charmap.is_symbol() {
+                continue;
+            }
+            if let Some(glyph) = charmap.map(code).filter(|glyph| glyph.to_u32() != 0) {
                 found = Some((face, glyph));
                 break;
             }

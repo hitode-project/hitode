@@ -3,26 +3,21 @@
 //! word arithmetic, so their pixels match bit for bit. The routines keep
 //! every register but EAX.
 
-use adv_cpu::backend::{Guest, Prot, Reg};
-use adv_machine::{Conv, Env};
+use adv_cpu::body::{Body, EAX, Input, Mem, Ret, Stop};
+use adv_machine::Conv;
 
-use super::Helper;
+type Helper = (&'static str, Conv, &'static [u8], Body);
 
 const ROW: Conv = Conv::Cdecl { argc: 3 };
 pub(super) const HELPERS: [Helper; 4] = [
-    ("kirikiri2!TVPAlphaBlend", ROW, ALPHA_BLEND, alpha_blend),
-    (
-        "kirikiri2!TVPPsAlphaBlend",
-        ROW,
-        PS_ALPHA_BLEND,
-        ps_alpha_blend,
-    ),
-    ("kirikiri2!TVPFillARGB", ROW, FILL_ARGB, fill_argb),
+    ("kirikiri2!TVPAlphaBlend", ROW, ALPHA_BLEND, ALPHA),
+    ("kirikiri2!TVPPsAlphaBlend", ROW, PS_ALPHA_BLEND, PS_ALPHA),
+    ("kirikiri2!TVPFillARGB", ROW, FILL_ARGB, FILL),
     (
         "kirikiri2!TVPInterpStretchCopy",
         Conv::Cdecl { argc: 7 },
         INTERP_STRETCH_COPY,
-        interp_stretch_copy,
+        INTERP,
     ),
 ];
 
@@ -40,8 +35,8 @@ fn lerp(from: u64, to: u64, f: [u16; 2]) -> u64 {
         vget_lane_u64::<0>(vreinterpret_u64_u8(vmovn_u16(vaddq_u16(from, step))))
     }
 }
-#[cfg(not(target_arch = "aarch64"))]
-fn lerp(from: u64, to: u64, f: [u16; 2]) -> u64 {
+#[cfg(any(test, not(target_arch = "aarch64")))]
+fn lerp_scalar(from: u64, to: u64, f: [u16; 2]) -> u64 {
     let (from, to) = (from.to_le_bytes(), to.to_le_bytes());
     u64::from_le_bytes(std::array::from_fn(|i| {
         let (from, to) = (u16::from(from[i]), u16::from(to[i]));
@@ -63,8 +58,8 @@ fn ps_lerp(from: u64, to: u64, f: [u16; 2]) -> u64 {
         vget_lane_u64::<0>(vreinterpret_u64_u8(vqmovun_s16(vaddq_s16(from, step))))
     }
 }
-#[cfg(not(target_arch = "aarch64"))]
-fn ps_lerp(from: u64, to: u64, f: [u16; 2]) -> u64 {
+#[cfg(any(test, not(target_arch = "aarch64")))]
+fn ps_lerp_scalar(from: u64, to: u64, f: [u16; 2]) -> u64 {
     let (from, to) = (from.to_le_bytes(), to.to_le_bytes());
     u64::from_le_bytes(std::array::from_fn(|i| {
         let (from, to) = (i16::from(from[i]), i16::from(to[i]));
@@ -73,279 +68,220 @@ fn ps_lerp(from: u64, to: u64, f: [u16; 2]) -> u64 {
     }))
 }
 
-fn pixel(bytes: &[u8], index: usize) -> u32 {
-    u32::from_le_bytes(bytes[4 * index..4 * index + 4].try_into().unwrap())
+#[cfg(not(target_arch = "aarch64"))]
+use lerp_scalar as lerp;
+#[cfg(not(target_arch = "aarch64"))]
+use ps_lerp_scalar as ps_lerp;
+
+const ARGS: &[Input] = &[Input::Stack(0), Input::Stack(1), Input::Stack(2)];
+adv_cpu::body!(ALPHA = alpha_blend, inputs: ARGS, outputs: EAX, pop: 0);
+adv_cpu::body!(PS_ALPHA = ps_alpha_blend, inputs: ARGS, outputs: EAX, pop: 0);
+adv_cpu::body!(FILL = fill_argb, inputs: &[Input::Stack(0), Input::Stack(1), Input::Stack(2), Input::Eax], outputs: EAX, pop: 0);
+adv_cpu::body!(INTERP = interp_stretch_copy, inputs: &[Input::Stack(0), Input::Stack(1), Input::Stack(2), Input::Stack(3), Input::Stack(4), Input::Stack(5), Input::Stack(6)], outputs: EAX, pop: 0);
+
+// SAFETY: callers check the complete spans before touching pixels. Raw
+// accesses keep overlapping reads and writes in the assembly's order.
+unsafe fn pixel(p: *const u8, i: usize) -> u32 {
+    u32::from_le(unsafe { p.add(4 * i).cast::<u32>().read_unaligned() })
 }
-fn pair(bytes: &[u8], index: usize) -> u64 {
-    u64::from_le_bytes(bytes[4 * index..4 * index + 8].try_into().unwrap())
+unsafe fn pair(p: *const u8, i: usize) -> u64 {
+    u64::from_le(unsafe { p.add(4 * i).cast::<u64>().read_unaligned() })
 }
-/// The pixels in the low halves of `a` and `b`, as a pair.
+unsafe fn put(p: *mut u8, i: usize, value: u32) {
+    unsafe { p.add(4 * i).cast::<u32>().write_unaligned(value.to_le()) };
+}
+unsafe fn put_pair(p: *mut u8, i: usize, value: u64) {
+    unsafe { p.add(4 * i).cast::<u64>().write_unaligned(value.to_le()) };
+}
 fn join(a: u64, b: u64) -> u64 {
     a & 0xffff_ffff | b << 32
 }
-fn set(bytes: &mut [u8], index: usize, value: &[u8]) {
-    bytes[4 * index..4 * index + value.len()].copy_from_slice(value);
-}
-
-/// `len` pixels at `at`, if guest code could access them with `prot`.
-fn view<'a>(
-    cpu: &'a dyn Guest,
-    at: u32,
-    len: usize,
-    prot: Prot,
-    scratch: &'a mut [u8],
-) -> Option<&'a [u8]> {
-    let size = u32::try_from(4 * len).ok()?;
-    at.checked_add(size)?;
-    if !cpu.accessible(at, size, prot) {
-        return None;
-    }
-    if let Some(bytes) = cpu.shared_bytes(at, 4 * len) {
-        return Some(bytes);
-    }
-    cpu.read(at, scratch).ok()?;
-    Some(scratch)
-}
-
-fn disjoint(a: u32, a_len: usize, b: u32, b_len: usize) -> bool {
-    let (a, b) = (u64::from(a), u64::from(b));
-    a + 4 * a_len as u64 <= b || b + 4 * b_len as u64 <= a
-}
-
-/// EAX and EDX as the routines leave them.
-fn kept(env: &Env<'_>) -> Option<u64> {
-    Some(u64::from(env.cpu.reg(Reg::Edx)) << 32 | u64::from(env.cpu.reg(Reg::Eax)))
+fn size(at: u32, len: u32, write: bool) -> Result<u32, Stop> {
+    len.checked_mul(4)
+        .filter(|&n| u64::from(at) + u64::from(n) <= 1 << 32)
+        .ok_or(Stop::Fault { address: at, write })
 }
 
 // spec: NAT-BODY-14
-/// TVPAlphaBlend(dest, src, len): `src` over `dest` by its alpha. Pairs
-/// from an 8-byte aligned `dest` copy when both are opaque, stay when both
-/// are clear and blend otherwise; the rest copy only when opaque.
-fn alpha_blend(env: &mut Env<'_>) -> Option<u64> {
-    let (dest, src) = (env.arg(0), env.arg(1));
-    let Ok(len @ 1..) = usize::try_from(env.arg(2) as i32) else {
-        return kept(env);
-    };
-    // The routine reads each source pair before it writes its destination.
-    if dest != src && !disjoint(dest, len, src, len) {
-        return None;
+fn alpha_blend<M: Mem>(mem: &mut M, [dest, src, len, ..]: [u32; 7]) -> Result<Ret, Stop> {
+    if len as i32 <= 0 {
+        return Ok(0u32.into());
     }
-    let size = u32::try_from(4 * len).ok()?;
-    dest.checked_add(size)?;
-    if !env.cpu.accessible(dest, size, Prot::RW) {
-        return None;
-    }
-    if !env.cpu.accessible(src, size, Prot::READ) {
-        return None;
-    }
-    let (input, output) = super::super::scratch(env.ext, 8 * len).split_at_mut(4 * len);
-    // Equal input/output needs a snapshot; disjoint ordinary input may be borrowed.
-    let source = if src == dest {
-        env.cpu.read(src, input).ok()?;
-        input.as_ptr()
-    } else {
-        view(env.cpu, src, len, Prot::READ, input)?.as_ptr()
-    };
-    let mut fallback = false;
-    let d = match env.cpu.writable_bytes(dest, 4 * len) {
-        Some(bytes) => bytes,
-        None => {
-            fallback = true;
-            env.cpu.read(dest, output).ok()?;
-            &mut *output
-        }
-    };
-    // SAFETY: the input is either separately owned above or ordinary storage
-    // disjoint from the writable destination. No guest mappings change here.
-    let s = unsafe { std::slice::from_raw_parts(source, 4 * len) };
-    let over = |d: &mut [u8], i: usize| {
-        let (from, to) = (pixel(d, i), pixel(s, i));
-        let alpha = (to >> 24) as u16;
-        let out = if alpha == 0xff {
-            to
-        } else {
-            lerp(from.into(), to.into(), [alpha, 0]) as u32
+    let [d, s] = mem.spans([
+        (dest, size(dest, len, true)?, true),
+        (src, size(src, len, false)?, false),
+    ])?;
+    let len = len as usize;
+    // SAFETY: the complete source and destination were checked above.
+    unsafe {
+        let over = |i| {
+            let (from, to) = (pixel(d, i), pixel(s, i));
+            let alpha = (to >> 24) as u16;
+            put(
+                d,
+                i,
+                if alpha == 255 {
+                    to
+                } else {
+                    lerp(from.into(), to.into(), [alpha, 0]) as u32
+                },
+            );
         };
-        set(d, i, &out.to_le_bytes());
+        let mut i = 0;
+        if len > 4 {
+            if dest & 4 != 0 {
+                over(0);
+                i = 1;
+            }
+            if i + 4 < len {
+                let mut to = pair(s, i);
+                while i + 4 < len {
+                    let alpha = [(to >> 24) as u16 & 255, (to >> 56) as u16];
+                    if alpha[0] & alpha[1] == 255 {
+                        put_pair(d, i, pair(s, i));
+                        i += 2;
+                        to = pair(s, i);
+                    } else if alpha[0] | alpha[1] == 0 {
+                        i += 2;
+                        to = pair(s, i);
+                    } else {
+                        let value = lerp(pair(d, i), to, alpha);
+                        to = pair(s, i + 2);
+                        put_pair(d, i, value);
+                        i += 2;
+                    }
+                }
+            }
+        }
+        for i in i..len {
+            over(i);
+        }
+    }
+    mem.commit()?;
+    Ok(0u32.into())
+}
+
+// spec: NAT-BODY-14
+fn ps_alpha_blend<M: Mem>(mem: &mut M, [dest, src, len, ..]: [u32; 7]) -> Result<Ret, Stop> {
+    if len as i32 <= 0 {
+        return Ok(0u32.into());
+    }
+    // The assembly enters the pair loop with an unsigned comparison, then
+    // continues it and the scalar tail with signed address comparisons.
+    let end = src.wrapping_add(len.wrapping_mul(4));
+    let limit = end.wrapping_sub(16);
+    let leading = u32::from(src < limit && src & 4 != 0);
+    let mut at = src.wrapping_add(leading * 4);
+    let groups = if at < limit {
+        let next = at.wrapping_add(16);
+        let extra = (((i64::from(limit as i32) - i64::from(next as i32)).max(0) + 15) / 16) as u32;
+        at = at.wrapping_add((extra + 1).wrapping_mul(16));
+        extra + 1
+    } else {
+        0
     };
-    let mut i = 0;
-    if len > 4 {
-        if dest & 4 != 0 {
-            over(d, 0);
+    let singles = 1
+        + (((i64::from(end as i32) - i64::from(at.wrapping_add(4) as i32)).max(0) + 3) / 4) as u32;
+    let count = leading + groups * 4 + singles;
+    let [d, s] = mem.spans([
+        (dest, size(dest, count, true)?, true),
+        (src, size(src, count, false)?, false),
+    ])?;
+    // SAFETY: the complete spans were checked above.
+    unsafe {
+        let single = |i| {
+            let to = pixel(s, i);
+            put(
+                d,
+                i,
+                ps_lerp(pixel(d, i).into(), to.into(), [(to >> 25) as u16, 0]) as u32,
+            );
+        };
+        let mut i = 0;
+        if leading != 0 {
+            single(0);
             i = 1;
         }
-        while i + 4 < len {
-            let to = pair(s, i);
-            let alpha = [(to >> 24) as u16 & 0xff, (to >> 56) as u16];
-            if alpha[0] & alpha[1] == 0xff {
-                set(d, i, &to.to_le_bytes());
-            } else if alpha[0] | alpha[1] != 0 {
-                let out = lerp(pair(d, i), to, alpha);
-                set(d, i, &out.to_le_bytes());
+        for _ in 0..groups {
+            for j in [i, i + 2] {
+                let to = pair(s, j);
+                put_pair(
+                    d,
+                    j,
+                    ps_lerp(pair(d, j), to, [(to >> 25) as u16 & 127, (to >> 57) as u16]),
+                );
             }
-            i += 2;
+            i += 4;
+        }
+        for j in i..i + singles as usize {
+            single(j);
         }
     }
-    for i in i..len {
-        over(d, i);
-    }
-    if fallback {
-        env.cpu.write(dest, output).ok()?;
-    }
-    kept(env)
+    mem.commit()?;
+    Ok(0u32.into())
 }
 
 // spec: NAT-BODY-14
-/// TVPPsAlphaBlend(dest, src, len): `src` over `dest` by the top 7 bits of
-/// its alpha, every pixel alike.
-fn ps_alpha_blend(env: &mut Env<'_>) -> Option<u64> {
-    let (dest, src) = (env.arg(0), env.arg(1));
-    let Ok(len @ 1..) = usize::try_from(env.arg(2) as i32) else {
-        return kept(env);
-    };
-    // Its loops compare addresses as signed, unlike an index.
-    let end = src.checked_add(u32::try_from(4 * len + 16).ok()?)?;
-    if (dest != src && !disjoint(dest, len, src, len)) || (src ^ (end - 1)) >> 31 != 0 {
-        return None;
+fn fill_argb<M: Mem>(mem: &mut M, [dest, len, value, eax, ..]: [u32; 7]) -> Result<Ret, Stop> {
+    if len as i32 <= 0 {
+        return Ok(eax.into());
     }
-    let size = u32::try_from(4 * len).ok()?;
-    dest.checked_add(size)?;
-    if !env.cpu.accessible(dest, size, Prot::RW) {
-        return None;
-    }
-    if !env.cpu.accessible(src, size, Prot::READ) {
-        return None;
-    }
-    let (input, output) = super::super::scratch(env.ext, 8 * len).split_at_mut(4 * len);
-    // Equal input/output needs a snapshot; disjoint ordinary input may be borrowed.
-    let source = if src == dest {
-        env.cpu.read(src, input).ok()?;
-        input.as_ptr()
-    } else {
-        view(env.cpu, src, len, Prot::READ, input)?.as_ptr()
-    };
-    let mut fallback = false;
-    let d = match env.cpu.writable_bytes(dest, 4 * len) {
-        Some(bytes) => bytes,
-        None => {
-            fallback = true;
-            env.cpu.read(dest, output).ok()?;
-            &mut *output
+    let d = mem.output(dest, size(dest, len, true)?)?;
+    // SAFETY: the destination was checked above.
+    unsafe {
+        for i in 0..len as usize {
+            put(d, i, value);
         }
-    };
-    // SAFETY: the input is either separately owned above or ordinary storage
-    // disjoint from the writable destination. No guest mappings change here.
-    let s = unsafe { std::slice::from_raw_parts(source, 4 * len) };
-    let alpha = |pair: u64| [(pair >> 25) as u16 & 0x7f, (pair >> 57) as u16];
-    for i in (0..len - 1).step_by(2) {
-        let out = ps_lerp(pair(d, i), pair(s, i), alpha(pair(s, i)));
-        set(d, i, &out.to_le_bytes());
     }
-    if len % 2 == 1 {
-        let to = pixel(s, len - 1).into();
-        let out = ps_lerp(pixel(d, len - 1).into(), to, alpha(to)) as u32;
-        set(d, len - 1, &out.to_le_bytes());
-    }
-    if fallback {
-        env.cpu.write(dest, output).ok()?;
-    }
-    kept(env)
+    mem.commit()?;
+    Ok(value.into())
 }
 
 // spec: NAT-BODY-14
-/// TVPFillARGB(dest, len, value), which leaves `value` in EAX.
-fn fill_argb(env: &mut Env<'_>) -> Option<u64> {
-    let (dest, value) = (env.arg(0), env.arg(2));
-    let Ok(len @ 1..) = usize::try_from(env.arg(1) as i32) else {
-        return kept(env);
-    };
-    let size = u32::try_from(4 * len).ok()?;
-    if dest.checked_add(size).is_none() || !env.cpu.accessible(dest, size, Prot::WRITE) {
-        return None;
+fn interp_stretch_copy<M: Mem>(
+    mem: &mut M,
+    [dest, len, src1, src2, blend_y, start, step]: [u32; 7],
+) -> Result<Ret, Stop> {
+    if len as i32 <= 0 {
+        return Ok(0u32.into());
     }
-    if let Some(bytes) = env.cpu.writable_bytes(dest, size as usize) {
-        bytes.as_chunks_mut::<4>().0.fill(value.to_le_bytes());
-    } else {
-        let bytes = super::super::scratch(env.ext, 4 * len);
-        bytes.as_chunks_mut::<4>().0.fill(value.to_le_bytes());
-        env.cpu.write(dest, bytes).ok()?;
-    }
-    Some(u64::from(env.cpu.reg(Reg::Edx)) << 32 | u64::from(value))
-}
-
-// spec: NAT-BODY-14
-/// TVPInterpStretchCopy(dest, len, src1, src2, blend_y, srcstart, srcstep):
-/// each pixel interpolates its two source rows at the 16.16 position
-/// `srcstart + i * srcstep`, then blends them by `blend_y`.
-fn interp_stretch_copy(env: &mut Env<'_>) -> Option<u64> {
-    let [dest, len, src1, src2, blend_y, start, step] = std::array::from_fn(|i| env.arg(i as u32));
-    let Ok(len @ 1..) = usize::try_from(len as i32) else {
-        return kept(env);
-    };
-    let x = |i: usize| start.wrapping_add((i as u32).wrapping_mul(step));
-    let (first, last) = (0..len).fold((u32::MAX, 0), |(first, last), i| {
-        (first.min(x(i) >> 16), last.max(x(i) >> 16))
+    let x = |i: u32| start.wrapping_add(i.wrapping_mul(step));
+    let (first, last) = (0..len).fold((u32::MAX, 0), |(a, b), i| {
+        (a.min(x(i) >> 16), b.max(x(i) >> 16))
     });
-    // Each position reads its pixel and the next.
-    let span = (last - first + 2) as usize;
-    let [Some(row1), Some(row2)] = [src1, src2].map(|src| src.checked_add(4 * first)) else {
-        return None;
-    };
-    if !disjoint(dest, len, row1, span)
-        || !disjoint(dest, len, row2, span)
-        || !env
-            .cpu
-            .accessible(dest, u32::try_from(4 * len).ok()?, Prot::WRITE)
-    {
-        return None;
-    }
-    let row_bytes = u32::try_from(4 * span).ok()?;
-    if !env.cpu.accessible(row1, row_bytes, Prot::READ)
-        || !env.cpu.accessible(row2, row_bytes, Prot::READ)
-    {
-        return None;
-    }
-    let (rows, output) = super::super::scratch(env.ext, 8 * span + 4 * len).split_at_mut(8 * span);
-    let (top_scratch, bottom_scratch) = rows.split_at_mut(4 * span);
-    let p1 = view(env.cpu, row1, span, Prot::READ, top_scratch)?.as_ptr();
-    let p2 = view(env.cpu, row2, span, Prot::READ, bottom_scratch)?.as_ptr();
-    let mut fallback = false;
-    let d = match env.cpu.writable_bytes(dest, 4 * len) {
-        Some(bytes) => bytes,
-        None => {
-            fallback = true;
-            &mut *output
-        }
-    };
-    // SAFETY: both inputs are separately owned or ordinary storage disjoint
-    // from the output, and no mapping changes occur during this computation.
-    let (s1, s2) = unsafe {
-        (
-            std::slice::from_raw_parts(p1, 4 * span),
-            std::slice::from_raw_parts(p2, 4 * span),
-        )
-    };
+    let span = (last - first + 2) * 4;
+    let [d, top, bottom] = mem.spans([
+        (dest, size(dest, len, true)?, true),
+        (src1.wrapping_add(first * 4), span, false),
+        (src2.wrapping_add(first * 4), span, false),
+    ])?;
     let factor = blend_y.wrapping_add(blend_y >> 7) as u16;
-    // Pixel `i`'s rows, top then bottom, from both rows' pairs at its position.
-    let rows = |i: usize| {
-        let (at, f) = (((x(i) >> 16) - first) as usize, (x(i) >> 8 & 0xff) as u16);
-        let (top, bottom) = (pair(s1, at), pair(s2, at));
-        lerp(join(top, bottom), join(top >> 32, bottom >> 32), [f; 2])
-    };
-    for i in (0..len - 1).step_by(2) {
-        let (a, b) = (rows(i), rows(i + 1));
-        let out = lerp(join(a, b), join(a >> 32, b >> 32), [factor; 2]);
-        set(d, i, &out.to_le_bytes());
+    // SAFETY: both source rows and the destination were checked together.
+    unsafe {
+        let rows = |i| {
+            let (at, f) = (((x(i) >> 16) - first) as usize, (x(i) >> 8 & 255) as u16);
+            let (a, b) = (pair(top, at), pair(bottom, at));
+            lerp(join(a, b), join(a >> 32, b >> 32), [f; 2])
+        };
+        for i in (0..len - 1).step_by(2) {
+            let (a, b) = (rows(i), rows(i + 1));
+            put_pair(
+                d,
+                i as usize,
+                lerp(join(a, b), join(a >> 32, b >> 32), [factor; 2]),
+            );
+        }
+        if len % 2 == 1 {
+            let a = rows(len - 1);
+            put(
+                d,
+                (len - 1) as usize,
+                lerp(a & 0xffff_ffff, a >> 32, [factor, 0]) as u32,
+            );
+        }
     }
-    if len % 2 == 1 {
-        let a = rows(len - 1);
-        let out = lerp(a & 0xffff_ffff, a >> 32, [factor, 0]) as u32;
-        set(d, len - 1, &out.to_le_bytes());
-    }
-    if fallback {
-        env.cpu.write(dest, output).ok()?;
-    }
-    kept(env)
+    mem.commit()?;
+    Ok(0u32.into())
 }
 
 const ALPHA_BLEND: &[u8] = &[
@@ -441,3 +377,23 @@ const FILL_ARGB: &[u8] = &[
     0x47, 0x30, 0x83, 0xc7, 0x40, 0x39, 0xdf, 0x72, 0xea, 0x83, 0xc3, 0x3c, 0x39, 0xdf, 0x73, 0x09,
     0x89, 0x07, 0x83, 0xc7, 0x04, 0x39, 0xdf, 0x72, 0xf7, 0x5a, 0x59, 0x5b, 0x5e, 0x5f, 0xc3,
 ];
+
+#[cfg(test)]
+mod tests {
+    // spec: NAT-BODY-19
+    #[test]
+    fn neon_matches_scalar_words() {
+        let mut state = 0x9e3779b97f4a7c15u64;
+        for _ in 0..10000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let a = state;
+            state = state.wrapping_mul(0x2545f4914f6cdd1d);
+            let b = state;
+            let f = [state as u16, (state >> 32) as u16];
+            assert_eq!(super::lerp(a, b, f), super::lerp_scalar(a, b, f));
+            assert_eq!(super::ps_lerp(a, b, f), super::ps_lerp_scalar(a, b, f));
+        }
+    }
+}

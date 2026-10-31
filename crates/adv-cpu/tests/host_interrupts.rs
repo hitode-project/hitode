@@ -1,8 +1,9 @@
 use adv_cpu::{EXEC, Executor, READ, Region, RunOutcome, WRITE};
+use adv_sync::pending::INTERRUPT;
 use iced_x86::code_asm::*;
 use iced_x86::{Decoder, DecoderOptions};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 mod support;
@@ -44,7 +45,7 @@ fn pending_notification_preserves_cpu_and_fuel_until_owner_clears_it() {
     });
     for native in [false, true] {
         let mut m = machine(&[(CODE, bytes.clone())], native);
-        let flag = Arc::new(AtomicBool::new(true));
+        let flag = Arc::new(AtomicU32::new(INTERRUPT));
         m.set_host_interrupt_flag(flag.clone());
         m.state.fuel = 123;
         let before = m.state.clone();
@@ -52,9 +53,9 @@ fn pending_notification_preserves_cpu_and_fuel_until_owner_clears_it() {
             assert_eq!(m.run(STOP, 123).unwrap(), RunOutcome::Interrupted);
             assert_eq!(m.state, before);
         }
-        assert!(flag.load(Ordering::Acquire));
+        assert_ne!(flag.load(Ordering::Acquire), 0);
         assert_eq!(m.stats.native_blocks + m.stats.interpreter_instructions, 0);
-        flag.store(false, Ordering::Release);
+        flag.store(0, Ordering::Release);
         assert_eq!(m.run(STOP, 123).unwrap(), RunOutcome::ReachedStop);
         assert_eq!(m.state.regs[0], 1);
     }
@@ -104,12 +105,12 @@ fn native_direct_indirect_and_linked_loops_interrupt_and_resume_exact_prefix() {
         m.state.mmx[1] = u64::from_le_bytes([1; 8]);
         m.state.mmx_mode = 1 | (1 << 2) | (3 << 8);
         m.state.commit_mmx();
-        let flag = Arc::new(AtomicBool::new(false));
+        let flag = Arc::new(AtomicU32::new(0));
         m.set_host_interrupt_flag(flag.clone());
         let notify = flag.clone();
         let producer = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(2));
-            notify.store(true, Ordering::Release);
+            notify.store(INTERRUPT, Ordering::Release);
         });
         let elapsed = Instant::now();
         let budget = 100_000_000;
@@ -138,7 +139,7 @@ fn native_direct_indirect_and_linked_loops_interrupt_and_resume_exact_prefix() {
                 .any(|instruction| instruction.ip() == pc)
                 || (mode == 2 && m.state.eip == TARGET)
         );
-        flag.store(false, Ordering::Release);
+        flag.store(0, Ordering::Release);
         m.state.regs[1] = 10 + pending_decrement;
         assert_eq!(m.run(STOP, 1000).unwrap(), RunOutcome::ReachedStop);
         assert_eq!(m.state.regs[0], completed + 10);
@@ -162,12 +163,12 @@ fn interpreted_x87_loop_interrupts_at_a_restartable_block_boundary() {
     });
     let mut m = machine(&[(CODE, bytes)], false);
     m.state.regs[1] = 100_000_000;
-    let flag = Arc::new(AtomicBool::new(false));
+    let flag = Arc::new(AtomicU32::new(0));
     m.set_host_interrupt_flag(flag.clone());
     let notify = flag.clone();
     let producer = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(2));
-        notify.store(true, Ordering::Release);
+        notify.store(INTERRUPT, Ordering::Release);
     });
     let budget = 100_000_000;
     assert_eq!(m.run(STOP, budget).unwrap(), RunOutcome::Interrupted);
@@ -178,7 +179,7 @@ fn interpreted_x87_loop_interrupts_at_a_restartable_block_boundary() {
     if m.state.regs[0] > 0 {
         assert_eq!(m.memory().read(DATA, 4).unwrap(), &2f32.to_le_bytes());
     }
-    flag.store(false, Ordering::Release);
+    flag.store(0, Ordering::Release);
     let done = m.state.regs[0];
     m.state.regs[1] = 10;
     assert_eq!(m.run(STOP, 1000).unwrap(), RunOutcome::ReachedStop);
@@ -255,7 +256,7 @@ fn pal_budget_stop_disable_and_fault_priorities_preserve_original_outcomes() {
                 kind: FaultKind::Read(0x2dead000)
             })
         );
-        assert!(wake.interrupt_flag().load(Ordering::Acquire));
+        assert_ne!(wake.interrupt_flag().load(Ordering::Acquire) & INTERRUPT, 0);
         cpu.set_host_interrupts(true);
         cpu.set_reg(Reg::Eip, CODE);
         wake.take_interrupt();

@@ -1,3 +1,4 @@
+/* Build: i686-w64-mingw32-gcc -O2 -Wall font-query-formats.c -o font-query-formats.exe -lgdi32 */
 /* The restored native-GDI query cases, emitted for independent Windows comparison. */
 #include <windows.h>
 #include <stdio.h>

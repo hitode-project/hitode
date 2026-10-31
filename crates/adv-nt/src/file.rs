@@ -4,6 +4,7 @@
 mod information;
 mod io;
 mod probes;
+pub(crate) mod state;
 pub mod volume;
 
 pub use information::{query, set};
@@ -108,11 +109,23 @@ pub fn write(env: &mut Env<'_>, args: &[u32]) -> Outcome {
                 let count = unsafe {
                     match position {
                         Some(off) => libc::pwrite(fd.fd, bytes.as_ptr().cast(), bytes.len(), off),
+                        None if fd.file.is_some() => libc::pwrite(
+                            fd.fd,
+                            bytes.as_ptr().cast(),
+                            bytes.len(),
+                            fd.file.as_ref().unwrap().position.get(),
+                        ),
                         None => libc::write(fd.fd, bytes.as_ptr().cast(), bytes.len()),
                     }
                 };
                 if count >= 0 {
-                    if let Some(off) = position
+                    if let Some(file) = &fd.file {
+                        if !asynchronous {
+                            file.position.set(
+                                position.unwrap_or_else(|| file.position.get()) + count as i64,
+                            );
+                        }
+                    } else if let Some(off) = position
                         && !asynchronous
                     {
                         // SAFETY: the same regular file; Wine advances its synchronous position.

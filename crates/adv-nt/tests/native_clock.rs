@@ -2,13 +2,21 @@
 
 #[cfg(any(target_vendor = "apple", target_os = "android"))]
 use adv_wineserver as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use adv_cpu::Cpu;
 use adv_cpu::backend::{Guest, GuestExt, Prot};
 use adv_machine::{Clock, Machine, RunResult, layout::PARK_ADDR};
 use adv_nt::dispatch::{self, Platform};
 use adv_pe::Pe;
+
+#[allow(dead_code)]
+mod wine {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../adv-nt/tests/common/wine.rs"
+    ));
+}
 
 const CODE: u32 = 0x0040_0000;
 const SLOT: u32 = 0x0041_0000;
@@ -89,8 +97,7 @@ fn call(machine: &mut Machine<Cpu>, counter: u32, frequency: u32) -> [u32; 7] {
 // spec: NAT-BODY-2
 #[test]
 fn performance_counter_matches_wine() {
-    let Some(dist) = std::env::var_os("ADV_WINE_DIST").map(PathBuf::from) else {
-        eprintln!("skipped: ADV_WINE_DIST is not set");
+    let Some(dist) = wine::dist() else {
         return;
     };
     let dll = dist.join("lib/wine/i386-windows/ntdll.dll");
@@ -98,6 +105,7 @@ fn performance_counter_matches_wine() {
     let mut native = machine(&dll, &image);
     let mut reference = machine(&dll, &image);
     reference.sys.redirects.clear();
+    reference.sys.stats.services_enabled = true;
     const CASES: u32 = 300;
     for case in 0..CASES {
         let now = 1_000_000 + u64::from(case) * 12_345_678;
@@ -128,7 +136,7 @@ fn performance_counter_matches_wine() {
             .map(|tally| tally.calls)
             .sum::<u64>()
     };
-    assert!(native.sys.host_calls > u64::from(CASES / 2));
+    assert!(native.sys.host_calls < reference.sys.host_calls);
     assert!(
         syscalls(&native) < u64::from(CASES / 2),
         "the body bypasses system calls"
@@ -144,6 +152,6 @@ fn performance_counter_matches_wine() {
         assert_eq!(got, call(&mut reference, counter, frequency));
         assert_eq!(got[0], adv_nt::status::ACCESS_VIOLATION);
         assert_eq!(got[1], got[2]);
-        assert_eq!(adv_nt::native::declines(&native.ext), abandons + 1);
+        assert_eq!(adv_nt::native::declines(&native.ext), abandons);
     }
 }

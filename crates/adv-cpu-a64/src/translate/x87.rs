@@ -73,7 +73,22 @@ pub struct X87 {
 
 /// The `X87` for `instruction`, whose interpreter helper is `helper`.
 pub fn plan(instruction: &Instruction, helper: u8, opcode: Option<u16>) -> Option<X87> {
-    let fast = fast::classify(instruction)?;
+    let fast = match instruction.mnemonic() {
+        iced_x86::Mnemonic::Fld if instruction.memory_size().size() == 10 => Fast::Load80,
+        iced_x86::Mnemonic::Fstp if instruction.memory_size().size() == 10 => Fast::Store80,
+        m @ (iced_x86::Mnemonic::Fsin
+        | iced_x86::Mnemonic::Fcos
+        | iced_x86::Mnemonic::Fsincos
+        | iced_x86::Mnemonic::Fptan
+        | iced_x86::Mnemonic::Fpatan
+        | iced_x86::Mnemonic::F2xm1
+        | iced_x86::Mnemonic::Fyl2x
+        | iced_x86::Mnemonic::Fyl2xp1
+        | iced_x86::Mnemonic::Fscale
+        | iced_x86::Mnemonic::Fprem
+        | iced_x86::Mnemonic::Fprem1) => Fast::Leaf(m),
+        _ => fast::classify(instruction)?,
+    };
     let mem = if instruction.op0_kind() == OpKind::Memory {
         Some(memory(instruction)?)
     } else {
@@ -235,6 +250,7 @@ impl Translator<'_> {
         let mut dp = x.mem.is_some();
         let mut metadata = true;
         match x.fast {
+            Fast::Load80 | Fast::Store80 | Fast::Leaf(_) => unreachable!("cached forms"),
             Fast::Wait => metadata = false,
             Fast::Round => self.x87_round(slow),
             Fast::Scale => self.x87_scale(slow),
@@ -1489,7 +1505,7 @@ mod tests {
         iced_x86::Decoder::with_ip(32, &bytes, 0x1000, 0).decode()
     }
 
-    // spec: A64F-FP-2
+    // spec: A64F-FP-2, A64F-FP-8
     #[test]
     fn plans_take_the_fast_forms_with_their_operands() {
         let load = plan(
@@ -1517,8 +1533,13 @@ mod tests {
         assert!(plan(&decode(|a| a.fnstsw(ax).unwrap()), 0, None).is_some());
         let control = plan(&decode(|a| a.fldcw(word_ptr(esp + 4)).unwrap()), 0, None).unwrap();
         assert_eq!(control.fast, Fast::LoadControl);
-        assert!(plan(&decode(|a| a.fld(tword_ptr(esi)).unwrap()), 0, None).is_none());
-        assert!(plan(&decode(|a| a.fld(dword_ptr(esi).gs()).unwrap()), 0, None).is_none());
+        let load80 = plan(&decode(|a| a.fld(tword_ptr(esi)).unwrap()), 0, None).unwrap();
+        assert_eq!(load80.fast, Fast::Load80);
+        let store80 = plan(&decode(|a| a.fstp(tword_ptr(esi)).unwrap()), 0, None).unwrap();
+        assert_eq!((store80.fast, store80.mem), (Fast::Store80, load80.mem));
+        let gs_load = plan(&decode(|a| a.fld(dword_ptr(esi).gs()).unwrap()), 0, None).unwrap();
+        assert_eq!(gs_load.fast, Fast::Load(Source::F32));
+        assert_eq!(gs_load.mem, load80.mem);
         assert!(plan(&decode(|a| a.fsqrt().unwrap()), 0, None).is_none());
     }
 }

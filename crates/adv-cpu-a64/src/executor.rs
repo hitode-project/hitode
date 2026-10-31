@@ -7,7 +7,7 @@
 //! pass the same semantic tests.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
 use adv_cpu_core::instruction_trace::Trace;
@@ -72,8 +72,10 @@ pub struct Executor {
     pub(crate) faults: rustc_hash::FxHashMap<u32, u64>,
     interpreter: Interpreter,
     timestamp: adv_cpu_core::timestamp::Counter,
-    interrupt: Arc<AtomicBool>,
+    interrupt: Arc<AtomicU32>,
     host_interrupts: bool,
+    diagnostics: u8,
+    alarm: Option<adv_sync::pending::Deadline>,
     deadline: Option<Instant>,
     /// `ADV_INTERP_TRACE_*` observations of an interpreter-only executor.
     pub(crate) instruction_trace: Option<Box<Trace>>,
@@ -152,8 +154,10 @@ impl Executor {
             faults: Default::default(),
             interpreter: Interpreter::new(),
             timestamp: Default::default(),
-            interrupt: Arc::new(AtomicBool::new(false)),
+            interrupt: Arc::new(AtomicU32::new(0)),
             host_interrupts: true,
+            diagnostics: 0,
+            alarm: None,
             deadline: None,
             instruction_trace: (!translate).then(Trace::from_env).flatten(),
             #[cfg(native)]
@@ -251,14 +255,23 @@ impl Executor {
 
     pub fn set_deadline(&mut self, deadline: Option<Instant>) {
         self.deadline = deadline;
+        if deadline.is_some() && self.alarm.is_none() {
+            self.alarm = Some(adv_sync::pending::Deadline::new(self.interrupt.clone()));
+        }
+        if let Some(alarm) = &self.alarm {
+            alarm.set(deadline, &self.interrupt);
+        }
     }
 
-    pub fn set_host_interrupt_flag(&mut self, interrupt: Arc<AtomicBool>) {
+    pub fn set_host_interrupt_flag(&mut self, interrupt: Arc<AtomicU32>) {
+        self.alarm = None;
         self.interrupt = interrupt;
+        self.set_deadline(self.deadline);
     }
 
     pub fn host_interrupt_pending(&self) -> bool {
-        self.host_interrupts && self.interrupt.load(Ordering::Acquire)
+        self.host_interrupts
+            && self.interrupt.load(Ordering::Acquire) & adv_sync::pending::INTERRUPT != 0
     }
 
     pub fn set_host_interrupts(&mut self, enabled: bool) {
@@ -378,6 +391,15 @@ impl Executor {
         budget: u64,
         handler: Option<&mut dyn ExecutionTrap>,
     ) -> Result<RunOutcome, String> {
+        let diagnostics = handler.as_ref().map_or(0, |handler| handler.diagnostics());
+        if self.diagnostics != diagnostics {
+            self.diagnostics = diagnostics;
+            self.memory.count_host_access(diagnostics != 0);
+            #[cfg(native)]
+            if let Some(native) = &mut self.native {
+                native.clear();
+            }
+        }
         // Another process of the family may have used the shared window.
         self.memory.attach()?;
         let mut bridge = Bridge {
@@ -398,8 +420,23 @@ impl Executor {
         };
         #[cfg(native)]
         if let Some(native) = &mut self.native {
+            native.set_body_services(
+                bridge
+                    .handler
+                    .as_ref()
+                    .map_or_else(Default::default, |h| h.body_services()),
+            );
             native.deadline = self.deadline.map(crate::native::deadline);
-            native.interrupt = self.host_interrupts.then(|| self.interrupt.clone());
+            native.interrupt = Some(self.interrupt.clone());
+            native.pending_mask = if self.host_interrupts {
+                u32::MAX
+            } else {
+                !adv_sync::pending::INTERRUPT
+            };
+            self.interrupt.fetch_and(
+                !(adv_sync::pending::STOP | adv_sync::pending::WORK),
+                Ordering::AcqRel,
+            );
         }
         // Observations follow only interpreter-only runs, as in the x64 engine.
         let mut trace = self
@@ -437,6 +474,7 @@ impl Executor {
             return Ok(None);
         };
         let fuel = self.state.fuel;
+        native.clock = (bridge as *mut Bridge<'_>).cast();
         // Host calls run in place only with a handler to take them.
         let traps = if bridge.handler.is_some() {
             bridge.memory = &mut self.memory;
@@ -556,12 +594,23 @@ impl Executor {
             {
                 self.state.rep = None;
             }
+            // Interpreted runs reach the owner's target too (A64-CTL-14).
             if let Some(handler) = bridge.handler.as_ref()
-                && let Some((target, original)) = handler.required_redirect(self.state.eip)
+                && let Some((target, original)) = handler
+                    .required_redirect(self.state.eip)
+                    .or_else(|| handler.redirect(self.state.eip))
                 && self
                     .memory
                     .read_data(self.state.eip, original.len())
                     .is_ok_and(|bytes| bytes.as_ref() == original)
+                && handler
+                    .redirect_checks(self.state.eip)
+                    .iter()
+                    .all(|(at, original)| {
+                        self.memory
+                            .read_data(*at, original.len())
+                            .is_ok_and(|bytes| bytes.as_ref() == original.as_ref())
+                    })
             {
                 self.state.eip = target;
                 continue;
@@ -581,6 +630,13 @@ impl Executor {
             } else if let Some(exit) = self.run_native(stop, bridge)? {
                 match exit {
                     Exit::Dispatch => continue,
+                    Exit::Yield => {
+                        if let Some(handler) = bridge.handler.as_mut() {
+                            bridge.parked =
+                                handler.body_yield(&mut self.state, &mut self.memory)?;
+                        }
+                        continue;
+                    }
                     // The helper ran the instruction; the owner completes it.
                     #[cfg(native)]
                     Exit::Stepped => {
@@ -747,8 +803,8 @@ mod speed_tests {
         let mut again = a.create_label();
         a.mov(ebp, 3).unwrap();
         a.set_label(&mut again).unwrap();
-        a.shrd(eax, edx, cl).unwrap(); // operation helper
-        a.lahf().unwrap(); // interpret helper
+        a.shrd(eax, edx, cl).unwrap(); // native form
+        a.cpuid().unwrap(); // interpret helper
         a.mov(ecx, 5).unwrap();
         a.rep().movsb().unwrap();
         a.dec(ebp).unwrap();
@@ -785,7 +841,7 @@ mod speed_tests {
                 [0, 0, 0, 21, 15]
             } else {
                 // Native REP elements count as translated work.
-                [25, 3, 3, 2, 0]
+                [28, 0, 3, 2, 0]
             };
             assert_eq!(
                 cpu.retired_forms(),
@@ -843,13 +899,13 @@ mod speed_tests {
 
     // spec: WINE-UI-8, A64-MEM-5
     #[test]
-    fn speed_retired_forms_refund_faulting_apply_and_rep() {
+    fn speed_retired_forms_refund_faulting_instructions_and_rep() {
         let mut cpu = Executor::address_space().unwrap();
         cpu.map(0x10000, 0x4000, 7).unwrap();
         cpu.map(0x20000, 0x4000, 3).unwrap();
         cpu.native.as_mut().unwrap().first_visits = false;
         cpu.count_tier0(true);
-        // NEG through apply reads successfully, but its store faults.
+        // Native NEG reads successfully, but its store faults.
         cpu.write(0x10000, &[0xf7, 0x1b]).unwrap();
         cpu.protect(0x20000, 0x4000, 1).unwrap();
         cpu.state.eip = 0x10000;

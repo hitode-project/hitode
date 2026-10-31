@@ -173,6 +173,9 @@ pub const RETURN_PAD: u32 = 0;
 /// Diagnostic binding for a CPU interruption; never emitted as a callable API.
 pub(crate) const EXCEPTION_DISPATCH: u32 = 1;
 
+#[cfg(test)]
+thread_local! { pub(crate) static LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
 pub struct ThunkTable {
     /// Published copies in synthetic DLL images share the transport bindings.
     thunk_pages: HashSet<u32>,
@@ -622,6 +625,8 @@ impl ThunkTable {
     }
 
     pub fn get(&self, index: u32) -> &Thunk {
+        #[cfg(test)]
+        LOOKUPS.set(LOOKUPS.get() + 1);
         &self.thunks[index as usize]
     }
 

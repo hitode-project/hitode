@@ -21,7 +21,7 @@
 
 use adv_cpu_core::memory::Memory;
 
-use super::decode::{Effects, Fetcher, Helper, Op};
+use super::decode::{Effects, Fetcher, Helper, Op, Src};
 use super::flags::FlagSet;
 
 /// Longest trace, in guest instructions.
@@ -73,6 +73,7 @@ pub enum Mode {
 pub struct Inst {
     /// The thunk of a recognized host call (A64-CTL-12).
     pub call: Option<u32>,
+    pub locked: Option<(super::decode::Mem, u8, u8)>,
     pub pc: u32,
     pub next_pc: u32,
     pub op: Op,
@@ -116,6 +117,29 @@ pub struct Trace {
     pub failure: u8,
     /// What each `Op::Helper` runs.
     pub helpers: Vec<Helper>,
+    /// What each `Op::Body` calls.
+    pub bodies: Vec<Bound>,
+    pub memory_pages: (u32, u32),
+}
+
+/// Where a function entry's calls go instead (A64-CTL-14): `target` while
+/// the entry still holds `original`, or `body` called in place.
+pub struct Redirect {
+    pub target: u32,
+    pub original: Vec<u8>,
+    pub checks: Vec<(u32, Box<[u8]>)>,
+    pub body: Option<adv_cpu_core::body::DirectBody>,
+}
+
+/// A direct body call (A64-CALL-2).
+#[derive(Clone, Copy, Debug)]
+pub struct Bound {
+    pub body: adv_cpu_core::body::DirectBody,
+    /// The full path, which a body that stops leaves for.
+    pub thunk: u32,
+    /// At the entry itself, the return address pushed, rather than at a
+    /// call that pushes nothing.
+    pub entry: bool,
 }
 
 /// The stops, behind a one-word filter: most EIPs are not stops.
@@ -142,6 +166,107 @@ fn slot(pc: u32, frame: u16) -> usize {
     (key.wrapping_mul(0x9E37_79B1) >> 24) as usize & (SLOTS - 1)
 }
 
+/// Resolve forwarding entries whose register and stack effects cancel before
+/// their tail transfer. Every instruction and pointer slot is a code dependency.
+fn forwarded_body(
+    memory: &Memory,
+    mut pc: u32,
+    redirect: &dyn Fn(u32) -> Option<Redirect>,
+    stops: &Stops<'_>,
+) -> Option<(Bound, Vec<(u32, u32)>)> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Value {
+        Register(u8),
+        Stack(i32),
+    }
+    let initial = std::array::from_fn::<_, 8, _>(|r| {
+        if r == 4 {
+            Value::Stack(0)
+        } else {
+            Value::Register(r as u8)
+        }
+    });
+    let mut registers = initial;
+    let mut stack = Vec::new();
+    let mut seen = Vec::new();
+    let mut watched = Vec::new();
+    let mut fetcher = Fetcher::new(memory);
+    while !seen.contains(&pc) {
+        if stops.contains(pc) {
+            return None;
+        }
+        seen.push(pc);
+        if registers == initial
+            && stack.is_empty()
+            && let Some(Redirect {
+                target,
+                original,
+                checks,
+                body: Some(body),
+            }) = redirect(pc)
+        {
+            let same = |at: u32, original: &[u8]| {
+                let mut bytes = vec![0; original.len()];
+                memory.read_into(at, &mut bytes).is_ok() && bytes == original
+            };
+            if same(pc, &original) && checks.iter().all(|(at, bytes)| same(*at, bytes)) {
+                watched.push((pc, original.len() as u32));
+                watched.extend(checks.iter().map(|(at, bytes)| (*at, bytes.len() as u32)));
+                return Some((
+                    Bound {
+                        body,
+                        thunk: target,
+                        entry: false,
+                    },
+                    watched,
+                ));
+            }
+        }
+        let (op, size) = fetcher.fetch(pc)?;
+        watched.push((pc, size));
+        let next = pc.wrapping_add(size);
+        pc = match op {
+            Op::Nop => next,
+            Op::Mov(Src::Reg(dst), Src::Reg(src)) if dst != 4 => {
+                registers[usize::from(dst)] = registers[usize::from(src)];
+                next
+            }
+            Op::Push(Src::Reg(reg)) => {
+                let Value::Stack(offset) = registers[4] else {
+                    return None;
+                };
+                stack.push(registers[usize::from(reg)]);
+                registers[4] = Value::Stack(offset - 4);
+                next
+            }
+            Op::Pop(reg) if reg != 4 => {
+                let Value::Stack(offset) = registers[4] else {
+                    return None;
+                };
+                registers[usize::from(reg)] = stack.pop()?;
+                registers[4] = Value::Stack(offset + 4);
+                next
+            }
+            Op::Jmp(target) if registers == initial && stack.is_empty() => target,
+            Op::JmpIndirect(Src::Mem(slot))
+                if registers == initial
+                    && stack.is_empty()
+                    && slot.base.is_none()
+                    && slot.index.is_none()
+                    && !slot.fs
+                    && slot.address_bits == 32 =>
+            {
+                let mut bytes = [0; 4];
+                memory.read_into(slot.disp, &mut bytes).ok()?;
+                watched.push((slot.disp, 4));
+                u32::from_le_bytes(bytes)
+            }
+            _ => return None,
+        };
+    }
+    None
+}
+
 impl Trace {
     /// Traces from `entry`, ending before any of `stops` except at the
     /// entry. `redirect` gives, for a function entry whose calls go
@@ -153,10 +278,12 @@ impl Trace {
         entry: u32,
         stops: &[u32],
         host: &dyn Fn(u32, u32) -> Option<u32>,
-        redirect: &dyn Fn(u32) -> Option<(u32, Vec<u8>)>,
+        redirect: &dyn Fn(u32) -> Option<Redirect>,
     ) {
+        self.memory_pages = (memory.base >> 12, (memory.len >> 12) as u32);
         self.insts.clear();
         self.code.clear();
+        self.bodies.clear();
         self.frames.clear();
         self.frames.push(Frame {
             parent: 0,
@@ -186,14 +313,38 @@ impl Trace {
                 self.insts[len - 1].next = Next::Edge(edge);
                 break;
             }
-            let redirected = redirect(pc).filter(|(_, original)| {
-                let mut bytes = vec![0; original.len()];
-                memory.read_into(pc, &mut bytes).is_ok() && bytes == *original
-            });
-            let fetched = match redirected {
-                Some((target, original)) => {
-                    self.code.push((pc, original.len() as u32));
-                    Some((Op::Jmp(target), 0))
+            let intact = |entry: u32| {
+                redirect(entry).filter(|redirect| {
+                    let mut bytes = vec![0; redirect.original.len()];
+                    memory.read_into(entry, &mut bytes).is_ok()
+                        && bytes == redirect.original
+                        && redirect.checks.iter().all(|(at, original)| {
+                            let mut bytes = vec![0; original.len()];
+                            memory.read_into(*at, &mut bytes).is_ok()
+                                && bytes.as_slice() == original.as_ref()
+                        })
+                })
+            };
+            let fetched = match intact(pc) {
+                Some(redirect) => {
+                    self.code.push((pc, redirect.original.len() as u32));
+                    self.code.extend(
+                        redirect
+                            .checks
+                            .iter()
+                            .map(|(at, bytes)| (*at, bytes.len() as u32)),
+                    );
+                    match redirect.body {
+                        Some(body) if self.bodies.len() <= usize::from(u8::MAX) => {
+                            self.bodies.push(Bound {
+                                body,
+                                thunk: redirect.target,
+                                entry: true,
+                            });
+                            Some((Op::Body(self.bodies.len() as u8 - 1), 0))
+                        }
+                        _ => Some((Op::Jmp(redirect.target), 0)),
+                    }
                 }
                 None => fetcher.fetch(pc),
             };
@@ -205,11 +356,54 @@ impl Trace {
                 break;
             };
             let next_pc = pc.wrapping_add(size);
+            // Import slots and the entries calls reach are watched like code,
+            // so a transfer through them is static (A64-CALL-1).
+            let mut watched = Vec::new();
+            let op = match op {
+                Op::CallIndirect(Src::Mem(slot)) | Op::JmpIndirect(Src::Mem(slot))
+                    if slot.base.is_none()
+                        && slot.index.is_none()
+                        && !slot.fs
+                        && slot.address_bits == 32 =>
+                {
+                    let mut target = [0; 4];
+                    match memory.read_into(slot.disp, &mut target) {
+                        Ok(()) => {
+                            watched.push((slot.disp, 4));
+                            let target = u32::from_le_bytes(target);
+                            if matches!(op, Op::CallIndirect(_)) {
+                                Op::Call(target)
+                            } else {
+                                Op::Jmp(target)
+                            }
+                        }
+                        Err(_) => op,
+                    }
+                }
+                _ => op,
+            };
+            let op = match op {
+                Op::Call(target)
+                    if target != next_pc && self.bodies.len() <= usize::from(u8::MAX) =>
+                {
+                    match forwarded_body(memory, target, redirect, &stops) {
+                        Some((bound, dependencies)) => {
+                            watched.extend(dependencies);
+                            self.bodies.push(bound);
+                            Op::Body(self.bodies.len() as u8 - 1)
+                        }
+                        _ => op,
+                    }
+                }
+                _ => op,
+            };
             weight += if matches!(op, Op::X87(_) | Op::Fild64(..))
                 || matches!(
                     op,
                     Op::Simd(super::simd::Simd {
-                        kind: super::simd::Kind::PackedToInt(_),
+                        kind: super::simd::Kind::PackedToInt(..)
+                            | super::simd::Kind::MaskMove
+                            | super::simd::Kind::Approximate(..),
                         ..
                     })
                 ) {
@@ -223,7 +417,8 @@ impl Trace {
                 _ => self.code.push((pc, size)),
             }
             let mut inst = Inst {
-                call: if matches!(op, Op::Helper(_)) && size == 2 {
+                locked: fetcher.locked,
+                call: if matches!(op, Op::Syscall) && size == 2 {
                     let mut bytes = [0; 7];
                     memory
                         .read_into(pc.wrapping_sub(5), &mut bytes)
@@ -249,6 +444,7 @@ impl Trace {
             if inst.call.is_some() {
                 self.code.push((pc.wrapping_sub(5), 7));
             }
+            self.code.extend(watched);
             // A continuation must be new to the trace and leave room after it.
             let continuation = || {
                 len + 4 < MAX_INSTRUCTIONS
@@ -277,6 +473,15 @@ impl Trace {
                 Op::CallIndirect(_) if continuation() => {
                     inst.mode = Mode::Real;
                     Some((next_pc, frame))
+                }
+                Op::Body(index) if self.bodies[usize::from(index)].entry && frame != 0 => {
+                    let Frame { parent, ret, .. } = self.frames[usize::from(frame)];
+                    inst.mode = Mode::Inline(ret);
+                    Some((ret, parent))
+                }
+                Op::Body(index) if self.bodies[usize::from(index)].entry => {
+                    inst.next = Next::Dynamic;
+                    None
                 }
                 Op::Ret(_) if frame != 0 => {
                     let Frame { parent, ret, .. } = self.frames[usize::from(frame)];

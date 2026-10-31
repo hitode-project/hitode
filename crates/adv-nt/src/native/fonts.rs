@@ -16,7 +16,7 @@ macro_rules! bodies {
     ($($module:literal, $conv:ident, $argc:literal, $name:literal;)*) => {
         pub(super) const BODIES: &[super::Body] = &[$(super::Body {
             name: std::borrow::Cow::Borrowed(concat!($module,"!",$name)),
-            conv: Conv::$conv { argc: $argc }, body: None, handler: run,
+            conv: Conv::$conv { argc: $argc }, body: None, handler: run, direct: None,
         }),*];
     }
 }

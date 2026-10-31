@@ -1,10 +1,18 @@
 //! NT call packages through Wine's Win32 DLLs in headless sessions.
 #![cfg(any(target_vendor = "apple", target_os = "android"))]
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use adv_runtime::wine::session::{Config, Session, Stop};
+
+#[allow(dead_code)]
+mod wine {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../adv-nt/tests/common/wine.rs"
+    ));
+}
 
 /// Runs the probe `exe` and returns how it stopped and what it printed, or
 /// `None` in the parent process and when no Wine dist is configured. Each
@@ -33,13 +41,7 @@ fn probe_inspect(
         );
         return None;
     }
-    let (Some(dist), Some(probes)) = (
-        std::env::var_os("ADV_WINE_DIST").map(PathBuf::from),
-        std::env::var_os("ADV_WINE_PROBES").map(PathBuf::from),
-    ) else {
-        eprintln!("skipped: ADV_WINE_DIST or ADV_WINE_PROBES is not set");
-        return None;
-    };
+    let wine::Wine { dist, probes } = wine::wine()?;
     let root = std::env::temp_dir().join(format!("adv-nt-{test}-{}", std::process::id()));
     let game = root.join("game");
     std::fs::create_dir_all(&game).unwrap();
@@ -430,6 +432,9 @@ fn registry() {
             "child_update",
             "delete",
             "reopen",
+            "retire_setup",
+            "retire_warm",
+            "retired_handle",
         ],
     );
 }

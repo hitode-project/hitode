@@ -1,70 +1,81 @@
 //! Borland C++'s runtime: its 64-bit division (LLDIV.ASM) and copies.
 
-use adv_cpu::backend::Reg;
-use adv_machine::{Conv, Env};
-
-use super::Helper;
+use adv_cpu::body::{EAX, ECX, EDX, Input, Mem, Ret, Stop};
+use adv_machine::Conv;
 
 const DIVISOR: Conv = Conv::Stdcall { argc: 2 };
 const COPY: Conv = Conv::Cdecl { argc: 3 };
-pub(super) const HELPERS: [Helper; 6] = [
-    ("borland!__lldiv", DIVISOR, LLDIV, lldiv),
-    ("borland!__lludiv", DIVISOR, LLUDIV, lludiv),
-    ("borland!__llmod", DIVISOR, LLMOD, llmod),
-    ("borland!__llumod", DIVISOR, LLUMOD, llumod),
-    ("borland!memcpy", COPY, MEMCPY, memcpy),
-    ("borland!memmove", COPY, MEMMOVE, memmove),
+pub(super) const HELPERS: [(&str, Conv, &[u8], adv_cpu::body::Body); 6] = [
+    ("borland!__lldiv", DIVISOR, LLDIV, SIGNED_DIV),
+    ("borland!__lludiv", DIVISOR, LLUDIV, UNSIGNED_DIV),
+    ("borland!__llmod", DIVISOR, LLMOD, SIGNED_MOD),
+    ("borland!__llumod", DIVISOR, LLUMOD, UNSIGNED_MOD),
+    ("borland!memcpy", COPY, MEMCPY, COPY_FORWARD),
+    ("borland!memmove", COPY, MEMMOVE, MOVE),
 ];
-
-// Each division divides EDX:EAX by the stacked divisor, pops it and
-// leaves ECX zero. A zero divisor faults in its DIV.
-fn divide(env: &mut Env<'_>, op: fn(u64, u64) -> u64) -> Option<u64> {
-    let dividend = u64::from(env.cpu.reg(Reg::Edx)) << 32 | u64::from(env.cpu.reg(Reg::Eax));
-    let divisor = u64::from(env.arg(1)) << 32 | u64::from(env.arg(0));
-    if divisor == 0 {
-        return None;
-    }
-    env.cpu.set_reg(Reg::Ecx, 0);
-    Some(op(dividend, divisor))
-}
-// spec: NAT-BODY-13
-fn lldiv(env: &mut Env<'_>) -> Option<u64> {
-    divide(env, |a, b| (a as i64).wrapping_div(b as i64) as u64)
-}
-fn lludiv(env: &mut Env<'_>) -> Option<u64> {
-    divide(env, |a, b| a / b)
-}
-fn llmod(env: &mut Env<'_>) -> Option<u64> {
-    divide(env, |a, b| (a as i64).wrapping_rem(b as i64) as u64)
-}
-fn llumod(env: &mut Env<'_>) -> Option<u64> {
-    divide(env, |a, b| a % b)
-}
+const DIV_INPUTS: &[Input] = &[Input::Eax, Input::Edx, Input::Stack(0), Input::Stack(1)];
+const COPY_INPUTS: &[Input] = &[Input::Stack(0), Input::Stack(1), Input::Stack(2)];
+adv_cpu::body!(SIGNED_DIV = divide::<_, true, false>, inputs: DIV_INPUTS, outputs: EAX | ECX | EDX, pop: 8);
+adv_cpu::body!(UNSIGNED_DIV = divide::<_, false, false>, inputs: DIV_INPUTS, outputs: EAX | ECX | EDX, pop: 8);
+adv_cpu::body!(SIGNED_MOD = divide::<_, true, true>, inputs: DIV_INPUTS, outputs: EAX | ECX | EDX, pop: 8);
+adv_cpu::body!(UNSIGNED_MOD = divide::<_, false, true>, inputs: DIV_INPUTS, outputs: EAX | ECX | EDX, pop: 8);
+adv_cpu::body!(COPY_FORWARD = copy::<_, false>, inputs: COPY_INPUTS, outputs: EAX | ECX | EDX, pop: 0);
+adv_cpu::body!(MOVE = copy::<_, true>, inputs: COPY_INPUTS, outputs: EAX | ECX | EDX, pop: 0);
 
 // spec: NAT-BODY-13
-/// memcpy(dest, src, n) copies forward with REP MOVS: EAX is `dest`, EDX
-/// `n` and ECX zero.
-fn memcpy(env: &mut Env<'_>) -> Option<u64> {
-    let (dest, src, n) = (env.arg(0), env.arg(1), env.arg(2));
-    // Copying forward into the source's tail repeats its bytes.
-    if dest > src && dest - src < n {
-        return None;
+fn divide<M: Mem, const SIGNED: bool, const MOD: bool>(
+    _: &mut M,
+    [lo, hi, dlo, dhi, ..]: [u32; 7],
+) -> Result<Ret, Stop> {
+    let a = u64::from(hi) << 32 | u64::from(lo);
+    let b = u64::from(dhi) << 32 | u64::from(dlo);
+    if b == 0 {
+        return Err(Stop::DivideByZero);
     }
-    if n != 0 {
-        env.cpu.copy_memory(src, dest, n as usize).ok()?;
-    }
-    env.cpu.set_reg(Reg::Ecx, 0);
-    Some(u64::from(n) << 32 | u64::from(dest))
+    let value = match (SIGNED, MOD) {
+        (true, false) => (a as i64).wrapping_div(b as i64) as u64,
+        (true, true) => (a as i64).wrapping_rem(b as i64) as u64,
+        (false, false) => a / b,
+        (false, true) => a % b,
+    };
+    Ok(value.into())
 }
-/// memmove(dest, src, n), as memcpy except that it returns at once when
-/// `dest` is `src`, ECX still `n`.
-fn memmove(env: &mut Env<'_>) -> Option<u64> {
-    let (dest, src, n) = (env.arg(0), env.arg(1), env.arg(2));
-    if n != 0 && dest != src {
-        env.cpu.copy_memory(src, dest, n as usize).ok()?;
+
+// spec: NAT-BODY-13
+fn copy<M: Mem, const MOVE: bool>(mem: &mut M, [dst, src, len, ..]: [u32; 7]) -> Result<Ret, Stop> {
+    if len != 0 && (!MOVE || dst != src) {
+        let [from, to] = mem.spans([(src, len, false), (dst, len, true)])?;
+        // SAFETY: both spans were checked. REP MOVSD reads a complete dword
+        // before writing it; its byte tail follows in the same direction.
+        unsafe {
+            if MOVE && dst > src {
+                let tail = len % 4;
+                for i in (len - tail..len).rev() {
+                    to.add(i as usize).write(from.add(i as usize).read());
+                }
+                for i in (0..len - tail).step_by(4).rev() {
+                    to.add(i as usize)
+                        .cast::<u32>()
+                        .write_unaligned(from.add(i as usize).cast::<u32>().read_unaligned());
+                }
+            } else {
+                for i in (0..len - len % 4).step_by(4) {
+                    to.add(i as usize)
+                        .cast::<u32>()
+                        .write_unaligned(from.add(i as usize).cast::<u32>().read_unaligned());
+                }
+                for i in len - len % 4..len {
+                    to.add(i as usize).write(from.add(i as usize).read());
+                }
+            }
+        }
+        mem.commit()?;
     }
-    env.cpu.set_reg(Reg::Ecx, if dest == src { n } else { 0 });
-    Some(u64::from(n) << 32 | u64::from(dest))
+    Ok(Ret {
+        value: u64::from(len) << 32 | u64::from(dst),
+        ecx: if MOVE && dst == src { len } else { 0 },
+        yield_now: false,
+    })
 }
 
 const LLDIV: &[u8] = &[

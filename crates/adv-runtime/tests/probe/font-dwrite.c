@@ -1,3 +1,4 @@
+/* Build: i686-w64-mingw32-gcc -O2 -Wall font-dwrite.c -o font-dwrite.exe -ldwrite -ld2d1 -lole32 -luuid -lgdi32 */
 /* CFF outline and glyph-run analysis through Wine's DirectWrite PE frontend. */
 #define COBJMACROS
 #include <windows.h>
