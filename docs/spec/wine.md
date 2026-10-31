@@ -182,12 +182,13 @@ process family may stay unseen until the revision ends.
 
 ### WINE-SYS-15 Directory listings for absent names
 
-**Rule**: Path lookups MUST remember known directories, and list a directory once after 32 absent-name lookups. An ASCII name without `~` that matches no listed name MUST then resolve as missing without a host lookup. Server calls that create, remove or rename a name, and NT mutations of a directory, MUST end what is remembered.
+**Rule**: Path lookups MUST remember known directories, and list a directory once after 32 absent-name lookups. An ASCII name without `~` that matches no listed name MUST then resolve as missing without a host lookup. Server name changes, NT mutations of a directory and links the runtime changes in the prefix MUST end what is remembered.
 **Verification**: Test
 
 Listed names include every name the host may fold to an ASCII one. Directories
 over 65536 names, or unreadable ones, keep host lookups. File writes and
-metadata changes leave listings intact.
+metadata changes leave listings intact. Lookups remember a drive by its link, so
+relinking the game drive for the next session ends them.
 
 ## NT files
 

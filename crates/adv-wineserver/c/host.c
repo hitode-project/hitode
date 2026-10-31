@@ -123,6 +123,13 @@ static int names_changed( int ret )
     return ret;
 }
 
+/* The runtime changed a name in the prefix without the server, such as a
+ * drive link between sessions. */
+void hitode_names_changed( void )
+{
+    names_changed( 0 );
+}
+
 int hitode_chdir( const char *path )
 {
     int fd = openat( current_dir, path, O_RDONLY | O_DIRECTORY | O_CLOEXEC );

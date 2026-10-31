@@ -147,6 +147,7 @@ pub(super) fn prepare(
         for letter in letters.chars().filter(char::is_ascii_uppercase) {
             let path = devices.join(format!("{}:", letter.to_ascii_lowercase()));
             if path.is_symlink() {
+                adv_wineserver::names_changed();
                 std::fs::remove_file(path).map_err(|e| e.to_string())?;
             }
         }
