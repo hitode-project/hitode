@@ -167,6 +167,7 @@ unsafe extern "C" {
     fn hitode_server_queue() -> c_int;
     fn hitode_server_ready() -> c_int;
     fn hitode_names_revision() -> u64;
+    fn hitode_names_changed();
     fn hitode_event_watch(
         queue: c_int,
         notify: extern "C" fn(*mut c_void),
@@ -182,6 +183,13 @@ unsafe extern "C" {
 pub fn names_revision() -> u64 {
     // SAFETY: an atomic load with no preconditions.
     unsafe { hitode_names_revision() }
+}
+
+/// Ends the names revision for a change the runtime made on the host, such as
+/// relinking a drive, so cached probes and listings see it.
+pub fn names_changed() {
+    // SAFETY: an atomic increment with no preconditions.
+    unsafe { hitode_names_changed() }
 }
 
 /// Whether the thread already owns a queue, without creating one.

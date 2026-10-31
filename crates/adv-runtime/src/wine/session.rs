@@ -339,11 +339,14 @@ fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
 
 /// Link `target` to `source`, retaining an existing matching link. A stale
 /// link is replaced even when it dangles: mobile app bundles move on every
-/// install, so links into the previous bundle no longer resolve.
+/// install, so links into the previous bundle no longer resolve. A change ends
+/// the names revision: lookups cache by link path, so a drive relinked for the
+/// next game must not answer from the last game's listing (WINE-SYS-15).
 pub(super) fn link(source: &Path, target: &Path) -> Result<(), String> {
     if std::fs::read_link(target).is_ok_and(|existing| existing == source) {
         return Ok(());
     }
+    adv_wineserver::names_changed();
     if target.symlink_metadata().is_ok() {
         std::fs::remove_file(target).map_err(|e| format!("{}: {e}", target.display()))?;
     }
@@ -1406,6 +1409,38 @@ mod link_tests {
         assert!(!target.exists());
         super::link(&source, &target).unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), b"pe");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_relinked_drive_drops_the_last_listing() {
+        use adv_nt::path::{Lookup, lookup};
+        let root = std::env::temp_dir().join(format!("adv-relinked-drive-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (last, next, devices) = (
+            root.join("last"),
+            root.join("next"),
+            root.join("dosdevices"),
+        );
+        for dir in [&last, &next, &devices] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(next.join("data1.arc"), b"").unwrap();
+        super::link(&last, &devices.join("d:")).unwrap();
+        let name = |name: &str| {
+            let name = format!(r"\??\D:\{name}"); // privacy: allow authored guest drive path
+            name.encode_utf16().collect::<Vec<u16>>()
+        };
+        // Enough absent names for the last game's root to be listed.
+        for index in 0..40 {
+            let probe = lookup(&devices, &name(&format!("probe{index}.dat")));
+            assert!(matches!(probe, Ok(Lookup::Missing(_))));
+        }
+        super::link(&next, &devices.join("d:")).unwrap();
+        assert!(matches!(
+            lookup(&devices, &name("data1.arc")),
+            Ok(Lookup::Found(_))
+        ));
         std::fs::remove_dir_all(&root).unwrap();
     }
 }
