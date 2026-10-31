@@ -228,6 +228,8 @@ fn deadline_and_interrupt_leave_before_the_instruction_after_a_call() {
         if delayed {
             calls.delay = true;
             executor.set_deadline(Some(Instant::now() + std::time::Duration::from_millis(5)));
+            // Check the deadline even when the timer worker has not delivered its notification.
+            executor.alarm.as_ref().unwrap().set(None, &flag);
         } else {
             calls.interrupt = Some(flag);
         }
