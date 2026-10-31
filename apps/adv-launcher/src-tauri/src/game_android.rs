@@ -23,8 +23,6 @@ struct Host {
     playback: Option<Playback>,
     /// Shared lifecycle, audio focus and overlay pause gates.
     lifecycle: adv_shell::mobile::Lifecycle,
-    /// The game was asked to close; another request forces it.
-    closing: bool,
     touch_mode: adv_shell::mobile::TouchMode,
     /// The surface's placement and the screen's occlusion, with the
     /// view's pixels per point (AND-APP-16).
@@ -237,7 +235,6 @@ pub async fn start_game(
             host.session = Some(session);
             host.playback = Some(playback);
             host.lifecycle.set_overlay_pause(false);
-            host.closing = false;
             host.apply_pause();
             Ok(())
         })?;
@@ -247,27 +244,17 @@ pub async fn start_game(
     .await
 }
 
+/// Asks the running game to close, or forces it.
 #[tauri::command]
-pub async fn stop_game(window: WebviewWindow) -> Result<(), String> {
-    on_ui(&window, || {
-        with_session(|host, session| {
-            if std::mem::replace(&mut host.closing, true) {
+pub async fn stop_game(window: WebviewWindow, force: bool) -> Result<(), String> {
+    on_ui(&window, move || {
+        with_session(|_, session| {
+            if force {
                 session.force_close();
             } else {
                 session.request_close();
             }
         })
-    })
-    .await
-}
-
-/// The game declined to quit, or the player changed their mind: the next
-/// stop asks again instead of forcing.
-#[tauri::command]
-pub async fn keep_game(window: WebviewWindow) -> Result<(), String> {
-    on_ui(&window, || {
-        HOST.with_borrow_mut(|host| host.closing = false);
-        Ok(())
     })
     .await
 }
