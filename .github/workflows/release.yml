@@ -24,11 +24,14 @@ env:
   TAG: ${{ inputs.tag || github.ref_name }}
   CARGO_INCREMENTAL: '0'
   CARGO_TERM_COLOR: never
+  # Releases build with the same compilers every time; raise these on purpose.
+  RUST_TOOLCHAIN: '1.99.1'
+  XCODE: /Applications/Xcode_26.6.app
 
 jobs:
   build:
     name: build (${{ matrix.platform }})
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 150
     strategy:
       fail-fast: false
@@ -49,11 +52,16 @@ jobs:
           mkdir -p "$RUNNER_TEMP/dist"
       - name: Install toolchains
         run: |
-          rustup update stable --no-self-update
+          sudo xcode-select --switch "$XCODE"
+          xcodebuild -version
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --no-self-update
+          rustup default "$RUST_TOOLCHAIN"
           case "${{ matrix.platform }}" in
+            macos) rustup target add aarch64-apple-darwin ;;
             ios) rustup target add aarch64-apple-ios ;;
             android) rustup target add aarch64-linux-android ;;
           esac
+          rustc --version
           echo "LIBCLANG_PATH=$(dirname "$(dirname "$(xcrun --find clang)")")/lib" >> "$GITHUB_ENV"
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
