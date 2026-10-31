@@ -186,11 +186,7 @@ pub(super) fn render(
     let target = physdev(env, dc);
     let monochrome = target.is_some_and(|(dev, _)| {
         env.cpu.read_u32(dev).ok() == module(env).map(|base| base + layout::DIB_DRIVER)
-            && env
-                .cpu
-                .read_u32(dev + layout::dibdev::dib + layout::dib::bit_count)
-                .ok()
-                == Some(1)
+            && palette_dib(env, dev)
     });
     let mut run = Run {
         glyphs: Vec::with_capacity(units.len()),
@@ -387,7 +383,7 @@ pub(super) fn driver_output(env: &mut Env<'_>, a: &[u32]) -> Outcome {
         fills: Vec::new(),
         clip: None,
         foreground: [0; 3],
-        mono: request.quality == Quality::Monochrome,
+        mono: request.quality == Quality::Monochrome || palette_dib(env, a[0]),
     };
     let dc = dc_pointer(env, hdc).unwrap();
     let attr = env.cpu.read_u32(dc + layout::dc::attr).unwrap();
@@ -572,6 +568,14 @@ pub(super) fn poly(env: &mut Env<'_>, a: &[u32]) -> Outcome {
     }
     .draw(env)
 }
+/// Windows draws text on DIBs of 8 bits per pixel or fewer without
+/// antialiasing, whatever quality the font asks for (WIN32-GDI-16).
+fn palette_dib(env: &mut Env<'_>, dev: u32) -> bool {
+    env.cpu
+        .read_u32(dev + layout::dibdev::dib + layout::dib::bit_count)
+        .is_ok_and(|bits| bits <= 8)
+}
+
 fn compose(env: &mut Env<'_>, dev: u32, run: &Run) -> Outcome {
     let dib = dev + layout::dibdev::dib;
     let get = |at| env.cpu.read_u32(dib + at).unwrap();
@@ -591,11 +595,13 @@ fn compose(env: &mut Env<'_>, dev: u32, run: &Run) -> Outcome {
     };
     let colors = get(layout::dib::color_table);
     let count = get(layout::dib::color_table_size);
-    let palette: Vec<[u8; 3]> = (0..count)
-        .map(|i| {
-            let v = env.cpu.read_u32(colors + i * 4).unwrap();
-            [(v >> 16) as u8, (v >> 8) as u8, v as u8]
-        })
+    let mut table = vec![0; count as usize * 4];
+    env.cpu.read(colors, &mut table).unwrap();
+    let palette: Vec<[u8; 3]> = table
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&[b, g, r, _]| [r, g, b])
         .collect();
     let region = env.cpu.read_u32(dev + layout::dibdev::clip).unwrap();
     let clips = if let Some(p) = object(env, region, 4) {
@@ -657,6 +663,8 @@ fn compose(env: &mut Env<'_>, dev: u32, run: &Run) -> Outcome {
             .read(at, &mut bytes[row * pitch..(row + 1) * pitch])
             .unwrap();
     }
+    let mut nearest = NEAREST.take();
+    nearest.adopt(&palette);
     let mut blend = |x: i32, y: i32, rgb: [u8; 3], coverage: u32| {
         if x < bounds[0]
             || x >= bounds[2]
@@ -701,19 +709,7 @@ fn compose(env: &mut Env<'_>, dev: u32, run: &Run) -> Outcome {
                 as u8
         });
         let value = if bpp <= 8 {
-            palette
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, p)| {
-                    p.iter()
-                        .zip(rgb)
-                        .map(|(&a, b)| {
-                            let d = i32::from(a) - i32::from(b);
-                            d * d
-                        })
-                        .sum::<i32>()
-                })
-                .map_or(u32::from(rgb[0] >= 128), |(i, _)| i as u32)
+            nearest.index(rgb).unwrap_or(u32::from(rgb[0] >= 128))
         } else {
             let mut v = if bpp == 16 {
                 0
@@ -798,6 +794,7 @@ fn compose(env: &mut Env<'_>, dev: u32, run: &Run) -> Outcome {
             }
         }
     }
+    NEAREST.set(nearest);
     for row in 0..rows {
         let at = bits.wrapping_add(((origin[1] + bounds[1] + row as i32) * stride) as u32)
             + first as u32;
@@ -806,6 +803,73 @@ fn compose(env: &mut Env<'_>, dev: u32, run: &Run) -> Outcome {
             .unwrap();
     }
     Outcome::Return(1)
+}
+
+/// The palette entry nearest to `rgb` by squared distance, the first on ties.
+fn nearest(palette: &[[u8; 3]], rgb: [u8; 3]) -> Option<u32> {
+    palette
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, p)| {
+            p.iter()
+                .zip(rgb)
+                .map(|(&a, b)| {
+                    let d = i32::from(a) - i32::from(b);
+                    d * d
+                })
+                .sum::<i32>()
+        })
+        .map(|(i, _)| i as u32)
+}
+
+/// Antialiased text on a palette DIB asks for the same few blends pixel after
+/// pixel and call after call; a full scan of the palette for each pixel stalled
+/// whole frames. Answers are kept in a direct-mapped table, since a hash per
+/// pixel costs as much as the rest of the blend, until the palette changes.
+struct Nearest {
+    palette: Vec<[u8; 3]>,
+    slots: Box<[Slot]>,
+}
+
+/// A blend and the palette entry nearest to it.
+type Slot = Option<([u8; 3], Option<u32>)>;
+
+/// Slots of the table, a power of two; a collision only repeats a scan.
+const NEAREST_SLOTS: usize = 4096;
+
+impl Default for Nearest {
+    fn default() -> Self {
+        Nearest {
+            palette: Vec::new(),
+            slots: vec![None; NEAREST_SLOTS].into_boxed_slice(),
+        }
+    }
+}
+
+impl Nearest {
+    fn adopt(&mut self, palette: &[[u8; 3]]) {
+        if self.palette != palette {
+            self.palette = palette.to_vec();
+            self.slots.fill(None);
+        }
+    }
+
+    fn index(&mut self, rgb: [u8; 3]) -> Option<u32> {
+        let key = u32::from_le_bytes([rgb[0], rgb[1], rgb[2], 0]);
+        let slot = (key.wrapping_mul(0x9e37_79b1) >> 20) as usize % NEAREST_SLOTS;
+        match self.slots[slot] {
+            Some((kept, index)) if kept == rgb => index,
+            _ => {
+                let index = nearest(&self.palette, rgb);
+                self.slots[slot] = Some((rgb, index));
+                index
+            }
+        }
+    }
+}
+
+thread_local! {
+    static NEAREST: std::cell::Cell<Nearest> = std::cell::Cell::default();
 }
 
 pub(super) fn rule(
@@ -1128,4 +1192,60 @@ fn fill_driver(
             })
         })
     })
+}
+
+#[cfg(test)]
+mod nearest_tests {
+    use super::{Nearest, nearest};
+
+    fn cube() -> Vec<[u8; 3]> {
+        let mut palette: Vec<[u8; 3]> = (0..216u32)
+            .map(|i| {
+                [
+                    (i / 36 * 51) as u8,
+                    (i / 6 % 6 * 51) as u8,
+                    (i % 6 * 51) as u8,
+                ]
+            })
+            .collect();
+        palette.extend((0..40u32).map(|i| [(i * 6) as u8; 3]));
+        palette
+    }
+
+    fn blends() -> impl Iterator<Item = [u8; 3]> {
+        let colors: [[u8; 3]; 4] = [[0, 0, 0], [255, 255, 255], [200, 40, 90], [12, 140, 230]];
+        colors.into_iter().flat_map(move |under| {
+            colors.into_iter().flat_map(move |over| {
+                (0..=64u32).map(move |level| {
+                    let coverage = (level * 255 + 32) / 64;
+                    std::array::from_fn(|i| {
+                        let (a, b) = (u32::from(under[i]), u32::from(over[i]));
+                        ((a * (255 - coverage) + b * coverage + 127) / 255) as u8
+                    })
+                })
+            })
+        })
+    }
+
+    #[test]
+    fn kept_answers_match_a_full_scan_until_the_palette_changes() {
+        let mut kept = Nearest::default();
+        let palette = cube();
+        kept.adopt(&palette);
+        for rgb in blends().chain(blends()) {
+            assert_eq!(kept.index(rgb), nearest(&palette, rgb));
+        }
+        let reversed: Vec<_> = palette.iter().rev().copied().collect();
+        kept.adopt(&reversed);
+        for rgb in blends() {
+            assert_eq!(kept.index(rgb), nearest(&reversed, rgb));
+        }
+    }
+
+    #[test]
+    fn ties_take_the_first_entry_and_an_empty_palette_has_none() {
+        let palette = [[10, 10, 10], [30, 30, 30], [10, 10, 10]];
+        assert_eq!(nearest(&palette, [20, 20, 20]), Some(0));
+        assert_eq!(nearest(&[], [20, 20, 20]), None);
+    }
 }

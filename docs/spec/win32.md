@@ -42,6 +42,15 @@ This spec covers the Win32 state the shared crates still own: image rebasing, he
 **Rule**: Monochrome text MUST preserve coverage as index bits even when both palette entries contain identical RGB. Drawing MUST preserve the original palette.
 **Verification**: Test
 
+### WIN32-GDI-16 Palette text
+
+**Rule**: Text on DIBs of 8 bits per pixel or fewer MUST be drawn from monochrome glyphs, whatever quality the font requests. Deeper DIBs MUST keep the requested antialiasing.
+**Verification**: Test
+
+Windows 11 leaves two pixel values on 4 and 8 bit DIBs for antialiased and
+ClearType fonts, and blends on 16, 24 and 32 bit ones; Wine's DIB driver does
+the same. Blending into a palette also cost a nearest-color search per pixel.
+
 ### WIN32-GDI-10 Selected font metrics
 
 **Rule**: Glyph widths, ABC spacing, Unicode coverage and legacy/Point32 A/W text extents MUST share selected device fonts and validation of counted text. Windows MUST preserve native fallback and bitmap-font outcomes; portable measurements MUST use outline advances, hinted bounds, and primary-face coverage.
