@@ -1,0 +1,23 @@
+Hitode {version} improves performance and compatibility. / Hitode {version} 提升了性能和兼容性。
+
+## Changes / 更新内容
+
+- TODO: one user-visible line in English.
+- TODO: 同一句的中文。
+
+## Downloads / 下载
+
+| Platform / 平台 | File / 文件 |
+|---|---|
+| macOS (Apple silicon, macOS 11+) | `Hitode-{version}-macos-arm64.dmg` |
+| Android (ARMv8-A 64-bit) | `Hitode-{version}-android-arm64.apk` |
+| iOS / iPadOS | `Hitode-{version}-ios-unsigned.ipa` |
+
+Checksums / 校验值：`SHA256SUMS.txt`. Licenses / 许可证：`Hitode-{version}-licenses.zip`. Wine source / Wine 源码：`wine-11.0.tar.xz`.
+
+**Mac:** not notarized. After the first warning, click "Open Anyway" in System Settings → Privacy & Security, or run `xattr -dr com.apple.quarantine /Applications/Hitode.app`.
+**Mac：**未经公证。第一次被拦截后，在"系统设置 → 隐私与安全性"里点"仍要打开"，或在终端执行 `xattr -dr com.apple.quarantine /Applications/Hitode.app`。
+
+**iOS:** unsigned; sideload it with a development signature and enable JIT. / 未签名，需以开发签名侧载并启用 JIT。[docs/ios.zh-CN.md](https://github.com/hitode-project/hitode/blob/master/docs/ios.zh-CN.md)
+
+Problems? / 遇到问题？[Open a game issue / 提交游戏问题](https://github.com/hitode-project/hitode/issues/new?template=game-issue.yml)

@@ -1,0 +1,220 @@
+# Builds a version tag into a draft release: the macOS DMG, the unsigned iOS
+# IPA, the signed Android APK, license texts, the Wine source and checksums.
+# Signing waits for a maintainer to approve the `release` environment; the
+# maintainer tests the draft's files on devices, edits its notes and publishes.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to build, such as v0.2.3
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
+  CARGO_INCREMENTAL: '0'
+  CARGO_TERM_COLOR: never
+
+jobs:
+  build:
+    name: build (${{ matrix.platform }})
+    runs-on: macos-15
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [macos, ios, android]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ env.TAG }}
+          persist-credentials: false
+      - name: Check the tag against the workspace version
+        run: |
+          # A suffix after the version, as in v0.2.3-ci.1, marks a trial run.
+          version="${TAG#v}"
+          grep -qx "version = \"${version%%-*}\"" Cargo.toml || { echo "Cargo.toml is not ${version%%-*}"; exit 1; }
+          test "$(node --print "require('./apps/adv-launcher/package.json').version")" = "${version%%-*}"
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/dist"
+      - name: Install toolchains
+        run: |
+          rustup update stable --no-self-update
+          case "${{ matrix.platform }}" in
+            ios) rustup target add aarch64-apple-ios ;;
+            android) rustup target add aarch64-linux-android ;;
+          esac
+          echo "LIBCLANG_PATH=$(dirname "$(dirname "$(xcrun --find clang)")")/lib" >> "$GITHUB_ENV"
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        if: matrix.platform == 'android'
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Install the Android NDK
+        if: matrix.platform == 'android'
+        run: |
+          ndk=28.2.13676358
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;$ndk" "build-tools;36.0.0" > /dev/null
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$ndk" >> "$GITHUB_ENV"
+          echo "NDK_HOME=$ANDROID_HOME/ndk/$ndk" >> "$GITHUB_ENV"
+      - name: Install the launcher's packages
+        run: |
+          npm install --global "$(node --print "require('./apps/adv-launcher/package.json').packageManager")"
+          pnpm --dir apps/adv-launcher install --frozen-lockfile
+      - name: Fetch the pinned Wine build
+        run: |
+          python3 tools/release/fetch_wine.py "$RUNNER_TEMP/wine"
+          echo "ADV_WINE_DIST=$RUNNER_TEMP/wine/wine11-sse-strip" >> "$GITHUB_ENV"
+
+      - name: Build the macOS app
+        if: matrix.platform == 'macos'
+        run: |
+          python3 tools/macos/build.py --ffmpeg-only
+          cd apps/adv-launcher
+          PATH="$GITHUB_WORKSPACE/target/macos-ffmpeg/bin:$PATH" pnpm tauri build --ci --target aarch64-apple-darwin --bundles app
+      - name: Sign ad hoc and make the DMG
+        if: matrix.platform == 'macos'
+        run: |
+          stage="$RUNNER_TEMP/stage"
+          mkdir -p "$stage"
+          ditto target/aarch64-apple-darwin/release/bundle/macos/Hitode.app "$stage/Hitode.app"
+          strip -x "$stage/Hitode.app/Contents/MacOS/adv-launcher"
+          codesign --force --sign - --options runtime \
+            --entitlements apps/adv-launcher/src-tauri/macos.entitlements "$stage/Hitode.app"
+          codesign --verify --strict "$stage/Hitode.app"
+          ln -s /Applications "$stage/Applications"
+          hdiutil create -quiet -size 300m -volname Hitode -srcfolder "$stage" -format ULMO -fs APFS \
+            "$RUNNER_TEMP/dist/Hitode-$VERSION-macos-arm64.dmg"
+          mount=$(hdiutil attach -nobrowse -readonly "$RUNNER_TEMP/dist/Hitode-$VERSION-macos-arm64.dmg" | tail -1 | awk -F'\t' '{print $NF}')
+          codesign --verify --strict "$mount/Hitode.app"
+          python3 tools/privacy/scan.py --artifacts "$mount"
+          hdiutil detach -quiet "$mount"
+      - name: Collect license texts
+        if: matrix.platform == 'macos'
+        run: |
+          cargo fetch --locked --manifest-path apps/adv-launcher/src-tauri/Cargo.toml
+          name="Hitode-$VERSION-licenses"
+          python3 tools/release/licenses.py "$RUNNER_TEMP/$name" "$VERSION" "$RUNNER_TEMP/wine/wine-11.0"
+          (cd "$RUNNER_TEMP" && zip -qrX "dist/$name.zip" "$name")
+          cp "$RUNNER_TEMP/wine/wine-11.0.tar.xz" "$RUNNER_TEMP/dist/"
+
+      - name: Build the unsigned iOS app
+        if: matrix.platform == 'ios'
+        run: |
+          python3 apps/adv-launcher/scripts/icons.py
+          python3 tools/macos/build.py --ios
+          cd apps/adv-launcher
+          PATH="$GITHUB_WORKSPACE/target/ios-ffmpeg/bin:$PATH" pnpm tauri ios build --ci --no-sign
+          ipa="$RUNNER_TEMP/dist/Hitode-$VERSION-ios-unsigned.ipa"
+          cp src-tauri/gen/apple/build/arm64/Hitode.ipa "$ipa"
+          unzip -q "$ipa" -d "$RUNNER_TEMP/ipa"
+          if codesign -dv "$RUNNER_TEMP/ipa/Payload/Hitode.app" 2>/dev/null; then echo "the IPA is signed"; exit 1; fi
+
+      - name: Build the Android APK
+        if: matrix.platform == 'android'
+        run: |
+          python3 tools/macos/build.py --android
+          cd apps/adv-launcher
+          PATH="$GITHUB_WORKSPACE/target/android-ffmpeg/bin:$PATH" CARGO_PROFILE_RELEASE_STRIP=debuginfo \
+            pnpm tauri android build --ci --apk --target aarch64
+          "$ANDROID_HOME/build-tools/36.0.0/zipalign" -f -P 16 4 \
+            src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release-unsigned.apk \
+            "$RUNNER_TEMP/dist/Hitode-$VERSION-android-arm64-unsigned.apk"
+          python3 "$GITHUB_WORKSPACE/tools/android/check-apk.py" "$RUNNER_TEMP/dist/Hitode-$VERSION-android-arm64-unsigned.apk"
+
+      - name: Scan the packages for private data
+        if: matrix.platform != 'macos'
+        run: python3 tools/privacy/scan.py --artifacts "$RUNNER_TEMP"/dist/*
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ${{ matrix.platform }}
+          path: ${{ runner.temp }}/dist/
+          if-no-files-found: error
+          retention-days: 14
+
+  sign-android:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: release
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ env.TAG }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: android
+          path: ${{ runner.temp }}/android
+      - name: Sign the APK
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          version="${TAG#v}"
+          tools="$ANDROID_HOME/build-tools/36.0.0"
+          test -x "$tools/apksigner" || yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "build-tools;36.0.0" > /dev/null
+          keystore="$RUNNER_TEMP/release.p12"
+          printf '%s' "$KEYSTORE_B64" | base64 --decode > "$keystore"
+          mkdir -p "$RUNNER_TEMP/dist"
+          "$tools/apksigner" sign --ks "$keystore" --ks-key-alias hitode --ks-pass env:KS_PASS \
+            --out "$RUNNER_TEMP/dist/Hitode-$version-android-arm64.apk" \
+            "$RUNNER_TEMP/android/Hitode-$version-android-arm64-unsigned.apk"
+          rm -f "$keystore" "$RUNNER_TEMP"/dist/*.idsig
+          "$tools/apksigner" verify "$RUNNER_TEMP/dist/Hitode-$version-android-arm64.apk"
+          python3 tools/android/check-apk.py "$RUNNER_TEMP/dist/Hitode-$version-android-arm64.apk"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: android-signed
+          path: ${{ runner.temp }}/dist/
+          if-no-files-found: error
+          retention-days: 14
+
+  draft:
+    needs: [build, sign-android]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ env.TAG }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/artifacts
+      - name: Gather the files and their checksums
+        run: |
+          version="${TAG#v}"
+          out="$RUNNER_TEMP/release"
+          mkdir -p "$out"
+          cp "$RUNNER_TEMP"/artifacts/macos/* "$RUNNER_TEMP"/artifacts/ios/* "$RUNNER_TEMP"/artifacts/android-signed/* "$out/"
+          python3 tools/privacy/scan.py --artifacts "$out/Hitode-$version-android-arm64.apk" \
+            "$out/Hitode-$version-licenses.zip"
+          (cd "$out" && sha256sum Hitode-* wine-11.0.tar.xz > SHA256SUMS.txt && cat SHA256SUMS.txt)
+          sed "s/{version}/$version/g" tools/release/notes.txt > "$RUNNER_TEMP/notes.md"
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${TAG#v}"
+          gh release create "$TAG" -R "$GITHUB_REPOSITORY" --verify-tag --draft \
+            --title "Hitode $version" --notes-file "$RUNNER_TEMP/notes.md" "$RUNNER_TEMP"/release/*
+          check="$RUNNER_TEMP/check"
+          mkdir -p "$check"
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -D "$check"
+          (cd "$check" && sha256sum -c SHA256SUMS.txt)
