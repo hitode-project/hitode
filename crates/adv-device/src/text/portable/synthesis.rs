@@ -1,4 +1,6 @@
-//! Synthetic weight keeps the original contour verbs and expands their joins.
+//! Synthetic weight keeps the original contour verbs and expands their joins
+//! horizontally: the glyph widens by `strength` to the right, its height and
+//! left edge stay.
 use super::*;
 
 pub(super) fn embolden(commands: &mut [Command], strength: f32) {
@@ -42,7 +44,10 @@ pub(super) fn embolden(commands: &mut [Command], strength: f32) {
             let a = normal(old[(i + n - 1) % n], old[i]);
             let b = normal(old[i], old[(i + 1) % n]);
             let scale = strength * 0.5 / (1.0 + a.x * b.x + a.y * b.y).max(0.25);
-            points[i] = old[i] + (a + b) * scale + Vector::new(strength * 0.5, strength * 0.5);
+            // A sharp corner's miter would reach past the stroke; clamping it
+            // keeps the left edge in place.
+            let offset = ((a + b) * scale).x.clamp(-strength * 0.5, strength * 0.5);
+            points[i] = old[i] + Vector::new(offset + strength * 0.5, 0.0);
         }
     }
     let mut contour = 0;

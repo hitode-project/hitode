@@ -329,7 +329,7 @@ fn a_host_call_that_expires_the_budget_does_not_start_following_bulk_writes() {
     impl TrapHandler for Slow {
         fn on_trap(&mut self, _: &mut dyn Guest, vector: u8) -> TrapAction {
             assert_eq!(vector, 0x2e);
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(Duration::from_millis(400));
             TrapAction::Continue
         }
     }
@@ -346,7 +346,8 @@ fn a_host_call_that_expires_the_budget_does_not_start_following_bulk_writes() {
     cpu.set_reg(Reg::Eax, 0x44);
     cpu.set_reg(Reg::Ecx, 4096);
     cpu.set_reg(Reg::Edi, DST);
-    let budget = Duration::from_millis(1);
+    // Wide enough that translating the first block never spends it.
+    let budget = Duration::from_millis(200);
     cpu.set_execution_budget(Some(budget));
     assert_eq!(
         cpu.run(&mut Slow),

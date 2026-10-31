@@ -195,6 +195,16 @@ Unmatched libraries MUST execute their guest implementations.
 **Rule**: Fonts shipped with the Windows installation MUST be discovered only for families that no host font provides, after every host face. Glyph association MUST NOT draw from a symbol-encoded face that the request did not select.
 **Verification**: Test
 
+### DEV-FONT-7 Synthetic bold
+
+**Rule**: A bold request for a face without a bold design MUST widen each glyph by exactly one pixel to the right at every size. The box width, cell advance, average and maximum character widths grow by one; glyph height, both origins and the font's ascent stay.
+**Verification**: Test
+
+### DEV-FONT-8 Glyphs inside the cell
+
+**Rule**: An upright glyph's box and bitmap MUST be clipped to its font's cell: the box never reaches above the ascent or below the descent.
+**Verification**: Test
+
 ## Optical media
 
 ### DEV-DISC-1 Mount configuration
