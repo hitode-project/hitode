@@ -9,7 +9,7 @@ pub const DEADLINE: u32 = 2;
 pub const STOP: u32 = 4;
 pub const WORK: u32 = 8;
 
-/// A retained timer worker sets the pending word; host calls never read a clock.
+/// A retained timer worker sets the pending word for deadline notifications.
 pub struct Deadline {
     state: Arc<(Mutex<State>, Condvar)>,
     worker: Option<std::thread::JoinHandle<()>>,

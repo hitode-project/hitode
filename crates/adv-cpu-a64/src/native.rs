@@ -577,6 +577,7 @@ fn host(
         && memory.dirty_pages.len() == dirty
         && cpu.eip == next
         && !native.pending_work()
+        && !native.past()
 }
 
 /// Read the owner's counter without synchronizing guest architectural state.

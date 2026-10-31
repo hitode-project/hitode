@@ -59,7 +59,7 @@ Native host protection MUST retain its executable-page write barrier.
 
 ### EXEC-CALL-1 Host call bookkeeping
 
-**Rule**: With diagnostics off, an ordinary host call MUST NOT read a clock, read the guest stack, record recent calls or count memory work. It MUST look up its thunk once. Toggling diagnostics MUST discard translated units, so generated code carries no diagnostic branches.
+**Rule**: With diagnostics off, host calls MUST NOT read clocks (except active deadline checks), read guest stacks, record recent calls or count memory work. Each MUST look up its thunk once. Toggling diagnostics MUST discard translated units, so generated code carries no diagnostic branches.
 **Verification**: Test
 
 ### EXEC-CALL-2 Host call entry checks

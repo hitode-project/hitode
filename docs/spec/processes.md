@@ -156,7 +156,7 @@ While time skipping is requested, ready polling contexts MUST retain PROC-CLOCK-
 
 ### PROC-DEV-1 Foreground frames
 
-**Rule**: A foreground switch MUST move the single frame mailbox producer to the new process. Frame sequence numbers MUST keep increasing across the switch.
+**Rule**: A foreground switch MUST move the single frame mailbox producer to the new process, including when the former foreground process exits. Frame sequence numbers MUST keep increasing across the switch.
 **Verification**: Test
 
 ### PROC-DEV-2 Shared devices

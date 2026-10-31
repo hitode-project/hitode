@@ -18,6 +18,82 @@ mod wine {
     ));
 }
 
+// spec: PROC-DEV-1
+#[test]
+fn a_child_inherits_the_ui_mailbox_when_its_launcher_exits() {
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "display_child_session",
+            "--nocapture",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[ignore = "subprocess entry: Wine owns process-global server state"]
+fn display_child_session() {
+    let Some(wine::Wine { dist, probes }) = wine::wine() else {
+        return;
+    };
+    let root = std::env::temp_dir().join(format!("adv-wine-display-child-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let config = Config {
+        dist: &dist,
+        prefix: &root,
+        drive: None,
+        locale: 0x409,
+        fonts: "",
+        exe: &probes.join("display_child.exe"),
+        width: 640,
+        height: 480,
+        jit: true,
+        debug: "",
+        stdout: None,
+    };
+    let (producer, mut consumer) = frame_mailbox();
+    let mut session = Session::start(
+        &config,
+        adv_sync::WakeEvent::new().unwrap(),
+        move |machine| {
+            machine
+                .ext
+                .get_mut::<SurfaceStore>()
+                .set_frame_mailbox(producer, adv_sync::WakeEvent::new().unwrap());
+            machine.set_frame_handoff(false);
+            Ok(())
+        },
+    )
+    .unwrap();
+    let stop = session.run(Instant::now() + Duration::from_secs(5));
+    assert!(matches!(stop, Stop::Paused), "{stop:?}");
+    assert!(
+        consumer.update(),
+        "child frame did not reach the UI mailbox"
+    );
+    let mut frame = Snapshot::default();
+    consumer.current().snapshot(&mut frame).unwrap();
+    assert_eq!((frame.width, frame.height), (80, 40));
+    assert!(
+        frame
+            .bgra
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|pixel| pixel[..3] == [255; 3])
+    );
+    drop(session);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 // spec: WINE-GFX-7
 #[test]
 fn a_waiting_program_publishes_its_frame_to_the_ui() {
