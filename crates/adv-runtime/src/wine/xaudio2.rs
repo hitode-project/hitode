@@ -44,10 +44,7 @@ pub(super) fn install<B: Backend>(machine: &mut Machine<B>, drive: &Path) -> Res
         let original = path.with_file_name(ORIGINALS[version]);
         let source = std::fs::canonicalize(if path.is_symlink() { &path } else { &original })
             .map_err(|e| e.to_string())?;
-        if original.exists() {
-            std::fs::remove_file(&original).map_err(|e| e.to_string())?;
-        }
-        std::os::unix::fs::symlink(&source, &original).map_err(|e| e.to_string())?;
+        super::session::link(&source, &original)?;
         let pe = adv_pe::Pe::parse(&std::fs::read(source).map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string())?;
         let names = pe.exports().map_err(|e| e.to_string())?;
