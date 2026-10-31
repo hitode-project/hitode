@@ -337,8 +337,10 @@ fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Link `target` to `source`, retaining an existing matching link.
-fn link(source: &Path, target: &Path) -> Result<(), String> {
+/// Link `target` to `source`, retaining an existing matching link. A stale
+/// link is replaced even when it dangles: mobile app bundles move on every
+/// install, so links into the previous bundle no longer resolve.
+pub(super) fn link(source: &Path, target: &Path) -> Result<(), String> {
     if std::fs::read_link(target).is_ok_and(|existing| existing == source) {
         return Ok(());
     }
@@ -1389,3 +1391,21 @@ impl Session {
 #[cfg(test)]
 #[path = "../../tests/wine/server_quiet.rs"]
 mod server_quiet;
+
+#[cfg(test)]
+mod link_tests {
+    #[test]
+    fn a_dangling_link_is_replaced() {
+        let root = std::env::temp_dir().join(format!("adv-dangling-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.dll");
+        std::fs::write(&source, b"pe").unwrap();
+        let target = root.join("target.dll");
+        std::os::unix::fs::symlink(root.join("moved/source.dll"), &target).unwrap();
+        assert!(!target.exists());
+        super::link(&source, &target).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"pe");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+}
