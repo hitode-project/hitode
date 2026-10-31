@@ -855,6 +855,13 @@ fn fixed(request: &FontRequest) -> bool {
             "ms gothic" | "ｍｓ ゴシック" | "ms mincho" | "ｍｓ 明朝"
         )
 }
+/// Windows widens a face without a bold design by exactly one pixel, at
+/// every size: the glyph extends to the right only (DEV-FONT-7).
+fn synthetic_bold(request: &FontRequest, font: &FontRef<'_>, weight: u16) -> bool {
+    normalized_weight(request) >= 600
+        && weight < 600
+        && font.axes().get_by_tag(skrifa::Tag::new(b"wght")).is_none()
+}
 fn normalized_weight(request: &FontRequest) -> i32 {
     if request.weight == 0 {
         400
@@ -1129,12 +1136,13 @@ fn font_metrics(
     } else {
         1.0
     };
+    let ascent = (asc * scale).round() as i32;
+    // Windows rounds the ascent and descent of an em-sized font separately.
     let height = if request.height > 0 {
         request.height
     } else {
-        ((asc + desc) * scale).round() as i32
+        ascent + (desc * scale).round() as i32
     };
-    let ascent = (asc * scale).round() as i32;
     let metrics = TextMetrics {
         height,
         ascent,
@@ -1225,8 +1233,13 @@ impl Font {
         primary: Arc<Face>,
         profile: Option<Arc<profile::Loaded>>,
     ) -> Result<Self, TextError> {
-        let (em, xscale, mut metrics) = font_metrics(&primary.font()?, request)?;
-        metrics.encoding = realized(request.encoding, ansi, &primary.font()?);
+        let font = primary.font()?;
+        let (em, xscale, mut metrics) = font_metrics(&font, request)?;
+        metrics.encoding = realized(request.encoding, ansi, &font);
+        if synthetic_bold(request, &font, primary.info.weight.0) {
+            metrics.average_width += 1;
+            metrics.maximum_width += 1;
+        }
         diagnostic(
             request,
             &primary,
@@ -1516,11 +1529,8 @@ impl Font {
     }
     fn advance(&self, face: &Face, glyph: GlyphId, code: Option<u32>) -> Result<f32, TextError> {
         let font = face.font()?;
-        let bold = if normalized_weight(&self.request) >= 600
-            && face.info.weight.0 < 600
-            && font.axes().get_by_tag(skrifa::Tag::new(b"wght")).is_none()
-        {
-            (self.em / 24.0).round().max(1.0)
+        let bold = if synthetic_bold(&self.request, &font, face.info.weight.0) {
+            1.0
         } else {
             0.0
         };
@@ -1788,11 +1798,8 @@ impl Font {
                 .draw(DrawSettings::unhinted(Size::new(self.em), &loc), &mut pen)
                 .map_err(|e| TextError::Glyph(format!("glyph outline: {e}")))?;
         }
-        let bold = normalized_weight(&self.request) >= 600
-            && face.info.weight.0 < 600
-            && font.axes().get_by_tag(skrifa::Tag::new(b"wght")).is_none();
-        if bold {
-            synthesis::embolden(&mut pen.commands, (self.em / 24.0).round().max(1.0));
+        if synthetic_bold(&self.request, &font, face.info.weight.0) {
+            synthesis::embolden(&mut pen.commands, 1.0);
         }
         let angle = self.request.glyph_angle
             + if self.request.face.starts_with('@') {
@@ -1824,6 +1831,15 @@ impl Font {
                 bounds.max.x.ceil(),
                 bounds.max.y.ceil(),
             )
+        };
+        // GDI clips an upright glyph to its font's cell, so no box reaches
+        // above the ascent or below the descent (DEV-FONT-8).
+        let (bottom, top) = if matrix == Transform::IDENTITY {
+            let ascent = self.metrics.ascent as f32;
+            let bottom = bottom.max(-(self.metrics.descent as f32)).min(ascent);
+            (bottom, top.min(ascent).max(bottom))
+        } else {
+            (bottom, top)
         };
         if [left, bottom, right, top]
             .iter()

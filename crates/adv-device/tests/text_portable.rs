@@ -942,6 +942,94 @@ fn windows_fonts_fill_only_families_the_host_lacks() {
     );
 }
 
+// spec: DEV-FONT-7
+#[test]
+fn synthetic_bold_widens_one_pixel_to_the_right_at_every_size() {
+    let directory = FixtureDirectory::new();
+    std::fs::write(
+        directory.0.join("japanese.ttf"),
+        include_bytes!("fixtures/font-resource-japanese.ttf"),
+    )
+    .unwrap();
+    let mut text = Text::with_font_directories(std::slice::from_ref(&directory.0));
+    // Windows 11 26H2, this font, GGO_GRAY8_BITMAP: at every height bold
+    // adds one pixel to the box width, cell advance, average and maximum
+    // width; height and both origins stay.
+    for height in [-12, -26, -48, -96] {
+        let mut regular = font("ADV Japanese Fixture");
+        regular.height = height;
+        let bold = FontRequest {
+            weight: 700,
+            ..regular.clone()
+        };
+        let (r, b) = (
+            text.metrics(&regular).unwrap(),
+            text.metrics(&bold).unwrap(),
+        );
+        assert_eq!((b.height, b.ascent), (r.height, r.ascent), "{height}");
+        assert_eq!(
+            (b.average_width, b.maximum_width),
+            (r.average_width + 1, r.maximum_width + 1),
+            "{height}"
+        );
+        for code in [u32::from(b'A'), u32::from(b'B'), 0x3042] {
+            let character = Character::Unicode(code);
+            let r = text
+                .glyph(&regular, glyph(character, GlyphFormat::Gray8))
+                .unwrap()
+                .metrics;
+            let g = text
+                .glyph(&bold, glyph(character, GlyphFormat::Gray8))
+                .unwrap()
+                .metrics;
+            assert_eq!(
+                (g.height, g.origin_x, g.origin_y, g.advance_x),
+                (r.height, r.origin_x, r.origin_y, r.advance_x + 1),
+                "{height} {code:#x}"
+            );
+            assert!((1..=2).contains(&(g.width - r.width)), "{height} {code:#x}");
+            assert!(g.origin_y <= b.ascent, "{height} {code:#x}");
+        }
+    }
+}
+
+// spec: DEV-FONT-8
+#[test]
+fn upright_glyph_boxes_stay_inside_the_font_cell() {
+    let directory = FixtureDirectory::new();
+    // The Japanese fixture with winAscent 600 below its 700-unit glyph tops
+    // and B moved 300 units down, past winDescent 200.
+    std::fs::write(
+        directory.0.join("clipped.ttf"),
+        include_bytes!("fixtures/font-resource-clipped.ttf"),
+    )
+    .unwrap();
+    let mut text = Text::with_font_directories(std::slice::from_ref(&directory.0));
+    // Windows 11 26H2, GGO_GRAY8_BITMAP: (tmHeight, tmAscent), then A and B
+    // as (gmptGlyphOrigin.y, gmBlackBoxY).
+    for (height, cell, a, b) in [
+        (-12, (9, 7), (7, 7), (5, 7)),
+        (-26, (21, 16), (16, 16), (11, 16)),
+        (-48, (39, 29), (29, 29), (20, 30)),
+        (-96, (77, 58), (58, 58), (39, 58)),
+    ] {
+        let mut request = font("ADV Clipped Fixture");
+        request.height = height;
+        let metrics = text.metrics(&request).unwrap();
+        assert_eq!((metrics.height, metrics.ascent), cell, "{height}");
+        for (code, expected) in [(b'A', a), (b'B', b)] {
+            let character = Character::Unicode(u32::from(code));
+            let g = text
+                .glyph(&request, glyph(character, GlyphFormat::Gray8))
+                .unwrap()
+                .metrics;
+            assert_eq!((g.origin_y, g.height as i32), expected, "{height} {code}");
+            assert!(g.origin_y <= metrics.ascent);
+            assert!(g.origin_y - g.height as i32 >= -metrics.descent);
+        }
+    }
+}
+
 /// Tests may execute on another host than the compiler (notably Android).
 /// Materialize the authored input on that host and retire only our own files.
 struct FixtureDirectory(PathBuf);
