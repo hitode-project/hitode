@@ -1,5 +1,5 @@
 //! Build pull-source graphs with the common splitter/decoders and
-//! existing guest video renderers. Audio uses the ordinary DirectSound renderer.
+//! existing guest renderers, with native video and DirectSound renderers as defaults.
 use super::*;
 use crate::dshow::filter::{INPUT, OUTPUT, Role};
 
@@ -108,15 +108,12 @@ fn pin_with(env: &mut Env<'_>, graph: u32, pointer: u32, existing_only: bool) ->
         return file(env, graph, filter, pin, existing_only, None);
     }
     match state(env).pins[&pin].major {
-        MEDIATYPE_VIDEO => video(
+        MEDIATYPE_VIDEO | MEDIATYPE_AUDIO => renderer(
             env,
             graph,
             pin,
             existing_only,
             Box::new(|_, results| Outcome::Return(results[0])),
-        ),
-        MEDIATYPE_AUDIO => Outcome::Return(
-            audio(env, graph, pin, existing_only).map_or_else(|error| error, |_| S_OK),
         ),
         _ => Outcome::Return(VFW_E_CANNOT_RENDER),
     }
@@ -424,36 +421,42 @@ fn streams(env: &mut Env<'_>, mut build: Build) -> Outcome {
     }
     let finish: Then = Box::new(move |env, results| {
         let video_result = results.first().copied();
-        let audio_result = audio_output.map(|pin| audio(env, graph, pin, existing_only));
-        let video_ok = video_result == Some(S_OK);
-        let audio_ok = audio_result.as_ref().is_some_and(Result::is_ok);
-        let failed = video_result.is_some_and(|hr| hr != S_OK)
-            || audio_result.as_ref().is_some_and(Result::is_err);
-        let hr = if failed && (video_ok || audio_ok) {
-            adv_abi::warn_unavailable(
-                env,
-                "IGraphBuilder::Render",
-                "only part of the source's streams could be rendered",
-            );
-            VFW_S_PARTIAL_RENDER
-        } else if failed {
-            video_result
-                .filter(|hr| *hr != S_OK)
-                .or_else(|| audio_result.and_then(Result::err))
-                .unwrap_or(VFW_E_CANNOT_RENDER)
-        } else if video_ok || audio_ok {
-            S_OK
-        } else {
-            VFW_E_CANNOT_RENDER
-        };
-        build.finish(env, hr)
+        let finish: Then = Box::new(move |env, results| {
+            let audio_result = results.first().copied();
+            let video_ok = video_result == Some(S_OK);
+            let audio_ok = audio_result == Some(S_OK);
+            let failed = video_result.is_some_and(|hr| hr != S_OK)
+                || audio_result.is_some_and(|hr| hr != S_OK);
+            let hr = if failed && (video_ok || audio_ok) {
+                adv_abi::warn_unavailable(
+                    env,
+                    "IGraphBuilder::Render",
+                    "only part of the source's streams could be rendered",
+                );
+                VFW_S_PARTIAL_RENDER
+            } else if failed {
+                video_result
+                    .filter(|hr| *hr != S_OK)
+                    .or(audio_result)
+                    .unwrap_or(VFW_E_CANNOT_RENDER)
+            } else if video_ok || audio_ok {
+                S_OK
+            } else {
+                VFW_E_CANNOT_RENDER
+            };
+            build.finish(env, hr)
+        });
+        match audio_output {
+            Some(out) => renderer(env, graph, out, existing_only, finish),
+            None => finish(env, Vec::new()),
+        }
     });
     match video_output {
         Some(out) if target.is_some() => {
             let outcome = filter::connect(env, out, target.unwrap(), 0);
             after(env, outcome, finish)
         }
-        Some(out) => video(env, graph, out, existing_only, finish),
+        Some(out) => renderer(env, graph, out, existing_only, finish),
         None => finish(env, Vec::new()),
     }
 }
@@ -473,7 +476,7 @@ fn available_renderer(env: &mut Env<'_>, graph: u32, role: Role) -> Option<u32> 
     })
 }
 
-fn audio(env: &mut Env<'_>, graph: u32, out: u32, existing_only: bool) -> Result<(), u32> {
+fn system_audio(env: &mut Env<'_>, graph: u32, out: u32, existing_only: bool) -> Result<(), u32> {
     if let Some(renderer) = available_renderer(env, graph, Role::AudioRenderer) {
         return connect(env, out, endpoint(env, renderer, INPUT));
     }
@@ -495,7 +498,7 @@ fn audio(env: &mut Env<'_>, graph: u32, out: u32, existing_only: bool) -> Result
     Ok(())
 }
 
-fn video(env: &mut Env<'_>, graph: u32, out: u32, existing_only: bool, then: Then) -> Outcome {
+fn renderer(env: &mut Env<'_>, graph: u32, out: u32, existing_only: bool, then: Then) -> Outcome {
     let filters = g(env, graph)
         .members
         .iter()
@@ -520,7 +523,11 @@ fn next_filter(
         free(env, scratch);
         let owner = state(env).pins[&out].filter;
         let graph = state(env).filters[&owner].graph;
-        let hr = system_video(env, graph, out, existing_only);
+        let hr = if state(env).pins[&out].major == MEDIATYPE_AUDIO {
+            system_audio(env, graph, out, existing_only).map_or_else(|hr| hr, |_| S_OK)
+        } else {
+            system_video(env, graph, out, existing_only)
+        };
         return then(env, vec![hr]);
     };
     let _ = env.cpu.write_u32(scratch, 0);

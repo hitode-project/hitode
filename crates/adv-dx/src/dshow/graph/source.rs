@@ -247,4 +247,4 @@ pub(crate) fn file_method(env: &mut Env<'_>, filter: u32, method: &str) -> Outco
 }
 
 #[cfg(test)]
-pub(super) mod tests;
+pub(crate) mod tests;
