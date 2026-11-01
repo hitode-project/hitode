@@ -18,7 +18,7 @@ pub(crate) struct Allocator {
 pub(crate) struct Sample {
     allocator: u32,
     pub buffer: u32,
-    size: u32,
+    pub size: u32,
     pub actual: u32,
     pub time: Option<(i64, i64)>,
     media_time: Option<(i64, i64)>,

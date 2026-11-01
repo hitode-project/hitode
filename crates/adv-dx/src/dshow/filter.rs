@@ -638,10 +638,7 @@ fn decoded_audio_type(env: &Env<'_>, pin: u32) -> Option<MediaType> {
         .as_ref()?
         .audio
         .clone()?;
-    Some(MediaType::audio_pcm(
-        audio.sample_rate,
-        audio.channels.min(2),
-    ))
+    Some(MediaType::audio_pcm(audio.sample_rate, audio.channels))
 }
 
 /// IGraphBuilder::Connect / ConnectDirect / IPin::Connect for any pair of pins.
@@ -789,7 +786,12 @@ fn finish_guest_connection(
                 return abort_guest_connection(env, out, input, VFW_E_NO_TRANSPORT);
             }
             state(env).pins.get_mut(&out).unwrap().mem = mem;
-            let size = mt.sample_size.max(1);
+            let size = if mt.major == MEDIATYPE_AUDIO {
+                // Keep a second of PCM, as the DirectSound renderer does.
+                u32::from_le_bytes(mt.format[8..12].try_into().unwrap())
+            } else {
+                mt.sample_size.max(1)
+            };
             let allocator = match sample::create_allocator(env, 3, size) {
                 Ok(allocator) => allocator,
                 Err(error) => return abort_guest_connection(env, out, input, error),

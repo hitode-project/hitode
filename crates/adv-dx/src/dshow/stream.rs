@@ -1,7 +1,7 @@
 //! Streaming: one guest thread per running splitter. It decodes at the graph's
 //! media position, pushes video samples into the downstream (usually guest)
-//! renderer and audio into the DirectSound mixer. Receive may block while the
-//! graph is paused, which is why delivery happens on a thread of its own.
+//! renderer. Audio feeds either a guest renderer or the DirectSound mixer.
+//! Receive may block while the graph is paused, so delivery has its own thread.
 use std::collections::VecDeque;
 
 use adv_device::media::{AudioFrame, VideoFrame};
@@ -25,6 +25,8 @@ pub(crate) struct Session {
     video: Option<VideoTarget>,
     /// Mixer stream of a host audio renderer.
     audio: Option<u64>,
+    /// Host output pin feeding a guest audio renderer.
+    audio_guest: Option<u32>,
     wake: Handle,
     generation: u32,
     seen_generation: u32,
@@ -33,6 +35,7 @@ pub(crate) struct Session {
     ending: bool,
     ended: bool,
     discontinuity: bool,
+    audio_discontinuity: bool,
     segment: i64,
     pending_audio: VecDeque<AudioFrame>,
     /// The mixer stream was told the graph paused; queued PCM must not play on.
@@ -95,9 +98,12 @@ pub(crate) fn start(env: &mut Env<'_>, graph: u32, filter: u32) -> u32 {
         .copied()
         .filter(|p| state_ref.pins[p].dir == OUTPUT)
         .collect();
-    let (mut video, mut audio_renderer) = (None, false);
+    let (mut video, mut audio_renderer, mut audio_guest) = (None, false, None);
     for out in outputs {
         match follow(env, out) {
+            Some(End::Guest(pin)) if state(env).pins[&pin].major == MEDIATYPE_AUDIO => {
+                audio_guest = Some(pin);
+            }
             Some(End::Guest(pin)) if video.is_none() => video = Some(VideoTarget::Guest(pin)),
             Some(End::VideoRenderer(renderer)) if video.is_none() => {
                 video = Some(VideoTarget::Host(renderer));
@@ -106,7 +112,7 @@ pub(crate) fn start(env: &mut Env<'_>, graph: u32, filter: u32) -> u32 {
             _ => {}
         }
     }
-    if video.is_none() && !audio_renderer {
+    if video.is_none() && !audio_renderer && audio_guest.is_none() {
         return 0;
     }
     let audio = audio_renderer
@@ -127,6 +133,7 @@ pub(crate) fn start(env: &mut Env<'_>, graph: u32, filter: u32) -> u32 {
             splitter: filter,
             video,
             audio,
+            audio_guest,
             wake,
             generation: 1,
             seen_generation: 0,
@@ -135,6 +142,7 @@ pub(crate) fn start(env: &mut Env<'_>, graph: u32, filter: u32) -> u32 {
             ending: false,
             ended: false,
             discontinuity: true,
+            audio_discontinuity: true,
             segment: 0,
             pending_audio: VecDeque::new(),
             audio_paused: false,
@@ -147,12 +155,14 @@ pub(crate) fn start(env: &mut Env<'_>, graph: u32, filter: u32) -> u32 {
     );
     apply_volume(env, graph);
     if env.ext.try_get::<Host>().is_some() {
-        let native = !matches!(video, Some(VideoTarget::Guest(_)));
+        let native = !matches!(video, Some(VideoTarget::Guest(_))) && audio_guest.is_none();
         session(env, id).host = native;
         if !native {
             state(env).pending_threads.push(id);
         }
-        return u32::from(video.is_some()) + u32::from(audio_renderer);
+        return u32::from(video.is_some())
+            + u32::from(audio_renderer)
+            + u32::from(audio_guest.is_some());
     }
     let spawned = env
         .sys
@@ -171,7 +181,7 @@ pub(crate) fn start(env: &mut Env<'_>, graph: u32, filter: u32) -> u32 {
         return 0;
     }
     log::info!("DirectShow: streaming splitter {filter:#x} (video={video:?}, audio={audio:?})");
-    u32::from(video.is_some()) + u32::from(audio_renderer)
+    u32::from(video.is_some()) + u32::from(audio_renderer) + u32::from(audio_guest.is_some())
 }
 
 pub(crate) fn wake(env: &mut Env<'_>, id: u32) {
@@ -346,54 +356,65 @@ fn process_update(
     stats.video_frames += u64::from(update.video.is_some());
     stats.audio_frames += update.audio.len() as u64;
     let s = session(env, id);
-    if s.audio.is_some() {
+    if s.audio.is_some() || s.audio_guest.is_some() {
         s.pending_audio.extend(update.audio);
     }
     if !paused {
         push_audio(env, id);
     }
-    let past_stop = state(env).graphs[&graph]
-        .stop
-        .is_some_and(|stop| position >= stop);
-    let ended = update.ended || past_stop;
-    let s = session(env, id);
-    if paused {
-        s.prerolled = true;
-    }
-    let video = s.video;
-    match (update.video, video) {
-        (Some(frame), Some(VideoTarget::Guest(pin))) if !past_stop => {
-            deliver(env, id, pin, frame, move |env| {
-                if ended {
-                    end_of_stream(env, id)
-                } else {
-                    pump(env, id)
-                }
-            })
+    let then = move |env: &mut Env<'_>| {
+        let past_stop = state(env).graphs[&graph]
+            .stop
+            .is_some_and(|stop| position >= stop);
+        let ended = update.ended || past_stop;
+        let s = session(env, id);
+        if paused {
+            s.prerolled = true;
         }
-        (Some(frame), Some(VideoTarget::Host(renderer))) if !past_stop => {
-            if !state(env)
-                .filters
-                .get(&renderer)
-                .is_some_and(|f| f.graph == graph)
-            {
-                return abort_stream(env, id, VFW_E_NOT_CONNECTED, "video renderer was detached");
+        let video = s.video;
+        match (update.video, video) {
+            (Some(frame), Some(VideoTarget::Guest(pin))) if !past_stop => {
+                deliver(env, id, pin, frame, move |env| {
+                    if ended {
+                        end_of_stream(env, id)
+                    } else {
+                        pump(env, id)
+                    }
+                })
             }
-            match video::publish(env, graph, frame) {
-                Ok(Some(outcome)) => outcome,
-                Ok(None) if ended => end_of_stream(env, id),
-                Ok(None) if session(env, id).host => {
-                    wait(env, id, Some(env.sys.clock.now_us() + 1000))
+            (Some(frame), Some(VideoTarget::Host(renderer))) if !past_stop => {
+                if !state(env)
+                    .filters
+                    .get(&renderer)
+                    .is_some_and(|f| f.graph == graph)
+                {
+                    return abort_stream(
+                        env,
+                        id,
+                        VFW_E_NOT_CONNECTED,
+                        "video renderer was detached",
+                    );
                 }
-                Ok(None) => pump(env, id),
-                Err(hr) => abort_stream(env, id, hr, "video presentation failed"),
+                match video::publish(env, graph, frame) {
+                    Ok(Some(outcome)) => outcome,
+                    Ok(None) if ended => end_of_stream(env, id),
+                    Ok(None) if session(env, id).host => {
+                        wait(env, id, Some(env.sys.clock.now_us() + 1000))
+                    }
+                    Ok(None) => pump(env, id),
+                    Err(hr) => abort_stream(env, id, hr, "video presentation failed"),
+                }
+            }
+            _ if ended => end_of_stream(env, id),
+            _ => {
+                let deadline = env.sys.clock.now_us() + POLL_US;
+                wait(env, id, Some(deadline))
             }
         }
-        _ if ended => end_of_stream(env, id),
-        _ => {
-            let deadline = env.sys.clock.now_us() + POLL_US;
-            wait(env, id, Some(deadline))
-        }
+    };
+    match (session(env, id).audio_guest, paused) {
+        (Some(pin), false) => deliver_audio(env, id, pin, then),
+        _ => then(env),
     }
 }
 
@@ -438,7 +459,8 @@ fn abort_stream(env: &mut Env<'_>, id: u32, hresult: u32, reason: &str) -> Outco
 fn begin_segment(env: &mut Env<'_>, id: u32) -> Outcome {
     let s = session(env, id);
     let flush = s.seen_generation != 0;
-    let (graph, splitter, video, audio) = (s.graph, s.splitter, s.video, s.audio);
+    let (graph, splitter, video, audio, audio_guest) =
+        (s.graph, s.splitter, s.video, s.audio, s.audio_guest);
     if let (Some(stream), Some(sound)) = (audio, env.ext.try_get_mut::<Sound>())
         && flush
         && !sound.audio.flush_pcm(stream)
@@ -471,6 +493,7 @@ fn begin_segment(env: &mut Env<'_>, id: u32) -> Outcome {
     s.ended = false;
     s.prerolled = false;
     s.discontinuity = true;
+    s.audio_discontinuity = true;
     s.pending_audio.clear();
     s.updates.clear();
     s.decoded_end = false;
@@ -480,7 +503,11 @@ fn begin_segment(env: &mut Env<'_>, id: u32) -> Outcome {
     }
     s.segment = position;
     let mut calls = VecDeque::new();
-    if let Some(VideoTarget::Guest(pin)) = video {
+    let video_guest = match video {
+        Some(VideoTarget::Guest(pin)) => Some(pin),
+        _ => None,
+    };
+    for pin in video_guest.into_iter().chain(audio_guest) {
         let peer = state(env).pins[&pin].peer;
         if flush {
             calls.push_back(Call(peer, 15, vec![]));
@@ -511,7 +538,12 @@ fn begin_segment(env: &mut Env<'_>, id: u32) -> Outcome {
 fn end_of_stream(env: &mut Env<'_>, id: u32) -> Outcome {
     let s = session(env, id);
     s.ending = true;
-    let (graph, video, audio) = (s.graph, s.video, s.audio);
+    if let Some(pin) = s.audio_guest
+        && !s.pending_audio.is_empty()
+    {
+        return deliver_audio(env, id, pin, move |env| end_of_stream(env, id));
+    }
+    let (graph, video, audio, audio_guest) = (s.graph, s.video, s.audio, s.audio_guest);
     // Pending PCM must precede End in the same FIFO; an accepted End cannot
     // strand frames that were refused by the data queue on the previous pass.
     push_audio(env, id);
@@ -542,19 +574,23 @@ fn end_of_stream(env: &mut Env<'_>, id: u32) -> Outcome {
     if renderer_audio {
         graph::notify(env, graph, EC_COMPLETE, 0, 0);
     }
-    let then =
-        move |env: &mut Env<'_>| graph::flush_posts(env, Box::new(move |env, _| pump(env, id)));
+    let mut calls = VecDeque::new();
+    if let Some(pin) = audio_guest {
+        calls.push_back(Call(state(env).pins[&pin].peer, 14, vec![]));
+    }
     match video {
         Some(VideoTarget::Guest(pin)) => {
-            let peer = state(env).pins[&pin].peer;
-            guest_call(env, peer, 14, vec![], move |env, _| then(env))
+            calls.push_back(Call(state(env).pins[&pin].peer, 14, vec![]));
         }
-        Some(VideoTarget::Host(_)) => {
-            graph::notify(env, graph, EC_COMPLETE, 0, 0);
-            then(env)
-        }
-        None => then(env),
+        Some(VideoTarget::Host(_)) => graph::notify(env, graph, EC_COMPLETE, 0, 0),
+        None => {}
     }
+    chain(
+        env,
+        calls,
+        Vec::new(),
+        Box::new(move |env, _| graph::flush_posts(env, Box::new(move |env, _| pump(env, id)))),
+    )
 }
 
 /// Whether this session feeds a host audio renderer (counted in `expected`).
@@ -606,6 +642,72 @@ fn push_audio(env: &mut Env<'_>, id: u32) {
         }
         session(env, id).audio_end = session(env, id).audio_end.max(end);
     }
+}
+
+fn deliver_audio(
+    env: &mut Env<'_>,
+    id: u32,
+    pin: u32,
+    then: impl FnOnce(&mut Env<'_>) -> Outcome + 'static,
+) -> Outcome {
+    if session(env, id).pending_audio.is_empty() {
+        return then(env);
+    }
+    let p = &state(env).pins[&pin];
+    let (mem, allocator) = (p.mem, p.allocator);
+    let Some(sample) = sample::take(env, allocator) else {
+        return Outcome::block(
+            Wait::Object {
+                handle: session(env, id).wake,
+                deadline: Some(env.sys.clock.now_us() + POLL_US),
+            },
+            move |env, _| deliver_audio(env, id, pin, then),
+        );
+    };
+    let frame = session(env, id).pending_audio.pop_front().unwrap();
+    let graph = session(env, id).graph;
+    let graph = &state(env).graphs[&graph];
+    let base = 10f32.powf(graph.volume as f32 / 2000.0);
+    let gains = [
+        base * 10f32.powf(-graph.balance.max(0) as f32 / 2000.0),
+        base * 10f32.powf(graph.balance.min(0) as f32 / 2000.0),
+    ];
+    let bytes: Vec<u8> = frame
+        .samples
+        .iter()
+        .enumerate()
+        .flat_map(|(i, value)| {
+            let channel = i % usize::from(frame.channels);
+            let gain = if frame.channels == 1 {
+                base
+            } else {
+                gains[channel.min(1)]
+            };
+            ((*value * gain * 32768.0) as i16).to_le_bytes()
+        })
+        .collect();
+    let sample_data = &state(env).samples[&sample];
+    let (buffer, capacity) = (sample_data.buffer, sample_data.size as usize);
+    if bytes.len() > capacity || env.cpu.write(buffer, &bytes).is_err() {
+        release(env, sample);
+        return abort_stream(env, id, E_FAIL, "audio sample write failed");
+    }
+    let duration = frame.samples.len() as i64 * 10_000_000
+        / (i64::from(frame.sample_rate) * i64::from(frame.channels));
+    let s = session(env, id);
+    let start = frame.pts_us as i64 * 10 - s.segment;
+    let discontinuity = std::mem::take(&mut s.audio_discontinuity);
+    let sample_data = state(env).samples.get_mut(&sample).unwrap();
+    sample_data.actual = bytes.len() as u32;
+    sample_data.time = Some((start, start + duration));
+    sample_data.discontinuity = discontinuity;
+    guest_call(env, mem, 6, vec![sample], move |env, hr| {
+        release(env, sample);
+        if hr & 0x8000_0000 != 0 {
+            return abort_stream(env, id, hr, "audio Receive failed");
+        }
+        deliver_audio(env, id, pin, then)
+    })
 }
 
 fn deliver(
@@ -738,7 +840,11 @@ fn produce(env: &mut Env<'_>, id: u32) {
             Err(_) => s.decoded_end = true,
         }
         if match &result {
-            Ok(update) => update.video.is_some() || update.ended,
+            Ok(update) => {
+                update.video.is_some()
+                    || update.ended
+                    || (s.audio_guest.is_some() && !update.audio.is_empty())
+            }
             Err(_) => true,
         } {
             s.updates.push_back(result);
@@ -823,6 +929,7 @@ mod tests {
                 // Error handling must not call this renderer's EndOfStream.
                 video: Some(VideoTarget::Guest(0xdead_beef)),
                 audio: None,
+                audio_guest: None,
                 wake,
                 generation: 1,
                 seen_generation: 1,
@@ -831,6 +938,7 @@ mod tests {
                 ending: false,
                 ended: false,
                 discontinuity: true,
+                audio_discontinuity: true,
                 segment: 0,
                 pending_audio: VecDeque::new(),
                 audio_paused: false,
@@ -842,6 +950,79 @@ mod tests {
             },
         );
         (m, graph, events, wake)
+    }
+
+    // spec: MEDIA-STREAM-1
+    #[test]
+    fn guest_audio_receives_pcm_blocks_with_segment_times() {
+        #[derive(Default)]
+        struct Received(Vec<(Vec<i16>, (i64, i64), bool)>);
+        let (mut m, graph, _, _) = failure_session();
+        m.ext.insert(Received::default());
+        m.sys.thunks.resolver_mut::<Registry>().unwrap().add(
+            "authored-audio.dll",
+            "Receive",
+            Conv::Stdcall { argc: 2 },
+            |env| {
+                let pointer = env.arg(1);
+                let sample = &state(env).samples[&pointer];
+                let (buffer, actual, time, discontinuity) = (
+                    sample.buffer,
+                    sample.actual,
+                    sample.time.unwrap(),
+                    sample.discontinuity,
+                );
+                let mut bytes = vec![0; actual as usize];
+                env.cpu.read(buffer, &mut bytes).unwrap();
+                let pcm = bytes
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|b| i16::from_le_bytes(*b))
+                    .collect();
+                env.ext
+                    .get_mut::<Received>()
+                    .0
+                    .push((pcm, time, discontinuity));
+                Outcome::Return(S_OK)
+            },
+        );
+        let receive = m.resolve_import("authored-audio.dll", "Receive").unwrap();
+        m.cpu.write_u32(OUTPUT + 0x100, OUTPUT + 0x200).unwrap();
+        m.cpu.write_u32(OUTPUT + 0x200 + 6 * 4, receive).unwrap();
+        let decoder = activate(&mut m, CLSID_MPEG_AUDIO_CODEC, IID_IBASEFILTER);
+        let out = *m.ext.get::<State>().filters[&decoder].pins.last().unwrap();
+        let allocator = sample::create_allocator(&mut env(&mut m), 1, 44100 * 4).unwrap();
+        let state = m.ext.get_mut::<State>();
+        let pin = state.pins.get_mut(&out).unwrap();
+        pin.mem = OUTPUT + 0x100;
+        pin.allocator = allocator;
+        let s = state.sessions.get_mut(&1).unwrap();
+        s.video = None;
+        s.audio_guest = Some(out);
+        s.segment = 10_000;
+        for pts_us in [1000, 2000] {
+            s.pending_audio.push_back(AudioFrame {
+                pts_us,
+                sample_rate: 1000,
+                channels: 2,
+                samples: vec![0.25, -0.5],
+            });
+        }
+        assert_eq!(state.graphs[&graph].volume, 0);
+        let outcome = deliver_audio(&mut env(&mut m), 1, out, |_| Outcome::Return(S_OK));
+        assert_eq!(
+            super::super::graph::source::tests::finish(&mut m, outcome),
+            S_OK
+        );
+        assert_eq!(
+            m.ext.get::<Received>().0,
+            vec![
+                (vec![8192, -16384], (0, 10_000), true),
+                (vec![8192, -16384], (10_000, 20_000), false),
+            ]
+        );
+        assert!(m.ext.get::<State>().sessions[&1].pending_audio.is_empty());
     }
 
     // spec: MEDIA-STREAM-1, DEV-AUDIO-5

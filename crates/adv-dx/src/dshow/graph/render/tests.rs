@@ -21,6 +21,7 @@ struct Renderer {
     connected: BTreeMap<u32, u32>,
     reject_all: bool,
     rejected: u32,
+    audio: bool,
     disconnected: u32,
 }
 
@@ -86,11 +87,16 @@ fn callback(env: &mut Env<'_>) -> Outcome {
             r(VFW_E_NOT_CONNECTED)
         }
         7 => {
-            // ReceiveConnection: validate a real negotiated RGB image type.
             let mt = MediaType::read(env, env.arg(2)).unwrap();
-            assert_eq!(mt.major, MEDIATYPE_VIDEO);
-            assert_eq!(mt.sub, MEDIASUBTYPE_RGB32);
-            assert_eq!(mt.video_geometry(), Some((3, 2, 32)));
+            if env.ext.get::<Renderer>().audio {
+                assert_eq!(mt.major, MEDIATYPE_AUDIO);
+                assert_eq!(mt.sub, MEDIASUBTYPE_PCM);
+                assert_eq!(mt.sample_size, 4);
+            } else {
+                assert_eq!(mt.major, MEDIATYPE_VIDEO);
+                assert_eq!(mt.sub, MEDIASUBTYPE_RGB32);
+                assert_eq!(mt.video_geometry(), Some((3, 2, 32)));
+            }
             let output = env.arg(1);
             env.ext.get_mut::<Renderer>().connected.insert(this, output);
             r(S_OK)
@@ -301,4 +307,47 @@ fn video_render_refusal_is_failure_and_retires_every_failed_connection() {
     assert_eq!(output.peer, 0);
     assert_eq!(output.mem, 0);
     assert_eq!(output.allocator, 0);
+}
+
+#[test]
+// spec: MEDIA-GRAPH-3, MEDIA-GRAPH-5
+fn render_ex_connects_an_existing_guest_audio_renderer() {
+    let (mut m, graph, out) = fixture(false);
+    m.ext.get_mut::<Renderer>().audio = true;
+    let state = m.ext.get_mut::<State>();
+    let decoder = state.pins[&out].filter;
+    state.filters.get_mut(&decoder).unwrap().role = Role::AudioDecoder;
+    for pin in state.pins.values_mut() {
+        if pin.major == MEDIATYPE_VIDEO {
+            pin.major = MEDIATYPE_AUDIO;
+            if let Some(mt) = &mut pin.mt {
+                mt.major = MEDIATYPE_AUDIO;
+            }
+        }
+    }
+    let source = state
+        .filters
+        .values_mut()
+        .find_map(|f| f.source.as_mut())
+        .unwrap();
+    let info = source.info.as_mut().unwrap();
+    info.video = None;
+    info.audio = Some(adv_device::media::AudioInfo {
+        codec: "authored".into(),
+        sample_rate: 44100,
+        channels: 2,
+    });
+    let members = state.graphs[&graph].members.len();
+    let outcome = extended(&mut env(&mut m), graph, out, 1, 0);
+    assert_eq!(finish(&mut m, outcome), S_OK);
+    let state = m.ext.get::<State>();
+    assert_eq!(state.graphs[&graph].members.len(), members);
+    assert_eq!(state.pins[&out].peer, PINS[1]);
+    let allocator = state.pins[&out].allocator;
+    let sample = state.allocators[&allocator].free[0];
+    // A PCM block needs more room than the four-byte PCM frame size.
+    assert_eq!(
+        crate::dshow::tests::method(&mut m, "IMediaSample::GetSize", &[sample]),
+        44100 * 4
+    );
 }
