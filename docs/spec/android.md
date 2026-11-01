@@ -60,7 +60,7 @@ This spec covers the Android player: its package, its lifecycle and input, and t
 
 ### AND-APP-13 Game sessions
 
-**Rule**: The launcher MUST create and drive game sessions on the activity's UI thread, at most one at a time, using the SurfaceView's current window. A session MUST be paused while the activity is paused, audio focus is lost or the overlay holds a pause. Game mode MUST begin when a session starts and end when it finishes.
+**Rule**: The launcher MUST create and drive game sessions on the activity's UI thread, at most one at a time, using the SurfaceView's current window. A session MUST be paused while the activity is paused, audio focus is lost or the overlay holds a pause. Game mode MUST begin when a session starts and end when it finishes, hiding the trackpad cursor.
 **Applies to**: Android
 **Verification**: Review — sessions need the activity's looper and SurfaceView, which only a device provides.
 

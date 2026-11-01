@@ -73,6 +73,7 @@ class MainActivity : TauriActivity() {
             window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             if (resumed) requestAudioFocus()
         } else {
+            container?.setCursor(false, 0f, 0f)
             abandonAudioFocus()
             requestedOrientation = previousOrientation
             if (!previousKeepScreenOn) {
