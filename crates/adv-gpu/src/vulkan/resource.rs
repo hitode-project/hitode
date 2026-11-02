@@ -279,11 +279,7 @@ impl Image {
                         Some(
                             vk::DescriptorImageInfo::default()
                                 .image_view(handle)
-                                .image_layout(if format.has_depth() {
-                                    vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL
-                                } else {
-                                    vk::ImageLayout::GENERAL
-                                }),
+                                .image_layout(binding::sampled_layout(format)),
                         ),
                     )?,
                 );

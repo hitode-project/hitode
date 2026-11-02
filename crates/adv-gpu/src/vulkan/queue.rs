@@ -84,33 +84,37 @@ impl Queue {
         let waiter = std::thread::Builder::new()
             .name("adv-gpu waiter".into())
             .spawn(move || {
+                // Sleeps on the GPU, never on a timer: blocked on the oldest
+                // pending submission, or on messages when none is pending.
                 let mut callbacks: Vec<(u64, Box<dyn FnOnce() + Send>)> = Vec::new();
-                loop {
-                    let message = if callbacks.is_empty()
-                        && backend.state.lock().unwrap().pending.is_empty()
-                    {
-                        receiver
-                            .recv()
-                            .map_err(|_| mpsc::RecvTimeoutError::Disconnected)
-                    } else {
-                        receiver.recv_timeout(Duration::from_millis(1))
+                let mut stop = false;
+                while !stop {
+                    let mut handle = |message| match message {
+                        Message::Wake => {}
+                        Message::Callback(token, callback) => callbacks.push((token, callback)),
+                        Message::Stop => stop = true,
                     };
-                    match message {
-                        Ok(Message::Wake) => {}
-                        Ok(Message::Callback(token, callback)) => callbacks.push((token, callback)),
-                        Ok(Message::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    if !backend.wait_oldest() {
+                        handle(receiver.recv().unwrap_or(Message::Stop));
                     }
-                    if let Ok(token) = backend.poll() {
-                        let mut i = 0;
-                        while i < callbacks.len() {
-                            if callbacks[i].0 <= token.0 {
-                                let (_, callback) = callbacks.remove(i);
-                                callback();
-                            } else {
-                                i += 1;
+                    loop {
+                        match receiver.try_recv() {
+                            Ok(message) => handle(message),
+                            Err(mpsc::TryRecvError::Empty) => break,
+                            Err(mpsc::TryRecvError::Disconnected) => {
+                                handle(Message::Stop);
+                                break;
                             }
                         }
+                    }
+                    if let Ok(Token(completed)) = backend.poll() {
+                        callbacks.retain_mut(|(token, callback)| {
+                            if *token > completed {
+                                return true;
+                            }
+                            std::mem::replace(callback, Box::new(|| {}))();
+                            false
+                        });
                     }
                 }
                 let _ = backend
@@ -268,6 +272,45 @@ impl Queue {
     }
 }
 impl Shared {
+    /// Blocks until the oldest pending submission completes. False, without
+    /// blocking, when nothing is pending or the device is lost.
+    fn wait_oldest(&self) -> bool {
+        let Some((token, fence)) = self
+            .state
+            .lock()
+            .unwrap()
+            .pending
+            .front()
+            .map(|s| (s.token, s.fence))
+        else {
+            return false;
+        };
+        if self.context.lost.load(Ordering::Relaxed) {
+            return false;
+        }
+        // A submit or poll elsewhere only advances state; a fence reset
+        // after it signalled at worst delays this wake to its next use.
+        let result = unsafe {
+            if self.timeline != vk::Semaphore::null() {
+                let semaphores = [self.timeline];
+                let values = [token];
+                let info = vk::SemaphoreWaitInfo::default()
+                    .semaphores(&semaphores)
+                    .values(&values);
+                if self.context.api >= vk::API_VERSION_1_2 {
+                    self.context.device.wait_semaphores(&info, u64::MAX)
+                } else {
+                    self.context.timeline.wait_semaphores(&info, u64::MAX)
+                }
+            } else {
+                self.context
+                    .device
+                    .wait_for_fences(&[fence], true, u64::MAX)
+            }
+        };
+        let _ = self.context.result(result);
+        true
+    }
     fn poll(&self) -> Result<Token> {
         self.context.check()?;
         let mut state = self.state.lock().unwrap();

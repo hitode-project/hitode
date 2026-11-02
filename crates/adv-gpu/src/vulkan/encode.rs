@@ -1,5 +1,6 @@
 use super::resource::{ImageCore, ImageState};
 use super::*;
+use arrayvec::ArrayVec;
 use ash::vk::Handle;
 
 /// What a submission owns until it completes. Objects it uses need no
@@ -15,6 +16,8 @@ pub(crate) struct Encoder {
     pub(super) resources: Resources,
     pub(super) error: Option<Error>,
     pub(super) submitted: bool,
+    /// No work recorded since the last memory barrier.
+    pub(super) synced: bool,
     originals: Vec<(Arc<ImageCore>, Vec<ImageState>)>,
     pub(super) commands: Vec<vk::CommandBuffer>,
 }
@@ -80,6 +83,7 @@ impl Encoder {
             resources: Resources::default(),
             error: None,
             submitted: false,
+            synced: false,
             originals: Vec::new(),
             commands: Vec::new(),
         };
@@ -122,10 +126,13 @@ impl Encoder {
     pub(super) fn ready(&self) -> bool {
         self.error.is_none()
     }
+    /// Orders all earlier work, including earlier submissions, before what
+    /// follows. Skipped when nothing was recorded since the last one.
     pub(super) fn memory_barrier(&mut self) {
-        if !self.ready() {
+        if !self.ready() || self.synced {
             return;
         }
+        self.synced = true;
         let context = &self.shared.context;
         unsafe {
             if context.caps.modern.contains(Modern::SYNCHRONIZATION2) {
@@ -319,12 +326,13 @@ impl Encoder {
         let timestamp = self.timestamp_start(desc.timestamps);
         let modern = self.shared.context.caps.modern;
         let none = modern.contains(Modern::LOAD_STORE_OP_NONE);
-        let mut attachments = Vec::new();
-        let mut views = Vec::new();
-        let mut clears = Vec::new();
-        let mut colors = Vec::new();
-        let mut resolves = Vec::new();
-        let mut dynamic_colors = Vec::new();
+        // Colors, their resolves and depth: no allocation per pass.
+        let mut attachments = ArrayVec::<_, 17>::new();
+        let mut views = ArrayVec::<_, 17>::new();
+        let mut clears = ArrayVec::<_, 17>::new();
+        let mut colors = ArrayVec::<_, 8>::new();
+        let mut resolves = ArrayVec::<_, 8>::new();
+        let mut dynamic_colors = ArrayVec::<_, 8>::new();
         let mut depth_info = vk::RenderingAttachmentInfo::default();
         let mut stencil_info = vk::RenderingAttachmentInfo::default();
         let mut depth_ref = None;
@@ -659,6 +667,7 @@ impl Encoder {
             return;
         }
         let regions = buffer_image_copies(src, dst, size);
+        self.synced = false;
         unsafe {
             self.shared.context.device.cmd_copy_buffer_to_image(
                 self.command,
@@ -686,6 +695,7 @@ impl Encoder {
             return;
         }
         let regions = buffer_image_copies(dst, src, size);
+        self.synced = false;
         unsafe {
             self.shared.context.device.cmd_copy_image_to_buffer(
                 self.command,
@@ -767,6 +777,7 @@ impl Encoder {
                     .extent(extent)
             })
             .collect();
+        self.synced = false;
         unsafe {
             self.shared.context.device.cmd_copy_image(
                 self.command,
@@ -788,6 +799,7 @@ impl Encoder {
         if !self.ready() {
             return;
         }
+        self.synced = false;
         unsafe {
             self.shared.context.device.cmd_copy_buffer(
                 self.command,
@@ -806,6 +818,7 @@ impl Encoder {
         if !self.ready() {
             return;
         }
+        self.synced = false;
         unsafe {
             self.shared.context.device.cmd_fill_buffer(
                 self.command,
@@ -830,6 +843,7 @@ impl Encoder {
         if !self.ready() {
             return;
         }
+        self.synced = false;
         unsafe {
             self.shared.context.device.cmd_copy_query_pool_results(
                 self.command,
@@ -1058,7 +1072,6 @@ impl Drop for RenderPass<'_> {
         if self.encoder.ready() {
             let command = self.encoder.command;
             self.encoder.command = self.preamble;
-            self.encoder.memory_barrier();
             for &(pool, index) in &self.resets {
                 unsafe {
                     self.encoder.shared.context.device.cmd_reset_query_pool(
@@ -1146,10 +1159,12 @@ impl RenderPass<'_> {
             pipeline.is_some() || !self.encoder.ready(),
             "draw without a pipeline"
         );
-        pipeline.is_some_and(|p| {
+        let ready = pipeline.is_some_and(|p| {
             self.bindings
                 .flush(self.encoder, p, vk::PipelineBindPoint::GRAPHICS)
-        })
+        });
+        self.encoder.synced &= !ready;
+        ready
     }
     pub(crate) fn draw(&mut self, vertices: std::ops::Range<u32>, instances: std::ops::Range<u32>) {
         if self.prepare() {
@@ -1373,10 +1388,12 @@ impl ComputePass<'_> {
             pipeline.is_some() || !self.encoder.ready(),
             "dispatch without a pipeline"
         );
-        pipeline.is_some_and(|p| {
+        let ready = pipeline.is_some_and(|p| {
             self.bindings
                 .flush(self.encoder, p, vk::PipelineBindPoint::COMPUTE)
-        })
+        });
+        self.encoder.synced &= !ready;
+        ready
     }
     pub(crate) fn dispatch(&mut self, x: u32, y: u32, z: u32) {
         self.encoder.memory_barrier();
