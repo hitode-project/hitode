@@ -10,6 +10,9 @@ use crate::plan::{CompositorCaps, Layers, Tiles};
 use adv_gpu::{PresentImage, Token, queue::Fence};
 use std::time::Instant;
 
+#[cfg(any(target_os = "android", test))]
+pub mod android;
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Presented {
     pub serial: u64,

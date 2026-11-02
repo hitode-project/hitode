@@ -27,5 +27,17 @@ objc2-quartz-core = { version = "0.3.2", default-features = false, features = ["
 name = "core_animation"
 harness = false
 
+[target.'cfg(target_os = "android")'.dependencies]
+ndk-sys = "0.6"
+libc = "0.2"
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
+
+[[example]]
+name = "display-probe"
+path = "../../tools/android/display-probe/probe.rs"
+crate-type = ["cdylib"]
+
 [lints]
 workspace = true

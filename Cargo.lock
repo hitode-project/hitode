@@ -115,6 +115,8 @@ dependencies = [
  "adv-gpu",
  "arrayvec",
  "dispatch2",
+ "libc",
+ "ndk-sys",
  "objc2",
  "objc2-core-foundation",
  "objc2-core-graphics",

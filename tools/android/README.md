@@ -12,6 +12,31 @@ toolchain is NDK r28c, cargo-ndk 4.1.2, Rust 1.98.1 and JDK 21. The Unicorn test
 oracle additionally uses the existing MSYS shell at `C:/msys64/usr/bin/sh.exe`.
 Test-only Unicorn never enters an application's dependency graph.
 
+## SurfaceControl display probe
+
+The Java-free NativeActivity probe needs SDK platform and build-tools 36, NDK
+r28c, JDK 21, cargo-ndk and the `aarch64-linux-android` Rust target. With
+`ANDROID_HOME`, `ANDROID_NDK_HOME` and `JAVA_HOME` set, build from the repository
+root:
+
+```sh
+RUSTC_WRAPPER=sccache CARGO_TARGET_DIR="$PWD/target-android" \
+  python3 tools/android/display-probe/build.py
+```
+
+The script signs `target-android/display-probe/display-probe.apk` with the
+existing Android debug keystore. The activity presents 600 moving-bar frames
+through SurfaceControl and finishes. Logcat tag `adv-display-probe` reports
+present CPU nanoseconds, latch minus desired time, shown minus latch, releases,
+pool ages, and minimum, median and p95 summaries. The diagnostic system property
+`debug.adv.probe.rotation` accepts 0 (default), 90, 180 or 270 and is read when a
+window is created.
+
+Presentable pools survive window destruction. A replacement window reattaches
+the newest buffer with an empty GPU submission, preserving its pixels.
+Compositor teardown waits up to one second for detach completion; if no fence
+arrives, its outstanding buffer leases are retained to prevent unsafe reuse.
+
 ## CPU tests in the adb shell
 
 ```powershell

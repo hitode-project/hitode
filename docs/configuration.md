@@ -9,6 +9,14 @@ Kinds:
 - **Diagnostic** only observes or checks.
 - **Fixture** controls self-written tests and the conditions they run under.
 
+## Android display probe
+
+The `debug.adv.probe.rotation` Android system property is diagnostic. Its default
+is 0; 90, 180 and 270 select the base layer's SurfaceControl rotation. The
+NativeActivity probe reads it on window creation. See
+[the Android tools](../tools/android/README.md#surfacecontrol-display-probe) for
+the build command and timing output.
+
 ## Launcher upscaling
 
 The global filter offers Off, Anime4K, CuNNy, ArtCNN and k7_modernAnime; Off is the default.
