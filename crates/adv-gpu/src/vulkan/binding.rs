@@ -691,8 +691,7 @@ impl Bindings {
                 self.values
                     .push(self.slots[group(b.kind) as usize][b.slot as usize]);
             }
-            let (set, new) =
-                encoder.descriptor_set(compiled.set_layout, &compiled.bindings, &self.values)?;
+            let (set, new) = encoder.descriptor_set(compiled.set_layout, &self.values)?;
             if !new {
                 unsafe {
                     encoder.shared.context.device.cmd_bind_descriptor_sets(
@@ -815,7 +814,6 @@ impl DescriptorArena {
         &mut self,
         context: &Context,
         layout: vk::DescriptorSetLayout,
-        bindings: &[Binding],
         key: &[Bound],
     ) -> Result<(vk::DescriptorSet, bool)> {
         if let Some(&set) = self.sets.get(key) {
@@ -838,17 +836,19 @@ impl DescriptorArena {
                 Err(error) => return context.result(Err(error)),
             }
         }
-        let mut counts = HashMap::new();
-        for b in bindings {
-            *counts.entry(descriptor(b.kind)).or_insert(0) += 256;
-        }
-        let sizes: Vec<_> = counts
-            .into_iter()
-            .map(|(ty, descriptor_count)| vk::DescriptorPoolSize {
-                ty,
-                descriptor_count,
-            })
-            .collect();
+        // Every pool holds every kind: a set may only come from a pool sized
+        // for its descriptor types, whichever layout first needed a pool.
+        let sizes = [
+            vk::DescriptorType::UNIFORM_BUFFER,
+            vk::DescriptorType::SAMPLED_IMAGE,
+            vk::DescriptorType::SAMPLER,
+            vk::DescriptorType::STORAGE_IMAGE,
+            vk::DescriptorType::STORAGE_BUFFER,
+        ]
+        .map(|ty| vk::DescriptorPoolSize {
+            ty,
+            descriptor_count: 1024,
+        });
         let pool = context.result(unsafe {
             context.device.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
