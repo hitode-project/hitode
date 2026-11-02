@@ -177,11 +177,17 @@ impl Queue {
             );
         }
     }
-    pub(crate) fn export_fence(&mut self, _token: Token) -> Result<crate::queue::Fence> {
-        todo!("B3")
+    /// Metal tracks hazards and Core Animation needs no queue transfer, so a
+    /// hand-off is a plain submit and there is no acquire fence.
+    pub(crate) fn submit_present(
+        &mut self,
+        encoder: crate::Encoder,
+        _buffers: &[(&super::Image, &super::PresentBuffer)],
+    ) -> Result<(Token, Option<super::Fence>)> {
+        Ok((self.submit(encoder)?, None))
     }
-    pub(crate) fn wait_fence(&mut self, _fence: crate::queue::Fence) -> Result<()> {
-        todo!("B3")
+    pub(crate) fn wait_next(&mut self, fence: super::Fence) {
+        match fence {}
     }
 }
 

@@ -371,57 +371,49 @@ impl Device {
     pub(crate) fn lost(&self) -> Option<String> {
         self.0.lost.load(Ordering::Relaxed).then(|| LOST.into())
     }
-    pub(crate) fn create_present_pool(&self, _desc: &PoolDesc) -> Result<crate::PresentPool> {
-        todo!("A3")
-    }
 }
 
 pub(crate) use pipeline::{ComputePipeline, PipelineCache, RenderPipeline};
 pub(crate) use shader::Shader;
 
-pub(crate) struct Fence;
+pub(crate) use encode::{ComputePass, Encoder, RenderPass};
+pub(crate) use queue::Queue;
+pub(crate) use resource::{Buffer, Image, ImageView, QuerySet, Sampler, SamplerCore};
+pub(crate) use ring::{Ring, Span};
+
+/// A sync file descriptor from or for the system compositor.
+#[cfg(target_os = "android")]
+pub(crate) struct Fence(pub(crate) std::os::fd::OwnedFd);
+#[cfg(target_os = "android")]
 impl Fence {
-    #[cfg(unix)]
-    pub(crate) fn into_fd(self) -> Option<std::os::fd::OwnedFd> {
-        todo!("A3")
-    }
-    #[cfg(unix)]
-    pub(crate) fn from_fd(_fd: std::os::fd::OwnedFd) -> crate::queue::Fence {
-        todo!("A3")
+    pub(crate) fn duplicate(&self) -> Result<Self> {
+        self.0
+            .try_clone()
+            .map(Self)
+            .map_err(|e| Error::Unavailable(format!("sync fd: {e}")))
     }
 }
-pub(crate) struct PresentPool;
-impl PresentPool {
-    pub(crate) fn acquire(&mut self) -> Option<crate::PresentImage> {
-        todo!("A3")
-    }
-    pub(crate) fn trim(&mut self, _keep: u32) {
-        todo!("A3")
+/// No compositor fences exist without presentable buffers.
+#[cfg(not(target_os = "android"))]
+pub(crate) enum Fence {}
+#[cfg(not(target_os = "android"))]
+impl Fence {
+    pub(crate) fn duplicate(&self) -> Result<Self> {
+        match *self {}
     }
 }
-pub(crate) struct PresentImage;
-impl PresentImage {
-    pub(crate) fn image(&self) -> &crate::Image {
-        todo!("A3")
-    }
-    pub(crate) fn age(&self) -> Option<u32> {
+
+/// One presentable buffer: an imported AHardwareBuffer on Android. Other
+/// targets report no presentable formats, so none is ever created there.
+pub(crate) struct PresentBuffer;
+impl PresentBuffer {
+    pub(crate) fn new(_device: &Device, _desc: &PoolDesc) -> Result<(crate::Image, Self)> {
         todo!("A3")
     }
     pub(crate) fn export(&self) -> Export<'_> {
         todo!("A3")
     }
-    pub(crate) fn presented(&mut self, _written: Token) {
-        todo!("A3")
-    }
-    pub(crate) fn released(self, _fence: Option<crate::queue::Fence>) {
-        todo!("A3")
-    }
 }
-
-pub(crate) use encode::{ComputePass, Encoder, RenderPass};
-pub(crate) use queue::Queue;
-pub(crate) use resource::{Buffer, Image, ImageView, QuerySet, Sampler, SamplerCore};
-pub(crate) use ring::{Ring, Span};
 
 #[cfg(test)]
 mod tests;

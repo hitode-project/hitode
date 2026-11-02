@@ -264,10 +264,20 @@ impl Queue {
             .unwrap()
             .send(Message::Callback(token.0, callback));
     }
-    pub(crate) fn export_fence(&mut self, _token: Token) -> Result<crate::queue::Fence> {
+    /// Ends `encoder` with the hand-off of `buffers` to the compositor and
+    /// returns the acquire fence the same batch signals.
+    pub(crate) fn submit_present(
+        &mut self,
+        encoder: crate::Encoder,
+        buffers: &[(&super::Image, &super::PresentBuffer)],
+    ) -> Result<(Token, Option<super::Fence>)> {
+        if buffers.is_empty() {
+            return Ok((self.submit(encoder)?, None));
+        }
         todo!("A3")
     }
-    pub(crate) fn wait_fence(&mut self, _fence: crate::queue::Fence) -> Result<()> {
+    /// Makes the next submission wait on a compositor release fence.
+    pub(crate) fn wait_next(&mut self, _fence: super::Fence) {
         todo!("A3")
     }
 }
