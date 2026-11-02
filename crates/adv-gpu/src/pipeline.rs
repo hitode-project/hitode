@@ -78,7 +78,10 @@ bitflags::bitflags! {
 ///
 /// The backend rewrites these declarations to its own binding model
 /// (bindless heap indices, push descriptors, descriptor sets or Metal
-/// argument indices) before lowering, so shaders never see it.
+/// argument indices) before lowering, so shaders never see it. Metal gives
+/// uniform `b#` `buffer(#)`, storage buffer `u#` `buffer(29 - #)`, sampled
+/// `t#` `texture(#)`, storage image `u#` `texture(95 - #)` and `s#`
+/// `sampler(#)`; a stage whose indices meet in one table is rejected.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Binding {
     pub slot: u32,

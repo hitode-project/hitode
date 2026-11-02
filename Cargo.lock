@@ -162,8 +162,12 @@ dependencies = [
  "arrayvec",
  "ash",
  "bitflags 2.13.2",
+ "block2",
  "gpu-allocator",
  "naga",
+ "objc2",
+ "objc2-foundation",
+ "objc2-metal",
 ]
 
 [[package]]

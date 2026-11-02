@@ -96,6 +96,25 @@
 //! stored, and no scratch targets are needed. Adreno 750 behaves the same
 //! with either `renderArea` or the scissor.
 
+/// Opens a device for a backend's internal tests, or returns from the test
+/// where the target has none, unless `ADV_GPU_REQUIRE_BACKEND` is set (the
+/// conformance suite's rule).
+#[cfg(test)]
+macro_rules! test_device {
+    ($options:expr) => {
+        match crate::Device::open(&$options) {
+            Ok(opened) => opened,
+            Err(crate::Error::Unavailable(reason))
+                if std::env::var_os("ADV_GPU_REQUIRE_BACKEND").is_none() =>
+            {
+                eprintln!("skipped: {reason}");
+                return;
+            }
+            Err(error) => panic!("open device: {error}"),
+        }
+    };
+}
+
 #[cfg(target_vendor = "apple")]
 mod metal;
 #[cfg(target_vendor = "apple")]

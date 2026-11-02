@@ -54,7 +54,6 @@ impl Encoder {
     pub(super) fn descriptor_set(
         &mut self,
         layout: vk::DescriptorSetLayout,
-        bindings: &[Binding],
         key: &[binding::Bound],
     ) -> Result<(vk::DescriptorSet, bool)> {
         if self.resources.descriptors.is_none() {
@@ -68,12 +67,11 @@ impl Encoder {
             arena.reset(&self.shared.context)?;
             self.resources.descriptors = Some(arena);
         }
-        self.resources.descriptors.as_mut().unwrap().get(
-            &self.shared.context,
-            layout,
-            bindings,
-            key,
-        )
+        self.resources
+            .descriptors
+            .as_mut()
+            .unwrap()
+            .get(&self.shared.context, layout, key)
     }
     pub(super) fn new(shared: Arc<queue::Shared>) -> Self {
         shared.context.open.fetch_add(1, Ordering::AcqRel);

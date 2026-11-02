@@ -91,9 +91,11 @@ pub struct ComputePassDesc<'a> {
 /// index in one bindless heap (descriptor indexing, update after bind), and
 /// `bind` writes that index and any offset into the draw's push constants: no
 /// descriptor work per draw. Older drivers use push descriptors (Adreno 6xx)
-/// or descriptor sets cached by content (Mali G76). On Metal `bind` is a
-/// direct `set*` call, the cheapest binding on Apple5 (argument buffers are
-/// only tier 1 there). Vertex streams bind as storage buffers.
+/// or descriptor sets cached by content (Mali G76). On Metal each slot owns a
+/// fixed argument index; `bind` records the resource and each draw issues
+/// direct `set*` calls (`set*BufferOffset` when only the offset moved) for the
+/// changed slots its stages read, the cheapest binding on Apple5 (argument
+/// buffers are only tier 1 there). Vertex streams bind as storage buffers.
 #[derive(Clone, Copy)]
 pub enum Bind<'a> {
     Uniform(BufferSlice<'a>),
@@ -157,6 +159,10 @@ impl Encoder {
     pub fn retain(&mut self, span: Span) {
         self.inner.retain(span)
     }
+    /// Copy query results into `dst` as 64-bit values. They are there when
+    /// this submission's token completes; read them on the host, not from
+    /// later commands of this encoder (Metal resolves timestamps after the
+    /// submission's work, since earlier resolves lose samples).
     pub fn resolve_queries(
         &mut self,
         set: &QuerySet,
