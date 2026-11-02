@@ -198,9 +198,9 @@ impl Encoder {
             for mip in mips.clone() {
                 let index = (layer * image.desc().mips + mip) as usize;
                 let old = states[index];
-                #[cfg(any(target_os = "android", test))]
+                #[cfg(target_os = "android")]
                 let (src_family, dst_family) = old.queue_families(layout, context.family);
-                #[cfg(not(any(target_os = "android", test)))]
+                #[cfg(not(target_os = "android"))]
                 let (src_family, dst_family) = (vk::QUEUE_FAMILY_IGNORED, vk::QUEUE_FAMILY_IGNORED);
                 let range = vk::ImageSubresourceRange::default()
                     .aspect_mask(formats::aspect(image.desc().format))
@@ -252,7 +252,7 @@ impl Encoder {
                     layout,
                     access,
                     stage,
-                    #[cfg(any(target_os = "android", test))]
+                    #[cfg(target_os = "android")]
                     family: if layout == vk::ImageLayout::PRESENT_SRC_KHR {
                         vk::QUEUE_FAMILY_FOREIGN_EXT
                     } else {

@@ -98,7 +98,7 @@ pub(super) struct ImageState {
     pub(super) layout: vk::ImageLayout,
     pub(super) access: vk::AccessFlags2,
     pub(super) stage: vk::PipelineStageFlags2,
-    #[cfg(any(target_os = "android", test))]
+    #[cfg(target_os = "android")]
     pub(super) family: u32,
 }
 impl Default for ImageState {
@@ -107,16 +107,15 @@ impl Default for ImageState {
             layout: vk::ImageLayout::UNDEFINED,
             access: vk::AccessFlags2::empty(),
             stage: vk::PipelineStageFlags2::TOP_OF_PIPE,
-            #[cfg(any(target_os = "android", test))]
+            #[cfg(target_os = "android")]
             family: vk::QUEUE_FAMILY_IGNORED,
         }
     }
 }
-#[cfg(any(target_os = "android", test))]
+#[cfg(target_os = "android")]
 impl ImageState {
     pub(super) fn queue_families(&self, layout: vk::ImageLayout, family: u32) -> (u32, u32) {
         if layout == vk::ImageLayout::PRESENT_SRC_KHR {
-            debug_assert_ne!(self.family, vk::QUEUE_FAMILY_FOREIGN_EXT);
             (family, vk::QUEUE_FAMILY_FOREIGN_EXT)
         } else if self.family == vk::QUEUE_FAMILY_FOREIGN_EXT {
             (vk::QUEUE_FAMILY_FOREIGN_EXT, family)

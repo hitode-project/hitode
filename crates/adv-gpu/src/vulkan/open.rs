@@ -314,10 +314,6 @@ impl Device {
                 }
                 names.push(name.as_ptr());
             }
-            #[cfg(target_os = "android")]
-            if has(ash::ext::image_compression_control::NAME) {
-                names.push(ash::ext::image_compression_control::NAME.as_ptr());
-            }
             let families = instance.get_physical_device_queue_family_properties(physical);
             let family = families
                 .iter()
@@ -639,19 +635,7 @@ impl Device {
             }
             let memory = instance.get_physical_device_memory_properties(physical);
             #[cfg(target_os = "android")]
-            let present_caps = match present::capabilities(
-                instance,
-                &device,
-                props.vendor_id,
-                memory.memory_type_count,
-                has(ash::ext::image_compression_control::NAME),
-            ) {
-                Ok(caps) => caps,
-                Err(error) => {
-                    device.destroy_device(None);
-                    return Err(error);
-                }
-            };
+            let present_caps = present::capabilities(props.vendor_id);
             #[cfg(target_os = "android")]
             if present_caps.contains(FormatCaps::PRESENTABLE) {
                 feature_bits |= Features::PRESENTABLE_BUFFERS;

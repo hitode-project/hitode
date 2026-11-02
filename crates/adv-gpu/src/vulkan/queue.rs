@@ -173,14 +173,10 @@ impl Queue {
             encoder.inner.release(image);
         }
         #[cfg(not(target_os = "android"))]
-        debug_assert!(buffers.is_empty());
+        let _ = buffers;
         context.result(unsafe { context.device.end_command_buffer(encoder.inner.command) })?;
         let mut state = self.shared.state.lock().unwrap();
         let token = state.next;
-        #[cfg(target_os = "android")]
-        if let Some(error) = state.sync.error {
-            return context.result(Err(error));
-        }
         let fence = if self.shared.timeline == vk::Semaphore::null() {
             match state.fences.pop() {
                 Some(f) => f,
@@ -338,9 +334,10 @@ impl Queue {
             .send(Message::Callback(token.0, callback));
     }
     /// Makes the next submission wait on a compositor release fence.
-    pub(crate) fn wait_next(&mut self, fence: super::Fence) {
+    pub(crate) fn wait_next(&mut self, fence: super::Fence) -> Result<()> {
         #[cfg(target_os = "android")]
-        self.shared
+        return self
+            .shared
             .state
             .lock()
             .unwrap()

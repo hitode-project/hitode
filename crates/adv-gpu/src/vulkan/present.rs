@@ -53,7 +53,6 @@ unsafe extern "C" {
         desc: *const HardwareBufferDesc,
         out: *mut *mut vk::AHardwareBuffer,
     ) -> i32;
-    fn AHardwareBuffer_describe(buffer: *const vk::AHardwareBuffer, desc: *mut HardwareBufferDesc);
     fn AHardwareBuffer_release(buffer: *mut vk::AHardwareBuffer);
     fn AHardwareBuffer_isSupported(desc: *const HardwareBufferDesc) -> i32;
 }
@@ -70,23 +69,13 @@ impl Drop for HardwareBuffer {
 }
 pub(crate) struct PresentBuffer(HardwareBuffer);
 impl PresentBuffer {
+    /// The pool has validated format and size.
     pub(crate) fn new(device: &Device, desc: &PoolDesc) -> Result<(crate::Image, Self)> {
-        if !device
-            .caps()
-            .format(desc.format)
-            .contains(FormatCaps::PRESENTABLE)
-            || desc.width == 0
-            || desc.height == 0
-            || desc.width.max(desc.height) > device.caps().limits.max_image_2d
-        {
-            return Err(Error::Invalid(format!("present buffer {desc:?}")));
-        }
         let context = &device.0;
         let (handle, memory, buffer) = allocate(
             &context.device,
             &context.ahb,
             &HardwareBufferDesc::new(desc.width, desc.height, context.vendor),
-            context.memory.memory_type_count,
         )?;
         let image = Image::wrap(ImageCore {
             context: context.clone(),
@@ -124,7 +113,6 @@ fn allocate(
     device: &ash::Device,
     ahb: &ash::android::external_memory_android_hardware_buffer::Device,
     requested: &HardwareBufferDesc,
-    memory_types: u32,
 ) -> Result<(vk::Image, vk::DeviceMemory, HardwareBuffer)> {
     let mut pointer = std::ptr::null_mut();
     // SAFETY: NDK descriptions have the C layout; all handles and pNext chains
@@ -132,27 +120,14 @@ fn allocate(
     unsafe {
         match AHardwareBuffer_allocate(requested, &mut pointer) {
             0 => {}
-            -12 | 12 => return Err(Error::OutOfMemory), // ENOMEM
+            -12 => return Err(Error::OutOfMemory), // -ENOMEM
             error => {
                 return Err(Error::Unavailable(format!(
                     "AHardwareBuffer allocation: {error}"
                 )));
             }
         }
-        let buffer = HardwareBuffer(
-            NonNull::new(pointer)
-                .ok_or_else(|| Error::Unavailable("null AHardwareBuffer".into()))?,
-        );
-        let mut actual = HardwareBufferDesc::default();
-        AHardwareBuffer_describe(pointer, &mut actual);
-        if actual.width != requested.width
-            || actual.height != requested.height
-            || actual.layers != requested.layers
-            || actual.format != requested.format
-            || actual.usage & requested.usage != requested.usage
-        {
-            return Err(Error::Unavailable("AHardwareBuffer description".into()));
-        }
+        let buffer = HardwareBuffer(NonNull::new_unchecked(pointer));
         let mut format = vk::AndroidHardwareBufferFormatPropertiesANDROID::default();
         let mut properties =
             vk::AndroidHardwareBufferPropertiesANDROID::default().push_next(&mut format);
@@ -160,14 +135,6 @@ fn allocate(
             .map_err(vk_error)?;
         let (allocation_size, memory_type_bits) =
             (properties.allocation_size, properties.memory_type_bits);
-        if format.format != formats::vk(FORMAT)
-            || memory_type_bits.trailing_zeros() >= memory_types
-            || allocation_size == 0
-        {
-            return Err(Error::Unavailable(
-                "AHardwareBuffer import properties".into(),
-            ));
-        }
         let mut external = vk::ExternalMemoryImageCreateInfo::default()
             .handle_types(vk::ExternalMemoryHandleTypeFlags::ANDROID_HARDWARE_BUFFER_ANDROID);
         let handle = device
@@ -214,50 +181,17 @@ fn allocate(
     }
 }
 
-pub(super) fn capabilities(
-    instance: &ash::Instance,
-    device: &ash::Device,
-    vendor: u32,
-    memory_types: u32,
-    compression: bool,
-) -> Result<FormatCaps> {
+/// Presentable caps of [`FORMAT`]. Compression follows the vendor:
+/// `VK_EXT_image_compression_control` reports lossless and uncompressed
+/// images alike as `DEFAULT`, so no query proves it; `present_cost` does.
+pub(super) fn capabilities(vendor: u32) -> FormatCaps {
     if unsafe { AHardwareBuffer_isSupported(&HardwareBufferDesc::new(64, 64, vendor)) } == 0 {
-        return Ok(FormatCaps::empty());
+        FormatCaps::empty()
+    } else if matches!(vendor, QUALCOMM | ARM) {
+        FormatCaps::PRESENTABLE | FormatCaps::PRESENTABLE_COMPRESSED
+    } else {
+        FormatCaps::PRESENTABLE
     }
-    let mut compressed = matches!(vendor, QUALCOMM | ARM);
-    if compression {
-        let ahb =
-            ash::android::external_memory_android_hardware_buffer::Device::new(instance, device);
-        let (image, memory, _buffer) = allocate(
-            device,
-            &ahb,
-            &HardwareBufferDesc::new(64, 64, vendor),
-            memory_types,
-        )?;
-        let mut properties = vk::ImageCompressionPropertiesEXT::default();
-        let mut layout = vk::SubresourceLayout2EXT::default().push_next(&mut properties);
-        unsafe {
-            ash::ext::image_compression_control::Device::new(instance, device)
-                .get_image_subresource_layout2(
-                    image,
-                    &vk::ImageSubresource2EXT::default().image_subresource(
-                        vk::ImageSubresource::default().aspect_mask(vk::ImageAspectFlags::COLOR),
-                    ),
-                    &mut layout,
-                );
-            device.destroy_image(image, None);
-            device.free_memory(memory, None);
-        }
-        // DEFAULT rules out fixed-rate compression, but does not prove
-        // lossless storage; it still needs the vendor's allocation policy.
-        compressed &= properties.image_compression_flags == vk::ImageCompressionFlagsEXT::DEFAULT;
-    }
-    Ok(FormatCaps::PRESENTABLE
-        | if compressed {
-            FormatCaps::PRESENTABLE_COMPRESSED
-        } else {
-            FormatCaps::empty()
-        })
 }
 
 /// Permanent payloads are unsignaled: waits consume temporary imports and
@@ -268,7 +202,6 @@ pub(super) struct Semaphores {
     pub(super) waits: Vec<vk::Semaphore>,
     pub(super) stages: Vec<vk::PipelineStageFlags>,
     retired: VecDeque<(u64, vk::Semaphore)>,
-    pub(super) error: Option<vk::Result>,
 }
 impl Semaphores {
     pub(super) fn semaphore(
@@ -287,31 +220,27 @@ impl Semaphores {
             )
         }
     }
-    pub(super) fn wait_next(&mut self, context: &Context, fence: Fence) {
-        let result = self.semaphore(context).and_then(|semaphore| {
-            let result = unsafe {
-                context.semaphore_fd.import_semaphore_fd(
-                    &vk::ImportSemaphoreFdInfoKHR::default()
-                        .semaphore(semaphore)
-                        .flags(vk::SemaphoreImportFlags::TEMPORARY)
-                        .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD)
-                        .fd(fence.0.as_raw_fd()),
-                )
-            };
-            if let Err(error) = result {
-                unsafe { context.device.destroy_semaphore(semaphore, None) };
-                return Err(error);
-            }
-            let _ = fence.0.into_raw_fd(); // Vulkan owns it after a successful import.
-            self.waits.push(semaphore);
-            self.stages.push(
-                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT | vk::PipelineStageFlags::TRANSFER,
-            );
-            Ok(())
-        });
+    pub(super) fn wait_next(&mut self, context: &Context, fence: Fence) -> Result<()> {
+        let semaphore = self.semaphore(context).map_err(vk_error)?;
+        let result = unsafe {
+            context.semaphore_fd.import_semaphore_fd(
+                &vk::ImportSemaphoreFdInfoKHR::default()
+                    .semaphore(semaphore)
+                    .flags(vk::SemaphoreImportFlags::TEMPORARY)
+                    .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD)
+                    .fd(fence.0.as_raw_fd()),
+            )
+        };
         if let Err(error) = result {
-            self.error.get_or_insert(error);
+            self.free.push(semaphore);
+            return Err(vk_error(error));
         }
+        let _ = fence.0.into_raw_fd(); // Vulkan owns it after a successful import.
+        self.waits.push(semaphore);
+        self.stages.push(
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT | vk::PipelineStageFlags::TRANSFER,
+        );
+        Ok(())
     }
     pub(super) fn submitted(&mut self, token: u64) {
         self.retired
@@ -333,14 +262,8 @@ impl Semaphores {
         } {
             Ok(fd) => {
                 self.retired.push_back((token, semaphore));
-                // Vulkan may return -1 for a payload that has already signaled.
-                if fd == -1 {
-                    return Ok(None);
-                }
-                if fd < 0 {
-                    return Err(Error::Unavailable("invalid sync fd".into()));
-                }
-                Ok(Some(Fence(unsafe { OwnedFd::from_raw_fd(fd) })))
+                // -1 stands for a payload that has already signaled.
+                Ok((fd != -1).then(|| Fence(unsafe { OwnedFd::from_raw_fd(fd) })))
             }
             Err(error) => {
                 context.retire(Retired::Semaphore(semaphore));

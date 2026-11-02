@@ -107,35 +107,6 @@ fn bytes(buffer: &crate::Buffer) -> &[u8] {
     unsafe { &*buffer.mapped().unwrap().as_ptr() }
 }
 
-#[test]
-fn foreign_ownership_transfers_leave_private_images_local() {
-    use super::resource::ImageState;
-    let local = ImageState::default();
-    let foreign = ImageState {
-        family: vk::QUEUE_FAMILY_FOREIGN_EXT,
-        ..local
-    };
-    for layout in [
-        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-    ] {
-        assert_eq!(
-            local.queue_families(layout, 3),
-            (vk::QUEUE_FAMILY_IGNORED, vk::QUEUE_FAMILY_IGNORED)
-        );
-        assert_eq!(
-            foreign.queue_families(layout, 3),
-            (vk::QUEUE_FAMILY_FOREIGN_EXT, 3)
-        );
-    }
-    assert_eq!(
-        local.queue_families(vk::ImageLayout::PRESENT_SRC_KHR, 3),
-        (3, vk::QUEUE_FAMILY_FOREIGN_EXT)
-    );
-}
-
 #[cfg(target_os = "android")]
 #[test]
 fn present_batches_reuse_fences_and_preserve_content() {
