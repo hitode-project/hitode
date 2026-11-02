@@ -39,6 +39,7 @@ impl Device {
                 samplers: Mutex::new(HashMap::new()),
                 rings: Mutex::new(Vec::new()),
                 clears: Mutex::new(HashMap::new()),
+                pipelines: Mutex::new(pipeline::Pipelines::default()),
             })),
         };
         let queue = crate::Queue {

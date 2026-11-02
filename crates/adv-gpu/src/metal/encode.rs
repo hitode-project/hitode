@@ -21,9 +21,14 @@ pub(crate) struct RenderPass<'e> {
     pub(super) work: bool,
     occlusion: Vec<(Object<dyn MTLBuffer>, usize, usize)>,
     resolves: Vec<(Object<dyn MTLTexture>, Object<dyn MTLTexture>)>,
+    pipeline: Option<RenderPipeline>,
+    bound: [Bound; 2],
+    index: Option<(Object<dyn MTLBuffer>, usize, IndexFormat)>,
+    depth_bias: (f32, f32, f32),
 }
 pub(crate) struct ComputePass<'e> {
-    #[allow(dead_code)] // B2 encodes compute commands here.
+    pipeline: Option<ComputePipeline>,
+    bound: Bound,
     pub(super) raw: Object<dyn MTLComputeCommandEncoder>,
     encoder: &'e mut Encoder,
     timestamps: Option<(Arc<QueryData>, u32)>,
@@ -242,6 +247,10 @@ impl Encoder {
                 work,
                 occlusion: Vec::new(),
                 resolves,
+                pipeline: None,
+                bound: std::array::from_fn(|_| Bound::default()),
+                index: None,
+                depth_bias: (0.0, 0.0, 0.0),
             },
         }
     }
@@ -270,6 +279,8 @@ impl Encoder {
         raw.setLabel(Some(&NSString::from_str(desc.label)));
         crate::ComputePass {
             inner: ComputePass {
+                pipeline: None,
+                bound: Bound::default(),
                 raw,
                 encoder: self,
                 timestamps: desc
@@ -547,28 +558,200 @@ impl Drop for RenderPass<'_> {
     }
 }
 impl RenderPass<'_> {
-    pub(crate) fn set_pipeline(&mut self, _pipeline: &crate::RenderPipeline) {
-        todo!("B2")
+    pub(crate) fn set_pipeline(&mut self, pipeline: &crate::RenderPipeline) {
+        let p = &pipeline.inner;
+        if self.pipeline.as_ref().is_none_or(|old| old.raw != p.raw) {
+            self.raw.setRenderPipelineState(&p.raw);
+        }
+        if self
+            .pipeline
+            .as_ref()
+            .is_none_or(|old| old.depth != p.depth)
+        {
+            self.raw.setDepthStencilState(Some(&p.depth));
+        }
+        self.raw.setCullMode(match p.primitive.cull {
+            Cull::None => MTLCullMode::None,
+            Cull::Front => MTLCullMode::Front,
+            Cull::Back => MTLCullMode::Back,
+        });
+        self.raw.setFrontFacingWinding(if p.primitive.front_ccw {
+            MTLWinding::CounterClockwise
+        } else {
+            MTLWinding::Clockwise
+        });
+        self.raw.setTriangleFillMode(if p.primitive.wireframe {
+            MTLTriangleFillMode::Lines
+        } else {
+            MTLTriangleFillMode::Fill
+        });
+        self.raw.setDepthClipMode(if p.primitive.unclipped_depth {
+            MTLDepthClipMode::Clamp
+        } else {
+            MTLDepthClipMode::Clip
+        });
+        let (constant, slope, clamp) = if p.depth_bias {
+            self.depth_bias
+        } else {
+            (0.0, 0.0, 0.0)
+        };
+        self.raw
+            .setDepthBias_slopeScale_clamp(constant, slope, clamp);
+        self.pipeline = Some(p.clone());
+        self.update_sizes();
     }
-    pub(crate) fn bind(&mut self, _slot: u32, _resource: Bind<'_>) {
-        todo!("B2")
+    pub(crate) fn bind(&mut self, slot: u32, resource: Bind<'_>) {
+        let group = bind_group(resource);
+        let p = self
+            .pipeline
+            .as_ref()
+            .expect("render pipeline before binding");
+        for b in p
+            .bindings
+            .iter()
+            .filter(|b| b.resource.slot == slot && b.resource.group == group)
+        {
+            let stage = usize::from(b.stages == Stages::FRAGMENT);
+            let index = b.resource.index as usize;
+            if !self.bound[stage].set(index, resource) {
+                continue;
+            }
+            unsafe {
+                match resource {
+                    Bind::Uniform(buffer) | Bind::StorageBuffer(buffer) => {
+                        if stage == 0 {
+                            self.raw.setVertexBuffer_offset_atIndex(
+                                Some(&buffer.buffer.inner.0.raw),
+                                buffer.offset as usize,
+                                index,
+                            );
+                        } else {
+                            self.raw.setFragmentBuffer_offset_atIndex(
+                                Some(&buffer.buffer.inner.0.raw),
+                                buffer.offset as usize,
+                                index,
+                            );
+                        }
+                    }
+                    Bind::Sampled(image) | Bind::StorageImage(image) => {
+                        if stage == 0 {
+                            self.raw
+                                .setVertexTexture_atIndex(Some(&image.inner.raw), index);
+                        } else {
+                            self.raw
+                                .setFragmentTexture_atIndex(Some(&image.inner.raw), index);
+                        }
+                    }
+                    Bind::Sampler(sampler) => {
+                        if stage == 0 {
+                            self.raw
+                                .setVertexSamplerState_atIndex(Some(&sampler.inner.0), index);
+                        } else {
+                            self.raw
+                                .setFragmentSamplerState_atIndex(Some(&sampler.inner.0), index);
+                        }
+                    }
+                }
+            }
+        }
+        self.update_sizes();
     }
-    pub(crate) fn set_index_buffer(&mut self, _buffer: BufferSlice<'_>, _format: IndexFormat) {
-        todo!("B2")
+    fn update_sizes(&mut self) {
+        let p = self.pipeline.as_ref().unwrap();
+        for (stage, sizes) in p.sizes.iter().enumerate() {
+            if let Some((index, values)) = self.bound[stage].sizes(sizes.as_ref()) {
+                unsafe {
+                    if stage == 0 {
+                        self.raw.setVertexBytes_length_atIndex(
+                            NonNull::new(values.as_ptr().cast_mut()).unwrap().cast(),
+                            std::mem::size_of_val(values),
+                            index,
+                        );
+                    } else {
+                        self.raw.setFragmentBytes_length_atIndex(
+                            NonNull::new(values.as_ptr().cast_mut()).unwrap().cast(),
+                            std::mem::size_of_val(values),
+                            index,
+                        );
+                    }
+                }
+            }
+        }
     }
-    pub(crate) fn draw(&mut self, _vertices: Range<u32>, _instances: Range<u32>) {
-        todo!("B2")
+    pub(crate) fn set_index_buffer(&mut self, buffer: BufferSlice<'_>, format: IndexFormat) {
+        self.index = Some((
+            buffer.buffer.inner.0.raw.clone(),
+            buffer.offset as usize,
+            format,
+        ));
+    }
+    pub(crate) fn draw(&mut self, vertices: Range<u32>, instances: Range<u32>) {
+        self.work = true;
+        let topology = topology(
+            self.pipeline
+                .as_ref()
+                .expect("render pipeline before draw")
+                .primitive
+                .topology,
+        );
+        unsafe {
+            self.raw
+                .drawPrimitives_vertexStart_vertexCount_instanceCount_baseInstance(
+                    topology,
+                    vertices.start as usize,
+                    vertices.len(),
+                    instances.len(),
+                    instances.start as usize,
+                );
+        }
     }
     pub(crate) fn draw_indexed(
         &mut self,
-        _indices: Range<u32>,
-        _base_vertex: i32,
-        _instances: Range<u32>,
+        indices: Range<u32>,
+        base_vertex: i32,
+        instances: Range<u32>,
     ) {
-        todo!("B2")
+        self.work = true;
+        let topology = topology(
+            self.pipeline
+                .as_ref()
+                .expect("render pipeline before draw")
+                .primitive
+                .topology,
+        );
+        let (buffer, offset, format) = self
+            .index
+            .as_ref()
+            .expect("index buffer before indexed draw");
+        let (index_type, stride) = index_type(*format);
+        unsafe {
+            self.raw.drawIndexedPrimitives_indexCount_indexType_indexBuffer_indexBufferOffset_instanceCount_baseVertex_baseInstance(topology, indices.len(), index_type, buffer, offset + indices.start as usize * stride, instances.len(), base_vertex as isize, instances.start as usize);
+        }
     }
-    pub(crate) fn draw_indirect(&mut self, _args: BufferSlice<'_>, _indexed: bool) {
-        todo!("B2")
+    pub(crate) fn draw_indirect(&mut self, args: BufferSlice<'_>, indexed: bool) {
+        self.work = true;
+        let topology = topology(
+            self.pipeline
+                .as_ref()
+                .expect("render pipeline before draw")
+                .primitive
+                .topology,
+        );
+        unsafe {
+            if indexed {
+                let (buffer, offset, format) = self
+                    .index
+                    .as_ref()
+                    .expect("index buffer before indexed draw");
+                self.raw.drawIndexedPrimitives_indexType_indexBuffer_indexBufferOffset_indirectBuffer_indirectBufferOffset(topology, index_type(*format).0, buffer, *offset, &args.buffer.inner.0.raw, args.offset as usize);
+            } else {
+                self.raw.drawPrimitives_indirectBuffer_indirectBufferOffset(
+                    topology,
+                    &args.buffer.inner.0.raw,
+                    args.offset as usize,
+                );
+            }
+        }
     }
     pub(crate) fn set_viewport(
         &mut self,
@@ -599,8 +782,11 @@ impl RenderPass<'_> {
             .setBlendColorRed_green_blue_alpha(rgba[0], rgba[1], rgba[2], rgba[3]);
     }
     pub(crate) fn set_depth_bias(&mut self, constant: f32, slope: f32, clamp: f32) {
-        self.raw
-            .setDepthBias_slopeScale_clamp(constant, slope, clamp);
+        self.depth_bias = (constant, slope, clamp);
+        if self.pipeline.as_ref().is_some_and(|p| p.depth_bias) {
+            self.raw
+                .setDepthBias_slopeScale_clamp(constant, slope, clamp);
+        }
     }
     pub(crate) fn begin_occlusion(&mut self, set: &crate::queue::QuerySet, index: u32) {
         if let QueryData::Occlusion(raw) = &*set.inner.0 {
@@ -628,16 +814,211 @@ impl Drop for ComputePass<'_> {
     }
 }
 impl ComputePass<'_> {
-    pub(crate) fn set_pipeline(&mut self, _pipeline: &crate::ComputePipeline) {
-        todo!("B2")
+    pub(crate) fn set_pipeline(&mut self, pipeline: &crate::ComputePipeline) {
+        if self
+            .pipeline
+            .as_ref()
+            .is_none_or(|p| p.raw != pipeline.inner.raw)
+        {
+            self.raw.setComputePipelineState(&pipeline.inner.raw);
+        }
+        self.pipeline = Some(pipeline.inner.clone());
+        self.update_sizes();
     }
-    pub(crate) fn bind(&mut self, _slot: u32, _resource: Bind<'_>) {
-        todo!("B2")
+    pub(crate) fn bind(&mut self, slot: u32, resource: Bind<'_>) {
+        let group = bind_group(resource);
+        let p = self
+            .pipeline
+            .as_ref()
+            .expect("compute pipeline before binding");
+        let Some(binding) = p
+            .bindings
+            .iter()
+            .find(|b| b.resource.slot == slot && b.resource.group == group)
+        else {
+            return;
+        };
+        let index = binding.resource.index as usize;
+        if self.bound.set(index, resource) {
+            unsafe {
+                match resource {
+                    Bind::Uniform(buffer) | Bind::StorageBuffer(buffer) => {
+                        self.raw.setBuffer_offset_atIndex(
+                            Some(&buffer.buffer.inner.0.raw),
+                            buffer.offset as usize,
+                            index,
+                        )
+                    }
+                    Bind::Sampled(image) | Bind::StorageImage(image) => {
+                        self.raw.setTexture_atIndex(Some(&image.inner.raw), index)
+                    }
+                    Bind::Sampler(sampler) => self
+                        .raw
+                        .setSamplerState_atIndex(Some(&sampler.inner.0), index),
+                }
+            }
+        }
+        self.update_sizes();
     }
-    pub(crate) fn dispatch(&mut self, _x: u32, _y: u32, _z: u32) {
-        todo!("B2")
+    fn update_sizes(&mut self) {
+        if let Some((index, values)) = self
+            .bound
+            .sizes(self.pipeline.as_ref().unwrap().sizes.as_ref())
+        {
+            unsafe {
+                self.raw.setBytes_length_atIndex(
+                    NonNull::new(values.as_ptr().cast_mut()).unwrap().cast(),
+                    std::mem::size_of_val(values),
+                    index,
+                );
+            }
+        }
     }
-    pub(crate) fn dispatch_indirect(&mut self, _args: BufferSlice<'_>) {
-        todo!("B2")
+    pub(crate) fn dispatch(&mut self, x: u32, y: u32, z: u32) {
+        self.work = true;
+        let [w, h, d] = self
+            .pipeline
+            .as_ref()
+            .expect("compute pipeline before dispatch")
+            .workgroup;
+        self.raw
+            .dispatchThreadgroups_threadsPerThreadgroup(metal_size(x, y, z), metal_size(w, h, d));
+    }
+    pub(crate) fn dispatch_indirect(&mut self, args: BufferSlice<'_>) {
+        self.work = true;
+        let [w, h, d] = self
+            .pipeline
+            .as_ref()
+            .expect("compute pipeline before dispatch")
+            .workgroup;
+        unsafe {
+            self.raw
+                .dispatchThreadgroupsWithIndirectBuffer_indirectBufferOffset_threadsPerThreadgroup(
+                    &args.buffer.inner.0.raw,
+                    args.offset as usize,
+                    metal_size(w, h, d),
+                );
+        }
+    }
+}
+
+fn bind_group(resource: Bind<'_>) -> u32 {
+    match resource {
+        Bind::Uniform(_) => 0,
+        Bind::Sampled(_) => 1,
+        Bind::Sampler(_) => 2,
+        Bind::StorageImage(_) | Bind::StorageBuffer(_) => 3,
+    }
+}
+fn topology(t: Topology) -> MTLPrimitiveType {
+    match t {
+        Topology::Points => MTLPrimitiveType::Point,
+        Topology::Lines => MTLPrimitiveType::Line,
+        Topology::LineStrip => MTLPrimitiveType::LineStrip,
+        Topology::Triangles => MTLPrimitiveType::Triangle,
+        Topology::TriangleStrip => MTLPrimitiveType::TriangleStrip,
+    }
+}
+fn index_type(f: IndexFormat) -> (MTLIndexType, usize) {
+    match f {
+        IndexFormat::U16 => (MTLIndexType::UInt16, 2),
+        IndexFormat::U32 => (MTLIndexType::UInt32, 4),
+    }
+}
+
+struct Bound {
+    buffers: [Option<(usize, u64, u64)>; 31],
+    textures: [usize; 128],
+    samplers: [usize; 16],
+    sizes: Option<(u8, Vec<u32>)>,
+}
+impl Default for Bound {
+    fn default() -> Self {
+        Self {
+            buffers: [None; 31],
+            textures: [0; 128],
+            samplers: [0; 16],
+            sizes: None,
+        }
+    }
+}
+impl Bound {
+    fn set(&mut self, index: usize, resource: Bind<'_>) -> bool {
+        match resource {
+            Bind::Uniform(b) | Bind::StorageBuffer(b) => {
+                let value = (
+                    Retained::as_ptr(&b.buffer.inner.0.raw) as usize,
+                    b.offset,
+                    b.size,
+                );
+                let changed =
+                    self.buffers[index].is_none_or(|old| (old.0, old.1) != (value.0, value.1));
+                self.buffers[index] = Some(value);
+                if changed && self.sizes.as_ref().is_some_and(|s| s.0 as usize == index) {
+                    self.sizes = None;
+                }
+                return changed;
+            }
+            Bind::Sampled(image) | Bind::StorageImage(image) => {
+                let value = Retained::as_ptr(&image.inner.raw) as usize;
+                if self.textures[index] == value {
+                    return false;
+                }
+                self.textures[index] = value;
+            }
+            Bind::Sampler(sampler) => {
+                let value = Retained::as_ptr(&sampler.inner.0) as usize;
+                if self.samplers[index] == value {
+                    return false;
+                }
+                self.samplers[index] = value;
+            }
+        }
+        true
+    }
+    fn sizes(&mut self, layout: Option<&shader::BufferSizes>) -> Option<(usize, &[u32])> {
+        let shader::BufferSizes { index, slots } = layout?;
+        let values: Vec<_> = slots
+            .iter()
+            .map(|slot| {
+                slot.and_then(|slot| self.buffers[slot as usize])
+                    .map_or(0, |b| b.2 as u32)
+            })
+            .collect();
+        if self
+            .sizes
+            .as_ref()
+            .is_some_and(|s| s.0 == *index && s.1 == values)
+        {
+            return None;
+        }
+        self.buffers[*index as usize] = None;
+        self.sizes = Some((*index, values));
+        Some((*index as usize, &self.sizes.as_ref().unwrap().1))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn binding_cache_tracks_slice_sizes_and_shared_buffer_indices() {
+        let mut bound = Bound::default();
+        let sizes = shader::BufferSizes {
+            index: 29,
+            slots: vec![Some(0), None],
+        };
+        bound.buffers[0] = Some((1, 16, 64));
+        assert_eq!(bound.sizes(Some(&sizes)), Some((29, &[64, 0][..])));
+        assert!(bound.sizes(Some(&sizes)).is_none());
+        bound.buffers[0] = Some((1, 16, 32));
+        assert_eq!(bound.sizes(Some(&sizes)), Some((29, &[32, 0][..])));
+        // Another pipeline uses this index as an ordinary buffer, then the
+        // runtime-array pipeline returns and must restore its size table.
+        bound.sizes = None;
+        bound.buffers[29] = Some((2, 0, 16));
+        assert_eq!(bound.sizes(Some(&sizes)), Some((29, &[32, 0][..])));
+        assert_eq!(bound.buffers[29], None);
     }
 }
