@@ -157,6 +157,10 @@ impl Encoder {
     pub fn retain(&mut self, span: Span) {
         self.inner.retain(span)
     }
+    /// Copy query results into `dst` as 64-bit values. They are there when
+    /// this submission's token completes; read them on the host, not from
+    /// later commands of this encoder (Metal resolves timestamps after the
+    /// submission's work, since earlier resolves lose samples).
     pub fn resolve_queries(
         &mut self,
         set: &QuerySet,

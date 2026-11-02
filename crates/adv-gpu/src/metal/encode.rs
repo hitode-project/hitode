@@ -7,9 +7,19 @@ pub(crate) struct Encoder {
     pub(super) spans: Vec<crate::Span>,
     visibility: Option<Object<dyn MTLBuffer>>,
     visibility_offset: usize,
-    // Counter sample buffers do not participate in tracked-resource hazards.
-    // Order stage-boundary writes before a following counter resolve blit.
-    counter_fence: Option<Object<dyn MTLFence>>,
+    /// Timestamp resolves, encoded after this submission completes.
+    pub(super) resolves: Vec<Resolve>,
+}
+
+/// macOS 26 and later lose counter samples resolved before the sampling
+/// command buffer completes, so timestamps resolve in a follow-up buffer.
+pub(super) struct Resolve {
+    pub(super) set: Arc<QueryData>,
+    pub(super) range: Range<u32>,
+    pub(super) dst: Object<dyn MTLBuffer>,
+    pub(super) offset: usize,
+    /// Indices whose pass did no work, as of encoding: written as zero.
+    pub(super) empty: Vec<bool>,
 }
 
 pub(crate) struct RenderPass<'e> {
@@ -30,7 +40,8 @@ pub(crate) struct ComputePass<'e> {
     pipeline: Option<ComputePipeline>,
     bound: Bound,
     pub(super) raw: Object<dyn MTLComputeCommandEncoder>,
-    encoder: &'e mut Encoder,
+    /// Holds the encoder exclusively while the pass is open.
+    _encoder: std::marker::PhantomData<&'e mut Encoder>,
     timestamps: Option<(Arc<QueryData>, u32)>,
     /// Dispatches reached the GPU, so encoder-boundary samples are written.
     pub(super) work: bool,
@@ -44,27 +55,19 @@ impl Encoder {
             spans: Vec::new(),
             visibility: None,
             visibility_offset: 0,
-            counter_fence: None,
+            resolves: Vec::new(),
         }
     }
     fn blit(&self) -> Object<dyn MTLBlitCommandEncoder> {
-        let blit = self
-            .command
+        self.command
             .blitCommandEncoder()
-            .expect("Metal blit encoder");
-        if let Some(fence) = &self.counter_fence {
-            blit.waitForFence(fence);
-        }
-        blit
+            .expect("Metal blit encoder")
     }
     pub(crate) fn render_pass<'e>(
         &'e mut self,
         desc: &RenderPassDesc<'_>,
     ) -> crate::RenderPass<'e> {
         let d = MTLRenderPassDescriptor::new();
-        if desc.timestamps.is_some() && self.counter_fence.is_none() {
-            self.counter_fence = Some(self.device.0.raw.newFence().expect("Metal counter fence"));
-        }
         let mut size = desc
             .colors
             .first()
@@ -259,9 +262,6 @@ impl Encoder {
         desc: &ComputePassDesc<'_>,
     ) -> crate::ComputePass<'e> {
         let d = MTLComputePassDescriptor::new();
-        if desc.timestamps.is_some() && self.counter_fence.is_none() {
-            self.counter_fence = Some(self.device.0.raw.newFence().expect("Metal counter fence"));
-        }
         if let Some((set, first)) = desc.timestamps
             && let QueryData::Timestamp { raw, .. } = &*set.inner.0
         {
@@ -282,7 +282,7 @@ impl Encoder {
                 pipeline: None,
                 bound: Bound::default(),
                 raw,
-                encoder: self,
+                _encoder: std::marker::PhantomData,
                 timestamps: desc
                     .timestamps
                     .map(|(set, first)| (set.inner.0.clone(), first)),
@@ -414,37 +414,32 @@ impl Encoder {
         dst: &crate::Buffer,
         offset: u64,
     ) {
-        let blit = self.blit();
-        unsafe {
-            match &*set.inner.0 {
-                QueryData::Timestamp { raw, empty, .. } => {
-                    blit.resolveCounters_inRange_destinationBuffer_destinationOffset(
-                        raw,
-                        NSRange::new(range.start as usize, range.len()),
-                        &dst.inner.0.raw,
-                        offset as usize,
-                    );
-                    // Passes without work wrote no samples: report both of
-                    // their timestamps as zero, an empty duration.
-                    let empty = empty.lock().unwrap();
-                    for index in range.clone() {
-                        if empty[index as usize] {
-                            let at = offset as usize + (index - range.start) as usize * 8;
-                            blit.fillBuffer_range_value(&dst.inner.0.raw, NSRange::new(at, 8), 0);
-                        }
-                    }
-                }
-                QueryData::Occlusion(raw) => blit
-                    .copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
+        match &*set.inner.0 {
+            QueryData::Timestamp { empty, .. } => {
+                let empty =
+                    empty.lock().unwrap()[range.start as usize..range.end as usize].to_vec();
+                self.resolves.push(Resolve {
+                    set: set.inner.0.clone(),
+                    range,
+                    dst: dst.inner.0.raw.clone(),
+                    offset: offset as usize,
+                    empty,
+                });
+            }
+            QueryData::Occlusion(raw) => {
+                let blit = self.blit();
+                unsafe {
+                    blit.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
                         raw,
                         range.start as usize * 8,
                         &dst.inner.0.raw,
                         offset as usize,
                         range.len() * 8,
-                    ),
+                    );
+                }
+                blit.endEncoding();
             }
         }
-        blit.endEncoding();
     }
 }
 
@@ -522,10 +517,6 @@ impl Drop for RenderPass<'_> {
     fn drop(&mut self) {
         if let Some((set, first)) = &self.timestamps {
             set.mark(*first, !self.work);
-            self.raw.updateFence_afterStages(
-                self.encoder.counter_fence.as_ref().unwrap(),
-                MTLRenderStages::Vertex | MTLRenderStages::Fragment,
-            );
         }
         self.raw.endEncoding();
         if self.occlusion.is_empty() && self.resolves.is_empty() {
@@ -807,8 +798,6 @@ impl Drop for ComputePass<'_> {
     fn drop(&mut self) {
         if let Some((set, first)) = &self.timestamps {
             set.mark(*first, !self.work);
-            self.raw
-                .updateFence(self.encoder.counter_fence.as_ref().unwrap());
         }
         self.raw.endEncoding();
     }

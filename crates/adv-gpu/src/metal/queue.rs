@@ -73,17 +73,37 @@ impl Queue {
     }
     pub(crate) fn submit(&mut self, encoder: crate::Encoder) -> Result<Token> {
         self.device.inner.check()?;
+        let encode::Encoder {
+            command,
+            spans,
+            resolves,
+            ..
+        } = encoder.inner;
         let token = Token(self.next);
         self.next += 1;
-        for span in encoder.inner.spans {
+        for span in spans {
             span.inner.submitted(token.0);
         }
         self.rings(|ring| ring.submitted(token.0));
+        // Timestamp resolves go to a buffer queued right behind this one and
+        // encoded once it completes (see `encode::Resolve`); that buffer
+        // signals the token, so completion still implies the results.
+        let follow = (!resolves.is_empty()).then(|| {
+            command.enqueue();
+            let follow = self
+                .raw
+                .commandBuffer()
+                .expect("Metal command buffer allocation");
+            follow.enqueue();
+            follow
+        });
+        let pending = Mutex::new(follow.clone().map(|follow| (follow, resolves)));
         let lost = self.device.inner.0.lost.clone();
         let event = self.event.clone();
         let block = block2::RcBlock::new(
             move |command: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
-                if let Some(error) = unsafe { command.as_ref() }.error() {
+                let error = unsafe { command.as_ref() }.error();
+                if let Some(error) = &error {
                     // Faulted work cannot signal its encoded event. Publish the loss
                     // before waking shared-event waiters so they return DeviceLost.
                     if matches!(error.code(), 1..=4 | 11) {
@@ -91,19 +111,23 @@ impl Queue {
                     }
                     event.setSignaledValue(event.signaledValue().max(token.0));
                 }
+                let Some((follow, resolves)) = pending.lock().unwrap().take() else {
+                    return;
+                };
+                if error.is_none() {
+                    resolve(&follow, &resolves);
+                }
+                follow.encodeSignalEvent_value(ProtocolObject::from_ref(&*event), token.0);
+                follow.commit();
             },
         );
         unsafe {
-            encoder
-                .inner
-                .command
-                .addCompletedHandler(block2::RcBlock::as_ptr(&block));
-            encoder
-                .inner
-                .command
-                .encodeSignalEvent_value(ProtocolObject::from_ref(&*self.event), token.0);
+            command.addCompletedHandler(block2::RcBlock::as_ptr(&block));
+            if follow.is_none() {
+                command.encodeSignalEvent_value(ProtocolObject::from_ref(&*self.event), token.0);
+            }
         }
-        encoder.inner.command.commit();
+        command.commit();
         Ok(token)
     }
     fn rings(&self, mut f: impl FnMut(&mut ring::State)) {
@@ -159,6 +183,28 @@ impl Queue {
     pub(crate) fn wait_fence(&mut self, _fence: crate::queue::Fence) -> Result<()> {
         todo!("B3")
     }
+}
+
+fn resolve(follow: &ProtocolObject<dyn MTLCommandBuffer>, resolves: &[encode::Resolve]) {
+    let blit = follow.blitCommandEncoder().expect("Metal blit encoder");
+    for r in resolves {
+        let QueryData::Timestamp { raw, .. } = &*r.set else {
+            unreachable!("only timestamps resolve late");
+        };
+        unsafe {
+            blit.resolveCounters_inRange_destinationBuffer_destinationOffset(
+                raw,
+                NSRange::new(r.range.start as usize, r.range.len()),
+                &r.dst,
+                r.offset,
+            );
+            // Passes without work wrote no samples: zero, an empty duration.
+            for (i, _) in r.empty.iter().enumerate().filter(|(_, empty)| **empty) {
+                blit.fillBuffer_range_value(&r.dst, NSRange::new(r.offset + i * 8, 8), 0);
+            }
+        }
+    }
+    blit.endEncoding();
 }
 
 #[derive(Clone)]
