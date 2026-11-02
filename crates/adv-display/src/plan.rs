@@ -93,8 +93,11 @@ pub struct Settings {
 /// What the system compositor can do for us.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CompositorCaps {
-    /// Layers can scale with nearest or linear filtering.
+    /// Layers can scale with linear filtering.
     pub scales: bool,
+    /// Layers can also magnify with nearest filtering. Without it (Android's
+    /// SurfaceFlinger filters linearly) the output pass does integer scales.
+    pub nearest: bool,
     /// Layers can rotate without composition falling back to the GPU.
     pub rotates: bool,
     /// YUV layers are converted and scaled by the display controller.
@@ -722,7 +725,7 @@ pub fn plan(
     let output_needed = !upscale
         && ((!integer && prescale != (1, 1))
             || (!caps.rotates && settings.rotation != Rotation::None)
-            || (!caps.scales && viewport_size != canvas));
+            || ((!caps.scales || (integer && !caps.nearest)) && viewport_size != canvas));
     // This decision deliberately excludes frame damage, videos and pool state.
     let swap_role = if caps.presentable_compressed || (!upscale && !output_needed) {
         SwapRole::Presentable { canvas }
@@ -947,7 +950,7 @@ pub fn plan(
         } else {
             settings.rotation
         };
-        let output = if !caps.scales {
+        let output = if !caps.scales || (integer && !caps.nearest) {
             viewport_size
         } else if integer {
             canvas

@@ -25,6 +25,7 @@ fn settings() -> Settings {
 fn caps() -> CompositorCaps {
     CompositorCaps {
         scales: true,
+        nearest: true,
         rotates: true,
         yuv_layers: true,
         solid_color_layers: true,
@@ -207,6 +208,45 @@ fn rotations_and_compositor_limits() {
         &PoolState::default(),
     );
     assert!(p.stages.is_empty());
+}
+
+// spec: HOST-VIEW-9
+#[test]
+fn linear_only_compositors_scale_integers_in_the_output_pass() {
+    let linear = CompositorCaps {
+        nearest: false,
+        ..caps()
+    };
+    // 2x: nearest needs the pass, at the whole viewport.
+    let s = Settings {
+        view: (640, 480),
+        ..settings()
+    };
+    let p = run(&frame(), &s, &linear, &PoolState::default());
+    assert_eq!(p.targets[0].size, (640, 480));
+    let Some(Stage::Output { scale, .. }) = p.stages.first() else {
+        panic!("output pass expected");
+    };
+    assert_eq!(*scale, Scale::Integer { x: 2, y: 2 });
+    // 2.5x: the integer part as with nearest layers, the rest linear.
+    let s = Settings {
+        view: (800, 600),
+        ..settings()
+    };
+    assert_eq!(
+        run(&frame(), &s, &linear, &PoolState::default()).stages,
+        run(&frame(), &s, &caps(), &PoolState::default()).stages
+    );
+    // 1:1 needs no pass.
+    let s = Settings {
+        view: (320, 240),
+        ..settings()
+    };
+    assert!(
+        run(&frame(), &s, &linear, &PoolState::default())
+            .stages
+            .is_empty()
+    );
 }
 
 // spec: HOST-VIEW-9, HOST-VIEW-11
