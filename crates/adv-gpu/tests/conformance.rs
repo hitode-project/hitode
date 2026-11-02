@@ -733,7 +733,7 @@ fn vertex_fetch_reads_storage_buffers_with_base_vertex() {
 }
 
 #[test]
-fn uniforms_textures_and_samplers_bind_by_slot() {
+fn bindings_persist_across_pipelines_by_slot() {
     let mut gpu = gpu!();
     let texture = gpu.target(2, 2, Format::Rgba8Unorm);
     let texels: [u8; 16] = [
@@ -784,6 +784,7 @@ fn uniforms_textures_and_samplers_bind_by_slot() {
             compare: None,
         })
         .expect("sampler");
+    let solid = gpu.pipeline(&gpu.solid_desc(Format::Rgba8Unorm));
     // Tint drops green, so the green and white quadrants show what the uniform did.
     let (uniforms, _) = gpu.uniforms(&[block([1.0, 0.0, 1.0, 1.0], 0.5)]);
     let mut encoder = gpu.queue.encoder("sampled");
@@ -808,10 +809,14 @@ fn uniforms_textures_and_samplers_bind_by_slot() {
             None,
             whole(8, 8),
         ));
-        pass.set_pipeline(&pipeline);
-        pass.bind(0, Bind::Uniform(uniforms.slice(0..32)));
+        // Slots bound before any pipeline survive a pipeline that does not
+        // read them and reach the next one that does.
         pass.bind(0, Bind::Sampled(texture.view()));
         pass.bind(0, Bind::Sampler(&sampler));
+        pass.bind(0, Bind::Uniform(uniforms.slice(0..32)));
+        pass.set_pipeline(&solid);
+        pass.draw(0..3, 0..1);
+        pass.set_pipeline(&pipeline);
         pass.draw(0..3, 0..1);
     }
     gpu.submit(encoder);

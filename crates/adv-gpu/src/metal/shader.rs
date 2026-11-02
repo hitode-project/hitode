@@ -12,57 +12,80 @@ pub(super) struct Function {
     pub stage: Stage,
     pub raw: Object<dyn MTLFunction>,
     pub workgroup: [u32; 3],
-    pub used: Option<Vec<Slot>>,
-    pub sizes: Option<BufferSizes>,
-}
-#[derive(Clone)]
-pub(super) struct BufferSizes {
-    pub index: u8,
-    pub slots: Vec<Option<u8>>,
-}
-
-#[derive(Clone, Copy)]
-pub(super) struct Slot {
-    pub group: u32,
-    pub slot: u32,
-    pub buffer: bool,
-    pub index: u8,
+    /// Native indices the entry reads; `None` for precompiled libraries, whose
+    /// pipelines use their declared bindings.
+    pub used: Option<Used>,
+    /// Storage buffer index of each entry in naga's byte-size table at
+    /// `buffer(SIZES)`; `None` for runtime arrays the entry does not use.
+    pub sizes: Option<Box<[Option<u8>]>>,
 }
 
-// Each entry point has independent tables, fixed when its library is compiled.
-// Sort used bindings by (group, slot), then number buffers, textures and samplers
-// consecutively in their own tables. Groups 0 and 3 share the buffer table;
-// groups 1 and 3 share the texture table. Runtime arrays reserve buffer(30) for
-// naga's byte-size table, so every buffer index remains below 31. Precompiled
-// libraries use this same ordering for their per-stage binding declarations.
-pub(super) fn binding_layout(
-    mut bindings: Vec<(u32, u32, bool)>,
-    textures: u32,
-    sizes: bool,
-) -> Result<Vec<Slot>> {
-    bindings.sort_unstable();
-    let mut next = [0u8; 3];
-    let mut result = Vec::new();
-    for (group, slot, buffer) in bindings {
-        let (table, limit, slot_limit) = match (group, buffer) {
-            (0 | 3, true) => (0, 31 - u8::from(sizes), 31),
-            (1, false) => (1, textures as u8, textures),
-            (3, false) => (1, textures as u8, 31),
-            (2, false) => (2, 16, 16),
-            _ => return Err(Error::Invalid("Metal binding group".into())),
-        };
-        if slot >= slot_limit || next[table] >= limit {
-            return Err(Error::Invalid("Metal binding table limit".into()));
-        }
-        result.push(Slot {
-            group,
-            slot,
-            buffer,
-            index: next[table],
-        });
-        next[table] += 1;
+/// Native indices of one stage, one bit per index.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct Used {
+    pub buffers: u32,
+    pub textures: u128,
+    pub samplers: u16,
+}
+
+/// Native indices are fixed per slot, like D3D registers, so a binding
+/// survives pipeline changes untouched: uniform slot `s` is `buffer(s)`,
+/// storage buffer `s` is `buffer(29 - s)`, sampled image `s` is `texture(s)`,
+/// storage image `s` is `texture(95 - s)` and sampler `s` is `sampler(s)`.
+/// `buffer(30)` holds naga's runtime-array byte sizes. Precompiled libraries
+/// declare the same indices. A stage whose two kinds of one table meet is
+/// rejected at creation.
+pub(super) const SIZES: usize = 30;
+pub(super) fn native(group: u32, slot: u32, buffer: bool, textures: u32) -> Result<(usize, u32)> {
+    let (table, index, limit) = match (group, buffer) {
+        (0, true) => (0, slot, SIZES as u32),
+        (3, true) => (0, (SIZES as u32 - 1).wrapping_sub(slot), SIZES as u32),
+        (1, false) => (1, slot, textures),
+        (3, false) => (1, 95u32.wrapping_sub(slot), 96),
+        (2, false) => (2, slot, 16),
+        _ => return Err(Error::Invalid("Metal binding group".into())),
+    };
+    if index >= limit {
+        return Err(Error::Invalid(format!(
+            "Metal binding {group}:{slot} exceeds its table"
+        )));
     }
-    Ok(result)
+    Ok((table, index))
+}
+
+impl Used {
+    /// Adds one binding, rejecting an index another binding already holds.
+    pub fn add(&mut self, group: u32, slot: u32, buffer: bool, textures: u32) -> Result<u32> {
+        let (table, index) = native(group, slot, buffer, textures)?;
+        let fresh = match table {
+            0 => {
+                let fresh = self.buffers & 1 << index == 0;
+                self.buffers |= 1 << index;
+                fresh
+            }
+            1 => {
+                let fresh = self.textures & 1 << index == 0;
+                self.textures |= 1 << index;
+                fresh
+            }
+            _ => {
+                let fresh = self.samplers & 1 << index == 0;
+                self.samplers |= 1 << index;
+                fresh
+            }
+        };
+        if !fresh {
+            return Err(Error::Invalid(format!(
+                "Metal binding {group}:{slot} shares index {index} with another kind"
+            )));
+        }
+        Ok(index)
+    }
+    pub fn contains(self, other: Used) -> bool {
+        other.buffers & !self.buffers == 0
+            && other.textures & !self.textures == 0
+            && other.samplers & !self.samplers == 0
+    }
 }
 
 pub(super) fn binding_group(kind: BindingKind) -> (u32, bool) {
@@ -183,7 +206,9 @@ impl Device {
                     &Default::default(),
                 )
                 .map_err(|e| compile_error(&ep.name, e))?;
-                let mut used = Vec::new();
+                let textures = self.caps().limits.max_sampled_images;
+                let mut used = Used::default();
+                let mut resources = msl::EntryPointResources::default();
                 let mut sizes = Vec::new();
                 let entry_info = info.get_entry_point(0);
                 for (handle, var) in module.global_variables.iter() {
@@ -239,45 +264,30 @@ impl Device {
                             ));
                         }
                     };
-                    used.push((binding.group, binding.binding, buffer));
-                }
-                let needs_sizes = sizes.iter().any(Option::is_some);
-                let used =
-                    binding_layout(used, self.caps().limits.max_sampled_images, needs_sizes)?;
-                let mut resources = msl::EntryPointResources::default();
-                for slot in &used {
-                    let binding = naga::ResourceBinding {
-                        group: slot.group,
-                        binding: slot.slot,
-                    };
+                    let index = used.add(binding.group, binding.binding, buffer, textures)? as u8;
                     let mut target = msl::BindTarget::default();
-                    if slot.buffer {
-                        target.buffer = Some(slot.index);
-                    } else if slot.group == 2 {
-                        target.sampler = Some(msl::BindSamplerTarget::Resource(slot.index));
-                    } else {
-                        target.texture = Some(slot.index);
+                    match (buffer, binding.group) {
+                        (true, _) => target.buffer = Some(index),
+                        (false, 2) => {
+                            target.sampler = Some(msl::BindSamplerTarget::Resource(index))
+                        }
+                        _ => target.texture = Some(index),
                     }
-                    target.mutable = module.global_variables.iter().any(|(_, var)| var.binding == Some(binding)
-                        && matches!(var.space, naga::AddressSpace::Storage { access } if access.contains(naga::StorageAccess::STORE)));
+                    target.mutable = matches!(var.space, naga::AddressSpace::Storage { access }
+                        if access.contains(naga::StorageAccess::STORE));
                     resources.resources.insert(binding, target);
                 }
-                let sizes = if needs_sizes {
-                    resources.sizes_buffer = Some(30);
-                    Some(BufferSizes {
-                        index: 30,
-                        slots: sizes
+                let sizes = if sizes.iter().any(Option::is_some) {
+                    if sizes.len() > SIZES {
+                        return Err(compile_error(&ep.name, "too many runtime arrays"));
+                    }
+                    resources.sizes_buffer = Some(SIZES as u8);
+                    Some(
+                        sizes
                             .iter()
-                            .map(|slot| {
-                                slot.map(|slot| {
-                                    used.iter()
-                                        .find(|s| s.group == 3 && s.slot == slot && s.buffer)
-                                        .unwrap()
-                                        .index
-                                })
-                            })
+                            .map(|slot| slot.map(|slot| (SIZES - 1) as u8 - slot as u8))
                             .collect(),
-                    })
+                    )
                 } else {
                     None
                 };
@@ -380,28 +390,17 @@ impl Shader {
 mod tests {
     use super::*;
     #[test]
-    fn per_stage_layout_packs_sparse_slots_into_shared_tables() {
-        let slots = binding_layout(
-            vec![
-                (3, 30, true),
-                (3, 8, false),
-                (2, 15, false),
-                (1, 95, false),
-                (0, 30, true),
-            ],
-            96,
-            true,
-        )
-        .unwrap();
-        assert_eq!(
-            slots
-                .iter()
-                .map(|s| (s.group, s.slot, s.index))
-                .collect::<Vec<_>>(),
-            [(0, 30, 0), (1, 95, 0), (2, 15, 0), (3, 8, 1), (3, 30, 1)]
-        );
-        let full: Vec<_> = (0..31).map(|slot| (0, slot, true)).collect();
-        assert!(binding_layout(full.clone(), 96, false).is_ok());
-        assert!(binding_layout(full, 96, true).is_err());
+    fn slots_hold_fixed_indices_and_kinds_meeting_in_a_table_are_rejected() {
+        let mut used = Used::default();
+        assert_eq!(used.add(0, 3, true, 96).unwrap(), 3);
+        assert_eq!(used.add(3, 0, true, 96).unwrap(), 29);
+        assert_eq!(used.add(1, 95, false, 96).unwrap(), 95);
+        assert_eq!(used.add(3, 1, false, 96).unwrap(), 94);
+        assert_eq!(used.add(2, 15, false, 96).unwrap(), 15);
+        assert!(used.add(3, 0, false, 96).is_err());
+        assert!(used.add(0, 29, true, 96).is_err());
+        assert!(used.add(0, 30, true, 96).is_err());
+        assert!(used.add(1, 96, false, 96).is_err());
+        assert!(used.add(2, 16, false, 96).is_err());
     }
 }

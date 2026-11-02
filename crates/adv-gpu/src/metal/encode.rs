@@ -1,4 +1,7 @@
+use super::pipeline::{ComputeData, Raster, RenderData};
+use super::shader::{self, Used};
 use super::*;
+use arrayvec::ArrayVec;
 use std::ops::Range;
 
 pub(crate) struct Encoder {
@@ -31,14 +34,15 @@ pub(crate) struct RenderPass<'e> {
     pub(super) work: bool,
     occlusion: Vec<(Object<dyn MTLBuffer>, usize, usize)>,
     resolves: Vec<(Object<dyn MTLTexture>, Object<dyn MTLTexture>)>,
-    pipeline: Option<RenderPipeline>,
-    bound: [Bound; 2],
+    pipeline: Option<Arc<RenderData>>,
+    raster: Raster,
+    bindings: Box<Bindings>,
     index: Option<(Object<dyn MTLBuffer>, usize, IndexFormat)>,
     depth_bias: (f32, f32, f32),
 }
 pub(crate) struct ComputePass<'e> {
-    pipeline: Option<ComputePipeline>,
-    bound: Bound,
+    pipeline: Option<Arc<ComputeData>>,
+    bindings: Box<Bindings>,
     pub(super) raw: Object<dyn MTLComputeCommandEncoder>,
     /// Holds the encoder exclusively while the pass is open.
     _encoder: std::marker::PhantomData<&'e mut Encoder>,
@@ -251,7 +255,8 @@ impl Encoder {
                 occlusion: Vec::new(),
                 resolves,
                 pipeline: None,
-                bound: std::array::from_fn(|_| Bound::default()),
+                raster: Raster::DEFAULT,
+                bindings: Bindings::new(),
                 index: None,
                 depth_bias: (0.0, 0.0, 0.0),
             },
@@ -280,7 +285,7 @@ impl Encoder {
         crate::ComputePass {
             inner: ComputePass {
                 pipeline: None,
-                bound: Bound::default(),
+                bindings: Bindings::new(),
                 raw,
                 _encoder: std::marker::PhantomData,
                 timestamps: desc
@@ -550,141 +555,70 @@ impl Drop for RenderPass<'_> {
 }
 impl RenderPass<'_> {
     pub(crate) fn set_pipeline(&mut self, pipeline: &crate::RenderPipeline) {
-        let p = &pipeline.inner;
-        if self.pipeline.as_ref().is_none_or(|old| old.raw != p.raw) {
+        let p = &pipeline.inner.0;
+        let old = self.pipeline.as_deref();
+        if old.is_some_and(|old| std::ptr::eq(old, &**p)) {
+            return;
+        }
+        if old.is_none_or(|old| !same(&old.raw, &p.raw)) {
             self.raw.setRenderPipelineState(&p.raw);
         }
-        if self
-            .pipeline
-            .as_ref()
-            .is_none_or(|old| old.depth != p.depth)
-        {
+        if old.is_none_or(|old| !same(&old.depth, &p.depth)) {
             self.raw.setDepthStencilState(Some(&p.depth));
         }
-        self.raw.setCullMode(match p.primitive.cull {
-            Cull::None => MTLCullMode::None,
-            Cull::Front => MTLCullMode::Front,
-            Cull::Back => MTLCullMode::Back,
-        });
-        self.raw.setFrontFacingWinding(if p.primitive.front_ccw {
-            MTLWinding::CounterClockwise
-        } else {
-            MTLWinding::Clockwise
-        });
-        self.raw.setTriangleFillMode(if p.primitive.wireframe {
-            MTLTriangleFillMode::Lines
-        } else {
-            MTLTriangleFillMode::Fill
-        });
-        self.raw.setDepthClipMode(if p.primitive.unclipped_depth {
-            MTLDepthClipMode::Clamp
-        } else {
-            MTLDepthClipMode::Clip
-        });
-        let (constant, slope, clamp) = if p.depth_bias {
-            self.depth_bias
-        } else {
-            (0.0, 0.0, 0.0)
-        };
-        self.raw
-            .setDepthBias_slopeScale_clamp(constant, slope, clamp);
+        let (old, new) = (self.raster, p.raster);
+        if old.cull != new.cull {
+            self.raw.setCullMode(new.cull);
+        }
+        if old.winding != new.winding {
+            self.raw.setFrontFacingWinding(new.winding);
+        }
+        if old.fill != new.fill {
+            self.raw.setTriangleFillMode(new.fill);
+        }
+        if old.clip != new.clip {
+            self.raw.setDepthClipMode(new.clip);
+        }
+        if old.depth_bias != new.depth_bias && self.depth_bias != (0.0, 0.0, 0.0) {
+            let (constant, slope, clamp) = if new.depth_bias {
+                self.depth_bias
+            } else {
+                (0.0, 0.0, 0.0)
+            };
+            self.raw
+                .setDepthBias_slopeScale_clamp(constant, slope, clamp);
+        }
+        self.raster = new;
+        self.bindings.sizes_dirty |= p.sizes.iter().any(Option::is_some);
         self.pipeline = Some(p.clone());
-        self.update_sizes();
     }
     pub(crate) fn bind(&mut self, slot: u32, resource: Bind<'_>) {
-        let group = bind_group(resource);
+        self.bindings.bind(slot, resource);
+    }
+    /// Gives each stage the bindings it reads that changed since its last draw.
+    fn flush(&mut self) -> MTLPrimitiveType {
         let p = self
             .pipeline
-            .as_ref()
-            .expect("render pipeline before binding");
-        for b in p
-            .bindings
-            .iter()
-            .filter(|b| b.resource.slot == slot && b.resource.group == group)
-        {
-            let stage = usize::from(b.stages == Stages::FRAGMENT);
-            let index = b.resource.index as usize;
-            if !self.bound[stage].set(index, resource) {
-                continue;
-            }
-            unsafe {
-                match resource {
-                    Bind::Uniform(buffer) | Bind::StorageBuffer(buffer) => {
-                        if stage == 0 {
-                            self.raw.setVertexBuffer_offset_atIndex(
-                                Some(&buffer.buffer.inner.0.raw),
-                                buffer.offset as usize,
-                                index,
-                            );
-                        } else {
-                            self.raw.setFragmentBuffer_offset_atIndex(
-                                Some(&buffer.buffer.inner.0.raw),
-                                buffer.offset as usize,
-                                index,
-                            );
-                        }
-                    }
-                    Bind::Sampled(image) | Bind::StorageImage(image) => {
-                        if stage == 0 {
-                            self.raw
-                                .setVertexTexture_atIndex(Some(&image.inner.raw), index);
-                        } else {
-                            self.raw
-                                .setFragmentTexture_atIndex(Some(&image.inner.raw), index);
-                        }
-                    }
-                    Bind::Sampler(sampler) => {
-                        if stage == 0 {
-                            self.raw
-                                .setVertexSamplerState_atIndex(Some(&sampler.inner.0), index);
-                        } else {
-                            self.raw
-                                .setFragmentSamplerState_atIndex(Some(&sampler.inner.0), index);
-                        }
-                    }
-                }
-            }
-        }
-        self.update_sizes();
-    }
-    fn update_sizes(&mut self) {
-        let p = self.pipeline.as_ref().unwrap();
-        for (stage, sizes) in p.sizes.iter().enumerate() {
-            if let Some((index, values)) = self.bound[stage].sizes(sizes.as_ref()) {
-                unsafe {
-                    if stage == 0 {
-                        self.raw.setVertexBytes_length_atIndex(
-                            NonNull::new(values.as_ptr().cast_mut()).unwrap().cast(),
-                            std::mem::size_of_val(values),
-                            index,
-                        );
-                    } else {
-                        self.raw.setFragmentBytes_length_atIndex(
-                            NonNull::new(values.as_ptr().cast_mut()).unwrap().cast(),
-                            std::mem::size_of_val(values),
-                            index,
-                        );
-                    }
-                }
-            }
-        }
+            .as_deref()
+            .expect("render pipeline before draw");
+        let sizes = std::mem::take(&mut self.bindings.sizes_dirty);
+        let raw = &*self.raw;
+        let table = |stage: usize| p.sizes[stage].as_deref().filter(|_| sizes);
+        self.bindings.flush(0, p.used[0], table(0), &Vertex(raw));
+        self.bindings.flush(1, p.used[1], table(1), &Fragment(raw));
+        p.topology
     }
     pub(crate) fn set_index_buffer(&mut self, buffer: BufferSlice<'_>, format: IndexFormat) {
-        self.index = Some((
-            buffer.buffer.inner.0.raw.clone(),
-            buffer.offset as usize,
-            format,
-        ));
+        let raw = &buffer.buffer.inner.0.raw;
+        let offset = buffer.offset as usize;
+        match &mut self.index {
+            Some((old, o, f)) if same(old, raw) => (*o, *f) = (offset, format),
+            index => *index = Some((raw.clone(), offset, format)),
+        }
     }
     pub(crate) fn draw(&mut self, vertices: Range<u32>, instances: Range<u32>) {
         self.work = true;
-        let topology = topology(
-            self.pipeline
-                .as_ref()
-                .expect("render pipeline before draw")
-                .primitive
-                .topology,
-        );
+        let topology = self.flush();
         unsafe {
             self.raw
                 .drawPrimitives_vertexStart_vertexCount_instanceCount_baseInstance(
@@ -703,13 +637,7 @@ impl RenderPass<'_> {
         instances: Range<u32>,
     ) {
         self.work = true;
-        let topology = topology(
-            self.pipeline
-                .as_ref()
-                .expect("render pipeline before draw")
-                .primitive
-                .topology,
-        );
+        let topology = self.flush();
         let (buffer, offset, format) = self
             .index
             .as_ref()
@@ -721,13 +649,7 @@ impl RenderPass<'_> {
     }
     pub(crate) fn draw_indirect(&mut self, args: BufferSlice<'_>, indexed: bool) {
         self.work = true;
-        let topology = topology(
-            self.pipeline
-                .as_ref()
-                .expect("render pipeline before draw")
-                .primitive
-                .topology,
-        );
+        let topology = self.flush();
         unsafe {
             if indexed {
                 let (buffer, offset, format) = self
@@ -774,7 +696,7 @@ impl RenderPass<'_> {
     }
     pub(crate) fn set_depth_bias(&mut self, constant: f32, slope: f32, clamp: f32) {
         self.depth_bias = (constant, slope, clamp);
-        if self.pipeline.as_ref().is_some_and(|p| p.depth_bias) {
+        if self.raster.depth_bias {
             self.raw
                 .setDepthBias_slopeScale_clamp(constant, slope, clamp);
         }
@@ -804,210 +726,272 @@ impl Drop for ComputePass<'_> {
 }
 impl ComputePass<'_> {
     pub(crate) fn set_pipeline(&mut self, pipeline: &crate::ComputePipeline) {
+        let p = &pipeline.inner.0;
         if self
             .pipeline
             .as_ref()
-            .is_none_or(|p| p.raw != pipeline.inner.raw)
+            .is_some_and(|old| Arc::ptr_eq(old, p))
         {
-            self.raw.setComputePipelineState(&pipeline.inner.raw);
+            return;
         }
-        self.pipeline = Some(pipeline.inner.clone());
-        self.update_sizes();
-    }
-    pub(crate) fn bind(&mut self, slot: u32, resource: Bind<'_>) {
-        let group = bind_group(resource);
-        let p = self
+        if self
             .pipeline
             .as_ref()
-            .expect("compute pipeline before binding");
-        let Some(binding) = p
-            .bindings
-            .iter()
-            .find(|b| b.resource.slot == slot && b.resource.group == group)
-        else {
-            return;
-        };
-        let index = binding.resource.index as usize;
-        if self.bound.set(index, resource) {
-            unsafe {
-                match resource {
-                    Bind::Uniform(buffer) | Bind::StorageBuffer(buffer) => {
-                        self.raw.setBuffer_offset_atIndex(
-                            Some(&buffer.buffer.inner.0.raw),
-                            buffer.offset as usize,
-                            index,
-                        )
-                    }
-                    Bind::Sampled(image) | Bind::StorageImage(image) => {
-                        self.raw.setTexture_atIndex(Some(&image.inner.raw), index)
-                    }
-                    Bind::Sampler(sampler) => self
-                        .raw
-                        .setSamplerState_atIndex(Some(&sampler.inner.0), index),
-                }
-            }
-        }
-        self.update_sizes();
-    }
-    fn update_sizes(&mut self) {
-        if let Some((index, values)) = self
-            .bound
-            .sizes(self.pipeline.as_ref().unwrap().sizes.as_ref())
+            .is_none_or(|old| !same(&old.raw, &p.raw))
         {
-            unsafe {
-                self.raw.setBytes_length_atIndex(
-                    NonNull::new(values.as_ptr().cast_mut()).unwrap().cast(),
-                    std::mem::size_of_val(values),
-                    index,
-                );
-            }
+            self.raw.setComputePipelineState(&p.raw);
         }
+        self.bindings.sizes_dirty |= p.sizes.is_some();
+        self.pipeline = Some(p.clone());
+    }
+    pub(crate) fn bind(&mut self, slot: u32, resource: Bind<'_>) {
+        self.bindings.bind(slot, resource);
+    }
+    fn flush(&mut self) -> MTLSize {
+        let p = self
+            .pipeline
+            .as_deref()
+            .expect("compute pipeline before dispatch");
+        let sizes = std::mem::take(&mut self.bindings.sizes_dirty);
+        let table = p.sizes.as_deref().filter(|_| sizes);
+        self.bindings.flush(0, p.used, table, &Compute(&self.raw));
+        p.workgroup
     }
     pub(crate) fn dispatch(&mut self, x: u32, y: u32, z: u32) {
         self.work = true;
-        let [w, h, d] = self
-            .pipeline
-            .as_ref()
-            .expect("compute pipeline before dispatch")
-            .workgroup;
+        let workgroup = self.flush();
         self.raw
-            .dispatchThreadgroups_threadsPerThreadgroup(metal_size(x, y, z), metal_size(w, h, d));
+            .dispatchThreadgroups_threadsPerThreadgroup(metal_size(x, y, z), workgroup);
     }
     pub(crate) fn dispatch_indirect(&mut self, args: BufferSlice<'_>) {
         self.work = true;
-        let [w, h, d] = self
-            .pipeline
-            .as_ref()
-            .expect("compute pipeline before dispatch")
-            .workgroup;
+        let workgroup = self.flush();
         unsafe {
             self.raw
                 .dispatchThreadgroupsWithIndirectBuffer_indirectBufferOffset_threadsPerThreadgroup(
                     &args.buffer.inner.0.raw,
                     args.offset as usize,
-                    metal_size(w, h, d),
+                    workgroup,
                 );
         }
     }
 }
 
-fn bind_group(resource: Bind<'_>) -> u32 {
-    match resource {
-        Bind::Uniform(_) => 0,
-        Bind::Sampled(_) => 1,
-        Bind::Sampler(_) => 2,
-        Bind::StorageImage(_) | Bind::StorageBuffer(_) => 3,
-    }
-}
-fn topology(t: Topology) -> MTLPrimitiveType {
-    match t {
-        Topology::Points => MTLPrimitiveType::Point,
-        Topology::Lines => MTLPrimitiveType::Line,
-        Topology::LineStrip => MTLPrimitiveType::LineStrip,
-        Topology::Triangles => MTLPrimitiveType::Triangle,
-        Topology::TriangleStrip => MTLPrimitiveType::TriangleStrip,
-    }
-}
 fn index_type(f: IndexFormat) -> (MTLIndexType, usize) {
     match f {
         IndexFormat::U16 => (MTLIndexType::UInt16, 2),
         IndexFormat::U32 => (MTLIndexType::UInt32, 4),
     }
 }
+fn same<T: objc2::Message + ?Sized>(a: &Retained<T>, b: &Retained<T>) -> bool {
+    std::ptr::eq(Retained::as_ptr(a), Retained::as_ptr(b))
+}
 
-struct Bound {
-    buffers: [Option<(usize, u64, u64)>; 31],
-    textures: [usize; 128],
-    samplers: [usize; 16],
-    sizes: Option<(u8, Vec<u32>)>,
+/// What a pass has bound at each native index (fixed per slot, see
+/// [`shader::native`]), and which of it each stage has yet to receive. `bind`
+/// only records; draws send each stage the changed indices it reads, so
+/// slots persist across pipelines and may be bound before one is set.
+struct Bindings {
+    buffers: [Option<BufferBinding>; 31],
+    textures: [Option<Object<dyn MTLTexture>>; 128],
+    samplers: [Option<Object<dyn MTLSamplerState>>; 16],
+    /// Per stage: indices whose resource changed since the stage last drew.
+    dirty: [Used; 2],
+    /// Per stage: buffer indices whose object (not just offset) changed.
+    moved: [u32; 2],
+    /// A buffer size changed or a pipeline with a size table was set.
+    sizes_dirty: bool,
+    /// Per stage: the size table last written to `buffer(SIZES)`.
+    sent: [Option<ArrayVec<u32, { shader::SIZES }>>; 2],
 }
-impl Default for Bound {
-    fn default() -> Self {
-        Self {
-            buffers: [None; 31],
-            textures: [0; 128],
-            samplers: [0; 16],
-            sizes: None,
+
+struct BufferBinding {
+    raw: Object<dyn MTLBuffer>,
+    offset: u64,
+    size: u64,
+}
+
+/// One stage of an encoder, as `Bindings::flush` writes to it.
+trait Target {
+    fn buffer(&self, buffer: &ProtocolObject<dyn MTLBuffer>, offset: usize, index: usize);
+    fn offset(&self, offset: usize, index: usize);
+    fn texture(&self, texture: &ProtocolObject<dyn MTLTexture>, index: usize);
+    fn sampler(&self, sampler: &ProtocolObject<dyn MTLSamplerState>, index: usize);
+    fn bytes(&self, bytes: &[u32], index: usize);
+}
+struct Vertex<'a>(&'a ProtocolObject<dyn MTLRenderCommandEncoder>);
+struct Fragment<'a>(&'a ProtocolObject<dyn MTLRenderCommandEncoder>);
+struct Compute<'a>(&'a ProtocolObject<dyn MTLComputeCommandEncoder>);
+fn bytes(bytes: &[u32]) -> (NonNull<std::ffi::c_void>, usize) {
+    (NonNull::from(bytes).cast(), std::mem::size_of_val(bytes))
+}
+macro_rules! target {
+    ($ty:ident, $buffer:ident, $offset:ident, $texture:ident, $sampler:ident, $bytes:ident) => {
+        impl Target for $ty<'_> {
+            fn buffer(&self, buffer: &ProtocolObject<dyn MTLBuffer>, offset: usize, index: usize) {
+                unsafe { self.0.$buffer(Some(buffer), offset, index) }
+            }
+            fn offset(&self, offset: usize, index: usize) {
+                unsafe { self.0.$offset(offset, index) }
+            }
+            fn texture(&self, texture: &ProtocolObject<dyn MTLTexture>, index: usize) {
+                unsafe { self.0.$texture(Some(texture), index) }
+            }
+            fn sampler(&self, sampler: &ProtocolObject<dyn MTLSamplerState>, index: usize) {
+                unsafe { self.0.$sampler(Some(sampler), index) }
+            }
+            fn bytes(&self, data: &[u32], index: usize) {
+                let (pointer, length) = bytes(data);
+                unsafe { self.0.$bytes(pointer, length, index) }
+            }
         }
-    }
+    };
 }
-impl Bound {
-    fn set(&mut self, index: usize, resource: Bind<'_>) -> bool {
+target!(
+    Vertex,
+    setVertexBuffer_offset_atIndex,
+    setVertexBufferOffset_atIndex,
+    setVertexTexture_atIndex,
+    setVertexSamplerState_atIndex,
+    setVertexBytes_length_atIndex
+);
+target!(
+    Fragment,
+    setFragmentBuffer_offset_atIndex,
+    setFragmentBufferOffset_atIndex,
+    setFragmentTexture_atIndex,
+    setFragmentSamplerState_atIndex,
+    setFragmentBytes_length_atIndex
+);
+target!(
+    Compute,
+    setBuffer_offset_atIndex,
+    setBufferOffset_atIndex,
+    setTexture_atIndex,
+    setSamplerState_atIndex,
+    setBytes_length_atIndex
+);
+
+impl Bindings {
+    fn new() -> Box<Self> {
+        Box::new(Self {
+            buffers: std::array::from_fn(|_| None),
+            textures: std::array::from_fn(|_| None),
+            samplers: std::array::from_fn(|_| None),
+            dirty: [Used::default(); 2],
+            moved: [0; 2],
+            sizes_dirty: false,
+            sent: [None, None],
+        })
+    }
+    fn bind(&mut self, slot: u32, resource: Bind<'_>) {
+        let index;
         match resource {
             Bind::Uniform(b) | Bind::StorageBuffer(b) => {
-                let value = (
-                    Retained::as_ptr(&b.buffer.inner.0.raw) as usize,
-                    b.offset,
-                    b.size,
-                );
-                let changed =
-                    self.buffers[index].is_none_or(|old| (old.0, old.1) != (value.0, value.1));
-                self.buffers[index] = Some(value);
-                if changed && self.sizes.as_ref().is_some_and(|s| s.0 as usize == index) {
-                    self.sizes = None;
+                index = if matches!(resource, Bind::Uniform(_)) {
+                    slot
+                } else {
+                    shader::SIZES as u32 - 1 - slot
+                };
+                let raw = &b.buffer.inner.0.raw;
+                match &mut self.buffers[index as usize] {
+                    Some(old) if same(&old.raw, raw) => {
+                        if (old.offset, old.size) == (b.offset, b.size) {
+                            return;
+                        }
+                        self.sizes_dirty |= old.size != b.size;
+                        (old.offset, old.size) = (b.offset, b.size);
+                    }
+                    entry => {
+                        *entry = Some(BufferBinding {
+                            raw: raw.clone(),
+                            offset: b.offset,
+                            size: b.size,
+                        });
+                        self.sizes_dirty = true;
+                        self.moved[0] |= 1 << index;
+                        self.moved[1] |= 1 << index;
+                    }
                 }
-                return changed;
+                self.dirty[0].buffers |= 1 << index;
+                self.dirty[1].buffers |= 1 << index;
             }
             Bind::Sampled(image) | Bind::StorageImage(image) => {
-                let value = Retained::as_ptr(&image.inner.raw) as usize;
-                if self.textures[index] == value {
-                    return false;
+                index = if matches!(resource, Bind::Sampled(_)) {
+                    slot
+                } else {
+                    95 - slot
+                };
+                let entry = &mut self.textures[index as usize];
+                if entry
+                    .as_ref()
+                    .is_some_and(|old| same(old, &image.inner.raw))
+                {
+                    return;
                 }
-                self.textures[index] = value;
+                *entry = Some(image.inner.raw.clone());
+                self.dirty[0].textures |= 1 << index;
+                self.dirty[1].textures |= 1 << index;
             }
             Bind::Sampler(sampler) => {
-                let value = Retained::as_ptr(&sampler.inner.0) as usize;
-                if self.samplers[index] == value {
-                    return false;
+                index = slot;
+                let entry = &mut self.samplers[index as usize];
+                if entry
+                    .as_ref()
+                    .is_some_and(|old| same(old, &*sampler.inner.0))
+                {
+                    return;
                 }
-                self.samplers[index] = value;
+                *entry = Some((*sampler.inner.0).clone());
+                self.dirty[0].samplers |= 1 << index;
+                self.dirty[1].samplers |= 1 << index;
             }
         }
-        true
     }
-    fn sizes(&mut self, layout: Option<&shader::BufferSizes>) -> Option<(usize, &[u32])> {
-        let shader::BufferSizes { index, slots } = layout?;
-        let values: Vec<_> = slots
-            .iter()
-            .map(|slot| {
-                slot.and_then(|slot| self.buffers[slot as usize])
-                    .map_or(0, |b| b.2 as u32)
-            })
-            .collect();
-        if self
-            .sizes
-            .as_ref()
-            .is_some_and(|s| s.0 == *index && s.1 == values)
-        {
-            return None;
+    /// Sends `stage` the changed indices it reads, and its size table when
+    /// `sizes` is given and differs from the last one sent.
+    fn flush(&mut self, stage: usize, used: Used, sizes: Option<&[Option<u8>]>, to: &impl Target) {
+        let dirty = &mut self.dirty[stage];
+        let mut buffers = dirty.buffers & used.buffers;
+        let mut textures = dirty.textures & used.textures;
+        let mut samplers = dirty.samplers & used.samplers;
+        dirty.buffers &= !buffers;
+        dirty.textures &= !textures;
+        dirty.samplers &= !samplers;
+        let moved = self.moved[stage] & buffers;
+        self.moved[stage] &= !buffers;
+        while buffers != 0 {
+            let i = buffers.trailing_zeros() as usize;
+            buffers &= buffers - 1;
+            let buffer = self.buffers[i].as_ref().unwrap();
+            if moved & 1 << i != 0 {
+                to.buffer(&buffer.raw, buffer.offset as usize, i);
+            } else {
+                to.offset(buffer.offset as usize, i);
+            }
         }
-        self.buffers[*index as usize] = None;
-        self.sizes = Some((*index, values));
-        Some((*index as usize, &self.sizes.as_ref().unwrap().1))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn binding_cache_tracks_slice_sizes_and_shared_buffer_indices() {
-        let mut bound = Bound::default();
-        let sizes = shader::BufferSizes {
-            index: 29,
-            slots: vec![Some(0), None],
-        };
-        bound.buffers[0] = Some((1, 16, 64));
-        assert_eq!(bound.sizes(Some(&sizes)), Some((29, &[64, 0][..])));
-        assert!(bound.sizes(Some(&sizes)).is_none());
-        bound.buffers[0] = Some((1, 16, 32));
-        assert_eq!(bound.sizes(Some(&sizes)), Some((29, &[32, 0][..])));
-        // Another pipeline uses this index as an ordinary buffer, then the
-        // runtime-array pipeline returns and must restore its size table.
-        bound.sizes = None;
-        bound.buffers[29] = Some((2, 0, 16));
-        assert_eq!(bound.sizes(Some(&sizes)), Some((29, &[32, 0][..])));
-        assert_eq!(bound.buffers[29], None);
+        while textures != 0 {
+            let i = textures.trailing_zeros() as usize;
+            textures &= textures - 1;
+            to.texture(self.textures[i].as_ref().unwrap(), i);
+        }
+        while samplers != 0 {
+            let i = samplers.trailing_zeros() as usize;
+            samplers &= samplers - 1;
+            to.sampler(self.samplers[i].as_ref().unwrap(), i);
+        }
+        if let Some(slots) = sizes {
+            let values: ArrayVec<u32, { shader::SIZES }> = slots
+                .iter()
+                .map(|slot| {
+                    slot.and_then(|i| self.buffers[i as usize].as_ref())
+                        .map_or(0, |b| b.size as u32)
+                })
+                .collect();
+            if self.sent[stage].as_ref() != Some(&values) {
+                to.bytes(&values, shader::SIZES);
+                self.sent[stage] = Some(values);
+            }
+        }
     }
 }

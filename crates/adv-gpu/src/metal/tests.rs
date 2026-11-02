@@ -563,22 +563,22 @@ fn compiled_states_share_across_dynamic_and_depth_state_changes() {
     desc.depth_stencil.as_mut().unwrap().depth_bias = true;
     assert_eq!(device.pipeline_identity(&desc), identity);
     let second = device.create_render_pipeline(&desc, None).unwrap();
-    assert_eq!(first.inner.raw, second.inner.raw);
-    assert_ne!(first.inner.depth, second.inner.depth);
+    assert_eq!(first.inner.0.raw, second.inner.0.raw);
+    assert_ne!(first.inner.0.depth, second.inner.0.depth);
     desc.depth_stencil.as_mut().unwrap().depth_bias = false;
     let third = device.create_render_pipeline(&desc, None).unwrap();
-    assert_eq!(second.inner.depth, third.inner.depth);
+    assert_eq!(second.inner.0.depth, third.inner.0.depth);
     desc.colors[0].write_mask = 1;
     assert_ne!(device.pipeline_identity(&desc), identity);
     let fourth = device.create_render_pipeline(&desc, None).unwrap();
-    assert_ne!(first.inner.raw, fourth.inner.raw);
+    assert_ne!(first.inner.0.raw, fourth.inner.0.raw);
 }
 
 #[test]
 fn ir_compute_uses_workgroup_dimensions_and_runtime_slice_lengths() {
     let (device, mut queue) = gpu();
     let source = "
-        @group(0) @binding(30) var<uniform> add: vec4<u32>;
+        @group(0) @binding(3) var<uniform> add: vec4<u32>;
         @group(3) @binding(30) var<storage, read> unused: array<vec4<u32>>;
         @group(3) @binding(0) var<storage, read_write> values: array<u32>;
         @group(3) @binding(1) var image: texture_storage_2d<rgba8unorm, write>;
@@ -600,7 +600,7 @@ fn ir_compute_uses_workgroup_dimensions_and_runtime_slice_lengths() {
         entry: shader.entry("main", Stage::Compute).unwrap(),
         bindings: vec![
             Binding {
-                slot: 30,
+                slot: 3,
                 kind: BindingKind::UniformBuffer,
                 stages: Stages::COMPUTE,
             },
@@ -623,7 +623,7 @@ fn ir_compute_uses_workgroup_dimensions_and_runtime_slice_lengths() {
     let cache = crate::pipeline::PipelineCache::load(&[]);
     let pipeline = device.create_compute_pipeline(&desc, Some(&cache)).unwrap();
     let same = device.create_compute_pipeline(&desc, None).unwrap();
-    assert_eq!(pipeline.inner.raw, same.inner.raw);
+    assert_eq!(pipeline.inner.0.raw, same.inner.0.raw);
     let uniforms = upload_words(&device, &[0, 7, 0, 0, 0]);
     let values = device
         .create_buffer(&BufferDesc {
@@ -664,7 +664,7 @@ fn ir_compute_uses_workgroup_dimensions_and_runtime_slice_lengths() {
             label: "compute",
         });
         pass.set_pipeline(&pipeline);
-        pass.bind(30, Bind::Uniform(uniforms.slice(4..20)));
+        pass.bind(3, Bind::Uniform(uniforms.slice(4..20)));
         // Changing only the slice length updates naga's size table without
         // redundantly setting the same native buffer and offset.
         pass.bind(
@@ -737,7 +737,7 @@ fn ir_compute_uses_workgroup_dimensions_and_runtime_slice_lengths() {
 #[test]
 fn precompiled_msl_and_shader_validation() {
     let (device, mut queue) = gpu();
-    let shader = device.create_shader(ShaderDesc { source: Source::Precompiled { spirv: &[u32::MAX], metal: b"#include <metal_stdlib>\nusing namespace metal;\nkernel void main0(device uint* out [[buffer(0)]], uint i [[thread_position_in_grid]]) { out[i] = i + 5; }" }, identity: 102, label: "precompiled" }).unwrap();
+    let shader = device.create_shader(ShaderDesc { source: Source::Precompiled { spirv: &[u32::MAX], metal: b"#include <metal_stdlib>\nusing namespace metal;\nkernel void main0(device uint* out [[buffer(29)]], uint i [[thread_position_in_grid]]) { out[i] = i + 5; }" }, identity: 102, label: "precompiled" }).unwrap();
     let pipeline = device
         .create_compute_pipeline(
             &ComputePipelineDesc {

@@ -89,25 +89,68 @@ pub(super) struct Pipelines {
     depth: HashMap<DepthKey, Object<dyn MTLDepthStencilState>>,
     compute: HashMap<Entry, Object<dyn MTLComputePipelineState>>,
 }
-pub(super) struct BoundSlot {
-    pub resource: shader::Slot,
-    pub stages: Stages,
+#[derive(Clone)]
+pub(crate) struct RenderPipeline(pub(super) Arc<RenderData>);
+pub(super) struct RenderData {
+    pub raw: Object<dyn MTLRenderPipelineState>,
+    pub depth: Object<dyn MTLDepthStencilState>,
+    pub raster: Raster,
+    pub topology: MTLPrimitiveType,
+    /// Vertex, then fragment.
+    pub used: [shader::Used; 2],
+    pub sizes: [Option<Box<[Option<u8>]>>; 2],
+}
+/// Encoder raster state a pipeline implies; passes emit only what changes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct Raster {
+    pub cull: MTLCullMode,
+    pub winding: MTLWinding,
+    pub fill: MTLTriangleFillMode,
+    pub clip: MTLDepthClipMode,
+    pub depth_bias: bool,
+}
+impl Raster {
+    /// A new render encoder's state.
+    pub const DEFAULT: Self = Self {
+        cull: MTLCullMode::None,
+        winding: MTLWinding::Clockwise,
+        fill: MTLTriangleFillMode::Fill,
+        clip: MTLDepthClipMode::Clip,
+        depth_bias: false,
+    };
+    fn new(p: Primitive, depth_bias: bool) -> Self {
+        Self {
+            cull: match p.cull {
+                Cull::None => MTLCullMode::None,
+                Cull::Front => MTLCullMode::Front,
+                Cull::Back => MTLCullMode::Back,
+            },
+            winding: if p.front_ccw {
+                MTLWinding::CounterClockwise
+            } else {
+                MTLWinding::Clockwise
+            },
+            fill: if p.wireframe {
+                MTLTriangleFillMode::Lines
+            } else {
+                MTLTriangleFillMode::Fill
+            },
+            clip: if p.unclipped_depth {
+                MTLDepthClipMode::Clamp
+            } else {
+                MTLDepthClipMode::Clip
+            },
+            depth_bias,
+        }
+    }
 }
 #[derive(Clone)]
-pub(crate) struct RenderPipeline {
-    pub(super) raw: Object<dyn MTLRenderPipelineState>,
-    pub(super) depth: Object<dyn MTLDepthStencilState>,
-    pub(super) primitive: Primitive,
-    pub(super) depth_bias: bool,
-    pub(super) bindings: Arc<[BoundSlot]>,
-    pub(super) sizes: [Option<shader::BufferSizes>; 2],
-}
-#[derive(Clone)]
-pub(crate) struct ComputePipeline {
-    pub(super) raw: Object<dyn MTLComputePipelineState>,
-    pub(super) workgroup: [u32; 3],
-    pub(super) bindings: Arc<[BoundSlot]>,
-    pub(super) sizes: Option<shader::BufferSizes>,
+pub(crate) struct ComputePipeline(pub(super) Arc<ComputeData>);
+pub(super) struct ComputeData {
+    pub raw: Object<dyn MTLComputePipelineState>,
+    pub workgroup: MTLSize,
+    pub used: shader::Used,
+    pub sizes: Option<Box<[Option<u8>]>>,
 }
 
 impl Device {
@@ -133,11 +176,12 @@ impl Device {
             {
                 return Err(Error::Compile("render pipeline: wrong shader stage".into()));
             }
-            let mut functions = vec![(Stages::VERTEX, vertex)];
-            if let Some(fragment) = fragment {
-                functions.push((Stages::FRAGMENT, fragment));
-            }
-            let bindings = self.bindings(&desc.bindings, &functions)?;
+            let used = [
+                self.used(&desc.bindings, Stages::VERTEX, vertex)?,
+                fragment.map_or(Ok(shader::Used::default()), |f| {
+                    self.used(&desc.bindings, Stages::FRAGMENT, f)
+                })?,
+            ];
             let key = RenderKey::new(desc);
             let d = MTLRenderPipelineDescriptor::new();
             d.setLabel(Some(&NSString::from_str(desc.label)));
@@ -218,14 +262,23 @@ impl Device {
                 raw
             };
             Ok(crate::RenderPipeline {
-                inner: RenderPipeline {
+                inner: RenderPipeline(Arc::new(RenderData {
                     raw,
                     depth,
-                    primitive: desc.primitive,
-                    depth_bias: desc.depth_stencil.is_some_and(|d| d.depth_bias),
-                    bindings: bindings.into(),
+                    raster: Raster::new(
+                        desc.primitive,
+                        desc.depth_stencil.is_some_and(|d| d.depth_bias),
+                    ),
+                    topology: match desc.primitive.topology {
+                        Topology::Points => MTLPrimitiveType::Point,
+                        Topology::Lines => MTLPrimitiveType::Line,
+                        Topology::LineStrip => MTLPrimitiveType::LineStrip,
+                        Topology::Triangles => MTLPrimitiveType::Triangle,
+                        Topology::TriangleStrip => MTLPrimitiveType::TriangleStrip,
+                    },
+                    used,
                     sizes: [vertex.sizes.clone(), fragment.and_then(|f| f.sizes.clone())],
-                },
+                })),
             })
         })
     }
@@ -242,7 +295,7 @@ impl Device {
                     "compute pipeline: wrong shader stage".into(),
                 ));
             }
-            let bindings = self.bindings(&desc.bindings, &[(Stages::COMPUTE, entry)])?;
+            let used = self.used(&desc.bindings, Stages::COMPUTE, entry)?;
             let d = MTLComputePipelineDescriptor::new();
             d.setLabel(Some(&NSString::from_str(desc.label)));
             d.setComputeFunction(Some(&entry.raw));
@@ -270,61 +323,40 @@ impl Device {
                 pipelines.compute.insert(desc.entry.clone(), raw.clone());
                 raw
             };
+            let [width, height, depth] = entry.workgroup.map(|n| n as usize);
             Ok(crate::ComputePipeline {
-                inner: ComputePipeline {
+                inner: ComputePipeline(Arc::new(ComputeData {
                     raw,
-                    bindings: bindings.into(),
-                    workgroup: entry.workgroup,
+                    workgroup: MTLSize {
+                        width,
+                        height,
+                        depth,
+                    },
+                    used,
                     sizes: entry.sizes.clone(),
-                },
+                })),
             })
         })
     }
-    fn bindings(
+    /// Native indices one stage reads; each must be declared in `bindings`.
+    fn used(
         &self,
         bindings: &[Binding],
-        functions: &[(Stages, &shader::Function)],
-    ) -> Result<Vec<BoundSlot>> {
-        let mut result = Vec::new();
-        for &(stage, function) in functions {
-            let declared: Vec<_> = bindings
-                .iter()
-                .filter(|b| b.stages.contains(stage))
-                .collect();
-            let precompiled;
-            let slots = if let Some(used) = &function.used {
-                used
-            } else {
-                precompiled = shader::binding_layout(
-                    declared
-                        .iter()
-                        .map(|b| {
-                            let (group, buffer) = shader::binding_group(b.kind);
-                            (group, b.slot, buffer)
-                        })
-                        .collect(),
-                    self.caps().limits.max_sampled_images,
-                    false,
-                )?;
-                &precompiled
-            };
-            for slot in slots {
-                if !declared.iter().any(|b| {
-                    b.slot == slot.slot
-                        && shader::binding_group(b.kind) == (slot.group, slot.buffer)
-                }) {
-                    return Err(Error::Invalid(format!(
-                        "missing {stage:?} binding {}:{}",
-                        slot.group, slot.slot
-                    )));
-                }
-                result.push(BoundSlot {
-                    resource: *slot,
-                    stages: stage,
-                });
-            }
+        stage: Stages,
+        function: &shader::Function,
+    ) -> Result<shader::Used> {
+        let mut declared = shader::Used::default();
+        for b in bindings.iter().filter(|b| b.stages.contains(stage)) {
+            let (group, buffer) = shader::binding_group(b.kind);
+            declared.add(group, b.slot, buffer, self.caps().limits.max_sampled_images)?;
         }
-        Ok(result)
+        let used = function.used.unwrap_or(declared);
+        if !declared.contains(used) {
+            return Err(Error::Invalid(format!(
+                "{stage:?} reads a binding the pipeline does not declare"
+            )));
+        }
+        Ok(used)
     }
 }
 

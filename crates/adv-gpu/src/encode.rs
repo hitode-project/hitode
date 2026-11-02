@@ -91,9 +91,11 @@ pub struct ComputePassDesc<'a> {
 /// index in one bindless heap (descriptor indexing, update after bind), and
 /// `bind` writes that index and any offset into the draw's push constants: no
 /// descriptor work per draw. Older drivers use push descriptors (Adreno 6xx)
-/// or descriptor sets cached by content (Mali G76). On Metal `bind` is a
-/// direct `set*` call, the cheapest binding on Apple5 (argument buffers are
-/// only tier 1 there). Vertex streams bind as storage buffers.
+/// or descriptor sets cached by content (Mali G76). On Metal each slot owns a
+/// fixed argument index; `bind` records the resource and each draw issues
+/// direct `set*` calls (`set*BufferOffset` when only the offset moved) for the
+/// changed slots its stages read, the cheapest binding on Apple5 (argument
+/// buffers are only tier 1 there). Vertex streams bind as storage buffers.
 #[derive(Clone, Copy)]
 pub enum Bind<'a> {
     Uniform(BufferSlice<'a>),

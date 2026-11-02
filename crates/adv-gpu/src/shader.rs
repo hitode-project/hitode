@@ -15,7 +15,9 @@ pub enum Source<'a> {
     Wgsl(&'a str),
     Ir(Box<naga::Module>),
     /// Build-time output: SPIR-V words for Vulkan, MSL source or a Metal
-    /// library for Metal. Only the current backend's half is read.
+    /// library for Metal, declaring the argument indices
+    /// [`crate::pipeline::Binding`] lists. Only the current backend's half is
+    /// read.
     Precompiled {
         spirv: &'a [u32],
         metal: &'a [u8],
