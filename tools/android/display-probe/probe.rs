@@ -390,13 +390,21 @@ mod android {
                 ..Default::default()
             })
             .expect("open GPU");
-            let pool = pool(&device, bounds);
+            // A quarter turn draws landscape content for a portrait window.
+            probe.bounds = match rotation() {
+                Rotation::Quarter | Rotation::ThreeQuarters => Rect {
+                    w: bounds.h,
+                    h: bounds.w,
+                    ..bounds
+                },
+                _ => bounds,
+            };
+            let pool = pool(&device, probe.bounds);
             probe.gpu = Some(Gpu {
                 device,
                 queue,
                 pool,
             });
-            probe.bounds = bounds;
         }
         probe.layers = Some(Layers {
             base: Layer {
