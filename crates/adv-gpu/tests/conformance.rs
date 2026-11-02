@@ -50,7 +50,8 @@ fn options() -> DeviceOptions {
     };
     DeviceOptions {
         software: !cfg!(any(target_vendor = "apple", target_os = "android")),
-        validation: true,
+        // Shell processes on Android user builds cannot load layers.
+        validation: !cfg!(target_os = "android"),
         disable,
         ring_size: 4 << 20,
         label: "conformance",
@@ -1218,8 +1219,10 @@ fn present_pools_track_ages_and_releases() {
         .queue
         .submit_present(encoder, &mut [&mut first])
         .expect("submit");
-    // Android compositors wait on a sync fd; Apple's attach after the token.
-    assert_eq!(first.acquire_fence().is_some(), cfg!(target_os = "android"));
+    // Android compositors wait on a sync fd, absent once the batch has
+    // signaled; Apple's attach after the token.
+    let fence = first.acquire_fence();
+    assert!(cfg!(target_os = "android") || fence.is_none());
     first.released(None);
     drop(second);
     gpu.finish(token);

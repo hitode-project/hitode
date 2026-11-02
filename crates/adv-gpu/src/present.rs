@@ -108,7 +108,12 @@ impl PresentPool {
         };
         let age = buffer.stamp.map(|n| (shared.presents - n + 1) as u32);
         if let Some(fence) = buffer.release.take() {
-            queue.inner.wait_next(fence.inner);
+            // A fence that cannot be waited on leaves the buffer's readers
+            // unknown: the buffer leaves the pool.
+            if let Err(error) = queue.inner.wait_next(fence.inner) {
+                shared.allocated -= 1;
+                return Err(error);
+            }
         }
         Ok(Some(PresentImage {
             buffer: Some(buffer),

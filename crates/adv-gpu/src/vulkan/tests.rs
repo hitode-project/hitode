@@ -5,7 +5,8 @@ macro_rules! gpu {
     ($disable:expr) => {
         test_device!(DeviceOptions {
             software: !cfg!(target_os = "android"),
-            validation: true,
+            // Shell processes on user builds cannot load layers.
+            validation: !cfg!(target_os = "android"),
             disable: $disable,
             ..DeviceOptions::default()
         })
@@ -105,6 +106,109 @@ fn read_image(
 fn bytes(buffer: &crate::Buffer) -> &[u8] {
     // SAFETY: Every caller waits for the writing submission before reading.
     unsafe { &*buffer.mapped().unwrap().as_ptr() }
+}
+
+#[cfg(target_os = "android")]
+#[test]
+fn present_batches_reuse_fences_and_preserve_content() {
+    for disable in [Modern::empty(), Modern::all()] {
+        let (device, mut queue) = gpu!(disable);
+        if !device
+            .caps()
+            .features
+            .contains(Features::PRESENTABLE_BUFFERS)
+        {
+            continue;
+        }
+        let mut pool = device
+            .create_present_pool(&PoolDesc {
+                width: 8,
+                height: 8,
+                format: present::FORMAT,
+                count: 2,
+                label: "present batch",
+            })
+            .unwrap();
+        let size = Extent {
+            width: 8,
+            height: 8,
+            depth_or_layers: 1,
+        };
+        let outputs = [readback(&device, 8 * 8 * 4), readback(&device, 8 * 8 * 4)];
+        for frame in 0..4 {
+            let mut images: Vec<_> = (0..2)
+                .map(|_| pool.acquire(&mut queue).unwrap().unwrap())
+                .collect();
+            if frame != 0 {
+                assert!(images.iter().all(|i| i.age().is_some()));
+                // An abandoned recording must leave the foreign state intact.
+                let mut abandoned = queue.encoder("abandoned acquire");
+                read_image(&mut abandoned, images[0].image(), 0, 0, size, &outputs[0]);
+                drop(abandoned);
+                assert_eq!(
+                    images[0].image().inner.core.states.lock().unwrap()[0].family,
+                    vk::QUEUE_FAMILY_FOREIGN_EXT
+                );
+            }
+            let mut encoder = queue.encoder("present batch");
+            for (image, output) in images.iter().zip(&outputs) {
+                let (area, color) = if frame == 0 {
+                    (
+                        Rect {
+                            x: 0,
+                            y: 0,
+                            w: 8,
+                            h: 8,
+                        },
+                        [1.0, 0.0, 0.0, 1.0],
+                    )
+                } else {
+                    (
+                        Rect {
+                            x: 0,
+                            y: 0,
+                            w: 1,
+                            h: 1,
+                        },
+                        [0.0, 1.0, 0.0, 1.0],
+                    )
+                };
+                drop(encoder.render_pass(&pass(
+                    image.image().view(),
+                    area,
+                    Load::Clear(color),
+                    Store::Store,
+                    None,
+                )));
+                read_image(&mut encoder, image.image(), 0, 0, size, output);
+            }
+            let token = queue
+                .submit_present(encoder, &mut images.iter_mut().collect::<Vec<_>>())
+                .unwrap();
+            for mut image in images {
+                let fence = image.acquire_fence();
+                // Loop the GPU's sync fd back as the compositor release. The
+                // next batch must import it, even before this token completes.
+                image.released(fence);
+            }
+            if frame != 3 {
+                continue;
+            }
+            assert!(queue.wait(token, Duration::from_secs(20)).unwrap());
+            for output in &outputs {
+                for (i, pixel) in bytes(output).as_chunks::<4>().0.iter().enumerate() {
+                    assert_eq!(
+                        pixel,
+                        if i == 0 {
+                            &[0, 255, 0, 255]
+                        } else {
+                            &[255, 0, 0, 255]
+                        }
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[test]
@@ -539,9 +643,9 @@ fn binding_tiers_render_identical_pixels() {
         let mut disabled = desc.clone();
         disabled.colors[0].write_mask = 0;
         let disabled = device.create_render_pipeline(&disabled, None).unwrap();
-        assert_eq!(
-            pipeline.inner.compiled.handle == disabled.inner.compiled.handle,
-            device.caps().modern.contains(Modern::COLOR_WRITE_ENABLE)
+        assert_ne!(
+            pipeline.inner.compiled.handle,
+            disabled.inner.compiled.handle
         );
         assert_eq!(
             pipeline.inner.compiled.handle,
@@ -1006,7 +1110,8 @@ fn bindless_sixteen_images_and_samplers_fit_128_push_constant_bytes() {
     let (device, mut queue) = Device::open_with_push_limit(
         &DeviceOptions {
             software: !cfg!(target_os = "android"),
-            validation: true,
+            // Shell processes on user builds cannot load layers.
+            validation: !cfg!(target_os = "android"),
             ..Default::default()
         },
         128,

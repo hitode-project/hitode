@@ -83,16 +83,23 @@ pub(super) struct ImageCore {
     pub(super) context: Arc<Context>,
     pub(super) handle: vk::Image,
     pub(super) desc: ImageDesc,
-    usage: vk::ImageUsageFlags,
+    pub(super) usage: vk::ImageUsageFlags,
     pub(super) conversion: Option<vk::SamplerYcbcrConversion>,
-    allocation: Option<Allocation>,
+    pub(super) allocation: Option<ImageAllocation>,
     pub(super) states: Mutex<Vec<ImageState>>,
+}
+pub(crate) enum ImageAllocation {
+    Private(Allocation),
+    #[cfg(target_os = "android")]
+    Present(vk::DeviceMemory),
 }
 #[derive(Clone, Copy)]
 pub(super) struct ImageState {
     pub(super) layout: vk::ImageLayout,
     pub(super) access: vk::AccessFlags2,
     pub(super) stage: vk::PipelineStageFlags2,
+    #[cfg(target_os = "android")]
+    pub(super) family: u32,
 }
 impl Default for ImageState {
     fn default() -> Self {
@@ -100,6 +107,20 @@ impl Default for ImageState {
             layout: vk::ImageLayout::UNDEFINED,
             access: vk::AccessFlags2::empty(),
             stage: vk::PipelineStageFlags2::TOP_OF_PIPE,
+            #[cfg(target_os = "android")]
+            family: vk::QUEUE_FAMILY_IGNORED,
+        }
+    }
+}
+#[cfg(target_os = "android")]
+impl ImageState {
+    pub(super) fn queue_families(&self, layout: vk::ImageLayout, family: u32) -> (u32, u32) {
+        if layout == vk::ImageLayout::PRESENT_SRC_KHR {
+            (family, vk::QUEUE_FAMILY_FOREIGN_EXT)
+        } else if self.family == vk::QUEUE_FAMILY_FOREIGN_EXT {
+            (vk::QUEUE_FAMILY_FOREIGN_EXT, family)
+        } else {
+            (vk::QUEUE_FAMILY_IGNORED, vk::QUEUE_FAMILY_IGNORED)
         }
     }
 }
@@ -132,6 +153,21 @@ impl Drop for ViewCore {
     }
 }
 impl Image {
+    pub(super) fn wrap(core: ImageCore) -> Result<crate::Image> {
+        let image = Self {
+            core: Arc::new(core),
+            default: std::sync::OnceLock::new(),
+        };
+        let default = image.default_view(&ViewDesc {
+            format: None,
+            dimension: None,
+            mips: 0..image.desc().mips,
+            layers: 0..layers(image.desc()),
+            plane: 0,
+        })?;
+        let _ = image.default.set(default);
+        Ok(crate::Image { inner: image })
+    }
     pub(crate) fn desc(&self) -> &ImageDesc {
         &self.core.desc
     }
@@ -563,7 +599,7 @@ impl Device {
             desc: *desc,
             usage,
             conversion: None,
-            allocation: Some(allocation),
+            allocation: Some(ImageAllocation::Private(allocation)),
             states: Mutex::new(vec![
                 ImageState::default();
                 (desc.mips * layers(desc)) as usize
@@ -596,19 +632,7 @@ impl Device {
                     self.0.device.create_sampler_ycbcr_conversion(&info, None)
                 })?);
         }
-        let image = Image {
-            core: Arc::new(core),
-            default: std::sync::OnceLock::new(),
-        };
-        let default = image.default_view(&ViewDesc {
-            format: None,
-            dimension: None,
-            mips: 0..desc.mips,
-            layers: 0..layers(desc),
-            plane: 0,
-        })?;
-        let _ = image.default.set(default);
-        Ok(crate::Image { inner: image })
+        Image::wrap(core)
     }
     pub(crate) fn sampler(&self, desc: &SamplerDesc) -> Result<crate::Sampler> {
         let mut cache = self.0.samplers.lock().unwrap();

@@ -79,8 +79,7 @@ bitflags::bitflags! {
         const PUSH_DESCRIPTORS = 1 << 4;
         /// Extended dynamic state 1 and 2.
         const EXTENDED_DYNAMIC_STATE = 1 << 5;
-        const COLOR_WRITE_ENABLE = 1 << 6;
-        const LOAD_STORE_OP_NONE = 1 << 7;
+        const LOAD_STORE_OP_NONE = 1 << 6;
     }
 }
 

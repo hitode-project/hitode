@@ -188,7 +188,7 @@ impl Queue {
     ) -> Result<(Token, Option<super::Fence>)> {
         Ok((self.submit(encoder)?, None))
     }
-    pub(crate) fn wait_next(&mut self, fence: super::Fence) {
+    pub(crate) fn wait_next(&mut self, fence: super::Fence) -> Result<()> {
         match fence {}
     }
 }

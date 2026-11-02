@@ -49,6 +49,8 @@ impl Device {
             }
             let mut layers = Vec::new();
             let mut instance_extensions = Vec::new();
+            #[cfg(target_os = "android")]
+            instance_extensions.push(ash::khr::surface::NAME.as_ptr());
             if options.validation {
                 if !entry
                     .enumerate_instance_layer_properties()
@@ -196,10 +198,17 @@ impl Device {
                 heap,
                 cache_prefix,
                 push: ash::khr::push_descriptor::Device::new(&instance, &device),
-                color_write: ash::ext::color_write_enable::Device::new(&instance, &device),
                 dynamic: ash::khr::dynamic_rendering::Device::new(&instance, &device),
                 sync2: ash::khr::synchronization2::Device::new(&instance, &device),
                 timeline: ash::khr::timeline_semaphore::Device::new(&instance, &device),
+                #[cfg(target_os = "android")]
+                ahb: ash::android::external_memory_android_hardware_buffer::Device::new(
+                    &instance, &device,
+                ),
+                #[cfg(target_os = "android")]
+                semaphore_fd: ash::khr::external_semaphore_fd::Device::new(&instance, &device),
+                #[cfg(target_os = "android")]
+                vendor: properties.vendor_id,
                 _entry: entry,
                 instance,
                 debug,
@@ -296,6 +305,8 @@ impl Device {
                 ash::android::external_memory_android_hardware_buffer::NAME,
                 ash::khr::external_fence_fd::NAME,
                 ash::khr::external_semaphore_fd::NAME,
+                ash::khr::swapchain::NAME,
+                ash::ext::queue_family_foreign::NAME,
             ] {
                 if !has(name) {
                     return Err(Error::Unavailable(name.to_string_lossy().into()));
@@ -319,7 +330,6 @@ impl Device {
             let mut indexing = vk::PhysicalDeviceDescriptorIndexingFeatures::default();
             let mut eds1 = vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT::default();
             let mut eds2 = vk::PhysicalDeviceExtendedDynamicState2FeaturesEXT::default();
-            let mut color = vk::PhysicalDeviceColorWriteEnableFeaturesEXT::default();
             let mut float16 = vk::PhysicalDeviceShaderFloat16Int8Features::default();
             let mut dot = vk::PhysicalDeviceShaderIntegerDotProductFeatures::default();
             let mut matrix = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default();
@@ -327,6 +337,7 @@ impl Device {
             let mut matrix_nv = vk::PhysicalDeviceCooperativeMatrixFeaturesNV::default();
             let mut weighted = vk::PhysicalDeviceImageProcessingFeaturesQCOM::default();
             let mut tile_features = vk::PhysicalDeviceTilePropertiesFeaturesQCOM::default();
+            let mut imageless = vk::PhysicalDeviceImagelessFramebufferFeatures::default();
             let mut format4444 = vk::PhysicalDevice4444FormatsFeaturesEXT::default();
             let mut features = vk::PhysicalDeviceFeatures2::default()
                 .push_next(&mut ycbcr)
@@ -336,7 +347,6 @@ impl Device {
                 .push_next(&mut indexing)
                 .push_next(&mut eds1)
                 .push_next(&mut eds2)
-                .push_next(&mut color)
                 .push_next(&mut float16)
                 .push_next(&mut dot)
                 .push_next(&mut matrix)
@@ -345,6 +355,9 @@ impl Device {
                 .push_next(&mut weighted)
                 .push_next(&mut format4444)
                 .push_next(&mut tile_features);
+            if api >= vk::API_VERSION_1_2 {
+                features = features.push_next(&mut imageless);
+            }
             instance.get_physical_device_features2(physical, &mut features);
             let base = features.features;
             // Feature query chains must be detached before building the enabled chain.
@@ -355,7 +368,6 @@ impl Device {
             indexing.p_next = std::ptr::null_mut();
             eds1.p_next = std::ptr::null_mut();
             eds2.p_next = std::ptr::null_mut();
-            color.p_next = std::ptr::null_mut();
             float16.p_next = std::ptr::null_mut();
             dot.p_next = std::ptr::null_mut();
             matrix.p_next = std::ptr::null_mut();
@@ -364,6 +376,7 @@ impl Device {
             weighted.p_next = std::ptr::null_mut();
             format4444.p_next = std::ptr::null_mut();
             tile_features.p_next = std::ptr::null_mut();
+            imageless.p_next = std::ptr::null_mut();
 
             if ycbcr.sampler_ycbcr_conversion == 0 {
                 return Err(Error::Unavailable("samplerYcbcrConversion".into()));
@@ -440,12 +453,6 @@ impl Device {
                 ash::ext::extended_dynamic_state::NAME,
                 vk::API_VERSION_1_3,
             );
-            let use_color = enable(
-                Modern::COLOR_WRITE_ENABLE,
-                color.color_write_enable != 0,
-                ash::ext::color_write_enable::NAME,
-                u32::MAX,
-            );
             enable(
                 Modern::LOAD_STORE_OP_NONE,
                 true,
@@ -480,9 +487,6 @@ impl Device {
             }
             if use_eds && api < vk::API_VERSION_1_3 {
                 device_features = device_features.push_next(&mut eds1).push_next(&mut eds2);
-            }
-            if use_color {
-                device_features = device_features.push_next(&mut color);
             }
             let mut feature_bits =
                 Features::PIPELINE_CACHE | Features::INDIRECT | Features::YCBCR_SAMPLING;
@@ -587,11 +591,16 @@ impl Device {
             if mirror_clamp && api < vk::API_VERSION_1_2 {
                 names.push(ash::khr::sampler_mirror_clamp_to_edge::NAME.as_ptr());
             }
-            let tile_extension =
-                has(ash::qcom::tile_properties::NAME) && tile_features.tile_properties != 0;
+            // The tile query describes its attachment through an imageless
+            // framebuffer: drivers size bins by attachment format.
+            let tile_extension = has(ash::qcom::tile_properties::NAME)
+                && tile_features.tile_properties != 0
+                && imageless.imageless_framebuffer != 0;
             if tile_extension {
                 names.push(ash::qcom::tile_properties::NAME.as_ptr());
-                device_features = device_features.push_next(&mut tile_features);
+                device_features = device_features
+                    .push_next(&mut tile_features)
+                    .push_next(&mut imageless);
             }
             let priorities = [1.0];
             let queues = [vk::DeviceQueueCreateInfo::default()
@@ -622,6 +631,12 @@ impl Device {
                 feature_bits |= Features::SUBGROUP;
             }
             let memory = instance.get_physical_device_memory_properties(physical);
+            #[cfg(target_os = "android")]
+            let present_caps = present::capabilities(props.vendor_id);
+            #[cfg(target_os = "android")]
+            if present_caps.contains(FormatCaps::PRESENTABLE) {
+                feature_bits |= Features::PRESENTABLE_BUFFERS;
+            }
             if memory.memory_types_as_slice().iter().any(|t| {
                 t.property_flags
                     .contains(vk::MemoryPropertyFlags::LAZILY_ALLOCATED)
@@ -675,6 +690,10 @@ impl Device {
                     }
                     if f == Format::Bgra4Unorm && !has4444 {
                         caps = FormatCaps::empty();
+                    }
+                    #[cfg(target_os = "android")]
+                    if f == present::FORMAT {
+                        caps |= present_caps;
                     }
                     (f, caps)
                 })
@@ -745,22 +764,47 @@ impl Device {
 }
 
 unsafe fn query_tile(instance: &ash::Instance, device: &ash::Device) -> Result<(u32, u32)> {
-    // An attachment-free framebuffer queries the device's default tile geometry.
+    // The bin size of one full-HD RGBA8 color target, the common display case.
+    let (width, height) = (1920, 1080);
+    let format = [vk::Format::R8G8B8A8_UNORM];
     unsafe {
-        let subpasses =
-            [vk::SubpassDescription::default()
-                .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)];
+        let attachments = [vk::AttachmentDescription::default()
+            .format(format[0])
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .load_op(vk::AttachmentLoadOp::DONT_CARE)
+            .store_op(vk::AttachmentStoreOp::STORE)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .final_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)];
+        let color = [vk::AttachmentReference::default()
+            .attachment(0)
+            .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)];
+        let subpasses = [vk::SubpassDescription::default()
+            .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+            .color_attachments(&color)];
         let pass = device
             .create_render_pass(
-                &vk::RenderPassCreateInfo::default().subpasses(&subpasses),
+                &vk::RenderPassCreateInfo::default()
+                    .attachments(&attachments)
+                    .subpasses(&subpasses),
                 None,
             )
             .map_err(vk_error)?;
+        let images = [vk::FramebufferAttachmentImageInfo::default()
+            .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+            .width(width)
+            .height(height)
+            .layer_count(1)
+            .view_formats(&format)];
+        let mut imageless =
+            vk::FramebufferAttachmentsCreateInfo::default().attachment_image_infos(&images);
         let framebuffer = match device.create_framebuffer(
             &vk::FramebufferCreateInfo::default()
+                .push_next(&mut imageless)
+                .flags(vk::FramebufferCreateFlags::IMAGELESS)
                 .render_pass(pass)
-                .width(1)
-                .height(1)
+                .attachment_count(1)
+                .width(width)
+                .height(height)
                 .layers(1),
             None,
         ) {
