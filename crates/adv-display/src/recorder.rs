@@ -1,27 +1,26 @@
-//! The flight recorder: a ring of recent planner inputs and outcomes. It holds
-//! geometry and timings only, never image content, so it can go into public
-//! reports. Tests replay it through [`crate::plan::plan`] and a headless
-//! compositor; replays reproduce decision and bookkeeping bugs, not driver or
-//! pixel bugs.
+//! A bounded JSON-lines flight recorder of geometry and timings, never pixels.
+//! Replay uses each recorded input ledger, so the first mismatch identifies a
+//! planner decision rather than depending on a GPU or platform compositor.
 
-use crate::plan::{CompositorCaps, CostModel, FrameInfo, Plan, PoolState, Settings};
-use std::time::Duration;
+use crate::plan::{CompositorCaps, CostModel, FrameInfo, Plan, PoolState, Settings, plan};
+use serde::{Deserialize, Serialize};
+use std::{collections::VecDeque, time::Duration};
 
 pub const CAPACITY: usize = 600;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Event {
     Present(Box<PresentRecord>),
-    /// Window created, replaced, resized or lost; app backgrounded or resumed.
-    Lifecycle(&'static str),
-    /// A pool buffer came back from the compositor.
+    /// Window and application lifecycle changes.
+    Lifecycle(String),
+    /// Release order, without image content or platform handles.
     Released {
         pool: u8,
-        buffer: u8,
+        buffer: usize,
     },
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PresentRecord {
     pub frame: FrameInfo,
     pub settings: Settings,
@@ -33,16 +32,67 @@ pub struct PresentRecord {
     pub stage_times: Vec<Duration>,
 }
 
+#[derive(Default)]
 pub struct Recorder {
-    _inner: (),
+    events: VecDeque<Event>,
 }
 
 impl Recorder {
-    pub fn record(&mut self, _event: Event) {
-        todo!("D")
+    pub fn record(&mut self, event: Event) {
+        if self.events.len() == CAPACITY {
+            self.events.pop_front();
+        }
+        self.events.push_back(event);
     }
-    /// The ring, oldest first, as JSON lines for reports.
+
+    pub fn events(&self) -> impl Iterator<Item = &Event> {
+        self.events.iter()
+    }
+
+    /// JSON lines, oldest first. All event fields have JSON representations.
     pub fn dump(&self) -> String {
-        todo!("D")
+        let mut dump = String::new();
+        for event in &self.events {
+            dump.push_str(&serde_json::to_string(event).expect("serializable recorder event"));
+            dump.push('\n');
+        }
+        dump
     }
+}
+
+/// Parse the complete stream, without truncating it to the live ring capacity.
+pub fn parse(json_lines: &str) -> Result<Vec<Event>, serde_json::Error> {
+    json_lines.lines().map(serde_json::from_str).collect()
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReplayMismatch {
+    /// Zero-based event index, including lifecycle and release events.
+    pub record: usize,
+    pub serial: u64,
+    pub recorded: Box<Plan>,
+    pub replayed: Box<Plan>,
+}
+
+pub fn replay(events: &[Event]) -> Result<(), ReplayMismatch> {
+    for (index, event) in events.iter().enumerate() {
+        if let Event::Present(record) = event {
+            let replayed = plan(
+                &record.frame,
+                &record.settings,
+                &record.caps,
+                &record.cost,
+                &record.pools,
+            );
+            if replayed != record.plan {
+                return Err(ReplayMismatch {
+                    record: index,
+                    serial: record.frame.serial,
+                    recorded: Box::new(record.plan.clone()),
+                    replayed: Box::new(replayed),
+                });
+            }
+        }
+    }
+    Ok(())
 }

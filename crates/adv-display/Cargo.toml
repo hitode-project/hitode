@@ -9,8 +9,10 @@ publish.workspace = true
 
 [dependencies]
 adv-gpu = { path = "../adv-gpu" }
-arrayvec = "0.7"
-smallvec = "1"
+arrayvec = { version = "0.7", features = ["serde"] }
+smallvec = { version = "1", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [lints]
 workspace = true
