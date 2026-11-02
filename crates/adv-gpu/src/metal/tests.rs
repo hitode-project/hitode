@@ -15,8 +15,10 @@ const AREA: Rect = Rect {
 };
 const TIMEOUT: Duration = Duration::from_secs(20);
 
-fn gpu() -> (crate::Device, crate::Queue) {
-    crate::Device::open(&DeviceOptions::default()).unwrap()
+macro_rules! gpu {
+    () => {
+        test_device!(DeviceOptions::default())
+    };
 }
 fn image(device: &crate::Device, format: Format) -> crate::Image {
     device
@@ -85,7 +87,7 @@ fn color_pass<'a>(
 
 #[test]
 fn bounded_color_clears_and_unused_attachments_preserve_contents() {
-    let (device, mut queue) = gpu();
+    let (device, mut queue) = gpu!();
     for format in [Format::Rgba8Unorm, Format::R32Uint] {
         let image = image(&device, format);
         let dst = readback(&device, 256);
@@ -157,7 +159,7 @@ fn bounded_color_clears_and_unused_attachments_preserve_contents() {
 
 #[test]
 fn bounded_depth_and_stencil_clears_preserve_the_other_aspect() {
-    let (device, mut queue) = gpu();
+    let (device, mut queue) = gpu!();
     let image = image(&device, Format::Depth32FloatStencil8);
     let depth = readback(&device, 256);
     let stencil = readback(&device, 64);
@@ -232,7 +234,7 @@ fn public_handles_meet_the_thread_contract() {
 
 #[test]
 fn visibility_queries_count_internal_draws() {
-    let (device, mut queue) = gpu();
+    let (device, mut queue) = gpu!();
     let image = image(&device, Format::Rgba8Unorm);
     let set = device.create_query_set(QueryKind::Occlusion, 2).unwrap();
     let dst = readback(&device, 16);
@@ -262,7 +264,7 @@ fn visibility_queries_count_internal_draws() {
 
 #[test]
 fn passes_without_work_report_zero_duration() {
-    let (device, mut queue) = gpu();
+    let (device, mut queue) = gpu!();
     if !device.caps().features.contains(Features::TIMESTAMPS) {
         return;
     }
@@ -296,7 +298,7 @@ fn passes_without_work_report_zero_duration() {
 
 #[test]
 fn multisample_resolves_preserve_pixels_outside_the_area() {
-    let (device, mut queue) = gpu();
+    let (device, mut queue) = gpu!();
     let resolved = image(&device, Format::Rgba8Unorm);
     let dst = readback(&device, 256);
     for (transient, area) in [(false, AREA), (true, WHOLE), (true, AREA)] {
@@ -374,7 +376,7 @@ fn multisample_resolves_preserve_pixels_outside_the_area() {
 
 #[test]
 fn passes_with_work_report_their_own_samples() {
-    let (device, mut queue) = gpu();
+    let (device, mut queue) = gpu!();
     if !device.caps().features.contains(Features::TIMESTAMPS) {
         return;
     }
@@ -456,7 +458,7 @@ fn upload_words(device: &crate::Device, words: &[u32]) -> crate::Buffer {
 
 #[test]
 fn all_draw_methods_keep_the_area_and_write_pass_samples() {
-    let (device, mut queue) = gpu();
+    let (device, mut queue) = gpu!();
     let target = image(&device, Format::Rgba8Unorm);
     let pipeline = device
         .create_render_pipeline(&draw_desc(&device), None)
@@ -543,7 +545,7 @@ fn all_draw_methods_keep_the_area_and_write_pass_samples() {
 
 #[test]
 fn compiled_states_share_across_dynamic_and_depth_state_changes() {
-    let (device, _) = gpu();
+    let (device, _) = gpu!();
     let mut desc = draw_desc(&device);
     desc.depth_stencil = Some(DepthStencil {
         format: Format::Depth32FloatStencil8,
@@ -576,7 +578,7 @@ fn compiled_states_share_across_dynamic_and_depth_state_changes() {
 
 #[test]
 fn ir_compute_uses_workgroup_dimensions_and_runtime_slice_lengths() {
-    let (device, mut queue) = gpu();
+    let (device, mut queue) = gpu!();
     let source = "
         @group(0) @binding(3) var<uniform> add: vec4<u32>;
         @group(3) @binding(30) var<storage, read> unused: array<vec4<u32>>;
@@ -718,7 +720,7 @@ fn ir_compute_uses_workgroup_dimensions_and_runtime_slice_lengths() {
     let data = cache.serialize().unwrap();
     let loaded = crate::pipeline::PipelineCache::load(&data);
     // A fresh backend has no in-memory pipeline object and must consult the archive.
-    let (another, _) = gpu();
+    let (another, _) = gpu!();
     another
         .create_compute_pipeline(&desc, Some(&loaded))
         .unwrap();
@@ -736,7 +738,7 @@ fn ir_compute_uses_workgroup_dimensions_and_runtime_slice_lengths() {
 
 #[test]
 fn precompiled_msl_and_shader_validation() {
-    let (device, mut queue) = gpu();
+    let (device, mut queue) = gpu!();
     let shader = device.create_shader(ShaderDesc { source: Source::Precompiled { spirv: &[u32::MAX], metal: b"#include <metal_stdlib>\nusing namespace metal;\nkernel void main0(device uint* out [[buffer(29)]], uint i [[thread_position_in_grid]]) { out[i] = i + 5; }" }, identity: 102, label: "precompiled" }).unwrap();
     let pipeline = device
         .create_compute_pipeline(

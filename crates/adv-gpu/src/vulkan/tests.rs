@@ -1,14 +1,15 @@
 use super::*;
 use std::time::Duration;
 
-fn gpu(disable: Modern) -> (crate::Device, crate::Queue) {
-    crate::Device::open(&DeviceOptions {
-        software: !cfg!(target_os = "android"),
-        validation: true,
-        disable,
-        ..DeviceOptions::default()
-    })
-    .unwrap()
+macro_rules! gpu {
+    ($disable:expr) => {
+        test_device!(DeviceOptions {
+            software: !cfg!(target_os = "android"),
+            validation: true,
+            disable: $disable,
+            ..DeviceOptions::default()
+        })
+    };
 }
 fn pass<'a>(
     view: &'a crate::ImageView,
@@ -109,7 +110,7 @@ fn bytes(buffer: &crate::Buffer) -> &[u8] {
 #[test]
 fn views_partial_clears_query_resets_and_resolves() {
     for disable in [Modern::empty(), Modern::all()] {
-        let (device, mut queue) = gpu(disable);
+        let (device, mut queue) = gpu!(disable);
         let extent = Extent {
             width: 8,
             height: 8,
@@ -391,7 +392,7 @@ fn views_partial_clears_query_resets_and_resolves() {
 
 #[test]
 fn ring_reservations_retire_in_order_and_loss_is_sticky() {
-    let (device, mut queue) = gpu(Modern::empty());
+    let (device, mut queue) = gpu!(Modern::empty());
     let mut ring = device.ring(1024).unwrap();
     let first = ring.reserve(512, 16).unwrap();
     let second = ring.reserve(512, 16).unwrap();
@@ -430,7 +431,7 @@ fn binding_tiers_render_identical_pixels() {
     .into_iter()
     .flat_map(|(disable, tier)| (0..3).map(move |source_kind| (disable, tier, source_kind)))
     {
-        let (device, mut queue) = gpu(disable);
+        let (device, mut queue) = gpu!(disable);
         assert!(device.caps().modern.contains(tier));
         assert_eq!(device.inner.0.heap.is_some(), tier == Modern::BINDLESS);
         let wgsl = "
@@ -744,7 +745,7 @@ fn binding_tiers_dispatch_storage_images_and_indirect_work() {
         Modern::BINDLESS,
         Modern::BINDLESS | Modern::PUSH_DESCRIPTORS,
     ] {
-        let (device, mut queue) = gpu(disable);
+        let (device, mut queue) = gpu!(disable);
         let shader = device
             .create_shader(ShaderDesc {
                 source: Source::Wgsl(
@@ -915,7 +916,7 @@ fn storage_pipeline(device: &crate::Device, source: &str) -> crate::RenderPipeli
 
 #[test]
 fn bindless_ring_offsets_keep_one_descriptor_for_ten_thousand_draws() {
-    let (device, mut queue) = gpu(Modern::empty());
+    let (device, mut queue) = gpu!(Modern::empty());
     let heap = device.inner.0.heap.as_ref().unwrap();
     let before = heap.used(3);
     let alignment = u64::from(device.caps().limits.storage_offset_alignment).max(16);
@@ -1231,7 +1232,7 @@ fn bindless_sixteen_images_and_samplers_fit_128_push_constant_bytes() {
 
 #[test]
 fn bindless_storage_offsets_index_by_array_stride() {
-    let (device, mut queue) = gpu(Modern::empty());
+    let (device, mut queue) = gpu!(Modern::empty());
     let shader = device
         .create_shader(ShaderDesc {
             source: Source::Wgsl(
