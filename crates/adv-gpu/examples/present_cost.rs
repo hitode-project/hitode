@@ -38,7 +38,10 @@ fn main() {
     })
     .expect("open device");
     let caps = device.caps();
-    println!("{}", caps.adapter);
+    println!(
+        "{} ({}), tile {:?}",
+        caps.adapter, caps.driver, caps.limits.tile
+    );
     let Some(format) = [Format::Rgba8Unorm, Format::Bgra8Unorm]
         .into_iter()
         .find(|&f| caps.format(f).contains(FormatCaps::PRESENTABLE))

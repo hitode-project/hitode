@@ -52,15 +52,6 @@ impl RenderKey {
             depth.stencil_read_mask = 0;
             depth.stencil_write_mask = 0;
         }
-        if modern.contains(Modern::COLOR_WRITE_ENABLE) {
-            // EXT_color_write_enable gates entire attachments, not individual
-            // components. Partial component masks must remain in the key.
-            for color in &mut key.colors {
-                if color.write_mask == 0 {
-                    color.write_mask = 15;
-                }
-            }
-        }
         key
     }
 }
@@ -187,7 +178,6 @@ pub(super) struct Dynamic {
     stencil: [(vk::StencilOp, vk::StencilOp, vk::StencilOp, vk::CompareOp); 2],
     read_mask: u32,
     write_mask: u32,
-    color_write: (u32, [u32; 8]),
 }
 impl Dynamic {
     fn new(desc: &RenderPipelineDesc) -> Self {
@@ -207,10 +197,6 @@ impl Dynamic {
             pass: StencilOp::Keep,
         };
         let (front, back) = depth.and_then(|d| d.stencil).unwrap_or((keep, keep));
-        let mut color_write = (desc.colors.len() as u32, [0; 8]);
-        for (enable, color) in color_write.1.iter_mut().zip(&desc.colors) {
-            *enable = u32::from(color.write_mask != 0);
-        }
         Self {
             cull: cull(desc.primitive.cull),
             front: winding(desc.primitive.front_ccw),
@@ -223,7 +209,6 @@ impl Dynamic {
             stencil: [face(front), face(back)],
             read_mask: depth.map_or(255, |d| d.stencil_read_mask as u32),
             write_mask: depth.map_or(255, |d| d.stencil_write_mask as u32),
-            color_write,
         }
     }
     pub(super) fn emit(&self, context: &Context, command: vk::CommandBuffer, old: Option<&Self>) {
@@ -282,13 +267,6 @@ impl Dynamic {
                     command,
                     vk::StencilFaceFlags::FRONT_AND_BACK,
                     self.write_mask,
-                );
-            }
-            if context.caps.modern.contains(Modern::COLOR_WRITE_ENABLE) && changed!(color_write) {
-                (context.color_write.fp().cmd_set_color_write_enable_ext)(
-                    command,
-                    self.color_write.0,
-                    self.color_write.1.as_ptr(),
                 );
             }
         }
@@ -537,13 +515,7 @@ impl Device {
             .iter()
             .map(|c| {
                 let mut attachment = vk::PipelineColorBlendAttachmentState::default()
-                    .color_write_mask(vk::ColorComponentFlags::from_raw(
-                        if c.write_mask == 0 && modern.contains(Modern::COLOR_WRITE_ENABLE) {
-                            15
-                        } else {
-                            c.write_mask as u32
-                        },
-                    ));
+                    .color_write_mask(vk::ColorComponentFlags::from_raw(c.write_mask as u32));
                 if let Some((rgb, alpha)) = c.blend {
                     attachment = attachment
                         .blend_enable(true)
@@ -557,17 +529,7 @@ impl Device {
                 attachment
             })
             .collect();
-        let enables: Vec<_> = desc
-            .colors
-            .iter()
-            .map(|c| u32::from(c.write_mask != 0))
-            .collect();
-        let mut write =
-            vk::PipelineColorWriteCreateInfoEXT::default().color_write_enables(&enables);
-        let mut blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&attachments);
-        if modern.contains(Modern::COLOR_WRITE_ENABLE) {
-            blend = blend.push_next(&mut write);
-        }
+        let blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&attachments);
         let mut dynamic = vec![
             vk::DynamicState::VIEWPORT,
             vk::DynamicState::SCISSOR,
@@ -591,9 +553,6 @@ impl Device {
                 vk::DynamicState::PRIMITIVE_RESTART_ENABLE,
                 vk::DynamicState::RASTERIZER_DISCARD_ENABLE,
             ]);
-        }
-        if modern.contains(Modern::COLOR_WRITE_ENABLE) {
-            dynamic.push(vk::DynamicState::COLOR_WRITE_ENABLE_EXT);
         }
         let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic);
         let formats: Vec<_> = desc.colors.iter().map(|c| formats::vk(c.format)).collect();

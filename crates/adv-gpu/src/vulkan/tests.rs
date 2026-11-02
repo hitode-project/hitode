@@ -5,7 +5,8 @@ macro_rules! gpu {
     ($disable:expr) => {
         test_device!(DeviceOptions {
             software: !cfg!(target_os = "android"),
-            validation: true,
+            // Shell processes on user builds cannot load layers.
+            validation: !cfg!(target_os = "android"),
             disable: $disable,
             ..DeviceOptions::default()
         })
@@ -642,9 +643,9 @@ fn binding_tiers_render_identical_pixels() {
         let mut disabled = desc.clone();
         disabled.colors[0].write_mask = 0;
         let disabled = device.create_render_pipeline(&disabled, None).unwrap();
-        assert_eq!(
-            pipeline.inner.compiled.handle == disabled.inner.compiled.handle,
-            device.caps().modern.contains(Modern::COLOR_WRITE_ENABLE)
+        assert_ne!(
+            pipeline.inner.compiled.handle,
+            disabled.inner.compiled.handle
         );
         assert_eq!(
             pipeline.inner.compiled.handle,
@@ -1109,7 +1110,8 @@ fn bindless_sixteen_images_and_samplers_fit_128_push_constant_bytes() {
     let (device, mut queue) = Device::open_with_push_limit(
         &DeviceOptions {
             software: !cfg!(target_os = "android"),
-            validation: true,
+            // Shell processes on user builds cannot load layers.
+            validation: !cfg!(target_os = "android"),
             ..Default::default()
         },
         128,

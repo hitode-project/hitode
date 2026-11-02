@@ -68,7 +68,6 @@ pub(crate) struct Context {
     push: ash::khr::push_descriptor::Device,
     /// Set when extended dynamic state is in use.
     eds: Option<Eds>,
-    color_write: ash::ext::color_write_enable::Device,
     cache_prefix: [u8; 28],
     #[cfg(target_os = "android")]
     ahb: ash::android::external_memory_android_hardware_buffer::Device,

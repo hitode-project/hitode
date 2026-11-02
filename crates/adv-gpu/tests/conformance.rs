@@ -50,7 +50,8 @@ fn options() -> DeviceOptions {
     };
     DeviceOptions {
         software: !cfg!(any(target_vendor = "apple", target_os = "android")),
-        validation: true,
+        // Shell processes on Android user builds cannot load layers.
+        validation: !cfg!(target_os = "android"),
         disable,
         ring_size: 4 << 20,
         label: "conformance",
