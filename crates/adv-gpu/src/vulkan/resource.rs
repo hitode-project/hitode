@@ -15,9 +15,19 @@ pub(super) struct BufferCore {
     pub(super) handle: vk::Buffer,
     desc: BufferDesc,
     allocation: Option<Allocation>,
+    pub(super) uniforms: Mutex<HashMap<u64, vk::DescriptorSet>>,
+    storage: Mutex<HashMap<(u64, u64), u32>>,
 }
 impl Drop for BufferCore {
     fn drop(&mut self) {
+        if let Some(heap) = &self.context.heap {
+            for (_, set) in self.uniforms.get_mut().unwrap().drain() {
+                heap.free_uniform(&self.context, set);
+            }
+            for (_, index) in self.storage.get_mut().unwrap().drain() {
+                heap.free(3, index);
+            }
+        }
         unsafe {
             self.context.device.destroy_buffer(self.handle, None);
         }
@@ -25,6 +35,27 @@ impl Drop for BufferCore {
     }
 }
 impl Buffer {
+    // A buffer binding owns its heap entry until the buffer retires. Distinct
+    // slices populate entries on first use; repeated draws reuse them.
+    pub(super) fn heap_index(&self, offset: u64, size: u64) -> Result<u32> {
+        let mut indices = self.0.storage.lock().unwrap();
+        if let Some(&index) = indices.get(&(offset, size)) {
+            return Ok(index);
+        }
+        let index = self.0.context.heap.as_ref().unwrap().insert(
+            &self.0.context,
+            3,
+            Some(
+                vk::DescriptorBufferInfo::default()
+                    .buffer(self.0.handle)
+                    .offset(offset)
+                    .range(size),
+            ),
+            None,
+        )?;
+        indices.insert((offset, size), index);
+        Ok(index)
+    }
     pub(crate) fn desc(&self) -> &BufferDesc {
         &self.0.desc
     }
@@ -112,9 +143,19 @@ pub(super) struct ViewCore {
     pub(super) handle: vk::ImageView,
     pub(super) desc: ViewDesc,
     pub(super) format: Format,
+    pub(super) sampled: Option<u32>,
+    pub(super) storage: Option<u32>,
 }
 impl Drop for ViewCore {
     fn drop(&mut self) {
+        if let Some(heap) = &self.image.inner.core.context.heap {
+            if let Some(index) = self.sampled {
+                heap.free(0, index);
+            }
+            if let Some(index) = self.storage {
+                heap.free(2, index);
+            }
+        }
         unsafe {
             self.image
                 .inner
@@ -252,18 +293,55 @@ impl Image {
             .core
             .context
             .result(unsafe { self.core.context.device.create_image_view(&info, None) })?;
-        Ok(crate::ImageView {
-            inner: ImageView(Arc::new(ViewCore {
-                image: crate::Image {
-                    inner: Image {
-                        core: self.core.clone(),
-                        default: std::sync::OnceLock::new(),
-                    },
+        let mut core = ViewCore {
+            sampled: None,
+            storage: None,
+            image: crate::Image {
+                inner: Image {
+                    core: self.core.clone(),
+                    default: std::sync::OnceLock::new(),
                 },
-                handle,
-                desc: desc.clone(),
-                format,
-            })),
+            },
+            handle,
+            desc: desc.clone(),
+            format,
+        };
+        if let Some(heap) = &self.core.context.heap {
+            if view_usage.contains(vk::ImageUsageFlags::SAMPLED) && self.core.conversion.is_none() {
+                core.sampled = Some(
+                    heap.insert(
+                        &self.core.context,
+                        0,
+                        None,
+                        Some(
+                            vk::DescriptorImageInfo::default()
+                                .image_view(handle)
+                                .image_layout(if format.has_depth() {
+                                    vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL
+                                } else {
+                                    vk::ImageLayout::GENERAL
+                                }),
+                        ),
+                    )?,
+                );
+            }
+            if view_usage.contains(vk::ImageUsageFlags::STORAGE) {
+                core.storage = Some(
+                    heap.insert(
+                        &self.core.context,
+                        2,
+                        None,
+                        Some(
+                            vk::DescriptorImageInfo::default()
+                                .image_view(handle)
+                                .image_layout(vk::ImageLayout::GENERAL),
+                        ),
+                    )?,
+                );
+            }
+        }
+        Ok(crate::ImageView {
+            inner: ImageView(Arc::new(core)),
         })
     }
 }
@@ -292,13 +370,17 @@ impl ImageView {
     }
 }
 #[derive(Clone)]
-pub(crate) struct Sampler(#[allow(dead_code)] pub(super) Arc<SamplerCore>); // Read by A2 bindings.
+pub(crate) struct Sampler(pub(super) Arc<SamplerCore>);
 pub(crate) struct SamplerCore {
     context: Arc<Context>,
     pub(super) handle: vk::Sampler,
+    pub(super) index: Option<u32>,
 }
 impl Drop for SamplerCore {
     fn drop(&mut self) {
+        if let Some(index) = self.index {
+            self.context.heap.as_ref().unwrap().free(1, index);
+        }
         unsafe {
             self.context.device.destroy_sampler(self.handle, None);
         }
@@ -381,6 +463,8 @@ impl Device {
                     handle,
                     desc: *desc,
                     allocation: Some(allocation),
+                    uniforms: Mutex::new(HashMap::new()),
+                    storage: Mutex::new(HashMap::new()),
                 }),
                 std::sync::OnceLock::new(),
             ),
@@ -614,10 +698,20 @@ impl Device {
         let handle = self
             .0
             .result(unsafe { self.0.device.create_sampler(&info, None) })?;
-        let sampler = Arc::new(SamplerCore {
+        let mut core = SamplerCore {
+            index: None,
             context: self.0.clone(),
             handle,
-        });
+        };
+        if let Some(heap) = &self.0.heap {
+            core.index = Some(heap.insert(
+                &self.0,
+                1,
+                None,
+                Some(vk::DescriptorImageInfo::default().sampler(handle)),
+            )?);
+        }
+        let sampler = Arc::new(core);
         cache.insert(*desc, Arc::downgrade(&sampler));
         Ok(crate::Sampler {
             inner: Sampler(sampler),

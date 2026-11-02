@@ -16,6 +16,7 @@ pub(super) struct Shared {
     timeline: vk::Semaphore,
     pub(super) state: Mutex<State>,
     pub(super) passes: Mutex<HashMap<encode::PassKey, encode::LegacyPass>>,
+    pub(super) descriptors: Mutex<Vec<binding::DescriptorArena>>,
 }
 pub(super) struct State {
     next: u64,
@@ -71,6 +72,7 @@ impl Queue {
             pool,
             timeline,
             passes: Mutex::new(HashMap::new()),
+            descriptors: Mutex::new(Vec::new()),
             state: Mutex::new(State {
                 next: 1,
                 completed: 0,
@@ -297,7 +299,10 @@ impl Shared {
         };
         state.completed = completed;
         while state.pending.front().is_some_and(|s| s.token <= completed) {
-            let submission = state.pending.pop_front().unwrap();
+            let mut submission = state.pending.pop_front().unwrap();
+            if let Some(arena) = submission._resources.descriptors.take() {
+                self.descriptors.lock().unwrap().push(arena);
+            }
             if submission.fence != vk::Fence::null() {
                 self.context
                     .result(unsafe { self.context.device.reset_fences(&[submission.fence]) })?;
@@ -329,7 +334,10 @@ impl Drop for Shared {
         let state = self.state.get_mut().unwrap();
         unsafe {
             let _ = self.context.device.device_wait_idle();
-            for submission in state.pending.drain(..) {
+            for mut submission in state.pending.drain(..) {
+                if let Some(mut arena) = submission._resources.descriptors.take() {
+                    arena.destroy(&self.context);
+                }
                 if submission.fence != vk::Fence::null() {
                     self.context.device.destroy_fence(submission.fence, None);
                 }
@@ -339,6 +347,9 @@ impl Drop for Shared {
             }
             if self.timeline != vk::Semaphore::null() {
                 self.context.device.destroy_semaphore(self.timeline, None);
+            }
+            for arena in self.descriptors.get_mut().unwrap() {
+                arena.destroy(&self.context);
             }
             for (_, pass) in self.passes.get_mut().unwrap().drain() {
                 self.context

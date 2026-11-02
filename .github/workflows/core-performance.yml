@@ -24,7 +24,6 @@ jobs:
   gpu:
     name: gpu (lavapipe)
     runs-on: ubuntu-24.04-arm
-    continue-on-error: true
     timeout-minutes: 15
     env:
       ADV_GPU_REQUIRE_BACKEND: '1'
@@ -35,12 +34,12 @@ jobs:
       - name: Install Vulkan software driver and validation
         run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers vulkan-validationlayers
       - name: Test Vulkan backend
-        run: cargo test --locked -p adv-gpu --test conformance
+        run: cargo test --locked -p adv-gpu --lib --test conformance
       - name: Test Vulkan stand-ins
         if: success() || failure()
         env:
           ADV_GPU_TEST_DISABLE: all
-        run: cargo test --locked -p adv-gpu --test conformance
+        run: cargo test --locked -p adv-gpu --lib --test conformance
 
   core:
     if: github.event_name != 'schedule'

@@ -54,7 +54,10 @@ impl Device {
                 instance_extensions.push(ash::ext::debug_utils::NAME.as_ptr());
             }
             let mut messenger_info = vk::DebugUtilsMessengerCreateInfoEXT::default()
-                .message_severity(vk::DebugUtilsMessageSeverityFlagsEXT::ERROR)
+                .message_severity(
+                    vk::DebugUtilsMessageSeverityFlagsEXT::ERROR
+                        | vk::DebugUtilsMessageSeverityFlagsEXT::WARNING,
+                )
                 .message_type(
                     vk::DebugUtilsMessageTypeFlagsEXT::GENERAL
                         | vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION
@@ -124,7 +127,59 @@ impl Device {
                     return Err(Error::Unavailable(format!("Vulkan allocator: {e}")));
                 }
             };
+            let properties = instance.get_physical_device_properties(physical);
+            let mut cache_prefix = [0; 28];
+            cache_prefix[..16].copy_from_slice(&properties.pipeline_cache_uuid);
+            for (i, value) in [
+                properties.vendor_id,
+                properties.device_id,
+                properties.driver_version,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                cache_prefix[16 + i * 4..20 + i * 4].copy_from_slice(&value.to_le_bytes());
+            }
+            let mut caps = caps;
+            let heap = if caps.modern.contains(Modern::BINDLESS) {
+                match binding::Heap::new(&instance, physical, &device) {
+                    Ok(heap) => Some(heap),
+                    Err(error) => {
+                        drop(allocator);
+                        device.destroy_device(None);
+                        if let Some((loader, messenger)) = &debug {
+                            loader.destroy_debug_utils_messenger(*messenger, None);
+                        }
+                        instance.destroy_instance(None);
+                        return Err(error);
+                    }
+                }
+            } else {
+                None
+            };
+            if let Some(heap) = &heap {
+                let slots = caps.limits.push_constant_bytes / 4 / 3;
+                caps.limits.max_sampled_images = caps
+                    .limits
+                    .max_sampled_images
+                    .min(slots)
+                    .min(heap.counts[0]);
+                caps.limits.max_samplers = caps.limits.max_samplers.min(slots).min(heap.counts[1]);
+                caps.limits.max_storage_bindings = caps
+                    .limits
+                    .max_storage_bindings
+                    .min(slots)
+                    .min(heap.counts[2])
+                    .min(heap.counts[3]);
+            }
             let context = Arc::new(Context {
+                pipelines: Mutex::new(pipeline::Pipelines::default()),
+                heap,
+                cache_prefix,
+                push: ash::khr::push_descriptor::Device::new(&instance, &device),
+                eds1: ash::ext::extended_dynamic_state::Device::new(&instance, &device),
+                eds2: ash::ext::extended_dynamic_state2::Device::new(&instance, &device),
+                color_write: ash::ext::color_write_enable::Device::new(&instance, &device),
                 dynamic: ash::khr::dynamic_rendering::Device::new(&instance, &device),
                 sync2: ash::khr::synchronization2::Device::new(&instance, &device),
                 timeline: ash::khr::timeline_semaphore::Device::new(&instance, &device),
@@ -632,7 +687,13 @@ impl Device {
                     max_image_3d: l.max_image_dimension3_d,
                     max_image_layers: l.max_image_array_layers,
                     max_color_attachments: l.max_color_attachments,
-                    max_uniform_buffers: l.max_per_stage_descriptor_uniform_buffers,
+                    max_uniform_buffers: if use_indexing {
+                        (l.max_bound_descriptor_sets - 1)
+                            .min(l.max_descriptor_set_uniform_buffers_dynamic)
+                            .min(l.max_per_stage_descriptor_uniform_buffers)
+                    } else {
+                        l.max_per_stage_descriptor_uniform_buffers
+                    },
                     max_sampled_images: l.max_per_stage_descriptor_sampled_images,
                     max_samplers: l.max_per_stage_descriptor_samplers,
                     max_storage_bindings: l

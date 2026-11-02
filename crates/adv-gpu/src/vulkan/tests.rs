@@ -420,3 +420,449 @@ fn ring_reservations_retire_in_order_and_loss_is_sticky() {
     assert!(matches!(device.ring(1024), Err(Error::DeviceLost(_))));
     assert!(matches!(ring.reserve(1, 1), Err(Error::DeviceLost(_))));
 }
+
+#[test]
+fn binding_tiers_render_identical_pixels() {
+    let mut results = Vec::new();
+    for (disable, tier, source_kind) in [
+        (Modern::empty(), Modern::BINDLESS),
+        (Modern::BINDLESS, Modern::PUSH_DESCRIPTORS),
+        (Modern::BINDLESS | Modern::PUSH_DESCRIPTORS, Modern::empty()),
+    ]
+    .into_iter()
+    .flat_map(|(disable, tier)| (0..3).map(move |source_kind| (disable, tier, source_kind)))
+    {
+        let (device, mut queue) = gpu(disable);
+        assert!(device.caps().modern.contains(tier));
+        assert_eq!(device.inner.0.heap.is_some(), tier == Modern::BINDLESS);
+        let wgsl = "
+            struct Block { color: vec4<f32> }
+            @group(0) @binding(0) var<uniform> block: Block;
+            @group(0) @binding(1) var<uniform> second: Block;
+            @group(1) @binding(0) var image: texture_2d<f32>;
+            @group(1) @binding(1) var other: texture_2d<f32>;
+            @group(2) @binding(0) var nearest: sampler;
+            @group(2) @binding(1) var other_sampler: sampler;
+            @group(3) @binding(0) var<storage,read> positions: array<vec2<f32>>;
+            struct Positions {data:array<vec2<f32>>}
+            @group(3) @binding(1) var<storage,read> other_positions:Positions;
+            fn position(i:u32) -> vec2<f32> {return (positions[i]+other_positions.data[i])*0.5;}
+            @vertex fn vs(@builtin(vertex_index) i:u32) -> @builtin(position) vec4<f32> {
+                return vec4<f32>(position(i), 0.5, 1.0);
+            }
+            @fragment fn fs() -> @location(0) vec4<f32> {
+                return (textureSample(image, nearest, vec2<f32>(0.5))+textureSample(other,other_sampler,vec2<f32>(0.5)))*0.5 * block.color * second.color;
+            }
+        ";
+        let module = naga::front::wgsl::parse_str(wgsl).unwrap();
+        let info = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .unwrap();
+        let spirv = naga::back::spv::write_vec(&module, &info, &Default::default(), None).unwrap();
+        let source = if source_kind == 0 {
+            Source::Wgsl(wgsl)
+        } else if source_kind == 1 {
+            Source::Ir(Box::new(module))
+        } else {
+            Source::Precompiled {
+                spirv: &spirv,
+                metal: b"unused",
+            }
+        };
+        let shader = device
+            .create_shader(ShaderDesc {
+                source,
+                identity: 101 + source_kind,
+                label: "binding tiers",
+            })
+            .unwrap();
+        assert!(shader.entry("vs", Stage::Fragment).is_err());
+        assert!(shader.entry("missing", Stage::Vertex).is_err());
+        let mut desc = RenderPipelineDesc {
+            vertex: shader.entry("vs", Stage::Vertex).unwrap(),
+            fragment: Some(shader.entry("fs", Stage::Fragment).unwrap()),
+            bindings: vec![
+                Binding {
+                    slot: 0,
+                    kind: BindingKind::UniformBuffer,
+                    stages: Stages::FRAGMENT,
+                },
+                Binding {
+                    slot: 0,
+                    kind: BindingKind::SampledImage {
+                        dimension: Dimension::D2,
+                        depth: false,
+                        multisampled: false,
+                    },
+                    stages: Stages::FRAGMENT,
+                },
+                Binding {
+                    slot: 0,
+                    kind: BindingKind::Sampler { comparison: false },
+                    stages: Stages::FRAGMENT,
+                },
+                Binding {
+                    slot: 0,
+                    kind: BindingKind::StorageBuffer { writable: false },
+                    stages: Stages::VERTEX,
+                },
+            ],
+            primitive: Primitive {
+                topology: Topology::Triangles,
+                cull: Cull::None,
+                front_ccw: false,
+                wireframe: false,
+                unclipped_depth: false,
+            },
+            colors: [ColorTarget {
+                format: Format::Rgba8Unorm,
+                blend: None,
+                write_mask: 15,
+            }]
+            .into_iter()
+            .collect(),
+            depth_stencil: None,
+            samples: 1,
+            alpha_to_coverage: false,
+            label: "binding tiers",
+        };
+        let extra: Vec<_> = desc
+            .bindings
+            .iter()
+            .map(|b| Binding { slot: 1, ..*b })
+            .collect();
+        desc.bindings.extend(extra);
+        let pipeline = device.create_render_pipeline(&desc, None).unwrap();
+        let duplicate = device.create_render_pipeline(&desc, None).unwrap();
+        let mut disabled = desc.clone();
+        disabled.colors[0].write_mask = 0;
+        let disabled = device.create_render_pipeline(&disabled, None).unwrap();
+        assert_eq!(
+            pipeline.inner.core.handle == disabled.inner.core.handle,
+            device.caps().modern.contains(Modern::COLOR_WRITE_ENABLE)
+        );
+        assert_eq!(pipeline.inner.core.handle, duplicate.inner.core.handle);
+        let sampler = device
+            .sampler(&SamplerDesc {
+                min: Filter::Nearest,
+                mag: Filter::Nearest,
+                mip: Filter::Nearest,
+                address: [Address::Clamp; 3],
+                border: BorderColor::TransparentBlack,
+                lod_bias: 0,
+                lod_min: 0,
+                lod_max: 0,
+                anisotropy: 1,
+                compare: None,
+            })
+            .unwrap();
+        let upload = |data: &[u8], usage| {
+            let buffer = device
+                .create_buffer(&BufferDesc {
+                    size: data.len() as u64,
+                    usage,
+                    memory: Memory::Upload,
+                    label: "tier data",
+                })
+                .unwrap();
+            // SAFETY: New buffers have no GPU users.
+            unsafe {
+                (&mut *buffer.mapped().unwrap().as_ptr()).copy_from_slice(data);
+            }
+            buffer
+        };
+        let floats = |data: &[f32]| {
+            data.iter()
+                .flat_map(|f| f.to_ne_bytes())
+                .collect::<Vec<_>>()
+        };
+        let storage_stride = device.caps().limits.storage_offset_alignment.max(8) as usize;
+        let mut vertices = vec![0; storage_stride + 24];
+        vertices[storage_stride..].copy_from_slice(&floats(&[-1.0, -1.0, 3.0, -1.0, -1.0, 3.0]));
+        let positions = upload(&vertices, BufferUsage::STORAGE);
+        let stride = device.caps().limits.uniform_offset_alignment.max(16) as usize;
+        let mut blocks = vec![0; stride + 16];
+        blocks[..16].copy_from_slice(&floats(&[1.0, 0.0, 0.0, 1.0]));
+        blocks[stride..].copy_from_slice(&floats(&[0.0, 1.0, 0.0, 1.0]));
+        let uniforms = upload(&blocks, BufferUsage::UNIFORM);
+        let indices = upload(&[0, 0, 1, 0, 2, 0], BufferUsage::INDEX);
+        let indirect = upload(
+            &[3u32, 1, 0, 0]
+                .into_iter()
+                .flat_map(u32::to_ne_bytes)
+                .collect::<Vec<_>>(),
+            BufferUsage::INDIRECT,
+        );
+        let indexed_args = upload(
+            &[3u32, 1, 0, 0, 0]
+                .into_iter()
+                .flat_map(u32::to_ne_bytes)
+                .collect::<Vec<_>>(),
+            BufferUsage::INDIRECT,
+        );
+        let size = Extent {
+            width: 8,
+            height: 8,
+            depth_or_layers: 1,
+        };
+        let image = create_image(&device, Format::Rgba8Unorm, size, 1, 1);
+        let texture = create_image(
+            &device,
+            Format::Rgba8Unorm,
+            Extent {
+                width: 1,
+                height: 1,
+                depth_or_layers: 1,
+            },
+            1,
+            1,
+        );
+        let output = readback(&device, 256);
+        let mut encoder = queue.encoder("tier comparison");
+        drop(encoder.render_pass(&pass(
+            texture.view(),
+            Rect {
+                x: 0,
+                y: 0,
+                w: 1,
+                h: 1,
+            },
+            Load::Clear([1.0; 4]),
+            Store::Store,
+            None,
+        )));
+        {
+            let mut render = encoder.render_pass(&pass(
+                image.view(),
+                Rect {
+                    x: 0,
+                    y: 0,
+                    w: 8,
+                    h: 8,
+                },
+                Load::Clear([0.0; 4]),
+                Store::Store,
+                None,
+            ));
+            render.set_pipeline(&pipeline);
+            render.set_pipeline(&duplicate);
+            render.bind(0, Bind::Sampled(texture.view()));
+            render.bind(1, Bind::Sampled(texture.view()));
+            render.bind(0, Bind::Sampler(&sampler));
+            render.bind(1, Bind::Sampler(&sampler));
+            render.bind(
+                0,
+                Bind::StorageBuffer(
+                    positions.slice(storage_stride as u64..storage_stride as u64 + 24),
+                ),
+            );
+            render.bind(
+                1,
+                Bind::StorageBuffer(
+                    positions.slice(storage_stride as u64..storage_stride as u64 + 24),
+                ),
+            );
+            render.set_index_buffer(indices.slice(0..6), IndexFormat::U16);
+            for (i, x) in [0, 4].into_iter().enumerate() {
+                render.bind(
+                    0,
+                    Bind::Uniform(uniforms.slice((i * stride) as u64..(i * stride + 16) as u64)),
+                );
+                render.bind(
+                    1,
+                    Bind::Uniform(uniforms.slice((i * stride) as u64..(i * stride + 16) as u64)),
+                );
+                render.set_scissor(Rect {
+                    x,
+                    y: 0,
+                    w: 4,
+                    h: 8,
+                });
+                render.draw(0..3, 0..1);
+                render.draw_indexed(0..3, 0, 0..1);
+                render.draw_indirect(indirect.slice(0..16), false);
+                render.draw_indirect(indexed_args.slice(0..20), true);
+                if i == 0 {
+                    render.set_pipeline(&disabled);
+                    render.bind(
+                        0,
+                        Bind::Uniform(uniforms.slice(stride as u64..stride as u64 + 16)),
+                    );
+                    render.bind(
+                        1,
+                        Bind::Uniform(uniforms.slice(stride as u64..stride as u64 + 16)),
+                    );
+                    render.draw(0..3, 0..1);
+                    render.set_pipeline(&pipeline);
+                }
+            }
+        }
+        read_image(&mut encoder, &image, 0, 0, size, &output);
+        drop((
+            uniforms,
+            positions,
+            sampler,
+            indices,
+            indirect,
+            indexed_args,
+            pipeline,
+            duplicate,
+            disabled,
+            shader,
+            texture,
+            image,
+        ));
+        finish(&mut queue, encoder);
+        let pixels = bytes(&output).to_vec();
+        for y in 0..8 {
+            for x in 0..8 {
+                assert_eq!(
+                    &pixels[(y * 8 + x) * 4..(y * 8 + x + 1) * 4],
+                    if x < 4 {
+                        &[255, 0, 0, 255]
+                    } else {
+                        &[0, 255, 0, 255]
+                    }
+                );
+            }
+        }
+        results.push(pixels);
+    }
+    for pixels in &results[1..] {
+        assert_eq!(&results[0], pixels);
+    }
+}
+
+#[test]
+fn binding_tiers_dispatch_storage_images_and_indirect_work() {
+    for disable in [
+        Modern::empty(),
+        Modern::BINDLESS,
+        Modern::BINDLESS | Modern::PUSH_DESCRIPTORS,
+    ] {
+        let (device, mut queue) = gpu(disable);
+        let shader = device
+            .create_shader(ShaderDesc {
+                source: Source::Wgsl(
+                    "
+            @group(3) @binding(0) var output_image:texture_storage_2d<rgba8unorm,write>;
+            @group(3) @binding(1) var<storage,read_write> values:array<u32>;
+            @compute @workgroup_size(1) fn main(@builtin(global_invocation_id) id:vec3<u32>) {
+                values[id.x]=id.x+17u;
+                textureStore(output_image,vec2<i32>(id.xy),vec4<f32>(1.0,0.0,0.0,1.0));
+            }
+        ",
+                ),
+                identity: 102,
+                label: "storage dispatch",
+            })
+            .unwrap();
+        let desc = ComputePipelineDesc {
+            entry: shader.entry("main", Stage::Compute).unwrap(),
+            bindings: vec![
+                Binding {
+                    slot: 0,
+                    kind: BindingKind::StorageImage {
+                        format: Format::Rgba8Unorm,
+                        writable: true,
+                    },
+                    stages: Stages::COMPUTE,
+                },
+                Binding {
+                    slot: 1,
+                    kind: BindingKind::StorageBuffer { writable: true },
+                    stages: Stages::COMPUTE,
+                },
+            ],
+            label: "storage dispatch",
+        };
+        let pipeline = device.create_compute_pipeline(&desc, None).unwrap();
+        let duplicate = device.create_compute_pipeline(&desc, None).unwrap();
+        assert_eq!(pipeline.inner.core.handle, duplicate.inner.core.handle);
+        let target = device
+            .create_image(&ImageDesc {
+                dimension: Dimension::D2,
+                size: Extent {
+                    width: 2,
+                    height: 1,
+                    depth_or_layers: 1,
+                },
+                format: Format::Rgba8Unorm,
+                mips: 1,
+                samples: 1,
+                usage: Usage::STORAGE | Usage::COPY_SRC,
+                view_formats: &[],
+                label: "storage output",
+            })
+            .unwrap();
+        let buffer = device
+            .create_buffer(&BufferDesc {
+                size: 8,
+                usage: BufferUsage::STORAGE | BufferUsage::COPY_SRC,
+                memory: Memory::Device,
+                label: "storage values",
+            })
+            .unwrap();
+        let args = device
+            .create_buffer(&BufferDesc {
+                size: 12,
+                usage: BufferUsage::INDIRECT,
+                memory: Memory::Upload,
+                label: "dispatch args",
+            })
+            .unwrap();
+        // SAFETY: The new indirect buffer has no GPU users.
+        unsafe {
+            (&mut *args.mapped().unwrap().as_ptr()).copy_from_slice(
+                &[2u32, 1, 1]
+                    .into_iter()
+                    .flat_map(u32::to_ne_bytes)
+                    .collect::<Vec<_>>(),
+            );
+        }
+        let output = readback(&device, 16);
+        let mut encoder = queue.encoder("storage dispatch");
+        {
+            let mut pass = encoder.compute_pass(&ComputePassDesc {
+                timestamps: None,
+                label: "dispatch",
+            });
+            pass.set_pipeline(&pipeline);
+            pass.bind(0, Bind::StorageImage(target.view()));
+            pass.bind(1, Bind::StorageBuffer(buffer.slice(0..8)));
+            pass.dispatch(2, 1, 1);
+            pass.set_pipeline(&duplicate);
+            pass.dispatch_indirect(args.slice(0..12));
+        }
+        encoder.copy_image_to_buffer(
+            ImageCopy {
+                image: &target,
+                mip: 0,
+                layer: 0,
+                origin: (0, 0, 0),
+            },
+            BufferCopy {
+                buffer: &output,
+                offset: 0,
+                row_pitch: 0,
+                rows: 0,
+            },
+            target.desc().size,
+        );
+        encoder.copy_buffer(buffer.slice(0..8), &output, 8);
+        drop((pipeline, duplicate, target, buffer, args, shader));
+        finish(&mut queue, encoder);
+        assert_eq!(&bytes(&output)[..8], &[255, 0, 0, 255, 255, 0, 0, 255]);
+        assert_eq!(
+            u32::from_ne_bytes(bytes(&output)[8..12].try_into().unwrap()),
+            17
+        );
+        assert_eq!(
+            u32::from_ne_bytes(bytes(&output)[12..16].try_into().unwrap()),
+            18
+        );
+    }
+}

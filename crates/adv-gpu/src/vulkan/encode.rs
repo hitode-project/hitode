@@ -9,6 +9,9 @@ pub(super) struct Resources {
     pub(super) views: Vec<ImageView>,
     pub(super) queries: Vec<QuerySet>,
     pub(super) spans: Vec<Span>,
+    pub(super) samplers: Vec<Sampler>,
+    pub(super) pipelines: Vec<Arc<pipeline::PipelineCore>>,
+    pub(super) descriptors: Option<binding::DescriptorArena>,
 }
 pub(crate) struct Encoder {
     pub(super) shared: Arc<queue::Shared>,
@@ -44,6 +47,30 @@ pub(super) struct LegacyPass {
 }
 
 impl Encoder {
+    pub(super) fn descriptor_set(
+        &mut self,
+        layout: vk::DescriptorSetLayout,
+        bindings: &[Binding],
+        values: &[binding::Bound],
+    ) -> Result<(vk::DescriptorSet, bool)> {
+        if self.resources.descriptors.is_none() {
+            let mut arena = self
+                .shared
+                .descriptors
+                .lock()
+                .unwrap()
+                .pop()
+                .unwrap_or_default();
+            arena.reset(&self.shared.context)?;
+            self.resources.descriptors = Some(arena);
+        }
+        self.resources.descriptors.as_mut().unwrap().get(
+            &self.shared.context,
+            layout,
+            bindings,
+            values,
+        )
+    }
     pub(super) fn new(shared: Arc<queue::Shared>) -> Self {
         let mut encoder = Self {
             shared,
@@ -89,7 +116,7 @@ impl Encoder {
             )
         })
     }
-    fn ready(&mut self) -> bool {
+    pub(super) fn ready(&mut self) -> bool {
         if self.error.is_some() {
             return false;
         }
@@ -225,7 +252,7 @@ impl Encoder {
         }
         self.resources.images.push(image.clone());
     }
-    fn view_transition(
+    pub(super) fn view_transition(
         &mut self,
         view: &ImageView,
         layout: vk::ImageLayout,
@@ -292,6 +319,8 @@ impl Encoder {
             inner: ComputePass {
                 encoder: self,
                 timestamp,
+                pipeline: None,
+                bindings: binding::Bindings::default(),
             },
         }
     }
@@ -536,6 +565,9 @@ impl Encoder {
             occlusion: None,
             preamble,
             resets: Vec::new(),
+            pipeline: None,
+            bindings: binding::Bindings::default(),
+            index: None,
         };
         pass.set_viewport(
             desc.area.x as f32,
@@ -546,6 +578,9 @@ impl Encoder {
             1.0,
         );
         pass.set_scissor(desc.area);
+        pass.set_stencil_reference(0);
+        pass.set_blend_constant([0.0; 4]);
+        pass.set_depth_bias(0.0, 0.0, 0.0);
         crate::RenderPass { inner: pass }
     }
     fn legacy_pass(
@@ -840,6 +875,9 @@ impl Encoder {
 impl Drop for Encoder {
     fn drop(&mut self) {
         if !self.submitted {
+            if let Some(arena) = self.resources.descriptors.take() {
+                self.shared.descriptors.lock().unwrap().push(arena);
+            }
             for (image, states) in self.originals.drain(..) {
                 *image.states.lock().unwrap() = states;
             }
@@ -1022,6 +1060,9 @@ pub(crate) struct RenderPass<'e> {
     occlusion: Option<(QuerySet, u32)>,
     preamble: vk::CommandBuffer,
     resets: Vec<(QuerySet, u32)>,
+    pipeline: Option<RenderPipeline>,
+    bindings: binding::Bindings,
+    index: Option<(vk::Buffer, u64, IndexFormat)>,
 }
 impl Drop for RenderPass<'_> {
     fn drop(&mut self) {
@@ -1068,32 +1109,287 @@ impl Drop for RenderPass<'_> {
     }
 }
 impl RenderPass<'_> {
-    pub(crate) fn set_pipeline(&mut self, _pipeline: &crate::RenderPipeline) {
-        todo!("A2")
+    pub(crate) fn set_pipeline(&mut self, pipeline: &crate::RenderPipeline) {
+        if !self.begun || !self.encoder.ready() {
+            return;
+        }
+        let pipeline = &pipeline.inner;
+        if self
+            .pipeline
+            .as_ref()
+            .is_some_and(|p| p.desc == pipeline.desc)
+        {
+            return;
+        }
+        let context = &self.encoder.shared.context;
+        if self
+            .pipeline
+            .as_ref()
+            .is_none_or(|p| p.core.handle != pipeline.core.handle)
+        {
+            unsafe {
+                context.device.cmd_bind_pipeline(
+                    self.encoder.command,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    pipeline.core.handle,
+                );
+            }
+        }
+        self.bindings.pipeline(pipeline.core.layout);
+        self.encoder.resources.pipelines.push(pipeline.core.clone());
+        let desc = &pipeline.desc;
+        let command = self.encoder.command;
+        unsafe {
+            if context.caps.modern.contains(Modern::EXTENDED_DYNAMIC_STATE) {
+                let primitive = desc.primitive;
+                if context.api >= vk::API_VERSION_1_3 {
+                    context
+                        .device
+                        .cmd_set_cull_mode(command, pipeline::cull(primitive.cull));
+                    context
+                        .device
+                        .cmd_set_front_face(command, pipeline::winding(primitive.front_ccw));
+                    context.device.cmd_set_primitive_topology(
+                        command,
+                        pipeline::topology(primitive.topology),
+                    );
+                    context
+                        .device
+                        .cmd_set_depth_test_enable(command, desc.depth_stencil.is_some());
+                    context.device.cmd_set_depth_write_enable(
+                        command,
+                        desc.depth_stencil.is_some_and(|d| d.depth_write),
+                    );
+                    context.device.cmd_set_depth_compare_op(
+                        command,
+                        resource::compare(
+                            desc.depth_stencil
+                                .map_or(Compare::Always, |d| d.depth_compare),
+                        ),
+                    );
+                    context.device.cmd_set_stencil_test_enable(
+                        command,
+                        desc.depth_stencil.is_some_and(|d| d.stencil.is_some()),
+                    );
+                    context.device.cmd_set_depth_bias_enable(
+                        command,
+                        desc.depth_stencil.is_some_and(|d| d.depth_bias),
+                    );
+                    context
+                        .device
+                        .cmd_set_primitive_restart_enable(command, false);
+                    context
+                        .device
+                        .cmd_set_rasterizer_discard_enable(command, false);
+                } else {
+                    context
+                        .eds1
+                        .cmd_set_cull_mode(command, pipeline::cull(primitive.cull));
+                    context
+                        .eds1
+                        .cmd_set_front_face(command, pipeline::winding(primitive.front_ccw));
+                    context.eds1.cmd_set_primitive_topology(
+                        command,
+                        pipeline::topology(primitive.topology),
+                    );
+                    context
+                        .eds1
+                        .cmd_set_depth_test_enable(command, desc.depth_stencil.is_some());
+                    context.eds1.cmd_set_depth_write_enable(
+                        command,
+                        desc.depth_stencil.is_some_and(|d| d.depth_write),
+                    );
+                    context.eds1.cmd_set_depth_compare_op(
+                        command,
+                        resource::compare(
+                            desc.depth_stencil
+                                .map_or(Compare::Always, |d| d.depth_compare),
+                        ),
+                    );
+                    context.eds1.cmd_set_stencil_test_enable(
+                        command,
+                        desc.depth_stencil.is_some_and(|d| d.stencil.is_some()),
+                    );
+                    context.eds2.cmd_set_depth_bias_enable(
+                        command,
+                        desc.depth_stencil.is_some_and(|d| d.depth_bias),
+                    );
+                    context
+                        .eds2
+                        .cmd_set_primitive_restart_enable(command, false);
+                    context
+                        .eds2
+                        .cmd_set_rasterizer_discard_enable(command, false);
+                }
+                let faces = desc.depth_stencil.and_then(|d| d.stencil).unwrap_or((
+                    StencilFace {
+                        compare: Compare::Always,
+                        fail: StencilOp::Keep,
+                        depth_fail: StencilOp::Keep,
+                        pass: StencilOp::Keep,
+                    },
+                    StencilFace {
+                        compare: Compare::Always,
+                        fail: StencilOp::Keep,
+                        depth_fail: StencilOp::Keep,
+                        pass: StencilOp::Keep,
+                    },
+                ));
+                for (face, state) in [
+                    (vk::StencilFaceFlags::FRONT, faces.0),
+                    (vk::StencilFaceFlags::BACK, faces.1),
+                ] {
+                    if context.api >= vk::API_VERSION_1_3 {
+                        context.device.cmd_set_stencil_op(
+                            command,
+                            face,
+                            pipeline::stencil_op(state.fail),
+                            pipeline::stencil_op(state.pass),
+                            pipeline::stencil_op(state.depth_fail),
+                            resource::compare(state.compare),
+                        );
+                    } else {
+                        context.eds1.cmd_set_stencil_op(
+                            command,
+                            face,
+                            pipeline::stencil_op(state.fail),
+                            pipeline::stencil_op(state.pass),
+                            pipeline::stencil_op(state.depth_fail),
+                            resource::compare(state.compare),
+                        );
+                    }
+                }
+            }
+            context.device.cmd_set_stencil_compare_mask(
+                command,
+                vk::StencilFaceFlags::FRONT_AND_BACK,
+                desc.depth_stencil
+                    .map_or(255, |d| d.stencil_read_mask as u32),
+            );
+            context.device.cmd_set_stencil_write_mask(
+                command,
+                vk::StencilFaceFlags::FRONT_AND_BACK,
+                desc.depth_stencil
+                    .map_or(255, |d| d.stencil_write_mask as u32),
+            );
+            if context.caps.modern.contains(Modern::COLOR_WRITE_ENABLE) {
+                let enables: Vec<_> = desc
+                    .colors
+                    .iter()
+                    .map(|c| u32::from(c.write_mask != 0))
+                    .collect();
+                (context.color_write.fp().cmd_set_color_write_enable_ext)(
+                    command,
+                    enables.len() as u32,
+                    enables.as_ptr(),
+                );
+            }
+        }
+        self.pipeline = Some(pipeline.clone());
     }
-    pub(crate) fn bind(&mut self, _slot: u32, _resource: Bind<'_>) {
-        todo!("A2")
+    pub(crate) fn bind(&mut self, slot: u32, resource: Bind<'_>) {
+        if let Some(pipeline) = &self.pipeline {
+            self.bindings.bind(
+                self.encoder,
+                &pipeline.core,
+                slot,
+                resource,
+                Some(self.preamble),
+            );
+        }
     }
-    pub(crate) fn set_index_buffer(&mut self, _buffer: BufferSlice<'_>, _format: IndexFormat) {
-        todo!("A2")
+    pub(crate) fn set_index_buffer(&mut self, buffer: BufferSlice<'_>, format: IndexFormat) {
+        if !self.encoder.ready() {
+            return;
+        }
+        let value = (buffer.buffer.inner.0.handle, buffer.offset, format);
+        if self.index == Some(value) {
+            return;
+        }
+        self.encoder
+            .resources
+            .buffers
+            .push(buffer.buffer.inner.clone());
+        unsafe {
+            self.encoder.shared.context.device.cmd_bind_index_buffer(
+                self.encoder.command,
+                value.0,
+                value.1,
+                match format {
+                    IndexFormat::U16 => vk::IndexType::UINT16,
+                    IndexFormat::U32 => vk::IndexType::UINT32,
+                },
+            );
+        }
+        self.index = Some(value);
     }
-    pub(crate) fn draw(
-        &mut self,
-        _vertices: std::ops::Range<u32>,
-        _instances: std::ops::Range<u32>,
-    ) {
-        todo!("A2")
+    fn prepare(&mut self) -> bool {
+        self.begun
+            && self.pipeline.as_ref().is_some_and(|p| {
+                self.bindings
+                    .flush(self.encoder, &p.core, vk::PipelineBindPoint::GRAPHICS)
+            })
+    }
+    pub(crate) fn draw(&mut self, vertices: std::ops::Range<u32>, instances: std::ops::Range<u32>) {
+        if self.prepare() {
+            unsafe {
+                self.encoder.shared.context.device.cmd_draw(
+                    self.encoder.command,
+                    vertices.end - vertices.start,
+                    instances.end - instances.start,
+                    vertices.start,
+                    instances.start,
+                );
+            }
+        }
     }
     pub(crate) fn draw_indexed(
         &mut self,
-        _indices: std::ops::Range<u32>,
-        _base_vertex: i32,
-        _instances: std::ops::Range<u32>,
+        indices: std::ops::Range<u32>,
+        base_vertex: i32,
+        instances: std::ops::Range<u32>,
     ) {
-        todo!("A2")
+        if self.prepare() {
+            unsafe {
+                self.encoder.shared.context.device.cmd_draw_indexed(
+                    self.encoder.command,
+                    indices.end - indices.start,
+                    instances.end - instances.start,
+                    indices.start,
+                    base_vertex,
+                    instances.start,
+                );
+            }
+        }
     }
-    pub(crate) fn draw_indirect(&mut self, _args: BufferSlice<'_>, _indexed: bool) {
-        todo!("A2")
+    pub(crate) fn draw_indirect(&mut self, args: BufferSlice<'_>, indexed: bool) {
+        if !self.prepare() {
+            return;
+        }
+        self.encoder
+            .resources
+            .buffers
+            .push(args.buffer.inner.clone());
+        unsafe {
+            let device = &self.encoder.shared.context.device;
+            if indexed {
+                device.cmd_draw_indexed_indirect(
+                    self.encoder.command,
+                    args.buffer.inner.0.handle,
+                    args.offset,
+                    1,
+                    20,
+                );
+            } else {
+                device.cmd_draw_indirect(
+                    self.encoder.command,
+                    args.buffer.inner.0.handle,
+                    args.offset,
+                    1,
+                    16,
+                );
+            }
+        }
     }
     pub(crate) fn set_viewport(
         &mut self,
@@ -1222,6 +1518,8 @@ impl RenderPass<'_> {
 pub(crate) struct ComputePass<'e> {
     pub(super) encoder: &'e mut Encoder,
     timestamp: Option<(QuerySet, u32)>,
+    pipeline: Option<ComputePipeline>,
+    bindings: binding::Bindings,
 }
 impl Drop for ComputePass<'_> {
     fn drop(&mut self) {
@@ -1229,16 +1527,67 @@ impl Drop for ComputePass<'_> {
     }
 }
 impl ComputePass<'_> {
-    pub(crate) fn set_pipeline(&mut self, _pipeline: &crate::ComputePipeline) {
-        todo!("A2")
+    pub(crate) fn set_pipeline(&mut self, pipeline: &crate::ComputePipeline) {
+        if !self.encoder.ready() {
+            return;
+        }
+        let pipeline = &pipeline.inner;
+        if self
+            .pipeline
+            .as_ref()
+            .is_some_and(|p| p.core.handle == pipeline.core.handle)
+        {
+            return;
+        }
+        unsafe {
+            self.encoder.shared.context.device.cmd_bind_pipeline(
+                self.encoder.command,
+                vk::PipelineBindPoint::COMPUTE,
+                pipeline.core.handle,
+            );
+        }
+        self.encoder.resources.pipelines.push(pipeline.core.clone());
+        self.bindings.pipeline(pipeline.core.layout);
+        self.pipeline = Some(pipeline.clone());
     }
-    pub(crate) fn bind(&mut self, _slot: u32, _resource: Bind<'_>) {
-        todo!("A2")
+    pub(crate) fn bind(&mut self, slot: u32, resource: Bind<'_>) {
+        if let Some(pipeline) = &self.pipeline {
+            self.bindings
+                .bind(self.encoder, &pipeline.core, slot, resource, None);
+        }
     }
-    pub(crate) fn dispatch(&mut self, _x: u32, _y: u32, _z: u32) {
-        todo!("A2")
+    fn prepare(&mut self) -> bool {
+        self.pipeline.as_ref().is_some_and(|p| {
+            self.bindings
+                .flush(self.encoder, &p.core, vk::PipelineBindPoint::COMPUTE)
+        })
     }
-    pub(crate) fn dispatch_indirect(&mut self, _args: BufferSlice<'_>) {
-        todo!("A2")
+    pub(crate) fn dispatch(&mut self, x: u32, y: u32, z: u32) {
+        self.encoder.memory_barrier();
+        if self.prepare() {
+            unsafe {
+                self.encoder
+                    .shared
+                    .context
+                    .device
+                    .cmd_dispatch(self.encoder.command, x, y, z);
+            }
+        }
+    }
+    pub(crate) fn dispatch_indirect(&mut self, args: BufferSlice<'_>) {
+        self.encoder.memory_barrier();
+        if self.prepare() {
+            self.encoder
+                .resources
+                .buffers
+                .push(args.buffer.inner.clone());
+            unsafe {
+                self.encoder.shared.context.device.cmd_dispatch_indirect(
+                    self.encoder.command,
+                    args.buffer.inner.0.handle,
+                    args.offset,
+                );
+            }
+        }
     }
 }

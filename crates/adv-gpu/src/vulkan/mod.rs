@@ -1,4 +1,4 @@
-//! Vulkan resources and ordered command submission. All Vulkan ownership stays
+//! Vulkan resources, shaders, pipelines and ordered submission. Ownership stays
 //! behind reference-counted handles.
 
 use ash::vk;
@@ -19,12 +19,15 @@ use crate::resource::*;
 use crate::shader::*;
 use crate::{Error, Extent, Format, Rect, Result};
 
+mod binding;
 mod encode;
 mod formats;
 mod open;
+mod pipeline;
 mod queue;
 mod resource;
 mod ring;
+mod shader;
 
 #[derive(Clone)]
 pub(crate) struct Device(pub(crate) Arc<Context>);
@@ -49,6 +52,13 @@ pub(crate) struct Context {
     anisotropy: bool,
     max_anisotropy: f32,
     mirror_clamp: bool,
+    pipelines: Mutex<pipeline::Pipelines>,
+    heap: Option<binding::Heap>,
+    push: ash::khr::push_descriptor::Device,
+    eds1: ash::ext::extended_dynamic_state::Device,
+    eds2: ash::ext::extended_dynamic_state2::Device,
+    color_write: ash::ext::color_write_enable::Device,
+    cache_prefix: [u8; 28],
 }
 
 impl Context {
@@ -162,6 +172,8 @@ fn vk_error(error: vk::Result) -> Error {
 
 impl Drop for Context {
     fn drop(&mut self) {
+        self.pipelines.get_mut().unwrap().destroy(&self.device);
+        self.heap.take();
         self.allocator.get_mut().unwrap().take();
         unsafe {
             self.device.destroy_device(None);
@@ -180,52 +192,13 @@ impl Device {
     pub(crate) fn lost(&self) -> Option<String> {
         self.0.lost.lock().unwrap().clone()
     }
-    pub(crate) fn create_shader(&self, _desc: ShaderDesc<'_>) -> Result<crate::Shader> {
-        todo!("A2")
-    }
-    pub(crate) fn create_render_pipeline(
-        &self,
-        _desc: &RenderPipelineDesc,
-        _cache: Option<&crate::pipeline::PipelineCache>,
-    ) -> Result<crate::RenderPipeline> {
-        todo!("A2")
-    }
-    pub(crate) fn pipeline_identity(&self, _desc: &RenderPipelineDesc) -> u64 {
-        todo!("A2")
-    }
-    pub(crate) fn create_compute_pipeline(
-        &self,
-        _desc: &ComputePipelineDesc,
-        _cache: Option<&crate::pipeline::PipelineCache>,
-    ) -> Result<crate::ComputePipeline> {
-        todo!("A2")
-    }
     pub(crate) fn create_present_pool(&self, _desc: &PoolDesc) -> Result<crate::PresentPool> {
         todo!("A3")
     }
 }
 
-#[derive(Clone)]
-pub(crate) struct Shader;
-impl Shader {
-    pub(crate) fn entry(&self, _name: &str, _stage: Stage) -> Result<Entry> {
-        todo!("A2")
-    }
-}
-#[derive(Clone)]
-pub(crate) struct RenderPipeline;
-#[derive(Clone)]
-pub(crate) struct ComputePipeline;
-#[derive(Clone)]
-pub(crate) struct PipelineCache;
-impl PipelineCache {
-    pub(crate) fn load(_data: &[u8]) -> crate::pipeline::PipelineCache {
-        todo!("A2")
-    }
-    pub(crate) fn serialize(&self) -> Result<Vec<u8>> {
-        todo!("A2")
-    }
-}
+pub(crate) use pipeline::{ComputePipeline, PipelineCache, RenderPipeline};
+pub(crate) use shader::Shader;
 
 pub(crate) struct Fence;
 impl Fence {
