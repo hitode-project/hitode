@@ -108,6 +108,138 @@ fn bytes(buffer: &crate::Buffer) -> &[u8] {
 }
 
 #[test]
+fn foreign_ownership_transfers_leave_private_images_local() {
+    use super::resource::ImageState;
+    let local = ImageState::default();
+    let foreign = ImageState {
+        family: vk::QUEUE_FAMILY_FOREIGN_EXT,
+        ..local
+    };
+    for layout in [
+        vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+    ] {
+        assert_eq!(
+            local.queue_families(layout, 3),
+            (vk::QUEUE_FAMILY_IGNORED, vk::QUEUE_FAMILY_IGNORED)
+        );
+        assert_eq!(
+            foreign.queue_families(layout, 3),
+            (vk::QUEUE_FAMILY_FOREIGN_EXT, 3)
+        );
+    }
+    assert_eq!(
+        local.queue_families(vk::ImageLayout::PRESENT_SRC_KHR, 3),
+        (3, vk::QUEUE_FAMILY_FOREIGN_EXT)
+    );
+}
+
+#[cfg(target_os = "android")]
+#[test]
+fn present_batches_reuse_fences_and_preserve_content() {
+    for disable in [Modern::empty(), Modern::all()] {
+        let (device, mut queue) = gpu!(disable);
+        if !device
+            .caps()
+            .features
+            .contains(Features::PRESENTABLE_BUFFERS)
+        {
+            continue;
+        }
+        let mut pool = device
+            .create_present_pool(&PoolDesc {
+                width: 8,
+                height: 8,
+                format: present::FORMAT,
+                count: 2,
+                label: "present batch",
+            })
+            .unwrap();
+        let size = Extent {
+            width: 8,
+            height: 8,
+            depth_or_layers: 1,
+        };
+        let outputs = [readback(&device, 8 * 8 * 4), readback(&device, 8 * 8 * 4)];
+        for frame in 0..4 {
+            let mut images: Vec<_> = (0..2)
+                .map(|_| pool.acquire(&mut queue).unwrap().unwrap())
+                .collect();
+            if frame != 0 {
+                assert!(images.iter().all(|i| i.age().is_some()));
+                // An abandoned recording must leave the foreign state intact.
+                let mut abandoned = queue.encoder("abandoned acquire");
+                read_image(&mut abandoned, images[0].image(), 0, 0, size, &outputs[0]);
+                drop(abandoned);
+                assert_eq!(
+                    images[0].image().inner.core.states.lock().unwrap()[0].family,
+                    vk::QUEUE_FAMILY_FOREIGN_EXT
+                );
+            }
+            let mut encoder = queue.encoder("present batch");
+            for (image, output) in images.iter().zip(&outputs) {
+                let (area, color) = if frame == 0 {
+                    (
+                        Rect {
+                            x: 0,
+                            y: 0,
+                            w: 8,
+                            h: 8,
+                        },
+                        [1.0, 0.0, 0.0, 1.0],
+                    )
+                } else {
+                    (
+                        Rect {
+                            x: 0,
+                            y: 0,
+                            w: 1,
+                            h: 1,
+                        },
+                        [0.0, 1.0, 0.0, 1.0],
+                    )
+                };
+                drop(encoder.render_pass(&pass(
+                    image.image().view(),
+                    area,
+                    Load::Clear(color),
+                    Store::Store,
+                    None,
+                )));
+                read_image(&mut encoder, image.image(), 0, 0, size, output);
+            }
+            let token = queue
+                .submit_present(encoder, &mut images.iter_mut().collect::<Vec<_>>())
+                .unwrap();
+            for mut image in images {
+                let fence = image.acquire_fence();
+                // Loop the GPU's sync fd back as the compositor release. The
+                // next batch must import it, even before this token completes.
+                image.released(fence);
+            }
+            if frame != 3 {
+                continue;
+            }
+            assert!(queue.wait(token, Duration::from_secs(20)).unwrap());
+            for output in &outputs {
+                for (i, pixel) in bytes(output).as_chunks::<4>().0.iter().enumerate() {
+                    assert_eq!(
+                        pixel,
+                        if i == 0 {
+                            &[0, 255, 0, 255]
+                        } else {
+                            &[255, 0, 0, 255]
+                        }
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn views_partial_clears_query_resets_and_resolves() {
     for disable in [Modern::empty(), Modern::all()] {
         let (device, mut queue) = gpu!(disable);

@@ -198,6 +198,10 @@ impl Encoder {
             for mip in mips.clone() {
                 let index = (layer * image.desc().mips + mip) as usize;
                 let old = states[index];
+                #[cfg(any(target_os = "android", test))]
+                let (src_family, dst_family) = old.queue_families(layout, context.family);
+                #[cfg(not(any(target_os = "android", test)))]
+                let (src_family, dst_family) = (vk::QUEUE_FAMILY_IGNORED, vk::QUEUE_FAMILY_IGNORED);
                 let range = vk::ImageSubresourceRange::default()
                     .aspect_mask(formats::aspect(image.desc().format))
                     .base_mip_level(mip)
@@ -213,8 +217,8 @@ impl Encoder {
                             .dst_access_mask(access)
                             .old_layout(old.layout)
                             .new_layout(layout)
-                            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                            .src_queue_family_index(src_family)
+                            .dst_queue_family_index(dst_family)
                             .image(image.core.handle)
                             .subresource_range(range)];
                         let info = vk::DependencyInfo::default().image_memory_barriers(&barriers);
@@ -229,8 +233,8 @@ impl Encoder {
                             .dst_access_mask(vk::AccessFlags::from_raw(access.as_raw() as u32))
                             .old_layout(old.layout)
                             .new_layout(layout)
-                            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                            .src_queue_family_index(src_family)
+                            .dst_queue_family_index(dst_family)
                             .image(image.core.handle)
                             .subresource_range(range)];
                         context.device.cmd_pipeline_barrier(
@@ -248,9 +252,26 @@ impl Encoder {
                     layout,
                     access,
                     stage,
+                    #[cfg(any(target_os = "android", test))]
+                    family: if layout == vk::ImageLayout::PRESENT_SRC_KHR {
+                        vk::QUEUE_FAMILY_FOREIGN_EXT
+                    } else {
+                        context.family
+                    },
                 };
             }
         }
+    }
+    #[cfg(target_os = "android")]
+    pub(super) fn release(&mut self, image: &Image) {
+        self.transition(
+            image,
+            0..1,
+            0..1,
+            vk::ImageLayout::PRESENT_SRC_KHR,
+            vk::AccessFlags2::empty(),
+            vk::PipelineStageFlags2::BOTTOM_OF_PIPE,
+        );
     }
     pub(super) fn view_transition(
         &mut self,

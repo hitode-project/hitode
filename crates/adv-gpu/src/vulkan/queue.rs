@@ -27,6 +27,8 @@ pub(super) struct State {
     /// synchronized, so a retire of it leaves the reset to the waiter.
     waiting: vk::Fence,
     retired: bool,
+    #[cfg(target_os = "android")]
+    sync: present::Semaphores,
 }
 struct Submission {
     token: u64,
@@ -83,6 +85,8 @@ impl Queue {
                 fences: Vec::new(),
                 waiting: vk::Fence::null(),
                 retired: false,
+                #[cfg(target_os = "android")]
+                sync: present::Semaphores::default(),
             }),
         });
         let (sender, receiver) = mpsc::channel();
@@ -148,16 +152,35 @@ impl Queue {
             inner: Encoder::new(self.shared.clone()),
         }
     }
-    pub(crate) fn submit(&mut self, mut encoder: crate::Encoder) -> Result<Token> {
+    pub(crate) fn submit(&mut self, encoder: crate::Encoder) -> Result<Token> {
+        Ok(self.submit_present(encoder, &[])?.0)
+    }
+    /// Releases each buffer to the compositor and exports the same batch's
+    /// binary semaphore once; the shared pool duplicates its fd per image.
+    pub(crate) fn submit_present(
+        &mut self,
+        mut encoder: crate::Encoder,
+        buffers: &[(&super::Image, &super::PresentBuffer)],
+    ) -> Result<(Token, Option<super::Fence>)> {
         let context = &self.shared.context;
         context.check()?;
         if let Some(error) = encoder.inner.error.take() {
             return Err(error);
         }
         encoder.inner.memory_barrier();
+        #[cfg(target_os = "android")]
+        for (image, _) in buffers {
+            encoder.inner.release(image);
+        }
+        #[cfg(not(target_os = "android"))]
+        debug_assert!(buffers.is_empty());
         context.result(unsafe { context.device.end_command_buffer(encoder.inner.command) })?;
         let mut state = self.shared.state.lock().unwrap();
         let token = state.next;
+        #[cfg(target_os = "android")]
+        if let Some(error) = state.sync.error {
+            return context.result(Err(error));
+        }
         let fence = if self.shared.timeline == vk::Semaphore::null() {
             match state.fences.pop() {
                 Some(f) => f,
@@ -170,17 +193,46 @@ impl Queue {
         } else {
             vk::Fence::null()
         };
+        #[cfg(target_os = "android")]
+        let signal = if buffers.is_empty() {
+            vk::Semaphore::null()
+        } else {
+            match context.result(state.sync.semaphore(context)) {
+                Ok(semaphore) => semaphore,
+                Err(error) => {
+                    if fence != vk::Fence::null() {
+                        state.fences.push(fence);
+                    }
+                    return Err(error);
+                }
+            }
+        };
         let mut commands = std::mem::take(&mut encoder.inner.commands);
         commands.push(encoder.inner.command);
-        let semaphores = [self.shared.timeline];
-        let values = [token];
+        let mut semaphores = arrayvec::ArrayVec::<_, 2>::new();
+        let mut values = arrayvec::ArrayVec::<_, 2>::new();
+        if self.shared.timeline != vk::Semaphore::null() {
+            semaphores.push(self.shared.timeline);
+            values.push(token);
+        }
+        #[cfg(target_os = "android")]
+        if signal != vk::Semaphore::null() {
+            semaphores.push(signal);
+            values.push(0);
+        }
         let mut timeline_info =
             vk::TimelineSemaphoreSubmitInfo::default().signal_semaphore_values(&values);
-        let mut submit = vk::SubmitInfo::default().command_buffers(&commands);
+        let mut submit = vk::SubmitInfo::default()
+            .command_buffers(&commands)
+            .signal_semaphores(&semaphores);
         if self.shared.timeline != vk::Semaphore::null() {
+            submit = submit.push_next(&mut timeline_info);
+        }
+        #[cfg(target_os = "android")]
+        {
             submit = submit
-                .signal_semaphores(&semaphores)
-                .push_next(&mut timeline_info);
+                .wait_semaphores(&state.sync.waits)
+                .wait_dst_stage_mask(&state.sync.stages);
         }
         if let Err(error) = context.result(unsafe {
             context
@@ -189,6 +241,10 @@ impl Queue {
         }) {
             if fence != vk::Fence::null() {
                 state.fences.push(fence);
+            }
+            #[cfg(target_os = "android")]
+            if signal != vk::Semaphore::null() {
+                state.sync.free.push(signal);
             }
             commands.pop();
             encoder.inner.commands = commands;
@@ -217,7 +273,18 @@ impl Queue {
         context.open.fetch_sub(1, Ordering::Release);
         encoder.inner.submitted = true;
         let _ = self.sender.as_ref().unwrap().send(Message::Wake);
-        Ok(Token(token))
+        #[cfg(target_os = "android")]
+        let acquire = {
+            state.sync.submitted(token);
+            if signal != vk::Semaphore::null() {
+                state.sync.export(context, signal, token)?
+            } else {
+                None
+            }
+        };
+        #[cfg(not(target_os = "android"))]
+        let acquire = None;
+        Ok((Token(token), acquire))
     }
     pub(crate) fn poll(&mut self) -> Result<Token> {
         self.shared.poll()
@@ -270,21 +337,17 @@ impl Queue {
             .unwrap()
             .send(Message::Callback(token.0, callback));
     }
-    /// Ends `encoder` with the hand-off of `buffers` to the compositor and
-    /// returns the acquire fence the same batch signals.
-    pub(crate) fn submit_present(
-        &mut self,
-        encoder: crate::Encoder,
-        buffers: &[(&super::Image, &super::PresentBuffer)],
-    ) -> Result<(Token, Option<super::Fence>)> {
-        if buffers.is_empty() {
-            return Ok((self.submit(encoder)?, None));
-        }
-        todo!("A3")
-    }
     /// Makes the next submission wait on a compositor release fence.
-    pub(crate) fn wait_next(&mut self, _fence: super::Fence) {
-        todo!("A3")
+    pub(crate) fn wait_next(&mut self, fence: super::Fence) {
+        #[cfg(target_os = "android")]
+        self.shared
+            .state
+            .lock()
+            .unwrap()
+            .sync
+            .wait_next(&self.shared.context, fence);
+        #[cfg(not(target_os = "android"))]
+        match fence {}
     }
 }
 impl Shared {
@@ -375,6 +438,8 @@ impl Shared {
             }
             state.commands.extend(submission.commands);
         }
+        #[cfg(target_os = "android")]
+        state.sync.retire(completed);
         self.context.rings.lock().unwrap().retain(|weak| {
             if let Some(ring) = weak.upgrade() {
                 ring.retire(completed);
@@ -411,6 +476,8 @@ impl Drop for Shared {
             for fence in state.fences.drain(..) {
                 self.context.device.destroy_fence(fence, None);
             }
+            #[cfg(target_os = "android")]
+            state.sync.destroy(&self.context);
             if self.timeline != vk::Semaphore::null() {
                 self.context.device.destroy_semaphore(self.timeline, None);
             }

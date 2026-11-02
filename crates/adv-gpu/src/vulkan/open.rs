@@ -49,6 +49,8 @@ impl Device {
             }
             let mut layers = Vec::new();
             let mut instance_extensions = Vec::new();
+            #[cfg(target_os = "android")]
+            instance_extensions.push(ash::khr::surface::NAME.as_ptr());
             if options.validation {
                 if !entry
                     .enumerate_instance_layer_properties()
@@ -200,6 +202,14 @@ impl Device {
                 dynamic: ash::khr::dynamic_rendering::Device::new(&instance, &device),
                 sync2: ash::khr::synchronization2::Device::new(&instance, &device),
                 timeline: ash::khr::timeline_semaphore::Device::new(&instance, &device),
+                #[cfg(target_os = "android")]
+                ahb: ash::android::external_memory_android_hardware_buffer::Device::new(
+                    &instance, &device,
+                ),
+                #[cfg(target_os = "android")]
+                semaphore_fd: ash::khr::external_semaphore_fd::Device::new(&instance, &device),
+                #[cfg(target_os = "android")]
+                vendor: properties.vendor_id,
                 _entry: entry,
                 instance,
                 debug,
@@ -296,11 +306,17 @@ impl Device {
                 ash::android::external_memory_android_hardware_buffer::NAME,
                 ash::khr::external_fence_fd::NAME,
                 ash::khr::external_semaphore_fd::NAME,
+                ash::khr::swapchain::NAME,
+                ash::ext::queue_family_foreign::NAME,
             ] {
                 if !has(name) {
                     return Err(Error::Unavailable(name.to_string_lossy().into()));
                 }
                 names.push(name.as_ptr());
+            }
+            #[cfg(target_os = "android")]
+            if has(ash::ext::image_compression_control::NAME) {
+                names.push(ash::ext::image_compression_control::NAME.as_ptr());
             }
             let families = instance.get_physical_device_queue_family_properties(physical);
             let family = families
@@ -622,6 +638,24 @@ impl Device {
                 feature_bits |= Features::SUBGROUP;
             }
             let memory = instance.get_physical_device_memory_properties(physical);
+            #[cfg(target_os = "android")]
+            let present_caps = match present::capabilities(
+                instance,
+                &device,
+                props.vendor_id,
+                memory.memory_type_count,
+                has(ash::ext::image_compression_control::NAME),
+            ) {
+                Ok(caps) => caps,
+                Err(error) => {
+                    device.destroy_device(None);
+                    return Err(error);
+                }
+            };
+            #[cfg(target_os = "android")]
+            if present_caps.contains(FormatCaps::PRESENTABLE) {
+                feature_bits |= Features::PRESENTABLE_BUFFERS;
+            }
             if memory.memory_types_as_slice().iter().any(|t| {
                 t.property_flags
                     .contains(vk::MemoryPropertyFlags::LAZILY_ALLOCATED)
@@ -675,6 +709,10 @@ impl Device {
                     }
                     if f == Format::Bgra4Unorm && !has4444 {
                         caps = FormatCaps::empty();
+                    }
+                    #[cfg(target_os = "android")]
+                    if f == present::FORMAT {
+                        caps |= present_caps;
                     }
                     (f, caps)
                 })

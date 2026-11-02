@@ -1,5 +1,7 @@
 //! Vulkan resources, shaders, pipelines and ordered submission. Ownership stays
-//! behind reference-counted handles.
+//! behind reference-counted handles. Android presentable images import GPU and
+//! composer-only AHardwareBuffers; submission transfers ownership to FOREIGN
+//! and exchanges sync fds through pooled binary semaphores.
 
 use ash::vk;
 use gpu_allocator::MemoryLocation;
@@ -25,6 +27,8 @@ mod encode;
 mod formats;
 mod open;
 mod pipeline;
+#[cfg(target_os = "android")]
+mod present;
 mod queue;
 mod resource;
 mod ring;
@@ -66,6 +70,12 @@ pub(crate) struct Context {
     eds: Option<Eds>,
     color_write: ash::ext::color_write_enable::Device,
     cache_prefix: [u8; 28],
+    #[cfg(target_os = "android")]
+    ahb: ash::android::external_memory_android_hardware_buffer::Device,
+    #[cfg(target_os = "android")]
+    semaphore_fd: ash::khr::external_semaphore_fd::Device,
+    #[cfg(target_os = "android")]
+    vendor: u32,
 }
 
 /// A GPU object whose last handle dropped. Encoders hold no references:
@@ -79,7 +89,7 @@ pub(super) enum Retired {
     },
     Image {
         handle: vk::Image,
-        allocation: Allocation,
+        allocation: resource::ImageAllocation,
         conversion: Option<vk::SamplerYcbcrConversion>,
     },
     View {
@@ -92,6 +102,8 @@ pub(super) enum Retired {
         index: Option<u32>,
     },
     Query(vk::QueryPool),
+    #[cfg(target_os = "android")]
+    Semaphore(vk::Semaphore),
 }
 
 /// Extended dynamic state entry points: core on 1.3, else the extensions.
@@ -216,7 +228,13 @@ impl Context {
                         self.device
                             .destroy_sampler_ycbcr_conversion(conversion, None);
                     }
-                    self.free(allocation);
+                    match allocation {
+                        resource::ImageAllocation::Private(allocation) => self.free(allocation),
+                        #[cfg(target_os = "android")]
+                        resource::ImageAllocation::Present(memory) => {
+                            self.device.free_memory(memory, None);
+                        }
+                    }
                 }
                 Retired::View {
                     handle,
@@ -247,6 +265,8 @@ impl Context {
                     self.device.destroy_sampler(handle, None);
                 }
                 Retired::Query(handle) => self.device.destroy_query_pool(handle, None),
+                #[cfg(target_os = "android")]
+                Retired::Semaphore(handle) => self.device.destroy_semaphore(handle, None),
             }
         }
     }
@@ -403,15 +423,18 @@ impl Fence {
     }
 }
 
-/// One presentable buffer: an imported AHardwareBuffer on Android. Other
-/// targets report no presentable formats, so none is ever created there.
+#[cfg(target_os = "android")]
+pub(crate) use present::PresentBuffer;
+/// Other Vulkan targets have no presentable formats.
+#[cfg(not(target_os = "android"))]
 pub(crate) struct PresentBuffer;
+#[cfg(not(target_os = "android"))]
 impl PresentBuffer {
     pub(crate) fn new(_device: &Device, _desc: &PoolDesc) -> Result<(crate::Image, Self)> {
-        todo!("A3")
+        unreachable!("no presentable Vulkan formats on this target")
     }
     pub(crate) fn export(&self) -> Export<'_> {
-        todo!("A3")
+        unreachable!("no presentable Vulkan formats on this target")
     }
 }
 
