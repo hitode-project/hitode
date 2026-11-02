@@ -91,7 +91,8 @@ fn scaling_and_viewports() {
         assert_eq!(p.layers.base.crop, rect(0, 0, crop.0, crop.1));
         assert_eq!(p.layers.base.nearest, nearest);
         if let Some(Stage::Output { scale, from, .. }) = p.stages.first() {
-            assert_eq!(*scale, Scale::SharpBilinear { prescale: (2, 2) });
+            // The pass prescales; the compositor's layer scales linearly.
+            assert_eq!(*scale, Scale::Integer { x: 2, y: 2 });
             assert_eq!(*from, Source::Base);
         }
     }
@@ -159,7 +160,15 @@ fn rotations_and_compositor_limits() {
                         transform.rotation,
                         if rotates { Rotation::None } else { rotation }
                     );
-                    assert_eq!(*scale, Scale::Integer { x: 2, y: 2 });
+                    // A rotation-only pass is 1:1; the layer scales.
+                    let factor = if scales { 1 } else { 2 };
+                    assert_eq!(
+                        *scale,
+                        Scale::Integer {
+                            x: factor,
+                            y: factor
+                        }
+                    );
                 }
             }
         }
@@ -179,6 +188,11 @@ fn rotations_and_compositor_limits() {
     );
     assert_eq!(p.targets[0].size, s.view);
     assert_eq!(p.stages.len(), 1);
+    // Without compositor scaling the one pass is the whole sharp-bilinear scale.
+    let Some(Stage::Output { scale, .. }) = p.stages.first() else {
+        panic!("output pass expected");
+    };
+    assert_eq!(*scale, Scale::SharpBilinear { prescale: (2, 2) });
     // A 1:1 image needs no scaling capability.
     let p = run(
         &frame(),

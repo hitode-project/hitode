@@ -956,7 +956,15 @@ pub fn plan(
         };
         let (target, age) = pools.target(OUTPUT, swapped(output, rotation));
         let work = pools.damage(&damage, age);
-        let scale = if integer {
+        // What this pass does. With compositor scaling it only prescales by
+        // the integer part (1 when it exists for rotation alone) and the layer
+        // does the rest; without it the pass covers the whole viewport.
+        let scale = if caps.scales {
+            Scale::Integer {
+                x: output.0 / canvas.0,
+                y: output.1 / canvas.1,
+            }
+        } else if integer {
             Scale::Integer {
                 x: prescale.0,
                 y: prescale.1,
