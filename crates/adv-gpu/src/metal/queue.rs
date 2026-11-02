@@ -16,12 +16,14 @@ impl Device {
     pub(crate) fn open(options: &DeviceOptions) -> Result<(crate::Device, crate::Queue)> {
         let raw = MTLCreateSystemDefaultDevice()
             .ok_or_else(|| Error::Unavailable("no system Metal device".into()))?;
-        let supported = if cfg!(target_os = "ios") {
-            raw.supportsFamily(MTLGPUFamily::Apple5)
+        // The floor is A12 on iOS and M1 on macOS. Virtual GPUs (the
+        // paravirtual device of macOS guests) report only Mac2 and fall below.
+        let floor = if cfg!(target_os = "ios") {
+            MTLGPUFamily::Apple5
         } else {
-            raw.supportsFamily(MTLGPUFamily::Apple7) || raw.supportsFamily(MTLGPUFamily::Mac2)
+            MTLGPUFamily::Apple7
         };
-        if !supported {
+        if !raw.supportsFamily(floor) {
             return Err(Error::Unavailable(
                 "Metal GPU family below the platform baseline".into(),
             ));

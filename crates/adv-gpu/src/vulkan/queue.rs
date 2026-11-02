@@ -23,6 +23,10 @@ pub(super) struct State {
     pending: VecDeque<Submission>,
     pub(super) commands: Vec<vk::CommandBuffer>,
     fences: Vec<vk::Fence>,
+    /// The fence the waiter thread blocks on. Fences are externally
+    /// synchronized, so a retire of it leaves the reset to the waiter.
+    waiting: vk::Fence,
+    retired: bool,
 }
 struct Submission {
     token: u64,
@@ -77,6 +81,8 @@ impl Queue {
                 pending: VecDeque::new(),
                 commands: Vec::new(),
                 fences: Vec::new(),
+                waiting: vk::Fence::null(),
+                retired: false,
             }),
         });
         let (sender, receiver) = mpsc::channel();
@@ -285,21 +291,18 @@ impl Shared {
     /// Blocks until the oldest pending submission completes. False, without
     /// blocking, when nothing is pending or the device is lost.
     fn wait_oldest(&self) -> bool {
-        let Some((token, fence)) = self
-            .state
-            .lock()
-            .unwrap()
-            .pending
-            .front()
-            .map(|s| (s.token, s.fence))
-        else {
-            return false;
+        let (token, fence) = {
+            let mut state = self.state.lock().unwrap();
+            let Some(oldest) = state.pending.front() else {
+                return false;
+            };
+            if self.context.lost.load(Ordering::Relaxed) {
+                return false;
+            }
+            let oldest = (oldest.token, oldest.fence);
+            state.waiting = oldest.1;
+            oldest
         };
-        if self.context.lost.load(Ordering::Relaxed) {
-            return false;
-        }
-        // A submit or poll elsewhere only advances state; a fence reset
-        // after it signalled at worst delays this wake to its next use.
         let result = unsafe {
             if self.timeline != vk::Semaphore::null() {
                 let semaphores = [self.timeline];
@@ -319,6 +322,12 @@ impl Shared {
             }
         };
         let _ = self.context.result(result);
+        let mut state = self.state.lock().unwrap();
+        state.waiting = vk::Fence::null();
+        if std::mem::take(&mut state.retired) {
+            let _ = unsafe { self.context.device.reset_fences(&[fence]) };
+            state.fences.push(fence);
+        }
         true
     }
     fn poll(&self) -> Result<Token> {
@@ -356,10 +365,13 @@ impl Shared {
             if let Some(arena) = submission._resources.descriptors.take() {
                 self.descriptors.lock().unwrap().push(arena);
             }
-            if submission.fence != vk::Fence::null() {
+            let fence = submission.fence;
+            if fence != vk::Fence::null() && fence == state.waiting {
+                state.retired = true;
+            } else if fence != vk::Fence::null() {
                 self.context
-                    .result(unsafe { self.context.device.reset_fences(&[submission.fence]) })?;
-                state.fences.push(submission.fence);
+                    .result(unsafe { self.context.device.reset_fences(&[fence]) })?;
+                state.fences.push(fence);
             }
             state.commands.extend(submission.commands);
         }
