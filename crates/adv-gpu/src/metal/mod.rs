@@ -44,7 +44,6 @@ struct DeviceState {
     samplers: Mutex<HashMap<SamplerDesc, Sampler>>,
     rings: Mutex<Vec<Weak<Mutex<ring::State>>>>,
     clears: Mutex<HashMap<clear::Key, clear::Pipeline>>,
-    timestamp_tick: OnceLock<(Object<dyn MTLComputePipelineState>, crate::Buffer)>,
 }
 
 impl Device {

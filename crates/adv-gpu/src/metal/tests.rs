@@ -257,7 +257,7 @@ fn visibility_queries_count_internal_draws() {
 }
 
 #[test]
-fn both_pass_types_write_nonzero_timestamp_boundaries() {
+fn passes_without_work_report_zero_duration() {
     let (device, mut queue) = gpu();
     if !device.caps().features.contains(Features::TIMESTAMPS) {
         return;
@@ -283,12 +283,10 @@ fn both_pass_types_write_nonzero_timestamp_boundaries() {
         .iter()
         .map(|v| u64::from_le_bytes(*v))
         .collect();
-    assert!(
-        timestamps.iter().all(|&v| v != 0 && v != u64::MAX),
-        "{timestamps:?}"
-    );
+    // A whole-target clear is a load action and an empty compute pass has no
+    // dispatch: neither does work, so both report equal timestamps.
     for pair in timestamps.as_chunks::<2>().0 {
-        assert!(pair[0] <= pair[1], "{pair:?}");
+        assert_eq!(pair[0], pair[1], "{pair:?}");
     }
 }
 
@@ -368,4 +366,28 @@ fn multisample_resolves_preserve_pixels_outside_the_area() {
             }
         }
     }
+}
+
+#[test]
+fn passes_with_work_report_their_own_samples() {
+    let (device, mut queue) = gpu();
+    if !device.caps().features.contains(Features::TIMESTAMPS) {
+        return;
+    }
+    let image = image(&device, Format::Rgba8Unorm);
+    let set = device.create_query_set(QueryKind::Timestamp, 2).unwrap();
+    let dst = readback(&device, 16);
+    let mut encoder = queue.encoder("timestamps with work");
+    // A clear bounded by the area is an internal draw, so the GPU samples it.
+    let mut render = color_pass(image.view(), Load::Clear([1.0; 4]), Store::Store, AREA);
+    render.timestamps = Some((&set, 0));
+    drop(encoder.render_pass(&render));
+    encoder.resolve_queries(&set, 0..2, &dst, 0);
+    finish(&mut queue, encoder);
+    let [start, end] =
+        [0, 8].map(|i| u64::from_le_bytes(bytes(&dst)[i..i + 8].try_into().unwrap()));
+    assert!(
+        start != 0 && start != u64::MAX && end >= start,
+        "{start} {end}"
+    );
 }

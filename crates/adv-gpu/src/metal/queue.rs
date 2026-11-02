@@ -39,7 +39,6 @@ impl Device {
                 samplers: Mutex::new(HashMap::new()),
                 rings: Mutex::new(Vec::new()),
                 clears: Mutex::new(HashMap::new()),
-                timestamp_tick: OnceLock::new(),
             })),
         };
         let queue = crate::Queue {
@@ -167,6 +166,10 @@ pub(super) enum QueryData {
     Timestamp {
         raw: Object<dyn MTLCounterSampleBuffer>,
         period: f64,
+        /// Indices whose pass ended without work. Apple GPUs sample counters
+        /// at stage boundaries only, so such a pass writes nothing; resolves
+        /// report it as zero duration instead (see `RenderPassDesc::timestamps`).
+        empty: Mutex<Vec<bool>>,
     },
     Occlusion(Object<dyn MTLBuffer>),
 }
@@ -226,12 +229,27 @@ impl Device {
                     }
                     (cpu1 - cpu0) as f64 / (gpu1 - gpu0) as f64
                 };
-                QueryData::Timestamp { raw, period }
+                QueryData::Timestamp {
+                    raw,
+                    period,
+                    empty: Mutex::new(vec![false; count as usize]),
+                }
             }
         };
         Ok(crate::queue::QuerySet {
             inner: QuerySet(Arc::new(data)),
         })
+    }
+}
+impl QueryData {
+    /// Record whether the pass that owns timestamps `first` and `first + 1`
+    /// ended without work.
+    pub(super) fn mark(&self, first: u32, empty: bool) {
+        if let Self::Timestamp { empty: flags, .. } = self {
+            let mut flags = flags.lock().unwrap();
+            flags[first as usize] = empty;
+            flags[first as usize + 1] = empty;
+        }
     }
 }
 impl QuerySet {

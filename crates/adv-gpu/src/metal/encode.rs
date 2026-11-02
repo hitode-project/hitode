@@ -16,7 +16,9 @@ pub(crate) struct RenderPass<'e> {
     pub(super) raw: Object<dyn MTLRenderCommandEncoder>,
     encoder: &'e mut Encoder,
     area: Rect,
-    timestamps: bool,
+    timestamps: Option<(Arc<QueryData>, u32)>,
+    /// Draws reached the GPU, so stage-boundary samples are written.
+    pub(super) work: bool,
     occlusion: Vec<(Object<dyn MTLBuffer>, usize, usize)>,
     resolves: Vec<(Object<dyn MTLTexture>, Object<dyn MTLTexture>)>,
 }
@@ -24,7 +26,9 @@ pub(crate) struct ComputePass<'e> {
     #[allow(dead_code)] // B2 encodes compute commands here.
     pub(super) raw: Object<dyn MTLComputeCommandEncoder>,
     encoder: &'e mut Encoder,
-    timestamps: bool,
+    timestamps: Option<(Arc<QueryData>, u32)>,
+    /// Dispatches reached the GPU, so encoder-boundary samples are written.
+    pub(super) work: bool,
 }
 
 impl Encoder {
@@ -226,13 +230,16 @@ impl Encoder {
             zfar: 1.0,
         });
         raw.setScissorRect(scissor(area));
-        self.device.clear(&raw, desc, area);
+        let work = self.device.clear(&raw, desc, area);
         crate::RenderPass {
             inner: RenderPass {
                 raw,
                 encoder: self,
                 area,
-                timestamps: desc.timestamps.is_some(),
+                timestamps: desc
+                    .timestamps
+                    .map(|(set, first)| (set.inner.0.clone(), first)),
+                work,
                 occlusion: Vec::new(),
                 resolves,
             },
@@ -261,35 +268,14 @@ impl Encoder {
             .computeCommandEncoderWithDescriptor(&d)
             .expect("Metal compute encoder");
         raw.setLabel(Some(&NSString::from_str(desc.label)));
-        if desc.timestamps.is_some() {
-            // Empty compute encoders can omit their counter writes. A tiny
-            // tracked write keeps the stage boundaries present for sampling.
-            let (tick, scratch) = self.device.0.timestamp_tick.get_or_init(|| {
-                let library = self.device.0.raw.newLibraryWithSource_options_error(
-                    &NSString::from_str("#include <metal_stdlib>\nusing namespace metal; kernel void timestamp_tick(device uint* value [[buffer(0)]]) { *value = 0; }"), None)
-                    .expect("Metal timestamp shader");
-                let function = library.newFunctionWithName(&NSString::from_str("timestamp_tick")).unwrap();
-                let pipeline = self.device.0.raw.newComputePipelineStateWithFunction_error(&function)
-                    .expect("Metal timestamp pipeline");
-                let scratch = self.device.create_buffer(&BufferDesc { size: 4,
-                    usage: BufferUsage::STORAGE, memory: Memory::Device, label: "timestamp tick" })
-                    .expect("Metal timestamp scratch");
-                (pipeline, scratch)
-            });
-            raw.setComputePipelineState(tick);
-            unsafe {
-                raw.setBuffer_offset_atIndex(Some(&scratch.inner.0.raw), 0, 0);
-            }
-            raw.dispatchThreadgroups_threadsPerThreadgroup(
-                metal_size(1, 1, 1),
-                metal_size(1, 1, 1),
-            );
-        }
         crate::ComputePass {
             inner: ComputePass {
                 raw,
                 encoder: self,
-                timestamps: desc.timestamps.is_some(),
+                timestamps: desc
+                    .timestamps
+                    .map(|(set, first)| (set.inner.0.clone(), first)),
+                work: false,
             },
         }
     }
@@ -420,13 +406,23 @@ impl Encoder {
         let blit = self.blit();
         unsafe {
             match &*set.inner.0 {
-                QueryData::Timestamp { raw, .. } => blit
-                    .resolveCounters_inRange_destinationBuffer_destinationOffset(
+                QueryData::Timestamp { raw, empty, .. } => {
+                    blit.resolveCounters_inRange_destinationBuffer_destinationOffset(
                         raw,
                         NSRange::new(range.start as usize, range.len()),
                         &dst.inner.0.raw,
                         offset as usize,
-                    ),
+                    );
+                    // Passes without work wrote no samples: report both of
+                    // their timestamps as zero, an empty duration.
+                    let empty = empty.lock().unwrap();
+                    for index in range.clone() {
+                        if empty[index as usize] {
+                            let at = offset as usize + (index - range.start) as usize * 8;
+                            blit.fillBuffer_range_value(&dst.inner.0.raw, NSRange::new(at, 8), 0);
+                        }
+                    }
+                }
                 QueryData::Occlusion(raw) => blit
                     .copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
                         raw,
@@ -513,7 +509,8 @@ fn store(store: Store, partial: bool) -> MTLStoreAction {
 
 impl Drop for RenderPass<'_> {
     fn drop(&mut self) {
-        if self.timestamps {
+        if let Some((set, first)) = &self.timestamps {
+            set.mark(*first, !self.work);
             self.raw.updateFence_afterStages(
                 self.encoder.counter_fence.as_ref().unwrap(),
                 MTLRenderStages::Vertex | MTLRenderStages::Fragment,
@@ -622,7 +619,8 @@ impl RenderPass<'_> {
 }
 impl Drop for ComputePass<'_> {
     fn drop(&mut self) {
-        if self.timestamps {
+        if let Some((set, first)) = &self.timestamps {
+            set.mark(*first, !self.work);
             self.raw
                 .updateFence(self.encoder.counter_fence.as_ref().unwrap());
         }

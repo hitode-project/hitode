@@ -21,7 +21,7 @@ impl Device {
         encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
         desc: &RenderPassDesc<'_>,
         area: Rect,
-    ) {
+    ) -> bool {
         let mut key = Key {
             colors: [MTLPixelFormat::Invalid; MAX_COLOR_TARGETS],
             write: 0,
@@ -96,7 +96,7 @@ impl Device {
         }
         if (key.write == 0 && !key.clear_depth && !key.clear_stencil) || area.w == 0 || area.h == 0
         {
-            return;
+            return false;
         }
         let mut clears = self.0.clears.lock().unwrap();
         let pipeline = clears
@@ -123,6 +123,7 @@ impl Device {
         // Internal clearing is not caller-visible dynamic state.
         encoder.setDepthStencilState(None);
         encoder.setStencilReferenceValue(0);
+        true
     }
 
     fn clear_pipeline(&self, key: &Key) -> Pipeline {
