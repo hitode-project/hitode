@@ -104,6 +104,7 @@ impl Gpu {
                 mips: 1,
                 samples: 1,
                 usage: Usage::COLOR | Usage::SAMPLED | Usage::COPY_SRC | Usage::COPY_DST,
+                view_formats: &[],
                 label: "target",
             })
             .expect("create target")
@@ -118,6 +119,7 @@ impl Gpu {
                 mips: 1,
                 samples: 1,
                 usage: Usage::DEPTH_STENCIL,
+                view_formats: &[],
                 label: "depth",
             })
             .expect("create depth")
@@ -1142,6 +1144,7 @@ fn multisampled_targets_resolve() {
             mips: 1,
             samples: 4,
             usage: Usage::COLOR | Usage::TRANSIENT,
+            view_formats: &[],
             label: "msaa",
         })
         .expect("msaa target");

@@ -64,17 +64,28 @@ pub struct RenderPassDesc<'a> {
     /// on either backend.
     pub area: Rect,
     /// Write GPU timestamps at the pass's start and end into `(set, first)` and
-    /// `(set, first + 1)`. Needs [`crate::Features::TIMESTAMPS`].
+    /// `(set, first + 1)`. Needs [`crate::Features::TIMESTAMPS`]. Timestamps
+    /// measure work: a pass without draws (its loads and stores only) may
+    /// report a zero duration, both values equal and otherwise unspecified,
+    /// because tile GPUs sample counters only where shader stages run.
     pub timestamps: Option<(&'a QuerySet, u32)>,
     pub label: &'static str,
 }
 
 pub struct ComputePassDesc<'a> {
+    /// As [`RenderPassDesc::timestamps`]; a pass without dispatches may report
+    /// a zero duration.
     pub timestamps: Option<(&'a QuerySet, u32)>,
     pub label: &'static str,
 }
 
-/// A resource bound to a slot of the current pipeline's binding list.
+/// A resource bound to a slot. Slots persist across pipelines within a pass,
+/// like D3D registers, so binding before `set_pipeline` is fine; every slot
+/// in the drawing pipeline's binding list must be bound. A uniform slice must
+/// cover the shader's block and start at `uniform_offset_alignment`; a
+/// storage slice starts at `storage_offset_alignment` and a multiple of the
+/// shader's array stride. These are caller contracts, asserted in debug
+/// builds only.
 ///
 /// On the modern Vulkan tier every image, buffer and sampler holds a fixed
 /// index in one bindless heap (descriptor indexing, update after bind), and
