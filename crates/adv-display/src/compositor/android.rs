@@ -124,7 +124,9 @@ mod native {
         assert!(fd >= -1, "invalid compositor fence");
         (fd != -1).then(|| unsafe { OwnedFd::from_raw_fd(fd) })
     }
-    fn signal_time(fd: &OwnedFd, fences: &mut Vec<SyncFenceInfo>) -> Option<i64> {
+    /// `None` while the fence is pending; then its signal time, or `None` inside
+    /// when it failed (the frame never reached the panel).
+    fn signal_time(fd: &OwnedFd, fences: &mut Vec<SyncFenceInfo>) -> Option<Option<i64>> {
         // android/sync.h's sync_file_info query, with reusable storage instead
         // of libsync's per-call allocation. Both ioctls are nonblocking.
         unsafe {
@@ -135,9 +137,10 @@ mod native {
                 0,
                 "sync file info"
             );
-            assert!(info.status >= 0, "present fence failed");
-            if info.status == 0 {
-                return None;
+            match info.status {
+                0 => return None,
+                s if s < 0 => return Some(None),
+                _ => {}
             }
             assert!(info.count > 0, "empty present fence");
             fences.resize_with(info.count as usize, SyncFenceInfo::default);
@@ -147,7 +150,9 @@ mod native {
                 0,
                 "sync fence info"
             );
-            Some(fences.iter().map(|f| f.timestamp).max().unwrap() as i64)
+            Some(Some(
+                fences.iter().map(|f| f.timestamp).max().unwrap() as i64
+            ))
         }
     }
 
@@ -156,19 +161,17 @@ mod native {
         ns: i64,
     }
     impl Clock {
-        fn new() -> Result<Self, Error> {
+        fn new() -> Self {
             let instant = Instant::now();
             let mut time = libc::timespec {
                 tv_sec: 0,
                 tv_nsec: 0,
             };
-            if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) } != 0 {
-                return Err(Error::SurfaceLost);
-            }
-            Ok(Self {
+            unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) };
+            Self {
                 instant,
                 ns: time.tv_sec * 1_000_000_000 + time.tv_nsec,
-            })
+            }
         }
         fn ns(&self, at: Instant) -> i64 {
             self.ns
@@ -251,7 +254,7 @@ mod native {
             window: NonNull<ndk_sys::ANativeWindow>,
             caps: CompositorCaps,
         ) -> Result<Self, Error> {
-            let clock = Clock::new()?;
+            let clock = Clock::new();
             let (w, h) = unsafe {
                 (
                     ANativeWindow_getWidth(window.as_ptr()),
@@ -519,11 +522,11 @@ mod native {
             // Keep unsignaled present fences and report their shown time on a
             // later drain. Latch reports and shown updates are oldest first.
             for event in &mut self.pending {
-                let shown = event
-                    .present
-                    .as_ref()
-                    .and_then(|fd| signal_time(fd, &mut self.fences))
-                    .map(|ns| self.clock.instant(ns));
+                let signaled = match &event.present {
+                    Some(fd) => signal_time(fd, &mut self.fences),
+                    None => Some(None),
+                };
+                let shown = signaled.flatten().map(|ns| self.clock.instant(ns));
                 if !event.reported || shown.is_some() {
                     presented.push(Presented {
                         serial: event.serial,
@@ -532,7 +535,7 @@ mod native {
                     });
                     event.reported = true;
                 }
-                if shown.is_some() {
+                if signaled.is_some() {
                     event.present = None;
                 }
             }
