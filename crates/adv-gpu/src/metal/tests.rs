@@ -35,6 +35,7 @@ fn image(device: &crate::Device, format: Format) -> crate::Image {
             } else {
                 Usage::COLOR | Usage::COPY_SRC
             },
+            view_formats: &[],
             label: "bounded clear test",
         })
         .unwrap()

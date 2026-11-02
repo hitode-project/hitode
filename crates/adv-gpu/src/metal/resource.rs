@@ -104,7 +104,13 @@ impl Device {
             },
         );
         d.setHazardTrackingMode(MTLHazardTrackingMode::Tracked);
-        let mut usage = MTLTextureUsage::PixelFormatView;
+        // Reinterpreting views cost lossless compression; only images that
+        // declare other view formats allow them.
+        let mut usage = if desc.view_formats.is_empty() {
+            MTLTextureUsage::empty()
+        } else {
+            MTLTextureUsage::PixelFormatView
+        };
         if desc.usage.contains(Usage::SAMPLED) {
             usage |= MTLTextureUsage::ShaderRead;
         }
@@ -303,7 +309,13 @@ impl Image {
         {
             return Err(Error::Invalid("image view range".into()));
         }
-        let format = caps::pixel_format(desc.format.unwrap_or(image.format))
+        let view_format = desc.format.unwrap_or(image.format);
+        if view_format != image.format && !image.view_formats.contains(&view_format) {
+            return Err(Error::Invalid(
+                "image view format not declared in view_formats".into(),
+            ));
+        }
+        let format = caps::pixel_format(view_format)
             .ok_or_else(|| Error::Invalid("image view format".into()))?;
         let dimension = desc.dimension.unwrap_or(image.dimension);
         let raw = unsafe {
