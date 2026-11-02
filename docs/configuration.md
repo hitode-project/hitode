@@ -90,6 +90,7 @@ Header macros, placeholder names in script examples and names read only to clear
 | `ADV_VERIFY_FRAMES` | Diagnostic | Off; `1` executes every D3D9 frame and asynchronously compares pixels outside computed damage with the previous readback |
 | `ADV_WINE_DIST` | Build / Fixture | The Wine installation embedded into the player; required for playable builds. Unset: Wine integration tests skip and pass; set: it must be complete |
 | `ADV_WINE_PROBES` | Fixture | Set by device runners to probes the host built; elsewhere tests build them |
+| `VK_DRIVER_FILES` | Fixture | Unset: Vulkan loader discovers drivers. The lavapipe CI job selects its software ICD explicitly |
 
 The `adv-dx/d3d9-counters` Cargo feature adds a D3D9 work report: retained
 recording bytes and lookup operations per draw, changed entries per StateBlock

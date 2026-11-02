@@ -115,6 +115,13 @@ Linux core and hardware acceptance checks use `ubuntu-24.04-arm`; release-mode
 Apple Silicon acceptance is also a gate. Cargo caches are separated by job and
 test group. Mac jobs use three workers; Linux jobs use four. The privacy scan runs on every PR.
 
+The Vulkan backend and its stand-ins run on lavapipe with validation enabled on
+`ubuntu-26.04-arm`. Its validation layers recognize `VK_KHR_load_store_op_none`;
+Ubuntu 24.04's layers predate that extension. `VK_DRIVER_FILES` selects only
+lavapipe's ICD, avoiding hardware driver discovery on the CPU runner.
+Test output is uncaptured so a validation failure remains visible when its
+callback aborts the process.
+
 ## Launcher
 
 The launcher in `apps/adv-launcher` is a Tauri app with a Svelte front end. It builds with `media` on every platform, so it needs the FFmpeg variables.
