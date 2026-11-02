@@ -12,5 +12,9 @@ arrayvec = "0.7"
 bitflags = "2"
 naga = { version = "=30.0.1", default-features = false }
 
+[target.'cfg(not(target_vendor = "apple"))'.dependencies]
+ash = { version = "0.38", default-features = false, features = ["loaded", "debug", "std"] }
+gpu-allocator = { version = "0.28", default-features = false, features = ["std", "vulkan"] }
+
 [lints]
 workspace = true

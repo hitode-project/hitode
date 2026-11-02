@@ -160,7 +160,9 @@ name = "adv-gpu"
 version = "0.2.3"
 dependencies = [
  "arrayvec",
+ "ash",
  "bitflags 2.13.2",
+ "gpu-allocator",
  "naga",
 ]
 
