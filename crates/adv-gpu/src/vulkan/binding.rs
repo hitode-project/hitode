@@ -1,4 +1,6 @@
+use super::pipeline::Compiled;
 use super::*;
+use arrayvec::ArrayVec;
 use ash::vk::Handle;
 
 pub(super) fn group(kind: BindingKind) -> u32 {
@@ -31,36 +33,45 @@ pub(super) fn stages(stages: Stages) -> vk::ShaderStageFlags {
     }
     flags
 }
+/// Where a heap binding's index, and a storage buffer's element offset, live
+/// in the push block. Resolved once per compiled pipeline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct IndexWord {
+pub(super) struct Field {
     pub(super) word: u32,
     pub(super) shift: u32,
     pub(super) mask: u32,
     pub(super) offset: Option<u32>,
+    pub(super) stride: u32,
 }
-// Heap indices share words when they fit in 16 bits. Each storage offset
-// has its own full word; register numbers do not consume gaps.
+/// Heap indices share words when they fit in 16 bits. Each storage offset
+/// has its own full word; register numbers do not consume gaps.
 #[derive(Default, Clone, Debug, PartialEq, Eq)]
 pub(super) struct PushLayout {
-    pub(super) bindings: HashMap<(u32, u32), IndexWord>,
+    /// By group, indexed by slot.
+    fields: [Vec<Option<Field>>; 4],
     pub(super) words: usize,
 }
 impl PushLayout {
-    pub(super) fn new(bindings: &[Binding], heap: &Heap, bytes: u32) -> Result<Self> {
-        let mut ordered = bindings.to_vec();
-        ordered.sort_by_key(|b| (group(b.kind), b.slot));
+    /// `bindings` sorted by `(group, slot)`; `strides` are the storage array
+    /// strides the shaders declare, by slot.
+    pub(super) fn new(
+        bindings: &[Binding],
+        heap: &Heap,
+        bytes: u32,
+        strides: &HashMap<u32, u32>,
+    ) -> Result<Self> {
         let mut layout = Self::default();
         let mut half = None;
-        for binding in &ordered {
-            if binding.kind == BindingKind::UniformBuffer {
+        for binding in bindings {
+            let group = group(binding.kind);
+            if group == 0 {
                 continue;
             }
             let kind = match binding.kind {
                 BindingKind::SampledImage { .. } => 0,
                 BindingKind::Sampler { .. } => 1,
                 BindingKind::StorageImage { .. } => 2,
-                BindingKind::StorageBuffer { .. } => 3,
-                _ => unreachable!(),
+                _ => 3,
             };
             let packed = heap.counts[kind] <= 65536;
             let (word, shift) = if packed && let Some(word) = half.take() {
@@ -73,20 +84,24 @@ impl PushLayout {
                 }
                 (word, 0)
             };
-            layout.bindings.insert(
-                (group(binding.kind), binding.slot),
-                IndexWord {
-                    word,
-                    shift,
-                    mask: if packed { 65535 } else { u32::MAX },
-                    offset: None,
-                },
-            );
+            let fields = &mut layout.fields[group as usize];
+            let slot = binding.slot as usize;
+            if fields.len() <= slot {
+                fields.resize(slot + 1, None);
+            }
+            fields[slot] = Some(Field {
+                word,
+                shift,
+                mask: if packed { 65535 } else { u32::MAX },
+                offset: None,
+                // A slot no shader reads has no stride; its offset is unused.
+                stride: strides.get(&binding.slot).copied().unwrap_or(1),
+            });
         }
-        for binding in ordered {
+        for binding in bindings {
             if matches!(binding.kind, BindingKind::StorageBuffer { .. }) {
-                layout.bindings.get_mut(&(3, binding.slot)).unwrap().offset =
-                    Some(layout.words as u32);
+                let field = layout.fields[3][binding.slot as usize].as_mut().unwrap();
+                field.offset = Some(layout.words as u32);
                 layout.words += 1;
             }
         }
@@ -96,6 +111,9 @@ impl PushLayout {
             ));
         }
         Ok(layout)
+    }
+    pub(super) fn field(&self, group: u32, slot: u32) -> Option<&Field> {
+        self.fields[group as usize].get(slot as usize)?.as_ref()
     }
 }
 
@@ -328,123 +346,103 @@ impl Drop for Heap {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
-pub(super) enum Bound {
-    Buffer { handle: u64, offset: u64, size: u64 },
-    Image { handle: u64, layout: i32 },
-    Sampler(u64),
+/// One bound resource: the descriptor the fallback tiers write and the heap
+/// index and offset the bindless tier pushes. A zero handle is unbound.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub(super) struct Bound {
+    handle: u64,
+    offset: u64,
+    size: u64,
+    layout: i32,
+    index: u32,
 }
 impl Bound {
     fn buffer_info(&self) -> vk::DescriptorBufferInfo {
-        match *self {
-            Self::Buffer {
-                handle,
-                offset,
-                size,
-            } => vk::DescriptorBufferInfo::default()
-                .buffer(vk::Buffer::from_raw(handle))
-                .offset(offset)
-                .range(size),
-            _ => vk::DescriptorBufferInfo::default(),
-        }
+        vk::DescriptorBufferInfo::default()
+            .buffer(vk::Buffer::from_raw(self.handle))
+            .offset(self.offset)
+            .range(self.size)
     }
-    fn image_info(&self) -> vk::DescriptorImageInfo {
-        match *self {
-            Self::Image { handle, layout } => vk::DescriptorImageInfo::default()
-                .image_view(vk::ImageView::from_raw(handle))
-                .image_layout(vk::ImageLayout::from_raw(layout)),
-            Self::Sampler(handle) => {
-                vk::DescriptorImageInfo::default().sampler(vk::Sampler::from_raw(handle))
-            }
-            _ => vk::DescriptorImageInfo::default(),
+    fn image_info(&self, kind: BindingKind) -> vk::DescriptorImageInfo {
+        if matches!(kind, BindingKind::Sampler { .. }) {
+            return vk::DescriptorImageInfo::default().sampler(vk::Sampler::from_raw(self.handle));
         }
+        vk::DescriptorImageInfo::default()
+            .image_view(vk::ImageView::from_raw(self.handle))
+            .image_layout(vk::ImageLayout::from_raw(self.layout))
     }
 }
+
+/// Bindings of one pass. Slots persist across pipelines, as D3D registers
+/// do. `bind` and `flush` hash nothing, clone nothing and lock only when a
+/// slot changes to a resource that needs a layout transition or a new
+/// uniform descriptor.
 #[derive(Default)]
 pub(super) struct Bindings {
-    values: HashMap<(u32, u32), Bound>,
-    changed: bool,
-    dirty: std::collections::HashSet<(u32, u32)>,
-    pushed_layout: vk::PipelineLayout,
+    /// By group, indexed by slot.
+    slots: [Vec<Bound>; 4],
+    /// The pipeline layout `push` follows.
     layout: vk::PipelineLayout,
+    // Bindless tier.
     heap_bound: bool,
-    uniform_bound: HashMap<u32, (vk::DescriptorSet, u32)>,
-    uniforms: HashMap<u32, (Buffer, u32, u64)>,
-    push_layout: PushLayout,
     push: Vec<u32>,
-    push_dirty: Option<std::ops::Range<usize>>,
-    heap_values: HashMap<(u32, u32), (u32, u64)>,
-    rebuild: bool,
+    push_dirty: (usize, usize),
+    uniform_sets: Vec<vk::DescriptorSet>,
+    uniform_dirty: u64,
+    // Push-descriptor and cached-set tiers.
+    dirty: [u128; 4],
+    changed: bool,
+    pushed_layout: vk::PipelineLayout,
+    values: Vec<Bound>,
 }
+const CLEAN: (usize, usize) = (usize::MAX, 0);
 impl Bindings {
-    pub(super) fn pipeline(&mut self, pipeline: &pipeline::PipelineCore) {
-        self.rebuild = true;
-        if self.layout != pipeline.layout {
-            self.layout = pipeline.layout;
-            self.changed = true;
-        }
-    }
-    fn set_word(&mut self, word: usize, value: u32) {
-        if self.push[word] == value {
+    pub(super) fn pipeline(&mut self, compiled: &Compiled) {
+        if self.layout == compiled.layout {
             return;
         }
-        self.push[word] = value;
-        self.push_dirty = Some(self.push_dirty.as_ref().map_or(word..word + 1, |range| {
-            range.start.min(word)..range.end.max(word + 1)
-        }));
+        self.layout = compiled.layout;
+        self.changed = true;
+        self.push.clear();
+        self.push.resize(compiled.push.words, 0);
+        for binding in &compiled.bindings {
+            let group = group(binding.kind);
+            let bound = self.slots[group as usize]
+                .get(binding.slot as usize)
+                .copied();
+            if let (Some(field), Some(bound)) = (compiled.push.field(group, binding.slot), bound) {
+                self.encode(field, &bound);
+            }
+        }
+        self.push_dirty = (0, self.push.len());
     }
-    fn encode(
-        &mut self,
-        pipeline: &pipeline::PipelineCore,
-        key: (u32, u32),
-        index: u32,
-        offset: u64,
-    ) -> Result<()> {
-        let Some(field) = pipeline.push.bindings.get(&key) else {
-            return Ok(());
-        };
+    fn set_word(&mut self, word: usize, value: u32) {
+        if self.push[word] != value {
+            self.push[word] = value;
+            self.push_dirty = (self.push_dirty.0.min(word), self.push_dirty.1.max(word + 1));
+        }
+    }
+    fn encode(&mut self, field: &Field, bound: &Bound) {
+        debug_assert!(bound.index <= field.mask);
         let word = field.word as usize;
         self.set_word(
             word,
-            (self.push[word] & !(field.mask << field.shift))
-                | ((index & field.mask) << field.shift),
+            (self.push[word] & !(field.mask << field.shift)) | (bound.index << field.shift),
         );
         if let Some(word) = field.offset {
-            let stride = u64::from(pipeline.storage_strides.get(&key.1).copied().unwrap_or(1));
-            if !offset.is_multiple_of(stride) {
-                return Err(Error::Invalid(
-                    "storage offset is not aligned to the array stride".into(),
-                ));
-            }
-            let offset = u32::try_from(offset / stride)
-                .map_err(|_| Error::Invalid("storage offset exceeds push-constant range".into()))?;
-            self.set_word(word as usize, offset);
+            let stride = u64::from(field.stride);
+            debug_assert!(
+                bound.offset.is_multiple_of(stride),
+                "storage offset {} is not a multiple of the array stride {stride}",
+                bound.offset
+            );
+            self.set_word(word as usize, (bound.offset / stride) as u32);
         }
-        Ok(())
-    }
-    fn rebuild(&mut self, pipeline: &pipeline::PipelineCore) -> Result<()> {
-        if !self.rebuild {
-            return Ok(());
-        }
-        if self.push_layout != pipeline.push {
-            self.push_layout = pipeline.push.clone();
-            self.push = vec![0; pipeline.push.words];
-            self.push_dirty = if self.push.is_empty() {
-                None
-            } else {
-                Some(0..self.push.len())
-            };
-        }
-        for (key, (index, offset)) in self.heap_values.clone() {
-            self.encode(pipeline, key, index, offset)?;
-        }
-        self.rebuild = false;
-        Ok(())
     }
     pub(super) fn bind(
         &mut self,
         encoder: &mut Encoder,
-        pipeline: &pipeline::PipelineCore,
+        compiled: Option<&Compiled>,
         slot: u32,
         resource: Bind<'_>,
         preamble: Option<vk::CommandBuffer>,
@@ -452,301 +450,320 @@ impl Bindings {
         if !encoder.ready() {
             return;
         }
-        if encoder.shared.context.heap.is_some()
-            && let Bind::StorageBuffer(slice) = resource
-        {
-            let stride = u64::from(pipeline.storage_strides.get(&slot).copied().unwrap_or(1));
-            let alignment = u64::from(encoder.shared.context.caps.limits.storage_offset_alignment);
-            if !slice.offset.is_multiple_of(alignment) || !slice.offset.is_multiple_of(stride) {
-                encoder.error = Some(Error::Invalid(
-                    "storage offset is not aligned to the device limit and array stride".into(),
-                ));
-                return;
-            }
-        }
         let (group, bound) = match resource {
             Bind::Uniform(slice) | Bind::StorageBuffer(slice) => {
-                encoder.resources.buffers.push(slice.buffer.inner.clone());
+                let core = &slice.buffer.inner.0;
+                let storage = matches!(resource, Bind::StorageBuffer(_));
+                debug_assert!(slice.offset.is_multiple_of(u64::from(if storage {
+                    encoder.shared.context.caps.limits.storage_offset_alignment
+                } else {
+                    encoder.shared.context.caps.limits.uniform_offset_alignment
+                })));
                 (
-                    if matches!(resource, Bind::Uniform(_)) {
-                        0
-                    } else {
-                        3
-                    },
-                    Bound::Buffer {
-                        handle: slice.buffer.inner.0.handle.as_raw(),
+                    if storage { 3 } else { 0 },
+                    Bound {
+                        handle: core.handle.as_raw(),
                         offset: slice.offset,
                         size: slice.size,
+                        layout: 0,
+                        index: if storage {
+                            core.storage.unwrap_or(0)
+                        } else {
+                            0
+                        },
                     },
                 )
             }
             Bind::Sampled(view) | Bind::StorageImage(view) => {
                 let sampled = matches!(resource, Bind::Sampled(_));
-                if sampled && view.inner.0.image.inner.core.conversion.is_some() {
-                    encoder.error = Some(Error::Unavailable(
-                        "YCbCr sampling requires a combined immutable sampler".into(),
-                    ));
-                    return;
-                }
-                let depth = view.inner.0.format.has_depth();
-                let layout = if sampled && depth {
+                let core = &view.inner.0;
+                debug_assert!(
+                    !sampled || core.image.inner.core.conversion.is_none(),
+                    "YCbCr images need a combined immutable sampler"
+                );
+                let layout = if sampled && core.format.has_depth() {
                     vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL
                 } else {
                     vk::ImageLayout::GENERAL
                 };
+                let index = if sampled { core.sampled } else { core.storage };
+                (
+                    if sampled { 1 } else { 3 },
+                    Bound {
+                        handle: core.handle.as_raw(),
+                        offset: 0,
+                        size: 0,
+                        layout: layout.as_raw(),
+                        index: index.unwrap_or(0),
+                    },
+                )
+            }
+            Bind::Sampler(sampler) => (
+                2,
+                Bound {
+                    handle: sampler.inner.0.handle.as_raw(),
+                    index: sampler.inner.0.index.unwrap_or(0),
+                    ..Bound::default()
+                },
+            ),
+        };
+        debug_assert!(slot < 128, "slot {slot}");
+        let slots = &mut self.slots[group as usize];
+        if slots.len() <= slot as usize {
+            slots.resize(slot as usize + 1, Bound::default());
+        }
+        let old = std::mem::replace(&mut slots[slot as usize], bound);
+        if old == bound {
+            return;
+        }
+        if let Bind::Sampled(view) | Bind::StorageImage(view) = resource {
+            let layout = vk::ImageLayout::from_raw(bound.layout);
+            let stale = view.inner.0.image.inner.core.states.lock().unwrap()[..]
+                .iter()
+                .any(|s| s.layout != layout);
+            if stale {
+                // Inside a render pass the barrier goes to the pass preamble.
                 let command = encoder.command;
                 if let Some(preamble) = preamble {
                     encoder.command = preamble;
                 }
-                let needs_transition = view
-                    .inner
-                    .0
-                    .image
-                    .inner
-                    .core
-                    .states
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .any(|s| s.layout != layout);
-                if needs_transition {
-                    encoder.view_transition(
-                        &view.inner,
-                        layout,
-                        vk::AccessFlags2::SHADER_READ
-                            | if sampled {
-                                vk::AccessFlags2::empty()
-                            } else {
-                                vk::AccessFlags2::SHADER_WRITE
-                            },
-                        vk::PipelineStageFlags2::ALL_GRAPHICS
-                            | vk::PipelineStageFlags2::COMPUTE_SHADER,
-                    );
-                }
+                let write = if group == 1 {
+                    vk::AccessFlags2::empty()
+                } else {
+                    vk::AccessFlags2::SHADER_WRITE
+                };
+                encoder.view_transition(
+                    &view.inner,
+                    layout,
+                    vk::AccessFlags2::SHADER_READ | write,
+                    vk::PipelineStageFlags2::ALL_GRAPHICS | vk::PipelineStageFlags2::COMPUTE_SHADER,
+                );
                 encoder.command = command;
-                encoder.resources.views.push(view.inner.clone());
-                (
-                    if sampled { 1 } else { 3 },
-                    Bound::Image {
-                        handle: view.inner.0.handle.as_raw(),
-                        layout: layout.as_raw(),
-                    },
-                )
             }
-            Bind::Sampler(sampler) => {
-                encoder.resources.samplers.push(sampler.inner.clone());
-                (2, Bound::Sampler(sampler.inner.0.handle.as_raw()))
-            }
-        };
-        if self.values.get(&(group, slot)) == Some(&bound) {
-            return;
         }
-        self.values.insert((group, slot), bound);
-        self.dirty.insert((group, slot));
-        self.changed = true;
         let context = &encoder.shared.context;
-        if context.heap.is_some() {
-            if let Err(error) = self.rebuild(pipeline) {
-                encoder.error = Some(error);
-                return;
-            }
-            let result = match resource {
-                Bind::Uniform(slice) => {
-                    self.uniforms.insert(
-                        slot,
-                        (slice.buffer.inner.clone(), slice.offset as u32, slice.size),
-                    );
-                    Ok(())
-                }
-                _ => {
-                    let (index, offset) = match resource {
-                        Bind::Sampled(view) => (view.inner.0.sampled.unwrap(), 0),
-                        Bind::Sampler(sampler) => (sampler.inner.0.index.unwrap(), 0),
-                        Bind::StorageImage(view) => (view.inner.0.storage.unwrap(), 0),
-                        Bind::StorageBuffer(slice) => {
-                            (slice.buffer.inner.0.storage.unwrap(), slice.offset)
+        let Some(heap) = &context.heap else {
+            self.dirty[group as usize] |= 1 << slot;
+            self.changed = true;
+            return;
+        };
+        if let Bind::Uniform(slice) = resource {
+            // Ring uploads move the offset every draw; the descriptor depends
+            // only on the buffer and the block size.
+            if old.handle != bound.handle || old.size != bound.size {
+                let mut sets = slice.buffer.inner.0.uniforms.lock().unwrap();
+                let set = match sets.get(&bound.size) {
+                    Some(&set) => set,
+                    None => match heap.uniform(context, slice.buffer.inner.0.handle, bound.size) {
+                        Ok(set) => *sets.entry(bound.size).or_insert(set),
+                        Err(error) => {
+                            drop(sets);
+                            encoder.error = Some(error);
+                            return;
                         }
-                        Bind::Uniform(_) => unreachable!(),
-                    };
-                    self.heap_values.insert((group, slot), (index, offset));
-                    self.encode(pipeline, (group, slot), index, offset)
+                    },
+                };
+                if self.uniform_sets.len() <= slot as usize {
+                    self.uniform_sets
+                        .resize(slot as usize + 1, vk::DescriptorSet::null());
                 }
-            };
-            if let Err(error) = result {
-                encoder.error = Some(error);
+                self.uniform_sets[slot as usize] = set;
             }
+            debug_assert!(slot < 64);
+            self.uniform_dirty |= 1 << slot;
+        } else if let Some(field) = compiled.and_then(|c| c.push.field(group, slot)) {
+            self.encode(field, &bound);
         }
     }
+    /// Makes the bindings visible to the next draw or dispatch. False if the
+    /// encoder failed.
     pub(super) fn flush(
         &mut self,
         encoder: &mut Encoder,
-        pipeline: &pipeline::PipelineCore,
+        compiled: &Compiled,
         point: vk::PipelineBindPoint,
     ) -> bool {
         if !encoder.ready() {
             return false;
         }
-        let context = encoder.shared.context.clone();
-        if let Some(heap) = &context.heap {
-            if let Err(error) = self.rebuild(pipeline) {
-                encoder.error = Some(error);
-                return false;
-            }
-            if !self.heap_bound {
-                unsafe {
-                    context.device.cmd_bind_descriptor_sets(
-                        encoder.command,
-                        point,
-                        pipeline.layout,
-                        0,
-                        &[heap.set],
-                        &[],
-                    );
-                }
-                self.heap_bound = true;
-            }
-            for binding in &pipeline.bindings {
-                if binding.kind != BindingKind::UniformBuffer {
-                    continue;
-                }
-                let slot = binding.slot;
-                let Some((buffer, offset, bound_size)) = self.uniforms.get(&slot) else {
-                    encoder.error = Some(Error::Invalid("missing uniform binding".into()));
-                    return false;
-                };
-                let size = pipeline
-                    .uniform_sizes
-                    .get(&slot)
-                    .copied()
-                    .unwrap_or(*bound_size);
-                let mut sets = buffer.0.uniforms.lock().unwrap();
-                let set = if let Some(&set) = sets.get(&size) {
-                    set
-                } else {
-                    match heap.uniform(&context, buffer.0.handle, size) {
-                        Ok(set) => {
-                            sets.insert(size, set);
-                            set
-                        }
-                        Err(error) => {
-                            encoder.error = Some(error);
-                            return false;
-                        }
-                    }
-                };
-                if self.uniform_bound.get(&slot) != Some(&(set, *offset)) {
-                    unsafe {
-                        context.device.cmd_bind_descriptor_sets(
-                            encoder.command,
-                            point,
-                            pipeline.layout,
-                            slot + 1,
-                            &[set],
-                            &[*offset],
-                        );
-                    }
-                    self.uniform_bound.insert(slot, (set, *offset));
-                }
-            }
-            if let Some(range) = self.push_dirty.take() {
-                let words = &self.push[range.clone()];
-                // SAFETY: u32 words are initialized; Vulkan copies these bytes
-                // during the command, before the CPU block can change.
-                let bytes = unsafe {
-                    std::slice::from_raw_parts(
-                        words.as_ptr().cast::<u8>(),
-                        std::mem::size_of_val(words),
-                    )
-                };
-                unsafe {
-                    context.device.cmd_push_constants(
-                        encoder.command,
-                        pipeline.layout,
-                        vk::ShaderStageFlags::ALL,
-                        (range.start * 4) as u32,
-                        bytes,
-                    );
-                }
-            }
+        debug_assert!(
+            compiled
+                .bindings
+                .iter()
+                .all(|b| self.slots[group(b.kind) as usize]
+                    .get(b.slot as usize)
+                    .is_some_and(|v| v.handle != 0)),
+            "a pipeline binding has no resource"
+        );
+        if encoder.shared.context.heap.is_some() {
+            self.flush_heap(&encoder.shared.context, encoder.command, compiled, point);
             return true;
         }
-        if !self.changed || pipeline.bindings.is_empty() {
+        if !self.changed || compiled.bindings.is_empty() {
             return true;
         }
-        let values: Vec<_> = pipeline
-            .bindings
-            .iter()
-            .map(|b| self.values.get(&(group(b.kind), b.slot)).cloned())
-            .collect();
-        if values.iter().any(Option::is_none) {
-            encoder.error = Some(Error::Invalid("missing pipeline binding".into()));
+        if let Err(error) = self.flush_sets(encoder, compiled, point) {
+            encoder.error = Some(error);
             return false;
         }
-        let values: Vec<_> = values.into_iter().flatten().collect();
-        let buffers: Vec<_> = values.iter().map(Bound::buffer_info).collect();
-        let images: Vec<_> = values.iter().map(Bound::image_info).collect();
-        let push = context.caps.modern.contains(Modern::PUSH_DESCRIPTORS);
+        true
+    }
+    fn flush_heap(
+        &mut self,
+        context: &Context,
+        command: vk::CommandBuffer,
+        compiled: &Compiled,
+        point: vk::PipelineBindPoint,
+    ) {
+        let device = &context.device;
+        unsafe {
+            if !self.heap_bound {
+                let set = context.heap.as_ref().unwrap().set;
+                device.cmd_bind_descriptor_sets(command, point, compiled.layout, 0, &[set], &[]);
+                self.heap_bound = true;
+            }
+            let mut uniforms = self.uniform_dirty & compiled.uniforms;
+            self.uniform_dirty &= !uniforms;
+            while uniforms != 0 {
+                let slot = uniforms.trailing_zeros();
+                uniforms &= uniforms - 1;
+                let offset = self.slots[0][slot as usize].offset;
+                debug_assert!(offset <= u64::from(u32::MAX));
+                device.cmd_bind_descriptor_sets(
+                    command,
+                    point,
+                    compiled.layout,
+                    slot + 1,
+                    &[self.uniform_sets[slot as usize]],
+                    &[offset as u32],
+                );
+            }
+            let (start, end) = std::mem::replace(&mut self.push_dirty, CLEAN);
+            if start < end {
+                let words = &self.push[start..end];
+                // SAFETY: initialized u32 words, copied by the driver now.
+                let bytes = std::slice::from_raw_parts(
+                    words.as_ptr().cast::<u8>(),
+                    std::mem::size_of_val(words),
+                );
+                device.cmd_push_constants(
+                    command,
+                    compiled.layout,
+                    vk::ShaderStageFlags::ALL,
+                    (start * 4) as u32,
+                    bytes,
+                );
+            }
+        }
+    }
+    fn flush_sets(
+        &mut self,
+        encoder: &mut Encoder,
+        compiled: &Compiled,
+        point: vk::PipelineBindPoint,
+    ) -> Result<()> {
+        let push = encoder
+            .shared
+            .context
+            .caps
+            .modern
+            .contains(Modern::PUSH_DESCRIPTORS);
+        let all = !push || self.pushed_layout != compiled.layout;
         let set = if push {
             vk::DescriptorSet::null()
         } else {
-            match encoder.descriptor_set(pipeline.set_layout, &pipeline.bindings, &values) {
-                Ok((set, false)) => {
-                    unsafe {
-                        context.device.cmd_bind_descriptor_sets(
-                            encoder.command,
-                            point,
-                            pipeline.layout,
-                            0,
-                            &[set],
-                            &[],
-                        );
-                    }
-                    self.changed = false;
-                    return true;
-                }
-                Ok((set, true)) => set,
-                Err(error) => {
-                    encoder.error = Some(error);
-                    return false;
-                }
+            // The set layout leads the key, so one arena serves every pipeline.
+            self.values.clear();
+            self.values.push(Bound {
+                handle: compiled.set_layout.as_raw(),
+                ..Bound::default()
+            });
+            for b in &compiled.bindings {
+                self.values
+                    .push(self.slots[group(b.kind) as usize][b.slot as usize]);
             }
+            let (set, new) =
+                encoder.descriptor_set(compiled.set_layout, &compiled.bindings, &self.values)?;
+            if !new {
+                unsafe {
+                    encoder.shared.context.device.cmd_bind_descriptor_sets(
+                        encoder.command,
+                        point,
+                        compiled.layout,
+                        0,
+                        &[set],
+                        &[],
+                    );
+                }
+                self.changed = false;
+                return Ok(());
+            }
+            set
         };
-        let writes: Vec<_> = pipeline
+        let context = &encoder.shared.context;
+        let written = compiled
             .bindings
             .iter()
-            .enumerate()
-            .filter(|(_, b)| {
-                !push
-                    || self.pushed_layout != pipeline.layout
-                    || self.dirty.contains(&(group(b.kind), b.slot))
-            })
-            .map(|(i, b)| {
-                let write = vk::WriteDescriptorSet::default()
-                    .dst_set(set)
-                    .dst_binding(b.slot * 4 + group(b.kind))
-                    .descriptor_type(descriptor(b.kind));
-                if matches!(values[i], Bound::Buffer { .. }) {
-                    write.buffer_info(&buffers[i..i + 1])
-                } else {
-                    write.image_info(&images[i..i + 1])
+            .filter(|b| all || self.dirty[group(b.kind) as usize] & (1 << b.slot) != 0);
+        // Fixed-size batches keep the descriptor infos on the stack.
+        let mut buffers = ArrayVec::<vk::DescriptorBufferInfo, 32>::new();
+        let mut images = ArrayVec::<vk::DescriptorImageInfo, 32>::new();
+        let mut batch = ArrayVec::<&Binding, 32>::new();
+        let mut written = written.peekable();
+        while written.peek().is_some() {
+            batch.clear();
+            buffers.clear();
+            images.clear();
+            batch.extend(written.by_ref().take(32));
+            for b in &batch {
+                let bound = &self.slots[group(b.kind) as usize][b.slot as usize];
+                match b.kind {
+                    BindingKind::UniformBuffer | BindingKind::StorageBuffer { .. } => {
+                        buffers.push(bound.buffer_info())
+                    }
+                    kind => images.push(bound.image_info(kind)),
                 }
-            })
-            .collect();
-        unsafe {
-            if push {
-                context.push.cmd_push_descriptor_set(
-                    encoder.command,
-                    point,
-                    pipeline.layout,
-                    0,
-                    &writes,
-                );
-            } else {
-                context.device.update_descriptor_sets(&writes, &[]);
+            }
+            let (mut nb, mut ni) = (0, 0);
+            let writes: ArrayVec<_, 32> = batch
+                .iter()
+                .map(|b| {
+                    let write = vk::WriteDescriptorSet::default()
+                        .dst_set(set)
+                        .dst_binding(b.slot * 4 + group(b.kind))
+                        .descriptor_type(descriptor(b.kind));
+                    match b.kind {
+                        BindingKind::UniformBuffer | BindingKind::StorageBuffer { .. } => {
+                            nb += 1;
+                            write.buffer_info(&buffers[nb - 1..nb])
+                        }
+                        _ => {
+                            ni += 1;
+                            write.image_info(&images[ni - 1..ni])
+                        }
+                    }
+                })
+                .collect();
+            unsafe {
+                if push {
+                    context.push.cmd_push_descriptor_set(
+                        encoder.command,
+                        point,
+                        compiled.layout,
+                        0,
+                        &writes,
+                    );
+                } else {
+                    context.device.update_descriptor_sets(&writes, &[]);
+                }
+            }
+        }
+        if !push {
+            unsafe {
                 context.device.cmd_bind_descriptor_sets(
                     encoder.command,
                     point,
-                    pipeline.layout,
+                    compiled.layout,
                     0,
                     &[set],
                     &[],
@@ -754,16 +771,17 @@ impl Bindings {
             }
         }
         self.changed = false;
-        self.dirty.clear();
-        self.pushed_layout = pipeline.layout;
-        true
+        self.dirty = [0; 4];
+        self.pushed_layout = compiled.layout;
+        Ok(())
     }
 }
 
 #[derive(Default)]
 pub(super) struct DescriptorArena {
     pools: Vec<vk::DescriptorPool>,
-    sets: HashMap<(vk::DescriptorSetLayout, Vec<Bound>), vk::DescriptorSet>,
+    /// Keyed by the set layout followed by the bound values.
+    sets: HashMap<Vec<Bound>, vk::DescriptorSet>,
 }
 impl DescriptorArena {
     pub(super) fn reset(&mut self, context: &Context) -> Result<()> {
@@ -789,10 +807,9 @@ impl DescriptorArena {
         context: &Context,
         layout: vk::DescriptorSetLayout,
         bindings: &[Binding],
-        values: &[Bound],
+        key: &[Bound],
     ) -> Result<(vk::DescriptorSet, bool)> {
-        let key = (layout, values.to_vec());
-        if let Some(&set) = self.sets.get(&key) {
+        if let Some(&set) = self.sets.get(key) {
             return Ok((set, false));
         }
         let allocate = |pool| unsafe {
@@ -805,7 +822,7 @@ impl DescriptorArena {
         for &pool in &self.pools {
             match allocate(pool) {
                 Ok(sets) => {
-                    self.sets.insert(key, sets[0]);
+                    self.sets.insert(key.to_vec(), sets[0]);
                     return Ok((sets[0], true));
                 }
                 Err(vk::Result::ERROR_OUT_OF_POOL_MEMORY | vk::Result::ERROR_FRAGMENTED_POOL) => {}
@@ -833,7 +850,7 @@ impl DescriptorArena {
         })?;
         self.pools.push(pool);
         let set = context.result(allocate(pool))?[0];
-        self.sets.insert(key, set);
+        self.sets.insert(key.to_vec(), set);
         Ok((set, true))
     }
 }

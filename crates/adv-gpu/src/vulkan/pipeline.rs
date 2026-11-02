@@ -72,10 +72,17 @@ pub(super) struct Pipelines {
     compute: HashMap<ComputeKey, Arc<Compiled>>,
     passes: HashMap<(Vec<Format>, Option<Format>, u32), vk::RenderPass>,
 }
-struct Compiled {
-    handle: vk::Pipeline,
-    layout: vk::PipelineLayout,
-    set_layout: vk::DescriptorSetLayout,
+/// A driver pipeline and what binding needs from it, resolved once. Lives
+/// in the device's cache until the device drops.
+pub(super) struct Compiled {
+    pub(super) handle: vk::Pipeline,
+    pub(super) layout: vk::PipelineLayout,
+    pub(super) set_layout: vk::DescriptorSetLayout,
+    /// Sorted by `(group, slot)`.
+    pub(super) bindings: Vec<Binding>,
+    pub(super) push: binding::PushLayout,
+    /// Bindless tier: uniform slots, one bit each.
+    pub(super) uniforms: u64,
 }
 impl Pipelines {
     pub(super) fn destroy(&mut self, device: &ash::Device) {
@@ -154,68 +161,145 @@ impl Pipelines {
 }
 #[derive(Clone)]
 pub(crate) struct RenderPipeline {
-    pub(super) core: Arc<PipelineCore>,
-    pub(super) desc: Arc<RenderPipelineDesc>,
+    _context: Arc<Context>,
+    pub(super) compiled: Arc<Compiled>,
+    pub(super) dynamic: Dynamic,
 }
 #[derive(Clone)]
 pub(crate) struct ComputePipeline {
-    pub(super) core: Arc<PipelineCore>,
-}
-pub(super) struct PipelineCore {
     _context: Arc<Context>,
-    _compiled: Arc<Compiled>,
-    pub(super) handle: vk::Pipeline,
-    pub(super) layout: vk::PipelineLayout,
-    pub(super) set_layout: vk::DescriptorSetLayout,
-    pub(super) bindings: Vec<Binding>,
-    pub(super) uniform_sizes: HashMap<u32, u64>,
-    pub(super) storage_strides: HashMap<u32, u32>,
-    pub(super) push: binding::PushLayout,
+    pub(super) compiled: Arc<Compiled>,
 }
-impl PipelineCore {
-    fn new(
-        context: Arc<Context>,
-        compiled: Arc<Compiled>,
-        mut bindings: Vec<Binding>,
-        entries: &[&Entry],
-    ) -> Arc<Self> {
-        bindings.sort_by_key(|b| (binding::group(b.kind), b.slot));
-        let mut uniforms = HashMap::<u32, u64>::new();
-        let mut storage_strides = HashMap::new();
-        for entry in entries {
-            storage_strides.extend(entry.shader.inner.storage_strides(entry.index));
-            for (&slot, &size) in entry.shader.inner.uniforms(entry.index) {
-                uniforms
-                    .entry(slot)
-                    .and_modify(|n| *n = (*n).max(size))
-                    .or_insert(size);
+
+/// Pipeline state that commands set, resolved at creation so `set_pipeline`
+/// emits only what differs from the pass's previous pipeline. Every pipeline
+/// of a device declares the same dynamic states, so state carries over.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct Dynamic {
+    cull: vk::CullModeFlags,
+    front: vk::FrontFace,
+    topology: vk::PrimitiveTopology,
+    depth_test: bool,
+    depth_write: bool,
+    depth_compare: vk::CompareOp,
+    stencil_test: bool,
+    depth_bias: bool,
+    stencil: [(vk::StencilOp, vk::StencilOp, vk::StencilOp, vk::CompareOp); 2],
+    read_mask: u32,
+    write_mask: u32,
+    color_write: (u32, [u32; 8]),
+}
+impl Dynamic {
+    fn new(desc: &RenderPipelineDesc) -> Self {
+        let depth = desc.depth_stencil;
+        let face = |f: StencilFace| {
+            (
+                stencil_op(f.fail),
+                stencil_op(f.pass),
+                stencil_op(f.depth_fail),
+                resource::compare(f.compare),
+            )
+        };
+        let keep = StencilFace {
+            compare: Compare::Always,
+            fail: StencilOp::Keep,
+            depth_fail: StencilOp::Keep,
+            pass: StencilOp::Keep,
+        };
+        let (front, back) = depth.and_then(|d| d.stencil).unwrap_or((keep, keep));
+        let mut color_write = (desc.colors.len() as u32, [0; 8]);
+        for (enable, color) in color_write.1.iter_mut().zip(&desc.colors) {
+            *enable = u32::from(color.write_mask != 0);
+        }
+        Self {
+            cull: cull(desc.primitive.cull),
+            front: winding(desc.primitive.front_ccw),
+            topology: topology(desc.primitive.topology),
+            depth_test: depth.is_some(),
+            depth_write: depth.is_some_and(|d| d.depth_write),
+            depth_compare: resource::compare(depth.map_or(Compare::Always, |d| d.depth_compare)),
+            stencil_test: depth.is_some_and(|d| d.stencil.is_some()),
+            depth_bias: depth.is_some_and(|d| d.depth_bias),
+            stencil: [face(front), face(back)],
+            read_mask: depth.map_or(255, |d| d.stencil_read_mask as u32),
+            write_mask: depth.map_or(255, |d| d.stencil_write_mask as u32),
+            color_write,
+        }
+    }
+    pub(super) fn emit(&self, context: &Context, command: vk::CommandBuffer, old: Option<&Self>) {
+        macro_rules! changed {
+            ($($field:ident),+) => { old.is_none_or(|o| $(o.$field != self.$field)||+) };
+        }
+        let device = &context.device;
+        unsafe {
+            if let Some(eds) = &context.eds {
+                if old.is_none() {
+                    (eds.primitive_restart)(command, vk::FALSE);
+                    (eds.rasterizer_discard)(command, vk::FALSE);
+                }
+                if changed!(cull) {
+                    (eds.cull)(command, self.cull);
+                }
+                if changed!(front) {
+                    (eds.front)(command, self.front);
+                }
+                if changed!(topology) {
+                    (eds.topology)(command, self.topology);
+                }
+                if changed!(depth_test) {
+                    (eds.depth_test)(command, self.depth_test.into());
+                }
+                if changed!(depth_write) {
+                    (eds.depth_write)(command, self.depth_write.into());
+                }
+                if changed!(depth_compare) {
+                    (eds.depth_compare)(command, self.depth_compare);
+                }
+                if changed!(stencil_test) {
+                    (eds.stencil_test)(command, self.stencil_test.into());
+                }
+                if changed!(depth_bias) {
+                    (eds.depth_bias)(command, self.depth_bias.into());
+                }
+                if changed!(stencil) {
+                    for (face, (fail, pass, depth_fail, compare)) in [
+                        (vk::StencilFaceFlags::FRONT, self.stencil[0]),
+                        (vk::StencilFaceFlags::BACK, self.stencil[1]),
+                    ] {
+                        (eds.stencil_op)(command, face, fail, pass, depth_fail, compare);
+                    }
+                }
+            }
+            if changed!(read_mask) {
+                device.cmd_set_stencil_compare_mask(
+                    command,
+                    vk::StencilFaceFlags::FRONT_AND_BACK,
+                    self.read_mask,
+                );
+            }
+            if changed!(write_mask) {
+                device.cmd_set_stencil_write_mask(
+                    command,
+                    vk::StencilFaceFlags::FRONT_AND_BACK,
+                    self.write_mask,
+                );
+            }
+            if context.caps.modern.contains(Modern::COLOR_WRITE_ENABLE) && changed!(color_write) {
+                (context.color_write.fp().cmd_set_color_write_enable_ext)(
+                    command,
+                    self.color_write.0,
+                    self.color_write.1.as_ptr(),
+                );
             }
         }
-        let push = if let Some(heap) = &context.heap {
-            binding::PushLayout::new(&bindings, heap, context.caps.limits.push_constant_bytes)
-                .unwrap()
-        } else {
-            binding::PushLayout::default()
-        };
-        Arc::new(Self {
-            handle: compiled.handle,
-            layout: compiled.layout,
-            set_layout: compiled.set_layout,
-            bindings,
-            uniform_sizes: uniforms,
-            storage_strides,
-            push,
-            _context: context,
-            _compiled: compiled,
-        })
     }
 }
+
 fn layouts(
     context: &Context,
     bindings: &[Binding],
 ) -> Result<(vk::PipelineLayout, vk::DescriptorSetLayout)> {
     let (sets, own) = if let Some(heap) = &context.heap {
-        binding::PushLayout::new(bindings, heap, context.caps.limits.push_constant_bytes)?;
         let count = bindings
             .iter()
             .filter(|b| b.kind == BindingKind::UniformBuffer)
@@ -283,81 +367,138 @@ impl Device {
         desc: &RenderPipelineDesc,
         cache: Option<&crate::pipeline::PipelineCache>,
     ) -> Result<crate::RenderPipeline> {
-        self.0.check()?;
-        let mut external = cache.map(|c| c.inner.0.lock().unwrap());
-        let cache = if let Some(cache) = &mut external {
-            cache.handle(&self.0)?
-        } else {
-            vk::PipelineCache::null()
-        };
-        let mut pipelines = self.0.pipelines.lock().unwrap();
         let key = RenderKey::new(desc, self.caps().modern);
-        let compiled = if let Some(compiled) = pipelines.render.get(&key) {
-            compiled.clone()
-        } else {
-            let (layout, set_layout) = layouts(&self.0, &key.bindings)?;
-            let result = self.compile_render(desc, layout, cache, &mut pipelines);
-            let handle = match result {
-                Ok(handle) => handle,
-                Err(e) => {
-                    unsafe {
-                        self.0.device.destroy_pipeline_layout(layout, None);
-                        if set_layout != vk::DescriptorSetLayout::null() {
-                            self.0
-                                .device
-                                .destroy_descriptor_set_layout(set_layout, None);
-                        }
-                    }
-                    return Err(e);
-                }
-            };
-            let compiled = Arc::new(Compiled {
-                handle,
-                layout,
-                set_layout,
-            });
-            pipelines.render.insert(key, compiled.clone());
-            compiled
+        let mut pipelines = self.0.pipelines.lock().unwrap();
+        let compiled = match pipelines.render.get(&key) {
+            Some(compiled) => compiled.clone(),
+            None => {
+                let mut external = cache.map(|c| c.inner.0.lock().unwrap());
+                let cache = match &mut external {
+                    Some(cache) => cache.handle(&self.0)?,
+                    None => vk::PipelineCache::null(),
+                };
+                let entries: Vec<&Entry> = std::iter::once(&desc.vertex)
+                    .chain(&desc.fragment)
+                    .collect();
+                let compiled =
+                    Arc::new(self.compile(&key.bindings, &entries, |layout, stages| {
+                        self.compile_render(desc, layout, stages, cache, &mut pipelines)
+                    })?);
+                pipelines.render.insert(key, compiled.clone());
+                compiled
+            }
         };
         Ok(crate::RenderPipeline {
             inner: RenderPipeline {
-                core: PipelineCore::new(
-                    self.0.clone(),
-                    compiled,
-                    desc.bindings.clone(),
-                    &std::iter::once(&desc.vertex)
-                        .chain(desc.fragment.as_ref())
-                        .collect::<Vec<_>>(),
-                ),
-                desc: Arc::new(desc.clone()),
+                _context: self.0.clone(),
+                compiled,
+                dynamic: Dynamic::new(desc),
             },
+        })
+    }
+    pub(crate) fn create_compute_pipeline(
+        &self,
+        desc: &ComputePipelineDesc,
+        cache: Option<&crate::pipeline::PipelineCache>,
+    ) -> Result<crate::ComputePipeline> {
+        let mut bindings = desc.bindings.clone();
+        bindings.sort_by_key(|b| (binding::group(b.kind), b.slot));
+        let key = ComputeKey(entry_key(&desc.entry), bindings);
+        let mut pipelines = self.0.pipelines.lock().unwrap();
+        let compiled = match pipelines.compute.get(&key) {
+            Some(compiled) => compiled.clone(),
+            None => {
+                let mut external = cache.map(|c| c.inner.0.lock().unwrap());
+                let cache = match &mut external {
+                    Some(cache) => cache.handle(&self.0)?,
+                    None => vk::PipelineCache::null(),
+                };
+                let compiled =
+                    Arc::new(self.compile(&key.1, &[&desc.entry], |layout, stages| {
+                        let info = vk::ComputePipelineCreateInfo::default()
+                            .stage(stages[0])
+                            .layout(layout);
+                        let created =
+                            unsafe { self.0.device.create_compute_pipelines(cache, &[info], None) };
+                        self.0
+                            .result(created.map(|h| h[0]).map_err(|(_, error)| error))
+                    })?);
+                pipelines.compute.insert(key, compiled.clone());
+                compiled
+            }
+        };
+        Ok(crate::ComputePipeline {
+            inner: ComputePipeline {
+                _context: self.0.clone(),
+                compiled,
+            },
+        })
+    }
+    /// The push layout, shader stages and pipeline layout for `bindings`
+    /// (sorted), then the driver pipeline from `build`.
+    fn compile(
+        &self,
+        bindings: &[Binding],
+        entries: &[&Entry],
+        build: impl FnOnce(
+            vk::PipelineLayout,
+            &[vk::PipelineShaderStageCreateInfo<'_>],
+        ) -> Result<vk::Pipeline>,
+    ) -> Result<Compiled> {
+        let push = match &self.0.heap {
+            Some(heap) => {
+                let mut strides = HashMap::new();
+                for entry in entries {
+                    strides.extend(entry.shader.inner.storage_strides(entry.index));
+                }
+                let bytes = self.0.caps.limits.push_constant_bytes;
+                binding::PushLayout::new(bindings, heap, bytes, &strides)?
+            }
+            None => binding::PushLayout::default(),
+        };
+        let modules = entries
+            .iter()
+            .map(|e| e.shader.inner.stage(e, &push))
+            .collect::<Result<Vec<_>>>()?;
+        let stages: Vec<_> = modules.iter().map(|m| m.info()).collect();
+        let (layout, set_layout) = layouts(&self.0, bindings)?;
+        let handle = match build(layout, &stages) {
+            Ok(handle) => handle,
+            Err(error) => {
+                unsafe {
+                    self.0.device.destroy_pipeline_layout(layout, None);
+                    if set_layout != vk::DescriptorSetLayout::null() {
+                        self.0
+                            .device
+                            .destroy_descriptor_set_layout(set_layout, None);
+                    }
+                }
+                return Err(error);
+            }
+        };
+        let uniforms = bindings
+            .iter()
+            .filter(|b| b.kind == BindingKind::UniformBuffer)
+            .fold(0, |mask, b| mask | 1 << b.slot);
+        Ok(Compiled {
+            handle,
+            layout,
+            set_layout,
+            bindings: bindings.to_vec(),
+            push,
+            uniforms,
         })
     }
     fn compile_render(
         &self,
         desc: &RenderPipelineDesc,
         layout: vk::PipelineLayout,
+        stages: &[vk::PipelineShaderStageCreateInfo<'_>],
         cache: vk::PipelineCache,
         pipelines: &mut Pipelines,
     ) -> Result<vk::Pipeline> {
         let context = &self.0;
         let modern = self.caps().modern;
-        let push = context
-            .heap
-            .as_ref()
-            .map(|heap| {
-                binding::PushLayout::new(
-                    &desc.bindings,
-                    heap,
-                    context.caps.limits.push_constant_bytes,
-                )
-            })
-            .transpose()?;
-        let modules = std::iter::once(&desc.vertex)
-            .chain(desc.fragment.as_ref())
-            .map(|e| e.shader.inner.stage(e, push.as_ref()))
-            .collect::<Result<Vec<_>>>()?;
-        let stages: Vec<_> = modules.iter().map(|m| m.info()).collect();
         let vertex = vk::PipelineVertexInputStateCreateInfo::default();
         let assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
             .topology(topology(desc.primitive.topology));
@@ -467,7 +608,7 @@ impl Device {
             }
         }
         let mut info = vk::GraphicsPipelineCreateInfo::default()
-            .stages(&stages)
+            .stages(stages)
             .vertex_input_state(&vertex)
             .input_assembly_state(&assembly)
             .viewport_state(&viewport)
@@ -482,94 +623,12 @@ impl Device {
         } else {
             info = info.render_pass(pipelines.compatible_pass(context, desc)?);
         }
-        match unsafe {
+        let created = unsafe {
             context
                 .device
                 .create_graphics_pipelines(cache, &[info], None)
-        } {
-            Ok(handles) => Ok(handles[0]),
-            Err((handles, error)) => {
-                for handle in handles {
-                    unsafe {
-                        context.device.destroy_pipeline(handle, None);
-                    }
-                }
-                context.result(Err(error))
-            }
-        }
-    }
-    pub(crate) fn create_compute_pipeline(
-        &self,
-        desc: &ComputePipelineDesc,
-        cache: Option<&crate::pipeline::PipelineCache>,
-    ) -> Result<crate::ComputePipeline> {
-        self.0.check()?;
-        let mut external = cache.map(|c| c.inner.0.lock().unwrap());
-        let cache = if let Some(cache) = &mut external {
-            cache.handle(&self.0)?
-        } else {
-            vk::PipelineCache::null()
         };
-        let mut bindings = desc.bindings.clone();
-        bindings.sort_by_key(|b| (binding::group(b.kind), b.slot));
-        let key = ComputeKey(entry_key(&desc.entry), bindings);
-        let mut pipelines = self.0.pipelines.lock().unwrap();
-        let compiled = if let Some(compiled) = pipelines.compute.get(&key) {
-            compiled.clone()
-        } else {
-            let push = self
-                .0
-                .heap
-                .as_ref()
-                .map(|heap| {
-                    binding::PushLayout::new(
-                        &desc.bindings,
-                        heap,
-                        self.0.caps.limits.push_constant_bytes,
-                    )
-                })
-                .transpose()?;
-            let module = desc.entry.shader.inner.stage(&desc.entry, push.as_ref())?;
-            let (layout, set_layout) = layouts(&self.0, &key.1)?;
-            let info = vk::ComputePipelineCreateInfo::default()
-                .stage(module.info())
-                .layout(layout);
-            let handle =
-                match unsafe { self.0.device.create_compute_pipelines(cache, &[info], None) } {
-                    Ok(handles) => handles[0],
-                    Err((handles, error)) => {
-                        unsafe {
-                            for handle in handles {
-                                self.0.device.destroy_pipeline(handle, None);
-                            }
-                            self.0.device.destroy_pipeline_layout(layout, None);
-                            if set_layout != vk::DescriptorSetLayout::null() {
-                                self.0
-                                    .device
-                                    .destroy_descriptor_set_layout(set_layout, None);
-                            }
-                        }
-                        return self.0.result(Err(error));
-                    }
-                };
-            let compiled = Arc::new(Compiled {
-                handle,
-                layout,
-                set_layout,
-            });
-            pipelines.compute.insert(key, compiled.clone());
-            compiled
-        };
-        Ok(crate::ComputePipeline {
-            inner: ComputePipeline {
-                core: PipelineCore::new(
-                    self.0.clone(),
-                    compiled,
-                    desc.bindings.clone(),
-                    &[&desc.entry],
-                ),
-            },
-        })
+        context.result(created.map(|h| h[0]).map_err(|(_, error)| error))
     }
 }
 pub(super) fn topology(t: Topology) -> vk::PrimitiveTopology {

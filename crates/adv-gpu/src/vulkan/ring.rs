@@ -58,12 +58,7 @@ impl Device {
 }
 impl Ring {
     pub(crate) fn reserve(&mut self, size: u64, align: u64) -> Result<crate::Span> {
-        self.0.buffer.inner.0.context.check()?;
-        if align == 0 || !align.is_power_of_two() {
-            return Err(Error::Invalid(
-                "ring alignment must be a power of two".into(),
-            ));
-        }
+        debug_assert!(align.is_power_of_two(), "ring alignment {align}");
         let capacity = self.0.buffer.desc().size;
         if size > capacity {
             return Err(Error::Busy);

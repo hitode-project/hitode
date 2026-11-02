@@ -8,6 +8,7 @@ use gpu_allocator::vulkan::{
 };
 use std::collections::{HashMap, VecDeque};
 use std::ffi::CStr;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use crate::caps::*;
@@ -42,7 +43,13 @@ pub(crate) struct Context {
     caps: Caps,
     memory: vk::PhysicalDeviceMemoryProperties,
     allocator: Mutex<Option<Allocator>>,
-    lost: Mutex<Option<String>>,
+    lost: AtomicBool,
+    /// The token the next submission takes, and the encoders still open:
+    /// each may submit a use of an object dropped now.
+    next: AtomicU64,
+    open: AtomicU64,
+    retired: Mutex<VecDeque<(u64, Retired)>>,
+    passes: Mutex<HashMap<encode::PassKey, encode::LegacyPass>>,
     samplers: Mutex<HashMap<SamplerDesc, Weak<SamplerCore>>>,
     rings: Mutex<Vec<Weak<ring::RingCore>>>,
     dynamic: ash::khr::dynamic_rendering::Device,
@@ -55,29 +62,193 @@ pub(crate) struct Context {
     pipelines: Mutex<pipeline::Pipelines>,
     heap: Option<binding::Heap>,
     push: ash::khr::push_descriptor::Device,
-    eds1: ash::ext::extended_dynamic_state::Device,
-    eds2: ash::ext::extended_dynamic_state2::Device,
+    /// Set when extended dynamic state is in use.
+    eds: Option<Eds>,
     color_write: ash::ext::color_write_enable::Device,
     cache_prefix: [u8; 28],
 }
 
-impl Context {
-    fn check(&self) -> Result<()> {
-        match self.lost.lock().unwrap().as_ref() {
-            Some(reason) => Err(Error::DeviceLost(reason.clone())),
-            None => Ok(()),
+/// A GPU object whose last handle dropped. Encoders hold no references:
+/// destruction waits for the submission that may have used it instead.
+pub(super) enum Retired {
+    Buffer {
+        handle: vk::Buffer,
+        allocation: Allocation,
+        storage: Option<u32>,
+        uniforms: Vec<vk::DescriptorSet>,
+    },
+    Image {
+        handle: vk::Image,
+        allocation: Allocation,
+        conversion: Option<vk::SamplerYcbcrConversion>,
+    },
+    View {
+        handle: vk::ImageView,
+        sampled: Option<u32>,
+        storage: Option<u32>,
+    },
+    Sampler {
+        handle: vk::Sampler,
+        index: Option<u32>,
+    },
+    Query(vk::QueryPool),
+}
+
+/// Extended dynamic state entry points: core on 1.3, else the extensions.
+pub(super) struct Eds {
+    cull: vk::PFN_vkCmdSetCullMode,
+    front: vk::PFN_vkCmdSetFrontFace,
+    topology: vk::PFN_vkCmdSetPrimitiveTopology,
+    depth_test: vk::PFN_vkCmdSetDepthTestEnable,
+    depth_write: vk::PFN_vkCmdSetDepthWriteEnable,
+    depth_compare: vk::PFN_vkCmdSetDepthCompareOp,
+    stencil_test: vk::PFN_vkCmdSetStencilTestEnable,
+    stencil_op: vk::PFN_vkCmdSetStencilOp,
+    depth_bias: vk::PFN_vkCmdSetDepthBiasEnable,
+    primitive_restart: vk::PFN_vkCmdSetPrimitiveRestartEnable,
+    rasterizer_discard: vk::PFN_vkCmdSetRasterizerDiscardEnable,
+}
+impl Eds {
+    fn load(instance: &ash::Instance, device: &ash::Device, api: u32) -> Self {
+        if api >= vk::API_VERSION_1_3 {
+            let f = device.fp_v1_3();
+            return Self {
+                cull: f.cmd_set_cull_mode,
+                front: f.cmd_set_front_face,
+                topology: f.cmd_set_primitive_topology,
+                depth_test: f.cmd_set_depth_test_enable,
+                depth_write: f.cmd_set_depth_write_enable,
+                depth_compare: f.cmd_set_depth_compare_op,
+                stencil_test: f.cmd_set_stencil_test_enable,
+                stencil_op: f.cmd_set_stencil_op,
+                depth_bias: f.cmd_set_depth_bias_enable,
+                primitive_restart: f.cmd_set_primitive_restart_enable,
+                rasterizer_discard: f.cmd_set_rasterizer_discard_enable,
+            };
         }
+        let one = ash::ext::extended_dynamic_state::Device::new(instance, device);
+        let two = ash::ext::extended_dynamic_state2::Device::new(instance, device);
+        let (one, two) = (one.fp(), two.fp());
+        Self {
+            cull: one.cmd_set_cull_mode_ext,
+            front: one.cmd_set_front_face_ext,
+            topology: one.cmd_set_primitive_topology_ext,
+            depth_test: one.cmd_set_depth_test_enable_ext,
+            depth_write: one.cmd_set_depth_write_enable_ext,
+            depth_compare: one.cmd_set_depth_compare_op_ext,
+            stencil_test: one.cmd_set_stencil_test_enable_ext,
+            stencil_op: one.cmd_set_stencil_op_ext,
+            depth_bias: two.cmd_set_depth_bias_enable_ext,
+            primitive_restart: two.cmd_set_primitive_restart_enable_ext,
+            rasterizer_discard: two.cmd_set_rasterizer_discard_enable_ext,
+        }
+    }
+}
+
+const LOST: &str = "Vulkan device lost";
+
+impl Context {
+    /// Device loss is reported by submit, wait and poll only.
+    fn check(&self) -> Result<()> {
+        if self.lost.load(Ordering::Relaxed) {
+            return Err(Error::DeviceLost(LOST.into()));
+        }
+        Ok(())
     }
     fn result<T>(&self, result: std::result::Result<T, vk::Result>) -> Result<T> {
         result.map_err(|error| {
             if error == vk::Result::ERROR_DEVICE_LOST {
-                let reason = "Vulkan device lost".to_owned();
-                *self.lost.lock().unwrap() = Some(reason.clone());
-                Error::DeviceLost(reason)
-            } else {
-                vk_error(error)
+                self.lost.store(true, Ordering::Relaxed);
             }
+            vk_error(error)
         })
+    }
+    pub(super) fn retire(&self, item: Retired) {
+        // Submit advances `next` before closing its encoder, so reading
+        // `open` first never misses that encoder's token.
+        let open = self.open.load(Ordering::Acquire);
+        let token = self.next.load(Ordering::Acquire) - 1 + open;
+        let mut retired = self.retired.lock().unwrap();
+        let token = retired.back().map_or(token, |(last, _)| token.max(*last));
+        retired.push_back((token, item));
+    }
+    /// Destroys objects whose last possible use has completed. Holding the
+    /// lock throughout means a poll that returns has destroyed them, whichever
+    /// thread reaped; destruction drops no handles, so it never retires.
+    pub(super) fn reap(&self, completed: u64) {
+        let mut retired = self.retired.lock().unwrap();
+        while retired
+            .front()
+            .is_some_and(|(token, _)| *token <= completed)
+        {
+            let (_, item) = retired.pop_front().unwrap();
+            self.destroy(item);
+        }
+    }
+    fn destroy(&self, item: Retired) {
+        let heap = self.heap.as_ref();
+        unsafe {
+            match item {
+                Retired::Buffer {
+                    handle,
+                    allocation,
+                    storage,
+                    uniforms,
+                } => {
+                    if let Some(heap) = heap {
+                        for set in uniforms {
+                            heap.free_uniform(self, set);
+                        }
+                        if let Some(index) = storage {
+                            heap.free(3, index);
+                        }
+                    }
+                    self.device.destroy_buffer(handle, None);
+                    self.free(allocation);
+                }
+                Retired::Image {
+                    handle,
+                    allocation,
+                    conversion,
+                } => {
+                    self.device.destroy_image(handle, None);
+                    if let Some(conversion) = conversion {
+                        self.device
+                            .destroy_sampler_ycbcr_conversion(conversion, None);
+                    }
+                    self.free(allocation);
+                }
+                Retired::View {
+                    handle,
+                    sampled,
+                    storage,
+                } => {
+                    if let Some(heap) = heap {
+                        for (kind, index) in [(0, sampled), (2, storage)] {
+                            if let Some(index) = index {
+                                heap.free(kind, index);
+                            }
+                        }
+                    }
+                    self.passes.lock().unwrap().retain(|key, pass| {
+                        let used = key.uses(handle);
+                        if used {
+                            self.device.destroy_framebuffer(pass.framebuffer, None);
+                            self.device.destroy_render_pass(pass.pass, None);
+                        }
+                        !used
+                    });
+                    self.device.destroy_image_view(handle, None);
+                }
+                Retired::Sampler { handle, index } => {
+                    if let (Some(heap), Some(index)) = (heap, index) {
+                        heap.free(1, index);
+                    }
+                    self.device.destroy_sampler(handle, None);
+                }
+                Retired::Query(handle) => self.device.destroy_query_pool(handle, None),
+            }
+        }
     }
     fn allocate(
         &self,
@@ -87,7 +258,6 @@ impl Context {
         lazy: bool,
         name: &str,
     ) -> Result<Allocation> {
-        self.check()?;
         let flags = match memory {
             Memory::Device => vk::MemoryPropertyFlags::DEVICE_LOCAL,
             Memory::Upload => {
@@ -165,13 +335,22 @@ fn vk_error(error: vk::Result) -> Error {
         vk::Result::ERROR_OUT_OF_HOST_MEMORY | vk::Result::ERROR_OUT_OF_DEVICE_MEMORY => {
             Error::OutOfMemory
         }
-        vk::Result::ERROR_DEVICE_LOST => Error::DeviceLost("Vulkan device lost".into()),
+        vk::Result::ERROR_DEVICE_LOST => Error::DeviceLost(LOST.into()),
         _ => Error::Unavailable(format!("Vulkan: {error:?}")),
     }
 }
 
 impl Drop for Context {
     fn drop(&mut self) {
+        // Every handle is gone, so nothing records; wait for the GPU.
+        let _ = unsafe { self.device.device_wait_idle() };
+        self.reap(u64::MAX);
+        for (_, pass) in self.passes.get_mut().unwrap().drain() {
+            unsafe {
+                self.device.destroy_framebuffer(pass.framebuffer, None);
+                self.device.destroy_render_pass(pass.pass, None);
+            }
+        }
         self.pipelines.get_mut().unwrap().destroy(&self.device);
         self.heap.take();
         self.allocator.get_mut().unwrap().take();
@@ -190,7 +369,7 @@ impl Device {
         &self.0.caps
     }
     pub(crate) fn lost(&self) -> Option<String> {
-        self.0.lost.lock().unwrap().clone()
+        self.0.lost.load(Ordering::Relaxed).then(|| LOST.into())
     }
     pub(crate) fn create_present_pool(&self, _desc: &PoolDesc) -> Result<crate::PresentPool> {
         todo!("A3")

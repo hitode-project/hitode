@@ -2,15 +2,11 @@ use super::resource::{ImageCore, ImageState};
 use super::*;
 use ash::vk::Handle;
 
+/// What a submission owns until it completes. Objects it uses need no
+/// reference: their destruction waits for it (see [`Retired`]).
 #[derive(Default)]
 pub(super) struct Resources {
-    pub(super) buffers: Vec<Buffer>,
-    pub(super) images: Vec<Image>,
-    pub(super) views: Vec<ImageView>,
-    pub(super) queries: Vec<QuerySet>,
     pub(super) spans: Vec<Span>,
-    pub(super) samplers: Vec<Sampler>,
-    pub(super) pipelines: Vec<Arc<pipeline::PipelineCore>>,
     pub(super) descriptors: Option<binding::DescriptorArena>,
 }
 pub(crate) struct Encoder {
@@ -40,10 +36,15 @@ struct AttachmentKey {
     stencil_store: i32,
     layout: i32,
 }
+impl PassKey {
+    pub(super) fn uses(&self, view: vk::ImageView) -> bool {
+        self.attachments.iter().any(|a| a.view == view.as_raw())
+    }
+}
+/// Destroyed with the first of its views to retire.
 pub(super) struct LegacyPass {
     pub(super) pass: vk::RenderPass,
     pub(super) framebuffer: vk::Framebuffer,
-    pub(super) _views: Vec<ImageView>,
 }
 
 impl Encoder {
@@ -51,7 +52,7 @@ impl Encoder {
         &mut self,
         layout: vk::DescriptorSetLayout,
         bindings: &[Binding],
-        values: &[binding::Bound],
+        key: &[binding::Bound],
     ) -> Result<(vk::DescriptorSet, bool)> {
         if self.resources.descriptors.is_none() {
             let mut arena = self
@@ -68,10 +69,11 @@ impl Encoder {
             &self.shared.context,
             layout,
             bindings,
-            values,
+            key,
         )
     }
     pub(super) fn new(shared: Arc<queue::Shared>) -> Self {
+        shared.context.open.fetch_add(1, Ordering::AcqRel);
         let mut encoder = Self {
             shared,
             command: vk::CommandBuffer::null(),
@@ -88,7 +90,6 @@ impl Encoder {
     }
     fn allocate_command(&mut self) -> Result<()> {
         let context = &self.shared.context;
-        context.check()?;
         let mut state = self.shared.state.lock().unwrap();
         self.command = match state.commands.pop() {
             Some(command) => {
@@ -116,15 +117,10 @@ impl Encoder {
             )
         })
     }
-    pub(super) fn ready(&mut self) -> bool {
-        if self.error.is_some() {
-            return false;
-        }
-        if let Err(e) = self.shared.context.check() {
-            self.error = Some(e);
-            return false;
-        }
-        true
+    /// False after a driver failure; later commands are dropped and submit
+    /// reports it.
+    pub(super) fn ready(&self) -> bool {
+        self.error.is_none()
     }
     pub(super) fn memory_barrier(&mut self) {
         if !self.ready() {
@@ -250,7 +246,6 @@ impl Encoder {
                 };
             }
         }
-        self.resources.images.push(image.clone());
     }
     pub(super) fn view_transition(
         &mut self,
@@ -267,44 +262,36 @@ impl Encoder {
             access,
             stage,
         );
-        self.resources.views.push(view.clone());
     }
     fn timestamp_start(
         &mut self,
         timestamps: Option<(&crate::queue::QuerySet, u32)>,
-    ) -> Option<(QuerySet, u32)> {
+    ) -> Option<(vk::QueryPool, u32)> {
         let (set, index) = timestamps?;
         if !self.ready() {
             return None;
         }
-        self.resources.queries.push(set.inner.clone());
+        let pool = set.inner.0.handle;
         unsafe {
-            self.shared.context.device.cmd_reset_query_pool(
-                self.command,
-                set.inner.0.handle,
-                index,
-                2,
-            );
-            self.shared.context.device.cmd_write_timestamp(
+            let device = &self.shared.context.device;
+            device.cmd_reset_query_pool(self.command, pool, index, 2);
+            device.cmd_write_timestamp(
                 self.command,
                 vk::PipelineStageFlags::TOP_OF_PIPE,
-                set.inner.0.handle,
+                pool,
                 index,
             );
         }
-        Some((set.inner.clone(), index + 1))
+        Some((pool, index + 1))
     }
-    fn timestamp_end(&mut self, timestamp: &Option<(QuerySet, u32)>) {
-        if !self.ready() {
-            return;
-        }
-        if let Some((set, index)) = timestamp {
+    fn timestamp_end(&mut self, timestamp: Option<(vk::QueryPool, u32)>) {
+        if let (true, Some((pool, index))) = (self.ready(), timestamp) {
             unsafe {
                 self.shared.context.device.cmd_write_timestamp(
                     self.command,
                     vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                    set.0.handle,
-                    *index,
+                    pool,
+                    index,
                 );
             }
         }
@@ -378,7 +365,7 @@ impl Encoder {
                 vk::AttachmentStoreOp::DONT_CARE,
                 vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
             ));
-            views.push(view.clone());
+            views.push(view.0.handle);
             clears.push(clear);
             colors.push(vk::AttachmentReference {
                 attachment: index,
@@ -418,7 +405,7 @@ impl Encoder {
                     vk::AttachmentStoreOp::DONT_CARE,
                     vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
                 ));
-                views.push(view.clone());
+                views.push(view.0.handle);
                 clears.push(vk::ClearValue::default());
             } else {
                 resolves.push(vk::AttachmentReference {
@@ -485,7 +472,7 @@ impl Encoder {
                 store_op(depth.stencil.1, none),
                 layout,
             ));
-            views.push(view.clone());
+            views.push(view.0.handle);
             clears.push(clear);
         }
         // Keep the preamble open until the pass ends: its occlusion queries
@@ -566,6 +553,7 @@ impl Encoder {
             preamble,
             resets: Vec::new(),
             pipeline: None,
+            state: None,
             bindings: binding::Bindings::default(),
             index: None,
         };
@@ -586,7 +574,7 @@ impl Encoder {
     fn legacy_pass(
         &mut self,
         attachments: &[vk::AttachmentDescription],
-        views: &[ImageView],
+        views: &[vk::ImageView],
         colors: &[vk::AttachmentReference],
         resolves: &[vk::AttachmentReference],
         depth: Option<&vk::AttachmentReference>,
@@ -597,7 +585,7 @@ impl Encoder {
                 .iter()
                 .zip(views)
                 .map(|(a, v)| AttachmentKey {
-                    view: v.0.handle.as_raw(),
+                    view: v.as_raw(),
                     format: a.format.as_raw(),
                     samples: a.samples.as_raw(),
                     load: a.load_op.as_raw(),
@@ -611,7 +599,7 @@ impl Encoder {
             height: size.height,
             layers: size.depth_or_layers,
         };
-        let mut cache = self.shared.passes.lock().unwrap();
+        let mut cache = self.shared.context.passes.lock().unwrap();
         if let Some(pass) = cache.get(&key) {
             return Ok((pass.pass, pass.framebuffer));
         }
@@ -632,12 +620,11 @@ impl Encoder {
                 None,
             )
         })?;
-        let handles: Vec<_> = views.iter().map(|v| v.0.handle).collect();
         let framebuffer = match context.result(unsafe {
             context.device.create_framebuffer(
                 &vk::FramebufferCreateInfo::default()
                     .render_pass(pass)
-                    .attachments(&handles)
+                    .attachments(views)
                     .width(size.width)
                     .height(size.height)
                     .layers(size.depth_or_layers),
@@ -652,14 +639,7 @@ impl Encoder {
                 return Err(e);
             }
         };
-        cache.insert(
-            key,
-            LegacyPass {
-                pass,
-                framebuffer,
-                _views: views.to_vec(),
-            },
-        );
+        cache.insert(key, LegacyPass { pass, framebuffer });
         Ok((pass, framebuffer))
     }
     pub(crate) fn copy_buffer_to_image(
@@ -688,7 +668,6 @@ impl Encoder {
                 &regions,
             );
         }
-        self.resources.buffers.push(src.buffer.inner.clone());
     }
     pub(crate) fn copy_image_to_buffer(
         &mut self,
@@ -716,7 +695,6 @@ impl Encoder {
                 &regions,
             );
         }
-        self.resources.buffers.push(dst.buffer.inner.clone());
     }
     fn copy_transition(
         &mut self,
@@ -822,9 +800,6 @@ impl Encoder {
                 }],
             );
         }
-        self.resources
-            .buffers
-            .extend([src.buffer.inner.clone(), dst.inner.clone()]);
     }
     pub(crate) fn fill_buffer(&mut self, dst: BufferSlice<'_>, value: u32) {
         self.memory_barrier();
@@ -840,7 +815,6 @@ impl Encoder {
                 value,
             );
         }
-        self.resources.buffers.push(dst.buffer.inner.clone());
     }
     pub(crate) fn retain(&mut self, span: crate::Span) {
         self.resources.spans.push(span.inner);
@@ -868,13 +842,12 @@ impl Encoder {
                 vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
             );
         }
-        self.resources.queries.push(set.inner.clone());
-        self.resources.buffers.push(dst.inner.clone());
     }
 }
 impl Drop for Encoder {
     fn drop(&mut self) {
         if !self.submitted {
+            self.shared.context.open.fetch_sub(1, Ordering::Release);
             if let Some(arena) = self.resources.descriptors.take() {
                 self.shared.descriptors.lock().unwrap().push(arena);
             }
@@ -1056,11 +1029,12 @@ pub(crate) struct RenderPass<'e> {
     area: Rect,
     dynamic: bool,
     begun: bool,
-    timestamp: Option<(QuerySet, u32)>,
-    occlusion: Option<(QuerySet, u32)>,
+    timestamp: Option<(vk::QueryPool, u32)>,
+    occlusion: Option<(vk::QueryPool, u32)>,
     preamble: vk::CommandBuffer,
-    resets: Vec<(QuerySet, u32)>,
-    pipeline: Option<RenderPipeline>,
+    resets: Vec<(vk::QueryPool, u32)>,
+    pipeline: Option<Arc<pipeline::Compiled>>,
+    state: Option<pipeline::Dynamic>,
     bindings: binding::Bindings,
     index: Option<(vk::Buffer, u64, IndexFormat)>,
 }
@@ -1080,17 +1054,17 @@ impl Drop for RenderPass<'_> {
                 }
             }
         }
-        self.encoder.timestamp_end(&self.timestamp);
+        self.encoder.timestamp_end(self.timestamp);
         if self.encoder.ready() {
             let command = self.encoder.command;
             self.encoder.command = self.preamble;
             self.encoder.memory_barrier();
-            for (set, index) in &self.resets {
+            for &(pool, index) in &self.resets {
                 unsafe {
                     self.encoder.shared.context.device.cmd_reset_query_pool(
                         self.preamble,
-                        set.0.handle,
-                        *index,
+                        pool,
+                        index,
                         1,
                     );
                 }
@@ -1110,193 +1084,40 @@ impl Drop for RenderPass<'_> {
 }
 impl RenderPass<'_> {
     pub(crate) fn set_pipeline(&mut self, pipeline: &crate::RenderPipeline) {
-        if !self.begun || !self.encoder.ready() {
+        if !self.encoder.ready() {
             return;
         }
         let pipeline = &pipeline.inner;
-        if self
-            .pipeline
-            .as_ref()
-            .is_some_and(|p| p.desc == pipeline.desc)
-        {
-            return;
-        }
         let context = &self.encoder.shared.context;
+        let command = self.encoder.command;
         if self
             .pipeline
             .as_ref()
-            .is_none_or(|p| p.core.handle != pipeline.core.handle)
+            .is_none_or(|p| p.handle != pipeline.compiled.handle)
         {
             unsafe {
                 context.device.cmd_bind_pipeline(
-                    self.encoder.command,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    pipeline.core.handle,
-                );
-            }
-        }
-        self.bindings.pipeline(&pipeline.core);
-        self.encoder.resources.pipelines.push(pipeline.core.clone());
-        let desc = &pipeline.desc;
-        let command = self.encoder.command;
-        unsafe {
-            if context.caps.modern.contains(Modern::EXTENDED_DYNAMIC_STATE) {
-                let primitive = desc.primitive;
-                if context.api >= vk::API_VERSION_1_3 {
-                    context
-                        .device
-                        .cmd_set_cull_mode(command, pipeline::cull(primitive.cull));
-                    context
-                        .device
-                        .cmd_set_front_face(command, pipeline::winding(primitive.front_ccw));
-                    context.device.cmd_set_primitive_topology(
-                        command,
-                        pipeline::topology(primitive.topology),
-                    );
-                    context
-                        .device
-                        .cmd_set_depth_test_enable(command, desc.depth_stencil.is_some());
-                    context.device.cmd_set_depth_write_enable(
-                        command,
-                        desc.depth_stencil.is_some_and(|d| d.depth_write),
-                    );
-                    context.device.cmd_set_depth_compare_op(
-                        command,
-                        resource::compare(
-                            desc.depth_stencil
-                                .map_or(Compare::Always, |d| d.depth_compare),
-                        ),
-                    );
-                    context.device.cmd_set_stencil_test_enable(
-                        command,
-                        desc.depth_stencil.is_some_and(|d| d.stencil.is_some()),
-                    );
-                    context.device.cmd_set_depth_bias_enable(
-                        command,
-                        desc.depth_stencil.is_some_and(|d| d.depth_bias),
-                    );
-                    context
-                        .device
-                        .cmd_set_primitive_restart_enable(command, false);
-                    context
-                        .device
-                        .cmd_set_rasterizer_discard_enable(command, false);
-                } else {
-                    context
-                        .eds1
-                        .cmd_set_cull_mode(command, pipeline::cull(primitive.cull));
-                    context
-                        .eds1
-                        .cmd_set_front_face(command, pipeline::winding(primitive.front_ccw));
-                    context.eds1.cmd_set_primitive_topology(
-                        command,
-                        pipeline::topology(primitive.topology),
-                    );
-                    context
-                        .eds1
-                        .cmd_set_depth_test_enable(command, desc.depth_stencil.is_some());
-                    context.eds1.cmd_set_depth_write_enable(
-                        command,
-                        desc.depth_stencil.is_some_and(|d| d.depth_write),
-                    );
-                    context.eds1.cmd_set_depth_compare_op(
-                        command,
-                        resource::compare(
-                            desc.depth_stencil
-                                .map_or(Compare::Always, |d| d.depth_compare),
-                        ),
-                    );
-                    context.eds1.cmd_set_stencil_test_enable(
-                        command,
-                        desc.depth_stencil.is_some_and(|d| d.stencil.is_some()),
-                    );
-                    context.eds2.cmd_set_depth_bias_enable(
-                        command,
-                        desc.depth_stencil.is_some_and(|d| d.depth_bias),
-                    );
-                    context
-                        .eds2
-                        .cmd_set_primitive_restart_enable(command, false);
-                    context
-                        .eds2
-                        .cmd_set_rasterizer_discard_enable(command, false);
-                }
-                let faces = desc.depth_stencil.and_then(|d| d.stencil).unwrap_or((
-                    StencilFace {
-                        compare: Compare::Always,
-                        fail: StencilOp::Keep,
-                        depth_fail: StencilOp::Keep,
-                        pass: StencilOp::Keep,
-                    },
-                    StencilFace {
-                        compare: Compare::Always,
-                        fail: StencilOp::Keep,
-                        depth_fail: StencilOp::Keep,
-                        pass: StencilOp::Keep,
-                    },
-                ));
-                for (face, state) in [
-                    (vk::StencilFaceFlags::FRONT, faces.0),
-                    (vk::StencilFaceFlags::BACK, faces.1),
-                ] {
-                    if context.api >= vk::API_VERSION_1_3 {
-                        context.device.cmd_set_stencil_op(
-                            command,
-                            face,
-                            pipeline::stencil_op(state.fail),
-                            pipeline::stencil_op(state.pass),
-                            pipeline::stencil_op(state.depth_fail),
-                            resource::compare(state.compare),
-                        );
-                    } else {
-                        context.eds1.cmd_set_stencil_op(
-                            command,
-                            face,
-                            pipeline::stencil_op(state.fail),
-                            pipeline::stencil_op(state.pass),
-                            pipeline::stencil_op(state.depth_fail),
-                            resource::compare(state.compare),
-                        );
-                    }
-                }
-            }
-            context.device.cmd_set_stencil_compare_mask(
-                command,
-                vk::StencilFaceFlags::FRONT_AND_BACK,
-                desc.depth_stencil
-                    .map_or(255, |d| d.stencil_read_mask as u32),
-            );
-            context.device.cmd_set_stencil_write_mask(
-                command,
-                vk::StencilFaceFlags::FRONT_AND_BACK,
-                desc.depth_stencil
-                    .map_or(255, |d| d.stencil_write_mask as u32),
-            );
-            if context.caps.modern.contains(Modern::COLOR_WRITE_ENABLE) {
-                let enables: Vec<_> = desc
-                    .colors
-                    .iter()
-                    .map(|c| u32::from(c.write_mask != 0))
-                    .collect();
-                (context.color_write.fp().cmd_set_color_write_enable_ext)(
                     command,
-                    enables.len() as u32,
-                    enables.as_ptr(),
+                    vk::PipelineBindPoint::GRAPHICS,
+                    pipeline.compiled.handle,
                 );
             }
+            self.bindings.pipeline(&pipeline.compiled);
+            self.pipeline = Some(pipeline.compiled.clone());
         }
-        self.pipeline = Some(pipeline.clone());
+        if self.state != Some(pipeline.dynamic) {
+            pipeline.dynamic.emit(context, command, self.state.as_ref());
+            self.state = Some(pipeline.dynamic);
+        }
     }
     pub(crate) fn bind(&mut self, slot: u32, resource: Bind<'_>) {
-        if let Some(pipeline) = &self.pipeline {
-            self.bindings.bind(
-                self.encoder,
-                &pipeline.core,
-                slot,
-                resource,
-                Some(self.preamble),
-            );
-        }
+        self.bindings.bind(
+            self.encoder,
+            self.pipeline.as_deref(),
+            slot,
+            resource,
+            Some(self.preamble),
+        );
     }
     pub(crate) fn set_index_buffer(&mut self, buffer: BufferSlice<'_>, format: IndexFormat) {
         if !self.encoder.ready() {
@@ -1306,10 +1127,6 @@ impl RenderPass<'_> {
         if self.index == Some(value) {
             return;
         }
-        self.encoder
-            .resources
-            .buffers
-            .push(buffer.buffer.inner.clone());
         unsafe {
             self.encoder.shared.context.device.cmd_bind_index_buffer(
                 self.encoder.command,
@@ -1324,11 +1141,15 @@ impl RenderPass<'_> {
         self.index = Some(value);
     }
     fn prepare(&mut self) -> bool {
-        self.begun
-            && self.pipeline.as_ref().is_some_and(|p| {
-                self.bindings
-                    .flush(self.encoder, &p.core, vk::PipelineBindPoint::GRAPHICS)
-            })
+        let pipeline = self.pipeline.as_deref();
+        debug_assert!(
+            pipeline.is_some() || !self.encoder.ready(),
+            "draw without a pipeline"
+        );
+        pipeline.is_some_and(|p| {
+            self.bindings
+                .flush(self.encoder, p, vk::PipelineBindPoint::GRAPHICS)
+        })
     }
     pub(crate) fn draw(&mut self, vertices: std::ops::Range<u32>, instances: std::ops::Range<u32>) {
         if self.prepare() {
@@ -1366,10 +1187,6 @@ impl RenderPass<'_> {
         if !self.prepare() {
             return;
         }
-        self.encoder
-            .resources
-            .buffers
-            .push(args.buffer.inner.clone());
         unsafe {
             let device = &self.encoder.shared.context.device;
             if indexed {
@@ -1489,8 +1306,7 @@ impl RenderPass<'_> {
         if !self.begun || !self.encoder.ready() {
             return;
         }
-        self.resets.push((set.inner.clone(), index));
-        self.encoder.resources.queries.push(set.inner.clone());
+        self.resets.push((set.inner.0.handle, index));
         unsafe {
             self.encoder.shared.context.device.cmd_begin_query(
                 self.encoder.command,
@@ -1499,43 +1315,41 @@ impl RenderPass<'_> {
                 vk::QueryControlFlags::PRECISE,
             );
         }
-        self.occlusion = Some((set.inner.clone(), index));
+        self.occlusion = Some((set.inner.0.handle, index));
     }
     pub(crate) fn end_occlusion(&mut self) {
         if self.encoder.ready()
-            && let Some((set, index)) = self.occlusion.take()
+            && let Some((pool, index)) = self.occlusion.take()
         {
             unsafe {
-                self.encoder.shared.context.device.cmd_end_query(
-                    self.encoder.command,
-                    set.0.handle,
-                    index,
-                );
+                self.encoder
+                    .shared
+                    .context
+                    .device
+                    .cmd_end_query(self.encoder.command, pool, index);
             }
         }
     }
 }
 pub(crate) struct ComputePass<'e> {
     pub(super) encoder: &'e mut Encoder,
-    timestamp: Option<(QuerySet, u32)>,
-    pipeline: Option<ComputePipeline>,
+    timestamp: Option<(vk::QueryPool, u32)>,
+    pipeline: Option<Arc<pipeline::Compiled>>,
     bindings: binding::Bindings,
 }
 impl Drop for ComputePass<'_> {
     fn drop(&mut self) {
-        self.encoder.timestamp_end(&self.timestamp);
+        self.encoder.timestamp_end(self.timestamp);
     }
 }
 impl ComputePass<'_> {
     pub(crate) fn set_pipeline(&mut self, pipeline: &crate::ComputePipeline) {
-        if !self.encoder.ready() {
-            return;
-        }
-        let pipeline = &pipeline.inner;
-        if self
-            .pipeline
-            .as_ref()
-            .is_some_and(|p| p.core.handle == pipeline.core.handle)
+        let compiled = &pipeline.inner.compiled;
+        if !self.encoder.ready()
+            || self
+                .pipeline
+                .as_ref()
+                .is_some_and(|p| p.handle == compiled.handle)
         {
             return;
         }
@@ -1543,23 +1357,25 @@ impl ComputePass<'_> {
             self.encoder.shared.context.device.cmd_bind_pipeline(
                 self.encoder.command,
                 vk::PipelineBindPoint::COMPUTE,
-                pipeline.core.handle,
+                compiled.handle,
             );
         }
-        self.encoder.resources.pipelines.push(pipeline.core.clone());
-        self.bindings.pipeline(&pipeline.core);
-        self.pipeline = Some(pipeline.clone());
+        self.bindings.pipeline(compiled);
+        self.pipeline = Some(compiled.clone());
     }
     pub(crate) fn bind(&mut self, slot: u32, resource: Bind<'_>) {
-        if let Some(pipeline) = &self.pipeline {
-            self.bindings
-                .bind(self.encoder, &pipeline.core, slot, resource, None);
-        }
+        self.bindings
+            .bind(self.encoder, self.pipeline.as_deref(), slot, resource, None);
     }
     fn prepare(&mut self) -> bool {
-        self.pipeline.as_ref().is_some_and(|p| {
+        let pipeline = self.pipeline.as_deref();
+        debug_assert!(
+            pipeline.is_some() || !self.encoder.ready(),
+            "dispatch without a pipeline"
+        );
+        pipeline.is_some_and(|p| {
             self.bindings
-                .flush(self.encoder, &p.core, vk::PipelineBindPoint::COMPUTE)
+                .flush(self.encoder, p, vk::PipelineBindPoint::COMPUTE)
         })
     }
     pub(crate) fn dispatch(&mut self, x: u32, y: u32, z: u32) {
@@ -1577,10 +1393,6 @@ impl ComputePass<'_> {
     pub(crate) fn dispatch_indirect(&mut self, args: BufferSlice<'_>) {
         self.encoder.memory_barrier();
         if self.prepare() {
-            self.encoder
-                .resources
-                .buffers
-                .push(args.buffer.inner.clone());
             unsafe {
                 self.encoder.shared.context.device.cmd_dispatch_indirect(
                     self.encoder.command,

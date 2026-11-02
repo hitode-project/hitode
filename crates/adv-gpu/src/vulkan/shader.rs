@@ -9,7 +9,6 @@ struct ShaderCore {
     identity: u64,
     module: vk::ShaderModule,
     entries: Vec<(CString, Stage)>,
-    uniforms: Vec<HashMap<u32, u64>>,
     storage_strides: Vec<HashMap<u32, u32>>,
     heap: Option<HeapShader>,
 }
@@ -40,12 +39,12 @@ impl Shader {
     pub(super) fn stage<'a>(
         &'a self,
         entry: &'a Entry,
-        layout: Option<&binding::PushLayout>,
+        layout: &binding::PushLayout,
     ) -> Result<ShaderStage<'a>> {
-        let (module, temporary) = if let (Some(heap), Some(layout)) = (&self.0.heap, layout) {
+        let (module, temporary) = if let Some(heap) = &self.0.heap {
             let mut module = heap.module.clone();
             for patch in &heap.patches {
-                let field = layout.bindings.get(&patch.binding);
+                let field = layout.field(patch.binding.0, patch.binding.1);
                 let value = field.map_or(0, |field| match patch.part {
                     Part::Word => field.word,
                     Part::Shift => field.shift,
@@ -90,9 +89,6 @@ impl Shader {
     }
     pub(super) fn storage_strides(&self, index: u32) -> &HashMap<u32, u32> {
         &self.0.storage_strides[index as usize]
-    }
-    pub(super) fn uniforms(&self, index: u32) -> &HashMap<u32, u64> {
-        &self.0.uniforms[index as usize]
     }
 }
 pub(super) struct ShaderStage<'a> {
@@ -208,7 +204,6 @@ fn validate(
 }
 impl Device {
     pub(crate) fn create_shader(&self, desc: ShaderDesc<'_>) -> Result<crate::Shader> {
-        self.0.check()?;
         let (mut module, precompiled) = match desc.source {
             Source::Wgsl(text) => (
                 naga::front::wgsl::parse_str(text)
@@ -248,19 +243,11 @@ impl Device {
         layouter
             .update(module.to_ctx())
             .map_err(|e| Error::Compile(format!("shader layout: {e}")))?;
-        let mut uniforms = vec![HashMap::new(); entries.len()];
         let mut storage_strides = vec![HashMap::new(); entries.len()];
         for (handle, global) in module.global_variables.iter() {
             if let Some(binding) = &global.binding {
                 if binding.group > 3 {
                     return Err(Error::Compile("resource group must be 0..3".into()));
-                }
-                if binding.group == 0 {
-                    for (index, uniforms) in uniforms.iter_mut().enumerate() {
-                        if !info.get_entry_point(index)[handle].is_empty() {
-                            uniforms.insert(binding.binding, u64::from(layouter[global.ty].size));
-                        }
-                    }
                 }
                 if matches!(global.space, naga::AddressSpace::Storage { .. }) {
                     let stride = storage_shape(&module, global.ty, &layouter).stride;
@@ -313,7 +300,6 @@ impl Device {
                 identity: desc.identity,
                 module: handle,
                 entries,
-                uniforms,
                 storage_strides,
                 heap,
             })),

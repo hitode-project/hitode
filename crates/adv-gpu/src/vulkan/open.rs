@@ -186,13 +186,16 @@ impl Device {
                     .min(heap.counts[2])
                     .min(heap.counts[3]);
             }
+            let eds = caps
+                .modern
+                .contains(Modern::EXTENDED_DYNAMIC_STATE)
+                .then(|| Eds::load(&instance, &device, device_api));
             let context = Arc::new(Context {
+                eds,
                 pipelines: Mutex::new(pipeline::Pipelines::default()),
                 heap,
                 cache_prefix,
                 push: ash::khr::push_descriptor::Device::new(&instance, &device),
-                eds1: ash::ext::extended_dynamic_state::Device::new(&instance, &device),
-                eds2: ash::ext::extended_dynamic_state2::Device::new(&instance, &device),
                 color_write: ash::ext::color_write_enable::Device::new(&instance, &device),
                 dynamic: ash::khr::dynamic_rendering::Device::new(&instance, &device),
                 sync2: ash::khr::synchronization2::Device::new(&instance, &device),
@@ -206,7 +209,11 @@ impl Device {
                 caps,
                 memory,
                 allocator: Mutex::new(Some(allocator)),
-                lost: Mutex::new(None),
+                lost: AtomicBool::new(false),
+                next: AtomicU64::new(1),
+                open: AtomicU64::new(0),
+                retired: Mutex::new(VecDeque::new()),
+                passes: Mutex::new(HashMap::new()),
                 samplers: Mutex::new(HashMap::new()),
                 rings: Mutex::new(Vec::new()),
                 api: device_api,

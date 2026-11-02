@@ -15,7 +15,6 @@ pub(super) struct Shared {
     handle: vk::Queue,
     timeline: vk::Semaphore,
     pub(super) state: Mutex<State>,
-    pub(super) passes: Mutex<HashMap<encode::PassKey, encode::LegacyPass>>,
     pub(super) descriptors: Mutex<Vec<binding::DescriptorArena>>,
 }
 pub(super) struct State {
@@ -71,7 +70,6 @@ impl Queue {
             context,
             pool,
             timeline,
-            passes: Mutex::new(HashMap::new()),
             descriptors: Mutex::new(Vec::new()),
             state: Mutex::new(State {
                 next: 1,
@@ -205,6 +203,8 @@ impl Queue {
             _resources: resources,
         });
         state.next += 1;
+        context.next.store(state.next, Ordering::Release);
+        context.open.fetch_sub(1, Ordering::Release);
         encoder.inner.submitted = true;
         let _ = self.sender.as_ref().unwrap().send(Message::Wake);
         Ok(Token(token))
@@ -318,6 +318,7 @@ impl Shared {
                 false
             }
         });
+        self.context.reap(completed);
         Ok(Token(completed))
     }
 }
@@ -350,12 +351,6 @@ impl Drop for Shared {
             }
             for arena in self.descriptors.get_mut().unwrap() {
                 arena.destroy(&self.context);
-            }
-            for (_, pass) in self.passes.get_mut().unwrap().drain() {
-                self.context
-                    .device
-                    .destroy_framebuffer(pass.framebuffer, None);
-                self.context.device.destroy_render_pass(pass.pass, None);
             }
             self.context.device.destroy_command_pool(self.pool, None);
         }

@@ -21,18 +21,18 @@ pub(super) struct BufferCore {
 }
 impl Drop for BufferCore {
     fn drop(&mut self) {
-        if let Some(heap) = &self.context.heap {
-            for (_, set) in self.uniforms.get_mut().unwrap().drain() {
-                heap.free_uniform(&self.context, set);
-            }
-            if let Some(index) = self.storage {
-                heap.free(3, index);
-            }
-        }
-        unsafe {
-            self.context.device.destroy_buffer(self.handle, None);
-        }
-        self.context.free(self.allocation.take().unwrap());
+        self.context.retire(Retired::Buffer {
+            handle: self.handle,
+            allocation: self.allocation.take().unwrap(),
+            storage: self.storage,
+            uniforms: self
+                .uniforms
+                .get_mut()
+                .unwrap()
+                .drain()
+                .map(|(_, set)| set)
+                .collect(),
+        });
     }
 }
 impl Buffer {
@@ -105,15 +105,11 @@ impl Default for ImageState {
 }
 impl Drop for ImageCore {
     fn drop(&mut self) {
-        unsafe {
-            self.context.device.destroy_image(self.handle, None);
-            if let Some(conversion) = self.conversion {
-                self.context
-                    .device
-                    .destroy_sampler_ycbcr_conversion(conversion, None);
-            }
-        }
-        self.context.free(self.allocation.take().unwrap());
+        self.context.retire(Retired::Image {
+            handle: self.handle,
+            allocation: self.allocation.take().unwrap(),
+            conversion: self.conversion,
+        });
     }
 }
 #[derive(Clone)]
@@ -128,22 +124,11 @@ pub(super) struct ViewCore {
 }
 impl Drop for ViewCore {
     fn drop(&mut self) {
-        if let Some(heap) = &self.image.inner.core.context.heap {
-            if let Some(index) = self.sampled {
-                heap.free(0, index);
-            }
-            if let Some(index) = self.storage {
-                heap.free(2, index);
-            }
-        }
-        unsafe {
-            self.image
-                .inner
-                .core
-                .context
-                .device
-                .destroy_image_view(self.handle, None);
-        }
+        self.image.inner.core.context.retire(Retired::View {
+            handle: self.handle,
+            sampled: self.sampled,
+            storage: self.storage,
+        });
     }
 }
 impl Image {
@@ -166,7 +151,6 @@ impl Image {
         self.core.handle.as_raw()
     }
     pub(crate) fn create_view(&self, desc: &ViewDesc) -> Result<crate::ImageView> {
-        self.core.context.check()?;
         if self.desc().format.planes() > 1 {
             return Err(Error::Unavailable(
                 "plane views require mutable multi-planar images".into(),
@@ -175,7 +159,6 @@ impl Image {
         self.default_view(desc)
     }
     fn default_view(&self, desc: &ViewDesc) -> Result<crate::ImageView> {
-        self.core.context.check()?;
         let format = desc.format.unwrap_or(self.core.desc.format);
         if format != self.core.desc.format && !self.core.desc.view_formats.contains(&format) {
             return Err(Error::Invalid(
@@ -358,12 +341,10 @@ pub(crate) struct SamplerCore {
 }
 impl Drop for SamplerCore {
     fn drop(&mut self) {
-        if let Some(index) = self.index {
-            self.context.heap.as_ref().unwrap().free(1, index);
-        }
-        unsafe {
-            self.context.device.destroy_sampler(self.handle, None);
-        }
+        self.context.retire(Retired::Sampler {
+            handle: self.handle,
+            index: self.index,
+        });
     }
 }
 #[derive(Clone)]
@@ -380,15 +361,12 @@ impl QuerySet {
 }
 impl Drop for QueryCore {
     fn drop(&mut self) {
-        unsafe {
-            self.context.device.destroy_query_pool(self.handle, None);
-        }
+        self.context.retire(Retired::Query(self.handle));
     }
 }
 
 impl Device {
     pub(crate) fn create_buffer(&self, desc: &BufferDesc) -> Result<crate::Buffer> {
-        self.0.check()?;
         if desc.size == 0 {
             return Err(Error::Invalid("zero buffer size".into()));
         }
@@ -465,7 +443,6 @@ impl Device {
         })
     }
     pub(crate) fn create_image(&self, desc: &ImageDesc) -> Result<crate::Image> {
-        self.0.check()?;
         if self.caps().format(desc.format).is_empty() {
             return Err(Error::Unavailable(format!(
                 "image format {:?}",
@@ -638,7 +615,6 @@ impl Device {
         Ok(crate::Image { inner: image })
     }
     pub(crate) fn sampler(&self, desc: &SamplerDesc) -> Result<crate::Sampler> {
-        self.0.check()?;
         let mut cache = self.0.samplers.lock().unwrap();
         if let Some(sampler) = cache.get(desc).and_then(Weak::upgrade) {
             return Ok(crate::Sampler {
@@ -716,7 +692,6 @@ impl Device {
         kind: QueryKind,
         count: u32,
     ) -> Result<crate::queue::QuerySet> {
-        self.0.check()?;
         let feature = match kind {
             QueryKind::Timestamp => Features::TIMESTAMPS,
             QueryKind::Occlusion => Features::OCCLUSION_QUERIES,

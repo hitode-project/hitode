@@ -147,15 +147,19 @@ pub struct Extent {
 pub enum Error {
     /// No usable adapter, or a required baseline feature is missing.
     Unavailable(String),
-    /// The device was lost. Every later call fails with this until the owner
-    /// recreates the device; handles from the lost device stay inert.
+    /// The device was lost. Submit, wait and poll fail with this until the
+    /// owner recreates the device; other calls do not check, and handles from
+    /// the lost device stay inert.
     DeviceLost(String),
     /// Out of device or host memory for this request. Nothing was allocated.
     OutOfMemory,
     /// A bounded resource (ring, pool, frames in flight) is full now and will
     /// free when submissions complete. Nothing was written or encoded.
     Busy,
-    /// The request violates this API's contract or the device's limits.
+    /// A creation request exceeds the device's limits or carries malformed
+    /// input. Contract violations on encode paths (binds, draws, ring
+    /// reservations) are caller bugs: debug assertions, never checked in
+    /// release builds.
     Invalid(String),
     /// A shader or pipeline failed to compile; the message names the stage.
     Compile(String),
