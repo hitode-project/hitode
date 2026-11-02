@@ -127,9 +127,11 @@ mod android {
         shown: Vec<i64>,
         releases: Vec<i64>,
         ages: Vec<i64>,
+        unlatched: usize,
     }
     impl Metrics {
         fn summary(&mut self) {
+            log(format!("summary unlatched={}", self.unlatched));
             for (name, values) in [
                 ("present_cpu_ns", &mut self.cpu),
                 ("latch_minus_desired_ns", &mut self.latch),
@@ -181,7 +183,10 @@ mod android {
                 .drain(&mut self.presented, &mut self.released);
             for p in self.presented.drain(..).filter(|p| p.serial != 0) {
                 let i = p.serial as usize - 1;
-                let latch = p.latched.unwrap();
+                let Some(latch) = p.latched else {
+                    self.metrics.unlatched += 1;
+                    continue;
+                };
                 if self.latched[i].is_none() {
                     let ns = delta(latch, self.desired[i]);
                     self.metrics.latch.push(ns);

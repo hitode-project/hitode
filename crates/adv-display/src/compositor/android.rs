@@ -530,7 +530,8 @@ mod native {
                 if !event.reported || shown.is_some() {
                     presented.push(Presented {
                         serial: event.serial,
-                        latched: Some(self.clock.instant(event.latch)),
+                        // A transaction replaced before latching reports none.
+                        latched: (event.latch > 0).then(|| self.clock.instant(event.latch)),
                         shown,
                     });
                     event.reported = true;
