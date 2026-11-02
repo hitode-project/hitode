@@ -43,6 +43,12 @@ pub struct ImageDesc {
     pub mips: u32,
     pub samples: u32,
     pub usage: Usage,
+    /// Other formats views of this image may use, within its compatibility
+    /// class (sRGB siblings, D3D10/11 typeless families). Empty for most
+    /// images: declaring formats can cost framebuffer compression (Vulkan
+    /// `MUTABLE_FORMAT` with a format list, Metal `PixelFormatView`), so only
+    /// images that really reinterpret pay for it.
+    pub view_formats: &'static [Format],
     pub label: &'static str,
 }
 
@@ -62,8 +68,8 @@ impl Image {
     pub fn view(&self) -> &ImageView {
         self.inner.view()
     }
-    /// A view of a mip or layer range, optionally reinterpreting the format
-    /// within its compatibility class (D3D typeless resources, sRGB views).
+    /// A view of a mip or layer range, optionally in one of the formats the
+    /// image declared in [`ImageDesc::view_formats`].
     pub fn create_view(&self, desc: &ViewDesc) -> Result<ImageView> {
         self.inner.create_view(desc)
     }
