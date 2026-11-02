@@ -1,17 +1,48 @@
-//! The display layer: everything between a published game frame and the panel.
+//! Pure presentation planning, pool bookkeeping and compositor ownership.
 //!
-//! **Skeleton for review (issue #103, wave 0).** Contract types only.
-//!
-//! - [`plan`] decides, per present, the cheapest way to show a frame. It is a
-//!   pure function of plain data and never touches the GPU, so tests and the
-//!   flight recorder replay it exactly.
-//! - Stages execute a plan on the GPU owner thread over `adv-gpu`.
-//! - [`compositor::Compositor`] hands layers to the system compositor:
-//!   SurfaceControl on Android, Core Animation on Apple, a swapchain elsewhere,
-//!   and a headless one for tests.
+//! [`plan::plan`] consumes serializable geometry, damage, capabilities and pool
+//! state. Executors run its stages and call [`plan::PoolState::after_present`]
+//! only after submitting the complete frame. No GPU work runs in this crate.
+//! [`compositor`] transfers presentable images to the system compositor and
+//! returns ownership on release. [`recorder`] stores and replays planner data.
 
 pub mod compositor;
 pub mod plan;
 pub mod recorder;
 
-pub use adv_gpu::Rect;
+/// A rectangle in physical pixels or texels, with its origin at the top left.
+/// Display owns this serializable geometry; GPU rectangles remain GPU data.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub struct Rect {
+    pub x: u32,
+    pub y: u32,
+    pub w: u32,
+    pub h: u32,
+}
+
+impl From<Rect> for adv_gpu::Rect {
+    fn from(r: Rect) -> Self {
+        Self {
+            x: r.x,
+            y: r.y,
+            w: r.w,
+            h: r.h,
+        }
+    }
+}
+
+impl From<adv_gpu::Rect> for Rect {
+    fn from(r: adv_gpu::Rect) -> Self {
+        Self {
+            x: r.x,
+            y: r.y,
+            w: r.w,
+            h: r.h,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;
