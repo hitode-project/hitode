@@ -64,12 +64,17 @@ pub struct RenderPassDesc<'a> {
     /// on either backend.
     pub area: Rect,
     /// Write GPU timestamps at the pass's start and end into `(set, first)` and
-    /// `(set, first + 1)`. Needs [`crate::Features::TIMESTAMPS`].
+    /// `(set, first + 1)`. Needs [`crate::Features::TIMESTAMPS`]. Timestamps
+    /// measure work: a pass without draws (its loads and stores only) may
+    /// report a zero duration, both values equal and otherwise unspecified,
+    /// because tile GPUs sample counters only where shader stages run.
     pub timestamps: Option<(&'a QuerySet, u32)>,
     pub label: &'static str,
 }
 
 pub struct ComputePassDesc<'a> {
+    /// As [`RenderPassDesc::timestamps`]; a pass without dispatches may report
+    /// a zero duration.
     pub timestamps: Option<(&'a QuerySet, u32)>,
     pub label: &'static str,
 }
