@@ -57,6 +57,12 @@ fn create_image(
                 } else {
                     Usage::empty()
                 },
+            // Exercises the mutable image with a format list.
+            view_formats: if format == Format::Rgba8Unorm {
+                &[Format::Rgba8Srgb]
+            } else {
+                &[]
+            },
             label: "internal image",
         })
         .unwrap()
@@ -298,6 +304,7 @@ fn views_partial_clears_query_resets_and_resolves() {
             .create_image(&ImageDesc {
                 format: Format::Rgba8Unorm,
                 usage: Usage::SAMPLED | Usage::STORAGE,
+                view_formats: &[Format::Rgba8Srgb],
                 ..*integer.desc()
             })
             .unwrap();

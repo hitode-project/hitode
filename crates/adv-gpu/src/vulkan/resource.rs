@@ -156,8 +156,10 @@ impl Image {
     fn default_view(&self, desc: &ViewDesc) -> Result<crate::ImageView> {
         self.core.context.check()?;
         let format = desc.format.unwrap_or(self.core.desc.format);
-        if !formats::compatible(self.core.desc.format, format) {
-            return Err(Error::Invalid("incompatible image view format".into()));
+        if format != self.core.desc.format && !self.core.desc.view_formats.contains(&format) {
+            return Err(Error::Invalid(
+                "image view format not declared in view_formats".into(),
+            ));
         }
         let layers = layers(&self.core.desc);
         if desc.mips.is_empty()
@@ -434,8 +436,15 @@ impl Device {
         if lazy {
             usage |= vk::ImageUsageFlags::TRANSIENT_ATTACHMENT;
         }
+        // Only images that declare other view formats are mutable, and they
+        // name the list so drivers can keep framebuffer compression.
         let mut flags = vk::ImageCreateFlags::empty();
-        if formats::mutable(desc.format) {
+        let view_formats: Vec<vk::Format> = std::iter::once(desc.format)
+            .chain(desc.view_formats.iter().copied())
+            .map(formats::vk)
+            .collect();
+        let mut format_list = vk::ImageFormatListCreateInfo::default().view_formats(&view_formats);
+        if !desc.view_formats.is_empty() {
             flags |= vk::ImageCreateFlags::MUTABLE_FORMAT;
         }
         if desc.dimension == Dimension::Cube {
@@ -455,7 +464,7 @@ impl Device {
                 1
             },
         };
-        let info = vk::ImageCreateInfo::default()
+        let mut info = vk::ImageCreateInfo::default()
             .flags(flags)
             .image_type(image_type)
             .format(formats::vk(desc.format))
@@ -465,6 +474,10 @@ impl Device {
             .samples(vk::SampleCountFlags::from_raw(desc.samples))
             .tiling(vk::ImageTiling::OPTIMAL)
             .usage(usage);
+        // The list is core from 1.2; older drivers get the flag alone.
+        if !desc.view_formats.is_empty() && self.0.api >= vk::API_VERSION_1_2 {
+            info = info.push_next(&mut format_list);
+        }
         let handle = self
             .0
             .result(unsafe { self.0.device.create_image(&info, None) })?;

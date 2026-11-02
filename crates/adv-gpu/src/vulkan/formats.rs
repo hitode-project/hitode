@@ -59,43 +59,6 @@ pub(super) fn vk(format: Format) -> vk::Format {
         Format::P010 => vk::Format::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16,
     }
 }
-pub(super) fn mutable(format: Format) -> bool {
-    // Packed legacy and depth formats have no typed siblings in this API.
-    !matches!(
-        format,
-        Format::B5g6r5Unorm
-            | Format::Bgr5a1Unorm
-            | Format::Bgra4Unorm
-            | Format::Depth16Unorm
-            | Format::Depth24UnormStencil8
-            | Format::Depth32Float
-            | Format::Depth32FloatStencil8
-            | Format::Nv12
-            | Format::P010
-    )
-}
-pub(super) fn compatible(a: Format, b: Format) -> bool {
-    let class = |format| match format {
-        Format::R8Unorm => Some(8),
-        Format::Rg8Unorm
-        | Format::R16Float
-        | Format::B5g6r5Unorm
-        | Format::Bgr5a1Unorm
-        | Format::Bgra4Unorm => Some(16),
-        Format::Rgba8Unorm
-        | Format::Rgba8Srgb
-        | Format::Bgra8Unorm
-        | Format::Bgra8Srgb
-        | Format::Rgb10a2Unorm
-        | Format::Rg16Float
-        | Format::R32Float
-        | Format::R32Uint => Some(32),
-        Format::Rgba16Float | Format::Rg32Float => Some(64),
-        Format::Rgba32Float => Some(128),
-        _ => None,
-    };
-    a == b || (mutable(a) && class(a).is_some() && class(a) == class(b))
-}
 pub(super) fn aspect(format: Format) -> vk::ImageAspectFlags {
     if format.has_depth() {
         vk::ImageAspectFlags::DEPTH
