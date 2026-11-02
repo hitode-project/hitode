@@ -13,7 +13,8 @@ pub(super) fn query(raw: &ProtocolObject<dyn MTLDevice>) -> Caps {
         | Features::OCCLUSION_QUERIES
         | Features::PIPELINE_CACHE
         | Features::INDIRECT
-        | Features::MULTISAMPLE;
+        | Features::MULTISAMPLE
+        | Features::PRESENTABLE_BUFFERS;
     if apple {
         features |= Features::TRANSIENT_ATTACHMENTS | Features::TILE_SHADERS;
     }
@@ -149,6 +150,7 @@ fn format_caps(
             }
             caps
         }
+        present::FORMAT => color | C::STORAGE | C::PRESENTABLE,
         Format::R32Uint => C::SAMPLED | C::COLOR | C::STORAGE,
         Format::R32Float | Format::Rg32Float | Format::Rgba32Float => {
             let mut caps = C::SAMPLED | C::COLOR | C::STORAGE | C::BLEND;

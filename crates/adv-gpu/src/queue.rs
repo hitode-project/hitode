@@ -76,7 +76,7 @@ impl Device {
         self.inner.ring(size)
     }
     pub fn create_present_pool(&self, desc: &PoolDesc) -> Result<PresentPool> {
-        self.inner.create_present_pool(desc)
+        PresentPool::new(self, desc)
     }
     pub fn create_query_set(&self, kind: QueryKind, count: u32) -> Result<QuerySet> {
         self.inner.create_query_set(kind, count)
@@ -111,8 +111,8 @@ impl Queue {
     pub fn submit(&mut self, encoder: Encoder) -> Result<Token> {
         self.inner.submit(encoder)
     }
-    /// The latest completed token. Retires ring spans, deferred destructions
-    /// and pool releases up to it. Never blocks.
+    /// The latest completed token. Retires ring spans and deferred
+    /// destructions up to it. Never blocks.
     pub fn poll(&mut self) -> Result<Token> {
         self.inner.poll()
     }
@@ -126,32 +126,30 @@ impl Queue {
     pub fn on_complete(&mut self, token: Token, callback: Box<dyn FnOnce() + Send>) {
         self.inner.on_complete(token, callback)
     }
-    /// A fence the platform compositor waits on before it latches a buffer
-    /// written by `token` (Android acquire fence).
-    pub fn export_fence(&mut self, token: Token) -> Result<Fence> {
-        self.inner.export_fence(token)
-    }
-    /// Make the next submission wait on a platform fence, such as a buffer's
-    /// release fence from SurfaceFlinger.
-    pub fn wait_fence(&mut self, fence: Fence) -> Result<()> {
-        self.inner.wait_fence(fence)
-    }
 }
 
-/// A platform fence. On Android it owns a sync file descriptor; on Apple it is
-/// a shared event and value.
+/// A system compositor fence: a sync file descriptor on Android. Other
+/// platforms have no compositor fences, and no value of this type exists
+/// there.
 pub struct Fence {
     pub(crate) inner: crate::imp::Fence,
 }
 
 impl Fence {
-    #[cfg(unix)]
-    pub fn into_fd(self) -> Option<std::os::fd::OwnedFd> {
-        self.inner.into_fd()
+    #[cfg(target_os = "android")]
+    pub fn into_fd(self) -> std::os::fd::OwnedFd {
+        self.inner.0
     }
-    #[cfg(unix)]
+    #[cfg(target_os = "android")]
     pub fn from_fd(fd: std::os::fd::OwnedFd) -> Self {
-        imp::Fence::from_fd(fd)
+        Self {
+            inner: imp::Fence(fd),
+        }
+    }
+    pub(crate) fn duplicate(&self) -> Result<Self> {
+        Ok(Self {
+            inner: self.inner.duplicate()?,
+        })
     }
 }
 

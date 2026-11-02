@@ -24,6 +24,7 @@ mod caps;
 mod clear;
 mod encode;
 mod pipeline;
+mod present;
 mod queue;
 mod resource;
 mod ring;
@@ -31,6 +32,7 @@ mod shader;
 
 pub(crate) use encode::{ComputePass, Encoder, RenderPass};
 pub(crate) use pipeline::{ComputePipeline, PipelineCache, RenderPipeline};
+pub(crate) use present::{Fence, PresentBuffer};
 use queue::QueryData;
 pub(crate) use queue::{QuerySet, Queue};
 pub(crate) use resource::{Buffer, Image, ImageView, Sampler};
@@ -63,67 +65,6 @@ impl Device {
             Some(reason) => Err(Error::DeviceLost(reason)),
             None => Ok(()),
         }
-    }
-    pub(crate) fn create_present_pool(&self, _desc: &PoolDesc) -> Result<crate::PresentPool> {
-        todo!("B3")
-    }
-}
-
-#[derive(Clone)]
-pub(crate) struct Fence;
-
-impl Fence {
-    #[cfg(unix)]
-    pub(crate) fn into_fd(self) -> Option<std::os::fd::OwnedFd> {
-        todo!("B3")
-    }
-
-    #[cfg(unix)]
-    pub(crate) fn from_fd(_fd: std::os::fd::OwnedFd) -> crate::queue::Fence {
-        todo!("B3")
-    }
-}
-
-#[derive(Clone)]
-pub(crate) struct PresentPool;
-
-impl PresentPool {
-    pub(crate) fn acquire(&mut self) -> Option<crate::PresentImage> {
-        todo!("B3")
-    }
-
-    pub(crate) fn trim(&mut self, _keep: u32) {
-        todo!("B3")
-    }
-}
-
-pub(crate) struct PresentImage;
-
-impl Drop for PresentImage {
-    fn drop(&mut self) {
-        todo!("B3")
-    }
-}
-
-impl PresentImage {
-    pub(crate) fn image(&self) -> &crate::Image {
-        todo!("B3")
-    }
-
-    pub(crate) fn age(&self) -> Option<u32> {
-        todo!("B3")
-    }
-
-    pub(crate) fn export(&self) -> Export<'_> {
-        todo!("B3")
-    }
-
-    pub(crate) fn presented(&mut self, _written: Token) {
-        todo!("B3")
-    }
-
-    pub(crate) fn released(self, _fence: Option<crate::queue::Fence>) {
-        todo!("B3")
     }
 }
 

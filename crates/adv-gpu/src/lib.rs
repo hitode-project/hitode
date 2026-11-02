@@ -23,7 +23,7 @@
 //! Chosen at compile time: Metal on Apple targets, Vulkan elsewhere. The public
 //! API has no dynamic dispatch and no backend types. Platform handles appear
 //! only where the platform requires them: presentable-buffer export
-//! ([`present::Export`]) and fence export ([`queue::Queue::export_fence`]).
+//! ([`present::Export`]) and compositor fences ([`queue::Fence`], Android).
 //!
 //! # Threads
 //!

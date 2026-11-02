@@ -29,8 +29,11 @@ pub enum LayerId {
     Host(crate::plan::HostLayer),
 }
 
-/// The executor marks the image `presented(acquire)` before transferring it.
-/// This crate only holds handles; it does not call the GPU backend.
+/// The executor submits the image's last write with `Queue::submit_present`,
+/// whose token is `acquire`, before transferring it. Android compositors take
+/// the latch fence from `PresentImage::acquire_fence`; Apple compositors
+/// attach once `acquire` completes. This crate only holds handles; it does not
+/// call the GPU backend.
 pub struct AcquiredImage {
     pub layer: LayerId,
     pub image: PresentImage,

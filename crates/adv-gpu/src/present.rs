@@ -26,31 +26,107 @@
 //! A pool tracks each buffer's age, the number of presents since its content
 //! was current, so callers redraw only the damage since then (GFX-REC-5).
 
-use crate::queue::Fence;
-use crate::{Format, Image, Token};
+use crate::queue::{Device, Fence, Queue};
+use crate::{Encoder, Format, FormatCaps, Image, Result, Token, imp};
+use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PoolDesc {
     pub width: u32,
     pub height: u32,
-    /// An RGBA format, or `Nv12`/`P010` for video planes.
+    /// A format with [`FormatCaps::PRESENTABLE`].
     pub format: Format,
     pub count: u32,
     pub label: &'static str,
 }
 
+/// Up to `count` buffers, allocated on demand. Buffers carry their age and
+/// any release fence; the pool, not its users, orders reuse after the
+/// compositor.
 pub struct PresentPool {
-    pub(crate) inner: crate::imp::PresentPool,
+    device: Device,
+    desc: PoolDesc,
+    shared: Arc<Mutex<Shared>>,
+}
+
+struct Shared {
+    free: Vec<Buffer>,
+    allocated: u32,
+    /// Presents of this pool so far; a buffer presented at `n` has age
+    /// `presents - n + 1`.
+    presents: u64,
+}
+
+struct Buffer {
+    image: Image,
+    raw: imp::PresentBuffer,
+    stamp: Option<u64>,
+    release: Option<Fence>,
 }
 
 impl PresentPool {
-    /// A free buffer, or `None` while every buffer is in flight or on screen.
-    pub fn acquire(&mut self) -> Option<PresentImage> {
-        self.inner.acquire()
+    pub(crate) fn new(device: &Device, desc: &PoolDesc) -> Result<Self> {
+        let caps = device.caps();
+        if !caps.format(desc.format).contains(FormatCaps::PRESENTABLE)
+            || desc.width == 0
+            || desc.height == 0
+            || desc.width.max(desc.height) > caps.limits.max_image_2d
+            || desc.count == 0
+        {
+            return Err(crate::Error::Invalid(format!("present pool {desc:?}")));
+        }
+        Ok(Self {
+            device: device.clone(),
+            desc: *desc,
+            shared: Arc::new(Mutex::new(Shared {
+                free: Vec::new(),
+                allocated: 0,
+                presents: 0,
+            })),
+        })
     }
-    /// Drop free buffers down to `keep`, for memory pressure and background.
+    /// The free buffer with the newest content, allocating one while fewer
+    /// than `count` exist; `None` while every buffer is in flight or on
+    /// screen. A buffer's release fence becomes a wait of `queue`'s next
+    /// submission, so callers never order against the compositor.
+    pub fn acquire(&mut self, queue: &mut Queue) -> Result<Option<PresentImage>> {
+        let mut shared = self.shared.lock().unwrap();
+        let newest = (0..shared.free.len()).max_by_key(|&i| shared.free[i].stamp);
+        let mut buffer = match newest {
+            Some(i) => shared.free.swap_remove(i),
+            None if shared.allocated < self.desc.count => {
+                let (image, raw) = imp::PresentBuffer::new(&self.device.inner, &self.desc)?;
+                shared.allocated += 1;
+                Buffer {
+                    image,
+                    raw,
+                    stamp: None,
+                    release: None,
+                }
+            }
+            None => return Ok(None),
+        };
+        let age = buffer.stamp.map(|n| (shared.presents - n + 1) as u32);
+        if let Some(fence) = buffer.release.take() {
+            queue.inner.wait_next(fence.inner);
+        }
+        Ok(Some(PresentImage {
+            buffer: Some(buffer),
+            age,
+            fence: None,
+            pool: self.shared.clone(),
+        }))
+    }
+    /// Drop free buffers, oldest content first, until at most `keep` remain
+    /// allocated; for memory pressure and background.
     pub fn trim(&mut self, keep: u32) {
-        self.inner.trim(keep)
+        let mut shared = self.shared.lock().unwrap();
+        shared
+            .free
+            .sort_unstable_by_key(|b| std::cmp::Reverse(b.stamp));
+        while shared.allocated > keep && shared.free.pop().is_some() {
+            shared.allocated -= 1;
+        }
     }
 }
 
@@ -58,33 +134,80 @@ impl PresentPool {
 /// ([`PresentImage::released`]) or when dropped unpresented, with its age
 /// unchanged then.
 pub struct PresentImage {
-    pub(crate) inner: crate::imp::PresentImage,
+    buffer: Option<Buffer>,
+    age: Option<u32>,
+    fence: Option<Fence>,
+    pool: Arc<Mutex<Shared>>,
 }
 
 impl PresentImage {
     pub fn image(&self) -> &Image {
-        self.inner.image()
+        &self.buffer().image
     }
     /// Presents since this buffer's content was current; `None` when its
-    /// content is undefined (new, or invalidated by a resize).
+    /// content is undefined (new to the pool).
     pub fn age(&self) -> Option<u32> {
-        self.inner.age()
+        self.age
     }
     /// The platform handle the compositor attaches. The image stays owned by
     /// the pool; the handle is valid until the release is reported.
     pub fn export(&self) -> Export<'_> {
-        self.inner.export()
+        self.buffer().raw.export()
     }
-    /// Mark the buffer handed to the compositor after `written` completes.
-    pub fn presented(&mut self, written: Token) {
-        self.inner.presented(written)
+    /// After [`Queue::submit_present`], the fence the compositor waits on
+    /// before latching this buffer: a sync fd on Android, `None` on Apple,
+    /// where the compositor attaches once the token completes.
+    pub fn acquire_fence(&mut self) -> Option<Fence> {
+        self.fence.take()
     }
     /// The compositor no longer reads the buffer once `fence` signals.
-    pub fn released(self, fence: Option<Fence>) {
-        self.inner.released(fence)
+    pub fn released(mut self, fence: Option<Fence>) {
+        self.buffer.as_mut().unwrap().release = fence;
+    }
+    fn buffer(&self) -> &Buffer {
+        self.buffer.as_ref().unwrap()
     }
 }
 
+impl Drop for PresentImage {
+    fn drop(&mut self) {
+        let buffer = self.buffer.take().unwrap();
+        self.pool.lock().unwrap().free.push(buffer);
+    }
+}
+
+impl Queue {
+    /// Submit `encoder` as the last write of `images`, which go to the system
+    /// compositor: the backend ends the submission with each buffer's hand-off
+    /// (a queue-family release on Vulkan) and signals their acquire fence in
+    /// the same batch. Each image's age restarts here.
+    pub fn submit_present(
+        &mut self,
+        encoder: Encoder,
+        images: &mut [&mut PresentImage],
+    ) -> Result<Token> {
+        let (token, fence) = {
+            let buffers: arrayvec::ArrayVec<_, 8> = images
+                .iter()
+                .map(|i| (&i.buffer().image.inner, &i.buffer().raw))
+                .collect();
+            self.inner.submit_present(encoder, &buffers)?
+        };
+        let mut fence = fence.map(|inner| Fence { inner });
+        let last = images.len().saturating_sub(1);
+        for (n, image) in images.iter_mut().enumerate() {
+            let mut pool = image.pool.lock().unwrap();
+            pool.presents += 1;
+            image.buffer.as_mut().unwrap().stamp = Some(pool.presents);
+            image.fence = if n == last {
+                fence.take()
+            } else {
+                fence.as_ref().map(Fence::duplicate).transpose()?
+            };
+        }
+        Ok(token)
+    }
+}
 #[non_exhaustive]
 pub enum Export<'a> {
     /// `AHardwareBuffer*`, borrowed.

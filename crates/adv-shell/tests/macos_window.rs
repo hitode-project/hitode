@@ -33,6 +33,10 @@ mod mac {
     use std::cell::RefCell;
     use std::rc::Rc;
 
+    const WM_ACTIVATEAPP: u32 = 0x1c;
+
+    /// Input messages without WM_ACTIVATEAPP: macOS activates the test
+    /// process at a time of its own choosing.
     fn inputs(events: Vec<Event>) -> Vec<(u32, u32, u32)> {
         events
             .into_iter()
@@ -41,7 +45,21 @@ mod mac {
                     message,
                     wparam,
                     lparam,
-                } => Some((message, wparam, lparam)),
+                } if message != WM_ACTIVATEAPP => Some((message, wparam, lparam)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn activations(events: Vec<Event>) -> Vec<u32> {
+        events
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::Input {
+                    message: WM_ACTIVATEAPP,
+                    wparam,
+                    ..
+                } => Some(wparam),
                 _ => None,
             })
             .collect()
@@ -705,13 +723,13 @@ mod mac {
         let app = NSApplication::sharedApplication(mtm);
         let application = app.delegate().unwrap();
         let _: () = unsafe { msg_send![&*application, applicationDidHide: &*note] };
-        assert!(inputs(dispatch(&mut window)).contains(&(0x1c, 0, 0)));
+        assert!(activations(dispatch(&mut window)).contains(&0));
         assert_eq!(window.native_client_size().unwrap(), (0, 0));
         let _: () = unsafe { msg_send![&*application, applicationDidUnhide: &*note] };
         let _: () = unsafe { msg_send![&*application, applicationDidBecomeActive: &*note] };
-        assert!(inputs(dispatch(&mut window)).contains(&(0x1c, 1, 0)));
+        assert!(activations(dispatch(&mut window)).contains(&1));
         let _: () = unsafe { msg_send![&*application, applicationDidResignActive: &*note] };
-        assert!(inputs(dispatch(&mut window)).contains(&(0x1c, 0, 0)));
+        assert!(activations(dispatch(&mut window)).contains(&0));
         println!("ok hide and activation");
 
         let center = objc2_app_kit::NSWorkspace::sharedWorkspace().notificationCenter();

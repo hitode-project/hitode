@@ -1196,10 +1196,13 @@ fn present_pools_track_ages_and_releases() {
             label: "pool",
         })
         .expect("pool");
-    let mut first = pool.acquire().expect("first buffer");
-    let second = pool.acquire().expect("second buffer");
+    let acquire = |pool: &mut adv_gpu::PresentPool, queue: &mut adv_gpu::Queue| {
+        pool.acquire(queue).expect("acquire")
+    };
+    let mut first = acquire(&mut pool, &mut gpu.queue).expect("first buffer");
+    let second = acquire(&mut pool, &mut gpu.queue).expect("second buffer");
     assert!(
-        pool.acquire().is_none(),
+        acquire(&mut pool, &mut gpu.queue).is_none(),
         "pool of two handed out a third buffer"
     );
     assert_eq!(first.age(), None);
@@ -1211,15 +1214,19 @@ fn present_pools_track_ages_and_releases() {
         None,
         whole(64, 64),
     )));
-    let token = gpu.queue.submit(encoder).expect("submit");
-    first.presented(token);
+    let token = gpu
+        .queue
+        .submit_present(encoder, &mut [&mut first])
+        .expect("submit");
+    // Android compositors wait on a sync fd; Apple's attach after the token.
+    assert_eq!(first.acquire_fence().is_some(), cfg!(target_os = "android"));
     first.released(None);
     drop(second);
     gpu.finish(token);
-    gpu.queue.poll().expect("poll");
-    let mut ages =
-        [pool.acquire(), pool.acquire()].map(|image| image.expect("buffer back in the pool").age());
-    ages.sort();
-    assert_eq!(ages, [None, Some(1)]);
+    // The newest content comes back first.
+    let newest = acquire(&mut pool, &mut gpu.queue).expect("presented buffer back");
+    let fresh = acquire(&mut pool, &mut gpu.queue).expect("unpresented buffer back");
+    assert_eq!((newest.age(), fresh.age()), (Some(1), None));
+    drop((newest, fresh));
     pool.trim(1);
 }

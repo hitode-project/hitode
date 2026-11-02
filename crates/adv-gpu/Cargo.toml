@@ -27,7 +27,11 @@ objc2-metal = { version = "0.3.2", default-features = false, features = [
     "MTLRenderCommandEncoder", "MTLRenderPipeline", "MTLDepthStencil",
     "MTLBlitCommandEncoder", "MTLComputePass", "MTLComputeCommandEncoder",
     "MTLCounters", "MTLLibrary", "MTLArgument", "MTLBinaryArchive", "MTLFence", "MTLComputePipeline",
+    "objc2-io-surface",
 ] }
+objc2-io-surface = { version = "0.3.2", default-features = false, features = ["std", "IOSurfaceRef", "IOSurfaceTypes", "objc2-core-foundation"] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFDictionary", "CFNumber", "CFString"] }
+objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std", "CGColorSpace"] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = [
     "std", "NSString", "NSRange", "NSArray", "NSError", "NSProcessInfo",
 ] }

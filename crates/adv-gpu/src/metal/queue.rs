@@ -16,12 +16,14 @@ impl Device {
     pub(crate) fn open(options: &DeviceOptions) -> Result<(crate::Device, crate::Queue)> {
         let raw = MTLCreateSystemDefaultDevice()
             .ok_or_else(|| Error::Unavailable("no system Metal device".into()))?;
-        let supported = if cfg!(target_os = "ios") {
-            raw.supportsFamily(MTLGPUFamily::Apple5)
+        // The floor is A12 on iOS and M1 on macOS. Virtual GPUs (the
+        // paravirtual device of macOS guests) report only Mac2 and fall below.
+        let floor = if cfg!(target_os = "ios") {
+            MTLGPUFamily::Apple5
         } else {
-            raw.supportsFamily(MTLGPUFamily::Apple7) || raw.supportsFamily(MTLGPUFamily::Mac2)
+            MTLGPUFamily::Apple7
         };
-        if !supported {
+        if !raw.supportsFamily(floor) {
             return Err(Error::Unavailable(
                 "Metal GPU family below the platform baseline".into(),
             ));
@@ -177,11 +179,17 @@ impl Queue {
             );
         }
     }
-    pub(crate) fn export_fence(&mut self, _token: Token) -> Result<crate::queue::Fence> {
-        todo!("B3")
+    /// Metal tracks hazards and Core Animation needs no queue transfer, so a
+    /// hand-off is a plain submit and there is no acquire fence.
+    pub(crate) fn submit_present(
+        &mut self,
+        encoder: crate::Encoder,
+        _buffers: &[(&super::Image, &super::PresentBuffer)],
+    ) -> Result<(Token, Option<super::Fence>)> {
+        Ok((self.submit(encoder)?, None))
     }
-    pub(crate) fn wait_fence(&mut self, _fence: crate::queue::Fence) -> Result<()> {
-        todo!("B3")
+    pub(crate) fn wait_next(&mut self, fence: super::Fence) {
+        match fence {}
     }
 }
 

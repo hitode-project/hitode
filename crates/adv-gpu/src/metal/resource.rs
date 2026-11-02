@@ -47,6 +47,19 @@ pub(crate) struct Sampler(#[allow(dead_code)] pub(super) Arc<Object<dyn MTLSampl
 impl Device {
     pub(crate) fn create_image(&self, desc: &ImageDesc) -> Result<crate::Image> {
         self.check()?;
+        let d = self.texture_descriptor(desc)?;
+        let raw = self
+            .0
+            .raw
+            .newTextureWithDescriptor(&d)
+            .ok_or(Error::OutOfMemory)?;
+        Ok(self.wrap_image(raw, desc))
+    }
+    /// The texture descriptor for `desc`, after checking it against the caps.
+    pub(super) fn texture_descriptor(
+        &self,
+        desc: &ImageDesc,
+    ) -> Result<Retained<MTLTextureDescriptor>> {
         let supported = self.caps().format(desc.format);
         if supported.is_empty() {
             return Err(Error::Invalid(format!(
@@ -121,13 +134,11 @@ impl Device {
             usage |= MTLTextureUsage::RenderTarget;
         }
         d.setUsage(usage);
-        let raw = self
-            .0
-            .raw
-            .newTextureWithDescriptor(&d)
-            .ok_or(Error::OutOfMemory)?;
+        Ok(d)
+    }
+    pub(super) fn wrap_image(&self, raw: Object<dyn MTLTexture>, desc: &ImageDesc) -> crate::Image {
         raw.setLabel(Some(&NSString::from_str(desc.label)));
-        Ok(crate::Image {
+        crate::Image {
             inner: Image {
                 data: Arc::new(ImageData {
                     raw,
@@ -136,7 +147,7 @@ impl Device {
                 }),
                 view: OnceLock::new(),
             },
-        })
+        }
     }
 
     pub(crate) fn create_buffer(&self, desc: &BufferDesc) -> Result<crate::Buffer> {
