@@ -126,6 +126,27 @@ impl Queue {
     pub fn on_complete(&mut self, token: Token, callback: Box<dyn FnOnce() + Send>) {
         self.inner.on_complete(token, callback)
     }
+    /// Completion callbacks on the main thread, for compositors whose commits
+    /// belong there (Core Animation).
+    #[cfg(target_vendor = "apple")]
+    pub fn main_notifier(&self) -> MainNotifier {
+        MainNotifier {
+            inner: self.inner.main_notifier(),
+        }
+    }
+}
+
+/// Runs completion callbacks on the main thread; any thread may register.
+#[cfg(target_vendor = "apple")]
+pub struct MainNotifier {
+    inner: imp::MainNotifier,
+}
+#[cfg(target_vendor = "apple")]
+impl MainNotifier {
+    /// Run `callback` on the main thread once `token` completes.
+    pub fn on_complete(&self, token: Token, callback: Box<dyn FnOnce() + Send>) {
+        self.inner.on_complete(token, callback)
+    }
 }
 
 /// A system compositor fence: a sync file descriptor on Android. Other

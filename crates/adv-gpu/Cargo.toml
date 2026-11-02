@@ -21,7 +21,7 @@ gpu-allocator = { version = "0.28", default-features = false, features = ["std",
 naga = { version = "=30.0.1", default-features = false, features = ["msl-out"] }
 objc2 = "0.6.4"
 objc2-metal = { version = "0.3.2", default-features = false, features = [
-    "std", "block2", "MTLDevice", "MTLCommandQueue", "MTLCommandBuffer",
+    "std", "block2", "dispatch2", "MTLDevice", "MTLCommandQueue", "MTLCommandBuffer",
     "MTLCommandEncoder", "MTLEvent", "MTLResource", "MTLBuffer", "MTLTexture",
     "MTLSampler", "MTLPixelFormat", "MTLTypes", "MTLRenderPass",
     "MTLRenderCommandEncoder", "MTLRenderPipeline", "MTLDepthStencil",
@@ -36,6 +36,7 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = [
     "std", "NSString", "NSRange", "NSArray", "NSError", "NSProcessInfo",
 ] }
 block2 = "0.6.2"
+dispatch2 = { version = "0.3.1", default-features = false, features = ["std", "objc2"] }
 
 [lints]
 workspace = true

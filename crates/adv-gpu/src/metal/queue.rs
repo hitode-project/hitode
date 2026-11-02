@@ -163,20 +163,18 @@ impl Queue {
         Ok(self.poll()? >= token)
     }
     pub(crate) fn on_complete(&mut self, token: Token, callback: Box<dyn FnOnce() + Send>) {
-        let callback = Mutex::new(Some(callback));
-        let block = block2::RcBlock::new(
-            move |_: NonNull<ProtocolObject<dyn MTLSharedEvent>>, _: u64| {
-                if let Some(callback) = callback.lock().unwrap().take() {
-                    callback();
-                }
-            },
-        );
-        unsafe {
-            self.event.notifyListener_atValue_block(
-                &self.listener,
-                token.0,
-                block2::RcBlock::as_ptr(&block),
-            );
+        notify(&self.event, &self.listener, token, callback);
+    }
+    pub(crate) fn main_notifier(&self) -> MainNotifier {
+        let listener = unsafe {
+            MTLSharedEventListener::initWithDispatchQueue(
+                <MTLSharedEventListener as objc2::AnyThread>::alloc(),
+                dispatch2::DispatchQueue::main(),
+            )
+        };
+        MainNotifier {
+            event: self.event.clone(),
+            listener,
         }
     }
     /// Metal tracks hazards and Core Animation needs no queue transfer, so a
@@ -319,3 +317,37 @@ impl QuerySet {
 // Query allocation handles are immutable; the queue alone encodes their writes.
 unsafe impl Send for QueryData {}
 unsafe impl Sync for QueryData {}
+
+/// Completion callbacks delivered on the main dispatch queue: the shared
+/// event's listener runs them there, with no thread of ours in between.
+pub(crate) struct MainNotifier {
+    event: Object<dyn MTLSharedEvent>,
+    listener: Retained<MTLSharedEventListener>,
+}
+// SAFETY: shared events and their listeners are thread-safe Metal objects.
+unsafe impl Send for MainNotifier {}
+unsafe impl Sync for MainNotifier {}
+impl MainNotifier {
+    pub(crate) fn on_complete(&self, token: Token, callback: Box<dyn FnOnce() + Send>) {
+        notify(&self.event, &self.listener, token, callback);
+    }
+}
+
+fn notify(
+    event: &Object<dyn MTLSharedEvent>,
+    listener: &MTLSharedEventListener,
+    token: Token,
+    callback: Box<dyn FnOnce() + Send>,
+) {
+    let callback = Mutex::new(Some(callback));
+    let block = block2::RcBlock::new(
+        move |_: NonNull<ProtocolObject<dyn MTLSharedEvent>>, _: u64| {
+            if let Some(callback) = callback.lock().unwrap().take() {
+                callback();
+            }
+        },
+    );
+    unsafe {
+        event.notifyListener_atValue_block(listener, token.0, block2::RcBlock::as_ptr(&block));
+    }
+}

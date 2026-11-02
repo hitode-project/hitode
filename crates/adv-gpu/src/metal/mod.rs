@@ -34,7 +34,7 @@ pub(crate) use encode::{ComputePass, Encoder, RenderPass};
 pub(crate) use pipeline::{ComputePipeline, PipelineCache, RenderPipeline};
 pub(crate) use present::{Fence, PresentBuffer};
 use queue::QueryData;
-pub(crate) use queue::{QuerySet, Queue};
+pub(crate) use queue::{MainNotifier, QuerySet, Queue};
 pub(crate) use resource::{Buffer, Image, ImageView, Sampler};
 pub(crate) use ring::{Ring, Span};
 pub(crate) use shader::Shader;

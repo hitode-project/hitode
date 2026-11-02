@@ -1,6 +1,11 @@
 //! Ownership at the system compositor boundary. A successful present retains
 //! every image (including a direct base) until `drain` returns its release.
 
+#[cfg(target_vendor = "apple")]
+mod apple;
+#[cfg(target_vendor = "apple")]
+pub use apple::LayerCompositor;
+
 use crate::plan::{CompositorCaps, Layers, Tiles};
 use adv_gpu::{PresentImage, Token, queue::Fence};
 use std::time::Instant;
