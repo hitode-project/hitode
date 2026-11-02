@@ -31,8 +31,72 @@ pub(super) fn stages(stages: Stages) -> vk::ShaderStageFlags {
     }
     flags
 }
-pub(super) fn word(group: u32, slot: u32) -> u32 {
-    slot * 3 + group - 1
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct IndexWord {
+    pub(super) word: u32,
+    pub(super) shift: u32,
+    pub(super) mask: u32,
+    pub(super) offset: Option<u32>,
+}
+// Heap indices share words when they fit in 16 bits. Each storage offset
+// has its own full word; register numbers do not consume gaps.
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
+pub(super) struct PushLayout {
+    pub(super) bindings: HashMap<(u32, u32), IndexWord>,
+    pub(super) words: usize,
+}
+impl PushLayout {
+    pub(super) fn new(bindings: &[Binding], heap: &Heap, bytes: u32) -> Result<Self> {
+        let mut ordered = bindings.to_vec();
+        ordered.sort_by_key(|b| (group(b.kind), b.slot));
+        let mut layout = Self::default();
+        let mut half = None;
+        for binding in &ordered {
+            if binding.kind == BindingKind::UniformBuffer {
+                continue;
+            }
+            let kind = match binding.kind {
+                BindingKind::SampledImage { .. } => 0,
+                BindingKind::Sampler { .. } => 1,
+                BindingKind::StorageImage { .. } => 2,
+                BindingKind::StorageBuffer { .. } => 3,
+                _ => unreachable!(),
+            };
+            let packed = heap.counts[kind] <= 65536;
+            let (word, shift) = if packed && let Some(word) = half.take() {
+                (word, 16)
+            } else {
+                let word = layout.words as u32;
+                layout.words += 1;
+                if packed {
+                    half = Some(word);
+                }
+                (word, 0)
+            };
+            layout.bindings.insert(
+                (group(binding.kind), binding.slot),
+                IndexWord {
+                    word,
+                    shift,
+                    mask: if packed { 65535 } else { u32::MAX },
+                    offset: None,
+                },
+            );
+        }
+        for binding in ordered {
+            if matches!(binding.kind, BindingKind::StorageBuffer { .. }) {
+                layout.bindings.get_mut(&(3, binding.slot)).unwrap().offset =
+                    Some(layout.words as u32);
+                layout.words += 1;
+            }
+        }
+        if layout.words * 4 > bytes as usize {
+            return Err(Error::Invalid(
+                "pipeline bindings exceed push-constant capacity".into(),
+            ));
+        }
+        Ok(layout)
+    }
 }
 
 pub(super) struct Heap {
@@ -177,6 +241,10 @@ impl Heap {
             Ok(heap)
         }
     }
+    #[cfg(test)]
+    pub(super) fn used(&self, kind: usize) -> usize {
+        self.counts[kind] as usize - self.state.lock().unwrap().free[kind].len()
+    }
     pub(super) fn insert(
         &self,
         context: &Context,
@@ -302,13 +370,76 @@ pub(super) struct Bindings {
     heap_bound: bool,
     uniform_bound: HashMap<u32, (vk::DescriptorSet, u32)>,
     uniforms: HashMap<u32, (Buffer, u32, u64)>,
+    push_layout: PushLayout,
+    push: Vec<u32>,
+    push_dirty: Option<std::ops::Range<usize>>,
+    heap_values: HashMap<(u32, u32), (u32, u64)>,
+    rebuild: bool,
 }
 impl Bindings {
-    pub(super) fn pipeline(&mut self, layout: vk::PipelineLayout) {
-        if self.layout != layout {
-            self.layout = layout;
+    pub(super) fn pipeline(&mut self, pipeline: &pipeline::PipelineCore) {
+        self.rebuild = true;
+        if self.layout != pipeline.layout {
+            self.layout = pipeline.layout;
             self.changed = true;
         }
+    }
+    fn set_word(&mut self, word: usize, value: u32) {
+        if self.push[word] == value {
+            return;
+        }
+        self.push[word] = value;
+        self.push_dirty = Some(self.push_dirty.as_ref().map_or(word..word + 1, |range| {
+            range.start.min(word)..range.end.max(word + 1)
+        }));
+    }
+    fn encode(
+        &mut self,
+        pipeline: &pipeline::PipelineCore,
+        key: (u32, u32),
+        index: u32,
+        offset: u64,
+    ) -> Result<()> {
+        let Some(field) = pipeline.push.bindings.get(&key) else {
+            return Ok(());
+        };
+        let word = field.word as usize;
+        self.set_word(
+            word,
+            (self.push[word] & !(field.mask << field.shift))
+                | ((index & field.mask) << field.shift),
+        );
+        if let Some(word) = field.offset {
+            let stride = u64::from(pipeline.storage_strides.get(&key.1).copied().unwrap_or(1));
+            if !offset.is_multiple_of(stride) {
+                return Err(Error::Invalid(
+                    "storage offset is not aligned to the array stride".into(),
+                ));
+            }
+            let offset = u32::try_from(offset / stride)
+                .map_err(|_| Error::Invalid("storage offset exceeds push-constant range".into()))?;
+            self.set_word(word as usize, offset);
+        }
+        Ok(())
+    }
+    fn rebuild(&mut self, pipeline: &pipeline::PipelineCore) -> Result<()> {
+        if !self.rebuild {
+            return Ok(());
+        }
+        if self.push_layout != pipeline.push {
+            self.push_layout = pipeline.push.clone();
+            self.push = vec![0; pipeline.push.words];
+            self.push_dirty = if self.push.is_empty() {
+                None
+            } else {
+                Some(0..self.push.len())
+            };
+        }
+        for (key, (index, offset)) in self.heap_values.clone() {
+            self.encode(pipeline, key, index, offset)?;
+        }
+        self.rebuild = false;
+        Ok(())
     }
     pub(super) fn bind(
         &mut self,
@@ -320,6 +451,18 @@ impl Bindings {
     ) {
         if !encoder.ready() {
             return;
+        }
+        if encoder.shared.context.heap.is_some()
+            && let Bind::StorageBuffer(slice) = resource
+        {
+            let stride = u64::from(pipeline.storage_strides.get(&slot).copied().unwrap_or(1));
+            let alignment = u64::from(encoder.shared.context.caps.limits.storage_offset_alignment);
+            if !slice.offset.is_multiple_of(alignment) || !slice.offset.is_multiple_of(stride) {
+                encoder.error = Some(Error::Invalid(
+                    "storage offset is not aligned to the device limit and array stride".into(),
+                ));
+                return;
+            }
         }
         let (group, bound) = match resource {
             Bind::Uniform(slice) | Bind::StorageBuffer(slice) => {
@@ -403,6 +546,10 @@ impl Bindings {
         self.changed = true;
         let context = &encoder.shared.context;
         if context.heap.is_some() {
+            if let Err(error) = self.rebuild(pipeline) {
+                encoder.error = Some(error);
+                return;
+            }
             let result = match resource {
                 Bind::Uniform(slice) => {
                     self.uniforms.insert(
@@ -412,24 +559,17 @@ impl Bindings {
                     Ok(())
                 }
                 _ => {
-                    let index = match resource {
-                        Bind::Sampled(view) => Ok(view.inner.0.sampled.unwrap()),
-                        Bind::Sampler(sampler) => Ok(sampler.inner.0.index.unwrap()),
-                        Bind::StorageImage(view) => Ok(view.inner.0.storage.unwrap()),
+                    let (index, offset) = match resource {
+                        Bind::Sampled(view) => (view.inner.0.sampled.unwrap(), 0),
+                        Bind::Sampler(sampler) => (sampler.inner.0.index.unwrap(), 0),
+                        Bind::StorageImage(view) => (view.inner.0.storage.unwrap(), 0),
                         Bind::StorageBuffer(slice) => {
-                            slice.buffer.inner.heap_index(slice.offset, slice.size)
+                            (slice.buffer.inner.0.storage.unwrap(), slice.offset)
                         }
                         Bind::Uniform(_) => unreachable!(),
                     };
-                    index.map(|index| unsafe {
-                        context.device.cmd_push_constants(
-                            encoder.command,
-                            pipeline.layout,
-                            vk::ShaderStageFlags::ALL,
-                            word(group, slot) * 4,
-                            &index.to_ne_bytes(),
-                        );
-                    })
+                    self.heap_values.insert((group, slot), (index, offset));
+                    self.encode(pipeline, (group, slot), index, offset)
                 }
             };
             if let Err(error) = result {
@@ -448,6 +588,10 @@ impl Bindings {
         }
         let context = encoder.shared.context.clone();
         if let Some(heap) = &context.heap {
+            if let Err(error) = self.rebuild(pipeline) {
+                encoder.error = Some(error);
+                return false;
+            }
             if !self.heap_bound {
                 unsafe {
                     context.device.cmd_bind_descriptor_sets(
@@ -502,6 +646,26 @@ impl Bindings {
                         );
                     }
                     self.uniform_bound.insert(slot, (set, *offset));
+                }
+            }
+            if let Some(range) = self.push_dirty.take() {
+                let words = &self.push[range.clone()];
+                // SAFETY: u32 words are initialized; Vulkan copies these bytes
+                // during the command, before the CPU block can change.
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        words.as_ptr().cast::<u8>(),
+                        std::mem::size_of_val(words),
+                    )
+                };
+                unsafe {
+                    context.device.cmd_push_constants(
+                        encoder.command,
+                        pipeline.layout,
+                        vk::ShaderStageFlags::ALL,
+                        (range.start * 4) as u32,
+                        bytes,
+                    );
                 }
             }
             return true;

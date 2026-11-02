@@ -1135,7 +1135,7 @@ impl RenderPass<'_> {
                 );
             }
         }
-        self.bindings.pipeline(pipeline.core.layout);
+        self.bindings.pipeline(&pipeline.core);
         self.encoder.resources.pipelines.push(pipeline.core.clone());
         let desc = &pipeline.desc;
         let command = self.encoder.command;
@@ -1547,7 +1547,7 @@ impl ComputePass<'_> {
             );
         }
         self.encoder.resources.pipelines.push(pipeline.core.clone());
-        self.bindings.pipeline(pipeline.core.layout);
+        self.bindings.pipeline(&pipeline.core);
         self.pipeline = Some(pipeline.clone());
     }
     pub(crate) fn bind(&mut self, slot: u32, resource: Bind<'_>) {

@@ -16,7 +16,8 @@ pub(super) struct BufferCore {
     desc: BufferDesc,
     allocation: Option<Allocation>,
     pub(super) uniforms: Mutex<HashMap<u64, vk::DescriptorSet>>,
-    storage: Mutex<HashMap<(u64, u64), u32>>,
+    // One descriptor covers the whole buffer for the allocation's lifetime.
+    pub(super) storage: Option<u32>,
 }
 impl Drop for BufferCore {
     fn drop(&mut self) {
@@ -24,7 +25,7 @@ impl Drop for BufferCore {
             for (_, set) in self.uniforms.get_mut().unwrap().drain() {
                 heap.free_uniform(&self.context, set);
             }
-            for (_, index) in self.storage.get_mut().unwrap().drain() {
+            if let Some(index) = self.storage {
                 heap.free(3, index);
             }
         }
@@ -35,27 +36,6 @@ impl Drop for BufferCore {
     }
 }
 impl Buffer {
-    // A buffer binding owns its heap entry until the buffer retires. Distinct
-    // slices populate entries on first use; repeated draws reuse them.
-    pub(super) fn heap_index(&self, offset: u64, size: u64) -> Result<u32> {
-        let mut indices = self.0.storage.lock().unwrap();
-        if let Some(&index) = indices.get(&(offset, size)) {
-            return Ok(index);
-        }
-        let index = self.0.context.heap.as_ref().unwrap().insert(
-            &self.0.context,
-            3,
-            Some(
-                vk::DescriptorBufferInfo::default()
-                    .buffer(self.0.handle)
-                    .offset(offset)
-                    .range(size),
-            ),
-            None,
-        )?;
-        indices.insert((offset, size), index);
-        Ok(index)
-    }
     pub(crate) fn desc(&self) -> &BufferDesc {
         &self.0.desc
     }
@@ -456,18 +436,32 @@ impl Device {
             self.0.free(allocation);
             return Err(e);
         }
+        let mut core = BufferCore {
+            context: self.0.clone(),
+            handle,
+            desc: *desc,
+            allocation: Some(allocation),
+            uniforms: Mutex::new(HashMap::new()),
+            storage: None,
+        };
+        if desc.usage.contains(BufferUsage::STORAGE)
+            && let Some(heap) = &self.0.heap
+        {
+            core.storage = Some(
+                heap.insert(
+                    &self.0,
+                    3,
+                    Some(
+                        vk::DescriptorBufferInfo::default()
+                            .buffer(handle)
+                            .range(desc.size),
+                    ),
+                    None,
+                )?,
+            );
+        }
         Ok(crate::Buffer {
-            inner: Buffer(
-                Arc::new(BufferCore {
-                    context: self.0.clone(),
-                    handle,
-                    desc: *desc,
-                    allocation: Some(allocation),
-                    uniforms: Mutex::new(HashMap::new()),
-                    storage: Mutex::new(HashMap::new()),
-                }),
-                std::sync::OnceLock::new(),
-            ),
+            inner: Buffer(Arc::new(core), std::sync::OnceLock::new()),
         })
     }
     pub(crate) fn create_image(&self, desc: &ImageDesc) -> Result<crate::Image> {

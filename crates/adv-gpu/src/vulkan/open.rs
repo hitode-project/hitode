@@ -22,9 +22,19 @@ unsafe extern "system" fn debug_message(
 impl Device {
     pub(crate) fn open(options: &DeviceOptions) -> Result<(crate::Device, crate::Queue)> {
         // SAFETY: All creation structures and extension names live through their calls.
-        unsafe { Self::open_vk(options) }
+        unsafe { Self::open_vk(options, None) }
     }
-    unsafe fn open_vk(options: &DeviceOptions) -> Result<(crate::Device, crate::Queue)> {
+    #[cfg(test)]
+    pub(super) fn open_with_push_limit(
+        options: &DeviceOptions,
+        limit: u32,
+    ) -> Result<(crate::Device, crate::Queue)> {
+        unsafe { Self::open_vk(options, Some(limit)) }
+    }
+    unsafe fn open_vk(
+        options: &DeviceOptions,
+        push_limit: Option<u32>,
+    ) -> Result<(crate::Device, crate::Queue)> {
         // SAFETY: Handles are used with their originating instance/device. Queried feature
         // chains remain alive through device creation; only supported features are enabled.
         unsafe {
@@ -141,6 +151,9 @@ impl Device {
                 cache_prefix[16 + i * 4..20 + i * 4].copy_from_slice(&value.to_le_bytes());
             }
             let mut caps = caps;
+            if let Some(limit) = push_limit {
+                caps.limits.push_constant_bytes = caps.limits.push_constant_bytes.min(limit);
+            }
             let heap = if caps.modern.contains(Modern::BINDLESS) {
                 match binding::Heap::new(&instance, physical, &device) {
                     Ok(heap) => Some(heap),
@@ -158,17 +171,18 @@ impl Device {
                 None
             };
             if let Some(heap) = &heap {
-                let slots = caps.limits.push_constant_bytes / 4 / 3;
+                let indices = caps.limits.push_constant_bytes / 2;
                 caps.limits.max_sampled_images = caps
                     .limits
                     .max_sampled_images
-                    .min(slots)
+                    .min(indices)
                     .min(heap.counts[0]);
-                caps.limits.max_samplers = caps.limits.max_samplers.min(slots).min(heap.counts[1]);
+                caps.limits.max_samplers =
+                    caps.limits.max_samplers.min(indices).min(heap.counts[1]);
                 caps.limits.max_storage_bindings = caps
                     .limits
                     .max_storage_bindings
-                    .min(slots)
+                    .min(caps.limits.push_constant_bytes / 6)
                     .min(heap.counts[2])
                     .min(heap.counts[3]);
             }

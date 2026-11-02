@@ -866,3 +866,430 @@ fn binding_tiers_dispatch_storage_images_and_indirect_work() {
         );
     }
 }
+
+fn storage_pipeline(device: &crate::Device, source: &str) -> crate::RenderPipeline {
+    let shader = device
+        .create_shader(ShaderDesc {
+            source: Source::Wgsl(source),
+            identity: 110,
+            label: "storage addressing",
+        })
+        .unwrap();
+    device
+        .create_render_pipeline(
+            &RenderPipelineDesc {
+                vertex: shader.entry("vs", Stage::Vertex).unwrap(),
+                fragment: Some(shader.entry("fs", Stage::Fragment).unwrap()),
+                bindings: vec![Binding {
+                    slot: 0,
+                    kind: BindingKind::StorageBuffer { writable: false },
+                    stages: Stages::VERTEX,
+                }],
+                primitive: Primitive {
+                    topology: Topology::Triangles,
+                    cull: Cull::None,
+                    front_ccw: false,
+                    wireframe: false,
+                    unclipped_depth: false,
+                },
+                colors: [ColorTarget {
+                    format: Format::Rgba8Unorm,
+                    blend: None,
+                    write_mask: 15,
+                }]
+                .into_iter()
+                .collect(),
+                depth_stencil: None,
+                samples: 1,
+                alpha_to_coverage: false,
+                label: "storage addressing",
+            },
+            None,
+        )
+        .unwrap()
+}
+
+#[test]
+fn bindless_ring_offsets_keep_one_descriptor_for_ten_thousand_draws() {
+    let (device, mut queue) = gpu(Modern::empty());
+    let heap = device.inner.0.heap.as_ref().unwrap();
+    let before = heap.used(3);
+    let alignment = u64::from(device.caps().limits.storage_offset_alignment).max(16);
+    let stride = 48u64.next_multiple_of(alignment);
+    let mut ring = device.ring(9999 * stride + 48).unwrap();
+    assert_eq!(heap.used(3), before + 1);
+    let pipeline = storage_pipeline(
+        &device,
+        "
+        @group(3) @binding(0) var<storage,read> positions:array<vec4<f32>>;
+        @vertex fn vs(@builtin(vertex_index) i:u32) -> @builtin(position) vec4<f32> {
+            if arrayLength(&positions)!=3u {return vec4<f32>(2.0,2.0,0.0,1.0);}
+            return positions[i];
+        }
+        @fragment fn fs() -> @location(0) vec4<f32> {return vec4<f32>(0.0,1.0,0.0,1.0);}
+    ",
+    );
+    let size = Extent {
+        width: 4,
+        height: 4,
+        depth_or_layers: 1,
+    };
+    let image = create_image(&device, Format::Rgba8Unorm, size, 1, 1);
+    let results = readback(&device, 64);
+    let mut encoder = queue.encoder("ring offsets");
+    let mut spans = Vec::new();
+    {
+        let mut render = encoder.render_pass(&pass(
+            image.view(),
+            Rect {
+                x: 0,
+                y: 0,
+                w: 4,
+                h: 4,
+            },
+            Load::Clear([0.0; 4]),
+            Store::Store,
+            None,
+        ));
+        render.set_pipeline(&pipeline);
+        for i in 0..10000 {
+            let mut span = ring.reserve(48, alignment).unwrap();
+            let positions = if i == 9999 {
+                [
+                    -1.0f32, -1.0, 0.0, 1.0, 3.0, -1.0, 0.0, 1.0, -1.0, 3.0, 0.0, 1.0,
+                ]
+            } else {
+                [0.0; 12]
+            };
+            for (dst, value) in span
+                .bytes()
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(positions)
+            {
+                dst.copy_from_slice(&value.to_ne_bytes());
+            }
+            // The descriptor covers the buffer, so a short bound size does not
+            // replace the shader's own runtime-array bounds.
+            render.bind(
+                0,
+                Bind::StorageBuffer(span.buffer().slice(span.offset()..span.offset() + 16)),
+            );
+            render.draw(0..3, 0..1);
+            assert_eq!(heap.used(3), before + 1);
+            spans.push(span);
+        }
+    }
+    for span in spans {
+        encoder.retain(span);
+    }
+    read_image(&mut encoder, &image, 0, 0, size, &results);
+    finish(&mut queue, encoder);
+    assert_eq!(heap.used(3), before + 1);
+    for pixel in bytes(&results).as_chunks::<4>().0 {
+        assert_eq!(*pixel, [0, 255, 0, 255]);
+    }
+    drop(ring);
+    assert_eq!(heap.used(3), before);
+}
+
+#[test]
+fn bindless_sixteen_images_and_samplers_fit_128_push_constant_bytes() {
+    let (device, mut queue) = Device::open_with_push_limit(
+        &DeviceOptions {
+            software: !cfg!(target_os = "android"),
+            validation: true,
+            ..Default::default()
+        },
+        128,
+    )
+    .unwrap();
+    assert!(device.caps().modern.contains(Modern::BINDLESS));
+    assert_eq!(device.caps().limits.push_constant_bytes, 128);
+    assert!(device.caps().limits.max_sampled_images >= 16);
+    assert!(device.caps().limits.max_samplers >= 16);
+    let mut source = String::from(
+        "@vertex fn vs(@builtin(vertex_index) i:u32) -> @builtin(position) vec4<f32> {let p=vec2<f32>(f32((i<<1u)&2u),f32(i&2u));return vec4<f32>(p*2.0-1.0,0.5,1.0);}\n",
+    );
+    let mut bindings = Vec::new();
+    for slot in 0..16 {
+        source.push_str(&format!("@group(1) @binding({slot}) var image{slot}:texture_2d<f32>;\n@group(2) @binding({slot}) var sampler{slot}:sampler;\n"));
+        bindings.push(Binding {
+            slot,
+            kind: BindingKind::SampledImage {
+                dimension: Dimension::D2,
+                depth: false,
+                multisampled: false,
+            },
+            stages: Stages::FRAGMENT,
+        });
+        bindings.push(Binding {
+            slot,
+            kind: BindingKind::Sampler { comparison: false },
+            stages: Stages::FRAGMENT,
+        });
+    }
+    source.push_str("@fragment fn fs() -> @location(0) vec4<f32> {var color=vec4<f32>(0.0);\n");
+    for slot in 0..16 {
+        source.push_str(&format!("color += (textureSample(image{slot},sampler{slot},vec2<f32>(0.5))+textureSample(image{slot},sampler{slot},vec2<f32>(2.0)))*{weight}.0;\n",weight=slot+1));
+    }
+    source.push_str("return color/272.0;}");
+    let shader = device
+        .create_shader(ShaderDesc {
+            source: Source::Wgsl(&source),
+            identity: 111,
+            label: "sixteen textures",
+        })
+        .unwrap();
+    let mut desc = RenderPipelineDesc {
+        vertex: shader.entry("vs", Stage::Vertex).unwrap(),
+        fragment: Some(shader.entry("fs", Stage::Fragment).unwrap()),
+        bindings,
+        primitive: Primitive {
+            topology: Topology::Triangles,
+            cull: Cull::None,
+            front_ccw: false,
+            wireframe: false,
+            unclipped_depth: false,
+        },
+        colors: [ColorTarget {
+            format: Format::Rgba8Unorm,
+            blend: None,
+            write_mask: 15,
+        }]
+        .into_iter()
+        .collect(),
+        depth_stencil: None,
+        samples: 1,
+        alpha_to_coverage: false,
+        label: "sixteen textures",
+    };
+    let pipeline = device.create_render_pipeline(&desc, None).unwrap();
+    assert_eq!(pipeline.inner.core.push.words, 16);
+    // Sparse register numbers use the same dense budget as contiguous slots.
+    let mut sparse = desc.bindings.clone();
+    for binding in &mut sparse {
+        binding.slot += 100;
+    }
+    assert_eq!(
+        binding::PushLayout::new(&sparse, device.inner.0.heap.as_ref().unwrap(), 128)
+            .unwrap()
+            .words,
+        16
+    );
+    for slot in 16..66 {
+        desc.bindings.push(Binding {
+            slot,
+            kind: BindingKind::Sampler { comparison: false },
+            stages: Stages::FRAGMENT,
+        });
+    }
+    assert!(matches!(
+        device.create_render_pipeline(&desc, None),
+        Err(Error::Invalid(_))
+    ));
+    let compute = device
+        .create_shader(ShaderDesc {
+            source: Source::Wgsl("@compute @workgroup_size(1) fn main() {}"),
+            identity: 112,
+            label: "capacity",
+        })
+        .unwrap();
+    assert!(matches!(
+        device.create_compute_pipeline(
+            &ComputePipelineDesc {
+                entry: compute.entry("main", Stage::Compute).unwrap(),
+                bindings: desc.bindings.clone(),
+                label: "capacity"
+            },
+            None
+        ),
+        Err(Error::Invalid(_))
+    ));
+    let size = Extent {
+        width: 4,
+        height: 4,
+        depth_or_layers: 1,
+    };
+    let image = create_image(&device, Format::Rgba8Unorm, size, 1, 1);
+    let mut textures = Vec::new();
+    let mut samplers = Vec::new();
+    let mut expected = [0.0; 4];
+    let mut encoder = queue.encoder("sixteen textures");
+    for slot in 0..16 {
+        let texture = create_image(
+            &device,
+            Format::Rgba8Unorm,
+            Extent {
+                width: 1,
+                height: 1,
+                depth_or_layers: 1,
+            },
+            1,
+            1,
+        );
+        let texel = [slot * 10, 255 - slot * 10, slot * 5, 255];
+        let border = match slot % 3 {
+            0 => BorderColor::TransparentBlack,
+            1 => BorderColor::OpaqueBlack,
+            _ => BorderColor::OpaqueWhite,
+        };
+        let clamp = slot % 2 != 0;
+        let sampler = device
+            .sampler(&SamplerDesc {
+                min: Filter::Nearest,
+                mag: Filter::Nearest,
+                mip: Filter::Nearest,
+                address: [if clamp {
+                    Address::Clamp
+                } else {
+                    Address::Border
+                }; 3],
+                border,
+                lod_bias: slot as i16,
+                lod_min: 0,
+                lod_max: 0,
+                anisotropy: 1,
+                compare: None,
+            })
+            .unwrap();
+        drop(encoder.render_pass(&pass(
+            texture.view(),
+            Rect {
+                x: 0,
+                y: 0,
+                w: 1,
+                h: 1,
+            },
+            Load::Clear(texel.map(|v| f64::from(v) / 255.0)),
+            Store::Store,
+            None,
+        )));
+        let outside = if clamp {
+            texel
+        } else {
+            match border {
+                BorderColor::TransparentBlack => [0; 4],
+                BorderColor::OpaqueBlack => [0, 0, 0, 255],
+                BorderColor::OpaqueWhite => [255; 4],
+            }
+        };
+        for channel in 0..4 {
+            expected[channel] += (f64::from(texel[channel]) + f64::from(outside[channel]))
+                * f64::from(slot + 1)
+                / 272.0;
+        }
+        textures.push(texture);
+        samplers.push(sampler);
+    }
+    {
+        let mut render = encoder.render_pass(&pass(
+            image.view(),
+            Rect {
+                x: 0,
+                y: 0,
+                w: 4,
+                h: 4,
+            },
+            Load::DontCare,
+            Store::Store,
+            None,
+        ));
+        render.set_pipeline(&pipeline);
+        for slot in 0..16 {
+            render.bind(slot as u32, Bind::Sampled(textures[slot].view()));
+            render.bind(slot as u32, Bind::Sampler(&samplers[slot]));
+        }
+        render.draw(0..3, 0..1);
+        // Unchanged bindings do not require another push-constant command.
+        render.draw(0..3, 0..1);
+    }
+    let results = readback(&device, 64);
+    read_image(&mut encoder, &image, 0, 0, size, &results);
+    finish(&mut queue, encoder);
+    for pixel in bytes(&results).as_chunks::<4>().0 {
+        for channel in 0..4 {
+            assert!(
+                pixel[channel].abs_diff(expected[channel].round() as u8) <= 1,
+                "{pixel:?} != {expected:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn bindless_storage_offsets_respect_device_alignment_and_array_stride() {
+    let (device, mut queue) = gpu(Modern::empty());
+    let shader = device
+        .create_shader(ShaderDesc {
+            source: Source::Wgsl(
+                "
+        @group(3) @binding(0) var<storage,read_write> values:array<array<u32,3>>;
+        @compute @workgroup_size(1) fn main() {values[0][0]=7u;}
+    ",
+            ),
+            identity: 113,
+            label: "storage alignment",
+        })
+        .unwrap();
+    let pipeline = device
+        .create_compute_pipeline(
+            &ComputePipelineDesc {
+                entry: shader.entry("main", Stage::Compute).unwrap(),
+                bindings: vec![Binding {
+                    slot: 0,
+                    kind: BindingKind::StorageBuffer { writable: true },
+                    stages: Stages::COMPUTE,
+                }],
+                label: "storage alignment",
+            },
+            None,
+        )
+        .unwrap();
+    let alignment = u64::from(device.caps().limits.storage_offset_alignment);
+    let offset = alignment * 3;
+    let buffer = device
+        .create_buffer(&BufferDesc {
+            size: offset + 12,
+            usage: BufferUsage::STORAGE | BufferUsage::COPY_SRC,
+            memory: Memory::Upload,
+            label: "aligned storage",
+        })
+        .unwrap();
+    // SAFETY: The new buffer has no GPU users.
+    unsafe {
+        (&mut *buffer.mapped().unwrap().as_ptr()).fill(0);
+    }
+    for offset in [1, alignment] {
+        let mut encoder = queue.encoder("invalid storage offset");
+        {
+            let mut pass = encoder.compute_pass(&ComputePassDesc {
+                timestamps: None,
+                label: "alignment",
+            });
+            pass.set_pipeline(&pipeline);
+            pass.bind(0, Bind::StorageBuffer(buffer.slice(offset..offset + 1)));
+        }
+        assert!(matches!(queue.submit(encoder), Err(Error::Invalid(_))));
+    }
+    let mut encoder = queue.encoder("aligned storage offset");
+    {
+        let mut pass = encoder.compute_pass(&ComputePassDesc {
+            timestamps: None,
+            label: "alignment",
+        });
+        pass.set_pipeline(&pipeline);
+        pass.bind(0, Bind::StorageBuffer(buffer.slice(offset..offset + 1)));
+        pass.dispatch(1, 1, 1);
+    }
+    let output = readback(&device, offset + 12);
+    encoder.copy_buffer(buffer.slice(0..offset + 12), &output, 0);
+    finish(&mut queue, encoder);
+    for (i, word) in bytes(&output).as_chunks::<4>().0.iter().enumerate() {
+        assert_eq!(
+            u32::from_ne_bytes(*word),
+            if i as u64 * 4 == offset { 7 } else { 0 }
+        );
+    }
+}

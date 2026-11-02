@@ -169,6 +169,8 @@ pub(super) struct PipelineCore {
     pub(super) set_layout: vk::DescriptorSetLayout,
     pub(super) bindings: Vec<Binding>,
     pub(super) uniform_sizes: HashMap<u32, u64>,
+    pub(super) storage_strides: HashMap<u32, u32>,
+    pub(super) push: binding::PushLayout,
 }
 impl PipelineCore {
     fn new(
@@ -179,7 +181,9 @@ impl PipelineCore {
     ) -> Arc<Self> {
         bindings.sort_by_key(|b| (binding::group(b.kind), b.slot));
         let mut uniforms = HashMap::<u32, u64>::new();
+        let mut storage_strides = HashMap::new();
         for entry in entries {
+            storage_strides.extend(entry.shader.inner.storage_strides(entry.index));
             for (&slot, &size) in entry.shader.inner.uniforms(entry.index) {
                 uniforms
                     .entry(slot)
@@ -187,12 +191,20 @@ impl PipelineCore {
                     .or_insert(size);
             }
         }
+        let push = if let Some(heap) = &context.heap {
+            binding::PushLayout::new(&bindings, heap, context.caps.limits.push_constant_bytes)
+                .unwrap()
+        } else {
+            binding::PushLayout::default()
+        };
         Arc::new(Self {
             handle: compiled.handle,
             layout: compiled.layout,
             set_layout: compiled.set_layout,
             bindings,
             uniform_sizes: uniforms,
+            storage_strides,
+            push,
             _context: context,
             _compiled: compiled,
         })
@@ -203,6 +215,7 @@ fn layouts(
     bindings: &[Binding],
 ) -> Result<(vk::PipelineLayout, vk::DescriptorSetLayout)> {
     let (sets, own) = if let Some(heap) = &context.heap {
+        binding::PushLayout::new(bindings, heap, context.caps.limits.push_constant_bytes)?;
         let count = bindings
             .iter()
             .filter(|b| b.kind == BindingKind::UniformBuffer)
@@ -329,10 +342,22 @@ impl Device {
     ) -> Result<vk::Pipeline> {
         let context = &self.0;
         let modern = self.caps().modern;
-        let stages: Vec<_> = std::iter::once(&desc.vertex)
+        let push = context
+            .heap
+            .as_ref()
+            .map(|heap| {
+                binding::PushLayout::new(
+                    &desc.bindings,
+                    heap,
+                    context.caps.limits.push_constant_bytes,
+                )
+            })
+            .transpose()?;
+        let modules = std::iter::once(&desc.vertex)
             .chain(desc.fragment.as_ref())
-            .map(|e| e.shader.inner.stage(e))
-            .collect();
+            .map(|e| e.shader.inner.stage(e, push.as_ref()))
+            .collect::<Result<Vec<_>>>()?;
+        let stages: Vec<_> = modules.iter().map(|m| m.info()).collect();
         let vertex = vk::PipelineVertexInputStateCreateInfo::default();
         let assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
             .topology(topology(desc.primitive.topology));
@@ -492,9 +517,22 @@ impl Device {
         let compiled = if let Some(compiled) = pipelines.compute.get(&key) {
             compiled.clone()
         } else {
+            let push = self
+                .0
+                .heap
+                .as_ref()
+                .map(|heap| {
+                    binding::PushLayout::new(
+                        &desc.bindings,
+                        heap,
+                        self.0.caps.limits.push_constant_bytes,
+                    )
+                })
+                .transpose()?;
+            let module = desc.entry.shader.inner.stage(&desc.entry, push.as_ref())?;
             let (layout, set_layout) = layouts(&self.0, &key.1)?;
             let info = vk::ComputePipelineCreateInfo::default()
-                .stage(desc.entry.shader.inner.stage(&desc.entry))
+                .stage(module.info())
                 .layout(layout);
             let handle =
                 match unsafe { self.0.device.create_compute_pipelines(cache, &[info], None) } {
