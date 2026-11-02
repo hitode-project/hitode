@@ -26,6 +26,10 @@ RULES: dict[str, set[str]] = {
     "adv-abi": {"adv-machine", "adv-pe", "adv-abi-macros"},
     "adv-abi-macros": set(),
     "adv-os": {"adv-abi", "adv-pe"},
+    # The only Vulkan and Metal user (issue #103).
+    "adv-gpu": set(),
+    # Planner, display stages, pools and compositors over adv-gpu (issue #103).
+    "adv-display": {"adv-gpu"},
     "adv-device": {"adv-sync"},
     "adv-dx": {"adv-abi", "adv-device"},
     # Wine's server, run in process for the Wine userland stack (issue #58).
