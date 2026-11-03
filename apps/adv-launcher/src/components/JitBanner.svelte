@@ -2,12 +2,18 @@
   import { t } from "../lib/i18n.svelte";
   import { jit } from "../lib/jit.svelte";
   import { nav } from "../lib/nav.svelte";
+  import { prefs, savePrefs } from "../lib/prefs.svelte";
 
   const status = $derived(jit.status);
+
+  function dismiss(): void {
+    prefs.hideJitWarnings = true;
+    savePrefs();
+  }
 </script>
 
 <!-- iOS library: show JIT readiness and signing restrictions. -->
-{#if jit.active && status && !status.ready}
+{#if jit.active && status && !status.ready && !prefs.hideJitWarnings}
   <div class="banner" role="status">
     {#if jit.signingUnsupported}
       <span class="text"><b>{t("当前签名不支持 JIT")}</b><span>{jit.note}</span></span>
@@ -18,14 +24,19 @@
         <b>{t("强烈建议启用 JIT")}</b>
         <span>{status.error || jit.requestError ? jit.note : t("未启用时游戏以解释模式运行，速度会慢很多。")}</span>
       </span>
-      {#if status.liveContainer}
-        <button class="act" onclick={() => jit.stikDebug()}>{t("用 StikDebug 启用")}</button>
-      {:else if status.pairingFile}
-        <button class="act" onclick={() => jit.enable()}>{status.error ? t("重试") : t("启用")}</button>
-      {:else}
-        <button class="act" onclick={() => nav.go({ name: "settings" })}>{t("设置方法")}</button>
-      {/if}
     {/if}
+    <div class="actions">
+      {#if !jit.signingUnsupported && !jit.busy}
+        {#if status.liveContainer}
+          <button class="act" onclick={() => jit.stikDebug()}>{t("用 StikDebug 启用")}</button>
+        {:else if status.pairingFile}
+          <button class="act" onclick={() => jit.enable()}>{status.error ? t("重试") : t("启用")}</button>
+        {:else}
+          <button class="act" onclick={() => nav.go({ name: "settings" })}>{t("设置方法")}</button>
+        {/if}
+      {/if}
+      <button class="dismiss" onclick={dismiss}>{t("不再提醒")}</button>
+    </div>
   </div>
 {/if}
 
@@ -64,5 +75,19 @@
     background: var(--accent);
     color: #fff;
     font-size: 13px;
+  }
+  .actions {
+    flex: 0 0 auto;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .dismiss {
+    min-height: 32px;
+    padding: 4px 0;
+    border: none;
+    background: none;
+    color: var(--fg2);
+    font-size: 12px;
   }
 </style>
