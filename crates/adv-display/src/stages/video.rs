@@ -409,6 +409,10 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    #[cfg_attr(
+        target_os = "android",
+        ignore = "Android samples converted external-format pools, which tests/video.rs covers"
+    )]
     // spec: HOST-VIEW-3
     fn video_draw_matches_cpu_reference() {
         let (device, mut queue) = Device::open(&DeviceOptions {
