@@ -69,8 +69,16 @@ pub(crate) struct Pass {
 /// A clear opens a new pass, and becomes the pass's load when it covers the
 /// pass area; a clear smaller than the operations after it stays a pass of
 /// its own, because loads act on the whole render area.
+#[cfg(test)]
 pub(crate) fn plan(ops: &[Op], has_depth: bool, next: NextDepth) -> Vec<Pass> {
-    let mut passes: Vec<Pass> = Vec::new();
+    let mut passes = Vec::new();
+    plan_into(ops, has_depth, next, &mut passes);
+    passes
+}
+
+/// Reuse the owner's planning storage across runs.
+pub(super) fn plan_into(ops: &[Op], has_depth: bool, next: NextDepth, passes: &mut Vec<Pass>) {
+    passes.clear();
     let mut start = 0;
     while start < ops.len() {
         // A pass runs to the next clear; a leading clear is kept alone when
@@ -89,14 +97,13 @@ pub(crate) fn plan(ops: &[Op], has_depth: bool, next: NextDepth) -> Vec<Pass> {
         start = end;
     }
     if has_depth {
-        settle_depth(ops, &mut passes, next);
+        settle_depth(ops, passes, next);
     } else {
-        for pass in &mut passes {
+        for pass in passes {
             pass.depth = (Load::None, Store::None);
             pass.stencil = (Load::None, Store::None);
         }
     }
-    passes
 }
 
 fn pass(ops: &[Op], range: std::ops::Range<usize>) -> Pass {

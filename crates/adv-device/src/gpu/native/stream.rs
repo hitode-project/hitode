@@ -45,6 +45,7 @@ pub(crate) struct Draw {
     pub bindings: std::ops::Range<u32>,
     pub index: Option<(Binding, IndexFormat)>,
     pub vertices: std::ops::Range<u32>,
+    pub instances: std::ops::Range<u32>,
     pub base_vertex: i32,
     /// x, y, width, height, min depth, max depth.
     pub viewport: [f32; 6],

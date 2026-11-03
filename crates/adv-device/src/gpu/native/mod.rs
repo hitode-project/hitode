@@ -11,7 +11,7 @@
 //!   GPU operation becomes a [`stream::Command`]. It never encodes, submits or
 //!   waits for the GPU, except a readback the guest waits for.
 //! - The GPU owner thread ([`owner`]) owns the `adv_gpu::Queue`. It turns
-//!   command chunks into passes ([`pass::plan`]), encodes and submits them,
+//!   command chunks into passes ([`pass`]), encodes and submits them,
 //!   and hands each presented frame to the display layer on the same thread,
 //!   so one thread makes every submission.
 //!
@@ -94,25 +94,6 @@ impl Gpu {
             clip: None,
             stats: Stats::default(),
             owner,
-            recording,
-        })
-    }
-    /// A second executor on the same device and owner thread, for another
-    /// guest device.
-    pub fn fork(&self) -> Result<Self, Error> {
-        self.check()?;
-        let (mut stream, commands) =
-            stream::channel(self.device.ring(64 << 20).map_err(record::gpu_error)?);
-        let mut recording = record::Recording::new(&self.device, &mut stream)?;
-        recording.readback_limit = self.recording.readback_limit;
-        self.owner.attach(commands)?;
-        Ok(Self {
-            device: self.device.clone(),
-            stream,
-            pipelines: Default::default(),
-            clip: None,
-            stats: Stats::default(),
-            owner: self.owner.clone(),
             recording,
         })
     }

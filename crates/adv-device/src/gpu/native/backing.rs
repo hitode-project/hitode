@@ -186,26 +186,26 @@ impl SwapBacking {
                 w: swap.size.0,
                 h: swap.size.1,
             };
-            if changed || age.is_none_or(|age| age as usize > self.history.len() + 1) {
-                repair(encoder, raw(previous), image, whole);
+            let damage = if changed || age.is_none_or(|age| age as usize > self.history.len() + 1) {
+                Damage::Whole
             } else {
-                for damage in self
+                let mut damage = Damage::None;
+                for old in self
                     .history
                     .iter()
                     .rev()
                     .take(age.unwrap().saturating_sub(1) as usize)
                 {
-                    match damage {
-                        Damage::None => {}
-                        Damage::Whole => {
-                            repair(encoder, raw(previous), image, whole);
-                            break;
-                        }
-                        Damage::Rects(rects) => {
-                            for &rect in rects {
-                                repair(encoder, raw(previous), image, rect);
-                            }
-                        }
+                    merge_damage(&mut damage, old);
+                }
+                damage
+            };
+            match damage {
+                Damage::None => {}
+                Damage::Whole => repair(encoder, raw(previous), image, whole),
+                Damage::Rects(rects) => {
+                    for rect in rects {
+                        repair(encoder, raw(previous), image, rect);
                     }
                 }
             }
@@ -214,7 +214,7 @@ impl SwapBacking {
         Ok(self.current_image().clone())
     }
 
-    fn current_image(&self) -> &adv_gpu::Image {
+    pub(super) fn current_image(&self) -> &adv_gpu::Image {
         raw(self.current.as_ref().unwrap())
     }
 
@@ -353,5 +353,125 @@ pub(super) fn swap_format() -> Format {
         Format::Rgba8Unorm
     } else {
         Format::Bgra8Unorm
+    }
+}
+
+/// Keep repair regions disjoint, coalescing intersecting bounds and reducing
+/// overflow to one bounding rectangle as GFX-REC-4 does.
+fn merge_damage(damage: &mut Damage, new: &Damage) {
+    match new {
+        Damage::None => {}
+        Damage::Whole => *damage = Damage::Whole,
+        Damage::Rects(rects) => {
+            for &rect in rects {
+                if matches!(damage, Damage::Whole) {
+                    return;
+                }
+                if matches!(damage, Damage::None) {
+                    *damage = Damage::Rects(Default::default());
+                }
+                let Damage::Rects(out) = damage else {
+                    unreachable!()
+                };
+                let mut rect = rect;
+                let mut i = 0;
+                while i < out.len() {
+                    let other = out[i];
+                    if rect.x <= other.x + other.w
+                        && other.x <= rect.x + rect.w
+                        && rect.y <= other.y + other.h
+                        && other.y <= rect.y + rect.h
+                    {
+                        rect = bounds(rect, out.swap_remove(i));
+                        i = 0;
+                    } else {
+                        i += 1;
+                    }
+                }
+                if out.is_full() {
+                    rect = out.iter().copied().fold(rect, bounds);
+                    out.clear();
+                }
+                out.push(rect);
+            }
+        }
+    }
+}
+fn bounds(a: Rect, b: Rect) -> Rect {
+    let x = a.x.min(b.x);
+    let y = a.y.min(b.y);
+    Rect {
+        x,
+        y,
+        w: (a.x + a.w).max(b.x + b.w) - x,
+        h: (a.y + a.h).max(b.y + b.h) - y,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rect(x: u32, y: u32, w: u32, h: u32) -> Rect {
+        Rect { x, y, w, h }
+    }
+    fn damage(rects: &[Rect]) -> Damage {
+        Damage::Rects(rects.iter().copied().collect())
+    }
+    fn check_once(damage: &Damage, required: &[Rect]) {
+        let Damage::Rects(rects) = damage else {
+            panic!("rectangle repair");
+        };
+        for y in 0..16 {
+            for x in 0..16 {
+                let inside = |r: &Rect| x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h;
+                let copies = rects.iter().filter(|r| inside(r)).count();
+                assert!(copies <= 1, "repair copied ({x}, {y}) more than once");
+                if required.iter().any(inside) {
+                    assert_eq!(copies, 1, "missing repair at ({x}, {y})");
+                }
+            }
+        }
+    }
+    // spec: GFX-REC-4, GFX-REC-5
+    #[test]
+    fn repair_merges_overlap_across_frames_and_preserves_disjoint_regions() {
+        let required = [
+            rect(0, 0, 3, 3),
+            rect(2, 2, 3, 3),
+            rect(10, 10, 1, 1),
+            rect(4, 0, 2, 3),
+        ];
+        let mut merged = Damage::None;
+        for r in required {
+            merge_damage(&mut merged, &damage(&[r]));
+        }
+        check_once(&merged, &required);
+        let Damage::Rects(rects) = &merged else {
+            unreachable!()
+        };
+        assert_eq!(rects.len(), 2);
+        assert!(rects.contains(&rect(0, 0, 6, 5)));
+        assert!(rects.contains(&rect(10, 10, 1, 1)));
+    }
+    // spec: GFX-REC-4, GFX-REC-5
+    #[test]
+    fn repair_overflow_bounds_every_region_and_whole_supersedes_rectangles() {
+        let required = [
+            rect(0, 0, 1, 1),
+            rect(2, 2, 1, 1),
+            rect(4, 4, 1, 1),
+            rect(6, 6, 1, 1),
+            rect(8, 8, 1, 1),
+        ];
+        let mut merged = Damage::None;
+        for r in required {
+            merge_damage(&mut merged, &damage(&[r]));
+        }
+        assert_eq!(merged, damage(&[rect(0, 0, 9, 9)]));
+        check_once(&merged, &required);
+        merge_damage(&mut merged, &Damage::Whole);
+        merge_damage(&mut merged, &damage(&[rect(10, 10, 1, 1)]));
+        assert_eq!(merged, Damage::Whole);
     }
 }

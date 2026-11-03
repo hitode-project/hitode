@@ -1,120 +1,54 @@
-//! Package C2: the GPU owner thread. It drains command chunks, groups the
-//! commands between `Target`s into passes with [`super::pass::plan`] once the
-//! next target or a submission boundary is known, encodes them into one
-//! encoder per submission, retains each chunk's ring spans with that encoder,
-//! submits at `Present`, `Readback` and `Submit`, and hands frames to the
-//! [`crate::frame::Presenter`] on this thread.
-
-use super::stream::Consumer;
-use crate::frame::Presenter;
-
-#[cfg(test)]
-pub(super) fn run(queue: adv_gpu::Queue, commands: Consumer, presenter: Box<dyn Presenter>) {
-    high_priority().expect("GPU owner QoS");
-    let (sender, receiver) = mpsc::channel();
-    let owner = Owner {
-        thread: Arc::new(OwnerThread {
-            sender: Some(sender),
-            join: None,
-        }),
-        failure: Arc::new(OnceLock::new()),
-    };
-    owner.attach(commands).expect("GPU stream thread");
-    drop(owner);
-    encode(queue, receiver, presenter).expect("GPU owner");
-}
+//! The GPU owner drains one stream, plans closed runs and encodes their
+//! original chunks. Run storage and chunks are reused after warm-up; spans
+//! stay with the encoder until its submission completes.
 
 use super::resources::Storage;
-use super::stream::{Binding, Bytes, Chunk, Command, Draw};
-use super::{Depth, Image, backing, pass};
-use crate::frame::{Base, Frame, SwapImage};
+use super::stream::{Binding, Bytes, Chunk, Command, Consumer, Draw};
+use super::{Depth, Image, Target, backing, pass};
+use crate::frame::{Base, Frame, Presenter, SwapImage, VideoPlane};
 use adv_gpu::encode::{Bind, BufferCopy, ColorAttachment, DepthAttachment, ImageCopy};
 use adv_gpu::resource::BufferSlice;
-use adv_gpu::{Buffer, Encoder, Extent, Queue, Rect, RenderPassDesc, Token};
-use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, OnceLock, mpsc};
+use adv_gpu::{Encoder, Extent, Queue, Rect, RenderPassDesc, Span, Token};
+use std::collections::VecDeque;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
-enum Work {
-    Chunk(Arc<Consumer>, Chunk),
-    Closed(Arc<Consumer>),
-}
-
-/// All streams forward complete chunks to this single queue owner. Relays
-/// sleep in Consumer::next; neither a recording draw nor an idle GPU polls.
-#[derive(Clone)]
 pub(super) struct Owner {
-    thread: Arc<OwnerThread>,
+    join: Option<std::thread::JoinHandle<()>>,
     pub failure: Arc<OnceLock<String>>,
 }
-struct OwnerThread {
-    sender: Option<mpsc::Sender<Work>>,
-    join: Option<std::thread::JoinHandle<()>>,
-}
-impl Drop for OwnerThread {
-    fn drop(&mut self) {
-        // Gpu drops its producer first. Closing the final registration
-        // sender lets all relays drain before the queue owner shuts down.
-        self.sender.take();
-        if let Some(join) = self.join.take() {
-            join.join().expect("GPU owner panicked");
-        }
-    }
-}
-
 impl Owner {
     pub fn start(
         queue: Queue,
         commands: Consumer,
         presenter: Box<dyn Presenter>,
     ) -> Result<Self, super::super::Error> {
-        let (sender, receiver) = mpsc::channel();
         let failure = Arc::new(OnceLock::new());
         let owner_failure = failure.clone();
         let join = std::thread::Builder::new()
             .name("GPU owner".into())
             .spawn(move || {
-                if let Err(error) =
-                    high_priority().and_then(|()| encode(queue, receiver, presenter))
-                {
+                if let Err(error) = run(queue, commands, presenter) {
                     let _ = owner_failure.set(error.to_string());
                 }
             })
             .map_err(|error| super::super::Error::Unavailable(error.to_string()))?;
-        let owner = Self {
-            thread: Arc::new(OwnerThread {
-                sender: Some(sender),
-                join: Some(join),
-            }),
+        Ok(Self {
+            join: Some(join),
             failure,
-        };
-        owner.attach(commands)?;
-        Ok(owner)
-    }
-
-    pub fn attach(&self, commands: Consumer) -> Result<(), super::super::Error> {
-        let sender = self.thread.sender.as_ref().unwrap().clone();
-        let commands = Arc::new(commands);
-        std::thread::Builder::new()
-            .name("GPU stream".into())
-            .spawn(move || {
-                while let Some(chunk) = commands.next() {
-                    if sender.send(Work::Chunk(commands.clone(), chunk)).is_err() {
-                        break;
-                    }
-                    while let Some(chunk) = commands.try_next() {
-                        if sender.send(Work::Chunk(commands.clone(), chunk)).is_err() {
-                            return;
-                        }
-                    }
-                }
-                let _ = sender.send(Work::Closed(commands));
-            })
-            .map_err(|error| super::super::Error::Unavailable(error.to_string()))?;
-        Ok(())
+        })
     }
 }
-
+impl Drop for Owner {
+    fn drop(&mut self) {
+        // Gpu drops its producer before joining the queue owner.
+        self.join
+            .take()
+            .unwrap()
+            .join()
+            .expect("GPU owner panicked");
+    }
+}
 fn high_priority() -> adv_gpu::Result<()> {
     #[cfg(target_vendor = "apple")]
     unsafe {
@@ -131,67 +65,26 @@ fn high_priority() -> adv_gpu::Result<()> {
     Ok(())
 }
 
+#[derive(Default)]
+struct Run {
+    ops: Vec<pass::Op>,
+    /// Each summary points straight into a retained chunk's commands.
+    locations: Vec<(usize, usize)>,
+    passes: Vec<pass::Pass>,
+}
 struct State {
     queue: Queue,
     encoder: Option<Encoder>,
     presenter: Box<dyn Presenter>,
-    targets: HashMap<usize, (Image, Option<Depth>)>,
-    depths: HashMap<usize, Vec<Depth>>,
-    pending: Option<Run>,
-    participants: Vec<Arc<Consumer>>,
+    target: Option<Target>,
+    depths: Vec<Depth>,
+    run: Run,
+    chunks: VecDeque<Chunk>,
+    cursor: (usize, usize),
+    completed: Token,
+    video: Arc<[VideoPlane]>,
     #[cfg(test)]
     passes: Vec<PassRecord>,
-}
-
-struct Run {
-    stream: usize,
-    color: Image,
-    depth: Option<Depth>,
-    ops: Vec<pass::Op>,
-    draws: Vec<Option<RecordedDraw>>,
-}
-struct RecordedDraw {
-    pipeline: adv_gpu::RenderPipeline,
-    vertices: std::ops::Range<u32>,
-    base_vertex: i32,
-    viewport: [f32; 6],
-    scissor: Rect,
-    stencil_reference: u32,
-    blend_constant: [f32; 4],
-    bindings: Vec<(u32, Resource)>,
-    index: Option<(Resource, adv_gpu::encode::IndexFormat)>,
-}
-enum Resource {
-    Uniform(Buffer, std::ops::Range<u64>),
-    Storage(Buffer, std::ops::Range<u64>),
-    Sampled(Image),
-    Sampler(adv_gpu::Sampler),
-}
-impl Resource {
-    fn capture(binding: &Binding, spans: &[(Buffer, u64)]) -> Self {
-        match binding {
-            Binding::Uniform(bytes) | Binding::Storage(bytes) => {
-                let s = slice(*bytes, spans);
-                let range = s.offset..s.offset + s.size;
-                if matches!(binding, Binding::Uniform(_)) {
-                    Self::Uniform(s.buffer.clone(), range)
-                } else {
-                    Self::Storage(s.buffer.clone(), range)
-                }
-            }
-            Binding::Buffer(buffer, range) => Self::Storage(buffer.clone(), range.clone()),
-            Binding::Sampled(image) => Self::Sampled(image.clone()),
-            Binding::Sampler(sampler) => Self::Sampler(sampler.clone()),
-        }
-    }
-    fn buffer(&self) -> BufferSlice<'_> {
-        match self {
-            Self::Uniform(buffer, range) | Self::Storage(buffer, range) => {
-                buffer.slice(range.clone())
-            }
-            _ => unreachable!("buffer binding"),
-        }
-    }
 }
 #[cfg(test)]
 struct PassRecord {
@@ -202,58 +95,41 @@ struct PassRecord {
     transient: bool,
 }
 
-fn encode(
+pub(super) fn run(
     queue: Queue,
-    receiver: mpsc::Receiver<Work>,
+    commands: Consumer,
     presenter: Box<dyn Presenter>,
 ) -> adv_gpu::Result<()> {
+    high_priority()?;
     let mut state = State::new(queue, presenter);
-    let mut ready = VecDeque::new();
-    while let Ok(work) = receiver.recv() {
-        ready.push_back(work);
-        ready.extend(receiver.try_iter());
-        while let Some(work) = ready.pop_front() {
-            match work {
-                Work::Chunk(consumer, mut chunk) => {
-                    let stream = Arc::as_ptr(&consumer) as usize;
-                    #[cfg(target_vendor = "apple")]
-                    objc2::rc::autoreleasepool(|_| {
-                        state.chunk(stream, &mut chunk, &ready, &consumer)
-                    })?;
-                    #[cfg(not(target_vendor = "apple"))]
-                    state.chunk(stream, &mut chunk, &ready, &consumer)?;
-                    consumer.recycle(chunk);
-                }
-                Work::Closed(consumer) => {
-                    state.close(pass::NextDepth::Keep)?;
-                    if state.encoder.is_some() {
-                        state.submit(&consumer, None)?;
-                    }
-                    let stream = Arc::as_ptr(&consumer) as usize;
-                    state.targets.remove(&stream);
-                    state.depths.remove(&stream);
-                }
-            }
-        }
-        state.queue.poll()?;
+    while let Some(chunk) = commands.next() {
+        state.chunks.push_back(chunk);
+        #[cfg(target_vendor = "apple")]
+        objc2::rc::autoreleasepool(|_| state.drain(&commands))?;
+        #[cfg(not(target_vendor = "apple"))]
+        state.drain(&commands)?;
     }
     state.close(pass::NextDepth::Keep)?;
-    if let Some(encoder) = state.encoder.take() {
-        state.queue.submit(encoder)?;
+    state.recycle(state.cursor.0, &commands);
+    if state.encoder.is_some() {
+        state.submit(None)?;
     }
+    state.poll(&commands)?;
     Ok(())
 }
-
 impl State {
     fn new(queue: Queue, presenter: Box<dyn Presenter>) -> Self {
         Self {
             queue,
             encoder: None,
             presenter,
-            targets: HashMap::new(),
-            depths: HashMap::new(),
-            pending: None,
-            participants: Vec::new(),
+            target: None,
+            depths: Vec::new(),
+            run: Run::default(),
+            chunks: VecDeque::new(),
+            cursor: (0, 0),
+            completed: Token(0),
+            video: Arc::from([]),
             #[cfg(test)]
             passes: Vec::new(),
         }
@@ -274,63 +150,76 @@ impl State {
             self.encoder.as_mut().unwrap(),
         )
     }
-    fn close(&mut self, next: pass::NextDepth) -> adv_gpu::Result<()> {
-        if let Some(run) = self.pending.take() {
-            let plans = pass::plan(&run.ops, run.depth.is_some(), next);
-            self.render(run, &plans)?;
+    fn poll(&mut self, consumer: &Consumer) -> adv_gpu::Result<()> {
+        let completed = self.queue.poll()?;
+        if completed > self.completed {
+            self.completed = completed;
+            consumer.retired();
         }
         Ok(())
     }
-    fn chunk(
-        &mut self,
-        stream: usize,
-        chunk: &mut Chunk,
-        ready: &VecDeque<Work>,
-        consumer: &Arc<Consumer>,
-    ) -> adv_gpu::Result<()> {
-        if self
-            .pending
-            .as_ref()
-            .is_some_and(|run| run.stream != stream)
-        {
-            self.close(pass::NextDepth::Keep)?;
+    fn close(&mut self, next: pass::NextDepth) -> adv_gpu::Result<()> {
+        if self.run.ops.is_empty() {
+            return Ok(());
         }
-        if !self
-            .participants
-            .iter()
-            .any(|other| Arc::ptr_eq(other, consumer))
-        {
-            self.participants.push(consumer.clone());
+        let mut run = std::mem::take(&mut self.run);
+        pass::plan_into(
+            &run.ops,
+            self.target.as_ref().unwrap().depth.is_some(),
+            next,
+            &mut run.passes,
+        );
+        let result = self.render(&run);
+        run.ops.clear();
+        run.locations.clear();
+        run.passes.clear();
+        self.run = run;
+        result
+    }
+    fn retain(&mut self, chunk: usize) {
+        if !self.chunks[chunk].spans.is_empty() {
+            self.encoder();
+            for span in self.chunks[chunk].spans.drain(..) {
+                self.encoder.as_mut().unwrap().retain(span);
+            }
         }
-        let spans: Vec<_> = chunk
-            .spans
-            .iter()
-            .map(|span| (span.buffer().clone(), span.offset()))
-            .collect();
-        for span in chunk.spans.drain(..) {
-            self.encoder().retain(span);
+    }
+    fn recycle(&mut self, count: usize, consumer: &Consumer) {
+        debug_assert!(self.run.ops.is_empty());
+        for _ in 0..count {
+            self.retain(0);
+            consumer.recycle(self.chunks.pop_front().unwrap());
         }
-        for at in 0..chunk.commands.len() {
-            let op = match &chunk.commands[at] {
+        self.cursor.0 -= count;
+    }
+    fn drain(&mut self, consumer: &Consumer) -> adv_gpu::Result<()> {
+        while self.cursor.0 < self.chunks.len() {
+            let (chunk, at) = self.cursor;
+            if at == self.chunks[chunk].commands.len() {
+                self.cursor = (chunk + 1, 0);
+                if self.run.ops.is_empty() {
+                    self.recycle(self.cursor.0, consumer);
+                }
+                continue;
+            }
+            let current = &self.chunks[chunk];
+            let op = match &current.commands[at] {
                 Command::Clear {
                     area,
                     color,
                     depth,
                     stencil,
-                } => Some((
-                    pass::Op {
-                        area: *area,
-                        kind: pass::OpKind::Clear {
-                            color: *color,
-                            depth: *depth,
-                            stencil: *stencil,
-                        },
+                } => Some(pass::Op {
+                    area: *area,
+                    kind: pass::OpKind::Clear {
+                        color: *color,
+                        depth: *depth,
+                        stencil: *stencil,
                     },
-                    None,
-                )),
+                }),
                 Command::Draw(n) => {
-                    let d = &chunk.draws[*n as usize];
-                    let op = pass::Op {
+                    let d = &current.draws[*n as usize];
+                    Some(pass::Op {
                         area: d.area,
                         kind: pass::OpKind::Draw {
                             writes_color: d.writes_color,
@@ -338,92 +227,58 @@ impl State {
                             writes_depth: d.writes_depth,
                             opaque: d.opaque,
                         },
-                    };
-                    let bindings = chunk.bindings
-                        [d.bindings.start as usize..d.bindings.end as usize]
-                        .iter()
-                        .map(|(slot, b)| (*slot, Resource::capture(b, &spans)))
-                        .collect();
-                    let index = d
-                        .index
-                        .as_ref()
-                        .map(|(b, f)| (Resource::capture(b, &spans), *f));
-                    Some((
-                        op,
-                        Some(RecordedDraw {
-                            pipeline: d.pipeline.clone(),
-                            vertices: d.vertices.clone(),
-                            base_vertex: d.base_vertex,
-                            viewport: d.viewport,
-                            scissor: d.scissor,
-                            stencil_reference: d.stencil_reference,
-                            blend_constant: d.blend_constant,
-                            bindings,
-                            index,
-                        }),
-                    ))
+                    })
                 }
                 _ => None,
             };
-            if let Some((op, draw)) = op {
-                let run = self.pending.get_or_insert_with(|| {
-                    let (color, depth) = self.targets[&stream].clone();
-                    Run {
-                        stream,
-                        color,
-                        depth,
-                        ops: Vec::new(),
-                        draws: Vec::new(),
-                    }
-                });
-                run.ops.push(op);
-                run.draws.push(draw);
+            if let Some(op) = op {
+                self.run.ops.push(op);
+                self.run.locations.push(self.cursor);
+                self.cursor.1 += 1;
                 continue;
             }
-            let next = self.pending.as_ref().map_or(pass::NextDepth::Keep, |run| {
-                next_depth(
-                    run.depth.as_ref(),
-                    chunk.commands[at..]
+            if !self.run.ops.is_empty() {
+                while let Some(chunk) = consumer.try_next() {
+                    self.chunks.push_back(chunk);
+                }
+                let next = next_depth(
+                    self.target.as_ref().unwrap().depth.as_ref(),
+                    self.chunks
                         .iter()
-                        .map(|c| (c, chunk.draws.as_slice()))
-                        .chain(
-                            ready
+                        .skip(chunk)
+                        .enumerate()
+                        .flat_map(|(n, c)| {
+                            c.commands
                                 .iter()
-                                .filter_map(|work| match work {
-                                    Work::Chunk(consumer, chunk)
-                                        if Arc::as_ptr(consumer) as usize == stream =>
-                                    {
-                                        Some(chunk)
-                                    }
-                                    _ => None,
-                                })
-                                .flat_map(|c| {
-                                    c.commands
-                                        .iter()
-                                        .map(|command| (command, c.draws.as_slice()))
-                                }),
-                        ),
-                )
-            });
-            self.close(next)?;
-            let command = std::mem::replace(&mut chunk.commands[at], Command::Submit);
-            if let Command::Target { color, depth } = command {
-                self.targets.insert(stream, (color, depth));
-            } else {
-                self.command(stream, command, &spans, consumer)?;
+                                .skip(if n == 0 { at } else { 0 })
+                                .map(|command| (command, c.draws.as_slice()))
+                        }),
+                );
+                self.close(next)?;
+                self.recycle(chunk, consumer);
             }
+            let (chunk, at) = self.cursor;
+            let command = std::mem::replace(&mut self.chunks[chunk].commands[at], Command::Submit);
+            if matches!(
+                command,
+                Command::Present { .. } | Command::Readback { .. } | Command::Submit
+            ) {
+                debug_assert_eq!(at + 1, self.chunks[chunk].commands.len());
+                self.retain(chunk);
+            }
+            self.command(command, chunk)?;
+            self.cursor.1 += 1;
         }
-        Ok(())
+        self.poll(consumer)
     }
-
-    fn command(
-        &mut self,
-        stream: usize,
-        command: Command,
-        spans: &[(Buffer, u64)],
-        consumer: &Arc<Consumer>,
-    ) -> adv_gpu::Result<()> {
+    fn command(&mut self, command: Command, chunk: usize) -> adv_gpu::Result<()> {
         match command {
+            Command::Target { color, depth } => {
+                self.target = Some(Target {
+                    image: color,
+                    depth,
+                })
+            }
             Command::Upload {
                 bytes,
                 pitch,
@@ -432,8 +287,8 @@ impl State {
                 rect,
             } => {
                 let (image, _, _) = self.image(&image)?;
-                let source = slice(bytes, spans);
-                self.encoder().copy_buffer_to_image(
+                let source = slice(bytes, &self.chunks[chunk].spans);
+                self.encoder.as_mut().unwrap().copy_buffer_to_image(
                     BufferCopy {
                         buffer: source.buffer,
                         offset: source.offset,
@@ -496,11 +351,11 @@ impl State {
                     },
                     extent(rect),
                 );
-                let token = self.submit(consumer, None)?;
+                let token = self.submit(None)?;
                 self.queue.on_complete(token, done);
             }
             Command::Submit => {
-                self.submit(consumer, None)?;
+                self.submit(None)?;
             }
             Command::Present {
                 image,
@@ -516,7 +371,7 @@ impl State {
                     SwapImage::Presentable(image) => Some(image),
                     _ => None,
                 };
-                let ready = self.submit(consumer, presentable)?;
+                let ready = self.submit(presentable)?;
                 if let Storage::Swap(backing) = &image.storage {
                     backing.owner.lock().unwrap().presented(&swap, &damage);
                 }
@@ -529,86 +384,69 @@ impl State {
                             damage,
                             ready,
                         },
-                        video: Arc::from([]),
+                        video: self.video.clone(),
                         published_at: Instant::now(),
                     },
                 );
                 self.presenter.drain();
-                if let Some(depths) = self.depths.remove(&stream) {
-                    for depth in depths {
-                        depth.0.owner.lock().unwrap().end_frame();
-                    }
+                for depth in self.depths.drain(..) {
+                    depth.0.owner.lock().unwrap().end_frame();
                 }
             }
-            Command::Target { .. } | Command::Clear { .. } | Command::Draw(_) => unreachable!(),
+            Command::Clear { .. } | Command::Draw(_) => unreachable!(),
         }
         Ok(())
     }
-
-    fn submit(
-        &mut self,
-        consumer: &Arc<Consumer>,
-        image: Option<&mut adv_gpu::PresentImage>,
-    ) -> adv_gpu::Result<Token> {
+    fn submit(&mut self, image: Option<&mut adv_gpu::PresentImage>) -> adv_gpu::Result<Token> {
         let encoder = self
             .encoder
             .take()
             .unwrap_or_else(|| self.queue.encoder("submission boundary"));
-        let token = if let Some(image) = image {
-            self.queue.submit_present(encoder, &mut [image])?
+        if let Some(image) = image {
+            self.queue.submit_present(encoder, &mut [image])
         } else {
-            self.queue.submit(encoder)?
-        };
-        if !self
-            .participants
-            .iter()
-            .any(|other| Arc::ptr_eq(other, consumer))
-        {
-            self.participants.push(consumer.clone());
+            self.queue.submit(encoder)
         }
-        let consumers = std::mem::take(&mut self.participants);
-        self.queue.on_complete(
-            token,
-            Box::new(move || {
-                for consumer in consumers {
-                    consumer.retired();
-                }
-            }),
-        );
-        Ok(token)
     }
-
-    fn render(&mut self, run: Run, plans: &[pass::Pass]) -> adv_gpu::Result<()> {
-        let (_, color, _) = self.image(&run.color)?;
-        let depth_image = run
+    fn render(&mut self, run: &Run) -> adv_gpu::Result<()> {
+        let target = self.target.as_ref().unwrap().clone();
+        let (_, color, _) = self.image(&target.image)?;
+        let depth_image = target
             .depth
             .as_ref()
             .map(|depth| {
-                let depths = self.depths.entry(run.stream).or_default();
-                if !depths.iter().any(|other| Arc::ptr_eq(&other.0, &depth.0)) {
-                    depths.push(depth.clone());
+                if !self
+                    .depths
+                    .iter()
+                    .any(|other| Arc::ptr_eq(&other.0, &depth.0))
+                {
+                    self.depths.push(depth.clone());
                 }
                 depth
                     .0
                     .owner
                     .lock()
                     .unwrap()
-                    .attachment(depth, self.queue.device(), plans)
+                    .attachment(depth, self.queue.device(), &run.passes)
             })
             .transpose()?;
-        let mut sampled = HashMap::new();
-        for draw in run.draws.iter().flatten() {
-            for (_, binding) in &draw.bindings {
-                if let Resource::Sampled(image) = binding
-                    && let std::collections::hash_map::Entry::Vacant(entry) =
-                        sampled.entry(image.id())
-                {
-                    let (_, view, _) = self.image(image)?;
-                    entry.insert(view);
+        // Swap acquisition can repair age with a copy, so it precedes the
+        // render pass. Each bind below resolves the current view in place.
+        for &(chunk, at) in &run.locations {
+            if let Command::Draw(n) = &self.chunks[chunk].commands[at] {
+                let range = self.chunks[chunk].draws[*n as usize].bindings.clone();
+                for index in range {
+                    if let Binding::Sampled(image) = &self.chunks[chunk].bindings[index as usize].1
+                        && matches!(image.storage, Storage::Swap(_))
+                    {
+                        let image = image.clone();
+                        self.image(&image)?;
+                    }
                 }
             }
         }
-        for plan in plans {
+        self.encoder();
+        for plan in &run.passes {
             let desc = RenderPassDesc {
                 colors: [ColorAttachment {
                     view: &color,
@@ -638,14 +476,17 @@ impl State {
                     .as_ref()
                     .is_some_and(|d| d.desc().usage.contains(adv_gpu::resource::Usage::TRANSIENT)),
             });
-            let mut pass = self.encoder().render_pass(&desc);
-            let mut slots: HashMap<(u8, u32), BindingKey> = HashMap::new();
+            let mut pass = self.encoder.as_mut().unwrap().render_pass(&desc);
             let mut viewport = None;
             let mut scissor = None;
             let mut stencil = None;
             let mut blend = None;
-            for recorded in run.draws[plan.ops.clone()].iter().flatten() {
-                let d = recorded;
+            for &(chunk, at) in &run.locations[plan.ops.clone()] {
+                let chunk = &self.chunks[chunk];
+                let Command::Draw(n) = chunk.commands[at] else {
+                    continue;
+                };
+                let d = &chunk.draws[n as usize];
                 pass.set_pipeline(&d.pipeline);
                 if viewport != Some(d.viewport) {
                     pass.set_viewport(
@@ -670,67 +511,51 @@ impl State {
                     pass.set_blend_constant(d.blend_constant);
                     blend = Some(d.blend_constant);
                 }
-                for (slot, binding) in &recorded.bindings {
-                    // Sampler identity is opaque in adv-gpu; only resources
-                    // whose identity is exposed can be compared here.
-                    if let Resource::Sampler(sampler) = binding {
-                        pass.bind(*slot, Bind::Sampler(sampler));
-                        continue;
-                    }
-                    let resource = match binding {
-                        Resource::Uniform(buffer, range) => {
-                            Bind::Uniform(buffer.slice(range.clone()))
+                for (slot, binding) in
+                    &chunk.bindings[d.bindings.start as usize..d.bindings.end as usize]
+                {
+                    match binding {
+                        Binding::Uniform(bytes) => {
+                            pass.bind(*slot, Bind::Uniform(slice(*bytes, &chunk.spans)))
                         }
-                        Resource::Storage(buffer, range) => {
-                            Bind::StorageBuffer(buffer.slice(range.clone()))
+                        Binding::Storage(bytes) => {
+                            pass.bind(*slot, Bind::StorageBuffer(slice(*bytes, &chunk.spans)))
                         }
-                        Resource::Sampled(image) => Bind::Sampled(&sampled[&image.id()]),
-                        Resource::Sampler(_) => unreachable!(),
-                    };
-                    let (kind, key) = binding_key(resource);
-                    if slots.get(&(kind, *slot)) != Some(&key) {
-                        pass.bind(*slot, resource);
-                        slots.insert((kind, *slot), key);
+                        Binding::Buffer(buffer, range) => {
+                            pass.bind(*slot, Bind::StorageBuffer(buffer.slice(range.clone())))
+                        }
+                        Binding::Sampler(sampler) => pass.bind(*slot, Bind::Sampler(sampler)),
+                        Binding::Sampled(image) => match &image.storage {
+                            Storage::Fixed { view, .. } => pass.bind(*slot, Bind::Sampled(view)),
+                            Storage::Swap(swap) => pass.bind(
+                                *slot,
+                                Bind::Sampled(swap.owner.lock().unwrap().current_image().view()),
+                            ),
+                        },
                     }
                 }
-                if let Some((index, format)) = &recorded.index {
-                    pass.set_index_buffer(index.buffer(), *format);
-                    pass.draw_indexed(d.vertices.clone(), d.base_vertex, 0..1);
+                if let Some((index, format)) = &d.index {
+                    let bytes = match index {
+                        Binding::Uniform(bytes) | Binding::Storage(bytes) => {
+                            slice(*bytes, &chunk.spans)
+                        }
+                        Binding::Buffer(buffer, range) => buffer.slice(range.clone()),
+                        _ => unreachable!("index binding"),
+                    };
+                    pass.set_index_buffer(bytes, *format);
+                    pass.draw_indexed(d.vertices.clone(), d.base_vertex, d.instances.clone());
                 } else {
-                    pass.draw(d.vertices.clone(), 0..1);
+                    pass.draw(d.vertices.clone(), d.instances.clone());
                 }
             }
         }
         Ok(())
     }
 }
-
-#[derive(PartialEq, Eq)]
-enum BindingKey {
-    Buffer(usize, u64, u64),
-    Image(u64),
-}
-fn binding_key(binding: Bind<'_>) -> (u8, BindingKey) {
-    match binding {
-        Bind::Uniform(s) | Bind::StorageBuffer(s) => {
-            let kind = u8::from(matches!(binding, Bind::StorageBuffer(_))) * 3;
-            let identity = s
-                .buffer
-                .mapped()
-                .map_or(s.buffer as *const _ as usize, |p| {
-                    p.as_ptr() as *mut u8 as usize
-                });
-            (kind, BindingKey::Buffer(identity, s.offset, s.size))
-        }
-        Bind::Sampled(image) => (1, BindingKey::Image(image as *const _ as u64)),
-        _ => unreachable!(),
-    }
-}
-fn slice(bytes: Bytes, spans: &[(Buffer, u64)]) -> BufferSlice<'_> {
-    let (buffer, offset) = &spans[bytes.span as usize];
-    buffer.slice(
-        offset + u64::from(bytes.offset)..offset + u64::from(bytes.offset) + u64::from(bytes.len),
-    )
+fn slice(bytes: Bytes, spans: &[Span]) -> BufferSlice<'_> {
+    let span = &spans[bytes.span as usize];
+    let offset = span.offset() + u64::from(bytes.offset);
+    span.buffer().slice(offset..offset + u64::from(bytes.len))
 }
 fn extent(rect: Rect) -> Extent {
     Extent {
@@ -739,7 +564,6 @@ fn extent(rect: Rect) -> Extent {
         depth_or_layers: 1,
     }
 }
-
 fn next_depth<'a>(
     depth: Option<&Depth>,
     commands: impl Iterator<Item = (&'a Command, &'a [Draw])>,
@@ -778,7 +602,6 @@ fn next_depth<'a>(
     }
     pass::NextDepth::Keep
 }
-
 pub(super) struct Headless;
 impl Presenter for Headless {
     fn presentable(&self, _: u32, _: u32) -> bool {
@@ -797,8 +620,8 @@ mod tests {
     use adv_gpu::resource::{BufferDesc, BufferUsage, Memory, Usage};
     use adv_gpu::shader::{ShaderDesc, Source, Stage};
     use adv_gpu::{Device, Format};
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Mutex, mpsc};
     use std::time::Duration;
 
     const TIMEOUT: Duration = Duration::from_secs(20);
@@ -897,7 +720,7 @@ mod tests {
         device: Device,
         state: State,
         producer: super::super::stream::Producer,
-        consumer: Arc<Consumer>,
+        consumer: Consumer,
         display: Arc<Display>,
     }
     impl Harness {
@@ -915,18 +738,14 @@ mod tests {
                 device,
                 state,
                 producer,
-                consumer: Arc::new(consumer),
+                consumer,
                 display,
             }
         }
         fn drain(&mut self) {
-            let mut chunks = VecDeque::new();
             while let Some(chunk) = self.consumer.try_next() {
-                chunks.push_back(Work::Chunk(self.consumer.clone(), chunk));
-            }
-            while let Some(Work::Chunk(consumer, mut chunk)) = chunks.pop_front() {
-                self.state.chunk(1, &mut chunk, &chunks, &consumer).unwrap();
-                consumer.recycle(chunk);
+                self.state.chunks.push_back(chunk);
+                self.state.drain(&self.consumer).unwrap();
             }
         }
         fn read(&mut self, image: &Image) -> Vec<u8> {
@@ -961,12 +780,9 @@ mod tests {
         }
     }
     fn pipeline(device: &Device) -> adv_gpu::RenderPipeline {
-        let shader = device
-            .create_shader(ShaderDesc {
-                identity: 17,
-                label: "owner draw",
-                source: Source::Wgsl(
-                    r#"
+        pipeline_source(
+            device,
+            r#"
 struct Color {rgba:vec4<f32>}
 @group(0) @binding(0) var<uniform> color:Color;
 @vertex fn vertex_main(@builtin(vertex_index) n:u32)->@builtin(position) vec4<f32> {
@@ -975,7 +791,23 @@ struct Color {rgba:vec4<f32>}
 }
 @fragment fn fragment_main()->@location(0) vec4<f32> {return color.rgba;}
 "#,
-                ),
+            vec![p::Binding {
+                slot: 0,
+                kind: p::BindingKind::UniformBuffer,
+                stages: p::Stages::FRAGMENT,
+            }],
+        )
+    }
+    fn pipeline_source(
+        device: &Device,
+        source: &str,
+        bindings: Vec<p::Binding>,
+    ) -> adv_gpu::RenderPipeline {
+        let shader = device
+            .create_shader(ShaderDesc {
+                identity: 17,
+                label: "owner draw",
+                source: Source::Wgsl(source),
             })
             .unwrap();
         device
@@ -983,11 +815,7 @@ struct Color {rgba:vec4<f32>}
                 &p::RenderPipelineDesc {
                     vertex: shader.entry("vertex_main", Stage::Vertex).unwrap(),
                     fragment: Some(shader.entry("fragment_main", Stage::Fragment).unwrap()),
-                    bindings: vec![p::Binding {
-                        slot: 0,
-                        kind: p::BindingKind::UniformBuffer,
-                        stages: p::Stages::FRAGMENT,
-                    }],
+                    bindings,
                     primitive: p::Primitive {
                         topology: p::Topology::Triangles,
                         cull: p::Cull::None,
@@ -1017,6 +845,7 @@ struct Color {rgba:vec4<f32>}
             bindings: 0..0,
             index: None,
             vertices: 0..3,
+            instances: 0..1,
             base_vertex: 0,
             viewport: [0., 0., 4., 4., 0., 1.],
             scissor: area,
@@ -1197,7 +1026,7 @@ struct Color {rgba:vec4<f32>}
         let owner = std::thread::spawn(move || run(queue, consumer, Box::new(Headless)));
         assert_eq!(events.recv_timeout(TIMEOUT).unwrap(), 2);
         producer_thread.join().unwrap();
-        owner.join().unwrap();
+        owner.join().unwrap().unwrap();
     }
 
     // spec: GFX-REC-5
@@ -1298,7 +1127,7 @@ struct Color {rgba:vec4<f32>}
         drop(display.frames.lock().unwrap().pop_front());
         assert_eq!(frames.recv_timeout(TIMEOUT).unwrap(), 4);
         drop(producer);
-        owner.join().unwrap();
+        owner.join().unwrap().unwrap();
     }
 
     // spec: GFX-PASS-2
@@ -1352,5 +1181,127 @@ struct Color {rgba:vec4<f32>}
             .push(present(&image, crate::frame::Damage::Whole, 3));
         h.drain();
         assert!(h.state.passes[2].transient);
+    }
+
+    // spec: GFX-INPUT-7, GFX-INPUT-1
+    #[test]
+    fn indexed_and_nonindexed_draws_fetch_each_instances_stream_data() {
+        let Some((device, queue)) = open() else {
+            return;
+        };
+        let mut h = Harness::new(device, queue);
+        let pipeline = pipeline_source(
+            &h.device,
+            r#"
+struct Instance {offset:vec4<f32>,color:vec4<f32>}
+@group(3) @binding(2) var<storage,read> positions:array<vec2<f32>>;
+@group(3) @binding(3) var<storage,read> instances:array<Instance>;
+struct Output {@builtin(position) position:vec4<f32>,@location(0) color:vec4<f32>}
+@vertex fn vertex_main(@builtin(vertex_index) v:u32,@builtin(instance_index) i:u32)->Output {
+    var out:Output;
+    out.position=vec4<f32>(positions[v]*vec2<f32>(0.5,1.0)+instances[i].offset.xy,0.0,1.0);
+    out.color=instances[i].color;return out;
+}
+@fragment fn fragment_main(in:Output)->@location(0) vec4<f32> {return in.color;}
+"#,
+            [2, 3]
+                .map(|slot| p::Binding {
+                    slot,
+                    kind: p::BindingKind::StorageBuffer { writable: false },
+                    stages: p::Stages::VERTEX,
+                })
+                .to_vec(),
+        );
+        let positions: [f32; 12] = [-1., -1., 1., -1., 1., 1., -1., -1., 1., 1., -1., 1.];
+        let instances: [f32; 16] = [
+            -0.5, 0., 0., 0., 1., 0., 0., 1., 0.5, 0., 0., 0., 0., 0., 1., 1.,
+        ];
+        for indexed in [false, true] {
+            let target = image(&h.device, 4, 4);
+            h.producer.push(color(&target));
+            h.producer.push(clear(rect(0, 0, 4, 4), [0.; 4]));
+            let align = h.device.caps().limits.storage_offset_alignment.max(32);
+            let instance_at = 48u32.next_multiple_of(align);
+            let index_at = instance_at + 64;
+            let data = h.producer.bytes(index_at + 24, align, |bytes| {
+                bytes[..48].copy_from_slice(bytemuck::cast_slice(&positions));
+                bytes[instance_at as usize..index_at as usize]
+                    .copy_from_slice(bytemuck::cast_slice(&instances));
+                bytes[index_at as usize..]
+                    .copy_from_slice(bytemuck::cast_slice(&[0u32, 1, 2, 3, 4, 5]));
+            });
+            let part = |offset, len| Bytes {
+                span: data.span,
+                offset: data.offset + offset,
+                len,
+            };
+            let mut d = draw(pipeline.clone(), rect(0, 0, 4, 4));
+            d.vertices = 0..6;
+            d.instances = 0..2;
+            if indexed {
+                d.index = Some((
+                    Binding::Storage(part(index_at, 24)),
+                    adv_gpu::encode::IndexFormat::U32,
+                ));
+            }
+            h.producer.draw(
+                d,
+                [
+                    (2, Binding::Storage(part(0, 48))),
+                    (3, Binding::Storage(part(instance_at, 64))),
+                ],
+            );
+            let pixels = h.read(&target);
+            for y in 0..4 {
+                for x in 0..4 {
+                    assert_eq!(
+                        &pixels[(y * 4 + x) * 4..(y * 4 + x + 1) * 4],
+                        if x < 2 {
+                            &[0, 0, 255, 255]
+                        } else {
+                            &[255, 0, 0, 255]
+                        },
+                        "indexed={indexed}, ({x}, {y})"
+                    );
+                }
+            }
+        }
+    }
+
+    // spec: GFX-PASS-2
+    #[test]
+    fn a_queued_depth_clear_avoids_storing_the_preceding_chunk() {
+        let Some((device, queue)) = open() else {
+            return;
+        };
+        let mut h = Harness::new(device, queue);
+        let image = image(&h.device, 4, 4);
+        let depth = Depth(Arc::new(backing::DepthBuffer::new(
+            (4, 4),
+            DepthFormat::Depth24Stencil8,
+        )));
+        let clear_depth = || Command::Clear {
+            area: rect(0, 0, 4, 4),
+            color: Some([1.; 4]),
+            depth: Some(1.),
+            stencil: Some(0),
+        };
+        h.producer.push(Command::Target {
+            color: image.clone(),
+            depth: Some(depth.clone()),
+        });
+        h.producer.push(clear_depth());
+        h.producer.push(Command::Submit);
+        h.producer.push(clear_depth());
+        h.producer.push(Command::DiscardDepth(depth));
+        h.producer
+            .push(present(&image, crate::frame::Damage::Whole, 1));
+        h.drain();
+        assert_eq!(h.state.passes.len(), 2);
+        for pass in &h.state.passes {
+            assert_eq!(pass.depth, Some((Load::Clear(1.), Store::DontCare)));
+            assert_eq!(pass.stencil, Some((Load::Clear(0), Store::DontCare)));
+            assert!(pass.transient);
+        }
     }
 }

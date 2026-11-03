@@ -326,10 +326,8 @@ impl Gpu {
             .as_ref()
             .map_or(draw.vertex_count as usize, |i| i.len());
         validate_count(count, state.topology)?;
-        if draw.instance_count != 1 {
-            return Err(Error::Unavailable(
-                "native command stream has no instanced draw field".into(),
-            ));
+        if draw.instance_count == 0 || count > 0x300000 {
+            return Err(invalid("invalid programmable primitive count"));
         }
         if draw.streams.len() > 16
             || draw.textures.len() != draw.program.textures.len()
@@ -379,7 +377,11 @@ impl Gpu {
                     || locations & (1 << a.location) != 0
                     || !a.offset.is_multiple_of(4)
                     || stream.stride != 0 && end > stream.stride
-                    || u64::from(if stream.instance { 0 } else { last }) * u64::from(stream.stride)
+                    || u64::from(if stream.instance {
+                        draw.instance_count - 1
+                    } else {
+                        last
+                    }) * u64::from(stream.stride)
                         + u64::from(end)
                         > stream.bytes.len() as u64
                 {
@@ -514,6 +516,7 @@ impl Gpu {
             bindings.push((slot::SAMPLERS + ordinal, Binding::Sampler(sampler)));
         }
         let mut command = summary(&state, pipeline, area, 0..count as u32);
+        command.instances = 0..draw.instance_count;
         command.uses_depth |= draw.program.writes_depth;
         command.writes_depth |= draw.program.writes_depth;
         command.index = draw.indices.as_ref().map(|i| {
@@ -714,6 +717,10 @@ impl Gpu {
         });
         self.check()
     }
+    /// D3D9 D3DPRESENTFLAG_DISCARD_DEPTHSTENCIL ends the depth contents.
+    pub fn discard_depth(&mut self, depth: &Depth) {
+        self.stream.push(Command::DiscardDepth(depth.clone()));
+    }
     pub fn flush(&mut self) -> Result<(), Error> {
         self.stream.push(Command::Submit);
         self.check()
@@ -881,12 +888,12 @@ impl Transfer {
         let mut output = self.completion.result.lock().unwrap();
         *output = Some(result);
         self.reservation.take();
-        self.completion.finished.store(true, Ordering::Release);
-        drop(output);
-        self.completion.ready.notify_all();
         if let Some(wake) = &self.wake {
             wake.signal();
         }
+        self.completion.finished.store(true, Ordering::Release);
+        drop(output);
+        self.completion.ready.notify_all();
     }
 }
 impl Drop for Transfer {
@@ -1053,6 +1060,7 @@ fn summary(
         bindings: 0..0,
         index: None,
         vertices,
+        instances: 0..1,
         base_vertex: 0,
         viewport: [
             v.x,
@@ -1216,7 +1224,7 @@ mod tests {
 
     // spec: GFX-REC-1, GFX-PASS-1
     #[test]
-    fn facade_clear_copy_readback_completion_and_fork() {
+    fn facade_clear_copy_readback_completion() {
         let mut gpu = match pollster::block_on(Gpu::request(!cfg!(target_vendor = "apple"))) {
             Ok(gpu) => gpu,
             Err(Error::Unavailable(reason))
@@ -1254,6 +1262,47 @@ mod tests {
             image: source.clone(),
             depth: None,
         };
+        let mut instanced = ProgrammableDraw {
+            instance_count: 0,
+            program: gpu::Program::new(Arc::from(""), Vec::new()),
+            streams: vec![gpu::VertexStream {
+                instance: true,
+                bytes: vec![0; 16].into(),
+                stride: 16,
+                attributes: vec![gpu::Attribute {
+                    location: 0,
+                    offset: 0,
+                    format: gpu::AttributeFormat::Float4,
+                }],
+            }],
+            indices: None,
+            vertex_count: 3,
+            vertex_constants: Default::default(),
+            pixel_constants: Default::default(),
+            textures: Vec::new(),
+            parameters: [[0; 4]; 40],
+        };
+        let state = DrawState::new(4, 4);
+        assert!(matches!(
+            gpu.draw_programmable(&target, &instanced, &state),
+            Err(Error::Invalid(_))
+        ));
+        instanced.instance_count = 2;
+        assert!(matches!(
+            gpu.draw_programmable(&target, &instanced, &state),
+            Err(Error::Invalid(_))
+        ));
+        let depth = gpu.depth(4, 4, gpu::DepthFormat::Float32).unwrap();
+        gpu.clear(
+            &Target {
+                image: source.clone(),
+                depth: Some(depth.clone()),
+            },
+            None,
+            Some(1.),
+        )
+        .unwrap();
+        gpu.discard_depth(&depth);
         gpu.clear(&target, Some([1., 0., 0., 1.]), None).unwrap();
         gpu.copy(&source, whole(&source), &destination, 0, 0)
             .unwrap();
@@ -1271,14 +1320,12 @@ mod tests {
         );
         assert!(transfer.poll().is_none());
         assert!(wake.wait(Some(std::time::Duration::ZERO)).unwrap());
-        let mut child = gpu.fork().unwrap();
-        drop(gpu);
-        let image = make_image(&child);
+        let image = make_image(&gpu);
         let target = Target {
             image: image.clone(),
             depth: None,
         };
-        child.clear(&target, Some([0., 1., 0., 1.]), None).unwrap();
+        gpu.clear(&target, Some([0., 1., 0., 1.]), None).unwrap();
         let mut desc = backing::image_desc(
             (4, 4),
             adv_gpu::Format::Bgra8Unorm,
@@ -1287,7 +1334,7 @@ mod tests {
                 | adv_gpu::resource::Usage::COPY_DST,
         );
         desc.mips = 2;
-        let mips = child.device.create_image(&desc).unwrap();
+        let mips = gpu.device.create_image(&desc).unwrap();
         let level = |n| Image {
             storage: Storage::Fixed {
                 image: mips.clone(),
@@ -1305,31 +1352,29 @@ mod tests {
             alpha: gpu::AlphaMode::Stored,
         };
         let (first, second) = (level(0), level(1));
-        child
-            .clear(
-                &Target {
-                    image: first.clone(),
-                    depth: None,
-                },
-                Some([1., 0., 0., 1.]),
-                None,
-            )
-            .unwrap();
-        child
-            .copy(
-                &first,
-                Rect {
-                    x: 0,
-                    y: 0,
-                    w: 2,
-                    h: 2,
-                },
-                &second,
-                0,
-                0,
-            )
-            .unwrap();
-        let mut mip_readback = child.readback(&second, None).unwrap();
+        gpu.clear(
+            &Target {
+                image: first.clone(),
+                depth: None,
+            },
+            Some([1., 0., 0., 1.]),
+            None,
+        )
+        .unwrap();
+        gpu.copy(
+            &first,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 2,
+                h: 2,
+            },
+            &second,
+            0,
+            0,
+        )
+        .unwrap();
+        let mut mip_readback = gpu.readback(&second, None).unwrap();
         mip_readback.take_completion_job().unwrap()();
         assert!(
             mip_readback
@@ -1346,10 +1391,10 @@ mod tests {
                 .unwrap();
         let id = surfaces.insert_native(target).unwrap();
         surfaces
-            .present_native(id, Damage::Whole, &mut child)
+            .present_native(id, Damage::Whole, &mut gpu)
             .unwrap();
         assert_eq!(surfaces.stats.presentations, 1);
-        let mut transfer = surfaces.readback_native(id, &mut child).unwrap();
+        let mut transfer = surfaces.readback_native(id, &mut gpu).unwrap();
         transfer.take_completion_job().unwrap()();
         assert!(
             transfer
