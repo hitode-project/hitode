@@ -3,7 +3,7 @@
 //! stay with the encoder until its submission completes.
 
 use super::resources::Storage;
-use super::stream::{Binding, Bytes, Chunk, Command, Consumer, Draw};
+use super::stream::{Binding, Bytes, Chunk, Command, Consumer, Draw, UploadSource};
 use super::{Depth, Image, Target, backing, pass};
 use crate::frame::{Base, Frame, Presenter, SwapImage, VideoPlane};
 use adv_gpu::encode::{Bind, BufferCopy, ColorAttachment, DepthAttachment, ImageCopy};
@@ -18,6 +18,13 @@ pub(super) struct Owner {
     pub failure: Arc<OnceLock<String>>,
 }
 impl Owner {
+    #[cfg(test)]
+    pub(super) fn unstarted() -> Self {
+        Self {
+            join: None,
+            failure: Arc::new(OnceLock::new()),
+        }
+    }
     pub fn start(
         queue: Queue,
         commands: Consumer,
@@ -42,6 +49,10 @@ impl Owner {
 impl Drop for Owner {
     fn drop(&mut self) {
         // Gpu drops its producer before joining the queue owner.
+        #[cfg(test)]
+        if self.join.is_none() {
+            return;
+        }
         self.join
             .take()
             .unwrap()
@@ -82,6 +93,8 @@ struct State {
     chunks: VecDeque<Chunk>,
     cursor: (usize, usize),
     completed: Token,
+    uploads: VecDeque<(Token, super::Staged)>,
+    pending_uploads: usize,
     video: Arc<[VideoPlane]>,
     #[cfg(test)]
     passes: Vec<PassRecord>,
@@ -129,6 +142,8 @@ impl State {
             chunks: VecDeque::new(),
             cursor: (0, 0),
             completed: Token(0),
+            uploads: VecDeque::new(),
+            pending_uploads: 0,
             video: Arc::from([]),
             #[cfg(test)]
             passes: Vec::new(),
@@ -152,6 +167,13 @@ impl State {
     }
     fn poll(&mut self, consumer: &Consumer) -> adv_gpu::Result<()> {
         let completed = self.queue.poll()?;
+        while self
+            .uploads
+            .front()
+            .is_some_and(|(token, _)| *token <= completed)
+        {
+            self.uploads.pop_front();
+        }
         if completed > self.completed {
             self.completed = completed;
             consumer.retired();
@@ -280,18 +302,21 @@ impl State {
                 })
             }
             Command::Upload {
-                bytes,
+                source,
                 pitch,
                 image,
                 mip,
                 rect,
             } => {
                 let (image, _, _) = self.image(&image)?;
-                let source = slice(bytes, &self.chunks[chunk].spans);
+                let source_bytes = match &source {
+                    UploadSource::Ring(bytes) => slice(*bytes, &self.chunks[chunk].spans),
+                    UploadSource::Staged(staged) => staged.buffer().slice(0..staged.len() as u64),
+                };
                 self.encoder.as_mut().unwrap().copy_buffer_to_image(
                     BufferCopy {
-                        buffer: source.buffer,
-                        offset: source.offset,
+                        buffer: source_bytes.buffer,
+                        offset: source_bytes.offset,
                         row_pitch: pitch,
                         rows: rect.h,
                     },
@@ -303,6 +328,11 @@ impl State {
                     },
                     extent(rect),
                 );
+                if let UploadSource::Staged(staged) = source {
+                    // Submit assigns the completion token to these pending uploads.
+                    self.uploads.push_back((Token(u64::MAX), staged));
+                    self.pending_uploads += 1;
+                }
             }
             Command::Copy {
                 source,
@@ -402,11 +432,16 @@ impl State {
             .encoder
             .take()
             .unwrap_or_else(|| self.queue.encoder("submission boundary"));
-        if let Some(image) = image {
-            self.queue.submit_present(encoder, &mut [image])
+        let token = if let Some(image) = image {
+            self.queue.submit_present(encoder, &mut [image])?
         } else {
-            self.queue.submit(encoder)
+            self.queue.submit(encoder)?
+        };
+        for (pending, _) in self.uploads.iter_mut().rev().take(self.pending_uploads) {
+            *pending = token;
         }
+        self.pending_uploads = 0;
+        Ok(token)
     }
     fn render(&mut self, run: &Run) -> adv_gpu::Result<()> {
         let target = self.target.as_ref().unwrap().clone();
@@ -625,6 +660,45 @@ mod tests {
     use std::time::Duration;
 
     const TIMEOUT: Duration = Duration::from_secs(20);
+
+    // spec: GFX-SAMPLER-4
+    #[test]
+    fn staged_uploads_are_retained_until_their_submission_completes() {
+        let Some((mut gpu, queue, consumer)) = super::super::resources::tests::open() else {
+            return;
+        };
+        let image = gpu.image(1, 1).unwrap();
+        let staged = gpu
+            .stage(4, 1, |write| {
+                write(0, &[11, 22, 33, 44]);
+                Ok::<(), ()>(())
+            })
+            .unwrap()
+            .unwrap();
+        let mut state = State::new(queue, Box::new(Headless));
+        state
+            .command(
+                Command::Upload {
+                    source: UploadSource::Staged(staged),
+                    pitch: 4,
+                    image,
+                    mip: 0,
+                    rect: rect(0, 0, 1, 1),
+                },
+                0,
+            )
+            .unwrap();
+        state.poll(&consumer).unwrap();
+        assert_eq!(state.uploads.len(), 1);
+        assert_eq!(state.pending_uploads, 1);
+        let token = state.submit(None).unwrap();
+        assert_eq!(state.uploads[0].0, token);
+        assert_eq!(state.pending_uploads, 0);
+        assert!(state.queue.wait(token, TIMEOUT).unwrap());
+        state.poll(&consumer).unwrap();
+        assert!(state.uploads.is_empty());
+    }
+
     fn open() -> Option<(Device, Queue)> {
         match Device::open(&adv_gpu::queue::DeviceOptions {
             software: !cfg!(target_vendor = "apple"),
@@ -1003,7 +1077,7 @@ struct Color {rgba:vec4<f32>}
         let producer_thread = std::thread::spawn(move || {
             let bytes = producer.bytes(128 << 10, 4, |bytes| bytes.fill(1));
             producer.push(Command::Upload {
-                bytes,
+                source: UploadSource::Ring(bytes),
                 pitch: 1024,
                 image: image.clone(),
                 mip: 0,
@@ -1013,7 +1087,7 @@ struct Color {rgba:vec4<f32>}
             let bytes = producer.bytes(128 << 10, 4, |bytes| bytes.fill(2));
             send.send(2).unwrap();
             producer.push(Command::Upload {
-                bytes,
+                source: UploadSource::Ring(bytes),
                 pitch: 1024,
                 image,
                 mip: 0,
@@ -1194,8 +1268,8 @@ struct Color {rgba:vec4<f32>}
             &h.device,
             r#"
 struct Instance {offset:vec4<f32>,color:vec4<f32>}
-@group(3) @binding(2) var<storage,read> positions:array<vec2<f32>>;
-@group(3) @binding(3) var<storage,read> instances:array<Instance>;
+@group(3) @binding(0) var<storage,read> positions:array<vec2<f32>>;
+@group(3) @binding(1) var<storage,read> instances:array<Instance>;
 struct Output {@builtin(position) position:vec4<f32>,@location(0) color:vec4<f32>}
 @vertex fn vertex_main(@builtin(vertex_index) v:u32,@builtin(instance_index) i:u32)->Output {
     var out:Output;
@@ -1204,7 +1278,7 @@ struct Output {@builtin(position) position:vec4<f32>,@location(0) color:vec4<f32
 }
 @fragment fn fragment_main(in:Output)->@location(0) vec4<f32> {return in.color;}
 "#,
-            [2, 3]
+            [0, 1]
                 .map(|slot| p::Binding {
                     slot,
                     kind: p::BindingKind::StorageBuffer { writable: false },
@@ -1247,8 +1321,8 @@ struct Output {@builtin(position) position:vec4<f32>,@location(0) color:vec4<f32
             h.producer.draw(
                 d,
                 [
-                    (2, Binding::Storage(part(0, 48))),
-                    (3, Binding::Storage(part(instance_at, 64))),
+                    (0, Binding::Storage(part(0, 48))),
+                    (1, Binding::Storage(part(instance_at, 64))),
                 ],
             );
             let pixels = h.read(&target);

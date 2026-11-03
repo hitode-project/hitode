@@ -1,13 +1,17 @@
 //! Package C1: images, render targets, depth buffers, staging and uploads.
 //!
-//! Resources are created synchronously on the calling thread. Upload bytes go
-//! once into the upload ring through [`super::stream::Producer::bytes`], in the
-//! destination's own format, and reach the image with one
-//! [`super::stream::Command::Upload`].
+//! Resources are created synchronously on the calling thread. Immediate
+//! uploads write once into the ring; replayable snapshots use pooled mapped
+//! buffers, independent of command chunks and ring capacity. Both carry the
+//! destination's own format and reach it with one upload command.
 
 use super::super::{AlphaMode, DepthFormat, Error, Rect, TexelFormat};
 use super::Gpu;
-use adv_gpu::resource::{Dimension, ImageDesc, Usage, ViewDesc};
+use adv_gpu::resource::{BufferDesc, BufferUsage, Dimension, ImageDesc, Memory, Usage, ViewDesc};
+use std::sync::{
+    Arc, Weak,
+    atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering},
+};
 
 pub(super) fn gpu_error(error: adv_gpu::Error) -> Error {
     match error {
@@ -258,22 +262,114 @@ impl Target {
     }
 }
 
-/// Guest rows already in the upload ring, waiting for their destination.
-#[derive(Clone)]
-pub struct Staged {
-    pub(super) bytes: super::stream::Bytes,
-    pub(super) pitch: u32,
+const FREE_STAGING_BYTES: u64 = 64 << 20;
+
+#[derive(Default)]
+pub(super) struct StagingPool {
+    returned: Arc<FreeStaging>,
+    buffers: Vec<Arc<StagingBuffer>>,
+}
+#[derive(Default)]
+struct FreeStaging {
+    /// Multiple dropping threads return nodes; only Gpu::stage takes them.
+    head: AtomicPtr<StagingBuffer>,
+    bytes: AtomicU64,
+}
+struct StagingBuffer {
+    buffer: adv_gpu::Buffer,
+    /// Cache the persistent mapping once; reuse makes no driver call.
+    mapping: AtomicPtr<u8>,
+    pool: Weak<FreeStaging>,
+    /// Count Staged handles independently of the pool's reusable Arc allocation.
+    users: AtomicUsize,
+    next: AtomicPtr<StagingBuffer>,
+}
+impl StagingPool {
+    fn reclaim(&mut self) {
+        let mut next = self
+            .returned
+            .head
+            .swap(std::ptr::null_mut(), Ordering::Acquire);
+        while !next.is_null() {
+            // SAFETY: each published node owns one Arc. Swapping the head
+            // transfers the whole list exclusively to this single consumer.
+            let buffer = unsafe { Arc::from_raw(next) };
+            next = buffer.next.load(Ordering::Relaxed);
+            self.buffers.push(buffer);
+        }
+    }
+}
+impl Drop for FreeStaging {
+    fn drop(&mut self) {
+        let mut next = *self.head.get_mut();
+        while !next.is_null() {
+            // SAFETY: the last pool reference is gone, so no producer can
+            // publish another node. Each queued pointer owns one Arc.
+            let buffer = unsafe { Arc::from_raw(next) };
+            next = buffer.next.load(Ordering::Relaxed);
+        }
+    }
 }
 
+/// Immutable guest rows in a pooled, CPU-written upload buffer.
+pub struct Staged {
+    buffer: Arc<StagingBuffer>,
+    pitch: u32,
+    len: u32,
+}
+impl Clone for Staged {
+    fn clone(&self) -> Self {
+        self.buffer.users.fetch_add(1, Ordering::Relaxed);
+        Self {
+            buffer: self.buffer.clone(),
+            pitch: self.pitch,
+            len: self.len,
+        }
+    }
+}
+impl Drop for Staged {
+    fn drop(&mut self) {
+        if self.buffer.users.fetch_sub(1, Ordering::AcqRel) == 1
+            && let Some(pool) = self.buffer.pool.upgrade()
+        {
+            let size = self.buffer.buffer.desc().size;
+            if pool
+                .bytes
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |bytes| {
+                    (size <= FREE_STAGING_BYTES - bytes).then_some(bytes + size)
+                })
+                .is_ok()
+            {
+                let node = Arc::into_raw(self.buffer.clone()).cast_mut();
+                let mut head = pool.head.load(Ordering::Relaxed);
+                loop {
+                    self.buffer.next.store(head, Ordering::Relaxed);
+                    match pool.head.compare_exchange_weak(
+                        head,
+                        node,
+                        Ordering::Release,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => break,
+                        Err(current) => head = current,
+                    }
+                }
+            }
+        }
+    }
+}
 impl Staged {
     pub fn pitch(&self) -> u32 {
         self.pitch
     }
     pub fn len(&self) -> usize {
-        self.bytes.len as usize
+        self.len as usize
     }
     pub fn is_empty(&self) -> bool {
-        self.bytes.len == 0
+        self.len == 0
+    }
+    pub(super) fn buffer(&self) -> &adv_gpu::Buffer {
+        &self.buffer.buffer
     }
 }
 
@@ -358,28 +454,77 @@ impl Gpu {
     pub fn stores(&self, texel: TexelFormat) -> bool {
         stores(&self.device, texel)
     }
-    /// Write `rows` rows through `fill` straight into the upload ring.
+    /// Write rows directly into a mapped staging buffer, without clearing it.
     pub fn stage<E>(
         &mut self,
         row_bytes: u32,
         rows: u32,
         fill: impl FnOnce(&mut dyn FnMut(u32, &[u8])) -> Result<(), E>,
     ) -> Result<Result<Staged, E>, Error> {
+        self.check()?;
         let size = row_bytes
             .checked_mul(rows)
             .filter(|_| row_bytes != 0 && rows != 0)
             .ok_or_else(|| Error::Invalid("staged upload size".into()))?;
-        let mut result = None;
-        let bytes = self.stream.bytes(size, 256, |destination| {
-            result = Some(fill(&mut |y, row| {
-                let at = y as usize * row_bytes as usize;
-                destination[at..at + row_bytes as usize].copy_from_slice(row);
-            }));
-        });
-        Ok(result.unwrap().map(|()| Staged {
-            bytes,
+        self.staging.reclaim();
+        let pooled = {
+            let pool = &mut self.staging;
+            let best = pool
+                .buffers
+                .iter()
+                .enumerate()
+                .filter(|(_, b)| b.buffer.desc().size >= u64::from(size))
+                .min_by_key(|(_, b)| b.buffer.desc().size)
+                .map(|(n, _)| n);
+            best.map(|n| {
+                let buffer = pool.buffers.swap_remove(n);
+                pool.returned
+                    .bytes
+                    .fetch_sub(buffer.buffer.desc().size, Ordering::Relaxed);
+                buffer.users.store(1, Ordering::Relaxed);
+                buffer
+            })
+        };
+        let buffer = match pooled {
+            Some(buffer) => buffer,
+            None => {
+                let buffer = self
+                    .device
+                    .create_buffer(&BufferDesc {
+                        size: u64::from(size),
+                        usage: BufferUsage::COPY_SRC,
+                        memory: Memory::Upload,
+                        label: "staged guest rows",
+                    })
+                    .map_err(gpu_error)?;
+                let mapping = AtomicPtr::new(buffer.mapped().unwrap().cast::<u8>().as_ptr());
+                Arc::new(StagingBuffer {
+                    buffer,
+                    mapping,
+                    pool: Arc::downgrade(&self.staging.returned),
+                    users: AtomicUsize::new(1),
+                    next: AtomicPtr::default(),
+                })
+            }
+        };
+        let staged = Staged {
+            buffer,
             pitch: row_bytes,
-        }))
+            len: size,
+        };
+        // SAFETY: the pool releases a buffer only after the last Staged handle
+        // is gone, including the owner's handle retained through completion.
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut(
+                staged.buffer.mapping.load(Ordering::Relaxed),
+                size as usize,
+            )
+        };
+        let result = fill(&mut |y, row| {
+            let at = y as usize * row_bytes as usize;
+            bytes[at..at + row_bytes as usize].copy_from_slice(row);
+        });
+        Ok(result.map(|()| staged))
     }
     pub fn upload_staged(
         &mut self,
@@ -388,17 +533,28 @@ impl Gpu {
         staged: &Staged,
     ) -> Result<(), Error> {
         upload_bounds(image, rectangle, staged.pitch, staged.len())?;
-        self.record_upload(image, rectangle, staged);
+        self.record_upload(
+            image,
+            rectangle,
+            staged.pitch,
+            super::stream::UploadSource::Staged(staged.clone()),
+        );
         Ok(())
     }
-    fn record_upload(&mut self, image: &Image, rectangle: Rect, staged: &Staged) {
+    fn record_upload(
+        &mut self,
+        image: &Image,
+        rectangle: Rect,
+        pitch: u32,
+        source: super::stream::UploadSource,
+    ) {
         let mip = match &image.storage {
             Storage::Fixed { level, .. } => level.unwrap_or(0),
             Storage::Swap(_) => 0,
         };
         self.stream.push(super::stream::Command::Upload {
-            bytes: staged.bytes,
-            pitch: staged.pitch,
+            source,
+            pitch,
             image: image.clone(),
             mip,
             rect: adv_gpu::Rect {
@@ -417,16 +573,20 @@ impl Gpu {
         bgra: &[u8],
     ) -> Result<(), Error> {
         let row = upload_bounds(image, rectangle, pitch, bgra.len())?;
-        let staged = self
-            .stage(row, rectangle.h, |write| {
-                for y in 0..rectangle.h {
-                    let start = y as usize * pitch as usize;
-                    write(y, &bgra[start..start + row as usize]);
-                }
-                Ok::<(), std::convert::Infallible>(())
-            })?
-            .unwrap();
-        self.record_upload(image, rectangle, &staged);
+        let bytes = self.stream.bytes(row * rectangle.h, 256, |bytes| {
+            for y in 0..rectangle.h {
+                let source = y as usize * pitch as usize;
+                let destination = y as usize * row as usize;
+                bytes[destination..destination + row as usize]
+                    .copy_from_slice(&bgra[source..source + row as usize]);
+            }
+        });
+        self.record_upload(
+            image,
+            rectangle,
+            row,
+            super::stream::UploadSource::Ring(bytes),
+        );
         Ok(())
     }
     pub fn upload_alpha(
@@ -493,7 +653,8 @@ pub(super) mod tests {
             }
             Err(error) => panic!("open native device: {error}"),
         };
-        let (producer, consumer) = stream::channel(device.ring(4 << 20).unwrap());
+        let (mut producer, consumer) = stream::channel(device.ring(4 << 20).unwrap());
+        let recording = super::super::record::Recording::new(&device, &mut producer).unwrap();
         Some((
             Gpu {
                 device,
@@ -501,6 +662,9 @@ pub(super) mod tests {
                 pipelines: pipelines::Pipelines::default(),
                 clip: None,
                 stats: Default::default(),
+                owner: super::super::owner::Owner::unstarted(),
+                recording,
+                staging: Default::default(),
             },
             queue,
             consumer,
@@ -516,7 +680,7 @@ pub(super) mod tests {
         let mut encoder = queue.encoder("native upload test");
         for command in &chunk.commands {
             if let stream::Command::Upload {
-                bytes,
+                source,
                 pitch,
                 image,
                 mip,
@@ -526,11 +690,17 @@ pub(super) mod tests {
                 let Storage::Fixed { image, .. } = &image.storage else {
                     unreachable!()
                 };
-                let span = &chunk.spans[bytes.span as usize];
+                let (buffer, offset) = match source {
+                    stream::UploadSource::Ring(bytes) => {
+                        let span = &chunk.spans[bytes.span as usize];
+                        (span.buffer(), span.offset() + u64::from(bytes.offset))
+                    }
+                    stream::UploadSource::Staged(staged) => (staged.buffer(), 0),
+                };
                 encoder.copy_buffer_to_image(
                     BufferCopy {
-                        buffer: span.buffer(),
-                        offset: span.offset() + u64::from(bytes.offset),
+                        buffer,
+                        offset,
                         row_pitch: *pitch,
                         rows: rect.h,
                     },
@@ -572,18 +742,10 @@ pub(super) mod tests {
                 &gpu::DrawState::new(image.width(), image.height()),
                 &[adv_gpu::Format::Bgra8Unorm],
                 None,
+                pipelines::fixed_sampling_flags(Some(image)),
             )
             .unwrap();
-        let params: [u32; 8] = [
-            1,
-            1 | pipelines::fixed_sampling_flags(Some(image)),
-            7,
-            0,
-            0,
-            0,
-            0,
-            0,
-        ];
+        let params: [u32; 8] = [1, 1, 7, 0, 0, 0, 0, 0];
         render(
             gpu,
             queue,
@@ -706,7 +868,7 @@ pub(super) mod tests {
             });
             pass.set_pipeline(pipeline);
             pass.bind(
-                pipelines::binding_slot(pipelines::slot::STREAMS),
+                pipelines::slot::STREAMS,
                 Bind::StorageBuffer(
                     span.buffer()
                         .slice(span.offset()..span.offset() + vertices.len() as u64),
@@ -762,7 +924,7 @@ pub(super) mod tests {
         // SAFETY: the submission completed; this buffer is mapped for readback.
         unsafe { readback.mapped().unwrap().as_ref().to_vec() }
     }
-    // Same integer expansion as d3d9::format::upload, including bit replication.
+    // Stored formats sample with exact unorm conversion; CPU-only expansion is independent.
     fn expanded(format: TexelFormat, input: &[u8]) -> Vec<u8> {
         match format {
             TexelFormat::Bgra8 => input.to_vec(),
@@ -785,7 +947,10 @@ pub(super) mod tests {
                         let b = (v & 31) as u8;
                         let g = ((v >> 5) & 63) as u8;
                         let r = (v >> 11) as u8;
-                        [b << 3 | b >> 2, g << 2 | g >> 4, r << 3 | r >> 2, 255]
+                        let unorm = |value: u8, maximum: u16| {
+                            ((u16::from(value) * 255 + maximum / 2) / maximum) as u8
+                        };
+                        [unorm(b, 31), unorm(g, 63), unorm(r, 31), 255]
                     }
                 })
                 .collect(),
@@ -858,8 +1023,162 @@ pub(super) mod tests {
                     actual[at], expected[at]
                 ));
             }
+            gpu.upload(
+                &image,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    w: 256,
+                    h: 256,
+                },
+                256 * bpp,
+                &input,
+            )
+            .unwrap();
+            upload_chunk(&mut gpu, &mut queue, &consumer);
+            assert_eq!(sample(&mut gpu, &mut queue, &image), actual);
         }
         assert!(mismatches.is_empty(), "{}", mismatches.join("; "));
+    }
+
+    pub(in crate::gpu::native) fn executor() -> Option<Gpu> {
+        match pollster::block_on(Gpu::request(!cfg!(target_vendor = "apple"))) {
+            Ok(gpu) => Some(gpu),
+            Err(Error::Unavailable(reason))
+                if std::env::var_os("ADV_GPU_REQUIRE_BACKEND").is_none() =>
+            {
+                eprintln!("skipped: {reason}");
+                None
+            }
+            Err(error) => panic!("device: {error}"),
+        }
+    }
+    pub(in crate::gpu::native) fn read(gpu: &mut Gpu, image: &Image) -> Vec<u8> {
+        let mut transfer = gpu.readback(image, None).unwrap();
+        transfer.take_completion_job().unwrap()();
+        transfer.poll().unwrap().unwrap()
+    }
+
+    // spec: GFX-SAMPLER-4
+    #[test]
+    fn staged_rows_survive_chunk_handoffs_submissions_and_readbacks() {
+        let Some(mut gpu) = executor() else { return };
+        let target = gpu.target(16, 16, false).unwrap();
+        let rectangle = Rect {
+            x: 0,
+            y: 0,
+            w: 16,
+            h: 16,
+        };
+        let pixels: Vec<u8> = (0..1024).map(|i| (i * 37) as u8).collect();
+        let staged = gpu
+            .stage(64, 16, |write| {
+                for (y, row) in pixels.as_chunks::<64>().0.iter().enumerate() {
+                    write(y as u32, row);
+                }
+                Ok::<(), ()>(())
+            })
+            .unwrap()
+            .unwrap();
+        // Each 128 uploads hands off a full chunk. Reusing the ring for these
+        // rows must never change a snapshot admitted before those chunks.
+        for _ in 0..400 {
+            gpu.upload(&target.image, rectangle, 64, &[0; 1024])
+                .unwrap();
+        }
+        gpu.flush().unwrap();
+        assert_eq!(read(&mut gpu, &target.image), vec![0; 1024]);
+        gpu.upload_staged(&target.image, rectangle, &staged)
+            .unwrap();
+        drop(staged);
+        assert_eq!(read(&mut gpu, &target.image), pixels);
+    }
+
+    // spec: GFX-SAMPLER-4
+    #[test]
+    fn staged_snapshot_can_exceed_the_upload_ring() {
+        let Some(mut gpu) = executor() else { return };
+        let (width, height) = (4096, 4097);
+        let target = gpu.target(width, height, false).unwrap();
+        let rectangle = Rect {
+            x: 0,
+            y: 0,
+            w: width,
+            h: height,
+        };
+        let row = [19, 71, 133, 229].repeat(width as usize);
+        let staged = gpu
+            .stage(width * 4, height, |write| {
+                for y in 0..height {
+                    write(y, &row);
+                }
+                Ok::<(), ()>(())
+            })
+            .unwrap()
+            .unwrap();
+        assert!(staged.len() > FREE_STAGING_BYTES as usize);
+        gpu.flush().unwrap();
+        gpu.upload_staged(&target.image, rectangle, &staged)
+            .unwrap();
+        drop(staged);
+        let pixels = read(&mut gpu, &target.image);
+        assert_eq!(pixels.len(), row.len() * height as usize);
+        assert!(pixels.chunks_exact(row.len()).all(|p| p == row));
+    }
+
+    // spec: GFX-SAMPLER-4
+    #[test]
+    fn staging_pool_reuses_the_smallest_fit_after_the_last_reference() {
+        let Some((mut gpu, _, _)) = open() else {
+            return;
+        };
+        let stage =
+            |gpu: &mut Gpu, size| gpu.stage(size, 1, |_| Ok::<(), ()>(())).unwrap().unwrap();
+        let small = stage(&mut gpu, 4);
+        let medium = stage(&mut gpu, 8);
+        let large = stage(&mut gpu, 12);
+        let medium_id = Arc::as_ptr(&medium.buffer);
+        let held = medium.clone();
+        drop(medium);
+        gpu.staging.reclaim();
+        assert!(gpu.staging.buffers.is_empty());
+        drop(large);
+        std::thread::spawn(move || drop(held)).join().unwrap();
+        let reused = stage(&mut gpu, 5);
+        assert_eq!(Arc::as_ptr(&reused.buffer), medium_id);
+        drop(reused);
+        assert_eq!(Arc::as_ptr(&stage(&mut gpu, 8).buffer), medium_id);
+        drop(small);
+        let above_budget = stage(&mut gpu, FREE_STAGING_BYTES as u32);
+        drop(above_budget);
+        gpu.staging.reclaim();
+        assert_eq!(gpu.staging.returned.bytes.load(Ordering::Relaxed), 24);
+        assert_eq!(gpu.staging.buffers.len(), 3);
+    }
+
+    // spec: GFX-SAMPLER-4
+    #[test]
+    fn concurrent_staging_returns_are_released_when_the_pool_drops() {
+        let Some((mut gpu, _, _)) = open() else {
+            return;
+        };
+        let staged: Vec<_> = (0..8)
+            .map(|_| gpu.stage(4, 1, |_| Ok::<(), ()>(())).unwrap().unwrap())
+            .collect();
+        let buffers: Vec<_> = staged.iter().map(|s| Arc::downgrade(&s.buffer)).collect();
+        let barrier = Arc::new(std::sync::Barrier::new(staged.len()));
+        std::thread::scope(|scope| {
+            for staged in staged {
+                let barrier = barrier.clone();
+                scope.spawn(move || {
+                    barrier.wait();
+                    drop(staged);
+                });
+            }
+        });
+        assert_eq!(gpu.staging.returned.bytes.load(Ordering::Relaxed), 32);
+        drop(gpu);
+        assert!(buffers.iter().all(|b| b.upgrade().is_none()));
     }
     // spec: GFX-SAMPLER-4
     #[test]

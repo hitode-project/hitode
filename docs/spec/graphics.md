@@ -319,8 +319,11 @@ snapshot storage; an unchanged Apply performs no state writes. Redundant fixed-s
 
 ### GFX-SAMPLER-4 Staged uploads
 
-**Rule**: Unlocked 32-bit BGRA pixels MUST be copied from guest memory once, straight into GPU staging memory, and reach the texture by a GPU copy. Staging storage MUST be bounded and reusable only after the GPU has read it.
+**Rule**: Pixels in formats stored by the GPU MUST be copied once from guest memory into GPU staging memory, reaching textures by GPU copy. Replayable snapshots MUST own their buffers independently of command chunks and upload-ring capacity. Buffers MUST be reused only after GPU completion.
 **Verification**: Test
+
+- The staging pool MUST choose the smallest free buffer that fits.
+- The pool MUST retain at most 64 MiB of free buffers.
 
 ## Bounded buffers
 

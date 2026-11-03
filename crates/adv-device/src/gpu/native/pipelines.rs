@@ -7,9 +7,8 @@ use super::super::{DrawState, Error, ProgrammableDraw};
 use super::Gpu;
 use std::path::Path;
 
-/// Binding slots, the same for every pipeline: record.rs binds them, the
-/// shaders declare them as `@binding(n)`. A pipeline lists only the slots its
-/// shaders read.
+/// Slots use adv-gpu's numbering per resource kind. WGSL groups identify the
+/// kind; record.rs and the owner use these same slot numbers directly.
 pub(crate) mod slot {
     /// Fixed-function transform and lighting state, or vertex shader
     /// constants.
@@ -19,12 +18,12 @@ pub(crate) mod slot {
     /// D3D9 vertex streams `0..16`, one storage buffer each; shaders pull
     /// their attributes (adv-gpu has no vertex input state). Fixed-function
     /// draws use stream 0 only, as packed [`super::super::super::Vertex`]es.
-    pub const STREAMS: u32 = 2;
+    pub const STREAMS: u32 = 0;
     /// Sampled images: pixel samplers `s0..s15`, then vertex samplers
-    /// `D3DVERTEXTEXTURESAMPLER0..3`; fixed-function stage `n` uses `n`.
-    pub const TEXTURES: u32 = 18;
+    /// `D3DVERTEXTEXTURESAMPLER0..3` at slots `16..20`; fixed stage `n` uses `n`.
+    pub const TEXTURES: u32 = 0;
     /// Samplers, in the same order as [`TEXTURES`].
-    pub const SAMPLERS: u32 = 38;
+    pub const SAMPLERS: u32 = 0;
 }
 
 use super::super::{self as gpu, Attribute, AttributeFormat, Program};
@@ -47,20 +46,8 @@ const MAGIC: &[u8; 8] = b"ADVNAT01";
 /// Vertex constants at slot 0 are followed immediately by the 640-byte
 /// ProgrammableDraw::parameters block. Slot 1 contains pixel constants.
 /// Fixed draws use the 32-byte fixed.wgsl Parameters block at slot 1;
-/// alpha_op bits 31 and 30 select opaque and A8 sampling respectively.
+/// Sampling adapters are specialized from the bound images in the pipeline key.
 const FIXED: &str = include_str!("../fixed.wgsl");
-
-/// Translate the stream's shared slot space to adv-gpu's per-kind registers.
-/// The owner applies this once when encoding a stream binding.
-pub(super) fn binding_slot(shared: u32) -> u32 {
-    match shared {
-        slot::VERTEX_UNIFORMS | slot::FRAGMENT_UNIFORMS => shared,
-        slot::STREAMS..slot::TEXTURES => shared - slot::STREAMS,
-        slot::TEXTURES..slot::SAMPLERS => shared - slot::TEXTURES,
-        slot::SAMPLERS..58 => shared - slot::SAMPLERS,
-        _ => unreachable!("executor binding slot"),
-    }
-}
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
 struct Raster {
@@ -93,14 +80,14 @@ impl From<&DrawState> for Raster {
 }
 #[derive(Clone, Serialize, Deserialize)]
 enum Kind {
-    Fixed,
+    Fixed(u8),
     Program {
         source: Arc<str>,
         textures: Vec<bool>,
         modes: Vec<u8>,
         streams: Vec<(u32, Vec<Attribute>, bool)>,
     },
-    Blit(gpu::Filter),
+    Blit(gpu::Filter, u8),
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct Recipe {
@@ -129,9 +116,9 @@ fn digest(bytes: &[u8]) -> u64 {
 }
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum DrawKind {
-    Fixed,
+    Fixed(u8),
     Program(u64),
-    Blit(gpu::Filter),
+    Blit(gpu::Filter, u8),
 }
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct StreamKey {
@@ -186,10 +173,11 @@ impl Pipelines {
         state: &DrawState,
         colors: &[Format],
         depth: Option<Format>,
+        sampling: u8,
     ) -> Result<RenderPipeline, Error> {
         let raster = Raster::from(state);
         let key = Key {
-            kind: DrawKind::Fixed,
+            kind: DrawKind::Fixed(sampling),
             raster,
             colors: colors.iter().copied().collect(),
             depth,
@@ -204,7 +192,7 @@ impl Pipelines {
             device,
             key,
             Recipe {
-                kind: Kind::Fixed,
+                kind: Kind::Fixed(sampling),
                 raster,
                 colors: colors.iter().copied().map(format_code).collect(),
                 depth: depth.map(format_code),
@@ -218,6 +206,7 @@ impl Pipelines {
         state: &DrawState,
         colors: &[Format],
         depth: Option<Format>,
+        sampling: &[u8],
     ) -> Result<RenderPipeline, Error> {
         let raster = Raster::from(state);
         let key = Key {
@@ -238,8 +227,8 @@ impl Pipelines {
                 .program
                 .textures
                 .iter()
-                .zip(&draw.textures)
-                .map(|(&vs, t)| (vs, sampling_mode(t.image.as_ref())))
+                .zip(sampling)
+                .map(|(&vs, &mode)| (vs, mode))
                 .collect(),
         };
         if let Some(pipeline) = self.entries.get(&key) {
@@ -254,11 +243,7 @@ impl Pipelines {
                 kind: Kind::Program {
                     source: draw.program.source.clone(),
                     textures: draw.program.textures.clone(),
-                    modes: draw
-                        .textures
-                        .iter()
-                        .map(|t| sampling_mode(t.image.as_ref()))
-                        .collect(),
+                    modes: sampling.to_vec(),
                     streams: draw
                         .streams
                         .iter()
@@ -276,10 +261,11 @@ impl Pipelines {
         device: &Device,
         filter: gpu::Filter,
         color: Format,
+        sampling: u8,
     ) -> Result<RenderPipeline, Error> {
         let mut state = DrawState::new(1, 1);
         let key = Key {
-            kind: DrawKind::Blit(filter),
+            kind: DrawKind::Blit(filter, sampling),
             raster: Raster::from(&state),
             colors: [color].into_iter().collect(),
             depth: None,
@@ -296,7 +282,7 @@ impl Pipelines {
             device,
             key,
             Recipe {
-                kind: Kind::Blit(filter),
+                kind: Kind::Blit(filter, sampling),
                 raster: Raster::from(&state),
                 colors: vec![format_code(color)],
                 depth: None,
@@ -378,7 +364,7 @@ impl Pipelines {
             "vulkan"
         };
         let identity = format!(
-            "native-1/{backend}/{}/{}/{:?}/{}",
+            "native-2/{backend}/{}/{}/{:?}/{}",
             device.caps().adapter,
             device.caps().driver,
             Format::Bgra8Unorm,
@@ -478,21 +464,19 @@ fn job(
         Ok(build(&device, &recipe, cache.as_deref()))
     })
 }
-fn sampling_mode(image: Option<&super::Image>) -> u8 {
+pub(super) fn fixed_sampling_flags(image: Option<&super::Image>) -> u8 {
     image.map_or(0, |image| {
-        if image.texel_format() == gpu::TexelFormat::A8 {
-            2
-        } else {
-            u8::from(image.alpha_mode() == gpu::AlphaMode::Opaque)
-        }
+        u8::from(image.alpha_mode() == gpu::AlphaMode::Opaque)
+            | (u8::from(image.texel_format() == gpu::TexelFormat::A8) << 1)
     })
 }
-
-pub(super) fn fixed_sampling_flags(image: Option<&super::Image>) -> u32 {
-    match sampling_mode(image) {
-        1 => 1 << 31,
-        2 => 1 << 30,
-        _ => 0,
+fn sampling_expression(flags: u8) -> &'static str {
+    match flags {
+        0 => "value",
+        1 => "vec4<f32>(value.rgb,1.0)",
+        2 => "vec4<f32>(0.0,0.0,0.0,value.r)",
+        3 => "vec4<f32>(0.0,0.0,0.0,1.0)",
+        _ => unreachable!("sampling flags"),
     }
 }
 
@@ -505,14 +489,6 @@ impl Gpu {
     }
     pub fn flush_pipeline_cache(&mut self) {
         self.pipelines.flush();
-        let cache = self.pipelines.stats();
-        self.stats.pipeline_cache_hits = cache.pipeline_cache_hits;
-        self.stats.compile_waits = cache.compile_waits;
-        self.stats.compile_wait_ns = cache.compile_wait_ns;
-        self.stats.prebuild_hits = cache.prebuild_hits;
-        self.stats.prebuild_misses = cache.prebuild_misses;
-        self.stats.persisted_pipelines = cache.persisted_pipelines;
-        self.stats.discarded_pipelines = cache.discarded_pipelines;
     }
 }
 
@@ -577,7 +553,7 @@ fn load_archive(path: &Path, identity: &str) -> Option<(VecDeque<Recipe>, Vec<u8
         return None;
     }
     let disk: Disk = serde_json::from_slice(&bytes[40..]).ok()?;
-    if disk.version != 1
+    if disk.version != 2
         || disk.identity != identity
         || disk.recipes.len() > MAX_PIPELINES
         || disk.recipes.iter().any(|r| !valid_recipe(r))
@@ -615,7 +591,7 @@ fn valid_recipe(recipe: &Recipe) -> bool {
                 }) && textures.iter().filter(|&&vs| vs).count() <= 4
                     && textures.iter().filter(|&&vs| !vs).count() <= 16
                     && modes.len() == textures.len()
-                    && modes.iter().all(|&m| m <= 2)
+                    && modes.iter().all(|&m| m <= 3)
                     && streams.len() <= 16
                     && streams.iter().map(|s| s.1.len()).sum::<usize>() <= 16
                     && streams.iter().all(|(stride, attrs, _)| {
@@ -631,7 +607,7 @@ fn valid_recipe(recipe: &Recipe) -> bool {
                             })
                     })
             }
-            _ => true,
+            Kind::Fixed(flags) | Kind::Blit(_, flags) => *flags <= 3,
         }
 }
 fn save_archive(
@@ -642,7 +618,7 @@ fn save_archive(
 ) -> std::io::Result<()> {
     use std::io::Write;
     let disk = Disk {
-        version: 1,
+        version: 2,
         identity: identity.to_owned(),
         recipes: recipes.clone(),
         driver: cache.serialize().map_err(std::io::Error::other)?,
@@ -693,7 +669,7 @@ fn build(
     cache: Option<&p::PipelineCache>,
 ) -> Result<Built, Error> {
     let source = match &recipe.kind {
-        Kind::Fixed | Kind::Blit(_) => fixed_source()?,
+        Kind::Fixed(flags) | Kind::Blit(_, flags) => fixed_source(*flags)?,
         Kind::Program {
             source,
             textures,
@@ -827,14 +803,34 @@ fn blend(b: gpu::Blend) -> p::BlendComponent {
         },
     }
 }
-fn fixed_source() -> Result<String, Error> {
+fn fixed_source(sampling: u8) -> Result<String, Error> {
+    let adapter = if sampling == 0 {
+        String::new()
+    } else {
+        format!(
+            "texel = {};",
+            sampling_expression(sampling).replace("value", "texel")
+        )
+    };
     let source = format!("{}\n{}", border_source("image", ""), FIXED)
         .replace("adv_border_sample(image, ", "adv_border_sample(")
-        .replace("@group(0) @binding(0)", &format!("@group(1) @binding({})", binding_slot(slot::TEXTURES)))
-        .replace("@group(0) @binding(1)", &format!("@group(2) @binding({})", binding_slot(slot::SAMPLERS)))
-        .replace("@group(0) @binding(2)", &format!("@group(0) @binding({})", slot::FRAGMENT_UNIFORMS))
-        .replace("    if (parameters.alpha_op & 0x80000000u)", "    if (parameters.alpha_op & 0x40000000u) != 0u { texel = vec4<f32>(0.0,0.0,0.0,texel.r); }\n    if (parameters.alpha_op & 0x80000000u)")
-        .replace("0x7fffffffu", "0x3fffffffu");
+        .replace(
+            "@group(0) @binding(0)",
+            &format!("@group(1) @binding({})", slot::TEXTURES),
+        )
+        .replace(
+            "@group(0) @binding(1)",
+            &format!("@group(2) @binding({})", slot::SAMPLERS),
+        )
+        .replace(
+            "@group(0) @binding(2)",
+            &format!("@group(0) @binding({})", slot::FRAGMENT_UNIFORMS),
+        )
+        .replace(
+            "if (parameters.alpha_op & 0x80000000u) != 0u { texel.a = 1.0; }",
+            &adapter,
+        )
+        .replace("parameters.alpha_op & 0x7fffffffu", "parameters.alpha_op");
     pulling(
         &source,
         &[(
@@ -911,11 +907,11 @@ fn program_source(
                 continue;
             }
             let group = if binding.binding % 2 == 0 { 1 } else { 2 };
-            let slot = binding_slot(if group == 1 {
+            let slot = if group == 1 {
                 slot::TEXTURES + n
             } else {
                 slot::SAMPLERS + n
-            });
+            };
             // Locate the binding attributes of this global in token space;
             // comments and whitespace have no semantic effect.
             let name = global.name.as_deref().unwrap();
@@ -954,11 +950,7 @@ fn program_source(
                 let alpha = name.replace("_image_", "_alpha_");
                 if source.contains(&format!("fn {alpha}(")) {
                     let body = function_body(&source, &alpha);
-                    let value = if modes[ordinal] == 2 {
-                        "vec4<f32>(0.0,0.0,0.0,value.r)"
-                    } else {
-                        "vec4<f32>(value.rgb,1.0)"
-                    };
+                    let value = sampling_expression(modes[ordinal]);
                     replacements.push((body, format!("return {value};")));
                 } else {
                     // Hand-authored programs use ordinary texture operations.
@@ -975,11 +967,7 @@ fn program_source(
                             ));
                         }
                     }
-                    let value = if modes[ordinal] == 2 {
-                        "vec4<f32>(0.0,0.0,0.0,value.r)"
-                    } else {
-                        "vec4<f32>(value.rgb,1.0)"
-                    };
+                    let value = sampling_expression(modes[ordinal]);
                     replacements.push((source.len()..source.len(), format!("\nfn adv_texel_{ordinal}(value:vec4<f32>)->vec4<f32>{{return {value};}}\n")));
                 }
             }
@@ -1115,7 +1103,7 @@ fn pulling(source: &str, streams: &[(u32, Vec<Attribute>, bool)]) -> Result<Stri
     for n in 0..streams.len() {
         result.push_str(&format!(
             "\n@group(3) @binding({}) var<storage,read> adv_stream_{n}:array<u32>;\n",
-            binding_slot(slot::STREAMS + n as u32)
+            slot::STREAMS + n as u32
         ));
     }
     result.push_str(&format!("\n@vertex fn vertex_main(@builtin(vertex_index) adv_vertex_index:u32,@builtin(instance_index) adv_instance_index:u32) {output} {{ return adv_guest_vertex({}); }}\n", arguments.join(",")));
@@ -1400,7 +1388,7 @@ struct V {{ @builtin(position) position:vec4<f32>, @location(0) color:vec4<f32> 
         for filter in [gpu::Filter::Nearest, gpu::Filter::Linear] {
             let pipeline = gpu
                 .pipelines
-                .blit(&gpu.device, filter, Format::Bgra8Unorm)
+                .blit(&gpu.device, filter, Format::Bgra8Unorm, 0)
                 .unwrap();
             let target = gpu.target_levels(1, 1, 1).unwrap();
             assert_eq!(
@@ -1509,6 +1497,11 @@ struct V {{ @builtin(position) position:vec4<f32>, @location(0) color:vec4<f32> 
                     &DrawState::new(1, 1),
                     &[Format::Bgra8Unorm],
                     None,
+                    &draw
+                        .textures
+                        .iter()
+                        .map(|t| fixed_sampling_flags(t.image.as_ref()))
+                        .collect::<arrayvec::ArrayVec<_, 20>>(),
                 )
                 .unwrap();
             let target = gpu.target_levels(1, 1, 1).unwrap();
@@ -1612,7 +1605,18 @@ struct V { @builtin(position) position:vec4<f32>, @location(0) uv:vec2<f32> }
         ];
         let pipeline = gpu
             .pipelines
-            .programmable(&gpu.device, &draw, &state, &[Format::Bgra8Unorm], None)
+            .programmable(
+                &gpu.device,
+                &draw,
+                &state,
+                &[Format::Bgra8Unorm],
+                None,
+                &draw
+                    .textures
+                    .iter()
+                    .map(|t| fixed_sampling_flags(t.image.as_ref()))
+                    .collect::<arrayvec::ArrayVec<_, 20>>(),
+            )
             .unwrap();
         let target = gpu.target_levels(1, 1, 1).unwrap();
         let mut vertex = bytemuck::bytes_of(&ConstantBlock::default()).to_vec();
@@ -1669,6 +1673,11 @@ struct V { @builtin(position) position:vec4<f32>, @location(0) uv:vec2<f32> }
                 &DrawState::new(1, 1),
                 &[Format::Bgra8Unorm],
                 None,
+                &draw
+                    .textures
+                    .iter()
+                    .map(|t| fixed_sampling_flags(t.image.as_ref()))
+                    .collect::<arrayvec::ArrayVec<_, 20>>(),
             )
             .unwrap();
         gpu.flush_pipeline_cache();
@@ -1695,6 +1704,7 @@ struct V { @builtin(position) position:vec4<f32>, @location(0) uv:vec2<f32> }
                 &DrawState::new(1, 1),
                 &[Format::Bgra8Unorm],
                 None,
+                0,
             )
             .unwrap();
         worker.join().unwrap();
@@ -1717,7 +1727,7 @@ struct V { @builtin(position) position:vec4<f32>, @location(0) uv:vec2<f32> }
         *source = "invalid WGSL".into();
         // Keep a valid driver blob and checksum while corrupting a recipe.
         let disk = Disk {
-            version: 1,
+            version: 2,
             identity: identity.clone(),
             recipes: malformed,
             driver,
@@ -1740,6 +1750,7 @@ struct V { @builtin(position) position:vec4<f32>, @location(0) uv:vec2<f32> }
                 &DrawState::new(1, 1),
                 &[Format::Bgra8Unorm],
                 None,
+                0,
             )
             .unwrap();
         rejected.flush();

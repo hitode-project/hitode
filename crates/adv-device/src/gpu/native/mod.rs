@@ -7,8 +7,9 @@
 //!
 //! - The execution thread calls the facade. Resources and pipelines are
 //!   created synchronously on it (`adv_gpu::Device` is `Send + Sync`); data is
-//!   written once, into the upload ring, in the resource's own format; every
-//!   GPU operation becomes a [`stream::Command`]. It never encodes, submits or
+//!   written once, into the upload ring or pooled staging buffers, in the
+//!   resource's own format. Every GPU operation becomes a [`stream::Command`].
+//!   It never encodes, submits or
 //!   waits for the GPU, except a readback the guest waits for.
 //! - The GPU owner thread ([`owner`]) owns the `adv_gpu::Queue`. It turns
 //!   command chunks into passes ([`pass`]), encodes and submits them,
@@ -70,6 +71,7 @@ pub struct Gpu {
     stats: Stats,
     owner: owner::Owner,
     recording: record::Recording,
+    staging: resources::StagingPool,
 }
 
 impl Gpu {
@@ -95,13 +97,23 @@ impl Gpu {
             stats: Stats::default(),
             owner,
             recording,
+            staging: Default::default(),
         })
     }
     pub fn set_clip(&mut self, clip: Option<Rect>) {
         self.clip = clip;
     }
     pub fn stats(&self) -> Stats {
-        self.stats
+        let mut stats = self.stats;
+        let cache = self.pipelines.stats();
+        stats.pipeline_cache_hits += cache.pipeline_cache_hits;
+        stats.compile_waits += cache.compile_waits;
+        stats.compile_wait_ns += cache.compile_wait_ns;
+        stats.prebuild_hits += cache.prebuild_hits;
+        stats.prebuild_misses += cache.prebuild_misses;
+        stats.persisted_pipelines = cache.persisted_pipelines;
+        stats.discarded_pipelines = cache.discarded_pipelines;
+        stats
     }
     /// Device loss, as reported by the owner thread.
     pub fn check(&self) -> Result<(), Error> {

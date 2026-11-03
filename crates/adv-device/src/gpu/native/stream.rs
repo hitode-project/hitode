@@ -1,8 +1,9 @@
 //! The command stream from the execution thread to the GPU owner thread.
 //!
 //! The execution thread appends [`Command`]s to a chunk and writes their data
-//! (vertices, constants, texels) straight into its upload ring. Full chunks go
-//! to the owner thread, which encodes while the execution thread keeps
+//! (vertices, constants, immediate texels) straight into its upload ring.
+//! Replayable uploads hold pooled staging buffers until GPU completion.
+//! Full chunks go to the owner thread, which encodes while the execution thread keeps
 //! recording, so a frame costs the longer of the two, not their sum. Chunks
 //! and their command storage come back for reuse: after warm-up, recording
 //! allocates nothing. One lock per chunk, never per command; the owner thread
@@ -61,6 +62,11 @@ pub(crate) struct Draw {
     pub opaque: Option<Rect>,
 }
 
+pub(crate) enum UploadSource {
+    Ring(Bytes),
+    Staged(super::Staged),
+}
+
 pub(crate) enum Command {
     /// Following clears and draws render to these attachments.
     Target {
@@ -78,7 +84,7 @@ pub(crate) enum Command {
     /// Rows of `pitch` bytes into `image`'s `mip` at `rect`, in the image's
     /// own format: converting formats is the GPU's job.
     Upload {
-        bytes: Bytes,
+        source: UploadSource,
         pitch: u32,
         image: Image,
         mip: u32,

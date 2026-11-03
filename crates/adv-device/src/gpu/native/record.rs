@@ -2,7 +2,7 @@
 //! assumes admitted commands and ring ranges are valid.
 
 use super::super::{self as gpu, DrawState, Error, Filter, ProgrammableDraw, Rect, Vertex};
-use super::pipelines::slot;
+use super::pipelines::{fixed_sampling_flags, slot};
 use super::resources::Storage;
 use super::stream::{Binding, Bytes, Command, Draw, Producer};
 use super::{Depth, Gpu, Image, ImageId, Target, backing};
@@ -42,7 +42,7 @@ impl Recording {
         };
         let bytes = stream.bytes(4, 4, |bytes| bytes.fill(255));
         stream.push(Command::Upload {
-            bytes,
+            source: super::stream::UploadSource::Ring(bytes),
             pitch: 4,
             image: white.clone(),
             mip: 0,
@@ -213,11 +213,23 @@ impl Gpu {
             .depth
             .as_ref()
             .map(|d| backing::depth_format(d.format()));
-        let pipeline = self.pipelines.fixed(&self.device, &state, &colors, depth)?;
+        let pipeline = self.pipelines.fixed(
+            &self.device,
+            &state,
+            &colors,
+            depth,
+            fixed_sampling_flags(image),
+        )?;
         let endpoint = if inclusive.is_some() {
             let mut point = state;
             point.topology = gpu::Topology::Points;
-            Some(self.pipelines.fixed(&self.device, &point, &colors, depth)?)
+            Some(self.pipelines.fixed(
+                &self.device,
+                &point,
+                &colors,
+                depth,
+                fixed_sampling_flags(image),
+            )?)
         } else {
             None
         };
@@ -415,6 +427,11 @@ impl Gpu {
             return Ok(());
         }
         self.select(target);
+        let sampling: arrayvec::ArrayVec<_, 20> = draw
+            .textures
+            .iter()
+            .map(|t| fixed_sampling_flags(t.image.as_ref()))
+            .collect();
         let pipeline = self.pipelines.programmable(
             &self.device,
             draw,
@@ -424,6 +441,7 @@ impl Gpu {
                 .depth
                 .as_ref()
                 .map(|d| backing::depth_format(d.format())),
+            &sampling,
         )?;
         let alignment = self.data_alignment() as usize;
         let parameters_offset = CONSTANT_SIZE;
@@ -544,15 +562,19 @@ impl Gpu {
         if source.shares_storage(destination) {
             return Err(invalid("image cannot blit onto itself"));
         }
-        if source.alpha_mode() == gpu::AlphaMode::Opaque
-            && destination.alpha_mode() == gpu::AlphaMode::Stored
-        {
-            return Err(Error::Unavailable(
-                "opaque-to-stored color conversion is unavailable".into(),
-            ));
-        }
         if (rectangle.w, rectangle.h) == (region.w, region.h) {
-            return if color_format(source) == color_format(destination) {
+            let copy_source = match &source.storage {
+                Storage::Fixed { image, .. } => image
+                    .desc()
+                    .usage
+                    .contains(adv_gpu::resource::Usage::COPY_SRC),
+                Storage::Swap(_) => true,
+            };
+            return if color_format(source) == color_format(destination)
+                && copy_source
+                && !(source.alpha_mode() == gpu::AlphaMode::Opaque
+                    && destination.alpha_mode() == gpu::AlphaMode::Stored)
+            {
                 self.copy_validated(source, rectangle, destination, region)
             } else {
                 self.blit_validated(source, rectangle, destination, region, Filter::Nearest)
@@ -632,9 +654,12 @@ impl Gpu {
         if area.w == 0 || area.h == 0 {
             return Ok(());
         }
-        let pipeline = self
-            .pipelines
-            .blit(&self.device, filter, color_format(destination))?;
+        let pipeline = self.pipelines.blit(
+            &self.device,
+            filter,
+            color_format(destination),
+            fixed_sampling_flags(Some(source)),
+        )?;
         self.select(&target);
         self.fixed_draw(&vertices, Some(source), &state, pipeline, area)
     }
@@ -1112,12 +1137,7 @@ fn fixed_parameters(state: &DrawState, image: Option<&Image>) -> [u32; 8] {
     let s = gpu::sampler_parameters(sampler);
     [
         op(state.texture_op),
-        op(state.alpha_texture_op)
-            | if image.is_some_and(|i| i.alpha_mode() == gpu::AlphaMode::Opaque) {
-                1 << 31
-            } else {
-                0
-            },
+        op(state.alpha_texture_op),
         compare,
         state.alpha_reference.to_bits(),
         s[0],
@@ -1220,7 +1240,256 @@ fn opaque_quad(
 
 #[cfg(test)]
 mod tests {
+    use super::super::resources::tests::{executor, read};
     use super::*;
+
+    fn quad(color: [f32; 4]) -> [Vertex; 6] {
+        [
+            (-1., -1.),
+            (1., -1.),
+            (-1., 1.),
+            (-1., 1.),
+            (1., -1.),
+            (1., 1.),
+        ]
+        .map(|(x, y)| Vertex {
+            position: [x, y, 0., 1.],
+            color,
+            uv: [(x + 1.) * 0.5, (1. - y) * 0.5],
+        })
+    }
+    fn program() -> ProgrammableDraw {
+        ProgrammableDraw {
+            instance_count: 1,
+            program: gpu::Program::new("struct C { f: array<vec4<f32>,256> }; @group(0) @binding(1) var<uniform> c:C; @vertex fn vertex_main(@builtin(vertex_index) i:u32)->@builtin(position) vec4<f32> { let p=array<vec2<f32>,3>(vec2(-1.,-1.),vec2(3.,-1.),vec2(-1.,3.)); return vec4(p[i],0.,1.); } @fragment fn fragment_main()->@location(0) vec4<f32> { return c.f[0]; }".into(), vec![]),
+            streams: vec![], indices: None, vertex_count: 3,
+            vertex_constants: Default::default(), pixel_constants: Default::default(),
+            textures: vec![], parameters: [[0; 4]; 40],
+        }
+    }
+
+    // Same scene and exact pixels as renderer/program/tests.rs.
+    // spec: GFX-BUFFER-2, GFX-CACHE-1
+    #[test]
+    fn facade_fixed_and_programmable_share_ordered_uploads() {
+        let Some(mut gpu) = executor() else { return };
+        let target = gpu.target(3, 1, false).unwrap();
+        gpu.clear(&target, Some([0.; 4]), None).unwrap();
+        let mut state = DrawState::new(3, 1);
+        let mut draw = program();
+        draw.pixel_constants.floats[0] = [0., 1., 0., 1.];
+        gpu.draw(&target, &quad([1., 0., 0., 1.]), None, state)
+            .unwrap();
+        state.scissor = Some(Rect {
+            x: 1,
+            y: 0,
+            w: 2,
+            h: 1,
+        });
+        gpu.draw_programmable(&target, &draw, &state).unwrap();
+        state.scissor = Some(Rect {
+            x: 2,
+            y: 0,
+            w: 1,
+            h: 1,
+        });
+        state.alpha_reference = 0.5;
+        gpu.draw(&target, &quad([0., 0., 1., 1.]), None, state)
+            .unwrap();
+        assert_eq!(
+            read(&mut gpu, &target.image),
+            [0, 0, 255, 255, 0, 255, 0, 255, 255, 0, 0, 255]
+        );
+        assert_eq!(gpu.stats().pipeline_cache_hits, 1);
+        assert_eq!(gpu.stats().prebuild_misses, 2);
+        assert_eq!(gpu.stats().compile_waits, 2);
+        let stats = gpu.stats();
+        gpu.flush_pipeline_cache();
+        assert_eq!(gpu.stats(), stats);
+
+        let texture = gpu.image(1, 1).unwrap();
+        gpu.upload(&texture, whole(&texture), 4, &[0, 0, 255, 255])
+            .unwrap();
+        state = DrawState::new(3, 1);
+        state.texture_op = gpu::TextureOp::Texture;
+        gpu.draw(&target, &quad([1.; 4]), Some(&texture), state)
+            .unwrap();
+        gpu.upload(&texture, whole(&texture), 4, &[0, 255, 0, 255])
+            .unwrap();
+        state.scissor = Some(Rect {
+            x: 1,
+            y: 0,
+            w: 2,
+            h: 1,
+        });
+        gpu.draw(&target, &quad([1.; 4]), Some(&texture), state)
+            .unwrap();
+        assert_eq!(
+            read(&mut gpu, &target.image),
+            [0, 0, 255, 255, 0, 255, 0, 255, 0, 255, 0, 255]
+        );
+    }
+
+    // Reuse the padded 2x2 texture and exact nearest pixels of tests/gpu.rs.
+    // Exercise both blit pipelines with the same authored colors.
+    // spec: GFX-SAMPLER-4, GFX-REC-1
+    #[test]
+    fn facade_textured_draw_and_blits_preserve_exact_pixels() {
+        let Some(mut gpu) = executor() else { return };
+        let target = gpu.target(2, 2, false).unwrap();
+        let image = gpu.image(2, 2).unwrap();
+        gpu.upload(
+            &image,
+            whole(&image),
+            12,
+            &[
+                0, 0, 255, 255, 0, 255, 0, 255, 19, 19, 19, 19, 255, 0, 0, 255, 255, 255, 255, 255,
+            ],
+        )
+        .unwrap();
+        let expected = [
+            0, 0, 255, 255, 0, 255, 0, 255, 255, 0, 0, 255, 255, 255, 255, 255,
+        ];
+        let mut state = DrawState::new(2, 2);
+        state.texture_op = gpu::TextureOp::Texture;
+        state.alpha_texture_op = gpu::TextureOp::Texture;
+        gpu.draw(&target, &quad([1.; 4]), Some(&image), state)
+            .unwrap();
+        assert_eq!(read(&mut gpu, &target.image), expected);
+        gpu.clear(&target, Some([0.; 4]), None).unwrap();
+        gpu.blit(
+            &image,
+            whole(&image),
+            &target.image,
+            whole(&target.image),
+            Filter::Nearest,
+        )
+        .unwrap();
+        assert_eq!(read(&mut gpu, &target.image), expected);
+        let copied = gpu.target(2, 2, false).unwrap();
+        gpu.blit(
+            &target.image,
+            whole(&target.image),
+            &copied.image,
+            whole(&copied.image),
+            Filter::Nearest,
+        )
+        .unwrap();
+        assert_eq!(read(&mut gpu, &copied.image), expected);
+        let solid = gpu.image(1, 1).unwrap();
+        gpu.upload(&solid, whole(&solid), 4, &expected[..4])
+            .unwrap();
+        gpu.blit(
+            &solid,
+            whole(&solid),
+            &target.image,
+            whole(&target.image),
+            Filter::Linear,
+        )
+        .unwrap();
+        assert_eq!(read(&mut gpu, &target.image), expected[..4].repeat(4));
+    }
+
+    // spec: GFX-SAMPLER-1, GFX-SAMPLER-4, GFX-CACHE-1
+    #[test]
+    fn facade_sampling_flags_follow_each_bound_image() {
+        let Some(mut gpu) = executor() else { return };
+        let target = gpu.target(1, 1, false).unwrap();
+        let mut state = DrawState::new(1, 1);
+        state.texture_op = gpu::TextureOp::Texture;
+        state.alpha_texture_op = gpu::TextureOp::Texture;
+        let mut draw = program();
+        draw.program = gpu::Program::new(
+            r#"
+@group(1) @binding(0) var image:texture_2d<f32>;
+@group(1) @binding(1) var image_sampler:sampler;
+@vertex fn vertex_main(@builtin(vertex_index) i:u32)->@builtin(position) vec4<f32> {
+    let p=array<vec2<f32>,3>(vec2(-1.,-1.),vec2(3.,-1.),vec2(-1.,3.));
+    return vec4(p[i],0.,1.);
+}
+@fragment fn fragment_main()->@location(0) vec4<f32> {
+    return textureSampleLevel(image,image_sampler,vec2(0.5),0.0);
+}"#
+            .into(),
+            vec![false],
+        );
+        for (format, input, expected) in [
+            (
+                gpu::TexelFormat::Bgra8,
+                &[11, 22, 33, 0][..],
+                [11, 22, 33, 0],
+            ),
+            (
+                gpu::TexelFormat::Bgrx8,
+                &[11, 22, 33, 0][..],
+                [11, 22, 33, 255],
+            ),
+            (gpu::TexelFormat::A8, &[77][..], [0, 0, 0, 77]),
+        ] {
+            let image = gpu.texture(1, 1, 1, format).unwrap();
+            gpu.upload(&image, whole(&image), input.len() as u32, input)
+                .unwrap();
+            gpu.draw(&target, &quad([1.; 4]), Some(&image), state)
+                .unwrap();
+            assert_eq!(read(&mut gpu, &target.image), expected);
+            draw.textures = vec![gpu::ProgramTexture {
+                image: Some(image.clone()),
+                sampler: state.sampler,
+            }];
+            gpu.draw_programmable(&target, &draw, &state).unwrap();
+            assert_eq!(read(&mut gpu, &target.image), expected);
+            gpu.blit(
+                &image,
+                whole(&image),
+                &target.image,
+                whole(&target.image),
+                Filter::Nearest,
+            )
+            .unwrap();
+            assert_eq!(read(&mut gpu, &target.image), expected);
+        }
+    }
+
+    // spec: GFX-SAMPLER-1, GFX-SAMPLER-4
+    #[test]
+    fn facade_programmable_samplers_and_adapters_follow_both_stages() {
+        let Some(mut gpu) = executor() else { return };
+        let target = gpu.target(1, 1, false).unwrap();
+        let alpha = gpu.texture(1, 1, 1, gpu::TexelFormat::A8).unwrap();
+        let opaque = gpu.texture(1, 1, 1, gpu::TexelFormat::Bgrx8).unwrap();
+        gpu.upload(&alpha, whole(&alpha), 1, &[77]).unwrap();
+        gpu.upload(&opaque, whole(&opaque), 4, &[11, 22, 33, 0])
+            .unwrap();
+        let mut draw = program();
+        draw.program = gpu::Program::new(
+            r#"
+@group(1) @binding(0) var vs_image:texture_2d<f32>;
+@group(1) @binding(1) var vs_sampler:sampler;
+@group(1) @binding(2) var ps_image:texture_2d<f32>;
+@group(1) @binding(3) var ps_sampler:sampler;
+struct V { @builtin(position) position:vec4<f32>, @location(0) alpha:f32 }
+@vertex fn vertex_main(@builtin(vertex_index) i:u32)->V {
+    let p=array<vec2<f32>,3>(vec2(-1.,-1.),vec2(3.,-1.),vec2(-1.,3.));
+    let value=textureSampleLevel(vs_image,vs_sampler,vec2(0.5),0.0);
+    return V(vec4(p[i],0.,1.),value.a);
+}
+@fragment fn fragment_main(v:V)->@location(0) vec4<f32> {
+    let value=textureSampleLevel(ps_image,ps_sampler,vec2(0.5),0.0);
+    return vec4(v.alpha,value.g,value.b,value.a);
+}"#
+            .into(),
+            vec![true, false],
+        );
+        draw.textures = [alpha, opaque]
+            .map(|image| gpu::ProgramTexture {
+                image: Some(image),
+                sampler: DrawState::new(1, 1).sampler,
+            })
+            .to_vec();
+        gpu.draw_programmable(&target, &draw, &DrawState::new(1, 1))
+            .unwrap();
+        assert_eq!(read(&mut gpu, &target.image), [11, 22, 77, 255]);
+    }
 
     // spec: GFX-REC-1, GFX-PASS-1
     #[test]
