@@ -248,10 +248,16 @@ fn d3d9_provider() -> adv_dx::d3d9::SurfaceProvider {
                 .replace_native(id, target)
                 .map(|_| ())
         },
+        #[cfg(not(feature = "native-display"))]
         present: |ext, id, damage, gpu| {
             ext.get_mut::<Surfaces<Snapshot>>()
                 .present_native_rotating(id, damage, gpu)
         },
+        #[cfg(feature = "native-display")]
+        present: native_present,
+        #[cfg(feature = "native-display")]
+        present_copy: native_present,
+        #[cfg(not(feature = "native-display"))]
         present_copy: |ext, id, damage, gpu| {
             use adv_device::gpu::Error;
             let graphics = ext.get_mut::<Surfaces<Snapshot>>();
@@ -270,6 +276,32 @@ fn d3d9_provider() -> adv_dx::d3d9::SurfaceProvider {
                 .and_then(|vsync| vsync.phase(std::time::Instant::now()))
         },
     }
+}
+
+#[cfg(feature = "native-display")]
+fn native_present(
+    ext: &mut adv_machine::Ext,
+    id: u32,
+    damage: Option<adv_device::surface::Rect>,
+    gpu: &mut adv_device::gpu::Gpu,
+) -> Result<u64, adv_device::gpu::Error> {
+    use adv_device::frame::Damage;
+    let damage = damage.map_or(Damage::Whole, |r| {
+        let mut damage = Damage::Rects(Default::default());
+        if let Damage::Rects(rects) = &mut damage {
+            rects.push(Default::default());
+            rects[0].x = r.x;
+            rects[0].y = r.y;
+            rects[0].w = r.w;
+            rects[0].h = r.h;
+        }
+        damage
+    });
+    let surfaces = ext.get_mut::<Surfaces<Snapshot>>();
+    surfaces
+        .present_native(id, damage, gpu)
+        .map_err(adv_device::gpu::Error::Invalid)?;
+    Ok(surfaces.stats.presentations)
 }
 
 /// Memory DCs lent to the fronts' surfaces.

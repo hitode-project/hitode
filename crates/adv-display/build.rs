@@ -19,6 +19,14 @@ fn main() {
     let software = read("software");
     for (name, wgsl, bindings) in [
         (
+            "output",
+            software.clone() + &read("output"),
+            bindings::OUTPUT
+                .into_iter()
+                .chain(bindings::INGEST)
+                .collect(),
+        ),
+        (
             "ingest",
             software.clone() + &read("ingest"),
             bindings::INGEST.to_vec(),

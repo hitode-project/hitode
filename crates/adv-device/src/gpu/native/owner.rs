@@ -61,6 +61,16 @@ impl Drop for Owner {
     }
 }
 fn high_priority() -> adv_gpu::Result<()> {
+    #[cfg(target_os = "android")]
+    unsafe {
+        // PRIORITY_DISPLAY, matching HWUI; leave core placement to the scheduler.
+        if libc::setpriority(libc::PRIO_PROCESS, 0, -4) != 0 {
+            return Err(adv_gpu::Error::Unavailable(format!(
+                "GPU owner priority: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+    }
     #[cfg(target_vendor = "apple")]
     unsafe {
         unsafe extern "C" {

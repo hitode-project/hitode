@@ -326,7 +326,12 @@ fn open_video(stream: &format::stream::Stream<'_>) -> Result<Video, Error> {
         software::scaling::Flags::BILINEAR,
     )?;
     #[cfg(feature = "native-display")]
-    let output = super::planes::Output::new(&decoder)?;
+    let output = super::planes::Output::new(
+        crate::gpu::Gpu::execution(false)
+            .map_err(|e| Error::Decode(e.to_string()))?
+            .device(),
+        &decoder,
+    )?;
     let frame_duration_us = if rate.numerator() > 0 {
         (1_000_000 * rate.denominator() as u64 / rate.numerator() as u64).max(1)
     } else {

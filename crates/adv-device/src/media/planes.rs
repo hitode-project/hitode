@@ -4,7 +4,6 @@ use super::{Error, VideoFrame};
 use adv_gpu::{
     Device, Format, FormatCaps, PresentPool,
     present::{PlaneMut, PoolDesc, YuvColor},
-    queue::DeviceOptions,
 };
 use ffmpeg_next::{self as ff, format::Pixel, frame, software};
 use std::sync::Arc;
@@ -35,10 +34,9 @@ pub(super) fn color(space: ff::color::Space, range: ff::color::Range) -> YuvColo
 }
 
 impl Output {
-    pub(super) fn new(decoder: &ff::decoder::Video) -> Result<Self, Error> {
+    pub(super) fn new(device: &Device, decoder: &ff::decoder::Video) -> Result<Self, Error> {
         let (width, height) = (decoder.width(), decoder.height());
         let color = color(decoder.color_space(), decoder.color_range());
-        let (device, _queue) = Device::open(&DeviceOptions::default()).map_err(gpu_error)?;
         let format = [Format::Nv12, Format::Nv21]
             .into_iter()
             .find(|&format| {

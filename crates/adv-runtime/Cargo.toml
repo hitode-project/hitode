@@ -11,6 +11,7 @@ description = "Guest GDI/DirectDraw software surfaces and a common presentation 
 default = []
 gpu = ["adv-dx/gpu", "adv-device/gpu"]
 media = ["adv-dx/media"]
+native-display = ["gpu", "adv-device/native-display"]
 
 [dependencies]
 adv-abi = { path = "../adv-abi" }

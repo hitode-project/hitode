@@ -11,8 +11,11 @@ description = "Host platform shell: window, input, audio device, execution drive
 default = []
 gpu = ["adv-runtime/gpu", "adv-device/gpu", "dep:wgpu", "dep:pollster"]
 media = ["adv-runtime/media"]
+native-display = ["gpu", "adv-device/native-display", "adv-runtime/native-display", "dep:adv-display", "dep:adv-gpu"]
 
 [dependencies]
+adv-display = { path = "../adv-display", optional = true }
+adv-gpu = { path = "../adv-gpu", optional = true }
 adv-runtime = { path = "../adv-runtime" }
 adv-machine = { path = "../adv-machine" }
 adv-os = { path = "../adv-os" }

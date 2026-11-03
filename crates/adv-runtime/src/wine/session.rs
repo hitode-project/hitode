@@ -1321,7 +1321,7 @@ impl Session {
     /// Take the latest presented frame into [`Session::frame`], reading a
     /// native one back from the GPU.
     pub fn capture(&mut self) -> Result<(), String> {
-        #[cfg(feature = "gpu")]
+        #[cfg(all(feature = "gpu", not(feature = "native-display")))]
         if let Some(composition) = self
             .machine
             .ext
@@ -1340,7 +1340,7 @@ impl Session {
             .map(|_| ())
     }
 
-    #[cfg(feature = "gpu")]
+    #[cfg(all(feature = "gpu", not(feature = "native-display")))]
     fn capture_native(
         &mut self,
         composition: adv_device::surface::PendingFrame,

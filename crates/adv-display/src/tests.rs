@@ -1010,3 +1010,30 @@ fn recorder_replays_stateful_upscales_and_composed_video() {
     assert!(!p.stages.iter().any(|s| matches!(s, Stage::Refine { .. })));
     assert!(p.unrefined.is_empty());
 }
+
+#[test]
+fn executor_recorder_keeps_600_presents_independently_of_releases() {
+    let mut recorder = Recorder::present_history();
+    for serial in 0..CAPACITY + 5 {
+        let mut record = record();
+        record.frame.serial = serial as u64;
+        recorder.record(Event::Present(Box::new(record)));
+        for buffer in 0..8 {
+            recorder.record(Event::Released { pool: 0, buffer });
+        }
+    }
+    let records = recorder
+        .events()
+        .filter_map(|e| {
+            if let Event::Present(r) = e {
+                Some(r)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(records.len(), CAPACITY);
+    assert_eq!(records[0].frame.serial, 5);
+    assert_eq!(records.last().unwrap().frame.serial, (CAPACITY + 4) as u64);
+    assert!(recorder.events().count() <= CAPACITY * 9);
+}

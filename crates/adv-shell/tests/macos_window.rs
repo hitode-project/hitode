@@ -158,7 +158,12 @@ mod mac {
         let mut window = Window::new("adv macos window test", 320, 240, true).unwrap();
         let native = find_window(mtm, "adv macos window test");
 
+        #[cfg(not(feature = "native-display"))]
         let (gpu, presenter) = window.create_native(false).unwrap();
+        #[cfg(feature = "native-display")]
+        let (gpu, presenter) = window
+            .create_display(false, adv_shell::window::WakeEvent::new().unwrap())
+            .unwrap();
         window.native_canvas((320, 240)).unwrap();
         let size = native.contentView().unwrap().bounds().size;
         let scale = native.backingScaleFactor();

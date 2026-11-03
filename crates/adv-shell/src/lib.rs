@@ -20,11 +20,17 @@ pub use adv_runtime::{
 };
 #[cfg(mobile)]
 pub use logging::init_system_log;
-#[cfg(host_view)]
+#[cfg(feature = "native-display")]
+mod display;
+#[cfg(all(host_view, not(feature = "native-display")))]
 mod native_gpu;
-#[cfg(host_view)]
+#[cfg(all(feature = "native-display", target_vendor = "apple"))]
+use display as native_gpu;
+#[cfg(all(host_view, not(feature = "native-display")))]
 mod upscaling;
-#[cfg(host_view)]
+#[cfg(feature = "native-display")]
+pub use display::Upscaler;
+#[cfg(all(host_view, not(feature = "native-display")))]
 pub use upscaling::Upscaler;
 mod scaling;
 pub use scaling::Scaling;
@@ -32,7 +38,10 @@ pub mod overlay;
 mod performance;
 #[cfg(host_view)]
 mod session;
-#[cfg(any(host_view, all(test, feature = "gpu")))]
+#[cfg(all(
+    not(feature = "native-display"),
+    any(host_view, all(test, feature = "gpu"))
+))]
 mod software_frame;
 pub mod window;
 #[cfg(host_view)]

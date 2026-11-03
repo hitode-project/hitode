@@ -123,8 +123,17 @@ pub(super) fn run(options: &Options, dist: &Path) -> Result<u8, String> {
     let result = (|| {
         let gpu = if options.headless_gpu {
             // As the built-in stack attaches a headless GPU.
+            #[cfg(feature = "native-display")]
+            let gpu = crate::display::headless(
+                options.gpu_software,
+                (options.width, options.height),
+                wake.clone(),
+            )?
+            .start()?;
+            #[cfg(not(feature = "native-display"))]
             let gpu = pollster::block_on(adv_device::gpu::Gpu::request(options.gpu_software))
                 .map_err(|e| e.to_string())?;
+            #[cfg(not(feature = "native-display"))]
             gpu.context()
                 .set_execution_wake(wake.clone())
                 .map_err(|_| "GPU wake already installed")?;
@@ -173,6 +182,12 @@ pub(super) fn run_execution(
     keys: Arc<KeyState>,
     background: adv_sync::background::Sender,
 ) -> Result<Finished, String> {
+    #[cfg(feature = "native-display")]
+    let gpu = worker
+        .display
+        .take()
+        .map(|startup| startup.start())
+        .transpose()?;
     let pacer = super::frame_pacer::HostPacer {
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         vsync: worker.vsync.take(),
@@ -183,7 +198,10 @@ pub(super) fn run_execution(
     };
     let host = Host {
         background: background.into_local(),
+        #[cfg(not(feature = "native-display"))]
         gpu: worker.gpu.take(),
+        #[cfg(feature = "native-display")]
+        gpu,
         frames: Some((worker.take_frames(), worker.ui_wake.clone())),
         pacer: Some(pacer),
     };

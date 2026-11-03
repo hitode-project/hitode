@@ -114,10 +114,13 @@ impl HostView {
         this.setOpaque(true);
         this.setBackgroundColor(Some(&UIColor::blackColor()));
         this.layer().addSublayer(&frame);
+        #[cfg(feature = "native-display")]
+        cursor.layer().setZPosition(2.0);
         this.addSubview(&cursor);
         Ok(this)
     }
     /// The frame sublayer the presenter draws into.
+    #[cfg(not(feature = "native-display"))]
     pub(crate) fn metal_layer(&self) -> *mut std::ffi::c_void {
         Retained::as_ptr(&self.ivars().frame).cast_mut().cast()
     }
@@ -130,6 +133,9 @@ impl HostView {
         }
     }
     fn apply_placement(&self) {
+        #[cfg(feature = "native-display")]
+        let placement = None::<crate::native_gpu::Placement>;
+        #[cfg(not(feature = "native-display"))]
         let placement = self.ivars().placement.get();
         let scale = self.contentScaleFactor();
         let bounds = self.bounds().size;

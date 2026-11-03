@@ -46,6 +46,8 @@ This spec covers the Android player: its package, its lifecycle and input, and t
 **Applies to**: Android
 **Verification**: Test
 
+With `native-display`, replacement MUST rebuild only SurfaceControl, retain display pools, and suspend presentation without a surface.
+
 ### AND-APP-11 Touch input
 
 **Rule**: Touch coordinates MUST match the scaled viewport and clamp to canvas edges. Touches MUST reach the guest only as the gestures of AND-APP-14.

@@ -92,7 +92,13 @@ pub async fn request(fallback: bool) -> Result<Gpu, Error> {
         return Gpu::facade(execution);
     }
     let (presenter, receiver) = CapturePresenter::new();
-    let gpu = Gpu::request_with_presenter(fallback, Box::new(presenter)).await?;
+    let (device, queue) = adv_gpu::Device::open(&adv_gpu::queue::DeviceOptions {
+        software: fallback,
+        validation: true,
+        ..Default::default()
+    })
+    .map_err(super::record::gpu_error)?;
+    let gpu = Gpu::request_with_presenter(device, queue, Box::new(presenter)).await?;
     *gpu.execution.capture.borrow_mut() = Some(Rc::new(Frames {
         receiver,
         frames: RefCell::new(Vec::new()),

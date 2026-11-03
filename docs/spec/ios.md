@@ -71,6 +71,8 @@ The launcher holds selected directories' security scopes while it runs. Game fol
 **Applies to**: iOS
 **Verification**: Review — UIKit layout and the display link run only inside an application.
 
+With `native-display`, IOSurface contents MUST attach through the Core Animation compositor after GPU completion, preserving the existing display link.
+
 ### IOS-APP-3 Touch routing
 
 **Rule**: The game view and the launcher's webview MUST share one container whose hit test asks the overlay Router for each new touch. UIKit then keeps that target for the touch's lifetime. The overlay MUST own all touches while no game runs, and the webview MUST be hidden while a game runs and the overlay draws nothing.

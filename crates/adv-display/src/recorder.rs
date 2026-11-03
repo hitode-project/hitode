@@ -35,11 +35,41 @@ pub struct PresentRecord {
 #[derive(Default)]
 pub struct Recorder {
     events: VecDeque<Event>,
+    present_history: bool,
+    presents: usize,
 }
 
 impl Recorder {
+    /// Executor history retains 600 presents independently of release traffic.
+    pub(crate) fn present_history() -> Self {
+        Self {
+            present_history: true,
+            ..Self::default()
+        }
+    }
     pub fn record(&mut self, event: Event) {
-        if self.events.len() == CAPACITY {
+        if self.present_history {
+            if matches!(event, Event::Present(_)) {
+                if self.presents == CAPACITY {
+                    while let Some(old) = self.events.pop_front() {
+                        if matches!(old, Event::Present(_)) {
+                            self.presents -= 1;
+                            break;
+                        }
+                    }
+                }
+                self.presents += 1;
+            } else if self.events.len() - self.presents == CAPACITY * 8 {
+                // A submission hands off at most eight images. Bound ancillary
+                // events separately so releases cannot evict planner records.
+                let oldest = self
+                    .events
+                    .iter()
+                    .position(|e| !matches!(e, Event::Present(_)))
+                    .unwrap();
+                self.events.remove(oldest);
+            }
+        } else if self.events.len() == CAPACITY {
             self.events.pop_front();
         }
         self.events.push_back(event);

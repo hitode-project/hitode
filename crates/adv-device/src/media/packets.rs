@@ -154,6 +154,8 @@ enum Kind {
 }
 
 pub(super) struct Decoder {
+    #[cfg(feature = "native-display")]
+    device: Option<adv_gpu::Device>,
     kind: Kind,
 }
 
@@ -262,7 +264,20 @@ impl Decoder {
                     .then(super::audio_clock::AudioClock::default),
             },
         };
-        Ok(Self { kind })
+        Ok(Self {
+            kind,
+            #[cfg(feature = "native-display")]
+            device: if matches!(format, CodecFormat::Video { .. }) {
+                Some(
+                    crate::gpu::Gpu::execution(false)
+                        .map_err(|e| Error::Decode(e.to_string()))?
+                        .device()
+                        .clone(),
+                )
+            } else {
+                None
+            },
+        })
     }
 
     pub fn decode(&mut self, data: &[u8], time_100ns: Option<u64>) -> Result<Vec<Decoded>, Error> {
@@ -328,7 +343,10 @@ impl Decoder {
                         Ok(()) => {
                             #[cfg(feature = "native-display")]
                             if output.is_none() {
-                                *output = Some(super::planes::Output::new(decoder)?);
+                                *output = Some(super::planes::Output::new(
+                                    self.device.as_ref().unwrap(),
+                                    decoder,
+                                )?);
                             }
 
                             #[cfg(not(feature = "native-display"))]

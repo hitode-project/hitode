@@ -21,6 +21,9 @@ tauri-build = { version = "=2.7.2", features = [] }
 lzma-rust2 = { version = "0.23.0", default-features = false, features = ["std", "xz", "encoder", "optimization"] }
 sha2 = "0.10.9"
 
+[features]
+native-display = ["adv-shell/native-display"]
+
 [dependencies]
 adv-shell = { path = "../../../crates/adv-shell" }
 adv-report = { path = "../../../crates/adv-report" }

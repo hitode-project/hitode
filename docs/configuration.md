@@ -9,6 +9,15 @@ Kinds:
 - **Diagnostic** only observes or checks.
 - **Fixture** controls self-written tests and the conditions they run under.
 
+## Native display migration
+
+`adv-shell/native-display` selects the `adv-display` executor over `adv-gpu` and
+forwards `adv-device/native-display` and `adv-runtime/native-display`.
+`adv-run` and the launcher forward it as `native-display`. This comparison
+feature defaults off and is removed by package G2 of issue #103.
+The native path stores the selected upscaler but presents with `Upscaler::Off`
+until package U1 supplies its stages. Without the feature the wgpu path remains.
+
 ## Android display probe
 
 The `debug.adv.probe.rotation` Android system property is diagnostic. Its default

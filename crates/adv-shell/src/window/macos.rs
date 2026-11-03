@@ -109,6 +109,7 @@ impl Viewport {
     }
 }
 
+#[cfg(not(feature = "native-display"))]
 pub(crate) fn native_viewport(
     width: u32,
     height: u32,
@@ -699,11 +700,20 @@ impl Window {
     pub fn post_input(&mut self, message: u32, wparam: u32, lparam: u32) -> Result<(), String> {
         self.view.post_input(message, wparam, lparam)
     }
+    #[cfg(not(feature = "native-display"))]
     pub fn create_native(
         &mut self,
         fallback: bool,
     ) -> Result<(adv_device::gpu::Gpu, crate::native_gpu::WindowPresenter), String> {
         self.view.create_native(fallback)
+    }
+    #[cfg(feature = "native-display")]
+    pub fn create_display(
+        &mut self,
+        software: bool,
+        wake: WakeEvent,
+    ) -> Result<(crate::display::Startup, crate::display::Ui), String> {
+        self.view.create_display(software, wake)
     }
     pub fn native_client_size(&self) -> Result<(u32, u32), String> {
         self.view.native_client_size()

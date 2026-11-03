@@ -28,5 +28,5 @@ fn video_color(pos: vec4<f32>) -> vec4<f32> {
 }
 @fragment fn fs_software(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     if inside(pos.xy, p.dst) || inside(pos.xy, p.bg) { return video_color(pos); }
-    return software_pixel(u32(pos.x), u32(pos.y));
+    return vec4(software_pixel(u32(pos.x), u32(pos.y)).rgb, 1.0);
 }

@@ -3,5 +3,5 @@
     return software_vertex(vertex, tile);
 }
 @fragment fn fragment_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
-    return software_pixel(u32(position.x), u32(position.y));
+    return vec4(software_pixel(u32(position.x), u32(position.y)).rgb, 1.0);
 }

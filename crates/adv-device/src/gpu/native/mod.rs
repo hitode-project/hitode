@@ -88,10 +88,11 @@ impl Gpu {
     /// any surface store or facade starts a headless one. The presenter stays
     /// until the last facade drops; a running execution refuses another.
     pub async fn request_with_presenter(
-        fallback: bool,
+        device: adv_gpu::Device,
+        queue: adv_gpu::Queue,
         presenter: Box<dyn crate::frame::Presenter>,
     ) -> Result<Self, Error> {
-        Self::start(fallback, Some(presenter))
+        Self::start(false, Some((device, queue, presenter)))
     }
     /// Share the thread's execution, starting a headless one if none runs.
     pub(crate) fn execution(fallback: bool) -> Result<Self, Error> {
@@ -99,7 +100,11 @@ impl Gpu {
     }
     fn start(
         fallback: bool,
-        presenter: Option<Box<dyn crate::frame::Presenter>>,
+        presenter: Option<(
+            adv_gpu::Device,
+            adv_gpu::Queue,
+            Box<dyn crate::frame::Presenter>,
+        )>,
     ) -> Result<Self, Error> {
         let execution = EXECUTION.with(|cached| {
             if let Some(execution) = cached.borrow().upgrade() {
@@ -110,18 +115,27 @@ impl Gpu {
                 }
                 return Ok(execution);
             }
-            let (device, queue) = adv_gpu::Device::open(&adv_gpu::queue::DeviceOptions {
-                software: fallback,
-                validation: cfg!(all(
-                    any(test, feature = "test-support"),
-                    not(target_os = "android")
-                )),
-                #[cfg(feature = "test-support")]
-                disable: adv_gpu::Modern::from_test_env(),
-                label: "execution GPU",
-                ..Default::default()
-            })
-            .map_err(record::gpu_error)?;
+            let (device, queue, presenter) = if let Some((device, queue, presenter)) = presenter {
+                (device, queue, presenter)
+            } else {
+                let (device, queue) = adv_gpu::Device::open(&adv_gpu::queue::DeviceOptions {
+                    software: fallback,
+                    validation: cfg!(all(
+                        any(test, feature = "test-support"),
+                        not(target_os = "android")
+                    )),
+                    #[cfg(feature = "test-support")]
+                    disable: adv_gpu::Modern::from_test_env(),
+                    label: "execution GPU",
+                    ..Default::default()
+                })
+                .map_err(record::gpu_error)?;
+                (
+                    device,
+                    queue,
+                    Box::new(owner::Headless) as Box<dyn crate::frame::Presenter>,
+                )
+            };
             let (producer, commands) =
                 stream::channel(device.ring(64 << 20).map_err(record::gpu_error)?);
             let execution = std::rc::Rc::new(Execution {
@@ -132,11 +146,7 @@ impl Gpu {
                 video: Arc::from([]),
                 #[cfg(feature = "test-support")]
                 capture: Default::default(),
-                owner: owner::Owner::start(
-                    queue,
-                    commands,
-                    presenter.unwrap_or_else(|| Box::new(owner::Headless)),
-                )?,
+                owner: owner::Owner::start(queue, commands, presenter)?,
             });
             *cached.borrow_mut() = std::rc::Rc::downgrade(&execution);
             Ok(execution)
@@ -165,6 +175,11 @@ impl Gpu {
             execution,
         })
     }
+    /// Device shared with the presenting queue, including decoder pools.
+    pub fn device(&self) -> &adv_gpu::Device {
+        &self.device
+    }
+
     pub(crate) fn software_slots(
         &self,
         surface: &crate::surface::Surface,
@@ -260,15 +275,27 @@ mod tests {
             fn drain(&mut self) {}
         }
         let (tx, rx) = std::sync::mpsc::channel();
+        let (device, queue) = adv_gpu::Device::open(&adv_gpu::queue::DeviceOptions {
+            software: !cfg!(target_vendor = "apple"),
+            ..Default::default()
+        })
+        .unwrap();
         let mut gpu = pollster::block_on(Gpu::request_with_presenter(
-            !cfg!(target_vendor = "apple"),
+            device.clone(),
+            queue,
             Box::new(Capture(tx)),
         ))
         .unwrap();
         let (other_tx, _) = std::sync::mpsc::channel();
+        let (other_device, other_queue) = adv_gpu::Device::open(&adv_gpu::queue::DeviceOptions {
+            software: !cfg!(target_vendor = "apple"),
+            ..Default::default()
+        })
+        .unwrap();
         assert!(matches!(
             pollster::block_on(Gpu::request_with_presenter(
-                false,
+                other_device,
+                other_queue,
                 Box::new(Capture(other_tx)),
             )),
             Err(Error::Invalid(_))

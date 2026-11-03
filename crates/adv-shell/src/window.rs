@@ -1,7 +1,9 @@
 pub use adv_sync::WakeEvent;
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", not(feature = "native-display")))]
 pub(crate) use macos::native_viewport;
+#[cfg(target_os = "macos")]
 use std::sync::Arc;
+#[cfg(any(all(host_view, not(feature = "native-display")), test))]
 use std::time::Duration;
 
 pub enum Event {
@@ -48,7 +50,7 @@ pub use adv_runtime::{
 };
 #[cfg(target_os = "ios")]
 pub use mobile::GameContainer;
-#[cfg(mobile)]
+#[cfg(all(mobile, not(feature = "native-display")))]
 pub(crate) use mobile::native_viewport;
 #[cfg(mobile)]
 pub use mobile::{GameView, TouchAction, ViewEvent};
@@ -58,7 +60,7 @@ pub(crate) mod android_epoch;
 #[path = "window/android/input.rs"]
 mod android_input_tests;
 
-#[cfg(host_view)]
+#[cfg(any(all(host_view, not(feature = "native-display")), test))]
 /// The guest is told the display runs at 60 Hz, and both `Present` and
 /// software frames are published at guest frame boundaries, so presenting
 /// faster only repeats conversion and composition. Faster displays keep 10%

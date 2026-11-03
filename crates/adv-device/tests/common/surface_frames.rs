@@ -116,8 +116,16 @@ mod native {
                 return execution;
             }
             let (presenter, frames) = CapturePresenter::new();
+            let (device, queue) = adv_gpu::Device::open(&adv_gpu::queue::DeviceOptions {
+                software: !cfg!(any(target_vendor = "apple", target_os = "android")),
+                validation: !cfg!(target_os = "android"),
+                disable: adv_gpu::Modern::from_test_env(),
+                ..Default::default()
+            })
+            .unwrap();
             let gpu = pollster::block_on(Gpu::request_with_presenter(
-                !cfg!(any(target_vendor = "apple", target_os = "android")),
+                device,
+                queue,
                 Box::new(presenter),
             ))
             .unwrap();

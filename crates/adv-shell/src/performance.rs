@@ -14,6 +14,24 @@ const SAMPLE_CAPACITY: usize = 4096;
 /// Queue delay is reported separately from nonpreemptible acquire/configure.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct NativePresentation {
+    #[cfg(feature = "native-display")]
+    pub display_passes: u64,
+    #[cfg(feature = "native-display")]
+    pub display_submissions: u64,
+    #[cfg(feature = "native-display")]
+    pub display_tiles: u64,
+    #[cfg(feature = "native-display")]
+    pub display_pixels: u64,
+    #[cfg(feature = "native-display")]
+    pub display_plan: &'static str,
+    #[cfg(feature = "native-display")]
+    pub display_stage_tiles: [u32; 3],
+    #[cfg(feature = "native-display")]
+    pub display_stage_pixels: [u32; 3],
+    #[cfg(feature = "native-display")]
+    pub display_latch_ns: Option<u64>,
+    #[cfg(feature = "native-display")]
+    pub display_shown_ns: Option<u64>,
     pub consumed: u64,
     pub uploads: u64,
     pub uploaded_bytes: u64,
@@ -34,7 +52,7 @@ pub(crate) struct NativePresentation {
 }
 impl NativePresentation {
     fn json(&self) -> String {
-        format!(
+        let json = format!(
             concat!(
                 "{{\"cumulative\": true, \"consumed_frames\": {}, \"software_uploads\": {}, ",
                 "\"presentations\": {}, \"configurations\": {}, \"max_queue_ns\": {}, ",
@@ -67,7 +85,15 @@ impl NativePresentation {
                     .map_or(1., |at| at.elapsed().as_secs_f64().max(1e-9)),
             self.upscaled_runs,
             self.upscaled_pixels
-        )
+        );
+        #[cfg(feature = "native-display")]
+        let json = {
+            let mut json = json;
+            json.pop();
+            json.push_str(&format!(", \"display_passes\": {}, \"display_submissions\": {}, \"display_tiles\": {}, \"display_pixels\": {}, \"display_plan\": \"{}\", \"last_stage_tiles\": {:?}, \"last_stage_pixels\": {:?}, \"last_latch_ns\": {}, \"last_shown_ns\": {}}}",self.display_passes,self.display_submissions,self.display_tiles,self.display_pixels,self.display_plan,self.display_stage_tiles,self.display_stage_pixels,self.display_latch_ns.map_or_else(||"null".into(),|n|n.to_string()),self.display_shown_ns.map_or_else(||"null".into(),|n|n.to_string())));
+            json
+        };
+        json
     }
 }
 impl Samples {

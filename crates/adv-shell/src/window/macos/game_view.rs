@@ -1,16 +1,24 @@
 //! Native game input and Metal presentation surface.
 use super::*;
+#[cfg(any(test, not(feature = "native-display")))]
 use crate::window::refresh_interval;
 use objc2_app_kit::NSView;
-use objc2_quartz_core::{CADisplayLink, CAFrameRateRange, CALayer, CAMetalLayer, CATransaction};
+#[cfg(not(feature = "native-display"))]
+use objc2_quartz_core::CATransaction;
+use objc2_quartz_core::{CADisplayLink, CAFrameRateRange, CALayer, CAMetalLayer};
+use std::time::Duration;
 
 pub struct Input {
     hub: Rc<Hub>,
     /// The frame's layer, a sublayer of the black base layer (HOST-VIEW-9).
+    #[cfg(not(feature = "native-display"))]
     frame: Retained<CAMetalLayer>,
     display: Retained<CALayer>,
+    #[cfg(not(feature = "native-display"))]
     displayed: Option<adv_device::gpu::NativeFrame>,
+    #[cfg(not(feature = "native-display"))]
     retired: Vec<adv_device::gpu::NativeFrame>,
+    #[cfg(not(feature = "native-display"))]
     retirement: Option<Retained<NSTimer>>,
     width: u32,
     height: u32,
@@ -83,6 +91,7 @@ define_class!(
         fn scroll_wheel(&self, event: &NSEvent) { self.ivars().borrow_mut().handle(self, event); }
         #[unsafe(method(frameClockFired:))]
         fn frame_clock_fired(&self, link: &CADisplayLink) { self.frame(link); }
+        #[cfg(not(feature = "native-display"))]
         #[unsafe(method(retireFrames:))]
         fn retire_frames_timer(&self, _timer: &NSTimer) { self.retire_frames(); }
     }
@@ -140,6 +149,7 @@ impl GameView {
     }
 
     /// Create the Metal surface on the UI thread before guest submissions begin.
+    #[cfg(not(feature = "native-display"))]
     pub(crate) fn create_native(
         &self,
         fallback: bool,
@@ -169,6 +179,26 @@ impl GameView {
         Ok((gpu, presenter))
     }
 
+    #[cfg(feature = "native-display")]
+    pub(crate) fn create_display(
+        &self,
+        software: bool,
+        wake: adv_sync::WakeEvent,
+    ) -> Result<(crate::display::Startup, crate::display::Ui), String> {
+        let (device, queue) = crate::display::open(software)?;
+        crate::display::apple_channel(
+            device,
+            queue,
+            self.layer().unwrap(),
+            self.native_scale(),
+            self.native_client_size()?,
+            wake,
+        )
+    }
+    #[cfg(feature = "native-display")]
+    pub(crate) fn native_scale(&self) -> f64 {
+        self.window().map_or(1., |w| w.backingScaleFactor())
+    }
     pub(crate) fn native_client_size(&self) -> Result<(u32, u32), String> {
         if self.hub().occluded.get() || self.hub().sleeping.get() {
             return Ok((0, 0));
@@ -237,6 +267,7 @@ impl GameView {
         }
     }
     /// Submit before the compositor's next refresh, respecting the 60 Hz cap.
+    #[cfg(not(feature = "native-display"))]
     pub(crate) fn next_refresh(&self) -> std::time::Instant {
         std::time::Instant::now() + refresh_interval(self.display_fps())
     }
@@ -250,6 +281,7 @@ impl GameView {
         }
         self.request_frame();
     }
+    #[cfg(not(feature = "native-display"))]
     fn display_fps(&self) -> isize {
         self.window()
             .and_then(|window| window.screen())
@@ -290,10 +322,14 @@ impl GameView {
         }
         hub.on_frame.borrow_mut().take();
         hub.vsync.clear();
+        #[cfg(not(feature = "native-display"))]
         let mut input = self.ivars().borrow_mut();
+        #[cfg(feature = "native-display")]
+        let input = self.ivars().borrow();
         unsafe { input.display.setContents(None) };
         // The view outlives execution teardown; keep its pins until then even
         // if Core Animation still references the removed contents.
+        #[cfg(not(feature = "native-display"))]
         if let Some(timer) = input.retirement.take() {
             timer.invalidate();
         }
@@ -309,6 +345,7 @@ impl GameView {
     fn frame(&self, link: &CADisplayLink) {
         let hub = self.hub();
         link.setPaused(true);
+        #[cfg(not(feature = "native-display"))]
         self.retire_frames();
         let period = link.duration();
         if period > 0.0 {
@@ -334,10 +371,14 @@ impl GameView {
         let display = CALayer::new();
         let this = Self::alloc(mtm).set_ivars(RefCell::new(Input {
             hub,
+            #[cfg(not(feature = "native-display"))]
             frame: frame.clone(),
             display: display.clone(),
+            #[cfg(not(feature = "native-display"))]
             displayed: None,
+            #[cfg(not(feature = "native-display"))]
             retired: Vec::new(),
+            #[cfg(not(feature = "native-display"))]
             retirement: None,
             width,
             height,
@@ -373,6 +414,15 @@ impl GameView {
     /// Show the frame at `placement.rectangle` (client pixels), or across the
     /// client without one. Implicit animations would blend old and new frames.
     pub(crate) fn place(&self, placement: Option<crate::native_gpu::Placement>) {
+        #[cfg(feature = "native-display")]
+        {
+            let _ = placement;
+        }
+        #[cfg(not(feature = "native-display"))]
+        self.place_legacy(placement);
+    }
+    #[cfg(not(feature = "native-display"))]
+    fn place_legacy(&self, placement: Option<crate::native_gpu::Placement>) {
         let scale = self
             .window()
             .map_or(1.0, |window| window.backingScaleFactor());
@@ -403,6 +453,7 @@ impl GameView {
         }
         CATransaction::commit();
     }
+    #[cfg(not(feature = "native-display"))]
     pub(crate) fn shared_frame(&self, frame: Option<adv_device::gpu::NativeFrame>) {
         let mut input = self.ivars().borrow_mut();
         CATransaction::begin();
@@ -444,6 +495,7 @@ impl GameView {
             input.retirement = Some(timer);
         }
     }
+    #[cfg(not(feature = "native-display"))]
     fn retire_frames(&self) {
         let mut input = self.ivars().borrow_mut();
         input
@@ -740,10 +792,14 @@ mod tests {
         let hub = Rc::new(Hub::default());
         let mut input = Input {
             hub: hub.clone(),
+            #[cfg(not(feature = "native-display"))]
             frame: CAMetalLayer::new(),
             display: CALayer::new(),
+            #[cfg(not(feature = "native-display"))]
             displayed: None,
+            #[cfg(not(feature = "native-display"))]
             retired: Vec::new(),
+            #[cfg(not(feature = "native-display"))]
             retirement: None,
             width: 640,
             height: 480,

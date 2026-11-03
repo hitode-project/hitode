@@ -44,7 +44,7 @@ RULES: dict[str, set[str]] = {
     # The assembly wires the Wine userland over the NT platform, and its
     # sessions connect the server to the NT platform.
     "adv-runtime": {"adv-dx", "adv-drv", "adv-wineserver"},
-    "adv-shell": {"adv-runtime", "adv-device", "adv-sync", "adv-report"},
+    "adv-shell": {"adv-runtime", "adv-device", "adv-display", "adv-sync", "adv-report"},
     "adv-run": {"adv-shell"},
     "adv-jit-helper": set(),
     # Tauri player frontend: library and in-game overlay over the native game view.

@@ -265,6 +265,8 @@ mod native {
         drained: u64,
         rects: Vec<ARect>,
         fences: Vec<SyncFenceInfo>,
+        frame_rate: u32,
+        applied_rate: Option<u32>,
     }
     impl SurfaceCompositor {
         /// # Safety
@@ -309,7 +311,14 @@ mod native {
                 drained: 0,
                 rects: Vec::new(),
                 fences: Vec::new(),
+                frame_rate: 60,
+                applied_rate: None,
             })
+        }
+        /// HOST-SES-11: apply cadence to the SurfaceControl layer, using the
+        /// optional API 30 symbol while retaining the API 29 baseline.
+        pub fn set_frame_rate(&mut self, rate: u32) {
+            self.frame_rate = rate;
         }
         fn surface(&mut self, id: Option<LayerId>) -> Result<(), Error> {
             if !self.surfaces.iter().any(|s| s.id == id) {
@@ -382,6 +391,22 @@ mod native {
             let mut event = self.completion(serial);
             for surface in &mut self.surfaces {
                 let handle = surface.handle.as_ptr();
+                if surface.id == Some(LayerId::Base) && self.applied_rate != Some(self.frame_rate) {
+                    let symbol = unsafe {
+                        libc::dlsym(
+                            libc::RTLD_DEFAULT,
+                            c"ASurfaceTransaction_setFrameRate".as_ptr(),
+                        )
+                    };
+                    if !symbol.is_null() {
+                        let set: unsafe extern "C" fn(Handle, Handle, f32, i8) =
+                            unsafe { std::mem::transmute(symbol) };
+                        unsafe {
+                            set(tx, handle, self.frame_rate as f32, 0);
+                        }
+                    }
+                    self.applied_rate = Some(self.frame_rate);
+                }
                 let (layer, visible, z) = match surface.id {
                     None => (None, true, 0),
                     Some(LayerId::Base) => (Some(&layers.base), true, 1),

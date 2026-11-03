@@ -8,6 +8,7 @@
 //! returns ownership on release. [`recorder`] stores and replays planner data.
 
 pub mod compositor;
+pub mod display;
 pub mod plan;
 pub mod recorder;
 pub mod stages;
@@ -48,3 +49,7 @@ impl From<adv_gpu::Rect> for Rect {
 
 #[cfg(test)]
 mod tests;
+// Native presentable buffers are supplied by IOSurface or AHardwareBuffer.
+// The Vulkan desktop backend exposes private images only.
+#[cfg(all(test, target_vendor = "apple"))]
+mod display_tests;
