@@ -221,7 +221,7 @@ impl PresentBuffer {
         }
         let _unlock = Unlock(buffer);
         assert_eq!(mapped.count, 3, "YUV lock plane count");
-        let [y, v, u, _] = mapped.planes;
+        let [y, u, v, _] = mapped.planes; // lockPlanes reports Y, Cb, Cr
         assert!(
             !y.data.is_null()
                 && !v.data.is_null()
