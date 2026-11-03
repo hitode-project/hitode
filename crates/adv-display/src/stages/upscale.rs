@@ -106,6 +106,43 @@ pub struct Upscaling {
     align: u32,
 }
 
+/// One pass's pipeline, in half precision where `half` and the pass has that
+/// form.
+fn pipeline(
+    device: &Device,
+    model: &Model,
+    pass: &Pass,
+    half: bool,
+) -> adv_gpu::Result<ComputePipeline> {
+    let (_, h, s) = SHADERS
+        .iter()
+        .find(|(path, ..)| *path == pass.shader)
+        .expect("every table shader is precompiled");
+    let compiled = if half {
+        h.as_ref().or(s.as_ref())
+    } else {
+        s.as_ref()
+    }
+    .expect("a single-precision form exists");
+    let shader = device.create_shader(ShaderDesc {
+        source: Source::Precompiled {
+            spirv: compiled.spirv,
+            metal: compiled.metal,
+            entries: compiled.entries,
+        },
+        identity: compiled.identity,
+        label: "upscale pass",
+    })?;
+    device.create_compute_pipeline(
+        &ComputePipelineDesc {
+            entry: shader.entry("main", Stage::Compute)?,
+            bindings: pass.layout(model),
+            label: "upscale pass",
+        },
+        None,
+    )
+}
+
 impl Upscaling {
     /// Blocking pipeline creation; run it on the compile pool.
     pub fn new(device: &Device, model: Model, size: (u32, u32)) -> adv_gpu::Result<Self> {
@@ -145,35 +182,7 @@ impl Upscaling {
         let pipelines = model
             .passes
             .iter()
-            .map(|pass| {
-                let (_, h, s) = SHADERS
-                    .iter()
-                    .find(|(path, ..)| *path == pass.shader)
-                    .expect("every table shader is precompiled");
-                let compiled = if half {
-                    h.as_ref().or(s.as_ref())
-                } else {
-                    s.as_ref()
-                }
-                .expect("a single-precision form exists");
-                let shader = device.create_shader(ShaderDesc {
-                    source: Source::Precompiled {
-                        spirv: compiled.spirv,
-                        metal: compiled.metal,
-                        entries: compiled.entries,
-                    },
-                    identity: compiled.identity,
-                    label: "upscale pass",
-                })?;
-                device.create_compute_pipeline(
-                    &ComputePipelineDesc {
-                        entry: shader.entry("main", Stage::Compute)?,
-                        bindings: pass.layout(&model),
-                        label: "upscale pass",
-                    },
-                    None,
-                )
-            })
+            .map(|pass| pipeline(device, &model, pass, half))
             .collect::<adv_gpu::Result<_>>()?;
         let sampler = |filter| {
             device.sampler(&SamplerDesc {
@@ -420,4 +429,49 @@ impl Upscaling {
 
 fn words(values: impl IntoIterator<Item = u32>) -> Vec<u8> {
     values.into_iter().flat_map(u32::to_le_bytes).collect()
+}
+
+#[cfg(test)]
+mod precision_tests {
+    use super::*;
+
+    /// Every pass this device runs, compiled alone in one precision, each
+    /// named first on unbuffered stderr so a driver crash identifies it.
+    fn compile(half: bool) {
+        use std::io::Write;
+        let (device, _queue) = Device::open(&adv_gpu::queue::DeviceOptions {
+            software: !cfg!(any(target_vendor = "apple", target_os = "android")),
+            validation: !cfg!(target_os = "android"),
+            disable: adv_gpu::Modern::from_test_env(),
+            ..Default::default()
+        })
+        .unwrap();
+        let mut done = vec![];
+        for choice in [
+            Upscaler::Anime4k,
+            Upscaler::Cunny,
+            Upscaler::Artcnn,
+            Upscaler::K7,
+        ] {
+            let m = model(&device, choice);
+            for pass in m.passes {
+                let (_, h, _) = SHADERS.iter().find(|(p, ..)| *p == pass.shader).unwrap();
+                if done.contains(&pass.shader) || (half && h.is_none()) {
+                    continue;
+                }
+                done.push(pass.shader);
+                let form = if half { "f16" } else { "f32" };
+                writeln!(std::io::stderr(), "compiling {} {form}", pass.shader).unwrap();
+                pipeline(&device, &m, pass, half).unwrap();
+            }
+        }
+    }
+    #[test]
+    fn half_precision_passes_compile() {
+        compile(true);
+    }
+    #[test]
+    fn single_precision_passes_compile() {
+        compile(false);
+    }
 }

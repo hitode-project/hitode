@@ -319,22 +319,3 @@ fn partial_runs_match_full_runs_within_the_model_radius() {
         assert_eq!(computed, 0);
     }
 }
-
-/// Each pass of the variant this device runs compiles on its own. The pass
-/// is named on stderr first, uncaptured, so a driver crash identifies it.
-#[test]
-fn every_pass_compiles_on_its_own() {
-    use std::io::Write;
-    let gpu = gpu();
-    for choice in CHOICES {
-        let m = model(&gpu.device, choice);
-        for i in 0..m.passes.len() {
-            writeln!(std::io::stderr(), "compiling {}", m.passes[i].shader).unwrap();
-            let single = Model {
-                passes: &m.passes[i..=i],
-                ..m
-            };
-            Upscaling::new(&gpu.device, single, (64, 48)).unwrap();
-        }
-    }
-}

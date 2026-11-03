@@ -1,7 +1,7 @@
-//! Game Loop runner for cloud devices. It runs every packaged GPU test binary
-//! (`libtest_<name>.so`) in its own process, first with every modern Vulkan
-//! feature masked and then as detected, so a crash in one run never hides
-//! another. Output lands in the app's external files directory, which Test Lab
+//! Game Loop runner for cloud devices. It runs every test of every packaged
+//! GPU test binary (`libtest_<name>.so`) in its own process, first with every
+//! modern Vulkan feature masked and then as detected, so a crash in one test
+//! never hides another. Output lands in the app's external files directory, which Test Lab
 //! pulls; one summary line per run also goes to logcat. The device's
 //! capabilities per tier are written last, after every test has run.
 
@@ -13,7 +13,7 @@ mod android {
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
-    /// Runs that exceed this are killed and reported as timeouts.
+    /// Tests that exceed this are killed and reported as timeouts.
     const TIMEOUT: Duration = Duration::from_secs(600);
     /// `ADV_GPU_TEST_DISABLE` per tier, the compatibility tier first.
     const TIERS: [(&str, &str); 2] = [("compat", "all"), ("modern", "")];
@@ -95,31 +95,24 @@ mod android {
                 let file = std::fs::File::create(out.join(format!("{tier}-{name}.log")))
                     .expect("log file");
                 let start = Instant::now();
-                let mut child = Command::new(path)
-                    .arg("--test-threads=1")
-                    .env("ADV_GPU_TEST_DISABLE", disable)
-                    .env("RUST_BACKTRACE", "1")
-                    .env("TMPDIR", &tmp)
-                    .current_dir(&tmp)
-                    .stdin(Stdio::null())
-                    .stdout(file.try_clone().expect("log file"))
-                    .stderr(file)
-                    .spawn()
-                    .expect("spawn test");
-                let status = loop {
-                    if let Some(status) = child.try_wait().expect("wait test") {
-                        break format!("{status}");
+                let cases = list(path);
+                let mut failed = Vec::new();
+                for case in &cases {
+                    let status = run_case(path, case, disable, &tmp, &file);
+                    if status != "exit status: 0" {
+                        failed.push(format!("{case} ({status})"));
                     }
-                    if start.elapsed() > TIMEOUT {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        break "timeout".to_owned();
-                    }
-                    std::thread::sleep(Duration::from_millis(200));
-                };
+                }
                 let line = format!(
-                    "{tier} {name}: {status} in {:.1} s",
-                    start.elapsed().as_secs_f32()
+                    "{tier} {name}: {}/{} passed in {:.1} s{}",
+                    cases.len() - failed.len(),
+                    cases.len(),
+                    start.elapsed().as_secs_f32(),
+                    if failed.is_empty() {
+                        String::new()
+                    } else {
+                        format!("; failed: {}", failed.join(", "))
+                    }
                 );
                 log(&line);
                 writeln!(summary, "{line}").unwrap();
@@ -153,6 +146,45 @@ mod android {
         std::fs::write(out.join("caps.txt"), &caps).expect("caps");
         log(caps.lines().next().unwrap_or_default());
         log("done");
+    }
+
+    /// The test names of a libtest binary.
+    fn list(path: &Path) -> Vec<String> {
+        let output = Command::new(path)
+            .args(["--list", "--format", "terse"])
+            .output()
+            .expect("list tests");
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| line.strip_suffix(": test"))
+            .map(str::to_owned)
+            .collect()
+    }
+    /// One test in its own process, so a crash never hides the others.
+    fn run_case(path: &Path, case: &str, disable: &str, tmp: &Path, log: &std::fs::File) -> String {
+        let start = Instant::now();
+        let mut child = Command::new(path)
+            .args(["--exact", case, "--test-threads=1"])
+            .env("ADV_GPU_TEST_DISABLE", disable)
+            .env("RUST_BACKTRACE", "1")
+            .env("TMPDIR", tmp)
+            .current_dir(tmp)
+            .stdin(Stdio::null())
+            .stdout(log.try_clone().expect("log file"))
+            .stderr(log.try_clone().expect("log file"))
+            .spawn()
+            .expect("spawn test");
+        loop {
+            if let Some(status) = child.try_wait().expect("wait test") {
+                return format!("{status}");
+            }
+            if start.elapsed() > TIMEOUT {
+                let _ = child.kill();
+                let _ = child.wait();
+                return "timeout".to_owned();
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     /// Every memory type, which the device caps do not show.
