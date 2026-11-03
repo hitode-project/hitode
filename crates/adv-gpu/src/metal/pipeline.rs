@@ -149,6 +149,7 @@ pub(crate) struct ComputePipeline(pub(super) Arc<ComputeData>);
 pub(super) struct ComputeData {
     pub raw: Object<dyn MTLComputePipelineState>,
     pub workgroup: MTLSize,
+    pub threadgroup: Box<[u32]>,
     pub used: shader::Used,
     pub sizes: Option<Box<[Option<u8>]>>,
 }
@@ -332,6 +333,7 @@ impl Device {
                         height,
                         depth,
                     },
+                    threadgroup: entry.threadgroup.clone(),
                     used,
                     sizes: entry.sizes.clone(),
                 })),

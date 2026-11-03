@@ -55,6 +55,7 @@ impl Output {
                 format,
                 count: 4,
                 color: Some(color),
+                storage: false,
                 label: "decoded video",
             })
             .map_err(gpu_error)?;

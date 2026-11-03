@@ -40,6 +40,7 @@ pub fn pipeline(device: &Device, format: Format) -> adv_gpu::Result<RenderPipeli
         source: adv_gpu::shader::Source::Precompiled {
             spirv: &include!(concat!(env!("OUT_DIR"), "/ingest.spv.rs")),
             metal: include_bytes!(concat!(env!("OUT_DIR"), "/ingest.msl")),
+            entries: &include!(concat!(env!("OUT_DIR"), "/ingest.entries.rs")),
         },
         identity: include!(concat!(env!("OUT_DIR"), "/ingest.identity.rs")),
         label: "software ingest",

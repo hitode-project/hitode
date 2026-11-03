@@ -149,6 +149,7 @@ fn video_draw_matches_cpu_reference() {
                 format,
                 color: Some(color),
                 count: 1,
+                storage: false,
                 label: "video planes",
             })
             .unwrap();

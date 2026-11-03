@@ -155,6 +155,7 @@ impl SwapBacking {
                         format: swap_format(),
                         color: None,
                         count: 3,
+                        storage: false,
                         label: "executor swap",
                     },
                 )?);

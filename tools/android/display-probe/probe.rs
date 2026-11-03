@@ -123,6 +123,7 @@ mod android {
                 height: bounds.h,
                 format: Format::Rgba8Unorm,
                 count: 3,
+                storage: false,
                 label: "display probe",
             })
             .expect("present pool")
@@ -512,6 +513,7 @@ mod android {
                             format,
                             count: 4,
                             color: Some(YuvColor::Bt601Limited),
+                            storage: false,
                             label: "YUV gradient",
                         })
                         .expect("create presentable YUV probe pool"),

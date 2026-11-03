@@ -54,6 +54,7 @@ mod macos {
                 height: H,
                 format: Format::Bgra8Unorm,
                 count: 3,
+                storage: false,
                 label: "core animation",
             })
             .expect("pool");
@@ -150,6 +151,7 @@ mod macos {
                 format: Format::Nv12,
                 count: 2,
                 color: Some(adv_gpu::present::YuvColor::Bt709Limited),
+                storage: false,
                 label: "YUV layer",
             })
             .unwrap();

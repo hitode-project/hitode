@@ -41,6 +41,9 @@ pub struct PoolDesc {
     /// A format with [`FormatCaps::PRESENTABLE`].
     pub format: Format,
     pub count: u32,
+    /// Compute writes the buffers as storage images (the upscaler's final
+    /// layer). RGB only; on Mali it may cost the buffers their compression.
+    pub storage: bool,
     pub label: &'static str,
 }
 
@@ -95,6 +98,7 @@ impl PresentPool {
             || desc.width.max(desc.height) > caps.limits.max_image_2d
             || desc.count == 0
             || matches!(desc.format, Format::Nv12 | Format::Nv21) != desc.color.is_some()
+            || desc.storage && desc.color.is_some()
         {
             return Err(crate::Error::Invalid(format!("present pool {desc:?}")));
         }

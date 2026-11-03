@@ -1013,6 +1013,166 @@ fn compute_writes_storage_buffers() {
     }
 }
 
+const SHARED: &str = "
+@group(3) @binding(0) var<storage, read_write> values: array<u32>;
+var<workgroup> a: array<u32, 64>;
+var<workgroup> b: array<vec2<u32>, 64>;
+@compute @workgroup_size(64) fn main(@builtin(local_invocation_index) i: u32, @builtin(workgroup_id) g: vec3<u32>) {
+    a[i] = i + g.x * 100u;
+    b[i] = vec2<u32>(i * 2u, 7u);
+    workgroupBarrier();
+    values[g.x * 64u + i] = a[63u - i] + b[(i + 1u) % 64u].x * b[i].y;
+}
+";
+
+/// Workgroup arrays are shared across a workgroup's invocations (Metal sets
+/// threadgroup lengths; Vulkan drops their explicit layouts).
+#[test]
+fn compute_shares_workgroup_memory() {
+    let mut gpu = gpu!();
+    let shader = gpu.shader(SHARED, 6);
+    let pipeline = gpu
+        .device
+        .create_compute_pipeline(
+            &ComputePipelineDesc {
+                entry: shader.entry("main", Stage::Compute).unwrap(),
+                bindings: vec![Binding {
+                    slot: 0,
+                    kind: BindingKind::StorageBuffer { writable: true },
+                    stages: Stages::COMPUTE,
+                }],
+                label: "shared",
+            },
+            None,
+        )
+        .expect("compute pipeline");
+    let values = gpu.buffer(
+        128 * 4,
+        BufferUsage::STORAGE | BufferUsage::COPY_SRC,
+        Memory::Device,
+    );
+    let mut encoder = gpu.queue.encoder("shared");
+    {
+        let mut pass = encoder.compute_pass(&ComputePassDesc {
+            timestamps: None,
+            label: "shared",
+        });
+        pass.set_pipeline(&pipeline);
+        pass.bind(0, Bind::StorageBuffer(values.slice(0..512)));
+        pass.dispatch(2, 1, 1);
+    }
+    gpu.submit(encoder);
+    for (n, word) in gpu.read_buffer(&values, 512).chunks(4).enumerate() {
+        let (g, i) = (n as u32 / 64, n as u32 % 64);
+        let expected = (63 - i + g * 100) + ((i + 1) % 64) * 2 * 7;
+        assert_eq!(
+            u32::from_le_bytes(word.try_into().unwrap()),
+            expected,
+            "invocation {n}"
+        );
+    }
+}
+
+const STORE: &str = "
+@group(3) @binding(0) var image: texture_storage_2d<rgba8unorm, write>;
+@compute @workgroup_size(8, 8) fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    textureStore(image, id.xy, vec4<f32>(vec2<f32>(id.xy) / 255.0, 0.5, 1.0));
+}
+";
+
+/// Compute writes storage images, and the presentable buffers of a storage
+/// pool, which the upscaler's final layer writes (HOST-VIEW-7).
+#[test]
+fn compute_writes_storage_images_and_storage_pools() {
+    let mut gpu = gpu!();
+    let shader = gpu.shader(STORE, 5);
+    let pipeline = gpu
+        .device
+        .create_compute_pipeline(
+            &ComputePipelineDesc {
+                entry: shader.entry("main", Stage::Compute).unwrap(),
+                bindings: vec![Binding {
+                    slot: 0,
+                    kind: BindingKind::StorageImage {
+                        format: Format::Rgba8Unorm,
+                        writable: true,
+                    },
+                    stages: Stages::COMPUTE,
+                }],
+                label: "store",
+            },
+            None,
+        )
+        .expect("compute pipeline");
+    let check = |gpu: &mut Gpu, image: &Image| {
+        let mut encoder = gpu.queue.encoder("store");
+        {
+            let mut pass = encoder.compute_pass(&ComputePassDesc {
+                timestamps: None,
+                label: "store",
+            });
+            pass.set_pipeline(&pipeline);
+            pass.bind(0, Bind::StorageImage(image.view()));
+            pass.dispatch(4, 2, 1);
+        }
+        gpu.submit(encoder);
+        let bgra = image.desc().format == Format::Bgra8Unorm;
+        for (i, texel) in gpu.read(image).chunks(4).enumerate() {
+            let (x, y) = ((i % 32) as u8, (i / 32) as u8);
+            let expected = if bgra {
+                [128, y, x, 255]
+            } else {
+                [x, y, 128, 255]
+            };
+            assert_eq!(
+                texel,
+                expected,
+                "texel {x},{y} of {:?}",
+                image.desc().format
+            );
+        }
+    };
+    let image = gpu
+        .device
+        .create_image(&ImageDesc {
+            dimension: Dimension::D2,
+            size: extent(32, 16),
+            format: Format::Rgba8Unorm,
+            mips: 1,
+            samples: 1,
+            usage: Usage::STORAGE | Usage::COPY_SRC,
+            view_formats: &[],
+            label: "storage image",
+        })
+        .expect("storage image");
+    check(&mut gpu, &image);
+    if !gpu.has(Features::PRESENTABLE_BUFFERS) {
+        return;
+    }
+    let format = [Format::Rgba8Unorm, Format::Bgra8Unorm]
+        .into_iter()
+        .find(|&f| gpu.supports(f, FormatCaps::PRESENTABLE | FormatCaps::STORAGE))
+        .expect("storage presentable format");
+    let mut pool = gpu
+        .device
+        .create_present_pool(&adv_gpu::present::PoolDesc {
+            color: None,
+            width: 32,
+            height: 16,
+            format,
+            count: 1,
+            storage: true,
+            label: "storage pool",
+        })
+        .expect("storage pool");
+    let buffer = pool
+        .acquire(&mut gpu.queue)
+        .expect("acquire")
+        .expect("buffer");
+    assert!(buffer.image().desc().usage.contains(Usage::STORAGE));
+    check(&mut gpu, buffer.image());
+}
+
 fn bytemuck_u32(values: &[u32]) -> &[u8] {
     // SAFETY: u32 has no padding.
     unsafe { std::slice::from_raw_parts(values.as_ptr().cast(), std::mem::size_of_val(values)) }
@@ -1213,6 +1373,7 @@ fn present_pools_track_ages_and_releases() {
             height: 64,
             format,
             count: 2,
+            storage: false,
             label: "pool",
         })
         .expect("pool");
@@ -1280,6 +1441,7 @@ fn cpu_yuv_pools_write_sample_and_release() {
             format,
             color: Some(YuvColor::Bt709Limited),
             count: 2,
+            storage: false,
             label: "CPU YUV",
         })
         .unwrap();
@@ -1422,6 +1584,7 @@ fn cpu_yuv_pools_write_sample_and_release() {
                 format,
                 color: Some(color),
                 count: 2,
+                storage: false,
                 label: "CPU YUV",
             })
             .unwrap();
@@ -1589,6 +1752,7 @@ fn yuv_pool_color_attachments() {
             format: Format::Nv12,
             color: Some(color),
             count: 1,
+            storage: false,
             label: "YUV color",
         };
         assert!(
@@ -1598,6 +1762,15 @@ fn yuv_pool_color_attachments() {
                     ..desc
                 })
                 .is_err()
+        );
+        assert!(
+            gpu.device
+                .create_present_pool(&PoolDesc {
+                    storage: true,
+                    ..desc
+                })
+                .is_err(),
+            "storage writes are RGB only"
         );
         let mut pool = gpu.device.create_present_pool(&desc).unwrap();
         let image = pool.acquire_cpu().unwrap();
@@ -1768,6 +1941,12 @@ vertex float4 vs(uint i [[vertex_id]], sampler s [[sampler(0)]]) {
     return float4(float(i), 0.0, 0.0, 1.0);
 }
 "#,
+                entries: &[adv_gpu::shader::PrecompiledEntry {
+                    name: "vs",
+                    function: "vs",
+                    workgroup: [1; 3],
+                    threadgroup: &[],
+                }],
             },
             identity: 1002,
             label: "colliding sampler slots",

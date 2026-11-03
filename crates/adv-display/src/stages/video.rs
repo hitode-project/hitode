@@ -85,11 +85,13 @@ fn pipeline(
             Source::Precompiled {
                 spirv: &include!(concat!(env!("OUT_DIR"), "/video_converted.spv.rs")),
                 metal: include_bytes!(concat!(env!("OUT_DIR"), "/video_converted.msl")),
+                entries: &include!(concat!(env!("OUT_DIR"), "/video_converted.entries.rs")),
             }
         } else {
             Source::Precompiled {
                 spirv: &include!(concat!(env!("OUT_DIR"), "/video.spv.rs")),
                 metal: include_bytes!(concat!(env!("OUT_DIR"), "/video.msl")),
+                entries: &include!(concat!(env!("OUT_DIR"), "/video.entries.rs")),
             }
         },
         identity: if converted {

@@ -14,12 +14,19 @@ const GPU_SAMPLED_IMAGE: u64 = 1 << 8;
 const GPU_FRAMEBUFFER: u64 = 1 << 9;
 const COMPOSER_OVERLAY: u64 = 1 << 11;
 const VENDOR_0: u64 = 1 << 28;
-const USAGE: vk::ImageUsageFlags = vk::ImageUsageFlags::from_raw(
-    vk::ImageUsageFlags::COLOR_ATTACHMENT.as_raw()
-        | vk::ImageUsageFlags::SAMPLED.as_raw()
-        | vk::ImageUsageFlags::TRANSFER_SRC.as_raw()
-        | vk::ImageUsageFlags::TRANSFER_DST.as_raw(),
-);
+/// Image usage of an RGB presentable buffer; `storage` adds compute writes.
+fn usage(storage: bool) -> (Usage, vk::ImageUsageFlags) {
+    let mut usage = Usage::COLOR | Usage::SAMPLED | Usage::COPY_SRC | Usage::COPY_DST;
+    let mut flags = vk::ImageUsageFlags::COLOR_ATTACHMENT
+        | vk::ImageUsageFlags::SAMPLED
+        | vk::ImageUsageFlags::TRANSFER_SRC
+        | vk::ImageUsageFlags::TRANSFER_DST;
+    if storage {
+        usage |= Usage::STORAGE;
+        flags |= vk::ImageUsageFlags::STORAGE;
+    }
+    (usage, flags)
+}
 
 #[repr(C)]
 #[derive(Default)]
@@ -132,6 +139,7 @@ impl PresentBuffer {
                 context.vendor,
                 desc.format == Format::Nv21,
             ),
+            desc.storage,
         )?;
         if let Some(format) = format
             && format.external != context.video_format.unwrap().external
@@ -158,7 +166,7 @@ impl PresentBuffer {
                 usage: if desc.format == Format::Nv21 {
                     Usage::SAMPLED
                 } else {
-                    Usage::COLOR | Usage::SAMPLED | Usage::COPY_SRC | Usage::COPY_DST
+                    usage(desc.storage).0
                 },
                 view_formats: &[],
                 label: desc.label,
@@ -166,7 +174,7 @@ impl PresentBuffer {
             usage: if desc.format == Format::Nv21 {
                 vk::ImageUsageFlags::SAMPLED
             } else {
-                USAGE
+                usage(desc.storage).1
             },
             conversion: video.map(|pool| pool.resources.conversion),
             video: video.cloned(),
@@ -268,6 +276,7 @@ fn allocate(
     device: &ash::Device,
     ahb: &ash::android::external_memory_android_hardware_buffer::Device,
     requested: &HardwareBufferDesc,
+    storage: bool,
 ) -> Result<(
     vk::Image,
     vk::DeviceMemory,
@@ -323,7 +332,7 @@ fn allocate(
                     .usage(if yuv {
                         vk::ImageUsageFlags::SAMPLED
                     } else {
-                        USAGE
+                        usage(storage).1
                     }),
                 None,
             )
@@ -385,7 +394,7 @@ pub(super) fn yuv_capabilities(
     if unsafe { AHardwareBuffer_isSupported(&requested) } == 0 {
         return Ok(None);
     }
-    let (image, memory, _buffer, format) = match allocate(device, ahb, &requested) {
+    let (image, memory, _buffer, format) = match allocate(device, ahb, &requested, false) {
         Ok(imported) => imported,
         Err(Error::Unavailable(_)) => return Ok(None),
         Err(error) => return Err(error),

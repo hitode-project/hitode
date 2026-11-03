@@ -745,6 +745,12 @@ impl ComputePass<'_> {
         {
             self.raw.setComputePipelineState(&p.raw);
         }
+        for (index, &length) in p.threadgroup.iter().enumerate() {
+            unsafe {
+                self.raw
+                    .setThreadgroupMemoryLength_atIndex(length as usize, index)
+            };
+        }
         self.bindings.sizes_dirty |= p.sizes.is_some();
         self.pipeline = Some(p.clone());
     }

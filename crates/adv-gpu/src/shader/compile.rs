@@ -10,6 +10,9 @@ pub struct Precompiled {
     pub spirv: Vec<u32>,
     pub metal: String,
     pub identity: u64,
+    /// Each entry point's WGSL name, Metal function name, workgroup size and
+    /// threadgroup argument lengths ([`crate::shader::PrecompiledEntry`]).
+    pub entries: Vec<(String, String, [u32; 3], Vec<u32>)>,
 }
 
 /// Compile a host shader using the GPU binding convention. Host stages admit
@@ -23,15 +26,25 @@ pub fn precompile(wgsl: &str, bindings: &[Binding]) -> Result<Precompiled> {
     )
     .validate(&module)
     .map_err(|e| compile_error("shader validation", e))?;
-    let mut spirv = naga::back::spv::write_vec(&module, &info, &Default::default(), None)
+    let options = naga::back::spv::Options {
+        use_storage_input_output_16: false,
+        ..Default::default()
+    };
+    let mut spirv = naga::back::spv::write_vec(&module, &info, &options, None)
         .map_err(|e| compile_error("SPIR-V", e))?;
+    legalize(&mut spirv);
     combine_video_sampler(&mut spirv, 4);
+    // SIMD-group matrices need MSL 2.3; everything else stays on 2.1.
+    let matrix = module
+        .types
+        .iter()
+        .any(|(_, ty)| matches!(ty.inner, naga::TypeInner::CooperativeMatrix { .. }));
     let metal = metal(
         &module,
         &info,
         Some(bindings),
         Options {
-            version: (2, 1),
+            version: if matrix { (2, 3) } else { (2, 1) },
             textures: 128,
             bounds: naga::proc::BoundsCheckPolicies {
                 index: naga::proc::BoundsCheckPolicy::Unchecked,
@@ -39,8 +52,15 @@ pub fn precompile(wgsl: &str, bindings: &[Binding]) -> Result<Precompiled> {
                 ..Default::default()
             },
         },
-    )?
-    .source;
+    )?;
+    let entries = module
+        .entry_points
+        .iter()
+        .zip(metal.names)
+        .zip(metal.threadgroup)
+        .map(|((ep, name), threadgroup)| (ep.name.clone(), name, ep.workgroup_size, threadgroup))
+        .collect();
+    let metal = metal.source;
     let mut identity = DefaultHasher::new();
     spirv.hash(&mut identity);
     metal.hash(&mut identity);
@@ -48,6 +68,7 @@ pub fn precompile(wgsl: &str, bindings: &[Binding]) -> Result<Precompiled> {
         spirv,
         metal,
         identity: identity.finish(),
+        entries,
     })
 }
 
@@ -58,6 +79,11 @@ pub(crate) struct Options {
 }
 pub(crate) struct Metal {
     pub source: String,
+    /// MSL function names, in entry point order.
+    pub names: Vec<String>,
+    /// Bytes of each entry's threadgroup arguments, which naga declares
+    /// without indices in global variable order; encoders set the lengths.
+    pub threadgroup: Vec<Vec<u32>>,
     #[cfg(all(feature = "backend", target_vendor = "apple"))]
     pub entries: Vec<MetalEntry>,
 }
@@ -181,6 +207,11 @@ pub(crate) fn metal(
     };
     #[cfg(all(feature = "backend", target_vendor = "apple"))]
     let mut entries = Vec::new();
+    let mut layouter = naga::proc::Layouter::default();
+    layouter
+        .update(module.to_ctx())
+        .map_err(|e| compile_error("MSL", e))?;
+    let mut threadgroup = Vec::new();
     for (i, ep) in module.entry_points.iter().enumerate() {
         let stage = match ep.stage {
             naga::ShaderStage::Vertex => Stages::VERTEX,
@@ -189,6 +220,16 @@ pub(crate) fn metal(
             _ => return Err(compile_error(&ep.name, "unsupported stage")),
         };
         let entry_info = info.get_entry_point(i);
+        threadgroup.push(
+            module
+                .global_variables
+                .iter()
+                .filter(|&(handle, var)| {
+                    var.space == naga::AddressSpace::WorkGroup && !entry_info[handle].is_empty()
+                })
+                .map(|(_, var)| layouter[var.ty].size.next_multiple_of(16))
+                .collect(),
+        );
         let mut resources = msl::EntryPointResources::default();
         let mut used = Used::default();
         let mut sizes = Vec::new();
@@ -304,17 +345,20 @@ pub(crate) fn metal(
     };
     let (source, translation) = msl::write_string(module, info, &msl_options, &pipeline)
         .map_err(|e| compile_error("MSL", e))?;
-    for (i, name) in translation.entry_point_names.into_iter().enumerate() {
-        let name = name.map_err(|e| compile_error(&module.entry_points[i].name, e))?;
-        #[cfg(all(feature = "backend", target_vendor = "apple"))]
-        {
-            entries[i].name = name;
-        }
-        #[cfg(not(all(feature = "backend", target_vendor = "apple")))]
-        let _ = name;
+    let names = translation
+        .entry_point_names
+        .into_iter()
+        .enumerate()
+        .map(|(i, name)| name.map_err(|e| compile_error(&module.entry_points[i].name, e)))
+        .collect::<Result<Vec<_>>>()?;
+    #[cfg(all(feature = "backend", target_vendor = "apple"))]
+    for (entry, name) in entries.iter_mut().zip(&names) {
+        entry.name = name.clone();
     }
     Ok(Metal {
         source,
+        names,
+        threadgroup,
         #[cfg(all(feature = "backend", target_vendor = "apple"))]
         entries,
     })
@@ -419,6 +463,53 @@ fn instructions(words: &[u32]) -> impl Iterator<Item = &[u32]> {
         rest = tail;
         Some(instruction)
     })
+}
+
+/// Naga's SPIR-V breaks two Vulkan rules our shaders never rely on:
+/// - It declares 16-bit buffer access with every half precision type, but
+///   `SHADER_F16` covers arithmetic only and phones lack the access features.
+/// - It gives every array an `ArrayStride`, which is invalid on arrays that
+///   only workgroup, private or function variables hold.
+pub(crate) fn legalize(words: &mut Vec<u32>) {
+    const STORAGE_BUFFER_16: u32 = 4433;
+    const UNIFORM_AND_STORAGE_BUFFER_16: u32 = 4434;
+    const ARRAY_STRIDE: u32 = 6;
+    // Uniform, PushConstant, StorageBuffer, PhysicalStorageBuffer.
+    const EXPLICIT: [u32; 4] = [2, 9, 12, 5349];
+    let mut parts = std::collections::HashMap::new();
+    let mut explicit = Vec::new();
+    for i in instructions(words) {
+        match i[0] & 0xffff {
+            // OpTypeArray, OpTypeRuntimeArray: the element; OpTypeStruct: members.
+            28 | 29 => {
+                parts.insert(i[1], &i[2..3]);
+            }
+            30 => {
+                parts.insert(i[1], &i[2..]);
+            }
+            // OpTypePointer
+            32 if EXPLICIT.contains(&i[2]) => explicit.push(i[3]),
+            _ => {}
+        }
+    }
+    let mut laid = std::collections::HashSet::new();
+    while let Some(id) = explicit.pop() {
+        if laid.insert(id) {
+            explicit.extend(parts.get(&id).into_iter().flat_map(|p| p.iter()));
+        }
+    }
+    let mut kept = words[..5].to_vec();
+    for i in instructions(words) {
+        let drop = match i[0] & 0xffff {
+            17 => matches!(i[1], STORAGE_BUFFER_16 | UNIFORM_AND_STORAGE_BUFFER_16),
+            71 => i[2] == ARRAY_STRIDE && !laid.contains(&i[1]),
+            _ => false,
+        };
+        if !drop {
+            kept.extend_from_slice(i);
+        }
+    }
+    *words = kept;
 }
 
 /// Naga emits separate WGSL textures and samplers. External-format sampling
@@ -589,6 +680,12 @@ mod tests {
         assert_eq!(a.identity, b.identity);
         assert_eq!(a.spirv[0], 0x07230203);
         assert!(a.metal.contains("kernel"));
+        assert_eq!(a.entries.len(), 1);
+        let (name, function, workgroup, threadgroup) = &a.entries[0];
+        assert_eq!((name.as_str(), *workgroup), ("main", [1, 1, 1]));
+        assert!(threadgroup.is_empty());
+        assert!(a.metal.contains(&format!("kernel void {function}(")));
+        assert_ne!(function, "main", "Metal reserves `main`");
         assert!(!a.metal.contains("_buffer_sizes."));
         assert_ne!(
             a.identity,

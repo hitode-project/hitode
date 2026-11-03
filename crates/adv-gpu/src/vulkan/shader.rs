@@ -171,14 +171,18 @@ fn lower(
     let info = validate(module, flags)?;
     let mut options = naga::back::spv::Options {
         lang_version: (1, 3),
+        use_storage_input_output_16: false,
         ..Default::default()
     };
     // Point lists need a written PointSize without maintenance5; Metal
     // lowering forces it the same way.
     options.flags |= naga::back::spv::WriterFlags::FORCE_POINT_SIZE;
-    naga::back::spv::write_vec(module, &info, &options, entry)
-        .map_err(|e| Error::Compile(format!("SPIR-V lowering: {e}")))
+    let mut words = naga::back::spv::write_vec(module, &info, &options, entry)
+        .map_err(|e| Error::Compile(format!("SPIR-V lowering: {e}")))?;
+    crate::shader::compile::legalize(&mut words);
+    Ok(words)
 }
+
 #[derive(Clone)]
 struct StorageShape {
     stride: u32,
@@ -375,9 +379,11 @@ fn rewrite_heap(
         },
         Span::UNDEFINED,
     );
+    // Named, so a shader's own `array<u32, N>` (say in workgroup memory, which
+    // takes no explicit layout) stays a separate type.
     let array = module.types.insert(
         Type {
-            name: None,
+            name: Some("binding_indices".into()),
             inner: TypeInner::Array {
                 base: uint,
                 size: naga::ArraySize::Constant(std::num::NonZeroU32::new(words).unwrap()),

@@ -21,7 +21,9 @@ pub struct Caps {
 bitflags::bitflags! {
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
     pub struct Features: u64 {
-        /// Half precision arithmetic in shaders.
+        /// Half precision arithmetic in shaders, outside buffer and stage
+        /// interfaces: phones lack 16-bit storage access (validation layers
+        /// catch such a shader in CI).
         const SHADER_F16 = 1 << 0;
         /// Subgroup (SIMD-group) operations and barriers.
         const SUBGROUP = 1 << 1;

@@ -131,6 +131,7 @@ fn ingest_decodes_every_format_and_palette_bit_for_bit() {
                         format: adv_gpu::Format::Bgra8Unorm,
                         color: None,
                         count: 1,
+                        storage: false,
                         label: "ingest target",
                     })
                     .unwrap();

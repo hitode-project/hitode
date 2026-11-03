@@ -125,60 +125,37 @@ def graph(passes):
     return result
 
 
-def emit(root, destination, models, allocate, matrix=False):
-    """Emit fused graphs using the same allocator as the reference models."""
+def combine(root, name, passes, write, matrix=False):
+    """Fused passes of one model, writing their shaders through `write`. With
+    `matrix`, None when the model has no matrix form."""
     import json
-    name = 'matrix_model' if matrix else 'fused_model'
-    rust = [f'pub(super) fn {name}(value: Upscaler) -> Model {{ match value {{',
-            'Upscaler::Off => unreachable!(),']
-    for variant, name in models:
-        passes = json.loads((root / name / 'passes.json').read_text())
-        if matrix and (passes[0]['formats'] != ['rgba16f'] * len(passes[0]['formats'])
-                       or 'enable f16;' not in (root / name / '1.wgsl').read_text()):
-            rust.append(f'Upscaler::{variant} => fused_model(value),')
-            continue
-        versions = graph(passes)
-        combined, index = [], 0
-        while index < len(passes):
-            p = passes[index]
-            value = dict(versions[index], shader=f'{name}/{index + 1}.wgsl')
-            # Quantized tensors amplify accumulated rounding differences. Fuse
-            # only the final intermediate pair before an 8-bit model's output.
-            if (index > 0 and index + 2 < len(passes)
-                    and ('rgba8' not in p['formats'] or index + 3 == len(passes))
-                    and set(passes[index + 1]['inputs']) == set(p['outputs'])
-                    and not any(set(versions[index]['outputs']) & set(later['inputs']) for later in versions[index + 2:])
-                    and p['samplers'] == passes[index + 1]['samplers']):
-                b = passes[index + 1]
-                source = pair((root / name / f'{index + 1}.wgsl').read_text(),
-                              (root / name / f'{index + 2}.wgsl').read_text(), p, b)
-                shader = f'{name}/{index + 1}-{index + 2}.wgsl'
-                (destination / shader).write_text('// Generated from pinned upstream sources; see vendor/upscaling/NOTICE.\n' + source)
-                value.update(outputs=versions[index + 1]['outputs'], formats=b['formats'],
-                             block=16, radius=2, shader=shader)
-                index += 1
-            if matrix and index == 0:
-                import matrix as cooperative
-                shader = f'{name}/1-matrix.wgsl'
-                source = cooperative.first((root / name / '1.wgsl').read_text())
-                (destination / shader).write_text('// Generated from pinned upstream sources; see vendor/upscaling/NOTICE.\n' + source + '\n')
-                value.update(shader=shader, block=16)
-            combined.append(value)
+    if matrix and (passes[0]['formats'] != ['rgba16f'] * len(passes[0]['formats'])
+                   or 'enable f16;' not in (root / name / '1.wgsl').read_text()):
+        return None
+    versions = graph(passes)
+    combined, index = [], 0
+    while index < len(passes):
+        p = passes[index]
+        value = dict(versions[index], shader=f'{name}/{index + 1}.wgsl')
+        # Quantized tensors amplify accumulated rounding differences. Fuse
+        # only the final intermediate pair before an 8-bit model's output.
+        if (index > 0 and index + 2 < len(passes)
+                and ('rgba8' not in p['formats'] or index + 3 == len(passes))
+                and set(passes[index + 1]['inputs']) == set(p['outputs'])
+                and not any(set(versions[index]['outputs']) & set(later['inputs']) for later in versions[index + 2:])
+                and p['samplers'] == passes[index + 1]['samplers']):
+            b = passes[index + 1]
+            shader = f'{name}/{index + 1}-{index + 2}.wgsl'
+            write(shader, pair((root / name / f'{index + 1}.wgsl').read_text(),
+                               (root / name / f'{index + 2}.wgsl').read_text(), p, b))
+            value.update(outputs=versions[index + 1]['outputs'], formats=b['formats'],
+                         block=16, radius=2, shader=shader)
             index += 1
-        names, textures = allocate(combined)
-        rust.append(f'Upscaler::{variant} => Model {{ textures: &[')
-        for fmt, scale in textures:
-            rust.append(f"({('Rgba8Unorm' if fmt == 'rgba8' else 'Rgba16Float')}, {scale}),")
-        rust.append(f"], output: {names['OUTPUT']}, passes: &[")
-        for p in combined:
-            source = (destination / p['shader']).read_text()
-            bindings = ['Uniform']
-            bindings += ['Source' if n == 'INPUT' else f'Texture({names[n]})' for n in p['inputs']]
-            bindings += [f'Texture({names[n]})' for n in p['outputs']]
-            bindings += ['Linear' if f == 'LINEAR' else 'Nearest' for f, _ in p['samplers']]
-            used = {int(n) for n in re.findall(r'@binding\((\d+)\)', source)}
-            entries = ','.join(f'({n},{value})' for n, value in enumerate(bindings) if n in used)
-            rust.append(f'''Pass {{ source: include_str!("{p['shader']}"), bindings: &[{entries}], block: {p['block']}, scale: {2 if 'OUTPUT' in p['outputs'] else 1}, radius: {p['radius']} }},''')
-        rust.append('] },')
-    rust.append('} }')
-    return '\n'.join(rust)
+        if matrix and index == 0:
+            import matrix as cooperative
+            shader = f'{name}/1-matrix.wgsl'
+            write(shader, cooperative.first((root / name / '1.wgsl').read_text()))
+            value.update(shader=shader, block=16)
+        combined.append(value)
+        index += 1
+    return combined

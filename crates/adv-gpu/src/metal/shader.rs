@@ -12,6 +12,8 @@ pub(super) struct Function {
     pub stage: Stage,
     pub raw: Object<dyn MTLFunction>,
     pub workgroup: [u32; 3],
+    /// Bytes of each threadgroup argument, by index.
+    pub threadgroup: Box<[u32]>,
     /// Native indices the entry reads; `None` for precompiled libraries, whose
     /// pipelines use their declared bindings.
     pub used: Option<Used>,
@@ -49,7 +51,11 @@ impl Device {
                 Source::Wgsl(source) => naga::front::wgsl::parse_str(source)
                     .map_err(|e| compile_error("WGSL", e.emit_to_string(source)))?,
                 Source::Ir(module) => *module,
-                Source::Precompiled { metal, .. } => {
+                Source::Precompiled {
+                    metal,
+                    entries: names,
+                    ..
+                } => {
                     let library = if metal.starts_with(b"MTLB") {
                         let file = pipeline::TemporaryFile::new()?;
                         std::fs::write(&file.0, metal).map_err(pipeline::io_error)?;
@@ -61,23 +67,22 @@ impl Device {
                     }
                     .map_err(|e| compile_error("Metal library", e))?;
                     let mut entries = Vec::new();
-                    for name in library.functionNames() {
+                    for entry in names {
                         let raw = library
-                            .newFunctionWithName(&name)
+                            .newFunctionWithName(&NSString::from_str(entry.function))
                             .ok_or_else(|| compile_error("Metal library", "missing function"))?;
                         let stage = match raw.functionType() {
                             MTLFunctionType::Vertex => Stage::Vertex,
                             MTLFunctionType::Fragment => Stage::Fragment,
                             MTLFunctionType::Kernel => Stage::Compute,
-                            _ => continue,
+                            _ => return Err(compile_error("Metal library", "unsupported stage")),
                         };
                         entries.push(Function {
-                            name: name.to_string(),
+                            name: entry.name.to_owned(),
                             stage,
                             raw,
-                            // Metal libraries expose no workgroup dimensions.
-                            // Precompiled kernels use one thread per group.
-                            workgroup: [1; 3],
+                            workgroup: entry.workgroup,
+                            threadgroup: entry.threadgroup.into(),
                             used: None,
                             sizes: None,
                         });
@@ -152,6 +157,7 @@ impl Device {
                     stage,
                     raw,
                     workgroup: module.entry_points[0].workgroup_size,
+                    threadgroup: lowered.threadgroup.into_iter().next().unwrap().into(),
                     used: Some(entry.used),
                     sizes: entry.sizes,
                 });

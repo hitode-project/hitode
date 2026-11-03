@@ -127,6 +127,7 @@ fn present_batches_reuse_fences_and_preserve_content() {
                 height: 8,
                 format: present::FORMAT,
                 count: 2,
+                storage: false,
                 label: "present batch",
             })
             .unwrap();
@@ -574,6 +575,7 @@ fn binding_tiers_render_identical_pixels() {
             Source::Precompiled {
                 spirv: &spirv,
                 metal: b"unused",
+                entries: &[],
             }
         };
         let shader = device

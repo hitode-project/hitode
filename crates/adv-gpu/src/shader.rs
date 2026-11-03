@@ -28,7 +28,23 @@ pub enum Source<'a> {
     Precompiled {
         spirv: &'a [u32],
         metal: &'a [u8],
+        /// [`Precompiled::entries`]; Metal loads exactly these.
+        entries: &'a [PrecompiledEntry<'a>],
     },
+}
+
+/// One entry point of [`Source::Precompiled`], with what Metal libraries do
+/// not record.
+#[derive(Clone, Copy, Debug)]
+pub struct PrecompiledEntry<'a> {
+    /// The WGSL name pipelines ask for.
+    pub name: &'a str,
+    /// The Metal function; naga renames reserved words such as `main`.
+    pub function: &'a str,
+    /// `[1; 3]` outside compute.
+    pub workgroup: [u32; 3],
+    /// Bytes of each threadgroup argument, in declaration order.
+    pub threadgroup: &'a [u32],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

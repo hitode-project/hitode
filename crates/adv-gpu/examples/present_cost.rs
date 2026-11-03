@@ -169,6 +169,7 @@ fn main() {
             height: HEIGHT,
             format,
             count: 3,
+            storage: false,
             label: "present cost",
         })
         .expect("pool");

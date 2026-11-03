@@ -65,7 +65,15 @@ impl PresentBuffer {
             format: desc.format,
             mips: 1,
             samples: 1,
-            usage: Usage::COLOR | Usage::SAMPLED | Usage::COPY_SRC | Usage::COPY_DST,
+            usage: Usage::COLOR
+                | Usage::SAMPLED
+                | Usage::COPY_SRC
+                | Usage::COPY_DST
+                | if desc.storage {
+                    Usage::STORAGE
+                } else {
+                    Usage::empty()
+                },
             view_formats: &[],
             label: desc.label,
         };
