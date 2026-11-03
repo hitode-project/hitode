@@ -570,14 +570,21 @@ pub(super) mod tests {
         };
         let (mut producer, consumer) = stream::channel(device.ring(4 << 20).unwrap());
         let recording = super::super::record::Recording::new(&device, &mut producer).unwrap();
+        let stream = stream::ExecutionStream(std::rc::Rc::new(std::cell::RefCell::new(producer)));
+        let execution = std::rc::Rc::new(super::super::Execution {
+            device: device.clone(),
+            stream: stream.clone(),
+            video: Arc::from([]),
+            owner: super::super::owner::Owner::unstarted(),
+        });
         Some((
             Gpu {
                 device,
-                stream: producer,
+                stream,
                 pipelines: pipelines::Pipelines::default(),
                 clip: None,
                 stats: Default::default(),
-                owner: super::super::owner::Owner::unstarted(),
+                execution,
                 recording,
                 staging: Default::default(),
             },
