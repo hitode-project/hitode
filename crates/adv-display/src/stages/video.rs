@@ -1,13 +1,16 @@
-//! One instanced draw per video: damage tiles sample NV12 or paint the border.
-//! Software bases decode inline. Gathered YUV is interpolated in float before
-//! the color matrix so filtering does not quantize intermediate plane values.
+//! One instanced draw per video: damage tiles sample YUV or paint the border.
+//! Software bases decode inline. Metal samples planes; Android samples the
+//! pool's converted RGB. Plane samples interpolate in float before the color matrix.
 
 use super::{bindings, ingest};
 use crate::{Rect, plan::Tiles};
 use adv_gpu::{
-    Device, Encoder, Format, Image, ImageView, RenderPipeline, Result, Ring, Sampler,
+    Device, Encoder, Format, Image, ImageView, PresentImage, PresentPool, RenderPipeline, Result,
+    Ring, Sampler,
     encode::{Bind, ColorAttachment, Load, RenderPassDesc, Store},
-    pipeline::{ColorTarget, Cull, Primitive, RenderPipelineDesc, Topology},
+    pipeline::{
+        BindingKind, ColorTarget, Cull, Primitive, RenderPipelineDesc, Topology, VideoPipelineDesc,
+    },
     present::YuvColor,
     resource::{Address, BorderColor, BufferSlice, Filter, SamplerDesc},
     shader::{ShaderDesc, Source, Stage},
@@ -36,51 +39,7 @@ fn resources_for(
     format: Format,
     software: bool,
 ) -> Result<(RenderPipeline, Sampler)> {
-    let shader = device.create_shader(ShaderDesc {
-        source: Source::Precompiled {
-            spirv: &include!(concat!(env!("OUT_DIR"), "/video.spv.rs")),
-            metal: include_bytes!(concat!(env!("OUT_DIR"), "/video.msl")),
-        },
-        identity: include!(concat!(env!("OUT_DIR"), "/video.identity.rs")),
-        label: "video",
-    })?;
-    let pipeline = device.create_render_pipeline(
-        &RenderPipelineDesc {
-            vertex: shader.entry(if software { "vs_software" } else { "vs" }, Stage::Vertex)?,
-            fragment: Some(
-                shader.entry(if software { "fs_software" } else { "fs" }, Stage::Fragment)?,
-            ),
-            bindings: if software {
-                bindings::VIDEO
-                    .iter()
-                    .copied()
-                    .filter(|b| b.slot != 2)
-                    .chain(bindings::INGEST)
-                    .collect()
-            } else {
-                bindings::VIDEO.to_vec()
-            },
-            primitive: Primitive {
-                topology: Topology::Triangles,
-                cull: Cull::None,
-                front_ccw: false,
-                wireframe: false,
-                unclipped_depth: false,
-            },
-            colors: [ColorTarget {
-                format,
-                blend: None,
-                write_mask: 15,
-            }]
-            .into_iter()
-            .collect(),
-            depth_stencil: None,
-            samples: 1,
-            alpha_to_coverage: false,
-            label: "video",
-        },
-        None,
-    )?;
+    let pipeline = pipeline(device, format, software, None)?;
     let sampler = device.sampler(&SamplerDesc {
         min: Filter::Linear,
         mag: Filter::Linear,
@@ -96,6 +55,101 @@ fn resources_for(
     Ok((pipeline, sampler))
 }
 
+/// Build once for the converted-video pool, off the encoding path.
+pub fn converted_resources(
+    device: &Device,
+    format: Format,
+    pool: &PresentPool,
+) -> Result<RenderPipeline> {
+    pipeline(device, format, false, Some(pool))
+}
+
+/// Decode the software base inline with a converted video picture.
+pub fn converted_software_resources(
+    device: &Device,
+    format: Format,
+    pool: &PresentPool,
+) -> Result<RenderPipeline> {
+    pipeline(device, format, true, Some(pool))
+}
+
+fn pipeline(
+    device: &Device,
+    format: Format,
+    software: bool,
+    pool: Option<&PresentPool>,
+) -> Result<RenderPipeline> {
+    let converted = pool.is_some() && cfg!(target_os = "android");
+    let shader = device.create_shader(ShaderDesc {
+        source: if converted {
+            Source::Precompiled {
+                spirv: &include!(concat!(env!("OUT_DIR"), "/video_converted.spv.rs")),
+                metal: include_bytes!(concat!(env!("OUT_DIR"), "/video_converted.msl")),
+            }
+        } else {
+            Source::Precompiled {
+                spirv: &include!(concat!(env!("OUT_DIR"), "/video.spv.rs")),
+                metal: include_bytes!(concat!(env!("OUT_DIR"), "/video.msl")),
+            }
+        },
+        identity: if converted {
+            include!(concat!(env!("OUT_DIR"), "/video_converted.identity.rs"))
+        } else {
+            include!(concat!(env!("OUT_DIR"), "/video.identity.rs"))
+        },
+        label: "video",
+    })?;
+    let mut desc = RenderPipelineDesc {
+        vertex: shader.entry(if software { "vs_software" } else { "vs" }, Stage::Vertex)?,
+        fragment: Some(shader.entry(if software { "fs_software" } else { "fs" }, Stage::Fragment)?),
+        bindings: if software {
+            bindings::VIDEO
+                .iter()
+                .copied()
+                .filter(|b| b.slot != 2)
+                .chain(bindings::INGEST)
+                .collect()
+        } else {
+            bindings::VIDEO.to_vec()
+        },
+        primitive: Primitive {
+            topology: Topology::Triangles,
+            cull: Cull::None,
+            front_ccw: false,
+            wireframe: false,
+            unclipped_depth: false,
+        },
+        colors: [ColorTarget {
+            format,
+            blend: None,
+            write_mask: 15,
+        }]
+        .into_iter()
+        .collect(),
+        depth_stencil: None,
+        samples: 1,
+        alpha_to_coverage: false,
+        label: "video",
+    };
+    if let Some(pool) = pool {
+        desc.bindings.retain(|b| {
+            matches!(
+                b.kind,
+                BindingKind::UniformBuffer | BindingKind::StorageBuffer { .. }
+            )
+        });
+        device.create_video_pipeline(
+            &VideoPipelineDesc {
+                pipeline: &desc,
+                pool,
+            },
+            None,
+        )
+    } else {
+        device.create_render_pipeline(&desc, None)
+    }
+}
+
 /// Compose into an existing canvas. Tiles outside the video and its background
 /// preserve the base. `resources` and the producer's ring are reused each frame.
 pub fn encode(
@@ -109,10 +163,10 @@ pub fn encode(
     encode_base(
         encoder,
         destination,
-        planes,
+        Picture::Planes(planes, resources.1),
         geometry,
         tiles,
-        resources,
+        (resources.0, resources.2),
         None,
     )
 }
@@ -127,37 +181,84 @@ pub fn encode_software(
     tiles: &Tiles,
     resources: (&RenderPipeline, &Sampler, &mut Ring),
 ) -> Result<()> {
-    debug_assert_eq!(
-        software.extent,
-        (
-            destination.desc().size.width,
-            destination.desc().size.height
-        )
-    );
     encode_base(
         encoder,
         destination,
-        planes,
+        Picture::Planes(planes, resources.1),
+        geometry,
+        tiles,
+        (resources.0, resources.2),
+        Some(software),
+    )
+}
+/// Compose through the pool's immutable YUV conversion.
+pub fn encode_converted(
+    encoder: &mut Encoder,
+    destination: &Image,
+    image: &PresentImage,
+    geometry: Geometry,
+    tiles: &Tiles,
+    resources: (&RenderPipeline, &mut Ring),
+) -> Result<()> {
+    encode_base(
+        encoder,
+        destination,
+        Picture::Converted(image),
+        geometry,
+        tiles,
+        resources,
+        None,
+    )
+}
+
+/// Decode a software publication and converted video in one draw.
+pub fn encode_converted_software(
+    encoder: &mut Encoder,
+    destination: &Image,
+    software: &ingest::Source<'_>,
+    image: &PresentImage,
+    geometry: Geometry,
+    tiles: &Tiles,
+    resources: (&RenderPipeline, &mut Ring),
+) -> Result<()> {
+    encode_base(
+        encoder,
+        destination,
+        Picture::Converted(image),
         geometry,
         tiles,
         resources,
         Some(software),
     )
 }
+
+enum Picture<'a> {
+    Planes(&'a [ImageView; 2], &'a Sampler),
+    Converted(&'a PresentImage),
+}
 fn encode_base(
     encoder: &mut Encoder,
     destination: &Image,
-    planes: &[ImageView; 2],
+    picture: Picture<'_>,
     geometry: Geometry,
     tiles: &Tiles,
-    resources: (&RenderPipeline, &Sampler, &mut Ring),
+    resources: (&RenderPipeline, &mut Ring),
     software: Option<&ingest::Source<'_>>,
 ) -> Result<()> {
     if tiles.rects.is_empty() {
         return Ok(());
     }
+    if let Some(software) = software {
+        debug_assert_eq!(
+            software.extent,
+            (
+                destination.desc().size.width,
+                destination.desc().size.height
+            )
+        );
+    }
     let (area, coverage_load) = ingest::coverage(tiles);
-    let (pipeline, sampler, ring) = resources;
+    let (pipeline, ring) = resources;
     let size = destination.desc().size;
     let d = geometry.destination;
     let (bg, color) = geometry.background.unwrap_or((Rect::default(), [0; 4]));
@@ -278,9 +379,14 @@ fn encode_base(
                 }),
             );
         }
-        pass.bind(0, Bind::Sampled(&planes[0]));
-        pass.bind(1, Bind::Sampled(&planes[1]));
-        pass.bind(0, Bind::Sampler(sampler));
+        match picture {
+            Picture::Planes(planes, sampler) => {
+                pass.bind(0, Bind::Sampled(&planes[0]));
+                pass.bind(1, Bind::Sampled(&planes[1]));
+                pass.bind(0, Bind::Sampler(sampler));
+            }
+            Picture::Converted(image) => pass.bind_video(image),
+        }
         pass.set_viewport(0.0, 0.0, size.width as f32, size.height as f32, 0.0, 1.0);
         pass.draw(0..6, 0..tiles.rects.len() as u32);
     }

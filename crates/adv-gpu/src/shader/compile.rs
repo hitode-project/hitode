@@ -1,7 +1,8 @@
-//! Backend-free host compilation and the Metal lowering shared by runtime shaders.
+//! Backend-free host compilation and the binding lowering shared by runtime shaders.
 use crate::pipeline::{Binding, BindingKind, Stages};
 use crate::{Error, Result};
 use naga::back::msl;
+use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 
 /// Portable host shader outputs. No device or driver is involved.
@@ -22,8 +23,9 @@ pub fn precompile(wgsl: &str, bindings: &[Binding]) -> Result<Precompiled> {
     )
     .validate(&module)
     .map_err(|e| compile_error("shader validation", e))?;
-    let spirv = naga::back::spv::write_vec(&module, &info, &Default::default(), None)
+    let mut spirv = naga::back::spv::write_vec(&module, &info, &Default::default(), None)
         .map_err(|e| compile_error("SPIR-V", e))?;
+    combine_video_sampler(&mut spirv, 4);
     let metal = metal(
         &module,
         &info,
@@ -86,7 +88,7 @@ pub(crate) fn native(group: u32, slot: u32, buffer: bool, textures: u32) -> Resu
         (0 | 3, true) => SIZES as u32,
         (1, false) => textures,
         (3, false) => 96,
-        (2, false) => 16,
+        (2, false) => 32,
         _ => return Err(Error::Invalid("Metal binding group".into())),
     };
     let (table, index) = index(group, slot, buffer);
@@ -101,9 +103,20 @@ pub(crate) fn native(group: u32, slot: u32, buffer: bool, textures: u32) -> Resu
 pub(crate) struct Used {
     pub buffers: u32,
     pub textures: u128,
-    pub samplers: u16,
+    pub samplers: u32,
+}
+pub(crate) fn sampler_index(slot: u32) -> u32 {
+    slot % 16
 }
 impl Used {
+    pub fn check_samplers(self) -> Result<()> {
+        if self.samplers as u16 & (self.samplers >> 16) as u16 != 0 {
+            return Err(Error::Invalid(
+                "sampler slots collide modulo 16 in one stage".into(),
+            ));
+        }
+        Ok(())
+    }
     pub fn add(&mut self, group: u32, slot: u32, buffer: bool, textures: u32) -> Result<u32> {
         let (table, index) = native(group, slot, buffer, textures)?;
         let fresh = match table {
@@ -128,7 +141,11 @@ impl Used {
                 "Metal binding {group}:{slot} shares index {index} with another kind"
             )));
         }
-        Ok(index)
+        Ok(if table == 2 {
+            sampler_index(index)
+        } else {
+            index
+        })
     }
     #[cfg(all(feature = "backend", target_vendor = "apple"))]
     pub fn contains(self, other: Used) -> bool {
@@ -197,7 +214,18 @@ pub(crate) fn metal(
             let Some(binding) = var.binding else {
                 continue;
             };
-            let buffer = match (binding.group, var.space, &module.types[var.ty].inner) {
+            let portable = match (binding.group, binding.binding) {
+                (4, 0) => naga::ResourceBinding {
+                    group: 1,
+                    binding: 0,
+                },
+                (4, 1) => naga::ResourceBinding {
+                    group: 2,
+                    binding: 0,
+                },
+                _ => binding,
+            };
+            let buffer = match (portable.group, var.space, &module.types[var.ty].inner) {
                 (0, naga::AddressSpace::Uniform, _)
                 | (3, naga::AddressSpace::Storage { .. }, _) => true,
                 (
@@ -225,6 +253,7 @@ pub(crate) fn metal(
                 }
             };
             if let Some(bindings) = bindings
+                && binding.group != 4
                 && !bindings.iter().any(|b| {
                     b.slot == binding.binding
                         && b.stages.contains(stage)
@@ -236,9 +265,9 @@ pub(crate) fn metal(
                     format!("undeclared binding {}:{}", binding.group, binding.binding),
                 ));
             }
-            let index = used.add(binding.group, binding.binding, buffer, options.textures)? as u8;
+            let index = used.add(portable.group, portable.binding, buffer, options.textures)? as u8;
             let mut target = msl::BindTarget::default();
-            match (buffer, binding.group) {
+            match (buffer, portable.group) {
                 (true, _) => target.buffer = Some(index),
                 (false, 2) => target.sampler = Some(msl::BindSamplerTarget::Resource(index)),
                 _ => target.texture = Some(index),
@@ -246,6 +275,7 @@ pub(crate) fn metal(
             target.mutable = matches!(var.space, naga::AddressSpace::Storage { access } if access.contains(naga::StorageAccess::STORE));
             resources.resources.insert(binding, target);
         }
+        used.check_samplers()?;
         if !sizes.is_empty() {
             resources.sizes_buffer = Some(SIZES as u8);
         }
@@ -290,6 +320,175 @@ pub(crate) fn metal(
     })
 }
 
+/// Naga has no combined-image global in its IR. Restore the reserved video
+/// pair only for import; pipeline lowering combines it again with the same
+/// function used by host compilation.
+#[cfg(any(test, all(feature = "backend", not(target_vendor = "apple"))))]
+pub(crate) fn parse_spirv(words: &[u32]) -> Result<naga::Module> {
+    if words.len() < 5 || words[0] != 0x07230203 {
+        return Err(compile_error("SPIR-V", "invalid header"));
+    }
+    let mut at = 5;
+    while at < words.len() {
+        let count = (words[at] >> 16) as usize;
+        if count == 0 || count > words.len() - at {
+            return Err(compile_error("SPIR-V", "invalid instruction length"));
+        }
+        at += count;
+    }
+    let mut import = words.to_vec();
+    let code: Vec<_> = instructions(words).collect();
+    let image = code.iter().find_map(|i| {
+        (i.len() == 4 && i[0] & 0xffff == 71 && i[2] == 34 && i[3] == 4).then(|| i[1])
+    });
+    if let Some(image) = image {
+        let pointee = code
+            .iter()
+            .find_map(|i| (i.len() == 4 && i[0] & 0xffff == 59 && i[2] == image).then(|| i[1]));
+        let sampled = code.iter().find_map(|i| {
+            (i.len() == 4 && i[0] & 0xffff == 32 && Some(i[1]) == pointee).then(|| i[3])
+        });
+        let image_type = code.iter().find_map(|i| {
+            (i.len() == 3 && i[0] & 0xffff == 27 && Some(i[1]) == sampled).then(|| i[2])
+        });
+        if let Some(image_type) = image_type {
+            let sampled = sampled.unwrap();
+            let missing = || compile_error("SPIR-V", "incomplete combined video declaration");
+            let image_pointer = code
+                .iter()
+                .find(|i| i.len() == 4 && i[0] & 0xffff == 32 && i[2] == 0 && i[3] == image_type)
+                .ok_or_else(missing)?[1];
+            let sampler_type = code
+                .iter()
+                .find(|i| i.len() == 2 && i[0] & 0xffff == 26)
+                .ok_or_else(missing)?[1];
+            let sampler_pointer = code
+                .iter()
+                .find(|i| i.len() == 4 && i[0] & 0xffff == 32 && i[2] == 0 && i[3] == sampler_type)
+                .ok_or_else(missing)?[1];
+            let mut next = words[3];
+            let sampler = next;
+            next += 1;
+            import.truncate(5);
+            let mut loads = HashMap::new();
+            for i in code {
+                match i[0] & 0xffff {
+                    71 if i.len() == 4 && i[1] == image && i[2] == 34 => {
+                        import.extend_from_slice(i);
+                        import.extend([(4 << 16) | 71, sampler, 34, 4]);
+                        import.extend([(4 << 16) | 71, sampler, 33, 1]);
+                    }
+                    32 if i.len() == 4 && i[1] == sampler_pointer => {
+                        import.extend_from_slice(i);
+                        import.extend([(4 << 16) | 59, sampler_pointer, sampler, 0]);
+                    }
+                    59 if i.len() == 4 && i[2] == image => {
+                        import.extend([(4 << 16) | 59, image_pointer, image, 0]);
+                    }
+                    61 if i.len() >= 4 && i[3] == image => {
+                        let (y, s) = (next, next + 1);
+                        next += 2;
+                        import.extend([(4 << 16) | 61, image_type, y, image]);
+                        import.extend([(4 << 16) | 61, sampler_type, s, sampler]);
+                        import.extend([(5 << 16) | 86, sampled, i[2], y, s]);
+                        loads.insert(i[2], (y, s));
+                    }
+                    83 if i.len() == 4 && i[1] == sampled && loads.contains_key(&i[3]) => {
+                        let &(y, s) = &loads[&i[3]];
+                        import.extend([(5 << 16) | 86, sampled, i[2], y, s]);
+                        loads.insert(i[2], (y, s));
+                    }
+                    _ => import.extend_from_slice(i),
+                }
+            }
+            import[3] = next;
+        }
+    }
+    naga::front::spv::Frontend::new(import.into_iter(), &Default::default())
+        .parse()
+        .map_err(|e| compile_error("SPIR-V", e))
+}
+
+fn instructions(words: &[u32]) -> impl Iterator<Item = &[u32]> {
+    let mut rest = &words[5..];
+    std::iter::from_fn(move || {
+        if rest.is_empty() {
+            return None;
+        }
+        let (instruction, tail) = rest.split_at((rest[0] >> 16) as usize);
+        rest = tail;
+        Some(instruction)
+    })
+}
+
+/// Naga emits separate WGSL textures and samplers. External-format sampling
+/// requires an OpTypeSampledImage variable in one combined descriptor instead.
+/// Only the reserved video pair is rewritten; the binding tiers are unchanged.
+pub(crate) fn combine_video_sampler(words: &mut Vec<u32>, set: u32) {
+    let mut sets = HashMap::new();
+    let mut bindings = HashMap::new();
+    for i in instructions(words) {
+        if i[0] & 0xffff == 71 {
+            // OpDecorate
+            match i[2] {
+                34 => {
+                    sets.insert(i[1], i[3]);
+                } // DescriptorSet
+                33 => {
+                    bindings.insert(i[1], i[3]);
+                } // Binding
+                _ => {}
+            }
+        }
+    }
+    let variable = |binding| {
+        bindings
+            .iter()
+            .find_map(|(&id, &b)| (b == binding && sets.get(&id) == Some(&set)).then_some(id))
+    };
+    let Some(image) = variable(0) else {
+        return;
+    }; // An entry may not use video.
+    let sampler = variable(1).expect("video sampler declaration");
+    let pointer = instructions(words)
+        .find(|i| i[0] & 0xffff == 59 && i[2] == image)
+        .unwrap()[1];
+    let image_type = instructions(words)
+        .find(|i| i[0] & 0xffff == 32 && i[1] == pointer)
+        .unwrap()[3];
+    let sampled_type = instructions(words)
+        .find(|i| i[0] & 0xffff == 27 && i[2] == image_type)
+        .unwrap()[1];
+    let combined_pointer = words[3];
+    words[3] += 1;
+    let mut output = words[..5].to_vec();
+    let mut loaded_images = Vec::new();
+    for i in instructions(words) {
+        let op = i[0] & 0xffff;
+        match op {
+            5 | 71 if i[1] == sampler => {}  // OpName / OpDecorate
+            59 if i[2] == sampler => {}      // OpVariable
+            27 if i[1] == sampled_type => {} // Its type must precede the variable.
+            59 if i[2] == image => {
+                output.extend([(3 << 16) | 27, sampled_type, image_type]);
+                output.extend([(4 << 16) | 32, combined_pointer, 0, sampled_type]); // OpTypePointer, UniformConstant
+                output.extend([(4 << 16) | 59, combined_pointer, image, 0]);
+            }
+            61 if i[3] == sampler => {} // OpLoad
+            61 if i[3] == image => {
+                loaded_images.push(i[2]);
+                output.extend([(4 << 16) | 61, sampled_type, i[2], image]);
+            }
+            86 if loaded_images.contains(&i[3]) => {
+                // OpSampledImage -> OpCopyObject
+                output.extend([(4 << 16) | 83, sampled_type, i[2], i[3]]);
+            }
+            _ => output.extend_from_slice(i),
+        }
+    }
+    *words = output;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,7 +504,76 @@ mod tests {
         assert!(used.add(0, 29, true, 96).is_err());
         assert!(used.add(0, 30, true, 96).is_err());
         assert!(used.add(1, 96, false, 96).is_err());
-        assert!(used.add(2, 16, false, 96).is_err());
+        assert_eq!(used.add(2, 16, false, 96).unwrap(), 0);
+        assert!(used.add(2, 32, false, 96).is_err());
+    }
+    #[test]
+    fn host_samplers_share_native_indices_only_across_stages() {
+        let source = r#"
+            @group(1) @binding(0) var image: texture_2d<f32>;
+            @group(2) @binding(16) var vertex_sampler: sampler;
+            @group(2) @binding(0) var fragment_sampler: sampler;
+            @vertex fn vs() -> @builtin(position) vec4<f32> {
+                return textureSampleLevel(image, vertex_sampler, vec2(0.5), 0.);
+            }
+            @fragment fn fs() -> @location(0) vec4<f32> {
+                return textureSampleLevel(image, fragment_sampler, vec2(0.5), 0.);
+            }
+        "#;
+        let bindings = [
+            Binding {
+                slot: 0,
+                kind: BindingKind::SampledImage {
+                    dimension: crate::resource::Dimension::D2,
+                    depth: false,
+                    multisampled: false,
+                },
+                stages: Stages::VERTEX | Stages::FRAGMENT,
+            },
+            Binding {
+                slot: 16,
+                kind: BindingKind::Sampler { comparison: false },
+                stages: Stages::VERTEX,
+            },
+            Binding {
+                slot: 0,
+                kind: BindingKind::Sampler { comparison: false },
+                stages: Stages::FRAGMENT,
+            },
+        ];
+        let compiled = precompile(source, &bindings).unwrap();
+        assert_eq!(compiled.metal.matches("[[sampler(0)]]").count(), 2);
+        let collision = source.replace("return textureSampleLevel(image, fragment_sampler, vec2(0.5), 0.);", "return textureSampleLevel(image, fragment_sampler, vec2(0.5), 0.) + textureSampleLevel(image, vertex_sampler, vec2(0.5), 0.);");
+        let mut bindings = bindings;
+        bindings[1].stages |= Stages::FRAGMENT;
+        assert!(precompile(&collision, &bindings).is_err());
+    }
+    #[test]
+    fn precompiled_video_is_combined() {
+        let compiled = precompile(
+            r#"
+            @group(4) @binding(0) var video: texture_2d<f32>;
+            @group(4) @binding(1) var filtering: sampler;
+            @fragment fn fs() -> @location(0) vec4<f32> {
+                return textureSampleLevel(video, filtering, vec2(0.5), 0.);
+            }
+        "#,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            instructions(&compiled.spirv)
+                .filter(|i| i[0] & 0xffff == 71 && i[2] == 34 && i[3] == 4)
+                .count(),
+            1
+        );
+        let module = parse_spirv(&compiled.spirv).unwrap();
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .unwrap();
     }
     #[test]
     fn host_compilation_checks_bindings_and_hashes_its_outputs() {

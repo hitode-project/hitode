@@ -28,7 +28,8 @@
 //! Build scripts use `default-features = false, features = ["precompile"]` to
 //! call [`shader::precompile`] without a backend or driver dependencies. The
 //! default `backend` feature provides the runtime API. Host compilation and
-//! runtime Metal shaders share the same naga lowering and argument-index rules.
+//! runtime shaders share Metal argument-index rules and the converted-video
+//! SPIR-V binding rewrite.
 //!
 //! # Threads
 //!

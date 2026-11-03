@@ -18,9 +18,24 @@ fn main() {
         ),
         (
             "video",
-            software + &read("video"),
+            software.clone() + &read("video") + &read("video_planes"),
             bindings::VIDEO
                 .into_iter()
+                .chain(bindings::INGEST)
+                .collect(),
+        ),
+        (
+            "video_converted",
+            software + &read("video") + &read("video_converted"),
+            bindings::VIDEO
+                .into_iter()
+                .filter(|b| {
+                    matches!(
+                        b.kind,
+                        adv_gpu::pipeline::BindingKind::UniformBuffer
+                            | adv_gpu::pipeline::BindingKind::StorageBuffer { .. }
+                    )
+                })
                 .chain(bindings::INGEST)
                 .collect(),
         ),

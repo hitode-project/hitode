@@ -1,6 +1,10 @@
 #![cfg(any(target_vendor = "apple", target_os = "android"))]
 
-use adv_display::{Rect, plan::Tiles, stages::video::*};
+use adv_display::{
+    Rect,
+    plan::Tiles,
+    stages::{ingest, video::*},
+};
 use adv_gpu::{
     Device, Format,
     encode::{ColorAttachment, Load, RenderPassDesc, Store},
@@ -24,6 +28,29 @@ fn video_draw_matches_cpu_reference() {
     let (device, mut queue) = Device::open(&DeviceOptions::default()).unwrap();
     #[cfg(target_vendor = "apple")]
     let (pipeline, sampler) = resources(&device, Format::Rgba8Unorm).unwrap();
+    #[cfg(target_vendor = "apple")]
+    let (software_pipeline, _) = software_resources(&device, Format::Rgba8Unorm).unwrap();
+    let software_buffer = device
+        .create_buffer(&BufferDesc {
+            size: 20 * 14 * 4,
+            usage: BufferUsage::STORAGE,
+            memory: Memory::Upload,
+            label: "software video base",
+        })
+        .unwrap();
+    for pixel in unsafe { software_buffer.mapped().unwrap().as_mut() }
+        .as_chunks_mut::<4>()
+        .0
+    {
+        *pixel = [147, 23, 94, 255];
+    }
+    let software_source = ingest::Source {
+        buffer: &software_buffer,
+        pitch: 80,
+        extent: (20, 14),
+        format: ingest::PixelFormat::Bgra32,
+        palette: None,
+    };
     let mut ring = device.ring(65536).unwrap();
     let size = Extent {
         width: 20,
@@ -107,6 +134,9 @@ fn video_draw_matches_cpu_reference() {
         ));
         #[cfg(target_os = "android")]
         let pipeline = converted_resources(&device, Format::Rgba8Unorm, &pool).unwrap();
+        #[cfg(target_os = "android")]
+        let software_pipeline =
+            converted_software_resources(&device, Format::Rgba8Unorm, &pool).unwrap();
         let mut image = pool.acquire_cpu().unwrap();
         image.write(|planes| {
             for row in 0..6 {
@@ -161,92 +191,125 @@ fn video_draw_matches_cpu_reference() {
             )),
             color,
         };
-        let mut encoder = queue.encoder("video test");
-        drop(
-            encoder.render_pass(&RenderPassDesc {
-                colors: [ColorAttachment {
-                    view: target.view(),
-                    load: Load::Clear([0.0, 0.0, 0.0, 1.0]),
-                    store: Store::Store,
-                    resolve: None,
-                }]
-                .into_iter()
-                .collect(),
-                depth_stencil: None,
-                area: GpuRect {
-                    x: 0,
-                    y: 0,
-                    w: 20,
-                    h: 14,
+        for software in [false, true] {
+            let mut encoder = queue.encoder("video test");
+            drop(
+                encoder.render_pass(&RenderPassDesc {
+                    colors: [ColorAttachment {
+                        view: target.view(),
+                        load: Load::Clear([0.0, 0.0, 0.0, 1.0]),
+                        store: Store::Store,
+                        resolve: None,
+                    }]
+                    .into_iter()
+                    .collect(),
+                    depth_stencil: None,
+                    area: GpuRect {
+                        x: 0,
+                        y: 0,
+                        w: 20,
+                        h: 14,
+                    },
+                    timestamps: None,
+                    label: "base",
+                }),
+            );
+            if software {
+                #[cfg(target_vendor = "apple")]
+                encode_software(
+                    &mut encoder,
+                    &target,
+                    &software_source,
+                    &planes,
+                    geometry,
+                    &tiles,
+                    (&software_pipeline, &sampler, &mut ring),
+                )
+                .unwrap();
+                #[cfg(target_os = "android")]
+                encode_converted_software(
+                    &mut encoder,
+                    &target,
+                    &software_source,
+                    &image,
+                    geometry,
+                    &tiles,
+                    (&software_pipeline, &mut ring),
+                )
+                .unwrap();
+            } else {
+                #[cfg(target_vendor = "apple")]
+                encode(
+                    &mut encoder,
+                    &target,
+                    &planes,
+                    geometry,
+                    &tiles,
+                    (&pipeline, &sampler, &mut ring),
+                )
+                .unwrap();
+                #[cfg(target_os = "android")]
+                encode_converted(
+                    &mut encoder,
+                    &target,
+                    &image,
+                    geometry,
+                    &tiles,
+                    (&pipeline, &mut ring),
+                )
+                .unwrap();
+            }
+            encoder.copy_image_to_buffer(
+                ImageCopy {
+                    image: &target,
+                    mip: 0,
+                    layer: 0,
+                    origin: (0, 0, 0),
                 },
-                timestamps: None,
-                label: "base",
-            }),
-        );
-        #[cfg(target_vendor = "apple")]
-        encode(
-            &mut encoder,
-            &target,
-            &planes,
-            geometry,
-            &tiles,
-            (&pipeline, &sampler, &mut ring),
-        )
-        .unwrap();
-        #[cfg(target_os = "android")]
-        encode_converted(
-            &mut encoder,
-            &target,
-            &image,
-            geometry,
-            &tiles,
-            (&pipeline, &mut ring),
-        )
-        .unwrap();
-        encoder.copy_image_to_buffer(
-            ImageCopy {
-                image: &target,
-                mip: 0,
-                layer: 0,
-                origin: (0, 0, 0),
-            },
-            BufferCopy {
-                buffer: &readback,
-                offset: 0,
-                row_pitch: 80,
-                rows: 14,
-            },
-            size,
-        );
-        let token: Token = queue.submit(encoder).unwrap();
-        assert!(queue.wait(token, Duration::from_secs(20)).unwrap());
-        let actual = unsafe { readback.mapped().unwrap().as_ref() };
-        for py in 0..14 {
-            for px in 0..20 {
-                let inside = |r: Rect| px >= r.x && px < r.x + r.w && py >= r.y && py < r.y + r.h;
-                let mut expected = [0, 0, 0, 255];
-                if tiles.rects.iter().copied().any(inside) {
-                    if inside(geometry.destination) {
-                        let d = geometry.destination;
-                        let sx = geometry.source_uv[0]
-                            + (px as f32 + 0.5 - d.x as f32) / d.w as f32 * geometry.source_uv[2];
-                        let sy = geometry.source_uv[1]
-                            + (py as f32 + 0.5 - d.y as f32) / d.h as f32 * geometry.source_uv[3];
-                        let luma = sample(&y, (8, 6), 1, 0, sx, sy);
-                        let u = sample(&uv, (4, 3), 2, 0, sx, sy);
-                        let v = sample(&uv, (4, 3), 2, 1, sx, sy);
-                        expected = rgb(luma, u, v, color);
-                    } else if inside(geometry.background.unwrap().0) {
-                        expected = [90, 60, 30, 255];
+                BufferCopy {
+                    buffer: &readback,
+                    offset: 0,
+                    row_pitch: 80,
+                    rows: 14,
+                },
+                size,
+            );
+            let token: Token = queue.submit(encoder).unwrap();
+            assert!(queue.wait(token, Duration::from_secs(20)).unwrap());
+            let actual = unsafe { readback.mapped().unwrap().as_ref() };
+            for py in 0..14 {
+                for px in 0..20 {
+                    let inside =
+                        |r: Rect| px >= r.x && px < r.x + r.w && py >= r.y && py < r.y + r.h;
+                    let mut expected = [0, 0, 0, 255];
+                    if tiles.rects.iter().copied().any(inside) {
+                        if software {
+                            expected = [94, 23, 147, 255];
+                        }
+                        if inside(geometry.destination) {
+                            let d = geometry.destination;
+                            let sx = geometry.source_uv[0]
+                                + (px as f32 + 0.5 - d.x as f32) / d.w as f32
+                                    * geometry.source_uv[2];
+                            let sy = geometry.source_uv[1]
+                                + (py as f32 + 0.5 - d.y as f32) / d.h as f32
+                                    * geometry.source_uv[3];
+                            let luma = sample(&y, (8, 6), 1, 0, sx, sy);
+                            let u = sample(&uv, (4, 3), 2, 0, sx, sy);
+                            let v = sample(&uv, (4, 3), 2, 1, sx, sy);
+                            expected = rgb(luma, u, v, color);
+                        } else if inside(geometry.background.unwrap().0) {
+                            expected = [90, 60, 30, 255];
+                        }
                     }
-                }
-                let at = (py * 20 + px) as usize * 4;
-                for channel in 0..4 {
-                    assert!(
-                        actual[at + channel].abs_diff(expected[channel]) <= 2,
-                        "{color:?} ({px},{py}): {:?} != {expected:?}",
-                        &actual[at..at + 4]
-                    );
+                    let at = (py * 20 + px) as usize * 4;
+                    for channel in 0..4 {
+                        assert!(
+                            actual[at + channel].abs_diff(expected[channel]) <= 2,
+                            "{color:?} ({px},{py}): {:?} != {expected:?}",
+                            &actual[at..at + 4]
+                        );
+                    }
                 }
             }
         }

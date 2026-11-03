@@ -985,7 +985,10 @@ impl Bindings {
         while samplers != 0 {
             let i = samplers.trailing_zeros() as usize;
             samplers &= samplers - 1;
-            to.sampler(self.samplers[i].as_ref().unwrap(), i % 16);
+            to.sampler(
+                self.samplers[i].as_ref().unwrap(),
+                crate::shader::compile::sampler_index(i as u32) as usize,
+            );
         }
         if let Some(slots) = sizes {
             let values: ArrayVec<u32, { shader::SIZES }> = slots

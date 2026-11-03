@@ -23,7 +23,8 @@ pub enum Source<'a> {
     /// Build-time output: SPIR-V words for Vulkan, MSL source or a Metal
     /// library for Metal, declaring the argument indices
     /// [`crate::pipeline::Binding`] lists. Only the current backend's half is
-    /// read.
+    /// read. The reserved converted-video pair (group 4) is already combined
+    /// in SPIR-V; backend lowering retargets it to the pool's descriptor set.
     Precompiled {
         spirv: &'a [u32],
         metal: &'a [u8],

@@ -1,4 +1,5 @@
 use super::*;
+use crate::shader::compile::combine_video_sampler;
 use naga::{Expression as E, Handle, Span, Type, TypeInner};
 use std::ffi::CString;
 
@@ -230,12 +231,7 @@ impl Device {
             ),
             Source::Ir(module) => (*module, None),
             Source::Precompiled { spirv, .. } => {
-                let module = naga::front::spv::Frontend::new(
-                    spirv.iter().copied(),
-                    &naga::front::spv::Options::default(),
-                )
-                .parse()
-                .map_err(|e| Error::Compile(format!("SPIR-V: {e}")))?;
+                let module = crate::shader::compile::parse_spirv(spirv)?;
                 (module, Some(spirv))
             }
         };
@@ -1019,85 +1015,6 @@ fn map_block(block: &mut naga::Block, map: &[H], starts: &[u32], arena: &naga::A
     }
 }
 
-/// Naga emits separate WGSL textures and samplers. External-format sampling
-/// requires an OpTypeSampledImage variable in one combined descriptor instead.
-/// Only the reserved video pair is rewritten; the binding tiers are unchanged.
-fn combine_video_sampler(words: &mut Vec<u32>, set: u32) {
-    fn instructions(words: &[u32]) -> impl Iterator<Item = &[u32]> {
-        let mut rest = &words[5..];
-        std::iter::from_fn(move || {
-            if rest.is_empty() {
-                return None;
-            }
-            let (instruction, tail) = rest.split_at((rest[0] >> 16) as usize);
-            rest = tail;
-            Some(instruction)
-        })
-    }
-    let mut sets = HashMap::new();
-    let mut bindings = HashMap::new();
-    for i in instructions(words) {
-        if i[0] & 0xffff == 71 {
-            // OpDecorate
-            match i[2] {
-                34 => {
-                    sets.insert(i[1], i[3]);
-                } // DescriptorSet
-                33 => {
-                    bindings.insert(i[1], i[3]);
-                } // Binding
-                _ => {}
-            }
-        }
-    }
-    let variable = |binding| {
-        bindings
-            .iter()
-            .find_map(|(&id, &b)| (b == binding && sets.get(&id) == Some(&set)).then_some(id))
-    };
-    let Some(image) = variable(0) else {
-        return;
-    }; // An entry may not use video.
-    let sampler = variable(1).expect("video sampler declaration");
-    let pointer = instructions(words)
-        .find(|i| i[0] & 0xffff == 59 && i[2] == image)
-        .unwrap()[1];
-    let image_type = instructions(words)
-        .find(|i| i[0] & 0xffff == 32 && i[1] == pointer)
-        .unwrap()[3];
-    let sampled_type = instructions(words)
-        .find(|i| i[0] & 0xffff == 27 && i[2] == image_type)
-        .unwrap()[1];
-    let combined_pointer = words[3];
-    words[3] += 1;
-    let mut output = words[..5].to_vec();
-    let mut loaded_images = Vec::new();
-    for i in instructions(words) {
-        let op = i[0] & 0xffff;
-        match op {
-            5 | 71 if i[1] == sampler => {}  // OpName / OpDecorate
-            59 if i[2] == sampler => {}      // OpVariable
-            27 if i[1] == sampled_type => {} // Its type must precede the variable.
-            59 if i[2] == image => {
-                output.extend([(3 << 16) | 27, sampled_type, image_type]);
-                output.extend([(4 << 16) | 32, combined_pointer, 0, sampled_type]); // OpTypePointer, UniformConstant
-                output.extend([(4 << 16) | 59, combined_pointer, image, 0]);
-            }
-            61 if i[3] == sampler => {} // OpLoad
-            61 if i[3] == image => {
-                loaded_images.push(i[2]);
-                output.extend([(4 << 16) | 61, sampled_type, i[2], image]);
-            }
-            86 if loaded_images.contains(&i[3]) => {
-                // OpSampledImage -> OpCopyObject
-                output.extend([(4 << 16) | 83, sampled_type, i[2], i[3]]);
-            }
-            _ => output.extend_from_slice(i),
-        }
-    }
-    *words = output;
-}
-
 #[cfg(test)]
 mod video_tests {
     use super::*;
@@ -1118,83 +1035,100 @@ mod video_tests {
                 return textureSampleLevel(video, filtering, p.xy * scale.xy, 0.);
             }
         "#;
-        for heap in [false, true] {
-            let mut module = naga::front::wgsl::parse_str(source).unwrap();
-            let video: Vec<_> = module
-                .global_variables
-                .iter()
-                .filter_map(|(h, g)| {
-                    g.binding
-                        .as_ref()
-                        .is_some_and(|b| b.group == 4)
-                        .then_some(h)
-                })
-                .collect();
-            if heap {
-                rewrite_heap(&mut module, 32, 4, [16; 4]).unwrap();
-            } else {
-                for (_, global) in module.global_variables.iter_mut() {
-                    if let Some(binding) = &mut global.binding
-                        && binding.group != 4
-                    {
-                        binding.binding = binding.binding * 4 + binding.group;
-                        binding.group = 0;
-                    }
-                }
-            }
-            for set in [5, 6] {
-                let mut module = module.clone();
-                for &global in &video {
-                    module.global_variables[global]
-                        .binding
-                        .as_mut()
-                        .unwrap()
-                        .group = set;
-                }
-                for entry in [
-                    None,
-                    Some(naga::back::spv::PipelineOptions {
-                        shader_stage: naga::ShaderStage::Vertex,
-                        entry_point: "vs".into(),
-                    }),
-                    Some(naga::back::spv::PipelineOptions {
-                        shader_stage: naga::ShaderStage::Fragment,
-                        entry_point: "fs".into(),
-                    }),
-                ] {
-                    let mut words = lower(&module, entry.as_ref(), heap).unwrap();
-                    combine_video_sampler(&mut words, set);
-                    // Vulkan validation checks the resulting combined-image SPIR-V.
-                    let handle = unsafe {
-                        device.inner.0.device.create_shader_module(
-                            &vk::ShaderModuleCreateInfo::default().code(&words),
-                            None,
-                        )
-                    }
-                    .unwrap();
-                    unsafe {
-                        device.inner.0.device.destroy_shader_module(handle, None);
-                    }
-                    // The combined declaration is the only descriptor in the appended set.
-                    let mut at = 5;
-                    let mut descriptors = 0;
-                    let mut combined_loads = 0;
-                    while at < words.len() {
-                        let count = (words[at] >> 16) as usize;
-                        match words[at] & 0xffff {
-                            71 if words[at + 2] == 34 && words[at + 3] == set => descriptors += 1,
-                            83 => combined_loads += 1,
-                            _ => {}
-                        }
-                        at += count;
-                    }
-                    let sampled = usize::from(
-                        entry
+        let compiled = crate::shader::precompile(
+            source,
+            &[Binding {
+                slot: 3,
+                kind: BindingKind::UniformBuffer,
+                stages: Stages::FRAGMENT,
+            }],
+        )
+        .unwrap();
+        for precompiled in [false, true] {
+            for heap in [false, true] {
+                let mut module = if precompiled {
+                    crate::shader::compile::parse_spirv(&compiled.spirv).unwrap()
+                } else {
+                    naga::front::wgsl::parse_str(source).unwrap()
+                };
+                let video: Vec<_> = module
+                    .global_variables
+                    .iter()
+                    .filter_map(|(h, g)| {
+                        g.binding
                             .as_ref()
-                            .is_none_or(|e| e.shader_stage == naga::ShaderStage::Fragment),
-                    );
-                    assert_eq!(descriptors, sampled);
-                    assert_eq!(combined_loads, sampled);
+                            .is_some_and(|b| b.group == 4)
+                            .then_some(h)
+                    })
+                    .collect();
+                if heap {
+                    rewrite_heap(&mut module, 32, 4, [16; 4]).unwrap();
+                } else {
+                    for (_, global) in module.global_variables.iter_mut() {
+                        if let Some(binding) = &mut global.binding
+                            && binding.group != 4
+                        {
+                            binding.binding = binding.binding * 4 + binding.group;
+                            binding.group = 0;
+                        }
+                    }
+                }
+                for set in [5, 6] {
+                    let mut module = module.clone();
+                    for &global in &video {
+                        module.global_variables[global]
+                            .binding
+                            .as_mut()
+                            .unwrap()
+                            .group = set;
+                    }
+                    for entry in [
+                        None,
+                        Some(naga::back::spv::PipelineOptions {
+                            shader_stage: naga::ShaderStage::Vertex,
+                            entry_point: "vs".into(),
+                        }),
+                        Some(naga::back::spv::PipelineOptions {
+                            shader_stage: naga::ShaderStage::Fragment,
+                            entry_point: "fs".into(),
+                        }),
+                    ] {
+                        let mut words = lower(&module, entry.as_ref(), heap).unwrap();
+                        combine_video_sampler(&mut words, set);
+                        // Vulkan validation checks the resulting combined-image SPIR-V.
+                        let handle = unsafe {
+                            device.inner.0.device.create_shader_module(
+                                &vk::ShaderModuleCreateInfo::default().code(&words),
+                                None,
+                            )
+                        }
+                        .unwrap();
+                        unsafe {
+                            device.inner.0.device.destroy_shader_module(handle, None);
+                        }
+                        // The combined declaration is the only descriptor in the appended set.
+                        let mut at = 5;
+                        let mut descriptors = 0;
+                        let mut combined_loads = 0;
+                        while at < words.len() {
+                            let count = (words[at] >> 16) as usize;
+                            match words[at] & 0xffff {
+                                71 if words[at + 2] == 34 && words[at + 3] == set => {
+                                    descriptors += 1
+                                }
+                                83 => combined_loads += 1,
+                                _ => {}
+                            }
+                            at += count;
+                        }
+                        let sampled = usize::from(
+                            entry
+                                .as_ref()
+                                .is_none_or(|e| e.shader_stage == naga::ShaderStage::Fragment),
+                        );
+                        assert_eq!(descriptors, sampled);
+                        assert_eq!(combined_loads, sampled);
+                    }
                 }
             }
         }
