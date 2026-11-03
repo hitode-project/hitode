@@ -52,6 +52,8 @@ JIT 需要调试器临时附加到 Hitode 上，而只有开发签名才带这�
    - **方式一**：在 LiveContainer 里点"+"，选中第 1 步下载的 Hitode IPA。装好后长按 Hitode → 设置，打开"带JIT启动"，并在"修复"一栏打开"使用 LiveContainer 的包名"。然后打开 SideStore，登录同一个 Apple ID，在"My Apps"里点"+"，选中 StikDebug 的 IPA。装好后回到 LiveContainer，在底部的"设置"页把"JIT启用工具"选为"StikDebug"。
 
      <img src="images/ios/livecontainer-bundle-id.png" alt="LiveContainer 中 Hitode 的设置：“带JIT启动”和修复一栏里的“使用 LiveContainer 的包名”都已打开" width="320">
+
+     <img src="images/ios/livecontainer-jit-enabler.png" alt="LiveContainer 底部“设置”页的 JIT 一栏：“JIT启用工具”选为 StikDebug" width="320">
    - **方式二**：打开 SideStore，登录同一个 Apple ID，在"My Apps"里点"+"，选中 Hitode 的 IPA。完成后，桌面上会出现 Hitode 的图标。
 
    SideStore 的具体操作见 [SideStore 文档](https://docs.sidestore.io/)。SideStore 只能续签经它安装的 app，所以要通过它安装一次。
