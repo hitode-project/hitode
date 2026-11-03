@@ -16,9 +16,7 @@
         <span class="note" class:ok={status.ready} role="status">{jit.signingUnsupported ? t("当前签名不支持 JIT") : jit.note}</span>
       </span>
       {#if !status.ready && status.debuggable}
-        {#if status.liveContainer}
-          <button class="secondary" disabled={jit.busy} onclick={() => jit.stikDebug()}>{t("用 StikDebug 启用")}</button>
-        {:else}
+        {#if !status.liveContainer}
           <button class="secondary" disabled={jit.busy || !status.pairingFile} onclick={() => jit.enable()}>{t("启用 JIT")}</button>
         {/if}
       {/if}
@@ -29,7 +27,7 @@
     {:else if !status.ready}
       <p class="advice">{t("强烈建议启用 JIT。未启用时游戏以解释模式运行，速度会慢很多。")}</p>
       {#if status.liveContainer}
-        <p class="advice">{t("在 LiveContainer 中请先打开“使用 LiveContainer 的 Bundle ID”")}</p>
+        <p class="advice">{t("在 LiveContainer 中长按 Hitode → 设置，打开“带JIT启动”和“使用 LiveContainer 的包名”，确认 LocalDevVPN 已连接，再从 LiveContainer 启动 Hitode")}</p>
       {:else}
         <ol class="steps">
           <li class:done={status.pairingFile}>

@@ -27,9 +27,7 @@
     {/if}
     <div class="actions">
       {#if !jit.signingUnsupported && !jit.busy}
-        {#if status.liveContainer}
-          <button class="act" onclick={() => jit.stikDebug()}>{t("用 StikDebug 启用")}</button>
-        {:else if status.pairingFile}
+        {#if status.pairingFile && !status.liveContainer}
           <button class="act" onclick={() => jit.enable()}>{status.error ? t("重试") : t("启用")}</button>
         {:else}
           <button class="act" onclick={() => nav.go({ name: "settings" })}>{t("设置方法")}</button>
