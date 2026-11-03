@@ -45,6 +45,8 @@ targets:
       path: adv-launcher_iOS/Info.plist
       properties:
         LSRequiresIPhoneOS: true
+        # iOS 27 advertises the RemotePairing port, which changes at each boot.
+        NSBonjourServices: [_remotepairing._tcp]
         NSLocalNetworkUsageDescription: Connect to this device through LocalDevVPN to enable JIT.
         UILaunchStoryboardName: LaunchScreen
         UIRequiredDeviceCapabilities: [arm64, metal]

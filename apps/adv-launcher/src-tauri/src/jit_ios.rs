@@ -399,11 +399,16 @@ fn listen(listener: TcpListener, token: &str, task: Task, pairing: Vec<u8>) -> R
     if line.trim_end() != token {
         return Err("JIT extension authentication failed".into());
     }
-    let request = serde_json::json!({
+    let mut request = serde_json::json!({
         "mode": task.name(),
         "pid": std::process::id(),
         "pairing": pairing,
     });
+    if task == Task::Enable {
+        let (port, source) = crate::remote_pairing::port(Duration::from_secs(3));
+        log::info!("JIT helper: RemotePairing port {port} ({source})");
+        request["remotePairingPort"] = port.into();
+    }
     writeln!(reader.get_mut(), "{request}").map_err(|e| e.to_string())?;
     reader
         .get_ref()

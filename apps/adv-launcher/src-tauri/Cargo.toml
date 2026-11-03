@@ -53,6 +53,7 @@ log.workspace = true
 # Video needs the static iOS FFmpeg from `tools/macos/build.py --ios`; build.rs
 # bundles it into the staticlib that Xcode links.
 adv-shell = { path = "../../../crates/adv-shell", features = ["media"] }
+libc = "0.2"
 log.workspace = true
 plist = "1.8"
 objc2 = "0.6.4"
