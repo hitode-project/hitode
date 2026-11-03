@@ -33,6 +33,10 @@ export interface Prefs {
   touchControls: boolean;
   /** iOS: ask for JIT whenever the launcher opens, once a pairing file is imported. */
   autoJit: boolean;
+  /** iOS: the LiveContainer folder-import guidance has been shown. */
+  liveContainerImportHintSeen: boolean;
+  /** iOS: permanently dismiss library and game-launch JIT warnings. */
+  hideJitWarnings: boolean;
 }
 
 const KEY = "adv-launcher.prefs";
@@ -54,6 +58,8 @@ const defaults: Prefs = {
   touchMode: "direct",
   touchControls: true,
   autoJit: true,
+  liveContainerImportHintSeen: false,
+  hideJitWarnings: false,
 };
 
 function load(): Prefs {

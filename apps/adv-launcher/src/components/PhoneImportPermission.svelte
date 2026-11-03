@@ -3,6 +3,8 @@
   import Icon from "./Icon.svelte";
   import { COPY_SIZE } from "../lib/fake-import";
   import { inTauri } from "../lib/bridge";
+  import { jit } from "../lib/jit.svelte";
+  import { prefs, savePrefs } from "../lib/prefs.svelte";
   import { prepareFolder, requestStoragePermission, storageSize } from "../lib/storage";
   import { nav } from "../lib/nav.svelte";
 
@@ -26,6 +28,15 @@
   let copySize = $state(inTauri ? "…" : COPY_SIZE);
   let operation: AbortController | undefined;
   let sheet = $state<HTMLElement>();
+  let showLiveContainerHint = $state(false);
+
+  $effect(() => {
+    if (ios && jit.status?.liveContainer && !prefs.liveContainerImportHintSeen) {
+      showLiveContainerHint = true;
+      prefs.liveContainerImportHintSeen = true;
+      savePrefs();
+    }
+  });
 
   let timer: ReturnType<typeof setTimeout> | undefined;
   $effect(() => () => { clearTimeout(timer); operation?.abort(); });
@@ -160,6 +171,9 @@
         </div>
         <h2 id="perm-t" class="ttl">{t("选择游戏文件夹")}</h2>
         <p class="line">{error || t("在“文件”里选中整个游戏文件夹。")}</p>
+        {#if showLiveContainerHint}
+          <p class="line">{t("请先返回 LiveContainer，长按 Hitode → 设置，打开“使用 LiveContainer 的 Bundle ID”，再重新启动 Hitode，否则可能在“文件”里点“打开”后没有反应。")}</p>
+        {/if}
         <div class="acts">
           <button class="primary" onclick={() => selectFolder(false)} disabled={busy}>{t("打开“文件”")}</button>
           <button class="quiet" onclick={oncancel}>{t("取消")}</button>

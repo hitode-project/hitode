@@ -5,6 +5,7 @@ import { pauseGame, startGame, stopGame, type GameFinished, type RunSummary } fr
 import { jit } from "./jit.svelte";
 import { library } from "./library.svelte";
 import { nav } from "./nav.svelte";
+import { prefs } from "./prefs.svelte";
 
 /**
  * The states of the launch screen; a game that fails to run comes back here as
@@ -207,7 +208,7 @@ export class LaunchFlow {
         await jit.settled();
         if (!this.#alive || this.view !== "jit-wait") return;
       }
-      if (jit.status && !jit.status.ready) {
+      if (jit.status && !jit.status.ready && !prefs.hideJitWarnings) {
         this.view = "jit";
         return;
       }
