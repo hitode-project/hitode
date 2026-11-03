@@ -289,10 +289,7 @@ impl Context {
     ) -> Result<Allocation> {
         let flags = match memory {
             Memory::Device => vk::MemoryPropertyFlags::DEVICE_LOCAL,
-            Memory::Upload => {
-                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT
-            }
-            Memory::Readback => {
+            Memory::Upload | Memory::Readback => {
                 vk::MemoryPropertyFlags::HOST_VISIBLE
                     | vk::MemoryPropertyFlags::HOST_COHERENT
                     | vk::MemoryPropertyFlags::HOST_CACHED
@@ -312,13 +309,6 @@ impl Context {
                 })
         };
         requirements.memory_type_bits &= mask(flags);
-        if memory == Memory::Upload {
-            let cached =
-                requirements.memory_type_bits & mask(flags | vk::MemoryPropertyFlags::HOST_CACHED);
-            if cached != 0 {
-                requirements.memory_type_bits = cached;
-            }
-        }
         if lazy {
             let lazy_types =
                 requirements.memory_type_bits & mask(vk::MemoryPropertyFlags::LAZILY_ALLOCATED);

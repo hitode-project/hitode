@@ -12,6 +12,7 @@ struct Entry {
 pub(crate) struct Slots {
     entries: [Entry; 3],
     next: usize,
+    last: Option<usize>,
     layout: (u32, u32, u32, PixelFormat, u32, bool),
     palette: Option<crate::frame::Palette>,
 }
@@ -40,9 +41,20 @@ impl Slots {
         Ok(Self {
             entries: entries.into_inner().ok().unwrap(),
             next: 0,
+            last: None,
             layout: Self::layout(s),
             palette: s.palette.clone(),
         })
+    }
+    pub fn previous(&self) -> Option<&[u8]> {
+        self.last.map(|i| {
+            // Only this execution thread writes slots. The last publication
+            // remains immutable until this method's borrow ends.
+            unsafe { self.entries[i].buffer.mapped().unwrap().as_ref() }
+        })
+    }
+    pub fn palette_matches(&self, surface: &Surface) -> bool {
+        self.palette == surface.palette
     }
     /// The only admission point for CPU writes to a slot. A held frame has no
     /// completion token yet; a submitted ingest retires with its queue token.
@@ -78,6 +90,8 @@ impl Slots {
             }
         }
         let i = self.acquire(stream);
+        // A guest read failure must not retain a partly overwritten baseline.
+        self.last = self.last.filter(|&last| last != i);
         let entry = &mut self.entries[i];
         let slot = Slot {
             buffer: entry.buffer.clone(),
@@ -100,6 +114,7 @@ impl Slots {
             }
         }
         entry.debt = Damage::default();
+        self.last = Some(i);
         let palette_changed = match (&self.palette, &s.palette) {
             (Some(a), Some(b)) => !Arc::ptr_eq(a, b),
             (None, None) => false,

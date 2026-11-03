@@ -48,7 +48,7 @@ This spec covers the neutral device services behind the API front ends: frames, 
 
 ### DEV-FRAME-12 Unchanged software redraws
 
-**Rule**: Mailbox redraws matching the last publication MUST NOT publish, copy snapshot storage, or wake presentation. This comparison MUST include damage smaller than a content-diff tile.
+**Rule**: Software redraws matching the last publication MUST NOT publish, copy snapshot storage, or wake presentation. This comparison MUST include damage smaller than a content-diff tile.
 **Verification**: Test
 
 ### DEV-FRAME-11 Deleted frame sources
@@ -58,7 +58,7 @@ This spec covers the neutral device services behind the API front ends: frames, 
 
 ### DEV-FRAME-10 Content-diff publication damage
 
-**Rule**: A mailbox software frame MUST shrink declared damage to 64x16 tiles whose pixels differ from the previous publication. A rectangle with more than three quarters changed MUST keep its declared bounds. The frame cap MUST measure declared damage.
+**Rule**: A software frame MUST shrink declared damage to 64x16 tiles whose pixels differ from the previous publication. A rectangle with more than three quarters changed MUST keep its declared bounds. The frame cap MUST measure declared damage.
 **Verification**: Test
 
 Comparing against the last publication keeps every slot's damage history complete, so incremental slots and consumers stay exact. Packed formats keep their declared damage.

@@ -673,16 +673,13 @@ fn publication_pitch(pitch: u32, format: PixelFormat) -> u32 {
 }
 
 /// Content-diff tiles (DEV-FRAME-10).
-#[cfg(not(feature = "native-display"))]
 const TILE_W: u32 = 64;
-#[cfg(not(feature = "native-display"))]
 const TILE_H: u32 = 16;
 
 /// Shrinks declared damage to the tiles whose pixels differ from `previous`,
 /// the complete last publication in the same layout. Downstream copies,
 /// uploads, composition and upscaling then follow what actually changed.
 /// A rectangle that mostly changed keeps its declared bounds.
-#[cfg(not(feature = "native-display"))]
 fn refine_damage(
     surface: &Surface,
     memory: &dyn SurfaceMemory,
@@ -1386,6 +1383,8 @@ pub struct Surfaces<P: Presenter> {
     gpu: crate::gpu::Gpu,
     #[cfg(feature = "native-display")]
     software_slots: BTreeMap<u32, slots::Slots>,
+    #[cfg(feature = "native-display")]
+    software_video: Option<Arc<[(u64, VideoLayer)]>>,
     pub stats: GraphicsStats,
     /// Display size: the primary surface's size.
     pub width: u32,
@@ -1459,6 +1458,8 @@ impl<P: Presenter> Surfaces<P> {
             gpu: crate::gpu::Gpu::execution(false).map_err(|e| e.to_string())?,
             #[cfg(feature = "native-display")]
             software_slots: BTreeMap::new(),
+            #[cfg(feature = "native-display")]
+            software_video: None,
             stats: GraphicsStats::default(),
             width,
             height,
@@ -2231,14 +2232,38 @@ impl<P: Presenter> Surfaces<P> {
         damage: Damage,
     ) -> Result<(), String> {
         let s = &self.surfaces[&id];
-        let reset = self
+        let layout_changed = self
             .software_slots
             .get(&id)
             .is_none_or(|slots| !slots.matches(s));
-        if reset {
+        if layout_changed {
             self.software_slots.insert(id, self.gpu.software_slots(s)?);
         }
-        let whole = reset || self.software_source != Some(id);
+        let slots = &self.software_slots[&id];
+        let previous = slots.previous();
+        let whole = layout_changed
+            || previous.is_none()
+            || self.software_source != Some(id)
+            || !slots.palette_matches(s)
+            || self
+                .software_video
+                .as_ref()
+                .is_none_or(|video| !Arc::ptr_eq(video, &self.video_layers));
+        let damage = if whole {
+            Damage::from_rect(s.rect())
+        } else {
+            refine_damage(
+                s,
+                m,
+                previous.expect("published software slot"),
+                s.pitch,
+                &damage,
+            )?
+        };
+        if damage.is_empty() {
+            self.stats.empty_damage += 1;
+            return Ok(());
+        }
         let serial = self.stats.presentations + 1;
         self.stats.copied_bytes += self.gpu.publish_software(
             self.software_slots.get_mut(&id).unwrap(),
@@ -2248,6 +2273,7 @@ impl<P: Presenter> Surfaces<P> {
             whole,
             serial,
         )?;
+        self.software_video = Some(self.video_layers.clone());
         self.software_source = Some(id);
         self.stats.presentations = serial;
         self.stats.published_frames += 1;

@@ -129,8 +129,8 @@ pub enum Memory {
     /// GPU-only.
     Device,
     /// Mapped for CPU writes and read by the GPU in place: software surface
-    /// slots, dynamic guest buffers. Cached where the platform keeps it
-    /// coherent; write-combined otherwise.
+    /// slots, dynamic guest buffers. Host-cached and coherent on Vulkan,
+    /// shared on Metal, so software damage comparison reads the same memory.
     Upload,
     /// Mapped for CPU reads after GPU writes: readbacks.
     Readback,

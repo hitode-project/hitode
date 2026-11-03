@@ -79,9 +79,24 @@ impl Gpu {
     /// Open the device and start its owner thread. `fallback` selects a
     /// software adapter (lavapipe) for tests and diagnostics.
     pub async fn request(fallback: bool) -> Result<Self, Error> {
-        Self::execution(fallback)
+        Self::request_with_presenter(fallback, Box::new(owner::Headless)).await
+    }
+    /// Start the execution thread's owner with its lifetime presenter. The
+    /// first facade selects it; later requests share that execution and retain
+    /// its original presenter. Call before surface stores to select a compositor.
+    pub async fn request_with_presenter(
+        fallback: bool,
+        presenter: Box<dyn crate::frame::Presenter>,
+    ) -> Result<Self, Error> {
+        Self::execution_with_presenter(fallback, presenter)
     }
     pub(crate) fn execution(fallback: bool) -> Result<Self, Error> {
+        Self::execution_with_presenter(fallback, Box::new(owner::Headless))
+    }
+    fn execution_with_presenter(
+        fallback: bool,
+        presenter: Box<dyn crate::frame::Presenter>,
+    ) -> Result<Self, Error> {
         let execution = EXECUTION.with(|cached| {
             if let Some(execution) = cached.borrow().upgrade() {
                 return Ok(execution);
@@ -101,7 +116,7 @@ impl Gpu {
                     producer,
                 ))),
                 video: Arc::from([]),
-                owner: owner::Owner::start(queue, commands, Box::new(owner::Headless))?,
+                owner: owner::Owner::start(queue, commands, presenter)?,
             });
             *cached.borrow_mut() = std::rc::Rc::downgrade(&execution);
             Ok(execution)
@@ -196,5 +211,58 @@ mod tests {
         let second = Gpu::execution(!cfg!(target_vendor = "apple")).unwrap();
         assert!(std::rc::Rc::ptr_eq(&first.stream.0, &second.stream.0));
         assert!(std::rc::Rc::ptr_eq(&first.execution, &second.execution));
+    }
+    #[test]
+    fn the_execution_presenter_is_fixed_until_its_last_facade_drops() {
+        struct Capture(std::sync::mpsc::Sender<u64>);
+        impl crate::frame::Presenter for Capture {
+            fn presentable(&self, _: u32, _: u32) -> bool {
+                false
+            }
+            fn present(&mut self, _: &mut adv_gpu::Queue, frame: crate::frame::Frame) {
+                self.0.send(frame.serial).unwrap();
+            }
+            fn drain(&mut self) {}
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut gpu = pollster::block_on(Gpu::request_with_presenter(
+            !cfg!(target_vendor = "apple"),
+            Box::new(Capture(tx)),
+        ))
+        .unwrap();
+        let (other_tx, other_rx) = std::sync::mpsc::channel();
+        let shared = pollster::block_on(Gpu::request_with_presenter(
+            false,
+            Box::new(Capture(other_tx)),
+        ))
+        .unwrap();
+        let headless = pollster::block_on(Gpu::request(false)).unwrap();
+        assert!(std::rc::Rc::ptr_eq(&gpu.execution, &shared.execution));
+        assert!(std::rc::Rc::ptr_eq(&gpu.execution, &headless.execution));
+        assert!(matches!(
+            other_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Disconnected)
+        ));
+        let slot =
+            crate::frame::Slot::new(&gpu.device, 1, 1, 4, crate::surface::PixelFormat::Bgra32)
+                .unwrap();
+        gpu.stream.push(stream::Command::Present {
+            base: crate::frame::Base::Software {
+                slot,
+                format: crate::surface::PixelFormat::Bgra32,
+                palette: None,
+                damage: crate::frame::Damage::Whole,
+            },
+            video: Arc::from([]),
+            serial: 7,
+        });
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(20)).unwrap(),
+            7
+        );
+        drop(shared);
+        drop(headless);
+        drop(gpu);
+        let _next = pollster::block_on(Gpu::request(!cfg!(target_vendor = "apple"))).unwrap();
     }
 }
