@@ -6,15 +6,31 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 mod composite;
+mod convert;
+use convert::{BLACK_PALETTE, decode_pixel};
 mod sprite;
 pub use sprite::{Sprite, SpriteAlpha, SpriteMode};
 mod packed;
+#[cfg(feature = "native-display")]
+pub(crate) mod slots;
 pub use composite::{Composite, CompositeError, GradientVertex};
-#[cfg(all(feature = "gpu", target_vendor = "apple"))]
+#[cfg(all(
+    feature = "gpu",
+    target_vendor = "apple",
+    not(feature = "native-display")
+))]
 mod pixels;
-#[cfg(all(feature = "gpu", target_vendor = "apple"))]
+#[cfg(all(
+    feature = "gpu",
+    target_vendor = "apple",
+    not(feature = "native-display")
+))]
 use pixels::Pixels;
-#[cfg(not(all(feature = "gpu", target_vendor = "apple")))]
+#[cfg(not(all(
+    feature = "gpu",
+    target_vendor = "apple",
+    not(feature = "native-display")
+)))]
 type Pixels = Vec<u8>;
 
 /// Memory needed by software surfaces. PAL guests with shared storage borrow pixels;
@@ -162,6 +178,7 @@ pub struct PendingFrame {
     published_at: Option<std::time::Instant>,
     pub(crate) pixels: Arc<Pixels>,
     damage: Damage,
+    #[cfg(not(feature = "native-display"))]
     bottom_up: bool,
     history: DamageHistory,
     video: Arc<[(u64, VideoLayer)]>,
@@ -180,6 +197,7 @@ impl Default for PendingFrame {
             published_at: None,
             pixels: Arc::new(Pixels::new()),
             damage: Damage::default(),
+            #[cfg(not(feature = "native-display"))]
             bottom_up: false,
             history: DamageHistory::default(),
             video: Arc::from([]),
@@ -189,6 +207,7 @@ impl Default for PendingFrame {
     }
 }
 impl PendingFrame {
+    #[cfg(not(feature = "native-display"))]
     fn store(
         &mut self,
         surface: &Surface,
@@ -312,30 +331,15 @@ impl PendingFrame {
         Ok(())
     }
     fn convert(&self, out: &mut Snapshot, damage: &[Rect]) {
-        for r in damage {
-            for y in r.y..r.y + r.h {
-                let src = &self.pixels[y as usize * self.pitch as usize..];
-                let start = (y as usize * self.width as usize + r.x as usize) * 4;
-                let dst = &mut out.bgra[start..start + r.w as usize * 4];
-                if self.format == PixelFormat::Bgra32 {
-                    dst.copy_from_slice(&src[r.x as usize * 4..(r.x + r.w) as usize * 4]);
-                } else {
-                    for (i, pixel) in dst.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-                        let x = r.x + i as u32;
-                        let raw = if self.format.packed() {
-                            &[self.format.index(src, x)][..]
-                        } else {
-                            &src[self.format.byte_offset(x) as usize..]
-                        };
-                        pixel.copy_from_slice(&decode_pixel(
-                            self.format,
-                            self.palette.as_deref(),
-                            raw,
-                        ));
-                    }
-                }
-            }
-        }
+        convert::convert(
+            self.format,
+            self.palette.as_deref(),
+            self.width,
+            self.pitch,
+            &self.pixels,
+            out,
+            damage,
+        );
     }
     pub fn damage(&self) -> &[Rect] {
         &self.damage
@@ -556,6 +560,7 @@ impl FrameDamage {
         self.publication
     }
     #[cfg(any(feature = "gpu", test))]
+    #[cfg(any(not(feature = "native-display"), test))]
     fn push(&mut self, surface: u32, damage: Option<Rect>) {
         self.publication += 1;
         self.recent[(self.publication % 8) as usize] = (self.publication, surface, damage);
@@ -637,6 +642,7 @@ impl DamageHistory {
         self.first = 0;
         self.len = 0;
     }
+    #[cfg(not(feature = "native-display"))]
     fn push(&mut self, entry: (u64, Damage)) {
         self.entries[(self.first + self.len) % 16] = entry;
         if self.len < 16 {
@@ -654,7 +660,12 @@ fn verify_software() -> bool {
     *VERIFY.get_or_init(|| std::env::var_os("ADV_VERIFY_SOFTWARE_FRAMES").is_some())
 }
 fn publication_pitch(pitch: u32, format: PixelFormat) -> u32 {
-    if cfg!(all(feature = "gpu", target_vendor = "apple")) && format == PixelFormat::Bgra32 {
+    if cfg!(all(
+        feature = "gpu",
+        target_vendor = "apple",
+        not(feature = "native-display")
+    )) && format == PixelFormat::Bgra32
+    {
         // A buffer-backed Metal texture requires aligned rows in its snapshot.
         return pitch.next_multiple_of(256);
     }
@@ -662,13 +673,16 @@ fn publication_pitch(pitch: u32, format: PixelFormat) -> u32 {
 }
 
 /// Content-diff tiles (DEV-FRAME-10).
+#[cfg(not(feature = "native-display"))]
 const TILE_W: u32 = 64;
+#[cfg(not(feature = "native-display"))]
 const TILE_H: u32 = 16;
 
 /// Shrinks declared damage to the tiles whose pixels differ from `previous`,
 /// the complete last publication in the same layout. Downstream copies,
 /// uploads, composition and upscaling then follow what actually changed.
 /// A rectangle that mostly changed keeps its declared bounds.
+#[cfg(not(feature = "native-display"))]
 fn refine_damage(
     surface: &Surface,
     memory: &dyn SurfaceMemory,
@@ -836,16 +850,6 @@ impl PixelFormat {
         };
         let [lo, hi] = value.to_le_bytes();
         [lo, hi, 0, 0]
-    }
-}
-
-const BLACK_PALETTE: [[u8; 4]; 256] = [[0; 4]; 256];
-
-fn decode_pixel(format: PixelFormat, palette: Option<&[[u8; 4]; 256]>, raw: &[u8]) -> [u8; 4] {
-    if format.indexed() {
-        palette.unwrap_or(&BLACK_PALETTE)[raw[0] as usize]
-    } else {
-        format.decode(raw)
     }
 }
 
@@ -1378,6 +1382,10 @@ impl Arena {
 
 pub struct Surfaces<P: Presenter> {
     pub presenter: P,
+    #[cfg(feature = "native-display")]
+    gpu: crate::gpu::Gpu,
+    #[cfg(feature = "native-display")]
+    software_slots: BTreeMap<u32, slots::Slots>,
     pub stats: GraphicsStats,
     /// Display size: the primary surface's size.
     pub width: u32,
@@ -1447,6 +1455,10 @@ impl<P: Presenter> Surfaces<P> {
         size(width, height)?;
         Ok(Self {
             presenter,
+            #[cfg(feature = "native-display")]
+            gpu: crate::gpu::Gpu::execution(false).map_err(|e| e.to_string())?,
+            #[cfg(feature = "native-display")]
+            software_slots: BTreeMap::new(),
             stats: GraphicsStats::default(),
             width,
             height,
@@ -1583,6 +1595,8 @@ impl<P: Presenter> Surfaces<P> {
         let Some(s) = self.surfaces.remove(&id) else {
             return false;
         };
+        #[cfg(feature = "native-display")]
+        self.software_slots.remove(&id);
         // A pending frame cannot outlive the pixels it would publish.
         if self
             .software_pending
@@ -2110,6 +2124,7 @@ impl<P: Presenter> Surfaces<P> {
         self.stats.software_flushes[reason as usize] += 1;
         Ok(self.stats.published_frames != before)
     }
+    #[cfg(not(feature = "native-display"))]
     fn publish_software(
         &mut self,
         id: u32,
@@ -2205,6 +2220,45 @@ impl<P: Presenter> Surfaces<P> {
         if !self.deferred_presentation {
             self.capture_complete()?;
         }
+        Ok(())
+    }
+
+    #[cfg(feature = "native-display")]
+    fn publish_software(
+        &mut self,
+        id: u32,
+        m: &dyn SurfaceMemory,
+        damage: Damage,
+    ) -> Result<(), String> {
+        let s = &self.surfaces[&id];
+        let reset = self
+            .software_slots
+            .get(&id)
+            .is_none_or(|slots| !slots.matches(s));
+        if reset {
+            self.software_slots.insert(id, self.gpu.software_slots(s)?);
+        }
+        let whole = reset || self.software_source != Some(id);
+        let serial = self.stats.presentations + 1;
+        self.stats.copied_bytes += self.gpu.publish_software(
+            self.software_slots.get_mut(&id).unwrap(),
+            s,
+            m,
+            damage,
+            whole,
+            serial,
+        )?;
+        self.software_source = Some(id);
+        self.stats.presentations = serial;
+        self.stats.published_frames += 1;
+        self.stats.damaged_pixels += damage
+            .iter()
+            .map(|r| u64::from(r.w) * u64::from(r.h))
+            .sum::<u64>();
+        self.stats.frame_pixels += u64::from(s.width) * u64::from(s.height);
+        self.stats
+            .software_started
+            .get_or_insert_with(std::time::Instant::now);
         Ok(())
     }
 
@@ -2333,6 +2387,7 @@ impl<P: Presenter> Surfaces<P> {
             .presentations
             .checked_add(1)
             .ok_or("presentation serial exhausted")?;
+        self.software_source = None;
         gpu.present(&target.image, damage, serial)
             .map_err(|error| error.to_string())?;
         self.stats.presentations = serial;

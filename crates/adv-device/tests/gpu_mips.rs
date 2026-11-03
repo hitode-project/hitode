@@ -1,5 +1,5 @@
 //! Mip views share one physical image; every transfer uses its selected level.
-#![cfg(feature = "gpu")]
+#![cfg(all(feature = "gpu", not(feature = "native-display")))]
 use adv_device::{gpu::*, surface::Rect};
 use std::time::Duration;
 

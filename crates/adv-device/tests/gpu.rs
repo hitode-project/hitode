@@ -1,4 +1,5 @@
 //! Actual host-adapter rendering. Readback is explicit validation, never Present.
+#![cfg(not(feature = "native-display"))]
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 

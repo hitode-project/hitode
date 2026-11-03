@@ -24,6 +24,9 @@ pub struct Frame {
     pub published_at: Instant,
 }
 
+pub use crate::surface::PixelFormat;
+pub type Palette = Arc<[[u8; 4]; 256]>;
+
 pub enum Base {
     /// A D3D9 or DirectDraw swap buffer; its last write completes at `ready`.
     Gpu {
@@ -31,6 +34,79 @@ pub enum Base {
         damage: Damage,
         ready: Token,
     },
+    /// Guest-format pixels in GPU-visible memory, normalized to top-down rows.
+    Software {
+        slot: Slot,
+        format: PixelFormat,
+        palette: Option<Palette>,
+        damage: Damage,
+    },
+}
+
+/// One software publication. The owner reports its last read with [`Slot::ingested`].
+/// Dropping an unencoded publication returns it immediately.
+pub struct Slot {
+    pub(crate) buffer: adv_gpu::Buffer,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) pitch: u32,
+    pub(crate) state: Arc<std::sync::atomic::AtomicU64>,
+}
+impl Slot {
+    /// Allocate one guest-format upload slot. Rows may have guest padding.
+    pub fn new(
+        device: &adv_gpu::Device,
+        width: u32,
+        height: u32,
+        pitch: u32,
+        format: PixelFormat,
+    ) -> adv_gpu::Result<Self> {
+        crate::surface::size(width, height).map_err(adv_gpu::Error::Invalid)?;
+        let bytes = pitch
+            .checked_mul(height)
+            .filter(|_| pitch >= format.row_bytes(width))
+            .ok_or_else(|| adv_gpu::Error::Invalid("software slot pitch".into()))?;
+        let buffer = device.create_buffer(&adv_gpu::resource::BufferDesc {
+            // Byte extraction uses u32 loads, including the final pixel.
+            size: u64::from(bytes).next_multiple_of(4),
+            usage: adv_gpu::resource::BufferUsage::STORAGE,
+            memory: adv_gpu::resource::Memory::Upload,
+            label: "software slot",
+        })?;
+        Ok(Self {
+            buffer,
+            width,
+            height,
+            pitch,
+            state: Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
+        })
+    }
+
+    pub fn buffer(&self) -> &adv_gpu::Buffer {
+        &self.buffer
+    }
+    pub fn extent(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+    pub fn pitch(&self) -> u32 {
+        self.pitch
+    }
+    /// Call after submitting every stage that reads this slot, on its owner queue.
+    pub fn ingested(self, ready: Token) {
+        debug_assert_ne!(ready.0, 0);
+        self.state
+            .store(ready.0, std::sync::atomic::Ordering::Release);
+    }
+}
+impl Drop for Slot {
+    fn drop(&mut self) {
+        let _ = self.state.compare_exchange(
+            u64::MAX,
+            0,
+            std::sync::atomic::Ordering::Release,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
 }
 
 pub enum SwapImage {

@@ -23,7 +23,7 @@ This spec covers the neutral device services behind the API front ends: frames, 
 
 ### DEV-FRAME-4 Incremental complete slots
 
-**Rule**: Each mailbox slot MUST retain its last stored serial and complete normalized pixels. The store MUST retain at most sixteen frame-serial/damage entries and copy their union since that slot's serial. Missing history or changed source/layout MUST rebuild the full frame.
+**Rule**: Each mailbox slot MUST retain its last stored serial and complete normalized pixels. The store MUST retain at most sixteen frame-serial/damage entries, copy their union since each slot's serial, and rebuild fully after missing history or source/layout changes. Native software slots MUST accumulate their own damage debt and wait for completed ingest before reuse.
 **Verification**: Test
 
 ### DEV-FRAME-5 Consumer damage accumulation
@@ -48,7 +48,7 @@ This spec covers the neutral device services behind the API front ends: frames, 
 
 ### DEV-FRAME-12 Unchanged software redraws
 
-**Rule**: Software redraws matching the last publication MUST NOT publish, copy snapshot storage, or wake presentation. This comparison MUST include damage smaller than a content-diff tile.
+**Rule**: Mailbox redraws matching the last publication MUST NOT publish, copy snapshot storage, or wake presentation. This comparison MUST include damage smaller than a content-diff tile.
 **Verification**: Test
 
 ### DEV-FRAME-11 Deleted frame sources
@@ -58,7 +58,7 @@ This spec covers the neutral device services behind the API front ends: frames, 
 
 ### DEV-FRAME-10 Content-diff publication damage
 
-**Rule**: A published software frame MUST shrink declared damage to 64x16 tiles whose pixels differ from the previous publication. A rectangle with more than three quarters changed MUST keep its declared bounds. The frame cap MUST measure declared damage.
+**Rule**: A mailbox software frame MUST shrink declared damage to 64x16 tiles whose pixels differ from the previous publication. A rectangle with more than three quarters changed MUST keep its declared bounds. The frame cap MUST measure declared damage.
 **Verification**: Test
 
 Comparing against the last publication keeps every slot's damage history complete, so incremental slots and consumers stay exact. Packed formats keep their declared damage.

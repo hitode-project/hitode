@@ -30,12 +30,7 @@ impl PixelFormat {
         (u64::from(x) * u64::from(self.bits()) / 8) as u32
     }
     pub(super) fn index(self, row: &[u8], x: u32) -> u8 {
-        let value = row[self.byte_offset(x) as usize];
-        match self {
-            Self::Indexed1 => (value >> (7 - x % 8)) & 1,
-            Self::Indexed4 => (value >> (4 - (x % 2) * 4)) & 15,
-            _ => value,
-        }
+        super::convert::index(self, row, x)
     }
     fn put_index(self, row: &mut [u8], x: u32, value: u8) {
         let bits = self.bits();

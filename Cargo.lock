@@ -76,6 +76,7 @@ dependencies = [
 name = "adv-device"
 version = "0.2.3"
 dependencies = [
+ "adv-display",
  "adv-gpu",
  "adv-sync",
  "arrayvec",
@@ -114,10 +115,12 @@ dependencies = [
 name = "adv-display"
 version = "0.2.3"
 dependencies = [
+ "adv-device",
  "adv-gpu",
  "arrayvec",
  "dispatch2",
  "libc",
+ "naga",
  "ndk-sys",
  "objc2",
  "objc2-core-foundation",

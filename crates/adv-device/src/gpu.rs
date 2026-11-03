@@ -13,10 +13,11 @@ mod index_bytes;
 mod line;
 pub use index_bytes::IndexBytes;
 #[cfg(feature = "native-display")]
-mod native;
+pub(crate) mod native;
 mod programmable;
 #[cfg(not(feature = "native-display"))]
 mod renderer;
+#[cfg(not(feature = "native-display"))]
 mod submission;
 mod vertex_bytes;
 #[cfg(not(feature = "native-display"))]
@@ -56,6 +57,7 @@ pub(super) fn program_module(source: &str) -> Result<wgpu::naga::Module, Error> 
 
 #[cfg(not(feature = "native-display"))]
 pub use renderer::{Gpu, Image, ImageId, NativeContext, NativeFrame, Readback, Staged, Target};
+#[cfg(not(feature = "native-display"))]
 pub use submission::SubmissionPause;
 pub use vertex_bytes::VertexBytes;
 #[derive(Clone, Copy, Debug)]

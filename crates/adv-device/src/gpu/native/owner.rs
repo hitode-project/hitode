@@ -5,7 +5,7 @@
 use super::resources::Storage;
 use super::stream::{Binding, Bytes, Chunk, Command, Consumer, Draw, UploadSource};
 use super::{Depth, Image, Target, backing, pass};
-use crate::frame::{Base, Frame, Presenter, SwapImage, VideoPlane};
+use crate::frame::{Base, Frame, Presenter, SwapImage};
 use adv_gpu::encode::{Bind, BufferCopy, ColorAttachment, DepthAttachment, ImageCopy};
 use adv_gpu::resource::BufferSlice;
 use adv_gpu::{Encoder, Extent, Queue, Rect, RenderPassDesc, Span, Token};
@@ -95,7 +95,6 @@ struct State {
     completed: Token,
     uploads: VecDeque<(Token, super::Staged)>,
     pending_uploads: usize,
-    video: Arc<[VideoPlane]>,
     #[cfg(test)]
     passes: Vec<PassRecord>,
 }
@@ -144,7 +143,6 @@ impl State {
             completed: Token(0),
             uploads: VecDeque::new(),
             pending_uploads: 0,
-            video: Arc::from([]),
             #[cfg(test)]
             passes: Vec::new(),
         }
@@ -176,7 +174,7 @@ impl State {
         }
         if completed > self.completed {
             self.completed = completed;
-            consumer.retired();
+            consumer.retired(completed);
         }
         Ok(())
     }
@@ -283,7 +281,10 @@ impl State {
             let command = std::mem::replace(&mut self.chunks[chunk].commands[at], Command::Submit);
             if matches!(
                 command,
-                Command::Present { .. } | Command::Readback { .. } | Command::Submit
+                Command::Present { .. }
+                    | Command::PresentSwap { .. }
+                    | Command::Readback { .. }
+                    | Command::Submit
             ) {
                 debug_assert_eq!(at + 1, self.chunks[chunk].commands.len());
                 self.retain(chunk);
@@ -387,10 +388,11 @@ impl State {
             Command::Submit => {
                 self.submit(None)?;
             }
-            Command::Present {
+            Command::PresentSwap {
                 image,
                 damage,
                 serial,
+                video,
             } => {
                 let (raw, _, _) = self.image(&image)?;
                 let mut swap = match &image.storage {
@@ -414,18 +416,40 @@ impl State {
                             damage,
                             ready,
                         },
-                        video: self.video.clone(),
+                        video,
                         published_at: Instant::now(),
                     },
                 );
-                self.presenter.drain();
-                for depth in self.depths.drain(..) {
-                    depth.0.owner.lock().unwrap().end_frame();
+                self.end_frame();
+            }
+            Command::Present {
+                base,
+                video,
+                serial,
+            } => {
+                if self.encoder.is_some() {
+                    self.submit(None)?;
                 }
+                self.presenter.present(
+                    &mut self.queue,
+                    Frame {
+                        serial,
+                        base,
+                        video,
+                        published_at: Instant::now(),
+                    },
+                );
+                self.end_frame();
             }
             Command::Clear { .. } | Command::Draw(_) => unreachable!(),
         }
         Ok(())
+    }
+    fn end_frame(&mut self) {
+        self.presenter.drain();
+        for depth in self.depths.drain(..) {
+            depth.0.owner.lock().unwrap().end_frame();
+        }
     }
     fn submit(&mut self, image: Option<&mut adv_gpu::PresentImage>) -> adv_gpu::Result<Token> {
         let encoder = self
@@ -761,10 +785,11 @@ mod tests {
         }
     }
     fn present(image: &Image, damage: crate::frame::Damage, serial: u64) -> Command {
-        Command::Present {
+        Command::PresentSwap {
             image: image.clone(),
             damage,
             serial,
+            video: Arc::from([]),
         }
     }
 
@@ -846,7 +871,9 @@ mod tests {
         }
         fn frame_image(&self, n: usize) -> adv_gpu::Image {
             let frames = self.display.frames.lock().unwrap();
-            let Base::Gpu { image, .. } = &frames[n].base;
+            let Base::Gpu { image, .. } = &frames[n].base else {
+                panic!("GPU frame")
+            };
             match image {
                 SwapImage::Private(i) => i.clone(),
                 SwapImage::Presentable(i) => i.image().clone(),
@@ -1062,6 +1089,56 @@ struct Color {rgba:vec4<f32>}
         assert_eq!(h.state.passes.len(), 3);
         assert_eq!(h.state.passes[1].area, rect(0, 0, 1, 1));
         assert_eq!(h.state.passes[2].area, rect(0, 0, 4, 4));
+    }
+
+    // spec: GFX-REC-1
+    #[test]
+    fn software_and_d3d9_presents_keep_one_stream_order_and_video() {
+        let Some((device, queue)) = open() else {
+            return;
+        };
+        let mut h = Harness::new(device, queue);
+        let image = image(&h.device, 4, 4);
+        let video: Arc<[crate::frame::VideoPlane]> = Arc::from([crate::frame::VideoPlane {}]);
+        for serial in 1..=6 {
+            if serial % 2 == 0 {
+                h.producer.push(color(&image));
+                h.producer.push(clear(rect(0, 0, 4, 4), [1., 0., 0., 1.]));
+                let mut command = present(&image, crate::frame::Damage::Whole, serial);
+                let Command::PresentSwap { video: planes, .. } = &mut command else {
+                    unreachable!()
+                };
+                *planes = video.clone();
+                h.producer.push(command);
+            } else {
+                let slot = crate::frame::Slot::new(
+                    &h.device,
+                    4,
+                    4,
+                    16,
+                    crate::surface::PixelFormat::Bgra32,
+                )
+                .unwrap();
+                h.producer.push(Command::Present {
+                    base: Base::Software {
+                        slot,
+                        format: crate::surface::PixelFormat::Bgra32,
+                        palette: None,
+                        damage: crate::frame::Damage::Whole,
+                    },
+                    video: video.clone(),
+                    serial,
+                });
+            }
+        }
+        h.drain();
+        let frames = h.display.frames.lock().unwrap();
+        assert_eq!(frames.len(), 6);
+        for (i, frame) in frames.iter().enumerate() {
+            assert_eq!(frame.serial, i as u64 + 1);
+            assert_eq!(matches!(frame.base, Base::Software { .. }), i % 2 == 0);
+            assert!(Arc::ptr_eq(&frame.video, &video));
+        }
     }
 
     // spec: GFX-REC-1

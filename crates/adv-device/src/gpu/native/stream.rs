@@ -34,6 +34,13 @@ pub(crate) enum Binding {
     /// Vertex streams and other shader-read data in the ring.
     Storage(Bytes),
     /// A persistent buffer: static guest vertex or index data.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "persistent buffers are exercised by executor tests"
+        )
+    )]
     Buffer(Buffer, std::ops::Range<u64>),
     Sampled(Image),
     Sampler(Sampler),
@@ -110,9 +117,15 @@ pub(crate) enum Command {
     /// Submit everything encoded so far (the producer needs ring space).
     Submit,
     /// End of a guest frame: submit and hand `image` to presentation.
-    Present {
+    PresentSwap {
         image: Image,
         damage: crate::frame::Damage,
+        serial: u64,
+        video: Arc<[crate::frame::VideoPlane]>,
+    },
+    Present {
+        base: crate::frame::Base,
+        video: Arc<[crate::frame::VideoPlane]>,
         serial: u64,
     },
 }
@@ -144,6 +157,7 @@ struct Shared {
     /// Signaled by the owner thread when submissions complete, so a producer
     /// whose ring is full can reserve again.
     retired: Condvar,
+    completed: std::sync::atomic::AtomicU64,
 }
 
 pub(crate) fn channel(ring: Ring) -> (Producer, Consumer) {
@@ -174,7 +188,10 @@ impl Producer {
     pub fn push(&mut self, command: Command) {
         let boundary = matches!(
             command,
-            Command::Present { .. } | Command::Readback { .. } | Command::Submit
+            Command::Present { .. }
+                | Command::PresentSwap { .. }
+                | Command::Readback { .. }
+                | Command::Submit
         );
         let target = matches!(command, Command::Target { .. });
         if target && !self.chunk.commands.is_empty() && self.shared.state.lock().unwrap().idle {
@@ -228,16 +245,29 @@ impl Producer {
                 Err(adv_gpu::Error::Busy) => {
                     // The ring is in flight or held by recorded commands: have
                     // the owner submit everything, then wait for completions.
-                    self.push(Command::Submit);
-                    let state = self.shared.state.lock().unwrap();
-                    let wait = std::time::Duration::from_millis(1);
-                    drop(self.shared.retired.wait_timeout(state, wait).unwrap());
+                    self.wait();
                 }
                 Err(error) => panic!("upload ring: {error}"),
             }
         };
         self.chunk.spans.push(span);
         (self.chunk.spans.len() - 1) as u16
+    }
+
+    pub fn completed(&self) -> u64 {
+        self.shared
+            .completed
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+    pub fn wait(&mut self) {
+        self.push(Command::Submit);
+        let state = self.shared.state.lock().unwrap();
+        drop(
+            self.shared
+                .retired
+                .wait_timeout(state, std::time::Duration::from_millis(1))
+                .unwrap(),
+        );
     }
 
     fn hand_off(&mut self) {
@@ -302,7 +332,25 @@ impl Consumer {
     }
 
     /// Submissions completed: a producer waiting for ring space may retry.
-    pub fn retired(&self) {
+    pub fn retired(&self, completed: adv_gpu::Token) {
+        self.shared
+            .completed
+            .store(completed.0, std::sync::atomic::Ordering::Release);
         self.shared.retired.notify_all();
+    }
+}
+
+/// Shared only on the execution thread; borrowing does not take a lock.
+#[derive(Clone)]
+pub(crate) struct ExecutionStream(pub std::rc::Rc<std::cell::RefCell<Producer>>);
+impl ExecutionStream {
+    pub fn push(&mut self, command: Command) {
+        self.0.borrow_mut().push(command);
+    }
+    pub fn bytes(&mut self, len: u32, align: u32, write: impl FnOnce(&mut [u8])) -> Bytes {
+        self.0.borrow_mut().bytes(len, align, write)
+    }
+    pub fn draw(&mut self, draw: Draw, bindings: impl IntoIterator<Item = (u32, Binding)>) {
+        self.0.borrow_mut().draw(draw, bindings);
     }
 }

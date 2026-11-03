@@ -735,10 +735,11 @@ impl Gpu {
                 )?;
             }
         }
-        self.stream.push(Command::Present {
+        self.stream.push(Command::PresentSwap {
             image: image.clone(),
             damage,
             serial,
+            video: self.execution.video.clone(),
         });
         self.check()
     }

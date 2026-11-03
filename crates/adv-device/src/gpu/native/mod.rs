@@ -60,45 +60,91 @@ pub use resources::{Depth, Image, ImageId, Staged, Target};
 
 use super::{Error, Rect, Stats};
 
-/// One executor: a device, its execution-thread state and the channel to its
-/// owner thread.
+/// Execution-thread GPU state. Facades and software surface stores created on
+/// one thread share its device, producer and owner; the facade stays on that
+/// thread. The last facade closes the producer before joining the owner.
 pub struct Gpu {
     device: adv_gpu::Device,
-    stream: stream::Producer,
+    stream: stream::ExecutionStream,
     pipelines: pipelines::Pipelines,
     /// The damage rectangle the next operations are limited to.
     clip: Option<Rect>,
     stats: Stats,
-    owner: owner::Owner,
     recording: record::Recording,
     staging: resources::StagingPool,
+    execution: std::rc::Rc<Execution>,
 }
 
 impl Gpu {
     /// Open the device and start its owner thread. `fallback` selects a
     /// software adapter (lavapipe) for tests and diagnostics.
     pub async fn request(fallback: bool) -> Result<Self, Error> {
-        let (device, queue) = adv_gpu::Device::open(&adv_gpu::queue::DeviceOptions {
-            software: fallback,
-            validation: cfg!(test),
-            label: "native executor",
-            ..Default::default()
-        })
-        .map_err(record::gpu_error)?;
-        let (mut stream, commands) =
-            stream::channel(device.ring(64 << 20).map_err(record::gpu_error)?);
-        let recording = record::Recording::new(&device, &mut stream)?;
-        let owner = owner::Owner::start(queue, commands, Box::new(owner::Headless))?;
+        Self::execution(fallback)
+    }
+    pub(crate) fn execution(fallback: bool) -> Result<Self, Error> {
+        let execution = EXECUTION.with(|cached| {
+            if let Some(execution) = cached.borrow().upgrade() {
+                return Ok(execution);
+            }
+            let (device, queue) = adv_gpu::Device::open(&adv_gpu::queue::DeviceOptions {
+                software: fallback,
+                validation: cfg!(test),
+                label: "execution GPU",
+                ..Default::default()
+            })
+            .map_err(record::gpu_error)?;
+            let (producer, commands) =
+                stream::channel(device.ring(64 << 20).map_err(record::gpu_error)?);
+            let execution = std::rc::Rc::new(Execution {
+                device,
+                stream: stream::ExecutionStream(std::rc::Rc::new(std::cell::RefCell::new(
+                    producer,
+                ))),
+                video: Arc::from([]),
+                owner: owner::Owner::start(queue, commands, Box::new(owner::Headless))?,
+            });
+            *cached.borrow_mut() = std::rc::Rc::downgrade(&execution);
+            Ok(execution)
+        })?;
+        let device = execution.device.clone();
+        let stream = execution.stream.clone();
+        let recording = record::Recording::new(&device, &mut stream.0.borrow_mut())?;
         Ok(Self {
             device,
             stream,
             pipelines: Default::default(),
             clip: None,
             stats: Stats::default(),
-            owner,
             recording,
             staging: Default::default(),
+            execution,
         })
+    }
+    pub(crate) fn software_slots(
+        &self,
+        surface: &crate::surface::Surface,
+    ) -> Result<crate::surface::slots::Slots, String> {
+        crate::surface::slots::Slots::new(&self.device, surface)
+    }
+    pub(crate) fn publish_software(
+        &mut self,
+        slots: &mut crate::surface::slots::Slots,
+        surface: &crate::surface::Surface,
+        memory: &dyn crate::surface::SurfaceMemory,
+        damage: crate::surface::Damage,
+        whole: bool,
+        serial: u64,
+    ) -> Result<u64, String> {
+        self.check().map_err(|e| e.to_string())?;
+        slots.publish(
+            &mut self.stream.0.borrow_mut(),
+            surface,
+            memory,
+            damage,
+            whole,
+            serial,
+            self.execution.video.clone(),
+        )
     }
     pub fn set_clip(&mut self, clip: Option<Rect>) {
         self.clip = clip;
@@ -117,12 +163,38 @@ impl Gpu {
     }
     /// Device loss, as reported by the owner thread.
     pub fn check(&self) -> Result<(), Error> {
-        if let Some(failure) = self.owner.failure.get() {
+        if let Some(failure) = self.execution.owner.failure.get() {
             return Err(Error::Device(failure.clone()));
         }
         if let Some(failure) = self.device.lost() {
             return Err(Error::Device(failure));
         }
         Ok(())
+    }
+}
+
+use std::sync::Arc;
+struct Execution {
+    device: adv_gpu::Device,
+    // The producer must close before Owner joins its thread.
+    stream: stream::ExecutionStream,
+    video: Arc<[crate::frame::VideoPlane]>,
+    owner: owner::Owner,
+}
+thread_local! {
+    static EXECUTION: std::cell::RefCell<std::rc::Weak<Execution>> = const {
+        std::cell::RefCell::new(std::rc::Weak::new())
+    };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn every_gpu_on_the_execution_thread_uses_one_producer() {
+        let first = Gpu::execution(!cfg!(target_vendor = "apple")).unwrap();
+        let second = Gpu::execution(!cfg!(target_vendor = "apple")).unwrap();
+        assert!(std::rc::Rc::ptr_eq(&first.stream.0, &second.stream.0));
+        assert!(std::rc::Rc::ptr_eq(&first.execution, &second.execution));
     }
 }

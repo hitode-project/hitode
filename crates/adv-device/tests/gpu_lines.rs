@@ -1,4 +1,4 @@
-#![cfg(feature = "gpu")]
+#![cfg(all(feature = "gpu", not(feature = "native-display")))]
 //! Authored line pixels; no guest image, native window or game.
 use adv_device::gpu::*;
 use adv_device::surface::Rect;

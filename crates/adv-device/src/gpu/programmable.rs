@@ -43,6 +43,7 @@ impl AttributeFormat {
             Self::Float4 => 16,
         }
     }
+    #[cfg(not(feature = "native-display"))]
     pub(crate) fn native(self) -> wgpu::VertexFormat {
         use wgpu::VertexFormat as F;
         match self {

@@ -1,5 +1,5 @@
 //! Arbitrary border colors must work without backend clamp-to-border features.
-#![cfg(feature = "gpu")]
+#![cfg(all(feature = "gpu", not(feature = "native-display")))]
 use adv_device::{gpu::*, surface::Rect};
 use std::time::Duration;
 
