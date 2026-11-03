@@ -15,6 +15,13 @@ fn asf_fixture() -> Vec<u8> {
 }
 
 #[test]
+#[cfg_attr(
+    all(
+        feature = "native-display",
+        not(any(target_vendor = "apple", target_os = "android"))
+    ),
+    ignore = "decoded video needs presentable YUV pools, which exist only on Apple and Android"
+)]
 fn asf_samples_round_trip_through_the_decoders() {
     let demuxed = demux(asf_fixture()).unwrap();
     assert_eq!(demuxed.container, "asf");
