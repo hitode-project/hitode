@@ -397,8 +397,9 @@ impl Presenter {
         let publication = self.display.take_publication();
         if let Some(p) = publication {
             let record = self.display.recorder().get(p.presentation).unwrap();
-            let stats = statistics(record, self.display.origin());
-            self.reported = Some(stamp(record));
+            let totals = self.display.totals();
+            let stats = statistics(record, totals, self.display.origin());
+            self.reported = Some(stamp(record, totals));
             self.shared.send(Ok(Feedback::Presented(Presented {
                 serial: p.serial,
                 published_at: p.published_at,
@@ -434,20 +435,25 @@ impl Presenter {
         let Some(record) = self.display.recorder().latest() else {
             return;
         };
-        let stamp = stamp(record);
+        let totals = self.display.totals();
+        let stamp = stamp(record, totals);
         if self.reported != Some(stamp) {
             self.reported = Some(stamp);
             self.shared.send(Ok(Feedback::Statistics(statistics(
                 record,
+                totals,
                 self.display.origin(),
             ))));
         }
     }
 }
-fn stamp(record: &adv_display::recorder::PresentRecord) -> (u64, u64, bool, bool, bool) {
+fn stamp(
+    record: &adv_display::recorder::PresentRecord,
+    totals: &adv_display::recorder::Totals,
+) -> (u64, u64, bool, bool, bool) {
     (
-        record.statistics.presents,
-        record.statistics.configurations,
+        totals.presents,
+        totals.configurations,
         record.statistics.latched.is_some(),
         record.statistics.shown.is_some(),
         record.stage_times.iter().any(|d| !d.is_zero()),
@@ -455,18 +461,19 @@ fn stamp(record: &adv_display::recorder::PresentRecord) -> (u64, u64, bool, bool
 }
 fn statistics(
     r: &adv_display::recorder::PresentRecord,
+    t: &adv_display::recorder::Totals,
     origin: Instant,
 ) -> crate::performance::NativePresentation {
     let s = r.statistics;
     let mut stats = crate::performance::NativePresentation {
         consumed: r.frame.serial,
-        uploads: s.software_frames,
-        presented: s.presents,
-        direct_presentations: s.direct_presents,
-        gpu_transfer_bytes: s.software_bytes,
-        software_started: s.software_started.map(|at| origin + at),
-        configurations: s.configurations,
-        max_queue_ns: s.max_queue.as_nanos() as u64,
+        uploads: t.software_frames,
+        presented: t.presents,
+        direct_presentations: t.direct_presents,
+        gpu_transfer_bytes: t.software_bytes,
+        software_started: t.software_started.map(|at| origin + at),
+        configurations: t.configurations,
+        max_queue_ns: t.max_queue.as_nanos() as u64,
         display_plan: match s.kind {
             adv_display::recorder::PlanKind::Direct => "direct",
             adv_display::recorder::PlanKind::Merged => "merged",
@@ -476,7 +483,7 @@ fn statistics(
         display_submissions: s.submissions as u64,
         display_latch_ns: s.latched.map(|d| d.saturating_sub(r.at).as_nanos() as u64),
         display_shown_ns: s.shown.map(|d| d.saturating_sub(r.at).as_nanos() as u64),
-        max_job_ns: s.max_cpu.as_nanos() as u64,
+        max_job_ns: t.max_cpu.as_nanos() as u64,
         ..Default::default()
     };
     for (i, stage) in r.plan.stages.iter().enumerate() {
@@ -829,21 +836,21 @@ mod tests {
                     self.send.send("rate").unwrap();
                 }
             }
-            fn detach(self: Box<Self>) -> Vec<AcquiredImage> {
+            fn detach(&mut self) -> Option<adv_gpu::queue::Fence> {
                 self.send.send("detached").unwrap();
-                Box::new(self.inner).detach()
+                self.inner.detach()
             }
             fn present(
                 &mut self,
                 l: &plan::Layers,
                 d: &plan::Tiles,
-                i: Vec<AcquiredImage>,
+                i: &mut [AcquiredImage],
                 s: u64,
                 a: Instant,
-            ) -> Result<(), PresentError> {
+            ) -> Result<(), Error> {
                 self.inner.present(l, d, i, s, a)
             }
-            fn drain(&mut self, p: &mut Vec<Presented>, r: &mut Vec<ReleasedImage>) {
+            fn drain(&mut self, p: &mut Vec<Presented>, r: &mut Vec<Released>) {
                 self.inner.drain(p, r);
             }
         }

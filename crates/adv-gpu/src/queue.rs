@@ -183,7 +183,7 @@ impl Fence {
             inner: imp::Fence(fd),
         }
     }
-    pub(crate) fn duplicate(&self) -> Result<Self> {
+    pub fn duplicate(&self) -> Result<Self> {
         Ok(Self {
             inner: self.inner.duplicate()?,
         })

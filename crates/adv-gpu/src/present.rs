@@ -388,23 +388,12 @@ impl Drop for PresentImage {
     }
 }
 
-impl Encoder {
-    /// Return a sampled presentable image to the external domain after its last
-    /// read. This does not count a write or restart its age. Keep its lease until
-    /// the submission's token permits reuse.
-    pub fn release_presentable(&mut self, image: &Image) {
-        #[cfg(target_os = "android")]
-        self.inner.release(&image.inner);
-        #[cfg(not(target_os = "android"))]
-        let _ = image;
-    }
-}
-
 impl Queue {
     /// Submit `encoder` as the last write of `images`, which go to the system
     /// compositor: the backend ends the submission with each buffer's hand-off
     /// (a queue-family release on Vulkan) and signals their acquire fence in
-    /// the same batch. Each image's age restarts here.
+    /// the same batch. Each image's age restarts here. Every submission also
+    /// returns the presentable images it only sampled to the compositor.
     pub fn submit_present(
         &mut self,
         encoder: Encoder,

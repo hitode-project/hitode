@@ -1,5 +1,6 @@
-//! Ownership at the system compositor boundary. A successful present retains
-//! every image (including a direct base) until `drain` returns its release.
+//! The system compositor boundary. The executor owns every image; a
+//! compositor keeps only native references and reports, per present serial and
+//! layer, when it stopped reading an image.
 
 #[cfg(target_vendor = "apple")]
 mod apple;
@@ -50,45 +51,38 @@ pub struct AcquiredImage {
     pub acquire: Token,
 }
 
-pub struct ReleasedImage {
+/// The image `layer` showed since present `serial` is no longer read once
+/// `fence` signals.
+pub struct Released {
     pub serial: u64,
     pub layer: LayerId,
-    pub image: PresentImage,
     pub fence: Option<Fence>,
-}
-
-/// On error image ownership returns to the executor for retirement. An image
-/// whose write completed still contains that write even if attachment failed.
-pub struct PresentError {
-    pub error: Error,
-    pub images: Vec<AcquiredImage>,
 }
 
 pub type Wake = std::sync::Arc<dyn Fn() + Send + Sync>;
 pub trait Compositor: Send {
-    fn image(&self, _layer: LayerId) -> Option<&AcquiredImage> {
-        None
-    }
     fn set_waker(&mut self, _wake: Wake) {}
     fn set_scale(&mut self, _scale: f64) {}
     fn set_frame_rate(&mut self, _rate: u32) {}
-    /// Detach every layer, returning the current leases without a redraw.
-    fn detach(self: Box<Self>) -> Vec<AcquiredImage>;
+    /// Empty every layer and wait for that to take effect, before the
+    /// compositor drops. Every attached image is free once the returned fence
+    /// signals; no releases are reported for them.
+    fn detach(&mut self) -> Option<Fence>;
 
     fn caps(&self) -> CompositorCaps;
     /// Attach all layers atomically at or after `at`. Implementations order
-    /// acquire tokens before latching.
+    /// acquire tokens before latching. The caller keeps `images` until their
+    /// release; on error none of them was attached.
     fn present(
         &mut self,
         layers: &Layers,
         damage: &Tiles,
-        images: Vec<AcquiredImage>,
+        images: &mut [AcquiredImage],
         serial: u64,
         at: Instant,
-    ) -> Result<(), PresentError>;
-    /// Nonblocking, oldest first. The caller returns each released image to its
-    /// pool with `PresentImage::released`, forwarding the optional fence.
-    fn drain(&mut self, presented: &mut Vec<Presented>, released: &mut Vec<ReleasedImage>);
+    ) -> Result<(), Error>;
+    /// Nonblocking, oldest first.
+    fn drain(&mut self, presented: &mut Vec<Presented>, released: &mut Vec<Released>);
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -105,9 +99,10 @@ pub struct Presentation {
 pub struct HeadlessCompositor {
     caps: CompositorCaps,
     pub presentations: Vec<Presentation>,
-    held: Vec<(u64, AcquiredImage)>,
+    /// The serial and layer of each attached image.
+    showing: Vec<(u64, LayerId)>,
     presented: Vec<Presented>,
-    released: Vec<ReleasedImage>,
+    released: Vec<Released>,
 }
 
 impl HeadlessCompositor {
@@ -115,7 +110,7 @@ impl HeadlessCompositor {
         Self {
             caps,
             presentations: vec![],
-            held: vec![],
+            showing: vec![],
             presented: vec![],
             released: vec![],
         }
@@ -123,14 +118,9 @@ impl HeadlessCompositor {
 }
 
 impl Compositor for HeadlessCompositor {
-    fn image(&self, layer: LayerId) -> Option<&AcquiredImage> {
-        self.held
-            .iter()
-            .find(|(_, i)| i.layer == layer)
-            .map(|(_, i)| i)
-    }
-    fn detach(mut self: Box<Self>) -> Vec<AcquiredImage> {
-        self.held.drain(..).map(|(_, i)| i).collect()
+    fn detach(&mut self) -> Option<Fence> {
+        self.showing.clear();
+        None
     }
     fn caps(&self) -> CompositorCaps {
         self.caps.clone()
@@ -140,19 +130,18 @@ impl Compositor for HeadlessCompositor {
         &mut self,
         layers: &Layers,
         damage: &Tiles,
-        images: Vec<AcquiredImage>,
+        images: &mut [AcquiredImage],
         serial: u64,
         at: Instant,
-    ) -> Result<(), PresentError> {
-        let replaced = self.held.extract_if(.., |(_, old)| {
-            images.iter().any(|i| i.layer == old.layer)
-                || matches!(old.layer, LayerId::Video(id) if !layers.video.iter().any(|(v,_)| *v == id))
+    ) -> Result<(), Error> {
+        let replaced = self.showing.extract_if(.., |(_, layer)| {
+            images.iter().any(|i| i.layer == *layer)
+                || matches!(layer, LayerId::Video(id) if !layers.video.iter().any(|(v, _)| v == id))
         });
         self.released
-            .extend(replaced.map(|(serial, acquired)| ReleasedImage {
+            .extend(replaced.map(|(serial, layer)| Released {
                 serial,
-                layer: acquired.layer,
-                image: acquired.image,
+                layer,
                 fence: None,
             }));
         self.presentations.push(Presentation {
@@ -162,7 +151,8 @@ impl Compositor for HeadlessCompositor {
             at,
             acquires: images.iter().map(|i| (i.layer, i.acquire)).collect(),
         });
-        self.held.extend(images.into_iter().map(|i| (serial, i)));
+        self.showing
+            .extend(images.iter().map(|i| (serial, i.layer)));
         self.presented.push(Presented {
             serial,
             latched: Some(at),
@@ -171,7 +161,7 @@ impl Compositor for HeadlessCompositor {
         Ok(())
     }
 
-    fn drain(&mut self, presented: &mut Vec<Presented>, released: &mut Vec<ReleasedImage>) {
+    fn drain(&mut self, presented: &mut Vec<Presented>, released: &mut Vec<Released>) {
         presented.append(&mut self.presented);
         released.append(&mut self.released);
     }

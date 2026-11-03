@@ -13,11 +13,8 @@ struct Capture {
     history: Arc<Mutex<Vec<Presentation>>>,
 }
 impl Compositor for Capture {
-    fn detach(self: Box<Self>) -> Vec<AcquiredImage> {
-        Box::new(self.headless).detach()
-    }
-    fn image(&self, layer: LayerId) -> Option<&AcquiredImage> {
-        self.headless.image(layer)
+    fn detach(&mut self) -> Option<adv_gpu::queue::Fence> {
+        self.headless.detach()
     }
     fn caps(&self) -> CompositorCaps {
         self.headless.caps()
@@ -26,10 +23,10 @@ impl Compositor for Capture {
         &mut self,
         l: &Layers,
         d: &Tiles,
-        i: Vec<AcquiredImage>,
+        i: &mut [AcquiredImage],
         s: u64,
         a: std::time::Instant,
-    ) -> std::result::Result<(), PresentError> {
+    ) -> std::result::Result<(), crate::compositor::Error> {
         self.history.lock().unwrap().push(Presentation {
             layers: l.clone(),
             damage: d.clone(),
@@ -39,7 +36,7 @@ impl Compositor for Capture {
         });
         self.headless.present(l, d, i, s, a)
     }
-    fn drain(&mut self, p: &mut Vec<Presented>, r: &mut Vec<ReleasedImage>) {
+    fn drain(&mut self, p: &mut Vec<Presented>, r: &mut Vec<Released>) {
         self.headless.drain(p, r);
     }
 }
@@ -293,16 +290,6 @@ fn rotation_and_settings_invalidate_content_and_rebuild_only_reattaches() {
     );
     let stages = display.recorder().latest().unwrap().statistics.passes;
     display.rebuild(compositor(&history), &mut q).unwrap();
-    assert_eq!(
-        display
-            .ledger()
-            .pools
-            .iter()
-            .flat_map(|p| &p.buffers)
-            .filter(|b| b.in_use)
-            .count(),
-        1
-    );
     assert_eq!(history.lock().unwrap().len(), 3);
     assert_eq!(
         display
@@ -410,8 +397,8 @@ fn software_ingest_and_video_layers_share_one_plan() {
 fn failed_attachment_keeps_the_ledger_uncommitted_and_reports_the_submitted_read() {
     struct Reject;
     impl Compositor for Reject {
-        fn detach(self: Box<Self>) -> Vec<AcquiredImage> {
-            vec![]
+        fn detach(&mut self) -> Option<adv_gpu::queue::Fence> {
+            None
         }
         fn caps(&self) -> CompositorCaps {
             caps()
@@ -420,16 +407,13 @@ fn failed_attachment_keeps_the_ledger_uncommitted_and_reports_the_submitted_read
             &mut self,
             _: &Layers,
             _: &Tiles,
-            images: Vec<AcquiredImage>,
+            _: &mut [AcquiredImage],
             _: u64,
             _: std::time::Instant,
-        ) -> std::result::Result<(), PresentError> {
-            Err(PresentError {
-                error: crate::compositor::Error::SurfaceLost,
-                images,
-            })
+        ) -> std::result::Result<(), crate::compositor::Error> {
+            Err(crate::compositor::Error::SurfaceLost)
         }
-        fn drain(&mut self, _: &mut Vec<Presented>, _: &mut Vec<ReleasedImage>) {}
+        fn drain(&mut self, _: &mut Vec<Presented>, _: &mut Vec<Released>) {}
     }
     let (d, mut q) = Device::open(&queue::DeviceOptions {
         validation: true,
@@ -485,27 +469,24 @@ impl Compositor for Controlled {
     fn caps(&self) -> CompositorCaps {
         self.headless.caps()
     }
-    fn image(&self, id: LayerId) -> Option<&AcquiredImage> {
-        self.headless.image(id)
-    }
-    fn detach(self: Box<Self>) -> Vec<AcquiredImage> {
-        Box::new(self.headless).detach()
+    fn detach(&mut self) -> Option<adv_gpu::queue::Fence> {
+        self.headless.detach()
     }
     fn present(
         &mut self,
         l: &Layers,
         d: &Tiles,
-        i: Vec<AcquiredImage>,
+        i: &mut [AcquiredImage],
         s: u64,
         a: std::time::Instant,
-    ) -> std::result::Result<(), PresentError> {
+    ) -> std::result::Result<(), crate::compositor::Error> {
         self.history
             .lock()
             .unwrap()
             .push(i.iter().map(|a| (a.layer, a.image.image().id())).collect());
         self.headless.present(l, d, i, s, a)
     }
-    fn drain(&mut self, p: &mut Vec<Presented>, r: &mut Vec<ReleasedImage>) {
+    fn drain(&mut self, p: &mut Vec<Presented>, r: &mut Vec<Released>) {
         self.headless.drain(&mut vec![], r);
         p.append(&mut self.latch.lock().unwrap());
     }
@@ -919,7 +900,10 @@ fn changing_settings_while_a_frame_is_held_never_aliases_its_read_source() {
     let mut changed = settings();
     changed.rotation = Rotation::Half;
     display.settings(&mut q, changed).unwrap();
-    assert_eq!(display.ledger().pools[0].buffers.len(), 3);
+    // The redraw planned around the shown image and its read source.
+    let buffers = &display.ledger().pools[0].buffers;
+    assert_eq!(buffers.len(), 2);
+    assert!(buffers.iter().all(|b| b.in_use));
     latch(&events, 1);
     display.service(&mut q).unwrap();
     assert_eq!(display.recorder().latest().unwrap().frame.serial, 2);

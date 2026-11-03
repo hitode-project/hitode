@@ -40,6 +40,13 @@ pub struct Statistics {
     pub submissions: u32,
     pub latched: Option<Duration>,
     pub shown: Option<Duration>,
+    /// This present's serial: the number of presents up to it.
+    pub presents: u64,
+}
+
+/// Running totals since the display was created.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Totals {
     pub presents: u64,
     pub software_frames: u64,
     pub software_bytes: u64,

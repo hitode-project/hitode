@@ -293,9 +293,14 @@ fn ingest_decodes_every_format_and_palette_bit_for_bit() {
                 let token = queue.submit(encoder).unwrap();
                 slot.ingested(token);
                 assert!(queue.wait(token, TIMEOUT).unwrap());
+                // Presented layers are opaque: ingest drops the source alpha byte.
+                let mut expected = cpu.bgra.clone();
+                for pixel in expected.as_chunks_mut::<4>().0 {
+                    pixel[3] = 255;
+                }
                 assert_eq!(
                     unsafe { readback.mapped().unwrap().as_ref() },
-                    cpu.bgra,
+                    expected,
                     "{format:?}, palette={has_palette}, bottom_up={bottom_up}"
                 );
             }

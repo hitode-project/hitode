@@ -176,7 +176,7 @@ pub struct PoolId(pub u8);
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PoolBuffer {
     pub age: Option<u32>,
-    /// Leased by a compositor or a held frame. Order its release fence before reuse.
+    /// Read by a compositor or by the frame being planned; set by `occupy`.
     pub in_use: bool,
 }
 
@@ -337,17 +337,9 @@ pub const MODEL_RADII: [(Upscaler, u32); 4] = [
     (Upscaler::K7, 8),
 ];
 
-impl Plan {
-    fn attaches(&self, pool: PoolId) -> bool {
-        std::iter::once(&self.layers.base)
-            .chain(self.layers.video.iter().map(|(_, l)| l))
-            .any(|l| l.source == Source::Pool(pool))
-    }
-}
-
 impl PoolState {
     /// Commit all writes once, after the atomic present succeeds. Intermediate
-    /// targets age too, but only images attached as layers await release.
+    /// targets age too.
     pub fn after_present(&mut self, plan: &Plan) {
         for pool in &mut self.pools {
             for buffer in &mut pool.buffers {
@@ -355,11 +347,7 @@ impl PoolState {
             }
         }
         for target in &plan.targets {
-            let attached = plan.attaches(target.pool);
-            *self.buffer(target) = PoolBuffer {
-                age: Some(1),
-                in_use: attached,
-            };
+            self.buffer(target).age = Some(1);
         }
         self.history.push_back(plan.damage.clone());
         if self.history.len() > HISTORY {
@@ -368,11 +356,16 @@ impl PoolState {
         self.unrefined.clone_from(&plan.unrefined);
     }
 
-    pub(crate) fn reserve(&mut self, plan: &Plan) {
-        for target in &plan.targets {
-            if plan.attaches(target.pool) {
-                self.buffer(target).in_use = true;
+    /// Mark exactly the `leased` buffers in use: those a compositor may read
+    /// or the next frame samples, presented or not.
+    pub fn occupy(&mut self, leased: impl IntoIterator<Item = Target>) {
+        for pool in &mut self.pools {
+            for buffer in &mut pool.buffers {
+                buffer.in_use = false;
             }
+        }
+        for target in leased {
+            self.buffer(&target).in_use = true;
         }
     }
     fn buffer(&mut self, target: &Target) -> &mut PoolBuffer {
@@ -395,18 +388,6 @@ impl PoolState {
             PoolBuffer::default,
         );
         &mut pool.buffers[target.buffer]
-    }
-
-    /// Call after ordering the returned release fence before future GPU work.
-    pub fn release(&mut self, pool: PoolId, buffer: usize) {
-        if let Some(buffer) = self
-            .pools
-            .iter_mut()
-            .find(|p| p.id == pool)
-            .and_then(|p| p.buffers.get_mut(buffer))
-        {
-            buffer.in_use = false;
-        }
     }
 
     /// Size, rotation, scaling, upscaler changes and device loss discard content

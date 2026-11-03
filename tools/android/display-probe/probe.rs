@@ -185,9 +185,34 @@ mod android {
         buffers: Vec<(u64, Rect, u32)>,
         metrics: Metrics,
         presented: Vec<Presented>,
-        released: Vec<ReleasedImage>,
+        released: Vec<Released>,
+        /// Attached images with their serial, until released.
+        screen: Vec<(u64, AcquiredImage)>,
     }
     impl Probe {
+        fn detach(&mut self) {
+            if let Some(mut compositor) = self.compositor.take() {
+                let fence = compositor.detach();
+                for (_, acquired) in self.screen.drain(..) {
+                    let fence = fence.as_ref().map(|f| f.duplicate().expect("fence"));
+                    acquired.image.released(fence);
+                }
+            }
+        }
+        fn attach(
+            &mut self,
+            layers: &Layers,
+            mut images: Vec<AcquiredImage>,
+            serial: u64,
+            at: Instant,
+        ) {
+            self.compositor
+                .as_mut()
+                .unwrap()
+                .present(layers, &Tiles::default(), &mut images, serial, at)
+                .unwrap_or_else(|_| panic!("present"));
+            self.screen.extend(images.into_iter().map(|a| (serial, a)));
+        }
         fn drain(&mut self) {
             self.compositor
                 .as_mut()
@@ -213,7 +238,12 @@ mod android {
             }
             let releases = self.released.len();
             for r in self.released.drain(..) {
-                r.image.released(r.fence);
+                let i = self
+                    .screen
+                    .iter()
+                    .position(|(serial, a)| *serial == r.serial && a.layer == r.layer)
+                    .expect("released image is attached");
+                self.screen.swap_remove(i).1.image.released(r.fence);
             }
             self.metrics.releases.push(releases as i64);
             log(format!("frame={} releases={releases}", self.frame));
@@ -255,21 +285,18 @@ mod android {
                 "serial={serial} acquired_age={age:?} pool_ages={ages:?}"
             ));
             let start = clock(libc::CLOCK_THREAD_CPUTIME_ID);
-            self.compositor
-                .as_mut()
-                .unwrap()
-                .present(
-                    self.layers.as_ref().unwrap(),
-                    &Tiles::default(),
-                    vec![AcquiredImage {
-                        layer: LayerId::Base,
-                        image,
-                        acquire: token,
-                    }],
-                    serial,
-                    desired,
-                )
-                .unwrap_or_else(|_| panic!("present"));
+            let layers = self.layers.take().unwrap();
+            self.attach(
+                &layers,
+                vec![AcquiredImage {
+                    layer: LayerId::Base,
+                    image,
+                    acquire: token,
+                }],
+                serial,
+                desired,
+            );
+            self.layers = Some(layers);
             let cpu = clock(libc::CLOCK_THREAD_CPUTIME_ID) - start;
             self.metrics.cpu.push(cpu);
             log(format!("serial={serial} present_cpu_ns={cpu}"));
@@ -338,17 +365,9 @@ mod android {
             self.desired.push(desired);
             self.latched.push(None);
             self.frame += 1;
-            self.compositor
-                .as_mut()
-                .unwrap()
-                .present(
-                    self.layers.as_ref().unwrap(),
-                    &Tiles::default(),
-                    images,
-                    self.frame as u64,
-                    desired,
-                )
-                .unwrap_or_else(|_| panic!("YUV present"));
+            let layers = self.layers.take().unwrap();
+            self.attach(&layers, images, self.frame as u64, desired);
+            self.layers = Some(layers);
         }
         fn frame(&mut self, frame_time: i64) {
             self.drain();
@@ -586,13 +605,13 @@ mod android {
         }
     }
     unsafe extern "C" fn destroyed(activity: *mut Activity, _window: *mut ndk_sys::ANativeWindow) {
-        unsafe { state(activity) }.borrow_mut().compositor = None;
+        unsafe { state(activity) }.borrow_mut().detach();
     }
     unsafe extern "C" fn destroy(activity: *mut Activity) {
         let state = unsafe { Rc::from_raw((*activity).instance.cast::<RefCell<Probe>>()) };
         let mut probe = state.borrow_mut();
         probe.destroyed = true;
-        probe.compositor = None;
+        probe.detach();
     }
     #[unsafe(no_mangle)]
     pub unsafe extern "C" fn ANativeActivity_onCreate(

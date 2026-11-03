@@ -3,7 +3,7 @@ use crate::{
     Rect,
     compositor::*,
     plan::*,
-    recorder::{self, PlanKind, PresentRecord, StageStats, Statistics},
+    recorder::{self, PlanKind, PresentRecord, StageStats, Statistics, Totals},
     stages::{ingest, output, video},
 };
 use adv_gpu::{
@@ -118,6 +118,8 @@ struct Pending {
     record: PresentRecord,
     images: Vec<AcquiredImage>,
     video: Vec<Video>,
+    /// The last submission that reads the frame's base, or `Token(0)`.
+    read: Token,
 }
 struct Converted {
     pool: adv_gpu::present::PoolWeak,
@@ -139,6 +141,10 @@ struct Pipelines {
 pub struct Display {
     device: Device,
     compositor: Option<Box<dyn Compositor>>,
+    /// Every attached image with the serial that attached it, until the
+    /// compositor releases it. Declared after the compositor, which detaches
+    /// before these drop.
+    screen: Vec<(u64, AcquiredImage)>,
     caps: CompositorCaps,
     settings: Settings,
     cost: CostModel,
@@ -147,15 +153,16 @@ pub struct Display {
     pool_ids: HashMap<usize, PoolId>,
     pipelines: Pipelines,
     converted: HashMap<(usize, bool), Converted>,
+    /// Each video's current decoder image while it is not attached.
     leases: HashMap<u64, PresentImage>,
     ring: Ring,
     spans: Vec<Span>,
     recorder: recorder::Recorder,
+    totals: Totals,
     origin: Instant,
     wake: Option<Wake>,
     unlatched: Option<u64>,
     held: Option<Pending>,
-    kept: Vec<AcquiredImage>,
     video: Vec<Video>,
     publication: Option<Publication>,
     queries: Option<adv_gpu::queue::QuerySet>,
@@ -193,6 +200,7 @@ impl Display {
         let mut this = Self {
             caps: compositor.caps(),
             compositor: Some(compositor),
+            screen: vec![],
             device,
             settings,
             cost: CostModel {
@@ -209,11 +217,11 @@ impl Display {
             ring,
             spans: vec![],
             recorder: recorder::Recorder::present_history(),
+            totals: Totals::default(),
             origin: Instant::now(),
             wake: None,
             unlatched: None,
             held: None,
-            kept: vec![],
             video: vec![],
             publication: None,
             queries,
@@ -225,14 +233,7 @@ impl Display {
         Ok(this)
     }
     fn configure(&mut self) {
-        if let Some(r) = self.recorder.latest() {
-            let serial = r.statistics.presents;
-            self.recorder
-                .get_mut(serial)
-                .unwrap()
-                .statistics
-                .configurations += 1;
-        }
+        self.totals.configurations += 1;
         if let Some(c) = &mut self.compositor {
             c.set_scale(self.settings.scale);
             c.set_frame_rate(self.settings.rate);
@@ -247,6 +248,9 @@ impl Display {
     }
     pub fn recorder(&self) -> &recorder::Recorder {
         &self.recorder
+    }
+    pub fn totals(&self) -> &Totals {
+        &self.totals
     }
     pub fn ledger(&self) -> &PoolState {
         &self.pools
@@ -282,19 +286,14 @@ impl Display {
         Ok(())
     }
     fn redraw_frame(&self) -> Option<Frame> {
-        let (record, images, video) = if let Some(held) = &self.held {
-            (&held.record, held.images.as_slice(), &held.video)
+        let (record, image, video) = if let Some(held) = &self.held {
+            let base = held.images.iter().find(|i| i.layer == LayerId::Base);
+            (&held.record, base.map(|i| &i.image), &held.video)
         } else {
-            (self.recorder.latest()?, self.kept.as_slice(), &self.video)
+            (self.recorder.latest()?, None, &self.video)
         };
-        let image = images
-            .iter()
-            .find(|i| i.layer == LayerId::Base)
-            .or_else(|| {
-                self.compositor
-                    .as_ref()
-                    .and_then(|c| c.image(LayerId::Base))
-            })
+        let image = image
+            .or_else(|| shown(&self.screen, LayerId::Base))
             .unwrap();
         let mut info = record.frame.clone();
         info.base = BaseKind::Gpu { presentable: false };
@@ -302,7 +301,7 @@ impl Display {
         Some(Frame {
             info,
             base: Base::Retained {
-                image: image.image.image().clone(),
+                image: image.image().clone(),
                 canvas: record.frame.canvas,
                 rotation: buffer_rotation(record),
             },
@@ -325,32 +324,58 @@ impl Display {
         )
     }
     pub fn suspend(&mut self) {
-        if let Some(c) = self.compositor.take() {
-            self.kept = c.detach();
-            // Detach retired every older lease; only these images remain owned.
-            for pool in &mut self.pools.pools {
-                for buffer in &mut pool.buffers {
-                    buffer.in_use = false;
+        let Some(mut compositor) = self.compositor.take() else {
+            return;
+        };
+        let fence = compositor.detach();
+        drop(compositor);
+        // The latest present's images stay leased for the next compositor;
+        // everything else is free once the detach fence signals.
+        let latest = self
+            .recorder
+            .latest()
+            .map(|r| (r.statistics.presents, &r.plan.layers));
+        let current: Vec<_> = self
+            .screen
+            .iter()
+            .filter(|(_, a)| match (a.layer, latest) {
+                (LayerId::Base, Some(_)) => true,
+                (LayerId::Video(id), Some((_, layers))) => {
+                    layers.video.iter().any(|(v, _)| *v == id)
                 }
+                _ => false,
+            })
+            .map(|(serial, a)| (a.layer, *serial))
+            .fold(
+                Vec::<(LayerId, u64)>::new(),
+                |mut newest, (layer, serial)| {
+                    match newest.iter_mut().find(|(l, _)| *l == layer) {
+                        Some(n) => n.1 = n.1.max(serial),
+                        None => newest.push((layer, serial)),
+                    }
+                    newest
+                },
+            );
+        for (serial, mut acquired) in std::mem::take(&mut self.screen) {
+            let fence = fence
+                .as_ref()
+                .map(adv_gpu::queue::Fence::duplicate)
+                .transpose()
+                .expect("detach fence duplication");
+            if current.contains(&(acquired.layer, serial)) {
+                acquired
+                    .image
+                    .detached(fence)
+                    .expect("detach fence duplication");
+                self.screen.push((serial, acquired));
+            } else {
+                self.retire(acquired, fence)
+                    .expect("detach fence duplication");
             }
-            for acquired in &self.kept {
-                if let Some(id) = self.pool_ids.get(&acquired.image.pool().id()) {
-                    self.pools
-                        .pools
-                        .iter_mut()
-                        .find(|p| p.id == *id)
-                        .unwrap()
-                        .buffers[acquired.image.index()]
-                    .in_use = true;
-                }
-            }
-            if let Some(held) = &self.held {
-                self.pools.reserve(&held.record.plan);
-            }
-            self.unlatched = None;
-            self.recorder
-                .record(recorder::Event::Lifecycle("surface detached".into()));
         }
+        self.unlatched = None;
+        self.recorder
+            .record(recorder::Event::Lifecycle("surface detached".into()));
     }
     pub fn rebuild(
         &mut self,
@@ -361,23 +386,23 @@ impl Display {
         self.caps = compositor.caps();
         self.compositor = Some(compositor);
         self.configure();
+        let compositor = self.compositor.as_mut().unwrap();
         if let Some(w) = &self.wake {
-            self.compositor.as_mut().unwrap().set_waker(w.clone());
+            compositor.set_waker(w.clone());
         }
         if let Some(record) = self.recorder.latest() {
-            let layers = &record.plan.layers;
-            let serial = self.recorder.latest().unwrap().statistics.presents;
-            self.compositor
-                .as_mut()
-                .unwrap()
-                .present(
-                    layers,
-                    &Tiles::default(),
-                    std::mem::take(&mut self.kept),
-                    serial,
-                    Instant::now(),
-                )
-                .map_err(|e| Error::Compositor(e.error))?;
+            let serial = record.statistics.presents;
+            let mut images: Vec<_> = self.screen.drain(..).map(|(_, a)| a).collect();
+            let result = compositor.present(
+                &record.plan.layers,
+                &Tiles::default(),
+                &mut images,
+                serial,
+                Instant::now(),
+            );
+            // On failure they wait for the next compositor.
+            self.screen.extend(images.into_iter().map(|a| (serial, a)));
+            result.map_err(Error::Compositor)?;
             self.unlatched = Some(serial);
         }
         self.recorder
@@ -387,13 +412,34 @@ impl Display {
     }
     fn release(&mut self, image: PresentImage, fence: Option<adv_gpu::queue::Fence>) {
         if let Some(&id) = self.pool_ids.get(&image.pool().id()) {
-            self.pools.release(id, image.index());
             self.recorder.record(recorder::Event::Released {
                 pool: id.0,
                 buffer: image.index(),
             });
         }
         image.released(fence);
+    }
+    /// Return a released image to its pool, or keep it while it is still its
+    /// video's current image.
+    fn retire(
+        &mut self,
+        acquired: AcquiredImage,
+        fence: Option<adv_gpu::queue::Fence>,
+    ) -> adv_gpu::Result<()> {
+        if let LayerId::Video(id) = acquired.layer
+            && !self.leases.contains_key(&id)
+            && self
+                .video
+                .iter()
+                .any(|v| v.id == id && v.image.id() == acquired.image.image().id())
+        {
+            let mut image = acquired.image;
+            image.detached(fence)?;
+            self.leases.insert(id, image);
+        } else {
+            self.release(acquired.image, fence);
+        }
+        Ok(())
     }
     fn discard(&mut self, pending: Pending, source: Option<u64>) -> Option<PresentImage> {
         let mut reading = None;
@@ -407,6 +453,12 @@ impl Display {
             }
         }
         reading
+    }
+    fn attachable(&self) -> bool {
+        self.compositor.is_some()
+            && self.unlatched.is_none()
+            && self.settings.view.0 != 0
+            && self.settings.view.1 != 0
     }
     pub fn present(&mut self, queue: &mut Queue, mut frame: Frame) -> Result<Token, Failure> {
         self.drain(queue).map_err(|error| Failure {
@@ -425,7 +477,7 @@ impl Display {
         if self.invalid {
             frame.info.damage = Damage::Whole;
         }
-        let result = self.encode(queue, frame);
+        let result = self.encode(queue, frame, reading.as_ref());
         if let Some(image) = reading {
             self.release(image, None);
         }
@@ -433,68 +485,46 @@ impl Display {
             error,
             token: Token(0),
         })?;
-        let token = if matches!(pending.record.frame.base, BaseKind::Software { .. })
-            && pending.record.statistics.stages[0].pixels == 0
-        {
-            Token(0)
-        } else {
-            Token(pending.record.token)
-        };
-        if self.compositor.is_none()
-            || self.unlatched.is_some()
-            || self.settings.view.0 == 0
-            || self.settings.view.1 == 0
-        {
-            self.pools.reserve(&pending.record.plan);
-            self.held = Some(pending);
-        } else {
+        let token = pending.read;
+        if self.attachable() {
             self.attach(pending)
                 .map_err(|error| Failure { error, token })?;
+        } else {
+            self.held = Some(pending);
         }
         Ok(token)
     }
     fn attach(&mut self, mut pending: Pending) -> Result<(), Error> {
-        let layers = &pending.record.plan.layers;
-        let previous = self
-            .recorder
-            .latest()
-            .map(|r| r.statistics)
-            .unwrap_or_default();
-        let serial = previous.presents + 1;
-        pending.record.statistics.presents = serial;
-        let software = matches!(pending.record.frame.base, BaseKind::Software { .. })
-            && pending.record.statistics.stages[0].pixels != 0;
-        pending.record.statistics.software_frames = previous.software_frames + u64::from(software);
-        pending.record.statistics.software_bytes = previous.software_bytes
-            + if software {
-                pending.record.statistics.stages[0].pixels * 4
-            } else {
-                0
-            };
-        pending.record.statistics.software_started = previous
-            .software_started
-            .or(software.then_some(pending.record.at));
-        pending.record.statistics.direct_presents =
-            previous.direct_presents + u64::from(pending.record.plan.stages.is_empty());
-        pending.record.statistics.configurations = previous.configurations.max(1);
-        pending.record.statistics.max_cpu = previous.max_cpu.max(pending.record.cpu_time);
-        pending.record.statistics.max_queue = previous.max_queue.max(
-            pending
-                .record
-                .at
-                .saturating_sub(pending.record.published_at),
+        let serial = self.totals.presents + 1;
+        let presented = self.compositor.as_mut().unwrap().present(
+            &pending.record.plan.layers,
+            &Tiles::default(),
+            &mut pending.images,
+            serial,
+            Instant::now(),
         );
-        self.compositor
-            .as_mut()
-            .unwrap()
-            .present(
-                layers,
-                &Tiles::default(),
-                pending.images,
-                serial,
-                Instant::now(),
-            )
-            .map_err(|e| Error::Compositor(e.error))?;
+        if let Err(error) = presented {
+            self.discard(pending, None);
+            return Err(Error::Compositor(error));
+        }
+        let record = &mut pending.record;
+        record.statistics.presents = serial;
+        let software =
+            matches!(record.frame.base, BaseKind::Software { .. }) && pending.read != Token(0);
+        let totals = &mut self.totals;
+        totals.presents = serial;
+        if software {
+            totals.software_frames += 1;
+            totals.software_bytes += record.statistics.stages[0].pixels * 4;
+            totals.software_started.get_or_insert(record.at);
+        }
+        totals.direct_presents += u64::from(record.plan.stages.is_empty());
+        totals.max_cpu = totals.max_cpu.max(record.cpu_time);
+        totals.max_queue = totals
+            .max_queue
+            .max(record.at.saturating_sub(record.published_at));
+        self.screen
+            .extend(pending.images.into_iter().map(|a| (serial, a)));
         self.pools.after_present(&pending.record.plan);
         self.video = pending.video;
         self.unlatched = Some(serial);
@@ -549,17 +579,13 @@ impl Display {
             }
         }
         for r in released {
-            let retain = matches!(r.layer,LayerId::Video(id) if self.video.iter().any(|v|v.id==id&&v.image.id()==r.image.image().id()));
-            if retain {
-                let LayerId::Video(id) = r.layer else {
-                    unreachable!()
-                };
-                let mut image = r.image;
-                image.detached(r.fence)?;
-                self.leases.insert(id, image);
-            } else {
-                self.release(r.image, r.fence);
-            }
+            let i = self
+                .screen
+                .iter()
+                .position(|(serial, a)| *serial == r.serial && a.layer == r.layer)
+                .expect("released image is attached");
+            let (_, acquired) = self.screen.swap_remove(i);
+            self.retire(acquired, r.fence)?;
         }
         if !self.timings.is_empty() {
             let completed = queue.poll()?;
@@ -591,38 +617,18 @@ impl Display {
     }
     pub fn service(&mut self, queue: &mut Queue) -> Result<(), Error> {
         self.drain(queue)?;
-        if self.unlatched.is_none()
-            && self.compositor.is_some()
-            && self.settings.view.0 != 0
-            && self.settings.view.1 != 0
+        if self.attachable()
             && let Some(p) = self.held.take()
         {
             self.attach(p)?;
         }
         Ok(())
     }
-    fn video_image(&self, id: u64) -> &PresentImage {
-        self.leases
-            .get(&id)
-            .or_else(|| {
-                self.compositor
-                    .as_ref()
-                    .and_then(|c| c.image(LayerId::Video(id)))
-                    .map(|a| &a.image)
-            })
-            .or_else(|| {
-                self.kept
-                    .iter()
-                    .find(|a| a.layer == LayerId::Video(id))
-                    .map(|a| &a.image)
-            })
-            .expect("retained decoder lease")
-    }
     fn video_pipeline(&mut self, v: &Video, software: bool) -> adv_gpu::Result<()> {
         if v.planes.is_some() {
             return Ok(());
         }
-        let pool = self.video_image(v.id).pool();
+        let pool = video_image(&self.leases, &self.screen, v.id).pool();
         let key = (pool.id(), software);
         if !self.converted.contains_key(&key) {
             let pipeline = if software {
@@ -677,23 +683,7 @@ impl Display {
                 )?
             }
         } else {
-            // Split the borrows: these stores own all decoder leases; only the ring mutates.
-            let image = self
-                .leases
-                .get(&v.id)
-                .or_else(|| {
-                    self.compositor
-                        .as_ref()
-                        .and_then(|c| c.image(LayerId::Video(v.id)))
-                        .map(|a| &a.image)
-                })
-                .or_else(|| {
-                    self.kept
-                        .iter()
-                        .find(|a| a.layer == LayerId::Video(v.id))
-                        .map(|a| &a.image)
-                })
-                .unwrap();
+            let image = video_image(&self.leases, &self.screen, v.id);
             let pipeline = &self.converted[&(image.pool().id(), base.is_some())].pipeline;
             if let Some(base) = base {
                 video::encode_converted_software(
@@ -719,8 +709,22 @@ impl Display {
         self.spans.extend(data);
         Ok(())
     }
-    fn encode(&mut self, queue: &mut Queue, mut frame: Frame) -> Result<Pending, Error> {
+    fn encode(
+        &mut self,
+        queue: &mut Queue,
+        mut frame: Frame,
+        reading: Option<&PresentImage>,
+    ) -> Result<Pending, Error> {
         let started = Instant::now();
+        let leased = self.screen.iter().map(|(_, a)| &a.image).chain(reading);
+        self.pools.occupy(leased.filter_map(|i| {
+            let size = i.image().desc().size;
+            Some(Target {
+                pool: *self.pool_ids.get(&i.pool().id())?,
+                buffer: i.index(),
+                size: (size.width, size.height),
+            })
+        }));
         let mut settings = self.settings.clone();
         if settings.view.0 == 0 || settings.view.1 == 0 {
             settings.view = self
@@ -802,6 +806,7 @@ impl Display {
             .any(|s| !stage_target(s).1.rects.is_empty())
             .then(|| queue.encoder("display frame"));
         let mut timed = vec![];
+        let mut reads_base = false;
         for (index, stage) in planned.stages.iter().enumerate() {
             let (into, tiles) = stage_target(stage);
             statistics.stages[index] = StageStats {
@@ -815,6 +820,15 @@ impl Display {
             if tiles.rects.is_empty() {
                 continue;
             }
+            reads_base |= matches!(
+                stage,
+                Stage::Ingest { .. }
+                    | Stage::Video { .. }
+                    | Stage::Output {
+                        from: Source::Base,
+                        ..
+                    }
+            );
             let destination = targets[into.0 as usize].as_ref().unwrap().image();
             let size = destination.desc().size;
             let (area, load) = ingest::coverage(tiles);
@@ -922,22 +936,6 @@ impl Display {
             statistics.passes += 1;
             timed.push(index);
         }
-        if let Some(encoder) = &mut encoder {
-            match &frame.base {
-                Base::Presentable { image, .. } => encoder.release_presentable(image.image()),
-                Base::Retained { image, .. } => encoder.release_presentable(image),
-                _ => {}
-            }
-            if planned
-                .stages
-                .iter()
-                .any(|s| matches!(s, Stage::Video { .. }))
-            {
-                for v in &frame.video {
-                    encoder.release_presentable(&v.image);
-                }
-            }
-        }
         for data in self.spans.drain(..) {
             encoder.as_mut().unwrap().retain(data);
         }
@@ -1032,6 +1030,7 @@ impl Display {
             },
             images,
             video: frame.video,
+            read: if reads_base { token } else { Token(0) },
         })
     }
 }
@@ -1088,13 +1087,7 @@ impl Display {
             .iter()
             .map(|(id, _)| *id)
             .collect::<Vec<_>>();
-        let image = self
-            .compositor
-            .as_ref()
-            .and_then(|c| c.image(LayerId::Base))
-            .or_else(|| self.kept.iter().find(|a| a.layer == LayerId::Base))
-            .unwrap();
-        let base = image.image.image().clone();
+        let base = shown(&self.screen, LayerId::Base).unwrap().image().clone();
         let rotation = buffer_rotation(record);
         let videos = self
             .video
@@ -1171,10 +1164,6 @@ impl Display {
                 self.draw_video(&mut pass, &target, None, v, &tiles)?;
             }
         }
-        encoder.release_presentable(&base);
-        for v in &videos {
-            encoder.release_presentable(&v.image);
-        }
         for span in self.spans.drain(..) {
             encoder.retain(span);
         }
@@ -1195,6 +1184,26 @@ impl Display {
         );
         Ok((queue.submit(encoder)?, buffer, serial, canvas))
     }
+}
+
+/// The image `layer` shows: its newest attached one.
+fn shown(screen: &[(u64, AcquiredImage)], layer: LayerId) -> Option<&PresentImage> {
+    screen
+        .iter()
+        .filter(|(_, a)| a.layer == layer)
+        .max_by_key(|(serial, _)| *serial)
+        .map(|(_, a)| &a.image)
+}
+
+fn video_image<'a>(
+    leases: &'a HashMap<u64, PresentImage>,
+    screen: &'a [(u64, AcquiredImage)],
+    id: u64,
+) -> &'a PresentImage {
+    leases
+        .get(&id)
+        .or_else(|| shown(screen, LayerId::Video(id)))
+        .expect("retained decoder lease")
 }
 
 fn buffer_rotation(record: &PresentRecord) -> Rotation {

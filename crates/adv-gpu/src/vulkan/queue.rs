@@ -169,8 +169,11 @@ impl Queue {
         }
         encoder.inner.memory_barrier();
         #[cfg(target_os = "android")]
-        for (image, _) in buffers {
-            encoder.inner.release(image);
+        {
+            for (image, _) in buffers {
+                encoder.inner.release(&image.core);
+            }
+            encoder.inner.release_borrowed();
         }
         #[cfg(not(target_os = "android"))]
         let _ = buffers;

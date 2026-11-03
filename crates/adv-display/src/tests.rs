@@ -573,18 +573,19 @@ fn pool_present_release_invalidation_and_trim() {
     let p = run(&f, &settings(), &caps(), &pools);
     pools.after_present(&p);
     assert_eq!(pools.pools[0].buffers[0].age, Some(1));
+    pools.occupy([p.targets[0]]);
     assert!(pools.pools[0].buffers[0].in_use);
     let next = run(&f, &settings(), &caps(), &pools);
     assert_eq!(next.targets[0].buffer, 1);
     pools.after_present(&next);
     assert_eq!(pools.pools[0].buffers[0].age, Some(2));
-    pools.release(PoolId(0), 0);
+    pools.occupy([next.targets[0]]);
+    assert!(!pools.pools[0].buffers[0].in_use);
     let next = run(&f, &settings(), &caps(), &pools);
     assert_eq!(next.targets[0].buffer, 0);
-    pools.release(PoolId(0), 1);
+    pools.occupy([]);
     for _ in 0..HISTORY + 2 {
         pools.after_present(&next);
-        pools.release(PoolId(0), 0);
     }
     assert_eq!(pools.history.len(), HISTORY);
     pools.trim_to_one();
@@ -843,7 +844,7 @@ fn headless_records_and_reports_in_order_and_is_object_safe() {
                 .present(
                     &p.layers,
                     &damage,
-                    vec![],
+                    &mut [],
                     serial,
                     at + Duration::from_millis(serial)
                 )
@@ -940,7 +941,6 @@ fn quiet_frames_converge_with_a_chunk_budget() {
     };
     let first = plan(&frame(), &s, &caps(), &low, &pools);
     pools.after_present(&first);
-    pools.release(PoolId(2), 0);
     let c = CostModel {
         frame_budget_ns: 10_000,
         ..cost()
@@ -953,7 +953,6 @@ fn quiet_frames_converge_with_a_chunk_budget() {
         };
         let p = plan(&f, &s, &caps(), &c, &pools);
         pools.after_present(&p);
-        pools.release(PoolId(2), p.targets[0].buffer);
         if pools.unrefined.is_empty() {
             return;
         }
@@ -1019,9 +1018,6 @@ fn recorder_replays_stateful_upscales_and_composed_video() {
             stage_times: vec![Duration::from_nanos(12), Duration::from_nanos(34)],
         })));
         pools.after_present(&p);
-        for target in &p.targets {
-            pools.release(target.pool, target.buffer);
-        }
     }
     let parsed = parse(&recorder.dump()).unwrap();
     assert_eq!(parsed, recorder.events().cloned().collect::<Vec<_>>());

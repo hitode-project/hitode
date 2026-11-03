@@ -4,8 +4,8 @@
 //! state. Executors run its stages and call [`plan::PoolState::after_present`]
 //! only after submitting the complete frame. [`stages`] records GPU commands;
 //! the owner thread submits them.
-//! [`compositor`] transfers presentable images to the system compositor and
-//! returns ownership on release. [`recorder`] stores and replays planner data.
+//! [`compositor`] attaches presentable images to the system compositor and
+//! reports their release; the executor owns them throughout. [`recorder`] stores and replays planner data.
 
 pub mod compositor;
 pub mod display;

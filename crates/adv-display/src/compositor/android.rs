@@ -368,7 +368,8 @@ mod native {
         caps: CompositorCaps,
         clock: Clock,
         surfaces: Vec<Surface>,
-        held: Vec<(usize, u64, AcquiredImage)>,
+        /// The surface, serial and layer of each attached buffer.
+        held: Vec<(usize, u64, LayerId)>,
         inbox: Arc<Inbox>,
         free: VecDeque<Box<Completion>>,
         pending: VecDeque<Box<Completion>>,
@@ -475,13 +476,6 @@ mod native {
         }
     }
     impl Compositor for SurfaceCompositor {
-        fn image(&self, layer: LayerId) -> Option<&AcquiredImage> {
-            self.held
-                .iter()
-                .filter(|(_, _, i)| i.layer == layer)
-                .max_by_key(|(_, serial, _)| *serial)
-                .map(|(_, _, i)| i)
-        }
         fn set_waker(&mut self, wake: Wake) {
             let (signals, thread) = Signals::new(wake);
             assert!(self.inbox.owner.set(signals).is_ok());
@@ -493,8 +487,35 @@ mod native {
                 set_rate(base.handle.as_ptr(), rate);
             }
         }
-        fn detach(mut self: Box<Self>) -> Vec<AcquiredImage> {
-            self.detach_images()
+        fn detach(&mut self) -> Option<Fence> {
+            self.held.clear();
+            if self.surfaces.is_empty() {
+                return None;
+            }
+            let tx = unsafe { ASurfaceTransaction_create() };
+            for surface in &self.surfaces {
+                unsafe {
+                    ASurfaceTransaction_reparent(tx, surface.handle.as_ptr(), ptr::null_mut());
+                }
+            }
+            let event = self.completion(u64::MAX);
+            let order = event.order;
+            Self::apply(tx, event);
+            let ready = self.inbox.ready.lock().unwrap();
+            let mut ready = self
+                .inbox
+                .wake
+                .wait_while(ready, |r| !r.iter().any(|e| e.order == order))
+                .unwrap();
+            let i = ready.iter().position(|e| e.order == order).unwrap();
+            let mut event = ready.remove(i).unwrap();
+            drop(ready);
+            for surface in self.surfaces.drain(..) {
+                unsafe {
+                    ASurfaceControl_release(surface.handle.as_ptr());
+                }
+            }
+            event.present.take().map(Fence::from_fd)
         }
 
         fn caps(&self) -> CompositorCaps {
@@ -504,10 +525,10 @@ mod native {
             &mut self,
             layers: &Layers,
             _damage: &Tiles,
-            images: Vec<AcquiredImage>,
+            images: &mut [AcquiredImage],
             serial: u64,
             at: Instant,
-        ) -> Result<(), PresentError> {
+        ) -> Result<(), Error> {
             let create = self
                 .surface(None)
                 .and_then(|()| self.surface(Some(LayerId::Base)))
@@ -523,9 +544,7 @@ mod native {
                     }
                     Ok(())
                 });
-            if let Err(error) = create {
-                return Err(PresentError { error, images });
-            }
+            create?;
             let tx = unsafe { ASurfaceTransaction_create() };
             let mut event = self.completion(serial);
             for surface in &mut self.surfaces {
@@ -646,7 +665,7 @@ mod native {
                     }
                 }
             }
-            for mut acquired in images {
+            for acquired in images.iter_mut() {
                 let state = self
                     .surfaces
                     .iter_mut()
@@ -700,7 +719,7 @@ mod native {
                     );
                 }
                 event.previous.push((surface as usize, None));
-                self.held.push((surface as usize, serial, acquired));
+                self.held.push((surface as usize, serial, acquired.layer));
             }
             unsafe {
                 ASurfaceTransaction_setDesiredPresentTime(tx, self.clock.ns(at));
@@ -719,7 +738,7 @@ mod native {
             });
             Ok(())
         }
-        fn drain(&mut self, presented: &mut Vec<Presented>, released: &mut Vec<ReleasedImage>) {
+        fn drain(&mut self, presented: &mut Vec<Presented>, released: &mut Vec<Released>) {
             loop {
                 let event = {
                     let mut ready = self.inbox.ready.lock().unwrap();
@@ -738,11 +757,10 @@ mod native {
                         surface,
                         event.serial,
                     ) {
-                        let (_, serial, acquired) = self.held.swap_remove(i);
-                        released.push(ReleasedImage {
+                        let (_, serial, layer) = self.held.swap_remove(i);
+                        released.push(Released {
                             serial,
-                            layer: acquired.layer,
-                            image: acquired.image,
+                            layer,
                             fence: fence.map(Fence::from_fd),
                         });
                     }
@@ -780,61 +798,9 @@ mod native {
             }
         }
     }
-    impl SurfaceCompositor {
-        fn detach_images(&mut self) -> Vec<AcquiredImage> {
-            if self.surfaces.is_empty() {
-                return vec![];
-            }
-            let tx = unsafe { ASurfaceTransaction_create() };
-            for surface in &self.surfaces {
-                unsafe {
-                    ASurfaceTransaction_reparent(tx, surface.handle.as_ptr(), ptr::null_mut());
-                }
-            }
-            let event = self.completion(u64::MAX);
-            let order = event.order;
-            Self::apply(tx, event);
-            let ready = self.inbox.ready.lock().unwrap();
-            let mut ready = self
-                .inbox
-                .wake
-                .wait_while(ready, |r| !r.iter().any(|e| e.order == order))
-                .unwrap();
-            let i = ready.iter().position(|e| e.order == order).unwrap();
-            let event = ready.remove(i).unwrap();
-            drop(ready);
-            let mut current: Vec<(u64, AcquiredImage)> = vec![];
-            for (_, serial, mut acquired) in self.held.drain(..) {
-                let fence = event
-                    .present
-                    .as_ref()
-                    .map(|f| Fence::from_fd(f.try_clone().expect("detach fence")));
-                acquired
-                    .image
-                    .detached(fence)
-                    .expect("detach fence duplication");
-                if let Some(i) = current
-                    .iter()
-                    .position(|(_, old)| old.layer == acquired.layer)
-                {
-                    if serial > current[i].0 {
-                        current[i] = (serial, acquired);
-                    }
-                } else {
-                    current.push((serial, acquired));
-                }
-            }
-            for surface in self.surfaces.drain(..) {
-                unsafe {
-                    ASurfaceControl_release(surface.handle.as_ptr());
-                }
-            }
-            current.into_iter().map(|(_, image)| image).collect()
-        }
-    }
     impl Drop for SurfaceCompositor {
         fn drop(&mut self) {
-            drop(self.detach_images());
+            self.detach();
             if let Some(thread) = self.signal_thread.take() {
                 self.inbox.owner.get().unwrap().stop();
                 thread.join().unwrap();

@@ -14,7 +14,7 @@ fn main() {}
 #[cfg(target_os = "macos")]
 mod macos {
     use adv_display::Rect;
-    use adv_display::compositor::{AcquiredImage, Compositor, LayerCompositor, LayerId};
+    use adv_display::compositor::{AcquiredImage, Compositor, LayerCompositor, LayerId, Released};
     use adv_display::plan::{CompositorCaps, Damage, Layer, Layers, Rotation, Source, Tiles};
     use adv_gpu::encode::{ColorAttachment, Load, Store};
     use adv_gpu::present::{Export, PoolDesc, PresentPool};
@@ -67,6 +67,8 @@ mod macos {
         let mut released = vec![];
         // Drains until `serial` committed and `releases` images came back;
         // Core Animation may let go of a surface a run loop turn later.
+        // The test owns every image, as the executor does.
+        let mut screen = vec![];
         let mut drain = |compositor: &mut LayerCompositor, serial: u64, releases: usize| {
             let start = Instant::now();
             while presented
@@ -94,6 +96,7 @@ mod macos {
         };
         present(
             &mut compositor,
+            &mut screen,
             layers(whole, whole, true, None),
             vec![a],
             1,
@@ -117,6 +120,7 @@ mod macos {
         };
         present(
             &mut compositor,
+            &mut screen,
             layers(whole, inset, false, None),
             vec![b],
             2,
@@ -126,7 +130,7 @@ mod macos {
             out.iter().map(|r| (r.serial, r.layer)).collect::<Vec<_>>(),
             [(1, LayerId::Base)]
         );
-        out.into_iter().for_each(|r| r.image.released(r.fence));
+        release(out, &mut screen);
         assert_eq!(contents(base), b_surface);
         assert_eq!(base.frame(), rect(20.0, 10.0, 160.0, 80.0));
         assert_eq!(&*base.magnificationFilter(), unsafe { kCAFilterLinear });
@@ -138,7 +142,13 @@ mod macos {
             w: W / 2,
             h: H,
         };
-        present(&mut compositor, layers(half, whole, false, None), vec![], 3);
+        present(
+            &mut compositor,
+            &mut screen,
+            layers(half, whole, false, None),
+            vec![],
+            3,
+        );
         assert!(drain(&mut compositor, 3, 0).is_empty());
         assert_eq!(base.contentsRect(), rect(0.0, 0.0, 0.5, 1.0));
         assert_eq!(contents(base), b_surface);
@@ -173,6 +183,7 @@ mod macos {
         assert!(compositor.caps().yuv_layers);
         present(
             &mut compositor,
+            &mut screen,
             layers(whole, whole, false, Some(inset)),
             vec![v],
             4,
@@ -187,6 +198,7 @@ mod macos {
         assert!(video.zPosition() > base.zPosition());
         present(
             &mut compositor,
+            &mut screen,
             layers(whole, whole, false, None),
             vec![],
             5,
@@ -196,10 +208,10 @@ mod macos {
             out.iter().map(|r| (r.serial, r.layer)).collect::<Vec<_>>(),
             [(4, LayerId::Video(7))]
         );
-        out.into_iter().for_each(|r| r.image.released(r.fence));
+        release(out, &mut screen);
         assert_eq!(sublayers(&root).len(), 1);
 
-        // Drop empties the tree on main and returns every image to its pool.
+        // Drop empties the tree on main; then every image returns to its pool.
         drop(compositor);
         let start = Instant::now();
         while !sublayers(&root).is_empty() {
@@ -209,6 +221,7 @@ mod macos {
             );
             CFRunLoop::run_in_mode(unsafe { kCFRunLoopDefaultMode }, 0.005, true);
         }
+        drop(screen);
         let mut held = vec![];
         let start = Instant::now();
         while held.len() < 3 {
@@ -267,15 +280,33 @@ mod macos {
 
     fn present(
         compositor: &mut LayerCompositor,
+        screen: &mut Vec<(u64, AcquiredImage)>,
         layers: Layers,
-        images: Vec<AcquiredImage>,
+        mut images: Vec<AcquiredImage>,
         serial: u64,
     ) {
         assert!(
             compositor
-                .present(&layers, &Tiles::default(), images, serial, Instant::now())
+                .present(
+                    &layers,
+                    &Tiles::default(),
+                    &mut images,
+                    serial,
+                    Instant::now()
+                )
                 .is_ok()
         );
+        screen.extend(images.into_iter().map(|i| (serial, i)));
+    }
+
+    fn release(released: Vec<Released>, screen: &mut Vec<(u64, AcquiredImage)>) {
+        for r in released {
+            let i = screen
+                .iter()
+                .position(|(serial, a)| *serial == r.serial && a.layer == r.layer)
+                .expect("released image is attached");
+            screen.swap_remove(i).1.image.released(r.fence);
+        }
     }
 
     /// Clears a pool buffer and submits it as a present.

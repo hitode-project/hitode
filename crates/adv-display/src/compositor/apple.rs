@@ -1,8 +1,8 @@
 //! Core Animation compositor (macOS, iOS, HOST-VIEW-11). Presentable
 //! IOSurfaces become layer contents in a commit that runs on the main thread
 //! the moment the GPU finishes their writes: the queue's main notifier calls
-//! it, so no thread polls or waits. A replaced surface returns to its pool once
-//! the replacing commit ran and Core Animation no longer uses it.
+//! it, so no thread polls or waits. A replaced surface is released once the
+//! replacing commit ran and Core Animation no longer uses it.
 
 use super::*;
 use crate::Rect;
@@ -30,10 +30,11 @@ pub struct LayerCompositor {
     /// never dropped off the main thread (which would sync to it).
     tree: ManuallyDrop<Arc<MainThreadBound<RefCell<Tree>>>>,
     shared: Arc<Mutex<Shared>>,
-    /// The image each layer shows, with the serial that brought it.
-    showing: Vec<(u64, AcquiredImage)>,
-    /// Replaced images: their serial and the serial whose commit replaced them.
-    retired: Vec<(u64, u64, AcquiredImage)>,
+    /// Each layer's image: the serial that brought it and its size.
+    showing: Vec<(u64, LayerId, (u32, u32))>,
+    /// Replaced images: their serial, the serial whose commit replaced them,
+    /// and their layer.
+    retired: Vec<(u64, u64, LayerId)>,
     /// The newest acquire token: every commit waits for it, so commits run in
     /// serial order even when a present brings no image.
     last: Token,
@@ -116,12 +117,6 @@ impl LayerCompositor {
 }
 
 impl Compositor for LayerCompositor {
-    fn image(&self, layer: LayerId) -> Option<&AcquiredImage> {
-        self.showing
-            .iter()
-            .find(|(_, i)| i.layer == layer)
-            .map(|(_, i)| i)
-    }
     fn set_waker(&mut self, wake: Wake) {
         self.shared.lock().unwrap().wake = Some(wake);
     }
@@ -143,7 +138,7 @@ impl Compositor for LayerCompositor {
             }),
         );
     }
-    fn detach(mut self: Box<Self>) -> Vec<AcquiredImage> {
+    fn detach(&mut self) -> Option<Fence> {
         let (send, done) = std::sync::mpsc::sync_channel(1);
         let tree = Arc::clone(&self.tree);
         self.notifier.on_complete(
@@ -157,7 +152,8 @@ impl Compositor for LayerCompositor {
         );
         done.recv().unwrap();
         self.retired.clear();
-        self.showing.drain(..).map(|(_, i)| i).collect()
+        self.showing.clear();
+        None
     }
 
     fn caps(&self) -> CompositorCaps {
@@ -168,12 +164,12 @@ impl Compositor for LayerCompositor {
         &mut self,
         layers: &Layers,
         _damage: &Tiles,
-        images: Vec<AcquiredImage>,
+        images: &mut [AcquiredImage],
         serial: u64,
         _at: Instant,
-    ) -> Result<(), PresentError> {
+    ) -> Result<(), Error> {
         let mut contents = Vec::with_capacity(images.len());
-        for image in images {
+        for image in images.iter() {
             let Export::IoSurface(surface, _) = image.image.export() else {
                 unreachable!("Apple presentable buffers are IOSurfaces")
             };
@@ -181,34 +177,32 @@ impl Compositor for LayerCompositor {
             let surface = unsafe { CFRetained::retain(surface.cast::<IOSurfaceRef>()) };
             contents.push((image.layer, Surface(surface)));
             self.last = self.last.max(image.acquire);
-            match self
-                .showing
-                .iter_mut()
-                .find(|(_, i)| i.layer == image.layer)
-            {
+            let size = image.image.image().desc().size;
+            let shown = (serial, image.layer, (size.width, size.height));
+            match self.showing.iter_mut().find(|(_, l, _)| *l == image.layer) {
                 Some(old) => {
-                    let (shown, old) = std::mem::replace(old, (serial, image));
-                    self.retired.push((shown, serial, old));
+                    let (since, layer, _) = std::mem::replace(old, shown);
+                    self.retired.push((since, serial, layer));
                 }
-                None => self.showing.push((serial, image)),
+                None => self.showing.push(shown),
             }
         }
         // A video that left the frame retires with its layer.
-        let gone = self.showing.extract_if(.., |(_, image)| {
-            matches!(image.layer, LayerId::Video(v) if !layers.video.iter().any(|(id, _)| *id == v))
+        let gone = self.showing.extract_if(.., |(_, layer, _)| {
+            matches!(layer, LayerId::Video(v) if !layers.video.iter().any(|(id, _)| id == v))
         });
         self.retired
-            .extend(gone.map(|(shown, image)| (shown, serial, image)));
+            .extend(gone.map(|(since, layer, _)| (since, serial, layer)));
         let size = |id: LayerId| {
             self.showing
                 .iter()
-                .find(|(_, image)| image.layer == id)
-                .map(|(_, image)| image.image.image().desc().size)
+                .find(|(_, layer, _)| *layer == id)
+                .map(|(_, _, size)| *size)
         };
         let mut placements = Vec::new();
         let mut place = |id: LayerId, layer: &Layer, z: f64| {
-            if let Some(size) = size(id) {
-                let (w, h) = (f64::from(size.width), f64::from(size.height));
+            if let Some((w, h)) = size(id) {
+                let (w, h) = (f64::from(w), f64::from(h));
                 let c = layer.crop;
                 placements.push(Placement {
                     id,
@@ -279,39 +273,34 @@ impl Compositor for LayerCompositor {
         Ok(())
     }
 
-    fn drain(&mut self, presented: &mut Vec<Presented>, released: &mut Vec<ReleasedImage>) {
+    fn drain(&mut self, presented: &mut Vec<Presented>, released: &mut Vec<Released>) {
         let committed = {
             let mut shared = self.shared.lock().unwrap();
             presented.append(&mut shared.presented);
             shared.committed
         };
         let done = self.retired.extract_if(.., |(_, by, _)| *by <= committed);
-        released.extend(done.map(|(serial, _, image)| ReleasedImage {
+        released.extend(done.map(|(serial, _, layer)| Released {
             serial,
-            layer: image.layer,
-            image: image.image,
+            layer,
             fence: None,
         }));
     }
 }
 
 impl Drop for LayerCompositor {
-    /// Empties the layers on the main thread after the last commit, then
-    /// returns every image to its pool once Core Animation lets go of it.
-    /// Nothing here waits, so a main thread that tears the window down while
-    /// this thread drops cannot deadlock.
+    /// Empties the layers on the main thread after the last commit. Nothing
+    /// here waits, so a main thread that tears the window down while this
+    /// thread drops cannot deadlock. Core Animation retains the surfaces it
+    /// still shows.
     fn drop(&mut self) {
         // SAFETY: `tree` is not used after this.
         let tree = unsafe { ManuallyDrop::take(&mut self.tree) };
-        let mut images: Vec<_> = self.showing.drain(..).map(|(_, image)| image).collect();
-        images.extend(self.retired.drain(..).map(|(_, _, image)| image));
         self.notifier.on_complete(
             self.last,
             Box::new(move || {
                 let mtm = MainThreadMarker::new().expect("main notifier off the main thread");
-                tree.get(mtm)
-                    .borrow_mut()
-                    .clear(Box::new(move || drop(images)));
+                tree.get(mtm).borrow_mut().clear(Box::new(|| {}));
             }),
         );
     }
