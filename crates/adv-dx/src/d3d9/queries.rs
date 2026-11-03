@@ -226,13 +226,11 @@ fn get_data(
             }
         }
         // Submit the backend's pending batches without a completion wait.
-        let Some(gpu) = env.ext.get::<State>().gpu.as_ref() else {
+        let Some(gpu) = env.ext.get_mut::<State>().gpu.as_mut() else {
             return UNAVAILABLE;
         };
-        match gpu.context().submission() {
-            Ok(lease) => {
-                lease.submit([]);
-            }
+        match gpu.flush() {
+            Ok(()) => {}
             Err(Error::Busy) => return 1,
             Err(_) => return DEVICE_LOST,
         }

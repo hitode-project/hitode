@@ -21,13 +21,14 @@
 //!   or store an attachment only when its contents are read before or after.
 //! - Uploads carry guest bytes unconverted; formats the GPU stores natively
 //!   need no CPU pass, and X8 formats are sampled with alpha forced to one.
-//! - Depth buffers that every pass clears first and none reads afterwards are
-//!   transient attachments (memoryless on Apple, lazily allocated on Vulkan).
+//! - Depth buffers that no pass stores are transient attachments (memoryless
+//!   on Apple, lazily allocated on Vulkan); the owner thread decides per
+//!   frame ([`backing`]).
 //! - Recording allocates nothing after warm-up: command chunks and their ring
 //!   spans are reused.
 //! - Swap buffers are presentable buffers whenever the display plan shows
 //!   them by reference, so a frame reaches the system compositor without a
-//!   copy; the owner thread picks each frame's buffer ([`swap`]).
+//!   copy; the owner thread picks each frame's buffer ([`backing`]).
 //!
 //! # Ownership of the files
 //!
@@ -38,20 +39,20 @@
 //! | `pipelines.rs` | C1 | fixed-function, programmable and blit pipelines; the disk cache |
 //! | `record.rs` | C2 | clears, draws, blits, copies, presents and readbacks as commands |
 //! | `owner.rs` | C2 | the owner thread: passes, encoding, submission, frames |
-//! | `swap.rs` | C2 | swap buffers: private or presentable, age repair |
+//! | `backing.rs` | C2 | swap and depth buffers: private, presentable or transient memory |
 //! | `surface.rs` native surfaces | C2 | present through [`Gpu::present`]; the rotation pool and `NativeFrame` publication of the wgpu renderer are compiled out under this feature |
 //! | `frame.rs`, software and video slots | E | frames, video planes and their presentation layers |
 //!
 //! Under this feature `gpu/clear.rs` and the wgpu `Depth` are compiled out too;
 //! package G deletes them with the renderer.
 
+mod backing;
 mod owner;
 pub(crate) mod pass;
 mod pipelines;
 mod record;
 mod resources;
 pub(crate) mod stream;
-mod swap;
 
 pub use record::Readback;
 pub use resources::{Depth, Image, ImageId, Staged, Target};

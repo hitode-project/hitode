@@ -63,7 +63,7 @@ pub(crate) enum Command {
     /// Following clears and draws render to these attachments.
     Target {
         color: Image,
-        depth: Option<adv_gpu::Image>,
+        depth: Option<super::Depth>,
     },
     Clear {
         area: Rect,
@@ -90,7 +90,7 @@ pub(crate) enum Command {
     },
     /// The executor's depth buffer is undefined from here
     /// (D3D9 `DISCARD_DEPTHSTENCIL`).
-    DiscardDepth(adv_gpu::Image),
+    DiscardDepth(super::Depth),
     /// Copy `rect` of `image` into `into` and submit; `done` runs when the
     /// bytes are readable.
     Readback {

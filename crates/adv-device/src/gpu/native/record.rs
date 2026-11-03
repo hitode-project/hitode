@@ -104,7 +104,7 @@ impl Gpu {
         todo!("C2")
     }
     /// Submit what is recorded without ending the frame (D3D9 query flushes).
-    pub fn flush(&mut self) {
+    pub fn flush(&mut self) -> Result<(), Error> {
         todo!("C2")
     }
     pub fn readback(

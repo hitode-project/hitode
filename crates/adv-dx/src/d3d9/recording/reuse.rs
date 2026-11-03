@@ -171,7 +171,7 @@ fn signature(
                 (env.ext.get::<State>().provider.target)(env.ext, r.surface.ok_or(INVALID)?)
                     .ok_or(INVALID)?
                     .image;
-            (r.lod, image.view(), image.alpha_mode() as u8).hash(&mut h);
+            (r.lod, image.id(), image.alpha_mode() as u8).hash(&mut h);
         }
     }
     // Local sampling proofs depend on which producers precede this draw.

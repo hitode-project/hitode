@@ -372,7 +372,7 @@ impl Analysis {
         slot: Option<u128>,
     ) -> Arc<Record> {
         let image = image(&p.operation).unwrap();
-        let slot = slot.unwrap_or_else(|| hash(image.view()));
+        let slot = slot.unwrap_or_else(|| hash(image.id()));
         let mut record = Record {
             writes: Vec::new(),
             reads: p.reads.clone(),

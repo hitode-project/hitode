@@ -38,7 +38,7 @@ pub use renderer::Submission;
 #[cfg(not(feature = "native-display"))]
 pub use renderer::validate_program;
 #[cfg(not(feature = "native-display"))]
-pub use renderer::{Gpu, Image, NativeContext, NativeFrame, Readback, Staged, Target};
+pub use renderer::{Gpu, Image, ImageId, NativeContext, NativeFrame, Readback, Staged, Target};
 pub use submission::SubmissionPause;
 pub use vertex_bytes::VertexBytes;
 #[derive(Clone, Copy, Debug)]

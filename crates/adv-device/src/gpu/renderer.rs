@@ -257,6 +257,12 @@ pub struct Image {
     frame_pins: Arc<AtomicUsize>,
     gate: Arc<submission::Gate>,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ImageId {
+    allocation: (u64, u64),
+    mips: (u32, u32),
+}
+
 impl Image {
     pub fn width(&self) -> u32 {
         self.width
@@ -300,6 +306,13 @@ impl Image {
     }
     pub fn shares_storage(&self, other: &Self) -> bool {
         self.context == other.context && self.id == other.id
+    }
+    /// Identity of the view: equal for clones, distinct per mip level.
+    pub fn id(&self) -> ImageId {
+        ImageId {
+            allocation: (self.context, self.id),
+            mips: (self.mip, self.levels),
+        }
     }
     pub(crate) fn reusable(&self) -> bool {
         Arc::strong_count(self.lease.as_ref().unwrap()) == 1
@@ -873,6 +886,17 @@ impl Gpu {
 
     pub fn check(&self) -> Result<(), Error> {
         self.context.check()
+    }
+
+    /// The largest image side the device supports.
+    pub fn max_image_size(&self) -> u32 {
+        self.context.device.limits().max_texture_dimension_2d
+    }
+
+    /// Submit the backend's pending batches without a completion wait.
+    pub fn flush(&mut self) -> Result<(), Error> {
+        self.context.submission()?.submit([]);
+        Ok(())
     }
 
     /// Nonblocking completion maintenance, for the shell/machine driver.

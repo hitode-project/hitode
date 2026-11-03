@@ -301,7 +301,7 @@ fn d3d9_reuse_rebases_onto_a_rotated_back_buffer_image() {
     f.okay("IDirect3DDevice9::EndScene", &[f.device]);
     present(&mut f);
     let new = f.image(f.back);
-    assert_ne!(new.view(), old.view());
+    assert_ne!(new.id(), old.id());
     assert_eq!(f.pixels(&new), expected);
     // Retained entries must not pin the rotated-out image, or presentation
     // can never reuse it.

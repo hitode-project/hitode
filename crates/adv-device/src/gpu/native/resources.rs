@@ -25,7 +25,7 @@ pub(super) enum Storage {
         level: Option<u32>,
     },
     /// A swap buffer: the owner thread picks its allocation for each frame.
-    Swap(std::sync::Arc<super::swap::Swap>),
+    Swap(std::sync::Arc<super::backing::Swap>),
 }
 
 impl Image {
@@ -76,21 +76,19 @@ pub struct ImageId {
     level: Option<u32>,
 }
 
+/// A depth-stencil buffer; the owner thread backs it ([`super::backing`]).
 #[derive(Clone)]
-pub struct Depth {
-    pub(super) image: adv_gpu::Image,
-    pub(super) format: DepthFormat,
-}
+pub struct Depth(pub(super) std::sync::Arc<super::backing::DepthBuffer>);
 
 impl Depth {
     pub fn width(&self) -> u32 {
-        self.image.desc().size.width
+        self.0.size.0
     }
     pub fn height(&self) -> u32 {
-        self.image.desc().size.height
+        self.0.size.1
     }
     pub fn format(&self) -> DepthFormat {
-        self.format
+        self.0.format
     }
 }
 
@@ -149,8 +147,7 @@ impl Gpu {
         let _ = (width, height, depth);
         todo!("C1")
     }
-    /// The largest image side the guest may create (`D3DCAPS9` texture
-    /// limits): the device limit, at most 4096.
+    /// The largest image side the device supports.
     pub fn max_image_size(&self) -> u32 {
         todo!("C1")
     }
@@ -163,7 +160,7 @@ impl Gpu {
         depth: bool,
     ) -> Result<Target, Error> {
         let _ = (width, height, depth);
-        todo!("C1")
+        todo!("C2")
     }
     pub fn target_levels(&self, width: u32, height: u32, levels: u32) -> Result<Target, Error> {
         let _ = (width, height, levels);
@@ -171,7 +168,7 @@ impl Gpu {
     }
     pub fn depth(&self, width: u32, height: u32, format: DepthFormat) -> Result<Depth, Error> {
         let _ = (width, height, format);
-        todo!("C1")
+        todo!("C2")
     }
     /// Write `height` rows through `fill` straight into the upload ring.
     pub fn stage<E>(
