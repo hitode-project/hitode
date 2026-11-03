@@ -1,14 +1,16 @@
-//! Pure presentation planning, pool bookkeeping and compositor ownership.
+//! Presentation planning, stage encoding, pool bookkeeping and compositor ownership.
 //!
 //! [`plan::plan`] consumes serializable geometry, damage, capabilities and pool
 //! state. Executors run its stages and call [`plan::PoolState::after_present`]
-//! only after submitting the complete frame. No GPU work runs in this crate.
+//! only after submitting the complete frame. [`stages`] records GPU commands;
+//! the owner thread submits them.
 //! [`compositor`] transfers presentable images to the system compositor and
 //! returns ownership on release. [`recorder`] stores and replays planner data.
 
 pub mod compositor;
 pub mod plan;
 pub mod recorder;
+pub mod stages;
 
 /// A rectangle in physical pixels or texels, with its origin at the top left.
 /// Display owns this serializable geometry; GPU rectangles remain GPU data.

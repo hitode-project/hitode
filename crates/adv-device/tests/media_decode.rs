@@ -148,12 +148,12 @@ fn synthetic_movie_decodes_video_pcm_seek_and_real_eof() {
         if let Some(video) = update.video {
             first_video_pts.get_or_insert(video.pts_us);
             assert_eq!(
-                (video.width, video.height, video.bgra.len()),
+                (video.width, video.height, video.bgra().len()),
                 (16, 16, 1024)
             );
             assert!(
                 video
-                    .bgra
+                    .bgra()
                     .as_chunks::<4>()
                     .0
                     .iter()
@@ -197,7 +197,7 @@ fn asf_rewind_restarts_at_the_first_packet() {
         for time in (0..=1_200_000).step_by(50_000) {
             let update = decoder.frame_at(time).unwrap();
             if let Some(video) = update.video {
-                frames.push((video.pts_us, video.bgra));
+                frames.push((video.pts_us, video.bgra().into_owned()));
             }
             if update.ended {
                 break;

@@ -11,7 +11,7 @@ mod android {
     use adv_gpu::{
         Device, Format, FormatCaps, PresentPool, Queue,
         encode::{ColorAttachment, Load, RenderPassDesc, Store},
-        present::PoolDesc,
+        present::{PoolDesc, YuvColor},
         queue::DeviceOptions,
     };
     use std::{
@@ -94,12 +94,18 @@ mod android {
             _ => panic!("probe rotation must be 0, 90, 180 or 270"),
         }
     }
+    fn yuv_mode() -> bool {
+        let mut value = [0; 92];
+        let len =
+            unsafe { __system_property_get(c"debug.adv.probe.yuv".as_ptr(), value.as_mut_ptr()) };
+        len == 1 && value[0] == b'1' as c_char
+    }
     fn caps(device: &Device) -> CompositorCaps {
         CompositorCaps {
             scales: true,
             nearest: false,
             rotates: true,
-            yuv_layers: false,
+            yuv_layers: true,
             solid_color_layers: true,
             damage_hints: true,
             presentable_compressed: device
@@ -112,6 +118,7 @@ mod android {
     fn pool(device: &Device, bounds: Rect) -> PresentPool {
         device
             .create_present_pool(&PoolDesc {
+                color: None,
                 width: bounds.w,
                 height: bounds.h,
                 format: Format::Rgba8Unorm,
@@ -156,10 +163,13 @@ mod android {
         device: Device,
         queue: Queue,
         pool: PresentPool,
+        yuv: Option<PresentPool>,
     }
     #[derive(Default)]
     struct Probe {
         activity: *mut Activity,
+        yuv_mode: bool,
+        attach_base: bool,
         compositor: Option<SurfaceCompositor>,
         gpu: Option<Gpu>,
         bounds: Rect,
@@ -262,6 +272,82 @@ mod android {
             self.metrics.cpu.push(cpu);
             log(format!("serial={serial} present_cpu_ns={cpu}"));
         }
+        fn frame_yuv(&mut self, frame_time: i64) {
+            let gpu = self.gpu.as_mut().unwrap();
+            let Some(mut image) = gpu.yuv.as_mut().unwrap().acquire_cpu() else {
+                return;
+            };
+            let phase = self.frame;
+            image.write(|planes| {
+                for y in 0..360 {
+                    for x in 0..640 {
+                        planes[0].data[y * planes[0].stride + x] =
+                            (16 + ((x + y + phase * 3) % 220)) as u8;
+                    }
+                }
+                for y in 0..180 {
+                    for x in 0..320 {
+                        let at = y * planes[1].stride + x * 2;
+                        planes[1].data[at] = (64 + (x + phase) % 128) as u8;
+                        planes[1].data[at + 1] = (64 + (y + phase) % 128) as u8;
+                    }
+                }
+            });
+            assert!(image.acquire_fence().is_none());
+            let mut images = vec![AcquiredImage {
+                layer: LayerId::Video(1),
+                image,
+                acquire: adv_gpu::Token(0),
+            }];
+            if self.attach_base {
+                self.attach_base = false;
+                let mut base = gpu.pool.acquire(&mut gpu.queue).unwrap().unwrap();
+                let mut encoder = gpu.queue.encoder("YUV background");
+                drop(
+                    encoder.render_pass(&RenderPassDesc {
+                        colors: [ColorAttachment {
+                            view: base.image().view(),
+                            load: Load::Clear([0.0, 0.0, 0.0, 1.0]),
+                            store: Store::Store,
+                            resolve: None,
+                        }]
+                        .into_iter()
+                        .collect(),
+                        depth_stencil: None,
+                        area: self.bounds.into(),
+                        timestamps: None,
+                        label: "YUV background",
+                    }),
+                );
+                let acquire = gpu.queue.submit_present(encoder, &mut [&mut base]).unwrap();
+                images.push(AcquiredImage {
+                    layer: LayerId::Base,
+                    image: base,
+                    acquire,
+                });
+            }
+            let now = Instant::now();
+            let offset = frame_time + 16_666_667 - clock(libc::CLOCK_MONOTONIC);
+            let desired = if offset >= 0 {
+                now + Duration::from_nanos(offset as u64)
+            } else {
+                now - Duration::from_nanos((-offset) as u64)
+            };
+            self.desired.push(desired);
+            self.latched.push(None);
+            self.frame += 1;
+            self.compositor
+                .as_mut()
+                .unwrap()
+                .present(
+                    self.layers.as_ref().unwrap(),
+                    &Tiles::default(),
+                    images,
+                    self.frame as u64,
+                    desired,
+                )
+                .unwrap_or_else(|_| panic!("YUV present"));
+        }
         fn frame(&mut self, frame_time: i64) {
             self.drain();
             let gpu = self.gpu.as_mut().unwrap();
@@ -273,6 +359,11 @@ mod android {
                 }
                 return;
             }
+            if self.yuv_mode {
+                self.frame_yuv(frame_time);
+                return;
+            }
+            let gpu = self.gpu.as_mut().unwrap();
             let Some(image) = gpu.pool.acquire(&mut gpu.queue).expect("acquire buffer") else {
                 return;
             };
@@ -400,10 +491,23 @@ mod android {
                 _ => bounds,
             };
             let pool = pool(&device, probe.bounds);
+            let yuv = probe.yuv_mode.then(|| {
+                device
+                    .create_present_pool(&PoolDesc {
+                        width: 640,
+                        height: 360,
+                        format: Format::Nv12,
+                        count: 4,
+                        color: Some(YuvColor::Bt601Limited),
+                        label: "YUV gradient",
+                    })
+                    .unwrap()
+            });
             probe.gpu = Some(Gpu {
                 device,
                 queue,
                 pool,
+                yuv,
             });
         }
         probe.layers = Some(Layers {
@@ -419,11 +523,30 @@ mod android {
             host: Default::default(),
             background: [0.0; 3],
         });
+        probe.attach_base = true;
+        if probe.yuv_mode {
+            probe.layers.as_mut().unwrap().video.push((
+                1,
+                Layer {
+                    source: Source::Video(1),
+                    crop: Rect {
+                        x: 0,
+                        y: 0,
+                        w: 640,
+                        h: 360,
+                    },
+                    dst: bounds,
+                    rotation: rotation(),
+                    nearest: false,
+                    damage: Damage::Whole,
+                },
+            ));
+        }
         probe.compositor = Some(
             unsafe { SurfaceCompositor::new(window, caps(&probe.gpu.as_ref().unwrap().device)) }
                 .unwrap_or_else(|_| panic!("SurfaceControl")),
         );
-        if reattach {
+        if reattach && !probe.yuv_mode {
             let gpu = probe.gpu.as_mut().unwrap();
             let image = gpu
                 .pool
@@ -457,6 +580,7 @@ mod android {
     ) {
         let probe = Probe {
             activity,
+            yuv_mode: yuv_mode(),
             desired: Vec::with_capacity(600),
             latched: Vec::with_capacity(600),
             buffers: Vec::with_capacity(3),

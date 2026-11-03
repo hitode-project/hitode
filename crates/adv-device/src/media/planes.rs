@@ -1,0 +1,457 @@
+//! Decoder output is copied once into four reusable NV12 presentable buffers.
+
+use super::{Error, VideoFrame};
+use adv_gpu::{
+    Device, Format, PresentPool,
+    present::{PlaneMut, PoolDesc, YuvColor},
+    queue::DeviceOptions,
+};
+use ffmpeg_next::{self as ff, format::Pixel, frame, software};
+use std::sync::Arc;
+
+pub(super) struct Output {
+    pool: PresentPool,
+    pictures: [Arc<crate::frame::DecodedPicture>; 4],
+    scaler: Option<software::scaling::Context>,
+    width: u32,
+    height: u32,
+}
+
+fn gpu_error(error: adv_gpu::Error) -> Error {
+    Error::Decode(error.to_string())
+}
+
+pub(super) fn color(space: ff::color::Space, range: ff::color::Range) -> YuvColor {
+    match (
+        space == ff::color::Space::BT709,
+        range == ff::color::Range::JPEG,
+    ) {
+        (false, false) => YuvColor::Bt601Limited,
+        (false, true) => YuvColor::Bt601Full,
+        (true, false) => YuvColor::Bt709Limited,
+        (true, true) => YuvColor::Bt709Full,
+    }
+}
+
+impl Output {
+    pub(super) fn new(decoder: &ff::decoder::Video) -> Result<Self, Error> {
+        let (width, height) = (decoder.width(), decoder.height());
+        let color = color(decoder.color_space(), decoder.color_range());
+        let (device, _queue) = Device::open(&DeviceOptions::default()).map_err(gpu_error)?;
+        let mut pool = device
+            .create_present_pool(&PoolDesc {
+                width,
+                height,
+                format: Format::Nv12,
+                count: 4,
+                color: Some(color),
+                label: "decoded video",
+            })
+            .map_err(gpu_error)?;
+        // Allocate at open. Every later acquire only leases an existing buffer.
+        let buffers: [_; 4] = std::array::from_fn(|_| pool.acquire_cpu().unwrap());
+        let pictures = std::array::from_fn(|i| {
+            Arc::new(crate::frame::DecodedPicture::new(
+                buffers[i].image().clone(),
+                color,
+            ))
+        });
+        drop(buffers);
+        let mut scaler = (!matches!(
+            decoder.format(),
+            Pixel::YUV420P | Pixel::YUVJ420P | Pixel::NV12
+        ))
+        .then(|| {
+            software::scaling::Context::get(
+                decoder.format(),
+                width,
+                height,
+                Pixel::NV12,
+                width,
+                height,
+                software::scaling::Flags::BILINEAR,
+            )
+        })
+        .transpose()?;
+        if let Some(scaler) = &mut scaler {
+            configure(
+                scaler,
+                color,
+                matches!(color, YuvColor::Bt601Full | YuvColor::Bt709Full),
+            );
+        }
+        Ok(Self {
+            pool,
+            pictures,
+            scaler,
+            width,
+            height,
+        })
+    }
+
+    pub(super) fn convert(
+        &mut self,
+        pts_us: u64,
+        decoded: &mut frame::Video,
+    ) -> Result<VideoFrame, Error> {
+        debug_assert_eq!(
+            (decoded.width(), decoded.height()),
+            (self.width, self.height)
+        );
+        for picture in &mut self.pictures {
+            if let Some(picture) = Arc::get_mut(picture) {
+                picture.release_unshown();
+            }
+        }
+        let mut image = self
+            .pool
+            .acquire_cpu()
+            .ok_or_else(|| Error::Decode("video pool exhausted".into()))?;
+        let picture = self
+            .pictures
+            .iter_mut()
+            .find(|p| p.image().id() == image.image().id())
+            .unwrap();
+        let picture_mut = Arc::get_mut(picture).expect("released picture is still referenced");
+        image.write(|planes| {
+            if let Some(scaler) = &mut self.scaler {
+                let input = unsafe { &*decoded.as_ptr() };
+                let mut output = [
+                    planes[0].data.as_mut_ptr(),
+                    planes[1].data.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                ];
+                let strides = [planes[0].stride as i32, planes[1].stride as i32, 0, 0];
+                // The decoder's dimensions and the pool's platform mapping bound every row.
+                assert_eq!(
+                    unsafe {
+                        ff::ffi::sws_scale(
+                            scaler.as_mut_ptr(),
+                            input.data.as_ptr().cast(),
+                            input.linesize.as_ptr(),
+                            0,
+                            self.height as i32,
+                            output.as_mut_ptr(),
+                            strides.as_ptr(),
+                        )
+                    },
+                    self.height as i32
+                );
+            } else {
+                copy(decoded, planes);
+            }
+        });
+        picture_mut.set_image(image, decoded);
+        Ok(VideoFrame {
+            pts_us,
+            width: self.width,
+            height: self.height,
+            picture: picture.clone(),
+        })
+    }
+}
+
+fn copy(source: &frame::Video, planes: &mut [PlaneMut<'_>]) {
+    let width = source.width() as usize;
+    let height = source.height() as usize;
+    for y in 0..height {
+        let start = y * planes[0].stride;
+        planes[0].data[start..start + width]
+            .copy_from_slice(&source.data(0)[y * source.stride(0)..][..width]);
+    }
+    let chroma = width.div_ceil(2);
+    for y in 0..height.div_ceil(2) {
+        let start = y * planes[1].stride;
+        let dst = &mut planes[1].data[start..start + chroma * 2];
+        if source.format() == Pixel::NV12 {
+            dst.copy_from_slice(&source.data(1)[y * source.stride(1)..][..chroma * 2]);
+        } else {
+            interleave(
+                &source.data(1)[y * source.stride(1)..][..chroma],
+                &source.data(2)[y * source.stride(2)..][..chroma],
+                dst,
+            );
+        }
+    }
+}
+
+fn scalar(u: &[u8], v: &[u8], dst: &mut [u8]) {
+    for ((u, v), pair) in u.iter().zip(v).zip(dst.as_chunks_mut::<2>().0.iter_mut()) {
+        pair.copy_from_slice(&[*u, *v]);
+    }
+}
+
+fn interleave(u: &[u8], v: &[u8], dst: &mut [u8]) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        use std::arch::aarch64::*;
+        let end = u.len() / 16 * 16;
+        for x in (0..end).step_by(16) {
+            // SAFETY: AArch64 always has NEON. These loads and stores stay in the row.
+            unsafe {
+                vst2q_u8(
+                    dst.as_mut_ptr().add(x * 2),
+                    uint8x16x2_t(vld1q_u8(u.as_ptr().add(x)), vld1q_u8(v.as_ptr().add(x))),
+                );
+            }
+        }
+        scalar(&u[end..], &v[end..], &mut dst[end * 2..]);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    scalar(u, v, dst);
+}
+
+fn configure(scaler: &mut software::scaling::Context, color: YuvColor, destination_full: bool) {
+    let full = matches!(color, YuvColor::Bt601Full | YuvColor::Bt709Full);
+    let matrix = match color {
+        YuvColor::Bt601Limited | YuvColor::Bt601Full => ff::ffi::SWS_CS_ITU601,
+        YuvColor::Bt709Limited | YuvColor::Bt709Full => ff::ffi::SWS_CS_ITU709,
+    };
+    unsafe {
+        let coefficients = ff::ffi::sws_getCoefficients(matrix);
+        assert_eq!(
+            ff::ffi::sws_setColorspaceDetails(
+                scaler.as_mut_ptr(),
+                coefficients,
+                i32::from(full),
+                coefficients,
+                i32::from(destination_full),
+                0,
+                1 << 16,
+                1 << 16
+            ),
+            0
+        );
+    }
+}
+
+/// The single guest-pixel conversion. swscale reads the retained decoder
+/// planes directly; no BGRA exists on the display path.
+pub(crate) fn bgra(source: &frame::Video, color: YuvColor) -> Vec<u8> {
+    let (width, height) = (source.width(), source.height());
+    let mut scaler = software::scaling::Context::get(
+        source.format(),
+        width,
+        height,
+        Pixel::BGRA,
+        width,
+        height,
+        software::scaling::Flags::BILINEAR,
+    )
+    .expect("guest BGRA scaler");
+    configure(&mut scaler, color, true);
+    let mut out = vec![0; width as usize * height as usize * 4];
+    unsafe {
+        let src = &*source.as_ptr();
+        let mut dst = [
+            out.as_mut_ptr(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        ];
+        let strides = [width as i32 * 4, 0, 0, 0];
+        assert_eq!(
+            ff::ffi::sws_scale(
+                scaler.as_mut_ptr(),
+                src.data.as_ptr().cast(),
+                src.linesize.as_ptr(),
+                0,
+                height as i32,
+                dst.as_mut_ptr(),
+                strides.as_ptr()
+            ),
+            height as i32
+        );
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    // spec: MEDIA-VIDEO-7
+    fn chroma_interleave_odd_widths_and_strides() {
+        for width in [1usize, 3, 17, 31, 33, 65] {
+            let n = width.div_ceil(2);
+            for padding in [0, 1, 15] {
+                let stride = n + padding;
+                let output_stride = n * 2 + padding;
+                let u: Vec<_> = (0..stride * 3).map(|x| (x * 7) as u8).collect();
+                let v: Vec<_> = (0..stride * 3).map(|x| (x * 11 + 1) as u8).collect();
+                let mut expected = vec![0xcd; output_stride * 3];
+                let mut actual = expected.clone();
+                for y in 0..3 {
+                    scalar(
+                        &u[y * stride..][..n],
+                        &v[y * stride..][..n],
+                        &mut expected[y * output_stride..][..n * 2],
+                    );
+                    interleave(
+                        &u[y * stride..][..n],
+                        &v[y * stride..][..n],
+                        &mut actual[y * output_stride..][..n * 2],
+                    );
+                }
+                assert_eq!(actual, expected, "width {width}, padding {padding}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod conversion_tests {
+    use super::*;
+    #[test]
+    // spec: MEDIA-VIDEO-7
+    fn guest_bgra_matches_swscale_for_both_matrices_and_ranges() {
+        for color in [
+            YuvColor::Bt601Limited,
+            YuvColor::Bt601Full,
+            YuvColor::Bt709Limited,
+            YuvColor::Bt709Full,
+        ] {
+            let mut source = frame::Video::new(Pixel::YUV420P, 18, 10);
+            for plane in 0..3 {
+                let (w, h) = if plane == 0 { (18, 10) } else { (9, 5) };
+                let stride = source.stride(plane);
+                for y in 0..h {
+                    for x in 0..w {
+                        source.data_mut(plane)[y * stride + x] =
+                            (35 + (x * 13 + y * 9 + plane * 41) % 190) as u8;
+                    }
+                }
+            }
+            let actual = bgra(&source, color);
+            let mut reference = software::scaling::Context::get(
+                Pixel::YUV420P,
+                18,
+                10,
+                Pixel::BGRA,
+                18,
+                10,
+                software::scaling::Flags::BILINEAR,
+            )
+            .unwrap();
+            unsafe {
+                let coefficients = ff::ffi::sws_getCoefficients(
+                    if matches!(color, YuvColor::Bt709Limited | YuvColor::Bt709Full) {
+                        ff::ffi::SWS_CS_ITU709
+                    } else {
+                        ff::ffi::SWS_CS_ITU601
+                    },
+                );
+                assert_eq!(
+                    ff::ffi::sws_setColorspaceDetails(
+                        reference.as_mut_ptr(),
+                        coefficients,
+                        i32::from(matches!(color, YuvColor::Bt601Full | YuvColor::Bt709Full)),
+                        coefficients,
+                        1,
+                        0,
+                        65536,
+                        65536
+                    ),
+                    0
+                );
+            }
+            let mut result = frame::Video::empty();
+            reference.run(&source, &mut result).unwrap();
+            for row in 0..10 {
+                assert_eq!(
+                    &actual[row * 72..][..72],
+                    &result.data(0)[row * result.stride(0)..][..72],
+                    "{color:?} row {row}"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(all(test, target_vendor = "apple"))]
+mod ownership_tests {
+    use crate::frame::{VideoGeometry, VideoPlane, VideoUpdate};
+    #[test]
+    // spec: MEDIA-VIDEO-7
+    fn decoded_pictures_reuse_four_buffers_and_transfer_once() {
+        let mut decoder = crate::media::Decoder::open_memory(
+            include_bytes!("../../../adv-dx/src/dshow/graph/render/fixtures/guest_movie.mpg")
+                .to_vec(),
+        )
+        .unwrap();
+        let mut ids = std::collections::HashSet::new();
+        for time in (0..1_000_000).step_by(40_000) {
+            let Some(frame) = decoder.frame_at(time).unwrap().video else {
+                continue;
+            };
+            ids.insert(frame.picture.image().id());
+            let plane = VideoPlane {
+                id: 7,
+                picture: frame.picture.clone(),
+                geometry: VideoGeometry {
+                    source: (frame.width, frame.height),
+                    destination: adv_gpu::Rect {
+                        x: 0,
+                        y: 0,
+                        w: frame.width,
+                        h: frame.height,
+                    },
+                    source_uv: [0.0, 0.0, 1.0, 1.0],
+                    background: None,
+                    clip: adv_gpu::Rect {
+                        x: 0,
+                        y: 0,
+                        w: frame.width,
+                        h: frame.height,
+                    },
+                    hide_cursor: false,
+                },
+            };
+            let VideoUpdate::Changed(image) = plane.take_picture() else {
+                panic!("first handoff");
+            };
+            assert!(matches!(plane.take_picture(), VideoUpdate::Retained));
+            assert!(matches!(plane.take_picture(), VideoUpdate::Retained));
+            image.released(None);
+        }
+        assert!(!ids.is_empty());
+        assert!(ids.len() <= 4);
+    }
+}
+
+#[cfg(all(test, target_vendor = "apple"))]
+mod packet_tests {
+    use crate::media::{CodecFormat, Decoded, PacketDecoder, demux};
+    #[test]
+    // spec: MEDIA-VIDEO-7
+    fn packet_video_decodes_into_reusable_planes() {
+        let input = demux(include_bytes!("packets/ramp.wmv").to_vec()).unwrap();
+        let stream = input
+            .streams
+            .iter()
+            .find(|s| matches!(s.format, CodecFormat::Video { .. }))
+            .unwrap();
+        let mut decoder = PacketDecoder::open(&stream.format).unwrap();
+        let mut count = 0;
+        for packet in &stream.packets {
+            for decoded in decoder
+                .decode(&packet.data, Some(packet.time_100ns))
+                .unwrap()
+            {
+                let Decoded::Video(frame) = decoded else {
+                    panic!("video stream");
+                };
+                assert_eq!((frame.width, frame.height), (64, 48));
+                assert_eq!(frame.picture.image().desc().format, adv_gpu::Format::Nv12);
+                assert_eq!(frame.bgra().len(), 64 * 48 * 4);
+                count += 1;
+            }
+        }
+        for decoded in decoder.drain().unwrap() {
+            assert!(matches!(decoded, Decoded::Video(_)));
+            count += 1;
+        }
+        assert_eq!(count, 10);
+    }
+}

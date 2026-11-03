@@ -80,10 +80,11 @@ impl LayerCompositor {
         root: Retained<CALayer>,
         scale: f64,
         notifier: MainNotifier,
-        caps: CompositorCaps,
+        mut caps: CompositorCaps,
         mtm: MainThreadMarker,
     ) -> Self {
         root.setOpaque(true);
+        caps.yuv_layers = true;
         Self {
             caps,
             notifier,

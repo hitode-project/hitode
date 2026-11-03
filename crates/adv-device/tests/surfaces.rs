@@ -62,6 +62,8 @@ fn store() -> Surfaces<Snapshot> {
 fn video_layer() -> VideoLayer {
     VideoLayer {
         frame: VideoFrame {
+            #[cfg(feature = "native-display")]
+            picture: None,
             width: 2,
             height: 1,
             pitch: 8,

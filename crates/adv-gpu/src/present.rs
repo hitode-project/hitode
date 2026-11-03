@@ -3,7 +3,7 @@
 //! Frame-buffer compression is a per-vendor allocation policy, never assumed:
 //!
 //! - Android allocates AHardwareBuffers with GPU sampling, GPU output and
-//!   composer usage and no CPU usage bit; any CPU bit makes gralloc fall back
+//!   composer usage and no CPU usage bit for RGB; any CPU bit makes gralloc fall back
 //!   to linear layout. Qualcomm gralloc compresses (UBWC) only when asked
 //!   with its private bit (`AHARDWAREBUFFER_USAGE_VENDOR_0`, i.e.
 //!   `GRALLOC_USAGE_PRIVATE_ALLOC_UBWC`). Measured on Adreno 750
@@ -13,6 +13,8 @@
 //!   added. Where `VK_EXT_image_compression_control` exists (Mali G610 and
 //!   later, Adreno 8xx), the backend reads each imported buffer's compression
 //!   and reports it to the speed report and flight recorder.
+//!   NV12 video buffers instead request CPU writing and GPU sampling with
+//!   composer overlay usage; their YUV layout is linear.
 //! - Apple backs them with IOSurfaces, which are not losslessly compressed:
 //!   measured on A12, a full 2560×1440 draw costs 544 µs into an IOSurface
 //!   against 220 µs into a private texture.
@@ -32,12 +34,29 @@ use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PoolDesc {
+    /// Fixed matrix and range: required for NV12, `None` for RGB.
+    pub color: Option<YuvColor>,
     pub width: u32,
     pub height: u32,
     /// A format with [`FormatCaps::PRESENTABLE`].
     pub format: Format,
     pub count: u32,
     pub label: &'static str,
+}
+
+/// The picture's YCbCr matrix and code-value range, fixed for a pool.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum YuvColor {
+    Bt601Limited,
+    Bt601Full,
+    Bt709Limited,
+    Bt709Full,
+}
+
+/// One CPU-writable plane. Rows include padding; NV12 has Y then interleaved UV.
+pub struct PlaneMut<'a> {
+    pub data: &'a mut [u8],
+    pub stride: usize,
 }
 
 /// Up to `count` buffers, allocated on demand. Buffers carry their age and
@@ -72,6 +91,7 @@ impl PresentPool {
             || desc.height == 0
             || desc.width.max(desc.height) > caps.limits.max_image_2d
             || desc.count == 0
+            || (desc.format == Format::Nv12) != desc.color.is_some()
         {
             return Err(crate::Error::Invalid(format!("present pool {desc:?}")));
         }
@@ -79,7 +99,7 @@ impl PresentPool {
             device: device.clone(),
             desc: *desc,
             shared: Arc::new(Mutex::new(Shared {
-                free: Vec::new(),
+                free: Vec::with_capacity(desc.count as usize),
                 allocated: 0,
                 presents: 0,
             })),
@@ -118,9 +138,45 @@ impl PresentPool {
         Ok(Some(PresentImage {
             buffer: Some(buffer),
             age,
+            cpu: false,
             fence: None,
             pool: self.shared.clone(),
         }))
+    }
+    /// Acquire an NV12 buffer for a CPU producer, waiting for the compositor's
+    /// release on this thread. No GPU queue is touched. `None` means every lease is outstanding.
+    /// Allocation or driver failures fail fast, as `write` has no error channel.
+    /// The completed acquire token is `Token(0)` and there is no acquire fence.
+    pub fn acquire_cpu(&mut self) -> Option<PresentImage> {
+        debug_assert_eq!(self.desc.format, Format::Nv12);
+        let mut shared = self.shared.lock().unwrap();
+        let newest = (0..shared.free.len()).max_by_key(|&i| shared.free[i].stamp);
+        let mut buffer = match newest {
+            Some(i) => shared.free.swap_remove(i),
+            None if shared.allocated < self.desc.count => {
+                let (image, raw) = imp::PresentBuffer::new(&self.device.inner, &self.desc)
+                    .expect("allocate CPU presentable buffer");
+                shared.allocated += 1;
+                Buffer {
+                    image,
+                    raw,
+                    stamp: None,
+                    release: None,
+                }
+            }
+            None => return None,
+        };
+        if let Some(fence) = buffer.release.take() {
+            fence.inner.wait_cpu();
+        }
+        let age = buffer.stamp.map(|n| (shared.presents - n + 1) as u32);
+        Some(PresentImage {
+            buffer: Some(buffer),
+            age,
+            fence: None,
+            cpu: true,
+            pool: self.shared.clone(),
+        })
     }
     /// Drop free buffers, oldest content first, until at most `keep` remain
     /// allocated; for memory pressure and background.
@@ -142,10 +198,21 @@ pub struct PresentImage {
     buffer: Option<Buffer>,
     age: Option<u32>,
     fence: Option<Fence>,
+    cpu: bool,
     pool: Arc<Mutex<Shared>>,
 }
 
 impl PresentImage {
+    /// Map a CPU-acquired YUV buffer, call `f` once, then unmap even on unwind.
+    /// `acquire_cpu` has already ordered the write after compositor release.
+    pub fn write(&mut self, f: impl FnOnce(&mut [PlaneMut<'_>])) {
+        debug_assert!(self.cpu, "write requires acquire_cpu");
+        self.buffer().raw.write(f);
+        let mut pool = self.pool.lock().unwrap();
+        pool.presents += 1;
+        self.buffer.as_mut().unwrap().stamp = Some(pool.presents);
+    }
+
     pub fn image(&self) -> &Image {
         &self.buffer().image
     }

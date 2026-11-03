@@ -137,8 +137,8 @@ mod tests {
                 "{:?} {:?} {}",
                 u.video.map(|v| (
                     v.pts_us,
-                    v.bgra.len(),
-                    v.bgra.iter().map(|&b| u64::from(b)).sum::<u64>()
+                    v.bgra().len(),
+                    v.bgra().iter().map(|&b| u64::from(b)).sum::<u64>()
                 )),
                 u.audio
                     .iter()

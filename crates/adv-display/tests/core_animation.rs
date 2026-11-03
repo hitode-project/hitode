@@ -49,6 +49,7 @@ mod macos {
         };
         let mut pool = device
             .create_present_pool(&PoolDesc {
+                color: None,
                 width: W,
                 height: H,
                 format: Format::Bgra8Unorm,
@@ -142,7 +143,32 @@ mod macos {
         assert_eq!(contents(base), b_surface);
 
         // A video layer comes above the base and goes with its image.
-        let (v, v_surface) = draw(&mut pool, &mut queue, LayerId::Video(7));
+        let mut yuv = device
+            .create_present_pool(&PoolDesc {
+                width: W,
+                height: H,
+                format: Format::Nv12,
+                count: 2,
+                color: Some(adv_gpu::present::YuvColor::Bt709Limited),
+                label: "YUV layer",
+            })
+            .unwrap();
+        let mut image = yuv.acquire_cpu().unwrap();
+        image.write(|planes| {
+            planes[0].data.fill(96);
+            planes[1].data.fill(128);
+        });
+        assert!(image.acquire_fence().is_none());
+        let Export::IoSurface(surface, _) = image.export() else {
+            unreachable!()
+        };
+        let v_surface = surface.as_ptr() as usize;
+        let v = AcquiredImage {
+            layer: LayerId::Video(7),
+            image,
+            acquire: adv_gpu::Token(0),
+        };
+        assert!(compositor.caps().yuv_layers);
         present(
             &mut compositor,
             layers(whole, whole, false, Some(inset)),

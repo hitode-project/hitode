@@ -122,6 +122,7 @@ fn present_batches_reuse_fences_and_preserve_content() {
         }
         let mut pool = device
             .create_present_pool(&PoolDesc {
+                color: None,
                 width: 8,
                 height: 8,
                 format: present::FORMAT,

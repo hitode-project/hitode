@@ -1,6 +1,6 @@
 //! Android API 29 SurfaceControl presentation. Callers supply caps with scaling,
-//! rotation, solid colors and damage hints enabled, nearest filtering and YUV
-//! layers disabled. Compression and tile size come from the GPU device.
+//! rotation, YUV layers, solid colors and damage hints enabled, nearest
+//! filtering disabled. Compression and tile size come from the GPU device.
 
 use crate::{
     Rect,
@@ -111,6 +111,7 @@ mod native {
         fn ASurfaceTransaction_setVisibility(tx: Handle, surface: Handle, visibility: i8);
         fn ASurfaceTransaction_setZOrder(tx: Handle, surface: Handle, z: i32);
         fn ASurfaceTransaction_setBuffer(tx: Handle, surface: Handle, buffer: Handle, fence: i32);
+        fn ASurfaceTransaction_setBufferDataSpace(tx: Handle, surface: Handle, dataspace: i32);
         fn ASurfaceTransaction_setColor(tx: Handle, surface: Handle, r: f32, g: f32, b: f32, alpha: f32, dataspace: i32);
         fn ASurfaceTransaction_setGeometry(tx: Handle, surface: Handle, crop: *const ARect, dst: *const ARect, transform: i32);
         fn ASurfaceTransaction_setDamageRegion(tx: Handle, surface: Handle, rects: *const ARect, count: u32);
@@ -196,6 +197,7 @@ mod native {
         geometry: Option<Geometry>,
         visible: bool,
         z: Option<i32>,
+        dataspace: i32,
     }
     #[derive(Default)]
     struct Completion {
@@ -252,8 +254,9 @@ mod native {
         /// Android as documented by this module.
         pub unsafe fn new(
             window: NonNull<ndk_sys::ANativeWindow>,
-            caps: CompositorCaps,
+            mut caps: CompositorCaps,
         ) -> Result<Self, Error> {
+            caps.yuv_layers = true;
             let clock = Clock::new();
             let (w, h) = unsafe {
                 (
@@ -308,6 +311,7 @@ mod native {
                     geometry: None,
                     visible: true,
                     z: None,
+                    dataspace: 142671872, // ADATASPACE_SRGB is the platform default.
                 });
             }
             Ok(())
@@ -423,13 +427,12 @@ mod native {
                 }
             }
             for mut acquired in images {
-                let surface = self
+                let state = self
                     .surfaces
-                    .iter()
+                    .iter_mut()
                     .find(|s| s.id == Some(acquired.layer))
-                    .expect("image layer exists")
-                    .handle
-                    .as_ptr();
+                    .expect("image layer exists");
+                let surface = state.handle.as_ptr();
                 let Export::AndroidHardwareBuffer(buffer, _) = acquired.image.export() else {
                     panic!("Android presentable buffer");
                 };
@@ -440,6 +443,17 @@ mod native {
                     .map_or(-1, |f| f.into_fd().into_raw_fd());
                 unsafe {
                     ASurfaceTransaction_setBuffer(tx, surface, buffer, fd);
+                    let dataspace = if acquired.image.image().desc().format == adv_gpu::Format::Nv12
+                    {
+                        // BT.601 limited: STANDARD_BT601_625 | TRANSFER_SMPTE_170M | RANGE_LIMITED.
+                        (2 << 16) | (3 << 22) | (2 << 27)
+                    } else {
+                        142671872
+                    }; // ADATASPACE_SRGB
+                    if state.dataspace != dataspace {
+                        ASurfaceTransaction_setBufferDataSpace(tx, surface, dataspace);
+                        state.dataspace = dataspace;
+                    }
                 }
                 let layer = match acquired.layer {
                     LayerId::Base => &layers.base,

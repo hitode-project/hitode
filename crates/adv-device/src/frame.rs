@@ -19,7 +19,7 @@ pub enum Damage {
 pub struct Frame {
     pub serial: u64,
     pub base: Base,
-    /// Decoded video shown as its own layers (package E).
+    /// Decoded pictures and their canvas geometry.
     pub video: Arc<[VideoPlane]>,
     pub published_at: Instant,
 }
@@ -41,8 +41,118 @@ pub enum SwapImage {
     Presentable(adv_gpu::PresentImage),
 }
 
-/// Package E.
-pub struct VideoPlane {}
+/// A decoded picture. The lease can be transferred once, even when several
+/// queued frames refer to this same picture. An unshown picture keeps its lease.
+pub struct DecodedPicture {
+    image: adv_gpu::Image,
+    planes: [adv_gpu::ImageView; 2],
+    color: adv_gpu::present::YuvColor,
+    lease: std::sync::Mutex<Option<adv_gpu::PresentImage>>,
+    #[cfg(feature = "media")]
+    source: ffmpeg_next::frame::Video,
+}
+
+impl std::fmt::Debug for DecodedPicture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DecodedPicture")
+            .field("id", &self.image.id())
+            .finish()
+    }
+}
+
+impl DecodedPicture {
+    #[cfg(feature = "media")]
+    pub(crate) fn new(image: adv_gpu::Image, color: adv_gpu::present::YuvColor) -> Self {
+        let planes = std::array::from_fn(|plane| {
+            image
+                .create_view(&adv_gpu::resource::ViewDesc {
+                    format: Some([adv_gpu::Format::R8Unorm, adv_gpu::Format::Rg8Unorm][plane]),
+                    dimension: None,
+                    mips: 0..1,
+                    layers: 0..1,
+                    plane: plane as u32,
+                })
+                .expect("NV12 plane view")
+        });
+        Self {
+            image,
+            planes,
+            color,
+            lease: std::sync::Mutex::new(None),
+            source: ffmpeg_next::frame::Video::empty(),
+        }
+    }
+    #[cfg(feature = "media")]
+    pub(crate) fn release_unshown(&mut self) {
+        self.lease.get_mut().unwrap().take();
+    }
+    #[cfg(feature = "media")]
+    pub(crate) fn set_image(
+        &mut self,
+        image: adv_gpu::PresentImage,
+        source: &mut ffmpeg_next::frame::Video,
+    ) {
+        // Retain decoder planes for guest snapshots after the present lease moves.
+        unsafe {
+            ffmpeg_next::ffi::av_frame_unref(self.source.as_mut_ptr());
+            ffmpeg_next::ffi::av_frame_move_ref(self.source.as_mut_ptr(), source.as_mut_ptr());
+        }
+        *self.lease.get_mut().unwrap() = Some(image);
+    }
+    pub(crate) fn bgra(&self) -> Vec<u8> {
+        #[cfg(feature = "media")]
+        {
+            crate::media::planes::bgra(&self.source, self.color)
+        }
+        #[cfg(not(feature = "media"))]
+        {
+            unreachable!("decoded pictures require media")
+        }
+    }
+    pub fn color(&self) -> adv_gpu::present::YuvColor {
+        self.color
+    }
+    pub fn image(&self) -> &adv_gpu::Image {
+        &self.image
+    }
+    pub fn planes(&self) -> &[adv_gpu::ImageView; 2] {
+        &self.planes
+    }
+}
+
+/// Geometry after owner clipping, in canvas coordinates. The UV rectangle
+/// preserves sampling phase for signed destinations and cropped source pictures.
+#[derive(Clone, Copy, Debug)]
+pub struct VideoGeometry {
+    pub source: (u32, u32),
+    pub destination: Rect,
+    pub source_uv: [f32; 4],
+    pub background: Option<(Rect, [u8; 4])>,
+    pub clip: Rect,
+    pub hide_cursor: bool,
+}
+
+pub struct VideoPlane {
+    pub id: u64,
+    pub geometry: VideoGeometry,
+    pub picture: Arc<DecodedPicture>,
+}
+
+/// A changed picture transfers its lease; a retained picture refers to the
+/// layer's already attached buffer. There is no separately writable changed bit.
+pub enum VideoUpdate {
+    Changed(adv_gpu::PresentImage),
+    Retained,
+}
+
+impl VideoPlane {
+    pub fn take_picture(&self) -> VideoUpdate {
+        match self.picture.lease.lock().unwrap().take() {
+            Some(image) => VideoUpdate::Changed(image),
+            None => VideoUpdate::Retained,
+        }
+    }
+}
 
 /// The display layer's entry on the GPU owner thread. It encodes its stages on
 /// the same queue, after the frame's own commands.

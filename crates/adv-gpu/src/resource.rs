@@ -85,7 +85,8 @@ pub struct ViewDesc {
     pub dimension: Option<Dimension>,
     pub mips: std::ops::Range<u32>,
     pub layers: std::ops::Range<u32>,
-    /// For two-plane formats, the plane this view samples.
+    /// For NV12 presentable buffers, 0 samples Y as `R8Unorm` and 1
+    /// samples UV as `Rg8Unorm`, with ceil-divided width and height.
     pub plane: u32,
 }
 

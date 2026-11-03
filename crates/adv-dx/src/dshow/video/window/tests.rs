@@ -445,15 +445,15 @@ fn unsupported_window_modes_report_failure_and_preserve_geometry() {
 fn snapshot_crops_source_and_writes_bottom_up_rows_with_checked_capacity() {
     let mut m = tests::machine();
     let graph = graph(&mut m);
-    let frame = VideoFrame {
-        width: 3,
-        height: 2,
-        pitch: 16,
-        bgra: Arc::from([
+    let frame = VideoFrame::from_bgra(
+        3,
+        2,
+        16,
+        Arc::from([
             1, 2, 3, 255, 4, 5, 6, 255, 7, 8, 9, 255, 0, 0, 0, 0, 10, 11, 12, 255, 13, 14, 15, 255,
             16, 17, 18, 255, 0, 0, 0, 0,
         ]),
-    };
+    );
     let cropped = Rect {
         left: 1,
         top: 0,

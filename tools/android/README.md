@@ -30,7 +30,20 @@ through SurfaceControl and finishes. Logcat tag `adv-display-probe` reports
 present CPU nanoseconds, latch minus desired time, shown minus latch, releases,
 pool ages, and minimum, median and p95 summaries. The diagnostic system property
 `debug.adv.probe.rotation` accepts 0 (default), 90, 180 or 270 and is read when a
-window is created.
+window is created. Set `debug.adv.probe.yuv` to `1` before launching to show a
+moving 640×360 NV12 gradient over a black base. The decoder-style path uses
+`acquire_cpu` and `write`, a completed token and no acquire fence; only the
+initial black base uses the GPU. Clear the property to restore the bar mode.
+
+Build the shared GPU conformance binary for the D2a device probe with:
+
+```sh
+RUSTC_WRAPPER=sccache CARGO_TARGET_DIR="$PWD/target" \
+  cargo ndk -t arm64-v8a --platform 29 test -p adv-gpu --test conformance --no-run
+```
+
+Run `cpu_yuv_pools_write_sample_and_release` in that probe for CPU acquisition,
+strided plane writes, two-plane sampling and lease release order.
 
 Presentable pools survive window destruction. A replacement window reattaches
 the newest buffer with an empty GPU submission, preserving its pixels.

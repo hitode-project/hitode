@@ -1190,6 +1190,7 @@ fn present_pools_track_ages_and_releases() {
     let mut pool = gpu
         .device
         .create_present_pool(&adv_gpu::present::PoolDesc {
+            color: None,
             width: 64,
             height: 64,
             format,
@@ -1232,4 +1233,197 @@ fn present_pools_track_ages_and_releases() {
     assert_eq!((newest.age(), fresh.age()), (Some(1), None));
     drop((newest, fresh));
     pool.trim(1);
+}
+
+#[test]
+fn cpu_yuv_pools_write_sample_and_release() {
+    use adv_gpu::{
+        present::{PoolDesc, YuvColor},
+        resource::ViewDesc,
+    };
+    let mut gpu = gpu!();
+    if !gpu.supports(Format::Nv12, FormatCaps::PRESENTABLE) {
+        return;
+    }
+    let mut pool = gpu
+        .device
+        .create_present_pool(&PoolDesc {
+            width: 18,
+            height: 10,
+            format: Format::Nv12,
+            color: Some(YuvColor::Bt709Limited),
+            count: 2,
+            label: "CPU YUV",
+        })
+        .unwrap();
+    let mut first = pool.acquire_cpu().unwrap();
+    let second = pool.acquire_cpu().unwrap();
+    assert!(pool.acquire_cpu().is_none());
+    let first_id = first.image().id();
+    first.write(|planes| {
+        assert_eq!(planes.len(), 2);
+        for y in 0..10 {
+            for x in 0..18 {
+                planes[0].data[y * planes[0].stride + x] = (x * 9 + y * 3) as u8;
+            }
+        }
+        for y in 0..5 {
+            for x in 0..9 {
+                let at = y * planes[1].stride + x * 2;
+                planes[1].data[at..at + 2]
+                    .copy_from_slice(&[(x * 11 + 23) as u8, (y * 21 + 97) as u8]);
+            }
+        }
+    });
+    assert!(first.acquire_fence().is_none());
+    let views: [_; 2] = std::array::from_fn(|plane| {
+        first
+            .image()
+            .create_view(&ViewDesc {
+                format: Some([Format::R8Unorm, Format::Rg8Unorm][plane]),
+                dimension: None,
+                mips: 0..1,
+                layers: 0..1,
+                plane: plane as u32,
+            })
+            .unwrap()
+    });
+    assert_eq!(views[1].size(), extent(9, 5));
+    let shader = gpu.shader(
+        r#"
+        @group(1) @binding(0) var y: texture_2d<f32>;
+        @group(1) @binding(1) var uv: texture_2d<f32>;
+        @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+            let p = array<vec2<f32>, 3>(vec2(-1., -1.), vec2(3., -1.), vec2(-1., 3.));
+            return vec4(p[i], 0., 1.);
+        }
+        @fragment fn fs(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
+            let xy = vec2<i32>(p.xy);
+            return vec4(textureLoad(y, xy, 0).r, textureLoad(uv, xy / 2, 0).rg, 1.);
+        }
+    "#,
+        0x795556,
+    );
+    let pipeline = gpu.pipeline(&RenderPipelineDesc {
+        vertex: shader.entry("vs", Stage::Vertex).unwrap(),
+        fragment: Some(shader.entry("fs", Stage::Fragment).unwrap()),
+        bindings: (0..2)
+            .map(|slot| Binding {
+                slot,
+                kind: BindingKind::SampledImage {
+                    dimension: Dimension::D2,
+                    depth: false,
+                    multisampled: false,
+                },
+                stages: Stages::FRAGMENT,
+            })
+            .collect(),
+        primitive: primitive(),
+        colors: colors(Format::Rgba8Unorm, None),
+        depth_stencil: None,
+        samples: 1,
+        alpha_to_coverage: false,
+        label: "sample YUV planes",
+    });
+    let target = gpu.target(18, 10, Format::Rgba8Unorm);
+    let mut encoder = gpu.queue.encoder("sample CPU planes");
+    {
+        let mut pass = encoder.render_pass(&pass(
+            color(target.view(), Load::DontCare),
+            None,
+            whole(18, 10),
+        ));
+        pass.set_pipeline(&pipeline);
+        pass.bind(0, Bind::Sampled(&views[0]));
+        pass.bind(1, Bind::Sampled(&views[1]));
+        pass.draw(0..3, 0..1);
+    }
+    gpu.submit(encoder);
+    let pixels = gpu.read(&target);
+    for y in 0..10usize {
+        for x in 0..18usize {
+            assert_eq!(
+                &pixels[(y * 18 + x) * 4..][..4],
+                &[
+                    (x * 9 + y * 3) as u8,
+                    (x / 2 * 11 + 23) as u8,
+                    (y / 2 * 21 + 97) as u8,
+                    255,
+                ]
+            );
+        }
+    }
+    first.released(None);
+    let mut next = pool.acquire_cpu().unwrap();
+    assert_eq!(next.image().id(), first_id);
+    assert_eq!(next.age(), Some(1));
+    next.write(|p| p[0].data[0] = 99);
+    assert!(
+        pool.acquire_cpu().is_none(),
+        "screen-owned lease was reused"
+    );
+    drop(second);
+    let other = pool.acquire_cpu().unwrap();
+    assert_ne!(other.image().id(), first_id);
+}
+
+#[cfg(target_vendor = "apple")]
+#[test]
+fn yuv_pool_color_attachments() {
+    use adv_gpu::present::{Export, PoolDesc, YuvColor};
+    use objc2_core_foundation::CFString;
+    use objc2_io_surface::{IOSurfaceRef, kIOSurfaceColorSpace};
+    #[link(name = "IOSurface", kind = "framework")]
+    unsafe extern "C" {
+        static kIOSurfaceYCbCrMatrix: &'static CFString;
+    }
+    let gpu = gpu!();
+    for color in [
+        YuvColor::Bt601Limited,
+        YuvColor::Bt601Full,
+        YuvColor::Bt709Limited,
+        YuvColor::Bt709Full,
+    ] {
+        let desc = PoolDesc {
+            width: 18,
+            height: 10,
+            format: Format::Nv12,
+            color: Some(color),
+            count: 1,
+            label: "YUV color",
+        };
+        assert!(
+            gpu.device
+                .create_present_pool(&PoolDesc {
+                    color: None,
+                    ..desc
+                })
+                .is_err()
+        );
+        let mut pool = gpu.device.create_present_pool(&desc).unwrap();
+        let image = pool.acquire_cpu().unwrap();
+        let Export::IoSurface(pointer, _) = image.export() else {
+            unreachable!()
+        };
+        let surface = unsafe { pointer.cast::<IOSurfaceRef>().as_ref() };
+        let full = matches!(color, YuvColor::Bt601Full | YuvColor::Bt709Full);
+        assert_eq!(
+            surface.pixel_format(),
+            u32::from_be_bytes(if full { *b"420f" } else { *b"420v" })
+        );
+        let matrix = surface
+            .value(unsafe { kIOSurfaceYCbCrMatrix })
+            .unwrap()
+            .downcast::<CFString>()
+            .unwrap();
+        assert_eq!(
+            matrix.to_string(),
+            if matches!(color, YuvColor::Bt709Limited | YuvColor::Bt709Full) {
+                "ITU_R_709_2"
+            } else {
+                "ITU_R_601_4"
+            }
+        );
+        assert!(surface.value(unsafe { kIOSurfaceColorSpace }).is_some());
+    }
 }

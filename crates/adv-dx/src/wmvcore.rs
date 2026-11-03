@@ -837,7 +837,7 @@ fn decoded_packet(frame: media::Decoded, format: &CodecFormat) -> media::Packet 
                 _ => 0,
             },
             key: true,
-            data: frame.bgra,
+            data: frame.into_bgra(),
         },
         media::Decoded::Audio(frame) => media::Packet {
             time_100ns: frame.pts_us * 10,

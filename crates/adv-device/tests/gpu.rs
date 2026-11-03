@@ -267,6 +267,8 @@ fn video_over_native_base_keeps_gpu_pixels_and_pins_layers_for_explicit_capture(
     surfaces.present_native(target, &mut gpu).unwrap();
     let layer = VideoLayer {
         frame: VideoFrame {
+            #[cfg(feature = "native-display")]
+            picture: None,
             width: 1,
             height: 1,
             pitch: 4,

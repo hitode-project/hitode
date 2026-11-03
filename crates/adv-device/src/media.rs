@@ -57,13 +57,59 @@ pub struct AudioInfo {
     pub channels: u16,
 }
 
-/// Top-down, tightly packed BGRA rows.
+/// A decoded picture. Native display retains YUV; the reference path retains BGRA.
 #[derive(Debug)]
 pub struct VideoFrame {
     pub pts_us: u64,
     pub width: u32,
     pub height: u32,
+    #[cfg(not(feature = "native-display"))]
     pub bgra: Vec<u8>,
+    #[cfg(feature = "native-display")]
+    pub picture: std::sync::Arc<crate::frame::DecodedPicture>,
+}
+
+impl VideoFrame {
+    /// Guest pixel requests convert once on demand; display never requests BGRA.
+    pub fn bgra(&self) -> std::borrow::Cow<'_, [u8]> {
+        #[cfg(not(feature = "native-display"))]
+        {
+            std::borrow::Cow::Borrowed(&self.bgra)
+        }
+        #[cfg(feature = "native-display")]
+        {
+            std::borrow::Cow::Owned(self.picture.bgra())
+        }
+    }
+
+    pub fn into_bgra(self) -> Vec<u8> {
+        #[cfg(not(feature = "native-display"))]
+        {
+            self.bgra
+        }
+        #[cfg(feature = "native-display")]
+        {
+            self.picture.bgra()
+        }
+    }
+
+    pub fn into_surface(self) -> crate::surface::VideoFrame {
+        crate::surface::VideoFrame {
+            width: self.width,
+            height: self.height,
+            pitch: self.width * 4,
+            #[cfg(not(feature = "native-display"))]
+            bgra: self.bgra.into(),
+            #[cfg(feature = "native-display")]
+            bgra: {
+                static EMPTY: std::sync::OnceLock<std::sync::Arc<[u8]>> =
+                    std::sync::OnceLock::new();
+                EMPTY.get_or_init(|| std::sync::Arc::from([])).clone()
+            },
+            #[cfg(feature = "native-display")]
+            picture: Some(self.picture),
+        }
+    }
 }
 
 /// Interleaved, source-rate PCM. `pts_us` is relative to the start of the media.
@@ -104,6 +150,8 @@ mod audio_clock;
 mod native;
 #[cfg(feature = "media")]
 mod packets;
+#[cfg(all(feature = "media", feature = "native-display"))]
+pub(crate) mod planes;
 #[cfg(feature = "media")]
 mod worker;
 

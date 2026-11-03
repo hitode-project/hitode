@@ -77,7 +77,7 @@ fn asf_samples_round_trip_through_the_decoders() {
         // Limited-range luma: BGRA grey follows the encoded level.
         let expected = (f32::from(40 + i as u8 * 16) - 16.0) * 255.0 / 219.0;
         let centre =
-            &frame.bgra[(HEIGHT as usize / 2 * WIDTH as usize + WIDTH as usize / 2) * 4..][..4];
+            &frame.bgra()[(HEIGHT as usize / 2 * WIDTH as usize + WIDTH as usize / 2) * 4..][..4];
         assert!(
             (f32::from(centre[1]) - expected).abs() < 12.0,
             "frame {i}: {centre:?} vs {expected}"

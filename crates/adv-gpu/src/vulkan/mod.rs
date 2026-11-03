@@ -417,6 +417,9 @@ impl Fence {
 pub(crate) enum Fence {}
 #[cfg(not(target_os = "android"))]
 impl Fence {
+    pub(crate) fn wait_cpu(self) {
+        match self {}
+    }
     pub(crate) fn duplicate(&self) -> Result<Self> {
         match *self {}
     }
@@ -430,6 +433,9 @@ pub(crate) struct PresentBuffer;
 #[cfg(not(target_os = "android"))]
 impl PresentBuffer {
     pub(crate) fn new(_device: &Device, _desc: &PoolDesc) -> Result<(crate::Image, Self)> {
+        unreachable!("no presentable Vulkan formats on this target")
+    }
+    pub(crate) fn write(&self, _f: impl FnOnce(&mut [PlaneMut<'_>])) {
         unreachable!("no presentable Vulkan formats on this target")
     }
     pub(crate) fn export(&self) -> Export<'_> {

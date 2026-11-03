@@ -634,7 +634,19 @@ impl Device {
             #[cfg(target_os = "android")]
             let present_caps = present::capabilities(props.vendor_id);
             #[cfg(target_os = "android")]
-            if present_caps.contains(FormatCaps::PRESENTABLE) {
+            let yuv_caps = match present::yuv_capabilities(
+                &ash::android::external_memory_android_hardware_buffer::Device::new(
+                    instance, &device,
+                ),
+            ) {
+                Ok(caps) => caps,
+                Err(error) => {
+                    device.destroy_device(None);
+                    return Err(error);
+                }
+            };
+            #[cfg(target_os = "android")]
+            if (present_caps | yuv_caps).contains(FormatCaps::PRESENTABLE) {
                 feature_bits |= Features::PRESENTABLE_BUFFERS;
             }
             if memory.memory_types_as_slice().iter().any(|t| {
@@ -694,6 +706,10 @@ impl Device {
                     #[cfg(target_os = "android")]
                     if f == present::FORMAT {
                         caps |= present_caps;
+                    }
+                    #[cfg(target_os = "android")]
+                    if f == Format::Nv12 {
+                        caps |= yuv_caps;
                     }
                     (f, caps)
                 })

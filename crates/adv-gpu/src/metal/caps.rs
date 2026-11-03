@@ -120,7 +120,8 @@ fn format_caps(
     use FormatCaps as C;
     let color = C::SAMPLED | C::FILTERED | C::COLOR | C::BLEND;
     match f {
-        Format::Nv12 | Format::P010 | Format::Bgra4Unorm => C::empty(),
+        Format::Nv12 => C::SAMPLED | C::FILTERED | C::PRESENTABLE,
+        Format::P010 | Format::Bgra4Unorm => C::empty(),
         Format::B5g6r5Unorm | Format::Bgr5a1Unorm => {
             if apple {
                 color

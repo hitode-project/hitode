@@ -603,9 +603,10 @@ fn current_image(env: &mut Env<'_>, graph: u32, info: &VideoInfo) -> u32 {
 /// BI_RGB 32-bit DIB, bottom-up, including the BITMAPINFOHEADER. Captures use
 /// source cropping but retain native pixels rather than destination scaling.
 fn dib(frame: &VideoFrame, source: Rect) -> Result<Vec<u8>, u32> {
+    let bgra = frame.bgra();
     if !source.in_image(frame.width, frame.height)
         || frame.pitch < frame.width.checked_mul(4).ok_or(E_FAIL)?
-        || u64::from(frame.pitch) * u64::from(frame.height) > frame.bgra.len() as u64
+        || u64::from(frame.pitch) * u64::from(frame.height) > bgra.len() as u64
     {
         return Err(E_FAIL);
     }
@@ -630,8 +631,7 @@ fn dib(frame: &VideoFrame, source: Rect) -> Result<Vec<u8>, u32> {
         let source_y = source.top as usize + source.height as usize - 1 - y;
         let start = source_y * frame.pitch as usize + source.left as usize * 4;
         let target = 40 + y * row as usize;
-        bytes[target..target + row as usize]
-            .copy_from_slice(&frame.bgra[start..start + row as usize]);
+        bytes[target..target + row as usize].copy_from_slice(&bgra[start..start + row as usize]);
     }
     Ok(bytes)
 }

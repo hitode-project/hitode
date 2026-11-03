@@ -9,6 +9,7 @@ pub(crate) struct Image {
 
 pub(super) struct ImageData {
     pub(super) raw: Object<dyn MTLTexture>,
+    pub(super) planes: Option<[Object<dyn MTLTexture>; 2]>,
     desc: ImageDesc,
     lost: Arc<OnceLock<String>>,
 }
@@ -47,6 +48,11 @@ pub(crate) struct Sampler(#[allow(dead_code)] pub(super) Arc<Object<dyn MTLSampl
 impl Device {
     pub(crate) fn create_image(&self, desc: &ImageDesc) -> Result<crate::Image> {
         self.check()?;
+        if desc.format == Format::Nv12 {
+            return Err(Error::Invalid(
+                "NV12 images come from presentable pools".into(),
+            ));
+        }
         let d = self.texture_descriptor(desc)?;
         let raw = self
             .0
@@ -142,6 +148,7 @@ impl Device {
             inner: Image {
                 data: Arc::new(ImageData {
                     raw,
+                    planes: None,
                     desc: *desc,
                     lost: self.0.lost.clone(),
                 }),
@@ -312,6 +319,32 @@ impl Image {
             return Err(Error::DeviceLost(reason.clone()));
         }
         let image = self.desc();
+        if let Some(planes) = &self.data.planes {
+            let plane = desc.plane as usize;
+            if plane > 1
+                || desc.mips != (0..1)
+                || desc.layers != (0..1)
+                || desc.dimension.is_some_and(|d| d != Dimension::D2)
+                || desc
+                    .format
+                    .is_some_and(|f| f != [Format::R8Unorm, Format::Rg8Unorm][plane])
+            {
+                return Err(Error::Invalid("NV12 plane view".into()));
+            }
+            return Ok(crate::ImageView {
+                inner: ImageView {
+                    raw: planes[plane].clone(),
+                    image: crate::Image {
+                        inner: self.clone(),
+                    },
+                    size: Extent {
+                        width: planes[plane].width() as u32,
+                        height: planes[plane].height() as u32,
+                        depth_or_layers: 1,
+                    },
+                },
+            });
+        }
         if desc.plane != 0
             || desc.mips.is_empty()
             || desc.layers.is_empty()

@@ -5,7 +5,10 @@ use ff::{Rational, codec, format, frame, media, software};
 use ffmpeg_next as ff;
 
 use super::native::Input;
-use super::{AudioFrame, CodecFormat, Decoded, Demuxed, Error, Packet, PacketStream, VideoFrame};
+use super::{AudioFrame, CodecFormat, Decoded, Demuxed, Error, Packet, PacketStream};
+
+#[cfg(not(feature = "native-display"))]
+use super::VideoFrame;
 
 const HUNDRED_NS: Rational = Rational(1, 10_000_000);
 /// AV_INPUT_BUFFER_PADDING_SIZE: decoders may over-read extradata by this much.
@@ -136,7 +139,12 @@ pub(super) fn demux(bytes: Vec<u8>) -> Result<Demuxed, Error> {
 enum Kind {
     Video {
         decoder: ff::decoder::Video,
+        #[cfg(not(feature = "native-display"))]
         scaler: Option<(format::Pixel, u32, u32, software::scaling::Context)>,
+        #[cfg(feature = "native-display")]
+        output: Option<super::planes::Output>,
+        #[cfg(feature = "native-display")]
+        decoded: frame::Video,
     },
     Audio {
         decoder: ff::decoder::Audio,
@@ -240,7 +248,12 @@ impl Decoder {
         let kind = match format {
             CodecFormat::Video { .. } => Kind::Video {
                 decoder: decoder.video()?,
+                #[cfg(not(feature = "native-display"))]
                 scaler: None,
+                #[cfg(feature = "native-display")]
+                output: None,
+                #[cfg(feature = "native-display")]
+                decoded: frame::Video::empty(),
             },
             CodecFormat::Audio { .. } => Kind::Audio {
                 decoder: decoder.audio()?,
@@ -298,10 +311,35 @@ impl Decoder {
         let mut out = Vec::new();
         loop {
             let result = match &mut self.kind {
-                Kind::Video { decoder, scaler } => {
+                Kind::Video {
+                    decoder,
+                    #[cfg(not(feature = "native-display"))]
+                    scaler,
+                    #[cfg(feature = "native-display")]
+                    output,
+                    #[cfg(feature = "native-display")]
+                    decoded,
+                } => {
+                    #[cfg(not(feature = "native-display"))]
                     let mut decoded = frame::Video::empty();
-                    match decoder.receive_frame(&mut decoded) {
-                        Ok(()) => convert_video(scaler, &decoded).map(|f| Some(Decoded::Video(f))),
+                    #[cfg(not(feature = "native-display"))]
+                    let decoded = &mut decoded;
+                    match decoder.receive_frame(decoded) {
+                        Ok(()) => {
+                            #[cfg(feature = "native-display")]
+                            if output.is_none() {
+                                *output = Some(super::planes::Output::new(decoder)?);
+                            }
+
+                            #[cfg(not(feature = "native-display"))]
+                            let result = convert_video(scaler, decoded);
+                            #[cfg(feature = "native-display")]
+                            let result = Ok(output.as_mut().unwrap().convert(
+                                decoded.timestamp().map_or(0, |t| (t.max(0) / 10) as u64),
+                                decoded,
+                            )?);
+                            result.map(|f| Some(Decoded::Video(f)))
+                        }
                         Err(error) => Err(error),
                     }
                 }
@@ -336,6 +374,7 @@ impl Decoder {
     }
 }
 
+#[cfg(not(feature = "native-display"))]
 fn convert_video(
     scaler: &mut Option<(format::Pixel, u32, u32, software::scaling::Context)>,
     decoded: &frame::Video,

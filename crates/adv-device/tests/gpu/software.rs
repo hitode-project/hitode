@@ -243,6 +243,8 @@ fn bgra_texture_reads_snapshot_storage_after_the_guest_and_mailbox_reuse_their_f
     };
     let layer = VideoLayer {
         frame: VideoFrame {
+            #[cfg(feature = "native-display")]
+            picture: None,
             width: 1,
             height: 1,
             pitch: 4,

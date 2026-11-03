@@ -101,6 +101,7 @@ pub struct CompositorCaps {
     /// Layers can rotate without composition falling back to the GPU.
     pub rotates: bool,
     /// YUV layers are converted and scaled by the display controller.
+    /// Core Animation and Android SurfaceControl both support these.
     pub yuv_layers: bool,
     pub solid_color_layers: bool,
     pub damage_hints: bool,

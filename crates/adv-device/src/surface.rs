@@ -369,6 +369,69 @@ impl PendingFrame {
     pub fn shared_video_layers(&self) -> Arc<[(u64, VideoLayer)]> {
         self.video.clone()
     }
+    /// Package G calls this when promoting a completed surface frame to the
+    /// native frame contract. Taking a picture remains the compositor's action.
+    #[cfg(feature = "native-display")]
+    pub fn fill_video(&self, frame: &mut crate::frame::Frame) {
+        frame.video = self
+            .video
+            .iter()
+            .filter_map(|(id, layer)| {
+                let picture = layer.frame.picture.as_ref()?;
+                let mapped;
+                let layer = if layer.canvas != self.extent() {
+                    mapped = layer
+                        .mapped(self.extent())
+                        .expect("validated video mapping");
+                    &mapped
+                } else {
+                    layer
+                };
+                let layout = layer
+                    .layout(self.extent())
+                    .expect("validated video geometry");
+                if layout.video.is_none() && layout.background.is_none() {
+                    return None;
+                }
+                let region = layout.video.unwrap_or(VideoRegion {
+                    destination: Rect::default(),
+                    source_uv: [0.0; 4],
+                });
+                Some(crate::frame::VideoPlane {
+                    id: *id,
+                    picture: picture.clone(),
+                    geometry: crate::frame::VideoGeometry {
+                        source: (layer.frame.width, layer.frame.height),
+                        destination: adv_gpu::Rect {
+                            x: region.destination.x,
+                            y: region.destination.y,
+                            w: region.destination.w,
+                            h: region.destination.h,
+                        },
+                        source_uv: region.source_uv,
+                        background: layout.background.map(|(r, c)| {
+                            (
+                                adv_gpu::Rect {
+                                    x: r.x,
+                                    y: r.y,
+                                    w: r.w,
+                                    h: r.h,
+                                },
+                                c,
+                            )
+                        }),
+                        clip: adv_gpu::Rect {
+                            x: layer.clip.x,
+                            y: layer.clip.y,
+                            w: layer.clip.w,
+                            h: layer.clip.h,
+                        },
+                        hide_cursor: layer.hide_cursor,
+                    },
+                })
+            })
+            .collect();
+    }
     pub fn hide_cursor(&self) -> bool {
         self.video_cursor_regions()
             .is_ok_and(|regions| regions.iter().any(|region| region.hide_cursor))
@@ -831,6 +894,28 @@ pub struct VideoFrame {
     pub height: u32,
     pub pitch: u32,
     pub bgra: Arc<[u8]>,
+    #[cfg(feature = "native-display")]
+    pub picture: Option<Arc<crate::frame::DecodedPicture>>,
+}
+
+impl VideoFrame {
+    pub fn from_bgra(width: u32, height: u32, pitch: u32, bgra: Arc<[u8]>) -> Self {
+        Self {
+            width,
+            height,
+            pitch,
+            bgra,
+            #[cfg(feature = "native-display")]
+            picture: None,
+        }
+    }
+    pub fn bgra(&self) -> std::borrow::Cow<'_, [u8]> {
+        #[cfg(feature = "native-display")]
+        if let Some(picture) = &self.picture {
+            return std::borrow::Cow::Owned(picture.bgra());
+        }
+        std::borrow::Cow::Borrowed(&self.bgra)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -939,7 +1024,11 @@ impl VideoLayer {
             .checked_mul(4)
             .ok_or("video row overflow")?;
         let bytes = u64::from(self.frame.pitch) * u64::from(self.frame.height - 1) + u64::from(row);
-        if self.frame.pitch < row || bytes > self.frame.bgra.len() as u64 {
+        #[cfg(feature = "native-display")]
+        let yuv = self.frame.picture.is_some();
+        #[cfg(not(feature = "native-display"))]
+        let yuv = false;
+        if !yuv && (self.frame.pitch < row || bytes > self.frame.bgra.len() as u64) {
             return Err("invalid video frame layout".into());
         }
         if self.source.w == 0
@@ -1074,7 +1163,7 @@ impl VideoLayer {
             h: (bottom - top) as u32,
         })
     }
-    fn pixel(&self, x: u32, y: u32) -> &[u8] {
+    fn pixel<'a>(&self, pixels: &'a [u8], x: u32, y: u32) -> &'a [u8] {
         // Sample pixel centres, matching the host GPU's nearest texture sampler.
         // Clipping keeps the original destination origin and sampling phase.
         let sx = u64::from(self.source.x)
@@ -1084,7 +1173,7 @@ impl VideoLayer {
             + (((i64::from(y) - self.destination.y) as u64 * 2 + 1) * u64::from(self.source.h))
                 / (u64::from(self.destination.h) * 2);
         let at = sy as usize * self.frame.pitch as usize + sx as usize * 4;
-        &self.frame.bgra[at..at + 4]
+        &pixels[at..at + 4]
     }
     fn compose(&self, out: &mut Snapshot) -> Result<(), String> {
         self.validate()?;
@@ -1104,10 +1193,11 @@ impl VideoLayer {
         let Some(rect) = self.clipped_rect((out.width, out.height)) else {
             return Ok(());
         };
+        let pixels = self.frame.bgra();
         for y in rect.y..rect.y + rect.h {
             for x in rect.x..rect.x + rect.w {
                 let at = (y as usize * out.width as usize + x as usize) * 4;
-                out.bgra[at..at + 4].copy_from_slice(self.pixel(x, y));
+                out.bgra[at..at + 4].copy_from_slice(self.pixel(&pixels, x, y));
             }
         }
         Ok(())
@@ -1134,6 +1224,7 @@ impl VideoLayer {
         out.width = rect.w;
         out.height = rect.h;
         out.bgra.resize(rect.w as usize * rect.h as usize * 4, 0);
+        let pixels = self.frame.bgra();
         for y in 0..rect.h {
             for x in 0..rect.w {
                 let at = (y as usize * rect.w as usize + x as usize) * 4;
@@ -1141,7 +1232,7 @@ impl VideoLayer {
                 let dy = rect.y + y;
                 if video.is_some_and(|v| dx >= v.x && dx < v.x + v.w && dy >= v.y && dy < v.y + v.h)
                 {
-                    out.bgra[at..at + 4].copy_from_slice(self.pixel(dx, dy));
+                    out.bgra[at..at + 4].copy_from_slice(self.pixel(&pixels, dx, dy));
                 } else {
                     out.bgra[at..at + 4].copy_from_slice(&self.background.unwrap().1);
                 }
@@ -1602,7 +1693,14 @@ impl<P: Presenter> Surfaces<P> {
                 self.stats.coalesced_frames += 1;
             }
             self.pending_frame = Some(frame.clone());
-            if !self.deferred_presentation {
+            #[cfg(feature = "native-display")]
+            let host_video = self
+                .video_layers
+                .iter()
+                .any(|(_, layer)| layer.frame.picture.is_some());
+            #[cfg(not(feature = "native-display"))]
+            let host_video = false;
+            if !self.deferred_presentation && !host_video {
                 self.capture_complete()?;
             }
         }

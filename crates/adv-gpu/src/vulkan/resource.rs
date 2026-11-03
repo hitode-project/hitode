@@ -187,7 +187,7 @@ impl Image {
         self.core.handle.as_raw()
     }
     pub(crate) fn create_view(&self, desc: &ViewDesc) -> Result<crate::ImageView> {
-        if self.desc().format.planes() > 1 {
+        if self.desc().format.planes() > 1 && self.core.conversion.is_some() {
             return Err(Error::Unavailable(
                 "plane views require mutable multi-planar images".into(),
             ));
@@ -195,8 +195,24 @@ impl Image {
         self.default_view(desc)
     }
     fn default_view(&self, desc: &ViewDesc) -> Result<crate::ImageView> {
-        let format = desc.format.unwrap_or(self.core.desc.format);
-        if format != self.core.desc.format && !self.core.desc.view_formats.contains(&format) {
+        let planar = self.core.desc.format == Format::Nv12 && self.core.conversion.is_none();
+        if planar
+            && (desc.plane > 1
+                || desc
+                    .format
+                    .is_some_and(|f| f != [Format::R8Unorm, Format::Rg8Unorm][desc.plane as usize]))
+        {
+            return Err(Error::Invalid("NV12 plane view".into()));
+        }
+        let format = if planar {
+            [Format::R8Unorm, Format::Rg8Unorm][desc.plane as usize]
+        } else {
+            desc.format.unwrap_or(self.core.desc.format)
+        };
+        if !planar
+            && format != self.core.desc.format
+            && !self.core.desc.view_formats.contains(&format)
+        {
             return Err(Error::Invalid(
                 "image view format not declared in view_formats".into(),
             ));
@@ -234,7 +250,11 @@ impl Image {
                 }
             }
         };
-        let aspect = formats::aspect(format);
+        let aspect = if planar {
+            [vk::ImageAspectFlags::PLANE_0, vk::ImageAspectFlags::PLANE_1][desc.plane as usize]
+        } else {
+            formats::aspect(format)
+        };
         let caps = self.core.context.caps.format(format);
         if caps.is_empty() {
             return Err(Error::Unavailable(format!("image view format {format:?}")));
@@ -353,9 +373,20 @@ impl ImageView {
     }
     pub(crate) fn size(&self) -> Extent {
         let desc = self.0.image.desc();
+        let chroma = desc.format.planes() > 1 && self.0.desc.plane == 1;
+        let width = if chroma {
+            desc.size.width.div_ceil(2)
+        } else {
+            desc.size.width
+        };
+        let height = if chroma {
+            desc.size.height.div_ceil(2)
+        } else {
+            desc.size.height
+        };
         Extent {
-            width: (desc.size.width >> self.0.desc.mips.start).max(1),
-            height: (desc.size.height >> self.0.desc.mips.start).max(1),
+            width: (width >> self.0.desc.mips.start).max(1),
+            height: (height >> self.0.desc.mips.start).max(1),
             depth_or_layers: if desc.dimension == Dimension::D3 {
                 (desc.size.depth_or_layers >> self.0.desc.mips.start).max(1)
             } else {
