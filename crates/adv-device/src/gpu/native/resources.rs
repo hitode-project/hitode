@@ -11,26 +11,52 @@ use super::Gpu;
 /// A sampled or rendered image. Clones share the allocation.
 #[derive(Clone)]
 pub struct Image {
-    pub(super) image: adv_gpu::Image,
-    /// The view draws sample and passes render: one mip level, or all.
-    pub(super) view: adv_gpu::ImageView,
+    pub(super) storage: Storage,
     pub(super) alpha: AlphaMode,
+}
+
+#[derive(Clone)]
+pub(super) enum Storage {
+    /// One allocation, and the view draws sample and passes render: one mip
+    /// level, or all (`level` is `None`).
+    Fixed {
+        image: adv_gpu::Image,
+        view: adv_gpu::ImageView,
+        level: Option<u32>,
+    },
+    /// A swap buffer: the owner thread picks its allocation for each frame.
+    Swap(std::sync::Arc<super::swap::Swap>),
 }
 
 impl Image {
     pub fn width(&self) -> u32 {
-        self.view.size().width
+        self.size().0
     }
     pub fn height(&self) -> u32 {
-        self.view.size().height
+        self.size().1
+    }
+    fn size(&self) -> (u32, u32) {
+        match &self.storage {
+            Storage::Fixed { view, .. } => (view.size().width, view.size().height),
+            Storage::Swap(swap) => swap.size,
+        }
     }
     pub fn alpha_mode(&self) -> AlphaMode {
         self.alpha
     }
-    /// Identity of the allocation, equal for every clone and mip level; the
-    /// recording keys of `adv-dx` use it where they hashed the wgpu view.
-    pub fn id(&self) -> u64 {
-        self.image.id()
+    /// Identity of the view: equal for clones, distinct per mip level. The
+    /// recording keys of `adv-dx` use it where they compared wgpu views.
+    pub fn id(&self) -> ImageId {
+        match &self.storage {
+            Storage::Fixed { image, level, .. } => ImageId {
+                allocation: image.id(),
+                level: *level,
+            },
+            Storage::Swap(swap) => ImageId {
+                allocation: swap.id,
+                level: None,
+            },
+        }
     }
     pub fn mip_levels(&self) -> u32 {
         todo!("C1")
@@ -40,14 +66,32 @@ impl Image {
         todo!("C1")
     }
     pub fn shares_storage(&self, other: &Self) -> bool {
-        self.image.id() == other.image.id()
+        self.id().allocation == other.id().allocation
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ImageId {
+    allocation: u64,
+    level: Option<u32>,
 }
 
 #[derive(Clone)]
 pub struct Depth {
     pub(super) image: adv_gpu::Image,
     pub(super) format: DepthFormat,
+}
+
+impl Depth {
+    pub fn width(&self) -> u32 {
+        self.image.desc().size.width
+    }
+    pub fn height(&self) -> u32 {
+        self.image.desc().size.height
+    }
+    pub fn format(&self) -> DepthFormat {
+        self.format
+    }
 }
 
 #[derive(Clone)]
@@ -105,6 +149,13 @@ impl Gpu {
         let _ = (width, height, depth);
         todo!("C1")
     }
+    /// The largest image side the guest may create (`D3DCAPS9` texture
+    /// limits): the device limit, at most 4096.
+    pub fn max_image_size(&self) -> u32 {
+        todo!("C1")
+    }
+    /// A swap buffer target ([`super::swap`]): its image is resolved by the
+    /// owner thread, which hands it to presentation without a copy.
     pub fn presentation_target(
         &self,
         width: u32,

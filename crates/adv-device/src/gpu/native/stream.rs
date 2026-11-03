@@ -8,8 +8,9 @@
 //! allocates nothing. One lock per chunk, never per command; the owner thread
 //! is woken only when it waits for work.
 
+use super::Image;
 use adv_gpu::encode::IndexFormat;
-use adv_gpu::{Buffer, Image, ImageView, Rect, RenderPipeline, Ring, Sampler, Span};
+use adv_gpu::{Buffer, Rect, RenderPipeline, Ring, Sampler, Span};
 use arrayvec::ArrayVec;
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
@@ -34,7 +35,7 @@ pub(crate) enum Binding {
     Storage(Bytes),
     /// A persistent buffer: static guest vertex or index data.
     Buffer(Buffer, std::ops::Range<u64>),
-    Sampled(ImageView),
+    Sampled(Image),
     Sampler(Sampler),
 }
 
@@ -61,8 +62,8 @@ pub(crate) struct Draw {
 pub(crate) enum Command {
     /// Following clears and draws render to these attachments.
     Target {
-        color: ImageView,
-        depth: Option<ImageView>,
+        color: Image,
+        depth: Option<adv_gpu::Image>,
     },
     Clear {
         area: Rect,
@@ -89,7 +90,7 @@ pub(crate) enum Command {
     },
     /// The executor's depth buffer is undefined from here
     /// (D3D9 `DISCARD_DEPTHSTENCIL`).
-    DiscardDepth(Image),
+    DiscardDepth(adv_gpu::Image),
     /// Copy `rect` of `image` into `into` and submit; `done` runs when the
     /// bytes are readable.
     Readback {

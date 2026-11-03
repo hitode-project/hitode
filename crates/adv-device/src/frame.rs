@@ -25,12 +25,20 @@ pub struct Frame {
 }
 
 pub enum Base {
-    /// A D3D9 or DirectDraw back buffer; its last write completes at `ready`.
+    /// A D3D9 or DirectDraw swap buffer; its last write completes at `ready`.
     Gpu {
-        image: adv_gpu::Image,
+        image: SwapImage,
         damage: Damage,
         ready: Token,
     },
+}
+
+pub enum SwapImage {
+    /// Read by the display layer's stages, which the owner thread encodes
+    /// before the next frame writes the image.
+    Private(adv_gpu::Image),
+    /// Shown by reference; back in its pool once the compositor releases it.
+    Presentable(adv_gpu::PresentImage),
 }
 
 /// Package E.
@@ -39,5 +47,11 @@ pub struct VideoPlane {}
 /// The display layer's entry on the GPU owner thread. It encodes its stages on
 /// the same queue, after the frame's own commands.
 pub trait Presenter: Send {
+    /// Whether swap buffers of this size should be presentable buffers: the
+    /// display plan shows them by reference (`SwapRole` in `adv-display`).
+    /// Changes with settings or rotation, never per frame.
+    fn presentable(&self, width: u32, height: u32) -> bool;
     fn present(&mut self, queue: &mut adv_gpu::Queue, frame: Frame);
+    /// Return the images the compositor released to their pools; nonblocking.
+    fn drain(&mut self);
 }

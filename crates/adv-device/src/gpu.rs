@@ -25,7 +25,7 @@ use depth::DeferredClear;
 pub use depth::Depth;
 pub use depth::{DepthFormat, Stencil, StencilFace, StencilOp};
 #[cfg(feature = "native-display")]
-pub use native::{Depth, Gpu, Image, Readback, Staged, Target};
+pub use native::{Depth, Gpu, Image, ImageId, Readback, Staged, Target};
 pub use programmable::{
     Attribute, AttributeFormat, ConstantBlock, Program, ProgramTexture, ProgrammableDraw,
     VertexStream,

@@ -4,10 +4,14 @@
 
 use super::super::{DrawState, Error, Filter, ProgrammableDraw, Rect, Vertex};
 use super::{Gpu, Image, Target};
+use crate::frame::Damage;
 use std::sync::Arc;
 
 /// A copy of an image the guest reads back.
-pub struct Readback {}
+pub struct Readback {
+    pub width: u32,
+    pub height: u32,
+}
 
 impl Readback {
     pub fn cancel(&self) {
@@ -29,6 +33,18 @@ impl Gpu {
         depth: Option<f32>,
     ) -> Result<(), Error> {
         self.clear_with_stencil(target, color, depth, None)
+    }
+    /// D3D9 `Clear` with rectangles: clears `rectangle` of the attachments.
+    pub fn clear_region(
+        &mut self,
+        target: &Target,
+        rectangle: Rect,
+        color: Option<[f64; 4]>,
+        depth: Option<f32>,
+        stencil: Option<u32>,
+    ) -> Result<(), Error> {
+        let _ = (target, rectangle, color, depth, stencil);
+        todo!("C2")
     }
     pub fn clear_with_stencil(
         &mut self,
@@ -82,8 +98,13 @@ impl Gpu {
         todo!("C2")
     }
     /// End the guest frame: submit and hand `image` to presentation.
-    pub fn present(&mut self, image: &Image, serial: u64) -> Result<(), Error> {
-        let _ = (image, serial);
+    /// `damage` is what changed since the previous present of `image`.
+    pub fn present(&mut self, image: &Image, damage: Damage, serial: u64) -> Result<(), Error> {
+        let _ = (image, damage, serial);
+        todo!("C2")
+    }
+    /// Submit what is recorded without ending the frame (D3D9 query flushes).
+    pub fn flush(&mut self) {
         todo!("C2")
     }
     pub fn readback(

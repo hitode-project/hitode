@@ -25,6 +25,9 @@
 //!   transient attachments (memoryless on Apple, lazily allocated on Vulkan).
 //! - Recording allocates nothing after warm-up: command chunks and their ring
 //!   spans are reused.
+//! - Swap buffers are presentable buffers whenever the display plan shows
+//!   them by reference, so a frame reaches the system compositor without a
+//!   copy; the owner thread picks each frame's buffer ([`swap`]).
 //!
 //! # Ownership of the files
 //!
@@ -35,6 +38,7 @@
 //! | `pipelines.rs` | C1 | fixed-function, programmable and blit pipelines; the disk cache |
 //! | `record.rs` | C2 | clears, draws, blits, copies, presents and readbacks as commands |
 //! | `owner.rs` | C2 | the owner thread: passes, encoding, submission, frames |
+//! | `swap.rs` | C2 | swap buffers: private or presentable, age repair |
 //! | `surface.rs` native surfaces | C2 | present through [`Gpu::present`]; the rotation pool and `NativeFrame` publication of the wgpu renderer are compiled out under this feature |
 //! | `frame.rs`, software and video slots | E | frames, video planes and their presentation layers |
 //!
@@ -47,9 +51,10 @@ mod pipelines;
 mod record;
 mod resources;
 pub(crate) mod stream;
+mod swap;
 
 pub use record::Readback;
-pub use resources::{Depth, Image, Staged, Target};
+pub use resources::{Depth, Image, ImageId, Staged, Target};
 
 use super::{Error, Rect, Stats};
 
