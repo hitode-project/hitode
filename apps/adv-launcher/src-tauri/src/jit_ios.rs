@@ -405,7 +405,9 @@ fn listen(listener: TcpListener, token: &str, task: Task, pairing: Vec<u8>) -> R
         "pairing": pairing,
     });
     if task == Task::Enable {
-        let (port, source) = crate::remote_pairing::port(Duration::from_secs(3));
+        // The loopback instance is a local record and answers at once; before
+        // iOS 27 none is visible on the device, so this bounds the wait.
+        let (port, source) = crate::remote_pairing::port(Duration::from_millis(500));
         log::info!("JIT helper: RemotePairing port {port} ({source})");
         request["remotePairingPort"] = port.into();
     }
