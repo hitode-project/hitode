@@ -8,15 +8,19 @@ pub(crate) struct Shader(Arc<ShaderCore>);
 struct ShaderCore {
     context: Arc<Context>,
     identity: u64,
-    module: vk::ShaderModule,
+    /// One module per entry point, except precompiled SPIR-V, which keeps its
+    /// single module, and heap shaders, which lower per pipeline. Adreno
+    /// drivers fail pipeline creation for some modules with several entry
+    /// points of one stage, so lowered IR never shares a module.
+    modules: Vec<vk::ShaderModule>,
     entries: Vec<(CString, Stage)>,
     storage_strides: Vec<HashMap<u32, u32>>,
     heap: Option<HeapShader>,
 }
 impl Drop for ShaderCore {
     fn drop(&mut self) {
-        unsafe {
-            self.context.device.destroy_shader_module(self.module, None);
+        for &module in &self.modules {
+            unsafe { self.context.device.destroy_shader_module(module, None) };
         }
     }
 }
@@ -70,11 +74,7 @@ impl Shader {
             let mut words = lower(
                 &module,
                 Some(&naga::back::spv::PipelineOptions {
-                    shader_stage: match entry.stage {
-                        Stage::Vertex => naga::ShaderStage::Vertex,
-                        Stage::Fragment => naga::ShaderStage::Fragment,
-                        Stage::Compute => naga::ShaderStage::Compute,
-                    },
+                    shader_stage: naga_stage(entry.stage),
                     entry_point: self.0.entries[entry.index as usize]
                         .0
                         .to_str()
@@ -96,7 +96,8 @@ impl Shader {
                 true,
             )
         } else {
-            (self.0.module, false)
+            let index = (entry.index as usize).min(self.0.modules.len() - 1);
+            (self.0.modules[index], false)
         };
         Ok(ShaderStage {
             shader: self,
@@ -158,6 +159,14 @@ enum Part {
     Shift,
     Offset,
 }
+fn naga_stage(stage: Stage) -> naga::ShaderStage {
+    match stage {
+        Stage::Vertex => naga::ShaderStage::Vertex,
+        Stage::Fragment => naga::ShaderStage::Fragment,
+        Stage::Compute => naga::ShaderStage::Compute,
+    }
+}
+
 fn lower(
     module: &naga::Module,
     entry: Option<&naga::back::spv::PipelineOptions>,
@@ -309,9 +318,7 @@ impl Device {
                 .iter()
                 .all(|(_, g)| g.binding.is_none());
         let mut patches = Vec::new();
-        let words = if already_lowered {
-            precompiled.unwrap().to_vec()
-        } else {
+        if !already_lowered {
             if let Some(heap) = &self.0.heap {
                 patches = rewrite_heap(
                     &mut module,
@@ -329,28 +336,51 @@ impl Device {
                     }
                 }
             }
-            lower(&module, None, self.0.heap.is_some())?
+        }
+        // Heap and video shaders lower per pipeline, from the module kept here.
+        let per_pipeline = !already_lowered && (self.0.heap.is_some() || !video.is_empty());
+        let lowered: Vec<Vec<u32>> = if already_lowered {
+            vec![precompiled.unwrap().to_vec()]
+        } else if per_pipeline {
+            Vec::new()
+        } else {
+            entries
+                .iter()
+                .map(|(name, stage)| {
+                    lower(
+                        &module,
+                        Some(&naga::back::spv::PipelineOptions {
+                            shader_stage: naga_stage(*stage),
+                            entry_point: name.to_str().unwrap().into(),
+                        }),
+                        false,
+                    )
+                })
+                .collect::<Result<_>>()?
         };
-        let heap = (self.0.heap.is_some() || !video.is_empty()).then_some(HeapShader {
-            module,
-            patches,
-            video,
-        });
-        let handle = self.0.result(unsafe {
-            self.0
-                .device
-                .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None)
-        })?;
+        let mut core = ShaderCore {
+            context: self.0.clone(),
+            identity: desc.identity,
+            modules: Vec::with_capacity(lowered.len()),
+            entries,
+            storage_strides,
+            heap: per_pipeline.then_some(HeapShader {
+                module,
+                patches,
+                video,
+            }),
+        };
+        // Dropping `core` on an error destroys the modules created so far.
+        for words in &lowered {
+            core.modules.push(self.0.result(unsafe {
+                self.0
+                    .device
+                    .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(words), None)
+            })?);
+        }
         Ok(crate::Shader {
             identity: desc.identity,
-            inner: Shader(Arc::new(ShaderCore {
-                context: self.0.clone(),
-                identity: desc.identity,
-                module: handle,
-                entries,
-                storage_strides,
-                heap,
-            })),
+            inner: Shader(Arc::new(core)),
         })
     }
 }

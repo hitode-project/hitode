@@ -10,25 +10,25 @@ fn software_pixel(x: u32, y: u32) -> vec4<f32> {
     let surface = parameters[0];
     let row = y * surface.z;
     let kind = surface.w;
-    var color = 0u;
+    // Direct formats keep their channels apart. Assembling them into one u32
+    // first is miscompiled on Adreno 750, which sign-extends bit 15 into the
+    // upper channels.
+    var bgra = vec4<u32>(0u);
     if kind == 0u {
         let at = row + x * 4u;
-        color = byte_at(at) | (byte_at(at + 1u) << 8u) |
-            (byte_at(at + 2u) << 16u) | (byte_at(at + 3u) << 24u);
+        bgra = vec4(byte_at(at), byte_at(at + 1u), byte_at(at + 2u), byte_at(at + 3u));
     } else if kind == 1u {
         let at = row + x * 3u;
-        color = byte_at(at) | (byte_at(at + 1u) << 8u) | (byte_at(at + 2u) << 16u);
+        bgra = vec4(byte_at(at), byte_at(at + 1u), byte_at(at + 2u), 0u);
     } else if kind <= 3u {
         let at = row + x * 2u;
         let raw = byte_at(at) | (byte_at(at + 1u) << 8u);
-        let blue = (raw & 31u) * 255u / 31u;
-        var green = ((raw >> 5u) & 31u) * 255u / 31u;
-        var red = ((raw >> 10u) & 31u) * 255u / 31u;
+        bgra = vec4((raw & 31u) * 255u / 31u, ((raw >> 5u) & 31u) * 255u / 31u,
+            ((raw >> 10u) & 31u) * 255u / 31u, 0u);
         if kind == 2u {
-            green = ((raw >> 5u) & 63u) * 255u / 63u;
-            red = ((raw >> 11u) & 31u) * 255u / 31u;
+            bgra.y = ((raw >> 5u) & 63u) * 255u / 63u;
+            bgra.z = ((raw >> 11u) & 31u) * 255u / 31u;
         }
-        color = blue | (green << 8u) | (red << 16u);
     } else {
         var index = 0u;
         if kind == 5u {
@@ -37,9 +37,9 @@ fn software_pixel(x: u32, y: u32) -> vec4<f32> {
             index = (byte_at(row + x / 8u) >> (7u - x % 8u)) & 1u;
         }
         else { index = byte_at(row + x); }
-        color = parameters[1u + index / 4u][index % 4u];
+        return unpack4x8unorm(parameters[1u + index / 4u][index % 4u]).bgra;
     }
-    return unpack4x8unorm(color).bgra;
+    return vec4<f32>(bgra.zyxw) / 255.0;
 }
 fn software_vertex(vertex: u32, tile: u32) -> vec4<f32> {
     let corners = array<vec2<u32>, 6>(vec2(0u, 0u), vec2(1u, 0u), vec2(0u, 1u),
