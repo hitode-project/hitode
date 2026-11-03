@@ -8,10 +8,7 @@
 use super::super::{AlphaMode, DepthFormat, Error, Rect, TexelFormat};
 use super::Gpu;
 use adv_gpu::resource::{BufferDesc, BufferUsage, Dimension, ImageDesc, Memory, Usage, ViewDesc};
-use std::sync::{
-    Arc, Weak,
-    atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering},
-};
+use std::sync::Arc;
 
 pub(super) fn gpu_error(error: adv_gpu::Error) -> Error {
     match error {
@@ -262,101 +259,65 @@ impl Target {
     }
 }
 
+/// Idle staging bytes kept for reuse.
 const FREE_STAGING_BYTES: u64 = 64 << 20;
 
+/// Every staging buffer, shared with the [`Staged`] handles that use it. A
+/// buffer is free once the pool holds its only reference: the owner thread
+/// drops its handle after the submission that read it completed.
 #[derive(Default)]
-pub(super) struct StagingPool {
-    returned: Arc<FreeStaging>,
-    buffers: Vec<Arc<StagingBuffer>>,
-}
-#[derive(Default)]
-struct FreeStaging {
-    /// Multiple dropping threads return nodes; only Gpu::stage takes them.
-    head: AtomicPtr<StagingBuffer>,
-    bytes: AtomicU64,
-}
-struct StagingBuffer {
-    buffer: adv_gpu::Buffer,
-    /// Cache the persistent mapping once; reuse makes no driver call.
-    mapping: AtomicPtr<u8>,
-    pool: Weak<FreeStaging>,
-    /// Count Staged handles independently of the pool's reusable Arc allocation.
-    users: AtomicUsize,
-    next: AtomicPtr<StagingBuffer>,
-}
+pub(super) struct StagingPool(Vec<Arc<adv_gpu::Buffer>>);
+
 impl StagingPool {
-    fn reclaim(&mut self) {
-        let mut next = self
-            .returned
-            .head
-            .swap(std::ptr::null_mut(), Ordering::Acquire);
-        while !next.is_null() {
-            // SAFETY: each published node owns one Arc. Swapping the head
-            // transfers the whole list exclusively to this single consumer.
-            let buffer = unsafe { Arc::from_raw(next) };
-            next = buffer.next.load(Ordering::Relaxed);
-            self.buffers.push(buffer);
+    /// The smallest free buffer of at least `size` bytes, or a new one after
+    /// trimming idle buffers to the budget.
+    fn take(&mut self, device: &adv_gpu::Device, size: u64) -> Result<Arc<adv_gpu::Buffer>, Error> {
+        let mut best: Option<(usize, u64)> = None;
+        for (n, buffer) in self.0.iter_mut().enumerate() {
+            let len = buffer.desc().size;
+            if len >= size && best.is_none_or(|(_, b)| len < b) && Arc::get_mut(buffer).is_some() {
+                best = Some((n, len));
+            }
         }
-    }
-}
-impl Drop for FreeStaging {
-    fn drop(&mut self) {
-        let mut next = *self.head.get_mut();
-        while !next.is_null() {
-            // SAFETY: the last pool reference is gone, so no producer can
-            // publish another node. Each queued pointer owns one Arc.
-            let buffer = unsafe { Arc::from_raw(next) };
-            next = buffer.next.load(Ordering::Relaxed);
+        if let Some((n, _)) = best {
+            return Ok(self.0[n].clone());
         }
+        let mut idle: u64 = self
+            .0
+            .iter_mut()
+            .filter_map(|b| Arc::get_mut(b).map(|b| b.desc().size))
+            .sum();
+        self.0.retain_mut(|b| {
+            let Some(b) = Arc::get_mut(b) else {
+                return true;
+            };
+            if idle + size <= FREE_STAGING_BYTES {
+                return true;
+            }
+            idle -= b.desc().size;
+            false
+        });
+        let buffer = Arc::new(
+            device
+                .create_buffer(&BufferDesc {
+                    size,
+                    usage: BufferUsage::COPY_SRC,
+                    memory: Memory::Upload,
+                    label: "staged guest rows",
+                })
+                .map_err(gpu_error)?,
+        );
+        self.0.push(buffer.clone());
+        Ok(buffer)
     }
 }
 
 /// Immutable guest rows in a pooled, CPU-written upload buffer.
+#[derive(Clone)]
 pub struct Staged {
-    buffer: Arc<StagingBuffer>,
+    buffer: Arc<adv_gpu::Buffer>,
     pitch: u32,
     len: u32,
-}
-impl Clone for Staged {
-    fn clone(&self) -> Self {
-        self.buffer.users.fetch_add(1, Ordering::Relaxed);
-        Self {
-            buffer: self.buffer.clone(),
-            pitch: self.pitch,
-            len: self.len,
-        }
-    }
-}
-impl Drop for Staged {
-    fn drop(&mut self) {
-        if self.buffer.users.fetch_sub(1, Ordering::AcqRel) == 1
-            && let Some(pool) = self.buffer.pool.upgrade()
-        {
-            let size = self.buffer.buffer.desc().size;
-            if pool
-                .bytes
-                .try_update(Ordering::Relaxed, Ordering::Relaxed, |bytes| {
-                    (size <= FREE_STAGING_BYTES - bytes).then_some(bytes + size)
-                })
-                .is_ok()
-            {
-                let node = Arc::into_raw(self.buffer.clone()).cast_mut();
-                let mut head = pool.head.load(Ordering::Relaxed);
-                loop {
-                    self.buffer.next.store(head, Ordering::Relaxed);
-                    match pool.head.compare_exchange_weak(
-                        head,
-                        node,
-                        Ordering::Release,
-                        Ordering::Relaxed,
-                    ) {
-                        Ok(_) => break,
-                        Err(current) => head = current,
-                    }
-                }
-            }
-        }
-    }
 }
 impl Staged {
     pub fn pitch(&self) -> u32 {
@@ -369,7 +330,7 @@ impl Staged {
         self.len == 0
     }
     pub(super) fn buffer(&self) -> &adv_gpu::Buffer {
-        &self.buffer.buffer
+        &self.buffer
     }
 }
 
@@ -466,65 +427,19 @@ impl Gpu {
             .checked_mul(rows)
             .filter(|_| row_bytes != 0 && rows != 0)
             .ok_or_else(|| Error::Invalid("staged upload size".into()))?;
-        self.staging.reclaim();
-        let pooled = {
-            let pool = &mut self.staging;
-            let best = pool
-                .buffers
-                .iter()
-                .enumerate()
-                .filter(|(_, b)| b.buffer.desc().size >= u64::from(size))
-                .min_by_key(|(_, b)| b.buffer.desc().size)
-                .map(|(n, _)| n);
-            best.map(|n| {
-                let buffer = pool.buffers.swap_remove(n);
-                pool.returned
-                    .bytes
-                    .fetch_sub(buffer.buffer.desc().size, Ordering::Relaxed);
-                buffer.users.store(1, Ordering::Relaxed);
-                buffer
-            })
-        };
-        let buffer = match pooled {
-            Some(buffer) => buffer,
-            None => {
-                let buffer = self
-                    .device
-                    .create_buffer(&BufferDesc {
-                        size: u64::from(size),
-                        usage: BufferUsage::COPY_SRC,
-                        memory: Memory::Upload,
-                        label: "staged guest rows",
-                    })
-                    .map_err(gpu_error)?;
-                let mapping = AtomicPtr::new(buffer.mapped().unwrap().cast::<u8>().as_ptr());
-                Arc::new(StagingBuffer {
-                    buffer,
-                    mapping,
-                    pool: Arc::downgrade(&self.staging.returned),
-                    users: AtomicUsize::new(1),
-                    next: AtomicPtr::default(),
-                })
-            }
-        };
-        let staged = Staged {
-            buffer,
-            pitch: row_bytes,
-            len: size,
-        };
-        // SAFETY: the pool releases a buffer only after the last Staged handle
-        // is gone, including the owner's handle retained through completion.
-        let bytes = unsafe {
-            std::slice::from_raw_parts_mut(
-                staged.buffer.mapping.load(Ordering::Relaxed),
-                size as usize,
-            )
-        };
+        let buffer = self.staging.take(&self.device, u64::from(size))?;
+        // SAFETY: `take` returns a buffer no other handle shares, so neither the
+        // GPU nor another writer touches it until the returned `Staged` is used.
+        let bytes = unsafe { &mut buffer.mapped().unwrap().as_mut()[..size as usize] };
         let result = fill(&mut |y, row| {
             let at = y as usize * row_bytes as usize;
             bytes[at..at + row_bytes as usize].copy_from_slice(row);
         });
-        Ok(result.map(|()| staged))
+        Ok(result.map(|()| Staged {
+            buffer,
+            pitch: row_bytes,
+            len: size,
+        }))
     }
     pub fn upload_staged(
         &mut self,
@@ -1017,7 +932,14 @@ pub(super) mod tests {
             let actual = sample(&mut gpu, &mut queue, &image);
             let expected = expanded(format, &input);
             assert_eq!(actual.len(), expected.len());
-            if let Some(at) = actual.iter().zip(&expected).position(|(a, b)| a != b) {
+            // Float to unorm may yield either neighboring integer (Vulkan "Fixed-Point
+            // Data Conversions"); only 5- and 6-bit channels convert to non-integers.
+            let slack = u8::from(format == TexelFormat::B5g6r5);
+            if let Some(at) = actual
+                .iter()
+                .zip(&expected)
+                .position(|(a, b)| a.abs_diff(*b) > slack)
+            {
                 mismatches.push(format!(
                     "{format:?} differs at byte {at}: {} != {}",
                     actual[at], expected[at]
@@ -1140,45 +1062,17 @@ pub(super) mod tests {
         let medium_id = Arc::as_ptr(&medium.buffer);
         let held = medium.clone();
         drop(medium);
-        gpu.staging.reclaim();
-        assert!(gpu.staging.buffers.is_empty());
+        // A clone still shares it, so a fitting request allocates.
+        assert_ne!(Arc::as_ptr(&stage(&mut gpu, 8).buffer), medium_id);
         drop(large);
         std::thread::spawn(move || drop(held)).join().unwrap();
-        let reused = stage(&mut gpu, 5);
-        assert_eq!(Arc::as_ptr(&reused.buffer), medium_id);
-        drop(reused);
-        assert_eq!(Arc::as_ptr(&stage(&mut gpu, 8).buffer), medium_id);
+        assert_eq!(Arc::as_ptr(&stage(&mut gpu, 5).buffer), medium_id);
         drop(small);
+        assert_eq!(gpu.staging.0.len(), 4);
+        // A request past the budget trims every idle buffer first.
         let above_budget = stage(&mut gpu, FREE_STAGING_BYTES as u32);
+        assert_eq!(gpu.staging.0.len(), 1);
         drop(above_budget);
-        gpu.staging.reclaim();
-        assert_eq!(gpu.staging.returned.bytes.load(Ordering::Relaxed), 24);
-        assert_eq!(gpu.staging.buffers.len(), 3);
-    }
-
-    // spec: GFX-SAMPLER-4
-    #[test]
-    fn concurrent_staging_returns_are_released_when_the_pool_drops() {
-        let Some((mut gpu, _, _)) = open() else {
-            return;
-        };
-        let staged: Vec<_> = (0..8)
-            .map(|_| gpu.stage(4, 1, |_| Ok::<(), ()>(())).unwrap().unwrap())
-            .collect();
-        let buffers: Vec<_> = staged.iter().map(|s| Arc::downgrade(&s.buffer)).collect();
-        let barrier = Arc::new(std::sync::Barrier::new(staged.len()));
-        std::thread::scope(|scope| {
-            for staged in staged {
-                let barrier = barrier.clone();
-                scope.spawn(move || {
-                    barrier.wait();
-                    drop(staged);
-                });
-            }
-        });
-        assert_eq!(gpu.staging.returned.bytes.load(Ordering::Relaxed), 32);
-        drop(gpu);
-        assert!(buffers.iter().all(|b| b.upgrade().is_none()));
     }
     // spec: GFX-SAMPLER-4
     #[test]

@@ -1105,6 +1105,10 @@ struct Color {rgba:vec4<f32>}
 
     // spec: GFX-REC-5
     #[test]
+    #[cfg_attr(
+        not(any(target_vendor = "apple", target_os = "android")),
+        ignore = "presentable pools exist only on Apple and Android"
+    )]
     fn swap_age_repair_and_role_changes_preserve_exact_content() {
         let Some((device, queue)) = open() else {
             return;
@@ -1175,6 +1179,10 @@ struct Color {rgba:vec4<f32>}
 
     // spec: GFX-REC-5
     #[test]
+    #[cfg_attr(
+        not(any(target_vendor = "apple", target_os = "android")),
+        ignore = "presentable pools exist only on Apple and Android"
+    )]
     fn an_exhausted_swap_pool_waits_for_compositor_release() {
         let Some((device, queue)) = open() else {
             return;
