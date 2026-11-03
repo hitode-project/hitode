@@ -874,7 +874,6 @@ fn depth_and_stencil_tests_reject_fragments() {
         .find(|&f| gpu.supports(f, FormatCaps::DEPTH_STENCIL))
         .expect("depth format with stencil");
     let image = gpu.target(8, 8, Format::Rgba8Unorm);
-    let depth = gpu.depth(8, 8, format);
     let face = |compare, pass| StencilFace {
         compare,
         fail: StencilOp::Keep,
@@ -895,51 +894,70 @@ fn depth_and_stencil_tests_reject_fragments() {
     mark.depth_stencil = Some(state(Compare::Always, StencilOp::Replace, Compare::Always));
     let mark = gpu.pipeline(&mark);
     let mut test = gpu.solid_desc(Format::Rgba8Unorm);
-    test.depth_stencil = Some(state(Compare::Equal, StencilOp::Keep, Compare::Less));
+    let mut tested = state(Compare::Equal, StencilOp::Keep, Compare::Less);
+    tested.depth_write = false;
+    test.depth_stencil = Some(tested);
     let test = gpu.pipeline(&test);
 
-    // Mark the left half with stencil 1 at depth 0.5, then draw red at 0.7
-    // (fails depth) and green at 0.3 (passes where marked).
+    // Mark the left half with stencil 1 at depth 0.5, then in a second pass
+    // draw red at 0.7 (fails depth) and green at 0.3 (passes where marked).
     let (uniforms, stride) = gpu.uniforms(&[block(WHITE, 0.5), block(RED, 0.7), block(GREEN, 0.3)]);
-    let attachment = DepthAttachment {
-        view: depth.view(),
-        depth: (Load::Clear(1.0), Store::DontCare),
-        stencil: (Load::Clear(0), Store::DontCare),
-        read_only: false,
-    };
-    let mut encoder = gpu.queue.encoder("depth");
-    {
-        let mut pass = encoder.render_pass(&pass(
-            color(image.view(), clear(BLUE)),
-            Some(attachment),
-            whole(8, 8),
-        ));
-        pass.set_stencil_reference(1);
-        pass.set_pipeline(&mark);
-        pass.set_scissor(Rect {
-            x: 0,
-            y: 0,
-            w: 4,
-            h: 8,
-        });
-        pass.bind(0, Bind::Uniform(uniforms.slice(0..32)));
-        pass.draw(0..3, 0..1);
-        pass.set_scissor(whole(8, 8));
-        pass.set_pipeline(&test);
-        for i in 1..3 {
-            pass.bind(
-                0,
-                Bind::Uniform(uniforms.slice(i * stride..i * stride + 32)),
-            );
+    // A depth attachment larger than the color one serves the color's size.
+    for (width, height) in [(8, 8), (12, 10)] {
+        let depth = gpu.depth(width, height, format);
+        let mut encoder = gpu.queue.encoder("depth");
+        {
+            let mut pass = encoder.render_pass(&pass(
+                color(image.view(), clear(BLUE)),
+                Some(DepthAttachment {
+                    view: depth.view(),
+                    depth: (Load::Clear(1.0), Store::Store),
+                    stencil: (Load::Clear(0), Store::Store),
+                    read_only: false,
+                }),
+                whole(8, 8),
+            ));
+            pass.set_stencil_reference(1);
+            pass.set_pipeline(&mark);
+            pass.set_scissor(Rect {
+                x: 0,
+                y: 0,
+                w: 4,
+                h: 8,
+            });
+            pass.bind(0, Bind::Uniform(uniforms.slice(0..32)));
             pass.draw(0..3, 0..1);
         }
-    }
-    gpu.submit(encoder);
-    let bytes = gpu.read(&image);
-    for y in 0..8 {
-        for x in 0..8 {
-            let expected = if x < 4 { GREEN } else { BLUE };
-            assert_eq!(pixel(&bytes, 8, x, y), rgba8(expected), "({x}, {y})");
+        // A pass that tests depth and stencil without writing them still
+        // binds them (`Store::None`).
+        {
+            let mut pass = encoder.render_pass(&pass(
+                color(image.view(), Load::Load),
+                Some(DepthAttachment {
+                    view: depth.view(),
+                    depth: (Load::Load, Store::None),
+                    stencil: (Load::Load, Store::None),
+                    read_only: false,
+                }),
+                whole(8, 8),
+            ));
+            pass.set_stencil_reference(1);
+            pass.set_pipeline(&test);
+            for i in 1..3 {
+                pass.bind(
+                    0,
+                    Bind::Uniform(uniforms.slice(i * stride..i * stride + 32)),
+                );
+                pass.draw(0..3, 0..1);
+            }
+        }
+        gpu.submit(encoder);
+        let bytes = gpu.read(&image);
+        for y in 0..8 {
+            for x in 0..8 {
+                let expected = if x < 4 { GREEN } else { BLUE };
+                assert_eq!(pixel(&bytes, 8, x, y), rgba8(expected), "({x}, {y})");
+            }
         }
     }
 }

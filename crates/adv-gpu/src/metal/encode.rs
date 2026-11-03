@@ -87,7 +87,7 @@ impl Encoder {
             let attachment = unsafe { d.colorAttachments().objectAtIndexedSubscript(i) };
             size.width = size.width.min(color.view.size().width);
             size.height = size.height.min(color.view.size().height);
-            if color.load == Load::None || color.store == Store::None {
+            if !attached(color.load, color.store) {
                 continue;
             }
             attachment.setTexture(Some(&color.view.inner.raw));
@@ -144,7 +144,7 @@ impl Encoder {
             size.height = size.height.min(depth.view.size().height);
             let bounded = partial(desc.area, depth.view.size())
                 && view.raw.storageMode() != MTLStorageMode::Memoryless;
-            if depth.depth.0 != Load::None && depth.depth.1 != Store::None {
+            if attached(depth.depth.0, depth.depth.1) {
                 let attachment = d.depthAttachment();
                 attachment.setTexture(Some(&view.raw));
                 attachment.setLoadAction(load(depth.depth.0, bounded));
@@ -154,8 +154,7 @@ impl Encoder {
                 }
             }
             if view.raw.pixelFormat() == MTLPixelFormat::Depth32Float_Stencil8
-                && depth.stencil.0 != Load::None
-                && depth.stencil.1 != Store::None
+                && attached(depth.stencil.0, depth.stencil.1)
             {
                 let attachment = d.stencilAttachment();
                 attachment.setTexture(Some(&view.raw));
@@ -492,6 +491,11 @@ pub(super) fn intersect(a: Rect, b: Rect) -> Rect {
         w: (a.x.saturating_add(a.w).min(b.x.saturating_add(b.w))).saturating_sub(x),
         h: (a.y.saturating_add(a.h).min(b.y.saturating_add(b.h))).saturating_sub(y),
     }
+}
+/// Whether the pass binds the attachment: Metal leaves out one the pass
+/// neither reads nor keeps. A read-only one (`Load` with `Store::None`) stays.
+pub(super) fn attached<T>(load: Load<T>, store: Store) -> bool {
+    matches!(load, Load::Load) || !matches!(load, Load::None) && store != Store::None
 }
 pub(super) fn partial(area: Rect, size: Extent) -> bool {
     area.x != 0 || area.y != 0 || area.w < size.width || area.h < size.height

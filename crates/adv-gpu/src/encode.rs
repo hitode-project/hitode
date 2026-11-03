@@ -43,6 +43,8 @@ pub struct ColorAttachment<'a> {
     pub resolve: Option<&'a ImageView>,
 }
 
+/// The view may be larger than the color attachments, as a D3D depth buffer
+/// may be; the pass then covers the colors' size.
 pub struct DepthAttachment<'a> {
     pub view: &'a ImageView,
     pub depth: (Load<f32>, Store),

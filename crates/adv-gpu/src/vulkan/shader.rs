@@ -169,16 +169,15 @@ fn lower(
         naga::valid::ValidationFlags::all()
     };
     let info = validate(module, flags)?;
-    naga::back::spv::write_vec(
-        module,
-        &info,
-        &naga::back::spv::Options {
-            lang_version: (1, 3),
-            ..Default::default()
-        },
-        entry,
-    )
-    .map_err(|e| Error::Compile(format!("SPIR-V lowering: {e}")))
+    let mut options = naga::back::spv::Options {
+        lang_version: (1, 3),
+        ..Default::default()
+    };
+    // Point lists need a written PointSize without maintenance5; Metal
+    // lowering forces it the same way.
+    options.flags |= naga::back::spv::WriterFlags::FORCE_POINT_SIZE;
+    naga::back::spv::write_vec(module, &info, &options, entry)
+        .map_err(|e| Error::Compile(format!("SPIR-V lowering: {e}")))
 }
 #[derive(Clone)]
 struct StorageShape {

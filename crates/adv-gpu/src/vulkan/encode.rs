@@ -444,7 +444,18 @@ impl Encoder {
         }
         if let Some(depth) = &desc.depth_stencil {
             let view = &depth.view.inner;
-            dimensions = view.size();
+            // The depth attachment may be larger than the color ones; the
+            // framebuffer may exceed none of them.
+            let size = view.size();
+            dimensions = if desc.colors.is_empty() {
+                size
+            } else {
+                Extent {
+                    width: dimensions.width.min(size.width),
+                    height: dimensions.height.min(size.height),
+                    ..dimensions
+                }
+            };
             let layout = if depth.read_only {
                 vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL
             } else {
