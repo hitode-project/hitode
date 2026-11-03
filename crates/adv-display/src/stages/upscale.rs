@@ -434,7 +434,7 @@ fn words(values: impl IntoIterator<Item = u32>) -> Vec<u8> {
 #[cfg(test)]
 mod precision_tests {
     use super::*;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     /// The case a child process compiles; unset in the parent.
     const CASE: &str = "ADV_UPSCALE_COMPILE_CASE";
@@ -584,47 +584,68 @@ mod precision_tests {
         }
     }
 
-    /// Each case compiles in its own process, so a driver crash names the
-    /// form and every other case still reports. The rewrites of `SUBJECT`
-    /// show which construct a compiler rejects.
+    /// Cases compile in a child process that announces each one first; a
+    /// driver crash names its case and a new child resumes after it, so every
+    /// other case still reports. The rewrites of `SUBJECT` show which
+    /// construct a compiler rejects.
     #[test]
     fn passes_compile_in_isolation() {
+        use std::io::{BufRead, Write};
         let device = device();
-        if let Ok(case) = std::env::var(CASE) {
-            compile(&device, &case);
+        let cases = cases(&device);
+        if let Ok(start) = std::env::var(CASE) {
+            let mut out = std::io::stdout();
+            for (i, case) in cases.iter().enumerate().skip(start.parse().unwrap()) {
+                writeln!(out, "{i}").unwrap();
+                out.flush().unwrap();
+                compile(&device, case);
+            }
             return;
         }
-        let cases = cases(&device);
         drop(device);
         let mut failed = vec![];
-        for case in &cases {
+        let mut start = 0;
+        while start < cases.len() {
             let mut child = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "stages::upscale::precision_tests::passes_compile_in_isolation",
                     "--exact",
                     "--nocapture",
                 ])
-                .env(CASE, case)
-                .stdout(std::process::Stdio::null())
+                .env(CASE, start.to_string())
+                .stdout(std::process::Stdio::piped())
                 .spawn()
                 .unwrap();
-            let start = Instant::now();
+            let (sender, announced) = std::sync::mpsc::channel();
+            let stdout = child.stdout.take().unwrap();
+            std::thread::spawn(move || {
+                for line in std::io::BufReader::new(stdout).lines() {
+                    if let Ok(i) = line.unwrap().parse::<usize>() {
+                        sender.send(i).unwrap();
+                    }
+                }
+            });
+            let mut current = None;
             let status = loop {
-                if let Some(status) = child.try_wait().unwrap() {
-                    break status.to_string();
+                match announced.recv_timeout(Duration::from_secs(60)) {
+                    Ok(i) => current = Some(i),
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        break child.wait().unwrap().to_string();
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        child.kill().unwrap();
+                        child.wait().unwrap();
+                        break "timed out".to_owned();
+                    }
                 }
-                if start.elapsed() > Duration::from_secs(60) {
-                    child.kill().unwrap();
-                    child.wait().unwrap();
-                    break "timed out".to_owned();
-                }
-                std::thread::sleep(Duration::from_millis(20));
             };
-            let ok = status == "exit status: 0";
-            eprintln!("{case}: {}", if ok { "ok" } else { &status });
-            if !ok {
-                failed.push(format!("{case} ({status})"));
+            if status == "exit status: 0" {
+                break;
             }
+            let i = current.expect("the child failed before its first case");
+            eprintln!("{}: {status}", cases[i]);
+            failed.push(format!("{} ({status})", cases[i]));
+            start = i + 1;
         }
         assert!(failed.is_empty(), "failed: {}", failed.join(", "));
     }
