@@ -162,6 +162,8 @@ both mappings; removing settings on the next run restores the prefix namespace.
 
 The execution engine is AArch64. Platform and device build capabilities such as `gpu` and `media` are described in [building.md](building.md).
 
+`adv-gpu/backend` is enabled by default and provides GPU runtime access. Build scripts use `adv-gpu` with `default-features = false, features = ["precompile"]` for the naga host-shader compiler and binding descriptions without GPU backends or driver dependencies. Host compilation and runtime Metal lowering share their argument-index rules.
+
 Host service CSV diagnostics also count successful guest bodies and ordinary fallbacks per API, with the guest fraction. Guest probes are installed only while host profiling, frame timing or frame-budget diagnostics are active; disabled bodies and fallback jumps contain no counter instructions.
 
 ### AArch64 compact window

@@ -119,7 +119,6 @@ dependencies = [
  "arrayvec",
  "dispatch2",
  "libc",
- "naga",
  "ndk-sys",
  "objc2",
  "objc2-core-foundation",

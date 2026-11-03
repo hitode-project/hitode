@@ -1,9 +1,7 @@
 //! One instanced tile draw decodes a software source into a presentable buffer.
 use crate::plan::Tiles;
 use adv_gpu::encode::{Bind, ColorAttachment, Load, Store};
-use adv_gpu::pipeline::{
-    Binding, BindingKind, ColorTarget, Cull, Primitive, RenderPipelineDesc, Stages, Topology,
-};
+use adv_gpu::pipeline::{ColorTarget, Cull, Primitive, RenderPipelineDesc, Topology};
 use adv_gpu::{
     Device, Encoder, Format, ImageView, Rect, RenderPass, RenderPassDesc, RenderPipeline, Ring,
     Span,
@@ -50,18 +48,7 @@ pub fn pipeline(device: &Device, format: Format) -> adv_gpu::Result<RenderPipeli
         &RenderPipelineDesc {
             vertex: shader.entry("vertex_main", adv_gpu::shader::Stage::Vertex)?,
             fragment: Some(shader.entry("fragment_main", adv_gpu::shader::Stage::Fragment)?),
-            bindings: vec![
-                Binding {
-                    slot: 0,
-                    kind: BindingKind::StorageBuffer { writable: false },
-                    stages: Stages::FRAGMENT,
-                },
-                Binding {
-                    slot: 1,
-                    kind: BindingKind::StorageBuffer { writable: false },
-                    stages: Stages::VERTEX | Stages::FRAGMENT,
-                },
-            ],
+            bindings: super::bindings::INGEST.to_vec(),
             primitive: Primitive {
                 topology: Topology::Triangles,
                 cull: Cull::None,
@@ -183,7 +170,7 @@ fn write_words(bytes: &mut [u8], words: &[u32]) {
         out.copy_from_slice(&word.to_le_bytes());
     }
 }
-fn coverage(tiles: &Tiles) -> (Rect, Load<[f64; 4]>) {
+pub(super) fn coverage(tiles: &Tiles) -> (Rect, Load<[f64; 4]>) {
     let first = tiles.rects[0];
     let (mut x, mut y, mut right, mut bottom, mut pixels) =
         (first.x, first.y, first.x + first.w, first.y + first.h, 0u64);

@@ -5,10 +5,16 @@
 //!   [`naga::Module`] directly, or SPIR-V that naga's SPIR-V front end reads
 //!   into one before it reaches this crate.
 //! - Host shaders (fixed function, ingest, composition, upscalers) are WGSL,
-//!   precompiled at build time into both outputs and loaded as
+//!   precompiled at build time through [`precompile`] into both outputs and loaded as
 //!   [`Source::Precompiled`], so a launch never pays for their translation.
 
+#[cfg(feature = "backend")]
 use crate::Result;
+
+#[cfg(feature = "precompile")]
+pub(crate) mod compile;
+#[cfg(feature = "precompile")]
+pub use compile::{Precompiled, precompile};
 
 #[non_exhaustive]
 pub enum Source<'a> {
@@ -41,6 +47,7 @@ pub struct ShaderDesc<'a> {
 }
 
 /// A validated module, ready for pipelines on this device. Clone shares it.
+#[cfg(feature = "backend")]
 #[derive(Clone)]
 pub struct Shader {
     /// [`ShaderDesc::identity`].
@@ -48,12 +55,14 @@ pub struct Shader {
     pub(crate) inner: crate::imp::Shader,
 }
 
+#[cfg(feature = "backend")]
 impl Shader {
     pub fn entry(&self, name: &str, stage: Stage) -> Result<Entry> {
         self.inner.entry(name, stage)
     }
 }
 
+#[cfg(feature = "backend")]
 #[derive(Clone)]
 pub struct Entry {
     pub shader: Shader,

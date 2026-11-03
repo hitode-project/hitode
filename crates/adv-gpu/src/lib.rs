@@ -25,6 +25,11 @@
 //! only where the platform requires them: presentable-buffer export
 //! ([`present::Export`]) and compositor fences ([`queue::Fence`], Android).
 //!
+//! Build scripts use `default-features = false, features = ["precompile"]` to
+//! call [`shader::precompile`] without a backend or driver dependencies. The
+//! default `backend` feature provides the runtime API. Host compilation and
+//! runtime Metal shaders share the same naga lowering and argument-index rules.
+//!
 //! # Threads
 //!
 //! - [`Device`] is `Clone + Send + Sync`. Any thread may create resources and
@@ -99,7 +104,7 @@
 /// Opens a device for a backend's internal tests, or returns from the test
 /// where the target has none, unless `ADV_GPU_REQUIRE_BACKEND` is set (the
 /// conformance suite's rule).
-#[cfg(test)]
+#[cfg(all(test, feature = "backend"))]
 macro_rules! test_device {
     ($options:expr) => {
         match crate::Device::open(&$options) {
@@ -115,33 +120,44 @@ macro_rules! test_device {
     };
 }
 
-#[cfg(target_vendor = "apple")]
+#[cfg(all(feature = "backend", target_vendor = "apple"))]
 mod metal;
-#[cfg(target_vendor = "apple")]
+#[cfg(all(feature = "backend", target_vendor = "apple"))]
 use metal as imp;
-#[cfg(not(target_vendor = "apple"))]
+#[cfg(all(feature = "backend", not(target_vendor = "apple")))]
 mod vulkan;
-#[cfg(not(target_vendor = "apple"))]
+#[cfg(all(feature = "backend", not(target_vendor = "apple")))]
 use vulkan as imp;
 
 pub mod caps;
+#[cfg(feature = "backend")]
 pub mod encode;
 pub mod format;
 pub mod pipeline;
+#[cfg(feature = "backend")]
 pub mod present;
+#[cfg(feature = "backend")]
 pub mod queue;
 pub mod resource;
+#[cfg(feature = "backend")]
 pub mod ring;
 pub mod shader;
 
 pub use caps::{Caps, Features, FormatCaps, Limits, Modern};
+#[cfg(feature = "backend")]
 pub use encode::{ComputePass, Encoder, RenderPass, RenderPassDesc};
 pub use format::Format;
+#[cfg(feature = "backend")]
 pub use pipeline::{ComputePipeline, RenderPipeline};
+#[cfg(feature = "backend")]
 pub use present::{PresentImage, PresentPool};
+#[cfg(feature = "backend")]
 pub use queue::{Device, Queue, Token};
+#[cfg(feature = "backend")]
 pub use resource::{Buffer, Image, ImageView, Sampler};
+#[cfg(feature = "backend")]
 pub use ring::{Ring, Span};
+#[cfg(feature = "backend")]
 pub use shader::Shader;
 
 /// A rectangle in texels. Origin top left.

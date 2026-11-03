@@ -8,7 +8,9 @@
 //! - Render targets do not request `STORAGE` unless a compute pass really
 //!   writes them; on some drivers it disables lossless compression.
 
-use crate::{Extent, Format, Result};
+#[cfg(feature = "backend")]
+use crate::Result;
+use crate::{Extent, Format};
 
 bitflags::bitflags! {
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -55,11 +57,13 @@ pub struct ImageDesc {
 /// A GPU-private image, compressed where the hardware allows. Clone shares the
 /// allocation. Content is undefined until written; the first pass that covers
 /// it may use `Load::DontCare`.
+#[cfg(feature = "backend")]
 #[derive(Clone)]
 pub struct Image {
     pub(crate) inner: crate::imp::Image,
 }
 
+#[cfg(feature = "backend")]
 impl Image {
     pub fn desc(&self) -> &ImageDesc {
         self.inner.desc()
@@ -90,11 +94,13 @@ pub struct ViewDesc {
     pub plane: u32,
 }
 
+#[cfg(feature = "backend")]
 #[derive(Clone)]
 pub struct ImageView {
     pub(crate) inner: crate::imp::ImageView,
 }
 
+#[cfg(feature = "backend")]
 impl ImageView {
     pub fn image(&self) -> &Image {
         self.inner.image()
@@ -138,11 +144,13 @@ pub struct BufferDesc {
     pub label: &'static str,
 }
 
+#[cfg(feature = "backend")]
 #[derive(Clone)]
 pub struct Buffer {
     pub(crate) inner: crate::imp::Buffer,
 }
 
+#[cfg(feature = "backend")]
 impl Buffer {
     pub fn desc(&self) -> &BufferDesc {
         self.inner.desc()
@@ -159,6 +167,7 @@ impl Buffer {
     }
 }
 
+#[cfg(feature = "backend")]
 #[derive(Clone, Copy)]
 pub struct BufferSlice<'a> {
     pub buffer: &'a Buffer,
@@ -207,6 +216,7 @@ pub struct SamplerDesc {
 }
 
 /// Samplers are interned by description; equal descriptions share one object.
+#[cfg(feature = "backend")]
 #[derive(Clone)]
 pub struct Sampler {
     #[allow(dead_code)] // read by the backends

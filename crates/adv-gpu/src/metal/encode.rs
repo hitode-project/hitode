@@ -788,7 +788,7 @@ fn same<T: objc2::Message + ?Sized>(a: &Retained<T>, b: &Retained<T>) -> bool {
 }
 
 /// What a pass has bound at each native index (fixed per slot, see
-/// [`shader::native`]), and which of it each stage has yet to receive. `bind`
+/// [`shader::index`]), and which of it each stage has yet to receive. `bind`
 /// only records; draws send each stage the changed indices it reads, so
 /// slots persist across pipelines and may be bound before one is set.
 struct Bindings {
@@ -890,11 +890,12 @@ impl Bindings {
         let index;
         match resource {
             Bind::Uniform(b) | Bind::StorageBuffer(b) => {
-                index = if matches!(resource, Bind::Uniform(_)) {
-                    slot
+                let group = if matches!(resource, Bind::Uniform(_)) {
+                    0
                 } else {
-                    shader::SIZES as u32 - 1 - slot
+                    3
                 };
+                index = shader::index(group, slot, true).1;
                 let raw = &b.buffer.inner.0.raw;
                 match &mut self.buffers[index as usize] {
                     Some(old) if same(&old.raw, raw) => {
@@ -919,11 +920,12 @@ impl Bindings {
                 self.dirty[1].buffers |= 1 << index;
             }
             Bind::Sampled(image) | Bind::StorageImage(image) => {
-                index = if matches!(resource, Bind::Sampled(_)) {
-                    slot
+                let group = if matches!(resource, Bind::Sampled(_)) {
+                    1
                 } else {
-                    95 - slot
+                    3
                 };
+                index = shader::index(group, slot, false).1;
                 let entry = &mut self.textures[index as usize];
                 if entry
                     .as_ref()
@@ -936,7 +938,7 @@ impl Bindings {
                 self.dirty[1].textures |= 1 << index;
             }
             Bind::Sampler(sampler) => {
-                index = slot;
+                index = shader::index(2, slot, false).1;
                 let entry = &mut self.samplers[index as usize];
                 if entry
                     .as_ref()

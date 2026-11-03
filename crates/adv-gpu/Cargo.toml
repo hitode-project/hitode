@@ -7,20 +7,24 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+default = ["backend"]
+# Runtime GPU access; build scripts disable defaults and select precompile only.
+backend = ["precompile", "dep:arrayvec", "dep:ash", "dep:gpu-allocator", "dep:objc2", "dep:objc2-metal", "dep:objc2-io-surface", "dep:objc2-core-foundation", "dep:objc2-core-graphics", "dep:objc2-foundation", "dep:block2", "dep:dispatch2"]
+precompile = ["naga/spv-out", "naga/msl-out"]
+
 [dependencies]
-arrayvec = "0.7"
+arrayvec = { version = "0.7", optional = true }
 bitflags = "2"
 naga = { version = "=30.0.1", default-features = false, features = ["wgsl-in", "spv-in"] }
 
 [target.'cfg(not(target_vendor = "apple"))'.dependencies]
-naga = { version = "=30.0.1", default-features = false, features = ["spv-out"] }
-ash = { version = "0.38", default-features = false, features = ["loaded", "debug", "std"] }
-gpu-allocator = { version = "0.28", default-features = false, features = ["std", "vulkan"] }
+ash = { version = "0.38", optional = true, default-features = false, features = ["loaded", "debug", "std"] }
+gpu-allocator = { version = "0.28", optional = true, default-features = false, features = ["std", "vulkan"] }
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
-naga = { version = "=30.0.1", default-features = false, features = ["msl-out"] }
-objc2 = "0.6.4"
-objc2-metal = { version = "0.3.2", default-features = false, features = [
+objc2 = { version = "0.6.4", optional = true }
+objc2-metal = { version = "0.3.2", optional = true, default-features = false, features = [
     "std", "block2", "dispatch2", "MTLDevice", "MTLCommandQueue", "MTLCommandBuffer",
     "MTLCommandEncoder", "MTLEvent", "MTLResource", "MTLBuffer", "MTLTexture",
     "MTLSampler", "MTLPixelFormat", "MTLTypes", "MTLRenderPass",
@@ -29,14 +33,14 @@ objc2-metal = { version = "0.3.2", default-features = false, features = [
     "MTLCounters", "MTLLibrary", "MTLArgument", "MTLBinaryArchive", "MTLFence", "MTLComputePipeline",
     "objc2-io-surface",
 ] }
-objc2-io-surface = { version = "0.3.2", default-features = false, features = ["std", "IOSurfaceRef", "IOSurfaceTypes", "libc", "objc2-core-foundation"] }
-objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFDictionary", "CFNumber", "CFString", "CFArray"] }
-objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std", "CGColorSpace"] }
-objc2-foundation = { version = "0.3.2", default-features = false, features = [
+objc2-io-surface = { version = "0.3.2", optional = true, default-features = false, features = ["std", "IOSurfaceRef", "IOSurfaceTypes", "libc", "objc2-core-foundation"] }
+objc2-core-foundation = { version = "0.3.2", optional = true, default-features = false, features = ["std", "CFDictionary", "CFNumber", "CFString", "CFArray"] }
+objc2-core-graphics = { version = "0.3.2", optional = true, default-features = false, features = ["std", "CGColorSpace"] }
+objc2-foundation = { version = "0.3.2", optional = true, default-features = false, features = [
     "std", "NSString", "NSRange", "NSArray", "NSError", "NSProcessInfo",
 ] }
-block2 = "0.6.2"
-dispatch2 = { version = "0.3.1", default-features = false, features = ["std", "objc2"] }
+block2 = { version = "0.6.2", optional = true }
+dispatch2 = { version = "0.3.1", optional = true, default-features = false, features = ["std", "objc2"] }
 
 [lints]
 workspace = true

@@ -8,7 +8,7 @@ license.workspace = true
 publish.workspace = true
 
 [build-dependencies]
-naga = { version = "=30.0.1", default-features = false, features = ["wgsl-in", "spv-out", "msl-out"] }
+adv-gpu = { path = "../adv-gpu", default-features = false, features = ["precompile"] }
 
 [dependencies]
 adv-gpu = { path = "../adv-gpu" }

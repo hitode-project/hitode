@@ -150,7 +150,6 @@ fn ingest_decodes_every_format_and_palette_bit_for_bit() {
                             depth_or_layers: 1,
                         },
                         format: adv_gpu::Format::Bgra8Unorm,
-                        color: None,
                         mips: 1,
                         samples: 1,
                         usage: adv_gpu::resource::Usage::COLOR | adv_gpu::resource::Usage::COPY_SRC,

@@ -28,9 +28,14 @@
 //! description needs, so the executor's caches, prebuilds and disk cache count
 //! real compilations instead of state combinations.
 
+use crate::Format;
+#[cfg(feature = "backend")]
+use crate::Result;
+#[cfg(feature = "backend")]
 use crate::imp;
+#[cfg(feature = "backend")]
 use crate::shader::Entry;
-use crate::{Format, Result};
+#[cfg(feature = "backend")]
 use arrayvec::ArrayVec;
 
 pub const MAX_COLOR_TARGETS: usize = 8;
@@ -209,6 +214,7 @@ pub struct ColorTarget {
     pub write_mask: u8,
 }
 
+#[cfg(feature = "backend")]
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RenderPipelineDesc {
     pub vertex: Entry,
@@ -222,6 +228,7 @@ pub struct RenderPipelineDesc {
     pub label: &'static str,
 }
 
+#[cfg(feature = "backend")]
 /// A render pipeline sampling a pool's converted RGB video. The fragment shader
 /// declares a `texture_2d<f32>` at group 4, binding 0, and its sampler at binding 1.
 /// These become one combined immutable sampler at binding 0 in a dedicated set.
@@ -231,6 +238,7 @@ pub struct VideoPipelineDesc<'a> {
     pub pool: &'a crate::PresentPool,
 }
 
+#[cfg(feature = "backend")]
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ComputePipelineDesc {
     pub entry: Entry,
@@ -238,12 +246,14 @@ pub struct ComputePipelineDesc {
     pub label: &'static str,
 }
 
+#[cfg(feature = "backend")]
 #[derive(Clone)]
 pub struct RenderPipeline {
     #[allow(dead_code)] // read by the backends
     pub(crate) inner: crate::imp::RenderPipeline,
 }
 
+#[cfg(feature = "backend")]
 #[derive(Clone)]
 pub struct ComputePipeline {
     #[allow(dead_code)] // read by the backends
@@ -253,11 +263,13 @@ pub struct ComputePipeline {
 /// Driver pipeline binaries keyed by our own pipeline identity. Vulkan uses a
 /// `VkPipelineCache`, Metal a binary archive. Data from another driver version
 /// is discarded on load, never trusted.
+#[cfg(feature = "backend")]
 pub struct PipelineCache {
     #[allow(dead_code)] // read by the backends
     pub(crate) inner: crate::imp::PipelineCache,
 }
 
+#[cfg(feature = "backend")]
 impl PipelineCache {
     pub fn load(data: &[u8]) -> Self {
         imp::PipelineCache::load(data)
@@ -268,18 +280,22 @@ impl PipelineCache {
 }
 
 // Entry equality is by shader identity, entry index and stage.
+#[cfg(feature = "backend")]
 impl PartialEq for Entry {
     fn eq(&self, other: &Self) -> bool {
         (self.shader.identity, self.index, self.stage)
             == (other.shader.identity, other.index, other.stage)
     }
 }
+#[cfg(feature = "backend")]
 impl Eq for Entry {}
+#[cfg(feature = "backend")]
 impl std::hash::Hash for Entry {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         (self.shader.identity, self.index, self.stage).hash(state);
     }
 }
+#[cfg(feature = "backend")]
 impl std::fmt::Debug for Entry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Entry").field("index", &self.index).finish()
