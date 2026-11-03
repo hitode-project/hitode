@@ -49,7 +49,7 @@ JIT 需要调试器临时附加到 Hitode 上，而只有开发签名才带这�
 6. **信任开发者。**
    第一次打开 LiveContainer 时如果提示"不受信任的开发者"，就到 设置 → 通用 → VPN 与设备管理 里，信任你的 Apple ID。之后用同一个 Apple ID 安装的 app 不用再信任。详见 [Apple 的说明](https://support.apple.com/zh-cn/118254)。
 7. **安装 Hitode**，按你选的方式：
-   - **方式一**：在 LiveContainer 里点"+"，选中第 1 步下载的 Hitode IPA。装好后长按 Hitode → 设置，打开"带JIT启动"，并在"修复"一栏打开"使用 LiveContainer 的包名"。然后打开 SideStore，登录同一个 Apple ID，在"My Apps"里点"+"，选中 StikDebug 的 IPA。
+   - **方式一**：在 LiveContainer 里点"+"，选中第 1 步下载的 Hitode IPA。装好后长按 Hitode → 设置，打开"带JIT启动"，并在"修复"一栏打开"使用 LiveContainer 的包名"。然后打开 SideStore，登录同一个 Apple ID，在"My Apps"里点"+"，选中 StikDebug 的 IPA。装好后回到 LiveContainer，在底部的"设置"页把"JIT启用工具"选为"StikDebug"。
 
      <img src="images/ios/livecontainer-bundle-id.png" alt="LiveContainer 中 Hitode 的设置：“带JIT启动”和修复一栏里的“使用 LiveContainer 的包名”都已打开" width="320">
    - **方式二**：打开 SideStore，登录同一个 Apple ID，在"My Apps"里点"+"，选中 Hitode 的 IPA。完成后，桌面上会出现 Hitode 的图标。

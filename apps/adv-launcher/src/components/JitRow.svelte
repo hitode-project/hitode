@@ -27,7 +27,7 @@
     {:else if !status.ready}
       <p class="advice">{t("强烈建议启用 JIT。未启用时游戏以解释模式运行，速度会慢很多。")}</p>
       {#if status.liveContainer}
-        <p class="advice">{t("在 LiveContainer 中长按 Hitode → 设置，打开“带JIT启动”和“使用 LiveContainer 的包名”，确认 LocalDevVPN 已连接，再从 LiveContainer 启动 Hitode")}</p>
+        <p class="advice">{t("在 LiveContainer 的“设置”页把“JIT启用工具”选为 StikDebug，长按 Hitode → 设置，打开“带JIT启动”和“使用 LiveContainer 的包名”，确认 LocalDevVPN 已连接，再从 LiveContainer 启动 Hitode")}</p>
       {:else}
         <ol class="steps">
           <li class:done={status.pairingFile}>
