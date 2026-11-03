@@ -380,7 +380,7 @@ fn staged_uploads_land_after_pending_clears_and_recycle_their_buffer() {
             .map(|y| (0..12).map(|i| y * 16 + i).collect())
             .collect();
         let staged = gpu
-            .stage(2, 2, |write| {
+            .stage(8, 2, |write| {
                 rows.iter()
                     .enumerate()
                     .for_each(|(y, row)| write(y as u32, &row[4..]));
@@ -412,7 +412,7 @@ fn staged_uploads_land_after_pending_clears_and_recycle_their_buffer() {
             })
             .unwrap();
         assert_eq!(gpu.staging.lock().unwrap().len(), 1);
-        let again = gpu.stage(2, 2, |_| Ok::<(), ()>(())).unwrap().unwrap();
+        let again = gpu.stage(8, 2, |_| Ok::<(), ()>(())).unwrap().unwrap();
         assert!(
             gpu.staging.lock().unwrap().is_empty(),
             "the pooled buffer is reused"

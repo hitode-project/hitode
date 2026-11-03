@@ -591,7 +591,20 @@ pub(super) fn create_texture(
     // default and managed pools retain one texture with shared mip views.
     if pool < 2 {
         let target = match env.ext.get::<State>().gpu.as_ref() {
-            Some(g) => g.target_levels(width, height, levels.len() as u32),
+            Some(g) => g
+                .target_levels(width, height, levels.len() as u32)
+                .and_then(|mut target| {
+                    if usage & 1 == 0 {
+                        let texel = format::texel(format).unwrap();
+                        let stored = if g.stores(texel) {
+                            texel
+                        } else {
+                            adv_device::gpu::TexelFormat::Bgra8
+                        };
+                        target.image = g.texture(width, height, levels.len() as u32, stored)?;
+                    }
+                    Ok(target)
+                }),
             None => return Outcome::Return(UNAVAILABLE),
         };
         let target = match target {

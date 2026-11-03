@@ -67,7 +67,7 @@ fn benchmark_update_texture() {
             // The isolated primitives below measure cold allocation/copy costs;
             // the actual API timing uses its own bounded, warmed scratch buffers.
             let transfer = prepare(
-                &env(&mut f.m),
+                &mut env(&mut f.m),
                 device,
                 source,
                 destination,

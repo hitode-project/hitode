@@ -128,9 +128,15 @@ fn next(env: &mut Env<'_>, id: Id) -> Outcome {
     if adv_abi::guest::check_range(env.cpu, address, size, Prot::READ).is_err() {
         return Outcome::Return(INVALID);
     }
-    let Some((pixels, pitch)) =
-        format::snapshot(env, format, address, pitch, rectangle.w, rectangle.h)
-    else {
+    let state = env.ext.get_mut::<State>();
+    let Some((pixels, pitch)) = format::snapshot(
+        env.cpu,
+        state.gpu.as_mut().unwrap(),
+        &mut state.upload_admission,
+        &mut state.upload_scratch,
+        (format, address, pitch),
+        (rectangle.w, rectangle.h),
+    ) else {
         return Outcome::Return(INVALID);
     };
     if let Some(Payload::Resource(r)) = com(env).get_identity_mut(&mut env.sys.objects, id) {

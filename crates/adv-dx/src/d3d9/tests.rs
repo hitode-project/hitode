@@ -58,6 +58,8 @@ fn machine_with_limits(native: bool, references: u32) -> Machine<JitCpu> {
             ("IDirect3DQuery9", 0),
         ]),
         gpu: None,
+        upload_admission: 0,
+        upload_scratch: Vec::new(),
         provider,
         pending: Vec::new(),
         private_releases: Vec::new(),

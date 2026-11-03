@@ -130,7 +130,7 @@ Immutable snapshot presentation MUST preserve known color damage, just as rotati
 **Rule**: Translation MUST cache external register usage, excluding shader-local definitions. Fingerprints, copies and uploads MUST process only those ranges while preserving exact bits and uniform layout. Recording MUST retain complete xxh3-128 identities, and both backends MUST reserve aligned complete binding windows before writing.
 **Verification**: Test
 
-Usage includes implicit matrix rows, int/bool operands and legacy bump parameters. Relative float addressing covers all 256 float registers except local definitions. Constants, vertices, indices and pixels use 128-bit content keys. Insufficient storage wraps before the complete binding window exceeds the buffer. Packed wgpu uploads retain one queue write per buffer per batch. Immutable snapshots retain only used registers, reuse unchanged captures across writes to unused registers and serve CPU damage interpretation directly. Complete constant blocks are materialized only on demand; CPU interpretation agrees with complete constants.
+Usage includes implicit matrix rows, int/bool operands and legacy bump parameters. Relative float addressing covers all 256 float registers except local definitions. Constants, vertices and indices use 128-bit content keys. Pixels are identified by upload admission. Insufficient storage wraps before the complete binding window exceeds the buffer. Packed wgpu uploads retain one queue write per buffer per batch. Immutable snapshots retain only used registers, reuse unchanged captures across writes to unused registers and serve CPU damage interpretation directly. Complete constant blocks are materialized only on demand; CPU interpretation agrees with complete constants.
 
 ### GFX-REC-8 Frontend work counters
 
@@ -319,7 +319,7 @@ snapshot storage; an unchanged Apply performs no state writes. Redundant fixed-s
 
 ### GFX-SAMPLER-4 Staged uploads
 
-**Rule**: Unlocked 32-bit BGRA pixels MUST be copied from guest memory once, straight into GPU staging memory, and reach the texture by a GPU copy. Staging buffers MUST return to a bounded per-device pool after the GPU has read them.
+**Rule**: Unlocked 32-bit BGRA pixels MUST be copied from guest memory once, straight into GPU staging memory, and reach the texture by a GPU copy. Staging storage MUST be bounded and reusable only after the GPU has read it.
 **Verification**: Test
 
 ## Bounded buffers

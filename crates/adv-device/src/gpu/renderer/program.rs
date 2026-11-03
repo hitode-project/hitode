@@ -296,22 +296,8 @@ struct TextureBinding {
     used: u64,
 }
 
-/// Validate before handing guest-derived source to the device. Failure remains
-/// a failed command, rather than poisoning the GPU's uncaptured-error channel.
-pub fn validate_program(program: &Program) -> Result<(), Error> {
-    if program.source.len() > Program::MAX_SOURCE_LEN {
-        return Err(invalid("program source exceeds limit"));
-    }
-    let module = wgpu::naga::front::wgsl::parse_str(&program.source)
-        .map_err(|e| invalid(&e.emit_to_string(&program.source)))?;
-    wgpu::naga::valid::Validator::new(
-        wgpu::naga::valid::ValidationFlags::all(),
-        wgpu::naga::valid::Capabilities::empty(),
-    )
-    .validate(&module)
-    .map_err(|e| invalid(&e.emit_to_string(&program.source)))?;
-    Ok(())
-}
+pub use crate::gpu::validate_program;
+
 impl Gpu {
     pub(super) fn draw_target(
         &self,

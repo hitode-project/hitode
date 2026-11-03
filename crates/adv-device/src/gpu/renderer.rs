@@ -16,7 +16,6 @@ mod recipes;
 mod warmup;
 #[cfg(target_vendor = "apple")]
 pub use metal::DisplayCompletion;
-pub use program::validate_program;
 
 #[derive(Clone, Copy)]
 pub(super) enum SwitchReason {
@@ -199,27 +198,31 @@ impl Submission<'_> {
 
 /// BGRA rows in GPU-visible memory from [`Gpu::stage`]. Dropping it returns the
 /// buffer to the pool once the GPU has finished reading it.
+#[derive(Clone)]
 pub struct Staged {
+    inner: Arc<Staging>,
+}
+struct Staging {
     buffer: Option<wgpu::Buffer>,
     pool: Arc<Mutex<Vec<wgpu::Buffer>>>,
     context: u64,
-    width: u32,
+    row_bytes: u32,
     height: u32,
     pitch: u32,
 }
 impl Staged {
     /// Bytes per staged row, aligned for GPU copies.
     pub fn pitch(&self) -> u32 {
-        self.pitch
+        self.inner.pitch
     }
     pub fn len(&self) -> usize {
-        self.pitch as usize * self.height as usize
+        self.inner.pitch as usize * self.inner.height as usize
     }
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 }
-impl Drop for Staged {
+impl Drop for Staging {
     fn drop(&mut self) {
         /// Pooled buffers kept per device; more are released.
         const POOL: usize = 8;
@@ -269,6 +272,9 @@ impl Image {
     }
     pub fn height(&self) -> u32 {
         self.height
+    }
+    pub fn texel_format(&self) -> TexelFormat {
+        TexelFormat::Bgra8
     }
     pub fn alpha_mode(&self) -> AlphaMode {
         self.alpha
@@ -1068,19 +1074,34 @@ impl Gpu {
         ))
     }
 
+    pub fn texture(
+        &self,
+        width: u32,
+        height: u32,
+        levels: u32,
+        _format: TexelFormat,
+    ) -> Result<Image, Error> {
+        self.image_levels(width, height, levels)
+    }
+    pub fn stores(&self, format: TexelFormat) -> bool {
+        format == TexelFormat::Bgra8
+    }
+    pub fn compile_handle(&self) -> NativeContext {
+        self.context.clone()
+    }
+
     /// Snapshot BGRA rows straight into GPU-visible memory: `fill` writes each
     /// row by index through the callback it is given. This is the upload's
     /// only CPU copy; [`Gpu::upload_staged`] copies on the GPU.
     pub fn stage<E>(
-        &self,
-        width: u32,
+        &mut self,
+        row_bytes: u32,
         height: u32,
         fill: impl FnOnce(&mut dyn FnMut(u32, &[u8])) -> Result<(), E>,
     ) -> Result<Result<Staged, E>, Error> {
         self.check()?;
-        let pitch = width
-            .checked_mul(4)
-            .filter(|_| width > 0 && height > 0)
+        let pitch = (row_bytes > 0 && height > 0)
+            .then_some(row_bytes)
             .ok_or_else(|| invalid("staged upload size"))?
             .next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
         let size = u64::from(pitch) * u64::from(height);
@@ -1108,7 +1129,7 @@ impl Gpu {
                 .slice(..size)
                 .get_mapped_range_mut()
                 .map_err(|error| invalid(&format!("staged upload mapping: {error}")))?;
-            let row = width as usize * 4;
+            let row = row_bytes as usize;
             fill(&mut |y, bytes| {
                 let at = y as usize * pitch as usize;
                 view.slice(at..at + row).copy_from_slice(&bytes[..row]);
@@ -1116,12 +1137,14 @@ impl Gpu {
         };
         buffer.unmap();
         Ok(filled.map(|()| Staged {
-            buffer: Some(buffer),
-            pool: self.staging.clone(),
-            context: self.context.id,
-            width,
-            height,
-            pitch,
+            inner: Arc::new(Staging {
+                buffer: Some(buffer),
+                pool: self.staging.clone(),
+                context: self.context.id,
+                row_bytes,
+                height,
+                pitch,
+            }),
         }))
     }
 
@@ -1136,8 +1159,8 @@ impl Gpu {
         self.own(image)?;
         image.writable()?;
         rectangle_in(image, rectangle)?;
-        if staged.context != self.context.id
-            || (staged.width, staged.height) != (rectangle.w, rectangle.h)
+        if staged.inner.context != self.context.id
+            || (staged.inner.row_bytes, staged.inner.height) != (rectangle.w * 4, rectangle.h)
         {
             return Err(invalid("staged upload does not match its rectangle"));
         }
@@ -1149,10 +1172,10 @@ impl Gpu {
                 });
         encoder.copy_buffer_to_texture(
             wgpu::TexelCopyBufferInfo {
-                buffer: staged.buffer.as_ref().unwrap(),
+                buffer: staged.inner.buffer.as_ref().unwrap(),
                 layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
-                    bytes_per_row: Some(staged.pitch),
+                    bytes_per_row: Some(staged.inner.pitch),
                     rows_per_image: Some(rectangle.h),
                 },
             },

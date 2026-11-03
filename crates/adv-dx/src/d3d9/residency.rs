@@ -225,7 +225,22 @@ pub(super) fn ensure(env: &mut Env<'_>, pointer: u32) -> u32 {
         );
         return UNAVAILABLE;
     };
-    let target = match gpu.target_levels(width, height, count) {
+    let target = match gpu
+        .target_levels(width, height, count)
+        .and_then(|mut target| {
+            let texel = format::texel(format).unwrap();
+            target.image = gpu.texture(
+                width,
+                height,
+                count,
+                if gpu.stores(texel) {
+                    texel
+                } else {
+                    adv_device::gpu::TexelFormat::Bgra8
+                },
+            )?;
+            Ok(target)
+        }) {
         Ok(target) => target.with_alpha_mode(targets::alpha_mode(format)),
         Err(error) => {
             return match gpu_error(error) {

@@ -1,7 +1,6 @@
-//! SDK guest pixel layouts over the shared BGRA8 GPU image representation.
+//! SDK pixel layouts: raw staging for stored formats, BGRA8 expansion otherwise.
 use std::sync::Arc;
 
-use adv_machine::Env;
 // D3DFORMAT names run from the most significant channel to the least:
 // https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dformat
 
@@ -24,62 +23,58 @@ pub(super) fn length(format: u32, width: u32, height: u32) -> Option<u32> {
         .filter(|&n| n > 0 && n <= 64 * 1024 * 1024)
 }
 
-/// Snapshot guest rows for an upload. BGRA formats go straight into GPU staging
-/// memory, their one CPU copy; others convert through host memory. The caller
-/// has checked that `height` rows of `pitch` bytes are readable at `address`.
+pub(super) fn texel(format: u32) -> Option<adv_device::gpu::TexelFormat> {
+    use adv_device::gpu::TexelFormat as T;
+    Some(match format {
+        21 => T::Bgra8,
+        22 => T::Bgrx8,
+        23 => T::B5g6r5,
+        26 => T::Bgra4,
+        28 => T::A8,
+        _ => return None,
+    })
+}
+
+/// Snapshot admitted guest rows, staging native formats without conversion.
+/// The caller has checked that the complete source rectangle is readable.
 pub(super) fn snapshot(
-    env: &Env<'_>,
-    format: u32,
-    address: u32,
-    pitch: u32,
-    width: u32,
-    height: u32,
+    cpu: &dyn adv_cpu::backend::Guest,
+    gpu: &mut adv_device::gpu::Gpu,
+    admission: &mut u64,
+    scratch: &mut Vec<u8>,
+    source: (u32, u32, u32),
+    size: (u32, u32),
 ) -> Option<(super::Pixels, u32)> {
-    let gpu = env.ext.get::<super::State>().gpu.as_ref();
-    if let (21 | 22, Some(gpu)) = (format, gpu) {
-        let mut digest = xxhash_rust::xxh3::Xxh3::new();
-        let mut scratch = vec![0; width as usize * 4];
-        let staged = gpu.stage(width, height, |write| {
-            for y in 0..height {
-                let at = address + y * pitch;
-                let row = match env.cpu.shared_bytes(at, scratch.len()) {
-                    Some(row) if format == 21 => row,
-                    shared => {
-                        match shared {
-                            Some(row) => scratch.copy_from_slice(row),
-                            None => env.cpu.read(at, &mut scratch).map_err(drop)?,
-                        }
-                        if format == 22 {
-                            scratch
-                                .as_chunks_mut::<4>()
-                                .0
-                                .iter_mut()
-                                .for_each(|texel| texel[3] = 255);
-                        }
-                        &scratch
+    let (format, address, pitch) = source;
+    let (width, height) = size;
+    *admission += 1;
+    let identity = *admission;
+    if gpu.stores(texel(format)?) {
+        let row_bytes = self::pitch(format, width)?;
+        let staged = gpu
+            .stage(row_bytes, height, |write| {
+                for y in 0..height {
+                    let at = address + y * pitch;
+                    if let Some(row) = cpu.shared_bytes(at, row_bytes as usize) {
+                        write(y, row);
+                    } else {
+                        scratch.resize(row_bytes as usize, 0);
+                        cpu.read(at, scratch).map_err(drop)?;
+                        write(y, scratch);
                     }
-                };
-                digest.update(row);
-                write(y, row);
-            }
-            Ok::<(), ()>(())
-        });
-        if let Ok(Ok(staged)) = staged {
-            let pitch = staged.pitch();
-            return Some((
-                super::Pixels::Staged(Arc::new(staged), digest.digest()),
-                pitch,
-            ));
-        }
+                }
+                Ok::<(), ()>(())
+            })
+            .ok()?
+            .ok()?;
+        let pitch = staged.pitch();
+        return Some((super::Pixels::Staged(staged, identity), pitch));
     }
     let row = self::pitch(format, width)?;
     let mut pixels = vec![0; ((height - 1) * pitch + row) as usize];
-    env.cpu.read(address, &mut pixels).ok()?;
-    if format == 28 {
-        return Some((super::Pixels::Alpha8(Arc::new(pixels)), pitch));
-    }
+    cpu.read(address, &mut pixels).ok()?;
     let (pixels, pitch) = upload(format, pixels, pitch, width, height)?;
-    Some((super::Pixels::Host(Arc::new(pixels)), pitch))
+    Some((super::Pixels::Host(Arc::new(pixels), identity), pitch))
 }
 
 /// The GPU receives BGRA8, while a packed texture retains its actual SDK bytes.
@@ -186,6 +181,42 @@ pub(super) fn readback(format: u32, pixels: Vec<u8>) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // spec: GFX-REC-7
+    #[test]
+    fn snapshots_identify_admissions_and_clones_without_hashing_pixels() {
+        let mut fixture = crate::d3d9::stretch::tests::Fixture::new();
+        let address = fixture.packet([1u8, 2, 3, 4]);
+        let state = fixture.m.ext.get_mut::<super::super::State>();
+        let gpu = state.gpu.as_mut().unwrap();
+        let mut capture = || {
+            snapshot(
+                &fixture.m.cpu,
+                gpu,
+                &mut state.upload_admission,
+                &mut state.upload_scratch,
+                (21, address, 4),
+                (1, 1),
+            )
+            .unwrap()
+            .0
+        };
+        let first = capture();
+        let second = capture();
+        use super::super::recording::hash;
+        assert_eq!(hash(&first), hash(first.clone()));
+        assert_ne!(hash(&first), hash(second));
+        let super::super::Pixels::Staged(_, admission) = first else {
+            panic!("BGRA staging");
+        };
+        assert_eq!(
+            hash(super::super::Pixels::Host(Arc::new(vec![0; 4]), admission)),
+            hash(super::super::Pixels::Host(
+                Arc::new(vec![255; 4]),
+                admission
+            ))
+        );
+    }
 
     #[test]
     fn packed_argb_round_trips_every_channel_value_and_respects_guest_row_padding() {

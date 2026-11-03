@@ -35,8 +35,25 @@ pub use programmable::{
 pub use renderer::DisplayCompletion;
 #[cfg(not(feature = "native-display"))]
 pub use renderer::Submission;
-#[cfg(not(feature = "native-display"))]
-pub use renderer::validate_program;
+/// Validate guest-derived source before handing it to the device.
+pub fn validate_program(program: &Program) -> Result<(), Error> {
+    program_module(program.source()).map(drop)
+}
+pub(super) fn program_module(source: &str) -> Result<wgpu::naga::Module, Error> {
+    if source.len() > Program::MAX_SOURCE_LEN {
+        return Err(Error::Invalid("program source exceeds limit".into()));
+    }
+    let module = wgpu::naga::front::wgsl::parse_str(source)
+        .map_err(|e| Error::Invalid(e.emit_to_string(source)))?;
+    wgpu::naga::valid::Validator::new(
+        wgpu::naga::valid::ValidationFlags::all(),
+        wgpu::naga::valid::Capabilities::empty(),
+    )
+    .validate(&module)
+    .map_err(|e| Error::Invalid(e.emit_to_string(source)))?;
+    Ok(module)
+}
+
 #[cfg(not(feature = "native-display"))]
 pub use renderer::{Gpu, Image, ImageId, NativeContext, NativeFrame, Readback, Staged, Target};
 pub use submission::SubmissionPause;
@@ -48,6 +65,16 @@ pub enum GpuBackend {
     Gl,
     Direct3D12,
     Metal,
+}
+
+/// Guest texel layouts accepted by texture creation and raw staging.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TexelFormat {
+    Bgra8,
+    Bgrx8,
+    B5g6r5,
+    Bgra4,
+    A8,
 }
 
 /// Whether sampled alpha is stored or implicitly one (RGBX color images).

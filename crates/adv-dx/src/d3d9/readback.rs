@@ -396,13 +396,17 @@ pub(super) fn unlock_internal(env: &mut Env<'_>, this: GuestPtr<()>) -> Outcome 
     if adv_abi::guest::check_range(env.cpu, address, size, Prot::READ).is_err() {
         return Outcome::Return(INVALID);
     }
+    let state = env.ext.get_mut::<State>();
+    let Some(gpu) = state.gpu.as_mut() else {
+        return Outcome::Return(UNAVAILABLE);
+    };
     let Some((pixels, pitch)) = format::snapshot(
-        env,
-        format,
-        address,
-        pitch,
-        lock.rectangle.w,
-        lock.rectangle.h,
+        env.cpu,
+        gpu,
+        &mut state.upload_admission,
+        &mut state.upload_scratch,
+        (format, address, pitch),
+        (lock.rectangle.w, lock.rectangle.h),
     ) else {
         return Outcome::Return(INVALID);
     };

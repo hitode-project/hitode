@@ -62,7 +62,7 @@ fn schedule(
         fixed: fixed_features(&d.fixed, None),
     };
     let state = env.ext.get_mut::<State>();
-    let Some(context) = state.gpu.as_ref().map(|gpu| gpu.context().clone()) else {
+    let Some(context) = state.gpu.as_ref().map(|gpu| gpu.compile_handle()) else {
         return;
     };
     let cache = &mut state.programs;
