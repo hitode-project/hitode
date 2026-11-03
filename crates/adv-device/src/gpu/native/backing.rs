@@ -150,6 +150,7 @@ impl SwapBacking {
             if self.pool.is_none() {
                 self.pool = Some(queue.device().create_present_pool(
                     &adv_gpu::present::PoolDesc {
+                        color: None,
                         width: swap.size.0,
                         height: swap.size.1,
                         format: swap_format(),

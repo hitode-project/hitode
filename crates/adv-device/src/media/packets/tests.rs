@@ -58,20 +58,14 @@ fn asf_samples_round_trip_through_the_decoders() {
     );
 
     let mut decoder = PacketDecoder::open(&video.format).unwrap();
-    let mut frames = Vec::new();
-    for packet in &video.packets {
-        frames.extend(
-            decoder
-                .decode(&packet.data, Some(packet.time_100ns))
-                .unwrap(),
-        );
-    }
-    frames.extend(decoder.drain().unwrap());
-    assert_eq!(frames.len(), FRAMES as usize);
-    for (i, (decoded, packet)) in frames.iter().zip(&video.packets).enumerate() {
+    // Check each picture as it is decoded and release it, as players do: the
+    // decoder's output pool holds only a few pictures.
+    let mut checked = 0;
+    let mut check = |decoded: Decoded| {
         let Decoded::Video(frame) = decoded else {
             panic!("audio from a video decoder")
         };
+        let (i, packet) = (checked, &video.packets[checked]);
         assert_eq!((frame.width, frame.height), (WIDTH, HEIGHT));
         assert_eq!(frame.pts_us, packet.time_100ns / 10);
         // Limited-range luma: BGRA grey follows the encoded level.
@@ -82,7 +76,20 @@ fn asf_samples_round_trip_through_the_decoders() {
             (f32::from(centre[1]) - expected).abs() < 12.0,
             "frame {i}: {centre:?} vs {expected}"
         );
+        checked += 1;
+    };
+    for packet in &video.packets {
+        for decoded in decoder
+            .decode(&packet.data, Some(packet.time_100ns))
+            .unwrap()
+        {
+            check(decoded);
+        }
     }
+    for decoded in decoder.drain().unwrap() {
+        check(decoded);
+    }
+    assert_eq!(checked, FRAMES as usize);
 
     let audio = demuxed
         .streams
