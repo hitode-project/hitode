@@ -131,6 +131,16 @@ impl Gpu {
             *cached.borrow_mut() = std::rc::Rc::downgrade(&execution);
             Ok(execution)
         })?;
+        Self::facade(execution)
+    }
+    /// Another facade on this execution, for a child process that the
+    /// session drives on the same thread. Its commands share the device,
+    /// stream and owner; pipelines, recording state and staging start fresh.
+    pub fn fork(&self) -> Result<Self, Error> {
+        self.check()?;
+        Self::facade(self.execution.clone())
+    }
+    fn facade(execution: std::rc::Rc<Execution>) -> Result<Self, Error> {
         let device = execution.device.clone();
         let stream = execution.stream.clone();
         let recording = record::Recording::new(&device, &mut stream.0.borrow_mut())?;
@@ -221,6 +231,9 @@ mod tests {
         let second = Gpu::execution(!cfg!(target_vendor = "apple")).unwrap();
         assert!(std::rc::Rc::ptr_eq(&first.stream.0, &second.stream.0));
         assert!(std::rc::Rc::ptr_eq(&first.execution, &second.execution));
+        let child = first.fork().unwrap();
+        assert!(std::rc::Rc::ptr_eq(&first.stream.0, &child.stream.0));
+        assert!(std::rc::Rc::ptr_eq(&first.execution, &child.execution));
     }
     #[test]
     fn the_execution_presenter_is_fixed_until_its_last_facade_drops() {
