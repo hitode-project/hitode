@@ -5,8 +5,8 @@
 //! scales the layer, so no display-resolution pass runs (HOST-VIEW-9).
 use super::GameView;
 pub use crate::mobile::TouchAction;
+pub(crate) use crate::mobile::key_message as message;
 use crate::mobile::{Insets, Layout, Occlusion, Rect};
-pub(crate) use crate::mobile::{key_message as message, position};
 use crate::overlay::{Router, Target};
 use objc2::Message;
 use objc2::rc::{Allocated, Retained};

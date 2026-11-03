@@ -1,6 +1,7 @@
 pub use adv_sync::WakeEvent;
 #[cfg(target_os = "macos")]
 pub(crate) use macos::native_viewport;
+#[cfg(not(mobile))]
 use std::sync::Arc;
 use std::time::Duration;
 

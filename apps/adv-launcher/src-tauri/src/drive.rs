@@ -42,17 +42,18 @@ pub fn reveal_drive(app: AppHandle) -> Result<(), String> {
     let drive = drive(&app).map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&drive).map_err(|e| e.to_string())?;
     #[cfg(target_os = "android")]
-    return crate::android::reveal_drive(&app);
+    {
+        crate::android::reveal_drive(&app)
+    }
     #[cfg(target_os = "ios")]
     {
         use tauri_plugin_opener::OpenerExt;
-        return app
-            .opener()
+        app.opener()
             .open_url(
                 format!("shareddocuments://{}", drive.display()),
                 None::<&str>,
             )
-            .map_err(|e| e.to_string());
+            .map_err(|e| e.to_string())
     }
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
