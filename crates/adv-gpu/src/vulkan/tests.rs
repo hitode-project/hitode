@@ -470,6 +470,7 @@ fn views_partial_clears_query_resets_and_resolves() {
             unsafe {
                 (&mut *upload.mapped().unwrap().as_ptr()).copy_from_slice(&pattern);
             }
+            let uploaded = readback(&device, size);
             let results = readback(&device, size);
             let copy = |image| ImageCopy {
                 image,
@@ -488,10 +489,12 @@ fn views_partial_clears_query_resets_and_resolves() {
                 copy(&source),
                 desc.size,
             );
+            read_image(&mut encoder, &source, 0, 0, desc.size, &uploaded);
             encoder.copy_image(copy(&source), copy(&destination), desc.size);
             read_image(&mut encoder, &destination, 0, 0, desc.size, &results);
             finish(&mut queue, encoder);
-            assert_eq!(bytes(&results), pattern);
+            assert_eq!(bytes(&uploaded), pattern, "{format:?} upload");
+            assert_eq!(bytes(&results), pattern, "{format:?} image copy");
         }
     }
 }

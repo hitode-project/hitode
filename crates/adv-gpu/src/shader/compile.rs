@@ -27,6 +27,8 @@ pub fn precompile(wgsl: &str, bindings: &[Binding]) -> Result<Precompiled> {
     .validate(&module)
     .map_err(|e| compile_error("shader validation", e))?;
     let options = naga::back::spv::Options {
+        // Vulkan 1.1, our floor, takes SPIR-V 1.3; subgroup operations need it.
+        lang_version: (1, 3),
         use_storage_input_output_16: false,
         ..Default::default()
     };

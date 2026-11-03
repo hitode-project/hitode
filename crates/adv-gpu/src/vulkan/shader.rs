@@ -449,6 +449,7 @@ fn rewrite_heap(
         Span::UNDEFINED,
     );
     let mut globals = HashMap::new();
+    let mut shared = HashMap::new();
     for (handle, global) in module.global_variables.iter_mut() {
         let Some(binding) = &mut global.binding else {
             continue;
@@ -568,9 +569,20 @@ fn rewrite_heap(
             Span::UNDEFINED,
         );
         global.ty = array;
+        // One variable per heap binding and type: older Mali drivers read
+        // descriptors only through the first of several aliasing variables.
+        let variable = *shared
+            .entry((
+                binding.binding,
+                array,
+                global.space,
+                global.memory_decorations,
+            ))
+            .or_insert(handle);
         globals.insert(
             handle,
             Global {
+                variable,
                 word,
                 shift,
                 offset,
@@ -593,6 +605,8 @@ fn rewrite_heap(
     Ok(patches)
 }
 struct Global {
+    /// The variable all aliases of this binding and type access.
+    variable: Handle<naga::GlobalVariable>,
     word: Handle<naga::Constant>,
     shift: Handle<naga::Constant>,
     offset: Option<Handle<naga::Constant>>,
@@ -620,7 +634,7 @@ fn rewrite_function(
             continue;
         }
         let arena = &mut function.expressions;
-        let base = arena.append(E::GlobalVariable(global), Span::UNDEFINED);
+        let base = arena.append(E::GlobalVariable(resource.variable), Span::UNDEFINED);
         let pc = arena.append(E::GlobalVariable(push), Span::UNDEFINED);
         let word = arena.append(E::Constant(resource.word), Span::UNDEFINED);
         let shift = arena.append(E::Constant(resource.shift), Span::UNDEFINED);

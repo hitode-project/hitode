@@ -1,9 +1,11 @@
 //! Game Loop runner for cloud devices. It runs every test of every packaged
 //! GPU test binary (`libtest_<name>.so`) in its own process, first with every
 //! modern Vulkan feature masked and then as detected, so a crash in one test
-//! never hides another. Output lands in the app's external files directory, which Test Lab
-//! pulls; one summary line per run also goes to logcat. The device's
-//! capabilities per tier are written last, after every test has run.
+//! never hides another. A test failing as detected reruns with each modern
+//! feature masked alone, naming the features it needs masked. Output lands in
+//! the app's external files directory, which Test Lab pulls; one summary line
+//! per run also goes to logcat. The device's capabilities per tier are written
+//! last, after every test has run.
 
 #[cfg(target_os = "android")]
 mod android {
@@ -100,7 +102,12 @@ mod android {
                 for case in &cases {
                     let status = run_case(path, case, disable, &tmp, &file);
                     if status != "exit status: 0" {
-                        failed.push(format!("{case} ({status})"));
+                        let culprits = if disable.is_empty() {
+                            culprits(path, case, &tmp, &file)
+                        } else {
+                            String::new()
+                        };
+                        failed.push(format!("{case} ({status}){culprits}"));
                     }
                 }
                 let line = format!(
@@ -142,7 +149,7 @@ mod android {
                 Err(error) => writeln!(caps, "{tier}: open failed: {error}").unwrap(),
             }
         }
-        caps.push_str(&memory_types());
+        caps.push_str(&native_properties());
         std::fs::write(out.join("caps.txt"), &caps).expect("caps");
         log(caps.lines().next().unwrap_or_default());
         log("done");
@@ -159,6 +166,19 @@ mod android {
             .filter_map(|line| line.strip_suffix(": test"))
             .map(str::to_owned)
             .collect()
+    }
+    /// The modern features whose masking alone makes a failing test pass.
+    fn culprits(path: &Path, case: &str, tmp: &Path, log: &std::fs::File) -> String {
+        let passing: Vec<_> = adv_gpu::Modern::all()
+            .iter_names()
+            .filter(|(name, _)| run_case(path, case, name, tmp, log) == "exit status: 0")
+            .map(|(name, _)| name)
+            .collect();
+        if passing.is_empty() {
+            " [fails without each feature]".to_owned()
+        } else {
+            format!(" [passes without {}]", passing.join(" or "))
+        }
     }
     /// One test in its own process, so a crash never hides the others.
     fn run_case(path: &Path, case: &str, disable: &str, tmp: &Path, log: &std::fs::File) -> String {
@@ -187,8 +207,9 @@ mod android {
         }
     }
 
-    /// Every memory type, which the device caps do not show.
-    fn memory_types() -> String {
+    /// Every memory type, and the features of formats whose caps fold several
+    /// bits, which the device caps do not show.
+    fn native_properties() -> String {
         use ash::vk;
         let mut out = String::new();
         let entry = unsafe { ash::Entry::load() }.expect("Vulkan loader");
@@ -204,6 +225,16 @@ mod android {
                     ty.heap_index, ty.property_flags
                 )
                 .unwrap();
+            }
+            for format in [
+                vk::Format::G8_B8R8_2PLANE_420_UNORM,
+                vk::Format::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16,
+                vk::Format::A4R4G4B4_UNORM_PACK16_EXT,
+            ] {
+                let features =
+                    unsafe { instance.get_physical_device_format_properties(device, format) }
+                        .optimal_tiling_features;
+                writeln!(out, "format {format:?}: {features:?}").unwrap();
             }
         }
         unsafe { instance.destroy_instance(None) };
