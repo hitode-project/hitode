@@ -11,7 +11,6 @@ publish.workspace = true
 naga = { version = "=30.0.1", default-features = false, features = ["wgsl-in", "spv-out", "msl-out"] }
 
 [dependencies]
-adv-device = { path = "../adv-device" }
 adv-gpu = { path = "../adv-gpu" }
 arrayvec = { version = "0.7", features = ["serde"] }
 smallvec = { version = "1", features = ["serde"] }

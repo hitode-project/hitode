@@ -1,6 +1,5 @@
 //! One instanced tile draw decodes a software source into a presentable buffer.
 use crate::plan::Tiles;
-use adv_device::frame::{Palette, PixelFormat, Slot};
 use adv_gpu::encode::{Bind, ColorAttachment, Load, Store};
 use adv_gpu::pipeline::{
     Binding, BindingKind, ColorTarget, Cull, Primitive, RenderPipelineDesc, Stages, Topology,
@@ -9,6 +8,30 @@ use adv_gpu::{
     Device, Encoder, Format, ImageView, Rect, RenderPass, RenderPassDesc, RenderPipeline, Ring,
     Span,
 };
+
+/// Packed software encodings understood by the ingest shader.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PixelFormat {
+    Bgra32,
+    Bgr24,
+    Rgb565,
+    Rgb555,
+    Indexed8,
+    Indexed4,
+    Indexed1,
+}
+
+/// Borrowed publication data. The producer owns its slot and completion state;
+/// the caller reports its last submitted read through the producer's token API.
+#[derive(Clone, Copy)]
+pub struct Source<'a> {
+    pub buffer: &'a adv_gpu::Buffer,
+    pub pitch: u32,
+    pub extent: (u32, u32),
+    pub format: PixelFormat,
+    /// BGRA palette entries; absent indexed palettes decode to black.
+    pub palette: Option<&'a [[u8; 4]; 256]>,
+}
 
 /// The decoder and its bindings can also be included in a video composition
 /// shader, which calls `software_pixel` in the same fragment invocation.
@@ -64,28 +87,25 @@ pub fn pipeline(device: &Device, format: Format) -> adv_gpu::Result<RenderPipeli
 
 /// Encodes Ingest into a presentable buffer's view. Video stages use [`source`]
 /// and [`bind`] to decode inline in their composition draw. The submitting owner
-/// calls `slot.ingested(token)` after its last read.
+/// reports the source slot's ingest token after its last read.
 /// `ring` belongs to that owner; Busy leaves the encoder untouched.
-#[allow(clippy::too_many_arguments)]
 pub fn encode(
     encoder: &mut Encoder,
     pipeline: &RenderPipeline,
     ring: &mut Ring,
-    slot: &Slot,
-    format: PixelFormat,
-    palette: Option<&Palette>,
+    software: &Source<'_>,
     destination: &ImageView,
     tiles: &Tiles,
 ) -> adv_gpu::Result<()> {
     if tiles.rects.is_empty() {
         return Ok(());
     }
-    let (width, height) = slot.extent();
+    let (width, height) = software.extent;
     debug_assert_eq!(
         (destination.size().width, destination.size().height),
         (width, height)
     );
-    let data = source(ring, slot, format, palette, tiles)?;
+    let data = source(ring, software, tiles)?;
     let (area, load) = coverage(tiles);
     let mut pass = encoder.render_pass(&RenderPassDesc {
         colors: [ColorAttachment {
@@ -103,7 +123,7 @@ pub fn encode(
     });
     pass.set_pipeline(pipeline);
     pass.set_viewport(0., 0., width as f32, height as f32, 0., 1.);
-    bind(&mut pass, slot, &data);
+    bind(&mut pass, software, &data);
     pass.draw(0..6, 0..tiles.rects.len() as u32);
     drop(pass);
     encoder.retain(data);
@@ -111,17 +131,11 @@ pub fn encode(
 }
 /// Prepare the software bindings for Ingest or a composed Video draw. The
 /// owner retains the returned span in the encoder after ending the pass.
-pub fn source(
-    ring: &mut Ring,
-    slot: &Slot,
-    format: PixelFormat,
-    palette: Option<&Palette>,
-    tiles: &Tiles,
-) -> adv_gpu::Result<Span> {
-    let (width, height) = slot.extent();
+pub fn source(ring: &mut Ring, software: &Source<'_>, tiles: &Tiles) -> adv_gpu::Result<Span> {
+    let (width, height) = software.extent;
     let mut data = ring.reserve(((65 + tiles.rects.len()) * 16) as u64, 256)?;
     let bytes = data.bytes();
-    let kind = match format {
+    let kind = match software.format {
         PixelFormat::Bgra32 => 0,
         PixelFormat::Bgr24 => 1,
         PixelFormat::Rgb565 => 2,
@@ -130,8 +144,8 @@ pub fn source(
         PixelFormat::Indexed4 => 5,
         PixelFormat::Indexed1 => 6,
     };
-    write_words(&mut bytes[..16], &[width, height, slot.pitch(), kind]);
-    if let Some(palette) = palette {
+    write_words(&mut bytes[..16], &[width, height, software.pitch, kind]);
+    if let Some(palette) = software.palette {
         bytes[16..1040].copy_from_slice(palette.as_flattened());
     } else {
         bytes[16..1040].fill(0);
@@ -150,10 +164,10 @@ pub fn source(
 
 /// Bind the software source in a stage's render pass. A Video shader includes
 /// `SOFTWARE_WGSL` and calls `software_pixel` before composing its planes.
-pub fn bind(pass: &mut RenderPass<'_>, slot: &Slot, data: &Span) {
+pub fn bind(pass: &mut RenderPass<'_>, software: &Source<'_>, data: &Span) {
     pass.bind(
         0,
-        Bind::StorageBuffer(slot.buffer().slice(0..slot.buffer().desc().size)),
+        Bind::StorageBuffer(software.buffer.slice(0..software.buffer.desc().size)),
     );
     pass.bind(
         1,

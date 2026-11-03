@@ -1099,7 +1099,7 @@ struct Color {rgba:vec4<f32>}
         };
         let mut h = Harness::new(device, queue);
         let image = image(&h.device, 4, 4);
-        let video: Arc<[crate::frame::VideoPlane]> = Arc::from([crate::frame::VideoPlane {}]);
+        let video: Arc<[crate::frame::VideoPlane]> = Arc::from([]);
         for serial in 1..=6 {
             if serial % 2 == 0 {
                 h.producer.push(color(&image));

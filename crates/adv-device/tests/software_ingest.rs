@@ -2,6 +2,7 @@
 #![cfg(feature = "native-display")]
 use adv_device::frame::Slot;
 use adv_device::surface::{PixelFormat, Rect, Snapshot, Surface};
+use adv_display::stages::ingest::{PixelFormat as IngestFormat, Source};
 use adv_gpu::encode::{BufferCopy, ImageCopy};
 use adv_gpu::queue::DeviceOptions;
 use adv_gpu::resource::{BufferDesc, BufferUsage, Memory as GpuMemory};
@@ -107,13 +108,28 @@ fn ingest_decodes_every_format_and_palette_bit_for_bit() {
                 let slot = Slot::new(&device, s.width, s.height, s.pitch, format).unwrap();
                 let out = unsafe { slot.buffer().mapped().unwrap().as_mut() };
                 out[..memory.bytes.len()].copy_from_slice(&normalized);
-                let palette = s.palette.clone();
+                let software = Source {
+                    buffer: slot.buffer(),
+                    pitch: slot.pitch(),
+                    extent: slot.extent(),
+                    format: match format {
+                        PixelFormat::Bgra32 => IngestFormat::Bgra32,
+                        PixelFormat::Bgr24 => IngestFormat::Bgr24,
+                        PixelFormat::Rgb565 => IngestFormat::Rgb565,
+                        PixelFormat::Rgb555 => IngestFormat::Rgb555,
+                        PixelFormat::Indexed8 => IngestFormat::Indexed8,
+                        PixelFormat::Indexed4 => IngestFormat::Indexed4,
+                        PixelFormat::Indexed1 => IngestFormat::Indexed1,
+                    },
+                    palette: s.palette.as_deref(),
+                };
                 #[cfg(target_vendor = "apple")]
                 let mut pool = device
                     .create_present_pool(&adv_gpu::present::PoolDesc {
                         width: s.width,
                         height: s.height,
                         format: adv_gpu::Format::Bgra8Unorm,
+                        color: None,
                         count: 1,
                         label: "ingest target",
                     })
@@ -134,6 +150,7 @@ fn ingest_decodes_every_format_and_palette_bit_for_bit() {
                             depth_or_layers: 1,
                         },
                         format: adv_gpu::Format::Bgra8Unorm,
+                        color: None,
                         mips: 1,
                         samples: 1,
                         usage: adv_gpu::resource::Usage::COLOR | adv_gpu::resource::Usage::COPY_SRC,
@@ -165,9 +182,7 @@ fn ingest_decodes_every_format_and_palette_bit_for_bit() {
                     &mut encoder,
                     &pipeline,
                     &mut ring,
-                    &slot,
-                    format,
-                    palette.as_ref(),
+                    &software,
                     target.view(),
                     &whole,
                 )
@@ -221,9 +236,7 @@ fn ingest_decodes_every_format_and_palette_bit_for_bit() {
                     &mut encoder,
                     &pipeline,
                     &mut ring,
-                    &slot,
-                    format,
-                    palette.as_ref(),
+                    &software,
                     target.view(),
                     &tiles,
                 )

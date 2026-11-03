@@ -154,6 +154,7 @@ impl SwapBacking {
                         width: swap.size.0,
                         height: swap.size.1,
                         format: swap_format(),
+                        color: None,
                         count: 3,
                         label: "executor swap",
                     },

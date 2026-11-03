@@ -9,6 +9,7 @@ pub mod codec_kernel;
 pub mod constants;
 #[cfg(feature = "device")]
 mod device;
+#[cfg(feature = "native-display")]
 pub mod frame;
 #[cfg(feature = "gpu")]
 pub mod gpu;

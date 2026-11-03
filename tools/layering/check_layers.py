@@ -29,7 +29,7 @@ RULES: dict[str, set[str]] = {
     # The only Vulkan and Metal user (issue #103).
     "adv-gpu": set(),
     # Planner, display stages, pools and compositors over adv-gpu (issue #103).
-    "adv-display": {"adv-gpu", "adv-device"},
+    "adv-display": {"adv-gpu"},
     # The D3D9/DirectDraw executor records onto adv-gpu (issue #103).
     "adv-device": {"adv-sync", "adv-gpu"},
     "adv-dx": {"adv-abi", "adv-device"},
