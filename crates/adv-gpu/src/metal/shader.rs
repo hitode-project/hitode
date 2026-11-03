@@ -20,18 +20,18 @@ pub(super) struct Function {
     pub sizes: Option<Box<[Option<u8>]>>,
 }
 
-/// Native indices of one stage, one bit per index.
+/// Indices one stage reads: native buffer/texture indices and logical sampler slots.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct Used {
     pub buffers: u32,
     pub textures: u128,
-    pub samplers: u16,
+    pub samplers: u32,
 }
 
 /// Native indices are fixed per slot, like D3D registers, so a binding
 /// survives pipeline changes untouched: uniform slot `s` is `buffer(s)`,
 /// storage buffer `s` is `buffer(29 - s)`, sampled image `s` is `texture(s)`,
-/// storage image `s` is `texture(95 - s)` and sampler `s` is `sampler(s)`.
+/// storage image `s` is `texture(95 - s)` and sampler `s` is `sampler(s % 16)` for logical slots 0..32.
 /// `buffer(30)` holds naga's runtime-array byte sizes. Precompiled libraries
 /// declare the same indices. A stage whose two kinds of one table meet is
 /// rejected at creation.
@@ -42,7 +42,7 @@ pub(super) fn native(group: u32, slot: u32, buffer: bool, textures: u32) -> Resu
         (3, true) => (0, (SIZES as u32 - 1).wrapping_sub(slot), SIZES as u32),
         (1, false) => (1, slot, textures),
         (3, false) => (1, 95u32.wrapping_sub(slot), 96),
-        (2, false) => (2, slot, 16),
+        (2, false) => (2, slot, 32),
         _ => return Err(Error::Invalid("Metal binding group".into())),
     };
     if index >= limit {
@@ -79,7 +79,7 @@ impl Used {
                 "Metal binding {group}:{slot} shares index {index} with another kind"
             )));
         }
-        Ok(index)
+        Ok(if table == 2 { index % 16 } else { index })
     }
     pub fn contains(self, other: Used) -> bool {
         other.buffers & !self.buffers == 0
@@ -401,6 +401,8 @@ mod tests {
         assert!(used.add(0, 29, true, 96).is_err());
         assert!(used.add(0, 30, true, 96).is_err());
         assert!(used.add(1, 96, false, 96).is_err());
-        assert!(used.add(2, 16, false, 96).is_err());
+        assert_eq!(used.add(2, 16, false, 96).unwrap(), 0);
+        assert_eq!(used.add(2, 31, false, 96).unwrap(), 15);
+        assert!(used.add(2, 32, false, 96).is_err());
     }
 }

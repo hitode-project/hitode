@@ -794,7 +794,8 @@ fn same<T: objc2::Message + ?Sized>(a: &Retained<T>, b: &Retained<T>) -> bool {
 struct Bindings {
     buffers: [Option<BufferBinding>; 31],
     textures: [Option<Object<dyn MTLTexture>>; 128],
-    samplers: [Option<Object<dyn MTLSamplerState>>; 16],
+    samplers: [Option<Object<dyn MTLSamplerState>>; 32],
+    sampler_slots: [u32; 2],
     /// Per stage: indices whose resource changed since the stage last drew.
     dirty: [Used; 2],
     /// Per stage: buffer indices whose object (not just offset) changed.
@@ -878,6 +879,7 @@ impl Bindings {
             buffers: std::array::from_fn(|_| None),
             textures: std::array::from_fn(|_| None),
             samplers: std::array::from_fn(|_| None),
+            sampler_slots: [0; 2],
             dirty: [Used::default(); 2],
             moved: [0; 2],
             sizes_dirty: false,
@@ -952,6 +954,9 @@ impl Bindings {
     /// `sizes` is given and differs from the last one sent.
     fn flush(&mut self, stage: usize, used: Used, sizes: Option<&[Option<u8>]>, to: &impl Target) {
         let dirty = &mut self.dirty[stage];
+        // A pipeline can change which logical slot owns a physical sampler index.
+        dirty.samplers |= used.samplers & !self.sampler_slots[stage];
+        self.sampler_slots[stage] = used.samplers;
         let mut buffers = dirty.buffers & used.buffers;
         let mut textures = dirty.textures & used.textures;
         let mut samplers = dirty.samplers & used.samplers;
@@ -978,7 +983,7 @@ impl Bindings {
         while samplers != 0 {
             let i = samplers.trailing_zeros() as usize;
             samplers &= samplers - 1;
-            to.sampler(self.samplers[i].as_ref().unwrap(), i);
+            to.sampler(self.samplers[i].as_ref().unwrap(), i % 16);
         }
         if let Some(slots) = sizes {
             let values: ArrayVec<u32, { shader::SIZES }> = slots

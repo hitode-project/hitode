@@ -55,7 +55,7 @@ pub(super) fn query(raw: &ProtocolObject<dyn MTLDevice>) -> Caps {
             max_color_attachments: 8,
             max_uniform_buffers: 31,
             max_sampled_images: if apple && !apple6 { 96 } else { 128 },
-            max_samplers: 16,
+            max_samplers: 32,
             max_storage_bindings: 31,
             max_workgroup_storage: raw.maxThreadgroupMemoryLength() as u32,
             max_workgroup_invocations: 1024,

@@ -81,7 +81,10 @@ bitflags::bitflags! {
 /// argument indices) before lowering, so shaders never see it. Metal gives
 /// uniform `b#` `buffer(#)`, storage buffer `u#` `buffer(29 - #)`, sampled
 /// `t#` `texture(#)`, storage image `u#` `texture(95 - #)` and `s#`
-/// `sampler(#)`; a stage whose indices meet in one table is rejected.
+/// `sampler(slot % 16)` for sampler slots `0..32`. A stage cannot use two
+/// sampler slots with the same index modulo 16; pipeline creation rejects
+/// such collisions. Buffers and textures whose indices meet in one stage's
+/// table are also rejected.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Binding {
     pub slot: u32,

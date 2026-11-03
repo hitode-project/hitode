@@ -351,6 +351,11 @@ impl Device {
             declared.add(group, b.slot, buffer, self.caps().limits.max_sampled_images)?;
         }
         let used = function.used.unwrap_or(declared);
+        if used.samplers as u16 & (used.samplers >> 16) as u16 != 0 {
+            return Err(Error::Invalid(format!(
+                "{stage:?} sampler slots collide modulo 16"
+            )));
+        }
         if !declared.contains(used) {
             return Err(Error::Invalid(format!(
                 "{stage:?} reads a binding the pipeline does not declare"

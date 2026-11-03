@@ -1427,3 +1427,185 @@ fn yuv_pool_color_attachments() {
         assert!(surface.value(unsafe { kIOSurfaceColorSpace }).is_some());
     }
 }
+
+#[test]
+fn vertex_and_fragment_samplers_use_independent_stage_indices() {
+    let mut gpu = gpu!();
+    let image = gpu.target(2, 1, Format::Rgba8Unorm);
+    let target = gpu.target(1, 1, Format::Rgba8Unorm);
+    let source = gpu.upload(&[255, 0, 0, 255, 0, 255, 0, 255], BufferUsage::COPY_SRC);
+    let mut encoder = gpu.queue.encoder("sampler upload");
+    encoder.copy_buffer_to_image(
+        BufferCopy {
+            buffer: &source,
+            offset: 0,
+            row_pitch: 8,
+            rows: 1,
+        },
+        ImageCopy {
+            image: &image,
+            mip: 0,
+            layer: 0,
+            origin: (0, 0, 0),
+        },
+        extent(2, 1),
+    );
+    gpu.submit(encoder);
+    let shader = gpu.shader(
+        r#"
+@group(1) @binding(0) var image:texture_2d<f32>;
+@group(2) @binding(0) var point:sampler;
+@group(2) @binding(16) var linear:sampler;
+struct V { @builtin(position) position:vec4<f32>, @location(0) red:f32 }
+fn vertex(i:u32, red:f32)->V {
+    let p=vec2<f32>(f32((i<<1u)&2u),f32(i&2u));
+    return V(vec4<f32>(p*2.0-1.0,0.0,1.0),red);
+}
+@vertex fn vs(@builtin(vertex_index) i:u32)->V {
+    return vertex(i,textureSampleLevel(image,linear,vec2<f32>(0.375,0.5),0.0).r);
+}
+@vertex fn vs_point(@builtin(vertex_index) i:u32)->V {
+    return vertex(i,textureSampleLevel(image,point,vec2<f32>(0.375,0.5),0.0).r);
+}
+@fragment fn fs(v:V)->@location(0) vec4<f32> {
+    return vec4<f32>(v.red,textureSampleLevel(image,point,vec2<f32>(0.375,0.5),0.0).g,0.0,1.0);
+}
+"#,
+        1001,
+    );
+    let mut desc = RenderPipelineDesc {
+        vertex: shader.entry("vs", Stage::Vertex).unwrap(),
+        fragment: Some(shader.entry("fs", Stage::Fragment).unwrap()),
+        bindings: vec![
+            Binding {
+                slot: 0,
+                kind: BindingKind::SampledImage {
+                    dimension: Dimension::D2,
+                    depth: false,
+                    multisampled: false,
+                },
+                stages: Stages::VERTEX | Stages::FRAGMENT,
+            },
+            Binding {
+                slot: 0,
+                kind: BindingKind::Sampler { comparison: false },
+                stages: Stages::VERTEX | Stages::FRAGMENT,
+            },
+            Binding {
+                slot: 16,
+                kind: BindingKind::Sampler { comparison: false },
+                stages: Stages::VERTEX,
+            },
+        ],
+        primitive: primitive(),
+        colors: colors(Format::Rgba8Unorm, None),
+        depth_stencil: None,
+        samples: 1,
+        alpha_to_coverage: false,
+        label: "per-stage samplers",
+    };
+    let linear_pipeline = gpu.pipeline(&desc);
+    desc.vertex = shader.entry("vs_point", Stage::Vertex).unwrap();
+    let point_pipeline = gpu.pipeline(&desc);
+    let sampler = |filter| {
+        gpu.device
+            .sampler(&SamplerDesc {
+                min: filter,
+                mag: filter,
+                mip: Filter::Nearest,
+                address: [Address::Clamp; 3],
+                border: BorderColor::TransparentBlack,
+                lod_bias: 0,
+                lod_min: 0,
+                lod_max: 0,
+                anisotropy: 1,
+                compare: None,
+            })
+            .unwrap()
+    };
+    let (point, linear) = (sampler(Filter::Nearest), sampler(Filter::Linear));
+    for (pipelines, expected) in [
+        (vec![&linear_pipeline], [191, 0, 0, 255]),
+        (vec![&linear_pipeline, &point_pipeline], [255, 0, 0, 255]),
+        (
+            vec![&linear_pipeline, &point_pipeline, &linear_pipeline],
+            [191, 0, 0, 255],
+        ),
+    ] {
+        let mut encoder = gpu.queue.encoder("per-stage sampler draw");
+        {
+            let mut render = encoder.render_pass(&pass(
+                color(target.view(), Load::DontCare),
+                None,
+                whole(1, 1),
+            ));
+            render.bind(0, Bind::Sampled(image.view()));
+            render.bind(0, Bind::Sampler(&point));
+            render.bind(16, Bind::Sampler(&linear));
+            for pipeline in pipelines {
+                render.set_pipeline(pipeline);
+                render.draw(0..3, 0..1);
+            }
+        }
+        gpu.submit(encoder);
+        assert_eq!(gpu.read(&target), expected);
+    }
+}
+
+#[cfg(target_vendor = "apple")]
+#[test]
+fn metal_rejects_sampler_aliases_within_one_stage_at_pipeline_creation() {
+    let gpu = gpu!();
+    // Precompiled entries use the pipeline's declarations as their used mask.
+    // This checks the pipeline boundary independently of the MSL compiler.
+    let shader = gpu
+        .device
+        .create_shader(ShaderDesc {
+            source: Source::Precompiled {
+                spirv: &[],
+                metal: br#"#include <metal_stdlib>
+using namespace metal;
+vertex float4 vs(uint i [[vertex_id]], sampler s [[sampler(0)]]) {
+    return float4(float(i), 0.0, 0.0, 1.0);
+}
+"#,
+            },
+            identity: 1002,
+            label: "colliding sampler slots",
+        })
+        .unwrap();
+    let desc = RenderPipelineDesc {
+        vertex: shader.entry("vs", Stage::Vertex).unwrap(),
+        fragment: None,
+        bindings: vec![
+            Binding {
+                slot: 0,
+                kind: BindingKind::SampledImage {
+                    dimension: Dimension::D2,
+                    depth: false,
+                    multisampled: false,
+                },
+                stages: Stages::VERTEX,
+            },
+            Binding {
+                slot: 0,
+                kind: BindingKind::Sampler { comparison: false },
+                stages: Stages::VERTEX,
+            },
+            Binding {
+                slot: 16,
+                kind: BindingKind::Sampler { comparison: false },
+                stages: Stages::VERTEX,
+            },
+        ],
+        primitive: primitive(),
+        colors: ArrayVec::new(),
+        depth_stencil: None,
+        samples: 1,
+        alpha_to_coverage: false,
+        label: "colliding sampler slots",
+    };
+    assert!(
+        matches!(gpu.device.create_render_pipeline(&desc, None), Err(Error::Invalid(reason)) if reason.contains("collide modulo 16"))
+    );
+}
