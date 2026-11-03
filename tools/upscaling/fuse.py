@@ -89,7 +89,7 @@ fn load_{i}(uv: vec2<f32>) -> vec4<f32> {{
 
     a, b = DECL.sub(bind_a, a), DECL.sub(bind_b, b)
     b = re.sub(r'struct SLANG_ParameterGroup_Params[^}]+};', '', b)
-    b = b.replace('Params_b0', 'Params_a0').replace('dimensions_b0', 'dimensions_a0').replace('origin_b0', 'origin_a0')
+    b = b.replace('Params_b0', 'Params_a0').replace('dimensions_b0', 'dimensions_a0')
     enable = 'enable f16;\n' if 'enable f16;' in a else ''
     a, b = a.replace('enable f16;', ''), b.replace('enable f16;', '')
     main = '''
@@ -97,7 +97,7 @@ var<private> tile_origin: vec2<i32>;
 var<private> tile_index: u32;
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_index) lane: u32) {
-    let origin = group.xy * 16u + Params_a0.origin_a0.xy;
+    let origin = group.xy * 16u;
     tile_origin = vec2<i32>(origin) - vec2<i32>(1);
     for (var i = lane; i < 324u; i += 64u) {
         tile_index = i;

@@ -39,7 +39,7 @@ def generate(compiler):
             ins = re.search('//!IN ([^\\n]+)', body)[1].replace(' ', '').split(',')
             outs = re.search('//!OUT ([^\\n]+)', body)[1].replace(' ', '').split(',')
             block = int(re.search('//!BLOCK_SIZE (\\d+)', body)[1])
-            pre = '[[vk::binding(0,0)]] cbuffer Params { uint4 dimensions; uint4 origin; };\n' + precision + '\n' + shared + '\n'
+            pre = '[[vk::binding(0,0)]] cbuffer Params { uint4 dimensions; };\n' + precision + '\n' + shared + '\n'
             binding = 1
             for name in ins:
                 pre += f'[[vk::binding({binding},0)]] Texture2D<float4> {name};\n'
@@ -52,9 +52,7 @@ def generate(compiler):
                 binding += 1
             for name in outs:
                 body = re.sub('\\b' + name + '\\[([^\\]]+)\\]\\s*=\\s*([^;]+);', lambda m: name + '.Store(' + m[1] + ', ' + m[2] + ');', body)
-            # origin.xy is the damaged region's corner in input pixels, origin.zw in output pixels.
-            origin = 'origin.zw' if 'OUTPUT' in outs else 'origin.xy'
-            src = pre + body + f'\n[numthreads(64,1,1)] void main(uint3 group : SV_GroupID, uint3 tid : SV_GroupThreadID) {{ Pass{n}(group.xy * {block} + {origin}, tid); }}\n'
+            src = pre + body + f'\n[numthreads(64,1,1)] void main(uint3 group : SV_GroupID, uint3 tid : SV_GroupThreadID) {{ Pass{n}(group.xy * {block}, tid); }}\n'
             p = outdir / f'{n}.slang'
             p.write_text(src)
             # Upstream relies on implicit float-to-half conversions.
@@ -77,7 +75,7 @@ def generate(compiler):
         outs = [save[1] if save else 'OUTPUT']
         if last:
             ins.append('INPUT')
-        pre = '[[vk::binding(0,0)]] cbuffer Params { uint4 dimensions; uint4 origin; };\n'
+        pre = '[[vk::binding(0,0)]] cbuffer Params { uint4 dimensions; };\n'
         for (b, name) in enumerate(ins, 1):
             pre += f'[[vk::binding({b},0)]] Texture2D<float4> {name};\n'
         b = len(ins) + 1
@@ -95,8 +93,7 @@ def generate(compiler):
         if 'LUMA' in ins:
             pre = pre.replace('return LUMA.SampleLevel(sam, uv, 0);', 'return float4(dot(LUMA.SampleLevel(sam, uv, 0).rgb, float3(0.2126, 0.7152, 0.0722)), 0, 0, 1);')
         size = 'dimensions.zw' if last else 'dimensions.xy'
-        origin = 'origin.zw' if last else 'origin.xy'
-        main = f'\n[numthreads(8,8,1)] void main(uint3 group : SV_DispatchThreadID) {{ uint2 id = group.xy + {origin}; if(any(id >= {size})) return; float2 pos = (float2(id) + 0.5) / float2({size}); float4 v=hook(pos);'
+        main = f'\n[numthreads(8,8,1)] void main(uint3 group : SV_GroupID, uint3 tid : SV_GroupThreadID) {{ uint2 id = group.xy * 8 + tid.xy; if(any(id >= {size})) return; float2 pos = (float2(id) + 0.5) / float2({size}); float4 v=hook(pos);'
         if last:
             main += 'float3 rgb=INPUT.SampleLevel(sam,pos,0).rgb; v=float4(rgb + (v.x - dot(rgb,float3(0.2126,0.7152,0.0722))),1);'
         main += f'{outs[0]}.Store(id,v); }}'
@@ -127,9 +124,28 @@ def rebind(source):
     return fuse.DECL.sub(group, source)
 
 
+# Each workgroup covers one listed cell of its pass's output grid: workgroup
+# `i` reads `cells[i]`, packed as x | y << 16 in units of the pass's block.
+CELLS = '''@group(3) @binding(0) var<storage, read> cells: array<u32>;
+fn cell(index: u32) -> vec2<u32> {
+    let packed = cells[index];
+    return vec2<u32>(packed & 0xffffu, packed >> 16u);
+}
+'''
+
+
+def listed(source):
+    """Take each workgroup's block from the cell list instead of its id."""
+    group = re.search(r'@builtin\(workgroup_id\)\s*(\w+)', source)[1]
+    source, count = re.subn(r'\b' + group + r'\.xy\b', f'cell({group}.x)', source)
+    assert count == 1, 'one block origin per entry'
+    entry = source.index('@compute')
+    return source[:entry] + CELLS + source[entry:]
+
+
 def write(shader, source):
     (UPSCALE / shader).parent.mkdir(parents=True, exist_ok=True)
-    (UPSCALE / shader).write_text(HEADER + rebind(source).rstrip() + '\n')
+    (UPSCALE / shader).write_text(HEADER + listed(rebind(source)).rstrip() + '\n')
 
 
 def slots(passes):
@@ -162,13 +178,14 @@ def model(passes):
     rust = ['Model { tensors: &[' + ', '.join('Rgba8Unorm' if fmt == 'rgba8' else 'Rgba16Float' for fmt in tensors) + '], passes: &[']
     for p in passes:
         roles = ['Uniform']
+        cells = '(0, Cells), '
         roles += ['Source' if n == 'INPUT' else f'Tensor({names[n]})' for n in p['inputs']]
         roles += ['Output' if n == 'OUTPUT' else f'Store({names[n]})' for n in p['outputs']]
         roles += ['Linear' if f == 'LINEAR' else 'Nearest' for (f, _) in p['samplers']]
         used = {int(n) for n in re.findall('@binding\\((\\d+)\\)', (UPSCALE / p['shader']).read_text())}
         entries = ', '.join(f'({n}, {role})' for (n, role) in enumerate(roles) if n in used)
         scale = 2 if 'OUTPUT' in p['outputs'] else 1
-        rust.append(f"Pass {{ shader: \"{p['shader']}\", bindings: &[{entries}], block: {p['block']}, scale: {scale}, radius: {p['radius']} }},")
+        rust.append(f"Pass {{ shader: \"{p['shader']}\", bindings: &[{cells}{entries}], block: {p['block']}, scale: {scale}, radius: {p['radius']} }},")
     rust.append('] }')
     return '\n'.join(rust)
 

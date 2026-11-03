@@ -5,7 +5,6 @@ enable f16;
 struct SLANG_ParameterGroup_Params_std140_a0
 {
     @align(16) dimensions_a0 : vec4<u32>,
-    @align(16) origin_a0 : vec4<u32>,
 };
 
 @binding(0) @group(0) var<uniform> Params_a0 : SLANG_ParameterGroup_Params_std140_a0;
@@ -290,9 +289,14 @@ fn load_3(uv: vec2<f32>) -> vec4<f32> {
 }
 var<private> tile_origin: vec2<i32>;
 var<private> tile_index: u32;
+@group(3) @binding(0) var<storage, read> cells: array<u32>;
+fn cell(index: u32) -> vec2<u32> {
+    let packed = cells[index];
+    return vec2<u32>(packed & 0xffffu, packed >> 16u);
+}
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_index) lane: u32) {
-    let origin = group.xy * 16u + Params_a0.origin_a0.xy;
+    let origin = cell(group.x) * 16u;
     tile_origin = vec2<i32>(origin) - vec2<i32>(1);
     for (var i = lane; i < 324u; i += 64u) {
         tile_index = i;

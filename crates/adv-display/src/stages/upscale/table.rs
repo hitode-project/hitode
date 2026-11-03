@@ -7,8 +7,10 @@ use adv_gpu::resource::Dimension;
 /// What a pass binds at a slot. Slots keep the generated binding numbers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
-    /// Canvas dimensions and the region origin.
+    /// Canvas and doubled dimensions.
     Uniform,
+    /// The workgroup cells to compute (storage group, slot 0).
+    Cells,
     /// The composed canvas.
     Source,
     /// A tensor the pass reads.
@@ -57,6 +59,7 @@ impl Pass {
                 slot,
                 kind: match role {
                     Role::Uniform => BindingKind::UniformBuffer,
+                    Role::Cells => BindingKind::StorageBuffer { writable: false },
                     Role::Source | Role::Tensor(_) => sampled,
                     Role::Store(i) => BindingKind::StorageImage {
                         format: model.tensors[i],

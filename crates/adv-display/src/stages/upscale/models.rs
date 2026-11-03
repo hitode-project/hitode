@@ -9,6 +9,7 @@ pub const REFERENCE: [Model; 4] = [
             Pass {
                 shader: "Anime4K_Upscale_Denoise_L/1.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Source),
                     (2, Store(0)),
@@ -22,6 +23,7 @@ pub const REFERENCE: [Model; 4] = [
             Pass {
                 shader: "Anime4K_Upscale_Denoise_L/2.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(0)),
                     (2, Tensor(1)),
@@ -36,6 +38,7 @@ pub const REFERENCE: [Model; 4] = [
             Pass {
                 shader: "Anime4K_Upscale_Denoise_L/3.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(2)),
                     (2, Tensor(3)),
@@ -50,6 +53,7 @@ pub const REFERENCE: [Model; 4] = [
             Pass {
                 shader: "Anime4K_Upscale_Denoise_L/4.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Source),
                     (2, Tensor(0)),
@@ -72,6 +76,7 @@ pub const REFERENCE: [Model; 4] = [
             Pass {
                 shader: "CuNNy-4x12-NVL/1.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Source),
                     (2, Store(0)),
@@ -86,6 +91,7 @@ pub const REFERENCE: [Model; 4] = [
             Pass {
                 shader: "CuNNy-4x12-NVL/2.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(0)),
                     (2, Tensor(1)),
@@ -102,6 +108,7 @@ pub const REFERENCE: [Model; 4] = [
             Pass {
                 shader: "CuNNy-4x12-NVL/3.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(3)),
                     (2, Tensor(4)),
@@ -118,6 +125,7 @@ pub const REFERENCE: [Model; 4] = [
             Pass {
                 shader: "CuNNy-4x12-NVL/4.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(0)),
                     (2, Tensor(1)),
@@ -134,6 +142,7 @@ pub const REFERENCE: [Model; 4] = [
             Pass {
                 shader: "CuNNy-4x12-NVL/5.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(3)),
                     (2, Tensor(4)),
@@ -150,6 +159,7 @@ pub const REFERENCE: [Model; 4] = [
             Pass {
                 shader: "CuNNy-4x12-NVL/6.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Source),
                     (2, Tensor(0)),
@@ -183,28 +193,52 @@ pub const REFERENCE: [Model; 4] = [
         passes: &[
             Pass {
                 shader: "ArtCNN_C4F16/1.wgsl",
-                bindings: &[(0, Uniform), (1, Source), (2, Store(0)), (3, Linear)],
+                bindings: &[
+                    (0, Cells),
+                    (0, Uniform),
+                    (1, Source),
+                    (2, Store(0)),
+                    (3, Linear),
+                ],
                 block: 8,
                 scale: 1,
                 radius: 1,
             },
             Pass {
                 shader: "ArtCNN_C4F16/2.wgsl",
-                bindings: &[(0, Uniform), (1, Source), (2, Store(1)), (3, Linear)],
+                bindings: &[
+                    (0, Cells),
+                    (0, Uniform),
+                    (1, Source),
+                    (2, Store(1)),
+                    (3, Linear),
+                ],
                 block: 8,
                 scale: 1,
                 radius: 1,
             },
             Pass {
                 shader: "ArtCNN_C4F16/3.wgsl",
-                bindings: &[(0, Uniform), (1, Source), (2, Store(2)), (3, Linear)],
+                bindings: &[
+                    (0, Cells),
+                    (0, Uniform),
+                    (1, Source),
+                    (2, Store(2)),
+                    (3, Linear),
+                ],
                 block: 8,
                 scale: 1,
                 radius: 1,
             },
             Pass {
                 shader: "ArtCNN_C4F16/4.wgsl",
-                bindings: &[(0, Uniform), (1, Source), (2, Store(3)), (3, Linear)],
+                bindings: &[
+                    (0, Cells),
+                    (0, Uniform),
+                    (1, Source),
+                    (2, Store(3)),
+                    (3, Linear),
+                ],
                 block: 8,
                 scale: 1,
                 radius: 1,
@@ -212,6 +246,7 @@ pub const REFERENCE: [Model; 4] = [
             Pass {
                 shader: "ArtCNN_C4F16/5.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(0)),
                     (2, Tensor(1)),
@@ -227,6 +262,7 @@ pub const REFERENCE: [Model; 4] = [
             Pass {
                 shader: "ArtCNN_C4F16/6.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(0)),
                     (2, Tensor(1)),
@@ -242,6 +278,7 @@ pub const REFERENCE: [Model; 4] = [
             Pass {
                 shader: "ArtCNN_C4F16/7.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(0)),
                     (2, Tensor(1)),
@@ -257,6 +294,7 @@ pub const REFERENCE: [Model; 4] = [
             Pass {
                 shader: "ArtCNN_C4F16/8.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(0)),
                     (2, Tensor(1)),
@@ -272,6 +310,7 @@ pub const REFERENCE: [Model; 4] = [
             Pass {
                 shader: "ArtCNN_C4F16/9.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(4)),
                     (2, Tensor(5)),
@@ -287,6 +326,7 @@ pub const REFERENCE: [Model; 4] = [
             Pass {
                 shader: "ArtCNN_C4F16/10.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(4)),
                     (2, Tensor(5)),
@@ -302,6 +342,7 @@ pub const REFERENCE: [Model; 4] = [
             Pass {
                 shader: "ArtCNN_C4F16/11.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(4)),
                     (2, Tensor(5)),
@@ -317,6 +358,7 @@ pub const REFERENCE: [Model; 4] = [
             Pass {
                 shader: "ArtCNN_C4F16/12.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(4)),
                     (2, Tensor(5)),
@@ -332,6 +374,7 @@ pub const REFERENCE: [Model; 4] = [
             Pass {
                 shader: "ArtCNN_C4F16/13.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(8)),
                     (2, Tensor(9)),
@@ -347,6 +390,7 @@ pub const REFERENCE: [Model; 4] = [
             Pass {
                 shader: "ArtCNN_C4F16/14.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(8)),
                     (2, Tensor(9)),
@@ -362,6 +406,7 @@ pub const REFERENCE: [Model; 4] = [
             Pass {
                 shader: "ArtCNN_C4F16/15.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(8)),
                     (2, Tensor(9)),
@@ -377,6 +422,7 @@ pub const REFERENCE: [Model; 4] = [
             Pass {
                 shader: "ArtCNN_C4F16/16.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(8)),
                     (2, Tensor(9)),
@@ -392,6 +438,7 @@ pub const REFERENCE: [Model; 4] = [
             Pass {
                 shader: "ArtCNN_C4F16/17.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(4)),
                     (2, Tensor(5)),
@@ -407,6 +454,7 @@ pub const REFERENCE: [Model; 4] = [
             Pass {
                 shader: "ArtCNN_C4F16/18.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(4)),
                     (2, Tensor(5)),
@@ -422,6 +470,7 @@ pub const REFERENCE: [Model; 4] = [
             Pass {
                 shader: "ArtCNN_C4F16/19.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(4)),
                     (2, Tensor(5)),
@@ -437,6 +486,7 @@ pub const REFERENCE: [Model; 4] = [
             Pass {
                 shader: "ArtCNN_C4F16/20.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(4)),
                     (2, Tensor(5)),
@@ -452,6 +502,7 @@ pub const REFERENCE: [Model; 4] = [
             Pass {
                 shader: "ArtCNN_C4F16/21.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(8)),
                     (2, Tensor(9)),
@@ -467,6 +518,7 @@ pub const REFERENCE: [Model; 4] = [
             Pass {
                 shader: "ArtCNN_C4F16/22.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(8)),
                     (2, Tensor(9)),
@@ -482,6 +534,7 @@ pub const REFERENCE: [Model; 4] = [
             Pass {
                 shader: "ArtCNN_C4F16/23.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(8)),
                     (2, Tensor(9)),
@@ -497,6 +550,7 @@ pub const REFERENCE: [Model; 4] = [
             Pass {
                 shader: "ArtCNN_C4F16/24.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(8)),
                     (2, Tensor(9)),
@@ -512,6 +566,7 @@ pub const REFERENCE: [Model; 4] = [
             Pass {
                 shader: "ArtCNN_C4F16/25.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(0)),
                     (2, Tensor(4)),
@@ -531,6 +586,7 @@ pub const REFERENCE: [Model; 4] = [
             Pass {
                 shader: "ArtCNN_C4F16/26.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(8)),
                     (2, Source),
@@ -558,6 +614,7 @@ pub const REFERENCE: [Model; 4] = [
             Pass {
                 shader: "k7_modernAnime_FHD_x2/1.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Source),
                     (2, Store(0)),
@@ -573,6 +630,7 @@ pub const REFERENCE: [Model; 4] = [
             Pass {
                 shader: "k7_modernAnime_FHD_x2/2.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(0)),
                     (2, Tensor(1)),
@@ -591,6 +649,7 @@ pub const REFERENCE: [Model; 4] = [
             Pass {
                 shader: "k7_modernAnime_FHD_x2/3.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(4)),
                     (2, Tensor(5)),
@@ -609,6 +668,7 @@ pub const REFERENCE: [Model; 4] = [
             Pass {
                 shader: "k7_modernAnime_FHD_x2/4.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(0)),
                     (2, Tensor(1)),
@@ -627,6 +687,7 @@ pub const REFERENCE: [Model; 4] = [
             Pass {
                 shader: "k7_modernAnime_FHD_x2/5.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(4)),
                     (2, Tensor(5)),
@@ -645,6 +706,7 @@ pub const REFERENCE: [Model; 4] = [
             Pass {
                 shader: "k7_modernAnime_FHD_x2/6.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(0)),
                     (2, Tensor(1)),
@@ -663,6 +725,7 @@ pub const REFERENCE: [Model; 4] = [
             Pass {
                 shader: "k7_modernAnime_FHD_x2/7.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(4)),
                     (2, Tensor(5)),
@@ -681,6 +744,7 @@ pub const REFERENCE: [Model; 4] = [
             Pass {
                 shader: "k7_modernAnime_FHD_x2/8.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Source),
                     (2, Tensor(0)),
@@ -705,6 +769,7 @@ pub const FUSED: [Model; 4] = [
             Pass {
                 shader: "Anime4K_Upscale_Denoise_L/1.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Source),
                     (2, Store(0)),
@@ -718,6 +783,7 @@ pub const FUSED: [Model; 4] = [
             Pass {
                 shader: "Anime4K_Upscale_Denoise_L/2-3.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(0)),
                     (2, Tensor(1)),
@@ -732,6 +798,7 @@ pub const FUSED: [Model; 4] = [
             Pass {
                 shader: "Anime4K_Upscale_Denoise_L/4.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Source),
                     (2, Tensor(2)),
@@ -754,6 +821,7 @@ pub const FUSED: [Model; 4] = [
             Pass {
                 shader: "CuNNy-4x12-NVL/1.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Source),
                     (2, Store(0)),
@@ -768,6 +836,7 @@ pub const FUSED: [Model; 4] = [
             Pass {
                 shader: "CuNNy-4x12-NVL/2.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(0)),
                     (2, Tensor(1)),
@@ -784,6 +853,7 @@ pub const FUSED: [Model; 4] = [
             Pass {
                 shader: "CuNNy-4x12-NVL/3.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(3)),
                     (2, Tensor(4)),
@@ -800,6 +870,7 @@ pub const FUSED: [Model; 4] = [
             Pass {
                 shader: "CuNNy-4x12-NVL/4-5.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(0)),
                     (2, Tensor(1)),
@@ -816,6 +887,7 @@ pub const FUSED: [Model; 4] = [
             Pass {
                 shader: "CuNNy-4x12-NVL/6.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Source),
                     (2, Tensor(3)),
@@ -849,28 +921,52 @@ pub const FUSED: [Model; 4] = [
         passes: &[
             Pass {
                 shader: "ArtCNN_C4F16/1.wgsl",
-                bindings: &[(0, Uniform), (1, Source), (2, Store(0)), (3, Linear)],
+                bindings: &[
+                    (0, Cells),
+                    (0, Uniform),
+                    (1, Source),
+                    (2, Store(0)),
+                    (3, Linear),
+                ],
                 block: 8,
                 scale: 1,
                 radius: 1,
             },
             Pass {
                 shader: "ArtCNN_C4F16/2.wgsl",
-                bindings: &[(0, Uniform), (1, Source), (2, Store(1)), (3, Linear)],
+                bindings: &[
+                    (0, Cells),
+                    (0, Uniform),
+                    (1, Source),
+                    (2, Store(1)),
+                    (3, Linear),
+                ],
                 block: 8,
                 scale: 1,
                 radius: 1,
             },
             Pass {
                 shader: "ArtCNN_C4F16/3.wgsl",
-                bindings: &[(0, Uniform), (1, Source), (2, Store(2)), (3, Linear)],
+                bindings: &[
+                    (0, Cells),
+                    (0, Uniform),
+                    (1, Source),
+                    (2, Store(2)),
+                    (3, Linear),
+                ],
                 block: 8,
                 scale: 1,
                 radius: 1,
             },
             Pass {
                 shader: "ArtCNN_C4F16/4.wgsl",
-                bindings: &[(0, Uniform), (1, Source), (2, Store(3)), (3, Linear)],
+                bindings: &[
+                    (0, Cells),
+                    (0, Uniform),
+                    (1, Source),
+                    (2, Store(3)),
+                    (3, Linear),
+                ],
                 block: 8,
                 scale: 1,
                 radius: 1,
@@ -878,6 +974,7 @@ pub const FUSED: [Model; 4] = [
             Pass {
                 shader: "ArtCNN_C4F16/5.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(0)),
                     (2, Tensor(1)),
@@ -893,6 +990,7 @@ pub const FUSED: [Model; 4] = [
             Pass {
                 shader: "ArtCNN_C4F16/6.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(0)),
                     (2, Tensor(1)),
@@ -908,6 +1006,7 @@ pub const FUSED: [Model; 4] = [
             Pass {
                 shader: "ArtCNN_C4F16/7.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(0)),
                     (2, Tensor(1)),
@@ -923,6 +1022,7 @@ pub const FUSED: [Model; 4] = [
             Pass {
                 shader: "ArtCNN_C4F16/8.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(0)),
                     (2, Tensor(1)),
@@ -938,6 +1038,7 @@ pub const FUSED: [Model; 4] = [
             Pass {
                 shader: "ArtCNN_C4F16/9.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(4)),
                     (2, Tensor(5)),
@@ -953,6 +1054,7 @@ pub const FUSED: [Model; 4] = [
             Pass {
                 shader: "ArtCNN_C4F16/10.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(4)),
                     (2, Tensor(5)),
@@ -968,6 +1070,7 @@ pub const FUSED: [Model; 4] = [
             Pass {
                 shader: "ArtCNN_C4F16/11.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(4)),
                     (2, Tensor(5)),
@@ -983,6 +1086,7 @@ pub const FUSED: [Model; 4] = [
             Pass {
                 shader: "ArtCNN_C4F16/12.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(4)),
                     (2, Tensor(5)),
@@ -998,6 +1102,7 @@ pub const FUSED: [Model; 4] = [
             Pass {
                 shader: "ArtCNN_C4F16/13.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(8)),
                     (2, Tensor(9)),
@@ -1013,6 +1118,7 @@ pub const FUSED: [Model; 4] = [
             Pass {
                 shader: "ArtCNN_C4F16/14.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(8)),
                     (2, Tensor(9)),
@@ -1028,6 +1134,7 @@ pub const FUSED: [Model; 4] = [
             Pass {
                 shader: "ArtCNN_C4F16/15.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(8)),
                     (2, Tensor(9)),
@@ -1043,6 +1150,7 @@ pub const FUSED: [Model; 4] = [
             Pass {
                 shader: "ArtCNN_C4F16/16.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(8)),
                     (2, Tensor(9)),
@@ -1058,6 +1166,7 @@ pub const FUSED: [Model; 4] = [
             Pass {
                 shader: "ArtCNN_C4F16/17.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(4)),
                     (2, Tensor(5)),
@@ -1073,6 +1182,7 @@ pub const FUSED: [Model; 4] = [
             Pass {
                 shader: "ArtCNN_C4F16/18.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(4)),
                     (2, Tensor(5)),
@@ -1088,6 +1198,7 @@ pub const FUSED: [Model; 4] = [
             Pass {
                 shader: "ArtCNN_C4F16/19.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(4)),
                     (2, Tensor(5)),
@@ -1103,6 +1214,7 @@ pub const FUSED: [Model; 4] = [
             Pass {
                 shader: "ArtCNN_C4F16/20.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(4)),
                     (2, Tensor(5)),
@@ -1118,6 +1230,7 @@ pub const FUSED: [Model; 4] = [
             Pass {
                 shader: "ArtCNN_C4F16/21.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(8)),
                     (2, Tensor(9)),
@@ -1133,6 +1246,7 @@ pub const FUSED: [Model; 4] = [
             Pass {
                 shader: "ArtCNN_C4F16/22.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(8)),
                     (2, Tensor(9)),
@@ -1148,6 +1262,7 @@ pub const FUSED: [Model; 4] = [
             Pass {
                 shader: "ArtCNN_C4F16/23.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(8)),
                     (2, Tensor(9)),
@@ -1163,6 +1278,7 @@ pub const FUSED: [Model; 4] = [
             Pass {
                 shader: "ArtCNN_C4F16/24.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(8)),
                     (2, Tensor(9)),
@@ -1178,6 +1294,7 @@ pub const FUSED: [Model; 4] = [
             Pass {
                 shader: "ArtCNN_C4F16/25.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(0)),
                     (2, Tensor(4)),
@@ -1197,6 +1314,7 @@ pub const FUSED: [Model; 4] = [
             Pass {
                 shader: "ArtCNN_C4F16/26.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(8)),
                     (2, Source),
@@ -1224,6 +1342,7 @@ pub const FUSED: [Model; 4] = [
             Pass {
                 shader: "k7_modernAnime_FHD_x2/1.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Source),
                     (2, Store(0)),
@@ -1239,6 +1358,7 @@ pub const FUSED: [Model; 4] = [
             Pass {
                 shader: "k7_modernAnime_FHD_x2/2-3.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(0)),
                     (2, Tensor(1)),
@@ -1257,6 +1377,7 @@ pub const FUSED: [Model; 4] = [
             Pass {
                 shader: "k7_modernAnime_FHD_x2/4-5.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(4)),
                     (2, Tensor(5)),
@@ -1275,6 +1396,7 @@ pub const FUSED: [Model; 4] = [
             Pass {
                 shader: "k7_modernAnime_FHD_x2/6-7.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(0)),
                     (2, Tensor(1)),
@@ -1293,6 +1415,7 @@ pub const FUSED: [Model; 4] = [
             Pass {
                 shader: "k7_modernAnime_FHD_x2/8.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Source),
                     (2, Tensor(4)),
@@ -1317,6 +1440,7 @@ pub const MATRIX: [Model; 4] = [
             Pass {
                 shader: "Anime4K_Upscale_Denoise_L/1-matrix.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Source),
                     (2, Store(0)),
@@ -1330,6 +1454,7 @@ pub const MATRIX: [Model; 4] = [
             Pass {
                 shader: "Anime4K_Upscale_Denoise_L/2-3.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(0)),
                     (2, Tensor(1)),
@@ -1344,6 +1469,7 @@ pub const MATRIX: [Model; 4] = [
             Pass {
                 shader: "Anime4K_Upscale_Denoise_L/4.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Source),
                     (2, Tensor(2)),
@@ -1375,6 +1501,7 @@ pub const MATRIX: [Model; 4] = [
             Pass {
                 shader: "k7_modernAnime_FHD_x2/1-matrix.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Source),
                     (2, Store(0)),
@@ -1390,6 +1517,7 @@ pub const MATRIX: [Model; 4] = [
             Pass {
                 shader: "k7_modernAnime_FHD_x2/2-3.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(0)),
                     (2, Tensor(1)),
@@ -1408,6 +1536,7 @@ pub const MATRIX: [Model; 4] = [
             Pass {
                 shader: "k7_modernAnime_FHD_x2/4-5.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(4)),
                     (2, Tensor(5)),
@@ -1426,6 +1555,7 @@ pub const MATRIX: [Model; 4] = [
             Pass {
                 shader: "k7_modernAnime_FHD_x2/6-7.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Tensor(0)),
                     (2, Tensor(1)),
@@ -1444,6 +1574,7 @@ pub const MATRIX: [Model; 4] = [
             Pass {
                 shader: "k7_modernAnime_FHD_x2/8.wgsl",
                 bindings: &[
+                    (0, Cells),
                     (0, Uniform),
                     (1, Source),
                     (2, Tensor(4)),

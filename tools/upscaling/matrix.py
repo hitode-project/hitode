@@ -81,7 +81,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
         @builtin(subgroup_id) subgroup: u32,
         @builtin(subgroup_invocation_id) sublane: u32,
         @builtin(num_subgroups) groups: u32) {{
-    let origin = group.xy * 16u + Params_0.origin_0.xy;
+    let origin = group.xy * 16u;
     let size = Params_0.dimensions_0.xy;
     for (var i = lane; i < {len(constants)}u; i += 64u) {{ weights[i] = coefficients[i]; }}
     for (var i = lane; i < 324u; i += 64u) {{

@@ -2,7 +2,6 @@
 struct SLANG_ParameterGroup_Params_std140_0
 {
     @align(16) dimensions_0 : vec4<u32>,
-    @align(16) origin_0 : vec4<u32>,
 };
 
 @binding(0) @group(0) var<uniform> Params_0 : SLANG_ParameterGroup_Params_std140_0;
@@ -28,11 +27,16 @@ fn hook_0( pos_0 : vec2<f32>) -> vec4<f32>
     return clamp(result_0, vec4<f32>(0.0f), vec4<f32>(1.0f));
 }
 
+@group(3) @binding(0) var<storage, read> cells: array<u32>;
+fn cell(index: u32) -> vec2<u32> {
+    let packed = cells[index];
+    return vec2<u32>(packed & 0xffffu, packed >> 16u);
+}
 @compute
 @workgroup_size(8, 8, 1)
-fn main(@builtin(global_invocation_id) group_0 : vec3<u32>)
+fn main(@builtin(workgroup_id) group_0 : vec3<u32>, @builtin(local_invocation_id) tid_0 : vec3<u32>)
 {
-    var id_0 : vec2<u32> = group_0.xy + Params_0.origin_0.zw;
+    var id_0 : vec2<u32> = cell(group_0.x) * vec2<u32>(u32(8)) + tid_0.xy;
     if((any((id_0 >= (Params_0.dimensions_0.zw)))))
     {
         return;

@@ -89,7 +89,7 @@ impl Gpu {
     }
 
     /// Writes `pixels` (in 1/256 steps) into the input and runs the model.
-    fn run(&mut self, scaler: &Scaler, pixels: &[[u32; 3]], damage: Option<Rect>) {
+    fn run(&mut self, scaler: &Scaler, pixels: &[[u32; 3]], damage: Option<&[Rect]>) -> u64 {
         let bytes: Vec<u8> = pixels
             .iter()
             .flat_map(|p| [half(p[0]), half(p[1]), half(p[2]), [0x00, 0x3c]])
@@ -115,12 +115,13 @@ impl Gpu {
             },
             input.desc().size,
         );
-        scaler
+        let computed = scaler
             .upscaling
             .encode(&mut encoder, &mut self.ring, scaler.output.view(), damage)
             .unwrap();
         let token = self.queue.submit(encoder).unwrap();
         assert!(self.queue.wait(token, Duration::from_secs(60)).unwrap());
+        computed
     }
 
     /// The output's rows of RGBA8 texels.
@@ -244,31 +245,14 @@ fn partial_runs_match_full_runs_within_the_model_radius() {
             })
         })
         .collect();
+    let rect = |x, y, w, h| Rect { x, y, w, h };
+    // Single changes, edges, and disjoint changes far apart in one run.
     let damages = [
-        Rect {
-            x: 77,
-            y: 61,
-            w: 3,
-            h: 2,
-        },
-        Rect {
-            x: 0,
-            y: 0,
-            w: 2,
-            h: 5,
-        },
-        Rect {
-            x: 150,
-            y: 120,
-            w: 10,
-            h: 8,
-        },
-        Rect {
-            x: 40,
-            y: 100,
-            w: 31,
-            h: 1,
-        },
+        vec![rect(77, 61, 3, 2)],
+        vec![rect(0, 0, 2, 5)],
+        vec![rect(150, 120, 10, 8)],
+        vec![rect(40, 100, 31, 1)],
+        vec![rect(3, 120, 4, 4), rect(140, 6, 9, 3), rect(80, 64, 1, 1)],
     ];
     for choice in CHOICES {
         let selected = model(&gpu.device, choice);
@@ -281,13 +265,19 @@ fn partial_runs_match_full_runs_within_the_model_radius() {
         let mut frame = pixels.clone();
         for (step, damage) in damages.iter().enumerate() {
             let before = gpu.read(&full.output);
-            for y in damage.y..damage.y + damage.h {
-                for x in damage.x..damage.x + damage.w {
-                    frame[(y * size.0 + x) as usize] = [255, step as u32 * 60, 128];
+            for r in damage {
+                for y in r.y..r.y + r.h {
+                    for x in r.x..r.x + r.w {
+                        frame[(y * size.0 + x) as usize] = [255, step as u32 * 50, 128];
+                    }
                 }
             }
             gpu.run(&full, &frame, None);
-            gpu.run(&partial, &frame, Some(*damage));
+            let computed = gpu.run(&partial, &frame, Some(damage));
+            assert!(
+                computed < u64::from(size.0 * size.1) / 2,
+                "{choice:?} partial run {step} computed {computed} pixels"
+            );
             let after = gpu.read(&full.output);
             assert!(
                 gpu.read(&partial.output) == after,
@@ -299,19 +289,32 @@ fn partial_runs_match_full_runs_within_the_model_radius() {
                 for x in 0..old.len() / 4 {
                     if old[x * 4..x * 4 + 4] != new[x * 4..x * 4 + 4] {
                         let (x, y) = (x as u32 / 2, y as u32 / 2);
-                        let dx = damage
-                            .x
-                            .saturating_sub(x)
-                            .max(x.saturating_sub(damage.x + damage.w - 1));
-                        let dy = damage
-                            .y
-                            .saturating_sub(y)
-                            .max(y.saturating_sub(damage.y + damage.h - 1));
-                        reached = reached.max(dx.max(dy));
+                        let distance = damage
+                            .iter()
+                            .map(|r| {
+                                let dx = r.x.saturating_sub(x).max(x.saturating_sub(r.x + r.w - 1));
+                                let dy = r.y.saturating_sub(y).max(y.saturating_sub(r.y + r.h - 1));
+                                dx.max(dy)
+                            })
+                            .min()
+                            .unwrap();
+                        reached = reached.max(distance);
                     }
                 }
             }
             assert!(reached <= reach, "{choice:?} reaches {reached}");
         }
+        // Nothing changed: nothing is computed.
+        let mut encoder = gpu.queue.encoder("upscale test");
+        let computed = partial
+            .upscaling
+            .encode(
+                &mut encoder,
+                &mut gpu.ring,
+                partial.output.view(),
+                Some(&[]),
+            )
+            .unwrap();
+        assert_eq!(computed, 0);
     }
 }
