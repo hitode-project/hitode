@@ -45,7 +45,7 @@ pub enum SwapImage {
 /// queued frames refer to this same picture. An unshown picture keeps its lease.
 pub struct DecodedPicture {
     image: adv_gpu::Image,
-    planes: [adv_gpu::ImageView; 2],
+    planes: Option<[adv_gpu::ImageView; 2]>,
     color: adv_gpu::present::YuvColor,
     lease: std::sync::Mutex<Option<adv_gpu::PresentImage>>,
     #[cfg(feature = "media")]
@@ -63,16 +63,18 @@ impl std::fmt::Debug for DecodedPicture {
 impl DecodedPicture {
     #[cfg(feature = "media")]
     pub(crate) fn new(image: adv_gpu::Image, color: adv_gpu::present::YuvColor) -> Self {
-        let planes = std::array::from_fn(|plane| {
-            image
-                .create_view(&adv_gpu::resource::ViewDesc {
-                    format: Some([adv_gpu::Format::R8Unorm, adv_gpu::Format::Rg8Unorm][plane]),
-                    dimension: None,
-                    mips: 0..1,
-                    layers: 0..1,
-                    plane: plane as u32,
-                })
-                .expect("NV12 plane view")
+        let planes = (image.desc().format == adv_gpu::Format::Nv12).then(|| {
+            std::array::from_fn(|plane| {
+                image
+                    .create_view(&adv_gpu::resource::ViewDesc {
+                        format: Some([adv_gpu::Format::R8Unorm, adv_gpu::Format::Rg8Unorm][plane]),
+                        dimension: None,
+                        mips: 0..1,
+                        layers: 0..1,
+                        plane: plane as u32,
+                    })
+                    .expect("NV12 plane view")
+            })
         });
         Self {
             image,
@@ -116,7 +118,7 @@ impl DecodedPicture {
         &self.image
     }
     pub fn planes(&self) -> &[adv_gpu::ImageView; 2] {
-        &self.planes
+        self.planes.as_ref().expect("NV12 plane views")
     }
 }
 

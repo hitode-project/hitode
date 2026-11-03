@@ -1,8 +1,8 @@
-//! Decoder output is copied once into four reusable NV12 presentable buffers.
+//! Decoder output is copied once into four reusable YUV presentable buffers.
 
 use super::{Error, VideoFrame};
 use adv_gpu::{
-    Device, Format, PresentPool,
+    Device, Format, FormatCaps, PresentPool,
     present::{PlaneMut, PoolDesc, YuvColor},
     queue::DeviceOptions,
 };
@@ -15,6 +15,7 @@ pub(super) struct Output {
     scaler: Option<software::scaling::Context>,
     width: u32,
     height: u32,
+    format: Format,
 }
 
 fn gpu_error(error: adv_gpu::Error) -> Error {
@@ -38,11 +39,20 @@ impl Output {
         let (width, height) = (decoder.width(), decoder.height());
         let color = color(decoder.color_space(), decoder.color_range());
         let (device, _queue) = Device::open(&DeviceOptions::default()).map_err(gpu_error)?;
+        let format = [Format::Nv12, Format::Nv21]
+            .into_iter()
+            .find(|&format| {
+                device
+                    .caps()
+                    .format(format)
+                    .contains(FormatCaps::PRESENTABLE)
+            })
+            .ok_or_else(|| Error::Decode("no presentable YUV format".into()))?;
         let mut pool = device
             .create_present_pool(&PoolDesc {
                 width,
                 height,
-                format: Format::Nv12,
+                format,
                 count: 4,
                 color: Some(color),
                 label: "decoded video",
@@ -59,14 +69,18 @@ impl Output {
         drop(buffers);
         let mut scaler = (!matches!(
             decoder.format(),
-            Pixel::YUV420P | Pixel::YUVJ420P | Pixel::NV12
+            Pixel::YUV420P | Pixel::YUVJ420P | Pixel::NV12 | Pixel::NV21
         ))
         .then(|| {
             software::scaling::Context::get(
                 decoder.format(),
                 width,
                 height,
-                Pixel::NV12,
+                if format == Format::Nv21 {
+                    Pixel::NV21
+                } else {
+                    Pixel::NV12
+                },
                 width,
                 height,
                 software::scaling::Flags::BILINEAR,
@@ -86,6 +100,7 @@ impl Output {
             scaler,
             width,
             height,
+            format,
         })
     }
 
@@ -139,7 +154,7 @@ impl Output {
                     self.height as i32
                 );
             } else {
-                copy(decoded, planes);
+                copy(decoded, planes, self.format);
             }
         });
         picture_mut.set_image(image, decoded);
@@ -152,7 +167,7 @@ impl Output {
     }
 }
 
-fn copy(source: &frame::Video, planes: &mut [PlaneMut<'_>]) {
+fn copy(source: &frame::Video, planes: &mut [PlaneMut<'_>], format: Format) {
     let width = source.width() as usize;
     let height = source.height() as usize;
     for y in 0..height {
@@ -161,17 +176,31 @@ fn copy(source: &frame::Video, planes: &mut [PlaneMut<'_>]) {
             .copy_from_slice(&source.data(0)[y * source.stride(0)..][..width]);
     }
     let chroma = width.div_ceil(2);
-    for y in 0..height.div_ceil(2) {
-        let start = y * planes[1].stride;
-        let dst = &mut planes[1].data[start..start + chroma * 2];
-        if source.format() == Pixel::NV12 {
-            dst.copy_from_slice(&source.data(1)[y * source.stride(1)..][..chroma * 2]);
-        } else {
-            interleave(
-                &source.data(1)[y * source.stride(1)..][..chroma],
-                &source.data(2)[y * source.stride(2)..][..chroma],
-                dst,
-            );
+    let vu = format == Format::Nv21;
+    match source.format() {
+        Pixel::NV12 | Pixel::NV21 => {
+            let swap = (source.format() == Pixel::NV21) != vu;
+            for y in 0..height.div_ceil(2) {
+                let start = y * planes[1].stride;
+                let dst = &mut planes[1].data[start..start + chroma * 2];
+                let src = &source.data(1)[y * source.stride(1)..][..chroma * 2];
+                if swap {
+                    swap_chroma(src, dst);
+                } else {
+                    dst.copy_from_slice(src);
+                }
+            }
+        }
+        _ => {
+            let (first, second) = if vu { (2, 1) } else { (1, 2) };
+            for y in 0..height.div_ceil(2) {
+                let start = y * planes[1].stride;
+                interleave(
+                    &source.data(first)[y * source.stride(first)..][..chroma],
+                    &source.data(second)[y * source.stride(second)..][..chroma],
+                    &mut planes[1].data[start..start + chroma * 2],
+                );
+            }
         }
     }
 }
@@ -200,6 +229,34 @@ fn interleave(u: &[u8], v: &[u8], dst: &mut [u8]) {
     }
     #[cfg(not(target_arch = "aarch64"))]
     scalar(u, v, dst);
+}
+
+fn swap_chroma(src: &[u8], dst: &mut [u8]) {
+    #[cfg(not(target_arch = "aarch64"))]
+    let end = 0;
+    #[cfg(target_arch = "aarch64")]
+    let end = src.len() / 16 * 16;
+    #[cfg(target_arch = "aarch64")]
+    {
+        use std::arch::aarch64::*;
+        for x in (0..end).step_by(16) {
+            // SAFETY: NEON is baseline; each load and store stays within the row.
+            unsafe {
+                vst1q_u8(
+                    dst.as_mut_ptr().add(x),
+                    vrev16q_u8(vld1q_u8(src.as_ptr().add(x))),
+                );
+            }
+        }
+    }
+    for (src, dst) in src[end..]
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .zip(dst[end..].as_chunks_mut::<2>().0.iter_mut())
+    {
+        *dst = [src[1], src[0]];
+    }
 }
 
 fn configure(scaler: &mut software::scaling::Context, color: YuvColor, destination_full: bool) {
@@ -270,6 +327,92 @@ pub(crate) fn bgra(source: &frame::Video, color: YuvColor) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    // spec: MEDIA-VIDEO-7
+    fn decoder_copy_writes_both_chroma_orders_without_touching_padding() {
+        for width in [1usize, 3, 17, 31, 33, 65] {
+            for source_format in [Pixel::YUV420P, Pixel::NV12, Pixel::NV21] {
+                let mut source = frame::Video::new(source_format, width as u32, 5);
+                let y_value = |x: usize, y: usize| (x * 3 + y * 7) as u8;
+                let u_value = |x: usize, y: usize| (x * 11 + y * 3 + 17) as u8;
+                let v_value = |x: usize, y: usize| (x * 7 + y * 13 + 91) as u8;
+                for y in 0..5 {
+                    for x in 0..width {
+                        let at = y * source.stride(0) + x;
+                        source.data_mut(0)[at] = y_value(x, y);
+                    }
+                }
+                for y in 0..3 {
+                    for x in 0..width.div_ceil(2) {
+                        if source_format == Pixel::YUV420P {
+                            for (plane, value) in [(1, u_value(x, y)), (2, v_value(x, y))] {
+                                let at = y * source.stride(plane) + x;
+                                source.data_mut(plane)[at] = value;
+                            }
+                        } else {
+                            let pair = if source_format == Pixel::NV21 {
+                                [v_value(x, y), u_value(x, y)]
+                            } else {
+                                [u_value(x, y), v_value(x, y)]
+                            };
+                            let at = y * source.stride(1) + x * 2;
+                            source.data_mut(1)[at..at + 2].copy_from_slice(&pair);
+                        }
+                    }
+                }
+                for format in [Format::Nv12, Format::Nv21] {
+                    let stride = width + 7;
+                    let chroma_stride = width.div_ceil(2) * 2 + 9;
+                    let mut y_plane = vec![0xcd; stride * 5];
+                    let mut chroma = vec![0xcd; chroma_stride * 3];
+                    copy(
+                        &source,
+                        &mut [
+                            PlaneMut {
+                                data: &mut y_plane,
+                                stride,
+                            },
+                            PlaneMut {
+                                data: &mut chroma,
+                                stride: chroma_stride,
+                            },
+                        ],
+                        format,
+                    );
+                    for y in 0..5 {
+                        for x in 0..width {
+                            assert_eq!(y_plane[y * stride + x], y_value(x, y));
+                        }
+                        assert!(
+                            y_plane[y * stride + width..(y + 1) * stride]
+                                .iter()
+                                .all(|&b| b == 0xcd)
+                        );
+                    }
+                    for y in 0..3 {
+                        for x in 0..width.div_ceil(2) {
+                            let expected = if format == Format::Nv21 {
+                                [v_value(x, y), u_value(x, y)]
+                            } else {
+                                [u_value(x, y), v_value(x, y)]
+                            };
+                            assert_eq!(
+                                &chroma[y * chroma_stride + x * 2..][..2],
+                                &expected,
+                                "{source_format:?} -> {format:?}, width {width}"
+                            );
+                        }
+                        assert!(
+                            chroma[y * chroma_stride + width.div_ceil(2) * 2
+                                ..(y + 1) * chroma_stride]
+                                .iter()
+                                .all(|&b| b == 0xcd)
+                        );
+                    }
+                }
+            }
+        }
+    }
     #[test]
     // spec: MEDIA-VIDEO-7
     fn chroma_interleave_odd_widths_and_strides() {

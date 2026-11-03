@@ -200,7 +200,7 @@ mod native {
         dataspace: i32,
     }
     /// `ADataSpace` of a buffer: sRGB (the platform default) for RGB, the
-    /// pool's matrix and range with the SMPTE 170M transfer for NV12.
+    /// pool's matrix and range with the SMPTE 170M transfer for YUV.
     fn dataspace(color: Option<adv_gpu::present::YuvColor>) -> i32 {
         use adv_gpu::present::YuvColor as C;
         const BT709: i32 = 1 << 16;

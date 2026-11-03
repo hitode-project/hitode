@@ -186,6 +186,17 @@ impl RenderPass<'_> {
     pub fn bind(&mut self, slot: u32, resource: Bind<'_>) {
         self.inner.bind(slot, resource)
     }
+    /// Bind this buffer's prebuilt converted-video set. Set its pool's video
+    /// pipeline first. No descriptor is written on the encoding path.
+    pub fn bind_video(&mut self, image: &crate::PresentImage) {
+        #[cfg(target_os = "android")]
+        self.inner.bind_video(image);
+        #[cfg(not(target_os = "android"))]
+        {
+            let _ = image;
+            unreachable!("converted video pipelines are unsupported on this backend");
+        }
+    }
     pub fn set_index_buffer(&mut self, buffer: BufferSlice<'_>, format: IndexFormat) {
         self.inner.set_index_buffer(buffer, format)
     }

@@ -491,18 +491,34 @@ mod android {
                 _ => bounds,
             };
             let pool = pool(&device, probe.bounds);
-            let yuv = probe.yuv_mode.then(|| {
-                device
-                    .create_present_pool(&PoolDesc {
-                        width: 640,
-                        height: 360,
-                        format: Format::Nv12,
-                        count: 4,
-                        color: Some(YuvColor::Bt601Limited),
-                        label: "YUV gradient",
-                    })
-                    .unwrap()
-            });
+            let yuv = if probe.yuv_mode {
+                let Some(format) = [Format::Nv12, Format::Nv21].into_iter().find(|&format| {
+                    device
+                        .caps()
+                        .format(format)
+                        .contains(FormatCaps::PRESENTABLE)
+                }) else {
+                    log("YUV probe unavailable: no presentable YUV format".into());
+                    unsafe {
+                        ANativeActivity_finish(probe.activity);
+                    }
+                    return;
+                };
+                Some(
+                    device
+                        .create_present_pool(&PoolDesc {
+                            width: 640,
+                            height: 360,
+                            format,
+                            count: 4,
+                            color: Some(YuvColor::Bt601Limited),
+                            label: "YUV gradient",
+                        })
+                        .expect("create presentable YUV probe pool"),
+                )
+            } else {
+                None
+            };
             probe.gpu = Some(Gpu {
                 device,
                 queue,

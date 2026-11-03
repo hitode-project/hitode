@@ -40,6 +40,7 @@ impl Shader {
         &'a self,
         entry: &'a Entry,
         layout: &binding::PushLayout,
+        video_set: Option<u32>,
     ) -> Result<ShaderStage<'a>> {
         let (module, temporary) = if let Some(heap) = &self.0.heap {
             let mut module = heap.module.clone();
@@ -52,7 +53,20 @@ impl Shader {
                 });
                 module.global_expressions[patch.init] = E::Literal(naga::Literal::U32(value));
             }
-            let words = lower(
+            let has_video = !heap.video.is_empty();
+            if has_video && video_set.is_none() {
+                return Err(Error::Compile(
+                    "group 4 requires a video pool pipeline".into(),
+                ));
+            }
+            for &global in &heap.video {
+                module.global_variables[global]
+                    .binding
+                    .as_mut()
+                    .unwrap()
+                    .group = video_set.unwrap();
+            }
+            let mut words = lower(
                 &module,
                 Some(&naga::back::spv::PipelineOptions {
                     shader_stage: match entry.stage {
@@ -66,8 +80,11 @@ impl Shader {
                         .unwrap()
                         .into(),
                 }),
-                true,
+                self.0.context.heap.is_some(),
             )?;
+            if has_video {
+                combine_video_sampler(&mut words, video_set.unwrap());
+            }
             (
                 self.0.context.result(unsafe {
                     self.0.context.device.create_shader_module(
@@ -127,6 +144,7 @@ impl Drop for ShaderStage<'_> {
 struct HeapShader {
     module: naga::Module,
     patches: Vec<Patch>,
+    video: Vec<Handle<naga::GlobalVariable>>,
 }
 struct Patch {
     init: Handle<E>,
@@ -244,10 +262,30 @@ impl Device {
             .update(module.to_ctx())
             .map_err(|e| Error::Compile(format!("shader layout: {e}")))?;
         let mut storage_strides = vec![HashMap::new(); entries.len()];
+        let mut video = Vec::new();
         for (handle, global) in module.global_variables.iter() {
             if let Some(binding) = &global.binding {
-                if binding.group > 3 {
-                    return Err(Error::Compile("resource group must be 0..3".into()));
+                if binding.group > 4
+                    || (binding.group == 4
+                        && !matches!(
+                            (binding.binding, &module.types[global.ty].inner),
+                            (
+                                0,
+                                TypeInner::Image {
+                                    dim: naga::ImageDimension::D2,
+                                    arrayed: false,
+                                    class: naga::ImageClass::Sampled {
+                                        kind: naga::ScalarKind::Float,
+                                        multi: false
+                                    }
+                                }
+                            ) | (1, TypeInner::Sampler { comparison: false })
+                        ))
+                {
+                    return Err(Error::Compile("resource groups are 0..3, or video texture/sampler at group 4 bindings 0/1".into()));
+                }
+                if binding.group == 4 {
+                    video.push(handle);
                 }
                 if matches!(global.space, naga::AddressSpace::Storage { .. }) {
                     let stride = storage_shape(&module, global.ty, &layouter).stride;
@@ -258,6 +296,11 @@ impl Device {
                     }
                 }
             }
+        }
+        if !video.is_empty() && video.len() != 2 {
+            return Err(Error::Compile(
+                "video requires its texture and sampler pair".into(),
+            ));
         }
         // Build-time SPIR-V already uses this backend's convention. Modules with
         // declared groups are lowered exactly like IR, including heap rewriting.
@@ -279,7 +322,9 @@ impl Device {
                 )?;
             } else {
                 for (_, global) in module.global_variables.iter_mut() {
-                    if let Some(binding) = &mut global.binding {
+                    if let Some(binding) = &mut global.binding
+                        && binding.group != 4
+                    {
                         binding.binding = binding.binding * 4 + binding.group;
                         binding.group = 0;
                     }
@@ -287,7 +332,11 @@ impl Device {
             }
             lower(&module, None, self.0.heap.is_some())?
         };
-        let heap = self.0.heap.as_ref().map(|_| HeapShader { module, patches });
+        let heap = (self.0.heap.is_some() || !video.is_empty()).then_some(HeapShader {
+            module,
+            patches,
+            video,
+        });
         let handle = self.0.result(unsafe {
             self.0
                 .device
@@ -373,6 +422,9 @@ fn rewrite_heap(
         let Some(binding) = &mut global.binding else {
             continue;
         };
+        if binding.group == 4 {
+            continue;
+        }
         let group = binding.group;
         let slot = binding.binding;
         if group == 0 {
@@ -963,6 +1015,188 @@ fn map_block(block: &mut naga::Block, map: &[H], starts: &[u32], arena: &naga::A
                 m(payload);
             }
             _ => {}
+        }
+    }
+}
+
+/// Naga emits separate WGSL textures and samplers. External-format sampling
+/// requires an OpTypeSampledImage variable in one combined descriptor instead.
+/// Only the reserved video pair is rewritten; the binding tiers are unchanged.
+fn combine_video_sampler(words: &mut Vec<u32>, set: u32) {
+    fn instructions(words: &[u32]) -> impl Iterator<Item = &[u32]> {
+        let mut rest = &words[5..];
+        std::iter::from_fn(move || {
+            if rest.is_empty() {
+                return None;
+            }
+            let (instruction, tail) = rest.split_at((rest[0] >> 16) as usize);
+            rest = tail;
+            Some(instruction)
+        })
+    }
+    let mut sets = HashMap::new();
+    let mut bindings = HashMap::new();
+    for i in instructions(words) {
+        if i[0] & 0xffff == 71 {
+            // OpDecorate
+            match i[2] {
+                34 => {
+                    sets.insert(i[1], i[3]);
+                } // DescriptorSet
+                33 => {
+                    bindings.insert(i[1], i[3]);
+                } // Binding
+                _ => {}
+            }
+        }
+    }
+    let variable = |binding| {
+        bindings
+            .iter()
+            .find_map(|(&id, &b)| (b == binding && sets.get(&id) == Some(&set)).then_some(id))
+    };
+    let Some(image) = variable(0) else {
+        return;
+    }; // An entry may not use video.
+    let sampler = variable(1).expect("video sampler declaration");
+    let pointer = instructions(words)
+        .find(|i| i[0] & 0xffff == 59 && i[2] == image)
+        .unwrap()[1];
+    let image_type = instructions(words)
+        .find(|i| i[0] & 0xffff == 32 && i[1] == pointer)
+        .unwrap()[3];
+    let sampled_type = instructions(words)
+        .find(|i| i[0] & 0xffff == 27 && i[2] == image_type)
+        .unwrap()[1];
+    let combined_pointer = words[3];
+    words[3] += 1;
+    let mut output = words[..5].to_vec();
+    let mut loaded_images = Vec::new();
+    for i in instructions(words) {
+        let op = i[0] & 0xffff;
+        match op {
+            5 | 71 if i[1] == sampler => {}  // OpName / OpDecorate
+            59 if i[2] == sampler => {}      // OpVariable
+            27 if i[1] == sampled_type => {} // Its type must precede the variable.
+            59 if i[2] == image => {
+                output.extend([(3 << 16) | 27, sampled_type, image_type]);
+                output.extend([(4 << 16) | 32, combined_pointer, 0, sampled_type]); // OpTypePointer, UniformConstant
+                output.extend([(4 << 16) | 59, combined_pointer, image, 0]);
+            }
+            61 if i[3] == sampler => {} // OpLoad
+            61 if i[3] == image => {
+                loaded_images.push(i[2]);
+                output.extend([(4 << 16) | 61, sampled_type, i[2], image]);
+            }
+            86 if loaded_images.contains(&i[3]) => {
+                // OpSampledImage -> OpCopyObject
+                output.extend([(4 << 16) | 83, sampled_type, i[2], i[3]]);
+            }
+            _ => output.extend_from_slice(i),
+        }
+    }
+    *words = output;
+}
+
+#[cfg(test)]
+mod video_tests {
+    use super::*;
+
+    #[test]
+    fn video_pair_becomes_one_combined_descriptor() {
+        let (device, _queue) = test_device!(DeviceOptions {
+            software: !cfg!(target_os = "android"),
+            validation: !cfg!(target_os = "android"),
+            ..DeviceOptions::default()
+        });
+        let source = r#"
+            @group(4) @binding(0) var video: texture_2d<f32>;
+            @group(4) @binding(1) var filtering: sampler;
+            @group(0) @binding(3) var<uniform> scale: vec4<f32>;
+            @vertex fn vs() -> @builtin(position) vec4<f32> { return vec4(0., 0., 0., 1.); }
+            @fragment fn fs(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
+                return textureSampleLevel(video, filtering, p.xy * scale.xy, 0.);
+            }
+        "#;
+        for heap in [false, true] {
+            let mut module = naga::front::wgsl::parse_str(source).unwrap();
+            let video: Vec<_> = module
+                .global_variables
+                .iter()
+                .filter_map(|(h, g)| {
+                    g.binding
+                        .as_ref()
+                        .is_some_and(|b| b.group == 4)
+                        .then_some(h)
+                })
+                .collect();
+            if heap {
+                rewrite_heap(&mut module, 32, 4, [16; 4]).unwrap();
+            } else {
+                for (_, global) in module.global_variables.iter_mut() {
+                    if let Some(binding) = &mut global.binding
+                        && binding.group != 4
+                    {
+                        binding.binding = binding.binding * 4 + binding.group;
+                        binding.group = 0;
+                    }
+                }
+            }
+            for set in [5, 6] {
+                let mut module = module.clone();
+                for &global in &video {
+                    module.global_variables[global]
+                        .binding
+                        .as_mut()
+                        .unwrap()
+                        .group = set;
+                }
+                for entry in [
+                    None,
+                    Some(naga::back::spv::PipelineOptions {
+                        shader_stage: naga::ShaderStage::Vertex,
+                        entry_point: "vs".into(),
+                    }),
+                    Some(naga::back::spv::PipelineOptions {
+                        shader_stage: naga::ShaderStage::Fragment,
+                        entry_point: "fs".into(),
+                    }),
+                ] {
+                    let mut words = lower(&module, entry.as_ref(), heap).unwrap();
+                    combine_video_sampler(&mut words, set);
+                    // Vulkan validation checks the resulting combined-image SPIR-V.
+                    let handle = unsafe {
+                        device.inner.0.device.create_shader_module(
+                            &vk::ShaderModuleCreateInfo::default().code(&words),
+                            None,
+                        )
+                    }
+                    .unwrap();
+                    unsafe {
+                        device.inner.0.device.destroy_shader_module(handle, None);
+                    }
+                    // The combined declaration is the only descriptor in the appended set.
+                    let mut at = 5;
+                    let mut descriptors = 0;
+                    let mut combined_loads = 0;
+                    while at < words.len() {
+                        let count = (words[at] >> 16) as usize;
+                        match words[at] & 0xffff {
+                            71 if words[at + 2] == 34 && words[at + 3] == set => descriptors += 1,
+                            83 => combined_loads += 1,
+                            _ => {}
+                        }
+                        at += count;
+                    }
+                    let sampled = usize::from(
+                        entry
+                            .as_ref()
+                            .is_none_or(|e| e.shader_stage == naga::ShaderStage::Fragment),
+                    );
+                    assert_eq!(descriptors, sampled);
+                    assert_eq!(combined_loads, sampled);
+                }
+            }
         }
     }
 }

@@ -180,6 +180,8 @@ pub enum Error {
     /// reservations) are caller bugs: debug assertions, never checked in
     /// release builds.
     Invalid(String),
+    /// The requested operation is not supported by this backend.
+    Unsupported(String),
     /// A shader or pipeline failed to compile; the message names the stage.
     Compile(String),
 }
@@ -192,6 +194,7 @@ impl std::fmt::Display for Error {
             Self::OutOfMemory => f.write_str("GPU out of memory"),
             Self::Busy => f.write_str("GPU resource busy"),
             Self::Invalid(m) => write!(f, "invalid GPU request: {m}"),
+            Self::Unsupported(m) => write!(f, "unsupported GPU request: {m}"),
             Self::Compile(m) => write!(f, "GPU compile failed: {m}"),
         }
     }

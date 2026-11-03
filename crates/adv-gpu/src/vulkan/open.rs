@@ -100,7 +100,15 @@ impl Device {
             } else {
                 None
             };
-            let result = Self::open_device(options, &entry, &instance);
+            #[cfg(target_os = "android")]
+            let mut video_format = None;
+            let result = Self::open_device(
+                options,
+                &entry,
+                &instance,
+                #[cfg(target_os = "android")]
+                &mut video_format,
+            );
             let (
                 physical,
                 device,
@@ -209,6 +217,8 @@ impl Device {
                 semaphore_fd: ash::khr::external_semaphore_fd::Device::new(&instance, &device),
                 #[cfg(target_os = "android")]
                 vendor: properties.vendor_id,
+                #[cfg(target_os = "android")]
+                video_format,
                 _entry: entry,
                 instance,
                 debug,
@@ -243,6 +253,7 @@ impl Device {
         options: &DeviceOptions,
         entry: &ash::Entry,
         instance: &ash::Instance,
+        #[cfg(target_os = "android")] opened_video_format: &mut Option<video::VideoFormat>,
     ) -> Result<(
         vk::PhysicalDevice,
         ash::Device,
@@ -634,7 +645,8 @@ impl Device {
             #[cfg(target_os = "android")]
             let present_caps = present::capabilities(props.vendor_id);
             #[cfg(target_os = "android")]
-            let yuv_caps = match present::yuv_capabilities(
+            let video_format = match present::yuv_capabilities(
+                &device,
                 &ash::android::external_memory_android_hardware_buffer::Device::new(
                     instance, &device,
                 ),
@@ -646,7 +658,7 @@ impl Device {
                 }
             };
             #[cfg(target_os = "android")]
-            if (present_caps | yuv_caps).contains(FormatCaps::PRESENTABLE) {
+            if present_caps.contains(FormatCaps::PRESENTABLE) || video_format.is_some() {
                 feature_bits |= Features::PRESENTABLE_BUFFERS;
             }
             if memory.memory_types_as_slice().iter().any(|t| {
@@ -675,6 +687,24 @@ impl Device {
             let formats = formats::ALL
                 .iter()
                 .map(|&f| {
+                    if f == Format::Nv21 {
+                        #[cfg(target_os = "android")]
+                        return (
+                            f,
+                            video_format.map_or(FormatCaps::empty(), |format| {
+                                let mut caps = FormatCaps::PRESENTABLE | FormatCaps::SAMPLED;
+                                if format
+                                    .features
+                                    .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR)
+                                {
+                                    caps |= FormatCaps::FILTERED;
+                                }
+                                caps
+                            }),
+                        );
+                        #[cfg(not(target_os = "android"))]
+                        return (f, FormatCaps::empty());
+                    }
                     let flags = instance
                         .get_physical_device_format_properties(physical, formats::vk(f))
                         .optimal_tiling_features;
@@ -706,10 +736,6 @@ impl Device {
                     #[cfg(target_os = "android")]
                     if f == present::FORMAT {
                         caps |= present_caps;
-                    }
-                    #[cfg(target_os = "android")]
-                    if f == Format::Nv12 {
-                        caps |= yuv_caps;
                     }
                     (f, caps)
                 })
@@ -764,6 +790,10 @@ impl Device {
                     push_constant_bytes: l.max_push_constants_size,
                 },
             };
+            #[cfg(target_os = "android")]
+            {
+                *opened_video_format = video_format;
+            }
             Ok((
                 physical,
                 device,

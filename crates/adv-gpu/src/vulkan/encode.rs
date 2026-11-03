@@ -1151,6 +1151,41 @@ impl RenderPass<'_> {
             Some(self.preamble),
         );
     }
+    #[cfg(target_os = "android")]
+    pub(crate) fn bind_video(&mut self, image: &crate::PresentImage) {
+        if !self.encoder.ready() {
+            return;
+        }
+        let (pool, set) = image.video_set();
+        let pipeline = self
+            .pipeline
+            .as_ref()
+            .expect("video pipeline before bind_video");
+        let (index, expected) = pipeline.video.as_ref().expect("converted video pipeline");
+        debug_assert!(
+            Arc::ptr_eq(pool, expected),
+            "video buffer belongs to another pool"
+        );
+        let command = self.encoder.command;
+        self.encoder.command = self.preamble;
+        self.encoder.view_transition(
+            &image.image().view().inner,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::AccessFlags2::SHADER_READ,
+            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+        );
+        self.encoder.command = command;
+        unsafe {
+            self.encoder.shared.context.device.cmd_bind_descriptor_sets(
+                command,
+                vk::PipelineBindPoint::GRAPHICS,
+                pipeline.layout,
+                *index,
+                &[set],
+                &[],
+            );
+        }
+    }
     pub(crate) fn set_index_buffer(&mut self, buffer: BufferSlice<'_>, format: IndexFormat) {
         if !self.encoder.ready() {
             return;

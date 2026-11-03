@@ -13,7 +13,7 @@
 //!   added. Where `VK_EXT_image_compression_control` exists (Mali G610 and
 //!   later, Adreno 8xx), the backend reads each imported buffer's compression
 //!   and reports it to the speed report and flight recorder.
-//!   NV12 video buffers instead request CPU writing and GPU sampling with
+//!   NV21 video buffers instead request CPU writing and GPU sampling with
 //!   composer overlay usage; their YUV layout is linear.
 //! - Apple backs them with IOSurfaces, which are not losslessly compressed:
 //!   measured on A12, a full 2560×1440 draw costs 544 µs into an IOSurface
@@ -34,7 +34,7 @@ use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PoolDesc {
-    /// Fixed matrix and range: required for NV12, `None` for RGB.
+    /// Fixed matrix and range: required for NV12 or NV21, `None` for RGB.
     pub color: Option<YuvColor>,
     pub width: u32,
     pub height: u32,
@@ -53,7 +53,8 @@ pub enum YuvColor {
     Bt709Full,
 }
 
-/// One CPU-writable plane. Rows include padding; NV12 has Y then interleaved UV.
+/// One CPU-writable plane. Rows include padding. Both formats have Y first;
+/// NV12 chroma interleaves Cb then Cr (UV), NV21 Cr then Cb (VU).
 pub struct PlaneMut<'a> {
     pub data: &'a mut [u8],
     pub stride: usize,
@@ -63,7 +64,9 @@ pub struct PlaneMut<'a> {
 /// any release fence; the pool, not its users, orders reuse after the
 /// compositor.
 pub struct PresentPool {
-    device: Device,
+    #[cfg(target_os = "android")]
+    pub(crate) video: Option<Arc<imp::VideoPool>>,
+    pub(crate) device: Device,
     desc: PoolDesc,
     shared: Arc<Mutex<Shared>>,
 }
@@ -91,13 +94,15 @@ impl PresentPool {
             || desc.height == 0
             || desc.width.max(desc.height) > caps.limits.max_image_2d
             || desc.count == 0
-            || (desc.format == Format::Nv12) != desc.color.is_some()
+            || matches!(desc.format, Format::Nv12 | Format::Nv21) != desc.color.is_some()
         {
             return Err(crate::Error::Invalid(format!("present pool {desc:?}")));
         }
         Ok(Self {
             device: device.clone(),
             desc: *desc,
+            #[cfg(target_os = "android")]
+            video: imp::VideoPool::for_pool(&device.inner, desc)?,
             shared: Arc::new(Mutex::new(Shared {
                 free: Vec::with_capacity(desc.count as usize),
                 allocated: 0,
@@ -115,7 +120,12 @@ impl PresentPool {
         let mut buffer = match newest {
             Some(i) => shared.free.swap_remove(i),
             None if shared.allocated < self.desc.count => {
-                let (image, raw) = imp::PresentBuffer::new(&self.device.inner, &self.desc)?;
+                let (image, raw) = imp::PresentBuffer::new(
+                    &self.device.inner,
+                    &self.desc,
+                    #[cfg(target_os = "android")]
+                    self.video.as_ref(),
+                )?;
                 shared.allocated += 1;
                 Buffer {
                     image,
@@ -144,19 +154,24 @@ impl PresentPool {
             pool: self.shared.clone(),
         }))
     }
-    /// Acquire an NV12 buffer for a CPU producer, waiting for the compositor's
+    /// Acquire a YUV buffer for a CPU producer, waiting for the compositor's
     /// release on this thread. No GPU queue is touched. `None` means every lease is outstanding.
     /// Allocation or driver failures fail fast, as `write` has no error channel.
     /// The completed acquire token is `Token(0)` and there is no acquire fence.
     pub fn acquire_cpu(&mut self) -> Option<PresentImage> {
-        debug_assert_eq!(self.desc.format, Format::Nv12);
+        debug_assert!(matches!(self.desc.format, Format::Nv12 | Format::Nv21));
         let mut shared = self.shared.lock().unwrap();
         let newest = (0..shared.free.len()).max_by_key(|&i| shared.free[i].stamp);
         let mut buffer = match newest {
             Some(i) => shared.free.swap_remove(i),
             None if shared.allocated < self.desc.count => {
-                let (image, raw) = imp::PresentBuffer::new(&self.device.inner, &self.desc)
-                    .expect("allocate CPU presentable buffer");
+                let (image, raw) = imp::PresentBuffer::new(
+                    &self.device.inner,
+                    &self.desc,
+                    #[cfg(target_os = "android")]
+                    self.video.as_ref(),
+                )
+                .expect("allocate CPU presentable buffer");
                 shared.allocated += 1;
                 Buffer {
                     image,
@@ -211,6 +226,8 @@ impl PresentImage {
     pub fn write(&mut self, f: impl FnOnce(&mut [PlaneMut<'_>])) {
         debug_assert!(self.cpu, "write requires acquire_cpu");
         self.buffer().raw.write(f);
+        #[cfg(target_os = "android")]
+        self.buffer().image.inner.cpu_written();
         let mut pool = self.pool.lock().unwrap();
         pool.presents += 1;
         self.buffer.as_mut().unwrap().stamp = Some(pool.presents);
@@ -219,7 +236,7 @@ impl PresentImage {
     pub fn image(&self) -> &Image {
         &self.buffer().image
     }
-    /// The pool's matrix and range: `Some` exactly for NV12.
+    /// The pool's matrix and range: `Some` exactly for NV12 or NV21.
     pub fn color(&self) -> Option<YuvColor> {
         self.color
     }
@@ -242,6 +259,10 @@ impl PresentImage {
     /// The compositor no longer reads the buffer once `fence` signals.
     pub fn released(mut self, fence: Option<Fence>) {
         self.buffer.as_mut().unwrap().release = fence;
+    }
+    #[cfg(target_os = "android")]
+    pub(crate) fn video_set(&self) -> (&Arc<imp::VideoPool>, ash::vk::DescriptorSet) {
+        self.buffer().raw.video_set()
     }
     fn buffer(&self) -> &Buffer {
         self.buffer.as_ref().unwrap()

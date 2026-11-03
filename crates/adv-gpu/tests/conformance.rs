@@ -1235,6 +1235,7 @@ fn present_pools_track_ages_and_releases() {
     pool.trim(1);
 }
 
+#[cfg(not(target_os = "android"))]
 #[test]
 fn cpu_yuv_pools_write_sample_and_release() {
     use adv_gpu::{
@@ -1242,15 +1243,23 @@ fn cpu_yuv_pools_write_sample_and_release() {
         resource::ViewDesc,
     };
     let mut gpu = gpu!();
-    if !gpu.supports(Format::Nv12, FormatCaps::PRESENTABLE) {
+    let Some(format) = [Format::Nv12, Format::Nv21]
+        .into_iter()
+        .find(|&f| gpu.supports(f, FormatCaps::PRESENTABLE))
+    else {
+        assert!(
+            !(cfg!(target_vendor = "apple")
+                && std::env::var_os("ADV_GPU_REQUIRE_BACKEND").is_some()),
+            "required device has no presentable YUV format"
+        );
         return;
-    }
+    };
     let mut pool = gpu
         .device
         .create_present_pool(&PoolDesc {
             width: 18,
             height: 10,
-            format: Format::Nv12,
+            format,
             color: Some(YuvColor::Bt709Limited),
             count: 2,
             label: "CPU YUV",
@@ -1365,6 +1374,178 @@ fn cpu_yuv_pools_write_sample_and_release() {
     drop(second);
     let other = pool.acquire_cpu().unwrap();
     assert_ne!(other.image().id(), first_id);
+}
+
+#[cfg(target_os = "android")]
+#[test]
+fn cpu_yuv_pools_write_sample_and_release() {
+    use adv_gpu::{
+        present::{PoolDesc, YuvColor},
+        resource::ViewDesc,
+    };
+    let mut gpu = gpu!();
+    let Some(format) = [Format::Nv12, Format::Nv21]
+        .into_iter()
+        .find(|&format| gpu.supports(format, FormatCaps::PRESENTABLE))
+    else {
+        assert!(
+            !(cfg!(any(target_vendor = "apple", target_os = "android"))
+                && std::env::var_os("ADV_GPU_REQUIRE_BACKEND").is_some()),
+            "required device has no presentable YUV format"
+        );
+        return;
+    };
+    for color in [YuvColor::Bt601Limited, YuvColor::Bt709Full] {
+        let mut pool = gpu
+            .device
+            .create_present_pool(&PoolDesc {
+                width: 18,
+                height: 10,
+                format,
+                color: Some(color),
+                count: 2,
+                label: "CPU YUV",
+            })
+            .unwrap();
+        let mut first = pool.acquire_cpu().unwrap();
+        let second = pool.acquire_cpu().unwrap();
+        assert!(pool.acquire_cpu().is_none());
+        let first_id = first.image().id();
+        assert_eq!(first.color(), Some(color));
+        let shader = gpu.shader(
+            r#"
+            @group(4) @binding(0) var video: texture_2d<f32>;
+            @group(4) @binding(1) var filtering: sampler;
+            @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+                let p = array<vec2<f32>, 3>(vec2(-1., -1.), vec2(3., -1.), vec2(-1., 3.));
+                return vec4(p[i], 0., 1.);
+            }
+            @fragment fn fs(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
+                return textureSampleLevel(video, filtering, p.xy / vec2(18., 10.), 0.);
+            }
+        "#,
+            0x795556,
+        );
+        let desc = RenderPipelineDesc {
+            vertex: shader.entry("vs", Stage::Vertex).unwrap(),
+            fragment: Some(shader.entry("fs", Stage::Fragment).unwrap()),
+            bindings: vec![],
+            primitive: primitive(),
+            colors: colors(Format::Rgba8Unorm, None),
+            depth_stencil: None,
+            samples: 1,
+            alpha_to_coverage: false,
+            label: "sample YUV",
+        };
+        let pipeline = gpu
+            .device
+            .create_video_pipeline(
+                &adv_gpu::pipeline::VideoPipelineDesc {
+                    pipeline: &desc,
+                    pool: &pool,
+                },
+                None,
+            )
+            .unwrap();
+        let target = gpu.target(18, 10, Format::Rgba8Unorm);
+        for [y, u, v] in [
+            [80, 109, 175],
+            [150, 164, 91],
+            [16, 128, 128],
+            [235, 128, 128],
+        ] {
+            first.write(|planes| {
+                assert_eq!(planes.len(), 2);
+                for row in 0..10 {
+                    let at = row * planes[0].stride;
+                    planes[0].data[at..at + 18].fill(y);
+                }
+                for row in 0..5 {
+                    let at = row * planes[1].stride;
+                    for pair in planes[1].data[at..at + 18].as_chunks_mut::<2>().0 {
+                        *pair = if format == Format::Nv21 {
+                            [v, u]
+                        } else {
+                            [u, v]
+                        };
+                    }
+                }
+            });
+            assert!(first.acquire_fence().is_none());
+            assert!(
+                first
+                    .image()
+                    .create_view(&ViewDesc {
+                        format: Some(Format::R8Unorm),
+                        dimension: None,
+                        mips: 0..1,
+                        layers: 0..1,
+                        plane: 0,
+                    })
+                    .is_err(),
+                "external formats have no plane views"
+            );
+            let mut encoder = gpu.queue.encoder("sample CPU YUV");
+            {
+                let mut pass = encoder.render_pass(&pass(
+                    crate::color(target.view(), Load::DontCare),
+                    None,
+                    whole(18, 10),
+                ));
+                pass.set_pipeline(&pipeline);
+                pass.bind_video(&first);
+                pass.draw(0..3, 0..1);
+            }
+            gpu.submit(encoder);
+            let pixels = gpu.read(&target);
+            let expected = yuv_rgb(y, u, v, color);
+            for actual in pixels.as_chunks::<4>().0 {
+                for channel in 0..4 {
+                    assert!(
+                        actual[channel].abs_diff(expected[channel]) <= 2,
+                        "{color:?}: {actual:?} != {expected:?}"
+                    );
+                }
+            }
+        }
+        first.released(None);
+        let mut next = pool.acquire_cpu().unwrap();
+        assert_eq!(next.image().id(), first_id);
+        assert_eq!(next.age(), Some(1));
+        next.write(|p| p[0].data[0] = 99);
+        assert!(
+            pool.acquire_cpu().is_none(),
+            "screen-owned lease was reused"
+        );
+        drop(second);
+        let other = pool.acquire_cpu().unwrap();
+        assert_ne!(other.image().id(), first_id);
+    }
+}
+
+#[cfg(target_os = "android")]
+fn yuv_rgb(y: u8, u: u8, v: u8, color: adv_gpu::present::YuvColor) -> [u8; 4] {
+    use adv_gpu::present::YuvColor::*;
+    let full = matches!(color, Bt601Full | Bt709Full);
+    let (kr, kb) = if matches!(color, Bt709Limited | Bt709Full) {
+        (0.2126, 0.0722)
+    } else {
+        (0.299, 0.114)
+    };
+    let y = if full {
+        f64::from(y) / 255.0
+    } else {
+        (f64::from(y) - 16.0) / 219.0
+    };
+    let scale = if full { 255.0 } else { 224.0 };
+    let (u, v) = (
+        (f64::from(u) - 128.0) / scale,
+        (f64::from(v) - 128.0) / scale,
+    );
+    let (r, b) = (y + 2.0 * (1.0 - kr) * v, y + 2.0 * (1.0 - kb) * u);
+    let g = (y - kr * r - kb * b) / (1.0 - kr - kb);
+    let [r, g, b] = [r, g, b].map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8);
+    [r, g, b, 255]
 }
 
 #[cfg(target_vendor = "apple")]

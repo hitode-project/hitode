@@ -80,6 +80,8 @@ impl Clone for Image {
     }
 }
 pub(super) struct ImageCore {
+    // Release pool resources while the device is still alive.
+    pub(super) video: Option<Arc<VideoPool>>,
     pub(super) context: Arc<Context>,
     pub(super) handle: vk::Image,
     pub(super) desc: ImageDesc,
@@ -129,7 +131,11 @@ impl Drop for ImageCore {
         self.context.retire(Retired::Image {
             handle: self.handle,
             allocation: self.allocation.take().unwrap(),
-            conversion: self.conversion,
+            conversion: if self.video.is_some() {
+                None
+            } else {
+                self.conversion
+            },
         });
     }
 }
@@ -167,6 +173,15 @@ impl Image {
         })?;
         let _ = image.default.set(default);
         Ok(crate::Image { inner: image })
+    }
+    #[cfg(target_os = "android")]
+    pub(crate) fn cpu_written(&self) {
+        self.core.states.lock().unwrap()[0] = ImageState {
+            layout: vk::ImageLayout::GENERAL,
+            family: vk::QUEUE_FAMILY_FOREIGN_EXT,
+            access: vk::AccessFlags2::HOST_WRITE,
+            stage: vk::PipelineStageFlags2::HOST,
+        };
     }
     pub(crate) fn desc(&self) -> &ImageDesc {
         &self.core.desc
@@ -506,6 +521,11 @@ impl Device {
         })
     }
     pub(crate) fn create_image(&self, desc: &ImageDesc) -> Result<crate::Image> {
+        if desc.format == Format::Nv21 {
+            return Err(Error::Invalid(
+                "NV21 images come from presentable pools".into(),
+            ));
+        }
         if self.caps().format(desc.format).is_empty() {
             return Err(Error::Unavailable(format!(
                 "image format {:?}",
@@ -630,6 +650,7 @@ impl Device {
             desc: *desc,
             usage,
             conversion: None,
+            video: None,
             allocation: Some(ImageAllocation::Private(allocation)),
             states: Mutex::new(vec![
                 ImageState::default();

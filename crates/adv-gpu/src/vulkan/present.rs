@@ -39,7 +39,7 @@ impl HardwareBufferDesc {
             width,
             height,
             layers: 1,
-            format: if yuv { 0x23 } else { 1 }, // Y8Cb8Cr8_420 / R8G8B8A8_UNORM
+            format: if yuv { 0x11 } else { 1 }, // YCrCb_420_SP (NV21) / R8G8B8A8_UNORM
             usage: GPU_SAMPLED_IMAGE
                 | COMPOSER_OVERLAY
                 | if yuv {
@@ -111,21 +111,37 @@ impl Drop for HardwareBuffer {
         unsafe { AHardwareBuffer_release(self.0.as_ptr()) };
     }
 }
-pub(crate) struct PresentBuffer(HardwareBuffer);
+pub(crate) struct PresentBuffer {
+    buffer: HardwareBuffer,
+    video: Option<super::video::VideoSet>,
+}
 impl PresentBuffer {
     /// The pool has validated format and size.
-    pub(crate) fn new(device: &Device, desc: &PoolDesc) -> Result<(crate::Image, Self)> {
+    pub(crate) fn new(
+        device: &Device,
+        desc: &PoolDesc,
+        video: Option<&Arc<VideoPool>>,
+    ) -> Result<(crate::Image, Self)> {
         let context = &device.0;
-        let (handle, memory, buffer) = allocate(
+        let (handle, memory, buffer, format) = allocate(
             &context.device,
             &context.ahb,
             &HardwareBufferDesc::new(
                 desc.width,
                 desc.height,
                 context.vendor,
-                desc.format == Format::Nv12,
+                desc.format == Format::Nv21,
             ),
         )?;
+        if let Some(format) = format
+            && format.external != context.video_format.unwrap().external
+        {
+            unsafe {
+                context.device.destroy_image(handle, None);
+                context.device.free_memory(memory, None);
+            }
+            return Err(Error::Unavailable("NV21 external format changed".into()));
+        }
         let image = Image::wrap(ImageCore {
             context: context.clone(),
             handle,
@@ -139,7 +155,7 @@ impl PresentBuffer {
                 format: desc.format,
                 mips: 1,
                 samples: 1,
-                usage: if desc.format == Format::Nv12 {
+                usage: if desc.format == Format::Nv21 {
                     Usage::SAMPLED
                 } else {
                     Usage::COLOR | Usage::SAMPLED | Usage::COPY_SRC | Usage::COPY_DST
@@ -147,15 +163,16 @@ impl PresentBuffer {
                 view_formats: &[],
                 label: desc.label,
             },
-            usage: if desc.format == Format::Nv12 {
+            usage: if desc.format == Format::Nv21 {
                 vk::ImageUsageFlags::SAMPLED
             } else {
                 USAGE
             },
-            conversion: None,
+            conversion: video.map(|pool| pool.resources.conversion),
+            video: video.cloned(),
             allocation: Some(ImageAllocation::Present(memory)),
             states: Mutex::new(vec![ImageState {
-                layout: if desc.format == Format::Nv12 {
+                layout: if desc.format == Format::Nv21 {
                     vk::ImageLayout::GENERAL
                 } else {
                     vk::ImageLayout::UNDEFINED
@@ -164,10 +181,13 @@ impl PresentBuffer {
                 ..ImageState::default()
             }]),
         })?;
-        Ok((image, Self(buffer)))
+        let video = video
+            .map(|pool| pool.allocate(image.view().inner.0.handle))
+            .transpose()?;
+        Ok((image, Self { buffer, video }))
     }
     pub(crate) fn write(&self, f: impl FnOnce(&mut [PlaneMut<'_>])) {
-        let buffer = self.0.0.as_ptr();
+        let buffer = self.buffer.0.as_ptr();
         let mut desc = HardwareBufferDesc::default();
         let mut mapped = HardwarePlanes {
             count: 0,
@@ -201,18 +221,18 @@ impl PresentBuffer {
         }
         let _unlock = Unlock(buffer);
         assert_eq!(mapped.count, 3, "YUV lock plane count");
-        let [y, u, v, _] = mapped.planes;
+        let [y, v, u, _] = mapped.planes;
         assert!(
             !y.data.is_null()
-                && !u.data.is_null()
+                && !v.data.is_null()
                 && y.row_stride >= desc.width
                 && u.row_stride >= desc.width.div_ceil(2) * 2
                 && y.pixel_stride == 1
                 && u.pixel_stride == 2
                 && v.pixel_stride == 2
                 && u.row_stride == v.row_stride
-                && v.data as usize == u.data as usize + 1,
-            "NV12 hardware buffer layout"
+                && u.data as usize == v.data as usize + 1,
+            "NV21 hardware buffer layout"
         );
         let mut planes = unsafe {
             [
@@ -225,7 +245,7 @@ impl PresentBuffer {
                 },
                 PlaneMut {
                     data: std::slice::from_raw_parts_mut(
-                        u.data.cast(),
+                        v.data.cast(),
                         (desc.height.div_ceil(2) - 1) as usize * u.row_stride as usize
                             + desc.width.div_ceil(2) as usize * 2,
                     ),
@@ -235,8 +255,12 @@ impl PresentBuffer {
         };
         f(&mut planes);
     }
+    pub(crate) fn video_set(&self) -> (&Arc<VideoPool>, vk::DescriptorSet) {
+        let video = self.video.as_ref().expect("NV21 video buffer");
+        (&video.pool, video.handle)
+    }
     pub(crate) fn export(&self) -> Export<'_> {
-        Export::AndroidHardwareBuffer(self.0.0.cast(), std::marker::PhantomData)
+        Export::AndroidHardwareBuffer(self.buffer.0.cast(), std::marker::PhantomData)
     }
 }
 
@@ -244,7 +268,12 @@ fn allocate(
     device: &ash::Device,
     ahb: &ash::android::external_memory_android_hardware_buffer::Device,
     requested: &HardwareBufferDesc,
-) -> Result<(vk::Image, vk::DeviceMemory, HardwareBuffer)> {
+) -> Result<(
+    vk::Image,
+    vk::DeviceMemory,
+    HardwareBuffer,
+    Option<super::video::VideoFormat>,
+)> {
     let buffer = HardwareBuffer::allocate(requested)?;
     let pointer = buffer.0.as_ptr();
     // SAFETY: the live AHardwareBuffer and Vulkan handles outlive every call.
@@ -256,23 +285,30 @@ fn allocate(
             .map_err(vk_error)?;
         let (allocation_size, memory_type_bits) =
             (properties.allocation_size, properties.memory_type_bits);
-        let yuv = requested.format == 0x23;
-        if yuv && format.format != formats::vk(Format::Nv12) {
+        let yuv = requested.format == 0x11;
+        if yuv
+            && (format.format != vk::Format::UNDEFINED
+                || format.external_format == 0
+                || !format
+                    .format_features
+                    .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE))
+        {
             return Err(Error::Unavailable(
-                "AHardwareBuffer has no NV12 plane views".into(),
+                "AHardwareBuffer has no sampleable NV21 external format".into(),
             ));
         }
         let mut external = vk::ExternalMemoryImageCreateInfo::default()
             .handle_types(vk::ExternalMemoryHandleTypeFlags::ANDROID_HARDWARE_BUFFER_ANDROID);
+        let mut external_format = vk::ExternalFormatANDROID::default().external_format(if yuv {
+            format.external_format
+        } else {
+            0
+        });
         let handle = device
             .create_image(
                 &vk::ImageCreateInfo::default()
                     .push_next(&mut external)
-                    .flags(if yuv {
-                        vk::ImageCreateFlags::MUTABLE_FORMAT
-                    } else {
-                        vk::ImageCreateFlags::empty()
-                    })
+                    .push_next(&mut external_format)
                     .image_type(vk::ImageType::TYPE_2D)
                     .format(format.format)
                     .extent(vk::Extent3D {
@@ -313,7 +349,17 @@ fn allocate(
             device.free_memory(memory, None);
             return Err(vk_error(error));
         }
-        Ok((handle, memory, buffer))
+        Ok((
+            handle,
+            memory,
+            buffer,
+            yuv.then_some(super::video::VideoFormat {
+                external: format.external_format,
+                features: format.format_features,
+                x: format.suggested_x_chroma_offset,
+                y: format.suggested_y_chroma_offset,
+            }),
+        ))
     }
 }
 
@@ -332,24 +378,32 @@ pub(super) fn capabilities(vendor: u32) -> FormatCaps {
 }
 
 pub(super) fn yuv_capabilities(
+    device: &ash::Device,
     ahb: &ash::android::external_memory_android_hardware_buffer::Device,
-) -> Result<FormatCaps> {
+) -> Result<Option<super::video::VideoFormat>> {
     let requested = HardwareBufferDesc::new(64, 64, 0, true);
     if unsafe { AHardwareBuffer_isSupported(&requested) } == 0 {
-        return Ok(FormatCaps::empty());
+        return Ok(None);
     }
-    let buffer = HardwareBuffer::allocate(&requested)?;
-    let mut format = vk::AndroidHardwareBufferFormatPropertiesANDROID::default();
-    let mut properties =
-        vk::AndroidHardwareBufferPropertiesANDROID::default().push_next(&mut format);
-    unsafe { ahb.get_android_hardware_buffer_properties(buffer.0.as_ptr(), &mut properties) }
-        .map_err(vk_error)?;
-    // External-format-only imports have no independent plane views.
-    Ok(if format.format == formats::vk(Format::Nv12) {
-        FormatCaps::PRESENTABLE
-    } else {
-        FormatCaps::empty()
-    })
+    let (image, memory, _buffer, format) = match allocate(device, ahb, &requested) {
+        Ok(imported) => imported,
+        Err(Error::Unavailable(_)) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let format = format.unwrap();
+    let conversion = format.conversion(device, YuvColor::Bt601Limited);
+    unsafe {
+        device.destroy_image(image, None);
+        device.free_memory(memory, None);
+    }
+    match conversion {
+        Ok(conversion) => {
+            unsafe { device.destroy_sampler_ycbcr_conversion(conversion, None) };
+            Ok(Some(format))
+        }
+        Err(Error::Unavailable(_)) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 #[repr(C)]

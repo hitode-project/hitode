@@ -59,6 +59,22 @@ impl Device {
     ) -> Result<RenderPipeline> {
         self.inner.create_render_pipeline(desc, cache)
     }
+    /// Compile once for a pool's immutable video sampler, off the frame path.
+    pub fn create_video_pipeline(
+        &self,
+        desc: &crate::pipeline::VideoPipelineDesc<'_>,
+        cache: Option<&PipelineCache>,
+    ) -> Result<RenderPipeline> {
+        #[cfg(target_os = "android")]
+        {
+            self.inner.create_video_pipeline(desc, cache)
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            let _ = (desc, cache);
+            Err(crate::Error::Unsupported("converted video pools".into()))
+        }
+    }
     /// Identity of the driver object `desc` needs on this backend (see
     /// [`crate::pipeline`]). Equal identities share one compilation.
     pub fn pipeline_identity(&self, desc: &RenderPipelineDesc) -> u64 {

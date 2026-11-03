@@ -184,7 +184,7 @@ pub(super) fn pixel_format(f: Format) -> Option<MTLPixelFormat> {
         Format::B5g6r5Unorm => M::B5G6R5Unorm,
         Format::Bgr5a1Unorm => M::BGR5A1Unorm,
         // ABGR4 has alpha in the low nibble, so it cannot represent BGRA4.
-        Format::Bgra4Unorm | Format::Nv12 | Format::P010 => return None,
+        Format::Bgra4Unorm | Format::Nv12 | Format::Nv21 | Format::P010 => return None,
         Format::Rgb10a2Unorm => M::RGB10A2Unorm,
         Format::R16Float => M::R16Float,
         Format::Rg16Float => M::RG16Float,

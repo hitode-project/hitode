@@ -33,6 +33,8 @@ mod queue;
 mod resource;
 mod ring;
 mod shader;
+mod video;
+pub(crate) use video::VideoPool;
 
 #[derive(Clone)]
 pub(crate) struct Device(pub(crate) Arc<Context>);
@@ -75,6 +77,8 @@ pub(crate) struct Context {
     semaphore_fd: ash::khr::external_semaphore_fd::Device,
     #[cfg(target_os = "android")]
     vendor: u32,
+    #[cfg(target_os = "android")]
+    video_format: Option<video::VideoFormat>,
 }
 
 /// A GPU object whose last handle dropped. Encoders hold no references:
@@ -100,6 +104,9 @@ pub(super) enum Retired {
         handle: vk::Sampler,
         index: Option<u32>,
     },
+    Video(video::Resources),
+    #[cfg(target_os = "android")]
+    VideoDescriptors(vk::DescriptorPool),
     Query(vk::QueryPool),
     #[cfg(target_os = "android")]
     Semaphore(vk::Semaphore),
@@ -263,6 +270,9 @@ impl Context {
                     }
                     self.device.destroy_sampler(handle, None);
                 }
+                Retired::Video(resources) => resources.destroy(&self.device),
+                #[cfg(target_os = "android")]
+                Retired::VideoDescriptors(pool) => self.device.destroy_descriptor_pool(pool, None),
                 Retired::Query(handle) => self.device.destroy_query_pool(handle, None),
                 #[cfg(target_os = "android")]
                 Retired::Semaphore(handle) => self.device.destroy_semaphore(handle, None),

@@ -31,7 +31,7 @@ present CPU nanoseconds, latch minus desired time, shown minus latch, releases,
 pool ages, and minimum, median and p95 summaries. The diagnostic system property
 `debug.adv.probe.rotation` accepts 0 (default), 90, 180 or 270 and is read when a
 window is created. Set `debug.adv.probe.yuv` to `1` before launching to show a
-moving 640×360 NV12 gradient over a black base. The decoder-style path uses
+moving 640×360 NV21 gradient over a black base. The decoder-style path uses
 `acquire_cpu` and `write`, a completed token and no acquire fence; only the
 initial black base uses the GPU. Clear the property to restore the bar mode.
 

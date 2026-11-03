@@ -26,6 +26,7 @@ pub(super) const ALL: &[Format] = &[
     Format::Depth32Float,
     Format::Depth32FloatStencil8,
     Format::Nv12,
+    Format::Nv21,
     Format::P010,
 ];
 pub(super) fn vk(format: Format) -> vk::Format {
@@ -56,6 +57,7 @@ pub(super) fn vk(format: Format) -> vk::Format {
         Format::Depth32Float => vk::Format::D32_SFLOAT,
         Format::Depth32FloatStencil8 => vk::Format::D32_SFLOAT_S8_UINT,
         Format::Nv12 => vk::Format::G8_B8R8_2PLANE_420_UNORM,
+        Format::Nv21 => vk::Format::UNDEFINED,
         Format::P010 => vk::Format::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16,
     }
 }
@@ -75,7 +77,7 @@ pub(super) fn block(format: Format) -> (u32, u32) {
     match format {
         Format::Bc1Unorm => (4, 8),
         Format::Bc2Unorm | Format::Bc3Unorm => (4, 16),
-        Format::R8Unorm | Format::Nv12 => (1, 1),
+        Format::R8Unorm | Format::Nv12 | Format::Nv21 => (1, 1),
         Format::Rg8Unorm
         | Format::B5g6r5Unorm
         | Format::Bgr5a1Unorm

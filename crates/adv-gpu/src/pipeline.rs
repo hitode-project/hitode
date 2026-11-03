@@ -222,6 +222,15 @@ pub struct RenderPipelineDesc {
     pub label: &'static str,
 }
 
+/// A render pipeline sampling a pool's converted RGB video. The fragment shader
+/// declares a `texture_2d<f32>` at group 4, binding 0, and its sampler at binding 1.
+/// These become one combined immutable sampler at binding 0 in a dedicated set.
+/// Metal returns [`crate::Error::Unsupported`]; it samples NV12 plane views instead.
+pub struct VideoPipelineDesc<'a> {
+    pub pipeline: &'a RenderPipelineDesc,
+    pub pool: &'a crate::PresentPool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ComputePipelineDesc {
     pub entry: Entry,

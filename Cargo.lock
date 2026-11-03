@@ -170,6 +170,7 @@ dependencies = [
 name = "adv-gpu"
 version = "0.2.3"
 dependencies = [
+ "adv-display",
  "arrayvec",
  "ash",
  "bitflags 2.13.2",
