@@ -140,6 +140,7 @@ impl PresentPool {
             age,
             cpu: false,
             fence: None,
+            color: self.desc.color,
             pool: self.shared.clone(),
         }))
     }
@@ -175,6 +176,7 @@ impl PresentPool {
             age,
             fence: None,
             cpu: true,
+            color: self.desc.color,
             pool: self.shared.clone(),
         })
     }
@@ -199,6 +201,7 @@ pub struct PresentImage {
     age: Option<u32>,
     fence: Option<Fence>,
     cpu: bool,
+    color: Option<YuvColor>,
     pool: Arc<Mutex<Shared>>,
 }
 
@@ -215,6 +218,10 @@ impl PresentImage {
 
     pub fn image(&self) -> &Image {
         &self.buffer().image
+    }
+    /// The pool's matrix and range: `Some` exactly for NV12.
+    pub fn color(&self) -> Option<YuvColor> {
+        self.color
     }
     /// Presents since this buffer's content was current; `None` when its
     /// content is undefined (new to the pool).

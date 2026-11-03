@@ -199,6 +199,24 @@ mod native {
         z: Option<i32>,
         dataspace: i32,
     }
+    /// `ADataSpace` of a buffer: sRGB (the platform default) for RGB, the
+    /// pool's matrix and range with the SMPTE 170M transfer for NV12.
+    fn dataspace(color: Option<adv_gpu::present::YuvColor>) -> i32 {
+        use adv_gpu::present::YuvColor as C;
+        const BT709: i32 = 1 << 16;
+        const BT601_625: i32 = 2 << 16;
+        const SRGB: i32 = 2 << 22;
+        const SMPTE_170M: i32 = 3 << 22;
+        const FULL: i32 = 1 << 27;
+        const LIMITED: i32 = 2 << 27;
+        match color {
+            None => BT709 | SRGB | FULL,
+            Some(C::Bt601Limited) => BT601_625 | SMPTE_170M | LIMITED,
+            Some(C::Bt601Full) => BT601_625 | SMPTE_170M | FULL,
+            Some(C::Bt709Limited) => BT709 | SMPTE_170M | LIMITED,
+            Some(C::Bt709Full) => BT709 | SMPTE_170M | FULL,
+        }
+    }
     #[derive(Default)]
     struct Completion {
         inbox: Option<Arc<Inbox>>,
@@ -311,7 +329,7 @@ mod native {
                     geometry: None,
                     visible: true,
                     z: None,
-                    dataspace: 142671872, // ADATASPACE_SRGB is the platform default.
+                    dataspace: dataspace(None),
                 });
             }
             Ok(())
@@ -410,7 +428,7 @@ mod native {
                     }
                     if surface.id.is_none() && self.color != Some(layers.background) {
                         let [r, g, b] = layers.background;
-                        ASurfaceTransaction_setColor(tx, handle, r, g, b, 1.0, 142671872); // ADATASPACE_SRGB
+                        ASurfaceTransaction_setColor(tx, handle, r, g, b, 1.0, dataspace(None));
                         if surface.geometry.is_none() {
                             ASurfaceTransaction_setGeometry(
                                 tx,
@@ -443,13 +461,7 @@ mod native {
                     .map_or(-1, |f| f.into_fd().into_raw_fd());
                 unsafe {
                     ASurfaceTransaction_setBuffer(tx, surface, buffer, fd);
-                    let dataspace = if acquired.image.image().desc().format == adv_gpu::Format::Nv12
-                    {
-                        // BT.601 limited: STANDARD_BT601_625 | TRANSFER_SMPTE_170M | RANGE_LIMITED.
-                        (2 << 16) | (3 << 22) | (2 << 27)
-                    } else {
-                        142671872
-                    }; // ADATASPACE_SRGB
+                    let dataspace = dataspace(acquired.image.color());
                     if state.dataspace != dataspace {
                         ASurfaceTransaction_setBufferDataSpace(tx, surface, dataspace);
                         state.dataspace = dataspace;
