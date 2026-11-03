@@ -20,8 +20,43 @@ pub enum Event {
     },
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PlanKind {
+    #[default]
+    Direct,
+    Merged,
+    Upscaled,
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StageStats {
+    pub tiles: u32,
+    pub pixels: u64,
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Statistics {
+    pub kind: PlanKind,
+    pub stages: [StageStats; 4],
+    pub passes: u32,
+    pub submissions: u32,
+    pub latched: Option<Duration>,
+    pub shown: Option<Duration>,
+    pub presents: u64,
+    pub software_frames: u64,
+    pub software_bytes: u64,
+    pub software_started: Option<Duration>,
+    pub direct_presents: u64,
+    pub configurations: u64,
+    pub max_cpu: Duration,
+    pub max_queue: Duration,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PresentRecord {
+    pub statistics: Statistics,
+    pub token: u64,
+    pub published_at: Duration,
+    pub at: Duration,
+    pub cpu_time: Duration,
     pub frame: FrameInfo,
     pub settings: Settings,
     pub caps: CompositorCaps,
@@ -75,6 +110,39 @@ impl Recorder {
         self.events.push_back(event);
     }
 
+    pub fn latest(&self) -> Option<&PresentRecord> {
+        self.events.iter().rev().find_map(|e| {
+            if let Event::Present(r) = e {
+                Some(r.as_ref())
+            } else {
+                None
+            }
+        })
+    }
+    pub fn get(&self, serial: u64) -> Option<&PresentRecord> {
+        self.events.iter().rev().find_map(|e| match e {
+            Event::Present(r) if r.statistics.presents == serial => Some(r.as_ref()),
+            _ => None,
+        })
+    }
+    pub(crate) fn get_mut(&mut self, serial: u64) -> Option<&mut PresentRecord> {
+        self.events.iter_mut().rev().find_map(|e| {
+            if let Event::Present(r) = e {
+                (r.statistics.presents == serial).then_some(r.as_mut())
+            } else {
+                None
+            }
+        })
+    }
+    pub(crate) fn submission_mut(&mut self, token: u64) -> Option<&mut PresentRecord> {
+        self.events.iter_mut().rev().find_map(|e| {
+            if let Event::Present(r) = e {
+                (r.token == token).then_some(r.as_mut())
+            } else {
+                None
+            }
+        })
+    }
     pub fn events(&self) -> impl Iterator<Item = &Event> {
         self.events.iter()
     }

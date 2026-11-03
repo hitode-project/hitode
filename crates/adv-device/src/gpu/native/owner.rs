@@ -16,11 +16,13 @@ use std::time::Instant;
 pub(super) struct Owner {
     join: Option<std::thread::JoinHandle<()>>,
     pub failure: Arc<OnceLock<String>>,
+    pub wake: Option<super::stream::Waker>,
 }
 impl Owner {
     #[cfg(test)]
     pub(super) fn unstarted() -> Self {
         Self {
+            wake: None,
             join: None,
             failure: Arc::new(OnceLock::new()),
         }
@@ -30,6 +32,7 @@ impl Owner {
         commands: Consumer,
         presenter: Box<dyn Presenter>,
     ) -> Result<Self, super::super::Error> {
+        let wake = Some(commands.waker());
         let failure = Arc::new(OnceLock::new());
         let owner_failure = failure.clone();
         let join = std::thread::Builder::new()
@@ -41,6 +44,7 @@ impl Owner {
             })
             .map_err(|error| super::super::Error::Unavailable(error.to_string()))?;
         Ok(Self {
+            wake,
             join: Some(join),
             failure,
         })
@@ -94,6 +98,7 @@ struct Run {
     passes: Vec<pass::Pass>,
 }
 struct State {
+    wake: super::stream::Waker,
     queue: Queue,
     encoder: Option<Encoder>,
     presenter: Box<dyn Presenter>,
@@ -123,15 +128,30 @@ pub(super) fn run(
     presenter: Box<dyn Presenter>,
 ) -> adv_gpu::Result<()> {
     high_priority()?;
-    let mut state = State::new(queue, presenter);
-    while let Some(chunk) = commands.next() {
-        #[cfg(feature = "test-support")]
-        let _submissions = commands.submissions();
-        state.chunks.push_back(chunk);
-        #[cfg(target_vendor = "apple")]
-        objc2::rc::autoreleasepool(|_| state.drain(&commands))?;
-        #[cfg(not(target_vendor = "apple"))]
-        state.drain(&commands)?;
+    let mut state = State::new(queue, presenter, commands.waker());
+    let wake = commands.waker();
+    state.presenter.service(&mut state.queue, Some(&wake));
+    loop {
+        match commands.next() {
+            super::stream::Next::Closed => break,
+            super::stream::Next::Woken => {
+                state.close(pass::NextDepth::Keep)?;
+                if state.encoder.is_some() {
+                    state.submit(None)?;
+                }
+                state.presenter.service(&mut state.queue, Some(&wake));
+            }
+            super::stream::Next::Chunk(chunk) => {
+                #[cfg(feature = "test-support")]
+                let _submissions = commands.submissions();
+                state.chunks.push_back(chunk);
+                #[cfg(target_vendor = "apple")]
+                objc2::rc::autoreleasepool(|_| state.drain(&commands))?;
+                #[cfg(not(target_vendor = "apple"))]
+                state.drain(&commands)?;
+                state.presenter.service(&mut state.queue, None);
+            }
+        }
     }
     state.close(pass::NextDepth::Keep)?;
     state.recycle(state.cursor.0, &commands);
@@ -142,8 +162,9 @@ pub(super) fn run(
     Ok(())
 }
 impl State {
-    fn new(queue: Queue, presenter: Box<dyn Presenter>) -> Self {
+    fn new(queue: Queue, presenter: Box<dyn Presenter>, wake: super::stream::Waker) -> Self {
         Self {
+            wake,
             queue,
             encoder: None,
             presenter,
@@ -167,14 +188,38 @@ impl State {
         &mut self,
         image: &Image,
     ) -> adv_gpu::Result<(adv_gpu::Image, adv_gpu::ImageView, u32)> {
-        self.encoder();
-        backing::resolve(
-            image,
-            &mut self.queue,
-            &mut *self.presenter,
-            self.encoder.as_mut().unwrap(),
-        )
+        let mut blocked = false;
+        loop {
+            if blocked {
+                if self.encoder.is_some() {
+                    self.submit(None)?;
+                }
+                self.presenter.service(&mut self.queue, Some(&self.wake));
+            }
+            let result = backing::resolve(
+                image,
+                &mut self.queue,
+                &mut *self.presenter,
+                &mut self.encoder,
+            );
+            match result {
+                Err(adv_gpu::Error::Busy) => {
+                    if blocked && !self.wake.wait() {
+                        return Err(adv_gpu::Error::DeviceLost(
+                            "execution closed during swap acquisition".into(),
+                        ));
+                    }
+                    blocked = true;
+                }
+                Ok(resolved) => {
+                    self.encoder();
+                    return Ok(resolved);
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
+
     fn poll(&mut self, consumer: &Consumer) -> adv_gpu::Result<()> {
         let completed = self.queue.poll()?;
         while self
@@ -458,7 +503,6 @@ impl State {
         Ok(())
     }
     fn end_frame(&mut self) {
-        self.presenter.drain();
         for depth in self.depths.drain(..) {
             depth.0.owner.lock().unwrap().end_frame();
         }
@@ -679,7 +723,7 @@ impl Presenter for Headless {
         false
     }
     fn present(&mut self, _: &mut Queue, _: Frame) {}
-    fn drain(&mut self) {}
+    fn service(&mut self, _: &mut Queue, _: Option<&crate::frame::Waker>) {}
 }
 
 #[cfg(test)]
@@ -711,7 +755,7 @@ mod tests {
             })
             .unwrap()
             .unwrap();
-        let mut state = State::new(queue, Box::new(Headless));
+        let mut state = State::new(queue, Box::new(Headless), consumer.waker());
         state
             .command(
                 Command::Upload {
@@ -825,7 +869,13 @@ mod tests {
                 notify.send(serial).unwrap();
             }
         }
-        fn drain(&mut self) {}
+        fn service(&mut self, queue: &mut Queue, wake: Option<&crate::frame::Waker>) {
+            for reply in wake.map_or_else(Vec::new, |w| w.captures()) {
+                let encoder = queue.encoder("owner poke");
+                queue.submit(encoder).unwrap();
+                reply.send(Err("owner serviced".into())).unwrap();
+            }
+        }
     }
     struct Harness {
         device: Device,
@@ -844,6 +894,7 @@ mod tests {
                     display: display.clone(),
                     notify: None,
                 }),
+                consumer.waker(),
             );
             Self {
                 device,
@@ -1272,12 +1323,13 @@ struct Color {rgba:vec4<f32>}
         not(any(target_vendor = "apple", target_os = "android")),
         ignore = "presentable pools exist only on Apple and Android"
     )]
-    fn an_exhausted_swap_pool_waits_for_compositor_release() {
+    fn an_exhausted_swap_pool_services_pokes_and_waits_for_compositor_release() {
         let Some((device, queue)) = open() else {
             return;
         };
         let image = swap(4, 4);
         let (mut producer, consumer) = super::super::stream::channel(device.ring(1 << 20).unwrap());
+        let wake = consumer.waker();
         let display = Arc::new(Display::default());
         display.presentable.store(true, Ordering::Release);
         let (notify, frames) = mpsc::channel();
@@ -1295,7 +1347,17 @@ struct Color {rgba:vec4<f32>}
             assert_eq!(frames.recv_timeout(TIMEOUT).unwrap(), serial);
         }
         assert!(frames.recv_timeout(Duration::from_millis(20)).is_err());
+        assert_eq!(
+            wake.capture()
+                .recv_timeout(TIMEOUT)
+                .unwrap()
+                .err()
+                .as_deref(),
+            Some("owner serviced")
+        );
+        assert!(frames.recv_timeout(Duration::from_millis(20)).is_err());
         drop(display.frames.lock().unwrap().pop_front());
+        wake.poke();
         assert_eq!(frames.recv_timeout(TIMEOUT).unwrap(), 4);
         drop(producer);
         owner.join().unwrap().unwrap();

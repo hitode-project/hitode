@@ -118,6 +118,7 @@ version = "0.2.3"
 dependencies = [
  "adv-gpu",
  "arrayvec",
+ "block2",
  "dispatch2",
  "libc",
  "ndk-sys",
@@ -3998,6 +3999,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "96c1358452b371bf9f104e21ec536d37a650eb10f7ee379fff67d2e08d537f1f"
 dependencies = [
  "bitflags 2.13.2",
+ "block2",
  "objc2",
  "objc2-core-foundation",
  "objc2-core-graphics",

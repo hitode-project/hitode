@@ -148,6 +148,8 @@ struct State {
     /// The owner thread waits for a chunk.
     idle: bool,
     closed: bool,
+    poked: bool,
+    captures: Vec<crate::frame::CaptureReply>,
 }
 
 #[derive(Default)]
@@ -173,6 +175,43 @@ pub(crate) fn channel(ring: Ring) -> (Producer, Consumer) {
         },
         Consumer { shared },
     )
+}
+
+/// A wake of the same owner that consumes guest commands; it owns no GPU state.
+#[derive(Clone)]
+pub struct Waker(Arc<Shared>);
+impl Waker {
+    pub fn poke(&self) {
+        let mut state = self.0.state.lock().unwrap();
+        state.poked = true;
+        self.0.work.notify_one();
+    }
+    pub(crate) fn wait(&self) -> bool {
+        let state = self.0.state.lock().unwrap();
+        let mut state = self
+            .0
+            .work
+            .wait_while(state, |s| !s.poked && !s.closed)
+            .unwrap();
+        state.poked = false;
+        !state.closed
+    }
+    pub fn capture(&self) -> std::sync::mpsc::Receiver<Result<crate::frame::Captured, String>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut state = self.0.state.lock().unwrap();
+        state.captures.push(tx);
+        state.poked = true;
+        self.0.work.notify_one();
+        rx
+    }
+    pub fn captures(&self) -> Vec<crate::frame::CaptureReply> {
+        std::mem::take(&mut self.0.state.lock().unwrap().captures)
+    }
+}
+pub(crate) enum Next {
+    Chunk(Chunk),
+    Woken,
+    Closed,
 }
 
 /// The execution thread's end.
@@ -301,17 +340,26 @@ pub(crate) struct Consumer {
 }
 
 impl Consumer {
-    /// The next chunk, waiting while there is none; `None` once the producer
-    /// is gone and every chunk was taken.
-    pub fn next(&self) -> Option<Chunk> {
+    pub fn waker(&self) -> Waker {
+        Waker(self.shared.clone())
+    }
+    /// A poke or the next chunk, blocking only while neither exists.
+    pub fn next(&self) -> Next {
         let mut state = self.shared.state.lock().unwrap();
         loop {
+            // Captures must follow already published guest frames. Notifications
+            // are also serviced after each chunk and at swap acquisition.
             if let Some(chunk) = state.full.pop_front() {
                 state.idle = false;
-                return Some(chunk);
+                return Next::Chunk(chunk);
+            }
+            if state.poked {
+                state.poked = false;
+                state.idle = false;
+                return Next::Woken;
             }
             if state.closed {
-                return None;
+                return Next::Closed;
             }
             state.idle = true;
             state = self.shared.work.wait(state).unwrap();
@@ -398,5 +446,46 @@ impl Consumer {
             paused = self.shared.submissions.resumed.wait(paused).unwrap();
         }
         paused
+    }
+}
+
+#[cfg(test)]
+mod wake_tests {
+    use super::*;
+    #[test]
+    fn pokes_coalesce_and_wake_an_idle_consumer_without_a_chunk() {
+        let shared = Arc::new(Shared::default());
+        let consumer = Consumer { shared };
+        let wake = consumer.waker();
+        wake.poke();
+        wake.poke();
+        assert!(matches!(consumer.next(), Next::Woken));
+        let (send, received) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            send.send(matches!(consumer.next(), Next::Woken)).unwrap();
+        });
+        wake.poke();
+        assert!(
+            received
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap()
+        );
+        thread.join().unwrap();
+    }
+    #[test]
+    fn capture_pokes_follow_already_queued_frame_commands() {
+        let shared = Arc::new(Shared::default());
+        shared
+            .state
+            .lock()
+            .unwrap()
+            .full
+            .push_back(Chunk::default());
+        let consumer = Consumer { shared };
+        let wake = consumer.waker();
+        let _reply = wake.capture();
+        assert!(matches!(consumer.next(), Next::Chunk(_)));
+        assert!(matches!(consumer.next(), Next::Woken));
+        assert_eq!(wake.captures().len(), 1);
     }
 }

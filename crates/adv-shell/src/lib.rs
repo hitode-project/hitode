@@ -24,7 +24,7 @@ pub use logging::init_system_log;
 mod display;
 #[cfg(all(host_view, not(feature = "native-display")))]
 mod native_gpu;
-#[cfg(all(feature = "native-display", target_vendor = "apple"))]
+#[cfg(feature = "native-display")]
 use display as native_gpu;
 #[cfg(all(host_view, not(feature = "native-display")))]
 mod upscaling;
@@ -32,7 +32,11 @@ mod upscaling;
 pub use display::Upscaler;
 #[cfg(all(host_view, not(feature = "native-display")))]
 pub use upscaling::Upscaler;
+#[cfg(not(feature = "native-display"))]
 mod scaling;
+#[cfg(feature = "native-display")]
+pub use adv_display::plan::Placement as Scaling;
+#[cfg(not(feature = "native-display"))]
 pub use scaling::Scaling;
 pub mod overlay;
 mod performance;

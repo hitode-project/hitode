@@ -5,9 +5,9 @@
 use super::{bindings, ingest};
 use crate::{Rect, plan::Tiles};
 use adv_gpu::{
-    Device, Encoder, Format, Image, ImageView, PresentImage, PresentPool, RenderPipeline, Result,
-    Ring, Sampler,
-    encode::{Bind, ColorAttachment, Load, RenderPassDesc, Store},
+    Device, Format, Image, ImageView, PresentImage, PresentPool, RenderPass, RenderPipeline,
+    Result, Ring, Sampler,
+    encode::Bind,
     pipeline::{
         BindingKind, ColorTarget, Cull, Primitive, RenderPipelineDesc, Topology, VideoPipelineDesc,
     },
@@ -155,15 +155,15 @@ fn pipeline(
 /// Compose into an existing canvas. Tiles outside the video and its background
 /// preserve the base. `resources` and the producer's ring are reused each frame.
 pub fn encode(
-    encoder: &mut Encoder,
+    pass: &mut RenderPass<'_>,
     destination: &Image,
     planes: &[ImageView; 2],
     geometry: Geometry,
     tiles: &Tiles,
     resources: (&RenderPipeline, &Sampler, &mut Ring),
-) -> Result<()> {
+) -> Result<arrayvec::ArrayVec<adv_gpu::Span, 2>> {
     encode_base(
-        encoder,
+        pass,
         destination,
         Picture::Planes(planes, resources.1),
         geometry,
@@ -175,16 +175,16 @@ pub fn encode(
 
 /// Decode a software publication and compose video in the same tile draw.
 pub fn encode_software(
-    encoder: &mut Encoder,
+    pass: &mut RenderPass<'_>,
     destination: &Image,
     software: &ingest::Source<'_>,
     planes: &[ImageView; 2],
     geometry: Geometry,
     tiles: &Tiles,
     resources: (&RenderPipeline, &Sampler, &mut Ring),
-) -> Result<()> {
+) -> Result<arrayvec::ArrayVec<adv_gpu::Span, 2>> {
     encode_base(
-        encoder,
+        pass,
         destination,
         Picture::Planes(planes, resources.1),
         geometry,
@@ -195,15 +195,15 @@ pub fn encode_software(
 }
 /// Compose through the pool's immutable YUV conversion.
 pub fn encode_converted(
-    encoder: &mut Encoder,
+    pass: &mut RenderPass<'_>,
     destination: &Image,
     image: &PresentImage,
     geometry: Geometry,
     tiles: &Tiles,
     resources: (&RenderPipeline, &mut Ring),
-) -> Result<()> {
+) -> Result<arrayvec::ArrayVec<adv_gpu::Span, 2>> {
     encode_base(
-        encoder,
+        pass,
         destination,
         Picture::Converted(image),
         geometry,
@@ -215,16 +215,16 @@ pub fn encode_converted(
 
 /// Decode a software publication and converted video in one draw.
 pub fn encode_converted_software(
-    encoder: &mut Encoder,
+    pass: &mut RenderPass<'_>,
     destination: &Image,
     software: &ingest::Source<'_>,
     image: &PresentImage,
     geometry: Geometry,
     tiles: &Tiles,
     resources: (&RenderPipeline, &mut Ring),
-) -> Result<()> {
+) -> Result<arrayvec::ArrayVec<adv_gpu::Span, 2>> {
     encode_base(
-        encoder,
+        pass,
         destination,
         Picture::Converted(image),
         geometry,
@@ -239,16 +239,16 @@ enum Picture<'a> {
     Converted(&'a PresentImage),
 }
 fn encode_base(
-    encoder: &mut Encoder,
+    pass: &mut RenderPass<'_>,
     destination: &Image,
     picture: Picture<'_>,
     geometry: Geometry,
     tiles: &Tiles,
     resources: (&RenderPipeline, &mut Ring),
     software: Option<&ingest::Source<'_>>,
-) -> Result<()> {
+) -> Result<arrayvec::ArrayVec<adv_gpu::Span, 2>> {
     if tiles.rects.is_empty() {
-        return Ok(());
+        return Ok(Default::default());
     }
     if let Some(software) = software {
         debug_assert_eq!(
@@ -259,7 +259,6 @@ fn encode_base(
             )
         );
     }
-    let (area, coverage_load) = ingest::coverage(tiles);
     let (pipeline, ring) = resources;
     let size = destination.desc().size;
     let d = geometry.destination;
@@ -341,58 +340,36 @@ fn encode_base(
         }
         rectangles
     };
-    {
-        let mut pass = encoder.render_pass(&RenderPassDesc {
-            colors: [ColorAttachment {
-                view: destination.view(),
-                load: if software.is_some() {
-                    coverage_load
-                } else {
-                    Load::Load
-                },
-                store: Store::Store,
-                resolve: None,
-            }]
-            .into_iter()
-            .collect(),
-            depth_stencil: None,
-            area,
-            timestamps: None,
-            label: "video",
-        });
-        pass.set_pipeline(pipeline);
+    pass.set_pipeline(pipeline);
+    pass.bind(
+        0,
+        Bind::Uniform(BufferSlice {
+            buffer: constants.buffer(),
+            offset: constants.offset(),
+            size: constants.len(),
+        }),
+    );
+    if let Some(software) = software {
+        ingest::bind(pass, software, &rectangles);
+    } else {
         pass.bind(
-            0,
-            Bind::Uniform(BufferSlice {
-                buffer: constants.buffer(),
-                offset: constants.offset(),
-                size: constants.len(),
+            2,
+            Bind::StorageBuffer(BufferSlice {
+                buffer: rectangles.buffer(),
+                offset: rectangles.offset(),
+                size: rectangles.len(),
             }),
         );
-        if let Some(software) = software {
-            ingest::bind(&mut pass, software, &rectangles);
-        } else {
-            pass.bind(
-                2,
-                Bind::StorageBuffer(BufferSlice {
-                    buffer: rectangles.buffer(),
-                    offset: rectangles.offset(),
-                    size: rectangles.len(),
-                }),
-            );
-        }
-        match picture {
-            Picture::Planes(planes, sampler) => {
-                pass.bind(0, Bind::Sampled(&planes[0]));
-                pass.bind(1, Bind::Sampled(&planes[1]));
-                pass.bind(0, Bind::Sampler(sampler));
-            }
-            Picture::Converted(image) => pass.bind_video(image),
-        }
-        pass.set_viewport(0.0, 0.0, size.width as f32, size.height as f32, 0.0, 1.0);
-        pass.draw(0..6, 0..tiles.rects.len() as u32);
     }
-    encoder.retain(constants);
-    encoder.retain(rectangles);
-    Ok(())
+    match picture {
+        Picture::Planes(planes, sampler) => {
+            pass.bind(0, Bind::Sampled(&planes[0]));
+            pass.bind(1, Bind::Sampled(&planes[1]));
+            pass.bind(0, Bind::Sampler(sampler));
+        }
+        Picture::Converted(image) => pass.bind_video(image),
+    }
+    pass.set_viewport(0.0, 0.0, size.width as f32, size.height as f32, 0.0, 1.0);
+    pass.draw(0..6, 0..tiles.rects.len() as u32);
+    Ok([constants, rectangles].into_iter().collect())
 }

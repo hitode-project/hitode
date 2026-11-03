@@ -302,50 +302,82 @@ fn video_draw_matches_cpu_reference() {
                     label: "base",
                 }),
             );
+            let mut spans = Vec::new();
+            let mut pass = encoder.render_pass(&RenderPassDesc {
+                colors: [ColorAttachment {
+                    view: target.view(),
+                    load: Load::Load,
+                    store: Store::Store,
+                    resolve: None,
+                }]
+                .into_iter()
+                .collect(),
+                depth_stencil: None,
+                area: GpuRect {
+                    x: 0,
+                    y: 0,
+                    w: 20,
+                    h: 14,
+                },
+                timestamps: None,
+                label: "video test",
+            });
             if software {
                 #[cfg(not(target_os = "android"))]
-                encode_software(
-                    &mut encoder,
-                    &target,
-                    software_source,
-                    &planes,
-                    geometry,
-                    &tiles,
-                    (&software_pipeline, &sampler, &mut ring),
-                )
-                .unwrap();
+                spans.extend(
+                    encode_software(
+                        &mut pass,
+                        &target,
+                        software_source,
+                        &planes,
+                        geometry,
+                        &tiles,
+                        (&software_pipeline, &sampler, &mut ring),
+                    )
+                    .unwrap(),
+                );
                 #[cfg(target_os = "android")]
-                encode_converted_software(
-                    &mut encoder,
-                    &target,
-                    software_source,
-                    &image,
-                    geometry,
-                    &tiles,
-                    (&software_pipeline, &mut ring),
-                )
-                .unwrap();
+                spans.extend(
+                    encode_converted_software(
+                        &mut pass,
+                        &target,
+                        software_source,
+                        &image,
+                        geometry,
+                        &tiles,
+                        (&software_pipeline, &mut ring),
+                    )
+                    .unwrap(),
+                );
             } else {
                 #[cfg(not(target_os = "android"))]
-                encode(
-                    &mut encoder,
-                    &target,
-                    &planes,
-                    geometry,
-                    &tiles,
-                    (&pipeline, &sampler, &mut ring),
-                )
-                .unwrap();
+                spans.extend(
+                    encode(
+                        &mut pass,
+                        &target,
+                        &planes,
+                        geometry,
+                        &tiles,
+                        (&pipeline, &sampler, &mut ring),
+                    )
+                    .unwrap(),
+                );
                 #[cfg(target_os = "android")]
-                encode_converted(
-                    &mut encoder,
-                    &target,
-                    &image,
-                    geometry,
-                    &tiles,
-                    (&pipeline, &mut ring),
-                )
-                .unwrap();
+                spans.extend(
+                    encode_converted(
+                        &mut pass,
+                        &target,
+                        &image,
+                        geometry,
+                        &tiles,
+                        (&pipeline, &mut ring),
+                    )
+                    .unwrap(),
+                );
+            }
+            drop(pass);
+            for span in spans {
+                encoder.retain(span);
             }
             encoder.copy_image_to_buffer(
                 ImageCopy {

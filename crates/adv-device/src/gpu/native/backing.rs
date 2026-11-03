@@ -75,7 +75,6 @@ use adv_gpu::resource::{Dimension, ImageDesc, Usage};
 use adv_gpu::{Device, Encoder, Extent, Format, Queue, Rect};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 
 impl Swap {
     pub fn new(size: (u32, u32)) -> Self {
@@ -129,7 +128,7 @@ impl SwapBacking {
         swap: &Swap,
         queue: &mut Queue,
         presenter: &mut dyn Presenter,
-        encoder: &mut Encoder,
+        encoder: &mut Option<Encoder>,
     ) -> adv_gpu::Result<adv_gpu::Image> {
         let presentable = presenter.presentable(swap.size.0, swap.size.1);
         if self
@@ -161,13 +160,7 @@ impl SwapBacking {
                 )?);
             }
             let pool = self.pool.as_mut().unwrap();
-            let buffer = loop {
-                if let Some(buffer) = pool.acquire(queue)? {
-                    break buffer;
-                }
-                presenter.drain();
-                std::thread::sleep(Duration::from_millis(1));
-            };
+            let buffer = pool.acquire(queue)?.ok_or(adv_gpu::Error::Busy)?;
             SwapImage::Presentable(buffer)
         } else {
             SwapImage::Private(queue.device().create_image(&image_desc(
@@ -202,12 +195,15 @@ impl SwapBacking {
                 }
                 damage
             };
-            match damage {
-                Damage::None => {}
-                Damage::Whole => repair(encoder, raw(previous), image, whole),
-                Damage::Rects(rects) => {
-                    for rect in rects {
-                        repair(encoder, raw(previous), image, rect);
+            if !matches!(damage, Damage::None) {
+                let encoder = encoder.get_or_insert_with(|| queue.encoder("guest commands"));
+                match damage {
+                    Damage::None => unreachable!(),
+                    Damage::Whole => repair(encoder, raw(previous), image, whole),
+                    Damage::Rects(rects) => {
+                        for rect in rects {
+                            repair(encoder, raw(previous), image, rect);
+                        }
                     }
                 }
             }
@@ -279,7 +275,7 @@ pub(super) fn resolve(
     image: &Image,
     queue: &mut Queue,
     presenter: &mut dyn Presenter,
-    encoder: &mut Encoder,
+    encoder: &mut Option<Encoder>,
 ) -> adv_gpu::Result<(adv_gpu::Image, adv_gpu::ImageView, u32)> {
     match &image.storage {
         Storage::Fixed { image, view, level } => {
@@ -361,11 +357,7 @@ impl DepthBacking {
 }
 
 pub(super) fn swap_format() -> Format {
-    if cfg!(target_os = "android") {
-        Format::Rgba8Unorm
-    } else {
-        Format::Bgra8Unorm
-    }
+    adv_gpu::present::COLOR_FORMAT
 }
 
 /// Keep repair regions disjoint, coalescing intersecting bounds and reducing

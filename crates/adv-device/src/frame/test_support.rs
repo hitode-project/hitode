@@ -130,5 +130,5 @@ impl Presenter for CapturePresenter {
             })
             .unwrap();
     }
-    fn drain(&mut self) {}
+    fn service(&mut self, _: &mut adv_gpu::Queue, _: Option<&crate::frame::Waker>) {}
 }

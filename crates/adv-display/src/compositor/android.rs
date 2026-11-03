@@ -17,11 +17,11 @@ fn transform(rotation: Rotation) -> i32 {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct Geometry(Rect, Rect, Rotation);
+#[derive(Clone, Copy, PartialEq)]
+struct Geometry(Rect, Rect, Rotation, Option<[f32; 4]>);
 impl Geometry {
     fn update(last: &mut Option<Self>, layer: &Layer) -> bool {
-        let next = Self(layer.crop, layer.dst, layer.rotation);
+        let next = Self(layer.crop, layer.dst, layer.rotation, layer.source_uv);
         let changed = *last != Some(next);
         *last = Some(next);
         changed
@@ -54,7 +54,7 @@ mod native {
         ffi::{c_char, c_void},
         os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd},
         ptr::{self, NonNull},
-        sync::{Arc, Condvar, Mutex},
+        sync::{Arc, Condvar, Mutex, OnceLock},
         time::Duration,
     };
 
@@ -191,6 +191,32 @@ mod native {
         }
     }
 
+    fn set_rate(surface: Handle, rate: u32) {
+        type SetRate = unsafe extern "C" fn(Handle, Handle, f32, i8);
+        static SET: OnceLock<Option<SetRate>> = OnceLock::new();
+        let setter = SET.get_or_init(|| {
+            let symbol = unsafe {
+                libc::dlsym(
+                    libc::RTLD_DEFAULT,
+                    c"ASurfaceTransaction_setFrameRate".as_ptr(),
+                )
+            };
+            if symbol.is_null() {
+                None
+            } else {
+                Some(unsafe { std::mem::transmute::<*mut c_void, SetRate>(symbol) })
+            }
+        });
+        if let Some(set) = setter {
+            unsafe {
+                let tx = ASurfaceTransaction_create();
+                set(tx, surface, rate as f32, 0);
+                ASurfaceTransaction_apply(tx);
+                ASurfaceTransaction_delete(tx);
+            }
+        }
+    }
+
     struct Surface {
         id: Option<LayerId>,
         handle: NonNull<c_void>,
@@ -198,6 +224,7 @@ mod native {
         visible: bool,
         z: Option<i32>,
         dataspace: i32,
+        color: Option<[f32; 4]>,
     }
     /// `ADataSpace` of a buffer: sRGB (the platform default) for RGB, the
     /// pool's matrix and range with the SMPTE 170M transfer for YUV.
@@ -231,8 +258,82 @@ mod native {
     struct Inbox {
         ready: Mutex<VecDeque<Box<Completion>>>,
         wake: Condvar,
+        owner: OnceLock<Signals>,
     }
 
+    struct Signals {
+        poll: OwnedFd,
+        stop: OwnedFd,
+        wake: Wake,
+    }
+    impl Signals {
+        fn new(wake: Wake) -> (Self, std::thread::JoinHandle<()>) {
+            let poll = owned(unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) }).expect("epoll");
+            let stop = owned(unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) }).expect("eventfd");
+            let mut event = libc::epoll_event {
+                events: libc::EPOLLIN as u32,
+                u64: 0,
+            };
+            assert_eq!(
+                unsafe {
+                    libc::epoll_ctl(
+                        poll.as_raw_fd(),
+                        libc::EPOLL_CTL_ADD,
+                        stop.as_raw_fd(),
+                        &mut event,
+                    )
+                },
+                0
+            );
+            let fd = poll.try_clone().expect("epoll duplicate");
+            let notify = wake.clone();
+            let thread = std::thread::Builder::new()
+                .name("display fences".into())
+                .spawn(move || {
+                    let mut event = libc::epoll_event { events: 0, u64: 0 };
+                    loop {
+                        let n = unsafe { libc::epoll_wait(fd.as_raw_fd(), &mut event, 1, -1) };
+                        if n < 0
+                            && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
+                        {
+                            continue;
+                        }
+                        assert_eq!(n, 1, "present fence wait");
+                        if event.u64 == 0 {
+                            break;
+                        }
+                        notify();
+                    }
+                })
+                .expect("present fence thread");
+            (Self { poll, stop, wake }, thread)
+        }
+        fn watch(&self, fd: &OwnedFd) {
+            let mut event = libc::epoll_event {
+                events: (libc::EPOLLIN | libc::EPOLLONESHOT) as u32,
+                u64: 1,
+            };
+            assert_eq!(
+                unsafe {
+                    libc::epoll_ctl(
+                        self.poll.as_raw_fd(),
+                        libc::EPOLL_CTL_ADD,
+                        fd.as_raw_fd(),
+                        &mut event,
+                    )
+                },
+                0,
+                "present fence registration"
+            );
+        }
+        fn stop(&self) {
+            let value = 1u64;
+            assert_eq!(
+                unsafe { libc::write(self.stop.as_raw_fd(), (&value as *const u64).cast(), 8) },
+                8
+            );
+        }
+    }
     // This callback owns only numeric surface identities and fds. Its box and
     // previous-fence storage return to the owner thread for reuse.
     unsafe extern "C" fn complete(context: Handle, stats: Handle) {
@@ -245,18 +346,28 @@ mod native {
             });
         }
         let inbox = event.inbox.take().unwrap();
+        if let Some(signals) = inbox.owner.get()
+            && let Some(fd) = &event.present
+        {
+            signals.watch(fd);
+        }
         inbox.ready.lock().unwrap().push_back(event);
         inbox.wake.notify_one();
+        if let Some(signals) = inbox.owner.get() {
+            (signals.wake)();
+        }
     }
 
     /// SurfaceFlinger layers backed by Android hardware buffers.
+    // SAFETY: SurfaceControl handles and the retained window have no thread affinity.
+    unsafe impl Send for SurfaceCompositor {}
     pub struct SurfaceCompositor {
+        window: NonNull<ndk_sys::ANativeWindow>,
         parent: NonNull<c_void>,
         bounds: Rect,
         caps: CompositorCaps,
         clock: Clock,
         surfaces: Vec<Surface>,
-        color: Option<[f32; 3]>,
         held: Vec<(usize, u64, AcquiredImage)>,
         inbox: Arc<Inbox>,
         free: VecDeque<Box<Completion>>,
@@ -266,11 +377,11 @@ mod native {
         rects: Vec<ARect>,
         fences: Vec<SyncFenceInfo>,
         frame_rate: u32,
-        applied_rate: Option<u32>,
+        signal_thread: Option<std::thread::JoinHandle<()>>,
     }
     impl SurfaceCompositor {
         /// # Safety
-        /// `window` stays valid until the compositor drops. Caps must describe
+        /// `window` must be valid on entry; the compositor acquires its own reference. Caps must describe
         /// Android as documented by this module.
         pub unsafe fn new(
             window: NonNull<ndk_sys::ANativeWindow>,
@@ -291,7 +402,11 @@ mod native {
                 ASurfaceControl_createFromWindow(window.as_ptr(), c"adv-display".as_ptr())
             })
             .ok_or(Error::SurfaceLost)?;
+            unsafe {
+                ndk_sys::ANativeWindow_acquire(window.as_ptr());
+            }
             Ok(Self {
+                window,
                 parent,
                 bounds: Rect {
                     x: 0,
@@ -302,7 +417,6 @@ mod native {
                 caps,
                 clock,
                 surfaces: Vec::new(),
-                color: None,
                 held: Vec::new(),
                 inbox: Arc::default(),
                 free: VecDeque::new(),
@@ -312,13 +426,8 @@ mod native {
                 rects: Vec::new(),
                 fences: Vec::new(),
                 frame_rate: 60,
-                applied_rate: None,
+                signal_thread: None,
             })
-        }
-        /// HOST-SES-11: apply cadence to the SurfaceControl layer, using the
-        /// optional API 30 symbol while retaining the API 29 baseline.
-        pub fn set_frame_rate(&mut self, rate: u32) {
-            self.frame_rate = rate;
         }
         fn surface(&mut self, id: Option<LayerId>) -> Result<(), Error> {
             if !self.surfaces.iter().any(|s| s.id == id) {
@@ -326,6 +435,7 @@ mod native {
                     None => c"background",
                     Some(LayerId::Base) => c"base",
                     Some(LayerId::Video(_)) => c"video",
+                    Some(LayerId::VideoBackground(_)) => c"video background",
                     Some(LayerId::Host(_)) => c"host",
                 };
                 let handle = NonNull::new(unsafe {
@@ -339,7 +449,11 @@ mod native {
                     visible: true,
                     z: None,
                     dataspace: dataspace(None),
+                    color: None,
                 });
+                if id == Some(LayerId::Base) {
+                    set_rate(handle.as_ptr(), self.frame_rate);
+                }
             }
             Ok(())
         }
@@ -361,6 +475,28 @@ mod native {
         }
     }
     impl Compositor for SurfaceCompositor {
+        fn image(&self, layer: LayerId) -> Option<&AcquiredImage> {
+            self.held
+                .iter()
+                .filter(|(_, _, i)| i.layer == layer)
+                .max_by_key(|(_, serial, _)| *serial)
+                .map(|(_, _, i)| i)
+        }
+        fn set_waker(&mut self, wake: Wake) {
+            let (signals, thread) = Signals::new(wake);
+            assert!(self.inbox.owner.set(signals).is_ok());
+            self.signal_thread = Some(thread);
+        }
+        fn set_frame_rate(&mut self, rate: u32) {
+            self.frame_rate = rate;
+            if let Some(base) = self.surfaces.iter().find(|s| s.id == Some(LayerId::Base)) {
+                set_rate(base.handle.as_ptr(), rate);
+            }
+        }
+        fn detach(mut self: Box<Self>) -> Vec<AcquiredImage> {
+            self.detach_images()
+        }
+
         fn caps(&self) -> CompositorCaps {
             self.caps.clone()
         }
@@ -376,6 +512,9 @@ mod native {
                 .surface(None)
                 .and_then(|()| self.surface(Some(LayerId::Base)))
                 .and_then(|()| {
+                    for (id, _, _) in &layers.solids {
+                        self.surface(Some(LayerId::VideoBackground(*id)))?;
+                    }
                     for (id, _) in &layers.video {
                         self.surface(Some(LayerId::Video(*id)))?;
                     }
@@ -391,22 +530,6 @@ mod native {
             let mut event = self.completion(serial);
             for surface in &mut self.surfaces {
                 let handle = surface.handle.as_ptr();
-                if surface.id == Some(LayerId::Base) && self.applied_rate != Some(self.frame_rate) {
-                    let symbol = unsafe {
-                        libc::dlsym(
-                            libc::RTLD_DEFAULT,
-                            c"ASurfaceTransaction_setFrameRate".as_ptr(),
-                        )
-                    };
-                    if !symbol.is_null() {
-                        let set: unsafe extern "C" fn(Handle, Handle, f32, i8) =
-                            unsafe { std::mem::transmute(symbol) };
-                        unsafe {
-                            set(tx, handle, self.frame_rate as f32, 0);
-                        }
-                    }
-                    self.applied_rate = Some(self.frame_rate);
-                }
                 let (layer, visible, z) = match surface.id {
                     None => (None, true, 0),
                     Some(LayerId::Base) => (Some(&layers.base), true, 1),
@@ -415,7 +538,46 @@ mod native {
                         (
                             position.map(|i| &layers.video[i].1),
                             position.is_some(),
-                            position.map_or(0, |i| 2 + i as i32),
+                            position.map_or(0, |i| 3 + 2 * i as i32),
+                        )
+                    }
+                    Some(LayerId::VideoBackground(id)) => {
+                        let solid = layers.solids.iter().find(|(v, _, _)| *v == id);
+                        if let Some((_, dst, color)) = solid {
+                            unsafe {
+                                if surface.color != Some(*color) {
+                                    ASurfaceTransaction_setColor(
+                                        tx,
+                                        handle,
+                                        color[0],
+                                        color[1],
+                                        color[2],
+                                        color[3],
+                                        dataspace(None),
+                                    );
+                                    surface.color = Some(*color);
+                                }
+                                let geometry = Geometry(*dst, *dst, Rotation::None, None);
+                                if surface.geometry != Some(geometry) {
+                                    surface.geometry = Some(geometry);
+                                    ASurfaceTransaction_setGeometry(
+                                        tx,
+                                        handle,
+                                        &(*dst).into(),
+                                        &(*dst).into(),
+                                        0,
+                                    );
+                                }
+                            }
+                        }
+                        (
+                            None,
+                            solid.is_some(),
+                            layers
+                                .video
+                                .iter()
+                                .position(|(v, _)| *v == id)
+                                .map_or(0, |i| 2 + 2 * i as i32),
                         )
                     }
                     Some(LayerId::Host(id)) => (
@@ -430,7 +592,10 @@ mod native {
                         surface.visible = visible;
                     }
                     if !visible {
-                        if matches!(surface.id, Some(LayerId::Video(_))) {
+                        if matches!(
+                            surface.id,
+                            Some(LayerId::Video(_) | LayerId::VideoBackground(_))
+                        ) {
                             ASurfaceTransaction_reparent(tx, handle, ptr::null_mut());
                             event.previous.push((handle as usize, None));
                         }
@@ -446,12 +611,24 @@ mod native {
                         ASurfaceTransaction_setGeometry(
                             tx,
                             handle,
-                            &layer.crop.into(),
+                            &if let Some([x, y, w, h]) = layer.source_uv {
+                                Rect {
+                                    x: (x * layer.crop.w as f32).round() as u32,
+                                    y: (y * layer.crop.h as f32).round() as u32,
+                                    w: (w * layer.crop.w as f32).round() as u32,
+                                    h: (h * layer.crop.h as f32).round() as u32,
+                                }
+                                .into()
+                            } else {
+                                layer.crop.into()
+                            },
                             &layer.dst.into(),
                             transform(layer.rotation),
                         );
                     }
-                    if surface.id.is_none() && self.color != Some(layers.background) {
+                    let [r, g, b] = layers.background;
+                    let color = [r, g, b, 1.];
+                    if surface.id.is_none() && surface.color != Some(color) {
                         let [r, g, b] = layers.background;
                         ASurfaceTransaction_setColor(tx, handle, r, g, b, 1.0, dataspace(None));
                         if surface.geometry.is_none() {
@@ -463,9 +640,9 @@ mod native {
                                 0,
                             );
                             surface.geometry =
-                                Some(Geometry(self.bounds, self.bounds, Rotation::None));
+                                Some(Geometry(self.bounds, self.bounds, Rotation::None, None));
                         }
-                        self.color = Some(layers.background);
+                        surface.color = Some(color);
                     }
                 }
             }
@@ -495,6 +672,7 @@ mod native {
                 let layer = match acquired.layer {
                     LayerId::Base => &layers.base,
                     LayerId::Video(id) => &layers.video.iter().find(|(v, _)| *v == id).unwrap().1,
+                    LayerId::VideoBackground(_) => unreachable!("solid layer has no image"),
                     LayerId::Host(_) => panic!("host content is not implemented"),
                 };
                 self.rects.clear();
@@ -530,7 +708,8 @@ mod native {
             Self::apply(tx, event);
             // Applied transactions retain their controls through completion.
             self.surfaces.retain(|s| {
-                let keep = s.visible || !matches!(s.id, Some(LayerId::Video(_)));
+                let keep = s.visible
+                    || !matches!(s.id, Some(LayerId::Video(_) | LayerId::VideoBackground(_)));
                 if !keep {
                     unsafe {
                         ASurfaceControl_release(s.handle.as_ptr());
@@ -601,10 +780,11 @@ mod native {
             }
         }
     }
-    impl Drop for SurfaceCompositor {
-        fn drop(&mut self) {
-            // AND-APP-10: pools outlive windows. Only the detach present makes
-            // every image still held here safe for the pool to write again.
+    impl SurfaceCompositor {
+        fn detach_images(&mut self) -> Vec<AcquiredImage> {
+            if self.surfaces.is_empty() {
+                return vec![];
+            }
             let tx = unsafe { ASurfaceTransaction_create() };
             for surface in &self.surfaces {
                 unsafe {
@@ -615,36 +795,53 @@ mod native {
             let order = event.order;
             Self::apply(tx, event);
             let ready = self.inbox.ready.lock().unwrap();
-            let (mut ready, _) = self
+            let mut ready = self
                 .inbox
                 .wake
-                .wait_timeout_while(ready, Duration::from_secs(1), |ready| {
-                    !ready.iter().any(|e| e.order == order)
-                })
+                .wait_while(ready, |r| !r.iter().any(|e| e.order == order))
                 .unwrap();
-            if let Some(i) = ready.iter().position(|e| e.order == order) {
-                let event = ready.remove(i).unwrap();
-                for (_, _, acquired) in self.held.drain(..) {
-                    acquired.image.released(
-                        event.present.as_ref().map(|fd| {
-                            Fence::from_fd(fd.try_clone().expect("duplicate detach fence"))
-                        }),
-                    );
-                }
-            } else {
-                // No completion means no safe release fence. Keep the pool's
-                // outstanding leases rather than return buffers still read.
-                for (_, _, acquired) in self.held.drain(..) {
-                    std::mem::forget(acquired);
+            let i = ready.iter().position(|e| e.order == order).unwrap();
+            let event = ready.remove(i).unwrap();
+            drop(ready);
+            let mut current: Vec<(u64, AcquiredImage)> = vec![];
+            for (_, serial, mut acquired) in self.held.drain(..) {
+                let fence = event
+                    .present
+                    .as_ref()
+                    .map(|f| Fence::from_fd(f.try_clone().expect("detach fence")));
+                acquired
+                    .image
+                    .detached(fence)
+                    .expect("detach fence duplication");
+                if let Some(i) = current
+                    .iter()
+                    .position(|(_, old)| old.layer == acquired.layer)
+                {
+                    if serial > current[i].0 {
+                        current[i] = (serial, acquired);
+                    }
+                } else {
+                    current.push((serial, acquired));
                 }
             }
-            for surface in &self.surfaces {
+            for surface in self.surfaces.drain(..) {
                 unsafe {
                     ASurfaceControl_release(surface.handle.as_ptr());
                 }
             }
+            current.into_iter().map(|(_, image)| image).collect()
+        }
+    }
+    impl Drop for SurfaceCompositor {
+        fn drop(&mut self) {
+            drop(self.detach_images());
+            if let Some(thread) = self.signal_thread.take() {
+                self.inbox.owner.get().unwrap().stop();
+                thread.join().unwrap();
+            }
             unsafe {
                 ASurfaceControl_release(self.parent.as_ptr());
+                ndk_sys::ANativeWindow_release(self.window.as_ptr());
             }
         }
     }
@@ -678,6 +875,7 @@ mod tests {
             h: 32,
         };
         let mut layer = Layer {
+            source_uv: None,
             source: Source::Base,
             crop: rect,
             dst: rect,

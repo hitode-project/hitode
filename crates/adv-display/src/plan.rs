@@ -46,6 +46,8 @@ pub struct VideoGeometry {
     pub rect: Rect,
     /// True when the decoder wrote a new picture since the last present.
     pub changed: bool,
+    pub source_uv: Option<[f32; 4]>,
+    pub background: Option<(Rect, [u8; 4])>,
 }
 
 /// One published frame, as the planner sees it.
@@ -79,9 +81,37 @@ pub enum Rotation {
     ThreeQuarters,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Placement {
+    #[default]
+    Fit,
+    Integer,
+    Stretch,
+}
+impl Placement {
+    pub fn rectangle(self, client: (f64, f64), canvas: (u32, u32)) -> [f64; 4] {
+        let (cw, ch) = client;
+        if self == Self::Stretch {
+            return [0., 0., cw, ch];
+        }
+        let scale = (cw / f64::from(canvas.0)).min(ch / f64::from(canvas.1));
+        let scale = if self == Self::Integer && scale >= 1. {
+            scale.floor()
+        } else {
+            scale
+        };
+        let w = (f64::from(canvas.0) * scale).floor();
+        let h = (f64::from(canvas.1) * scale).floor();
+        [((cw - w) / 2.).floor(), ((ch - h) / 2.).floor(), w, h]
+    }
+}
+
 /// Window and preference state. Changes invalidate pools (whole damage).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Settings {
+    pub placement: Placement,
+    pub scale: f64,
+    pub rate: u32,
     /// The view in physical pixels, before rotation.
     pub view: (u32, u32),
     /// Panel orientation relative to the view.
@@ -93,6 +123,7 @@ pub struct Settings {
 /// What the system compositor can do for us.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CompositorCaps {
+    pub fractional_crops: bool,
     /// Layers can scale with linear filtering.
     pub scales: bool,
     /// Layers can also magnify with nearest filtering. Without it (Android's
@@ -145,7 +176,7 @@ pub struct PoolId(pub u8);
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PoolBuffer {
     pub age: Option<u32>,
-    /// Still owned by the compositor. A release fence must be ordered before reuse.
+    /// Leased by a compositor or a held frame. Order its release fence before reuse.
     pub in_use: bool,
 }
 
@@ -244,6 +275,7 @@ pub enum Stage {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Layer {
+    pub source_uv: Option<[f32; 4]>,
     pub source: Source,
     pub crop: Rect,
     pub dst: Rect,
@@ -261,6 +293,7 @@ pub enum HostLayer {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Layers {
+    pub solids: SmallVec<[(u64, Rect, [f32; 4]); 2]>,
     pub base: Layer,
     pub video: SmallVec<[(u64, Layer); 2]>,
     pub host: SmallVec<[HostLayer; 2]>,
@@ -304,6 +337,14 @@ pub const MODEL_RADII: [(Upscaler, u32); 4] = [
     (Upscaler::K7, 8),
 ];
 
+impl Plan {
+    fn attaches(&self, pool: PoolId) -> bool {
+        std::iter::once(&self.layers.base)
+            .chain(self.layers.video.iter().map(|(_, l)| l))
+            .any(|l| l.source == Source::Pool(pool))
+    }
+}
+
 impl PoolState {
     /// Commit all writes once, after the atomic present succeeds. Intermediate
     /// targets age too, but only images attached as layers await release.
@@ -314,31 +355,8 @@ impl PoolState {
             }
         }
         for target in &plan.targets {
-            let index = self.pools.iter().position(|p| p.id == target.pool);
-            let pool = if let Some(index) = index {
-                &mut self.pools[index]
-            } else {
-                self.pools.push(Pool {
-                    id: target.pool,
-                    size: target.size,
-                    buffers: vec![],
-                });
-                self.pools.last_mut().unwrap()
-            };
-            if pool.size != target.size {
-                pool.size = target.size;
-                for buffer in &mut pool.buffers {
-                    buffer.age = None;
-                }
-            }
-            pool.buffers.resize_with(
-                pool.buffers.len().max(target.buffer + 1),
-                PoolBuffer::default,
-            );
-            let attached = std::iter::once(&plan.layers.base)
-                .chain(plan.layers.video.iter().map(|(_, l)| l))
-                .any(|l| l.source == Source::Pool(target.pool));
-            pool.buffers[target.buffer] = PoolBuffer {
+            let attached = plan.attaches(target.pool);
+            *self.buffer(target) = PoolBuffer {
                 age: Some(1),
                 in_use: attached,
             };
@@ -348,6 +366,35 @@ impl PoolState {
             self.history.pop_front();
         }
         self.unrefined.clone_from(&plan.unrefined);
+    }
+
+    pub(crate) fn reserve(&mut self, plan: &Plan) {
+        for target in &plan.targets {
+            if plan.attaches(target.pool) {
+                self.buffer(target).in_use = true;
+            }
+        }
+    }
+    fn buffer(&mut self, target: &Target) -> &mut PoolBuffer {
+        let pool = if let Some(index) = self.pools.iter().position(|p| p.id == target.pool) {
+            &mut self.pools[index]
+        } else {
+            self.pools.push(Pool {
+                id: target.pool,
+                size: target.size,
+                buffers: vec![],
+            });
+            self.pools.last_mut().unwrap()
+        };
+        if pool.size != target.size {
+            pool.size = target.size;
+            pool.buffers.clear();
+        }
+        pool.buffers.resize_with(
+            pool.buffers.len().max(target.buffer + 1),
+            PoolBuffer::default,
+        );
+        &mut pool.buffers[target.buffer]
     }
 
     /// Call after ordering the returned release fence before future GPU work.
@@ -386,7 +433,7 @@ impl PoolState {
     }
 
     fn target(&self, id: PoolId, size: (u32, u32)) -> (Target, Option<u32>) {
-        let pool = self.pools.iter().find(|p| p.id == id);
+        let pool = self.pools.iter().find(|p| p.id == id && p.size == size);
         let buffer = pool
             .and_then(|p| {
                 p.buffers
@@ -450,7 +497,7 @@ impl Damage {
         }
     }
 
-    fn union(&self, other: &Self) -> Self {
+    pub(crate) fn union(&self, other: &Self) -> Self {
         match (self, other) {
             (Self::Whole, _) | (_, Self::Whole) => Self::Whole,
             (Self::None, d) | (d, Self::None) => d.clone(),
@@ -580,24 +627,13 @@ fn rotate(r: Rect, size: (u32, u32), rotation: Rotation) -> Rect {
         },
     }
 }
-fn viewport(canvas: (u32, u32), view: (u32, u32)) -> Rect {
-    let (w, h) =
-        if u64::from(view.0) * u64::from(canvas.1) <= u64::from(view.1) * u64::from(canvas.0) {
-            (
-                view.0,
-                (u64::from(view.0) * u64::from(canvas.1) / u64::from(canvas.0)) as u32,
-            )
-        } else {
-            (
-                (u64::from(view.1) * u64::from(canvas.0) / u64::from(canvas.1)) as u32,
-                view.1,
-            )
-        };
+fn viewport(canvas: (u32, u32), view: (u32, u32), placement: Placement) -> Rect {
+    let [x, y, w, h] = placement.rectangle((view.0 as f64, view.1 as f64), canvas);
     Rect {
-        x: (view.0 - w) / 2,
-        y: (view.1 - h) / 2,
-        w,
-        h,
+        x: x as u32,
+        y: y as u32,
+        w: w as u32,
+        h: h as u32,
     }
 }
 fn map(r: Rect, from: (u32, u32), to: (u32, u32)) -> Rect {
@@ -709,7 +745,7 @@ pub fn plan(
 ) -> Plan {
     let canvas = frame.canvas;
     let panel = swapped(settings.view, settings.rotation);
-    let viewport = viewport(canvas, panel);
+    let viewport = viewport(canvas, panel, settings.placement);
     let viewport_size = (viewport.w, viewport.h);
     let dst = rotate(viewport, panel, settings.rotation);
     let integer = viewport.w >= canvas.0
@@ -734,7 +770,18 @@ pub fn plan(
         SwapRole::Private
     };
     let separate_video = !upscale
+        && (caps.rotates || settings.rotation == Rotation::None)
         && caps.yuv_layers
+        && (caps.fractional_crops
+            || frame.video.iter().all(|v| {
+                v.source_uv.is_none_or(|uv| {
+                    uv.iter().enumerate().all(|(i, n)| {
+                        let value = *n * if i % 2 == 0 { v.source.0 } else { v.source.1 } as f32;
+                        value == value.round()
+                    })
+                })
+            }))
+        && (caps.solid_color_layers || frame.video.iter().all(|v| v.background.is_none()))
         && frame.video.iter().all(|v| {
             frame
                 .cursor_regions
@@ -756,7 +803,9 @@ pub fn plan(
         unrefined: vec![],
         swap_role,
         layers: Layers {
+            solids: SmallVec::new(),
             base: Layer {
+                source_uv: None,
                 source: Source::Base,
                 crop: whole(canvas),
                 dst,
@@ -771,12 +820,28 @@ pub fn plan(
     };
     if separate_video {
         for video in &frame.video {
+            if let Some((r, c)) = video.background {
+                let mut r = map(r, canvas, viewport_size);
+                r.x += viewport.x;
+                r.y += viewport.y;
+                result.layers.solids.push((
+                    video.id,
+                    rotate(r, panel, settings.rotation),
+                    [
+                        c[2] as f32 / 255.,
+                        c[1] as f32 / 255.,
+                        c[0] as f32 / 255.,
+                        1.,
+                    ],
+                ));
+            }
             let mut video_dst = map(video.rect, canvas, viewport_size);
             video_dst.x += viewport.x;
             video_dst.y += viewport.y;
             result.layers.video.push((
                 video.id,
                 Layer {
+                    source_uv: video.source_uv,
                     source: Source::Video(video.id),
                     crop: whole(video.source),
                     dst: rotate(video_dst, panel, settings.rotation),
@@ -935,6 +1000,7 @@ pub fn plan(
             .flatten()
             .collect::<Vec<_>>();
         result.layers.base = Layer {
+            source_uv: None,
             source: Source::Pool(OUTPUT),
             crop: whole(target.size),
             dst,

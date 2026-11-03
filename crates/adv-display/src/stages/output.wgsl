@@ -1,5 +1,5 @@
 // Output coordinates and tiles are in the target, including pre-rotation.
-struct Output { extent: vec2<f32>, source: vec2<f32>, dst: vec4<f32>, prescale: vec2<f32>, rotation: u32, linear: u32 }
+struct Output { extent: vec2<f32>, source: vec2<f32>, dst: vec4<f32>, prescale: vec2<f32>, rotation: u32, linear: u32, source_rotation: u32 }
 @group(0) @binding(0) var<uniform> output: Output;
 @group(3) @binding(2) var<storage, read> tiles: array<vec4<u32>>;
 @group(1) @binding(0) var image: texture_2d<f32>;
@@ -19,7 +19,14 @@ fn source_position(position: vec2<f32>) -> vec2<f32> {
     }
 }
 fn texel(p: vec2<f32>) -> vec4<f32> {
-    return textureLoad(image, vec2<i32>(clamp(p, vec2(0.0), output.source-1.0)), 0);
+    var uv = (clamp(p,vec2(0.0),output.source-1.0)+0.5)/output.source;
+    switch output.source_rotation {
+        case 1u: { uv=vec2(1.0-uv.y,uv.x); }
+        case 2u: { uv=1.0-uv; }
+        case 3u: { uv=vec2(uv.y,1.0-uv.x); }
+        default: {}
+    }
+    return textureLoad(image,vec2<i32>(min(floor(uv*vec2<f32>(textureDimensions(image))),vec2<f32>(textureDimensions(image))-1.0)),0);
 }
 fn soft_texel(p: vec2<f32>) -> vec4<f32> {
     let xy = vec2<u32>(clamp(p, vec2(0.0), output.source-1.0));

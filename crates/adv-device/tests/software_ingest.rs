@@ -37,6 +37,41 @@ fn surface(format: PixelFormat, width: u32, height: u32, pad: u32) -> Surface {
         palette: None,
     }
 }
+fn encode_ingest(
+    encoder: &mut adv_gpu::Encoder,
+    pipeline: &adv_gpu::RenderPipeline,
+    ring: &mut adv_gpu::Ring,
+    source: &Source<'_>,
+    target: &adv_gpu::Image,
+    tiles: &adv_display::plan::Tiles,
+) {
+    use adv_gpu::encode::{ColorAttachment, Load, RenderPassDesc, Store};
+    let span = {
+        let mut pass = encoder.render_pass(&RenderPassDesc {
+            colors: [ColorAttachment {
+                view: target.view(),
+                load: Load::Load,
+                store: Store::Store,
+                resolve: None,
+            }]
+            .into_iter()
+            .collect(),
+            depth_stencil: None,
+            area: adv_gpu::Rect {
+                x: 0,
+                y: 0,
+                w: source.extent.0,
+                h: source.extent.1,
+            },
+            timestamps: None,
+            label: "ingest",
+        });
+        adv_display::stages::ingest::encode(&mut pass, pipeline, ring, source, tiles).unwrap()
+    };
+    if let Some(span) = span {
+        encoder.retain(span);
+    }
+}
 // spec: DEV-FRAME-5
 #[test]
 fn ingest_decodes_every_format_and_palette_bit_for_bit() {
@@ -179,15 +214,14 @@ fn ingest_decodes_every_format_and_palette_bit_for_bit() {
                     }],
                 };
                 let mut encoder = queue.encoder("whole ingest");
-                adv_display::stages::ingest::encode(
+                encode_ingest(
                     &mut encoder,
                     &pipeline,
                     &mut ring,
                     &software,
-                    target.view(),
+                    target,
                     &whole,
-                )
-                .unwrap();
+                );
                 let token = queue.submit(encoder).unwrap();
                 assert!(queue.wait(token, TIMEOUT).unwrap());
                 // Change every source byte, then decode only two disjoint tiles.
@@ -233,15 +267,14 @@ fn ingest_decodes_every_format_and_palette_bit_for_bit() {
                         .collect(),
                 };
                 let mut encoder = queue.encoder("partial ingest");
-                adv_display::stages::ingest::encode(
+                encode_ingest(
                     &mut encoder,
                     &pipeline,
                     &mut ring,
                     &software,
-                    target.view(),
+                    target,
                     &tiles,
-                )
-                .unwrap();
+                );
                 encoder.copy_image_to_buffer(
                     ImageCopy {
                         image: target,

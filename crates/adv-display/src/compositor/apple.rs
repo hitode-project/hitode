@@ -9,7 +9,7 @@ use crate::Rect;
 use crate::plan::Layer;
 use adv_gpu::present::Export;
 use adv_gpu::queue::MainNotifier;
-use dispatch2::{DispatchQueue, MainThreadBound};
+use dispatch2::MainThreadBound;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObjectProtocol};
 use objc2::{MainThreadMarker, msg_send, sel};
@@ -22,7 +22,6 @@ use objc2_quartz_core::{
 use std::cell::RefCell;
 use std::mem::ManuallyDrop;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 pub struct LayerCompositor {
     caps: CompositorCaps,
@@ -44,15 +43,20 @@ pub struct LayerCompositor {
 struct Shared {
     committed: u64,
     presented: Vec<Presented>,
+    wake: Option<Wake>,
+    scale: f64,
 }
 
 /// Layer state, touched only on the main thread.
 struct Tree {
     root: Retained<CALayer>,
+    placements: Vec<Placement>,
+    background: Option<[f32; 3]>,
     scale: f64,
     layers: Vec<(LayerId, Retained<CALayer>)>,
 }
 
+#[derive(PartialEq)]
 struct Placement {
     id: LayerId,
     /// Normalized source rectangle.
@@ -60,6 +64,8 @@ struct Placement {
     /// Destination in pixels, top left origin.
     dst: Rect,
     nearest: bool,
+    color: Option<[f32; 4]>,
+    z: f64,
 }
 
 struct Commit {
@@ -91,25 +97,69 @@ impl LayerCompositor {
             tree: ManuallyDrop::new(Arc::new(MainThreadBound::new(
                 RefCell::new(Tree {
                     root,
+                    placements: vec![],
+                    background: None,
                     scale,
                     layers: vec![],
                 }),
                 mtm,
             ))),
-            shared: Arc::default(),
+            shared: Arc::new(Mutex::new(Shared {
+                scale,
+                ..Default::default()
+            })),
             showing: vec![],
             retired: vec![],
             last: Token(0),
         }
     }
-
-    /// The backing scale changed (the window moved between displays).
-    pub fn set_scale(&self, scale: f64, mtm: MainThreadMarker) {
-        self.tree.get(mtm).borrow_mut().scale = scale;
-    }
 }
 
 impl Compositor for LayerCompositor {
+    fn image(&self, layer: LayerId) -> Option<&AcquiredImage> {
+        self.showing
+            .iter()
+            .find(|(_, i)| i.layer == layer)
+            .map(|(_, i)| i)
+    }
+    fn set_waker(&mut self, wake: Wake) {
+        self.shared.lock().unwrap().wake = Some(wake);
+    }
+    fn set_scale(&mut self, scale: f64) {
+        self.shared.lock().unwrap().scale = scale;
+        let (tree, shared) = (Arc::clone(&self.tree), self.shared.clone());
+        self.notifier.on_complete(
+            self.last,
+            Box::new(move || {
+                let mtm = MainThreadMarker::new().unwrap();
+                let scale = shared.lock().unwrap().scale;
+                CATransaction::begin();
+                CATransaction::setDisableActions(true);
+                let mut tree = tree.get(mtm).borrow_mut();
+                if tree.scale != scale {
+                    tree.place(scale);
+                }
+                CATransaction::commit();
+            }),
+        );
+    }
+    fn detach(mut self: Box<Self>) -> Vec<AcquiredImage> {
+        let (send, done) = std::sync::mpsc::sync_channel(1);
+        let tree = Arc::clone(&self.tree);
+        self.notifier.on_complete(
+            self.last,
+            Box::new(move || {
+                let mtm = MainThreadMarker::new().expect("detach runs through the main notifier");
+                tree.get(mtm).borrow_mut().clear(Box::new(move || {
+                    send.send(()).unwrap();
+                }));
+            }),
+        );
+        done.recv().unwrap();
+        self.retired.clear();
+        self.showing.drain(..).map(|(_, i)| i).collect()
+    }
+
     fn caps(&self) -> CompositorCaps {
         self.caps.clone()
     }
@@ -156,26 +206,43 @@ impl Compositor for LayerCompositor {
                 .map(|(_, image)| image.image.image().desc().size)
         };
         let mut placements = Vec::new();
-        let mut place = |id: LayerId, layer: &Layer| {
+        let mut place = |id: LayerId, layer: &Layer, z: f64| {
             if let Some(size) = size(id) {
                 let (w, h) = (f64::from(size.width), f64::from(size.height));
                 let c = layer.crop;
                 placements.push(Placement {
                     id,
-                    crop: rect(
-                        f64::from(c.x) / w,
-                        f64::from(c.y) / h,
-                        f64::from(c.w) / w,
-                        f64::from(c.h) / h,
-                    ),
+                    crop: if let Some([x, y, w, h]) = layer.source_uv {
+                        rect(x as f64, y as f64, w as f64, h as f64)
+                    } else {
+                        rect(
+                            c.x as f64 / w,
+                            c.y as f64 / h,
+                            c.w as f64 / w,
+                            c.h as f64 / h,
+                        )
+                    },
                     dst: layer.dst,
                     nearest: layer.nearest,
+                    color: None,
+                    z,
                 });
             }
         };
-        place(LayerId::Base, &layers.base);
-        for (id, layer) in &layers.video {
-            place(LayerId::Video(*id), layer);
+        place(LayerId::Base, &layers.base, 0.);
+        for (i, (id, layer)) in layers.video.iter().enumerate() {
+            place(LayerId::Video(*id), layer, (i * 2 + 2) as f64);
+        }
+        for (id, dst, color) in &layers.solids {
+            let z = layers.video.iter().position(|(v, _)| v == id).unwrap() * 2 + 1;
+            placements.push(Placement {
+                id: LayerId::VideoBackground(*id),
+                crop: rect(0., 0., 1., 1.),
+                dst: *dst,
+                nearest: false,
+                color: Some(*color),
+                z: z as f64,
+            });
         }
         let commit = Commit {
             background: layers.background,
@@ -187,15 +254,26 @@ impl Compositor for LayerCompositor {
             self.last,
             Box::new(move || {
                 let mtm = MainThreadMarker::new().expect("main notifier off the main thread");
-                tree.get(mtm).borrow_mut().apply(commit, mtm);
-                let mut shared = shared.lock().unwrap();
-                shared.committed = serial;
-                // Core Animation reports no latch; the commit time stands in.
-                shared.presented.push(Presented {
-                    serial,
-                    latched: Some(Instant::now()),
-                    shown: None,
-                });
+                let scale = shared.lock().unwrap().scale;
+                tree.get(mtm).borrow_mut().apply(
+                    commit,
+                    scale,
+                    mtm,
+                    Box::new(move || {
+                        let mut shared = shared.lock().unwrap();
+                        shared.committed = serial;
+                        shared.presented.push(Presented {
+                            serial,
+                            latched: Some(Instant::now()),
+                            shown: None,
+                        });
+                        let wake = shared.wake.clone();
+                        drop(shared);
+                        if let Some(wake) = wake {
+                            wake();
+                        }
+                    }),
+                );
             }),
         );
         Ok(())
@@ -207,9 +285,7 @@ impl Compositor for LayerCompositor {
             presented.append(&mut shared.presented);
             shared.committed
         };
-        let done = self.retired.extract_if(.., |(_, by, image)| {
-            *by <= committed && !surface(image).is_in_use()
-        });
+        let done = self.retired.extract_if(.., |(_, by, _)| *by <= committed);
         released.extend(done.map(|(serial, _, image)| ReleasedImage {
             serial,
             layer: image.layer,
@@ -233,30 +309,12 @@ impl Drop for LayerCompositor {
             self.last,
             Box::new(move || {
                 let mtm = MainThreadMarker::new().expect("main notifier off the main thread");
-                tree.get(mtm).borrow_mut().clear();
-                retire(images, 60);
-                drop(tree);
+                tree.get(mtm)
+                    .borrow_mut()
+                    .clear(Box::new(move || drop(images)));
             }),
         );
     }
-}
-
-/// Drops images that Core Animation no longer uses; polls the rest once per
-/// display frame for about a second, then lets them go.
-fn retire(mut images: Vec<AcquiredImage>, tries: u32) {
-    images.retain(|image| tries > 0 && surface(image).is_in_use());
-    if !images.is_empty() {
-        let when = Duration::from_millis(16).try_into().unwrap();
-        let _ = DispatchQueue::main().after(when, move || retire(images, tries - 1));
-    }
-}
-
-fn surface(image: &AcquiredImage) -> &IOSurfaceRef {
-    let Export::IoSurface(surface, _) = image.image.export() else {
-        unreachable!("Apple presentable buffers are IOSurfaces")
-    };
-    // SAFETY: the image keeps its IOSurface alive.
-    unsafe { surface.cast::<IOSurfaceRef>().as_ref() }
 }
 
 fn rect(x: f64, y: f64, w: f64, h: f64) -> CGRect {
@@ -264,45 +322,54 @@ fn rect(x: f64, y: f64, w: f64, h: f64) -> CGRect {
 }
 
 impl Tree {
-    fn apply(&mut self, commit: Commit, mtm: MainThreadMarker) {
+    fn apply(
+        &mut self,
+        commit: Commit,
+        scale: f64,
+        mtm: MainThreadMarker,
+        done: Box<dyn FnOnce() + Send>,
+    ) {
         CATransaction::begin();
         CATransaction::setDisableActions(true);
-        let [r, g, b] = commit.background.map(f64::from);
-        self.root
-            .setBackgroundColor(Some(&CGColor::new_srgb(r, g, b, 1.0)));
-        let height = self.root.bounds().size.height;
-        let scale = self.scale;
-        // Videos that left the frame go; an absent base hides.
-        self.layers.retain(|(id, layer)| {
-            let placed = commit.placements.iter().any(|p| p.id == *id);
-            layer.setHidden(!placed);
-            if !placed && matches!(id, LayerId::Video(_)) {
-                layer.removeFromSuperlayer();
-                return false;
+        if self.background != Some(commit.background) {
+            let [r, g, b] = commit.background.map(f64::from);
+            self.root
+                .setBackgroundColor(Some(&CGColor::new_srgb(r, g, b, 1.)));
+            self.background = Some(commit.background);
+        }
+        if self.placements != commit.placements {
+            // Videos that left the frame go; an absent base hides.
+            self.layers.retain(|(id, layer)| {
+                let placed = commit.placements.iter().any(|p| p.id == *id);
+                layer.setHidden(!placed);
+                if !placed && matches!(id, LayerId::Video(_) | LayerId::VideoBackground(_)) {
+                    layer.removeFromSuperlayer();
+                    return false;
+                }
+                true
+            });
+            for placement in &commit.placements {
+                let layer = self.layer(placement.id, mtm);
+                layer.setContentsRect(placement.crop);
+                layer.setZPosition(placement.z);
+                if let Some([r, g, b, a]) = placement.color {
+                    layer.setBackgroundColor(Some(&CGColor::new_srgb(
+                        r as f64, g as f64, b as f64, a as f64,
+                    )));
+                }
+
+                unsafe {
+                    layer.setMagnificationFilter(if placement.nearest {
+                        kCAFilterNearest
+                    } else {
+                        kCAFilterLinear
+                    });
+                }
             }
-            true
-        });
-        for placement in &commit.placements {
-            let layer = self.layer(placement.id, mtm);
-            let d = placement.dst;
-            let (w, h) = (f64::from(d.w) / scale, f64::from(d.h) / scale);
-            let x = f64::from(d.x) / scale;
-            let y = f64::from(d.y) / scale;
-            // macOS layers put the origin at the bottom left.
-            let y = if cfg!(target_os = "macos") {
-                height - y - h
-            } else {
-                y
-            };
-            layer.setFrame(rect(x, y, w, h));
-            layer.setContentsRect(placement.crop);
-            unsafe {
-                layer.setMagnificationFilter(if placement.nearest {
-                    kCAFilterNearest
-                } else {
-                    kCAFilterLinear
-                });
-            }
+            self.placements = commit.placements;
+            self.place(scale);
+        } else if self.scale != scale {
+            self.place(scale);
         }
         for (id, surface) in commit.contents {
             let layer = self.layer(id, mtm);
@@ -313,7 +380,24 @@ impl Tree {
                 ))
             };
         }
+        completion(done);
         CATransaction::commit();
+    }
+    fn place(&mut self, scale: f64) {
+        self.scale = scale;
+        let height = self.root.bounds().size.height;
+        for p in &self.placements {
+            let layer = &self.layers.iter().find(|(id, _)| *id == p.id).unwrap().1;
+            let d = p.dst;
+            let (w, h) = (f64::from(d.w) / scale, f64::from(d.h) / scale);
+            let (x, y) = (f64::from(d.x) / scale, f64::from(d.y) / scale);
+            let y = if cfg!(target_os = "macos") {
+                height - y - h
+            } else {
+                y
+            };
+            layer.setFrame(rect(x, y, w, h));
+        }
     }
 
     /// The layer for `id`, created on first use above lower layer kinds.
@@ -331,7 +415,7 @@ impl Tree {
                 }
                 layer.setZPosition(match id {
                     LayerId::Base => 0.0,
-                    LayerId::Video(_) => 1.0,
+                    LayerId::Video(_) | LayerId::VideoBackground(_) => 1.0,
                     LayerId::Host(_) => 2.0,
                 });
                 self.root.addSublayer(&layer);
@@ -342,12 +426,27 @@ impl Tree {
         &self.layers[index].1
     }
 
-    fn clear(&mut self) {
+    fn clear(&mut self, done: Box<dyn FnOnce() + Send>) {
         CATransaction::begin();
         CATransaction::setDisableActions(true);
         for (_, layer) in self.layers.drain(..) {
             layer.removeFromSuperlayer();
         }
+        self.placements.clear();
+        completion(done);
         CATransaction::commit();
+    }
+}
+
+// CATransaction copies the block; the images remain leased until that commit completes.
+fn completion(done: Box<dyn FnOnce() + Send>) {
+    let done = Mutex::new(Some(done));
+    let block = block2::RcBlock::new(move || {
+        if let Some(done) = done.lock().unwrap().take() {
+            done();
+        }
+    });
+    unsafe {
+        CATransaction::setCompletionBlock(Some(&block));
     }
 }

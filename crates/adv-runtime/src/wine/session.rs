@@ -1321,6 +1321,33 @@ impl Session {
     /// Take the latest presented frame into [`Session::frame`], reading a
     /// native one back from the GPU.
     pub fn capture(&mut self) -> Result<(), String> {
+        #[cfg(feature = "native-display")]
+        {
+            if self.presented_frames() == 0 {
+                return Ok(());
+            }
+            let receiver = self.machine.ext.get::<adv_device::frame::Waker>().capture();
+            let frame = receiver
+                .recv_timeout(Duration::from_secs(10))
+                .map_err(|e| format!("capture: {e}"))??;
+            let surfaces = self.machine.ext.get_mut::<SurfaceStore>();
+            adv_device::surface::Presenter::present(
+                &mut surfaces.presenter,
+                adv_device::surface::FrameView {
+                    width: frame.width,
+                    height: frame.height,
+                    pitch: frame.width * 4,
+                    bgra: &frame.bgra,
+                    serial: frame.serial,
+                },
+            )?;
+            Ok(())
+        }
+        #[cfg(not(feature = "native-display"))]
+        self.capture_surface()
+    }
+    #[cfg(not(feature = "native-display"))]
+    fn capture_surface(&mut self) -> Result<(), String> {
         #[cfg(all(feature = "gpu", not(feature = "native-display")))]
         if let Some(composition) = self
             .machine

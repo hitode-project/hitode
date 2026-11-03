@@ -605,7 +605,9 @@ pub(super) mod tests {
         consumer: &stream::Consumer,
     ) {
         gpu.stream.push(stream::Command::Submit);
-        let mut chunk = consumer.next().unwrap();
+        let crate::gpu::native::stream::Next::Chunk(mut chunk) = consumer.next() else {
+            panic!("upload chunk");
+        };
         let mut encoder = queue.encoder("native upload test");
         for command in &chunk.commands {
             if let stream::Command::Upload {

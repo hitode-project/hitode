@@ -243,6 +243,16 @@ pub trait Presenter: Send {
     /// Changes with settings or rotation, never per frame.
     fn presentable(&self, width: u32, height: u32) -> bool;
     fn present(&mut self, queue: &mut adv_gpu::Queue, frame: Frame);
-    /// Return the images the compositor released to their pools; nonblocking.
-    fn drain(&mut self);
+    /// Service notifications on the owner. `Some(wake)` also services UI work:
+    /// the guest encoder is closed, so the hook may encode settings and captures.
+    fn service(&mut self, queue: &mut adv_gpu::Queue, wake: Option<&Waker>);
 }
+
+pub use crate::gpu::native::stream::Waker;
+pub struct Captured {
+    pub serial: u64,
+    pub width: u32,
+    pub height: u32,
+    pub bgra: Vec<u8>,
+}
+pub type CaptureReply = std::sync::mpsc::Sender<Result<Captured, String>>;

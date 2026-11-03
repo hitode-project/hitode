@@ -5,8 +5,8 @@
 //! scales the layer, so no display-resolution pass runs (HOST-VIEW-9).
 use super::GameView;
 pub use crate::mobile::TouchAction;
+pub(crate) use crate::mobile::key_message as message;
 use crate::mobile::{Insets, Layout, Occlusion, Rect};
-pub(crate) use crate::mobile::{key_message as message, position};
 use crate::overlay::{Router, Target};
 use objc2::Message;
 use objc2::rc::{Allocated, Retained};
@@ -14,7 +14,9 @@ use objc2::runtime::{AnyObject, NSObject};
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, class, define_class, msg_send, sel};
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_foundation::{NSObjectProtocol, NSSet, NSString};
-use objc2_quartz_core::{CAMetalLayer, CATransaction};
+#[cfg(not(feature = "native-display"))]
+use objc2_quartz_core::CAMetalLayer;
+use objc2_quartz_core::{CALayer, CATransaction};
 use objc2_ui_kit::UIViewAutoresizing;
 use objc2_ui_kit::{
     UIColor, UIEvent, UIPress, UIPressesEvent, UIResponder, UITouch, UITouchPhase, UIView,
@@ -25,7 +27,7 @@ use std::sync::{Arc, Mutex};
 
 pub struct Ivars {
     game: Weak<GameView>,
-    frame: Retained<CAMetalLayer>,
+    frame: Retained<CALayer>,
     /// The frame's last placement in pixels, kept across layouts.
     placement: Cell<Option<crate::native_gpu::Placement>>,
     /// Live touches by object address, with the pointer ids the mobile
@@ -98,7 +100,10 @@ define_class!(
 impl HostView {
     pub(crate) fn new(game: Weak<GameView>) -> Result<Retained<Self>, String> {
         let mtm = MainThreadMarker::new().ok_or("the game view must run on the main thread")?;
-        let frame = CAMetalLayer::new();
+        #[cfg(not(feature = "native-display"))]
+        let frame = CAMetalLayer::new().into_super();
+        #[cfg(feature = "native-display")]
+        let frame = CALayer::new();
         let cursor = cursor_view();
         let this = Self::alloc(mtm).set_ivars(Ivars {
             game,
@@ -114,10 +119,12 @@ impl HostView {
         this.setOpaque(true);
         this.setBackgroundColor(Some(&UIColor::blackColor()));
         this.layer().addSublayer(&frame);
-        #[cfg(feature = "native-display")]
-        cursor.layer().setZPosition(2.0);
         this.addSubview(&cursor);
         Ok(this)
+    }
+    #[cfg(feature = "native-display")]
+    pub(crate) fn display_layer(&self) -> Retained<CALayer> {
+        self.ivars().frame.clone()
     }
     /// The frame sublayer the presenter draws into.
     #[cfg(not(feature = "native-display"))]

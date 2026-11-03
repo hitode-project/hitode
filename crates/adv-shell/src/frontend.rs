@@ -3,7 +3,9 @@
 use crate::{performance, window};
 #[cfg(not(feature = "native-display"))]
 use adv_runtime::FrameConsumer;
-use adv_runtime::{DialogSet, FrameProducer, MenuBar, MenuKey};
+#[cfg(not(feature = "native-display"))]
+use adv_runtime::FrameProducer;
+use adv_runtime::{DialogSet, MenuBar, MenuKey};
 use adv_sync::{WakeEvent, input::KeyState, spsc};
 use std::sync::{
     Arc,
@@ -45,6 +47,7 @@ pub struct Worker {
     pub(crate) vsync: Option<Arc<adv_sync::vsync::Vsync>>,
     incoming: spsc::Consumer<Delivery>,
     requests: spsc::Producer<Request>,
+    #[cfg(not(feature = "native-display"))]
     frames: Option<FrameProducer>,
     menus: adv_sync::mailbox::Producer<MenuBar>,
     menu_key: Option<MenuKey>,
@@ -94,6 +97,7 @@ pub fn channel(wake: WakeEvent, keys: Arc<KeyState>) -> Result<(Worker, Ui), Str
     let ui_wake = WakeEvent::new().map_err(|e| e.to_string())?;
     let (events, incoming) = spsc::channel(INPUT_CAPACITY);
     let (requests_tx, requests_rx) = spsc::channel(32);
+    #[cfg(not(feature = "native-display"))]
     let (frames_tx, _frames_rx) = adv_runtime::frame_mailbox();
     let (menus_tx, menus_rx) =
         adv_sync::mailbox::channel(std::array::from_fn(|_| MenuBar::default()));
@@ -117,6 +121,7 @@ pub fn channel(wake: WakeEvent, keys: Arc<KeyState>) -> Result<(Worker, Ui), Str
             vsync: None,
             incoming,
             requests: requests_tx,
+            #[cfg(not(feature = "native-display"))]
             frames: Some(frames_tx),
             menus: menus_tx,
             menu_key: None,
@@ -178,6 +183,7 @@ impl Worker {
         self.menus.publish(move |slot| *slot = menu);
         self.ui_wake.signal();
     }
+    #[cfg(not(feature = "native-display"))]
     pub fn take_frames(&mut self) -> FrameProducer {
         self.frames.take().expect("frame producer installed once")
     }
@@ -492,21 +498,22 @@ impl Ui {
         if self.native.is_some() {
             let dimensions = window.native_client_size()?;
             #[cfg(target_vendor = "apple")]
-            self.native
-                .as_ref()
-                .unwrap()
-                .set_scale(window.native_scale());
-            self.native
-                .as_mut()
-                .unwrap()
-                .update(dimensions, self.cadence.rate());
-            while let Some(completed) = self.native.as_mut().unwrap().poll()? {
+            let scale = window.native_scale();
+            #[cfg(target_os = "android")]
+            let scale = 1.;
+            while let Some(feedback) = self.native.as_mut().unwrap().poll()? {
+                let completed = match feedback {
+                    crate::display::Feedback::Statistics(stats) => {
+                        self.metric(Delivery::Native(stats));
+                        continue;
+                    }
+                    crate::display::Feedback::Presented(completed) => completed,
+                };
                 self.cadence
                     .published(completed.serial, completed.published_at);
                 window.frame_rate(self.cadence.rate());
                 self.metric(Delivery::Native(completed.stats));
                 window.native_canvas(completed.canvas)?;
-                #[cfg(any(target_os = "macos", target_os = "ios"))]
                 window.place(Some(completed.placement));
                 window.set_video_cursor_regions(completed.cursor_regions);
                 let now = Instant::now();
@@ -525,9 +532,10 @@ impl Ui {
                     completed.at,
                 ));
             }
-            if let Some(stats) = self.native.as_ref().unwrap().statistics() {
-                self.metric(Delivery::Native(stats));
-            }
+            self.native
+                .as_mut()
+                .unwrap()
+                .update(dimensions, self.cadence.rate(), scale);
             self.repaint = false;
         }
         self.deadline(window)

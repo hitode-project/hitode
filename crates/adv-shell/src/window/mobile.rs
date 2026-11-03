@@ -55,6 +55,8 @@ pub struct GameView {
     pub(crate) vsync: Arc<adv_sync::vsync::Vsync>,
     client: Cell<(u32, u32)>,
     canvas: Cell<(u32, u32)>,
+    #[cfg(feature = "native-display")]
+    placement: Cell<Option<crate::display::Placement>>,
     pub(crate) scaling: Cell<crate::Scaling>,
     events: RefCell<Vec<Event>>,
     wake: RefCell<Option<WakeEvent>>,
@@ -106,6 +108,8 @@ impl GameView {
             vsync: Arc::default(),
             client: Cell::new((width, height)),
             canvas: Cell::new((width.max(1), height.max(1))),
+            #[cfg(feature = "native-display")]
+            placement: Cell::new(None),
             scaling: Cell::new(crate::Scaling::Fit),
             events: RefCell::new(Vec::new()),
             wake: RefCell::new(None),
@@ -151,14 +155,23 @@ impl GameView {
                 objc2::rc::Retained::as_ptr(host).cast_mut().cast()
             })
     }
-    #[cfg(target_os = "ios")]
+    #[cfg(any(target_os = "ios", feature = "native-display"))]
     pub(crate) fn place(&self, placement: Option<crate::native_gpu::Placement>) {
+        #[cfg(feature = "native-display")]
+        self.placement.set(placement);
+        #[cfg(target_os = "android")]
+        self.report_layout();
+        #[cfg(target_os = "ios")]
         if let Some(host) = self.host.borrow().as_ref() {
             host.place(placement);
         }
     }
     /// The presented frame's rectangle in view pixels.
     pub(crate) fn frame_rectangle(&self) -> [f64; 4] {
+        #[cfg(feature = "native-display")]
+        if let Some(p) = self.placement.get() {
+            return p.rectangle.map(f64::from);
+        }
         let (width, height) = self.client.get();
         self.scaling
             .get()
@@ -352,11 +365,12 @@ impl GameView {
         }
     }
     fn gesture(&self, gesture: Gesture) {
-        let (client, canvas, scaling) = (self.client.get(), self.canvas.get(), self.scaling.get());
+        let canvas = self.canvas.get();
+        let rectangle = self.frame_rectangle();
         match gesture {
             Gesture::Keyboard => return self.notify(ViewEvent::Keyboard),
             Gesture::Move(dx, dy) if self.mode.get() == TouchMode::Trackpad => {
-                let (sx, sy) = crate::mobile::magnification(client, canvas, scaling);
+                let (sx, sy) = crate::mobile::touch::magnification_in(rectangle, canvas);
                 let (x, y) = self.cursor.get();
                 let limit = |v: f32, size: u32| v.clamp(0.0, size.saturating_sub(1) as f32);
                 self.cursor.set((
@@ -366,7 +380,7 @@ impl GameView {
                 self.show_cursor();
             }
             Gesture::Point(x, y) => {
-                let at = crate::mobile::position(client, canvas, scaling, x, y);
+                let at = crate::mobile::touch::position_in(rectangle, canvas, x, y);
                 self.cursor.set(((at & 0xffff) as f32, (at >> 16) as f32));
             }
             _ => {}
@@ -391,13 +405,7 @@ impl GameView {
     fn show_cursor(&self) {
         let point = (self.mode.get() == TouchMode::Trackpad).then(|| {
             let (x, y) = self.cursor.get();
-            crate::mobile::client_point(
-                self.client.get(),
-                self.canvas.get(),
-                self.scaling.get(),
-                x,
-                y,
-            )
+            crate::mobile::touch::client_point_in(self.frame_rectangle(), self.canvas.get(), x, y)
         });
         #[cfg(target_os = "ios")]
         if let Some(host) = self.host.borrow().as_ref() {
@@ -504,10 +512,9 @@ impl GameView {
     }
     pub(crate) fn post_input(&self, message: u32, wparam: u32, lparam: u32) -> Result<(), String> {
         let lparam = if (0x200..=0x20a).contains(&message) {
-            input::position(
-                self.client.get(),
+            crate::mobile::touch::position_in(
+                self.frame_rectangle(),
                 self.canvas.get(),
-                self.scaling.get(),
                 lparam as u16 as i16 as f32,
                 (lparam >> 16) as u16 as i16 as f32,
             )
@@ -566,22 +573,14 @@ impl GameView {
         #[cfg(target_os = "android")]
         {
             let caps = crate::display::platform_caps(Some(&device));
-            let rate = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(60));
             let compositor = unsafe {
-                crate::display::AndroidCompositor::new(
+                adv_display::compositor::android::SurfaceCompositor::new(
                     self.window.get().ok_or("the Android view has no surface")?,
                     caps,
-                    rate.clone(),
-                )?
-            };
-            crate::display::channel(
-                device,
-                queue,
-                Box::new(compositor),
-                self.client.get(),
-                wake,
-                rate,
-            )
+                )
+            }
+            .map_err(|e| format!("SurfaceControl: {e:?}"))?;
+            crate::display::channel(device, queue, Box::new(compositor), self.client.get(), wake)
         }
         #[cfg(target_os = "ios")]
         {
@@ -590,7 +589,7 @@ impl GameView {
             crate::display::apple_channel(
                 device,
                 queue,
-                host.layer(),
+                host.display_layer(),
                 host.contentScaleFactor(),
                 self.client.get(),
                 wake,

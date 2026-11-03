@@ -16,6 +16,9 @@ fn frame() -> FrameInfo {
 }
 fn settings() -> Settings {
     Settings {
+        placement: crate::plan::Placement::Fit,
+        scale: 1.,
+        rate: 60,
         view: (640, 480),
         rotation: Rotation::None,
         upscaler: Upscaler::Off,
@@ -24,6 +27,7 @@ fn settings() -> Settings {
 }
 fn caps() -> CompositorCaps {
     CompositorCaps {
+        fractional_crops: !cfg!(target_os = "android"),
         scales: true,
         nearest: true,
         rotates: true,
@@ -182,6 +186,7 @@ fn rotations_and_compositor_limits() {
         &frame(),
         &s,
         &CompositorCaps {
+            fractional_crops: !cfg!(target_os = "android"),
             scales: false,
             ..caps()
         },
@@ -202,6 +207,7 @@ fn rotations_and_compositor_limits() {
             ..settings()
         },
         &CompositorCaps {
+            fractional_crops: !cfg!(target_os = "android"),
             scales: false,
             ..caps()
         },
@@ -214,6 +220,7 @@ fn rotations_and_compositor_limits() {
 #[test]
 fn linear_only_compositors_scale_integers_in_the_output_pass() {
     let linear = CompositorCaps {
+        fractional_crops: !cfg!(target_os = "android"),
         nearest: false,
         ..caps()
     };
@@ -307,6 +314,8 @@ fn video_layers_or_canvas_composition() {
         let mut f = frame();
         f.damage = Damage::None;
         f.video.push(VideoGeometry {
+            source_uv: None,
+            background: None,
             id: 7,
             source: (160, 120),
             rect: rect(10, 20, 100, 80),
@@ -360,6 +369,8 @@ fn video_layers_or_canvas_composition() {
     let mut f = frame();
     f.base = BaseKind::Software { indexed: true };
     f.video.push(VideoGeometry {
+        source_uv: None,
+        background: None,
         id: 1,
         source: (10, 10),
         rect: rect(0, 0, 10, 10),
@@ -369,6 +380,7 @@ fn video_layers_or_canvas_composition() {
         &f,
         &settings(),
         &CompositorCaps {
+            fractional_crops: !cfg!(target_os = "android"),
             yuv_layers: false,
             ..caps()
         },
@@ -403,6 +415,7 @@ fn upscaled_output_sizes_and_final_rotation() {
                     ..settings()
                 },
                 &CompositorCaps {
+                    fractional_crops: !cfg!(target_os = "android"),
                     rotates: false,
                     scales,
                     ..caps()
@@ -783,6 +796,8 @@ fn swap_role_depends_only_on_settings_caps_and_canvas() {
                 for video in [false, true] {
                     if video {
                         f.video.push(VideoGeometry {
+                            source_uv: None,
+                            background: None,
                             id: 3,
                             source: (10, 10),
                             rect: rect(0, 0, 10, 10),
@@ -797,6 +812,7 @@ fn swap_role_depends_only_on_settings_caps_and_canvas() {
                             ..settings()
                         },
                         &CompositorCaps {
+                            fractional_crops: !cfg!(target_os = "android"),
                             presentable_compressed: compressed,
                             yuv_layers: false,
                             ..caps()
@@ -856,6 +872,11 @@ fn headless_records_and_reports_in_order_and_is_object_safe() {
 
 fn record() -> PresentRecord {
     PresentRecord {
+        statistics: Default::default(),
+        token: 0,
+        published_at: Duration::ZERO,
+        at: Duration::ZERO,
+        cpu_time: Duration::ZERO,
         frame: frame(),
         settings: settings(),
         caps: caps(),
@@ -961,6 +982,8 @@ fn recorder_replays_stateful_upscales_and_composed_video() {
                 Damage::rects([rect(40, 40, 20, 20)])
             },
             video: [VideoGeometry {
+                source_uv: None,
+                background: None,
                 id: 7,
                 source: (20, 20),
                 rect: rect(50, 50, 20, 20),
@@ -982,6 +1005,11 @@ fn recorder_replays_stateful_upscales_and_composed_video() {
         };
         let p = plan(&f, &s, &caps(), &c, &pools);
         recorder.record(Event::Present(Box::new(PresentRecord {
+            statistics: Default::default(),
+            token: 0,
+            published_at: Duration::ZERO,
+            at: Duration::ZERO,
+            cpu_time: Duration::ZERO,
             frame: f,
             settings: s,
             caps: caps(),

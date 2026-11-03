@@ -26,8 +26,11 @@ const AUTO_CLICKS: u32 = 3;
 
 /// What the session gets from the shell before the process starts.
 struct Host {
+    #[cfg(feature = "native-display")]
+    capture: Option<adv_device::frame::Waker>,
     background: LocalSender,
     gpu: Option<adv_device::gpu::Gpu>,
+    #[cfg(not(feature = "native-display"))]
     frames: Option<(adv_runtime::FrameProducer, WakeEvent)>,
     pacer: Option<super::frame_pacer::HostPacer>,
 }
@@ -79,6 +82,10 @@ fn start(
         install_dir: options.install_dir.clone(),
     };
     environment.start(&config, wake.clone(), &fonts, move |machine| {
+        #[cfg(feature = "native-display")]
+        if let Some(waker) = host.capture {
+            machine.ext.insert(waker);
+        }
         Session::install_codec_kernels(machine, codec_kernels);
         machine.cpu.set_background_sender(host.background)?;
         options.configure_machine(machine, &wake, keys)?;
@@ -101,6 +108,7 @@ fn start(
         if let Some(gpu) = host.gpu {
             Session::attach_gpu(machine, gpu, gpu_wake)?;
         }
+        #[cfg(not(feature = "native-display"))]
         if let Some((frames, ui)) = host.frames {
             let store = machine.ext.get_mut::<adv_device::surface::SurfaceStore>();
             store.set_frame_mailbox(frames, ui);
@@ -121,29 +129,35 @@ pub(super) fn run(options: &Options, dist: &Path) -> Result<u8, String> {
         .map_err(|e| e.to_string())?;
     let mut service = background.start().map_err(|e| e.to_string())?;
     let result = (|| {
+        #[cfg(feature = "native-display")]
+        let display_gpu = crate::display::headless(
+            options.gpu_software,
+            (options.width, options.height),
+            wake.clone(),
+        )?
+        .start()?;
         let gpu = if options.headless_gpu {
-            // As the built-in stack attaches a headless GPU.
             #[cfg(feature = "native-display")]
-            let gpu = crate::display::headless(
-                options.gpu_software,
-                (options.width, options.height),
-                wake.clone(),
-            )?
-            .start()?;
+            let gpu = display_gpu.fork().map_err(|e| e.to_string())?;
             #[cfg(not(feature = "native-display"))]
-            let gpu = pollster::block_on(adv_device::gpu::Gpu::request(options.gpu_software))
-                .map_err(|e| e.to_string())?;
-            #[cfg(not(feature = "native-display"))]
-            gpu.context()
-                .set_execution_wake(wake.clone())
-                .map_err(|_| "GPU wake already installed")?;
+            let gpu = {
+                let gpu = pollster::block_on(adv_device::gpu::Gpu::request(options.gpu_software))
+                    .map_err(|e| e.to_string())?;
+                gpu.context()
+                    .set_execution_wake(wake.clone())
+                    .map_err(|_| "GPU wake already installed")?;
+                gpu
+            };
             Some(gpu)
         } else {
             None
         };
         let host = Host {
+            #[cfg(feature = "native-display")]
+            capture: Some(display_gpu.waker()),
             background: sender.into_local(),
             gpu,
+            #[cfg(not(feature = "native-display"))]
             frames: None,
             pacer: None,
         };
@@ -197,11 +211,14 @@ pub(super) fn run_execution(
         origin: Instant::now(),
     };
     let host = Host {
+        #[cfg(feature = "native-display")]
+        capture: gpu.as_ref().map(|g| g.waker()),
         background: background.into_local(),
         #[cfg(not(feature = "native-display"))]
         gpu: worker.gpu.take(),
         #[cfg(feature = "native-display")]
         gpu,
+        #[cfg(not(feature = "native-display"))]
         frames: Some((worker.take_frames(), worker.ui_wake.clone())),
         pacer: Some(pacer),
     };
@@ -325,8 +342,12 @@ fn observe_gate(
         session.capture()?;
         metrics.gate.frame_capture(started.elapsed());
     }
+    #[cfg(feature = "native-display")]
+    let serial = session.frame().frames;
+    #[cfg(not(feature = "native-display"))]
+    let serial = session.presented_frames();
     let completion = metrics.gate.observe(
-        session.presented_frames(),
+        serial,
         session.frame().width,
         &session.frame().bgra,
         Instant::now(),
@@ -1151,7 +1172,10 @@ mod tests {
             let keys = Arc::new(KeyState::default());
             let host = Host {
                 background: sender.into_local(),
+                #[cfg(feature = "native-display")]
+                capture: None,
                 gpu: None,
+                #[cfg(not(feature = "native-display"))]
                 frames: None,
                 pacer: None,
             };

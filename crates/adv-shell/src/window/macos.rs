@@ -133,6 +133,8 @@ pub(crate) fn native_viewport(
 /// dispatch on the main thread, so no borrow is held across `sendEvent`.
 #[derive(Default)]
 pub(crate) struct Hub {
+    #[cfg(feature = "native-display")]
+    placement: Cell<Option<crate::display::Placement>>,
     pub(crate) scaling: Cell<crate::Scaling>,
     main: Cell<usize>,
     wake: RefCell<Option<WakeEvent>>,

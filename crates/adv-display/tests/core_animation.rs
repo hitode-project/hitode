@@ -223,6 +223,7 @@ mod macos {
 
     fn caps() -> CompositorCaps {
         CompositorCaps {
+            fractional_crops: !cfg!(target_os = "android"),
             scales: true,
             nearest: true,
             rotates: false,
@@ -236,6 +237,7 @@ mod macos {
 
     fn layer(source: Source, crop: Rect, dst: Rect, nearest: bool) -> Layer {
         Layer {
+            source_uv: None,
             source,
             crop,
             dst,
@@ -253,6 +255,7 @@ mod macos {
             h: H,
         };
         Layers {
+            solids: Default::default(),
             base: layer(Source::Base, crop, dst, nearest),
             video: video
                 .map(|dst| smallvec![(7, layer(Source::Video(7), whole, dst, false))])

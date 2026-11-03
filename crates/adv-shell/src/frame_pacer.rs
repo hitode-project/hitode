@@ -76,6 +76,13 @@ impl Cadence {
 /// Earliest submission allowed by the presentation cap. GPU work starts here;
 /// the native compositor selects the following refresh without another host tick.
 #[cfg(any(host_view, test))]
+#[cfg_attr(
+    feature = "native-display",
+    allow(
+        dead_code,
+        reason = "used by the old path and its pacing integration test"
+    )
+)]
 pub(crate) fn submission_at(published: Instant, next: Instant) -> Instant {
     published.max(next)
 }

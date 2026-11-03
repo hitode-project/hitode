@@ -1,5 +1,5 @@
 //! Platform-neutral mobile input and lifecycle policy.
-mod touch;
+pub(crate) mod touch;
 pub use touch::{TouchAction, client_point, magnification, position};
 mod lifecycle;
 pub use lifecycle::{Lifecycle, State};

@@ -1,11 +1,8 @@
 //! One instanced tile draw decodes a software source into a presentable buffer.
 use crate::plan::Tiles;
-use adv_gpu::encode::{Bind, ColorAttachment, Load, Store};
+use adv_gpu::encode::{Bind, Load};
 use adv_gpu::pipeline::{ColorTarget, Cull, Primitive, RenderPipelineDesc, Topology};
-use adv_gpu::{
-    Device, Encoder, Format, ImageView, Rect, RenderPass, RenderPassDesc, RenderPipeline, Ring,
-    Span,
-};
+use adv_gpu::{Device, Format, Rect, RenderPass, RenderPipeline, Ring, Span};
 
 /// Packed software encodings understood by the ingest shader.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,44 +75,28 @@ pub fn pipeline(device: &Device, format: Format) -> adv_gpu::Result<RenderPipeli
 /// reports the source slot's ingest token after its last read.
 /// `ring` belongs to that owner; Busy leaves the encoder untouched.
 pub fn encode(
-    encoder: &mut Encoder,
+    pass: &mut RenderPass<'_>,
     pipeline: &RenderPipeline,
     ring: &mut Ring,
     software: &Source<'_>,
-    destination: &ImageView,
     tiles: &Tiles,
-) -> adv_gpu::Result<()> {
+) -> adv_gpu::Result<Option<Span>> {
     if tiles.rects.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
-    let (width, height) = software.extent;
-    debug_assert_eq!(
-        (destination.size().width, destination.size().height),
-        (width, height)
-    );
     let data = source(ring, software, tiles)?;
-    let (area, load) = coverage(tiles);
-    let mut pass = encoder.render_pass(&RenderPassDesc {
-        colors: [ColorAttachment {
-            view: destination,
-            load,
-            store: Store::Store,
-            resolve: None,
-        }]
-        .into_iter()
-        .collect(),
-        depth_stencil: None,
-        area,
-        timestamps: None,
-        label: "software ingest",
-    });
     pass.set_pipeline(pipeline);
-    pass.set_viewport(0., 0., width as f32, height as f32, 0., 1.);
-    bind(&mut pass, software, &data);
+    pass.set_viewport(
+        0.,
+        0.,
+        software.extent.0 as f32,
+        software.extent.1 as f32,
+        0.,
+        1.,
+    );
+    bind(pass, software, &data);
     pass.draw(0..6, 0..tiles.rects.len() as u32);
-    drop(pass);
-    encoder.retain(data);
-    Ok(())
+    Ok(Some(data))
 }
 /// Prepare the software bindings for Ingest or a composed Video draw. The
 /// owner retains the returned span in the encoder after ending the pass.
@@ -171,7 +152,7 @@ fn write_words(bytes: &mut [u8], words: &[u32]) {
         out.copy_from_slice(&word.to_le_bytes());
     }
 }
-pub(super) fn coverage(tiles: &Tiles) -> (Rect, Load<[f64; 4]>) {
+pub(crate) fn coverage(tiles: &Tiles) -> (Rect, Load<[f64; 4]>) {
     let first = tiles.rects[0];
     let (mut x, mut y, mut right, mut bottom, mut pixels) =
         (first.x, first.y, first.x + first.w, first.y + first.h, 0u64);

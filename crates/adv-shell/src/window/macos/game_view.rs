@@ -4,8 +4,10 @@ use super::*;
 use crate::window::refresh_interval;
 use objc2_app_kit::NSView;
 #[cfg(not(feature = "native-display"))]
+use objc2_quartz_core::CAMetalLayer;
+#[cfg(not(feature = "native-display"))]
 use objc2_quartz_core::CATransaction;
-use objc2_quartz_core::{CADisplayLink, CAFrameRateRange, CALayer, CAMetalLayer};
+use objc2_quartz_core::{CADisplayLink, CAFrameRateRange, CALayer};
 use std::time::Duration;
 
 pub struct Input {
@@ -13,6 +15,7 @@ pub struct Input {
     /// The frame's layer, a sublayer of the black base layer (HOST-VIEW-9).
     #[cfg(not(feature = "native-display"))]
     frame: Retained<CAMetalLayer>,
+    #[cfg(not(feature = "native-display"))]
     display: Retained<CALayer>,
     #[cfg(not(feature = "native-display"))]
     displayed: Option<adv_device::gpu::NativeFrame>,
@@ -98,11 +101,21 @@ define_class!(
 );
 
 impl GameView {
-    pub(super) fn viewport(&self, canvas: (u32, u32), scaling: crate::Scaling) -> Viewport {
+    pub(super) fn viewport(&self, canvas: (u32, u32), hub: &Hub) -> Viewport {
         let scale = self
             .window()
             .map_or(1.0, |window| window.backingScaleFactor());
-        Viewport::scaled(self.client(), canvas, scaling, scale)
+        #[cfg(feature = "native-display")]
+        if let Some(p) = hub.placement.get() {
+            let [x, y, width, height] = p.rectangle.map(|v| f64::from(v) / scale);
+            return Viewport {
+                x,
+                y,
+                width,
+                height,
+            };
+        }
+        Viewport::scaled(self.client(), canvas, hub.scaling.get(), scale)
     }
     pub(crate) fn clear_control_latch(&self) {
         let mut input = self.ivars().borrow_mut();
@@ -133,7 +146,7 @@ impl GameView {
                 f64::from(lparam as u16 as i16),
                 f64::from((lparam >> 16) as u16 as i16),
             );
-            let viewport = self.viewport(self.hub().canvas.get(), self.hub().scaling.get());
+            let viewport = self.viewport(self.hub().canvas.get(), &self.hub());
             let (x, y) =
                 viewport.position(x, y, self.hub().canvas.get().0, self.hub().canvas.get().1);
             u32::from(x as u16) | (u32::from(y as u16) << 16)
@@ -323,15 +336,12 @@ impl GameView {
         hub.on_frame.borrow_mut().take();
         hub.vsync.clear();
         #[cfg(not(feature = "native-display"))]
-        let mut input = self.ivars().borrow_mut();
-        #[cfg(feature = "native-display")]
-        let input = self.ivars().borrow();
-        unsafe { input.display.setContents(None) };
-        // The view outlives execution teardown; keep its pins until then even
-        // if Core Animation still references the removed contents.
-        #[cfg(not(feature = "native-display"))]
-        if let Some(timer) = input.retirement.take() {
-            timer.invalidate();
+        {
+            let mut input = self.ivars().borrow_mut();
+            unsafe { input.display.setContents(None) };
+            if let Some(timer) = input.retirement.take() {
+                timer.invalidate();
+            }
         }
     }
     /// Arms one display-link callback; false when the timer fallback is in use.
@@ -367,12 +377,15 @@ impl GameView {
         let hub = Rc::new(Hub::default());
         hub.canvas.set((width, height));
         hub.main_enabled.set(true);
+        #[cfg(not(feature = "native-display"))]
         let frame = CAMetalLayer::new();
+        #[cfg(not(feature = "native-display"))]
         let display = CALayer::new();
         let this = Self::alloc(mtm).set_ivars(RefCell::new(Input {
             hub,
             #[cfg(not(feature = "native-display"))]
             frame: frame.clone(),
+            #[cfg(not(feature = "native-display"))]
             display: display.clone(),
             #[cfg(not(feature = "native-display"))]
             displayed: None,
@@ -400,13 +413,16 @@ impl GameView {
         let black = objc2_core_graphics::CGColor::new_generic_gray(0.0, 1.0);
         base.setBackgroundColor(Some(&black));
         base.setOpaque(true);
-        unsafe { frame.setContentsGravity(objc2_quartz_core::kCAGravityResize) };
-        frame.setOpaque(true);
-        base.addSublayer(&frame);
-        unsafe { display.setContentsGravity(objc2_quartz_core::kCAGravityResize) };
-        display.setOpaque(true);
-        display.setHidden(true);
-        base.addSublayer(&display);
+        #[cfg(not(feature = "native-display"))]
+        {
+            unsafe { frame.setContentsGravity(objc2_quartz_core::kCAGravityResize) };
+            frame.setOpaque(true);
+            base.addSublayer(&frame);
+            unsafe { display.setContentsGravity(objc2_quartz_core::kCAGravityResize) };
+            display.setOpaque(true);
+            display.setHidden(true);
+            base.addSublayer(&display);
+        }
         view.setLayer(Some(&base));
         view.place(None);
         Ok(view)
@@ -416,7 +432,7 @@ impl GameView {
     pub(crate) fn place(&self, placement: Option<crate::native_gpu::Placement>) {
         #[cfg(feature = "native-display")]
         {
-            let _ = placement;
+            self.hub().placement.set(placement);
         }
         #[cfg(not(feature = "native-display"))]
         self.place_legacy(placement);
@@ -672,7 +688,7 @@ impl Input {
             return;
         }
         let inside = x >= 0.0 && y >= 0.0 && x < cw && y < ch;
-        let viewport = view.viewport((self.width, self.height), self.hub.scaling.get());
+        let viewport = view.viewport((self.width, self.height), &self.hub);
         let (gx, gy) = viewport.position(x, y, self.width, self.height);
         let on_canvas = gx >= 0 && gy >= 0 && gx < self.width as i32 && gy < self.height as i32;
         let pressed = NSEvent::pressedMouseButtons();
@@ -732,7 +748,7 @@ impl Input {
     }
 
     fn cursor_visible_at(&self, view: &GameView, point: (f64, f64)) -> bool {
-        let viewport = view.viewport((self.width, self.height), self.hub.scaling.get());
+        let viewport = view.viewport((self.width, self.height), &self.hub);
         let (x, y) = viewport.position(point.0, point.1, self.width, self.height);
         self.cursor_visible && !adv_runtime::VideoCursorRegion::hidden_at(&self.regions, x, y)
     }
@@ -794,6 +810,7 @@ mod tests {
             hub: hub.clone(),
             #[cfg(not(feature = "native-display"))]
             frame: CAMetalLayer::new(),
+            #[cfg(not(feature = "native-display"))]
             display: CALayer::new(),
             #[cfg(not(feature = "native-display"))]
             displayed: None,

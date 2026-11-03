@@ -126,10 +126,29 @@ fn draw(
             label: "preserved pixels",
         });
     }
-    encode(
-        &mut encoder,
+    let tiles = Tiles {
+        size: (1, 1),
+        rects: vec![damage.unwrap_or(rect)],
+    };
+    let (area, load) = super::ingest::coverage(&tiles);
+    let mut pass = encoder.render_pass(&adv_gpu::RenderPassDesc {
+        colors: [adv_gpu::encode::ColorAttachment {
+            view: target.view(),
+            load,
+            store: adv_gpu::encode::Store::Store,
+            resolve: None,
+        }]
+        .into_iter()
+        .collect(),
+        depth_stencil: None,
+        area,
+        timestamps: None,
+        label: "output test",
+    });
+    let data = encode(
+        &mut pass,
         source,
-        target.view(),
+        target.desc().size,
         Transform {
             rotation,
             dst: rect,
@@ -142,6 +161,10 @@ fn draw(
         (&pipeline, &mut ring),
     )
     .unwrap();
+    drop(pass);
+    for span in data {
+        encoder.retain(span);
+    }
     encoder.copy_image_to_buffer(
         ImageCopy {
             image: &target,

@@ -2,7 +2,7 @@
 mod bindings;
 pub mod ingest;
 pub mod output;
-pub mod upscale;
-pub mod video;
 #[cfg(test)]
 mod output_tests;
+pub mod upscale;
+pub mod video;

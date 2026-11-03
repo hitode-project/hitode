@@ -1,12 +1,17 @@
 //! One tile draw scales and rotates encoded RGB; the compositor owns the letterbox.
 use super::{bindings, ingest};
 use crate::plan::{Rotation, Scale, Tiles, Transform};
-use adv_gpu::encode::{Bind, ColorAttachment, RenderPassDesc, Store};
+use adv_gpu::encode::Bind;
 use adv_gpu::pipeline::{ColorTarget, Cull, Primitive, RenderPipelineDesc, Topology};
-use adv_gpu::{Device, Encoder, Format, ImageView, RenderPipeline, Ring};
+use adv_gpu::{Device, Extent, Format, ImageView, RenderPass, RenderPipeline, Ring, Span};
 
 pub enum Source<'a> {
     Image(&'a ImageView),
+    Retained {
+        view: &'a ImageView,
+        canvas: (u32, u32),
+        rotation: Rotation,
+    },
     Software(ingest::Source<'a>),
 }
 pub fn pipeline(
@@ -18,6 +23,7 @@ pub fn pipeline(
         source: adv_gpu::shader::Source::Precompiled {
             spirv: &include!(concat!(env!("OUT_DIR"), "/output.spv.rs")),
             metal: include_bytes!(concat!(env!("OUT_DIR"), "/output.msl")),
+            entries: &include!(concat!(env!("OUT_DIR"), "/output.entries.rs")),
         },
         identity: include!(concat!(env!("OUT_DIR"), "/output.identity.rs")),
         label: "display output",
@@ -65,19 +71,20 @@ pub fn pipeline(
 }
 
 pub fn encode(
-    encoder: &mut Encoder,
+    pass: &mut RenderPass<'_>,
     source: Source<'_>,
-    destination: &ImageView,
+    size: Extent,
     transform: Transform,
     scale: Scale,
     tiles: &Tiles,
     resources: (&RenderPipeline, &mut Ring),
-) -> adv_gpu::Result<()> {
+) -> adv_gpu::Result<arrayvec::ArrayVec<Span, 3>> {
     let (pipeline, ring) = resources;
     if tiles.rects.is_empty() {
-        return Ok(());
+        return Ok(Default::default());
     }
     let extent = match &source {
+        Source::Retained { canvas, .. } => *canvas,
         Source::Image(v) => (v.size().width, v.size().height),
         Source::Software(s) => s.extent,
     };
@@ -87,8 +94,7 @@ pub fn encode(
         Scale::Model => unreachable!("model output belongs to the upscaler"),
     };
     let d = transform.dst;
-    let size = destination.size();
-    let mut constants = ring.reserve(48, 256)?;
+    let mut constants = ring.reserve(64, 256)?;
     let values = [
         size.width as f32,
         size.height as f32,
@@ -117,6 +123,17 @@ pub fn encode(
     };
     constants.bytes()[40..44].copy_from_slice(&rotation.to_ne_bytes());
     constants.bytes()[44..48].copy_from_slice(&linear.to_ne_bytes());
+    let source_rotation = match &source {
+        Source::Retained { rotation, .. } => match rotation {
+            Rotation::None => 0u32,
+            Rotation::Quarter => 1,
+            Rotation::Half => 2,
+            Rotation::ThreeQuarters => 3,
+        },
+        _ => 0,
+    };
+    constants.bytes()[48..52].copy_from_slice(&source_rotation.to_ne_bytes());
+
     let mut rectangles = ring.reserve(tiles.rects.len() as u64 * 16, 256)?;
     for (out, r) in rectangles
         .bytes()
@@ -139,50 +156,34 @@ pub fn encode(
         Source::Software(s) => Some(ingest::source(ring, s, &Tiles::default())?),
         _ => None,
     };
-    let (area, load) = ingest::coverage(tiles);
-    {
-        let mut pass = encoder.render_pass(&RenderPassDesc {
-            colors: [ColorAttachment {
-                view: destination,
-                load,
-                store: Store::Store,
-                resolve: None,
-            }]
-            .into_iter()
-            .collect(),
-            depth_stencil: None,
-            area,
-            timestamps: None,
-            label: "display output",
-        });
-        pass.set_pipeline(pipeline);
-        pass.bind(
-            0,
-            Bind::Uniform(
-                constants
-                    .buffer()
-                    .slice(constants.offset()..constants.offset() + constants.len()),
-            ),
-        );
-        pass.bind(
-            2,
-            Bind::StorageBuffer(
-                rectangles
-                    .buffer()
-                    .slice(rectangles.offset()..rectangles.offset() + rectangles.len()),
-            ),
-        );
-        match &source {
-            Source::Image(view) => pass.bind(0, Bind::Sampled(view)),
-            Source::Software(s) => ingest::bind(&mut pass, s, software_data.as_ref().unwrap()),
-        }
-        pass.set_viewport(0., 0., size.width as f32, size.height as f32, 0., 1.);
-        pass.draw(0..6, 0..tiles.rects.len() as u32);
+    pass.set_pipeline(pipeline);
+    pass.bind(
+        0,
+        Bind::Uniform(
+            constants
+                .buffer()
+                .slice(constants.offset()..constants.offset() + constants.len()),
+        ),
+    );
+    pass.bind(
+        2,
+        Bind::StorageBuffer(
+            rectangles
+                .buffer()
+                .slice(rectangles.offset()..rectangles.offset() + rectangles.len()),
+        ),
+    );
+    match &source {
+        Source::Image(view) | Source::Retained { view, .. } => pass.bind(0, Bind::Sampled(view)),
+        Source::Software(s) => ingest::bind(pass, s, software_data.as_ref().unwrap()),
     }
-    encoder.retain(constants);
-    encoder.retain(rectangles);
-    if let Some(data) = software_data {
-        encoder.retain(data);
+    pass.set_viewport(0., 0., size.width as f32, size.height as f32, 0., 1.);
+    pass.draw(0..6, 0..tiles.rects.len() as u32);
+    let mut data = arrayvec::ArrayVec::new();
+    data.push(constants);
+    data.push(rectangles);
+    if let Some(software) = software_data {
+        data.push(software);
     }
-    Ok(())
+    Ok(data)
 }

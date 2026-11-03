@@ -263,7 +263,7 @@ impl Encoder {
         }
     }
     #[cfg(target_os = "android")]
-    pub(super) fn release(&mut self, image: &Image) {
+    pub(crate) fn release(&mut self, image: &Image) {
         self.transition(
             image,
             0..1,

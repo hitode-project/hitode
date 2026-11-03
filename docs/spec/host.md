@@ -66,20 +66,22 @@ This spec covers the host shells. It includes launcher overlay input, the game v
 **Rule**: The native frame size MUST use physical pixels: content points multiplied by `backingScaleFactor` on macOS. Native GPU presentation MUST default to preserving aspect ratio and black bars, using sharp-bilinear sampling unless the host selects an upscaler. Pointer positions MUST map back through the same letterbox.
 **Verification**: Test
 
-With `native-display`, the compositor MUST own the letterbox, and display feedback MUST preserve physical canvas placement for pointer mapping.
+With `native-display`, the planner MUST choose fit, integer or stretch placement. The compositor MUST own the black letterbox. Pointer mapping MUST use the exact rectangle returned by presentation feedback.
 
 ### HOST-VIEW-3 One composition path
 
 **Rule**: Video MUST share the base frame's geometry and filter policy. CPU video composition MUST run only for captures and guest pixel requests. Composition MUST preserve encoded colors, write opaque alpha and keep the letterbox black.
 **Verification**: Test
 
-With `native-display`, the planner MUST select video layers or canvas composition, retaining source crops and cursor-region feedback.
+With `native-display`, the planner MUST select video layers or canvas composition, preserve fractional source crops, and draw each video's border below its picture. Cursor feedback MUST preserve video ordering, hide-cursor flags and occlusion; requested captures and debugger pixel gates MUST read the owner's last presented composition.
 
 ### HOST-VIEW-4 Surface configuration off the UI thread
 
 **Rule**: On macOS the surface MUST be configured only by background tasks, at startup or after a submitted pause. The UI thread MUST only read the size and schedule work. With `native-display`, the UI MUST create the device and layer compositor, while the GPU owner MUST encode stages and submit frames.
 **Applies to**: macOS
 **Verification**: Review — the thread affinity of AppKit callbacks is not observable in a test.
+
+With `native-display`, settings and compositor notifications MUST poke the owner even without guest commands.
 
 ### HOST-VIEW-5 Key translation
 
@@ -115,7 +117,7 @@ Optimized kernels MUST retain the selected model, weights and arithmetic precisi
 **Applies to**: macOS, iOS
 **Verification**: Test
 
-With `native-display`, compositor capabilities MUST select direct scaling or a damage-limited output pass on every platform.
+With `native-display`, compositor capabilities MUST select direct scaling or a damage-limited output pass on every platform. The executor MUST use one render pass per target, including every composed video draw. Its recorder MUST hold pass counts and supported GPU timestamps.
 
 Nearest sampling at integer scales and an integer nearest prescale followed by bilinear filtering both define sharp-bilinear, so the look does not change. An upscaler's doubled output is magnified by the layer when the viewport can hold it, and otherwise resampled to the viewport's size; both are linear, as before. With composed video, the drawable covers the whole view and the frame is composed into it as before.
 
@@ -138,7 +140,7 @@ Every layer is a 3×3 convolution, so a change reaches at most one input pixel p
 **Applies to**: macOS
 **Verification**: Test
 
-With `native-display`, presentable pools MUST retain buffer identity across compositor replacement and order reuse after compositor release fences.
+With `native-display`, each planner pool MUST use indexed leases from one presentable pool in the backend's native color format. Compositor detach and rebuild MUST preserve the same base and video leases without drawing, and releases MUST order pool reuse after their fences; completion notifications MUST wake the owner without polling.
 
 Direct presentation requires Core Animation's `contentsOpaque` capability. Other presentations use the drawable compositor. Display callbacks reclaim retired surfaces; a temporary timer also drains pending retirements when the frame clock is idle or occluded.
 ### HOST-SES-1 Embedding
@@ -197,6 +199,8 @@ Preparation MUST validate the compressed stream completely before publishing the
 ### HOST-SES-10 Submit before refresh
 
 **Rule**: Published frames MUST schedule upload, scaling and presentation outside guest execution as soon as the presentation cap permits. Display links MUST publish refresh timing without gating submission or running without pending content. Hosts without display links MUST retain deadline timers.
+
+With `native-display`, the executor MUST keep at most one unlatched transaction and one newest held frame. Replacing a held frame MUST merge its damage and retire its software, swap and video resources after their reads; latch notifications MUST submit the held frame without a timer.
 **Verification**: Test
 
 ### HOST-SES-11 Requested display cadence
@@ -204,7 +208,7 @@ Preparation MUST validate the compressed stream completely before publishing the
 **Rule**: Display rate requests MUST follow publication timestamps, accounting for mailbox drops and excluding repaints. Supported Apple display links and Android native surfaces MUST receive the estimated guest cadence, capped at 60 Hz. Android surfaces MAY replace AND-APP-10's initial 60 Hz request after measuring cadence.
 **Verification**: Test
 
-With `native-display`, Android MUST request cadence through runtime-resolved `ASurfaceTransaction_setFrameRate` on the SurfaceControl base layer.
+With `native-display`, Android MUST request cadence through runtime-resolved `ASurfaceTransaction_setFrameRate` on the SurfaceControl base layer, updating the request only when the estimated rate changes.
 
 ### HOST-LIB-1 Storage and removal
 

@@ -102,6 +102,7 @@ mod android {
     }
     fn caps(device: &Device) -> CompositorCaps {
         CompositorCaps {
+            fractional_crops: !cfg!(target_os = "android"),
             scales: true,
             nearest: false,
             rotates: true,
@@ -529,7 +530,9 @@ mod android {
             });
         }
         probe.layers = Some(Layers {
+            solids: Default::default(),
             base: Layer {
+                source_uv: None,
                 source: Source::Base,
                 crop: probe.bounds,
                 dst: bounds,
@@ -546,6 +549,7 @@ mod android {
             probe.layers.as_mut().unwrap().video.push((
                 1,
                 Layer {
+                    source_uv: None,
                     source: Source::Video(1),
                     crop: Rect {
                         x: 0,

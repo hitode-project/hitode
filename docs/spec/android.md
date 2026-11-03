@@ -46,7 +46,7 @@ This spec covers the Android player: its package, its lifecycle and input, and t
 **Applies to**: Android
 **Verification**: Test
 
-With `native-display`, replacement MUST rebuild only SurfaceControl, retain display pools, and suspend presentation without a surface.
+With `native-display`, SurfaceControl MUST retain its own window reference. Window replacement and loss MUST poke the owner without waiting for a guest frame. Replacement MUST rebuild only the compositor, retaining detached leases and display pools while presentation is suspended. Rebuilding MUST reattach the same images without encoding, and the owner MUST run at `PRIORITY_DISPLAY` without core affinity.
 
 ### AND-APP-11 Touch input
 

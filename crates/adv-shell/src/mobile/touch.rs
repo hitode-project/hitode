@@ -9,7 +9,15 @@ pub enum TouchAction {
     Cancel,
 }
 pub fn position(client: (u32, u32), canvas: (u32, u32), scaling: Scaling, x: f32, y: f32) -> u32 {
-    let [left, top, width, height] = scaling.rectangle((client.0 as f64, client.1 as f64), canvas);
+    position_in(
+        scaling.rectangle((client.0 as f64, client.1 as f64), canvas),
+        canvas,
+        x,
+        y,
+    )
+}
+pub(crate) fn position_in(rectangle: [f64; 4], canvas: (u32, u32), x: f32, y: f32) -> u32 {
+    let [left, top, width, height] = rectangle;
     let x = ((f64::from(x) - left) * f64::from(canvas.0) / width.max(1.0))
         .floor()
         .clamp(0.0, f64::from(canvas.0.saturating_sub(1))) as u16;
@@ -20,7 +28,13 @@ pub fn position(client: (u32, u32), canvas: (u32, u32), scaling: Scaling, x: f32
 }
 /// Client pixels per canvas pixel along each axis of the presented frame.
 pub fn magnification(client: (u32, u32), canvas: (u32, u32), scaling: Scaling) -> (f32, f32) {
-    let [_, _, width, height] = scaling.rectangle((client.0 as f64, client.1 as f64), canvas);
+    magnification_in(
+        scaling.rectangle((client.0 as f64, client.1 as f64), canvas),
+        canvas,
+    )
+}
+pub(crate) fn magnification_in(rectangle: [f64; 4], canvas: (u32, u32)) -> (f32, f32) {
+    let [_, _, width, height] = rectangle;
     (
         (width / f64::from(canvas.0.max(1))) as f32,
         (height / f64::from(canvas.1.max(1))) as f32,
@@ -35,8 +49,21 @@ pub fn client_point(
     x: f32,
     y: f32,
 ) -> (f32, f32) {
-    let [left, top, ..] = scaling.rectangle((client.0 as f64, client.1 as f64), canvas);
-    let (sx, sy) = magnification(client, canvas, scaling);
+    client_point_in(
+        scaling.rectangle((client.0 as f64, client.1 as f64), canvas),
+        canvas,
+        x,
+        y,
+    )
+}
+pub(crate) fn client_point_in(
+    rectangle: [f64; 4],
+    canvas: (u32, u32),
+    x: f32,
+    y: f32,
+) -> (f32, f32) {
+    let [left, top, ..] = rectangle;
+    let (sx, sy) = magnification_in(rectangle, canvas);
     (left as f32 + (x + 0.5) * sx, top as f32 + (y + 0.5) * sy)
 }
 

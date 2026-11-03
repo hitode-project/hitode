@@ -175,6 +175,9 @@ impl Gpu {
             execution,
         })
     }
+    pub fn waker(&self) -> crate::frame::Waker {
+        self.execution.owner.wake.as_ref().unwrap().clone()
+    }
     /// Device shared with the presenting queue, including decoder pools.
     pub fn device(&self) -> &adv_gpu::Device {
         &self.device
@@ -272,7 +275,7 @@ mod tests {
             fn present(&mut self, _: &mut adv_gpu::Queue, frame: crate::frame::Frame) {
                 self.0.send(frame.serial).unwrap();
             }
-            fn drain(&mut self) {}
+            fn service(&mut self, _: &mut adv_gpu::Queue, _: Option<&crate::frame::Waker>) {}
         }
         let (tx, rx) = std::sync::mpsc::channel();
         let (device, queue) = adv_gpu::Device::open(&adv_gpu::queue::DeviceOptions {

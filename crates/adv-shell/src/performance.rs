@@ -19,15 +19,13 @@ pub(crate) struct NativePresentation {
     #[cfg(feature = "native-display")]
     pub display_submissions: u64,
     #[cfg(feature = "native-display")]
-    pub display_tiles: u64,
-    #[cfg(feature = "native-display")]
-    pub display_pixels: u64,
-    #[cfg(feature = "native-display")]
     pub display_plan: &'static str,
     #[cfg(feature = "native-display")]
     pub display_stage_tiles: [u32; 3],
     #[cfg(feature = "native-display")]
     pub display_stage_pixels: [u32; 3],
+    #[cfg(feature = "native-display")]
+    pub display_stage_ns: [u64; 3],
     #[cfg(feature = "native-display")]
     pub display_latch_ns: Option<u64>,
     #[cfg(feature = "native-display")]
@@ -52,7 +50,31 @@ pub(crate) struct NativePresentation {
 }
 impl NativePresentation {
     fn json(&self) -> String {
-        let json = format!(
+        #[cfg(feature = "native-display")]
+        let display = format!(
+            ", \"last_display_passes\": {}, \"last_display_submissions\": {}, \"last_display_tiles\": {}, \"last_display_pixels\": {}, \"display_plan\": \"{}\", \"last_stage_tiles\": {:?}, \"last_stage_pixels\": {:?}, \"last_stage_ns\": {:?}, \"last_latch_ns\": {}, \"last_shown_ns\": {}",
+            self.display_passes,
+            self.display_submissions,
+            self.display_stage_tiles
+                .iter()
+                .map(|&n| u64::from(n))
+                .sum::<u64>(),
+            self.display_stage_pixels
+                .iter()
+                .map(|&n| u64::from(n))
+                .sum::<u64>(),
+            self.display_plan,
+            self.display_stage_tiles,
+            self.display_stage_pixels,
+            self.display_stage_ns,
+            self.display_latch_ns
+                .map_or_else(|| "null".into(), |n| n.to_string()),
+            self.display_shown_ns
+                .map_or_else(|| "null".into(), |n| n.to_string())
+        );
+        #[cfg(not(feature = "native-display"))]
+        let display = "";
+        format!(
             concat!(
                 "{{\"cumulative\": true, \"consumed_frames\": {}, \"software_uploads\": {}, ",
                 "\"presentations\": {}, \"configurations\": {}, \"max_queue_ns\": {}, ",
@@ -61,7 +83,7 @@ impl NativePresentation {
                 "\"software_uploaded_bytes\": {}, \"software_converted_bytes\": {}, ",
                 "\"software_gpu_transfer_bytes\": {}, ",
                 "\"software_upload_bytes_per_second\": {:.3}, \"software_conversion_bytes_per_second\": {:.3}, ",
-                "\"upscaled_runs\": {}, \"upscaled_input_pixels\": {}}}"
+                "\"upscaled_runs\": {}, \"upscaled_input_pixels\": {}{}}}"
             ),
             self.consumed,
             self.uploads,
@@ -84,16 +106,9 @@ impl NativePresentation {
                     .software_started
                     .map_or(1., |at| at.elapsed().as_secs_f64().max(1e-9)),
             self.upscaled_runs,
-            self.upscaled_pixels
-        );
-        #[cfg(feature = "native-display")]
-        let json = {
-            let mut json = json;
-            json.pop();
-            json.push_str(&format!(", \"display_passes\": {}, \"display_submissions\": {}, \"display_tiles\": {}, \"display_pixels\": {}, \"display_plan\": \"{}\", \"last_stage_tiles\": {:?}, \"last_stage_pixels\": {:?}, \"last_latch_ns\": {}, \"last_shown_ns\": {}}}",self.display_passes,self.display_submissions,self.display_tiles,self.display_pixels,self.display_plan,self.display_stage_tiles,self.display_stage_pixels,self.display_latch_ns.map_or_else(||"null".into(),|n|n.to_string()),self.display_shown_ns.map_or_else(||"null".into(),|n|n.to_string())));
-            json
-        };
-        json
+            self.upscaled_pixels,
+            display,
+        )
     }
 }
 impl Samples {

@@ -71,7 +71,7 @@ The launcher holds selected directories' security scopes while it runs. Game fol
 **Applies to**: iOS
 **Verification**: Review — UIKit layout and the display link run only inside an application.
 
-With `native-display`, IOSurface contents MUST attach through the Core Animation compositor after GPU completion, preserving the existing display link.
+With `native-display`, IOSurface contents MUST attach through the Core Animation compositor after GPU completion, preserving the existing display link. Scale changes MUST reach the owner through the settings mailbox and apply on the main thread through the compositor notifier; transaction completion MUST poke the owner to advance held frames and releases.
 
 ### IOS-APP-3 Touch routing
 
