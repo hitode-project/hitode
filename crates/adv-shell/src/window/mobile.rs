@@ -43,6 +43,10 @@ pub enum ViewEvent {
 
 /// Trackpad cursor travel per finger travel.
 const TRACKPAD_GAIN: f32 = 1.25;
+
+/// Receives the view's events for the host UI.
+pub type Listener = Box<dyn Fn(ViewEvent)>;
+
 pub struct GameView {
     #[cfg(target_os = "android")]
     window: Cell<Option<NonNull<ndk_sys::ANativeWindow>>>,
@@ -66,7 +70,7 @@ pub struct GameView {
     cursor: Cell<(f32, f32)>,
     /// MK_ flags of buttons held through `mouse_button`.
     buttons: Cell<u32>,
-    listener: RefCell<Option<Box<dyn Fn(ViewEvent)>>>,
+    listener: RefCell<Option<Listener>>,
     /// The dialogs last sent to the listener.
     dialogs: RefCell<adv_runtime::DialogSet>,
     menu: RefCell<adv_runtime::MenuBar>,
@@ -230,7 +234,7 @@ impl GameView {
     }
     /// Receives the host's view events: layout, keyboard requests and, on
     /// Android, the trackpad cursor.
-    pub fn set_listener(&self, listener: Box<dyn Fn(ViewEvent)>) {
+    pub fn set_listener(&self, listener: Listener) {
         *self.listener.borrow_mut() = Some(listener);
     }
     pub(crate) fn notify(&self, event: ViewEvent) {
@@ -499,30 +503,6 @@ impl GameView {
             self.push(Event::FocusLost);
         }
     }
-    pub(crate) fn post_input(&self, message: u32, wparam: u32, lparam: u32) -> Result<(), String> {
-        let lparam = if (0x200..=0x20a).contains(&message) {
-            input::position(
-                self.client.get(),
-                self.canvas.get(),
-                self.scaling.get(),
-                lparam as u16 as i16 as f32,
-                (lparam >> 16) as u16 as i16 as f32,
-            )
-        } else {
-            lparam
-        };
-        if wparam == 0x11 && matches!(message, 0x100 | 0x101 | 0x104 | 0x105) {
-            self.keys
-                .borrow()
-                .set(wparam, matches!(message, 0x100 | 0x104));
-        }
-        self.push(Event::Input {
-            message,
-            wparam,
-            lparam,
-        });
-        Ok(())
-    }
     pub(crate) fn create_native(
         &self,
         fallback: bool,
@@ -603,11 +583,10 @@ impl GameView {
     pub(crate) fn set_video_cursor_regions(&self, _: Arc<[adv_runtime::VideoCursorRegion]>) {}
     pub(crate) fn frame_rate(&self, rate: u32) {
         self.frame_clock.set(true);
-        if self.requested_rate.replace(rate) == rate {
-            return;
+        if self.requested_rate.replace(rate) != rate {
+            #[cfg(target_os = "android")]
+            self.apply_frame_rate();
         }
-        #[cfg(target_os = "android")]
-        self.apply_frame_rate();
     }
     #[cfg(target_os = "android")]
     fn apply_frame_rate(&self) {

@@ -262,8 +262,7 @@ export class LaunchFlow {
   /** Enables JIT from the recommendation, then starts the game once it is ready. */
   async enableJit(): Promise<void> {
     this.view = "jit-wait";
-    if (jit.status?.liveContainer) await jit.stikDebug();
-    else await jit.enable();
+    await jit.enable();
     await jit.settled();
     if (this.#alive && this.view === "jit-wait") void this.#start();
   }

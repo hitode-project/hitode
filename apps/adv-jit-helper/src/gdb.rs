@@ -72,6 +72,11 @@ pub fn stopped_thread(reply: &str) -> std::result::Result<&str, String> {
         .ok_or_else(|| format!("unexpected stop reply {reply:?}"))
 }
 
+/// Resumes `tid` with the signal its stop reply (`T<signal>…`) reported.
+pub fn forward(stop: &str, tid: &str) -> String {
+    format!("vCont;C{}:{tid}", &stop[1..3])
+}
+
 /// Little-endian hex bytes, as register and memory reads return them.
 pub fn le_value(hex: &str) -> Option<u64> {
     if hex.is_empty() || hex.len() > 16 || !hex.len().is_multiple_of(2) {
@@ -126,14 +131,18 @@ async fn serve(debugger: &mut Debugger) -> Result<()> {
     let mask = u64::MAX
         .checked_shr(64 - bits)
         .ok_or("invalid address width")?;
+    let mut resume = "c".to_owned();
     loop {
-        let stop = command(debugger, "c").await?;
+        let stop = command(debugger, &resume).await?;
         let tid = stopped_thread(&stop)?;
         let pc = register(debugger, tid, PC).await?;
         let word = command(debugger, &format!("m{:x},4", pc & mask)).await?;
         if le_value(&word) != Some(u64::from(BRK_F00D)) {
-            return Err("player stopped outside a JIT request".into());
+            // Not a JIT request: the player gets its signal, as without a debugger.
+            resume = forward(&stop, tid);
+            continue;
         }
+        resume = "c".to_owned();
         let operation = register(debugger, tid, X16).await?;
         if operation > 1 {
             return Err(format!("unknown JIT request {operation}").into());
@@ -312,21 +321,20 @@ mod session_tests {
 
     // spec: IOS-JIT-2
     #[tokio::test]
-    async fn unrelated_stop_detaches_without_changing_registers() {
+    async fn unrelated_stop_passes_its_signal_to_the_player() {
         let mut exchanges = handshake();
         exchanges.extend([
             ("qHostInfo", "addressing_bits:47;"),
-            ("c", "T05thread:1;"),
-            ("p20;thread:1;", "0010000000000000"),
+            ("c", "T0dthread:2;"),
+            ("p20;thread:2;", "0010000000000000"),
             ("m1000,4", "00000000"),
+            ("vCont;C0d:2", "T05thread:1;"),
+            ("p20;thread:1;", "0020000000000000"),
+            ("m2000,4", "a0013ed4"),
+            ("p10;thread:1;", "0000000000000000"),
+            ("P20=0420000000000000;thread:1;", "OK"),
             ("D", "OK"),
         ]);
-        assert!(
-            session(true, exchanges)
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("outside a JIT request")
-        );
+        session(true, exchanges).await.unwrap();
     }
 }

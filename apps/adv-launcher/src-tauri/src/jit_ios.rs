@@ -1,12 +1,10 @@
-//! On-device JIT extension and external StikDebug requests (IOS-JIT-2).
+//! On-device JIT extension (IOS-JIT-2).
 use objc2::{
-    MainThreadMarker, msg_send,
+    msg_send,
     rc::Retained,
     runtime::{AnyClass, AnyObject},
 };
-use objc2_foundation::{
-    NSArray, NSBundle, NSDictionary, NSError, NSExtensionItem, NSString, NSURL,
-};
+use objc2_foundation::{NSArray, NSBundle, NSDictionary, NSError, NSExtensionItem, NSString};
 use std::{
     cell::RefCell,
     ffi::c_void,
@@ -21,7 +19,7 @@ use tauri::{AppHandle, Manager};
 #[derive(Default)]
 struct RequestState {
     waiting: bool,
-    /// What the running request does: a `Task` name or `external`.
+    /// What the running request does: a `Task` name.
     task: Option<&'static str>,
     stage: Option<String>,
     error: Option<String>,
@@ -147,38 +145,19 @@ pub fn jit_status(app: AppHandle) -> JitStatus {
 }
 
 #[tauri::command]
-pub fn request_jit(app: AppHandle, external: Option<bool>) -> Result<(), String> {
+pub fn request_jit(app: AppHandle) -> Result<(), String> {
     if let Some(result) = adv_shell::code_pool_state() {
         return result;
     }
     require_debug_signing()?;
-    if !external.unwrap_or(false) {
-        if std::env::var_os("LC_HOME_PATH").is_some() {
-            return Err("Use StikDebug inside LiveContainer".into());
-        }
-        let pairing =
-            std::fs::read(pairing_path(&app)?).map_err(|e| format!("pairingFile.plist: {e}"))?;
-        return run_helper(app, Task::Enable, pairing);
+    // LiveContainer's "Launch with JIT" starts the player under StikDebug,
+    // which prepares the pool at launch (IOS-JIT-1); it cannot host the helper.
+    if std::env::var_os("LC_HOME_PATH").is_some() {
+        return Err("Launch with JIT in LiveContainer".into());
     }
-    let mut state = REQUEST.lock().unwrap();
-    if state.waiting {
-        return Ok(());
-    }
-    *state = RequestState {
-        waiting: true,
-        task: Some("external"),
-        stage: Some("external".into()),
-        error: None,
-    };
-    drop(state);
-    let handle = app.clone();
-    let result = app
-        .run_on_main_thread(move || open_stikdebug(handle))
-        .map_err(|e| e.to_string());
-    if let Err(error) = &result {
-        finish(&app, Err(error.clone()));
-    }
-    result
+    let pairing =
+        std::fs::read(pairing_path(&app)?).map_err(|e| format!("pairingFile.plist: {e}"))?;
+    run_helper(app, Task::Enable, pairing)
 }
 
 /// Fixture: `ADV_IOS_JIT_AT_LAUNCH` names one helper task to run at launch,
@@ -188,7 +167,7 @@ pub fn request_at_launch(app: &AppHandle) {
         return;
     };
     let result = match name.as_str() {
-        "enable" => request_jit(app.clone(), Some(false)),
+        "enable" => request_jit(app.clone()),
         "ddiStatus" => check_ddi(app.clone()),
         "downloadDdi" => download_ddi(app.clone()),
         _ => Err(format!("unknown ADV_IOS_JIT_AT_LAUNCH task {name}")),
@@ -331,7 +310,7 @@ fn start_helper(app: &AppHandle, task: Task, pairing: Vec<u8>) -> Result<(), Str
     let info = NSDictionary::from_slices(&[&*NSString::from_str("endpoint")], &[&*endpoint]);
     // SAFETY: Foundation dictionary contains only strings, supported by NSSecureCoding.
     unsafe {
-        item.setUserInfo(Some(&info.cast_unchecked()));
+        item.setUserInfo(Some(info.cast_unchecked()));
     }
     let items = NSArray::from_slice(&[&*item]);
     // SAFETY: private Foundation methods use the Objective-C signatures shown here.
@@ -399,11 +378,18 @@ fn listen(listener: TcpListener, token: &str, task: Task, pairing: Vec<u8>) -> R
     if line.trim_end() != token {
         return Err("JIT extension authentication failed".into());
     }
-    let request = serde_json::json!({
+    let mut request = serde_json::json!({
         "mode": task.name(),
         "pid": std::process::id(),
         "pairing": pairing,
     });
+    if task == Task::Enable {
+        // The loopback instance is a local record and answers at once; before
+        // iOS 27 none is visible on the device, so this bounds the wait.
+        let (port, source) = crate::remote_pairing::port(Duration::from_millis(500));
+        log::info!("JIT helper: RemotePairing port {port} ({source})");
+        request["remotePairingPort"] = port.into();
+    }
     writeln!(reader.get_mut(), "{request}").map_err(|e| e.to_string())?;
     reader
         .get_ref()
@@ -449,35 +435,5 @@ fn listen(listener: TcpListener, token: &str, task: Task, pairing: Vec<u8>) -> R
         prepared
     } else {
         result.and(Err("JIT extension did not attach".into()))
-    }
-}
-
-fn open_stikdebug(app: AppHandle) {
-    let bundle = NSBundle::mainBundle()
-        .bundleIdentifier()
-        .map_or_else(|| app.config().identifier.clone(), |id| id.to_string());
-    let url = NSURL::URLWithString(&NSString::from_str(&format!(
-        "stikdebug://enable-jit?bundle-id={bundle}&pid={}&script-name=universal.js",
-        std::process::id(),
-    )))
-    .unwrap();
-    let completion = block2::RcBlock::new(move |opened: objc2::runtime::Bool| {
-        let handle = app.clone();
-        if !opened.as_bool() {
-            finish(
-                &handle,
-                Err("Cannot open StikDebug; install it before requesting external JIT".into()),
-            );
-            return;
-        }
-        std::thread::spawn(move || {
-            let result = adv_shell::prepare_code_pool_after_attach(Duration::from_secs(120));
-            finish(&handle, result);
-        });
-    });
-    // SAFETY: invoked on the main thread, URL and options have their declared types.
-    unsafe {
-        objc2_ui_kit::UIApplication::sharedApplication(MainThreadMarker::new().unwrap())
-            .openURL_options_completionHandler(&url, &NSDictionary::new(), Some(&completion));
     }
 }

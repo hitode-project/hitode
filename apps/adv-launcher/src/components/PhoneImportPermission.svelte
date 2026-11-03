@@ -172,7 +172,7 @@
         <h2 id="perm-t" class="ttl">{t("选择游戏文件夹")}</h2>
         <p class="line">{error || t("在“文件”里选中整个游戏文件夹。")}</p>
         {#if showLiveContainerHint}
-          <p class="line">{t("请先返回 LiveContainer，长按 Hitode → 设置，打开“使用 LiveContainer 的 Bundle ID”，再重新启动 Hitode，否则可能在“文件”里点“打开”后没有反应。")}</p>
+          <p class="line">{t("请先返回 LiveContainer，长按 Hitode → 设置，打开“使用 LiveContainer 的包名”，再重新启动 Hitode，否则可能在“文件”里点“打开”后没有反应。")}</p>
         {/if}
         <div class="acts">
           <button class="primary" onclick={() => selectFolder(false)} disabled={busy}>{t("打开“文件”")}</button>

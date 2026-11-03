@@ -68,8 +68,8 @@
       </div>
     {:else if flow.view === "jit"}
       <div class="acts fade">
-        {#if !jit.signingUnsupported && (jit.configured || jit.status?.liveContainer)}
-          <button class="btn primary" onclick={() => flow.enableJit()}>{jit.status?.liveContainer ? t("用 StikDebug 启用") : t("启用 JIT")}</button>
+        {#if !jit.signingUnsupported && jit.configured}
+          <button class="btn primary" onclick={() => flow.enableJit()}>{t("启用 JIT")}</button>
         {:else if !jit.signingUnsupported}
           <button class="btn primary" onclick={() => nav.replace({ name: "settings" })}>{t("设置方法")}</button>
         {/if}

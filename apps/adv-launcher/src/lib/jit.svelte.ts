@@ -9,7 +9,7 @@ export interface JitStatus {
   debuggable: boolean;
   error: string | null;
   waiting: boolean;
-  task: "enable" | "ddiStatus" | "downloadDdi" | "external" | null;
+  task: "enable" | "ddiStatus" | "downloadDdi" | null;
   liveContainer: boolean;
   pairingFile: boolean;
   stage: string | null;
@@ -31,7 +31,6 @@ const stages: Record<string, string> = {
   mounting: "正在挂载开发者镜像…",
   attaching: "正在连接调试器…",
   preparing: "正在准备 JIT 代码池…",
-  external: "正在等待 StikDebug…",
 };
 
 /** A host error, or a code the helper answers, in the user's words. */
@@ -112,11 +111,7 @@ class Jit {
   }
 
   enable(): Promise<void> {
-    return this.#run("request_jit", { external: false });
-  }
-
-  stikDebug(): Promise<void> {
-    return this.#run("request_jit", { external: true });
+    return this.#run("request_jit");
   }
 
   downloadDdi(): Promise<void> {
