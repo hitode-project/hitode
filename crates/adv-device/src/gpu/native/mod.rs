@@ -79,26 +79,32 @@ impl Gpu {
     /// Open the device and start its owner thread. `fallback` selects a
     /// software adapter (lavapipe) for tests and diagnostics.
     pub async fn request(fallback: bool) -> Result<Self, Error> {
-        Self::request_with_presenter(fallback, Box::new(owner::Headless)).await
+        Self::execution(fallback)
     }
-    /// Start the execution thread's owner with its lifetime presenter. The
-    /// first facade selects it; later requests share that execution and retain
-    /// its original presenter. Call before surface stores to select a compositor.
+    /// Start the execution thread's owner with its lifetime presenter, before
+    /// any surface store or facade starts a headless one. The presenter stays
+    /// until the last facade drops; a running execution refuses another.
     pub async fn request_with_presenter(
         fallback: bool,
         presenter: Box<dyn crate::frame::Presenter>,
     ) -> Result<Self, Error> {
-        Self::execution_with_presenter(fallback, presenter)
+        Self::start(fallback, Some(presenter))
     }
+    /// Share the thread's execution, starting a headless one if none runs.
     pub(crate) fn execution(fallback: bool) -> Result<Self, Error> {
-        Self::execution_with_presenter(fallback, Box::new(owner::Headless))
+        Self::start(fallback, None)
     }
-    fn execution_with_presenter(
+    fn start(
         fallback: bool,
-        presenter: Box<dyn crate::frame::Presenter>,
+        presenter: Option<Box<dyn crate::frame::Presenter>>,
     ) -> Result<Self, Error> {
         let execution = EXECUTION.with(|cached| {
             if let Some(execution) = cached.borrow().upgrade() {
+                if presenter.is_some() {
+                    return Err(Error::Invalid(
+                        "the execution already runs with its presenter".into(),
+                    ));
+                }
                 return Ok(execution);
             }
             let (device, queue) = adv_gpu::Device::open(&adv_gpu::queue::DeviceOptions {
@@ -116,7 +122,11 @@ impl Gpu {
                     producer,
                 ))),
                 video: Arc::from([]),
-                owner: owner::Owner::start(queue, commands, presenter)?,
+                owner: owner::Owner::start(
+                    queue,
+                    commands,
+                    presenter.unwrap_or_else(|| Box::new(owner::Headless)),
+                )?,
             });
             *cached.borrow_mut() = std::rc::Rc::downgrade(&execution);
             Ok(execution)
@@ -230,19 +240,16 @@ mod tests {
             Box::new(Capture(tx)),
         ))
         .unwrap();
-        let (other_tx, other_rx) = std::sync::mpsc::channel();
-        let shared = pollster::block_on(Gpu::request_with_presenter(
-            false,
-            Box::new(Capture(other_tx)),
-        ))
-        .unwrap();
-        let headless = pollster::block_on(Gpu::request(false)).unwrap();
-        assert!(std::rc::Rc::ptr_eq(&gpu.execution, &shared.execution));
-        assert!(std::rc::Rc::ptr_eq(&gpu.execution, &headless.execution));
+        let (other_tx, _) = std::sync::mpsc::channel();
         assert!(matches!(
-            other_rx.try_recv(),
-            Err(std::sync::mpsc::TryRecvError::Disconnected)
+            pollster::block_on(Gpu::request_with_presenter(
+                false,
+                Box::new(Capture(other_tx)),
+            )),
+            Err(Error::Invalid(_))
         ));
+        let shared = pollster::block_on(Gpu::request(false)).unwrap();
+        assert!(std::rc::Rc::ptr_eq(&gpu.execution, &shared.execution));
         let slot =
             crate::frame::Slot::new(&gpu.device, 1, 1, 4, crate::surface::PixelFormat::Bgra32)
                 .unwrap();
@@ -261,7 +268,6 @@ mod tests {
             7
         );
         drop(shared);
-        drop(headless);
         drop(gpu);
         let _next = pollster::block_on(Gpu::request(!cfg!(target_vendor = "apple"))).unwrap();
     }
