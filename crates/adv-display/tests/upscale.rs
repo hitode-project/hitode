@@ -24,6 +24,7 @@ fn gpu() -> Gpu {
     let (device, queue) = Device::open(&DeviceOptions {
         software: !cfg!(any(target_vendor = "apple", target_os = "android")),
         validation: !cfg!(target_os = "android"),
+        disable: adv_gpu::Modern::from_test_env(),
         ..Default::default()
     })
     .unwrap();

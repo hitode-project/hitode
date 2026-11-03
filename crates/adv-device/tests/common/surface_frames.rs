@@ -117,7 +117,7 @@ mod native {
             }
             let (presenter, frames) = CapturePresenter::new();
             let gpu = pollster::block_on(Gpu::request_with_presenter(
-                !cfg!(target_vendor = "apple"),
+                !cfg!(any(target_vendor = "apple", target_os = "android")),
                 Box::new(presenter),
             ))
             .unwrap();

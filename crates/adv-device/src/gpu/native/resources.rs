@@ -558,8 +558,8 @@ pub(super) mod tests {
 
     pub(in crate::gpu::native) fn open() -> Option<(Gpu, adv_gpu::Queue, stream::Consumer)> {
         let options = adv_gpu::queue::DeviceOptions {
-            software: !cfg!(target_vendor = "apple"),
-            validation: true,
+            software: !cfg!(any(target_vendor = "apple", target_os = "android")),
+            validation: !cfg!(target_os = "android"),
             ring_size: 4 << 20,
             ..Default::default()
         };

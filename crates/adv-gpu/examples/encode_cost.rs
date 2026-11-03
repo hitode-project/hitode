@@ -43,10 +43,7 @@ fn main() {
     let (device, mut queue) = Device::open(&DeviceOptions {
         software: !cfg!(any(target_vendor = "apple", target_os = "android")),
         validation: false,
-        disable: match std::env::var("ADV_GPU_TEST_DISABLE").as_deref() {
-            Ok("all") => adv_gpu::caps::Modern::all(),
-            _ => adv_gpu::caps::Modern::empty(),
-        },
+        disable: adv_gpu::caps::Modern::from_test_env(),
         ring_size: 4 << 20,
         label: "encode cost",
     })

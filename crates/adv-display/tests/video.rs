@@ -28,6 +28,7 @@ fn video_draw_matches_cpu_reference() {
         software: !cfg!(any(target_vendor = "apple", target_os = "android")),
         // Phones ship no validation layer.
         validation: !cfg!(target_os = "android"),
+        disable: adv_gpu::Modern::from_test_env(),
         ..Default::default()
     })
     .unwrap();

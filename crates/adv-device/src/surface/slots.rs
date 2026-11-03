@@ -182,8 +182,8 @@ mod tests {
     }
     fn open() -> (adv_gpu::Device, adv_gpu::Queue) {
         adv_gpu::Device::open(&DeviceOptions {
-            software: !cfg!(target_vendor = "apple"),
-            validation: true,
+            software: !cfg!(any(target_vendor = "apple", target_os = "android")),
+            validation: !cfg!(target_os = "android"),
             label: "software slots test",
             ..Default::default()
         })

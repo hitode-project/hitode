@@ -428,8 +428,8 @@ mod tests {
     #[test]
     fn a_real_depth_image_outlives_a_frame_of_partial_passes() {
         let device = match Device::open(&adv_gpu::queue::DeviceOptions {
-            software: !cfg!(target_vendor = "apple"),
-            validation: true,
+            software: !cfg!(any(target_vendor = "apple", target_os = "android")),
+            validation: !cfg!(target_os = "android"),
             label: "backing test",
             ..Default::default()
         }) {

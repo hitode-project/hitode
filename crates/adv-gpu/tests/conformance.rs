@@ -44,15 +44,11 @@ struct Gpu {
 }
 
 fn options() -> DeviceOptions {
-    let disable = match std::env::var("ADV_GPU_TEST_DISABLE").as_deref() {
-        Ok("all") => Modern::all(),
-        _ => Modern::empty(),
-    };
     DeviceOptions {
         software: !cfg!(any(target_vendor = "apple", target_os = "android")),
         // Shell processes on Android user builds cannot load layers.
         validation: !cfg!(target_os = "android"),
-        disable,
+        disable: Modern::from_test_env(),
         ring_size: 4 << 20,
         label: "conformance",
     }

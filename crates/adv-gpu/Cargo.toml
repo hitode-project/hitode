@@ -42,5 +42,10 @@ objc2-foundation = { version = "0.3.2", optional = true, default-features = fals
 block2 = { version = "0.6.2", optional = true }
 dispatch2 = { version = "0.3.1", optional = true, default-features = false, features = ["std", "objc2"] }
 
+[[example]]
+name = "gpu-check"
+path = "../../tools/android/gpu-check/check.rs"
+crate-type = ["cdylib"]
+
 [lints]
 workspace = true

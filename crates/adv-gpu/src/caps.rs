@@ -85,6 +85,21 @@ bitflags::bitflags! {
     }
 }
 
+impl Modern {
+    /// What GPU tests mask: `ADV_GPU_TEST_DISABLE=all` masks everything, so
+    /// one test binary covers both tiers, and flag names such as
+    /// `BINDLESS | PUSH_DESCRIPTORS` mask a subset. Only tests and probes call it.
+    #[doc(hidden)]
+    pub fn from_test_env() -> Self {
+        match std::env::var("ADV_GPU_TEST_DISABLE").as_deref() {
+            Ok("all") => Self::all(),
+            Ok(names) => bitflags::parser::from_str(names)
+                .unwrap_or_else(|_| panic!("ADV_GPU_TEST_DISABLE: unknown flags {names:?}")),
+            Err(_) => Self::empty(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
     pub max_image_2d: u32,

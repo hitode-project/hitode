@@ -112,7 +112,12 @@ impl Gpu {
             }
             let (device, queue) = adv_gpu::Device::open(&adv_gpu::queue::DeviceOptions {
                 software: fallback,
-                validation: cfg!(any(test, feature = "test-support")),
+                validation: cfg!(all(
+                    any(test, feature = "test-support"),
+                    not(target_os = "android")
+                )),
+                #[cfg(feature = "test-support")]
+                disable: adv_gpu::Modern::from_test_env(),
                 label: "execution GPU",
                 ..Default::default()
             })

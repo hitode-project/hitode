@@ -727,8 +727,8 @@ mod tests {
 
     fn open() -> Option<(Device, Queue)> {
         match Device::open(&adv_gpu::queue::DeviceOptions {
-            software: !cfg!(target_vendor = "apple"),
-            validation: true,
+            software: !cfg!(any(target_vendor = "apple", target_os = "android")),
+            validation: !cfg!(target_os = "android"),
             label: "owner test",
             ..Default::default()
         }) {
