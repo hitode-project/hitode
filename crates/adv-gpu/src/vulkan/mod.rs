@@ -287,13 +287,25 @@ impl Context {
         lazy: bool,
         name: &str,
     ) -> Result<Allocation> {
-        let flags = match memory {
-            Memory::Device => vk::MemoryPropertyFlags::DEVICE_LOCAL,
-            Memory::Upload | Memory::Readback => {
-                vk::MemoryPropertyFlags::HOST_VISIBLE
-                    | vk::MemoryPropertyFlags::HOST_COHERENT
-                    | vk::MemoryPropertyFlags::HOST_CACHED
-            }
+        // Mapped memory is never flushed or invalidated, so it must be
+        // coherent; CPU reads want it cached where a type is both.
+        let mapped = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+        let (required, preferred, location) = match memory {
+            Memory::Device => (
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                MemoryLocation::GpuOnly,
+            ),
+            Memory::Upload => (
+                mapped,
+                mapped | vk::MemoryPropertyFlags::HOST_CACHED,
+                MemoryLocation::CpuToGpu,
+            ),
+            Memory::Readback => (
+                mapped,
+                mapped | vk::MemoryPropertyFlags::HOST_CACHED,
+                MemoryLocation::GpuToCpu,
+            ),
         };
         let mask = |flags| {
             self.memory
@@ -308,19 +320,17 @@ impl Context {
                     }
                 })
         };
-        requirements.memory_type_bits &= mask(flags);
-        if lazy {
-            let lazy_types =
-                requirements.memory_type_bits & mask(vk::MemoryPropertyFlags::LAZILY_ALLOCATED);
-            if lazy_types != 0 {
-                requirements.memory_type_bits = lazy_types;
+        requirements.memory_type_bits &= mask(required);
+        let mut prefer = |flags| {
+            let types = requirements.memory_type_bits & mask(flags);
+            if types != 0 {
+                requirements.memory_type_bits = types;
             }
-        }
-        let location = if memory == Memory::Device {
-            MemoryLocation::GpuOnly
-        } else {
-            MemoryLocation::CpuToGpu
         };
+        prefer(preferred);
+        if lazy {
+            prefer(vk::MemoryPropertyFlags::LAZILY_ALLOCATED);
+        }
         self.allocator
             .lock()
             .unwrap()

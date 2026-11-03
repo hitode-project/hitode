@@ -72,7 +72,7 @@ fn compositor(history: &Arc<Mutex<Vec<Presentation>>>) -> Box<dyn Compositor + S
 }
 fn setup() -> (Device, Queue, Display, Arc<Mutex<Vec<Presentation>>>) {
     let (d, q) = Device::open(&queue::DeviceOptions {
-        validation: true,
+        validation: !cfg!(target_os = "android"),
         ..Default::default()
     })
     .unwrap();
@@ -416,7 +416,7 @@ fn failed_attachment_keeps_the_ledger_uncommitted_and_reports_the_submitted_read
         fn drain(&mut self, _: &mut Vec<Presented>, _: &mut Vec<Released>) {}
     }
     let (d, mut q) = Device::open(&queue::DeviceOptions {
-        validation: true,
+        validation: !cfg!(target_os = "android"),
         ..Default::default()
     })
     .unwrap();

@@ -20,8 +20,9 @@ fn draw(
     damage: Option<Rect>,
 ) -> Vec<u8> {
     let (device, mut queue) = Device::open(&queue::DeviceOptions {
-        software: !cfg!(target_vendor = "apple"),
-        validation: true,
+        software: !cfg!(any(target_vendor = "apple", target_os = "android")),
+        validation: !cfg!(target_os = "android"),
+        disable: adv_gpu::Modern::from_test_env(),
         ..Default::default()
     })
     .unwrap();

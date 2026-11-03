@@ -149,9 +149,33 @@ mod android {
                 Err(error) => writeln!(caps, "{tier}: open failed: {error}").unwrap(),
             }
         }
+        caps.push_str(&memory_types());
         std::fs::write(out.join("caps.txt"), &caps).expect("caps");
         log(caps.lines().next().unwrap_or_default());
         log("done");
+    }
+
+    /// Every memory type, which the device caps do not show.
+    fn memory_types() -> String {
+        use ash::vk;
+        let mut out = String::new();
+        let entry = unsafe { ash::Entry::load() }.expect("Vulkan loader");
+        let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_1);
+        let info = vk::InstanceCreateInfo::default().application_info(&app);
+        let instance = unsafe { entry.create_instance(&info, None) }.expect("instance");
+        for device in unsafe { instance.enumerate_physical_devices() }.expect("devices") {
+            let memory = unsafe { instance.get_physical_device_memory_properties(device) };
+            for (i, ty) in memory.memory_types_as_slice().iter().enumerate() {
+                writeln!(
+                    out,
+                    "memory type {i}: heap {} {:?}",
+                    ty.heap_index, ty.property_flags
+                )
+                .unwrap();
+            }
+        }
+        unsafe { instance.destroy_instance(None) };
+        out
     }
 
     #[unsafe(no_mangle)]

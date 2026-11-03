@@ -55,7 +55,13 @@ fn sample_position(position: vec2<f32>) -> vec2<f32> {
         let q = p * output.prescale - 0.5;
         let a = floor(q); let f = fract(q);
         let lo = floor(a / output.prescale); let hi = floor((a+1.0) / output.prescale);
-        c = mix(mix(soft_texel(lo),soft_texel(vec2(hi.x,lo.y)),f.x),mix(soft_texel(vec2(lo.x,hi.y)),soft_texel(hi),f.x),f.y);
+        // One decode site for the four taps: Adreno 750 fails to compile four
+        // inlined decoders when storage is bindless.
+        var t: array<vec4<f32>, 4>;
+        for (var i = 0u; i < 4u; i++) {
+            t[i] = soft_texel(select(lo, hi, vec2((i & 1u) != 0u, (i & 2u) != 0u)));
+        }
+        c = mix(mix(t[0],t[1],f.x),mix(t[2],t[3],f.x),f.y);
     }
     return vec4(c.rgb,1.0);
 }

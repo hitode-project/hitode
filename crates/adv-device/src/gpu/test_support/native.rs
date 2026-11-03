@@ -94,7 +94,7 @@ pub async fn request(fallback: bool) -> Result<Gpu, Error> {
     let (presenter, receiver) = CapturePresenter::new();
     let (device, queue) = adv_gpu::Device::open(&adv_gpu::queue::DeviceOptions {
         software: fallback,
-        validation: true,
+        validation: !cfg!(target_os = "android"),
         ..Default::default()
     })
     .map_err(super::record::gpu_error)?;

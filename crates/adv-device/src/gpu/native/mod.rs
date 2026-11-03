@@ -279,7 +279,7 @@ mod tests {
         }
         let (tx, rx) = std::sync::mpsc::channel();
         let (device, queue) = adv_gpu::Device::open(&adv_gpu::queue::DeviceOptions {
-            software: !cfg!(target_vendor = "apple"),
+            software: !cfg!(any(target_vendor = "apple", target_os = "android")),
             ..Default::default()
         })
         .unwrap();
@@ -291,7 +291,7 @@ mod tests {
         .unwrap();
         let (other_tx, _) = std::sync::mpsc::channel();
         let (other_device, other_queue) = adv_gpu::Device::open(&adv_gpu::queue::DeviceOptions {
-            software: !cfg!(target_vendor = "apple"),
+            software: !cfg!(any(target_vendor = "apple", target_os = "android")),
             ..Default::default()
         })
         .unwrap();
