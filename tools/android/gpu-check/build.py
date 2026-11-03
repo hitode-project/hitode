@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Build the Game Loop APK that runs the GPU tests on cloud devices.
 
-Needs ANDROID_HOME, ANDROID_NDK_HOME, CARGO_TARGET_DIR, cargo-ndk and a Java
-runtime for apksigner; prints the signed APK's path.
+Needs ANDROID_HOME, ANDROID_NDK_HOME, CARGO_TARGET_DIR, cargo-ndk and a JDK in
+JAVA_HOME (javac, d8, apksigner); prints the signed APK's path.
 """
 import json
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import zipfile
@@ -63,7 +64,19 @@ def main():
         tools / "aapt2", "link", "-I", sdk / "platforms/android-36/android.jar",
         "--manifest", Path(__file__).with_name("AndroidManifest.xml"), "-o", unsigned,
     ], check=True)
+    # Test Lab rejects APKs without code; one empty class satisfies it.
+    stub = build / "stub"
+    shutil.rmtree(stub, ignore_errors=True)
+    (stub / "org/hitode/gpucheck").mkdir(parents=True)
+    (stub / "org/hitode/gpucheck/Stub.java").write_text(
+        "package org.hitode.gpucheck;\nfinal class Stub {}\n")
+    javac = Path(os.environ["JAVA_HOME"]) / "bin/javac"
+    subprocess.run([javac, "--release", "11", "-d", stub, stub / "org/hitode/gpucheck/Stub.java"],
+                   check=True)
+    subprocess.run([tools / "d8", "--min-api", "29", "--output", stub,
+                    stub / "org/hitode/gpucheck/Stub.class"], check=True)
     with zipfile.ZipFile(unsigned, "a", compression=zipfile.ZIP_DEFLATED) as apk:
+        apk.write(stub / "classes.dex", "classes.dex")
         apk.write(target / "aarch64-linux-android/release/examples/libgpu_check.so",
                   "lib/arm64-v8a/libgpu_check.so")
         for name, executable in binaries:
