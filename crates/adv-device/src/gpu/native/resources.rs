@@ -447,6 +447,8 @@ impl Gpu {
         rectangle: Rect,
         staged: &Staged,
     ) -> Result<(), Error> {
+        #[cfg(feature = "test-support")]
+        self.stream.0.borrow().admit()?;
         upload_bounds(image, rectangle, staged.pitch, staged.len())?;
         self.record_upload(
             image,
@@ -487,6 +489,8 @@ impl Gpu {
         pitch: u32,
         bgra: &[u8],
     ) -> Result<(), Error> {
+        #[cfg(feature = "test-support")]
+        self.stream.0.borrow().admit()?;
         let row = upload_bounds(image, rectangle, pitch, bgra.len())?;
         let bytes = self.stream.bytes(row * rectangle.h, 256, |bytes| {
             for y in 0..rectangle.h {
@@ -576,6 +580,8 @@ pub(super) mod tests {
             stream: stream.clone(),
             video: Arc::from([]),
             owner: super::super::owner::Owner::unstarted(),
+            #[cfg(feature = "test-support")]
+            capture: Default::default(),
         });
         Some((
             Gpu {

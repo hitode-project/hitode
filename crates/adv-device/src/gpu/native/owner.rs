@@ -115,6 +115,8 @@ pub(super) fn run(
     high_priority()?;
     let mut state = State::new(queue, presenter);
     while let Some(chunk) = commands.next() {
+        #[cfg(feature = "test-support")]
+        let _submissions = commands.submissions();
         state.chunks.push_back(chunk);
         #[cfg(target_vendor = "apple")]
         objc2::rc::autoreleasepool(|_| state.drain(&commands))?;

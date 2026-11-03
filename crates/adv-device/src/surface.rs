@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 mod composite;
-mod convert;
+pub(crate) mod convert;
 use convert::{BLACK_PALETTE, decode_pixel};
 mod sprite;
 pub use sprite::{Sprite, SpriteAlpha, SpriteMode};

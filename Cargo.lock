@@ -76,6 +76,7 @@ dependencies = [
 name = "adv-device"
 version = "0.2.3"
 dependencies = [
+ "adv-device",
  "adv-display",
  "adv-gpu",
  "adv-sync",

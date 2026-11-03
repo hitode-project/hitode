@@ -19,12 +19,17 @@ mod programmable;
 mod renderer;
 #[cfg(not(feature = "native-display"))]
 mod submission;
+#[cfg(all(feature = "test-support", not(feature = "native-display")))]
+#[path = "gpu/test_support/renderer.rs"]
+pub mod test_support;
 mod vertex_bytes;
 #[cfg(not(feature = "native-display"))]
 use depth::DeferredClear;
 #[cfg(not(feature = "native-display"))]
 pub use depth::Depth;
 pub use depth::{DepthFormat, Stencil, StencilFace, StencilOp};
+#[cfg(all(feature = "test-support", feature = "native-display"))]
+pub use native::test_support;
 #[cfg(feature = "native-display")]
 pub use native::{Depth, Gpu, Image, ImageId, Readback, Staged, Target};
 pub use programmable::{

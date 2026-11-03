@@ -352,15 +352,8 @@ fn reference(f: &mut Fixture, colors: [[f32; 4]; 3]) -> Vec<u8> {
     pixels(f, &target.image)
 }
 fn latest(f: &mut Fixture) -> Vec<u8> {
-    let image =
-        f.m.ext
-            .get::<Presents>()
-            .latest
-            .as_ref()
-            .unwrap()
-            .image
-            .clone();
-    pixels(f, &image)
+    let frame = f.m.ext.get::<Presents>().latest.as_ref().unwrap().clone();
+    frame.pixels(f.m.ext.get_mut::<State>().gpu.as_mut().unwrap())
 }
 // spec: GFX-REC-4 GFX-REC-5
 #[test]
@@ -370,14 +363,12 @@ fn one_changed_quad_replays_in_order_and_clear_preserves_pixels_outside_damage()
     scene(&mut f, colors);
     present(&mut f);
     colors[0] = [1., 1., 0., 1.];
-    let before = stats(&f).draws;
+    test_support::renderer_test! { let before = stats(&f).draws; }
     scene(&mut f, colors);
     present(&mut f);
-    assert_eq!(
-        stats(&f).draws - before,
-        2,
-        "one bounded clear and the intersecting quad"
-    );
+    test_support::renderer_test! {
+        assert_eq!(stats(&f).draws - before, 2, "one bounded clear and the intersecting quad");
+    }
     assert_eq!(latest(&mut f), reference(&mut f, colors));
     let counts = f.m.ext.get::<State>().frames;
     assert_eq!(counts.clipped_executions, 1);
@@ -656,7 +647,7 @@ fn rotate(f: &mut Fixture, count: usize) {
         let provider = ext.get::<State>().provider;
         let image = (provider.target)(ext, surface).unwrap().image;
         let serial = ext.get::<Presents>().serial + 1;
-        let native = gpu.completed_frame(image, serial)?;
+        let native = test_support::completed_frame(gpu, image, damage, serial)?;
         let r = ext.get_mut::<Rotation>();
         r.damage.push(damage);
         r.next = (r.next + 1) % r.targets.len();

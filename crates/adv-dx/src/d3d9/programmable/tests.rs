@@ -22,7 +22,7 @@ fn every_declaration_type_is_fetched_by_the_gpu_with_d3d_component_defaults() {
         Ok("metal") => GpuBackend::Metal,
         _ => GpuBackend::Automatic,
     };
-    let mut gpu = pollster::block_on(Gpu::request_backend(
+    let mut gpu = pollster::block_on(adv_device::gpu::test_support::request_backend(
         matches!(backend, GpuBackend::Automatic)
             && !cfg!(any(target_os = "macos", target_os = "android")),
         backend,
@@ -222,8 +222,11 @@ fn every_declaration_type_is_fetched_by_the_gpu_with_d3d_component_defaults() {
             "one adapter cache, without stale temporary files"
         );
         assert!(std::fs::metadata(&files[0]).unwrap().len() > 40);
-        let mut reopened =
-            pollster::block_on(Gpu::request_backend(false, GpuBackend::Vulkan)).unwrap();
+        let mut reopened = pollster::block_on(adv_device::gpu::test_support::request_backend(
+            false,
+            GpuBackend::Vulkan,
+        ))
+        .unwrap();
         reopened.set_pipeline_cache_directory(Some(&dir));
         reopened.check().unwrap();
         reopened.set_pipeline_cache_directory(None);
@@ -235,6 +238,7 @@ fn every_declaration_type_is_fetched_by_the_gpu_with_d3d_component_defaults() {
     }
 }
 
+adv_device::gpu::test_support::renderer_test! {
 // spec: GFX-METAL-1
 #[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
 #[test]
@@ -243,17 +247,18 @@ fn declaration_fixtures_match_native_metal_and_wgpu_exactly() {
         "every_declaration_type_is_fetched_by_the_gpu_with_d3d_component_defaults",
     );
 }
+}
 
 // spec: GFX-INPUT-1
 #[test]
 fn fixed_pixel_stages_combine_a_second_texture_stage() {
-    let mut gpu = pollster::block_on(Gpu::request_backend(
+    let mut gpu = pollster::block_on(adv_device::gpu::test_support::request_backend(
         !cfg!(any(target_os = "macos", target_os = "android")),
         GpuBackend::Automatic,
     ))
     .unwrap();
     let target = gpu.target(8, 8, false).unwrap();
-    let texel = |bgra: [u8; 4]| {
+    let texel = |gpu: &mut Gpu, bgra: [u8; 4]| {
         let image = gpu.image(1, 1).unwrap();
         let whole = adv_device::surface::Rect {
             x: 0,
@@ -265,7 +270,10 @@ fn fixed_pixel_stages_combine_a_second_texture_stage() {
         image
     };
     // Stage zero texel (0.5, 1, 1, 1), stage one (1, 0.5, 0.25, 0.5).
-    let images = [texel([255, 255, 128, 255]), texel([64, 128, 255, 128])];
+    let images = [
+        texel(&mut gpu, [255, 255, 128, 255]),
+        texel(&mut gpu, [64, 128, 255, 128]),
+    ];
     let source = source::build(
         None,
         None,

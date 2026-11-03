@@ -1,6 +1,7 @@
 use super::super::stretch::tests::Fixture;
 use super::*;
 use adv_cpu::backend::Guest;
+use adv_device::gpu::test_support::{self, Frame};
 use adv_device::gpu::*;
 use adv_device::surface::Rect;
 
@@ -24,7 +25,7 @@ fn id(f: &mut Fixture) -> Id {
 struct Presents {
     serial: u64,
     published: Vec<u64>,
-    latest: Option<NativeFrame>,
+    latest: Option<Frame>,
     fail: bool,
     detached: bool,
     damage: Vec<Option<Rect>>,
@@ -44,7 +45,7 @@ fn fixture_with_limits(limits: adv_machine::ObjectLimits) -> Fixture {
             .unwrap()
             .image;
         let serial = ext.get::<Presents>().serial + 1;
-        let frame = gpu.present(&image, serial)?;
+        let frame = test_support::present(gpu, &image, damage, serial)?;
         let p = ext.get_mut::<Presents>();
         p.damage.push(damage);
         p.serial = serial;
@@ -312,6 +313,7 @@ fn render_target_readback_and_gpu_lock_flush_prior_draws() {
     assert!(f.m.ext.get::<State>().frames.flushes[Reason::Lock as usize] > 0);
 }
 
+test_support::renderer_test! {
 // spec: GFX-REC-1
 #[test]
 fn busy_resumes_the_unexecuted_suffix_once_and_cancellation_releases_flush_ownership() {
@@ -354,6 +356,7 @@ fn busy_resumes_the_unexecuted_suffix_once_and_cancellation_releases_flush_owner
         assert_eq!(&f.pixels(&image)[..4], &[0x33, 0x22, 0x11, 0xff]);
         assert!(f.m.ext.get::<State>().pending.is_empty());
     }
+}
 }
 
 // spec: GFX-REC-1, GFX-REC-2, GFX-REC-7
@@ -489,15 +492,10 @@ fn verification_executes_repeats_async_and_counts_real_pixel_mismatches() {
 #[test]
 fn invalid_commands_return_synchronously_and_device_loss_is_sticky_until_reset() {
     let mut f = fixture();
-    let pause =
-        f.m.ext
-            .get::<State>()
-            .gpu
-            .as_ref()
-            .unwrap()
-            .context()
-            .pause_submissions()
-            .unwrap();
+    let pause = adv_device::gpu::test_support::pause_submissions(
+        f.m.ext.get::<State>().gpu.as_ref().unwrap(),
+    )
+    .unwrap();
     let invalid = f.call(
         "IDirect3DDevice9::Clear",
         &[f.device, 0, 0, 1, 0, f32::NAN.to_bits(), 0],
@@ -525,15 +523,10 @@ fn invalid_commands_return_synchronously_and_device_loss_is_sticky_until_reset()
 #[test]
 fn command_and_byte_limits_flush_complete_ordered_work_and_disable_partial_frame_elision() {
     let mut f = fixture();
-    let pause =
-        f.m.ext
-            .get::<State>()
-            .gpu
-            .as_ref()
-            .unwrap()
-            .context()
-            .pause_submissions()
-            .unwrap();
+    let pause = adv_device::gpu::test_support::pause_submissions(
+        f.m.ext.get::<State>().gpu.as_ref().unwrap(),
+    )
+    .unwrap();
     for _ in 0..4095 {
         clear(&mut f, 0xff123456)
     }
@@ -1267,7 +1260,7 @@ fn another_front_publication_prevents_eliding_an_unchanged_device_frame() {
     let gpu = f.m.ext.get_mut::<State>().gpu.as_mut().unwrap();
     let other = gpu.target(16, 12, false).unwrap();
     gpu.clear(&other, Some([0., 0., 1., 1.]), None).unwrap();
-    let snapshot = gpu.present(&other.image, 2).unwrap();
+    let snapshot = test_support::present(gpu, &other.image, None, 2).unwrap();
     let p = f.m.ext.get_mut::<Presents>();
     p.serial = 2;
     p.latest = Some(snapshot);
@@ -1276,15 +1269,12 @@ fn another_front_publication_prevents_eliding_an_unchanged_device_frame() {
     present(&mut f);
     assert_eq!(f.m.ext.get::<Presents>().published, [1, 2, 3]);
     assert_eq!(f.m.ext.get::<State>().frames.eliminated_frames, 0);
-    let image =
-        f.m.ext
-            .get::<Presents>()
-            .latest
-            .as_ref()
-            .unwrap()
-            .image
-            .clone();
-    assert_eq!(&f.pixels(&image)[..4], &[0x56, 0x34, 0x12, 0xff]);
+    let frame = f.m.ext.get::<Presents>().latest.as_ref().unwrap().clone();
+    super::super::tests::flush_recordings(&mut env(&mut f));
+    assert_eq!(
+        &frame.pixels(f.m.ext.get_mut::<State>().gpu.as_mut().unwrap())[..4],
+        &[0x56, 0x34, 0x12, 0xff]
+    );
 }
 
 // spec: GFX-REC-1
@@ -1293,7 +1283,7 @@ fn execution_time_device_failure_is_deferred_to_cooperative_level_and_present() 
     let mut f = fixture();
     clear(&mut f, 0xff123456);
     let gpu = f.m.ext.get_mut::<State>().gpu.as_mut().unwrap();
-    gpu.context().device.destroy();
+    test_support::destroy(gpu);
     let _ = gpu.poll();
     let outcome = flush(&mut f, Reason::Readback);
     assert_eq!(f.finish(outcome), 0, "flush defers device loss");
@@ -1349,6 +1339,7 @@ fn cancelling_verification_releases_the_map_and_never_republishes_its_completed_
     assert_eq!(f.m.ext.get::<State>().frames.verification_mismatches, 0);
 }
 
+test_support::renderer_test! {
 // spec: GFX-REC-1 GFX-REC-2
 #[test]
 fn failed_busy_wait_admission_keeps_successful_prefix_but_rejects_incoming_upload() {
@@ -1400,6 +1391,7 @@ fn failed_busy_wait_admission_keeps_successful_prefix_but_rejects_incoming_uploa
     assert_eq!(f.pixels(&target.image), vec![0; 16 * 12 * 4]);
     let back = f.image(f.back);
     assert_eq!(&f.pixels(&back)[..4], &[0x56, 0x34, 0x12, 0xff]);
+}
 }
 
 // spec: GFX-REC-2
@@ -1890,6 +1882,7 @@ fn d3d9_package_b_event_tracks_issue_boundary_and_flushes_without_guest_waits() 
     );
 }
 
+test_support::renderer_test! {
 // spec: GFX-QUERY-1, GFX-REC-1
 #[test]
 fn d3d9_package_b_query_flush_busy_preserves_suffix_without_blocking_or_replay() {
@@ -1924,6 +1917,7 @@ fn d3d9_package_b_query_flush_busy_preserves_suffix_without_blocking_or_replay()
     assert_eq!(stats(&f).draws, before + 1);
     let image = f.image(rt);
     assert_eq!(&f.pixels(&image)[..4], &[0x33, 0x22, 0x11, 0xff]);
+}
 }
 
 // spec: GFX-QUERY-1

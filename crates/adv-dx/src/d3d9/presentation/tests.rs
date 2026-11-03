@@ -2,7 +2,10 @@
 use super::*;
 use adv_abi::ApiDiagnostics;
 use adv_cpu::{JitCpu, backend::Guest};
-use adv_device::gpu::{Image, NativeFrame};
+use adv_device::gpu::{
+    Image,
+    test_support::{self, Frame},
+};
 
 fn env(machine: &mut Machine<JitCpu>) -> Env<'_> {
     Env {
@@ -418,7 +421,7 @@ struct Surfaces {
     next: u32,
     serial: u64,
     targets: BTreeMap<u32, Target>,
-    frames: Vec<NativeFrame>,
+    frames: Vec<Frame>,
 }
 fn pixels(env: &mut Env<'_>, image: &Image) -> Vec<u8> {
     super::super::tests::flush_recordings(env);
@@ -434,8 +437,13 @@ fn pixels(env: &mut Env<'_>, image: &Image) -> Vec<u8> {
     transfer.poll().unwrap().unwrap()
 }
 
+fn frame_pixels(env: &mut Env<'_>, frame: &Frame) -> Vec<u8> {
+    super::super::tests::flush_recordings(env);
+    frame.pixels(env.ext.get_mut::<State>().gpu.as_mut().unwrap())
+}
+
 fn install_surfaces(env: &mut Env<'_>) {
-    let gpu = pollster::block_on(Gpu::request(!cfg!(any(
+    let gpu = pollster::block_on(adv_device::gpu::test_support::request(!cfg!(any(
         target_os = "macos",
         target_os = "android"
     ))))
@@ -458,10 +466,10 @@ fn install_surfaces(env: &mut Env<'_>) {
         ext.get_mut::<Surfaces>().targets.remove(&surface).unwrap();
         Ok(())
     };
-    state.provider.present_copy = |ext, surface, _, gpu| {
+    state.provider.present_copy = |ext, surface, damage, gpu| {
         let surfaces = ext.get_mut::<Surfaces>();
         let serial = surfaces.serial + 1;
-        let frame = gpu.present(&surfaces.targets[&surface].image, serial)?;
+        let frame = test_support::present(gpu, &surfaces.targets[&surface].image, damage, serial)?;
         surfaces.frames.push(frame);
         surfaces.serial = serial;
         Ok(serial)
@@ -539,8 +547,8 @@ fn copy_create_present_retains_pixels_and_reset_retains_effect_using_one_gpu() {
         Outcome::Return(0)
     ));
     assert_eq!(pixels(&mut env, &target.image), expected);
-    let snapshot = env.ext.get::<Surfaces>().frames[0].image.clone();
-    assert_eq!(pixels(&mut env, &snapshot), expected);
+    let snapshot = env.ext.get::<Surfaces>().frames[0].clone();
+    assert_eq!(frame_pixels(&mut env, &snapshot), expected);
     let front = device(&env, pointer).unwrap().front.unwrap();
     assert_ne!(front, surface);
     assert_eq!(env.ext.get::<Surfaces>().targets.len(), 2);
@@ -560,7 +568,7 @@ fn copy_create_present_retains_pixels_and_reset_retains_effect_using_one_gpu() {
     ));
     let green = [0u8, 255, 0, 255].repeat(16 * 12);
     assert_eq!(pixels(&mut env, &target.image), green);
-    assert_eq!(pixels(&mut env, &snapshot), expected);
+    assert_eq!(frame_pixels(&mut env, &snapshot), expected);
     let full = packet(
         &mut env,
         RECT {
@@ -656,6 +664,7 @@ fn copy_create_present_retains_pixels_and_reset_retains_effect_using_one_gpu() {
     assert_eq!(super::super::release(&mut env, pointer), 0);
     assert_eq!(env.sys.objects.alias_count(com(&env).namespace()), aliases);
     assert!(env.ext.get::<Surfaces>().targets.is_empty());
+    test_support::renderer_test! {
     assert_eq!(
         env.ext
             .get::<State>()
@@ -666,6 +675,7 @@ fn copy_create_present_retains_pixels_and_reset_retains_effect_using_one_gpu() {
             .native_frames,
         2
     );
+    }
     assert!(env.ext.get::<State>().pending.is_empty());
     assert!(env.ext.get::<State>().transfers.is_empty());
 }
@@ -727,7 +737,7 @@ fn partial_copy_preserves_front_pixels_back_buffer_and_prior_snapshots() {
     ));
     let front = device(&env, pointer).unwrap().front.unwrap();
     let front_target = env.ext.get::<Surfaces>().targets[&front].clone();
-    let first_snapshot = env.ext.get::<Surfaces>().frames[0].image.clone();
+    let first_snapshot = env.ext.get::<Surfaces>().frames[0].clone();
 
     env.ext
         .get_mut::<State>()
@@ -759,9 +769,9 @@ fn partial_copy_preserves_front_pixels_back_buffer_and_prior_snapshots() {
     let mut expected = original.clone();
     expected[..16 * 8 * 4].copy_from_slice(&[0u8, 255, 0, 255].repeat(16 * 8));
     assert_eq!(pixels(&mut env, &front_target.image), expected);
-    let second_snapshot = env.ext.get::<Surfaces>().frames[1].image.clone();
-    assert_eq!(pixels(&mut env, &second_snapshot), expected);
-    assert_eq!(pixels(&mut env, &first_snapshot), original);
+    let second_snapshot = env.ext.get::<Surfaces>().frames[1].clone();
+    assert_eq!(frame_pixels(&mut env, &second_snapshot), expected);
+    assert_eq!(frame_pixels(&mut env, &first_snapshot), original);
     assert_eq!(
         pixels(&mut env, &target.image),
         [0u8, 255, 0, 255].repeat(16 * 12)
@@ -823,9 +833,9 @@ fn partial_copy_preserves_front_pixels_back_buffer_and_prior_snapshots() {
     }
     assert_eq!(pixels(&mut env, &front_target.image), expected);
     assert_eq!(pixels(&mut env, &target.image), changed);
-    assert_eq!(pixels(&mut env, &first_snapshot), original);
+    assert_eq!(frame_pixels(&mut env, &first_snapshot), original);
     assert_eq!(
-        &pixels(&mut env, &second_snapshot)[16 * 8 * 4..],
+        &frame_pixels(&mut env, &second_snapshot)[16 * 8 * 4..],
         &original[16 * 8 * 4..]
     );
 
@@ -865,5 +875,5 @@ fn partial_copy_preserves_front_pixels_back_buffer_and_prior_snapshots() {
     assert!(env.ext.try_get::<ApiDiagnostics>().is_none());
     assert_eq!(super::super::release(&mut env, pointer), 0);
     assert!(env.ext.get::<Surfaces>().targets.is_empty());
-    assert_eq!(pixels(&mut env, &first_snapshot), original);
+    assert_eq!(frame_pixels(&mut env, &first_snapshot), original);
 }

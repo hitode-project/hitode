@@ -138,6 +138,8 @@ impl Gpu {
         depth: Option<f32>,
         stencil: Option<u32>,
     ) -> Result<(), Error> {
+        #[cfg(feature = "test-support")]
+        self.stream.0.borrow().admit()?;
         rectangle_in(&target.image, rectangle)?;
         if color.is_none() && depth.is_none() && stencil.is_none()
             || color.is_some_and(|c| c.iter().any(|v| !v.is_finite() || !(0. ..=1.).contains(v)))
@@ -185,6 +187,8 @@ impl Gpu {
         image: Option<&Image>,
         mut state: DrawState,
     ) -> Result<(), Error> {
+        #[cfg(feature = "test-support")]
+        self.stream.0.borrow().admit()?;
         validate_state(target, &state)?;
         validate_count(vertices.len(), state.topology)?;
         if std::mem::size_of_val(vertices) > MAX_UPLOAD
@@ -332,6 +336,8 @@ impl Gpu {
         draw: &ProgrammableDraw,
         state: &DrawState,
     ) -> Result<(), Error> {
+        #[cfg(feature = "test-support")]
+        self.stream.0.borrow().admit()?;
         validate_state(target, state)?;
         let count = draw
             .indices
@@ -557,6 +563,8 @@ impl Gpu {
         region: Rect,
         filter: Filter,
     ) -> Result<(), Error> {
+        #[cfg(feature = "test-support")]
+        self.stream.0.borrow().admit()?;
         rectangle_in(source, rectangle)?;
         rectangle_in(destination, region)?;
         if source.shares_storage(destination) {
@@ -671,6 +679,8 @@ impl Gpu {
         x: u32,
         y: u32,
     ) -> Result<(), Error> {
+        #[cfg(feature = "test-support")]
+        self.stream.0.borrow().admit()?;
         rectangle_in(source, rectangle)?;
         let region = Rect {
             x,
@@ -722,6 +732,8 @@ impl Gpu {
         self.check()
     }
     pub fn present(&mut self, image: &Image, damage: Damage, serial: u64) -> Result<(), Error> {
+        #[cfg(feature = "test-support")]
+        self.stream.0.borrow().admit()?;
         if let Damage::Rects(rects) = &damage {
             for &r in rects {
                 rectangle_in(
@@ -748,6 +760,8 @@ impl Gpu {
         self.stream.push(Command::DiscardDepth(depth.clone()));
     }
     pub fn flush(&mut self) -> Result<(), Error> {
+        #[cfg(feature = "test-support")]
+        self.stream.0.borrow().admit()?;
         self.stream.push(Command::Submit);
         self.check()
     }
@@ -756,6 +770,8 @@ impl Gpu {
         image: &Image,
         wake: Option<Arc<adv_sync::WakeEvent>>,
     ) -> Result<Readback, Error> {
+        #[cfg(feature = "test-support")]
+        self.stream.0.borrow().admit()?;
         self.check()?;
         let format = color_format(image);
         if !matches!(

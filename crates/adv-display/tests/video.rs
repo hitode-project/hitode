@@ -1,10 +1,10 @@
-#![cfg(any(target_vendor = "apple", target_os = "android"))]
-
 use adv_display::{
     Rect,
     plan::Tiles,
     stages::{ingest, video::*},
 };
+#[cfg(any(target_vendor = "apple", target_os = "android"))]
+use adv_gpu::present::PoolDesc;
 use adv_gpu::{
     Device, Format,
     encode::{ColorAttachment, Load, RenderPassDesc, Store},
@@ -14,7 +14,6 @@ use adv_gpu::{
 use adv_gpu::{
     Extent, Rect as GpuRect, Token,
     encode::{BufferCopy, ImageCopy},
-    present::PoolDesc,
     queue::DeviceOptions,
     resource::{BufferDesc, BufferUsage, ImageDesc, Memory, Usage},
 };
@@ -25,10 +24,15 @@ use std::time::Duration;
 #[test]
 // spec: HOST-VIEW-3
 fn video_draw_matches_cpu_reference() {
-    let (device, mut queue) = Device::open(&DeviceOptions::default()).unwrap();
-    #[cfg(target_vendor = "apple")]
+    let (device, mut queue) = Device::open(&DeviceOptions {
+        software: !cfg!(any(target_vendor = "apple", target_os = "android")),
+        validation: true,
+        ..Default::default()
+    })
+    .unwrap();
+    #[cfg(not(target_os = "android"))]
     let (pipeline, sampler) = resources(&device, Format::Rgba8Unorm).unwrap();
-    #[cfg(target_vendor = "apple")]
+    #[cfg(not(target_os = "android"))]
     let (software_pipeline, _) = software_resources(&device, Format::Rgba8Unorm).unwrap();
     let software_buffer = device
         .create_buffer(&BufferDesc {
@@ -50,6 +54,24 @@ fn video_draw_matches_cpu_reference() {
         extent: (20, 14),
         format: ingest::PixelFormat::Bgra32,
         palette: None,
+    };
+    let indexed_buffer = device
+        .create_buffer(&BufferDesc {
+            size: 140,
+            usage: BufferUsage::STORAGE,
+            memory: Memory::Upload,
+            label: "indexed video base",
+        })
+        .unwrap();
+    unsafe { indexed_buffer.mapped().unwrap().as_mut() }.fill(0x99);
+    let mut palette = [[0; 4]; 256];
+    palette[9] = [5, 15, 25, 255];
+    let indexed_source = ingest::Source {
+        buffer: &indexed_buffer,
+        pitch: 10,
+        extent: (20, 14),
+        format: ingest::PixelFormat::Indexed4,
+        palette: Some(&palette),
     };
     let mut ring = device.ring(65536).unwrap();
     let size = Extent {
@@ -77,14 +99,15 @@ fn video_draw_matches_cpu_reference() {
             label: "video readback",
         })
         .unwrap();
-    #[cfg(target_vendor = "apple")]
+    #[cfg(not(target_os = "android"))]
     let y: Vec<u8> = (0..8 * 6).map(|i| (24 + i * 4) as u8).collect();
-    #[cfg(target_vendor = "apple")]
+    #[cfg(not(target_os = "android"))]
     let uv: Vec<u8> = (0..4 * 3)
         .flat_map(|i| [(71 + i * 6) as u8, (171 - i * 4) as u8])
         .collect();
     #[cfg(target_os = "android")]
     let (y, uv) = (vec![80; 8 * 6], [109, 175].repeat(4 * 3));
+    #[cfg(any(target_vendor = "apple", target_os = "android"))]
     let format = [Format::Nv12, Format::Nv21]
         .into_iter()
         .find(|&f| {
@@ -117,6 +140,7 @@ fn video_draw_matches_cpu_reference() {
         YuvColor::Bt709Limited,
         YuvColor::Bt709Full,
     ] {
+        #[cfg(any(target_vendor = "apple", target_os = "android"))]
         let mut pool = device
             .create_present_pool(&PoolDesc {
                 width: 8,
@@ -137,7 +161,9 @@ fn video_draw_matches_cpu_reference() {
         #[cfg(target_os = "android")]
         let software_pipeline =
             converted_software_resources(&device, Format::Rgba8Unorm, &pool).unwrap();
+        #[cfg(any(target_vendor = "apple", target_os = "android"))]
         let mut image = pool.acquire_cpu().unwrap();
+        #[cfg(any(target_vendor = "apple", target_os = "android"))]
         image.write(|planes| {
             for row in 0..6 {
                 let start = row * planes[0].stride;
@@ -172,6 +198,59 @@ fn video_draw_matches_cpu_reference() {
                 })
                 .unwrap()
         });
+        #[cfg(not(any(target_vendor = "apple", target_os = "android")))]
+        let planes = {
+            let images = std::array::from_fn::<_, 2, _>(|plane| {
+                device
+                    .create_image(&ImageDesc {
+                        dimension: Dimension::D2,
+                        size: Extent {
+                            width: [8, 4][plane],
+                            height: [6, 3][plane],
+                            depth_or_layers: 1,
+                        },
+                        format: [Format::R8Unorm, Format::Rg8Unorm][plane],
+                        mips: 1,
+                        samples: 1,
+                        usage: Usage::SAMPLED | Usage::COPY_DST,
+                        view_formats: &[],
+                        label: "video plane",
+                    })
+                    .unwrap()
+            });
+            let upload = device
+                .create_buffer(&BufferDesc {
+                    size: 72,
+                    usage: BufferUsage::COPY_SRC,
+                    memory: Memory::Upload,
+                    label: "video plane bytes",
+                })
+                .unwrap();
+            let bytes = unsafe { upload.mapped().unwrap().as_mut() };
+            bytes[..48].copy_from_slice(&y);
+            bytes[48..].copy_from_slice(&uv);
+            let mut encoder = queue.encoder("video plane upload");
+            for (plane, image) in images.iter().enumerate() {
+                encoder.copy_buffer_to_image(
+                    BufferCopy {
+                        buffer: &upload,
+                        offset: [0, 48][plane],
+                        row_pitch: 8,
+                        rows: [6, 3][plane],
+                    },
+                    ImageCopy {
+                        image,
+                        mip: 0,
+                        layer: 0,
+                        origin: (0, 0, 0),
+                    },
+                    image.desc().size,
+                );
+            }
+            let token = queue.submit(encoder).unwrap();
+            assert!(queue.wait(token, Duration::from_secs(20)).unwrap());
+            images.map(|image| image.view().clone())
+        };
         let geometry = Geometry {
             destination: Rect {
                 x: 3,
@@ -191,7 +270,13 @@ fn video_draw_matches_cpu_reference() {
             )),
             color,
         };
-        for software in [false, true] {
+        for base in 0..3 {
+            let software = base != 0;
+            let software_source = if base == 2 {
+                &indexed_source
+            } else {
+                &software_source
+            };
             let mut encoder = queue.encoder("video test");
             drop(
                 encoder.render_pass(&RenderPassDesc {
@@ -215,11 +300,11 @@ fn video_draw_matches_cpu_reference() {
                 }),
             );
             if software {
-                #[cfg(target_vendor = "apple")]
+                #[cfg(not(target_os = "android"))]
                 encode_software(
                     &mut encoder,
                     &target,
-                    &software_source,
+                    software_source,
                     &planes,
                     geometry,
                     &tiles,
@@ -230,7 +315,7 @@ fn video_draw_matches_cpu_reference() {
                 encode_converted_software(
                     &mut encoder,
                     &target,
-                    &software_source,
+                    software_source,
                     &image,
                     geometry,
                     &tiles,
@@ -238,7 +323,7 @@ fn video_draw_matches_cpu_reference() {
                 )
                 .unwrap();
             } else {
-                #[cfg(target_vendor = "apple")]
+                #[cfg(not(target_os = "android"))]
                 encode(
                     &mut encoder,
                     &target,
@@ -284,7 +369,11 @@ fn video_draw_matches_cpu_reference() {
                     let mut expected = [0, 0, 0, 255];
                     if tiles.rects.iter().copied().any(inside) {
                         if software {
-                            expected = [94, 23, 147, 255];
+                            expected = if base == 2 {
+                                [25, 15, 5, 255]
+                            } else {
+                                [94, 23, 147, 255]
+                            };
                         }
                         if inside(geometry.destination) {
                             let d = geometry.destination;

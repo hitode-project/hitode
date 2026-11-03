@@ -8,7 +8,7 @@ use adv_cpu::{
 use adv_device::gpu::Image;
 use adv_machine::{Resume, WakeReason};
 
-mod benchmark;
+adv_device::gpu::test_support::renderer_test! { mod benchmark; }
 
 const STACK: u32 = 0x550000;
 #[derive(Default)]
@@ -352,15 +352,10 @@ fn inaccessible_staging_and_late_shadow_failure_restore_marks_for_retry() {
         f.m.cpu.protect(page, 4096, Prot::RW).unwrap();
     }
     super::super::tests::force_recording_limit(&mut env(&mut f.m), f.device);
-    let pause =
-        f.m.ext
-            .get::<State>()
-            .gpu
-            .as_ref()
-            .unwrap()
-            .context()
-            .pause_submissions()
-            .unwrap();
+    let pause = adv_device::gpu::test_support::pause_submissions(
+        f.m.ext.get::<State>().gpu.as_ref().unwrap(),
+    )
+    .unwrap();
     let outcome = f.call(
         "IDirect3DDevice9::UpdateTexture",
         &[f.device, source, destination],
@@ -399,15 +394,10 @@ fn busy_updates_keep_snapshot_new_dirty_marks_and_com_owners_until_cancel() {
         .storage;
     let output = f.packet(D3DLOCKED_RECT::default());
     super::super::tests::force_recording_limit(&mut env(&mut f.m), f.device);
-    let pause =
-        f.m.ext
-            .get::<State>()
-            .gpu
-            .as_ref()
-            .unwrap()
-            .context()
-            .pause_submissions()
-            .unwrap();
+    let pause = adv_device::gpu::test_support::pause_submissions(
+        f.m.ext.get::<State>().gpu.as_ref().unwrap(),
+    )
+    .unwrap();
     let outcome = f.call(
         "IDirect3DDevice9::UpdateTexture",
         &[f.device, source, destination],
@@ -446,15 +436,10 @@ fn busy_updates_keep_snapshot_new_dirty_marks_and_com_owners_until_cancel() {
     assert_eq!(f.pixels(&image), [9, 8, 7, 255].repeat(16));
     assert_eq!(f.invoke("IDirect3DTexture9::AddDirtyRect", &[source, 0]), 0);
     super::super::tests::force_recording_limit(&mut env(&mut f.m), f.device);
-    let pause =
-        f.m.ext
-            .get::<State>()
-            .gpu
-            .as_ref()
-            .unwrap()
-            .context()
-            .pause_submissions()
-            .unwrap();
+    let pause = adv_device::gpu::test_support::pause_submissions(
+        f.m.ext.get::<State>().gpu.as_ref().unwrap(),
+    )
+    .unwrap();
     let outcome = f.call(
         "IDirect3DDevice9::UpdateTexture",
         &[f.device, source, destination],
@@ -513,15 +498,10 @@ fn bgra_snapshot_survives_busy_upload_and_later_dirty_rects() {
         bottom: 2,
     });
     super::super::tests::force_recording_limit(&mut env(&mut f.m), f.device);
-    let pause =
-        f.m.ext
-            .get::<State>()
-            .gpu
-            .as_ref()
-            .unwrap()
-            .context()
-            .pause_submissions()
-            .unwrap();
+    let pause = adv_device::gpu::test_support::pause_submissions(
+        f.m.ext.get::<State>().gpu.as_ref().unwrap(),
+    )
+    .unwrap();
     let outcome = f.call(
         "IDirect3DDevice9::UpdateTexture",
         &[f.device, source, destination],

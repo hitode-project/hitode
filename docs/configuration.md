@@ -107,6 +107,10 @@ the feature compile out the instrumentation. Lookup counts cover resource
 identity resolutions and current/base content-version table probes in recording;
 they exclude backend work and damage-history bookkeeping.
 
+`adv-device/test-support` is a fixture feature enabled by the graphics crates'
+dev-dependencies. It provides frame capture, submission pauses and simulated
+device loss; builds without it omit the executor hooks.
+
 ## adv-run options
 
 `Options::parse_args` in `adv-shell` is authoritative; `adv-run --help` prints the same options. The library interface and the Android app configure themselves separately. Options that pick values of one capability share a row.

@@ -390,15 +390,10 @@ fn dirty_marks_wait_for_release_dc_continuation_after_a_busy_upload() {
     let dc = f.acquire(surface);
     assert_eq!(f.pixel(dc, 0, 0, Some(0x00010203)), 0x00010203);
     super::super::tests::force_recording_limit(&mut env(&mut f.m), f.device);
-    let pause =
-        f.m.ext
-            .get::<State>()
-            .gpu
-            .as_ref()
-            .unwrap()
-            .context()
-            .pause_submissions()
-            .unwrap();
+    let pause = adv_device::gpu::test_support::pause_submissions(
+        f.m.ext.get::<State>().gpu.as_ref().unwrap(),
+    )
+    .unwrap();
     let outcome = f.call("d3d9.dll", "IDirect3DSurface9::ReleaseDC", &[surface, dc]);
     assert!(matches!(outcome, Outcome::Block { .. }));
     drop(pause);

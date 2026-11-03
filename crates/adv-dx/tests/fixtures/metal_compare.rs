@@ -5,6 +5,7 @@ fn emit_metal_pixels(pixels: &[u8]) {
     let bytes: String = pixels.iter().map(|byte| format!("{byte:02x}")).collect();
     println!("\nMETAL_PIXELS:{bytes}");
 }
+adv_device::gpu::test_support::renderer_test! {
 #[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
 fn compare_metal_fixture(fixture: &str) {
     let run = |wgpu: bool| {
@@ -38,4 +39,5 @@ fn compare_metal_fixture(fixture: &str) {
         run(true),
         "native Metal and wgpu fixture bytes differ"
     );
+}
 }

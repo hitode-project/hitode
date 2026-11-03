@@ -54,6 +54,9 @@ mod pipelines;
 mod record;
 mod resources;
 pub(crate) mod stream;
+#[cfg(feature = "test-support")]
+#[path = "../test_support/native.rs"]
+pub mod test_support;
 
 pub use record::Readback;
 pub use resources::{Depth, Image, ImageId, Staged, Target};
@@ -109,7 +112,7 @@ impl Gpu {
             }
             let (device, queue) = adv_gpu::Device::open(&adv_gpu::queue::DeviceOptions {
                 software: fallback,
-                validation: cfg!(test),
+                validation: cfg!(any(test, feature = "test-support")),
                 label: "execution GPU",
                 ..Default::default()
             })
@@ -122,6 +125,8 @@ impl Gpu {
                     producer,
                 ))),
                 video: Arc::from([]),
+                #[cfg(feature = "test-support")]
+                capture: Default::default(),
                 owner: owner::Owner::start(
                     queue,
                     commands,
@@ -215,6 +220,8 @@ struct Execution {
     stream: stream::ExecutionStream,
     video: Arc<[crate::frame::VideoPlane]>,
     owner: owner::Owner,
+    #[cfg(feature = "test-support")]
+    capture: std::cell::RefCell<Option<std::rc::Rc<test_support::Frames>>>,
 }
 thread_local! {
     static EXECUTION: std::cell::RefCell<std::rc::Weak<Execution>> = const {

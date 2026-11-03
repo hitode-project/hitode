@@ -158,6 +158,8 @@ struct Shared {
     /// whose ring is full can reserve again.
     retired: Condvar,
     completed: std::sync::atomic::AtomicU64,
+    #[cfg(feature = "test-support")]
+    submissions: Arc<TestGate>,
 }
 
 pub(crate) fn channel(ring: Ring) -> (Producer, Consumer) {
@@ -352,5 +354,49 @@ impl ExecutionStream {
     }
     pub fn draw(&mut self, draw: Draw, bindings: impl IntoIterator<Item = (u32, Binding)>) {
         self.0.borrow_mut().draw(draw, bindings);
+    }
+}
+
+#[cfg(feature = "test-support")]
+#[derive(Default)]
+struct TestGate {
+    paused: Mutex<bool>,
+    resumed: Condvar,
+}
+#[cfg(feature = "test-support")]
+pub struct SubmissionPause(Arc<TestGate>);
+#[cfg(feature = "test-support")]
+impl Drop for SubmissionPause {
+    fn drop(&mut self) {
+        *self.0.paused.lock().unwrap() = false;
+        self.0.resumed.notify_one();
+    }
+}
+#[cfg(feature = "test-support")]
+impl Producer {
+    pub fn pause_submissions(&self) -> Result<SubmissionPause, super::super::Error> {
+        let mut paused = self.shared.submissions.paused.lock().unwrap();
+        if *paused {
+            return Err(super::super::Error::Busy);
+        }
+        *paused = true;
+        Ok(SubmissionPause(self.shared.submissions.clone()))
+    }
+    pub fn admit(&self) -> Result<(), super::super::Error> {
+        if *self.shared.submissions.paused.lock().unwrap() {
+            Err(super::super::Error::Busy)
+        } else {
+            Ok(())
+        }
+    }
+}
+#[cfg(feature = "test-support")]
+impl Consumer {
+    pub fn submissions(&self) -> std::sync::MutexGuard<'_, bool> {
+        let mut paused = self.shared.submissions.paused.lock().unwrap();
+        while *paused {
+            paused = self.shared.submissions.resumed.wait(paused).unwrap();
+        }
+        paused
     }
 }

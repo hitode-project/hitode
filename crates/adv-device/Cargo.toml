@@ -17,6 +17,8 @@ native-display = ["gpu", "dep:adv-gpu", "dep:arrayvec"]
 media = ["dep:ffmpeg-next"]
 # Full DAC rate matrices; `cargo test-full` enables it.
 slow-tests = []
+# Capture and executor hooks for graphics fixtures only.
+test-support = []
 
 [dependencies]
 cpal = { version = "0.16", optional = true }
@@ -46,6 +48,7 @@ fontdb = { version = "0.24", default-features = false, features = ["fs"] }
 encoding_rs.workspace = true
 
 [dev-dependencies]
+adv-device = { path = ".", features = ["test-support"] }
 adv-display = { path = "../adv-display" }
 pollster = "0.4"
 

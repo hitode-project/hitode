@@ -1,13 +1,9 @@
 //! Frame-source adapters for the same surface assertions in both renderer modes.
 use adv_device::surface::{self, FrameView, Rect, VideoCursorRegion};
 #[cfg(feature = "native-display")]
-use adv_device::surface::{FlushReason, PixelFormat, SurfaceMemory, VideoLayer};
+use adv_device::surface::{FlushReason, SurfaceMemory, VideoLayer};
 #[cfg(feature = "native-display")]
 use std::sync::Arc;
-
-#[cfg(feature = "native-display")]
-#[path = "../../src/surface/convert.rs"]
-mod reference;
 
 #[derive(Clone, Default)]
 pub struct Snapshot {
@@ -92,87 +88,24 @@ pub fn assert_age_copies(_: &Store, full_copies: usize) {
 #[cfg(feature = "native-display")]
 mod native {
     use super::*;
-    use adv_device::{frame, gpu::Gpu};
+    use adv_device::{
+        frame,
+        frame::test_support::{CapturePresenter, CapturedFrame},
+        gpu::Gpu,
+    };
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::rc::{Rc, Weak};
-    use std::sync::mpsc::{self, Receiver, Sender};
+    use std::sync::mpsc::Receiver;
     use std::time::Duration;
 
     struct Publication {
         frame: Frame,
         buffer: u64,
     }
-    struct Capture(Sender<Publication>);
-    impl frame::Presenter for Capture {
-        fn presentable(&self, _: u32, _: u32) -> bool {
-            false
-        }
-        fn present(&mut self, _: &mut adv_gpu::Queue, frame: frame::Frame) {
-            let frame::Base::Software {
-                slot,
-                format,
-                palette,
-                damage,
-            } = frame.base
-            else {
-                panic!("expected a software frame");
-            };
-            let (width, height) = slot.extent();
-            let full = Rect {
-                x: 0,
-                y: 0,
-                w: width,
-                h: height,
-            };
-            let damage = match damage {
-                frame::Damage::None => vec![],
-                frame::Damage::Whole => vec![full],
-                frame::Damage::Rects(rects) => rects
-                    .iter()
-                    .map(|r| Rect {
-                        x: r.x,
-                        y: r.y,
-                        w: r.w,
-                        h: r.h,
-                    })
-                    .collect(),
-            };
-            let mut cpu = Snapshot {
-                width,
-                height,
-                frames: frame.serial,
-                bgra: vec![0; width as usize * height as usize * 4],
-                ..Default::default()
-            };
-            // This synchronous test ingest finishes before the slot lease drops.
-            let bytes = unsafe { slot.buffer().mapped().unwrap().as_ref() };
-            reference::convert(
-                format,
-                palette.as_deref(),
-                width,
-                slot.pitch(),
-                bytes,
-                &mut cpu,
-                &[full],
-            );
-            let base = cpu;
-            self.0
-                .send(Publication {
-                    buffer: slot.buffer().mapped().unwrap().as_ptr() as *mut u8 as usize as u64,
-                    frame: Frame {
-                        base,
-                        damage,
-                        ..Default::default()
-                    },
-                })
-                .unwrap();
-        }
-        fn drain(&mut self) {}
-    }
     struct Execution {
         _gpu: Gpu,
-        frames: Receiver<Publication>,
+        frames: Receiver<CapturedFrame>,
     }
     thread_local! {
         static EXECUTION: RefCell<Weak<Execution>> = const { RefCell::new(Weak::new()) };
@@ -182,10 +115,10 @@ mod native {
             if let Some(execution) = cached.borrow().upgrade() {
                 return execution;
             }
-            let (tx, frames) = mpsc::channel();
+            let (presenter, frames) = CapturePresenter::new();
             let gpu = pollster::block_on(Gpu::request_with_presenter(
                 !cfg!(target_vendor = "apple"),
-                Box::new(Capture(tx)),
+                Box::new(presenter),
             ))
             .unwrap();
             let execution = Rc::new(Execution { _gpu: gpu, frames });
@@ -374,11 +307,45 @@ mod native {
         fn collect(&mut self) {
             let mut publications = Vec::new();
             for _ in self.published..self.inner.stats.published_frames {
-                let mut publication = self
+                let captured = self
                     .execution
                     .frames
                     .recv_timeout(Duration::from_secs(20))
                     .unwrap();
+                let pixels = captured.pixels;
+                let full = Rect {
+                    x: 0,
+                    y: 0,
+                    w: pixels.width,
+                    h: pixels.height,
+                };
+                let damage = match captured.damage {
+                    frame::Damage::None => vec![],
+                    frame::Damage::Whole => vec![full],
+                    frame::Damage::Rects(rects) => rects
+                        .iter()
+                        .map(|r| Rect {
+                            x: r.x,
+                            y: r.y,
+                            w: r.w,
+                            h: r.h,
+                        })
+                        .collect(),
+                };
+                let mut publication = Publication {
+                    buffer: captured.buffer.unwrap(),
+                    frame: Frame {
+                        base: Snapshot {
+                            width: pixels.width,
+                            height: pixels.height,
+                            bgra: pixels.bgra,
+                            frames: pixels.frames,
+                            ..Default::default()
+                        },
+                        damage,
+                        ..Default::default()
+                    },
+                };
                 if let Some(previous) = &self.latest {
                     if (publication.frame.base.width, publication.frame.base.height)
                         == (previous.base.width, previous.base.height)

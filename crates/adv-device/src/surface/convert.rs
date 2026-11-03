@@ -24,7 +24,7 @@ pub(super) fn index(format: PixelFormat, row: &[u8], x: u32) -> u8 {
     }
 }
 
-pub(super) fn convert(
+pub(crate) fn convert(
     format: PixelFormat,
     palette: Option<&[[u8; 4]; 256]>,
     width: u32,

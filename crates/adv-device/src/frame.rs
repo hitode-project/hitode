@@ -2,6 +2,9 @@
 //! video decoders) and the display layer (issue #103). Producers publish
 //! frames; the display layer plans and presents them on the GPU owner thread.
 
+#[cfg(feature = "test-support")]
+pub mod test_support;
+
 use adv_gpu::{Rect, Token};
 use arrayvec::ArrayVec;
 use std::sync::Arc;

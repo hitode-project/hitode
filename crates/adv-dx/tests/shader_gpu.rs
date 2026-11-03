@@ -31,7 +31,7 @@ fn shader(major: u32, minor: u32, body: Vec<u32>) -> Shader {
 }
 fn full_source(shader: &Shader, input: &Inputs) -> String {
     let mut source = String::from(
-        "diagnostic(off, derivative_uniformity);\nstruct ShaderInputs {v:array<vec4<f32>,16>,t:array<vec4<f32>,8>,position:vec4<f32>,front_face:bool};\nstruct ShaderOutputs {position:vec4<f32>,colors:array<vec4<f32>,2>,texcoords:array<vec4<f32>,8>,depth:f32,point_size:f32,fog:f32,generic:array<vec4<f32>,12>};\nstruct ShaderConstants {f:array<vec4<f32>,256>,i:array<vec4<i32>,16>,b:array<vec4<i32>,16>,bump_matrix:array<vec4<f32>,8>,bump_luminance:array<vec4<f32>,8>};\n@group(0) @binding(0) var<uniform> vs_constants:ShaderConstants; @group(0) @binding(1) var<uniform> ps_constants:ShaderConstants;\n",
+        "diagnostic(off, derivative_uniformity);\nstruct ShaderInputs {v:array<vec4<f32>,16>,t:array<vec4<f32>,8>,position:vec4<f32>,front_face:bool};\nstruct ShaderOutputs {position:vec4<f32>,colors:array<vec4<f32>,2>,texcoords:array<vec4<f32>,8>,depth:f32,point_size:f32,fog:f32,generic:array<vec4<f32>,12>};\nstruct ShaderConstants {f:array<vec4<f32>,256>,i:array<vec4<i32>,16>,b:array<vec4<i32>,16>,bump_matrix:array<vec4<f32>,8>,bump_luminance:array<vec4<f32>,8>};\nstruct DrawParameters {values:array<vec4<u32>,40>};\n@group(0) @binding(0) var<uniform> vs_constants:ShaderConstants; @group(0) @binding(1) var<uniform> ps_constants:ShaderConstants;\n",
     );
     source.push_str(&shader.translate().unwrap().source);
     source.push_str("@vertex fn vertex_main(@builtin(vertex_index) index:u32)->@builtin(position) vec4<f32> { let xy=array<vec2<f32>,3>(vec2<f32>(-1.0,-1.0),vec2<f32>(3.0,-1.0),vec2<f32>(-1.0,3.0));return vec4<f32>(xy[index],0.5,1.0);}\n@fragment fn fragment_main()->@location(0) vec4<f32> {var input:ShaderInputs;input.front_face=true;\n");
@@ -117,8 +117,10 @@ fn gpu_matches_reference_masks_modifiers_flow_and_specials() {
             GpuBackend::Automatic,
         ),
     };
-    let mut gpu = pollster::block_on(Gpu::request_backend(fallback, backend))
-        .expect("differential GPU adapter");
+    let mut gpu = pollster::block_on(adv_device::gpu::test_support::request_backend(
+        fallback, backend,
+    ))
+    .expect("differential GPU adapter");
     let mut constants = Constants::default();
     constants.f[0] = [0.2, 0.35, 0.65, 0.8];
     constants.f[1] = [0.6, 0.45, 0.3, 0.1];
@@ -295,9 +297,11 @@ fn gpu_matches_reference_masks_modifiers_flow_and_specials() {
     assert_eq!(Stage::Pixel, shader(3, 0, Vec::new()).stage);
 }
 
+adv_device::gpu::test_support::renderer_test! {
 // spec: GFX-METAL-1
 #[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
 #[test]
 fn shader_fixtures_match_native_metal_and_wgpu_exactly() {
     compare_metal_fixture("gpu_matches_reference_masks_modifiers_flow_and_specials");
+}
 }
