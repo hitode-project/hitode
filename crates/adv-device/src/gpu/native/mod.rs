@@ -68,19 +68,53 @@ pub struct Gpu {
     /// The damage rectangle the next operations are limited to.
     clip: Option<Rect>,
     stats: Stats,
+    owner: owner::Owner,
+    recording: record::Recording,
 }
 
 impl Gpu {
     /// Open the device and start its owner thread. `fallback` selects a
     /// software adapter (lavapipe) for tests and diagnostics.
     pub async fn request(fallback: bool) -> Result<Self, Error> {
-        let _ = fallback;
-        todo!("C2")
+        let (device, queue) = adv_gpu::Device::open(&adv_gpu::queue::DeviceOptions {
+            software: fallback,
+            validation: cfg!(test),
+            label: "native executor",
+            ..Default::default()
+        })
+        .map_err(record::gpu_error)?;
+        let (mut stream, commands) =
+            stream::channel(device.ring(64 << 20).map_err(record::gpu_error)?);
+        let recording = record::Recording::new(&device, &mut stream)?;
+        let owner = owner::Owner::start(queue, commands, Box::new(owner::Headless))?;
+        Ok(Self {
+            device,
+            stream,
+            pipelines: Default::default(),
+            clip: None,
+            stats: Stats::default(),
+            owner,
+            recording,
+        })
     }
     /// A second executor on the same device and owner thread, for another
     /// guest device.
     pub fn fork(&self) -> Result<Self, Error> {
-        todo!("C2")
+        self.check()?;
+        let (mut stream, commands) =
+            stream::channel(self.device.ring(64 << 20).map_err(record::gpu_error)?);
+        let mut recording = record::Recording::new(&self.device, &mut stream)?;
+        recording.readback_limit = self.recording.readback_limit;
+        self.owner.attach(commands)?;
+        Ok(Self {
+            device: self.device.clone(),
+            stream,
+            pipelines: Default::default(),
+            clip: None,
+            stats: Stats::default(),
+            owner: self.owner.clone(),
+            recording,
+        })
     }
     pub fn set_clip(&mut self, clip: Option<Rect>) {
         self.clip = clip;
@@ -90,6 +124,12 @@ impl Gpu {
     }
     /// Device loss, as reported by the owner thread.
     pub fn check(&self) -> Result<(), Error> {
-        todo!("C2")
+        if let Some(failure) = self.owner.failure.get() {
+            return Err(Error::Device(failure.clone()));
+        }
+        if let Some(failure) = self.device.lost() {
+            return Err(Error::Device(failure));
+        }
+        Ok(())
     }
 }

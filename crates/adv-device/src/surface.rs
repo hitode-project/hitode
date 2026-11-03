@@ -1338,6 +1338,7 @@ pub enum FlushReason {
 #[cfg(feature = "gpu")]
 struct NativeSurface {
     target: crate::gpu::Target,
+    #[cfg(not(feature = "native-display"))]
     spares: Vec<crate::gpu::Target>,
 }
 #[cfg(all(feature = "gpu", not(feature = "native-display")))]
@@ -2120,8 +2121,13 @@ impl<P: Presenter> Surfaces<P> {
         depth: bool,
     ) -> Result<u32, String> {
         size(width, height)?;
+        #[cfg(not(feature = "native-display"))]
         let target = gpu
             .target(width, height, depth)
+            .map_err(|error| error.to_string())?;
+        #[cfg(feature = "native-display")]
+        let target = gpu
+            .presentation_target(width, height, depth)
             .map_err(|error| error.to_string())?;
         self.insert_native(target)
     }
@@ -2151,6 +2157,7 @@ impl<P: Presenter> Surfaces<P> {
             id,
             NativeSurface {
                 target,
+                #[cfg(not(feature = "native-display"))]
                 spares: Vec::new(),
             },
         );
@@ -2162,7 +2169,7 @@ impl<P: Presenter> Surfaces<P> {
         self.native_surfaces.get(&id).map(|surface| &surface.target)
     }
 
-    #[cfg(feature = "gpu")]
+    #[cfg(all(feature = "gpu", not(feature = "native-display")))]
     pub fn native_pool_size(&self, id: u32) -> Option<usize> {
         self.native_surfaces
             .get(&id)
@@ -2189,6 +2196,7 @@ impl<P: Presenter> Surfaces<P> {
         surface.height = target.image.height();
         surface.pitch = surface.width * 4;
         surface.version = surface.version.wrapping_add(1);
+        #[cfg(not(feature = "native-display"))]
         native.spares.clear();
         Ok(std::mem::replace(&mut native.target, target))
     }
@@ -2208,6 +2216,45 @@ impl<P: Presenter> Surfaces<P> {
             .map_err(|error| error.to_string())?;
         self.publish_native_frame(id, frame, None)?;
         Ok(())
+    }
+
+    #[cfg(feature = "native-display")]
+    pub fn present_native(
+        &mut self,
+        id: u32,
+        damage: crate::frame::Damage,
+        gpu: &mut crate::gpu::Gpu,
+    ) -> Result<(), String> {
+        let target = &self
+            .native_surfaces
+            .get(&id)
+            .ok_or("unknown native surface")?
+            .target;
+        let serial = self
+            .stats
+            .presentations
+            .checked_add(1)
+            .ok_or("presentation serial exhausted")?;
+        gpu.present(&target.image, damage, serial)
+            .map_err(|error| error.to_string())?;
+        self.stats.presentations = serial;
+        Ok(())
+    }
+
+    /// Request an explicit diagnostic transfer of a native surface.
+    #[cfg(feature = "native-display")]
+    pub fn readback_native(
+        &self,
+        id: u32,
+        gpu: &mut crate::gpu::Gpu,
+    ) -> Result<crate::gpu::Readback, String> {
+        let target = &self
+            .native_surfaces
+            .get(&id)
+            .ok_or("unknown native surface")?
+            .target;
+        gpu.readback(&target.image, None)
+            .map_err(|error| error.to_string())
     }
 
     /// A deferred store without the shared output can finish private frames.

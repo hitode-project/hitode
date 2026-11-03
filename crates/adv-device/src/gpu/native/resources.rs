@@ -151,7 +151,7 @@ impl Gpu {
     pub fn max_image_size(&self) -> u32 {
         todo!("C1")
     }
-    /// A swap buffer target ([`super::swap`]): its image is resolved by the
+    /// A swap buffer target ([`super::backing`]): its image is resolved by the
     /// owner thread, which hands it to presentation without a copy.
     pub fn presentation_target(
         &self,
@@ -159,16 +159,31 @@ impl Gpu {
         height: u32,
         depth: bool,
     ) -> Result<Target, Error> {
-        let _ = (width, height, depth);
-        todo!("C2")
+        self.attachment_dimensions(width, height)?;
+        Ok(Target {
+            image: Image {
+                storage: Storage::Swap(std::sync::Arc::new(super::backing::Swap::new((
+                    width, height,
+                )))),
+                alpha: AlphaMode::Stored,
+            },
+            depth: depth.then(|| {
+                Depth(std::sync::Arc::new(super::backing::DepthBuffer::new(
+                    (width, height),
+                    DepthFormat::Float32,
+                )))
+            }),
+        })
     }
     pub fn target_levels(&self, width: u32, height: u32, levels: u32) -> Result<Target, Error> {
         let _ = (width, height, levels);
         todo!("C1")
     }
     pub fn depth(&self, width: u32, height: u32, format: DepthFormat) -> Result<Depth, Error> {
-        let _ = (width, height, format);
-        todo!("C2")
+        self.attachment_dimensions(width, height)?;
+        Ok(Depth(std::sync::Arc::new(
+            super::backing::DepthBuffer::new((width, height), format),
+        )))
     }
     /// Write `height` rows through `fill` straight into the upload ring.
     pub fn stage<E>(
