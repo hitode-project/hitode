@@ -11,7 +11,6 @@
 use super::Image;
 use adv_gpu::encode::IndexFormat;
 use adv_gpu::{Buffer, Rect, RenderPipeline, Ring, Sampler, Span};
-use arrayvec::ArrayVec;
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
 
@@ -41,7 +40,9 @@ pub(crate) enum Binding {
 
 pub(crate) struct Draw {
     pub pipeline: RenderPipeline,
-    pub bindings: ArrayVec<(u32, Binding), 12>,
+    /// `Chunk::bindings[range]`: every slot the pipeline reads, by
+    /// [`super::pipelines::slot`].
+    pub bindings: std::ops::Range<u32>,
     pub index: Option<(Binding, IndexFormat)>,
     pub vertices: std::ops::Range<u32>,
     pub base_vertex: i32,
@@ -109,13 +110,14 @@ pub(crate) enum Command {
     },
 }
 
-/// Commands, the draws they index and the ring spans their [`Bytes`] point
-/// into. Draws live apart so that a command stays small and a draw is not an
-/// allocation.
+/// Commands, the draws they index, the draws' bindings and the ring spans
+/// their [`Bytes`] point into. Draws and bindings live apart so that a
+/// command stays small and a draw is not an allocation.
 #[derive(Default)]
 pub(crate) struct Chunk {
     pub commands: Vec<Command>,
     pub draws: Vec<Draw>,
+    pub bindings: Vec<(u32, Binding)>,
     pub spans: Vec<Span>,
 }
 
@@ -177,7 +179,11 @@ impl Producer {
         }
     }
 
-    pub fn draw(&mut self, draw: Draw) {
+    /// `draw.bindings` is ignored and set to `bindings`.
+    pub fn draw(&mut self, mut draw: Draw, bindings: impl IntoIterator<Item = (u32, Binding)>) {
+        let start = self.chunk.bindings.len() as u32;
+        self.chunk.bindings.extend(bindings);
+        draw.bindings = start..self.chunk.bindings.len() as u32;
         self.chunk.draws.push(draw);
         let index = self.chunk.draws.len() as u32 - 1;
         self.push(Command::Draw(index));
@@ -284,6 +290,7 @@ impl Consumer {
         debug_assert!(chunk.spans.is_empty(), "spans go to the encoder");
         chunk.commands.clear();
         chunk.draws.clear();
+        chunk.bindings.clear();
         self.shared.state.lock().unwrap().free.push(chunk);
     }
 

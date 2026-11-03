@@ -7,6 +7,26 @@ use super::super::{DrawState, Error, ProgrammableDraw};
 use super::Gpu;
 use std::path::Path;
 
+/// Binding slots, the same for every pipeline: record.rs binds them, the
+/// shaders declare them as `@binding(n)`. A pipeline lists only the slots its
+/// shaders read.
+pub(crate) mod slot {
+    /// Fixed-function transform and lighting state, or vertex shader
+    /// constants.
+    pub const VERTEX_UNIFORMS: u32 = 0;
+    /// Texture-stage state and fog, or pixel shader constants.
+    pub const FRAGMENT_UNIFORMS: u32 = 1;
+    /// D3D9 vertex streams `0..16`, one storage buffer each; shaders pull
+    /// their attributes (adv-gpu has no vertex input state). Fixed-function
+    /// draws use stream 0 only, as packed [`super::super::super::Vertex`]es.
+    pub const STREAMS: u32 = 2;
+    /// Sampled images: pixel samplers `s0..s15`, then vertex samplers
+    /// `D3DVERTEXTEXTURESAMPLER0..3`; fixed-function stage `n` uses `n`.
+    pub const TEXTURES: u32 = 18;
+    /// Samplers, in the same order as [`TEXTURES`].
+    pub const SAMPLERS: u32 = 38;
+}
+
 #[derive(Default)]
 pub(super) struct Pipelines {}
 
