@@ -9,6 +9,7 @@ pub enum DepthFormat {
     Depth24Stencil8,
 }
 impl DepthFormat {
+    #[cfg(not(feature = "native-display"))]
     pub(super) fn format(self) -> wgpu::TextureFormat {
         match self {
             Self::Float32 => wgpu::TextureFormat::Depth32Float,
@@ -21,8 +22,10 @@ impl DepthFormat {
     }
 }
 
+#[cfg(not(feature = "native-display"))]
 #[derive(Clone)]
 pub struct Depth(std::sync::Arc<DepthImage>);
+#[cfg(not(feature = "native-display"))]
 struct DepthImage {
     _texture: wgpu::Texture,
     #[cfg(target_vendor = "apple")]
@@ -37,6 +40,7 @@ struct DepthImage {
     deferred: std::sync::Mutex<Option<DeferredClear>>,
 }
 
+#[cfg(not(feature = "native-display"))]
 #[derive(Clone)]
 pub(super) struct DeferredClear {
     pub(super) region: Rect,
@@ -45,6 +49,7 @@ pub(super) struct DeferredClear {
     /// A color image covering `region`, for a bounded clear draw.
     pub(super) image: Image,
 }
+#[cfg(not(feature = "native-display"))]
 impl Depth {
     pub(super) fn new(
         texture: wgpu::Texture,

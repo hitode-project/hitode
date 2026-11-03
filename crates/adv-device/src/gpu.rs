@@ -3,6 +3,7 @@
 //! Apple device requests, native draws, copies and compilation drain their
 //! autoreleased temporaries on the calling thread.
 use crate::surface::Rect;
+#[cfg(not(feature = "native-display"))]
 mod clear;
 mod constant_snapshot;
 pub use constant_snapshot::ConstantSnapshot;
@@ -11,20 +12,32 @@ mod depth;
 mod index_bytes;
 mod line;
 pub use index_bytes::IndexBytes;
+#[cfg(feature = "native-display")]
+mod native;
 mod programmable;
+#[cfg(not(feature = "native-display"))]
 mod renderer;
 mod submission;
 mod vertex_bytes;
+#[cfg(not(feature = "native-display"))]
 use depth::DeferredClear;
-pub use depth::{Depth, DepthFormat, Stencil, StencilFace, StencilOp};
+#[cfg(not(feature = "native-display"))]
+pub use depth::Depth;
+pub use depth::{DepthFormat, Stencil, StencilFace, StencilOp};
+#[cfg(feature = "native-display")]
+pub use native::{Depth, Gpu, Image, Readback, Staged, Target};
 pub use programmable::{
     Attribute, AttributeFormat, ConstantBlock, Program, ProgramTexture, ProgrammableDraw,
     VertexStream,
 };
 #[cfg(target_vendor = "apple")]
+#[cfg(not(feature = "native-display"))]
 pub use renderer::DisplayCompletion;
+#[cfg(not(feature = "native-display"))]
 pub use renderer::Submission;
+#[cfg(not(feature = "native-display"))]
 pub use renderer::validate_program;
+#[cfg(not(feature = "native-display"))]
 pub use renderer::{Gpu, Image, NativeContext, NativeFrame, Readback, Staged, Target};
 pub use submission::SubmissionPause;
 pub use vertex_bytes::VertexBytes;

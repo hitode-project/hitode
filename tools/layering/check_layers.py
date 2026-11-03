@@ -30,7 +30,8 @@ RULES: dict[str, set[str]] = {
     "adv-gpu": set(),
     # Planner, display stages, pools and compositors over adv-gpu (issue #103).
     "adv-display": {"adv-gpu"},
-    "adv-device": {"adv-sync"},
+    # The D3D9/DirectDraw executor records onto adv-gpu (issue #103).
+    "adv-device": {"adv-sync", "adv-gpu"},
     "adv-dx": {"adv-abi", "adv-device"},
     # Wine's server, run in process for the Wine userland stack (issue #58).
     "adv-wineserver": set(),

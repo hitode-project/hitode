@@ -11,6 +11,8 @@ publish.workspace = true
 default = []
 device = ["dep:cpal"]
 gpu = ["dep:wgpu", "dep:bytemuck", "dep:objc2", "dep:objc2-metal", "dep:objc2-foundation", "dep:objc2-core-foundation", "dep:objc2-core-graphics", "dep:objc2-io-surface", "dep:block2", "dep:naga-types", "dep:libc", "dep:serde"]
+# The executor over adv-gpu (issue #103); replaces the wgpu renderer.
+native-display = ["gpu", "dep:adv-gpu", "dep:arrayvec"]
 # FFmpeg movie decoding; needs FFMPEG_DIR (see docs/building.md).
 media = ["dep:ffmpeg-next"]
 # Full DAC rate matrices; `cargo test-full` enables it.
@@ -24,6 +26,8 @@ libc = { version = "0.2", optional = true }
 serde = { version = "1", optional = true, features = ["derive", "rc"] }
 serde_json = "1"
 adv-sync = { path = "../adv-sync" }
+adv-gpu = { path = "../adv-gpu", optional = true }
+arrayvec = { version = "0.7", optional = true }
 oxisynth = { version = "0.1.0", features = ["sf3"] }
 rubato = { version = "0.16", default-features = false }
 symphonia = { version = "0.5.5", default-features = false, features = ["pcm", "adpcm", "vorbis"] }

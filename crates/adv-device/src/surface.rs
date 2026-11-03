@@ -54,7 +54,7 @@ pub struct FrameView<'a> {
 pub trait Presenter {
     fn present(&mut self, frame: FrameView<'_>) -> Result<(), String>;
     /// Native GPU composition is a separate capability; no implicit CPU readback.
-    #[cfg(feature = "gpu")]
+    #[cfg(all(feature = "gpu", not(feature = "native-display")))]
     fn present_native(&mut self, _frame: &crate::gpu::NativeFrame) -> Result<(), String> {
         Err("presenter does not support native GPU frames".into())
     }
@@ -165,7 +165,7 @@ pub struct PendingFrame {
     bottom_up: bool,
     history: DamageHistory,
     video: Arc<[(u64, VideoLayer)]>,
-    #[cfg(feature = "gpu")]
+    #[cfg(all(feature = "gpu", not(feature = "native-display")))]
     native: Option<crate::gpu::NativeFrame>,
 }
 impl Default for PendingFrame {
@@ -183,7 +183,7 @@ impl Default for PendingFrame {
             bottom_up: false,
             history: DamageHistory::default(),
             video: Arc::from([]),
-            #[cfg(feature = "gpu")]
+            #[cfg(all(feature = "gpu", not(feature = "native-display")))]
             native: None,
         }
     }
@@ -209,7 +209,7 @@ impl PendingFrame {
         } else {
             damage_since(history, self.serial, serial, full)
         };
-        #[cfg(feature = "gpu")]
+        #[cfg(all(feature = "gpu", not(feature = "native-display")))]
         {
             self.native = None;
         }
@@ -262,7 +262,7 @@ impl PendingFrame {
         self.snapshot_with_video(out, false)
     }
     fn snapshot_with_video(&self, out: &mut Snapshot, video: bool) -> Result<(), String> {
-        #[cfg(feature = "gpu")]
+        #[cfg(all(feature = "gpu", not(feature = "native-display")))]
         if self.native.is_some() {
             return Err("native GPU snapshot requires an explicit asynchronous readback".into());
         }
@@ -393,7 +393,7 @@ impl PendingFrame {
     }
     /// Explicit native readback only: preserve the same immutable layer metadata
     /// as the GPU presentation, even when a newer video sample arrives.
-    #[cfg(feature = "gpu")]
+    #[cfg(all(feature = "gpu", not(feature = "native-display")))]
     pub fn snapshot_native(&self, bgra: &[u8], out: &mut Snapshot) -> Result<(), String> {
         if self.native.is_none() || bgra.len() != self.width as usize * self.height as usize * 4 {
             return Err("native capture dimensions or byte length mismatch".into());
@@ -405,12 +405,12 @@ impl PendingFrame {
         out.bgra.extend_from_slice(bgra);
         self.compose_video(out)
     }
-    #[cfg(feature = "gpu")]
+    #[cfg(all(feature = "gpu", not(feature = "native-display")))]
     pub fn native(&self) -> Option<&crate::gpu::NativeFrame> {
         self.native.as_ref()
     }
 
-    #[cfg(feature = "gpu")]
+    #[cfg(all(feature = "gpu", not(feature = "native-display")))]
     fn store_native(&mut self, frame: crate::gpu::NativeFrame) {
         self.width = frame.image.width();
         self.height = frame.image.height();
@@ -1303,7 +1303,7 @@ pub struct Surfaces<P: Presenter> {
     software_pending: Option<SoftwareFrame>,
     #[cfg(feature = "gpu")]
     native_surfaces: BTreeMap<u32, NativeSurface>,
-    #[cfg(feature = "gpu")]
+    #[cfg(all(feature = "gpu", not(feature = "native-display")))]
     native_damage: FrameDamage,
     primary: Option<u32>,
     deferred_presentation: bool,
@@ -1340,7 +1340,7 @@ struct NativeSurface {
     target: crate::gpu::Target,
     spares: Vec<crate::gpu::Target>,
 }
-#[cfg(feature = "gpu")]
+#[cfg(all(feature = "gpu", not(feature = "native-display")))]
 const MAX_ROTATION_TARGETS: usize = 8;
 
 impl<P: Presenter> Surfaces<P> {
@@ -1367,7 +1367,7 @@ impl<P: Presenter> Surfaces<P> {
             software_pending: None,
             #[cfg(feature = "gpu")]
             native_surfaces: BTreeMap::new(),
-            #[cfg(feature = "gpu")]
+            #[cfg(all(feature = "gpu", not(feature = "native-display")))]
             native_damage: FrameDamage::default(),
             primary: None,
             deferred_presentation: false,
@@ -1580,7 +1580,7 @@ impl<P: Presenter> Surfaces<P> {
         });
         frame.video = self.video_layers.clone();
         self.software_source = None;
-        #[cfg(feature = "gpu")]
+        #[cfg(all(feature = "gpu", not(feature = "native-display")))]
         if let Some(native) = &mut frame.native {
             native.serial = serial;
         }
@@ -1624,7 +1624,7 @@ impl<P: Presenter> Surfaces<P> {
             .as_ref()
             .is_some_and(|f| f.serial != self.captured_serial)
     }
-    #[cfg(feature = "gpu")]
+    #[cfg(all(feature = "gpu", not(feature = "native-display")))]
     pub fn latest_native_frame(&self) -> Option<&crate::gpu::NativeFrame> {
         self.frame_mailbox
             .as_ref()
@@ -1634,7 +1634,7 @@ impl<P: Presenter> Surfaces<P> {
     }
     /// Commit an explicit diagnostic readback, never used by normal native
     /// presentation. A newer frame invalidates this capture instead of mixing it.
-    #[cfg(feature = "gpu")]
+    #[cfg(all(feature = "gpu", not(feature = "native-display")))]
     pub fn capture_native_pixels(
         &mut self,
         serial: u64,
@@ -1658,7 +1658,7 @@ impl<P: Presenter> Surfaces<P> {
         self.capture_native_frame_pixels(&source, bgra)
     }
 
-    #[cfg(feature = "gpu")]
+    #[cfg(all(feature = "gpu", not(feature = "native-display")))]
     pub fn capture_native_frame_pixels(
         &mut self,
         source: &PendingFrame,
@@ -1684,7 +1684,7 @@ impl<P: Presenter> Surfaces<P> {
     /// Materialize a retained immutable source after a later presentation.
     /// Its own dimensions and serial remain authoritative; completed captures
     /// cannot replace a snapshot which is already newer.
-    #[cfg(feature = "gpu")]
+    #[cfg(all(feature = "gpu", not(feature = "native-display")))]
     pub fn capture_native_snapshot_pixels(
         &mut self,
         source: &crate::gpu::NativeFrame,
@@ -1738,7 +1738,7 @@ impl<P: Presenter> Surfaces<P> {
         else {
             return Ok(false);
         };
-        #[cfg(feature = "gpu")]
+        #[cfg(all(feature = "gpu", not(feature = "native-display")))]
         if let Some(native) = &frame.native {
             self.presenter.present_native(native)?;
             self.captured_serial = frame.serial;
@@ -2194,7 +2194,7 @@ impl<P: Presenter> Surfaces<P> {
     }
 
     /// Reuse the common presentation serial, coalescing and ownership mailbox.
-    #[cfg(feature = "gpu")]
+    #[cfg(all(feature = "gpu", not(feature = "native-display")))]
     pub fn present_native(&mut self, id: u32, gpu: &mut crate::gpu::Gpu) -> Result<(), String> {
         let image = &self
             .native_surfaces
@@ -2237,7 +2237,7 @@ impl<P: Presenter> Surfaces<P> {
     /// A discard boundary transfers the old target into the immutable frame and
     /// rotates one available target. No texture copy or Queue submit is needed.
     /// The pool is bounded; retaining all frames returns Busy before publication.
-    #[cfg(feature = "gpu")]
+    #[cfg(all(feature = "gpu", not(feature = "native-display")))]
     /// `damage` is what changed since this surface's previous presentation.
     pub fn present_native_rotating(
         &mut self,
@@ -2307,7 +2307,7 @@ impl<P: Presenter> Surfaces<P> {
 
     /// Commit a frame prepared by a device command producer through the same
     /// serial, ownership mailbox and capture path used by GDI/DirectDraw.
-    #[cfg(feature = "gpu")]
+    #[cfg(all(feature = "gpu", not(feature = "native-display")))]
     pub fn publish_native_frame(
         &mut self,
         id: u32,

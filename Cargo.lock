@@ -76,7 +76,9 @@ dependencies = [
 name = "adv-device"
 version = "0.2.3"
 dependencies = [
+ "adv-gpu",
  "adv-sync",
+ "arrayvec",
  "block2",
  "bytemuck",
  "cc",
