@@ -709,13 +709,9 @@ impl Display {
         self.spans.extend(data);
         Ok(())
     }
-    fn encode(
-        &mut self,
-        queue: &mut Queue,
-        mut frame: Frame,
-        reading: Option<&PresentImage>,
-    ) -> Result<Pending, Error> {
-        let started = Instant::now();
+    /// Plan around every image a compositor or this frame may still read.
+    /// A window without a size plans at the last presented view.
+    fn plan(&mut self, info: &FrameInfo, reading: Option<&PresentImage>) -> (Settings, Plan) {
         let leased = self.screen.iter().map(|(_, a)| &a.image).chain(reading);
         self.pools.occupy(leased.filter_map(|i| {
             let size = i.image().desc().size;
@@ -730,9 +726,17 @@ impl Display {
             settings.view = self
                 .recorder
                 .latest()
-                .map_or(frame.info.canvas, |r| r.settings.view);
+                .map_or(info.canvas, |r| r.settings.view);
         }
-        let planned = plan(&frame.info, &settings, &self.caps, &self.cost, &self.pools);
+        let planned = plan(info, &settings, &self.caps, &self.cost, &self.pools);
+        (settings, planned)
+    }
+    /// Acquire the planned target buffers, reallocating pools whose size changed.
+    fn targets(
+        &mut self,
+        queue: &mut Queue,
+        planned: &Plan,
+    ) -> Result<[Option<PresentImage>; 3], Error> {
         let mut targets: [Option<PresentImage>; 3] = std::array::from_fn(|_| None);
         for target in &planned.targets {
             let replace = self.allocations.get(&target.pool).is_none_or(|p| {
@@ -771,18 +775,35 @@ impl Display {
                 .expect("planner selected a free pool slot");
             targets[target.pool.0 as usize] = Some(image);
         }
+        Ok(targets)
+    }
+    /// Take each video's new decoder image; the replaced ones and those of
+    /// videos that left are returned for retirement after this frame.
+    fn update_leases(&mut self, video: &mut [Video]) -> Vec<PresentImage> {
         let mut retired = vec![];
         let gone = self
             .leases
-            .extract_if(|id, _| !frame.video.iter().any(|v| v.id == *id));
+            .extract_if(|id, _| !video.iter().any(|v| v.id == *id));
         retired.extend(gone.map(|(_, image)| image));
-        for v in &mut frame.video {
+        for v in video {
             if let Some(image) = v.update.take()
                 && let Some(old) = self.leases.insert(v.id, image)
             {
                 retired.push(old);
             }
         }
+        retired
+    }
+    fn encode(
+        &mut self,
+        queue: &mut Queue,
+        mut frame: Frame,
+        reading: Option<&PresentImage>,
+    ) -> Result<Pending, Error> {
+        let started = Instant::now();
+        let (settings, planned) = self.plan(&frame.info, reading);
+        let mut targets = self.targets(queue, &planned)?;
+        let retired = self.update_leases(&mut frame.video);
         if planned
             .stages
             .iter()
