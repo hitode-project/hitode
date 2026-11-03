@@ -26,7 +26,8 @@ use std::time::Duration;
 fn video_draw_matches_cpu_reference() {
     let (device, mut queue) = Device::open(&DeviceOptions {
         software: !cfg!(any(target_vendor = "apple", target_os = "android")),
-        validation: true,
+        // Phones ship no validation layer.
+        validation: !cfg!(target_os = "android"),
         ..Default::default()
     })
     .unwrap();

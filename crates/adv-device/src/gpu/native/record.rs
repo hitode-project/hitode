@@ -774,12 +774,31 @@ impl Gpu {
         self.stream.0.borrow().admit()?;
         self.check()?;
         let format = color_format(image);
-        if !matches!(
-            format,
-            adv_gpu::Format::Bgra8Unorm | adv_gpu::Format::Rgba8Unorm
-        ) {
-            return Err(Error::Unavailable("readback requires 32-bit color".into()));
+        let copyable = match &image.storage {
+            Storage::Fixed { image, .. } => image
+                .desc()
+                .usage
+                .contains(adv_gpu::resource::Usage::COPY_SRC),
+            Storage::Swap(_) => true,
+        };
+        if !copyable
+            || !matches!(
+                format,
+                adv_gpu::Format::Bgra8Unorm | adv_gpu::Format::Rgba8Unorm
+            )
+        {
+            // Sampling expands every stored format to BGRA, as a draw sees it.
+            let scratch = self.target(image.width(), image.height(), false)?.image;
+            self.blit_validated(
+                image,
+                whole(image),
+                &scratch,
+                whole(&scratch),
+                Filter::Nearest,
+            )?;
+            return self.readback(&scratch, wake);
         }
+        let opaque = image.alpha_mode() == gpu::AlphaMode::Opaque;
         self.recording
             .readbacks
             .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
@@ -826,6 +845,11 @@ impl Gpu {
                     if format == adv_gpu::Format::Rgba8Unorm {
                         for pixel in pixels.as_chunks_mut::<4>().0 {
                             pixel.swap(0, 2);
+                        }
+                    }
+                    if opaque {
+                        for pixel in pixels.as_chunks_mut::<4>().0 {
+                            pixel[3] = 255;
                         }
                     }
                     Ok(pixels)

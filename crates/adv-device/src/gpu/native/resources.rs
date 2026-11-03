@@ -246,12 +246,13 @@ impl Target {
         self.depth.as_ref()
     }
     pub fn with_depth(mut self, depth: Option<Depth>) -> Result<Self, Error> {
+        let (width, height) = self.image.size();
         if depth
             .as_ref()
-            .is_some_and(|d| (d.width(), d.height()) != self.image.size())
+            .is_some_and(|d| d.width() < width || d.height() < height)
         {
             return Err(Error::Invalid(
-                "depth size differs from color attachment".into(),
+                "depth is smaller than the color attachment".into(),
             ));
         }
         self.depth = depth;

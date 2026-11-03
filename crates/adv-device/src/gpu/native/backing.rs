@@ -309,6 +309,16 @@ impl DepthBacking {
         let loads = plans.iter().any(|p| {
             p.depth.0 == Load::Load || depth.format().has_stencil() && p.stencil.0 == Load::Load
         });
+        // A pass over part of a real image keeps the contents outside it.
+        let (width, height) = depth.0.size;
+        let keeps = self
+            .image
+            .as_ref()
+            .is_some_and(|image| !image.desc().usage.contains(Usage::TRANSIENT))
+            && plans
+                .iter()
+                .any(|p| p.area.x != 0 || p.area.y != 0 || p.area.w < width || p.area.h < height);
+        let stores = stores || keeps;
         let real = self.stored || stores || loads;
         if self
             .image
@@ -412,6 +422,53 @@ fn bounds(a: Rect, b: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // spec: GFX-PASS-3
+    #[test]
+    fn a_real_depth_image_outlives_a_frame_of_partial_passes() {
+        let device = match Device::open(&adv_gpu::queue::DeviceOptions {
+            software: !cfg!(target_vendor = "apple"),
+            validation: true,
+            label: "backing test",
+            ..Default::default()
+        }) {
+            Ok((device, _)) => device,
+            Err(adv_gpu::Error::Unavailable(_))
+                if std::env::var_os("ADV_GPU_REQUIRE_BACKEND").is_none() =>
+            {
+                return;
+            }
+            Err(error) => panic!("device: {error}"),
+        };
+        let depth = Depth(std::sync::Arc::new(DepthBuffer::new(
+            (8, 8),
+            super::super::super::DepthFormat::Depth24Stencil8,
+        )));
+        let pass = |area, store| super::super::pass::Pass {
+            ops: 0..1,
+            area,
+            color: (Load::Load, Store::Store),
+            depth: (Load::Clear(1.), store),
+            stencil: (Load::Clear(0), store),
+        };
+        let mut backing = DepthBacking::default();
+        backing
+            .attachment(&depth, &device, &[pass(rect(0, 0, 8, 8), Store::Store)])
+            .unwrap();
+        backing.end_frame();
+        // The area is cleared again before any read, but the rest of the
+        // image keeps the first frame's values.
+        backing
+            .attachment(&depth, &device, &[pass(rect(0, 0, 4, 4), Store::DontCare)])
+            .unwrap();
+        backing.end_frame();
+        assert!(
+            backing
+                .image
+                .as_ref()
+                .is_some_and(|image| !image.desc().usage.contains(Usage::TRANSIENT))
+        );
+    }
 
     fn rect(x: u32, y: u32, w: u32, h: u32) -> Rect {
         Rect { x, y, w, h }
