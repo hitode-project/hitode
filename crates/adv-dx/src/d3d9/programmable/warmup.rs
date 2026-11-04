@@ -61,9 +61,15 @@ fn schedule(
         features: (d.fixed.render[&152], d.fixed.render[&28] != 0),
         fixed: fixed_features(&d.fixed, None),
     };
-    // Triangle lists are the creation-time prediction; all raster conversion
-    // and attachment selection are shared with the eventual draw.
-    let prediction = fixed::prepare_state(env, pointer, 4)
+    // The first draw is predicted to match the last one (triangle lists
+    // before any); raster conversion and attachments are the draw's own.
+    let (kind, up_stride) = env
+        .ext
+        .get::<State>()
+        .programs
+        .last_draw
+        .unwrap_or((4, None));
+    let prediction = fixed::prepare_state(env, pointer, kind)
         .ok()
         .map(|(target, _, state)| {
             let textures = std::array::from_fn(|slot| texture(env, pointer, slot, &state).ok());
@@ -81,7 +87,9 @@ fn schedule(
                 })
                 .collect();
             (!attributes.is_empty()).then(|| VertexStream {
-                stride: d.buffers.streams[n].stride,
+                stride: up_stride
+                    .filter(|_| n == 0)
+                    .unwrap_or(d.buffers.streams[n].stride),
                 attributes,
                 instance: d.buffers.frequencies[0] & buffers::INDEXED_DATA != 0
                     && d.buffers.frequencies[n] & buffers::INSTANCE_DATA != 0,
@@ -258,6 +266,80 @@ mod tests {
             1
         );
         assert_eq!(after.prebuild_misses, before.prebuild_misses);
+    }
+
+    // spec: GFX-CACHE-7
+    #[test]
+    fn creation_predicts_the_last_draws_primitive_type_and_user_stride() {
+        use crate::d3d9::stretch::tests::Fixture;
+        let mut f = Fixture::new();
+        for (state, value) in [(7, 0), (22, 1)] {
+            f.okay(
+                "IDirect3DDevice9::SetRenderState",
+                &[f.device, state, value],
+            );
+        }
+        let output = f.packet(0u32);
+        let vertex = f.packet([
+            0xfffe0200u32,
+            0x0200001f,
+            0x80000000,
+            0x900f0000,
+            0x02000001,
+            0xc00f0000,
+            0x90e40000,
+            0xffff,
+        ]);
+        f.okay(
+            "IDirect3DDevice9::CreateVertexShader",
+            &[f.device, vertex, output],
+        );
+        let vertex = f.m.cpu.read_u32(output).unwrap();
+        f.okay("IDirect3DDevice9::SetVertexShader", &[f.device, vertex]);
+        let elements = f.packet([[0u8, 0, 4, 0, 3, 0, 0, 0], [255, 0, 0, 0, 17, 0, 0, 0]]);
+        f.okay(
+            "IDirect3DDevice9::CreateVertexDeclaration",
+            &[f.device, elements, output],
+        );
+        let declaration = f.m.cpu.read_u32(output).unwrap();
+        f.okay(
+            "IDirect3DDevice9::SetVertexDeclaration",
+            &[f.device, declaration],
+        );
+        // A quad as a user-pointer triangle strip, stride 20.
+        let quad = f.packet([
+            [0f32, -1., -1., 0.5, 1.],
+            [0., -1., 1., 0.5, 1.],
+            [0., 1., -1., 0.5, 1.],
+            [0., 1., 1., 0.5, 1.],
+        ]);
+        let mut draw = |f: &mut Fixture, constant: u32| {
+            let pixel = f.packet([0xffff0200u32, 0x02000001, 0x800f0800, constant, 0xffff]);
+            f.okay(
+                "IDirect3DDevice9::CreatePixelShader",
+                &[f.device, pixel, output],
+            );
+            let pixel = f.m.cpu.read_u32(output).unwrap();
+            f.okay("IDirect3DDevice9::SetPixelShader", &[f.device, pixel]);
+            for job in f.m.ext.get::<State>().programs.warming.values() {
+                job.resolve().as_ref().unwrap();
+            }
+            let before = f.m.ext.get::<State>().gpu.as_ref().unwrap().stats();
+            f.okay("IDirect3DDevice9::BeginScene", &[f.device]);
+            f.okay(
+                "IDirect3DDevice9::DrawPrimitiveUP",
+                &[f.device, 5, 2, quad, 20],
+            );
+            f.okay("IDirect3DDevice9::EndScene", &[f.device]);
+            let image = f.image(f.back);
+            f.pixels(&image);
+            let after = f.m.ext.get::<State>().gpu.as_ref().unwrap().stats();
+            after.anticipated_pipeline_draws - before.anticipated_pipeline_draws
+        };
+        // The first strip draw follows a triangle-list prediction; the next
+        // shader is predicted as the strip it will draw.
+        assert_eq!(draw(&mut f, 0xa0e40000), 0);
+        assert_eq!(draw(&mut f, 0xa0e40001), 1);
     }
 
     // spec: GFX-CACHE-7, GFX-SHADER-3

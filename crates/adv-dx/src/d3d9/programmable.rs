@@ -45,6 +45,9 @@ pub(super) struct ProgramCache {
     warming: std::collections::HashMap<ProgramKey, adv_device::gpu::compile::Compile<Program>>,
     warming_bytes: usize,
     warming_order: std::collections::VecDeque<(ProgramKey, usize)>,
+    /// The last programmable draw's primitive type and user-pointer stride:
+    /// an engine keeps drawing the same way, so creation predicts from it.
+    last_draw: Option<(i32, Option<u32>)>,
     pub counters: adv_device::gpu::compile::CompileCounters,
 }
 pub(super) fn register(registry: &mut Registry) {
@@ -382,6 +385,7 @@ fn prepare_checked(
         let streams = streams::capture(env, pointer, &inputs, up, start, first, last, instanced)?;
         let (target, image, state) =
             fixed::prepare_state(env, pointer, kind).map_err(|e| e.code)?;
+        env.ext.get_mut::<State>().programs.last_draw = Some((kind, up.map(|(_, stride)| stride)));
         (
             fixed::Draw {
                 target,
