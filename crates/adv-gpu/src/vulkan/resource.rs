@@ -83,7 +83,7 @@ impl Buffer {
         {
             return None;
         }
-        // Blocks are atom multiples, so rounding out stays inside the block.
+        // Host allocations are atom-aligned, so rounding out stays inside it.
         let atom = self.0.context.atom;
         let start = (allocation.offset() + range.start) / atom * atom;
         let end = (allocation.offset() + range.end).next_multiple_of(atom);

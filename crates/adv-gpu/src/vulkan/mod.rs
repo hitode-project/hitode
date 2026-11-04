@@ -321,10 +321,12 @@ impl Context {
                 })
         };
         requirements.memory_type_bits &= mask(required);
-        // Flushed and invalidated ranges round out to atoms, so host blocks,
-        // including one sized to a single large allocation, are atom multiples.
+        // Flushed and invalidated ranges round out to atoms, so host
+        // allocations start and end on atoms: rounding never reaches a
+        // neighbor's bytes or past its block.
         if memory != Memory::Device {
             requirements.size = requirements.size.next_multiple_of(self.atom);
+            requirements.alignment = requirements.alignment.max(self.atom);
         }
         let mut prefer = |flags| {
             let types = requirements.memory_type_bits & mask(flags);
