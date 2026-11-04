@@ -464,6 +464,15 @@ fn job(
         Ok(build(&device, &recipe, cache.as_deref()))
     })
 }
+/// Set in a program's sampling flags when its sampler addresses a border:
+/// only then does the pipeline carry the shader's border filtering. That
+/// code inlines at every sample, and compiled for seconds on Adreno 750.
+pub(super) const BORDER_SAMPLING: u8 = 4;
+pub(super) fn program_sampling_flags(texture: &gpu::ProgramTexture) -> u8 {
+    let border =
+        texture.sampler.u == gpu::Address::Border || texture.sampler.v == gpu::Address::Border;
+    fixed_sampling_flags(texture.image.as_ref()) | if border { BORDER_SAMPLING } else { 0 }
+}
 pub(super) fn fixed_sampling_flags(image: Option<&super::Image>) -> u8 {
     image.map_or(0, |image| {
         u8::from(image.alpha_mode() == gpu::AlphaMode::Opaque)
@@ -948,11 +957,31 @@ fn program_source(
                 }
                 replacements.push((source.len()..source.len(), border_source(name, &suffix)));
             }
-            if group == 1 && modes[ordinal] != 0 {
+            // The frontend guards border filtering with the sampler's draw
+            // parameters. Without a border in the key the guard is false, so
+            // compilers drop the branch before inlining it at every sample.
+            if group == 1 && modes[ordinal] & BORDER_SAMPLING == 0 {
+                for function in ["_sample_", "_sample_grad_"] {
+                    let function = name.replace("_image_", function);
+                    if !source.contains(&format!("fn {function}(")) {
+                        continue;
+                    }
+                    let body = function_body(&source, &function);
+                    let guard = "(config.x&3u)!=0u";
+                    let mut at = body.start;
+                    while let Some(found) = source[at..body.end].find(guard) {
+                        let start = at + found;
+                        replacements.push((start..start + guard.len(), "false".into()));
+                        at = start + guard.len();
+                    }
+                }
+            }
+            let alpha_flags = modes[ordinal] & !BORDER_SAMPLING;
+            if group == 1 && alpha_flags != 0 {
                 let alpha = name.replace("_image_", "_alpha_");
                 if source.contains(&format!("fn {alpha}(")) {
                     let body = function_body(&source, &alpha);
-                    let value = sampling_expression(modes[ordinal]);
+                    let value = sampling_expression(alpha_flags);
                     replacements.push((body, format!("return {value};")));
                 } else {
                     // Hand-authored programs use ordinary texture operations.
@@ -969,7 +998,7 @@ fn program_source(
                             ));
                         }
                     }
-                    let value = sampling_expression(modes[ordinal]);
+                    let value = sampling_expression(alpha_flags);
                     replacements.push((source.len()..source.len(), format!("\nfn adv_texel_{ordinal}(value:vec4<f32>)->vec4<f32>{{return {value};}}\n")));
                 }
             }
@@ -1500,7 +1529,7 @@ struct V {{ @builtin(position) position:vec4<f32>, @location(0) color:vec4<f32> 
                     &draw
                         .textures
                         .iter()
-                        .map(|t| fixed_sampling_flags(t.image.as_ref()))
+                        .map(program_sampling_flags)
                         .collect::<arrayvec::ArrayVec<_, 20>>(),
                 )
                 .unwrap();
@@ -1614,7 +1643,7 @@ struct V { @builtin(position) position:vec4<f32>, @location(0) uv:vec2<f32> }
                 &draw
                     .textures
                     .iter()
-                    .map(|t| fixed_sampling_flags(t.image.as_ref()))
+                    .map(program_sampling_flags)
                     .collect::<arrayvec::ArrayVec<_, 20>>(),
             )
             .unwrap();
@@ -1635,6 +1664,40 @@ struct V { @builtin(position) position:vec4<f32>, @location(0) uv:vec2<f32> }
             ),
             [11, 22, 33, 77]
         );
+    }
+
+    #[test]
+    fn border_filtering_is_compiled_only_for_border_samplers() {
+        let mut source = String::from(
+            r#"
+struct DrawParameters { values:array<vec4<u32>,40> }
+@group(0) @binding(2) var<uniform> draw_parameters:DrawParameters;
+@group(1) @binding(0) var ps_image_0:texture_2d<f32>;
+@group(1) @binding(1) var ps_sampler_0:sampler;
+fn ps_sample_0(coord:vec4<f32>)->vec4<f32> {
+let config=draw_parameters.values[16];
+if (config.x&3u)!=0u {return adv_border_sample(ps_image_0,coord.xy,0.0,config.x,config.y,config.z,config.w);}
+return textureSample(ps_image_0,ps_sampler_0,coord.xy);}
+struct V { @builtin(position) position:vec4<f32>, @location(0) uv:vec2<f32> }
+@vertex fn vertex_main(@location(0) position:vec4<f32>)->V { return V(position, position.xy); }
+@fragment fn fragment_main(v:V)->@location(0) vec4<f32> { return ps_sample_0(vec4<f32>(v.uv,0.0,0.0)); }
+"#,
+        );
+        source.push_str(gpu::BORDER_WGSL);
+        let streams = [(
+            16,
+            vec![Attribute {
+                location: 0,
+                offset: 0,
+                format: AttributeFormat::Float4,
+            }],
+            false,
+        )];
+        let guard = "(config.x&3u)!=0u";
+        let plain = program_source(&source, &[false], &[0], &streams).unwrap();
+        assert!(!plain.contains(guard));
+        let border = program_source(&source, &[false], &[BORDER_SAMPLING], &streams).unwrap();
+        assert!(border.contains(guard));
     }
 
     // spec: GFX-CACHE-7, GFX-CACHE-8, GFX-CACHE-9, GFX-CACHE-10
@@ -1676,7 +1739,7 @@ struct V { @builtin(position) position:vec4<f32>, @location(0) uv:vec2<f32> }
                 &draw
                     .textures
                     .iter()
-                    .map(|t| fixed_sampling_flags(t.image.as_ref()))
+                    .map(program_sampling_flags)
                     .collect::<arrayvec::ArrayVec<_, 20>>(),
             )
             .unwrap();

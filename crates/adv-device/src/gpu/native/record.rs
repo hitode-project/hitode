@@ -2,7 +2,7 @@
 //! assumes admitted commands and ring ranges are valid.
 
 use super::super::{self as gpu, DrawState, Error, Filter, ProgrammableDraw, Rect, Vertex};
-use super::pipelines::{fixed_sampling_flags, slot};
+use super::pipelines::{fixed_sampling_flags, program_sampling_flags, slot};
 use super::resources::Storage;
 use super::stream::{Binding, Bytes, Command, Draw, Producer};
 use super::{Depth, Gpu, Image, ImageId, Target, backing};
@@ -433,11 +433,8 @@ impl Gpu {
             return Ok(());
         }
         self.select(target);
-        let sampling: arrayvec::ArrayVec<_, 20> = draw
-            .textures
-            .iter()
-            .map(|t| fixed_sampling_flags(t.image.as_ref()))
-            .collect();
+        let sampling: arrayvec::ArrayVec<_, 20> =
+            draw.textures.iter().map(program_sampling_flags).collect();
         let pipeline = self.pipelines.programmable(
             &self.device,
             draw,
