@@ -55,6 +55,14 @@ struct Scaler {
 
 impl Gpu {
     fn scaler(&self, model: Model, size: (u32, u32)) -> Scaler {
+        let half = self
+            .device
+            .caps()
+            .features
+            .contains(adv_gpu::Features::SHADER_F16);
+        self.scaler_at(model, size, half)
+    }
+    fn scaler_at(&self, model: Model, size: (u32, u32), half: bool) -> Scaler {
         let output = self
             .device
             .create_image(&ImageDesc {
@@ -73,7 +81,7 @@ impl Gpu {
             })
             .unwrap();
         Scaler {
-            upscaling: Upscaling::new(&self.device, model, size).unwrap(),
+            upscaling: Upscaling::with_precision(&self.device, model, size, half).unwrap(),
             output,
         }
     }
@@ -321,4 +329,57 @@ fn partial_runs_match_full_runs_within_the_model_radius() {
             .unwrap();
         assert_eq!(computed, 0);
     }
+}
+
+// Names the variant a driver computes wrongly: each model's reference and
+// fused tables in each precision, run twice, against the reference in the
+// same precision and against single precision.
+// spec: HOST-VIEW-7
+#[test]
+fn variants_agree_in_each_precision_and_repeat_exactly() {
+    let mut gpu = gpu();
+    let size = (35, 29);
+    let mut seed = 0x2545_f491u32;
+    let pixels: Vec<[u32; 3]> = (0..size.0 * size.1)
+        .map(|_| {
+            [0; 3].map(|_| {
+                seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                (seed >> 16) % 257
+            })
+        })
+        .collect();
+    let half = gpu
+        .device
+        .caps()
+        .features
+        .contains(adv_gpu::Features::SHADER_F16);
+    let delta = |a: &[u8], b: &[u8]| a.iter().zip(b).map(|(x, y)| x.abs_diff(*y)).max().unwrap();
+    let mut report = vec![];
+    let mut wrong = false;
+    for choice in CHOICES {
+        let mut single = None;
+        for precision in [false, true].into_iter().filter(|&h| h <= half) {
+            let mut reference = None;
+            for (table, models) in [("reference", models::REFERENCE), ("fused", models::FUSED)] {
+                let scaler = gpu.scaler_at(models[index(choice)], size, precision);
+                let runs: Vec<_> = (0..2)
+                    .map(|_| {
+                        gpu.run(&scaler, &pixels, None);
+                        gpu.read(&scaler.output).concat()
+                    })
+                    .collect();
+                let base = reference.get_or_insert_with(|| runs[0].clone());
+                let single = single.get_or_insert_with(|| runs[0].clone());
+                let (error, from_single) = (delta(base, &runs[0]), delta(single, &runs[0]));
+                let repeats = runs[0] == runs[1];
+                wrong |= error > 2 || !repeats;
+                report.push(format!(
+                    "{choice:?} {table} {}: error={error} vs_f32={from_single} repeats={repeats}",
+                    if precision { "f16" } else { "f32" }
+                ));
+            }
+        }
+    }
+    eprintln!("{}", report.join("\n"));
+    assert!(!wrong, "{}", report.join("; "));
 }

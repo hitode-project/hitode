@@ -291,7 +291,8 @@ impl Context {
     ) -> Result<Allocation> {
         // Upload memory is never flushed, so it must be coherent. Memory the
         // CPU reads wants a cached type, flushed or invalidated where it is
-        // not coherent; the first preference outranks the second.
+        // not coherent; the first preference outranks the second. The type
+        // bits decide alone: the allocator's host locations demand coherence.
         let visible = vk::MemoryPropertyFlags::HOST_VISIBLE;
         let coherent = vk::MemoryPropertyFlags::HOST_COHERENT;
         let cached = vk::MemoryPropertyFlags::HOST_CACHED;
@@ -301,9 +302,10 @@ impl Context {
                 [vk::MemoryPropertyFlags::DEVICE_LOCAL; 2],
                 MemoryLocation::GpuOnly,
             ),
-            Memory::Upload => (visible | coherent, [cached; 2], MemoryLocation::CpuToGpu),
-            Memory::Shared => (visible, [cached, coherent], MemoryLocation::CpuToGpu),
-            Memory::Readback => (visible, [cached, coherent], MemoryLocation::GpuToCpu),
+            Memory::Upload => (visible | coherent, [cached; 2], MemoryLocation::Unknown),
+            Memory::Shared | Memory::Readback => {
+                (visible, [cached, coherent], MemoryLocation::Unknown)
+            }
         };
         let mask = |flags| {
             self.memory
@@ -319,6 +321,11 @@ impl Context {
                 })
         };
         requirements.memory_type_bits &= mask(required);
+        // Flushed and invalidated ranges round out to atoms, so host blocks,
+        // including one sized to a single large allocation, are atom multiples.
+        if memory != Memory::Device {
+            requirements.size = requirements.size.next_multiple_of(self.atom);
+        }
         let mut prefer = |flags| {
             let types = requirements.memory_type_bits & mask(flags);
             if types != 0 {

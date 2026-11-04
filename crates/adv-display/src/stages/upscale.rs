@@ -179,6 +179,18 @@ fn pipeline(
 impl Upscaling {
     /// Blocking pipeline creation; run it on the compile pool.
     pub fn new(device: &Device, model: Model, size: (u32, u32)) -> adv_gpu::Result<Self> {
+        let half = device.caps().features.contains(Features::SHADER_F16);
+        Self::with_precision(device, model, size, half)
+    }
+
+    /// As [`Self::new`], in half precision only where `half` and the model
+    /// declares it.
+    pub fn with_precision(
+        device: &Device,
+        model: Model,
+        size: (u32, u32),
+        half: bool,
+    ) -> adv_gpu::Result<Self> {
         let max = device.caps().limits.max_image_2d;
         if size.0 == 0 || size.1 == 0 || size.0 > max / 2 || size.1 > max / 2 {
             return Err(adv_gpu::Error::Invalid(
@@ -211,7 +223,6 @@ impl Upscaling {
             .iter()
             .map(|&format| image(format, Usage::SAMPLED | Usage::STORAGE, "upscale tensor"))
             .collect::<adv_gpu::Result<_>>()?;
-        let half = device.caps().features.contains(Features::SHADER_F16);
         let pipelines = model
             .passes
             .iter()
