@@ -273,6 +273,7 @@ impl Session {
             let weak = Rc::downgrade(&driver);
             driver.view.start_frame_clock(Rc::new(move || {
                 if let Some(driver) = weak.upgrade() {
+                    driver.refreshed();
                     driver.drive();
                 }
             }));
@@ -519,6 +520,12 @@ impl Driver {
         self.service.borrow_mut().shutdown();
         if let Some(callback) = self.on_finished.borrow_mut().take() {
             callback(result);
+        }
+    }
+    #[cfg(target_vendor = "apple")]
+    fn refreshed(&self) {
+        if let Some(ui) = self.ui.borrow().as_ref() {
+            ui.refreshed();
         }
     }
     fn drive(&self) {

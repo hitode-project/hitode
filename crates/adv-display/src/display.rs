@@ -89,6 +89,30 @@ pub struct Frame {
     pub base: Base,
     pub video: Vec<Video>,
     pub published_at: Instant,
+    /// Called with the token after which every stage that read the base has
+    /// completed; dropped uncalled when nothing read it, as when a newer frame
+    /// replaced this one before it was encoded.
+    pub on_read: Option<Box<dyn FnOnce(Token) + Send>>,
+}
+impl Frame {
+    /// Take over a replaced, never encoded frame: its damage, and the new
+    /// pictures of videos this frame still shows without a new one.
+    fn inherit(&mut self, older: Frame) {
+        self.info.damage = self.info.damage.union(&older.info.damage);
+        for old in older.video {
+            let Some(image) = old.update else { continue };
+            if let Some(i) = self
+                .video
+                .iter()
+                .position(|v| v.id == old.id && v.update.is_none())
+            {
+                self.video[i].update = Some(image);
+                if let Some(g) = self.info.video.iter_mut().find(|g| g.id == old.id) {
+                    g.changed = true;
+                }
+            }
+        }
+    }
 }
 #[derive(Debug)]
 pub enum Error {
@@ -240,7 +264,14 @@ pub struct Display {
     origin: Instant,
     wake: Option<Wake>,
     unlatched: Option<u64>,
+    /// The display refreshes counted so far, once a frame clock reports them,
+    /// and the count at the last attach: one attach per refresh.
+    refresh: Option<u64>,
+    attached_refresh: u64,
     held: Option<Pending>,
+    /// A software or presentable frame waiting, unencoded, for the next
+    /// attach; a newer frame replaces it.
+    deferred: Option<Frame>,
     video: Vec<Video>,
     publication: Option<Publication>,
     queries: Option<adv_gpu::queue::QuerySet>,
@@ -287,7 +318,10 @@ impl Display {
             origin: Instant::now(),
             wake: None,
             unlatched: None,
+            refresh: None,
+            attached_refresh: 0,
             held: None,
+            deferred: None,
             video: vec![],
             publication: None,
             queries,
@@ -426,7 +460,12 @@ impl Display {
         }
         Ok(())
     }
-    fn redraw_frame(&self) -> Option<Frame> {
+    /// The newest content again, in full: a waiting frame, else the shown one.
+    fn redraw_frame(&mut self) -> Option<Frame> {
+        if let Some(mut frame) = self.deferred.take() {
+            frame.info.damage = Damage::Whole;
+            return Some(frame);
+        }
         let (record, image, video) = if let Some(held) = &self.held {
             let base = held.images.iter().find(|i| i.layer == LayerId::Base);
             (&held.record, base.map(|i| &i.image), &held.video)
@@ -448,6 +487,7 @@ impl Display {
             },
             video: video.iter().map(Video::retained).collect(),
             published_at: self.origin + record.published_at,
+            on_read: None,
         })
     }
     pub fn presentable(&self, canvas: (u32, u32)) -> bool {
@@ -606,9 +646,18 @@ impl Display {
         }
         reading
     }
+    /// The frame clock counted `refresh` display refreshes. From then on a
+    /// present attaches at most once per refresh; frames between are held and
+    /// merged.
+    pub fn refreshed(&mut self, refresh: u64) {
+        if refresh > 0 {
+            self.refresh = Some(refresh);
+        }
+    }
     fn attachable(&self) -> bool {
         self.compositor.is_some()
             && self.unlatched.is_none()
+            && self.refresh.is_none_or(|r| r > self.attached_refresh)
             && self.settings.view.0 != 0
             && self.settings.view.1 != 0
     }
@@ -619,6 +668,18 @@ impl Display {
                 error,
                 token: Token(0),
             })?;
+        if let Some(older) = self.deferred.take() {
+            frame.inherit(older);
+        }
+        // Until it can attach, a frame whose base stays valid waits unencoded;
+        // a private swap image must be read before the guest writes it again.
+        if !self.attachable()
+            && matches!(frame.base, Base::Software { .. } | Base::Presentable { .. })
+        {
+            self.deferred = Some(frame);
+            return Ok(Token(0));
+        }
+        let on_read = frame.on_read.take();
         let source = if let Base::Retained { image, .. } = &frame.base {
             Some(image.id())
         } else {
@@ -642,6 +703,11 @@ impl Display {
             token: Token(0),
         })?;
         let token = pending.read;
+        if let Some(on_read) = on_read
+            && token != Token(0)
+        {
+            on_read(token);
+        }
         if self.attachable() {
             self.attach(pending)
                 .map_err(|error| Failure { error, token })?;
@@ -693,6 +759,7 @@ impl Display {
         self.pools.after_present(&pending.record.plan);
         self.video = pending.video;
         self.unlatched = Some(serial);
+        self.attached_refresh = self.refresh.unwrap_or(0);
         self.invalid = false;
         self.recorder
             .record(recorder::Event::Present(Box::new(pending.record)));
@@ -787,10 +854,12 @@ impl Display {
             self.present(queue, frame).map_err(|e| e.error)?;
         }
         self.drain(queue)?;
-        if self.attachable()
-            && let Some(p) = self.held.take()
-        {
-            self.attach(p)?;
+        if self.attachable() {
+            if let Some(frame) = self.deferred.take() {
+                self.present(queue, frame).map_err(|e| e.error)?;
+            } else if let Some(p) = self.held.take() {
+                self.attach(p)?;
+            }
         }
         Ok(())
     }

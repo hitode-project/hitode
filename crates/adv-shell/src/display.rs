@@ -10,7 +10,10 @@ use adv_sync::WakeEvent;
 pub use plan::Upscaler;
 use std::{
     collections::VecDeque,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -34,6 +37,8 @@ impl Mailbox {
 }
 struct Shared {
     settings: Mutex<Mailbox>,
+    /// Display refreshes the UI's frame clock counted.
+    refreshes: AtomicU64,
     feedback: Mutex<VecDeque<Result<Feedback, String>>>,
     wake: WakeEvent,
 }
@@ -93,6 +98,11 @@ impl Ui {
         }
     }
     /// Drop free display buffers (memory pressure, background).
+    /// One display refresh passed: a held frame may attach now.
+    pub fn refreshed(&self) {
+        self.shared.refreshes.fetch_add(1, Ordering::Relaxed);
+        self.shared.settings.lock().unwrap().poke();
+    }
     pub fn trim(&mut self) {
         let mut m = self.shared.settings.lock().unwrap();
         m.trim = true;
@@ -193,6 +203,7 @@ pub(crate) fn channel(
             window: None,
             wake: None,
         }),
+        refreshes: AtomicU64::new(0),
         feedback: Mutex::new(VecDeque::new()),
         wake,
     });
@@ -365,6 +376,7 @@ fn map(frame: frame::Frame) -> (display::Frame, Option<frame::Slot>) {
             base,
             video,
             published_at: frame.published_at,
+            on_read: None,
         },
         slot,
     )
@@ -511,18 +523,13 @@ impl frame::Presenter for Presenter {
             self.shared.send(Err(e));
             return;
         }
-        let (frame, slot) = map(frame);
-        let result = self.display.present(queue, frame);
-        let token = match &result {
-            Ok(t) => *t,
-            Err(e) => e.token,
-        };
-        if token.0 != 0
-            && let Some(slot) = slot
-        {
-            slot.ingested(token);
-        }
-        if let Err(e) = result {
+        let (mut frame, slot) = map(frame);
+        // The slot returns to the guest once its last reader completes.
+        frame.on_read = slot
+            .map(|slot| Box::new(move |token| slot.ingested(token)) as Box<dyn FnOnce(_) + Send>);
+        self.display
+            .refreshed(self.shared.refreshes.load(Ordering::Relaxed));
+        if let Err(e) = self.display.present(queue, frame) {
             self.shared
                 .send(Err(format!("display present: {:?}", e.error)));
         }
@@ -543,6 +550,8 @@ impl frame::Presenter for Presenter {
             Ok(())
         }
         .and_then(|()| {
+            self.display
+                .refreshed(self.shared.refreshes.load(Ordering::Relaxed));
             self.display
                 .service(queue)
                 .map_err(|e| format!("display service: {e:?}"))
@@ -590,6 +599,7 @@ mod tests {
                 window: None,
                 wake: None,
             }),
+            refreshes: AtomicU64::new(0),
             feedback: Mutex::new(VecDeque::new()),
             wake: WakeEvent::new().unwrap(),
         })

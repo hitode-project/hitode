@@ -45,6 +45,7 @@ define_class!(
                 driver.view.vsync.publish(at, Duration::from_secs_f64(period));
                 driver.view.period.set((period * 1e9) as i64);
             }
+            driver.refreshed();
             driver.drive();
         }
     }

@@ -144,6 +144,7 @@ fn frame(serial: u64, image: &Image, damage: Damage) -> Frame {
         base: Base::Private(image.clone()),
         video: vec![],
         published_at: std::time::Instant::now(),
+        on_read: None,
     }
 }
 // spec: HOST-VIEW-11
@@ -172,6 +173,7 @@ fn presentable_swap_is_shown_by_reference_without_a_stage() {
                 base: Base::Presentable { image, ready },
                 video: vec![],
                 published_at: std::time::Instant::now(),
+                on_read: None,
             },
         )
         .unwrap();
@@ -400,6 +402,7 @@ fn software_ingest_and_video_layers_share_one_plan() {
                 },
                 video: vec![video],
                 published_at: std::time::Instant::now(),
+                on_read: None,
             },
         )
         .unwrap();
@@ -460,6 +463,7 @@ fn failed_attachment_keeps_the_ledger_uncommitted_and_reports_the_submitted_read
             },
             video: vec![],
             published_at: std::time::Instant::now(),
+            on_read: None,
         },
     );
     let failure = result.unwrap_err();
@@ -567,6 +571,7 @@ fn coalescing_replaces_the_held_frame_merges_damage_and_releases_its_swap() {
                     base: Base::Presentable { image, ready },
                     video: vec![],
                     published_at: std::time::Instant::now(),
+                    on_read: None,
                 },
             )
             .unwrap();
@@ -814,7 +819,7 @@ fn composition_uses_one_pass_for_base_borders_and_all_videos_and_records_gpu_tim
 
 // spec: HOST-VIEW-3, HOST-VIEW-11
 #[test]
-fn coalesced_software_reports_its_read_and_superseded_video_returns_to_the_decoder() {
+fn coalesced_software_waits_unread_and_superseded_video_returns_to_the_decoder() {
     let (d, mut q) = Device::open(&queue::DeviceOptions::default()).unwrap();
     let events = Arc::new(Mutex::new(vec![]));
     let mut display = Display::new(
@@ -831,7 +836,7 @@ fn coalesced_software_reports_its_read_and_superseded_video_returns_to_the_decod
     )
     .unwrap();
     let mut decoders = vec![];
-    let mut tokens = vec![];
+    let reads = Arc::new(Mutex::new(vec![]));
     for serial in 1..=3 {
         let (mut frame, pool) = video_frame(&d, &mut q, serial);
         let buffer = d
@@ -851,24 +856,28 @@ fn coalesced_software_reports_its_read_and_superseded_video_returns_to_the_decod
             format: crate::stages::ingest::PixelFormat::Bgra32,
             palette: None,
         };
-        let token = display.present(&mut q, frame).unwrap();
-        assert_ne!(token, Token(0));
-        tokens.push(token);
+        let reads = reads.clone();
+        frame.on_read = Some(Box::new(move |token| {
+            reads.lock().unwrap().push((serial, token))
+        }));
+        display.present(&mut q, frame).unwrap();
         decoders.push(pool);
     }
-    let (send, done) = std::sync::mpsc::channel();
-    q.on_complete(tokens[2], Box::new(move || send.send(()).unwrap()));
-    done.recv_timeout(std::time::Duration::from_secs(20))
-        .unwrap();
-    assert!(
-        q.wait(tokens[1], std::time::Duration::from_secs(20))
-            .unwrap()
-    );
+    // The first frame attached; the later ones wait unencoded, and the second,
+    // replaced before the compositor latched the first, is never read.
+    let serials = |reads: &[(u64, Token)]| reads.iter().map(|r| r.0).collect::<Vec<_>>();
+    assert_eq!(serials(&reads.lock().unwrap()), [1]);
     assert!(decoders[0].acquire_cpu().is_none());
     assert!(decoders[1].acquire_cpu().is_some());
     assert!(decoders[2].acquire_cpu().is_none());
     latch(&events, 1);
     display.service(&mut q).unwrap();
+    let read = reads.lock().unwrap().clone();
+    assert_eq!(serials(&read), [1, 3]);
+    assert!(
+        q.wait(read[1].1, std::time::Duration::from_secs(20))
+            .unwrap()
+    );
     display.service(&mut q).unwrap();
     assert_eq!(display.recorder().latest().unwrap().frame.serial, 3);
     assert!(decoders[0].acquire_cpu().is_some());
@@ -1197,4 +1206,38 @@ fn upscaled_partial_frames_match_a_whole_run_across_buffer_ages() {
         d.caps().limits.tile,
         plans,
     );
+}
+
+// spec: HOST-VIEW-11
+#[test]
+fn a_frame_clock_attaches_at_most_one_present_per_refresh() {
+    let (d, mut q) = Device::open(&queue::DeviceOptions::default()).unwrap();
+    let events = Arc::new(Mutex::new(vec![]));
+    let mut display = Display::new(
+        d.clone(),
+        Box::new(Controlled {
+            headless: HeadlessCompositor::new(caps()),
+            history: Arc::default(),
+            latch: events.clone(),
+        }),
+        settings(),
+    )
+    .unwrap();
+    let image = private(&d, &mut q);
+    display.refreshed(1);
+    display
+        .present(&mut q, frame(1, &image, Damage::Whole))
+        .unwrap();
+    latch(&events, 1);
+    display.service(&mut q).unwrap();
+    // Latched within the same refresh: the next frame waits for the clock.
+    display
+        .present(&mut q, frame(2, &image, Damage::Whole))
+        .unwrap();
+    display.service(&mut q).unwrap();
+    assert_eq!(display.totals().presents, 1);
+    display.refreshed(2);
+    display.service(&mut q).unwrap();
+    assert_eq!(display.totals().presents, 2);
+    assert_eq!(display.recorder().latest().unwrap().frame.serial, 2);
 }

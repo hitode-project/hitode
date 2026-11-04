@@ -222,6 +222,13 @@ impl Worker {
     }
 }
 impl Ui {
+    /// The frame clock fired: one display refresh passed.
+    #[cfg(target_vendor = "apple")]
+    pub(crate) fn refreshed(&self) {
+        if let Some(native) = &self.native {
+            native.refreshed();
+        }
+    }
     #[cfg(host_view)]
     pub(crate) fn fps(&self) -> f64 {
         self.frame_times
