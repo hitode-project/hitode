@@ -108,10 +108,10 @@ impl Output {
         pts_us: u64,
         decoded: &mut frame::Video,
     ) -> Result<VideoFrame, Error> {
-        debug_assert_eq!(
-            (decoded.width(), decoded.height()),
-            (self.width, self.height)
-        );
+        // The pool and scaler were sized for the stream's first dimensions.
+        if (decoded.width(), decoded.height()) != (self.width, self.height) {
+            return Err(Error::Decode("video dimensions changed mid-stream".into()));
+        }
         for picture in &mut self.pictures {
             if let Some(picture) = Arc::get_mut(picture) {
                 picture.release_unshown();

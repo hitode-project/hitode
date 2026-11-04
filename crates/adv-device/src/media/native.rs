@@ -218,8 +218,11 @@ struct Video {
     time_base: Rational,
     #[cfg(not(feature = "gpu"))]
     scaler: software::scaling::Context,
+    /// Built at the first decoded frame, whose format the header may omit.
     #[cfg(feature = "gpu")]
-    output: super::planes::Output,
+    output: Option<super::planes::Output>,
+    #[cfg(feature = "gpu")]
+    device: adv_gpu::Device,
     frame_duration_us: u64,
 }
 
@@ -298,7 +301,10 @@ fn convert(
     pts_us: u64,
     decoded: &mut frame::Video,
 ) -> Result<VideoFrame, Error> {
-    video.output.convert(pts_us, decoded)
+    if video.output.is_none() {
+        video.output = Some(super::planes::Output::new(&video.device, &video.decoder)?);
+    }
+    video.output.as_mut().unwrap().convert(pts_us, decoded)
 }
 
 fn open_video(stream: &format::stream::Stream<'_>) -> Result<Video, Error> {
@@ -326,12 +332,10 @@ fn open_video(stream: &format::stream::Stream<'_>) -> Result<Video, Error> {
         software::scaling::Flags::BILINEAR,
     )?;
     #[cfg(feature = "gpu")]
-    let output = super::planes::Output::new(
-        crate::gpu::Gpu::execution(false)
-            .map_err(|e| Error::Decode(e.to_string()))?
-            .device(),
-        &decoder,
-    )?;
+    let device = crate::gpu::Gpu::execution(false)
+        .map_err(|e| Error::Decode(e.to_string()))?
+        .device()
+        .clone();
     let frame_duration_us = if rate.numerator() > 0 {
         (1_000_000 * rate.denominator() as u64 / rate.numerator() as u64).max(1)
     } else {
@@ -344,7 +348,9 @@ fn open_video(stream: &format::stream::Stream<'_>) -> Result<Video, Error> {
         #[cfg(not(feature = "gpu"))]
         scaler,
         #[cfg(feature = "gpu")]
-        output,
+        output: None,
+        #[cfg(feature = "gpu")]
+        device,
         frame_duration_us,
     })
 }
