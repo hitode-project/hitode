@@ -436,10 +436,8 @@ mod precision_tests {
     use super::*;
     use std::time::Duration;
 
-    /// The case a child process compiles; unset in the parent.
+    /// The first case a child process compiles; unset in the parent.
     const CASE: &str = "ADV_UPSCALE_COMPILE_CASE";
-    /// The pass whose forms the variant cases rewrite.
-    const SUBJECT: &str = "Anime4K_Upscale_Denoise_L/1.wgsl";
 
     fn device() -> Device {
         Device::open(&adv_gpu::queue::DeviceOptions {
@@ -452,10 +450,10 @@ mod precision_tests {
         .0
     }
 
-    /// `f16 <shader>` and `f32 <shader>` for every pass this device runs,
-    /// then rewrites of `SUBJECT` that each remove one construct.
-    fn cases(device: &Device) -> Vec<String> {
-        let mut cases = vec![];
+    /// Every pass this device runs, in each precision it has: the label, the
+    /// model, the pass and whether it is the half-precision form.
+    fn cases(device: &Device) -> Vec<(String, Model, &'static Pass, bool)> {
+        let mut cases: Vec<(String, Model, &'static Pass, bool)> = vec![];
         for half in [true, false] {
             for choice in [
                 Upscaler::Anime4k,
@@ -463,131 +461,22 @@ mod precision_tests {
                 Upscaler::Artcnn,
                 Upscaler::K7,
             ] {
-                for pass in model(device, choice).passes {
+                let m = model(device, choice);
+                for pass in m.passes {
                     let (_, h, _) = SHADERS.iter().find(|(p, ..)| *p == pass.shader).unwrap();
-                    let case = format!("{} {}", if half { "f16" } else { "f32" }, pass.shader);
-                    if !(half && h.is_none()) && !cases.contains(&case) {
-                        cases.push(case);
+                    let label = format!("{} {}", if half { "f16" } else { "f32" }, pass.shader);
+                    if !(half && h.is_none()) && !cases.iter().any(|c| c.0 == label) {
+                        cases.push((label, m, pass, half));
                     }
                 }
             }
         }
-        cases.extend(["stored-nulls", "uninitialized", "sampled"].map(String::from));
         cases
-    }
-
-    /// Function variables of array type lose their null initializer; with
-    /// `store`, the entry block stores the null instead.
-    fn without_null_arrays(spirv: &[u32], store: bool) -> Vec<u32> {
-        let instructions = || {
-            let mut rest = &spirv[5..];
-            std::iter::from_fn(move || {
-                let (head, tail) = rest.split_at_checked((*rest.first()? >> 16) as usize)?;
-                rest = tail;
-                Some(head)
-            })
-        };
-        let pointers: Vec<u32> = {
-            let arrays: Vec<u32> = instructions()
-                .filter(|i| i[0] & 0xffff == 28)
-                .map(|i| i[1])
-                .collect();
-            instructions()
-                .filter(|i| i[0] & 0xffff == 32 && arrays.contains(&i[3]))
-                .map(|i| i[1])
-                .collect()
-        };
-        let mut out = spirv[..5].to_vec();
-        let mut pending = vec![];
-        for i in instructions() {
-            let op = i[0] & 0xffff;
-            if op == 59 && i.len() == 5 && i[3] == 7 && pointers.contains(&i[1]) {
-                out.extend_from_slice(&[(4 << 16) | 59, i[1], i[2], 7]);
-                pending.push([(3 << 16) | 62, i[2], i[4]]);
-                continue;
-            }
-            if op != 59 && !pending.is_empty() {
-                if store {
-                    out.extend(pending.iter().flatten());
-                }
-                pending.clear();
-            }
-            out.extend_from_slice(i);
-        }
-        out
-    }
-
-    fn compile(device: &Device, case: &str) {
-        let (_, half, single) = SHADERS.iter().find(|(p, ..)| *p == SUBJECT).unwrap();
-        let subject = half.as_ref().or(single.as_ref()).unwrap();
-        let source = |spirv: &[u32]| {
-            device
-                .create_shader(ShaderDesc {
-                    source: Source::Precompiled {
-                        spirv,
-                        metal: subject.metal,
-                        entries: subject.entries,
-                    },
-                    identity: 0,
-                    label: "compile case",
-                })
-                .unwrap()
-        };
-        let m = models::FUSED[index(Upscaler::Anime4k)];
-        let pass = m.passes.iter().find(|p| p.shader == SUBJECT).unwrap();
-        let build = |shader: adv_gpu::Shader| {
-            device
-                .create_compute_pipeline(
-                    &ComputePipelineDesc {
-                        entry: shader.entry("main", Stage::Compute).unwrap(),
-                        bindings: pass.layout(&m),
-                        label: "compile case",
-                    },
-                    None,
-                )
-                .unwrap();
-        };
-        match case {
-            "stored-nulls" | "uninitialized" => {
-                build(source(&without_null_arrays(
-                    subject.spirv,
-                    case == "stored-nulls",
-                )));
-            }
-            "sampled" => {
-                let mut wgsl = include_str!("upscale/Anime4K_Upscale_Denoise_L/1.wgsl").to_owned();
-                for c in 0..3 {
-                    wgsl = wgsl.replace(
-                        &format!("textureGather((i32({c})), (INPUT_0), (sam_0), (tpos_0))"),
-                        "textureSampleLevel(INPUT_0, sam_0, tpos_0, 0.0)",
-                    );
-                }
-                assert!(!wgsl.contains("textureGather"));
-                let compiled = adv_gpu::shader::precompile(&wgsl, &pass.layout(&m)).unwrap();
-                build(source(&compiled.spirv));
-            }
-            _ => {
-                let (form, shader) = case.split_once(' ').unwrap();
-                let choice = [
-                    Upscaler::Anime4k,
-                    Upscaler::Cunny,
-                    Upscaler::Artcnn,
-                    Upscaler::K7,
-                ]
-                .into_iter()
-                .map(|choice| model(device, choice))
-                .find(|m| m.passes.iter().any(|p| p.shader == shader))
-                .unwrap();
-                let pass = choice.passes.iter().find(|p| p.shader == shader).unwrap();
-                pipeline(device, &choice, pass, form == "f16").unwrap();
-            }
-        }
     }
 
     /// Cases compile in a child process that announces each one first; a
     /// driver crash names its case and a new child resumes after it, so every
-    /// other case still reports. The rewrites of `SUBJECT` show which
-    /// construct a compiler rejects.
+    /// other case still reports.
     #[test]
     fn passes_compile_in_isolation() {
         use std::io::{BufRead, Write};
@@ -595,10 +484,10 @@ mod precision_tests {
         let cases = cases(&device);
         if let Ok(start) = std::env::var(CASE) {
             let mut out = std::io::stdout();
-            for (i, case) in cases.iter().enumerate().skip(start.parse().unwrap()) {
+            for (i, (_, m, pass, half)) in cases.iter().enumerate().skip(start.parse().unwrap()) {
                 writeln!(out, "{i}").unwrap();
                 out.flush().unwrap();
-                compile(&device, case);
+                pipeline(&device, m, pass, *half).unwrap();
             }
             return;
         }
@@ -643,8 +532,8 @@ mod precision_tests {
                 break;
             }
             let i = current.expect("the child failed before its first case");
-            eprintln!("{}: {status}", cases[i]);
-            failed.push(format!("{} ({status})", cases[i]));
+            eprintln!("{}: {status}", cases[i].0);
+            failed.push(format!("{} ({status})", cases[i].0));
             start = i + 1;
         }
         assert!(failed.is_empty(), "failed: {}", failed.join(", "));

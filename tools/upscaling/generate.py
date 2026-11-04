@@ -143,9 +143,21 @@ def listed(source):
     return source[:entry] + CELLS + source[entry:]
 
 
+def inline(source):
+    """Expand every MulAdd helper at its call sites: Adreno 6xx compilers crash
+    on functions that take a matrix. The products and sums stay in order."""
+    for name, x, y, a, body in re.findall(r'fn (MulAdd_\w+)\( *(\w+) *:[^,]+, *(\w+) *:[^,]+, *(\w+) *:[^)]+\)[^{]*\{\s*return ([^;]+);\s*\}\n*', source):
+        assert body == f'((({y}) * ({x}))) + {a}', body
+        source = re.sub(r'fn ' + name + r'\([^{]*\{[^}]*\}\n*', '', source)
+        expand = lambda args: f'((({args[1]}) * ({fuse.calls(args[0], name, expand)}))) + ({fuse.calls(args[2], name, expand)})'
+        source = fuse.calls(source, name, expand)
+    assert 'MulAdd' not in source
+    return source
+
+
 def write(shader, source):
     (UPSCALE / shader).parent.mkdir(parents=True, exist_ok=True)
-    (UPSCALE / shader).write_text(HEADER + listed(rebind(source)).rstrip() + '\n')
+    (UPSCALE / shader).write_text(HEADER + listed(rebind(inline(source))).rstrip() + '\n')
 
 
 def slots(passes):
