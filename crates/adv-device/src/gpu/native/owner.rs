@@ -930,7 +930,19 @@ mod tests {
             self.drain();
             done.recv_timeout(TIMEOUT).unwrap();
             self.state.queue.poll().unwrap();
-            unsafe { buffer.mapped().unwrap().as_ref() }.to_vec()
+            let mut bytes = unsafe { buffer.mapped().unwrap().as_ref() }.to_vec();
+            // As the guest readback does: RGBA storage (Android's presentable
+            // format) comes back in the guest's BGRA order.
+            let format = match &image.storage {
+                Storage::Fixed { image, .. } => image.desc().format,
+                Storage::Swap(_) => super::super::backing::swap_format(),
+            };
+            if format == Format::Rgba8Unorm {
+                for pixel in bytes.as_chunks_mut::<4>().0 {
+                    pixel.swap(0, 2);
+                }
+            }
+            bytes
         }
         fn frame_image(&self, n: usize) -> adv_gpu::Image {
             let frames = self.display.frames.lock().unwrap();

@@ -166,7 +166,7 @@ mod tests {
     #[test]
     // spec: GFX-REC-1
     fn pause_and_device_loss_apply_to_every_facade_on_the_execution() {
-        let mut gpu = request(!cfg!(target_vendor = "apple")).unwrap();
+        let mut gpu = request(!cfg!(any(target_vendor = "apple", target_os = "android"))).unwrap();
         let child = gpu.fork().unwrap();
         let target = gpu.target(2, 2, false).unwrap();
         gpu.clear(&target, Some([1., 0., 0., 1.]), None).unwrap();

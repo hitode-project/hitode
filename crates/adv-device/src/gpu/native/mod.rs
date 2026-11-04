@@ -251,8 +251,10 @@ mod tests {
     use super::*;
     #[test]
     fn every_gpu_on_the_execution_thread_uses_one_producer() {
-        let first = Gpu::execution(!cfg!(target_vendor = "apple")).unwrap();
-        let second = Gpu::execution(!cfg!(target_vendor = "apple")).unwrap();
+        let first =
+            Gpu::execution(!cfg!(any(target_vendor = "apple", target_os = "android"))).unwrap();
+        let second =
+            Gpu::execution(!cfg!(any(target_vendor = "apple", target_os = "android"))).unwrap();
         assert!(std::rc::Rc::ptr_eq(&first.stream.0, &second.stream.0));
         assert!(std::rc::Rc::ptr_eq(&first.execution, &second.execution));
         let child = first.fork().unwrap();
@@ -310,6 +312,7 @@ mod tests {
         );
         drop(shared);
         drop(gpu);
-        let _next = Gpu::request(!cfg!(target_vendor = "apple")).unwrap();
+        let _next =
+            Gpu::request(!cfg!(any(target_vendor = "apple", target_os = "android"))).unwrap();
     }
 }

@@ -993,7 +993,7 @@ pub(super) mod tests {
     }
 
     pub(in crate::gpu::native) fn executor() -> Option<Gpu> {
-        match Gpu::request(!cfg!(target_vendor = "apple")) {
+        match Gpu::request(!cfg!(any(target_vendor = "apple", target_os = "android"))) {
             Ok(gpu) => Some(gpu),
             Err(Error::Unavailable(reason))
                 if std::env::var_os("ADV_GPU_REQUIRE_BACKEND").is_none() =>

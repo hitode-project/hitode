@@ -1532,7 +1532,8 @@ struct V { @builtin(position) position:vec4<f32>, @location(0) alpha:f32 }
     // spec: GFX-REC-1, GFX-PASS-1
     #[test]
     fn facade_clear_copy_readback_completion() {
-        let mut gpu = match Gpu::request(!cfg!(target_vendor = "apple")) {
+        let mut gpu = match Gpu::request(!cfg!(any(target_vendor = "apple", target_os = "android")))
+        {
             Ok(gpu) => gpu,
             Err(Error::Unavailable(reason))
                 if std::env::var_os("ADV_GPU_REQUIRE_BACKEND").is_none() =>
