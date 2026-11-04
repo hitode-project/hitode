@@ -126,7 +126,15 @@ impl Output {
             .iter_mut()
             .find(|p| p.image().id() == image.image().id())
             .unwrap();
-        let picture_mut = Arc::get_mut(picture).expect("released picture is still referenced");
+        // The compositor released this buffer, but a guest or a queued frame
+        // may still hold its last picture; that one keeps its decoder planes.
+        if Arc::get_mut(picture).is_none() {
+            *picture = Arc::new(crate::frame::DecodedPicture::new(
+                image.image().clone(),
+                picture.color(),
+            ));
+        }
+        let picture_mut = Arc::get_mut(picture).unwrap();
         image.write(|planes| {
             if let Some(scaler) = &mut self.scaler {
                 let input = unsafe { &*decoded.as_ptr() };
@@ -523,11 +531,14 @@ mod ownership_tests {
         )
         .unwrap();
         let mut ids = std::collections::HashSet::new();
+        // Shown frames a guest keeps, with their snapshots at the time.
+        let mut held = vec![];
         for time in (0..1_000_000).step_by(40_000) {
             let Some(frame) = decoder.frame_at(time).unwrap().video else {
                 continue;
             };
             ids.insert(frame.picture.image().id());
+            held.push((frame.picture.clone(), frame.picture.bgra()));
             let plane = VideoPlane {
                 id: 7,
                 picture: frame.picture.clone(),
@@ -559,6 +570,10 @@ mod ownership_tests {
         }
         assert!(!ids.is_empty());
         assert!(ids.len() <= 4);
+        assert!(held.len() > 4);
+        for (picture, bgra) in &held {
+            assert_eq!(&picture.bgra(), bgra);
+        }
     }
 }
 
