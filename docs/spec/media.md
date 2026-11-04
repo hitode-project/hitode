@@ -172,5 +172,5 @@ Wine decoder capability probes MUST succeed for available codecs before stream s
 
 ### MEDIA-VIDEO-7 Native video planes
 
-**Rule**: With `native-display`, host decoded pictures MUST use four reusable presentable buffers per stream: NV12 on Apple, NV21 on Android. Display MUST transfer each picture's presentable lease at most once. Guest pixel requests MUST convert on demand using the stream matrix and range.
+**Rule**: With GPU rendering, decoded host pictures MUST use four reusable presentable buffers per stream: NV12 on Apple, NV21 on Android. Display MUST transfer each picture's presentable lease at most once. Guest pixel requests MUST convert on demand using the stream matrix and range.
 **Verification**: Test

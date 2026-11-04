@@ -22,7 +22,7 @@ The hook runs `tools/check.py` on what is staged: formatting, whitespace, privac
 
 ## Command-line runner
 
-`adv-run` runs a game with or without a window. `gpu` adds the wgpu renderer and `media` adds video through FFmpeg.
+`adv-run` runs a game with or without a window. `gpu` adds native Vulkan and Metal rendering and `media` adds video through FFmpeg.
 
 ```sh
 cargo build --release -p adv-run

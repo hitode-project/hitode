@@ -141,7 +141,7 @@ cargo build --release -p adv-run
 - [OxiSynth](https://github.com/PolyMeilex/OxiSynth) 和 FluidR3 Mono 音色库：MIDI 音乐的合成。
 - [FFmpeg](https://ffmpeg.org/) 和 Xiph 的 [libtheora](https://www.theora.org/)：播放游戏自带的视频。
 
-我们还用到了 [wgpu](https://wgpu.rs/)、[Symphonia](https://github.com/pdeljanov/Symphonia)、[cpal](https://github.com/RustAudio/cpal)、[encoding_rs](https://github.com/hsivonen/encoding_rs)、[corosensei](https://github.com/Amanieu/corosensei)、[Tauri](https://tauri.app/) 和 [Svelte](https://svelte.dev/)。
+我们还用到了 [Symphonia](https://github.com/pdeljanov/Symphonia)、[cpal](https://github.com/RustAudio/cpal)、[encoding_rs](https://github.com/hsivonen/encoding_rs)、[corosensei](https://github.com/Amanieu/corosensei)、[Tauri](https://tauri.app/) 和 [Svelte](https://svelte.dev/)。
 
 名字取自《CLANNAD》里伊吹风子一个个亲手雕、送给大家的木海星（ヒトデ）。我们也想把这些老游戏，一份份送到更多人手里。
 

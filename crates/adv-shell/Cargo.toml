@@ -9,9 +9,8 @@ description = "Host platform shell: window, input, audio device, execution drive
 
 [features]
 default = []
-gpu = ["adv-runtime/gpu", "adv-device/gpu", "dep:wgpu", "dep:pollster"]
+gpu = ["adv-runtime/gpu", "adv-device/gpu", "dep:adv-display", "dep:adv-gpu"]
 media = ["adv-runtime/media"]
-native-display = ["gpu", "adv-device/native-display", "adv-runtime/native-display", "dep:adv-display", "dep:adv-gpu"]
 
 [dependencies]
 adv-display = { path = "../adv-display", optional = true }
@@ -22,17 +21,15 @@ adv-os = { path = "../adv-os" }
 adv-sync = { path = "../adv-sync" }
 adv-report = { path = "../adv-report" }
 png = "0.17"
-wgpu = { version = "=30.0.1", optional = true, default-features = false, features = ["std", "wgsl"] }
-pollster = { version = "0.4", optional = true }
 
 [target.'cfg(not(any(target_os = "macos", target_os = "android")))'.dependencies]
 adv-device = { path = "../adv-device", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+adv-display = { path = "../adv-display" }
+adv-gpu = { path = "../adv-gpu" }
 adv-device = { path = "../adv-device", features = ["device", "gpu"] }
 adv-runtime = { path = "../adv-runtime", features = ["gpu"] }
-wgpu = { version = "=30.0.1", default-features = false, features = ["std", "wgsl", "metal"] }
-pollster = "0.4"
 log = "0.4"
 objc2 = "0.6.4"
 block2 = "0.6.2"
@@ -42,11 +39,6 @@ objc2-foundation = "0.3.2"
 objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std", "CGColor"] }
 objc2-quartz-core = { version = "0.3.2", default-features = false, features = ["std", "objc2-core-foundation", "objc2-core-graphics", "CABase", "CADisplayLink", "CAFrameRateRange", "CALayer", "CAMetalLayer", "CATransaction"] }
 
-[dev-dependencies]
-pollster = "0.4"
-# The wgpu stack's cost test compares against these until the cut.
-adv-display = { path = "../adv-display" }
-adv-gpu = { path = "../adv-gpu" }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 objc2-metal = { version = "0.3.2", default-features = false, features = ["std"] }
@@ -60,18 +52,18 @@ harness = false
 workspace = true
 
 [target.'cfg(target_os = "android")'.dependencies]
+adv-display = { path = "../adv-display" }
+adv-gpu = { path = "../adv-gpu" }
 adv-device = { path = "../adv-device", features = ["device", "gpu"] }
 adv-runtime = { path = "../adv-runtime", features = ["gpu"] }
-wgpu = { version = "=30.0.1", default-features = false, features = ["std", "wgsl", "vulkan"] }
-pollster = "0.4"
 ndk-sys = "0.6"
 log = "0.4"
 
 [target.'cfg(target_os = "ios")'.dependencies]
+adv-display = { path = "../adv-display" }
+adv-gpu = { path = "../adv-gpu" }
 adv-device = { path = "../adv-device", features = ["device", "gpu"] }
 adv-runtime = { path = "../adv-runtime", features = ["gpu"] }
-wgpu = { version = "=30.0.1", default-features = false, features = ["std", "wgsl", "metal"] }
-pollster = "0.4"
 log = "0.4"
 objc2 = "0.6.4"
 objc2-core-foundation = "0.3.2"

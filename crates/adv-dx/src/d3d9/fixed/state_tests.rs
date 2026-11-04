@@ -360,11 +360,8 @@ mod state_tests {
         targets: BTreeMap<u32, Target>,
     }
     fn gpu(env: &mut Env<'_>) {
-        let gpu = pollster::block_on(Gpu::request(!cfg!(any(
-            target_os = "macos",
-            target_os = "android"
-        ))))
-        .expect("test state/reset fixture");
+        let gpu = Gpu::request(!cfg!(any(target_os = "macos", target_os = "android")))
+            .expect("test state/reset fixture");
         env.ext.insert(Surfaces::default());
         let state = env.ext.get_mut::<State>();
         state.gpu = Some(gpu);
@@ -614,11 +611,7 @@ mod fixed_completion {
     }
     fn fixture() -> (Machine<adv_cpu::JitCpu>, u32, Target) {
         let mut m = crate::d3d9::tests::machine();
-        let gpu = pollster::block_on(Gpu::request(!cfg!(any(
-            target_os = "macos",
-            target_os = "android"
-        ))))
-        .unwrap();
+        let gpu = Gpu::request(!cfg!(any(target_os = "macos", target_os = "android"))).unwrap();
         let target = gpu.target(16, 12, false).unwrap();
         m.ext.insert(StencilTarget(target.clone()));
         let mut e = env(&mut m);

@@ -30,18 +30,8 @@ This spec covers shared CPU compositing and the DirectDraw and Direct3D 9 API fr
 
 ### GFX-METAL-1 Apple programmable draws
 
-**Rule**: Apple ARM programmable draws MUST use native Metal on the wgpu command queue, preserving the reference pixels exactly. Backend switches MUST submit preceding work before dependent operations, while initialization of allocations absent from the batch MAY precede it at its submission boundary. `ADV_GPU_BACKEND=wgpu` MUST select the reference until R3-B removes the migration switch.
+**Rule**: Apple ARM programmable draws MUST use native Metal through `adv-gpu`, preserving shader semantics and command order. The GPU owner MUST make every submission and preserve resource completion dependencies.
 **Verification**: Test
-
-| Concern | Contract |
-|---|---|
-| Resources | wgpu owns or wraps textures; display targets can use IOSurface storage. Software publications use no-copy Metal uploads. Bounded clears use native drawing and its shared prebuild/persistent pipeline cache. Texture and padded-attachment copies use native blits while Metal is active; first-use wgpu initialization for allocations absent from the batch is queued before it at the existing submission boundary. Texture uploads, fixed drawing and readback retain wgpu paths. |
-| Uploads | A shared 64 MiB ring holds vertices, indices and constants; ordered completion flags retire intervals, and insufficient space returns Busy before encoding or uploading. |
-| Shaders | Naga uses wgpu-hal 30 Metal options; MSL is cached by shader content, texture visibility, vertex layout and point topology variant. Pipeline states retain the existing 64-bit key and capacity limit. Native recipes use the shared background prebuild, demand result and persistent cache (GFX-CACHE-8, GFX-CACHE-10). |
-| Batches | Matching attachments reuse the encoder; adjacent identical constants reuse their ring range. |
-| Observations | GPU reports expose Metal draws, backend switches partitioned into partial clears, copies, uploads, fixed draws, readbacks and other transitions (including entry to Metal), ring bytes written and ring Busy returns. |
-
-Acquiring a submission lease MUST NOT flush queued drawing or change backends. Native frames MUST retain their producer's completion and let direct presentation subscribe to it without an extra queue submission. Actual reference-backend work MUST preserve queue order and invalidate stale native completion tokens.
 
 ## GPU render passes
 
@@ -50,7 +40,7 @@ Acquiring a submission lease MUST NOT flush queued drawing or change backends. N
 **Rule**: Full-target color clears MUST become load-action clears in the next compatible draw pass. Partial and padded-target clears MUST preserve bounded drawing semantics.
 Full-target clips MUST preserve full-clear load actions for equal-sized attachments.
 Pending clears MUST resolve before target changes, copies, readbacks, uploads, presentation, frame completion, or external queue submissions.
-Retained resources MUST keep pending clears valid after callers release their target handles. Backend changes MUST preserve command order.
+Retained resources MUST keep pending clears valid after callers release their target handles.
 **Verification**: Test
 
 ### GFX-PASS-2 Optional depth and stencil
@@ -58,7 +48,7 @@ Retained resources MUST keep pending clears valid after callers release their ta
 **Rule**: Draw passes MUST omit unused depth/stencil attachments unless clearing them or retaining an already attached depth/stencil image.
 Fragment-depth outputs MUST retain bound depth attachments.
 A draw requiring depth/stencil MUST reopen a color-only pass without adding a submission. Attached contents MUST retain Store actions across frames.
-Metal and wgpu MUST share these rules and report passes, color loads, depth loads, and clears merged into draw passes.
+The executor MUST report passes, color loads, depth loads, and clears merged into draw passes.
 **Verification**: Test
 
 ### GFX-PASS-3 Deferred depth and stencil clears
@@ -127,10 +117,10 @@ Immutable snapshot presentation MUST preserve known color damage, just as rotati
 
 ### GFX-REC-7 Shader constant ranges and content hashing
 
-**Rule**: Translation MUST cache external register usage, excluding shader-local definitions. Fingerprints, copies and uploads MUST process only those ranges while preserving exact bits and uniform layout. Recording MUST retain complete xxh3-128 identities, and both backends MUST reserve aligned complete binding windows before writing.
+**Rule**: Translation MUST cache external register usage, excluding shader-local definitions. Fingerprints, copies and uploads MUST process only those ranges while preserving exact bits and uniform layout. Recording MUST retain complete xxh3-128 identities, and the executor MUST reserve aligned complete binding windows before writing.
 **Verification**: Test
 
-Usage includes implicit matrix rows, int/bool operands and legacy bump parameters. Relative float addressing covers all 256 float registers except local definitions. Constants, vertices and indices use 128-bit content keys. Pixels are identified by upload admission. Insufficient storage wraps before the complete binding window exceeds the buffer. Packed wgpu uploads retain one queue write per buffer per batch. Immutable snapshots retain only used registers, reuse unchanged captures across writes to unused registers and serve CPU damage interpretation directly. Complete constant blocks are materialized only on demand; CPU interpretation agrees with complete constants.
+Usage includes implicit matrix rows, int/bool operands and legacy bump parameters. Relative float addressing covers all 256 float registers except local definitions. Constants, vertices and indices use 128-bit content keys. Pixels are identified by upload admission. Insufficient storage wraps before the complete binding window exceeds the buffer. Immutable snapshots retain only used registers, reuse unchanged captures across writes to unused registers and serve CPU damage interpretation directly. Complete constant blocks are materialized only on demand; CPU interpretation agrees with complete constants.
 
 ### GFX-REC-8 Frontend work counters
 
@@ -369,11 +359,6 @@ snapshot storage; an unchanged Apply performs no state writes. Redundant fixed-s
 **Rule**: Identical bytecode MAY reuse successful translations while preserving independent shader objects and exact GetFunction bytes. Each process translation cache MUST retain at most 256 entries, with at most 8 MiB of bytecode, WGSL, and sampler payloads. Translation and assembled-program caches MUST evict oldest entries individually instead of clearing unrelated entries.
 **Verification**: Test
 
-### GFX-CACHE-6 Texture bindings
-
-**Rule**: Texture binding caches MUST key layout identity, each bound view identity, and sampler state. They MUST retain at most 1024 entries with LRU eviction. Expired view lifetimes MUST invalidate cached bindings.
-**Verification**: Test
-
 ### GFX-CACHE-7 Background compilation
 
 **Rule**: Shader translation and module preparation MUST start at resource creation on a separately bounded, lower-priority worker. Demand MUST take queued work or join its existing compilation, preserving identical source and results. The worker MUST retain at most 64 queued jobs and 32 MiB, leaving work demand-driven if priority reduction fails.
@@ -425,7 +410,7 @@ CPU-only surfaces and managed texture-level locks preserve pending recorded comm
 **Rule**: Defaults, setters, and queries MUST agree for DITHERENABLE, COLORVERTEX, WRAP0–WRAP7, and AMBIENT. Enabling dithering or texture-coordinate wrapping MUST fail explicitly. AMBIENT MUST accept and preserve every DWORD value.
 **Verification**: Test
 
-Withdrawn: GFX-NUM-2, GFX-NUM-3, GFX-NUM-4, GFX-NUM-5
+Withdrawn: GFX-CACHE-6, GFX-NUM-2, GFX-NUM-3, GFX-NUM-4, GFX-NUM-5
 
 ### GFX-CACHE-8 Persistent pipeline identity
 

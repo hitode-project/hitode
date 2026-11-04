@@ -1,7 +1,4 @@
-//! The D3D9 and DirectDraw executor over `adv-gpu` (issue #103, packages C1
-//! and C2), behind the `native-display` feature. It keeps the facade the wgpu
-//! renderer offers `adv-dx`, method for method, so the front end does not
-//! change; package G removes the wgpu renderer and the feature.
+//! The D3D9 and DirectDraw executor over `adv-gpu`.
 //!
 //! # Threads
 //!
@@ -41,11 +38,8 @@
 //! | `record.rs` | C2 | clears, draws, blits, copies, presents and readbacks as commands |
 //! | `owner.rs` | C2 | the owner thread: passes, encoding, submission, frames |
 //! | `backing.rs` | C2 | swap and depth buffers: private, presentable or transient memory |
-//! | `surface.rs` native surfaces | C2 | present through [`Gpu::present`]; the rotation pool and `NativeFrame` publication of the wgpu renderer are compiled out under this feature |
 //! | `frame.rs`, software and video slots | E | frames, video planes and their presentation layers |
 //!
-//! Under this feature `gpu/clear.rs` and the wgpu `Depth` are compiled out too;
-//! package G deletes them with the renderer.
 
 mod backing;
 mod owner;
@@ -81,13 +75,13 @@ pub struct Gpu {
 impl Gpu {
     /// Open the device and start its owner thread. `fallback` selects a
     /// software adapter (lavapipe) for tests and diagnostics.
-    pub async fn request(fallback: bool) -> Result<Self, Error> {
+    pub fn request(fallback: bool) -> Result<Self, Error> {
         Self::execution(fallback)
     }
     /// Start the execution thread's owner with its lifetime presenter, before
     /// any surface store or facade starts a headless one. The presenter stays
     /// until the last facade drops; a running execution refuses another.
-    pub async fn request_with_presenter(
+    pub fn request_with_presenter(
         device: adv_gpu::Device,
         queue: adv_gpu::Queue,
         presenter: Box<dyn crate::frame::Presenter>,
@@ -283,12 +277,8 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        let mut gpu = pollster::block_on(Gpu::request_with_presenter(
-            device.clone(),
-            queue,
-            Box::new(Capture(tx)),
-        ))
-        .unwrap();
+        let mut gpu =
+            Gpu::request_with_presenter(device.clone(), queue, Box::new(Capture(tx))).unwrap();
         let (other_tx, _) = std::sync::mpsc::channel();
         let (other_device, other_queue) = adv_gpu::Device::open(&adv_gpu::queue::DeviceOptions {
             software: !cfg!(any(target_vendor = "apple", target_os = "android")),
@@ -296,14 +286,10 @@ mod tests {
         })
         .unwrap();
         assert!(matches!(
-            pollster::block_on(Gpu::request_with_presenter(
-                other_device,
-                other_queue,
-                Box::new(Capture(other_tx)),
-            )),
+            Gpu::request_with_presenter(other_device, other_queue, Box::new(Capture(other_tx))),
             Err(Error::Invalid(_))
         ));
-        let shared = pollster::block_on(Gpu::request(false)).unwrap();
+        let shared = Gpu::request(false).unwrap();
         assert!(std::rc::Rc::ptr_eq(&gpu.execution, &shared.execution));
         let slot =
             crate::frame::Slot::new(&gpu.device, 1, 1, 4, crate::surface::PixelFormat::Bgra32)
@@ -324,6 +310,6 @@ mod tests {
         );
         drop(shared);
         drop(gpu);
-        let _next = pollster::block_on(Gpu::request(!cfg!(target_vendor = "apple"))).unwrap();
+        let _next = Gpu::request(!cfg!(target_vendor = "apple")).unwrap();
     }
 }

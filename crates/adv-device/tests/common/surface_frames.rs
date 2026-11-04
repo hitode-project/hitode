@@ -1,8 +1,8 @@
-//! Frame-source adapters for the same surface assertions in both renderer modes.
+//! Frame-source adapters for surface assertions in GPU and CPU-only builds.
 use adv_device::surface::{self, FrameView, Rect, VideoCursorRegion};
-#[cfg(feature = "native-display")]
+#[cfg(feature = "gpu")]
 use adv_device::surface::{FlushReason, SurfaceMemory, VideoLayer};
-#[cfg(feature = "native-display")]
+#[cfg(feature = "gpu")]
 use std::sync::Arc;
 
 #[derive(Clone, Default)]
@@ -40,20 +40,20 @@ impl surface::Presenter for Snapshot {
     }
 }
 
-#[cfg(not(feature = "native-display"))]
+#[cfg(not(feature = "gpu"))]
 pub type Store = surface::Surfaces<Snapshot>;
-#[cfg(not(feature = "native-display"))]
+#[cfg(not(feature = "gpu"))]
 pub use surface::FrameProducer as Producer;
-#[cfg(not(feature = "native-display"))]
+#[cfg(not(feature = "gpu"))]
 pub struct Consumer(surface::FrameConsumer);
-#[cfg(not(feature = "native-display"))]
+#[cfg(not(feature = "gpu"))]
 pub struct Frame<'a>(&'a surface::PendingFrame);
-#[cfg(not(feature = "native-display"))]
+#[cfg(not(feature = "gpu"))]
 pub fn frame_mailbox() -> (Producer, Consumer) {
     let (tx, rx) = surface::frame_mailbox();
     (tx, Consumer(rx))
 }
-#[cfg(not(feature = "native-display"))]
+#[cfg(not(feature = "gpu"))]
 impl Consumer {
     pub fn update(&mut self) -> bool {
         self.0.update()
@@ -62,7 +62,7 @@ impl Consumer {
         Frame(self.0.current())
     }
 }
-#[cfg(not(feature = "native-display"))]
+#[cfg(not(feature = "gpu"))]
 impl Frame<'_> {
     pub fn snapshot(&self, out: &mut Snapshot) -> Result<(), String> {
         let mut cpu = out.take_cpu();
@@ -80,12 +80,12 @@ impl Frame<'_> {
         self.0.video_cursor_regions()
     }
 }
-#[cfg(not(feature = "native-display"))]
+#[cfg(not(feature = "gpu"))]
 pub fn assert_age_copies(_: &Store, full_copies: usize) {
     assert!(full_copies >= 1);
 }
 
-#[cfg(feature = "native-display")]
+#[cfg(feature = "gpu")]
 mod native {
     use super::*;
     use adv_device::{
@@ -123,12 +123,7 @@ mod native {
                 ..Default::default()
             })
             .unwrap();
-            let gpu = pollster::block_on(Gpu::request_with_presenter(
-                device,
-                queue,
-                Box::new(presenter),
-            ))
-            .unwrap();
+            let gpu = Gpu::request_with_presenter(device, queue, Box::new(presenter)).unwrap();
             let execution = Rc::new(Execution { _gpu: gpu, frames });
             *cached.borrow_mut() = Rc::downgrade(&execution);
             execution
@@ -577,5 +572,5 @@ mod native {
         }
     }
 }
-#[cfg(feature = "native-display")]
+#[cfg(feature = "gpu")]
 pub use native::{Store, assert_age_copies, frame_mailbox};

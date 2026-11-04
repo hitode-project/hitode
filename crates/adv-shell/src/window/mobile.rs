@@ -1,8 +1,3 @@
-//! The mobile game view, on the host's main thread: an Android SurfaceView
-//! supplied by the embedding host, or an iOS `CAMetalLayer` view this crate
-//! creates for the host to insert.
-#[cfg(not(feature = "native-display"))]
-use super::refresh_interval;
 use super::{Event, WakeEvent};
 #[cfg(target_os = "android")]
 use std::ptr::NonNull;
@@ -55,7 +50,7 @@ pub struct GameView {
     pub(crate) vsync: Arc<adv_sync::vsync::Vsync>,
     client: Cell<(u32, u32)>,
     canvas: Cell<(u32, u32)>,
-    #[cfg(feature = "native-display")]
+
     placement: Cell<Option<crate::display::Placement>>,
     pub(crate) scaling: Cell<crate::Scaling>,
     events: RefCell<Vec<Event>>,
@@ -108,7 +103,7 @@ impl GameView {
             vsync: Arc::default(),
             client: Cell::new((width, height)),
             canvas: Cell::new((width.max(1), height.max(1))),
-            #[cfg(feature = "native-display")]
+
             placement: Cell::new(None),
             scaling: Cell::new(crate::Scaling::Fit),
             events: RefCell::new(Vec::new()),
@@ -155,9 +150,8 @@ impl GameView {
                 objc2::rc::Retained::as_ptr(host).cast_mut().cast()
             })
     }
-    #[cfg(any(target_os = "ios", feature = "native-display"))]
-    pub(crate) fn place(&self, placement: Option<crate::native_gpu::Placement>) {
-        #[cfg(feature = "native-display")]
+
+    pub(crate) fn place(&self, placement: Option<crate::display::Placement>) {
         self.placement.set(placement);
         #[cfg(target_os = "android")]
         self.report_layout();
@@ -168,7 +162,6 @@ impl GameView {
     }
     /// The presented frame's rectangle in view pixels.
     pub(crate) fn frame_rectangle(&self) -> [f64; 4] {
-        #[cfg(feature = "native-display")]
         if let Some(p) = self.placement.get() {
             return p.rectangle.map(f64::from);
         }
@@ -209,8 +202,7 @@ impl GameView {
             }
         }
         self.client.set((width, height));
-        #[cfg(not(feature = "native-display"))]
-        self.apply_frame_rate();
+
         self.push(Event::Repaint);
         self.report_layout();
     }
@@ -533,37 +525,7 @@ impl GameView {
         });
         Ok(())
     }
-    #[cfg(not(feature = "native-display"))]
-    pub(crate) fn create_native(
-        &self,
-        fallback: bool,
-    ) -> Result<(adv_device::gpu::Gpu, crate::native_gpu::WindowPresenter), String> {
-        #[cfg(target_os = "android")]
-        let surface = self
-            .window
-            .get()
-            .ok_or("the Android view has no surface")?
-            .as_ptr();
-        #[cfg(target_os = "ios")]
-        let surface = self
-            .host
-            .borrow()
-            .as_ref()
-            .ok_or("the iOS view is gone")?
-            .metal_layer();
-        let size = self.client.get();
-        let (gpu, mut presenter) = pollster::block_on(unsafe {
-            crate::native_gpu::WindowPresenter::request(
-                surface.cast(),
-                size.0.max(1),
-                size.1.max(1),
-                fallback,
-            )
-        })?;
-        presenter.configure_exclusive(size.0.max(1), size.1.max(1))?;
-        Ok((gpu, presenter))
-    }
-    #[cfg(feature = "native-display")]
+
     pub(crate) fn create_display(
         &self,
         software: bool,
@@ -596,7 +558,7 @@ impl GameView {
             )
         }
     }
-    #[cfg(all(feature = "native-display", target_os = "ios"))]
+    #[cfg(target_os = "ios")]
     pub(crate) fn native_scale(&self) -> f64 {
         self.host.borrow().as_ref().unwrap().contentScaleFactor()
     }
@@ -654,28 +616,6 @@ impl GameView {
         if self.requested_rate.replace(rate) == rate {
             return;
         }
-        #[cfg(all(target_os = "android", not(feature = "native-display")))]
-        self.apply_frame_rate();
-    }
-    #[cfg(all(target_os = "android", not(feature = "native-display")))]
-    fn apply_frame_rate(&self) {
-        if let Some(window) = self.window.get() {
-            // API 30 symbol; the minimum supported Android API is 29.
-            let symbol =
-                unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"ANativeWindow_setFrameRate".as_ptr()) };
-            if !symbol.is_null() {
-                let set: unsafe extern "C" fn(*mut ndk_sys::ANativeWindow, f32, i8) -> i32 =
-                    unsafe { std::mem::transmute(symbol) };
-                unsafe {
-                    set(window.as_ptr(), self.requested_rate.get() as f32, 0);
-                }
-            }
-        }
-    }
-    #[cfg(not(feature = "native-display"))]
-    pub(crate) fn next_refresh(&self) -> Instant {
-        let fps = (1_000_000_000.0 / self.period.get() as f64).round() as isize;
-        Instant::now() + refresh_interval(fps)
     }
 }
 impl GameView {
@@ -701,15 +641,4 @@ impl Drop for GameView {
             }
         }
     }
-}
-#[cfg(not(feature = "native-display"))]
-pub(crate) fn native_viewport(
-    width: u32,
-    height: u32,
-    canvas_width: u32,
-    canvas_height: u32,
-) -> [f32; 4] {
-    crate::Scaling::Fit
-        .rectangle((width as f64, height as f64), (canvas_width, canvas_height))
-        .map(|v| v as f32)
 }

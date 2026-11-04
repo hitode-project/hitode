@@ -1,9 +1,9 @@
 //! UI presents the native game view. The execution worker owns the guest machine.
 //! Completed raw frames and input events cross bounded ownership channels.
 use crate::{performance, window};
-#[cfg(not(feature = "native-display"))]
+#[cfg(not(any(host_view, feature = "gpu")))]
 use adv_runtime::FrameConsumer;
-#[cfg(not(feature = "native-display"))]
+#[cfg(not(any(host_view, feature = "gpu")))]
 use adv_runtime::FrameProducer;
 use adv_runtime::{DialogSet, MenuBar, MenuKey};
 use adv_sync::{WakeEvent, input::KeyState, spsc};
@@ -38,16 +38,15 @@ pub struct Worker {
     input_epoch: Arc<window::android_epoch::Generation>,
     #[cfg(mobile)]
     keys: Arc<KeyState>,
-    #[cfg(all(host_view, not(feature = "native-display")))]
-    pub(crate) gpu: Option<adv_device::gpu::Gpu>,
-    #[cfg(feature = "native-display")]
+
+    #[cfg(any(host_view, feature = "gpu"))]
     pub(crate) display: Option<crate::display::Startup>,
     /// The host frame clock's vsync grid, handed to guest refresh pacing.
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub(crate) vsync: Option<Arc<adv_sync::vsync::Vsync>>,
     incoming: spsc::Consumer<Delivery>,
     requests: spsc::Producer<Request>,
-    #[cfg(not(feature = "native-display"))]
+    #[cfg(not(any(host_view, feature = "gpu")))]
     frames: Option<FrameProducer>,
     menus: adv_sync::mailbox::Producer<MenuBar>,
     menu_key: Option<MenuKey>,
@@ -67,8 +66,7 @@ pub struct Ui {
     /// Whether the game has shown a frame yet; until then it is loading.
     #[cfg(host_view)]
     presented: bool,
-    #[cfg(all(host_view, not(feature = "native-display")))]
-    next: Instant,
+
     #[cfg(host_view)]
     cadence: crate::frame_pacer::Cadence,
     #[cfg(host_view)]
@@ -79,13 +77,12 @@ pub struct Ui {
     repaint: bool,
     events: Rc<RefCell<spsc::Producer<Delivery>>>,
     requests: spsc::Consumer<Request>,
-    #[cfg(not(feature = "native-display"))]
+    #[cfg(not(any(host_view, feature = "gpu")))]
     frames: Option<FrameConsumer>,
     menus: adv_sync::mailbox::Consumer<MenuBar>,
     dialogs: adv_sync::mailbox::Consumer<DialogSet>,
-    #[cfg(all(host_view, not(feature = "native-display")))]
-    native: Option<crate::native_gpu::UiPresenter>,
-    #[cfg(feature = "native-display")]
+
+    #[cfg(any(host_view, feature = "gpu"))]
     native: Option<crate::display::Ui>,
     keys: Arc<KeyState>,
     execution_wake: WakeEvent,
@@ -97,7 +94,7 @@ pub fn channel(wake: WakeEvent, keys: Arc<KeyState>) -> Result<(Worker, Ui), Str
     let ui_wake = WakeEvent::new().map_err(|e| e.to_string())?;
     let (events, incoming) = spsc::channel(INPUT_CAPACITY);
     let (requests_tx, requests_rx) = spsc::channel(32);
-    #[cfg(not(feature = "native-display"))]
+    #[cfg(not(any(host_view, feature = "gpu")))]
     let (frames_tx, _frames_rx) = adv_runtime::frame_mailbox();
     let (menus_tx, menus_rx) =
         adv_sync::mailbox::channel(std::array::from_fn(|_| MenuBar::default()));
@@ -113,15 +110,14 @@ pub fn channel(wake: WakeEvent, keys: Arc<KeyState>) -> Result<(Worker, Ui), Str
             input_epoch: input_epoch.clone(),
             #[cfg(mobile)]
             keys: keys.clone(),
-            #[cfg(all(host_view, not(feature = "native-display")))]
-            gpu: None,
-            #[cfg(feature = "native-display")]
+
+            #[cfg(any(host_view, feature = "gpu"))]
             display: None,
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             vsync: None,
             incoming,
             requests: requests_tx,
-            #[cfg(not(feature = "native-display"))]
+            #[cfg(not(any(host_view, feature = "gpu")))]
             frames: Some(frames_tx),
             menus: menus_tx,
             menu_key: None,
@@ -140,8 +136,7 @@ pub fn channel(wake: WakeEvent, keys: Arc<KeyState>) -> Result<(Worker, Ui), Str
             frame_times: std::collections::VecDeque::new(),
             #[cfg(host_view)]
             presented: false,
-            #[cfg(all(host_view, not(feature = "native-display")))]
-            next: Instant::now(),
+
             #[cfg(host_view)]
             cadence: Default::default(),
             #[cfg(host_view)]
@@ -152,7 +147,7 @@ pub fn channel(wake: WakeEvent, keys: Arc<KeyState>) -> Result<(Worker, Ui), Str
             repaint: false,
             events: Rc::new(RefCell::new(events)),
             requests: requests_rx,
-            #[cfg(not(feature = "native-display"))]
+            #[cfg(not(any(host_view, feature = "gpu")))]
             frames: Some(_frames_rx),
             menus: menus_rx,
             dialogs: dialogs_rx,
@@ -183,7 +178,7 @@ impl Worker {
         self.menus.publish(move |slot| *slot = menu);
         self.ui_wake.signal();
     }
-    #[cfg(not(feature = "native-display"))]
+    #[cfg(not(any(host_view, feature = "gpu")))]
     pub fn take_frames(&mut self) -> FrameProducer {
         self.frames.take().expect("frame producer installed once")
     }
@@ -270,22 +265,8 @@ impl Ui {
         self.repaint = true;
         self.wake.signal();
     }
-    #[cfg(all(host_view, not(feature = "native-display")))]
-    pub(crate) fn native(
-        &mut self,
-        presenter: crate::native_gpu::WindowPresenter,
-        sender: adv_sync::background::Sender,
-    ) {
-        self.native = Some(crate::native_gpu::UiPresenter::new(
-            presenter,
-            self.frames
-                .take()
-                .expect("native compositor installed once"),
-            sender,
-            self.wake.clone(),
-        ));
-    }
-    #[cfg(feature = "native-display")]
+
+    #[cfg(any(host_view, feature = "gpu"))]
     pub(crate) fn display(&mut self, display: crate::display::Ui) {
         self.native = Some(display);
     }
@@ -439,62 +420,7 @@ impl Ui {
         let started = Instant::now();
         let events = window.take_events();
         self.repaint |= self.pump_events(events, started)?;
-        #[cfg(not(feature = "native-display"))]
-        if let Some(native) = &mut self.native {
-            let completed = native.poll()?;
-            if let Some(completed) = completed {
-                if !matches!(
-                    completed.rendered.result,
-                    crate::native_gpu::DrawResult::Presented
-                ) {
-                    self.next = Instant::now();
-                }
-                if let Some(at) = completed.rendered.published_at {
-                    self.cadence.published(completed.rendered.serial, at);
-                    window.frame_rate(self.cadence.rate());
-                }
-                self.metric(Delivery::Native(completed.stats));
-                self.repaint |= window.native_canvas(completed.rendered.canvas)?;
-                #[cfg(any(target_os = "macos", target_os = "ios"))]
-                if let Some(placement) = completed.rendered.placement {
-                    window.place(Some(placement));
-                    #[cfg(target_os = "macos")]
-                    window.shared_frame(completed.rendered.shared.map(|(frame, _)| frame));
-                }
-                window.set_video_cursor_regions(completed.rendered.cursor_regions);
-                if matches!(
-                    completed.rendered.result,
-                    crate::native_gpu::DrawResult::Presented
-                ) {
-                    let now = Instant::now();
-                    while self
-                        .frame_times
-                        .front()
-                        .is_some_and(|at| now.duration_since(*at) >= Duration::from_secs(1))
-                    {
-                        self.frame_times.pop_front();
-                    }
-                    self.frame_times.push_back(now);
-                    self.presented = true;
-                    self.metric(Delivery::Present(
-                        completed.rendered.serial,
-                        completed.elapsed,
-                        completed.at,
-                    ));
-                }
-            }
-            let native = self.native.as_mut().unwrap();
-            let dimensions = window.native_client_size()?;
-            let now = Instant::now();
-            if crate::frame_pacer::submission_at(now, self.next) <= now
-                && (native.has_update() || self.repaint)
-                && native.schedule(dimensions, self.repaint)?
-            {
-                self.repaint = false;
-                self.next = window.next_refresh();
-            }
-        }
-        #[cfg(feature = "native-display")]
+
         if self.native.is_some() {
             let dimensions = window.native_client_size()?;
             #[cfg(target_vendor = "apple")]
@@ -542,17 +468,6 @@ impl Ui {
     }
     #[cfg(host_view)]
     pub(crate) fn deadline(&self, window: &window::GameView) -> Result<Option<Instant>, String> {
-        #[cfg(not(feature = "native-display"))]
-        let refresh = match &self.native {
-            Some(native) => refresh_deadline(
-                self.next,
-                native.in_flight(),
-                native.has_update() || self.repaint,
-                window.native_client_size()?,
-            ),
-            None => None,
-        };
-        #[cfg(feature = "native-display")]
         let refresh: Option<Instant> = {
             let _ = window;
             None
@@ -602,7 +517,7 @@ impl Ui {
         self.wake.clone()
     }
 }
-#[cfg(any(all(host_view, not(feature = "native-display")), test))]
+#[cfg(test)]
 fn refresh_deadline(
     next: Instant,
     in_flight: bool,

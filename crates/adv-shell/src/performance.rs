@@ -14,21 +14,21 @@ const SAMPLE_CAPACITY: usize = 4096;
 /// Queue delay is reported separately from nonpreemptible acquire/configure.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct NativePresentation {
-    #[cfg(feature = "native-display")]
+    #[cfg(any(host_view, feature = "gpu"))]
     pub display_passes: u64,
-    #[cfg(feature = "native-display")]
+    #[cfg(any(host_view, feature = "gpu"))]
     pub display_submissions: u64,
-    #[cfg(feature = "native-display")]
+    #[cfg(any(host_view, feature = "gpu"))]
     pub display_plan: &'static str,
-    #[cfg(feature = "native-display")]
+    #[cfg(any(host_view, feature = "gpu"))]
     pub display_stage_tiles: [u32; 3],
-    #[cfg(feature = "native-display")]
+    #[cfg(any(host_view, feature = "gpu"))]
     pub display_stage_pixels: [u32; 3],
-    #[cfg(feature = "native-display")]
+    #[cfg(any(host_view, feature = "gpu"))]
     pub display_stage_ns: [u64; 3],
-    #[cfg(feature = "native-display")]
+    #[cfg(any(host_view, feature = "gpu"))]
     pub display_latch_ns: Option<u64>,
-    #[cfg(feature = "native-display")]
+    #[cfg(any(host_view, feature = "gpu"))]
     pub display_shown_ns: Option<u64>,
     pub consumed: u64,
     pub uploads: u64,
@@ -50,7 +50,7 @@ pub(crate) struct NativePresentation {
 }
 impl NativePresentation {
     fn json(&self) -> String {
-        #[cfg(feature = "native-display")]
+        #[cfg(any(host_view, feature = "gpu"))]
         let display = format!(
             ", \"last_display_passes\": {}, \"last_display_submissions\": {}, \"last_display_tiles\": {}, \"last_display_pixels\": {}, \"display_plan\": \"{}\", \"last_stage_tiles\": {:?}, \"last_stage_pixels\": {:?}, \"last_stage_ns\": {:?}, \"last_latch_ns\": {}, \"last_shown_ns\": {}",
             self.display_passes,
@@ -72,7 +72,7 @@ impl NativePresentation {
             self.display_shown_ns
                 .map_or_else(|| "null".into(), |n| n.to_string())
         );
-        #[cfg(not(feature = "native-display"))]
+        #[cfg(not(any(host_view, feature = "gpu")))]
         let display = "";
         format!(
             concat!(

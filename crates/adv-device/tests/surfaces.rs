@@ -65,7 +65,7 @@ fn store() -> Store {
 fn video_layer() -> VideoLayer {
     VideoLayer {
         frame: VideoFrame {
-            #[cfg(feature = "native-display")]
+            #[cfg(feature = "gpu")]
             picture: None,
             width: 2,
             height: 1,

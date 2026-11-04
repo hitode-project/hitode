@@ -66,22 +66,22 @@ This spec covers the host shells. It includes launcher overlay input, the game v
 **Rule**: The native frame size MUST use physical pixels: content points multiplied by `backingScaleFactor` on macOS. Native GPU presentation MUST default to preserving aspect ratio and black bars, using sharp-bilinear sampling unless the host selects an upscaler. Pointer positions MUST map back through the same letterbox.
 **Verification**: Test
 
-With `native-display`, the planner MUST choose fit, integer or stretch placement. The compositor MUST own the black letterbox. Pointer mapping MUST use the exact rectangle returned by presentation feedback.
+The planner MUST choose fit, integer or stretch placement. The compositor MUST own the black letterbox. Pointer mapping MUST use the exact rectangle returned by presentation feedback.
 
 ### HOST-VIEW-3 One composition path
 
 **Rule**: Video MUST share the base frame's geometry and filter policy. CPU video composition MUST run only for captures and guest pixel requests. Composition MUST preserve encoded colors, write opaque alpha and keep the letterbox black.
 **Verification**: Test
 
-With `native-display`, the planner MUST select video layers or canvas composition, preserve fractional source crops, and draw each video's border below its picture. Cursor feedback MUST preserve video ordering, hide-cursor flags and occlusion; requested captures and debugger pixel gates MUST read the owner's last presented composition.
+The planner MUST select video layers or canvas composition, preserve fractional source crops, and draw each video's border below its picture. Cursor feedback MUST preserve video ordering, hide-cursor flags and occlusion; requested captures and debugger pixel gates MUST read the owner's last presented composition.
 
-### HOST-VIEW-4 Surface configuration off the UI thread
+### HOST-VIEW-4 GPU ownership
 
-**Rule**: On macOS the surface MUST be configured only by background tasks, at startup or after a submitted pause. The UI thread MUST only read the size and schedule work. With `native-display`, the UI MUST create the device and layer compositor, while the GPU owner MUST encode stages and submit frames.
+**Rule**: The UI MUST create the device and layer compositor, while the GPU owner MUST encode stages and submit frames.
 **Applies to**: macOS
 **Verification**: Review — the thread affinity of AppKit callbacks is not observable in a test.
 
-With `native-display`, settings and compositor notifications MUST poke the owner even without guest commands.
+Settings and compositor notifications MUST poke the owner even without guest commands.
 
 ### HOST-VIEW-5 Key translation
 
@@ -113,20 +113,17 @@ Optimized kernels MUST retain the selected model, weights and arithmetic precisi
 
 ### HOST-VIEW-9 Compositor scaling
 
-**Rule**: Without upscaling or composed video, the frame layer MUST occupy the viewport over a black base and scale its image. Exact integer scales MUST keep the game resolution under nearest sampling. Other scales MUST prescale by the integer part per axis and leave the rest to linear filtering.
-**Applies to**: macOS, iOS
+**Rule**: Compositor capabilities MUST select direct scaling or a damage-limited output pass on every platform. Scaling without upscaling MUST preserve sharp-bilinear sampling over the compositor's black base.
 **Verification**: Test
 
-With `native-display`, compositor capabilities MUST select direct scaling or a damage-limited output pass on every platform. The executor MUST use one render pass per target, including every composed video draw. Its recorder MUST hold pass counts and supported GPU timestamps.
-
-Nearest sampling at integer scales and an integer nearest prescale followed by bilinear filtering both define sharp-bilinear, so the look does not change. An upscaler's doubled output is magnified by the layer when the viewport can hold it, and otherwise resampled to the viewport's size; both are linear, as before. With composed video, the drawable covers the whole view and the frame is composed into it as before.
+The executor MUST use one render pass per target, including every composed video draw. Its recorder MUST hold pass counts and supported GPU timestamps.
 
 ### HOST-VIEW-10 Damage-limited upscaling
 
 **Rule**: When a frame's damage since the last upscaled frame is known, the upscaler MUST recompute only pixels that damage reaches, matching a whole-frame run. Each pass MUST read only values computed in the same run or left valid by earlier runs. Rebuilds, composed video and unknown damage MUST run on the whole frame.
 **Verification**: Test
 
-A 3×3 convolution reaches one input pixel and a pointwise pass none. Reach follows the tensors each pass reads, so passes of one layer count once; the final layer's bilinear sample of the input reaches one pixel beside that chain. Fused passes retain the sum of their layer radii. Intermediate textures are shared between tensors, so the last pass covers the full reach. Each earlier pass covers what later readers of its tensors need, workgroup-rounded, plus its radius. The model's input and doubled output are private and stay complete; the output pass fills what each presentable buffer lacks from the doubled image.
+A 3×3 convolution reaches one input pixel and a pointwise pass none. Reach follows the tensors each pass reads, so passes of one layer count once; the final layer's bilinear sample of the input reaches one pixel beside that chain. Fused passes retain the sum of their layer radii. Intermediate textures are shared between tensors, so the last pass covers the full reach. Each earlier pass covers what later readers of its tensors need, workgroup-rounded, plus its radius.
 
 | Frame source | Damage since the last upscaled frame |
 |---|---|
@@ -136,13 +133,11 @@ A 3×3 convolution reaches one input pixel and a pointwise pass none. Reach foll
 
 ### HOST-VIEW-11 Shared display targets
 
-**Rule**: Metal display targets MAY use IOSurface storage shared with a native layer. Layers MUST receive frames after GPU completion and retain them until the system compositor releases their surfaces. Direct presentation MUST preserve opaque RGB, color space, scaling and frame cadence.
-**Applies to**: macOS
+**Rule**: Display targets MUST use presentable pools shared with the platform compositor. Layers MUST receive frames after GPU completion and retain them until the system compositor releases their surfaces. Direct presentation MUST preserve opaque RGB, color space, scaling and frame cadence.
 **Verification**: Test
 
-With `native-display`, each planner pool MUST use indexed leases from one presentable pool in the backend's native color format. Compositor detach and rebuild MUST preserve the same base and video leases without drawing, and releases MUST order pool reuse after their fences; completion notifications MUST wake the owner without polling.
+Each planner pool MUST use indexed leases from one presentable pool in the backend's native color format. Compositor detach and rebuild MUST preserve the same base and video leases without drawing, and releases MUST order pool reuse after their fences; completion notifications MUST wake the owner without polling.
 
-Direct presentation requires Core Animation's `contentsOpaque` capability. Other presentations use the drawable compositor. Display callbacks reclaim retired surfaces; a temporary timer also drains pending retirements when the frame clock is idle or occluded.
 ### HOST-SES-1 Embedding
 
 **Rule**: Embedded sessions MUST use the shared shell execution and background services. A session MUST NOT take over the host `NSApplication` delegate or the host window.
@@ -200,15 +195,15 @@ Preparation MUST validate the compressed stream completely before publishing the
 
 **Rule**: Published frames MUST schedule upload, scaling and presentation outside guest execution as soon as the presentation cap permits. Display links MUST publish refresh timing without gating submission or running without pending content. Hosts without display links MUST retain deadline timers.
 
-With `native-display`, the executor MUST keep at most one unlatched transaction and one newest held frame. Replacing a held frame MUST merge its damage and retire its software, swap and video resources after their reads; latch notifications MUST submit the held frame without a timer.
+The executor MUST keep at most one unlatched transaction and one newest held frame. Replacing a held frame MUST merge its damage and retire its software, swap and video resources after their reads; latch notifications MUST submit the held frame without a timer.
 **Verification**: Test
 
 ### HOST-SES-11 Requested display cadence
 
-**Rule**: Display rate requests MUST follow publication timestamps, accounting for mailbox drops and excluding repaints. Supported Apple display links and Android native surfaces MUST receive the estimated guest cadence, capped at 60 Hz. Android surfaces MAY replace AND-APP-10's initial 60 Hz request after measuring cadence.
+**Rule**: Display rate requests MUST follow publication timestamps, accounting for mailbox drops and excluding repaints. Supported Apple display links and the Android SurfaceControl base layer MUST receive the estimated guest cadence, capped at 60 Hz.
 **Verification**: Test
 
-With `native-display`, Android MUST request cadence through runtime-resolved `ASurfaceTransaction_setFrameRate` on the SurfaceControl base layer, updating the request only when the estimated rate changes.
+Android MUST request cadence through runtime-resolved `ASurfaceTransaction_setFrameRate` on the SurfaceControl base layer, updating the request only when the estimated rate changes.
 
 ### HOST-LIB-1 Storage and removal
 
@@ -402,21 +397,14 @@ Installer state MUST use the active stack's backing directory for the guest C dr
 **Rule**: Shipped files MUST NOT contain developer home, checkout or temporary build paths, including native helpers and archive members.
 **Verification**: Test
 
-Withdrawn: HOST-AND-1, HOST-AND-2, HOST-AND-3, HOST-AND-4, HOST-AND-5, HOST-AND-6, HOST-AND-7, HOST-AND-8, HOST-AND-9, HOST-AND-10, HOST-AND-11, HOST-SES-9, HOST-SAVE-1
+Withdrawn: HOST-DAMAGE-3, HOST-AND-1, HOST-AND-2, HOST-AND-3, HOST-AND-4, HOST-AND-5, HOST-AND-6, HOST-AND-7, HOST-AND-8, HOST-AND-9, HOST-AND-10, HOST-AND-11, HOST-SES-9, HOST-SAVE-1
 
 ### HOST-DAMAGE-1 Software texture uploads
 
-**Rule**: The software GPU presenter MUST transfer only damaged rectangles with matching origins and row pitches, without comparing complete frames. New or resized textures MUST receive complete images, while repaint MUST preserve existing textures. Metal uploads MUST retain immutable, page-owned publication storage through completion and decode it identically to CPU snapshots.
+**Rule**: Software ingest MUST transfer only damaged tiles with matching origins and row pitches. New or resized targets MUST ingest whole images, while repaint MUST preserve existing images. Mapped guest-format slots MUST remain immutable through GPU reads and decode identically to CPU snapshots.
 **Verification**: Test
-
-Metal uses no-copy buffers for publications without video overlays: BGRA samples buffer-backed textures directly, and other formats use integer GPU decoding. Other presentations reuse the consumer's BGRA snapshot.
 
 ### HOST-DAMAGE-2 Software work counters
 
 **Rule**: Software frame counters MUST expose copied, CPU-converted, CPU-uploaded and GPU-transferred bytes, published frames and empty damage. Byte rates MUST use elapsed real time and exclude diagnostic reference work.
-**Verification**: Test
-
-### HOST-DAMAGE-3 Sample shared snapshots
-
-**Rule**: Metal BGRA software presentation without video overlays MUST sample an immutable buffer-backed texture directly from snapshot storage. The texture MUST retain that storage through GPU use while guest writes and mailbox reuse continue independently.
 **Verification**: Test

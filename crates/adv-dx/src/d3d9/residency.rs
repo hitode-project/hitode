@@ -170,7 +170,7 @@ fn evict(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
     for (id, levels) in textures {
         surfaces(env, id, &vec![None; levels.len()], true);
     }
-    // Dropping saved retires the last owned GPU views. Submitted wgpu commands
+    // Dropping saved retires the last owned GPU views. Submitted GPU commands
     // keep their own backend lifetime; no queued image is explicitly destroyed.
     0
 }

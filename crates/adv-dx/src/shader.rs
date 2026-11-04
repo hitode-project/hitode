@@ -4,7 +4,7 @@
 //! bytecode is regular, and its semantic details need differential tests either
 //! way; vkd3d-shader is an LGPL C library that would need dynamic linking, an
 //! Android cross-build and a SPIR-V to naga hop. Both remain semantic references.
-//! naga validates the WGSL and stays on the same version as wgpu.
+//! naga validates the WGSL before native compilation.
 //!
 //! No game bytecode is embedded here. The token layout follows Microsoft's
 //! Instruction/Source/Destination Parameter Token and Relative Addressing specs.

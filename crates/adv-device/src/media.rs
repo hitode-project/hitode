@@ -57,37 +57,37 @@ pub struct AudioInfo {
     pub channels: u16,
 }
 
-/// A decoded picture. Native display retains YUV; the reference path retains BGRA.
+/// A decoded picture. GPU display retains YUV; CPU-only builds retain BGRA.
 #[derive(Debug)]
 pub struct VideoFrame {
     pub pts_us: u64,
     pub width: u32,
     pub height: u32,
-    #[cfg(not(feature = "native-display"))]
+    #[cfg(not(feature = "gpu"))]
     pub bgra: Vec<u8>,
-    #[cfg(feature = "native-display")]
+    #[cfg(feature = "gpu")]
     pub picture: std::sync::Arc<crate::frame::DecodedPicture>,
 }
 
 impl VideoFrame {
     /// Guest pixel requests convert once on demand; display never requests BGRA.
     pub fn bgra(&self) -> std::borrow::Cow<'_, [u8]> {
-        #[cfg(not(feature = "native-display"))]
+        #[cfg(not(feature = "gpu"))]
         {
             std::borrow::Cow::Borrowed(&self.bgra)
         }
-        #[cfg(feature = "native-display")]
+        #[cfg(feature = "gpu")]
         {
             std::borrow::Cow::Owned(self.picture.bgra())
         }
     }
 
     pub fn into_bgra(self) -> Vec<u8> {
-        #[cfg(not(feature = "native-display"))]
+        #[cfg(not(feature = "gpu"))]
         {
             self.bgra
         }
-        #[cfg(feature = "native-display")]
+        #[cfg(feature = "gpu")]
         {
             self.picture.bgra()
         }
@@ -98,15 +98,15 @@ impl VideoFrame {
             width: self.width,
             height: self.height,
             pitch: self.width * 4,
-            #[cfg(not(feature = "native-display"))]
+            #[cfg(not(feature = "gpu"))]
             bgra: self.bgra.into(),
-            #[cfg(feature = "native-display")]
+            #[cfg(feature = "gpu")]
             bgra: {
                 static EMPTY: std::sync::OnceLock<std::sync::Arc<[u8]>> =
                     std::sync::OnceLock::new();
                 EMPTY.get_or_init(|| std::sync::Arc::from([])).clone()
             },
-            #[cfg(feature = "native-display")]
+            #[cfg(feature = "gpu")]
             picture: Some(self.picture),
         }
     }
@@ -150,7 +150,7 @@ mod audio_clock;
 mod native;
 #[cfg(feature = "media")]
 mod packets;
-#[cfg(all(feature = "media", feature = "native-display"))]
+#[cfg(all(feature = "media", feature = "gpu"))]
 pub(crate) mod planes;
 #[cfg(feature = "media")]
 mod worker;

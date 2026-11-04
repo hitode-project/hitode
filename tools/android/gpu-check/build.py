@@ -15,7 +15,7 @@ import zipfile
 SUITES = [
     ("adv-gpu", [], ["--lib", "--test", "conformance"]),
     ("adv-display", [], ["--lib", "--test", "upscale", "--test", "video"]),
-    ("adv-device", ["native-display"], ["--test", "surfaces", "--test", "software_ingest"]),
+    ("adv-device", ["gpu"], ["--test", "surfaces", "--test", "software_ingest"]),
 ]
 NDK = ["cargo", "ndk", "-t", "arm64-v8a", "--platform", "29"]
 

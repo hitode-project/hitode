@@ -70,15 +70,15 @@ Comparing against the last publication keeps every slot's damage history complet
 **Rule**: Depth/stencil surfaces MAY exceed color dimensions and MUST retain identity and contents across color-target switches. Drawing and clearing MUST preserve depth/stencil outside the color region.
 **Verification**: Test
 
-### DEV-DEPTH-2 Attachment copies
+### DEV-DEPTH-2 Attachment regions
 
-**Rule**: Padded color attachments MUST copy the original mip region in and out within one submission. Invalid smaller or foreign-context depth attachments MUST fail before encoding.
+**Rule**: Larger depth attachments MUST preserve the logical color region without padding or copying the color image. Smaller depth attachments MUST fail before encoding.
 **Verification**: Test
 
-### DEV-DEPTH-3 Scratch bound
+### DEV-DEPTH-3 Attachment storage
 
-**Rule**: Each command producer MUST retain at most one color attachment scratch image, bounded to 64 MiB.
-**Verification**: Review — attachment tests check reuse, but do not attempt the 64 MiB admission boundary.
+**Rule**: Depth attachments MUST use their original images without allocating padded color scratch storage.
+**Verification**: Review — native render areas attach the original images without allocating color scratch storage.
 
 ## Texture updates
 

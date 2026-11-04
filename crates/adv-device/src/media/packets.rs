@@ -7,7 +7,7 @@ use ffmpeg_next as ff;
 use super::native::Input;
 use super::{AudioFrame, CodecFormat, Decoded, Demuxed, Error, Packet, PacketStream};
 
-#[cfg(not(feature = "native-display"))]
+#[cfg(not(feature = "gpu"))]
 use super::VideoFrame;
 
 const HUNDRED_NS: Rational = Rational(1, 10_000_000);
@@ -139,11 +139,11 @@ pub(super) fn demux(bytes: Vec<u8>) -> Result<Demuxed, Error> {
 enum Kind {
     Video {
         decoder: ff::decoder::Video,
-        #[cfg(not(feature = "native-display"))]
+        #[cfg(not(feature = "gpu"))]
         scaler: Option<(format::Pixel, u32, u32, software::scaling::Context)>,
-        #[cfg(feature = "native-display")]
+        #[cfg(feature = "gpu")]
         output: Option<super::planes::Output>,
-        #[cfg(feature = "native-display")]
+        #[cfg(feature = "gpu")]
         decoded: frame::Video,
     },
     Audio {
@@ -154,7 +154,7 @@ enum Kind {
 }
 
 pub(super) struct Decoder {
-    #[cfg(feature = "native-display")]
+    #[cfg(feature = "gpu")]
     device: Option<adv_gpu::Device>,
     kind: Kind,
 }
@@ -250,11 +250,11 @@ impl Decoder {
         let kind = match format {
             CodecFormat::Video { .. } => Kind::Video {
                 decoder: decoder.video()?,
-                #[cfg(not(feature = "native-display"))]
+                #[cfg(not(feature = "gpu"))]
                 scaler: None,
-                #[cfg(feature = "native-display")]
+                #[cfg(feature = "gpu")]
                 output: None,
-                #[cfg(feature = "native-display")]
+                #[cfg(feature = "gpu")]
                 decoded: frame::Video::empty(),
             },
             CodecFormat::Audio { .. } => Kind::Audio {
@@ -266,7 +266,7 @@ impl Decoder {
         };
         Ok(Self {
             kind,
-            #[cfg(feature = "native-display")]
+            #[cfg(feature = "gpu")]
             device: if matches!(format, CodecFormat::Video { .. }) {
                 Some(
                     crate::gpu::Gpu::execution(false)
@@ -328,20 +328,20 @@ impl Decoder {
             let result = match &mut self.kind {
                 Kind::Video {
                     decoder,
-                    #[cfg(not(feature = "native-display"))]
+                    #[cfg(not(feature = "gpu"))]
                     scaler,
-                    #[cfg(feature = "native-display")]
+                    #[cfg(feature = "gpu")]
                     output,
-                    #[cfg(feature = "native-display")]
+                    #[cfg(feature = "gpu")]
                     decoded,
                 } => {
-                    #[cfg(not(feature = "native-display"))]
+                    #[cfg(not(feature = "gpu"))]
                     let mut decoded = frame::Video::empty();
-                    #[cfg(not(feature = "native-display"))]
+                    #[cfg(not(feature = "gpu"))]
                     let decoded = &mut decoded;
                     match decoder.receive_frame(decoded) {
                         Ok(()) => {
-                            #[cfg(feature = "native-display")]
+                            #[cfg(feature = "gpu")]
                             if output.is_none() {
                                 *output = Some(super::planes::Output::new(
                                     self.device.as_ref().unwrap(),
@@ -349,9 +349,9 @@ impl Decoder {
                                 )?);
                             }
 
-                            #[cfg(not(feature = "native-display"))]
+                            #[cfg(not(feature = "gpu"))]
                             let result = convert_video(scaler, decoded);
-                            #[cfg(feature = "native-display")]
+                            #[cfg(feature = "gpu")]
                             let result = Ok(output.as_mut().unwrap().convert(
                                 decoded.timestamp().map_or(0, |t| (t.max(0) / 10) as u64),
                                 decoded,
@@ -392,7 +392,7 @@ impl Decoder {
     }
 }
 
-#[cfg(not(feature = "native-display"))]
+#[cfg(not(feature = "gpu"))]
 fn convert_video(
     scaler: &mut Option<(format::Pixel, u32, u32, software::scaling::Context)>,
     decoded: &frame::Video,

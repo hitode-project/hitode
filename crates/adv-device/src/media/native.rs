@@ -216,9 +216,9 @@ struct Video {
     decoder: ff::decoder::Video,
     stream: usize,
     time_base: Rational,
-    #[cfg(not(feature = "native-display"))]
+    #[cfg(not(feature = "gpu"))]
     scaler: software::scaling::Context,
-    #[cfg(feature = "native-display")]
+    #[cfg(feature = "gpu")]
     output: super::planes::Output,
     frame_duration_us: u64,
 }
@@ -233,7 +233,7 @@ pub(super) struct Native {
     next: VecDeque<(u64, frame::Video)>,
     /// The front of `next`, already converted by `prefetch`.
     converted: Option<VideoFrame>,
-    #[cfg(feature = "native-display")]
+    #[cfg(feature = "gpu")]
     free_video: Vec<frame::Video>,
     /// A decode error `prefetch` hit; the request that needs that frame reports it.
     deferred: Option<Error>,
@@ -270,7 +270,7 @@ fn micros(pts: i64, tb: Rational) -> i64 {
     .clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
 }
 
-#[cfg(not(feature = "native-display"))]
+#[cfg(not(feature = "gpu"))]
 fn convert(
     video: &mut Video,
     pts_us: u64,
@@ -292,7 +292,7 @@ fn convert(
     })
 }
 
-#[cfg(feature = "native-display")]
+#[cfg(feature = "gpu")]
 fn convert(
     video: &mut Video,
     pts_us: u64,
@@ -315,7 +315,7 @@ fn open_video(stream: &format::stream::Stream<'_>) -> Result<Video, Error> {
             "invalid or excessive video dimensions".into(),
         ));
     }
-    #[cfg(not(feature = "native-display"))]
+    #[cfg(not(feature = "gpu"))]
     let scaler = software::scaling::Context::get(
         decoder.format(),
         w,
@@ -325,7 +325,7 @@ fn open_video(stream: &format::stream::Stream<'_>) -> Result<Video, Error> {
         h,
         software::scaling::Flags::BILINEAR,
     )?;
-    #[cfg(feature = "native-display")]
+    #[cfg(feature = "gpu")]
     let output = super::planes::Output::new(
         crate::gpu::Gpu::execution(false)
             .map_err(|e| Error::Decode(e.to_string()))?
@@ -341,9 +341,9 @@ fn open_video(stream: &format::stream::Stream<'_>) -> Result<Video, Error> {
         decoder,
         stream: index,
         time_base,
-        #[cfg(not(feature = "native-display"))]
+        #[cfg(not(feature = "gpu"))]
         scaler,
-        #[cfg(feature = "native-display")]
+        #[cfg(feature = "gpu")]
         output,
         frame_duration_us,
     })
@@ -446,17 +446,17 @@ impl Native {
             video_packets: VecDeque::new(),
             video_packet_bytes: 0,
             next: {
-                #[cfg(feature = "native-display")]
+                #[cfg(feature = "gpu")]
                 {
                     VecDeque::with_capacity(AHEAD + 1)
                 }
-                #[cfg(not(feature = "native-display"))]
+                #[cfg(not(feature = "gpu"))]
                 {
                     VecDeque::new()
                 }
             },
             converted: None,
-            #[cfg(feature = "native-display")]
+            #[cfg(feature = "gpu")]
             free_video: (0..AHEAD + 1).map(|_| frame::Video::empty()).collect(),
             deferred: None,
             audio_out: Vec::new(),
@@ -551,14 +551,14 @@ impl Native {
     }
 
     fn next_video(&mut self) -> Result<Option<(u64, frame::Video)>, Error> {
-        #[cfg(feature = "native-display")]
+        #[cfg(feature = "gpu")]
         let mut decoded = self.free_video.pop().expect("decoder frame pool exhausted");
-        #[cfg(not(feature = "native-display"))]
+        #[cfg(not(feature = "gpu"))]
         let mut decoded = frame::Video::empty();
         match self.receive_video(&mut decoded) {
             Ok(Some(pts)) => Ok(Some((pts, decoded))),
             result => {
-                #[cfg(feature = "native-display")]
+                #[cfg(feature = "gpu")]
                 self.free_video.push(decoded);
                 result.map(|_| None)
             }
@@ -733,10 +733,10 @@ impl Native {
                 *clock = super::audio_clock::AudioClock::default();
             }
         }
-        #[cfg(feature = "native-display")]
+        #[cfg(feature = "gpu")]
         self.free_video
             .extend(self.next.drain(..).map(|(_, frame)| frame));
-        #[cfg(not(feature = "native-display"))]
+        #[cfg(not(feature = "gpu"))]
         self.next.clear();
         self.converted = None;
         self.deferred = None;
@@ -788,7 +788,7 @@ impl Native {
             if self.next.front().is_none_or(|(pts, _)| *pts > media_us) {
                 break;
             }
-            #[cfg(feature = "native-display")]
+            #[cfg(feature = "gpu")]
             if let Some((_, old)) = due.take() {
                 self.free_video.push(old);
             }
@@ -807,7 +807,7 @@ impl Native {
                 Some(frame) => Ok(frame),
                 None => convert(self.video.as_mut().unwrap(), pts_us, &mut decoded),
             };
-            #[cfg(feature = "native-display")]
+            #[cfg(feature = "gpu")]
             self.free_video.push(decoded);
             Some(result?)
         } else {

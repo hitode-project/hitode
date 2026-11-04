@@ -43,27 +43,7 @@ impl AttributeFormat {
             Self::Float4 => 16,
         }
     }
-    #[cfg(not(feature = "native-display"))]
-    pub(crate) fn native(self) -> wgpu::VertexFormat {
-        use wgpu::VertexFormat as F;
-        match self {
-            Self::Float1 => F::Float32,
-            Self::Float2 => F::Float32x2,
-            Self::Float3 => F::Float32x3,
-            Self::Float4 => F::Float32x4,
-            Self::Bgra8Unorm | Self::Unorm8x4 => F::Unorm8x4,
-            Self::Uint8x4 => F::Uint8x4,
-            Self::Sint16x2 => F::Sint16x2,
-            Self::Sint16x4 => F::Sint16x4,
-            Self::Snorm16x2 => F::Snorm16x2,
-            Self::Snorm16x4 => F::Snorm16x4,
-            Self::Unorm16x2 => F::Unorm16x2,
-            Self::Unorm16x4 => F::Unorm16x4,
-            Self::Uint10x3 | Self::Snorm10x3 => F::Uint32,
-            Self::Float16x2 => F::Float16x2,
-            Self::Float16x4 => F::Float16x4,
-        }
-    }
+
     pub fn wgsl_type(self) -> &'static str {
         match self {
             Self::Float1 => "f32",
@@ -130,7 +110,6 @@ pub struct Program {
     pub(super) writes_depth: bool,
     /// Complete validated WGSL with vertex_main and fragment_main entry points.
     pub(super) source: Arc<str>,
-    pub(super) compiled: Option<(u64, wgpu::ShaderModule)>,
     /// (binding ordinal, vertex visibility); each image uses two group-1 slots.
     pub textures: Vec<bool>,
     /// External register usage; hand-authored programs default to complete blocks.
@@ -168,7 +147,6 @@ impl Program {
             writes_depth,
             id: NEXT_PROGRAM.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             source,
-            compiled: None,
             textures,
             constants: [crate::constants::ConstantUsage::ALL; 2],
         }

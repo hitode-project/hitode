@@ -123,11 +123,11 @@ pub struct Startup {
 }
 impl Startup {
     pub fn start(self) -> Result<adv_device::gpu::Gpu, String> {
-        pollster::block_on(adv_device::gpu::Gpu::request_with_presenter(
+        adv_device::gpu::Gpu::request_with_presenter(
             self.device,
             self.queue,
             Box::new(self.presenter),
-        ))
+        )
         .map_err(|e| e.to_string())
     }
 }

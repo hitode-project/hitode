@@ -7,9 +7,6 @@ license.workspace = true
 publish.workspace = true
 description = "Run an x86 Windows guest through the ADV runtime"
 
-[features]
-native-display = ["adv-shell/native-display"]
-
 [dependencies]
 adv-shell = { path = "../../crates/adv-shell" }
 

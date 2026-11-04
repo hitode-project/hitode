@@ -1,5 +1,5 @@
 //! Package C1: pipelines for fixed-function draws, programmable draws and
-//! blits, keyed as the wgpu renderer keys them, and the disk cache
+//! blits, their pipeline keys, and the disk cache
 //! (GFX-CACHE-7, GFX-CACHE-8, GFX-CACHE-10) over `Device::pipeline_identity`.
 //! Lookups run on the execution thread; record.rs asks for a pipeline per draw.
 
@@ -583,11 +583,13 @@ fn valid_recipe(recipe: &Recipe) -> bool {
                 streams,
             } => {
                 gpu::program_module(source).is_ok_and(|module| {
-                    module.entry_points.iter().any(|e| {
-                        e.name == "vertex_main" && e.stage == wgpu::naga::ShaderStage::Vertex
-                    }) && module.entry_points.iter().any(|e| {
-                        e.name == "fragment_main" && e.stage == wgpu::naga::ShaderStage::Fragment
-                    })
+                    module
+                        .entry_points
+                        .iter()
+                        .any(|e| e.name == "vertex_main" && e.stage == naga::ShaderStage::Vertex)
+                        && module.entry_points.iter().any(|e| {
+                            e.name == "fragment_main" && e.stage == naga::ShaderStage::Fragment
+                        })
                 }) && textures.iter().filter(|&&vs| vs).count() <= 4
                     && textures.iter().filter(|&&vs| !vs).count() <= 16
                     && modes.len() == textures.len()
@@ -1007,18 +1009,18 @@ fn border_source(image: &str, suffix: &str) -> String {
     source
 }
 
-fn parse(source: &str) -> Result<wgpu::naga::Module, Error> {
-    wgpu::naga::front::wgsl::parse_str(source).map_err(|e| Error::Invalid(e.emit_to_string(source)))
+fn parse(source: &str) -> Result<naga::Module, Error> {
+    naga::front::wgsl::parse_str(source).map_err(|e| Error::Invalid(e.emit_to_string(source)))
 }
 // The wrapper edits only the validated vertex entry's header. Its body and
 // the frontend's attribute unpack expressions are retained verbatim.
 fn pulling(source: &str, streams: &[(u32, Vec<Attribute>, bool)]) -> Result<String, Error> {
-    use wgpu::naga::{Binding, BuiltIn, TypeInner};
+    use naga::{Binding, BuiltIn, TypeInner};
     let module = parse(source)?;
     let entry = module
         .entry_points
         .iter()
-        .find(|e| e.name == "vertex_main" && e.stage == wgpu::naga::ShaderStage::Vertex)
+        .find(|e| e.name == "vertex_main" && e.stage == naga::ShaderStage::Vertex)
         .ok_or_else(|| Error::Invalid("program has no vertex_main".into()))?;
     let fetch = |binding: &Binding| -> Result<String, Error> {
         match binding {
@@ -1179,11 +1181,11 @@ fn fetch(stream: usize, stride: u32, attribute: &Attribute, instance: bool) -> S
     }
 }
 fn bindings(source: &str) -> Result<Vec<p::Binding>, Error> {
-    use wgpu::naga::{AddressSpace, TypeInner};
+    use naga::{AddressSpace, TypeInner};
     let module = parse(source)?;
-    let info = wgpu::naga::valid::Validator::new(
-        wgpu::naga::valid::ValidationFlags::all(),
-        wgpu::naga::valid::Capabilities::SHADER_FLOAT16_IN_FLOAT32,
+    let info = naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::SHADER_FLOAT16_IN_FLOAT32,
     )
     .validate(&module)
     .map_err(|e| Error::Invalid(e.emit_to_string(source)))?;
@@ -1196,8 +1198,8 @@ fn bindings(source: &str) -> Result<Vec<p::Binding>, Error> {
         for (n, entry) in module.entry_points.iter().enumerate() {
             if !info.get_entry_point(n)[handle].is_empty() {
                 stages |= match entry.stage {
-                    wgpu::naga::ShaderStage::Vertex => p::Stages::VERTEX,
-                    wgpu::naga::ShaderStage::Fragment => p::Stages::FRAGMENT,
+                    naga::ShaderStage::Vertex => p::Stages::VERTEX,
+                    naga::ShaderStage::Fragment => p::Stages::FRAGMENT,
                     _ => p::Stages::COMPUTE,
                 };
             }
@@ -1207,18 +1209,16 @@ fn bindings(source: &str) -> Result<Vec<p::Binding>, Error> {
         }
         let (group, kind) = match variable.space {
             AddressSpace::Uniform => (0, p::BindingKind::UniformBuffer),
-            AddressSpace::Storage { access }
-                if !access.contains(wgpu::naga::StorageAccess::STORE) =>
-            {
+            AddressSpace::Storage { access } if !access.contains(naga::StorageAccess::STORE) => {
                 (3, p::BindingKind::StorageBuffer { writable: false })
             }
             AddressSpace::Handle => match module.types[variable.ty].inner {
                 TypeInner::Image {
-                    dim: wgpu::naga::ImageDimension::D2,
+                    dim: naga::ImageDimension::D2,
                     arrayed: false,
                     class:
-                        wgpu::naga::ImageClass::Sampled {
-                            kind: wgpu::naga::ScalarKind::Float,
+                        naga::ImageClass::Sampled {
+                            kind: naga::ScalarKind::Float,
                             multi: false,
                         },
                 } => (
@@ -1364,7 +1364,7 @@ struct V {{ @builtin(position) position:vec4<f32>, @location(0) color:vec4<f32> 
             parameters: [[0; 4]; 40],
         }
     }
-    // spec: GFX-INPUT-1, GFX-CACHE-8
+    // spec: GFX-INPUT-1, GFX-CACHE-8, GFX-METAL-1
     #[test]
     fn every_recipe_and_attribute_fetch_compiles_and_executes() {
         let Some((mut gpu, mut queue, consumer)) = open() else {

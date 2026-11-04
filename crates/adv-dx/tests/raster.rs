@@ -74,8 +74,7 @@ impl Fixture {
     }
     fn empty(objects: adv_machine::Objects) -> Self {
         #[cfg(feature = "gpu")]
-        let capture =
-            pollster::block_on(adv_device::gpu::test_support::SurfaceCapture::new()).unwrap();
+        let capture = adv_device::gpu::test_support::SurfaceCapture::new().unwrap();
         Self {
             #[cfg(feature = "gpu")]
             capture,

@@ -443,10 +443,10 @@ fn frame_pixels(env: &mut Env<'_>, frame: &Frame) -> Vec<u8> {
 }
 
 fn install_surfaces(env: &mut Env<'_>) {
-    let gpu = pollster::block_on(adv_device::gpu::test_support::request(!cfg!(any(
+    let gpu = adv_device::gpu::test_support::request(!cfg!(any(
         target_os = "macos",
         target_os = "android"
-    ))))
+    )))
     .expect("software COPY GPU fixture");
     env.ext.insert(Surfaces::default());
     let state = env.ext.get_mut::<State>();
@@ -664,18 +664,7 @@ fn copy_create_present_retains_pixels_and_reset_retains_effect_using_one_gpu() {
     assert_eq!(super::super::release(&mut env, pointer), 0);
     assert_eq!(env.sys.objects.alias_count(com(&env).namespace()), aliases);
     assert!(env.ext.get::<Surfaces>().targets.is_empty());
-    test_support::renderer_test! {
-    assert_eq!(
-        env.ext
-            .get::<State>()
-            .gpu
-            .as_ref()
-            .unwrap()
-            .stats()
-            .native_frames,
-        2
-    );
-    }
+
     assert!(env.ext.get::<State>().pending.is_empty());
     assert!(env.ext.get::<State>().transfers.is_empty());
 }

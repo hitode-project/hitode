@@ -141,7 +141,7 @@ Hitode would not exist without these projects.
 - [OxiSynth](https://github.com/PolyMeilex/OxiSynth) and the FluidR3 Mono SoundFont: MIDI music synthesis.
 - [FFmpeg](https://ffmpeg.org/) and Xiph's [libtheora](https://www.theora.org/): playback of the games' own videos.
 
-We also use [wgpu](https://wgpu.rs/), [Symphonia](https://github.com/pdeljanov/Symphonia), [cpal](https://github.com/RustAudio/cpal), [encoding_rs](https://github.com/hsivonen/encoding_rs), [corosensei](https://github.com/Amanieu/corosensei), [Tauri](https://tauri.app/) and [Svelte](https://svelte.dev/).
+We also use [Symphonia](https://github.com/pdeljanov/Symphonia), [cpal](https://github.com/RustAudio/cpal), [encoding_rs](https://github.com/hsivonen/encoding_rs), [corosensei](https://github.com/Amanieu/corosensei), [Tauri](https://tauri.app/) and [Svelte](https://svelte.dev/).
 
 The name comes from the wooden starfish (*hitode*) that Fuko Ibuki carves one by one and gives to everyone in *CLANNAD*. We want to hand these old games, one by one, to more people too.
 

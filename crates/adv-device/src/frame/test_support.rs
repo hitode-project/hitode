@@ -16,11 +16,20 @@ pub struct CapturedFrame {
     pub buffer: Option<u64>,
 }
 
-pub struct CapturePresenter(Sender<CapturedFrame>);
+pub struct CapturePresenter {
+    sender: Sender<CapturedFrame>,
+    latest: Option<super::Captured>,
+}
 impl CapturePresenter {
     pub fn new() -> (Self, Receiver<CapturedFrame>) {
         let (tx, rx) = mpsc::channel();
-        (Self(tx), rx)
+        (
+            Self {
+                sender: tx,
+                latest: None,
+            },
+            rx,
+        )
     }
 }
 impl Presenter for CapturePresenter {
@@ -122,7 +131,13 @@ impl Presenter for CapturePresenter {
                 )
             }
         };
-        self.0
+        self.latest = Some(super::Captured {
+            serial: pixels.frames,
+            width: pixels.width,
+            height: pixels.height,
+            bgra: pixels.bgra.clone(),
+        });
+        self.sender
             .send(CapturedFrame {
                 pixels,
                 damage,
@@ -130,5 +145,21 @@ impl Presenter for CapturePresenter {
             })
             .unwrap();
     }
-    fn service(&mut self, _: &mut adv_gpu::Queue, _: Option<&crate::frame::Waker>) {}
+    fn service(&mut self, _: &mut adv_gpu::Queue, wake: Option<&crate::frame::Waker>) {
+        if let Some(wake) = wake {
+            for reply in wake.captures() {
+                let frame = self
+                    .latest
+                    .as_ref()
+                    .map(|frame| super::Captured {
+                        serial: frame.serial,
+                        width: frame.width,
+                        height: frame.height,
+                        bgra: frame.bgra.clone(),
+                    })
+                    .ok_or_else(|| "no presented frame".to_owned());
+                let _ = reply.send(frame);
+            }
+        }
+    }
 }

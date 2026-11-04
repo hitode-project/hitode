@@ -109,31 +109,10 @@ impl Viewport {
     }
 }
 
-#[cfg(not(feature = "native-display"))]
-pub(crate) fn native_viewport(
-    width: u32,
-    height: u32,
-    canvas_width: u32,
-    canvas_height: u32,
-) -> [f32; 4] {
-    let viewport = Viewport::fit(
-        (f64::from(width), f64::from(height)),
-        canvas_width,
-        canvas_height,
-    );
-    [
-        viewport.x as f32,
-        viewport.y as f32,
-        viewport.width as f32,
-        viewport.height as f32,
-    ]
-}
-
 /// UI state the Objective-C callbacks reach. Callbacks run inside AppKit
 /// dispatch on the main thread, so no borrow is held across `sendEvent`.
 #[derive(Default)]
 pub(crate) struct Hub {
-    #[cfg(feature = "native-display")]
     placement: Cell<Option<crate::display::Placement>>,
     pub(crate) scaling: Cell<crate::Scaling>,
     main: Cell<usize>,
@@ -702,14 +681,7 @@ impl Window {
     pub fn post_input(&mut self, message: u32, wparam: u32, lparam: u32) -> Result<(), String> {
         self.view.post_input(message, wparam, lparam)
     }
-    #[cfg(not(feature = "native-display"))]
-    pub fn create_native(
-        &mut self,
-        fallback: bool,
-    ) -> Result<(adv_device::gpu::Gpu, crate::native_gpu::WindowPresenter), String> {
-        self.view.create_native(fallback)
-    }
-    #[cfg(feature = "native-display")]
+
     pub fn create_display(
         &mut self,
         software: bool,

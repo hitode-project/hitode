@@ -166,8 +166,7 @@ fn setup(jit: bool, legacy: bool, mut registry: Registry) -> (Machine<JitCpu>, u
     m.cpu.map(DATA, 4096, Prot::RW).unwrap();
     m.cpu.map(0x500000, 65536, Prot::RW).unwrap();
     #[cfg(feature = "gpu")]
-    m.ext
-        .insert(pollster::block_on(SurfaceCapture::new()).unwrap());
+    m.ext.insert(SurfaceCapture::new().unwrap());
     m.ext
         .insert(SurfaceStore::new(800, 600, 0x500000, 65536, Snapshot::default()).unwrap());
     front::install(

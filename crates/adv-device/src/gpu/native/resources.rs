@@ -142,7 +142,7 @@ impl Image {
         self.alpha
     }
     /// Identity of the view: equal for clones, distinct per mip level. The
-    /// recording keys of `adv-dx` use it where they compared wgpu views.
+    /// recording keys of `adv-dx` use it for image identity.
     pub fn id(&self) -> ImageId {
         match &self.storage {
             Storage::Fixed { image, level, .. } => ImageId {
@@ -980,7 +980,7 @@ pub(super) mod tests {
     }
 
     pub(in crate::gpu::native) fn executor() -> Option<Gpu> {
-        match pollster::block_on(Gpu::request(!cfg!(target_vendor = "apple"))) {
+        match Gpu::request(!cfg!(target_vendor = "apple")) {
             Ok(gpu) => Some(gpu),
             Err(Error::Unavailable(reason))
                 if std::env::var_os("ADV_GPU_REQUIRE_BACKEND").is_none() =>

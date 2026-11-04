@@ -33,7 +33,6 @@ png = "0.17"
 [dev-dependencies]
 adv-device = { path = "../adv-device", features = ["test-support"] }
 iced-x86 = { version = "1.21", default-features = false, features = ["std", "code_asm"] }
-pollster = "0.4"
 
 [lints]
 workspace = true

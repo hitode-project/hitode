@@ -9,15 +9,6 @@ Kinds:
 - **Diagnostic** only observes or checks.
 - **Fixture** controls self-written tests and the conditions they run under.
 
-## Native display migration
-
-`adv-shell/native-display` selects the `adv-display` executor over `adv-gpu` and
-forwards `adv-device/native-display` and `adv-runtime/native-display`.
-`adv-run` and the launcher forward it as `native-display`. This comparison
-feature defaults off and is removed by package G2 of issue #103.
-The native path stores the selected upscaler but presents with `Upscaler::Off`
-until the upscaling stages are wired into this executor. Without the feature the wgpu path remains.
-
 ## Android display probe
 
 The `debug.adv.probe.rotation` Android system property is diagnostic. Its default
@@ -77,7 +68,6 @@ Header macros, placeholder names in script examples and names read only to clear
 | `ADV_FIXTURE_OTHER_83F2` | Fixture | Deliberately undefined variable read by the fixture |
 | `ADV_FONT_DIR` | Feature | System font folders only |
 | `ADV_FONT_PROFILE` | Fixture | No controlled font profile |
-| `ADV_GPU_BACKEND` | Migration comparison | Unset: native Metal programmable draws on Apple ARM; `wgpu` forces the reference path. Remove when R3-B completes. |
 | `ADV_VERIFY_SOFTWARE_FRAMES` | Diagnostic | Off; any value compares incremental software storage and conversion against full-frame references |
 | `ADV_HOST_FEATURES` | Diagnostic | Every detected feature; can only turn features off |
 | `ADV_HOST_FEATURES_REPORT` | Diagnostic | Off |
@@ -100,7 +90,7 @@ Header macros, placeholder names in script examples and names read only to clear
 | `ADV_SAMPLES` | Fixture | Unset: tests that need games skip |
 | `ADV_SHELL_LOG_TEST_CHILD` | Fixture | Unset; set by the parent test |
 | `ADV_TEST_FFMPEG` | Fixture | `ffmpeg` |
-| `ADV_TEST_GPU_BACKEND` | Fixture | Automatic; `vulkan` or `gles` |
+| `ADV_TEST_GPU_BACKEND` | Fixture | Automatic; `vulkan` or `metal` |
 | `ADV_TEST_ISO` | Fixture | None; a read-only image must be given |
 | `ADV_TEXT_DIAGNOSTICS` | Diagnostic | Off |
 | `ADV_TIER1_CENSUS` | Diagnostic | Off; census of x87 exact-path forms |

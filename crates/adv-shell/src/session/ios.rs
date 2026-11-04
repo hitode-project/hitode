@@ -112,7 +112,7 @@ impl MainLoop {
         // The link retains its target until `invalidate`.
         let link = unsafe { CADisplayLink::displayLinkWithTarget_selector(&target, sel!(frame:)) };
         link.setPaused(true);
-        // The guest is told the display runs at 60 Hz (`refresh_interval`).
+        // The guest is told the display runs at 60 Hz.
         link.setPreferredFrameRateRange(CAFrameRateRange {
             minimum: 30.0,
             maximum: 60.0,

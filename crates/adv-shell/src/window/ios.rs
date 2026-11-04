@@ -14,8 +14,7 @@ use objc2::runtime::{AnyObject, NSObject};
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, class, define_class, msg_send, sel};
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_foundation::{NSObjectProtocol, NSSet, NSString};
-#[cfg(not(feature = "native-display"))]
-use objc2_quartz_core::CAMetalLayer;
+
 use objc2_quartz_core::{CALayer, CATransaction};
 use objc2_ui_kit::UIViewAutoresizing;
 use objc2_ui_kit::{
@@ -29,7 +28,7 @@ pub struct Ivars {
     game: Weak<GameView>,
     frame: Retained<CALayer>,
     /// The frame's last placement in pixels, kept across layouts.
-    placement: Cell<Option<crate::native_gpu::Placement>>,
+    placement: Cell<Option<crate::display::Placement>>,
     /// Live touches by object address, with the pointer ids the mobile
     /// policy tracks; UIKit reuses one `UITouch` for a finger's lifetime.
     touches: RefCell<Vec<(usize, i32)>>,
@@ -100,9 +99,7 @@ define_class!(
 impl HostView {
     pub(crate) fn new(game: Weak<GameView>) -> Result<Retained<Self>, String> {
         let mtm = MainThreadMarker::new().ok_or("the game view must run on the main thread")?;
-        #[cfg(not(feature = "native-display"))]
-        let frame = CAMetalLayer::new().into_super();
-        #[cfg(feature = "native-display")]
+
         let frame = CALayer::new();
         let cursor = cursor_view();
         let this = Self::alloc(mtm).set_ivars(Ivars {
@@ -122,28 +119,22 @@ impl HostView {
         this.addSubview(&cursor);
         Ok(this)
     }
-    #[cfg(feature = "native-display")]
+
     pub(crate) fn display_layer(&self) -> Retained<CALayer> {
         self.ivars().frame.clone()
     }
-    /// The frame sublayer the presenter draws into.
-    #[cfg(not(feature = "native-display"))]
-    pub(crate) fn metal_layer(&self) -> *mut std::ffi::c_void {
-        Retained::as_ptr(&self.ivars().frame).cast_mut().cast()
-    }
+
     /// Positions the frame layer; None fills the view. Each presented frame
     /// repeats its placement, which then changes nothing.
-    pub(crate) fn place(&self, placement: Option<crate::native_gpu::Placement>) {
+    pub(crate) fn place(&self, placement: Option<crate::display::Placement>) {
         if self.ivars().placement.replace(placement) != placement {
             self.apply_placement();
             self.report_layout();
         }
     }
     fn apply_placement(&self) {
-        #[cfg(feature = "native-display")]
-        let placement = None::<crate::native_gpu::Placement>;
-        #[cfg(not(feature = "native-display"))]
-        let placement = self.ivars().placement.get();
+        let placement = None::<crate::display::Placement>;
+
         let scale = self.contentScaleFactor();
         let bounds = self.bounds().size;
         let (rectangle, nearest) = match placement {

@@ -505,7 +505,7 @@ fn latch(events: &Arc<Mutex<Vec<Presented>>>, serial: u64) {
         shown: None,
     });
 }
-// spec: HOST-VIEW-11, HOST-SES-11
+// spec: HOST-VIEW-11, HOST-SES-10, HOST-SES-11
 #[test]
 fn coalescing_replaces_the_held_frame_merges_damage_and_releases_its_swap() {
     let (d, mut q) = Device::open(&queue::DeviceOptions::default()).unwrap();

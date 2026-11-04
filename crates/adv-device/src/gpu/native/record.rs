@@ -1371,7 +1371,7 @@ mod tests {
         );
     }
 
-    // Reuse the padded 2x2 texture and exact nearest pixels of tests/gpu.rs.
+    // Authored padded 2x2 texture with exact nearest pixels.
     // Exercise both blit pipelines with the same authored colors.
     // spec: GFX-SAMPLER-4, GFX-REC-1
     #[test]
@@ -1535,7 +1535,7 @@ struct V { @builtin(position) position:vec4<f32>, @location(0) alpha:f32 }
     // spec: GFX-REC-1, GFX-PASS-1
     #[test]
     fn facade_clear_copy_readback_completion() {
-        let mut gpu = match pollster::block_on(Gpu::request(!cfg!(target_vendor = "apple"))) {
+        let mut gpu = match Gpu::request(!cfg!(target_vendor = "apple")) {
             Ok(gpu) => gpu,
             Err(Error::Unavailable(reason))
                 if std::env::var_os("ADV_GPU_REQUIRE_BACKEND").is_none() =>

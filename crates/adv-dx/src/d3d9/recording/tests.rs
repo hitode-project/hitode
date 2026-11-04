@@ -313,52 +313,6 @@ fn render_target_readback_and_gpu_lock_flush_prior_draws() {
     assert!(f.m.ext.get::<State>().frames.flushes[Reason::Lock as usize] > 0);
 }
 
-test_support::renderer_test! {
-// spec: GFX-REC-1
-#[test]
-fn busy_resumes_the_unexecuted_suffix_once_and_cancellation_releases_flush_ownership() {
-    for cancel in [false, true] {
-        let mut f = fixture();
-        let rt = f.render_target(16, 12, 21);
-        let frozen = {
-            let image = f.image(rt);
-            f.m.ext
-                .get_mut::<State>()
-                .gpu
-                .as_mut()
-                .unwrap()
-                .completed_frame(image, 1)
-                .unwrap()
-        };
-        let d = draw(&mut f);
-        record_draw(&mut f, d);
-        f.okay("IDirect3DDevice9::SetRenderTarget", &[f.device, 0, rt]);
-        clear(&mut f, 0xff112233);
-        let before = stats(&f).draws;
-        let outcome = flush(&mut f, Reason::Readback);
-        assert!(matches!(outcome, Outcome::Block { .. }));
-        assert_eq!(stats(&f).draws, before + 1);
-        let owner = id(&mut f);
-        assert_eq!(frame(&mut env(&mut f), owner).head, 1);
-        if cancel {
-            super::super::cancel_pending(&mut f.m);
-            drop(outcome);
-            assert!(frame(&mut env(&mut f), owner).active.is_none());
-            drop(frozen);
-            let outcome = flush(&mut f, Reason::Readback);
-            assert_eq!(f.finish(outcome), 0);
-        } else {
-            drop(frozen);
-            assert_eq!(f.finish(outcome), 0);
-        }
-        assert_eq!(stats(&f).draws, before + 1);
-        let image = f.image(rt);
-        assert_eq!(&f.pixels(&image)[..4], &[0x33, 0x22, 0x11, 0xff]);
-        assert!(f.m.ext.get::<State>().pending.is_empty());
-    }
-}
-}
-
 // spec: GFX-REC-1, GFX-REC-2, GFX-REC-7
 #[test]
 fn repeated_programmable_frame_keeps_captures_without_backend_packing() {
@@ -1339,61 +1293,6 @@ fn cancelling_verification_releases_the_map_and_never_republishes_its_completed_
     assert_eq!(f.m.ext.get::<State>().frames.verification_mismatches, 0);
 }
 
-test_support::renderer_test! {
-// spec: GFX-REC-1 GFX-REC-2
-#[test]
-fn failed_busy_wait_admission_keeps_successful_prefix_but_rejects_incoming_upload() {
-    let mut f = fixture_with_limits(adv_machine::ObjectLimits {
-        references: 3,
-        ..adv_machine::ObjectLimits::default()
-    });
-    let source = f.surface(16, 12, 21, 0);
-    let target = f.target(source);
-    let frozen =
-        f.m.ext
-            .get_mut::<State>()
-            .gpu
-            .as_mut()
-            .unwrap()
-            .completed_frame(target.image.clone(), 1)
-            .unwrap();
-    clear(&mut f, 0xff123456);
-    let owner = id(&mut f);
-    let e = env(&mut f);
-    let resource = com(&e).identity::<Payload>(&e.sys.objects, source).unwrap();
-    frame(&mut env(&mut f), owner).force_limit();
-    let outcome = record(
-        &mut env(&mut f),
-        owner,
-        Operation::Upload {
-            resource,
-            level: None,
-            target: target.clone(),
-            pixels: Pixels::Host(Arc::new(vec![7; 16 * 12 * 4]), 1),
-            pitch: 64,
-            rectangle: Rect {
-                x: 0,
-                y: 0,
-                w: 16,
-                h: 12,
-            },
-        },
-    );
-    assert!(matches!(outcome, Outcome::Return(OUT_OF_MEMORY)));
-    let mut e = env(&mut f);
-    let fqueue = frame(&mut e, owner);
-    assert_eq!(fqueue.commands.len(), 1);
-    assert_eq!(fqueue.head, 1);
-    assert!(!fqueue.contents.keys().any(|k| k.0 == resource));
-    assert!(fqueue.active.is_none());
-    assert_eq!(f.m.ext.get::<State>().frames.recorded_commands, 1);
-    drop(frozen);
-    assert_eq!(f.pixels(&target.image), vec![0; 16 * 12 * 4]);
-    let back = f.image(f.back);
-    assert_eq!(&f.pixels(&back)[..4], &[0x56, 0x34, 0x12, 0xff]);
-}
-}
-
 // spec: GFX-REC-2
 #[test]
 fn private_background_presentations_do_not_seed_foreground_elision() {
@@ -1880,44 +1779,6 @@ fn d3d9_package_b_event_tracks_issue_boundary_and_flushes_without_guest_waits() 
         1,
         "later work remains recorded"
     );
-}
-
-test_support::renderer_test! {
-// spec: GFX-QUERY-1, GFX-REC-1
-#[test]
-fn d3d9_package_b_query_flush_busy_preserves_suffix_without_blocking_or_replay() {
-    let mut f = fixture();
-    let q = package_b_query(&mut f, 8);
-    let rt = f.render_target(16, 12, 21);
-    let image = f.image(rt);
-    let frozen =
-        f.m.ext
-            .get_mut::<State>()
-            .gpu
-            .as_mut()
-            .unwrap()
-            .completed_frame(image, 1)
-            .unwrap();
-    let d = draw(&mut f);
-    record_draw(&mut f, d);
-    f.okay("IDirect3DDevice9::SetRenderTarget", &[f.device, 0, rt]);
-    clear(&mut f, 0xff112233);
-    f.okay("IDirect3DQuery9::Issue", &[q, 1]);
-    let before = stats(&f).draws;
-    assert_eq!(
-        package_b_call(&mut f, "IDirect3DQuery9::GetData", &[q, 0, 0, 1]),
-        1
-    );
-    assert_eq!(stats(&f).draws, before + 1);
-    assert!(f.m.ext.get::<State>().pending.is_empty());
-    let owner = id(&mut f);
-    assert!(frame(&mut env(&mut f), owner).active.is_none());
-    drop(frozen);
-    f.okay("IDirect3DQuery9::GetData", &[q, 0, 0, 1]);
-    assert_eq!(stats(&f).draws, before + 1);
-    let image = f.image(rt);
-    assert_eq!(&f.pixels(&image)[..4], &[0x33, 0x22, 0x11, 0xff]);
-}
 }
 
 // spec: GFX-QUERY-1

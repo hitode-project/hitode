@@ -42,11 +42,11 @@ This spec covers the Android player: its package, its lifecycle and input, and t
 
 ### AND-APP-10 Native view
 
-**Rule**: Android views MUST acquire host `ANativeWindow` handles, present through Vulkan without readback, and stop rendering when no surface exists. Replacement MUST retain the instance and adapter, discard queued rendering, drain active jobs before releasing the window, and reconfigure for full redraw. Choreographer MUST follow pending content and reported periods, while views MUST request 60 Hz with optional `ANativeWindow_setFrameRate` and default compatibility.
+**Rule**: Android views MUST acquire host `ANativeWindow` handles, present through Vulkan without readback, and stop rendering when no surface exists. Choreographer MUST follow pending content and reported periods, and cadence requests MUST follow HOST-SES-11.
 **Applies to**: Android
 **Verification**: Test
 
-With `native-display`, SurfaceControl MUST retain its own window reference. Window replacement and loss MUST poke the owner without waiting for a guest frame. Replacement MUST rebuild only the compositor, retaining detached leases and display pools while presentation is suspended. Rebuilding MUST reattach the same images without encoding, and the owner MUST run at `PRIORITY_DISPLAY` without core affinity.
+SurfaceControl MUST retain its own window reference. Window replacement and loss MUST poke the owner without waiting for a guest frame. Replacement MUST rebuild only the compositor, retaining detached leases and display pools while presentation is suspended. Rebuilding MUST reattach the same images without encoding, and the owner MUST run at `PRIORITY_DISPLAY` without core affinity.
 
 ### AND-APP-11 Touch input
 

@@ -17,7 +17,7 @@ fn asf_fixture() -> Vec<u8> {
 #[test]
 #[cfg_attr(
     all(
-        feature = "native-display",
+        feature = "gpu",
         not(any(target_vendor = "apple", target_os = "android"))
     ),
     ignore = "decoded video needs presentable YUV pools, which exist only on Apple and Android"

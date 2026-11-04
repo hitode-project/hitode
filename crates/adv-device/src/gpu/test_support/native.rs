@@ -55,9 +55,9 @@ pub struct SurfaceCapture {
     published: u64,
 }
 impl SurfaceCapture {
-    pub async fn new() -> Result<Self, Error> {
+    pub fn new() -> Result<Self, Error> {
         Ok(Self {
-            gpu: request(!cfg!(any(target_vendor = "apple", target_os = "android"))).await?,
+            gpu: request(!cfg!(any(target_vendor = "apple", target_os = "android")))?,
             published: 0,
         })
     }
@@ -83,7 +83,7 @@ impl SurfaceCapture {
     }
 }
 
-pub async fn request(fallback: bool) -> Result<Gpu, Error> {
+pub fn request(fallback: bool) -> Result<Gpu, Error> {
     if let Some(execution) = super::EXECUTION.with(|cached| cached.borrow().upgrade()) {
         assert!(
             execution.capture.borrow().is_some(),
@@ -98,7 +98,7 @@ pub async fn request(fallback: bool) -> Result<Gpu, Error> {
         ..Default::default()
     })
     .map_err(super::record::gpu_error)?;
-    let gpu = Gpu::request_with_presenter(device, queue, Box::new(presenter)).await?;
+    let gpu = Gpu::request_with_presenter(device, queue, Box::new(presenter))?;
     *gpu.execution.capture.borrow_mut() = Some(Rc::new(Frames {
         receiver,
         frames: RefCell::new(Vec::new()),
@@ -106,8 +106,8 @@ pub async fn request(fallback: bool) -> Result<Gpu, Error> {
     }));
     Ok(gpu)
 }
-pub async fn request_backend(fallback: bool, _: GpuBackend) -> Result<Gpu, Error> {
-    request(fallback).await
+pub fn request_backend(fallback: bool, _: GpuBackend) -> Result<Gpu, Error> {
+    request(fallback)
 }
 pub fn present(
     gpu: &mut Gpu,
@@ -159,13 +159,6 @@ pub fn destroy(gpu: &Gpu) {
         .unwrap();
 }
 
-// Feature selection lives in the dependency that owns native-display.
-#[macro_export]
-macro_rules! renderer_test {
-    ($($tokens:tt)*) => {};
-}
-pub use crate::renderer_test;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,7 +166,7 @@ mod tests {
     #[test]
     // spec: GFX-REC-1
     fn pause_and_device_loss_apply_to_every_facade_on_the_execution() {
-        let mut gpu = pollster::block_on(request(!cfg!(target_vendor = "apple"))).unwrap();
+        let mut gpu = request(!cfg!(target_vendor = "apple")).unwrap();
         let child = gpu.fork().unwrap();
         let target = gpu.target(2, 2, false).unwrap();
         gpu.clear(&target, Some([1., 0., 0., 1.]), None).unwrap();

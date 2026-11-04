@@ -7,7 +7,6 @@ use adv_dx::shader::{
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-include!("fixtures/metal_compare.rs");
 
 fn reg(kind: u32, index: u32) -> u32 {
     0x80000000 | ((kind & 7) << 28) | ((kind & 24) << 8) | index
@@ -88,8 +87,6 @@ fn compare_gpu(gpu: &mut Gpu, name: &str, shader: Shader, input: &Inputs, consta
         assert!(Instant::now() < deadline, "readback timed out: {name}");
         std::thread::sleep(Duration::from_millis(1));
     };
-    #[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
-    emit_metal_pixels(&pixels);
     let expected = expected.colors[0].map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as i32);
     for (index, pixel) in pixels.as_chunks::<4>().0.iter().enumerate() {
         for channel in 0..4 {
@@ -109,18 +106,14 @@ fn gpu_matches_reference_masks_modifiers_flow_and_specials() {
     let backend = std::env::var("ADV_TEST_GPU_BACKEND").unwrap_or_default();
     let (fallback, backend) = match backend.as_str() {
         "vulkan" => (false, GpuBackend::Vulkan),
-        "gles" => (false, GpuBackend::Gl),
-        "dx12" => (false, GpuBackend::Direct3D12),
         "metal" => (false, GpuBackend::Metal),
         _ => (
             !cfg!(any(target_os = "macos", target_os = "android")),
             GpuBackend::Automatic,
         ),
     };
-    let mut gpu = pollster::block_on(adv_device::gpu::test_support::request_backend(
-        fallback, backend,
-    ))
-    .expect("differential GPU adapter");
+    let mut gpu = adv_device::gpu::test_support::request_backend(fallback, backend)
+        .expect("differential GPU adapter");
     let mut constants = Constants::default();
     constants.f[0] = [0.2, 0.35, 0.65, 0.8];
     constants.f[1] = [0.6, 0.45, 0.3, 0.1];
@@ -295,13 +288,4 @@ fn gpu_matches_reference_masks_modifiers_flow_and_specials() {
         );
     }
     assert_eq!(Stage::Pixel, shader(3, 0, Vec::new()).stage);
-}
-
-adv_device::gpu::test_support::renderer_test! {
-// spec: GFX-METAL-1
-#[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
-#[test]
-fn shader_fixtures_match_native_metal_and_wgpu_exactly() {
-    compare_metal_fixture("gpu_matches_reference_masks_modifiers_flow_and_specials");
-}
 }

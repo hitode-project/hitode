@@ -121,21 +121,7 @@ impl Session {
             .sender_with_capacity_wake(8, 8, wake.clone())
             .map_err(|e| e.to_string())?;
         let (mut worker, mut ui) = frontend::channel(wake.clone(), keys.clone())?;
-        #[cfg(not(feature = "native-display"))]
-        {
-            let (gpu, presenter) = view.create_native(options.gpu_software)?;
-            gpu.context()
-                .set_execution_wake(wake.clone())
-                .map_err(|_| "GPU execution wake was already registered")?;
-            let sender = background
-                .sender_with_capacity_wake(1, 1, ui.wake())
-                .map_err(|e| e.to_string())?;
-            ui.native(presenter, sender);
-            #[cfg(target_os = "macos")]
-            ui.install_sinks(&mut projection.borrow_mut());
-            worker.gpu = Some(gpu);
-        }
-        #[cfg(feature = "native-display")]
+
         {
             let (startup, display) = view.create_display(options.gpu_software, ui.wake())?;
             worker.display = Some(startup);

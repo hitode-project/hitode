@@ -70,10 +70,10 @@ impl Fixture {
         m.cpu.map(0x400000, 4096, Prot::RX).unwrap();
         m.spawn("authored color blits", 0x400000, &[], 65536)
             .unwrap();
-        let gpu = pollster::block_on(adv_device::gpu::test_support::request(!cfg!(any(
+        let gpu = adv_device::gpu::test_support::request(!cfg!(any(
             target_os = "macos",
             target_os = "android"
-        ))))
+        )))
         .unwrap();
         let wake = Arc::new(adv_sync::WakeEvent::new().unwrap());
         let mut builder = adv_sync::background::Builder::new((*wake).clone()).unwrap();

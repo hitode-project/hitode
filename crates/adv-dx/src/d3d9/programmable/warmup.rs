@@ -141,11 +141,8 @@ mod tests {
         machine.sys.objects = Objects::default();
         machine.ext.get_mut::<State>().com = Com::new(&mut machine.sys.objects).unwrap();
         machine.ext.get_mut::<State>().gpu = Some(
-            pollster::block_on(adv_device::gpu::Gpu::request(!cfg!(any(
-                target_os = "macos",
-                target_os = "android"
-            ))))
-            .unwrap(),
+            adv_device::gpu::Gpu::request(!cfg!(any(target_os = "macos", target_os = "android")))
+                .unwrap(),
         );
         let mut env = Env {
             context: machine.sys.current,

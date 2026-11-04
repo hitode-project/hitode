@@ -248,27 +248,11 @@ fn d3d9_provider() -> adv_dx::d3d9::SurfaceProvider {
                 .replace_native(id, target)
                 .map(|_| ())
         },
-        #[cfg(not(feature = "native-display"))]
-        present: |ext, id, damage, gpu| {
-            ext.get_mut::<Surfaces<Snapshot>>()
-                .present_native_rotating(id, damage, gpu)
-        },
-        #[cfg(feature = "native-display")]
+
         present: native_present,
-        #[cfg(feature = "native-display")]
+
         present_copy: native_present,
-        #[cfg(not(feature = "native-display"))]
-        present_copy: |ext, id, damage, gpu| {
-            use adv_device::gpu::Error;
-            let graphics = ext.get_mut::<Surfaces<Snapshot>>();
-            let target = graphics
-                .native_target(id)
-                .ok_or_else(|| Error::Invalid("COPY front surface no longer exists".into()))?;
-            let frame = gpu.present(&target.image, 0)?;
-            graphics
-                .publish_native_frame(id, frame, damage)
-                .map_err(Error::Invalid)
-        },
+
         repeat: |ext, id| ext.get_mut::<Surfaces<Snapshot>>().repeat_native_frame(id),
         presentation_serial: |ext| ext.get::<Surfaces<Snapshot>>().output_serial(),
         vsync: |ext| {
@@ -278,7 +262,7 @@ fn d3d9_provider() -> adv_dx::d3d9::SurfaceProvider {
     }
 }
 
-#[cfg(feature = "native-display")]
+#[cfg(feature = "gpu")]
 fn native_present(
     ext: &mut adv_machine::Ext,
     id: u32,

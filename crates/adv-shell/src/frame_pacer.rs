@@ -73,16 +73,44 @@ impl Cadence {
     }
 }
 
-/// Earliest submission allowed by the presentation cap. GPU work starts here;
-/// the native compositor selects the following refresh without another host tick.
-#[cfg(any(host_view, test))]
-#[cfg_attr(
-    feature = "native-display",
-    allow(
-        dead_code,
-        reason = "used by the old path and its pacing integration test"
-    )
-)]
-pub(crate) fn submission_at(published: Instant, next: Instant) -> Instant {
-    published.max(next)
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // spec: HOST-SES-8
+    #[test]
+    fn requested_cadence_caps_fast_publications_at_sixty() {
+        let origin = Instant::now();
+        for rate in [120, 180] {
+            let mut cadence = Cadence::default();
+            let period = Duration::from_secs_f64(1.0 / f64::from(rate));
+            for serial in 1..=5 {
+                cadence.published(u64::from(serial), origin + period * serial);
+            }
+            assert_eq!(cadence.rate(), 60);
+        }
+    }
+
+    // spec: HOST-SES-11
+    #[test]
+    fn requested_rate_follows_publication_cadence_including_dropped_frames() {
+        let origin = Instant::now();
+        for rate in [30, 60] {
+            let mut cadence = Cadence::default();
+            assert_eq!(cadence.rate(), 60);
+            let period = Duration::from_secs_f64(1.0 / f64::from(rate));
+            for serial in [1, 2, 4, 7, 8, 9] {
+                cadence.published(u64::from(serial), origin + period * serial);
+            }
+            assert_eq!(cadence.rate(), rate);
+            cadence.published(9, origin + period * 9); // Repaint is not a new publication.
+            assert_eq!(cadence.rate(), rate);
+            cadence.published(10, origin + Duration::from_secs(2));
+            assert_eq!(
+                cadence.rate(),
+                60,
+                "a still screen does not request a low rate"
+            );
+        }
+    }
 }

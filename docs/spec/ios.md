@@ -67,11 +67,11 @@ The launcher holds selected directories' security scopes while it runs. Game fol
 
 ### IOS-APP-2 Native view
 
-**Rule**: The game view MUST present through a Metal layer above a black base and leave scaling to Core Animation under HOST-VIEW-9. It MUST report its pixel size from layout. A display link MUST publish the vsync grid for guest refresh pacing and remain paused without pending frames under HOST-SES-10.
+**Rule**: The game view MUST present through the Core Animation compositor above a black base and leave scaling to Core Animation under HOST-VIEW-9. It MUST report its pixel size from layout. A display link MUST publish the vsync grid for guest refresh pacing and remain paused without pending frames under HOST-SES-10.
 **Applies to**: iOS
 **Verification**: Review — UIKit layout and the display link run only inside an application.
 
-With `native-display`, IOSurface contents MUST attach through the Core Animation compositor after GPU completion, preserving the existing display link. Scale changes MUST reach the owner through the settings mailbox and apply on the main thread through the compositor notifier; transaction completion MUST poke the owner to advance held frames and releases.
+IOSurface contents MUST attach through the Core Animation compositor after GPU completion, preserving the existing display link. Scale changes MUST reach the owner through the settings mailbox and apply on the main thread through the compositor notifier; transaction completion MUST poke the owner to advance held frames and releases.
 
 ### IOS-APP-3 Touch routing
 

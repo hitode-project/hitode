@@ -363,12 +363,10 @@ fn one_changed_quad_replays_in_order_and_clear_preserves_pixels_outside_damage()
     scene(&mut f, colors);
     present(&mut f);
     colors[0] = [1., 1., 0., 1.];
-    test_support::renderer_test! { let before = stats(&f).draws; }
+
     scene(&mut f, colors);
     present(&mut f);
-    test_support::renderer_test! {
-        assert_eq!(stats(&f).draws - before, 2, "one bounded clear and the intersecting quad");
-    }
+
     assert_eq!(latest(&mut f), reference(&mut f, colors));
     let counts = f.m.ext.get::<State>().frames;
     assert_eq!(counts.clipped_executions, 1);
@@ -391,6 +389,7 @@ fn bind_depth(f: &mut Fixture, width: u32, height: u32) -> u32 {
 
 // spec: GFX-REC-2, GFX-REC-3, GFX-REC-4, GFX-REC-5
 #[test]
+// spec: DEV-DEPTH-1, DEV-DEPTH-2
 fn padded_depth_and_stencil_clears_keep_local_redraw_pixel_exact() {
     for mode in 0..3 {
         let mut outputs = Vec::new();

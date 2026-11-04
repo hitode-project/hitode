@@ -3,8 +3,7 @@
 //! Apple device requests, native draws, copies and compilation drain their
 //! autoreleased temporaries on the calling thread.
 use crate::surface::Rect;
-#[cfg(not(feature = "native-display"))]
-mod clear;
+
 mod constant_snapshot;
 pub use constant_snapshot::ConstantSnapshot;
 pub mod compile;
@@ -12,65 +11,46 @@ mod depth;
 mod index_bytes;
 mod line;
 pub use index_bytes::IndexBytes;
-#[cfg(feature = "native-display")]
+
 pub(crate) mod native;
 mod programmable;
-#[cfg(not(feature = "native-display"))]
-mod renderer;
-#[cfg(not(feature = "native-display"))]
-mod submission;
-#[cfg(all(feature = "test-support", not(feature = "native-display")))]
-#[path = "gpu/test_support/renderer.rs"]
-pub mod test_support;
+
 mod vertex_bytes;
-#[cfg(not(feature = "native-display"))]
-use depth::DeferredClear;
-#[cfg(not(feature = "native-display"))]
-pub use depth::Depth;
+
 pub use depth::{DepthFormat, Stencil, StencilFace, StencilOp};
-#[cfg(all(feature = "test-support", feature = "native-display"))]
+#[cfg(feature = "test-support")]
 pub use native::test_support;
-#[cfg(feature = "native-display")]
+
 pub use native::{Depth, Gpu, Image, ImageId, Readback, Staged, Target};
 pub use programmable::{
     Attribute, AttributeFormat, ConstantBlock, Program, ProgramTexture, ProgrammableDraw,
     VertexStream,
 };
-#[cfg(target_vendor = "apple")]
-#[cfg(not(feature = "native-display"))]
-pub use renderer::DisplayCompletion;
-#[cfg(not(feature = "native-display"))]
-pub use renderer::Submission;
+
 /// Validate guest-derived source before handing it to the device.
 pub fn validate_program(program: &Program) -> Result<(), Error> {
     program_module(program.source()).map(drop)
 }
-pub(super) fn program_module(source: &str) -> Result<wgpu::naga::Module, Error> {
+pub(super) fn program_module(source: &str) -> Result<naga::Module, Error> {
     if source.len() > Program::MAX_SOURCE_LEN {
         return Err(Error::Invalid("program source exceeds limit".into()));
     }
-    let module = wgpu::naga::front::wgsl::parse_str(source)
+    let module = naga::front::wgsl::parse_str(source)
         .map_err(|e| Error::Invalid(e.emit_to_string(source)))?;
-    wgpu::naga::valid::Validator::new(
-        wgpu::naga::valid::ValidationFlags::all(),
-        wgpu::naga::valid::Capabilities::empty(),
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::empty(),
     )
     .validate(&module)
     .map_err(|e| Error::Invalid(e.emit_to_string(source)))?;
     Ok(module)
 }
 
-#[cfg(not(feature = "native-display"))]
-pub use renderer::{Gpu, Image, ImageId, NativeContext, NativeFrame, Readback, Staged, Target};
-#[cfg(not(feature = "native-display"))]
-pub use submission::SubmissionPause;
 pub use vertex_bytes::VertexBytes;
 #[derive(Clone, Copy, Debug)]
 pub enum GpuBackend {
     Automatic,
     Vulkan,
-    Gl,
-    Direct3D12,
     Metal,
 }
 
@@ -295,10 +275,6 @@ pub struct Stats {
     pub native_frames: u64,
     pub native_frame_allocations: u64,
     pub vertex_buffer_allocations: u64,
-    pub metal_draws: u64,
-    pub backend_switches: u64,
-    /// Partial clear, copy, upload, fixed draw, readback, other (including entry to Metal).
-    pub backend_switches_by_reason: [u64; 6],
     pub ring_bytes: u64,
     pub ring_busy: u64,
     pub buffer_writes: u64,
