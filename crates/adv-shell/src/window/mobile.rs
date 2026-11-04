@@ -502,29 +502,6 @@ impl GameView {
             self.push(Event::FocusLost);
         }
     }
-    pub(crate) fn post_input(&self, message: u32, wparam: u32, lparam: u32) -> Result<(), String> {
-        let lparam = if (0x200..=0x20a).contains(&message) {
-            crate::mobile::touch::position_in(
-                self.frame_rectangle(),
-                self.canvas.get(),
-                lparam as u16 as i16 as f32,
-                (lparam >> 16) as u16 as i16 as f32,
-            )
-        } else {
-            lparam
-        };
-        if wparam == 0x11 && matches!(message, 0x100 | 0x101 | 0x104 | 0x105) {
-            self.keys
-                .borrow()
-                .set(wparam, matches!(message, 0x100 | 0x104));
-        }
-        self.push(Event::Input {
-            message,
-            wparam,
-            lparam,
-        });
-        Ok(())
-    }
 
     pub(crate) fn create_display(
         &self,
