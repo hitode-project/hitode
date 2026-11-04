@@ -1419,3 +1419,41 @@ fn bindless_storage_offsets_index_by_array_stride() {
         );
     }
 }
+
+#[test]
+fn sampled_heap_entries_are_taken_on_first_sample() {
+    let (device, mut queue) = gpu!(Modern::empty());
+    if !device.caps().modern.contains(Modern::BINDLESS) {
+        return;
+    }
+    let heap = device.inner.0.heap.as_ref().unwrap();
+    let before = heap.used(0);
+    let size = Extent {
+        width: 8,
+        height: 8,
+        depth_or_layers: 1,
+    };
+    let image = create_image(&device, Format::Bgra8Unorm, size, 4, 1);
+    let levels: Vec<_> = (0..4)
+        .map(|mip| {
+            image
+                .create_view(&ViewDesc {
+                    format: None,
+                    dimension: None,
+                    mips: mip..mip + 1,
+                    layers: 0..1,
+                    plane: 0,
+                })
+                .unwrap()
+        })
+        .collect();
+    // Copy and render views never reach a shader's heap index.
+    assert_eq!(heap.used(0), before);
+    let index = levels[0].inner.0.sampled_index().unwrap();
+    assert_eq!(levels[0].inner.0.sampled_index().unwrap(), index);
+    assert_eq!(heap.used(0), before + 1);
+    drop(levels);
+    drop(image);
+    queue.poll().unwrap();
+    assert_eq!(heap.used(0), before);
+}

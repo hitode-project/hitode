@@ -191,14 +191,43 @@ pub(super) struct ViewCore {
     pub(super) handle: vk::ImageView,
     pub(super) desc: ViewDesc,
     pub(super) format: Format,
-    pub(super) sampled: Option<u32>,
+    /// The heap entry, taken when a pipeline first samples the view: views
+    /// used only to copy or render never hold one.
+    pub(super) sampled: std::sync::OnceLock<u32>,
     pub(super) storage: Option<u32>,
+}
+impl ViewCore {
+    /// The view's sampled heap entry, inserting it on first use. Without a
+    /// heap, shaders bind descriptor sets and the index is unused.
+    pub(super) fn sampled_index(&self) -> Result<u32> {
+        if let Some(&index) = self.sampled.get() {
+            return Ok(index);
+        }
+        let context = &self.image.inner.core.context;
+        let Some(heap) = &context.heap else {
+            return Ok(0);
+        };
+        let index = heap.insert(
+            context,
+            0,
+            None,
+            Some(
+                vk::DescriptorImageInfo::default()
+                    .image_view(self.handle)
+                    .image_layout(binding::sampled_layout(self.format)),
+            ),
+        )?;
+        if self.sampled.set(index).is_err() {
+            heap.free(0, index);
+        }
+        Ok(*self.sampled.get().unwrap())
+    }
 }
 impl Drop for ViewCore {
     fn drop(&mut self) {
         self.image.inner.core.context.retire(Retired::View {
             handle: self.handle,
-            sampled: self.sampled,
+            sampled: self.sampled.get().copied(),
             storage: self.storage,
         });
     }
@@ -373,7 +402,7 @@ impl Image {
             .context
             .result(unsafe { self.core.context.device.create_image_view(&info, None) })?;
         let mut core = ViewCore {
-            sampled: None,
+            sampled: std::sync::OnceLock::new(),
             storage: None,
             image: crate::Image {
                 inner: Image {
@@ -385,35 +414,21 @@ impl Image {
             desc: desc.clone(),
             format,
         };
-        if let Some(heap) = &self.core.context.heap {
-            if view_usage.contains(vk::ImageUsageFlags::SAMPLED) && self.core.conversion.is_none() {
-                core.sampled = Some(
-                    heap.insert(
-                        &self.core.context,
-                        0,
-                        None,
-                        Some(
-                            vk::DescriptorImageInfo::default()
-                                .image_view(handle)
-                                .image_layout(binding::sampled_layout(format)),
-                        ),
-                    )?,
-                );
-            }
-            if view_usage.contains(vk::ImageUsageFlags::STORAGE) {
-                core.storage = Some(
-                    heap.insert(
-                        &self.core.context,
-                        2,
-                        None,
-                        Some(
-                            vk::DescriptorImageInfo::default()
-                                .image_view(handle)
-                                .image_layout(vk::ImageLayout::GENERAL),
-                        ),
-                    )?,
-                );
-            }
+        if let Some(heap) = &self.core.context.heap
+            && view_usage.contains(vk::ImageUsageFlags::STORAGE)
+        {
+            core.storage = Some(
+                heap.insert(
+                    &self.core.context,
+                    2,
+                    None,
+                    Some(
+                        vk::DescriptorImageInfo::default()
+                            .image_view(handle)
+                            .image_layout(vk::ImageLayout::GENERAL),
+                    ),
+                )?,
+            );
         }
         Ok(crate::ImageView {
             inner: ImageView(Arc::new(core)),

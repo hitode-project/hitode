@@ -591,25 +591,31 @@ pub(super) fn create_texture(
     // default and managed pools retain one texture with shared mip views.
     if pool < 2 {
         let target = match env.ext.get::<State>().gpu.as_ref() {
-            Some(g) => g
-                .target_levels(width, height, levels.len() as u32)
-                .and_then(|mut target| {
-                    if usage & 1 == 0 {
-                        let texel = format::texel(format).unwrap();
-                        let stored = if g.stores(texel) {
-                            texel
-                        } else {
-                            adv_device::gpu::TexelFormat::Bgra8
-                        };
-                        target.image = g.texture(width, height, levels.len() as u32, stored)?;
-                    }
-                    Ok(target)
-                }),
+            Some(g) if usage & 1 != 0 => g.target_levels(width, height, levels.len() as u32),
+            Some(g) => {
+                let texel = format::texel(format).unwrap();
+                let stored = if g.stores(texel) {
+                    texel
+                } else {
+                    adv_device::gpu::TexelFormat::Bgra8
+                };
+                g.texture_levels(width, height, levels.len() as u32, stored)
+            }
             None => return Outcome::Return(UNAVAILABLE),
         };
         let target = match target {
             Ok(t) => t.with_alpha_mode(targets::alpha_mode(format)),
-            Err(e) => return gpu_error(e),
+            Err(e) => {
+                adv_abi::warn_unavailable(
+                    env,
+                    "IDirect3DDevice9::CreateTexture",
+                    &format!(
+                        "{width}x{height} levels={} format={format} usage={usage:#x} pool={pool}: {e:?}",
+                        levels.len()
+                    ),
+                );
+                return gpu_error(e);
+            }
         };
         let provider = env.ext.get::<State>().provider;
         for index in 0..levels.len() {
@@ -621,6 +627,11 @@ pub(super) fn create_texture(
             match (provider.insert)(env.ext, view) {
                 Ok(surface) => levels[index].surface = Some(surface),
                 Err(_) => {
+                    adv_abi::warn_unavailable(
+                        env,
+                        "IDirect3DDevice9::CreateTexture",
+                        "surface table is full",
+                    );
                     remove_levels(env, &levels);
                     return Outcome::Return(OUT_OF_MEMORY);
                 }
@@ -633,6 +644,11 @@ pub(super) fn create_texture(
         Some(0)
     };
     let Some(storage) = storage else {
+        adv_abi::warn_unavailable(
+            env,
+            "IDirect3DDevice9::CreateTexture",
+            &format!("guest storage of {len} bytes"),
+        );
         remove_levels(env, &levels);
         return Outcome::Return(OUT_OF_MEMORY);
     };

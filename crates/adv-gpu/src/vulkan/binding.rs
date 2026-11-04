@@ -126,6 +126,11 @@ impl PushLayout {
     }
 }
 
+/// Heap entries per kind. Sampled images follow guest content, so they take
+/// the most a 16-bit packed index addresses; samplers, storage images and
+/// storage buffers are host-owned and few.
+const CAPACITY: [u32; 4] = [65536, 1024, 1024, 1024];
+
 pub(super) struct Heap {
     device: ash::Device,
     pub(super) counts: [u32; 4],
@@ -152,7 +157,7 @@ impl Heap {
                 &mut vk::PhysicalDeviceProperties2::default().push_next(&mut indexing),
             );
         }
-        let counts = [
+        let limits = [
             indexing
                 .max_descriptor_set_update_after_bind_sampled_images
                 .min(indexing.max_per_stage_descriptor_update_after_bind_sampled_images),
@@ -165,9 +170,10 @@ impl Heap {
             indexing
                 .max_descriptor_set_update_after_bind_storage_buffers
                 .min(indexing.max_per_stage_descriptor_update_after_bind_storage_buffers),
-        ]
-        .map(|n| {
-            n.min(1024)
+        ];
+        let counts: [u32; 4] = std::array::from_fn(|kind| {
+            limits[kind]
+                .min(CAPACITY[kind])
                 .min(indexing.max_per_stage_update_after_bind_resources / 4)
         });
         let kinds = [
@@ -495,7 +501,17 @@ impl Bindings {
                 } else {
                     vk::ImageLayout::GENERAL
                 };
-                let index = if sampled { core.sampled } else { core.storage };
+                let index = if sampled {
+                    match core.sampled_index() {
+                        Ok(index) => index,
+                        Err(error) => {
+                            encoder.error = Some(error);
+                            return;
+                        }
+                    }
+                } else {
+                    core.storage.unwrap_or(0)
+                };
                 (
                     if sampled { 1 } else { 3 },
                     Bound {
@@ -503,7 +519,7 @@ impl Bindings {
                         offset: 0,
                         size: 0,
                         layout: layout.as_raw(),
-                        index: index.unwrap_or(0),
+                        index,
                     },
                 )
             }

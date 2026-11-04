@@ -391,6 +391,19 @@ impl Gpu {
             depth: None,
         })
     }
+    /// A sampled texture's levels in `texel`, which no draw renders into.
+    pub fn texture_levels(
+        &self,
+        width: u32,
+        height: u32,
+        levels: u32,
+        texel: TexelFormat,
+    ) -> Result<Target, Error> {
+        Ok(Target {
+            image: self.texture(width, height, levels, texel)?,
+            depth: None,
+        })
+    }
     pub fn depth(&self, width: u32, height: u32, format: DepthFormat) -> Result<Depth, Error> {
         self.attachment_dimensions(width, height)?;
         Ok(Depth(std::sync::Arc::new(
