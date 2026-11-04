@@ -1579,10 +1579,13 @@ impl<P: Presenter> Surfaces<P> {
             h: frame.height,
         });
         frame.video = self.video_layers.clone();
-        self.software_source = None;
-
+        // The native display keeps showing the software base beneath the
+        // layers; later samples publish over it again.
+        #[cfg(not(feature = "gpu"))]
+        {
+            self.software_source = None;
+        }
         self.stats.presentations = serial;
-        self.software_source = None;
         if let Some((mailbox, wake)) = &mut self.frame_mailbox {
             let overwritten = mailbox.publish(|slot| *slot = frame.clone());
             self.stats.coalesced_frames += u64::from(overwritten);

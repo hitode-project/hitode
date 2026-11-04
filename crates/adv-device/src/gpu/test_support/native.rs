@@ -216,10 +216,11 @@ mod tests {
                 .to_vec(),
         )
         .unwrap();
-        let video = (0..1_000_000)
+        let mut samples = (0..1_000_000)
             .step_by(40_000)
-            .find_map(|time| decoder.frame_at(time).unwrap().video)
-            .unwrap();
+            .filter_map(|time| decoder.frame_at(time).unwrap().video);
+        let video = samples.next().unwrap();
+        let next = samples.next().unwrap();
         let source = Rect {
             x: 0,
             y: 0,
@@ -260,7 +261,20 @@ mod tests {
             visible: true,
             hide_cursor: false,
         };
-        store.set_video_layer(7, Some(layer), &memory).unwrap();
+        store
+            .set_video_layer(7, Some(layer.clone()), &memory)
+            .unwrap();
+        // The next movie sample publishes over the same software base.
+        store
+            .set_video_layer(
+                7,
+                Some(crate::surface::VideoLayer {
+                    frame: next.into_surface(),
+                    ..layer
+                }),
+                &memory,
+            )
+            .unwrap();
         let execution = super::super::EXECUTION
             .with(|cached| cached.borrow().upgrade())
             .unwrap();
@@ -269,5 +283,6 @@ mod tests {
         // The movie frame is shown over the unchanged base.
         assert_eq!(frames.get(1).video, [7]);
         assert_eq!(frames.get(1).pixels.frames, 2);
+        assert_eq!(frames.get(2).video, [7]);
     }
 }
