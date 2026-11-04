@@ -22,7 +22,16 @@ unsafe extern "system" fn debug_message(
 impl Device {
     pub(crate) fn open(options: &DeviceOptions) -> Result<(crate::Device, crate::Queue)> {
         // SAFETY: All creation structures and extension names live through their calls.
-        unsafe { Self::open_vk(options, None) }
+        let (device, mut queue) = unsafe { Self::open_vk(options, None) }?;
+        if clears_pack_4444(&device, &mut queue)? {
+            return Ok((device, queue));
+        }
+        drop((device, queue));
+        let options = DeviceOptions {
+            disable: options.disable | Modern::DYNAMIC_RENDERING,
+            ..options.clone()
+        };
+        unsafe { Self::open_vk(&options, None) }
     }
     #[cfg(test)]
     pub(super) fn open_with_push_limit(
@@ -874,4 +883,84 @@ unsafe fn query_tile(instance: &ash::Instance, device: &ash::Device) -> Result<(
         result.result().map_err(vk_error)?;
         Ok((properties.tile_size.width, properties.tile_size.height))
     }
+}
+
+/// Whether dynamic rendering clears a 4444 target to the documented bits.
+/// Mali-G715 drivers (r44) pack the clear color as 565 there; render passes
+/// pack it right, so such a device opens without dynamic rendering. One 1x1
+/// clear and readback at open.
+fn clears_pack_4444(device: &crate::Device, queue: &mut crate::Queue) -> Result<bool> {
+    use crate::encode::{BufferCopy, ColorAttachment, ImageCopy, Load, RenderPassDesc, Store};
+    use crate::resource::{BufferDesc, BufferUsage, Dimension, ImageDesc, Memory, Usage};
+    let caps = device.caps();
+    if !caps.modern.contains(Modern::DYNAMIC_RENDERING)
+        || !caps.format(Format::Bgra4Unorm).contains(FormatCaps::COLOR)
+    {
+        return Ok(true);
+    }
+    let size = crate::Extent {
+        width: 1,
+        height: 1,
+        depth_or_layers: 1,
+    };
+    let image = device.create_image(&ImageDesc {
+        dimension: Dimension::D2,
+        size,
+        format: Format::Bgra4Unorm,
+        mips: 1,
+        samples: 1,
+        usage: Usage::COLOR | Usage::COPY_SRC,
+        view_formats: &[],
+        label: "4444 clear check",
+    })?;
+    let readback = device.create_buffer(&BufferDesc {
+        size: 4,
+        usage: BufferUsage::COPY_DST,
+        memory: Memory::Readback,
+        label: "4444 clear check",
+    })?;
+    let mut encoder = queue.encoder("4444 clear check");
+    drop(
+        encoder.render_pass(&RenderPassDesc {
+            colors: [ColorAttachment {
+                view: image.view(),
+                load: Load::Clear([1.0, 0.0, 0.0, 1.0]),
+                store: Store::Store,
+                resolve: None,
+            }]
+            .into_iter()
+            .collect(),
+            depth_stencil: None,
+            area: crate::Rect {
+                x: 0,
+                y: 0,
+                w: 1,
+                h: 1,
+            },
+            timestamps: None,
+            label: "4444 clear check",
+        }),
+    );
+    encoder.copy_image_to_buffer(
+        ImageCopy {
+            image: &image,
+            mip: 0,
+            layer: 0,
+            origin: (0, 0, 0),
+        },
+        BufferCopy {
+            buffer: &readback,
+            offset: 0,
+            row_pitch: 0,
+            rows: 0,
+        },
+        size,
+    );
+    let token = queue.submit(encoder)?;
+    if !queue.wait(token, std::time::Duration::from_secs(5))? {
+        return Err(Error::DeviceLost("4444 clear check timed out".into()));
+    }
+    // SAFETY: the submission that wrote the buffer has completed.
+    let texel = unsafe { &readback.mapped().unwrap().as_ref()[..2] };
+    Ok(texel == [0x00, 0xff])
 }
