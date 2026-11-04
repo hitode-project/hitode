@@ -281,6 +281,8 @@ pub struct Stats {
     pub last_flush_buffer_writes: u64,
     pub bind_group_creations: u64,
     pub pipeline_cache_hits: u64,
+    /// Draws using a pipeline first compiled by a creation-time prediction.
+    pub anticipated_pipeline_draws: u64,
     pub compile_waits: u64,
     pub compile_wait_ns: u64,
     pub prebuild_hits: u64,

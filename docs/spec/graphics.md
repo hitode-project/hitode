@@ -363,7 +363,7 @@ snapshot storage; an unchanged Apply performs no state writes. Redundant fixed-s
 
 **Rule**: Shader translation and module preparation MUST start at resource creation on a separately bounded, lower-priority worker. Demand MUST take queued work or join its existing compilation, preserving identical source and results. The worker MUST retain at most 64 queued jobs and 32 MiB, leaving work demand-driven if priority reduction fails.
 On Apple hosts, foreground waits MUST temporarily donate priority to the compiler and release that donation after the final waiter resumes.
-Binding changes MUST NOT start speculative module preparation for transient shader pairs. Shader and declaration creation retain their preparation jobs; actual draws and persisted pipeline recipes supply complete combinations.
+Binding changes MUST NOT start speculative preparation for transient shader pairs. Shader and declaration creation MUST anticipate driver pipelines from bound draw state, sharing recipe jobs with demand. Anticipated recipes MUST retain at most 16 jobs and 32 MiB, be evicted before demanded pipelines, and persist only after demand.
 **Verification**: Test — queue takeover, running-work joins and priority-donation lifetime; platform priority selection also requires review.
 
 ## Numerical comparisons
@@ -424,5 +424,5 @@ Withdrawn: GFX-CACHE-6, GFX-NUM-2, GFX-NUM-3, GFX-NUM-4, GFX-NUM-5
 
 ### GFX-CACHE-10 Prebuilding and counters
 
-**Rule**: Prebuilding MUST share one result with demand and yield at pipeline boundaries during foreground compilation. Reports MUST count foreground waits and nanoseconds, prebuild hits and misses, persisted recipes and discarded archives.
+**Rule**: Prebuilding MUST share one result with demand and yield at pipeline boundaries during foreground compilation. Reports MUST count foreground waits and nanoseconds, anticipated pipeline draws, prebuild hits and misses, persisted recipes and discarded archives.
 **Verification**: Test — shared prebuild/demand results and warm restart; report assembly also requires review.

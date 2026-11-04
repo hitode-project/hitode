@@ -1,7 +1,8 @@
 //! Package C1: pipelines for fixed-function draws, programmable draws and
 //! blits, their pipeline keys, and the disk cache
 //! (GFX-CACHE-7, GFX-CACHE-8, GFX-CACHE-10) over `Device::pipeline_identity`.
-//! Lookups run on the execution thread; record.rs asks for a pipeline per draw.
+//! Draws and creation-time predictions share recipe jobs across execution and
+//! compile threads.
 
 use super::super::{DrawState, Error, ProgrammableDraw};
 use super::Gpu;
@@ -37,7 +38,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 const MAX_PIPELINES: usize = 512;
 const ARCHIVE_LIMIT: usize = 8 << 20;
@@ -138,10 +139,10 @@ struct Key {
 
 #[derive(Default)]
 pub(super) struct Pipelines {
-    compiler: Compiler,
-    entries: HashMap<Key, RenderPipeline>,
+    entries: HashMap<Key, (RenderPipeline, [u8; 32], bool)>,
     order: VecDeque<Key>,
-    jobs: HashMap<[u8; 32], Compile<Result<Built, Error>>>,
+    jobs: Arc<Mutex<HashMap<[u8; 32], PipelineJob>>>,
+    anticipated: u64,
     cache_hits: u64,
     batch: Option<Compile<()>>,
     cache: Option<Arc<p::PipelineCache>>,
@@ -154,14 +155,77 @@ pub(super) struct Pipelines {
     persisted: u64,
 }
 
-/// A sendable shader-preparation endpoint for the front end's compile jobs.
-/// Complete vertex layouts arrive with draws; their pipelines are prepared by
-/// the recipe prebuilds and shared with demand.
-#[derive(Clone, Default)]
-pub struct Compiler;
+// Task, unclaimed speculative recipe bytes, and creation-time origin.
+type PipelineJob = (Compile<Result<Built, Error>>, Option<usize>, bool);
+
+/// Creation-time pipeline state and the same job table used by draws.
+#[derive(Clone)]
+pub struct Compiler {
+    device: Device,
+    jobs: Arc<Mutex<HashMap<[u8; 32], PipelineJob>>>,
+    counters: CompileCounters,
+    recipe: Option<Recipe>,
+    sampling: [Option<u8>; 20],
+}
 impl Compiler {
-    pub fn prepare_program(&self, program: Program) -> Result<Program, Error> {
+    pub fn prepare_program(
+        &self,
+        program: Program,
+        slots: &[(bool, u8)],
+    ) -> Result<Program, Error> {
         gpu::validate_program(&program)?;
+        let Some(mut recipe) = self.recipe.clone() else {
+            return Ok(program);
+        };
+        let Kind::Program {
+            source,
+            textures,
+            modes,
+            ..
+        } = &mut recipe.kind
+        else {
+            unreachable!()
+        };
+        *source = program.source.clone();
+        *textures = program.textures.clone();
+        let Some(sampling) = slots
+            .iter()
+            .map(|&(vertex, slot)| self.sampling[usize::from(slot) + if vertex { 16 } else { 0 }])
+            .collect::<Option<Vec<_>>>()
+        else {
+            return Ok(program);
+        };
+        *modes = sampling;
+        let encoded = serde_json::to_vec(&recipe).unwrap();
+        let key = Sha256::digest(&encoded).into();
+        let mut jobs = self.jobs.lock().unwrap();
+        if !jobs.contains_key(&key) {
+            while jobs.values().filter(|(_, size, _)| size.is_some()).count() == 16
+                || jobs
+                    .values()
+                    .filter_map(|(_, size, _)| *size)
+                    .sum::<usize>()
+                    + encoded.len()
+                    > 32 * 1024 * 1024
+            {
+                let disposable = *jobs
+                    .iter()
+                    .find(|(_, (_, size, _))| size.is_some())
+                    .unwrap()
+                    .0;
+                jobs.remove(&disposable);
+            }
+            // Speculation does not write the persistent driver cache. Only
+            // recipes actually demanded by a draw reach the archive.
+            let task = job(
+                &self.device,
+                recipe,
+                None,
+                self.counters.clone(),
+                encoded.len(),
+            );
+            jobs.insert(key, (task, Some(encoded.len()), true));
+        }
         Ok(program)
     }
 }
@@ -184,8 +248,9 @@ impl Pipelines {
             streams: arrayvec::ArrayVec::new(),
             textures: arrayvec::ArrayVec::new(),
         };
-        if let Some(pipeline) = self.entries.get(&key) {
+        if let Some((pipeline, _, anticipated)) = self.entries.get(&key) {
             self.cache_hits += 1;
+            self.anticipated += u64::from(*anticipated);
             return Ok(pipeline.clone());
         }
         self.demand(
@@ -231,8 +296,9 @@ impl Pipelines {
                 .map(|(&vs, &mode)| (vs, mode))
                 .collect(),
         };
-        if let Some(pipeline) = self.entries.get(&key) {
+        if let Some((pipeline, _, anticipated)) = self.entries.get(&key) {
             self.cache_hits += 1;
+            self.anticipated += u64::from(*anticipated);
             return Ok(pipeline.clone());
         }
         gpu::validate_program(&draw.program)?;
@@ -272,8 +338,9 @@ impl Pipelines {
             streams: arrayvec::ArrayVec::new(),
             textures: arrayvec::ArrayVec::new(),
         };
-        if let Some(pipeline) = self.entries.get(&key) {
+        if let Some((pipeline, _, anticipated)) = self.entries.get(&key) {
             self.cache_hits += 1;
+            self.anticipated += u64::from(*anticipated);
             return Ok(pipeline.clone());
         }
         state.texture_op = gpu::TextureOp::Texture;
@@ -297,24 +364,39 @@ impl Pipelines {
     ) -> Result<RenderPipeline, Error> {
         let encoded = serde_json::to_vec(&recipe).unwrap();
         let recipe_key: [u8; 32] = Sha256::digest(&encoded).into();
-        let task = if let Some(job) = self.jobs.get(&recipe_key) {
-            self.hits += 1;
-            job.clone()
-        } else {
-            self.misses += 1;
-            job(
-                device,
-                recipe.clone(),
-                self.cache.clone(),
-                self.counters.clone(),
-            )
+        let (task, anticipated) = {
+            let mut jobs = self.jobs.lock().unwrap();
+            if let Some((task, size, anticipated)) = jobs.get_mut(&recipe_key) {
+                self.hits += 1;
+                size.take();
+                (task.clone(), *anticipated)
+            } else {
+                self.misses += 1;
+                let task = job(
+                    device,
+                    recipe.clone(),
+                    self.cache.clone(),
+                    self.counters.clone(),
+                    usize::MAX,
+                );
+                jobs.insert(recipe_key, (task.clone(), None, false));
+                (task, false)
+            }
         };
         let built = task.wait().clone().map_err(Error::Device)??;
         let pipeline = built.pipeline;
         if self.entries.len() == MAX_PIPELINES {
-            self.entries.remove(&self.order.pop_front().unwrap());
+            let (_, old_recipe, _) = self
+                .entries
+                .remove(&self.order.pop_front().unwrap())
+                .unwrap();
+            let mut jobs = self.jobs.lock().unwrap();
+            jobs.retain(|_, (_, size, _)| size.is_none());
+            jobs.remove(&old_recipe);
         }
-        self.entries.insert(key.clone(), pipeline.clone());
+        self.anticipated += u64::from(anticipated);
+        self.entries
+            .insert(key.clone(), (pipeline.clone(), recipe_key, anticipated));
         self.order.push_back(key);
         if let Some(store) = &mut self.store
             && store.remember(recipe, recipe_key, encoded.len(), built.identity)
@@ -351,7 +433,7 @@ impl Pipelines {
     }
     fn open(&mut self, device: &Device, directory: Option<&Path>) {
         self.flush();
-        self.jobs.clear();
+        self.jobs = Default::default();
         self.batch = None;
         self.cache = None;
         self.store = None;
@@ -378,19 +460,29 @@ impl Pipelines {
         let cache = Arc::new(p::PipelineCache::load(&driver));
         let bytes = serde_json::to_vec(&recipes).unwrap().len();
         for recipe in &recipes {
-            self.jobs.insert(
+            self.jobs.lock().unwrap().insert(
                 Sha256::digest(serde_json::to_vec(recipe).unwrap()).into(),
-                job(
-                    device,
-                    recipe.clone(),
-                    Some(cache.clone()),
-                    self.counters.clone(),
+                (
+                    job(
+                        device,
+                        recipe.clone(),
+                        Some(cache.clone()),
+                        self.counters.clone(),
+                        usize::MAX,
+                    ),
+                    None,
+                    false,
                 ),
             );
         }
         self.batch = Some(compile::prebuild(
             bytes,
-            self.jobs.values().cloned().collect(),
+            self.jobs
+                .lock()
+                .unwrap()
+                .values()
+                .map(|(job, _, _)| job.clone())
+                .collect(),
         ));
         self.cache = Some(cache);
         let encoded: Vec<_> = recipes
@@ -415,6 +507,7 @@ impl Pipelines {
         let (waits, ns) = self.counters.snapshot();
         gpu::Stats {
             pipeline_cache_hits: self.cache_hits,
+            anticipated_pipeline_draws: self.anticipated,
             compile_waits: waits,
             compile_wait_ns: ns,
             prebuild_hits: self.hits,
@@ -458,9 +551,10 @@ fn job(
     recipe: Recipe,
     cache: Option<Arc<p::PipelineCache>>,
     counters: CompileCounters,
+    bytes: usize,
 ) -> Compile<Result<Built, Error>> {
     let device = device.clone();
-    Compile::spawn(usize::MAX, counters, move || {
+    Compile::spawn(bytes, counters, move || {
         Ok(build(&device, &recipe, cache.as_deref()))
     })
 }
@@ -490,8 +584,45 @@ fn sampling_expression(flags: u8) -> &'static str {
 }
 
 impl Gpu {
-    pub fn compile_handle(&self) -> Compiler {
-        self.pipelines.compiler.clone()
+    pub fn compile_handle(
+        &self,
+        prediction: Option<(
+            &super::Target,
+            &DrawState,
+            &[Option<gpu::ProgramTexture>; 20],
+        )>,
+        streams: &[gpu::VertexStream],
+    ) -> Compiler {
+        let recipe = prediction.map(|(target, state, _)| {
+            let mut state = *state;
+            super::record::normalize(target, &mut state);
+            Recipe {
+                kind: Kind::Program {
+                    source: "".into(),
+                    textures: Vec::new(),
+                    modes: Vec::new(),
+                    streams: streams
+                        .iter()
+                        .map(|s| (s.stride, s.attributes.clone(), s.instance))
+                        .collect(),
+                },
+                raster: Raster::from(&state),
+                colors: vec![format_code(super::record::color_format(&target.image))],
+                depth: target
+                    .depth
+                    .as_ref()
+                    .map(|d| format_code(super::backing::depth_format(d.format()))),
+            }
+        });
+        Compiler {
+            device: self.device.clone(),
+            jobs: self.pipelines.jobs.clone(),
+            counters: self.pipelines.counters.clone(),
+            recipe,
+            sampling: prediction.map_or([None; 20], |(_, _, textures)| {
+                std::array::from_fn(|n| textures[n].as_ref().map(program_sampling_flags))
+            }),
+        }
     }
     pub fn set_pipeline_cache_directory(&mut self, directory: Option<&Path>) {
         self.pipelines.open(&self.device, directory);
@@ -1700,6 +1831,62 @@ struct V { @builtin(position) position:vec4<f32>, @location(0) uv:vec2<f32> }
         assert!(border.contains(guard));
     }
 
+    // spec: GFX-CACHE-7, GFX-CACHE-8, GFX-CACHE-10
+    #[test]
+    fn a_different_draw_compiles_only_its_recipe_and_does_not_archive_the_prediction() {
+        let Some((mut gpu, _queue, _consumer)) = open() else {
+            return;
+        };
+        let directory =
+            std::env::temp_dir().join(format!("adv-anticipated-cache-{}", std::process::id()));
+        gpu.set_pipeline_cache_directory(Some(&directory));
+        let target = gpu.target(1, 1, false).unwrap();
+        let mut draw = draw(AttributeFormat::Float4, vec![0; 48]);
+        let mut state = DrawState::new(1, 1);
+        let textures = std::array::from_fn(|_| {
+            Some(gpu::ProgramTexture {
+                image: None,
+                sampler: state.sampler,
+            })
+        });
+        let compiler = gpu.compile_handle(Some((&target, &state, &textures)), &draw.streams);
+        let program = draw.program.clone();
+        draw.program = std::thread::spawn(move || compiler.prepare_program(program, &[]).unwrap())
+            .join()
+            .unwrap();
+        let anticipated = gpu
+            .pipelines
+            .jobs
+            .lock()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap()
+            .0
+            .clone();
+        anticipated.resolve().as_ref().unwrap().as_ref().unwrap();
+        assert_eq!(gpu.pipelines.jobs.lock().unwrap().len(), 1);
+        assert!(gpu.pipelines.store.as_ref().unwrap().recipes.is_empty());
+        state.color_write = 1;
+        gpu.draw_programmable(&target, &draw, &state).unwrap();
+        assert_eq!(gpu.stats().anticipated_pipeline_draws, 0);
+        assert_eq!(gpu.stats().prebuild_misses, 1);
+        let jobs = gpu.pipelines.jobs.lock().unwrap();
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(
+            jobs.values().filter(|(_, size, _)| size.is_some()).count(),
+            1
+        );
+        drop(jobs);
+        gpu.flush_pipeline_cache();
+        let store = gpu.pipelines.store.as_ref().unwrap();
+        let (recipes, _) = load_archive(&store.path, &store.identity).unwrap();
+        assert_eq!(recipes.len(), 1);
+        assert_eq!(recipes[0].raster.color_write, 1);
+        gpu.set_pipeline_cache_directory(None);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     // spec: GFX-CACHE-7, GFX-CACHE-8, GFX-CACHE-9, GFX-CACHE-10
     #[test]
     fn archives_round_trip_share_demand_and_discard_corruption() {
@@ -1755,8 +1942,16 @@ struct V { @builtin(position) position:vec4<f32>, @location(0) uv:vec2<f32> }
         assert!(load_archive(&path, "another driver").is_none());
         let mut warmed = Pipelines::default();
         warmed.open(&gpu.device, Some(&directory));
-        assert_eq!(warmed.jobs.len(), 2);
-        let task = warmed.jobs.values().next().unwrap().clone();
+        assert_eq!(warmed.jobs.lock().unwrap().len(), 2);
+        let task = warmed
+            .jobs
+            .lock()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap()
+            .0
+            .clone();
         let background = task.clone();
         let worker = std::thread::spawn(move || {
             background.resolve().as_ref().unwrap().as_ref().unwrap();
@@ -1806,7 +2001,7 @@ struct V { @builtin(position) position:vec4<f32>, @location(0) uv:vec2<f32> }
         let mut rejected = Pipelines::default();
         rejected.open(&gpu.device, Some(&directory));
         assert_eq!(rejected.discarded, 1);
-        assert!(rejected.jobs.is_empty());
+        assert!(rejected.jobs.lock().unwrap().is_empty());
         rejected
             .fixed(
                 &gpu.device,

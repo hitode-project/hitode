@@ -1012,7 +1012,7 @@ fn same_depth(a: Option<&Depth>, b: Option<&Depth>) -> bool {
         _ => false,
     }
 }
-fn color_format(image: &Image) -> adv_gpu::Format {
+pub(super) fn color_format(image: &Image) -> adv_gpu::Format {
     match &image.storage {
         Storage::Fixed { image, .. } => image.desc().format,
         Storage::Swap(_) => backing::swap_format(),
@@ -1069,7 +1069,7 @@ fn validate_state(target: &Target, state: &DrawState) -> Result<(), Error> {
     }
     Ok(())
 }
-fn normalize(target: &Target, state: &mut DrawState) {
+pub(super) fn normalize(target: &Target, state: &mut DrawState) {
     if let Some(s) = &mut state.stencil {
         s.read_mask &= 255;
         s.write_mask &= 255;

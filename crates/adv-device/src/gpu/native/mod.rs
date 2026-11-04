@@ -2,8 +2,9 @@
 //!
 //! # Threads
 //!
-//! - The execution thread calls the facade. Resources and pipelines are
-//!   created synchronously on it (`adv_gpu::Device` is `Send + Sync`); data is
+//! - The execution thread calls the facade and creates resources. Pipelines
+//!   share one job table with the low-priority compiler (`adv_gpu::Device` is
+//!   `Send + Sync`); creation-time predictions compile before demand. Data is
 //!   written once, into the upload ring or pooled staging buffers, in the
 //!   resource's own format. Every GPU operation becomes a [`stream::Command`].
 //!   It never encodes, submits or
@@ -210,6 +211,7 @@ impl Gpu {
         let mut stats = self.stats;
         let cache = self.pipelines.stats();
         stats.pipeline_cache_hits += cache.pipeline_cache_hits;
+        stats.anticipated_pipeline_draws += cache.anticipated_pipeline_draws;
         stats.compile_waits += cache.compile_waits;
         stats.compile_wait_ns += cache.compile_wait_ns;
         stats.prebuild_hits += cache.prebuild_hits;
