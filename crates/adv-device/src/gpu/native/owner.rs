@@ -136,6 +136,8 @@ pub(super) fn run(
             super::stream::Next::Closed => break,
             super::stream::Next::Woken => {
                 state.close(pass::NextDepth::Keep)?;
+                // The closed run read consumed chunks; their spans join this submission.
+                state.recycle(state.cursor.0, &commands);
                 if state.encoder.is_some() {
                     state.submit(None)?;
                 }
@@ -242,7 +244,12 @@ impl State {
         let mut run = std::mem::take(&mut self.run);
         pass::plan_into(
             &run.ops,
-            self.target.as_ref().unwrap().depth.is_some(),
+            self.target
+                .as_ref()
+                .unwrap()
+                .depth
+                .as_ref()
+                .map(|depth| depth.format().has_stencil()),
             next,
             &mut run.passes,
         );

@@ -63,21 +63,22 @@ pub(crate) struct Pass {
 }
 
 /// Split a run of operations on the same attachments into passes and choose
-/// their areas, loads and stores. `has_depth` says whether a depth-stencil
-/// attachment is bound; `next` is its next use after the run.
+/// their areas, loads and stores. `depth` is `Some(has_stencil)` when a depth
+/// attachment is bound, and with it whether its format has stencil; `next`
+/// is its next use after the run.
 ///
 /// A clear opens a new pass, and becomes the pass's load when it covers the
 /// pass area; a clear smaller than the operations after it stays a pass of
 /// its own, because loads act on the whole render area.
 #[cfg(test)]
-pub(crate) fn plan(ops: &[Op], has_depth: bool, next: NextDepth) -> Vec<Pass> {
+pub(crate) fn plan(ops: &[Op], depth: Option<bool>, next: NextDepth) -> Vec<Pass> {
     let mut passes = Vec::new();
-    plan_into(ops, has_depth, next, &mut passes);
+    plan_into(ops, depth, next, &mut passes);
     passes
 }
 
 /// Reuse the owner's planning storage across runs.
-pub(super) fn plan_into(ops: &[Op], has_depth: bool, next: NextDepth, passes: &mut Vec<Pass>) {
+pub(super) fn plan_into(ops: &[Op], depth: Option<bool>, next: NextDepth, passes: &mut Vec<Pass>) {
     passes.clear();
     let mut start = 0;
     while start < ops.len() {
@@ -96,8 +97,8 @@ pub(super) fn plan_into(ops: &[Op], has_depth: bool, next: NextDepth, passes: &m
         passes.push(pass(ops, start..end));
         start = end;
     }
-    if has_depth {
-        settle_depth(ops, passes, next);
+    if let Some(has_stencil) = depth {
+        settle_depth(ops, passes, next, has_stencil);
     } else {
         for pass in passes {
             pass.depth = (Load::None, Store::None);
@@ -169,7 +170,7 @@ fn pass(ops: &[Op], range: std::ops::Range<usize>) -> Pass {
 
 /// A store is needed only when a later pass loads what this one wrote: walk
 /// backwards, tracking whether the depth contents are read again.
-fn settle_depth(ops: &[Op], passes: &mut [Pass], next: NextDepth) {
+fn settle_depth(ops: &[Op], passes: &mut [Pass], next: NextDepth, has_stencil: bool) {
     let mut needed = match next {
         NextDepth::Keep => None,
         NextDepth::Cleared(rect) => Some(rect),
@@ -193,11 +194,12 @@ fn settle_depth(ops: &[Op], passes: &mut [Pass], next: NextDepth) {
         }
         let first = ops[pass.ops.start];
         needed = match first.kind {
+            // A clear rewrites the attachment when it covers every aspect.
             OpKind::Clear {
                 depth: Some(_),
-                stencil: Some(_),
+                stencil,
                 ..
-            } => Some(pass.area),
+            } if stencil.is_some() || !has_stencil => Some(pass.area),
             _ if pass.depth.0 == Load::None => needed,
             _ => None,
         };
@@ -274,7 +276,7 @@ mod tests {
     fn small_damage_loads_and_stores_only_its_area() {
         let passes = plan(
             &[sprite(rect(10, 10, 20, 20), false)],
-            false,
+            None,
             NextDepth::Keep,
         );
         assert_eq!(passes.len(), 1);
@@ -289,13 +291,13 @@ mod tests {
             sprite(rect(0, 0, 64, 64), true),
             sprite(rect(8, 8, 8, 8), false),
         ];
-        let passes = plan(&ops, false, NextDepth::Keep);
+        let passes = plan(&ops, None, NextDepth::Keep);
         assert_eq!(passes[0].color.0, Load::DontCare);
         let ops = [
             sprite(rect(0, 0, 8, 8), true),
             sprite(rect(8, 8, 8, 8), false),
         ];
-        assert_eq!(plan(&ops, false, NextDepth::Keep)[0].color.0, Load::Load);
+        assert_eq!(plan(&ops, None, NextDepth::Keep)[0].color.0, Load::Load);
     }
 
     #[test]
@@ -304,7 +306,7 @@ mod tests {
             clear(rect(0, 0, 64, 64), true, true),
             mesh(rect(4, 4, 8, 8)),
         ];
-        let passes = plan(&ops, true, NextDepth::Keep);
+        let passes = plan(&ops, Some(true), NextDepth::Keep);
         assert_eq!(passes.len(), 1);
         assert_eq!(passes[0].area, rect(0, 0, 64, 64));
         assert_eq!(passes[0].color.0, Load::Clear([0.0; 4]));
@@ -317,7 +319,7 @@ mod tests {
             clear(rect(0, 0, 8, 8), true, false),
             sprite(rect(0, 0, 64, 64), false),
         ];
-        let passes = plan(&ops, false, NextDepth::Keep);
+        let passes = plan(&ops, None, NextDepth::Keep);
         assert_eq!(passes.len(), 2);
         assert_eq!(passes[0].area, rect(0, 0, 8, 8));
         assert_eq!(passes[1].color.0, Load::Load);
@@ -330,12 +332,40 @@ mod tests {
             mesh(rect(0, 0, 64, 64)),
         ];
         let next = NextDepth::Cleared(rect(0, 0, 64, 64));
-        assert_eq!(plan(&ops, true, next)[0].depth.1, Store::DontCare);
+        assert_eq!(plan(&ops, Some(true), next)[0].depth.1, Store::DontCare);
         assert_eq!(
-            plan(&ops, true, NextDepth::Discarded)[0].stencil.1,
+            plan(&ops, Some(true), NextDepth::Discarded)[0].stencil.1,
             Store::DontCare
         );
-        assert_eq!(plan(&ops, true, NextDepth::Keep)[0].depth.1, Store::Store);
+        assert_eq!(
+            plan(&ops, Some(true), NextDepth::Keep)[0].depth.1,
+            Store::Store
+        );
+    }
+
+    #[test]
+    fn a_later_depth_clear_without_stencil_ends_the_store_of_a_depth_only_format() {
+        let depth_only_clear = Op {
+            area: rect(0, 0, 64, 64),
+            kind: OpKind::Clear {
+                color: None,
+                depth: Some(1.0),
+                stencil: None,
+            },
+        };
+        let ops = [
+            mesh(rect(0, 0, 64, 64)),
+            depth_only_clear,
+            mesh(rect(0, 0, 64, 64)),
+        ];
+        assert_eq!(
+            plan(&ops, Some(false), NextDepth::Keep)[0].depth.1,
+            Store::DontCare
+        );
+        assert_eq!(
+            plan(&ops, Some(true), NextDepth::Keep)[0].depth.1,
+            Store::Store
+        );
     }
 
     #[test]
@@ -345,7 +375,7 @@ mod tests {
             clear(rect(0, 0, 64, 64), false, true),
             mesh(rect(0, 0, 64, 64)),
         ];
-        let passes = plan(&ops, true, NextDepth::Keep);
+        let passes = plan(&ops, Some(true), NextDepth::Keep);
         assert_eq!(passes.len(), 2);
         assert_eq!(passes[0].depth.1, Store::DontCare);
         assert_eq!(passes[1].depth.1, Store::Store);
@@ -353,7 +383,11 @@ mod tests {
 
     #[test]
     fn untouched_attachments_pay_nothing() {
-        let passes = plan(&[sprite(rect(0, 0, 8, 8), false)], true, NextDepth::Keep);
+        let passes = plan(
+            &[sprite(rect(0, 0, 8, 8), false)],
+            Some(true),
+            NextDepth::Keep,
+        );
         assert_eq!(passes[0].depth, (Load::None, Store::None));
         let depth_only = Op {
             area: rect(0, 0, 8, 8),
@@ -365,7 +399,7 @@ mod tests {
             },
         };
         assert_eq!(
-            plan(&[depth_only], true, NextDepth::Keep)[0].color,
+            plan(&[depth_only], Some(true), NextDepth::Keep)[0].color,
             (Load::None, Store::None)
         );
     }

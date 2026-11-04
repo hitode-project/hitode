@@ -390,9 +390,8 @@ impl Pipelines {
                 .entries
                 .remove(&self.order.pop_front().unwrap())
                 .unwrap();
-            let mut jobs = self.jobs.lock().unwrap();
-            jobs.retain(|_, (_, size, _)| size.is_none());
-            jobs.remove(&old_recipe);
+            // Speculative jobs keep their own budget in `prepare_program`.
+            self.jobs.lock().unwrap().remove(&old_recipe);
         }
         self.anticipated += u64::from(anticipated);
         self.entries
@@ -733,7 +732,7 @@ fn valid_recipe(recipe: &Recipe) -> bool {
                 }) && textures.iter().filter(|&&vs| vs).count() <= 4
                     && textures.iter().filter(|&&vs| !vs).count() <= 16
                     && modes.len() == textures.len()
-                    && modes.iter().all(|&m| m <= 3)
+                    && modes.iter().all(|&m| m <= 3 | BORDER_SAMPLING)
                     && streams.len() <= 16
                     && streams.iter().map(|s| s.1.len()).sum::<usize>() <= 16
                     && streams.iter().all(|(stride, attrs, _)| {
@@ -1979,6 +1978,14 @@ struct V { @builtin(position) position:vec4<f32>, @location(0) uv:vec2<f32> }
             .iter_mut()
             .find(|r| matches!(r.kind, Kind::Program { .. }))
             .unwrap();
+        let mut bordered = program.clone();
+        if let Kind::Program { modes, .. } = &mut bordered.kind {
+            modes.fill(3 | BORDER_SAMPLING);
+        }
+        assert!(
+            valid_recipe(&bordered),
+            "border sampling survives the archive"
+        );
         let Kind::Program { source, .. } = &mut program.kind else {
             unreachable!()
         };
