@@ -368,13 +368,7 @@ impl Presenter {
     fn update(&mut self, queue: &mut Queue) -> Result<(), String> {
         let (settings, window) = {
             let mut m = self.shared.settings.lock().unwrap();
-            let settings = if std::mem::take(&mut m.dirty) {
-                let mut s = m.settings.clone();
-                s.upscaler = Upscaler::Off;
-                Some(s)
-            } else {
-                None
-            };
+            let settings = std::mem::take(&mut m.dirty).then(|| m.settings.clone());
             (settings, m.window.take())
         };
         if let Some(window) = window {

@@ -91,7 +91,6 @@ pub fn encode(
     let (prescale, linear) = match scale {
         Scale::Integer { x, y } => ((x, y), 0u32),
         Scale::SharpBilinear { prescale } => (prescale, 1),
-        Scale::Model => unreachable!("model output belongs to the upscaler"),
     };
     let d = transform.dst;
     let mut constants = ring.reserve(64, 256)?;

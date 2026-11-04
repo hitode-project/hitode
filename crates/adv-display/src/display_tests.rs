@@ -958,3 +958,138 @@ fn held_frames_reuse_intermediate_targets_without_reserving_their_slots() {
     assert_eq!(record.plan.targets.len(), 2);
     crate::recorder::replay(&crate::recorder::parse(&display.recorder().dump()).unwrap()).unwrap();
 }
+
+fn read(d: &Device, q: &mut Queue, image: &Image) -> Vec<u8> {
+    let size = image.desc().size;
+    let buffer = d
+        .create_buffer(&BufferDesc {
+            size: u64::from(size.width * size.height * 4),
+            usage: BufferUsage::COPY_DST,
+            memory: Memory::Readback,
+            label: "shown readback",
+        })
+        .unwrap();
+    let mut encoder = q.encoder("shown readback");
+    encoder.copy_image_to_buffer(
+        encode::ImageCopy {
+            image,
+            mip: 0,
+            layer: 0,
+            origin: (0, 0, 0),
+        },
+        encode::BufferCopy {
+            buffer: &buffer,
+            offset: 0,
+            row_pitch: 0,
+            rows: 0,
+        },
+        size,
+    );
+    let token = q.submit(encoder).unwrap();
+    assert!(q.wait(token, std::time::Duration::from_secs(10)).unwrap());
+    // SAFETY: the copy completed.
+    unsafe { buffer.mapped().unwrap().as_ref() }.to_vec()
+}
+
+// spec: HOST-VIEW-10
+#[test]
+fn upscaled_partial_frames_match_a_whole_run_across_buffer_ages() {
+    let (d, mut q) = Device::open(&queue::DeviceOptions {
+        validation: !cfg!(target_os = "android"),
+        disable: adv_gpu::Modern::from_test_env(),
+        ..Default::default()
+    })
+    .unwrap();
+    let upscaled = Settings {
+        view: (128, 96),
+        upscaler: Upscaler::Anime4k,
+        ..settings()
+    };
+    let history = Arc::default();
+    let mut display = Display::new(d.clone(), compositor(&history), upscaled.clone()).unwrap();
+    let image = d
+        .create_image(&ImageDesc {
+            dimension: Dimension::D2,
+            size: Extent {
+                width: 64,
+                height: 48,
+                depth_or_layers: 1,
+            },
+            format: Format::Bgra8Unorm,
+            mips: 1,
+            samples: 1,
+            usage: Usage::SAMPLED | Usage::COPY_DST,
+            view_formats: &[],
+            label: "changing source",
+        })
+        .unwrap();
+    let upload = |q: &mut Queue, pixels: &[u8]| {
+        let buffer = d
+            .create_buffer(&BufferDesc {
+                size: pixels.len() as u64,
+                usage: BufferUsage::COPY_SRC,
+                memory: Memory::Upload,
+                label: "source upload",
+            })
+            .unwrap();
+        // SAFETY: the buffer is new.
+        unsafe { buffer.mapped().unwrap().as_mut() }.copy_from_slice(pixels);
+        let mut encoder = q.encoder("source upload");
+        encoder.copy_buffer_to_image(
+            encode::BufferCopy {
+                buffer: &buffer,
+                offset: 0,
+                row_pitch: 0,
+                rows: 0,
+            },
+            encode::ImageCopy {
+                image: &image,
+                mip: 0,
+                layer: 0,
+                origin: (0, 0, 0),
+            },
+            image.desc().size,
+        );
+        q.submit(encoder).unwrap();
+    };
+    let mut pixels: Vec<u8> = (0..64 * 48 * 4).map(|i| (i * 7 % 251) as u8).collect();
+    let rect = |x, y, w, h| Rect { x, y, w, h };
+    // Changes at edges and apart, each frame into the older of two buffers.
+    let changes = [
+        None,
+        Some(rect(5, 7, 3, 2)),
+        Some(rect(40, 30, 6, 6)),
+        Some(rect(0, 0, 1, 1)),
+        Some(rect(60, 44, 4, 4)),
+    ];
+    for (serial, change) in changes.into_iter().enumerate() {
+        let damage = match change {
+            None => Damage::Whole,
+            Some(r) => {
+                for y in r.y..r.y + r.h {
+                    for x in r.x..r.x + r.w {
+                        let at = ((y * 64 + x) * 4) as usize;
+                        pixels[at..at + 3].copy_from_slice(&[255, serial as u8 * 60, 0]);
+                    }
+                }
+                Damage::rects([r])
+            }
+        };
+        upload(&mut q, &pixels);
+        display
+            .present(&mut q, frame(serial as u64 + 1, &image, damage))
+            .unwrap();
+    }
+    let latest = display.recorder().latest().unwrap();
+    let Stage::Upscale { tiles, .. } = &latest.plan.stages[0] else {
+        panic!("upscaled frame")
+    };
+    assert_eq!(tiles.rects, [rect(48, 32, 16, 16)]);
+    let partial = read(&d, &mut q, &display.shown_base());
+    let mut whole = Display::new(d.clone(), compositor(&history), upscaled).unwrap();
+    whole
+        .present(&mut q, frame(1, &image, Damage::Whole))
+        .unwrap();
+    assert_eq!(whole.shown_base().desc().size.width, 128);
+    assert!(partial == read(&d, &mut q, &whole.shown_base()));
+}

@@ -126,7 +126,7 @@ Nearest sampling at integer scales and an integer nearest prescale followed by b
 **Rule**: When a frame's damage since the last upscaled frame is known, the upscaler MUST recompute only pixels that damage reaches, matching a whole-frame run. Each pass MUST read only values computed in the same run or left valid by earlier runs. Rebuilds, composed video and unknown damage MUST run on the whole frame.
 **Verification**: Test
 
-Every layer is a 3×3 convolution, so a change reaches at most one input pixel per layer plus one for the final bilinear sample. Fused passes retain the sum of their layer radii. Intermediate textures are shared between tensors, so the last pass covers the full reach. Each earlier pass covers the next pass’s workgroup-rounded area plus its radius.
+A 3×3 convolution reaches one input pixel and a pointwise pass none. Reach follows the tensors each pass reads, so passes of one layer count once; the final layer's bilinear sample of the input reaches one pixel beside that chain. Fused passes retain the sum of their layer radii. Intermediate textures are shared between tensors, so the last pass covers the full reach. Each earlier pass covers what later readers of its tensors need, workgroup-rounded, plus its radius. The model's input and doubled output are private and stay complete; the output pass fills what each presentable buffer lacks from the doubled image.
 
 | Frame source | Damage since the last upscaled frame |
 |---|---|

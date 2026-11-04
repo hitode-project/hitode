@@ -4,7 +4,7 @@ use crate::{
     compositor::*,
     plan::*,
     recorder::{self, PlanKind, PresentRecord, StageStats, Statistics, Totals},
-    stages::{ingest, output, video},
+    stages::{ingest, output, upscale, video},
 };
 use adv_gpu::{
     Device, Format, Image, ImageView, PresentImage, PresentPool, Queue, RenderPipeline, Ring,
@@ -138,6 +138,28 @@ struct Pipelines {
     software_video: RenderPipeline,
     sampler: Sampler,
 }
+impl Pipelines {
+    fn new(device: &Device, format: Format) -> adv_gpu::Result<Self> {
+        let (video, sampler) = video::resources(device, format)?;
+        Ok(Self {
+            software_video: video::software_resources(device, format)?.0,
+            ingest: ingest::pipeline(device, format)?,
+            output: output::pipeline(device, format, false)?,
+            software: output::pipeline(device, format, true)?,
+            video,
+            sampler,
+        })
+    }
+}
+/// The selected model at one canvas size and the doubled image it keeps
+/// complete, which the output pass reads.
+struct Upscaled {
+    choice: Upscaler,
+    upscaling: upscale::Upscaling,
+    output: Image,
+    /// Composition into the model's half-precision input.
+    pipelines: Pipelines,
+}
 pub struct Display {
     device: Device,
     compositor: Option<Box<dyn Compositor>>,
@@ -147,12 +169,13 @@ pub struct Display {
     screen: Vec<(u64, AcquiredImage)>,
     caps: CompositorCaps,
     settings: Settings,
-    cost: CostModel,
     pools: PoolState,
     allocations: HashMap<PoolId, PresentPool>,
     pool_ids: HashMap<usize, PoolId>,
     pipelines: Pipelines,
-    converted: HashMap<(usize, bool), Converted>,
+    /// Keyed by decoder pool, software base and target format.
+    converted: HashMap<(usize, bool, Format), Converted>,
+    upscaled: Option<Upscaled>,
     /// Each video's current decoder image while it is not attached.
     leases: HashMap<u64, PresentImage>,
     ring: Ring,
@@ -176,8 +199,6 @@ impl Display {
         compositor: Box<dyn Compositor>,
         settings: Settings,
     ) -> adv_gpu::Result<Self> {
-        let format = adv_gpu::present::COLOR_FORMAT;
-        let (video, sampler) = video::resources(&device, format)?;
         let queries = if device
             .caps()
             .features
@@ -188,31 +209,19 @@ impl Display {
             None
         };
         let ring = device.ring(4 << 20)?;
-        let (software_video, _) = video::software_resources(&device, format)?;
-        let pipelines = Pipelines {
-            software_video,
-            ingest: ingest::pipeline(&device, format)?,
-            output: output::pipeline(&device, format, false)?,
-            software: output::pipeline(&device, format, true)?,
-            video,
-            sampler,
-        };
+        let pipelines = Pipelines::new(&device, adv_gpu::present::COLOR_FORMAT)?;
         let mut this = Self {
             caps: compositor.caps(),
             compositor: Some(compositor),
             screen: vec![],
             device,
             settings,
-            cost: CostModel {
-                ns_per_megapixel: Default::default(),
-                thermal: Thermal::Nominal,
-                frame_budget_ns: 16_666_667,
-            },
             pools: Default::default(),
             allocations: HashMap::new(),
             pool_ids: HashMap::new(),
             pipelines,
             converted: HashMap::new(),
+            upscaled: None,
             leases: HashMap::new(),
             ring,
             spans: vec![],
@@ -254,6 +263,11 @@ impl Display {
     }
     pub fn ledger(&self) -> &PoolState {
         &self.pools
+    }
+    /// The base image the compositor shows last.
+    #[cfg(test)]
+    pub(crate) fn shown_base(&self) -> Image {
+        shown(&self.screen, LayerId::Base).unwrap().image().clone()
     }
     pub fn take_publication(&mut self) -> Option<Publication> {
         self.publication.take()
@@ -319,7 +333,7 @@ impl Display {
             cursor_regions: Default::default(),
         };
         matches!(
-            plan(&info, &self.settings, &self.caps, &self.cost, &self.pools).swap_role,
+            plan(&info, &self.settings, &self.caps, &self.pools).swap_role,
             SwapRole::Presentable { .. }
         )
     }
@@ -470,6 +484,8 @@ impl Display {
         } else {
             None
         };
+        // A redraw resamples the shown image; the next frame replaces it whole.
+        let redraw = source.is_some();
         let reading = self.held.take().and_then(|held| {
             frame.info.damage = frame.info.damage.union(&held.record.plan.damage);
             self.discard(held, source)
@@ -492,6 +508,7 @@ impl Display {
         } else {
             self.held = Some(pending);
         }
+        self.invalid |= redraw;
         Ok(token)
     }
     fn attach(&mut self, mut pending: Pending) -> Result<(), Error> {
@@ -624,25 +641,114 @@ impl Display {
         }
         Ok(())
     }
-    fn video_pipeline(&mut self, v: &Video, software: bool) -> adv_gpu::Result<()> {
+    fn video_pipeline(&mut self, v: &Video, software: bool, format: Format) -> adv_gpu::Result<()> {
         if v.planes.is_some() {
             return Ok(());
         }
         let pool = video_image(&self.leases, &self.screen, v.id).pool();
-        let key = (pool.id(), software);
+        let key = (pool.id(), software, format);
         if !self.converted.contains_key(&key) {
             let pipeline = if software {
-                video::converted_software_resources(
-                    &self.device,
-                    adv_gpu::present::COLOR_FORMAT,
-                    pool,
-                )?
+                video::converted_software_resources(&self.device, format, pool)?
             } else {
-                video::converted_resources(&self.device, adv_gpu::present::COLOR_FORMAT, pool)?
+                video::converted_resources(&self.device, format, pool)?
             };
             let pool = pool.weak();
             self.converted.insert(key, Converted { pool, pipeline });
         }
+        Ok(())
+    }
+    /// Draw the base and `videos` into `target` within `tiles`, decoding a
+    /// software base inline with the first video.
+    fn compose(
+        &mut self,
+        pass: &mut adv_gpu::RenderPass,
+        target: &Image,
+        base: &Base,
+        videos: &[Video],
+        tiles: &Tiles,
+    ) -> adv_gpu::Result<()> {
+        let size = target.desc().size;
+        let format = target.desc().format;
+        let software = matches!(base, Base::Software { .. });
+        if !software || videos.is_empty() {
+            let pipelines = match &self.upscaled {
+                Some(u) if format != adv_gpu::present::COLOR_FORMAT => &u.pipelines,
+                _ => &self.pipelines,
+            };
+            let pipeline = if software {
+                &pipelines.software
+            } else {
+                &pipelines.output
+            };
+            self.spans.extend(output::encode(
+                pass,
+                base.source(),
+                size,
+                Transform {
+                    rotation: Rotation::None,
+                    dst: Rect {
+                        x: 0,
+                        y: 0,
+                        w: size.width,
+                        h: size.height,
+                    },
+                },
+                Scale::Integer { x: 1, y: 1 },
+                tiles,
+                (pipeline, &mut self.ring),
+            )?);
+        }
+        for (i, v) in videos.iter().enumerate() {
+            let base = if software && i == 0 {
+                let output::Source::Software(base) = base.source() else {
+                    unreachable!()
+                };
+                Some(base)
+            } else {
+                None
+            };
+            self.draw_video(pass, target, base.as_ref(), v, tiles)?;
+        }
+        Ok(())
+    }
+    /// Keep the selected model at this canvas size. A new one starts with an
+    /// invalid ledger: the planner invalidates on upscaler changes, and a
+    /// new canvas size is a new pool.
+    fn upscale(&mut self, choice: Upscaler, canvas: (u32, u32)) -> adv_gpu::Result<()> {
+        if self
+            .upscaled
+            .as_ref()
+            .is_some_and(|u| u.choice == choice && u.upscaling.size() == canvas)
+        {
+            return Ok(());
+        }
+        let pipelines = match self.upscaled.take() {
+            Some(u) => u.pipelines,
+            None => Pipelines::new(&self.device, upscale::INPUT)?,
+        };
+        let model = upscale::model(&self.device, choice);
+        let upscaling = upscale::Upscaling::new(&self.device, model, canvas)?;
+        let output = self.device.create_image(&adv_gpu::resource::ImageDesc {
+            dimension: adv_gpu::resource::Dimension::D2,
+            size: adv_gpu::Extent {
+                width: canvas.0 * 2,
+                height: canvas.1 * 2,
+                depth_or_layers: 1,
+            },
+            format: upscale::OUTPUT,
+            mips: 1,
+            samples: 1,
+            usage: adv_gpu::resource::Usage::STORAGE | adv_gpu::resource::Usage::SAMPLED,
+            view_formats: &[],
+            label: "upscaled",
+        })?;
+        self.upscaled = Some(Upscaled {
+            choice,
+            upscaling,
+            output,
+            pipelines,
+        });
         Ok(())
     }
     fn draw_video(
@@ -653,6 +759,11 @@ impl Display {
         v: &Video,
         tiles: &Tiles,
     ) -> adv_gpu::Result<()> {
+        let format = target.desc().format;
+        let pipelines = match &self.upscaled {
+            Some(u) if format != adv_gpu::present::COLOR_FORMAT => &u.pipelines,
+            _ => &self.pipelines,
+        };
         let data = if let Some(planes) = &v.planes {
             if let Some(base) = base {
                 video::encode_software(
@@ -663,8 +774,8 @@ impl Display {
                     v.geometry,
                     tiles,
                     (
-                        &self.pipelines.software_video,
-                        &self.pipelines.sampler,
+                        &pipelines.software_video,
+                        &pipelines.sampler,
                         &mut self.ring,
                     ),
                 )?
@@ -675,16 +786,12 @@ impl Display {
                     planes,
                     v.geometry,
                     tiles,
-                    (
-                        &self.pipelines.video,
-                        &self.pipelines.sampler,
-                        &mut self.ring,
-                    ),
+                    (&pipelines.video, &pipelines.sampler, &mut self.ring),
                 )?
             }
         } else {
             let image = video_image(&self.leases, &self.screen, v.id);
-            let pipeline = &self.converted[&(image.pool().id(), base.is_some())].pipeline;
+            let pipeline = &self.converted[&(image.pool().id(), base.is_some(), format)].pipeline;
             if let Some(base) = base {
                 video::encode_converted_software(
                     pass,
@@ -728,7 +835,7 @@ impl Display {
                 .latest()
                 .map_or(info.canvas, |r| r.settings.view);
         }
-        let planned = plan(info, &settings, &self.caps, &self.cost, &self.pools);
+        let planned = plan(info, &settings, &self.caps, &self.pools);
         (settings, planned)
     }
     /// Acquire the planned target buffers, reallocating pools whose size changed.
@@ -738,7 +845,8 @@ impl Display {
         planned: &Plan,
     ) -> Result<[Option<PresentImage>; 3], Error> {
         let mut targets: [Option<PresentImage>; 3] = std::array::from_fn(|_| None);
-        for target in &planned.targets {
+        // The upscaler's pool is its own private images.
+        for target in planned.targets.iter().filter(|t| t.pool != UPSCALE) {
             let replace = self.allocations.get(&target.pool).is_none_or(|p| {
                 let d = p.description();
                 (d.width, d.height) != target.size
@@ -804,13 +912,21 @@ impl Display {
         let (settings, planned) = self.plan(&frame.info, reading);
         let mut targets = self.targets(queue, &planned)?;
         let retired = self.update_leases(&mut frame.video);
-        if planned
-            .stages
-            .iter()
-            .any(|s| matches!(s, Stage::Video { .. }))
-        {
+        for stage in &planned.stages {
+            let format = match stage {
+                Stage::Video { .. } => adv_gpu::present::COLOR_FORMAT,
+                Stage::Upscale { video, .. } => {
+                    self.upscale(settings.upscaler, frame.info.canvas)?;
+                    if !video {
+                        continue;
+                    }
+                    upscale::INPUT
+                }
+                _ => continue,
+            };
+            let software = matches!(frame.base, Base::Software { .. });
             for (i, v) in frame.video.iter().enumerate() {
-                self.video_pipeline(v, i == 0 && matches!(frame.base, Base::Software { .. }))?;
+                self.video_pipeline(v, i == 0 && software, format)?;
             }
         }
         let mut statistics = Statistics {
@@ -845,12 +961,16 @@ impl Display {
                 stage,
                 Stage::Ingest { .. }
                     | Stage::Video { .. }
+                    | Stage::Upscale { .. }
                     | Stage::Output {
                         from: Source::Base,
                         ..
                     }
             );
-            let destination = targets[into.0 as usize].as_ref().unwrap().image();
+            let destination = match stage {
+                Stage::Upscale { .. } => self.upscaled.as_ref().unwrap().upscaling.input().clone(),
+                _ => targets[into.0 as usize].as_ref().unwrap().image().clone(),
+            };
             let size = destination.desc().size;
             let (area, load) = ingest::coverage(tiles);
             let mut pass = encoder
@@ -893,6 +1013,9 @@ impl Display {
                 } => {
                     let source = match from {
                         Source::Base => frame.base.source(),
+                        Source::Pool(UPSCALE) => {
+                            output::Source::Image(self.upscaled.as_ref().unwrap().output.view())
+                        }
                         Source::Pool(p) => output::Source::Image(
                             targets[p.0 as usize].as_ref().unwrap().image().view(),
                         ),
@@ -914,46 +1037,23 @@ impl Display {
                     )?);
                 }
                 Stage::Video { .. } => {
-                    let software = matches!(frame.base, Base::Software { .. });
-                    if !software || frame.video.is_empty() {
-                        let pipeline = if software {
-                            &self.pipelines.software
-                        } else {
-                            &self.pipelines.output
-                        };
-                        self.spans.extend(output::encode(
-                            &mut pass,
-                            frame.base.source(),
-                            size,
-                            Transform {
-                                rotation: Rotation::None,
-                                dst: Rect {
-                                    x: 0,
-                                    y: 0,
-                                    w: size.width,
-                                    h: size.height,
-                                },
-                            },
-                            Scale::Integer { x: 1, y: 1 },
-                            tiles,
-                            (pipeline, &mut self.ring),
-                        )?);
-                    }
-                    for (i, v) in frame.video.iter().enumerate() {
-                        let base = if software && i == 0 {
-                            let output::Source::Software(base) = frame.base.source() else {
-                                unreachable!()
-                            };
-                            Some(base)
-                        } else {
-                            None
-                        };
-                        self.draw_video(&mut pass, destination, base.as_ref(), v, tiles)?;
-                    }
+                    self.compose(&mut pass, &destination, &frame.base, &frame.video, tiles)?
                 }
-                _ => unreachable!(),
+                Stage::Upscale { video, .. } => {
+                    let video = if *video { &frame.video[..] } else { &[] };
+                    self.compose(&mut pass, &destination, &frame.base, video, tiles)?
+                }
             }
             drop(pass);
+            if let Stage::Upscale { .. } = stage {
+                let u = self.upscaled.as_ref().unwrap();
+                u.upscaling.encode(
+                    encoder.as_mut().unwrap(),
+                    &mut self.ring,
+                    u.output.view(),
+                    Some(&tiles.rects),
+                )?;
+            }
             statistics.passes += 1;
             timed.push(index);
         }
@@ -1041,7 +1141,6 @@ impl Display {
                 frame: frame.info,
                 settings,
                 caps: self.caps.clone(),
-                cost: self.cost.clone(),
                 pools: self.pools.clone(),
                 stage_times: vec![Duration::ZERO; planned.stages.len()],
                 plan: planned,
@@ -1117,7 +1216,7 @@ impl Display {
             .map(Video::retained)
             .collect::<Vec<_>>();
         for v in &videos {
-            self.video_pipeline(v, false)?;
+            self.video_pipeline(v, false, adv_gpu::present::COLOR_FORMAT)?;
         }
         let size = adv_gpu::Extent {
             width: canvas.0,
@@ -1239,9 +1338,7 @@ fn stage_target(stage: &Stage) -> (PoolId, &Tiles) {
     match stage {
         Stage::Ingest { into, tiles }
         | Stage::Video { into, tiles, .. }
+        | Stage::Upscale { into, tiles, .. }
         | Stage::Output { into, tiles, .. } => (*into, tiles),
-        Stage::Upscale { .. } | Stage::Refine { .. } => {
-            unreachable!("upscaling is not wired into the executor")
-        }
     }
 }

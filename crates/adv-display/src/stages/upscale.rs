@@ -4,7 +4,10 @@
 pub mod models;
 mod table;
 
-pub use table::{Model, Pass, Role};
+pub use table::{Model, OUTPUT, Pass, Role};
+
+/// The format of the model's input, which composition writes.
+pub const INPUT: Format = Format::Rgba16Float;
 
 /// One precision of a precompiled upscale shader.
 struct Compiled {
@@ -199,7 +202,7 @@ impl Upscaling {
             })
         };
         let input = image(
-            Format::Rgba16Float,
+            INPUT,
             Usage::SAMPLED | Usage::COLOR | Usage::COPY_DST,
             "upscale input",
         )?;

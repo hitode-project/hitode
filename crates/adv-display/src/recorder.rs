@@ -2,7 +2,7 @@
 //! Replay uses each recorded input ledger, so the first mismatch identifies a
 //! planner decision rather than depending on a GPU or platform compositor.
 
-use crate::plan::{CompositorCaps, CostModel, FrameInfo, Plan, PoolState, Settings, plan};
+use crate::plan::{CompositorCaps, FrameInfo, Plan, PoolState, Settings, plan};
 use serde::{Deserialize, Serialize};
 use std::{collections::VecDeque, time::Duration};
 
@@ -67,7 +67,6 @@ pub struct PresentRecord {
     pub frame: FrameInfo,
     pub settings: Settings,
     pub caps: CompositorCaps,
-    pub cost: CostModel,
     pub pools: PoolState,
     pub plan: Plan,
     /// GPU time per stage, in plan order, once known.
@@ -182,13 +181,7 @@ pub struct ReplayMismatch {
 pub fn replay(events: &[Event]) -> Result<(), ReplayMismatch> {
     for (index, event) in events.iter().enumerate() {
         if let Event::Present(record) = event {
-            let replayed = plan(
-                &record.frame,
-                &record.settings,
-                &record.caps,
-                &record.cost,
-                &record.pools,
-            );
+            let replayed = plan(&record.frame, &record.settings, &record.caps, &record.pools);
             if replayed != record.plan {
                 return Err(ReplayMismatch {
                     record: index,

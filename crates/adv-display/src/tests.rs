@@ -38,21 +38,8 @@ fn caps() -> CompositorCaps {
         tile: (0, 0),
     }
 }
-fn cost() -> CostModel {
-    CostModel {
-        ns_per_megapixel: [
-            (Tier::Selected, 1_000_000.0),
-            (Tier::Small, 500_000.0),
-            (Tier::Spatial, 100_000.0),
-        ]
-        .into_iter()
-        .collect(),
-        thermal: Thermal::Nominal,
-        frame_budget_ns: 10_000_000,
-    }
-}
 fn run(f: &FrameInfo, s: &Settings, c: &CompositorCaps, p: &PoolState) -> Plan {
-    plan(f, s, c, &cost(), p)
+    plan(f, s, c, p)
 }
 fn warm(pool: u8, size: (u32, u32), age: Option<u32>) -> PoolState {
     PoolState {
@@ -64,13 +51,18 @@ fn warm(pool: u8, size: (u32, u32), age: Option<u32>) -> PoolState {
         ..Default::default()
     }
 }
+/// The ledger after one whole frame under these settings.
+fn warmed(s: &Settings, c: &CompositorCaps) -> PoolState {
+    let mut pools = PoolState::default();
+    pools.after_present(&run(&frame(), s, c, &pools));
+    pools
+}
 fn stage_tiles(stage: &Stage) -> Vec<&Tiles> {
     match stage {
         Stage::Ingest { tiles, .. }
         | Stage::Video { tiles, .. }
-        | Stage::Output { tiles, .. }
-        | Stage::Refine { tiles, .. } => vec![tiles],
-        Stage::Upscale { regions, .. } => regions.iter().map(|(tiles, _)| tiles).collect(),
+        | Stage::Upscale { tiles, .. }
+        | Stage::Output { tiles, .. } => vec![tiles],
     }
 }
 
@@ -268,7 +260,7 @@ fn bases_and_ingest_merging() {
         for (view, upscaler, count) in [
             ((640, 480), Upscaler::Off, 0),
             ((800, 600), Upscaler::Off, 1),
-            ((640, 480), Upscaler::Cunny, 1),
+            ((640, 480), Upscaler::Cunny, 2),
         ] {
             let software = matches!(base, BaseKind::Software { .. });
             let p = run(
@@ -291,9 +283,8 @@ fn bases_and_ingest_merging() {
             );
             match p.stages.first() {
                 Some(Stage::Ingest { .. }) => assert!(software && count == 0),
-                Some(Stage::Output { from, .. } | Stage::Upscale { from, .. }) => {
-                    assert_eq!(*from, Source::Base)
-                }
+                Some(Stage::Output { from, .. }) => assert_eq!(*from, Source::Base),
+                Some(Stage::Upscale { video, .. }) => assert!(!video),
                 None => assert_eq!(p.layers.base.source, Source::Base),
                 other => panic!("unexpected {other:?}"),
             }
@@ -345,7 +336,7 @@ fn video_layers_or_canvas_composition() {
             assert_eq!(layer.dst, rect(20, 40, 200, 160));
             assert_eq!(layer.damage, Damage::Whole);
             assert!(p.stages.is_empty());
-        } else {
+        } else if upscaler == Upscaler::Off {
             assert!(matches!(
                 p.stages[0],
                 Stage::Video {
@@ -354,15 +345,10 @@ fn video_layers_or_canvas_composition() {
                 }
             ));
             assert_eq!(p.targets[0].size, f.canvas);
-            if upscaler != Upscaler::Off {
-                assert!(matches!(
-                    p.stages[1],
-                    Stage::Upscale {
-                        from: Source::Pool(PoolId(1)),
-                        ..
-                    }
-                ));
-            }
+        } else {
+            // Video composes straight into the model's input.
+            assert!(matches!(p.stages[0], Stage::Upscale { video: true, .. }));
+            assert_eq!(p.targets[0].size, f.canvas);
             assert_eq!(p.damage, Damage::rects([rect(10, 20, 100, 80)]));
         }
     }
@@ -399,12 +385,13 @@ fn upscaled_output_sizes_and_final_rotation() {
         Upscaler::Artcnn,
         Upscaler::K7,
     ] {
-        for (view, expected, rotation, scales) in [
-            ((960, 720), (640, 480), Rotation::None, true),
-            ((480, 360), (480, 360), Rotation::None, true),
-            ((720, 960), (480, 640), Rotation::Quarter, true),
-            ((360, 480), (360, 480), Rotation::ThreeQuarters, true),
-            ((960, 720), (960, 720), Rotation::Half, false),
+        // The layer magnifies the doubled image when the viewport holds it.
+        for (view, expected, rotation, scales, magnified) in [
+            ((960, 720), (640, 480), Rotation::None, true, true),
+            ((480, 360), (480, 360), Rotation::None, true, false),
+            ((720, 960), (480, 640), Rotation::Quarter, true, true),
+            ((360, 480), (360, 480), Rotation::ThreeQuarters, true, false),
+            ((960, 720), (960, 720), Rotation::Half, false, false),
         ] {
             let p = run(
                 &frame(),
@@ -422,18 +409,35 @@ fn upscaled_output_sizes_and_final_rotation() {
                 },
                 &PoolState::default(),
             );
-            assert_eq!(p.targets[0].size, expected);
-            assert_eq!(p.stages.len(), 1);
+            assert_eq!(p.targets[0].size, (320, 240));
+            assert_eq!(p.targets[1].size, expected);
+            assert_eq!(p.stages.len(), 2);
             assert!(matches!(
                 p.stages[0],
                 Stage::Upscale {
-                    scale: Scale::Model,
+                    video: false,
+                    into: UPSCALE,
                     ..
                 }
             ));
-            let Stage::Upscale { transform, .. } = &p.stages[0] else {
+            let Stage::Output {
+                from,
+                transform,
+                scale,
+                ..
+            } = &p.stages[1]
+            else {
                 unreachable!()
             };
+            assert_eq!(*from, Source::Pool(UPSCALE));
+            assert_eq!(
+                *scale,
+                if magnified {
+                    Scale::Integer { x: 1, y: 1 }
+                } else {
+                    Scale::SharpBilinear { prescale: (1, 1) }
+                }
+            );
             assert_eq!(transform.rotation, rotation);
             assert_eq!(transform.dst, rect(0, 0, expected.0, expected.1));
             assert_eq!(p.layers.base.rotation, Rotation::None);
@@ -477,21 +481,19 @@ fn damage_dilation_mapping_alignment_and_merging() {
             damage: Damage::rects([rect(40, 50, 1, 1)]),
             ..frame()
         };
-        let p = run(
-            &f,
-            &Settings {
-                upscaler: model,
-                ..settings()
-            },
-            &caps(),
-            &warm(2, (640, 480), Some(1)),
-        );
+        let s = Settings {
+            upscaler: model,
+            ..settings()
+        };
+        let p = run(&f, &s, &caps(), &warmed(&s, &caps()));
+        // The model recomputes from the change; the output pass covers its reach.
+        assert_eq!(stage_tiles(&p.stages[0])[0].rects, [rect(32, 48, 16, 16)]);
         let x = (40 - radius) * 2 / 16 * 16;
         let y = (50 - radius) * 2 / 16 * 16;
         let right = ((41 + radius) * 2).div_ceil(16) * 16;
         let bottom = ((51 + radius) * 2).div_ceil(16) * 16;
         assert_eq!(
-            stage_tiles(&p.stages[0])[0].rects,
+            stage_tiles(&p.stages[1])[0].rects,
             [rect(x, y, right - x, bottom - y)]
         );
     }
@@ -528,18 +530,18 @@ fn damage_dilation_mapping_alignment_and_merging() {
         damage: Damage::rects([rect(319, 239, 1, 1)]),
         ..frame()
     };
-    let p = run(
-        &f,
-        &Settings {
-            view: (480, 640),
-            rotation: Rotation::Quarter,
-            upscaler: Upscaler::Cunny,
-            ..settings()
-        },
-        &caps(),
-        &warm(2, (480, 640), Some(1)),
-    );
-    assert_eq!(stage_tiles(&p.stages[0])[0].rects, [rect(0, 624, 16, 16)]);
+    let s = Settings {
+        view: (480, 640),
+        rotation: Rotation::Quarter,
+        upscaler: Upscaler::Cunny,
+        ..settings()
+    };
+    let c = CompositorCaps {
+        rotates: false,
+        ..caps()
+    };
+    let p = run(&f, &s, &c, &warmed(&s, &c));
+    assert_eq!(stage_tiles(&p.stages[1])[0].rects, [rect(0, 624, 16, 16)]);
     let d = Damage::rects((0..5).map(|n| rect(n * 10, 0, 1, 1)));
     assert_eq!(d, Damage::rects([rect(0, 0, 41, 1)]));
 }
@@ -610,7 +612,6 @@ fn pool_present_release_invalidation_and_trim() {
     ] {
         pools.invalidate(); // Same entry point for setting changes and device loss.
         assert!(pools.history.is_empty());
-        assert!(pools.unrefined.is_empty());
         let p = run(
             &quiet,
             &Settings {
@@ -632,140 +633,6 @@ fn pool_present_release_invalidation_and_trim() {
     assert_eq!(stage_tiles(&p.stages[0])[0].rects, [rect(0, 0, 320, 240)]);
     pools.after_present(&p);
     assert_eq!(pools.pools[0].size, quiet.canvas);
-}
-
-#[test]
-fn budget_and_thermal_tier_table() {
-    for (thermal, budget, expected) in [
-        (Thermal::Nominal, 307_200, Tier::Selected),
-        (Thermal::Fair, 307_200, Tier::Selected),
-        (Thermal::Nominal, 307_199, Tier::Small),
-        (Thermal::Nominal, 100_000, Tier::Spatial),
-        (Thermal::Nominal, 0, Tier::Spatial),
-        (Thermal::Serious, 1_000_000, Tier::Small),
-        (Thermal::Critical, 1_000_000, Tier::Spatial),
-    ] {
-        let c = CostModel {
-            thermal,
-            frame_budget_ns: budget,
-            ..cost()
-        };
-        let p = plan(
-            &frame(),
-            &Settings {
-                upscaler: Upscaler::Cunny,
-                ..settings()
-            },
-            &caps(),
-            &c,
-            &PoolState::default(),
-        );
-        let Stage::Upscale { regions, .. } = &p.stages[0] else {
-            panic!()
-        };
-        assert_eq!(regions.len(), 1);
-        assert_eq!(regions[0].1, expected, "{thermal:?} {budget}");
-        assert_eq!(p.unrefined.is_empty(), expected == Tier::Selected);
-    }
-    // Remaining budget is shared across distinct damaged regions.
-    let f = FrameInfo {
-        damage: Damage::rects([rect(40, 40, 1, 1), rect(200, 180, 1, 1)]),
-        ..frame()
-    };
-    let c = CostModel {
-        frame_budget_ns: 1_500,
-        ..cost()
-    };
-    let p = plan(
-        &f,
-        &Settings {
-            upscaler: Upscaler::Cunny,
-            ..settings()
-        },
-        &caps(),
-        &c,
-        &warm(2, (640, 480), Some(1)),
-    );
-    let Stage::Upscale { regions, .. } = &p.stages[0] else {
-        panic!()
-    };
-    assert_eq!(
-        regions.iter().map(|(_, t)| *t).collect::<Vec<_>>(),
-        [Tier::Selected, Tier::Spatial]
-    );
-}
-
-#[test]
-fn quiet_refinement_oldest_first_and_new_damage_reset() {
-    let mut pools = warm(2, (640, 480), Some(1));
-    pools.unrefined = vec![
-        Unrefined {
-            rect: rect(200, 160, 16, 16),
-            tier: Tier::Spatial,
-            since: 20,
-        },
-        Unrefined {
-            rect: rect(32, 32, 16, 16),
-            tier: Tier::Small,
-            since: 10,
-        },
-    ];
-    let f = FrameInfo {
-        damage: Damage::None,
-        ..frame()
-    };
-    let s = Settings {
-        upscaler: Upscaler::Cunny,
-        ..settings()
-    };
-    let c = CostModel {
-        frame_budget_ns: 5_000,
-        ..cost()
-    };
-    let p = plan(&f, &s, &caps(), &c, &pools);
-    assert!(matches!(
-        p.stages.last(),
-        Some(Stage::Refine {
-            from: Source::Base,
-            ..
-        })
-    ));
-    assert_eq!(p.unrefined.len(), 1);
-    assert_eq!(p.unrefined[0].since, 20);
-    assert_ne!(p.damage, Damage::None);
-    // One smaller budget still makes progress on a large quiet region.
-    pools.unrefined[0].rect = rect(160, 120, 128, 96);
-    let p = plan(&f, &s, &caps(), &c, &pools);
-    assert!(p.stages.iter().any(|s| matches!(s, Stage::Refine { .. })));
-    let f = FrameInfo {
-        serial: 100,
-        damage: Damage::rects([rect(32, 32, 16, 16)]),
-        ..frame()
-    };
-    let c = CostModel {
-        frame_budget_ns: 0,
-        ..cost()
-    };
-    let p = plan(&f, &s, &caps(), &c, &pools);
-    assert!(
-        p.unrefined
-            .iter()
-            .any(|r| r.since == 100 && r.tier == Tier::Spatial)
-    );
-    assert!(!p.unrefined.iter().any(|r| r.since == 10));
-    for thermal in [Thermal::Serious, Thermal::Critical] {
-        let p = plan(
-            &FrameInfo {
-                damage: Damage::None,
-                ..frame()
-            },
-            &s,
-            &caps(),
-            &CostModel { thermal, ..cost() },
-            &pools,
-        );
-        assert!(!p.stages.iter().any(|s| matches!(s, Stage::Refine { .. })));
-    }
 }
 
 #[test]
@@ -887,7 +754,6 @@ fn record() -> PresentRecord {
         frame: frame(),
         settings: settings(),
         caps: caps(),
-        cost: cost(),
         pools: PoolState::default(),
         plan: run(&frame(), &settings(), &caps(), &PoolState::default()),
         stage_times: vec![Duration::from_nanos(123)],
@@ -935,38 +801,6 @@ fn recorder_round_trip_ring_and_replay_first_difference() {
 }
 
 #[test]
-fn quiet_frames_converge_with_a_chunk_budget() {
-    let s = Settings {
-        upscaler: Upscaler::Cunny,
-        ..settings()
-    };
-    let mut pools = PoolState::default();
-    let low = CostModel {
-        frame_budget_ns: 0,
-        ..cost()
-    };
-    let first = plan(&frame(), &s, &caps(), &low, &pools);
-    pools.after_present(&first);
-    let c = CostModel {
-        frame_budget_ns: 10_000,
-        ..cost()
-    };
-    for serial in 51..351 {
-        let f = FrameInfo {
-            serial,
-            damage: Damage::None,
-            ..frame()
-        };
-        let p = plan(&f, &s, &caps(), &c, &pools);
-        pools.after_present(&p);
-        if pools.unrefined.is_empty() {
-            return;
-        }
-    }
-    panic!("quiet regions did not converge to the selected tier");
-}
-
-#[test]
 fn recorder_replays_stateful_upscales_and_composed_video() {
     let mut recorder = Recorder::default();
     let mut pools = PoolState::default();
@@ -1004,11 +838,7 @@ fn recorder_replays_stateful_upscales_and_composed_video() {
             background: [0.1, 0.2, 0.3],
             ..settings()
         };
-        let c = CostModel {
-            frame_budget_ns: 100_000,
-            ..cost()
-        };
-        let p = plan(&f, &s, &caps(), &c, &pools);
+        let p = plan(&f, &s, &caps(), &pools);
         recorder.record(Event::Present(Box::new(PresentRecord {
             statistics: Default::default(),
             token: 0,
@@ -1018,7 +848,6 @@ fn recorder_replays_stateful_upscales_and_composed_video() {
             frame: f,
             settings: s,
             caps: caps(),
-            cost: c,
             pools: pools.clone(),
             plan: p.clone(),
             stage_times: vec![Duration::from_nanos(12), Duration::from_nanos(34)],
@@ -1028,17 +857,6 @@ fn recorder_replays_stateful_upscales_and_composed_video() {
     let parsed = parse(&recorder.dump()).unwrap();
     assert_eq!(parsed, recorder.events().cloned().collect::<Vec<_>>());
     assert_eq!(replay(&parsed), Ok(()));
-    // A complete selected redraw already refines the aged target.
-    let mut r = record();
-    r.settings.upscaler = Upscaler::Cunny;
-    r.pools.unrefined.push(Unrefined {
-        rect: rect(0, 0, 16, 16),
-        tier: Tier::Spatial,
-        since: 1,
-    });
-    let p = plan(&r.frame, &r.settings, &r.caps, &r.cost, &r.pools);
-    assert!(!p.stages.iter().any(|s| matches!(s, Stage::Refine { .. })));
-    assert!(p.unrefined.is_empty());
 }
 
 #[test]
