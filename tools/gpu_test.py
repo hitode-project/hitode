@@ -20,7 +20,7 @@ SUITES = [
     ("adv-gpu", [], ["--lib", "--test", "conformance"]),
     ("adv-display", [], ["--lib", "--test", "upscale", "--test", "video"]),
     ("adv-device", ["gpu", "test-support"], ["--lib", "--test", "surfaces", "--test", "software_ingest"]),
-    ("adv-dx", ["gpu"], ["--lib", "--test", "shader_gpu"]),
+    ("adv-dx", ["gpu"], ["--test", "shader_gpu"]),
 ]
 TIMEOUT = 900
 REMOTE = "/data/local/tmp/gpu-test"

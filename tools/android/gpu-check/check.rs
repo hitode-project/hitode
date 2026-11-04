@@ -204,6 +204,7 @@ mod android {
         let mut child = Command::new(path)
             .args(["--exact", case, "--test-threads=1"])
             .env("ADV_GPU_TEST_DISABLE", disable)
+            .env("ADV_GPU_REQUIRE_BACKEND", "1")
             .env("RUST_BACKTRACE", "1")
             .env("TMPDIR", tmp)
             .current_dir(tmp)

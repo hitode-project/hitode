@@ -313,7 +313,7 @@ mod tests {
             [0., 1., -1., 0.5, 1.],
             [0., 1., 1., 0.5, 1.],
         ]);
-        let mut draw = |f: &mut Fixture, constant: u32| {
+        let draw = |f: &mut Fixture, constant: u32| {
             let pixel = f.packet([0xffff0200u32, 0x02000001, 0x800f0800, constant, 0xffff]);
             f.okay(
                 "IDirect3DDevice9::CreatePixelShader",
