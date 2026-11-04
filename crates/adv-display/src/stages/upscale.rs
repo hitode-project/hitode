@@ -448,21 +448,7 @@ impl Upscaling {
             let mut list = Vec::new();
             for y in 0..grid.rows {
                 let row = &bits[y as usize * words..][..words];
-                let mut x = 0;
-                while x < grid.columns {
-                    let word = row[(x / 64) as usize] >> (x % 64);
-                    if word == 0 {
-                        x = (x / 64 + 1) * 64;
-                        continue;
-                    }
-                    let start = x + word.trailing_zeros();
-                    let mut end = start;
-                    loop {
-                        end += (row[(end / 64) as usize] >> (end % 64)).trailing_ones();
-                        if !end.is_multiple_of(64) || end >= grid.columns {
-                            break;
-                        }
-                    }
+                for (start, end) in runs(row, grid.columns) {
                     list.extend((start..end).map(|x| x | y << 16));
                     let run = Rect {
                         x: start * unit,
@@ -474,13 +460,39 @@ impl Upscaling {
                     for t in pass.reads() {
                         needed[t].push(input);
                     }
-                    x = end;
                 }
             }
             lists[i] = (list.len() as u32 != grid.columns * grid.rows).then_some(list);
         }
         lists
     }
+}
+
+/// The runs of set bits in a row of `columns` cells, as `start..end`.
+fn runs(row: &[u64], columns: u32) -> impl Iterator<Item = (u32, u32)> + '_ {
+    let mut x = 0;
+    std::iter::from_fn(move || {
+        while x < columns {
+            let word = row[(x / 64) as usize] >> (x % 64);
+            if word == 0 {
+                x = (x / 64 + 1) * 64;
+                continue;
+            }
+            let start = x + word.trailing_zeros();
+            let mut end = start;
+            // A run continues into the next word only from its first bit.
+            while end < columns {
+                let ones = (row[(end / 64) as usize] >> (end % 64)).trailing_ones();
+                end += ones;
+                if ones == 0 || !end.is_multiple_of(64) {
+                    break;
+                }
+            }
+            x = end.min(columns);
+            return Some((start, x));
+        }
+        None
+    })
 }
 
 fn words(values: impl IntoIterator<Item = u32>) -> Vec<u8> {
@@ -612,6 +624,23 @@ impl Check {
         let bytes = unsafe { self.readback.mapped().expect("readback memory").as_ref() };
         let (half, single) = bytes[..2 * Self::BYTES as usize].split_at(Self::BYTES as usize);
         half.iter().zip(single).all(|(a, b)| a.abs_diff(*b) <= 8)
+    }
+}
+
+#[cfg(test)]
+mod run_tests {
+    #[test]
+    // spec: HOST-VIEW-10
+    fn runs_end_at_word_boundaries_and_cross_them() {
+        let runs = |row: &[u64], columns| super::runs(row, columns).collect::<Vec<_>>();
+        // A run ending on the last bit of a word, before a clear next word.
+        assert_eq!(runs(&[1 << 63, 0], 100), [(63, 64)]);
+        assert_eq!(runs(&[!0, 1 << 1], 100), [(0, 64), (65, 66)]);
+        // Runs spanning words, and one ending at the row's last cell.
+        assert_eq!(runs(&[1 << 63, !0, 0b11], 130), [(63, 130)]);
+        assert_eq!(runs(&[0, 1 << 3 | 1 << 5], 70), [(67, 68), (69, 70)]);
+        assert_eq!(runs(&[!0], 64), [(0, 64)]);
+        assert!(runs(&[0, 0], 128).is_empty());
     }
 }
 
