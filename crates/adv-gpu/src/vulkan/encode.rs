@@ -31,6 +31,58 @@ pub(crate) struct Encoder {
     /// encoder writes it.
     originals: Vec<(Arc<ImageCore>, Vec<ImageState>, bool)>,
     pub(super) commands: Vec<vk::CommandBuffer>,
+    /// The pool `commands` come from, owned until the submission retires.
+    pub(super) pool: Option<Commands>,
+}
+/// One encoder's command buffers, reset as a whole pool once the GPU is done
+/// with them. Resetting single buffers made Adreno free and remap their
+/// memory through the kernel for every render pass.
+pub(super) struct Commands {
+    pool: vk::CommandPool,
+    pub(super) buffers: Vec<vk::CommandBuffer>,
+    used: usize,
+}
+impl Commands {
+    fn new(context: &Context) -> Result<Self> {
+        let pool = context.result(unsafe {
+            context.device.create_command_pool(
+                &vk::CommandPoolCreateInfo::default().queue_family_index(context.family),
+                None,
+            )
+        })?;
+        Ok(Self {
+            pool,
+            buffers: Vec::new(),
+            used: 0,
+        })
+    }
+    fn next(&mut self, context: &Context) -> Result<vk::CommandBuffer> {
+        if self.used == self.buffers.len() {
+            let buffer = context.result(unsafe {
+                context.device.allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::default()
+                        .command_pool(self.pool)
+                        .level(vk::CommandBufferLevel::PRIMARY)
+                        .command_buffer_count(1),
+                )
+            })?[0];
+            self.buffers.push(buffer);
+        }
+        self.used += 1;
+        Ok(self.buffers[self.used - 1])
+    }
+    /// Returns every buffer to the initial state, keeping its memory.
+    pub(super) fn reset(&mut self, context: &Context) -> Result<()> {
+        self.used = 0;
+        context.result(unsafe {
+            context
+                .device
+                .reset_command_pool(self.pool, vk::CommandPoolResetFlags::empty())
+        })
+    }
+    pub(super) fn destroy(self, context: &Context) {
+        unsafe { context.device.destroy_command_pool(self.pool, None) };
+    }
 }
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub(super) struct PassKey {
@@ -95,6 +147,7 @@ impl Encoder {
             synced: false,
             originals: Vec::new(),
             commands: Vec::new(),
+            pool: None,
         };
         if let Err(e) = encoder.allocate_command() {
             encoder.error = Some(e);
@@ -103,25 +156,14 @@ impl Encoder {
     }
     fn allocate_command(&mut self) -> Result<()> {
         let context = &self.shared.context;
-        let mut state = self.shared.state.lock().unwrap();
-        self.command = match state.commands.pop() {
-            Some(command) => {
-                context.result(unsafe {
-                    context
-                        .device
-                        .reset_command_buffer(command, vk::CommandBufferResetFlags::empty())
-                })?;
-                command
-            }
-            None => context.result(unsafe {
-                context.device.allocate_command_buffers(
-                    &vk::CommandBufferAllocateInfo::default()
-                        .command_pool(self.shared.pool)
-                        .level(vk::CommandBufferLevel::PRIMARY)
-                        .command_buffer_count(1),
-                )
-            })?[0],
-        };
+        if self.pool.is_none() {
+            let reused = self.shared.state.lock().unwrap().pools.pop();
+            self.pool = Some(match reused {
+                Some(pool) => pool,
+                None => Commands::new(context)?,
+            });
+        }
+        self.command = self.pool.as_mut().unwrap().next(context)?;
         context.result(unsafe {
             context.device.begin_command_buffer(
                 self.command,
@@ -925,16 +967,12 @@ impl Drop for Encoder {
             for (image, states, _) in self.originals.drain(..) {
                 *image.states.lock().unwrap() = states;
             }
-            if self.command != vk::CommandBuffer::null() {
-                self.commands.push(self.command);
-            }
-            if !self.commands.is_empty() {
-                let _state = self.shared.state.lock().unwrap();
-                unsafe {
-                    self.shared
-                        .context
-                        .device
-                        .free_command_buffers(self.shared.pool, &self.commands);
+            // Unsubmitted buffers never reached the GPU.
+            if let Some(mut pool) = self.pool.take() {
+                let context = &self.shared.context;
+                match pool.reset(context) {
+                    Ok(()) => self.shared.state.lock().unwrap().pools.push(pool),
+                    Err(_) => pool.destroy(context),
                 }
             }
         }

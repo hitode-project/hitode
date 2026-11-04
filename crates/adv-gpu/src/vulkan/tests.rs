@@ -1457,3 +1457,39 @@ fn sampled_heap_entries_are_taken_on_first_sample() {
     queue.poll().unwrap();
     assert_eq!(heap.used(0), before);
 }
+
+#[test]
+fn retired_submissions_reuse_one_command_pool_and_its_buffers() {
+    let (device, mut queue) = gpu!(Modern::empty());
+    let size = Extent {
+        width: 4,
+        height: 4,
+        depth_or_layers: 1,
+    };
+    let image = create_image(&device, Format::Bgra8Unorm, size, 1, 1);
+    let area = Rect {
+        x: 0,
+        y: 0,
+        w: 4,
+        h: 4,
+    };
+    for _ in 0..32 {
+        let mut encoder = queue.encoder("passes");
+        for _ in 0..3 {
+            drop(encoder.render_pass(&pass(
+                image.view(),
+                area,
+                Load::Clear([0.0; 4]),
+                Store::Store,
+                None,
+            )));
+        }
+        finish(&mut queue, encoder);
+        queue.poll().unwrap();
+    }
+    // An abandoned encoder returns its pool unsubmitted.
+    drop(queue.encoder("abandoned"));
+    let state = queue.inner.shared.state.lock().unwrap();
+    assert_eq!(state.pools.len(), 1);
+    assert!(state.pools[0].buffers.len() <= 4);
+}

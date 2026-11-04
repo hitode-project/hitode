@@ -11,7 +11,6 @@ pub(crate) struct Queue {
 }
 pub(super) struct Shared {
     pub(super) context: Arc<Context>,
-    pub(super) pool: vk::CommandPool,
     handle: vk::Queue,
     timeline: vk::Semaphore,
     pub(super) state: Mutex<State>,
@@ -21,7 +20,7 @@ pub(super) struct State {
     next: u64,
     completed: u64,
     pending: VecDeque<Submission>,
-    pub(super) commands: Vec<vk::CommandBuffer>,
+    pub(super) pools: Vec<encode::Commands>,
     fences: Vec<vk::Fence>,
     /// The fence the waiter thread blocks on. Fences are externally
     /// synchronized, so a retire of it leaves the reset to the waiter.
@@ -33,7 +32,7 @@ pub(super) struct State {
 struct Submission {
     token: u64,
     fence: vk::Fence,
-    commands: Vec<vk::CommandBuffer>,
+    commands: encode::Commands,
     _resources: encode::Resources,
 }
 enum Message {
@@ -44,44 +43,27 @@ enum Message {
 impl Queue {
     pub(super) fn new(device: crate::Device) -> Result<Self> {
         let context = device.inner.0.clone();
-        let pool = context.result(unsafe {
-            context.device.create_command_pool(
-                &vk::CommandPoolCreateInfo::default()
-                    .queue_family_index(context.family)
-                    .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
-                None,
-            )
-        })?;
         let timeline = if context.caps.modern.contains(Modern::TIMELINE_SEMAPHORES) {
             let mut ty =
                 vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE);
-            match context.result(unsafe {
+            context.result(unsafe {
                 context
                     .device
                     .create_semaphore(&vk::SemaphoreCreateInfo::default().push_next(&mut ty), None)
-            }) {
-                Ok(s) => s,
-                Err(e) => {
-                    unsafe {
-                        context.device.destroy_command_pool(pool, None);
-                    }
-                    return Err(e);
-                }
-            }
+            })?
         } else {
             vk::Semaphore::null()
         };
         let shared = Arc::new(Shared {
             handle: unsafe { context.device.get_device_queue(context.family, 0) },
             context,
-            pool,
             timeline,
             descriptors: Mutex::new(Vec::new()),
             state: Mutex::new(State {
                 next: 1,
                 completed: 0,
                 pending: VecDeque::new(),
-                commands: Vec::new(),
+                pools: Vec::new(),
                 fences: Vec::new(),
                 waiting: vk::Fence::null(),
                 retired: false,
@@ -264,7 +246,7 @@ impl Queue {
         state.pending.push_back(Submission {
             token,
             fence,
-            commands,
+            commands: encoder.inner.pool.take().unwrap(),
             _resources: resources,
         });
         state.next += 1;
@@ -436,7 +418,9 @@ impl Shared {
                     .result(unsafe { self.context.device.reset_fences(&[fence]) })?;
                 state.fences.push(fence);
             }
-            state.commands.extend(submission.commands);
+            let mut commands = submission.commands;
+            commands.reset(&self.context)?;
+            state.pools.push(commands);
         }
         #[cfg(target_os = "android")]
         state.sync.retire(completed);
@@ -472,6 +456,10 @@ impl Drop for Shared {
                 if submission.fence != vk::Fence::null() {
                     self.context.device.destroy_fence(submission.fence, None);
                 }
+                submission.commands.destroy(&self.context);
+            }
+            for commands in state.pools.drain(..) {
+                commands.destroy(&self.context);
             }
             for fence in state.fences.drain(..) {
                 self.context.device.destroy_fence(fence, None);
@@ -484,7 +472,6 @@ impl Drop for Shared {
             for arena in self.descriptors.get_mut().unwrap() {
                 arena.destroy(&self.context);
             }
-            self.context.device.destroy_command_pool(self.pool, None);
         }
     }
 }
