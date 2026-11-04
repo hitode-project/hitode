@@ -446,6 +446,10 @@ impl Ui {
                         self.metric(Delivery::Native(stats));
                         continue;
                     }
+                    crate::display::Feedback::Attached => {
+                        window.frame_presented();
+                        continue;
+                    }
                     crate::display::Feedback::Presented(completed) => completed,
                 };
                 window.frame_presented();

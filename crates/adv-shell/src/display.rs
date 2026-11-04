@@ -63,6 +63,9 @@ pub(crate) struct Presented {
     pub stats: crate::performance::NativePresentation,
 }
 pub(crate) enum Feedback {
+    /// A present went to the compositor: the frame clock should fire on the
+    /// next refresh, before the present latches.
+    Attached,
     Presented(Presented),
     Statistics(crate::performance::NativePresentation),
 }
@@ -150,6 +153,8 @@ struct Presenter {
     display: Display,
     shared: Arc<Shared>,
     reported: Option<(u64, u64, bool, bool, bool)>,
+    /// Presents the UI has been told of.
+    attached: u64,
 }
 pub(crate) fn platform_caps(device: Option<&Device>) -> plan::CompositorCaps {
     plan::CompositorCaps {
@@ -215,6 +220,7 @@ pub(crate) fn channel(
                 display,
                 shared: shared.clone(),
                 reported: None,
+                attached: 0,
             },
         },
         Ui {
@@ -408,6 +414,11 @@ impl Presenter {
         Ok(())
     }
     fn feedback(&mut self) {
+        let presents = self.display.totals().presents;
+        if presents != self.attached {
+            self.attached = presents;
+            self.shared.send(Ok(Feedback::Attached));
+        }
         let publication = self.display.take_publication();
         if let Some(p) = publication {
             let record = self.display.recorder().get(p.presentation).unwrap();

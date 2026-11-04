@@ -1210,7 +1210,7 @@ fn upscaled_partial_frames_match_a_whole_run_across_buffer_ages() {
 
 // spec: HOST-VIEW-11
 #[test]
-fn a_frame_clock_attaches_at_most_one_present_per_refresh() {
+fn a_frame_clock_encodes_and_attaches_at_most_once_per_refresh() {
     let (d, mut q) = Device::open(&queue::DeviceOptions::default()).unwrap();
     let events = Arc::new(Mutex::new(vec![]));
     let mut display = Display::new(
@@ -1223,21 +1223,48 @@ fn a_frame_clock_attaches_at_most_one_present_per_refresh() {
         settings(),
     )
     .unwrap();
-    let image = private(&d, &mut q);
+    let reads = Arc::new(Mutex::new(vec![]));
+    let software = |serial: u64| {
+        let buffer = d
+            .create_buffer(&BufferDesc {
+                size: 64 * 48 * 4,
+                usage: BufferUsage::STORAGE,
+                memory: Memory::Upload,
+                label: "paced software",
+            })
+            .unwrap();
+        let reads = reads.clone();
+        Frame {
+            info: info(serial, BaseKind::Software { indexed: false }, Damage::Whole),
+            base: Base::Software {
+                buffer,
+                pitch: 256,
+                extent: (64, 48),
+                format: crate::stages::ingest::PixelFormat::Bgra32,
+                palette: None,
+            },
+            video: vec![],
+            published_at: std::time::Instant::now(),
+            on_read: Some(Box::new(move |_| reads.lock().unwrap().push(serial))),
+        }
+    };
     display.refreshed(1);
-    display
-        .present(&mut q, frame(1, &image, Damage::Whole))
-        .unwrap();
-    latch(&events, 1);
-    display.service(&mut q).unwrap();
-    // Latched within the same refresh: the next frame waits for the clock.
-    display
-        .present(&mut q, frame(2, &image, Damage::Whole))
-        .unwrap();
-    display.service(&mut q).unwrap();
+    display.present(&mut q, software(1)).unwrap();
     assert_eq!(display.totals().presents, 1);
+    // Within the same refresh a frame waits unencoded, and a newer one
+    // replaces it.
+    display.present(&mut q, software(2)).unwrap();
+    display.present(&mut q, software(3)).unwrap();
+    display.service(&mut q).unwrap();
+    assert_eq!(*reads.lock().unwrap(), [1]);
+    // The next refresh encodes it before the first present latches; the latch
+    // then attaches it.
     display.refreshed(2);
     display.service(&mut q).unwrap();
+    assert_eq!(*reads.lock().unwrap(), [1, 3]);
+    assert_eq!(display.totals().presents, 1);
+    latch(&events, 1);
+    display.service(&mut q).unwrap();
     assert_eq!(display.totals().presents, 2);
-    assert_eq!(display.recorder().latest().unwrap().frame.serial, 2);
+    assert_eq!(display.recorder().latest().unwrap().frame.serial, 3);
 }

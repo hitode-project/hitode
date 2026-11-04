@@ -265,8 +265,9 @@ pub struct Display {
     wake: Option<Wake>,
     unlatched: Option<u64>,
     /// The display refreshes counted so far, once a frame clock reports them,
-    /// and the count at the last attach: one attach per refresh.
+    /// and the counts at the last encode and attach: one each per refresh.
     refresh: Option<u64>,
+    encoded_refresh: u64,
     attached_refresh: u64,
     held: Option<Pending>,
     /// A software or presentable frame waiting, unencoded, for the next
@@ -319,6 +320,7 @@ impl Display {
             wake: None,
             unlatched: None,
             refresh: None,
+            encoded_refresh: 0,
             attached_refresh: 0,
             held: None,
             deferred: None,
@@ -647,19 +649,30 @@ impl Display {
         reading
     }
     /// The frame clock counted `refresh` display refreshes. From then on a
-    /// present attaches at most once per refresh; frames between are held and
-    /// merged.
+    /// frame is encoded and attached at most once per refresh; frames between
+    /// wait and merge.
     pub fn refreshed(&mut self, refresh: u64) {
         if refresh > 0 {
             self.refresh = Some(refresh);
         }
     }
+    fn showing(&self) -> bool {
+        self.compositor.is_some() && self.settings.view.0 != 0 && self.settings.view.1 != 0
+    }
     fn attachable(&self) -> bool {
-        self.compositor.is_some()
+        self.showing()
             && self.unlatched.is_none()
             && self.refresh.is_none_or(|r| r > self.attached_refresh)
-            && self.settings.view.0 != 0
-            && self.settings.view.1 != 0
+    }
+    /// Whether a waiting frame should be encoded now: once per refresh, so it
+    /// is ready when the previous present latches; without a frame clock,
+    /// once it can attach.
+    fn encodable(&self) -> bool {
+        self.showing()
+            && match self.refresh {
+                Some(r) => r > self.encoded_refresh,
+                None => self.unlatched.is_none(),
+            }
     }
     pub fn present(&mut self, queue: &mut Queue, mut frame: Frame) -> Result<Token, Failure> {
         self.drain(queue)
@@ -671,9 +684,9 @@ impl Display {
         if let Some(older) = self.deferred.take() {
             frame.inherit(older);
         }
-        // Until it can attach, a frame whose base stays valid waits unencoded;
-        // a private swap image must be read before the guest writes it again.
-        if !self.attachable()
+        // Until it is due, a frame whose base stays valid waits unencoded; a
+        // private swap image must be read before the guest writes it again.
+        if !self.encodable()
             && matches!(frame.base, Base::Software { .. } | Base::Presentable { .. })
         {
             self.deferred = Some(frame);
@@ -694,6 +707,7 @@ impl Display {
         if self.invalid {
             frame.info.damage = Damage::Whole;
         }
+        self.encoded_refresh = self.refresh.unwrap_or(0);
         let result = self.encode(queue, frame, reading.as_ref());
         if let Some(image) = reading {
             self.release(image, None);
@@ -854,12 +868,13 @@ impl Display {
             self.present(queue, frame).map_err(|e| e.error)?;
         }
         self.drain(queue)?;
-        if self.attachable() {
-            if let Some(frame) = self.deferred.take() {
-                self.present(queue, frame).map_err(|e| e.error)?;
-            } else if let Some(p) = self.held.take() {
-                self.attach(p)?;
-            }
+        if self.deferred.is_some() && self.encodable() {
+            let frame = self.deferred.take().unwrap();
+            self.present(queue, frame).map_err(|e| e.error)?;
+        } else if self.attachable()
+            && let Some(p) = self.held.take()
+        {
+            self.attach(p)?;
         }
         Ok(())
     }
