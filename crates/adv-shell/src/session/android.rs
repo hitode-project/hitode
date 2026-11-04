@@ -68,7 +68,7 @@ impl MainLoop {
                 ALooper_addFd(
                     looper.as_ptr(),
                     fd,
-                    ALOOPER_POLL_CALLBACK as i32,
+                    ALOOPER_POLL_CALLBACK,
                     ALOOPER_EVENT_INPUT as i32,
                     Some(fd_callback),
                     data,

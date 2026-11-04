@@ -191,10 +191,10 @@ impl GameView {
                 ndk_sys::ANativeWindow_acquire(window.as_ptr());
             }
         }
-        if let Some(sink) = self.surface_sink.borrow().as_ref() {
-            if let Err(error) = sink(window) {
-                *self.error.borrow_mut() = Some(error);
-            }
+        if let Some(sink) = self.surface_sink.borrow().as_ref()
+            && let Err(error) = sink(window)
+        {
+            *self.error.borrow_mut() = Some(error);
         }
         if let Some(old) = self.window.replace(window) {
             unsafe {
