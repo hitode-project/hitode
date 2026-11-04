@@ -683,8 +683,26 @@ struct Face {
     /// Only diagnostics and resolution reports name the bytes; hashing every
     /// face that font enumeration loads cost seconds at startup.
     sha256: std::sync::OnceLock<String>,
+    /// First and last cmap codes below U+FFFF. A CJK cmap maps tens of
+    /// thousands of codes, and GetTextMetricsW asks for these on every call.
+    unicode_span: std::sync::OnceLock<Option<(u32, u32)>>,
 }
 impl Face {
+    fn unicode_span(&self) -> Result<Option<(u32, u32)>, TextError> {
+        if let Some(span) = self.unicode_span.get() {
+            return Ok(*span);
+        }
+        let font = self.font()?;
+        let mut codes = font
+            .charmap()
+            .mappings()
+            .map(|(code, _)| code)
+            .filter(|&code| code <= 0xfffe);
+        let span = codes
+            .next()
+            .map(|first| (first, codes.last().unwrap_or(first)));
+        Ok(*self.unicode_span.get_or_init(|| span))
+    }
     fn sha256(&self) -> &str {
         self.sha256
             .get_or_init(|| profile::hash(self.data.as_ref().as_ref()))
@@ -791,6 +809,7 @@ fn load_face(
         info,
         source,
         sha256: std::sync::OnceLock::new(),
+        unicode_span: std::sync::OnceLock::new(),
     });
     face.font()?;
     if store.faces.len() >= 128 {
@@ -1260,17 +1279,12 @@ impl Font {
     /// break follows OS/2 usFirstCharIndex and default is the code before it.
     /// Symbol cmaps report the F000 private-use page.
     pub(super) fn unicode_metrics(&self) -> Result<(TextMetrics, [u16; 4]), TextError> {
-        let font = self.primary.font()?;
-        let charmap = font.charmap();
-        let mut codes = charmap
-            .mappings()
-            .map(|(code, _)| code)
-            .filter(|&code| code <= 0xfffe);
-        let first = codes
-            .next()
+        let (first, last) = self
+            .primary
+            .unicode_span()?
             .ok_or_else(|| TextError::Font("font has no Unicode character map".into()))?;
-        let last = codes.last().unwrap_or(first);
-        let characters = if charmap.is_symbol() || (0xf000..0xf100).contains(&first) {
+        let font = self.primary.font()?;
+        let characters = if font.charmap().is_symbol() || (0xf000..0xf100).contains(&first) {
             [0, 0xf0ff, 0x1f, 0x20]
         } else {
             let os2_first = font.os2().map_or(0x20, |os2| os2.us_first_char_index());
