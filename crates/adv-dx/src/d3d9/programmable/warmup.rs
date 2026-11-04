@@ -33,25 +33,16 @@ fn schedule(
         id.and_then(|id| shaders::bound(env, id))
             .map(|s| (s.parsed.clone(), s.translation.clone()))
     });
-    let inputs = if let Some((vs, _)) = &stages[0] {
-        let result = match declaration {
-            Some(elements) => declaration_inputs(elements, vs),
-            None => super::inputs(env, pointer, vs),
-        };
-        result.unwrap_or_else(|_| {
-            vs.inputs
-                .iter()
-                .filter(|i| i.register.kind == crate::shader::RegisterKind::Input)
-                .map(|i| Input {
-                    stream: 0,
-                    offset: 0,
-                    format: AttributeFormat::Float4,
-                    register: u32::from(i.register.index),
-                })
-                .collect()
-        })
-    } else {
-        Vec::new()
+    // Only a bound vertex shader with resolved inputs predicts the draw's
+    // streams; fixed-function vertices take their layout from each draw.
+    let Some((vs, _)) = &stages[0] else {
+        return;
+    };
+    let Ok(inputs) = (match declaration {
+        Some(elements) => declaration_inputs(elements, vs),
+        None => super::inputs(env, pointer, vs),
+    }) else {
+        return;
     };
     let key = ProgramKey {
         vertex: ids[0],
@@ -96,7 +87,10 @@ fn schedule(
                 bytes: Vec::new().into(),
             })
         })
-        .collect();
+        .collect::<Vec<_>>();
+    // Without a bound stream the draw's layout is still unknown: the program
+    // still warms, but no pipeline is predicted.
+    let prediction = prediction.filter(|_| streams.iter().all(|s| s.stride != 0));
     let state = env.ext.get_mut::<State>();
     let Some(context) = state.gpu.as_ref().map(|gpu| {
         gpu.compile_handle(
