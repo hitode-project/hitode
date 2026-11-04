@@ -410,6 +410,95 @@ mod tests {
             .collect()
     }
 
+    /// Whole 1280×720 runs per model on this stack and on the native one,
+    /// back to back, before the cut deletes this stack. Run with
+    /// `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn whole_runs_cost_against_the_native_upscaler() {
+        use adv_display::stages::upscale;
+        const SIZE: (u32, u32) = (1280, 720);
+        const RUNS: u32 = 20;
+        let gpu = pollster::block_on(adv_device::gpu::Gpu::request(false)).unwrap();
+        let context = gpu.context();
+        let (device, mut queue) = adv_gpu::Device::open(&Default::default()).unwrap();
+        let mut ring = device.ring(1 << 20).unwrap();
+        let half = device
+            .caps()
+            .features
+            .contains(adv_gpu::Features::SHADER_F16);
+        let output = device
+            .create_image(&adv_gpu::resource::ImageDesc {
+                dimension: adv_gpu::resource::Dimension::D2,
+                size: adv_gpu::Extent {
+                    width: SIZE.0 * 2,
+                    height: SIZE.1 * 2,
+                    depth_or_layers: 1,
+                },
+                format: upscale::OUTPUT,
+                mips: 1,
+                samples: 1,
+                usage: adv_gpu::resource::Usage::STORAGE,
+                view_formats: &[],
+                label: "upscale cost",
+            })
+            .unwrap();
+        use adv_display::plan::Upscaler as Native;
+        for (choice, native) in [
+            (Upscaler::Anime4k, Native::Anime4k),
+            (Upscaler::Cunny, Native::Cunny),
+            (Upscaler::Artcnn, Native::Artcnn),
+            (Upscaler::K7, Native::K7),
+        ] {
+            let old = Upscaling::new(context, choice, SIZE).unwrap();
+            let wait = || {
+                context
+                    .device
+                    .poll(wgpu::PollType::Wait {
+                        submission_index: None,
+                        timeout: Some(std::time::Duration::from_secs(60)),
+                    })
+                    .unwrap();
+            };
+            let time_old = |runs| {
+                let start = std::time::Instant::now();
+                for _ in 0..runs {
+                    old.run(context, &context.submission().unwrap(), None);
+                }
+                wait();
+                start.elapsed() / runs
+            };
+            time_old(3);
+            let old_cost = time_old(RUNS);
+            let new = upscale::Upscaling::with_precision(
+                &device,
+                upscale::model(&device, native, half),
+                SIZE,
+                half,
+            )
+            .unwrap();
+            let mut time_new = |runs| {
+                let start = std::time::Instant::now();
+                let mut token = adv_gpu::Token(0);
+                for _ in 0..runs {
+                    let mut encoder = queue.encoder("upscale cost");
+                    new.encode(&mut encoder, &mut ring, output.view(), None)
+                        .unwrap();
+                    token = queue.submit(encoder).unwrap();
+                }
+                assert!(
+                    queue
+                        .wait(token, std::time::Duration::from_secs(60))
+                        .unwrap()
+                );
+                start.elapsed() / runs
+            };
+            time_new(3);
+            let new_cost = time_new(RUNS);
+            eprintln!("{choice:?} {SIZE:?}: wgpu {old_cost:?} native {new_cost:?}");
+        }
+    }
+
     // spec: HOST-VIEW-7
     #[test]
     fn half_precision_passes_widen_to_valid_single_precision() {

@@ -44,6 +44,9 @@ objc2-quartz-core = { version = "0.3.2", default-features = false, features = ["
 
 [dev-dependencies]
 pollster = "0.4"
+# The wgpu stack's cost test compares against these until the cut.
+adv-display = { path = "../adv-display" }
+adv-gpu = { path = "../adv-gpu" }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 objc2-metal = { version = "0.3.2", default-features = false, features = ["std"] }
