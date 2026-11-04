@@ -51,8 +51,12 @@ def main():
         apk.write(stub / "classes.dex", "classes.dex")
         apk.write(target / "aarch64-linux-android/release/examples/libgpu_check.so",
                   "lib/arm64-v8a/libgpu_check.so")
+        # Unstripped copies symbolize cloud tombstones after the target dir is gone.
+        symbols = build / "symbols"
+        symbols.mkdir(exist_ok=True)
         for name, executable in binaries:
             name = name.replace(":", "_").replace("-", "_")
+            shutil.copy2(executable, symbols / f"libtest_{name}.so")
             stripped = build / f"libtest_{name}.so"
             subprocess.run([strip, "-o", stripped, executable], check=True)
             apk.write(stripped, f"lib/arm64-v8a/libtest_{name}.so")

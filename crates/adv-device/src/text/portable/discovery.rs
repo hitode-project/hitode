@@ -197,6 +197,7 @@ mod tests {
     }
     // spec: DEV-FONT-1
     #[test]
+    #[cfg_attr(target_os = "android", ignore = "reads host fixture files")]
     fn metadata_matches_full_font_and_collection_discovery() {
         for name in ["font-resource.ttf", "font-resource.ttc"] {
             let path = Path::new(env!("CARGO_MANIFEST_DIR"))

@@ -1100,5 +1100,26 @@ fn upscaled_partial_frames_match_a_whole_run_across_buffer_ages() {
         .present(&mut q, frame(1, &image, Damage::Whole))
         .unwrap();
     assert_eq!(whole.shown_base().desc().size.width, 128);
-    assert!(partial == read(&d, &mut q, &whole.shown_base()));
+    let expected = read(&d, &mut q, &whole.shown_base());
+    // Report where the frames differ: a device failure leaves only this line.
+    let differing: Vec<_> = (0..partial.len() / 4)
+        .filter(|&i| partial[i * 4..i * 4 + 4] != expected[i * 4..i * 4 + 4])
+        .map(|i| (i % 128, i / 128))
+        .collect();
+    assert!(
+        differing.is_empty(),
+        "{} pixels differ, x {:?}..={:?}, y {:?}..={:?}, first {:?}: {:?} != {:?}",
+        differing.len(),
+        differing.iter().map(|p| p.0).min(),
+        differing.iter().map(|p| p.0).max(),
+        differing.iter().map(|p| p.1).min(),
+        differing.iter().map(|p| p.1).max(),
+        differing.first(),
+        differing
+            .first()
+            .map(|&(x, y)| &partial[(y * 128 + x) * 4..][..4]),
+        differing
+            .first()
+            .map(|&(x, y)| &expected[(y * 128 + x) * 4..][..4]),
+    );
 }
