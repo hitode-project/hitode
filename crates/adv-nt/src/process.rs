@@ -142,14 +142,24 @@ pub fn module_export(cpu: &dyn Guest, base: u32, name: &str) -> Option<u32> {
     let count = cpu.read_u32(directory + 0x18).ok()?;
     let [functions, names, ordinals] =
         [0x1c, 0x20, 0x24].map(|at| cpu.read_u32(directory + at).map_or(0, |rva| base + rva));
-    let mut text = vec![0; name.len() + 1];
-    for index in 0..count {
+    // The name table is sorted, and the loader binary-searches it. Comparing
+    // the guest bytes with the name and its terminator orders C strings.
+    let mut wanted = name.as_bytes().to_vec();
+    wanted.push(0);
+    let mut text = vec![0; wanted.len()];
+    let (mut low, mut high) = (0, count);
+    while low < high {
+        let index = low + (high - low) / 2;
         cpu.read(base + cpu.read_u32(names + 4 * index).ok()?, &mut text)
             .ok()?;
-        if text[..name.len()] == *name.as_bytes() && text[name.len()] == 0 {
-            let ordinal = u32::from(cpu.read_u16(ordinals + 2 * index).ok()?);
-            let target = cpu.read_u32(functions + 4 * ordinal).ok()?;
-            return (!(rva..rva + size).contains(&target)).then_some(base + target);
+        match text.as_slice().cmp(&wanted) {
+            std::cmp::Ordering::Less => low = index + 1,
+            std::cmp::Ordering::Greater => high = index,
+            std::cmp::Ordering::Equal => {
+                let ordinal = u32::from(cpu.read_u16(ordinals + 2 * index).ok()?);
+                let target = cpu.read_u32(functions + 4 * ordinal).ok()?;
+                return (!(rva..rva + size).contains(&target)).then_some(base + target);
+            }
         }
     }
     None
