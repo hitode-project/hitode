@@ -196,7 +196,9 @@ pub extern "system" fn Java_org_hitode_launcher_MainActivity_nativeScreen(
         values.into_iter().map(f64::from).collect::<Vec<_>>()
     };
     let cutouts = floats(&mut env, &cutouts)
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|r| Rect {
             x: r[0],
             y: r[1],

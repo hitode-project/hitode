@@ -764,16 +764,12 @@ impl Device {
                     (f, caps)
                 })
                 .collect();
-            let tile = if tile_extension {
-                match query_tile(instance, &device) {
-                    Ok(tile) => tile,
-                    Err(error) => {
-                        device.destroy_device(None);
-                        return Err(error);
-                    }
+            let tile = match query_tile(instance, &device, tile_extension) {
+                Ok(tile) => tile,
+                Err(error) => {
+                    device.destroy_device(None);
+                    return Err(error);
                 }
-            } else {
-                (0, 0)
             };
             let caps = Caps {
                 features: feature_bits,
@@ -834,8 +830,15 @@ impl Device {
     }
 }
 
-unsafe fn query_tile(instance: &ash::Instance, device: &ash::Device) -> Result<(u32, u32)> {
-    // The bin size of one full-HD RGBA8 color target, the common display case.
+/// The bin size of one full-HD RGBA8 color target, the common display case;
+/// without `VK_QCOM_tile_properties`, the render area granularity. Damage
+/// tiles align to it, so partial passes keep the optimal render areas the
+/// specification describes (Mali drivers lose pixels beside unaligned ones).
+unsafe fn query_tile(
+    instance: &ash::Instance,
+    device: &ash::Device,
+    qcom: bool,
+) -> Result<(u32, u32)> {
     let (width, height) = (1920, 1080);
     let format = [vk::Format::R8G8B8A8_UNORM];
     unsafe {
@@ -860,6 +863,11 @@ unsafe fn query_tile(instance: &ash::Instance, device: &ash::Device) -> Result<(
                 None,
             )
             .map_err(vk_error)?;
+        if !qcom {
+            let granularity = device.get_render_area_granularity(pass);
+            device.destroy_render_pass(pass, None);
+            return Ok((granularity.width, granularity.height));
+        }
         let images = [vk::FramebufferAttachmentImageInfo::default()
             .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
             .width(width)

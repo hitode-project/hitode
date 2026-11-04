@@ -1017,8 +1017,17 @@ fn upscaled_partial_frames_match_a_whole_run_across_buffer_ages() {
         upscaler: Upscaler::Anime4k,
         ..settings()
     };
-    let history = Arc::default();
-    let mut display = Display::new(d.clone(), compositor(&history), upscaled.clone()).unwrap();
+    let history: Arc<Mutex<Vec<Presentation>>> = Arc::default();
+    // Tiles as the shell sizes them, so partial passes keep this GPU's render
+    // area granularity.
+    let tiled = Box::new(Capture {
+        headless: HeadlessCompositor::new(CompositorCaps {
+            tile: d.caps().limits.tile,
+            ..caps()
+        }),
+        history: history.clone(),
+    });
+    let mut display = Display::new(d.clone(), tiled, upscaled.clone()).unwrap();
     let image = d
         .create_image(&ImageDesc {
             dimension: Dimension::D2,
@@ -1116,10 +1125,38 @@ fn upscaled_partial_frames_match_a_whole_run_across_buffer_ages() {
     let Stage::Upscale { tiles, .. } = &latest.plan.stages[0] else {
         panic!("upscaled frame")
     };
-    assert_eq!(tiles.rects, [rect(48, 32, 16, 16)]);
+    // One tile covers the last change in the corner.
+    assert!(
+        matches!(&tiles.rects[..], [r] if r.x <= 60 && r.y <= 44 && r.x + r.w == 64 && r.y + r.h == 48),
+        "{:?}",
+        tiles.rects
+    );
     assert_eq!(latest.statistics.kind, crate::recorder::PlanKind::Upscaled);
     assert!(display.totals().upscaled_runs > 0 && display.totals().upscaled_pixels > 0);
     let partial = read(&d, &mut q, &display.shown_base());
+    let partial_model = display.upscaled_copy(&mut q);
+    let partial_model = read(&d, &mut q, &partial_model);
+    // Each frame's stage tiles, for a device failure's report.
+    let plans: Vec<String> = display
+        .recorder()
+        .events()
+        .filter_map(|e| match e {
+            crate::recorder::Event::Present(r) => Some(format!(
+                "{}: {:?}",
+                r.frame.serial,
+                r.plan
+                    .stages
+                    .iter()
+                    .map(|s| match s {
+                        Stage::Upscale { tiles, .. } => ("upscale", tiles.rects.clone()),
+                        Stage::Output { tiles, .. } => ("output", tiles.rects.clone()),
+                        _ => ("other", vec![]),
+                    })
+                    .collect::<Vec<_>>()
+            )),
+            _ => None,
+        })
+        .collect();
     let mut whole = Display::new(d.clone(), compositor(&history), upscaled).unwrap();
     ready(&mut whole, &mut q, &pixels);
     whole
@@ -1127,6 +1164,11 @@ fn upscaled_partial_frames_match_a_whole_run_across_buffer_ages() {
         .unwrap();
     assert_eq!(whole.shown_base().desc().size.width, 128);
     let expected = read(&d, &mut q, &whole.shown_base());
+    let whole_model = whole.upscaled_copy(&mut q);
+    let whole_model = read(&d, &mut q, &whole_model);
+    let model_differing = (0..partial_model.len() / 4)
+        .filter(|&i| partial_model[i * 4..i * 4 + 4] != whole_model[i * 4..i * 4 + 4])
+        .count();
     // Report where the frames differ: a device failure leaves only this line.
     let differing: Vec<_> = (0..partial.len() / 4)
         .filter(|&i| partial[i * 4..i * 4 + 4] != expected[i * 4..i * 4 + 4])
@@ -1134,7 +1176,8 @@ fn upscaled_partial_frames_match_a_whole_run_across_buffer_ages() {
         .collect();
     assert!(
         differing.is_empty(),
-        "{} pixels differ, x {:?}..={:?}, y {:?}..={:?}, first {:?}: {:?} != {:?}",
+        "{} pixels differ, x {:?}..={:?}, y {:?}..={:?}, first {:?}: {:?} != {:?}; \
+         model output differs in {} pixels, first there {:?}; tile {:?}, plans {:#?}",
         differing.len(),
         differing.iter().map(|p| p.0).min(),
         differing.iter().map(|p| p.0).max(),
@@ -1147,5 +1190,11 @@ fn upscaled_partial_frames_match_a_whole_run_across_buffer_ages() {
         differing
             .first()
             .map(|&(x, y)| &expected[(y * 128 + x) * 4..][..4]),
+        model_differing,
+        differing
+            .first()
+            .map(|&(x, y)| &partial_model[(y * 128 + x) * 4..][..4]),
+        d.caps().limits.tile,
+        plans,
     );
 }

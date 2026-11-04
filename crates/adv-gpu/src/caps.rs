@@ -121,7 +121,8 @@ pub struct Limits {
     /// Bitmask of supported sample counts (bit n = 2^n samples).
     pub sample_counts: u32,
     /// Hardware tile or bin size in pixels, for aligning damage tiles
-    /// (`VK_QCOM_tile_properties`, Apple's tile size); `(0, 0)` when unknown.
+    /// (`VK_QCOM_tile_properties`, Apple's tile size, otherwise Vulkan's render
+    /// area granularity); `(0, 0)` when unknown.
     pub tile: (u32, u32),
     /// Push-constant bytes per draw (Vulkan); bindless indices live there.
     pub push_constant_bytes: u32,

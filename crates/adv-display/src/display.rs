@@ -330,6 +330,75 @@ impl Display {
     pub(crate) fn shown_base(&self) -> Image {
         shown(&self.screen, LayerId::Base).unwrap().image().clone()
     }
+    /// The upscaler's whole output, resampled 1:1 into a readable image.
+    #[cfg(test)]
+    pub(crate) fn upscaled_copy(&mut self, queue: &mut Queue) -> Image {
+        use adv_gpu::{encode, resource};
+        let u = self.upscaled.as_ref().expect("upscaler");
+        let size = u.output.desc().size;
+        let whole = Rect {
+            x: 0,
+            y: 0,
+            w: size.width,
+            h: size.height,
+        };
+        let target = self
+            .device
+            .create_image(&resource::ImageDesc {
+                dimension: resource::Dimension::D2,
+                size,
+                format: adv_gpu::present::COLOR_FORMAT,
+                mips: 1,
+                samples: 1,
+                usage: resource::Usage::COLOR | resource::Usage::COPY_SRC,
+                view_formats: &[],
+                label: "upscaled copy",
+            })
+            .unwrap();
+        let mut encoder = queue.encoder("upscaled copy");
+        let mut pass = encoder.render_pass(&adv_gpu::RenderPassDesc {
+            colors: [encode::ColorAttachment {
+                view: target.view(),
+                load: encode::Load::Clear([0.; 4]),
+                store: encode::Store::Store,
+                resolve: None,
+            }]
+            .into_iter()
+            .collect(),
+            depth_stencil: None,
+            area: adv_gpu::Rect {
+                x: 0,
+                y: 0,
+                w: size.width,
+                h: size.height,
+            },
+            timestamps: None,
+            label: "upscaled copy",
+        });
+        let spans = output::encode(
+            &mut pass,
+            output::Source::Image(u.output.view()),
+            size,
+            Transform {
+                rotation: Rotation::None,
+                dst: whole,
+            },
+            Scale::Integer { x: 1, y: 1 },
+            &Tiles {
+                size: (16, 16),
+                rects: vec![whole],
+            },
+            (&self.pipelines.output, &mut self.ring),
+        )
+        .unwrap();
+        drop(pass);
+        for span in spans {
+            encoder.retain(span);
+        }
+        let token = queue.submit(encoder).unwrap();
+        assert!(queue.wait(token, Duration::from_secs(10)).unwrap());
+        target
+    }
     pub fn take_publication(&mut self) -> Option<Publication> {
         self.publication.take()
     }
