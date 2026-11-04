@@ -60,8 +60,9 @@ pub(super) fn query(raw: &ProtocolObject<dyn MTLDevice>) -> Caps {
             max_storage_bindings: 31,
             max_workgroup_storage: raw.maxThreadgroupMemoryLength() as u32,
             max_workgroup_invocations: 1024,
-            uniform_offset_alignment: if apple { 4 } else { 256 },
-            storage_offset_alignment: if apple { 4 } else { 256 },
+            // Vector-typed bindings need their 16-byte alignment in the offset.
+            uniform_offset_alignment: if apple { 16 } else { 256 },
+            storage_offset_alignment: if apple { 16 } else { 256 },
             sample_counts,
             tile: if apple { (32, 32) } else { (0, 0) },
             push_constant_bytes: 0,

@@ -626,7 +626,7 @@ fn ir_compute_uses_workgroup_dimensions_and_runtime_slice_lengths() {
     let pipeline = device.create_compute_pipeline(&desc, Some(&cache)).unwrap();
     let same = device.create_compute_pipeline(&desc, None).unwrap();
     assert_eq!(pipeline.inner.0.raw, same.inner.0.raw);
-    let uniforms = upload_words(&device, &[0, 7, 0, 0, 0]);
+    let uniforms = upload_words(&device, &[0, 0, 0, 0, 7, 0, 0, 0]);
     let values = device
         .create_buffer(&BufferDesc {
             size: 64,
@@ -666,7 +666,7 @@ fn ir_compute_uses_workgroup_dimensions_and_runtime_slice_lengths() {
             label: "compute",
         });
         pass.set_pipeline(&pipeline);
-        pass.bind(3, Bind::Uniform(uniforms.slice(4..20)));
+        pass.bind(3, Bind::Uniform(uniforms.slice(16..32)));
         // Changing only the slice length updates naga's size table without
         // redundantly setting the same native buffer and offset.
         pass.bind(
