@@ -20,7 +20,7 @@ pub const MAX_SHADER_TOKENS: usize = 65_536;
 pub const MAX_EXECUTION_STEPS: usize = 65_536;
 pub const MAX_FLOW_DEPTH: usize = 32;
 pub const MAX_TRANSLATION_BYTES: usize = 4 * 1024 * 1024;
-pub const TRANSLATOR_ABI: &str = "adv-d3d9-wgsl-7";
+pub const TRANSLATOR_ABI: &str = "adv-d3d9-wgsl-8";
 /// Read a guest token stream without mistaking immediate or comment data for END.
 /// The callback's index is in DWORDs, and is always below MAX_SHADER_TOKENS.
 pub fn read_bytecode<E: std::fmt::Display>(
@@ -288,13 +288,17 @@ impl Shader {
     pub fn bytecode(&self) -> &[u32] {
         &self.tokens
     }
-    pub fn translate(&self) -> Result<Translation, Error> {
-        translate::translate(self)
+    pub fn translate(&self, ieee_f32: bool) -> Result<Translation, Error> {
+        translate::translate(self, ieee_f32)
     }
     /// Opt-in local cache; stores translated WGSL only, never original game bytecode.
     /// Cache I/O failures are non-fatal and fall back to fresh translation.
-    pub fn translate_cached(&self, directory: &std::path::Path) -> Result<Translation, Error> {
-        cache::translate_cached(self, directory)
+    pub fn translate_cached(
+        &self,
+        directory: &std::path::Path,
+        ieee_f32: bool,
+    ) -> Result<Translation, Error> {
+        cache::translate_cached(self, directory, ieee_f32)
     }
     pub fn disassemble(&self) -> String {
         parser::disassemble(self)

@@ -220,8 +220,8 @@ mod tests {
         let expected = source::build(
             Some(&vs),
             Some(&ps),
-            Some(&vs.translate().unwrap()),
-            Some(&ps.translate().unwrap()),
+            Some(&vs.translate(false).unwrap()),
+            Some(&ps.translate(false).unwrap()),
             &[Input {
                 stream: 0,
                 offset: 0,

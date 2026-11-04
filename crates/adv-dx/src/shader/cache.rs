@@ -6,16 +6,21 @@ const MAX_CACHE_BYTES: u64 = 32 * 1024 * 1024;
 fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
-fn key(shader: &Shader) -> String {
+fn key(shader: &Shader, ieee_f32: bool) -> String {
     let mut hash = Sha256::new();
     hash.update(TRANSLATOR_ABI.as_bytes());
+    hash.update([u8::from(ieee_f32)]);
     for word in shader.bytecode() {
         hash.update(word.to_le_bytes());
     }
     format!("{:x}", hash.finalize())
 }
-pub(super) fn translate_cached(shader: &Shader, directory: &Path) -> Result<Translation, Error> {
-    let key = key(shader);
+pub(super) fn translate_cached(
+    shader: &Shader,
+    directory: &Path,
+    ieee_f32: bool,
+) -> Result<Translation, Error> {
+    let key = key(shader, ieee_f32);
     let path = directory.join(format!("{key}.wgsl-cache"));
     if let Ok(file) = std::fs::File::open(&path) {
         let mut bytes = Vec::new();
@@ -29,7 +34,7 @@ pub(super) fn translate_cached(shader: &Shader, directory: &Path) -> Result<Tran
             return Ok(translation);
         }
     }
-    let translation = shader.translate()?;
+    let translation = shader.translate(ieee_f32)?;
     let _ = save(directory, &path, &key, &translation);
     Ok(translation)
 }
@@ -197,30 +202,30 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let original = shader.translate_cached(&dir).unwrap();
-        let path = dir.join(format!("{}.wgsl-cache", key(&shader)));
+        let original = shader.translate_cached(&dir, false).unwrap();
+        let path = dir.join(format!("{}.wgsl-cache", key(&shader, false)));
         assert!(path.is_file());
-        let cached = shader.translate_cached(&dir).unwrap();
+        let cached = shader.translate_cached(&dir, false).unwrap();
         assert_eq!(original.source, cached.source);
         assert_eq!(original.constants, cached.constants);
         assert_eq!(cached.constants.registers[0], 1 << 3);
         let payload = format!("0\n\n0,0,0,0,{},0\n{}", u64::MAX, original.source);
         let malformed = format!(
             "{TRANSLATOR_ABI}\n{}\n{}\n{payload}",
-            key(&shader),
+            key(&shader, false),
             digest(payload.as_bytes())
         );
-        assert!(decode(malformed.as_bytes(), &key(&shader), shader.stage).is_none());
+        assert!(decode(malformed.as_bytes(), &key(&shader, false), shader.stage).is_none());
         std::fs::write(&path, "corrupt").unwrap();
         assert_eq!(
             original.source,
-            shader.translate_cached(&dir).unwrap().source
+            shader.translate_cached(&dir, false).unwrap().source
         );
         let text = std::fs::read_to_string(&path).unwrap();
         std::fs::write(&path, text.replacen(TRANSLATOR_ABI, "old-translator", 1)).unwrap();
         assert_eq!(
             original.source,
-            shader.translate_cached(&dir).unwrap().source
+            shader.translate_cached(&dir, false).unwrap().source
         );
         for item in std::fs::read_dir(&dir).unwrap() {
             std::fs::remove_file(item.unwrap().path()).unwrap();
@@ -252,7 +257,7 @@ mod tests {
             .unwrap()
             .set_len(MAX_CACHE_BYTES * 2)
             .unwrap();
-        shader.translate_cached(&dir).unwrap();
+        shader.translate_cached(&dir, false).unwrap();
         let total: u64 = std::fs::read_dir(&dir)
             .unwrap()
             .filter_map(Result::ok)

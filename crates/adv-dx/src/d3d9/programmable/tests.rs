@@ -36,7 +36,7 @@ fn every_declaration_type_is_fetched_by_the_gpu_with_d3d_component_defaults() {
     gpu.set_pipeline_cache_directory(disk_dir.as_deref());
     let target = gpu.target(8, 8, false).unwrap();
     let shader = vertex();
-    let translated = shader.translate().unwrap();
+    let translated = shader.translate(false).unwrap();
     let float = |v: &[f32]| bytemuck::cast_slice(v).to_vec();
     let mut cases: Vec<(AttributeFormat, Vec<u8>, [f32; 4])> = vec![
         (AttributeFormat::Float1, float(&[0.25]), [0.25, 0., 0., 1.]),

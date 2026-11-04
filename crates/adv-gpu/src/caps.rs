@@ -6,6 +6,8 @@ use crate::Format;
 #[derive(Clone, Debug)]
 pub struct Caps {
     pub features: Features,
+    /// 32-bit shader arithmetic preserves infinities and NaNs.
+    pub ieee_f32: bool,
     /// Modern mechanisms the backend uses natively on this device. Everything
     /// absent runs through its stand-in; callers see the same API and
     /// behavior either way. For reports and the flight recorder only.

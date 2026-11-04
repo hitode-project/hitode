@@ -82,6 +82,7 @@ impl Shader {
                         .into(),
                 }),
                 self.0.context.heap.is_some(),
+                self.0.context.caps.ieee_f32,
             )?;
             if has_video {
                 combine_video_sampler(&mut words, video_set.unwrap());
@@ -171,6 +172,7 @@ fn lower(
     module: &naga::Module,
     entry: Option<&naga::back::spv::PipelineOptions>,
     heap: bool,
+    ieee_f32: bool,
 ) -> Result<Vec<u32>> {
     let flags = if heap {
         naga::valid::ValidationFlags::all() - naga::valid::ValidationFlags::BINDINGS
@@ -188,7 +190,7 @@ fn lower(
     options.flags |= naga::back::spv::WriterFlags::FORCE_POINT_SIZE;
     let mut words = naga::back::spv::write_vec(module, &info, &options, entry)
         .map_err(|e| Error::Compile(format!("SPIR-V lowering: {e}")))?;
-    crate::shader::compile::legalize(&mut words);
+    crate::shader::compile::legalize(&mut words, ieee_f32);
     Ok(words)
 }
 
@@ -340,7 +342,9 @@ impl Device {
         // Heap and video shaders lower per pipeline, from the module kept here.
         let per_pipeline = !already_lowered && (self.0.heap.is_some() || !video.is_empty());
         let lowered: Vec<Vec<u32>> = if already_lowered {
-            vec![precompiled.unwrap().to_vec()]
+            let mut words = precompiled.unwrap().to_vec();
+            crate::shader::compile::legalize(&mut words, self.0.caps.ieee_f32);
+            vec![words]
         } else if per_pipeline {
             Vec::new()
         } else {
@@ -354,6 +358,7 @@ impl Device {
                             entry_point: name.to_str().unwrap().into(),
                         }),
                         false,
+                        self.0.caps.ieee_f32,
                     )
                 })
                 .collect::<Result<_>>()?
@@ -1142,7 +1147,9 @@ mod video_tests {
                             entry_point: "fs".into(),
                         }),
                     ] {
-                        let mut words = lower(&module, entry.as_ref(), heap).unwrap();
+                        let mut words =
+                            lower(&module, entry.as_ref(), heap, device.inner.0.caps.ieee_f32)
+                                .unwrap();
                         combine_video_sampler(&mut words, set);
                         // Vulkan validation checks the resulting combined-image SPIR-V.
                         let handle = unsafe {

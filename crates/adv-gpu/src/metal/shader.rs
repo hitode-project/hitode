@@ -180,6 +180,12 @@ impl Device {
         compile.setLanguageVersion(MTLLanguageVersion(
             ((version.0 as usize) << 16) | version.1 as usize,
         ));
+        if objc2::available!(macos = 15.0, ios = 18.0) {
+            compile.setMathMode(MTLMathMode::Relaxed);
+        } else {
+            #[allow(deprecated)]
+            compile.setFastMathEnabled(false);
+        }
         if objc2::available!(macos = 11.0, ios = 13.0) {
             compile.setPreserveInvariance(true);
         }

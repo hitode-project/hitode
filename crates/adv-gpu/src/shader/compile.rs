@@ -34,7 +34,7 @@ pub fn precompile(wgsl: &str, bindings: &[Binding]) -> Result<Precompiled> {
     };
     let mut spirv = naga::back::spv::write_vec(&module, &info, &options, None)
         .map_err(|e| compile_error("SPIR-V", e))?;
-    legalize(&mut spirv);
+    legalize(&mut spirv, false);
     combine_video_sampler(&mut spirv, 4);
     // SIMD-group matrices need MSL 2.3; everything else stays on 2.1.
     let matrix = module
@@ -472,7 +472,7 @@ fn instructions(words: &[u32]) -> impl Iterator<Item = &[u32]> {
 ///   `SHADER_F16` covers arithmetic only and phones lack the access features.
 /// - It gives every array an `ArrayStride`, which is invalid on arrays that
 ///   only workgroup, private or function variables hold.
-pub(crate) fn legalize(words: &mut Vec<u32>) {
+pub(crate) fn legalize(words: &mut Vec<u32>, ieee_f32: bool) {
     const STORAGE_BUFFER_16: u32 = 4433;
     const UNIFORM_AND_STORAGE_BUFFER_16: u32 = 4434;
     const ARRAY_STRIDE: u32 = 6;
@@ -501,7 +501,32 @@ pub(crate) fn legalize(words: &mut Vec<u32>) {
         }
     }
     let mut kept = words[..5].to_vec();
+    let mut extension = ieee_f32;
+    let mut modes = ieee_f32;
+    if ieee_f32 {
+        // OpCapability SignedZeroInfNanPreserve (SPV_KHR_float_controls).
+        kept.extend([(2 << 16) | 17, 4466]);
+    }
     for i in instructions(words) {
+        let op = i[0] & 0xffff;
+        if extension && op != 17 {
+            let name = b"SPV_KHR_float_controls\0";
+            kept.push(((1 + name.len().div_ceil(4)) as u32) << 16 | 10);
+            for chunk in name.chunks(4) {
+                let mut word = [0; 4];
+                word[..chunk.len()].copy_from_slice(chunk);
+                kept.push(u32::from_le_bytes(word));
+            }
+            extension = false;
+        }
+        if modes && !matches!(op, 17 | 10 | 11 | 14 | 15) {
+            for entry in instructions(words).filter(|i| i[0] & 0xffff == 15) {
+                // OpExecutionMode <entry> SignedZeroInfNanPreserve 32.
+                kept.extend([(4 << 16) | 16, entry[2], 4461, 32]);
+            }
+            modes = false;
+        }
+
         let drop = match i[0] & 0xffff {
             17 => matches!(i[1], STORAGE_BUFFER_16 | UNIFORM_AND_STORAGE_BUFFER_16),
             71 => i[2] == ARRAY_STRIDE && !laid.contains(&i[1]),

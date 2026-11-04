@@ -43,6 +43,7 @@ pub(super) fn query(raw: &ProtocolObject<dyn MTLDevice>) -> Caps {
         .fold(0, |mask, (i, _)| mask | (1 << i));
     Caps {
         features,
+        ieee_f32: true,
         modern: Modern::empty(),
         limits: Limits {
             max_image_2d: if raw.supportsFamily(MTLGPUFamily::Apple10) {

@@ -508,6 +508,7 @@ pub fn set_gpu(ext: &mut Ext, mut gpu: Gpu) -> Result<(), String> {
     if state.gpu.is_some() {
         return Err("D3D9 GPU already installed".into());
     }
+    state.shader_translations.ieee_f32 = gpu.device().caps().ieee_f32;
     gpu.set_pipeline_cache_directory(state.shader_cache.as_deref());
     state.gpu = Some(gpu);
     Ok(())

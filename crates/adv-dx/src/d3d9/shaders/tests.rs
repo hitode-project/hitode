@@ -720,7 +720,7 @@ fn translation_cache_evicts_without_changing_retained_programs() {
     assert_eq!(cache.entries.len(), 256);
     let (recent_tokens, _) = cache.order.back().unwrap();
     let recent = cache.entries[recent_tokens].as_ref().unwrap().clone();
-    let recent_shader = crate::shader::Shader::parse(recent_tokens).unwrap();
+    let recent_shader = crate::shader::Shader::parse(&recent_tokens.1).unwrap();
     let replacement = cache.translate(&first, None).unwrap();
     assert!(Arc::ptr_eq(
         &recent,

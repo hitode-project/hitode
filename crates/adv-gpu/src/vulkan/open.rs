@@ -325,6 +325,16 @@ impl Device {
                     .unwrap_or(vk::API_VERSION_1_0),
             );
             let mut names = Vec::new();
+            let mut float_controls = vk::PhysicalDeviceFloatControlsProperties::default();
+            if api >= vk::API_VERSION_1_2 || has(ash::khr::shader_float_controls::NAME) {
+                let mut properties =
+                    vk::PhysicalDeviceProperties2::default().push_next(&mut float_controls);
+                instance.get_physical_device_properties2(physical, &mut properties);
+                if api < vk::API_VERSION_1_2 {
+                    names.push(ash::khr::shader_float_controls::NAME.as_ptr());
+                }
+            }
+
             #[cfg(target_os = "android")]
             for name in [
                 ash::android::external_memory_android_hardware_buffer::NAME,
@@ -767,6 +777,7 @@ impl Device {
             };
             let caps = Caps {
                 features: feature_bits,
+                ieee_f32: float_controls.shader_signed_zero_inf_nan_preserve_float32 != 0,
                 modern,
                 adapter: CStr::from_ptr(props.device_name.as_ptr())
                     .to_string_lossy()
