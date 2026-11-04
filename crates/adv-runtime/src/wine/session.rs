@@ -1136,6 +1136,11 @@ impl Session {
                 .map_err(|e| e.to_string())?;
             #[cfg(feature = "gpu")]
             adv_dx::d3d9::fork_host_state(&self.machine.ext, &mut machine.ext)?;
+            // Captures read the foreground machine's frames through the host GPU.
+            #[cfg(feature = "gpu")]
+            if let Some(waker) = self.machine.ext.try_get::<adv_device::frame::Waker>() {
+                machine.ext.insert(waker.clone());
+            }
             // Until foreground handoff, a child queues frames for the session's
             // consumer; Snapshot cannot present native GPU frames directly.
             machine
