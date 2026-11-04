@@ -50,6 +50,8 @@ struct DeviceState {
     samplers: Mutex<HashMap<SamplerDesc, Sampler>>,
     rings: Mutex<Vec<Weak<Mutex<ring::State>>>>,
     clears: Mutex<HashMap<clear::Key, clear::Pipeline>>,
+    /// Metal's initial depth-stencil state; encoders cannot be reset to nil.
+    default_depth: Object<dyn MTLDepthStencilState>,
     pipelines: Mutex<pipeline::Pipelines>,
 }
 

@@ -120,7 +120,7 @@ impl Device {
             encoder.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 3);
         }
         // Internal clearing is not caller-visible dynamic state.
-        encoder.setDepthStencilState(None);
+        encoder.setDepthStencilState(Some(&self.0.default_depth));
         encoder.setStencilReferenceValue(0);
         true
     }

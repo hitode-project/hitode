@@ -34,6 +34,9 @@ impl Device {
         let queue = raw.newCommandQueue().ok_or(Error::OutOfMemory)?;
         queue.setLabel(Some(&NSString::from_str(options.label)));
         let event = raw.newSharedEvent().ok_or(Error::OutOfMemory)?;
+        let default_depth = raw
+            .newDepthStencilStateWithDescriptor(&MTLDepthStencilDescriptor::new())
+            .ok_or(Error::OutOfMemory)?;
         let device = crate::Device {
             inner: Device(Arc::new(DeviceState {
                 raw,
@@ -43,6 +46,7 @@ impl Device {
                 samplers: Mutex::new(HashMap::new()),
                 rings: Mutex::new(Vec::new()),
                 clears: Mutex::new(HashMap::new()),
+                default_depth,
                 pipelines: Mutex::new(pipeline::Pipelines::default()),
             })),
         };
