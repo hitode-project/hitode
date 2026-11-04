@@ -51,5 +51,5 @@ impl From<adv_gpu::Rect> for Rect {
 mod tests;
 // Native presentable buffers are supplied by IOSurface or AHardwareBuffer.
 // The Vulkan desktop backend exposes private images only.
-#[cfg(all(test, target_vendor = "apple"))]
+#[cfg(all(test, any(target_vendor = "apple", target_os = "android")))]
 mod display_tests;

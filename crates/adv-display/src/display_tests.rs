@@ -40,6 +40,13 @@ impl Compositor for Capture {
         self.headless.drain(p, r);
     }
 }
+/// The platform decoders' presentable YUV format; fixtures fill neutral
+/// chroma, so plane order does not matter.
+const DECODED: Format = if cfg!(target_os = "android") {
+    Format::Nv21
+} else {
+    Format::Nv12
+};
 fn caps() -> CompositorCaps {
     CompositorCaps {
         fractional_crops: !cfg!(target_os = "android"),
@@ -325,7 +332,7 @@ fn software_ingest_and_video_layers_share_one_plan() {
             color: Some(adv_gpu::present::YuvColor::Bt601Full),
             width: 8,
             height: 8,
-            format: Format::Nv12,
+            format: DECODED,
             count: 2,
             storage: false,
             label: "video",
@@ -592,7 +599,7 @@ fn video_frame(d: &Device, q: &mut Queue, serial: u64) -> (Frame, PresentPool) {
             color: Some(adv_gpu::present::YuvColor::Bt601Full),
             width: 8,
             height: 8,
-            format: Format::Nv12,
+            format: DECODED,
             count: 1,
             storage: false,
             label: "decoder",
@@ -629,18 +636,21 @@ fn video_frame(d: &Device, q: &mut Queue, serial: u64) -> (Frame, PresentPool) {
     frame.video.push(Video {
         id: 9,
         image: image.image().clone(),
-        planes: Some(std::array::from_fn(|i| {
-            image
-                .image()
-                .create_view(&ViewDesc {
-                    format: Some([Format::R8Unorm, Format::Rg8Unorm][i]),
-                    dimension: None,
-                    mips: 0..1,
-                    layers: 0..1,
-                    plane: i as u32,
-                })
-                .unwrap()
-        })),
+        // Android decoders' external formats are sampled converted.
+        planes: (!cfg!(target_os = "android")).then(|| {
+            std::array::from_fn(|i| {
+                image
+                    .image()
+                    .create_view(&ViewDesc {
+                        format: Some([Format::R8Unorm, Format::Rg8Unorm][i]),
+                        dimension: None,
+                        mips: 0..1,
+                        layers: 0..1,
+                        plane: i as u32,
+                    })
+                    .unwrap()
+            })
+        }),
         update: Some(image),
         hide_cursor: true,
         geometry: crate::stages::video::Geometry {
@@ -750,33 +760,12 @@ fn composition_uses_one_pass_for_base_borders_and_all_videos_and_records_gpu_tim
     let mut display =
         Display::new(d.clone(), Box::new(HeadlessCompositor::new(c)), settings()).unwrap();
     let (mut frame, _decoder) = video_frame(&d, &mut q, 1);
-    let first = &frame.video[0];
-    let planes = std::array::from_fn(|i| {
-        first
-            .image
-            .create_view(&ViewDesc {
-                format: Some(if i == 0 {
-                    Format::R8Unorm
-                } else {
-                    Format::Rg8Unorm
-                }),
-                plane: i as u32,
-                dimension: None,
-                mips: 0..1,
-                layers: 0..1,
-            })
-            .unwrap()
-    });
-    let mut second = Video {
-        id: 10,
-        image: first.image.clone(),
-        planes: Some(planes),
-        geometry: first.geometry,
-        hide_cursor: false,
-        update: None,
-    };
+    // A second video from its own decoder.
+    let (mut other, _second_decoder) = video_frame(&d, &mut q, 1);
+    let mut second = other.video.remove(0);
+    second.id = 10;
+    second.hide_cursor = false;
     second.geometry.destination.x = 32;
-    // Both draws can sample one decoder lease, with distinct video identities.
     let geometry = frame.info.video[0].clone();
     frame.info.video.push(VideoGeometry {
         id: 10,

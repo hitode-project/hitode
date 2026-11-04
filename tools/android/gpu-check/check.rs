@@ -5,7 +5,8 @@
 //! feature masked alone, naming the features it needs masked. Output lands in
 //! the app's external files directory, which Test Lab pulls; one summary line
 //! per run also goes to logcat. The device's capabilities per tier are written
-//! last, after every test has run.
+//! last, after every test has run. An `only` file in that directory narrows a
+//! local run to tests whose `binary::name` contains one of its lines.
 
 #[cfg(target_os = "android")]
 mod android {
@@ -91,13 +92,30 @@ mod android {
         tests.sort();
         let tmp = out.join("tmp");
         std::fs::create_dir_all(&tmp).expect("temporary directory");
+        let only: Vec<String> = std::fs::read_to_string(out.join("only"))
+            .map(|s| {
+                s.lines()
+                    .filter(|l| !l.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
         let mut summary = String::new();
         for (tier, disable) in TIERS {
             for (name, path) in &tests {
+                let cases: Vec<_> = list(path)
+                    .into_iter()
+                    .filter(|case| {
+                        let full = format!("{name}::{case}");
+                        only.is_empty() || only.iter().any(|o| full.contains(o.as_str()))
+                    })
+                    .collect();
+                if cases.is_empty() {
+                    continue;
+                }
                 let file = std::fs::File::create(out.join(format!("{tier}-{name}.log")))
                     .expect("log file");
                 let start = Instant::now();
-                let cases = list(path);
                 let mut failed = Vec::new();
                 for case in &cases {
                     let status = run_case(path, case, disable, &tmp, &file);
