@@ -1241,6 +1241,10 @@ impl Display {
             for i in &mut images {
                 i.acquire = token;
             }
+            // Intermediates the base read stay here, current for reuse.
+            for target in targets.iter_mut().flatten() {
+                target.written();
+            }
             token
         } else {
             images[0].acquire

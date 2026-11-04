@@ -339,6 +339,13 @@ impl PresentImage {
     pub fn image(&self) -> &Image {
         &self.buffer().image
     }
+    /// A submitted GPU write that stays on this queue (an intermediate later
+    /// submissions read) makes the content current, as a present does.
+    pub fn written(&mut self) {
+        let mut pool = self.pool.shared.lock().unwrap();
+        pool.presents += 1;
+        self.buffer.as_mut().unwrap().stamp = Some(pool.presents);
+    }
     /// The pool's matrix and range: `Some` exactly for NV12 or NV21.
     pub fn color(&self) -> Option<YuvColor> {
         self.color

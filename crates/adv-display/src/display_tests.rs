@@ -944,6 +944,19 @@ fn held_frames_reuse_intermediate_targets_without_reserving_their_slots() {
     assert_eq!(record.frame.serial, 5);
     assert_eq!(record.statistics.passes, 2);
     assert_eq!(record.plan.targets.len(), 2);
+    // A held frame reuses the intermediate's content without writing it.
+    let (mut held, _pool) = video_frame(&d, &mut q, 6);
+    held.info.damage = Damage::None;
+    held.info.video[0].changed = false;
+    display.present(&mut q, held).unwrap();
+    latch(&events, 2);
+    display.service(&mut q).unwrap();
+    let record = display.recorder().latest().unwrap();
+    assert_eq!(record.frame.serial, 6);
+    let Stage::Video { tiles, .. } = &record.plan.stages[0] else {
+        panic!("composed video")
+    };
+    assert!(tiles.rects.is_empty());
     crate::recorder::replay(&crate::recorder::parse(&display.recorder().dump()).unwrap()).unwrap();
 }
 
