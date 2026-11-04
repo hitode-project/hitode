@@ -157,7 +157,7 @@ impl GameView {
         self.report_layout();
         #[cfg(target_os = "ios")]
         if let Some(host) = self.host.borrow().as_ref() {
-            host.place(placement);
+            host.placed();
         }
     }
     /// The presented frame's rectangle in view pixels.
