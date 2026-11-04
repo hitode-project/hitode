@@ -63,7 +63,6 @@ pub type Wake = std::sync::Arc<dyn Fn() + Send + Sync>;
 pub trait Compositor: Send {
     fn set_waker(&mut self, _wake: Wake) {}
     fn set_scale(&mut self, _scale: f64) {}
-    fn set_frame_rate(&mut self, _rate: u32) {}
     /// Empty every layer and wait for that to take effect, before the
     /// compositor drops. Every attached image is free once the returned fence
     /// signals; no releases are reported for them.

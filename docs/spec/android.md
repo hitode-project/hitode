@@ -42,7 +42,7 @@ This spec covers the Android player: its package, its lifecycle and input, and t
 
 ### AND-APP-10 Native view
 
-**Rule**: Android views MUST acquire host `ANativeWindow` handles, present through Vulkan without readback, and stop rendering when no surface exists. Choreographer MUST follow pending content and reported periods, and cadence requests MUST follow HOST-SES-11.
+**Rule**: Android views MUST acquire host `ANativeWindow` handles, present through Vulkan without readback, and stop rendering when no surface exists. Choreographer MUST follow pending content and reported periods, and display rate requests MUST follow HOST-SES-11.
 **Applies to**: Android
 **Verification**: Test
 

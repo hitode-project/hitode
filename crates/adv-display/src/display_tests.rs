@@ -64,7 +64,6 @@ fn settings() -> Settings {
     Settings {
         placement: crate::plan::Placement::Fit,
         scale: 1.,
-        rate: 60,
         view: (64, 48),
         rotation: Rotation::None,
         upscaler: Upscaler::Off,
@@ -505,7 +504,7 @@ fn latch(events: &Arc<Mutex<Vec<Presented>>>, serial: u64) {
         shown: None,
     });
 }
-// spec: HOST-VIEW-11, HOST-SES-10, HOST-SES-11
+// spec: HOST-VIEW-11, HOST-SES-10
 #[test]
 fn coalescing_replaces_the_held_frame_merges_damage_and_releases_its_swap() {
     let (d, mut q) = Device::open(&queue::DeviceOptions::default()).unwrap();
@@ -802,7 +801,7 @@ fn composition_uses_one_pass_for_base_borders_and_all_videos_and_records_gpu_tim
     assert_eq!(&captured.bgra[0..4], &[191, 128, 64, 255]);
 }
 
-// spec: HOST-VIEW-3, HOST-VIEW-11, HOST-SES-11
+// spec: HOST-VIEW-3, HOST-VIEW-11
 #[test]
 fn coalesced_software_reports_its_read_and_superseded_video_returns_to_the_decoder() {
     let (d, mut q) = Device::open(&queue::DeviceOptions::default()).unwrap();

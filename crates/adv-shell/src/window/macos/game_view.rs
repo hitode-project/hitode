@@ -230,14 +230,7 @@ impl GameView {
         }
     }
 
-    pub(crate) fn frame_rate(&self, rate: u32) {
-        if let Some(link) = self.hub().link.borrow().as_ref() {
-            link.setPreferredFrameRateRange(CAFrameRateRange {
-                minimum: rate as f32,
-                maximum: rate as f32,
-                preferred: rate as f32,
-            });
-        }
+    pub(crate) fn frame_presented(&self) {
         self.request_frame();
     }
 

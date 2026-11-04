@@ -300,7 +300,6 @@ impl Display {
         self.totals.configurations += 1;
         if let Some(c) = &mut self.compositor {
             c.set_scale(self.settings.scale);
-            c.set_frame_rate(self.settings.rate);
         }
     }
     pub fn set_waker(&mut self, wake: Wake) {
@@ -341,13 +340,10 @@ impl Display {
             || self.settings.placement != settings.placement
             || self.settings.upscaler != settings.upscaler
             || self.settings.background != settings.background;
-        if let Some(c) = &mut self.compositor {
-            if self.settings.scale != settings.scale {
-                c.set_scale(settings.scale);
-            }
-            if self.settings.rate != settings.rate {
-                c.set_frame_rate(settings.rate);
-            }
+        if let Some(c) = &mut self.compositor
+            && self.settings.scale != settings.scale
+        {
+            c.set_scale(settings.scale);
         }
         self.settings = settings;
         if redraw {

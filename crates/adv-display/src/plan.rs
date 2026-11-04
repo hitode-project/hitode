@@ -111,7 +111,6 @@ impl Placement {
 pub struct Settings {
     pub placement: Placement,
     pub scale: f64,
-    pub rate: u32,
     /// The view in physical pixels, before rotation.
     pub view: (u32, u32),
     /// Panel orientation relative to the view.

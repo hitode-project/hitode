@@ -377,7 +377,6 @@ mod native {
         drained: u64,
         rects: Vec<ARect>,
         fences: Vec<SyncFenceInfo>,
-        frame_rate: u32,
         signal_thread: Option<std::thread::JoinHandle<()>>,
     }
     impl SurfaceCompositor {
@@ -426,7 +425,6 @@ mod native {
                 drained: 0,
                 rects: Vec::new(),
                 fences: Vec::new(),
-                frame_rate: 60,
                 signal_thread: None,
             })
         }
@@ -453,7 +451,9 @@ mod native {
                     color: None,
                 });
                 if id == Some(LayerId::Base) {
-                    set_rate(handle.as_ptr(), self.frame_rate);
+                    // Presentation never exceeds 60 Hz (HOST-SES-8); an idle
+                    // layer posts nothing and its request lapses (HOST-SES-11).
+                    set_rate(handle.as_ptr(), 60);
                 }
             }
             Ok(())
@@ -480,12 +480,6 @@ mod native {
             let (signals, thread) = Signals::new(wake);
             assert!(self.inbox.owner.set(signals).is_ok());
             self.signal_thread = Some(thread);
-        }
-        fn set_frame_rate(&mut self, rate: u32) {
-            self.frame_rate = rate;
-            if let Some(base) = self.surfaces.iter().find(|s| s.id == Some(LayerId::Base)) {
-                set_rate(base.handle.as_ptr(), rate);
-            }
         }
         fn detach(&mut self) -> Option<Fence> {
             self.held.clear();

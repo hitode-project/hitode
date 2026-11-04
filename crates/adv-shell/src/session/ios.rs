@@ -130,12 +130,7 @@ impl MainLoop {
     }
 
     /// Sample the display clock for new content without delaying submission.
-    pub(super) fn arm(&self, next: Option<Instant>, rate: u32, frame: bool) -> Result<(), String> {
-        self.link.setPreferredFrameRateRange(CAFrameRateRange {
-            minimum: rate as f32,
-            maximum: rate as f32,
-            preferred: rate as f32,
-        });
+    pub(super) fn arm(&self, next: Option<Instant>, frame: bool) -> Result<(), String> {
         if crate::frontend::request_vsync(frame.then(Instant::now), self.pending.get()) {
             self.pending.set(true);
             self.link.setPaused(false);

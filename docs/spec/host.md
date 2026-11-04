@@ -198,12 +198,12 @@ Preparation MUST validate the compressed stream completely before publishing the
 The executor MUST keep at most one unlatched transaction and one newest held frame. Replacing a held frame MUST merge its damage and retire its software, swap and video resources after their reads; latch notifications MUST submit the held frame without a timer.
 **Verification**: Test
 
-### HOST-SES-11 Requested display cadence
+### HOST-SES-11 Requested display rate
 
-**Rule**: Display rate requests MUST follow publication timestamps, accounting for mailbox drops and excluding repaints. Apple display links and the Android base layer MUST receive 60/n Hz, with n the fewest recurring 1/60 s ticks per publication. A refresh lowered by such a request MUST NOT slow the guest frame clock.
-**Verification**: Test
+**Rule**: Apple display links and the Android base layer MUST request 60 Hz once, when created. The request MUST NOT follow publication cadence.
+**Verification**: Review — the request is a platform call with no observable result off device.
 
-A tick count recurs when it appears twice within the last second, so a guest that misses frames under load still requests 60 Hz. On a display slowed below 60 Hz, guest ticks subdivide its vsync to the nearest 1/60 s.
+The request is the presentation cap of HOST-SES-8, not an estimate of the guest's rate. A cadence estimate under load moves every few frames: SurfaceControl honors each value, and the display switches refresh rate on every change. A layer that posts nothing lets its request lapse, so the display still idles.
 
 Android MUST request cadence through runtime-resolved `ASurfaceTransaction_setFrameRate` on the SurfaceControl base layer, updating the request only when the estimated rate changes.
 

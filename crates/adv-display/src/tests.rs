@@ -18,7 +18,6 @@ fn settings() -> Settings {
     Settings {
         placement: crate::plan::Placement::Fit,
         scale: 1.,
-        rate: 60,
         view: (640, 480),
         rotation: Rotation::None,
         upscaler: Upscaler::Off,

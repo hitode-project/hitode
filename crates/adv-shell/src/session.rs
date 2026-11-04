@@ -528,11 +528,7 @@ impl Driver {
             let result = self.main_loop.borrow().as_ref().map(|main_loop| {
                 #[cfg(target_os = "ios")]
                 {
-                    main_loop.arm(
-                        next,
-                        self.view.requested_rate.get(),
-                        self.view.frame_clock.replace(false),
-                    )
+                    main_loop.arm(next, self.view.frame_clock.replace(false))
                 }
                 #[cfg(target_os = "android")]
                 {

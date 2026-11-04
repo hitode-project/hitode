@@ -68,7 +68,6 @@ pub struct Ui {
     presented: bool,
 
     #[cfg(host_view)]
-    cadence: crate::frame_pacer::Cadence,
     #[cfg(host_view)]
     pub(crate) menu_changed: bool,
     #[cfg(host_view)]
@@ -138,7 +137,6 @@ pub fn channel(wake: WakeEvent, keys: Arc<KeyState>) -> Result<(Worker, Ui), Str
             presented: false,
 
             #[cfg(host_view)]
-            cadence: Default::default(),
             #[cfg(host_view)]
             menu_changed: false,
             #[cfg(host_view)]
@@ -435,9 +433,7 @@ impl Ui {
                     }
                     crate::display::Feedback::Presented(completed) => completed,
                 };
-                self.cadence
-                    .published(completed.serial, completed.published_at);
-                window.frame_rate(self.cadence.rate());
+                window.frame_presented();
                 self.metric(Delivery::Native(completed.stats));
                 window.native_canvas(completed.canvas)?;
                 window.place(Some(completed.placement));
@@ -458,10 +454,7 @@ impl Ui {
                     completed.at,
                 ));
             }
-            self.native
-                .as_mut()
-                .unwrap()
-                .update(dimensions, self.cadence.rate(), scale);
+            self.native.as_mut().unwrap().update(dimensions, scale);
             self.repaint = false;
         }
         self.deadline(window)

@@ -40,6 +40,8 @@ pub enum ViewEvent {
 
 /// Trackpad cursor travel per finger travel.
 const TRACKPAD_GAIN: f32 = 1.25;
+/// Receives what the game view reports to the host.
+type Listener = Box<dyn Fn(ViewEvent)>;
 pub struct GameView {
     #[cfg(target_os = "android")]
     window: Cell<Option<NonNull<ndk_sys::ANativeWindow>>>,
@@ -65,7 +67,7 @@ pub struct GameView {
     cursor: Cell<(f32, f32)>,
     /// MK_ flags of buttons held through `mouse_button`.
     buttons: Cell<u32>,
-    listener: RefCell<Option<Box<dyn Fn(ViewEvent)>>>,
+    listener: RefCell<Option<Listener>>,
     /// The dialogs last sent to the listener.
     dialogs: RefCell<adv_runtime::DialogSet>,
     menu: RefCell<adv_runtime::MenuBar>,
@@ -81,7 +83,6 @@ pub struct GameView {
     control: Cell<bool>,
     physical_keys: RefCell<std::collections::BTreeSet<i32>>,
     keys: RefCell<Arc<adv_sync::input::KeyState>>,
-    pub(crate) requested_rate: Cell<u32>,
     pub(crate) frame_clock: Cell<bool>,
     pub(crate) period: Cell<i64>,
 }
@@ -128,7 +129,6 @@ impl GameView {
             control: Cell::new(false),
             physical_keys: RefCell::new(Default::default()),
             keys: RefCell::new(Arc::default()),
-            requested_rate: Cell::new(60),
             frame_clock: Cell::new(false),
             period: Cell::new(16_666_667),
         });
@@ -238,7 +238,7 @@ impl GameView {
     }
     /// Receives the host's view events: layout, keyboard requests and, on
     /// Android, the trackpad cursor.
-    pub fn set_listener(&self, listener: Box<dyn Fn(ViewEvent)>) {
+    pub fn set_listener(&self, listener: Listener) {
         *self.listener.borrow_mut() = Some(listener);
     }
     pub(crate) fn notify(&self, event: ViewEvent) {
@@ -588,11 +588,8 @@ impl GameView {
     /// A mobile view cannot be minimized; the next touch restores the guest.
     pub(crate) fn minimize(&self) {}
     pub(crate) fn set_video_cursor_regions(&self, _: Arc<[adv_runtime::VideoCursorRegion]>) {}
-    pub(crate) fn frame_rate(&self, rate: u32) {
+    pub(crate) fn frame_presented(&self) {
         self.frame_clock.set(true);
-        if self.requested_rate.replace(rate) == rate {
-            return;
-        }
     }
 }
 impl GameView {

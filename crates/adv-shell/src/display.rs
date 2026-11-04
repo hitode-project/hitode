@@ -49,7 +49,6 @@ impl Shared {
 }
 pub(crate) struct Presented {
     pub serial: u64,
-    pub published_at: Instant,
     pub canvas: (u32, u32),
     pub placement: Placement,
     pub cursor_regions: Arc<[adv_runtime::VideoCursorRegion]>,
@@ -83,11 +82,10 @@ impl Ui {
             m.poke();
         }
     }
-    pub fn update(&mut self, view: (u32, u32), rate: u32, scale: f64) {
+    pub fn update(&mut self, view: (u32, u32), scale: f64) {
         let mut m = self.shared.settings.lock().unwrap();
-        if m.settings.view != view || m.settings.rate != rate || m.settings.scale != scale {
+        if m.settings.view != view || m.settings.scale != scale {
             m.settings.view = view;
-            m.settings.rate = rate;
             m.settings.scale = scale;
             m.dirty = true;
             m.poke();
@@ -173,7 +171,6 @@ pub(crate) fn channel(
         rotation: plan::Rotation::None,
         placement: plan::Placement::Fit,
         scale: 1.,
-        rate: 60,
         upscaler: Upscaler::Off,
         background: [0.; 3],
     };
@@ -237,7 +234,7 @@ pub(crate) fn apple_channel(
         objc2::MainThreadMarker::new().unwrap(),
     );
     let (startup, mut ui) = channel(device, queue, Box::new(c), view, wake)?;
-    ui.update(view, 60, scale);
+    ui.update(view, scale);
     Ok((startup, ui))
 }
 fn damage(d: &frame::Damage) -> plan::Damage {
@@ -396,7 +393,6 @@ impl Presenter {
             self.reported = Some(stamp(record, totals));
             self.shared.send(Ok(Feedback::Presented(Presented {
                 serial: p.serial,
-                published_at: p.published_at,
                 canvas: p.canvas,
                 placement: Placement {
                     rectangle: [
@@ -573,7 +569,6 @@ mod tests {
                     rotation: plan::Rotation::None,
                     placement: crate::Scaling::Fit,
                     scale: 1.,
-                    rate: 60,
                     upscaler: Upscaler::Off,
                     background: [0.; 3],
                 },
@@ -592,7 +587,7 @@ mod tests {
             caps: platform_caps(None),
         }
     }
-    // spec: HOST-VIEW-1, HOST-SES-11
+    // spec: HOST-VIEW-1
     #[test]
     fn settings_mailbox_reads_the_latest_complete_settings_and_retains_the_filter() {
         let shared = shared();
@@ -600,11 +595,10 @@ mod tests {
         ui.set_upscaler(Upscaler::Artcnn);
         ui.set_scaling(crate::Scaling::Integer);
         for n in 1..=100 {
-            ui.update((n * 8, n * 6), 30, 1.);
+            ui.update((n * 8, n * 6), 1.);
         }
         let s = shared.settings.lock().unwrap().settings.clone();
         assert_eq!(s.view, (800, 600));
-        assert_eq!(s.rate, 30);
         assert_eq!(s.placement, crate::Scaling::Integer);
         assert_eq!(s.upscaler, Upscaler::Artcnn);
         let (device, mut queue) = open(false).unwrap();
@@ -623,7 +617,7 @@ mod tests {
         startup.presenter.update(&mut queue).unwrap();
         assert!(startup.presenter.display.presentable((640, 480)));
     }
-    // spec: HOST-SES-3, HOST-SES-11
+    // spec: HOST-SES-3
     #[test]
     fn feedback_is_bounded_and_preserves_publication_and_geometry() {
         let shared = shared();
@@ -632,7 +626,6 @@ mod tests {
         for serial in 1..=140 {
             shared.send(Ok(Feedback::Presented(Presented {
                 serial,
-                published_at,
                 canvas: (320, 240),
                 placement: Placement {
                     rectangle: [10., 20., 640., 480.],
@@ -657,7 +650,6 @@ mod tests {
             panic!("presented");
         };
         assert_eq!(first.serial, 13);
-        assert_eq!(first.published_at, published_at);
         assert_eq!(first.canvas, (320, 240));
         assert_eq!(first.placement.rectangle, [10., 20., 640., 480.]);
         assert!(first.cursor_regions[0].hide_cursor);
@@ -808,7 +800,7 @@ mod tests {
             assert!(mapped.video[0].hide_cursor);
         }
     }
-    // spec: AND-APP-10, HOST-SES-11
+    // spec: AND-APP-10
     #[test]
     fn owner_services_settings_and_window_pokes_without_a_guest_frame() {
         use adv_display::compositor::*;
@@ -823,11 +815,6 @@ mod tests {
             fn set_scale(&mut self, scale: f64) {
                 if scale == 2. {
                     self.send.send("scale").unwrap();
-                }
-            }
-            fn set_frame_rate(&mut self, rate: u32) {
-                if rate == 30 {
-                    self.send.send("rate").unwrap();
                 }
             }
             fn detach(&mut self) -> Option<adv_gpu::queue::Fence> {
@@ -859,14 +846,10 @@ mod tests {
         let (startup, mut ui) =
             channel(device, queue, make(), (64, 48), WakeEvent::new().unwrap()).unwrap();
         let gpu = startup.start().unwrap();
-        ui.update((128, 96), 30, 2.);
+        ui.update((128, 96), 2.);
         assert_eq!(
             received.recv_timeout(Duration::from_secs(10)).unwrap(),
             "scale"
-        );
-        assert_eq!(
-            received.recv_timeout(Duration::from_secs(10)).unwrap(),
-            "rate"
         );
         {
             let mut m = ui.shared.settings.lock().unwrap();
@@ -885,10 +868,6 @@ mod tests {
         assert_eq!(
             received.recv_timeout(Duration::from_secs(10)).unwrap(),
             "scale"
-        );
-        assert_eq!(
-            received.recv_timeout(Duration::from_secs(10)).unwrap(),
-            "rate"
         );
         drop(gpu);
     }
