@@ -25,7 +25,7 @@ import java.nio.file.attribute.BasicFileAttributes
  */
 class DriveProvider : DocumentsProvider() {
     companion object {
-        const val AUTHORITY = "org.hitode.launcher.drive"
+        const val AUTHORITY = BuildConfig.APPLICATION_ID + ".drive"
         const val ROOT = "drive"
         private const val DRIVE = "C:"
         private val ROOT_COLUMNS = arrayOf(

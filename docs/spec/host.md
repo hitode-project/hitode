@@ -390,7 +390,7 @@ Installer state MUST use the active stack's backing directory for the guest C dr
 
 ### HOST-PKG-7 Complete package inputs
 
-**Rule**: A local launcher package build MUST stop before compiling when the complete Wine installation, or a platform toolchain it needs, is missing. The Cargo wrapper it runs through MUST carry that Wine installation.
+**Rule**: A local launcher package build MUST embed a complete Wine installation: the one `ADV_WINE_DIST` names, otherwise the pinned build. It MUST stop before compiling when that installation, or a platform toolchain it needs, is missing. The Cargo wrapper it runs through MUST carry that Wine installation.
 **Applies to**: macOS, iOS, Android
 **Verification**: Test
 
