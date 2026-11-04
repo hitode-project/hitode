@@ -138,6 +138,31 @@ struct Pipelines {
     software_video: RenderPipeline,
     sampler: Sampler,
 }
+impl Upscaled {
+    fn new(device: &Device, choice: Upscaler, canvas: (u32, u32)) -> adv_gpu::Result<Self> {
+        let upscaling = upscale::Upscaling::new(device, upscale::model(device, choice), canvas)?;
+        let output = device.create_image(&adv_gpu::resource::ImageDesc {
+            dimension: adv_gpu::resource::Dimension::D2,
+            size: adv_gpu::Extent {
+                width: canvas.0 * 2,
+                height: canvas.1 * 2,
+                depth_or_layers: 1,
+            },
+            format: upscale::OUTPUT,
+            mips: 1,
+            samples: 1,
+            usage: adv_gpu::resource::Usage::STORAGE | adv_gpu::resource::Usage::SAMPLED,
+            view_formats: &[],
+            label: "upscaled",
+        })?;
+        Ok(Self {
+            choice,
+            upscaling,
+            output,
+            pipelines: Pipelines::new(device, upscale::INPUT)?,
+        })
+    }
+}
 impl Pipelines {
     fn new(device: &Device, format: Format) -> adv_gpu::Result<Self> {
         let (video, sampler) = video::resources(device, format)?;
@@ -150,6 +175,13 @@ impl Pipelines {
             sampler,
         })
     }
+}
+/// A model build: its choice and canvas, and the result once sent. A failed
+/// build stays here, so the view stays unscaled instead of retrying.
+struct Building {
+    key: (Upscaler, (u32, u32)),
+    result: std::sync::mpsc::Receiver<adv_gpu::Result<Upscaled>>,
+    failed: bool,
 }
 /// The selected model at one canvas size and the doubled image it keeps
 /// complete, which the output pass reads.
@@ -176,6 +208,8 @@ pub struct Display {
     /// Keyed by decoder pool, software base and target format.
     converted: HashMap<(usize, bool, Format), Converted>,
     upscaled: Option<Upscaled>,
+    /// The model being built off the owner thread, for this choice and canvas.
+    building: Option<Building>,
     /// Each video's current decoder image while it is not attached.
     leases: HashMap<u64, PresentImage>,
     ring: Ring,
@@ -222,6 +256,7 @@ impl Display {
             pipelines,
             converted: HashMap::new(),
             upscaled: None,
+            building: None,
             leases: HashMap::new(),
             ring,
             spans: vec![],
@@ -263,6 +298,11 @@ impl Display {
     }
     pub fn ledger(&self) -> &PoolState {
         &self.pools
+    }
+    /// Whether the selected model is installed, taking a finished build.
+    #[cfg(test)]
+    pub(crate) fn upscaler_ready(&mut self) -> bool {
+        self.install() || self.upscaled.is_some()
     }
     /// The base image the compositor shows last.
     #[cfg(test)]
@@ -633,6 +673,11 @@ impl Display {
         Ok(())
     }
     pub fn service(&mut self, queue: &mut Queue) -> Result<(), Error> {
+        if self.install()
+            && let Some(frame) = self.redraw_frame()
+        {
+            self.present(queue, frame).map_err(|e| e.error)?;
+        }
         self.drain(queue)?;
         if self.attachable()
             && let Some(p) = self.held.take()
@@ -712,44 +757,67 @@ impl Display {
         }
         Ok(())
     }
-    /// Keep the selected model at this canvas size. A new one starts with an
-    /// invalid ledger: the planner invalidates on upscaler changes, and a
-    /// new canvas size is a new pool.
-    fn upscale(&mut self, choice: Upscaler, canvas: (u32, u32)) -> adv_gpu::Result<()> {
+    /// The upscaler this frame can run: `choice` once its model is built for
+    /// `canvas`, otherwise none while a build runs off the owner thread
+    /// (pipeline creation blocks for long on mobile drivers).
+    fn upscaler(&mut self, choice: Upscaler, canvas: (u32, u32)) -> Upscaler {
+        self.install();
+        let key = (choice, canvas);
+        if choice == Upscaler::Off {
+            self.upscaled = None;
+            self.building = None;
+            return choice;
+        }
         if self
             .upscaled
             .as_ref()
-            .is_some_and(|u| u.choice == choice && u.upscaling.size() == canvas)
+            .is_some_and(|u| (u.choice, u.upscaling.size()) == key)
         {
-            return Ok(());
+            return choice;
         }
-        let pipelines = match self.upscaled.take() {
-            Some(u) => u.pipelines,
-            None => Pipelines::new(&self.device, upscale::INPUT)?,
+        if self.building.as_ref().is_none_or(|b| b.key != key) {
+            let (send, result) = std::sync::mpsc::sync_channel(1);
+            let (device, wake) = (self.device.clone(), self.wake.clone());
+            let spawned = std::thread::Builder::new()
+                .name("adv-upscale-build".into())
+                .spawn(move || {
+                    let _ = send.send(Upscaled::new(&device, choice, canvas));
+                    if let Some(wake) = wake {
+                        wake();
+                    }
+                });
+            self.building = Some(Building {
+                key,
+                result,
+                failed: spawned.is_err(),
+            });
+        }
+        Upscaler::Off
+    }
+    /// Take a finished build. Content shown so far is unscaled, so the next
+    /// frame is whole.
+    fn install(&mut self) -> bool {
+        let Some(building) = self.building.as_mut().filter(|b| !b.failed) else {
+            return false;
         };
-        let model = upscale::model(&self.device, choice);
-        let upscaling = upscale::Upscaling::new(&self.device, model, canvas)?;
-        let output = self.device.create_image(&adv_gpu::resource::ImageDesc {
-            dimension: adv_gpu::resource::Dimension::D2,
-            size: adv_gpu::Extent {
-                width: canvas.0 * 2,
-                height: canvas.1 * 2,
-                depth_or_layers: 1,
-            },
-            format: upscale::OUTPUT,
-            mips: 1,
-            samples: 1,
-            usage: adv_gpu::resource::Usage::STORAGE | adv_gpu::resource::Usage::SAMPLED,
-            view_formats: &[],
-            label: "upscaled",
-        })?;
-        self.upscaled = Some(Upscaled {
-            choice,
-            upscaling,
-            output,
-            pipelines,
-        });
-        Ok(())
+        match building.result.try_recv() {
+            Ok(Ok(upscaled)) => {
+                self.building = None;
+                self.upscaled = Some(upscaled);
+                self.pools.invalidate();
+                self.invalid = true;
+                true
+            }
+            Ok(Err(error)) => {
+                eprintln!(
+                    "[display] {:?} upscaler unavailable: {error:?}",
+                    building.key.0
+                );
+                building.failed = true;
+                false
+            }
+            Err(_) => false,
+        }
     }
     fn draw_video(
         &mut self,
@@ -829,6 +897,7 @@ impl Display {
             })
         }));
         let mut settings = self.settings.clone();
+        settings.upscaler = self.upscaler(settings.upscaler, info.canvas);
         if settings.view.0 == 0 || settings.view.1 == 0 {
             settings.view = self
                 .recorder
@@ -915,13 +984,7 @@ impl Display {
         for stage in &planned.stages {
             let format = match stage {
                 Stage::Video { .. } => adv_gpu::present::COLOR_FORMAT,
-                Stage::Upscale { video, .. } => {
-                    self.upscale(settings.upscaler, frame.info.canvas)?;
-                    if !video {
-                        continue;
-                    }
-                    upscale::INPUT
-                }
+                Stage::Upscale { video: true, .. } => upscale::INPUT,
                 _ => continue,
             };
             let software = matches!(frame.base, Base::Software { .. });

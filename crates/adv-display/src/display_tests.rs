@@ -1053,6 +1053,26 @@ fn upscaled_partial_frames_match_a_whole_run_across_buffer_ages() {
         q.submit(encoder).unwrap();
     };
     let mut pixels: Vec<u8> = (0..64 * 48 * 4).map(|i| (i * 7 % 251) as u8).collect();
+    // The model builds off the owner thread; frames show unscaled meanwhile.
+    let ready = |display: &mut Display, q: &mut Queue, pixels: &[u8]| {
+        upload(q, pixels);
+        display
+            .present(q, frame(100, &image, Damage::Whole))
+            .unwrap();
+        assert_eq!(
+            display.recorder().latest().unwrap().settings.upscaler,
+            Upscaler::Off
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !display.upscaler_ready() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "upscaler build timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    };
+    ready(&mut display, &mut q, &pixels);
     let rect = |x, y, w, h| Rect { x, y, w, h };
     // Changes at edges and apart, each frame into the older of two buffers.
     let changes = [
@@ -1087,6 +1107,7 @@ fn upscaled_partial_frames_match_a_whole_run_across_buffer_ages() {
     assert_eq!(tiles.rects, [rect(48, 32, 16, 16)]);
     let partial = read(&d, &mut q, &display.shown_base());
     let mut whole = Display::new(d.clone(), compositor(&history), upscaled).unwrap();
+    ready(&mut whole, &mut q, &pixels);
     whole
         .present(&mut q, frame(1, &image, Damage::Whole))
         .unwrap();
