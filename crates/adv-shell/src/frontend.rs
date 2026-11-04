@@ -223,7 +223,7 @@ impl Worker {
 }
 impl Ui {
     /// The frame clock fired: one display refresh passed.
-    #[cfg(target_vendor = "apple")]
+    #[cfg(host_view)]
     pub(crate) fn refreshed(&self) {
         if let Some(native) = &self.native {
             native.refreshed();
@@ -534,6 +534,17 @@ fn refresh_deadline(
 ) -> Option<Instant> {
     (!in_flight && dirty && dimensions.0 != 0 && dimensions.1 != 0).then_some(next)
 }
+/// Whether a vsync `elapsed_ns` after the last counted one is a presentation
+/// refresh: faster panels count every n-th vsync, the fewest that keep
+/// presentation at or below 60 Hz.
+#[cfg(any(target_os = "android", test))]
+pub(crate) fn counts_refresh(elapsed_ns: i64, period_ns: i64) -> bool {
+    const SIXTY: i64 = 16_666_667;
+    let period = if period_ns > 0 { period_ns } else { SIXTY };
+    // The tolerance absorbs periods a little shorter than an exact divisor.
+    let every = ((SIXTY as f64 / period as f64 - 0.05).ceil() as i64).max(1);
+    elapsed_ns >= every * period - period / 2
+}
 #[cfg(any(mobile, test))]
 pub(crate) fn request_vsync(next: Option<Instant>, pending: bool) -> bool {
     !pending && next.is_some_and(|next| next <= Instant::now())
@@ -581,6 +592,29 @@ mod tests {
             refresh_deadline(overdue, false, true, (320, 240)),
             Some(overdue)
         );
+    }
+    // spec: HOST-SES-8
+    #[test]
+    fn presentation_refreshes_stay_at_sixty_hertz_on_faster_panels() {
+        let count = |period: i64, ticks: i64| {
+            let mut last = i64::MIN / 2;
+            (1..=ticks)
+                .filter(|&n| {
+                    let at = n * period + if n % 2 == 0 { 300_000 } else { -300_000 };
+                    let counted = counts_refresh(at - last, period);
+                    if counted {
+                        last = at;
+                    }
+                    counted
+                })
+                .count()
+        };
+        // One second of vsyncs with jitter, at 60, 120, 90 and 144 Hz.
+        assert_eq!(count(16_666_667, 60), 60);
+        assert_eq!(count(8_333_333, 120), 60);
+        assert_eq!(count(11_111_111, 90), 45);
+        assert_eq!(count(6_944_444, 144), 48);
+        assert!(counts_refresh(16_666_667, 0));
     }
     // spec: AND-APP-10
     #[test]

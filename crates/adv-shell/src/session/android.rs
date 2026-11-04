@@ -16,6 +16,8 @@ pub(super) struct MainLoop {
     wake_fd: i32,
     choreographer: *mut AChoreographer,
     pending: Cell<bool>,
+    /// Frame time of the last refresh presentation counted, in nanoseconds.
+    counted: Cell<i64>,
     unregister: Option<RateHook>,
     driver: Weak<Driver>,
 }
@@ -55,6 +57,7 @@ impl MainLoop {
             wake_fd: driver.wake.as_raw_fd(),
             choreographer,
             pending: Cell::new(false),
+            counted: Cell::new(i64::MIN / 2),
             unregister: (!register.is_null() && !unregister.is_null())
                 .then(|| unsafe { std::mem::transmute::<*mut c_void, RateHook>(unregister) }),
             driver: Rc::downgrade(driver),
@@ -87,15 +90,26 @@ impl MainLoop {
         driver.wake.signal();
         Ok(main_loop)
     }
+    fn post_frame(&self) {
+        self.pending.set(true);
+        // One Weak token survives teardown until the uncancellable callback.
+        let data = Box::into_raw(Box::new(self.driver.clone())).cast();
+        unsafe {
+            AChoreographer_postFrameCallback64(self.choreographer, Some(frame_callback), data);
+        }
+    }
+    /// Whether the frame at `frame_ns` is a presentation refresh.
+    fn counts(&self, frame_ns: i64, period: i64) -> bool {
+        let counted = crate::frontend::counts_refresh(frame_ns - self.counted.get(), period);
+        if counted {
+            self.counted.set(frame_ns);
+        }
+        counted
+    }
     pub(super) fn arm(&self, next: Option<Instant>, frame: bool) -> Result<(), String> {
         let mut spec: libc::itimerspec = unsafe { std::mem::zeroed() };
         if crate::frontend::request_vsync(frame.then(Instant::now), self.pending.get()) {
-            self.pending.set(true);
-            // One Weak token survives teardown until the uncancellable callback.
-            let data = Box::into_raw(Box::new(self.driver.clone())).cast();
-            unsafe {
-                AChoreographer_postFrameCallback64(self.choreographer, Some(frame_callback), data);
-            }
+            self.post_frame();
         }
         if let Some(next) = next {
             let delay = next.saturating_duration_since(Instant::now());
@@ -131,11 +145,20 @@ unsafe extern "C" fn fd_callback(fd: i32, _: i32, data: *mut c_void) -> i32 {
     driver.drive();
     1
 }
-unsafe extern "C" fn frame_callback(_: i64, data: *mut c_void) {
+unsafe extern "C" fn frame_callback(frame_ns: i64, data: *mut c_void) {
     let weak = unsafe { Box::from_raw(data as *mut Weak<Driver>) };
     if let Some(driver) = weak.upgrade() {
-        if let Some(main_loop) = driver.main_loop.borrow().as_ref() {
+        let counted = driver.main_loop.borrow().as_ref().is_none_or(|main_loop| {
             main_loop.pending.set(false);
+            let counted = main_loop.counts(frame_ns, driver.view.period.get());
+            if !counted {
+                // A waiting frame attaches on the next counted refresh.
+                main_loop.post_frame();
+            }
+            counted
+        });
+        if counted {
+            driver.refreshed();
         }
         driver.drive();
     }

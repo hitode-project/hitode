@@ -522,7 +522,6 @@ impl Driver {
             callback(result);
         }
     }
-    #[cfg(target_vendor = "apple")]
     fn refreshed(&self) {
         if let Some(ui) = self.ui.borrow().as_ref() {
             ui.refreshed();
