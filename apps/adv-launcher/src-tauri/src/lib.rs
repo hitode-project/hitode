@@ -23,6 +23,8 @@ mod mobile_view;
 pub mod overlay;
 #[cfg(any(target_os = "macos", target_os = "android", target_os = "ios"))]
 mod play;
+#[cfg(target_os = "ios")]
+mod remote_pairing;
 mod report;
 #[cfg(any(target_os = "macos", target_os = "android", target_os = "ios"))]
 mod settings;

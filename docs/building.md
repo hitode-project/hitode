@@ -2,6 +2,8 @@
 
 This page lists how to build, test and package each front end. Games are never part of a build: point `ADV_SAMPLES` at your own game folder when a command needs one.
 
+To build installable apps on an Apple silicon Mac, run `python3 tools/macos/package_launcher.py mac`, `ios`, `android`, or `all`. Before compiling, it lists every missing tool with the command that installs it. See [Launcher](#launcher).
+
 ## Requirements
 
 - Rust stable with rustfmt, and Python 3.
@@ -144,6 +146,20 @@ missing build input.
 When generating a mobile Cargo wrapper below, set `ADV_WINE_DIST` at that step;
 the wrapper carries it through Xcode's restricted build environment.
 
+Build local launcher packages with one command:
+
+```sh
+python3 tools/macos/package_launcher.py all                 # mac, ios and android
+python3 tools/macos/package_launcher.py android --install   # build and install on the phone
+```
+
+- Name one or more of `mac`, `ios` and `android`, or `all`. Packages land in `target/package/<platform>/`: an ad hoc signed `Hitode.app`, a development signed `Hitode.ipa`, and an aligned `Hitode.apk` signed with the SDK debug key.
+- Every input is checked before compiling. Unset `ADV_WINE_DIST` downloads the pinned Wine build into `target/wine` once. The tool refreshes the `build.py` wrapper for each platform so it carries Wine, sets `LIBCLANG_PATH`, uses `sccache` when installed and installs the launcher packages when missing.
+- Android finds JDK 21, the SDK and the NDK the Gradle project names, from `JAVA_HOME`, `ANDROID_HOME` and `NDK_HOME` or their Homebrew locations. iOS needs `APPLE_DEVELOPMENT_TEAM`.
+- `--install` uses the only connected device of each platform; `--install DEVICE` names it for one mobile platform.
+- A debug-signed APK cannot update a release-signed install. `--side-by-side NAME` suffixes the application ID with `NAME`, so the APK installs as a separate app beside the release.
+- `-- COMMAND` with one platform prepares the same environment and runs `COMMAND` in `apps/adv-launcher` instead of the standard build.
+
 For a macOS release, run `python3 tools/macos/build.py --ffmpeg-only`, then put its printed wrapper folder first on `PATH` and run `pnpm tauri build --target aarch64-apple-darwin --bundles app,dmg`. The wrapper selects the static FFmpeg, remaps build paths and strips release debug records. Preserve a separate dSYM when needed, and run `strip -x` on the bundled executable before its final signature to remove local symbols. The bundle is signed ad hoc with Hardened Runtime and only the `allow-jit` entitlement. The version comes from `package.json`, and must match the Cargo workspace version.
 
 ## macOS release package
@@ -173,16 +189,12 @@ target/macos/ADV.app/Contents/MacOS/adv-run --wine <distribution> --audio \
 The Android app is the launcher built for Android. It needs Android SDK platform and build tools 36, NDK r28c or newer, JDK 21 and the `aarch64-linux-android` Rust target, with `JAVA_HOME`, `ANDROID_HOME` and `NDK_HOME` set. Like the iOS app, it links a decode-only static FFmpeg built from `ffmpeg.json`.
 
 ```sh
-ANDROID_NDK_HOME=$NDK_HOME python3 tools/macos/build.py --android
-cd apps/adv-launcher
-pnpm install --frozen-lockfile
-PATH=../../target/android-ffmpeg/bin:$PATH \
-  CARGO_PROFILE_RELEASE_STRIP=debuginfo pnpm tauri android build --apk --target aarch64
+python3 tools/macos/package_launcher.py android
 ```
 
 - `build.py --android` writes a `cargo` wrapper into `target/android-ffmpeg/bin` that sets `FFMPEG_DIR` and points bindgen at the NDK headers.
 
-- The strip setting keeps the release profile's line tables out of the APK, which stores native libraries uncompressed. The release APK is `src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release-unsigned.apk`. Sign it with `apksigner` and a keystore kept outside the repository, since `cargo clean` empties `target/`. Keep that keystore: only the same key can update an installed copy without losing its library and saves.
+- The wrapper's strip setting keeps the release profile's line tables out of the APK, which stores native libraries uncompressed. The release APK is `src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release-unsigned.apk`. Sign it with `apksigner` and a keystore kept outside the repository, since `cargo clean` empties `target/`. Keep that keystore: only the same key can update an installed copy without losing its library and saves.
 - `--debug` builds a debuggable APK signed with the SDK debug key. Its native code is unoptimized, so use it for startup and lifecycle checks, not gameplay.
 - `python3 tools/android/check-apk.py <apk>` checks 16 KiB ELF and ZIP alignment. These checks prove packaging properties, not execution on a 16 KiB device.
 - `tools/android/run-cpu-tests.ps1` runs the CPU tests on a device through adb. [tools/android/README.md](../tools/android/README.md) covers its options.
@@ -201,10 +213,7 @@ In the app, import a complete game folder, choose its `.exe` and code page, and 
 The iOS app links a decode-only static FFmpeg built for iPhone arm64 from the same `ffmpeg.json` as the macOS release.
 
 ```sh
-python3 tools/macos/build.py --ios
-cd apps/adv-launcher
-PATH=../../target/ios-ffmpeg/bin:$PATH APPLE_DEVELOPMENT_TEAM=<team> \
-  pnpm tauri ios build --export-method debugging --target aarch64
+APPLE_DEVELOPMENT_TEAM=<team> python3 tools/macos/package_launcher.py ios
 ```
 
 - Tauri's Xcode build passes only `HOME` and `PATH` on to Cargo, so `FFMPEG_DIR` cannot be set directly. `build.py --ios` writes a `cargo` wrapper into `target/ios-ffmpeg/bin` that sets it and strips release debug records. Both iOS executables also strip linker debug records on export.

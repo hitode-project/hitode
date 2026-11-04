@@ -24,6 +24,7 @@ enum Mode {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct Request {
     #[serde(default)]
     mode: Mode,
@@ -31,6 +32,9 @@ struct Request {
     pid: u32,
     #[serde(default)]
     pairing: Vec<u8>,
+    /// RemotePairing's port, which the host discovers.
+    #[serde(default)]
+    remote_pairing_port: u16,
 }
 
 define_class!(
@@ -100,9 +104,13 @@ fn run(endpoint: &str) -> Result<(), Box<dyn std::error::Error>> {
         Mode::Enable => runtime.block_on(async {
             tokio::time::timeout(
                 Duration::from_secs(240),
-                crate::device::enable(request.pid, &request.pairing, &cache, &|stage| {
-                    send(stage, None)
-                }),
+                crate::device::enable(
+                    request.pid,
+                    &request.pairing,
+                    request.remote_pairing_port,
+                    &cache,
+                    &|stage| send(stage, None),
+                ),
             )
             .await
             .map_err(|_| "JIT helper timed out".to_string())?

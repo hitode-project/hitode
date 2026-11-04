@@ -36,7 +36,7 @@
         <!-- Drive C: of the Wine prefix, in the system Files app. -->
         <provider
           android:name=".DriveProvider"
-          android:authorities="org.hitode.launcher.drive"
+          android:authorities="${applicationId}.drive"
           android:exported="true"
           android:grantUriPermissions="true"
           android:permission="android.permission.MANAGE_DOCUMENTS">

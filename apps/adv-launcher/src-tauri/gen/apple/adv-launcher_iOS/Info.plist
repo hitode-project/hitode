@@ -15,13 +15,17 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.2.3</string>
+	<string>0.2.4</string>
 	<key>CFBundleVersion</key>
-	<string>0.2.3</string>
+	<string>0.2.4</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<key>LSSupportsOpeningDocumentsInPlace</key>
 	<true/>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_remotepairing._tcp</string>
+	</array>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Connect to this device through LocalDevVPN to enable JIT.</string>
 	<key>UIFileSharingEnabled</key>

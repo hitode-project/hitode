@@ -38,6 +38,10 @@ It accepts installed families and imported font files; Auto restores the runtime
 Volume, mute, scaling and FPS controls in the game overlay apply immediately.
 Snapshots include the independent game data directory and registry. Automatic backups default to on with five retained copies; retention choices are three, five or ten and exclude manual backups.
 
+On iOS, JIT warnings are shown by default; "Don't remind me again" on the library banner persistently hides both the banner and game-launch warnings (`hideJitWarnings`).
+LiveContainer folder-import guidance is shown once and records `liveContainerImportHintSeen` when displayed.
+Both choices use `adv-launcher.prefs` and survive launcher restarts.
+
 The import page lists VNDB candidates for the game and links only the one the user picks; the default is no link. Searching accepts names, `v` identifiers and VNDB visual novel links, ten candidates per page.
 Searching automatically at import stays off until the user answers a one-time prompt on the first import; dismissing it keeps search manual. The choice lives in `adv-launcher.prefs` and the settings switch changes it. Only game names are sent.
 Metadata and cached thumbnails persist in `library.json`; refreshing metadata preserves the independently editable display name.
@@ -95,8 +99,9 @@ Header macros, placeholder names in script examples and names read only to clear
 | `ADV_TEXT_DIAGNOSTICS` | Diagnostic | Off |
 | `ADV_TIER1_CENSUS` | Diagnostic | Off; census of x87 exact-path forms |
 | `ADV_VERIFY_FRAMES` | Diagnostic | Off; `1` executes every D3D9 frame and asynchronously compares pixels outside computed damage with the previous readback |
-| `ADV_WINE_DIST` | Build / Fixture | The Wine installation embedded into the player; required for playable builds. Unset: Wine integration tests skip and pass; set: it must be complete |
+| `ADV_WINE_DIST` | Build / Fixture | The Wine installation embedded into the player; required for playable builds; `tools/macos/package_launcher.py` downloads the pinned build when unset. Unset: Wine integration tests skip and pass; set: it must be complete |
 | `ADV_WINE_PROBES` | Fixture | Set by device runners to probes the host built; elsewhere tests build them |
+| `HITODE_ANDROID_ID_SUFFIX` | Build | Unset: application ID `org.hitode.launcher`; set by `package_launcher.py --side-by-side` |
 | `VK_DRIVER_FILES` | Fixture | Unset: Vulkan loader discovers drivers. The lavapipe CI job selects its software ICD explicitly |
 
 The `adv-dx/d3d9-counters` Cargo feature adds a D3D9 work report: retained

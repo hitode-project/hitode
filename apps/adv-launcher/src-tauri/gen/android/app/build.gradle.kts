@@ -21,6 +21,8 @@ android {
     defaultConfig {
         manifestPlaceholders["usesCleartextTraffic"] = "false"
         applicationId = "org.hitode.launcher"
+        // A suffix installs a test build beside the signed release (tools/macos/package_launcher.py).
+        System.getenv("HITODE_ANDROID_ID_SUFFIX")?.let { applicationIdSuffix = ".$it" }
         minSdk = 29
         targetSdk = 36
         ndk {

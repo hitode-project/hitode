@@ -24,15 +24,22 @@ const DDI_REVISION: &str = "6eae353ae694bda1c421d4a3eee5459ae59c99a1";
 pub async fn enable(
     pid: u32,
     pairing: &[u8],
+    remote_pairing_port: u16,
     cache: &Path,
     progress: &impl Fn(&str),
 ) -> Result<()> {
     progress("connecting");
     let mut pairing = RpPairingFile::from_bytes(pairing)?;
-    let socket = connect_vpn(49152).await?;
-    let mut remote = RemotePairingClient::new(RpPairingSocket::new(socket), "Hitode");
-    remote.attempt_pair_verify().await?;
-    remote.validate_pairing(&mut pairing).await?;
+    let socket = connect_vpn(remote_pairing_port).await?;
+    let pair = async {
+        let mut remote = RemotePairingClient::new(RpPairingSocket::new(socket), "Hitode");
+        remote.attempt_pair_verify().await?;
+        remote.validate_pairing(&mut pairing).await?;
+        Result::Ok(remote)
+    };
+    let mut remote = pair
+        .await
+        .map_err(|e| format!("RemotePairing port {remote_pairing_port}: {e}"))?;
     let port = remote.create_tcp_listener().await?;
     let tunnel =
         connect_tls_psk_tunnel_native(connect_vpn(port).await?, remote.encryption_key()).await?;
@@ -104,8 +111,10 @@ async fn connect_vpn(port: u16) -> Result<TcpStream> {
     .await
     {
         Ok(Ok(socket)) => Ok(socket),
-        Ok(Err(error)) => Err(format!("LocalDevVPN unreachable: {error}").into()),
-        Err(_) => Err("LocalDevVPN unreachable: connection timed out".into()),
+        Ok(Err(error)) => Err(format!("LocalDevVPN unreachable: {error} (port {port})").into()),
+        Err(_) => {
+            Err(format!("LocalDevVPN unreachable: connection timed out (port {port})").into())
+        }
     }
 }
 
