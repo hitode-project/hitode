@@ -543,9 +543,15 @@ impl Bindings {
         }
         if let Bind::Sampled(view) | Bind::StorageImage(view) = resource {
             let layout = vk::ImageLayout::from_raw(bound.layout);
-            let stale = view.inner.0.image.inner.core.states.lock().unwrap()[..]
-                .iter()
-                .any(|s| s.layout != layout);
+            let desc = &view.inner.0.desc;
+            let core = &view.inner.0.image.inner.core;
+            let states = core.states.lock().unwrap();
+            let stale = desc.layers.clone().any(|layer| {
+                desc.mips
+                    .clone()
+                    .any(|mip| states[(layer * core.desc.mips + mip) as usize].layout != layout)
+            });
+            drop(states);
             if stale {
                 // Inside a render pass the barrier goes to the pass preamble.
                 let command = encoder.command;
