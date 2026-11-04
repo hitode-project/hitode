@@ -200,8 +200,10 @@ The executor MUST keep at most one unlatched transaction and one newest held fra
 
 ### HOST-SES-11 Requested display cadence
 
-**Rule**: Display rate requests MUST follow publication timestamps, accounting for mailbox drops and excluding repaints. Supported Apple display links and the Android SurfaceControl base layer MUST receive the estimated guest cadence, capped at 60 Hz.
+**Rule**: Display rate requests MUST follow publication timestamps, accounting for mailbox drops and excluding repaints. Apple display links and the Android base layer MUST receive 60/n Hz, with n the fewest recurring 1/60 s ticks per publication. A refresh lowered by such a request MUST NOT slow the guest frame clock.
 **Verification**: Test
+
+A tick count recurs when it appears twice within the last second, so a guest that misses frames under load still requests 60 Hz. On a display slowed below 60 Hz, guest ticks subdivide its vsync to the nearest 1/60 s.
 
 Android MUST request cadence through runtime-resolved `ASurfaceTransaction_setFrameRate` on the SurfaceControl base layer, updating the request only when the estimated rate changes.
 
