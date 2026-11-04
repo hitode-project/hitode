@@ -20,6 +20,8 @@ pub enum Base {
         image: PresentImage,
         ready: Token,
     },
+    /// A private swap image: the guest writes the other one of its pair
+    /// next, so a frame waiting unencoded keeps its content.
     Private(Image),
     Software {
         buffer: adv_gpu::Buffer,
@@ -270,8 +272,8 @@ pub struct Display {
     encoded_refresh: u64,
     attached_refresh: u64,
     held: Option<Pending>,
-    /// A software or presentable frame waiting, unencoded, for the next
-    /// attach; a newer frame replaces it.
+    /// A guest frame waiting, unencoded, for its refresh; a newer frame
+    /// replaces it.
     deferred: Option<Frame>,
     video: Vec<Video>,
     publication: Option<Publication>,
@@ -666,9 +668,12 @@ impl Display {
     }
     /// Whether a waiting frame should be encoded now: once per refresh, so it
     /// is ready when the previous present latches; without a frame clock,
-    /// once it can attach.
+    /// once it can attach. Never while an encoded frame still waits to attach:
+    /// a frame encoded only to be replaced is GPU work nobody sees, and a late
+    /// latch would otherwise pile encodes up behind the slow GPU.
     fn encodable(&self) -> bool {
         self.showing()
+            && self.held.is_none()
             && match self.refresh {
                 Some(r) => r > self.encoded_refresh,
                 None => self.unlatched.is_none(),
@@ -684,11 +689,10 @@ impl Display {
         if let Some(older) = self.deferred.take() {
             frame.inherit(older);
         }
-        // Until it is due, a frame whose base stays valid waits unencoded; a
-        // private swap image must be read before the guest writes it again.
-        if !self.encodable()
-            && matches!(frame.base, Base::Software { .. } | Base::Presentable { .. })
-        {
+        // Until it is due, a guest frame waits unencoded and the next one
+        // replaces it: each base stays valid while it waits (a software slot,
+        // a swap buffer, a private swap image the guest no longer writes).
+        if !self.encodable() && !matches!(frame.base, Base::Retained { .. }) {
             self.deferred = Some(frame);
             return Ok(Token(0));
         }
@@ -868,13 +872,14 @@ impl Display {
             self.present(queue, frame).map_err(|e| e.error)?;
         }
         self.drain(queue)?;
-        if self.deferred.is_some() && self.encodable() {
-            let frame = self.deferred.take().unwrap();
-            self.present(queue, frame).map_err(|e| e.error)?;
-        } else if self.attachable()
+        if self.attachable()
             && let Some(p) = self.held.take()
         {
             self.attach(p)?;
+        }
+        if self.deferred.is_some() && self.encodable() {
+            let frame = self.deferred.take().unwrap();
+            self.present(queue, frame).map_err(|e| e.error)?;
         }
         Ok(())
     }

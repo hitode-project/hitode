@@ -6,9 +6,11 @@
 //!
 //! # Swap buffers
 //!
-//! - Private, while [`crate::frame::Presenter::presentable`] says no: one
-//!   private (compressed) image, presented as `SwapImage::Private`. The
-//!   display stages read it in queue order, before the next frame writes it.
+//! - Private, while [`crate::frame::Presenter::presentable`] says no: a pair
+//!   of private (compressed) images, presented as `SwapImage::Private` in
+//!   turn. The display may keep the latest one waiting unencoded until its
+//!   refresh, so the guest writes the other, repaired like a pool buffer of
+//!   age two.
 //! - Presentable: a pool from `Device::create_present_pool`. After each
 //!   `Present` the owner acquires the next buffer and, before the next pass
 //!   on it, copies from the buffer just presented what is not current in it:
@@ -50,6 +52,10 @@ pub(super) struct SwapBacking {
     pool: Option<adv_gpu::PresentPool>,
     role: Option<bool>,
     history: std::collections::VecDeque<crate::frame::Damage>,
+    /// While private: the latest presented image, and the one before it,
+    /// which the next frame writes.
+    private: Option<adv_gpu::Image>,
+    spare: Option<adv_gpu::Image>,
 }
 
 /// Shared by the clones of one depth buffer.
@@ -142,9 +148,12 @@ impl SwapBacking {
         if changed {
             self.previous = self.current.take().or_else(|| self.previous.take());
             self.pool = None;
+            self.private = None;
+            self.spare = None;
             self.history.clear();
             self.role = Some(presentable);
         }
+        let mut age = None;
         let current = if presentable {
             if self.pool.is_none() {
                 self.pool = Some(queue.device().create_present_pool(
@@ -161,7 +170,11 @@ impl SwapBacking {
             }
             let pool = self.pool.as_mut().unwrap();
             let buffer = pool.acquire(queue)?.ok_or(adv_gpu::Error::Busy)?;
+            age = buffer.age();
             SwapImage::Presentable(buffer)
+        } else if let Some(image) = self.spare.take() {
+            age = Some(2);
+            SwapImage::Private(image)
         } else {
             SwapImage::Private(queue.device().create_image(&image_desc(
                 swap.size,
@@ -171,10 +184,6 @@ impl SwapBacking {
         };
         let image = raw(&current);
         if let Some(previous) = &self.previous {
-            let age = match &current {
-                SwapImage::Presentable(image) => image.age(),
-                SwapImage::Private(_) => None,
-            };
             let whole = Rect {
                 x: 0,
                 y: 0,
@@ -224,8 +233,8 @@ impl SwapBacking {
         // Keep the latest allocation alive as the source of age repair. A
         // presentable lease itself goes to the compositor, never to this clone.
         self.previous = Some(SwapImage::Private(raw(image).clone()));
-        if matches!(image, SwapImage::Private(_)) {
-            self.current = Some(SwapImage::Private(raw(image).clone()));
+        if let SwapImage::Private(image) = image {
+            self.spare = self.private.replace(image.clone());
         }
         self.history.push_back(damage.clone());
         if self.history.len() > 8 {

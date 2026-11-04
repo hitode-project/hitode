@@ -1338,6 +1338,54 @@ struct Color {rgba:vec4<f32>}
 
     // spec: GFX-REC-5
     #[test]
+    fn private_swaps_alternate_so_the_latest_frame_survives_the_next() {
+        let Some((device, queue)) = open() else {
+            return;
+        };
+        let mut h = Harness::new(device, queue);
+        let image = swap(4, 4);
+        let (red, green, blue) = ([0, 0, 255, 255], [0, 255, 0, 255], [255, 0, 0, 255]);
+        let pixels = |bytes: &[u8], at: &dyn Fn(usize, usize) -> [u8; 4]| {
+            for y in 0..4 {
+                for x in 0..4 {
+                    assert_eq!(bytes[(y * 4 + x) * 4..][..4], at(x, y), "pixel {x},{y}");
+                }
+            }
+        };
+        h.producer.push(color(&image));
+        h.producer.push(clear(rect(0, 0, 4, 4), [1., 0., 0., 1.]));
+        h.producer
+            .push(present(&image, crate::frame::Damage::Whole, 1));
+        h.producer.push(clear(rect(0, 0, 1, 1), [0., 1., 0., 1.]));
+        h.producer.push(present(
+            &image,
+            crate::frame::Damage::Rects([rect(0, 0, 1, 1)].into_iter().collect()),
+            2,
+        ));
+        h.producer.push(clear(rect(1, 1, 1, 1), [0., 0., 1., 1.]));
+        h.producer.push(present(
+            &image,
+            crate::frame::Damage::Rects([rect(1, 1, 1, 1)].into_iter().collect()),
+            3,
+        ));
+        h.drain();
+        let (first, second, third) = (h.frame_image(0), h.frame_image(1), h.frame_image(2));
+        assert_ne!(first.id(), second.id());
+        assert_eq!(first.id(), third.id());
+        // The third frame went to the first image, repaired from the second:
+        // the second, the latest a display may keep waiting, is untouched.
+        pixels(&h.read(&fixed(second)), &|x, y| {
+            if (x, y) == (0, 0) { green } else { red }
+        });
+        pixels(&h.read(&fixed(third)), &|x, y| match (x, y) {
+            (0, 0) => green,
+            (1, 1) => blue,
+            _ => red,
+        });
+    }
+
+    // spec: GFX-REC-5
+    #[test]
     #[cfg_attr(
         not(any(target_vendor = "apple", target_os = "android")),
         ignore = "presentable pools exist only on Apple and Android"

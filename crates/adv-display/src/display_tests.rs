@@ -899,9 +899,13 @@ fn changing_settings_while_a_frame_is_held_never_aliases_its_read_source() {
     )
     .unwrap();
     let image = private(&d, &mut q);
+    // A frame clock encodes the second frame on the next refresh, held until
+    // the first latches.
+    display.refreshed(1);
     display
         .present(&mut q, frame(1, &image, Damage::Whole))
         .unwrap();
+    display.refreshed(2);
     display
         .present(&mut q, frame(2, &image, Damage::None))
         .unwrap();
@@ -919,6 +923,7 @@ fn changing_settings_while_a_frame_is_held_never_aliases_its_read_source() {
     let mut changed = settings();
     changed.view = (128, 96);
     display.settings(&mut q, changed).unwrap();
+    display.refreshed(3);
     latch(&events, 2);
     display.service(&mut q).unwrap();
     let record = display.recorder().latest().unwrap();
@@ -1263,8 +1268,16 @@ fn a_frame_clock_encodes_and_attaches_at_most_once_per_refresh() {
     display.service(&mut q).unwrap();
     assert_eq!(*reads.lock().unwrap(), [1, 3]);
     assert_eq!(display.totals().presents, 1);
+    // While it waits to attach, a late latch makes later refreshes encode
+    // nothing: a frame encoded only to be replaced is GPU work nobody sees.
+    display.present(&mut q, software(4)).unwrap();
+    display.refreshed(3);
+    display.service(&mut q).unwrap();
+    assert_eq!(*reads.lock().unwrap(), [1, 3]);
     latch(&events, 1);
     display.service(&mut q).unwrap();
     assert_eq!(display.totals().presents, 2);
     assert_eq!(display.recorder().latest().unwrap().frame.serial, 3);
+    // Once it attaches, the waiting frame is encoded for the next latch.
+    assert_eq!(*reads.lock().unwrap(), [1, 3, 4]);
 }
