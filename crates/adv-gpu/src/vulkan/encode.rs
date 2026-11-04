@@ -967,9 +967,13 @@ impl Drop for Encoder {
             for (image, states, _) in self.originals.drain(..) {
                 *image.states.lock().unwrap() = states;
             }
-            // Unsubmitted buffers never reached the GPU.
+            // Unsubmitted buffers never reached the GPU. The open one is
+            // ended first, so the reset never meets a recording buffer.
             if let Some(mut pool) = self.pool.take() {
                 let context = &self.shared.context;
+                if self.command != vk::CommandBuffer::null() {
+                    let _ = unsafe { context.device.end_command_buffer(self.command) };
+                }
                 match pool.reset(context) {
                     Ok(()) => self.shared.state.lock().unwrap().pools.push(pool),
                     Err(_) => pool.destroy(context),
