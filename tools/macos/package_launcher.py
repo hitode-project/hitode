@@ -35,11 +35,7 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[2]
 LAUNCHER = ROOT / 'apps/adv-launcher'
 TAURI = LAUNCHER / 'src-tauri'
-GRADLE = TAURI / 'gen/android/app/build.gradle.kts'
 OUTPUT = ROOT / 'target/package'
-# The files apps/adv-launcher/src-tauri/build/wine.rs requires before embedding.
-WINE_REQUIRED = ('lib/wine/i386-windows/ntdll.dll', 'lib/wine/i386-unix/win32u.so',
-                 'share/hitode/prefix/system.reg')
 
 
 def module(path: Path):
@@ -49,42 +45,13 @@ def module(path: Path):
     return loaded
 
 
-def wine_dist(env: dict) -> Path:
-    root = env.get('ADV_WINE_DIST')
-    if not root:
-        fetch = module(ROOT / 'tools/release/fetch_wine.py')
-        out = ROOT / 'target/wine'
-        out.mkdir(parents=True, exist_ok=True)
-        root = fetch.fetch(json.loads(fetch.PINS.read_text())['dist'], out)
-    for required in WINE_REQUIRED:
-        if not (Path(root) / required).is_file():
-            raise ValueError(f'incomplete ADV_WINE_DIST: missing {required}')
-    return Path(root).resolve()
-
-
-def output(*args: str) -> str | None:
-    try:
-        return subprocess.run(args, check=True, capture_output=True, text=True).stdout.strip()
-    except (OSError, subprocess.CalledProcessError):
-        return None
-
-
-def android(env: dict) -> tuple[dict, list[str]]:
-    brew = output('brew', '--prefix')
-    java = (env.get('JAVA_HOME') or output('/usr/libexec/java_home', '-v', '21')
-            or (brew and f'{brew}/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home'))
-    sdk = (env.get('ANDROID_HOME') or env.get('ANDROID_SDK_ROOT')
-           or (brew and f'{brew}/share/android-commandlinetools'))
-    version = re.search(r'ndkVersion = "([^"]+)"', GRADLE.read_text()).group(1)
-    ndk = env.get('NDK_HOME') or env.get('ANDROID_NDK_HOME') or (sdk and f'{sdk}/ndk/{version}')
-    problems = [f'missing {name}: {fix}' for name, path, fix in [
-        ('JDK 21', java, 'brew install openjdk@21, or set JAVA_HOME'),
-        ('Android SDK', sdk, 'brew install --cask android-commandlinetools, or set ANDROID_HOME'),
-        (f'NDK {version}', ndk, f'sdkmanager --sdk_root="$ANDROID_HOME" "ndk;{version}", or set NDK_HOME'),
-        ('Android build tools', sdk and next(Path(sdk, 'build-tools').glob('*/apksigner'), None),
-         'sdkmanager --sdk_root="$ANDROID_HOME" "build-tools;36.0.0"'),
-    ] if not path or not Path(path).exists()]
-    return {'JAVA_HOME': java, 'ANDROID_HOME': sdk, 'NDK_HOME': ndk, 'ANDROID_NDK_HOME': ndk}, problems
+# Toolchain discovery shared with the other tools.
+toolchain = module(ROOT / 'tools/env.py')
+GRADLE = toolchain.GRADLE
+WINE_REQUIRED = toolchain.WINE_REQUIRED
+wine_dist = toolchain.wine_dist
+output = toolchain.output
+android = toolchain.android
 
 
 TARGETS = {'mac': 'aarch64-apple-darwin', 'ios': 'aarch64-apple-ios', 'android': 'aarch64-linux-android'}

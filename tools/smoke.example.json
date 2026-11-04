@@ -1,0 +1,9 @@
+{
+  "games": {
+    "example": {
+      "exe": "Example Game/game.exe",
+      "codepage": 932,
+      "steps": "wait 25; capture title; click 110 457; wait 8; capture start; clicks 6 640 500 2.5; capture story"
+    }
+  }
+}

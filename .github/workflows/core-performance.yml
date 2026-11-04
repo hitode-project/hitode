@@ -144,7 +144,7 @@ jobs:
         timeout-minutes: 10
         run: |
           set -o pipefail
-          cargo clippy --workspace --all-targets --locked --features adv-shell/gpu,adv-shell/media,adv-device/slow-tests -- -D warnings 2>&1 | tee "$RUNNER_TEMP/workspace-clippy.txt"
+          python3 tools/lint.py host 2>&1 | tee "$RUNNER_TEMP/workspace-clippy.txt"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:

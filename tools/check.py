@@ -34,15 +34,15 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "tools"))
+import env as toolchain  # noqa: E402
+import lint  # noqa: E402
 # Generated (tools/abi) or third-party sources: never reformatted.
 UNFORMATTED = ("data/abi/", "vendor/", "crates/adv-cpu-core/softfloat/")
 LAUNCHER = "apps/adv-launcher/"
 DEFAULT_BRANCHES = ("master", "main")
 # Paths whose changes CI builds or lints; anything else is documentation.
 CODE = (".rs", ".toml", ".lock", ".py", ".c", ".h", ".ps1", ".sh", ".svelte", ".ts", ".js", ".json", ".yml")
-# The Clippy gate of .github/workflows/core-performance.yml.
-WORKSPACE_LINT = ["--workspace", "--all-targets", "--locked",
-                  "--features", "adv-shell/gpu,adv-shell/media,adv-device/slow-tests"]
 HOOK = """#!/bin/sh
 # Installed by tools/check.py --install-hook; shared by every worktree.
 if [ -f tools/check.py ]; then
@@ -105,18 +105,10 @@ def output(command: list[str]) -> str:
 
 def cargo_env() -> dict[str, str]:
     """The environment for Cargo, with the media build variables filled in on a Mac."""
-    env = dict(os.environ)
-    if sys.platform != "darwin":
-        return env
-    if not env.get("FFMPEG_DIR"):
-        prefix = output(["brew", "--prefix", "ffmpeg@8"]) if shutil.which("brew") else ""
-        if prefix and (Path(prefix) / "include").is_dir():
-            env["FFMPEG_DIR"] = prefix
-    if not env.get("LIBCLANG_PATH"):
-        clang = output(["xcrun", "--find", "clang"])
-        if clang:
-            env["LIBCLANG_PATH"] = str(Path(clang).parent.parent / "lib")
-    return env
+    try:
+        return toolchain.cargo("mac")
+    except toolchain.Missing as missing:
+        sys.exit("\n".join(f"FAIL  {problem}" for problem in missing.problems))
 
 
 def run(name: str, command: list[str], env: dict[str, str] | None = None) -> bool:
@@ -168,8 +160,7 @@ def master_note() -> None:
 
 def clippy() -> bool:
     """The workspace-lint gate of .github/workflows/core-performance.yml."""
-    return run("clippy workspace-lint",
-               ["cargo", "clippy", *WORKSPACE_LINT, "--", "-D", "warnings"], cargo_env())
+    return lint.lint("host")
 
 
 def default_features() -> bool:

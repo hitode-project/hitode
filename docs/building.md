@@ -9,7 +9,7 @@ To build installable apps on an Apple silicon Mac, run `python3 tools/macos/pack
 - Rust stable with rustfmt, and Python 3.
 - CMake, for the test-only Unicorn reference in `adv-unicorn`.
 - For video: FFmpeg 8 headers and libraries, and libclang for bindgen. Set `FFMPEG_DIR` to the FFmpeg root with `include` and `lib`, and `LIBCLANG_PATH` to the folder holding libclang. The libraries must match the target architecture.
-  - Development on a Mac may use Homebrew: `brew install ffmpeg@8`, then `export FFMPEG_DIR=$(brew --prefix ffmpeg@8) LIBCLANG_PATH=$(dirname "$(dirname "$(xcrun --find clang)")")/lib`. `tools/check.py` fills in these two values by itself when they are unset.
+  - Development on a Mac may use Homebrew: `brew install ffmpeg@8`, then `export FFMPEG_DIR=$(brew --prefix ffmpeg@8) LIBCLANG_PATH=$(dirname "$(dirname "$(xcrun --find clang)")")/lib`. `tools/check.py` fills in these two values by itself when they are unset, as do `tools/env.py`, `tools/lint.py` and `tools/smoke.py`, which share that discovery with the iOS and Android toolchains.
   - Release packages never use Homebrew: they link the pinned static FFmpeg that `tools/macos/build.py` builds (below). On macOS, `media` also links the system VideoToolbox and CoreMedia frameworks required by that build.
   - Without FFmpeg, everything except `media` builds and tests: leave out `adv-shell/media` and test single crates with `-p`, since the workspace suites (`cargo test --workspace`, `cargo test-full`) build the launcher.
 - For the launcher: Node.js and pnpm.
