@@ -388,6 +388,12 @@ Installer state MUST use the active stack's backing directory for the guest C dr
 **Rule**: Shipped files MUST NOT contain developer home, checkout or temporary build paths, including native helpers and archive members.
 **Verification**: Test
 
+### HOST-PKG-7 Complete package inputs
+
+**Rule**: A local launcher package build MUST stop before compiling when the complete Wine installation, or a platform toolchain it needs, is missing. The Cargo wrapper it runs through MUST carry that Wine installation.
+**Applies to**: macOS, iOS, Android
+**Verification**: Test
+
 Withdrawn: HOST-AND-1, HOST-AND-2, HOST-AND-3, HOST-AND-4, HOST-AND-5, HOST-AND-6, HOST-AND-7, HOST-AND-8, HOST-AND-9, HOST-AND-10, HOST-AND-11, HOST-SES-9, HOST-SAVE-1
 
 ### HOST-DAMAGE-1 Software texture uploads
