@@ -592,7 +592,6 @@ pub(super) mod tests {
         let execution = std::rc::Rc::new(super::super::Execution {
             device: device.clone(),
             stream: stream.clone(),
-            video: Arc::from([]),
             owner: super::super::owner::Owner::unstarted(),
             #[cfg(feature = "test-support")]
             capture: Default::default(),

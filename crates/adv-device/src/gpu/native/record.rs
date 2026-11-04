@@ -728,7 +728,13 @@ impl Gpu {
         self.stats.image_copy_bytes += u64::from(rectangle.w) * u64::from(rectangle.h) * 4;
         self.check()
     }
-    pub fn present(&mut self, image: &Image, damage: Damage, serial: u64) -> Result<(), Error> {
+    pub fn present(
+        &mut self,
+        image: &Image,
+        damage: Damage,
+        serial: u64,
+        video: std::sync::Arc<[crate::frame::VideoPlane]>,
+    ) -> Result<(), Error> {
         #[cfg(feature = "test-support")]
         self.stream.0.borrow().admit()?;
         if let Damage::Rects(rects) = &damage {
@@ -748,7 +754,7 @@ impl Gpu {
             image: image.clone(),
             damage,
             serial,
-            video: self.execution.video.clone(),
+            video,
         });
         self.check()
     }

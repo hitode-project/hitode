@@ -341,69 +341,6 @@ impl PendingFrame {
     pub fn shared_video_layers(&self) -> Arc<[(u64, VideoLayer)]> {
         self.video.clone()
     }
-    /// Package G calls this when promoting a completed surface frame to the
-    /// native frame contract. Taking a picture remains the compositor's action.
-    #[cfg(feature = "gpu")]
-    pub fn fill_video(&self, frame: &mut crate::frame::Frame) {
-        frame.video = self
-            .video
-            .iter()
-            .filter_map(|(id, layer)| {
-                let picture = layer.frame.picture.as_ref()?;
-                let mapped;
-                let layer = if layer.canvas != self.extent() {
-                    mapped = layer
-                        .mapped(self.extent())
-                        .expect("validated video mapping");
-                    &mapped
-                } else {
-                    layer
-                };
-                let layout = layer
-                    .layout(self.extent())
-                    .expect("validated video geometry");
-                if layout.video.is_none() && layout.background.is_none() {
-                    return None;
-                }
-                let region = layout.video.unwrap_or(VideoRegion {
-                    destination: Rect::default(),
-                    source_uv: [0.0; 4],
-                });
-                Some(crate::frame::VideoPlane {
-                    id: *id,
-                    picture: picture.clone(),
-                    geometry: crate::frame::VideoGeometry {
-                        source: (layer.frame.width, layer.frame.height),
-                        destination: adv_gpu::Rect {
-                            x: region.destination.x,
-                            y: region.destination.y,
-                            w: region.destination.w,
-                            h: region.destination.h,
-                        },
-                        source_uv: region.source_uv,
-                        background: layout.background.map(|(r, c)| {
-                            (
-                                adv_gpu::Rect {
-                                    x: r.x,
-                                    y: r.y,
-                                    w: r.w,
-                                    h: r.h,
-                                },
-                                c,
-                            )
-                        }),
-                        clip: adv_gpu::Rect {
-                            x: layer.clip.x,
-                            y: layer.clip.y,
-                            w: layer.clip.w,
-                            h: layer.clip.h,
-                        },
-                        hide_cursor: layer.hide_cursor,
-                    },
-                })
-            })
-            .collect();
-    }
     pub fn hide_cursor(&self) -> bool {
         self.video_cursor_regions()
             .is_ok_and(|regions| regions.iter().any(|region| region.hide_cursor))
@@ -819,6 +756,68 @@ pub struct VideoLayer {
 
 /// Visible geometry in completed-frame pixels, shared by software capture and
 /// the GPU presenter. UVs crop the immutable decoder image without repacking it.
+/// The decoded layers' planes over a base of `extent`, as the native display
+/// composes them. Taking a picture remains the compositor's action.
+#[cfg(feature = "gpu")]
+fn video_planes(
+    video: &[(u64, VideoLayer)],
+    extent: (u32, u32),
+) -> Arc<[crate::frame::VideoPlane]> {
+    video
+        .iter()
+        .filter_map(|(id, layer)| {
+            let picture = layer.frame.picture.as_ref()?;
+            let mapped;
+            let layer = if layer.canvas != extent {
+                mapped = layer.mapped(extent).expect("validated video mapping");
+                &mapped
+            } else {
+                layer
+            };
+            let layout = layer.layout(extent).expect("validated video geometry");
+            if layout.video.is_none() && layout.background.is_none() {
+                return None;
+            }
+            let region = layout.video.unwrap_or(VideoRegion {
+                destination: Rect::default(),
+                source_uv: [0.0; 4],
+            });
+            Some(crate::frame::VideoPlane {
+                id: *id,
+                picture: picture.clone(),
+                geometry: crate::frame::VideoGeometry {
+                    source: (layer.frame.width, layer.frame.height),
+                    destination: adv_gpu::Rect {
+                        x: region.destination.x,
+                        y: region.destination.y,
+                        w: region.destination.w,
+                        h: region.destination.h,
+                    },
+                    source_uv: region.source_uv,
+                    background: layout.background.map(|(r, c)| {
+                        (
+                            adv_gpu::Rect {
+                                x: r.x,
+                                y: r.y,
+                                w: r.w,
+                                h: r.h,
+                            },
+                            c,
+                        )
+                    }),
+                    clip: adv_gpu::Rect {
+                        x: layer.clip.x,
+                        y: layer.clip.y,
+                        w: layer.clip.w,
+                        h: layer.clip.h,
+                    },
+                    hide_cursor: layer.hide_cursor,
+                },
+            })
+        })
+        .collect()
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct VideoRegion {
     pub destination: Rect,
@@ -1258,6 +1257,13 @@ impl Arena {
     }
 }
 
+/// Layers, the base extent they were mapped to, and their planes.
+#[cfg(feature = "gpu")]
+type NativeVideo = (
+    Arc<[(u64, VideoLayer)]>,
+    (u32, u32),
+    Arc<[crate::frame::VideoPlane]>,
+);
 pub struct Surfaces<P: Presenter> {
     pub presenter: P,
     #[cfg(feature = "gpu")]
@@ -1266,6 +1272,12 @@ pub struct Surfaces<P: Presenter> {
     software_slots: BTreeMap<u32, slots::Slots>,
     #[cfg(feature = "gpu")]
     software_video: Option<Arc<[(u64, VideoLayer)]>>,
+    /// The planes last built from `video_layers`, for the base extent.
+    #[cfg(feature = "gpu")]
+    native_video: NativeVideo,
+    /// The native surface last presented, when it is the current base.
+    #[cfg(feature = "gpu")]
+    native_source: Option<u32>,
     pub stats: GraphicsStats,
     /// Display size: the primary surface's size.
     pub width: u32,
@@ -1336,6 +1348,10 @@ impl<P: Presenter> Surfaces<P> {
             software_slots: BTreeMap::new(),
             #[cfg(feature = "gpu")]
             software_video: None,
+            #[cfg(feature = "gpu")]
+            native_video: (Arc::from([]), (0, 0), Arc::from([])),
+            #[cfg(feature = "gpu")]
+            native_source: None,
             stats: GraphicsStats::default(),
             width,
             height,
@@ -1536,6 +1552,8 @@ impl<P: Presenter> Surfaces<P> {
             video.sort_by_key(|(id, _)| *id);
         }
         self.video_layers = Arc::from(video);
+        #[cfg(feature = "gpu")]
+        self.present_video(m, serial)?;
         if self.retained_frame.is_none() {
             let (width, height) = self
                 .video_layers
@@ -2035,6 +2053,8 @@ impl<P: Presenter> Surfaces<P> {
             return Ok(());
         }
         let serial = self.stats.presentations + 1;
+        let video = self.native_video((s.width, s.height));
+        let s = &self.surfaces[&id];
         self.stats.copied_bytes += self.gpu.publish_software(
             self.software_slots.get_mut(&id).unwrap(),
             s,
@@ -2042,9 +2062,11 @@ impl<P: Presenter> Surfaces<P> {
             damage,
             whole,
             serial,
+            video,
         )?;
         self.software_video = Some(self.video_layers.clone());
         self.software_source = Some(id);
+        self.native_source = None;
         self.stats.presentations = serial;
         self.stats.published_frames += 1;
         self.stats.damaged_pixels += damage
@@ -2137,20 +2159,94 @@ impl<P: Presenter> Surfaces<P> {
         damage: crate::frame::Damage,
         gpu: &mut crate::gpu::Gpu,
     ) -> Result<(), String> {
-        let target = &self
+        let image = &self
             .native_surfaces
             .get(&id)
             .ok_or("unknown native surface")?
-            .target;
+            .target
+            .image;
+        let extent = (image.width(), image.height());
         let serial = self
             .stats
             .presentations
             .checked_add(1)
             .ok_or("presentation serial exhausted")?;
+        let video = self.native_video(extent);
+        gpu.present(
+            &self.native_surfaces[&id].target.image,
+            damage,
+            serial,
+            video,
+        )
+        .map_err(|error| error.to_string())?;
         self.software_source = None;
-        gpu.present(&target.image, damage, serial)
-            .map_err(|error| error.to_string())?;
+        self.native_source = Some(id);
         self.stats.presentations = serial;
+        Ok(())
+    }
+
+    #[cfg(feature = "gpu")]
+    fn native_video(&mut self, extent: (u32, u32)) -> Arc<[crate::frame::VideoPlane]> {
+        let (layers, at, planes) = &mut self.native_video;
+        if !Arc::ptr_eq(layers, &self.video_layers) || *at != extent {
+            *planes = video_planes(&self.video_layers, extent);
+            *layers = self.video_layers.clone();
+            *at = extent;
+        }
+        planes.clone()
+    }
+
+    /// Show changed video layers over the unchanged native base. A layer that
+    /// moved, appeared or went away redraws the base beneath it.
+    #[cfg(feature = "gpu")]
+    fn present_video(&mut self, m: &dyn SurfaceMemory, serial: u64) -> Result<(), String> {
+        let extent = if let Some(id) = self.native_source {
+            let image = &self.native_surfaces[&id].target.image;
+            (image.width(), image.height())
+        } else if let Some(id) = self.software_source {
+            (self.surfaces[&id].width, self.surfaces[&id].height)
+        } else {
+            return Ok(());
+        };
+        let before = self.native_video.2.clone();
+        let video = self.native_video(extent);
+        let whole = before.len() != video.len()
+            || before
+                .iter()
+                .zip(video.iter())
+                .any(|(a, b)| a.id != b.id || a.geometry != b.geometry);
+        if let Some(id) = self.native_source {
+            let damage = if whole {
+                crate::frame::Damage::Whole
+            } else {
+                crate::frame::Damage::Rects(Default::default())
+            };
+            self.gpu
+                .present(
+                    &self.native_surfaces[&id].target.image,
+                    damage,
+                    serial,
+                    video,
+                )
+                .map_err(|error| error.to_string())?;
+        } else if let Some(id) = self.software_source {
+            let s = &self.surfaces[&id];
+            let damage = if whole {
+                Damage::from_rect(s.rect())
+            } else {
+                Damage::default()
+            };
+            self.stats.copied_bytes += self.gpu.publish_software(
+                self.software_slots.get_mut(&id).unwrap(),
+                s,
+                m,
+                damage,
+                whole,
+                serial,
+                video,
+            )?;
+            self.software_video = Some(self.video_layers.clone());
+        }
         Ok(())
     }
 

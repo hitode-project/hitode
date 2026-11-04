@@ -129,7 +129,7 @@ pub fn present(
             .collect(),
         ),
     };
-    gpu.present(image, damage.clone(), serial)?;
+    gpu.present(image, damage.clone(), serial, std::sync::Arc::from([]))?;
     let source = gpu.execution.capture.borrow().as_ref().unwrap().clone();
     let index = source.reserve();
     Ok(Frame {
@@ -186,5 +186,88 @@ mod tests {
         destroy(&child);
         assert!(matches!(gpu.check(), Err(Error::Device(_))));
         assert!(matches!(child.check(), Err(Error::Device(_))));
+    }
+
+    #[cfg(feature = "media")]
+    #[test]
+    fn video_layers_reach_the_native_display_without_a_game_present() {
+        struct Flat(Vec<u8>);
+        impl crate::surface::SurfaceMemory for Flat {
+            fn read(&self, at: u32, len: usize) -> Result<std::borrow::Cow<'_, [u8]>, String> {
+                let at = at as usize;
+                Ok(std::borrow::Cow::Borrowed(&self.0[at..at + len]))
+            }
+            fn write(&mut self, at: u32, data: &[u8]) -> Result<(), String> {
+                self.0[at as usize..at as usize + data.len()].copy_from_slice(data);
+                Ok(())
+            }
+            fn writable(&self, _: u32, _: usize) -> Result<(), String> {
+                Ok(())
+            }
+            fn copy(&mut self, src: u32, dst: u32, len: usize) -> Result<(), String> {
+                self.0
+                    .copy_within(src as usize..src as usize + len, dst as usize);
+                Ok(())
+            }
+        }
+        let _gpu = request(!cfg!(any(target_vendor = "apple", target_os = "android"))).unwrap();
+        let mut decoder = crate::media::Decoder::open_memory(
+            include_bytes!("../../../../adv-dx/src/dshow/graph/render/fixtures/guest_movie.mpg")
+                .to_vec(),
+        )
+        .unwrap();
+        let video = (0..1_000_000)
+            .step_by(40_000)
+            .find_map(|time| decoder.frame_at(time).unwrap().video)
+            .unwrap();
+        let source = Rect {
+            x: 0,
+            y: 0,
+            w: video.width,
+            h: video.height,
+        };
+        let mut memory = Flat(vec![0; 1 << 16]);
+        let mut store =
+            crate::surface::SurfaceStore::new(8, 8, 16, 65520, Default::default()).unwrap();
+        let base = store
+            .create(
+                8,
+                8,
+                false,
+                crate::surface::PixelFormat::Bgra32,
+                &mut memory,
+            )
+            .unwrap();
+        store.present(base, &memory, store[base].rect()).unwrap();
+        let canvas = Rect {
+            x: 0,
+            y: 0,
+            w: 8,
+            h: 8,
+        };
+        let layer = crate::surface::VideoLayer {
+            frame: video.into_surface(),
+            source,
+            destination: crate::surface::BlitRect {
+                x: 0,
+                y: 0,
+                w: 8,
+                h: 8,
+            },
+            background: None,
+            clip: canvas,
+            canvas: (8, 8),
+            visible: true,
+            hide_cursor: false,
+        };
+        store.set_video_layer(7, Some(layer), &memory).unwrap();
+        let execution = super::super::EXECUTION
+            .with(|cached| cached.borrow().upgrade())
+            .unwrap();
+        let frames = execution.capture.borrow().clone().unwrap();
+        assert!(frames.get(0).video.is_empty());
+        // The movie frame is shown over the unchanged base.
+        assert_eq!(frames.get(1).video, [7]);
+        assert_eq!(frames.get(1).pixels.frames, 2);
     }
 }

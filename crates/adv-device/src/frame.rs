@@ -203,7 +203,7 @@ impl DecodedPicture {
 
 /// Geometry after owner clipping, in canvas coordinates. The UV rectangle
 /// preserves sampling phase for signed destinations and cropped source pictures.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct VideoGeometry {
     pub source: (u32, u32),
     pub destination: Rect,

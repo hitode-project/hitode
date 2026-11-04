@@ -14,6 +14,8 @@ pub struct CapturedFrame {
     pub damage: Damage,
     /// Software slot identity, for buffer-age assertions.
     pub buffer: Option<u64>,
+    /// The video layers the frame carried, by id.
+    pub video: Vec<u64>,
 }
 
 pub struct CapturePresenter {
@@ -37,6 +39,7 @@ impl Presenter for CapturePresenter {
         false
     }
     fn present(&mut self, queue: &mut Queue, frame: Frame) {
+        let video = frame.video.iter().map(|v| v.id).collect();
         let (pixels, damage, buffer) = match frame.base {
             Base::Gpu { image, damage, .. } => {
                 let image = match &image {
@@ -142,6 +145,7 @@ impl Presenter for CapturePresenter {
                 pixels,
                 damage,
                 buffer,
+                video,
             })
             .unwrap();
     }

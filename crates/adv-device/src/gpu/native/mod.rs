@@ -138,7 +138,6 @@ impl Gpu {
                 stream: stream::ExecutionStream(std::rc::Rc::new(std::cell::RefCell::new(
                     producer,
                 ))),
-                video: Arc::from([]),
                 #[cfg(feature = "test-support")]
                 capture: Default::default(),
                 owner: owner::Owner::start(queue, commands, presenter)?,
@@ -184,6 +183,7 @@ impl Gpu {
     ) -> Result<crate::surface::slots::Slots, String> {
         crate::surface::slots::Slots::new(&self.device, surface)
     }
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn publish_software(
         &mut self,
         slots: &mut crate::surface::slots::Slots,
@@ -192,6 +192,7 @@ impl Gpu {
         damage: crate::surface::Damage,
         whole: bool,
         serial: u64,
+        video: Arc<[crate::frame::VideoPlane]>,
     ) -> Result<u64, String> {
         self.check().map_err(|e| e.to_string())?;
         slots.publish(
@@ -201,7 +202,7 @@ impl Gpu {
             damage,
             whole,
             serial,
-            self.execution.video.clone(),
+            video,
         )
     }
     pub fn set_clip(&mut self, clip: Option<Rect>) {
@@ -237,7 +238,6 @@ struct Execution {
     device: adv_gpu::Device,
     // The producer must close before Owner joins its thread.
     stream: stream::ExecutionStream,
-    video: Arc<[crate::frame::VideoPlane]>,
     owner: owner::Owner,
     #[cfg(feature = "test-support")]
     capture: std::cell::RefCell<Option<std::rc::Rc<test_support::Frames>>>,
