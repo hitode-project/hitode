@@ -55,6 +55,9 @@ pub struct Totals {
     pub configurations: u64,
     pub max_cpu: Duration,
     pub max_queue: Duration,
+    pub upscaled_runs: u64,
+    /// Input pixels the upscaler recomputed.
+    pub upscaled_pixels: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

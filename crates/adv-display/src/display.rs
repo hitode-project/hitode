@@ -207,6 +207,8 @@ struct Upscaled {
     /// Composition into the model's half-precision input.
     pipelines: Pipelines,
 }
+/// Timestamped passes per frame: every stage, plus the upscaler's compute.
+const TIMED_PASSES: u32 = 8;
 pub struct Display {
     device: Device,
     compositor: Option<Box<dyn Compositor>>,
@@ -257,7 +259,7 @@ impl Display {
             .features
             .contains(adv_gpu::Features::TIMESTAMPS)
         {
-            Some(device.create_query_set(adv_gpu::queue::QueryKind::Timestamp, 8)?)
+            Some(device.create_query_set(adv_gpu::queue::QueryKind::Timestamp, TIMED_PASSES * 2)?)
         } else {
             None
         };
@@ -594,6 +596,14 @@ impl Display {
             totals.software_started.get_or_insert(record.at);
         }
         totals.direct_presents += u64::from(record.plan.stages.is_empty());
+        for (stage, stats) in record.plan.stages.iter().zip(&record.statistics.stages) {
+            if let Stage::Upscale { .. } = stage
+                && stats.pixels > 0
+            {
+                totals.upscaled_runs += 1;
+                totals.upscaled_pixels += stats.pixels;
+            }
+        }
         totals.max_cpu = totals.max_cpu.max(record.cpu_time);
         totals.max_queue = totals
             .max_queue
@@ -679,7 +689,7 @@ impl Display {
                         let end = u64::from_ne_bytes(
                             bytes[pair * 16 + 8..pair * 16 + 16].try_into().unwrap(),
                         );
-                        record.stage_times[stage] = Duration::from_nanos(
+                        record.stage_times[stage] += Duration::from_nanos(
                             ((end - start) as f64 * self.queries.as_ref().unwrap().period()) as u64,
                         );
                     }
@@ -1021,6 +1031,8 @@ impl Display {
         mut frame: Frame,
         reading: Option<&PresentImage>,
     ) -> Result<Pending, Error> {
+        // A frame that failed mid-way left its unsubmitted spans; drop them.
+        self.spans.clear();
         let started = Instant::now();
         let (settings, planned) = self.plan(&frame.info, reading);
         let mut targets = self.targets(queue, &planned)?;
@@ -1039,6 +1051,12 @@ impl Display {
         let mut statistics = Statistics {
             kind: if planned.stages.is_empty() {
                 PlanKind::Direct
+            } else if planned
+                .stages
+                .iter()
+                .any(|s| matches!(s, Stage::Upscale { .. }))
+            {
+                PlanKind::Upscaled
             } else {
                 PlanKind::Merged
             },
@@ -1152,17 +1170,26 @@ impl Display {
                 }
             }
             drop(pass);
+            statistics.passes += 1;
+            timed.push(index);
             if let Stage::Upscale { .. } = stage {
+                // The model's compute pass is timed as a second span of its
+                // stage. Pixels are those the last model pass recomputed; none
+                // means no compute pass ran, nor wrote its timestamps.
                 let u = self.upscaled.as_ref().unwrap();
-                u.upscaling.encode(
+                let upscaled = u.upscaling.encode(
                     encoder.as_mut().unwrap(),
                     &mut self.ring,
                     u.output.view(),
                     Some(&tiles.rects),
+                    self.queries.as_ref().map(|q| (q, statistics.passes * 2)),
                 )?;
+                statistics.stages[index].pixels = upscaled;
+                if upscaled > 0 {
+                    statistics.passes += 1;
+                    timed.push(index);
+                }
             }
-            statistics.passes += 1;
-            timed.push(index);
         }
         for data in self.spans.drain(..) {
             encoder.as_mut().unwrap().retain(data);
@@ -1171,7 +1198,7 @@ impl Display {
             if let Some(q) = &self.queries {
                 let buffer = self.readbacks.pop().map(Ok).unwrap_or_else(|| {
                     self.device.create_buffer(&adv_gpu::resource::BufferDesc {
-                        size: 64,
+                        size: u64::from(TIMED_PASSES) * 16,
                         usage: adv_gpu::resource::BufferUsage::COPY_DST,
                         memory: adv_gpu::resource::Memory::Readback,
                         label: "stage times",
@@ -1301,6 +1328,7 @@ impl Display {
         &mut self,
         queue: &mut Queue,
     ) -> Result<(Token, adv_gpu::Buffer, u64, (u32, u32)), Error> {
+        self.spans.clear();
         let record = self
             .recorder
             .latest()

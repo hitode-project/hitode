@@ -21,11 +21,11 @@ pub(crate) struct NativePresentation {
     #[cfg(any(host_view, feature = "gpu"))]
     pub display_plan: &'static str,
     #[cfg(any(host_view, feature = "gpu"))]
-    pub display_stage_tiles: [u32; 3],
+    pub display_stage_tiles: [u32; 4],
     #[cfg(any(host_view, feature = "gpu"))]
-    pub display_stage_pixels: [u32; 3],
+    pub display_stage_pixels: [u32; 4],
     #[cfg(any(host_view, feature = "gpu"))]
-    pub display_stage_ns: [u64; 3],
+    pub display_stage_ns: [u64; 4],
     #[cfg(any(host_view, feature = "gpu"))]
     pub display_latch_ns: Option<u64>,
     #[cfg(any(host_view, feature = "gpu"))]

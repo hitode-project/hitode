@@ -139,7 +139,13 @@ impl Gpu {
         );
         let computed = scaler
             .upscaling
-            .encode(&mut encoder, &mut self.ring, scaler.output.view(), damage)
+            .encode(
+                &mut encoder,
+                &mut self.ring,
+                scaler.output.view(),
+                damage,
+                None,
+            )
             .unwrap();
         let token = self.queue.submit(encoder).unwrap();
         assert!(self.queue.wait(token, Duration::from_secs(60)).unwrap());
@@ -340,6 +346,7 @@ fn partial_runs_match_full_runs_within_the_model_radius() {
                 &mut gpu.ring,
                 partial.output.view(),
                 Some(&[]),
+                None,
             )
             .unwrap();
         assert_eq!(computed, 0);

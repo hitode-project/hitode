@@ -323,6 +323,7 @@ impl Upscaling {
         ring: &mut Ring,
         output: &ImageView,
         damage: Option<&[Rect]>,
+        timestamps: Option<(&adv_gpu::queue::QuerySet, u32)>,
     ) -> adv_gpu::Result<u64> {
         let passes = self.model.passes;
         let lists = match damage {
@@ -353,7 +354,7 @@ impl Upscaling {
         }
         let chunk = DISPATCH / self.align * self.align;
         let mut compute = encoder.compute_pass(&ComputePassDesc {
-            timestamps: None,
+            timestamps,
             label: "upscale",
         });
         for (i, (pass, pipeline)) in passes.iter().zip(&self.pipelines).enumerate() {
@@ -590,7 +591,7 @@ impl Check {
                 rows: 0,
             };
             encoder.copy_buffer_to_image(pixels, at(input), input.desc().size);
-            upscaling.encode(encoder, ring, output.view(), None)?;
+            upscaling.encode(encoder, ring, output.view(), None, None)?;
             let readback = BufferCopy {
                 buffer: &self.readback,
                 offset,

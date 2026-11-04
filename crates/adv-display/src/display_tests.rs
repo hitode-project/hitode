@@ -1093,6 +1093,8 @@ fn upscaled_partial_frames_match_a_whole_run_across_buffer_ages() {
         panic!("upscaled frame")
     };
     assert_eq!(tiles.rects, [rect(48, 32, 16, 16)]);
+    assert_eq!(latest.statistics.kind, crate::recorder::PlanKind::Upscaled);
+    assert!(display.totals().upscaled_runs > 0 && display.totals().upscaled_pixels > 0);
     let partial = read(&d, &mut q, &display.shown_base());
     let mut whole = Display::new(d.clone(), compositor(&history), upscaled).unwrap();
     ready(&mut whole, &mut q, &pixels);

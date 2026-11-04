@@ -21,6 +21,8 @@ enum Request {
     Hide,
     Minimize,
 }
+// Native statistics move each frame; boxing them would allocate per frame.
+#[allow(clippy::large_enum_variant)]
 enum Delivery {
     Input(window::Event),
     #[cfg(mobile)]

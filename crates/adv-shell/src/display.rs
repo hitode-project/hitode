@@ -464,6 +464,8 @@ fn statistics(
         software_started: t.software_started.map(|at| origin + at),
         configurations: t.configurations,
         max_queue_ns: t.max_queue.as_nanos() as u64,
+        upscaled_runs: t.upscaled_runs,
+        upscaled_pixels: t.upscaled_pixels,
         display_plan: match s.kind {
             adv_display::recorder::PlanKind::Direct => "direct",
             adv_display::recorder::PlanKind::Merged => "merged",
@@ -481,7 +483,7 @@ fn statistics(
             plan::Stage::Ingest { .. } => 0,
             plan::Stage::Video { .. } => 1,
             plan::Stage::Output { .. } => 2,
-            _ => unreachable!(),
+            plan::Stage::Upscale { .. } => 3,
         };
         stats.display_stage_tiles[index] += s.stages[i].tiles;
         stats.display_stage_pixels[index] += s.stages[i].pixels as u32;
