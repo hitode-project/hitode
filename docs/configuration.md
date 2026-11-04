@@ -84,7 +84,8 @@ Header macros, placeholder names in script examples and names read only to clear
 | `ADV_PRINTF_DIAG_PATH` | Diagnostic | No output |
 | `ADV_PRINTF_DIAG_WORDS` | Diagnostic | Empty filter; needs `ADV_PRINTF_DIAG_PATH` |
 | `ADV_PRIVACY_TERMS` | Diagnostic | The local `.privacy-terms`, if present |
-| `ADV_SAMPLES` | Fixture | Unset: tests that need games skip |
+| `ADV_SAMPLES` | Fixture | Unset: tests that need games skip; `tools/smoke.py` reads its game list from `smoke.json` there |
+| `ADV_SMOKE` | Fixture | The game list of `tools/smoke.py` (shape: `tools/smoke.example.json`); unset: `$ADV_SAMPLES/smoke.json` |
 | `ADV_SHELL_LOG_TEST_CHILD` | Fixture | Unset; set by the parent test |
 | `ADV_TEST_FFMPEG` | Fixture | `ffmpeg` |
 | `ADV_TEST_GPU_BACKEND` | Fixture | Automatic; `vulkan` or `gles` |

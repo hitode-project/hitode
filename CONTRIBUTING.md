@@ -10,6 +10,9 @@ You need Rust stable, Python 3, and CMake for the differential tests. [docs/buil
 python3 tools/check.py --install-hook   # checks formatting, privacy, layering and specs before each commit
 python3 tools/check.py --fix            # applies formatting and regenerates generated tables
 python3 tools/check.py --ci             # the checks plus CI's Clippy gates; run before pushing
+python3 tools/lint.py ios android       # Clippy for the mobile targets, which CI does not build
+python3 tools/smoke.py                  # headless smoke of your games, listed in $ADV_SAMPLES/smoke.json
+python3 tools/env.py android -- cargo …  # any command in a platform's toolchain environment
 cargo test -p adv-cpu                   # test the crates you changed
 cargo run -p adv-run --release -- --audio path/to/game.exe   # the code page is detected; --codepage 932|936 overrides
 ```

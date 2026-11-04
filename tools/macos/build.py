@@ -98,7 +98,8 @@ def remap_flags() -> list[str]:
     ]]
 
 
-def build(jobs: int, ffmpeg_only: bool, mobile: str | None = None) -> dict:
+def static_ffmpeg(jobs: int, mobile: str | None = None) -> tuple[Path, str, dict]:
+    """The installed static FFmpeg prefix for macOS or `mobile`, built once per checkout."""
     if platform.system() != 'Darwin' or platform.machine() != 'arm64':
         raise ValueError('this build targets ARM macOS')
     profile = json.loads(PROFILE.read_text())
@@ -107,29 +108,42 @@ def build(jobs: int, ffmpeg_only: bool, mobile: str | None = None) -> dict:
     base = ROOT / f"target/{mobile or 'macos'}-ffmpeg" / key
     source = base / f"ffmpeg-{profile['version']}"
     prefix = base / 'install'
+    if (prefix / 'build.json').exists():
+        return prefix, key, profile
     base.mkdir(parents=True, exist_ok=True)
-    log_dir = ROOT / 'target/scratch/macos-package'
-    log_dir.mkdir(parents=True, exist_ok=True)
     archive = base.parent / f"ffmpeg-{profile['version']}.tar.xz"
     if not archive.exists():
         archive.write_bytes(download(profile['url']))
     if digest(archive) != profile['sha256']:
         raise ValueError('FFmpeg source checksum mismatch')
-    with (log_dir / (f'build-static-{mobile}.log' if mobile else 'build-static.log')).open('w') as log:
+    with log_file(mobile).open('w') as log:
         def run(*args, **kwargs):
             subprocess.run([str(a) for a in args], check=True, stdout=log, stderr=subprocess.STDOUT, **kwargs)
-        if not (prefix / 'build.json').exists():
-            if not source.exists():
-                run('tar', '-xf', archive, '-C', base)
-            run(source / 'configure', *configure(profile, prefix, mobile), cwd=source)
-            run('make', f'-j{jobs}', cwd=source)
-            run('make', 'install', cwd=source)
-            (prefix / 'build.json').write_text(json.dumps(profile, indent=2) + '\n')
-        for library in ['avcodec', 'avformat', 'avutil', 'swresample', 'swscale']:
-            if not (prefix / 'lib' / f'lib{library}.a').is_file():
-                raise ValueError('static FFmpeg build is incomplete')
-        if list((prefix / 'lib').glob('*.dylib')) or list((prefix / 'lib').glob('*.so')):
-            raise ValueError('static FFmpeg prefix contains dynamic libraries')
+        if not source.exists():
+            run('tar', '-xf', archive, '-C', base)
+        run(source / 'configure', *configure(profile, prefix, mobile), cwd=source)
+        run('make', f'-j{jobs}', cwd=source)
+        run('make', 'install', cwd=source)
+    for library in ['avcodec', 'avformat', 'avutil', 'swresample', 'swscale']:
+        if not (prefix / 'lib' / f'lib{library}.a').is_file():
+            raise ValueError('static FFmpeg build is incomplete')
+    if list((prefix / 'lib').glob('*.dylib')) or list((prefix / 'lib').glob('*.so')):
+        raise ValueError('static FFmpeg prefix contains dynamic libraries')
+    (prefix / 'build.json').write_text(json.dumps(profile, indent=2) + '\n')
+    return prefix, key, profile
+
+
+def log_file(mobile: str | None) -> Path:
+    log_dir = ROOT / 'target/scratch/macos-package'
+    log_dir.mkdir(parents=True, exist_ok=True)
+    return log_dir / (f'build-static-{mobile}.log' if mobile else 'build-static.log')
+
+
+def build(jobs: int, ffmpeg_only: bool, mobile: str | None = None) -> dict:
+    prefix, key, profile = static_ffmpeg(jobs, mobile)
+    with log_file(mobile).open('a') as log:
+        def run(*args, **kwargs):
+            subprocess.run([str(a) for a in args], check=True, stdout=log, stderr=subprocess.STDOUT, **kwargs)
         if mobile or ffmpeg_only:
             # Tauri's Xcode build passes only HOME and PATH to Cargo, so a cargo
             # wrapper first on PATH carries the FFmpeg location instead.
