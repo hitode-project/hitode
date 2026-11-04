@@ -424,6 +424,8 @@ impl Buffer {
             self.desc().size as usize,
         ))
     }
+    /// Shared storage is coherent.
+    pub(crate) fn flush(&self, _: impl IntoIterator<Item = std::ops::Range<u64>>) {}
     pub(crate) fn slice(&self, range: std::ops::Range<u64>) -> BufferSlice<'_> {
         BufferSlice {
             buffer: self.1.get_or_init(|| {

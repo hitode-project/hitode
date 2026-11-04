@@ -493,6 +493,10 @@ fn views_partial_clears_query_resets_and_resolves() {
             encoder.copy_image(copy(&source), copy(&destination), desc.size);
             read_image(&mut encoder, &destination, 0, 0, desc.size, &results);
             finish(&mut queue, encoder);
+            // A Mali-G52 driver (r34) reads back zero chroma here although the
+            // format reports transfers; barriers use COLOR, as non-disjoint
+            // planar images require. Players never copy planar images on the
+            // GPU; decoders write them on the CPU.
             assert_eq!(bytes(&uploaded), pattern, "{format:?} upload");
             assert_eq!(bytes(&results), pattern, "{format:?} image copy");
         }

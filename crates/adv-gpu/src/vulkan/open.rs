@@ -209,6 +209,10 @@ impl Device {
                 .modern
                 .contains(Modern::EXTENDED_DYNAMIC_STATE)
                 .then(|| Eds::load(&instance, &device, device_api));
+            let atom = instance
+                .get_physical_device_properties(physical)
+                .limits
+                .non_coherent_atom_size;
             let context = Arc::new(Context {
                 eds,
                 pipelines: Mutex::new(pipeline::Pipelines::default()),
@@ -236,6 +240,7 @@ impl Device {
                 family,
                 caps,
                 memory,
+                atom,
                 allocator: Mutex::new(Some(allocator)),
                 lost: AtomicBool::new(false),
                 next: AtomicU64::new(1),

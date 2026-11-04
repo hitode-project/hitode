@@ -113,6 +113,10 @@ impl Slots {
                 copied += len as u64;
             }
         }
+        entry.buffer.flush(entry.debt.iter().map(|r| {
+            let start = u64::from(r.y * s.pitch + s.format.byte_offset(r.x));
+            start..start + u64::from((r.h - 1) * s.pitch + s.span(r.x, r.w))
+        }));
         entry.debt = Damage::default();
         self.last = Some(i);
         let palette_changed = match (&self.palette, &s.palette) {

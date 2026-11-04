@@ -128,12 +128,17 @@ bitflags::bitflags! {
 pub enum Memory {
     /// GPU-only.
     Device,
-    /// Mapped for CPU writes and read by the GPU in place: software surface
-    /// slots, dynamic guest buffers. Coherent, and host-cached where the
-    /// device has such a type, on Vulkan; shared on Metal. Software damage
-    /// comparison reads the same memory.
+    /// Mapped for CPU writes that the GPU reads in place: rings, dynamic
+    /// guest buffers. Coherent, and host-cached where a type is both, on
+    /// Vulkan; shared on Metal.
     Upload,
-    /// Mapped for CPU reads after GPU writes: readbacks.
+    /// Mapped for CPU writes that the CPU also reads back and the GPU reads:
+    /// software surface slots, whose damage comparison reads the previous
+    /// frame. Host-cached, and coherent where a type is both; writers call
+    /// [`Buffer::flush`].
+    Shared,
+    /// Mapped for CPU reads after GPU writes: readbacks. Host-cached, and
+    /// coherent where a type is both.
     Readback,
 }
 
@@ -160,8 +165,16 @@ impl Buffer {
     /// buffer. The caller orders CPU access against GPU use through tokens:
     /// write only ranges no unfinished submission reads, read only after the
     /// writing submission completes.
+    ///
+    /// On a `Readback` buffer the call also makes completed GPU writes
+    /// visible to the CPU, so take the mapping after the completion.
     pub fn mapped(&self) -> Option<std::ptr::NonNull<[u8]>> {
         self.inner.mapped()
+    }
+    /// Make CPU writes to `ranges` of a `Shared` buffer visible to the GPU,
+    /// before the submission that reads them. Free on coherent memory.
+    pub fn flush(&self, ranges: impl IntoIterator<Item = std::ops::Range<u64>>) {
+        self.inner.flush(ranges)
     }
     pub fn slice(&self, range: std::ops::Range<u64>) -> BufferSlice<'_> {
         self.inner.slice(range)

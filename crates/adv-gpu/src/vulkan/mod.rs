@@ -48,6 +48,8 @@ pub(crate) struct Context {
     family: u32,
     caps: Caps,
     memory: vk::PhysicalDeviceMemoryProperties,
+    /// `nonCoherentAtomSize`, the granularity of flushes and invalidations.
+    atom: u64,
     allocator: Mutex<Option<Allocator>>,
     lost: AtomicBool,
     /// The token the next submission takes, and the encoders still open:
@@ -287,25 +289,21 @@ impl Context {
         lazy: bool,
         name: &str,
     ) -> Result<Allocation> {
-        // Mapped memory is never flushed or invalidated, so it must be
-        // coherent; CPU reads want it cached where a type is both.
-        let mapped = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+        // Upload memory is never flushed, so it must be coherent. Memory the
+        // CPU reads wants a cached type, flushed or invalidated where it is
+        // not coherent; the first preference outranks the second.
+        let visible = vk::MemoryPropertyFlags::HOST_VISIBLE;
+        let coherent = vk::MemoryPropertyFlags::HOST_COHERENT;
+        let cached = vk::MemoryPropertyFlags::HOST_CACHED;
         let (required, preferred, location) = match memory {
             Memory::Device => (
                 vk::MemoryPropertyFlags::DEVICE_LOCAL,
-                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                [vk::MemoryPropertyFlags::DEVICE_LOCAL; 2],
                 MemoryLocation::GpuOnly,
             ),
-            Memory::Upload => (
-                mapped,
-                mapped | vk::MemoryPropertyFlags::HOST_CACHED,
-                MemoryLocation::CpuToGpu,
-            ),
-            Memory::Readback => (
-                mapped,
-                mapped | vk::MemoryPropertyFlags::HOST_CACHED,
-                MemoryLocation::GpuToCpu,
-            ),
+            Memory::Upload => (visible | coherent, [cached; 2], MemoryLocation::CpuToGpu),
+            Memory::Shared => (visible, [cached, coherent], MemoryLocation::CpuToGpu),
+            Memory::Readback => (visible, [cached, coherent], MemoryLocation::GpuToCpu),
         };
         let mask = |flags| {
             self.memory
@@ -327,7 +325,9 @@ impl Context {
                 requirements.memory_type_bits = types;
             }
         };
-        prefer(preferred);
+        for flags in preferred {
+            prefer(flags);
+        }
         if lazy {
             prefer(vk::MemoryPropertyFlags::LAZILY_ALLOCATED);
         }

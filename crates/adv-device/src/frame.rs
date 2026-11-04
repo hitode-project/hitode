@@ -73,7 +73,7 @@ impl Slot {
             // Byte extraction uses u32 loads, including the final pixel.
             size: u64::from(bytes).next_multiple_of(4),
             usage: adv_gpu::resource::BufferUsage::STORAGE,
-            memory: adv_gpu::resource::Memory::Upload,
+            memory: adv_gpu::resource::Memory::Shared,
             label: "software slot",
         })?;
         Ok(Self {

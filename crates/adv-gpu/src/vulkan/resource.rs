@@ -43,11 +43,56 @@ impl Buffer {
         if self.0.desc.memory == Memory::Device {
             return None;
         }
-        self.0
-            .allocation
-            .as_ref()?
-            .mapped_ptr()
-            .map(|p| std::ptr::NonNull::slice_from_raw_parts(p.cast(), self.0.desc.size as usize))
+        let pointer = self.0.allocation.as_ref()?.mapped_ptr()?;
+        if self.0.desc.memory == Memory::Readback
+            && let Some(range) = self.noncoherent(0..self.0.desc.size)
+        {
+            // SAFETY: the range lies in this buffer's mapped allocation.
+            unsafe {
+                self.0
+                    .context
+                    .device
+                    .invalidate_mapped_memory_ranges(&[range])
+            }
+            .expect("invalidate readback memory");
+        }
+        Some(std::ptr::NonNull::slice_from_raw_parts(
+            pointer.cast(),
+            self.0.desc.size as usize,
+        ))
+    }
+    pub(crate) fn flush(&self, ranges: impl IntoIterator<Item = std::ops::Range<u64>>) {
+        let ranges: Vec<_> = ranges
+            .into_iter()
+            .filter_map(|range| self.noncoherent(range))
+            .collect();
+        if !ranges.is_empty() {
+            // SAFETY: every range lies in this buffer's mapped allocation.
+            unsafe { self.0.context.device.flush_mapped_memory_ranges(&ranges) }
+                .expect("flush shared memory");
+        }
+    }
+    /// `range` of the buffer as atom-aligned device memory, or `None` where
+    /// the memory is coherent and needs no flush or invalidation.
+    fn noncoherent(&self, range: std::ops::Range<u64>) -> Option<vk::MappedMemoryRange<'static>> {
+        let allocation = self.0.allocation.as_ref()?;
+        if allocation
+            .memory_properties()
+            .contains(vk::MemoryPropertyFlags::HOST_COHERENT)
+            || range.is_empty()
+        {
+            return None;
+        }
+        // Blocks are atom multiples, so rounding out stays inside the block.
+        let atom = self.0.context.atom;
+        let start = (allocation.offset() + range.start) / atom * atom;
+        let end = (allocation.offset() + range.end).next_multiple_of(atom);
+        Some(
+            vk::MappedMemoryRange::default()
+                .memory(unsafe { allocation.memory() })
+                .offset(start)
+                .size(end - start),
+        )
     }
     pub(crate) fn slice(&self, range: std::ops::Range<u64>) -> BufferSlice<'_> {
         BufferSlice {
