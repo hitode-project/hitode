@@ -118,7 +118,7 @@ def graph(passes):
     current = {'INPUT': 'INPUT'}
     result = []
     for i, p in enumerate(passes):
-        value = dict(p, inputs=[current[n] for n in p['inputs']], radius=1)
+        value = dict(p, inputs=[current[n] for n in p['inputs']])
         value['outputs'] = [n if n == 'OUTPUT' else f'{n}_version{i}' for n in p['outputs']]
         current.update(zip(p['outputs'], value['outputs']))
         result.append(value)
@@ -149,7 +149,7 @@ def combine(root, name, passes, write, matrix=False):
             write(shader, pair((root / name / f'{index + 1}.wgsl').read_text(),
                                (root / name / f'{index + 2}.wgsl').read_text(), p, b))
             value.update(outputs=versions[index + 1]['outputs'], formats=b['formats'],
-                         block=16, radius=2, shader=shader)
+                         block=16, radius=p['radius'] + b['radius'], shader=shader)
             index += 1
         if matrix and index == 0:
             import matrix as cooperative

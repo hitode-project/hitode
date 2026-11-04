@@ -466,7 +466,13 @@ fn damage_dilation_mapping_alignment_and_merging() {
     let p = run(&f, &settings(), &caps(), &warm(0, f.canvas, Some(1)));
     assert_eq!(stage_tiles(&p.stages[0])[0].rects, [rect(0, 0, 32, 32)]);
     assert_eq!(p.layers.base.damage, Damage::rects([rect(0, 0, 32, 32)]));
-    for (model, radius) in MODEL_RADII {
+    for model in [
+        Upscaler::Anime4k,
+        Upscaler::Cunny,
+        Upscaler::Artcnn,
+        Upscaler::K7,
+    ] {
+        let radius = crate::stages::upscale::reach(model);
         let f = FrameInfo {
             damage: Damage::rects([rect(40, 50, 1, 1)]),
             ..frame()
@@ -533,7 +539,7 @@ fn damage_dilation_mapping_alignment_and_merging() {
         &caps(),
         &warm(2, (480, 640), Some(1)),
     );
-    assert_eq!(stage_tiles(&p.stages[0])[0].rects, [rect(0, 608, 32, 32)]);
+    assert_eq!(stage_tiles(&p.stages[0])[0].rects, [rect(0, 624, 16, 16)]);
     let d = Damage::rects((0..5).map(|n| rect(n * 10, 0, 1, 1)));
     assert_eq!(d, Damage::rects([rect(0, 0, 41, 1)]));
 }
@@ -667,7 +673,7 @@ fn budget_and_thermal_tier_table() {
         ..frame()
     };
     let c = CostModel {
-        frame_budget_ns: 5_000,
+        frame_budget_ns: 1_500,
         ..cost()
     };
     let p = plan(
@@ -713,7 +719,7 @@ fn quiet_refinement_oldest_first_and_new_damage_reset() {
         ..settings()
     };
     let c = CostModel {
-        frame_budget_ns: 10_000,
+        frame_budget_ns: 5_000,
         ..cost()
     };
     let p = plan(&f, &s, &caps(), &c, &pools);

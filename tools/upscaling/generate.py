@@ -70,6 +70,8 @@ def generate(compiler):
     manifest = []
     for (n, body) in enumerate(parts, 1):
         ins = re.findall('//!BIND (\\w+)', body)
+        # Convolutions sample neighbours; depth-to-space reads its own texel.
+        radius = int('_texOff(' in body)
         save = re.search('//!SAVE (\\w+)', body)
         last = not save
         outs = [save[1] if save else 'OUTPUT']
@@ -103,7 +105,7 @@ def generate(compiler):
         if r.returncode:
             print(n, r.stderr[:2500])
             raise SystemExit(1)
-        manifest.append(dict(inputs=['INPUT' if x == 'LUMA' else x for x in ins], outputs=outs, block=8, samplers=[['LINEAR', 'sam']], formats=['rgba16f']))
+        manifest.append(dict(inputs=['INPUT' if x == 'LUMA' else x for x in ins], outputs=outs, block=8, samplers=[['LINEAR', 'sam']], formats=['rgba16f'], radius=radius))
     (outdir / 'passes.json').write_text(json.dumps(manifest, indent=2))
     print('ArtCNN compiled', len(manifest))
     emit(root)
@@ -207,7 +209,7 @@ def emit(root):
     for (variant, name) in MODELS:
         passes = json.loads((root / name / 'passes.json').read_text())
         for (i, p) in enumerate(passes, 1):
-            p.update(shader=f'{name}/{i}.wgsl', radius=1)
+            p.update(shader=f'{name}/{i}.wgsl', radius=p.get('radius', 1))
             write(p['shader'], (root / name / f'{i}.wgsl').read_text())
         tables['REFERENCE'].append(model(passes))
         fused = fuse.combine(root, name, passes, write)

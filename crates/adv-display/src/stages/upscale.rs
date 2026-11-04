@@ -66,10 +66,23 @@ pub fn reach(choice: Upscaler) -> u32 {
 }
 
 impl Model {
-    /// Input pixels a change reaches in the output: every layer is a 3×3
-    /// convolution, and the final layer also samples the input bilinearly.
+    /// Input pixels a change reaches in the output. Reach follows the data:
+    /// a pass's outputs reach its radius beyond the farthest input it reads,
+    /// so passes of one layer add theirs once. The final layer's bilinear
+    /// sample of the input reaches one pixel beside that chain.
     pub fn reach(&self) -> u32 {
-        self.passes.iter().map(|p| p.radius).sum::<u32>() + 1
+        let mut tensors = vec![0; self.tensors.len()];
+        let mut output = 0;
+        for pass in self.passes {
+            let reach = pass.reads().map(|t| tensors[t]).max().unwrap_or(0) + pass.radius;
+            for written in pass.writes() {
+                match written {
+                    Some(t) => tensors[t] = reach,
+                    None => output = reach,
+                }
+            }
+        }
+        output.max(1)
     }
 }
 
@@ -77,6 +90,23 @@ impl Pass {
     /// Input pixels per workgroup cell along each axis.
     fn unit(&self) -> u32 {
         self.block / self.scale
+    }
+
+    /// The tensors this pass reads.
+    fn reads(&self) -> impl Iterator<Item = usize> {
+        self.bindings.iter().filter_map(|(_, role)| match role {
+            Role::Tensor(t) => Some(*t),
+            _ => None,
+        })
+    }
+
+    /// The tensors this pass writes, `None` for the output.
+    fn writes(&self) -> impl Iterator<Item = Option<usize>> {
+        self.bindings.iter().filter_map(|(_, role)| match role {
+            Role::Store(t) => Some(Some(*t)),
+            Role::Output => Some(None),
+            _ => None,
+        })
     }
 }
 
@@ -356,7 +386,8 @@ impl Upscaling {
 
     /// Each pass's cell list after a change within `damage`, or `None` where
     /// it is the whole grid. Walks back from the last pass: a pass's cells
-    /// must cover what its successor reads, its radius beyond the cells.
+    /// cover what later readers need of the tensors it writes, and it needs
+    /// its inputs its radius beyond those cells.
     fn cells(&self, damage: &[Rect]) -> Vec<Option<Vec<u32>>> {
         let grow = |r: Rect, by: u32| {
             let x = r.x.saturating_sub(by);
@@ -369,7 +400,10 @@ impl Upscaling {
             }
         };
         let reach = self.model.reach();
-        let mut needed: Vec<Rect> = damage
+        // What later readers need of each tensor, the output last.
+        let output = self.model.tensors.len();
+        let mut needed = vec![Vec::new(); output + 1];
+        needed[output] = damage
             .iter()
             .filter(|r| r.w > 0 && r.h > 0)
             .map(|&r| grow(r, reach))
@@ -380,7 +414,12 @@ impl Upscaling {
             let unit = pass.unit();
             let words = grid.columns.div_ceil(64) as usize;
             let mut bits = vec![0u64; words * grid.rows as usize];
-            for r in needed.iter().filter(|r| r.w > 0 && r.h > 0) {
+            // Earlier writers of these tensors feed no later reader.
+            let wanted: Vec<Rect> = pass
+                .writes()
+                .flat_map(|t| std::mem::take(&mut needed[t.unwrap_or(output)]))
+                .collect();
+            for r in wanted.iter().filter(|r| r.w > 0 && r.h > 0) {
                 let (x0, x1) = (r.x / unit, (r.x + r.w - 1) / unit);
                 for y in r.y / unit..=(r.y + r.h - 1) / unit {
                     let row = &mut bits[y as usize * words..][..words];
@@ -391,7 +430,6 @@ impl Upscaling {
                     }
                 }
             }
-            needed.clear();
             let mut list = Vec::new();
             for y in 0..grid.rows {
                 let row = &bits[y as usize * words..][..words];
@@ -417,7 +455,10 @@ impl Upscaling {
                         w: (end - start) * unit,
                         h: unit,
                     };
-                    needed.push(grow(run, pass.radius));
+                    let input = grow(run, pass.radius);
+                    for t in pass.reads() {
+                        needed[t].push(input);
+                    }
                     x = end;
                 }
             }

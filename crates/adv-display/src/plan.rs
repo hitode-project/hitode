@@ -328,15 +328,6 @@ const CANVAS: PoolId = PoolId(0);
 const VIDEO: PoolId = PoolId(1);
 const OUTPUT: PoolId = PoolId(2);
 
-/// Placeholder input-pixel receptive field radii. Package F replaces these
-/// with the kernel generator's exact radii for the shipped models.
-pub const MODEL_RADII: [(Upscaler, u32); 4] = [
-    (Upscaler::Anime4k, 8),
-    (Upscaler::Cunny, 14),
-    (Upscaler::Artcnn, 10),
-    (Upscaler::K7, 8),
-];
-
 impl PoolState {
     /// Commit all writes once, after the atomic present succeeds. Intermediate
     /// targets age too.
@@ -857,11 +848,7 @@ pub fn plan(
         };
         let (target, age) = pools.target(OUTPUT, swapped(output, settings.rotation));
         let work = pools.damage(&damage, age);
-        let reach = MODEL_RADII
-            .iter()
-            .find(|(m, _)| *m == settings.upscaler)
-            .unwrap()
-            .1;
+        let reach = crate::stages::upscale::reach(settings.upscaler);
         let mut budget = cost.frame_budget_ns as f64;
         let mut regions = vec![];
         // Merge after dilation/alignment as well, so no target pixel gets two
