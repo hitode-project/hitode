@@ -312,7 +312,11 @@ fn host_system() -> (Vec<u8>, Vec<u8>) {
         field
             .iter()
             .take_while(|&&c| c != 0)
-            .map(|&c| c as u8)
+            .map(|&c| {
+                #[allow(clippy::unnecessary_cast, reason = "c_char is i8 on Apple targets")]
+                let byte = c as u8;
+                byte
+            })
             .collect()
     };
     (text(&name.sysname), text(&name.release))
