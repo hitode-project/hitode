@@ -1053,7 +1053,7 @@ fn upscaled_partial_frames_match_a_whole_run_across_buffer_ages() {
             Upscaler::Off
         );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        while !display.upscaler_ready() {
+        while !display.upscaler_ready(q) {
             assert!(
                 std::time::Instant::now() < deadline,
                 "upscaler build timed out"

@@ -144,6 +144,8 @@ fn ingest_decodes_every_format_and_palette_bit_for_bit() {
                 let slot = Slot::new(&device, s.width, s.height, s.pitch, format).unwrap();
                 let out = unsafe { slot.buffer().mapped().unwrap().as_mut() };
                 out[..memory.bytes.len()].copy_from_slice(&normalized);
+                // Shared memory may be non-coherent: publish CPU writes.
+                slot.buffer().flush([0..normalized.len() as u64]);
                 let software = Source {
                     buffer: slot.buffer(),
                     pitch: slot.pitch(),
@@ -231,6 +233,7 @@ fn ingest_decodes_every_format_and_palette_bit_for_bit() {
                 }
                 (unsafe { slot.buffer().mapped().unwrap().as_mut() })[..normalized.len()]
                     .copy_from_slice(&normalized);
+                slot.buffer().flush([0..normalized.len() as u64]);
                 let rects = [
                     Rect {
                         x: 1,

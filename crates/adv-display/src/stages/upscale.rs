@@ -51,11 +51,11 @@ fn index(choice: Upscaler) -> usize {
     }
 }
 
-/// The model a device runs: matrix input convolutions where it has half
-/// precision 8×8 matrices, the fused layers otherwise.
-pub fn model(device: &Device, choice: Upscaler) -> Model {
+/// The model a device runs: matrix input convolutions where it runs half
+/// precision and has 8×8 matrices of it, the fused layers otherwise.
+pub fn model(device: &Device, choice: Upscaler, half: bool) -> Model {
     let matrix = Features::MATRIX_F16_8X8 | Features::SHADER_F16 | Features::SUBGROUP;
-    if device.caps().features.contains(matrix) {
+    if half && device.caps().features.contains(matrix) {
         models::MATRIX[index(choice)]
     } else {
         models::FUSED[index(choice)]
@@ -486,6 +486,134 @@ fn words(values: impl IntoIterator<Item = u32>) -> Vec<u8> {
     values.into_iter().flat_map(u32::to_le_bytes).collect()
 }
 
+/// `k / 256` as IEEE half-precision bits; exact for k up to 256.
+fn half_bits(k: u32) -> [u8; 2] {
+    if k == 0 {
+        return [0, 0];
+    }
+    let exponent = 31 - k.leading_zeros();
+    let mantissa = ((k << (10 - exponent)) & 0x3ff) as u16;
+    (((exponent + 7) as u16) << 10 | mantissa).to_le_bytes()
+}
+
+/// The canvas of the precision check.
+const CHECK: (u32, u32) = (16, 16);
+
+/// A model's half forms against its single forms on a small canvas of
+/// pseudo-random pixels. Some drivers compute the half forms of some models
+/// wrongly by whole channels (Adreno 6xx); healthy half precision stays
+/// within 3 levels of single precision.
+pub struct Check {
+    /// Half, then single precision, each with its doubled output.
+    runs: [(Upscaling, Image); 2],
+    pixels: Buffer,
+    readback: Buffer,
+}
+
+impl Check {
+    /// Blocking pipeline creation, like [`Upscaling::new`]. `None` when
+    /// `model` has no half form.
+    pub fn new(device: &Device, model: Model) -> adv_gpu::Result<Option<Self>> {
+        let halves = model.passes.iter().any(|pass| {
+            SHADERS
+                .iter()
+                .any(|(path, h, _)| *path == pass.shader && h.is_some())
+        });
+        if !halves {
+            return Ok(None);
+        }
+        let run = |half| {
+            let output = device.create_image(&ImageDesc {
+                dimension: Dimension::D2,
+                size: Extent {
+                    width: CHECK.0 * 2,
+                    height: CHECK.1 * 2,
+                    depth_or_layers: 1,
+                },
+                format: OUTPUT,
+                mips: 1,
+                samples: 1,
+                usage: Usage::STORAGE | Usage::COPY_SRC,
+                view_formats: &[],
+                label: "upscale check",
+            })?;
+            Ok::<_, adv_gpu::Error>((
+                Upscaling::with_precision(device, model, CHECK, half)?,
+                output,
+            ))
+        };
+        let mut seed = 0x2545_f491u32;
+        let mut level = || {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            half_bits((seed >> 16) % 257)
+        };
+        let bytes: Vec<u8> = (0..CHECK.0 * CHECK.1)
+            .flat_map(|_| [level(), level(), level(), [0x00, 0x3c]])
+            .flatten()
+            .collect();
+        let buffer = |size, usage, memory| {
+            device.create_buffer(&BufferDesc {
+                size,
+                usage,
+                memory,
+                label: "upscale check",
+            })
+        };
+        let pixels = buffer(bytes.len() as u64, BufferUsage::COPY_SRC, Memory::Upload)?;
+        // SAFETY: the buffer is new and no GPU work refers to it yet.
+        (unsafe { pixels.mapped().expect("upload memory").as_mut() })[..bytes.len()]
+            .copy_from_slice(&bytes);
+        Ok(Some(Self {
+            runs: [run(true)?, run(false)?],
+            pixels,
+            readback: buffer(2 * Self::BYTES, BufferUsage::COPY_DST, Memory::Readback)?,
+        }))
+    }
+
+    const BYTES: u64 = (CHECK.0 * CHECK.1 * 16) as u64;
+
+    /// Both runs and their readback.
+    pub fn encode(&self, encoder: &mut Encoder, ring: &mut Ring) -> adv_gpu::Result<()> {
+        use adv_gpu::encode::{BufferCopy, ImageCopy};
+        let at = |image| ImageCopy {
+            image,
+            mip: 0,
+            layer: 0,
+            origin: (0, 0, 0),
+        };
+        for (offset, (upscaling, output)) in (0..).step_by(Self::BYTES as usize).zip(&self.runs) {
+            let input = upscaling.input();
+            let pixels = BufferCopy {
+                buffer: &self.pixels,
+                offset: 0,
+                row_pitch: 0,
+                rows: 0,
+            };
+            encoder.copy_buffer_to_image(pixels, at(input), input.desc().size);
+            upscaling.encode(encoder, ring, output.view(), None)?;
+            let readback = BufferCopy {
+                buffer: &self.readback,
+                offset,
+                row_pitch: 0,
+                rows: 0,
+            };
+            encoder.copy_image_to_buffer(at(output), readback, output.desc().size);
+        }
+        Ok(())
+    }
+
+    /// Whether the half forms computed what the single forms did.
+    ///
+    /// # Safety
+    /// The work [`Self::encode`] recorded has completed.
+    pub unsafe fn agrees(&self) -> bool {
+        // SAFETY: the caller guarantees the copies completed.
+        let bytes = unsafe { self.readback.mapped().expect("readback memory").as_ref() };
+        let (half, single) = bytes[..2 * Self::BYTES as usize].split_at(Self::BYTES as usize);
+        half.iter().zip(single).all(|(a, b)| a.abs_diff(*b) <= 8)
+    }
+}
+
 #[cfg(test)]
 mod precision_tests {
     use super::*;
@@ -516,7 +644,7 @@ mod precision_tests {
                 Upscaler::Artcnn,
                 Upscaler::K7,
             ] {
-                let m = model(device, choice);
+                let m = model(device, choice, half);
                 for pass in m.passes {
                     let (_, h, _) = SHADERS.iter().find(|(p, ..)| *p == pass.shader).unwrap();
                     let label = format!("{} {}", if half { "f16" } else { "f32" }, pass.shader);

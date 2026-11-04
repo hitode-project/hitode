@@ -139,8 +139,20 @@ struct Pipelines {
     sampler: Sampler,
 }
 impl Upscaled {
-    fn new(device: &Device, choice: Upscaler, canvas: (u32, u32)) -> adv_gpu::Result<Self> {
-        let upscaling = upscale::Upscaling::new(device, upscale::model(device, choice), canvas)?;
+    /// With the check of its half forms when it runs them.
+    fn new(
+        device: &Device,
+        choice: Upscaler,
+        canvas: (u32, u32),
+        half: bool,
+    ) -> adv_gpu::Result<(Self, Option<upscale::Check>)> {
+        let model = upscale::model(device, choice, half);
+        let check = if half {
+            upscale::Check::new(device, model)?
+        } else {
+            None
+        };
+        let upscaling = upscale::Upscaling::with_precision(device, model, canvas, half)?;
         let output = device.create_image(&adv_gpu::resource::ImageDesc {
             dimension: adv_gpu::resource::Dimension::D2,
             size: adv_gpu::Extent {
@@ -155,12 +167,13 @@ impl Upscaled {
             view_formats: &[],
             label: "upscaled",
         })?;
-        Ok(Self {
+        let upscaled = Self {
             choice,
             upscaling,
             output,
             pipelines: Pipelines::new(device, upscale::INPUT)?,
-        })
+        };
+        Ok((upscaled, check))
     }
 }
 impl Pipelines {
@@ -176,11 +189,13 @@ impl Pipelines {
         })
     }
 }
-/// A model build: its choice and canvas, and the result once sent. A failed
-/// build stays here, so the view stays unscaled instead of retrying.
+/// A model build: its choice and canvas, the result once sent, then its
+/// half-precision check until the GPU ran it. A failed build stays here, so
+/// the view stays unscaled instead of retrying.
 struct Building {
     key: (Upscaler, (u32, u32)),
-    result: std::sync::mpsc::Receiver<adv_gpu::Result<Upscaled>>,
+    result: std::sync::mpsc::Receiver<adv_gpu::Result<(Upscaled, Option<upscale::Check>)>>,
+    checking: Option<(Upscaled, upscale::Check, Token)>,
     failed: bool,
 }
 /// The selected model at one canvas size and the doubled image it keeps
@@ -210,6 +225,10 @@ pub struct Display {
     upscaled: Option<Upscaled>,
     /// The model being built off the owner thread, for this choice and canvas.
     building: Option<Building>,
+    /// Models whose half forms this device computes wrongly; they build in
+    /// Whether a check found this device computes half precision wrongly;
+    /// every model then builds in single precision.
+    single: bool,
     /// Each video's current decoder image while it is not attached.
     leases: HashMap<u64, PresentImage>,
     ring: Ring,
@@ -257,6 +276,7 @@ impl Display {
             converted: HashMap::new(),
             upscaled: None,
             building: None,
+            single: false,
             leases: HashMap::new(),
             ring,
             spans: vec![],
@@ -301,8 +321,8 @@ impl Display {
     }
     /// Whether the selected model is installed, taking a finished build.
     #[cfg(test)]
-    pub(crate) fn upscaler_ready(&mut self) -> bool {
-        self.install() || self.upscaled.is_some()
+    pub(crate) fn upscaler_ready(&mut self, queue: &mut Queue) -> bool {
+        self.install(queue).unwrap() || self.upscaled.is_some()
     }
     /// The base image the compositor shows last.
     #[cfg(test)]
@@ -515,10 +535,12 @@ impl Display {
             && self.settings.view.1 != 0
     }
     pub fn present(&mut self, queue: &mut Queue, mut frame: Frame) -> Result<Token, Failure> {
-        self.drain(queue).map_err(|error| Failure {
-            error,
-            token: Token(0),
-        })?;
+        self.drain(queue)
+            .and_then(|()| self.install(queue))
+            .map_err(|error| Failure {
+                error,
+                token: Token(0),
+            })?;
         let source = if let Base::Retained { image, .. } = &frame.base {
             Some(image.id())
         } else {
@@ -673,7 +695,7 @@ impl Display {
         Ok(())
     }
     pub fn service(&mut self, queue: &mut Queue) -> Result<(), Error> {
-        if self.install()
+        if self.install(queue)?
             && let Some(frame) = self.redraw_frame()
         {
             self.present(queue, frame).map_err(|e| e.error)?;
@@ -761,7 +783,6 @@ impl Display {
     /// `canvas`, otherwise none while a build runs off the owner thread
     /// (pipeline creation blocks for long on mobile drivers).
     fn upscaler(&mut self, choice: Upscaler, canvas: (u32, u32)) -> Upscaler {
-        self.install();
         let key = (choice, canvas);
         if choice == Upscaler::Off {
             self.upscaled = None;
@@ -778,10 +799,15 @@ impl Display {
         if self.building.as_ref().is_none_or(|b| b.key != key) {
             let (send, result) = std::sync::mpsc::sync_channel(1);
             let (device, wake) = (self.device.clone(), self.wake.clone());
+            let half = device
+                .caps()
+                .features
+                .contains(adv_gpu::Features::SHADER_F16)
+                && !self.single;
             let spawned = std::thread::Builder::new()
                 .name("adv-upscale-build".into())
                 .spawn(move || {
-                    let _ = send.send(Upscaled::new(&device, choice, canvas));
+                    let _ = send.send(Upscaled::new(&device, choice, canvas, half));
                     if let Some(wake) = wake {
                         wake();
                     }
@@ -789,35 +815,57 @@ impl Display {
             self.building = Some(Building {
                 key,
                 result,
+                checking: None,
                 failed: spawned.is_err(),
             });
         }
         Upscaler::Off
     }
-    /// Take a finished build. Content shown so far is unscaled, so the next
-    /// frame is whole.
-    fn install(&mut self) -> bool {
+    /// Take a finished build once its check, if any, agreed. Content shown so
+    /// far is unscaled, so the next frame is whole. A disagreeing check drops
+    /// the build; the next frame rebuilds it in single precision.
+    fn install(&mut self, queue: &mut Queue) -> Result<bool, Error> {
         let Some(building) = self.building.as_mut().filter(|b| !b.failed) else {
-            return false;
+            return Ok(false);
         };
-        match building.result.try_recv() {
-            Ok(Ok(upscaled)) => {
-                self.building = None;
-                self.upscaled = Some(upscaled);
-                self.pools.invalidate();
-                self.invalid = true;
-                true
+        let choice = building.key.0;
+        let upscaled = match building.checking.take() {
+            Some((upscaled, check, token)) => {
+                if queue.poll()? < token {
+                    building.checking = Some((upscaled, check, token));
+                    return Ok(false);
+                }
+                // SAFETY: the check's work completed.
+                if !unsafe { check.agrees() } {
+                    eprintln!("[display] {choice:?} half precision disagrees; using single");
+                    self.single = true;
+                    self.building = None;
+                    return Ok(false);
+                }
+                upscaled
             }
-            Ok(Err(error)) => {
-                eprintln!(
-                    "[display] {:?} upscaler unavailable: {error:?}",
-                    building.key.0
-                );
-                building.failed = true;
-                false
-            }
-            Err(_) => false,
-        }
+            None => match building.result.try_recv() {
+                Ok(Ok((upscaled, None))) => upscaled,
+                Ok(Ok((upscaled, Some(check)))) => {
+                    let mut encoder = queue.encoder("upscale check");
+                    check.encode(&mut encoder, &mut self.ring)?;
+                    let token = queue.submit(encoder)?;
+                    building.checking = Some((upscaled, check, token));
+                    return Ok(false);
+                }
+                Ok(Err(error)) => {
+                    eprintln!("[display] {choice:?} upscaler unavailable: {error:?}");
+                    building.failed = true;
+                    return Ok(false);
+                }
+                Err(_) => return Ok(false),
+            },
+        };
+        self.building = None;
+        self.upscaled = Some(upscaled);
+        self.pools.invalidate();
+        self.invalid = true;
+        Ok(true)
     }
     fn draw_video(
         &mut self,

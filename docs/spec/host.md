@@ -99,7 +99,7 @@ With `native-display`, settings and compositor notifications MUST poke the owner
 **Rule**: Selected upscalers MUST process the composed game frame on the host GPU without modifying guest pixels. Software, GPU and video inputs MUST share the same filter. Native-size and downscaled output MUST bypass super-resolution.
 **Verification**: Test
 
-Models whose upstream source declares FP16 compute in half precision when the GPU offers shader f16. Otherwise their passes run in single precision with the same f16-rounded weights.
+Models whose upstream source declares FP16 compute in half precision when the GPU offers shader f16. Otherwise their passes run in single precision with the same f16-rounded weights. Before a half-precision model is shown, it runs once against its single-precision form on a small canvas. If any channel differs by more than 8/255, the device computes every model in single precision.
 
 Optimized kernels MUST retain the selected model, weights and arithmetic precision. Final 8-bit display channels MUST differ by at most 2/255 from the unfused model. Adjacent layers share quantized workgroup storage; no intermediate tensor precision is discarded. Devices offering half-precision 8×8 cooperative matrices use tiled RGB input convolutions for Anime4K and k7; their Metal backend uses SIMD-group matrices. CuNNy keeps its vector input convolution and 8-bit intermediate storage, fusing only the final intermediate pair. ArtCNN keeps its FP32 graph.
 

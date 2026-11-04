@@ -1,6 +1,6 @@
 use adv_display::Rect;
 use adv_display::plan::Upscaler;
-use adv_display::stages::upscale::{Model, Upscaling, model, models};
+use adv_display::stages::upscale::{Check, Model, Upscaling, model, models};
 use adv_gpu::encode::{BufferCopy, ImageCopy};
 use adv_gpu::queue::DeviceOptions;
 use adv_gpu::resource::{BufferDesc, BufferUsage, Dimension, ImageDesc, Memory, Usage};
@@ -54,15 +54,28 @@ struct Scaler {
 }
 
 impl Gpu {
-    fn scaler(&self, model: Model, size: (u32, u32)) -> Scaler {
-        let half = self
+    /// Whether `choice` runs in half precision here: the device has it and
+    /// the display's check finds the half forms agree.
+    fn precision(&mut self, choice: Upscaler) -> bool {
+        if !self
             .device
             .caps()
             .features
-            .contains(adv_gpu::Features::SHADER_F16);
-        self.scaler_at(model, size, half)
+            .contains(adv_gpu::Features::SHADER_F16)
+        {
+            return false;
+        }
+        let Some(check) = Check::new(&self.device, model(&self.device, choice, true)).unwrap()
+        else {
+            return true;
+        };
+        let mut encoder = self.queue.encoder("upscale check");
+        check.encode(&mut encoder, &mut self.ring).unwrap();
+        let token = self.queue.submit(encoder).unwrap();
+        assert!(self.queue.wait(token, Duration::from_secs(60)).unwrap());
+        unsafe { check.agrees() }
     }
-    fn scaler_at(&self, model: Model, size: (u32, u32), half: bool) -> Scaler {
+    fn scaler(&self, model: Model, size: (u32, u32), half: bool) -> Scaler {
         let output = self
             .device
             .create_image(&ImageDesc {
@@ -174,12 +187,13 @@ fn optimized_layers_match_reference_display_pixels_and_clamped_edges() {
     let mut gpu = gpu();
     for choice in CHOICES {
         let mut maximum = [0u8; 2];
-        let selected = model(&gpu.device, choice);
+        let half = gpu.precision(choice);
+        let selected = model(&gpu.device, choice, half);
         for (size, patterns) in [((1, 1), 3), ((35, 29), 3), ((130, 97), 3), ((513, 257), 1)] {
             let scalers = [
-                gpu.scaler(models::REFERENCE[index(choice)], size),
-                gpu.scaler(models::FUSED[index(choice)], size),
-                gpu.scaler(selected, size),
+                gpu.scaler(models::REFERENCE[index(choice)], size, half),
+                gpu.scaler(models::FUSED[index(choice)], size, half),
+                gpu.scaler(selected, size, half),
             ];
             let mut seed = 0x2545_f491u32;
             for pattern in 0..patterns {
@@ -264,9 +278,10 @@ fn partial_runs_match_full_runs_within_the_model_radius() {
         vec![rect(3, 120, 4, 4), rect(140, 6, 9, 3), rect(80, 64, 1, 1)],
     ];
     for choice in CHOICES {
-        let selected = model(&gpu.device, choice);
-        let full = gpu.scaler(selected, size);
-        let partial = gpu.scaler(selected, size);
+        let half = gpu.precision(choice);
+        let selected = model(&gpu.device, choice, half);
+        let full = gpu.scaler(selected, size, half);
+        let partial = gpu.scaler(selected, size, half);
         for scaler in [&full, &partial] {
             gpu.run(scaler, &pixels, None);
         }
@@ -332,8 +347,9 @@ fn partial_runs_match_full_runs_within_the_model_radius() {
 }
 
 // Names the variant a driver computes wrongly: each model's reference and
-// fused tables in each precision, run twice, against the reference in the
-// same precision and against single precision.
+// fused tables in each precision the display runs, run twice, against the
+// reference in the same precision and against single precision. Half
+// precision the check accepts stays close to single on a larger canvas.
 // spec: HOST-VIEW-7
 #[test]
 fn variants_agree_in_each_precision_and_repeat_exactly() {
@@ -348,20 +364,16 @@ fn variants_agree_in_each_precision_and_repeat_exactly() {
             })
         })
         .collect();
-    let half = gpu
-        .device
-        .caps()
-        .features
-        .contains(adv_gpu::Features::SHADER_F16);
     let delta = |a: &[u8], b: &[u8]| a.iter().zip(b).map(|(x, y)| x.abs_diff(*y)).max().unwrap();
     let mut report = vec![];
     let mut wrong = false;
     for choice in CHOICES {
         let mut single = None;
+        let half = gpu.precision(choice);
         for precision in [false, true].into_iter().filter(|&h| h <= half) {
             let mut reference = None;
             for (table, models) in [("reference", models::REFERENCE), ("fused", models::FUSED)] {
-                let scaler = gpu.scaler_at(models[index(choice)], size, precision);
+                let scaler = gpu.scaler(models[index(choice)], size, precision);
                 let runs: Vec<_> = (0..2)
                     .map(|_| {
                         gpu.run(&scaler, &pixels, None);
@@ -372,7 +384,7 @@ fn variants_agree_in_each_precision_and_repeat_exactly() {
                 let single = single.get_or_insert_with(|| runs[0].clone());
                 let (error, from_single) = (delta(base, &runs[0]), delta(single, &runs[0]));
                 let repeats = runs[0] == runs[1];
-                wrong |= error > 2 || !repeats;
+                wrong |= error > 2 || !repeats || from_single > 8;
                 report.push(format!(
                     "{choice:?} {table} {}: error={error} vs_f32={from_single} repeats={repeats}",
                     if precision { "f16" } else { "f32" }
