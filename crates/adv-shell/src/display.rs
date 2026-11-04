@@ -21,6 +21,7 @@ pub(crate) struct Placement {
 struct Mailbox {
     settings: plan::Settings,
     dirty: bool,
+    trim: bool,
     window: Option<Option<Box<dyn Compositor>>>,
     wake: Option<frame::Waker>,
 }
@@ -90,6 +91,12 @@ impl Ui {
             m.dirty = true;
             m.poke();
         }
+    }
+    /// Drop free display buffers (memory pressure, background).
+    pub fn trim(&mut self) {
+        let mut m = self.shared.settings.lock().unwrap();
+        m.trim = true;
+        m.poke();
     }
     pub(crate) fn poll(&mut self) -> Result<Option<Feedback>, String> {
         self.shared.feedback.lock().unwrap().pop_front().transpose()
@@ -182,6 +189,7 @@ pub(crate) fn channel(
         settings: Mutex::new(Mailbox {
             settings,
             dirty: true,
+            trim: false,
             window: None,
             wake: None,
         }),
@@ -363,10 +371,10 @@ fn map(frame: frame::Frame) -> (display::Frame, Option<frame::Slot>) {
 }
 impl Presenter {
     fn update(&mut self, queue: &mut Queue) -> Result<(), String> {
-        let (settings, window) = {
+        let (settings, window, trim) = {
             let mut m = self.shared.settings.lock().unwrap();
             let settings = std::mem::take(&mut m.dirty).then(|| m.settings.clone());
-            (settings, m.window.take())
+            (settings, m.window.take(), std::mem::take(&mut m.trim))
         };
         if let Some(window) = window {
             match window {
@@ -381,6 +389,9 @@ impl Presenter {
             self.display
                 .settings(queue, settings)
                 .map_err(|e| format!("display settings: {e:?}"))?;
+        }
+        if trim {
+            self.display.trim();
         }
         Ok(())
     }
@@ -575,6 +586,7 @@ mod tests {
                     background: [0.; 3],
                 },
                 dirty: true,
+                trim: false,
                 window: None,
                 wake: None,
             }),

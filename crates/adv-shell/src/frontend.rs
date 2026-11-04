@@ -271,6 +271,12 @@ impl Ui {
         self.native = Some(display);
     }
     #[cfg(mobile)]
+    pub(crate) fn trim_memory(&mut self) {
+        if let Some(native) = &mut self.native {
+            native.trim();
+        }
+    }
+    #[cfg(mobile)]
     pub(crate) fn pause_input(&mut self, paused: bool) {
         if paused && !self.paused {
             self.input_epoch.invalidate();

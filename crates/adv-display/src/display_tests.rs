@@ -250,6 +250,17 @@ fn private_swap_limits_output_to_damage_and_reconstructs_buffer_age() {
     let quiet = display.recorder().latest().unwrap();
     assert_eq!(quiet.statistics.passes, 0);
     assert_eq!(quiet.statistics.submissions, 0);
+    // Trimming keeps one free buffer and forgets content: the next present redraws.
+    display.trim();
+    assert!(
+        display.ledger().pools[0].buffers[1..]
+            .iter()
+            .all(|b| b.in_use)
+    );
+    display
+        .present(&mut q, frame(8, &image, Damage::None))
+        .unwrap();
+    assert!(display.recorder().latest().unwrap().statistics.passes > 0);
     crate::recorder::replay(&crate::recorder::parse(&display.recorder().dump()).unwrap()).unwrap();
 }
 // spec: HOST-VIEW-1, HOST-VIEW-9

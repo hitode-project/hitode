@@ -211,11 +211,11 @@ impl Session {
             driver.view.bind(
                 view_keys,
                 Box::new(move |window| {
-                    if let Some(driver) = weak.upgrade() {
-                        if let Some(ui) = driver.ui.borrow_mut().as_mut() {
-                            unsafe {
-                                ui.replace_window(window)?;
-                            }
+                    if let Some(driver) = weak.upgrade()
+                        && let Some(ui) = driver.ui.borrow_mut().as_mut()
+                    {
+                        unsafe {
+                            ui.replace_window(window)?;
                         }
                     }
                     Ok(())
@@ -361,6 +361,13 @@ impl Session {
             ui.pause_input(paused);
         }
         self.driver.view.hub().pause(paused);
+    }
+    /// The system asked for memory back, or the app went to the background.
+    #[cfg(mobile)]
+    pub fn trim_memory(&self) {
+        if let Some(ui) = self.driver.ui.borrow_mut().as_mut() {
+            ui.trim_memory();
+        }
     }
     pub fn request_close(&self) {
         self.driver.view.hub().request_close();

@@ -448,6 +448,17 @@ impl Display {
         self.unlatched = None;
         self.recorder
             .record(recorder::Event::Lifecycle("surface detached".into()));
+        self.trim();
+    }
+    /// Under memory pressure or in the background, each pool keeps one free
+    /// buffer; the next present redraws in full.
+    pub fn trim(&mut self) {
+        self.pools.trim_to_one();
+        for pool in self.allocations.values_mut() {
+            pool.trim(1);
+        }
+        self.recorder
+            .record(recorder::Event::Lifecycle("pools trimmed".into()));
     }
     pub fn rebuild(
         &mut self,

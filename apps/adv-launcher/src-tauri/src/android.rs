@@ -281,6 +281,14 @@ pub extern "system" fn Java_org_hitode_launcher_MainActivity_nativeResume(
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_org_hitode_launcher_MainActivity_nativeTrimMemory(
+    _env: JNIEnv<'_>,
+    _activity: JObject<'_>,
+) {
+    crate::game::trim_memory();
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_org_hitode_launcher_MainActivity_nativeAudioFocus(
     _env: JNIEnv<'_>,
     _activity: JObject<'_>,
