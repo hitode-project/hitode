@@ -1295,9 +1295,10 @@ fn repeated_strips_do_not_publish_or_wake_and_one_row_is_precise() {
         s.flush(&m, adv_device::surface::FlushReason::Immediate)
             .unwrap();
         assert!(rx.update());
-        assert_eq!(rx.current().damage(), &[damage]);
+        // Published damage is in 8-pixel cells: this surface is one cell.
+        assert_eq!(rx.current().damage(), &[s[dst].rect()]);
         rx.current().snapshot(&mut out).unwrap();
-        assert_eq!(&*out.damage, &[damage]);
+        assert_eq!(&*out.damage, &[s[dst].rect()]);
         assert_eq!(&out.bgra[40..60], &[7; 20]);
         assert_eq!(&out.bgra[..40], &[0; 40]);
         assert_eq!(&out.bgra[60..], &[0; 20]);
@@ -1307,21 +1308,24 @@ fn repeated_strips_do_not_publish_or_wake_and_one_row_is_precise() {
 // spec: DEV-FRAME-4, DEV-FRAME-5, DEV-FRAME-7
 #[test]
 fn three_slots_catch_up_and_skipped_frames_merge_with_a_bounded_history() {
-    let mut s = store();
+    // Five cells across and four down, one change per cell.
+    const W: u32 = 40;
+    const H: u32 = 32;
+    let at = |x: u32, y: u32| ((y * W + x) * 4) as usize;
+    let mut s = Store::new(W, H, 16, 65520, Snapshot::default()).unwrap();
     let mut m = Memory::new(true);
     let id = s.primary(&mut m).unwrap();
     let (tx, mut rx) = frame_mailbox();
     s.set_frame_mailbox(tx, adv_sync::WakeEvent::new().unwrap());
     let mut out = Snapshot::default();
-    let mut expected = vec![0; 80];
+    let mut expected = vec![0; at(0, H)];
     for n in 0..12 {
-        let y = n % 4;
-        let x = n % 5;
+        let y = n % 4 * 8;
+        let x = n % 5 * 8;
         let r = Rect { x, y, w: 1, h: 1 };
         let value = [n as u8 + 1; 4];
         m.write(s[id].row(x, y), &value).unwrap();
-        expected[((y * 5 + x) * 4) as usize..((y * 5 + x) * 4 + 4) as usize]
-            .copy_from_slice(&value);
+        expected[at(x, y)..at(x, y) + 4].copy_from_slice(&value);
         let before = s.stats.copied_bytes;
         s.present(id, &m, r).unwrap();
         s.flush(&m, adv_device::surface::FlushReason::Immediate)
@@ -1330,7 +1334,7 @@ fn three_slots_catch_up_and_skipped_frames_merge_with_a_bounded_history() {
         rx.current().snapshot(&mut out).unwrap();
         assert_eq!(out.bgra, expected);
         if n >= 3 {
-            assert!(s.stats.copied_bytes - before < 80);
+            assert!(s.stats.copied_bytes - before < expected.len() as u64);
         }
         // A fresh capture verifies the full slot, not only the consumer's patch.
         let mut full = Snapshot::default();
@@ -1346,14 +1350,14 @@ fn three_slots_catch_up_and_skipped_frames_merge_with_a_bounded_history() {
     };
     for n in 0..3 {
         let r = Rect {
-            x: n * 2,
+            x: n * 16,
             y: 0,
             w: 1,
             h: 1,
         };
         let value = [40 + n as u8; 4];
         m.write(s[id].row(r.x, r.y), &value).unwrap();
-        expected[(r.x * 4) as usize..(r.x * 4 + 4) as usize].copy_from_slice(&value);
+        expected[at(r.x, 0)..at(r.x, 0) + 4].copy_from_slice(&value);
         s.present(id, &m, r).unwrap();
         s.flush(&m, adv_device::surface::FlushReason::Immediate)
             .unwrap();
@@ -1366,13 +1370,13 @@ fn three_slots_catch_up_and_skipped_frames_merge_with_a_bounded_history() {
     for n in 0..20 {
         let r = Rect {
             x: 0,
-            y: 3,
+            y: 24,
             w: 1,
             h: 1,
         };
         let value = [80 + n; 4];
-        m.write(s[id].row(0, 3), &value).unwrap();
-        expected[60..64].copy_from_slice(&value);
+        m.write(s[id].row(0, 24), &value).unwrap();
+        expected[at(0, 24)..at(0, 24) + 4].copy_from_slice(&value);
         s.present(id, &m, r).unwrap();
         s.flush(&m, adv_device::surface::FlushReason::Immediate)
             .unwrap();
@@ -1387,18 +1391,18 @@ fn three_slots_catch_up_and_skipped_frames_merge_with_a_bounded_history() {
     let mut full_copies = 0;
     for n in 0..2 {
         let r = Rect {
-            x: 4,
-            y: 3,
+            x: 32,
+            y: 24,
             w: 1,
             h: 1,
         };
-        m.write(s[id].row(4, 3), &[120 + n; 4]).unwrap();
-        expected[76..80].fill(120 + n);
+        m.write(s[id].row(32, 24), &[120 + n; 4]).unwrap();
+        expected[at(32, 24)..at(32, 24) + 4].fill(120 + n);
         let before = s.stats.copied_bytes;
         s.present(id, &m, r).unwrap();
         s.flush(&m, adv_device::surface::FlushReason::Immediate)
             .unwrap();
-        full_copies += usize::from(s.stats.copied_bytes - before == 80);
+        full_copies += usize::from(s.stats.copied_bytes - before == expected.len() as u64);
         assert!(rx.update());
         let mut full = Snapshot::default();
         rx.current().snapshot(&mut full).unwrap();
@@ -1439,7 +1443,8 @@ fn bottom_up_palette_changes_and_packed_edges_match_full_conversion() {
             .unwrap();
         assert!(rx.update());
         rx.current().snapshot(&mut out).unwrap();
-        assert_eq!(&*out.damage, &[r]);
+        // One 8-pixel cell covers this surface.
+        assert_eq!(&*out.damage, &[s[id].rect()]);
         assert_eq!(&out.bgra[32..36], &[7, 8, 9, 0]);
         let mut full = Snapshot::default();
         rx.current().snapshot(&mut full).unwrap();
@@ -1497,8 +1502,8 @@ fn surface_switches_and_resize_round_trips_invalidate_damage_history() {
 
 // spec: DEV-FRAME-5
 #[test]
-fn more_than_four_disjoint_changes_merge_into_a_bounding_box() {
-    let mut s = store();
+fn disjoint_changes_stay_apart_in_cells() {
+    let mut s = Store::new(40, 32, 16, 65520, Snapshot::default()).unwrap();
     let mut m = Memory::new(false);
     let id = s.primary(&mut m).unwrap();
     let (tx, mut rx) = frame_mailbox();
@@ -1509,7 +1514,8 @@ fn more_than_four_disjoint_changes_merge_into_a_bounding_box() {
     assert!(rx.update());
     let mut out = Snapshot::default();
     rx.current().snapshot(&mut out).unwrap();
-    for (x, y) in [(0, 0), (2, 0), (4, 0), (0, 2), (2, 2)] {
+    let changes = [(0, 0), (16, 0), (32, 0), (0, 16), (16, 16)];
+    for (x, y) in changes {
         let r = Rect { x, y, w: 1, h: 1 };
         m.write(s[id].row(x, y), &[7; 4]).unwrap();
         s.present(id, &m, r).unwrap();
@@ -1520,12 +1526,7 @@ fn more_than_four_disjoint_changes_merge_into_a_bounding_box() {
     rx.current().snapshot(&mut out).unwrap();
     assert_eq!(
         &*out.damage,
-        &[Rect {
-            x: 0,
-            y: 0,
-            w: 5,
-            h: 3
-        }]
+        changes.map(|(x, y)| Rect { x, y, w: 8, h: 8 })
     );
     let mut full = Snapshot::default();
     rx.current().snapshot(&mut full).unwrap();
@@ -1567,12 +1568,8 @@ fn strip_frame_is_published_once_with_all_damage_at_the_writer_boundary() {
     assert!(s.flush_context(7, &m, FlushReason::Message).unwrap());
     assert!(rx.update());
     assert_eq!(s.stats.presentations, 2);
-    let damage = Rect {
-        x: 0,
-        y: 0,
-        w: 5,
-        h: 3,
-    };
+    // The three strips, in 8-pixel cells: the whole surface.
+    let damage = s[id].rect();
     assert_eq!(rx.current().damage(), &[damage]);
     rx.current().snapshot(&mut out).unwrap();
     assert_eq!(&*out.damage, &[damage]);
@@ -1694,8 +1691,8 @@ fn declared_damage_shrinks_to_changed_tiles_against_the_last_publication() {
             Some(vec![Rect {
                 x: 64,
                 y: 16,
-                w: 64,
-                h: 16
+                w: 8,
+                h: 8
             }])
         );
         assert_eq!(publish(&mut s, &m), None);

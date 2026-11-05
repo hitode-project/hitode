@@ -38,7 +38,15 @@ fn feed(h: &mut History, mut next: Sequence) {
         h.record(key, bounds, Arc::default());
     }
 }
-fn step(h: &mut History, slot: u128, key: u128, r: Rect) -> (Rect, Rect) {
+/// The cells of the test target the rectangles touch.
+fn cells(rects: &[Rect]) -> Region {
+    let mut region = Region::empty((100, 100));
+    for &r in rects {
+        region.add(r.into());
+    }
+    region
+}
+fn step(h: &mut History, slot: u128, key: u128, r: Rect) -> (Region, Region) {
     feed(h, sequence(slot, key, r));
     h.advance(false, &HashMap::default())
 }
@@ -54,19 +62,19 @@ fn ordered_differences_include_old_new_and_removed_bounds_and_buffer_ages() {
     let b = Rect { x: 12, ..a };
     let c = Rect { y: 13, ..a };
     let mut h = History::default();
-    assert_eq!(step(&mut h, 1, 1, a).1.w, 100);
-    assert_eq!(step(&mut h, 2, 2, b).1.w, 100);
+    assert!(step(&mut h, 1, 1, a).1.is_whole());
+    assert!(step(&mut h, 2, 2, b).1.is_whole());
     let (changed, redraw) = step(&mut h, 1, 3, c);
-    assert_eq!(changed, b.union(c));
+    assert_eq!(changed, cells(&[b, c]), "old and new bounds stay apart");
     assert_eq!(
         redraw,
-        a.union(b).union(c),
+        cells(&[a, b, c]),
         "age two includes both intervening damages"
     );
     step(&mut h, 3, 4, a);
     assert_eq!(
         step(&mut h, 2, 5, b).1,
-        a.union(b).union(c),
+        cells(&[a, b, c]),
         "age three includes three damages"
     );
     let mut removed = sequence(2, 5, b);
@@ -74,7 +82,7 @@ fn ordered_differences_include_old_new_and_removed_bounds_and_buffer_ages() {
     feed(&mut h, removed);
     assert_eq!(
         h.advance(false, &HashMap::default()).0,
-        b,
+        cells(&[b]),
         "removed commands retain their old bounds"
     );
 }
@@ -93,24 +101,13 @@ fn missing_slots_and_shape_changes_need_full_but_large_damage_keeps_its_bounds()
         step(&mut h, 2, n, r);
     }
     assert_eq!(h.changes.len(), 8);
-    assert_eq!(step(&mut h, 1, 11, r).1.w, 100);
+    assert!(step(&mut h, 1, 11, r).1.is_whole());
     feed(&mut h, sequence(1, 11, r));
     h.next.shape = 2;
-    assert_eq!(h.advance(false, &HashMap::default()).1.w, 100);
+    assert!(h.advance(false, &HashMap::default()).1.is_whole());
     step(&mut h, 1, 11, r);
     let large = Rect { w: 80, h: 80, ..r };
-    assert_eq!(step(&mut h, 1, 12, large).1, large);
-    let mut d = Damage::default();
-    for x in 0..5 {
-        d.add(Rect {
-            x: x * 5,
-            y: 0,
-            w: 1,
-            h: 1,
-        });
-    }
-    assert_eq!(d.len, 1);
-    assert_eq!(d.bound().w, 21);
+    assert_eq!(step(&mut h, 1, 12, large).1, cells(&[large]));
 }
 
 // spec: GFX-REC-4, GFX-REC-11
@@ -132,9 +129,12 @@ fn d3d9_differential_insertions_removals_and_reordering_damage_only_unmatched_bo
         feed(&mut h, next);
         h.advance(false, &HashMap::default()).0
     };
-    assert_eq!(run(&[(1, a), (2, b), (3, c)]).w, 100);
-    assert_eq!(run(&[(1, a), (4, inserted), (2, b), (3, c)]), inserted);
-    assert_eq!(run(&[(1, a), (2, b), (3, c)]), inserted);
-    assert_eq!(run(&[(1, a), (2, b), (3, c)]), Rect::default());
-    assert_eq!(run(&[(2, b), (1, a), (3, c)]), a);
+    assert!(run(&[(1, a), (2, b), (3, c)]).is_whole());
+    assert_eq!(
+        run(&[(1, a), (4, inserted), (2, b), (3, c)]),
+        cells(&[inserted])
+    );
+    assert_eq!(run(&[(1, a), (2, b), (3, c)]), cells(&[inserted]));
+    assert!(run(&[(1, a), (2, b), (3, c)]).is_empty());
+    assert_eq!(run(&[(2, b), (1, a), (3, c)]), cells(&[a]));
 }

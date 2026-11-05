@@ -139,6 +139,7 @@ pub mod pipeline;
 pub mod present;
 #[cfg(feature = "backend")]
 pub mod queue;
+pub mod region;
 pub mod resource;
 #[cfg(feature = "backend")]
 pub mod ring;
@@ -154,6 +155,7 @@ pub use pipeline::{ComputePipeline, RenderPipeline};
 pub use present::{PresentImage, PresentPool};
 #[cfg(feature = "backend")]
 pub use queue::{Device, Queue, Token};
+pub use region::Region;
 #[cfg(feature = "backend")]
 pub use resource::{Buffer, Image, ImageView, Sampler};
 #[cfg(feature = "backend")]

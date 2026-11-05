@@ -266,21 +266,9 @@ fn d3d9_provider() -> adv_dx::d3d9::SurfaceProvider {
 fn native_present(
     ext: &mut adv_machine::Ext,
     id: u32,
-    damage: Option<adv_device::surface::Rect>,
+    damage: Option<adv_device::surface::Region>,
     gpu: &mut adv_device::gpu::Gpu,
 ) -> Result<u64, adv_device::gpu::Error> {
-    use adv_device::frame::Damage;
-    let damage = damage.map_or(Damage::Whole, |r| {
-        let mut damage = Damage::Rects(Default::default());
-        if let Damage::Rects(rects) = &mut damage {
-            rects.push(Default::default());
-            rects[0].x = r.x;
-            rects[0].y = r.y;
-            rects[0].w = r.w;
-            rects[0].h = r.h;
-        }
-        damage
-    });
     let surfaces = ext.get_mut::<Surfaces<Snapshot>>();
     surfaces
         .present_native(id, damage, gpu)

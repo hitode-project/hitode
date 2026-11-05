@@ -6,18 +6,11 @@
 pub mod test_support;
 
 use adv_gpu::{Rect, Token};
-use arrayvec::ArrayVec;
 use std::sync::Arc;
 use std::time::Instant;
 
-/// Changed pixels since the producer's previous frame. More than four
-/// rectangles collapse into their union.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Damage {
-    None,
-    Rects(ArrayVec<Rect, 4>),
-    Whole,
-}
+/// Changed pixels since the producer's previous frame, in the base's size.
+pub use adv_gpu::Region;
 
 pub struct Frame {
     pub serial: u64,
@@ -34,7 +27,7 @@ pub enum Base {
     /// A D3D9 or DirectDraw swap buffer; its last write completes at `ready`.
     Gpu {
         image: SwapImage,
-        damage: Damage,
+        damage: Region,
         ready: Token,
     },
     /// Guest-format pixels in GPU-visible memory, normalized to top-down rows.
@@ -42,7 +35,7 @@ pub enum Base {
         slot: Slot,
         format: PixelFormat,
         palette: Option<Palette>,
-        damage: Damage,
+        damage: Region,
     },
 }
 

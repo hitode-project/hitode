@@ -28,7 +28,7 @@ This spec covers the neutral device services behind the API front ends: frames, 
 
 ### DEV-FRAME-5 Consumer damage accumulation
 
-**Rule**: Each consumer MUST accumulate history since its last converted serial, preserve undamaged BGRA pixels, and fully convert when history is missing. Damage MUST contain at most four rectangles, merging overflow into a bounding box. Bottom-up storage and indexed palettes MUST preserve exact pixels.
+**Rule**: Each consumer MUST accumulate history since its last converted serial, preserve undamaged BGRA pixels, and fully convert when history is missing. Damage MUST be a region of 8x8-pixel cells covering every changed pixel, so distant changes stay apart and no layer merges them into bounds. Bottom-up storage and indexed palettes MUST preserve exact pixels.
 **Verification**: Test
 
 ### DEV-FRAME-6 Full-frame transitions
@@ -43,12 +43,12 @@ This spec covers the neutral device services behind the API front ends: frames, 
 
 ### DEV-FRAME-8 Software frame boundaries
 
-**Rule**: With a mailbox, software presents MUST accumulate four-rectangle damage, publishing one serial/history entry per flush. Writer waits/message retrieval MUST flush, and any wait/present MUST flush after 50 ms. Readback, capture, layout/palette/video changes, flips and exit MUST flush first, with immediate headless presents and reason-specific counters.
+**Rule**: With a mailbox, software presents MUST accumulate cell-region damage, publishing one serial/history entry per flush. Writer waits/message retrieval MUST flush, and any wait/present MUST flush after 50 ms. Readback, capture, layout/palette/video changes, flips and exit MUST flush first, with immediate headless presents and reason-specific counters.
 **Verification**: Test
 
 ### DEV-FRAME-12 Unchanged software redraws
 
-**Rule**: Software redraws matching the last publication MUST NOT publish, copy snapshot storage, or wake presentation. This comparison MUST include damage smaller than a content-diff tile.
+**Rule**: Software redraws matching the last publication MUST NOT publish, copy snapshot storage, or wake presentation. This comparison MUST include damage smaller than a damage cell.
 **Verification**: Test
 
 ### DEV-FRAME-11 Deleted frame sources
@@ -58,7 +58,7 @@ This spec covers the neutral device services behind the API front ends: frames, 
 
 ### DEV-FRAME-10 Content-diff publication damage
 
-**Rule**: A software frame MUST shrink declared damage to 64x16 tiles whose pixels differ from the previous publication. A rectangle with more than three quarters changed MUST keep its declared bounds. The frame cap MUST measure declared damage.
+**Rule**: A software frame MUST shrink declared damage to the 8x8-pixel cells whose pixels differ from the previous publication. A rectangle with more than three quarters changed MUST keep its declared bounds. The frame cap MUST measure declared damage.
 **Verification**: Test
 
 Comparing against the last publication keeps every slot's damage history complete, so incremental slots and consumers stay exact. Packed formats keep their declared damage.

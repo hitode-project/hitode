@@ -422,9 +422,13 @@ mod android {
                     }),
                 );
             }
-            let damage = self
-                .last_bar
-                .map_or(Damage::Whole, |previous| Damage::rects([previous, bar]));
+            let size = (self.bounds.w, self.bounds.h);
+            let damage = self.last_bar.map_or(Region::whole(size), |previous| {
+                let mut damage = Region::empty(size);
+                damage.add(previous.into());
+                damage.add(bar.into());
+                damage
+            });
             self.layers.as_mut().unwrap().base.damage = damage;
             let now = Instant::now();
             let offset = frame_time + 16_666_667 - clock(libc::CLOCK_MONOTONIC);
@@ -557,7 +561,7 @@ mod android {
                 dst: bounds,
                 rotation: rotation(),
                 nearest: false,
-                damage: Damage::Whole,
+                damage: Region::whole((probe.bounds.w, probe.bounds.h)),
             },
             video: Default::default(),
             host: Default::default(),
@@ -579,7 +583,7 @@ mod android {
                     dst: bounds,
                     rotation: rotation(),
                     nearest: false,
-                    damage: Damage::Whole,
+                    damage: Region::whole((640, 360)),
                 },
             ));
         }
@@ -595,7 +599,8 @@ mod android {
                 .expect("last buffer")
                 .expect("last buffer released");
             let encoder = gpu.queue.encoder("reattach");
-            probe.layers.as_mut().unwrap().base.damage = Damage::None;
+            let size = (probe.bounds.w, probe.bounds.h);
+            probe.layers.as_mut().unwrap().base.damage = Region::empty(size);
             probe.present(encoder, image, 0, Instant::now());
         }
         let pending = probe.pending;

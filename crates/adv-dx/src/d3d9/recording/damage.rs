@@ -2,7 +2,7 @@
 use super::*;
 use adv_device::{
     gpu::{AttributeFormat, Image},
-    surface::Rect,
+    surface::{Rect, Region, rects},
 };
 use rustc_hash::FxHashSet as HashSet;
 pub(super) mod sampling;
@@ -22,6 +22,20 @@ fn full(image: &Image) -> Rect {
         w: image.width(),
         h: image.height(),
     }
+}
+fn size(r: Rect) -> (u32, u32) {
+    (r.x + r.w, r.y + r.h)
+}
+/// `region` in an image of `size`, clipped to it.
+fn resized(region: &Region, size: (u32, u32)) -> Region {
+    if region.size() == size {
+        return region.clone();
+    }
+    let mut out = Region::empty(size);
+    for r in region.rects() {
+        out.add(r);
+    }
+    out
 }
 
 pub(super) fn bounds(env: &Env<'_>, device: &Device, operation: &Operation) -> Rect {
@@ -177,50 +191,31 @@ struct Samples {
     reads: Vec<(sampling::Read, u128)>,
 }
 impl Samples {
-    fn changed(&self, old: &Self, changes: &HashMap<Content, Rect>, bounds: Rect) -> Option<Rect> {
+    /// Each changed source region maps through the proven sampling, rectangle
+    /// by rectangle, into `damage`.
+    fn changed(
+        &self,
+        old: &Self,
+        changes: &HashMap<Content, Region>,
+        bounds: Rect,
+        damage: &mut Region,
+    ) -> Option<()> {
         if self.base != old.base || self.reads.len() != old.reads.len() {
             return None;
         }
-        let mut damage = Rect::default();
+        let mut local = Region::empty(damage.size());
         for ((read, version), (previous, before)) in self.reads.iter().zip(&old.reads) {
             if read != previous {
                 return None;
             }
             if version != before {
-                damage = damage.union(read.mapping.map(*changes.get(&read.source)?, bounds));
+                for r in rects(changes.get(&read.source)?) {
+                    local.add(read.mapping.map(r, bounds).into());
+                }
             }
         }
-        Some(damage)
-    }
-}
-#[derive(Clone, Default)]
-struct Damage {
-    rects: [Rect; 4],
-    len: usize,
-}
-impl Damage {
-    fn add(&mut self, r: Rect) {
-        if r.empty() {
-            return;
-        }
-        if self.len == 4 {
-            self.rects[0] = self.bound().union(r);
-            self.len = 1;
-        } else {
-            self.rects[self.len] = r;
-            self.len += 1;
-        }
-    }
-    fn bound(&self) -> Rect {
-        self.rects[..self.len]
-            .iter()
-            .copied()
-            .fold(Rect::default(), Rect::union)
-    }
-    fn extend(&mut self, other: &Self) {
-        for &r in &other.rects[..other.len] {
-            self.add(r);
-        }
+        damage.union(&local);
+        Some(())
     }
 }
 #[derive(Default)]
@@ -229,7 +224,7 @@ struct Sequence {
     samples: HashMap<usize, Arc<Samples>>,
     index: HashMap<u128, Vec<usize>>,
     cursor: usize,
-    damage: Damage,
+    damage: Region,
     pending: Vec<(usize, usize)>,
     last_write: u64,
     full: Rect,
@@ -242,7 +237,7 @@ struct Sequence {
 struct History {
     previous: Sequence,
     next: Sequence,
-    changes: std::collections::VecDeque<Damage>,
+    changes: std::collections::VecDeque<Region>,
     slots: HashMap<u128, u64>,
     serial: u64,
     seen: u64,
@@ -251,6 +246,9 @@ impl History {
     fn record(&mut self, key: u128, bounds: Rect, samples: Arc<Samples>) {
         let s = &mut self.next;
         let at = s.entries.len();
+        if at == 0 {
+            s.damage = Region::empty(size(s.full));
+        }
         let old = self.previous.index.get(&key).and_then(|positions| {
             let first = positions.partition_point(|&n| n < s.cursor);
             positions[first..]
@@ -260,7 +258,7 @@ impl History {
         });
         if let Some(old) = old {
             for &(_, r) in &self.previous.entries[s.cursor..old] {
-                s.damage.add(r);
+                s.damage.add(r.into());
             }
             s.cursor = old + 1;
             if let Some(samples) = self.previous.samples.get(&old) {
@@ -282,7 +280,7 @@ impl History {
                 s.pending.push((s.cursor, at));
                 s.cursor += 1;
             } else {
-                s.damage.add(bounds);
+                s.damage.add(bounds.into());
             }
             if !samples.reads.is_empty() {
                 s.samples.insert(at, samples);
@@ -291,22 +289,27 @@ impl History {
         s.index.entry(key).or_default().push(at);
         s.entries.push((key, bounds));
     }
-    fn advance(&mut self, force: bool, changes: &HashMap<Content, Rect>) -> (Rect, Rect) {
+    /// What this content changed, and what its slot must redraw.
+    fn advance(&mut self, force: bool, changes: &HashMap<Content, Region>) -> (Region, Region) {
         let next = &self.next;
-        let mut changed = Damage::default();
+        let size = size(next.full);
+        let mut changed = Region::empty(size);
         if force || self.serial == 0 || self.previous.shape != next.shape {
-            changed.add(next.full);
+            changed = Region::whole(size);
             self.slots.clear();
         } else {
-            changed.extend(&next.damage);
+            changed.union(&next.damage);
             for &(_, bounds) in &self.previous.entries[next.cursor..] {
-                changed.add(bounds);
+                changed.add(bounds.into());
             }
             for &(old, new) in &next.pending {
                 let (_, bounds) = next.entries[new];
-                let local =
-                    next.samples[&new].changed(&self.previous.samples[&old], changes, bounds);
-                changed.add(local.unwrap_or(bounds));
+                if next.samples[&new]
+                    .changed(&self.previous.samples[&old], changes, bounds, &mut changed)
+                    .is_none()
+                {
+                    changed.add(bounds.into());
+                }
             }
         }
         self.serial += 1;
@@ -315,9 +318,9 @@ impl History {
             self.changes.pop_front();
         }
         let since = self.slots.get(&next.slot).copied().unwrap_or(0);
-        let mut redraw = Damage::default();
+        let mut redraw = Region::empty(size);
         if since == 0 || self.serial - since > self.changes.len() as u64 {
-            redraw.add(next.full);
+            redraw = Region::whole(size);
         } else {
             for d in self
                 .changes
@@ -325,10 +328,10 @@ impl History {
                 .rev()
                 .take((self.serial - since) as usize)
             {
-                redraw.extend(d);
+                redraw.union(d);
             }
         }
-        let result = (changed.bound(), redraw.bound());
+        let result = (changed, redraw);
         self.slots.insert(next.slot, self.serial);
         self.slots.retain(|_, n| self.serial - *n <= 8);
         std::mem::swap(&mut self.previous, &mut self.next);
@@ -336,7 +339,7 @@ impl History {
         self.next.samples.clear();
         self.next.index.clear();
         self.next.cursor = 0;
-        self.next.damage = Damage::default();
+        self.next.damage = Region::default();
         self.next.pending.clear();
         result
     }
@@ -352,8 +355,10 @@ pub(super) struct Analysis {
     histories: HashMap<Content, History>,
     reads: HashSet<Content>,
     unsafe_order: bool,
-    pub clips: HashMap<u128, Rect>,
-    pub changed: HashMap<u128, Rect>,
+    /// What each slot must redraw, in its view.
+    pub clips: HashMap<u128, Region>,
+    /// What each slot's color changed.
+    pub changed: HashMap<u128, Region>,
     pub planned: bool,
     epoch: u64,
     ordinal: u64,
@@ -495,19 +500,19 @@ impl Analysis {
                 force || self.unsafe_order || h.seen + 1 != self.epoch,
                 &changes,
             );
-            changes.insert(content, changed);
-            let redraw = redraw.clipped(full);
+            let redraw = resized(&redraw, size(full));
             h.seen = self.epoch;
             self.clips
                 .entry(slot)
-                .and_modify(|r| *r = r.union(redraw))
+                .and_modify(|r| r.union(&redraw))
                 .or_insert(redraw);
             if content.2 == 0 {
                 self.changed
                     .entry(slot)
-                    .and_modify(|r| *r = r.union(changed))
-                    .or_insert(changed);
+                    .and_modify(|r| r.union(&changed))
+                    .or_insert_with(|| changed.clone());
             }
+            changes.insert(content, changed);
         }
         self.planned = true;
     }
