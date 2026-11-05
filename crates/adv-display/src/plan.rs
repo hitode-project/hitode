@@ -2,27 +2,14 @@
 //! image content.
 
 use crate::Rect;
-use arrayvec::ArrayVec;
+pub use adv_gpu::Region;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use std::collections::VecDeque;
 
-/// Damage as a short list of rectangles. More than [`Damage::MAX`] rectangles
-/// collapse into their union. `Whole` means unknown or everything.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Damage {
-    None,
-    Rects(ArrayVec<Rect, 4>),
-    Whole,
-}
-
-impl Damage {
-    pub const MAX: usize = 4;
-}
-
 /// Tiles the GPU stages run on. Tile size is per stage (the upscaler's
 /// workgroup footprint, the output pass's alignment); the list is the damage
-/// dilated and rounded to that size.
+/// dilated and rounded to that size, as disjoint rectangles.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tiles {
     pub size: (u32, u32),
@@ -56,8 +43,9 @@ pub struct FrameInfo {
     pub serial: u64,
     pub canvas: (u32, u32),
     pub base: BaseKind,
-    /// Damage since the previous published frame.
-    pub damage: Damage,
+    /// Damage since the previous published frame. A region of another size
+    /// than the canvas means everything changed.
+    pub damage: Region,
     pub video: SmallVec<[VideoGeometry; 2]>,
     pub cursor_regions: SmallVec<[Rect; 2]>,
 }
@@ -165,7 +153,7 @@ pub struct Pool {
 pub struct PoolState {
     pub pools: Vec<Pool>,
     /// Canvas damage, oldest first; bounded by `HISTORY`.
-    pub history: VecDeque<Damage>,
+    pub history: VecDeque<Region>,
 }
 
 /// A stage's chosen allocation. All stages for one pool write this buffer;
@@ -235,7 +223,8 @@ pub struct Layer {
     pub dst: Rect,
     pub rotation: Rotation,
     pub nearest: bool,
-    pub damage: Damage,
+    /// In source-image pixels.
+    pub damage: Region,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -269,7 +258,7 @@ pub struct Plan {
     pub stages: Vec<Stage>,
     pub targets: Vec<Target>,
     /// Canvas damage including video changes.
-    pub damage: Damage,
+    pub damage: Region,
     pub layers: Layers,
     pub swap_role: SwapRole,
 }
@@ -382,51 +371,16 @@ impl PoolState {
         )
     }
 
-    fn damage(&self, damage: &Damage, age: Option<u32>) -> Damage {
-        let Some(age) = age.filter(|&age| age > 0) else {
-            return Damage::Whole;
+    fn damage(&self, damage: &Region, age: Option<u32>) -> Region {
+        let count = age.filter(|&age| age > 0).map(|age| (age - 1) as usize);
+        let Some(count) = count.filter(|&count| count <= self.history.len()) else {
+            return Region::whole(damage.size());
         };
-        let count = (age - 1) as usize;
-        if count > self.history.len() {
-            return Damage::Whole;
+        let mut out = damage.clone();
+        for old in self.history.iter().rev().take(count) {
+            out.union(old);
         }
-        self.history
-            .iter()
-            .rev()
-            .take(count)
-            .fold(damage.clone(), |d, old| d.union(old))
-    }
-}
-
-impl Damage {
-    pub fn rects(rects: impl IntoIterator<Item = Rect>) -> Self {
-        let rects = merge(rects.into_iter().collect());
-        if rects.is_empty() {
-            Self::None
-        } else if rects.len() <= Self::MAX {
-            Self::Rects(rects.into_iter().collect())
-        } else {
-            Self::Rects(std::iter::once(rects.into_iter().reduce(union).unwrap()).collect())
-        }
-    }
-
-    fn list(&self, size: (u32, u32)) -> Vec<Rect> {
-        match self {
-            Self::None => vec![],
-            Self::Whole => vec![whole(size)],
-            Self::Rects(rects) => rects
-                .iter()
-                .filter_map(|&r| intersection(r, whole(size)))
-                .collect(),
-        }
-    }
-
-    pub(crate) fn union(&self, other: &Self) -> Self {
-        match (self, other) {
-            (Self::Whole, _) | (_, Self::Whole) => Self::Whole,
-            (Self::None, d) | (d, Self::None) => d.clone(),
-            (Self::Rects(a), Self::Rects(b)) => Self::rects(a.iter().chain(b).copied()),
-        }
+        out
     }
 }
 
@@ -451,34 +405,6 @@ fn intersection(a: Rect, b: Rect) -> Option<Rect> {
         h: bottom - y,
     })
 }
-fn union(a: Rect, b: Rect) -> Rect {
-    let x = a.x.min(b.x);
-    let y = a.y.min(b.y);
-    Rect {
-        x,
-        y,
-        w: end_x(a).max(end_x(b)) - x,
-        h: end_y(a).max(end_y(b)) - y,
-    }
-}
-fn merge(rects: Vec<Rect>) -> Vec<Rect> {
-    let mut out: Vec<Rect> = vec![];
-    for mut rect in rects.into_iter().filter(|r| r.w > 0 && r.h > 0) {
-        let mut i = 0;
-        while i < out.len() {
-            if intersection(rect, out[i]).is_some() {
-                rect = union(rect, out.remove(i));
-                i = 0;
-            } else {
-                i += 1;
-            }
-        }
-        out.push(rect);
-    }
-    out.sort_by_key(|r| (r.y, r.x, r.h, r.w));
-    out
-}
-
 fn swapped(size: (u32, u32), rotation: Rotation) -> (u32, u32) {
     if matches!(rotation, Rotation::Quarter | Rotation::ThreeQuarters) {
         (size.1, size.0)
@@ -542,8 +468,16 @@ fn tile_size(caps: &CompositorCaps) -> (u32, u32) {
     }
     (aligned(caps.tile.0), aligned(caps.tile.1))
 }
+/// The region covering exactly `rects`.
+fn covering(size: (u32, u32), rects: &[Rect]) -> Region {
+    let mut region = Region::empty(size);
+    for &r in rects {
+        region.add(r.into());
+    }
+    region
+}
 fn tiles(
-    damage: &Damage,
+    damage: &Region,
     canvas: (u32, u32),
     output: (u32, u32),
     rotation: Rotation,
@@ -551,40 +485,44 @@ fn tiles(
     size: (u32, u32),
 ) -> Tiles {
     let target = swapped(output, rotation);
-    let rects = damage
-        .list(canvas)
-        .into_iter()
-        .map(|r| {
-            let x = r.x.saturating_sub(reach);
-            let y = r.y.saturating_sub(reach);
-            let r = Rect {
-                x,
-                y,
-                w: end_x(r).saturating_add(reach).min(canvas.0) - x,
-                h: end_y(r).saturating_add(reach).min(canvas.1) - y,
-            };
-            let r = rotate(map(r, canvas, output), output, rotation);
-            let x = r.x / size.0 * size.0;
-            let y = r.y / size.1 * size.1;
-            Rect {
-                x,
-                y,
-                w: end_x(r)
-                    .div_ceil(size.0)
-                    .saturating_mul(size.0)
-                    .min(target.0)
-                    - x,
-                h: end_y(r)
-                    .div_ceil(size.1)
-                    .saturating_mul(size.1)
-                    .min(target.1)
-                    - y,
+    // Dilated tiles overlap; the region keeps their union exact.
+    let mut cover = Region::empty(target);
+    for r in damage.rects() {
+        let r = Rect::from(r);
+        cover.add(
+            {
+                let x = r.x.saturating_sub(reach);
+                let y = r.y.saturating_sub(reach);
+                let r = Rect {
+                    x,
+                    y,
+                    w: end_x(r).saturating_add(reach).min(canvas.0) - x,
+                    h: end_y(r).saturating_add(reach).min(canvas.1) - y,
+                };
+                let r = rotate(map(r, canvas, output), output, rotation);
+                let x = r.x / size.0 * size.0;
+                let y = r.y / size.1 * size.1;
+                Rect {
+                    x,
+                    y,
+                    w: end_x(r)
+                        .div_ceil(size.0)
+                        .saturating_mul(size.0)
+                        .min(target.0)
+                        - x,
+                    h: end_y(r)
+                        .div_ceil(size.1)
+                        .saturating_mul(size.1)
+                        .min(target.1)
+                        - y,
+                }
             }
-        })
-        .collect();
+            .into(),
+        );
+    }
     Tiles {
         size,
-        rects: merge(rects),
+        rects: cover.rects().into_iter().map(Into::into).collect(),
     }
 }
 /// Decide how to show a frame. `canvas` dimensions must be nonzero. Destinations
@@ -642,11 +580,15 @@ pub fn plan(
                 .all(|&c| intersection(c, v.rect).is_none())
         });
     let compose_video = !frame.video.is_empty() && !separate_video;
-    let mut damage = frame.damage.clone();
+    let mut damage = if frame.damage.size() == canvas {
+        frame.damage.clone()
+    } else {
+        Region::whole(canvas)
+    };
     if compose_video {
-        damage = damage.union(&Damage::rects(
-            frame.video.iter().filter(|v| v.changed).map(|v| v.rect),
-        ));
+        for video in frame.video.iter().filter(|v| v.changed) {
+            damage.add(video.rect.into());
+        }
     }
     let size = tile_size(caps);
     let mut result = Plan {
@@ -700,9 +642,9 @@ pub fn plan(
                     rotation: settings.rotation,
                     nearest: false,
                     damage: if video.changed {
-                        Damage::Whole
+                        Region::whole(video.source)
                     } else {
-                        Damage::None
+                        Region::empty(video.source)
                     },
                 },
             ));
@@ -786,7 +728,7 @@ pub fn plan(
             u32::from(!caps.scales && !integer)
         };
         let tile = tiles(&work, canvas, output, rotation, reach, size);
-        result.layers.base.damage = Damage::rects(tile.rects.clone());
+        result.layers.base.damage = covering(target.size, &tile.rects);
         result.stages.push(Stage::Output {
             from: source,
             into: OUTPUT,
@@ -809,14 +751,14 @@ pub fn plan(
     } else if source != Source::Base {
         result.layers.base.source = source;
         if let Stage::Video { tiles, .. } = &result.stages[0] {
-            result.layers.base.damage = Damage::rects(tiles.rects.clone());
+            result.layers.base.damage = covering(canvas, &tiles.rects);
         }
     } else if matches!(frame.base, BaseKind::Software { .. }) {
         let (target, age) = pools.target(CANVAS, canvas);
         let work = pools.damage(&damage, age);
         let tile = tiles(&work, canvas, canvas, Rotation::None, 0, size);
         result.layers.base.source = Source::Pool(CANVAS);
-        result.layers.base.damage = Damage::rects(tile.rects.clone());
+        result.layers.base.damage = covering(canvas, &tile.rects);
         result.stages.push(Stage::Ingest {
             into: CANVAS,
             tiles: tile,

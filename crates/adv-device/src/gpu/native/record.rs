@@ -6,7 +6,7 @@ use super::pipelines::{fixed_sampling_flags, program_sampling_flags, slot};
 use super::resources::Storage;
 use super::stream::{Binding, Bytes, Command, Draw, Producer};
 use super::{Depth, Gpu, Image, ImageId, Target, backing};
-use crate::frame::Damage;
+use crate::frame::Region;
 use adv_gpu::resource::{BufferDesc, BufferUsage, Memory};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -731,25 +731,12 @@ impl Gpu {
     pub fn present(
         &mut self,
         image: &Image,
-        damage: Damage,
+        damage: Region,
         serial: u64,
         video: std::sync::Arc<[crate::frame::VideoPlane]>,
     ) -> Result<(), Error> {
         #[cfg(feature = "test-support")]
         self.stream.0.borrow().admit()?;
-        if let Damage::Rects(rects) = &damage {
-            for &r in rects {
-                rectangle_in(
-                    image,
-                    Rect {
-                        x: r.x,
-                        y: r.y,
-                        w: r.w,
-                        h: r.h,
-                    },
-                )?;
-            }
-        }
         self.stream.push(Command::PresentSwap {
             image: image.clone(),
             damage,
@@ -1704,9 +1691,7 @@ struct V { @builtin(position) position:vec4<f32>, @location(0) alpha:f32 }
             crate::surface::Surfaces::new(4, 4, 0, 4096, crate::surface::Snapshot::default())
                 .unwrap();
         let id = surfaces.insert_native(target).unwrap();
-        surfaces
-            .present_native(id, Damage::Whole, &mut gpu)
-            .unwrap();
+        surfaces.present_native(id, None, &mut gpu).unwrap();
         assert_eq!(surfaces.stats.presentations, 1);
         let mut transfer = surfaces.readback_native(id, &mut gpu).unwrap();
         transfer.take_completion_job().unwrap()();

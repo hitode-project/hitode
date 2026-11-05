@@ -1,11 +1,10 @@
 //! Test adapters for the native executor; absent from ordinary builds.
 use super::{Gpu, Image, stream};
 use crate::frame::{
-    Damage,
+    Region,
     test_support::{CapturePresenter, CapturedFrame},
 };
 use crate::gpu::{Error, GpuBackend};
-use crate::surface::Rect;
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
@@ -23,7 +22,7 @@ pub struct Frame {
     source: Rc<Frames>,
     index: usize,
     serial: u64,
-    damage: Damage,
+    damage: Region,
 }
 impl Frames {
     fn get(&self, index: usize) -> std::cell::Ref<'_, CapturedFrame> {
@@ -49,7 +48,8 @@ impl Frame {
     }
 }
 
-/// Captures software publications into the front's existing snapshot assertions.
+/// Captures software publications, with their damage, into the front's
+/// existing snapshot assertions.
 pub struct SurfaceCapture {
     gpu: Gpu,
     published: u64,
@@ -78,6 +78,7 @@ impl SurfaceCapture {
                 },
             )
             .unwrap();
+            surfaces.presenter.damage = frame.damage.clone();
             self.published += 1;
         }
     }
@@ -112,23 +113,10 @@ pub fn request_backend(fallback: bool, _: GpuBackend) -> Result<Gpu, Error> {
 pub fn present(
     gpu: &mut Gpu,
     image: &Image,
-    damage: Option<Rect>,
+    damage: Option<Region>,
     serial: u64,
 ) -> Result<Frame, Error> {
-    let damage = match damage {
-        None => Damage::Whole,
-        Some(r) if r.empty() => Damage::None,
-        Some(r) => Damage::Rects(
-            [adv_gpu::Rect {
-                x: r.x,
-                y: r.y,
-                w: r.w,
-                h: r.h,
-            }]
-            .into_iter()
-            .collect(),
-        ),
-    };
+    let damage = damage.unwrap_or_else(|| Region::whole((image.width(), image.height())));
     gpu.present(image, damage.clone(), serial, std::sync::Arc::from([]))?;
     let source = gpu.execution.capture.borrow().as_ref().unwrap().clone();
     let index = source.reserve();
@@ -142,7 +130,7 @@ pub fn present(
 pub fn completed_frame(
     gpu: &mut Gpu,
     image: Image,
-    damage: Option<Rect>,
+    damage: Option<Region>,
     serial: u64,
 ) -> Result<Frame, Error> {
     present(gpu, &image, damage, serial)
@@ -221,7 +209,7 @@ mod tests {
             .filter_map(|time| decoder.frame_at(time).unwrap().video);
         let video = samples.next().unwrap();
         let next = samples.next().unwrap();
-        let source = Rect {
+        let source = crate::surface::Rect {
             x: 0,
             y: 0,
             w: video.width,
@@ -240,7 +228,7 @@ mod tests {
             )
             .unwrap();
         store.present(base, &memory, store[base].rect()).unwrap();
-        let canvas = Rect {
+        let canvas = crate::surface::Rect {
             x: 0,
             y: 0,
             w: 8,

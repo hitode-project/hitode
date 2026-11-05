@@ -4,12 +4,26 @@ use std::time::{Duration, Instant};
 fn rect(x: u32, y: u32, w: u32, h: u32) -> Rect {
     Rect { x, y, w, h }
 }
+/// Damage of the test canvas.
+fn cells(rects: &[Rect]) -> Region {
+    let mut region = Region::empty((320, 240));
+    for &r in rects {
+        region.add(r.into());
+    }
+    region
+}
+fn all() -> Region {
+    Region::whole((320, 240))
+}
+fn none() -> Region {
+    Region::empty((320, 240))
+}
 fn frame() -> FrameInfo {
     FrameInfo {
         serial: 50,
         canvas: (320, 240),
         base: BaseKind::Gpu { presentable: true },
-        damage: Damage::Whole,
+        damage: all(),
         video: Default::default(),
         cursor_regions: Default::default(),
     }
@@ -302,7 +316,7 @@ fn video_layers_or_canvas_composition() {
         (Upscaler::Anime4k, true, None, false),
     ] {
         let mut f = frame();
-        f.damage = Damage::None;
+        f.damage = none();
         f.video.push(VideoGeometry {
             source_uv: None,
             background: None,
@@ -333,7 +347,7 @@ fn video_layers_or_canvas_composition() {
             assert_eq!(layer.source, Source::Video(7));
             assert_eq!(layer.crop, rect(0, 0, 160, 120));
             assert_eq!(layer.dst, rect(20, 40, 200, 160));
-            assert_eq!(layer.damage, Damage::Whole);
+            assert_eq!(layer.damage, Region::whole((160, 120)));
             assert!(p.stages.is_empty());
         } else if upscaler == Upscaler::Off {
             assert!(matches!(
@@ -348,7 +362,7 @@ fn video_layers_or_canvas_composition() {
             // Video composes straight into the model's input.
             assert!(matches!(p.stages[0], Stage::Upscale { video: true, .. }));
             assert_eq!(p.targets[0].size, f.canvas);
-            assert_eq!(p.damage, Damage::rects([rect(10, 20, 100, 80)]));
+            assert_eq!(p.damage, cells(&[rect(10, 20, 100, 80)]));
         }
     }
     let mut f = frame();
@@ -462,13 +476,13 @@ fn upscaled_output_sizes_and_final_rotation() {
 #[test]
 fn damage_dilation_mapping_alignment_and_merging() {
     let mut f = FrameInfo {
-        damage: Damage::rects([rect(15, 15, 2, 2), rect(18, 18, 2, 2)]),
+        damage: cells(&[rect(15, 15, 2, 2), rect(18, 18, 2, 2)]),
         ..frame()
     };
     f.base = BaseKind::Software { indexed: false };
     let p = run(&f, &settings(), &caps(), &warm(0, f.canvas, Some(1)));
     assert_eq!(stage_tiles(&p.stages[0])[0].rects, [rect(0, 0, 32, 32)]);
-    assert_eq!(p.layers.base.damage, Damage::rects([rect(0, 0, 32, 32)]));
+    assert_eq!(p.layers.base.damage, cells(&[rect(0, 0, 32, 32)]));
     for model in [
         Upscaler::Anime4k,
         Upscaler::Cunny,
@@ -477,7 +491,7 @@ fn damage_dilation_mapping_alignment_and_merging() {
     ] {
         let radius = crate::stages::upscale::reach(model);
         let f = FrameInfo {
-            damage: Damage::rects([rect(40, 50, 1, 1)]),
+            damage: cells(&[rect(40, 50, 1, 1)]),
             ..frame()
         };
         let s = Settings {
@@ -485,12 +499,13 @@ fn damage_dilation_mapping_alignment_and_merging() {
             ..settings()
         };
         let p = run(&f, &s, &caps(), &warmed(&s, &caps()));
-        // The model recomputes from the change; the output pass covers its reach.
+        // The model recomputes from the change's cell (40, 48, 8, 8); the
+        // output pass covers its reach.
         assert_eq!(stage_tiles(&p.stages[0])[0].rects, [rect(32, 48, 16, 16)]);
         let x = (40 - radius) * 2 / 16 * 16;
-        let y = (50 - radius) * 2 / 16 * 16;
-        let right = ((41 + radius) * 2).div_ceil(16) * 16;
-        let bottom = ((51 + radius) * 2).div_ceil(16) * 16;
+        let y = (48 - radius) * 2 / 16 * 16;
+        let right = ((48 + radius) * 2).div_ceil(16) * 16;
+        let bottom = ((56 + radius) * 2).div_ceil(16) * 16;
         assert_eq!(
             stage_tiles(&p.stages[1])[0].rects,
             [rect(x, y, right - x, bottom - y)]
@@ -507,7 +522,7 @@ fn damage_dilation_mapping_alignment_and_merging() {
     );
     assert_eq!(stage_tiles(&p.stages[0])[0].size, (48, 32));
     assert_eq!(stage_tiles(&p.stages[0])[0].rects, [rect(0, 0, 48, 32)]);
-    for damage in [Damage::Whole, Damage::None] {
+    for damage in [all(), none()] {
         let p = run(
             &FrameInfo {
                 damage: damage.clone(),
@@ -517,7 +532,7 @@ fn damage_dilation_mapping_alignment_and_merging() {
             &caps(),
             &warm(0, f.canvas, Some(1)),
         );
-        let expected = if damage == Damage::Whole {
+        let expected = if damage.is_whole() {
             vec![rect(0, 0, 320, 240)]
         } else {
             vec![]
@@ -526,7 +541,7 @@ fn damage_dilation_mapping_alignment_and_merging() {
     }
     // Rounding clips to target edges, including after a clockwise rotation.
     let f = FrameInfo {
-        damage: Damage::rects([rect(319, 239, 1, 1)]),
+        damage: cells(&[rect(319, 239, 1, 1)]),
         ..frame()
     };
     let s = Settings {
@@ -540,9 +555,11 @@ fn damage_dilation_mapping_alignment_and_merging() {
         ..caps()
     };
     let p = run(&f, &s, &c, &warmed(&s, &c));
-    assert_eq!(stage_tiles(&p.stages[1])[0].rects, [rect(0, 624, 16, 16)]);
-    let d = Damage::rects((0..5).map(|n| rect(n * 10, 0, 1, 1)));
-    assert_eq!(d, Damage::rects([rect(0, 0, 41, 1)]));
+    // The corner cell (312, 232, 8, 8) and its reach end at the target edges.
+    assert_eq!(stage_tiles(&p.stages[1])[0].rects, [rect(0, 608, 32, 32)]);
+    // Distant changes stay apart instead of merging into their bounds.
+    let d: Vec<_> = (0..5).map(|n| rect(n * 20, 0, 1, 1)).collect();
+    assert_eq!(cells(&d).rects().len(), 5);
 }
 
 // spec: HOST-VIEW-10
@@ -550,7 +567,7 @@ fn damage_dilation_mapping_alignment_and_merging() {
 fn buffer_age_table() {
     let f = FrameInfo {
         base: BaseKind::Software { indexed: false },
-        damage: Damage::rects([rect(1, 1, 1, 1)]),
+        damage: cells(&[rect(1, 1, 1, 1)]),
         ..frame()
     };
     for (age, count, expected) in [
@@ -562,7 +579,7 @@ fn buffer_age_table() {
     ] {
         let mut pools = warm(0, f.canvas, age);
         for _ in 0..count {
-            pools.history.push_back(Damage::rects([rect(65, 65, 1, 1)]));
+            pools.history.push_back(cells(&[rect(65, 65, 1, 1)]));
         }
         let p = run(&f, &settings(), &caps(), &pools);
         assert_eq!(stage_tiles(&p.stages[0])[0].rects, expected, "{age:?}");
@@ -598,7 +615,7 @@ fn pool_present_release_invalidation_and_trim() {
     pools.trim_to_one();
     assert_eq!(pools.pools[0].buffers.len(), 1);
     let quiet = FrameInfo {
-        damage: Damage::None,
+        damage: none(),
         ..f.clone()
     };
     let p = run(&quiet, &settings(), &caps(), &pools);
@@ -652,11 +669,7 @@ fn swap_role_depends_only_on_settings_caps_and_canvas() {
             SwapRole::Presentable { canvas: (320, 240) },
         ),
     ] {
-        for damage in [
-            Damage::None,
-            Damage::Whole,
-            Damage::rects([rect(1, 2, 3, 4)]),
-        ] {
+        for damage in [none(), all(), cells(&[rect(1, 2, 3, 4)])] {
             for base in [
                 BaseKind::Gpu { presentable: false },
                 BaseKind::Software { indexed: true },
@@ -815,9 +828,9 @@ fn recorder_replays_stateful_upscales_and_composed_video() {
         let f = FrameInfo {
             serial: serial as u64,
             damage: if serial == 0 {
-                Damage::Whole
+                all()
             } else {
-                Damage::rects([rect(40, 40, 20, 20)])
+                cells(&[rect(40, 40, 20, 20)])
             },
             video: [VideoGeometry {
                 source_uv: None,

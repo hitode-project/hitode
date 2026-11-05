@@ -382,7 +382,7 @@ fn d3d9_differential_frames_match_full_commands_damage_and_pixels_with_statebloc
             let published = f.m.ext.get::<Presents>().damage.len();
             f.okay("IDirect3DDevice9::EndScene", &[d]);
             present(&mut f);
-            let damage = f.m.ext.get::<Presents>().damage.get(published).copied();
+            let damage = f.m.ext.get::<Presents>().damage.get(published).cloned();
             let image = f.image(f.back);
             frames.push((key, damage, f.pixels(&image)));
             f.okay("IDirect3DDevice9::BeginScene", &[d]);

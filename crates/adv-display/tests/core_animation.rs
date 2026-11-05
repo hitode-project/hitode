@@ -15,7 +15,7 @@ fn main() {}
 mod macos {
     use adv_display::Rect;
     use adv_display::compositor::{AcquiredImage, Compositor, LayerCompositor, LayerId, Released};
-    use adv_display::plan::{CompositorCaps, Damage, Layer, Layers, Rotation, Source, Tiles};
+    use adv_display::plan::{CompositorCaps, Layer, Layers, Region, Rotation, Source, Tiles};
     use adv_gpu::encode::{ColorAttachment, Load, Store};
     use adv_gpu::present::{Export, PoolDesc, PresentPool};
     use adv_gpu::queue::DeviceOptions;
@@ -256,7 +256,7 @@ mod macos {
             dst,
             rotation: Rotation::None,
             nearest,
-            damage: Damage::Whole,
+            damage: Region::whole((crop.w, crop.h)),
         }
     }
 

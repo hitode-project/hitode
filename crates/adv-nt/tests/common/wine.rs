@@ -6,10 +6,14 @@
 use std::path::{Path, PathBuf};
 
 /// The stripped installation `ADV_WINE_DIST` names, or `None` when it is
-/// unset: a machine without Wine skips these tests. One that is set must be
-/// complete, or the test fails rather than skipping.
+/// unset: a developer machine without Wine skips these tests, CI fails them.
+/// One that is set must be complete, or the test fails rather than skipping.
 pub fn dist() -> Option<PathBuf> {
     let Some(dist) = std::env::var_os("ADV_WINE_DIST").map(PathBuf::from) else {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "ADV_WINE_DIST is not set: CI runs every Wine test"
+        );
         eprintln!("skipped: ADV_WINE_DIST is not set");
         return None;
     };
@@ -27,6 +31,18 @@ pub fn dist() -> Option<PathBuf> {
         );
     }
     Some(dist)
+}
+
+/// The unstripped build beside `ADV_WINE_DIST`, whose DWARF the layout
+/// tests compare against, or `None` where only the stripped release
+/// userland exists, as in CI.
+pub fn debug_dist() -> Option<PathBuf> {
+    let debug = dist()?.with_file_name("wine11-sse-dist");
+    if !debug.is_dir() {
+        eprintln!("skipped: no unstripped Wine build at {}", debug.display());
+        return None;
+    }
+    Some(debug)
 }
 
 /// The installation and the probes built from the current sources.

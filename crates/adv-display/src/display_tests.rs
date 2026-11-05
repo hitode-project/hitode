@@ -86,7 +86,21 @@ fn setup() -> (Device, Queue, Display, Arc<Mutex<Vec<Presentation>>>) {
     let display = Display::new(d.clone(), compositor(&history), settings()).unwrap();
     (d, q, display, history)
 }
-fn info(serial: u64, base: BaseKind, damage: Damage) -> FrameInfo {
+/// Damage of the test canvas.
+fn cells(rects: &[Rect]) -> Region {
+    let mut region = Region::empty((64, 48));
+    for &r in rects {
+        region.add(r.into());
+    }
+    region
+}
+fn all() -> Region {
+    Region::whole((64, 48))
+}
+fn none() -> Region {
+    Region::empty((64, 48))
+}
+fn info(serial: u64, base: BaseKind, damage: Region) -> FrameInfo {
     FrameInfo {
         serial,
         canvas: (64, 48),
@@ -138,7 +152,7 @@ fn private(d: &Device, q: &mut Queue) -> Image {
     q.submit(encoder).unwrap();
     image
 }
-fn frame(serial: u64, image: &Image, damage: Damage) -> Frame {
+fn frame(serial: u64, image: &Image, damage: Region) -> Frame {
     Frame {
         info: info(serial, BaseKind::Gpu { presentable: false }, damage),
         base: Base::Private(image.clone()),
@@ -169,7 +183,7 @@ fn presentable_swap_is_shown_by_reference_without_a_stage() {
         .present(
             &mut q,
             Frame {
-                info: info(1, BaseKind::Gpu { presentable: true }, Damage::Whole),
+                info: info(1, BaseKind::Gpu { presentable: true }, all()),
                 base: Base::Presentable { image, ready },
                 video: vec![],
                 published_at: std::time::Instant::now(),
@@ -195,9 +209,9 @@ fn private_swap_limits_output_to_damage_and_reconstructs_buffer_age() {
     let image = private(&d, &mut q);
     for (serial, x) in [(1, 0), (2, 16), (3, 32), (4, 48)] {
         let damage = if serial == 1 {
-            Damage::Whole
+            all()
         } else {
-            Damage::rects([Rect {
+            cells(&[Rect {
                 x,
                 y: 0,
                 w: 1,
@@ -222,22 +236,15 @@ fn private_swap_limits_output_to_damage_and_reconstructs_buffer_age() {
     let Stage::Output { tiles, .. } = &records[2].plan.stages[0] else {
         panic!("private output")
     };
+    // Age two: this frame's change and the previous one, as one span.
     assert_eq!(
         tiles.rects,
-        [
-            Rect {
-                x: 16,
-                y: 0,
-                w: 16,
-                h: 16
-            },
-            Rect {
-                x: 32,
-                y: 0,
-                w: 16,
-                h: 16
-            }
-        ]
+        [Rect {
+            x: 16,
+            y: 0,
+            w: 32,
+            h: 16
+        }]
     );
     assert_eq!(
         records[2].plan.targets[0].buffer,
@@ -246,7 +253,7 @@ fn private_swap_limits_output_to_damage_and_reconstructs_buffer_age() {
     assert_eq!(display.ledger().pools[0].buffers.len(), 2);
     for serial in 5..=7 {
         display
-            .present(&mut q, frame(serial, &image, Damage::None))
+            .present(&mut q, frame(serial, &image, none()))
             .unwrap();
     }
     let quiet = display.recorder().latest().unwrap();
@@ -259,9 +266,7 @@ fn private_swap_limits_output_to_damage_and_reconstructs_buffer_age() {
             .iter()
             .all(|b| b.in_use)
     );
-    display
-        .present(&mut q, frame(8, &image, Damage::None))
-        .unwrap();
+    display.present(&mut q, frame(8, &image, none())).unwrap();
     assert!(display.recorder().latest().unwrap().statistics.passes > 0);
     crate::recorder::replay(&crate::recorder::parse(&display.recorder().dump()).unwrap()).unwrap();
 }
@@ -270,9 +275,7 @@ fn private_swap_limits_output_to_damage_and_reconstructs_buffer_age() {
 fn rotation_and_settings_invalidate_content_and_rebuild_only_reattaches() {
     let (d, mut q, mut display, history) = setup();
     let image = private(&d, &mut q);
-    display
-        .present(&mut q, frame(1, &image, Damage::Whole))
-        .unwrap();
+    display.present(&mut q, frame(1, &image, all())).unwrap();
     let mut changed = settings();
     changed.rotation = Rotation::Quarter;
     changed.background = [0.1, 0.2, 0.3];
@@ -290,7 +293,7 @@ fn rotation_and_settings_invalidate_content_and_rebuild_only_reattaches() {
         })
         .last()
         .unwrap();
-    assert_eq!(record.frame.damage, Damage::Whole);
+    assert_eq!(record.frame.damage, all());
     let Stage::Output {
         transform, tiles, ..
     } = &record.plan.stages[0]
@@ -355,7 +358,7 @@ fn software_ingest_and_video_layers_share_one_plan() {
         p[0].data.fill(80);
         p[1].data.fill(128);
     });
-    let mut info = info(1, BaseKind::Software { indexed: false }, Damage::Whole);
+    let mut info = info(1, BaseKind::Software { indexed: false }, all());
     info.video.push(VideoGeometry {
         source_uv: None,
         background: None,
@@ -453,7 +456,7 @@ fn failed_attachment_keeps_the_ledger_uncommitted_and_reports_the_submitted_read
     let result = display.present(
         &mut q,
         Frame {
-            info: info(1, BaseKind::Software { indexed: false }, Damage::Whole),
+            info: info(1, BaseKind::Software { indexed: false }, all()),
             base: Base::Software {
                 buffer,
                 pitch: 256,
@@ -561,7 +564,7 @@ fn coalescing_replaces_the_held_frame_merges_damage_and_releases_its_swap() {
                     info: info(
                         serial,
                         BaseKind::Gpu { presentable: true },
-                        Damage::rects([Rect {
+                        cells(&[Rect {
                             x,
                             y: 0,
                             w: 1,
@@ -589,7 +592,7 @@ fn coalescing_replaces_the_held_frame_merges_damage_and_releases_its_swap() {
     assert_eq!(record.frame.serial, 3);
     assert_eq!(
         record.frame.damage,
-        Damage::rects([
+        cells(&[
             Rect {
                 x: 32,
                 y: 0,
@@ -608,7 +611,7 @@ fn coalescing_replaces_the_held_frame_merges_damage_and_releases_its_swap() {
     assert_eq!(record.statistics.passes, 0);
 }
 fn video_frame(d: &Device, q: &mut Queue, serial: u64) -> (Frame, PresentPool) {
-    let mut frame = frame(serial, &private(d, q), Damage::Whole);
+    let mut frame = frame(serial, &private(d, q), all());
     let mut pool = d
         .create_present_pool(&PoolDesc {
             color: Some(adv_gpu::present::YuvColor::Bt601Full),
@@ -902,13 +905,9 @@ fn changing_settings_while_a_frame_is_held_never_aliases_its_read_source() {
     // A frame clock encodes the second frame on the next refresh, held until
     // the first latches.
     display.refreshed(1);
-    display
-        .present(&mut q, frame(1, &image, Damage::Whole))
-        .unwrap();
+    display.present(&mut q, frame(1, &image, all())).unwrap();
     display.refreshed(2);
-    display
-        .present(&mut q, frame(2, &image, Damage::None))
-        .unwrap();
+    display.present(&mut q, frame(2, &image, none())).unwrap();
     let mut changed = settings();
     changed.rotation = Rotation::Half;
     display.settings(&mut q, changed).unwrap();
@@ -927,7 +926,7 @@ fn changing_settings_while_a_frame_is_held_never_aliases_its_read_source() {
     latch(&events, 2);
     display.service(&mut q).unwrap();
     let record = display.recorder().latest().unwrap();
-    assert_eq!(record.frame.damage, Damage::Whole);
+    assert_eq!(record.frame.damage, all());
     crate::recorder::replay(&crate::recorder::parse(&display.recorder().dump()).unwrap()).unwrap();
 }
 
@@ -971,7 +970,7 @@ fn held_frames_reuse_intermediate_targets_without_reserving_their_slots() {
     assert_eq!(record.plan.targets.len(), 2);
     // A held frame reuses the intermediate's content without writing it.
     let (mut held, _pool) = video_frame(&d, &mut q, 6);
-    held.info.damage = Damage::None;
+    held.info.damage = none();
     held.info.video[0].changed = false;
     display.present(&mut q, held).unwrap();
     latch(&events, 2);
@@ -1091,9 +1090,7 @@ fn upscaled_partial_frames_match_a_whole_run_across_buffer_ages() {
     // The model builds off the owner thread; frames show unscaled meanwhile.
     let ready = |display: &mut Display, q: &mut Queue, pixels: &[u8]| {
         upload(q, pixels);
-        display
-            .present(q, frame(100, &image, Damage::Whole))
-            .unwrap();
+        display.present(q, frame(100, &image, all())).unwrap();
         assert_eq!(
             display.recorder().latest().unwrap().settings.upscaler,
             Upscaler::Off
@@ -1119,7 +1116,7 @@ fn upscaled_partial_frames_match_a_whole_run_across_buffer_ages() {
     ];
     for (serial, change) in changes.into_iter().enumerate() {
         let damage = match change {
-            None => Damage::Whole,
+            None => all(),
             Some(r) => {
                 for y in r.y..r.y + r.h {
                     for x in r.x..r.x + r.w {
@@ -1127,7 +1124,7 @@ fn upscaled_partial_frames_match_a_whole_run_across_buffer_ages() {
                         pixels[at..at + 3].copy_from_slice(&[255, serial as u8 * 60, 0]);
                     }
                 }
-                Damage::rects([r])
+                cells(&[r])
             }
         };
         upload(&mut q, &pixels);
@@ -1173,9 +1170,7 @@ fn upscaled_partial_frames_match_a_whole_run_across_buffer_ages() {
         .collect();
     let mut whole = Display::new(d.clone(), compositor(&history), upscaled).unwrap();
     ready(&mut whole, &mut q, &pixels);
-    whole
-        .present(&mut q, frame(1, &image, Damage::Whole))
-        .unwrap();
+    whole.present(&mut q, frame(1, &image, all())).unwrap();
     assert_eq!(whole.shown_base().desc().size.width, 128);
     let expected = read(&d, &mut q, &whole.shown_base());
     let whole_model = whole.upscaled_copy(&mut q);
@@ -1240,7 +1235,7 @@ fn a_frame_clock_encodes_and_attaches_at_most_once_per_refresh() {
             .unwrap();
         let reads = reads.clone();
         Frame {
-            info: info(serial, BaseKind::Software { indexed: false }, Damage::Whole),
+            info: info(serial, BaseKind::Software { indexed: false }, all()),
             base: Base::Software {
                 buffer,
                 pitch: 256,
