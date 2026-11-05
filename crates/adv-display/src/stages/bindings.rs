@@ -71,3 +71,71 @@ pub const OUTPUT: [Binding; 3] = [
         stages: Stages::FRAGMENT,
     },
 ];
+
+pub const UPSCALE_DELTA: [Binding; 6] = [
+    Binding {
+        slot: 0,
+        kind: BindingKind::UniformBuffer,
+        stages: Stages::COMPUTE,
+    },
+    Binding {
+        slot: 0,
+        kind: BindingKind::SampledImage {
+            dimension: Dimension::D2,
+            depth: false,
+            multisampled: false,
+        },
+        stages: Stages::COMPUTE,
+    },
+    Binding {
+        slot: 0,
+        kind: BindingKind::StorageImage {
+            format: adv_gpu::Format::Rgba16Float,
+            writable: true,
+        },
+        stages: Stages::COMPUTE,
+    },
+    Binding {
+        slot: 1,
+        kind: BindingKind::StorageBuffer { writable: false },
+        stages: Stages::COMPUTE,
+    },
+    Binding {
+        slot: 2,
+        kind: BindingKind::StorageBuffer { writable: true },
+        stages: Stages::COMPUTE,
+    },
+    Binding {
+        slot: 3,
+        kind: BindingKind::StorageBuffer { writable: true },
+        stages: Stages::COMPUTE,
+    },
+];
+
+pub const UPSCALE_FILTER: [Binding; 5] = [
+    Binding {
+        slot: 0,
+        kind: BindingKind::UniformBuffer,
+        stages: Stages::COMPUTE,
+    },
+    Binding {
+        slot: 0,
+        kind: BindingKind::StorageBuffer { writable: false },
+        stages: Stages::COMPUTE,
+    },
+    Binding {
+        slot: 1,
+        kind: BindingKind::StorageBuffer { writable: false },
+        stages: Stages::COMPUTE,
+    },
+    Binding {
+        slot: 2,
+        kind: BindingKind::StorageBuffer { writable: true },
+        stages: Stages::COMPUTE,
+    },
+    Binding {
+        slot: 3,
+        kind: BindingKind::StorageBuffer { writable: true },
+        stages: Stages::COMPUTE,
+    },
+];

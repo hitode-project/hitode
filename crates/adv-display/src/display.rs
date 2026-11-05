@@ -1261,8 +1261,16 @@ impl Display {
                         ..
                     }
             );
+            let exact = matches!(frame.info.base, BaseKind::Software { .. })
+                && matches!(stage, Stage::Upscale { video: false, .. });
             let destination = match stage {
-                Stage::Upscale { .. } => self.upscaled.as_ref().unwrap().upscaling.input().clone(),
+                Stage::Upscale { .. } => self
+                    .upscaled
+                    .as_ref()
+                    .unwrap()
+                    .upscaling
+                    .input(exact)
+                    .clone(),
                 _ => targets[into.0 as usize].as_ref().unwrap().image().clone(),
             };
             let size = destination.desc().size;
@@ -1343,7 +1351,7 @@ impl Display {
             timed.push(index);
             if let Stage::Upscale { .. } = stage {
                 // The model's compute pass is timed as a second span of its
-                // stage. Pixels are those the last model pass recomputed; none
+                // stage. Pixels bound the last model pass's recomputed work; none
                 // means no compute pass ran, nor wrote its timestamps.
                 let u = self.upscaled.as_ref().unwrap();
                 let upscaled = u.upscaling.encode(
@@ -1351,6 +1359,7 @@ impl Display {
                     &mut self.ring,
                     u.output.view(),
                     Some(&tiles.rects),
+                    exact,
                     self.queries.as_ref().map(|q| (q, statistics.passes * 2)),
                 )?;
                 statistics.stages[index].pixels = upscaled;

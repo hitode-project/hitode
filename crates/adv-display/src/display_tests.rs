@@ -1276,3 +1276,159 @@ fn a_frame_clock_encodes_and_attaches_at_most_once_per_refresh() {
     // Once it attaches, the waiting frame is encoded for the next latch.
     assert_eq!(*reads.lock().unwrap(), [1, 3, 4]);
 }
+
+// spec: HOST-VIEW-10, HOST-SES-10
+#[test]
+fn paced_upscaling_compares_the_newest_composition_to_the_last_encoded_input() {
+    let (d, mut q) = Device::open(&queue::DeviceOptions {
+        validation: !cfg!(target_os = "android"),
+        disable: adv_gpu::Modern::from_test_env(),
+        ..Default::default()
+    })
+    .unwrap();
+    let settings = Settings {
+        view: (128, 96),
+        upscaler: Upscaler::Anime4k,
+        ..settings()
+    };
+    let events = Arc::new(Mutex::new(vec![]));
+    let mut display = Display::new(
+        d.clone(),
+        Box::new(Controlled {
+            headless: HeadlessCompositor::new(caps()),
+            history: Arc::default(),
+            latch: events.clone(),
+        }),
+        settings.clone(),
+    )
+    .unwrap();
+    let mut seed = 0x2545_f491u32;
+    let original: Vec<u8> = (0..64 * 48 * 4)
+        .map(|_| {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            (seed >> 16) as u8
+        })
+        .collect();
+    let mut intermediate = original.clone();
+    intermediate[4..7].copy_from_slice(&[0, 255, 0]);
+    let mut newest = original.clone();
+    newest[(40 * 64 + 50) * 4..][..3].copy_from_slice(&[255, 0, 128]);
+    let images: Vec<_> = [&original, &intermediate, &newest]
+        .into_iter()
+        .map(|pixels| {
+            let image = d
+                .create_image(&ImageDesc {
+                    dimension: Dimension::D2,
+                    size: Extent {
+                        width: 64,
+                        height: 48,
+                        depth_or_layers: 1,
+                    },
+                    format: Format::Bgra8Unorm,
+                    mips: 1,
+                    samples: 1,
+                    usage: Usage::SAMPLED | Usage::COPY_DST,
+                    view_formats: &[],
+                    label: "paced upscale source",
+                })
+                .unwrap();
+            let upload = d
+                .create_buffer(&BufferDesc {
+                    size: pixels.len() as u64,
+                    usage: BufferUsage::COPY_SRC,
+                    memory: Memory::Upload,
+                    label: "paced upscale upload",
+                })
+                .unwrap();
+            // SAFETY: the upload is new.
+            unsafe { upload.mapped().unwrap().as_mut() }.copy_from_slice(pixels);
+            let mut encoder = q.encoder("paced upscale upload");
+            encoder.copy_buffer_to_image(
+                encode::BufferCopy {
+                    buffer: &upload,
+                    offset: 0,
+                    row_pitch: 0,
+                    rows: 0,
+                },
+                encode::ImageCopy {
+                    image: &image,
+                    mip: 0,
+                    layer: 0,
+                    origin: (0, 0, 0),
+                },
+                image.desc().size,
+            );
+            q.submit(encoder).unwrap();
+            image
+        })
+        .collect();
+    let ready = |display: &mut Display, q: &mut Queue, image: &Image| {
+        display.present(q, frame(100, image, all())).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !display.upscaler_ready(q) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "upscaler build timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    };
+    ready(&mut display, &mut q, &images[0]);
+    latch(&events, 1);
+    display.service(&mut q).unwrap();
+    display
+        .present(&mut q, frame(1, &images[0], all()))
+        .unwrap();
+    assert_eq!(display.recorder().latest().unwrap().frame.serial, 1);
+    display
+        .present(
+            &mut q,
+            frame(
+                2,
+                &images[1],
+                cells(&[Rect {
+                    x: 1,
+                    y: 0,
+                    w: 1,
+                    h: 1,
+                }]),
+            ),
+        )
+        .unwrap();
+    // The newest publication cancels the first pixel change and changes a
+    // distant pixel; both publications' cells survive in merged S.
+    display
+        .present(
+            &mut q,
+            frame(
+                3,
+                &images[2],
+                cells(&[
+                    Rect {
+                        x: 1,
+                        y: 0,
+                        w: 1,
+                        h: 1,
+                    },
+                    Rect {
+                        x: 50,
+                        y: 40,
+                        w: 1,
+                        h: 1,
+                    },
+                ]),
+            ),
+        )
+        .unwrap();
+    assert_eq!(display.recorder().latest().unwrap().frame.serial, 1);
+    latch(&events, 2);
+    display.service(&mut q).unwrap();
+    assert_eq!(display.recorder().latest().unwrap().frame.serial, 3);
+    let partial = display.upscaled_copy(&mut q);
+    let partial = read(&d, &mut q, &partial);
+    let mut whole = Display::new(d.clone(), compositor(&Arc::default()), settings).unwrap();
+    ready(&mut whole, &mut q, &images[2]);
+    whole.present(&mut q, frame(1, &images[2], all())).unwrap();
+    let expected = whole.upscaled_copy(&mut q);
+    assert_eq!(partial, read(&d, &mut q, &expected));
+}

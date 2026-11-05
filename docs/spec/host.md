@@ -120,8 +120,12 @@ The executor MUST use one render pass per target, including every composed video
 
 ### HOST-VIEW-10 Damage-limited upscaling
 
-**Rule**: When a frame's damage since the last upscaled frame is known, the upscaler MUST recompute only pixels that damage reaches, matching a whole-frame run. Each pass MUST read only values computed in the same run or left valid by earlier runs. Rebuilds, composed video and unknown damage MUST run on the whole frame.
+**Rule**: Upscaling MUST match a whole-frame run bitwise while limiting model work to cells reached by changed input cells. Each pass MUST read only values computed in the same run or left valid by earlier runs. GPU filters MUST compact producer-damage lists into indirect dispatches without CPU readback.
 **Verification**: Test
+
+Producer damage S covers every changed pixel in 8×8 input cells. Conservative damage composes into scratch; comparison against the persistent input updates changed pixels and marks their cells in GPU bitmap Δ. Exact software damage without composed video writes the input directly and seeds Δ from S. The input therefore equals the last encoded composition, including when pacing merges publications. Rebuilds initialize the whole input and Δ; unknown damage and composed video use whole-frame S, then comparison refines it on subsequent encodes.
+
+CPU lists retain the backwards dependency closure of S. Each GPU filter retains listed cells whose rectangles, grown by accumulated reach to the output, meet Δ. The bound includes later workgroup rounding and the largest tensor branch, preserving the dependency closure even for conservatively retained cells. Each CPU-list slice compacts independently and supplies at most 65535 workgroups through indirect arguments. Empty Δ launches no filter or model workgroups; empty S encodes nothing. Scratch, Δ, compacted lists and indirect buffers persist with the upscaler. Reported pixel counts remain the last CPU list's upper bound.
 
 A 3×3 convolution reaches one input pixel and a pointwise pass none. Reach follows the tensors each pass reads, so passes of one layer count once; the final layer's bilinear sample of the input reaches one pixel beside that chain. Fused passes retain the sum of their layer radii. Intermediate textures are shared between tensors, so the last pass covers the full reach. Each earlier pass covers what later readers of its tensors need, workgroup-rounded, plus its radius.
 
