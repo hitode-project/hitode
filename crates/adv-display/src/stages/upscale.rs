@@ -70,6 +70,13 @@ pub fn reach(choice: Upscaler) -> u32 {
 }
 
 impl Model {
+    /// Whether nonzero integer translations preserve this kernel's output bits.
+    /// Vulkan normalized linear samples fail the translation checks for the
+    /// first three models; their references keep the canvas size and position.
+    pub fn translations(&self) -> bool {
+        cfg!(target_vendor = "apple") || self.passes[0].shader.starts_with("k7_")
+    }
+
     /// Input-pixel radius bounding a change in the output. Reach follows the data:
     /// a pass's outputs reach its radius beyond the farthest input it reads,
     /// so passes of one layer add theirs once. The final layer's bilinear
@@ -160,6 +167,10 @@ pub struct Upscaling {
     compare: ComputePipeline,
     initialize: ComputePipeline,
     filter: ComputePipeline,
+    /// Reconstruction, output exactness, then per-pass validity and requirements.
+    state: Buffer,
+    metadata: Buffer,
+    required_start: u64,
     /// Filter and model indirect records, one per CPU-list slice.
     gates: Buffer,
     arguments: Buffer,
@@ -308,10 +319,37 @@ impl Upscaling {
         let argument_stride = u64::from(align * 4).max(16);
         let reaches = model.filter_reaches();
         let mut argument_bytes = 0;
+        let source_words = size.0.div_ceil(8).div_ceil(32) * size.1.div_ceil(8);
+        let exact_start = 1 + source_words;
+        let last_unit = model.passes.last().unwrap().unit();
+        let valid_start =
+            exact_start + size.0.div_ceil(last_unit).div_ceil(32) * size.1.div_ceil(last_unit);
+        let mut bitmap_words = 0;
+        let mut descriptors = Vec::new();
+        let mut writers = vec![None; model.tensors.len()];
+        let mut consumers = vec![0u32; model.passes.len()];
+        let mut affected = vec![0; model.tensors.len()];
+        for (i, pass) in model.passes.iter().enumerate() {
+            for t in pass.reads() {
+                if let Some(writer) = writers[t] {
+                    consumers[writer] |= 1 << i;
+                }
+            }
+            let reach = pass.reads().map(|t| affected[t]).max().unwrap_or(0) + pass.radius;
+            descriptors.push((bitmap_words, reach));
+            bitmap_words +=
+                size.0.div_ceil(pass.unit()).div_ceil(32) * size.1.div_ceil(pass.unit());
+            for t in pass.writes().flatten() {
+                writers[t] = Some(i);
+                affected[t] = reach;
+            }
+        }
+        let required_start = valid_start + bitmap_words;
+        let mut metadata_words = Vec::new();
         let mut grids = Vec::new();
         let mut shapes: Vec<(u32, u32)> = Vec::new();
         let mut whole = Vec::new();
-        for (pass, reach) in model.passes.iter().zip(reaches) {
+        for (i, (pass, reach)) in model.passes.iter().zip(reaches).enumerate() {
             let shape = (size.0.div_ceil(pass.unit()), size.1.div_ceil(pass.unit()));
             let index = match shapes.iter().position(|&s| s == shape) {
                 Some(index) => index,
@@ -329,6 +367,32 @@ impl Upscaling {
                 }
             };
             let count = shape.0 * shape.1;
+            let aliases = model
+                .passes
+                .iter()
+                .enumerate()
+                .fold(0u32, |mask, (j, other)| {
+                    if i != j
+                        && pass
+                            .writes()
+                            .flatten()
+                            .any(|t| other.writes().any(|u| u == Some(t)))
+                    {
+                        mask | 1 << j
+                    } else {
+                        mask
+                    }
+                });
+            metadata_words.extend([
+                shape.0,
+                shape.1,
+                pass.unit(),
+                descriptors[i].0,
+                descriptors[i].1,
+                pass.radius,
+                consumers[i],
+                aliases,
+            ]);
             grids.push(Grid {
                 columns: shape.0,
                 rows: shape.1,
@@ -340,7 +404,20 @@ impl Upscaling {
                     label: "upscale compacted cells",
                 })?,
                 parameters: upload(
-                    &words([size.0, size.1, pass.unit(), reach]),
+                    &words([
+                        size.0,
+                        size.1,
+                        pass.unit(),
+                        reach,
+                        i as u32,
+                        model.passes.len() as u32,
+                        exact_start,
+                        valid_start,
+                        required_start,
+                        0,
+                        0,
+                        0,
+                    ]),
                     BufferUsage::UNIFORM,
                     "upscale filter parameters",
                 )?,
@@ -429,6 +506,17 @@ impl Upscaling {
             compare: delta_pipeline("compare")?,
             initialize: delta_pipeline("initialize")?,
             filter,
+            state: buffer(
+                u64::from(required_start + bitmap_words) * 4,
+                BufferUsage::STORAGE | BufferUsage::COPY_SRC | BufferUsage::COPY_DST,
+                "upscale validity and requirements",
+            )?,
+            metadata: upload(
+                &words(metadata_words),
+                BufferUsage::STORAGE,
+                "upscale pass graph",
+            )?,
+            required_start: u64::from(required_start) * 4,
             gates: buffer(
                 argument_bytes,
                 BufferUsage::STORAGE
@@ -625,6 +713,15 @@ impl Upscaling {
             &self.gates,
             0,
         );
+        if !self.initialized.get() {
+            encoder.fill_buffer(self.state.slice(0..self.state.desc().size), 0);
+        } else {
+            encoder.fill_buffer(
+                self.state
+                    .slice(self.required_start..self.state.desc().size),
+                0,
+            );
+        }
         let mut compute = encoder.compute_pass(&ComputePassDesc {
             timestamps,
             label: "upscale",
@@ -671,11 +768,19 @@ impl Upscaling {
                 None => (&self.whole[grid.whole], 0, grid.columns * grid.rows),
             }
         };
-        for (i, (pass, pipeline)) in passes.iter().zip(&self.pipelines).enumerate() {
+        compute.bind(
+            4,
+            Bind::StorageBuffer(self.state.slice(0..self.state.desc().size)),
+        );
+        compute.bind(
+            5,
+            Bind::StorageBuffer(self.metadata.slice(0..self.metadata.desc().size)),
+        );
+        for i in (0..passes.len()).rev() {
             let grid = &self.grids[i];
             let (buffer, base, count) = list(i);
             compute.set_pipeline(&self.filter);
-            compute.bind(0, Bind::Uniform(grid.parameters.slice(0..16)));
+            compute.bind(0, Bind::Uniform(grid.parameters.slice(0..48)));
             compute.bind(
                 1,
                 Bind::StorageBuffer(self.delta.slice(0..self.delta.desc().size)),
@@ -702,6 +807,10 @@ impl Upscaling {
                 );
                 compute.dispatch_indirect(self.gates.slice(argument..argument + 12));
             }
+        }
+        for (i, (pass, pipeline)) in passes.iter().zip(&self.pipelines).enumerate() {
+            let grid = &self.grids[i];
+            let (_, _, count) = list(i);
             compute.set_pipeline(pipeline);
             for &(slot, role) in pass.bindings {
                 let resource = match role {

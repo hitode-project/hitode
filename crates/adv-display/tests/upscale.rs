@@ -641,3 +641,83 @@ fn conservative_damage_matches_whole_frames_in_all_forms_and_buffer_ages() {
         }
     }
 }
+
+// spec: HOST-VIEW-10
+#[test]
+fn integer_translations_preserve_interior_bits_in_every_kernel_form() {
+    let mut gpu = gpu();
+    let matrix = adv_gpu::Features::MATRIX_F16_8X8
+        | adv_gpu::Features::SHADER_F16
+        | adv_gpu::Features::SUBGROUP;
+    let size = (97u32, 81u32);
+    let mut seed = 0x1649_b307u32;
+    let pixels: Vec<_> = (0..size.0 * size.1)
+        .map(|_| {
+            std::array::from_fn(|_| {
+                seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                (seed >> 16) % 257
+            })
+        })
+        .collect();
+    let mut failures = Vec::new();
+    for half in [false, true] {
+        if half
+            && !gpu
+                .device
+                .caps()
+                .features
+                .contains(adv_gpu::Features::SHADER_F16)
+        {
+            continue;
+        }
+        for (form, table) in [models::REFERENCE, models::FUSED, models::MATRIX]
+            .into_iter()
+            .enumerate()
+        {
+            if form == 2 && (!half || !gpu.device.caps().features.contains(matrix)) {
+                continue;
+            }
+            for (m, model) in table.into_iter().enumerate() {
+                let original = gpu.scaler(model, size, half);
+                let shifted = gpu.scaler(model, size, half);
+                gpu.run(&original, &pixels, None, true);
+                let expected = gpu.read(&original.output);
+                for (dx, dy) in [
+                    (1u32, 0u32),
+                    (0, 1),
+                    (1, 1),
+                    (8, 0),
+                    (0, 8),
+                    (8, 8),
+                    (16, 16),
+                ] {
+                    let translated: Vec<_> = (0..size.1)
+                        .flat_map(|y| {
+                            let pixels = &pixels;
+                            (0..size.0).map(move |x| {
+                                pixels[(y.saturating_sub(dy) * size.0 + x.saturating_sub(dx))
+                                    as usize]
+                            })
+                        })
+                        .collect();
+                    gpu.run(&shifted, &translated, None, true);
+                    let actual = gpu.read(&shifted.output);
+                    let reach = model.reach();
+                    let mut different = 0;
+                    for y in (reach + dy) * 2..(size.1 - reach) * 2 {
+                        for x in (reach + dx) * 2..(size.0 - reach) * 2 {
+                            let a = &actual[y as usize][x as usize * 4..][..4];
+                            let b =
+                                &expected[(y - dy * 2) as usize][(x - dx * 2) as usize * 4..][..4];
+                            different += usize::from(a != b);
+                        }
+                    }
+                    if different != 0 && model.translations() {
+                        failures.push(format!("model={m} form={form} half={half} offset=({dx},{dy}) pixels={different}"));
+                    }
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}

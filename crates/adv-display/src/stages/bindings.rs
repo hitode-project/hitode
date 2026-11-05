@@ -112,7 +112,7 @@ pub const UPSCALE_DELTA: [Binding; 6] = [
     },
 ];
 
-pub const UPSCALE_FILTER: [Binding; 5] = [
+pub const UPSCALE_FILTER: [Binding; 7] = [
     Binding {
         slot: 0,
         kind: BindingKind::UniformBuffer,
@@ -136,6 +136,16 @@ pub const UPSCALE_FILTER: [Binding; 5] = [
     Binding {
         slot: 3,
         kind: BindingKind::StorageBuffer { writable: true },
+        stages: Stages::COMPUTE,
+    },
+    Binding {
+        slot: 4,
+        kind: BindingKind::StorageBuffer { writable: true },
+        stages: Stages::COMPUTE,
+    },
+    Binding {
+        slot: 5,
+        kind: BindingKind::StorageBuffer { writable: false },
         stages: Stages::COMPUTE,
     },
 ];
