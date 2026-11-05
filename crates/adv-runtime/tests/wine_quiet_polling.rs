@@ -88,10 +88,18 @@ fn wine_peek_and_time_loop_idles_and_notifications_wake_it() {
         .parse()
         .unwrap();
     assert!(elapsed >= 100);
-    assert!(session.control_metrics().idle_waits > 0);
+    // The timed loop may finish before quiet polling settles on a slow host.
+    let waits = session.control_metrics().idle_waits;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while session.control_metrics().idle_waits == waits {
+        let stop = session.run(Instant::now() + Duration::from_millis(10));
+        assert!(matches!(stop, Stop::Paused), "{stop:?}");
+        assert!(Instant::now() < deadline, "quiet polling did not idle");
+    }
     let before = session.machine.cpu.read_u32(fields[4]).unwrap();
     wake.take_interrupt();
-    let result = session.machine.run_slice(Duration::from_millis(100));
+    // Bounded so a polling loop that never idles fails instead of hanging.
+    let result = session.machine.run_slice(Duration::from_secs(10));
     assert!(
         matches!(result, SliceResult::Complete(RunResult::Idle { .. })),
         "{result:?}"
