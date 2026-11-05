@@ -11,6 +11,49 @@ use adv_machine::{Env, Outcome};
 
 use crate::context;
 
+pub const WINE_STUB: u32 = 0x8000_0100;
+
+/// One session's Wine stubs, shared by its processes and read by the debugger.
+#[derive(Default)]
+pub struct StubGaps {
+    pub called: std::collections::BTreeSet<String>,
+    pub last: Option<String>,
+    pub failure: Option<String>,
+}
+
+fn stub(env: &mut Env<'_>, module: &str, function: &str, terminal: bool) {
+    let Some(gaps) = env
+        .ext
+        .try_get::<std::rc::Rc<std::cell::RefCell<StubGaps>>>()
+    else {
+        return;
+    };
+    let name = format!("{}!{function}", module.to_ascii_lowercase());
+    let mut gaps = gaps.borrow_mut();
+    gaps.called.insert(name.clone());
+    gaps.last = Some(name.clone());
+    if terminal {
+        gaps.failure = Some(name);
+    }
+}
+
+/// Stub parameters are untrusted guest string pointers.
+fn stub_name(cpu: &dyn adv_cpu::backend::Guest, address: u32) -> Option<String> {
+    let mut bytes = Vec::new();
+    for offset in 0..160 {
+        let mut byte = [0];
+        cpu.read(address.checked_add(offset)?, &mut byte).ok()?;
+        if byte[0] == 0 {
+            return String::from_utf8(bytes).ok();
+        }
+        if !byte[0].is_ascii_graphic() || matches!(byte[0], b'/' | b'\\' | b'!') {
+            return None;
+        }
+        bytes.push(byte[0]);
+    }
+    None
+}
+
 pub struct Record {
     pub code: u32,
     pub flags: u32,
@@ -192,14 +235,14 @@ pub fn raise(env: &mut Env<'_>, args: &[u32]) -> Outcome {
         count,
         information,
     };
-    if first_chance == 0 {
-        // Nothing handled it; Wine would tell a debugger and end the process.
-        return Outcome::Fail(format!(
-            "unhandled exception {:#010x} at {:#010x}, parameters {:x?}",
-            raised.code,
-            raised.address,
-            &raised.information[..count]
-        ));
+    if raised.code == WINE_STUB
+        && count == 2
+        && let (Some(module), Some(function)) = (
+            stub_name(env.cpu, information[0]),
+            stub_name(env.cpu, information[1]),
+        )
+    {
+        stub(env, &module, &function, first_chance == 0);
     }
     let mut checkpoint = match env.checkpoint() {
         Ok(checkpoint) => checkpoint,
@@ -207,6 +250,18 @@ pub fn raise(env: &mut Env<'_>, args: &[u32]) -> Outcome {
     };
     if let Err(error) = context::decode(&image, &mut checkpoint.state) {
         return Outcome::Fail(format!("NtRaiseException: {error}"));
+    }
+    if first_chance == 0 {
+        // Retain the terminal record for reports; no ordinary exception is captured.
+        let message = format!(
+            "unhandled exception {:#010x} at {:#010x}, parameters {:x?}",
+            raised.code,
+            raised.address,
+            &raised.information[..count]
+        );
+        env.ext.insert(raised);
+        env.ext.insert(checkpoint);
+        return Outcome::Fail(message);
     }
     context::save_debug(env, env.context, &image);
     enter_dispatcher(env, checkpoint, &raised, &[])
@@ -238,13 +293,14 @@ pub fn syscall_stub(env: &mut Env<'_>, _: &[u32]) -> Outcome {
         Err(code) => return Outcome::Return(code),
     };
     checkpoint.state.regs[4] += 4;
+    stub(env, "ntdll", name, false);
     let tail = format!("ntdll\0{name}\0").into_bytes();
     let stack = (checkpoint.state.regs[4] - LAYOUT_SIZE - tail.len() as u32) & !63;
     let mut information = [0; 15];
     information[0] = stack + LAYOUT_SIZE;
     information[1] = stack + LAYOUT_SIZE + 6;
     let record = Record {
-        code: 0x8000_0100,
+        code: WINE_STUB,
         flags: 1,
         nested: 0,
         address: checkpoint.state.eip,

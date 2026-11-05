@@ -362,6 +362,9 @@ fn next(env: &mut Env<'_>, mask: u32) -> Outcome {
         send,
         [input.hwnd, scratch + 28, SEND_HARDWARE_INPUT],
         move |env, _| {
+            if let Some(milestones) = env.ext.try_get::<std::sync::Arc<adv_device::Milestones>>() {
+                milestones.input.get_or_init(|| milestones.elapsed_ms());
+            }
             free_slot(env, scratch);
             next(env, mask)
         },

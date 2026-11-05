@@ -33,6 +33,7 @@ pub struct Session {
 type OnFinished = Box<dyn FnOnce(Result<Finished, String>)>;
 
 struct Driver {
+    options: Arc<Options>,
     #[cfg(mobile)]
     main_loop: RefCell<Option<platform::MainLoop>>,
     #[cfg(target_os = "macos")]
@@ -143,6 +144,8 @@ impl Session {
         let (mut tx, rx) = spsc::channel(1);
         #[cfg(mobile)]
         let view_keys = keys.clone();
+        let options = Arc::new(options);
+        let execution_options = options.clone();
         let execute = move |environment: Option<(
             &mut adv_runtime::wine::session::Host,
             &std::path::Path,
@@ -151,14 +154,20 @@ impl Session {
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match environment {
                     Some((environment, dist)) => crate::wine::run_execution(
                         environment,
-                        &options,
+                        &execution_options,
                         dist,
                         worker,
                         wake,
                         keys,
                         execution_sender,
                     ),
-                    None => crate::run_execution(options, worker, wake, keys, execution_sender),
+                    None => crate::run_execution(
+                        &execution_options,
+                        worker,
+                        wake,
+                        keys,
+                        execution_sender,
+                    ),
                 }))
                 .unwrap_or_else(|_| Err("execution worker panicked".into()));
             let _ = tx.push(result);
@@ -176,6 +185,7 @@ impl Session {
             ),
         };
         let driver = Rc::new(Driver {
+            options,
             #[cfg(mobile)]
             main_loop: RefCell::new(None),
             #[cfg(target_os = "macos")]
@@ -508,6 +518,23 @@ impl Driver {
         false
     }
     fn finish(&self, mut result: Result<Finished, String>) {
+        if let Ok(finished) = &mut result {
+            let display = self
+                .ui
+                .borrow()
+                .as_ref()
+                .and_then(frontend::Ui::report_settings);
+            let fast_forward = if self.view.fast_forward_toggle() {
+                adv_report::FastForward::Toggle
+            } else {
+                adv_report::FastForward::Hold
+            };
+            finished.summary.settings = Some(crate::report_settings(
+                &self.options,
+                display,
+                Some(fast_forward),
+            ));
+        }
         drop(self.ui.borrow_mut().take());
         // Retires guest menus and dialogs unless a nested loop still holds them.
         #[cfg(target_os = "macos")]

@@ -112,6 +112,9 @@ impl GameView {
             });
         }
     }
+    pub(crate) fn fast_forward_toggle(&self) -> bool {
+        self.ivars().borrow().toggle_control
+    }
     pub(crate) fn set_fast_forward_toggle(&self, toggle: bool) {
         let mut input = self.ivars().borrow_mut();
         if input.toggle_control != toggle {

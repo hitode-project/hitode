@@ -594,10 +594,12 @@ struct Trampolines {
 
 /// Binds the bodies of the image `pe`, mapped at `base`.
 pub(crate) fn bind(cpu: &mut dyn Guest, sys: &mut Sys, ext: &mut Ext, base: u32, pe: &adv_pe::Pe) {
-    if !ext
-        .try_get::<Images>()
-        .is_some_and(|images| images.0.contains_key(&base))
-    {
+    if !ext.try_get::<Images>().is_some_and(|images| {
+        images
+            .0
+            .get(&base)
+            .is_some_and(|module| module.is_distribution())
+    }) {
         // A game image: only helpers it links statically are known.
         for section in &pe.sections {
             if section.characteristics & adv_pe::scn::MEM_EXECUTE != 0 {

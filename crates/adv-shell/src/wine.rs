@@ -512,8 +512,12 @@ impl DebugTarget for DebugSession<'_> {
         self.session.contexts_report()
     }
     fn api_gaps_report(&self) -> String {
-        "unavailable on the Wine stack: built-in API gap diagnostics; use Wine debug channels"
-            .into()
+        let gaps = self.session.stub_gaps.borrow();
+        if gaps.called.is_empty() {
+            "no called API gaps".into()
+        } else {
+            gaps.called.iter().cloned().collect::<Vec<_>>().join("\n")
+        }
     }
     fn report(&self) -> String {
         report(self.options, self.session, self.metrics, self.started, None)
@@ -813,6 +817,7 @@ fn drive(
         }
         Ok(())
     })();
+    let ended = session.milestones.elapsed_ms();
     if let Err(error) = result {
         outcome.reason = "guest_failure";
         outcome.failure = Some(error);
@@ -856,20 +861,60 @@ fn drive(
     } else {
         outcome.exit_code.unwrap_or(0) as u8
     };
+    let process = session.failed_process.unwrap_or(session.machine.sys.pid);
+    let mut failure = None;
+    session.debug_processes(|machine| {
+        if machine.sys.pid == process {
+            failure = super::report_machine_failure(
+                machine,
+                outcome.failure.as_deref(),
+                outcome.exit_code,
+                &session.stub_gaps.borrow(),
+                Duration::from_millis(ended),
+            );
+        }
+    });
+    let adapter = session
+        .machine
+        .ext
+        .get::<adv_device::surface::SurfaceStore>()
+        .device()
+        .adapter_identity();
     let summary = adv_report::RunSummary {
-        failure: super::report_failure(
-            outcome.failure.as_deref(),
-            outcome.exit_code,
-            session
-                .machine
-                .sys
-                .latest_cpu_fault
-                .as_ref()
-                .map(super::cpu_fault),
-            started.elapsed(),
-        ),
+        failure,
+        graphics: Some(adv_report::Graphics {
+            api: if adapter.api == "metal" {
+                adv_report::GraphicsApi::Metal
+            } else {
+                adv_report::GraphicsApi::Vulkan
+            },
+            name: adapter.name,
+            vendor: adapter.vendor,
+            device: adapter.device,
+            driver: adapter.driver,
+            tier: adapter.tier.into(),
+        }),
+        settings: worker
+            .is_none()
+            .then(|| super::report_settings(options, None, None)),
+        api_gaps: adv_report::ApiGaps::new(session.stub_gaps.borrow().called.iter().cloned(), []),
         perf: adv_report::Perf::from_samples(metrics.performance.frame_samples()),
-        ..adv_report::RunSummary::default()
+        timeline: Some(adv_report::Timeline {
+            window: session.milestones.window.get().copied(),
+            frame: metrics
+                .performance
+                .run_first_frame
+                .map(|at| at.duration_since(session.milestones.started).as_millis() as u64),
+            audio: session.milestones.audio.get().copied(),
+            video: session.milestones.video.get().copied(),
+            input: session.milestones.input.get().copied(),
+            frames: metrics.performance.run_frames,
+            last_frame: metrics
+                .performance
+                .run_last_frame
+                .map(|at| at.duration_since(session.milestones.started).as_millis() as u64),
+            end: ended,
+        }),
     };
     if let Some(error) = outcome.screenshot_error {
         return Err(error);
@@ -1121,6 +1166,120 @@ mod tests {
     use std::io::{BufRead, BufReader, Write};
 
     use std::process::{Command, Stdio};
+
+    // spec: REPORT-GAP-1, REPORT-FAIL-1, REPORT-TIME-1, REPORT-SITE-1
+    #[test]
+    fn report_wine_stubs_locate_the_failure() {
+        let Some(wine::Wine { dist, probes }) = wine::wine() else {
+            return;
+        };
+        let root = std::env::temp_dir().join(format!("adv-report-stub-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut environment = WineHost::default();
+        for (probe, api) in [
+            ("report_stub.exe", Some("advapi32.dll!CredProfileLoaded")),
+            (
+                "report_syscall_stub.exe",
+                Some("ntdll!NtApphelpCacheControl"),
+            ),
+            ("report_child_fault.exe", None),
+        ] {
+            let exe = probes.join(probe);
+            let mut options = Options::new(exe.clone(), root.join("data"));
+            options.headless = true;
+            options.codepage = Some(1252);
+            options.wine_prefix = Some(root.join("prefix"));
+            options.seconds = Some(20.0);
+            let wake = WakeEvent::new().unwrap();
+            let mut background = adv_sync::background::Builder::new(wake.clone()).unwrap();
+            let sender = background
+                .sender_with_capacity_wake(8, 8, wake.clone())
+                .unwrap();
+            let mut service = background.start().unwrap();
+            let keys = Arc::new(KeyState::default());
+            let host = Host {
+                capture: None,
+                background: sender.into_local(),
+                gpu: None,
+                pacer: None,
+            };
+            let session =
+                start(&mut environment, &options, &dist, wake.clone(), &keys, host).unwrap();
+            let (_, session, summary) =
+                drive(&options, session, None, &keys, &wake, None, Instant::now()).unwrap();
+            service.shutdown();
+            let failure = summary.failure.as_ref().unwrap();
+            if let Some(api) = api {
+                let gaps = summary.api_gaps.as_ref().unwrap();
+                let mut expected = vec!["example.dll!Missing", api];
+                expected.sort_unstable();
+                assert_eq!(gaps.called, expected);
+                assert!(gaps.imported.is_empty());
+                assert_eq!(failure.kind, adv_report::FailureKind::Api);
+                assert_eq!(failure.api.as_deref(), Some(api));
+                let metrics = Metrics::new(super::super::audio::AudioOutput::from_stream(
+                    false,
+                    true,
+                    session.audio_stream(),
+                ));
+                let debug = DebugSession {
+                    session: &session,
+                    options: &options,
+                    metrics: &metrics,
+                    started: Instant::now(),
+                };
+                assert_eq!(debug.api_gaps_report(), gaps.called.join("\n"));
+            } else {
+                assert_ne!(session.failed_process, Some(session.machine.sys.pid));
+                assert_eq!(failure.kind, adv_report::FailureKind::Cpu);
+                assert!(
+                    failure
+                        .cpu_fault
+                        .as_ref()
+                        .unwrap()
+                        .starts_with("exception 0xc000001d at exe+0x"),
+                    "{failure:?}"
+                );
+                assert!(summary.api_gaps.is_none());
+            }
+            assert_eq!(summary.timeline.as_ref().unwrap().frames, 0);
+            let settings = summary.settings.as_ref().unwrap();
+            assert_eq!(
+                (settings.upscaler, settings.scaling, settings.fast_forward),
+                (None, None, None)
+            );
+            let report = adv_report::Report {
+                schema: adv_report::SCHEMA.into(),
+                dedupe_key: adv_report::dedupe_key(
+                    &[1; 32],
+                    &adv_report::Game::identify(&exe, 1252).unwrap().exe_sha256,
+                ),
+                app: adv_report::App {
+                    version: env!("CARGO_PKG_VERSION").into(),
+                    build: env!("ADV_SHELL_BUILD").into(),
+                    channel: "test".into(),
+                },
+                platform: adv_report::Platform::current(
+                    summary.graphics.clone().unwrap(),
+                    summary.settings.clone().unwrap(),
+                ),
+                game: adv_report::Game::identify(&exe, 1252).unwrap(),
+                title: None,
+                outcome: adv_report::Outcome::Failed,
+                issues: vec![adv_report::Issue::Crash],
+                perf_issues: None,
+                note: None,
+                failure: summary.failure,
+                perf: summary.perf,
+                api_gaps: summary.api_gaps,
+                timeline: summary.timeline,
+            };
+            let json = adv_report::to_json(&report).unwrap();
+            println!("{json}");
+        }
+        drop(environment);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     // spec: WINE-UI-5, WINE-SES-7
     #[test]
@@ -1384,7 +1543,7 @@ mod tests {
             assert!(debug_command(&format!("mem 0x{address} 4")).contains("19 28 37 46"));
             assert!(debug_command(&format!("dis 0x{address} 1")).contains("pid 0x"));
             assert!(debug_command("calls 8").contains("NT/Unix"));
-            assert!(debug_command("gaps").contains("unavailable on the Wine stack"));
+            assert!(debug_command("gaps").contains("no called API gaps"));
             debug_command("slow reset");
             debug_command("slow");
             assert!(debug_command("report").contains("scene_gate"));

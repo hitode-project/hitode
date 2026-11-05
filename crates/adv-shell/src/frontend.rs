@@ -257,6 +257,12 @@ impl Ui {
     }
 
     #[cfg(host_view)]
+    pub(crate) fn report_settings(&self) -> Option<(adv_report::Upscaler, adv_report::Scaling)> {
+        self.native
+            .as_ref()
+            .map(crate::display::Ui::report_settings)
+    }
+    #[cfg(host_view)]
     pub(crate) fn set_scaling(&mut self, value: crate::Scaling) {
         if let Some(native) = &mut self.native {
             native.set_scaling(value);

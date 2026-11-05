@@ -1264,6 +1264,11 @@ pub(super) fn shown(env: &mut Env<'_>, hwnd: u32) -> Outcome {
         vec![("GetWindowLongW", vec![hwnd, GWL_STYLE])],
         move |env, results| {
             if results[0] & WS_CHILD == 0 {
+                if let Some(milestones) =
+                    env.ext.try_get::<std::sync::Arc<adv_device::Milestones>>()
+                {
+                    milestones.window.get_or_init(|| milestones.elapsed_ms());
+                }
                 read(env, env.context, Box::new(|_| Outcome::Return(0)))
             } else {
                 Outcome::Return(0)

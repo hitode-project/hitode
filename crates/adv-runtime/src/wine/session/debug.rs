@@ -126,7 +126,8 @@ impl Session {
         text
     }
 
-    fn debug_processes(&self, mut visit: impl FnMut(&Machine<Cpu>)) {
+    /// Visit the foreground and parked processes without changing execution state.
+    pub fn debug_processes(&self, mut visit: impl FnMut(&Machine<Cpu>)) {
         visit(&self.machine);
         for machine in self.shared.driver.borrow().parked.values() {
             visit(machine);

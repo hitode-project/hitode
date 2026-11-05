@@ -38,6 +38,7 @@ body:
     attributes:
       label: Symptom / 现象
       multiple: true
+      # Report Issue enum order and labels are checked by report.test.ts.
       options:
         - Does not start / 无法启动
         - Freezes / 卡死（画面不动、没有响应）
@@ -62,5 +63,5 @@ body:
     id: report
     attributes:
       label: Report / 报告
-      description: Optional. Paste the anonymous report the launcher saved.
+      description: Report JSON from the launcher, or attach its saved file.
       render: json

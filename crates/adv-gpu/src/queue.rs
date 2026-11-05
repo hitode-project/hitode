@@ -31,10 +31,24 @@ pub struct Device {
     pub(crate) inner: crate::imp::Device,
 }
 
+/// Adapter identifiers contain model and driver data, never a registry ID or serial.
+#[derive(Clone, Debug)]
+pub struct AdapterIdentity {
+    pub api: &'static str,
+    pub name: String,
+    pub vendor: String,
+    pub device: String,
+    pub driver: String,
+    pub tier: &'static str,
+}
+
 impl Device {
     /// Open the platform's device and its queue.
     pub fn open(options: &DeviceOptions) -> Result<(Device, Queue)> {
         imp::Device::open(options)
+    }
+    pub fn adapter_identity(&self) -> AdapterIdentity {
+        self.inner.adapter_identity()
     }
     pub fn caps(&self) -> &Caps {
         self.inner.caps()

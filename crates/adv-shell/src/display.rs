@@ -82,6 +82,24 @@ pub struct Ui {
     caps: plan::CompositorCaps,
 }
 impl Ui {
+    pub(crate) fn report_settings(&self) -> (adv_report::Upscaler, adv_report::Scaling) {
+        let mailbox = self.shared.settings.lock().unwrap();
+        let upscaler = match mailbox.settings.upscaler {
+            Upscaler::Off => adv_report::Upscaler::Off,
+            Upscaler::Anime4k => adv_report::Upscaler::Anime4k,
+            Upscaler::Cunny => adv_report::Upscaler::Cunny,
+            Upscaler::Artcnn => adv_report::Upscaler::Artcnn,
+            Upscaler::K7 => adv_report::Upscaler::K7,
+            _ => unreachable!(),
+        };
+        let scaling = match mailbox.settings.placement {
+            crate::Scaling::Fit => adv_report::Scaling::Fit,
+            crate::Scaling::Integer => adv_report::Scaling::Integer,
+            crate::Scaling::Stretch => adv_report::Scaling::Stretch,
+        };
+        (upscaler, scaling)
+    }
+
     pub fn set_upscaler(&mut self, value: Upscaler) {
         let mut m = self.shared.settings.lock().unwrap();
         if m.settings.upscaler != value {
@@ -628,6 +646,19 @@ mod tests {
             caps: platform_caps(None),
         }
     }
+    // spec: REPORT-PLAT-1
+    #[test]
+    fn report_reads_the_live_display_settings() {
+        let shared = shared();
+        let mut ui = ui(shared);
+        ui.set_upscaler(Upscaler::Cunny);
+        ui.set_scaling(crate::Scaling::Stretch);
+        assert_eq!(
+            ui.report_settings(),
+            (adv_report::Upscaler::Cunny, adv_report::Scaling::Stretch)
+        );
+    }
+
     // spec: HOST-VIEW-1
     #[test]
     fn settings_mailbox_reads_the_latest_complete_settings_and_retains_the_filter() {

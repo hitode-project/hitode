@@ -1,6 +1,6 @@
 [package]
 name = "adv-report"
-description = "The anonymous compatibility report (hitode.report/1) and the run summary it is built from"
+description = "The anonymous compatibility report (hitode.report/2) and the run summary it is built from"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,6 +8,8 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+adv-pe = { path = "../adv-pe" }
+libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

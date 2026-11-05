@@ -496,6 +496,9 @@ impl GameView {
         self.physical_keys.borrow_mut().clear();
         self.keys.borrow().release_all();
     }
+    pub(crate) fn fast_forward_toggle(&self) -> bool {
+        self.toggle_control.get()
+    }
     pub(crate) fn set_fast_forward_toggle(&self, toggle: bool) {
         if self.toggle_control.replace(toggle) != toggle {
             self.clear_control_latch();

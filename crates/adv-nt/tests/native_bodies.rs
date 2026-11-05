@@ -122,6 +122,27 @@ fn call(machine: &mut Machine<Cpu>, data: &[u8], args: [u32; 3]) -> Result<Vec<u
     Ok(words)
 }
 
+// spec: NAT-BODY-1
+#[test]
+fn report_non_distribution_image_does_not_bind_distribution_bodies() {
+    let Some(dist) = wine::dist() else {
+        return;
+    };
+    let dll = dist.join("lib/wine/i386-windows/ntdll.dll");
+    let image = std::fs::read(&dll).unwrap();
+    let native = machine(&dll, &image, "memcpy");
+    let game = machine(Path::new("game/ntdll.dll"), &image, "memcpy");
+    let entry = native.cpu.read_u32(SLOT).unwrap();
+    assert!(native.sys.redirects.contains_key(&entry));
+    assert!(!game.sys.redirects.contains_key(&entry));
+    assert_eq!(
+        game.ext.get::<adv_nt::identity::Images>().0[&Pe::parse(&image).unwrap().image_base]
+            .path
+            .as_deref(),
+        Some(Path::new("game/ntdll.dll"))
+    );
+}
+
 // spec: NAT-BODY-1, A64-CALL-4, A64-CALL-5
 #[test]
 fn ntdll_memcpy_matches_wine() {

@@ -16,8 +16,8 @@ import sys
 RULES: dict[str, set[str]] = {
     "adv-sync": set(),
     "adv-pe": set(),
-    # The anonymous compatibility report format; no runtime knowledge.
-    "adv-report": set(),
+    # Reports read executable headers through adv-pe; no runtime knowledge.
+    "adv-report": {"adv-pe"},
     # Engine-neutral core; each engine builds on it; the facade picks one.
     "adv-cpu-core": {"adv-sync"},
     "adv-cpu-a64": {"adv-cpu-core"},
