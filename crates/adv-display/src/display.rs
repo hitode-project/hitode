@@ -87,6 +87,7 @@ impl Video {
     }
 }
 pub struct Frame {
+    pub records: Vec<upscale::DrawRecord>,
     pub info: FrameInfo,
     pub base: Base,
     pub video: Vec<Video>,
@@ -189,7 +190,9 @@ impl Upscaled {
             format: upscale::OUTPUT,
             mips: 1,
             samples: 1,
-            usage: adv_gpu::resource::Usage::STORAGE | adv_gpu::resource::Usage::SAMPLED,
+            usage: adv_gpu::resource::Usage::STORAGE
+                | adv_gpu::resource::Usage::SAMPLED
+                | adv_gpu::resource::Usage::COPY_SRC,
             view_formats: &[],
             label: "upscaled",
         })?;
@@ -485,6 +488,7 @@ impl Display {
         info.base = BaseKind::Gpu { presentable: false };
         info.damage = Region::whole(info.canvas);
         Some(Frame {
+            records: Vec::new(),
             info,
             base: Base::Retained {
                 image: image.image().clone(),
@@ -1305,8 +1309,33 @@ impl Display {
                         ..
                     }
             );
-            let exact = matches!(frame.info.base, BaseKind::Software { .. })
+            let software = matches!(frame.info.base, BaseKind::Software { .. })
                 && matches!(stage, Stage::Upscale { video: false, .. });
+            let damage = software.then(|| {
+                frame
+                    .info
+                    .damage
+                    .rects()
+                    .into_iter()
+                    .map(Into::into)
+                    .collect::<Vec<_>>()
+            });
+            let input = if software {
+                if self
+                    .upscaled
+                    .as_ref()
+                    .unwrap()
+                    .upscaling
+                    .broad(damage.as_deref())
+                {
+                    upscale::Input::Software
+                } else {
+                    upscale::Input::Exact
+                }
+            } else {
+                upscale::Input::Composed
+            };
+            let exact = input == upscale::Input::Exact;
             let destination = match stage {
                 Stage::Upscale { .. } => self
                     .upscaled
@@ -1398,21 +1427,12 @@ impl Display {
                 // stage. Pixels bound the last model pass's recomputed work; none
                 // means no compute pass ran, nor wrote its timestamps.
                 let u = self.upscaled.as_ref().unwrap();
-                let damage = exact.then(|| {
-                    frame
-                        .info
-                        .damage
-                        .rects()
-                        .into_iter()
-                        .map(Into::into)
-                        .collect::<Vec<_>>()
-                });
                 let upscaled = u.upscaling.encode(
-                    encoder.as_mut().unwrap(),
-                    &mut self.ring,
+                    (encoder.as_mut().unwrap(), &mut self.ring),
                     u.output.view(),
                     Some(damage.as_deref().unwrap_or(&tiles.rects)),
-                    exact,
+                    input,
+                    &frame.records,
                     self.queries.as_ref().map(|q| (q, statistics.passes * 2)),
                 )?;
                 statistics.stages[index].pixels = upscaled;

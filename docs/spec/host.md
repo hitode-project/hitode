@@ -125,9 +125,13 @@ The executor MUST use one render pass per target, including every composed video
 
 Producer damage S covers every changed pixel in 8×8 input cells. Conservative damage composes into scratch; comparison against the persistent input updates changed pixels and marks their cells in GPU bitmap Δ. Exact software damage without composed video writes the input directly and seeds Δ from S. The input therefore equals the last encoded composition, including when pacing merges publications. Rebuilds initialize the whole input and Δ; unknown damage and composed video use whole-frame S, then comparison refines it on subsequent encodes.
 
-CPU lists retain the backwards dependency closure of S. Each GPU filter retains listed cells whose rectangles, grown by accumulated reach to the output, meet Δ. The bound includes later workgroup rounding and the largest tensor branch, preserving the dependency closure even for conservatively retained cells. Each CPU-list slice compacts independently and supplies at most 65535 workgroups through indirect arguments. Empty Δ launches no filter or model workgroups; empty S encodes nothing. Scratch, Δ, compacted lists and indirect buffers persist with the upscaler. Reported pixel counts remain the last CPU list's upper bound.
+CPU lists retain the backwards dependency closure of S. Without reconstruction, each GPU filter retains listed cells whose rectangles, grown by accumulated reach to the output, meet Δ. The bound includes later workgroup rounding and the largest tensor branch, preserving the dependency closure even for conservatively retained cells. Each CPU-list slice compacts independently and supplies at most 65535 workgroups through indirect arguments. Empty Δ launches no filter or model workgroups; empty S encodes nothing. Scratch, Δ, compacted lists and indirect buffers persist with the upscaler. Reported pixel counts remain the last CPU list's upper bound.
+
+GPU bitmaps track each pass's valid tensor cells and required writes, and the output's exact cells. Filters run backwards before model passes run forwards; shared tensor lifetimes are invalid for dependency selection. Required output cells exclude reconstructed cells; earlier requirements grow through each reader's radius and include affected or invalid cells. Skipped affected cells become invalid, computed cells become valid, and overlapping writers invalidate shared tensor storage. With no reconstruction, filters retain the same cells and dispatch counts as damage-only execution.
 
 A 3×3 convolution reaches one input pixel. A linear tensor sample reaches one texel, including samples aimed at texel centers; other pointwise operations have no reach. Reach follows the tensors each pass reads, so passes of one layer count once; the final layer's bilinear sample of the input reaches one pixel beside that chain. Fused passes retain the sum of their layer radii. Intermediate textures are shared between tensors, so the last pass covers the full reach. Each earlier pass covers what later readers of its tensors need, workgroup-rounded, plus its radius.
+
+Integer translations preserve interior output bits in the checked Metal forms of all four models and Vulkan forms of k7. Vulkan Anime4K, CuNNy and ArtCNN fail translation checks, so their references retain the canvas dimensions and zero offset.
 
 | Frame source | Damage since the last upscaled frame |
 |---|---|
@@ -150,6 +154,17 @@ Each planner pool MUST use indexed leases from one presentable pool in the backe
 `damage on|off` applies at the next presented frame without changing guest execution. Pink marks presented-record damage, including merged publications and whole-frame invalidation, united with changed video rectangles; green marks GPU input delta; blue marks the last upscale pass's compacted output cells. Diagonal stripes distinguish overlapping marks over light and dark content. GPU histories age once per presented frame, mapping through placement, scaling and rotation; input and output marks appear only when the frame uses upscaling. No GPU damage data is read back.
 
 A transparent host layer places the tints above the normal picture and video layers. Base and video layers, retained images, damage, buffer reuse, captures, redraws and content counters keep their ordinary path. Diagnostic resources are allocated on first use and discarded when disabled; outstanding host-image leases remain valid until release.
+
+### HOST-VIEW-13 Verified reconstruction
+
+**Rule**: An output cell MAY copy the previous output at twice an offset only when its whole field matches the previous input at that offset. The field MUST stay clear of canvas borders the offset crosses, and its source cells MUST be exact. Candidates MUST cost work, never pixels.
+**Verification**: Test
+
+Candidates come from draw-record phase changes and one global canvas offset. The delta kernel gives each changed cell a digest and compares at most four offsets pixel by pixel, all inside Δ. Each filter erodes the per-cell matches by ⌈reach/8⌉ cells, so every pixel of the field verified. Along a border the offset runs parallel to, clamped samples move with the content, so the border is allowed there. A reconstructed cell is exact, its tensors become invalid, and overlapping copies go through scratch.
+
+Global motion projects rows and columns of the new and previous input and correlates them on the GPU, without readback. Broad exact software damage runs it in the same frame. Conservative damage runs it only after a frame whose unexplained Δ exceeded one eighth of the canvas cells. A still frame with whole-layer redraws therefore issues the same dispatches as before. The first frame of a shake therefore pays one ordinary model run. Small exact software damage keeps the direct input path and only refreshes cell digests.
+
+A cell whose field holds one colour takes that colour's output from a 4096-entry table, filled by one model cell per new colour. Canvases whose verification state exceeds Vulkan's guaranteed 128 MiB storage range, about 3200×1800, are not upscaled.
 
 ### HOST-SES-1 Embedding
 

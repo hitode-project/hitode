@@ -17,16 +17,22 @@ fn main() {
         fs::read_to_string(path).unwrap()
     };
     let software = read("software");
+    let reference = read("upscale_reference");
     for (name, wgsl, bindings) in [
         ("damage", read("damage"), bindings::DAMAGE.to_vec()),
         (
+            "upscale_motion",
+            read("upscale_motion"),
+            bindings::UPSCALE_MOTION.to_vec(),
+        ),
+        (
             "upscale_delta",
-            read("upscale_delta"),
+            reference.clone() + &read("upscale_delta"),
             bindings::UPSCALE_DELTA.to_vec(),
         ),
         (
             "upscale_filter",
-            read("upscale_filter"),
+            reference + &read("upscale_filter"),
             bindings::UPSCALE_FILTER.to_vec(),
         ),
         (
@@ -85,6 +91,12 @@ fn main() {
 /// Precompile each upscale shader once per precision, keyed by its path. The
 /// table `upscale.rs` lists them for `stages::upscale`.
 fn upscale(out: &std::path::Path) {
+    let reference_path = "src/stages/upscale_reference.wgsl";
+    let publish_path = "src/stages/upscale_publish.wgsl";
+    println!("cargo:rerun-if-changed={reference_path}");
+    println!("cargo:rerun-if-changed={publish_path}");
+    let publish =
+        fs::read_to_string(reference_path).unwrap() + &fs::read_to_string(publish_path).unwrap();
     let mut done: Vec<(&str, Vec<adv_gpu::pipeline::Binding>)> = vec![];
     let mut table = String::from("&[\n");
     for model in models::REFERENCE
@@ -101,6 +113,15 @@ fn upscale(out: &std::path::Path) {
             let path = format!("src/stages/upscale/{}", pass.shader);
             println!("cargo:rerun-if-changed={path}");
             let source = fs::read_to_string(&path).unwrap();
+            let source = if pass
+                .bindings
+                .iter()
+                .any(|(_, role)| *role == table::Role::Output)
+            {
+                source.replace("textureStore((OUTPUT_0),", "publish(") + &publish
+            } else {
+                source
+            };
             let mut forms = vec![];
             for (half, wgsl) in [(true, source.clone()), (false, widen(&source))] {
                 if half && !source.contains("enable f16;") {

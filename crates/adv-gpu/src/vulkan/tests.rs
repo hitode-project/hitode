@@ -1613,3 +1613,70 @@ fn retired_submissions_reuse_one_command_pool_and_its_buffers() {
     assert_eq!(state.pools.len(), 1);
     assert!(state.pools[0].buffers.len() <= 4);
 }
+
+// spec: HOST-VIEW-10
+#[test]
+fn precompiled_workgroup_atomic_arrays_start_zero_after_round_trip() {
+    let (device, mut queue) = gpu!(Modern::empty());
+    let bindings = vec![Binding {
+        slot: 0,
+        kind: BindingKind::StorageBuffer { writable: true },
+        stages: Stages::COMPUTE,
+    }];
+    let compiled = crate::shader::precompile(
+        "var<workgroup> values: array<atomic<u32>, 4>;
+         @group(3) @binding(0) var<storage, read_write> output: array<u32>;
+         @compute @workgroup_size(4)
+         fn main(@builtin(local_invocation_index) lane: u32, @builtin(workgroup_id) group: vec3<u32>) {
+             output[group.x * 4u + lane] = atomicLoad(&values[lane]);
+             workgroupBarrier();
+             atomicStore(&values[lane], 0xffffffffu);
+         }",
+        &bindings,
+    ).unwrap();
+    let shader = device
+        .create_shader(ShaderDesc {
+            source: Source::Precompiled {
+                spirv: &compiled.spirv,
+                metal: &[],
+                entries: &[],
+            },
+            identity: compiled.identity,
+            label: "workgroup initialization",
+        })
+        .unwrap();
+    let pipeline = device
+        .create_compute_pipeline(
+            &ComputePipelineDesc {
+                entry: shader.entry("main", Stage::Compute).unwrap(),
+                bindings,
+                label: "workgroup initialization",
+            },
+            None,
+        )
+        .unwrap();
+    let output = device
+        .create_buffer(&BufferDesc {
+            size: 256,
+            usage: BufferUsage::STORAGE | BufferUsage::COPY_SRC,
+            memory: Memory::Device,
+            label: "workgroup initialization output",
+        })
+        .unwrap();
+    let result = readback(&device, 256);
+    for _ in 0..2 {
+        let mut encoder = queue.encoder("workgroup initialization");
+        {
+            let mut pass = encoder.compute_pass(&ComputePassDesc {
+                timestamps: None,
+                label: "workgroup initialization",
+            });
+            pass.set_pipeline(&pipeline);
+            pass.bind(0, Bind::StorageBuffer(output.slice(0..256)));
+            pass.dispatch(16, 1, 1);
+        }
+        encoder.copy_buffer(output.slice(0..256), &result, 0);
+        finish(&mut queue, encoder);
+        assert!(bytes(&result).iter().all(|&byte| byte == 0));
+    }
+}

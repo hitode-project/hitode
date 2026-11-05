@@ -17,6 +17,7 @@ const MAX_READBACKS: usize = 8;
 const CONSTANT_SIZE: usize = std::mem::size_of::<gpu::ConstantBlock>();
 
 pub(super) struct Recording {
+    records: Arc<[crate::frame::DrawRecord]>,
     target: Option<(ImageId, Option<Depth>)>,
     white: Image,
     samplers: HashMap<gpu::Sampler, adv_gpu::Sampler>,
@@ -54,6 +55,7 @@ impl Recording {
             },
         });
         Ok(Self {
+            records: Arc::from([]),
             target: None,
             white,
             samplers: HashMap::new(),
@@ -728,6 +730,10 @@ impl Gpu {
         self.stats.image_copy_bytes += u64::from(rectangle.w) * u64::from(rectangle.h) * 4;
         self.check()
     }
+    /// Proposals attached to the next publication on this facade.
+    pub fn draw_records(&mut self, records: Arc<[crate::frame::DrawRecord]>) {
+        self.recording.records = records;
+    }
     pub fn present(
         &mut self,
         image: &Image,
@@ -738,6 +744,7 @@ impl Gpu {
         #[cfg(feature = "test-support")]
         self.stream.0.borrow().admit()?;
         self.stream.push(Command::PresentSwap {
+            records: std::mem::replace(&mut self.recording.records, Arc::from([])),
             image: image.clone(),
             damage,
             serial,

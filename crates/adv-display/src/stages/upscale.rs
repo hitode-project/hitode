@@ -9,6 +9,26 @@ pub use table::{Model, OUTPUT, Pass, Role};
 /// The format of the model's input, which composition writes.
 pub const INPUT: Format = Format::Rgba16Float;
 
+/// How composition populated the model input.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Input {
+    /// Exact damage written directly into persistent input.
+    Exact,
+    /// Exact software damage compared through scratch for global motion.
+    Software,
+    /// Conservative composed damage compared through scratch.
+    Composed,
+}
+
+/// A producer proposal in canvas coordinates; pixels establish every match.
+#[derive(Clone, Debug)]
+pub struct DrawRecord {
+    pub target: Rect,
+    pub content: u128,
+    pub phase: [i32; 2],
+    pub motion: Option<[i32; 2]>,
+}
+
 /// One precision of a precompiled upscale shader.
 struct Compiled {
     spirv: &'static [u32],
@@ -35,11 +55,18 @@ use adv_gpu::{
     Buffer, ComputePipeline, Device, Encoder, Extent, Features, Format, Image, ImageView, Ring,
     Sampler,
 };
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 
 /// Workgroups per dispatch, below the portable 65535 per dimension. Larger
 /// lists split into dispatches over aligned slices.
 const DISPATCH: u32 = 65535;
+const COLOURS: u64 = 4096;
+const COLOUR_LEADERS: u64 = 32 + COLOURS * 16;
+const VERIFIED_CELLS: u64 = COLOUR_LEADERS + COLOURS * 16;
+const VERIFIED_STRIDE: u64 = 1120;
+/// Vulkan's guaranteed storage binding range; canvases up to about 3200×1800 fit.
+const STORAGE_RANGE: u64 = 1 << 27;
 
 /// The selected model's tables, in `Upscaler` order.
 fn index(choice: Upscaler) -> usize {
@@ -70,6 +97,13 @@ pub fn reach(choice: Upscaler) -> u32 {
 }
 
 impl Model {
+    /// Whether nonzero integer translations preserve this kernel's output bits.
+    /// Vulkan normalized linear samples fail the translation checks for the
+    /// first three models; their references keep the canvas size and position.
+    pub fn translations(&self) -> bool {
+        cfg!(target_vendor = "apple") || self.passes[0].shader.starts_with("k7_")
+    }
+
     /// Input-pixel radius bounding a change in the output. Reach follows the data:
     /// a pass's outputs reach its radius beyond the farthest input it reads,
     /// so passes of one layer add theirs once. The final layer's bilinear
@@ -154,12 +188,26 @@ pub struct Upscaling {
     /// The last encoded composition, in half precision.
     input: Image,
     scratch: Image,
+    previous_input: Image,
+    constant_output: Image,
+    verification: Buffer,
+    phases: RefCell<HashMap<u128, [i32; 2]>>,
+    epoch: Cell<u32>,
+    motion: Buffer,
+    motion_arguments: Buffer,
+    project: ComputePipeline,
+    correlate: ComputePipeline,
+    choose_motion: ComputePipeline,
     initialized: Cell<bool>,
     delta: Buffer,
     delta_dimensions: Buffer,
     compare: ComputePipeline,
     initialize: ComputePipeline,
     filter: ComputePipeline,
+    /// Reconstruction, output exactness, then per-pass validity and requirements.
+    state: Buffer,
+    metadata: Buffer,
+    required_start: u64,
     /// Filter and model indirect records, one per CPU-list slice.
     gates: Buffer,
     arguments: Buffer,
@@ -236,6 +284,12 @@ impl Upscaling {
                 "upscaled canvas exceeds the image limit".into(),
             ));
         }
+        let cells = u64::from(size.0.div_ceil(8) * size.1.div_ceil(8));
+        if VERIFIED_CELLS + cells * VERIFIED_STRIDE > STORAGE_RANGE {
+            return Err(adv_gpu::Error::Invalid(
+                "upscaled canvas exceeds the verification binding".into(),
+            ));
+        }
         let image = |format, usage, label| {
             device.create_image(&ImageDesc {
                 dimension: Dimension::D2,
@@ -261,6 +315,11 @@ impl Upscaling {
             INPUT,
             Usage::SAMPLED | Usage::COLOR | Usage::COPY_DST,
             "upscale scratch",
+        )?;
+        let previous_input = image(
+            INPUT,
+            Usage::SAMPLED | Usage::STORAGE,
+            "upscale previous input",
         )?;
         let tensors = model
             .tensors
@@ -308,10 +367,37 @@ impl Upscaling {
         let argument_stride = u64::from(align * 4).max(16);
         let reaches = model.filter_reaches();
         let mut argument_bytes = 0;
+        let source_words = size.0.div_ceil(8).div_ceil(32) * size.1.div_ceil(8);
+        let exact_start = 1 + source_words;
+        let last_unit = model.passes.last().unwrap().unit();
+        let valid_start =
+            exact_start + size.0.div_ceil(last_unit).div_ceil(32) * size.1.div_ceil(last_unit);
+        let mut bitmap_words = 0;
+        let mut descriptors = Vec::new();
+        let mut writers = vec![None; model.tensors.len()];
+        let mut consumers = vec![0u32; model.passes.len()];
+        let mut affected = vec![0; model.tensors.len()];
+        for (i, pass) in model.passes.iter().enumerate() {
+            for t in pass.reads() {
+                if let Some(writer) = writers[t] {
+                    consumers[writer] |= 1 << i;
+                }
+            }
+            let reach = pass.reads().map(|t| affected[t]).max().unwrap_or(0) + pass.radius;
+            descriptors.push((bitmap_words, reach));
+            bitmap_words +=
+                size.0.div_ceil(pass.unit()).div_ceil(32) * size.1.div_ceil(pass.unit());
+            for t in pass.writes().flatten() {
+                writers[t] = Some(i);
+                affected[t] = reach;
+            }
+        }
+        let required_start = valid_start + bitmap_words;
+        let mut metadata_words = Vec::new();
         let mut grids = Vec::new();
         let mut shapes: Vec<(u32, u32)> = Vec::new();
         let mut whole = Vec::new();
-        for (pass, reach) in model.passes.iter().zip(reaches) {
+        for (i, (pass, reach)) in model.passes.iter().zip(reaches).enumerate() {
             let shape = (size.0.div_ceil(pass.unit()), size.1.div_ceil(pass.unit()));
             let index = match shapes.iter().position(|&s| s == shape) {
                 Some(index) => index,
@@ -329,6 +415,32 @@ impl Upscaling {
                 }
             };
             let count = shape.0 * shape.1;
+            let aliases = model
+                .passes
+                .iter()
+                .enumerate()
+                .fold(0u32, |mask, (j, other)| {
+                    if i != j
+                        && pass
+                            .writes()
+                            .flatten()
+                            .any(|t| other.writes().any(|u| u == Some(t)))
+                    {
+                        mask | 1 << j
+                    } else {
+                        mask
+                    }
+                });
+            metadata_words.extend([
+                shape.0,
+                shape.1,
+                pass.unit(),
+                descriptors[i].0,
+                descriptors[i].1,
+                pass.radius,
+                consumers[i],
+                aliases,
+            ]);
             grids.push(Grid {
                 columns: shape.0,
                 rows: shape.1,
@@ -340,7 +452,20 @@ impl Upscaling {
                     label: "upscale compacted cells",
                 })?,
                 parameters: upload(
-                    &words([size.0, size.1, pass.unit(), reach]),
+                    &words([
+                        size.0,
+                        size.1,
+                        pass.unit(),
+                        reach,
+                        i as u32,
+                        model.passes.len() as u32,
+                        exact_start,
+                        valid_start,
+                        required_start,
+                        argument_stride as u32 / 4,
+                        (size.0.div_ceil(8) * size.1.div_ceil(8)).div_ceil(8),
+                        0,
+                    ]),
                     BufferUsage::UNIFORM,
                     "upscale filter parameters",
                 )?,
@@ -380,6 +505,10 @@ impl Upscaling {
                 size.1,
                 argument_bytes as u32 / 4,
                 argument_stride as u32 / 4,
+                model.reach(),
+                u32::from(model.translations()),
+                last_unit,
+                0,
             ]),
             BufferUsage::UNIFORM,
             "upscale delta dimensions",
@@ -399,6 +528,25 @@ impl Upscaling {
                     entry: delta_shader.entry(entry, Stage::Compute)?,
                     bindings: super::bindings::UPSCALE_DELTA.to_vec(),
                     label: "upscale delta",
+                },
+                None,
+            )
+        };
+        let motion_shader = device.create_shader(ShaderDesc {
+            source: Source::Precompiled {
+                spirv: &include!(concat!(env!("OUT_DIR"), "/upscale_motion.spv.rs")),
+                metal: include_bytes!(concat!(env!("OUT_DIR"), "/upscale_motion.msl")),
+                entries: &include!(concat!(env!("OUT_DIR"), "/upscale_motion.entries.rs")),
+            },
+            identity: include!(concat!(env!("OUT_DIR"), "/upscale_motion.identity.rs")),
+            label: "upscale motion",
+        })?;
+        let motion_pipeline = |entry| {
+            device.create_compute_pipeline(
+                &ComputePipelineDesc {
+                    entry: motion_shader.entry(entry, Stage::Compute)?,
+                    bindings: super::bindings::UPSCALE_MOTION.to_vec(),
+                    label: "upscale motion",
                 },
                 None,
             )
@@ -423,12 +571,61 @@ impl Upscaling {
         Ok(Self {
             model,
             scratch,
+            previous_input,
+            constant_output: device.create_image(&ImageDesc {
+                dimension: Dimension::D2,
+                size: Extent {
+                    width: 128,
+                    height: 128,
+                    depth_or_layers: 1,
+                },
+                format: OUTPUT,
+                mips: 1,
+                samples: 1,
+                usage: Usage::SAMPLED | Usage::STORAGE,
+                view_formats: &[],
+                label: "upscale constant colours",
+            })?,
+            verification: buffer(
+                VERIFIED_CELLS + u64::from(source_shape.0 * source_shape.1) * VERIFIED_STRIDE,
+                BufferUsage::STORAGE | BufferUsage::COPY_SRC | BufferUsage::COPY_DST,
+                "upscale candidate verification",
+            )?,
+            phases: RefCell::new(HashMap::new()),
+            epoch: Cell::new(0),
+            motion: buffer(
+                u64::from(source_words + (size.0 + size.1) * 4) * 4,
+                BufferUsage::STORAGE | BufferUsage::COPY_DST,
+                "upscale motion profiles",
+            )?,
+            motion_arguments: buffer(
+                argument_stride * 8,
+                BufferUsage::STORAGE
+                    | BufferUsage::INDIRECT
+                    | BufferUsage::COPY_DST
+                    | BufferUsage::COPY_SRC,
+                "upscale motion arguments",
+            )?,
+            project: motion_pipeline("project")?,
+            correlate: motion_pipeline("correlate")?,
+            choose_motion: motion_pipeline("choose")?,
             initialized: Cell::new(false),
             delta,
             delta_dimensions,
             compare: delta_pipeline("compare")?,
             initialize: delta_pipeline("initialize")?,
             filter,
+            state: buffer(
+                u64::from(required_start + bitmap_words) * 4,
+                BufferUsage::STORAGE | BufferUsage::COPY_SRC | BufferUsage::COPY_DST,
+                "upscale validity and requirements",
+            )?,
+            metadata: upload(
+                &words(metadata_words),
+                BufferUsage::STORAGE,
+                "upscale pass graph",
+            )?,
+            required_start: u64::from(required_start) * 4,
             gates: buffer(
                 argument_bytes,
                 BufferUsage::STORAGE
@@ -460,6 +657,17 @@ impl Upscaling {
         })
     }
 
+    /// Broad damage can pay for projection with the saved model interior.
+    pub fn broad(&self, damage: Option<&[Rect]>) -> bool {
+        damage.is_none_or(|rects| {
+            let cells: u32 = rects
+                .iter()
+                .map(|r| r.w.div_ceil(8) * r.h.div_ceil(8))
+                .sum();
+            cells >= (self.size.0.div_ceil(8) * self.size.1.div_ceil(8)).div_ceil(8)
+        })
+    }
+
     pub fn size(&self) -> (u32, u32) {
         self.size
     }
@@ -479,13 +687,17 @@ impl Upscaling {
     /// input pixels. `Busy` leaves the encoder untouched.
     pub fn encode(
         &self,
-        encoder: &mut Encoder,
-        ring: &mut Ring,
+        gpu: (&mut Encoder, &mut Ring),
         output: &ImageView,
         damage: Option<&[Rect]>,
-        exact: bool,
+        input: Input,
+        records: &[DrawRecord],
         timestamps: Option<(&adv_gpu::queue::QuerySet, u32)>,
     ) -> adv_gpu::Result<u64> {
+        let (encoder, ring) = gpu;
+        let exact = input == Input::Exact;
+        let global =
+            !exact && self.initialized.get() && self.model.translations() && self.broad(damage);
         let passes = self.model.passes;
         let lists = match damage {
             Some(damage) => self.cells(damage),
@@ -518,11 +730,31 @@ impl Upscaling {
                 )
             })
         };
+        let phases = self.phases.borrow();
+        let proposals: Vec<_> = records
+            .iter()
+            .filter_map(|record| {
+                let old = phases.get(&record.content)?;
+                let motion = [record.phase[0] - old[0], record.phase[1] - old[1]];
+                (self.model.translations() && motion != [0, 0]).then_some((record.target, motion))
+            })
+            .collect();
+        drop(phases);
         // Reserve all uploads before recording any commands.
         let padded = |l: &Vec<u32>| (l.len() as u64).next_multiple_of(u64::from(self.align));
         let entries: u64 =
             lists.iter().flatten().map(padded).sum::<u64>() + source.as_ref().map_or(0, padded);
-        let gate_start = entries * 4;
+        let proposal_start = entries * 4;
+        let header_start = proposal_start
+            + (proposals.len().max(1) as u64 * 32).next_multiple_of(u64::from(self.align) * 4);
+        let motion_start = header_start + (32u64).next_multiple_of(u64::from(self.align) * 4);
+        let motion_bytes = if global {
+            u64::from(self.size.0.div_ceil(8).div_ceil(32) * self.size.1.div_ceil(8)) * 4
+        } else {
+            0
+        };
+        let motion_seed = motion_start + motion_bytes.next_multiple_of(u64::from(self.align) * 4);
+        let gate_start = motion_seed + self.argument_stride * 3;
         let model_start = gate_start + self.gates.desc().size;
         let delta_start = model_start + self.arguments.desc().size;
         let mut span = ring.reserve(
@@ -541,6 +773,98 @@ impl Upscaling {
                 *offset = origin + at as u64;
                 span.bytes()[at..at + list.len() * 4].copy_from_slice(&words(list.iter().copied()));
                 at += padded(list) as usize * 4;
+            }
+        }
+        let epoch = self.epoch.get().wrapping_add(1);
+        span.bytes()[header_start as usize..header_start as usize + 32].copy_from_slice(&words([
+            epoch,
+            proposals.len() as u32,
+            0,
+            0,
+            0,
+            u32::from(exact),
+            0,
+            0,
+        ]));
+        for (i, (rect, offset)) in proposals.iter().enumerate() {
+            let start = proposal_start as usize + i * 32;
+            span.bytes()[start..start + 32].copy_from_slice(&words([
+                rect.x,
+                rect.y,
+                rect.w,
+                rect.h,
+                offset[0] as u32,
+                offset[1] as u32,
+                0,
+                0,
+            ]));
+        }
+        if !self.initialized.get() {
+            encoder.fill_buffer(self.verification.slice(0..self.verification.desc().size), 0);
+        }
+        encoder.fill_buffer(
+            self.verification.slice(COLOUR_LEADERS..VERIFIED_CELLS),
+            u32::MAX,
+        );
+        encoder.copy_buffer(
+            span.buffer()
+                .slice(origin + header_start..origin + header_start + 24),
+            &self.verification,
+            0,
+        );
+        let next_motion = u64::from(epoch % 2) * self.argument_stride * 4;
+        let current_motion = u64::from((epoch + 1) % 2) * self.argument_stride * 4;
+        if !self.initialized.get() {
+            encoder.fill_buffer(
+                self.motion_arguments
+                    .slice(0..self.motion_arguments.desc().size),
+                0,
+            );
+        } else {
+            encoder.fill_buffer(
+                self.motion_arguments
+                    .slice(next_motion..next_motion + self.argument_stride * 4),
+                0,
+            );
+        }
+        if global {
+            let bitmap =
+                &mut span.bytes()[motion_start as usize..(motion_start + motion_bytes) as usize];
+            if let Some(source) = &source {
+                bitmap.fill(0);
+                let stride = self.size.0.div_ceil(8).div_ceil(32);
+                for &packed in source {
+                    let (x, y) = (packed & 65535, packed >> 16);
+                    let at = ((y * stride + x / 32) * 4) as usize;
+                    let word =
+                        u32::from_le_bytes(bitmap[at..at + 4].try_into().unwrap()) | 1 << (x % 32);
+                    bitmap[at..at + 4].copy_from_slice(&word.to_le_bytes());
+                }
+            } else {
+                bitmap.fill(255);
+            }
+            encoder.copy_buffer(
+                span.buffer()
+                    .slice(origin + motion_start..origin + motion_start + motion_bytes),
+                &self.motion,
+                0,
+            );
+            if input == Input::Software {
+                let max = self.size.0.max(self.size.1);
+                for (i, shape) in [[max, 2, 1], [max * 2 - 1, 2, 1], [1, 1, 1]]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let at = motion_seed as usize + i * self.argument_stride as usize;
+                    span.bytes()[at..at + 12].copy_from_slice(&words(shape));
+                }
+                encoder.copy_buffer(
+                    span.buffer().slice(
+                        origin + motion_seed..origin + motion_seed + self.argument_stride * 3,
+                    ),
+                    &self.motion_arguments,
+                    current_motion,
+                );
             }
         }
         let chunk = DISPATCH / self.align * self.align;
@@ -625,17 +949,63 @@ impl Upscaling {
             &self.gates,
             0,
         );
+        if !self.initialized.get() {
+            encoder.fill_buffer(self.state.slice(0..self.state.desc().size), 0);
+        } else {
+            let rebuild_bytes =
+                u64::from(1 + self.size.0.div_ceil(8).div_ceil(32) * self.size.1.div_ceil(8)) * 4;
+            encoder.fill_buffer(self.state.slice(0..rebuild_bytes), 0);
+            encoder.fill_buffer(
+                self.state
+                    .slice(self.required_start..self.state.desc().size),
+                0,
+            );
+        }
         let mut compute = encoder.compute_pass(&ComputePassDesc {
             timestamps,
             label: "upscale",
         });
+        if global {
+            compute.bind(0, Bind::Uniform(self.delta_dimensions.slice(0..32)));
+            compute.bind(0, Bind::Sampled(self.scratch.view()));
+            compute.bind(1, Bind::Sampled(self.previous_input.view()));
+            compute.bind(
+                0,
+                Bind::StorageBuffer(self.motion.slice(0..self.motion.desc().size)),
+            );
+            compute.bind(
+                1,
+                Bind::StorageBuffer(self.verification.slice(0..self.verification.desc().size)),
+            );
+            for (i, pipeline) in [&self.project, &self.correlate, &self.choose_motion]
+                .into_iter()
+                .enumerate()
+            {
+                compute.set_pipeline(pipeline);
+                let at = current_motion + i as u64 * self.argument_stride;
+                compute.dispatch_indirect(self.motion_arguments.slice(at..at + 12));
+            }
+        }
         if !exact {
             compute.set_pipeline(if self.initialized.get() {
                 &self.compare
             } else {
                 &self.initialize
             });
-            compute.bind(0, Bind::Uniform(self.delta_dimensions.slice(0..16)));
+            compute.bind(0, Bind::Uniform(self.delta_dimensions.slice(0..32)));
+            compute.bind(1, Bind::Sampled(self.previous_input.view()));
+            compute.bind(2, Bind::Sampled(output));
+            compute.bind(
+                4,
+                Bind::StorageBuffer(self.verification.slice(0..self.verification.desc().size)),
+            );
+            compute.bind(
+                5,
+                Bind::StorageBuffer(span.buffer().slice(
+                    origin + proposal_start
+                        ..origin + proposal_start + proposals.len().max(1) as u64 * 32,
+                )),
+            );
             compute.bind(0, Bind::Sampled(self.scratch.view()));
             compute.bind(0, Bind::StorageImage(self.input.view()));
             compute.bind(
@@ -671,11 +1041,34 @@ impl Upscaling {
                 None => (&self.whole[grid.whole], 0, grid.columns * grid.rows),
             }
         };
-        for (i, (pass, pipeline)) in passes.iter().zip(&self.pipelines).enumerate() {
+        compute.bind(
+            4,
+            Bind::StorageBuffer(self.state.slice(0..self.state.desc().size)),
+        );
+        compute.bind(
+            5,
+            Bind::StorageBuffer(self.metadata.slice(0..self.metadata.desc().size)),
+        );
+        compute.bind(
+            9,
+            Bind::StorageBuffer(
+                self.motion_arguments
+                    .slice(0..self.motion_arguments.desc().size),
+            ),
+        );
+        compute.bind(
+            6,
+            Bind::StorageBuffer(self.verification.slice(0..self.verification.desc().size)),
+        );
+        compute.bind(0, Bind::Sampled(self.input.view()));
+        compute.bind(2, Bind::Sampled(self.constant_output.view()));
+        compute.bind(7, Bind::StorageImage(self.previous_input.view()));
+        compute.bind(8, Bind::StorageImage(output));
+        for i in (0..passes.len()).rev() {
             let grid = &self.grids[i];
             let (buffer, base, count) = list(i);
             compute.set_pipeline(&self.filter);
-            compute.bind(0, Bind::Uniform(grid.parameters.slice(0..16)));
+            compute.bind(0, Bind::Uniform(grid.parameters.slice(0..48)));
             compute.bind(
                 1,
                 Bind::StorageBuffer(self.delta.slice(0..self.delta.desc().size)),
@@ -702,7 +1095,18 @@ impl Upscaling {
                 );
                 compute.dispatch_indirect(self.gates.slice(argument..argument + 12));
             }
+        }
+        for (i, (pass, pipeline)) in passes.iter().zip(&self.pipelines).enumerate() {
+            let grid = &self.grids[i];
+            let (_, _, count) = list(i);
             compute.set_pipeline(pipeline);
+            if pass.bindings.iter().any(|(_, role)| *role == Role::Output) {
+                compute.bind(
+                    16,
+                    Bind::StorageBuffer(self.verification.slice(0..self.verification.desc().size)),
+                );
+                compute.bind(17, Bind::StorageImage(self.constant_output.view()));
+            }
             for &(slot, role) in pass.bindings {
                 let resource = match role {
                     Role::Uniform => Bind::Uniform(self.dimensions.slice(0..16)),
@@ -730,6 +1134,10 @@ impl Upscaling {
         drop(compute);
         encoder.retain(span);
         self.initialized.set(true);
+        self.epoch.set(epoch);
+        let mut phases = self.phases.borrow_mut();
+        phases.clear();
+        phases.extend(records.iter().map(|r| (r.content, r.phase)));
         let last = passes.len() - 1;
         let cells = lists[last].as_ref().map_or(
             u64::from(self.grids[last].columns * self.grids[last].rows),
@@ -918,7 +1326,7 @@ impl Check {
                 format: OUTPUT,
                 mips: 1,
                 samples: 1,
-                usage: Usage::STORAGE | Usage::COPY_SRC,
+                usage: Usage::STORAGE | Usage::SAMPLED | Usage::COPY_SRC,
                 view_formats: &[],
                 label: "upscale check",
             })?;
@@ -975,7 +1383,14 @@ impl Check {
                 rows: 0,
             };
             encoder.copy_buffer_to_image(pixels, at(input), input.desc().size);
-            upscaling.encode(encoder, ring, output.view(), None, true, None)?;
+            upscaling.encode(
+                (encoder, ring),
+                output.view(),
+                None,
+                Input::Exact,
+                &[],
+                None,
+            )?;
             let readback = BufferCopy {
                 buffer: &self.readback,
                 offset,

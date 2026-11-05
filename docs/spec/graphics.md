@@ -149,6 +149,13 @@ Damage clipping remains a conservative region optimization under GFX-REC-4/5.
 **Rule**: State writes MUST maintain history-independent 128-bit identities, preserving state-block membership and exact values. Eligible unchanged draws MUST reuse shared previous-frame entries, checking guest-writable bytes and realigning after insertions or removals. Reuse MUST preserve commands, conservative damage, and pixels, and unavailable histories and flush boundaries MUST retain full preparation.
 **Verification**: Test
 
+### GFX-REC-12 Texel-phase draw records
+
+**Rule**: Each presentation MUST carry one record per recorded draw that samples a source at unit scale and integer offset. A record names the target bounds, the source content identity, its phase, and the phase change since that content's last presented draw. Records MUST only propose candidates, never establish a match.
+**Verification**: Test
+
+The phase is the screen position minus the texel position, in input pixels. Content identity combines the source image with its content version, so a rewritten texture starts a new history. Records are O(draws).
+
 ### GFX-PACE-1 Vsync-locked refresh boundaries
 
 **Rule**: Present boundaries MUST fall on host vsyncs, and a late Present MUST wait for the next one without repaying missed frames. At display rates within 1% of a whole multiple of the guest rate, on-time boundaries MUST be exactly that many vsyncs apart. Other rates MUST snap the guest's rational cadence to the nearest vsync after now.
