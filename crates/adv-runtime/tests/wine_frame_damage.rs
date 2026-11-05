@@ -7,7 +7,7 @@ use adv_abi::{
     Conv, Outcome, Registry,
     dll::{Export, ModuleImage},
 };
-use adv_device::surface::{FrameConsumer, Rect, Snapshot, SurfaceStore, frame_mailbox};
+use adv_device::surface::{Rect, Snapshot, SurfaceStore};
 use adv_machine::{HostFn, Resolver, RunResult};
 
 struct Platform(Registry);
@@ -22,7 +22,12 @@ impl Resolver for Platform {
     }
 }
 struct Checkpoints {
-    frames: FrameConsumer,
+    /// Software frames reach the native display in GPU builds and the frame
+    /// mailbox otherwise.
+    #[cfg(feature = "gpu")]
+    frames: adv_device::gpu::test_support::SurfaceCapture,
+    #[cfg(not(feature = "gpu"))]
+    frames: adv_device::surface::FrameConsumer,
     snapshot: Snapshot,
     seen: Vec<(u32, u64, u64, bool, Vec<Rect>)>,
 }
@@ -42,19 +47,37 @@ fn wine_identical_redraws_publish_nothing_and_partial_redraws_keep_damage() {
                 adv_drv::user::input::post(env.ext, 0x200, 0, 17 << 16 | 13).unwrap();
                 adv_nt::server::run(env);
             }
-            let store = env.ext.get::<SurfaceStore>();
+            let (checkpoints, store) = env.ext.get2_installed_mut::<Checkpoints, SurfaceStore>();
             let (published, copied) = (store.stats.published_frames, store.stats.copied_bytes);
-            let checkpoints = env.ext.get_mut::<Checkpoints>();
-            let updated = checkpoints.frames.update();
-            let damage = if updated {
-                checkpoints
-                    .frames
-                    .current()
-                    .snapshot(&mut checkpoints.snapshot)
-                    .unwrap();
-                checkpoints.frames.current().damage().to_vec()
-            } else {
-                Vec::new()
+            #[cfg(feature = "gpu")]
+            let (updated, damage) = {
+                let before = store.presenter.frames;
+                checkpoints.frames.update(store);
+                let frame = &store.presenter;
+                let updated = frame.frames != before;
+                if updated {
+                    let snapshot = &mut checkpoints.snapshot;
+                    (snapshot.width, snapshot.height) = (frame.width, frame.height);
+                    snapshot.bgra.clone_from(&frame.bgra);
+                }
+                let damage = if updated {
+                    adv_device::surface::rects(&frame.damage)
+                } else {
+                    Vec::new()
+                };
+                (updated, damage)
+            };
+            #[cfg(not(feature = "gpu"))]
+            let (updated, damage) = {
+                let updated = checkpoints.frames.update();
+                let damage = if updated {
+                    let frame = checkpoints.frames.current();
+                    frame.snapshot(&mut checkpoints.snapshot).unwrap();
+                    frame.damage()
+                } else {
+                    Vec::new()
+                };
+                (updated, damage)
             };
             checkpoints
                 .seen
@@ -63,6 +86,9 @@ fn wine_identical_redraws_publish_nothing_and_partial_redraws_keep_damage() {
         },
     );
     let mut seen = Vec::new();
+    // The capture precedes the store's GPU facade on this thread.
+    #[cfg(feature = "gpu")]
+    let mut capture = Some(adv_device::gpu::test_support::SurfaceCapture::new().unwrap());
     let Some((result, output)) = common::run_probe_inspect(
         "frame_damage.exe",
         false,
@@ -82,11 +108,17 @@ fn wine_identical_redraws_publish_nothing_and_partial_redraws_keep_damage() {
             )
             .unwrap();
             adv_unix::builtin::install(&prefix.join("drive_c"), &image).unwrap();
-            let (producer, frames) = frame_mailbox();
-            machine
-                .ext
-                .get_mut::<SurfaceStore>()
-                .set_frame_mailbox(producer, adv_sync::WakeEvent::new().unwrap());
+            #[cfg(feature = "gpu")]
+            let frames = capture.take().unwrap();
+            #[cfg(not(feature = "gpu"))]
+            let frames = {
+                let (producer, frames) = adv_device::surface::frame_mailbox();
+                machine
+                    .ext
+                    .get_mut::<SurfaceStore>()
+                    .set_frame_mailbox(producer, adv_sync::WakeEvent::new().unwrap());
+                frames
+            };
             machine.ext.insert(Checkpoints {
                 frames,
                 snapshot: Snapshot::default(),
@@ -127,11 +159,12 @@ fn wine_identical_redraws_publish_nothing_and_partial_redraws_keep_damage() {
     assert!(seen[2].3);
     assert_eq!(
         seen[2].4,
+        // Rows 5..8 of the first 16 columns, in 8-pixel cells.
         [Rect {
             x: 0,
-            y: 5,
+            y: 0,
             w: 16,
-            h: 3
+            h: 8
         }]
     );
     assert_eq!(
