@@ -791,12 +791,10 @@ fn changed_elf_function_is_not_bound() {
 // spec: NAT-BODY-4
 #[test]
 fn dib_layout_matches_dwarf() {
-    let Some(dist) = dist() else {
+    let Some(debug) = wine::debug_dist() else {
         return;
     };
-    let path = dist
-        .with_file_name("wine11-sse-dist")
-        .join("usr/local/lib/wine/i386-unix/win32u.so");
+    let path = debug.join("usr/local/lib/wine/i386-unix/win32u.so");
     let dump = std::process::Command::new("dwarfdump")
         .arg("--debug-info")
         .arg(path)

@@ -79,6 +79,14 @@ fn probe(name: &str, expected: &str) {
                 .get::<adv_device::surface::SurfaceStore>();
             if let Some(frame) = store.latest_frame() {
                 for (_, layer) in frame.video_layers() {
+                    // GPU builds hand the decoded picture to the native
+                    // display, which composes it; only its geometry is here.
+                    #[cfg(feature = "gpu")]
+                    if layer.frame.picture.is_some() {
+                        assert_eq!((layer.destination.x, layer.destination.y), (28, 32));
+                        pixels = true;
+                    }
+                    #[cfg(not(feature = "gpu"))]
                     if layer.frame.bgra[2] > 230 {
                         assert_eq!((layer.destination.x, layer.destination.y), (28, 32));
                         let mut snapshot = adv_device::surface::Snapshot::default();
