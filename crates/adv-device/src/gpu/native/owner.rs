@@ -469,7 +469,11 @@ impl State {
                 };
                 let ready = self.submit(presentable)?;
                 if let Storage::Swap(backing) = &image.storage {
-                    backing.owner.lock().unwrap().presented(&swap, &damage);
+                    backing
+                        .owner
+                        .lock()
+                        .unwrap()
+                        .presented(&swap, &damage, serial);
                 }
                 self.presenter.present(
                     &mut self.queue,

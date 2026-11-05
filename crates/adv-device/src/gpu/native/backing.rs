@@ -51,7 +51,8 @@ pub(super) struct SwapBacking {
     previous: Option<crate::frame::SwapImage>,
     pool: Option<adv_gpu::PresentPool>,
     role: Option<bool>,
-    history: std::collections::VecDeque<crate::frame::Damage>,
+    /// Presents of this swap by serial, oldest first.
+    history: std::collections::VecDeque<(u64, crate::frame::Damage)>,
     /// While private: the latest presented image, and the one before it,
     /// which the next frame writes.
     private: Option<adv_gpu::Image>,
@@ -190,19 +191,10 @@ impl SwapBacking {
                 w: swap.size.0,
                 h: swap.size.1,
             };
-            let damage = if changed || age.is_none_or(|age| age as usize > self.history.len() + 1) {
+            let damage = if changed {
                 Damage::Whole
             } else {
-                let mut damage = Damage::None;
-                for old in self
-                    .history
-                    .iter()
-                    .rev()
-                    .take(age.unwrap().saturating_sub(1) as usize)
-                {
-                    merge_damage(&mut damage, old);
-                }
-                damage
+                stale(&self.history, age)
             };
             if !matches!(damage, Damage::None) {
                 let encoder = encoder.get_or_insert_with(|| queue.encoder("guest commands"));
@@ -229,14 +221,14 @@ impl SwapBacking {
         self.current.take().unwrap()
     }
 
-    pub fn presented(&mut self, image: &SwapImage, damage: &Damage) {
+    pub fn presented(&mut self, image: &SwapImage, damage: &Damage, serial: u64) {
         // Keep the latest allocation alive as the source of age repair. A
         // presentable lease itself goes to the compositor, never to this clone.
         self.previous = Some(SwapImage::Private(raw(image).clone()));
         if let SwapImage::Private(image) = image {
             self.spare = self.private.replace(image.clone());
         }
-        self.history.push_back(damage.clone());
+        self.history.push_back((serial, damage.clone()));
         if self.history.len() > 8 {
             self.history.pop_front();
         }
@@ -367,6 +359,30 @@ impl DepthBacking {
 
 pub(super) fn swap_format() -> Format {
     adv_gpu::present::COLOR_FORMAT
+}
+
+/// What a buffer of `age` misses: the damage of this swap's presents since
+/// the one it holds. Each damage is against the producer's previous frame, so
+/// it describes this swap's own history only while no other present came
+/// between, as when guest targets rotate (GFX-REC-5); otherwise everything.
+fn stale(history: &std::collections::VecDeque<(u64, Damage)>, age: Option<u32>) -> Damage {
+    let Some(age) = age.map(|age| age as usize).filter(|&age| age > 0) else {
+        return Damage::Whole;
+    };
+    let held = history.len().checked_sub(age);
+    if held.is_none_or(|held| {
+        history
+            .range(held..)
+            .zip(history.range(held + 1..))
+            .any(|((a, _), (b, _))| *b != a + 1)
+    }) {
+        return Damage::Whole;
+    }
+    let mut damage = Damage::None;
+    for (_, old) in history.iter().rev().take(age - 1) {
+        merge_damage(&mut damage, old);
+    }
+    damage
 }
 
 /// Keep repair regions disjoint, coalescing intersecting bounds and reducing
@@ -533,5 +549,27 @@ mod tests {
         merge_damage(&mut merged, &Damage::Whole);
         merge_damage(&mut merged, &damage(&[rect(10, 10, 1, 1)]));
         assert_eq!(merged, Damage::Whole);
+    }
+
+    // spec: GFX-REC-5
+    #[test]
+    fn repair_unions_damage_only_across_consecutive_presents() {
+        let history = |serials: &[u64]| -> std::collections::VecDeque<_> {
+            serials
+                .iter()
+                .map(|&n| (n, damage(&[rect(n as u32, 0, 1, 1)])))
+                .collect()
+        };
+        // Presented every frame: a buffer two presents old misses the latest.
+        let every = history(&[4, 5, 6]);
+        assert_eq!(stale(&every, Some(2)), damage(&[rect(6, 0, 1, 1)]));
+        assert_eq!(stale(&every, Some(1)), Damage::None);
+        // Rotating with another target: the damage is against frames this
+        // swap never held.
+        let rotating = history(&[2, 4, 6]);
+        assert_eq!(stale(&rotating, Some(2)), Damage::Whole);
+        assert_eq!(stale(&rotating, Some(1)), Damage::None);
+        assert_eq!(stale(&every, Some(4)), Damage::Whole);
+        assert_eq!(stale(&every, None), Damage::Whole);
     }
 }
