@@ -47,7 +47,7 @@ pub use native::SurfaceCompositor;
 #[cfg(target_os = "android")]
 mod native {
     use super::*;
-    use crate::{compositor::*, plan::Damage};
+    use crate::compositor::*;
     use adv_gpu::present::Export;
     use std::{
         collections::VecDeque,
@@ -689,21 +689,19 @@ mod native {
                     LayerId::Host(_) => panic!("host content is not implemented"),
                 };
                 self.rects.clear();
-                match &layer.damage {
-                    Damage::Whole => self.rects.push(
-                        Rect {
-                            x: 0,
-                            y: 0,
-                            w: acquired.image.image().desc().size.width,
-                            h: acquired.image.image().desc().size.height,
-                        }
-                        .into(),
-                    ),
-                    Damage::Rects(rects) => {
-                        self.rects.extend(rects.iter().copied().map(ARect::from))
-                    }
-                    Damage::None => {}
-                }
+                let size = acquired.image.image().desc().size;
+                let damage = if layer.damage.size() == (size.width, size.height) {
+                    layer.damage.rects()
+                } else {
+                    vec![adv_gpu::Rect {
+                        x: 0,
+                        y: 0,
+                        w: size.width,
+                        h: size.height,
+                    }]
+                };
+                self.rects
+                    .extend(damage.into_iter().map(|r| ARect::from(Rect::from(r))));
                 unsafe {
                     ASurfaceTransaction_setDamageRegion(
                         tx,
@@ -810,7 +808,7 @@ mod native {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plan::{Damage, Source};
+    use crate::plan::{Region, Source};
 
     #[test]
     fn transforms() {
@@ -841,11 +839,11 @@ mod tests {
             dst: rect,
             rotation: Rotation::None,
             nearest: false,
-            damage: Damage::Whole,
+            damage: Region::whole((32, 32)),
         };
         assert!(Geometry::update(&mut last, &layer));
         assert!(!Geometry::update(&mut last, &layer));
-        layer.damage = Damage::None;
+        layer.damage = Region::empty((32, 32));
         layer.nearest = true;
         assert!(!Geometry::update(&mut last, &layer));
         layer.crop.x = 1;

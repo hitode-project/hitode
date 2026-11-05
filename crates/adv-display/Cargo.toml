@@ -11,7 +11,7 @@ publish.workspace = true
 adv-gpu = { path = "../adv-gpu", default-features = false, features = ["precompile"] }
 
 [dependencies]
-adv-gpu = { path = "../adv-gpu" }
+adv-gpu = { path = "../adv-gpu", features = ["serde"] }
 arrayvec = { version = "0.7", features = ["serde"] }
 smallvec = { version = "1", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }

@@ -851,7 +851,18 @@ mod tests {
             stencil: None,
         }
     }
-    fn present(image: &Image, damage: crate::frame::Damage, serial: u64) -> Command {
+    /// The cells of `image` the rectangles touch; none for an empty list.
+    fn damage(image: &Image, rects: &[Rect]) -> crate::frame::Region {
+        let mut region = crate::frame::Region::empty((image.width(), image.height()));
+        for &r in rects {
+            region.add(r);
+        }
+        region
+    }
+    fn whole(image: &Image) -> crate::frame::Region {
+        crate::frame::Region::whole((image.width(), image.height()))
+    }
+    fn present(image: &Image, damage: crate::frame::Region, serial: u64) -> Command {
         Command::PresentSwap {
             image: image.clone(),
             damage,
@@ -1113,7 +1124,7 @@ struct Color {rgba:vec4<f32>}
         assert!(h.state.passes[0].stencil.is_none());
         assert!(!h.state.passes[0].transient);
         h.producer
-            .push(present(&destination, crate::frame::Damage::Whole, 7));
+            .push(present(&destination, whole(&destination), 7));
         h.drain();
         let Base::Gpu {
             image: SwapImage::Private(frame),
@@ -1190,7 +1201,7 @@ struct Color {rgba:vec4<f32>}
             if serial % 2 == 0 {
                 h.producer.push(color(&image));
                 h.producer.push(clear(rect(0, 0, 4, 4), [1., 0., 0., 1.]));
-                let mut command = present(&image, crate::frame::Damage::Whole, serial);
+                let mut command = present(&image, whole(&image), serial);
                 let Command::PresentSwap { video: planes, .. } = &mut command else {
                     unreachable!()
                 };
@@ -1210,7 +1221,7 @@ struct Color {rgba:vec4<f32>}
                         slot,
                         format: crate::surface::PixelFormat::Bgra32,
                         palette: None,
-                        damage: crate::frame::Damage::Whole,
+                        damage: crate::frame::Region::whole((4, 4)),
                     },
                     video: video.clone(),
                     serial,
@@ -1284,26 +1295,19 @@ struct Color {rgba:vec4<f32>}
         h.producer.push(Command::Submit);
         h.drain();
         let rendered = h.state.image(&image).unwrap().0.id();
-        h.producer
-            .push(present(&image, crate::frame::Damage::Whole, 1));
+        h.producer.push(present(&image, whole(&image), 1));
         h.drain();
         let first = h.frame_image(0);
         assert_eq!(first.id(), rendered);
         h.producer.push(clear(rect(1, 1, 1, 1), [0., 0., 1., 1.]));
-        h.producer.push(present(
-            &image,
-            crate::frame::Damage::Rects([rect(1, 1, 1, 1)].into_iter().collect()),
-            2,
-        ));
+        h.producer
+            .push(present(&image, damage(&image, &[rect(1, 1, 1, 1)]), 2));
         h.drain();
         assert_ne!(first.id(), h.frame_image(1).id());
         drop(h.display.frames.lock().unwrap().pop_front());
         h.producer.push(clear(rect(0, 0, 1, 1), [0., 1., 0., 1.]));
-        h.producer.push(present(
-            &image,
-            crate::frame::Damage::Rects([rect(0, 0, 1, 1)].into_iter().collect()),
-            3,
-        ));
+        h.producer
+            .push(present(&image, damage(&image, &[rect(0, 0, 1, 1)]), 3));
         h.drain();
         let current = h.frame_image(1);
         assert_eq!(current.id(), first.id());
@@ -1325,15 +1329,13 @@ struct Color {rgba:vec4<f32>}
         }
         h.display.presentable.store(false, Ordering::Release);
         assert_eq!(h.read(&image), expected);
-        h.producer
-            .push(present(&image, crate::frame::Damage::None, 4));
+        h.producer.push(present(&image, damage(&image, &[]), 4));
         h.drain();
         let private = h.frame_image(2);
         assert_eq!(h.read(&fixed(private.clone())), expected);
         h.display.presentable.store(true, Ordering::Release);
         assert_eq!(h.read(&image), expected);
-        h.producer
-            .push(present(&image, crate::frame::Damage::None, 5));
+        h.producer.push(present(&image, damage(&image, &[]), 5));
         h.drain();
         let last = h.frame_image(3);
         assert_ne!(last.id(), private.id());
@@ -1358,20 +1360,13 @@ struct Color {rgba:vec4<f32>}
         };
         h.producer.push(color(&image));
         h.producer.push(clear(rect(0, 0, 4, 4), [1., 0., 0., 1.]));
-        h.producer
-            .push(present(&image, crate::frame::Damage::Whole, 1));
+        h.producer.push(present(&image, whole(&image), 1));
         h.producer.push(clear(rect(0, 0, 1, 1), [0., 1., 0., 1.]));
-        h.producer.push(present(
-            &image,
-            crate::frame::Damage::Rects([rect(0, 0, 1, 1)].into_iter().collect()),
-            2,
-        ));
+        h.producer
+            .push(present(&image, damage(&image, &[rect(0, 0, 1, 1)]), 2));
         h.producer.push(clear(rect(1, 1, 1, 1), [0., 0., 1., 1.]));
-        h.producer.push(present(
-            &image,
-            crate::frame::Damage::Rects([rect(1, 1, 1, 1)].into_iter().collect()),
-            3,
-        ));
+        h.producer
+            .push(present(&image, damage(&image, &[rect(1, 1, 1, 1)]), 3));
         h.drain();
         let (first, second, third) = (h.frame_image(0), h.frame_image(1), h.frame_image(2));
         assert_ne!(first.id(), second.id());
@@ -1412,7 +1407,7 @@ struct Color {rgba:vec4<f32>}
         producer.push(color(&image));
         for serial in 1..=4 {
             producer.push(clear(rect(0, 0, 4, 4), [0., 0., serial as f64 / 4., 1.]));
-            producer.push(present(&image, crate::frame::Damage::Whole, serial));
+            producer.push(present(&image, whole(&image), serial));
         }
         for serial in 1..=3 {
             assert_eq!(frames.recv_timeout(TIMEOUT).unwrap(), serial);
@@ -1458,8 +1453,7 @@ struct Color {rgba:vec4<f32>}
         };
         h.producer.push(clear_depth());
         h.producer.push(Command::DiscardDepth(depth.clone()));
-        h.producer
-            .push(present(&image, crate::frame::Damage::Whole, 1));
+        h.producer.push(present(&image, whole(&image), 1));
         h.drain();
         assert!(h.state.passes[0].transient);
         assert_eq!(
@@ -1471,8 +1465,7 @@ struct Color {rgba:vec4<f32>}
             Some((Load::Clear(0), Store::DontCare))
         );
         h.producer.push(clear_depth());
-        h.producer
-            .push(present(&image, crate::frame::Damage::Whole, 2));
+        h.producer.push(present(&image, whole(&image), 2));
         h.drain();
         assert!(!h.state.passes[1].transient);
         assert_eq!(
@@ -1481,8 +1474,7 @@ struct Color {rgba:vec4<f32>}
         );
         h.producer.push(clear_depth());
         h.producer.push(Command::DiscardDepth(depth));
-        h.producer
-            .push(present(&image, crate::frame::Damage::Whole, 3));
+        h.producer.push(present(&image, whole(&image), 3));
         h.drain();
         assert!(h.state.passes[2].transient);
     }
@@ -1598,8 +1590,7 @@ struct Output {@builtin(position) position:vec4<f32>,@location(0) color:vec4<f32
         h.producer.push(Command::Submit);
         h.producer.push(clear_depth());
         h.producer.push(Command::DiscardDepth(depth));
-        h.producer
-            .push(present(&image, crate::frame::Damage::Whole, 1));
+        h.producer.push(present(&image, whole(&image), 1));
         h.drain();
         assert_eq!(h.state.passes.len(), 2);
         for pass in &h.state.passes {

@@ -27,7 +27,7 @@ impl Snapshot {
         self.width = cpu.width;
         self.height = cpu.height;
         self.frames = cpu.frames;
-        self.damage = cpu.damage.to_vec();
+        self.damage = surface::rects(&cpu.damage);
         self.bgra = cpu.bgra;
     }
 }
@@ -70,7 +70,7 @@ impl Frame<'_> {
         out.set_cpu(cpu);
         Ok(())
     }
-    pub fn damage(&self) -> &[Rect] {
+    pub fn damage(&self) -> Vec<Rect> {
         self.0.damage()
     }
     pub fn hide_cursor(&self) -> bool {
@@ -89,7 +89,6 @@ pub fn assert_age_copies(_: &Store, full_copies: usize) {
 mod native {
     use super::*;
     use adv_device::{
-        frame,
         frame::test_support::{CapturePresenter, CapturedFrame},
         gpu::Gpu,
     };
@@ -137,25 +136,14 @@ mod native {
         history: Vec<(u64, Vec<Rect>)>,
         video: Arc<[(u64, VideoLayer)]>,
     }
-    fn add(rects: &mut Vec<Rect>, mut rect: Rect) {
-        let mut i = 0;
-        while i < rects.len() {
-            let old = rects[i];
-            if rect.x <= old.x + old.w
-                && old.x <= rect.x + rect.w
-                && rect.y <= old.y + old.h
-                && old.y <= rect.y + rect.h
-            {
-                rect = rect.union(rects.remove(i));
-                i = 0;
-            } else {
-                i += 1;
-            }
+    /// Adds `rect` to `rects` with the cell contract of frame damage.
+    fn add(size: (u32, u32), rects: &mut Vec<Rect>, rect: Rect) {
+        let mut region = surface::Region::empty(size);
+        for &r in rects.iter() {
+            region.add(r.into());
         }
-        if rects.len() == 4 {
-            rect = rects.drain(..).fold(rect, Rect::union);
-        }
-        rects.push(rect);
+        region.add(rect.into());
+        *rects = surface::rects(&region);
     }
     impl Frame {
         fn full(&self) -> Rect {
@@ -197,7 +185,7 @@ mod native {
             } else {
                 for (_, rects) in self.history.iter().filter(|(n, _)| *n > out.frames) {
                     for &r in rects {
-                        add(&mut damage, r);
+                        add((self.base.width, self.base.height), &mut damage, r);
                     }
                 }
             }
@@ -316,25 +304,7 @@ mod native {
                     .recv_timeout(Duration::from_secs(20))
                     .unwrap();
                 let pixels = captured.pixels;
-                let full = Rect {
-                    x: 0,
-                    y: 0,
-                    w: pixels.width,
-                    h: pixels.height,
-                };
-                let damage = match captured.damage {
-                    frame::Damage::None => vec![],
-                    frame::Damage::Whole => vec![full],
-                    frame::Damage::Rects(rects) => rects
-                        .iter()
-                        .map(|r| Rect {
-                            x: r.x,
-                            y: r.y,
-                            w: r.w,
-                            h: r.h,
-                        })
-                        .collect(),
-                };
+                let damage = surface::rects(&captured.damage);
                 let mut publication = Publication {
                     buffer: captured.buffer.unwrap(),
                     frame: Frame {
@@ -547,16 +517,17 @@ mod native {
             for publication in &batch.publications {
                 let width = publication.frame.base.width;
                 let pixels = (width * publication.frame.base.height) as usize;
+                let size = (width, publication.frame.base.height);
                 for debt in slots.values_mut() {
                     for &rect in &publication.frame.damage {
-                        add(debt, rect);
+                        add(size, debt, rect);
                     }
                 }
                 let debt = slots
                     .entry(publication.buffer)
                     .or_insert_with(|| vec![publication.frame.full()]);
                 // Count the union's coverage independently of the slot copier.
-                // Debt uses the same bounded-rectangle contract as frame damage.
+                // Debt uses the same cell contract as frame damage.
                 let mut covered = vec![false; pixels];
                 for r in debt.iter() {
                     for y in r.y..r.y + r.h {

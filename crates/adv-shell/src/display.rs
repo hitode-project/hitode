@@ -230,7 +230,7 @@ pub(crate) fn channel(
         },
     ))
 }
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", all(test, feature = "media")))]
 pub(crate) fn headless(
     software: bool,
     view: (u32, u32),
@@ -261,13 +261,6 @@ pub(crate) fn apple_channel(
     let (startup, mut ui) = channel(device, queue, Box::new(c), view, wake)?;
     ui.update(view, scale);
     Ok((startup, ui))
-}
-fn damage(d: &frame::Damage) -> plan::Damage {
-    match d {
-        frame::Damage::None => plan::Damage::None,
-        frame::Damage::Whole => plan::Damage::Whole,
-        frame::Damage::Rects(r) => plan::Damage::rects(r.iter().copied().map(Into::into)),
-    }
 }
 fn format(f: frame::PixelFormat) -> adv_display::stages::ingest::PixelFormat {
     use adv_display::stages::ingest::PixelFormat as P;
@@ -301,7 +294,7 @@ fn map(frame: frame::Frame) -> (display::Frame, Option<frame::Slot>) {
                 (size.width, size.height),
                 base,
                 plan::BaseKind::Gpu { presentable },
-                damage(&d),
+                d,
                 None,
             )
         }
@@ -330,7 +323,7 @@ fn map(frame: frame::Frame) -> (display::Frame, Option<frame::Slot>) {
                             | frame::PixelFormat::Indexed1
                     ),
                 },
-                damage(&d),
+                d,
                 Some(slot),
             )
         }
@@ -715,14 +708,14 @@ mod tests {
                     slot,
                     format: f,
                     palette: Some(Arc::new([[1, 2, 3, 4]; 256])),
-                    damage: frame::Damage::Whole,
+                    damage: frame::Region::whole((2, 2)),
                 },
                 video: Arc::from([]),
                 published_at: Instant::now(),
             });
             assert_eq!(mapped.info.canvas, (2, 2));
             assert_eq!(mapped.info.serial, 5);
-            assert_eq!(mapped.info.damage, plan::Damage::Whole);
+            assert_eq!(mapped.info.damage, frame::Region::whole((2, 2)));
             assert!(slot.is_some());
             let display::Base::Software {
                 buffer,
@@ -758,7 +751,7 @@ mod tests {
                 serial: 6,
                 base: frame::Base::Gpu {
                     image,
-                    damage: frame::Damage::None,
+                    damage: frame::Region::empty((8, 8)),
                     ready: adv_gpu::Token(7),
                 },
                 video: Arc::from([]),
@@ -817,7 +810,7 @@ mod tests {
                     slot,
                     format: frame::PixelFormat::Bgra32,
                     palette: None,
-                    damage: frame::Damage::None,
+                    damage: frame::Region::empty((8, 8)),
                 },
                 video: Arc::clone(&video),
                 published_at: Instant::now(),

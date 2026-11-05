@@ -28,7 +28,7 @@ struct Presents {
     latest: Option<Frame>,
     fail: bool,
     detached: bool,
-    damage: Vec<Option<Rect>>,
+    damage: Vec<Option<adv_device::surface::Region>>,
 }
 fn fixture() -> Fixture {
     fixture_with_limits(adv_machine::ObjectLimits::default())
@@ -45,7 +45,7 @@ fn fixture_with_limits(limits: adv_machine::ObjectLimits) -> Fixture {
             .unwrap()
             .image;
         let serial = ext.get::<Presents>().serial + 1;
-        let frame = test_support::present(gpu, &image, damage, serial)?;
+        let frame = test_support::present(gpu, &image, damage.clone(), serial)?;
         let p = ext.get_mut::<Presents>();
         p.damage.push(damage);
         p.serial = serial;

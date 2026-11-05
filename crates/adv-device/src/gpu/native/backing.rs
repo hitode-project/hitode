@@ -52,7 +52,7 @@ pub(super) struct SwapBacking {
     pool: Option<adv_gpu::PresentPool>,
     role: Option<bool>,
     /// Presents of this swap by serial, oldest first.
-    history: std::collections::VecDeque<(u64, crate::frame::Damage)>,
+    history: std::collections::VecDeque<(u64, Region)>,
     /// While private: the latest presented image, and the one before it,
     /// which the next frame writes.
     private: Option<adv_gpu::Image>,
@@ -76,7 +76,7 @@ pub(super) struct DepthBacking {
 
 use super::resources::Storage;
 use super::{Depth, Image};
-use crate::frame::{Damage, Presenter, SwapImage};
+use crate::frame::{Presenter, Region, SwapImage};
 use adv_gpu::encode::{ImageCopy, Load, Store};
 use adv_gpu::resource::{Dimension, ImageDesc, Usage};
 use adv_gpu::{Device, Encoder, Extent, Format, Queue, Rect};
@@ -185,27 +185,15 @@ impl SwapBacking {
         };
         let image = raw(&current);
         if let Some(previous) = &self.previous {
-            let whole = Rect {
-                x: 0,
-                y: 0,
-                w: swap.size.0,
-                h: swap.size.1,
-            };
             let damage = if changed {
-                Damage::Whole
+                Region::whole(swap.size)
             } else {
-                stale(&self.history, age)
+                stale(&self.history, swap.size, age)
             };
-            if !matches!(damage, Damage::None) {
+            if !damage.is_empty() {
                 let encoder = encoder.get_or_insert_with(|| queue.encoder("guest commands"));
-                match damage {
-                    Damage::None => unreachable!(),
-                    Damage::Whole => repair(encoder, raw(previous), image, whole),
-                    Damage::Rects(rects) => {
-                        for rect in rects {
-                            repair(encoder, raw(previous), image, rect);
-                        }
-                    }
+                for rect in damage.rects() {
+                    repair(encoder, raw(previous), image, rect);
                 }
             }
         }
@@ -221,7 +209,7 @@ impl SwapBacking {
         self.current.take().unwrap()
     }
 
-    pub fn presented(&mut self, image: &SwapImage, damage: &Damage, serial: u64) {
+    pub fn presented(&mut self, image: &SwapImage, damage: &Region, serial: u64) {
         // Keep the latest allocation alive as the source of age repair. A
         // presentable lease itself goes to the compositor, never to this clone.
         self.previous = Some(SwapImage::Private(raw(image).clone()));
@@ -364,10 +352,15 @@ pub(super) fn swap_format() -> Format {
 /// What a buffer of `age` misses: the damage of this swap's presents since
 /// the one it holds. Each damage is against the producer's previous frame, so
 /// it describes this swap's own history only while no other present came
-/// between, as when guest targets rotate (GFX-REC-5); otherwise everything.
-fn stale(history: &std::collections::VecDeque<(u64, Damage)>, age: Option<u32>) -> Damage {
+/// between, as when guest targets rotate (GFX-REC-4, GFX-REC-5); otherwise
+/// everything.
+fn stale(
+    history: &std::collections::VecDeque<(u64, Region)>,
+    size: (u32, u32),
+    age: Option<u32>,
+) -> Region {
     let Some(age) = age.map(|age| age as usize).filter(|&age| age > 0) else {
-        return Damage::Whole;
+        return Region::whole(size);
     };
     let held = history.len().checked_sub(age);
     if held.is_none_or(|held| {
@@ -376,65 +369,13 @@ fn stale(history: &std::collections::VecDeque<(u64, Damage)>, age: Option<u32>) 
             .zip(history.range(held + 1..))
             .any(|((a, _), (b, _))| *b != a + 1)
     }) {
-        return Damage::Whole;
+        return Region::whole(size);
     }
-    let mut damage = Damage::None;
+    let mut damage = Region::empty(size);
     for (_, old) in history.iter().rev().take(age - 1) {
-        merge_damage(&mut damage, old);
+        damage.union(old);
     }
     damage
-}
-
-/// Keep repair regions disjoint, coalescing intersecting bounds and reducing
-/// overflow to one bounding rectangle as GFX-REC-4 does.
-fn merge_damage(damage: &mut Damage, new: &Damage) {
-    match new {
-        Damage::None => {}
-        Damage::Whole => *damage = Damage::Whole,
-        Damage::Rects(rects) => {
-            for &rect in rects {
-                if matches!(damage, Damage::Whole) {
-                    return;
-                }
-                if matches!(damage, Damage::None) {
-                    *damage = Damage::Rects(Default::default());
-                }
-                let Damage::Rects(out) = damage else {
-                    unreachable!()
-                };
-                let mut rect = rect;
-                let mut i = 0;
-                while i < out.len() {
-                    let other = out[i];
-                    if rect.x <= other.x + other.w
-                        && other.x <= rect.x + rect.w
-                        && rect.y <= other.y + other.h
-                        && other.y <= rect.y + rect.h
-                    {
-                        rect = bounds(rect, out.swap_remove(i));
-                        i = 0;
-                    } else {
-                        i += 1;
-                    }
-                }
-                if out.is_full() {
-                    rect = out.iter().copied().fold(rect, bounds);
-                    out.clear();
-                }
-                out.push(rect);
-            }
-        }
-    }
-}
-fn bounds(a: Rect, b: Rect) -> Rect {
-    let x = a.x.min(b.x);
-    let y = a.y.min(b.y);
-    Rect {
-        x,
-        y,
-        w: (a.x + a.w).max(b.x + b.w) - x,
-        h: (a.y + a.h).max(b.y + b.h) - y,
-    }
 }
 
 #[cfg(test)]
@@ -491,85 +432,38 @@ mod tests {
     fn rect(x: u32, y: u32, w: u32, h: u32) -> Rect {
         Rect { x, y, w, h }
     }
-    fn damage(rects: &[Rect]) -> Damage {
-        Damage::Rects(rects.iter().copied().collect())
-    }
-    fn check_once(damage: &Damage, required: &[Rect]) {
-        let Damage::Rects(rects) = damage else {
-            panic!("rectangle repair");
-        };
-        for y in 0..16 {
-            for x in 0..16 {
-                let inside = |r: &Rect| x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h;
-                let copies = rects.iter().filter(|r| inside(r)).count();
-                assert!(copies <= 1, "repair copied ({x}, {y}) more than once");
-                if required.iter().any(inside) {
-                    assert_eq!(copies, 1, "missing repair at ({x}, {y})");
-                }
-            }
-        }
-    }
     // spec: GFX-REC-4, GFX-REC-5
     #[test]
-    fn repair_merges_overlap_across_frames_and_preserves_disjoint_regions() {
-        let required = [
-            rect(0, 0, 3, 3),
-            rect(2, 2, 3, 3),
-            rect(10, 10, 1, 1),
-            rect(4, 0, 2, 3),
-        ];
-        let mut merged = Damage::None;
-        for r in required {
-            merge_damage(&mut merged, &damage(&[r]));
-        }
-        check_once(&merged, &required);
-        let Damage::Rects(rects) = &merged else {
-            unreachable!()
-        };
-        assert_eq!(rects.len(), 2);
-        assert!(rects.contains(&rect(0, 0, 6, 5)));
-        assert!(rects.contains(&rect(10, 10, 1, 1)));
-    }
-    // spec: GFX-REC-4, GFX-REC-5
-    #[test]
-    fn repair_overflow_bounds_every_region_and_whole_supersedes_rectangles() {
-        let required = [
-            rect(0, 0, 1, 1),
-            rect(2, 2, 1, 1),
-            rect(4, 4, 1, 1),
-            rect(6, 6, 1, 1),
-            rect(8, 8, 1, 1),
-        ];
-        let mut merged = Damage::None;
-        for r in required {
-            merge_damage(&mut merged, &damage(&[r]));
-        }
-        assert_eq!(merged, damage(&[rect(0, 0, 9, 9)]));
-        check_once(&merged, &required);
-        merge_damage(&mut merged, &Damage::Whole);
-        merge_damage(&mut merged, &damage(&[rect(10, 10, 1, 1)]));
-        assert_eq!(merged, Damage::Whole);
-    }
-
-    // spec: GFX-REC-5
-    #[test]
-    fn repair_unions_damage_only_across_consecutive_presents() {
-        let history = |serials: &[u64]| -> std::collections::VecDeque<_> {
-            serials
+    fn repair_keeps_each_present_since_the_age_apart_and_unknown_content_whole() {
+        let size = (64, 64);
+        let history = |presents: &[(u64, Rect)]| -> std::collections::VecDeque<_> {
+            presents
                 .iter()
-                .map(|&n| (n, damage(&[rect(n as u32, 0, 1, 1)])))
+                .map(|&(serial, r)| {
+                    let mut region = Region::empty(size);
+                    region.add(r);
+                    (serial, region)
+                })
                 .collect()
         };
-        // Presented every frame: a buffer two presents old misses the latest.
-        let every = history(&[4, 5, 6]);
-        assert_eq!(stale(&every, Some(2)), damage(&[rect(6, 0, 1, 1)]));
-        assert_eq!(stale(&every, Some(1)), Damage::None);
+        let every = history(&[
+            (4, rect(56, 56, 8, 8)),
+            (5, rect(0, 0, 3, 3)),
+            (6, rect(40, 0, 2, 2)),
+        ]);
+        // Age three misses the last two presents, not the oldest, and the
+        // distant regions stay apart.
+        assert_eq!(
+            stale(&every, size, Some(3)).rects(),
+            [rect(0, 0, 8, 8), rect(40, 0, 8, 8)]
+        );
+        assert!(stale(&every, size, Some(1)).is_empty());
+        assert!(stale(&every, size, Some(4)).is_whole());
+        assert!(stale(&every, size, None).is_whole());
         // Rotating with another target: the damage is against frames this
         // swap never held.
-        let rotating = history(&[2, 4, 6]);
-        assert_eq!(stale(&rotating, Some(2)), Damage::Whole);
-        assert_eq!(stale(&rotating, Some(1)), Damage::None);
-        assert_eq!(stale(&every, Some(4)), Damage::Whole);
-        assert_eq!(stale(&every, None), Damage::Whole);
+        let rotating = history(&[(2, rect(0, 0, 1, 1)), (4, rect(0, 0, 1, 1))]);
+        assert!(stale(&rotating, size, Some(2)).is_whole());
+        assert!(stale(&rotating, size, Some(1)).is_empty());
     }
 }

@@ -1,5 +1,5 @@
 //! Owner-thread capture shared by graphics fixtures.
-use super::{Base, Damage, Frame, Presenter, SwapImage};
+use super::{Base, Frame, Presenter, Region, SwapImage};
 use crate::surface::{Rect, Snapshot, convert};
 use adv_gpu::{
     Extent, Queue,
@@ -11,7 +11,7 @@ use std::time::Duration;
 
 pub struct CapturedFrame {
     pub pixels: Snapshot,
-    pub damage: Damage,
+    pub damage: Region,
     /// Software slot identity, for buffer-age assertions.
     pub buffer: Option<u64>,
     /// The video layers the frame carried, by id.
