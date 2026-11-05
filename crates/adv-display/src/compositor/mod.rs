@@ -136,6 +136,7 @@ impl Compositor for HeadlessCompositor {
         let replaced = self.showing.extract_if(.., |(_, layer)| {
             images.iter().any(|i| i.layer == *layer)
                 || matches!(layer, LayerId::Video(id) if !layers.video.iter().any(|(v, _)| v == id))
+                || matches!(layer, LayerId::Host(crate::plan::HostLayer::Damage) if !layers.host.contains(&crate::plan::HostLayer::Damage))
         });
         self.released
             .extend(replaced.map(|(serial, layer)| Released {

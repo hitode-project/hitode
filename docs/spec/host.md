@@ -142,6 +142,15 @@ A 3×3 convolution reaches one input pixel. A linear tensor sample reaches one t
 
 Each planner pool MUST use indexed leases from one presentable pool in the backend's native color format. Compositor detach and rebuild MUST preserve the same base and video leases without drawing, and releases MUST order pool reuse after their fences; completion notifications MUST wake the owner without polling.
 
+### HOST-VIEW-12 Debug damage overlay
+
+**Rule**: Debugger damage visualization MUST tint producer damage, upscale input changes and recomputed output in physical view coordinates, fading marks over eight presented frames. Diagnostic presentation MUST preserve normal picture layers, retained content, damage, upscale work and content statistics. Disabled visualization MUST preserve ordinary plans, pixels, leases, pacing and GPU work.
+**Verification**: Test
+
+`damage on|off` applies at the next presented frame without changing guest execution. Pink marks presented-record damage, including merged publications and whole-frame invalidation, united with changed video rectangles; green marks GPU input delta; blue marks the last upscale pass's compacted output cells. Diagonal stripes distinguish overlapping marks over light and dark content. GPU histories age once per presented frame, mapping through placement, scaling and rotation; input and output marks appear only when the frame uses upscaling. No GPU damage data is read back.
+
+A transparent host layer places the tints above the normal picture and video layers. Base and video layers, retained images, damage, buffer reuse, captures, redraws and content counters keep their ordinary path. Diagnostic resources are allocated on first use and discarded when disabled; outstanding host-image leases remain valid until release.
+
 ### HOST-SES-1 Embedding
 
 **Rule**: Embedded sessions MUST use the shared shell execution and background services. A session MUST NOT take over the host `NSApplication` delegate or the host window.

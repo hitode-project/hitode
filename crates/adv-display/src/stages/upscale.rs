@@ -738,6 +738,39 @@ impl Upscaling {
         Ok(cells * u64::from(passes[last].unit()).pow(2))
     }
 
+    /// Diagnostic readers of the existing GPU result; no extra upscale work.
+    pub(crate) fn damage_delta(&self) -> adv_gpu::resource::BufferSlice<'_> {
+        self.delta.slice(0..self.delta.desc().size)
+    }
+
+    pub(crate) fn damage_unit(&self) -> u32 {
+        self.model.passes.last().unwrap().unit()
+    }
+
+    pub(crate) fn damage_cells(
+        &self,
+    ) -> impl Iterator<
+        Item = (
+            adv_gpu::resource::BufferSlice<'_>,
+            adv_gpu::resource::BufferSlice<'_>,
+        ),
+    > {
+        let grid = self.grids.last().unwrap();
+        let chunk = DISPATCH / self.align * self.align;
+        (0..grid.columns * grid.rows)
+            .step_by(chunk as usize)
+            .enumerate()
+            .map(move |(slice, first)| {
+                let count = chunk.min(grid.columns * grid.rows - first);
+                let start = u64::from(first) * 4;
+                let argument = grid.arguments + slice as u64 * self.argument_stride;
+                (
+                    grid.compacted.slice(start..start + u64::from(count) * 4),
+                    self.arguments.slice(argument..argument + 12),
+                )
+            })
+    }
+
     /// Each pass's cell list after a change within `damage`, or `None` where
     /// it is the whole grid. Walks back from the last pass: a pass's cells
     /// cover what later readers need of the tensors it writes, and it needs

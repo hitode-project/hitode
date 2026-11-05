@@ -28,13 +28,20 @@ use std::time::Instant;
 mod profile;
 
 /// Start before guest translation so samples can name every generated unit.
-pub(crate) fn start(options: &crate::Options, windowed: bool, wake: WakeEvent) -> Option<Debugger> {
+pub(crate) fn start(
+    options: &crate::Options,
+    windowed: bool,
+    wake: WakeEvent,
+    #[cfg(any(host_view, feature = "gpu"))] display: Option<Arc<crate::display::Shared>>,
+) -> Option<Debugger> {
     requested(options.debug)
         .then(|| {
             Debugger::start(
                 crate::debug_info(options, windowed),
                 &options.data_dir,
                 wake,
+                #[cfg(any(host_view, feature = "gpu"))]
+                display,
             )
         })
         .and_then(|result| {
@@ -134,6 +141,8 @@ struct Request {
 }
 
 struct Shared {
+    #[cfg(any(host_view, feature = "gpu"))]
+    display: Option<Arc<crate::display::Shared>>,
     info: String,
     timeline: Mutex<VecDeque<FrameRow>>,
     retirement: Mutex<VecDeque<(u64, [u64; 5])>>,
@@ -166,11 +175,18 @@ pub(crate) struct Debugger {
 
 impl Debugger {
     /// Starts serving on the calling thread, which must be the execution thread.
-    pub(crate) fn start(info: String, data_dir: &Path, wake: WakeEvent) -> Result<Self, String> {
+    pub(crate) fn start(
+        info: String,
+        data_dir: &Path,
+        wake: WakeEvent,
+        #[cfg(any(host_view, feature = "gpu"))] display: Option<Arc<crate::display::Shared>>,
+    ) -> Result<Self, String> {
         #[cfg(target_arch = "aarch64")]
         adv_runtime::jit_map_enable();
         let (sender, receiver) = mpsc::channel();
         let shared = Arc::new(Shared {
+            #[cfg(any(host_view, feature = "gpu"))]
+            display,
             info: format!("{info}\n{}", host_image()),
             timeline: Mutex::new(VecDeque::with_capacity(1024)),
             retirement: Mutex::default(),
@@ -1103,6 +1119,14 @@ fn profile_summary(
     text.join("\n")
 }
 
+fn damage_argument(args: &[&str]) -> Result<bool, String> {
+    match args {
+        ["on"] => Ok(true),
+        ["off"] => Ok(false),
+        _ => Err("damage on|off".into()),
+    }
+}
+
 /// Answers what this module records without the execution thread.
 #[cfg(unix)]
 fn immediate(shared: &Shared, command: &str, args: &[&str]) -> Option<Result<String, String>> {
@@ -1114,6 +1138,22 @@ fn immediate(shared: &Shared, command: &str, args: &[&str]) -> Option<Result<Str
         unix_us().saturating_sub(seconds * 1_000_000)
     };
     Some(match command {
+        "damage" => damage_argument(args).and_then(|enabled| {
+            #[cfg(any(host_view, feature = "gpu"))]
+            {
+                shared
+                    .display
+                    .as_ref()
+                    .ok_or("no native display")?
+                    .damage(enabled);
+                Ok(format!("damage {}", if enabled { "on" } else { "off" }))
+            }
+            #[cfg(not(any(host_view, feature = "gpu")))]
+            {
+                let _ = enabled;
+                Err("no native display".into())
+            }
+        }),
         "ping" => Ok("pong".into()),
         "help" => Ok(HELP.into()),
         "info" => Ok(format!(
@@ -1181,7 +1221,7 @@ fn immediate(shared: &Shared, command: &str, args: &[&str]) -> Option<Result<Str
 
 #[cfg(unix)]
 const HELP: &str = "\
-answered at once: ping, help, info, timeline [SECONDS], retirement [SECONDS], marks, mark [LABEL],
+answered at once: damage on|off, ping, help, info, timeline [SECONDS], retirement [SECONDS], marks, mark [LABEL],
   samples [SECONDS], profile [off|HZ], snaps, pull [NAME]
 at a guest boundary: threads, stack CONTEXT [FRAMES], calls [COUNT], gaps,
   modules, mem ADDRESS [LENGTH], dis ADDRESS [COUNT], slow [reset], boundary [reset], report,
@@ -1299,6 +1339,16 @@ fn answer(shared: &Shared, line: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    // spec: HOST-VIEW-12
+    fn damage_command_accepts_only_one_on_or_off_argument() {
+        assert_eq!(super::damage_argument(&["on"]), Ok(true));
+        assert_eq!(super::damage_argument(&["off"]), Ok(false));
+        for args in [vec![], vec!["ON"], vec!["1"], vec!["on", "off"]] {
+            assert_eq!(super::damage_argument(&args), Err("damage on|off".into()));
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -1375,8 +1425,14 @@ mod boundary_tests {
         let text = boundary_text(boundary, target.0.sys.pid, &HashMap::new());
         assert!(text.find("small").unwrap() < text.find("large").unwrap());
         let root = std::env::temp_dir().join(format!("adv-boundary-debug-{}", std::process::id()));
-        let mut debugger =
-            Debugger::start("boundary test".into(), &root, WakeEvent::new().unwrap()).unwrap();
+        let mut debugger = Debugger::start(
+            "boundary test".into(),
+            &root,
+            WakeEvent::new().unwrap(),
+            #[cfg(any(host_view, feature = "gpu"))]
+            None,
+        )
+        .unwrap();
         assert!(
             debugger
                 .execute("boundary reset", &target)

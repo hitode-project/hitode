@@ -35,7 +35,7 @@ impl Mailbox {
         }
     }
 }
-struct Shared {
+pub(crate) struct Shared {
     settings: Mutex<Mailbox>,
     /// Display refreshes the UI's frame clock counted.
     refreshes: AtomicU64,
@@ -43,6 +43,13 @@ struct Shared {
     wake: WakeEvent,
 }
 impl Shared {
+    pub(crate) fn damage(&self, enabled: bool) {
+        let mut mailbox = self.settings.lock().unwrap();
+        mailbox.settings.damage_overlay = enabled;
+        mailbox.dirty = true;
+        mailbox.poke();
+    }
+
     fn send(&self, value: Result<Feedback, String>) {
         let mut q = self.feedback.lock().unwrap();
         if q.len() == 128 {
@@ -140,6 +147,10 @@ pub struct Startup {
     presenter: Presenter,
 }
 impl Startup {
+    pub(crate) fn debug_settings(&self) -> Arc<Shared> {
+        self.presenter.shared.clone()
+    }
+
     pub fn start(self) -> Result<adv_device::gpu::Gpu, String> {
         adv_device::gpu::Gpu::request_with_presenter(
             self.device,
@@ -195,6 +206,7 @@ pub(crate) fn channel(
         scale: 1.,
         upscaler: Upscaler::Off,
         background: [0.; 3],
+        damage_overlay: false,
     };
     #[cfg(target_os = "android")]
     let caps = compositor.caps();
@@ -597,6 +609,7 @@ mod tests {
                     scale: 1.,
                     upscaler: Upscaler::Off,
                     background: [0.; 3],
+                    damage_overlay: false,
                 },
                 dirty: true,
                 trim: false,

@@ -105,6 +105,9 @@ pub struct Settings {
     pub rotation: Rotation,
     pub upscaler: Upscaler,
     pub background: [f32; 3],
+    /// Live debugger damage visualization.
+    #[serde(default)]
+    pub damage_overlay: bool,
 }
 
 /// What the system compositor can do for us.
@@ -232,6 +235,7 @@ pub enum HostLayer {
     Hud,
     GestureHint,
     Cursor,
+    Damage,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -764,6 +768,9 @@ pub fn plan(
             tiles: tile,
         });
         result.targets.push(target);
+    }
+    if settings.damage_overlay {
+        result.layers.host.push(HostLayer::Damage);
     }
     result
 }

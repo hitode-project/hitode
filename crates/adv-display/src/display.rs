@@ -242,6 +242,7 @@ pub struct Display {
     /// compositor releases it. Declared after the compositor, which detaches
     /// before these drop.
     screen: Vec<(u64, AcquiredImage)>,
+    overlay: Option<crate::damage::Damage>,
     caps: CompositorCaps,
     settings: Settings,
     pools: PoolState,
@@ -303,6 +304,7 @@ impl Display {
             caps: compositor.caps(),
             compositor: Some(compositor),
             screen: vec![],
+            overlay: None,
             device,
             settings,
             pools: Default::default(),
@@ -525,6 +527,9 @@ impl Display {
             .iter()
             .filter(|(_, a)| match (a.layer, latest) {
                 (LayerId::Base, Some(_)) => true,
+                (LayerId::Host(HostLayer::Damage), Some((_, layers))) => {
+                    layers.host.contains(&HostLayer::Damage)
+                }
                 (LayerId::Video(id), Some((_, layers))) => {
                     layers.video.iter().any(|(v, _)| *v == id)
                 }
@@ -589,8 +594,23 @@ impl Display {
         if let Some(record) = self.recorder.latest() {
             let serial = record.statistics.presents;
             let mut images: Vec<_> = self.screen.drain(..).map(|(_, a)| a).collect();
+            let mut diagnostic_layers;
+            let layers = if self.settings.damage_overlay || self.overlay.is_some() {
+                diagnostic_layers = record.plan.layers.clone();
+                crate::damage::prepare(
+                    &mut self.overlay,
+                    (&self.device, queue),
+                    (record, self.settings.damage_overlay, None),
+                    &mut diagnostic_layers,
+                    &mut images,
+                    &self.screen,
+                )?;
+                &diagnostic_layers
+            } else {
+                &record.plan.layers
+            };
             let result = compositor.present(
-                &record.plan.layers,
+                layers,
                 &Tiles::default(),
                 &mut images,
                 serial,
@@ -622,6 +642,10 @@ impl Display {
         acquired: AcquiredImage,
         fence: Option<adv_gpu::queue::Fence>,
     ) -> adv_gpu::Result<()> {
+        if acquired.layer == LayerId::Host(HostLayer::Damage) {
+            crate::damage::released(acquired.image, fence);
+            return Ok(());
+        }
         if let LayerId::Video(id) = acquired.layer
             && !self.leases.contains_key(&id)
             && self
@@ -727,7 +751,7 @@ impl Display {
             on_read(token);
         }
         if self.attachable() {
-            self.attach(pending)
+            self.attach(queue, pending)
                 .map_err(|error| Failure { error, token })?;
         } else {
             self.held = Some(pending);
@@ -735,8 +759,28 @@ impl Display {
         self.invalid |= redraw;
         Ok(token)
     }
-    fn attach(&mut self, mut pending: Pending) -> Result<(), Error> {
+    fn attach(&mut self, queue: &mut Queue, mut pending: Pending) -> Result<(), Error> {
         let serial = self.totals.presents + 1;
+        if self.settings.damage_overlay || self.overlay.is_some() {
+            let upscaling = pending
+                .record
+                .plan
+                .stages
+                .iter()
+                .any(|s| matches!(s, Stage::Upscale { .. }))
+                .then(|| &self.upscaled.as_ref().unwrap().upscaling);
+            let mut layers = pending.record.plan.layers.clone();
+            crate::damage::prepare(
+                &mut self.overlay,
+                (&self.device, queue),
+                (&pending.record, self.settings.damage_overlay, upscaling),
+                &mut layers,
+                &mut pending.images,
+                &self.screen,
+            )?;
+            pending.record.settings.damage_overlay = self.settings.damage_overlay;
+            pending.record.plan.layers = layers;
+        }
         let presented = self.compositor.as_mut().unwrap().present(
             &pending.record.plan.layers,
             &Tiles::default(),
@@ -875,7 +919,7 @@ impl Display {
         if self.attachable()
             && let Some(p) = self.held.take()
         {
-            self.attach(p)?;
+            self.attach(queue, p)?;
         }
         if self.deferred.is_some() && self.encodable() {
             let frame = self.deferred.take().unwrap();

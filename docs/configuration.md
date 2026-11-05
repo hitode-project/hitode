@@ -63,7 +63,7 @@ Header macros, placeholder names in script examples and names read only to clear
 | `ADV_CODESIGN_IDENTITY` | Feature | Unset: `tools/macos/package.py` signs ad hoc |
 | `ADV_CONTROLLED_FAULT_CASE` | Fixture | Unset; set by the parent test |
 | `ADV_CPU_DIRECT_PROBE` | Fixture | Unset; set by the parent test |
-| `ADV_DEBUG` | Diagnostic | Off; `1` serves the interactive debugger, as `adv-run --debug` |
+| `ADV_DEBUG` | Diagnostic | Off; `1` serves the interactive debugger, as `adv-run --debug`; `damage on` / `damage off` toggles the GPU damage overlay |
 | `ADV_DLL_DRIVER_RUNNER` | Fixture | Unset: skip the runner check |
 | `ADV_ENGINE_BENCH_ENGINES` | Fixture | Both the interpreter and the platform engine |
 | `ADV_ENGINE_BENCH_SCALE` | Fixture | `100` percent of the default iterations (1 to 1000) |

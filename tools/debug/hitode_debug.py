@@ -17,6 +17,7 @@ runner as they are; these are shaped here:
   speed [SECONDS] [--range A:B | --marks A:B | --frame N]
                             sample shares, retired instructions, ns/inst, MIPS
                             and hottest guest units by execution form
+  damage on|off            show or hide GPU damage tints
   boundary [reset]          native body host work and tail calls
   snap [LABEL], pull [NAME] save a snapshot under target/investigations/debug
   analyze [--gap MS]        snapshot now and explain each stall in it
@@ -763,7 +764,12 @@ def run(session, line):
     if not words:
         return
     command, args = words[0], words[1:]
-    if command == "tl":
+    if command == "damage":
+        parser = argparse.ArgumentParser(prog="damage")
+        parser.add_argument("state", choices=("on", "off"))
+        state = parser.parse_args(args).state
+        print(session.text(f"damage {state}"))
+    elif command == "tl":
         show_timeline(session, args)
     elif command == "prof":
         show_profile(session, args)
