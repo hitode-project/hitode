@@ -1354,11 +1354,20 @@ impl Display {
                 // stage. Pixels bound the last model pass's recomputed work; none
                 // means no compute pass ran, nor wrote its timestamps.
                 let u = self.upscaled.as_ref().unwrap();
+                let damage = exact.then(|| {
+                    frame
+                        .info
+                        .damage
+                        .rects()
+                        .into_iter()
+                        .map(Into::into)
+                        .collect::<Vec<_>>()
+                });
                 let upscaled = u.upscaling.encode(
                     encoder.as_mut().unwrap(),
                     &mut self.ring,
                     u.output.view(),
-                    Some(&tiles.rects),
+                    Some(damage.as_deref().unwrap_or(&tiles.rects)),
                     exact,
                     self.queries.as_ref().map(|q| (q, statistics.passes * 2)),
                 )?;

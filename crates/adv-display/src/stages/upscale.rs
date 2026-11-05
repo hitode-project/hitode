@@ -742,7 +742,7 @@ impl Upscaling {
     /// it is the whole grid. Walks back from the last pass: a pass's cells
     /// cover what later readers need of the tensors it writes, and it needs
     /// its inputs its radius beyond those cells.
-    fn cells(&self, damage: &[Rect]) -> Vec<Option<Vec<u32>>> {
+    pub(crate) fn cells(&self, damage: &[Rect]) -> Vec<Option<Vec<u32>>> {
         let grow = |r: Rect, by: u32| {
             let x = r.x.saturating_sub(by);
             let y = r.y.saturating_sub(by);

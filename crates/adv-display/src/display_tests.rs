@@ -1018,6 +1018,107 @@ fn read(d: &Device, q: &mut Queue, image: &Image) -> Vec<u8> {
 
 // spec: HOST-VIEW-10
 #[test]
+fn exact_software_upscaling_uses_producer_cells() {
+    use crate::stages::upscale;
+
+    let (d, mut q, mut display, _) = setup();
+    display
+        .settings(
+            &mut q,
+            Settings {
+                view: (128, 96),
+                upscaler: Upscaler::Anime4k,
+                ..settings()
+            },
+        )
+        .unwrap();
+    let software = |serial, pixels: &[u8], damage| {
+        let buffer = d
+            .create_buffer(&BufferDesc {
+                size: pixels.len() as u64,
+                usage: BufferUsage::STORAGE,
+                memory: Memory::Upload,
+                label: "exact software source",
+            })
+            .unwrap();
+        // SAFETY: no GPU work references the new buffer.
+        unsafe { buffer.mapped().unwrap().as_mut() }.copy_from_slice(pixels);
+        Frame {
+            info: info(serial, BaseKind::Software { indexed: false }, damage),
+            base: Base::Software {
+                buffer,
+                pitch: 256,
+                extent: (64, 48),
+                format: crate::stages::ingest::PixelFormat::Bgra32,
+                palette: None,
+            },
+            video: vec![],
+            published_at: std::time::Instant::now(),
+            on_read: None,
+        }
+    };
+    let mut pixels: Vec<u8> = (0..64 * 48 * 4).map(|i| (i * 7 % 251) as u8).collect();
+    display
+        .present(&mut q, software(100, &pixels, all()))
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !display.upscaler_ready(&mut q) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "upscaler build timed out"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    display
+        .present(&mut q, software(1, &pixels, all()))
+        .unwrap();
+    let changed = Rect {
+        x: 24,
+        y: 24,
+        w: 8,
+        h: 8,
+    };
+    for y in changed.y..changed.y + changed.h {
+        for x in changed.x..changed.x + changed.w {
+            let at = ((y * 64 + x) * 4) as usize;
+            pixels[at..at + 3].copy_from_slice(&[255, 0, 128]);
+        }
+    }
+    display
+        .present(&mut q, software(2, &pixels, cells(&[changed])))
+        .unwrap();
+    let latest = display.recorder().latest().unwrap();
+    let Stage::Upscale { tiles, .. } = &latest.plan.stages[0] else {
+        panic!("upscaled software frame")
+    };
+    let model = upscale::model(&d, Upscaler::Anime4k, false);
+    let upscaling = upscale::Upscaling::with_precision(&d, model, (64, 48), false).unwrap();
+    let last = model.passes.last().unwrap();
+    let unit = last.block / last.scale;
+    let count = |damage: &[Rect]| {
+        upscaling
+            .cells(damage)
+            .last()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .len() as u64
+            * u64::from(unit).pow(2)
+    };
+    let expected = count(&[changed]);
+    assert!(expected < count(&tiles.rects));
+    assert_eq!(latest.statistics.stages[0].pixels, expected);
+    let partial = display.upscaled_copy(&mut q);
+    let partial = read(&d, &mut q, &partial);
+    display
+        .present(&mut q, software(3, &pixels, all()))
+        .unwrap();
+    let whole = display.upscaled_copy(&mut q);
+    assert_eq!(partial, read(&d, &mut q, &whole));
+}
+
+// spec: HOST-VIEW-10
+#[test]
 fn upscaled_partial_frames_match_a_whole_run_across_buffer_ages() {
     let (d, mut q) = Device::open(&queue::DeviceOptions {
         validation: !cfg!(target_os = "android"),
