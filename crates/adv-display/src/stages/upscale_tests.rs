@@ -315,10 +315,11 @@ fn unchanged_composition_launches_no_filter_or_model_workgroups() {
         assert!(queue.wait(token, Duration::from_secs(60)).unwrap());
         if frame == 0 {
             let grid = upscaling.grids.last().unwrap();
+            // A new colour's cells compute once; its owner fills the table.
             assert_eq!(
                 read(&device, &mut queue, &upscaling.arguments)[grid.arguments as usize / 4],
-                1,
-                "one model output cell fills a new constant colour"
+                grid.columns * grid.rows,
+                "a new constant colour computes its cells once"
             );
         }
     }

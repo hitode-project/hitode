@@ -1,8 +1,8 @@
 @group(3) @binding(16) var<storage, read_write> references: Verification;
 @group(3) @binding(17) var colour_output: texture_storage_2d<rgba8unorm, write>;
 
-// The final model writer also publishes one new constant pattern and all cells
-// waiting for it. Native UNORM stores quantize both destinations identically.
+// The final model writer of a new colour's owner also publishes its constant
+// pattern. Native UNORM stores quantize both destinations identically.
 fn publish(pixel: vec2<u32>, value: vec4<f32>) {
     textureStore(OUTPUT_0, vec2<i32>(pixel), value);
     let size = Params_0.dimensions_0.xy;
@@ -22,16 +22,5 @@ fn publish(pixel: vec2<u32>, value: vec4<f32>) {
         references.colours[cache].key = references.cells[at].colour;
         references.colours[cache].valid = 1u;
         atomicStore(&references.colours[cache].touched, references.epoch & 0x7fffffffu);
-    }
-    let count = columns * ((size.y + 7u) / 8u);
-    for (var i = 0u; i < count; i++) {
-        if atomicLoad(&references.cells[i].constant_epoch) != references.epoch || atomicLoad(&references.cells[i].slot) != slot { continue; }
-        let destination = vec2(i % columns, i / columns) * 16u;
-        for (var y = phase.y; y < 16u; y += 2u) {
-            for (var x = phase.x; x < 16u; x += 2u) {
-                let p = destination + vec2(x, y);
-                if all(p < size * 2u) { textureStore(OUTPUT_0, vec2<i32>(p), value); }
-            }
-        }
     }
 }

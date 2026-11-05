@@ -251,6 +251,7 @@ fn colour_owner(key: vec2<u32>, cell: u32) -> u32 {
     return 0xffffffffu;
 }
 
+// 1 when a cached colour rebuilt the cell, 2 for a new colour's owner, else 0.
 fn constant_reconstruction(origin: vec2<u32>) -> u32 {
     if verified.padding0 != 0u { return 0u; }
     let cell = origin / 8u;
@@ -277,13 +278,15 @@ fn constant_reconstruction(origin: vec2<u32>) -> u32 {
             return 1u;
         }
     }
+    // A new colour's owner computes and publishes it. Other cells of that
+    // colour compute it this once, so no cell waits on another's run.
     let slot = colour_owner(key, at);
-    if slot == 0xffffffffu { return 0u; }
+    if slot == 0xffffffffu || atomicLoad(&verified.leaders[slot].owner) != at || any(origin != cell * 8u) {
+        return 0u;
+    }
     atomicStore(&verified.cells[at].slot, slot);
     atomicStore(&verified.cells[at].constant_epoch, verified.epoch);
-    atomicStore(&state[0], 1u);
-    let owner = atomicLoad(&verified.leaders[slot].owner);
-    return select(2u, 3u, owner == at && all(origin == cell * 8u));
+    return 2u;
 }
 
 fn select_cell(packed: u32) -> bool {
@@ -302,7 +305,7 @@ fn select_cell(packed: u32) -> bool {
             return false;
         }
         let colour = constant_reconstruction(origin);
-        if colour == 1u || colour == 2u {
+        if colour == 1u {
             atomicAnd(&state[parameters.valid + at], ~mask);
             atomicOr(&state[parameters.exact + at - grid.offset], mask);
             return false;
