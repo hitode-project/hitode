@@ -1,4 +1,4 @@
-import type { Report, ReportBase } from "./report";
+import type { Report, ReportBase, ReportSettings } from "./report";
 import type { Game } from "./types";
 
 // Stand-ins used only in a plain browser (`pnpm dev`), where there is no
@@ -12,16 +12,18 @@ function hash(text: string, seed: number): number {
   return h >>> 0;
 }
 
-/** What report_base would return for `game` on a Windows PC or an Android phone. */
+/** What report_base would return for `game` on a desktop or an Android phone. */
 export function fakeReportBase(game: Game, phone: boolean): ReportBase {
   const sha = Array.from({ length: 8 }, (_, i) => hash(game.id, i).toString(16).padStart(8, "0")).join("");
+  const graphics = { api: "vulkan" as const, name: "Example GPU", vendor: "0x1234", device: "0x5678", driver: "1", tier: "bindless" };
+  const settings: ReportSettings = { upscaler: "off", scaling: "fit", fast_forward: "hold", touch_mode: "direct", font_files: 0, font_overrides: 0, font_smoothing: null, discs: 0 };
   return {
     dedupe_key: "q3V9sJk2" + hash(game.id, 7).toString(36).padStart(7, "0"),
     app: { version: "0.4.2", build: "a1b2c3d", channel: "preview" },
     platform: phone
-      ? { os: "android", os_major: "15", arch: "aarch64", cpu_engine: "a64", graphics: "gpu" }
-      : { os: "windows", os_major: "11", arch: "x86_64", cpu_engine: "x64", graphics: "gpu" },
-    game: { exe_sha256: sha, exe_size: 600000 + (hash(game.id, 99) % 3000000), codepage: game.codepage },
+      ? { os: "android", os_major: "15", model: "Example1,1", graphics, settings }
+      : { os: "macos", os_major: "26", model: "Example1,1", graphics, settings },
+    game: { exe_sha256: sha, exe_size: 600000 + (hash(game.id, 99) % 3000000), codepage: game.codepage, timestamp: 123, image_size: 8192 },
   };
 }
 

@@ -18,5 +18,6 @@
     "noEmit": true,
     "skipLibCheck": true
   },
+  "exclude": ["src/lib/*.test.ts"],
   "include": ["src/**/*.ts", "src/**/*.svelte", "vite.config.ts", "svelte.config.js"]
 }

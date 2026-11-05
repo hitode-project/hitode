@@ -56,6 +56,27 @@ struct DeviceState {
 }
 
 impl Device {
+    pub(crate) fn adapter_identity(&self) -> crate::queue::AdapterIdentity {
+        let caps = self.caps();
+        let vendor = if self.0.raw.supportsFamily(MTLGPUFamily::Apple1) {
+            "apple"
+        } else if caps.adapter.contains("AMD") {
+            "amd"
+        } else if caps.adapter.contains("Intel") {
+            "intel"
+        } else {
+            "unknown"
+        };
+        crate::queue::AdapterIdentity {
+            api: "metal",
+            name: caps.adapter.clone(),
+            vendor: vendor.into(),
+            device: caps.adapter.clone(),
+            driver: caps.driver.clone(),
+            tier: "metal",
+        }
+    }
+
     pub(crate) fn caps(&self) -> &Caps {
         &self.0.caps
     }

@@ -1254,6 +1254,7 @@ type NativeVideo = (
 );
 pub struct Surfaces<P: Presenter> {
     pub presenter: P,
+    pub milestones: Option<Arc<crate::Milestones>>,
     #[cfg(feature = "gpu")]
     gpu: crate::gpu::Gpu,
     #[cfg(feature = "gpu")]
@@ -1319,6 +1320,11 @@ struct NativeSurface {
 }
 
 impl<P: Presenter> Surfaces<P> {
+    #[cfg(feature = "gpu")]
+    pub fn device(&self) -> &adv_gpu::Device {
+        self.gpu.device()
+    }
+
     /// A store whose pixels and front objects live in the guest range `arena..arena + len`.
     pub fn new(
         width: u32,
@@ -1330,6 +1336,7 @@ impl<P: Presenter> Surfaces<P> {
         size(width, height)?;
         Ok(Self {
             presenter,
+            milestones: None,
             #[cfg(feature = "gpu")]
             gpu: crate::gpu::Gpu::execution(false).map_err(|e| e.to_string())?,
             #[cfg(feature = "gpu")]
@@ -1522,6 +1529,7 @@ impl<P: Presenter> Surfaces<P> {
         layer: Option<VideoLayer>,
         m: &dyn SurfaceMemory,
     ) -> Result<u64, String> {
+        let has_frame = layer.is_some();
         if let Some(layer) = &layer {
             layer.validate()?;
         } else if !self.video_layers.iter().any(|(id, _)| *id == key) {
@@ -1594,6 +1602,9 @@ impl<P: Presenter> Surfaces<P> {
             if !self.deferred_presentation && !host_video {
                 self.capture_complete()?;
             }
+        }
+        if has_frame && let Some(milestones) = &self.milestones {
+            milestones.video.get_or_init(|| milestones.elapsed_ms());
         }
         Ok(serial)
     }

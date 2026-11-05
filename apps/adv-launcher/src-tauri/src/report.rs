@@ -1,7 +1,6 @@
 //! The anonymous compatibility report: the fields that identify build,
-//! platform and game, and saving the report the overlay assembled. Submission
-//! waits for the report service.
-use adv_report::{App, Game, Platform, Report};
+//! platform and game, validating delivery and saving the report the overlay assembled.
+use adv_report::{App, Game, Graphics, GraphicsApi, Platform, Report, Settings};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Manager, Runtime};
@@ -36,10 +35,33 @@ pub async fn report_base<R: Runtime>(
     app: AppHandle<R>,
     exe: PathBuf,
     codepage: u32,
+    settings: Settings,
+    graphics: Option<Graphics>,
 ) -> Result<ReportBase, String> {
     let data = app.path().app_data_dir().map_err(|e| e.to_string())?;
     tauri::async_runtime::spawn_blocking(move || {
         let game = Game::identify(&exe, codepage).map_err(|e| format!("{}: {e}", exe.display()))?;
+        let graphics = match graphics {
+            Some(graphics) => graphics,
+            None => {
+                let (device, _queue) =
+                    adv_gpu::Device::open(&adv_gpu::queue::DeviceOptions::default())
+                        .map_err(|e| e.to_string())?;
+                let identity = device.adapter_identity();
+                Graphics {
+                    api: if identity.api == "metal" {
+                        GraphicsApi::Metal
+                    } else {
+                        GraphicsApi::Vulkan
+                    },
+                    name: identity.name,
+                    vendor: identity.vendor,
+                    device: identity.device,
+                    driver: identity.driver,
+                    tier: identity.tier.into(),
+                }
+            }
+        };
         Ok(ReportBase {
             dedupe_key: adv_report::dedupe_key(&installation_secret(&data)?, &game.exe_sha256),
             app: App {
@@ -47,12 +69,18 @@ pub async fn report_base<R: Runtime>(
                 build: env!("ADV_BUILD").into(),
                 channel: "preview".into(),
             },
-            platform: Platform::current("gpu"),
+            platform: Platform::current(graphics, settings),
             game,
         })
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// Validate at the delivery boundary before opening an issue.
+#[tauri::command]
+pub fn report_json(report: Report) -> Result<String, String> {
+    adv_report::to_json(&report)
 }
 
 /// Civil date (UTC) of a Unix day number.

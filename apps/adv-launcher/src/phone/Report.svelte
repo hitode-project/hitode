@@ -121,7 +121,7 @@
         </div>
 
         <div>
-          <textarea class="note" rows="3" aria-label={t("补充说明（可选）")} placeholder={t("补充说明（可选）")} bind:value={form.note}></textarea>
+          <textarea class="note" rows="3" aria-label={t("补充说明（可选）")} placeholder={t("补充说明（可选）")} bind:value={form.note} maxlength="2000"></textarea>
         </div>
 
         <div>
@@ -130,7 +130,14 @@
             {#each form.rows as r (r.id)}
               <div class="rw" class:off={r.removed}>
                 <span class="k">{r.label}</span>
-                <span class="v" class:mono={!r.txt} class:txt={r.txt}>{r.value}</span>
+                {#if r.optional === "title"}
+                    <span class="v txt">
+                      <label><input type="checkbox" checked={!form.off.title} onchange={(event) => (form.off.title = !event.currentTarget.checked)} />{r.value} · {ctx.title?.vndb}</label>
+                      <input class="edition" aria-label={t("版本、补丁或翻译组")} placeholder={t("版本、补丁或翻译组")} maxlength="80" bind:value={form.edition} disabled={r.removed} />
+                    </span>
+                  {:else}
+                    <span class="v" class:mono={!r.txt} class:txt={r.txt}>{r.value}</span>
+                  {/if}
                 {#if r.locked}
                   <span class="lock" role="img" aria-label={t("{0}：必需，无法移除", r.label)}>
                     <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" aria-hidden="true"><rect x="3.5" y="7" width="9" height="6.5" rx="1.5"></rect><path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2"></path></svg>
@@ -148,7 +155,7 @@
               </div>
             {/each}
           </div>
-          <div class="privacy">{t("不含文件路径、用户名、截图和存档")}</div>
+
           <button class="rawbtn" class:open={form.rawOpen} aria-expanded={form.rawOpen} aria-controls="pr-raw" onclick={() => (form.rawOpen = !form.rawOpen)}>
             <span>{t("查看原始数据")}</span>
             <svg class="chev" width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6l4 4 4-4"></path></svg>
@@ -161,6 +168,8 @@
 
       <footer class="foot">
         <button class="primary big" onclick={() => form.save()} disabled={sending}>{t("保存为文件")}</button>
+          <button class="primary big" onclick={() => form.openIssue()} disabled={sending}>{t("打开问题页")}</button>
+          {#if form.deliveryError}<p role="alert">{form.deliveryError}</p>{/if}
 
       </footer>
     </div>
@@ -190,6 +199,7 @@
         <svg width="26" height="26" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2.5v7.5M4.8 7l3.2 3.2L11.2 7"></path><path d="M3 12.5h10"></path></svg>
       {/snippet}
       <div class="path mono">{form.savedPath}</div>
+        {#if form.attachReport}<p>{t("把文件附到问题中")}</p>{/if}
       {#snippet actions()}
         <button class="primary big" data-autofocus onclick={() => nav.back()}>{t("完成")}</button>
       {/snippet}
@@ -198,6 +208,7 @@
 </div>
 
 <style>
+  .edition { display: block; width: 100%; font: inherit; margin-top: 6px; }
   .report {
     --tint: color-mix(in srgb, var(--accent) 8%, transparent);
     flex: 1 1 0;
@@ -503,6 +514,7 @@
   .foot {
     flex: 0 0 auto;
     display: flex;
+    flex-wrap: wrap;
     gap: 10px;
     padding: 12px max(20px, var(--safe-right)) max(var(--safe-bottom), 16px) max(20px, var(--safe-left));
     border-top: 1px solid var(--line);
@@ -510,6 +522,7 @@
   }
   .foot > button {
     flex: 1 1 0;
+    min-width: 0;
   }
   /* The phone report board's pill buttons are 48px tall. */
   .big {
@@ -589,4 +602,6 @@
       transition: none;
     }
   }
+  .foot > p { flex-basis: 100%; margin: 0; font-size: 12px; }
+  .foot > .primary.big { padding: 0 10px; white-space: normal; font-size: 14px; }
 </style>

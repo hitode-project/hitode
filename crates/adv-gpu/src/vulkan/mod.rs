@@ -403,6 +403,24 @@ impl Drop for Context {
 }
 
 impl Device {
+    pub(crate) fn adapter_identity(&self) -> crate::queue::AdapterIdentity {
+        let caps = self.caps();
+        let id = |at| u32::from_le_bytes(self.0.cache_prefix[at..at + 4].try_into().unwrap());
+        crate::queue::AdapterIdentity {
+            api: "vulkan",
+            name: caps.adapter.clone(),
+            vendor: format!("0x{:04x}", id(16)),
+            device: format!("0x{:04x}", id(20)),
+            driver: caps.driver.clone(),
+            tier: if caps.modern.contains(Modern::BINDLESS) {
+                "bindless"
+            } else if caps.modern.contains(Modern::PUSH_DESCRIPTORS) {
+                "push_descriptors"
+            } else {
+                "descriptor_sets"
+            },
+        }
+    }
     pub(crate) fn caps(&self) -> &Caps {
         &self.0.caps
     }

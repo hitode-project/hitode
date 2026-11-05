@@ -250,6 +250,7 @@ pub(crate) struct Shared {
     connected: AtomicBool,
     waker: OnceLock<WakeEvent>,
     counters: Counters,
+    milestones: OnceLock<Arc<crate::Milestones>>,
 }
 impl Drop for Shared {
     fn drop(&mut self) {
@@ -286,6 +287,7 @@ impl AudioControl {
         let (retired_tx, retired_rx) = channel(4096);
         let clock = Arc::new(PlaybackClock::new(device_allowed));
         let shared = Arc::new(Shared {
+            milestones: OnceLock::new(),
             engine: AtomicPtr::new(std::ptr::null_mut()),
             clock,
             rate: AtomicU32::new(44100),
@@ -333,6 +335,9 @@ impl AudioControl {
             })),
             stream,
         }
+    }
+    pub fn set_milestones(&self, milestones: Arc<crate::Milestones>) {
+        let _ = self.stream.shared.milestones.set(milestones);
     }
     pub fn stream(&self) -> crate::AudioStream {
         self.stream.clone()
@@ -1113,10 +1118,16 @@ impl Engine {
             .counters
             .output_samples
             .fetch_add(out.len() as u64, Ordering::Relaxed);
-        shared.counters.nonzero_samples.fetch_add(
-            out.iter().filter(|value| value.abs() > 0.00001).count() as u64,
-            Ordering::Relaxed,
-        );
+        let nonzero = out.iter().filter(|value| value.abs() > 0.00001).count() as u64;
+        shared
+            .counters
+            .nonzero_samples
+            .fetch_add(nonzero, Ordering::Relaxed);
+        if nonzero != 0
+            && let Some(milestones) = shared.milestones.get()
+        {
+            milestones.audio.get_or_init(|| milestones.elapsed_ms());
+        }
         self.cursor_us += out.len() as f64 / f64::from(channels) * step;
         let active = self
             .voices

@@ -36,6 +36,9 @@ export interface GamePatch {
   folder?: string; exe?: string;
 }
 export interface RunSummary {
+  graphics?: import("./report").ReportGraphics | null;
+  settings?: import("./report").ReportSettings | null;
+  timeline?: import("./report").ReportTimeline | null;
   failure: {
     kind: "api" | "cpu" | "runtime";
     api: string | null;

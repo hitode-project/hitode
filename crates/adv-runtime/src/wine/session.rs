@@ -11,6 +11,10 @@ mod debug;
 mod files;
 mod fonts;
 mod host;
+pub use adv_cpu::backend::GuestExt;
+pub use adv_machine::exception::Checkpoint;
+pub use adv_nt::exception::{Record, StubGaps, WINE_STUB};
+pub use adv_nt::identity::Images;
 pub use host::Host;
 
 use adv_drv::user::project;
@@ -85,6 +89,9 @@ pub struct ControlMetrics {
 
 pub struct Session {
     pub machine: Machine<Cpu>,
+    pub failed_process: Option<u32>,
+    pub stub_gaps: Rc<RefCell<adv_nt::exception::StubGaps>>,
+    pub milestones: std::sync::Arc<adv_device::Milestones>,
     // Retires clients after the active machine releases its connection.
     _lease: host::Lease,
     wake: WakeEvent,
@@ -728,6 +735,12 @@ impl Session {
         let config = process_config;
         let mut machine = new_machine(&config, &drive, clock, &wake, &audio)?;
         machine.ext.insert(mounts);
+        let stub_gaps = Rc::new(RefCell::new(adv_nt::exception::StubGaps::default()));
+        machine.ext.insert(stub_gaps.clone());
+        let milestones = std::sync::Arc::new(adv_device::Milestones::default());
+        audio.set_milestones(milestones.clone());
+        machine.ext.insert(milestones.clone());
+        machine.ext.get_mut::<SurfaceStore>().milestones = Some(milestones.clone());
         prepare(&mut machine)?;
         let startup = Startup {
             image: &format!(r"{game_drive}:\{name}"),
@@ -771,6 +784,9 @@ impl Session {
         machine.ext.insert(shared.clone());
         Ok(Session {
             machine,
+            failed_process: None,
+            stub_gaps,
+            milestones,
             _lease: lease,
             wake,
             audio,
@@ -825,6 +841,9 @@ impl Session {
 
     fn run_family(&mut self, until: Instant, stop_frame: bool) -> Stop {
         let result = self.run_family_inner(until, stop_frame);
+        if matches!(result, Stop::Failed(_)) {
+            self.failed_process = Some(self.machine.sys.pid);
+        }
         if self.shared.id.get() != self.foreground
             && self
                 .shared
@@ -1147,6 +1166,8 @@ impl Session {
                 .ext
                 .get_mut::<SurfaceStore>()
                 .set_deferred_presentation(true)?;
+            machine.ext.insert(self.milestones.clone());
+            machine.ext.get_mut::<SurfaceStore>().milestones = Some(self.milestones.clone());
             let mut progress = shared.clone();
             let (connection, registered) = adv_nt::server::Connection::from_socket(
                 child.socket,
@@ -1188,6 +1209,7 @@ impl Session {
                 .ext
                 .insert(self.machine.ext.get::<process::Children>().fork());
             machine.ext.insert(shared.clone());
+            machine.ext.insert(self.stub_gaps.clone());
             self.shared
                 .driver
                 .borrow_mut()

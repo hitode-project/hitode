@@ -198,6 +198,7 @@ dependencies = [
 name = "adv-launcher"
 version = "0.2.4"
 dependencies = [
+ "adv-gpu",
  "adv-report",
  "adv-shell",
  "base64 0.23.1",
@@ -285,6 +286,8 @@ dependencies = [
 name = "adv-report"
 version = "0.2.4"
 dependencies = [
+ "adv-pe",
+ "libc",
  "serde",
  "serde_json",
  "sha2 0.10.9",

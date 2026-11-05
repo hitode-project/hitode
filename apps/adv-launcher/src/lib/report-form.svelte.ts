@@ -1,9 +1,13 @@
 import { t } from "./i18n.svelte";
-import { call } from "./bridge";
+import { invoke } from "@tauri-apps/api/core";
+import { call, inTauri } from "./bridge";
+import { playback } from "./playback";
+import { prefs } from "./prefs.svelte";
+import { gameFilter } from "./upscaling.svelte";
 import { fakeReportBase, fakeSavedPath, fakeSubmit } from "./fake-report";
 import { codepageLabel } from "./format";
 import type { RunSummary } from "./host";
-import { buildReport, PERF_ISSUES, type PerfIssue, type Report, type ReportBase, type ReportApiGaps, type ReportFailure, type ReportPerf, type Situation } from "./report";
+import { buildReport, issueUrl, PERF_ISSUES, type PerfIssue, type Report, type ReportBase, type ReportApiGaps, type ReportFailure, type ReportPerf, type Situation, type ReportTitle, type ReportTimeline, type ReportSettings } from "./report";
 import type { Game } from "./types";
 
 // The report form shared by the desktop and phone report screens: what the
@@ -12,13 +16,13 @@ import type { Game } from "./types";
 
 export type ReportView = "form" | "sending" | "sent" | "error" | "saved";
 /** Rows the user may leave out of the report. */
-export type Optional = "failure" | "perf" | "gaps" | "note";
+export type Optional = "title" | "failure" | "perf" | "gaps" | "note";
 
 export const SITUATIONS: [Situation, string][] = [
-  ["fail", "无法启动"],
-  ["crash", "中途出错"],
-  ["perf", "能玩，但有性能问题"],
-  ["ok", "能正常玩"],
+  ["no_start", "无法启动"], ["freeze", "卡死"], ["crash", "闪退"],
+  ["stutter", "卡顿、掉帧"], ["graphics", "画面异常"], ["sound_video", "声音或视频异常"],
+  ["input", "操作异常"], ["save", "存档读档异常"], ["heat", "发热、耗电异常"],
+  ["other", "其他"], ["ok", "能正常玩"],
 ];
 
 export const ISSUE_LABELS: Record<PerfIssue, string> = {
@@ -33,6 +37,8 @@ export const ISSUE_LABELS: Record<PerfIssue, string> = {
 /** What the report screen shows and sends besides the user's own choices. */
 export interface ReportContext {
   base: ReportBase;
+  title: ReportTitle | null;
+  timeline: ReportTimeline | null;
   /** Header line under the game title. */
   build: string;
   /** Read-only rows of "将发送的内容". */
@@ -78,16 +84,35 @@ function gapsLabel(gaps: ReportApiGaps): string {
  * game's last run this session (`summary`; missing when it has not run).
  */
 export async function loadReportContext(game: Game, summary: RunSummary | null | undefined, phone: boolean): Promise<ReportContext> {
+  const played = playback(game.id);
+  const recorded = summary?.settings;
+  const settings: ReportSettings = recorded
+    ? {
+        ...(recorded.upscaler === undefined ? {} : { upscaler: recorded.upscaler }),
+        ...(recorded.scaling === undefined ? {} : { scaling: recorded.scaling }),
+        ...(recorded.fast_forward === undefined ? {} : { fast_forward: recorded.fast_forward }),
+        touch_mode: prefs.touchMode, font_files: recorded.font_files, font_overrides: recorded.font_overrides,
+        font_smoothing: recorded.font_smoothing, discs: recorded.discs,
+      }
+    : {
+        upscaler: gameFilter(game.id), scaling: played.scale === "int" ? "integer" : played.scale,
+        fast_forward: played.toggle ? "toggle" : "hold", touch_mode: prefs.touchMode,
+        font_files: played.fontFiles.length, font_overrides: Object.keys(played.fontFamilies).length,
+        font_smoothing: played.smoothing, discs: played.discs.length,
+      };
   const base = await call<ReportBase>(
     "report_base",
-    { exe: `${game.path}/${game.exe}`, codepage: game.codepage },
+    { exe: `${game.path}/${game.exe}`, codepage: game.codepage, settings, graphics: summary?.graphics ?? null },
     fakeReportBase(game, phone),
   );
+  base.platform.settings = settings;
   const { app, platform } = base;
   const sha = base.game.exe_sha256;
-  const platformName = `${OS_NAMES[platform.os] ?? platform.os} ${platform.os_major} · ${platform.arch === "aarch64" ? "arm64" : "x64"}`;
+  const platformName = `${OS_NAMES[platform.os] ?? platform.os} ${platform.os_major} · ${platform.model}`;
   return {
     base,
+    title: game.vndb ? { vndb: game.vndb.id, name: game.vndb.title, edition: base.game.file_version ?? "" } : null,
+    timeline: summary?.timeline ?? null,
     build: `hitode ${app.version} · ${platformName}`,
     exeLabel: `sha256 ${sha.slice(0, 4)}…${sha.slice(-4)} · ${(base.game.exe_size / 1048576).toFixed(1)} MB`,
     versionLabel: `${app.version} (${app.build})`,
@@ -115,10 +140,13 @@ export interface ReportRow {
 
 export class ReportForm {
   view = $state<ReportView>("form");
-  situation = $state<Situation>("fail");
+  situation = $state<Situation>("no_start");
+  edition = $state("");
+  deliveryError = $state("");
+  attachReport = $state(false);
   issues = $state<Partial<Record<PerfIssue, boolean>>>({});
   note = $state("");
-  off = $state<Record<Optional, boolean>>({ failure: false, perf: false, gaps: false, note: false });
+  off = $state<Record<Optional, boolean>>({ title: false, failure: false, perf: false, gaps: false, note: false });
   rawOpen = $state(false);
   savedPath = $state("");
   /** Null while loading. */
@@ -139,7 +167,7 @@ export class ReportForm {
       let live = true;
       loadReportContext(g, s, phone).then(
         (ctx) => {
-          if (live) this.context = ctx;
+          if (live) { this.context = ctx; this.edition = ctx.title?.edition ?? ""; }
         },
         (error: unknown) => {
           if (live) this.loadError = String(error);
@@ -151,8 +179,8 @@ export class ReportForm {
     });
   }
 
-  readonly isPerf = $derived(this.situation === "perf");
-  readonly hasFail = $derived(this.situation === "fail" || this.situation === "crash");
+  readonly isPerf = $derived(this.situation === "stutter");
+  readonly hasFail = $derived(["no_start", "freeze", "crash"].includes(this.situation));
   readonly trimmed = $derived(this.note.trim());
   readonly sending = $derived(this.view === "sending");
 
@@ -165,9 +193,10 @@ export class ReportForm {
       { id: "plat", label: t("平台"), value: ctx.platformLabel, locked: true },
       { id: "cp", label: t("编码"), value: ctx.codepageLabel, locked: true },
     ];
+    if (ctx.title) list.push({ id: "title", label: t("作品与版本"), value: ctx.title.name, txt: true, locked: false, optional: "title" });
     // A launch failure is the point of the report, so it cannot be left out.
     if (this.hasFail)
-      list.push({ id: "fail", label: t("失败信息"), value: ctx.failureLabel, locked: this.situation === "fail", optional: "failure" });
+      list.push({ id: "fail", label: t("失败信息"), value: ctx.failureLabel, locked: this.situation === "no_start", optional: "failure" });
     if (this.isPerf) list.push({ id: "perf", label: t("性能"), value: ctx.perfLabel, locked: false, optional: "perf" });
     // Gaps the game survived matter in every situation.
     if (ctx.apiGaps) list.push({ id: "gaps", label: t("未实现接口"), value: gapsLabel(ctx.apiGaps), locked: false, optional: "gaps" });
@@ -179,9 +208,12 @@ export class ReportForm {
     const ctx = this.#ctx();
     if (!ctx) return null;
     const { situation, hasFail, isPerf, trimmed, off } = this;
-    const keepFailure = hasFail && (situation === "fail" || !off.failure);
+    const keepFailure = hasFail && (situation === "no_start" || !off.failure);
     return buildReport(ctx.base, {
       situation,
+      title: ctx.title ? { ...ctx.title, edition: this.edition.trim() } : null,
+      keepTitle: !off.title,
+      timeline: ctx.timeline,
       perfIssues: PERF_ISSUES.filter((k) => this.issues[k]),
       note: trimmed && !off.note ? trimmed : null,
       failure: keepFailure ? ctx.failure : null,
@@ -204,14 +236,36 @@ export class ReportForm {
     this.view = await fakeSubmit(report);
   }
 
-  async save(): Promise<void> {
+  async openIssue(): Promise<void> {
     const report = this.report;
     if (!report || this.sending) return;
+    this.deliveryError = "";
+    this.attachReport = false;
+    try {
+      const json = await call<string>("report_json", { report }, JSON.stringify(report, null, 2));
+      const url = issueUrl(report, json);
+      if (!new URL(url).searchParams.has("report")) {
+        if (!(await this.save())) return;
+        this.attachReport = true;
+      }
+      if (inTauri) await invoke("plugin:opener|open_url", { url });
+      else window.open(url, "_blank", "noopener");
+    } catch {
+      this.view = "form";
+      this.deliveryError = t("没能打开问题页，请再试一次");
+    }
+  }
+
+  async save(): Promise<boolean> {
+    const report = this.report;
+    if (!report || this.sending) return false;
     try {
       this.savedPath = await call<string>("save_report", { report }, fakeSavedPath());
       this.view = "saved";
+      return true;
     } catch (error) {
       console.error("save_report failed", error);
+      return false;
     }
   }
 }

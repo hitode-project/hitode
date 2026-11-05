@@ -79,7 +79,7 @@ fn load(path: &Path) -> Option<Arc<Table>> {
         .clone()
 }
 
-/// A mapped image of the distribution.
+/// A mapped image and its optional distribution identity.
 #[derive(Clone, Debug)]
 pub struct Module {
     pub base: u32,
@@ -87,17 +87,23 @@ pub struct Module {
     /// The image file's name, lowercase.
     pub name: String,
     header: u64,
-    table: PathBuf,
+    pub path: Option<PathBuf>,
+    table: Option<PathBuf>,
 }
 
 impl Module {
+    /// Whether its source path belongs to a distribution module.
+    pub fn is_distribution(&self) -> bool {
+        self.table.is_some()
+    }
+
     /// The image's table, if it describes this build.
     pub fn table(&self) -> Option<Arc<Table>> {
-        load(&self.table).filter(|table| table.header == self.header)
+        load(self.table.as_ref()?).filter(|table| table.header == self.header)
     }
 }
 
-/// The process's mapped distribution images, by base.
+/// The process's mapped images, by base.
 #[derive(Default)]
 pub struct Images(pub BTreeMap<u32, Module>);
 
@@ -124,23 +130,30 @@ fn table_of(dll: &Path) -> Option<(String, PathBuf)> {
     Some((name, table))
 }
 
-/// Records the image of `file`, mapped at `base`, if it is a module of
-/// the distribution.
+/// Records the mapped source and, for distribution modules, its code identity.
 pub(crate) fn note_image(ext: &mut Ext, base: u32, size: u32, dll: Option<&Path>, headers: &[u8]) {
     let images = ext.get_or_default::<Images>();
-    images.0.remove(&base);
-    if let Some((name, table)) = dll.and_then(table_of) {
-        images.0.insert(
+    let distribution = dll.and_then(table_of);
+    let header = if distribution.is_some() {
+        fnv1a64(headers)
+    } else {
+        0
+    };
+    let (name, table) = distribution.map_or_else(
+        || (String::new(), None),
+        |(name, table)| (name, Some(table)),
+    );
+    images.0.insert(
+        base,
+        Module {
             base,
-            Module {
-                base,
-                size,
-                name,
-                header: fnv1a64(headers),
-                table,
-            },
-        );
-    }
+            size,
+            name,
+            header,
+            table,
+            path: dll.map(Path::to_owned),
+        },
+    );
 }
 
 /// Records ntdll.dll, which a process maps from `image`, read from `dll`,
@@ -276,7 +289,8 @@ mod tests {
             size: 0x2000,
             name: "x.dll".into(),
             header: fnv1a64(headers),
-            table: table.clone(),
+            path: None,
+            table: Some(table.clone()),
         };
         assert!(module(b"MZ").table().is_some());
         assert!(module(b"MZ\0").table().is_none());

@@ -57,3 +57,28 @@ pub struct DeviceClock {
     pub consumed_frames: u64,
     pub queued_frames: u32,
 }
+
+/// Set-once guest events shared by every process of a run.
+pub struct Milestones {
+    pub started: std::time::Instant,
+    pub window: std::sync::OnceLock<u64>,
+    pub audio: std::sync::OnceLock<u64>,
+    pub video: std::sync::OnceLock<u64>,
+    pub input: std::sync::OnceLock<u64>,
+}
+impl Default for Milestones {
+    fn default() -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            window: Default::default(),
+            audio: Default::default(),
+            video: Default::default(),
+            input: Default::default(),
+        }
+    }
+}
+impl Milestones {
+    pub fn elapsed_ms(&self) -> u64 {
+        self.started.elapsed().as_millis() as u64
+    }
+}

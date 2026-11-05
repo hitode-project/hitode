@@ -148,6 +148,9 @@ impl Samples {
 
 #[derive(Default)]
 pub struct Performance {
+    pub(crate) run_first_frame: Option<Instant>,
+    pub(crate) run_last_frame: Option<Instant>,
+    pub(crate) run_frames: u64,
     #[cfg(any(
         target_os = "android",
         all(target_os = "macos", target_arch = "aarch64")
@@ -195,6 +198,9 @@ impl Performance {
     /// The first new frame establishes a boundary: its partial interval is excluded.
     pub fn reset(&mut self, serial: u64) {
         *self = Self {
+            run_first_frame: self.run_first_frame,
+            run_last_frame: self.run_last_frame,
+            run_frames: self.run_frames,
             #[cfg(any(
                 target_os = "android",
                 all(target_os = "macos", target_arch = "aarch64")
@@ -239,6 +245,9 @@ impl Performance {
         }
         if serial > self.observed_serial {
             let now = Instant::now();
+            self.run_first_frame.get_or_insert(now);
+            self.run_last_frame = Some(now);
+            self.run_frames = serial;
             if let Some(previous) = self.last_frame_observation.replace(now) {
                 self.warm_frame_wall_intervals
                     .add(now.saturating_duration_since(previous));
@@ -413,15 +422,21 @@ mod tests {
         assert!(stats.json().contains("\"ui_metrics_dropped_total\": 20"));
         assert_eq!(stats.pump_total, Duration::ZERO);
     }
+    // spec: REPORT-TIME-1
     #[test]
-    fn resetting_measurement_excludes_prior_frames_and_the_first_partial_interval() {
+    fn report_timeline_survives_resetting_frame_measurements() {
         let mut stats = Performance::default();
         let now = Instant::now();
         stats.step(Duration::from_secs(2), 100);
         stats.present(100, Duration::from_millis(2), now);
+        let first_frame = stats.run_first_frame;
+        assert!(first_frame.is_some());
         stats.reset(100);
         let now = stats.measurement_start.unwrap();
         stats.step(Duration::from_millis(5), 100);
+        assert_eq!(stats.run_first_frame, first_frame);
+        assert_eq!(stats.run_last_frame, first_frame);
+        assert_eq!(stats.run_frames, 100);
         stats.present(100, Duration::from_millis(1), now);
         stats.step(Duration::from_millis(3), 101);
         stats.present(
@@ -447,6 +462,9 @@ mod tests {
         assert_eq!(stats.host_intervals.recent, [16.0]);
         assert_eq!(stats.host_presentations, 2);
         assert_eq!(stats.host_repaints, 1);
+        assert_eq!(stats.run_first_frame, first_frame);
+        assert_eq!(stats.run_frames, 102);
+        assert!(stats.run_last_frame >= first_frame);
     }
     #[test]
     fn frame_metrics_exclude_idle_steps_placeholders_and_same_serial_repaints() {

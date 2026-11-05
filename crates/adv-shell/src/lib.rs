@@ -585,11 +585,178 @@ fn checksum(bytes: &[u8]) -> u64 {
 }
 
 /// The fault as a report shows it; backend text may name host state.
-fn cpu_fault(snapshot: &adv_machine::exception::CpuFaultSnapshot) -> String {
+fn cpu_fault(
+    snapshot: &adv_machine::exception::CpuFaultSnapshot,
+    caller: Option<u32>,
+    mut place: impl FnMut(u32) -> String,
+) -> String {
     let pc = snapshot.fault.pc;
-    match snapshot.access() {
-        Some((access, at)) => format!("{access} {at:#010x} at {pc:#010x}"),
-        None => format!("{} at {pc:#010x}", snapshot.kind_name()),
+    let pc = place(pc);
+    let mut text = match snapshot.access() {
+        Some((access, at)) => format!("{access} {} at {pc}", place(at)),
+        None => format!("{} at {pc}", snapshot.kind_name()),
+    };
+    if let Some(address) = caller {
+        text.push_str(&format!(" return {}", place(address)));
+    }
+    text
+}
+
+#[cfg(host_view)]
+fn report_site(
+    address: u32,
+    base: u32,
+    size: u32,
+    main: u32,
+    wine: Option<&str>,
+    path: Option<&Path>,
+) -> String {
+    if address.wrapping_sub(base) >= size {
+        return format!("{address:#010x}");
+    }
+    let name = if base == main {
+        "exe".into()
+    } else if let Some(name) = wine {
+        name.to_owned()
+    } else {
+        path.and_then(|path| std::fs::read(path).ok()).map_or_else(
+            || "game".into(),
+            |bytes| format!("game#{}", &adv_report::sha256(&bytes)[..8]),
+        )
+    };
+    format!("{name}+0x{:x}", address - base)
+}
+
+#[cfg(host_view)]
+fn report_machine_failure(
+    machine: &adv_machine::Machine<adv_runtime::Cpu>,
+    message: Option<&str>,
+    exit_code: Option<u32>,
+    gaps: &adv_runtime::wine::session::StubGaps,
+    elapsed: Duration,
+) -> Option<adv_report::Failure> {
+    const STATUS_ACCESS_VIOLATION: u32 = 0xc000_0005;
+    const STATUS_ILLEGAL_INSTRUCTION: u32 = 0xc000_001d;
+    const STATUS_INTEGER_DIVIDE_BY_ZERO: u32 = 0xc000_0094;
+    const STATUS_INTEGER_OVERFLOW: u32 = 0xc000_0095;
+    const STATUS_PRIVILEGED_INSTRUCTION: u32 = 0xc000_0096;
+    const STATUS_STACK_OVERFLOW: u32 = 0xc000_00fd;
+    use adv_runtime::wine::session::GuestExt;
+    let terminal = machine.ext.try_get::<adv_runtime::wine::session::Record>();
+    let snapshot = machine
+        .sys
+        .latest_cpu_fault
+        .as_ref()
+        .filter(|snapshot| terminal.is_none_or(|record| record.address == snapshot.fault.pc));
+    let terminal_cpu = terminal.filter(|record| {
+        matches!(
+            record.code,
+            STATUS_ACCESS_VIOLATION
+                | STATUS_ILLEGAL_INSTRUCTION
+                | STATUS_INTEGER_DIVIDE_BY_ZERO
+                | STATUS_INTEGER_OVERFLOW
+                | STATUS_PRIVILEGED_INSTRUCTION
+                | STATUS_STACK_OVERFLOW
+        )
+    });
+    let stub = gaps.failure.clone().or_else(|| {
+        (exit_code == Some(adv_runtime::wine::session::WINE_STUB))
+            .then(|| gaps.last.clone())
+            .flatten()
+    });
+    let mut found = report_failure(
+        message,
+        exit_code.or_else(|| terminal.map(|record| record.code)),
+        terminal_cpu
+            .map(|record| format!("exception {:#010x}", record.code))
+            .or_else(|| snapshot.map(|fault| fault.kind_name().to_owned())),
+        stub,
+        elapsed,
+    );
+    if let Some(failure) = &mut found
+        && failure.kind == adv_report::FailureKind::Cpu
+    {
+        let main = machine.cpu.read_u32(machine.sys.peb + 8).ok();
+        let images = machine.ext.try_get::<adv_runtime::wine::session::Images>();
+        let place = |address| match images.and_then(|images| images.containing(address)) {
+            Some(module) => report_site(
+                address,
+                module.base,
+                module.size,
+                main.unwrap_or(0),
+                module.table().is_some().then_some(module.name.as_str()),
+                module.path.as_deref(),
+            ),
+            None => format!("{address:#010x}"),
+        };
+        let caller = |context: u32, sp: u32, bp: u32| {
+            let stack = &machine.sys.contexts[context as usize];
+            bp.checked_add(4)
+                .filter(|&at| {
+                    at >= sp && at >= stack.stack_lo && at <= stack.stack_hi.saturating_sub(4)
+                })
+                .and_then(|at| machine.cpu.read_u32(at).ok())
+        };
+        if let Some(record) = terminal_cpu {
+            let mut text = if record.code == STATUS_ACCESS_VIOLATION && record.count >= 2 {
+                let access = match record.information[0] {
+                    0 => "read",
+                    1 => "write",
+                    8 => "execute",
+                    _ => "access",
+                };
+                format!(
+                    "{access} {} at {}",
+                    place(record.information[1]),
+                    place(record.address)
+                )
+            } else {
+                format!(
+                    "{} at {}",
+                    failure.cpu_fault.as_deref().unwrap(),
+                    place(record.address)
+                )
+            };
+            if let Some(checkpoint) = machine
+                .ext
+                .try_get::<adv_runtime::wine::session::Checkpoint>()
+                && let Some(address) = caller(
+                    machine.sys.current,
+                    checkpoint.state.regs[4],
+                    checkpoint.state.regs[5],
+                )
+            {
+                text.push_str(&format!(" return {}", place(address)));
+            }
+            failure.cpu_fault = Some(text);
+        } else if let Some(snapshot) = snapshot {
+            // CpuFaultSnapshot retains EBP in register slot 2.
+            let caller = caller(
+                snapshot.context,
+                snapshot.stack_address,
+                snapshot.registers[2].1,
+            );
+            failure.cpu_fault = Some(cpu_fault(snapshot, caller, place));
+        }
+    }
+    found
+}
+
+#[cfg(host_view)]
+fn report_settings(
+    options: &Options,
+    display: Option<(adv_report::Upscaler, adv_report::Scaling)>,
+    fast_forward: Option<adv_report::FastForward>,
+) -> adv_report::Settings {
+    adv_report::Settings {
+        upscaler: display.map(|(upscaler, _)| upscaler),
+        scaling: display.map(|(_, scaling)| scaling),
+        fast_forward,
+        touch_mode: None,
+        font_files: options.font_files.len() as u32,
+        font_overrides: options.font_families.len() as u32,
+        font_smoothing: options.font_smoothing,
+        discs: options.cdroms.len() as u32,
     }
 }
 
@@ -597,9 +764,12 @@ fn cpu_fault(snapshot: &adv_machine::exception::CpuFaultSnapshot) -> String {
 /// `elapsed`, classified like a guest failure; no frame timing is kept.
 pub fn error_summary(error: &str, elapsed: Duration) -> adv_report::RunSummary {
     adv_report::RunSummary {
-        failure: report_failure(Some(error), None, None, elapsed),
+        failure: report_failure(Some(error), None, None, None, elapsed),
         perf: None,
         api_gaps: None,
+        timeline: None,
+        settings: None,
+        graphics: None,
     }
 }
 
@@ -609,27 +779,32 @@ fn report_failure(
     message: Option<&str>,
     exit_code: Option<u32>,
     fault: Option<String>,
+    stub: Option<String>,
     elapsed: Duration,
 ) -> Option<adv_report::Failure> {
     use adv_report::FailureKind;
-    let (kind, api) = match message {
-        // Strict ABI stubs fail with "unimplemented: module!name (...)"
-        // (adv-abi/src/stub.rs); a child process prefixes its pid.
-        Some(message) if message.contains("unimplemented: ") => (
-            FailureKind::Api,
-            message
-                .split("unimplemented: ")
-                .nth(1)
-                .and_then(|api| api.split(" (").next())
-                .map(str::to_owned),
-        ),
-        Some(message) if message.contains("unhandled CPU") => (FailureKind::Cpu, None),
-        Some(_) => (FailureKind::Runtime, None),
-        // An unhandled guest exception ends the process with its NTSTATUS.
-        None if exit_code.is_some_and(|code| code >= 0xc000_0000) && fault.is_some() => {
-            (FailureKind::Cpu, None)
+    let (kind, api) = if let Some(api) = stub {
+        (FailureKind::Api, Some(api))
+    } else {
+        match message {
+            // Strict ABI stubs fail with "unimplemented: module!name (...)"
+            // (adv-abi/src/stub.rs); a child process prefixes its pid.
+            Some(message) if message.contains("unimplemented: ") => (
+                FailureKind::Api,
+                message
+                    .split("unimplemented: ")
+                    .nth(1)
+                    .and_then(|api| api.split(" (").next())
+                    .map(str::to_owned),
+            ),
+            Some(message) if message.contains("unhandled CPU") => (FailureKind::Cpu, None),
+            // An unhandled guest exception ends the process with its NTSTATUS.
+            _ if exit_code.is_some_and(|code| code >= 0xc000_0000) && fault.is_some() => {
+                (FailureKind::Cpu, None)
+            }
+            Some(_) => (FailureKind::Runtime, None),
+            None => return None,
         }
-        None => return None,
     };
     Some(adv_report::Failure {
         kind,
@@ -668,6 +843,44 @@ fn run(options: Options) -> Result<u8, String> {
     }
 }
 
+// spec: REPORT-SITE-1
+#[cfg(host_view)]
+#[test]
+fn report_crash_sites_use_anonymous_module_names() {
+    let directory = std::env::temp_dir().join(format!("adv-report-site-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("module.dll");
+    std::fs::write(&path, b"abc").unwrap();
+    assert_eq!(
+        report_site(0x401234, 0x400000, 0x2000, 0x400000, None, Some(&path)),
+        "exe+0x1234"
+    );
+    assert_eq!(
+        report_site(
+            0x601234,
+            0x600000,
+            0x2000,
+            0x400000,
+            Some("ntdll.dll"),
+            Some(&path)
+        ),
+        "ntdll.dll+0x1234"
+    );
+    assert_eq!(
+        report_site(0x601234, 0x600000, 0x2000, 0x400000, None, Some(&path)),
+        "game#ba7816bf+0x1234"
+    );
+    assert_eq!(
+        report_site(0x601234, 0x600000, 0x2000, 0x400000, None, None),
+        "game+0x1234"
+    );
+    assert_eq!(
+        report_site(0x1234, 0x600000, 0x2000, 0x400000, None, Some(&path)),
+        "0x00001234"
+    );
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
 // spec: REPORT-FAIL-1
 #[test]
 fn report_failures_are_classified_without_host_text() {
@@ -678,6 +891,7 @@ fn report_failures_are_classified_without_host_text() {
         Some("process 2: unimplemented: d3d9.dll!IDirect3DDevice9::CreateVolumeTexture (strict ABI stub)"),
         None,
         fault(),
+        None,
         minute,
     )
     .unwrap();
@@ -687,16 +901,29 @@ fn report_failures_are_classified_without_host_text() {
         Some("d3d9.dll!IDirect3DDevice9::CreateVolumeTexture")
     );
     assert_eq!((api.cpu_fault, api.after), (None, FailureAfter::Minutes));
-    let cpu = report_failure(Some("unhandled CPU stop: Fault(..)"), None, fault(), minute).unwrap();
+    let cpu = report_failure(
+        Some("unhandled CPU stop: Fault(..)"),
+        None,
+        fault(),
+        None,
+        minute,
+    )
+    .unwrap();
     assert_eq!(
         (cpu.kind, cpu.cpu_fault, cpu.api),
         (FailureKind::Cpu, fault(), None)
     );
-    let exited = report_failure(None, Some(0xc000_0005), fault(), minute).unwrap();
+    let exited = report_failure(None, Some(0xc000_0005), fault(), None, minute).unwrap();
     assert_eq!((exited.kind, exited.cpu_fault), (FailureKind::Cpu, fault()));
     // Other messages may name host paths; only the kind is kept.
-    let runtime =
-        report_failure(Some("open save/data.bin: denied"), None, fault(), minute).unwrap();
+    let runtime = report_failure(
+        Some("open save/data.bin: denied"),
+        None,
+        fault(),
+        None,
+        minute,
+    )
+    .unwrap();
     // spec: REPORT-FAIL-3
     let ended = error_summary("UI stopped while the guest was running", minute);
     assert_eq!(ended.perf, None);
@@ -708,8 +935,11 @@ fn report_failures_are_classified_without_host_text() {
         (runtime.kind, runtime.api, runtime.cpu_fault),
         (FailureKind::Runtime, None, None)
     );
-    assert_eq!(report_failure(None, Some(0), fault(), minute), None);
-    assert_eq!(report_failure(None, Some(0xc000_0005), None, minute), None);
+    assert_eq!(report_failure(None, Some(0), fault(), None, minute), None);
+    assert_eq!(
+        report_failure(None, Some(0xc000_0005), None, None, minute),
+        None
+    );
 }
 
 #[test]
@@ -775,7 +1005,7 @@ impl Suspension {
 
 #[cfg(host_view)]
 fn run_execution(
-    options: Options,
+    options: &Options,
     worker: frontend::Worker,
     wake: window::WakeEvent,
     keys: std::sync::Arc<adv_sync::input::KeyState>,
@@ -787,7 +1017,7 @@ fn run_execution(
         .ok_or("no Wine distribution to run on")?;
     wine::run_execution(
         &mut adv_runtime::wine::session::Host::default(),
-        &options,
+        options,
         &dist,
         worker,
         wake,
