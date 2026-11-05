@@ -99,10 +99,10 @@ Intermediate color damage MUST propagate through proven axis-aligned copies and 
 
 ### GFX-REC-5 Clipped execution and buffer age
 
-**Rule**: Present MUST replay the complete recording once, loading attachments and intersecting writes with the redraw bounding box. Each allocation MUST accumulate damage since its last execution, using full redraw when older than the eight-frame history. Clip state MUST clear after execution, including Busy and failure paths.
+**Rule**: Present MUST replay the complete recording once, loading attachments and running each write once per disjoint redraw scissor it meets. Each allocation MUST accumulate damage since its last execution, using full redraw when older than the eight-frame history. Clip state MUST clear after execution, including Busy and failure paths.
 **Verification**: Test
 
-Unknown allocations redraw fully; nonrotating targets have age one. Clear and copy respect the clip. Early flushes conservatively invalidate damage history. DISCARD rotation requires an initial full overwrite so replay reconstructs stale slots exactly. Accumulating frames restore the last logical backbuffer when necessary and keep the snapshot path. Early reads restore that baseline too. Diagnostic verification executes full frames while still computing damage and reading the actual presented allocation. No presentation cadence or audio behavior changes.
+Redraw scissors are at most eight disjoint rectangles covering the redraw cells; more coarsen the cells. A busy write resumes after the scissors it finished. Unknown allocations redraw fully; nonrotating targets have age one. Clear and copy respect the clip. Early flushes conservatively invalidate damage history. DISCARD rotation requires an initial full overwrite so replay reconstructs stale slots exactly. Accumulating frames restore the last logical backbuffer when necessary and keep the snapshot path. Early reads restore that baseline too. Diagnostic verification executes full frames while still computing damage and reading the actual presented allocation. No presentation cadence or audio behavior changes.
 Immutable snapshot presentation MUST preserve known color damage, just as rotating presentation does. Draws whose conservative bounds do not intersect the required execution region MUST be omitted before backend submission.
 
 ### GFX-REC-6 D3D9 unchanged calls
