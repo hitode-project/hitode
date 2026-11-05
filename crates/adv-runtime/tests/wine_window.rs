@@ -36,6 +36,10 @@ fn gdi_painting_a_window_reaches_the_presenter() {
     let mut registry = Registry::default();
     adv_runtime::wine::register(&mut registry);
     let mut presented = None;
+    // GPU builds show software frames on the native display; the capture
+    // precedes the store's GPU facade on this thread.
+    #[cfg(feature = "gpu")]
+    let capture = adv_device::gpu::test_support::SurfaceCapture::new().unwrap();
     let Some((result, output)) = common::run_probe_inspect(
         "window.exe",
         false,
@@ -44,8 +48,17 @@ fn gdi_painting_a_window_reaches_the_presenter() {
         |machine, prefix| {
             adv_unix::install(machine);
             adv_runtime::wine::install(machine, &prefix.join("drive_c"), 640, 480).unwrap();
+            #[cfg(feature = "gpu")]
+            machine.ext.insert(capture);
         },
         |machine| {
+            #[cfg(feature = "gpu")]
+            {
+                let (capture, store) = machine
+                    .ext
+                    .get2_installed_mut::<adv_device::gpu::test_support::SurfaceCapture, SurfaceStore>();
+                capture.update(store);
+            }
             let frame = &machine.ext.get::<SurfaceStore>().presenter;
             let stride = frame.width as usize;
             presented = Some((
