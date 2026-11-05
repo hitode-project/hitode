@@ -168,12 +168,14 @@ pub(super) struct Recording {
     reuse: reuse::Cache,
     passes: passes::Plan,
     damage: damage::Analysis,
-    verify_region: Option<adv_device::surface::Rect>,
+    verify_region: Option<adv_device::surface::Region>,
     verify_image: Option<adv_device::gpu::Image>,
     baseline: Option<adv_device::gpu::Image>,
     pub(super) rotate: bool,
     held_uploads: Vec<(Id, Option<u32>)>,
     head: usize,
+    /// Scissors the operation at `head` finished before it was busy.
+    part: usize,
     bytes: usize,
     key: u128,
     contents: Contents,
@@ -209,8 +211,8 @@ pub(super) fn forget(env: &mut Env<'_>, owner: Id, pointer: u32) {
     }
 }
 /// What the frame being presented changed since the previous presentation, when known.
-pub(super) fn changed(f: &Recording) -> Option<adv_device::surface::Rect> {
-    f.verify_region
+pub(super) fn changed(f: &Recording) -> Option<adv_device::surface::Region> {
+    f.verify_region.clone()
 }
 fn frame<'a>(env: &'a mut Env<'_>, owner: Id) -> &'a mut Recording {
     let Some(Payload::Device(d)) = com(env).get_identity_mut(&mut env.sys.objects, owner) else {
@@ -659,38 +661,47 @@ pub(super) fn flush(
                 *stencil = None;
             }
         }
-        let clip = if env.ext.get::<State>().verify_frames {
-            None
+        // The slot's scissors, unless it redraws whole (GFX-REC-5).
+        let slot = damage::image(&operation)
+            .filter(|_| !env.ext.get::<State>().verify_frames)
+            .and_then(|i| {
+                let slot = hash(i.id());
+                let full = adv_device::surface::Rect {
+                    x: 0,
+                    y: 0,
+                    w: i.width(),
+                    h: i.height(),
+                };
+                let parts = frame(env, owner).damage.clips.get(&slot)?;
+                (parts[..] != [full]).then_some((slot, parts.len()))
+            });
+        let result = if let Some((slot, parts)) = slot {
+            let mut result = Ok(Completion::Command);
+            // A write meeting several scissors resumes after the ones it
+            // finished when it was busy, so no blend applies twice.
+            while frame(env, owner).part < parts {
+                let f = frame(env, owner);
+                let clip = f.damage.clips[&slot][f.part];
+                if !f.passes.outside_damage(f.head, clip) {
+                    let gpu = env.ext.get_mut::<State>().gpu.as_mut().unwrap();
+                    gpu.set_clip(Some(clip));
+                    result = execute_gpu(env, &operation);
+                    env.ext
+                        .get_mut::<State>()
+                        .gpu
+                        .as_mut()
+                        .unwrap()
+                        .set_clip(None);
+                    if result.is_err() {
+                        break;
+                    }
+                }
+                frame(env, owner).part += 1;
+            }
+            result
         } else {
-            damage::image(&operation).and_then(|i| {
-                frame(env, owner)
-                    .damage
-                    .clips
-                    .get(&hash(i.id()))
-                    .copied()
-                    .filter(|r| r.w < i.width() || r.h < i.height())
-            })
+            execute_gpu(env, &operation)
         };
-        if clip.is_some_and(|r| {
-            let f = frame(env, owner);
-            f.passes.outside_damage(f.head, r)
-        }) {
-            frame(env, owner).head += 1;
-            continue;
-        }
-        env.ext
-            .get_mut::<State>()
-            .gpu
-            .as_mut()
-            .unwrap()
-            .set_clip(clip);
-        let result = execute_gpu(env, &operation);
-        env.ext
-            .get_mut::<State>()
-            .gpu
-            .as_mut()
-            .unwrap()
-            .set_clip(None);
         match result {
             Err(Error::Busy) => {
                 let f = frame(env, owner);
@@ -706,6 +717,7 @@ pub(super) fn flush(
                     d.frame.commands.clear();
                     d.frame.passes.truncate(0);
                     d.frame.head = 0;
+                    d.frame.part = 0;
                 }
                 return Ok(Completion::Command);
             }
@@ -718,6 +730,7 @@ pub(super) fn flush(
                 }
                 let f = frame(env, owner);
                 f.head += 1;
+                f.part = 0;
                 f.partial = true;
                 result?;
             }
@@ -761,6 +774,7 @@ pub(super) fn unlock(env: &mut Env<'_>, owner: Id, token: u64) {
         f.commands.clear();
         f.passes.truncate(0);
         f.head = 0;
+        f.part = 0;
         f.bytes = 0;
         for (resource, level) in held {
             clear_upload_lock(env, resource, level, true);
@@ -875,20 +889,32 @@ pub(super) fn present(env: &mut Env<'_>, operation: &Operation) -> Result<Comple
             h: image.height(),
         };
         let slot = hash(image.id());
+        let size = (full.w, full.h);
         f.verify_region = Some(if force || copy.is_some() {
-            full
+            adv_device::surface::Region::whole(size)
         } else {
-            f.damage.changed.get(&slot).copied().unwrap_or_default()
+            f.damage
+                .changed
+                .get(&slot)
+                .cloned()
+                .unwrap_or_else(|| adv_device::surface::Region::empty(size))
         });
-        let clip = f.damage.clips.get(&slot).copied().unwrap_or(full);
-        let fraction =
-            f64::from(clip.w) * f64::from(clip.h) / (f64::from(full.w) * f64::from(full.h));
+        let parts = f
+            .damage
+            .clips
+            .get(&slot)
+            .filter(|parts| parts[..] != [full]);
+        let clipped = parts.is_some();
+        let area = parts.map_or(u64::from(full.w) * u64::from(full.h), |parts| {
+            parts.iter().map(|r| u64::from(r.w) * u64::from(r.h)).sum()
+        });
+        let fraction = area as f64 / (f64::from(full.w) * f64::from(full.h));
         let counters = &mut env.ext.get_mut::<State>().frames;
         #[cfg(feature = "d3d9-counters")]
         {
             counters.eliminated_passes += _dead_passes;
         }
-        if verify || clip == full {
+        if verify || !clipped {
             counters.full_executions += 1;
         } else {
             counters.clipped_executions += 1;
@@ -996,9 +1022,9 @@ fn verify_pixels(
     };
     let pixels = (ticket.width, ticket.height, pixels?);
     let region = if repeat {
-        adv_device::surface::Rect::default()
+        adv_device::surface::Region::empty((pixels.0, pixels.1))
     } else {
-        f.verify_region.unwrap()
+        f.verify_region.clone().unwrap()
     };
     let mismatch = f.previous.as_ref().is_some_and(|previous| {
         previous.0 == pixels.0
@@ -1012,11 +1038,8 @@ fn verify_pixels(
                 .enumerate()
                 .any(|(n, (a, b))| {
                     let (x, y) = (n as u32 % pixels.0, n as u32 / pixels.0);
-                    (x < region.x
-                        || x >= region.x + region.w
-                        || y < region.y
-                        || y >= region.y + region.h)
-                        && a != b
+                    a != b
+                        && !region.intersects(adv_device::surface::Rect { x, y, w: 1, h: 1 }.into())
                 })
     });
     f.previous = Some(pixels);

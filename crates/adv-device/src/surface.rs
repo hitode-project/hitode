@@ -62,7 +62,7 @@ pub struct Snapshot {
     pub bgra: Vec<u8>,
     pub frames: u64,
     /// Regions converted during the latest snapshot, for incremental upload.
-    pub damage: Damage,
+    pub damage: Region,
 }
 
 /// One process-local pixel/target store. Snapshot is neutral device data, so
@@ -156,7 +156,7 @@ pub struct PendingFrame {
     serial: u64,
     published_at: Option<std::time::Instant>,
     pub(crate) pixels: Arc<Pixels>,
-    damage: Damage,
+    damage: Region,
     #[cfg(not(feature = "gpu"))]
     bottom_up: bool,
     history: DamageHistory,
@@ -173,7 +173,7 @@ impl Default for PendingFrame {
             serial: 0,
             published_at: None,
             pixels: Arc::new(Pixels::new()),
-            damage: Damage::default(),
+            damage: Region::default(),
             #[cfg(not(feature = "gpu"))]
             bottom_up: false,
             history: DamageHistory::default(),
@@ -189,7 +189,7 @@ impl PendingFrame {
         memory: &dyn SurfaceMemory,
         serial: u64,
         history: &DamageHistory,
-        damage: &Damage,
+        damage: &Region,
     ) -> Result<u64, String> {
         let full = surface.rect();
         let pitch = surface.pitch;
@@ -199,7 +199,7 @@ impl PendingFrame {
             || self.format != surface.format
             || Arc::get_mut(&mut self.pixels).is_none();
         let regions = if reset {
-            Damage::from_rect(full)
+            region((full.w, full.h), full)
         } else {
             damage_since(history, self.serial, serial, full)
         };
@@ -212,14 +212,14 @@ impl PendingFrame {
         self.bottom_up = surface.bottom_up;
         self.serial = 0; // A failed write invalidates this private slot's baseline.
         self.history = history.clone();
-        self.damage = *damage;
+        self.damage.clone_from(damage);
         if Arc::get_mut(&mut self.pixels).is_none() {
             self.pixels = Arc::new(Pixels::new());
         }
         let output = Arc::get_mut(&mut self.pixels).unwrap();
         output.resize((pitch * surface.height) as usize, 0);
         let mut copied = 0;
-        for r in regions.iter().copied() {
+        for r in rects(&regions) {
             let start = surface.format.byte_offset(r.x) as usize;
             let n = surface.span(r.x, r.w) as usize;
             for y in r.y..r.y + r.h {
@@ -267,7 +267,7 @@ impl PendingFrame {
             || out.bgra.len() != self.width as usize * self.height as usize * 4
             || (video && !self.video.is_empty())
         {
-            Damage::from_rect(full)
+            region((full.w, full.h), full)
         } else {
             damage_since(&self.history, out.frames, self.serial, full)
         };
@@ -275,7 +275,7 @@ impl PendingFrame {
         out.height = self.height;
         out.bgra
             .resize(self.width as usize * self.height as usize * 4, 0);
-        self.convert(out, &damage);
+        self.convert(out, &rects(&damage));
         if video {
             self.compose_video(out)?;
         }
@@ -309,11 +309,14 @@ impl PendingFrame {
             damage,
         );
     }
-    pub fn damage(&self) -> &[Rect] {
+    pub fn damage(&self) -> Vec<Rect> {
+        rects(&self.damage)
+    }
+    pub fn damage_region(&self) -> &Region {
         &self.damage
     }
     /// Changes since an independent software consumer's last complete frame.
-    pub fn damage_since(&self, serial: u64) -> Damage {
+    pub fn damage_since(&self, serial: u64) -> Region {
         damage_since(
             &self.history,
             serial,
@@ -418,53 +421,47 @@ impl Rect {
         }
     }
 }
-/// Bounded software damage, stored without per-publication allocation.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Damage {
-    rects: [Rect; 4],
-    len: usize,
-}
-impl Damage {
-    fn from_rect(rect: Rect) -> Self {
+/// Software damage: cells of the surface, never collapsed (#116).
+pub use adv_gpu::Region;
+impl From<Rect> for adv_gpu::Rect {
+    fn from(r: Rect) -> Self {
         Self {
-            rects: [rect, Rect::default(), Rect::default(), Rect::default()],
-            len: usize::from(!rect.empty()),
-        }
-    }
-    fn add(&mut self, mut r: Rect) {
-        let mut i = 0;
-        while i < self.len {
-            let old = self.rects[i];
-            if r.x <= old.x + old.w
-                && old.x <= r.x + r.w
-                && r.y <= old.y + old.h
-                && old.y <= r.y + r.h
-            {
-                r = r.union(old);
-                self.rects.copy_within(i + 1..self.len, i);
-                self.len -= 1;
-                i = 0;
-            } else {
-                i += 1;
-            }
-        }
-        if self.len == 4 {
-            *self = Self::from_rect(self.iter().copied().fold(r, Rect::union));
-        } else {
-            self.rects[self.len] = r;
-            self.len += 1;
+            x: r.x,
+            y: r.y,
+            w: r.w,
+            h: r.h,
         }
     }
 }
-impl std::ops::Deref for Damage {
-    type Target = [Rect];
-    fn deref(&self) -> &[Rect] {
-        &self.rects[..self.len]
+impl From<adv_gpu::Rect> for Rect {
+    fn from(r: adv_gpu::Rect) -> Self {
+        Self {
+            x: r.x,
+            y: r.y,
+            w: r.w,
+            h: r.h,
+        }
     }
+}
+/// The disjoint rectangles of `region`.
+pub fn rects(region: &Region) -> Vec<Rect> {
+    region.rects().into_iter().map(Into::into).collect()
+}
+fn region(size: (u32, u32), rect: Rect) -> Region {
+    let mut region = Region::empty(size);
+    region.add(rect.into());
+    region
+}
+fn area(region: &Region) -> u64 {
+    region
+        .rects()
+        .iter()
+        .map(|r| u64::from(r.w) * u64::from(r.h))
+        .sum()
 }
 #[derive(Clone, Default)]
 struct DamageHistory {
-    entries: [(u64, Damage); 16],
+    entries: [(u64, Region); 16],
     first: usize,
     len: usize,
 }
@@ -474,7 +471,7 @@ impl DamageHistory {
         self.len = 0;
     }
     #[cfg(not(feature = "gpu"))]
-    fn push(&mut self, entry: (u64, Damage)) {
+    fn push(&mut self, entry: (u64, Region)) {
         self.entries[(self.first + self.len) % 16] = entry;
         if self.len < 16 {
             self.len += 1;
@@ -482,7 +479,7 @@ impl DamageHistory {
             self.first = (self.first + 1) % 16;
         }
     }
-    fn iter(&self) -> impl Iterator<Item = &(u64, Damage)> {
+    fn iter(&self) -> impl Iterator<Item = &(u64, Region)> {
         (0..self.len).map(|i| &self.entries[(self.first + i) % 16])
     }
 }
@@ -490,31 +487,28 @@ fn verify_software() -> bool {
     static VERIFY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *VERIFY.get_or_init(|| std::env::var_os("ADV_VERIFY_SOFTWARE_FRAMES").is_some())
 }
-/// Content-diff tiles (DEV-FRAME-10).
-const TILE_W: u32 = 64;
-const TILE_H: u32 = 16;
-
-/// Shrinks declared damage to the tiles whose pixels differ from `previous`,
-/// the complete last publication in the same layout. Downstream copies,
-/// uploads, composition and upscaling then follow what actually changed.
-/// A rectangle that mostly changed keeps its declared bounds.
+/// Shrinks declared damage to the cells whose pixels differ from `previous`,
+/// the complete last publication in the same layout (DEV-FRAME-10). Rows
+/// compare whole first, then in cell-wide segments. Downstream copies,
+/// uploads, composition and upscaling then follow what actually changed. A
+/// declared rectangle that mostly changed stays whole.
 fn refine_damage(
     surface: &Surface,
     memory: &dyn SurfaceMemory,
     previous: &[u8],
     previous_pitch: u32,
-    declared: &Damage,
-) -> Result<Damage, String> {
+    declared: &Region,
+) -> Result<Region, String> {
+    use adv_gpu::region::CELL;
     let format = surface.format;
-    let mut out = Damage::default();
-    for r in declared.iter().copied() {
+    let mut out = Region::empty(declared.size());
+    for r in rects(declared) {
         let total = u64::from(r.w) * u64::from(r.h);
         let mut changed = 0u64;
-        let mut bands = Damage::default();
+        let mut cells = Region::empty(declared.size());
         let mut y = r.y;
         while y < r.y + r.h && changed * 4 <= total * 3 {
-            let h = TILE_H.min(r.y + r.h - y);
-            let (mut lo, mut hi) = (u32::MAX, 0);
+            let h = CELL.min(r.y + r.h - y);
             for row in y..y + h {
                 let start = format.byte_offset(r.x) as usize;
                 let n = surface.span(r.x, r.w) as usize;
@@ -526,51 +520,45 @@ fn refine_damage(
                 }
                 let mut x = r.x;
                 while x < r.x + r.w {
-                    let w = TILE_W.min(r.x + r.w - x);
-                    if x < lo || x + w > hi {
+                    let cell = Rect {
+                        x,
+                        y,
+                        w: CELL.min(r.x + r.w - x),
+                        h,
+                    };
+                    if !cells.intersects(cell.into()) {
                         let a = (format.byte_offset(x) - format.byte_offset(r.x)) as usize;
-                        let b = a + surface.span(x, w) as usize;
+                        let b = a + surface.span(x, cell.w) as usize;
                         if src[a..b] != old[a..b] {
-                            (lo, hi) = (lo.min(x), hi.max(x + w));
+                            cells.add(cell.into());
+                            changed += u64::from(cell.w) * u64::from(h);
                         }
                     }
-                    x += w;
+                    x += cell.w;
                 }
-            }
-            if lo < hi {
-                changed += u64::from(hi - lo) * u64::from(h);
-                bands.add(Rect {
-                    x: lo,
-                    y,
-                    w: hi - lo,
-                    h,
-                });
             }
             y += h;
         }
         if changed * 4 > total * 3 {
-            out.add(r);
+            out.add(r.into());
         } else {
-            for band in bands.iter().copied() {
-                out.add(band);
-            }
+            out.union(&cells);
         }
     }
     Ok(out)
 }
 
-fn damage_since(history: &DamageHistory, since: u64, serial: u64, full: Rect) -> Damage {
+fn damage_since(history: &DamageHistory, since: u64, serial: u64, full: Rect) -> Region {
+    let size = (full.w, full.h);
     if since == serial && since != 0 {
-        return Damage::default();
+        return Region::empty(size);
     }
     if since == 0 || since > serial || history.iter().next().is_none_or(|(n, _)| since < n - 1) {
-        return Damage::from_rect(full);
+        return Region::whole(size);
     }
-    let mut result = Damage::default();
+    let mut result = Region::empty(size);
     for (_, damage) in history.iter().filter(|(n, _)| *n > since) {
-        for &r in damage.iter() {
-            result.add(r);
-        }
+        result.union(damage);
     }
     result
 }
@@ -1314,7 +1302,7 @@ struct SoftwareFrame {
     source: u32,
     writer: u32,
     started: std::time::Instant,
-    damage: Damage,
+    damage: Region,
 }
 
 #[derive(Clone, Copy)]
@@ -1572,12 +1560,7 @@ impl<P: Presenter> Surfaces<P> {
         frame.serial = serial;
         frame.published_at = Some(std::time::Instant::now());
         frame.history.clear(); // Video composition and removal always rebuild the base.
-        frame.damage = Damage::from_rect(Rect {
-            x: 0,
-            y: 0,
-            w: frame.width,
-            h: frame.height,
-        });
+        frame.damage = Region::whole((frame.width, frame.height));
         frame.video = self.video_layers.clone();
         // The native display keeps showing the software base beneath the
         // layers; later samples publish over it again.
@@ -1653,11 +1636,7 @@ impl<P: Presenter> Surfaces<P> {
         let mut snapshot = std::mem::take(&mut self.conversion);
         frame.snapshot(&mut snapshot)?;
         if frame.format != PixelFormat::Bgra32 {
-            self.stats.converted_pixels += snapshot
-                .damage
-                .iter()
-                .map(|r| u64::from(r.w) * u64::from(r.h))
-                .sum::<u64>();
+            self.stats.converted_pixels += area(&snapshot.damage);
         }
         let result = self.presenter.present(FrameView {
             width: snapshot.width,
@@ -1666,11 +1645,7 @@ impl<P: Presenter> Surfaces<P> {
             bgra: &snapshot.bgra,
             serial: frame.serial,
         });
-        self.stats.converted_bytes += snapshot
-            .damage
-            .iter()
-            .map(|r| u64::from(r.w) * u64::from(r.h) * 4)
-            .sum::<u64>();
+        self.stats.converted_bytes += area(&snapshot.damage) * 4;
         self.conversion = snapshot;
         result?;
         self.captured_serial = frame.serial;
@@ -1856,7 +1831,8 @@ impl<P: Presenter> Surfaces<P> {
         if self.native_surfaces.contains_key(&id) {
             return Err("native surface requires GPU presentation".into());
         }
-        let damage = damage.clipped(self.surfaces[&id].rect());
+        let full = self.surfaces[&id].rect();
+        let damage = damage.clipped(full);
         if damage.empty() {
             self.stats.empty_damage += 1;
         } else if self.frame_mailbox.is_some() {
@@ -1871,12 +1847,12 @@ impl<P: Presenter> Surfaces<P> {
                 source: id,
                 writer: context,
                 started: std::time::Instant::now(),
-                damage: Damage::default(),
+                damage: Region::empty((full.w, full.h)),
             });
             pending.writer = context;
-            pending.damage.add(damage);
+            pending.damage.add(damage.into());
         } else {
-            return self.publish_software(id, m, Damage::from_rect(damage));
+            return self.publish_software(id, m, region((full.w, full.h), damage));
         }
         if self.software_expired() {
             self.flush(m, FlushReason::Timeout)?;
@@ -1921,7 +1897,7 @@ impl<P: Presenter> Surfaces<P> {
         &mut self,
         id: u32,
         m: &dyn SurfaceMemory,
-        damage: Damage,
+        damage: Region,
     ) -> Result<(), String> {
         let s = &self.surfaces[&id];
         let latest = self.retained_frame.as_ref();
@@ -1935,7 +1911,7 @@ impl<P: Presenter> Surfaces<P> {
                     || !Arc::ptr_eq(&f.video, &self.video_layers)
             });
         let damage = if reset {
-            Damage::from_rect(s.rect())
+            Region::whole((s.width, s.height))
         } else {
             damage
         };
@@ -1958,12 +1934,10 @@ impl<P: Presenter> Surfaces<P> {
             .software_started
             .get_or_insert_with(std::time::Instant::now);
         self.software_source = Some(id);
-        self.stats.damaged_pixels += damage
-            .iter()
-            .map(|r| u64::from(r.w) * u64::from(r.h))
-            .sum::<u64>();
+        self.stats.damaged_pixels += area(&damage);
         self.stats.frame_pixels += frame_pixels;
-        self.damage_history.push((self.stats.presentations, damage));
+        self.damage_history
+            .push((self.stats.presentations, damage.clone()));
         // Retire our latest reference before recycling the writer's private slot.
         self.retained_frame = None;
         if let Some((mailbox, wake)) = &mut self.frame_mailbox {
@@ -2020,7 +1994,7 @@ impl<P: Presenter> Surfaces<P> {
         &mut self,
         id: u32,
         m: &dyn SurfaceMemory,
-        damage: Damage,
+        damage: Region,
     ) -> Result<(), String> {
         let s = &self.surfaces[&id];
         let layout_changed = self
@@ -2041,7 +2015,7 @@ impl<P: Presenter> Surfaces<P> {
                 .as_ref()
                 .is_none_or(|video| !Arc::ptr_eq(video, &self.video_layers));
         let damage = if whole {
-            Damage::from_rect(s.rect())
+            Region::whole((s.width, s.height))
         } else {
             refine_damage(
                 s,
@@ -2058,6 +2032,7 @@ impl<P: Presenter> Surfaces<P> {
         let serial = self.stats.presentations + 1;
         let video = self.native_video((s.width, s.height));
         let s = &self.surfaces[&id];
+        let damaged = area(&damage);
         self.stats.copied_bytes += self.gpu.publish_software(
             self.software_slots.get_mut(&id).unwrap(),
             s,
@@ -2072,10 +2047,7 @@ impl<P: Presenter> Surfaces<P> {
         self.native_source = None;
         self.stats.presentations = serial;
         self.stats.published_frames += 1;
-        self.stats.damaged_pixels += damage
-            .iter()
-            .map(|r| u64::from(r.w) * u64::from(r.h))
-            .sum::<u64>();
+        self.stats.damaged_pixels += damaged;
         self.stats.frame_pixels += u64::from(s.width) * u64::from(s.height);
         self.stats
             .software_started
@@ -2155,11 +2127,12 @@ impl<P: Presenter> Surfaces<P> {
         Ok(std::mem::replace(&mut native.target, target))
     }
 
+    /// `None` damage means everything changed.
     #[cfg(feature = "gpu")]
     pub fn present_native(
         &mut self,
         id: u32,
-        damage: crate::frame::Damage,
+        damage: Option<Region>,
         gpu: &mut crate::gpu::Gpu,
     ) -> Result<(), String> {
         let image = &self
@@ -2174,6 +2147,7 @@ impl<P: Presenter> Surfaces<P> {
             .presentations
             .checked_add(1)
             .ok_or("presentation serial exhausted")?;
+        let damage = damage.unwrap_or_else(|| Region::whole(extent));
         let video = self.native_video(extent);
         gpu.present(
             &self.native_surfaces[&id].target.image,
@@ -2220,9 +2194,9 @@ impl<P: Presenter> Surfaces<P> {
                 .any(|(a, b)| a.id != b.id || a.geometry != b.geometry);
         if let Some(id) = self.native_source {
             let damage = if whole {
-                crate::frame::Damage::Whole
+                Region::whole(extent)
             } else {
-                crate::frame::Damage::Rects(Default::default())
+                Region::empty(extent)
             };
             self.gpu
                 .present(
@@ -2235,9 +2209,9 @@ impl<P: Presenter> Surfaces<P> {
         } else if let Some(id) = self.software_source {
             let s = &self.surfaces[&id];
             let damage = if whole {
-                Damage::from_rect(s.rect())
+                Region::whole((s.width, s.height))
             } else {
-                Damage::default()
+                Region::empty((s.width, s.height))
             };
             self.stats.copied_bytes += self.gpu.publish_software(
                 self.software_slots.get_mut(&id).unwrap(),

@@ -95,9 +95,7 @@ int main(void)
     while (timeGetTime() - start < 100) peek();
     printf("deadline=%lu\n", timeGetTime() - start);
     fflush(stdout);
-    start = timeGetTime();
-    while (seen != 63 && timeGetTime() - start < 10000) peek();
-    if (seen != 63) return 8;
+    while (seen != 63) peek();
     if (WaitForSingleObject(worker, 1000) || WaitForSingleObject(io, 1000)) return 9;
     DestroyWindow(window);
     return data != 'x';

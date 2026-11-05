@@ -171,14 +171,17 @@ jobs:
               --exclude adv-launcher --exclude adv-jit-helper --exclude tauri-plugin-storage
             features: ''
             media: false
+            wine: true
           - group: graphics-runtime
             packages: -p adv-device -p adv-dx -p adv-runtime -p adv-shell -p adv-run
             features: adv-shell/gpu,adv-shell/media
             media: true
+            wine: true
           - group: frontends
             packages: -p adv-launcher -p adv-jit-helper -p tauri-plugin-storage
             features: adv-shell/gpu
             media: true
+            wine: false
     env:
       CARGO_BUILD_JOBS: '3'
       CARGO_TARGET_DIR: ${{ github.workspace }}/target/workspace-ci
@@ -215,6 +218,21 @@ jobs:
           prefix=("$GITHUB_WORKSPACE"/target/macos-ffmpeg/*/install)
           echo "FFMPEG_DIR=${prefix[0]}" >> "$GITHUB_ENV"
           echo "LIBCLANG_PATH=$(dirname "$(dirname "$(xcrun --find clang)")")/lib" >> "$GITHUB_ENV"
+      # Wine probe tests run against the pinned userland; without it they
+      # would fail in CI rather than skip (adv-nt/tests/common/wine.rs).
+      - name: Cache pinned Wine userland
+        if: matrix.wine
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: target/wine-dist
+          key: wine-dist-${{ hashFiles('tools/release/wine.json') }}
+      - name: Fetch the pinned Wine userland and the probe compiler
+        if: matrix.wine
+        timeout-minutes: 10
+        run: |
+          python3 tools/release/fetch_wine.py target/wine-dist dist
+          echo "ADV_WINE_DIST=$GITHUB_WORKSPACE/target/wine-dist/wine11-sse-strip" >> "$GITHUB_ENV"
+          brew install mingw-w64
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         if: matrix.group == 'frontends'
         with:
@@ -248,7 +266,7 @@ jobs:
           fi
           cargo test "${args[@]}" --no-run --timings -v 2>&1 | tee "$RUNNER_TEMP/workspace-build.txt"
       - name: Execute tests
-        timeout-minutes: 5
+        timeout-minutes: 15
         run: |
           set -o pipefail
           read -r -a packages <<< "$WORKSPACE_PACKAGES"

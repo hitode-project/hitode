@@ -119,7 +119,7 @@ pub(crate) enum Command {
     /// End of a guest frame: submit and hand `image` to presentation.
     PresentSwap {
         image: Image,
-        damage: crate::frame::Damage,
+        damage: crate::frame::Region,
         serial: u64,
         video: Arc<[crate::frame::VideoPlane]>,
     },

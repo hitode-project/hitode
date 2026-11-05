@@ -10,7 +10,7 @@ publish.workspace = true
 [features]
 default = []
 device = ["dep:cpal"]
-gpu = ["dep:adv-gpu", "dep:arrayvec", "dep:bytemuck", "dep:objc2", "dep:libc", "dep:serde", "dep:naga"]
+gpu = ["adv-gpu/backend", "dep:arrayvec", "dep:bytemuck", "dep:objc2", "dep:libc", "dep:serde", "dep:naga"]
 # FFmpeg movie decoding; needs FFMPEG_DIR (see docs/building.md).
 media = ["dep:ffmpeg-next"]
 # Full DAC rate matrices; `cargo test-full` enables it.
@@ -26,7 +26,8 @@ libc = { version = "0.2", optional = true }
 serde = { version = "1", optional = true, features = ["derive", "rc"] }
 serde_json = "1"
 adv-sync = { path = "../adv-sync" }
-adv-gpu = { path = "../adv-gpu", optional = true }
+# Without `gpu`, only its damage regions.
+adv-gpu = { path = "../adv-gpu", default-features = false }
 arrayvec = { version = "0.7", optional = true }
 oxisynth = { version = "0.1.0", features = ["sf3"] }
 rubato = { version = "0.16", default-features = false }

@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 struct Entry {
     buffer: adv_gpu::Buffer,
     state: Arc<AtomicU64>,
-    debt: Damage,
+    debt: Region,
 }
 pub(crate) struct Slots {
     entries: [Entry; 3],
@@ -35,7 +35,7 @@ impl Slots {
             entries.push(Entry {
                 buffer: slot.buffer.clone(),
                 state: slot.state.clone(),
-                debt: Damage::from_rect(s.rect()),
+                debt: Region::whole((s.width, s.height)),
             });
         }
         Ok(Self {
@@ -79,15 +79,13 @@ impl Slots {
         stream: &mut Producer,
         s: &Surface,
         m: &dyn SurfaceMemory,
-        damage: Damage,
+        damage: Region,
         whole: bool,
         serial: u64,
         video: Arc<[crate::frame::VideoPlane]>,
     ) -> Result<u64, String> {
         for entry in &mut self.entries {
-            for &r in damage.iter() {
-                entry.debt.add(r);
-            }
+            entry.debt.union(&damage);
         }
         let i = self.acquire(stream);
         // A guest read failure must not retain a partly overwritten baseline.
@@ -103,7 +101,8 @@ impl Slots {
         // SAFETY: acquire admitted this slot only after its GPU reads completed.
         let output = unsafe { entry.buffer.mapped().unwrap().as_mut() };
         let mut copied = 0;
-        for &r in entry.debt.iter() {
+        let debt = rects(&entry.debt);
+        for &r in &debt {
             let start = s.format.byte_offset(r.x);
             let len = s.span(r.x, r.w) as usize;
             for y in r.y..r.y + r.h {
@@ -113,11 +112,11 @@ impl Slots {
                 copied += len as u64;
             }
         }
-        entry.buffer.flush(entry.debt.iter().map(|r| {
+        entry.buffer.flush(debt.iter().map(|r| {
             let start = u64::from(r.y * s.pitch + s.format.byte_offset(r.x));
             start..start + u64::from((r.h - 1) * s.pitch + s.span(r.x, r.w))
         }));
-        entry.debt = Damage::default();
+        entry.debt = Region::empty((s.width, s.height));
         self.last = Some(i);
         let palette_changed = match (&self.palette, &s.palette) {
             (Some(a), Some(b)) => !Arc::ptr_eq(a, b),
@@ -126,7 +125,7 @@ impl Slots {
         };
         self.palette.clone_from(&s.palette);
         let damage = if whole || palette_changed {
-            Damage::from_rect(s.rect())
+            Region::whole((s.width, s.height))
         } else {
             damage
         };
@@ -135,17 +134,7 @@ impl Slots {
                 slot,
                 format: s.format,
                 palette: self.palette.clone(),
-                damage: crate::frame::Damage::Rects(
-                    damage
-                        .iter()
-                        .map(|r| adv_gpu::Rect {
-                            x: r.x,
-                            y: r.y,
-                            w: r.w,
-                            h: r.h,
-                        })
-                        .collect(),
-                ),
+                damage,
             },
             video,
             serial,
@@ -212,7 +201,7 @@ mod tests {
         Slot,
         PixelFormat,
         Option<crate::frame::Palette>,
-        crate::frame::Damage,
+        crate::frame::Region,
     ) {
         let mut chunk = consumer.try_next().unwrap();
         let Command::Present {
@@ -248,8 +237,9 @@ mod tests {
         let (mut producer, consumer) = stream::channel(device.ring(4096).unwrap());
         let mut ids = Vec::new();
         for frame in 0..9 {
+            // Cells apart, so each slot's debt stays three separate cells.
             let rect = Rect {
-                x: frame * 4,
+                x: frame * 16 % 64,
                 y: 0,
                 w: 1,
                 h: 1,
@@ -262,7 +252,7 @@ mod tests {
                     &mut producer,
                     &s,
                     &memory,
-                    Damage::from_rect(rect),
+                    super::region((s.width, s.height), rect),
                     frame == 3,
                     frame as u64,
                     Arc::from([]),
@@ -270,19 +260,7 @@ mod tests {
                 .unwrap();
             let (slot, _, _, damage) = take(&consumer);
             if frame == 3 {
-                assert_eq!(
-                    damage,
-                    crate::frame::Damage::Rects(
-                        [adv_gpu::Rect {
-                            x: 0,
-                            y: 0,
-                            w: s.width,
-                            h: s.height,
-                        }]
-                        .into_iter()
-                        .collect()
-                    )
-                );
+                assert!(damage.is_whole());
             }
             ids.push(slot.buffer().mapped().unwrap().as_ptr().cast::<u8>() as usize);
             let reads = memory.reads.lock().unwrap();
@@ -290,11 +268,15 @@ mod tests {
                 assert_eq!(copied, 64 * 2 * 3);
                 assert_eq!(*reads, [(0, 192), (s.pitch, 192)]);
             } else {
-                assert_eq!(copied, 9);
+                // Three cells of 8 pixels, each on both rows.
+                assert_eq!(copied, 3 * 2 * 24);
+                let mut cells: Vec<_> = ((frame - 2)..=frame).map(|i| i * 16 % 64).collect();
+                cells.sort();
                 assert_eq!(
                     *reads,
-                    ((frame - 2)..=frame)
-                        .map(|i| (s.row(i * 4, 0), 3))
+                    cells
+                        .into_iter()
+                        .flat_map(|x| [(s.row(x, 0), 24), (s.row(x, 1), 24)])
                         .collect::<Vec<_>>()
                 );
                 assert_eq!(ids[frame as usize], ids[frame as usize - 3]);
@@ -326,7 +308,7 @@ mod tests {
                     &mut producer,
                     &s,
                     &memory,
-                    Damage::default(),
+                    Region::empty((s.width, s.height)),
                     serial == 0,
                     serial,
                     Arc::from([]),
@@ -348,7 +330,7 @@ mod tests {
                     &mut producer,
                     &s,
                     &memory,
-                    Damage::default(),
+                    Region::empty((s.width, s.height)),
                     false,
                     3,
                     Arc::from([])
@@ -363,18 +345,7 @@ mod tests {
         ));
         assert_eq!(previous[1], [0; 4]);
         assert!(memory.reads.lock().unwrap().is_empty());
-        let crate::frame::Damage::Rects(rects) = damage else {
-            panic!("full decode damage")
-        };
-        assert_eq!(
-            rects.as_slice(),
-            &[adv_gpu::Rect {
-                x: 0,
-                y: 0,
-                w: 16,
-                h: 2
-            }]
-        );
+        assert!(damage.is_whole());
     }
 
     #[test]
@@ -394,7 +365,7 @@ mod tests {
                     &mut producer,
                     &s,
                     &memory,
-                    Damage::from_rect(s.rect()),
+                    Region::whole((s.width, s.height)),
                     false,
                     serial,
                     Arc::from([]),
@@ -410,7 +381,7 @@ mod tests {
                     &mut producer,
                     &s,
                     &memory,
-                    Damage::from_rect(s.rect()),
+                    Region::whole((s.width, s.height)),
                     false,
                     3,
                     Arc::from([]),

@@ -2007,14 +2007,12 @@ fn d3dx_block_rounding_wraps_and_zero_divisors_fault() {
 // spec: NAT-BODY-20
 #[test]
 fn nls_layout_matches_dwarf() {
-    let Some(dist) = dist() else {
+    let Some(debug) = wine::debug_dist() else {
         return;
     };
     let source = include_str!("../src/native/nls.rs");
     for module in ["kernelbase", "ntdll"] {
-        let dll = dist
-            .with_file_name("wine11-sse-dist")
-            .join(format!("usr/local/lib/wine/i386-windows/{module}.dll"));
+        let dll = debug.join(format!("usr/local/lib/wine/i386-windows/{module}.dll"));
         let pe = Pe::parse(&std::fs::read(&dll).unwrap()).unwrap();
         let dump = std::process::Command::new("dwarfdump")
             .arg("--debug-info")

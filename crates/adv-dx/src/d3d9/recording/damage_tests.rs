@@ -370,7 +370,8 @@ fn one_changed_quad_replays_in_order_and_clear_preserves_pixels_outside_damage()
     assert_eq!(latest(&mut f), reference(&mut f, colors));
     let counts = f.m.ext.get::<State>().frames;
     assert_eq!(counts.clipped_executions, 1);
-    assert!((counts.clipped_area_sum - (1. + 16. / 192.)).abs() < 1e-9);
+    // The quad's 4x4 bounds round to their 8x8 damage cell.
+    assert!((counts.clipped_area_sum - (1. + 64. / 192.)).abs() < 1e-9);
 }
 
 fn bind_depth(f: &mut Fixture, width: u32, height: u32) -> u32 {
@@ -557,9 +558,14 @@ fn attachment_only_changes_do_not_publish_color_damage() {
         );
         present(&mut f);
         assert_eq!(latest(&mut f), expected);
-        assert_eq!(
-            f.m.ext.get::<Presents>().damage.last().copied().flatten(),
-            Some(Rect::default())
+        assert!(
+            f.m.ext
+                .get::<Presents>()
+                .damage
+                .last()
+                .cloned()
+                .flatten()
+                .is_some_and(|d| d.is_empty())
         );
     }
 }
@@ -611,8 +617,8 @@ fn repeated_partial_clear_overwrites_its_region_without_accumulating_damage() {
         assert_eq!(frames[2], frames[3]);
         if !verify {
             let damage = &f.m.ext.get::<Presents>().damage;
-            assert_eq!(damage[2], Some(Rect::default()));
-            assert_eq!(damage[4], Some(Rect::default()));
+            assert!(damage[2].as_ref().is_some_and(|d| d.is_empty()));
+            assert!(damage[4].as_ref().is_some_and(|d| d.is_empty()));
         }
         outputs.push(frames);
     }
@@ -622,7 +628,7 @@ fn repeated_partial_clear_overwrites_its_region_without_accumulating_damage() {
 struct Rotation {
     targets: Vec<Target>,
     next: usize,
-    damage: Vec<Option<adv_device::surface::Rect>>,
+    damage: Vec<Option<adv_device::surface::Region>>,
 }
 fn rotate(f: &mut Fixture, count: usize) {
     let mut targets = vec![f.target(f.back)];
@@ -646,7 +652,7 @@ fn rotate(f: &mut Fixture, count: usize) {
         let provider = ext.get::<State>().provider;
         let image = (provider.target)(ext, surface).unwrap().image;
         let serial = ext.get::<Presents>().serial + 1;
-        let native = test_support::completed_frame(gpu, image, damage, serial)?;
+        let native = test_support::completed_frame(gpu, image, damage.clone(), serial)?;
         let r = ext.get_mut::<Rotation>();
         r.damage.push(damage);
         r.next = (r.next + 1) % r.targets.len();
@@ -678,7 +684,7 @@ fn age_two_and_three_rotating_targets_match_full_execution_bit_for_bit() {
                 "rotation {count}, frame {frame}"
             );
             // The published damage covers every pixel that differs from the previous present.
-            let published = f.m.ext.get::<Rotation>().damage.last().copied().flatten();
+            let published = f.m.ext.get::<Rotation>().damage.last().cloned().flatten();
             if let (Some(r), Some(previous)) = (published, &previous) {
                 for (i, (a, b)) in pixels
                     .as_chunks::<4>()
@@ -688,7 +694,7 @@ fn age_two_and_three_rotating_targets_match_full_execution_bit_for_bit() {
                     .enumerate()
                 {
                     let (x, y) = (i as u32 % 16, i as u32 / 16);
-                    let inside = x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h;
+                    let inside = r.intersects(Rect { x, y, w: 1, h: 1 }.into());
                     assert!(
                         inside || a == b,
                         "rotation {count}, frame {frame}, pixel {x},{y}"
@@ -717,7 +723,8 @@ fn verification_checks_outside_changed_bounds_and_reads_presented_rotation_slot(
     }
     assert_eq!(f.m.ext.get::<State>().frames.verification_mismatches, 0);
     let owner = id(&mut f);
-    frame(&mut env(&mut f), owner).previous.as_mut().unwrap().2[0] ^= 1;
+    // A pixel outside the changed quad's damage cell.
+    frame(&mut env(&mut f), owner).previous.as_mut().unwrap().2[(11 * 16 + 15) * 4] ^= 1;
     colors[0][1] = 0.75;
     scene(&mut f, colors);
     present(&mut f);
@@ -817,7 +824,8 @@ fn sampled_target_changes_damage_the_consuming_draw_and_copy_clips_keep_offsets(
     }
     assert_ne!(keys[0], keys[1]);
     assert_eq!(f.m.ext.get::<State>().frames.clipped_executions, 1);
-    assert!((f.m.ext.get::<State>().frames.clipped_area_sum - (1. + 16. / 192.)).abs() < 1e-9);
+    // The consuming quad's damage cell.
+    assert!((f.m.ext.get::<State>().frames.clipped_area_sum - (1. + 64. / 192.)).abs() < 1e-9);
     // Source and destination offsets must move together in an unscaled copy.
     let gpu = f.m.ext.get_mut::<State>().gpu.as_mut().unwrap();
     let a = gpu.target(4, 4, false).unwrap();
@@ -1182,20 +1190,10 @@ fn local_damage_crosses_scaled_copy_and_fixed_or_shader_composition_exactly() {
                     }
                     present(&mut f);
                     frames.push(latest(&mut f));
-                    if n > 0 {
-                        let damage =
-                            f.m.ext
-                                .get::<Rotation>()
-                                .damage
-                                .last()
-                                .copied()
-                                .flatten()
-                                .unwrap();
-                        assert!(
-                            damage.w * damage.h < 16 * 12 / 2,
-                            "shader={shader} flip={flipped}, frame={n}: {damage:?}"
-                        );
-                    }
+                    // Each intermediate hop rounds to 8x8 cells, which on this
+                    // 2x2-cell target reach everything; the tracker's unit tests
+                    // cover locality. Verification checks the damage covers every
+                    // change.
                 }
                 assert_eq!(f.m.ext.get::<State>().frames.verification_mismatches, 0);
                 outputs.push(frames);
@@ -1203,4 +1201,68 @@ fn local_damage_crosses_scaled_copy_and_fixed_or_shader_composition_exactly() {
             assert_eq!(outputs[0], outputs[1], "shader={shader} flip={flipped}");
         }
     }
+}
+/// A `w`×`h` quad at `x`,`y` in the 16×12 fixture target.
+fn quad_at(f: &mut Fixture, (x, y, w, h): (f32, f32, f32, f32), color: [f32; 4]) -> fixed::Draw {
+    let mut d = draw(f);
+    d.vertices = [
+        (x, y),
+        (x + w, y),
+        (x, y + h),
+        (x, y + h),
+        (x + w, y),
+        (x + w, y + h),
+    ]
+    .map(|(x, y)| Vertex {
+        position: [x / 8. - 1., 1. - y / 6., 0., 1.],
+        color,
+        uv: [0.; 2],
+    })
+    .to_vec()
+    .into();
+    d
+}
+// spec: GFX-REC-4 GFX-REC-5
+#[test]
+fn distant_changes_replay_in_separate_scissors_without_losing_unchanged_draws_between() {
+    // Two diagonal cells change; the cell between them holds an unchanged
+    // draw that meets neither. One scissor around both would make the clear
+    // erase it unless it ran too; each scissor alone leaves it untouched.
+    let quads = [(1., 1., 2., 2.), (10., 1., 2., 2.), (10., 9., 2., 2.)];
+    let mut colors = [[1., 0., 0., 1.], [0., 1., 0., 1.], [0., 0., 1., 1.]];
+    let mut f = fixture();
+    let frame = |f: &mut Fixture, colors: [[f32; 4]; 3]| {
+        clear(f, 0xff000000);
+        for (q, color) in quads.into_iter().zip(colors) {
+            let d = quad_at(f, q, color);
+            record_draw(f, d);
+        }
+        present(f);
+    };
+    frame(&mut f, colors);
+    colors[0] = [1., 1., 0., 1.];
+    colors[2] = [1., 1., 1., 1.];
+    frame(&mut f, colors);
+
+    let target =
+        f.m.ext
+            .get::<State>()
+            .gpu
+            .as_ref()
+            .unwrap()
+            .target(16, 12, false)
+            .unwrap()
+            .with_alpha_mode(AlphaMode::Opaque);
+    let gpu = f.m.ext.get_mut::<State>().gpu.as_mut().unwrap();
+    gpu.clear(&target, Some([0., 0., 0., 1.]), None).unwrap();
+    for (q, color) in quads.into_iter().zip(colors) {
+        let d = quad_at(&mut f, q, color);
+        let gpu = f.m.ext.get_mut::<State>().gpu.as_mut().unwrap();
+        gpu.draw(&target, &d.vertices, None, d.state).unwrap();
+    }
+    assert_eq!(latest(&mut f), pixels(&mut f, &target.image));
+    let counts = f.m.ext.get::<State>().frames;
+    assert_eq!(counts.clipped_executions, 1);
+    // The 8x8 top-left and 8x4 bottom-right cells of the 192-pixel target.
+    assert!((counts.clipped_area_sum - (1. + 96. / 192.)).abs() < 1e-9);
 }

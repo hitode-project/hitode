@@ -100,7 +100,7 @@ impl Frame {
     /// Take over a replaced, never encoded frame: its damage, and the new
     /// pictures of videos this frame still shows without a new one.
     fn inherit(&mut self, older: Frame) {
-        self.info.damage = self.info.damage.union(&older.info.damage);
+        self.info.damage.union(&older.info.damage);
         for old in older.video {
             let Some(image) = old.update else { continue };
             if let Some(i) = self
@@ -467,7 +467,7 @@ impl Display {
     /// The newest content again, in full: a waiting frame, else the shown one.
     fn redraw_frame(&mut self) -> Option<Frame> {
         if let Some(mut frame) = self.deferred.take() {
-            frame.info.damage = Damage::Whole;
+            frame.info.damage = Region::whole(frame.info.canvas);
             return Some(frame);
         }
         let (record, image, video) = if let Some(held) = &self.held {
@@ -481,7 +481,7 @@ impl Display {
             .unwrap();
         let mut info = record.frame.clone();
         info.base = BaseKind::Gpu { presentable: false };
-        info.damage = Damage::Whole;
+        info.damage = Region::whole(info.canvas);
         Some(Frame {
             info,
             base: Base::Retained {
@@ -499,7 +499,7 @@ impl Display {
             serial: 0,
             canvas,
             base: BaseKind::Gpu { presentable: true },
-            damage: Damage::None,
+            damage: Region::empty(canvas),
             video: Default::default(),
             cursor_regions: Default::default(),
         };
@@ -705,11 +705,11 @@ impl Display {
         // A redraw resamples the shown image; the next frame replaces it whole.
         let redraw = source.is_some();
         let reading = self.held.take().and_then(|held| {
-            frame.info.damage = frame.info.damage.union(&held.record.plan.damage);
+            frame.info.damage.union(&held.record.plan.damage);
             self.discard(held, source)
         });
         if self.invalid {
-            frame.info.damage = Damage::Whole;
+            frame.info.damage = Region::whole(frame.info.canvas);
         }
         self.encoded_refresh = self.refresh.unwrap_or(0);
         let result = self.encode(queue, frame, reading.as_ref());

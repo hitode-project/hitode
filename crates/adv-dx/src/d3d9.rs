@@ -71,12 +71,12 @@ pub struct SurfaceProvider {
     pub target: fn(&Ext, u32) -> Option<Target>,
     pub remove: fn(&mut Ext, &mut dyn adv_cpu::backend::Guest, u32) -> Result<(), String>,
     pub replace: fn(&mut Ext, u32, Target) -> Result<(), String>,
-    /// Rotates the surface's front; the rectangle is what changed since its previous present.
+    /// Rotates the surface's front; the region is what changed since its previous present.
     pub present:
-        fn(&mut Ext, u32, Option<adv_device::surface::Rect>, &mut Gpu) -> Result<u64, Error>,
+        fn(&mut Ext, u32, Option<adv_device::surface::Region>, &mut Gpu) -> Result<u64, Error>,
     /// Snapshot a preserved COPY front without rotating its writable target.
     pub present_copy:
-        fn(&mut Ext, u32, Option<adv_device::surface::Rect>, &mut Gpu) -> Result<u64, Error>,
+        fn(&mut Ext, u32, Option<adv_device::surface::Region>, &mut Gpu) -> Result<u64, Error>,
     /// Complete a guest Present without publishing or executing a GPU command.
     pub repeat: fn(&mut Ext, u32) -> Result<u64, Error>,
     /// Shared serial includes other devices, GDI, DirectDraw and video fronts.

@@ -1,13 +1,14 @@
-//! A window shown through a UI's frame mailbox: DirectDraw blits text Wine's
-//! GDI drew to the primary surface, and the frame reaches the mailbox while
-//! the program waits for messages, with nothing reading it back.
+//! A window shown to the UI: DirectDraw blits text Wine's GDI drew to the
+//! primary surface, and the frame reaches the UI while the program waits for
+//! messages, with nothing reading it back. GPU builds show software frames on
+//! the native display; other builds hand them to the UI's frame mailbox.
 //!
 //! It needs `ADV_WINE_DIST`, as the probe tests do.
 #![cfg(any(target_vendor = "apple", target_os = "android"))]
 
 use std::time::{Duration, Instant};
 
-use adv_device::surface::{Snapshot, SurfaceStore, frame_mailbox};
+use adv_device::surface::{Snapshot, SurfaceStore};
 use adv_runtime::wine::session::{Config, Session, Stop};
 
 #[allow(dead_code)]
@@ -16,6 +17,59 @@ mod wine {
         env!("CARGO_MANIFEST_DIR"),
         "/../adv-nt/tests/common/wine.rs"
     ));
+}
+
+/// What the UI receives from a session.
+struct Ui {
+    #[cfg(feature = "gpu")]
+    capture: adv_device::gpu::test_support::SurfaceCapture,
+    #[cfg(not(feature = "gpu"))]
+    mailbox: (
+        Option<adv_device::surface::FrameProducer>,
+        adv_device::surface::FrameConsumer,
+    ),
+}
+impl Ui {
+    /// Before the session starts, so the capture precedes its GPU facades.
+    fn new() -> Self {
+        Self {
+            #[cfg(feature = "gpu")]
+            capture: adv_device::gpu::test_support::SurfaceCapture::new().unwrap(),
+            #[cfg(not(feature = "gpu"))]
+            mailbox: {
+                let (producer, consumer) = adv_device::surface::frame_mailbox();
+                (Some(producer), consumer)
+            },
+        }
+    }
+    /// From the session's `prepare`.
+    fn attach(&mut self, machine: &mut adv_machine::Machine<adv_cpu::Cpu>) {
+        #[cfg(not(feature = "gpu"))]
+        machine.ext.get_mut::<SurfaceStore>().set_frame_mailbox(
+            self.mailbox.0.take().unwrap(),
+            adv_sync::WakeEvent::new().unwrap(),
+        );
+        machine.set_frame_handoff(false);
+    }
+    /// The latest frame the foreground process showed, if any.
+    fn frame(&mut self, session: &mut Session) -> Option<Snapshot> {
+        let mut frame = Snapshot::default();
+        #[cfg(feature = "gpu")]
+        {
+            let store = session.machine.ext.get_mut::<SurfaceStore>();
+            self.capture.update(store);
+            std::mem::swap(&mut frame, &mut store.presenter);
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            let _ = session;
+            let consumer = &mut self.mailbox.1;
+            if consumer.update() {
+                consumer.current().snapshot(&mut frame).unwrap();
+            }
+        }
+        (frame.frames > 0).then_some(frame)
+    }
 }
 
 // spec: PROC-DEV-1
@@ -59,28 +113,17 @@ fn display_child_session() {
         debug: "",
         stdout: None,
     };
-    let (producer, mut consumer) = frame_mailbox();
-    let mut session = Session::start(
-        &config,
-        adv_sync::WakeEvent::new().unwrap(),
-        move |machine| {
-            machine
-                .ext
-                .get_mut::<SurfaceStore>()
-                .set_frame_mailbox(producer, adv_sync::WakeEvent::new().unwrap());
-            machine.set_frame_handoff(false);
-            Ok(())
-        },
-    )
+    let mut ui = Ui::new();
+    let mut session = Session::start(&config, adv_sync::WakeEvent::new().unwrap(), |machine| {
+        ui.attach(machine);
+        Ok(())
+    })
     .unwrap();
     let stop = session.run(Instant::now() + Duration::from_secs(5));
     assert!(matches!(stop, Stop::Paused), "{stop:?}");
-    assert!(
-        consumer.update(),
-        "child frame did not reach the UI mailbox"
-    );
-    let mut frame = Snapshot::default();
-    consumer.current().snapshot(&mut frame).unwrap();
+    let frame = ui
+        .frame(&mut session)
+        .expect("child frame did not reach the UI");
     assert_eq!((frame.width, frame.height), (80, 40));
     assert!(
         frame
@@ -118,27 +161,19 @@ fn a_waiting_program_publishes_its_frame_to_the_ui() {
         debug: "",
         stdout: None,
     };
-    let (producer, mut consumer) = frame_mailbox();
-    let ui = adv_sync::WakeEvent::new().unwrap();
-    let published = ui.clone();
+    let mut ui = Ui::new();
     let wake = adv_sync::WakeEvent::new().unwrap();
-    let mut session = Session::start(&config, wake, move |machine| {
-        machine
-            .ext
-            .get_mut::<SurfaceStore>()
-            .set_frame_mailbox(producer, published);
-        machine.set_frame_handoff(false);
+    let mut session = Session::start(&config, wake, |machine| {
+        ui.attach(machine);
         Ok(())
     })
     .unwrap();
     // The probe never exits; it waits for messages once it has painted.
     let stop = session.run(Instant::now() + Duration::from_secs(5));
+    assert!(matches!(stop, Stop::Paused), "{stop:?}");
+    let frame = ui.frame(&mut session).expect("no frame reached the UI");
     drop(session);
     std::fs::remove_dir_all(&root).unwrap();
-    assert!(matches!(stop, Stop::Paused), "{stop:?}");
-    assert!(consumer.update(), "no frame reached the mailbox");
-    let mut frame = Snapshot::default();
-    consumer.current().snapshot(&mut frame).unwrap();
     assert_eq!((frame.width, frame.height), (320, 120));
     let pixels = frame.bgra.as_chunks::<4>().0;
     let white = pixels.iter().filter(|p| p[..3] == [0xff; 3]).count();
