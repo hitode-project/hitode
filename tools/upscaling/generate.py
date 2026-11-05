@@ -70,7 +70,7 @@ def generate(compiler):
     manifest = []
     for (n, body) in enumerate(parts, 1):
         ins = re.findall('//!BIND (\\w+)', body)
-        # Convolutions sample neighbours; depth-to-space reads its own texel.
+        # Convolution offsets; model() also counts linear tensor sampling.
         radius = int('_texOff(' in body)
         save = re.search('//!SAVE (\\w+)', body)
         last = not save
@@ -196,10 +196,17 @@ def model(passes):
         roles += ['Source' if n == 'INPUT' else f'Tensor({names[n]})' for n in p['inputs']]
         roles += ['Output' if n == 'OUTPUT' else f'Store({names[n]})' for n in p['outputs']]
         roles += ['Linear' if f == 'LINEAR' else 'Nearest' for (f, _) in p['samplers']]
-        used = {int(n) for n in re.findall('@binding\\((\\d+)\\)', (UPSCALE / p['shader']).read_text())}
+        source = (UPSCALE / p['shader']).read_text()
+        used = {int(n) for n in re.findall('@binding\\((\\d+)\\)', source)}
         entries = ', '.join(f'({n}, {role})' for (n, role) in enumerate(roles) if n in used)
+        bindings = {name: roles[int(slot)] for slot, name in
+                    re.findall(r'@binding\((\d+)\)\s*@group\([12]\)\s*var\s+(\w+)', source)}
+        linear_tensor = any(bindings[texture].startswith('Tensor(') and bindings[sampler] == 'Linear'
+                            for texture, sampler in re.findall(
+                                r'textureSampleLevel\(\s*\(?(\w+)\)?\s*,\s*\(?(\w+)\)?', source))
+        radius = max(p['radius'], int(linear_tensor))
         scale = 2 if 'OUTPUT' in p['outputs'] else 1
-        rust.append(f"Pass {{ shader: \"{p['shader']}\", bindings: &[{cells}{entries}], block: {p['block']}, scale: {scale}, radius: {p['radius']} }},")
+        rust.append(f"Pass {{ shader: \"{p['shader']}\", bindings: &[{cells}{entries}], block: {p['block']}, scale: {scale}, radius: {radius} }},")
     rust.append('] }')
     return '\n'.join(rust)
 

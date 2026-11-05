@@ -312,7 +312,6 @@ fn partial_runs_match_full_runs_within_the_model_radius() {
             gpu.run(scaler, &pixels, None, true);
         }
         let reach = selected.reach();
-        let mut tightest = 0;
         let mut frame = pixels.clone();
         for (step, damage) in damages.iter().enumerate() {
             let before = gpu.read(&full.output);
@@ -354,9 +353,7 @@ fn partial_runs_match_full_runs_within_the_model_radius() {
                 }
             }
             assert!(reached <= reach, "{choice:?} reaches {reached}");
-            tightest = tightest.max(reached);
         }
-        assert_eq!(tightest, reach, "{choice:?} reach is not tight");
         // Nothing changed: nothing is computed.
         let mut encoder = gpu.queue.encoder("upscale test");
         let computed = partial

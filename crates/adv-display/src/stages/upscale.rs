@@ -70,7 +70,7 @@ pub fn reach(choice: Upscaler) -> u32 {
 }
 
 impl Model {
-    /// Input pixels a change reaches in the output. Reach follows the data:
+    /// Input-pixel radius bounding a change in the output. Reach follows the data:
     /// a pass's outputs reach its radius beyond the farthest input it reads,
     /// so passes of one layer add theirs once. The final layer's bilinear
     /// sample of the input reaches one pixel beside that chain.
