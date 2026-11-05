@@ -577,12 +577,10 @@ fn mixer_matches_wine() {
 // spec: NAT-BODY-3
 #[test]
 fn mixer_layout_matches_dwarf() {
-    let Some(dist) = dist() else {
+    let Some(debug) = wine::debug_dist() else {
         return;
     };
-    let dll = dist
-        .with_file_name("wine11-sse-dist")
-        .join("usr/local/lib/wine/i386-windows/dsound.dll");
+    let dll = debug.join("usr/local/lib/wine/i386-windows/dsound.dll");
     let dump = std::process::Command::new("dwarfdump")
         .arg("--debug-info")
         .arg(&dll)

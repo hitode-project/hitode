@@ -33,6 +33,18 @@ pub fn dist() -> Option<PathBuf> {
     Some(dist)
 }
 
+/// The unstripped build beside `ADV_WINE_DIST`, whose DWARF the layout
+/// tests compare against, or `None` where only the stripped release
+/// userland exists, as in CI.
+pub fn debug_dist() -> Option<PathBuf> {
+    let debug = dist()?.with_file_name("wine11-sse-dist");
+    if !debug.is_dir() {
+        eprintln!("skipped: no unstripped Wine build at {}", debug.display());
+        return None;
+    }
+    Some(debug)
+}
+
 /// The installation and the probes built from the current sources.
 pub struct Wine {
     pub dist: PathBuf,
