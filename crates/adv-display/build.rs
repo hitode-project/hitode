@@ -18,6 +18,7 @@ fn main() {
     };
     let software = read("software");
     for (name, wgsl, bindings) in [
+        ("damage", read("damage"), bindings::DAMAGE.to_vec()),
         (
             "upscale_delta",
             read("upscale_delta"),

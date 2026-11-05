@@ -6,7 +6,7 @@
 
 use super::*;
 use crate::Rect;
-use crate::plan::Layer;
+use crate::plan::{HostLayer, Layer};
 use adv_gpu::present::Export;
 use adv_gpu::queue::MainNotifier;
 use dispatch2::MainThreadBound;
@@ -190,6 +190,7 @@ impl Compositor for LayerCompositor {
         // A video that left the frame retires with its layer.
         let gone = self.showing.extract_if(.., |(_, layer, _)| {
             matches!(layer, LayerId::Video(v) if !layers.video.iter().any(|(id, _)| id == v))
+                || matches!(layer, LayerId::Host(HostLayer::Damage) if !layers.host.contains(&HostLayer::Damage))
         });
         self.retired
             .extend(gone.map(|(since, layer, _)| (since, serial, layer)));
@@ -226,6 +227,15 @@ impl Compositor for LayerCompositor {
         place(LayerId::Base, &layers.base, 0.);
         for (i, (id, layer)) in layers.video.iter().enumerate() {
             place(LayerId::Video(*id), layer, (i * 2 + 2) as f64);
+        }
+        if layers.host.contains(&HostLayer::Damage)
+            && let Some(size) = size(LayerId::Host(HostLayer::Damage))
+        {
+            place(
+                LayerId::Host(HostLayer::Damage),
+                &crate::damage::layer(size),
+                (layers.video.len() * 2 + 3) as f64,
+            );
         }
         for (id, dst, color) in &layers.solids {
             let z = layers.video.iter().position(|(v, _)| v == id).unwrap() * 2 + 1;
@@ -331,7 +341,14 @@ impl Tree {
             self.layers.retain(|(id, layer)| {
                 let placed = commit.placements.iter().any(|p| p.id == *id);
                 layer.setHidden(!placed);
-                if !placed && matches!(id, LayerId::Video(_) | LayerId::VideoBackground(_)) {
+                if !placed
+                    && matches!(
+                        id,
+                        LayerId::Video(_)
+                            | LayerId::VideoBackground(_)
+                            | LayerId::Host(HostLayer::Damage)
+                    )
+                {
                     layer.removeFromSuperlayer();
                     return false;
                 }
@@ -396,11 +413,12 @@ impl Tree {
             None => {
                 let layer = CALayer::new();
                 unsafe { layer.setContentsGravity(kCAGravityResize) };
-                layer.setOpaque(true);
+                let opaque = id != LayerId::Host(HostLayer::Damage);
+                layer.setOpaque(opaque);
                 // Core Animation's contentsOpaque (HOST-VIEW-11) ignores the
                 // IOSurface's alpha channel.
                 if layer.respondsToSelector(sel!(setContentsOpaque:)) {
-                    let _: () = unsafe { msg_send![&layer, setContentsOpaque: true] };
+                    let _: () = unsafe { msg_send![&layer, setContentsOpaque: opaque] };
                 }
                 layer.setZPosition(match id {
                     LayerId::Base => 0.0,

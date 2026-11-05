@@ -48,6 +48,7 @@ pub use native::SurfaceCompositor;
 mod native {
     use super::*;
     use crate::compositor::*;
+    use crate::plan::HostLayer;
     use adv_gpu::present::Export;
     use std::{
         collections::VecDeque,
@@ -112,6 +113,7 @@ mod native {
         fn ASurfaceTransaction_setZOrder(tx: Handle, surface: Handle, z: i32);
         fn ASurfaceTransaction_setBuffer(tx: Handle, surface: Handle, buffer: Handle, fence: i32);
         fn ASurfaceTransaction_setBufferDataSpace(tx: Handle, surface: Handle, dataspace: i32);
+        fn ASurfaceTransaction_setBufferTransparency(tx: Handle, surface: Handle, transparency: i8);
         fn ASurfaceTransaction_setColor(tx: Handle, surface: Handle, r: f32, g: f32, b: f32, alpha: f32, dataspace: i32);
         fn ASurfaceTransaction_setGeometry(tx: Handle, surface: Handle, crop: *const ARect, dst: *const ARect, transform: i32);
         fn ASurfaceTransaction_setDamageRegion(tx: Handle, surface: Handle, rects: *const ARect, count: u32);
@@ -541,6 +543,17 @@ mod native {
             create?;
             let tx = unsafe { ASurfaceTransaction_create() };
             let mut event = self.completion(serial);
+            let damage_layer = if layers.host.contains(&HostLayer::Damage) {
+                let image = &images
+                    .iter()
+                    .find(|a| a.layer == LayerId::Host(HostLayer::Damage))
+                    .unwrap()
+                    .image;
+                let size = image.image().desc().size;
+                Some(crate::damage::layer((size.width, size.height)))
+            } else {
+                None
+            };
             for surface in &mut self.surfaces {
                 let handle = surface.handle.as_ptr();
                 let (layer, visible, z) = match surface.id {
@@ -593,6 +606,17 @@ mod native {
                                 .map_or(0, |i| 2 + 2 * i as i32),
                         )
                     }
+                    Some(LayerId::Host(HostLayer::Damage)) => {
+                        // ASURFACE_TRANSACTION_TRANSPARENCY_TRANSLUCENT.
+                        unsafe {
+                            ASurfaceTransaction_setBufferTransparency(tx, handle, 1);
+                        }
+                        (
+                            damage_layer.as_ref(),
+                            damage_layer.is_some(),
+                            3 + 2 * layers.video.len() as i32 + HostLayer::Damage as i32,
+                        )
+                    }
                     Some(LayerId::Host(id)) => (
                         None,
                         layers.host.contains(&id),
@@ -607,7 +631,11 @@ mod native {
                     if !visible {
                         if matches!(
                             surface.id,
-                            Some(LayerId::Video(_) | LayerId::VideoBackground(_))
+                            Some(
+                                LayerId::Video(_)
+                                    | LayerId::VideoBackground(_)
+                                    | LayerId::Host(HostLayer::Damage)
+                            )
                         ) {
                             ASurfaceTransaction_reparent(tx, handle, ptr::null_mut());
                             event.previous.push((handle as usize, None));
@@ -686,6 +714,7 @@ mod native {
                     LayerId::Base => &layers.base,
                     LayerId::Video(id) => &layers.video.iter().find(|(v, _)| *v == id).unwrap().1,
                     LayerId::VideoBackground(_) => unreachable!("solid layer has no image"),
+                    LayerId::Host(HostLayer::Damage) => damage_layer.as_ref().unwrap(),
                     LayerId::Host(_) => panic!("host content is not implemented"),
                 };
                 self.rects.clear();
@@ -720,7 +749,14 @@ mod native {
             // Applied transactions retain their controls through completion.
             self.surfaces.retain(|s| {
                 let keep = s.visible
-                    || !matches!(s.id, Some(LayerId::Video(_) | LayerId::VideoBackground(_)));
+                    || !matches!(
+                        s.id,
+                        Some(
+                            LayerId::Video(_)
+                                | LayerId::VideoBackground(_)
+                                | LayerId::Host(HostLayer::Damage)
+                        )
+                    );
                 if !keep {
                     unsafe {
                         ASurfaceControl_release(s.handle.as_ptr());

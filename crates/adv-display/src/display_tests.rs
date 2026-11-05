@@ -68,6 +68,7 @@ fn settings() -> Settings {
         rotation: Rotation::None,
         upscaler: Upscaler::Off,
         background: [0.; 3],
+        damage_overlay: false,
     }
 }
 fn compositor(history: &Arc<Mutex<Vec<Presentation>>>) -> Box<dyn Compositor + Send> {
@@ -1532,4 +1533,243 @@ fn paced_upscaling_compares_the_newest_composition_to_the_last_encoded_input() {
     whole.present(&mut q, frame(1, &images[2], all())).unwrap();
     let expected = whole.upscaled_copy(&mut q);
     assert_eq!(partial, read(&d, &mut q, &expected));
+}
+
+/// A compositor that releases each image before its specified buffer age.
+struct AgeCompositor {
+    age: u64,
+    serial: u64,
+    images: Vec<(u64, LayerId)>,
+    presented: Vec<Presented>,
+}
+impl Compositor for AgeCompositor {
+    fn caps(&self) -> CompositorCaps {
+        caps()
+    }
+    fn detach(&mut self) -> Option<adv_gpu::queue::Fence> {
+        self.images.clear();
+        None
+    }
+    fn present(
+        &mut self,
+        _: &Layers,
+        _: &Tiles,
+        images: &mut [AcquiredImage],
+        serial: u64,
+        at: std::time::Instant,
+    ) -> std::result::Result<(), crate::compositor::Error> {
+        self.serial = serial;
+        self.images.extend(images.iter().map(|a| (serial, a.layer)));
+        self.presented.push(Presented {
+            serial,
+            latched: Some(at),
+            shown: Some(at),
+        });
+        Ok(())
+    }
+    fn drain(&mut self, presented: &mut Vec<Presented>, released: &mut Vec<Released>) {
+        presented.append(&mut self.presented);
+        released.extend(
+            self.images
+                .extract_if(.., |(serial, _)| *serial + self.age <= self.serial + 1)
+                .map(|(serial, layer)| Released {
+                    serial,
+                    layer,
+                    fence: None,
+                }),
+        );
+    }
+}
+
+// spec: HOST-VIEW-12
+#[test]
+fn damage_off_matches_legacy_settings_and_toggle_preserves_clean_frames_at_ages_one_to_three() {
+    for age in 1..=3 {
+        let (device, mut queue) = Device::open(&queue::DeviceOptions {
+            validation: !cfg!(target_os = "android"),
+            ..Default::default()
+        })
+        .unwrap();
+        let mut legacy = serde_json::to_value(settings()).unwrap();
+        legacy.as_object_mut().unwrap().remove("damage_overlay");
+        let legacy: Settings = serde_json::from_value(legacy).unwrap();
+        let compositor = || {
+            Box::new(AgeCompositor {
+                age,
+                serial: 0,
+                images: vec![],
+                presented: vec![],
+            }) as Box<dyn Compositor>
+        };
+        let mut baseline = Display::new(device.clone(), compositor(), legacy.clone()).unwrap();
+        let mut explicit_off = Display::new(device.clone(), compositor(), settings()).unwrap();
+        let mut toggled = Display::new(device.clone(), compositor(), settings()).unwrap();
+        let source = private(&device, &mut queue);
+        let mut observed_age = false;
+        for serial in 1..=14 {
+            let damage = if serial == 1 {
+                all()
+            } else {
+                cells(&[Rect {
+                    x: ((serial % 8) * 8) as u32,
+                    y: 8,
+                    w: 8,
+                    h: 8,
+                }])
+            };
+            let mut toggle = settings();
+            toggle.damage_overlay = (3..=7).contains(&serial);
+            toggled.settings(&mut queue, toggle).unwrap();
+            baseline
+                .present(&mut queue, frame(serial, &source, damage.clone()))
+                .unwrap();
+            explicit_off
+                .present(&mut queue, frame(serial, &source, damage.clone()))
+                .unwrap();
+            toggled
+                .present(&mut queue, frame(serial, &source, damage))
+                .unwrap();
+            let expected = baseline.recorder().latest().unwrap();
+            let actual = explicit_off.recorder().latest().unwrap();
+            assert_eq!(actual.plan, expected.plan);
+            assert_eq!(actual.statistics.stages, expected.statistics.stages);
+            if let Some(target) = expected.plan.targets.first() {
+                observed_age |= expected
+                    .pools
+                    .pools
+                    .iter()
+                    .find(|p| p.id == target.pool)
+                    .and_then(|p| p.buffers.get(target.buffer))
+                    .and_then(|b| b.age)
+                    == Some(age as u32);
+            }
+            let pixels = read(&device, &mut queue, &baseline.shown_base());
+            assert_eq!(
+                read(&device, &mut queue, &explicit_off.shown_base()),
+                pixels
+            );
+            assert_eq!(read(&device, &mut queue, &toggled.shown_base()), pixels);
+            assert_eq!(
+                toggled.recorder().latest().unwrap().statistics.stages,
+                expected.statistics.stages
+            );
+            if serial >= 10 {
+                assert_eq!(toggled.recorder().latest().unwrap().plan, expected.plan);
+            }
+        }
+        assert!(observed_age, "buffer age {age} was not exercised");
+    }
+}
+
+// spec: HOST-VIEW-12
+#[test]
+fn damage_toggle_keeps_separate_video_and_rebuilt_captures_clean() {
+    let (device, mut queue, mut diagnostic, history) = setup();
+    let baseline_history = Arc::default();
+    let mut baseline =
+        Display::new(device.clone(), compositor(&baseline_history), settings()).unwrap();
+    let source = private(&device, &mut queue);
+    let mut pool = device
+        .create_present_pool(&PoolDesc {
+            color: Some(adv_gpu::present::YuvColor::Bt601Full),
+            width: 8,
+            height: 8,
+            format: DECODED,
+            count: 2,
+            storage: false,
+            label: "damage video fixture",
+        })
+        .unwrap();
+    let mut pictures = [pool.acquire_cpu().unwrap(), pool.acquire_cpu().unwrap()];
+    for picture in &mut pictures {
+        picture.write(|planes| {
+            planes[0].data.fill(80);
+            planes[1].data.fill(128);
+        });
+    }
+    let raw = [pictures[0].image().clone(), pictures[1].image().clone()];
+    let mut initial = pictures.map(Some);
+    let rect = Rect {
+        x: 16,
+        y: 16,
+        w: 16,
+        h: 16,
+    };
+    for serial in 1..=12 {
+        let mut current = settings();
+        current.damage_overlay = matches!(serial, 2..=4 | 6..=7);
+        diagnostic.settings(&mut queue, current).unwrap();
+        for (index, display) in [&mut baseline, &mut diagnostic].into_iter().enumerate() {
+            let mut frame = frame(serial, &source, if serial == 1 { all() } else { none() });
+            if serial <= 10 {
+                frame.info.video.push(VideoGeometry {
+                    source_uv: None,
+                    background: None,
+                    id: 9,
+                    source: (8, 8),
+                    rect,
+                    changed: serial == 1,
+                });
+                frame.video.push(Video {
+                    id: 9,
+                    image: raw[index].clone(),
+                    planes: (DECODED == Format::Nv12).then(|| {
+                        std::array::from_fn(|plane| {
+                            raw[index]
+                                .create_view(&ViewDesc {
+                                    format: Some([Format::R8Unorm, Format::Rg8Unorm][plane]),
+                                    dimension: None,
+                                    mips: 0..1,
+                                    layers: 0..1,
+                                    plane: plane as u32,
+                                })
+                                .unwrap()
+                        })
+                    }),
+                    hide_cursor: false,
+                    geometry: crate::stages::video::Geometry {
+                        destination: rect,
+                        source_uv: [0., 0., 1., 1.],
+                        background: None,
+                        color: adv_gpu::present::YuvColor::Bt601Full,
+                    },
+                    update: initial[index].take(),
+                });
+            }
+            display.present(&mut queue, frame).unwrap();
+        }
+        if serial == 3 {
+            baseline
+                .rebuild(compositor(&baseline_history), &mut queue)
+                .unwrap();
+            diagnostic
+                .rebuild(compositor(&history), &mut queue)
+                .unwrap();
+        }
+        let capture = |display: &mut Display, queue: &mut Queue| {
+            let (send, done) = std::sync::mpsc::channel();
+            display.capture(queue, Box::new(move |result| send.send(result).unwrap()));
+            done.recv_timeout(std::time::Duration::from_secs(20))
+                .unwrap()
+                .unwrap()
+                .bgra
+        };
+        assert_eq!(
+            capture(&mut diagnostic, &mut queue),
+            capture(&mut baseline, &mut queue)
+        );
+        assert_eq!(
+            diagnostic.recorder().latest().unwrap().statistics.stages,
+            baseline.recorder().latest().unwrap().statistics.stages
+        );
+        let presentation = history.lock().unwrap().last().unwrap().clone();
+        let expected = baseline_history.lock().unwrap().last().unwrap().clone();
+        assert_eq!(presentation.layers.base, expected.layers.base);
+        assert_eq!(presentation.layers.video, expected.layers.video);
+        assert_eq!(presentation.layers.solids, expected.layers.solids);
+        if matches!(serial, 2..=4 | 6..=7) {
+            assert_eq!(presentation.layers.video.len(), 1);
+            assert!(presentation.layers.host.contains(&HostLayer::Damage));
+        }
+    }
 }

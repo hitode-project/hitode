@@ -469,6 +469,7 @@ fn conservative_damage_matches_whole_frames_in_all_forms_and_buffer_ages() {
                     scale: 1.,
                     rotation: Rotation::None,
                     background: [0.; 3],
+                    damage_overlay: false,
                 };
                 // Independent presentation pools exercise actual planner repair
                 // and the output shader at ages one, two and three.

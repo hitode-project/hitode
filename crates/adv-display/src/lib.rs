@@ -8,6 +8,7 @@
 //! reports their release; the executor owns them throughout. [`recorder`] stores and replays planner data.
 
 pub mod compositor;
+mod damage;
 pub mod display;
 pub mod plan;
 pub mod recorder;

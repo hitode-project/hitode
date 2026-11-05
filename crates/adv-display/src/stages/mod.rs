@@ -1,5 +1,5 @@
 //! GPU encoders for the stages selected by the planner.
-mod bindings;
+pub(crate) mod bindings;
 pub mod ingest;
 pub mod output;
 #[cfg(test)]

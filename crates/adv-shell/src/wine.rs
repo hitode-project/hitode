@@ -120,12 +120,14 @@ pub(super) fn run(options: &Options, dist: &Path) -> Result<u8, String> {
         .map_err(|e| e.to_string())?;
     let mut service = background.start().map_err(|e| e.to_string())?;
     let result = (|| {
-        let display_gpu = crate::display::headless(
+        let display_startup = crate::display::headless(
             options.gpu_software,
             (options.width, options.height),
             wake.clone(),
-        )?
-        .start()?;
+        )?;
+        let debug_display =
+            super::debug::requested(options.debug).then(|| display_startup.debug_settings());
+        let display_gpu = display_startup.start()?;
         let gpu = if options.headless_gpu {
             let gpu = display_gpu.fork().map_err(|e| e.to_string())?;
 
@@ -140,7 +142,7 @@ pub(super) fn run(options: &Options, dist: &Path) -> Result<u8, String> {
 
             pacer: None,
         };
-        let debugger = super::debug::start(options, false, wake.clone());
+        let debugger = super::debug::start(options, false, wake.clone(), debug_display);
         let keys = Arc::new(KeyState::default());
         let started = Instant::now();
         let session = start(
@@ -175,6 +177,14 @@ pub(super) fn run_execution(
     keys: Arc<KeyState>,
     background: adv_sync::background::Sender,
 ) -> Result<Finished, String> {
+    let debug_display = super::debug::requested(options.debug)
+        .then(|| {
+            worker
+                .display
+                .as_ref()
+                .map(|startup| startup.debug_settings())
+        })
+        .flatten();
     let gpu = worker
         .display
         .take()
@@ -197,7 +207,7 @@ pub(super) fn run_execution(
         pacer: Some(pacer),
     };
     let started = Instant::now();
-    let debugger = super::debug::start(options, true, wake.clone());
+    let debugger = super::debug::start(options, true, wake.clone(), debug_display);
     let session = start(environment, options, dist, wake.clone(), &keys, host)?;
     let (exit_code, _, summary) = drive(
         options,

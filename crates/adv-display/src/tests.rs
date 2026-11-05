@@ -36,6 +36,7 @@ fn settings() -> Settings {
         rotation: Rotation::None,
         upscaler: Upscaler::Off,
         background: [0.0; 3],
+        damage_overlay: false,
     }
 }
 fn caps() -> CompositorCaps {
@@ -896,4 +897,30 @@ fn executor_recorder_keeps_600_presents_independently_of_releases() {
     assert_eq!(records[0].frame.serial, 5);
     assert_eq!(records.last().unwrap().frame.serial, (CAPACITY + 4) as u64);
     assert!(recorder.events().count() <= CAPACITY * 9);
+}
+
+// spec: HOST-VIEW-12
+#[test]
+fn disabled_damage_setting_preserves_legacy_plans_at_buffer_ages_one_to_three() {
+    let mut old = serde_json::to_value(settings()).unwrap();
+    old.as_object_mut().unwrap().remove("damage_overlay");
+    let legacy: Settings = serde_json::from_value(old).unwrap();
+    let mut explicit = settings();
+    explicit.damage_overlay = false;
+    for age in 1..=3 {
+        let mut pools = PoolState::default();
+        let mut info = frame();
+        info.base = BaseKind::Gpu { presentable: false };
+        for serial in 0..6 {
+            info.damage = cells(&[rect(serial * 16, 16, 8, 8)]);
+            for pool in &mut pools.pools {
+                for buffer in &mut pool.buffers {
+                    buffer.age = Some(age);
+                }
+            }
+            let expected = plan(&info, &legacy, &caps(), &pools);
+            assert_eq!(plan(&info, &explicit, &caps(), &pools), expected);
+            pools.after_present(&expected);
+        }
+    }
 }

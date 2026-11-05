@@ -139,3 +139,32 @@ pub const UPSCALE_FILTER: [Binding; 5] = [
         stages: Stages::COMPUTE,
     },
 ];
+
+/// GPU diagnostic history, shared by compute and presentation draws.
+pub const DAMAGE: [Binding; 5] = [
+    Binding {
+        slot: 1,
+        kind: BindingKind::UniformBuffer,
+        stages: Stages::COMPUTE.union(Stages::FRAGMENT),
+    },
+    Binding {
+        slot: 4,
+        kind: BindingKind::StorageBuffer { writable: true },
+        stages: Stages::COMPUTE.union(Stages::FRAGMENT),
+    },
+    Binding {
+        slot: 5,
+        kind: BindingKind::StorageBuffer { writable: false },
+        stages: Stages::COMPUTE,
+    },
+    Binding {
+        slot: 6,
+        kind: BindingKind::StorageBuffer { writable: false },
+        stages: Stages::COMPUTE,
+    },
+    Binding {
+        slot: 7,
+        kind: BindingKind::StorageBuffer { writable: false },
+        stages: Stages::COMPUTE,
+    },
+];
