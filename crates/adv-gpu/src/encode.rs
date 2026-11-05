@@ -92,7 +92,10 @@ pub struct ComputePassDesc<'a> {
 /// On the modern Vulkan tier every image, buffer and sampler holds a fixed
 /// index in one bindless heap (descriptor indexing, update after bind), and
 /// `bind` writes that index and any offset into the draw's push constants: no
-/// descriptor work per draw. Older drivers use push descriptors (Adreno 6xx)
+/// descriptor work per draw. On that tier, pipelines accessing storage buffers
+/// atomically use classic descriptor sets for every binding, avoiding heap-indexed atomics
+/// and stale push-descriptor offsets when switching from a heap pipeline.
+/// Older drivers use push descriptors (Adreno 6xx)
 /// or descriptor sets cached by content (Mali G76). On Metal each slot owns a
 /// fixed argument index; `bind` records the resource and each draw issues
 /// direct `set*` calls (`set*BufferOffset` when only the offset moved) for the

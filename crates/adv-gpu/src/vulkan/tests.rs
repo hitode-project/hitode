@@ -1421,6 +1421,126 @@ fn bindless_storage_offsets_index_by_array_stride() {
 }
 
 #[test]
+fn storage_slice_struct_atomics_keep_dispatch_offsets() {
+    for disable in [
+        Modern::empty(),
+        Modern::PUSH_DESCRIPTORS,
+        Modern::BINDLESS,
+        Modern::BINDLESS | Modern::PUSH_DESCRIPTORS,
+    ] {
+        let (device, mut queue) = gpu!(disable);
+        let stride = u64::from(device.caps().limits.storage_offset_alignment).max(16);
+        let buffer = |size, label| {
+            device
+                .create_buffer(&BufferDesc {
+                    size,
+                    usage: BufferUsage::STORAGE | BufferUsage::COPY_SRC | BufferUsage::COPY_DST,
+                    memory: Memory::Device,
+                    label,
+                })
+                .unwrap()
+        };
+        // Keep descriptor zero occupied: heap atomics must address the bound buffer.
+        let zero = buffer(stride * 5, "descriptor zero");
+        let records = buffer(stride * 5, "atomic records");
+        let output = buffer(64 * 4, "atomic returns");
+        if device.caps().modern.contains(Modern::BINDLESS) {
+            assert_eq!(zero.inner.0.storage, Some(0));
+            assert!(records.inner.0.storage.unwrap() >= 1);
+        }
+        let bindings: Vec<_> = (0..2)
+            .map(|slot| Binding {
+                slot,
+                kind: BindingKind::StorageBuffer { writable: true },
+                stages: Stages::COMPUTE,
+            })
+            .collect();
+        let pipeline = |source| {
+            let compiled = crate::shader::precompile(source, &bindings).unwrap();
+            let shader = device
+                .create_shader(ShaderDesc {
+                    source: Source::Precompiled {
+                        spirv: &compiled.spirv,
+                        metal: &[],
+                        entries: &[],
+                    },
+                    identity: compiled.identity,
+                    label: "sliced storage",
+                })
+                .unwrap();
+            device
+                .create_compute_pipeline(
+                    &ComputePipelineDesc {
+                        entry: shader.entry("main", Stage::Compute).unwrap(),
+                        bindings: bindings.clone(),
+                        label: "sliced storage",
+                    },
+                    None,
+                )
+                .unwrap()
+        };
+        let atomic = pipeline(
+            "struct Record { x: atomic<u32>, y: u32, z: u32, count: u32 }
+             @group(3) @binding(0) var<storage, read_write> output: array<u32>;
+             @group(3) @binding(1) var<storage, read_write> record: Record;
+             @compute @workgroup_size(64)
+             fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+                 output[id.x] = atomicAdd(&record.x, 1u);
+             }",
+        );
+        let plain = pipeline(
+            "struct Record { x: u32, y: u32, z: u32, count: u32 }
+             @group(3) @binding(1) var<storage, read_write> record: Record;
+             @compute @workgroup_size(1) fn main() { record.y = 7u; }",
+        );
+        let result = readback(&device, stride * 10 + 64 * 4);
+        let mut encoder = queue.encoder("sliced storage atomics");
+        encoder.fill_buffer(zero.slice(0..stride * 5), 0);
+        encoder.fill_buffer(records.slice(0..stride * 5), 0);
+        {
+            let mut pass = encoder.compute_pass(&ComputePassDesc {
+                timestamps: None,
+                label: "sliced storage atomics",
+            });
+            pass.bind(0, Bind::StorageBuffer(output.slice(0..64 * 4)));
+            for record in [1, 2, 3, 4, 1] {
+                let offset = stride * record;
+                pass.set_pipeline(&plain);
+                pass.bind(1, Bind::StorageBuffer(records.slice(offset..offset + 16)));
+                pass.dispatch(1, 1, 1);
+                // Slots persist when switching between heap and ordinary layouts.
+                pass.set_pipeline(&atomic);
+                pass.dispatch(1, 1, 1);
+            }
+        }
+        encoder.copy_buffer(records.slice(0..stride * 5), &result, 0);
+        encoder.copy_buffer(zero.slice(0..stride * 5), &result, stride * 5);
+        encoder.copy_buffer(output.slice(0..64 * 4), &result, stride * 10);
+        finish(&mut queue, encoder);
+        let words: Vec<_> = bytes(&result)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|w| u32::from_le_bytes(*w))
+            .collect();
+        for (i, &value) in words[..(stride * 10 / 4) as usize].iter().enumerate() {
+            let offset = i as u64 * 4;
+            let record = offset / stride;
+            let expected = match (record, offset % stride) {
+                (1, 0) => 128,
+                (2..=4, 0) => 64,
+                (1..=4, 4) => 7,
+                _ => 0,
+            };
+            assert_eq!(value, expected, "{disable:?}, byte {offset}");
+        }
+        let mut returns = words[(stride * 10 / 4) as usize..].to_vec();
+        returns.sort_unstable();
+        assert_eq!(returns, (64..128).collect::<Vec<_>>());
+    }
+}
+
+#[test]
 fn sampled_heap_entries_are_taken_on_first_sample() {
     let (device, mut queue) = gpu!(Modern::empty());
     if !device.caps().modern.contains(Modern::BINDLESS) {

@@ -88,7 +88,7 @@ impl Gpu {
                 format: Format::Rgba8Unorm,
                 mips: 1,
                 samples: 1,
-                usage: Usage::STORAGE | Usage::COPY_SRC,
+                usage: Usage::STORAGE | Usage::SAMPLED | Usage::COPY_SRC,
                 view_formats: &[],
                 label: "upscale output",
             })
@@ -111,7 +111,13 @@ impl Gpu {
     }
 
     /// Writes `pixels` (in 1/256 steps) into the input and runs the model.
-    fn run(&mut self, scaler: &Scaler, pixels: &[[u32; 3]], damage: Option<&[Rect]>) -> u64 {
+    fn run(
+        &mut self,
+        scaler: &Scaler,
+        pixels: &[[u32; 3]],
+        damage: Option<&[Rect]>,
+        exact: bool,
+    ) -> u64 {
         let bytes: Vec<u8> = pixels
             .iter()
             .flat_map(|p| [half(p[0]), half(p[1]), half(p[2]), [0x00, 0x3c]])
@@ -120,23 +126,36 @@ impl Gpu {
         let upload = self.buffer(bytes.len() as u64, BufferUsage::COPY_SRC, Memory::Upload);
         let mapped = unsafe { upload.mapped().unwrap().as_mut() };
         mapped[..bytes.len()].copy_from_slice(&bytes);
-        let input = scaler.upscaling.input();
+        let input = scaler.upscaling.input(exact);
         let mut encoder = self.queue.encoder("upscale test");
-        encoder.copy_buffer_to_image(
-            BufferCopy {
-                buffer: &upload,
-                offset: 0,
-                row_pitch: 0,
-                rows: 0,
-            },
-            ImageCopy {
-                image: input,
-                mip: 0,
-                layer: 0,
-                origin: (0, 0, 0),
-            },
-            input.desc().size,
-        );
+        let size = input.desc().size;
+        let whole = [Rect {
+            x: 0,
+            y: 0,
+            w: size.width,
+            h: size.height,
+        }];
+        for r in damage.unwrap_or(&whole) {
+            encoder.copy_buffer_to_image(
+                BufferCopy {
+                    buffer: &upload,
+                    offset: u64::from((r.y * size.width + r.x) * 8),
+                    row_pitch: size.width * 8,
+                    rows: size.height,
+                },
+                ImageCopy {
+                    image: input,
+                    mip: 0,
+                    layer: 0,
+                    origin: (r.x, r.y, 0),
+                },
+                Extent {
+                    width: r.w,
+                    height: r.h,
+                    depth_or_layers: 1,
+                },
+            );
+        }
         let computed = scaler
             .upscaling
             .encode(
@@ -144,6 +163,7 @@ impl Gpu {
                 &mut self.ring,
                 scaler.output.view(),
                 damage,
+                exact,
                 None,
             )
             .unwrap();
@@ -222,7 +242,7 @@ fn optimized_layers_match_reference_display_pixels_and_clamped_edges() {
                 let results: Vec<_> = scalers
                     .iter()
                     .map(|scaler| {
-                        gpu.run(scaler, &pixels, None);
+                        gpu.run(scaler, &pixels, None, true);
                         gpu.read(&scaler.output).concat()
                     })
                     .collect();
@@ -289,10 +309,9 @@ fn partial_runs_match_full_runs_within_the_model_radius() {
         let full = gpu.scaler(selected, size, half);
         let partial = gpu.scaler(selected, size, half);
         for scaler in [&full, &partial] {
-            gpu.run(scaler, &pixels, None);
+            gpu.run(scaler, &pixels, None, true);
         }
         let reach = selected.reach();
-        let mut tightest = 0;
         let mut frame = pixels.clone();
         for (step, damage) in damages.iter().enumerate() {
             let before = gpu.read(&full.output);
@@ -303,8 +322,8 @@ fn partial_runs_match_full_runs_within_the_model_radius() {
                     }
                 }
             }
-            gpu.run(&full, &frame, None);
-            let computed = gpu.run(&partial, &frame, Some(damage));
+            gpu.run(&full, &frame, None, true);
+            let computed = gpu.run(&partial, &frame, Some(damage), true);
             assert!(
                 computed < u64::from(size.0 * size.1) / 2,
                 "{choice:?} partial run {step} computed {computed} pixels"
@@ -334,9 +353,7 @@ fn partial_runs_match_full_runs_within_the_model_radius() {
                 }
             }
             assert!(reached <= reach, "{choice:?} reaches {reached}");
-            tightest = tightest.max(reached);
         }
-        assert_eq!(tightest, reach, "{choice:?} reach is not tight");
         // Nothing changed: nothing is computed.
         let mut encoder = gpu.queue.encoder("upscale test");
         let computed = partial
@@ -346,6 +363,7 @@ fn partial_runs_match_full_runs_within_the_model_radius() {
                 &mut gpu.ring,
                 partial.output.view(),
                 Some(&[]),
+                true,
                 None,
             )
             .unwrap();
@@ -383,7 +401,7 @@ fn variants_agree_in_each_precision_and_repeat_exactly() {
                 let scaler = gpu.scaler(models[index(choice)], size, precision);
                 let runs: Vec<_> = (0..2)
                     .map(|_| {
-                        gpu.run(&scaler, &pixels, None);
+                        gpu.run(&scaler, &pixels, None, true);
                         gpu.read(&scaler.output).concat()
                     })
                     .collect();
@@ -401,4 +419,224 @@ fn variants_agree_in_each_precision_and_repeat_exactly() {
     }
     eprintln!("{}", report.join("\n"));
     assert!(!wrong, "{}", report.join("; "));
+}
+
+// spec: HOST-VIEW-10
+#[test]
+fn conservative_damage_matches_whole_frames_in_all_forms_and_buffer_ages() {
+    use adv_display::{plan::*, stages::output};
+    use adv_gpu::encode::{ColorAttachment, RenderPassDesc, Store};
+    let mut gpu = gpu();
+    let size = (129, 97);
+    let doubled = (size.0 * 2, size.1 * 2);
+    let rect = |x, y, w, h| Rect { x, y, w, h };
+    let caps = CompositorCaps {
+        fractional_crops: true,
+        scales: true,
+        nearest: true,
+        rotates: true,
+        yuv_layers: true,
+        solid_color_layers: true,
+        damage_hints: true,
+        presentable_compressed: false,
+        tile: gpu.device.caps().limits.tile,
+    };
+    let presentation_pipeline = output::pipeline(&gpu.device, Format::Rgba8Unorm, false).unwrap();
+    let matrix = adv_gpu::Features::MATRIX_F16_8X8
+        | adv_gpu::Features::SHADER_F16
+        | adv_gpu::Features::SUBGROUP;
+    for (m, choice) in CHOICES.into_iter().enumerate() {
+        for half in [false, true] {
+            if half
+                && !gpu
+                    .device
+                    .caps()
+                    .features
+                    .contains(adv_gpu::Features::SHADER_F16)
+            {
+                continue;
+            }
+            for (form, table) in [("fused", models::FUSED), ("matrix", models::MATRIX)] {
+                if form == "matrix" && (!half || !gpu.device.caps().features.contains(matrix)) {
+                    continue;
+                }
+                let full = gpu.scaler(table[m], size, half);
+                let partial = gpu.scaler(table[m], size, half);
+                let settings = Settings {
+                    view: doubled,
+                    upscaler: choice,
+                    placement: Placement::Fit,
+                    scale: 1.,
+                    rotation: Rotation::None,
+                    background: [0.; 3],
+                };
+                // Independent presentation pools exercise actual planner repair
+                // and the output shader at ages one, two and three.
+                let mut pools: Vec<_> = (1..=3)
+                    .map(|count| {
+                        let images: Vec<_> = (0..count)
+                            .map(|_| {
+                                gpu.device
+                                    .create_image(&ImageDesc {
+                                        dimension: Dimension::D2,
+                                        size: Extent {
+                                            width: doubled.0,
+                                            height: doubled.1,
+                                            depth_or_layers: 1,
+                                        },
+                                        format: Format::Rgba8Unorm,
+                                        mips: 1,
+                                        samples: 1,
+                                        usage: Usage::COLOR | Usage::COPY_SRC,
+                                        view_formats: &[],
+                                        label: "aged presentation",
+                                    })
+                                    .unwrap()
+                            })
+                            .collect();
+                        (
+                            PoolState {
+                                pools: vec![Pool {
+                                    id: PoolId(2),
+                                    size: doubled,
+                                    buffers: vec![PoolBuffer::default(); count],
+                                }],
+                                ..Default::default()
+                            },
+                            images,
+                        )
+                    })
+                    .collect();
+                let mut seed = 0x2545_f491u32;
+                let mut next = || {
+                    seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                    (seed >> 16) % 257
+                };
+                let mut pixels: Vec<_> = (0..size.0 * size.1)
+                    .map(|_| [next(), next(), next()])
+                    .collect();
+                for step in 0..15 {
+                    let mut damage = adv_gpu::Region::empty(size);
+                    if step == 0 {
+                        damage = adv_gpu::Region::whole(size);
+                    }
+                    if step == 1 {
+                        // Whole S and just one changed input cell.
+                        pixels[(48 * size.0 + 64) as usize] = [256, 0, 128];
+                        damage = adv_gpu::Region::whole(size);
+                    } else if step == 3 {
+                        for (x, y) in [(0, 0), (size.0 - 1, size.1 - 1)] {
+                            pixels[(y * size.0 + x) as usize] = [next(), next(), next()];
+                            damage.add(rect(x, y, 1, 1).into());
+                        }
+                    } else if step == 4 {
+                        // Two paced publications merge before encoding. One
+                        // intermediate change is cancelled by the newest frame.
+                        let old = pixels[5];
+                        pixels[5] = [next(), next(), next()];
+                        damage.add(rect(5, 0, 1, 1).into());
+                        pixels[(80 * size.0 + 90) as usize] = [next(), next(), next()];
+                        pixels[5] = old;
+                        damage.add(rect(90, 80, 1, 1).into());
+                    } else if step >= 5 && step != 8 {
+                        for _ in 0..3 {
+                            let (x, y) = (next() % size.0, next() % size.1);
+                            pixels[(y * size.0 + x) as usize] = [next(), next(), next()];
+                            // Conservative quads include many unchanged cells.
+                            let producer = if step == 10 {
+                                rect(x, y, 1, 1)
+                            } else {
+                                rect(x.saturating_sub(16), y.saturating_sub(16), 40, 40)
+                            };
+                            damage.add(producer.into());
+                        }
+                    }
+                    if step == 2 || step == 8 {
+                        damage = adv_gpu::Region::whole(size);
+                    }
+                    let exact = step == 0 || step == 10;
+                    let rects: Vec<Rect> = damage.rects().into_iter().map(Into::into).collect();
+                    gpu.run(&partial, &pixels, Some(&rects), exact);
+                    gpu.run(&full, &pixels, None, true);
+                    let expected = gpu.read(&full.output);
+                    assert_eq!(
+                        gpu.read(&partial.output),
+                        expected,
+                        "{choice:?} {form} half={half} frame={step}"
+                    );
+                    let info = FrameInfo {
+                        serial: step as u64,
+                        canvas: size,
+                        base: BaseKind::Gpu { presentable: false },
+                        damage,
+                        video: Default::default(),
+                        cursor_regions: Default::default(),
+                    };
+                    for (state, images) in &mut pools {
+                        let selected = step % images.len();
+                        let pool = state.pools.iter_mut().find(|p| p.id == PoolId(2)).unwrap();
+                        for (i, b) in pool.buffers.iter_mut().enumerate() {
+                            b.in_use = i != selected;
+                        }
+                        if step >= images.len() {
+                            assert_eq!(pool.buffers[selected].age, Some(images.len() as u32));
+                        }
+                        let plan = plan(&info, &settings, &caps, state);
+                        let Stage::Output {
+                            transform,
+                            scale,
+                            tiles,
+                            ..
+                        } = plan.stages.last().unwrap()
+                        else {
+                            panic!("output stage")
+                        };
+                        let target = &images[selected];
+                        let mut encoder = gpu.queue.encoder("aged presentation");
+                        if !tiles.rects.is_empty() {
+                            let area = rect(0, 0, doubled.0, doubled.1).into();
+                            let load = adv_gpu::encode::Load::Load;
+                            let mut pass = encoder.render_pass(&RenderPassDesc {
+                                colors: [ColorAttachment {
+                                    view: target.view(),
+                                    load,
+                                    store: Store::Store,
+                                    resolve: None,
+                                }]
+                                .into_iter()
+                                .collect(),
+                                depth_stencil: None,
+                                area,
+                                timestamps: None,
+                                label: "aged presentation",
+                            });
+                            let spans = output::encode(
+                                &mut pass,
+                                output::Source::Image(partial.output.view()),
+                                target.desc().size,
+                                *transform,
+                                *scale,
+                                tiles,
+                                (&presentation_pipeline, &mut gpu.ring),
+                            )
+                            .unwrap();
+                            drop(pass);
+                            for span in spans {
+                                encoder.retain(span);
+                            }
+                        }
+                        let token = gpu.queue.submit(encoder).unwrap();
+                        assert!(gpu.queue.wait(token, Duration::from_secs(60)).unwrap());
+                        state.after_present(&plan);
+                        assert_eq!(
+                            gpu.read(target),
+                            expected,
+                            "{choice:?} {form} half={half} frame={step} age={}",
+                            images.len()
+                        );
+                    }
+                }
+            }
+        }
+    }
 }

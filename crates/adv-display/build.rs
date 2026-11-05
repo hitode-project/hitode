@@ -19,6 +19,16 @@ fn main() {
     let software = read("software");
     for (name, wgsl, bindings) in [
         (
+            "upscale_delta",
+            read("upscale_delta"),
+            bindings::UPSCALE_DELTA.to_vec(),
+        ),
+        (
+            "upscale_filter",
+            read("upscale_filter"),
+            bindings::UPSCALE_FILTER.to_vec(),
+        ),
+        (
             "output",
             software.clone() + &read("output"),
             bindings::OUTPUT

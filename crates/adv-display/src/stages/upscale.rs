@@ -35,6 +35,7 @@ use adv_gpu::{
     Buffer, ComputePipeline, Device, Encoder, Extent, Features, Format, Image, ImageView, Ring,
     Sampler,
 };
+use std::cell::Cell;
 
 /// Workgroups per dispatch, below the portable 65535 per dimension. Larger
 /// lists split into dispatches over aligned slices.
@@ -69,7 +70,7 @@ pub fn reach(choice: Upscaler) -> u32 {
 }
 
 impl Model {
-    /// Input pixels a change reaches in the output. Reach follows the data:
+    /// Input-pixel radius bounding a change in the output. Reach follows the data:
     /// a pass's outputs reach its radius beyond the farthest input it reads,
     /// so passes of one layer add theirs once. The final layer's bilinear
     /// sample of the input reaches one pixel beside that chain.
@@ -86,6 +87,28 @@ impl Model {
             }
         }
         output.max(1)
+    }
+
+    /// A cell-to-delta distance bounding the backwards dependency closure.
+    /// Rounding a later reader adds at most unit-1 pixels on either side.
+    /// Taking the largest branch also covers shared tensor storage.
+    fn filter_reaches(&self) -> Vec<u32> {
+        let output = self.tensors.len();
+        let mut needed = vec![0; output + 1];
+        needed[output] = self.reach();
+        let mut reaches = vec![0; self.passes.len()];
+        for (i, pass) in self.passes.iter().enumerate().rev() {
+            let reach = pass
+                .writes()
+                .map(|t| std::mem::take(&mut needed[t.unwrap_or(output)]))
+                .max()
+                .unwrap_or(0);
+            reaches[i] = reach;
+            for t in pass.reads() {
+                needed[t] = needed[t].max(reach + pass.unit() - 1 + pass.radius);
+            }
+        }
+        reaches
     }
 }
 
@@ -118,14 +141,30 @@ struct Grid {
     columns: u32,
     rows: u32,
     whole: usize,
+    compacted: Buffer,
+    parameters: Buffer,
+    /// First aligned indirect record for this pass.
+    arguments: u64,
 }
 
 /// One model at one canvas size. Only the selected model is resident.
 pub struct Upscaling {
     model: Model,
     size: (u32, u32),
-    /// The composed canvas in half precision, written by composition.
+    /// The last encoded composition, in half precision.
     input: Image,
+    scratch: Image,
+    initialized: Cell<bool>,
+    delta: Buffer,
+    delta_dimensions: Buffer,
+    compare: ComputePipeline,
+    initialize: ComputePipeline,
+    filter: ComputePipeline,
+    /// Filter and model indirect records, one per CPU-list slice.
+    gates: Buffer,
+    arguments: Buffer,
+    argument_stride: u64,
+    source_whole: usize,
     tensors: Vec<Image>,
     pipelines: Vec<ComputePipeline>,
     nearest: Sampler,
@@ -215,8 +254,13 @@ impl Upscaling {
         };
         let input = image(
             INPUT,
-            Usage::SAMPLED | Usage::COLOR | Usage::COPY_DST,
+            Usage::SAMPLED | Usage::COLOR | Usage::COPY_DST | Usage::STORAGE,
             "upscale input",
+        )?;
+        let scratch = image(
+            INPUT,
+            Usage::SAMPLED | Usage::COLOR | Usage::COPY_DST,
+            "upscale scratch",
         )?;
         let tensors = model
             .tensors
@@ -259,10 +303,15 @@ impl Upscaling {
             BufferUsage::UNIFORM,
             "upscale dimensions",
         )?;
+        let align = device.caps().limits.storage_offset_alignment.max(4) / 4;
+        let chunk = DISPATCH / align * align;
+        let argument_stride = u64::from(align * 4).max(16);
+        let reaches = model.filter_reaches();
+        let mut argument_bytes = 0;
         let mut grids = Vec::new();
         let mut shapes: Vec<(u32, u32)> = Vec::new();
         let mut whole = Vec::new();
-        for pass in model.passes {
+        for (pass, reach) in model.passes.iter().zip(reaches) {
             let shape = (size.0.div_ceil(pass.unit()), size.1.div_ceil(pass.unit()));
             let index = match shapes.iter().position(|&s| s == shape) {
                 Some(index) => index,
@@ -279,14 +328,125 @@ impl Upscaling {
                     shapes.len() - 1
                 }
             };
+            let count = shape.0 * shape.1;
             grids.push(Grid {
                 columns: shape.0,
                 rows: shape.1,
                 whole: index,
+                compacted: device.create_buffer(&BufferDesc {
+                    size: u64::from(count) * 4,
+                    usage: BufferUsage::STORAGE | BufferUsage::COPY_SRC,
+                    memory: Memory::Device,
+                    label: "upscale compacted cells",
+                })?,
+                parameters: upload(
+                    &words([size.0, size.1, pass.unit(), reach]),
+                    BufferUsage::UNIFORM,
+                    "upscale filter parameters",
+                )?,
+                arguments: argument_bytes,
             });
+            argument_bytes += u64::from(count.div_ceil(chunk)) * argument_stride;
         }
+        let source_shape = (size.0.div_ceil(8), size.1.div_ceil(8));
+        let source_whole = if let Some(i) = shapes.iter().position(|&s| s == source_shape) {
+            i
+        } else {
+            whole.push(upload(
+                &words(
+                    (0..source_shape.1).flat_map(|y| (0..source_shape.0).map(move |x| x | y << 16)),
+                ),
+                BufferUsage::STORAGE,
+                "upscale source cells",
+            )?);
+            whole.len() - 1
+        };
+        let buffer = |bytes, usage, label| {
+            device.create_buffer(&BufferDesc {
+                size: bytes,
+                usage,
+                memory: Memory::Device,
+                label,
+            })
+        };
+        let delta = buffer(
+            u64::from(source_shape.0.div_ceil(32) * source_shape.1 + 1) * 4,
+            BufferUsage::STORAGE | BufferUsage::COPY_DST,
+            "upscale delta",
+        )?;
+        let delta_dimensions = upload(
+            &words([
+                size.0,
+                size.1,
+                argument_bytes as u32 / 4,
+                argument_stride as u32 / 4,
+            ]),
+            BufferUsage::UNIFORM,
+            "upscale delta dimensions",
+        )?;
+        let delta_shader = device.create_shader(ShaderDesc {
+            source: Source::Precompiled {
+                spirv: &include!(concat!(env!("OUT_DIR"), "/upscale_delta.spv.rs")),
+                metal: include_bytes!(concat!(env!("OUT_DIR"), "/upscale_delta.msl")),
+                entries: &include!(concat!(env!("OUT_DIR"), "/upscale_delta.entries.rs")),
+            },
+            identity: include!(concat!(env!("OUT_DIR"), "/upscale_delta.identity.rs")),
+            label: "upscale delta",
+        })?;
+        let delta_pipeline = |entry| {
+            device.create_compute_pipeline(
+                &ComputePipelineDesc {
+                    entry: delta_shader.entry(entry, Stage::Compute)?,
+                    bindings: super::bindings::UPSCALE_DELTA.to_vec(),
+                    label: "upscale delta",
+                },
+                None,
+            )
+        };
+        let filter_shader = device.create_shader(ShaderDesc {
+            source: Source::Precompiled {
+                spirv: &include!(concat!(env!("OUT_DIR"), "/upscale_filter.spv.rs")),
+                metal: include_bytes!(concat!(env!("OUT_DIR"), "/upscale_filter.msl")),
+                entries: &include!(concat!(env!("OUT_DIR"), "/upscale_filter.entries.rs")),
+            },
+            identity: include!(concat!(env!("OUT_DIR"), "/upscale_filter.identity.rs")),
+            label: "upscale filter",
+        })?;
+        let filter = device.create_compute_pipeline(
+            &ComputePipelineDesc {
+                entry: filter_shader.entry("main", Stage::Compute)?,
+                bindings: super::bindings::UPSCALE_FILTER.to_vec(),
+                label: "upscale filter",
+            },
+            None,
+        )?;
         Ok(Self {
             model,
+            scratch,
+            initialized: Cell::new(false),
+            delta,
+            delta_dimensions,
+            compare: delta_pipeline("compare")?,
+            initialize: delta_pipeline("initialize")?,
+            filter,
+            gates: buffer(
+                argument_bytes,
+                BufferUsage::STORAGE
+                    | BufferUsage::INDIRECT
+                    | BufferUsage::COPY_SRC
+                    | BufferUsage::COPY_DST,
+                "upscale filter arguments",
+            )?,
+            arguments: buffer(
+                argument_bytes,
+                BufferUsage::STORAGE
+                    | BufferUsage::INDIRECT
+                    | BufferUsage::COPY_SRC
+                    | BufferUsage::COPY_DST,
+                "upscale model arguments",
+            )?,
+            argument_stride,
+            source_whole,
             size,
             input,
             tensors,
@@ -296,7 +456,7 @@ impl Upscaling {
             dimensions,
             grids,
             whole,
-            align: device.caps().limits.storage_offset_alignment.max(4) / 4,
+            align,
         })
     }
 
@@ -306,23 +466,24 @@ impl Upscaling {
     pub fn model(&self) -> &Model {
         &self.model
     }
-    /// The half-precision canvas the model reads; composition writes it.
-    pub fn input(&self) -> &Image {
-        &self.input
+    /// Composition target: the persistent input for exact damage, otherwise
+    /// scratch for comparison against the last encoded input.
+    pub fn input(&self, exact: bool) -> &Image {
+        if exact { &self.input } else { &self.scratch }
     }
 
-    /// Recompute after the input changed within `damage`, or entirely, into
-    /// `output`, a doubled-size view with storage usage. Each pass covers the
-    /// cells of its grid that the next pass reads, so reads stay within values
-    /// computed in this run, and disjoint changes stay disjoint (HOST-VIEW-10).
-    /// Returns the input pixels the last pass recomputed. `Busy` leaves the
-    /// encoder untouched.
+    /// Update after composition within `damage`, or the whole canvas. Exact
+    /// damage writes the input directly; conservative damage writes scratch.
+    /// Filters compact the CPU lists against GPU change cells (HOST-VIEW-10).
+    /// Returns the last pass's CPU-list pixels, an upper bound on recomputed
+    /// input pixels. `Busy` leaves the encoder untouched.
     pub fn encode(
         &self,
         encoder: &mut Encoder,
         ring: &mut Ring,
         output: &ImageView,
         damage: Option<&[Rect]>,
+        exact: bool,
         timestamps: Option<(&adv_gpu::queue::QuerySet, u32)>,
     ) -> adv_gpu::Result<u64> {
         let passes = self.model.passes;
@@ -333,31 +494,214 @@ impl Upscaling {
         if lists.iter().any(|l| l.as_ref().is_some_and(Vec::is_empty)) {
             return Ok(0);
         }
-        // Listed cells go to the ring, each list at an aligned offset.
-        let padded = |l: &Vec<u32>| (l.len() as u64).next_multiple_of(u64::from(self.align));
-        let entries: u64 = lists.iter().flatten().map(padded).sum();
-        let mut span = None;
-        let mut offsets = vec![0; passes.len()];
-        if entries > 0 {
-            let mut reserved = ring.reserve(entries * 4, u64::from(self.align) * 4)?;
-            let origin = reserved.offset();
-            let bytes = reserved.bytes();
-            let mut at = 0;
-            for (list, offset) in lists.iter().zip(&mut offsets) {
-                if let Some(list) = list {
-                    *offset = origin + at as u64;
-                    bytes[at..at + list.len() * 4].copy_from_slice(&words(list.iter().copied()));
-                    at += padded(list) as usize * 4;
+        let source = if exact {
+            None
+        } else {
+            damage.and_then(|rects| {
+                let mut region = adv_gpu::Region::empty(self.size);
+                for &rect in rects {
+                    region.add(rect.into());
                 }
+                if region.is_whole() {
+                    return None;
+                }
+                Some(
+                    region
+                        .rects()
+                        .into_iter()
+                        .flat_map(|r| {
+                            (r.y / 8..(r.y + r.h).div_ceil(8)).flat_map(move |y| {
+                                (r.x / 8..(r.x + r.w).div_ceil(8)).map(move |x| x | y << 16)
+                            })
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            })
+        };
+        // Reserve all uploads before recording any commands.
+        let padded = |l: &Vec<u32>| (l.len() as u64).next_multiple_of(u64::from(self.align));
+        let entries: u64 =
+            lists.iter().flatten().map(padded).sum::<u64>() + source.as_ref().map_or(0, padded);
+        let gate_start = entries * 4;
+        let model_start = gate_start + self.gates.desc().size;
+        let delta_start = model_start + self.arguments.desc().size;
+        let mut span = ring.reserve(
+            delta_start + if exact { self.delta.desc().size } else { 0 },
+            u64::from(self.align) * 4,
+        )?;
+        let origin = span.offset();
+        let mut offsets = vec![0; passes.len() + 1];
+        let mut at = 0;
+        for (list, offset) in lists
+            .iter()
+            .chain(std::iter::once(&source))
+            .zip(&mut offsets)
+        {
+            if let Some(list) = list {
+                *offset = origin + at as u64;
+                span.bytes()[at..at + list.len() * 4].copy_from_slice(&words(list.iter().copied()));
+                at += padded(list) as usize * 4;
             }
-            span = Some(reserved);
         }
         let chunk = DISPATCH / self.align * self.align;
+        // Copy zero counts and unit y/z dimensions into the reusable indirect
+        // records. Compare activates each filter only when delta is nonempty.
+        let gate_data = &mut span.bytes()[gate_start as usize..model_start as usize];
+        gate_data.fill(0);
+        for (i, grid) in self.grids.iter().enumerate() {
+            let count = lists[i]
+                .as_ref()
+                .map_or(grid.columns * grid.rows, |l| l.len() as u32);
+            for (slice, first) in (0..count).step_by(chunk as usize).enumerate() {
+                let offset = (grid.arguments + slice as u64 * self.argument_stride) as usize;
+                gate_data[offset + 4..offset + 8].copy_from_slice(&1u32.to_le_bytes());
+                gate_data[offset + 8..offset + 12].copy_from_slice(&1u32.to_le_bytes());
+                gate_data[offset + 12..offset + 16]
+                    .copy_from_slice(&chunk.min(count - first).to_le_bytes());
+            }
+        }
+        span.bytes().copy_within(
+            gate_start as usize..model_start as usize,
+            model_start as usize,
+        );
+        encoder.copy_buffer(
+            span.buffer()
+                .slice(origin + model_start..origin + delta_start),
+            &self.arguments,
+            0,
+        );
+        if exact {
+            // Exact publications already provide delta. Upload its bitmap and
+            // activate filters without launching a comparison kernel.
+            let bitmap = &mut span.bytes()[delta_start as usize..];
+            bitmap.fill(0);
+            let stride = self.size.0.div_ceil(8).div_ceil(32);
+            let whole = [Rect {
+                x: 0,
+                y: 0,
+                w: self.size.0,
+                h: self.size.1,
+            }];
+            for r in damage
+                .unwrap_or(&whole)
+                .iter()
+                .filter(|r| r.w > 0 && r.h > 0)
+            {
+                let (x0, x1) = (r.x / 8, (r.x + r.w).div_ceil(8));
+                for y in r.y / 8..(r.y + r.h).div_ceil(8) {
+                    for word in x0 / 32..=(x1 - 1) / 32 {
+                        let lo = if word == x0 / 32 { x0 % 32 } else { 0 };
+                        let hi = if word == (x1 - 1) / 32 {
+                            (x1 - 1) % 32
+                        } else {
+                            31
+                        };
+                        let mask = (!0u32 << lo) & (!0u32 >> (31 - hi));
+                        let at = ((y * stride + word) * 4) as usize;
+                        let value =
+                            u32::from_le_bytes(bitmap[at..at + 4].try_into().unwrap()) | mask;
+                        bitmap[at..at + 4].copy_from_slice(&value.to_le_bytes());
+                    }
+                }
+            }
+            for record in span.bytes()[gate_start as usize..model_start as usize]
+                .chunks_mut(self.argument_stride as usize)
+            {
+                let count = u32::from_le_bytes(record[12..16].try_into().unwrap());
+                record[..4].copy_from_slice(&count.div_ceil(64).to_le_bytes());
+            }
+            encoder.copy_buffer(
+                span.buffer()
+                    .slice(origin + delta_start..origin + span.len()),
+                &self.delta,
+                0,
+            );
+        } else {
+            encoder.fill_buffer(self.delta.slice(0..self.delta.desc().size), 0);
+        }
+        encoder.copy_buffer(
+            span.buffer()
+                .slice(origin + gate_start..origin + model_start),
+            &self.gates,
+            0,
+        );
         let mut compute = encoder.compute_pass(&ComputePassDesc {
             timestamps,
             label: "upscale",
         });
+        if !exact {
+            compute.set_pipeline(if self.initialized.get() {
+                &self.compare
+            } else {
+                &self.initialize
+            });
+            compute.bind(0, Bind::Uniform(self.delta_dimensions.slice(0..16)));
+            compute.bind(0, Bind::Sampled(self.scratch.view()));
+            compute.bind(0, Bind::StorageImage(self.input.view()));
+            compute.bind(
+                2,
+                Bind::StorageBuffer(self.delta.slice(0..self.delta.desc().size)),
+            );
+            compute.bind(
+                3,
+                Bind::StorageBuffer(self.gates.slice(0..self.gates.desc().size)),
+            );
+            let (source_buffer, source_offset, source_count) = source.as_ref().map_or(
+                (
+                    &self.whole[self.source_whole],
+                    0,
+                    self.size.0.div_ceil(8) * self.size.1.div_ceil(8),
+                ),
+                |l| (span.buffer(), offsets[passes.len()], l.len() as u32),
+            );
+            for first in (0..source_count).step_by(chunk as usize) {
+                let n = chunk.min(source_count - first);
+                let start = source_offset + u64::from(first) * 4;
+                compute.bind(
+                    1,
+                    Bind::StorageBuffer(source_buffer.slice(start..start + u64::from(n) * 4)),
+                );
+                compute.dispatch(n, 1, 1);
+            }
+        }
+        let list = |i: usize| {
+            let grid = &self.grids[i];
+            match &lists[i] {
+                Some(list) => (span.buffer(), offsets[i], list.len() as u32),
+                None => (&self.whole[grid.whole], 0, grid.columns * grid.rows),
+            }
+        };
         for (i, (pass, pipeline)) in passes.iter().zip(&self.pipelines).enumerate() {
+            let grid = &self.grids[i];
+            let (buffer, base, count) = list(i);
+            compute.set_pipeline(&self.filter);
+            compute.bind(0, Bind::Uniform(grid.parameters.slice(0..16)));
+            compute.bind(
+                1,
+                Bind::StorageBuffer(self.delta.slice(0..self.delta.desc().size)),
+            );
+            for (slice, first) in (0..count).step_by(chunk as usize).enumerate() {
+                let n = chunk.min(count - first);
+                let start = base + u64::from(first) * 4;
+                let compacted = u64::from(first) * 4;
+                let argument = grid.arguments + slice as u64 * self.argument_stride;
+                compute.bind(
+                    0,
+                    Bind::StorageBuffer(buffer.slice(start..start + u64::from(n) * 4)),
+                );
+                compute.bind(
+                    2,
+                    Bind::StorageBuffer(
+                        grid.compacted
+                            .slice(compacted..compacted + u64::from(n) * 4),
+                    ),
+                );
+                compute.bind(
+                    3,
+                    Bind::StorageBuffer(self.arguments.slice(argument..argument + 16)),
+                );
+                compute.dispatch_indirect(self.gates.slice(argument..argument + 12));
+            }
             compute.set_pipeline(pipeline);
             for &(slot, role) in pass.bindings {
                 let resource = match role {
@@ -372,25 +716,20 @@ impl Upscaling {
                 };
                 compute.bind(slot, resource);
             }
-            let grid = &self.grids[i];
-            let (buffer, base, count) = match (&lists[i], &span) {
-                (Some(list), Some(span)) => (span.buffer(), offsets[i], list.len() as u32),
-                _ => (&self.whole[grid.whole], 0, grid.columns * grid.rows),
-            };
-            for first in (0..count).step_by(chunk as usize) {
+            for (slice, first) in (0..count).step_by(chunk as usize).enumerate() {
                 let n = chunk.min(count - first);
-                let start = base + u64::from(first) * 4;
+                let start = u64::from(first) * 4;
+                let argument = grid.arguments + slice as u64 * self.argument_stride;
                 compute.bind(
                     0,
-                    Bind::StorageBuffer(buffer.slice(start..start + u64::from(n) * 4)),
+                    Bind::StorageBuffer(grid.compacted.slice(start..start + u64::from(n) * 4)),
                 );
-                compute.dispatch(n, 1, 1);
+                compute.dispatch_indirect(self.arguments.slice(argument..argument + 16));
             }
         }
         drop(compute);
-        if let Some(span) = span {
-            encoder.retain(span);
-        }
+        encoder.retain(span);
+        self.initialized.set(true);
         let last = passes.len() - 1;
         let cells = lists[last].as_ref().map_or(
             u64::from(self.grids[last].columns * self.grids[last].rows),
@@ -403,7 +742,7 @@ impl Upscaling {
     /// it is the whole grid. Walks back from the last pass: a pass's cells
     /// cover what later readers need of the tensors it writes, and it needs
     /// its inputs its radius beyond those cells.
-    fn cells(&self, damage: &[Rect]) -> Vec<Option<Vec<u32>>> {
+    pub(crate) fn cells(&self, damage: &[Rect]) -> Vec<Option<Vec<u32>>> {
         let grow = |r: Rect, by: u32| {
             let x = r.x.saturating_sub(by);
             let y = r.y.saturating_sub(by);
@@ -595,7 +934,7 @@ impl Check {
             origin: (0, 0, 0),
         };
         for (offset, (upscaling, output)) in (0..).step_by(Self::BYTES as usize).zip(&self.runs) {
-            let input = upscaling.input();
+            let input = upscaling.input(true);
             let pixels = BufferCopy {
                 buffer: &self.pixels,
                 offset: 0,
@@ -603,7 +942,7 @@ impl Check {
                 rows: 0,
             };
             encoder.copy_buffer_to_image(pixels, at(input), input.desc().size);
-            upscaling.encode(encoder, ring, output.view(), None, None)?;
+            upscaling.encode(encoder, ring, output.view(), None, true, None)?;
             let readback = BufferCopy {
                 buffer: &self.readback,
                 offset,
@@ -752,3 +1091,7 @@ mod precision_tests {
         assert!(failed.is_empty(), "failed: {}", failed.join(", "));
     }
 }
+
+#[cfg(test)]
+#[path = "upscale_tests.rs"]
+mod delta_tests;
