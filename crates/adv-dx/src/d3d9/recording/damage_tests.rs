@@ -1202,3 +1202,67 @@ fn local_damage_crosses_scaled_copy_and_fixed_or_shader_composition_exactly() {
         }
     }
 }
+/// A `w`×`h` quad at `x`,`y` in the 16×12 fixture target.
+fn quad_at(f: &mut Fixture, (x, y, w, h): (f32, f32, f32, f32), color: [f32; 4]) -> fixed::Draw {
+    let mut d = draw(f);
+    d.vertices = [
+        (x, y),
+        (x + w, y),
+        (x, y + h),
+        (x, y + h),
+        (x + w, y),
+        (x + w, y + h),
+    ]
+    .map(|(x, y)| Vertex {
+        position: [x / 8. - 1., 1. - y / 6., 0., 1.],
+        color,
+        uv: [0.; 2],
+    })
+    .to_vec()
+    .into();
+    d
+}
+// spec: GFX-REC-4 GFX-REC-5
+#[test]
+fn distant_changes_replay_in_separate_scissors_without_losing_unchanged_draws_between() {
+    // Two diagonal cells change; the cell between them holds an unchanged
+    // draw that meets neither. One scissor around both would make the clear
+    // erase it unless it ran too; each scissor alone leaves it untouched.
+    let quads = [(1., 1., 2., 2.), (10., 1., 2., 2.), (10., 9., 2., 2.)];
+    let mut colors = [[1., 0., 0., 1.], [0., 1., 0., 1.], [0., 0., 1., 1.]];
+    let mut f = fixture();
+    let frame = |f: &mut Fixture, colors: [[f32; 4]; 3]| {
+        clear(f, 0xff000000);
+        for (q, color) in quads.into_iter().zip(colors) {
+            let d = quad_at(f, q, color);
+            record_draw(f, d);
+        }
+        present(f);
+    };
+    frame(&mut f, colors);
+    colors[0] = [1., 1., 0., 1.];
+    colors[2] = [1., 1., 1., 1.];
+    frame(&mut f, colors);
+
+    let target =
+        f.m.ext
+            .get::<State>()
+            .gpu
+            .as_ref()
+            .unwrap()
+            .target(16, 12, false)
+            .unwrap()
+            .with_alpha_mode(AlphaMode::Opaque);
+    let gpu = f.m.ext.get_mut::<State>().gpu.as_mut().unwrap();
+    gpu.clear(&target, Some([0., 0., 0., 1.]), None).unwrap();
+    for (q, color) in quads.into_iter().zip(colors) {
+        let d = quad_at(&mut f, q, color);
+        let gpu = f.m.ext.get_mut::<State>().gpu.as_mut().unwrap();
+        gpu.draw(&target, &d.vertices, None, d.state).unwrap();
+    }
+    assert_eq!(latest(&mut f), pixels(&mut f, &target.image));
+    let counts = f.m.ext.get::<State>().frames;
+    assert_eq!(counts.clipped_executions, 1);
+    // The 8x8 top-left and 8x4 bottom-right cells of the 192-pixel target.
+    assert!((counts.clipped_area_sum - (1. + 96. / 192.)).abs() < 1e-9);
+}

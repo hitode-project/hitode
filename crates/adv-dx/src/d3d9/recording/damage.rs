@@ -350,13 +350,19 @@ pub(super) struct Record {
     reads: Vec<Content>,
     view: Rect,
 }
+/// Scissors per slot. A draw spanning several distant changes is submitted
+/// once per scissor it meets; past this many, coarser cells merge them.
+const PARTS: usize = 8;
 #[derive(Default)]
 pub(super) struct Analysis {
     histories: HashMap<Content, History>,
     reads: HashSet<Content>,
     unsafe_order: bool,
-    /// What each slot must redraw, in its view.
-    pub clips: HashMap<u128, Region>,
+    /// What each slot must redraw, in its view, as disjoint scissors. Every
+    /// write to a pixel inside one runs clipped to that same scissor, so the
+    /// pixel ends exactly as a full replay leaves it; a write meeting several
+    /// runs once per scissor (GFX-REC-5).
+    pub clips: HashMap<u128, Vec<Rect>>,
     /// What each slot's color changed.
     pub changed: HashMap<u128, Region>,
     pub planned: bool,
@@ -492,6 +498,7 @@ impl Analysis {
             .collect();
         order.sort_unstable_by_key(|(_, last)| *last);
         let mut changes = HashMap::default();
+        let mut redraws: HashMap<u128, Region> = HashMap::default();
         for (content, _) in order {
             let h = self.histories.get_mut(&content).unwrap();
             let slot = h.next.slot;
@@ -502,7 +509,7 @@ impl Analysis {
             );
             let redraw = resized(&redraw, size(full));
             h.seen = self.epoch;
-            self.clips
+            redraws
                 .entry(slot)
                 .and_modify(|r| r.union(&redraw))
                 .or_insert(redraw);
@@ -514,6 +521,12 @@ impl Analysis {
             }
             changes.insert(content, changed);
         }
+        self.clips.extend(redraws.into_iter().map(|(slot, redraw)| {
+            (
+                slot,
+                redraw.parts(PARTS).into_iter().map(Into::into).collect(),
+            )
+        }));
         self.planned = true;
     }
     pub fn rotatable(&self, slot: u128) -> bool {

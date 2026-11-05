@@ -153,6 +153,47 @@ impl Region {
         out
     }
 
+    /// At most `max` (at least one) disjoint rectangles covering every marked
+    /// cell: the [`rects`](Self::rects) of the finest grid of `CELL << k`
+    /// squares that needs no more of them.
+    pub fn parts(&self, max: usize) -> Vec<Rect> {
+        let mut out = self.rects();
+        let (columns, rows) = cells(self.size);
+        let mut k = 0;
+        while out.len() > max.max(1) {
+            k += 1;
+            let mut coarse = Self::empty((
+                columns.div_ceil(1 << k) * CELL,
+                rows.div_ceil(1 << k) * CELL,
+            ));
+            for y in 0..rows {
+                for (a, b) in runs(self.row(y), columns) {
+                    let (a, b) = (a >> k, (b - 1) >> k);
+                    coarse.add(Rect {
+                        x: a * CELL,
+                        y: (y >> k) * CELL,
+                        w: (b - a + 1) * CELL,
+                        h: CELL,
+                    });
+                }
+            }
+            out = coarse
+                .rects()
+                .into_iter()
+                .map(|r| {
+                    let (x, y) = (r.x << k, r.y << k);
+                    Rect {
+                        x,
+                        y,
+                        w: ((r.x + r.w) << k).min(self.size.0) - x,
+                        h: ((r.y + r.h) << k).min(self.size.1) - y,
+                    }
+                })
+                .collect();
+        }
+        out
+    }
+
     /// Cell range of `rect` clipped to the image, if any.
     fn span(&self, rect: Rect) -> Option<(u32, u32, u32, u32)> {
         let x1 = rect.x.saturating_add(rect.w).min(self.size.0);
@@ -275,6 +316,48 @@ mod tests {
             }
         }
         check(&region, shape);
+    }
+
+    #[test]
+    fn parts_stay_disjoint_and_cover_every_cell_within_the_limit() {
+        let size = (8 * 70 + 3, 8 * 9 + 5);
+        let mut region = Region::empty(size);
+        let shape = |x: u32, y: u32| (x * 7 + y * 3) % 5 < 2;
+        for y in 0..10 {
+            for x in 0..71 {
+                if shape(x, y) {
+                    region.add(rect(x * CELL, y * CELL, 1, 1));
+                }
+            }
+        }
+        assert_eq!(region.parts(usize::MAX), region.rects());
+        for max in [1, 3, 8, 40] {
+            let parts = region.parts(max);
+            assert!(parts.len() <= max, "{max}: {}", parts.len());
+            let (w, h) = size;
+            let mut cover = vec![0u8; (w * h) as usize];
+            for r in &parts {
+                assert!(r.x + r.w <= w && r.y + r.h <= h, "{r:?}");
+                for y in r.y..r.y + r.h {
+                    for x in r.x..r.x + r.w {
+                        cover[(y * w + x) as usize] += 1;
+                    }
+                }
+            }
+            for y in 0..h {
+                for x in 0..w {
+                    let at = cover[(y * w + x) as usize];
+                    assert!(at <= 1, "{max}: pixel {x},{y} in two parts");
+                    assert!(at == 1 || !shape(x / CELL, y / CELL), "{max}: {x},{y}");
+                }
+            }
+        }
+        // Two distant changes stay two parts.
+        let mut two = Region::empty((1280, 720));
+        two.add(rect(3, 5, 2, 2));
+        two.add(rect(1270, 710, 10, 10));
+        assert_eq!(two.parts(8), [rect(0, 0, 8, 8), rect(1264, 704, 16, 16)]);
+        assert_eq!(Region::empty((9, 9)).parts(8), []);
     }
 
     #[test]
