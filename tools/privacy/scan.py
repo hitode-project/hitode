@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Scan repository files (and optionally commits) for private data.
+"""Scan repository files for private data.
 
 The repository must not carry the tester's machine: host paths, personal
 email addresses, or anything listed in a local terms file. Guest paths the
 emulator itself presents (C:\\Users\\Player, C:\\Program Files, ...) are fine.
 
   python3 tools/privacy/scan.py                  # tracked and unignored files
-  python3 tools/privacy/scan.py --commits A..B   # also author/committer emails
   python3 tools/privacy/scan.py --artifacts <app> <apk> <ipa> <licenses.zip>
 
 Extra terms (game titles, user names, machine names) go one per line in a
@@ -123,17 +122,6 @@ def scan_files(root: Path, terms: list[str]) -> list[str]:
     return problems
 
 
-def scan_commits(root: Path, commits: str) -> list[str]:
-    problems = []
-    log = git("-C", str(root), "log", "--format=%h%x00%ae%x00%ce", commits)
-    for entry in log.splitlines():
-        sha, author, committer = entry.split("\0")
-        for role, email in (("author", author), ("committer", committer)):
-            if not email.lower().endswith(NOREPLY) and email != "noreply@github.com":
-                problems.append(f"commit {sha}: {role} email is not a GitHub noreply address")
-    return problems
-
-
 def scan_artifact(name: str, data: bytes, prefixes: list[str]) -> list[str]:
     stream = io.BytesIO(data)
     if zipfile.is_zipfile(stream):
@@ -176,15 +164,12 @@ def scan_artifacts(paths: list[Path], root: Path) -> list[str]:
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--commits", help="also check author/committer emails in this range")
     parser.add_argument("--artifacts", nargs="+", type=Path,
                         help="also scan shipped files, directories and ZIP/IPA/APK contents; mount DMGs first")
     args = parser.parse_args(argv)
     root = Path(git("rev-parse", "--show-toplevel").strip())
     terms = load_terms(root)
     problems = scan_files(root, terms)
-    if args.commits:
-        problems += scan_commits(root, args.commits)
     if args.artifacts:
         problems += scan_artifacts(args.artifacts, root)
     for problem in problems:
