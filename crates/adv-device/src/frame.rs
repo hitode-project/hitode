@@ -23,12 +23,23 @@ pub struct Frame {
 pub use crate::surface::PixelFormat;
 pub type Palette = Arc<[[u8; 4]; 256]>;
 
+/// A verified geometry proposal, never permission to copy output pixels.
+#[derive(Clone, Debug)]
+pub struct DrawRecord {
+    pub target: Rect,
+    pub content: u128,
+    /// Screen position minus texel position, in input pixels.
+    pub phase: [i32; 2],
+    pub motion: Option<[i32; 2]>,
+}
+
 pub enum Base {
     /// A D3D9 or DirectDraw swap buffer; its last write completes at `ready`.
     Gpu {
         image: SwapImage,
         damage: Region,
         ready: Token,
+        records: Arc<[DrawRecord]>,
     },
     /// Guest-format pixels in GPU-visible memory, normalized to top-down rows.
     Software {

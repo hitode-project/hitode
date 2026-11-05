@@ -53,7 +53,8 @@ impl Pass {
             depth: false,
             multisampled: false,
         };
-        self.bindings
+        let mut bindings: Vec<_> = self
+            .bindings
             .iter()
             .map(|&(slot, role)| Binding {
                 slot,
@@ -73,6 +74,24 @@ impl Pass {
                 },
                 stages: Stages::COMPUTE,
             })
-            .collect()
+            .collect();
+        if self.bindings.iter().any(|(_, role)| *role == Role::Output) {
+            bindings.extend([
+                Binding {
+                    slot: 16,
+                    kind: BindingKind::StorageBuffer { writable: true },
+                    stages: Stages::COMPUTE,
+                },
+                Binding {
+                    slot: 17,
+                    kind: BindingKind::StorageImage {
+                        format: OUTPUT,
+                        writable: true,
+                    },
+                    stages: Stages::COMPUTE,
+                },
+            ]);
+        }
+        bindings
     }
 }

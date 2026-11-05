@@ -58,6 +58,22 @@ fn gpu_filter_lists_cover_the_delta_dependency_closure() {
         }
         for (m, model) in table.into_iter().enumerate() {
             let upscaling = Upscaling::with_precision(&device, model, size, form == 2).unwrap();
+            let output = device
+                .create_image(&ImageDesc {
+                    dimension: Dimension::D2,
+                    size: Extent {
+                        width: size.0 * 2,
+                        height: size.1 * 2,
+                        depth_or_layers: 1,
+                    },
+                    format: OUTPUT,
+                    mips: 1,
+                    samples: 1,
+                    usage: Usage::STORAGE,
+                    view_formats: &[],
+                    label: "filter output",
+                })
+                .unwrap();
             for (s, delta) in [
                 (vec![rect(0, 0, size.0, size.1)], vec![rect(256, 64, 8, 8)]),
                 (
@@ -94,6 +110,18 @@ fn gpu_filter_lists_cover_the_delta_dependency_closure() {
                     0,
                 );
                 encoder.fill_buffer(upscaling.state.slice(0..upscaling.state.desc().size), 0);
+                encoder.fill_buffer(
+                    upscaling
+                        .verification
+                        .slice(0..upscaling.verification.desc().size),
+                    0,
+                );
+                encoder.fill_buffer(
+                    upscaling
+                        .motion_arguments
+                        .slice(0..upscaling.motion_arguments.desc().size),
+                    0,
+                );
                 let mut pass = encoder.compute_pass(&ComputePassDesc {
                     timestamps: None,
                     label: "filter cell selection",
@@ -110,6 +138,26 @@ fn gpu_filter_lists_cover_the_delta_dependency_closure() {
                         upscaling.metadata.slice(0..upscaling.metadata.desc().size),
                     ),
                 );
+                pass.bind(
+                    9,
+                    Bind::StorageBuffer(
+                        upscaling
+                            .motion_arguments
+                            .slice(0..upscaling.motion_arguments.desc().size),
+                    ),
+                );
+                pass.bind(
+                    6,
+                    Bind::StorageBuffer(
+                        upscaling
+                            .verification
+                            .slice(0..upscaling.verification.desc().size),
+                    ),
+                );
+                pass.bind(0, Bind::Sampled(upscaling.input.view()));
+                pass.bind(2, Bind::Sampled(upscaling.constant_output.view()));
+                pass.bind(7, Bind::StorageImage(upscaling.previous_input.view()));
+                pass.bind(8, Bind::StorageImage(output.view()));
                 for (i, grid) in upscaling.grids.iter().enumerate().rev() {
                     let list = source[i].clone().unwrap_or_else(|| {
                         (0..grid.rows)
@@ -196,7 +244,7 @@ fn unchanged_composition_launches_no_filter_or_model_workgroups() {
             format: OUTPUT,
             mips: 1,
             samples: 1,
-            usage: Usage::STORAGE | Usage::COPY_SRC,
+            usage: Usage::STORAGE | Usage::SAMPLED | Usage::COPY_SRC,
             view_formats: &[],
             label: "unchanged output",
         })
@@ -237,7 +285,14 @@ fn unchanged_composition_launches_no_filter_or_model_workgroups() {
         );
         assert!(
             upscaling
-                .encode(&mut encoder, &mut ring, output.view(), None, exact, None)
+                .encode(
+                    (&mut encoder, &mut ring),
+                    output.view(),
+                    None,
+                    Input::Composed,
+                    &[],
+                    None
+                )
                 .unwrap()
                 > 0
         );
@@ -258,6 +313,14 @@ fn unchanged_composition_launches_no_filter_or_model_workgroups() {
         );
         let token = queue.submit(encoder).unwrap();
         assert!(queue.wait(token, Duration::from_secs(60)).unwrap());
+        if frame == 0 {
+            let grid = upscaling.grids.last().unwrap();
+            assert_eq!(
+                read(&device, &mut queue, &upscaling.arguments)[grid.arguments as usize / 4],
+                1,
+                "one model output cell fills a new constant colour"
+            );
+        }
     }
     for buffer in [&upscaling.gates, &upscaling.arguments] {
         let records = read(&device, &mut queue, buffer);
@@ -272,11 +335,11 @@ fn unchanged_composition_launches_no_filter_or_model_workgroups() {
     assert_eq!(
         upscaling
             .encode(
-                &mut encoder,
-                &mut ring,
+                (&mut encoder, &mut ring),
                 output.view(),
                 Some(&[]),
-                false,
+                Input::Composed,
+                &[],
                 None
             )
             .unwrap(),
@@ -336,19 +399,34 @@ fn invalid_tensor_neighbours_recompute_after_rebuilt_outputs() {
                                 format: OUTPUT,
                                 mips: 1,
                                 samples: 1,
-                                usage: Usage::STORAGE | Usage::COPY_SRC | Usage::COPY_DST,
+                                usage: Usage::STORAGE
+                                    | Usage::SAMPLED
+                                    | Usage::COPY_SRC
+                                    | Usage::COPY_DST,
                                 view_formats: &[],
                                 label: "rebuilt output test",
                             })
                             .unwrap()
                     })
                     .collect();
-                for frame in 0..4 {
+                for frame in 0..10 {
                     for (i, pixel) in pixels.as_chunks_mut::<8>().0.iter_mut().enumerate() {
-                        if frame < 2 || i == (40 * size.0 + 47 + frame) as usize {
+                        if frame < 2 || (frame < 7 && i == (40 * size.0 + 47 + frame) as usize) {
                             for channel in pixel.as_chunks_mut::<2>().0.iter_mut() {
                                 seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
                                 channel.copy_from_slice(&half_bits((seed >> 16) % 257));
+                            }
+                        }
+                    }
+                    if frame >= 7 {
+                        // A broad pan must see the input history from every
+                        // small direct software update, including alpha bits.
+                        let old = pixels.clone();
+                        for y in 0..size.1 {
+                            for x in 0..size.0 {
+                                let into = ((y * size.0 + x) * 8) as usize;
+                                let from = ((y * size.0 + x.saturating_sub(1)) * 8) as usize;
+                                pixels[into..into + 8].copy_from_slice(&old[from..from + 8]);
                             }
                         }
                     }
@@ -359,11 +437,32 @@ fn invalid_tensor_neighbours_recompute_after_rebuilt_outputs() {
                         w: 16,
                         h: 8,
                     }];
-                    let damage = (frame >= 2).then_some(&damage[..]);
+                    let damage = (2..7).contains(&frame).then_some(&damage[..]);
                     // Compute the oracle first. Selected cells below stand in for
                     // reconstruction; the other output cells keep their old data.
                     for i in [1, 0] {
                         let mut encoder = queue.encoder("rebuilt output dependencies");
+                        let mode = if i == 0 && frame >= 7 {
+                            Input::Composed
+                        } else {
+                            Input::Exact
+                        };
+                        let records = if frame == 6 || frame == 7 {
+                            vec![DrawRecord {
+                                target: Rect {
+                                    x: 0,
+                                    y: 0,
+                                    w: size.0,
+                                    h: size.1,
+                                },
+                                content: 42,
+                                phase: [i32::from(frame == 7), 0],
+                                motion: None,
+                            }]
+                        } else {
+                            Vec::new()
+                        };
+                        let input = runs[i].input(mode == Input::Exact);
                         encoder.copy_buffer_to_image(
                             BufferCopy {
                                 buffer: &pixels_upload,
@@ -371,53 +470,97 @@ fn invalid_tensor_neighbours_recompute_after_rebuilt_outputs() {
                                 row_pitch: 0,
                                 rows: 0,
                             },
-                            at(runs[i].input(true), 0, 0),
-                            runs[i].input(true).desc().size,
+                            at(input, 0, 0),
+                            input.desc().size,
                         );
-                        if i == 0 && frame > 0 {
-                            let stride = size.0.div_ceil(8).div_ceil(32);
-                            let mut rebuilt =
-                                vec![0u32; (1 + stride * size.1.div_ceil(8)) as usize];
-                            rebuilt[0] = 1;
-                            if frame == 1 {
-                                for y in 1..size.1 / 8 - 1 {
-                                    for x in 1..size.0 / 8 - 1 {
-                                        if (x + y) % 3 == 0 {
-                                            continue;
-                                        }
-                                        rebuilt[(1 + y * stride + x / 32) as usize] |=
-                                            1 << (x % 32);
-                                        encoder.copy_image(
-                                            at(&images[1], x * 16, y * 16),
-                                            at(&images[0], x * 16, y * 16),
-                                            Extent {
-                                                width: 16,
-                                                height: 16,
-                                                depth_or_layers: 1,
-                                            },
-                                        );
+                        if i == 0 && frame > 0 && frame < 7 {
+                            // Supply verified reference cells directly: this test isolates
+                            // backwards requirements from candidate selection.
+                            let columns = size.0.div_ceil(8);
+                            let mut verified = vec![
+                                0u32;
+                                (columns * size.1.div_ceil(8) * (VERIFIED_STRIDE as u32 / 4))
+                                    as usize
+                            ];
+                            let mut copied = Vec::new();
+                            let erosion = model.reach().div_ceil(8);
+                            for y in 1..size.1 / 8 - 1 {
+                                for x in 1..size.0 / 8 - 1 {
+                                    if frame >= 2
+                                        && (x.abs_diff(5) > erosion || y.abs_diff(5) > erosion)
+                                    {
+                                        continue;
                                     }
+                                    let start =
+                                        ((y * columns + x) * (VERIFIED_STRIDE as u32 / 4)) as usize;
+                                    verified[start] = runs[i].epoch.get().wrapping_add(1);
+                                    verified[start + 10] = 1;
+                                    copied.push((x, y));
                                 }
                             }
-                            let rebuilt = upload(&device, &words(rebuilt), BufferUsage::COPY_SRC);
+                            let verified = upload(&device, &words(verified), BufferUsage::COPY_SRC);
                             encoder.copy_buffer(
-                                rebuilt.slice(0..rebuilt.desc().size),
-                                &runs[i].state,
-                                0,
+                                verified.slice(0..verified.desc().size),
+                                &runs[i].verification,
+                                VERIFIED_CELLS,
                             );
+                            for (x, y) in copied {
+                                let cell = y * columns + x;
+                                encoder.copy_image_to_buffer(
+                                    at(&images[1], x * 16, y * 16),
+                                    BufferCopy {
+                                        buffer: &runs[i].verification,
+                                        offset: VERIFIED_CELLS
+                                            + u64::from(cell) * VERIFIED_STRIDE
+                                            + 96,
+                                        row_pitch: 64,
+                                        rows: 16,
+                                    },
+                                    Extent {
+                                        width: 16,
+                                        height: 16,
+                                        depth_or_layers: 1,
+                                    },
+                                );
+                            }
                         }
                         runs[i]
                             .encode(
-                                &mut encoder,
-                                &mut ring,
+                                (&mut encoder, &mut ring),
                                 images[i].view(),
                                 if i == 0 { damage } else { None },
-                                true,
+                                mode,
+                                &records,
                                 None,
                             )
                             .unwrap();
                         let token = queue.submit(encoder).unwrap();
                         assert!(queue.wait(token, Duration::from_secs(60)).unwrap());
+                    }
+                    if frame > 0 && (frame < 7 || model.translations()) {
+                        assert_eq!(
+                            read(&device, &mut queue, &runs[0].state)[0],
+                            1,
+                            "the fixture must rebuild cells"
+                        );
+                    }
+                    if frame >= 7 && model.translations() {
+                        let grid = runs[0].grids.last().unwrap();
+                        let selected = read(&device, &mut queue, &runs[0].arguments)
+                            [grid.arguments as usize / 4];
+                        assert!(
+                            selected < grid.columns * grid.rows,
+                            "the broad frame must find references after small software updates"
+                        );
+                        let cells = read(&device, &mut queue, &grid.compacted);
+                        let band = (model.reach().div_ceil(8) + 1) * 8;
+                        for &cell in &cells[..selected as usize] {
+                            let x = (cell & 65535) * model.passes.last().unwrap().unit();
+                            assert!(
+                                x < band || x + model.passes.last().unwrap().unit() > size.0 - band,
+                                "a pure pan only computes edge bands"
+                            );
+                        }
                     }
                     let bytes = u64::from(size.0 * size.1 * 16);
                     let readback = device

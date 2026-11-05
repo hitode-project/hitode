@@ -30,6 +30,8 @@ pub fn precompile(wgsl: &str, bindings: &[Binding]) -> Result<Precompiled> {
         // Vulkan 1.1, our floor, takes SPIR-V 1.3; subgroup operations need it.
         lang_version: (1, 3),
         use_storage_input_output_16: false,
+        // The final writer adds workgroup zero initialization; the intermediate must not carry it.
+        zero_initialize_workgroup_memory: naga::back::spv::ZeroInitializeWorkgroupMemoryMode::None,
         ..Default::default()
     };
     let mut spirv = naga::back::spv::write_vec(&module, &info, &options, None)

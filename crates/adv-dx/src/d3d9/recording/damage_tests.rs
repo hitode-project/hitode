@@ -1266,3 +1266,56 @@ fn distant_changes_replay_in_separate_scissors_without_losing_unchanged_draws_be
     // The 8x8 top-left and 8x4 bottom-right cells of the 192-pixel target.
     assert!((counts.clipped_area_sum - (1. + 96. / 192.)).abs() < 1e-9);
 }
+
+// spec: GFX-REC-12
+#[test]
+fn integer_texel_phase_records_follow_content_across_presentations() {
+    let mut f = fixture();
+    let source = f.render_target(4, 4, 21);
+    let image = f.target(source).image;
+    f.okay("IDirect3DDevice9::SetRenderTarget", &[f.device, 0, source]);
+    clear(&mut f, 0xff4070a0);
+    f.okay("IDirect3DDevice9::SetRenderTarget", &[f.device, 0, f.back]);
+    sample_binding(&mut f, Some(source));
+    let owner = id(&mut f);
+    let mut identity = None;
+    for (n, x) in [0., 2., 5.].into_iter().enumerate() {
+        clear(&mut f, 0xff000000);
+        let mut d = quad_at(&mut f, (x, 3., 4., 4.), [1.; 4]);
+        d.image = Some(image.clone());
+        d.state.texture_op = TextureOp::Texture;
+        let vertices = Arc::make_mut(&mut d.vertices);
+        for (v, uv) in
+            vertices
+                .iter_mut()
+                .zip([[0., 0.], [1., 0.], [0., 1.], [0., 1.], [1., 0.], [1., 1.]])
+        {
+            v.uv = uv;
+        }
+        record_draw(&mut f, d);
+        let records = frame(&mut env(&mut f), owner).records.clone();
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record.phase, [x as i32, 3]);
+        assert_eq!(record.motion, [None, Some([2, 0]), Some([3, 0])][n]);
+        assert_eq!(*identity.get_or_insert(record.content), record.content);
+        present(&mut f);
+    }
+    for (x, width) in [(2.5, 4.), (2., 5.)] {
+        let mut d = quad_at(&mut f, (x, 3., width, 4.), [1.; 4]);
+        d.image = Some(image.clone());
+        d.state.texture_op = TextureOp::Texture;
+        for (v, uv) in Arc::make_mut(&mut d.vertices).iter_mut().zip([
+            [0., 0.],
+            [1., 0.],
+            [0., 1.],
+            [0., 1.],
+            [1., 0.],
+            [1., 1.],
+        ]) {
+            v.uv = uv;
+        }
+        record_draw(&mut f, d);
+    }
+    assert!(frame(&mut env(&mut f), owner).records.is_empty());
+}

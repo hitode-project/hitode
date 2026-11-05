@@ -634,7 +634,7 @@ mod tests {
                 format: upscale::OUTPUT,
                 mips: 1,
                 samples: 1,
-                usage: Usage::STORAGE,
+                usage: Usage::STORAGE | Usage::SAMPLED,
                 view_formats: &[],
                 label: "damage upscale fixture",
             })
@@ -643,8 +643,15 @@ mod tests {
         let mut run = |queue: &mut Queue, color: [f64; 4]| {
             fill(queue, u.input(false), color);
             let mut encoder = queue.encoder("damage upscale fixture");
-            u.encode(&mut encoder, &mut ring, result.view(), None, false, None)
-                .unwrap();
+            u.encode(
+                (&mut encoder, &mut ring),
+                result.view(),
+                None,
+                upscale::Input::Composed,
+                &[],
+                None,
+            )
+            .unwrap();
             queue.submit(encoder).unwrap();
         };
         run(&mut queue, [0.1, 0.2, 0.3, 1.]);
@@ -680,8 +687,15 @@ mod tests {
                 depth_or_layers: 1,
             },
         );
-        u.encode(&mut encoder, &mut ring, result.view(), None, false, None)
-            .unwrap();
+        u.encode(
+            (&mut encoder, &mut ring),
+            result.view(),
+            None,
+            upscale::Input::Composed,
+            &[],
+            None,
+        )
+        .unwrap();
         queue.submit(encoder).unwrap();
         let mut gpu = Damage::new(&device, canvas, view, u.damage_unit()).unwrap();
         let pixels = draw(&mut gpu, &device, &mut queue, &record, Some(&u), true);

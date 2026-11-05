@@ -155,6 +155,17 @@ Each planner pool MUST use indexed leases from one presentable pool in the backe
 
 A transparent host layer places the tints above the normal picture and video layers. Base and video layers, retained images, damage, buffer reuse, captures, redraws and content counters keep their ordinary path. Diagnostic resources are allocated on first use and discarded when disabled; outstanding host-image leases remain valid until release.
 
+### HOST-VIEW-13 Verified reconstruction
+
+**Rule**: An output cell MAY copy the previous output at twice an offset only when its whole field matches the previous input at that offset. The field MUST stay clear of canvas borders the offset crosses, and its source cells MUST be exact. Candidates MUST cost work, never pixels.
+**Verification**: Test
+
+Candidates come from draw-record phase changes and one global canvas offset. The delta kernel gives each changed cell a digest and compares at most four offsets pixel by pixel, all inside Δ. Each filter erodes the per-cell matches by ⌈reach/8⌉ cells, so every pixel of the field verified. Along a border the offset runs parallel to, clamped samples move with the content, so the border is allowed there. A reconstructed cell is exact, its tensors become invalid, and overlapping copies go through scratch.
+
+Global motion projects rows and columns of the new and previous input and correlates them on the GPU, without readback. Broad exact software damage runs it in the same frame. Conservative damage runs it only after a frame whose unexplained Δ exceeded one eighth of the canvas cells. A still frame with whole-layer redraws therefore issues the same dispatches as before. The first frame of a shake therefore pays one ordinary model run. Small exact software damage keeps the direct input path and only refreshes cell digests.
+
+A cell whose field holds one colour takes that colour's output from a 4096-entry table, filled by one model cell per new colour. Canvases whose verification state exceeds Vulkan's guaranteed 128 MiB storage range, about 3200×1800, are not upscaled.
+
 ### HOST-SES-1 Embedding
 
 **Rule**: Embedded sessions MUST use the shared shell execution and background services. A session MUST NOT take over the host `NSApplication` delegate or the host window.
