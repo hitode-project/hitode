@@ -1,7 +1,10 @@
+#[path = "common/surface_frames.rs"]
+mod frames;
 use adv_device::surface::{
-    BlitOptions, BlitRect, FlushReason, PixelFormat, Rect, Sampling, Snapshot, Sprite, SpriteAlpha,
-    SpriteMode, SurfaceMemory, Surfaces, VideoCursorRegion, VideoFrame, VideoLayer, frame_mailbox,
+    BlitOptions, BlitRect, FlushReason, PixelFormat, Rect, Sampling, Sprite, SpriteAlpha,
+    SpriteMode, SurfaceMemory, VideoCursorRegion, VideoFrame, VideoLayer,
 };
+use frames::{Snapshot, Store, frame_mailbox};
 use std::borrow::Cow;
 use std::sync::Arc;
 
@@ -55,13 +58,15 @@ impl SurfaceMemory for Memory {
         Ok(())
     }
 }
-fn store() -> Surfaces<Snapshot> {
-    Surfaces::new(5, 4, 16, 65520, Snapshot::default()).unwrap()
+fn store() -> Store {
+    Store::new(5, 4, 16, 65520, Snapshot::default()).unwrap()
 }
 
 fn video_layer() -> VideoLayer {
     VideoLayer {
         frame: VideoFrame {
+            #[cfg(feature = "gpu")]
+            picture: None,
             width: 2,
             height: 1,
             pitch: 8,
@@ -173,7 +178,7 @@ fn video_updates_clip_and_restore_an_immutable_base_without_game_present() {
         &[22, 0, 0, 255, 33, 0, 0, 255, 33, 0, 0, 255, 9, 0, 0, 255]
     );
     assert_eq!(&composed.bgra[36..40], &pixels[36..40]);
-    let mut patch = Snapshot::default();
+    let mut patch = adv_device::surface::Snapshot::default();
     let bounds = layer.rasterize((5, 4), &mut patch).unwrap().unwrap();
     assert_eq!(
         bounds,
@@ -452,7 +457,7 @@ fn segmented_storage_reuses_deleted_blocks_and_rolls_back_initialization_failure
         }
     }
     let mut memory = Memory::new(false);
-    let mut s = Surfaces::new(4, 4, 16, 128, Snapshot::default()).unwrap();
+    let mut s = Store::new(4, 4, 16, 128, Snapshot::default()).unwrap();
     assert!(
         s.create(
             4,
@@ -504,7 +509,7 @@ fn segmented_storage_reuses_deleted_blocks_and_rolls_back_initialization_failure
         (256, 256, 0)
     );
 }
-fn logical_pixels(s: &Surfaces<Snapshot>, id: u32, m: &Memory) -> Vec<Vec<u8>> {
+fn logical_pixels(s: &Store, id: u32, m: &Memory) -> Vec<Vec<u8>> {
     let surface = &s[id];
     (0..surface.height)
         .flat_map(|y| {
@@ -516,7 +521,7 @@ fn logical_pixels(s: &Surfaces<Snapshot>, id: u32, m: &Memory) -> Vec<Vec<u8>> {
         })
         .collect()
 }
-fn pattern(s: &Surfaces<Snapshot>, id: u32, m: &mut Memory) {
+fn pattern(s: &Store, id: u32, m: &mut Memory) {
     let surface = &s[id];
     for y in 0..surface.height {
         for x in 0..surface.width {
@@ -873,7 +878,7 @@ const INDEXED_COLORS: [[u8; 4]; 6] = [
     [3, 9, 244, 0],
 ];
 
-fn indexed_pattern(s: &mut Surfaces<Snapshot>, m: &mut Memory, bottom_up: bool) -> u32 {
+fn indexed_pattern(s: &mut Store, m: &mut Memory, bottom_up: bool) -> u32 {
     let id = s.create(3, 2, bottom_up, PixelFormat::Indexed8, m).unwrap();
     s.set_palette(id, 1, &INDEXED_COLORS, m).unwrap();
     m.write(s[id].row(0, 0), &[1, 2, 3, 0xcc]).unwrap();
@@ -1399,7 +1404,7 @@ fn three_slots_catch_up_and_skipped_frames_merge_with_a_bounded_history() {
         rx.current().snapshot(&mut full).unwrap();
         assert_eq!(full.bgra, expected);
     }
-    assert!(full_copies >= 1);
+    frames::assert_age_copies(&s, full_copies);
 }
 
 // spec: DEV-FRAME-4, DEV-FRAME-5, DEV-FRAME-6
@@ -1484,6 +1489,7 @@ fn surface_switches_and_resize_round_trips_invalidate_damage_history() {
     s.flush(&m, adv_device::surface::FlushReason::Immediate)
         .unwrap();
     assert!(rx.update());
+    assert_eq!(rx.current().damage(), &[s[a].rect()]);
     rx.current().snapshot(&mut out).unwrap();
     assert_eq!(&*out.damage, &[s[a].rect()]);
     assert_eq!(out.bgra, [0x78, 0x56, 0x34, 0x12].repeat(20));
@@ -1651,11 +1657,11 @@ fn declared_damage_shrinks_to_changed_tiles_against_the_last_publication() {
         (PixelFormat::Bgr24, true),
     ] {
         let mut m = Memory::new(false);
-        let mut s = Surfaces::new(128, 64, 16, 65520, Snapshot::default()).unwrap();
+        let mut s = Store::new(128, 64, 16, 65520, Snapshot::default()).unwrap();
         let id = s.create(128, 64, bottom_up, format, &mut m).unwrap();
         let (producer, mut consumer) = frame_mailbox();
         s.set_frame_mailbox(producer, adv_sync::WakeEvent::new().unwrap());
-        let mut publish = |s: &mut Surfaces<Snapshot>, m: &Memory| {
+        let mut publish = |s: &mut Store, m: &Memory| {
             s.present(id, m, s[id].rect()).unwrap();
             s.flush(m, FlushReason::Immediate).unwrap();
             if !consumer.update() {

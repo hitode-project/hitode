@@ -1,10 +1,6 @@
 use super::*;
 use adv_cpu::backend::Guest;
 use adv_device::gpu::*;
-include!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/metal_compare.rs"
-));
 
 fn vertex() -> Shader {
     Shader::parse(&[
@@ -18,15 +14,14 @@ fn vertex() -> Shader {
 fn every_declaration_type_is_fetched_by_the_gpu_with_d3d_component_defaults() {
     let backend = match std::env::var("ADV_TEST_GPU_BACKEND").as_deref() {
         Ok("vulkan") => GpuBackend::Vulkan,
-        Ok("gles") => GpuBackend::Gl,
         Ok("metal") => GpuBackend::Metal,
         _ => GpuBackend::Automatic,
     };
-    let mut gpu = pollster::block_on(Gpu::request_backend(
+    let mut gpu = adv_device::gpu::test_support::request_backend(
         matches!(backend, GpuBackend::Automatic)
             && !cfg!(any(target_os = "macos", target_os = "android")),
         backend,
-    ))
+    )
     .unwrap();
     let disk_dir = matches!(backend, GpuBackend::Vulkan).then(|| {
         std::env::temp_dir().join(format!(
@@ -41,7 +36,7 @@ fn every_declaration_type_is_fetched_by_the_gpu_with_d3d_component_defaults() {
     gpu.set_pipeline_cache_directory(disk_dir.as_deref());
     let target = gpu.target(8, 8, false).unwrap();
     let shader = vertex();
-    let translated = shader.translate().unwrap();
+    let translated = shader.translate(false).unwrap();
     let float = |v: &[f32]| bytemuck::cast_slice(v).to_vec();
     let mut cases: Vec<(AttributeFormat, Vec<u8>, [f32; 4])> = vec![
         (AttributeFormat::Float1, float(&[0.25]), [0.25, 0., 0., 1.]),
@@ -200,8 +195,6 @@ fn every_declaration_type_is_fetched_by_the_gpu_with_d3d_component_defaults() {
         let mut read = gpu.readback(&target.image, None).unwrap();
         read.take_completion_job().unwrap()();
         let pixels = read.poll().unwrap().unwrap();
-        #[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
-        emit_metal_pixels(&pixels);
         let got = &pixels[(4 * 8 + 4) * 4..(4 * 8 + 4) * 4 + 4];
         let want =
             [expected[2], expected[1], expected[0], expected[3]].map(|x| (x * 255.).round() as u8);
@@ -223,7 +216,7 @@ fn every_declaration_type_is_fetched_by_the_gpu_with_d3d_component_defaults() {
         );
         assert!(std::fs::metadata(&files[0]).unwrap().len() > 40);
         let mut reopened =
-            pollster::block_on(Gpu::request_backend(false, GpuBackend::Vulkan)).unwrap();
+            adv_device::gpu::test_support::request_backend(false, GpuBackend::Vulkan).unwrap();
         reopened.set_pipeline_cache_directory(Some(&dir));
         reopened.check().unwrap();
         reopened.set_pipeline_cache_directory(None);
@@ -235,25 +228,16 @@ fn every_declaration_type_is_fetched_by_the_gpu_with_d3d_component_defaults() {
     }
 }
 
-// spec: GFX-METAL-1
-#[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
-#[test]
-fn declaration_fixtures_match_native_metal_and_wgpu_exactly() {
-    compare_metal_fixture(
-        "every_declaration_type_is_fetched_by_the_gpu_with_d3d_component_defaults",
-    );
-}
-
 // spec: GFX-INPUT-1
 #[test]
 fn fixed_pixel_stages_combine_a_second_texture_stage() {
-    let mut gpu = pollster::block_on(Gpu::request_backend(
+    let mut gpu = adv_device::gpu::test_support::request_backend(
         !cfg!(any(target_os = "macos", target_os = "android")),
         GpuBackend::Automatic,
-    ))
+    )
     .unwrap();
     let target = gpu.target(8, 8, false).unwrap();
-    let texel = |bgra: [u8; 4]| {
+    let texel = |gpu: &mut Gpu, bgra: [u8; 4]| {
         let image = gpu.image(1, 1).unwrap();
         let whole = adv_device::surface::Rect {
             x: 0,
@@ -265,7 +249,10 @@ fn fixed_pixel_stages_combine_a_second_texture_stage() {
         image
     };
     // Stage zero texel (0.5, 1, 1, 1), stage one (1, 0.5, 0.25, 0.5).
-    let images = [texel([255, 255, 128, 255]), texel([64, 128, 255, 128])];
+    let images = [
+        texel(&mut gpu, [255, 255, 128, 255]),
+        texel(&mut gpu, [64, 128, 255, 128]),
+    ];
     let source = source::build(
         None,
         None,

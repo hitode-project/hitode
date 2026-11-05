@@ -24,7 +24,7 @@ fn frame(decoder: &mut Decoder, time: u64) -> Update {
 fn answer(update: Update) -> String {
     format!(
         "{:?} {:?} {}",
-        update.video.map(|v| (v.pts_us, v.bgra)),
+        update.video.map(|v| (v.pts_us, v.bgra().into_owned())),
         update
             .audio
             .into_iter()

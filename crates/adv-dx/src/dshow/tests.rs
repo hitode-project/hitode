@@ -471,14 +471,9 @@ fn system_filters_expose_pins_and_join_the_graph() {
 #[test]
 // spec: MEDIA-STREAM-1
 fn rgb_conversion_writes_bottom_up_rows() {
-    let frame = adv_device::media::VideoFrame {
-        pts_us: 0,
-        width: 2,
-        height: 2,
-        bgra: vec![1, 2, 3, 255, 4, 5, 6, 255, 7, 8, 9, 255, 10, 11, 12, 255],
-    };
+    let bgra = vec![1, 2, 3, 255, 4, 5, 6, 255, 7, 8, 9, 255, 10, 11, 12, 255];
     let mt = MediaType::video_rgb(MEDIASUBTYPE_RGB24, 2, 2, 333_333);
-    let bytes = stream::convert(&frame, &mt);
+    let bytes = stream::convert_bgra(2, 2, &bgra, &mt);
     // Stride pads 6 bytes to 8; the top source row lands last.
     assert_eq!(
         bytes,

@@ -200,6 +200,8 @@ pub struct State {
     com: Com,
     tables: BTreeMap<&'static str, u32>,
     gpu: Option<Gpu>,
+    upload_admission: u64,
+    upload_scratch: Vec<u8>,
     provider: SurfaceProvider,
     pending: Vec<Pending>,
     private_releases: Vec<u32>,
@@ -290,26 +292,30 @@ pub fn diagnostics(ext: &Ext, objects: &Objects) -> Diagnostics {
 /// Upload bytes snapshotted when the upload was recorded.
 #[derive(Clone)]
 enum Pixels {
-    Host(Arc<Vec<u8>>),
-    Alpha8(Arc<Vec<u8>>),
-    /// GPU staging memory and the content hash of the rows written to it.
-    Staged(Arc<adv_device::gpu::Staged>, u64),
+    Host(Arc<Vec<u8>>, u64),
+    /// GPU staging memory and its admission identity.
+    Staged(adv_device::gpu::Staged, u64),
 }
 impl Pixels {
     fn len(&self) -> usize {
         match self {
-            Self::Host(pixels) | Self::Alpha8(pixels) => pixels.len(),
+            Self::Host(pixels, _) => pixels.len(),
             Self::Staged(staged, _) => staged.len(),
         }
     }
 }
-/// Recording keys identify uploads by content.
+/// Upload admission already gives each recording a fresh content identity.
 impl std::hash::Hash for Pixels {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        match self {
-            Self::Host(pixels) | Self::Alpha8(pixels) => pixels.as_slice().hash(state),
-            Self::Staged(_, digest) => digest.hash(state),
-        }
+        let (Self::Host(_, admission) | Self::Staged(_, admission)) = self;
+        admission.hash(state);
+    }
+}
+
+impl State {
+    fn admit_upload(&mut self) -> u64 {
+        self.upload_admission += 1;
+        self.upload_admission
     }
 }
 
@@ -477,6 +483,8 @@ pub fn install<B: Backend>(
         com,
         tables,
         gpu: None,
+        upload_admission: 0,
+        upload_scratch: Vec::new(),
         provider,
         pending: Vec::new(),
         private_releases: Vec::new(),
@@ -500,6 +508,7 @@ pub fn set_gpu(ext: &mut Ext, mut gpu: Gpu) -> Result<(), String> {
     if state.gpu.is_some() {
         return Err("D3D9 GPU already installed".into());
     }
+    state.shader_translations.ieee_f32 = gpu.device().caps().ieee_f32;
     gpu.set_pipeline_cache_directory(state.shader_cache.as_deref());
     state.gpu = Some(gpu);
     Ok(())
@@ -1486,8 +1495,7 @@ fn execute_gpu(env: &mut Env<'_>, operation: &Operation) -> Result<Completion, E
             pitch,
             rectangle,
         } => match pixels {
-            Pixels::Host(pixels) => gpu.upload(&target.image, *rectangle, *pitch, pixels),
-            Pixels::Alpha8(pixels) => gpu.upload_alpha(&target.image, *rectangle, *pitch, pixels),
+            Pixels::Host(pixels, _) => gpu.upload(&target.image, *rectangle, *pitch, pixels),
             Pixels::Staged(staged, _) => gpu.upload_staged(&target.image, *rectangle, staged),
         }
         .map(|()| Completion::Command),

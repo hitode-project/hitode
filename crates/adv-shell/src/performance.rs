@@ -14,6 +14,22 @@ const SAMPLE_CAPACITY: usize = 4096;
 /// Queue delay is reported separately from nonpreemptible acquire/configure.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct NativePresentation {
+    #[cfg(any(host_view, feature = "gpu"))]
+    pub display_passes: u64,
+    #[cfg(any(host_view, feature = "gpu"))]
+    pub display_submissions: u64,
+    #[cfg(any(host_view, feature = "gpu"))]
+    pub display_plan: &'static str,
+    #[cfg(any(host_view, feature = "gpu"))]
+    pub display_stage_tiles: [u32; 4],
+    #[cfg(any(host_view, feature = "gpu"))]
+    pub display_stage_pixels: [u32; 4],
+    #[cfg(any(host_view, feature = "gpu"))]
+    pub display_stage_ns: [u64; 4],
+    #[cfg(any(host_view, feature = "gpu"))]
+    pub display_latch_ns: Option<u64>,
+    #[cfg(any(host_view, feature = "gpu"))]
+    pub display_shown_ns: Option<u64>,
     pub consumed: u64,
     pub uploads: u64,
     pub uploaded_bytes: u64,
@@ -34,6 +50,30 @@ pub(crate) struct NativePresentation {
 }
 impl NativePresentation {
     fn json(&self) -> String {
+        #[cfg(any(host_view, feature = "gpu"))]
+        let display = format!(
+            ", \"last_display_passes\": {}, \"last_display_submissions\": {}, \"last_display_tiles\": {}, \"last_display_pixels\": {}, \"display_plan\": \"{}\", \"last_stage_tiles\": {:?}, \"last_stage_pixels\": {:?}, \"last_stage_ns\": {:?}, \"last_latch_ns\": {}, \"last_shown_ns\": {}",
+            self.display_passes,
+            self.display_submissions,
+            self.display_stage_tiles
+                .iter()
+                .map(|&n| u64::from(n))
+                .sum::<u64>(),
+            self.display_stage_pixels
+                .iter()
+                .map(|&n| u64::from(n))
+                .sum::<u64>(),
+            self.display_plan,
+            self.display_stage_tiles,
+            self.display_stage_pixels,
+            self.display_stage_ns,
+            self.display_latch_ns
+                .map_or_else(|| "null".into(), |n| n.to_string()),
+            self.display_shown_ns
+                .map_or_else(|| "null".into(), |n| n.to_string())
+        );
+        #[cfg(not(any(host_view, feature = "gpu")))]
+        let display = "";
         format!(
             concat!(
                 "{{\"cumulative\": true, \"consumed_frames\": {}, \"software_uploads\": {}, ",
@@ -43,7 +83,7 @@ impl NativePresentation {
                 "\"software_uploaded_bytes\": {}, \"software_converted_bytes\": {}, ",
                 "\"software_gpu_transfer_bytes\": {}, ",
                 "\"software_upload_bytes_per_second\": {:.3}, \"software_conversion_bytes_per_second\": {:.3}, ",
-                "\"upscaled_runs\": {}, \"upscaled_input_pixels\": {}}}"
+                "\"upscaled_runs\": {}, \"upscaled_input_pixels\": {}{}}}"
             ),
             self.consumed,
             self.uploads,
@@ -66,7 +106,8 @@ impl NativePresentation {
                     .software_started
                     .map_or(1., |at| at.elapsed().as_secs_f64().max(1e-9)),
             self.upscaled_runs,
-            self.upscaled_pixels
+            self.upscaled_pixels,
+            display,
         )
     }
 }

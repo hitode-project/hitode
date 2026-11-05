@@ -5,7 +5,10 @@ use ff::{Rational, codec, format, frame, media, software};
 use ffmpeg_next as ff;
 
 use super::native::Input;
-use super::{AudioFrame, CodecFormat, Decoded, Demuxed, Error, Packet, PacketStream, VideoFrame};
+use super::{AudioFrame, CodecFormat, Decoded, Demuxed, Error, Packet, PacketStream};
+
+#[cfg(not(feature = "gpu"))]
+use super::VideoFrame;
 
 const HUNDRED_NS: Rational = Rational(1, 10_000_000);
 /// AV_INPUT_BUFFER_PADDING_SIZE: decoders may over-read extradata by this much.
@@ -136,7 +139,12 @@ pub(super) fn demux(bytes: Vec<u8>) -> Result<Demuxed, Error> {
 enum Kind {
     Video {
         decoder: ff::decoder::Video,
+        #[cfg(not(feature = "gpu"))]
         scaler: Option<(format::Pixel, u32, u32, software::scaling::Context)>,
+        #[cfg(feature = "gpu")]
+        output: Option<super::planes::Output>,
+        #[cfg(feature = "gpu")]
+        decoded: frame::Video,
     },
     Audio {
         decoder: ff::decoder::Audio,
@@ -146,6 +154,8 @@ enum Kind {
 }
 
 pub(super) struct Decoder {
+    #[cfg(feature = "gpu")]
+    device: Option<adv_gpu::Device>,
     kind: Kind,
 }
 
@@ -240,7 +250,12 @@ impl Decoder {
         let kind = match format {
             CodecFormat::Video { .. } => Kind::Video {
                 decoder: decoder.video()?,
+                #[cfg(not(feature = "gpu"))]
                 scaler: None,
+                #[cfg(feature = "gpu")]
+                output: None,
+                #[cfg(feature = "gpu")]
+                decoded: frame::Video::empty(),
             },
             CodecFormat::Audio { .. } => Kind::Audio {
                 decoder: decoder.audio()?,
@@ -249,7 +264,20 @@ impl Decoder {
                     .then(super::audio_clock::AudioClock::default),
             },
         };
-        Ok(Self { kind })
+        Ok(Self {
+            kind,
+            #[cfg(feature = "gpu")]
+            device: if matches!(format, CodecFormat::Video { .. }) {
+                Some(
+                    crate::gpu::Gpu::execution(false)
+                        .map_err(|e| Error::Decode(e.to_string()))?
+                        .device()
+                        .clone(),
+                )
+            } else {
+                None
+            },
+        })
     }
 
     pub fn decode(&mut self, data: &[u8], time_100ns: Option<u64>) -> Result<Vec<Decoded>, Error> {
@@ -298,10 +326,38 @@ impl Decoder {
         let mut out = Vec::new();
         loop {
             let result = match &mut self.kind {
-                Kind::Video { decoder, scaler } => {
+                Kind::Video {
+                    decoder,
+                    #[cfg(not(feature = "gpu"))]
+                    scaler,
+                    #[cfg(feature = "gpu")]
+                    output,
+                    #[cfg(feature = "gpu")]
+                    decoded,
+                } => {
+                    #[cfg(not(feature = "gpu"))]
                     let mut decoded = frame::Video::empty();
-                    match decoder.receive_frame(&mut decoded) {
-                        Ok(()) => convert_video(scaler, &decoded).map(|f| Some(Decoded::Video(f))),
+                    #[cfg(not(feature = "gpu"))]
+                    let decoded = &mut decoded;
+                    match decoder.receive_frame(decoded) {
+                        Ok(()) => {
+                            #[cfg(feature = "gpu")]
+                            if output.is_none() {
+                                *output = Some(super::planes::Output::new(
+                                    self.device.as_ref().unwrap(),
+                                    decoder,
+                                )?);
+                            }
+
+                            #[cfg(not(feature = "gpu"))]
+                            let result = convert_video(scaler, decoded);
+                            #[cfg(feature = "gpu")]
+                            let result = Ok(output.as_mut().unwrap().convert(
+                                decoded.timestamp().map_or(0, |t| (t.max(0) / 10) as u64),
+                                decoded,
+                            )?);
+                            result.map(|f| Some(Decoded::Video(f)))
+                        }
                         Err(error) => Err(error),
                     }
                 }
@@ -336,6 +392,7 @@ impl Decoder {
     }
 }
 
+#[cfg(not(feature = "gpu"))]
 fn convert_video(
     scaler: &mut Option<(format::Pixel, u32, u32, software::scaling::Context)>,
     decoded: &frame::Video,

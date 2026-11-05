@@ -1,4 +1,5 @@
 use super::*;
+use crate::shader::compile::combine_video_sampler;
 use naga::{Expression as E, Handle, Span, Type, TypeInner};
 use std::ffi::CString;
 
@@ -7,15 +8,19 @@ pub(crate) struct Shader(Arc<ShaderCore>);
 struct ShaderCore {
     context: Arc<Context>,
     identity: u64,
-    module: vk::ShaderModule,
+    /// One module per entry point, except precompiled SPIR-V, which keeps its
+    /// single module, and heap shaders, which lower per pipeline. Adreno
+    /// drivers fail pipeline creation for some modules with several entry
+    /// points of one stage, so lowered IR never shares a module.
+    modules: Vec<vk::ShaderModule>,
     entries: Vec<(CString, Stage)>,
     storage_strides: Vec<HashMap<u32, u32>>,
     heap: Option<HeapShader>,
 }
 impl Drop for ShaderCore {
     fn drop(&mut self) {
-        unsafe {
-            self.context.device.destroy_shader_module(self.module, None);
+        for &module in &self.modules {
+            unsafe { self.context.device.destroy_shader_module(module, None) };
         }
     }
 }
@@ -40,6 +45,7 @@ impl Shader {
         &'a self,
         entry: &'a Entry,
         layout: &binding::PushLayout,
+        video_set: Option<u32>,
     ) -> Result<ShaderStage<'a>> {
         let (module, temporary) = if let Some(heap) = &self.0.heap {
             let mut module = heap.module.clone();
@@ -52,22 +58,35 @@ impl Shader {
                 });
                 module.global_expressions[patch.init] = E::Literal(naga::Literal::U32(value));
             }
-            let words = lower(
+            let has_video = !heap.video.is_empty();
+            if has_video && video_set.is_none() {
+                return Err(Error::Compile(
+                    "group 4 requires a video pool pipeline".into(),
+                ));
+            }
+            for &global in &heap.video {
+                module.global_variables[global]
+                    .binding
+                    .as_mut()
+                    .unwrap()
+                    .group = video_set.unwrap();
+            }
+            let mut words = lower(
                 &module,
                 Some(&naga::back::spv::PipelineOptions {
-                    shader_stage: match entry.stage {
-                        Stage::Vertex => naga::ShaderStage::Vertex,
-                        Stage::Fragment => naga::ShaderStage::Fragment,
-                        Stage::Compute => naga::ShaderStage::Compute,
-                    },
+                    shader_stage: naga_stage(entry.stage),
                     entry_point: self.0.entries[entry.index as usize]
                         .0
                         .to_str()
                         .unwrap()
                         .into(),
                 }),
-                true,
+                self.0.context.heap.is_some(),
+                self.0.context.caps.ieee_f32,
             )?;
+            if has_video {
+                combine_video_sampler(&mut words, video_set.unwrap());
+            }
             (
                 self.0.context.result(unsafe {
                     self.0.context.device.create_shader_module(
@@ -78,7 +97,8 @@ impl Shader {
                 true,
             )
         } else {
-            (self.0.module, false)
+            let index = (entry.index as usize).min(self.0.modules.len() - 1);
+            (self.0.modules[index], false)
         };
         Ok(ShaderStage {
             shader: self,
@@ -127,6 +147,7 @@ impl Drop for ShaderStage<'_> {
 struct HeapShader {
     module: naga::Module,
     patches: Vec<Patch>,
+    video: Vec<Handle<naga::GlobalVariable>>,
 }
 struct Patch {
     init: Handle<E>,
@@ -139,10 +160,19 @@ enum Part {
     Shift,
     Offset,
 }
+fn naga_stage(stage: Stage) -> naga::ShaderStage {
+    match stage {
+        Stage::Vertex => naga::ShaderStage::Vertex,
+        Stage::Fragment => naga::ShaderStage::Fragment,
+        Stage::Compute => naga::ShaderStage::Compute,
+    }
+}
+
 fn lower(
     module: &naga::Module,
     entry: Option<&naga::back::spv::PipelineOptions>,
     heap: bool,
+    ieee_f32: bool,
 ) -> Result<Vec<u32>> {
     let flags = if heap {
         naga::valid::ValidationFlags::all() - naga::valid::ValidationFlags::BINDINGS
@@ -150,17 +180,20 @@ fn lower(
         naga::valid::ValidationFlags::all()
     };
     let info = validate(module, flags)?;
-    naga::back::spv::write_vec(
-        module,
-        &info,
-        &naga::back::spv::Options {
-            lang_version: (1, 3),
-            ..Default::default()
-        },
-        entry,
-    )
-    .map_err(|e| Error::Compile(format!("SPIR-V lowering: {e}")))
+    let mut options = naga::back::spv::Options {
+        lang_version: (1, 3),
+        use_storage_input_output_16: false,
+        ..Default::default()
+    };
+    // Point lists need a written PointSize without maintenance5; Metal
+    // lowering forces it the same way.
+    options.flags |= naga::back::spv::WriterFlags::FORCE_POINT_SIZE;
+    let mut words = naga::back::spv::write_vec(module, &info, &options, entry)
+        .map_err(|e| Error::Compile(format!("SPIR-V lowering: {e}")))?;
+    crate::shader::compile::legalize(&mut words, ieee_f32);
+    Ok(words)
 }
+
 #[derive(Clone)]
 struct StorageShape {
     stride: u32,
@@ -212,12 +245,7 @@ impl Device {
             ),
             Source::Ir(module) => (*module, None),
             Source::Precompiled { spirv, .. } => {
-                let module = naga::front::spv::Frontend::new(
-                    spirv.iter().copied(),
-                    &naga::front::spv::Options::default(),
-                )
-                .parse()
-                .map_err(|e| Error::Compile(format!("SPIR-V: {e}")))?;
+                let module = crate::shader::compile::parse_spirv(spirv)?;
                 (module, Some(spirv))
             }
         };
@@ -244,10 +272,30 @@ impl Device {
             .update(module.to_ctx())
             .map_err(|e| Error::Compile(format!("shader layout: {e}")))?;
         let mut storage_strides = vec![HashMap::new(); entries.len()];
+        let mut video = Vec::new();
         for (handle, global) in module.global_variables.iter() {
             if let Some(binding) = &global.binding {
-                if binding.group > 3 {
-                    return Err(Error::Compile("resource group must be 0..3".into()));
+                if binding.group > 4
+                    || (binding.group == 4
+                        && !matches!(
+                            (binding.binding, &module.types[global.ty].inner),
+                            (
+                                0,
+                                TypeInner::Image {
+                                    dim: naga::ImageDimension::D2,
+                                    arrayed: false,
+                                    class: naga::ImageClass::Sampled {
+                                        kind: naga::ScalarKind::Float,
+                                        multi: false
+                                    }
+                                }
+                            ) | (1, TypeInner::Sampler { comparison: false })
+                        ))
+                {
+                    return Err(Error::Compile("resource groups are 0..3, or video texture/sampler at group 4 bindings 0/1".into()));
+                }
+                if binding.group == 4 {
+                    video.push(handle);
                 }
                 if matches!(global.space, naga::AddressSpace::Storage { .. }) {
                     let stride = storage_shape(&module, global.ty, &layouter).stride;
@@ -259,6 +307,11 @@ impl Device {
                 }
             }
         }
+        if !video.is_empty() && video.len() != 2 {
+            return Err(Error::Compile(
+                "video requires its texture and sampler pair".into(),
+            ));
+        }
         // Build-time SPIR-V already uses this backend's convention. Modules with
         // declared groups are lowered exactly like IR, including heap rewriting.
         let already_lowered = precompiled.is_some()
@@ -267,9 +320,7 @@ impl Device {
                 .iter()
                 .all(|(_, g)| g.binding.is_none());
         let mut patches = Vec::new();
-        let words = if already_lowered {
-            precompiled.unwrap().to_vec()
-        } else {
+        if !already_lowered {
             if let Some(heap) = &self.0.heap {
                 patches = rewrite_heap(
                     &mut module,
@@ -279,30 +330,62 @@ impl Device {
                 )?;
             } else {
                 for (_, global) in module.global_variables.iter_mut() {
-                    if let Some(binding) = &mut global.binding {
+                    if let Some(binding) = &mut global.binding
+                        && binding.group != 4
+                    {
                         binding.binding = binding.binding * 4 + binding.group;
                         binding.group = 0;
                     }
                 }
             }
-            lower(&module, None, self.0.heap.is_some())?
+        }
+        // Heap and video shaders lower per pipeline, from the module kept here.
+        let per_pipeline = !already_lowered && (self.0.heap.is_some() || !video.is_empty());
+        let lowered: Vec<Vec<u32>> = if already_lowered {
+            let mut words = precompiled.unwrap().to_vec();
+            crate::shader::compile::legalize(&mut words, self.0.caps.ieee_f32);
+            vec![words]
+        } else if per_pipeline {
+            Vec::new()
+        } else {
+            entries
+                .iter()
+                .map(|(name, stage)| {
+                    lower(
+                        &module,
+                        Some(&naga::back::spv::PipelineOptions {
+                            shader_stage: naga_stage(*stage),
+                            entry_point: name.to_str().unwrap().into(),
+                        }),
+                        false,
+                        self.0.caps.ieee_f32,
+                    )
+                })
+                .collect::<Result<_>>()?
         };
-        let heap = self.0.heap.as_ref().map(|_| HeapShader { module, patches });
-        let handle = self.0.result(unsafe {
-            self.0
-                .device
-                .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&words), None)
-        })?;
+        let mut core = ShaderCore {
+            context: self.0.clone(),
+            identity: desc.identity,
+            modules: Vec::with_capacity(lowered.len()),
+            entries,
+            storage_strides,
+            heap: per_pipeline.then_some(HeapShader {
+                module,
+                patches,
+                video,
+            }),
+        };
+        // Dropping `core` on an error destroys the modules created so far.
+        for words in &lowered {
+            core.modules.push(self.0.result(unsafe {
+                self.0
+                    .device
+                    .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(words), None)
+            })?);
+        }
         Ok(crate::Shader {
             identity: desc.identity,
-            inner: Shader(Arc::new(ShaderCore {
-                context: self.0.clone(),
-                identity: desc.identity,
-                module: handle,
-                entries,
-                storage_strides,
-                heap,
-            })),
+            inner: Shader(Arc::new(core)),
         })
     }
 }
@@ -331,9 +414,11 @@ fn rewrite_heap(
         },
         Span::UNDEFINED,
     );
+    // Named, so a shader's own `array<u32, N>` (say in workgroup memory, which
+    // takes no explicit layout) stays a separate type.
     let array = module.types.insert(
         Type {
-            name: None,
+            name: Some("binding_indices".into()),
             inner: TypeInner::Array {
                 base: uint,
                 size: naga::ArraySize::Constant(std::num::NonZeroU32::new(words).unwrap()),
@@ -369,10 +454,14 @@ fn rewrite_heap(
         Span::UNDEFINED,
     );
     let mut globals = HashMap::new();
+    let mut shared = HashMap::new();
     for (handle, global) in module.global_variables.iter_mut() {
         let Some(binding) = &mut global.binding else {
             continue;
         };
+        if binding.group == 4 {
+            continue;
+        }
         let group = binding.group;
         let slot = binding.binding;
         if group == 0 {
@@ -485,9 +574,20 @@ fn rewrite_heap(
             Span::UNDEFINED,
         );
         global.ty = array;
+        // One variable per heap binding and type: older Mali drivers read
+        // descriptors only through the first of several aliasing variables.
+        let variable = *shared
+            .entry((
+                binding.binding,
+                array,
+                global.space,
+                global.memory_decorations,
+            ))
+            .or_insert(handle);
         globals.insert(
             handle,
             Global {
+                variable,
                 word,
                 shift,
                 offset,
@@ -510,6 +610,8 @@ fn rewrite_heap(
     Ok(patches)
 }
 struct Global {
+    /// The variable all aliases of this binding and type access.
+    variable: Handle<naga::GlobalVariable>,
     word: Handle<naga::Constant>,
     shift: Handle<naga::Constant>,
     offset: Option<Handle<naga::Constant>>,
@@ -537,7 +639,7 @@ fn rewrite_function(
             continue;
         }
         let arena = &mut function.expressions;
-        let base = arena.append(E::GlobalVariable(global), Span::UNDEFINED);
+        let base = arena.append(E::GlobalVariable(resource.variable), Span::UNDEFINED);
         let pc = arena.append(E::GlobalVariable(push), Span::UNDEFINED);
         let word = arena.append(E::Constant(resource.word), Span::UNDEFINED);
         let shift = arena.append(E::Constant(resource.shift), Span::UNDEFINED);
@@ -963,6 +1065,128 @@ fn map_block(block: &mut naga::Block, map: &[H], starts: &[u32], arena: &naga::A
                 m(payload);
             }
             _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod video_tests {
+    use super::*;
+
+    #[test]
+    fn video_pair_becomes_one_combined_descriptor() {
+        let (device, _queue) = test_device!(DeviceOptions {
+            software: !cfg!(target_os = "android"),
+            validation: !cfg!(target_os = "android"),
+            ..DeviceOptions::default()
+        });
+        let source = r#"
+            @group(4) @binding(0) var video: texture_2d<f32>;
+            @group(4) @binding(1) var filtering: sampler;
+            @group(0) @binding(3) var<uniform> scale: vec4<f32>;
+            @vertex fn vs() -> @builtin(position) vec4<f32> { return vec4(0., 0., 0., 1.); }
+            @fragment fn fs(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
+                return textureSampleLevel(video, filtering, p.xy * scale.xy, 0.);
+            }
+        "#;
+        let compiled = crate::shader::precompile(
+            source,
+            &[Binding {
+                slot: 3,
+                kind: BindingKind::UniformBuffer,
+                stages: Stages::FRAGMENT,
+            }],
+        )
+        .unwrap();
+        for precompiled in [false, true] {
+            for heap in [false, true] {
+                let mut module = if precompiled {
+                    crate::shader::compile::parse_spirv(&compiled.spirv).unwrap()
+                } else {
+                    naga::front::wgsl::parse_str(source).unwrap()
+                };
+                let video: Vec<_> = module
+                    .global_variables
+                    .iter()
+                    .filter_map(|(h, g)| {
+                        g.binding
+                            .as_ref()
+                            .is_some_and(|b| b.group == 4)
+                            .then_some(h)
+                    })
+                    .collect();
+                if heap {
+                    rewrite_heap(&mut module, 32, 4, [16; 4]).unwrap();
+                } else {
+                    for (_, global) in module.global_variables.iter_mut() {
+                        if let Some(binding) = &mut global.binding
+                            && binding.group != 4
+                        {
+                            binding.binding = binding.binding * 4 + binding.group;
+                            binding.group = 0;
+                        }
+                    }
+                }
+                for set in [5, 6] {
+                    let mut module = module.clone();
+                    for &global in &video {
+                        module.global_variables[global]
+                            .binding
+                            .as_mut()
+                            .unwrap()
+                            .group = set;
+                    }
+                    for entry in [
+                        None,
+                        Some(naga::back::spv::PipelineOptions {
+                            shader_stage: naga::ShaderStage::Vertex,
+                            entry_point: "vs".into(),
+                        }),
+                        Some(naga::back::spv::PipelineOptions {
+                            shader_stage: naga::ShaderStage::Fragment,
+                            entry_point: "fs".into(),
+                        }),
+                    ] {
+                        let mut words =
+                            lower(&module, entry.as_ref(), heap, device.inner.0.caps.ieee_f32)
+                                .unwrap();
+                        combine_video_sampler(&mut words, set);
+                        // Vulkan validation checks the resulting combined-image SPIR-V.
+                        let handle = unsafe {
+                            device.inner.0.device.create_shader_module(
+                                &vk::ShaderModuleCreateInfo::default().code(&words),
+                                None,
+                            )
+                        }
+                        .unwrap();
+                        unsafe {
+                            device.inner.0.device.destroy_shader_module(handle, None);
+                        }
+                        // The combined declaration is the only descriptor in the appended set.
+                        let mut at = 5;
+                        let mut descriptors = 0;
+                        let mut combined_loads = 0;
+                        while at < words.len() {
+                            let count = (words[at] >> 16) as usize;
+                            match words[at] & 0xffff {
+                                71 if words[at + 2] == 34 && words[at + 3] == set => {
+                                    descriptors += 1
+                                }
+                                83 => combined_loads += 1,
+                                _ => {}
+                            }
+                            at += count;
+                        }
+                        let sampled = usize::from(
+                            entry
+                                .as_ref()
+                                .is_none_or(|e| e.shader_stage == naga::ShaderStage::Fragment),
+                        );
+                        assert_eq!(descriptors, sampled);
+                        assert_eq!(combined_loads, sampled);
+                    }
+                }
+            }
         }
     }
 }

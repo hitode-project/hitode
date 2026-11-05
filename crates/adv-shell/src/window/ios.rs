@@ -14,7 +14,8 @@ use objc2::runtime::{AnyObject, NSObject};
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, class, define_class, msg_send, sel};
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_foundation::{NSObjectProtocol, NSSet, NSString};
-use objc2_quartz_core::{CAMetalLayer, CATransaction};
+
+use objc2_quartz_core::{CALayer, CATransaction};
 use objc2_ui_kit::UIViewAutoresizing;
 use objc2_ui_kit::{
     UIColor, UIEvent, UIPress, UIPressesEvent, UIResponder, UITouch, UITouchPhase, UIView,
@@ -25,9 +26,7 @@ use std::sync::{Arc, Mutex};
 
 pub struct Ivars {
     game: Weak<GameView>,
-    frame: Retained<CAMetalLayer>,
-    /// The frame's last placement in pixels, kept across layouts.
-    placement: Cell<Option<crate::native_gpu::Placement>>,
+    frame: Retained<CALayer>,
     /// Live touches by object address, with the pointer ids the mobile
     /// policy tracks; UIKit reuses one `UITouch` for a finger's lifetime.
     touches: RefCell<Vec<(usize, i32)>>,
@@ -98,12 +97,12 @@ define_class!(
 impl HostView {
     pub(crate) fn new(game: Weak<GameView>) -> Result<Retained<Self>, String> {
         let mtm = MainThreadMarker::new().ok_or("the game view must run on the main thread")?;
-        let frame = CAMetalLayer::new();
+
+        let frame = CALayer::new();
         let cursor = cursor_view();
         let this = Self::alloc(mtm).set_ivars(Ivars {
             game,
             frame: frame.clone(),
-            placement: Cell::new(None),
             touches: RefCell::new(Vec::new()),
             next_pointer: Cell::new(0),
             cursor: cursor.clone(),
@@ -117,41 +116,24 @@ impl HostView {
         this.addSubview(&cursor);
         Ok(this)
     }
-    /// The frame sublayer the presenter draws into.
-    pub(crate) fn metal_layer(&self) -> *mut std::ffi::c_void {
-        Retained::as_ptr(&self.ivars().frame).cast_mut().cast()
+
+    pub(crate) fn display_layer(&self) -> Retained<CALayer> {
+        self.ivars().frame.clone()
     }
-    /// Positions the frame layer; None fills the view. Each presented frame
-    /// repeats its placement, which then changes nothing.
-    pub(crate) fn place(&self, placement: Option<crate::native_gpu::Placement>) {
-        if self.ivars().placement.replace(placement) != placement {
-            self.apply_placement();
-            self.report_layout();
-        }
+
+    /// The display composes the placement into a frame that fills the view;
+    /// a new placement only moves the touch area.
+    pub(crate) fn placed(&self) {
+        self.report_layout();
     }
-    fn apply_placement(&self) {
-        let placement = self.ivars().placement.get();
-        let scale = self.contentScaleFactor();
+    fn fill_view(&self) {
         let bounds = self.bounds().size;
-        let (rectangle, nearest) = match placement {
-            Some(placement) => (
-                placement.rectangle.map(|v| f64::from(v) / scale),
-                placement.nearest,
-            ),
-            None => ([0.0, 0.0, bounds.width, bounds.height], false),
-        };
-        let [x, y, w, h] = rectangle;
-        let frame = &self.ivars().frame;
         CATransaction::begin();
         CATransaction::setDisableActions(true);
-        frame.setFrame(CGRect::new(CGPoint::new(x, y), CGSize::new(w, h)));
-        unsafe {
-            frame.setMagnificationFilter(if nearest {
-                objc2_quartz_core::kCAFilterNearest
-            } else {
-                objc2_quartz_core::kCAFilterLinear
-            });
-        }
+        self.ivars().frame.setFrame(CGRect::new(
+            CGPoint::new(0.0, 0.0),
+            CGSize::new(bounds.width, bounds.height),
+        ));
         CATransaction::commit();
     }
     /// Pixels map one to one onto the drawable.
@@ -162,7 +144,7 @@ impl HostView {
         self.setContentScaleFactor(scale);
         self.layer().setContentsScale(scale);
         self.ivars().frame.setContentsScale(scale);
-        self.apply_placement();
+        self.fill_view();
         let size = self.bounds().size;
         let pixels = |points: f64| (points * scale).round().max(0.0) as u32;
         if let Some(game) = self.ivars().game.upgrade() {

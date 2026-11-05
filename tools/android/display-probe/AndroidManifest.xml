@@ -1,0 +1,13 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="org.hitode.displayprobe" android:versionCode="1" android:versionName="1">
+    <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="36" />
+    <uses-feature android:name="android.hardware.vulkan.version" android:version="4198400" android:required="true" />
+    <application android:hasCode="false" android:label="Display probe" android:debuggable="true" android:extractNativeLibs="false" android:theme="@android:style/Theme.Material.NoActionBar.Fullscreen">
+        <activity android:name="android.app.NativeActivity" android:showWhenLocked="true" android:turnScreenOn="true" android:exported="true" android:configChanges="orientation|screenSize|screenLayout|keyboardHidden">
+            <meta-data android:name="android.app.lib_name" android:value="display_probe" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

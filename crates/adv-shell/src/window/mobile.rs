@@ -1,7 +1,4 @@
-//! The mobile game view, on the host's main thread: an Android SurfaceView
-//! supplied by the embedding host, or an iOS `CAMetalLayer` view this crate
-//! creates for the host to insert.
-use super::{Event, WakeEvent, refresh_interval};
+use super::{Event, WakeEvent};
 #[cfg(target_os = "android")]
 use std::ptr::NonNull;
 use std::{
@@ -43,10 +40,8 @@ pub enum ViewEvent {
 
 /// Trackpad cursor travel per finger travel.
 const TRACKPAD_GAIN: f32 = 1.25;
-
-/// Receives the view's events for the host UI.
-pub type Listener = Box<dyn Fn(ViewEvent)>;
-
+/// Receives what the game view reports to the host.
+type Listener = Box<dyn Fn(ViewEvent)>;
 pub struct GameView {
     #[cfg(target_os = "android")]
     window: Cell<Option<NonNull<ndk_sys::ANativeWindow>>>,
@@ -57,6 +52,8 @@ pub struct GameView {
     pub(crate) vsync: Arc<adv_sync::vsync::Vsync>,
     client: Cell<(u32, u32)>,
     canvas: Cell<(u32, u32)>,
+
+    placement: Cell<Option<crate::display::Placement>>,
     pub(crate) scaling: Cell<crate::Scaling>,
     events: RefCell<Vec<Event>>,
     wake: RefCell<Option<WakeEvent>>,
@@ -86,7 +83,6 @@ pub struct GameView {
     control: Cell<bool>,
     physical_keys: RefCell<std::collections::BTreeSet<i32>>,
     keys: RefCell<Arc<adv_sync::input::KeyState>>,
-    pub(crate) requested_rate: Cell<u32>,
     pub(crate) frame_clock: Cell<bool>,
     pub(crate) period: Cell<i64>,
 }
@@ -108,6 +104,8 @@ impl GameView {
             vsync: Arc::default(),
             client: Cell::new((width, height)),
             canvas: Cell::new((width.max(1), height.max(1))),
+
+            placement: Cell::new(None),
             scaling: Cell::new(crate::Scaling::Fit),
             events: RefCell::new(Vec::new()),
             wake: RefCell::new(None),
@@ -131,7 +129,6 @@ impl GameView {
             control: Cell::new(false),
             physical_keys: RefCell::new(Default::default()),
             keys: RefCell::new(Arc::default()),
-            requested_rate: Cell::new(60),
             frame_clock: Cell::new(false),
             period: Cell::new(16_666_667),
         });
@@ -153,14 +150,21 @@ impl GameView {
                 objc2::rc::Retained::as_ptr(host).cast_mut().cast()
             })
     }
-    #[cfg(target_os = "ios")]
-    pub(crate) fn place(&self, placement: Option<crate::native_gpu::Placement>) {
+
+    pub(crate) fn place(&self, placement: Option<crate::display::Placement>) {
+        self.placement.set(placement);
+        #[cfg(target_os = "android")]
+        self.report_layout();
+        #[cfg(target_os = "ios")]
         if let Some(host) = self.host.borrow().as_ref() {
-            host.place(placement);
+            host.placed();
         }
     }
     /// The presented frame's rectangle in view pixels.
     pub(crate) fn frame_rectangle(&self) -> [f64; 4] {
+        if let Some(p) = self.placement.get() {
+            return p.rectangle.map(f64::from);
+        }
         let (width, height) = self.client.get();
         self.scaling
             .get()
@@ -187,10 +191,10 @@ impl GameView {
                 ndk_sys::ANativeWindow_acquire(window.as_ptr());
             }
         }
-        if let Some(sink) = self.surface_sink.borrow().as_ref() {
-            if let Err(error) = sink(window) {
-                *self.error.borrow_mut() = Some(error);
-            }
+        if let Some(sink) = self.surface_sink.borrow().as_ref()
+            && let Err(error) = sink(window)
+        {
+            *self.error.borrow_mut() = Some(error);
         }
         if let Some(old) = self.window.replace(window) {
             unsafe {
@@ -198,7 +202,7 @@ impl GameView {
             }
         }
         self.client.set((width, height));
-        self.apply_frame_rate();
+
         self.push(Event::Repaint);
         self.report_layout();
     }
@@ -353,11 +357,12 @@ impl GameView {
         }
     }
     fn gesture(&self, gesture: Gesture) {
-        let (client, canvas, scaling) = (self.client.get(), self.canvas.get(), self.scaling.get());
+        let canvas = self.canvas.get();
+        let rectangle = self.frame_rectangle();
         match gesture {
             Gesture::Keyboard => return self.notify(ViewEvent::Keyboard),
             Gesture::Move(dx, dy) if self.mode.get() == TouchMode::Trackpad => {
-                let (sx, sy) = crate::mobile::magnification(client, canvas, scaling);
+                let (sx, sy) = crate::mobile::touch::magnification_in(rectangle, canvas);
                 let (x, y) = self.cursor.get();
                 let limit = |v: f32, size: u32| v.clamp(0.0, size.saturating_sub(1) as f32);
                 self.cursor.set((
@@ -367,7 +372,7 @@ impl GameView {
                 self.show_cursor();
             }
             Gesture::Point(x, y) => {
-                let at = crate::mobile::position(client, canvas, scaling, x, y);
+                let at = crate::mobile::touch::position_in(rectangle, canvas, x, y);
                 self.cursor.set(((at & 0xffff) as f32, (at >> 16) as f32));
             }
             _ => {}
@@ -392,13 +397,7 @@ impl GameView {
     fn show_cursor(&self) {
         let point = (self.mode.get() == TouchMode::Trackpad).then(|| {
             let (x, y) = self.cursor.get();
-            crate::mobile::client_point(
-                self.client.get(),
-                self.canvas.get(),
-                self.scaling.get(),
-                x,
-                y,
-            )
+            crate::mobile::touch::client_point_in(self.frame_rectangle(), self.canvas.get(), x, y)
         });
         #[cfg(target_os = "ios")]
         if let Some(host) = self.host.borrow().as_ref() {
@@ -503,34 +502,42 @@ impl GameView {
             self.push(Event::FocusLost);
         }
     }
-    pub(crate) fn create_native(
+
+    pub(crate) fn create_display(
         &self,
-        fallback: bool,
-    ) -> Result<(adv_device::gpu::Gpu, crate::native_gpu::WindowPresenter), String> {
+        software: bool,
+        wake: adv_sync::WakeEvent,
+    ) -> Result<(crate::display::Startup, crate::display::Ui), String> {
+        let (device, queue) = crate::display::open(software)?;
         #[cfg(target_os = "android")]
-        let surface = self
-            .window
-            .get()
-            .ok_or("the Android view has no surface")?
-            .as_ptr();
+        {
+            let caps = crate::display::platform_caps(Some(&device));
+            let compositor = unsafe {
+                adv_display::compositor::android::SurfaceCompositor::new(
+                    self.window.get().ok_or("the Android view has no surface")?,
+                    caps,
+                )
+            }
+            .map_err(|e| format!("SurfaceControl: {e:?}"))?;
+            crate::display::channel(device, queue, Box::new(compositor), self.client.get(), wake)
+        }
         #[cfg(target_os = "ios")]
-        let surface = self
-            .host
-            .borrow()
-            .as_ref()
-            .ok_or("the iOS view is gone")?
-            .metal_layer();
-        let size = self.client.get();
-        let (gpu, mut presenter) = pollster::block_on(unsafe {
-            crate::native_gpu::WindowPresenter::request(
-                surface.cast(),
-                size.0.max(1),
-                size.1.max(1),
-                fallback,
+        {
+            let host = self.host.borrow();
+            let host = host.as_ref().ok_or("the iOS view is gone")?;
+            crate::display::apple_channel(
+                device,
+                queue,
+                host.display_layer(),
+                host.contentScaleFactor(),
+                self.client.get(),
+                wake,
             )
-        })?;
-        presenter.configure_exclusive(size.0.max(1), size.1.max(1))?;
-        Ok((gpu, presenter))
+        }
+    }
+    #[cfg(target_os = "ios")]
+    pub(crate) fn native_scale(&self) -> f64 {
+        self.host.borrow().as_ref().unwrap().contentScaleFactor()
     }
     pub(crate) fn native_client_size(&self) -> Result<(u32, u32), String> {
         Ok(if self.has_surface() && !self.paused.get() {
@@ -581,31 +588,8 @@ impl GameView {
     /// A mobile view cannot be minimized; the next touch restores the guest.
     pub(crate) fn minimize(&self) {}
     pub(crate) fn set_video_cursor_regions(&self, _: Arc<[adv_runtime::VideoCursorRegion]>) {}
-    pub(crate) fn frame_rate(&self, rate: u32) {
+    pub(crate) fn frame_presented(&self) {
         self.frame_clock.set(true);
-        if self.requested_rate.replace(rate) != rate {
-            #[cfg(target_os = "android")]
-            self.apply_frame_rate();
-        }
-    }
-    #[cfg(target_os = "android")]
-    fn apply_frame_rate(&self) {
-        if let Some(window) = self.window.get() {
-            // API 30 symbol; the minimum supported Android API is 29.
-            let symbol =
-                unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"ANativeWindow_setFrameRate".as_ptr()) };
-            if !symbol.is_null() {
-                let set: unsafe extern "C" fn(*mut ndk_sys::ANativeWindow, f32, i8) -> i32 =
-                    unsafe { std::mem::transmute(symbol) };
-                unsafe {
-                    set(window.as_ptr(), self.requested_rate.get() as f32, 0);
-                }
-            }
-        }
-    }
-    pub(crate) fn next_refresh(&self) -> Instant {
-        let fps = (1_000_000_000.0 / self.period.get() as f64).round() as isize;
-        Instant::now() + refresh_interval(fps)
     }
 }
 impl GameView {
@@ -631,14 +615,4 @@ impl Drop for GameView {
             }
         }
     }
-}
-pub(crate) fn native_viewport(
-    width: u32,
-    height: u32,
-    canvas_width: u32,
-    canvas_height: u32,
-) -> [f32; 4] {
-    crate::Scaling::Fit
-        .rectangle((width as f64, height as f64), (canvas_width, canvas_height))
-        .map(|v| v as f32)
 }

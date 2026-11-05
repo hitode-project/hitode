@@ -57,13 +57,59 @@ pub struct AudioInfo {
     pub channels: u16,
 }
 
-/// Top-down, tightly packed BGRA rows.
+/// A decoded picture. GPU display retains YUV; CPU-only builds retain BGRA.
 #[derive(Debug)]
 pub struct VideoFrame {
     pub pts_us: u64,
     pub width: u32,
     pub height: u32,
+    #[cfg(not(feature = "gpu"))]
     pub bgra: Vec<u8>,
+    #[cfg(feature = "gpu")]
+    pub picture: std::sync::Arc<crate::frame::DecodedPicture>,
+}
+
+impl VideoFrame {
+    /// Guest pixel requests convert once on demand; display never requests BGRA.
+    pub fn bgra(&self) -> std::borrow::Cow<'_, [u8]> {
+        #[cfg(not(feature = "gpu"))]
+        {
+            std::borrow::Cow::Borrowed(&self.bgra)
+        }
+        #[cfg(feature = "gpu")]
+        {
+            std::borrow::Cow::Owned(self.picture.bgra())
+        }
+    }
+
+    pub fn into_bgra(self) -> Vec<u8> {
+        #[cfg(not(feature = "gpu"))]
+        {
+            self.bgra
+        }
+        #[cfg(feature = "gpu")]
+        {
+            self.picture.bgra()
+        }
+    }
+
+    pub fn into_surface(self) -> crate::surface::VideoFrame {
+        crate::surface::VideoFrame {
+            width: self.width,
+            height: self.height,
+            pitch: self.width * 4,
+            #[cfg(not(feature = "gpu"))]
+            bgra: self.bgra.into(),
+            #[cfg(feature = "gpu")]
+            bgra: {
+                static EMPTY: std::sync::OnceLock<std::sync::Arc<[u8]>> =
+                    std::sync::OnceLock::new();
+                EMPTY.get_or_init(|| std::sync::Arc::from([])).clone()
+            },
+            #[cfg(feature = "gpu")]
+            picture: Some(self.picture),
+        }
+    }
 }
 
 /// Interleaved, source-rate PCM. `pts_us` is relative to the start of the media.
@@ -104,6 +150,8 @@ mod audio_clock;
 mod native;
 #[cfg(feature = "media")]
 mod packets;
+#[cfg(all(feature = "media", feature = "gpu"))]
+pub(crate) mod planes;
 #[cfg(feature = "media")]
 mod worker;
 

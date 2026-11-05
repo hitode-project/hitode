@@ -33,7 +33,7 @@ impl Device {
         };
         let mut values = [[0u32; 4]; MAX_COLOR_TARGETS];
         for (i, color) in desc.colors.iter().enumerate() {
-            if color.load == Load::None || color.store == Store::None {
+            if !encode::attached(color.load, color.store) {
                 continue;
             }
             key.colors[i] = color.view.inner.raw.pixelFormat();
@@ -60,7 +60,7 @@ impl Device {
             let bounded = encode::partial(desc.area, depth.view.size());
             let format = depth.view.inner.raw.pixelFormat();
             key.samples = depth.view.inner.raw.sampleCount();
-            if depth.depth.0 != Load::None && depth.depth.1 != Store::None {
+            if encode::attached(depth.depth.0, depth.depth.1) {
                 key.depth = format;
                 if bounded && !depth.read_only {
                     match depth.depth.0 {
@@ -76,8 +76,7 @@ impl Device {
                 }
             }
             if format == MTLPixelFormat::Depth32Float_Stencil8
-                && depth.stencil.0 != Load::None
-                && depth.stencil.1 != Store::None
+                && encode::attached(depth.stencil.0, depth.stencil.1)
             {
                 key.stencil = format;
                 if bounded && !depth.read_only {
@@ -121,7 +120,7 @@ impl Device {
             encoder.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 3);
         }
         // Internal clearing is not caller-visible dynamic state.
-        encoder.setDepthStencilState(None);
+        encoder.setDepthStencilState(Some(&self.0.default_depth));
         encoder.setStencilReferenceValue(0);
         true
     }

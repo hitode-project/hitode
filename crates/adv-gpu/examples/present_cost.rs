@@ -164,10 +164,12 @@ fn main() {
 
     let mut pool = device
         .create_present_pool(&PoolDesc {
+            color: None,
             width: WIDTH,
             height: HEIGHT,
             format,
             count: 3,
+            storage: false,
             label: "present cost",
         })
         .expect("pool");

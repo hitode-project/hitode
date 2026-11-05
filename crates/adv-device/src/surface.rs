@@ -6,15 +6,15 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 mod composite;
+pub(crate) mod convert;
+use convert::{BLACK_PALETTE, decode_pixel};
 mod sprite;
 pub use sprite::{Sprite, SpriteAlpha, SpriteMode};
 mod packed;
+#[cfg(feature = "gpu")]
+pub(crate) mod slots;
 pub use composite::{Composite, CompositeError, GradientVertex};
-#[cfg(all(feature = "gpu", target_vendor = "apple"))]
-mod pixels;
-#[cfg(all(feature = "gpu", target_vendor = "apple"))]
-use pixels::Pixels;
-#[cfg(not(all(feature = "gpu", target_vendor = "apple")))]
+
 type Pixels = Vec<u8>;
 
 /// Memory needed by software surfaces. PAL guests with shared storage borrow pixels;
@@ -53,11 +53,6 @@ pub struct FrameView<'a> {
 }
 pub trait Presenter {
     fn present(&mut self, frame: FrameView<'_>) -> Result<(), String>;
-    /// Native GPU composition is a separate capability; no implicit CPU readback.
-    #[cfg(feature = "gpu")]
-    fn present_native(&mut self, _frame: &crate::gpu::NativeFrame) -> Result<(), String> {
-        Err("presenter does not support native GPU frames".into())
-    }
 }
 
 #[derive(Default)]
@@ -162,11 +157,10 @@ pub struct PendingFrame {
     published_at: Option<std::time::Instant>,
     pub(crate) pixels: Arc<Pixels>,
     damage: Damage,
+    #[cfg(not(feature = "gpu"))]
     bottom_up: bool,
     history: DamageHistory,
     video: Arc<[(u64, VideoLayer)]>,
-    #[cfg(feature = "gpu")]
-    native: Option<crate::gpu::NativeFrame>,
 }
 impl Default for PendingFrame {
     fn default() -> Self {
@@ -180,15 +174,15 @@ impl Default for PendingFrame {
             published_at: None,
             pixels: Arc::new(Pixels::new()),
             damage: Damage::default(),
+            #[cfg(not(feature = "gpu"))]
             bottom_up: false,
             history: DamageHistory::default(),
             video: Arc::from([]),
-            #[cfg(feature = "gpu")]
-            native: None,
         }
     }
 }
 impl PendingFrame {
+    #[cfg(not(feature = "gpu"))]
     fn store(
         &mut self,
         surface: &Surface,
@@ -198,7 +192,7 @@ impl PendingFrame {
         damage: &Damage,
     ) -> Result<u64, String> {
         let full = surface.rect();
-        let pitch = publication_pitch(surface.pitch, surface.format);
+        let pitch = surface.pitch;
         let reset = self.width != surface.width
             || self.height != surface.height
             || self.pitch != pitch
@@ -209,10 +203,7 @@ impl PendingFrame {
         } else {
             damage_since(history, self.serial, serial, full)
         };
-        #[cfg(feature = "gpu")]
-        {
-            self.native = None;
-        }
+
         self.width = surface.width;
         self.height = surface.height;
         self.pitch = pitch;
@@ -262,10 +253,6 @@ impl PendingFrame {
         self.snapshot_with_video(out, false)
     }
     fn snapshot_with_video(&self, out: &mut Snapshot, video: bool) -> Result<(), String> {
-        #[cfg(feature = "gpu")]
-        if self.native.is_some() {
-            return Err("native GPU snapshot requires an explicit asynchronous readback".into());
-        }
         if self.width == 0 {
             return Ok(());
         }
@@ -312,30 +299,15 @@ impl PendingFrame {
         Ok(())
     }
     fn convert(&self, out: &mut Snapshot, damage: &[Rect]) {
-        for r in damage {
-            for y in r.y..r.y + r.h {
-                let src = &self.pixels[y as usize * self.pitch as usize..];
-                let start = (y as usize * self.width as usize + r.x as usize) * 4;
-                let dst = &mut out.bgra[start..start + r.w as usize * 4];
-                if self.format == PixelFormat::Bgra32 {
-                    dst.copy_from_slice(&src[r.x as usize * 4..(r.x + r.w) as usize * 4]);
-                } else {
-                    for (i, pixel) in dst.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-                        let x = r.x + i as u32;
-                        let raw = if self.format.packed() {
-                            &[self.format.index(src, x)][..]
-                        } else {
-                            &src[self.format.byte_offset(x) as usize..]
-                        };
-                        pixel.copy_from_slice(&decode_pixel(
-                            self.format,
-                            self.palette.as_deref(),
-                            raw,
-                        ));
-                    }
-                }
-            }
-        }
+        convert::convert(
+            self.format,
+            self.palette.as_deref(),
+            self.width,
+            self.pitch,
+            &self.pixels,
+            out,
+            damage,
+        );
     }
     pub fn damage(&self) -> &[Rect] {
         &self.damage
@@ -390,39 +362,6 @@ impl PendingFrame {
             layer.compose(out)?;
         }
         Ok(())
-    }
-    /// Explicit native readback only: preserve the same immutable layer metadata
-    /// as the GPU presentation, even when a newer video sample arrives.
-    #[cfg(feature = "gpu")]
-    pub fn snapshot_native(&self, bgra: &[u8], out: &mut Snapshot) -> Result<(), String> {
-        if self.native.is_none() || bgra.len() != self.width as usize * self.height as usize * 4 {
-            return Err("native capture dimensions or byte length mismatch".into());
-        }
-        out.width = self.width;
-        out.height = self.height;
-        out.frames = self.serial;
-        out.bgra.clear();
-        out.bgra.extend_from_slice(bgra);
-        self.compose_video(out)
-    }
-    #[cfg(feature = "gpu")]
-    pub fn native(&self) -> Option<&crate::gpu::NativeFrame> {
-        self.native.as_ref()
-    }
-
-    #[cfg(feature = "gpu")]
-    fn store_native(&mut self, frame: crate::gpu::NativeFrame) {
-        self.width = frame.image.width();
-        self.height = frame.image.height();
-        self.pitch = self.width * 4;
-        self.format = PixelFormat::Bgra32;
-        self.palette = None;
-        self.serial = frame.serial;
-        self.published_at = Some(std::time::Instant::now());
-        if !self.pixels.is_empty() {
-            self.pixels = Arc::new(Pixels::new());
-        }
-        self.native = Some(frame);
     }
 }
 
@@ -479,46 +418,6 @@ impl Rect {
         }
     }
 }
-/// The damage of the last eight native publications, each relative to the
-/// publication before it. A consumer that last saw publication `n` redraws the
-/// union since `n`, so frames replaced in the mailbox still count.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct FrameDamage {
-    publication: u64,
-    /// (publication, surface, damage); `None` damage means the whole frame.
-    recent: [(u64, u32, Option<Rect>); 8],
-}
-impl FrameDamage {
-    pub fn publication(&self) -> u64 {
-        self.publication
-    }
-    #[cfg(any(feature = "gpu", test))]
-    fn push(&mut self, surface: u32, damage: Option<Rect>) {
-        self.publication += 1;
-        self.recent[(self.publication % 8) as usize] = (self.publication, surface, damage);
-    }
-    /// The area changed since publication `last`, or `None` for the whole frame:
-    /// when `last` is unknown or too old, or another surface published since it.
-    pub fn since(&self, last: Option<u64>) -> Option<Rect> {
-        let last = last?;
-        if last >= self.publication || self.publication - last >= 8 {
-            return None;
-        }
-        let surface = self.recent[(self.publication % 8) as usize].1;
-        let mut union = Rect::default();
-        for publication in last..=self.publication {
-            let (n, s, damage) = self.recent[(publication % 8) as usize];
-            if n != publication || s != surface {
-                return None;
-            }
-            if publication > last {
-                union = union.union(damage?);
-            }
-        }
-        Some(union)
-    }
-}
-
 /// Bounded software damage, stored without per-publication allocation.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Damage {
@@ -574,6 +473,7 @@ impl DamageHistory {
         self.first = 0;
         self.len = 0;
     }
+    #[cfg(not(feature = "gpu"))]
     fn push(&mut self, entry: (u64, Damage)) {
         self.entries[(self.first + self.len) % 16] = entry;
         if self.len < 16 {
@@ -590,14 +490,6 @@ fn verify_software() -> bool {
     static VERIFY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *VERIFY.get_or_init(|| std::env::var_os("ADV_VERIFY_SOFTWARE_FRAMES").is_some())
 }
-fn publication_pitch(pitch: u32, format: PixelFormat) -> u32 {
-    if cfg!(all(feature = "gpu", target_vendor = "apple")) && format == PixelFormat::Bgra32 {
-        // A buffer-backed Metal texture requires aligned rows in its snapshot.
-        return pitch.next_multiple_of(256);
-    }
-    pitch
-}
-
 /// Content-diff tiles (DEV-FRAME-10).
 const TILE_W: u32 = 64;
 const TILE_H: u32 = 16;
@@ -776,16 +668,6 @@ impl PixelFormat {
     }
 }
 
-const BLACK_PALETTE: [[u8; 4]; 256] = [[0; 4]; 256];
-
-fn decode_pixel(format: PixelFormat, palette: Option<&[[u8; 4]; 256]>, raw: &[u8]) -> [u8; 4] {
-    if format.indexed() {
-        palette.unwrap_or(&BLACK_PALETTE)[raw[0] as usize]
-    } else {
-        format.decode(raw)
-    }
-}
-
 fn encode_pixel(format: PixelFormat, palette: Option<&[[u8; 4]; 256]>, pixel: [u8; 4]) -> [u8; 4] {
     if !format.indexed() {
         return format.encode(pixel);
@@ -831,6 +713,28 @@ pub struct VideoFrame {
     pub height: u32,
     pub pitch: u32,
     pub bgra: Arc<[u8]>,
+    #[cfg(feature = "gpu")]
+    pub picture: Option<Arc<crate::frame::DecodedPicture>>,
+}
+
+impl VideoFrame {
+    pub fn from_bgra(width: u32, height: u32, pitch: u32, bgra: Arc<[u8]>) -> Self {
+        Self {
+            width,
+            height,
+            pitch,
+            bgra,
+            #[cfg(feature = "gpu")]
+            picture: None,
+        }
+    }
+    pub fn bgra(&self) -> std::borrow::Cow<'_, [u8]> {
+        #[cfg(feature = "gpu")]
+        if let Some(picture) = &self.picture {
+            return std::borrow::Cow::Owned(picture.bgra());
+        }
+        std::borrow::Cow::Borrowed(&self.bgra)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -852,6 +756,68 @@ pub struct VideoLayer {
 
 /// Visible geometry in completed-frame pixels, shared by software capture and
 /// the GPU presenter. UVs crop the immutable decoder image without repacking it.
+/// The decoded layers' planes over a base of `extent`, as the native display
+/// composes them. Taking a picture remains the compositor's action.
+#[cfg(feature = "gpu")]
+fn video_planes(
+    video: &[(u64, VideoLayer)],
+    extent: (u32, u32),
+) -> Arc<[crate::frame::VideoPlane]> {
+    video
+        .iter()
+        .filter_map(|(id, layer)| {
+            let picture = layer.frame.picture.as_ref()?;
+            let mapped;
+            let layer = if layer.canvas != extent {
+                mapped = layer.mapped(extent).expect("validated video mapping");
+                &mapped
+            } else {
+                layer
+            };
+            let layout = layer.layout(extent).expect("validated video geometry");
+            if layout.video.is_none() && layout.background.is_none() {
+                return None;
+            }
+            let region = layout.video.unwrap_or(VideoRegion {
+                destination: Rect::default(),
+                source_uv: [0.0; 4],
+            });
+            Some(crate::frame::VideoPlane {
+                id: *id,
+                picture: picture.clone(),
+                geometry: crate::frame::VideoGeometry {
+                    source: (layer.frame.width, layer.frame.height),
+                    destination: adv_gpu::Rect {
+                        x: region.destination.x,
+                        y: region.destination.y,
+                        w: region.destination.w,
+                        h: region.destination.h,
+                    },
+                    source_uv: region.source_uv,
+                    background: layout.background.map(|(r, c)| {
+                        (
+                            adv_gpu::Rect {
+                                x: r.x,
+                                y: r.y,
+                                w: r.w,
+                                h: r.h,
+                            },
+                            c,
+                        )
+                    }),
+                    clip: adv_gpu::Rect {
+                        x: layer.clip.x,
+                        y: layer.clip.y,
+                        w: layer.clip.w,
+                        h: layer.clip.h,
+                    },
+                    hide_cursor: layer.hide_cursor,
+                },
+            })
+        })
+        .collect()
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct VideoRegion {
     pub destination: Rect,
@@ -939,7 +905,11 @@ impl VideoLayer {
             .checked_mul(4)
             .ok_or("video row overflow")?;
         let bytes = u64::from(self.frame.pitch) * u64::from(self.frame.height - 1) + u64::from(row);
-        if self.frame.pitch < row || bytes > self.frame.bgra.len() as u64 {
+        #[cfg(feature = "gpu")]
+        let yuv = self.frame.picture.is_some();
+        #[cfg(not(feature = "gpu"))]
+        let yuv = false;
+        if !yuv && (self.frame.pitch < row || bytes > self.frame.bgra.len() as u64) {
             return Err("invalid video frame layout".into());
         }
         if self.source.w == 0
@@ -1074,7 +1044,7 @@ impl VideoLayer {
             h: (bottom - top) as u32,
         })
     }
-    fn pixel(&self, x: u32, y: u32) -> &[u8] {
+    fn pixel<'a>(&self, pixels: &'a [u8], x: u32, y: u32) -> &'a [u8] {
         // Sample pixel centres, matching the host GPU's nearest texture sampler.
         // Clipping keeps the original destination origin and sampling phase.
         let sx = u64::from(self.source.x)
@@ -1084,7 +1054,7 @@ impl VideoLayer {
             + (((i64::from(y) - self.destination.y) as u64 * 2 + 1) * u64::from(self.source.h))
                 / (u64::from(self.destination.h) * 2);
         let at = sy as usize * self.frame.pitch as usize + sx as usize * 4;
-        &self.frame.bgra[at..at + 4]
+        &pixels[at..at + 4]
     }
     fn compose(&self, out: &mut Snapshot) -> Result<(), String> {
         self.validate()?;
@@ -1104,10 +1074,11 @@ impl VideoLayer {
         let Some(rect) = self.clipped_rect((out.width, out.height)) else {
             return Ok(());
         };
+        let pixels = self.frame.bgra();
         for y in rect.y..rect.y + rect.h {
             for x in rect.x..rect.x + rect.w {
                 let at = (y as usize * out.width as usize + x as usize) * 4;
-                out.bgra[at..at + 4].copy_from_slice(self.pixel(x, y));
+                out.bgra[at..at + 4].copy_from_slice(self.pixel(&pixels, x, y));
             }
         }
         Ok(())
@@ -1134,6 +1105,7 @@ impl VideoLayer {
         out.width = rect.w;
         out.height = rect.h;
         out.bgra.resize(rect.w as usize * rect.h as usize * 4, 0);
+        let pixels = self.frame.bgra();
         for y in 0..rect.h {
             for x in 0..rect.w {
                 let at = (y as usize * rect.w as usize + x as usize) * 4;
@@ -1141,7 +1113,7 @@ impl VideoLayer {
                 let dy = rect.y + y;
                 if video.is_some_and(|v| dx >= v.x && dx < v.x + v.w && dy >= v.y && dy < v.y + v.h)
                 {
-                    out.bgra[at..at + 4].copy_from_slice(self.pixel(dx, dy));
+                    out.bgra[at..at + 4].copy_from_slice(self.pixel(&pixels, dx, dy));
                 } else {
                     out.bgra[at..at + 4].copy_from_slice(&self.background.unwrap().1);
                 }
@@ -1285,8 +1257,27 @@ impl Arena {
     }
 }
 
+/// Layers, the base extent they were mapped to, and their planes.
+#[cfg(feature = "gpu")]
+type NativeVideo = (
+    Arc<[(u64, VideoLayer)]>,
+    (u32, u32),
+    Arc<[crate::frame::VideoPlane]>,
+);
 pub struct Surfaces<P: Presenter> {
     pub presenter: P,
+    #[cfg(feature = "gpu")]
+    gpu: crate::gpu::Gpu,
+    #[cfg(feature = "gpu")]
+    software_slots: BTreeMap<u32, slots::Slots>,
+    #[cfg(feature = "gpu")]
+    software_video: Option<Arc<[(u64, VideoLayer)]>>,
+    /// The planes last built from `video_layers`, for the base extent.
+    #[cfg(feature = "gpu")]
+    native_video: NativeVideo,
+    /// The native surface last presented, when it is the current base.
+    #[cfg(feature = "gpu")]
+    native_source: Option<u32>,
     pub stats: GraphicsStats,
     /// Display size: the primary surface's size.
     pub width: u32,
@@ -1303,8 +1294,7 @@ pub struct Surfaces<P: Presenter> {
     software_pending: Option<SoftwareFrame>,
     #[cfg(feature = "gpu")]
     native_surfaces: BTreeMap<u32, NativeSurface>,
-    #[cfg(feature = "gpu")]
-    native_damage: FrameDamage,
+
     primary: Option<u32>,
     deferred_presentation: bool,
     pending_frame: Option<PendingFrame>,
@@ -1338,10 +1328,7 @@ pub enum FlushReason {
 #[cfg(feature = "gpu")]
 struct NativeSurface {
     target: crate::gpu::Target,
-    spares: Vec<crate::gpu::Target>,
 }
-#[cfg(feature = "gpu")]
-const MAX_ROTATION_TARGETS: usize = 8;
 
 impl<P: Presenter> Surfaces<P> {
     /// A store whose pixels and front objects live in the guest range `arena..arena + len`.
@@ -1355,6 +1342,16 @@ impl<P: Presenter> Surfaces<P> {
         size(width, height)?;
         Ok(Self {
             presenter,
+            #[cfg(feature = "gpu")]
+            gpu: crate::gpu::Gpu::execution(false).map_err(|e| e.to_string())?,
+            #[cfg(feature = "gpu")]
+            software_slots: BTreeMap::new(),
+            #[cfg(feature = "gpu")]
+            software_video: None,
+            #[cfg(feature = "gpu")]
+            native_video: (Arc::from([]), (0, 0), Arc::from([])),
+            #[cfg(feature = "gpu")]
+            native_source: None,
             stats: GraphicsStats::default(),
             width,
             height,
@@ -1367,8 +1364,7 @@ impl<P: Presenter> Surfaces<P> {
             software_pending: None,
             #[cfg(feature = "gpu")]
             native_surfaces: BTreeMap::new(),
-            #[cfg(feature = "gpu")]
-            native_damage: FrameDamage::default(),
+
             primary: None,
             deferred_presentation: false,
             pending_frame: None,
@@ -1491,6 +1487,8 @@ impl<P: Presenter> Surfaces<P> {
         let Some(s) = self.surfaces.remove(&id) else {
             return false;
         };
+        #[cfg(feature = "gpu")]
+        self.software_slots.remove(&id);
         // A pending frame cannot outlive the pixels it would publish.
         if self
             .software_pending
@@ -1554,6 +1552,8 @@ impl<P: Presenter> Surfaces<P> {
             video.sort_by_key(|(id, _)| *id);
         }
         self.video_layers = Arc::from(video);
+        #[cfg(feature = "gpu")]
+        self.present_video(m, serial)?;
         if self.retained_frame.is_none() {
             let (width, height) = self
                 .video_layers
@@ -1562,7 +1562,7 @@ impl<P: Presenter> Surfaces<P> {
             let mut frame = PendingFrame {
                 width,
                 height,
-                pitch: publication_pitch(width * 4, PixelFormat::Bgra32),
+                pitch: width * 4,
                 ..Default::default()
             };
             Arc::make_mut(&mut frame.pixels).resize(frame.pitch as usize * height as usize, 0);
@@ -1579,13 +1579,13 @@ impl<P: Presenter> Surfaces<P> {
             h: frame.height,
         });
         frame.video = self.video_layers.clone();
-        self.software_source = None;
-        #[cfg(feature = "gpu")]
-        if let Some(native) = &mut frame.native {
-            native.serial = serial;
+        // The native display keeps showing the software base beneath the
+        // layers; later samples publish over it again.
+        #[cfg(not(feature = "gpu"))]
+        {
+            self.software_source = None;
         }
         self.stats.presentations = serial;
-        self.software_source = None;
         if let Some((mailbox, wake)) = &mut self.frame_mailbox {
             let overwritten = mailbox.publish(|slot| *slot = frame.clone());
             self.stats.coalesced_frames += u64::from(overwritten);
@@ -1601,7 +1601,14 @@ impl<P: Presenter> Surfaces<P> {
                 self.stats.coalesced_frames += 1;
             }
             self.pending_frame = Some(frame.clone());
-            if !self.deferred_presentation {
+            #[cfg(feature = "gpu")]
+            let host_video = self
+                .video_layers
+                .iter()
+                .any(|(_, layer)| layer.frame.picture.is_some());
+            #[cfg(not(feature = "gpu"))]
+            let host_video = false;
+            if !self.deferred_presentation && !host_video {
                 self.capture_complete()?;
             }
         }
@@ -1624,102 +1631,6 @@ impl<P: Presenter> Surfaces<P> {
             .as_ref()
             .is_some_and(|f| f.serial != self.captured_serial)
     }
-    #[cfg(feature = "gpu")]
-    pub fn latest_native_frame(&self) -> Option<&crate::gpu::NativeFrame> {
-        self.frame_mailbox
-            .as_ref()
-            .and_then(|(mailbox, _)| mailbox.latest())
-            .or(self.pending_frame.as_ref())
-            .and_then(|frame| frame.native.as_ref())
-    }
-    /// Commit an explicit diagnostic readback, never used by normal native
-    /// presentation. A newer frame invalidates this capture instead of mixing it.
-    #[cfg(feature = "gpu")]
-    pub fn capture_native_pixels(
-        &mut self,
-        serial: u64,
-        width: u32,
-        height: u32,
-        bgra: &[u8],
-    ) -> Result<bool, String> {
-        let Some(frame) = self.latest_native_frame() else {
-            return Ok(false);
-        };
-        if frame.serial != serial {
-            return Ok(false);
-        }
-        if frame.image.width() != width
-            || frame.image.height() != height
-            || bgra.len() != width as usize * height as usize * 4
-        {
-            return Err("native capture dimensions or byte length mismatch".into());
-        }
-        let source = self.latest_frame().unwrap().clone();
-        self.capture_native_frame_pixels(&source, bgra)
-    }
-
-    #[cfg(feature = "gpu")]
-    pub fn capture_native_frame_pixels(
-        &mut self,
-        source: &PendingFrame,
-        bgra: &[u8],
-    ) -> Result<bool, String> {
-        let mut snapshot = Snapshot::default();
-        source.snapshot_native(bgra, &mut snapshot)?;
-        if source.serial <= self.captured_serial || source.serial > self.stats.presentations {
-            return Ok(false);
-        }
-        self.presenter.present(FrameView {
-            width: snapshot.width,
-            height: snapshot.height,
-            pitch: snapshot.width * 4,
-            bgra: &snapshot.bgra,
-            serial: source.serial,
-        })?;
-        self.captured_serial = source.serial;
-        self.stats.host_captures += 1;
-        Ok(true)
-    }
-
-    /// Materialize a retained immutable source after a later presentation.
-    /// Its own dimensions and serial remain authoritative; completed captures
-    /// cannot replace a snapshot which is already newer.
-    #[cfg(feature = "gpu")]
-    pub fn capture_native_snapshot_pixels(
-        &mut self,
-        source: &crate::gpu::NativeFrame,
-        bgra: &[u8],
-    ) -> Result<bool, String> {
-        let width = source.image.width();
-        let height = source.image.height();
-        let length = (width as usize)
-            .checked_mul(height as usize)
-            .and_then(|pixels| pixels.checked_mul(4))
-            .ok_or("native capture dimensions overflow")?;
-        if bgra.len() != length {
-            return Err("native capture dimensions or byte length mismatch".into());
-        }
-        if let Some(frame) = self
-            .latest_frame()
-            .filter(|frame| frame.serial == source.serial)
-            .cloned()
-        {
-            return self.capture_native_frame_pixels(&frame, bgra);
-        }
-        if source.serial <= self.captured_serial || source.serial > self.stats.presentations {
-            return Ok(false);
-        }
-        self.presenter.present(FrameView {
-            width,
-            height,
-            pitch: width * 4,
-            bgra,
-            serial: source.serial,
-        })?;
-        self.captured_serial = source.serial;
-        self.stats.host_captures += 1;
-        Ok(true)
-    }
 
     /// Materialize the newest complete frame once, including after the guest stops
     /// producing frames. Raw pixels are owned, so later guest writes or surface
@@ -1738,13 +1649,7 @@ impl<P: Presenter> Surfaces<P> {
         else {
             return Ok(false);
         };
-        #[cfg(feature = "gpu")]
-        if let Some(native) = &frame.native {
-            self.presenter.present_native(native)?;
-            self.captured_serial = frame.serial;
-            self.stats.host_captures += 1;
-            return Ok(true);
-        }
+
         let mut snapshot = std::mem::take(&mut self.conversion);
         frame.snapshot(&mut snapshot)?;
         if frame.format != PixelFormat::Bgra32 {
@@ -2011,6 +1916,7 @@ impl<P: Presenter> Surfaces<P> {
         self.stats.software_flushes[reason as usize] += 1;
         Ok(self.stats.published_frames != before)
     }
+    #[cfg(not(feature = "gpu"))]
     fn publish_software(
         &mut self,
         id: u32,
@@ -2022,7 +1928,7 @@ impl<P: Presenter> Surfaces<P> {
         let reset = self.software_source != Some(id)
             || latest.is_none_or(|f| {
                 f.extent() != (s.width, s.height)
-                    || f.pitch != publication_pitch(s.pitch, s.format)
+                    || f.pitch != s.pitch
                     || f.format != s.format
                     || f.bottom_up != s.bottom_up
                     || f.palette != s.palette
@@ -2109,6 +2015,74 @@ impl<P: Presenter> Surfaces<P> {
         Ok(())
     }
 
+    #[cfg(feature = "gpu")]
+    fn publish_software(
+        &mut self,
+        id: u32,
+        m: &dyn SurfaceMemory,
+        damage: Damage,
+    ) -> Result<(), String> {
+        let s = &self.surfaces[&id];
+        let layout_changed = self
+            .software_slots
+            .get(&id)
+            .is_none_or(|slots| !slots.matches(s));
+        if layout_changed {
+            self.software_slots.insert(id, self.gpu.software_slots(s)?);
+        }
+        let slots = &self.software_slots[&id];
+        let previous = slots.previous();
+        let whole = layout_changed
+            || previous.is_none()
+            || self.software_source != Some(id)
+            || !slots.palette_matches(s)
+            || self
+                .software_video
+                .as_ref()
+                .is_none_or(|video| !Arc::ptr_eq(video, &self.video_layers));
+        let damage = if whole {
+            Damage::from_rect(s.rect())
+        } else {
+            refine_damage(
+                s,
+                m,
+                previous.expect("published software slot"),
+                s.pitch,
+                &damage,
+            )?
+        };
+        if damage.is_empty() {
+            self.stats.empty_damage += 1;
+            return Ok(());
+        }
+        let serial = self.stats.presentations + 1;
+        let video = self.native_video((s.width, s.height));
+        let s = &self.surfaces[&id];
+        self.stats.copied_bytes += self.gpu.publish_software(
+            self.software_slots.get_mut(&id).unwrap(),
+            s,
+            m,
+            damage,
+            whole,
+            serial,
+            video,
+        )?;
+        self.software_video = Some(self.video_layers.clone());
+        self.software_source = Some(id);
+        self.native_source = None;
+        self.stats.presentations = serial;
+        self.stats.published_frames += 1;
+        self.stats.damaged_pixels += damage
+            .iter()
+            .map(|r| u64::from(r.w) * u64::from(r.h))
+            .sum::<u64>();
+        self.stats.frame_pixels += u64::from(s.width) * u64::from(s.height);
+        self.stats
+            .software_started
+            .get_or_insert_with(std::time::Instant::now);
+        Ok(())
+    }
+
     /// A GPU-backed entry in the same surface-id space. Its pixels are not mapped
     /// in guest memory until the API frontend explicitly requests a lock/readback.
     #[cfg(feature = "gpu")]
@@ -2120,8 +2094,9 @@ impl<P: Presenter> Surfaces<P> {
         depth: bool,
     ) -> Result<u32, String> {
         size(width, height)?;
+
         let target = gpu
-            .target(width, height, depth)
+            .presentation_target(width, height, depth)
             .map_err(|error| error.to_string())?;
         self.insert_native(target)
     }
@@ -2147,26 +2122,13 @@ impl<P: Presenter> Surfaces<P> {
                 palette: None,
             },
         );
-        self.native_surfaces.insert(
-            id,
-            NativeSurface {
-                target,
-                spares: Vec::new(),
-            },
-        );
+        self.native_surfaces.insert(id, NativeSurface { target });
         Ok(id)
     }
 
     #[cfg(feature = "gpu")]
     pub fn native_target(&self, id: u32) -> Option<&crate::gpu::Target> {
         self.native_surfaces.get(&id).map(|surface| &surface.target)
-    }
-
-    #[cfg(feature = "gpu")]
-    pub fn native_pool_size(&self, id: u32) -> Option<usize> {
-        self.native_surfaces
-            .get(&id)
-            .map(|surface| surface.spares.len() + 1)
     }
 
     /// Reset/replace storage while preserving the logical surface id. All old
@@ -2189,25 +2151,122 @@ impl<P: Presenter> Surfaces<P> {
         surface.height = target.image.height();
         surface.pitch = surface.width * 4;
         surface.version = surface.version.wrapping_add(1);
-        native.spares.clear();
+
         Ok(std::mem::replace(&mut native.target, target))
     }
 
-    /// Reuse the common presentation serial, coalescing and ownership mailbox.
     #[cfg(feature = "gpu")]
-    pub fn present_native(&mut self, id: u32, gpu: &mut crate::gpu::Gpu) -> Result<(), String> {
+    pub fn present_native(
+        &mut self,
+        id: u32,
+        damage: crate::frame::Damage,
+        gpu: &mut crate::gpu::Gpu,
+    ) -> Result<(), String> {
         let image = &self
             .native_surfaces
             .get(&id)
             .ok_or("unknown native surface")?
             .target
             .image;
-        let serial = self.stats.presentations + 1;
-        let frame = gpu
-            .present(image, serial)
-            .map_err(|error| error.to_string())?;
-        self.publish_native_frame(id, frame, None)?;
+        let extent = (image.width(), image.height());
+        let serial = self
+            .stats
+            .presentations
+            .checked_add(1)
+            .ok_or("presentation serial exhausted")?;
+        let video = self.native_video(extent);
+        gpu.present(
+            &self.native_surfaces[&id].target.image,
+            damage,
+            serial,
+            video,
+        )
+        .map_err(|error| error.to_string())?;
+        self.software_source = None;
+        self.native_source = Some(id);
+        self.stats.presentations = serial;
         Ok(())
+    }
+
+    #[cfg(feature = "gpu")]
+    fn native_video(&mut self, extent: (u32, u32)) -> Arc<[crate::frame::VideoPlane]> {
+        let (layers, at, planes) = &mut self.native_video;
+        if !Arc::ptr_eq(layers, &self.video_layers) || *at != extent {
+            *planes = video_planes(&self.video_layers, extent);
+            *layers = self.video_layers.clone();
+            *at = extent;
+        }
+        planes.clone()
+    }
+
+    /// Show changed video layers over the unchanged native base. A layer that
+    /// moved, appeared or went away redraws the base beneath it.
+    #[cfg(feature = "gpu")]
+    fn present_video(&mut self, m: &dyn SurfaceMemory, serial: u64) -> Result<(), String> {
+        let extent = if let Some(id) = self.native_source {
+            let image = &self.native_surfaces[&id].target.image;
+            (image.width(), image.height())
+        } else if let Some(id) = self.software_source {
+            (self.surfaces[&id].width, self.surfaces[&id].height)
+        } else {
+            return Ok(());
+        };
+        let before = self.native_video.2.clone();
+        let video = self.native_video(extent);
+        let whole = before.len() != video.len()
+            || before
+                .iter()
+                .zip(video.iter())
+                .any(|(a, b)| a.id != b.id || a.geometry != b.geometry);
+        if let Some(id) = self.native_source {
+            let damage = if whole {
+                crate::frame::Damage::Whole
+            } else {
+                crate::frame::Damage::Rects(Default::default())
+            };
+            self.gpu
+                .present(
+                    &self.native_surfaces[&id].target.image,
+                    damage,
+                    serial,
+                    video,
+                )
+                .map_err(|error| error.to_string())?;
+        } else if let Some(id) = self.software_source {
+            let s = &self.surfaces[&id];
+            let damage = if whole {
+                Damage::from_rect(s.rect())
+            } else {
+                Damage::default()
+            };
+            self.stats.copied_bytes += self.gpu.publish_software(
+                self.software_slots.get_mut(&id).unwrap(),
+                s,
+                m,
+                damage,
+                whole,
+                serial,
+                video,
+            )?;
+            self.software_video = Some(self.video_layers.clone());
+        }
+        Ok(())
+    }
+
+    /// Request an explicit diagnostic transfer of a native surface.
+    #[cfg(feature = "gpu")]
+    pub fn readback_native(
+        &self,
+        id: u32,
+        gpu: &mut crate::gpu::Gpu,
+    ) -> Result<crate::gpu::Readback, String> {
+        let target = &self
+            .native_surfaces
+            .get(&id)
+            .ok_or("unknown native surface")?
+            .target;
+        gpu.readback(&target.image, None)
+            .map_err(|error| error.to_string())
     }
 
     /// A deferred store without the shared output can finish private frames.
@@ -2234,136 +2293,6 @@ impl<P: Presenter> Surfaces<P> {
         Ok(serial)
     }
 
-    /// A discard boundary transfers the old target into the immutable frame and
-    /// rotates one available target. No texture copy or Queue submit is needed.
-    /// The pool is bounded; retaining all frames returns Busy before publication.
-    #[cfg(feature = "gpu")]
-    /// `damage` is what changed since this surface's previous presentation.
-    pub fn present_native_rotating(
-        &mut self,
-        id: u32,
-        damage: Option<Rect>,
-        gpu: &mut crate::gpu::Gpu,
-    ) -> Result<u64, crate::gpu::Error> {
-        use crate::gpu::Error;
-        let context = gpu.context().clone();
-        let submission = context.submission()?;
-        let native = self
-            .native_surfaces
-            .get_mut(&id)
-            .ok_or_else(|| Error::Invalid("unknown native surface".into()))?;
-        let mut reusable = native
-            .spares
-            .iter()
-            .position(|target| target.image.reusable());
-        if reusable.is_none() && native.spares.len() + 1 >= MAX_ROTATION_TARGETS {
-            // Register before the second capacity check, covering release
-            // between the first observation and a future Machine wait.
-            gpu.wait_for_frame_release();
-            reusable = native
-                .spares
-                .iter()
-                .position(|target| target.image.reusable());
-            if reusable.is_none() {
-                return Err(Error::Busy);
-            }
-        }
-        // Prepare every fallible operation before changing the active target.
-        let replacement = if reusable.is_none() {
-            Some(
-                gpu.presentation_target(
-                    native.target.image.width(),
-                    native.target.image.height(),
-                    native.target.has_depth(),
-                )?
-                .with_alpha_mode(native.target.image.alpha_mode()),
-            )
-        } else {
-            None
-        };
-        let serial = self
-            .stats
-            .presentations
-            .checked_add(1)
-            .ok_or_else(|| Error::Invalid("presentation serial exhausted".into()))?;
-        let frame = gpu.completed_frame_under(native.target.image.clone(), serial, &submission)?;
-        let replacement =
-            replacement.unwrap_or_else(|| native.spares.swap_remove(reusable.unwrap()));
-        if let Err(error) = self.publish_native_frame(id, frame, damage) {
-            if reusable.is_some() {
-                self.native_surfaces
-                    .get_mut(&id)
-                    .unwrap()
-                    .spares
-                    .push(replacement);
-            }
-            return Err(Error::Invalid(error));
-        }
-        let native = self.native_surfaces.get_mut(&id).unwrap();
-        let old = std::mem::replace(&mut native.target, replacement);
-        native.spares.push(old);
-        Ok(serial)
-    }
-
-    /// Commit a frame prepared by a device command producer through the same
-    /// serial, ownership mailbox and capture path used by GDI/DirectDraw.
-    #[cfg(feature = "gpu")]
-    pub fn publish_native_frame(
-        &mut self,
-        id: u32,
-        mut frame: crate::gpu::NativeFrame,
-        damage: Option<Rect>,
-    ) -> Result<u64, String> {
-        let native = self
-            .native_surfaces
-            .get(&id)
-            .ok_or("unknown native surface")?;
-        if !native.target.image.same_context(&frame.image)
-            || (native.target.image.width(), native.target.image.height())
-                != (frame.image.width(), frame.image.height())
-        {
-            return Err("prepared frame does not match its native surface".into());
-        }
-        let serial = self
-            .stats
-            .presentations
-            .checked_add(1)
-            .ok_or("presentation serial exhausted")?;
-        frame.serial = serial;
-        self.native_damage.push(id, damage);
-        frame.damage = self.native_damage;
-        if self.frame_mailbox.is_none() && !self.deferred_presentation {
-            self.presenter.present_native(&frame)?;
-            self.captured_serial = serial;
-            self.stats.host_captures += 1;
-        }
-        self.stats.presentations = serial;
-        self.software_source = None;
-        if let Some((mailbox, wake)) = &mut self.frame_mailbox {
-            let overwritten = mailbox.publish(|slot| {
-                slot.store_native(frame);
-                slot.video = self.video_layers.clone();
-                self.retained_frame = Some(slot.clone());
-            });
-            self.stats.coalesced_frames += u64::from(overwritten);
-            if !overwritten {
-                wake.signal();
-            }
-        } else {
-            if self
-                .pending_frame
-                .as_ref()
-                .is_some_and(|old| old.serial != self.captured_serial)
-            {
-                self.stats.coalesced_frames += 1;
-            }
-            let slot = self.pending_frame.get_or_insert_with(PendingFrame::default);
-            slot.store_native(frame);
-            slot.video = self.video_layers.clone();
-            self.retained_frame = Some(slot.clone());
-        }
-        Ok(serial)
-    }
     /// Draw a counted text run through the cached backend. Scratch storage is
     /// bounded and reused; no surface payload or guest object is created.
     pub fn draw_text(
@@ -3094,34 +3023,5 @@ impl<P: Presenter> Surfaces<P> {
             m.write(address, &self.blit_row)?;
         }
         Ok(clipped)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{FrameDamage, Rect};
-
-    // spec: HOST-VIEW-10
-    #[test]
-    fn frame_damage_unions_publications_and_reports_gaps_as_unknown() {
-        let rect = |x, w| Rect { x, y: 0, w, h: 1 };
-        let mut damage = FrameDamage::default();
-        damage.push(1, Some(rect(0, 2)));
-        damage.push(1, Some(rect(10, 2)));
-        assert_eq!(damage.since(Some(1)), Some(rect(10, 2)));
-        assert_eq!(damage.since(Some(0)), None, "an unknown publication");
-        assert_eq!(damage.since(None), None);
-        assert_eq!(damage.since(Some(2)), None, "nothing new is a full redraw");
-        damage.push(1, None);
-        damage.push(1, Some(rect(4, 1)));
-        assert_eq!(damage.since(Some(3)), Some(rect(4, 1)));
-        assert_eq!(damage.since(Some(2)), None, "a full publication in between");
-        damage.push(2, Some(rect(4, 1)));
-        assert_eq!(damage.since(Some(4)), None, "another surface in between");
-        for _ in 0..8 {
-            damage.push(2, Some(rect(0, 1)));
-        }
-        assert_eq!(damage.since(Some(5)), None, "evicted history");
-        assert_eq!(damage.since(Some(6)), Some(rect(0, 1)));
     }
 }

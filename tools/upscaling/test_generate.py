@@ -39,7 +39,8 @@ class TextureReuse(unittest.TestCase):
         self.assertEqual(names['a'], names['c'])
         self.assertNotEqual(names['skip'], names['c'])
         self.assertNotEqual(names['b'], names['c'])
-        self.assertEqual(textures[names['OUTPUT']], ('rgba16f', 2))
+        self.assertNotIn('OUTPUT', names, 'the output is the presentable buffer')
+        self.assertEqual(len(textures), 3)
 
     def test_quantized_storage_is_not_reused_as_float(self):
         graph = [stage(['INPUT'], ['a'], ['rgba8']), stage(['a'], ['b']),

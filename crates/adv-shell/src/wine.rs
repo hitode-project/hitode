@@ -26,9 +26,10 @@ const AUTO_CLICKS: u32 = 3;
 
 /// What the session gets from the shell before the process starts.
 struct Host {
+    capture: Option<adv_device::frame::Waker>,
     background: LocalSender,
     gpu: Option<adv_device::gpu::Gpu>,
-    frames: Option<(adv_runtime::FrameProducer, WakeEvent)>,
+
     pacer: Option<super::frame_pacer::HostPacer>,
 }
 
@@ -79,6 +80,9 @@ fn start(
         install_dir: options.install_dir.clone(),
     };
     environment.start(&config, wake.clone(), &fonts, move |machine| {
+        if let Some(waker) = host.capture {
+            machine.ext.insert(waker);
+        }
         Session::install_codec_kernels(machine, codec_kernels);
         machine.cpu.set_background_sender(host.background)?;
         options.configure_machine(machine, &wake, keys)?;
@@ -101,12 +105,7 @@ fn start(
         if let Some(gpu) = host.gpu {
             Session::attach_gpu(machine, gpu, gpu_wake)?;
         }
-        if let Some((frames, ui)) = host.frames {
-            let store = machine.ext.get_mut::<adv_device::surface::SurfaceStore>();
-            store.set_frame_mailbox(frames, ui);
-            // The UI takes published frames itself.
-            machine.set_frame_handoff(false);
-        }
+
         Ok(())
     })
 }
@@ -121,21 +120,24 @@ pub(super) fn run(options: &Options, dist: &Path) -> Result<u8, String> {
         .map_err(|e| e.to_string())?;
     let mut service = background.start().map_err(|e| e.to_string())?;
     let result = (|| {
+        let display_gpu = crate::display::headless(
+            options.gpu_software,
+            (options.width, options.height),
+            wake.clone(),
+        )?
+        .start()?;
         let gpu = if options.headless_gpu {
-            // As the built-in stack attaches a headless GPU.
-            let gpu = pollster::block_on(adv_device::gpu::Gpu::request(options.gpu_software))
-                .map_err(|e| e.to_string())?;
-            gpu.context()
-                .set_execution_wake(wake.clone())
-                .map_err(|_| "GPU wake already installed")?;
+            let gpu = display_gpu.fork().map_err(|e| e.to_string())?;
+
             Some(gpu)
         } else {
             None
         };
         let host = Host {
+            capture: Some(display_gpu.waker()),
             background: sender.into_local(),
             gpu,
-            frames: None,
+
             pacer: None,
         };
         let debugger = super::debug::start(options, false, wake.clone());
@@ -173,6 +175,11 @@ pub(super) fn run_execution(
     keys: Arc<KeyState>,
     background: adv_sync::background::Sender,
 ) -> Result<Finished, String> {
+    let gpu = worker
+        .display
+        .take()
+        .map(|startup| startup.start())
+        .transpose()?;
     let pacer = super::frame_pacer::HostPacer {
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         vsync: worker.vsync.take(),
@@ -182,9 +189,11 @@ pub(super) fn run_execution(
         origin: Instant::now(),
     };
     let host = Host {
+        capture: gpu.as_ref().map(|g| g.waker()),
         background: background.into_local(),
-        gpu: worker.gpu.take(),
-        frames: Some((worker.take_frames(), worker.ui_wake.clone())),
+
+        gpu,
+
         pacer: Some(pacer),
     };
     let started = Instant::now();
@@ -307,8 +316,11 @@ fn observe_gate(
         session.capture()?;
         metrics.gate.frame_capture(started.elapsed());
     }
+
+    let serial = session.frame().frames;
+
     let completion = metrics.gate.observe(
-        session.presented_frames(),
+        serial,
         session.frame().width,
         &session.frame().bgra,
         Instant::now(),
@@ -567,7 +579,7 @@ fn drive(
                         }
                         session.input(message, wparam, lparam)?;
                     }
-                    #[cfg(host_view)]
+
                     window::Event::Text(text, reply) => {
                         let _ = reply.send(session.text(&text));
                     }
@@ -576,26 +588,22 @@ fn drive(
                             session.set_suspended(paused);
                         });
                         session.close();
-                        // A hosted view waits for the guest, which may ask to
-                        // confirm; a second quit request forces the close.
-                        #[cfg(not(host_view))]
-                        close_at.get_or_insert_with(Instant::now);
                     }
-                    #[cfg(host_view)]
+
                     window::Event::ForceClose => break 'run,
-                    #[cfg(host_view)]
+
                     window::Event::AudioSuspended(sleeping) => {
                         suspension.apply(&mut metrics.audio, Some(sleeping), None, |paused| {
                             session.set_suspended(paused);
                         });
                     }
-                    #[cfg(host_view)]
+
                     window::Event::Paused(value) => {
                         suspension.apply(&mut metrics.audio, None, Some(value), |paused| {
                             session.set_suspended(paused);
                         });
                     }
-                    #[cfg(host_view)]
+
                     window::Event::Volume(percent) => {
                         metrics.audio.set_volume(percent);
                     }
@@ -1133,8 +1141,10 @@ mod tests {
             let keys = Arc::new(KeyState::default());
             let host = Host {
                 background: sender.into_local(),
+
+                capture: None,
                 gpu: None,
-                frames: None,
+
                 pacer: None,
             };
             let mut session = start(

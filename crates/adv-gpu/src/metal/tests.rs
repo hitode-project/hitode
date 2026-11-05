@@ -626,7 +626,7 @@ fn ir_compute_uses_workgroup_dimensions_and_runtime_slice_lengths() {
     let pipeline = device.create_compute_pipeline(&desc, Some(&cache)).unwrap();
     let same = device.create_compute_pipeline(&desc, None).unwrap();
     assert_eq!(pipeline.inner.0.raw, same.inner.0.raw);
-    let uniforms = upload_words(&device, &[0, 7, 0, 0, 0]);
+    let uniforms = upload_words(&device, &[0, 0, 0, 0, 7, 0, 0, 0]);
     let values = device
         .create_buffer(&BufferDesc {
             size: 64,
@@ -666,7 +666,7 @@ fn ir_compute_uses_workgroup_dimensions_and_runtime_slice_lengths() {
             label: "compute",
         });
         pass.set_pipeline(&pipeline);
-        pass.bind(3, Bind::Uniform(uniforms.slice(4..20)));
+        pass.bind(3, Bind::Uniform(uniforms.slice(16..32)));
         // Changing only the slice length updates naga's size table without
         // redundantly setting the same native buffer and offset.
         pass.bind(
@@ -739,11 +739,11 @@ fn ir_compute_uses_workgroup_dimensions_and_runtime_slice_lengths() {
 #[test]
 fn precompiled_msl_and_shader_validation() {
     let (device, mut queue) = gpu!();
-    let shader = device.create_shader(ShaderDesc { source: Source::Precompiled { spirv: &[u32::MAX], metal: b"#include <metal_stdlib>\nusing namespace metal;\nkernel void main0(device uint* out [[buffer(29)]], uint i [[thread_position_in_grid]]) { out[i] = i + 5; }" }, identity: 102, label: "precompiled" }).unwrap();
+    let shader = device.create_shader(ShaderDesc { source: Source::Precompiled { spirv: &[u32::MAX], metal: b"#include <metal_stdlib>\nusing namespace metal;\nkernel void main0(device uint* out [[buffer(29)]], uint i [[thread_position_in_grid]]) { out[i] = i + 5; }", entries: &[crate::shader::PrecompiledEntry { name: "main", function: "main0", workgroup: [1, 1, 1], threadgroup: &[] }] }, identity: 102, label: "precompiled" }).unwrap();
     let pipeline = device
         .create_compute_pipeline(
             &ComputePipelineDesc {
-                entry: shader.entry("main0", Stage::Compute).unwrap(),
+                entry: shader.entry("main", Stage::Compute).unwrap(),
                 bindings: vec![Binding {
                     slot: 0,
                     kind: BindingKind::StorageBuffer { writable: true },

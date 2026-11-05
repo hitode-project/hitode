@@ -43,12 +43,12 @@ fn wine_gdi_draws_into_d3d9_surfaces_that_reach_the_presenter() {
         adv_runtime::wine::GRAPHICS_DRIVER,
         Platform(registry),
         |machine, prefix| {
+            let gpu = adv_device::gpu::test_support::request(false).unwrap();
+            machine.ext.insert(gpu.waker());
             adv_unix::install(machine);
             adv_runtime::wine::install(machine, &prefix.join("drive_c"), 640, 480).unwrap();
             // As the shell attaches a GPU: its wake, and the readback worker.
-            let gpu = block_on(adv_device::gpu::Gpu::request(false)).unwrap();
             let wake = adv_sync::WakeEvent::new().unwrap();
-            assert!(gpu.context().set_execution_wake(wake.clone()).is_ok());
             machine.cpu.set_waker(wake.clone()).unwrap();
             machine
                 .ext
@@ -98,36 +98,24 @@ fn wine_gdi_draws_into_d3d9_surfaces_that_reach_the_presenter() {
 /// Read the latest native frame back into the presenter, as a shell's
 /// diagnostic capture does.
 fn capture(machine: &mut adv_machine::Machine<adv_cpu::Cpu>) {
-    let Some(composition) = machine
+    let frame = machine
         .ext
-        .get::<SurfaceStore>()
-        .latest_frame()
-        .filter(|frame| frame.native().is_some())
-        .cloned()
-    else {
-        return;
-    };
-    let image = composition.native().unwrap().image.clone();
-    let mut readback = adv_dx::d3d9::readback_image(&mut machine.ext, &image).unwrap();
-    if let Some(job) = readback.take_completion_job() {
-        job();
-    }
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    let bgra = loop {
-        if let Some(pixels) = readback.poll() {
-            break pixels.unwrap();
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "bounded frame readback"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    };
-    machine
-        .ext
-        .get_mut::<SurfaceStore>()
-        .capture_native_frame_pixels(&composition, &bgra)
+        .get::<adv_device::frame::Waker>()
+        .capture()
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .unwrap()
         .unwrap();
+    adv_device::surface::Presenter::present(
+        &mut machine.ext.get_mut::<SurfaceStore>().presenter,
+        adv_device::surface::FrameView {
+            width: frame.width,
+            height: frame.height,
+            pitch: frame.width * 4,
+            bgra: &frame.bgra,
+            serial: frame.serial,
+        },
+    )
+    .unwrap();
 }
 
 /// The machine's wake, which the GPU and its readback worker signal.
@@ -146,22 +134,4 @@ fn serve(machine: &mut adv_machine::Machine<adv_cpu::Cpu>) -> bool {
             .unwrap();
     }
     false
-}
-
-fn block_on<F: std::future::Future>(future: F) -> F::Output {
-    struct Wake(std::thread::Thread);
-    impl std::task::Wake for Wake {
-        fn wake(self: std::sync::Arc<Self>) {
-            self.0.unpark();
-        }
-    }
-    let waker = std::task::Waker::from(std::sync::Arc::new(Wake(std::thread::current())));
-    let mut context = std::task::Context::from_waker(&waker);
-    let mut future = std::pin::pin!(future);
-    loop {
-        if let std::task::Poll::Ready(value) = future.as_mut().poll(&mut context) {
-            return value;
-        }
-        std::thread::park();
-    }
 }

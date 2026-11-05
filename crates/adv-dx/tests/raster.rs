@@ -30,6 +30,8 @@ struct Fixture {
     objects: adv_machine::Objects,
     memory: Memory,
     surfaces: Surfaces<Snapshot>,
+    #[cfg(feature = "gpu")]
+    capture: adv_device::gpu::test_support::SurfaceCapture,
     ddraw: DirectDraw,
     device: u32,
 }
@@ -71,7 +73,11 @@ impl Fixture {
         f
     }
     fn empty(objects: adv_machine::Objects) -> Self {
+        #[cfg(feature = "gpu")]
+        let capture = adv_device::gpu::test_support::SurfaceCapture::new().unwrap();
         Self {
+            #[cfg(feature = "gpu")]
+            capture,
             objects,
             memory: Memory(vec![0; 65536]),
             surfaces: Surfaces::new(5, 4, 4096, 61440, Snapshot::default()).unwrap(),
@@ -86,7 +92,8 @@ impl Fixture {
         }
     }
     fn dd(&mut self, id: u32, args: &[u32]) -> u32 {
-        self.ddraw
+        let result = self
+            .ddraw
             .call(
                 id,
                 args,
@@ -94,7 +101,10 @@ impl Fixture {
                 &mut self.objects,
                 &mut self.memory,
             )
-            .unwrap()
+            .unwrap();
+        #[cfg(feature = "gpu")]
+        self.capture.update(&mut self.surfaces);
+        result
     }
     fn surface(&mut self, w: u32, h: u32, format: PixelFormat, primary: bool) -> (u32, u32, u32) {
         let mut desc = [0u8; 108];

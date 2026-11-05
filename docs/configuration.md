@@ -9,6 +9,14 @@ Kinds:
 - **Diagnostic** only observes or checks.
 - **Fixture** controls self-written tests and the conditions they run under.
 
+## Android display probe
+
+The `debug.adv.probe.rotation` Android system property is diagnostic. Its default
+is 0; 90, 180 and 270 select the base layer's SurfaceControl rotation. The
+NativeActivity probe reads it on window creation. See
+[the Android tools](../tools/android/README.md#surfacecontrol-display-probe) for
+the build command and timing output.
+
 ## Launcher upscaling
 
 The global filter offers Off, Anime4K, CuNNy, ArtCNN and k7_modernAnime; Off is the default.
@@ -64,7 +72,6 @@ Header macros, placeholder names in script examples and names read only to clear
 | `ADV_FIXTURE_OTHER_83F2` | Fixture | Deliberately undefined variable read by the fixture |
 | `ADV_FONT_DIR` | Feature | System font folders only |
 | `ADV_FONT_PROFILE` | Fixture | No controlled font profile |
-| `ADV_GPU_BACKEND` | Migration comparison | Unset: native Metal programmable draws on Apple ARM; `wgpu` forces the reference path. Remove when R3-B completes. |
 | `ADV_VERIFY_SOFTWARE_FRAMES` | Diagnostic | Off; any value compares incremental software storage and conversion against full-frame references |
 | `ADV_HOST_FEATURES` | Diagnostic | Every detected feature; can only turn features off |
 | `ADV_HOST_FEATURES_REPORT` | Diagnostic | Off |
@@ -88,7 +95,7 @@ Header macros, placeholder names in script examples and names read only to clear
 | `ADV_SMOKE` | Fixture | The game list of `tools/smoke.py` (shape: `tools/smoke.example.json`); unset: `$ADV_SAMPLES/smoke.json` |
 | `ADV_SHELL_LOG_TEST_CHILD` | Fixture | Unset; set by the parent test |
 | `ADV_TEST_FFMPEG` | Fixture | `ffmpeg` |
-| `ADV_TEST_GPU_BACKEND` | Fixture | Automatic; `vulkan` or `gles` |
+| `ADV_TEST_GPU_BACKEND` | Fixture | Automatic; `vulkan` or `metal` |
 | `ADV_TEST_ISO` | Fixture | None; a read-only image must be given |
 | `ADV_TEXT_DIAGNOSTICS` | Diagnostic | Off |
 | `ADV_TIER1_CENSUS` | Diagnostic | Off; census of x87 exact-path forms |
@@ -104,6 +111,10 @@ Apply, and eliminated dead frames/passes. It is diagnostic only. Builds without
 the feature compile out the instrumentation. Lookup counts cover resource
 identity resolutions and current/base content-version table probes in recording;
 they exclude backend work and damage-history bookkeeping.
+
+`adv-device/test-support` is a fixture feature enabled by the graphics crates'
+dev-dependencies. It provides frame capture, submission pauses and simulated
+device loss; builds without it omit the executor hooks.
 
 ## adv-run options
 
@@ -159,6 +170,8 @@ both mappings; removing settings on the next run restores the prefix namespace.
 ## Cargo features
 
 The execution engine is AArch64. Platform and device build capabilities such as `gpu` and `media` are described in [building.md](building.md).
+
+`adv-gpu/backend` is enabled by default and provides GPU runtime access. Build scripts use `adv-gpu` with `default-features = false, features = ["precompile"]` for the naga host-shader compiler and binding descriptions without GPU backends or driver dependencies. Host compilation and runtime Metal lowering share their argument-index rules.
 
 Host service CSV diagnostics also count successful guest bodies and ordinary fallbacks per API, with the guest fraction. Guest probes are installed only while host profiling, frame timing or frame-budget diagnostics are active; disabled bodies and fallback jumps contain no counter instructions.
 

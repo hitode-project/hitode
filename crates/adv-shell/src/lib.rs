@@ -20,20 +20,23 @@ pub use adv_runtime::{
 };
 #[cfg(mobile)]
 pub use logging::init_system_log;
-#[cfg(host_view)]
-mod native_gpu;
-#[cfg(host_view)]
-mod upscaling;
-#[cfg(host_view)]
-pub use upscaling::Upscaler;
+#[cfg(any(host_view, feature = "gpu"))]
+mod display;
+
+#[cfg(any(host_view, feature = "gpu"))]
+pub use display::Upscaler;
+
+#[cfg(not(any(host_view, feature = "gpu")))]
 mod scaling;
+#[cfg(any(host_view, feature = "gpu"))]
+pub use adv_display::plan::Placement as Scaling;
+#[cfg(not(any(host_view, feature = "gpu")))]
 pub use scaling::Scaling;
 pub mod overlay;
 mod performance;
 #[cfg(host_view)]
 mod session;
-#[cfg(any(host_view, all(test, feature = "gpu")))]
-mod software_frame;
+
 pub mod window;
 #[cfg(host_view)]
 mod wine;

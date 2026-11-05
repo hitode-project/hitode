@@ -3,7 +3,7 @@
 //! Apple device requests, native draws, copies and compilation drain their
 //! autoreleased temporaries on the calling thread.
 use crate::surface::Rect;
-mod clear;
+
 mod constant_snapshot;
 pub use constant_snapshot::ConstantSnapshot;
 pub mod compile;
@@ -11,30 +11,57 @@ mod depth;
 mod index_bytes;
 mod line;
 pub use index_bytes::IndexBytes;
+
+pub(crate) mod native;
 mod programmable;
-mod renderer;
-mod submission;
+
 mod vertex_bytes;
-use depth::DeferredClear;
-pub use depth::{Depth, DepthFormat, Stencil, StencilFace, StencilOp};
+
+pub use depth::{DepthFormat, Stencil, StencilFace, StencilOp};
+#[cfg(feature = "test-support")]
+pub use native::test_support;
+
+pub use native::{Depth, Gpu, Image, ImageId, Readback, Staged, Target};
 pub use programmable::{
     Attribute, AttributeFormat, ConstantBlock, Program, ProgramTexture, ProgrammableDraw,
     VertexStream,
 };
-#[cfg(target_vendor = "apple")]
-pub use renderer::DisplayCompletion;
-pub use renderer::Submission;
-pub use renderer::validate_program;
-pub use renderer::{Gpu, Image, NativeContext, NativeFrame, Readback, Staged, Target};
-pub use submission::SubmissionPause;
+
+/// Validate guest-derived source before handing it to the device.
+pub fn validate_program(program: &Program) -> Result<(), Error> {
+    program_module(program.source()).map(drop)
+}
+pub(super) fn program_module(source: &str) -> Result<naga::Module, Error> {
+    if source.len() > Program::MAX_SOURCE_LEN {
+        return Err(Error::Invalid("program source exceeds limit".into()));
+    }
+    let module = naga::front::wgsl::parse_str(source)
+        .map_err(|e| Error::Invalid(e.emit_to_string(source)))?;
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::empty(),
+    )
+    .validate(&module)
+    .map_err(|e| Error::Invalid(e.emit_to_string(source)))?;
+    Ok(module)
+}
+
 pub use vertex_bytes::VertexBytes;
 #[derive(Clone, Copy, Debug)]
 pub enum GpuBackend {
     Automatic,
     Vulkan,
-    Gl,
-    Direct3D12,
     Metal,
+}
+
+/// Guest texel layouts accepted by texture creation and raw staging.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TexelFormat {
+    Bgra8,
+    Bgrx8,
+    B5g6r5,
+    Bgra4,
+    A8,
 }
 
 /// Whether sampled alpha is stored or implicitly one (RGBX color images).
@@ -248,16 +275,14 @@ pub struct Stats {
     pub native_frames: u64,
     pub native_frame_allocations: u64,
     pub vertex_buffer_allocations: u64,
-    pub metal_draws: u64,
-    pub backend_switches: u64,
-    /// Partial clear, copy, upload, fixed draw, readback, other (including entry to Metal).
-    pub backend_switches_by_reason: [u64; 6],
     pub ring_bytes: u64,
     pub ring_busy: u64,
     pub buffer_writes: u64,
     pub last_flush_buffer_writes: u64,
     pub bind_group_creations: u64,
     pub pipeline_cache_hits: u64,
+    /// Draws using a pipeline first compiled by a creation-time prediction.
+    pub anticipated_pipeline_draws: u64,
     pub compile_waits: u64,
     pub compile_wait_ns: u64,
     pub prebuild_hits: u64,

@@ -586,7 +586,9 @@ fn set_in(
                     mode &= !0o222;
                 }
             } else {
-                mode |= (0o600 | ((mode & 0o44) >> 1)) & !u32::from(*START_UMASK);
+                #[allow(clippy::useless_conversion, reason = "mode_t is u16 on Apple targets")]
+                let umask = u32::from(*START_UMASK);
+                mode |= (0o600 | ((mode & 0o44) >> 1)) & !umask;
             }
             // SAFETY: the descriptor remains live.
             if unsafe { libc::fchmod(fd.fd, mode as _) } == -1 {

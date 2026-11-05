@@ -169,3 +169,8 @@ Wine decoder capability probes MUST succeed for available codecs before stream s
 
 **Rule**: Standalone host video windows, fullscreen activation, and input-message forwarding MUST fail explicitly without altering embedded geometry.
 **Verification**: Test
+
+### MEDIA-VIDEO-7 Native video planes
+
+**Rule**: With GPU rendering, decoded host pictures MUST use four reusable presentable buffers per stream: NV12 on Apple, NV21 on Android. Display MUST transfer each picture's presentable lease at most once. Guest pixel requests MUST convert on demand using the stream matrix and range.
+**Verification**: Test

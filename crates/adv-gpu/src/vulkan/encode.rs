@@ -3,6 +3,15 @@ use super::*;
 use arrayvec::ArrayVec;
 use ash::vk::Handle;
 
+const WRITES: vk::AccessFlags2 = vk::AccessFlags2::from_raw(
+    vk::AccessFlags2::COLOR_ATTACHMENT_WRITE.as_raw()
+        | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE.as_raw()
+        | vk::AccessFlags2::SHADER_WRITE.as_raw()
+        | vk::AccessFlags2::SHADER_STORAGE_WRITE.as_raw()
+        | vk::AccessFlags2::TRANSFER_WRITE.as_raw()
+        | vk::AccessFlags2::MEMORY_WRITE.as_raw(),
+);
+
 /// What a submission owns until it completes. Objects it uses need no
 /// reference: their destruction waits for it (see [`Retired`]).
 #[derive(Default)]
@@ -18,8 +27,62 @@ pub(crate) struct Encoder {
     pub(super) submitted: bool,
     /// No work recorded since the last memory barrier.
     pub(super) synced: bool,
-    originals: Vec<(Arc<ImageCore>, Vec<ImageState>)>,
+    /// Each image this encoder touched: its states before, and whether the
+    /// encoder writes it.
+    originals: Vec<(Arc<ImageCore>, Vec<ImageState>, bool)>,
     pub(super) commands: Vec<vk::CommandBuffer>,
+    /// The pool `commands` come from, owned until the submission retires.
+    pub(super) pool: Option<Commands>,
+}
+/// One encoder's command buffers, reset as a whole pool once the GPU is done
+/// with them. Resetting single buffers made Adreno free and remap their
+/// memory through the kernel for every render pass.
+pub(super) struct Commands {
+    pool: vk::CommandPool,
+    pub(super) buffers: Vec<vk::CommandBuffer>,
+    used: usize,
+}
+impl Commands {
+    fn new(context: &Context) -> Result<Self> {
+        let pool = context.result(unsafe {
+            context.device.create_command_pool(
+                &vk::CommandPoolCreateInfo::default().queue_family_index(context.family),
+                None,
+            )
+        })?;
+        Ok(Self {
+            pool,
+            buffers: Vec::new(),
+            used: 0,
+        })
+    }
+    fn next(&mut self, context: &Context) -> Result<vk::CommandBuffer> {
+        if self.used == self.buffers.len() {
+            let buffer = context.result(unsafe {
+                context.device.allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::default()
+                        .command_pool(self.pool)
+                        .level(vk::CommandBufferLevel::PRIMARY)
+                        .command_buffer_count(1),
+                )
+            })?[0];
+            self.buffers.push(buffer);
+        }
+        self.used += 1;
+        Ok(self.buffers[self.used - 1])
+    }
+    /// Returns every buffer to the initial state, keeping its memory.
+    pub(super) fn reset(&mut self, context: &Context) -> Result<()> {
+        self.used = 0;
+        context.result(unsafe {
+            context
+                .device
+                .reset_command_pool(self.pool, vk::CommandPoolResetFlags::empty())
+        })
+    }
+    pub(super) fn destroy(self, context: &Context) {
+        unsafe { context.device.destroy_command_pool(self.pool, None) };
+    }
 }
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub(super) struct PassKey {
@@ -84,6 +147,7 @@ impl Encoder {
             synced: false,
             originals: Vec::new(),
             commands: Vec::new(),
+            pool: None,
         };
         if let Err(e) = encoder.allocate_command() {
             encoder.error = Some(e);
@@ -92,25 +156,14 @@ impl Encoder {
     }
     fn allocate_command(&mut self) -> Result<()> {
         let context = &self.shared.context;
-        let mut state = self.shared.state.lock().unwrap();
-        self.command = match state.commands.pop() {
-            Some(command) => {
-                context.result(unsafe {
-                    context
-                        .device
-                        .reset_command_buffer(command, vk::CommandBufferResetFlags::empty())
-                })?;
-                command
-            }
-            None => context.result(unsafe {
-                context.device.allocate_command_buffers(
-                    &vk::CommandBufferAllocateInfo::default()
-                        .command_pool(self.shared.pool)
-                        .level(vk::CommandBufferLevel::PRIMARY)
-                        .command_buffer_count(1),
-                )
-            })?[0],
-        };
+        if self.pool.is_none() {
+            let reused = self.shared.state.lock().unwrap().pools.pop();
+            self.pool = Some(match reused {
+                Some(pool) => pool,
+                None => Commands::new(context)?,
+            });
+        }
+        self.command = self.pool.as_mut().unwrap().next(context)?;
         context.result(unsafe {
             context.device.begin_command_buffer(
                 self.command,
@@ -175,7 +228,7 @@ impl Encoder {
     }
     fn transition(
         &mut self,
-        image: &Image,
+        core: &Arc<ImageCore>,
         mips: std::ops::Range<u32>,
         layers: std::ops::Range<u32>,
         layout: vk::ImageLayout,
@@ -185,25 +238,27 @@ impl Encoder {
         if !self.ready() {
             return;
         }
-        let mut states = image.core.states.lock().unwrap();
-        if !self
+        let mut states = core.states.lock().unwrap();
+        let written = access.intersects(WRITES);
+        match self
             .originals
-            .iter()
-            .any(|(core, _)| Arc::ptr_eq(core, &image.core))
+            .iter_mut()
+            .find(|(c, ..)| Arc::ptr_eq(c, core))
         {
-            self.originals.push((image.core.clone(), states.clone()));
+            Some(original) => original.2 |= written,
+            None => self.originals.push((core.clone(), states.clone(), written)),
         }
         let context = &self.shared.context;
         for layer in layers {
             for mip in mips.clone() {
-                let index = (layer * image.desc().mips + mip) as usize;
+                let index = (layer * core.desc.mips + mip) as usize;
                 let old = states[index];
                 #[cfg(target_os = "android")]
                 let (src_family, dst_family) = old.queue_families(layout, context.family);
                 #[cfg(not(target_os = "android"))]
                 let (src_family, dst_family) = (vk::QUEUE_FAMILY_IGNORED, vk::QUEUE_FAMILY_IGNORED);
                 let range = vk::ImageSubresourceRange::default()
-                    .aspect_mask(formats::aspect(image.desc().format))
+                    .aspect_mask(formats::aspect(core.desc.format))
                     .base_mip_level(mip)
                     .level_count(1)
                     .base_array_layer(layer)
@@ -219,7 +274,7 @@ impl Encoder {
                             .new_layout(layout)
                             .src_queue_family_index(src_family)
                             .dst_queue_family_index(dst_family)
-                            .image(image.core.handle)
+                            .image(core.handle)
                             .subresource_range(range)];
                         let info = vk::DependencyInfo::default().image_memory_barriers(&barriers);
                         if context.api >= vk::API_VERSION_1_3 {
@@ -235,7 +290,7 @@ impl Encoder {
                             .new_layout(layout)
                             .src_queue_family_index(src_family)
                             .dst_queue_family_index(dst_family)
-                            .image(image.core.handle)
+                            .image(core.handle)
                             .subresource_range(range)];
                         context.device.cmd_pipeline_barrier(
                             self.command,
@@ -262,16 +317,30 @@ impl Encoder {
             }
         }
     }
+    /// Hand a presentable image to the compositor after this submission.
     #[cfg(target_os = "android")]
-    pub(super) fn release(&mut self, image: &Image) {
+    pub(super) fn release(&mut self, core: &Arc<ImageCore>) {
         self.transition(
-            image,
+            core,
             0..1,
             0..1,
             vk::ImageLayout::PRESENT_SRC_KHR,
             vk::AccessFlags2::empty(),
             vk::PipelineStageFlags2::BOTTOM_OF_PIPE,
         );
+    }
+    /// Return every image this encoder took from the external domain and only
+    /// read: the compositor may still show it. Written images stay owned here
+    /// unless submitted for presentation.
+    #[cfg(target_os = "android")]
+    pub(super) fn release_borrowed(&mut self) {
+        for i in 0..self.originals.len() {
+            let (core, states, written) = &self.originals[i];
+            if !written && states[0].family == vk::QUEUE_FAMILY_FOREIGN_EXT {
+                let core = core.clone();
+                self.release(&core);
+            }
+        }
     }
     pub(super) fn view_transition(
         &mut self,
@@ -281,7 +350,7 @@ impl Encoder {
         stage: vk::PipelineStageFlags2,
     ) {
         self.transition(
-            &view.0.image.inner,
+            &view.0.image.inner.core,
             view.0.desc.mips.clone(),
             view.0.desc.layers.clone(),
             layout,
@@ -444,7 +513,18 @@ impl Encoder {
         }
         if let Some(depth) = &desc.depth_stencil {
             let view = &depth.view.inner;
-            dimensions = view.size();
+            // The depth attachment may be larger than the color ones; the
+            // framebuffer may exceed none of them.
+            let size = view.size();
+            dimensions = if desc.colors.is_empty() {
+                size
+            } else {
+                Extent {
+                    width: dimensions.width.min(size.width),
+                    height: dimensions.height.min(size.height),
+                    ..dimensions
+                }
+            };
             let layout = if depth.read_only {
                 vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL
             } else {
@@ -738,7 +818,7 @@ impl Encoder {
             size.depth_or_layers
         };
         self.transition(
-            &copy.image.inner,
+            &copy.image.inner.core,
             copy.mip..copy.mip + 1,
             copy.layer..copy.layer + count,
             layout,
@@ -884,19 +964,19 @@ impl Drop for Encoder {
             if let Some(arena) = self.resources.descriptors.take() {
                 self.shared.descriptors.lock().unwrap().push(arena);
             }
-            for (image, states) in self.originals.drain(..) {
+            for (image, states, _) in self.originals.drain(..) {
                 *image.states.lock().unwrap() = states;
             }
-            if self.command != vk::CommandBuffer::null() {
-                self.commands.push(self.command);
-            }
-            if !self.commands.is_empty() {
-                let _state = self.shared.state.lock().unwrap();
-                unsafe {
-                    self.shared
-                        .context
-                        .device
-                        .free_command_buffers(self.shared.pool, &self.commands);
+            // Unsubmitted buffers never reached the GPU. The open one is
+            // ended first, so the reset never meets a recording buffer.
+            if let Some(mut pool) = self.pool.take() {
+                let context = &self.shared.context;
+                if self.command != vk::CommandBuffer::null() {
+                    let _ = unsafe { context.device.end_command_buffer(self.command) };
+                }
+                match pool.reset(context) {
+                    Ok(()) => self.shared.state.lock().unwrap().pools.push(pool),
+                    Err(_) => pool.destroy(context),
                 }
             }
         }
@@ -1150,6 +1230,41 @@ impl RenderPass<'_> {
             resource,
             Some(self.preamble),
         );
+    }
+    #[cfg(target_os = "android")]
+    pub(crate) fn bind_video(&mut self, image: &crate::PresentImage) {
+        if !self.encoder.ready() {
+            return;
+        }
+        let (pool, set) = image.video_set();
+        let pipeline = self
+            .pipeline
+            .as_ref()
+            .expect("video pipeline before bind_video");
+        let (index, expected) = pipeline.video.as_ref().expect("converted video pipeline");
+        debug_assert!(
+            Arc::ptr_eq(pool, expected),
+            "video buffer belongs to another pool"
+        );
+        let command = self.encoder.command;
+        self.encoder.command = self.preamble;
+        self.encoder.view_transition(
+            &image.image().view().inner,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::AccessFlags2::SHADER_READ,
+            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+        );
+        self.encoder.command = command;
+        unsafe {
+            self.encoder.shared.context.device.cmd_bind_descriptor_sets(
+                command,
+                vk::PipelineBindPoint::GRAPHICS,
+                pipeline.layout,
+                *index,
+                &[set],
+                &[],
+            );
+        }
     }
     pub(crate) fn set_index_buffer(&mut self, buffer: BufferSlice<'_>, format: IndexFormat) {
         if !self.encoder.ready() {

@@ -15,7 +15,7 @@ struct Evidence {
     device: u32,
     ranges: Vec<(u32, usize)>,
     snapshots: Vec<Snapshot>,
-    frames: Vec<adv_device::gpu::NativeFrame>,
+    frames: Vec<adv_device::gpu::test_support::Frame>,
 }
 fn capture(env: &mut Env<'_>) -> Outcome {
     let pointer = env.ext.get::<Evidence>().device;
@@ -43,7 +43,7 @@ fn fixture(traced: bool) -> Fixture {
             .unwrap()
             .image;
         let serial = ext.get::<Evidence>().frames.len() as u64 + 1;
-        let frame = gpu.present(&image, serial)?;
+        let frame = adv_device::gpu::test_support::present(gpu, &image, None, serial)?;
         ext.get_mut::<Evidence>().frames.push(frame);
         Ok(serial)
     };
@@ -184,13 +184,19 @@ fn d3d9_direct_and_traced_calls_match_state_command_keys_registers_stack_memory_
         .collect();
     assert!(changes.is_empty(), "memory differences: {changes:?}");
     assert_eq!(evidence.snapshots[0].1.len(), 32);
-    let images: Vec<_> = evidence
-        .frames
-        .iter()
-        .map(|frame| frame.image.clone())
-        .collect();
+    let images = evidence.frames.clone();
     assert_eq!(images.len(), 2);
-    assert_eq!(f.pixels(&images[0]), f.pixels(&images[1]));
+    super::tests::flush_recordings(&mut Env {
+        context: f.m.sys.current,
+        cpu: &mut f.m.cpu,
+        sys: &mut f.m.sys,
+        ext: &mut f.m.ext,
+        thunk: 0,
+    });
+    assert_eq!(
+        images[0].pixels(f.m.ext.get_mut::<State>().gpu.as_mut().unwrap()),
+        images[1].pixels(f.m.ext.get_mut::<State>().gpu.as_mut().unwrap())
+    );
 }
 
 // spec: A64-CTL-12, GFX-REC-1

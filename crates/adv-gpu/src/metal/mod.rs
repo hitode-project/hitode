@@ -34,7 +34,7 @@ pub(crate) use encode::{ComputePass, Encoder, RenderPass};
 pub(crate) use pipeline::{ComputePipeline, PipelineCache, RenderPipeline};
 pub(crate) use present::{Fence, PresentBuffer};
 use queue::QueryData;
-pub(crate) use queue::{QuerySet, Queue};
+pub(crate) use queue::{MainNotifier, QuerySet, Queue};
 pub(crate) use resource::{Buffer, Image, ImageView, Sampler};
 pub(crate) use ring::{Ring, Span};
 pub(crate) use shader::Shader;
@@ -50,6 +50,8 @@ struct DeviceState {
     samplers: Mutex<HashMap<SamplerDesc, Sampler>>,
     rings: Mutex<Vec<Weak<Mutex<ring::State>>>>,
     clears: Mutex<HashMap<clear::Key, clear::Pipeline>>,
+    /// Metal's initial depth-stencil state; encoders cannot be reset to nil.
+    default_depth: Object<dyn MTLDepthStencilState>,
     pipelines: Mutex<pipeline::Pipelines>,
 }
 

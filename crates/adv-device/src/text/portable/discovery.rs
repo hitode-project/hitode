@@ -4,7 +4,9 @@ use super::MAX_SYSTEM_FONT_BYTES;
 #[cfg(any(target_os = "macos", test))]
 use super::{Database, Source};
 #[cfg(any(target_os = "macos", test))]
-use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
+use std::sync::Arc;
+#[cfg(target_os = "macos")]
+use std::{collections::BTreeSet, path::PathBuf};
 use std::{
     fs::File,
     io::{self, Read, Seek, SeekFrom},
@@ -120,7 +122,7 @@ fn load_file(db: &mut Database, path: &Path) -> io::Result<()> {
     }
     Ok(())
 }
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 fn load_directory(db: &mut Database, directory: &Path, seen: &mut BTreeSet<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(directory) else {
         return;
@@ -195,6 +197,7 @@ mod tests {
     }
     // spec: DEV-FONT-1
     #[test]
+    #[cfg_attr(target_os = "android", ignore = "reads host fixture files")]
     fn metadata_matches_full_font_and_collection_discovery() {
         for name in ["font-resource.ttf", "font-resource.ttc"] {
             let path = Path::new(env!("CARGO_MANIFEST_DIR"))

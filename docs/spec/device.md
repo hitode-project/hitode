@@ -23,7 +23,7 @@ This spec covers the neutral device services behind the API front ends: frames, 
 
 ### DEV-FRAME-4 Incremental complete slots
 
-**Rule**: Each mailbox slot MUST retain its last stored serial and complete normalized pixels. The store MUST retain at most sixteen frame-serial/damage entries and copy their union since that slot's serial. Missing history or changed source/layout MUST rebuild the full frame.
+**Rule**: Each mailbox slot MUST retain its last stored serial and complete normalized pixels. The store MUST retain at most sixteen frame-serial/damage entries, copy their union since each slot's serial, and rebuild fully after missing history or source/layout changes. Native software slots MUST accumulate their own damage debt and wait for completed ingest before reuse.
 **Verification**: Test
 
 ### DEV-FRAME-5 Consumer damage accumulation
@@ -58,7 +58,7 @@ This spec covers the neutral device services behind the API front ends: frames, 
 
 ### DEV-FRAME-10 Content-diff publication damage
 
-**Rule**: A published software frame MUST shrink declared damage to 64x16 tiles whose pixels differ from the previous publication. A rectangle with more than three quarters changed MUST keep its declared bounds. The frame cap MUST measure declared damage.
+**Rule**: A software frame MUST shrink declared damage to 64x16 tiles whose pixels differ from the previous publication. A rectangle with more than three quarters changed MUST keep its declared bounds. The frame cap MUST measure declared damage.
 **Verification**: Test
 
 Comparing against the last publication keeps every slot's damage history complete, so incremental slots and consumers stay exact. Packed formats keep their declared damage.
@@ -70,15 +70,15 @@ Comparing against the last publication keeps every slot's damage history complet
 **Rule**: Depth/stencil surfaces MAY exceed color dimensions and MUST retain identity and contents across color-target switches. Drawing and clearing MUST preserve depth/stencil outside the color region.
 **Verification**: Test
 
-### DEV-DEPTH-2 Attachment copies
+### DEV-DEPTH-2 Attachment regions
 
-**Rule**: Padded color attachments MUST copy the original mip region in and out within one submission. Invalid smaller or foreign-context depth attachments MUST fail before encoding.
+**Rule**: Larger depth attachments MUST preserve the logical color region without padding or copying the color image. Smaller depth attachments MUST fail before encoding.
 **Verification**: Test
 
-### DEV-DEPTH-3 Scratch bound
+### DEV-DEPTH-3 Attachment storage
 
-**Rule**: Each command producer MUST retain at most one color attachment scratch image, bounded to 64 MiB.
-**Verification**: Review — attachment tests check reuse, but do not attempt the 64 MiB admission boundary.
+**Rule**: Depth attachments MUST use their original images without allocating padded color scratch storage.
+**Verification**: Review — native render areas attach the original images without allocating color scratch storage.
 
 ## Texture updates
 

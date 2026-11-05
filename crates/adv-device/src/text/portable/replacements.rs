@@ -188,6 +188,7 @@ mod tests {
 
     // spec: DEV-FONT-1, WINE-SES-5
     #[test]
+    #[cfg_attr(target_os = "android", ignore = "reads host fixture files")]
     fn claimed_cjk_code_pages_require_mapped_characters() {
         let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
         let claimed = codepage(Encoding::Latin)
@@ -211,6 +212,7 @@ mod tests {
 
     // spec: DEV-FONT-1, WINE-SES-5
     #[test]
+    #[cfg_attr(target_os = "android", ignore = "reads host fixture files")]
     fn simplified_chinese_replacements_prefer_heiti_to_songti() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/font-resource.ttf");
@@ -238,6 +240,7 @@ mod tests {
 
     // spec: DEV-FONT-1, WINE-SES-5
     #[test]
+    #[cfg_attr(target_os = "android", ignore = "reads host fixture files")]
     fn replacements_require_repertoire_and_prefer_actual_truetype() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/font-resource.ttf");

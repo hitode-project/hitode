@@ -43,11 +43,56 @@ impl Buffer {
         if self.0.desc.memory == Memory::Device {
             return None;
         }
-        self.0
-            .allocation
-            .as_ref()?
-            .mapped_ptr()
-            .map(|p| std::ptr::NonNull::slice_from_raw_parts(p.cast(), self.0.desc.size as usize))
+        let pointer = self.0.allocation.as_ref()?.mapped_ptr()?;
+        if self.0.desc.memory == Memory::Readback
+            && let Some(range) = self.noncoherent(0..self.0.desc.size)
+        {
+            // SAFETY: the range lies in this buffer's mapped allocation.
+            unsafe {
+                self.0
+                    .context
+                    .device
+                    .invalidate_mapped_memory_ranges(&[range])
+            }
+            .expect("invalidate readback memory");
+        }
+        Some(std::ptr::NonNull::slice_from_raw_parts(
+            pointer.cast(),
+            self.0.desc.size as usize,
+        ))
+    }
+    pub(crate) fn flush(&self, ranges: impl IntoIterator<Item = std::ops::Range<u64>>) {
+        let ranges: Vec<_> = ranges
+            .into_iter()
+            .filter_map(|range| self.noncoherent(range))
+            .collect();
+        if !ranges.is_empty() {
+            // SAFETY: every range lies in this buffer's mapped allocation.
+            unsafe { self.0.context.device.flush_mapped_memory_ranges(&ranges) }
+                .expect("flush shared memory");
+        }
+    }
+    /// `range` of the buffer as atom-aligned device memory, or `None` where
+    /// the memory is coherent and needs no flush or invalidation.
+    fn noncoherent(&self, range: std::ops::Range<u64>) -> Option<vk::MappedMemoryRange<'static>> {
+        let allocation = self.0.allocation.as_ref()?;
+        if allocation
+            .memory_properties()
+            .contains(vk::MemoryPropertyFlags::HOST_COHERENT)
+            || range.is_empty()
+        {
+            return None;
+        }
+        // Host allocations are atom-aligned, so rounding out stays inside it.
+        let atom = self.0.context.atom;
+        let start = (allocation.offset() + range.start) / atom * atom;
+        let end = (allocation.offset() + range.end).next_multiple_of(atom);
+        Some(
+            vk::MappedMemoryRange::default()
+                .memory(unsafe { allocation.memory() })
+                .offset(start)
+                .size(end - start),
+        )
     }
     pub(crate) fn slice(&self, range: std::ops::Range<u64>) -> BufferSlice<'_> {
         BufferSlice {
@@ -80,6 +125,8 @@ impl Clone for Image {
     }
 }
 pub(super) struct ImageCore {
+    // Release pool resources while the device is still alive.
+    pub(super) video: Option<Arc<VideoPool>>,
     pub(super) context: Arc<Context>,
     pub(super) handle: vk::Image,
     pub(super) desc: ImageDesc,
@@ -129,7 +176,11 @@ impl Drop for ImageCore {
         self.context.retire(Retired::Image {
             handle: self.handle,
             allocation: self.allocation.take().unwrap(),
-            conversion: self.conversion,
+            conversion: if self.video.is_some() {
+                None
+            } else {
+                self.conversion
+            },
         });
     }
 }
@@ -140,14 +191,43 @@ pub(super) struct ViewCore {
     pub(super) handle: vk::ImageView,
     pub(super) desc: ViewDesc,
     pub(super) format: Format,
-    pub(super) sampled: Option<u32>,
+    /// The heap entry, taken when a pipeline first samples the view: views
+    /// used only to copy or render never hold one.
+    pub(super) sampled: std::sync::OnceLock<u32>,
     pub(super) storage: Option<u32>,
+}
+impl ViewCore {
+    /// The view's sampled heap entry, inserting it on first use. Without a
+    /// heap, shaders bind descriptor sets and the index is unused.
+    pub(super) fn sampled_index(&self) -> Result<u32> {
+        if let Some(&index) = self.sampled.get() {
+            return Ok(index);
+        }
+        let context = &self.image.inner.core.context;
+        let Some(heap) = &context.heap else {
+            return Ok(0);
+        };
+        let index = heap.insert(
+            context,
+            0,
+            None,
+            Some(
+                vk::DescriptorImageInfo::default()
+                    .image_view(self.handle)
+                    .image_layout(binding::sampled_layout(self.format)),
+            ),
+        )?;
+        if self.sampled.set(index).is_err() {
+            heap.free(0, index);
+        }
+        Ok(*self.sampled.get().unwrap())
+    }
 }
 impl Drop for ViewCore {
     fn drop(&mut self) {
         self.image.inner.core.context.retire(Retired::View {
             handle: self.handle,
-            sampled: self.sampled,
+            sampled: self.sampled.get().copied(),
             storage: self.storage,
         });
     }
@@ -168,6 +248,15 @@ impl Image {
         let _ = image.default.set(default);
         Ok(crate::Image { inner: image })
     }
+    #[cfg(target_os = "android")]
+    pub(crate) fn cpu_written(&self) {
+        self.core.states.lock().unwrap()[0] = ImageState {
+            layout: vk::ImageLayout::GENERAL,
+            family: vk::QUEUE_FAMILY_FOREIGN_EXT,
+            access: vk::AccessFlags2::HOST_WRITE,
+            stage: vk::PipelineStageFlags2::HOST,
+        };
+    }
     pub(crate) fn desc(&self) -> &ImageDesc {
         &self.core.desc
     }
@@ -187,7 +276,7 @@ impl Image {
         self.core.handle.as_raw()
     }
     pub(crate) fn create_view(&self, desc: &ViewDesc) -> Result<crate::ImageView> {
-        if self.desc().format.planes() > 1 {
+        if self.desc().format.planes() > 1 && self.core.conversion.is_some() {
             return Err(Error::Unavailable(
                 "plane views require mutable multi-planar images".into(),
             ));
@@ -195,8 +284,24 @@ impl Image {
         self.default_view(desc)
     }
     fn default_view(&self, desc: &ViewDesc) -> Result<crate::ImageView> {
-        let format = desc.format.unwrap_or(self.core.desc.format);
-        if format != self.core.desc.format && !self.core.desc.view_formats.contains(&format) {
+        let planar = self.core.desc.format == Format::Nv12 && self.core.conversion.is_none();
+        if planar
+            && (desc.plane > 1
+                || desc
+                    .format
+                    .is_some_and(|f| f != [Format::R8Unorm, Format::Rg8Unorm][desc.plane as usize]))
+        {
+            return Err(Error::Invalid("NV12 plane view".into()));
+        }
+        let format = if planar {
+            [Format::R8Unorm, Format::Rg8Unorm][desc.plane as usize]
+        } else {
+            desc.format.unwrap_or(self.core.desc.format)
+        };
+        if !planar
+            && format != self.core.desc.format
+            && !self.core.desc.view_formats.contains(&format)
+        {
             return Err(Error::Invalid(
                 "image view format not declared in view_formats".into(),
             ));
@@ -234,7 +339,11 @@ impl Image {
                 }
             }
         };
-        let aspect = formats::aspect(format);
+        let aspect = if planar {
+            [vk::ImageAspectFlags::PLANE_0, vk::ImageAspectFlags::PLANE_1][desc.plane as usize]
+        } else {
+            formats::aspect(format)
+        };
         let caps = self.core.context.caps.format(format);
         if caps.is_empty() {
             return Err(Error::Unavailable(format!("image view format {format:?}")));
@@ -293,7 +402,7 @@ impl Image {
             .context
             .result(unsafe { self.core.context.device.create_image_view(&info, None) })?;
         let mut core = ViewCore {
-            sampled: None,
+            sampled: std::sync::OnceLock::new(),
             storage: None,
             image: crate::Image {
                 inner: Image {
@@ -305,35 +414,21 @@ impl Image {
             desc: desc.clone(),
             format,
         };
-        if let Some(heap) = &self.core.context.heap {
-            if view_usage.contains(vk::ImageUsageFlags::SAMPLED) && self.core.conversion.is_none() {
-                core.sampled = Some(
-                    heap.insert(
-                        &self.core.context,
-                        0,
-                        None,
-                        Some(
-                            vk::DescriptorImageInfo::default()
-                                .image_view(handle)
-                                .image_layout(binding::sampled_layout(format)),
-                        ),
-                    )?,
-                );
-            }
-            if view_usage.contains(vk::ImageUsageFlags::STORAGE) {
-                core.storage = Some(
-                    heap.insert(
-                        &self.core.context,
-                        2,
-                        None,
-                        Some(
-                            vk::DescriptorImageInfo::default()
-                                .image_view(handle)
-                                .image_layout(vk::ImageLayout::GENERAL),
-                        ),
-                    )?,
-                );
-            }
+        if let Some(heap) = &self.core.context.heap
+            && view_usage.contains(vk::ImageUsageFlags::STORAGE)
+        {
+            core.storage = Some(
+                heap.insert(
+                    &self.core.context,
+                    2,
+                    None,
+                    Some(
+                        vk::DescriptorImageInfo::default()
+                            .image_view(handle)
+                            .image_layout(vk::ImageLayout::GENERAL),
+                    ),
+                )?,
+            );
         }
         Ok(crate::ImageView {
             inner: ImageView(Arc::new(core)),
@@ -353,9 +448,20 @@ impl ImageView {
     }
     pub(crate) fn size(&self) -> Extent {
         let desc = self.0.image.desc();
+        let chroma = desc.format.planes() > 1 && self.0.desc.plane == 1;
+        let width = if chroma {
+            desc.size.width.div_ceil(2)
+        } else {
+            desc.size.width
+        };
+        let height = if chroma {
+            desc.size.height.div_ceil(2)
+        } else {
+            desc.size.height
+        };
         Extent {
-            width: (desc.size.width >> self.0.desc.mips.start).max(1),
-            height: (desc.size.height >> self.0.desc.mips.start).max(1),
+            width: (width >> self.0.desc.mips.start).max(1),
+            height: (height >> self.0.desc.mips.start).max(1),
             depth_or_layers: if desc.dimension == Dimension::D3 {
                 (desc.size.depth_or_layers >> self.0.desc.mips.start).max(1)
             } else {
@@ -475,6 +581,11 @@ impl Device {
         })
     }
     pub(crate) fn create_image(&self, desc: &ImageDesc) -> Result<crate::Image> {
+        if desc.format == Format::Nv21 {
+            return Err(Error::Invalid(
+                "NV21 images come from presentable pools".into(),
+            ));
+        }
         if self.caps().format(desc.format).is_empty() {
             return Err(Error::Unavailable(format!(
                 "image format {:?}",
@@ -599,6 +710,7 @@ impl Device {
             desc: *desc,
             usage,
             conversion: None,
+            video: None,
             allocation: Some(ImageAllocation::Private(allocation)),
             states: Mutex::new(vec![
                 ImageState::default();

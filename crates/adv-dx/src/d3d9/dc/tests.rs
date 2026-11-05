@@ -63,13 +63,8 @@ impl Fixture {
             Ok(())
         };
         if gpu {
-            state.gpu = Some(
-                pollster::block_on(Gpu::request(!cfg!(any(
-                    target_os = "macos",
-                    target_os = "android"
-                ))))
-                .unwrap(),
-            );
+            state.gpu =
+                Some(Gpu::request(!cfg!(any(target_os = "macos", target_os = "android"))).unwrap());
         }
         let wake = Arc::new(adv_sync::WakeEvent::new().unwrap());
         let mut builder = adv_sync::background::Builder::new((*wake).clone()).unwrap();
@@ -390,15 +385,10 @@ fn dirty_marks_wait_for_release_dc_continuation_after_a_busy_upload() {
     let dc = f.acquire(surface);
     assert_eq!(f.pixel(dc, 0, 0, Some(0x00010203)), 0x00010203);
     super::super::tests::force_recording_limit(&mut env(&mut f.m), f.device);
-    let pause =
-        f.m.ext
-            .get::<State>()
-            .gpu
-            .as_ref()
-            .unwrap()
-            .context()
-            .pause_submissions()
-            .unwrap();
+    let pause = adv_device::gpu::test_support::pause_submissions(
+        f.m.ext.get::<State>().gpu.as_ref().unwrap(),
+    )
+    .unwrap();
     let outcome = f.call("d3d9.dll", "IDirect3DSurface9::ReleaseDC", &[surface, dc]);
     assert!(matches!(outcome, Outcome::Block { .. }));
     drop(pause);

@@ -5,10 +5,16 @@
 //!   [`naga::Module`] directly, or SPIR-V that naga's SPIR-V front end reads
 //!   into one before it reaches this crate.
 //! - Host shaders (fixed function, ingest, composition, upscalers) are WGSL,
-//!   precompiled at build time into both outputs and loaded as
+//!   precompiled at build time through [`precompile`] into both outputs and loaded as
 //!   [`Source::Precompiled`], so a launch never pays for their translation.
 
+#[cfg(feature = "backend")]
 use crate::Result;
+
+#[cfg(feature = "precompile")]
+pub(crate) mod compile;
+#[cfg(feature = "precompile")]
+pub use compile::{Precompiled, precompile};
 
 #[non_exhaustive]
 pub enum Source<'a> {
@@ -17,11 +23,28 @@ pub enum Source<'a> {
     /// Build-time output: SPIR-V words for Vulkan, MSL source or a Metal
     /// library for Metal, declaring the argument indices
     /// [`crate::pipeline::Binding`] lists. Only the current backend's half is
-    /// read.
+    /// read. The reserved converted-video pair (group 4) is already combined
+    /// in SPIR-V; backend lowering retargets it to the pool's descriptor set.
     Precompiled {
         spirv: &'a [u32],
         metal: &'a [u8],
+        /// [`Precompiled::entries`]; Metal loads exactly these.
+        entries: &'a [PrecompiledEntry<'a>],
     },
+}
+
+/// One entry point of [`Source::Precompiled`], with what Metal libraries do
+/// not record.
+#[derive(Clone, Copy, Debug)]
+pub struct PrecompiledEntry<'a> {
+    /// The WGSL name pipelines ask for.
+    pub name: &'a str,
+    /// The Metal function; naga renames reserved words such as `main`.
+    pub function: &'a str,
+    /// `[1; 3]` outside compute.
+    pub workgroup: [u32; 3],
+    /// Bytes of each threadgroup argument, in declaration order.
+    pub threadgroup: &'a [u32],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -41,6 +64,7 @@ pub struct ShaderDesc<'a> {
 }
 
 /// A validated module, ready for pipelines on this device. Clone shares it.
+#[cfg(feature = "backend")]
 #[derive(Clone)]
 pub struct Shader {
     /// [`ShaderDesc::identity`].
@@ -48,12 +72,14 @@ pub struct Shader {
     pub(crate) inner: crate::imp::Shader,
 }
 
+#[cfg(feature = "backend")]
 impl Shader {
     pub fn entry(&self, name: &str, stage: Stage) -> Result<Entry> {
         self.inner.entry(name, stage)
     }
 }
 
+#[cfg(feature = "backend")]
 #[derive(Clone)]
 pub struct Entry {
     pub shader: Shader,

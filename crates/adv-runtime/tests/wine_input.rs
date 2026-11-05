@@ -52,14 +52,14 @@ fn run(probe: &str, gpu: bool) {
         stdout: Some(stdout.as_raw_fd()),
     };
     let wake = adv_sync::WakeEvent::new().unwrap();
+    #[cfg(feature = "gpu")]
+    let capture_gpu = adv_device::gpu::test_support::request(false).unwrap();
     let mut session = Session::start(&config, wake.clone(), |machine| {
         #[cfg(feature = "gpu")]
+        machine.ext.insert(capture_gpu.waker());
+        #[cfg(feature = "gpu")]
         if gpu {
-            let gpu = pollster::block_on(adv_device::gpu::Gpu::request(false))
-                .map_err(|e| e.to_string())?;
-            gpu.context()
-                .set_execution_wake(wake.clone())
-                .map_err(|_| "GPU wake already installed")?;
+            let gpu = capture_gpu.fork().map_err(|e| e.to_string())?;
             Session::attach_gpu(machine, gpu, wake.clone())?;
         }
         #[cfg(not(feature = "gpu"))]

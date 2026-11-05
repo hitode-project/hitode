@@ -37,45 +37,28 @@ impl adv_machine::frame_spin::FramePacer for HostPacer {
     }
 }
 
-/// Publication cadence, independent of render latency and mailbox frame drops.
-#[cfg(any(host_view, test))]
-#[derive(Default)]
-pub(crate) struct Cadence {
-    last: Option<(u64, Instant)>,
-    periods: [u64; 4],
-    samples: usize,
-}
-#[cfg(any(host_view, test))]
-impl Cadence {
-    pub(crate) fn published(&mut self, serial: u64, at: Instant) {
-        if let Some((previous, time)) = self.last {
-            if serial <= previous {
-                return;
-            }
-            let elapsed = at.saturating_duration_since(time);
-            if elapsed > Duration::from_millis(250) {
-                self.samples = 0;
-            } else {
-                self.periods[self.samples % 4] =
-                    (elapsed.as_nanos() / u128::from(serial - previous)) as u64;
-                self.samples += 1;
-            }
-        }
-        self.last = Some((serial, at));
-    }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use adv_machine::frame_spin::FramePacer;
 
-    pub(crate) fn rate(&self) -> u32 {
-        if self.samples < 4 {
-            return 60;
+    // spec: HOST-SES-8
+    #[test]
+    fn faster_displays_still_tick_once_per_sixtieth() {
+        let vsync = Arc::new(Vsync::default());
+        let pacer = HostPacer {
+            vsync: Some(vsync.clone()),
+            keys: Arc::default(),
+            origin: Instant::now(),
+        };
+        for hz in [120.0, 144.0] {
+            vsync.publish(Instant::now(), Duration::from_secs_f64(1.0 / hz));
+            let wait = pacer.until_vsync().unwrap();
+            assert!(
+                wait > Duration::from_secs_f64(1.0 / hz),
+                "{hz} Hz: {wait:?}"
+            );
+            assert!(wait <= PERIOD.mul_f64(1.1), "{hz} Hz: {wait:?}");
         }
-        let period = self.periods.iter().sum::<u64>() as f64 / 4.0;
-        (1e9 / period).round().clamp(1.0, 60.0) as u32
     }
-}
-
-/// Earliest submission allowed by the presentation cap. GPU work starts here;
-/// the native compositor selects the following refresh without another host tick.
-#[cfg(any(host_view, test))]
-pub(crate) fn submission_at(published: Instant, next: Instant) -> Instant {
-    published.max(next)
 }

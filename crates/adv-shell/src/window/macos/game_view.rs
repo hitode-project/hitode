@@ -1,17 +1,13 @@
 //! Native game input and Metal presentation surface.
 use super::*;
-use crate::window::refresh_interval;
 use objc2_app_kit::NSView;
-use objc2_quartz_core::{CADisplayLink, CAFrameRateRange, CALayer, CAMetalLayer, CATransaction};
+
+use objc2_quartz_core::{CADisplayLink, CAFrameRateRange, CALayer};
+use std::time::Duration;
 
 pub struct Input {
     hub: Rc<Hub>,
-    /// The frame's layer, a sublayer of the black base layer (HOST-VIEW-9).
-    frame: Retained<CAMetalLayer>,
-    display: Retained<CALayer>,
-    displayed: Option<adv_device::gpu::NativeFrame>,
-    retired: Vec<adv_device::gpu::NativeFrame>,
-    retirement: Option<Retained<NSTimer>>,
+
     width: u32,
     height: u32,
     cursor_visible: bool,
@@ -83,17 +79,25 @@ define_class!(
         fn scroll_wheel(&self, event: &NSEvent) { self.ivars().borrow_mut().handle(self, event); }
         #[unsafe(method(frameClockFired:))]
         fn frame_clock_fired(&self, link: &CADisplayLink) { self.frame(link); }
-        #[unsafe(method(retireFrames:))]
-        fn retire_frames_timer(&self, _timer: &NSTimer) { self.retire_frames(); }
     }
 );
 
 impl GameView {
-    pub(super) fn viewport(&self, canvas: (u32, u32), scaling: crate::Scaling) -> Viewport {
+    pub(super) fn viewport(&self, canvas: (u32, u32), hub: &Hub) -> Viewport {
         let scale = self
             .window()
             .map_or(1.0, |window| window.backingScaleFactor());
-        Viewport::scaled(self.client(), canvas, scaling, scale)
+
+        if let Some(p) = hub.placement.get() {
+            let [x, y, width, height] = p.rectangle.map(|v| f64::from(v) / scale);
+            return Viewport {
+                x,
+                y,
+                width,
+                height,
+            };
+        }
+        Viewport::scaled(self.client(), canvas, hub.scaling.get(), scale)
     }
     pub(crate) fn clear_control_latch(&self) {
         let mut input = self.ivars().borrow_mut();
@@ -124,7 +128,7 @@ impl GameView {
                 f64::from(lparam as u16 as i16),
                 f64::from((lparam >> 16) as u16 as i16),
             );
-            let viewport = self.viewport(self.hub().canvas.get(), self.hub().scaling.get());
+            let viewport = self.viewport(self.hub().canvas.get(), &self.hub());
             let (x, y) =
                 viewport.position(x, y, self.hub().canvas.get().0, self.hub().canvas.get().1);
             u32::from(x as u16) | (u32::from(y as u16) << 16)
@@ -139,36 +143,25 @@ impl GameView {
         Ok(())
     }
 
-    /// Create the Metal surface on the UI thread before guest submissions begin.
-    pub(crate) fn create_native(
+    pub(crate) fn create_display(
         &self,
-        fallback: bool,
-    ) -> Result<(adv_device::gpu::Gpu, crate::native_gpu::WindowPresenter), String> {
-        let (width, height) = self.native_client_size()?;
-        // SAFETY: the owner retains NSView, and with it the frame layer, until
-        // the background service joins and the presenter drops. Surface
-        // creation stays on the main thread.
-        let (gpu, mut presenter) = pollster::block_on(unsafe {
-            crate::native_gpu::WindowPresenter::request(
-                Retained::as_ptr(&self.ivars().borrow().frame) as *mut std::ffi::c_void,
-                width.max(1),
-                height.max(1),
-                fallback,
-            )
-        })?;
-        presenter.configure_exclusive(width.max(1), height.max(1))?;
-        // Core Animation's contentsOpaque handles IOSurface alpha independently
-        // of the public opaque flag (which only describes layer coverage).
-        let display = &self.ivars().borrow().display;
-        presenter.direct_layer = display.respondsToSelector(sel!(setContentsOpaque:));
-        if presenter.direct_layer {
-            unsafe {
-                let _: () = msg_send![display, setContentsOpaque: true];
-            }
-        }
-        Ok((gpu, presenter))
+        software: bool,
+        wake: adv_sync::WakeEvent,
+    ) -> Result<(crate::display::Startup, crate::display::Ui), String> {
+        let (device, queue) = crate::display::open(software)?;
+        crate::display::apple_channel(
+            device,
+            queue,
+            self.layer().unwrap(),
+            self.native_scale(),
+            self.native_client_size()?,
+            wake,
+        )
     }
 
+    pub(crate) fn native_scale(&self) -> f64 {
+        self.window().map_or(1., |w| w.backingScaleFactor())
+    }
     pub(crate) fn native_client_size(&self) -> Result<(u32, u32), String> {
         if self.hub().occluded.get() || self.hub().sleeping.get() {
             return Ok((0, 0));
@@ -236,25 +229,11 @@ impl GameView {
             window.miniaturize(None);
         }
     }
-    /// Submit before the compositor's next refresh, respecting the 60 Hz cap.
-    pub(crate) fn next_refresh(&self) -> std::time::Instant {
-        std::time::Instant::now() + refresh_interval(self.display_fps())
-    }
-    pub(crate) fn frame_rate(&self, rate: u32) {
-        if let Some(link) = self.hub().link.borrow().as_ref() {
-            link.setPreferredFrameRateRange(CAFrameRateRange {
-                minimum: rate as f32,
-                maximum: rate as f32,
-                preferred: rate as f32,
-            });
-        }
+
+    pub(crate) fn frame_presented(&self) {
         self.request_frame();
     }
-    fn display_fps(&self) -> isize {
-        self.window()
-            .and_then(|window| window.screen())
-            .map_or(60, |screen| screen.maximumFramesPerSecond())
-    }
+
     /// Starts the display-link frame clock where AppKit provides one (macOS
     /// 14). It stays paused until `request_frame`; each callback publishes the
     /// vsync grid for guest pacing and runs `on_frame` once.
@@ -267,7 +246,7 @@ impl GameView {
         }
         let link = unsafe { self.displayLinkWithTarget_selector(self, sel!(frameClockFired:)) };
         link.setPaused(true);
-        // The guest is told the display runs at 60 Hz (`refresh_interval`).
+        // The guest is told the display runs at 60 Hz.
         link.setPreferredFrameRateRange(CAFrameRateRange {
             minimum: 30.0,
             maximum: 60.0,
@@ -290,13 +269,6 @@ impl GameView {
         }
         hub.on_frame.borrow_mut().take();
         hub.vsync.clear();
-        let mut input = self.ivars().borrow_mut();
-        unsafe { input.display.setContents(None) };
-        // The view outlives execution teardown; keep its pins until then even
-        // if Core Animation still references the removed contents.
-        if let Some(timer) = input.retirement.take() {
-            timer.invalidate();
-        }
     }
     /// Arms one display-link callback; false when the timer fallback is in use.
     pub(crate) fn request_frame(&self) -> bool {
@@ -309,7 +281,7 @@ impl GameView {
     fn frame(&self, link: &CADisplayLink) {
         let hub = self.hub();
         link.setPaused(true);
-        self.retire_frames();
+
         let period = link.duration();
         if period > 0.0 {
             let now = std::time::Instant::now();
@@ -330,15 +302,10 @@ impl GameView {
         let hub = Rc::new(Hub::default());
         hub.canvas.set((width, height));
         hub.main_enabled.set(true);
-        let frame = CAMetalLayer::new();
-        let display = CALayer::new();
+
         let this = Self::alloc(mtm).set_ivars(RefCell::new(Input {
             hub,
-            frame: frame.clone(),
-            display: display.clone(),
-            displayed: None,
-            retired: Vec::new(),
-            retirement: None,
+
             width,
             height,
             cursor_visible: true,
@@ -359,102 +326,19 @@ impl GameView {
         let black = objc2_core_graphics::CGColor::new_generic_gray(0.0, 1.0);
         base.setBackgroundColor(Some(&black));
         base.setOpaque(true);
-        unsafe { frame.setContentsGravity(objc2_quartz_core::kCAGravityResize) };
-        frame.setOpaque(true);
-        base.addSublayer(&frame);
-        unsafe { display.setContentsGravity(objc2_quartz_core::kCAGravityResize) };
-        display.setOpaque(true);
-        display.setHidden(true);
-        base.addSublayer(&display);
+
         view.setLayer(Some(&base));
         view.place(None);
         Ok(view)
     }
     /// Show the frame at `placement.rectangle` (client pixels), or across the
     /// client without one. Implicit animations would blend old and new frames.
-    pub(crate) fn place(&self, placement: Option<crate::native_gpu::Placement>) {
-        let scale = self
-            .window()
-            .map_or(1.0, |window| window.backingScaleFactor());
-        let bounds = self.bounds().size;
-        let (rectangle, nearest) = match placement {
-            Some(placement) => (
-                placement.rectangle.map(|v| f64::from(v) / scale),
-                placement.nearest,
-            ),
-            None => ([0.0, 0.0, bounds.width, bounds.height], false),
-        };
-        let [x, y, w, h] = rectangle;
-        let input = self.ivars().borrow();
-        CATransaction::begin();
-        CATransaction::setDisableActions(true);
-        for frame in [&*input.frame as &CALayer, &input.display] {
-            frame.setFrame(objc2_core_foundation::CGRect::new(
-                objc2_core_foundation::CGPoint::new(x, bounds.height - y - h),
-                objc2_core_foundation::CGSize::new(w, h),
-            ));
-            unsafe {
-                frame.setMagnificationFilter(if nearest {
-                    objc2_quartz_core::kCAFilterNearest
-                } else {
-                    objc2_quartz_core::kCAFilterLinear
-                });
-            }
-        }
-        CATransaction::commit();
-    }
-    pub(crate) fn shared_frame(&self, frame: Option<adv_device::gpu::NativeFrame>) {
-        let mut input = self.ivars().borrow_mut();
-        CATransaction::begin();
-        CATransaction::setDisableActions(true);
-        let surface = frame.as_ref().map(|frame| frame.io_surface().unwrap());
-        // IOSurfaceRef is the supported Core Animation layer contents object.
-        unsafe {
-            input.display.setContents(
-                surface.map(|surface| &*(std::ptr::from_ref(surface).cast::<AnyObject>())),
-            );
-        }
-        input.display.setHidden(frame.is_none());
-        input.frame.setHidden(frame.is_some());
-        if let Some(old) = std::mem::replace(&mut input.displayed, frame)
-            && input
-                .displayed
-                .as_ref()
-                .is_none_or(|next| !next.image.shares_storage(&old.image))
+    pub(crate) fn place(&self, placement: Option<crate::display::Placement>) {
         {
-            input.retired.push(old);
-        }
-        CATransaction::commit();
-        if !input.retired.is_empty() && input.retirement.is_none() {
-            // A hidden window can stop its display link while the compositor
-            // still owns retired frames. Drain those pins without stalling the guest.
-            let timer = unsafe {
-                NSTimer::timerWithTimeInterval_target_selector_userInfo_repeats(
-                    1. / 60.,
-                    self,
-                    sel!(retireFrames:),
-                    None,
-                    true,
-                )
-            };
-            unsafe {
-                objc2_foundation::NSRunLoop::mainRunLoop()
-                    .addTimer_forMode(&timer, objc2_foundation::NSRunLoopCommonModes)
-            };
-            input.retirement = Some(timer);
+            self.hub().placement.set(placement);
         }
     }
-    fn retire_frames(&self) {
-        let mut input = self.ivars().borrow_mut();
-        input
-            .retired
-            .retain(|frame| frame.io_surface().unwrap().is_in_use());
-        if input.retired.is_empty()
-            && let Some(timer) = input.retirement.take()
-        {
-            timer.invalidate();
-        }
-    }
+
     pub(crate) fn hub(&self) -> Rc<Hub> {
         self.ivars().borrow().hub.clone()
     }
@@ -620,7 +504,7 @@ impl Input {
             return;
         }
         let inside = x >= 0.0 && y >= 0.0 && x < cw && y < ch;
-        let viewport = view.viewport((self.width, self.height), self.hub.scaling.get());
+        let viewport = view.viewport((self.width, self.height), &self.hub);
         let (gx, gy) = viewport.position(x, y, self.width, self.height);
         let on_canvas = gx >= 0 && gy >= 0 && gx < self.width as i32 && gy < self.height as i32;
         let pressed = NSEvent::pressedMouseButtons();
@@ -680,7 +564,7 @@ impl Input {
     }
 
     fn cursor_visible_at(&self, view: &GameView, point: (f64, f64)) -> bool {
-        let viewport = view.viewport((self.width, self.height), self.hub.scaling.get());
+        let viewport = view.viewport((self.width, self.height), &self.hub);
         let (x, y) = viewport.position(point.0, point.1, self.width, self.height);
         self.cursor_visible && !adv_runtime::VideoCursorRegion::hidden_at(&self.regions, x, y)
     }
@@ -721,30 +605,13 @@ impl Input {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // spec: HOST-SES-8
-    #[test]
-    fn presentation_never_exceeds_the_guest_refresh_rate() {
-        let fast = refresh_interval(180);
-        assert!(
-            fast > Duration::from_secs_f64(1.0 / 70.0)
-                && fast < Duration::from_secs_f64(1.0 / 60.0)
-        );
-        assert_eq!(refresh_interval(120), fast);
-        assert_eq!(refresh_interval(60), Duration::from_secs_f64(1.0 / 60.0));
-        assert_eq!(refresh_interval(48), Duration::from_secs_f64(1.0 / 48.0));
-        assert_eq!(refresh_interval(0), Duration::from_secs_f64(1.0 / 24.0));
-    }
     // spec: HOST-RUN-2
     #[test]
     fn toggle_control_ignores_physical_releases_and_uses_one_guest_key() {
         let hub = Rc::new(Hub::default());
         let mut input = Input {
             hub: hub.clone(),
-            frame: CAMetalLayer::new(),
-            display: CALayer::new(),
-            displayed: None,
-            retired: Vec::new(),
-            retirement: None,
+
             width: 640,
             height: 480,
             cursor_visible: true,

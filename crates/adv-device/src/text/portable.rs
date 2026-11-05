@@ -32,7 +32,6 @@ type FontBytes = Arc<dyn AsRef<[u8]> + Send + Sync>;
 struct FaceStore {
     faces: BTreeMap<ID, Arc<Face>>,
     files: BTreeMap<PathBuf, FontBytes>,
-    digests: BTreeMap<usize, (FontBytes, String)>,
     file_bytes: usize,
 }
 #[derive(Clone)]
@@ -681,9 +680,33 @@ struct Face {
     index: u32,
     info: FaceInfo,
     source: String,
-    sha256: String,
+    /// Only diagnostics and resolution reports name the bytes; hashing every
+    /// face that font enumeration loads cost seconds at startup.
+    sha256: std::sync::OnceLock<String>,
+    /// First and last cmap codes below U+FFFF. A CJK cmap maps tens of
+    /// thousands of codes, and GetTextMetricsW asks for these on every call.
+    unicode_span: std::sync::OnceLock<Option<(u32, u32)>>,
 }
 impl Face {
+    fn unicode_span(&self) -> Result<Option<(u32, u32)>, TextError> {
+        if let Some(span) = self.unicode_span.get() {
+            return Ok(*span);
+        }
+        let font = self.font()?;
+        let mut codes = font
+            .charmap()
+            .mappings()
+            .map(|(code, _)| code)
+            .filter(|&code| code <= 0xfffe);
+        let span = codes
+            .next()
+            .map(|first| (first, codes.last().unwrap_or(first)));
+        Ok(*self.unicode_span.get_or_init(|| span))
+    }
+    fn sha256(&self) -> &str {
+        self.sha256
+            .get_or_init(|| profile::hash(self.data.as_ref().as_ref()))
+    }
     fn font(&self) -> Result<FontRef<'_>, TextError> {
         FontRef::from_index(self.data.as_ref().as_ref(), self.index).map_err(font_error)
     }
@@ -709,7 +732,7 @@ fn diagnostic(
         .map(|name| name.0.as_str())
         .unwrap_or("");
     let source = &face.source;
-    let sha256 = &face.sha256;
+    let sha256 = face.sha256();
     let profile_sha256 = profile
         .map(|profile| profile.sha256.as_str())
         .unwrap_or("uncontrolled");
@@ -749,7 +772,6 @@ fn source_bytes(store: &mut FaceStore, source: &Source) -> Result<FontBytes, Tex
     if store.files.len() >= 32 || store.file_bytes + length > MAX_SYSTEM_FONT_BYTES {
         store.faces.clear();
         store.files.clear();
-        store.digests.clear();
         store.file_bytes = 0;
     }
     store.file_bytes += length;
@@ -781,27 +803,13 @@ fn load_face(
             .unwrap_or_else(|| "guest resource".to_owned()),
         Source::File(path) => path.display().to_string(),
     };
-    // A TTC's faces share one buffer; hash the immutable bytes once. Retain
-    // its Arc with the digest so an allocation address cannot be reused here.
-    let identity = Arc::as_ptr(&data) as *const () as usize;
-    let sha256 = if let Some((_, digest)) = store.digests.get(&identity) {
-        digest.clone()
-    } else {
-        let digest = profile::hash(data.as_ref().as_ref());
-        if store.digests.len() >= 96 {
-            store.digests.clear();
-        }
-        store
-            .digests
-            .insert(identity, (Arc::clone(&data), digest.clone()));
-        digest
-    };
     let face = Arc::new(Face {
         data,
         index: info.index,
         info,
         source,
-        sha256,
+        sha256: std::sync::OnceLock::new(),
+        unicode_span: std::sync::OnceLock::new(),
     });
     face.font()?;
     if store.faces.len() >= 128 {
@@ -1271,17 +1279,12 @@ impl Font {
     /// break follows OS/2 usFirstCharIndex and default is the code before it.
     /// Symbol cmaps report the F000 private-use page.
     pub(super) fn unicode_metrics(&self) -> Result<(TextMetrics, [u16; 4]), TextError> {
-        let font = self.primary.font()?;
-        let charmap = font.charmap();
-        let mut codes = charmap
-            .mappings()
-            .map(|(code, _)| code)
-            .filter(|&code| code <= 0xfffe);
-        let first = codes
-            .next()
+        let (first, last) = self
+            .primary
+            .unicode_span()?
             .ok_or_else(|| TextError::Font("font has no Unicode character map".into()))?;
-        let last = codes.last().unwrap_or(first);
-        let characters = if charmap.is_symbol() || (0xf000..0xf100).contains(&first) {
+        let font = self.primary.font()?;
+        let characters = if font.charmap().is_symbol() || (0xf000..0xf100).contains(&first) {
             [0, 0xf0ff, 0x1f, 0x20]
         } else {
             let os2_first = font.os2().map_or(0x20, |os2| os2.us_first_char_index());
@@ -1437,7 +1440,7 @@ impl Font {
                 .unwrap_or_default(),
             source: face.source.clone(),
             face_index: face.index,
-            sha256: face.sha256.clone(),
+            sha256: face.sha256().to_owned(),
             font_bytes: face.data.as_ref().as_ref().len(),
             glyph_index: glyph.to_u32(),
             default_glyph: code == 0 || mapped != Some(glyph),

@@ -343,7 +343,7 @@ pub(super) fn prepare(
                     .position(|l| {
                         l.surface
                             .and_then(|s| (env.ext.get::<State>().provider.target)(env.ext, s))
-                            .is_some_and(|t| t.image.view() == destination.image.view())
+                            .is_some_and(|t| t.image.id() == destination.image.id())
                     })
                     .map(|n| n as u32),
                 _ => None,
@@ -519,14 +519,17 @@ fn validate(operation: &Operation) -> Result<(), u32> {
             pixels,
             ..
         } => {
-            let width = if matches!(pixels, Pixels::Alpha8(_)) {
-                1
-            } else {
-                4
+            let width = match pixels {
+                Pixels::Staged(..) => match target.image.texel_format() {
+                    adv_device::gpu::TexelFormat::A8 => 1,
+                    adv_device::gpu::TexelFormat::B5g6r5 | adv_device::gpu::TexelFormat::Bgra4 => 2,
+                    _ => 4,
+                },
+                Pixels::Host(..) => 4,
             };
             bounds(&target.image, *rectangle, false)
                 && u64::from(*pitch) >= u64::from(rectangle.w) * width
-                && (width == 1 || pitch.is_multiple_of(4))
+                && pitch.is_multiple_of(width as u32)
                 && u64::from(*pitch) * u64::from(rectangle.h - 1) + u64::from(rectangle.w) * width
                     <= pixels.len() as u64
         }

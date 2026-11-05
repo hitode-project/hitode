@@ -137,8 +137,8 @@ mod tests {
                 "{:?} {:?} {}",
                 u.video.map(|v| (
                     v.pts_us,
-                    v.bgra.len(),
-                    v.bgra.iter().map(|&b| u64::from(b)).sum::<u64>()
+                    v.bgra().len(),
+                    v.bgra().iter().map(|&b| u64::from(b)).sum::<u64>()
                 )),
                 u.audio
                     .iter()
@@ -152,6 +152,13 @@ mod tests {
 
     // spec: MEDIA-STREAM-4
     #[test]
+    #[cfg_attr(
+        all(
+            feature = "gpu",
+            not(any(target_vendor = "apple", target_os = "android"))
+        ),
+        ignore = "decoded video needs presentable YUV pools, which exist only on Apple and Android"
+    )]
     fn prefetching_between_requests_changes_no_answer() {
         let movie =
             include_bytes!("../../../adv-dx/src/dshow/graph/render/fixtures/guest_movie.mpg");

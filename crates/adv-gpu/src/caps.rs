@@ -6,6 +6,8 @@ use crate::Format;
 #[derive(Clone, Debug)]
 pub struct Caps {
     pub features: Features,
+    /// 32-bit shader arithmetic preserves infinities and NaNs.
+    pub ieee_f32: bool,
     /// Modern mechanisms the backend uses natively on this device. Everything
     /// absent runs through its stand-in; callers see the same API and
     /// behavior either way. For reports and the flight recorder only.
@@ -21,7 +23,9 @@ pub struct Caps {
 bitflags::bitflags! {
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
     pub struct Features: u64 {
-        /// Half precision arithmetic in shaders.
+        /// Half precision arithmetic in shaders, outside buffer and stage
+        /// interfaces: phones lack 16-bit storage access (validation layers
+        /// catch such a shader in CI).
         const SHADER_F16 = 1 << 0;
         /// Subgroup (SIMD-group) operations and barriers.
         const SUBGROUP = 1 << 1;
@@ -83,6 +87,21 @@ bitflags::bitflags! {
     }
 }
 
+impl Modern {
+    /// What GPU tests mask: `ADV_GPU_TEST_DISABLE=all` masks everything, so
+    /// one test binary covers both tiers, and flag names such as
+    /// `BINDLESS | PUSH_DESCRIPTORS` mask a subset. Only tests and probes call it.
+    #[doc(hidden)]
+    pub fn from_test_env() -> Self {
+        match std::env::var("ADV_GPU_TEST_DISABLE").as_deref() {
+            Ok("all") => Self::all(),
+            Ok(names) => bitflags::parser::from_str(names)
+                .unwrap_or_else(|_| panic!("ADV_GPU_TEST_DISABLE: unknown flags {names:?}")),
+            Err(_) => Self::empty(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
     pub max_image_2d: u32,
@@ -102,7 +121,8 @@ pub struct Limits {
     /// Bitmask of supported sample counts (bit n = 2^n samples).
     pub sample_counts: u32,
     /// Hardware tile or bin size in pixels, for aligning damage tiles
-    /// (`VK_QCOM_tile_properties`, Apple's tile size); `(0, 0)` when unknown.
+    /// (`VK_QCOM_tile_properties`, Apple's tile size, otherwise Vulkan's render
+    /// area granularity); `(0, 0)` when unknown.
     pub tile: (u32, u32),
     /// Push-constant bytes per draw (Vulkan); bindless indices live there.
     pub push_constant_bytes: u32,

@@ -44,15 +44,11 @@ struct Gpu {
 }
 
 fn options() -> DeviceOptions {
-    let disable = match std::env::var("ADV_GPU_TEST_DISABLE").as_deref() {
-        Ok("all") => Modern::all(),
-        _ => Modern::empty(),
-    };
     DeviceOptions {
         software: !cfg!(any(target_vendor = "apple", target_os = "android")),
         // Shell processes on Android user builds cannot load layers.
         validation: !cfg!(target_os = "android"),
-        disable,
+        disable: Modern::from_test_env(),
         ring_size: 4 << 20,
         label: "conformance",
     }
@@ -874,7 +870,6 @@ fn depth_and_stencil_tests_reject_fragments() {
         .find(|&f| gpu.supports(f, FormatCaps::DEPTH_STENCIL))
         .expect("depth format with stencil");
     let image = gpu.target(8, 8, Format::Rgba8Unorm);
-    let depth = gpu.depth(8, 8, format);
     let face = |compare, pass| StencilFace {
         compare,
         fail: StencilOp::Keep,
@@ -895,51 +890,70 @@ fn depth_and_stencil_tests_reject_fragments() {
     mark.depth_stencil = Some(state(Compare::Always, StencilOp::Replace, Compare::Always));
     let mark = gpu.pipeline(&mark);
     let mut test = gpu.solid_desc(Format::Rgba8Unorm);
-    test.depth_stencil = Some(state(Compare::Equal, StencilOp::Keep, Compare::Less));
+    let mut tested = state(Compare::Equal, StencilOp::Keep, Compare::Less);
+    tested.depth_write = false;
+    test.depth_stencil = Some(tested);
     let test = gpu.pipeline(&test);
 
-    // Mark the left half with stencil 1 at depth 0.5, then draw red at 0.7
-    // (fails depth) and green at 0.3 (passes where marked).
+    // Mark the left half with stencil 1 at depth 0.5, then in a second pass
+    // draw red at 0.7 (fails depth) and green at 0.3 (passes where marked).
     let (uniforms, stride) = gpu.uniforms(&[block(WHITE, 0.5), block(RED, 0.7), block(GREEN, 0.3)]);
-    let attachment = DepthAttachment {
-        view: depth.view(),
-        depth: (Load::Clear(1.0), Store::DontCare),
-        stencil: (Load::Clear(0), Store::DontCare),
-        read_only: false,
-    };
-    let mut encoder = gpu.queue.encoder("depth");
-    {
-        let mut pass = encoder.render_pass(&pass(
-            color(image.view(), clear(BLUE)),
-            Some(attachment),
-            whole(8, 8),
-        ));
-        pass.set_stencil_reference(1);
-        pass.set_pipeline(&mark);
-        pass.set_scissor(Rect {
-            x: 0,
-            y: 0,
-            w: 4,
-            h: 8,
-        });
-        pass.bind(0, Bind::Uniform(uniforms.slice(0..32)));
-        pass.draw(0..3, 0..1);
-        pass.set_scissor(whole(8, 8));
-        pass.set_pipeline(&test);
-        for i in 1..3 {
-            pass.bind(
-                0,
-                Bind::Uniform(uniforms.slice(i * stride..i * stride + 32)),
-            );
+    // A depth attachment larger than the color one serves the color's size.
+    for (width, height) in [(8, 8), (12, 10)] {
+        let depth = gpu.depth(width, height, format);
+        let mut encoder = gpu.queue.encoder("depth");
+        {
+            let mut pass = encoder.render_pass(&pass(
+                color(image.view(), clear(BLUE)),
+                Some(DepthAttachment {
+                    view: depth.view(),
+                    depth: (Load::Clear(1.0), Store::Store),
+                    stencil: (Load::Clear(0), Store::Store),
+                    read_only: false,
+                }),
+                whole(8, 8),
+            ));
+            pass.set_stencil_reference(1);
+            pass.set_pipeline(&mark);
+            pass.set_scissor(Rect {
+                x: 0,
+                y: 0,
+                w: 4,
+                h: 8,
+            });
+            pass.bind(0, Bind::Uniform(uniforms.slice(0..32)));
             pass.draw(0..3, 0..1);
         }
-    }
-    gpu.submit(encoder);
-    let bytes = gpu.read(&image);
-    for y in 0..8 {
-        for x in 0..8 {
-            let expected = if x < 4 { GREEN } else { BLUE };
-            assert_eq!(pixel(&bytes, 8, x, y), rgba8(expected), "({x}, {y})");
+        // A pass that tests depth and stencil without writing them still
+        // binds them (`Store::None`).
+        {
+            let mut pass = encoder.render_pass(&pass(
+                color(image.view(), Load::Load),
+                Some(DepthAttachment {
+                    view: depth.view(),
+                    depth: (Load::Load, Store::None),
+                    stencil: (Load::Load, Store::None),
+                    read_only: false,
+                }),
+                whole(8, 8),
+            ));
+            pass.set_stencil_reference(1);
+            pass.set_pipeline(&test);
+            for i in 1..3 {
+                pass.bind(
+                    0,
+                    Bind::Uniform(uniforms.slice(i * stride..i * stride + 32)),
+                );
+                pass.draw(0..3, 0..1);
+            }
+        }
+        gpu.submit(encoder);
+        let bytes = gpu.read(&image);
+        for y in 0..8 {
+            for x in 0..8 {
+                let expected = if x < 4 { GREEN } else { BLUE };
+                assert_eq!(pixel(&bytes, 8, x, y), rgba8(expected), "({x}, {y})");
+            }
         }
     }
 }
@@ -993,6 +1007,166 @@ fn compute_writes_storage_buffers() {
         let i = (i % 128) as u32;
         assert_eq!(u32::from_le_bytes(word.try_into().unwrap()), i * 3 + 1);
     }
+}
+
+const SHARED: &str = "
+@group(3) @binding(0) var<storage, read_write> values: array<u32>;
+var<workgroup> a: array<u32, 64>;
+var<workgroup> b: array<vec2<u32>, 64>;
+@compute @workgroup_size(64) fn main(@builtin(local_invocation_index) i: u32, @builtin(workgroup_id) g: vec3<u32>) {
+    a[i] = i + g.x * 100u;
+    b[i] = vec2<u32>(i * 2u, 7u);
+    workgroupBarrier();
+    values[g.x * 64u + i] = a[63u - i] + b[(i + 1u) % 64u].x * b[i].y;
+}
+";
+
+/// Workgroup arrays are shared across a workgroup's invocations (Metal sets
+/// threadgroup lengths; Vulkan drops their explicit layouts).
+#[test]
+fn compute_shares_workgroup_memory() {
+    let mut gpu = gpu!();
+    let shader = gpu.shader(SHARED, 6);
+    let pipeline = gpu
+        .device
+        .create_compute_pipeline(
+            &ComputePipelineDesc {
+                entry: shader.entry("main", Stage::Compute).unwrap(),
+                bindings: vec![Binding {
+                    slot: 0,
+                    kind: BindingKind::StorageBuffer { writable: true },
+                    stages: Stages::COMPUTE,
+                }],
+                label: "shared",
+            },
+            None,
+        )
+        .expect("compute pipeline");
+    let values = gpu.buffer(
+        128 * 4,
+        BufferUsage::STORAGE | BufferUsage::COPY_SRC,
+        Memory::Device,
+    );
+    let mut encoder = gpu.queue.encoder("shared");
+    {
+        let mut pass = encoder.compute_pass(&ComputePassDesc {
+            timestamps: None,
+            label: "shared",
+        });
+        pass.set_pipeline(&pipeline);
+        pass.bind(0, Bind::StorageBuffer(values.slice(0..512)));
+        pass.dispatch(2, 1, 1);
+    }
+    gpu.submit(encoder);
+    for (n, word) in gpu.read_buffer(&values, 512).chunks(4).enumerate() {
+        let (g, i) = (n as u32 / 64, n as u32 % 64);
+        let expected = (63 - i + g * 100) + ((i + 1) % 64) * 2 * 7;
+        assert_eq!(
+            u32::from_le_bytes(word.try_into().unwrap()),
+            expected,
+            "invocation {n}"
+        );
+    }
+}
+
+const STORE: &str = "
+@group(3) @binding(0) var image: texture_storage_2d<rgba8unorm, write>;
+@compute @workgroup_size(8, 8) fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    textureStore(image, id.xy, vec4<f32>(vec2<f32>(id.xy) / 255.0, 0.5, 1.0));
+}
+";
+
+/// Compute writes storage images, and the presentable buffers of a storage
+/// pool, which the upscaler's final layer writes (HOST-VIEW-7).
+#[test]
+fn compute_writes_storage_images_and_storage_pools() {
+    let mut gpu = gpu!();
+    let shader = gpu.shader(STORE, 5);
+    let pipeline = gpu
+        .device
+        .create_compute_pipeline(
+            &ComputePipelineDesc {
+                entry: shader.entry("main", Stage::Compute).unwrap(),
+                bindings: vec![Binding {
+                    slot: 0,
+                    kind: BindingKind::StorageImage {
+                        format: Format::Rgba8Unorm,
+                        writable: true,
+                    },
+                    stages: Stages::COMPUTE,
+                }],
+                label: "store",
+            },
+            None,
+        )
+        .expect("compute pipeline");
+    let check = |gpu: &mut Gpu, image: &Image| {
+        let mut encoder = gpu.queue.encoder("store");
+        {
+            let mut pass = encoder.compute_pass(&ComputePassDesc {
+                timestamps: None,
+                label: "store",
+            });
+            pass.set_pipeline(&pipeline);
+            pass.bind(0, Bind::StorageImage(image.view()));
+            pass.dispatch(4, 2, 1);
+        }
+        gpu.submit(encoder);
+        let bgra = image.desc().format == Format::Bgra8Unorm;
+        for (i, texel) in gpu.read(image).chunks(4).enumerate() {
+            let (x, y) = ((i % 32) as u8, (i / 32) as u8);
+            let expected = if bgra {
+                [128, y, x, 255]
+            } else {
+                [x, y, 128, 255]
+            };
+            assert_eq!(
+                texel,
+                expected,
+                "texel {x},{y} of {:?}",
+                image.desc().format
+            );
+        }
+    };
+    let image = gpu
+        .device
+        .create_image(&ImageDesc {
+            dimension: Dimension::D2,
+            size: extent(32, 16),
+            format: Format::Rgba8Unorm,
+            mips: 1,
+            samples: 1,
+            usage: Usage::STORAGE | Usage::COPY_SRC,
+            view_formats: &[],
+            label: "storage image",
+        })
+        .expect("storage image");
+    check(&mut gpu, &image);
+    if !gpu.has(Features::PRESENTABLE_BUFFERS) {
+        return;
+    }
+    let format = [Format::Rgba8Unorm, Format::Bgra8Unorm]
+        .into_iter()
+        .find(|&f| gpu.supports(f, FormatCaps::PRESENTABLE | FormatCaps::STORAGE))
+        .expect("storage presentable format");
+    let mut pool = gpu
+        .device
+        .create_present_pool(&adv_gpu::present::PoolDesc {
+            color: None,
+            width: 32,
+            height: 16,
+            format,
+            count: 1,
+            storage: true,
+            label: "storage pool",
+        })
+        .expect("storage pool");
+    let buffer = pool
+        .acquire(&mut gpu.queue)
+        .expect("acquire")
+        .expect("buffer");
+    assert!(buffer.image().desc().usage.contains(Usage::STORAGE));
+    check(&mut gpu, buffer.image());
 }
 
 fn bytemuck_u32(values: &[u32]) -> &[u8] {
@@ -1190,10 +1364,12 @@ fn present_pools_track_ages_and_releases() {
     let mut pool = gpu
         .device
         .create_present_pool(&adv_gpu::present::PoolDesc {
+            color: None,
             width: 64,
             height: 64,
             format,
             count: 2,
+            storage: false,
             label: "pool",
         })
         .expect("pool");
@@ -1232,4 +1408,578 @@ fn present_pools_track_ages_and_releases() {
     assert_eq!((newest.age(), fresh.age()), (Some(1), None));
     drop((newest, fresh));
     pool.trim(1);
+}
+
+#[cfg(not(target_os = "android"))]
+#[test]
+fn cpu_yuv_pools_write_sample_and_release() {
+    use adv_gpu::{
+        present::{PoolDesc, YuvColor},
+        resource::ViewDesc,
+    };
+    let mut gpu = gpu!();
+    let Some(format) = [Format::Nv12, Format::Nv21]
+        .into_iter()
+        .find(|&f| gpu.supports(f, FormatCaps::PRESENTABLE))
+    else {
+        assert!(
+            !(cfg!(target_vendor = "apple")
+                && std::env::var_os("ADV_GPU_REQUIRE_BACKEND").is_some()),
+            "required device has no presentable YUV format"
+        );
+        return;
+    };
+    let mut pool = gpu
+        .device
+        .create_present_pool(&PoolDesc {
+            width: 18,
+            height: 10,
+            format,
+            color: Some(YuvColor::Bt709Limited),
+            count: 2,
+            storage: false,
+            label: "CPU YUV",
+        })
+        .unwrap();
+    let mut first = pool.acquire_cpu().unwrap();
+    let second = pool.acquire_cpu().unwrap();
+    assert!(pool.acquire_cpu().is_none());
+    let first_id = first.image().id();
+    first.write(|planes| {
+        assert_eq!(planes.len(), 2);
+        for y in 0..10 {
+            for x in 0..18 {
+                planes[0].data[y * planes[0].stride + x] = (x * 9 + y * 3) as u8;
+            }
+        }
+        for y in 0..5 {
+            for x in 0..9 {
+                let at = y * planes[1].stride + x * 2;
+                planes[1].data[at..at + 2]
+                    .copy_from_slice(&[(x * 11 + 23) as u8, (y * 21 + 97) as u8]);
+            }
+        }
+    });
+    assert!(first.acquire_fence().is_none());
+    let views: [_; 2] = std::array::from_fn(|plane| {
+        first
+            .image()
+            .create_view(&ViewDesc {
+                format: Some([Format::R8Unorm, Format::Rg8Unorm][plane]),
+                dimension: None,
+                mips: 0..1,
+                layers: 0..1,
+                plane: plane as u32,
+            })
+            .unwrap()
+    });
+    assert_eq!(views[1].size(), extent(9, 5));
+    let shader = gpu.shader(
+        r#"
+        @group(1) @binding(0) var y: texture_2d<f32>;
+        @group(1) @binding(1) var uv: texture_2d<f32>;
+        @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+            let p = array<vec2<f32>, 3>(vec2(-1., -1.), vec2(3., -1.), vec2(-1., 3.));
+            return vec4(p[i], 0., 1.);
+        }
+        @fragment fn fs(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
+            let xy = vec2<i32>(p.xy);
+            return vec4(textureLoad(y, xy, 0).r, textureLoad(uv, xy / 2, 0).rg, 1.);
+        }
+    "#,
+        0x795556,
+    );
+    let pipeline = gpu.pipeline(&RenderPipelineDesc {
+        vertex: shader.entry("vs", Stage::Vertex).unwrap(),
+        fragment: Some(shader.entry("fs", Stage::Fragment).unwrap()),
+        bindings: (0..2)
+            .map(|slot| Binding {
+                slot,
+                kind: BindingKind::SampledImage {
+                    dimension: Dimension::D2,
+                    depth: false,
+                    multisampled: false,
+                },
+                stages: Stages::FRAGMENT,
+            })
+            .collect(),
+        primitive: primitive(),
+        colors: colors(Format::Rgba8Unorm, None),
+        depth_stencil: None,
+        samples: 1,
+        alpha_to_coverage: false,
+        label: "sample YUV planes",
+    });
+    let target = gpu.target(18, 10, Format::Rgba8Unorm);
+    let mut encoder = gpu.queue.encoder("sample CPU planes");
+    {
+        let mut pass = encoder.render_pass(&pass(
+            color(target.view(), Load::DontCare),
+            None,
+            whole(18, 10),
+        ));
+        pass.set_pipeline(&pipeline);
+        pass.bind(0, Bind::Sampled(&views[0]));
+        pass.bind(1, Bind::Sampled(&views[1]));
+        pass.draw(0..3, 0..1);
+    }
+    gpu.submit(encoder);
+    let pixels = gpu.read(&target);
+    for y in 0..10usize {
+        for x in 0..18usize {
+            assert_eq!(
+                &pixels[(y * 18 + x) * 4..][..4],
+                &[
+                    (x * 9 + y * 3) as u8,
+                    (x / 2 * 11 + 23) as u8,
+                    (y / 2 * 21 + 97) as u8,
+                    255,
+                ]
+            );
+        }
+    }
+    first.released(None);
+    let mut next = pool.acquire_cpu().unwrap();
+    assert_eq!(next.image().id(), first_id);
+    assert_eq!(next.age(), Some(1));
+    next.write(|p| p[0].data[0] = 99);
+    assert!(
+        pool.acquire_cpu().is_none(),
+        "screen-owned lease was reused"
+    );
+    drop(second);
+    let other = pool.acquire_cpu().unwrap();
+    assert_ne!(other.image().id(), first_id);
+}
+
+#[cfg(target_os = "android")]
+#[test]
+fn cpu_yuv_pools_write_sample_and_release() {
+    use adv_gpu::{
+        present::{PoolDesc, YuvColor},
+        resource::ViewDesc,
+    };
+    let mut gpu = gpu!();
+    let Some(format) = [Format::Nv12, Format::Nv21]
+        .into_iter()
+        .find(|&format| gpu.supports(format, FormatCaps::PRESENTABLE))
+    else {
+        assert!(
+            !(cfg!(any(target_vendor = "apple", target_os = "android"))
+                && std::env::var_os("ADV_GPU_REQUIRE_BACKEND").is_some()),
+            "required device has no presentable YUV format"
+        );
+        return;
+    };
+    for color in [YuvColor::Bt601Limited, YuvColor::Bt709Full] {
+        let mut pool = gpu
+            .device
+            .create_present_pool(&PoolDesc {
+                width: 18,
+                height: 10,
+                format,
+                color: Some(color),
+                count: 2,
+                storage: false,
+                label: "CPU YUV",
+            })
+            .unwrap();
+        let mut first = pool.acquire_cpu().unwrap();
+        let second = pool.acquire_cpu().unwrap();
+        assert!(pool.acquire_cpu().is_none());
+        let first_id = first.image().id();
+        assert_eq!(first.color(), Some(color));
+        let shader = gpu.shader(
+            r#"
+            @group(4) @binding(0) var video: texture_2d<f32>;
+            @group(4) @binding(1) var filtering: sampler;
+            @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+                let p = array<vec2<f32>, 3>(vec2(-1., -1.), vec2(3., -1.), vec2(-1., 3.));
+                return vec4(p[i], 0., 1.);
+            }
+            @fragment fn fs(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
+                return textureSampleLevel(video, filtering, p.xy / vec2(18., 10.), 0.);
+            }
+        "#,
+            0x795556,
+        );
+        let desc = RenderPipelineDesc {
+            vertex: shader.entry("vs", Stage::Vertex).unwrap(),
+            fragment: Some(shader.entry("fs", Stage::Fragment).unwrap()),
+            bindings: vec![],
+            primitive: primitive(),
+            colors: colors(Format::Rgba8Unorm, None),
+            depth_stencil: None,
+            samples: 1,
+            alpha_to_coverage: false,
+            label: "sample YUV",
+        };
+        let pipeline = gpu
+            .device
+            .create_video_pipeline(
+                &adv_gpu::pipeline::VideoPipelineDesc {
+                    pipeline: &desc,
+                    pool: &pool,
+                },
+                None,
+            )
+            .unwrap();
+        let target = gpu.target(18, 10, Format::Rgba8Unorm);
+        for [y, u, v] in [
+            [80, 109, 175],
+            [150, 164, 91],
+            [16, 128, 128],
+            [235, 128, 128],
+        ] {
+            first.write(|planes| {
+                assert_eq!(planes.len(), 2);
+                for row in 0..10 {
+                    let at = row * planes[0].stride;
+                    planes[0].data[at..at + 18].fill(y);
+                }
+                for row in 0..5 {
+                    let at = row * planes[1].stride;
+                    for pair in planes[1].data[at..at + 18].as_chunks_mut::<2>().0 {
+                        *pair = if format == Format::Nv21 {
+                            [v, u]
+                        } else {
+                            [u, v]
+                        };
+                    }
+                }
+            });
+            assert!(first.acquire_fence().is_none());
+            assert!(
+                first
+                    .image()
+                    .create_view(&ViewDesc {
+                        format: Some(Format::R8Unorm),
+                        dimension: None,
+                        mips: 0..1,
+                        layers: 0..1,
+                        plane: 0,
+                    })
+                    .is_err(),
+                "external formats have no plane views"
+            );
+            let mut encoder = gpu.queue.encoder("sample CPU YUV");
+            {
+                let mut pass = encoder.render_pass(&pass(
+                    crate::color(target.view(), Load::DontCare),
+                    None,
+                    whole(18, 10),
+                ));
+                pass.set_pipeline(&pipeline);
+                pass.bind_video(&first);
+                pass.draw(0..3, 0..1);
+            }
+            gpu.submit(encoder);
+            let pixels = gpu.read(&target);
+            let expected = yuv_rgb(y, u, v, color);
+            for actual in pixels.as_chunks::<4>().0 {
+                for channel in 0..4 {
+                    assert!(
+                        actual[channel].abs_diff(expected[channel]) <= 2,
+                        "{color:?}: {actual:?} != {expected:?}"
+                    );
+                }
+            }
+        }
+        first.released(None);
+        let mut next = pool.acquire_cpu().unwrap();
+        assert_eq!(next.image().id(), first_id);
+        assert_eq!(next.age(), Some(1));
+        next.write(|p| p[0].data[0] = 99);
+        assert!(
+            pool.acquire_cpu().is_none(),
+            "screen-owned lease was reused"
+        );
+        drop(second);
+        let other = pool.acquire_cpu().unwrap();
+        assert_ne!(other.image().id(), first_id);
+    }
+}
+
+#[cfg(target_os = "android")]
+fn yuv_rgb(y: u8, u: u8, v: u8, color: adv_gpu::present::YuvColor) -> [u8; 4] {
+    use adv_gpu::present::YuvColor::*;
+    let full = matches!(color, Bt601Full | Bt709Full);
+    let (kr, kb) = if matches!(color, Bt709Limited | Bt709Full) {
+        (0.2126, 0.0722)
+    } else {
+        (0.299, 0.114)
+    };
+    let y = if full {
+        f64::from(y) / 255.0
+    } else {
+        (f64::from(y) - 16.0) / 219.0
+    };
+    let scale = if full { 255.0 } else { 224.0 };
+    let (u, v) = (
+        (f64::from(u) - 128.0) / scale,
+        (f64::from(v) - 128.0) / scale,
+    );
+    let (r, b) = (y + 2.0 * (1.0 - kr) * v, y + 2.0 * (1.0 - kb) * u);
+    let g = (y - kr * r - kb * b) / (1.0 - kr - kb);
+    let [r, g, b] = [r, g, b].map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8);
+    [r, g, b, 255]
+}
+
+#[cfg(target_vendor = "apple")]
+#[test]
+fn yuv_pool_color_attachments() {
+    use adv_gpu::present::{Export, PoolDesc, YuvColor};
+    use objc2_core_foundation::CFString;
+    use objc2_io_surface::{IOSurfaceRef, kIOSurfaceColorSpace};
+    #[link(name = "IOSurface", kind = "framework")]
+    unsafe extern "C" {
+        static kIOSurfaceYCbCrMatrix: &'static CFString;
+    }
+    let gpu = gpu!();
+    for color in [
+        YuvColor::Bt601Limited,
+        YuvColor::Bt601Full,
+        YuvColor::Bt709Limited,
+        YuvColor::Bt709Full,
+    ] {
+        let desc = PoolDesc {
+            width: 18,
+            height: 10,
+            format: Format::Nv12,
+            color: Some(color),
+            count: 1,
+            storage: false,
+            label: "YUV color",
+        };
+        assert!(
+            gpu.device
+                .create_present_pool(&PoolDesc {
+                    color: None,
+                    ..desc
+                })
+                .is_err()
+        );
+        assert!(
+            gpu.device
+                .create_present_pool(&PoolDesc {
+                    storage: true,
+                    ..desc
+                })
+                .is_err(),
+            "storage writes are RGB only"
+        );
+        let mut pool = gpu.device.create_present_pool(&desc).unwrap();
+        let image = pool.acquire_cpu().unwrap();
+        let Export::IoSurface(pointer, _) = image.export() else {
+            unreachable!()
+        };
+        let surface = unsafe { pointer.cast::<IOSurfaceRef>().as_ref() };
+        let full = matches!(color, YuvColor::Bt601Full | YuvColor::Bt709Full);
+        assert_eq!(
+            surface.pixel_format(),
+            u32::from_be_bytes(if full { *b"420f" } else { *b"420v" })
+        );
+        let matrix = surface
+            .value(unsafe { kIOSurfaceYCbCrMatrix })
+            .unwrap()
+            .downcast::<CFString>()
+            .unwrap();
+        assert_eq!(
+            matrix.to_string(),
+            if matches!(color, YuvColor::Bt709Limited | YuvColor::Bt709Full) {
+                "ITU_R_709_2"
+            } else {
+                "ITU_R_601_4"
+            }
+        );
+        assert!(surface.value(unsafe { kIOSurfaceColorSpace }).is_some());
+    }
+}
+
+#[test]
+fn vertex_and_fragment_samplers_use_independent_stage_indices() {
+    let mut gpu = gpu!();
+    let image = gpu.target(2, 1, Format::Rgba8Unorm);
+    let target = gpu.target(1, 1, Format::Rgba8Unorm);
+    let source = gpu.upload(&[255, 0, 0, 255, 0, 255, 0, 255], BufferUsage::COPY_SRC);
+    let mut encoder = gpu.queue.encoder("sampler upload");
+    encoder.copy_buffer_to_image(
+        BufferCopy {
+            buffer: &source,
+            offset: 0,
+            row_pitch: 8,
+            rows: 1,
+        },
+        ImageCopy {
+            image: &image,
+            mip: 0,
+            layer: 0,
+            origin: (0, 0, 0),
+        },
+        extent(2, 1),
+    );
+    gpu.submit(encoder);
+    let shader = gpu.shader(
+        r#"
+@group(1) @binding(0) var image:texture_2d<f32>;
+@group(2) @binding(0) var point:sampler;
+@group(2) @binding(16) var linear:sampler;
+struct V { @builtin(position) position:vec4<f32>, @location(0) red:f32 }
+fn vertex(i:u32, red:f32)->V {
+    let p=vec2<f32>(f32((i<<1u)&2u),f32(i&2u));
+    return V(vec4<f32>(p*2.0-1.0,0.0,1.0),red);
+}
+@vertex fn vs(@builtin(vertex_index) i:u32)->V {
+    return vertex(i,textureSampleLevel(image,linear,vec2<f32>(0.375,0.5),0.0).r);
+}
+@vertex fn vs_point(@builtin(vertex_index) i:u32)->V {
+    return vertex(i,textureSampleLevel(image,point,vec2<f32>(0.375,0.5),0.0).r);
+}
+@fragment fn fs(v:V)->@location(0) vec4<f32> {
+    return vec4<f32>(v.red,textureSampleLevel(image,point,vec2<f32>(0.375,0.5),0.0).g,0.0,1.0);
+}
+"#,
+        1001,
+    );
+    let mut desc = RenderPipelineDesc {
+        vertex: shader.entry("vs", Stage::Vertex).unwrap(),
+        fragment: Some(shader.entry("fs", Stage::Fragment).unwrap()),
+        bindings: vec![
+            Binding {
+                slot: 0,
+                kind: BindingKind::SampledImage {
+                    dimension: Dimension::D2,
+                    depth: false,
+                    multisampled: false,
+                },
+                stages: Stages::VERTEX | Stages::FRAGMENT,
+            },
+            Binding {
+                slot: 0,
+                kind: BindingKind::Sampler { comparison: false },
+                stages: Stages::VERTEX | Stages::FRAGMENT,
+            },
+            Binding {
+                slot: 16,
+                kind: BindingKind::Sampler { comparison: false },
+                stages: Stages::VERTEX,
+            },
+        ],
+        primitive: primitive(),
+        colors: colors(Format::Rgba8Unorm, None),
+        depth_stencil: None,
+        samples: 1,
+        alpha_to_coverage: false,
+        label: "per-stage samplers",
+    };
+    let linear_pipeline = gpu.pipeline(&desc);
+    desc.vertex = shader.entry("vs_point", Stage::Vertex).unwrap();
+    let point_pipeline = gpu.pipeline(&desc);
+    let sampler = |filter| {
+        gpu.device
+            .sampler(&SamplerDesc {
+                min: filter,
+                mag: filter,
+                mip: Filter::Nearest,
+                address: [Address::Clamp; 3],
+                border: BorderColor::TransparentBlack,
+                lod_bias: 0,
+                lod_min: 0,
+                lod_max: 0,
+                anisotropy: 1,
+                compare: None,
+            })
+            .unwrap()
+    };
+    let (point, linear) = (sampler(Filter::Nearest), sampler(Filter::Linear));
+    for (pipelines, expected) in [
+        (vec![&linear_pipeline], [191, 0, 0, 255]),
+        (vec![&linear_pipeline, &point_pipeline], [255, 0, 0, 255]),
+        (
+            vec![&linear_pipeline, &point_pipeline, &linear_pipeline],
+            [191, 0, 0, 255],
+        ),
+    ] {
+        let mut encoder = gpu.queue.encoder("per-stage sampler draw");
+        {
+            let mut render = encoder.render_pass(&pass(
+                color(target.view(), Load::DontCare),
+                None,
+                whole(1, 1),
+            ));
+            render.bind(0, Bind::Sampled(image.view()));
+            render.bind(0, Bind::Sampler(&point));
+            render.bind(16, Bind::Sampler(&linear));
+            for pipeline in pipelines {
+                render.set_pipeline(pipeline);
+                render.draw(0..3, 0..1);
+            }
+        }
+        gpu.submit(encoder);
+        assert_eq!(gpu.read(&target), expected);
+    }
+}
+
+#[cfg(target_vendor = "apple")]
+#[test]
+fn metal_rejects_sampler_aliases_within_one_stage_at_pipeline_creation() {
+    let gpu = gpu!();
+    // Precompiled entries use the pipeline's declarations as their used mask.
+    // This checks the pipeline boundary independently of the MSL compiler.
+    let shader = gpu
+        .device
+        .create_shader(ShaderDesc {
+            source: Source::Precompiled {
+                spirv: &[],
+                metal: br#"#include <metal_stdlib>
+using namespace metal;
+vertex float4 vs(uint i [[vertex_id]], sampler s [[sampler(0)]]) {
+    return float4(float(i), 0.0, 0.0, 1.0);
+}
+"#,
+                entries: &[adv_gpu::shader::PrecompiledEntry {
+                    name: "vs",
+                    function: "vs",
+                    workgroup: [1; 3],
+                    threadgroup: &[],
+                }],
+            },
+            identity: 1002,
+            label: "colliding sampler slots",
+        })
+        .unwrap();
+    let desc = RenderPipelineDesc {
+        vertex: shader.entry("vs", Stage::Vertex).unwrap(),
+        fragment: None,
+        bindings: vec![
+            Binding {
+                slot: 0,
+                kind: BindingKind::SampledImage {
+                    dimension: Dimension::D2,
+                    depth: false,
+                    multisampled: false,
+                },
+                stages: Stages::VERTEX,
+            },
+            Binding {
+                slot: 0,
+                kind: BindingKind::Sampler { comparison: false },
+                stages: Stages::VERTEX,
+            },
+            Binding {
+                slot: 16,
+                kind: BindingKind::Sampler { comparison: false },
+                stages: Stages::VERTEX,
+            },
+        ],
+        primitive: primitive(),
+        colors: ArrayVec::new(),
+        depth_stencil: None,
+        samples: 1,
+        alpha_to_coverage: false,
+        label: "colliding sampler slots",
+    };
+    assert!(
+        matches!(gpu.device.create_render_pipeline(&desc, None), Err(Error::Invalid(reason)) if reason.contains("collide modulo 16"))
+    );
 }

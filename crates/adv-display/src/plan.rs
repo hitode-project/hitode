@@ -46,6 +46,8 @@ pub struct VideoGeometry {
     pub rect: Rect,
     /// True when the decoder wrote a new picture since the last present.
     pub changed: bool,
+    pub source_uv: Option<[f32; 4]>,
+    pub background: Option<(Rect, [u8; 4])>,
 }
 
 /// One published frame, as the planner sees it.
@@ -79,9 +81,36 @@ pub enum Rotation {
     ThreeQuarters,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Placement {
+    #[default]
+    Fit,
+    Integer,
+    Stretch,
+}
+impl Placement {
+    pub fn rectangle(self, client: (f64, f64), canvas: (u32, u32)) -> [f64; 4] {
+        let (cw, ch) = client;
+        if self == Self::Stretch {
+            return [0., 0., cw, ch];
+        }
+        let scale = (cw / f64::from(canvas.0)).min(ch / f64::from(canvas.1));
+        let scale = if self == Self::Integer && scale >= 1. {
+            scale.floor()
+        } else {
+            scale
+        };
+        let w = (f64::from(canvas.0) * scale).floor();
+        let h = (f64::from(canvas.1) * scale).floor();
+        [((cw - w) / 2.).floor(), ((ch - h) / 2.).floor(), w, h]
+    }
+}
+
 /// Window and preference state. Changes invalidate pools (whole damage).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Settings {
+    pub placement: Placement,
+    pub scale: f64,
     /// The view in physical pixels, before rotation.
     pub view: (u32, u32),
     /// Panel orientation relative to the view.
@@ -93,11 +122,16 @@ pub struct Settings {
 /// What the system compositor can do for us.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CompositorCaps {
-    /// Layers can scale with nearest or linear filtering.
+    pub fractional_crops: bool,
+    /// Layers can scale with linear filtering.
     pub scales: bool,
+    /// Layers can also magnify with nearest filtering. Without it (Android's
+    /// SurfaceFlinger filters linearly) the output pass does integer scales.
+    pub nearest: bool,
     /// Layers can rotate without composition falling back to the GPU.
     pub rotates: bool,
     /// YUV layers are converted and scaled by the display controller.
+    /// Core Animation and Android SurfaceControl both support these.
     pub yuv_layers: bool,
     pub solid_color_layers: bool,
     pub damage_hints: bool,
@@ -107,33 +141,6 @@ pub struct CompositorCaps {
     pub tile: (u32, u32),
 }
 
-/// Per-device cost model for upscaling tiers: GPU nanoseconds per output
-/// megapixel, from timestamps, with the thermal state they were measured in.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct CostModel {
-    pub ns_per_megapixel: SmallVec<[(Tier, f64); 4]>,
-    pub thermal: Thermal,
-    pub frame_budget_ns: u64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum Thermal {
-    Nominal,
-    Fair,
-    Serious,
-    Critical,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum Tier {
-    /// The selected model.
-    Selected,
-    /// A smaller network of the same family.
-    Small,
-    /// A spatial scaler.
-    Spatial,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PoolId(pub u8);
 
@@ -141,7 +148,7 @@ pub struct PoolId(pub u8);
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PoolBuffer {
     pub age: Option<u32>,
-    /// Still owned by the compositor. A release fence must be ordered before reuse.
+    /// Read by a compositor or by the frame being planned; set by `occupy`.
     pub in_use: bool,
 }
 
@@ -152,20 +159,11 @@ pub struct Pool {
     pub buffers: Vec<PoolBuffer>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Unrefined {
-    /// Canvas coordinates, ordered by the present when last damaged.
-    pub rect: Rect,
-    pub tier: Tier,
-    pub since: u64,
-}
-
 /// The executor keeps this ledger alongside its actual allocations. Invalidate
 /// it when geometry, scaling, the upscaler or the device changes.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PoolState {
     pub pools: Vec<Pool>,
-    pub unrefined: Vec<Unrefined>,
     /// Canvas damage, oldest first; bounded by `HISTORY`.
     pub history: VecDeque<Damage>,
 }
@@ -192,8 +190,6 @@ pub enum Scale {
     Integer { x: u32, y: u32 },
     /// Integer nearest prescale per axis, then linear (sharp-bilinear).
     SharpBilinear { prescale: (u32, u32) },
-    /// The upscaler's final layer resamples the virtual doubled image.
-    Model,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -213,18 +209,11 @@ pub enum Stage {
         into: PoolId,
         tiles: Tiles,
     },
-    /// Fused compute layers into private intermediates, then the final layer as
-    /// a draw into a presentable buffer. Regions carry their tiers.
+    /// Compose the base, and the video when `video`, into the model's private
+    /// input, then recompute the doubled image the damage reaches. `into`
+    /// ledgers the persistent input and output; tiles are canvas pixels.
     Upscale {
-        from: Source,
-        into: PoolId,
-        regions: Vec<(Tiles, Tier)>,
-        scale: Scale,
-        transform: Transform,
-    },
-    /// Background refinement of quiet regions with the selected model.
-    Refine {
-        from: Source,
+        video: bool,
         into: PoolId,
         tiles: Tiles,
     },
@@ -240,6 +229,7 @@ pub enum Stage {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Layer {
+    pub source_uv: Option<[f32; 4]>,
     pub source: Source,
     pub crop: Rect,
     pub dst: Rect,
@@ -257,6 +247,7 @@ pub enum HostLayer {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Layers {
+    pub solids: SmallVec<[(u64, Rect, [f32; 4]); 2]>,
     pub base: Layer,
     pub video: SmallVec<[(u64, Layer); 2]>,
     pub host: SmallVec<[HostLayer; 2]>,
@@ -277,10 +268,8 @@ pub enum SwapRole {
 pub struct Plan {
     pub stages: Vec<Stage>,
     pub targets: Vec<Target>,
-    /// Canvas damage including video changes and completed refinements.
+    /// Canvas damage including video changes.
     pub damage: Damage,
-    /// Committed to the ledger only after the frame is presented.
-    pub unrefined: Vec<Unrefined>,
     pub layers: Layers,
     pub swap_role: SwapRole,
 }
@@ -290,19 +279,12 @@ pub const HISTORY: usize = 32;
 const CANVAS: PoolId = PoolId(0);
 const VIDEO: PoolId = PoolId(1);
 const OUTPUT: PoolId = PoolId(2);
-
-/// Placeholder input-pixel receptive field radii. Package F replaces these
-/// with the kernel generator's exact radii for the shipped models.
-pub const MODEL_RADII: [(Upscaler, u32); 4] = [
-    (Upscaler::Anime4k, 8),
-    (Upscaler::Cunny, 14),
-    (Upscaler::Artcnn, 10),
-    (Upscaler::K7, 8),
-];
+/// The upscaler's private input and doubled output: one persistent buffer.
+pub const UPSCALE: PoolId = PoolId(3);
 
 impl PoolState {
     /// Commit all writes once, after the atomic present succeeds. Intermediate
-    /// targets age too, but only images attached as layers await release.
+    /// targets age too.
     pub fn after_present(&mut self, plan: &Plan) {
         for pool in &mut self.pools {
             for buffer in &mut pool.buffers {
@@ -310,52 +292,46 @@ impl PoolState {
             }
         }
         for target in &plan.targets {
-            let index = self.pools.iter().position(|p| p.id == target.pool);
-            let pool = if let Some(index) = index {
-                &mut self.pools[index]
-            } else {
-                self.pools.push(Pool {
-                    id: target.pool,
-                    size: target.size,
-                    buffers: vec![],
-                });
-                self.pools.last_mut().unwrap()
-            };
-            if pool.size != target.size {
-                pool.size = target.size;
-                for buffer in &mut pool.buffers {
-                    buffer.age = None;
-                }
-            }
-            pool.buffers.resize_with(
-                pool.buffers.len().max(target.buffer + 1),
-                PoolBuffer::default,
-            );
-            let attached = std::iter::once(&plan.layers.base)
-                .chain(plan.layers.video.iter().map(|(_, l)| l))
-                .any(|l| l.source == Source::Pool(target.pool));
-            pool.buffers[target.buffer] = PoolBuffer {
-                age: Some(1),
-                in_use: attached,
-            };
+            self.buffer(target).age = Some(1);
         }
         self.history.push_back(plan.damage.clone());
         if self.history.len() > HISTORY {
             self.history.pop_front();
         }
-        self.unrefined.clone_from(&plan.unrefined);
     }
 
-    /// Call after ordering the returned release fence before future GPU work.
-    pub fn release(&mut self, pool: PoolId, buffer: usize) {
-        if let Some(buffer) = self
-            .pools
-            .iter_mut()
-            .find(|p| p.id == pool)
-            .and_then(|p| p.buffers.get_mut(buffer))
-        {
-            buffer.in_use = false;
+    /// Mark exactly the `leased` buffers in use: those a compositor may read
+    /// or the next frame samples, presented or not.
+    pub fn occupy(&mut self, leased: impl IntoIterator<Item = Target>) {
+        for pool in &mut self.pools {
+            for buffer in &mut pool.buffers {
+                buffer.in_use = false;
+            }
         }
+        for target in leased {
+            self.buffer(&target).in_use = true;
+        }
+    }
+    fn buffer(&mut self, target: &Target) -> &mut PoolBuffer {
+        let pool = if let Some(index) = self.pools.iter().position(|p| p.id == target.pool) {
+            &mut self.pools[index]
+        } else {
+            self.pools.push(Pool {
+                id: target.pool,
+                size: target.size,
+                buffers: vec![],
+            });
+            self.pools.last_mut().unwrap()
+        };
+        if pool.size != target.size {
+            pool.size = target.size;
+            pool.buffers.clear();
+        }
+        pool.buffers.resize_with(
+            pool.buffers.len().max(target.buffer + 1),
+            PoolBuffer::default,
+        );
+        &mut pool.buffers[target.buffer]
     }
 
     /// Size, rotation, scaling, upscaler changes and device loss discard content
@@ -367,7 +343,6 @@ impl PoolState {
             }
         }
         self.history.clear();
-        self.unrefined.clear();
     }
 
     /// The executor trims its free allocations to one. Drop their ledger too;
@@ -382,7 +357,7 @@ impl PoolState {
     }
 
     fn target(&self, id: PoolId, size: (u32, u32)) -> (Target, Option<u32>) {
-        let pool = self.pools.iter().find(|p| p.id == id);
+        let pool = self.pools.iter().find(|p| p.id == id && p.size == size);
         let buffer = pool
             .and_then(|p| {
                 p.buffers
@@ -446,7 +421,7 @@ impl Damage {
         }
     }
 
-    fn union(&self, other: &Self) -> Self {
+    pub(crate) fn union(&self, other: &Self) -> Self {
         match (self, other) {
             (Self::Whole, _) | (_, Self::Whole) => Self::Whole,
             (Self::None, d) | (d, Self::None) => d.clone(),
@@ -504,49 +479,6 @@ fn merge(rects: Vec<Rect>) -> Vec<Rect> {
     out
 }
 
-/// Remove a changed/refined rectangle, retaining untouched pieces and their age.
-fn subtract(regions: &mut Vec<Unrefined>, cut: Rect) {
-    *regions = regions
-        .drain(..)
-        .flat_map(|region| {
-            let r = region.rect;
-            let Some(i) = intersection(r, cut) else {
-                return vec![region];
-            };
-            [
-                Rect {
-                    x: r.x,
-                    y: r.y,
-                    w: r.w,
-                    h: i.y - r.y,
-                },
-                Rect {
-                    x: r.x,
-                    y: end_y(i),
-                    w: r.w,
-                    h: end_y(r) - end_y(i),
-                },
-                Rect {
-                    x: r.x,
-                    y: i.y,
-                    w: i.x - r.x,
-                    h: i.h,
-                },
-                Rect {
-                    x: end_x(i),
-                    y: i.y,
-                    w: end_x(r) - end_x(i),
-                    h: i.h,
-                },
-            ]
-            .into_iter()
-            .filter(|r| r.w > 0 && r.h > 0)
-            .map(|rect| Unrefined { rect, ..region })
-            .collect()
-        })
-        .collect();
-}
-
 fn swapped(size: (u32, u32), rotation: Rotation) -> (u32, u32) {
     if matches!(rotation, Rotation::Quarter | Rotation::ThreeQuarters) {
         (size.1, size.0)
@@ -576,24 +508,13 @@ fn rotate(r: Rect, size: (u32, u32), rotation: Rotation) -> Rect {
         },
     }
 }
-fn viewport(canvas: (u32, u32), view: (u32, u32)) -> Rect {
-    let (w, h) =
-        if u64::from(view.0) * u64::from(canvas.1) <= u64::from(view.1) * u64::from(canvas.0) {
-            (
-                view.0,
-                (u64::from(view.0) * u64::from(canvas.1) / u64::from(canvas.0)) as u32,
-            )
-        } else {
-            (
-                (u64::from(view.1) * u64::from(canvas.0) / u64::from(canvas.1)) as u32,
-                view.1,
-            )
-        };
+fn viewport(canvas: (u32, u32), view: (u32, u32), placement: Placement) -> Rect {
+    let [x, y, w, h] = placement.rectangle((view.0 as f64, view.1 as f64), canvas);
     Rect {
-        x: (view.0 - w) / 2,
-        y: (view.1 - h) / 2,
-        w,
-        h,
+        x: x as u32,
+        y: y as u32,
+        w: w as u32,
+        h: h as u32,
     }
 }
 fn map(r: Rect, from: (u32, u32), to: (u32, u32)) -> Rect {
@@ -666,33 +587,6 @@ fn tiles(
         rects: merge(rects),
     }
 }
-fn pixels(tiles: &Tiles) -> f64 {
-    tiles
-        .rects
-        .iter()
-        .map(|r| f64::from(r.w) * f64::from(r.h))
-        .sum()
-}
-fn predicted(cost: &CostModel, tier: Tier, tiles: &Tiles) -> f64 {
-    cost.ns_per_megapixel
-        .iter()
-        .find(|(t, _)| *t == tier)
-        .map_or(
-            if tier == Tier::Spatial {
-                0.0
-            } else {
-                f64::INFINITY
-            },
-            |(_, ns)| ns * pixels(tiles) / 1_000_000.0,
-        )
-}
-fn allowed(tier: Tier, thermal: Thermal) -> bool {
-    match thermal {
-        Thermal::Critical => tier == Tier::Spatial,
-        Thermal::Serious => tier != Tier::Selected,
-        Thermal::Nominal | Thermal::Fair => true,
-    }
-}
 /// Decide how to show a frame. `canvas` dimensions must be nonzero. Destinations
 /// are in panel pixels; crops and layer damage are in source-image coordinates.
 /// The caller acquires the named targets before executing any stage.
@@ -700,12 +594,11 @@ pub fn plan(
     frame: &FrameInfo,
     settings: &Settings,
     caps: &CompositorCaps,
-    cost: &CostModel,
     pools: &PoolState,
 ) -> Plan {
     let canvas = frame.canvas;
     let panel = swapped(settings.view, settings.rotation);
-    let viewport = viewport(canvas, panel);
+    let viewport = viewport(canvas, panel, settings.placement);
     let viewport_size = (viewport.w, viewport.h);
     let dst = rotate(viewport, panel, settings.rotation);
     let integer = viewport.w >= canvas.0
@@ -722,7 +615,7 @@ pub fn plan(
     let output_needed = !upscale
         && ((!integer && prescale != (1, 1))
             || (!caps.rotates && settings.rotation != Rotation::None)
-            || (!caps.scales && viewport_size != canvas));
+            || ((!caps.scales || (integer && !caps.nearest)) && viewport_size != canvas));
     // This decision deliberately excludes frame damage, videos and pool state.
     let swap_role = if caps.presentable_compressed || (!upscale && !output_needed) {
         SwapRole::Presentable { canvas }
@@ -730,7 +623,18 @@ pub fn plan(
         SwapRole::Private
     };
     let separate_video = !upscale
+        && (caps.rotates || settings.rotation == Rotation::None)
         && caps.yuv_layers
+        && (caps.fractional_crops
+            || frame.video.iter().all(|v| {
+                v.source_uv.is_none_or(|uv| {
+                    uv.iter().enumerate().all(|(i, n)| {
+                        let value = *n * if i % 2 == 0 { v.source.0 } else { v.source.1 } as f32;
+                        value == value.round()
+                    })
+                })
+            }))
+        && (caps.solid_color_layers || frame.video.iter().all(|v| v.background.is_none()))
         && frame.video.iter().all(|v| {
             frame
                 .cursor_regions
@@ -749,10 +653,11 @@ pub fn plan(
         stages: vec![],
         targets: vec![],
         damage: damage.clone(),
-        unrefined: vec![],
         swap_role,
         layers: Layers {
+            solids: SmallVec::new(),
             base: Layer {
+                source_uv: None,
                 source: Source::Base,
                 crop: whole(canvas),
                 dst,
@@ -767,12 +672,28 @@ pub fn plan(
     };
     if separate_video {
         for video in &frame.video {
+            if let Some((r, c)) = video.background {
+                let mut r = map(r, canvas, viewport_size);
+                r.x += viewport.x;
+                r.y += viewport.y;
+                result.layers.solids.push((
+                    video.id,
+                    rotate(r, panel, settings.rotation),
+                    [
+                        c[2] as f32 / 255.,
+                        c[1] as f32 / 255.,
+                        c[0] as f32 / 255.,
+                        1.,
+                    ],
+                ));
+            }
             let mut video_dst = map(video.rect, canvas, viewport_size);
             video_dst.x += viewport.x;
             video_dst.y += viewport.y;
             result.layers.video.push((
                 video.id,
                 Layer {
+                    source_uv: video.source_uv,
                     source: Source::Video(video.id),
                     crop: whole(video.source),
                     dst: rotate(video_dst, panel, settings.rotation),
@@ -788,7 +709,7 @@ pub fn plan(
         }
     }
     let mut source = Source::Base;
-    if compose_video {
+    if compose_video && !upscale {
         let (target, age) = pools.target(VIDEO, canvas);
         let work = pools.damage(&damage, age);
         result.stages.push(Stage::Video {
@@ -800,146 +721,18 @@ pub fn plan(
         source = Source::Pool(VIDEO);
     }
     if upscale {
-        let output = if caps.scales && viewport.w >= canvas.0 * 2 && viewport.h >= canvas.1 * 2 {
-            (canvas.0 * 2, canvas.1 * 2)
-        } else {
-            viewport_size
-        };
-        let (target, age) = pools.target(OUTPUT, swapped(output, settings.rotation));
+        let (target, age) = pools.target(UPSCALE, canvas);
         let work = pools.damage(&damage, age);
-        let reach = MODEL_RADII
-            .iter()
-            .find(|(m, _)| *m == settings.upscaler)
-            .unwrap()
-            .1;
-        let mut budget = cost.frame_budget_ns as f64;
-        let mut regions = vec![];
-        // Merge after dilation/alignment as well, so no target pixel gets two
-        // conflicting tier decisions. Back-map these regions to the canvas.
-        let affected = tiles(&work, canvas, output, settings.rotation, reach, size);
-        let mut unrefined = pools.unrefined.clone();
-        for output_rect in affected.rects {
-            let tile = Tiles {
-                size,
-                rects: vec![output_rect],
-            };
-            let inverse = match settings.rotation {
-                Rotation::Quarter => Rotation::ThreeQuarters,
-                Rotation::ThreeQuarters => Rotation::Quarter,
-                r => r,
-            };
-            let rect = map(rotate(output_rect, target.size, inverse), output, canvas);
-            let tier = [Tier::Selected, Tier::Small, Tier::Spatial]
-                .into_iter()
-                .find(|&tier| allowed(tier, cost.thermal) && predicted(cost, tier, &tile) <= budget)
-                // Spatial is the real-time floor, even when no tier fits.
-                .unwrap_or(Tier::Spatial);
-            budget = (budget - predicted(cost, tier, &tile)).max(0.0);
-            let since = if damage
-                .list(canvas)
-                .iter()
-                .any(|&d| intersection(d, rect).is_some())
-            {
-                frame.serial
-            } else {
-                pools
-                    .unrefined
-                    .iter()
-                    .filter(|r| intersection(r.rect, rect).is_some())
-                    .map(|r| r.since)
-                    .min()
-                    .unwrap_or(frame.serial)
-            };
-            subtract(&mut unrefined, rect);
-            if tier != Tier::Selected {
-                unrefined.push(Unrefined { rect, tier, since });
-            }
-            regions.push((tile, tier));
-        }
         result.stages.push(Stage::Upscale {
-            from: source,
-            into: OUTPUT,
-            regions,
-            transform: Transform {
-                rotation: settings.rotation,
-                dst: whole(target.size),
-            },
-            scale: Scale::Model,
+            video: compose_video,
+            into: UPSCALE,
+            tiles: tiles(&work, canvas, canvas, Rotation::None, 0, size),
         });
-        // Only previously quiet work is eligible. Split it into bounded chunks,
-        // so a large region can converge over several small frame budgets.
-        let mut quiet = unrefined.clone();
-        for rect in damage.list(canvas) {
-            subtract(&mut quiet, rect);
-        }
-        quiet.sort_by_key(|r| r.since);
-        let mut refined = vec![];
-        if allowed(Tier::Selected, cost.thermal) {
-            for region in quiet {
-                for y in (region.rect.y..end_y(region.rect)).step_by(size.1 as usize) {
-                    for x in (region.rect.x..end_x(region.rect)).step_by(size.0 as usize) {
-                        let rect = Rect {
-                            x,
-                            y,
-                            w: size.0.min(end_x(region.rect) - x),
-                            h: size.1.min(end_y(region.rect) - y),
-                        };
-                        let tile = tiles(
-                            &Damage::rects([rect]),
-                            canvas,
-                            output,
-                            settings.rotation,
-                            reach,
-                            size,
-                        );
-                        let ns = predicted(cost, Tier::Selected, &tile);
-                        if ns <= budget {
-                            budget -= ns;
-                            refined.extend(tile.rects);
-                            subtract(&mut unrefined, rect);
-                            result.damage = result.damage.union(&Damage::rects([rect]));
-                        }
-                    }
-                }
-            }
-        }
-        if !refined.is_empty() {
-            result.stages.push(Stage::Refine {
-                from: source,
-                into: OUTPUT,
-                tiles: Tiles {
-                    size,
-                    rects: merge(refined),
-                },
-            });
-        }
-        unrefined.sort_by_key(|r| (r.since, r.rect.y, r.rect.x));
-        result.unrefined = unrefined;
-        let written = result
-            .stages
-            .iter()
-            .filter_map(|stage| match stage {
-                Stage::Upscale { regions, .. } => Some(
-                    regions
-                        .iter()
-                        .flat_map(|(t, _)| t.rects.clone())
-                        .collect::<Vec<_>>(),
-                ),
-                Stage::Refine { tiles, .. } => Some(tiles.rects.clone()),
-                _ => None,
-            })
-            .flatten()
-            .collect::<Vec<_>>();
-        result.layers.base = Layer {
-            source: Source::Pool(OUTPUT),
-            crop: whole(target.size),
-            dst,
-            rotation: Rotation::None,
-            nearest: false,
-            damage: Damage::rects(written),
-        };
         result.targets.push(target);
-    } else if output_needed
+        source = Source::Pool(UPSCALE);
+    }
+    if upscale
+        || output_needed
         || (source == Source::Base && matches!(frame.base, BaseKind::Gpu { presentable: false }))
     {
         let rotation = if caps.rotates {
@@ -947,7 +740,16 @@ pub fn plan(
         } else {
             settings.rotation
         };
-        let output = if !caps.scales {
+        // The layer magnifies the upscaler's doubled image when the viewport
+        // holds it; otherwise this pass resamples it to the viewport.
+        let doubled = (canvas.0 * 2, canvas.1 * 2);
+        let output = if upscale {
+            if caps.scales && viewport.w >= doubled.0 && viewport.h >= doubled.1 {
+                doubled
+            } else {
+                viewport_size
+            }
+        } else if !caps.scales || (integer && !caps.nearest) {
             viewport_size
         } else if integer {
             canvas
@@ -959,7 +761,13 @@ pub fn plan(
         // What this pass does. With compositor scaling it only prescales by
         // the integer part (1 when it exists for rotation alone) and the layer
         // does the rest; without it the pass covers the whole viewport.
-        let scale = if caps.scales {
+        let scale = if upscale {
+            if output == doubled {
+                Scale::Integer { x: 1, y: 1 }
+            } else {
+                Scale::SharpBilinear { prescale: (1, 1) }
+            }
+        } else if caps.scales {
             Scale::Integer {
                 x: output.0 / canvas.0,
                 y: output.1 / canvas.1,
@@ -972,7 +780,11 @@ pub fn plan(
         } else {
             Scale::SharpBilinear { prescale }
         };
-        let reach = u32::from(!caps.scales && !integer);
+        let reach = if upscale {
+            crate::stages::upscale::reach(settings.upscaler) + u32::from(output != doubled)
+        } else {
+            u32::from(!caps.scales && !integer)
+        };
         let tile = tiles(&work, canvas, output, rotation, reach, size);
         result.layers.base.damage = Damage::rects(tile.rects.clone());
         result.stages.push(Stage::Output {
@@ -992,7 +804,7 @@ pub fn plan(
         } else {
             Rotation::None
         };
-        result.layers.base.nearest = integer;
+        result.layers.base.nearest = integer && !upscale;
         result.targets.push(target);
     } else if source != Source::Base {
         result.layers.base.source = source;

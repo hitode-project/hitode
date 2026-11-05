@@ -33,6 +33,8 @@ mod queue;
 mod resource;
 mod ring;
 mod shader;
+mod video;
+pub(crate) use video::VideoPool;
 
 #[derive(Clone)]
 pub(crate) struct Device(pub(crate) Arc<Context>);
@@ -46,6 +48,8 @@ pub(crate) struct Context {
     family: u32,
     caps: Caps,
     memory: vk::PhysicalDeviceMemoryProperties,
+    /// `nonCoherentAtomSize`, the granularity of flushes and invalidations.
+    atom: u64,
     allocator: Mutex<Option<Allocator>>,
     lost: AtomicBool,
     /// The token the next submission takes, and the encoders still open:
@@ -75,6 +79,8 @@ pub(crate) struct Context {
     semaphore_fd: ash::khr::external_semaphore_fd::Device,
     #[cfg(target_os = "android")]
     vendor: u32,
+    #[cfg(target_os = "android")]
+    video_format: Option<video::VideoFormat>,
 }
 
 /// A GPU object whose last handle dropped. Encoders hold no references:
@@ -100,6 +106,9 @@ pub(super) enum Retired {
         handle: vk::Sampler,
         index: Option<u32>,
     },
+    Video(video::Resources),
+    #[cfg(target_os = "android")]
+    VideoDescriptors(vk::DescriptorPool),
     Query(vk::QueryPool),
     #[cfg(target_os = "android")]
     Semaphore(vk::Semaphore),
@@ -263,6 +272,9 @@ impl Context {
                     }
                     self.device.destroy_sampler(handle, None);
                 }
+                Retired::Video(resources) => resources.destroy(&self.device),
+                #[cfg(target_os = "android")]
+                Retired::VideoDescriptors(pool) => self.device.destroy_descriptor_pool(pool, None),
                 Retired::Query(handle) => self.device.destroy_query_pool(handle, None),
                 #[cfg(target_os = "android")]
                 Retired::Semaphore(handle) => self.device.destroy_semaphore(handle, None),
@@ -277,15 +289,22 @@ impl Context {
         lazy: bool,
         name: &str,
     ) -> Result<Allocation> {
-        let flags = match memory {
-            Memory::Device => vk::MemoryPropertyFlags::DEVICE_LOCAL,
-            Memory::Upload => {
-                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT
-            }
-            Memory::Readback => {
-                vk::MemoryPropertyFlags::HOST_VISIBLE
-                    | vk::MemoryPropertyFlags::HOST_COHERENT
-                    | vk::MemoryPropertyFlags::HOST_CACHED
+        // Upload memory is never flushed, so it must be coherent. Memory the
+        // CPU reads wants a cached type, flushed or invalidated where it is
+        // not coherent; the first preference outranks the second. The type
+        // bits decide alone: the allocator's host locations demand coherence.
+        let visible = vk::MemoryPropertyFlags::HOST_VISIBLE;
+        let coherent = vk::MemoryPropertyFlags::HOST_COHERENT;
+        let cached = vk::MemoryPropertyFlags::HOST_CACHED;
+        let (required, preferred, location) = match memory {
+            Memory::Device => (
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                [vk::MemoryPropertyFlags::DEVICE_LOCAL; 2],
+                MemoryLocation::GpuOnly,
+            ),
+            Memory::Upload => (visible | coherent, [cached; 2], MemoryLocation::Unknown),
+            Memory::Shared | Memory::Readback => {
+                (visible, [cached, coherent], MemoryLocation::Unknown)
             }
         };
         let mask = |flags| {
@@ -301,26 +320,26 @@ impl Context {
                     }
                 })
         };
-        requirements.memory_type_bits &= mask(flags);
-        if memory == Memory::Upload {
-            let cached =
-                requirements.memory_type_bits & mask(flags | vk::MemoryPropertyFlags::HOST_CACHED);
-            if cached != 0 {
-                requirements.memory_type_bits = cached;
+        requirements.memory_type_bits &= mask(required);
+        // Flushed and invalidated ranges round out to atoms, so host
+        // allocations start and end on atoms: rounding never reaches a
+        // neighbor's bytes or past its block.
+        if memory != Memory::Device {
+            requirements.size = requirements.size.next_multiple_of(self.atom);
+            requirements.alignment = requirements.alignment.max(self.atom);
+        }
+        let mut prefer = |flags| {
+            let types = requirements.memory_type_bits & mask(flags);
+            if types != 0 {
+                requirements.memory_type_bits = types;
             }
+        };
+        for flags in preferred {
+            prefer(flags);
         }
         if lazy {
-            let lazy_types =
-                requirements.memory_type_bits & mask(vk::MemoryPropertyFlags::LAZILY_ALLOCATED);
-            if lazy_types != 0 {
-                requirements.memory_type_bits = lazy_types;
-            }
+            prefer(vk::MemoryPropertyFlags::LAZILY_ALLOCATED);
         }
-        let location = if memory == Memory::Device {
-            MemoryLocation::GpuOnly
-        } else {
-            MemoryLocation::CpuToGpu
-        };
         self.allocator
             .lock()
             .unwrap()
@@ -417,6 +436,9 @@ impl Fence {
 pub(crate) enum Fence {}
 #[cfg(not(target_os = "android"))]
 impl Fence {
+    pub(crate) fn wait_cpu(self) {
+        match self {}
+    }
     pub(crate) fn duplicate(&self) -> Result<Self> {
         match *self {}
     }
@@ -430,6 +452,9 @@ pub(crate) struct PresentBuffer;
 #[cfg(not(target_os = "android"))]
 impl PresentBuffer {
     pub(crate) fn new(_device: &Device, _desc: &PoolDesc) -> Result<(crate::Image, Self)> {
+        unreachable!("no presentable Vulkan formats on this target")
+    }
+    pub(crate) fn write(&self, _f: impl FnOnce(&mut [PlaneMut<'_>])) {
         unreachable!("no presentable Vulkan formats on this target")
     }
     pub(crate) fn export(&self) -> Export<'_> {

@@ -59,6 +59,22 @@ impl Device {
     ) -> Result<RenderPipeline> {
         self.inner.create_render_pipeline(desc, cache)
     }
+    /// Compile once for a pool's immutable video sampler, off the frame path.
+    pub fn create_video_pipeline(
+        &self,
+        desc: &crate::pipeline::VideoPipelineDesc<'_>,
+        cache: Option<&PipelineCache>,
+    ) -> Result<RenderPipeline> {
+        #[cfg(target_os = "android")]
+        {
+            self.inner.create_video_pipeline(desc, cache)
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            let _ = (desc, cache);
+            Err(crate::Error::Unsupported("converted video pools".into()))
+        }
+    }
     /// Identity of the driver object `desc` needs on this backend (see
     /// [`crate::pipeline`]). Equal identities share one compilation.
     pub fn pipeline_identity(&self, desc: &RenderPipelineDesc) -> u64 {
@@ -126,6 +142,27 @@ impl Queue {
     pub fn on_complete(&mut self, token: Token, callback: Box<dyn FnOnce() + Send>) {
         self.inner.on_complete(token, callback)
     }
+    /// Completion callbacks on the main thread, for compositors whose commits
+    /// belong there (Core Animation).
+    #[cfg(target_vendor = "apple")]
+    pub fn main_notifier(&self) -> MainNotifier {
+        MainNotifier {
+            inner: self.inner.main_notifier(),
+        }
+    }
+}
+
+/// Runs completion callbacks on the main thread; any thread may register.
+#[cfg(target_vendor = "apple")]
+pub struct MainNotifier {
+    inner: imp::MainNotifier,
+}
+#[cfg(target_vendor = "apple")]
+impl MainNotifier {
+    /// Run `callback` on the main thread once `token` completes.
+    pub fn on_complete(&self, token: Token, callback: Box<dyn FnOnce() + Send>) {
+        self.inner.on_complete(token, callback)
+    }
 }
 
 /// A system compositor fence: a sync file descriptor on Android. Other
@@ -146,7 +183,7 @@ impl Fence {
             inner: imp::Fence(fd),
         }
     }
-    pub(crate) fn duplicate(&self) -> Result<Self> {
+    pub fn duplicate(&self) -> Result<Self> {
         Ok(Self {
             inner: self.inner.duplicate()?,
         })

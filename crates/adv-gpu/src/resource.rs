@@ -8,7 +8,9 @@
 //! - Render targets do not request `STORAGE` unless a compute pass really
 //!   writes them; on some drivers it disables lossless compression.
 
-use crate::{Extent, Format, Result};
+#[cfg(feature = "backend")]
+use crate::Result;
+use crate::{Extent, Format};
 
 bitflags::bitflags! {
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -55,11 +57,13 @@ pub struct ImageDesc {
 /// A GPU-private image, compressed where the hardware allows. Clone shares the
 /// allocation. Content is undefined until written; the first pass that covers
 /// it may use `Load::DontCare`.
+#[cfg(feature = "backend")]
 #[derive(Clone)]
 pub struct Image {
     pub(crate) inner: crate::imp::Image,
 }
 
+#[cfg(feature = "backend")]
 impl Image {
     pub fn desc(&self) -> &ImageDesc {
         self.inner.desc()
@@ -85,15 +89,18 @@ pub struct ViewDesc {
     pub dimension: Option<Dimension>,
     pub mips: std::ops::Range<u32>,
     pub layers: std::ops::Range<u32>,
-    /// For two-plane formats, the plane this view samples.
+    /// For NV12 presentable buffers, 0 samples Y as `R8Unorm` and 1
+    /// samples UV as `Rg8Unorm`, with ceil-divided width and height.
     pub plane: u32,
 }
 
+#[cfg(feature = "backend")]
 #[derive(Clone)]
 pub struct ImageView {
     pub(crate) inner: crate::imp::ImageView,
 }
 
+#[cfg(feature = "backend")]
 impl ImageView {
     pub fn image(&self) -> &Image {
         self.inner.image()
@@ -121,11 +128,17 @@ bitflags::bitflags! {
 pub enum Memory {
     /// GPU-only.
     Device,
-    /// Mapped for CPU writes and read by the GPU in place: software surface
-    /// slots, dynamic guest buffers. Cached where the platform keeps it
-    /// coherent; write-combined otherwise.
+    /// Mapped for CPU writes that the GPU reads in place: rings, dynamic
+    /// guest buffers. Coherent, and host-cached where a type is both, on
+    /// Vulkan; shared on Metal.
     Upload,
-    /// Mapped for CPU reads after GPU writes: readbacks.
+    /// Mapped for CPU writes that the CPU also reads back and the GPU reads:
+    /// software surface slots, whose damage comparison reads the previous
+    /// frame. Host-cached, and coherent where a type is both; writers call
+    /// [`Buffer::flush`].
+    Shared,
+    /// Mapped for CPU reads after GPU writes: readbacks. Host-cached, and
+    /// coherent where a type is both.
     Readback,
 }
 
@@ -137,11 +150,13 @@ pub struct BufferDesc {
     pub label: &'static str,
 }
 
+#[cfg(feature = "backend")]
 #[derive(Clone)]
 pub struct Buffer {
     pub(crate) inner: crate::imp::Buffer,
 }
 
+#[cfg(feature = "backend")]
 impl Buffer {
     pub fn desc(&self) -> &BufferDesc {
         self.inner.desc()
@@ -150,14 +165,23 @@ impl Buffer {
     /// buffer. The caller orders CPU access against GPU use through tokens:
     /// write only ranges no unfinished submission reads, read only after the
     /// writing submission completes.
+    ///
+    /// On a `Readback` buffer the call also makes completed GPU writes
+    /// visible to the CPU, so take the mapping after the completion.
     pub fn mapped(&self) -> Option<std::ptr::NonNull<[u8]>> {
         self.inner.mapped()
+    }
+    /// Make CPU writes to `ranges` of a `Shared` buffer visible to the GPU,
+    /// before the submission that reads them. Free on coherent memory.
+    pub fn flush(&self, ranges: impl IntoIterator<Item = std::ops::Range<u64>>) {
+        self.inner.flush(ranges)
     }
     pub fn slice(&self, range: std::ops::Range<u64>) -> BufferSlice<'_> {
         self.inner.slice(range)
     }
 }
 
+#[cfg(feature = "backend")]
 #[derive(Clone, Copy)]
 pub struct BufferSlice<'a> {
     pub buffer: &'a Buffer,
@@ -206,6 +230,7 @@ pub struct SamplerDesc {
 }
 
 /// Samplers are interned by description; equal descriptions share one object.
+#[cfg(feature = "backend")]
 #[derive(Clone)]
 pub struct Sampler {
     #[allow(dead_code)] // read by the backends

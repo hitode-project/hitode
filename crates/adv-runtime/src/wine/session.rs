@@ -1136,6 +1136,11 @@ impl Session {
                 .map_err(|e| e.to_string())?;
             #[cfg(feature = "gpu")]
             adv_dx::d3d9::fork_host_state(&self.machine.ext, &mut machine.ext)?;
+            // Captures read the foreground machine's frames through the host GPU.
+            #[cfg(feature = "gpu")]
+            if let Some(waker) = self.machine.ext.try_get::<adv_device::frame::Waker>() {
+                machine.ext.insert(waker.clone());
+            }
             // Until foreground handoff, a child queues frames for the session's
             // consumer; Snapshot cannot present native GPU frames directly.
             machine
@@ -1322,16 +1327,32 @@ impl Session {
     /// native one back from the GPU.
     pub fn capture(&mut self) -> Result<(), String> {
         #[cfg(feature = "gpu")]
-        if let Some(composition) = self
-            .machine
-            .ext
-            .get::<SurfaceStore>()
-            .latest_frame()
-            .filter(|frame| frame.native().is_some())
-            .cloned()
         {
-            return self.capture_native(composition);
+            if self.presented_frames() == 0 {
+                return Ok(());
+            }
+            let receiver = self.machine.ext.get::<adv_device::frame::Waker>().capture();
+            let frame = receiver
+                .recv_timeout(Duration::from_secs(10))
+                .map_err(|e| format!("capture: {e}"))??;
+            let surfaces = self.machine.ext.get_mut::<SurfaceStore>();
+            adv_device::surface::Presenter::present(
+                &mut surfaces.presenter,
+                adv_device::surface::FrameView {
+                    width: frame.width,
+                    height: frame.height,
+                    pitch: frame.width * 4,
+                    bgra: &frame.bgra,
+                    serial: frame.serial,
+                },
+            )?;
+            Ok(())
         }
+        #[cfg(not(feature = "gpu"))]
+        self.capture_surface()
+    }
+    #[cfg(not(feature = "gpu"))]
+    fn capture_surface(&mut self) -> Result<(), String> {
         let memory = crate::graphics::guest_memory(&mut self.machine.cpu);
         self.machine
             .ext
@@ -1340,39 +1361,8 @@ impl Session {
             .map(|_| ())
     }
 
-    #[cfg(feature = "gpu")]
-    fn capture_native(
-        &mut self,
-        composition: adv_device::surface::PendingFrame,
-    ) -> Result<(), String> {
-        let image = composition.native().unwrap().image.clone();
-        let mut readback = adv_dx::d3d9::readback_image(&mut self.machine.ext, &image)
-            .map_err(|e| e.to_string())?;
-        if let Some(job) = readback.take_completion_job() {
-            job();
-        }
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let bgra = loop {
-            if let Some(pixels) = readback.poll() {
-                break pixels.map_err(|e| e.to_string())?;
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err("frame readback timed out".into());
-            }
-            self.wake
-                .wait(Some(remaining.min(Duration::from_millis(1))))
-                .map_err(|e| e.to_string())?;
-        };
-        self.machine
-            .ext
-            .get_mut::<SurfaceStore>()
-            .capture_native_frame_pixels(&composition, &bgra)
-            .map(|_| ())
-    }
-
-    /// Attach `gpu`, whose context already signals `wake`: our Direct3D 9
-    /// renders on it, and its readbacks signal `wake` too. Call from the
+    /// Attach `gpu` to Direct3D 9 and route readback completions to `wake`.
+    /// Call from the
     /// `prepare` of [`Session::start`].
     #[cfg(feature = "gpu")]
     pub fn attach_gpu(

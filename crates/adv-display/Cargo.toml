@@ -7,12 +7,41 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[build-dependencies]
+adv-gpu = { path = "../adv-gpu", default-features = false, features = ["precompile"] }
+
 [dependencies]
 adv-gpu = { path = "../adv-gpu" }
 arrayvec = { version = "0.7", features = ["serde"] }
 smallvec = { version = "1", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+objc2 = "0.6.4"
+block2 = "0.6.2"
+dispatch2 = { version = "0.3.1", default-features = false, features = ["std", "objc2"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSString"] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFCGTypes", "CFRunLoop"] }
+objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std", "CGColor"] }
+objc2-io-surface = { version = "0.3.2", default-features = false, features = ["std", "IOSurfaceRef", "objc2-core-foundation"] }
+objc2-quartz-core = { version = "0.3.2", default-features = false, features = ["std", "objc2-core-foundation", "objc2-core-graphics", "CALayer", "CATransaction", "block2"] }
+
+[[test]]
+name = "core_animation"
+harness = false
+
+[target.'cfg(target_os = "android")'.dependencies]
+ndk-sys = "0.6"
+libc = "0.2"
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
+
+[[example]]
+name = "display-probe"
+path = "../../tools/android/display-probe/probe.rs"
+crate-type = ["cdylib"]
 
 [lints]
 workspace = true

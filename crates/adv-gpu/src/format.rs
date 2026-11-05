@@ -40,6 +40,8 @@ pub enum Format {
     // Two-plane YUV 4:2:0 for video planes: plane 0 is R8, plane 1 is Rg8
     // (`P010`: R16 and Rg16). Only presentable or sampled; never rendered.
     Nv12,
+    /// Y, then interleaved Cr and Cb, 4:2:0. Presentable YUV pools only.
+    Nv21,
     P010,
 }
 
@@ -61,7 +63,7 @@ impl Format {
     }
     pub fn planes(self) -> u32 {
         match self {
-            Self::Nv12 | Self::P010 => 2,
+            Self::Nv12 | Self::Nv21 | Self::P010 => 2,
             _ => 1,
         }
     }

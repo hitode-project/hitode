@@ -248,21 +248,11 @@ fn d3d9_provider() -> adv_dx::d3d9::SurfaceProvider {
                 .replace_native(id, target)
                 .map(|_| ())
         },
-        present: |ext, id, damage, gpu| {
-            ext.get_mut::<Surfaces<Snapshot>>()
-                .present_native_rotating(id, damage, gpu)
-        },
-        present_copy: |ext, id, damage, gpu| {
-            use adv_device::gpu::Error;
-            let graphics = ext.get_mut::<Surfaces<Snapshot>>();
-            let target = graphics
-                .native_target(id)
-                .ok_or_else(|| Error::Invalid("COPY front surface no longer exists".into()))?;
-            let frame = gpu.present(&target.image, 0)?;
-            graphics
-                .publish_native_frame(id, frame, damage)
-                .map_err(Error::Invalid)
-        },
+
+        present: native_present,
+
+        present_copy: native_present,
+
         repeat: |ext, id| ext.get_mut::<Surfaces<Snapshot>>().repeat_native_frame(id),
         presentation_serial: |ext| ext.get::<Surfaces<Snapshot>>().output_serial(),
         vsync: |ext| {
@@ -270,6 +260,32 @@ fn d3d9_provider() -> adv_dx::d3d9::SurfaceProvider {
                 .and_then(|vsync| vsync.phase(std::time::Instant::now()))
         },
     }
+}
+
+#[cfg(feature = "gpu")]
+fn native_present(
+    ext: &mut adv_machine::Ext,
+    id: u32,
+    damage: Option<adv_device::surface::Rect>,
+    gpu: &mut adv_device::gpu::Gpu,
+) -> Result<u64, adv_device::gpu::Error> {
+    use adv_device::frame::Damage;
+    let damage = damage.map_or(Damage::Whole, |r| {
+        let mut damage = Damage::Rects(Default::default());
+        if let Damage::Rects(rects) = &mut damage {
+            rects.push(Default::default());
+            rects[0].x = r.x;
+            rects[0].y = r.y;
+            rects[0].w = r.w;
+            rects[0].h = r.h;
+        }
+        damage
+    });
+    let surfaces = ext.get_mut::<Surfaces<Snapshot>>();
+    surfaces
+        .present_native(id, damage, gpu)
+        .map_err(adv_device::gpu::Error::Invalid)?;
+    Ok(surfaces.stats.presentations)
 }
 
 /// Memory DCs lent to the fronts' surfaces.

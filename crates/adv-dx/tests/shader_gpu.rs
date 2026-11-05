@@ -7,7 +7,6 @@ use adv_dx::shader::{
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-include!("fixtures/metal_compare.rs");
 
 fn reg(kind: u32, index: u32) -> u32 {
     0x80000000 | ((kind & 7) << 28) | ((kind & 24) << 8) | index
@@ -31,9 +30,9 @@ fn shader(major: u32, minor: u32, body: Vec<u32>) -> Shader {
 }
 fn full_source(shader: &Shader, input: &Inputs) -> String {
     let mut source = String::from(
-        "diagnostic(off, derivative_uniformity);\nstruct ShaderInputs {v:array<vec4<f32>,16>,t:array<vec4<f32>,8>,position:vec4<f32>,front_face:bool};\nstruct ShaderOutputs {position:vec4<f32>,colors:array<vec4<f32>,2>,texcoords:array<vec4<f32>,8>,depth:f32,point_size:f32,fog:f32,generic:array<vec4<f32>,12>};\nstruct ShaderConstants {f:array<vec4<f32>,256>,i:array<vec4<i32>,16>,b:array<vec4<i32>,16>,bump_matrix:array<vec4<f32>,8>,bump_luminance:array<vec4<f32>,8>};\n@group(0) @binding(0) var<uniform> vs_constants:ShaderConstants; @group(0) @binding(1) var<uniform> ps_constants:ShaderConstants;\n",
+        "diagnostic(off, derivative_uniformity);\nstruct ShaderInputs {v:array<vec4<f32>,16>,t:array<vec4<f32>,8>,position:vec4<f32>,front_face:bool};\nstruct ShaderOutputs {position:vec4<f32>,colors:array<vec4<f32>,2>,texcoords:array<vec4<f32>,8>,depth:f32,point_size:f32,fog:f32,generic:array<vec4<f32>,12>};\nstruct ShaderConstants {f:array<vec4<f32>,256>,i:array<vec4<i32>,16>,b:array<vec4<i32>,16>,bump_matrix:array<vec4<f32>,8>,bump_luminance:array<vec4<f32>,8>};\nstruct DrawParameters {values:array<vec4<u32>,40>};\n@group(0) @binding(0) var<uniform> vs_constants:ShaderConstants; @group(0) @binding(1) var<uniform> ps_constants:ShaderConstants;\n",
     );
-    source.push_str(&shader.translate().unwrap().source);
+    source.push_str(&shader.translate(false).unwrap().source);
     source.push_str("@vertex fn vertex_main(@builtin(vertex_index) index:u32)->@builtin(position) vec4<f32> { let xy=array<vec2<f32>,3>(vec2<f32>(-1.0,-1.0),vec2<f32>(3.0,-1.0),vec2<f32>(-1.0,3.0));return vec4<f32>(xy[index],0.5,1.0);}\n@fragment fn fragment_main()->@location(0) vec4<f32> {var input:ShaderInputs;input.front_face=true;\n");
     for (register, v) in input.v.iter().enumerate() {
         source.push_str(&format!(
@@ -88,8 +87,6 @@ fn compare_gpu(gpu: &mut Gpu, name: &str, shader: Shader, input: &Inputs, consta
         assert!(Instant::now() < deadline, "readback timed out: {name}");
         std::thread::sleep(Duration::from_millis(1));
     };
-    #[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
-    emit_metal_pixels(&pixels);
     let expected = expected.colors[0].map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as i32);
     for (index, pixel) in pixels.as_chunks::<4>().0.iter().enumerate() {
         for channel in 0..4 {
@@ -109,15 +106,13 @@ fn gpu_matches_reference_masks_modifiers_flow_and_specials() {
     let backend = std::env::var("ADV_TEST_GPU_BACKEND").unwrap_or_default();
     let (fallback, backend) = match backend.as_str() {
         "vulkan" => (false, GpuBackend::Vulkan),
-        "gles" => (false, GpuBackend::Gl),
-        "dx12" => (false, GpuBackend::Direct3D12),
         "metal" => (false, GpuBackend::Metal),
         _ => (
             !cfg!(any(target_os = "macos", target_os = "android")),
             GpuBackend::Automatic,
         ),
     };
-    let mut gpu = pollster::block_on(Gpu::request_backend(fallback, backend))
+    let mut gpu = adv_device::gpu::test_support::request_backend(fallback, backend)
         .expect("differential GPU adapter");
     let mut constants = Constants::default();
     constants.f[0] = [0.2, 0.35, 0.65, 0.8];
@@ -295,9 +290,167 @@ fn gpu_matches_reference_masks_modifiers_flow_and_specials() {
     assert_eq!(Stage::Pixel, shader(3, 0, Vec::new()).stage);
 }
 
-// spec: GFX-METAL-1
-#[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
+fn check_bits(gpu: &mut Gpu, source: String, constants: ConstantBlock) {
+    Shader::validate_wgsl(&source).unwrap();
+    let target = gpu.target(1, 1, false).unwrap();
+    let draw = ProgrammableDraw {
+        instance_count: 1,
+        program: Program::new(source.into(), vec![]),
+        streams: vec![],
+        indices: None,
+        vertex_count: 3,
+        vertex_constants: ConstantBlock::default().into(),
+        pixel_constants: constants.into(),
+        textures: vec![],
+        parameters: [[0; 4]; 40],
+    };
+    gpu.draw_programmable(&target, &draw, &DrawState::new(1, 1))
+        .unwrap();
+    let mut readback = gpu.readback(&target.image, None).unwrap();
+    if let Some(job) = readback.take_completion_job() {
+        job();
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        gpu.poll().unwrap();
+        if let Some(pixels) = readback.poll() {
+            assert_eq!(pixels.unwrap(), [255; 4]);
+            break;
+        }
+        assert!(Instant::now() < deadline, "readback timed out");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 #[test]
-fn shader_fixtures_match_native_metal_and_wgpu_exactly() {
-    compare_metal_fixture("gpu_matches_reference_masks_modifiers_flow_and_specials");
+// spec: GFX-NUM-1
+fn native_ieee_arithmetic_matches_emulation_on_device() {
+    let mut gpu = Gpu::request(!cfg!(any(target_vendor = "apple", target_os = "android"))).unwrap();
+    if !gpu.device().caps().ieee_f32 {
+        return;
+    }
+    for op in [Opcode::Mul, Opcode::Mad, Opcode::Dp3, Opcode::Slt] {
+        let mut args = vec![dst(8, 0), src(2, 0), src(2, 1)];
+        if op == Opcode::Mad {
+            args.push(src(2, 2));
+        }
+        let shader = shader(3, 0, ins(op, &args));
+        let emulated = shader.translate(false).unwrap().source;
+        let native = shader.translate(true).unwrap().source;
+        assert!(!native.contains("_mul"));
+        assert!(!native.contains("_cmp_scalar"));
+        assert!(!native.contains("_compare"));
+        let mut source = full_source(&shader, &Inputs::default()).replace(
+            &emulated,
+            &(emulated
+                .replace("ps_", "emulated_")
+                .replace("emulated_constants", "ps_constants")
+                + &native),
+        );
+        source = source.replace(
+            "return ps_run(input).colors[0];",
+            r#"
+let a=bitcast<vec4<u32>>(ps_run(input).colors[0]);
+let b=bitcast<vec4<u32>>(emulated_run(input).colors[0]);
+let nan_a=(a&vec4<u32>(0x7fffffffu))>vec4<u32>(0x7f800000u);
+let nan_b=(b&vec4<u32>(0x7fffffffu))>vec4<u32>(0x7f800000u);
+return vec4<f32>(select(0.0,1.0,all((a==b)|(nan_a&nan_b))));"#,
+        );
+        for (a, b, c) in [
+            (
+                [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.0],
+                [1.0; 4],
+                [-0.0; 4],
+            ),
+            (
+                [f32::INFINITY, f32::NEG_INFINITY, 0.0, -0.0],
+                [0.0, -0.0, f32::INFINITY, f32::NEG_INFINITY],
+                [0.0; 4],
+            ),
+            ([-0.0; 4], [1.0; 4], [-0.0; 4]),
+            ([0.25, -2.0, 4.0, -0.0], [2.0, 0.5, -0.25, -1.0], [0.125; 4]),
+        ] {
+            let mut constants = ConstantBlock::default();
+            constants.floats[..3].copy_from_slice(&[a, b, c]);
+            check_bits(&mut gpu, source.clone(), constants);
+        }
+    }
+}
+
+#[test]
+// spec: GFX-SHADER-3, GFX-REC-7, GFX-NUM-1
+fn constants_read_in_place_match_reference_on_device() {
+    let mut gpu = Gpu::request(!cfg!(any(target_vendor = "apple", target_os = "android"))).unwrap();
+    let ieee_f32 = gpu.device().caps().ieee_f32;
+    let mut definitions = ins(
+        Opcode::Def,
+        &[
+            dst(2, 1),
+            0.25f32.to_bits(),
+            (-0.0f32).to_bits(),
+            2.0f32.to_bits(),
+            (-3.0f32).to_bits(),
+        ],
+    );
+    definitions.extend(ins(Opcode::Defi, &[dst(7, 1), 2, (-3i32) as u32, 4, 5]));
+    definitions.extend(ins(Opcode::Defb, &[dst(14, 1), 1]));
+    let mut constants = Constants::default();
+    constants.f[0] = [6.0; 4];
+    constants.f[1] = [9.0; 4];
+    constants.f[2] = [0.5, -0.0, -0.5, 1.0];
+    constants.i[1] = [9; 4];
+    constants.i[2] = [-4, 3, 2, 1];
+    constants.b[1] = [0; 4];
+    constants.b[2] = [-7; 4];
+    let mut bodies = Vec::new();
+    for kind in [2, 7, 14] {
+        for index in [1, 2] {
+            let mut body = definitions.clone();
+            body.extend(ins(Opcode::Mov, &[dst(8, 0), src(kind, index)]));
+            bodies.push((body, constants.clone()));
+        }
+    }
+    // PS3 relative constants use the loop register. Include both register bounds.
+    for index in [-2, 0, 1, 222, 223, 255] {
+        let mut body = definitions.clone();
+        body.extend(ins(Opcode::Loop, &[src(15, 0), src(7, 0)]));
+        body.extend(ins(
+            Opcode::Mov,
+            &[dst(8, 0), src(2, 1) | 0x2000, reg(15, 0)],
+        ));
+        body.extend(ins(Opcode::EndLoop, &[]));
+        let mut values = constants.clone();
+        values.i[0] = [1, index, 1, 0];
+        values.f[223] = [0.75; 4];
+        values.f[224] = [7.0; 4];
+        values.f[255] = [8.0; 4];
+        bodies.push((body, values));
+    }
+    for (body, constants) in bodies {
+        let shader = shader(3, 0, body);
+        let expected = interpreter::run(&shader, &Inputs::default(), &constants, &mut NoTextures)
+            .unwrap()
+            .colors[0]
+            .map(f32::to_bits);
+        let emulated = shader.translate(false).unwrap().source;
+        let native = shader.translate(ieee_f32).unwrap().source;
+        assert!(!native.contains("var c="));
+        assert!(!native.contains("var ci="));
+        assert!(!native.contains("var cb="));
+        let source = full_source(&shader,&Inputs::default()).replace(&emulated,&native).replace(
+            "return ps_run(input).colors[0];",
+            &format!("return vec4<f32>(select(0.0,1.0,all(bitcast<vec4<u32>>(ps_run(input).colors[0])==vec4<u32>({}u,{}u,{}u,{}u))));",expected[0],expected[1],expected[2],expected[3]),
+        );
+        check_bits(
+            &mut gpu,
+            source,
+            ConstantBlock {
+                floats: constants.f,
+                integers: constants.i,
+                booleans: constants.b,
+                bump_matrix: constants.bump_matrix,
+                bump_luminance: constants.bump_luminance,
+            },
+        );
+    }
 }

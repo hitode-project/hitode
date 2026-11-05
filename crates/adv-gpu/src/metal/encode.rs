@@ -87,7 +87,7 @@ impl Encoder {
             let attachment = unsafe { d.colorAttachments().objectAtIndexedSubscript(i) };
             size.width = size.width.min(color.view.size().width);
             size.height = size.height.min(color.view.size().height);
-            if color.load == Load::None || color.store == Store::None {
+            if !attached(color.load, color.store) {
                 continue;
             }
             attachment.setTexture(Some(&color.view.inner.raw));
@@ -144,7 +144,7 @@ impl Encoder {
             size.height = size.height.min(depth.view.size().height);
             let bounded = partial(desc.area, depth.view.size())
                 && view.raw.storageMode() != MTLStorageMode::Memoryless;
-            if depth.depth.0 != Load::None && depth.depth.1 != Store::None {
+            if attached(depth.depth.0, depth.depth.1) {
                 let attachment = d.depthAttachment();
                 attachment.setTexture(Some(&view.raw));
                 attachment.setLoadAction(load(depth.depth.0, bounded));
@@ -154,8 +154,7 @@ impl Encoder {
                 }
             }
             if view.raw.pixelFormat() == MTLPixelFormat::Depth32Float_Stencil8
-                && depth.stencil.0 != Load::None
-                && depth.stencil.1 != Store::None
+                && attached(depth.stencil.0, depth.stencil.1)
             {
                 let attachment = d.stencilAttachment();
                 attachment.setTexture(Some(&view.raw));
@@ -493,6 +492,11 @@ pub(super) fn intersect(a: Rect, b: Rect) -> Rect {
         h: (a.y.saturating_add(a.h).min(b.y.saturating_add(b.h))).saturating_sub(y),
     }
 }
+/// Whether the pass binds the attachment: Metal leaves out one the pass
+/// neither reads nor keeps. A read-only one (`Load` with `Store::None`) stays.
+pub(super) fn attached<T>(load: Load<T>, store: Store) -> bool {
+    matches!(load, Load::Load) || !matches!(load, Load::None) && store != Store::None
+}
 pub(super) fn partial(area: Rect, size: Extent) -> bool {
     area.x != 0 || area.y != 0 || area.w < size.width || area.h < size.height
 }
@@ -741,6 +745,12 @@ impl ComputePass<'_> {
         {
             self.raw.setComputePipelineState(&p.raw);
         }
+        for (index, &length) in p.threadgroup.iter().enumerate() {
+            unsafe {
+                self.raw
+                    .setThreadgroupMemoryLength_atIndex(length as usize, index)
+            };
+        }
         self.bindings.sizes_dirty |= p.sizes.is_some();
         self.pipeline = Some(p.clone());
     }
@@ -788,13 +798,14 @@ fn same<T: objc2::Message + ?Sized>(a: &Retained<T>, b: &Retained<T>) -> bool {
 }
 
 /// What a pass has bound at each native index (fixed per slot, see
-/// [`shader::native`]), and which of it each stage has yet to receive. `bind`
+/// [`shader::index`]), and which of it each stage has yet to receive. `bind`
 /// only records; draws send each stage the changed indices it reads, so
 /// slots persist across pipelines and may be bound before one is set.
 struct Bindings {
     buffers: [Option<BufferBinding>; 31],
     textures: [Option<Object<dyn MTLTexture>>; 128],
-    samplers: [Option<Object<dyn MTLSamplerState>>; 16],
+    samplers: [Option<Object<dyn MTLSamplerState>>; 32],
+    sampler_slots: [u32; 2],
     /// Per stage: indices whose resource changed since the stage last drew.
     dirty: [Used; 2],
     /// Per stage: buffer indices whose object (not just offset) changed.
@@ -878,6 +889,7 @@ impl Bindings {
             buffers: std::array::from_fn(|_| None),
             textures: std::array::from_fn(|_| None),
             samplers: std::array::from_fn(|_| None),
+            sampler_slots: [0; 2],
             dirty: [Used::default(); 2],
             moved: [0; 2],
             sizes_dirty: false,
@@ -888,11 +900,12 @@ impl Bindings {
         let index;
         match resource {
             Bind::Uniform(b) | Bind::StorageBuffer(b) => {
-                index = if matches!(resource, Bind::Uniform(_)) {
-                    slot
+                let group = if matches!(resource, Bind::Uniform(_)) {
+                    0
                 } else {
-                    shader::SIZES as u32 - 1 - slot
+                    3
                 };
+                index = shader::index(group, slot, true).1;
                 let raw = &b.buffer.inner.0.raw;
                 match &mut self.buffers[index as usize] {
                     Some(old) if same(&old.raw, raw) => {
@@ -917,11 +930,12 @@ impl Bindings {
                 self.dirty[1].buffers |= 1 << index;
             }
             Bind::Sampled(image) | Bind::StorageImage(image) => {
-                index = if matches!(resource, Bind::Sampled(_)) {
-                    slot
+                let group = if matches!(resource, Bind::Sampled(_)) {
+                    1
                 } else {
-                    95 - slot
+                    3
                 };
+                index = shader::index(group, slot, false).1;
                 let entry = &mut self.textures[index as usize];
                 if entry
                     .as_ref()
@@ -934,7 +948,7 @@ impl Bindings {
                 self.dirty[1].textures |= 1 << index;
             }
             Bind::Sampler(sampler) => {
-                index = slot;
+                index = shader::index(2, slot, false).1;
                 let entry = &mut self.samplers[index as usize];
                 if entry
                     .as_ref()
@@ -952,6 +966,9 @@ impl Bindings {
     /// `sizes` is given and differs from the last one sent.
     fn flush(&mut self, stage: usize, used: Used, sizes: Option<&[Option<u8>]>, to: &impl Target) {
         let dirty = &mut self.dirty[stage];
+        // A pipeline can change which logical slot owns a physical sampler index.
+        dirty.samplers |= used.samplers & !self.sampler_slots[stage];
+        self.sampler_slots[stage] = used.samplers;
         let mut buffers = dirty.buffers & used.buffers;
         let mut textures = dirty.textures & used.textures;
         let mut samplers = dirty.samplers & used.samplers;
@@ -978,7 +995,10 @@ impl Bindings {
         while samplers != 0 {
             let i = samplers.trailing_zeros() as usize;
             samplers &= samplers - 1;
-            to.sampler(self.samplers[i].as_ref().unwrap(), i);
+            to.sampler(
+                self.samplers[i].as_ref().unwrap(),
+                crate::shader::compile::sampler_index(i as u32) as usize,
+            );
         }
         if let Some(slots) = sizes {
             let values: ArrayVec<u32, { shader::SIZES }> = slots

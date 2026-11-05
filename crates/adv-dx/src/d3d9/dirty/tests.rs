@@ -34,13 +34,8 @@ fn machine(gpu: bool) -> (Machine<JitCpu>, u32) {
     m.spawn("fixture", 0x400000, &[], 65536).unwrap();
     m.ext.insert(Surfaces::default());
     if gpu {
-        m.ext.get_mut::<State>().gpu = Some(
-            pollster::block_on(Gpu::request(!cfg!(any(
-                target_os = "macos",
-                target_os = "android"
-            ))))
-            .unwrap(),
-        );
+        m.ext.get_mut::<State>().gpu =
+            Some(Gpu::request(!cfg!(any(target_os = "macos", target_os = "android"))).unwrap());
     }
     let state = m.ext.get_mut::<State>();
     state.tables.insert("IDirect3DTexture9", 0);
@@ -408,15 +403,10 @@ fn busy_upload_preserves_new_marks_and_cancellation_releases_only_the_reservatio
     let storage = resources::resource(&env(&mut m), texture).unwrap().storage;
     m.cpu.write(storage, &[0x66; 64]).unwrap();
     super::super::tests::force_recording_limit(&mut env(&mut m), device);
-    let pause = m
-        .ext
-        .get::<State>()
-        .gpu
-        .as_ref()
-        .unwrap()
-        .context()
-        .pause_submissions()
-        .unwrap();
+    let pause = adv_device::gpu::test_support::pause_submissions(
+        m.ext.get::<State>().gpu.as_ref().unwrap(),
+    )
+    .unwrap();
     let Outcome::Block { then, .. } = add_rect(&mut m, texture, 0) else {
         panic!("paused GPU must wait");
     };
@@ -438,15 +428,10 @@ fn busy_upload_preserves_new_marks_and_cancellation_releases_only_the_reservatio
     assert!(m.ext.get::<State>().pending.is_empty());
     let objects = m.sys.objects.object_count();
     super::super::tests::force_recording_limit(&mut env(&mut m), device);
-    let pause = m
-        .ext
-        .get::<State>()
-        .gpu
-        .as_ref()
-        .unwrap()
-        .context()
-        .pause_submissions()
-        .unwrap();
+    let pause = adv_device::gpu::test_support::pause_submissions(
+        m.ext.get::<State>().gpu.as_ref().unwrap(),
+    )
+    .unwrap();
     let outcome = add_rect(&mut m, texture, 0);
     assert!(matches!(outcome, Outcome::Block { .. }));
     super::super::cancel_pending(&mut m);

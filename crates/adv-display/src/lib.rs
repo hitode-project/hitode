@@ -1,14 +1,17 @@
-//! Pure presentation planning, pool bookkeeping and compositor ownership.
+//! Presentation planning, stage encoding, pool bookkeeping and compositor ownership.
 //!
 //! [`plan::plan`] consumes serializable geometry, damage, capabilities and pool
 //! state. Executors run its stages and call [`plan::PoolState::after_present`]
-//! only after submitting the complete frame. No GPU work runs in this crate.
-//! [`compositor`] transfers presentable images to the system compositor and
-//! returns ownership on release. [`recorder`] stores and replays planner data.
+//! only after submitting the complete frame. [`stages`] records GPU commands;
+//! the owner thread submits them.
+//! [`compositor`] attaches presentable images to the system compositor and
+//! reports their release; the executor owns them throughout. [`recorder`] stores and replays planner data.
 
 pub mod compositor;
+pub mod display;
 pub mod plan;
 pub mod recorder;
+pub mod stages;
 
 /// A rectangle in physical pixels or texels, with its origin at the top left.
 /// Display owns this serializable geometry; GPU rectangles remain GPU data.
@@ -46,3 +49,7 @@ impl From<adv_gpu::Rect> for Rect {
 
 #[cfg(test)]
 mod tests;
+// Native presentable buffers are supplied by IOSurface or AHardwareBuffer.
+// The Vulkan desktop backend exposes private images only.
+#[cfg(all(test, any(target_vendor = "apple", target_os = "android")))]
+mod display_tests;

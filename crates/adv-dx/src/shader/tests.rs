@@ -48,7 +48,7 @@ fn validation_wrapper(shader: &Shader, translation: &Translation) -> String {
     text
 }
 fn validate(s: &Shader) {
-    let tr = s.translate().unwrap();
+    let tr = s.translate(false).unwrap();
     let text = validation_wrapper(s, &tr);
     if let Err(e) = Shader::validate_wgsl(&text) {
         panic!("{e}\n{text}");
@@ -72,7 +72,7 @@ fn usage_includes_matrix_rows_int_bool_and_excludes_all_local_definitions() {
         body.extend(instruction(Opcode::EndRep, &[]));
     }
     let usage = shader(Stage::Vertex, 2, 0, &body)
-        .translate()
+        .translate(false)
         .unwrap()
         .constants;
     assert!(!usage.relative);
@@ -95,7 +95,7 @@ fn usage_includes_matrix_rows_int_bool_and_excludes_all_local_definitions() {
             0,
             &instruction(op, &[dst(4, 0), src(2, 63), src(2, 127)]),
         );
-        let used = s.translate().unwrap().constants;
+        let used = s.translate(false).unwrap().constants;
         assert_eq!(
             used.ranges()
                 .flat_map(|r| r.start / 16..r.end / 16)
@@ -122,7 +122,7 @@ fn relative_usage_covers_all_floats_but_keeps_local_definitions_private() {
         src(2, 3) | 0x2000,
     ];
     let s = shader(Stage::Vertex, 1, 1, &body);
-    let usage = s.translate().unwrap().constants;
+    let usage = s.translate(false).unwrap().constants;
     assert!(usage.relative);
     let registers = usage
         .ranges()
@@ -140,7 +140,7 @@ fn relative_usage_covers_all_floats_but_keeps_local_definitions_private() {
 fn legacy_bump_usage_covers_only_the_implicit_stage_parameters() {
     for op in [Opcode::Texbem, Opcode::Texbeml] {
         let s = shader(Stage::Pixel, 1, 1, &[op as u32, dst(3, 1), src(3, 0)]);
-        let usage = s.translate().unwrap().constants;
+        let usage = s.translate(false).unwrap().constants;
         let expected = if op == Opcode::Texbem {
             vec![289]
         } else {
@@ -161,7 +161,7 @@ fn legacy_bump_usage_covers_only_the_implicit_stage_parameters() {
         &[Opcode::Bem as u32, dst(0, 1), src(0, 0), src(0, 2)],
     );
     assert_eq!(
-        s.translate()
+        s.translate(false)
             .unwrap()
             .constants
             .ranges()
@@ -315,7 +315,7 @@ fn texture_metadata_and_sampling() {
     ));
     let s = shader(Stage::Pixel, 3, 0, &body);
     validate(&s);
-    let tr = s.translate().unwrap();
+    let tr = s.translate(false).unwrap();
     assert_eq!(
         tr.samplers,
         vec![SamplerBinding {

@@ -216,7 +216,13 @@ struct Video {
     decoder: ff::decoder::Video,
     stream: usize,
     time_base: Rational,
+    #[cfg(not(feature = "gpu"))]
     scaler: software::scaling::Context,
+    /// Built at the first decoded frame, whose format the header may omit.
+    #[cfg(feature = "gpu")]
+    output: Option<super::planes::Output>,
+    #[cfg(feature = "gpu")]
+    device: adv_gpu::Device,
     frame_duration_us: u64,
 }
 
@@ -230,6 +236,8 @@ pub(super) struct Native {
     next: VecDeque<(u64, frame::Video)>,
     /// The front of `next`, already converted by `prefetch`.
     converted: Option<VideoFrame>,
+    #[cfg(feature = "gpu")]
+    free_video: Vec<frame::Video>,
     /// A decode error `prefetch` hit; the request that needs that frame reports it.
     deferred: Option<Error>,
     audio_out: Vec<AudioFrame>,
@@ -265,7 +273,12 @@ fn micros(pts: i64, tb: Rational) -> i64 {
     .clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
 }
 
-fn convert(video: &mut Video, pts_us: u64, decoded: &frame::Video) -> Result<VideoFrame, Error> {
+#[cfg(not(feature = "gpu"))]
+fn convert(
+    video: &mut Video,
+    pts_us: u64,
+    decoded: &mut frame::Video,
+) -> Result<VideoFrame, Error> {
     let mut bgra = frame::Video::empty();
     video.scaler.run(decoded, &mut bgra)?;
     let (width, height) = (bgra.width(), bgra.height());
@@ -282,6 +295,18 @@ fn convert(video: &mut Video, pts_us: u64, decoded: &frame::Video) -> Result<Vid
     })
 }
 
+#[cfg(feature = "gpu")]
+fn convert(
+    video: &mut Video,
+    pts_us: u64,
+    decoded: &mut frame::Video,
+) -> Result<VideoFrame, Error> {
+    if video.output.is_none() {
+        video.output = Some(super::planes::Output::new(&video.device, &video.decoder)?);
+    }
+    video.output.as_mut().unwrap().convert(pts_us, decoded)
+}
+
 fn open_video(stream: &format::stream::Stream<'_>) -> Result<Video, Error> {
     let (index, time_base, rate) = (stream.index(), stream.time_base(), stream.avg_frame_rate());
     let mut context = codec::Context::from_parameters(stream.parameters())?;
@@ -296,6 +321,7 @@ fn open_video(stream: &format::stream::Stream<'_>) -> Result<Video, Error> {
             "invalid or excessive video dimensions".into(),
         ));
     }
+    #[cfg(not(feature = "gpu"))]
     let scaler = software::scaling::Context::get(
         decoder.format(),
         w,
@@ -305,6 +331,11 @@ fn open_video(stream: &format::stream::Stream<'_>) -> Result<Video, Error> {
         h,
         software::scaling::Flags::BILINEAR,
     )?;
+    #[cfg(feature = "gpu")]
+    let device = crate::gpu::Gpu::execution(false)
+        .map_err(|e| Error::Decode(e.to_string()))?
+        .device()
+        .clone();
     let frame_duration_us = if rate.numerator() > 0 {
         (1_000_000 * rate.denominator() as u64 / rate.numerator() as u64).max(1)
     } else {
@@ -314,7 +345,12 @@ fn open_video(stream: &format::stream::Stream<'_>) -> Result<Video, Error> {
         decoder,
         stream: index,
         time_base,
+        #[cfg(not(feature = "gpu"))]
         scaler,
+        #[cfg(feature = "gpu")]
+        output: None,
+        #[cfg(feature = "gpu")]
+        device,
         frame_duration_us,
     })
 }
@@ -415,8 +451,19 @@ impl Native {
             audio,
             video_packets: VecDeque::new(),
             video_packet_bytes: 0,
-            next: VecDeque::new(),
+            next: {
+                #[cfg(feature = "gpu")]
+                {
+                    VecDeque::with_capacity(AHEAD + 1)
+                }
+                #[cfg(not(feature = "gpu"))]
+                {
+                    VecDeque::new()
+                }
+            },
             converted: None,
+            #[cfg(feature = "gpu")]
+            free_video: (0..AHEAD + 1).map(|_| frame::Video::empty()).collect(),
             deferred: None,
             audio_out: Vec::new(),
             origin_us,
@@ -510,10 +557,24 @@ impl Native {
     }
 
     fn next_video(&mut self) -> Result<Option<(u64, frame::Video)>, Error> {
+        #[cfg(feature = "gpu")]
+        let mut decoded = self.free_video.pop().expect("decoder frame pool exhausted");
+        #[cfg(not(feature = "gpu"))]
+        let mut decoded = frame::Video::empty();
+        match self.receive_video(&mut decoded) {
+            Ok(Some(pts)) => Ok(Some((pts, decoded))),
+            result => {
+                #[cfg(feature = "gpu")]
+                self.free_video.push(decoded);
+                result.map(|_| None)
+            }
+        }
+    }
+
+    fn receive_video(&mut self, decoded: &mut frame::Video) -> Result<Option<u64>, Error> {
         loop {
             let video = self.video.as_mut().expect("video stream");
-            let mut decoded = frame::Video::empty();
-            match video.decoder.receive_frame(&mut decoded) {
+            match video.decoder.receive_frame(decoded) {
                 Ok(()) => {
                     self.stats.video_frames += 1;
                     let pts = decoded
@@ -525,7 +586,7 @@ impl Native {
                         })
                         .unwrap_or(self.last_video_us + video.frame_duration_us);
                     self.last_video_us = pts;
-                    return Ok(Some((pts, decoded)));
+                    return Ok(Some(pts));
                 }
                 Err(ff::Error::Eof) => {
                     self.eof = true;
@@ -678,6 +739,10 @@ impl Native {
                 *clock = super::audio_clock::AudioClock::default();
             }
         }
+        #[cfg(feature = "gpu")]
+        self.free_video
+            .extend(self.next.drain(..).map(|(_, frame)| frame));
+        #[cfg(not(feature = "gpu"))]
         self.next.clear();
         self.converted = None;
         self.deferred = None;
@@ -729,6 +794,10 @@ impl Native {
             if self.next.front().is_none_or(|(pts, _)| *pts > media_us) {
                 break;
             }
+            #[cfg(feature = "gpu")]
+            if let Some((_, old)) = due.take() {
+                self.free_video.push(old);
+            }
             due = self.next.pop_front();
             ready = self.converted.take();
         }
@@ -739,12 +808,16 @@ impl Native {
         }
         self.seek_pending = false;
         self.read_ahead_audio(media_us)?;
-        let video = match (ready, due) {
-            (Some(frame), _) => Some(frame),
-            (None, Some((pts_us, decoded))) => {
-                Some(convert(self.video.as_mut().unwrap(), pts_us, &decoded)?)
-            }
-            (None, None) => None,
+        let video = if let Some((pts_us, mut decoded)) = due {
+            let result = match ready {
+                Some(frame) => Ok(frame),
+                None => convert(self.video.as_mut().unwrap(), pts_us, &mut decoded),
+            };
+            #[cfg(feature = "gpu")]
+            self.free_video.push(decoded);
+            Some(result?)
+        } else {
+            ready
         };
         if video.is_some() {
             self.stats.converted_frames += 1;
@@ -778,7 +851,7 @@ impl Native {
             }
         }
         if self.converted.is_none()
-            && let Some((pts_us, decoded)) = self.next.front()
+            && let Some((pts_us, decoded)) = self.next.front_mut()
         {
             // A failed conversion is retried, and reported, by the request.
             self.converted = convert(self.video.as_mut().unwrap(), *pts_us, decoded).ok();

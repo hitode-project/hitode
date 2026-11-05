@@ -16,14 +16,16 @@ impl Device {
     pub(crate) fn open(options: &DeviceOptions) -> Result<(crate::Device, crate::Queue)> {
         let raw = MTLCreateSystemDefaultDevice()
             .ok_or_else(|| Error::Unavailable("no system Metal device".into()))?;
-        // The floor is A12 on iOS and M1 on macOS. Virtual GPUs (the
-        // paravirtual device of macOS guests) report only Mac2 and fall below.
-        let floor = if cfg!(target_os = "ios") {
-            MTLGPUFamily::Apple5
+        // The floor is A12 on iOS and M1 on macOS. On Apple silicon a
+        // Mac2-only device is the paravirtual GPU of a macOS guest (CI
+        // runners); the caps treat it as a Mac2 GPU. Intel Macs stay out.
+        let supported = if cfg!(target_os = "ios") {
+            raw.supportsFamily(MTLGPUFamily::Apple5)
         } else {
-            MTLGPUFamily::Apple7
+            raw.supportsFamily(MTLGPUFamily::Apple7)
+                || (cfg!(target_arch = "aarch64") && raw.supportsFamily(MTLGPUFamily::Mac2))
         };
-        if !raw.supportsFamily(floor) {
+        if !supported {
             return Err(Error::Unavailable(
                 "Metal GPU family below the platform baseline".into(),
             ));
@@ -32,6 +34,9 @@ impl Device {
         let queue = raw.newCommandQueue().ok_or(Error::OutOfMemory)?;
         queue.setLabel(Some(&NSString::from_str(options.label)));
         let event = raw.newSharedEvent().ok_or(Error::OutOfMemory)?;
+        let default_depth = raw
+            .newDepthStencilStateWithDescriptor(&MTLDepthStencilDescriptor::new())
+            .ok_or(Error::OutOfMemory)?;
         let device = crate::Device {
             inner: Device(Arc::new(DeviceState {
                 raw,
@@ -41,6 +46,7 @@ impl Device {
                 samplers: Mutex::new(HashMap::new()),
                 rings: Mutex::new(Vec::new()),
                 clears: Mutex::new(HashMap::new()),
+                default_depth,
                 pipelines: Mutex::new(pipeline::Pipelines::default()),
             })),
         };
@@ -163,20 +169,18 @@ impl Queue {
         Ok(self.poll()? >= token)
     }
     pub(crate) fn on_complete(&mut self, token: Token, callback: Box<dyn FnOnce() + Send>) {
-        let callback = Mutex::new(Some(callback));
-        let block = block2::RcBlock::new(
-            move |_: NonNull<ProtocolObject<dyn MTLSharedEvent>>, _: u64| {
-                if let Some(callback) = callback.lock().unwrap().take() {
-                    callback();
-                }
-            },
-        );
-        unsafe {
-            self.event.notifyListener_atValue_block(
-                &self.listener,
-                token.0,
-                block2::RcBlock::as_ptr(&block),
-            );
+        notify(&self.event, &self.listener, token, callback);
+    }
+    pub(crate) fn main_notifier(&self) -> MainNotifier {
+        let listener = unsafe {
+            MTLSharedEventListener::initWithDispatchQueue(
+                <MTLSharedEventListener as objc2::AnyThread>::alloc(),
+                dispatch2::DispatchQueue::main(),
+            )
+        };
+        MainNotifier {
+            event: self.event.clone(),
+            listener,
         }
     }
     /// Metal tracks hazards and Core Animation needs no queue transfer, so a
@@ -319,3 +323,37 @@ impl QuerySet {
 // Query allocation handles are immutable; the queue alone encodes their writes.
 unsafe impl Send for QueryData {}
 unsafe impl Sync for QueryData {}
+
+/// Completion callbacks delivered on the main dispatch queue: the shared
+/// event's listener runs them there, with no thread of ours in between.
+pub(crate) struct MainNotifier {
+    event: Object<dyn MTLSharedEvent>,
+    listener: Retained<MTLSharedEventListener>,
+}
+// SAFETY: shared events and their listeners are thread-safe Metal objects.
+unsafe impl Send for MainNotifier {}
+unsafe impl Sync for MainNotifier {}
+impl MainNotifier {
+    pub(crate) fn on_complete(&self, token: Token, callback: Box<dyn FnOnce() + Send>) {
+        notify(&self.event, &self.listener, token, callback);
+    }
+}
+
+fn notify(
+    event: &Object<dyn MTLSharedEvent>,
+    listener: &MTLSharedEventListener,
+    token: Token,
+    callback: Box<dyn FnOnce() + Send>,
+) {
+    let callback = Mutex::new(Some(callback));
+    let block = block2::RcBlock::new(
+        move |_: NonNull<ProtocolObject<dyn MTLSharedEvent>>, _: u64| {
+            if let Some(callback) = callback.lock().unwrap().take() {
+                callback();
+            }
+        },
+    );
+    unsafe {
+        event.notifyListener_atValue_block(listener, token.0, block2::RcBlock::as_ptr(&block));
+    }
+}

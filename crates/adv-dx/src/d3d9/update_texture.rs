@@ -10,13 +10,12 @@ struct Transfers {
     active: Vec<Transfer>,
     scratch: Scratch,
 }
-// Retain at most two initialized CPU buffers, independently of live transfers.
+// Retain one initialized CPU shadow buffer, independently of live transfers.
 // Larger updates still work, but do not leave their allocations in the cache.
 const MAX_SCRATCH: usize = 8 * 1024 * 1024;
 #[derive(Default)]
 struct Scratch {
     raw: Vec<u8>,
-    pixels: Vec<u8>,
 }
 impl Scratch {
     fn keep(slot: &mut Vec<u8>, candidate: Vec<u8>) {
@@ -49,8 +48,7 @@ struct Commit {
     height: u32,
     level: u32,
     address: Option<u32>,
-    raw: Arc<Vec<u8>>,
-    converted: Option<Arc<Vec<u8>>>,
+    raw: Vec<u8>,
 }
 pub(super) fn register(registry: &mut Registry) {
     registry.register(update_ABI);
@@ -94,7 +92,6 @@ fn update(
     let prepared = prepare(env, device, source.addr(), destination.addr(), &mut scratch);
     let cached = &mut env.ext.get_mut::<Transfers>().scratch;
     Scratch::keep(&mut cached.raw, scratch.raw);
-    Scratch::keep(&mut cached.pixels, scratch.pixels);
     let mut transfer = match prepared {
         Ok(Some(transfer)) => transfer,
         Ok(None) => return Outcome::Return(0),
@@ -134,14 +131,19 @@ fn update(
 }
 
 fn prepare(
-    env: &Env<'_>,
+    env: &mut Env<'_>,
     device: Id,
     source: u32,
     destination: u32,
     scratch: &mut Scratch,
 ) -> Result<Option<Transfer>, u32> {
-    let src = resources::resource(env, source).ok_or(INVALID)?;
-    let dst = resources::resource(env, destination).ok_or(INVALID)?;
+    let namespace = com(env);
+    let Some(Payload::Resource(src)) = namespace.get(&env.sys.objects, source) else {
+        return Err(INVALID);
+    };
+    let Some(Payload::Resource(dst)) = namespace.get(&env.sys.objects, destination) else {
+        return Err(INVALID);
+    };
     if src.kind != Kind::Texture
         || dst.kind != Kind::Texture
         || src.device != device
@@ -198,40 +200,30 @@ fn prepare(
         };
         let target = d
             .surface
-            .and_then(|surface| (state.provider.target)(env.ext, surface))
+            .and_then(|surface| (env.ext.get::<State>().provider.target)(env.ext, surface))
             .ok_or(INVALID)?;
-        let mut raw = std::mem::take(&mut scratch.raw);
-        raw.resize(length as usize, 0);
-        env.cpu.read(source, &mut raw).map_err(|_| INVALID)?;
-        let raw = Arc::new(raw);
+        let mut raw = Vec::new();
+        if address.is_some() {
+            raw = std::mem::take(&mut scratch.raw);
+            raw.resize(length as usize, 0);
+            env.cpu.read(source, &mut raw).map_err(|_| INVALID)?;
+        }
         let raw_pitch = pitch;
-        let (pixels, pitch) = if matches!(s.desc.Format, 21 | 28) {
-            // BGRA8 already matches the GPU layout. Keep one immutable owned
-            // snapshot for both submission retries and guest shadow writeback.
-            (Arc::clone(&raw), pitch)
-        } else {
-            let input = if s.desc.Format == 22 {
-                let mut pixels = std::mem::take(&mut scratch.pixels);
-                pixels.clone_from(raw.as_ref());
-                pixels
-            } else {
-                raw.as_ref().clone()
-            };
-            let (pixels, pitch) =
-                format::upload(s.desc.Format, input, pitch, rectangle.w, rectangle.h)
-                    .ok_or(INVALID)?;
-            (Arc::new(pixels), pitch)
-        };
+        let state = env.ext.get_mut::<State>();
+        let (pixels, pitch) = format::snapshot(
+            env.cpu,
+            state.gpu.as_mut().unwrap(),
+            &mut state.upload_admission,
+            &mut state.upload_scratch,
+            (s.desc.Format, source, pitch),
+            (rectangle.w, rectangle.h),
+        )
+        .ok_or(INVALID)?;
         let level = index as u32;
-        let converted = (s.desc.Format == 22).then(|| Arc::clone(&pixels));
         remaining.push_back(Upload {
             level,
             target,
-            pixels: if s.desc.Format == 28 {
-                Pixels::Alpha8(pixels)
-            } else {
-                Pixels::Host(pixels)
-            },
+            pixels,
             pitch,
             rectangle,
             commit: Commit {
@@ -241,7 +233,6 @@ fn prepare(
                 level,
                 address,
                 raw,
-                converted,
             },
         });
     }
@@ -341,14 +332,7 @@ fn uploaded(env: &mut Env<'_>, destination: Id, outcome: Outcome) -> Outcome {
                 .take()
                 .unwrap();
             let scratch = &mut env.ext.get_mut::<Transfers>().scratch;
-            if let Ok(raw) = Arc::try_unwrap(commit.raw) {
-                Scratch::keep(&mut scratch.raw, raw);
-            }
-            if let Some(converted) = commit.converted
-                && let Ok(pixels) = Arc::try_unwrap(converted)
-            {
-                Scratch::keep(&mut scratch.pixels, pixels);
-            }
+            Scratch::keep(&mut scratch.raw, commit.raw);
             next(env, destination)
         }
         Outcome::Block {

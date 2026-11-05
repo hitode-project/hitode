@@ -142,12 +142,7 @@ fn layer(env: &Env<'_>, graph: u32) -> Option<VideoLayer> {
             },
         ),
         None => (
-            VideoFrame {
-                width: 1,
-                height: 1,
-                pitch: 4,
-                bgra: std::sync::Arc::from([0u8, 0, 0, 255]),
-            },
+            VideoFrame::from_bgra(1, 1, 4, std::sync::Arc::from([0u8, 0, 0, 255])),
             Rect {
                 x: 0,
                 y: 0,
@@ -220,19 +215,7 @@ pub(crate) fn publish(
     if !connected(env, graph) {
         return Err(VFW_E_NOT_CONNECTED);
     }
-    let pitch = frame.width.checked_mul(4).ok_or(E_INVALIDARG)?;
-    if frame.height == 0
-        || frame.width == 0
-        || u64::from(pitch) * u64::from(frame.height) != frame.bgra.len() as u64
-    {
-        return Err(E_INVALIDARG);
-    }
-    state(env).graphs.get_mut(&graph).unwrap().video_frame = Some(VideoFrame {
-        width: frame.width,
-        height: frame.height,
-        pitch,
-        bgra: frame.bgra.into(),
-    });
+    state(env).graphs.get_mut(&graph).unwrap().video_frame = Some(frame.into_surface());
     let visible = layer(env, graph).is_some();
     let serial = update(env, graph)?;
     if !visible {

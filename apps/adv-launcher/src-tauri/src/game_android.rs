@@ -129,6 +129,14 @@ pub(crate) fn lifecycle(resumed: bool) {
     });
 }
 
+pub(crate) fn trim_memory() {
+    HOST.with_borrow(|host| {
+        if let Some(session) = &host.session {
+            session.trim_memory();
+        }
+    });
+}
+
 pub(crate) fn audio_focus(active: bool) {
     HOST.with_borrow_mut(|host| {
         host.lifecycle.set_audio_focus(active);

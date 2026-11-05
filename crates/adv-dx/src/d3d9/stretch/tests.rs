@@ -70,10 +70,10 @@ impl Fixture {
         m.cpu.map(0x400000, 4096, Prot::RX).unwrap();
         m.spawn("authored color blits", 0x400000, &[], 65536)
             .unwrap();
-        let gpu = pollster::block_on(Gpu::request(!cfg!(any(
+        let gpu = adv_device::gpu::test_support::request(!cfg!(any(
             target_os = "macos",
             target_os = "android"
-        ))))
+        )))
         .unwrap();
         let wake = Arc::new(adv_sync::WakeEvent::new().unwrap());
         let mut builder = adv_sync::background::Builder::new((*wake).clone()).unwrap();
@@ -473,15 +473,10 @@ fn recorded_blit_retains_image_leases_until_success_or_cancel() {
             )
             .unwrap();
         super::super::tests::force_recording_limit(&mut env(&mut f.m), f.device);
-        let pause =
-            f.m.ext
-                .get::<State>()
-                .gpu
-                .as_ref()
-                .unwrap()
-                .context()
-                .pause_submissions()
-                .unwrap();
+        let pause = adv_device::gpu::test_support::pause_submissions(
+            f.m.ext.get::<State>().gpu.as_ref().unwrap(),
+        )
+        .unwrap();
         let outcome = f.call(
             "IDirect3DDevice9::StretchRect",
             &[f.device, src, 0, dst, 0, 2],

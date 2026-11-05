@@ -2,7 +2,7 @@ use super::*;
 use std::collections::BTreeMap;
 use std::fmt::Write;
 
-pub(super) fn translate(shader: &Shader) -> Result<Translation, Error> {
+pub(super) fn translate(shader: &Shader, ieee_f32: bool) -> Result<Translation, Error> {
     let p = if shader.stage == Stage::Vertex {
         "vs"
     } else {
@@ -90,51 +90,43 @@ pub(super) fn translate(shader: &Shader) -> Result<Translation, Error> {
         }
     }
     let mut out = String::new();
-    // Explicit bit classification preserves D3D comparisons and 0*infinity even
-    // when FXC otherwise folds multiplication by zero and x==x under fast math.
-    writeln!(out,"fn {p}_mul_scalar(a:f32,b:f32)->f32 {{ let aa=bitcast<u32>(a)&0x7fffffffu; let bb=bitcast<u32>(b)&0x7fffffffu; if aa>0x7f800000u || bb>0x7f800000u || (aa==0x7f800000u && bb==0u) || (bb==0x7f800000u && aa==0u) {{ return bitcast<f32>(0x7fc00000u); }} return a*b; }}\nfn {p}_mul(a:vec4<f32>,b:vec4<f32>)->vec4<f32> {{ return vec4<f32>({p}_mul_scalar(a.x,b.x),{p}_mul_scalar(a.y,b.y),{p}_mul_scalar(a.z,b.z),{p}_mul_scalar(a.w,b.w)); }}").unwrap();
-    writeln!(out,"fn {p}_cmp_scalar(a:f32,b:f32,mode:u32)->bool {{ let aa=bitcast<u32>(a)&0x7fffffffu; let bb=bitcast<u32>(b)&0x7fffffffu; if aa>0x7f800000u || bb>0x7f800000u {{ return mode==5u; }} switch mode {{ case 1u:{{return a>b;}} case 2u:{{return a==b;}} case 3u:{{return a>=b;}} case 4u:{{return a<b;}} case 5u:{{return a!=b;}} default:{{return a<=b;}} }} }}\nfn {p}_compare(a:vec4<f32>,b:vec4<f32>,mode:u32)->vec4<bool> {{ return vec4<bool>({p}_cmp_scalar(a.x,b.x,mode),{p}_cmp_scalar(a.y,b.y,mode),{p}_cmp_scalar(a.z,b.z,mode),{p}_cmp_scalar(a.w,b.w,mode)); }}").unwrap();
-    writeln!(out,"fn {p}_dot2(a:vec4<f32>,b:vec4<f32>)->f32 {{let v={p}_mul(a,b);return v.x+v.y;}}\nfn {p}_dot3(a:vec4<f32>,b:vec4<f32>)->f32 {{let v={p}_mul(a,b);return v.x+v.y+v.z;}}\nfn {p}_dot4(a:vec4<f32>,b:vec4<f32>)->f32 {{let v={p}_mul(a,b);return v.x+v.y+v.z+v.w;}}").unwrap();
+    if !ieee_f32 {
+        // Explicit bit classification preserves D3D comparisons and 0*infinity even
+        // when FXC otherwise folds multiplication by zero and x==x under fast math.
+        writeln!(out,"fn {p}_mul_scalar(a:f32,b:f32)->f32 {{ let aa=bitcast<u32>(a)&0x7fffffffu; let bb=bitcast<u32>(b)&0x7fffffffu; if aa>0x7f800000u || bb>0x7f800000u || (aa==0x7f800000u && bb==0u) || (bb==0x7f800000u && aa==0u) {{ return bitcast<f32>(0x7fc00000u); }} return a*b; }}\nfn {p}_mul(a:vec4<f32>,b:vec4<f32>)->vec4<f32> {{ return vec4<f32>({p}_mul_scalar(a.x,b.x),{p}_mul_scalar(a.y,b.y),{p}_mul_scalar(a.z,b.z),{p}_mul_scalar(a.w,b.w)); }}").unwrap();
+        writeln!(out,"fn {p}_cmp_scalar(a:f32,b:f32,mode:u32)->bool {{ let aa=bitcast<u32>(a)&0x7fffffffu; let bb=bitcast<u32>(b)&0x7fffffffu; if aa>0x7f800000u || bb>0x7f800000u {{ return mode==5u; }} switch mode {{ case 1u:{{return a>b;}} case 2u:{{return a==b;}} case 3u:{{return a>=b;}} case 4u:{{return a<b;}} case 5u:{{return a!=b;}} default:{{return a<=b;}} }} }}\nfn {p}_compare(a:vec4<f32>,b:vec4<f32>,mode:u32)->vec4<bool> {{ return vec4<bool>({p}_cmp_scalar(a.x,b.x,mode),{p}_cmp_scalar(a.y,b.y,mode),{p}_cmp_scalar(a.z,b.z,mode),{p}_cmp_scalar(a.w,b.w,mode)); }}").unwrap();
+    }
+    let product = multiply("a", "b", p, ieee_f32, false);
+    writeln!(out,"fn {p}_dot2(a:vec4<f32>,b:vec4<f32>)->f32 {{let v={product};return v.x+v.y;}}\nfn {p}_dot3(a:vec4<f32>,b:vec4<f32>)->f32 {{let v={product};return v.x+v.y+v.z;}}\nfn {p}_dot4(a:vec4<f32>,b:vec4<f32>)->f32 {{let v={product};return v.x+v.y+v.z+v.w;}}").unwrap();
     // D3D's rcp/rsq/log edge cases are explicit instead of relying on WGSL division-by-zero.
     writeln!(out,"fn {p}_rcp(x:f32)->f32 {{ if x == 0.0 {{ return bitcast<f32>(0x7f800000u); }} return 1.0 / x; }}").unwrap();
     writeln!(out,"fn {p}_rsq(x:f32)->f32 {{ if x == 0.0 {{ return bitcast<f32>(0x7f800000u); }} return inverseSqrt(abs(x)); }}").unwrap();
     writeln!(out,"fn {p}_log(x:f32)->f32 {{ if x == 0.0 {{ return bitcast<f32>(0xff800000u); }} return log2(abs(x)); }}").unwrap();
     writeln!(out,"fn {p}_lit(x:vec4<f32>)->vec4<f32> {{ var z=0.0; if x.x > 0.0 {{ z=pow(max(x.y,0.0),clamp(x.w,-128.0,128.0)); }} return vec4<f32>(1.0,max(x.x,0.0),z,1.0); }}").unwrap();
-    writeln!(out,"fn {p}_run(input:ShaderInputs)->ShaderOutputs {{\nvar r:array<vec4<f32>,32>; var t=input.t; var rr:array<vec4<f32>,32>; var tt:array<vec4<f32>,8>; var a=vec4<f32>(0.0); var al=0i; var pred=vec4<f32>(0.0);\nvar ro:array<vec4<f32>,3>; var od:array<vec4<f32>,2>; var o:array<vec4<f32>,12>; var oc:array<vec4<f32>,2>; var depth=0.0;\nvar c={p}_constants.f; var ci={p}_constants.i; var cb={p}_constants.b;\nvar matrix=vec3<f32>(0.0); var matrix_n=0u;\nvar pc=0u; var calls:array<u32,32>; var call_n=0u; var loops:array<i32,32>; var loop_steps:array<i32,32>; var loop_saved:array<i32,32>; var loop_n=0u; var steps=0u;").unwrap();
-    for ins in &shader.instructions {
-        if matches!(ins.opcode, Opcode::Def | Opcode::Defi | Opcode::Defb) {
-            let index = ins.destination.as_ref().expect("definition").register.index;
-            match ins.opcode {
-                Opcode::Def => {
-                    write!(out, "c[{index}u]=vec4<f32>(").unwrap();
-                    for (i, bits) in ins.immediate.iter().enumerate() {
-                        if i != 0 {
-                            out.push(',');
-                        }
-                        write!(out, "bitcast<f32>(0x{bits:08x}u)").unwrap();
-                    }
-                    out.push_str(");\n");
-                }
-                Opcode::Defi => {
-                    writeln!(
-                        out,
-                        "ci[{index}u]=bitcast<vec4<i32>>(vec4<u32>({}u,{}u,{}u,{}u));",
-                        ins.immediate[0], ins.immediate[1], ins.immediate[2], ins.immediate[3]
-                    )
-                    .unwrap();
-                }
-                Opcode::Defb => {
-                    writeln!(
-                        out,
-                        "cb[{index}u]=vec4<i32>({});",
-                        i32::from(ins.immediate[0] != 0)
-                    )
-                    .unwrap();
-                }
-                _ => {}
-            }
+    if shader
+        .instructions
+        .iter()
+        .flat_map(|i| &i.sources)
+        .any(|s| s.register.kind == RegisterKind::Float && s.relative.is_some())
+    {
+        writeln!(
+            out,
+            "fn {p}_read_c(index:i32)->vec4<f32> {{ switch index {{"
+        )
+        .unwrap();
+        let definitions: BTreeMap<_, _> = shader
+            .instructions
+            .iter()
+            .filter(|i| i.opcode == Opcode::Def)
+            .map(|i| (i.destination.as_ref().unwrap().register.index, i))
+            .collect();
+        for (index, ins) in definitions {
+            writeln!(out, "case {index}i:{{return {};}}", definition(ins)).unwrap();
         }
+        let bound = float_bound(shader);
+        writeln!(out, "default:{{return select(vec4<f32>(0.0),{p}_constants.f[u32(clamp(index,0i,255i))],index>=0i&&index<{bound}i);}} }} }}").unwrap();
     }
+    writeln!(out,"fn {p}_run(input:ShaderInputs)->ShaderOutputs {{\nvar r:array<vec4<f32>,32>; var t=input.t; var rr:array<vec4<f32>,32>; var tt:array<vec4<f32>,8>; var a=vec4<f32>(0.0); var al=0i; var pred=vec4<f32>(0.0);\nvar ro:array<vec4<f32>,3>; var od:array<vec4<f32>,2>; var o:array<vec4<f32>,12>; var oc:array<vec4<f32>,2>; var depth=0.0;\nvar matrix=vec3<f32>(0.0); var matrix_n=0u;\nvar pc=0u; var calls:array<u32,32>; var call_n=0u; var loops:array<i32,32>; var loop_steps:array<i32,32>; var loop_saved:array<i32,32>; var loop_n=0u; var steps=0u;").unwrap();
     let has_flow = shader.instructions.iter().any(|i| {
         matches!(
             i.opcode,
@@ -176,7 +168,7 @@ pub(super) fn translate(shader: &Shader) -> Result<Translation, Error> {
         if let Some(pr) = &ins.predicate {
             writeln!(out, "if ({}) .x != 0.0 {{", src(pr, shader, p, 0)).unwrap();
         }
-        emit_instruction(&mut out, shader, ins, pc, p)?;
+        emit_instruction(&mut out, shader, ins, pc, p, ieee_f32)?;
         if ins.predicate.is_some() {
             out.push_str("}\n");
         }
@@ -338,26 +330,19 @@ fn raw(register: Register, relative: Option<Relative>, shader: &Shader, offset: 
             }
         }
         Float => {
-            let c = format!("c[{i}]");
+            let p = if shader.stage == Stage::Vertex {
+                "vs"
+            } else {
+                "ps"
+            };
             if let Some(rr) = relative {
-                let index = format!(
-                    "{}i+{}",
+                format!(
+                    "{p}_read_c({}i+{})",
                     u32::from(register.index) + u32::from(offset),
                     rel(rr)
-                );
-                let bound = if shader.stage == Stage::Pixel {
-                    if shader.version.major == 1 {
-                        8
-                    } else if shader.version.major == 2 {
-                        32
-                    } else {
-                        224
-                    }
-                } else {
-                    256
-                };
-                format!("select(vec4<f32>(0.0),{c},({index})>=0i&&({index})<{bound}i)")
+                )
             } else {
+                let c = constant(register, shader, offset, p, "f");
                 if shader.stage == Stage::Pixel && shader.version.major == 1 {
                     format!("clamp({c},vec4<f32>(-1.0),vec4<f32>(1.0))")
                 } else {
@@ -375,10 +360,17 @@ fn raw(register: Register, relative: Option<Relative>, shader: &Shader, offset: 
         RasterOutput => format!("ro[{i}]"),
         ColorOutputLegacy => format!("od[{i}]"),
         Output => format!("o[{i}]"),
-        Int => format!("vec4<f32>(ci[{i}])"),
+        Int | Bool => {
+            let p = if shader.stage == Stage::Vertex {
+                "vs"
+            } else {
+                "ps"
+            };
+            let bank = if register.kind == Int { "i" } else { "b" };
+            format!("vec4<f32>({})", constant(register, shader, offset, p, bank))
+        }
         ColorOutput => format!("oc[{i}]"),
         DepthOutput => "vec4<f32>(depth)".into(),
-        Bool => format!("vec4<f32>(cb[{i}])"),
         Loop => "vec4<f32>(f32(al))".into(),
         Misc => {
             if register.index == 0 {
@@ -417,8 +409,68 @@ fn src(source: &Source, shader: &Shader, _p: &str, offset: u16) -> String {
         Not => format!("select(vec4<f32>(0.0),vec4<f32>(1.0),{v}==vec4<f32>(0.0))"),
     }
 }
-fn compare(a: &str, b: &str, control: u8, p: &str) -> String {
-    format!("{p}_cmp_scalar({a},{b},{control}u)")
+fn definition(ins: &Instruction) -> String {
+    match ins.opcode {
+        Opcode::Def => format!(
+            "bitcast<vec4<f32>>(vec4<u32>({}u,{}u,{}u,{}u))",
+            ins.immediate[0], ins.immediate[1], ins.immediate[2], ins.immediate[3]
+        ),
+        Opcode::Defi => format!(
+            "bitcast<vec4<i32>>(vec4<u32>({}u,{}u,{}u,{}u))",
+            ins.immediate[0], ins.immediate[1], ins.immediate[2], ins.immediate[3]
+        ),
+        Opcode::Defb => format!("vec4<i32>({})", i32::from(ins.immediate[0] != 0)),
+        _ => unreachable!(),
+    }
+}
+fn constant(register: Register, shader: &Shader, offset: u16, p: &str, bank: &str) -> String {
+    let index = register.index + offset;
+    shader
+        .instructions
+        .iter()
+        .rev()
+        .find(|i| {
+            matches!(i.opcode, Opcode::Def | Opcode::Defi | Opcode::Defb)
+                && i.destination
+                    .as_ref()
+                    .is_some_and(|d| d.register == Register { index, ..register })
+        })
+        .map_or_else(|| format!("{p}_constants.{bank}[{index}u]"), definition)
+}
+fn float_bound(shader: &Shader) -> u32 {
+    if shader.stage == Stage::Vertex {
+        256
+    } else {
+        match shader.version.major {
+            1 => 8,
+            2 => 32,
+            _ => 224,
+        }
+    }
+}
+fn multiply(a: &str, b: &str, p: &str, ieee_f32: bool, scalar: bool) -> String {
+    if ieee_f32 {
+        format!("({a}*{b})")
+    } else {
+        let suffix = if scalar { "_scalar" } else { "" };
+        format!("{p}_mul{suffix}({a},{b})")
+    }
+}
+fn compare(a: &str, b: &str, control: u8, p: &str, ieee_f32: bool, scalar: bool) -> String {
+    if ieee_f32 {
+        let op = match control {
+            1 => ">",
+            2 => "==",
+            3 => ">=",
+            4 => "<",
+            5 => "!=",
+            _ => "<=",
+        };
+        format!("({a}{op}{b})")
+    } else {
+        let helper = if scalar { "cmp_scalar" } else { "compare" };
+        format!("{p}_{helper}({a},{b},{control}u)")
+    }
 }
 fn emit_write(out: &mut String, d: &Destination, value: &str, shader: &Shader) {
     let mut rhs = value.to_string();
@@ -468,6 +520,7 @@ fn emit_instruction(
     i: &Instruction,
     pc: usize,
     p: &str,
+    ieee_f32: bool,
 ) -> Result<(), Error> {
     use Opcode::*;
     let operands: Vec<_> = i
@@ -485,6 +538,8 @@ fn emit_instruction(
     let a = operands.first().map_or("vec4<f32>(0.0)", String::as_str);
     let b = operands.get(1).map_or("vec4<f32>(0.0)", String::as_str);
     let c = operands.get(2).map_or("vec4<f32>(0.0)", String::as_str);
+    let mul = |a: &str, b: &str| multiply(a, b, p, ieee_f32, false);
+    let cmp = |a: &str, b: &str, control| compare(a, b, control, p, ieee_f32, false);
     let f = s.flow[pc];
     let mut value = String::new();
     match i.opcode {
@@ -493,7 +548,14 @@ fn emit_instruction(
             let cond = if i.opcode == If {
                 format!("({a}).x!=0.0")
             } else {
-                compare(&format!("({a}).x"), &format!("({b}).x"), i.controls, p)
+                compare(
+                    &format!("({a}).x"),
+                    &format!("({b}).x"),
+                    i.controls,
+                    p,
+                    ieee_f32,
+                    true,
+                )
             };
             writeln!(out, "if !({cond}) {{ pc={}u; }}", f.target).unwrap();
         }
@@ -547,7 +609,14 @@ fn emit_instruction(
             let cond = match i.opcode {
                 Break => "true".into(),
                 Breakp => format!("({a}).x!=0.0"),
-                _ => compare(&format!("({a}).x"), &format!("({b}).x"), i.controls, p),
+                _ => compare(
+                    &format!("({a}).x"),
+                    &format!("({b}).x"),
+                    i.controls,
+                    p,
+                    ieee_f32,
+                    true,
+                ),
             };
             writeln!(
                 out,
@@ -570,26 +639,33 @@ fn emit_instruction(
         }
         Add => value = format!("{a}+{b}"),
         Sub => value = format!("{a}-{b}"),
-        Mad => value = format!("{p}_mul({a},{b})+{c}"),
-        Mul => value = format!("{p}_mul({a},{b})"),
+        Mad => value = format!("{}+{c}", mul(a, b)),
+        Mul => value = mul(a, b),
         Rcp => value = format!("vec4<f32>({p}_rcp(({a}).x))"),
         Rsq => value = format!("vec4<f32>({p}_rsq(({a}).x))"),
         Dp3 => value = format!("vec4<f32>({p}_dot3({a},{b}))"),
         Dp4 => value = format!("vec4<f32>({p}_dot4({a},{b}))"),
         Min => value = format!("min({a},{b})"),
         Max => value = format!("max({a},{b})"),
-        Slt => value = format!("select(vec4<f32>(0.0),vec4<f32>(1.0),{p}_compare({a},{b},4u))"),
-        Sge => value = format!("select(vec4<f32>(0.0),vec4<f32>(1.0),{p}_compare({a},{b},3u))"),
+        Slt => value = format!("select(vec4<f32>(0.0),vec4<f32>(1.0),{})", cmp(a, b, 4)),
+        Sge => value = format!("select(vec4<f32>(0.0),vec4<f32>(1.0),{})", cmp(a, b, 3)),
         Exp => value = format!("vec4<f32>(exp2(({a}).x))"),
         Log => value = format!("vec4<f32>({p}_log(({a}).x))"),
         Lit => value = format!("{p}_lit({a})"),
-        Dst => value = format!("vec4<f32>(1.0,{p}_mul_scalar(({a}).y,({b}).y),({a}).z,({b}).w)"),
-        Lrp => value = format!("{p}_mul({a},{b})+{p}_mul(vec4<f32>(1.0)-{a},{c})"),
+        Dst => {
+            value = format!(
+                "vec4<f32>(1.0,{},({a}).z,({b}).w)",
+                multiply(&format!("({a}).y"), &format!("({b}).y"), p, ieee_f32, true)
+            )
+        }
+        Lrp => value = format!("{}+{}", mul(a, b), mul(&format!("(vec4<f32>(1.0)-{a})"), c)),
         Frc => value = format!("fract({a})"),
         Pow => value = format!("vec4<f32>(pow(abs(({a}).x),({b}).x))"),
         Crs => {
             value = format!(
-                "vec4<f32>(({p}_mul(({a}).yzxx,({b}).zxyy)-{p}_mul(({a}).zxyy,({b}).yzxx)).xyz,0.0)"
+                "vec4<f32>(({}-{}).xyz,0.0)",
+                mul(&format!("({a}).yzxx"), &format!("({b}).zxyy")),
+                mul(&format!("({a}).zxyy"), &format!("({b}).yzxx"))
             )
         }
         Sgn => value = format!("sign({a})"),
@@ -597,19 +673,22 @@ fn emit_instruction(
         Nrm => value = format!("vec4<f32>(normalize(({a}).xyz),({a}).w)"),
         SinCos => value = format!("vec4<f32>(cos(({a}).x),sin(({a}).x),0.0,0.0)"),
         Mova => value = format!("sign({a})*floor(abs({a})+vec4<f32>(0.5))"),
-        Cmp => value = format!("select({c},{b},{p}_compare({a},vec4<f32>(0.0),3u))"),
+        Cmp => value = format!("select({c},{b},{})", cmp(a, "vec4<f32>(0.0)", 3)),
         Cnd => {
             value = if s.version.minor < 4 {
-                format!("select({c},{b},{p}_cmp_scalar(({a}).w,0.5,1u))")
+                format!(
+                    "select({c},{b},{})",
+                    compare(&format!("({a}).w"), "0.5", 1, p, ieee_f32, true)
+                )
             } else {
-                format!("select({c},{b},{p}_compare({a},vec4<f32>(0.5),1u))")
+                format!("select({c},{b},{})", cmp(a, "vec4<f32>(0.5)", 1))
             }
         }
         Dp2add => value = format!("vec4<f32>({p}_dot2({a},{b})+({c}).x)"),
         Setp => {
             value = format!(
-                "select(vec4<f32>(0.0),vec4<f32>(1.0),{p}_compare({a},{b},{}u))",
-                i.controls
+                "select(vec4<f32>(0.0),vec4<f32>(1.0),{})",
+                cmp(a, b, i.controls)
             )
         }
         Dsx => value = format!("dpdx({a})"),

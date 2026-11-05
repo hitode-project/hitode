@@ -1,7 +1,8 @@
 """Regenerate the four pinned GPU upscalers with Slang 2026.19.
 
 Usage: python3 tools/upscaling/generate.py /path/to/slangc
-Input: vendor/upscaling shader sources. Output: shell WGSL and model tables.
+Input: vendor/upscaling shader sources. Output: the display upscale stage's
+WGSL, in the GPU layer's binding groups, and its model tables.
 Temporary compiler inputs stay in target/scratch/upscaling-generator.
 """
 import pathlib
@@ -38,7 +39,7 @@ def generate(compiler):
             ins = re.search('//!IN ([^\\n]+)', body)[1].replace(' ', '').split(',')
             outs = re.search('//!OUT ([^\\n]+)', body)[1].replace(' ', '').split(',')
             block = int(re.search('//!BLOCK_SIZE (\\d+)', body)[1])
-            pre = '[[vk::binding(0,0)]] cbuffer Params { uint4 dimensions; uint4 origin; };\n' + precision + '\n' + shared + '\n'
+            pre = '[[vk::binding(0,0)]] cbuffer Params { uint4 dimensions; };\n' + precision + '\n' + shared + '\n'
             binding = 1
             for name in ins:
                 pre += f'[[vk::binding({binding},0)]] Texture2D<float4> {name};\n'
@@ -51,9 +52,7 @@ def generate(compiler):
                 binding += 1
             for name in outs:
                 body = re.sub('\\b' + name + '\\[([^\\]]+)\\]\\s*=\\s*([^;]+);', lambda m: name + '.Store(' + m[1] + ', ' + m[2] + ');', body)
-            # origin.xy is the damaged region's corner in input pixels, origin.zw in output pixels.
-            origin = 'origin.zw' if 'OUTPUT' in outs else 'origin.xy'
-            src = pre + body + f'\n[numthreads(64,1,1)] void main(uint3 group : SV_GroupID, uint3 tid : SV_GroupThreadID) {{ Pass{n}(group.xy * {block} + {origin}, tid); }}\n'
+            src = pre + body + f'\n[numthreads(64,1,1)] void main(uint3 group : SV_GroupID, uint3 tid : SV_GroupThreadID) {{ Pass{n}(group.xy * {block}, tid); }}\n'
             p = outdir / f'{n}.slang'
             p.write_text(src)
             # Upstream relies on implicit float-to-half conversions.
@@ -71,12 +70,14 @@ def generate(compiler):
     manifest = []
     for (n, body) in enumerate(parts, 1):
         ins = re.findall('//!BIND (\\w+)', body)
+        # Convolutions sample neighbours; depth-to-space reads its own texel.
+        radius = int('_texOff(' in body)
         save = re.search('//!SAVE (\\w+)', body)
         last = not save
         outs = [save[1] if save else 'OUTPUT']
         if last:
             ins.append('INPUT')
-        pre = '[[vk::binding(0,0)]] cbuffer Params { uint4 dimensions; uint4 origin; };\n'
+        pre = '[[vk::binding(0,0)]] cbuffer Params { uint4 dimensions; };\n'
         for (b, name) in enumerate(ins, 1):
             pre += f'[[vk::binding({b},0)]] Texture2D<float4> {name};\n'
         b = len(ins) + 1
@@ -94,8 +95,7 @@ def generate(compiler):
         if 'LUMA' in ins:
             pre = pre.replace('return LUMA.SampleLevel(sam, uv, 0);', 'return float4(dot(LUMA.SampleLevel(sam, uv, 0).rgb, float3(0.2126, 0.7152, 0.0722)), 0, 0, 1);')
         size = 'dimensions.zw' if last else 'dimensions.xy'
-        origin = 'origin.zw' if last else 'origin.xy'
-        main = f'\n[numthreads(8,8,1)] void main(uint3 group : SV_DispatchThreadID) {{ uint2 id = group.xy + {origin}; if(any(id >= {size})) return; float2 pos = (float2(id) + 0.5) / float2({size}); float4 v=hook(pos);'
+        main = f'\n[numthreads(8,8,1)] void main(uint3 group : SV_GroupID, uint3 tid : SV_GroupThreadID) {{ uint2 id = group.xy * 8 + tid.xy; if(any(id >= {size})) return; float2 pos = (float2(id) + 0.5) / float2({size}); float4 v=hook(pos);'
         if last:
             main += 'float3 rgb=INPUT.SampleLevel(sam,pos,0).rgb; v=float4(rgb + (v.x - dot(rgb,float3(0.2126,0.7152,0.0722))),1);'
         main += f'{outs[0]}.Store(id,v); }}'
@@ -105,13 +105,66 @@ def generate(compiler):
         if r.returncode:
             print(n, r.stderr[:2500])
             raise SystemExit(1)
-        manifest.append(dict(inputs=['INPUT' if x == 'LUMA' else x for x in ins], outputs=outs, block=8, samplers=[['LINEAR', 'sam']], formats=['rgba16f']))
+        manifest.append(dict(inputs=['INPUT' if x == 'LUMA' else x for x in ins], outputs=outs, block=8, samplers=[['LINEAR', 'sam']], formats=['rgba16f'], radius=radius))
     (outdir / 'passes.json').write_text(json.dumps(manifest, indent=2))
     print('ArtCNN compiled', len(manifest))
     emit(root)
 
+UPSCALE = BASE / 'crates/adv-display/src/stages/upscale'
+MODELS = [('Anime4k', 'Anime4K_Upscale_Denoise_L'), ('Cunny', 'CuNNy-4x12-NVL'), ('Artcnn', 'ArtCNN_C4F16'), ('K7', 'k7_modernAnime_FHD_x2')]
+HEADER = '// Generated from pinned upstream sources; see vendor/upscaling/NOTICE.\n'
+# Binding groups of the GPU layer: uniforms, sampled images, samplers, storage.
+GROUPS = [('var<uniform>', 0), ('texture_2d<', 1), ('sampler', 2), ('texture_storage_2d<', 3)]
+
+
+def rebind(source):
+    """Move each binding to its kind's group; the final layer writes the 8-bit
+    presentable buffer. Binding numbers, and so the kernels, stay unchanged."""
+    def group(m):
+        decl = m[0].replace('@group(0)', f'@group({next(g for marker, g in GROUPS if marker in m[0])})')
+        return decl.replace('rgba16float', 'rgba8unorm') if m[2].startswith('OUTPUT_') else decl
+    return fuse.DECL.sub(group, source)
+
+
+# Each workgroup covers one listed cell of its pass's output grid: workgroup
+# `i` reads `cells[i]`, packed as x | y << 16 in units of the pass's block.
+CELLS = '''@group(3) @binding(0) var<storage, read> cells: array<u32>;
+fn cell(index: u32) -> vec2<u32> {
+    let packed = cells[index];
+    return vec2<u32>(packed & 0xffffu, packed >> 16u);
+}
+'''
+
+
+def listed(source):
+    """Take each workgroup's block from the cell list instead of its id."""
+    group = re.search(r'@builtin\(workgroup_id\)\s*(\w+)', source)[1]
+    source, count = re.subn(r'\b' + group + r'\.xy\b', f'cell({group}.x)', source)
+    assert count == 1, 'one block origin per entry'
+    entry = source.index('@compute')
+    return source[:entry] + CELLS + source[entry:]
+
+
+def inline(source):
+    """Expand every MulAdd helper at its call sites: Adreno 6xx compilers crash
+    on functions that take a matrix. The products and sums stay in order."""
+    for name, x, y, a, body in re.findall(r'fn (MulAdd_\w+)\( *(\w+) *:[^,]+, *(\w+) *:[^,]+, *(\w+) *:[^)]+\)[^{]*\{\s*return ([^;]+);\s*\}\n*', source):
+        assert body == f'((({y}) * ({x}))) + {a}', body
+        source = re.sub(r'fn ' + name + r'\([^{]*\{[^}]*\}\n*', '', source)
+        expand = lambda args: f'((({args[1]}) * ({fuse.calls(args[0], name, expand)}))) + ({fuse.calls(args[2], name, expand)})'
+        source = fuse.calls(source, name, expand)
+    assert 'MulAdd' not in source
+    return source
+
+
+def write(shader, source):
+    (UPSCALE / shader).parent.mkdir(parents=True, exist_ok=True)
+    (UPSCALE / shader).write_text(HEADER + listed(rebind(inline(source))).rstrip() + '\n')
+
+
 def slots(passes):
-    """Reuse a texture only after its last reader, retaining the final output."""
+    """Reuse a tensor only after its last reader. The output is the presentable
+    buffer, not a tensor."""
     last = {}
     formats = {}
     for (i, p) in enumerate(passes):
@@ -122,45 +175,60 @@ def slots(passes):
     allocated = []
     for (i, p) in enumerate(passes):
         for name in p['outputs']:
-            if name in names:
+            if name in names or name == 'OUTPUT':
                 continue
-            kind = (formats[name], 2 if name == 'OUTPUT' else 1)
-            slot = next((j for (j, (fmt, scale, end)) in enumerate(allocated) if (fmt, scale) == kind and end < i), len(allocated))
+            slot = next((j for (j, (fmt, end)) in enumerate(allocated) if fmt == formats[name] and end < i), len(allocated))
             if slot == len(allocated):
-                allocated.append((*kind, last[name]))
+                allocated.append((formats[name], last[name]))
             else:
-                allocated[slot] = (*kind, last[name])
+                allocated[slot] = (formats[name], last[name])
             names[name] = slot
-    return (names, [(fmt, scale) for (fmt, scale, _) in allocated])
+    return (names, [fmt for (fmt, _) in allocated])
+
+
+def model(passes):
+    """One model table entry; `passes` carry their emitted shader paths."""
+    (names, tensors) = slots(passes)
+    rust = ['Model { tensors: &[' + ', '.join('Rgba8Unorm' if fmt == 'rgba8' else 'Rgba16Float' for fmt in tensors) + '], passes: &[']
+    for p in passes:
+        roles = ['Uniform']
+        cells = '(0, Cells), '
+        roles += ['Source' if n == 'INPUT' else f'Tensor({names[n]})' for n in p['inputs']]
+        roles += ['Output' if n == 'OUTPUT' else f'Store({names[n]})' for n in p['outputs']]
+        roles += ['Linear' if f == 'LINEAR' else 'Nearest' for (f, _) in p['samplers']]
+        used = {int(n) for n in re.findall('@binding\\((\\d+)\\)', (UPSCALE / p['shader']).read_text())}
+        entries = ', '.join(f'({n}, {role})' for (n, role) in enumerate(roles) if n in used)
+        scale = 2 if 'OUTPUT' in p['outputs'] else 1
+        rust.append(f"Pass {{ shader: \"{p['shader']}\", bindings: &[{cells}{entries}], block: {p['block']}, scale: {scale}, radius: {p['radius']} }},")
+    rust.append('] }')
+    return '\n'.join(rust)
+
 
 def emit(root):
-    destination = BASE / 'crates/adv-shell/src/upscaling'
-    models = [('Anime4k', 'Anime4K_Upscale_Denoise_L'), ('Cunny', 'CuNNy-4x12-NVL'), ('Artcnn', 'ArtCNN_C4F16'), ('K7', 'k7_modernAnime_FHD_x2')]
-    rust = ['// Generated by tools/upscaling/generate.py; see vendor/upscaling/NOTICE.', 'use super::{Binding::*, Model, Pass, Upscaler};', 'use wgpu::TextureFormat::{Rgba8Unorm, Rgba16Float};', '#[cfg(test)]', 'pub(super) fn model(value: Upscaler) -> Model {', 'match value {', 'Upscaler::Off => unreachable!(),']
-    for (variant, name) in models:
+    tables = {'REFERENCE': [], 'FUSED': [], 'MATRIX': []}
+    for (variant, name) in MODELS:
         passes = json.loads((root / name / 'passes.json').read_text())
-        (names, textures) = slots(passes)
-        rust.append(f'Upscaler::{variant} => Model {{ textures: &[')
-        for (fmt, scale) in textures:
-            rust.append(f"({('Rgba8Unorm' if fmt == 'rgba8' else 'Rgba16Float')}, {scale}),")
-        rust.append(f"], output: {names['OUTPUT']}, passes: &[")
-        directory = destination / name
-        directory.mkdir(exist_ok=True)
         for (i, p) in enumerate(passes, 1):
-            wgsl = (root / name / f'{i}.wgsl').read_text()
-            (directory / f'{i}.wgsl').write_text('// Generated from pinned upstream sources; see vendor/upscaling/NOTICE.\n' + wgsl.rstrip() + '\n')
-            bindings = ['Uniform']
-            bindings += ['Source' if n == 'INPUT' else f'Texture({names[n]})' for n in p['inputs']]
-            bindings += [f'Texture({names[n]})' for n in p['outputs']]
-            bindings += ['Linear' if f == 'LINEAR' else 'Nearest' for (f, _) in p['samplers']]
-            used = {int(n) for n in re.findall('@binding\\((\\d+)\\)', wgsl)}
-            entries = ','.join((f'({n},{value})' for (n, value) in enumerate(bindings) if n in used))
-            rust.append(f'''Pass {{ source: include_str!("{name}/{i}.wgsl"), bindings: &[{entries}], block: {p['block']}, scale: {(2 if 'OUTPUT' in p['outputs'] else 1)}, radius: 1 }},''')
-        rust.append('] },')
-    rust.append('}\n}')
-    rust.append(fuse.emit(root, destination, models, slots))
-    rust.append(fuse.emit(root, destination, models, slots, matrix=True))
-    (destination / 'models.rs').write_text('\n'.join(rust) + '\n')
-    subprocess.run(['rustfmt', '--edition', '2024', str(destination / 'models.rs')], check=True)
+            p.update(shader=f'{name}/{i}.wgsl', radius=p.get('radius', 1))
+            write(p['shader'], (root / name / f'{i}.wgsl').read_text())
+        tables['REFERENCE'].append(model(passes))
+        fused = fuse.combine(root, name, passes, write)
+        tables['FUSED'].append(model(fused))
+        matrix = fuse.combine(root, name, passes, write, matrix=True)
+        index = len(tables['FUSED']) - 1
+        tables['MATRIX'].append(model(matrix) if matrix else f'FUSED[{index}]')
+    rust = ['// Generated by tools/upscaling/generate.py; see vendor/upscaling/NOTICE.',
+            '//! Model tables in `Upscaler` order (Anime4K, CuNNy, ArtCNN, k7).',
+            'use super::table::{Format::*, Model, Pass, Role::*};']
+    docs = {'REFERENCE': 'Unfused upstream passes, the reference for tests.',
+            'FUSED': 'Adjacent layers fused through workgroup storage.',
+            'MATRIX': 'Fused, with half-precision 8x8 matrix input convolutions where the model allows.'}
+    for (table, entries) in tables.items():
+        rust.append(f'/// {docs[table]}')
+        rust.append(f'pub const {table}: [Model; 4] = [' + ',\n'.join(entries) + '];')
+    (UPSCALE / 'models.rs').write_text('\n'.join(rust) + '\n')
+    subprocess.run(['rustfmt', '--edition', '2024', str(UPSCALE / 'models.rs')], check=True)
+
+
 if __name__ == '__main__':
     generate(pathlib.Path(sys.argv[1]).resolve())

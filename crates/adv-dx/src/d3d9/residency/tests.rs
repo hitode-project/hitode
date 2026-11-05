@@ -38,13 +38,7 @@ fn machine() -> (Machine<JitCpu>, u32) {
         .unwrap();
     machine.ext.insert(Surfaces::default());
     let state = machine.ext.get_mut::<State>();
-    state.gpu = Some(
-        pollster::block_on(Gpu::request(!cfg!(any(
-            target_os = "macos",
-            target_os = "android"
-        ))))
-        .unwrap(),
-    );
+    state.gpu = Some(Gpu::request(!cfg!(any(target_os = "macos", target_os = "android"))).unwrap());
     state.tables.insert("IDirect3DTexture9", 0);
     state.provider.insert = |ext, target| {
         let surfaces = ext.get_mut::<Surfaces>();
@@ -335,15 +329,10 @@ fn managed_eviction_retains_cpu_and_mip_aliases_then_restores_real_pixels_and_ca
         .protect(storage & !4095, 4096, Prot::RW)
         .unwrap();
     super::super::tests::force_recording_limit(&mut env(&mut machine), device);
-    let pause = machine
-        .ext
-        .get::<State>()
-        .gpu
-        .as_ref()
-        .unwrap()
-        .context()
-        .pause_submissions()
-        .unwrap();
+    let pause = adv_device::gpu::test_support::pause_submissions(
+        machine.ext.get::<State>().gpu.as_ref().unwrap(),
+    )
+    .unwrap();
     let Outcome::Block { then, .. } = call(
         &mut machine,
         "IDirect3DDevice9::SetTexture",
@@ -382,15 +371,10 @@ fn managed_eviction_retains_cpu_and_mip_aliases_then_restores_real_pixels_and_ca
         &[device],
     ));
     super::super::tests::force_recording_limit(&mut env(&mut machine), device);
-    let pause = machine
-        .ext
-        .get::<State>()
-        .gpu
-        .as_ref()
-        .unwrap()
-        .context()
-        .pause_submissions()
-        .unwrap();
+    let pause = adv_device::gpu::test_support::pause_submissions(
+        machine.ext.get::<State>().gpu.as_ref().unwrap(),
+    )
+    .unwrap();
     let pending = call(
         &mut machine,
         "IDirect3DDevice9::SetTexture",

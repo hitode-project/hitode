@@ -43,6 +43,7 @@ pub(super) fn query(raw: &ProtocolObject<dyn MTLDevice>) -> Caps {
         .fold(0, |mask, (i, _)| mask | (1 << i));
     Caps {
         features,
+        ieee_f32: true,
         modern: Modern::empty(),
         limits: Limits {
             max_image_2d: if raw.supportsFamily(MTLGPUFamily::Apple10) {
@@ -55,12 +56,13 @@ pub(super) fn query(raw: &ProtocolObject<dyn MTLDevice>) -> Caps {
             max_color_attachments: 8,
             max_uniform_buffers: 31,
             max_sampled_images: if apple && !apple6 { 96 } else { 128 },
-            max_samplers: 16,
+            max_samplers: 32,
             max_storage_bindings: 31,
             max_workgroup_storage: raw.maxThreadgroupMemoryLength() as u32,
             max_workgroup_invocations: 1024,
-            uniform_offset_alignment: if apple { 4 } else { 256 },
-            storage_offset_alignment: if apple { 4 } else { 256 },
+            // Vector-typed bindings need their 16-byte alignment in the offset.
+            uniform_offset_alignment: if apple { 16 } else { 256 },
+            storage_offset_alignment: if apple { 16 } else { 256 },
             sample_counts,
             tile: if apple { (32, 32) } else { (0, 0) },
             push_constant_bytes: 0,
@@ -120,7 +122,8 @@ fn format_caps(
     use FormatCaps as C;
     let color = C::SAMPLED | C::FILTERED | C::COLOR | C::BLEND;
     match f {
-        Format::Nv12 | Format::P010 | Format::Bgra4Unorm => C::empty(),
+        Format::Nv12 => C::SAMPLED | C::FILTERED | C::PRESENTABLE,
+        Format::P010 | Format::Bgra4Unorm => C::empty(),
         Format::B5g6r5Unorm | Format::Bgr5a1Unorm => {
             if apple {
                 color
@@ -183,7 +186,7 @@ pub(super) fn pixel_format(f: Format) -> Option<MTLPixelFormat> {
         Format::B5g6r5Unorm => M::B5G6R5Unorm,
         Format::Bgr5a1Unorm => M::BGR5A1Unorm,
         // ABGR4 has alpha in the low nibble, so it cannot represent BGRA4.
-        Format::Bgra4Unorm | Format::Nv12 | Format::P010 => return None,
+        Format::Bgra4Unorm | Format::Nv12 | Format::Nv21 | Format::P010 => return None,
         Format::Rgb10a2Unorm => M::RGB10A2Unorm,
         Format::R16Float => M::R16Float,
         Format::Rg16Float => M::RG16Float,

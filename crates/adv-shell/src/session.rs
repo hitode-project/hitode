@@ -121,17 +121,14 @@ impl Session {
             .sender_with_capacity_wake(8, 8, wake.clone())
             .map_err(|e| e.to_string())?;
         let (mut worker, mut ui) = frontend::channel(wake.clone(), keys.clone())?;
-        let (gpu, presenter) = view.create_native(options.gpu_software)?;
-        gpu.context()
-            .set_execution_wake(wake.clone())
-            .map_err(|_| "GPU execution wake was already registered")?;
-        let sender = background
-            .sender_with_capacity_wake(1, 1, ui.wake())
-            .map_err(|e| e.to_string())?;
-        ui.native(presenter, sender);
-        #[cfg(target_os = "macos")]
-        ui.install_sinks(&mut projection.borrow_mut());
-        worker.gpu = Some(gpu);
+
+        {
+            let (startup, display) = view.create_display(options.gpu_software, ui.wake())?;
+            worker.display = Some(startup);
+            ui.display(display);
+            #[cfg(target_os = "macos")]
+            ui.install_sinks(&mut projection.borrow_mut());
+        }
         #[cfg(target_os = "macos")]
         {
             worker.vsync = Some(view.vsync());
@@ -214,11 +211,11 @@ impl Session {
             driver.view.bind(
                 view_keys,
                 Box::new(move |window| {
-                    if let Some(driver) = weak.upgrade() {
-                        if let Some(ui) = driver.ui.borrow_mut().as_mut() {
-                            unsafe {
-                                ui.replace_window(window)?;
-                            }
+                    if let Some(driver) = weak.upgrade()
+                        && let Some(ui) = driver.ui.borrow_mut().as_mut()
+                    {
+                        unsafe {
+                            ui.replace_window(window)?;
                         }
                     }
                     Ok(())
@@ -276,6 +273,7 @@ impl Session {
             let weak = Rc::downgrade(&driver);
             driver.view.start_frame_clock(Rc::new(move || {
                 if let Some(driver) = weak.upgrade() {
+                    driver.refreshed();
                     driver.drive();
                 }
             }));
@@ -364,6 +362,13 @@ impl Session {
             ui.pause_input(paused);
         }
         self.driver.view.hub().pause(paused);
+    }
+    /// The system asked for memory back, or the app went to the background.
+    #[cfg(mobile)]
+    pub fn trim_memory(&self) {
+        if let Some(ui) = self.driver.ui.borrow_mut().as_mut() {
+            ui.trim_memory();
+        }
     }
     pub fn request_close(&self) {
         self.driver.view.hub().request_close();
@@ -517,6 +522,11 @@ impl Driver {
             callback(result);
         }
     }
+    fn refreshed(&self) {
+        if let Some(ui) = self.ui.borrow().as_ref() {
+            ui.refreshed();
+        }
+    }
     fn drive(&self) {
         let next = match self.tick() {
             Ok(next) => next,
@@ -531,11 +541,7 @@ impl Driver {
             let result = self.main_loop.borrow().as_ref().map(|main_loop| {
                 #[cfg(target_os = "ios")]
                 {
-                    main_loop.arm(
-                        next,
-                        self.view.requested_rate.get(),
-                        self.view.frame_clock.replace(false),
-                    )
+                    main_loop.arm(next, self.view.frame_clock.replace(false))
                 }
                 #[cfg(target_os = "android")]
                 {

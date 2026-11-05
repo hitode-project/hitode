@@ -23,11 +23,14 @@ impl TranslationJob {
         self.0.wait().as_ref()
     }
 }
+type TranslationKey = (bool, Arc<[u32]>);
+
 #[derive(Default)]
 pub(super) struct TranslationCache {
-    entries: BTreeMap<Arc<[u32]>, TranslationJob>,
+    pub ieee_f32: bool,
+    entries: BTreeMap<TranslationKey, TranslationJob>,
     bytes: usize,
-    order: std::collections::VecDeque<(Arc<[u32]>, usize)>,
+    order: std::collections::VecDeque<(TranslationKey, usize)>,
     pub counters: CompileCounters,
     failures: Arc<std::sync::atomic::AtomicU64>,
 }
@@ -37,22 +40,24 @@ impl TranslationCache {
         shader: &crate::shader::Shader,
         directory: Option<&std::path::Path>,
     ) -> TranslationJob {
-        if let Some(translation) = self.entries.get(shader.bytecode()) {
+        let key = (self.ieee_f32, Arc::from(shader.bytecode()));
+        if let Some(translation) = self.entries.get(&key) {
             return translation.clone();
         }
         self.bytes = 0;
         for (tokens, bytes) in &mut self.order {
-            *bytes = translation_bytes(tokens, &self.entries[tokens]);
+            *bytes = translation_bytes(&tokens.1, &self.entries[tokens]);
             self.bytes += *bytes;
         }
         let bytes = shader.bytecode().len() * 4 + crate::shader::MAX_TRANSLATION_BYTES;
         let parsed = shader.clone();
         let directory = directory.map(std::path::Path::to_owned);
         let failures = self.failures.clone();
+        let ieee_f32 = self.ieee_f32;
         let job = TranslationJob(Compile::spawn(bytes, self.counters.clone(), move || {
             let result = match directory {
-                Some(directory) => parsed.translate_cached(&directory),
-                None => parsed.translate(),
+                Some(directory) => parsed.translate_cached(&directory, ieee_f32),
+                None => parsed.translate(ieee_f32),
             }
             .map(Arc::new)
             .map_err(|e| e.to_string());
@@ -68,7 +73,6 @@ impl TranslationCache {
                 self.entries.remove(&oldest);
                 self.bytes -= bytes;
             }
-            let key: Arc<[u32]> = shader.bytecode().into();
             self.order.push_back((key.clone(), bytes));
             self.entries.insert(key, job.clone());
             self.bytes += bytes;

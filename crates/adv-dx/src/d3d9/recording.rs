@@ -450,7 +450,7 @@ fn append(
             .collect()
     });
     let (command, damage) = if let Some(saved) = shared {
-        let slot = hash(target.as_ref().unwrap().image.view());
+        let slot = hash(target.as_ref().unwrap().image.id());
         f.damage.replay(&saved.damage, slot);
         (saved.command, saved.damage.clone())
     } else {
@@ -468,7 +468,7 @@ fn append(
                 p,
                 command,
                 &f.contents,
-                target.as_ref().map(|t| hash(t.image.view())),
+                target.as_ref().map(|t| hash(t.image.id())),
             ),
         )
     };
@@ -666,7 +666,7 @@ pub(super) fn flush(
                 frame(env, owner)
                     .damage
                     .clips
-                    .get(&hash(i.view()))
+                    .get(&hash(i.id()))
                     .copied()
                     .filter(|r| r.w < i.width() || r.h < i.height())
             })
@@ -864,7 +864,7 @@ pub(super) fn present(env: &mut Env<'_>, operation: &Operation) -> Result<Comple
             0
         };
         f.damage.plan(force);
-        f.rotate = !force && f.damage.rotatable(hash(image.view()));
+        f.rotate = !force && f.damage.rotatable(hash(image.id()));
         if verify && copy.is_none() {
             f.verify_image = Some(image.clone());
         }
@@ -874,7 +874,7 @@ pub(super) fn present(env: &mut Env<'_>, operation: &Operation) -> Result<Comple
             w: image.width(),
             h: image.height(),
         };
-        let slot = hash(image.view());
+        let slot = hash(image.id());
         f.verify_region = Some(if force || copy.is_some() {
             full
         } else {

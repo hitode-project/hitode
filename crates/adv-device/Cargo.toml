@@ -10,11 +10,13 @@ publish.workspace = true
 [features]
 default = []
 device = ["dep:cpal"]
-gpu = ["dep:wgpu", "dep:bytemuck", "dep:objc2", "dep:objc2-metal", "dep:objc2-foundation", "dep:objc2-core-foundation", "dep:objc2-core-graphics", "dep:objc2-io-surface", "dep:block2", "dep:naga-types", "dep:libc", "dep:serde"]
+gpu = ["dep:adv-gpu", "dep:arrayvec", "dep:bytemuck", "dep:objc2", "dep:libc", "dep:serde", "dep:naga"]
 # FFmpeg movie decoding; needs FFMPEG_DIR (see docs/building.md).
 media = ["dep:ffmpeg-next"]
 # Full DAC rate matrices; `cargo test-full` enables it.
 slow-tests = []
+# Capture and executor hooks for graphics fixtures only.
+test-support = []
 
 [dependencies]
 cpal = { version = "0.16", optional = true }
@@ -24,12 +26,14 @@ libc = { version = "0.2", optional = true }
 serde = { version = "1", optional = true, features = ["derive", "rc"] }
 serde_json = "1"
 adv-sync = { path = "../adv-sync" }
+adv-gpu = { path = "../adv-gpu", optional = true }
+arrayvec = { version = "0.7", optional = true }
 oxisynth = { version = "0.1.0", features = ["sf3"] }
 rubato = { version = "0.16", default-features = false }
 symphonia = { version = "0.5.5", default-features = false, features = ["pcm", "adpcm", "vorbis"] }
 ogg = "0.9.2"
 ffmpeg-next = { version = "8.0", optional = true, default-features = false, features = ["codec", "format", "software-scaling", "software-resampling"] }
-wgpu = { version = "=30.0.1", optional = true, default-features = false, features = ["std", "vulkan", "gles", "wgsl"] }
+naga = { version = "=30.0.1", optional = true, features = ["wgsl-in"] }
 bytemuck = { version = "1.23", optional = true, features = ["derive"] }
 
 # One portable outline/raster stack. Font discovery needs no native fontconfig
@@ -42,7 +46,8 @@ fontdb = { version = "0.24", default-features = false, features = ["fs"] }
 encoding_rs.workspace = true
 
 [dev-dependencies]
-pollster = "0.4"
+adv-device = { path = ".", features = ["test-support"] }
+adv-display = { path = "../adv-display" }
 
 [build-dependencies]
 cc = "1"
@@ -53,18 +58,5 @@ objc2-io-surface = { version = "0.3.2", default-features = false, features = ["s
 [lints]
 workspace = true
 
-[[test]]
-name = "gpu"
-required-features = ["gpu"]
-
 [target.'cfg(target_vendor = "apple")'.dependencies]
-wgpu = { version = "=30.0.1", optional = true, default-features = false, features = ["metal"] }
-
 objc2 = { version = "0.6.4", optional = true }
-objc2-metal = { version = "0.3.2", optional = true, default-features = false, features = ["std", "objc2-io-surface"] }
-objc2-core-foundation = { version = "0.3.2", optional = true, default-features = false, features = ["std", "CFDictionary", "CFNumber", "CFString"] }
-objc2-core-graphics = { version = "0.3.2", optional = true, default-features = false, features = ["std", "CGColorSpace"] }
-objc2-io-surface = { version = "0.3.2", optional = true, default-features = false, features = ["std", "IOSurfaceRef", "objc2-core-foundation"] }
-objc2-foundation = { version = "0.3.2", optional = true, default-features = false, features = ["std", "NSString", "NSRange"] }
-block2 = { version = "0.6.2", optional = true }
-naga-types = { version = "=30.0.1", optional = true }

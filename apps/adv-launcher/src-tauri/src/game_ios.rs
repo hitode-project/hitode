@@ -22,8 +22,9 @@ use objc2_avf_audio::{
 };
 use objc2_foundation::{NSNotification, NSNotificationCenter, NSObjectProtocol, NSOperationQueue};
 use objc2_ui_kit::{
-    UIApplication, UIApplicationDidBecomeActiveNotification, UIApplicationState,
-    UIApplicationWillResignActiveNotification, UIView,
+    UIApplication, UIApplicationDidBecomeActiveNotification,
+    UIApplicationDidEnterBackgroundNotification, UIApplicationDidReceiveMemoryWarningNotification,
+    UIApplicationState, UIApplicationWillResignActiveNotification, UIView,
 };
 use std::{cell::RefCell, ptr::NonNull, rc::Rc, sync::Mutex, time::Instant};
 use tauri::{AppHandle, Manager, WebviewWindow};
@@ -107,6 +108,17 @@ pub fn setup(app: &tauri::App) -> tauri::Result<()> {
                 center.addObserverForName_object_queue_usingBlock(Some(name), None, None, &block)
             });
         }
+        for name in unsafe {
+            [
+                UIApplicationDidEnterBackgroundNotification,
+                UIApplicationDidReceiveMemoryWarningNotification,
+            ]
+        } {
+            let block = RcBlock::new(|_: NonNull<NSNotification>| trim_memory());
+            observers.push(unsafe {
+                center.addObserverForName_object_queue_usingBlock(Some(name), None, None, &block)
+            });
+        }
         // Audio interruptions are posted off the main thread.
         if let Some(name) = unsafe { AVAudioSessionInterruptionNotification } {
             let block = RcBlock::new(|notification: NonNull<NSNotification>| {
@@ -154,6 +166,14 @@ pub fn setup(app: &tauri::App) -> tauri::Result<()> {
         });
     });
     Ok(())
+}
+
+fn trim_memory() {
+    HOST.with_borrow(|host| {
+        if let Some(session) = &host.session {
+            session.trim_memory();
+        }
+    });
 }
 
 fn lifecycle(active: bool) {

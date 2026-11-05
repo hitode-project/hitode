@@ -265,23 +265,8 @@ fn update_surface(
                 None,
             ),
         };
-        let mut raw = vec![0; ((from.h - 1) * pitch + row) as usize];
-        env.cpu.read(address, &mut raw).map_err(|_| INVALID)?;
-        let raw = Arc::new(raw);
         let source_pitch = pitch;
-        let (pixels, pitch) = if matches!(src.desc.Format, 21 | 28) {
-            (Arc::clone(&raw), pitch)
-        } else {
-            let (pixels, pitch) =
-                format::upload(src.desc.Format, raw.as_ref().clone(), pitch, from.w, from.h)
-                    .ok_or(INVALID)?;
-            (Arc::new(pixels), pitch)
-        };
-        let pixels = if src.desc.Format == 28 {
-            Pixels::Alpha8(pixels)
-        } else {
-            Pixels::Host(pixels)
-        };
+        let source_format = src.desc.Format;
         let shadow = resources::storage(env, dst).map(|address| {
             let pitch = format::pitch(dst.desc.Format, dst.desc.Width).unwrap();
             (
@@ -295,6 +280,22 @@ fn update_surface(
             adv_abi::guest::check_range(env.cpu, address, (from.h - 1) * pitch + row, Prot::WRITE)
                 .map_err(|_| INVALID)?;
         }
+        let mut raw = Vec::new();
+        if shadow.is_some() {
+            raw.resize(((from.h - 1) * pitch + row) as usize, 0);
+            env.cpu.read(address, &mut raw).map_err(|_| INVALID)?;
+        }
+        let state = env.ext.get_mut::<State>();
+        let gpu = state.gpu.as_mut().ok_or(UNAVAILABLE)?;
+        let (pixels, pitch) = format::snapshot(
+            env.cpu,
+            gpu,
+            &mut state.upload_admission,
+            &mut state.upload_scratch,
+            (source_format, address, pitch),
+            (from.w, from.h),
+        )
+        .ok_or(INVALID)?;
         Ok((
             owner,
             resource,
@@ -335,7 +336,7 @@ fn update_surface(
 
 /// The guest copy of an uploaded surface: source pitch, row bytes, height,
 /// destination address and pitch, and the uploaded bytes.
-type Shadow = (u32, u32, u32, Option<(u32, u32)>, Arc<Vec<u8>>);
+type Shadow = (u32, u32, u32, Option<(u32, u32)>, Vec<u8>);
 
 fn surface_uploaded(
     env: &mut Env<'_>,
@@ -451,6 +452,7 @@ fn color_fill(
         texel[3] = 255;
     }
     let pixels = texel.repeat(to.w as usize * to.h as usize);
+    let admission = env.ext.get_mut::<State>().admit_upload();
     dispatch(
         env,
         owner,
@@ -458,7 +460,7 @@ fn color_fill(
             resource,
             level,
             target,
-            pixels: Pixels::Host(Arc::new(pixels)),
+            pixels: Pixels::Host(Arc::new(pixels), admission),
             pitch: to.w * 4,
             rectangle: to,
         },

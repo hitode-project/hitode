@@ -718,14 +718,16 @@ fn guest_movie_render_configures_system_window_streams_video_and_pcm_and_release
         panic!("stream must wait after its first frame");
     };
     let frame = video::latest(&env(&mut m), graph).unwrap();
-    assert!(frame.bgra[0] < 20 && frame.bgra[1] < 20 && frame.bgra[2] > 220);
+    let pixels = frame.bgra();
+    assert!(pixels[0] < 20 && pixels[1] < 20 && pixels[2] > 220);
     m.sys.clock.advance_to(m.sys.clock.now_us() + 40_000);
     let outcome = then(&mut env(&mut m), Resume::Woke(WakeReason::Timeout));
     let Outcome::Block { then, .. } = outcome else {
         panic!("stream must wait after its second frame");
     };
     let frame = video::latest(&env(&mut m), graph).unwrap();
-    assert!(frame.bgra[0] < 20 && frame.bgra[1] < 20 && frame.bgra[2] > 220);
+    let pixels = frame.bgra();
+    assert!(pixels[0] < 20 && pixels[1] < 20 && pixels[2] > 220);
     assert!(
         m.ext.get::<State>().filters[&splitter]
             .source
@@ -774,8 +776,8 @@ fn guest_movie_render_configures_system_window_streams_video_and_pcm_and_release
         panic!("paused stream must retain its frame and wait");
     };
     assert_eq!(
-        video::latest(&env(&mut m), graph).unwrap().bgra.as_ref(),
-        frame.bgra.as_ref()
+        video::latest(&env(&mut m), graph).unwrap().bgra(),
+        frame.bgra()
     );
     assert_eq!(m.ext.get::<Presentation>().updates.len(), updates);
     // Owner visibility can change while the paused decoder emits no frames.

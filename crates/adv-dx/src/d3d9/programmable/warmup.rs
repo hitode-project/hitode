@@ -33,25 +33,16 @@ fn schedule(
         id.and_then(|id| shaders::bound(env, id))
             .map(|s| (s.parsed.clone(), s.translation.clone()))
     });
-    let inputs = if let Some((vs, _)) = &stages[0] {
-        let result = match declaration {
-            Some(elements) => declaration_inputs(elements, vs),
-            None => super::inputs(env, pointer, vs),
-        };
-        result.unwrap_or_else(|_| {
-            vs.inputs
-                .iter()
-                .filter(|i| i.register.kind == crate::shader::RegisterKind::Input)
-                .map(|i| Input {
-                    stream: 0,
-                    offset: 0,
-                    format: AttributeFormat::Float4,
-                    register: u32::from(i.register.index),
-                })
-                .collect()
-        })
-    } else {
-        Vec::new()
+    // Only a bound vertex shader with resolved inputs predicts the draw's
+    // streams; fixed-function vertices take their layout from each draw.
+    let Some((vs, _)) = &stages[0] else {
+        return;
+    };
+    let Ok(inputs) = (match declaration {
+        Some(elements) => declaration_inputs(elements, vs),
+        None => super::inputs(env, pointer, vs),
+    }) else {
+        return;
     };
     let key = ProgramKey {
         vertex: ids[0],
@@ -61,13 +52,64 @@ fn schedule(
         features: (d.fixed.render[&152], d.fixed.render[&28] != 0),
         fixed: fixed_features(&d.fixed, None),
     };
+    // The first draw is predicted to match the last one (triangle lists
+    // before any); raster conversion and attachments are the draw's own.
+    let (kind, up_stride) = env
+        .ext
+        .get::<State>()
+        .programs
+        .last_draw
+        .unwrap_or((4, None));
+    let prediction = fixed::prepare_state(env, pointer, kind)
+        .ok()
+        .map(|(target, _, state)| {
+            let textures = std::array::from_fn(|slot| texture(env, pointer, slot, &state).ok());
+            (target, state, textures)
+        });
+    let streams: Vec<_> = (0..16)
+        .filter_map(|n| {
+            let attributes: Vec<_> = inputs
+                .iter()
+                .filter(|i| i.stream == n)
+                .map(|i| Attribute {
+                    location: i.register,
+                    offset: i.offset,
+                    format: i.format,
+                })
+                .collect();
+            (!attributes.is_empty()).then(|| VertexStream {
+                stride: up_stride
+                    .filter(|_| n == 0)
+                    .unwrap_or(d.buffers.streams[n].stride),
+                attributes,
+                instance: d.buffers.frequencies[0] & buffers::INDEXED_DATA != 0
+                    && d.buffers.frequencies[n] & buffers::INSTANCE_DATA != 0,
+                bytes: Vec::new().into(),
+            })
+        })
+        .collect::<Vec<_>>();
+    // Without a bound stream the draw's layout is still unknown: the program
+    // still warms, but no pipeline is predicted.
+    let prediction = prediction.filter(|_| streams.iter().all(|s| s.stride != 0));
     let state = env.ext.get_mut::<State>();
-    let Some(context) = state.gpu.as_ref().map(|gpu| gpu.context().clone()) else {
+    let Some(context) = state.gpu.as_ref().map(|gpu| {
+        gpu.compile_handle(
+            prediction
+                .as_ref()
+                .map(|(target, state, textures)| (target, state, textures)),
+            &streams,
+        )
+    }) else {
         return;
     };
     let cache = &mut state.programs;
-    if cache.entries.contains_key(&key) || cache.warming.contains_key(&key) {
-        return;
+    if cache.warming.remove(&key).is_some() {
+        let at = cache
+            .warming_order
+            .iter()
+            .position(|(k, _)| k == &key)
+            .unwrap();
+        cache.warming_bytes -= cache.warming_order.remove(at).unwrap().1;
     }
     // Reserve the maximum result for each speculative variant. Larger programs
     // remain supported through the ordinary draw path, without speculative copies.
@@ -126,7 +168,9 @@ fn schedule(
                 .as_ref()
                 .map_or(Default::default(), |t| t.constants)
         });
-        context.prepare_program(program).map_err(|e| e.to_string())
+        context
+            .prepare_program(program, &slots)
+            .map_err(|e| e.to_string())
     });
     cache.warming.insert(key, job);
 }
@@ -134,6 +178,164 @@ fn schedule(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use adv_cpu::backend::Guest;
+    // spec: GFX-CACHE-7, GFX-CACHE-10
+    #[test]
+    fn creation_anticipates_the_first_matching_draw_without_a_new_compile() {
+        use crate::d3d9::stretch::tests::Fixture;
+        let mut f = Fixture::new();
+        for (state, value) in [(7, 0), (22, 1)] {
+            f.okay(
+                "IDirect3DDevice9::SetRenderState",
+                &[f.device, state, value],
+            );
+        }
+        let output = f.packet(0u32);
+        f.okay(
+            "IDirect3DDevice9::CreateVertexBuffer",
+            &[f.device, 60, 0, 0, 1, output, 0],
+        );
+        let buffer = f.m.cpu.read_u32(output).unwrap();
+        f.okay("IDirect3DVertexBuffer9::Lock", &[buffer, 0, 0, output, 0]);
+        f.m.cpu
+            .write(
+                f.m.cpu.read_u32(output).unwrap(),
+                bytemuck::cast_slice(&[
+                    [0f32, -1., -1., 0.5, 1.],
+                    [0., 3., -1., 0.5, 1.],
+                    [0., -1., 3., 0.5, 1.],
+                ]),
+            )
+            .unwrap();
+        f.okay("IDirect3DVertexBuffer9::Unlock", &[buffer]);
+        f.okay(
+            "IDirect3DDevice9::SetStreamSource",
+            &[f.device, 0, buffer, 0, 20],
+        );
+        let vertex = f.packet([
+            0xfffe0200u32,
+            0x0200001f,
+            0x80000000,
+            0x900f0000,
+            0x02000001,
+            0xc00f0000,
+            0x90e40000,
+            0xffff,
+        ]);
+        f.okay(
+            "IDirect3DDevice9::CreateVertexShader",
+            &[f.device, vertex, output],
+        );
+        let vertex = f.m.cpu.read_u32(output).unwrap();
+        f.okay("IDirect3DDevice9::SetVertexShader", &[f.device, vertex]);
+        let pixel = f.packet([0xffff0200u32, 0x02000001, 0x800f0800, 0xa0e40000, 0xffff]);
+        f.okay(
+            "IDirect3DDevice9::CreatePixelShader",
+            &[f.device, pixel, output],
+        );
+        let pixel = f.m.cpu.read_u32(output).unwrap();
+        f.okay("IDirect3DDevice9::SetPixelShader", &[f.device, pixel]);
+        let elements = f.packet([[0u8, 0, 4, 0, 3, 0, 0, 0], [255, 0, 0, 0, 17, 0, 0, 0]]);
+        f.okay(
+            "IDirect3DDevice9::CreateVertexDeclaration",
+            &[f.device, elements, output],
+        );
+        let declaration = f.m.cpu.read_u32(output).unwrap();
+        f.okay(
+            "IDirect3DDevice9::SetVertexDeclaration",
+            &[f.device, declaration],
+        );
+        for job in f.m.ext.get::<State>().programs.warming.values() {
+            job.resolve().as_ref().unwrap();
+        }
+        let before = f.m.ext.get::<State>().gpu.as_ref().unwrap().stats();
+        f.okay("IDirect3DDevice9::BeginScene", &[f.device]);
+        f.okay("IDirect3DDevice9::DrawPrimitive", &[f.device, 4, 0, 1]);
+        let image = f.image(f.back);
+        f.pixels(&image);
+        let after = f.m.ext.get::<State>().gpu.as_ref().unwrap().stats();
+        assert_eq!(after.draws - before.draws, 1);
+        assert_eq!(
+            after.anticipated_pipeline_draws - before.anticipated_pipeline_draws,
+            1
+        );
+        assert_eq!(after.prebuild_misses, before.prebuild_misses);
+    }
+
+    // spec: GFX-CACHE-7
+    #[test]
+    fn creation_predicts_the_last_draws_primitive_type_and_user_stride() {
+        use crate::d3d9::stretch::tests::Fixture;
+        let mut f = Fixture::new();
+        for (state, value) in [(7, 0), (22, 1)] {
+            f.okay(
+                "IDirect3DDevice9::SetRenderState",
+                &[f.device, state, value],
+            );
+        }
+        let output = f.packet(0u32);
+        let vertex = f.packet([
+            0xfffe0200u32,
+            0x0200001f,
+            0x80000000,
+            0x900f0000,
+            0x02000001,
+            0xc00f0000,
+            0x90e40000,
+            0xffff,
+        ]);
+        f.okay(
+            "IDirect3DDevice9::CreateVertexShader",
+            &[f.device, vertex, output],
+        );
+        let vertex = f.m.cpu.read_u32(output).unwrap();
+        f.okay("IDirect3DDevice9::SetVertexShader", &[f.device, vertex]);
+        let elements = f.packet([[0u8, 0, 4, 0, 3, 0, 0, 0], [255, 0, 0, 0, 17, 0, 0, 0]]);
+        f.okay(
+            "IDirect3DDevice9::CreateVertexDeclaration",
+            &[f.device, elements, output],
+        );
+        let declaration = f.m.cpu.read_u32(output).unwrap();
+        f.okay(
+            "IDirect3DDevice9::SetVertexDeclaration",
+            &[f.device, declaration],
+        );
+        // A quad as a user-pointer triangle strip, stride 20.
+        let quad = f.packet([
+            [0f32, -1., -1., 0.5, 1.],
+            [0., -1., 1., 0.5, 1.],
+            [0., 1., -1., 0.5, 1.],
+            [0., 1., 1., 0.5, 1.],
+        ]);
+        let draw = |f: &mut Fixture, constant: u32| {
+            let pixel = f.packet([0xffff0200u32, 0x02000001, 0x800f0800, constant, 0xffff]);
+            f.okay(
+                "IDirect3DDevice9::CreatePixelShader",
+                &[f.device, pixel, output],
+            );
+            let pixel = f.m.cpu.read_u32(output).unwrap();
+            f.okay("IDirect3DDevice9::SetPixelShader", &[f.device, pixel]);
+            for job in f.m.ext.get::<State>().programs.warming.values() {
+                job.resolve().as_ref().unwrap();
+            }
+            let before = f.m.ext.get::<State>().gpu.as_ref().unwrap().stats();
+            f.okay("IDirect3DDevice9::BeginScene", &[f.device]);
+            f.okay(
+                "IDirect3DDevice9::DrawPrimitiveUP",
+                &[f.device, 5, 2, quad, 20],
+            );
+            f.okay("IDirect3DDevice9::EndScene", &[f.device]);
+            let image = f.image(f.back);
+            f.pixels(&image);
+            let after = f.m.ext.get::<State>().gpu.as_ref().unwrap().stats();
+            after.anticipated_pipeline_draws - before.anticipated_pipeline_draws
+        };
+        // The first strip draw follows a triangle-list prediction; the next
+        // shader is predicted as the strip it will draw.
+        assert_eq!(draw(&mut f, 0xa0e40000), 0);
+        assert_eq!(draw(&mut f, 0xa0e40001), 1);
+    }
+
     // spec: GFX-CACHE-7, GFX-SHADER-3
     #[test]
     fn shader_and_declaration_creation_prepare_exact_draw_modules() {
@@ -141,11 +343,8 @@ mod tests {
         machine.sys.objects = Objects::default();
         machine.ext.get_mut::<State>().com = Com::new(&mut machine.sys.objects).unwrap();
         machine.ext.get_mut::<State>().gpu = Some(
-            pollster::block_on(adv_device::gpu::Gpu::request(!cfg!(any(
-                target_os = "macos",
-                target_os = "android"
-            ))))
-            .unwrap(),
+            adv_device::gpu::Gpu::request(!cfg!(any(target_os = "macos", target_os = "android")))
+                .unwrap(),
         );
         let mut env = Env {
             context: machine.sys.current,
@@ -223,8 +422,8 @@ mod tests {
         let expected = source::build(
             Some(&vs),
             Some(&ps),
-            Some(&vs.translate().unwrap()),
-            Some(&ps.translate().unwrap()),
+            Some(&vs.translate(false).unwrap()),
+            Some(&ps.translate(false).unwrap()),
             &[Input {
                 stream: 0,
                 offset: 0,

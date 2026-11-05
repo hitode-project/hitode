@@ -170,7 +170,7 @@ fn evict(env: &mut Env<'_>, this: GuestPtr<()>) -> u32 {
     for (id, levels) in textures {
         surfaces(env, id, &vec![None; levels.len()], true);
     }
-    // Dropping saved retires the last owned GPU views. Submitted wgpu commands
+    // Dropping saved retires the last owned GPU views. Submitted GPU commands
     // keep their own backend lifetime; no queued image is explicitly destroyed.
     0
 }
@@ -225,7 +225,13 @@ pub(super) fn ensure(env: &mut Env<'_>, pointer: u32) -> u32 {
         );
         return UNAVAILABLE;
     };
-    let target = match gpu.target_levels(width, height, count) {
+    let texel = format::texel(format).unwrap();
+    let stored = if gpu.stores(texel) {
+        texel
+    } else {
+        adv_device::gpu::TexelFormat::Bgra8
+    };
+    let target = match gpu.texture_levels(width, height, count, stored) {
         Ok(target) => target.with_alpha_mode(targets::alpha_mode(format)),
         Err(error) => {
             return match gpu_error(error) {

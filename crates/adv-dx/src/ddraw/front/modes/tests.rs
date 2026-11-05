@@ -5,6 +5,8 @@ use adv_cpu::{
     JitCpu,
     backend::{Guest, GuestExt, asm::Asm},
 };
+#[cfg(feature = "gpu")]
+use adv_device::gpu::test_support::SurfaceCapture;
 use adv_device::surface::{MemoryOperations, MemoryView, Snapshot};
 use adv_machine::{Clock, Conv, Machine, Resume, RunResult, Wait, layout::PARK_ADDR};
 use std::borrow::Cow;
@@ -27,10 +29,17 @@ fn primary_blits_refresh_window_clipper_geometry_after_moves_without_reattachmen
             origin: (point.0, point.1),
         })
     };
-    let call = |m: &mut Machine<JitCpu>, id, args: &[u32]| match front::call(&mut env(m), id, args)
-    {
-        Outcome::Return(hr) => hr,
-        _ => panic!("synchronous authored draw"),
+    let call = |m: &mut Machine<JitCpu>, id, args: &[u32]| {
+        let result = match front::call(&mut env(m), id, args) {
+            Outcome::Return(hr) => hr,
+            _ => panic!("synchronous authored draw"),
+        };
+        #[cfg(feature = "gpu")]
+        {
+            let (capture, surfaces) = m.ext.get2_installed_mut::<SurfaceCapture, SurfaceStore>();
+            capture.update(surfaces);
+        }
+        result
     };
     assert_eq!(call(&mut m, api::CREATE_CLIPPER, &[device, 0, DATA, 0]), 0);
     let clipper = m.cpu.read_u32(DATA).unwrap();
@@ -156,6 +165,8 @@ fn setup(jit: bool, legacy: bool, mut registry: Registry) -> (Machine<JitCpu>, u
     m.cpu.map(CODE, 4096, Prot::RX).unwrap();
     m.cpu.map(DATA, 4096, Prot::RW).unwrap();
     m.cpu.map(0x500000, 65536, Prot::RW).unwrap();
+    #[cfg(feature = "gpu")]
+    m.ext.insert(SurfaceCapture::new().unwrap());
     m.ext
         .insert(SurfaceStore::new(800, 600, 0x500000, 65536, Snapshot::default()).unwrap());
     front::install(

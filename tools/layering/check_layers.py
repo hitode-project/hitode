@@ -30,7 +30,8 @@ RULES: dict[str, set[str]] = {
     "adv-gpu": set(),
     # Planner, display stages, pools and compositors over adv-gpu (issue #103).
     "adv-display": {"adv-gpu"},
-    "adv-device": {"adv-sync"},
+    # The D3D9/DirectDraw executor records onto adv-gpu (issue #103).
+    "adv-device": {"adv-sync", "adv-gpu"},
     "adv-dx": {"adv-abi", "adv-device"},
     # Wine's server, run in process for the Wine userland stack (issue #58).
     "adv-wineserver": set(),
@@ -43,7 +44,7 @@ RULES: dict[str, set[str]] = {
     # The assembly wires the Wine userland over the NT platform, and its
     # sessions connect the server to the NT platform.
     "adv-runtime": {"adv-dx", "adv-drv", "adv-wineserver"},
-    "adv-shell": {"adv-runtime", "adv-device", "adv-sync", "adv-report"},
+    "adv-shell": {"adv-runtime", "adv-device", "adv-display", "adv-sync", "adv-report"},
     "adv-run": {"adv-shell"},
     "adv-jit-helper": set(),
     # Tauri player frontend: library and in-game overlay over the native game view.

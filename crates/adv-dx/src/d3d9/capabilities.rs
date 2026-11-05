@@ -36,7 +36,7 @@ fn available(env: &Env<'_>) -> bool {
         .get::<State>()
         .gpu
         .as_ref()
-        .is_some_and(|g| g.context().check().is_ok())
+        .is_some_and(|g| g.check().is_ok())
 }
 fn mode_value(env: &Env<'_>) -> D3DDISPLAYMODE {
     let (width, height, refresh) = (env.ext.get::<State>().provider.display)(env.ext);
@@ -276,16 +276,11 @@ fn check_conversion(
 }
 pub(super) fn caps(env: &Env<'_>) -> Result<D3DCAPS9, u32> {
     let g = env.ext.get::<State>().gpu.as_ref().ok_or(UNAVAILABLE)?;
-    g.context().check().map_err(|_| DEVICE_LOST)?;
+    g.check().map_err(|_| DEVICE_LOST)?;
     // 4096 is what D3D9-era hardware reported and titles test against; a full
     // square level fits the 64 MiB level budget. Drawing uses 40-byte neutral
     // vertices; 131072 triangles fit the 16 MiB bounded vertex upload.
-    let texture_size = g
-        .context()
-        .device
-        .limits()
-        .max_texture_dimension_2d
-        .min(4096);
+    let texture_size = g.max_image_size().min(4096);
     let gates = env.ext.get::<State>().shader_caps;
     let model = if gates.sm3 {
         3
@@ -437,11 +432,8 @@ mod tests {
     // spec: GFX-CAP-1, GFX-CAP-2, GFX-CAP-3
     fn capabilities_exclude_unimplemented_paths_and_bound_the_usable_upload() {
         let mut m = super::super::tests::machine();
-        let gpu = pollster::block_on(Gpu::request(!cfg!(any(
-            target_os = "macos",
-            target_os = "android"
-        ))))
-        .expect("capability GPU fixture adapter");
+        let gpu = Gpu::request(!cfg!(any(target_os = "macos", target_os = "android")))
+            .expect("capability GPU fixture adapter");
         set_gpu(&mut m.ext, gpu).unwrap();
         let mut env = Env {
             context: m.sys.current,

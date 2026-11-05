@@ -6,7 +6,9 @@ fn main() {
             Ok("macos" | "ios")
         )
     {
-        for framework in ["VideoToolbox", "CoreMedia"] {
+        // Static FFmpeg's VideoToolbox code also needs CoreVideo, which the
+        // wgpu Metal backend used to link for it.
+        for framework in ["VideoToolbox", "CoreMedia", "CoreVideo"] {
             println!("cargo:rustc-link-lib=framework={framework}");
         }
     }

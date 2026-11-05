@@ -22,7 +22,16 @@ unsafe extern "system" fn debug_message(
 impl Device {
     pub(crate) fn open(options: &DeviceOptions) -> Result<(crate::Device, crate::Queue)> {
         // SAFETY: All creation structures and extension names live through their calls.
-        unsafe { Self::open_vk(options, None) }
+        let (device, mut queue) = unsafe { Self::open_vk(options, None) }?;
+        if clears_pack_4444(&device, &mut queue)? {
+            return Ok((device, queue));
+        }
+        drop((device, queue));
+        let options = DeviceOptions {
+            disable: options.disable | Modern::DYNAMIC_RENDERING,
+            ..options.clone()
+        };
+        unsafe { Self::open_vk(&options, None) }
     }
     #[cfg(test)]
     pub(super) fn open_with_push_limit(
@@ -100,7 +109,15 @@ impl Device {
             } else {
                 None
             };
-            let result = Self::open_device(options, &entry, &instance);
+            #[cfg(target_os = "android")]
+            let mut video_format = None;
+            let result = Self::open_device(
+                options,
+                &entry,
+                &instance,
+                #[cfg(target_os = "android")]
+                &mut video_format,
+            );
             let (
                 physical,
                 device,
@@ -192,6 +209,10 @@ impl Device {
                 .modern
                 .contains(Modern::EXTENDED_DYNAMIC_STATE)
                 .then(|| Eds::load(&instance, &device, device_api));
+            let atom = instance
+                .get_physical_device_properties(physical)
+                .limits
+                .non_coherent_atom_size;
             let context = Arc::new(Context {
                 eds,
                 pipelines: Mutex::new(pipeline::Pipelines::default()),
@@ -209,6 +230,8 @@ impl Device {
                 semaphore_fd: ash::khr::external_semaphore_fd::Device::new(&instance, &device),
                 #[cfg(target_os = "android")]
                 vendor: properties.vendor_id,
+                #[cfg(target_os = "android")]
+                video_format,
                 _entry: entry,
                 instance,
                 debug,
@@ -217,6 +240,7 @@ impl Device {
                 family,
                 caps,
                 memory,
+                atom,
                 allocator: Mutex::new(Some(allocator)),
                 lost: AtomicBool::new(false),
                 next: AtomicU64::new(1),
@@ -243,6 +267,7 @@ impl Device {
         options: &DeviceOptions,
         entry: &ash::Entry,
         instance: &ash::Instance,
+        #[cfg(target_os = "android")] opened_video_format: &mut Option<video::VideoFormat>,
     ) -> Result<(
         vk::PhysicalDevice,
         ash::Device,
@@ -300,6 +325,16 @@ impl Device {
                     .unwrap_or(vk::API_VERSION_1_0),
             );
             let mut names = Vec::new();
+            let mut float_controls = vk::PhysicalDeviceFloatControlsProperties::default();
+            if api >= vk::API_VERSION_1_2 || has(ash::khr::shader_float_controls::NAME) {
+                let mut properties =
+                    vk::PhysicalDeviceProperties2::default().push_next(&mut float_controls);
+                instance.get_physical_device_properties2(physical, &mut properties);
+                if api < vk::API_VERSION_1_2 {
+                    names.push(ash::khr::shader_float_controls::NAME.as_ptr());
+                }
+            }
+
             #[cfg(target_os = "android")]
             for name in [
                 ash::android::external_memory_android_hardware_buffer::NAME,
@@ -634,7 +669,20 @@ impl Device {
             #[cfg(target_os = "android")]
             let present_caps = present::capabilities(props.vendor_id);
             #[cfg(target_os = "android")]
-            if present_caps.contains(FormatCaps::PRESENTABLE) {
+            let video_format = match present::yuv_capabilities(
+                &device,
+                &ash::android::external_memory_android_hardware_buffer::Device::new(
+                    instance, &device,
+                ),
+            ) {
+                Ok(caps) => caps,
+                Err(error) => {
+                    device.destroy_device(None);
+                    return Err(error);
+                }
+            };
+            #[cfg(target_os = "android")]
+            if present_caps.contains(FormatCaps::PRESENTABLE) || video_format.is_some() {
                 feature_bits |= Features::PRESENTABLE_BUFFERS;
             }
             if memory.memory_types_as_slice().iter().any(|t| {
@@ -663,6 +711,24 @@ impl Device {
             let formats = formats::ALL
                 .iter()
                 .map(|&f| {
+                    if f == Format::Nv21 {
+                        #[cfg(target_os = "android")]
+                        return (
+                            f,
+                            video_format.map_or(FormatCaps::empty(), |format| {
+                                let mut caps = FormatCaps::PRESENTABLE | FormatCaps::SAMPLED;
+                                if format
+                                    .features
+                                    .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR)
+                                {
+                                    caps |= FormatCaps::FILTERED;
+                                }
+                                caps
+                            }),
+                        );
+                        #[cfg(not(target_os = "android"))]
+                        return (f, FormatCaps::empty());
+                    }
                     let flags = instance
                         .get_physical_device_format_properties(physical, formats::vk(f))
                         .optimal_tiling_features;
@@ -698,19 +764,16 @@ impl Device {
                     (f, caps)
                 })
                 .collect();
-            let tile = if tile_extension {
-                match query_tile(instance, &device) {
-                    Ok(tile) => tile,
-                    Err(error) => {
-                        device.destroy_device(None);
-                        return Err(error);
-                    }
+            let tile = match query_tile(instance, &device, tile_extension) {
+                Ok(tile) => tile,
+                Err(error) => {
+                    device.destroy_device(None);
+                    return Err(error);
                 }
-            } else {
-                (0, 0)
             };
             let caps = Caps {
                 features: feature_bits,
+                ieee_f32: float_controls.shader_signed_zero_inf_nan_preserve_float32 != 0,
                 modern,
                 adapter: CStr::from_ptr(props.device_name.as_ptr())
                     .to_string_lossy()
@@ -748,6 +811,10 @@ impl Device {
                     push_constant_bytes: l.max_push_constants_size,
                 },
             };
+            #[cfg(target_os = "android")]
+            {
+                *opened_video_format = video_format;
+            }
             Ok((
                 physical,
                 device,
@@ -763,8 +830,15 @@ impl Device {
     }
 }
 
-unsafe fn query_tile(instance: &ash::Instance, device: &ash::Device) -> Result<(u32, u32)> {
-    // The bin size of one full-HD RGBA8 color target, the common display case.
+/// The bin size of one full-HD RGBA8 color target, the common display case;
+/// without `VK_QCOM_tile_properties`, the render area granularity. Damage
+/// tiles align to it, so partial passes keep the optimal render areas the
+/// specification describes (Mali drivers lose pixels beside unaligned ones).
+unsafe fn query_tile(
+    instance: &ash::Instance,
+    device: &ash::Device,
+    qcom: bool,
+) -> Result<(u32, u32)> {
     let (width, height) = (1920, 1080);
     let format = [vk::Format::R8G8B8A8_UNORM];
     unsafe {
@@ -789,6 +863,11 @@ unsafe fn query_tile(instance: &ash::Instance, device: &ash::Device) -> Result<(
                 None,
             )
             .map_err(vk_error)?;
+        if !qcom {
+            let granularity = device.get_render_area_granularity(pass);
+            device.destroy_render_pass(pass, None);
+            return Ok((granularity.width, granularity.height));
+        }
         let images = [vk::FramebufferAttachmentImageInfo::default()
             .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
             .width(width)
@@ -828,4 +907,84 @@ unsafe fn query_tile(instance: &ash::Instance, device: &ash::Device) -> Result<(
         result.result().map_err(vk_error)?;
         Ok((properties.tile_size.width, properties.tile_size.height))
     }
+}
+
+/// Whether dynamic rendering clears a 4444 target to the documented bits.
+/// Mali-G715 drivers (r44) pack the clear color as 565 there; render passes
+/// pack it right, so such a device opens without dynamic rendering. One 1x1
+/// clear and readback at open.
+fn clears_pack_4444(device: &crate::Device, queue: &mut crate::Queue) -> Result<bool> {
+    use crate::encode::{BufferCopy, ColorAttachment, ImageCopy, Load, RenderPassDesc, Store};
+    use crate::resource::{BufferDesc, BufferUsage, Dimension, ImageDesc, Memory, Usage};
+    let caps = device.caps();
+    if !caps.modern.contains(Modern::DYNAMIC_RENDERING)
+        || !caps.format(Format::Bgra4Unorm).contains(FormatCaps::COLOR)
+    {
+        return Ok(true);
+    }
+    let size = crate::Extent {
+        width: 1,
+        height: 1,
+        depth_or_layers: 1,
+    };
+    let image = device.create_image(&ImageDesc {
+        dimension: Dimension::D2,
+        size,
+        format: Format::Bgra4Unorm,
+        mips: 1,
+        samples: 1,
+        usage: Usage::COLOR | Usage::COPY_SRC,
+        view_formats: &[],
+        label: "4444 clear check",
+    })?;
+    let readback = device.create_buffer(&BufferDesc {
+        size: 4,
+        usage: BufferUsage::COPY_DST,
+        memory: Memory::Readback,
+        label: "4444 clear check",
+    })?;
+    let mut encoder = queue.encoder("4444 clear check");
+    drop(
+        encoder.render_pass(&RenderPassDesc {
+            colors: [ColorAttachment {
+                view: image.view(),
+                load: Load::Clear([1.0, 0.0, 0.0, 1.0]),
+                store: Store::Store,
+                resolve: None,
+            }]
+            .into_iter()
+            .collect(),
+            depth_stencil: None,
+            area: crate::Rect {
+                x: 0,
+                y: 0,
+                w: 1,
+                h: 1,
+            },
+            timestamps: None,
+            label: "4444 clear check",
+        }),
+    );
+    encoder.copy_image_to_buffer(
+        ImageCopy {
+            image: &image,
+            mip: 0,
+            layer: 0,
+            origin: (0, 0, 0),
+        },
+        BufferCopy {
+            buffer: &readback,
+            offset: 0,
+            row_pitch: 0,
+            rows: 0,
+        },
+        size,
+    );
+    let token = queue.submit(encoder)?;
+    if !queue.wait(token, std::time::Duration::from_secs(5))? {
+        return Err(Error::DeviceLost("4444 clear check timed out".into()));
+    }
+    // SAFETY: the submission that wrote the buffer has completed.
+    let texel = unsafe { &readback.mapped().unwrap().as_ref()[..2] };
+    Ok(texel == [0x00, 0xff])
 }

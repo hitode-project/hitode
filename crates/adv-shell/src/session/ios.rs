@@ -45,6 +45,7 @@ define_class!(
                 driver.view.vsync.publish(at, Duration::from_secs_f64(period));
                 driver.view.period.set((period * 1e9) as i64);
             }
+            driver.refreshed();
             driver.drive();
         }
     }
@@ -112,7 +113,7 @@ impl MainLoop {
         // The link retains its target until `invalidate`.
         let link = unsafe { CADisplayLink::displayLinkWithTarget_selector(&target, sel!(frame:)) };
         link.setPaused(true);
-        // The guest is told the display runs at 60 Hz (`refresh_interval`).
+        // The guest is told the display runs at 60 Hz.
         link.setPreferredFrameRateRange(CAFrameRateRange {
             minimum: 30.0,
             maximum: 60.0,
@@ -130,12 +131,7 @@ impl MainLoop {
     }
 
     /// Sample the display clock for new content without delaying submission.
-    pub(super) fn arm(&self, next: Option<Instant>, rate: u32, frame: bool) -> Result<(), String> {
-        self.link.setPreferredFrameRateRange(CAFrameRateRange {
-            minimum: rate as f32,
-            maximum: rate as f32,
-            preferred: rate as f32,
-        });
+    pub(super) fn arm(&self, next: Option<Instant>, frame: bool) -> Result<(), String> {
         if crate::frontend::request_vsync(frame.then(Instant::now), self.pending.get()) {
             self.pending.set(true);
             self.link.setPaused(false);

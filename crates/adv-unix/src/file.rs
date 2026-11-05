@@ -227,6 +227,11 @@ fn host_stat(env: &mut Env<'_>) -> Result<::libc::stat, u32> {
 
 /// fstat(fd, *stat): glibc's i386 `struct stat`, with 32-bit sizes and
 /// times.
+#[allow(
+    clippy::unnecessary_cast,
+    clippy::useless_conversion,
+    reason = "stat field widths differ per host"
+)]
 fn fstat(env: &mut Env<'_>) -> Outcome {
     let buffer = env.arg(1);
     let stat = match host_stat(env) {
@@ -301,6 +306,11 @@ fn store_stat64(env: &mut Env<'_>, stat: Result<::libc::stat, u32>) -> Outcome {
 
 /// The mode, link count, owner, group and device at the offsets both
 /// layouts share. The file type bits are the same on every host.
+#[allow(
+    clippy::unnecessary_cast,
+    clippy::useless_conversion,
+    reason = "stat field widths differ per host"
+)]
 fn common_fields(bytes: &mut [u8], stat: &::libc::stat) {
     bytes[16..20].copy_from_slice(&u32::from(stat.st_mode).to_le_bytes());
     bytes[20..24].copy_from_slice(&(stat.st_nlink as u32).to_le_bytes());

@@ -760,6 +760,15 @@ fn deliver(
 
 /// Top-down BGRA into the negotiated RGB layout (bottom-up for positive heights).
 pub(crate) fn convert(frame: &VideoFrame, mt: &MediaType) -> Vec<u8> {
+    convert_bgra(frame.width, frame.height, &frame.bgra(), mt)
+}
+
+pub(crate) fn convert_bgra(
+    frame_width: u32,
+    frame_height: u32,
+    bgra: &[u8],
+    mt: &MediaType,
+) -> Vec<u8> {
     let Some((width, height, bits)) = mt.video_geometry() else {
         return Vec::new();
     };
@@ -768,12 +777,12 @@ pub(crate) fn convert(frame: &VideoFrame, mt: &MediaType) -> Vec<u8> {
     let stride = ((width as usize * bytes_per) + 3) & !3;
     let mut out = vec![0u8; stride * rows as usize];
     let (w, h) = (
-        width.min(frame.width) as usize,
-        rows.min(frame.height) as usize,
+        width.min(frame_width) as usize,
+        rows.min(frame_height) as usize,
     );
     let rgb565 = mt.sub == MEDIASUBTYPE_RGB565;
     for y in 0..h {
-        let src = &frame.bgra[y * frame.width as usize * 4..];
+        let src = &bgra[y * frame_width as usize * 4..];
         let row = if height > 0 { rows as usize - 1 - y } else { y };
         let dst = &mut out[row * stride..];
         for x in 0..w {

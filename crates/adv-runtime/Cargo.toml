@@ -33,6 +33,7 @@ adv-wineserver = { path = "../adv-wineserver" }
 log.workspace = true
 
 [dev-dependencies]
+adv-device = { path = "../adv-device", features = ["test-support"] }
 encoding_rs.workspace = true
 unicorn-engine.workspace = true
 adv-unicorn = { path = "../adv-unicorn" }
@@ -42,7 +43,6 @@ png = "0.17"
 
 [target.'cfg(any(target_vendor = "apple", target_os = "android"))'.dev-dependencies]
 libc = "0.2"
-pollster = "0.4"
 
 [lints]
 workspace = true

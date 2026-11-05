@@ -10,6 +10,8 @@ pub mod constants;
 #[cfg(feature = "device")]
 mod device;
 #[cfg(feature = "gpu")]
+pub mod frame;
+#[cfg(feature = "gpu")]
 pub mod gpu;
 pub mod media;
 pub mod midi;

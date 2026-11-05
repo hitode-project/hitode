@@ -116,6 +116,12 @@ class MainActivity : TauriActivity() {
         super.onPause()
     }
 
+    /** Hidden UI or memory pressure: the display keeps one buffer per pool. */
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        nativeTrimMemory()
+    }
+
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
         if (hasFocus && gameMode) applyImmersiveMode()
@@ -188,4 +194,5 @@ class MainActivity : TauriActivity() {
     external fun nativePause()
     external fun nativeResume()
     external fun nativeAudioFocus(active: Boolean)
+    external fun nativeTrimMemory()
 }

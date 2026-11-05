@@ -1,4 +1,5 @@
 use super::*;
+use ash::vk::Handle;
 use std::hash::{Hash, Hasher};
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -16,6 +17,7 @@ struct RenderKey {
     depth: Option<DepthStencil>,
     samples: u32,
     alpha: bool,
+    video: Option<u64>,
 }
 impl RenderKey {
     fn new(desc: &RenderPipelineDesc, modern: Modern) -> Self {
@@ -28,6 +30,7 @@ impl RenderKey {
             depth: desc.depth_stencil,
             samples: desc.samples,
             alpha: desc.alpha_to_coverage,
+            video: None,
         };
         key.bindings
             .sort_by_key(|b| (binding::group(b.kind), b.slot));
@@ -74,6 +77,8 @@ pub(super) struct Compiled {
     pub(super) push: binding::PushLayout,
     /// Bindless tier: uniform slots, one bit each.
     pub(super) uniforms: u64,
+    #[cfg(target_os = "android")]
+    pub(super) video: Option<(u32, Arc<VideoPool>)>,
 }
 impl Pipelines {
     pub(super) fn destroy(&mut self, device: &ash::Device) {
@@ -152,8 +157,8 @@ impl Pipelines {
 }
 #[derive(Clone)]
 pub(crate) struct RenderPipeline {
-    _context: Arc<Context>,
     pub(super) compiled: Arc<Compiled>,
+    _context: Arc<Context>,
     pub(super) dynamic: Dynamic,
 }
 #[derive(Clone)]
@@ -276,8 +281,9 @@ impl Dynamic {
 fn layouts(
     context: &Context,
     bindings: &[Binding],
+    video: Option<&Arc<VideoPool>>,
 ) -> Result<(vk::PipelineLayout, vk::DescriptorSetLayout)> {
-    let (sets, own) = if let Some(heap) = &context.heap {
+    let (mut sets, own) = if let Some(heap) = &context.heap {
         let count = bindings
             .iter()
             .filter(|b| b.kind == BindingKind::UniformBuffer)
@@ -313,6 +319,26 @@ fn layouts(
         })?;
         (vec![set], set)
     };
+    if let Some(video) = video {
+        let limit = unsafe {
+            context
+                .instance
+                .get_physical_device_properties(context.physical)
+        }
+        .limits
+        .max_bound_descriptor_sets;
+        if sets.len() as u32 == limit {
+            if own != vk::DescriptorSetLayout::null() {
+                unsafe {
+                    context.device.destroy_descriptor_set_layout(own, None);
+                }
+            }
+            return Err(Error::Invalid(
+                "video set exceeds descriptor-set limit".into(),
+            ));
+        }
+        sets.push(video.resources.layout);
+    }
     let push = [vk::PushConstantRange {
         stage_flags: vk::ShaderStageFlags::ALL,
         offset: 0,
@@ -345,7 +371,34 @@ impl Device {
         desc: &RenderPipelineDesc,
         cache: Option<&crate::pipeline::PipelineCache>,
     ) -> Result<crate::RenderPipeline> {
-        let key = RenderKey::new(desc, self.caps().modern);
+        self.render_pipeline(desc, cache, None)
+    }
+    #[cfg(target_os = "android")]
+    pub(crate) fn create_video_pipeline(
+        &self,
+        desc: &VideoPipelineDesc<'_>,
+        cache: Option<&crate::pipeline::PipelineCache>,
+    ) -> Result<crate::RenderPipeline> {
+        if !Arc::ptr_eq(&self.0, &desc.pool.device.inner.0) {
+            return Err(Error::Invalid(
+                "video pool belongs to another device".into(),
+            ));
+        }
+        let video = desc
+            .pool
+            .video
+            .as_ref()
+            .ok_or_else(|| Error::Unsupported("pool has no converted video sampler".into()))?;
+        self.render_pipeline(desc.pipeline, cache, Some(video))
+    }
+    fn render_pipeline(
+        &self,
+        desc: &RenderPipelineDesc,
+        cache: Option<&crate::pipeline::PipelineCache>,
+        video: Option<&Arc<VideoPool>>,
+    ) -> Result<crate::RenderPipeline> {
+        let mut key = RenderKey::new(desc, self.caps().modern);
+        key.video = video.map(|v| v.resources.layout.as_raw());
         let mut pipelines = self.0.pipelines.lock().unwrap();
         let compiled = match pipelines.render.get(&key) {
             Some(compiled) => compiled.clone(),
@@ -359,9 +412,11 @@ impl Device {
                     .chain(&desc.fragment)
                     .collect();
                 let compiled =
-                    Arc::new(self.compile(&key.bindings, &entries, |layout, stages| {
-                        self.compile_render(desc, layout, stages, cache, &mut pipelines)
-                    })?);
+                    Arc::new(
+                        self.compile(&key.bindings, &entries, video, |layout, stages| {
+                            self.compile_render(desc, layout, stages, cache, &mut pipelines)
+                        })?,
+                    );
                 pipelines.render.insert(key, compiled.clone());
                 compiled
             }
@@ -392,15 +447,18 @@ impl Device {
                     None => vk::PipelineCache::null(),
                 };
                 let compiled =
-                    Arc::new(self.compile(&key.1, &[&desc.entry], |layout, stages| {
-                        let info = vk::ComputePipelineCreateInfo::default()
-                            .stage(stages[0])
-                            .layout(layout);
-                        let created =
-                            unsafe { self.0.device.create_compute_pipelines(cache, &[info], None) };
-                        self.0
-                            .result(created.map(|h| h[0]).map_err(|(_, error)| error))
-                    })?);
+                    Arc::new(
+                        self.compile(&key.1, &[&desc.entry], None, |layout, stages| {
+                            let info = vk::ComputePipelineCreateInfo::default()
+                                .stage(stages[0])
+                                .layout(layout);
+                            let created = unsafe {
+                                self.0.device.create_compute_pipelines(cache, &[info], None)
+                            };
+                            self.0
+                                .result(created.map(|h| h[0]).map_err(|(_, error)| error))
+                        })?,
+                    );
                 pipelines.compute.insert(key, compiled.clone());
                 compiled
             }
@@ -418,6 +476,7 @@ impl Device {
         &self,
         bindings: &[Binding],
         entries: &[&Entry],
+        video: Option<&Arc<VideoPool>>,
         build: impl FnOnce(
             vk::PipelineLayout,
             &[vk::PipelineShaderStageCreateInfo<'_>],
@@ -434,12 +493,25 @@ impl Device {
             }
             None => binding::PushLayout::default(),
         };
+        let video = video.map(|pool| {
+            let set = if self.0.heap.is_some() {
+                1 + bindings
+                    .iter()
+                    .filter(|b| b.kind == BindingKind::UniformBuffer)
+                    .map(|b| b.slot + 1)
+                    .max()
+                    .unwrap_or(0)
+            } else {
+                1
+            };
+            (set, pool.clone())
+        });
         let modules = entries
             .iter()
-            .map(|e| e.shader.inner.stage(e, &push))
+            .map(|e| e.shader.inner.stage(e, &push, video.as_ref().map(|v| v.0)))
             .collect::<Result<Vec<_>>>()?;
         let stages: Vec<_> = modules.iter().map(|m| m.info()).collect();
-        let (layout, set_layout) = layouts(&self.0, bindings)?;
+        let (layout, set_layout) = layouts(&self.0, bindings, video.as_ref().map(|v| &v.1))?;
         let handle = match build(layout, &stages) {
             Ok(handle) => handle,
             Err(error) => {
@@ -465,6 +537,8 @@ impl Device {
             bindings: bindings.to_vec(),
             push,
             uniforms,
+            #[cfg(target_os = "android")]
+            video,
         })
     }
     fn compile_render(
