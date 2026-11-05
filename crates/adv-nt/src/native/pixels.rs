@@ -426,54 +426,25 @@ fn shuffle(dst: &Pixels, src: &Pixels, df: &Format, sf: &Format, d: *mut u8, s: 
 }
 
 pub(super) struct FloatControl {
-    #[cfg(target_arch = "aarch64")]
     saved: u64,
-    #[cfg(target_arch = "x86_64")]
-    saved: u32,
 }
 impl FloatControl {
     pub(super) fn new(mxcsr: u32) -> Self {
-        #[cfg(target_arch = "aarch64")]
-        {
-            let saved: u64;
-            let rounding = [0u64, 2, 1, 3][(mxcsr >> 13 & 3) as usize];
-            let control = rounding << 22;
-            // SAFETY: the body's floating controls are restored by Drop.
-            unsafe {
-                std::arch::asm!("mrs {saved}, fpcr", "msr fpcr, {control}", saved = out(reg) saved, control = in(reg) control, options(nostack));
-            }
-            Self { saved }
+        let saved: u64;
+        let rounding = [0u64, 2, 1, 3][(mxcsr >> 13 & 3) as usize];
+        let control = rounding << 22;
+        // SAFETY: the body's floating controls are restored by Drop.
+        unsafe {
+            std::arch::asm!("mrs {saved}, fpcr", "msr fpcr, {control}", saved = out(reg) saved, control = in(reg) control, options(nostack));
         }
-        #[cfg(target_arch = "x86_64")]
-        {
-            let mut saved = 0;
-            // SAFETY: SSE controls use valid guest control bits, with host traps masked.
-            unsafe {
-                std::arch::asm!("stmxcsr [{p}]", p=in(reg) &mut saved, options(nostack));
-            }
-            let control = (mxcsr & 0xffff & !0x8040) | 0x1f80;
-            unsafe {
-                std::arch::asm!("ldmxcsr [{p}]", p=in(reg) &control, options(nostack));
-            }
-            Self { saved }
-        }
-        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-        {
-            let _ = mxcsr;
-            Self {}
-        }
+        Self { saved }
     }
 }
 impl Drop for FloatControl {
     fn drop(&mut self) {
-        #[cfg(target_arch = "aarch64")]
         // SAFETY: saved is this thread's entry FPCR.
         unsafe {
             std::arch::asm!("msr fpcr, {saved}", saved=in(reg) self.saved, options(nostack));
-        }
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            std::arch::asm!("ldmxcsr [{p}]", p=in(reg) &self.saved, options(nostack));
         }
     }
 }
