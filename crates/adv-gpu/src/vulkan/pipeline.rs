@@ -75,6 +75,8 @@ pub(super) struct Compiled {
     /// Sorted by `(group, slot)`.
     pub(super) bindings: Vec<Binding>,
     pub(super) push: binding::PushLayout,
+    /// On heap tiers, atomic storage requires classic sets for the whole pipeline.
+    pub(super) classic: bool,
     /// Bindless tier: uniform slots, one bit each.
     pub(super) uniforms: u64,
     #[cfg(target_os = "android")]
@@ -282,8 +284,9 @@ fn layouts(
     context: &Context,
     bindings: &[Binding],
     video: Option<&Arc<VideoPool>>,
+    classic: bool,
 ) -> Result<(vk::PipelineLayout, vk::DescriptorSetLayout)> {
-    let (mut sets, own) = if let Some(heap) = &context.heap {
+    let (mut sets, own) = if let Some(heap) = context.heap.as_ref().filter(|_| !classic) {
         let count = bindings
             .iter()
             .filter(|b| b.kind == BindingKind::UniformBuffer)
@@ -304,7 +307,7 @@ fn layouts(
                     .stage_flags(binding::stages(b.stages))
             })
             .collect();
-        let flags = if context.caps.modern.contains(Modern::PUSH_DESCRIPTORS) {
+        let flags = if !classic && context.caps.modern.contains(Modern::PUSH_DESCRIPTORS) {
             vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR
         } else {
             vk::DescriptorSetLayoutCreateFlags::empty()
@@ -345,7 +348,7 @@ fn layouts(
         size: context.caps.limits.push_constant_bytes,
     }];
     let mut info = vk::PipelineLayoutCreateInfo::default().set_layouts(&sets);
-    if context.heap.is_some() {
+    if !classic && context.heap.is_some() {
         info = info.push_constant_ranges(&push);
     }
     match context.result(unsafe { context.device.create_pipeline_layout(&info, None) }) {
@@ -482,7 +485,10 @@ impl Device {
             &[vk::PipelineShaderStageCreateInfo<'_>],
         ) -> Result<vk::Pipeline>,
     ) -> Result<Compiled> {
-        let push = match &self.0.heap {
+        let classic =
+            self.0.heap.is_some() && entries.iter().any(|e| e.shader.inner.storage_atomics());
+        let heap = self.0.heap.is_some() && !classic;
+        let push = match self.0.heap.as_ref().filter(|_| heap) {
             Some(heap) => {
                 let mut strides = HashMap::new();
                 for entry in entries {
@@ -494,7 +500,7 @@ impl Device {
             None => binding::PushLayout::default(),
         };
         let video = video.map(|pool| {
-            let set = if self.0.heap.is_some() {
+            let set = if heap {
                 1 + bindings
                     .iter()
                     .filter(|b| b.kind == BindingKind::UniformBuffer)
@@ -508,10 +514,15 @@ impl Device {
         });
         let modules = entries
             .iter()
-            .map(|e| e.shader.inner.stage(e, &push, video.as_ref().map(|v| v.0)))
+            .map(|e| {
+                e.shader
+                    .inner
+                    .stage(e, &push, video.as_ref().map(|v| v.0), heap)
+            })
             .collect::<Result<Vec<_>>>()?;
         let stages: Vec<_> = modules.iter().map(|m| m.info()).collect();
-        let (layout, set_layout) = layouts(&self.0, bindings, video.as_ref().map(|v| &v.1))?;
+        let (layout, set_layout) =
+            layouts(&self.0, bindings, video.as_ref().map(|v| &v.1), classic)?;
         let handle = match build(layout, &stages) {
             Ok(handle) => handle,
             Err(error) => {
@@ -536,6 +547,7 @@ impl Device {
             set_layout,
             bindings: bindings.to_vec(),
             push,
+            classic,
             uniforms,
             #[cfg(target_os = "android")]
             video,

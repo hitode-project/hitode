@@ -15,7 +15,8 @@ struct ShaderCore {
     modules: Vec<vk::ShaderModule>,
     entries: Vec<(CString, Stage)>,
     storage_strides: Vec<HashMap<u32, u32>>,
-    heap: Option<HeapShader>,
+    storage_atomics: bool,
+    pipeline: Option<PipelineShader>,
 }
 impl Drop for ShaderCore {
     fn drop(&mut self) {
@@ -46,25 +47,36 @@ impl Shader {
         entry: &'a Entry,
         layout: &binding::PushLayout,
         video_set: Option<u32>,
+        heap: bool,
     ) -> Result<ShaderStage<'a>> {
-        let (module, temporary) = if let Some(heap) = &self.0.heap {
-            let mut module = heap.module.clone();
-            for patch in &heap.patches {
-                let field = layout.field(patch.binding.0, patch.binding.1);
-                let value = field.map_or(0, |field| match patch.part {
-                    Part::Word => field.word,
-                    Part::Shift => field.shift,
-                    Part::Offset => field.offset.unwrap(),
-                });
-                module.global_expressions[patch.init] = E::Literal(naga::Literal::U32(value));
+        let (module, temporary) = if let Some(shader) = &self.0.pipeline {
+            let mut module = shader.module.clone();
+            if heap {
+                let patches = rewrite_heap(
+                    &mut module,
+                    self.0.context.caps.limits.push_constant_bytes / 4,
+                    self.0.context.caps.limits.max_uniform_buffers,
+                    self.0.context.heap.as_ref().unwrap().counts,
+                )?;
+                for patch in &patches {
+                    let field = layout.field(patch.binding.0, patch.binding.1);
+                    let value = field.map_or(0, |field| match patch.part {
+                        Part::Word => field.word,
+                        Part::Shift => field.shift,
+                        Part::Offset => field.offset.unwrap(),
+                    });
+                    module.global_expressions[patch.init] = E::Literal(naga::Literal::U32(value));
+                }
+            } else {
+                rewrite_bindings(&mut module);
             }
-            let has_video = !heap.video.is_empty();
+            let has_video = !shader.video.is_empty();
             if has_video && video_set.is_none() {
                 return Err(Error::Compile(
                     "group 4 requires a video pool pipeline".into(),
                 ));
             }
-            for &global in &heap.video {
+            for &global in &shader.video {
                 module.global_variables[global]
                     .binding
                     .as_mut()
@@ -81,7 +93,7 @@ impl Shader {
                         .unwrap()
                         .into(),
                 }),
-                self.0.context.heap.is_some(),
+                heap,
                 self.0.context.caps.ieee_f32,
             )?;
             if has_video {
@@ -109,6 +121,9 @@ impl Shader {
     }
     pub(super) fn storage_strides(&self, index: u32) -> &HashMap<u32, u32> {
         &self.0.storage_strides[index as usize]
+    }
+    pub(super) fn storage_atomics(&self) -> bool {
+        self.0.storage_atomics
     }
 }
 pub(super) struct ShaderStage<'a> {
@@ -142,11 +157,9 @@ impl Drop for ShaderStage<'_> {
         }
     }
 }
-// Resource accesses are prepared at shader creation. The pipeline resolves
-// word positions and shifts from its complete binding list before stage lowering.
-struct HeapShader {
+// The complete pipeline selects heap or ordinary bindings before lowering.
+struct PipelineShader {
     module: naga::Module,
-    patches: Vec<Patch>,
     video: Vec<Handle<naga::GlobalVariable>>,
 }
 struct Patch {
@@ -235,6 +248,38 @@ fn validate(
         .validate(module)
         .map_err(|e| Error::Compile(format!("shader validation: {e:?}")))
 }
+
+fn storage_atomics(module: &naga::Module, info: &naga::valid::ModuleInfo) -> bool {
+    let accesses = |function: &naga::Function, info: &naga::valid::FunctionInfo| {
+        function.expressions.iter().any(|(handle, _)| {
+            matches!(
+                info[handle].ty.inner_with(&module.types),
+                TypeInner::Pointer {
+                    base,
+                    space: naga::AddressSpace::Storage { .. },
+                } if matches!(module.types[*base].inner, TypeInner::Atomic(_))
+            )
+        })
+    };
+    module.functions.iter().any(|(h, f)| accesses(f, &info[h]))
+        || module
+            .entry_points
+            .iter()
+            .enumerate()
+            .any(|(i, e)| accesses(&e.function, info.get_entry_point(i)))
+}
+
+fn rewrite_bindings(module: &mut naga::Module) {
+    for (_, global) in module.global_variables.iter_mut() {
+        if let Some(binding) = &mut global.binding
+            && binding.group != 4
+        {
+            binding.binding = binding.binding * 4 + binding.group;
+            binding.group = 0;
+        }
+    }
+}
+
 impl Device {
     pub(crate) fn create_shader(&self, desc: ShaderDesc<'_>) -> Result<crate::Shader> {
         let (mut module, precompiled) = match desc.source {
@@ -250,6 +295,7 @@ impl Device {
             }
         };
         let info = validate(&module, naga::valid::ValidationFlags::all())?;
+        let storage_atomics = storage_atomics(&module, &info);
         let entries: Vec<_> = module
             .entry_points
             .iter()
@@ -319,28 +365,11 @@ impl Device {
                 .global_variables
                 .iter()
                 .all(|(_, g)| g.binding.is_none());
-        let mut patches = Vec::new();
-        if !already_lowered {
-            if let Some(heap) = &self.0.heap {
-                patches = rewrite_heap(
-                    &mut module,
-                    self.caps().limits.push_constant_bytes / 4,
-                    self.caps().limits.max_uniform_buffers,
-                    heap.counts,
-                )?;
-            } else {
-                for (_, global) in module.global_variables.iter_mut() {
-                    if let Some(binding) = &mut global.binding
-                        && binding.group != 4
-                    {
-                        binding.binding = binding.binding * 4 + binding.group;
-                        binding.group = 0;
-                    }
-                }
-            }
-        }
         // Heap and video shaders lower per pipeline, from the module kept here.
         let per_pipeline = !already_lowered && (self.0.heap.is_some() || !video.is_empty());
+        if !already_lowered && !per_pipeline {
+            rewrite_bindings(&mut module);
+        }
         let lowered: Vec<Vec<u32>> = if already_lowered {
             let mut words = precompiled.unwrap().to_vec();
             crate::shader::compile::legalize(&mut words, self.0.caps.ieee_f32);
@@ -369,11 +398,8 @@ impl Device {
             modules: Vec::with_capacity(lowered.len()),
             entries,
             storage_strides,
-            heap: per_pipeline.then_some(HeapShader {
-                module,
-                patches,
-                video,
-            }),
+            storage_atomics,
+            pipeline: per_pipeline.then_some(PipelineShader { module, video }),
         };
         // Dropping `core` on an error destroys the modules created so far.
         for words in &lowered {

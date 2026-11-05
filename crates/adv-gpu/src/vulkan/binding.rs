@@ -573,9 +573,11 @@ impl Bindings {
             }
         }
         let context = &encoder.shared.context;
-        let Some(heap) = &context.heap else {
+        if context.heap.is_none() || compiled.is_none_or(|p| p.classic) {
             self.dirty[group as usize] |= 1 << slot;
             self.changed = true;
+        }
+        let Some(heap) = &context.heap else {
             return;
         };
         if let Bind::Uniform(slice) = resource {
@@ -626,10 +628,11 @@ impl Bindings {
                     .is_some_and(|v| v.handle != 0)),
             "a pipeline binding has no resource"
         );
-        if encoder.shared.context.heap.is_some() {
+        if !compiled.classic && encoder.shared.context.heap.is_some() {
             self.flush_heap(&encoder.shared.context, encoder.command, compiled, point);
             return true;
         }
+        self.heap_bound = false;
         if !self.changed || compiled.bindings.is_empty() {
             return true;
         }
@@ -652,6 +655,7 @@ impl Bindings {
                 let set = context.heap.as_ref().unwrap().set;
                 device.cmd_bind_descriptor_sets(command, point, compiled.layout, 0, &[set], &[]);
                 self.heap_bound = true;
+                self.uniform_dirty |= compiled.uniforms;
             }
             let mut uniforms = self.uniform_dirty & compiled.uniforms;
             self.uniform_dirty &= !uniforms;
@@ -693,12 +697,13 @@ impl Bindings {
         compiled: &Compiled,
         point: vk::PipelineBindPoint,
     ) -> Result<()> {
-        let push = encoder
-            .shared
-            .context
-            .caps
-            .modern
-            .contains(Modern::PUSH_DESCRIPTORS);
+        let push = !compiled.classic
+            && encoder
+                .shared
+                .context
+                .caps
+                .modern
+                .contains(Modern::PUSH_DESCRIPTORS);
         let all = !push || self.pushed_layout != compiled.layout;
         let set = if push {
             vk::DescriptorSet::null()
