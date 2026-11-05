@@ -164,7 +164,7 @@ Candidates come from draw-record phase changes and one global canvas offset. The
 
 Global motion projects rows and columns of the new and previous input and correlates them on the GPU, without readback. Broad exact software damage runs it in the same frame. Conservative damage runs it only after a frame whose unexplained Δ exceeded one eighth of the canvas cells. A still frame with whole-layer redraws therefore issues the same dispatches as before. The first frame of a shake therefore pays one ordinary model run. Small exact software damage keeps the direct input path and only refreshes cell digests.
 
-A cell whose field holds one colour takes that colour's output from a 4096-entry table, filled by one model cell per new colour. Canvases whose verification state exceeds Vulkan's guaranteed 128 MiB storage range, about 3200×1800, are not upscaled.
+A cell whose field holds one colour takes that colour's output from a 4096-entry table, filled by one model cell per new colour; that frame's other cells of the colour compute it. Canvases whose verification state exceeds Vulkan's guaranteed 128 MiB storage range, about 3200×1800, are not upscaled.
 
 ### HOST-SES-1 Embedding
 
