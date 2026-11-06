@@ -1,9 +1,9 @@
 // Bookkeeping: one dispatch per frame, one workgroup per 128-pixel tile
-// (HOST-VIEW-10). Each tile evaluates every pass backwards over itself and a
-// halo, in workgroup memory, from read-only inputs: delta and the validity the
-// previous frame left. Halo results equal the neighbour's own, so only
-// interior cells are written: each pass's compacted list, its validity and
-// the delta bitmap.
+// (HOST-VIEW-10). Each tile selects every pass's cells over itself and a halo,
+// in workgroup memory, from read-only inputs: delta and the validity the
+// previous frame left; then settles which computed cells are exact. Halo
+// results equal the neighbour's own, so only interior cells are written: each
+// pass's compacted list, its validity and the delta bitmap.
 const TILE: u32 = 128u;
 const ARENA: u32 = 2048u;
 const LANES: u32 = 256u;
@@ -112,7 +112,29 @@ fn clear_validity(index: u32, origin: vec2<i32>, cell: vec2<i32>) {
     atomicAnd(&validity[grid.arena + b.x], ~b.y);
 }
 
-// One pass over its region cells, as the per-pass filter decided them.
+// Whether every cell of grid `index` meeting the pixels [lo, hi), clipped to
+// the canvas, holds exact results; false beyond the region.
+fn all_valid(index: u32, origin: vec2<i32>, lo: vec2<i32>, hi: vec2<i32>) -> bool {
+    let grid = metadata.grids[index];
+    let size = vec2<i32>(metadata.shape.size);
+    let first = quotient(max(lo, vec2(0)), i32(grid.unit));
+    let last = quotient(min(hi, size) + i32(grid.unit) - 1, i32(grid.unit));
+    let start = grid_origin(origin, grid.unit);
+    let n = i32(span(grid.unit));
+    for (var y = first.y; y < last.y; y++) {
+        for (var x = first.x; x < last.x; x++) {
+            let local = vec2(x, y) - start;
+            if any(local < vec2(0)) || any(local >= vec2(n)) { return false; }
+            let b = bit((u32(n) + 31u) / 32u, vec2<u32>(local));
+            if (atomicLoad(&validity[grid.arena + b.x]) & b.y) == 0u { return false; }
+        }
+    }
+    return true;
+}
+
+// Backwards from the last pass: the output cells a change reaches, then in
+// every other pass the cells meeting their need that hold no exact result.
+// The need is in pixels, so a cell's outer pixels may stay inexact.
 fn select_pass(index: u32, origin: vec2<i32>, lane: u32) {
     let shape = metadata.shape;
     let grid = metadata.grids[index];
@@ -128,22 +150,41 @@ fn select_pass(index: u32, origin: vec2<i32>, lane: u32) {
         let b = bit(words, local);
         let slot = grid.arena + b.x;
         let affected = meets(origin, pixel - i32(grid.affected), pixel + i32(grid.unit + grid.affected));
-        let was_valid = grid.aliases == 0u && (atomicLoad(&validity[slot]) & b.y) != 0u;
+        if affected { atomicAnd(&validity[slot], ~b.y); }
         var keep = affected;
         if !last {
-            var needed = false;
-            for (var j = index + 1u; j < shape.passes; j++) {
-                if (grid.consumers & (1u << j)) != 0u && required_by(j, origin, pixel, grid.unit, metadata.grids[j].radius) {
-                    needed = true;
-                    break;
-                }
-            }
-            keep = needed && (affected || !was_valid);
+            // Storage another pass shares holds no result of this one.
+            let valid = grid.aliases == 0u && (atomicLoad(&validity[slot]) & b.y) != 0u;
+            keep = !valid && required_by(shape.passes - 1u, origin, pixel, grid.unit, grid.margin);
         }
-        if affected { atomicAnd(&validity[slot], ~b.y); }
-        if !keep { continue; }
-        atomicOr(&required[slot], b.y);
-        var overwritten = false;
+        if keep { atomicOr(&required[slot], b.y); }
+    }
+    workgroupBarrier();
+}
+
+// Forwards: a computed cell is exact where every input it read was, and a
+// pass sharing its storage loses what it overwrites.
+fn settle(index: u32, origin: vec2<i32>, lane: u32) {
+    let shape = metadata.shape;
+    let grid = metadata.grids[index];
+    let n = span(grid.unit);
+    let words = (n + 31u) / 32u;
+    let first = grid_origin(origin, grid.unit);
+    let radius = i32(grid.radius);
+    for (var i = lane; i < n * n; i += LANES) {
+        let local = vec2(i % n, i / n);
+        let cell = first + vec2<i32>(local);
+        if any(cell < vec2(0)) || cell.x >= i32(grid.columns) || cell.y >= i32(grid.rows) { continue; }
+        let b = bit(words, local);
+        let slot = grid.arena + b.x;
+        if (atomicLoad(&required[slot]) & b.y) == 0u { continue; }
+        let pixel = cell * i32(grid.unit);
+        var exact = true;
+        for (var q = 0u; q < index && exact; q++) {
+            if (grid.producers & (1u << q)) != 0u {
+                exact = all_valid(q, origin, pixel - radius, pixel + i32(grid.unit) + radius);
+            }
+        }
         for (var j = 0u; j < shape.passes; j++) {
             if (grid.aliases & (1u << j)) == 0u { continue; }
             let other = metadata.grids[j];
@@ -152,14 +193,18 @@ fn select_pass(index: u32, origin: vec2<i32>, lane: u32) {
             for (var y = lo.y; y < hi.y; y++) {
                 for (var x = lo.x; x < hi.x; x++) {
                     if j > index && required_at(j, origin, vec2(x, y)) {
-                        overwritten = true;
+                        exact = false;
                     } else {
                         clear_validity(j, origin, vec2(x, y));
                     }
                 }
             }
         }
-        if !overwritten { atomicOr(&validity[slot], b.y); }
+        if exact {
+            atomicOr(&validity[slot], b.y);
+        } else {
+            atomicAnd(&validity[slot], ~b.y);
+        }
     }
     workgroupBarrier();
 }
@@ -241,6 +286,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_index
     }
     workgroupBarrier();
     for (var p = shape.passes; p > 0u; p--) { select_pass(p - 1u, origin, lane); }
+    for (var p = 0u; p < shape.passes; p++) { settle(p, origin, lane); }
     // Interior results: lists, validity and delta.
     let current = arguments(parity);
     for (var p = 0u; p < shape.passes; p++) {

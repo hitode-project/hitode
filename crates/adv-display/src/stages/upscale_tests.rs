@@ -144,28 +144,36 @@ fn closure(upscaling: &Upscaling, damage: &[Rect]) -> Vec<BTreeSet<u32>> {
     let mut needed = vec![Vec::new(); output + 1];
     needed[output] = damage.iter().map(|&r| grow(r, model.reach())).collect();
     let mut lists = vec![BTreeSet::new(); model.passes.len()];
+    let last = model.passes.len() - 1;
     for (i, pass) in model.passes.iter().enumerate().rev() {
         let unit = pass.unit();
         let wanted: Vec<Rect> = pass
             .writes()
             .flat_map(|t| std::mem::take(&mut needed[t.unwrap_or(output)]))
+            .filter(|r| r.w > 0 && r.h > 0)
             .collect();
-        for r in wanted.iter().filter(|r| r.w > 0 && r.h > 0) {
+        let mut reads = Vec::new();
+        for r in &wanted {
             for y in r.y / unit..=(r.y + r.h - 1) / unit {
                 for x in r.x / unit..=(r.x + r.w - 1) / unit {
-                    if lists[i].insert(x | y << 16) {
-                        let cell = Rect {
+                    // The output's need is its whole cells; inner passes
+                    // need only the pixels, grown by each radius.
+                    if lists[i].insert(x | y << 16) && i == last {
+                        reads.push(Rect {
                             x: x * unit,
                             y: y * unit,
                             w: unit,
                             h: unit,
-                        };
-                        for t in pass.reads() {
-                            needed[t].push(grow(cell, pass.radius));
-                        }
+                        });
                     }
                 }
             }
+        }
+        if i != last {
+            reads = wanted;
+        }
+        for t in pass.reads() {
+            needed[t].extend(reads.iter().map(|&r| grow(r, pass.radius)));
         }
     }
     lists
@@ -236,7 +244,8 @@ fn bookkeeping_lists_cover_the_changed_dependency_closure() {
 }
 
 /// Every pass selected the cells of the change's closure it can reach, and
-/// nothing outside the closure. `delta` covers whole 8x8 cells (clipped to
+/// nothing outside the closure: the cells meeting the output cells' need,
+/// grown in pixels. `delta` covers whole 8x8 cells (clipped to
 /// the canvas), the granularity bookkeeping sees.
 fn covers_closure(
     device: &Device,

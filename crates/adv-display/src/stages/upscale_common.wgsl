@@ -16,9 +16,13 @@ struct Shape {
     valid1: u32, arguments0: u32, arguments1: u32, set_words: u32,
     records: u32, chunk: u32,
 }
+// One pass's grid. `affected`: input pixels a change reaches in its results;
+// `producers`: passes whose results it reads; `margin`: input pixels by which
+// the output cells' need grows back to its results.
 struct Grid {
     columns: u32, rows: u32, unit: u32, affected: u32,
-    radius: u32, consumers: u32, aliases: u32, valid: u32,
+    radius: u32, producers: u32, aliases: u32, valid: u32,
     compacted: u32, arguments: u32, counter: u32, arena: u32,
+    margin: u32,
 }
 struct Metadata { shape: Shape, grids: array<Grid> }

@@ -395,15 +395,18 @@ impl Upscaling {
         let halo = (reaches[0] + unit_max).next_multiple_of(16);
         let span = |unit: u32| (TILE + 2 * halo) / unit;
         let region_words = |unit: u32| span(unit).div_ceil(32) * span(unit);
-        // What each pass writes reaches this far from changed input.
+        // What each pass writes reaches this far from changed input, and
+        // the passes whose results it reads.
         let mut writers = vec![None; model.tensors.len()];
         let mut consumers = vec![0u32; passes.len()];
+        let mut producers = vec![0u32; passes.len()];
         let mut affected = vec![0; model.tensors.len()];
         let mut reach = vec![0; passes.len()];
         for (i, pass) in passes.iter().enumerate() {
             for t in pass.reads() {
                 if let Some(writer) = writers[t] {
                     consumers[writer] |= 1 << i;
+                    producers[i] |= 1u32 << writer;
                 }
             }
             reach[i] = pass.reads().map(|t| affected[t]).max().unwrap_or(0) + pass.radius;
@@ -413,6 +416,16 @@ impl Upscaling {
             }
         }
         let output_reach = reach[passes.len() - 1];
+        // Input pixels by which the output cells' need grows back to each
+        // pass's results: exact, so a pass computes only cells meeting it.
+        let mut margins = vec![0u32; passes.len()];
+        for i in (0..passes.len()).rev() {
+            margins[i] = (i + 1..passes.len())
+                .filter(|&j| consumers[i] & 1 << j != 0)
+                .map(|j| margins[j] + passes[j].radius)
+                .max()
+                .unwrap_or(0);
+        }
         if output_reach > 16
             || (TILE + 2 * (halo + 32)).div_ceil(8).div_ceil(32) * (TILE + 2 * (halo + 32)) / 8
                 > DELTA_WORDS
@@ -444,13 +457,14 @@ impl Upscaling {
                 pass.unit(),
                 reach[i],
                 pass.radius,
-                consumers[i],
+                producers[i],
                 aliases,
                 valid,
                 entries as u32,
                 records as u32 * 4,
                 0,
                 arena,
+                margins[i],
             ]);
             grids.push(Grid {
                 columns: shape.0,
