@@ -93,13 +93,16 @@ const fn storage(slot: u32, writable: bool) -> Binding {
     }
 }
 
-/// Anchors: the input, the frame, anchors, state and the pass graph.
-pub const UPSCALE_ANCHOR: [Binding; 5] = [
+/// Anchors: both inputs, the frame, anchors, state, the pass graph and the
+/// facts.
+pub const UPSCALE_ANCHOR: [Binding; 7] = [
     sampled(0),
+    sampled(1),
     storage(0, false),
     storage(1, true),
     storage(2, true),
     storage(3, false),
+    storage(4, true),
 ];
 /// Compare: both inputs, the frame, the facts, state, the pass graph and the
 /// anchors.

@@ -1,15 +1,24 @@
-// Anchors: one workgroup per source cell whose windows the change reaches
-// (HOST-VIEW-13). A cell's anchor is its unique least window hash; looking it
-// up in the previous frame's index votes for the offset it moved by. Only the
-// previous frame's anchors are read here: bookkeeping commits these.
+// Anchors: one workgroup per source cell whose windows the change may reach
+// (HOST-VIEW-13). Without exact damage, the cell compares the pixels its
+// windows read with the previous input: it stamps itself changed with the
+// frame's epoch when its own pixels differ, and keeps its anchor when none
+// do. A cell's anchor is its unique least window hash; looking it up in the
+// previous frame's index votes for the offset it moved by. Only the previous
+// frame's anchors are read here: bookkeeping commits these.
 @group(1) @binding(0) var current: texture_2d<f32>;
+@group(1) @binding(1) var previous: texture_2d<f32>;
 @group(3) @binding(0) var<storage, read> frame: array<u32>;
 @group(3) @binding(1) var<storage, read_write> anchors: array<u32>;
 @group(3) @binding(2) var<storage, read_write> state: array<atomic<u32>>;
 @group(3) @binding(3) var<storage, read> metadata: Metadata;
+@group(3) @binding(4) var<storage, read_write> facts: array<Fact>;
 const PROBES: u32 = 8u;
 var<workgroup> least: atomic<u32>;
 var<workgroup> ties: atomic<u32>;
+// Whether the cell's own pixels, and any pixel its windows read, changed.
+var<workgroup> changed: atomic<u32>;
+var<workgroup> touched: atomic<u32>;
+var<workgroup> stirred: u32;
 // The cell and the pixels its windows reach beyond it, as mixed pixel values,
 // then each row's hashes of WINDOW pixels.
 const SIDE: u32 = 8u + WINDOW - 1u;
@@ -62,15 +71,40 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_index
     let packed = listed(FRAME_ANCHOR_LIST, index);
     let cell = vec2(packed & 65535u, packed >> 16u);
     let pixel = cell * 8u + vec2(lane % 8u, lane / 8u);
+    if !hashing() {
+        // One producer cell: whether its own pixels changed.
+        if all(pixel < shape.size) && any(bitcast<vec4<u32>>(textureLoad(current, pixel, 0))
+            != bitcast<vec4<u32>>(textureLoad(previous, pixel, 0))) {
+            atomicStore(&changed, 1u);
+        }
+        workgroupBarrier();
+        if lane == 0u && atomicLoad(&changed) != 0u { facts[cell.y * shape.columns + cell.x].changed = frame[FRAME_EPOCH]; }
+        return;
+    }
     if lane == 0u { atomicStore(&least, NO_ANCHOR); }
+    let exact = frame[FRAME_EXACT] != 0u;
     // Each pixel the windows read once; beyond the canvas it is never used.
     let limit = vec2<i32>(shape.size) - 1;
     for (var i = lane; i < SIDE * SIDE; i += 64u) {
-        let at = min(vec2<i32>(cell * 8u + vec2(i % SIDE, i / SIDE)), limit);
+        let local = vec2(i % SIDE, i / SIDE);
+        let unclamped = vec2<i32>(cell * 8u + local);
+        let at = min(unclamped, limit);
         let p = bitcast<vec4<u32>>(textureLoad(current, at, 0));
         pixels[i] = mixed(p.x ^ mixed(p.y ^ mixed(p.z ^ mixed(p.w))));
+        if !exact && all(unclamped == at) && any(p != bitcast<vec4<u32>>(textureLoad(previous, at, 0))) {
+            atomicStore(&touched, 1u);
+            if all(local < vec2(8u)) { atomicStore(&changed, 1u); }
+        }
     }
     workgroupBarrier();
+    if !exact {
+        if lane == 0u {
+            if atomicLoad(&changed) != 0u { facts[cell.y * shape.columns + cell.x].changed = frame[FRAME_EPOCH]; }
+            stirred = atomicLoad(&touched);
+        }
+        // Windows that read no changed pixel keep the anchor.
+        if workgroupUniformLoad(&stirred) == 0u { return; }
+    }
     for (var i = lane; i < SIDE * 8u; i += 64u) {
         let at = (i / 8u) * SIDE + i % 8u;
         rows[i] = polynomial(pixels[at], pixels[at + 1u], pixels[at + 2u], pixels[at + 3u], 0x01000193u);
@@ -114,8 +148,9 @@ fn main(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_index
     let owner = (source.y / 8u * shape.columns + source.x / 8u) * 2u;
     if anchors[owner] != hash || anchors[owner + 1u] != old { return; }
     let offset = vec2<i32>(pixel) - vec2<i32>(source);
-    if any(offset != vec2(0)) {
-        // Compare verifies the offset only near the cells that voted for it.
+    // Without compare this frame seeks no offsets. Compare verifies an offset
+    // only near the cells that voted for it.
+    if frame[FRAME_COMPARED] != 0u && any(offset != vec2(0)) {
         anchors[pending + 3u] = vote(offset);
     }
 }

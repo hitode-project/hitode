@@ -13,8 +13,6 @@ const FRAME_ANCHOR_LIST: u32 = 7u;
 const FRAME_DATA: u32 = 8u;
 // A list offset meaning every source cell in order: whole-canvas changes.
 const WHOLE: u32 = 0xffffffffu;
-// A compared cell the producer may have changed.
-const COMPARE_FLAG: u32 = 0x80000000u;
 // Per source cell, what compare found: the epochs it last found the cell
 // changed and last matched hypotheses, and the bits of those that matched.
 struct Fact { changed: u32, compared: u32, matches: u32 }
@@ -32,10 +30,10 @@ const WINDOW: u32 = 4u;
 const VOTES: u32 = 64u;
 const PROPOSALS: u32 = 4u;
 const VOTE_CAP: u32 = 32u;
-// Per frame parity: the count, the bits of those that copied a cell, then up
-// to HYPOTHESES packed offsets, the first zero.
+// Per frame parity: the count, the bits of those that copied a cell, up to
+// HYPOTHESES packed offsets, the first zero, then the epoch that chose them.
 const HYPOTHESES: u32 = 8u;
-const HYPOTHESIS_WORDS: u32 = 10u;
+const HYPOTHESIS_WORDS: u32 = 11u;
 // Copy entries: the cell's x and 13 bits of y, the hypothesis above.
 const COPY_SHIFT: u32 = 29u;
 const COPY_ROWS: u32 = 0x1fffu;
@@ -47,6 +45,13 @@ fn listed(list: u32, index: u32) -> u32 {
         return index % columns | (index / columns) << 16u;
     }
     return frame[FRAME_DATA + frame[list] + index];
+}
+
+// Whether the anchor pass hashes: in exact first frames and frames seeking
+// offsets. Otherwise it only finds the change, and bookkeeping drops the
+// anchors whose windows meet it.
+fn hashing() -> bool {
+    return frame[FRAME_ANCHORED] != 0u && (frame[FRAME_EXACT] != 0u || frame[FRAME_COMPARED] != 0u);
 }
 
 // An offset packed as x | y << 16, both signed.
@@ -61,6 +66,8 @@ struct Shape {
     records: u32, chunk: u32, reach: u32, hypotheses: u32,
     votes: u32, copies: u32, copy_arguments: u32, copy_counter: u32,
     index_mask: u32, neighbourhood: u32,
+    // Compare's indirect record, which the hypotheses write.
+    compare_record: u32, pad: u32,
 }
 // One pass's grid. `affected`: input pixels a change reaches in its results;
 // `producers`: passes whose results it reads; `margin`: input pixels by which
