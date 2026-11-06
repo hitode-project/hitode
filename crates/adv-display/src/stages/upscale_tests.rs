@@ -66,7 +66,6 @@ fn frame(
     pixels: &Buffer,
     damage: Option<&[Rect]>,
     input: Input,
-    records: &[DrawRecord],
 ) -> u64 {
     let mut encoder = queue.encoder("upscale test frame");
     let target = upscaling.input();
@@ -99,7 +98,7 @@ fn frame(
         );
     }
     let computed = upscaling
-        .encode((&mut encoder, ring), damage, input, records, None)
+        .encode((&mut encoder, ring), damage, input, None)
         .unwrap();
     let token = queue.submit(encoder).unwrap();
     assert!(queue.wait(token, Duration::from_secs(60)).unwrap());
@@ -201,7 +200,6 @@ fn bookkeeping_lists_cover_the_changed_dependency_closure() {
                 &pixels,
                 None,
                 Input::Exact,
-                &[],
             );
             assert!(first > 0);
             for (i, cells) in selected(&device, &mut queue, &upscaling).iter().enumerate() {
@@ -224,7 +222,6 @@ fn bookkeeping_lists_cover_the_changed_dependency_closure() {
                     &pixels,
                     Some(&delta),
                     Input::Exact,
-                    &[],
                 );
                 covers_closure(
                     &device,
@@ -298,7 +295,6 @@ fn large_canvases_select_only_the_changed_closure() {
         &pixels,
         None,
         Input::Exact,
-        &[],
     );
     for delta in [
         vec![Rect {
@@ -321,7 +317,6 @@ fn large_canvases_select_only_the_changed_closure() {
             &pixels,
             Some(&delta),
             Input::Exact,
-            &[],
         );
         covers_closure(&device, &mut queue, &upscaling, &delta, "4K");
     }
@@ -349,7 +344,6 @@ fn unchanged_composition_launches_no_model_workgroups() {
                 &pixels,
                 None,
                 Input::Composed,
-                &[]
             ) > 0
         );
         let lists = selected(&device, &mut queue, &upscaling);
@@ -390,13 +384,7 @@ fn unchanged_composition_launches_no_model_workgroups() {
     let mut encoder = queue.encoder("empty producer damage");
     assert_eq!(
         upscaling
-            .encode(
-                (&mut encoder, &mut ring),
-                Some(&[]),
-                Input::Composed,
-                &[],
-                None
-            )
+            .encode((&mut encoder, &mut ring), Some(&[]), Input::Composed, None)
             .unwrap(),
         0
     );
@@ -427,7 +415,6 @@ fn invalid_tensor_neighbours_recompute_after_rebuilt_outputs() {
                     Upscaling::with_precision(&device, model, size, half).unwrap(),
                     Upscaling::with_precision(&device, model, size, half).unwrap(),
                 ];
-                let mut phase = 0;
                 for index in 0..12 {
                     // Pans alternate with small software changes inside the
                     // rebuilt area, whose neighbours' tensors went unused.
@@ -458,20 +445,6 @@ fn invalid_tensor_neighbours_recompute_after_rebuilt_outputs() {
                             }
                         }
                     }
-                    if pan {
-                        phase += 1;
-                    }
-                    let records = [DrawRecord {
-                        target: Rect {
-                            x: 0,
-                            y: 0,
-                            w: size.0,
-                            h: size.1,
-                        },
-                        content: 42,
-                        phase: [phase, 0],
-                        motion: None,
-                    }];
                     let buffer = upload(&device, &pixels, BufferUsage::COPY_SRC);
                     let damage = [small];
                     let (damage, input) = if pan || index < 2 {
@@ -479,26 +452,8 @@ fn invalid_tensor_neighbours_recompute_after_rebuilt_outputs() {
                     } else {
                         (Some(&damage[..]), Input::Exact)
                     };
-                    frame(
-                        &mut queue, &mut ring, &runs[0], &buffer, damage, input, &records,
-                    );
-                    frame(
-                        &mut queue,
-                        &mut ring,
-                        &runs[1],
-                        &buffer,
-                        None,
-                        Input::Exact,
-                        &[],
-                    );
-                    if pan && index > 2 && model.translations() {
-                        let grid = runs[0].grids.last().unwrap();
-                        let computed = selected(&device, &mut queue, &runs[0]).pop().unwrap();
-                        assert!(
-                            (computed.len() as u32) < grid.columns * grid.rows / 2,
-                            "form={form} model={m} frame={index}: a pan rebuilds its interior"
-                        );
-                    }
+                    frame(&mut queue, &mut ring, &runs[0], &buffer, damage, input);
+                    frame(&mut queue, &mut ring, &runs[1], &buffer, None, Input::Exact);
                     let outputs = [runs[0].output(), runs[1].output()];
                     let bytes = u64::from(size.0 * size.1 * 16);
                     let readback = device

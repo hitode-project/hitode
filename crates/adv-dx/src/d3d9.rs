@@ -1465,11 +1465,6 @@ fn execute_gpu(env: &mut Env<'_>, operation: &Operation) -> Result<Completion, E
             copy,
             ..
         } => {
-            if let Operation::Present { owner, .. } = operation
-                && let Some(Payload::Device(d)) = com(env).get_identity(&env.sys.objects, *owner)
-            {
-                gpu.draw_records(recording::records(&d.frame));
-            }
             let result = if let Some((device, copy)) = copy {
                 presentation::execute(env, &mut gpu, *device, *surface, *copy)
             } else {

@@ -368,23 +368,6 @@ fn draw_reads(env: &Env<'_>, device: &Device, draw: &fixed::Draw) -> Option<Vec<
     Some(result)
 }
 
-/// Integer texel phases are proposals; composed pixels still verify them.
-pub(in crate::d3d9::recording) fn phases(
-    env: &Env<'_>,
-    device: &Device,
-    draw: &fixed::Draw,
-) -> Vec<(Content, [i32; 2])> {
-    draw_reads(env, device, draw)
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|read| {
-            let m = read.mapping;
-            (m.scale == [1., 1.] && m.offset.iter().all(|v| v.fract() == 0.))
-                .then_some((read.source, m.offset.map(|v| -v as i32)))
-        })
-        .collect()
-}
-
 struct Vertex {
     position: [f64; 2],
     varyings: [[f32; 4]; 10],

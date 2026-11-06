@@ -305,12 +305,11 @@ fn format(f: frame::PixelFormat) -> adv_display::stages::ingest::PixelFormat {
     }
 }
 fn map(frame: frame::Frame) -> (display::Frame, Option<frame::Slot>) {
-    let (canvas, base, kind, changed, slot, records) = match frame.base {
+    let (canvas, base, kind, changed, slot) = match frame.base {
         frame::Base::Gpu {
             image,
             damage: d,
             ready,
-            records,
         } => {
             let size = match &image {
                 SwapImage::Private(i) => i.desc().size,
@@ -327,15 +326,6 @@ fn map(frame: frame::Frame) -> (display::Frame, Option<frame::Slot>) {
                 plan::BaseKind::Gpu { presentable },
                 d,
                 None,
-                records
-                    .iter()
-                    .map(|r| adv_display::stages::upscale::DrawRecord {
-                        target: r.target.into(),
-                        content: r.content,
-                        phase: r.phase,
-                        motion: r.motion,
-                    })
-                    .collect(),
             )
         }
         frame::Base::Software {
@@ -365,7 +355,6 @@ fn map(frame: frame::Frame) -> (display::Frame, Option<frame::Slot>) {
                 },
                 d,
                 Some(slot),
-                Vec::new(),
             )
         }
     };
@@ -412,7 +401,6 @@ fn map(frame: frame::Frame) -> (display::Frame, Option<frame::Slot>) {
         .collect();
     (
         display::Frame {
-            records,
             info,
             base,
             video,
@@ -806,7 +794,6 @@ mod tests {
             let (mapped, slot) = map(frame::Frame {
                 serial: 6,
                 base: frame::Base::Gpu {
-                    records: Arc::from([]),
                     image,
                     damage: frame::Region::empty((8, 8)),
                     ready: adv_gpu::Token(7),

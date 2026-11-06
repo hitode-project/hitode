@@ -155,7 +155,6 @@ fn private(d: &Device, q: &mut Queue) -> Image {
 }
 fn frame(serial: u64, image: &Image, damage: Region) -> Frame {
     Frame {
-        records: Vec::new(),
         info: info(serial, BaseKind::Gpu { presentable: false }, damage),
         base: Base::Private(image.clone()),
         video: vec![],
@@ -185,7 +184,6 @@ fn presentable_swap_is_shown_by_reference_without_a_stage() {
         .present(
             &mut q,
             Frame {
-                records: Vec::new(),
                 info: info(1, BaseKind::Gpu { presentable: true }, all()),
                 base: Base::Presentable { image, ready },
                 video: vec![],
@@ -398,7 +396,6 @@ fn software_ingest_and_video_layers_share_one_plan() {
         .present(
             &mut q,
             Frame {
-                records: Vec::new(),
                 info,
                 base: Base::Software {
                     buffer,
@@ -460,7 +457,6 @@ fn failed_attachment_keeps_the_ledger_uncommitted_and_reports_the_submitted_read
     let result = display.present(
         &mut q,
         Frame {
-            records: Vec::new(),
             info: info(1, BaseKind::Software { indexed: false }, all()),
             base: Base::Software {
                 buffer,
@@ -566,7 +562,6 @@ fn coalescing_replaces_the_held_frame_merges_damage_and_releases_its_swap() {
             .present(
                 &mut q,
                 Frame {
-                    records: Vec::new(),
                     info: info(
                         serial,
                         BaseKind::Gpu { presentable: true },
@@ -1050,7 +1045,6 @@ fn exact_software_upscaling_uses_producer_cells() {
         // SAFETY: no GPU work references the new buffer.
         unsafe { buffer.mapped().unwrap().as_mut() }.copy_from_slice(pixels);
         Frame {
-            records: Vec::new(),
             info: info(serial, BaseKind::Software { indexed: false }, damage),
             base: Base::Software {
                 buffer,
@@ -1331,7 +1325,6 @@ fn a_frame_clock_encodes_and_attaches_at_most_once_per_refresh() {
             .unwrap();
         let reads = reads.clone();
         Frame {
-            records: Vec::new(),
             info: info(serial, BaseKind::Software { indexed: false }, all()),
             base: Base::Software {
                 buffer,

@@ -453,7 +453,6 @@ impl State {
                 self.submit(None)?;
             }
             Command::PresentSwap {
-                records,
                 image,
                 damage,
                 serial,
@@ -484,7 +483,6 @@ impl State {
                             image: swap,
                             damage,
                             ready,
-                            records,
                         },
                         video,
                         published_at: Instant::now(),
@@ -866,7 +864,6 @@ mod tests {
     }
     fn present(image: &Image, damage: crate::frame::Region, serial: u64) -> Command {
         Command::PresentSwap {
-            records: Arc::from([]),
             image: image.clone(),
             damage,
             serial,

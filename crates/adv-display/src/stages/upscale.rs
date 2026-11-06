@@ -12,21 +12,10 @@ pub const INPUT: Format = Format::Rgba16Float;
 /// How composition populated the model input.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Input {
-    /// Exact damage written directly into persistent input.
+    /// Exact damage: the change itself.
     Exact,
-    /// Exact software damage compared through scratch for global motion.
-    Software,
-    /// Conservative composed damage compared through scratch.
+    /// Conservative composed damage, which compare narrows.
     Composed,
-}
-
-/// A producer proposal in canvas coordinates; pixels establish every match.
-#[derive(Clone, Debug)]
-pub struct DrawRecord {
-    pub target: Rect,
-    pub content: u128,
-    pub phase: [i32; 2],
-    pub motion: Option<[i32; 2]>,
 }
 
 /// One precision of a precompiled upscale shader.
@@ -56,7 +45,6 @@ use adv_gpu::{
     Sampler,
 };
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
 
 /// Workgroups per dispatch, below the portable 65535 per dimension. Larger
 /// lists split into dispatches over aligned slices.
@@ -183,43 +171,27 @@ const TILE: u32 = 128;
 const ARENA: u32 = 2048;
 /// Source-cell words of the bookkeeping delta and decision bitmaps.
 const DELTA_WORDS: u32 = 128;
-/// Words of the frame header before its data.
-const FRAME_WORDS: usize = 40;
-/// State words of the motion header and its two indirect sets.
-const MOTION_WORDS: u32 = 8 + 2 * 16;
-/// Distinct offsets per frame: the global motion and seven proposals.
-const OFFSETS: usize = 8;
-const COLOURS: u64 = 4096;
-const REFERENCE_HEADER: u64 = 16 + COLOURS * 4 + COLOURS * 32;
-const FACT: u64 = 32;
-/// Owner tags keep 17 bits for the cell index.
-const MAX_CELLS: u64 = 1 << 17;
+/// Words of the frame header before its data (upscale_common.wgsl).
+const FRAME_WORDS: usize = 8;
 
 /// One model at one canvas size. Only the selected model is resident.
 pub struct Upscaling {
     model: Model,
     size: (u32, u32),
-    /// The last two encoded inputs and their doubled outputs, alternating.
+    /// The last two encoded inputs, alternating, and the doubled output.
     inputs: [Image; 2],
-    outputs: [Image; 2],
-    /// The pair the last encode wrote.
+    output: Image,
+    /// The input the last encode read.
     newest: Cell<usize>,
     /// Producer damage of the last encode, which the older input lacks;
     /// `None` until both inputs hold a frame.
     stale: RefCell<Option<Region>>,
-    constant_output: Image,
-    references: Buffer,
-    phases: RefCell<HashMap<u128, [i32; 2]>>,
+    /// Per source cell, the epoch of the last compare that found it changed.
+    stamps: Buffer,
     epoch: Cell<u32>,
-    motion: Buffer,
-    project: ComputePipeline,
-    correlate: ComputePipeline,
-    choose_motion: ComputePipeline,
-    motion_dimensions: Buffer,
     compare: ComputePipeline,
     bookkeeping: ComputePipeline,
-    refresh: ComputePipeline,
-    /// Motion header, indirect sets, delta, validity and written stamps.
+    /// Indirect sets, delta and validity.
     state: Buffer,
     metadata: Buffer,
     compacted: Buffer,
@@ -237,14 +209,12 @@ pub struct Upscaling {
     align: u32,
 }
 
-/// Word offsets into the state buffer, and the refresh list's place.
+/// Word offsets into the state buffer.
 struct Layout {
     arguments: [u64; 2],
     set_words: u64,
     records: u64,
     delta: u64,
-    refresh: u64,
-    refresh_arguments: u64,
     chunk: u32,
 }
 
@@ -317,12 +287,7 @@ impl Upscaling {
     ) -> adv_gpu::Result<Self> {
         let max = device.caps().limits.max_image_2d;
         let (columns, rows) = (size.0.div_ceil(8), size.1.div_ceil(8));
-        if size.0 == 0
-            || size.1 == 0
-            || size.0 > max / 2
-            || size.1 > max / 2
-            || u64::from(columns * rows) > MAX_CELLS
-        {
+        if size.0 == 0 || size.1 == 0 || size.0 > max / 2 || size.1 > max / 2 {
             return Err(adv_gpu::Error::Invalid(
                 "upscaled canvas exceeds the image limit".into(),
             ));
@@ -351,13 +316,13 @@ impl Upscaling {
                 "upscale input",
             )
         };
-        let output = || {
+        let output = {
             image(
                 (size.0 * 2, size.1 * 2),
                 OUTPUT,
                 Usage::STORAGE | Usage::SAMPLED | Usage::COPY_SRC,
                 "upscaled",
-            )
+            )?
         };
         let tensors = model
             .tensors
@@ -502,24 +467,18 @@ impl Upscaling {
         if arena > ARENA {
             return Err(unsupported("bookkeeping memory"));
         }
-        let last_grid = grids.last().unwrap();
-        let last_cells = last_grid.columns * last_grid.rows;
-        let refresh = entries;
-        let refresh_records = records;
-        records += u64::from(last_cells.div_ceil(chunk));
-        entries += 2 * u64::from(last_cells);
-        // Records first, then one counter per pass and the refresh counter.
+        // Records first, then one counter per pass.
         let record_words = records * 4;
         for (i, row) in metadata.iter_mut().enumerate() {
             row[10] = (record_words + i as u64) as u32;
         }
-        let set_words = record_words + passes.len() as u64 + 1;
+        let set_words = record_words + passes.len() as u64;
         let delta_words = u64::from(columns.div_ceil(32) * rows);
-        let arguments = [u64::from(MOTION_WORDS), u64::from(MOTION_WORDS) + set_words];
-        let delta = arguments[1] + set_words;
+        let arguments = [0, set_words];
+        // The damage overlay binds delta as storage.
+        let delta = (2 * set_words).next_multiple_of(u64::from(align));
         let valid_start = delta + delta_words;
-        let written = valid_start + 2 * u64::from(valid);
-        let state_words = written + u64::from(last_cells);
+        let state_words = valid_start + 2 * u64::from(valid);
         let shape = [
             size.0,
             size.1,
@@ -527,51 +486,20 @@ impl Upscaling {
             halo,
             columns,
             rows,
-            (columns * rows).div_ceil(8),
-            last.unit(),
             delta as u32,
             valid_start as u32,
             (valid_start + u64::from(valid)) as u32,
-            written as u32,
             arguments[0] as u32,
             arguments[1] as u32,
             set_words as u32,
-            refresh as u32,
-            (record_words + passes.len() as u64) as u32,
-            (refresh_records * 4) as u32,
-            chunk,
-            output_reach,
-            u32::from(model.translations()),
-            output_reach.div_ceil(8),
             record_words as u32,
-            0,
+            chunk,
         ];
         let metadata = upload(
             &words(shape.into_iter().chain(metadata.into_iter().flatten())),
             BufferUsage::STORAGE,
             "upscale pass graph",
         )?;
-        let motion_dimensions = upload(
-            &words([size.0, size.1, 0, 0, 0, 0, 0, 0]),
-            BufferUsage::UNIFORM,
-            "upscale motion dimensions",
-        )?;
-        let shader = stage_shader!(device, "upscale_motion")?;
-        let motion_pipeline = |entry| {
-            device.create_compute_pipeline(
-                &ComputePipelineDesc {
-                    entry: shader.entry(entry, Stage::Compute)?,
-                    bindings: super::bindings::UPSCALE_MOTION.to_vec(),
-                    label: "upscale motion",
-                },
-                None,
-            )
-        };
-        let (project, correlate, choose_motion) = (
-            motion_pipeline("project")?,
-            motion_pipeline("correlate")?,
-            motion_pipeline("choose")?,
-        );
         let stage = |shader: adv_gpu::Shader, entry, bindings: &[adv_gpu::pipeline::Binding]| {
             device.create_compute_pipeline(
                 &ComputePipelineDesc {
@@ -593,39 +521,18 @@ impl Upscaling {
                 "main",
                 &super::bindings::UPSCALE_FILTER,
             )?,
-            refresh: stage(
-                stage_shader!(device, "upscale_refresh")?,
-                "main",
-                &super::bindings::UPSCALE_REFRESH,
-            )?,
             model,
             size,
             inputs: [input()?, input()?],
-            outputs: [output()?, output()?],
+            output,
             newest: Cell::new(0),
             stale: RefCell::new(None),
-            constant_output: image(
-                (128, 128),
-                OUTPUT,
-                Usage::SAMPLED | Usage::STORAGE,
-                "upscale constant colours",
+            stamps: buffer(
+                u64::from(columns * rows) * 4,
+                BufferUsage::STORAGE | BufferUsage::COPY_DST,
+                "upscale change stamps",
             )?,
-            references: buffer(
-                REFERENCE_HEADER + u64::from(columns * rows) * FACT,
-                BufferUsage::STORAGE | BufferUsage::COPY_DST | BufferUsage::COPY_SRC,
-                "upscale references",
-            )?,
-            phases: RefCell::new(HashMap::new()),
             epoch: Cell::new(0),
-            motion: buffer(
-                u64::from((size.0 + size.1) * 4) * 4,
-                BufferUsage::STORAGE,
-                "upscale motion profiles",
-            )?,
-            project,
-            correlate,
-            choose_motion,
-            motion_dimensions,
             state: buffer(
                 state_words * 4,
                 // COPY_SRC: tests read it back.
@@ -646,8 +553,6 @@ impl Upscaling {
                 set_words,
                 records: record_words,
                 delta,
-                refresh,
-                refresh_arguments: refresh_records * 4,
                 chunk,
             },
             tensors,
@@ -658,17 +563,6 @@ impl Upscaling {
             grids,
             halo,
             align,
-        })
-    }
-
-    /// Broad damage can pay for projection with the saved model interior.
-    pub fn broad(&self, damage: Option<&[Rect]>) -> bool {
-        damage.is_none_or(|rects| {
-            let cells: u32 = rects
-                .iter()
-                .map(|r| r.w.div_ceil(8) * r.h.div_ceil(8))
-                .sum();
-            cells >= (self.size.0.div_ceil(8) * self.size.1.div_ceil(8)).div_ceil(8)
         })
     }
 
@@ -686,7 +580,7 @@ impl Upscaling {
 
     /// The doubled image of the last encode.
     pub fn output(&self) -> &Image {
-        &self.outputs[self.newest.get()]
+        &self.output
     }
 
     /// What composition writes into [`Self::input`] for a change within
@@ -714,7 +608,6 @@ impl Upscaling {
         gpu: (&mut Encoder, &mut Ring),
         damage: Option<&[Rect]>,
         input: Input,
-        records: &[DrawRecord],
         timestamps: Option<(&adv_gpu::queue::QuerySet, u32)>,
     ) -> adv_gpu::Result<u64> {
         let (encoder, ring) = gpu;
@@ -728,7 +621,6 @@ impl Upscaling {
             return Ok(0);
         }
         let exact = input == Input::Exact || !initialized;
-        let translations = self.model.translations();
         let (columns, rows) = (self.size.0.div_ceil(8), self.size.1.div_ceil(8));
         let rects: Vec<Rect> = region.rects().into_iter().map(Into::into).collect();
         // The bookkeeping tiles: wherever this change or the last one reaches.
@@ -773,33 +665,9 @@ impl Upscaling {
                 })
                 .collect()
         };
-        // Proposals by distinct offset; the first entry is the global motion.
-        let phases = self.phases.borrow();
-        let mut offsets: Vec<[i32; 2]> = vec![];
-        let mut proposals = vec![];
-        for record in records.iter().filter(|_| translations && !exact) {
-            let Some(old) = phases.get(&record.content) else {
-                continue;
-            };
-            let motion = [record.phase[0] - old[0], record.phase[1] - old[1]];
-            if motion == [0, 0] {
-                continue;
-            }
-            let k = match offsets.iter().position(|&o| o == motion) {
-                Some(k) => k,
-                None if offsets.len() + 1 < OFFSETS => {
-                    offsets.push(motion);
-                    offsets.len() - 1
-                }
-                None => continue,
-            };
-            proposals.push((record.target, k as u32 + 1));
-        }
-        drop(phases);
         let stride = columns.div_ceil(32);
         let bitmap_words = if exact { stride * rows } else { 0 };
-        let proposal_words = proposals.len() * 8;
-        let list = proposal_words;
+        let list = 0;
         let tile_at = list + compared.len();
         let bitmap = tile_at + tile_list.len();
         let data_words = bitmap + bitmap_words as usize;
@@ -814,23 +682,10 @@ impl Upscaling {
             };
             put(0, epoch);
             put(1, u32::from(exact));
-            put(2, proposals.len() as u32);
-            put(3, compared.len() as u32);
-            put(4, tile_list.len() as u32);
-            put(5, list as u32);
-            put(6, tile_at as u32);
-            put(7, bitmap as u32);
-            for (k, offset) in offsets.iter().enumerate() {
-                put(8 + (k + 1) * 4, offset[0] as u32);
-                put(8 + (k + 1) * 4 + 1, offset[1] as u32);
-                put(8 + (k + 1) * 4 + 2, 1);
-            }
-            for (i, (rect, k)) in proposals.iter().enumerate() {
-                let at = FRAME_WORDS + i * 8;
-                for (j, value) in [rect.x, rect.y, rect.w, rect.h, *k].into_iter().enumerate() {
-                    put(at + j, value);
-                }
-            }
+            put(2, compared.len() as u32);
+            put(3, list as u32);
+            put(4, tile_at as u32);
+            put(5, bitmap as u32);
             for (i, &cell) in compared.iter().enumerate() {
                 put(FRAME_WORDS + list + i, cell);
             }
@@ -855,7 +710,7 @@ impl Upscaling {
         if !initialized {
             // The only clears: both argument sets start as (0, 1, 1, 0) records.
             encoder.fill_buffer(self.state.slice(0..self.state.desc().size), 0);
-            encoder.fill_buffer(self.references.slice(0..self.references.desc().size), 0);
+            encoder.fill_buffer(self.stamps.slice(0..self.stamps.desc().size), 0);
             let mut init = ring.reserve(self.layout.set_words * 8, align)?;
             let bytes = init.bytes();
             bytes.fill(0);
@@ -876,36 +731,12 @@ impl Upscaling {
         }
         let (newest, written) = (self.newest.get(), 1 - self.newest.get());
         let state = || Bind::StorageBuffer(self.state.slice(0..self.state.desc().size));
-        let references =
-            || Bind::StorageBuffer(self.references.slice(0..self.references.desc().size));
+        let stamps = || Bind::StorageBuffer(self.stamps.slice(0..self.stamps.desc().size));
         let metadata = || Bind::StorageBuffer(self.metadata.slice(0..self.metadata.desc().size));
         let mut compute = encoder.compute_pass(&ComputePassDesc {
             timestamps,
             label: "upscale",
         });
-        if !exact && translations {
-            compute.bind(0, Bind::Uniform(self.motion_dimensions.slice(0..32)));
-            compute.bind(0, Bind::Sampled(self.inputs[written].view()));
-            compute.bind(1, Bind::Sampled(self.inputs[newest].view()));
-            compute.bind(
-                0,
-                Bind::StorageBuffer(self.motion.slice(0..self.motion.desc().size)),
-            );
-            compute.bind(1, state());
-            compute.bind(
-                2,
-                Bind::StorageBuffer(span.buffer().slice(frame_at..frame_at + 4)),
-            );
-            let set = (8 + u64::from(epoch % 2) * 16) * 4;
-            for (i, pipeline) in [&self.project, &self.correlate, &self.choose_motion]
-                .into_iter()
-                .enumerate()
-            {
-                compute.set_pipeline(pipeline);
-                let at = set + i as u64 * 16;
-                compute.dispatch_indirect(self.state.slice(at..at + 12));
-            }
-        }
         if !compared.is_empty() {
             compute.set_pipeline(&self.compare);
             compute.bind(0, Bind::Sampled(self.inputs[written].view()));
@@ -914,9 +745,8 @@ impl Upscaling {
                 0,
                 Bind::StorageBuffer(span.buffer().slice(frame_at..frame_at + frame_len)),
             );
-            compute.bind(1, references());
-            compute.bind(2, state());
-            compute.bind(3, metadata());
+            compute.bind(1, stamps());
+            compute.bind(2, metadata());
             let n = compared.len() as u32;
             compute.dispatch(n.min(DISPATCH), n.div_ceil(DISPATCH), 1);
         }
@@ -925,7 +755,7 @@ impl Upscaling {
             0,
             Bind::StorageBuffer(span.buffer().slice(frame_at..frame_at + frame_len)),
         );
-        compute.bind(1, references());
+        compute.bind(1, stamps());
         compute.bind(2, state());
         compute.bind(3, metadata());
         compute.bind(
@@ -936,28 +766,6 @@ impl Upscaling {
         compute.dispatch(n.min(DISPATCH), n.div_ceil(DISPATCH), 1);
         let set = self.layout.arguments[(epoch % 2) as usize];
         let chunk = u64::from(self.layout.chunk);
-        let last = self.grids.last().unwrap();
-        let last_cells = u64::from(last.columns * last.rows);
-        compute.set_pipeline(&self.refresh);
-        compute.bind(0, Bind::Sampled(self.outputs[newest].view()));
-        compute.bind(1, Bind::Sampled(self.constant_output.view()));
-        compute.bind(
-            1,
-            Bind::StorageBuffer(span.buffer().slice(frame_at..frame_at + frame_len)),
-        );
-        compute.bind(2, state());
-        compute.bind(3, metadata());
-        compute.bind(4, Bind::StorageImage(self.outputs[written].view()));
-        for (slice, first) in (0..last_cells).step_by(chunk as usize).enumerate() {
-            let n = chunk.min(last_cells - first);
-            let start = (self.layout.refresh + first * 2) * 4;
-            compute.bind(
-                0,
-                Bind::StorageBuffer(self.compacted.slice(start..start + n * 8)),
-            );
-            let at = (set + self.layout.refresh_arguments + slice as u64 * 4) * 4;
-            compute.dispatch_indirect(self.state.slice(at..at + 12));
-        }
         for (pass, (pipeline, grid)) in self
             .model
             .passes
@@ -965,10 +773,6 @@ impl Upscaling {
             .zip(self.pipelines.iter().zip(&self.grids))
         {
             compute.set_pipeline(pipeline);
-            if pass.bindings.iter().any(|(_, role)| *role == Role::Output) {
-                compute.bind(16, references());
-                compute.bind(17, Bind::StorageImage(self.constant_output.view()));
-            }
             for &(slot, role) in pass.bindings {
                 let resource = match role {
                     Role::Uniform => Bind::Uniform(self.dimensions.slice(0..16)),
@@ -976,7 +780,7 @@ impl Upscaling {
                     Role::Source => Bind::Sampled(self.inputs[written].view()),
                     Role::Tensor(t) => Bind::Sampled(self.tensors[t].view()),
                     Role::Store(t) => Bind::StorageImage(self.tensors[t].view()),
-                    Role::Output => Bind::StorageImage(self.outputs[written].view()),
+                    Role::Output => Bind::StorageImage(self.output.view()),
                     Role::Nearest => Bind::Sampler(&self.nearest),
                     Role::Linear => Bind::Sampler(&self.linear),
                 };
@@ -998,9 +802,6 @@ impl Upscaling {
         encoder.retain(span);
         self.epoch.set(epoch);
         self.newest.set(written);
-        let mut phases = self.phases.borrow_mut();
-        phases.clear();
-        phases.extend(records.iter().map(|r| (r.content, r.phase)));
         *self.stale.borrow_mut() = Some(region);
         Ok(self.reached(&rects))
     }
@@ -1154,7 +955,7 @@ impl Check {
                 rows: 0,
             };
             encoder.copy_buffer_to_image(pixels, at(input), input.desc().size);
-            upscaling.encode((encoder, ring), None, Input::Exact, &[], None)?;
+            upscaling.encode((encoder, ring), None, Input::Exact, None)?;
             let readback = BufferCopy {
                 buffer: &self.readback,
                 offset,

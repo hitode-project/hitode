@@ -87,7 +87,6 @@ impl Video {
     }
 }
 pub struct Frame {
-    pub records: Vec<upscale::DrawRecord>,
     pub info: FrameInfo,
     pub base: Base,
     pub video: Vec<Video>,
@@ -470,7 +469,6 @@ impl Display {
         info.base = BaseKind::Gpu { presentable: false };
         info.damage = Region::whole(info.canvas);
         Some(Frame {
-            records: Vec::new(),
             info,
             base: Base::Retained {
                 image: image.image().clone(),
@@ -1303,17 +1301,7 @@ impl Display {
                     .collect::<Vec<_>>()
             });
             let input = if software {
-                if self
-                    .upscaled
-                    .as_ref()
-                    .unwrap()
-                    .upscaling
-                    .broad(damage.as_deref())
-                {
-                    upscale::Input::Software
-                } else {
-                    upscale::Input::Exact
-                }
+                upscale::Input::Exact
             } else {
                 upscale::Input::Composed
             };
@@ -1428,7 +1416,6 @@ impl Display {
                     (encoder.as_mut().unwrap(), &mut self.ring),
                     Some(damage.as_deref().unwrap_or(&tiles.rects)),
                     input,
-                    &frame.records,
                     self.queries.as_ref().map(|q| (q, statistics.passes * 2)),
                 )?;
                 statistics.stages[index].pixels = upscaled;

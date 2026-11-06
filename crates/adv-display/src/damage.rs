@@ -631,7 +631,6 @@ mod tests {
                 (&mut encoder, &mut ring),
                 None,
                 upscale::Input::Composed,
-                &[],
                 None,
             )
             .unwrap();
@@ -676,7 +675,6 @@ mod tests {
             (&mut encoder, &mut ring),
             None,
             upscale::Input::Composed,
-            &[],
             None,
         )
         .unwrap();
