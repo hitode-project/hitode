@@ -100,7 +100,7 @@ jobs:
           python3 tools/layering/check_layers.py
 
   workspace-lint:
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 15
     env:
       CARGO_BUILD_JOBS: '3'
@@ -158,7 +158,7 @@ jobs:
 
   workspace:
     name: workspace (${{ matrix.group }}, macOS ARM64)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 35
     strategy:
       fail-fast: false

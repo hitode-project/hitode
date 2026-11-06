@@ -118,7 +118,6 @@ pub(crate) enum Command {
     Submit,
     /// End of a guest frame: submit and hand `image` to presentation.
     PresentSwap {
-        records: Arc<[crate::frame::DrawRecord]>,
         image: Image,
         damage: crate::frame::Region,
         serial: u64,

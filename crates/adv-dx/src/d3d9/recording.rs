@@ -165,8 +165,6 @@ fn lookups() -> u64 {
 #[derive(Default)]
 pub(super) struct Recording {
     commands: Vec<Operation>,
-    records: Vec<adv_device::frame::DrawRecord>,
-    phases: HashMap<u128, [i32; 2]>,
     reuse: reuse::Cache,
     passes: passes::Plan,
     damage: damage::Analysis,
@@ -213,9 +211,6 @@ pub(super) fn forget(env: &mut Env<'_>, owner: Id, pointer: u32) {
     }
 }
 /// What the frame being presented changed since the previous presentation, when known.
-pub(super) fn records(f: &Recording) -> std::sync::Arc<[adv_device::frame::DrawRecord]> {
-    f.records.clone().into()
-}
 pub(super) fn changed(f: &Recording) -> Option<adv_device::surface::Region> {
     f.verify_region.clone()
 }
@@ -419,25 +414,6 @@ fn append(
             })
     });
     let bytes = if retained.is_some() { 0 } else { p.bytes };
-    let records: Vec<_> = match &p.operation {
-        Operation::Draw(draw) => damage::sampling::phases(env, d, draw)
-            .into_iter()
-            .map(|(source, phase)| {
-                let content = hash((source, d.frame.contents.get(&source).copied().unwrap_or(0)));
-                adv_device::frame::DrawRecord {
-                    target: p.bounds.into(),
-                    content,
-                    phase,
-                    motion: d
-                        .frame
-                        .phases
-                        .get(&content)
-                        .map(|old| [phase[0] - old[0], phase[1] - old[1]]),
-                }
-            })
-            .collect(),
-        _ => Vec::new(),
-    };
     let lost = d.gpu_lost;
     let limit = d.frame.commands.len() + 1 >= 4096 || d.frame.bytes + bytes >= 64 * 1024 * 1024;
     // Ordinary admission unlocks immediately. A limit flush retains its lock
@@ -573,8 +549,6 @@ fn append(
     if let (Some(target), Operation::Draw(draw)) = (target, &mut operation) {
         draw.target = target;
     }
-    let old_records = f.records.len();
-    f.records.extend(records);
     f.commands.push(operation);
     let limit = f.commands.len() >= 4096 || f.bytes >= 64 * 1024 * 1024;
     env.ext.get_mut::<State>().frames.recorded_commands += 1;
@@ -587,7 +561,6 @@ fn append(
             let f = frame(env, owner);
             assert!(f.head < f.commands.len());
             let rejected = f.commands.pop();
-            f.records.truncate(old_records);
             let len = f.commands.len();
             f.passes.truncate(f.commands.len());
             f.damage.invalidate();
@@ -973,9 +946,6 @@ pub(super) fn present(env: &mut Env<'_>, operation: &Operation) -> Result<Comple
 fn finish(env: &mut Env<'_>, owner: Id, token: u64, presentation: u128, serial: Option<u64>) {
     unlock(env, owner, token);
     let f = frame(env, owner);
-    f.phases.clear();
-    f.phases
-        .extend(f.records.drain(..).map(|r| (r.content, r.phase)));
     f.damage.finish();
     f.rotate = false;
     f.verify_image = None;

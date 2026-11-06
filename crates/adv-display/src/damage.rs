@@ -623,38 +623,22 @@ mod tests {
         let u =
             upscale::Upscaling::with_precision(&device, upscale::models::FUSED[0], canvas, false)
                 .unwrap();
-        let result = device
-            .create_image(&ImageDesc {
-                dimension: Dimension::D2,
-                size: Extent {
-                    width: canvas.0 * 2,
-                    height: canvas.1 * 2,
-                    depth_or_layers: 1,
-                },
-                format: upscale::OUTPUT,
-                mips: 1,
-                samples: 1,
-                usage: Usage::STORAGE | Usage::SAMPLED,
-                view_formats: &[],
-                label: "damage upscale fixture",
-            })
-            .unwrap();
         let mut ring = device.ring(4 << 20).unwrap();
         let mut run = |queue: &mut Queue, color: [f64; 4]| {
-            fill(queue, u.input(false), color);
+            fill(queue, u.input(), color);
             let mut encoder = queue.encoder("damage upscale fixture");
             u.encode(
                 (&mut encoder, &mut ring),
-                result.view(),
                 None,
                 upscale::Input::Composed,
-                &[],
                 None,
             )
             .unwrap();
             queue.submit(encoder).unwrap();
         };
         run(&mut queue, [0.1, 0.2, 0.3, 1.]);
+        // The other input image holds nothing yet: compose the same frame.
+        fill(&mut queue, u.input(), [0.1, 0.2, 0.3, 1.]);
         // Change one input cell while S conservatively covers the whole canvas.
         let upload = device
             .create_buffer(&BufferDesc {
@@ -676,7 +660,7 @@ mod tests {
                 rows: 0,
             },
             ImageCopy {
-                image: u.input(false),
+                image: u.input(),
                 mip: 0,
                 layer: 0,
                 origin: (0, 0, 0),
@@ -689,10 +673,8 @@ mod tests {
         );
         u.encode(
             (&mut encoder, &mut ring),
-            result.view(),
             None,
             upscale::Input::Composed,
-            &[],
             None,
         )
         .unwrap();

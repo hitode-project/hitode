@@ -87,7 +87,6 @@ impl Video {
     }
 }
 pub struct Frame {
-    pub records: Vec<upscale::DrawRecord>,
     pub info: FrameInfo,
     pub base: Base,
     pub video: Vec<Video>,
@@ -180,26 +179,9 @@ impl Upscaled {
             None
         };
         let upscaling = upscale::Upscaling::with_precision(device, model, canvas, half)?;
-        let output = device.create_image(&adv_gpu::resource::ImageDesc {
-            dimension: adv_gpu::resource::Dimension::D2,
-            size: adv_gpu::Extent {
-                width: canvas.0 * 2,
-                height: canvas.1 * 2,
-                depth_or_layers: 1,
-            },
-            format: upscale::OUTPUT,
-            mips: 1,
-            samples: 1,
-            usage: adv_gpu::resource::Usage::STORAGE
-                | adv_gpu::resource::Usage::SAMPLED
-                | adv_gpu::resource::Usage::COPY_SRC,
-            view_formats: &[],
-            label: "upscaled",
-        })?;
         let upscaled = Self {
             choice,
             upscaling,
-            output,
             pipelines: Pipelines::new(device, upscale::INPUT)?,
         };
         Ok((upscaled, check))
@@ -227,12 +209,11 @@ struct Building {
     checking: Option<(Upscaled, upscale::Check, Token)>,
     failed: bool,
 }
-/// The selected model at one canvas size and the doubled image it keeps
-/// complete, which the output pass reads.
+/// The selected model at one canvas size; the output pass reads the doubled
+/// image it keeps complete.
 struct Upscaled {
     choice: Upscaler,
     upscaling: upscale::Upscaling,
-    output: Image,
     /// Composition into the model's half-precision input.
     pipelines: Pipelines,
 }
@@ -378,7 +359,7 @@ impl Display {
     pub(crate) fn upscaled_copy(&mut self, queue: &mut Queue) -> Image {
         use adv_gpu::{encode, resource};
         let u = self.upscaled.as_ref().expect("upscaler");
-        let size = u.output.desc().size;
+        let size = u.upscaling.output().desc().size;
         let whole = Rect {
             x: 0,
             y: 0,
@@ -420,7 +401,7 @@ impl Display {
         });
         let spans = output::encode(
             &mut pass,
-            output::Source::Image(u.output.view()),
+            output::Source::Image(u.upscaling.output().view()),
             size,
             Transform {
                 rotation: Rotation::None,
@@ -488,7 +469,6 @@ impl Display {
         info.base = BaseKind::Gpu { presentable: false };
         info.damage = Region::whole(info.canvas);
         Some(Frame {
-            records: Vec::new(),
             info,
             base: Base::Retained {
                 image: image.image().clone(),
@@ -1321,33 +1301,38 @@ impl Display {
                     .collect::<Vec<_>>()
             });
             let input = if software {
-                if self
-                    .upscaled
-                    .as_ref()
-                    .unwrap()
-                    .upscaling
-                    .broad(damage.as_deref())
-                {
-                    upscale::Input::Software
-                } else {
-                    upscale::Input::Exact
-                }
+                upscale::Input::Exact
             } else {
                 upscale::Input::Composed
             };
-            let exact = input == upscale::Input::Exact;
+            // The upscaler's input lags a frame behind, so composition also
+            // covers the last frame's change there.
+            let mut drawn = tiles;
+            let covered;
             let destination = match stage {
-                Stage::Upscale { .. } => self
-                    .upscaled
-                    .as_ref()
-                    .unwrap()
-                    .upscaling
-                    .input(exact)
-                    .clone(),
+                Stage::Upscale { .. } => {
+                    let upscaling = &self.upscaled.as_ref().unwrap().upscaling;
+                    let size = upscaling.size();
+                    covered = Tiles {
+                        size: tiles.size,
+                        rects: upscaling
+                            .composition(Some(damage.as_deref().unwrap_or(&tiles.rects)))
+                            .unwrap_or_else(|| {
+                                vec![Rect {
+                                    x: 0,
+                                    y: 0,
+                                    w: size.0,
+                                    h: size.1,
+                                }]
+                            }),
+                    };
+                    drawn = &covered;
+                    upscaling.input().clone()
+                }
                 _ => targets[into.0 as usize].as_ref().unwrap().image().clone(),
             };
             let size = destination.desc().size;
-            let (area, load) = ingest::coverage(tiles);
+            let (area, load) = ingest::coverage(drawn);
             let mut pass = encoder
                 .as_mut()
                 .unwrap()
@@ -1388,9 +1373,9 @@ impl Display {
                 } => {
                     let source = match from {
                         Source::Base => frame.base.source(),
-                        Source::Pool(UPSCALE) => {
-                            output::Source::Image(self.upscaled.as_ref().unwrap().output.view())
-                        }
+                        Source::Pool(UPSCALE) => output::Source::Image(
+                            self.upscaled.as_ref().unwrap().upscaling.output().view(),
+                        ),
                         Source::Pool(p) => output::Source::Image(
                             targets[p.0 as usize].as_ref().unwrap().image().view(),
                         ),
@@ -1416,7 +1401,7 @@ impl Display {
                 }
                 Stage::Upscale { video, .. } => {
                     let video = if *video { &frame.video[..] } else { &[] };
-                    self.compose(&mut pass, &destination, &frame.base, video, tiles)?
+                    self.compose(&mut pass, &destination, &frame.base, video, drawn)?
                 }
             }
             drop(pass);
@@ -1429,10 +1414,8 @@ impl Display {
                 let u = self.upscaled.as_ref().unwrap();
                 let upscaled = u.upscaling.encode(
                     (encoder.as_mut().unwrap(), &mut self.ring),
-                    u.output.view(),
                     Some(damage.as_deref().unwrap_or(&tiles.rects)),
                     input,
-                    &frame.records,
                     self.queries.as_ref().map(|q| (q, statistics.passes * 2)),
                 )?;
                 statistics.stages[index].pixels = upscaled;

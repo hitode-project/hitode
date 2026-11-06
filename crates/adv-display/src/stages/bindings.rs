@@ -1,4 +1,5 @@
 //! Binding descriptions shared by stage pipelines and host-shader compilation.
+use adv_gpu::Format;
 use adv_gpu::pipeline::{Binding, BindingKind, Stages};
 use adv_gpu::resource::Dimension;
 
@@ -72,151 +73,68 @@ pub const OUTPUT: [Binding; 3] = [
     },
 ];
 
-pub const UPSCALE_DELTA: [Binding; 10] = [
+const fn sampled(slot: u32) -> Binding {
     Binding {
-        slot: 0,
-        kind: BindingKind::UniformBuffer,
-        stages: Stages::COMPUTE,
-    },
-    Binding {
-        slot: 0,
+        slot,
         kind: BindingKind::SampledImage {
             dimension: Dimension::D2,
             depth: false,
             multisampled: false,
         },
         stages: Stages::COMPUTE,
-    },
-    Binding {
-        slot: 0,
-        kind: BindingKind::StorageImage {
-            format: adv_gpu::Format::Rgba16Float,
-            writable: true,
-        },
-        stages: Stages::COMPUTE,
-    },
-    Binding {
-        slot: 1,
-        kind: BindingKind::StorageBuffer { writable: false },
-        stages: Stages::COMPUTE,
-    },
-    Binding {
-        slot: 2,
-        kind: BindingKind::StorageBuffer { writable: true },
-        stages: Stages::COMPUTE,
-    },
-    Binding {
-        slot: 3,
-        kind: BindingKind::StorageBuffer { writable: true },
-        stages: Stages::COMPUTE,
-    },
-    Binding {
-        slot: 1,
-        kind: BindingKind::SampledImage {
-            dimension: Dimension::D2,
-            depth: false,
-            multisampled: false,
-        },
-        stages: Stages::COMPUTE,
-    },
-    Binding {
-        slot: 4,
-        kind: BindingKind::StorageBuffer { writable: true },
-        stages: Stages::COMPUTE,
-    },
-    Binding {
-        slot: 5,
-        kind: BindingKind::StorageBuffer { writable: false },
-        stages: Stages::COMPUTE,
-    },
-    Binding {
-        slot: 2,
-        kind: BindingKind::SampledImage {
-            dimension: Dimension::D2,
-            depth: false,
-            multisampled: false,
-        },
-        stages: Stages::COMPUTE,
-    },
-];
+    }
+}
 
-pub const UPSCALE_FILTER: [Binding; 13] = [
+const fn storage(slot: u32, writable: bool) -> Binding {
     Binding {
-        slot: 0,
-        kind: BindingKind::UniformBuffer,
+        slot,
+        kind: BindingKind::StorageBuffer { writable },
         stages: Stages::COMPUTE,
-    },
-    Binding {
-        slot: 0,
-        kind: BindingKind::StorageBuffer { writable: false },
-        stages: Stages::COMPUTE,
-    },
-    Binding {
-        slot: 1,
-        kind: BindingKind::StorageBuffer { writable: false },
-        stages: Stages::COMPUTE,
-    },
-    Binding {
-        slot: 2,
-        kind: BindingKind::StorageBuffer { writable: true },
-        stages: Stages::COMPUTE,
-    },
-    Binding {
-        slot: 3,
-        kind: BindingKind::StorageBuffer { writable: true },
-        stages: Stages::COMPUTE,
-    },
+    }
+}
+
+/// Anchors: the input, the frame, anchors, state and the pass graph.
+pub const UPSCALE_ANCHOR: [Binding; 5] = [
+    sampled(0),
+    storage(0, false),
+    storage(1, true),
+    storage(2, true),
+    storage(3, false),
+];
+/// Compare: both inputs, the frame, the facts, state, the pass graph and the
+/// anchors.
+pub const UPSCALE_DELTA: [Binding; 7] = [
+    sampled(0),
+    sampled(1),
+    storage(0, false),
+    storage(1, true),
+    storage(2, true),
+    storage(3, false),
+    storage(4, false),
+];
+/// Bookkeeping: the frame, the facts, state, the pass graph, the lists and
+/// anchors.
+pub const UPSCALE_FILTER: [Binding; 6] = [
+    storage(0, false),
+    storage(1, false),
+    storage(2, true),
+    storage(3, false),
+    storage(4, true),
+    storage(5, true),
+];
+/// Copies: the image read, the entries, the frame, state, the pass graph and
+/// the image written.
+pub const UPSCALE_COPY: [Binding; 6] = [
+    sampled(0),
+    storage(0, false),
+    storage(1, false),
+    storage(2, false),
+    storage(3, false),
     Binding {
         slot: 4,
-        kind: BindingKind::StorageBuffer { writable: true },
-        stages: Stages::COMPUTE,
-    },
-    Binding {
-        slot: 5,
-        kind: BindingKind::StorageBuffer { writable: false },
-        stages: Stages::COMPUTE,
-    },
-    Binding {
-        slot: 6,
-        kind: BindingKind::StorageBuffer { writable: true },
-        stages: Stages::COMPUTE,
-    },
-    Binding {
-        slot: 0,
-        kind: BindingKind::SampledImage {
-            dimension: Dimension::D2,
-            depth: false,
-            multisampled: false,
-        },
-        stages: Stages::COMPUTE,
-    },
-    Binding {
-        slot: 7,
         kind: BindingKind::StorageImage {
-            format: adv_gpu::Format::Rgba16Float,
+            format: Format::Rgba8Unorm,
             writable: true,
-        },
-        stages: Stages::COMPUTE,
-    },
-    Binding {
-        slot: 8,
-        kind: BindingKind::StorageImage {
-            format: adv_gpu::Format::Rgba8Unorm,
-            writable: true,
-        },
-        stages: Stages::COMPUTE,
-    },
-    Binding {
-        slot: 9,
-        kind: BindingKind::StorageBuffer { writable: true },
-        stages: Stages::COMPUTE,
-    },
-    Binding {
-        slot: 2,
-        kind: BindingKind::SampledImage {
-            dimension: Dimension::D2,
-            depth: false,
-            multisampled: false,
         },
         stages: Stages::COMPUTE,
     },
@@ -247,43 +165,6 @@ pub const DAMAGE: [Binding; 5] = [
     Binding {
         slot: 7,
         kind: BindingKind::StorageBuffer { writable: false },
-        stages: Stages::COMPUTE,
-    },
-];
-
-/// Projection, correlation and peak selection share one persistent buffer.
-pub const UPSCALE_MOTION: [Binding; 5] = [
-    Binding {
-        slot: 0,
-        kind: BindingKind::UniformBuffer,
-        stages: Stages::COMPUTE,
-    },
-    Binding {
-        slot: 0,
-        kind: BindingKind::SampledImage {
-            dimension: Dimension::D2,
-            depth: false,
-            multisampled: false,
-        },
-        stages: Stages::COMPUTE,
-    },
-    Binding {
-        slot: 1,
-        kind: BindingKind::SampledImage {
-            dimension: Dimension::D2,
-            depth: false,
-            multisampled: false,
-        },
-        stages: Stages::COMPUTE,
-    },
-    Binding {
-        slot: 0,
-        kind: BindingKind::StorageBuffer { writable: true },
-        stages: Stages::COMPUTE,
-    },
-    Binding {
-        slot: 1,
-        kind: BindingKind::StorageBuffer { writable: true },
         stages: Stages::COMPUTE,
     },
 ];
