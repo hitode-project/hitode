@@ -99,7 +99,7 @@ python3 -m unittest discover -s tools/<folder>
 - The workspace suite builds the launcher, so it needs the FFmpeg variables too.
 - The default suite must pass on every supported host, so any failure in it is real. A test that needs particular hardware, a GPU backend or an architecture states it with `required-features`, a `cfg` or `#[ignore = "reason"]`. A test that fails intermittently gets its cause fixed, not a retry.
 
-Every pull request runs the workspace on Apple Silicon (`macos-14`), with
+Every pull request runs the workspace on Apple Silicon (`macos-15`), with
 independent formatting and strict Clippy gates. Three parallel test groups cover
 core/system crates, graphics/runtime crates, and the launcher/JIT helper/storage
 plugin. New workspace members join the core/system group unless assigned to

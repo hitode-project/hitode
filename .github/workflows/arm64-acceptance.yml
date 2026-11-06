@@ -90,7 +90,7 @@ jobs:
 
   macos-arm64:
     # Release execution on Apple Silicon also covers native 16 KiB pages.
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 15
     env:
       CARGO_BUILD_JOBS: '3'
