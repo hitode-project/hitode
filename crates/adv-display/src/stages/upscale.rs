@@ -79,11 +79,19 @@ pub fn reach(choice: Upscaler) -> u32 {
 }
 
 impl Model {
-    /// Whether nonzero integer translations preserve this kernel's output bits.
-    /// Vulkan normalized linear samples fail the translation checks for the
-    /// first three models; their references keep the canvas size and position.
-    pub fn translations(&self) -> bool {
-        cfg!(target_vendor = "apple") || self.passes[0].shader.starts_with("k7_")
+    /// The most source cells apart along an axis that one output cell's field
+    /// meets: compare checks offsets this near the change and the votes.
+    pub fn neighbourhood(&self) -> u32 {
+        let unit = self.passes.last().unwrap().unit() as i32;
+        let reach = self.reach() as i32;
+        (0..8)
+            .map(|j| {
+                let first = (unit * j - reach).div_euclid(8);
+                let last = (unit * j + unit - 1 + reach).div_euclid(8);
+                (last - first) as u32
+            })
+            .max()
+            .unwrap()
     }
 
     /// Input-pixel radius bounding a change in the output. Reach follows the data:
@@ -173,6 +181,15 @@ const ARENA: u32 = 2048;
 const DELTA_WORDS: u32 = 128;
 /// Words of the frame header before its data (upscale_common.wgsl).
 const FRAME_WORDS: usize = 8;
+/// Words per source cell of the facts compare records.
+const FACT_WORDS: u64 = 3;
+/// Anchor windows' side; a change reaches anchors this far up and left, less one.
+const WINDOW: u32 = 4;
+/// Offset vote slots, and the words of one frame parity's hypotheses.
+const VOTES: u64 = 64;
+const HYPOTHESIS_WORDS: u64 = 10;
+/// The compare list's flag on cells the producer may have changed.
+const COMPARE_FLAG: u32 = 1 << 31;
 
 /// One model at one canvas size. Only the selected model is resident.
 pub struct Upscaling {
@@ -186,11 +203,19 @@ pub struct Upscaling {
     /// Producer damage of the last encode, which the older input lacks;
     /// `None` until both inputs hold a frame.
     stale: RefCell<Option<Region>>,
-    /// Per source cell, the epoch of the last compare that found it changed.
-    stamps: Buffer,
+    /// Per source cell, what compare found (upscale_common.wgsl).
+    facts: Buffer,
+    /// Per source cell anchors, pending anchors and the anchor index.
+    anchors: Buffer,
     epoch: Cell<u32>,
+    anchor: ComputePipeline,
+    hypotheses: ComputePipeline,
     compare: ComputePipeline,
     bookkeeping: ComputePipeline,
+    gather: ComputePipeline,
+    scatter: ComputePipeline,
+    /// Copied output cells between gather and scatter.
+    scratch: Image,
     /// Indirect sets, delta and validity.
     state: Buffer,
     metadata: Buffer,
@@ -216,6 +241,9 @@ struct Layout {
     records: u64,
     delta: u64,
     chunk: u32,
+    /// The copy list in the compacted buffer, and its first indirect record.
+    copies: u64,
+    copy_arguments: u64,
 }
 
 /// One pass's pipeline, in half precision where `half` and the pass has that
@@ -481,18 +509,32 @@ impl Upscaling {
         if arena > ARENA {
             return Err(unsupported("bookkeeping memory"));
         }
-        // Records first, then one counter per pass.
+        // The copy list: at most every last-pass cell.
+        let copies = entries;
+        let copy_arguments = records * 4;
+        let last_cells = {
+            let grid = grids.last().unwrap();
+            grid.columns * grid.rows
+        };
+        entries += u64::from(last_cells);
+        records += u64::from(last_cells.div_ceil(chunk));
+        // Records first, then one counter per pass and the copies'.
         let record_words = records * 4;
         for (i, row) in metadata.iter_mut().enumerate() {
             row[10] = (record_words + i as u64) as u32;
         }
-        let set_words = record_words + passes.len() as u64;
+        let copy_counter = record_words + passes.len() as u64;
+        let set_words = copy_counter + 1;
         let delta_words = u64::from(columns.div_ceil(32) * rows);
         let arguments = [0, set_words];
         // The damage overlay binds delta as storage.
         let delta = (2 * set_words).next_multiple_of(u64::from(align));
         let valid_start = delta + delta_words;
-        let state_words = valid_start + 2 * u64::from(valid);
+        let hypotheses = valid_start + 2 * u64::from(valid);
+        let votes = hypotheses + 2 * HYPOTHESIS_WORDS;
+        let state_words = votes + 2 * VOTES;
+        let cells = u64::from(columns * rows);
+        let index_slots = cells.next_power_of_two();
         let shape = [
             size.0,
             size.1,
@@ -508,6 +550,14 @@ impl Upscaling {
             set_words as u32,
             record_words as u32,
             chunk,
+            model.reach(),
+            hypotheses as u32,
+            votes as u32,
+            copies as u32,
+            copy_arguments as u32,
+            copy_counter as u32,
+            (index_slots - 1) as u32,
+            model.neighbourhood(),
         ];
         let metadata = upload(
             &words(shape.into_iter().chain(metadata.into_iter().flatten())),
@@ -525,6 +575,32 @@ impl Upscaling {
             )
         };
         Ok(Self {
+            anchor: stage(
+                stage_shader!(device, "upscale_anchor")?,
+                "main",
+                &super::bindings::UPSCALE_ANCHOR,
+            )?,
+            gather: stage(
+                stage_shader!(device, "upscale_copy")?,
+                "gather",
+                &super::bindings::UPSCALE_COPY,
+            )?,
+            scatter: stage(
+                stage_shader!(device, "upscale_copy")?,
+                "scatter",
+                &super::bindings::UPSCALE_COPY,
+            )?,
+            scratch: image(
+                (size.0 * 2, size.1 * 2),
+                OUTPUT,
+                Usage::STORAGE | Usage::SAMPLED,
+                "upscale copies",
+            )?,
+            hypotheses: stage(
+                stage_shader!(device, "upscale_delta")?,
+                "hypotheses",
+                &super::bindings::UPSCALE_DELTA,
+            )?,
             compare: stage(
                 stage_shader!(device, "upscale_delta")?,
                 "compare",
@@ -541,10 +617,16 @@ impl Upscaling {
             output,
             newest: Cell::new(0),
             stale: RefCell::new(None),
-            stamps: buffer(
-                u64::from(columns * rows) * 4,
+            facts: buffer(
+                cells * FACT_WORDS * 4,
+                // COPY_SRC: tests read it back.
+                BufferUsage::STORAGE | BufferUsage::COPY_DST | BufferUsage::COPY_SRC,
+                "upscale compare facts",
+            )?,
+            anchors: buffer(
+                (6 * cells + 2 * index_slots) * 4,
                 BufferUsage::STORAGE | BufferUsage::COPY_DST,
-                "upscale change stamps",
+                "upscale anchors",
             )?,
             epoch: Cell::new(0),
             state: buffer(
@@ -568,6 +650,8 @@ impl Upscaling {
                 records: record_words,
                 delta,
                 chunk,
+                copies,
+                copy_arguments,
             },
             tensors,
             pipelines,
@@ -667,24 +751,41 @@ impl Upscaling {
             .filter(|&(x, y)| tiles[(y * tile_columns + x) as usize])
             .map(|(x, y)| x | y << 16)
             .collect();
-        let compared: Vec<u32> = if exact {
-            vec![]
+        // Compare the producer's cells for change unless the damage is exact,
+        // and every cell sharing an output field with them, for the offset
+        // hypotheses. A whole-canvas change walks every cell instead of
+        // listing them; a first frame has nothing to compare against.
+        let whole = region.rects() == Region::whole(self.size).rects();
+        let compares = initialized;
+        let (mut compared, mut anchored) = (vec![], vec![]);
+        if !whole {
+            let mut seen = vec![0u64; (columns * rows).div_ceil(64) as usize];
+            if compares {
+                compared = self.cells(&rects, 0, 0, &mut seen);
+                if !exact {
+                    compared.iter_mut().for_each(|cell| *cell |= COMPARE_FLAG);
+                }
+                let ring = 8 * self.model.neighbourhood();
+                compared.extend(self.cells(&rects, ring, ring, &mut seen));
+            }
+            seen.fill(0);
+            anchored = self.cells(&rects, WINDOW - 1, 0, &mut seen);
+        }
+        let all = (columns * rows) as usize;
+        let compare_count = if whole && compares {
+            all
         } else {
-            rects
-                .iter()
-                .flat_map(|r| {
-                    (r.y / 8..(r.y + r.h).div_ceil(8)).flat_map(move |y| {
-                        (r.x / 8..(r.x + r.w).div_ceil(8)).map(move |x| x | y << 16)
-                    })
-                })
-                .collect()
+            compared.len()
         };
+        let anchor_count = if whole { all } else { anchored.len() };
+        let listed = |at: usize, every: bool| if every { u32::MAX } else { at as u32 };
         let stride = columns.div_ceil(32);
         let bitmap_words = if exact { stride * rows } else { 0 };
         let list = 0;
         let tile_at = list + compared.len();
         let bitmap = tile_at + tile_list.len();
-        let data_words = bitmap + bitmap_words as usize;
+        let anchor_at = bitmap + bitmap_words as usize;
+        let data_words = anchor_at + anchored.len();
         let align = u64::from(self.align) * 4;
         let mut span = ring.reserve(((FRAME_WORDS + data_words) * 4) as u64, align)?;
         let epoch = self.epoch.get() + 1;
@@ -696,10 +797,15 @@ impl Upscaling {
             };
             put(0, epoch);
             put(1, u32::from(exact));
-            put(2, compared.len() as u32);
-            put(3, list as u32);
+            put(2, compare_count as u32);
+            put(3, listed(list, whole));
             put(4, tile_at as u32);
             put(5, bitmap as u32);
+            put(6, anchor_count as u32);
+            put(7, listed(anchor_at, whole));
+            for (i, &cell) in anchored.iter().enumerate() {
+                put(FRAME_WORDS + anchor_at + i, cell);
+            }
             for (i, &cell) in compared.iter().enumerate() {
                 put(FRAME_WORDS + list + i, cell);
             }
@@ -724,7 +830,8 @@ impl Upscaling {
         if !initialized {
             // The only clears: both argument sets start as (0, 1, 1, 0) records.
             encoder.fill_buffer(self.state.slice(0..self.state.desc().size), 0);
-            encoder.fill_buffer(self.stamps.slice(0..self.stamps.desc().size), 0);
+            encoder.fill_buffer(self.facts.slice(0..self.facts.desc().size), 0);
+            encoder.fill_buffer(self.anchors.slice(0..self.anchors.desc().size), 0);
             let mut init = ring.reserve(self.layout.set_words * 8, align)?;
             let bytes = init.bytes();
             bytes.fill(0);
@@ -745,41 +852,76 @@ impl Upscaling {
         }
         let (newest, written) = (self.newest.get(), 1 - self.newest.get());
         let state = || Bind::StorageBuffer(self.state.slice(0..self.state.desc().size));
-        let stamps = || Bind::StorageBuffer(self.stamps.slice(0..self.stamps.desc().size));
+        let facts = || Bind::StorageBuffer(self.facts.slice(0..self.facts.desc().size));
+        let anchors = || Bind::StorageBuffer(self.anchors.slice(0..self.anchors.desc().size));
+        let frame = || Bind::StorageBuffer(span.buffer().slice(frame_at..frame_at + frame_len));
         let metadata = || Bind::StorageBuffer(self.metadata.slice(0..self.metadata.desc().size));
         let mut compute = encoder.compute_pass(&ComputePassDesc {
             timestamps,
             label: "upscale",
         });
-        if !compared.is_empty() {
-            compute.set_pipeline(&self.compare);
+        if anchor_count != 0 {
+            compute.set_pipeline(&self.anchor);
             compute.bind(0, Bind::Sampled(self.inputs[written].view()));
-            compute.bind(1, Bind::Sampled(self.inputs[newest].view()));
-            compute.bind(
-                0,
-                Bind::StorageBuffer(span.buffer().slice(frame_at..frame_at + frame_len)),
-            );
-            compute.bind(1, stamps());
-            compute.bind(2, metadata());
-            let n = compared.len() as u32;
+            compute.bind(0, frame());
+            compute.bind(1, anchors());
+            compute.bind(2, state());
+            compute.bind(3, metadata());
+            let n = anchor_count as u32;
             compute.dispatch(n.min(DISPATCH), n.div_ceil(DISPATCH), 1);
         }
+        if compare_count != 0 {
+            // The hypotheses once, then compare under them.
+            for (pipeline, n) in [(&self.hypotheses, 1), (&self.compare, compare_count as u32)] {
+                compute.set_pipeline(pipeline);
+                compute.bind(0, Bind::Sampled(self.inputs[written].view()));
+                compute.bind(1, Bind::Sampled(self.inputs[newest].view()));
+                compute.bind(0, frame());
+                compute.bind(1, facts());
+                compute.bind(2, state());
+                compute.bind(3, metadata());
+                compute.bind(4, anchors());
+                compute.dispatch(n.min(DISPATCH), n.div_ceil(DISPATCH), 1);
+            }
+        }
         compute.set_pipeline(&self.bookkeeping);
-        compute.bind(
-            0,
-            Bind::StorageBuffer(span.buffer().slice(frame_at..frame_at + frame_len)),
-        );
-        compute.bind(1, stamps());
+        compute.bind(0, frame());
+        compute.bind(1, facts());
         compute.bind(2, state());
         compute.bind(3, metadata());
         compute.bind(
             4,
             Bind::StorageBuffer(self.compacted.slice(0..self.compacted.desc().size)),
         );
+        compute.bind(5, anchors());
         let n = tile_list.len() as u32;
         compute.dispatch(n.min(DISPATCH), n.div_ceil(DISPATCH), 1);
         let set = self.layout.arguments[(epoch % 2) as usize];
         let chunk = u64::from(self.layout.chunk);
+        // Copies read the previous output before any pass writes it.
+        let last = self.grids.last().unwrap();
+        let copies = u64::from(last.columns * last.rows);
+        for (pipeline, read, write) in [
+            (&self.gather, &self.output, &self.scratch),
+            (&self.scatter, &self.scratch, &self.output),
+        ] {
+            compute.set_pipeline(pipeline);
+            compute.bind(0, Bind::Sampled(read.view()));
+            compute.bind(1, frame());
+            compute.bind(2, state());
+            compute.bind(3, metadata());
+            compute.bind(4, Bind::StorageImage(write.view()));
+            for (slice, first) in (0..copies).step_by(chunk as usize).enumerate() {
+                let n = chunk.min(copies - first);
+                let start = (self.layout.copies + first) * 4;
+                compute.bind(
+                    0,
+                    Bind::StorageBuffer(self.compacted.slice(start..start + n * 4)),
+                );
+                let at = (set + self.layout.copy_arguments + slice as u64 * 4) * 4;
+                compute.dispatch_indirect(self.state.slice(at..at + 12));
+            }
+        }
         for (pass, (pipeline, grid)) in self
             .model
             .passes
@@ -796,6 +938,9 @@ impl Upscaling {
                     Role::Store(t) => Bind::StorageImage(self.tensors[t].view()),
                     Role::Output => Bind::StorageImage(self.output.view()),
                     Role::Nearest => Bind::Sampler(&self.nearest),
+                    // At scale 1 linear samples land on texel centers, where
+                    // nearest returns the same texel and rounds robustly.
+                    Role::Linear if pass.scale == 1 => Bind::Sampler(&self.nearest),
                     Role::Linear => Bind::Sampler(&self.linear),
                 };
                 compute.bind(slot, resource);
@@ -818,6 +963,31 @@ impl Upscaling {
         self.newest.set(written);
         *self.stale.borrow_mut() = Some(region);
         Ok(self.reached(&rects))
+    }
+
+    /// The source cells meeting `rects` grown by `before` pixels up and left
+    /// and `after` down and right, packed, skipping and marking those `seen`.
+    fn cells(&self, rects: &[Rect], before: u32, after: u32, seen: &mut [u64]) -> Vec<u32> {
+        let columns = self.size.0.div_ceil(8);
+        let mut found = Vec::new();
+        for r in rects {
+            let (x0, y0) = (
+                r.x.saturating_sub(before) / 8,
+                r.y.saturating_sub(before) / 8,
+            );
+            let x1 = (r.x + r.w + after).min(self.size.0).div_ceil(8);
+            let y1 = (r.y + r.h + after).min(self.size.1).div_ceil(8);
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let i = (y * columns + x) as usize;
+                    if seen[i / 64] & 1 << (i % 64) == 0 {
+                        seen[i / 64] |= 1 << (i % 64);
+                        found.push(x | y << 16);
+                    }
+                }
+            }
+        }
+        found
     }
 
     /// Input pixels a change within `damage` reaches in the output, in cells.

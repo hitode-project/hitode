@@ -399,6 +399,44 @@ fn unchanged_composition_launches_no_model_workgroups() {
     );
 }
 
+fn upscaling_last(upscaling: &Upscaling) -> usize {
+    upscaling.model.passes.len() - 1
+}
+
+/// Output bytes where the first run differs from the second, its whole-frame
+/// reference.
+fn mismatches(device: &Device, queue: &mut Queue, runs: &[Upscaling; 2]) -> usize {
+    let size = runs[0].output().desc().size;
+    let bytes = u64::from(size.width * size.height * 4);
+    let readback = device
+        .create_buffer(&BufferDesc {
+            size: bytes * 2,
+            usage: BufferUsage::COPY_DST,
+            memory: Memory::Readback,
+            label: "upscale output comparison",
+        })
+        .unwrap();
+    let mut encoder = queue.encoder("upscale output comparison");
+    for (i, run) in runs.iter().enumerate() {
+        encoder.copy_image_to_buffer(
+            whole_image(run.output()),
+            BufferCopy {
+                buffer: &readback,
+                offset: i as u64 * bytes,
+                row_pitch: 0,
+                rows: 0,
+            },
+            size,
+        );
+    }
+    let token = queue.submit(encoder).unwrap();
+    assert!(queue.wait(token, Duration::from_secs(60)).unwrap());
+    // SAFETY: both image copies completed.
+    let both = unsafe { readback.mapped().unwrap().as_ref() };
+    let (actual, expected) = both[..bytes as usize * 2].split_at(bytes as usize);
+    actual.iter().zip(expected).filter(|(a, b)| a != b).count()
+}
+
 // spec: HOST-VIEW-10, HOST-VIEW-13
 #[test]
 fn invalid_tensor_neighbours_recompute_after_rebuilt_outputs() {
@@ -463,39 +501,194 @@ fn invalid_tensor_neighbours_recompute_after_rebuilt_outputs() {
                     };
                     frame(&mut queue, &mut ring, &runs[0], &buffer, damage, input);
                     frame(&mut queue, &mut ring, &runs[1], &buffer, None, Input::Exact);
-                    let outputs = [runs[0].output(), runs[1].output()];
-                    let bytes = u64::from(size.0 * size.1 * 16);
-                    let readback = device
-                        .create_buffer(&BufferDesc {
-                            size: bytes * 2,
-                            usage: BufferUsage::COPY_DST,
-                            memory: Memory::Readback,
-                            label: "rebuilt output readback",
-                        })
-                        .unwrap();
-                    let mut encoder = queue.encoder("rebuilt output comparison");
-                    for (i, image) in outputs.iter().enumerate() {
-                        encoder.copy_image_to_buffer(
-                            whole_image(image),
-                            BufferCopy {
-                                buffer: &readback,
-                                offset: i as u64 * bytes,
-                                row_pitch: 0,
-                                rows: 0,
-                            },
-                            image.desc().size,
+                    let mismatches = mismatches(&device, &mut queue, &runs);
+                    // A pan copies the old output one pixel over: only cells
+                    // whose field meets the fresh column or an x border compute.
+                    if pan {
+                        let last = upscaling_last(&runs[0]);
+                        let unit = model.passes.last().unwrap().unit();
+                        let reach = model.reach();
+                        let selected = selected(&device, &mut queue, &runs[0]);
+                        let border = |cell: &u32| {
+                            let x = (cell & 65535) * unit;
+                            x < 8 + reach || (x + unit).min(size.0) + reach > size.0
+                        };
+                        assert!(
+                            selected[last].iter().all(border),
+                            "form={form} model={m} half={half} frame={index} computes {:?}",
+                            selected[last]
+                                .iter()
+                                .filter(|c| !border(c))
+                                .collect::<Vec<_>>()
                         );
                     }
-                    let token = queue.submit(encoder).unwrap();
-                    assert!(queue.wait(token, Duration::from_secs(60)).unwrap());
-                    // SAFETY: both image copies completed.
-                    let actual = unsafe { readback.mapped().unwrap().as_ref() };
-                    let (actual, expected) = actual.split_at(bytes as usize);
-                    let mismatches = actual.iter().zip(expected).filter(|(a, b)| a != b).count();
                     assert_eq!(
                         mismatches, 0,
                         "form={form} model={m} half={half} frame={index}"
                     );
+                }
+            }
+        }
+    }
+}
+
+/// A repeatable texture level in 1/256 steps over the whole plane.
+fn texture(seed: u32, x: i32, y: i32) -> u32 {
+    let mut h = seed ^ (x as u32).wrapping_mul(0x9e37_79b1) ^ (y as u32).wrapping_mul(0x85eb_ca77);
+    h ^= h >> 15;
+    h = h.wrapping_mul(0x2c1b_3c6d);
+    h ^= h >> 12;
+    h % 257
+}
+
+// spec: HOST-VIEW-13
+#[test]
+fn offsets_are_verified_only_near_their_votes() {
+    let (device, mut queue) = open();
+    let size = (257u32, 193u32);
+    let mut ring = device.ring(1 << 21).unwrap();
+    let model = models::FUSED[0];
+    let runs = [
+        Upscaling::with_precision(&device, model, size, false).unwrap(),
+        Upscaling::with_precision(&device, model, size, false).unwrap(),
+    ];
+    // New content everywhere but a sprite that moved: only the sprite votes.
+    let sprites = [(40, 30), (45, 26)];
+    for (index, sprite) in sprites.into_iter().enumerate() {
+        let mut pixels = Vec::with_capacity((size.0 * size.1 * 8) as usize);
+        for y in 0..size.1 as i32 {
+            for x in 0..size.0 as i32 {
+                let inside = (sprite.0..sprite.0 + 48).contains(&x)
+                    && (sprite.1..sprite.1 + 40).contains(&y);
+                let (seed, u, v) = if inside {
+                    (7, x - sprite.0, y - sprite.1)
+                } else {
+                    (11 + 4 * index as u32, x, y)
+                };
+                for channel in 0..4 {
+                    pixels.extend(half_bits(texture(seed + channel, u, v)));
+                }
+            }
+        }
+        let buffer = upload(&device, &pixels, BufferUsage::COPY_SRC);
+        frame(
+            &mut queue,
+            &mut ring,
+            &runs[0],
+            &buffer,
+            None,
+            Input::Composed,
+        );
+        frame(&mut queue, &mut ring, &runs[1], &buffer, None, Input::Exact);
+        assert_eq!(mismatches(&device, &mut queue, &runs), 0, "frame {index}");
+    }
+    let facts = read(&device, &mut queue, &runs[0].facts);
+    let epoch = runs[0].epoch.get();
+    let r = model.neighbourhood() as i32;
+    let columns = size.0.div_ceil(8) as i32;
+    let (x0, y0) = (45 / 8 - r, 26 / 8 - r);
+    let (x1, y1) = ((45 + 47) / 8 + r, (26 + 39) / 8 + r);
+    let mut verified = 0;
+    for (at, fact) in facts.chunks(FACT_WORDS as usize).enumerate() {
+        if fact[1] != epoch {
+            continue;
+        }
+        let (x, y) = (at as i32 % columns, at as i32 / columns);
+        assert!(
+            (x0..=x1).contains(&x) && (y0..=y1).contains(&y),
+            "cell ({x}, {y}) verified far from the votes"
+        );
+        verified += 1;
+    }
+    assert!(verified > 0, "the sprite's offset was never verified");
+    let last = upscaling_last(&runs[0]);
+    let grid = &runs[0].grids[last];
+    let computed = selected(&device, &mut queue, &runs[0])[last].len();
+    assert!(
+        computed < (grid.columns * grid.rows) as usize,
+        "the moved sprite copied nothing"
+    );
+}
+
+// spec: HOST-VIEW-13
+#[test]
+fn offset_hypotheses_copy_moving_layers_exactly() {
+    let (device, mut queue) = open();
+    let size = (257u32, 193u32);
+    let mut ring = device.ring(1 << 21).unwrap();
+    let matrix = Features::MATRIX_F16_8X8 | Features::SHADER_F16 | Features::SUBGROUP;
+    // Background offset and sprite position per frame: a pan with a sprite
+    // moving across it, a new direction, a repeat of the sprite elsewhere,
+    // and a jump back to an older position.
+    type Frame = ((i32, i32), (i32, i32), bool);
+    let frames: [Frame; 7] = [
+        ((0, 0), (40, 30), false),
+        ((2, 0), (45, 26), false),
+        ((4, 0), (50, 22), false),
+        ((6, 0), (55, 18), false),
+        ((6, 3), (55, 18), false),
+        ((6, 6), (55, 18), true),
+        ((0, 0), (40, 30), false),
+    ];
+    for half in [false, true] {
+        if half && !device.caps().features.contains(Features::SHADER_F16) {
+            continue;
+        }
+        for (form, table) in [models::REFERENCE, models::FUSED, models::MATRIX]
+            .into_iter()
+            .enumerate()
+        {
+            if form == 2 && (!half || !device.caps().features.contains(matrix)) {
+                continue;
+            }
+            for (m, model) in table.into_iter().enumerate() {
+                let runs = [
+                    Upscaling::with_precision(&device, model, size, half).unwrap(),
+                    Upscaling::with_precision(&device, model, size, half).unwrap(),
+                ];
+                for (index, &(background, sprite, twin)) in frames.iter().enumerate() {
+                    let inside = |x: i32, y: i32, at: (i32, i32)| {
+                        (at.0..at.0 + 48).contains(&x) && (at.1..at.1 + 40).contains(&y)
+                    };
+                    let mut pixels = Vec::with_capacity((size.0 * size.1 * 8) as usize);
+                    for y in 0..size.1 as i32 {
+                        for x in 0..size.0 as i32 {
+                            let twin_at = (sprite.0 + 120, sprite.1 + 90);
+                            let (seed, u, v) = if inside(x, y, sprite) {
+                                (7, x - sprite.0, y - sprite.1)
+                            } else if twin && inside(x, y, twin_at) {
+                                (7, x - twin_at.0, y - twin_at.1)
+                            } else {
+                                (11, x - background.0, y - background.1)
+                            };
+                            for channel in 0..4 {
+                                pixels.extend(half_bits(texture(seed + channel, u, v)));
+                            }
+                        }
+                    }
+                    let buffer = upload(&device, &pixels, BufferUsage::COPY_SRC);
+                    frame(
+                        &mut queue,
+                        &mut ring,
+                        &runs[0],
+                        &buffer,
+                        None,
+                        Input::Composed,
+                    );
+                    frame(&mut queue, &mut ring, &runs[1], &buffer, None, Input::Exact);
+                    let label = format!("form={form} model={m} half={half} frame={index}");
+                    assert_eq!(mismatches(&device, &mut queue, &runs), 0, "{label}");
+                    // A steady pan reuses most of the output.
+                    if index == 3 {
+                        let grid = &runs[0].grids[upscaling_last(&runs[0])];
+                        let computed =
+                            selected(&device, &mut queue, &runs[0])[upscaling_last(&runs[0])].len();
+                        let cells = (grid.columns * grid.rows) as usize;
+                        assert!(
+                            computed * 2 < cells,
+                            "{label}: {computed} of {cells} computed"
+                        );
+                    }
                 }
             }
         }

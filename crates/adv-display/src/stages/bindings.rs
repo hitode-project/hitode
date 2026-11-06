@@ -1,4 +1,5 @@
 //! Binding descriptions shared by stage pipelines and host-shader compilation.
+use adv_gpu::Format;
 use adv_gpu::pipeline::{Binding, BindingKind, Stages};
 use adv_gpu::resource::Dimension;
 
@@ -72,68 +73,69 @@ pub const OUTPUT: [Binding; 3] = [
     },
 ];
 
-/// Compare: both inputs, the frame, the change stamps and the pass graph.
-pub const UPSCALE_DELTA: [Binding; 5] = [
+const fn sampled(slot: u32) -> Binding {
     Binding {
-        slot: 0,
+        slot,
         kind: BindingKind::SampledImage {
             dimension: Dimension::D2,
             depth: false,
             multisampled: false,
         },
         stages: Stages::COMPUTE,
-    },
-    Binding {
-        slot: 1,
-        kind: BindingKind::SampledImage {
-            dimension: Dimension::D2,
-            depth: false,
-            multisampled: false,
-        },
-        stages: Stages::COMPUTE,
-    },
-    Binding {
-        slot: 0,
-        kind: BindingKind::StorageBuffer { writable: false },
-        stages: Stages::COMPUTE,
-    },
-    Binding {
-        slot: 1,
-        kind: BindingKind::StorageBuffer { writable: true },
-        stages: Stages::COMPUTE,
-    },
-    Binding {
-        slot: 2,
-        kind: BindingKind::StorageBuffer { writable: false },
-        stages: Stages::COMPUTE,
-    },
-];
+    }
+}
 
-/// Bookkeeping: the frame, the change stamps, state, the pass graph and the lists.
-pub const UPSCALE_FILTER: [Binding; 5] = [
+const fn storage(slot: u32, writable: bool) -> Binding {
     Binding {
-        slot: 0,
-        kind: BindingKind::StorageBuffer { writable: false },
+        slot,
+        kind: BindingKind::StorageBuffer { writable },
         stages: Stages::COMPUTE,
-    },
-    Binding {
-        slot: 1,
-        kind: BindingKind::StorageBuffer { writable: false },
-        stages: Stages::COMPUTE,
-    },
-    Binding {
-        slot: 2,
-        kind: BindingKind::StorageBuffer { writable: true },
-        stages: Stages::COMPUTE,
-    },
-    Binding {
-        slot: 3,
-        kind: BindingKind::StorageBuffer { writable: false },
-        stages: Stages::COMPUTE,
-    },
+    }
+}
+
+/// Anchors: the input, the frame, anchors, state and the pass graph.
+pub const UPSCALE_ANCHOR: [Binding; 5] = [
+    sampled(0),
+    storage(0, false),
+    storage(1, true),
+    storage(2, true),
+    storage(3, false),
+];
+/// Compare: both inputs, the frame, the facts, state, the pass graph and the
+/// anchors.
+pub const UPSCALE_DELTA: [Binding; 7] = [
+    sampled(0),
+    sampled(1),
+    storage(0, false),
+    storage(1, true),
+    storage(2, true),
+    storage(3, false),
+    storage(4, false),
+];
+/// Bookkeeping: the frame, the facts, state, the pass graph, the lists and
+/// anchors.
+pub const UPSCALE_FILTER: [Binding; 6] = [
+    storage(0, false),
+    storage(1, false),
+    storage(2, true),
+    storage(3, false),
+    storage(4, true),
+    storage(5, true),
+];
+/// Copies: the image read, the entries, the frame, state, the pass graph and
+/// the image written.
+pub const UPSCALE_COPY: [Binding; 6] = [
+    sampled(0),
+    storage(0, false),
+    storage(1, false),
+    storage(2, false),
+    storage(3, false),
     Binding {
         slot: 4,
-        kind: BindingKind::StorageBuffer { writable: true },
+        kind: BindingKind::StorageImage {
+            format: Format::Rgba8Unorm,
+            writable: true,
+        },
         stages: Stages::COMPUTE,
     },
 ];

@@ -27,8 +27,18 @@ fn main() {
         ),
         (
             "upscale_filter",
-            common + &read("upscale_filter"),
+            common.clone() + &read("upscale_filter"),
             bindings::UPSCALE_FILTER.to_vec(),
+        ),
+        (
+            "upscale_anchor",
+            common.clone() + &read("upscale_anchor"),
+            bindings::UPSCALE_ANCHOR.to_vec(),
+        ),
+        (
+            "upscale_copy",
+            common + &read("upscale_copy"),
+            bindings::UPSCALE_COPY.to_vec(),
         ),
         (
             "output",
@@ -101,7 +111,14 @@ fn upscale(out: &std::path::Path) {
             }
             let path = format!("src/stages/upscale/{}", pass.shader);
             println!("cargo:rerun-if-changed={path}");
-            let source = fs::read_to_string(&path).unwrap();
+            // Passes at scale 1 sample texel centers and bind nearest there.
+            let linear: Vec<u32> = pass
+                .bindings
+                .iter()
+                .filter(|(_, role)| *role == table::Role::Linear && pass.scale != 1)
+                .map(|&(slot, _)| slot)
+                .collect();
+            let source = snapped(&fs::read_to_string(&path).unwrap(), &linear);
             let mut forms = vec![];
             for (half, wgsl) in [(true, source.clone()), (false, widen(&source))] {
                 if half && !source.contains("enable f16;") {
@@ -153,6 +170,99 @@ fn entries(compiled: &adv_gpu::shader::Precompiled) -> String {
 
 /// Single-precision form of a half-precision pass for devices without shader
 /// f16. Weights keep their f16-rounded values.
+/// Rewrites the samples through the samplers at `slots`, bound linear, as
+/// loads weighed by phases snapped to 1/256. Normalized coordinates round
+/// differently across a canvas and Vulkan quantizes their weights, so hardware
+/// filtering could weigh one phase two ways; snapped, equal phases weigh alike
+/// at every position and integer translations keep output bits (HOST-VIEW-13).
+fn snapped(source: &str, slots: &[u32]) -> String {
+    let names: Vec<&str> = source
+        .lines()
+        .filter(|line| line.contains(": sampler;"))
+        .filter(|line| {
+            slots
+                .iter()
+                .any(|slot| line.contains(&format!("@binding({slot})")))
+        })
+        .map(|line| {
+            line.split("var ")
+                .nth(1)
+                .unwrap()
+                .split(':')
+                .next()
+                .unwrap()
+                .trim()
+        })
+        .collect();
+    if names.is_empty() {
+        return source.to_owned();
+    }
+    let call = "textureSampleLevel(";
+    let mut out = String::with_capacity(source.len());
+    // One helper per texture: SPIR-V from naga cannot pass textures.
+    let mut textures: Vec<String> = vec![];
+    let mut rest = source;
+    while let Some(at) = rest.find(call) {
+        out.push_str(&rest[..at]);
+        // The call's four arguments, split at top-level commas.
+        let body = &rest[at + call.len()..];
+        let (mut depth, mut start, mut args, mut end) = (0, 0, vec![], 0);
+        for (i, c) in body.char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' if depth == 0 => {
+                    args.push(body[start..i].trim());
+                    end = i + 1;
+                    break;
+                }
+                ')' => depth -= 1,
+                ',' if depth == 0 => {
+                    args.push(body[start..i].trim());
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        let bare = |arg: &str| {
+            arg.trim_start_matches('(')
+                .trim_end_matches(')')
+                .trim()
+                .to_owned()
+        };
+        if args.len() == 4 && names.contains(&bare(args[1]).as_str()) {
+            let texture = bare(args[0]);
+            out.push_str(&format!("snapped_{texture}({})", args[2]));
+            if !textures.contains(&texture) {
+                textures.push(texture);
+            }
+        } else {
+            out.push_str(&rest[at..at + call.len() + end]);
+        }
+        rest = &body[end..];
+    }
+    out.push_str(rest);
+    for texture in textures {
+        out += &SNAPPED_LINEAR.replace("TEXTURE", &texture);
+    }
+    out
+}
+
+const SNAPPED_LINEAR: &str = "
+fn snapped_TEXTURE(uv: vec2<f32>) -> vec4<f32> {
+    let size = textureDimensions(TEXTURE, 0);
+    let p = round((uv * vec2<f32>(size) - 0.5) * 256.0) / 256.0;
+    let base = floor(p);
+    let f = p - base;
+    let last = vec2<i32>(size) - 1;
+    let a = clamp(vec2<i32>(base), vec2(0), last);
+    if all(f == vec2(0.0)) { return textureLoad(TEXTURE, a, 0); }
+    let b = clamp(vec2<i32>(base) + 1, vec2(0), last);
+    let top = mix(textureLoad(TEXTURE, a, 0), textureLoad(TEXTURE, vec2(b.x, a.y), 0), f.x);
+    let bottom = mix(textureLoad(TEXTURE, vec2(a.x, b.y), 0), textureLoad(TEXTURE, b, 0), f.x);
+    return mix(top, bottom, f.y);
+}
+";
+
 fn widen(source: &str) -> String {
     let source = source.replacen("enable f16;", "", 1);
     let mut out = String::with_capacity(source.len());

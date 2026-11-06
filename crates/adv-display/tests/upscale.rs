@@ -685,7 +685,7 @@ fn integer_translations_preserve_interior_bits_in_every_kernel_form() {
                             different += usize::from(a != b);
                         }
                     }
-                    if different != 0 && model.translations() {
+                    if different != 0 {
                         failures.push(format!("model={m} form={form} half={half} offset=({dx},{dy}) pixels={different}"));
                     }
                 }
