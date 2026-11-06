@@ -107,6 +107,9 @@ pub enum Bind<'a> {
     Sampled(&'a ImageView),
     Sampler(&'a Sampler),
     StorageImage(&'a ImageView),
+    /// A slice at a nonzero offset binds an array, or a struct whose first
+    /// member is the array, at a multiple of its stride: the Vulkan heap tier
+    /// applies the offset to that array's index.
     StorageBuffer(BufferSlice<'a>),
 }
 

@@ -32,8 +32,13 @@ fn main() {
         ),
         (
             "upscale_filter",
-            reference + &read("upscale_filter"),
+            reference.clone() + &read("upscale_filter"),
             bindings::UPSCALE_FILTER.to_vec(),
+        ),
+        (
+            "upscale_refresh",
+            reference + &read("upscale_refresh"),
+            bindings::UPSCALE_REFRESH.to_vec(),
         ),
         (
             "output",

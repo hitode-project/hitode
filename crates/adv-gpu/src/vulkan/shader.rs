@@ -14,7 +14,9 @@ struct ShaderCore {
     /// points of one stage, so lowered IR never shares a module.
     modules: Vec<vk::ShaderModule>,
     entries: Vec<(CString, Stage)>,
-    storage_strides: Vec<HashMap<u32, u32>>,
+    /// By entry point and storage slot: the outer array's stride, and whether
+    /// struct members precede it.
+    storage_strides: Vec<HashMap<u32, (u32, bool)>>,
     storage_atomics: bool,
     pipeline: Option<PipelineShader>,
 }
@@ -119,7 +121,7 @@ impl Shader {
             temporary,
         })
     }
-    pub(super) fn storage_strides(&self, index: u32) -> &HashMap<u32, u32> {
+    pub(super) fn storage_strides(&self, index: u32) -> &HashMap<u32, (u32, bool)> {
         &self.0.storage_strides[index as usize]
     }
     pub(super) fn storage_atomics(&self) -> bool {
@@ -211,32 +213,41 @@ fn lower(
 struct StorageShape {
     stride: u32,
     path: Option<Vec<u32>>,
+    /// Members precede the outer array, so a binding offset cannot apply.
+    header: bool,
 }
 fn storage_shape(
     module: &naga::Module,
     ty: Handle<Type>,
     layouter: &naga::proc::Layouter,
 ) -> StorageShape {
-    fn array(module: &naga::Module, ty: Handle<Type>, path: Vec<u32>) -> Option<(u32, Vec<u32>)> {
+    fn array(
+        module: &naga::Module,
+        ty: Handle<Type>,
+        path: Vec<u32>,
+        at: u32,
+    ) -> Option<(u32, Vec<u32>, u32)> {
         match &module.types[ty].inner {
-            TypeInner::Array { stride, .. } => Some((*stride, path)),
+            TypeInner::Array { stride, .. } => Some((*stride, path, at)),
             TypeInner::Struct { members, .. } => members.iter().enumerate().find_map(|(i, m)| {
                 let mut path = path.clone();
                 path.push(i as u32);
-                array(module, m.ty, path)
+                array(module, m.ty, path, at + m.offset)
             }),
             _ => None,
         }
     }
-    if let Some((stride, path)) = array(module, ty, Vec::new()) {
+    if let Some((stride, path, at)) = array(module, ty, Vec::new(), 0) {
         StorageShape {
             stride,
             path: Some(path),
+            header: at != 0,
         }
     } else {
         StorageShape {
             stride: layouter[ty].alignment.round_up(layouter[ty].size),
             path: None,
+            header: false,
         }
     }
 }
@@ -344,10 +355,10 @@ impl Device {
                     video.push(handle);
                 }
                 if matches!(global.space, naga::AddressSpace::Storage { .. }) {
-                    let stride = storage_shape(&module, global.ty, &layouter).stride;
+                    let shape = storage_shape(&module, global.ty, &layouter);
                     for (index, strides) in storage_strides.iter_mut().enumerate() {
                         if !info.get_entry_point(index)[handle].is_empty() {
-                            strides.insert(binding.binding, stride);
+                            strides.insert(binding.binding, (shape.stride, shape.header));
                         }
                     }
                 }

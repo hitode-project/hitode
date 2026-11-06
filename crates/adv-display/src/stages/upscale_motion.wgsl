@@ -2,23 +2,21 @@ struct Dimensions {
     size: vec2<u32>, argument_words: u32, argument_stride: u32,
     reach: u32, translations: u32, output_unit: u32, padding: u32,
 }
-struct Header { epoch: u32, count: u32, offset: vec2<i32>, sharp: u32 }
 @group(0) @binding(0) var<uniform> dimensions: Dimensions;
 @group(1) @binding(0) var composed: texture_2d<f32>;
 @group(1) @binding(1) var previous: texture_2d<f32>;
 @group(3) @binding(0) var<storage, read_write> data: array<u32>;
-@group(3) @binding(1) var<storage, read_write> header: Header;
+// The state words of the motion header (upscale_reference.wgsl).
+@group(3) @binding(1) var<storage, read_write> header: array<u32>;
+@group(3) @binding(2) var<storage, read> epoch: u32;
 var<workgroup> sums: array<vec4<f32>, 64>;
 var<workgroup> products: array<f32, 64>;
 
-fn bitmap_words() -> u32 {
-    return ((dimensions.size.x + 7u) / 8u + 31u) / 32u * ((dimensions.size.y + 7u) / 8u);
-}
 fn profile(axis: u32, old: bool, line: u32) -> u32 {
-    return bitmap_words() + select(0u, dimensions.size.x, axis == 1u) * 2u + line * 2u + u32(old);
+    return select(0u, dimensions.size.x, axis == 1u) * 2u + line * 2u + u32(old);
 }
 fn score(axis: u32, index: u32) -> u32 {
-    return bitmap_words() + (dimensions.size.x + dimensions.size.y) * 2u + select(0u, dimensions.size.x * 2u, axis == 1u) + index;
+    return (dimensions.size.x + dimensions.size.y) * 2u + select(0u, dimensions.size.x * 2u, axis == 1u) + index;
 }
 
 @compute @workgroup_size(64)
@@ -32,12 +30,7 @@ fn project(@builtin(workgroup_id) group: vec3<u32>, @builtin(local_invocation_in
         var pixel = vec2(group.x, i);
         if axis == 1u { pixel = pixel.yx; }
         let old = textureLoad(previous, vec2<i32>(pixel), 0).xyz;
-        let cell = pixel / 8u;
-        let stride = ((dimensions.size.x + 7u) / 8u + 31u) / 32u;
-        var next = old;
-        if (data[cell.y * stride + cell.x / 32u] & (1u << (cell.x % 32u))) != 0u {
-            next = textureLoad(composed, vec2<i32>(pixel), 0).xyz;
-        }
+        let next = textureLoad(composed, vec2<i32>(pixel), 0).xyz;
         values += vec2(dot(next, vec3(0.299, 0.587, 0.114)), dot(old, vec3(0.299, 0.587, 0.114)));
     }
     sums[lane] = vec4(values, 0.0, 0.0);
@@ -110,6 +103,16 @@ fn choose() {
         }
         sharp = sharp && best > 0.95 && best - second > 0.05;
     }
-    header.offset = offset;
-    header.sharp = u32(sharp);
+    header[0] = u32(offset.x);
+    header[1] = u32(offset.y);
+    header[2] = u32(sharp);
+    header[3] = epoch;
+    // Failed projections back off: the next 1, 3, 7, 15 openings are skipped.
+    if sharp {
+        header[4] = 0u;
+        header[5] = 0u;
+    } else {
+        header[4] = min(header[4] + 1u, 4u);
+        header[5] = (1u << header[4]) - 1u;
+    }
 }

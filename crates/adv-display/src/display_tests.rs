@@ -1100,20 +1100,8 @@ fn exact_software_upscaling_uses_producer_cells() {
     };
     let model = upscale::model(&d, Upscaler::Anime4k, false);
     let upscaling = upscale::Upscaling::with_precision(&d, model, (64, 48), false).unwrap();
-    let last = model.passes.last().unwrap();
-    let unit = last.block / last.scale;
-    let count = |damage: &[Rect]| {
-        upscaling
-            .cells(damage)
-            .last()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .len() as u64
-            * u64::from(unit).pow(2)
-    };
-    let expected = count(&[changed]);
-    assert!(expected < count(&tiles.rects));
+    let expected = upscaling.reached(&[changed]);
+    assert!(expected < upscaling.reached(&tiles.rects));
     assert_eq!(latest.statistics.stages[0].pixels, expected);
     let partial = display.upscaled_copy(&mut q);
     let partial = read(&d, &mut q, &partial);

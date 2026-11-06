@@ -47,10 +47,9 @@ fn half(k: u32) -> [u8; 2] {
     bits.to_le_bytes()
 }
 
-/// One upscaler with its own doubled output.
+/// One upscaler; its doubled output is that of its last encode.
 struct Scaler {
     upscaling: Upscaling,
-    output: Image,
 }
 
 impl Gpu {
@@ -76,26 +75,8 @@ impl Gpu {
         unsafe { check.agrees() }
     }
     fn scaler(&self, model: Model, size: (u32, u32), half: bool) -> Scaler {
-        let output = self
-            .device
-            .create_image(&ImageDesc {
-                dimension: Dimension::D2,
-                size: Extent {
-                    width: size.0 * 2,
-                    height: size.1 * 2,
-                    depth_or_layers: 1,
-                },
-                format: Format::Rgba8Unorm,
-                mips: 1,
-                samples: 1,
-                usage: Usage::STORAGE | Usage::SAMPLED | Usage::COPY_SRC,
-                view_formats: &[],
-                label: "upscale output",
-            })
-            .unwrap();
         Scaler {
             upscaling: Upscaling::with_precision(&self.device, model, size, half).unwrap(),
-            output,
         }
     }
 
@@ -127,16 +108,17 @@ impl Gpu {
         let upload = self.buffer(bytes.len() as u64, BufferUsage::COPY_SRC, Memory::Upload);
         let mapped = unsafe { upload.mapped().unwrap().as_mut() };
         mapped[..bytes.len()].copy_from_slice(&bytes);
-        let input = scaler.upscaling.input(exact);
+        let input = scaler.upscaling.input();
         let mut encoder = self.queue.encoder("upscale test");
         let size = input.desc().size;
-        let whole = [Rect {
+        let whole = vec![Rect {
             x: 0,
             y: 0,
             w: size.width,
             h: size.height,
         }];
-        for r in damage.unwrap_or(&whole) {
+        // The input lags a frame behind: composition covers both changes.
+        for r in scaler.upscaling.composition(damage).unwrap_or(whole) {
             encoder.copy_buffer_to_image(
                 BufferCopy {
                     buffer: &upload,
@@ -161,7 +143,6 @@ impl Gpu {
             .upscaling
             .encode(
                 (&mut encoder, &mut self.ring),
-                scaler.output.view(),
                 damage,
                 if exact { Input::Exact } else { Input::Composed },
                 records,
@@ -244,7 +225,7 @@ fn optimized_layers_match_reference_display_pixels_and_clamped_edges() {
                     .iter()
                     .map(|scaler| {
                         gpu.run(scaler, &pixels, None, true, &[]);
-                        gpu.read(&scaler.output).concat()
+                        gpu.read(scaler.upscaling.output()).concat()
                     })
                     .collect();
                 for (maximum, result) in maximum.iter_mut().zip(&results[1..]) {
@@ -315,7 +296,7 @@ fn partial_runs_match_full_runs_within_the_model_radius() {
         let reach = selected.reach();
         let mut frame = pixels.clone();
         for (step, damage) in damages.iter().enumerate() {
-            let before = gpu.read(&full.output);
+            let before = gpu.read(full.upscaling.output());
             for r in damage {
                 for y in r.y..r.y + r.h {
                     for x in r.x..r.x + r.w {
@@ -329,9 +310,9 @@ fn partial_runs_match_full_runs_within_the_model_radius() {
                 computed < u64::from(size.0 * size.1) / 2,
                 "{choice:?} partial run {step} computed {computed} pixels"
             );
-            let after = gpu.read(&full.output);
+            let after = gpu.read(full.upscaling.output());
             assert!(
-                gpu.read(&partial.output) == after,
+                gpu.read(partial.upscaling.output()) == after,
                 "{choice:?} partial run {step} differs"
             );
             // How far, in input pixels, the change reached in the output.
@@ -361,7 +342,6 @@ fn partial_runs_match_full_runs_within_the_model_radius() {
             .upscaling
             .encode(
                 (&mut encoder, &mut gpu.ring),
-                partial.output.view(),
                 Some(&[]),
                 Input::Exact,
                 &[],
@@ -403,7 +383,7 @@ fn variants_agree_in_each_precision_and_repeat_exactly() {
                 let runs: Vec<_> = (0..2)
                     .map(|_| {
                         gpu.run(&scaler, &pixels, None, true, &[]);
-                        gpu.read(&scaler.output).concat()
+                        gpu.read(scaler.upscaling.output()).concat()
                     })
                     .collect();
                 let base = reference.get_or_insert_with(|| runs[0].clone());
@@ -560,9 +540,9 @@ fn conservative_damage_matches_whole_frames_in_all_forms_and_buffer_ages() {
                     let rects: Vec<Rect> = damage.rects().into_iter().map(Into::into).collect();
                     gpu.run(&partial, &pixels, Some(&rects), exact, &[]);
                     gpu.run(&full, &pixels, None, true, &[]);
-                    let expected = gpu.read(&full.output);
+                    let expected = gpu.read(full.upscaling.output());
                     assert_eq!(
-                        gpu.read(&partial.output),
+                        gpu.read(partial.upscaling.output()),
                         expected,
                         "{choice:?} {form} half={half} frame={step}"
                     );
@@ -614,7 +594,7 @@ fn conservative_damage_matches_whole_frames_in_all_forms_and_buffer_ages() {
                             });
                             let spans = output::encode(
                                 &mut pass,
-                                output::Source::Image(partial.output.view()),
+                                output::Source::Image(partial.upscaling.output().view()),
                                 target.desc().size,
                                 *transform,
                                 *scale,
@@ -682,7 +662,7 @@ fn integer_translations_preserve_interior_bits_in_every_kernel_form() {
                 let original = gpu.scaler(model, size, half);
                 let shifted = gpu.scaler(model, size, half);
                 gpu.run(&original, &pixels, None, true, &[]);
-                let expected = gpu.read(&original.output);
+                let expected = gpu.read(original.upscaling.output());
                 for (dx, dy) in [
                     (1u32, 0u32),
                     (0, 1),
@@ -702,7 +682,7 @@ fn integer_translations_preserve_interior_bits_in_every_kernel_form() {
                         })
                         .collect();
                     gpu.run(&shifted, &translated, None, true, &[]);
-                    let actual = gpu.read(&shifted.output);
+                    let actual = gpu.read(shifted.upscaling.output());
                     let reach = model.reach();
                     let mut different = 0;
                     for y in (reach + dy) * 2..(size.1 - reach) * 2 {
@@ -785,8 +765,8 @@ fn previous_output_proposals_preserve_pans_borders_and_wrong_candidates() {
                 gpu.run(&partial, &pixels, None, false, &records);
                 gpu.run(&full, &pixels, None, true, &[]);
                 assert_eq!(
-                    gpu.read(&partial.output),
-                    gpu.read(&full.output),
+                    gpu.read(partial.upscaling.output()),
+                    gpu.read(full.upscaling.output()),
                     "{choice:?} half={half} frame={frame}"
                 );
             }
@@ -838,8 +818,8 @@ fn constant_inputs_have_one_exact_two_by_two_output_pattern() {
                     false,
                     &[],
                 );
-                let expected = gpu.read(&scaler.output);
-                let cached_output = gpu.read(&cached.output);
+                let expected = gpu.read(scaler.upscaling.output());
+                let cached_output = gpu.read(cached.upscaling.output());
                 let mismatches = expected
                     .iter()
                     .flatten()
@@ -850,7 +830,7 @@ fn constant_inputs_have_one_exact_two_by_two_output_pattern() {
                     mismatches, 0,
                     "constant reconstruction {choice:?} half={half} colour={colour:?}"
                 );
-                let output = gpu.read(&scaler.output);
+                let output = gpu.read(scaler.upscaling.output());
                 let mut mismatches = 0;
                 for y in 0..size.1 * 2 {
                     for x in 0..size.0 * 2 {

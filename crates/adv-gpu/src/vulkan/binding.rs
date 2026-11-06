@@ -51,6 +51,9 @@ pub(super) struct Field {
     pub(super) mask: u32,
     pub(super) offset: Option<u32>,
     pub(super) stride: u32,
+    /// Struct members precede the outer array: they read from the buffer
+    /// start, so the binding offset must be zero.
+    pub(super) header: bool,
 }
 /// Heap indices share words when they fit in 16 bits. Each storage offset
 /// has its own full word; register numbers do not consume gaps.
@@ -62,12 +65,12 @@ pub(super) struct PushLayout {
 }
 impl PushLayout {
     /// `bindings` sorted by `(group, slot)`; `strides` are the storage array
-    /// strides the shaders declare, by slot.
+    /// strides the shaders declare, by slot, with their header flags.
     pub(super) fn new(
         bindings: &[Binding],
         heap: &Heap,
         bytes: u32,
-        strides: &HashMap<u32, u32>,
+        strides: &HashMap<u32, (u32, bool)>,
     ) -> Result<Self> {
         let mut layout = Self::default();
         let mut half = None;
@@ -98,13 +101,15 @@ impl PushLayout {
             if fields.len() <= slot {
                 fields.resize(slot + 1, None);
             }
+            // A slot no shader reads has no stride; its offset is unused.
+            let (stride, header) = strides.get(&binding.slot).copied().unwrap_or((1, false));
             fields[slot] = Some(Field {
                 word,
                 shift,
                 mask: if packed { 65535 } else { u32::MAX },
                 offset: None,
-                // A slot no shader reads has no stride; its offset is unused.
-                stride: strides.get(&binding.slot).copied().unwrap_or(1),
+                stride,
+                header,
             });
         }
         for binding in bindings {
@@ -449,6 +454,11 @@ impl Bindings {
             debug_assert!(
                 bound.offset.is_multiple_of(stride),
                 "storage offset {} is not a multiple of the array stride {stride}",
+                bound.offset
+            );
+            debug_assert!(
+                bound.offset == 0 || !field.header,
+                "storage offset {} on a struct whose members precede its array",
                 bound.offset
             );
             self.set_word(word as usize, (bound.offset / stride) as u32);
