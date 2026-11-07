@@ -168,6 +168,7 @@ pub(crate) struct Debugger {
     snapshot_baseline: HashMap<(u32, u32), [u64; 3]>,
     boundary_baseline: HashMap<(u32, usize), adv_runtime::NativeBodyCount>,
     boundary_snapshot_baseline: HashMap<(u32, usize), adv_runtime::NativeBodyCount>,
+    d3d9_baseline: HashMap<u32, adv_runtime::D3d9Counters>,
     /// The longest busy gap waiting for its snapshot, and when it ended.
     stall: Option<(u64, u64)>,
     stall_snapshots: usize,
@@ -221,6 +222,7 @@ impl Debugger {
             },
             boundary_baseline: HashMap::new(),
             boundary_snapshot_baseline: HashMap::new(),
+            d3d9_baseline: HashMap::new(),
             slow_baseline: HashMap::new(),
             snapshot_baseline: HashMap::new(),
             stall: None,
@@ -361,6 +363,11 @@ impl Debugger {
             }
             "slow" => Ok(self.slow(runtime, args.first() == Some(&"reset"))),
             "boundary" => Ok(self.boundary(runtime, args.first() == Some(&"reset"))),
+            "d3d9" => Ok(self.d3d9(
+                runtime,
+                args.first() == Some(&"reset"),
+                args.first() == Some(&"frame"),
+            )),
             "report" => Ok(runtime.report()),
             "snap" => {
                 let label = args.first().copied().unwrap_or("manual");
@@ -445,6 +452,62 @@ impl Debugger {
             return "native boundary counts reset".into();
         }
         boundary_text(boundary, pid, &self.boundary_baseline)
+    }
+
+    /// D3D9 presents since the last `d3d9 reset`: why whole surfaces changed,
+    /// how many executed clipped, and the flushes that ended frames early.
+    fn d3d9(
+        &mut self,
+        runtime: &impl DebugTarget<Backend = Cpu>,
+        reset: bool,
+        frame: bool,
+    ) -> String {
+        let machine = runtime.machine();
+        let pid = machine.sys.pid;
+        let Some(now) = adv_runtime::d3d9_counters(&machine.ext) else {
+            return "no D3D9 device".into();
+        };
+        if reset {
+            self.d3d9_baseline.insert(pid, now);
+            return "D3D9 counts reset".into();
+        }
+        if frame {
+            return adv_runtime::d3d9_frame().unwrap_or_else(|| {
+                "capturing the next whole frame; run `d3d9 frame` again".into()
+            });
+        }
+        let base = self.d3d9_baseline.get(&pid).copied().unwrap_or_default();
+        let since = |now: &[u64], base: &[u64]| -> Vec<u64> {
+            now.iter().zip(base).map(|(n, b)| n - b).collect()
+        };
+        let whole = since(&now.whole, &base.whole);
+        let flushes = since(&now.flushes, &base.flushes);
+        let clipped = now.clipped_executions - base.clipped_executions;
+        let full = now.full_executions - base.full_executions;
+        let area = (now.clipped_area_sum - base.clipped_area_sum) / (clipped + full).max(1) as f64;
+        let presents = flushes[0].max(1);
+        format!(
+            "executions: clipped {clipped}, full {full}, mean area {area:.3}; repeated frames {}\n\
+             per present: submissions {:.1}, pixels {:.0}; chains run whole {}\n\
+             whole changes: content flush {}, presentation {}, copy {}, analysis {}\n\
+             flushes: present {}, readback {}, lock {}, dc {}, reset {}, release {}, limit {}, wait {}",
+            now.eliminated_frames - base.eliminated_frames,
+            (now.submissions - base.submissions) as f64 / presents as f64,
+            (now.submitted_pixels - base.submitted_pixels) as f64 / presents as f64,
+            now.promotions - base.promotions,
+            whole[0],
+            whole[1],
+            whole[2],
+            whole[3],
+            flushes[0],
+            flushes[1],
+            flushes[2],
+            flushes[3],
+            flushes[4],
+            flushes[5],
+            flushes[6],
+            flushes[7],
+        )
     }
 
     /// Writes and keeps a snapshot; returns its name.
@@ -1224,8 +1287,8 @@ const HELP: &str = "\
 answered at once: damage on|off, ping, help, info, timeline [SECONDS], retirement [SECONDS], marks, mark [LABEL],
   samples [SECONDS], profile [off|HZ], snaps, pull [NAME]
 at a guest boundary: threads, stack CONTEXT [FRAMES], calls [COUNT], gaps,
-  modules, mem ADDRESS [LENGTH], dis ADDRESS [COUNT], slow [reset], boundary [reset], report,
-  snap [LABEL]
+  modules, mem ADDRESS [LENGTH], dis ADDRESS [COUNT], slow [reset], boundary [reset], d3d9 [reset|frame],
+  report, snap [LABEL]
 client reports: tl, prof, speed [SECONDS] [--range A:B | --marks A:B | --frame N], analyze, watch";
 
 #[cfg(unix)]

@@ -268,6 +268,11 @@ pub struct Diagnostics {
     pub frames: FrameCounters,
 }
 pub use recording::Counters as FrameCounters;
+pub use recording::trace::take_or_arm as frame_trace;
+/// The frame counters, once a D3D9 device has existed.
+pub fn frame_counters(ext: &Ext) -> Option<FrameCounters> {
+    ext.try_get::<State>().map(|state| state.frames)
+}
 pub fn diagnostics(ext: &Ext, objects: &Objects) -> Diagnostics {
     let state = ext.get::<State>();
     Diagnostics {

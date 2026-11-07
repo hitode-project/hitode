@@ -83,6 +83,16 @@ impl Region {
         }
     }
 
+    /// Keeps only the cells `other` marks too. A region of another size
+    /// cannot narrow this one.
+    pub fn intersect(&mut self, other: &Self) {
+        if other.size == self.size {
+            for (a, b) in self.bits.iter_mut().zip(&other.bits) {
+                *a &= b;
+            }
+        }
+    }
+
     /// Whether any cell `rect` touches is marked.
     pub fn intersects(&self, rect: Rect) -> bool {
         let Some((x0, x1, y0, y1)) = self.span(rect) else {

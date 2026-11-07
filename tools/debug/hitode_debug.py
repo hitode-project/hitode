@@ -19,6 +19,9 @@ runner as they are; these are shaped here:
                             and hottest guest units by execution form
   damage on|off            show or hide GPU damage tints
   boundary [reset]          native body host work and tail calls
+  d3d9 [reset|frame]        D3D9 presents: clipped vs full executions, why
+                            whole surfaces changed, flushes by reason; `frame`
+                            captures the next frame's commands (run it twice)
   snap [LABEL], pull [NAME] save a snapshot under target/investigations/debug
   analyze [--gap MS]        snapshot now and explain each stall in it
   watch [--gap MS]          pull, save and analyze every new snapshot until

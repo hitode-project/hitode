@@ -1,5 +1,8 @@
 use super::*;
 fn quad(f: &mut Fixture, x: f32, color: [f32; 4]) -> fixed::Draw {
+    quad_deep(f, x, 0., color)
+}
+fn quad_deep(f: &mut Fixture, x: f32, z: f32, color: [f32; 4]) -> fixed::Draw {
     let mut d = draw(f);
     d.vertices = [
         (x, 3.),
@@ -10,7 +13,7 @@ fn quad(f: &mut Fixture, x: f32, color: [f32; 4]) -> fixed::Draw {
         (x + 2., 5.),
     ]
     .map(|(x, y)| Vertex {
-        position: [x / 8. - 1., 1. - y / 6., 0., 1.],
+        position: [x / 8. - 1., 1. - y / 6., z, 1.],
         color,
         uv: [0.; 2],
     })
@@ -794,6 +797,102 @@ fn shader_bounds_use_float_inputs_and_fall_back_for_nonfloat_or_unavailable_exec
     assert_eq!(bounds(&mut f, d), full);
 }
 // spec: GFX-REC-4 GFX-REC-5
+// spec: GFX-REC-4 GFX-REC-5
+#[test]
+fn readbacks_keep_damage_and_clip_slots_they_did_not_write() {
+    for back_first in [false, true] {
+        let mut f = fixture();
+        let source = f.render_target(16, 12, 21);
+        // Readback destinations match the source format.
+        let system = f.surface(16, 12, if back_first { 22 } else { 21 }, 2);
+        let mut colors = [[1., 0., 0., 1.], [0., 1., 0., 1.], [0., 0., 1., 1.]];
+        for _ in 0..2 {
+            if back_first {
+                scene(&mut f, colors);
+                f.okay(
+                    "IDirect3DDevice9::GetRenderTargetData",
+                    &[f.device, f.back, system],
+                );
+            } else {
+                f.okay("IDirect3DDevice9::SetRenderTarget", &[f.device, 0, source]);
+                clear(&mut f, 0xff00ff00);
+                f.okay(
+                    "IDirect3DDevice9::GetRenderTargetData",
+                    &[f.device, source, system],
+                );
+                f.okay("IDirect3DDevice9::SetRenderTarget", &[f.device, 0, f.back]);
+                scene(&mut f, colors);
+            }
+            present(&mut f);
+            colors[0] = [1., 1., 0., 1.];
+        }
+        assert_eq!(latest(&mut f), reference(&mut f, colors));
+        let counts = f.m.ext.get::<State>().frames;
+        // A source cleared alike each frame is read where it already is.
+        assert_eq!(
+            counts.flushes[Reason::Readback as usize],
+            if back_first { 2 } else { 1 }
+        );
+        // Only the first present changes the whole surface.
+        assert_eq!(counts.whole, [0, 1, 0, 0]);
+        // A back buffer the readback flushed runs whole that frame.
+        assert_eq!(counts.clipped_executions, u64::from(!back_first));
+    }
+}
+
+// spec: GFX-REC-4 GFX-REC-5
+#[test]
+fn depth_shared_by_two_slots_clips_color_and_keeps_depth_exact() {
+    let mut outputs = Vec::new();
+    for verify in [false, true] {
+        let mut f = fixture();
+        bind_depth(&mut f, 16, 12);
+        f.m.ext.get_mut::<State>().verify_frames = verify;
+        let source = f.render_target(16, 12, 21);
+        let mut frames = Vec::new();
+        for n in 0..5 {
+            let tested = n == 4;
+            // The back buffer clears depth first and the offscreen target
+            // last, so a skipped offscreen clear would leave the wrong depth.
+            let flags = if tested { 1 } else { 3 };
+            f.okay(
+                "IDirect3DDevice9::Clear",
+                &[f.device, 0, 0, flags, 0xff000000, 0.75f32.to_bits(), 0],
+            );
+            for index in 0..3 {
+                let green = if index == 0 { n as f32 / 8. } else { 0. };
+                let z = if tested { 0.25 } else { 0. };
+                let mut d = quad_deep(&mut f, 2. + index as f32 * 4., z, [1., green, 0., 1.]);
+                if tested {
+                    let device = f.device;
+                    d.target = depth::attach(&env(&mut f), device, d.target).unwrap();
+                    d.state.depth = Some(Compare::Equal);
+                }
+                record_draw(&mut f, d);
+            }
+            if !tested {
+                f.okay("IDirect3DDevice9::SetRenderTarget", &[f.device, 0, source]);
+                f.okay(
+                    "IDirect3DDevice9::Clear",
+                    &[f.device, 0, 0, 3, 0xff00ff00, 0.25f32.to_bits(), 0],
+                );
+                f.okay("IDirect3DDevice9::SetRenderTarget", &[f.device, 0, f.back]);
+            }
+            present(&mut f);
+            frames.push(latest(&mut f));
+        }
+        let counts = f.m.ext.get::<State>().frames;
+        assert_eq!(counts.verification_mismatches, 0);
+        if !verify {
+            // Only the first present changes the whole surface.
+            assert_eq!(counts.whole, [0, 1, 0, 0]);
+            assert_eq!(counts.clipped_executions, 4);
+        }
+        outputs.push(frames);
+    }
+    assert_eq!(outputs[0], outputs[1]);
+}
+
 #[test]
 fn sampled_target_changes_damage_the_consuming_draw_and_copy_clips_keep_offsets() {
     let mut f = fixture();
@@ -976,6 +1075,450 @@ fn programmable_clipped_replay_matches_full_shader_execution() {
         assert_eq!(latest(&mut f), expected);
     }
     assert_eq!(f.m.ext.get::<State>().frames.clipped_executions, 1);
+}
+/// A 64x48 back buffer, larger than the cells so one cell's change stays
+/// local, and a composite drawing a texture through a half-texel offset
+/// with linear filtering.
+struct Composite {
+    vs: u32,
+    ps: u32,
+    half: u32,
+    /// The whole target, and its left half reading the texture's left half.
+    full: u32,
+    left: u32,
+}
+fn composite_fixture(verify: bool) -> (Fixture, Composite) {
+    let mut f = fixture();
+    f.m.ext.get_mut::<State>().verify_frames = verify;
+    let parameters = f.packet(D3DPRESENT_PARAMETERS {
+        BackBufferWidth: 64,
+        BackBufferHeight: 48,
+        BackBufferFormat: 22,
+        BackBufferCount: 1,
+        SwapEffect: 1,
+        hDeviceWindow: 0x7788,
+        Windowed: 1,
+        ..D3DPRESENT_PARAMETERS::default()
+    });
+    f.okay("IDirect3DDevice9::Reset", &[f.device, parameters]);
+    let pointer = f.device;
+    let e = env(&mut f);
+    let back = device(&e, pointer).unwrap().back_buffer.unwrap();
+    let Some(Payload::Resource(r)) = com(&e).get_identity(&e.sys.objects, back) else {
+        unreachable!()
+    };
+    f.back = r.pointer;
+    f.m.ext
+        .get_mut::<State>()
+        .tables
+        .insert("IDirect3DTexture9", 0);
+    let output = f.packet([0u32; 2]);
+    // mov oPos, v0; mov oT0, v1
+    let vs = f.packet([
+        0xfffe0200u32,
+        0x0200001f,
+        0x80000000,
+        0x900f0000,
+        0x0200001f,
+        0x80000005,
+        0x900f0001,
+        0x02000001,
+        0xc00f0000,
+        0x90e40000,
+        0x02000001,
+        0xe00f0000,
+        0x90e40001,
+        0xffff,
+    ]);
+    f.okay(
+        "IDirect3DDevice9::CreateVertexShader",
+        &[f.device, vs, output],
+    );
+    let vs = f.m.cpu.read_u32(output).unwrap();
+    // add r0.xy, t0, c0; texld r0, r0, s0; mov oC0, r0
+    let ps = f.packet([
+        0xffff0200u32,
+        0x0200001f,
+        0x80000000,
+        0xb0030000,
+        0x0200001f,
+        0x90000000,
+        0xa00f0800,
+        0x03000002,
+        0x80030000,
+        0xb0e40000,
+        0xa0e40000,
+        0x03000042,
+        0x800f0000,
+        0x80e40000,
+        0xa0e40800,
+        0x02000001,
+        0x800f0800,
+        0x80e40000,
+        0xffff,
+    ]);
+    f.okay(
+        "IDirect3DDevice9::CreatePixelShader",
+        &[f.device, ps, output],
+    );
+    let ps = f.m.cpu.read_u32(output).unwrap();
+    let half = f.packet([0.5f32 / 64., 0.5 / 48., 0., 0.]);
+    let full = f.packet([
+        [-1f32, 1., 0., 0., 0.],
+        [1., 1., 0., 1., 0.],
+        [-1., -1., 0., 0., 1.],
+        [1., -1., 0., 1., 1.],
+    ]);
+    let left = f.packet([
+        [-1f32, 1., 0., 0., 0.],
+        [0., 1., 0., 0.5, 0.],
+        [-1., -1., 0., 0., 1.],
+        [0., -1., 0., 0.5, 1.],
+    ]);
+    (
+        f,
+        Composite {
+            vs,
+            ps,
+            half,
+            full,
+            left,
+        },
+    )
+}
+/// A 64x48 render-target texture and its surface.
+fn layer(f: &mut Fixture) -> (u32, u32) {
+    let output = f.packet([0u32; 2]);
+    f.okay(
+        "IDirect3DDevice9::CreateTexture",
+        &[f.device, 64, 48, 1, 1, 21, 0, output, 0],
+    );
+    let texture = f.m.cpu.read_u32(output).unwrap();
+    f.okay("IDirect3DTexture9::GetSurfaceLevel", &[texture, 0, output]);
+    (texture, f.m.cpu.read_u32(output).unwrap())
+}
+/// Clears `target` black and draws one fixed-function quad on it.
+fn paint(f: &mut Fixture, target: u32, x: f32, color: [f32; 4]) {
+    f.okay("IDirect3DDevice9::SetRenderTarget", &[f.device, 0, target]);
+    clear(f, 0xff000000);
+    let mut d = quad_deep(f, x, 0., color);
+    d.target = f.target(target);
+    record_draw(f, d);
+}
+/// Draws `texture` through `quad` into `target`, after clearing it black
+/// when `clear` is set.
+fn composite(f: &mut Fixture, c: &Composite, texture: u32, target: u32, quad: u32, wipe: bool) {
+    f.okay("IDirect3DDevice9::SetRenderTarget", &[f.device, 0, target]);
+    if wipe {
+        clear(f, 0xff000000);
+    }
+    for (name, args) in [
+        ("SetVertexShader", vec![f.device, c.vs]),
+        ("SetPixelShader", vec![f.device, c.ps]),
+        ("SetPixelShaderConstantF", vec![f.device, 0, c.half, 1]),
+        ("SetTexture", vec![f.device, 0, texture]),
+        ("SetSamplerState", vec![f.device, 0, 1, 3]),
+        ("SetSamplerState", vec![f.device, 0, 2, 3]),
+        ("SetSamplerState", vec![f.device, 0, 5, 2]),
+        ("SetSamplerState", vec![f.device, 0, 6, 2]),
+        ("SetFVF", vec![f.device, 0x102]),
+        ("SetRenderState", vec![f.device, 22, 1]),
+        ("BeginScene", vec![f.device]),
+        ("DrawPrimitiveUP", vec![f.device, 5, 2, quad, 20]),
+        ("EndScene", vec![f.device]),
+        ("SetTexture", vec![f.device, 0, 0]),
+        ("SetVertexShader", vec![f.device, 0]),
+        ("SetPixelShader", vec![f.device, 0]),
+    ] {
+        f.okay(&format!("IDirect3DDevice9::{name}"), &args);
+    }
+}
+/// Runs `frame` for `count` presents with and without verification, after
+/// `setup`, checks that clipped execution leaves the pixels a full replay
+/// does, and returns the clipped run's counters after the first present and
+/// at the end.
+fn against_full_replay<T>(
+    count: usize,
+    setup: impl Fn(&mut Fixture) -> T,
+    frame: impl Fn(&mut Fixture, &Composite, &T, usize),
+) -> (Counters, Counters) {
+    let mut outputs = Vec::new();
+    let mut counters = Vec::new();
+    for verify in [false, true] {
+        let (mut f, c) = composite_fixture(verify);
+        let resources = setup(&mut f);
+        let mut frames = Vec::new();
+        let mut first = None;
+        for n in 0..count {
+            frame(&mut f, &c, &resources, n);
+            present(&mut f);
+            frames.push(latest(&mut f));
+            first.get_or_insert(f.m.ext.get::<State>().frames);
+        }
+        assert_eq!(f.m.ext.get::<State>().frames.verification_mismatches, 0);
+        counters.push((first.unwrap(), f.m.ext.get::<State>().frames));
+        outputs.push(frames);
+    }
+    for (n, (clipped, full)) in outputs[0].iter().zip(&outputs[1]).enumerate() {
+        assert!(clipped == full, "frame {n} differs from a full replay");
+    }
+    counters[0]
+}
+/// Pixels submitted per present after the first, as a fraction of the
+/// first, whole, present.
+fn steady_share(first: &Counters, end: &Counters, presents: usize) -> f64 {
+    (end.submitted_pixels - first.submitted_pixels) as f64
+        / (presents - 1) as f64
+        / first.submitted_pixels as f64
+}
+// spec: GFX-REC-4 GFX-REC-5
+#[test]
+fn half_texel_composite_keeps_local_damage_and_full_replay_pixels() {
+    let (first, end) = against_full_replay(4, layer, |f, c, &(t, l), n| {
+        paint(f, l, 1., [1., n as f32 / 8., 0., 1.]);
+        composite(f, c, t, f.back, c.full, true);
+    });
+    // The layer and the composite redraw only the moving quad's cells.
+    assert_eq!(end.clipped_executions, 3, "{end:?}");
+    assert!(steady_share(&first, &end, 4) < 0.25, "{end:?}");
+}
+/// A fixed-function quad on `target` testing the bound depth buffer.
+fn tested(f: &mut Fixture, target: u32, x: f32, z: f32, write: bool, color: [f32; 4]) {
+    let mut d = quad_deep(f, x, z, color);
+    d.target = f.target(target);
+    let device = f.device;
+    d.target = depth::attach(&env(f), device, d.target).unwrap();
+    d.state.depth = Some(Compare::Less);
+    d.state.depth_write = write;
+    record_draw(f, d);
+}
+// spec: GFX-REC-4 GFX-REC-5
+#[test]
+fn layer_generations_serve_their_own_reads() {
+    // The layer is drawn twice a frame, each time from a clear; the first
+    // generation fills the target and the second, changing one, its left
+    // half. Executing the first only where its read needs it, then the
+    // second over it, keeps both reads exact.
+    let (first, end) = against_full_replay(4, layer, |f, c, &(t, l), n| {
+        paint(f, l, 6., [0., 0., 1., 1.]);
+        composite(f, c, t, f.back, c.full, true);
+        paint(f, l, 1., [1., n as f32 / 8., 0., 1.]);
+        composite(f, c, t, f.back, c.left, false);
+    });
+    assert_eq!(end.promotions, 0);
+    assert!(steady_share(&first, &end, 4) < 0.25, "{end:?}");
+}
+// spec: GFX-REC-4 GFX-REC-5
+#[test]
+fn ping_pong_filters_follow_their_reads_and_in_place_reuse_runs_whole() {
+    // A to B and back once: every version read is either transient or a
+    // final one the slot holds, so execution stays local.
+    let (first, end) = against_full_replay(
+        4,
+        |f| (layer(f), layer(f)),
+        |f, c, &((a, sa), (b, sb)), n| {
+            paint(f, sa, 1., [1., n as f32 / 8., 0., 1.]);
+            composite(f, c, a, sb, c.full, true);
+            composite(f, c, b, sa, c.full, true);
+            composite(f, c, a, f.back, c.full, true);
+        },
+    );
+    assert_eq!(end.promotions, 0);
+    assert!(steady_share(&first, &end, 4) < 0.35, "{end:?}");
+    // Twice: B's first version, written in place, costs B's final chain its
+    // cells, whose inputs come from A's final chain, which in turn must cover
+    // what A's first version wrote: the demand feeds back through shared
+    // storage, so the chains run whole and pixels stay exact.
+    let (_, end) = against_full_replay(
+        3,
+        |f| (layer(f), layer(f)),
+        |f, c, &((a, sa), (b, sb)), n| {
+            paint(f, sa, 1., [1., n as f32 / 8., 0., 1.]);
+            composite(f, c, a, sb, c.full, true);
+            composite(f, c, b, sa, c.full, true);
+            composite(f, c, a, sb, c.full, true);
+            composite(f, c, b, f.back, c.full, true);
+        },
+    );
+    assert!(end.promotions > 0, "{end:?}");
+}
+// spec: GFX-REC-4 GFX-REC-5
+#[test]
+fn shared_tested_depth_keeps_each_version_exact() {
+    // The layer writes depth that the back buffer's quad then tests; the
+    // layer itself is composited with linear filtering.
+    let (first, end) = against_full_replay(
+        4,
+        |f| {
+            bind_depth(f, 64, 48);
+            layer(f)
+        },
+        |f, c, &(t, l), n| {
+            f.okay("IDirect3DDevice9::SetRenderTarget", &[f.device, 0, l]);
+            f.okay(
+                "IDirect3DDevice9::Clear",
+                &[f.device, 0, 0, 3, 0xff000000, 0.75f32.to_bits(), 0],
+            );
+            tested(f, l, 1. + n as f32 * 0.25, 0.5, true, [1., 0., 0., 1.]);
+            composite(f, c, t, f.back, c.full, true);
+            tested(f, f.back, 2., 0.6, false, [1.; 4]);
+        },
+    );
+    assert_eq!(end.promotions, 0);
+    assert!(steady_share(&first, &end, 4) < 0.3, "{end:?}");
+}
+// spec: GFX-REC-4 GFX-REC-5
+#[test]
+fn retained_depth_keeps_skipped_cells_for_later_tests() {
+    // Depth is cleared and a static quad writes it, while another quad
+    // changes elsewhere; the last frame stops clearing and tests against
+    // the depth the skipped static quad left.
+    against_full_replay(
+        4,
+        |f| bind_depth(f, 64, 48),
+        |f, _, _, n| {
+            let back = f.back;
+            if n < 3 {
+                f.okay(
+                    "IDirect3DDevice9::Clear",
+                    &[f.device, 0, 0, 3, 0xff000000, 0.75f32.to_bits(), 0],
+                );
+                tested(f, back, 1., 0.25, true, [0., 0., 1., 1.]);
+                tested(f, back, 9., 0.25, true, [1., n as f32 / 8., 0., 1.]);
+            } else {
+                tested(f, back, 1.5, 0.5, false, [1.; 4]);
+            }
+        },
+    );
+}
+// spec: GFX-REC-4 GFX-REC-5
+#[test]
+fn a_final_version_read_before_any_overwrite_is_settled() {
+    // Each frame rebuilds the layer twice from clears, until the last frame
+    // reads it without drawing it at all.
+    against_full_replay(4, layer, |f, c, &(t, l), n| {
+        if n < 3 {
+            paint(f, l, 1., [1., n as f32 / 8., 0., 1.]);
+            composite(f, c, t, f.back, c.left, true);
+            paint(f, l, 6., [0., n as f32 / 8., 1., 1.]);
+        }
+        composite(f, c, t, f.back, c.full, n == 3);
+    });
+}
+// spec: GFX-REC-4 GFX-REC-5
+#[test]
+fn a_fill_after_a_read_keeps_the_earlier_read_local() {
+    // The layer is composited, then filled from the CPU and sampled again by
+    // a small quad: each read binds its own version.
+    let (first, end) = against_full_replay(
+        4,
+        |f| {
+            let small = f.packet([
+                [0.125f32, 0.5, 0., 36. / 64., 12. / 48.],
+                [0.375, 0.5, 0., 44. / 64., 12. / 48.],
+                [0.125, 1. / 6., 0., 36. / 64., 20. / 48.],
+                [0.375, 1. / 6., 0., 44. / 64., 20. / 48.],
+            ]);
+            (layer(f), small)
+        },
+        |f, c, &((t, l), small), n| {
+            paint(f, l, 1., [1., n as f32 / 8., 0., 1.]);
+            composite(f, c, t, f.back, c.full, true);
+            f.okay(
+                "IDirect3DDevice9::ColorFill",
+                &[f.device, l, 0, 0xff000010 + n as u32],
+            );
+            composite(f, c, t, f.back, small, false);
+        },
+    );
+    assert_eq!(end.promotions, 0);
+    // The fill itself runs whole, a quarter of the first present; the rest
+    // only in the moving quad's and the small quad's cells.
+    assert!(steady_share(&first, &end, 4) < 0.5, "{end:?}");
+}
+// spec: GFX-REC-4 GFX-REC-5
+#[test]
+fn an_accumulating_layer_changes_only_where_this_frame_drew() {
+    let (first, end) = against_full_replay(6, layer, |f, c, &(t, l), n| {
+        f.okay("IDirect3DDevice9::SetRenderTarget", &[f.device, 0, l]);
+        if n == 0 {
+            clear(f, 0xff000000);
+        }
+        let mut d = quad(f, 1. + 2. * n as f32, [1., n as f32 / 8., 0., 1.]);
+        d.target = f.target(l);
+        record_draw(f, d);
+        composite(f, c, t, f.back, c.full, true);
+    });
+    assert_eq!(end.promotions, 0);
+    assert!(steady_share(&first, &end, 6) < 0.1, "{end:?}");
+}
+// spec: GFX-REC-1 GFX-REC-4 GFX-REC-5
+#[test]
+fn readback_executes_only_what_the_observed_target_depends_on() {
+    // A hit mask cleared with the shared depth is read back mid-frame,
+    // between the generations of an unrelated layer the back buffer
+    // composites; it is static, or changes every frame.
+    for moving in [false, true] {
+        readback_closure(moving);
+    }
+}
+fn readback_closure(moving: bool) {
+    let mut outputs = Vec::new();
+    let mut counters = Vec::new();
+    for verify in [false, true] {
+        let (mut f, c) = composite_fixture(verify);
+        bind_depth(&mut f, 64, 48);
+        let (texture, l) = layer(&mut f);
+        let mask = f.render_target(64, 48, 21);
+        let system = f.surface(64, 48, 21, 2);
+        let mut frames = Vec::new();
+        let mut first = None;
+        for n in 0..4 {
+            paint(&mut f, l, 6., [0., 0., 1., 1.]);
+            let back = f.back;
+            composite(&mut f, &c, texture, back, c.full, true);
+            f.okay("IDirect3DDevice9::SetRenderTarget", &[f.device, 0, mask]);
+            f.okay(
+                "IDirect3DDevice9::Clear",
+                &[f.device, 0, 0, 3, 0xff000000, 1f32.to_bits(), 0],
+            );
+            let x = if moving { 3. + n as f32 } else { 3. };
+            let mut d = quad_deep(&mut f, x, 0., [1.; 4]);
+            d.target = f.target(mask);
+            record_draw(&mut f, d);
+            f.okay(
+                "IDirect3DDevice9::GetRenderTargetData",
+                &[f.device, mask, system],
+            );
+            let locked = f.lock(system, 0, 0);
+            let mut bytes = vec![0; 64 * 48 * 4];
+            f.m.cpu.read(locked.pBits, &mut bytes).unwrap();
+            f.okay("IDirect3DSurface9::UnlockRect", &[system]);
+            paint(&mut f, l, 1., [1., n as f32 / 8., 0., 1.]);
+            composite(&mut f, &c, texture, back, c.left, false);
+            present(&mut f);
+            frames.push((bytes, latest(&mut f)));
+            first.get_or_insert(f.m.ext.get::<State>().frames);
+        }
+        let end = f.m.ext.get::<State>().frames;
+        assert_eq!(end.verification_mismatches, 0);
+        // An unchanged mask is read where it already is.
+        let flushes = if verify || moving { 4 } else { 1 };
+        assert_eq!(end.flushes[Reason::Readback as usize], flushes);
+        counters.push((first.unwrap(), end));
+        outputs.push(frames);
+    }
+    for (n, (clipped, full)) in outputs[0].iter().zip(&outputs[1]).enumerate() {
+        assert!(clipped.0 == full.0, "frame {n} reads back other pixels");
+        assert!(clipped.1 == full.1, "frame {n} differs from a full replay");
+    }
+    let (first, end) = counters[0];
+    // The mask runs early, whole (its clear and quad), only while it
+    // changes; the layer and the back buffer stay local.
+    assert_eq!(end.promotions, 0);
+    let mask = if moving { 2. * 64. * 48. } else { 0. };
+    let rest = steady_share(&first, &end, 4) - mask / first.submitted_pixels as f64;
+    assert!(rest < 0.25, "{rest} {end:?}");
 }
 // spec: GFX-REC-1 GFX-REC-3 GFX-REC-5
 #[test]

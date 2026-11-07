@@ -33,10 +33,18 @@ fn sequence(slot: u128, key: u128, r: Rect) -> Sequence {
 }
 fn feed(h: &mut History, mut next: Sequence) {
     let entries = std::mem::take(&mut next.entries);
-    h.next = next;
+    let (key, bounds) = entries[0];
+    h.start(key, bounds, false);
+    *h.next.last_mut().unwrap() = next;
     for (key, bounds) in entries {
-        h.record(key, bounds, Arc::default());
+        h.record(key, bounds, Arc::default(), Vec::new());
     }
+}
+/// One generation's change, settled as the final version.
+fn advance(h: &mut History, force: bool) -> (Region, Region) {
+    let last = h.next.len() - 1;
+    let changed = h.changed(last, force, &Changes::default());
+    h.settle(force, changed)
 }
 /// The cells of the test target the rectangles touch.
 fn cells(rects: &[Rect]) -> Region {
@@ -48,7 +56,7 @@ fn cells(rects: &[Rect]) -> Region {
 }
 fn step(h: &mut History, slot: u128, key: u128, r: Rect) -> (Region, Region) {
     feed(h, sequence(slot, key, r));
-    h.advance(false, &HashMap::default())
+    advance(h, false)
 }
 // spec: GFX-REC-4 GFX-REC-5
 #[test]
@@ -81,14 +89,14 @@ fn ordered_differences_include_old_new_and_removed_bounds_and_buffer_ages() {
     removed.entries.pop();
     feed(&mut h, removed);
     assert_eq!(
-        h.advance(false, &HashMap::default()).0,
+        advance(&mut h, false).0,
         cells(&[b]),
         "removed commands retain their old bounds"
     );
 }
 // spec: GFX-REC-4 GFX-REC-5
 #[test]
-fn missing_slots_and_shape_changes_need_full_but_large_damage_keeps_its_bounds() {
+fn missing_slots_and_shape_changes_need_full_but_long_absences_keep_their_damage() {
     let r = Rect {
         x: 2,
         y: 3,
@@ -100,11 +108,18 @@ fn missing_slots_and_shape_changes_need_full_but_large_damage_keeps_its_bounds()
     for n in 2..=10 {
         step(&mut h, 2, n, r);
     }
-    assert_eq!(h.changes.len(), 8);
-    assert!(step(&mut h, 1, 11, r).1.is_whole());
+    assert_eq!(
+        step(&mut h, 1, 11, r).1,
+        cells(&[r]),
+        "a slot absent for many frames redraws only what changed meanwhile"
+    );
+    assert!(
+        step(&mut h, 3, 12, r).1.is_whole(),
+        "a slot that never held the content redraws whole"
+    );
     feed(&mut h, sequence(1, 11, r));
-    h.next.shape = 2;
-    assert!(h.advance(false, &HashMap::default()).1.is_whole());
+    h.next.last_mut().unwrap().shape = 2;
+    assert!(advance(&mut h, false).1.is_whole());
     step(&mut h, 1, 11, r);
     let large = Rect { w: 80, h: 80, ..r };
     assert_eq!(step(&mut h, 1, 12, large).1, cells(&[large]));
@@ -127,7 +142,7 @@ fn d3d9_differential_insertions_removals_and_reordering_damage_only_unmatched_bo
         let mut next = sequence(1, 1, a);
         next.entries = entries.to_vec();
         feed(&mut h, next);
-        h.advance(false, &HashMap::default()).0
+        advance(&mut h, false).0
     };
     assert!(run(&[(1, a), (2, b), (3, c)]).is_whole());
     assert_eq!(

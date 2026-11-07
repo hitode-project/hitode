@@ -478,8 +478,12 @@ fn read_target(
     }) {
         return outcome;
     }
+    if let Some(id) = com(env).identity::<Payload>(&env.sys.objects, source.addr()) {
+        recording::trace::readback(env, id);
+    }
     if let Some(owner) = com(env).identity::<Payload>(&env.sys.objects, this.addr())
-        && recording::has_work(env, owner)
+        && let Some(surface) = com(env).identity::<Payload>(&env.sys.objects, source.addr())
+        && recording::observes(env, owner, surface)
     {
         return recording::barrier(env, owner, recording::Reason::Readback, move |env| {
             read_target(env, this, source, destination)

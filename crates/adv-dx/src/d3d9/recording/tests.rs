@@ -252,6 +252,9 @@ fn equal_full_clear_frames_skip_gpu_and_publication_but_complete_each_guest_fram
     clear(&mut f, 0xffabcdef);
     present(&mut f);
     assert_eq!(f.m.ext.get::<Presents>().published, [1, 5]);
+    // The first present has no previous presentation; the new full clear
+    // changes the whole surface by analysis.
+    assert_eq!(f.m.ext.get::<State>().frames.whole, [0, 1, 0, 1]);
     let back = f.image(f.back);
     assert_eq!(&f.pixels(&back)[..4], &[0xef, 0xcd, 0xab, 0xff]);
 }
