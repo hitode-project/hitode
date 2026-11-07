@@ -375,6 +375,17 @@ fn one_changed_quad_replays_in_order_and_clear_preserves_pixels_outside_damage()
     assert_eq!(counts.clipped_executions, 1);
     // The quad's 4x4 bounds round to their 8x8 damage cell.
     assert!((counts.clipped_area_sum - (1. + 64. / 192.)).abs() < 1e-9);
+    assert_eq!(counts.changed_pixels, 192 + 64);
+    assert_eq!(counts.executed_pixels, 192 + 64);
+    assert_eq!(counts.extra_pixels, 0);
+    assert_eq!(counts.submitted_vertices, 18 + 12);
+    assert_eq!(counts.repeated_vertices, 0);
+    scene(&mut f, colors);
+    present(&mut f);
+    let repeated = f.m.ext.get::<State>().frames;
+    assert_eq!(repeated.changed_pixels, counts.changed_pixels);
+    assert_eq!(repeated.executed_pixels, counts.executed_pixels);
+    assert_eq!(repeated.submitted_vertices, counts.submitted_vertices);
 }
 
 fn bind_depth(f: &mut Fixture, width: u32, height: u32) -> u32 {
@@ -1281,6 +1292,217 @@ fn half_texel_composite_keeps_local_damage_and_full_replay_pixels() {
     // The layer and the composite redraw only the moving quad's cells.
     assert_eq!(end.clipped_executions, 3, "{end:?}");
     assert!(steady_share(&first, &end, 4) < 0.25, "{end:?}");
+}
+// spec: GFX-REC-4 GFX-REC-5
+#[test]
+fn removed_draw_before_changed_composite_keeps_damage_local() {
+    let (first, end) = against_full_replay(3, layer, |f, c, &(texture, surface), n| {
+        paint(f, surface, 1., [0., 0., 1., 1.]);
+        composite(f, c, texture, f.back, c.full, true);
+        if n == 0 {
+            let text = quad(f, 8., [1.; 4]);
+            record_draw(f, text);
+        }
+        paint(f, surface, 1., [1., n as f32 / 8., 0., 1.]);
+        composite(f, c, texture, f.back, c.full, false);
+    });
+    assert_eq!(end.clipped_executions, 2, "{end:?}");
+    assert!(steady_share(&first, &end, 3) < 0.5, "{end:?}");
+}
+// spec: GFX-REC-4 GFX-REC-5 GFX-COPY-3
+#[test]
+fn disjoint_uploads_before_sampling_preserve_both_patches() {
+    against_full_replay(3, layer, |f, c, &(texture, surface), n| {
+        let patches = match n {
+            0 => vec![(
+                Rect {
+                    x: 0,
+                    y: 0,
+                    w: 64,
+                    h: 48,
+                },
+                [0, 0, 0, 255],
+            )],
+            1 => vec![
+                (
+                    Rect {
+                        x: 16,
+                        y: 16,
+                        w: 8,
+                        h: 8,
+                    },
+                    [255, 0, 0, 255],
+                ),
+                (
+                    Rect {
+                        x: 40,
+                        y: 16,
+                        w: 8,
+                        h: 8,
+                    },
+                    [0, 255, 0, 255],
+                ),
+            ],
+            _ => vec![],
+        };
+        for (rectangle, color) in patches {
+            let target = f.target(surface);
+            let owner = id(f);
+            let e = env(f);
+            let resource = com(&e)
+                .identity::<Payload>(&e.sys.objects, texture)
+                .unwrap();
+            let bytes = color.repeat((rectangle.w * rectangle.h) as usize);
+            let key = hash(&bytes) as u64;
+            assert!(matches!(
+                record(
+                    &mut env(f),
+                    owner,
+                    Operation::Upload {
+                        resource,
+                        level: Some(0),
+                        target,
+                        pixels: Pixels::Host(Arc::new(bytes), UploadKey::Admission(key)),
+                        pitch: rectangle.w * 4,
+                        rectangle,
+                    }
+                ),
+                Outcome::Return(0)
+            ));
+        }
+        composite(f, c, texture, f.back, c.full, true);
+        let cursor = quad(f, 1. + n as f32, [1.; 4]);
+        record_draw(f, cursor);
+    });
+}
+// spec: GFX-REC-2 GFX-REC-4 GFX-REC-5
+#[test]
+fn repeated_full_upload_keeps_cursor_damage_local() {
+    let (_, end) = against_full_replay(3, layer, |f, c, &(texture, surface), n| {
+        let mut bytes = [0x33u8; 64 * 48 * 4];
+        if n == 2 {
+            bytes[0] = 255;
+        }
+        let address = f.packet(bytes);
+        let target = f.target(surface);
+        let owner = id(f);
+        let e = env(f);
+        let resource = com(&e)
+            .identity::<Payload>(&e.sys.objects, texture)
+            .unwrap();
+        let state = f.m.ext.get_mut::<State>();
+        let (pixels, pitch) = format::snapshot(
+            &f.m.cpu,
+            state.gpu.as_mut().unwrap(),
+            &mut state.upload_admission,
+            &mut state.upload_scratch,
+            (21, address, 64 * 4),
+            (64, 48),
+            true,
+        )
+        .unwrap();
+        let result = record(
+            &mut env(f),
+            owner,
+            Operation::Upload {
+                resource,
+                level: Some(0),
+                target,
+                pixels,
+                pitch,
+                rectangle: Rect {
+                    x: 0,
+                    y: 0,
+                    w: 64,
+                    h: 48,
+                },
+            },
+        );
+        assert_eq!(f.finish(result), 0);
+        composite(f, c, texture, f.back, c.full, true);
+        let cursor = quad(f, 1. + n as f32, [1.; 4]);
+        record_draw(f, cursor);
+    });
+    assert_eq!(end.clipped_executions, 1, "{end:?}");
+    assert_eq!(end.submissions, 11, "{end:?}");
+}
+// spec: GFX-REC-2 GFX-REC-4 GFX-REC-5
+#[test]
+fn changing_copy_presentation_rectangles_keeps_render_damage_local() {
+    let mut outputs = Vec::new();
+    for verify in [false, true] {
+        let mut f = fixture();
+        f.m.ext.get_mut::<State>().verify_frames = verify;
+        let pointer = f.device;
+        let mut parameters = device(&env(&mut f), pointer).unwrap().parameters;
+        parameters.SwapEffect = 3;
+        let parameters = f.packet(parameters);
+        f.okay("IDirect3DDevice9::Reset", &[pointer, parameters]);
+        let full = f.packet([0u32, 0, 16, 12, 0, 1f32.to_bits()]);
+        let changed = f.packet([2u32, 2, 2, 2, 0, 1f32.to_bits()]);
+        let part = f.packet(RECT {
+            left: 0,
+            top: 0,
+            right: 8,
+            bottom: 8,
+        });
+        let mut frames = Vec::new();
+        for n in 0..3 {
+            let before = f.m.ext.get::<State>().frames;
+            f.okay("IDirect3DDevice9::SetViewport", &[pointer, full]);
+            clear(&mut f, 0xff000000);
+            let color = if n == 0 { 0xff0000ff } else { 0xff00ff00 };
+            f.okay("IDirect3DDevice9::SetViewport", &[pointer, changed]);
+            clear(&mut f, color);
+            let rectangle = if n == 1 { part } else { 0 };
+            f.okay(
+                "IDirect3DDevice9::Present",
+                &[pointer, rectangle, rectangle, 0, 0],
+            );
+            frames.push(latest(&mut f));
+            if !verify && n > 0 {
+                let after = f.m.ext.get::<State>().frames;
+                let area = after.executed_pixels - before.executed_pixels;
+                assert_eq!(area, if n == 1 { 64 } else { 0 });
+                assert_eq!(after.changed_pixels - before.changed_pixels, area);
+                assert_eq!(after.eliminated_frames, 0);
+            }
+        }
+        outputs.push(frames);
+    }
+    assert!(outputs[0] == outputs[1]);
+}
+// spec: GFX-REC-3 GFX-REC-5
+#[test]
+fn composite_counts_vertices_again_for_each_disjoint_scissor() {
+    let (first, end) = against_full_replay(2, layer, |f, c, &(t, l), n| {
+        let color = [1., n as f32 / 8., 0., 1.];
+        paint(f, l, 1., color);
+        let mut d = quad(f, 11., color);
+        d.target = f.target(l);
+        d.state = DrawState::new(64, 48);
+        record_draw(f, d);
+        composite(f, c, t, f.back, c.full, true);
+    });
+    // The four-vertex composition strip meets both scissors.
+    assert_eq!(end.repeated_vertices - first.repeated_vertices, 4);
+    assert!(end.executed_pixels - first.executed_pixels < 64 * 48);
+}
+// spec: GFX-REC-3 GFX-REC-5
+#[test]
+fn retained_intermediate_reads_count_their_own_whole_chain_promotions() {
+    let (first, end) = against_full_replay(4, layer, |f, c, &(t, l), n| {
+        paint(f, l, 1., [1., n as f32 / 8., 0., 1.]);
+        composite(f, c, t, f.back, c.full, true);
+        f.okay("IDirect3DDevice9::SetRenderTarget", &[f.device, 0, l]);
+        let mut d = quad(f, 11., [0., 0., 1., 1.]);
+        d.target = f.target(l);
+        record_draw(f, d);
+        composite(f, c, t, f.back, c.left, false);
+    });
+    assert_eq!(first.intermediate_promotions, 0);
+    assert_eq!(end.intermediate_promotions, 3);
+    assert_eq!(end.promotions, 0);
 }
 /// A fixed-function quad on `target` testing the bound depth buffer.
 fn tested(f: &mut Fixture, target: u32, x: f32, z: f32, write: bool, color: [f32; 4]) {

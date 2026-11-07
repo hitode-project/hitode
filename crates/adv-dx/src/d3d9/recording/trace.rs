@@ -198,7 +198,7 @@ pub(super) fn present(
     partial: bool,
     force: bool,
     copy: bool,
-    promotions: u64,
+    promotions: [u64; 2],
     execution: &rustc_hash::FxHashMap<u128, adv_device::surface::Region>,
 ) {
     if capturing() {
@@ -219,9 +219,31 @@ pub(super) fn present(
             .collect();
         slots.sort();
         push(format!(
-            "present: partial {partial}, force {force}, copy {copy}, promotions {promotions}; executed [{}]",
+            "present: partial {partial}, force {force}, copy {copy}, promotions intermediate {} late {}; planned [{}]",
+            promotions[0],
+            promotions[1],
             slots.join(", ")
         ));
+    }
+}
+pub(super) fn work(work: &HashMap<(Content, usize, u128), damage::Work>, planned: bool) {
+    if !capturing() {
+        return;
+    }
+    if !planned {
+        push("present: repeated; E 0 px, submissions 0, vertices 0".into());
+        return;
+    }
+    let mut rows: Vec<_> = work.iter().map(|((content, generation, slot), work)| {
+        let [delta, executed, extra] = work.areas();
+        format!(
+            "slot {:04x} {} generation {generation}: delta {delta} px, E {executed} px, E\\delta {extra} px; submissions {}, vertices {}, repeated vertices {}",
+            *slot as u16, name(content), work.submissions, work.vertices, work.repeated_vertices
+        )
+    }).collect();
+    rows.sort();
+    for row in rows {
+        push(row);
     }
 }
 pub(super) fn frame_end() {

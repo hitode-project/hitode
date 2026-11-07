@@ -139,10 +139,18 @@ pub struct Counters {
     /// Final chains planned whole because a late demand reached writes
     /// already planned.
     pub promotions: u64,
+    pub intermediate_promotions: u64,
     /// Recorded writes submitted, once per scissor, and the pixels those
     /// submissions covered (a whole write counts its image).
     pub submissions: u64,
     pub submitted_pixels: u64,
+    /// Input vertices submitted, including instances and repeated scissors.
+    pub submitted_vertices: u64,
+    pub repeated_vertices: u64,
+    /// Backbuffer cell areas accumulated once per completed present.
+    pub changed_pixels: u64,
+    pub executed_pixels: u64,
+    pub extra_pixels: u64,
 }
 impl Counters {
     pub fn work_report(&self) -> String {
@@ -187,6 +195,8 @@ pub(super) struct Recording {
     passes: passes::Plan,
     damage: damage::Analysis,
     verify_region: Option<adv_device::surface::Region>,
+    output_slot: Option<u128>,
+    executed: HashMap<u128, adv_device::surface::Region>,
     verify_image: Option<adv_device::gpu::Image>,
     baseline: Option<adv_device::gpu::Image>,
     pub(super) rotate: bool,
@@ -534,7 +544,8 @@ fn append(
             f.contents.slots[slot].2 = Some(old);
             f.contents.touched.push(slot);
         }
-        let next = if matches!(p.operation, Operation::Upload { .. }) {
+        let next = if matches!(&p.operation, Operation::Upload { pixels, .. } if matches!(pixels.key(), UploadKey::Admission(_)))
+        {
             f.upload = f.upload.checked_add(1).expect("upload content exhausted");
             f.upload
         } else if overwrite {
@@ -801,9 +812,6 @@ pub(super) fn flush(
                 let f = frame(env, owner);
                 let clip = f.damage.clip(node.unwrap()).unwrap()[f.part];
                 if !f.passes.outside_damage(f.head, clip) {
-                    let counters = &mut env.ext.get_mut::<State>().frames;
-                    counters.submissions += 1;
-                    counters.submitted_pixels += u64::from(clip.w) * u64::from(clip.h);
                     let gpu = env.ext.get_mut::<State>().gpu.as_mut().unwrap();
                     gpu.set_clip(Some(clip));
                     result = execute_gpu(env, &operation);
@@ -816,16 +824,17 @@ pub(super) fn flush(
                     if result.is_err() {
                         break;
                     }
+                    submitted(env, owner, node, &operation, Some(clip));
                 }
                 frame(env, owner).part += 1;
             }
             result
         } else {
-            let counters = &mut env.ext.get_mut::<State>().frames;
-            counters.submissions += 1;
-            counters.submitted_pixels += damage::image(&operation)
-                .map_or(0, |i| u64::from(i.width()) * u64::from(i.height()));
-            execute_gpu(env, &operation)
+            let result = execute_gpu(env, &operation);
+            if result.is_ok() {
+                submitted(env, owner, node, &operation, None);
+            }
+            result
         };
         match result {
             Err(Error::Busy) => {
@@ -864,6 +873,67 @@ pub(super) fn flush(
                 result?;
             }
         }
+    }
+}
+fn submitted(
+    env: &mut Env<'_>,
+    owner: Id,
+    node: Option<usize>,
+    operation: &Operation,
+    clip: Option<adv_device::surface::Rect>,
+) {
+    let Some(image) = damage::image(operation) else {
+        return;
+    };
+    let area = clip.unwrap_or(adv_device::surface::Rect {
+        x: 0,
+        y: 0,
+        w: image.width(),
+        h: image.height(),
+    });
+    let area = match operation {
+        Operation::Clear { rectangle, .. } => area.clipped(*rectangle),
+        Operation::Copy { region, .. } => area.clipped(*region),
+        _ => area,
+    };
+    frame(env, owner)
+        .executed
+        .entry(hash(image.id()))
+        .or_insert_with(|| adv_device::surface::Region::empty((image.width(), image.height())))
+        .add(area.into());
+    let vertices = match operation {
+        Operation::Draw(d) => d
+            .programmable
+            .as_ref()
+            .map_or(d.vertices.len() as u64, |p| {
+                u64::from(p.vertex_count) * u64::from(p.instance_count)
+            }),
+        _ => 0,
+    };
+    let aspects = match operation {
+        Operation::Clear {
+            color,
+            depth,
+            stencil,
+            ..
+        } => {
+            u8::from(color.is_some())
+                | u8::from(depth.is_some()) << 1
+                | u8::from(stencil.is_some()) << 2
+        }
+        _ => 7,
+    };
+    let repeated = node.is_some_and(|n| {
+        frame(env, owner)
+            .damage
+            .submitted(n, area, aspects, vertices)
+    });
+    let counters = &mut env.ext.get_mut::<State>().frames;
+    counters.submissions += 1;
+    counters.submitted_pixels += u64::from(area.w) * u64::from(area.h);
+    counters.submitted_vertices += vertices;
+    if repeated {
+        counters.repeated_vertices += vertices;
     }
 }
 fn clear_upload_lock(env: &mut Env<'_>, resource: Id, level: Option<u32>, dirty: bool) {
@@ -1020,7 +1090,7 @@ pub(super) fn present(env: &mut Env<'_>, operation: &Operation) -> Result<Comple
         let provider = env.ext.get::<State>().provider;
         let image = (provider.target)(env.ext, *surface).unwrap().image;
         let f = frame(env, *owner);
-        let force = f.last != Some(presentation);
+        let force = f.last.is_none();
         let _dead_passes = if !verify && !f.partial && f.head == 0 {
             f.passes.plan()
         } else {
@@ -1038,6 +1108,7 @@ pub(super) fn present(env: &mut Env<'_>, operation: &Operation) -> Result<Comple
             h: image.height(),
         };
         let slot = hash(image.id());
+        f.output_slot = Some(slot);
         let size = (full.w, full.h);
         f.verify_region = Some(if force || copy.is_some() {
             adv_device::surface::Region::whole(size)
@@ -1081,7 +1152,8 @@ pub(super) fn present(env: &mut Env<'_>, operation: &Operation) -> Result<Comple
         if let Some(cause) = whole {
             counters.whole[cause] += 1;
         }
-        counters.promotions += promotions;
+        counters.intermediate_promotions += promotions[0];
+        counters.promotions += promotions[1];
         if verify || !clipped {
             counters.full_executions += 1;
         } else {
@@ -1112,6 +1184,23 @@ pub(super) fn present(env: &mut Env<'_>, operation: &Operation) -> Result<Comple
     Ok(completion)
 }
 fn finish(env: &mut Env<'_>, owner: Id, token: u64, presentation: u128, serial: Option<u64>) {
+    let f = frame(env, owner);
+    let delta = f.output_slot.and_then(|s| f.damage.changed.get(&s));
+    let changed = delta.map_or(0, damage::area);
+    let executed = f.output_slot.and_then(|s| f.executed.get(&s)).cloned();
+    let execution_area = executed.as_ref().map_or(0, damage::area);
+    let extra = match (executed, delta) {
+        (Some(mut r), Some(delta)) => {
+            r.intersect(delta);
+            execution_area - damage::area(&r)
+        }
+        _ => execution_area,
+    };
+    trace::work(&f.damage.work, f.damage.planned);
+    let counters = &mut env.ext.get_mut::<State>().frames;
+    counters.changed_pixels += changed;
+    counters.executed_pixels += execution_area;
+    counters.extra_pixels += extra;
     trace::frame_end();
     unlock(env, owner, token);
     let f = frame(env, owner);
@@ -1119,6 +1208,8 @@ fn finish(env: &mut Env<'_>, owner: Id, token: u64, presentation: u128, serial: 
     f.rotate = false;
     f.verify_image = None;
     f.verify_region = None;
+    f.output_slot = None;
+    f.executed.clear();
     f.last = Some(presentation);
     f.last_serial = serial;
     f.contents.reset();

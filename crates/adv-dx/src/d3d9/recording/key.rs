@@ -324,8 +324,19 @@ pub(super) fn prepare(
             pitch,
             rectangle,
         } => {
-            write(content(env, *resource, *level, 0), true);
-            (1u8, target_key(target), pixels, pitch, rect(*rectangle)).hash(&mut h);
+            write(
+                content(env, *resource, *level, 0),
+                format::covers(*rectangle, &target.image),
+            );
+            (
+                1u8,
+                target_key(target),
+                target.image.texel_format() as u8,
+                pixels,
+                pitch,
+                rect(*rectangle),
+            )
+                .hash(&mut h);
             bytes = pixels.len();
         }
         Operation::Copy {

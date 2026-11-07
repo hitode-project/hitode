@@ -19,24 +19,26 @@ pub(super) struct Node {
     pub producers: Vec<Option<usize>>,
     /// For each write, the write before it to the same content.
     pub previous: Vec<Option<usize>>,
+    pub generations: Vec<usize>,
+    pub submissions: u64,
 }
 
 /// Scissors per write; `None` executes it whole.
 pub(super) type Clips = Vec<Option<Vec<Rect>>>;
 
-/// The plan, and how many chains it had to execute whole because a late
-/// demand reached writes already planned.
+/// The plan and whole-chain promotions: intermediate external reads, then
+/// late demands reaching writes already planned.
 pub(super) fn schedule(
     nodes: &[Node],
     done: &HashSet<(usize, Content)>,
     stale: &HashMap<Content, Region>,
-) -> (Clips, u64) {
+) -> (Clips, [u64; 2]) {
     let graph = Graph::new(nodes, done, stale);
     let mut whole = graph.whole.clone();
     let mut promotions = 0;
     loop {
         match graph.pass(&whole) {
-            Ok(clips) => return (clips, promotions),
+            Ok(clips) => return (clips, [graph.intermediate, promotions]),
             Err(g) => {
                 debug_assert!(!whole[g]);
                 whole[g] = true;
@@ -82,8 +84,9 @@ struct Graph<'a> {
     last: HashMap<Content, usize>,
     /// Each group's cells before demand: the stale cells of its contents.
     initial: Vec<Region>,
-    /// Groups that execute whole: a flush already ran some of their writes.
+    /// Groups that execute whole after an early flush or intermediate read.
     whole: Vec<bool>,
+    intermediate: u64,
 }
 impl<'a> Graph<'a> {
     fn new(
@@ -174,10 +177,29 @@ impl<'a> Graph<'a> {
                 whole[of[k]] = true;
             }
         }
-        let last = writers
+        let last: HashMap<Content, usize> = writers
             .iter()
             .map(|(k, list)| (*k, *list.last().unwrap()))
             .collect();
+        let mut intermediate = HashSet::default();
+        for node in nodes {
+            for ((source, _), producer) in node.record.demands.iter().zip(&node.producers) {
+                if let Some(p) = producer
+                    && *p >= start[source]
+                    && *p != last[source]
+                    && !node.record.writes.iter().any(|w| w.0 == *source)
+                {
+                    intermediate.insert(of[source]);
+                }
+            }
+        }
+        let intermediate_count = intermediate
+            .iter()
+            .filter(|&&g| !whole[g] && !initial[g].is_whole())
+            .count() as u64;
+        for &g in &intermediate {
+            whole[g] = true;
+        }
         Self {
             nodes,
             done,
@@ -186,6 +208,7 @@ impl<'a> Graph<'a> {
             last,
             initial,
             whole,
+            intermediate: intermediate_count,
         }
     }
     fn pass(&self, whole: &[bool]) -> Result<Clips, usize> {
@@ -300,7 +323,7 @@ impl Pass<'_, '_> {
     fn cut(&self, g: usize, c: usize) -> Result<Option<Vec<Rect>>, usize> {
         let record = &self.graph.nodes[c].record;
         let e = clipped(self.parts[g].as_ref().unwrap(), record.bounds);
-        // Uploads replace the whole image; only a whole chain may run one.
+        // Uploads cannot be scissored; only a whole chain may run one.
         if record.upload && !e.is_empty() {
             return if self.region[g].is_whole() {
                 Ok(None)

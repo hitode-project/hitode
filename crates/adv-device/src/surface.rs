@@ -2138,7 +2138,7 @@ impl<P: Presenter> Surfaces<P> {
         Ok(std::mem::replace(&mut native.target, target))
     }
 
-    /// `None` damage means everything changed.
+    /// Damage is relative to the preceding publication of this surface.
     #[cfg(feature = "gpu")]
     pub fn present_native(
         &mut self,
@@ -2158,7 +2158,9 @@ impl<P: Presenter> Surfaces<P> {
             .presentations
             .checked_add(1)
             .ok_or("presentation serial exhausted")?;
-        let damage = damage.unwrap_or_else(|| Region::whole(extent));
+        let damage = damage
+            .filter(|_| self.native_source == Some(id))
+            .unwrap_or_else(|| Region::whole(extent));
         let video = self.native_video(extent);
         gpu.present(
             &self.native_surfaces[&id].target.image,

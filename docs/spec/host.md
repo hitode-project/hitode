@@ -135,7 +135,7 @@ Linear samples load texels and weigh them by phases snapped to 1/256, so equal p
 |---|---|
 | Software | The snapshot's damage, when the previous consumed frame was upscaled |
 | D3D9 rotating Present | Union of the recorded changes of each publication since the last upscaled one |
-| D3D9 copy Present, another surface, more than eight publications, or a skipped frame | Unknown |
+| D3D9 copy Present, a switch between publication sources, more than eight publications, or a skipped frame | Unknown |
 
 ### HOST-VIEW-11 Shared display targets
 

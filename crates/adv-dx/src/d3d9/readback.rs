@@ -407,6 +407,7 @@ pub(super) fn unlock_internal(env: &mut Env<'_>, this: GuestPtr<()>) -> Outcome 
         &mut state.upload_scratch,
         (format, address, pitch),
         (lock.rectangle.w, lock.rectangle.h),
+        format::covers(lock.rectangle, &target.image),
     ) else {
         return Outcome::Return(INVALID);
     };

@@ -297,9 +297,13 @@ pub fn diagnostics(ext: &Ext, objects: &Objects) -> Diagnostics {
 /// Upload bytes snapshotted when the upload was recorded.
 #[derive(Clone)]
 enum Pixels {
-    Host(Arc<Vec<u8>>, u64),
-    /// GPU staging memory and its admission identity.
-    Staged(adv_device::gpu::Staged, u64),
+    Host(Arc<Vec<u8>>, UploadKey),
+    Staged(adv_device::gpu::Staged, UploadKey),
+}
+#[derive(Clone, Copy, Hash)]
+enum UploadKey {
+    Admission(u64),
+    Content(u128),
 }
 impl Pixels {
     fn len(&self) -> usize {
@@ -308,12 +312,14 @@ impl Pixels {
             Self::Staged(staged, _) => staged.len(),
         }
     }
+    fn key(&self) -> UploadKey {
+        let (Self::Host(_, key) | Self::Staged(_, key)) = self;
+        *key
+    }
 }
-/// Upload admission already gives each recording a fresh content identity.
 impl std::hash::Hash for Pixels {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        let (Self::Host(_, admission) | Self::Staged(_, admission)) = self;
-        admission.hash(state);
+        self.key().hash(state);
     }
 }
 

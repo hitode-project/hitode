@@ -1,5 +1,8 @@
 //! SDK pixel layouts: raw staging for stored formats, BGRA8 expansion otherwise.
+use super::UploadKey;
+use adv_device::{gpu::Image, surface::Rect};
 use std::sync::Arc;
+use xxhash_rust::xxh3::Xxh3;
 
 // D3DFORMAT names run from the most significant channel to the least:
 // https://learn.microsoft.com/en-us/windows/win32/direct3d9/d3dformat
@@ -35,6 +38,13 @@ pub(super) fn texel(format: u32) -> Option<adv_device::gpu::TexelFormat> {
     })
 }
 
+pub(super) fn covers(rectangle: Rect, image: &Image) -> bool {
+    rectangle.x == 0
+        && rectangle.y == 0
+        && rectangle.w == image.width()
+        && rectangle.h == image.height()
+}
+
 /// Snapshot admitted guest rows, staging native formats without conversion.
 /// The caller has checked that the complete source rectangle is readable.
 pub(super) fn snapshot(
@@ -44,37 +54,53 @@ pub(super) fn snapshot(
     scratch: &mut Vec<u8>,
     source: (u32, u32, u32),
     size: (u32, u32),
+    whole: bool,
 ) -> Option<(super::Pixels, u32)> {
     let (format, address, pitch) = source;
     let (width, height) = size;
-    *admission += 1;
-    let identity = *admission;
+    let mut key = |hash: Option<Xxh3>| match hash {
+        Some(hash) => UploadKey::Content(hash.digest128()),
+        None => {
+            *admission += 1;
+            UploadKey::Admission(*admission)
+        }
+    };
+    let mut hash = whole.then(Xxh3::new);
     if gpu.stores(texel(format)?) {
         let row_bytes = self::pitch(format, width)?;
         let staged = gpu
             .stage(row_bytes, height, |write| {
                 for y in 0..height {
                     let at = address + y * pitch;
-                    if let Some(row) = cpu.shared_bytes(at, row_bytes as usize) {
-                        write(y, row);
+                    let row = if let Some(row) = cpu.shared_bytes(at, row_bytes as usize) {
+                        row
                     } else {
                         scratch.resize(row_bytes as usize, 0);
                         cpu.read(at, scratch).map_err(drop)?;
-                        write(y, scratch);
+                        scratch.as_slice()
+                    };
+                    if let Some(hash) = &mut hash {
+                        hash.update(row);
                     }
+                    write(y, row);
                 }
                 Ok::<(), ()>(())
             })
             .ok()?
             .ok()?;
         let pitch = staged.pitch();
-        return Some((super::Pixels::Staged(staged, identity), pitch));
+        return Some((super::Pixels::Staged(staged, key(hash)), pitch));
     }
     let row = self::pitch(format, width)?;
     let mut pixels = vec![0; ((height - 1) * pitch + row) as usize];
     cpu.read(address, &mut pixels).ok()?;
     let (pixels, pitch) = upload(format, pixels, pitch, width, height)?;
-    Some((super::Pixels::Host(Arc::new(pixels), identity), pitch))
+    if let Some(hash) = &mut hash {
+        for row in pixels.chunks(pitch as usize).take(height as usize) {
+            hash.update(&row[..width as usize * 4]);
+        }
+    }
+    Some((super::Pixels::Host(Arc::new(pixels), key(hash)), pitch))
 }
 
 /// The GPU receives BGRA8, while a packed texture retains its actual SDK bytes.
@@ -197,6 +223,7 @@ mod tests {
                 &mut state.upload_scratch,
                 (21, address, 4),
                 (1, 1),
+                false,
             )
             .unwrap()
             .0

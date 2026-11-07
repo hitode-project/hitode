@@ -314,18 +314,26 @@ impl History {
                 s.gens.insert(at, previous.gens[&old].clone());
             }
         } else {
-            if previous
-                .entries
-                .get(s.cursor)
-                .is_some_and(|e| e.1 == bounds)
-                && previous
-                    .samples
-                    .get(&s.cursor)
-                    .is_some_and(|old| old.base == samples.base)
-                && !samples.reads.is_empty()
-            {
-                s.pending.push((s.cursor, at));
-                s.cursor += 1;
+            let sampled = (!samples.reads.is_empty())
+                .then(|| {
+                    previous
+                        .samples
+                        .iter()
+                        .filter_map(|(&n, old)| {
+                            (n >= s.cursor
+                                && previous.entries[n].1 == bounds
+                                && old.base == samples.base)
+                                .then_some(n)
+                        })
+                        .min()
+                })
+                .flatten();
+            if let Some(old) = sampled {
+                for &(_, r) in &previous.entries[s.cursor..old] {
+                    s.damage.add(r.into());
+                }
+                s.pending.push((old, at));
+                s.cursor = old + 1;
             } else {
                 s.damage.add(bounds.into());
             }
@@ -417,6 +425,28 @@ pub(super) struct Record {
 /// Scissors per write. A draw spanning several distant changes is submitted
 /// once per scissor it meets; past this many, coarser cells merge them.
 const PARTS: usize = 8;
+pub(super) fn area(region: &Region) -> u64 {
+    rects(region)
+        .iter()
+        .map(|r| u64::from(r.w) * u64::from(r.h))
+        .sum()
+}
+#[derive(Default)]
+pub(super) struct Work {
+    pub changed: Region,
+    pub executed: Region,
+    pub submissions: u64,
+    pub vertices: u64,
+    pub repeated_vertices: u64,
+}
+impl Work {
+    pub fn areas(&self) -> [u64; 3] {
+        let mut common = self.executed.clone();
+        common.intersect(&self.changed);
+        let executed = area(&self.executed);
+        [area(&self.changed), executed, executed - area(&common)]
+    }
+}
 #[derive(Default)]
 pub(super) struct Analysis {
     histories: HashMap<Content, History>,
@@ -433,6 +463,7 @@ pub(super) struct Analysis {
     pub execution: HashMap<u128, Region>,
     /// What each slot's color changed.
     pub changed: HashMap<u128, Region>,
+    pub work: HashMap<(Content, usize, u128), Work>,
     pub planned: bool,
     epoch: u64,
     ordinal: u64,
@@ -576,6 +607,8 @@ impl Analysis {
             record: record.clone(),
             producers,
             previous,
+            generations: Vec::new(),
+            submissions: 0,
         });
         for &(k, key, bounds, full, shape, overwrite, ref samples) in &record.writes {
             // Which generation of each sampled source the read meets.
@@ -603,13 +636,22 @@ impl Analysis {
                 s.independent = fresh;
             }
             history.record(key, bounds, samples.clone(), gens);
+            let generation = history.next.len() - 1;
+            self.nodes[at].generations.push(generation);
+            self.work
+                .entry((k, generation, slot))
+                .or_insert_with(|| Work {
+                    changed: Region::whole(size(full)),
+                    executed: Region::empty(size(full)),
+                    ..Default::default()
+                });
         }
     }
-    /// Plans the frame; returns how many final chains a late demand made
-    /// execute whole.
-    pub fn plan(&mut self, force: bool) -> u64 {
+    /// Plans the frame; returns whole-chain promotions for intermediate
+    /// external reads and late demands, respectively.
+    pub fn plan(&mut self, force: bool) -> [u64; 2] {
         if self.planned {
-            return 0;
+            return [0; 2];
         }
         self.epoch += 1;
         // Generations in the order their last writes ran, so each read meets
@@ -630,6 +672,11 @@ impl Analysis {
             let h = &self.histories[&content];
             let changed = h.changed(g, force || h.seen + 1 != self.epoch, &changes);
             changes.insert((content, g), (changed, h.matched[g]));
+        }
+        for ((content, generation, _), work) in &mut self.work {
+            if let Some((changed, _)) = changes.get(&(*content, *generation)) {
+                work.changed = changed.clone();
+            }
         }
         let mut stale = HashMap::default();
         for (content, h) in &mut self.histories {
@@ -677,6 +724,25 @@ impl Analysis {
     /// The scissors write `n` of the frame executes in; `None` runs it whole.
     pub fn clip(&self, n: usize) -> Option<&[Rect]> {
         self.clips.get(n)?.as_deref()
+    }
+    /// Counts only successful submissions, including writes before Present.
+    pub fn submitted(&mut self, n: usize, rect: Rect, aspects: u8, vertices: u64) -> bool {
+        let node = &mut self.nodes[n];
+        let repeated = node.submissions != 0;
+        node.submissions += 1;
+        for (w, &generation) in node.record.writes.iter().zip(&node.generations) {
+            if aspects & (1 << w.0.2) == 0 {
+                continue;
+            }
+            let work = self.work.get_mut(&(w.0, generation, node.slot)).unwrap();
+            work.executed.add(rect.into());
+            work.submissions += 1;
+            work.vertices += vertices;
+            if repeated {
+                work.repeated_vertices += vertices;
+            }
+        }
+        repeated
     }
     /// How many writes the frame recorded.
     pub fn len(&self) -> usize {
@@ -792,6 +858,7 @@ impl Analysis {
         self.last_writer.clear();
         self.done.clear();
         self.execution.clear();
+        self.work.clear();
         self.planned = false;
     }
     pub fn invalidate(&mut self) {

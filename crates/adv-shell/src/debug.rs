@@ -488,12 +488,20 @@ impl Debugger {
         let presents = flushes[0].max(1);
         format!(
             "executions: clipped {clipped}, full {full}, mean area {area:.3}; repeated frames {}\n\
-             per present: submissions {:.1}, pixels {:.0}; chains run whole {}\n\
+             per present: submissions {:.1}, pixels {:.0}, vertices {:.0}, repeated vertices {:.0}\n\
+             backbuffer per present: delta {:.0} px, E {:.0} px, E\\delta {:.0} px\n\
+             chains run whole: intermediate read {}, late demand {}\n\
              whole changes: content flush {}, presentation {}, copy {}, analysis {}\n\
              flushes: present {}, readback {}, lock {}, dc {}, reset {}, release {}, limit {}, wait {}",
             now.eliminated_frames - base.eliminated_frames,
             (now.submissions - base.submissions) as f64 / presents as f64,
             (now.submitted_pixels - base.submitted_pixels) as f64 / presents as f64,
+            (now.submitted_vertices - base.submitted_vertices) as f64 / presents as f64,
+            (now.repeated_vertices - base.repeated_vertices) as f64 / presents as f64,
+            (now.changed_pixels - base.changed_pixels) as f64 / presents as f64,
+            (now.executed_pixels - base.executed_pixels) as f64 / presents as f64,
+            (now.extra_pixels - base.extra_pixels) as f64 / presents as f64,
+            now.intermediate_promotions - base.intermediate_promotions,
             now.promotions - base.promotions,
             whole[0],
             whole[1],
