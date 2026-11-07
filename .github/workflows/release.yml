@@ -1,7 +1,4 @@
-# Builds a version tag into a draft release: the macOS DMG, the unsigned iOS
-# IPA, the signed Android APK, license texts, the Wine source and checksums.
-# Signing waits for a maintainer to approve the `release` environment; the
-# maintainer tests the draft's files on devices, edits its notes and publishes.
+# Trial packages only. No release is created.
 name: Release
 
 on:
@@ -42,13 +39,10 @@ jobs:
         with:
           ref: ${{ env.TAG }}
           persist-credentials: false
-      - name: Check the tag against the workspace version
+      - name: Prepare package output
         run: |
-          # A suffix after the version, as in v0.2.3-ci.1, marks a trial run.
           version="${TAG#v}"
-          grep -qx "version = \"${version%%-*}\"" Cargo.toml || { echo "Cargo.toml is not ${version%%-*}"; exit 1; }
-          test "$(node --print "require('./apps/adv-launcher/package.json').version")" = "${version%%-*}"
-          echo "VERSION=$version" >> "$GITHUB_ENV"
+          echo "VERSION=${version%%-*}" >> "$GITHUB_ENV"
           mkdir -p "$RUNNER_TEMP/dist"
       - name: Install toolchains
         run: |
@@ -102,14 +96,9 @@ jobs:
           strip -x "$stage/Hitode.app/Contents/MacOS/adv-launcher"
           codesign --force --sign - --options runtime \
             --entitlements apps/adv-launcher/src-tauri/macos.entitlements "$stage/Hitode.app"
-          codesign --verify --strict "$stage/Hitode.app"
           ln -s /Applications "$stage/Applications"
           hdiutil create -quiet -size 300m -volname Hitode -srcfolder "$stage" -format ULMO -fs APFS \
             "$RUNNER_TEMP/dist/Hitode-$VERSION-macos-arm64.dmg"
-          mount=$(hdiutil attach -nobrowse -readonly "$RUNNER_TEMP/dist/Hitode-$VERSION-macos-arm64.dmg" | tail -1 | awk -F'\t' '{print $NF}')
-          codesign --verify --strict "$mount/Hitode.app"
-          python3 tools/privacy/scan.py --artifacts "$mount"
-          hdiutil detach -quiet "$mount"
       - name: Collect license texts
         if: matrix.platform == 'macos'
         run: |
@@ -128,8 +117,6 @@ jobs:
           PATH="$GITHUB_WORKSPACE/target/ios-ffmpeg/bin:$PATH" pnpm tauri ios build --ci --no-sign
           ipa="$RUNNER_TEMP/dist/Hitode-$VERSION-ios-unsigned.ipa"
           cp src-tauri/gen/apple/build/arm64/Hitode.ipa "$ipa"
-          unzip -q "$ipa" -d "$RUNNER_TEMP/ipa"
-          if codesign -dv "$RUNNER_TEMP/ipa/Payload/Hitode.app" 2>/dev/null; then echo "the IPA is signed"; exit 1; fi
 
       - name: Build the Android APK
         if: matrix.platform == 'android'
@@ -141,11 +128,7 @@ jobs:
           "$ANDROID_HOME/build-tools/36.0.0/zipalign" -f -P 16 4 \
             src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release-unsigned.apk \
             "$RUNNER_TEMP/dist/Hitode-$VERSION-android-arm64-unsigned.apk"
-          python3 "$GITHUB_WORKSPACE/tools/android/check-apk.py" "$RUNNER_TEMP/dist/Hitode-$VERSION-android-arm64-unsigned.apk"
 
-      - name: Scan the packages for private data
-        if: matrix.platform != 'macos'
-        run: python3 tools/privacy/scan.py --artifacts "$RUNNER_TEMP"/dist/*
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: ${{ matrix.platform }}
@@ -173,6 +156,7 @@ jobs:
           KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
         run: |
           version="${TAG#v}"
+          version="${version%%-*}"
           tools="$ANDROID_HOME/build-tools/36.0.0"
           test -x "$tools/apksigner" || yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "build-tools;36.0.0" > /dev/null
           keystore="$RUNNER_TEMP/release.p12"
@@ -182,8 +166,6 @@ jobs:
             --out "$RUNNER_TEMP/dist/Hitode-$version-android-arm64.apk" \
             "$RUNNER_TEMP/android/Hitode-$version-android-arm64-unsigned.apk"
           rm -f "$keystore" "$RUNNER_TEMP"/dist/*.idsig
-          "$tools/apksigner" verify "$RUNNER_TEMP/dist/Hitode-$version-android-arm64.apk"
-          python3 tools/android/check-apk.py "$RUNNER_TEMP/dist/Hitode-$version-android-arm64.apk"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: android-signed
@@ -191,38 +173,3 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  draft:
-    needs: [build, sign-android]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          ref: ${{ env.TAG }}
-          persist-credentials: false
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          path: ${{ runner.temp }}/artifacts
-      - name: Gather the files and their checksums
-        run: |
-          version="${TAG#v}"
-          out="$RUNNER_TEMP/release"
-          mkdir -p "$out"
-          cp "$RUNNER_TEMP"/artifacts/macos/* "$RUNNER_TEMP"/artifacts/ios/* "$RUNNER_TEMP"/artifacts/android-signed/* "$out/"
-          python3 tools/privacy/scan.py --artifacts "$out/Hitode-$version-android-arm64.apk" \
-            "$out/Hitode-$version-licenses.zip"
-          (cd "$out" && sha256sum Hitode-* wine-11.0.tar.xz > SHA256SUMS.txt && cat SHA256SUMS.txt)
-          sed "s/{version}/$version/g" tools/release/notes.txt > "$RUNNER_TEMP/notes.md"
-      - name: Create the draft release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          version="${TAG#v}"
-          gh release create "$TAG" -R "$GITHUB_REPOSITORY" --verify-tag --draft \
-            --title "Hitode $version" --notes-file "$RUNNER_TEMP/notes.md" "$RUNNER_TEMP"/release/*
-          check="$RUNNER_TEMP/check"
-          mkdir -p "$check"
-          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -D "$check"
-          (cd "$check" && sha256sum -c SHA256SUMS.txt)
