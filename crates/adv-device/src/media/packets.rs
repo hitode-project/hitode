@@ -260,7 +260,7 @@ impl Decoder {
             CodecFormat::Audio { .. } => Kind::Audio {
                 decoder: decoder.audio()?,
                 converter: None,
-                clock: matches!(id, codec::Id::WMAV1 | codec::Id::WMAV2)
+                clock: matches!(id, codec::Id::WMAV1 | codec::Id::WMAV2 | codec::Id::WMAPRO)
                     .then(super::audio_clock::AudioClock::default),
             },
         };
