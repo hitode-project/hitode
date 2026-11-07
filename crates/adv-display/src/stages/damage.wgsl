@@ -62,6 +62,6 @@ fn canvas_position(position: vec2<f32>) -> vec2<f32> {
     if marked_count == 1u || strengths[selected] == 0. {
         selected = select(select(2u, 1u, h.y > 0.), 0u, h.x > 0.);
     }
-    let alpha = strengths[selected] * 0.5;
+    let alpha = strengths[selected] * select(0.5, 0.18, selected == 0u);
     return vec4(colors[selected] * alpha, alpha);
 }
