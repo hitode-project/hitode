@@ -287,6 +287,12 @@ fn update_surface(
         }
         let state = env.ext.get_mut::<State>();
         let gpu = state.gpu.as_mut().ok_or(UNAVAILABLE)?;
+        let rectangle = Rect {
+            x: point.x as u32,
+            y: point.y as u32,
+            w: from.w,
+            h: from.h,
+        };
         let (pixels, pitch) = format::snapshot(
             env.cpu,
             gpu,
@@ -294,6 +300,7 @@ fn update_surface(
             &mut state.upload_scratch,
             (source_format, address, pitch),
             (from.w, from.h),
+            format::covers(rectangle, &target.image),
         )
         .ok_or(INVALID)?;
         Ok((
@@ -307,12 +314,7 @@ fn update_surface(
                 target,
                 pixels,
                 pitch,
-                rectangle: Rect {
-                    x: point.x as u32,
-                    y: point.y as u32,
-                    w: from.w,
-                    h: from.h,
-                },
+                rectangle,
             },
         ))
     })();
@@ -460,7 +462,7 @@ fn color_fill(
             resource,
             level,
             target,
-            pixels: Pixels::Host(Arc::new(pixels), admission),
+            pixels: Pixels::Host(Arc::new(pixels), UploadKey::Admission(admission)),
             pitch: to.w * 4,
             rectangle: to,
         },

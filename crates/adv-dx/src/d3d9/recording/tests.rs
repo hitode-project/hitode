@@ -252,6 +252,9 @@ fn equal_full_clear_frames_skip_gpu_and_publication_but_complete_each_guest_fram
     clear(&mut f, 0xffabcdef);
     present(&mut f);
     assert_eq!(f.m.ext.get::<Presents>().published, [1, 5]);
+    // The first present has no previous presentation; the new full clear
+    // changes the whole surface by analysis.
+    assert_eq!(f.m.ext.get::<State>().frames.whole, [0, 1, 0, 1]);
     let back = f.image(f.back);
     assert_eq!(&f.pixels(&back)[..4], &[0xef, 0xcd, 0xab, 0xff]);
 }
@@ -292,7 +295,7 @@ fn render_target_readback_and_gpu_lock_flush_prior_draws() {
         resource,
         level: None,
         target,
-        pixels: Pixels::Host(Arc::new(vec![7; 16 * 12 * 4]), 1),
+        pixels: Pixels::Host(Arc::new(vec![7; 16 * 12 * 4]), UploadKey::Admission(1)),
         pitch: 64,
         rectangle: Rect {
             x: 0,
@@ -387,7 +390,7 @@ fn repeated_programmable_frame_keeps_captures_without_backend_packing() {
 
 // spec: GFX-REC-2
 #[test]
-fn overlay_without_clear_and_sampled_upload_versions_are_not_eliminated() {
+fn accumulating_overlays_and_changed_uploads_are_not_eliminated() {
     let mut f = fixture();
     for _ in 0..2 {
         let mut d = draw(&mut f);
@@ -401,10 +404,10 @@ fn overlay_without_clear_and_sampled_upload_versions_are_not_eliminated() {
     }
     assert_eq!(f.m.ext.get::<State>().frames.eliminated_frames, 0);
     let source = f.surface(16, 12, 21, 0);
-    for _ in 0..2 {
+    for byte in [128, 128, 129] {
         let locked = f.lock(source, 0, 0);
         f.m.cpu
-            .write(locked.pBits, &vec![128; 16 * 12 * 4])
+            .write(locked.pBits, &vec![byte; 16 * 12 * 4])
             .unwrap();
         f.okay("IDirect3DSurface9::UnlockRect", &[source]);
         clear(&mut f, 0xff000000);
@@ -414,8 +417,11 @@ fn overlay_without_clear_and_sampled_upload_versions_are_not_eliminated() {
         );
         present(&mut f);
     }
-    assert_eq!(f.m.ext.get::<State>().frames.eliminated_frames, 0);
+    assert_eq!(f.m.ext.get::<State>().frames.eliminated_frames, 1);
     assert_eq!(f.m.ext.get::<Presents>().published.len(), 4);
+    let frame = f.m.ext.get::<Presents>().latest.as_ref().unwrap().clone();
+    let pixels = frame.pixels(f.m.ext.get_mut::<State>().gpu.as_mut().unwrap());
+    assert_eq!(&pixels[..3], &[129; 3]);
 }
 
 // spec: GFX-REC-3
@@ -492,6 +498,7 @@ fn command_and_byte_limits_flush_complete_ordered_work_and_disable_partial_frame
     assert!(matches!(outcome, Outcome::Block { .. }));
     drop(pause);
     assert_eq!(f.finish(outcome), 0);
+    assert_eq!(f.m.ext.get::<State>().frames.submissions, 4096);
     let owner = id(&mut f);
     assert!(frame(&mut env(&mut f), owner).commands.is_empty());
     present(&mut f);

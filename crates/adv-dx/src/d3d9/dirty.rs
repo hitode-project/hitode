@@ -136,6 +136,7 @@ fn next(env: &mut Env<'_>, id: Id) -> Outcome {
         &mut state.upload_scratch,
         (format, address, pitch),
         (rectangle.w, rectangle.h),
+        format::covers(rectangle, &target.image),
     ) else {
         return Outcome::Return(INVALID);
     };

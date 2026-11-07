@@ -34,6 +34,9 @@ pub use adv_device::ui::{
     DialogControl, DialogEvent, DialogFont, DialogSet, DialogTarget, DialogWindow, InputView,
     MenuBar, MenuCommand, MenuEvent, MenuItem, MenuKey, PopupPresentation, WindowView,
 };
+pub use adv_dx::d3d9::{
+    FrameCounters as D3d9Counters, frame_counters as d3d9_counters, frame_trace as d3d9_frame,
+};
 pub use adv_dx::dsound::{AudioSourceStatus, PcmDigest};
 pub use graphics::{
     FrameConsumer, FrameProducer, FrameView, GraphicsStats, PendingFrame, Presenter, Snapshot,

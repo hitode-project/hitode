@@ -62,6 +62,55 @@ fn store() -> Store {
     Store::new(5, 4, 16, 65520, Snapshot::default()).unwrap()
 }
 
+// spec: HOST-VIEW-10
+#[cfg(feature = "gpu")]
+#[test]
+fn returning_from_software_to_native_publishes_whole_damage_once() {
+    use adv_device::{
+        frame::test_support::CapturePresenter,
+        gpu::Gpu,
+        surface::{Region, SurfaceStore},
+    };
+    let (device, queue) = adv_gpu::Device::open(&adv_gpu::queue::DeviceOptions {
+        software: !cfg!(any(target_vendor = "apple", target_os = "android")),
+        ..Default::default()
+    })
+    .unwrap();
+    let (presenter, frames) = CapturePresenter::new();
+    let mut gpu = Gpu::request_with_presenter(device, queue, Box::new(presenter)).unwrap();
+    let mut store = SurfaceStore::new(5, 4, 16, 65520, Default::default()).unwrap();
+    let mut memory = Memory::new(false);
+    let target = gpu.target(5, 4, false).unwrap();
+    gpu.clear(&target, Some([0.25, 0.5, 0.75, 1.]), None)
+        .unwrap();
+    let native = store.insert_native(target).unwrap();
+    let software = store
+        .create(5, 4, false, PixelFormat::Bgra32, &mut memory)
+        .unwrap();
+    let next = || {
+        frames
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+    };
+    store.present_native(native, None, &mut gpu).unwrap();
+    let original = next();
+    store
+        .present(software, &memory, store[software].rect())
+        .unwrap();
+    assert!(next().pixels.bgra != original.pixels.bgra);
+    let unchanged = Region::empty((5, 4));
+    store
+        .present_native(native, Some(unchanged.clone()), &mut gpu)
+        .unwrap();
+    let restored = next();
+    assert_eq!(restored.pixels.bgra, original.pixels.bgra);
+    assert!(restored.damage.is_whole());
+    store
+        .present_native(native, Some(unchanged), &mut gpu)
+        .unwrap();
+    assert!(next().damage.is_empty());
+}
+
 fn video_layer() -> VideoLayer {
     VideoLayer {
         frame: VideoFrame {

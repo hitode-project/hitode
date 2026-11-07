@@ -52,6 +52,16 @@ impl Plan {
         self.skipped.clear();
         self.clear_masks.clear();
     }
+    /// Keeps the effects of the commands a flush left unexecuted.
+    pub fn retain(&mut self, keep: &[bool]) {
+        let mut n = 0;
+        self.effects.retain(|_| {
+            n += 1;
+            keep[n - 1]
+        });
+        self.skipped.clear();
+        self.clear_masks.clear();
+    }
     pub fn skip(&self, n: usize) -> bool {
         self.skipped.get(n).copied().unwrap_or(false)
     }

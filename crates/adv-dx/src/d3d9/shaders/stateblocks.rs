@@ -1180,14 +1180,19 @@ mod tests {
         let output = GuestPtr::new(alloc(&mut env, 4).unwrap());
         assert_eq!(create(&mut env, GuestPtr::new(pointer), 1, output), 0);
         let this = GuestPtr::new(output.read(env.cpu).unwrap());
-        let render_items = block(&env, this.addr())
-            .unwrap()
-            .snapshot
-            .as_ref()
-            .unwrap()
-            .mask
-            .render
-            .len() as u64;
+        // The render class: render states, material and lights.
+        let render_items = {
+            let mask = &block(&env, this.addr())
+                .unwrap()
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .mask;
+            (mask.render.len()
+                + usize::from(mask.material)
+                + mask.lights.len()
+                + mask.light_enable.len()) as u64
+        };
         assert_eq!(capture(&mut env, this), 0);
         let Some(Payload::Device(d)) = com(&env).get_identity_mut(&mut env.sys.objects, id) else {
             panic!()
