@@ -4,7 +4,7 @@
 //! and the integer instructions between them that do not observe x87
 //! state or v24-v31: no instruction helper, segment access, MMX, SSE
 //! writing a vector register, or transfer other than a forward jcc, an
-//! inlined call or an inlined return, whose miss publishes the run. A
+//! inlined call. Returns publish the run before transferring control. A
 //! merge inside it is reached only from the run, by arrivals that agree on
 //! which slots hold values; there every value moves to the host register
 //! of its slot, values only some arrivals hold are fetched, and stale ones
@@ -427,7 +427,7 @@ impl Translator<'_> {
 
     /// Whether the integer instruction at `index` may sit inside a run:
     /// it does not observe x87 state or v24-v31, and leaves only through
-    /// a jcc out of the trace or the miss of an inlined return.
+    /// a jcc out of the trace.
     fn joins(&self, index: usize) -> bool {
         let inst = self.trace.insts[index];
         if inst.locked.is_some() {
@@ -438,7 +438,6 @@ impl Translator<'_> {
             Op::Push(src) => register(src),
             Op::Pop(_) | Op::Leave => true,
             Op::Call(_) => inst.mode == Mode::Plain,
-            Op::Ret(_) => matches!(inst.mode, Mode::Inline(_)),
             // SSE that writes no vector register keeps the SIMD cache clean,
             // as the run's sites and exits assume.
             Op::Simd(simd) => {
