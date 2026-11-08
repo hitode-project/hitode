@@ -105,6 +105,46 @@ fn invoke(machine: &mut Machine<JitCpu>, data: u32, name: &str, args: &[u32]) ->
     }
 }
 
+// spec: WIN32-GDI-12
+#[test]
+fn empty_glyph_reports_a_black_box_without_a_bitmap() {
+    let (mut machine, data, dc) = fixture();
+    let matrix = data + 64;
+    let buffer = data + 128;
+    machine.cpu.write_u32(matrix, 1 << 16).unwrap();
+    machine.cpu.write_u32(matrix + 12, 1 << 16).unwrap();
+    for name in ["GetGlyphOutlineA", "GetGlyphOutlineW"] {
+        let space = u32::from(b' ');
+        assert_eq!(
+            invoke(
+                &mut machine,
+                data,
+                name,
+                &[dc, space, 6, data, 0, 0, matrix]
+            ),
+            0
+        );
+        assert_eq!(machine.cpu.read_u32(data).unwrap(), 1);
+        assert_eq!(machine.cpu.read_u32(data + 4).unwrap(), 1);
+
+        machine.cpu.write(data, &[0xab; 20]).unwrap();
+        machine.cpu.write(buffer, &[0xcd; 4]).unwrap();
+        assert_eq!(
+            invoke(
+                &mut machine,
+                data,
+                name,
+                &[dc, space, 6, data, 4, buffer, matrix],
+            ),
+            GDI_ERROR
+        );
+        let mut metrics = [0; 20];
+        machine.cpu.read(data, &mut metrics).unwrap();
+        assert_eq!(metrics, [0xab; 20]);
+        assert_eq!(machine.cpu.read_u32(buffer).unwrap(), 0xcdcd_cdcd);
+    }
+}
+
 // spec: WIN32-GDI-10
 #[test]
 fn text_extent_rejects_short_readonly_and_overflowing_ranges_without_partial_size() {
