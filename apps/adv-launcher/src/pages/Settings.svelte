@@ -1,10 +1,11 @@
 <script lang="ts">
   import { t } from "../lib/i18n.svelte";
   import { device } from "../lib/device.svelte";
-  import { call, preview } from "../lib/bridge";
+  import { preview } from "../lib/bridge";
   import SettingsAccent from "../components/SettingsAccent.svelte";
   import UpscalingSelect from "../components/UpscalingSelect.svelte";
   import SettingsSeg from "../components/SettingsSeg.svelte";
+  import UpdateSettings from "../components/UpdateSettings.svelte";
   import SettingsSwitch from "../components/SettingsSwitch.svelte";
   import JitRow from "../components/JitRow.svelte";
   import { jit } from "../lib/jit.svelte";
@@ -15,21 +16,13 @@
 
   let contentsOpen = $state(false);
 
-  interface Update { current: string; latest: string | null; url: string }
-  let update = $state<"idle" | "checking" | "failed" | Update>("idle");
-  async function checkUpdate() {
-    update = "checking";
-    try {
-      update = (await call<Update | null>("check_update", {}, null)) ?? "failed";
-    } catch {
-      update = "failed";
-    }
-  }
 </script>
 
 <main class="scroll" style="flex: 1 1 0; min-height: 0; overflow: auto">
   <div class="page">
     <h1>{t("设置")}</h1>
+
+    <UpdateSettings />
 
     <section class="sec" aria-labelledby="g-look">
       <h2 id="g-look">{t("外观")}</h2>
@@ -228,23 +221,6 @@
           <p>{t("不含文件路径、用户名、截图和存档")}</p>
         </div>
       {/if}
-    </section>
-
-    <section class="sec" aria-labelledby="g-about">
-      <h2 id="g-about">{t("关于")}</h2>
-      <div class="row">
-        <span class="t two">
-          <span>{t("版本")} {device.version}</span>
-          <span class="meta" aria-live="polite">
-            {#if update === "checking"}{t("正在检查…")}
-            {:else if update === "failed"}{t("检查失败，请稍后再试")}
-            {:else if update !== "idle" && update.latest}{t("有新版本 {0}", update.latest)} · <a href={update.url} target="_blank" rel="noreferrer">{t("前往下载")}</a>
-            {:else if update !== "idle"}{t("已是最新版本")}
-            {/if}
-          </span>
-        </span>
-        <button class="quiet" onclick={checkUpdate} disabled={update === "checking"}>{t("检查更新")}</button>
-      </div>
     </section>
 
     <footer>hitode {device.version} · GPL-3.0-or-later</footer>

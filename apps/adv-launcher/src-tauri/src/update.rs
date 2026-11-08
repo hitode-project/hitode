@@ -1,4 +1,4 @@
-//! Update check against the latest GitHub release; it runs only when the user asks.
+//! Update check against the latest GitHub release.
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 

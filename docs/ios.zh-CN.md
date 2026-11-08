@@ -2,17 +2,26 @@
 
 读完这篇，你可以在 iPhone 或 iPad 上安装 Hitode，开启 JIT 加速，并导入自己的游戏。
 
-- **你需要准备**：一台电脑（Mac 或 Windows）、一个 Apple ID、一根数据线（只在第一次连接时用）。
-- **大约要花多久**：第一次大约 20 分钟；之后每周花 1 分钟续签。
-- **最后验证**：2026-10-19，iPhone XS / iOS 18.7。
-
 ## 支持的设备
 
-- 需要 iOS / iPadOS 18 或更新的版本。
-- 已实机验证：iPhone XS（iOS 18.7）。
-- iPad 和 iOS 26 以上的系统还没有实机测试，欢迎反馈。
+- 最低系统版本为 iOS / iPadOS 16.2，芯片要求 A12 或更新。
+- 已实机验证：iPhone XS（iOS 18.7）。iOS 16 和早期 iOS 17 的兼容路径尚未实机验证。iPad 和 iOS 26 以上的系统也还没有实机测试。
 
-## 安装
+## iOS / iPadOS 16.2 至 17.3.1
+
+这一段系统需要从外部工具启用 JIT。设置页的「JIT 加速」显示「已启用」后，再启动游戏。
+
+| 系统 | 开启 JIT |
+|---|---|
+| 16.2–16.6.1、16.7 RC（20H18）、17.0 | 已装 [TrollStore 2.0.12 或更新版本](https://github.com/opa334/TrollStore/releases/tag/2.0.12) 的设备：导入 Hitode 的 TrollStore 包，在 TrollStore 的应用列表中点按 Hitode，选择 **Open with JIT**。每次彻底退出 Hitode 后都要这样启动。 |
+| 16.x 其余版本 | 用开发签名安装，按 [SideStore JIT 指南](https://docs.sidestore.io/docs/advanced/jit/) 配对后，在 SideStore 里选择 **Enable JIT**。 |
+| 17.0.1–17.3.1 | 用开发签名安装，由电脑上的 [SideJITServer](https://github.com/nythepegasus/SideJITServer) 启用 JIT。也可以通过 [LiveContainer](https://livecontainer.github.io/docs/guides/jit-support/) 调用该服务。 |
+
+如果[发布页](https://github.com/hitode-project/hitode/releases/latest)提供 `Hitode-<版本号>-ios-trollstore.ipa`，下载这个包。也可以按[构建文档](building.md#ios-launcher)在本地构建。该路径无需给 Hitode 导入配对文件，也无需 LocalDevVPN。
+
+## 安装（iOS / iPadOS 17.4 及以上）
+
+下文的自签流程需要一台电脑（Mac 或 Windows）、一个 Apple ID 和一根数据线（只在首次连接时用）。第一次大约需要 20 分钟，之后每周花约 1 分钟续签。
 
 > **必须用开发签名安装。**
 > 用免费 Apple ID 自签（下述方法）或用付费开发者账号自签均可。ad-hoc、企业签、"超级签"、TestFlight 等分发签名能安装，但无法开启 JIT，游戏无法正常游玩。
@@ -20,7 +29,7 @@
 <details>
 <summary>为什么必须用开发签名？</summary>
 
-JIT 需要调试器临时附加到 Hitode 上，而只有开发签名才带这个权限（`get-task-allow`）。各种分发签名都没有此权限。第三方签名服务基本都是分发签名，企业证书有被随时吊销的风险，笔者不建议使用。
+JIT 需要调试器临时附加到 Hitode 上。在这条自签安装路径中，由开发签名提供这个权限（`get-task-allow`）。各种分发签名都没有此权限。第三方签名服务基本都是分发签名，企业证书有被随时吊销的风险，笔者不建议使用。
 
 </details>
 

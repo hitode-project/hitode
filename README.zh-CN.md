@@ -65,7 +65,7 @@ Hitode 不针对某个游戏或引擎做适配，而是实现 32 位 Windows 视
 |---|---|---|
 | macOS（Apple 芯片） | 支持 | |
 | Android（ARMv8-A，64 位） | 支持 | |
-| iOS / iPadOS | 支持 | iPad 尚未实机测试。需自签安装；请用 LocalDevVPN 等工具启用 JIT，否则性能可能不足以游玩。安装方法见 [iOS 教程](docs/ios.zh-CN.md) |
+| iOS / iPadOS | 支持 | 最低目标为 iOS / iPadOS 16.2、A12 芯片。安装和开启 JIT 的方式取决于系统版本。安装方法见 [iOS 教程](docs/ios.zh-CN.md) |
 
 ## 下载
 

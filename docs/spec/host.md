@@ -295,7 +295,7 @@ Android MUST request cadence through runtime-resolved `ASurfaceTransaction_setFr
 
 ### HOST-UPDATE-1 Update check
 
-**Rule**: The launcher MUST check for updates only on request from phone or sidebar Settings, both showing the installed version. The check MUST read only the latest hitode-project release and compare its numeric version. External links MUST open only VNDB and hitode-project pages.
+**Rule**: The launcher MUST offer manual checks in Settings and check at most once per day in the foreground library when automatic checks are enabled. The check MUST read only the latest hitode-project release and compare its numeric version. External links MUST open only VNDB and hitode-project pages.
 **Applies to**: Launcher
 **Verification**: Test
 

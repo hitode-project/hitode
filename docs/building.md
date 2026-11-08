@@ -155,7 +155,7 @@ python3 tools/macos/package_launcher.py android --install   # build and install 
 
 - Name one or more of `mac`, `ios` and `android`, or `all`. Packages land in `target/package/<platform>/`: an ad hoc signed `Hitode.app`, a development signed `Hitode.ipa`, and an aligned `Hitode.apk` signed with the SDK debug key.
 - Every input is checked before compiling. Unset `ADV_WINE_DIST` downloads the pinned Wine build into `target/wine` once. The tool refreshes the `build.py` wrapper for each platform so it carries Wine, sets `LIBCLANG_PATH`, uses `sccache` when installed and installs the launcher packages when missing.
-- Android finds JDK 21, the SDK and the NDK the Gradle project names, from `JAVA_HOME`, `ANDROID_HOME` and `NDK_HOME` or their Homebrew locations. iOS needs `APPLE_DEVELOPMENT_TEAM`.
+- Android finds JDK 21, the SDK and the NDK the Gradle project names, from `JAVA_HOME`, `ANDROID_HOME` and `NDK_HOME` or their Homebrew locations. A development-signed iOS package needs `APPLE_DEVELOPMENT_TEAM`.
 - `--install` uses the only connected device of each platform; `--install DEVICE` names it for one mobile platform.
 - A debug-signed APK cannot update a release-signed install. `--side-by-side NAME` suffixes the application ID with `NAME`, so the APK installs as a separate app beside the release.
 - `-- COMMAND` with one platform prepares the same environment and runs `COMMAND` in `apps/adv-launcher` instead of the standard build.
@@ -220,6 +220,8 @@ APPLE_DEVELOPMENT_TEAM=<team> python3 tools/macos/package_launcher.py ios
 - The IPA is `src-tauri/gen/apple/build/arm64/Hitode.ipa`. Install it with `xcrun devicectl device install app --device <udid> <ipa>`.
 - Select game folders through Files to read them at their original locations, including outside the app's container. Directory access is restored from bookmarks after relaunch, and cloud files are downloaded before discovery and game launch. Games already in Documents through Finder or `devicectl device copy to --domain-type appDataContainer` are also read in place. Saves and registry stay in the app's private data directory.
 - The AppIcon images are not committed. `python3 apps/adv-launcher/scripts/icons.py` writes them to `src-tauri/icons/ios/`; the Xcode build copies them into `gen/apple/Assets.xcassets/AppIcon.appiconset/` and fails when they are missing.
+
+For TrollStore, install `ldid` (for example with `brew install ldid`) and run `python3 tools/macos/package_launcher.py ios --trollstore`. This writes `target/package/ios/Hitode-TrollStore.ipa` with `get-task-allow` on the main executable and needs no Apple signing team. Install and launch it with JIT from TrollStore.
 
 ## Local output
 
