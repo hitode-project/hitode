@@ -133,8 +133,8 @@ pub struct Counters {
     pub clipped_executions: u64,
     pub clipped_area_sum: f64,
     /// Presents that changed the whole surface, by cause: a flush that
-    /// changed contents outside the analysis, a different presentation, a
-    /// COPY swap, and the analysis itself (a whole change).
+    /// changed contents outside the analysis, a new presentation, a whole
+    /// COPY publication, and the analysis itself (a whole change).
     pub whole: [u64; 4],
     /// Final chains planned whole because a late demand reached writes
     /// already planned.
@@ -213,6 +213,7 @@ pub(super) struct Recording {
     next: u64,
     partial: bool,
     last: Option<u128>,
+    last_copy: Option<(u32, presentation::Copy)>,
     last_serial: Option<u64>,
     verdict: Option<bool>,
     presented: Option<(Completion, Option<u64>)>,
@@ -495,8 +496,8 @@ fn append(
     if lost {
         return Outcome::Return(0);
     }
-    trace::command(index, p, shared.is_some());
     let f = frame(env, owner);
+    trace::command(index, p, shared.is_some(), &f.contents);
     let previous = limit.then(|| {
         (
             f.key,
@@ -513,10 +514,10 @@ fn append(
             .map(|(k, _)| f.contents.get(k).copied())
             .collect()
     });
-    let (command, damage) = if let Some(saved) = shared {
+    let (command, attachment, damage) = if let Some(saved) = shared {
         let slot = hash(target.as_ref().unwrap().image.id());
-        f.damage.replay(&saved.damage, slot);
-        (saved.command, saved.damage.clone())
+        f.damage.replay(&saved.damage, slot, &f.contents);
+        (saved.command, saved.attachment, saved.damage.clone())
     } else {
         use std::hash::Hash;
         let mut command = xxhash_rust::xxh3::Xxh3::new();
@@ -526,18 +527,21 @@ fn append(
             (*k, f.contents.get(k).copied().unwrap_or(0)).hash(&mut command);
         }
         let command = command.digest128();
+        let attachment = p.attachment_command(command, &f.contents);
         (
             command,
+            attachment,
             f.damage.record(
                 p,
                 command,
+                attachment,
                 &f.contents,
                 target.as_ref().map(|t| hash(t.image.id())),
             ),
         )
     };
     for &(k, overwrite) in &p.writes {
-        let command = p.write_key(k, command);
+        let command = p.write_key(k, if k.2 == 0 { command } else { attachment });
         let slot = f.contents.resolve(k);
         let old = f.contents.slots[slot].1.unwrap_or(0);
         if f.contents.slots[slot].2.is_none() {
@@ -602,6 +606,7 @@ fn append(
         if let (Some(entry), Some(destinations)) = (entry, destinations) {
             let _ = entry.saved.set(reuse::Saved {
                 command,
+                attachment,
                 damage,
                 pass,
                 destinations,
@@ -892,7 +897,9 @@ fn submitted(
         h: image.height(),
     });
     let area = match operation {
-        Operation::Clear { rectangle, .. } => area.clipped(*rectangle),
+        Operation::Clear { rectangle, .. } | Operation::Upload { rectangle, .. } => {
+            area.clipped(*rectangle)
+        }
         Operation::Copy { region, .. } => area.clipped(*region),
         _ => area,
     };
@@ -1013,6 +1020,7 @@ pub(super) fn cancel(env: &mut Env<'_>, operation: &Operation) {
             f.partial = true;
             f.passes.truncate(f.commands.len());
             f.last = None;
+            f.last_copy = None;
             f.forget_damage();
             f.select = None;
             f.rotate = false;
@@ -1069,6 +1077,7 @@ pub(super) fn present(env: &mut Env<'_>, operation: &Operation) -> Result<Comple
         .check()?;
     enter(env, *owner, *token, Reason::Present)?;
     let presentation = hash((surface, copy.map(|(_, c)| c.key())));
+    let copy_baseline = copy.map(|(_, copy)| (*surface, copy));
     let verify = env.ext.get::<State>().verify_frames;
     let serial = (env.ext.get::<State>().provider.presentation_serial)(env.ext);
     let f = frame(env, *owner);
@@ -1083,7 +1092,14 @@ pub(super) fn present(env: &mut Env<'_>, operation: &Operation) -> Result<Comple
         let provider = env.ext.get::<State>().provider;
         let serial = (provider.repeat)(env.ext, *surface)?;
         env.ext.get_mut::<State>().frames.eliminated_frames += 1;
-        finish(env, *owner, *token, presentation, Some(serial));
+        finish(
+            env,
+            *owner,
+            *token,
+            presentation,
+            copy_baseline,
+            Some(serial),
+        );
         return Ok(Completion::Presented(serial, *deadline));
     }
     if !frame(env, *owner).damage.planned {
@@ -1096,8 +1112,9 @@ pub(super) fn present(env: &mut Env<'_>, operation: &Operation) -> Result<Comple
         } else {
             0
         };
-        let promotions = f.damage.plan(force);
-        f.rotate = !force && !f.partial && f.damage.rotatable(hash(image.id()));
+        let slot = hash(image.id());
+        let promotions = f.damage.plan(force, slot);
+        f.rotate = !force && !f.partial && f.damage.rotatable(slot);
         if verify && copy.is_none() {
             f.verify_image = Some(image.clone());
         }
@@ -1107,15 +1124,24 @@ pub(super) fn present(env: &mut Env<'_>, operation: &Operation) -> Result<Comple
             w: image.width(),
             h: image.height(),
         };
-        let slot = hash(image.id());
         f.output_slot = Some(slot);
         let size = (full.w, full.h);
-        f.verify_region = Some(if force || copy.is_some() {
+        let delta = f.damage.changed.get(&slot);
+        f.verify_region = Some(if let Some((_, copy)) = copy {
+            // The private front survives intervening publications. The surface
+            // provider accounts separately for a change of published source.
+            copy.damage(
+                f.last_copy.map(|(_, copy)| copy),
+                delta,
+                !force
+                    && !f.partial
+                    && delta.is_some()
+                    && f.last_copy.is_some_and(|(old, _)| old == *surface),
+            )
+        } else if force {
             adv_device::surface::Region::whole(size)
         } else {
-            f.damage
-                .changed
-                .get(&slot)
+            delta
                 .cloned()
                 .unwrap_or_else(|| adv_device::surface::Region::empty(size))
         });
@@ -1128,10 +1154,14 @@ pub(super) fn present(env: &mut Env<'_>, operation: &Operation) -> Result<Comple
         );
         let whole = if force {
             Some(1)
-        } else if copy.is_some() {
-            Some(2)
         } else if f.verify_region.as_ref().is_some_and(|r| r.is_whole()) {
-            Some(if f.partial { 0 } else { 3 })
+            Some(if f.partial {
+                0
+            } else if copy.is_some() {
+                2
+            } else {
+                3
+            })
         } else {
             None
         };
@@ -1180,10 +1210,17 @@ pub(super) fn present(env: &mut Env<'_>, operation: &Operation) -> Result<Comple
         verify_pixels(env, *owner, *surface, copy.is_some(), repeat)?;
     }
     let (completion, serial) = frame(env, *owner).presented.take().unwrap();
-    finish(env, *owner, *token, presentation, serial);
+    finish(env, *owner, *token, presentation, copy_baseline, serial);
     Ok(completion)
 }
-fn finish(env: &mut Env<'_>, owner: Id, token: u64, presentation: u128, serial: Option<u64>) {
+fn finish(
+    env: &mut Env<'_>,
+    owner: Id,
+    token: u64,
+    presentation: u128,
+    copy: Option<(u32, presentation::Copy)>,
+    serial: Option<u64>,
+) {
     let f = frame(env, owner);
     let delta = f.output_slot.and_then(|s| f.damage.changed.get(&s));
     let changed = delta.map_or(0, damage::area);
@@ -1211,6 +1248,7 @@ fn finish(env: &mut Env<'_>, owner: Id, token: u64, presentation: u128, serial: 
     f.output_slot = None;
     f.executed.clear();
     f.last = Some(presentation);
+    f.last_copy = copy;
     f.last_serial = serial;
     f.contents.reset();
     f.key = 0;

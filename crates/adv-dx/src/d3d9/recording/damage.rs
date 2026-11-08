@@ -1,10 +1,11 @@
-//! Recording-time sequence realignment and conservative eight-frame slot damage.
+//! Ordered write comparison, forward damage and reverse execution demand.
 use super::*;
 use adv_device::{
     gpu::{AttributeFormat, Image},
     surface::{Rect, Region, rects},
 };
 use rustc_hash::FxHashSet as HashSet;
+mod forward;
 pub(super) mod sampling;
 mod schedule;
 
@@ -29,9 +30,8 @@ fn size(r: Rect) -> (u32, u32) {
 }
 pub(super) fn bounds(env: &Env<'_>, device: &Device, operation: &Operation) -> Rect {
     match operation {
-        Operation::Clear { rectangle, .. } => *rectangle,
+        Operation::Clear { rectangle, .. } | Operation::Upload { rectangle, .. } => *rectangle,
         Operation::Copy { region, .. } => *region,
-        Operation::Upload { target, .. } => full(&target.image),
         Operation::Draw(d) => draw_bounds(env, device, d).unwrap_or_else(|| full(&d.target.image)),
         _ => Rect::default(),
     }
@@ -177,73 +177,55 @@ pub(in crate::d3d9) fn vertex_input(
 #[derive(Default)]
 struct Samples {
     base: u128,
-    reads: Vec<(sampling::Read, u128)>,
+    reads: Vec<Sample>,
 }
-/// For each of an entry's sampled reads, the generation of its source this
-/// frame had written when the read was recorded.
-type Generations = Vec<Option<usize>>;
-/// Each generation's change this frame, and the previous frame's generation
-/// it was compared with.
-type Changes = HashMap<(Content, usize), (Region, Option<usize>)>;
-impl Samples {
-    /// Each changed source region maps through the proven sampling, rectangle
-    /// by rectangle, into `damage`. A read of another generation than the
-    /// one its previous frame's read compares with is unknown.
-    fn changed(
-        &self,
-        gens: &Generations,
-        old: &Self,
-        old_gens: &Generations,
-        changes: &Changes,
-        bounds: Rect,
-        damage: &mut Region,
-    ) -> Option<()> {
-        if self.base != old.base || self.reads.len() != old.reads.len() {
-            return None;
-        }
-        let mut local = Region::empty(damage.size());
-        for (n, ((read, version), (previous, before))) in
-            self.reads.iter().zip(&old.reads).enumerate()
-        {
-            if read != previous {
-                return None;
-            }
-            if version != before {
-                let (Some(generation), Some(old)) =
-                    (gens.get(n).copied()?, old_gens.get(n).copied()?)
-                else {
-                    return None;
-                };
-                let (region, matched) = changes.get(&(read.source, generation))?;
-                if *matched != Some(old) {
-                    return None;
-                }
-                for r in rects(region) {
-                    local.add(read.mapping.map(r, bounds).into());
-                }
-            }
-        }
-        damage.union(&local);
-        Some(())
-    }
+struct Sample {
+    source: Content,
+    mappings: Vec<sampling::Mapping>,
+    version: u128,
 }
+/// The generation and number of writes visible to a read.
+#[derive(Clone, Copy)]
+struct Prefix {
+    forward: usize,
+    len: usize,
+}
+
+#[derive(Clone, Copy)]
+struct Match {
+    index: usize,
+    inputs: bool,
+}
+
+#[derive(Clone, Copy)]
+struct Generation {
+    index: usize,
+    forward: usize,
+}
+
+struct Observed {
+    samples: Arc<Samples>,
+    prefixes: Vec<Option<Prefix>>,
+}
+
 /// One generation of a content: its writes from a proven overwrite (or the
 /// frame start) up to the next.
 #[derive(Default)]
 struct Sequence {
     entries: Vec<(u128, Rect)>,
-    samples: HashMap<usize, Arc<Samples>>,
-    gens: HashMap<usize, Generations>,
+    observed: Vec<Option<Observed>>,
+    forward: usize,
     index: HashMap<u128, Vec<usize>>,
+    sampled_index: HashMap<u128, Vec<usize>>,
     cursor: usize,
-    damage: Region,
-    pending: Vec<(usize, usize)>,
-    last_write: u64,
+    matches: Vec<Option<Match>>,
+    different: bool,
     full: Rect,
     view: Rect,
     shape: u128,
     slot: u128,
     independent: bool,
+    initial: u128,
 }
 static EMPTY: std::sync::LazyLock<Sequence> = std::sync::LazyLock::new(Sequence::default);
 #[derive(Default)]
@@ -285,7 +267,13 @@ impl History {
         self.matched.push(found);
         self.next.push(Sequence::default());
     }
-    fn record(&mut self, key: u128, bounds: Rect, samples: Arc<Samples>, gens: Generations) {
+    fn record(
+        &mut self,
+        key: u128,
+        bounds: Rect,
+        samples: Arc<Samples>,
+        prefixes: Vec<Option<Prefix>>,
+    ) {
         let previous = self
             .matched
             .last()
@@ -294,99 +282,45 @@ impl History {
             .map_or(&*EMPTY, |m| &self.previous[m]);
         let s = self.next.last_mut().unwrap();
         let at = s.entries.len();
-        if at == 0 {
-            s.damage = Region::empty(size(s.full));
-        }
-        let old = previous.index.get(&key).and_then(|positions| {
+        let candidate = |positions: &Vec<usize>| {
             let first = positions.partition_point(|&n| n < s.cursor);
             positions[first..]
                 .iter()
                 .copied()
                 .find(|&n| previous.entries[n].1 == bounds)
-        });
-        if let Some(old) = old {
-            for &(_, r) in &previous.entries[s.cursor..old] {
-                s.damage.add(r.into());
-            }
-            s.cursor = old + 1;
-            if let Some(samples) = previous.samples.get(&old) {
-                s.samples.insert(at, samples.clone());
-                s.gens.insert(at, previous.gens[&old].clone());
-            }
-        } else {
-            let sampled = (!samples.reads.is_empty())
-                .then(|| {
-                    previous
-                        .samples
-                        .iter()
-                        .filter_map(|(&n, old)| {
-                            (n >= s.cursor
-                                && previous.entries[n].1 == bounds
-                                && old.base == samples.base)
-                                .then_some(n)
-                        })
-                        .min()
-                })
-                .flatten();
-            if let Some(old) = sampled {
-                for &(_, r) in &previous.entries[s.cursor..old] {
-                    s.damage.add(r.into());
+        };
+        let exact = previous.index.get(&key).and_then(candidate);
+        let matched = exact
+            .map(|index| Match {
+                index,
+                inputs: false,
+            })
+            .or_else(|| {
+                if samples.reads.is_empty() {
+                    return None;
                 }
-                s.pending.push((old, at));
-                s.cursor = old + 1;
-            } else {
-                s.damage.add(bounds.into());
-            }
-            if !samples.reads.is_empty() {
-                s.samples.insert(at, samples);
-                s.gens.insert(at, gens);
-            }
+                previous
+                    .sampled_index
+                    .get(&samples.base)
+                    .and_then(candidate)
+                    .map(|index| Match {
+                        index,
+                        inputs: true,
+                    })
+            });
+        s.different |= exact != Some(s.cursor);
+        if let Some(matched) = matched {
+            s.cursor = matched.index + 1;
+        }
+        s.matches.push(matched);
+        if !samples.reads.is_empty() {
+            s.sampled_index.entry(samples.base).or_default().push(at);
+            s.observed.push(Some(Observed { samples, prefixes }));
+        } else {
+            s.observed.push(None);
         }
         s.index.entry(key).or_default().push(at);
         s.entries.push((key, bounds));
-    }
-    /// What generation `g` changed against the previous generation it
-    /// compares with, or everything when it compares with none.
-    fn changed(&self, g: usize, force: bool, changes: &Changes) -> Region {
-        let next = &self.next[g];
-        let size = size(next.full);
-        let previous = match self.matched[g] {
-            Some(m) if !force && self.serial != 0 => &self.previous[m],
-            _ => return Region::whole(size),
-        };
-        if previous.shape != next.shape {
-            return Region::whole(size);
-        }
-        let mut changed = next.damage.clone();
-        for &(_, bounds) in &previous.entries[next.cursor..] {
-            changed.add(bounds.into());
-        }
-        for &(old, new) in &next.pending {
-            let (_, bounds) = next.entries[new];
-            if next.samples[&new]
-                .changed(
-                    &next.gens[&new],
-                    &previous.samples[&old],
-                    &previous.gens[&old],
-                    changes,
-                    bounds,
-                    &mut changed,
-                )
-                .is_none()
-            {
-                changed.add(bounds.into());
-            }
-        }
-        // Appending to the previous frame's only, hence final, version
-        // changes no more than this frame's writes either.
-        if !next.independent && self.previous.len() == 1 {
-            let mut written = Region::empty(size);
-            for &(_, bounds) in &next.entries {
-                written.add(bounds.into());
-            }
-            changed.intersect(&written);
-        }
-        changed
     }
     /// After every generation's change: what the final version changed since
     /// the previous frame's, and what its slot must redraw.
@@ -409,6 +343,17 @@ impl History {
         self.previous = std::mem::take(&mut self.next);
         self.matched.clear();
         (changed, redraw)
+    }
+
+    fn retains_start(&self) -> bool {
+        let next = &self.next[0];
+        self.next.len() == 1
+            && !next.independent
+            && self
+                .previous
+                .last()
+                .is_some_and(|old| old.shape == next.shape)
+            && self.stale.get(&next.slot).is_some_and(Region::is_empty)
     }
 }
 type Write = (Content, u128, Rect, Rect, u128, bool, Arc<Samples>);
@@ -466,7 +411,7 @@ pub(super) struct Analysis {
     pub work: HashMap<(Content, usize, u128), Work>,
     pub planned: bool,
     epoch: u64,
-    ordinal: u64,
+    forward_len: usize,
 }
 impl Analysis {
     pub fn written(&self, content: &Content) -> bool {
@@ -478,6 +423,7 @@ impl Analysis {
         &mut self,
         p: &key::Prepared,
         command: u128,
+        attachment: u128,
         contents: &Contents,
         slot: Option<u128>,
     ) -> Arc<Record> {
@@ -547,40 +493,38 @@ impl Analysis {
                 (overwrite && bounds == full) || current.is_some_and(|s| s.independent);
             // Only drawing can depend on the old values inside its write bounds.
             // Clears and copies overwrite that region even when the attachment is larger.
+            let retained = (matches!(p.operation, Operation::Draw(_)) && !independent)
+                .then(|| contents.get(&k).copied().unwrap_or(0));
             let key = hash((
-                p.write_key(k, command),
-                (matches!(p.operation, Operation::Draw(_)) && !independent)
-                    .then(|| contents.get(&k).copied().unwrap_or(0)),
+                p.write_key(k, if k.2 == 0 { command } else { attachment }),
+                retained,
             ));
-            let samples = if p.samples.is_empty() {
-                Samples::default()
-            } else {
-                let external: Vec<_> = p
+            let ignores_color = p.ignores_sampled_color(k);
+            let sampled = |source: &&Content| source.2 != 0 || !ignores_color;
+            let samples = Samples {
+                base: hash((p.key, retained)),
+                reads: p
                     .reads
                     .iter()
-                    .filter(|k| !p.samples.iter().any(|r| r.source == **k))
-                    .map(|k| (*k, contents.get(k).copied().unwrap_or(0)))
-                    .collect();
-                Samples {
-                    base: hash((
-                        p.key,
-                        external,
-                        (matches!(p.operation, Operation::Draw(_)) && !independent)
-                            .then(|| contents.get(&k).copied().unwrap_or(0)),
-                    )),
-                    reads: p
-                        .samples
-                        .iter()
-                        .map(|r| (*r, contents.get(&r.source).copied().unwrap_or(0)))
-                        .collect(),
-                }
+                    .filter(sampled)
+                    .map(|&source| Sample {
+                        source,
+                        mappings: p
+                            .samples
+                            .iter()
+                            .filter(|r| r.source == source)
+                            .map(|r| r.mapping)
+                            .collect(),
+                        version: contents.get(&source).copied().unwrap_or(0),
+                    })
+                    .collect(),
             };
             record
                 .writes
                 .push((k, key, bounds, full, shape, overwrite, Arc::new(samples)));
         }
         let record = Arc::new(record);
-        self.replay(&record, slot);
+        self.replay(&record, slot, contents);
         record
     }
     pub fn independent(&self, k: &Content) -> bool {
@@ -589,8 +533,7 @@ impl Analysis {
             .and_then(History::current)
             .is_some_and(|s| s.independent)
     }
-    pub fn replay(&mut self, record: &Arc<Record>, slot: u128) {
-        self.ordinal += 1;
+    pub fn replay(&mut self, record: &Arc<Record>, slot: u128, contents: &Contents) {
         let at = self.nodes.len();
         let producers = record
             .demands
@@ -610,17 +553,26 @@ impl Analysis {
             generations: Vec::new(),
             submissions: 0,
         });
-        for &(k, key, bounds, full, shape, overwrite, ref samples) in &record.writes {
-            // Which generation of each sampled source the read meets.
-            let gens = samples
+        // Reads of all aspects precede this command's writes, including a
+        // color write that also updates the depth or stencil it tests.
+        let mut prefixes = [const { Vec::new() }; 3];
+        for (write, prefixes) in record.writes.iter().zip(&mut prefixes) {
+            *prefixes = write
+                .6
                 .reads
                 .iter()
-                .map(|(r, _)| {
-                    self.histories
-                        .get(&r.source)
-                        .and_then(|h| h.next.len().checked_sub(1))
+                .map(|r| {
+                    let h = self.histories.get(&r.source)?;
+                    Some(Prefix {
+                        forward: h.next.last()?.forward,
+                        len: h.next.last()?.entries.len(),
+                    })
                 })
                 .collect();
+        }
+        for (&(k, key, bounds, full, shape, overwrite, ref samples), prefixes) in
+            record.writes.iter().zip(prefixes)
+        {
             let history = self.histories.entry(k).or_default();
             let fresh = overwrite && bounds == full;
             if fresh || history.next.is_empty() {
@@ -628,54 +580,56 @@ impl Analysis {
             }
             let s = history.next.last_mut().unwrap();
             s.full = full;
-            s.last_write = self.ordinal;
             s.view = record.view;
             s.shape = shape;
             s.slot = slot;
             if s.entries.is_empty() {
+                s.forward = self.forward_len;
+                self.forward_len += 1;
                 s.independent = fresh;
+                if !fresh {
+                    s.initial = contents.get(&k).copied().unwrap_or(0);
+                }
             }
-            history.record(key, bounds, samples.clone(), gens);
+            let forward = s.forward;
+            history.record(key, bounds, samples.clone(), prefixes);
             let generation = history.next.len() - 1;
-            self.nodes[at].generations.push(generation);
-            self.work
-                .entry((k, generation, slot))
-                .or_insert_with(|| Work {
-                    changed: Region::whole(size(full)),
-                    executed: Region::empty(size(full)),
-                    ..Default::default()
-                });
+            self.nodes[at].generations.push(Generation {
+                index: generation,
+                forward,
+            });
+            if trace::capturing() {
+                self.work
+                    .entry((k, generation, slot))
+                    .or_insert_with(|| Work {
+                        changed: Region::whole(size(full)),
+                        executed: Region::empty(size(full)),
+                        ..Default::default()
+                    });
+            }
         }
     }
     /// Plans the frame; returns whole-chain promotions for intermediate
     /// external reads and late demands, respectively.
-    pub fn plan(&mut self, force: bool) -> [u64; 2] {
+    pub fn plan(&mut self, force: bool, output: u128) -> [u64; 2] {
         if self.planned {
             return [0; 2];
         }
         self.epoch += 1;
-        // Generations in the order their last writes ran, so each read meets
-        // its source's change already known.
-        let mut order: Vec<_> = self
-            .histories
-            .iter()
-            .flat_map(|(k, h)| {
-                h.next
-                    .iter()
-                    .enumerate()
-                    .map(|(g, s)| (*k, g, s.last_write))
-            })
-            .collect();
-        order.sort_unstable_by_key(|&(_, _, last)| last);
-        let mut changes = Changes::default();
-        for (content, g, _) in order {
-            let h = &self.histories[&content];
-            let changed = h.changed(g, force || h.seen + 1 != self.epoch, &changes);
-            changes.insert((content, g), (changed, h.matched[g]));
-        }
+        let mut changes = forward::changes(
+            &self.histories,
+            &self.nodes,
+            self.forward_len,
+            self.epoch,
+            force,
+        );
         for ((content, generation, _), work) in &mut self.work {
-            if let Some((changed, _)) = changes.get(&(*content, *generation)) {
-                work.changed = changed.clone();
+            if let Some(s) = self
+                .histories
+                .get(content)
+                .and_then(|h| h.next.get(*generation))
+            {
+                work.changed = changes[s.forward].as_ref().unwrap().clone();
             }
         }
         let mut stale = HashMap::default();
@@ -684,9 +638,9 @@ impl Analysis {
                 continue;
             }
             let last = h.next.len() - 1;
-            let force = force || h.seen + 1 != self.epoch;
+            let force = force || (h.seen + 1 != self.epoch && !h.retains_start());
             let slot = h.next[last].slot;
-            let (changed, redraw) = h.settle(force, changes[&(*content, last)].0.clone());
+            let (changed, redraw) = h.settle(force, changes[h.next[last].forward].take().unwrap());
             h.seen = self.epoch;
             if content.2 == 0 {
                 self.changed
@@ -698,7 +652,11 @@ impl Analysis {
         }
         let (clips, promotions) = schedule::schedule(&self.nodes, &self.done, &stale);
         self.clips = clips;
+        let diagnose = trace::capturing();
         for (i, node) in self.nodes.iter().enumerate() {
+            if node.slot != output && !diagnose {
+                continue;
+            }
             let view = node.record.view;
             let r = self
                 .execution
@@ -715,6 +673,7 @@ impl Analysis {
                         r.add(p.into());
                     }
                 }
+                _ if node.record.upload => r.add(node.record.bounds.into()),
                 _ => *r = Region::whole(r.size()),
             }
         }
@@ -730,11 +689,16 @@ impl Analysis {
         let node = &mut self.nodes[n];
         let repeated = node.submissions != 0;
         node.submissions += 1;
+        if self.work.is_empty() {
+            return repeated;
+        }
         for (w, &generation) in node.record.writes.iter().zip(&node.generations) {
             if aspects & (1 << w.0.2) == 0 {
                 continue;
             }
-            let work = self.work.get_mut(&(w.0, generation, node.slot)).unwrap();
+            let Some(work) = self.work.get_mut(&(w.0, generation.index, node.slot)) else {
+                continue;
+            };
             work.executed.add(rect.into());
             work.submissions += 1;
             work.vertices += vertices;
@@ -774,8 +738,7 @@ impl Analysis {
             && h.seen == self.epoch
             && h.previous[m].shape == s.shape
             && s.cursor == h.previous[m].entries.len()
-            && s.pending.is_empty()
-            && s.damage.is_empty()
+            && !s.different
             && h.stale.get(&s.slot).is_some_and(Region::is_empty)
             && !self.done.iter().any(|(_, k)| k == content)
     }
@@ -851,7 +814,7 @@ impl Analysis {
             h.next.clear();
             h.matched.clear();
         }
-        self.ordinal = 0;
+        self.forward_len = 0;
         self.clips.clear();
         self.changed.clear();
         self.nodes.clear();

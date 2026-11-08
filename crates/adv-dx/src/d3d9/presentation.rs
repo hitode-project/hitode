@@ -1,6 +1,6 @@
 //! COPY presentation composes rectangles into a device-owned shared front surface.
 use super::*;
-use adv_device::surface::Rect;
+use adv_device::surface::{Rect, Region};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Copy {
@@ -16,6 +16,75 @@ impl Copy {
             self.transfer
                 .map(|t| (super::recording::rect(t.source), t.x, t.y)),
         ))
+    }
+
+    pub(super) fn damage(
+        self,
+        previous: Option<Self>,
+        delta: Option<&Region>,
+        comparable: bool,
+    ) -> Region {
+        let size = (self.width, self.height);
+        let Some(previous) = previous.filter(|p| (p.width, p.height) == size) else {
+            return Region::whole(size);
+        };
+        let mut damage = Region::empty(size);
+        let Some(t) = self.transfer else {
+            return damage;
+        };
+        let map = |r: Rect| Rect {
+            x: t.x + (r.x - t.source.x),
+            y: t.y + (r.y - t.source.y),
+            ..r
+        };
+        let offset = |t: Transfer| {
+            (
+                i64::from(t.x) - i64::from(t.source.x),
+                i64::from(t.y) - i64::from(t.source.y),
+            )
+        };
+        let overlap = previous
+            .transfer
+            .filter(|p| comparable && offset(*p) == offset(t))
+            .map(|p| t.source.clipped(p.source))
+            .filter(|r| !r.empty());
+        let Some(o) = overlap else {
+            damage.add(map(t.source).into());
+            return damage;
+        };
+        let s = t.source;
+        let bottom = o.y + o.h;
+        let right = o.x + o.w;
+        for r in [
+            Rect { h: o.y - s.y, ..s },
+            Rect {
+                y: bottom,
+                h: s.y + s.h - bottom,
+                ..s
+            },
+            Rect {
+                x: s.x,
+                y: o.y,
+                w: o.x - s.x,
+                h: o.h,
+            },
+            Rect {
+                x: right,
+                w: s.x + s.w - right,
+                ..o
+            },
+        ] {
+            damage.add(map(r).into());
+        }
+        if let Some(delta) = delta {
+            for r in adv_device::surface::rects(delta) {
+                let r = r.clipped(o);
+                if !r.empty() {
+                    damage.add(map(r).into());
+                }
+            }
+        }
+        damage
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -161,8 +230,8 @@ pub(super) fn execute(
     copy: Copy,
 ) -> Result<u64, Error> {
     let provider = env.ext.get::<State>().provider;
-    let old_front = match com(env).get_identity(&env.sys.objects, device) {
-        Some(Payload::Device(d)) => d.front,
+    let (old_front, damage) = match com(env).get_identity(&env.sys.objects, device) {
+        Some(Payload::Device(d)) => (d.front, recording::changed(&d.frame)),
         _ => return Err(Error::Invalid("COPY device no longer exists".into())),
     };
     let old_target = old_front.and_then(|surface| (provider.target)(env.ext, surface));
@@ -207,17 +276,39 @@ pub(super) fn execute(
         (front, target)
     };
     if let Some(transfer) = copy.transfer {
-        gpu.copy(
-            &source.image,
-            transfer.source,
-            &target.image,
-            transfer.x,
-            transfer.y,
-        )?;
+        if let Some(damage) = damage
+            .as_ref()
+            .filter(|d| !env.ext.get::<State>().verify_frames && !d.is_whole())
+        {
+            let destination = Rect {
+                x: transfer.x,
+                y: transfer.y,
+                ..transfer.source
+            };
+            for part in damage.parts(8) {
+                let part = Rect::from(part).clipped(destination);
+                if !part.empty() {
+                    let read = Rect {
+                        x: transfer.source.x + (part.x - transfer.x),
+                        y: transfer.source.y + (part.y - transfer.y),
+                        ..part
+                    };
+                    gpu.copy(&source.image, read, &target.image, part.x, part.y)?;
+                }
+            }
+        } else {
+            gpu.copy(
+                &source.image,
+                transfer.source,
+                &target.image,
+                transfer.x,
+                transfer.y,
+            )?;
+        }
     }
     // This callback snapshots, never rotates the front: future partial COPYs
     // must retain pixels outside their destination rectangle.
-    (provider.present_copy)(env.ext, front, None, gpu)
+    (provider.present_copy)(env.ext, front, damage, gpu)
 }
 
 pub(super) fn release(env: &mut Env<'_>, front: Option<u32>) {

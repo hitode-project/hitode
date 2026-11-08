@@ -1311,69 +1311,124 @@ fn removed_draw_before_changed_composite_keeps_damage_local() {
 }
 // spec: GFX-REC-4 GFX-REC-5 GFX-COPY-3
 #[test]
-fn disjoint_uploads_before_sampling_preserve_both_patches() {
-    against_full_replay(3, layer, |f, c, &(texture, surface), n| {
-        let patches = match n {
-            0 => vec![(
-                Rect {
-                    x: 0,
-                    y: 0,
-                    w: 64,
-                    h: 48,
-                },
-                [0, 0, 0, 255],
-            )],
-            1 => vec![
-                (
-                    Rect {
-                        x: 16,
-                        y: 16,
-                        w: 8,
-                        h: 8,
-                    },
-                    [255, 0, 0, 255],
-                ),
-                (
-                    Rect {
-                        x: 40,
-                        y: 16,
-                        w: 8,
-                        h: 8,
-                    },
-                    [0, 255, 0, 255],
-                ),
-            ],
-            _ => vec![],
-        };
-        for (rectangle, color) in patches {
-            let target = f.target(surface);
-            let owner = id(f);
-            let e = env(f);
-            let resource = com(&e)
-                .identity::<Payload>(&e.sys.objects, texture)
-                .unwrap();
-            let bytes = color.repeat((rectangle.w * rectangle.h) as usize);
-            let key = hash(&bytes) as u64;
-            assert!(matches!(
-                record(
-                    &mut env(f),
-                    owner,
-                    Operation::Upload {
-                        resource,
-                        level: Some(0),
-                        target,
-                        pixels: Pixels::Host(Arc::new(bytes), UploadKey::Admission(key)),
-                        pitch: rectangle.w * 4,
-                        rectangle,
-                    }
-                ),
-                Outcome::Return(0)
-            ));
-        }
-        composite(f, c, texture, f.back, c.full, true);
-        let cursor = quad(f, 1. + n as f32, [1.; 4]);
-        record_draw(f, cursor);
-    });
+fn intermittent_uploads_keep_texture_and_depth_composition_local() {
+    use adv_device::gpu::{Address, Filter, TextureOp};
+    for (address, alpha) in [
+        (Address::Repeat, Compare::Always),
+        (Address::Mirror, Compare::Always),
+        (Address::Mirror, Compare::Greater),
+    ] {
+        let (first, end) = against_full_replay(
+            5,
+            |f| {
+                bind_depth(f, 64, 48);
+                layer(f)
+            },
+            |f, _, &(texture, surface), n| {
+                let patches = match n {
+                    0 => vec![(
+                        Rect {
+                            x: 0,
+                            y: 0,
+                            w: 64,
+                            h: 48,
+                        },
+                        [0, 0, 0, 0],
+                    )],
+                    2 | 4 => vec![
+                        (
+                            Rect {
+                                x: 16,
+                                y: 16,
+                                w: 8,
+                                h: 8,
+                            },
+                            [255, n as u8, 0, if n == 2 { 255 } else { 0 }],
+                        ),
+                        (
+                            Rect {
+                                x: 40,
+                                y: 16,
+                                w: 8,
+                                h: 8,
+                            },
+                            [n as u8, 255, 0, if n == 2 { 255 } else { 0 }],
+                        ),
+                    ],
+                    _ => vec![],
+                };
+                for (rectangle, color) in patches {
+                    let target = f.target(surface);
+                    let owner = id(f);
+                    let e = env(f);
+                    let resource = com(&e)
+                        .identity::<Payload>(&e.sys.objects, texture)
+                        .unwrap();
+                    let bytes = color.repeat((rectangle.w * rectangle.h) as usize);
+                    let key = hash(&bytes) as u64;
+                    assert!(matches!(
+                        record(
+                            &mut env(f),
+                            owner,
+                            Operation::Upload {
+                                resource,
+                                level: Some(0),
+                                target,
+                                pixels: Pixels::Host(Arc::new(bytes), UploadKey::Admission(key)),
+                                pitch: rectangle.w * 4,
+                                rectangle,
+                            }
+                        ),
+                        Outcome::Return(0)
+                    ));
+                }
+                f.okay(
+                    "IDirect3DDevice9::Clear",
+                    &[f.device, 0, 0, 3, 0xff000000, 1f32.to_bits(), 0],
+                );
+                let mut textured = draw(f);
+                let device = f.device;
+                textured.target = depth::attach(&env(f), device, textured.target).unwrap();
+                textured.image = Some(f.image(surface));
+                textured.state = DrawState::new(64, 48);
+                textured.state.topology = Topology::TriangleStrip;
+                textured.state.depth = Some(Compare::Less);
+                textured.state.depth_write = true;
+                textured.state.alpha_test = alpha;
+                textured.state.alpha_reference = 0.5;
+                textured.state.sampler.u = address;
+                textured.state.sampler.v = address;
+                textured.state.sampler.mag = Filter::Linear;
+                textured.state.sampler.min = Filter::Linear;
+                textured.state.texture_op = TextureOp::Texture;
+                textured.state.alpha_texture_op = TextureOp::Texture;
+                textured.vertices = [[-1., -1.], [1., -1.], [-1., 1.], [1., 1.]]
+                    .map(|[x, y]| Vertex {
+                        position: [x, y, 0.25, 1.],
+                        color: [1.; 4],
+                        uv: [(x + 1.) / 2., (1. - y) / 2.],
+                    })
+                    .to_vec()
+                    .into();
+                let mut behind = textured.clone();
+                behind.image = None;
+                behind.state.alpha_test = Compare::Always;
+                behind.state.texture_op = TextureOp::Color;
+                behind.state.alpha_texture_op = TextureOp::Color;
+                for v in Arc::make_mut(&mut behind.vertices) {
+                    v.position[2] = 0.5;
+                    v.color = [0., 0., 1., 1.];
+                }
+                f.okay("IDirect3DDevice9::SetTexture", &[f.device, 0, texture]);
+                record_draw(f, textured);
+                f.okay("IDirect3DDevice9::SetTexture", &[f.device, 0, 0]);
+                record_draw(f, behind);
+            },
+        );
+        assert_eq!(end.promotions, first.promotions, "{end:?}");
+        assert_eq!(end.full_executions, first.full_executions, "{end:?}");
+        assert!(steady_share(&first, &end, 5) < 0.25, "{end:?}");
+    }
 }
 // spec: GFX-REC-2 GFX-REC-4 GFX-REC-5
 #[test]
@@ -1428,7 +1483,7 @@ fn repeated_full_upload_keeps_cursor_damage_local() {
 }
 // spec: GFX-REC-2 GFX-REC-4 GFX-REC-5
 #[test]
-fn changing_copy_presentation_rectangles_keeps_render_damage_local() {
+fn copy_presentation_preserves_local_damage_and_rebases_changed_rectangles() {
     let mut outputs = Vec::new();
     for verify in [false, true] {
         let mut f = fixture();
@@ -1446,28 +1501,80 @@ fn changing_copy_presentation_rectangles_keeps_render_damage_local() {
             right: 8,
             bottom: 8,
         });
+        let shifted = f.packet(RECT {
+            left: 8,
+            top: 0,
+            right: 16,
+            bottom: 8,
+        });
+        let inner = f.packet(RECT {
+            left: 0,
+            top: 0,
+            right: 4,
+            bottom: 8,
+        });
+        let shifted_inner = f.packet(RECT {
+            left: 8,
+            top: 0,
+            right: 12,
+            bottom: 8,
+        });
         let mut frames = Vec::new();
-        for n in 0..3 {
+        for n in 0..6 {
             let before = f.m.ext.get::<State>().frames;
             f.okay("IDirect3DDevice9::SetViewport", &[pointer, full]);
             clear(&mut f, 0xff000000);
-            let color = if n == 0 { 0xff0000ff } else { 0xff00ff00 };
+            let color = [0xff0000ff, 0xff00ff00, 0xffff0000][n.min(2)];
             f.okay("IDirect3DDevice9::SetViewport", &[pointer, changed]);
             clear(&mut f, color);
-            let rectangle = if n == 1 { part } else { 0 };
+            let (source, destination) = match n {
+                1 | 2 | 4 => (part, shifted),
+                3 => (inner, shifted_inner),
+                _ => (0, 0),
+            };
+            let copied = |f: &Fixture| {
+                f.m.ext
+                    .get::<State>()
+                    .gpu
+                    .as_ref()
+                    .unwrap()
+                    .stats()
+                    .image_copy_bytes
+            };
+            let before_copy = copied(&f);
             f.okay(
                 "IDirect3DDevice9::Present",
-                &[pointer, rectangle, rectangle, 0, 0],
+                &[pointer, source, destination, 0, 0],
             );
+            if n == 3 {
+                assert_eq!(copied(&f) - before_copy, if verify { 4 * 8 * 4 } else { 0 });
+            }
             frames.push(latest(&mut f));
             if !verify && n > 0 {
                 let after = f.m.ext.get::<State>().frames;
                 let area = after.executed_pixels - before.executed_pixels;
-                assert_eq!(area, if n == 1 { 64 } else { 0 });
+                assert_eq!(area, if n < 3 { 64 } else { 0 });
                 assert_eq!(after.changed_pixels - before.changed_pixels, area);
                 assert_eq!(after.eliminated_frames, 0);
             }
         }
+        let mut mapped = adv_device::surface::Region::empty((16, 12));
+        mapped.add(
+            Rect {
+                x: 8,
+                y: 0,
+                w: 8,
+                h: 8,
+            }
+            .into(),
+        );
+        let damage = &f.m.ext.get::<Presents>().damage;
+        for i in [1, 2, 4] {
+            assert_eq!(damage[i].as_ref(), Some(&mapped));
+        }
+        assert!(damage[3].as_ref().unwrap().is_empty());
+        assert!(damage[5].as_ref().unwrap().is_whole());
+        assert_eq!(f.m.ext.get::<State>().frames.verification_mismatches, 0);
         outputs.push(frames);
     }
     assert!(outputs[0] == outputs[1]);
@@ -1588,6 +1695,81 @@ fn shared_tested_depth_keeps_each_version_exact() {
     );
     assert_eq!(end.promotions, 0);
     assert!(steady_share(&first, &end, 4) < 0.3, "{end:?}");
+}
+// spec: GFX-REC-4 GFX-REC-5
+#[test]
+fn attachment_damage_uses_the_prefix_seen_by_each_draw() {
+    let (first, end) = against_full_replay(
+        3,
+        |f| {
+            bind_depth(f, 64, 48);
+            let viewport = |x, y, w, h| [x, y, w, h, 0, 1f32.to_bits()];
+            (
+                f.packet(viewport(0, 0, 64, 48)),
+                f.packet(viewport(0, 0, 8, 8)),
+                f.packet(viewport(56, 40, 8, 8)),
+            )
+        },
+        |f, _, &(full, left, right), n| {
+            f.okay("IDirect3DDevice9::SetViewport", &[f.device, full]);
+            clear(f, 0xff000000);
+            f.okay(
+                "IDirect3DDevice9::Clear",
+                &[f.device, 0, 0, 6, 0, 1f32.to_bits(), 1],
+            );
+            if n != 1 {
+                f.okay("IDirect3DDevice9::SetViewport", &[f.device, left]);
+                f.okay(
+                    "IDirect3DDevice9::Clear",
+                    &[f.device, 0, 0, 6, 0, 0.25f32.to_bits(), 0],
+                );
+                f.okay("IDirect3DDevice9::SetViewport", &[f.device, full]);
+            }
+            let mut d = draw(f);
+            let device = f.device;
+            d.target = depth::attach(&env(f), device, d.target).unwrap();
+            d.state = DrawState::new(64, 48);
+            d.state.topology = Topology::TriangleStrip;
+            d.state.depth = Some(Compare::Less);
+            let face = StencilFace {
+                compare: Compare::Equal,
+                fail: StencilOp::Keep,
+                depth_fail: StencilOp::Keep,
+                pass: StencilOp::Keep,
+            };
+            d.state.stencil = Some(Stencil {
+                front: face,
+                back: face,
+                read_mask: 255,
+                write_mask: 0,
+            });
+            d.state.stencil_reference = 1;
+            d.vertices = [[-1., -1.], [1., -1.], [-1., 1.], [1., 1.]]
+                .map(|[x, y]| Vertex {
+                    position: [x, y, 0.5, 1.],
+                    color: [1.; 4],
+                    uv: [0.; 2],
+                })
+                .to_vec()
+                .into();
+            record_draw(f, d);
+            // This write changes the final attachment, but the draw saw the earlier version.
+            f.okay("IDirect3DDevice9::SetViewport", &[f.device, right]);
+            f.okay(
+                "IDirect3DDevice9::Clear",
+                &[
+                    f.device,
+                    0,
+                    0,
+                    6,
+                    0,
+                    (0.25 + n as f32 / 4.).to_bits(),
+                    n as u32,
+                ],
+            );
+        },
+    );
+    assert_eq!(end.changed_pixels - first.changed_pixels, 2 * 64, "{end:?}");
 }
 // spec: GFX-REC-4 GFX-REC-5
 #[test]

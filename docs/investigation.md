@@ -79,6 +79,7 @@ Authored fixtures and generators for one area:
 - `--trace` writes one line per call: `ctx  frame  module!name  args  ret`, separated by tabs. It changes timing, so it is never used for timing.
 - A process or thread exit that does not return adds a `# terminal` comment with the original binding, exit code, entry stack and resume point.
 - `# cpu_fault` records a real CPU fault before personality exception handling. It does not mean the fault went unhandled. Interrupts use `# raw_interrupt`. Addresses stay out of shared reports.
+- The debugger's `d3d9 frame` lists command keys and read versions. Its `forward` lines show where command matching or sampled inputs enlarged each generation's damage. Use `d3d9 frame 2` to compare consecutive frames.
 
 **Bounded interpreter observation.** With `--backend interpreter` on the AArch64 engine, set `ADV_INTERP_TRACE_DIR` to an existing folder under `target` and `ADV_INTERP_TRACE_RANGES` to comma-separated half-open `<start>..<end>` PC ranges.
 
